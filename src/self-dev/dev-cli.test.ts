@@ -207,6 +207,16 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     expect(() => buildDevCliSpec(IN, SELF, { childLlmProvider: 'nope-llm' })).toThrow(/--child-llm-provider 알 수 없음: nope-llm/);
   });
 
+  it('--child-llm-provider claude-acp is accepted', () => {
+    const filled = buildDevCliSpec(IN, SELF, { childLlmProvider: 'claude-acp' });
+    expect(filled.self?.childLlm).toEqual({ provider: 'claude-acp', model: defaultChildLlmModel('anthropic'), source: 'flag' });
+    expect(defaultChildLlmModel('claude-acp')).toBe(defaultChildLlmModel('anthropic'));
+    const explicit = buildChildLlmSelection({ childLlmProvider: ' Claude-ACP ', childLlmModel: 'sonnet' });
+    expect(explicit).toEqual({ provider: 'claude-acp', model: 'sonnet', source: 'flag' });
+    expect(resolveImplementationChildModel('claude-acp', 'sonnet')).toEqual(resolveImplementationChildModel('anthropic', 'sonnet'));
+    expect(() => resolveImplementationChildModel('claude-acp', 'not-a-real-model')).toThrow(/--child-llm-model 알 수 없음: not-a-real-model/);
+  });
+
   it('canonical child model id resolves against the selected provider catalog', () => {
     // ⛔ 추천 모델 이름을 박지 않는다 — 기본(=추천)은 tier 사다리가 정한다(08-18 뒤 grok-4.6 → 4.7 로 늙었다).
     const recommendedGrok = defaultChildLlmModel('grok');

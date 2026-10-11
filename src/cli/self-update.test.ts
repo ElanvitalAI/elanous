@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync, readFileSync
 import { tmpdir, platform } from 'node:os';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { childPath, defaultPruneVersions, procStatHoldsNothing, liveRestartBlocked, planVersionPrune, relayImportClosure, rollbackTarget, runReleaseUpdate, runSelfUpdate, runUpdateForInstallation, updateRelay, versionCommit, type SelfUpdateDeps, type ReleaseUpdateDeps } from './self-update.js';
+import { assessRailSafe, childPath, defaultPruneVersions, procStatHoldsNothing, liveRestartBlocked, planVersionPrune, relayImportClosure, rollbackTarget, runReleaseUpdate, runSelfUpdate, runUpdateForInstallation, updateRelay, versionCommit, type SelfUpdateDeps, type ReleaseUpdateDeps } from './self-update.js';
 import type { RestartNeededResult } from './nexus-restart-needed.js';
 
 const checkout = resolve(import.meta.dir, '../..');
@@ -62,6 +62,60 @@ describe('runReleaseUpdate — release installer', () => {
     };
     return { prefix, packageRoot, calls, urls, lines, deps, setInstalledVersion: (value: string) => { installedVersion = value; }, cleanup: () => rmSync(prefix, { recursive: true, force: true }) };
   }
+
+  test('decision-drift: the release install and prune decisions are identical for either shadow verdict', async () => {
+    const original = debug.log.bind(debug);
+    const verdicts: Array<{ result: unknown; commands: string[]; shadow: Record<string, unknown> }> = [];
+    try {
+      for (const held of [false, true]) {
+        const f = setup();
+        const versions = join(f.prefix, 'versions');
+        const oldName = '0.1.0-111111111111';
+        const staleName = '0.1.0-222222222222';
+        const freshName = '0.2.0-333333333333';
+        mkdirSync(join(versions, oldName), { recursive: true });
+        mkdirSync(join(versions, staleName), { recursive: true });
+        utimesSync(join(versions, staleName), new Date('2020-01-01'), new Date('2020-01-01'));
+        writeFileSync(join(f.prefix, 'install.json'), JSON.stringify({ version: '0.1.0', versionDir: `versions/${oldName}`, commit: '111111111111' }));
+        const shadow: Record<string, unknown>[] = [];
+        const order: string[] = [];
+        debug.log = ((category: string, event: string, data?: Record<string, unknown>) => {
+          if (category === 'self-update.rail-safe' && event === 'shadow') {
+            shadow.push({ ...(data ?? {}) });
+            order.push('shadow');
+          }
+          return undefined;
+        }) as typeof debug.log;
+        const result = await runReleaseUpdate({ keep: 1 }, {
+          ...f.deps,
+          run: (command, args, cwd, input, env) => {
+            order.push(command);
+            f.calls.push({ command, args, cwd, input, env });
+            if (command === 'bash') {
+              mkdirSync(join(versions, freshName), { recursive: true });
+              writeFileSync(join(f.prefix, 'install.json'), JSON.stringify({ version: '0.2.0', versionDir: `versions/${freshName}`, commit: '333333333333' }));
+            }
+            return { status: 0, stderr: '' };
+          },
+          pruneVersions: () => ({ removed: [], kept: [] }),
+          listRailSafeProcesses: (pattern) => held && pattern.includes('222222222222')
+            ? { status: 0, stdout: `node ${join(versions, staleName, 'bin/elanous.mjs')} run\n`, stderr: '' }
+            : { status: 1, stdout: '', stderr: '' },
+          isReleaseRunActive: () => false,
+        });
+        verdicts.push({ result, commands: f.calls.map((call) => call.command), shadow: shadow[0] ?? {} });
+        expect(shadow).toHaveLength(1);
+        expect(order).toEqual(['shadow', 'bash']);
+        f.cleanup();
+      }
+    } finally { debug.log = original; }
+    expect(verdicts.map(({ result, commands }) => ({ result, commands }))).toEqual([
+      { result: verdicts[0]?.result, commands: ['bash'] },
+      { result: verdicts[0]?.result, commands: ['bash'] },
+    ]);
+    expect(verdicts.map(({ shadow }) => shadow.wouldBlock)).toEqual([false, true]);
+    expect(verdicts[1]?.shadow).toMatchObject({ reasons: ['held-version'], heldVersions: ['0.1.0-222222222222'], releaseRunActive: false });
+  });
 
   test('uses install.json prefix and latest installer, passing script on stdin without changing PATH', async () => {
     const f = setup();
@@ -690,6 +744,64 @@ describe('childPath', () => {
 });
 
 // 🆕 2026-09-24 — 야간 자동이 하룻밤 한 판(641MB)씩 쌓는다.
+describe('assessRailSafe — shadow predicate', () => {
+  const versionsDir = '/install/versions';
+  const entries = [
+    { name: '1.0.0-111111111111', mtimeMs: 3 },
+    { name: '1.0.0-222222222222', mtimeMs: 1 },
+    { name: '1.0.0-333333333333', mtimeMs: 2 },
+  ];
+  const input = (overrides: Partial<Parameters<typeof assessRailSafe>[0]> = {}) => ({
+    entries,
+    current: '1.0.0-333333333333',
+    daemonSha: '111111111',
+    keep: 1,
+    versionsDir,
+    listProcesses: () => ({ status: 1, stdout: '', stderr: '' }),
+    isReleaseRunActive: () => false,
+    ...overrides,
+  });
+
+  test('a process argv naming a planned-to-prune version reports held-version', () => {
+    const result = assessRailSafe(input({
+      listProcesses: (pattern) => ({ status: 0, stdout: `${versionsDir}/1.0.0-222222222222/bin/elanous.mjs ${pattern}\n`, stderr: '' }),
+    }));
+    expect(result).toEqual({ wouldBlock: true, reasons: ['held-version'], heldVersions: ['1.0.0-222222222222'], releaseRunActive: false });
+  });
+
+  test('an active release run reports release-run-active', () => {
+    expect(assessRailSafe(input({ isReleaseRunActive: () => true }))).toMatchObject({
+      wouldBlock: true, reasons: ['release-run-active'], heldVersions: [], releaseRunActive: true,
+    });
+  });
+
+  test('resolves pgrep PID-only output to argv for held versions and release runs', () => {
+    const commands = new Map([
+      ['12345', `${versionsDir}/1.0.0-222222222222/bin/elanous.mjs serve`],
+      ['67890', 'bun bin/elanous.mjs release run'],
+    ]);
+    const result = assessRailSafe(input({
+      listProcesses: (pattern) => ({
+        status: 0,
+        stdout: pattern.includes('release') ? '67890\n' : '12345\n',
+        stderr: '',
+      }),
+      readProcessCommand: (pid) => commands.get(pid) ?? null,
+      isReleaseRunActive: undefined,
+    }));
+    expect(result).toEqual({
+      wouldBlock: true,
+      reasons: ['held-version', 'release-run-active'],
+      heldVersions: ['1.0.0-222222222222'],
+      releaseRunActive: true,
+    });
+  });
+
+  test('no held version and no release run does not block', () => {
+    expect(assessRailSafe(input())).toEqual({ wouldBlock: false, reasons: [], heldVersions: [], releaseRunActive: false });
+  });
+});
+
 describe('planVersionPrune', () => {
   const e = (name: string, mtimeMs: number) => ({ name, mtimeMs });
   const list = [

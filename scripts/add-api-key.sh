@@ -121,7 +121,7 @@ REFRESH="$(dirname "$LOADER")/refresh_api_key_cache.sh"
 if [ -f "$REFRESH" ] && ! grep -q "\"$ENV_NAME\"" "$REFRESH"; then
   echo ""
   echo "   🔲 ⓷ 다른 기계에도 퍼뜨리려면 — ⛔ «자동으로 안 넣었다»"
-  echo "      먼저 AWS Secrets Manager 에 비밀 «$ENV_NAME» 을 만들고, 그 «뒤»에:"
+  echo "      먼저 AWS Secrets Manager 에 비밀 «${ENV_NAME}» 을 만들고, 그 «뒤»에:"
   echo "        fetch_secret \"$ENV_NAME\" \"\${CACHE_DIR}/$FILE_NAME\""
   echo "      ⚠️ 비밀이 «없는» 상태로 넣으면 그 스크립트가 set -e 라 다른 키 갱신까지 멈춘다."
 fi

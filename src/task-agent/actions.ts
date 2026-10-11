@@ -1,7 +1,7 @@
 import { copyFileSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
 import { debug } from '../debug/log.js';
-import { judgeNextMove } from './judge.js';
+import { judgeNextMove, retryMoveOf, SAME_MOVE_FAILURE_LIMIT } from './judge.js';
 import { checkCompletionEvidence } from './completion-evidence.js';
 
 export type DeliveryKind = 'research-report' | 'artifact' | 'content';
@@ -65,11 +65,66 @@ export interface ActionDeps {
   /** 실패 한 번을 잠금 안에서 디스크에 더한다(다른 프로세스의 실패를 덮지 않게) · 더한 뒤의 값을 돌려준다. */
   incrementFailure?(key: string): number;
   observe(event: 'task-agent.action', data: { taskId: string; kind: NextActionKind; result: string; reason: string }): void;
+  /** 사다리 R4 — 실제로 할 재발사 수의 허용 목록(`taskAgent.liveMoves` 어휘). 없으면 종전 그대로(재발사에 목록 검사 없음) · 목록에 없는 수는 shadow. */
+  liveMoves?: ReadonlySet<string>;
+  /** 한 판단 회차의 발사 칸 — 호출부가 회차마다 새로 준다. 없으면 회당 상한 없음(종전). 발사를 시도할 때마다 `count` 가 오른다. */
+  retryLaunches?: { count: number };
+  /** mbp 부하 관문(OP 신호 `loadMax`) — 지금 1분 부하가 `loadMax` 이상이거나 못 읽으면 발사하지 않고 shadow. 없으면 관문 없음(종전). */
+  loadGate?: { loadMax: number; load1(): number | null };
+}
+
+/** 재발사는 한 판단 회차에 한 건만 발사한다. */
+export const RETRY_LAUNCHES_PER_CYCLE = 1;
+
+/** live 인데도 shadow 로 내릴 사유 — 없으면 발사해도 된다(재발사 아닌 수는 늘 없다). 기다림(wait)은 발사가 아니라 부하·회당 상한을 보지 않는다. */
+function retryShadowReason(action: NextAction, deps: ActionDeps): string | undefined {
+  if (action.kind !== 'retry') return undefined;
+  const move = retryMoveOf(action.variant);
+  if (deps.liveMoves && !deps.liveMoves.has(move)) return `${move} not in live allow-list`;
+  if (action.variant === 'wait') return undefined;
+  if (deps.loadGate) {
+    const load = deps.loadGate.load1();
+    if (load === null || !Number.isFinite(load)) return `load gate: load unreadable (loadMax ${deps.loadGate.loadMax})`;
+    if (load >= deps.loadGate.loadMax) return `load gate: load ${load} >= loadMax ${deps.loadGate.loadMax}`;
+  }
+  if (deps.retryLaunches && deps.retryLaunches.count >= RETRY_LAUNCHES_PER_CYCLE) return `one relaunch per cycle already used (${move})`;
+  return undefined;
+}
+
+/** 결정 카드가 «근거»로 쓰는 세 칸 — 막힌 과제의 서명 · 막힌 화면 · 리뷰 must-fix. */
+export interface DecisionCardEvidence { signature?: string; screen?: string; mustFix?: readonly string[] }
+
+/** 비지 않은 근거 칸 이름들 — 비어 있으면 카드를 올리지 않는다(근거 없는 카드 0). */
+export function decisionCardGrounds(evidence: DecisionCardEvidence | undefined): Array<'signature' | 'screen' | 'must-fix'> {
+  const grounds: Array<'signature' | 'screen' | 'must-fix'> = [];
+  if (evidence?.signature?.trim()) grounds.push('signature');
+  if (evidence?.screen?.trim()) grounds.push('screen');
+  if (evidence?.mustFix?.some(fix => typeof fix === 'string' && fix.trim())) grounds.push('must-fix');
+  return grounds;
+}
+
+/** `decisions raise` 인자 — 종전 실행부(`executeNextAction`)와 live 수(`executeLiveDecisionCard`)가 같은 카드 모양을 쓴다. */
+export function decisionRaiseArgs(input: { taskId: string; reason: string; risk?: NextAction['risk']; evidence: string }): string[] {
+  const category = input.risk === 'money' ? 'money' : input.risk === 'security' ? 'security' : input.risk === 'irreversible-publication' ? 'publish' : 'other';
+  return ['decisions', 'raise', '--title', `${input.taskId}: ${input.reason}`, '--category', category, '--s', `Task ${input.taskId} needs a decision.`, '--c', input.reason, '--ref', input.evidence, '--q', 'Which action should be taken?', '--option', 'h=Keep on hold:no automatic execution', '--option', 'p=Approve action:execute after approval', '--skip-recommend', 'requires human decision', '--no-xcheck', 'automated escalation'];
 }
 
 /** 실패 셈 키. 갈래가 있으면 갈래별로 센다(G2 — «다른 수»의 실패가 같은 칸에 쌓이지 않게). 없으면 종전 키 그대로. */
 export function failureKey(action: Pick<NextAction, 'taskId' | 'kind' | 'variant'>): string {
   return JSON.stringify(action.variant ? [action.taskId, action.kind, action.variant] : [action.taskId, action.kind]);
+}
+
+/**
+ * 같은 «수»의 실패 수 — 상한 판정용. 셈 키(`failureKey`)는 종전 그대로 두되, 갈래 없는 재발사와 `narrow` 갈래는
+ * 같은 수(`narrow-relaunch` · `retryMoveOf`)라 두 키를 합쳐 본다(TA-LIVE-RETRY: 같은 과제·같은 수 3회 반복 0).
+ */
+export function sameMoveFailures(action: Pick<NextAction, 'taskId' | 'kind' | 'variant'>, deps: Pick<ActionDeps, 'failureCounts' | 'failures'>): number {
+  if (!deps.failureCounts) return deps.failures ?? 0;
+  if (action.kind !== 'retry' || retryMoveOf(action.variant) !== 'narrow-relaunch') return deps.failureCounts[failureKey(action)] ?? deps.failures ?? 0;
+  const bare = deps.failureCounts[failureKey({ taskId: action.taskId, kind: 'retry' })];
+  const narrow = deps.failureCounts[failureKey({ taskId: action.taskId, kind: 'retry', variant: 'narrow' })];
+  if (bare === undefined && narrow === undefined) return deps.failures ?? 0;
+  return (bare ?? 0) + (narrow ?? 0);
 }
 
 const RETRY_HINT: Record<Exclude<RetryVariant, 'wait'>, (action: NextAction) => string> = {
@@ -89,18 +144,19 @@ export async function executeNextAction(action: NextAction, deps: ActionDeps): P
     deps.observe('task-agent.action', { taskId: action.taskId, kind: action.kind, result, reason });
     return result;
   };
-  if (deps.mode !== 'live') {
+  const shadowReason = deps.mode === 'live' ? retryShadowReason(action, deps) : undefined;
+  if (deps.mode !== 'live' || shadowReason) {
     const destination = action.delivery && action.kind === 'deliver'
       ? ` → ${join(action.delivery.projectTarget, 'elanous-out', action.taskId)}/${action.delivery.files.join(', ')}` : '';
-    return record('shadow', `would ${action.kind}${action.variant ? `:${action.variant}` : ''}: ${action.rationale}${destination}`);
+    return record('shadow', `would ${action.kind}${action.variant ? `:${action.variant}` : ''}: ${action.rationale}${destination}${shadowReason ? ` · shadow: ${shadowReason}` : ''}`);
   }
   const card = async (reason: string) => {
     const evidence = JSON.stringify({ runId: action.runId, pr: action.pr, mustFix: action.mustFix ?? [], history: action.history ?? [], selected: action.kind, reason });
-    const result = await deps.command(['decisions', 'raise', '--title', `${action.taskId}: ${reason}`, '--category', action.risk === 'money' ? 'money' : action.risk === 'security' ? 'security' : action.risk === 'irreversible-publication' ? 'publish' : 'other', '--s', `Task ${action.taskId} needs a decision.`, '--c', reason, '--ref', evidence, '--q', 'Which action should be taken?', '--option', 'h=Keep on hold:no automatic execution', '--option', 'p=Approve action:execute after approval', '--skip-recommend', 'requires human decision', '--no-xcheck', 'automated escalation']);
+    const result = await deps.command(decisionRaiseArgs({ taskId: action.taskId, reason, ...(action.risk ? { risk: action.risk } : {}), evidence }));
     return record(result.status === 0 ? 'decision' : 'failed', reason);
   };
   if (action.risk) return card(`risk: ${action.risk}`);
-  if ((deps.failureCounts?.[failureKey(action)] ?? deps.failures ?? 0) >= 2) return card('same task/action failed twice');
+  if (sameMoveFailures(action, deps) >= SAME_MOVE_FAILURE_LIMIT) return card('same task/action failed twice');
   if (action.kind === 'land') {
     if (!action.cwd) return card('landing worktree unknown');
     const view = await deps.command(['gh', 'pr', 'view', String(action.pr), '--json', 'labels']);
@@ -175,6 +231,7 @@ export async function executeNextAction(action: NextAction, deps: ActionDeps): P
   // 여기 닿는 종류는 land · retry 둘뿐이다(green·decision·review 는 위에서 끝난다).
   const args = action.kind === 'land' ? ['pr', 'land', '--cwd', action.cwd!] : ['harness', 'say', retryText(action)];
   const day = deps.landingDay ?? new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Seoul' });
+  if (action.kind === 'retry' && deps.retryLaunches) deps.retryLaunches.count++;
   const outcome = await deps.command(args);
   if (outcome.status !== 0) {
     if (action.kind === 'land') deps.releaseLanding?.(day);

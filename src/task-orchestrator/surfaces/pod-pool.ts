@@ -31,6 +31,11 @@ export interface PodPoolMember {
   /** 원격 클러스터가 도는 기계(ssh 호스트). 없으면 이 기계의 docker 에 있다. */
   readonly sshHost?: string;
   readonly capacity: number;
+  /**
+   * POD-POOL-UNCAPPED-SPEC — 스펙에 `:N` 이 없어서 `capacity` 가 운영자 숫자가 아니라 `POD_POOL_DEFAULT_CAPACITY` 다.
+   * 발사 허가는 이 표시로 «풀 기본 상한이 막았다»(`limitedBy=pool-cap`)를 일반 `capacity` 와 갈라 말한다.
+   */
+  readonly capacityDefaulted?: boolean;
   /** k3d 클러스터 이름(이미지 반입용). 기본: 컨텍스트가 `k3d-<이름>` 이면 그 이름, 원격이면 `elanous-pool`. */
   readonly k3dCluster: string;
   /** 노드 로컬 레지스트리의 이미지(커밋 태그) — 있으면 Pod 가 이것을 pull 한다(델타 · 대표 2026-09-26). 없으면 반입된 로컬 이미지. */
@@ -115,18 +120,23 @@ export function remoteImageSkillsDigest(member: PodPoolMember, image: string, ru
 
 const MEMBER = /^([A-Za-z0-9][A-Za-z0-9._-]*)(?:@([A-Za-z0-9][A-Za-z0-9._-]*))?(?::(\d+))?(?:#(k3d-[A-Za-z0-9][A-Za-z0-9._-]*):([1-9]\d{0,4}))?$/u;
 
+/** 상한 없는 풀 스펙(`:N` 없음)의 노드 상한 — 파일 머리 주석의 «기본 2» 정본(POD-POOL-UNCAPPED-SPEC). */
+export const POD_POOL_DEFAULT_CAPACITY = 2;
+
 export function parsePodPool(spec: string): PodPoolMember[] {
   const members = spec.split(',').map((s) => s.trim()).filter(Boolean).map((part) => {
     const m = MEMBER.exec(part);
     if (!m) throw new Error(`--pod-pool: 못 읽는 노드 「${part}」 — 형식 컨텍스트[@ssh호스트][:상한][#k3d-레지스트리:포트]`);
-    const capacity = m[3] === undefined ? 2 : Number(m[3]);
+    // `:N` 이 없으면 «상한 없음»이 아니라 기본 상한 2 다 — 그 사실(`capacityDefaulted`)을 멤버에 남긴다.
+    const capacityDefaulted = m[3] === undefined;
+    const capacity = capacityDefaulted ? POD_POOL_DEFAULT_CAPACITY : Number(m[3]);
     // POOL-LITE (10-07): `:0` means «this member is off» — a `node-c:0` entry once threw here and broke every launch.
     //   It is dropped below (never chosen); only a pool with no live member left is an error.
     if (!Number.isInteger(capacity) || capacity < 0) throw new Error(`--pod-pool: 상한은 1 이상 — 「${part}」`);
     if (m[5] && Number(m[5]) > 65535) throw new Error(`--pod-pool: 레지스트리 포트는 65535 이하 — 「${part}」`);
     const context = m[1]!;
     const k3dCluster = context.startsWith('k3d-') ? context.slice(4) : 'elanous-pool';
-    return { context, capacity, k3dCluster, ...(m[2] ? { sshHost: m[2] } : {}), ...(m[4] ? { registry: `${m[4]}:${m[5]}` } : {}) };
+    return { context, capacity, ...(capacityDefaulted ? { capacityDefaulted: true } : {}), k3dCluster, ...(m[2] ? { sshHost: m[2] } : {}), ...(m[4] ? { registry: `${m[4]}:${m[5]}` } : {}) };
   });
   if (members.length === 0) throw new Error('--pod-pool: 노드가 없다');
   if (new Set(members.map((m) => m.context)).size !== members.length) throw new Error('--pod-pool: 컨텍스트가 겹친다');
@@ -642,7 +652,11 @@ export function syncPoolImage(member: PodPoolMember, image: string, localCommit:
     // The import phase gets its own stale window (the lock file's age restarts here).
     try { const now = new Date(); utimesSync(lockPath, now, now); } catch { /* lock gone · finish anyway */ }
     const imp = remote(host, `k3d image import ${image} -c ${member.k3dCluster}`);
-    if (imp.status !== 0) return { ok: false, action: 'failed', detail: `k3d import rc=${imp.status}: ${imp.stderr.slice(-300)}` };
+    // As in build.sh, only tools-node cleanup errors may follow a nonzero import rc.
+    // Ignore informational lines, but reject any other failure line (including WARN and untagged output).
+    const failures = imp.stderr.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !/^(?:INFO|DEBU|DEBUG|TRAC|TRACE)(?:\[|\s|:|$)/.test(line));
+    const cleanup = /^(?:(?:ERROR|ERRO|FATAL|FATA|WARNING|WARN|INFO)(?:\[[^\]]*\])?:?\s*)?(?:failed to import images: )?failed to delete tools node '[^']*': (?:Error response from daemon: )?(?:No such container: [A-Za-z0-9_.-]+|removal of container [A-Za-z0-9_.-]+ is already in progress)$/i;
+    if (imp.status !== 0 && (failures.length === 0 || !failures.every((line) => cleanup.test(line)))) return { ok: false, action: 'failed', detail: `k3d import rc=${imp.status}: ${imp.stderr.slice(-300)}` };
     const after = remoteImageCommit(member, image, remote);
     return after && (!localCommit || after === localCommit)
       ? { ok: true, action: 'shipped', detail: `${labelNow?.slice(0, 12) ?? '없음'} → ${after.slice(0, 12)}` }
@@ -736,7 +750,9 @@ export async function syncPoolImages(members: readonly PodPoolMember[], image: s
   const run = deps.run ?? defaultRemoteRun;
   const script = deps.buildScript === undefined ? podImageBuildScript() : deps.buildScript;
   const remoteBuild = deps.remoteBuild ?? (script ? defaultRemoteBuild(script, image) : null);
-  const ship = deps.ship ?? ((m: PodPoolMember, img: string, commit: string | null, remote: RemoteRun) => syncPoolImage(m, img, commit, { run: remote, inspect: deps.inspect, transfer: deps.transfer }));
+  // The registry-less build fallback below calls this ship path, including its remote import result check.
+  const ship = deps.ship ?? ((m: PodPoolMember, img: string, commit: string | null, remote: RemoteRun) =>
+    syncPoolImage(m, img, commit, { run: remote, inspect: deps.inspect, transfer: deps.transfer }));
   const results = new Map<string, PoolImageSync>();
   // pack 한 번 ⊕ 나눠 쓰기 — 원격 멤버가 둘 이상일 때만(하나뿐이면 종전대로 build.sh 가 스스로 pack 한다).
   //   주입된 remoteBuild(시험)에는 진짜 pack 을 붙이지 않는다 — pack 도 주입해야 쓴다.

@@ -13,15 +13,17 @@ const usage = (rows: unknown[]) => JSON.stringify({ rows, accountCounts: {} });
 
 describe('grok quota at launch', () => {
   test('reads the live `elanous usage --json` grok credit row', () => {
-    expect(grokQuotaFromUsageJson(usage([{ provider: 'grok', credits: { status: 'ok', usedPercent: 100 } }]))).toBe('exhausted');
-    expect(grokQuotaFromUsageJson(usage([{ provider: 'grok', credits: { status: 'ok', usedPercent: 42 } }, { provider: 'grok', credits: { status: 'ok', usedPercent: 100 } }]))).toBe('usable');
-    expect(grokQuotaFromUsageJson(usage([{ provider: 'codex', credits: { status: 'ok', usedPercent: 100 } }]))).toBe('unknown');
+    expect(grokQuotaFromUsageJson(usage([{ provider: 'grok', credits: { status: 'ok', periodType: 'USAGE_PERIOD_TYPE_WEEKLY', usedPercent: 100 } }]))).toBe('exhausted');
+    expect(grokQuotaFromUsageJson(usage([{ provider: 'grok', credits: { status: 'ok', periodType: 'USAGE_PERIOD_TYPE_WEEKLY', usedPercent: 42 } }, { provider: 'grok', credits: { status: 'ok', periodType: 'USAGE_PERIOD_TYPE_WEEKLY', usedPercent: 100 } }]))).toBe('usable');
+    expect(grokQuotaFromUsageJson(usage([{ provider: 'grok', credits: { status: 'ok', periodType: 'USAGE_PERIOD_TYPE_MONTHLY', usedPercent: 100 } }]))).toBe('unknown');
+    expect(grokQuotaFromUsageJson(usage([{ provider: 'grok', credits: { status: 'ok', periodType: 'USAGE_PERIOD_TYPE_WEEKLY', usedPercent: 101 } }]))).toBe('unknown');
+    expect(grokQuotaFromUsageJson(usage([{ provider: 'codex', credits: { status: 'ok', periodType: 'USAGE_PERIOD_TYPE_WEEKLY', usedPercent: 100 } }]))).toBe('unknown');
     expect(grokQuotaFromUsageJson('not json')).toBe('unknown');
   });
 
   test('uses the cache when it knows, and asks the live usage only when the cache is unknown', () => {
     let asked = 0;
-    const run = () => { asked++; return usage([{ provider: 'grok', credits: { status: 'ok', usedPercent: 100 } }]); };
+    const run = () => { asked++; return usage([{ provider: 'grok', credits: { status: 'ok', periodType: 'USAGE_PERIOD_TYPE_WEEKLY', usedPercent: 100 } }]); };
     expect(readGrokQuotaForLaunch({ readCached: () => 'usable', runUsage: run })).toBe('usable');
     expect(asked).toBe(0);
     expect(readGrokQuotaForLaunch({ readCached: () => 'unknown', runUsage: run })).toBe('exhausted');

@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from 'bun:test';
+import { expect, setDefaultTimeout, spyOn, test } from 'bun:test';
 import { execFile } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -24,6 +24,8 @@ import { FORBID_JUDGMENT_LINE, alreadyHandled, gatherSeatInputs, personaShadowLe
 import { parseAskTargetPathHints } from '../self-dev/launch-preflight.js';
 // The owner mark is assembled at runtime so the public export carries no literal (LEAK1).
 const CEO = '\u{1F451}';
+
+setDefaultTimeout(60_000);
 
 const now = new Date('2026-10-02T23:20:00Z');
 const fixture = () => {
@@ -2180,7 +2182,7 @@ test('different processes contend on the same seat lock before reading the ledge
         run: async () => { writeFileSync(process.argv[3], 'called'); throw Error('duplicate external call'); },
       });
       console.log(result.status);`;
-    const second = child('bun', ['-e', script, f.root, signal, external], { cwd: resolve(import.meta.dir, '../..'), timeout: 10_000 });
+    const second = child('bun', ['-e', script, f.root, signal, external], { cwd: resolve(import.meta.dir, '../..'), timeout: 60_000 });
     try {
       const deadline = Date.now() + 8_000;
       while (!existsSync(signal) && Date.now() < deadline) await new Promise((done) => setTimeout(done, 10));
@@ -2194,7 +2196,7 @@ test('different processes contend on the same seat lock before reading the ledge
     expect(existsSync(external)).toBe(false);
     expect(entries(f).filter((entry) => entry.status === 'launched')).toHaveLength(1);
   } finally { f.close(); }
-});
+}, 60_000);
 
 test('a harness response without a runId cannot be recorded as launched', async () => {
   const f = fixture();

@@ -155,11 +155,16 @@ export function registerGraphCommands(program: Command, runsDeps: { root?: strin
     .description('Advance one graph run, resuming a pending decision or starting only when requested')
     .option('--start', 'Start a new run when the graph is idle')
     .option('--schedule', 'Subscribe graph YAML triggers.schedule to the workflow scheduler and tick on each fire')
+    .option('--webhook', 'Subscribe graph YAML triggers.webhook to the workflow webhook router and tick on each request')
+    .option('--port <n>', 'Port for --webhook to listen on (default: any free port)')
     .option('--input <json>', 'JSON object passed to a newly started run')
     .option('--json', 'Print the tick result as JSON')
-    .action(async (file: string, opts: { start?: boolean; schedule?: boolean; input?: string; json?: boolean }) => {
+    .action(async (file: string, opts: { start?: boolean; schedule?: boolean; webhook?: boolean; port?: string; input?: string; json?: boolean }) => {
       try {
         if (opts.schedule && (opts.start || opts.input !== undefined || opts.json)) throw new Error('--schedule cannot be combined with --start, --input or --json');
+        if (opts.webhook && (opts.schedule || opts.start || opts.input !== undefined || opts.json)) throw new Error('--webhook cannot be combined with --schedule, --start, --input or --json');
+        if (opts.port !== undefined && !opts.webhook) throw new Error('--port requires --webhook');
+        if (opts.port !== undefined && (!/^\d+$/.test(opts.port) || Number(opts.port) > 65535)) throw new Error('--port must be an integer from 0 to 65535');
         if (opts.input !== undefined && !opts.start) throw new Error('--input requires --start');
         let input: Record<string, unknown> | undefined;
         if (opts.input !== undefined) {
@@ -171,6 +176,42 @@ export function registerGraphCommands(program: Command, runsDeps: { root?: strin
         }
         await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('graph');
         const { graphTick } = await import('./graph-tick.js');
+        if (opts.webhook) {
+          const { createWebhookSource } = await import('../workflow-runtime/triggers/webhook-source.js');
+          const graphFile = resolve(file);
+          const source = createWebhookSource();
+          // The CLI tick callback is the graph counterpart of the workflow webhook router's onEmit.
+          source.subscribeGraph(graphFile, async () => {
+            try {
+              const { notifyGraphEvents } = await import('./graph-notify.js');
+              const result = await graphTick(graphFile, { startIfIdle: true, deps: { notify: async () => { await notifyGraphEvents(); } } });
+              if (result.status === 'refused') return { ok: false, error: `refused: ${result.reason}` };
+              if (result.status === 'failed') return { ok: false, runId: result.runId, error: 'failed' };
+              return result.runId ? { ok: true, runId: result.runId } : { ok: false, error: `no run (${result.action})` };
+            } catch (error) {
+              debug.log('graph.runner', 'webhook-tick-failed', { file: graphFile, error: error instanceof Error ? error.message : String(error) });
+              return { ok: false, error: error instanceof Error ? error.message : String(error) };
+            }
+          });
+          if (!source.subscriptions().length) throw new Error('graph triggers.webhook is missing');
+          await source.start();
+          const server = Bun.serve({
+            hostname: '127.0.0.1',
+            port: opts.port === undefined ? 0 : Number(opts.port),
+            fetch: async (request) => {
+              const response = await source.dispatch({
+                method: request.method, path: new URL(request.url).pathname,
+                headers: Object.fromEntries(request.headers), body: await request.text(),
+              });
+              return response ? new Response(response.body, { status: response.status, headers: response.headers }) : new Response('webhook source not started', { status: 503 });
+            },
+          });
+          console.log(`graph webhook: ${source.subscriptions().length} active on http://127.0.0.1:${server.port}`);
+          const shutdown = () => { void server.stop(true).then(() => source.stop()).then(() => { process.exitCode = 0; }); };
+          process.once('SIGINT', shutdown);
+          process.once('SIGTERM', shutdown);
+          return;
+        }
         if (opts.schedule) {
           const { createScheduleSource } = await import('../workflow-runtime/triggers/schedule-source.js');
           const graphFile = resolve(file);

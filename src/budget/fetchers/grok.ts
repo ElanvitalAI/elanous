@@ -1,12 +1,12 @@
 // Grok budget fetcher adapter.
 //
 // Reuses `fetchGrokUsage` (src/grok/usage.ts). Existing subscription token
-// only. Does not infer a subscription-pool remaining/reset and does not
-// scrape a web page. Credit figures stay on the credits axis — they are
-// never written into RateWindow.remainingPercent.
+// only. Maps an explicitly returned weekly period + creditUsagePercent into
+// the provider's weekly quota window; credit balances remain on the credits axis.
 
 import {
   fetchGrokUsage,
+  grokUsageToSubscriptionAxis,
   grokUsageToCreditAxis,
   type GrokUsage,
 } from '../../grok/usage.js';
@@ -36,10 +36,20 @@ export function createGrokFetcher(opts: GrokFetcherOpts = {}): ProviderFetcher {
 
 export function grokUsageToSnapshot(usage: GrokUsage, fetchedAt: number = Date.now()): UsageSnapshot {
   const credits = creditsFromGrokUsage(usage);
+  const subscription = grokUsageToSubscriptionAxis(usage);
+  const windows = subscription.status === 'available'
+    ? [{
+        kind: 'weekly' as const,
+        windowMinutes: 10_080,
+        limit: 100,
+        used: 100 - subscription.remainingPercent,
+        remainingPercent: subscription.remainingPercent,
+        resetsAt: subscription.resetsAt,
+      }]
+    : [];
   return {
     provider: 'grok' as UsageProvider,
-    // ⛔ 크레딧 사용률을 구독 창 잔량처럼 보이게 하는 RateWindow 를 만들지 않는다.
-    windows: [],
+    windows,
     ...(credits ? { credits } : {}),
     fetchedAt,
     source: 'oauth-api',

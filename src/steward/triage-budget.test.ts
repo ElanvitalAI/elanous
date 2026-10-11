@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
-import { triageInputHash, triageWithinBudget } from './triage-budget.js';
+import { draftWithinBudget, triageInputHash, triageWithinBudget } from './triage-budget.js';
+import { InvalidWorkingBackwardsDraft } from './working-backwards.js';
 import type { TriageDecision, TriageIssue } from './triage.js';
 
 const issues = Array.from({ length: 46 }, (_, n): TriageIssue => ({
@@ -260,4 +261,68 @@ test('active judgments never exceed concurrency and all decisions preserve input
   expect(peak).toBe(3);
   expect(decisions.map(d => d.issue)).toEqual(issues.slice(0, 9).map(i => i.identifier));
   expect(stats).toEqual({ reused: 0, judged: 9, timedOut: 0, deferred: 0 });
+});
+
+test('ten never-finishing drafts resolve within the stage deadline and are all carried', async () => {
+  const wishes = issues.slice(0, 10);
+  const started = Date.now();
+  const result = await draftWithinBudget({ wishes, concurrency: 4, perItemMs: 10_000, deadlineMs: 60,
+    draft: () => new Promise<void>(() => undefined) });
+  expect(Date.now() - started).toBeLessThan(1_000);
+  expect(result.carried.map(item => item.wish.identifier)).toEqual(wishes.map(issue => issue.identifier));
+  expect(result.drafted).toEqual([]);
+  expect(result.invalid).toEqual([]);
+  expect(result.stats).toEqual({ drafted: 0, carried: 10, invalid: 0 });
+});
+
+test('a draft that outlives perItemMs is carried while the others are drafted', async () => {
+  const wishes = issues.slice(0, 3);
+  const result = await draftWithinBudget({ wishes, perItemMs: 20, deadlineMs: 5_000,
+    draft: wish => wish.identifier === 'ELA-1' ? new Promise<void>(() => undefined) : Promise.resolve() });
+  expect(result.drafted.map(issue => issue.identifier)).toEqual(['ELA-0', 'ELA-2']);
+  expect(result.carried.map(item => [item.wish.identifier, item.reason])).toEqual([['ELA-1', 'timeout']]);
+});
+
+test('active drafts never exceed concurrency', async () => {
+  let active = 0;
+  let peak = 0;
+  const result = await draftWithinBudget({ wishes: issues.slice(0, 10), concurrency: 3,
+    draft: async () => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      active--;
+    } });
+  expect(peak).toBe(3);
+  expect(result.stats).toEqual({ drafted: 10, carried: 0, invalid: 0 });
+});
+
+test('a timed-out draft keeps its concurrency slot until it settles', async () => {
+  let active = 0;
+  let peak = 0;
+  const result = await draftWithinBudget({ wishes: issues.slice(0, 4), concurrency: 2, perItemMs: 10, deadlineMs: 5_000,
+    draft: async () => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise(resolve => setTimeout(resolve, 40));
+      active--;
+    } });
+  expect(peak).toBe(2);
+  expect(result.stats).toEqual({ drafted: 0, carried: 4, invalid: 0 });
+});
+
+test('an InvalidWorkingBackwardsDraft lands only in invalid', async () => {
+  const result = await draftWithinBudget({ wishes: issues.slice(0, 3),
+    draft: async wish => { if (wish.identifier === 'ELA-1') throw new InvalidWorkingBackwardsDraft(); } });
+  expect(result.invalid.map(issue => issue.identifier)).toEqual(['ELA-1']);
+  expect(result.drafted.map(issue => issue.identifier)).toEqual(['ELA-0', 'ELA-2']);
+  expect(result.carried).toEqual([]);
+});
+
+test('a plain Error is carried without rejecting or becoming invalid', async () => {
+  const result = await draftWithinBudget({ wishes: issues.slice(0, 2),
+    draft: async wish => { if (wish.identifier === 'ELA-0') throw new Error('llm down'); } });
+  expect(result.carried.map(item => [item.wish.identifier, item.reason])).toEqual([['ELA-0', 'error']]);
+  expect(result.invalid).toEqual([]);
+  expect(result.drafted.map(issue => issue.identifier)).toEqual(['ELA-1']);
 });

@@ -1,0 +1,105 @@
+# 멈춤 갈래 사다리(STOP-AUTOHEAL)를 «선언»으로 — 0.2.24 GRAPH-HEAL-NODES 첫 조각.
+#
+# 한 문서(`---` 로 나눈다) = 멈춤 갈래 하나 = 처방 노드 하나. 조건은 실행기가 이미 주는 `stop_class` 다.
+#   stop_class == env-unrelated      → clean-workspace-regate
+#   stop_class == main-sync          → rebase-regate
+#   stop_class == pod-died           → resume-from-salvage
+#   stop_class == evidence-uncovered → derive-evidence-rejudge
+# ⛔ 이 넷 밖의 갈래(review-repeat · review-out-of-scope · fabric · launch-failed · unclassified)는 선언이 «없다» —
+#   처방은 `needs-owner` 이고 그것은 코드 기본(`AUTOHEAL_ACTION_BY_CLASS`)이 말한다.
+#
+# 🔑 노드 id 가 곧 처방 이름이다. `src/self-implement/stop-autoheal.ts` 는 그 갈래에 얹힌 오버레이가 «더한 노드 id» 로
+#   처방을 고르고, 선언이 없거나 못 읽으면 코드 표로 간다(원장·관측의 `source` = graph | code-default).
+#   ⇒ 이 파일과 코드 표가 «같은 답»을 내는지는 시험이 문다(stop-autoheal.test.ts).
+# ⚠️ 이 조각은 표를 선언으로 «옮기기만» 한다 — 노드의 recipe 는 주입 seam 이름(`stopAutohealActions`)이다.
+#   새 처방 노드(예: strategy-switch)는 다음 조각이다.
+#
+# 🚨 경로·값은 «파싱된 스펙» 키(camelCase)다 — `nodeId`·`maxVisits`.
+# ⛔ stage 는 `heal` 이다 — `runtime` 이면 실행기가 라운드마다 원장의 stop 줄로 `stop_class` 를 채워 이 노드들을
+#   «실행 그래프»에 얹는다(버전 해시·원장 값이 바뀐다). `heal` 은 `stop-autoheal.ts` 만 고른다.
+# 📌 한 번만 시도한다(원장 가드와 같은 규율) — 그래서 maxVisits 1 이다.
+# 📌 들어오는 간선 = `heal` 이 stop_class 로 가른다 · 나가는 간선 = 처방 결과(healed → 재발사 · needs-owner → 종결).
+---
+overlay_id: stop-heal-ladder-env-unrelated
+target: self-implement
+stage: heal
+applies_when: stop_class == env-unrelated
+patch:
+  - op: add
+    path: /nodes/-
+    value:
+      nodeId: clean-workspace-regate
+      kind: gate
+      recipe: stop-autoheal:clean-workspace-regate
+      maxVisits: 1
+      journeyStage: recover
+      contract: { inputs: [worktree], tools: read-and-run-tests, outputs: [passed, gate-log] }
+  - op: add
+    path: /edges/-
+    value: { from: heal, on: stop_class, map: { env-unrelated: clean-workspace-regate } }
+  - op: add
+    path: /edges/-
+    value: { from: clean-workspace-regate, on: outcome, map: { healed: dispatch, needs-owner: stopped } }
+---
+overlay_id: stop-heal-ladder-main-sync
+target: self-implement
+stage: heal
+applies_when: stop_class == main-sync
+patch:
+  - op: add
+    path: /nodes/-
+    value:
+      nodeId: rebase-regate
+      kind: git
+      recipe: stop-autoheal:rebase-regate
+      maxVisits: 1
+      journeyStage: recover
+      contract: { inputs: [worktree, base-branch], tools: git-write, outputs: [synced, passed] }
+  - op: add
+    path: /edges/-
+    value: { from: heal, on: stop_class, map: { main-sync: rebase-regate } }
+  - op: add
+    path: /edges/-
+    value: { from: rebase-regate, on: outcome, map: { healed: dispatch, needs-owner: stopped } }
+---
+overlay_id: stop-heal-ladder-pod-died
+target: self-implement
+stage: heal
+applies_when: stop_class == pod-died
+patch:
+  - op: add
+    path: /nodes/-
+    value:
+      nodeId: resume-from-salvage
+      kind: git
+      recipe: stop-autoheal:resume-from-salvage
+      maxVisits: 1
+      journeyStage: recover
+      contract: { inputs: [salvage_ref], tools: git-write, outputs: [resumed] }
+  - op: add
+    path: /edges/-
+    value: { from: heal, on: stop_class, map: { pod-died: resume-from-salvage } }
+  - op: add
+    path: /edges/-
+    value: { from: resume-from-salvage, on: outcome, map: { healed: dispatch, needs-owner: stopped } }
+---
+overlay_id: stop-heal-ladder-evidence-uncovered
+target: self-implement
+stage: heal
+applies_when: stop_class == evidence-uncovered
+patch:
+  - op: add
+    path: /nodes/-
+    value:
+      nodeId: derive-evidence-rejudge
+      kind: judge
+      recipe: stop-autoheal:derive-evidence-rejudge
+      maxVisits: 1
+      journeyStage: recover
+      contract: { inputs: [diff, review-summary], tools: read-only, outputs: [verdict] }
+  - op: add
+    path: /edges/-
+    value: { from: heal, on: stop_class, map: { evidence-uncovered: derive-evidence-rejudge } }
+  - op: add
+    path: /edges/-
+    value: { from: derive-evidence-rejudge, on: outcome, map: { healed: dispatch, needs-owner: stopped } }

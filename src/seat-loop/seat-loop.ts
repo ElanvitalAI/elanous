@@ -7,6 +7,8 @@ import { promisify } from 'node:util';
 import { TRACK_AGENT_FORBIDDEN_ACTION_REGEX, universeLaunch } from '../autopilot/track-agent.js';
 import { debug } from '../debug/log.js';
 import { openSurfaceEventsDb, recordEvent, surfaceEventsDbPath } from '../domains/surface-events.js';
+import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { installedCliArgv, resolveHqLaunchSeat } from '../hq/seats.js';
 import { judgeNeighbor } from '../loops/neighbors.js';
 import { checkLoopNeighbors, emitLoopHeartbeat, SEAT_NEIGHBORS } from '../loops/neighbor-runtime.js';
 import { addHarnessQueue, harnessQueueIdForKey, harnessQueueOutcome, listHarnessQueue } from '../harness/harness-queue.js';
@@ -72,6 +74,8 @@ export type SeatDeps = {
   now?: () => Date;
   read?: (path: string) => string;
   run?: (args: string[]) => Promise<string>;
+  /** Seat-folder resolver for every process this loop starts; production reads the registry-validated `seats/<role>` view, tests inject an isolated folder. */
+  launchSeat?: (seat: string) => string;
   enqueue?: (seat: string, text: string, root: string, idempotencyKey: string, item: SeatItem) => Promise<{ id: string }>;
   queueOutcome?: (id: string, root: string) => ReturnType<typeof harnessQueueOutcome>;
   queueItems?: (root: string) => ReturnType<typeof listHarnessQueue>;
@@ -118,10 +122,27 @@ const defaultRead = (path: string): string => {
   try { return readFileSync(path, 'utf8'); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return ''; throw error; }
 };
-const defaultRun = async (args: string[]): Promise<string> => {
-  const { argv, env } = universeLaunch(args);
-  const { stdout } = await exec('bun', argv, {
-    cwd: repoRoot, env, encoding: 'utf8',
+/** The seat's own registry-validated folder (`seats/<role>`, kept fresh by `hq seat --refresh`) — never this module's source tree. */
+export function seatLoopLaunchSeat(seat: string): string {
+  return resolveHqLaunchSeat(seat, getElanousConfigDir());
+}
+/** One seat launch boundary: installed-CLI argv (absolute runtime + absolute entry) with `seats/<role>` as cwd. */
+export function seatLoopLaunchCommand(seat: string, args: readonly string[],
+  launchSeat: (role: string) => string = seatLoopLaunchSeat): { argv: string[]; cwd: string; env: NodeJS.ProcessEnv } {
+  let cwd: string;
+  try { cwd = launchSeat(seat); }
+  catch (error) {
+    // A missing seat folder is a stopped launch, never a fall back to the tree this code was loaded from.
+    observe('launch-seat-unavailable', { seat, error: String(error).slice(0, 200) });
+    throw new Error(`seat ${seat} has no registry-validated seats/${seat} folder; refusing to launch from the source tree: ${String(error)}`);
+  }
+  const { argv, env } = universeLaunch([...args]);
+  return { argv: installedCliArgv(argv.slice(1)), cwd, env };
+}
+const defaultRun = async (args: string[], seat: string, launchSeat?: (role: string) => string): Promise<string> => {
+  const { argv, cwd, env } = seatLoopLaunchCommand(seat, args, launchSeat ?? seatLoopLaunchSeat);
+  const { stdout } = await exec(argv[0]!, argv.slice(1), {
+    cwd, env, encoding: 'utf8',
     timeout: args[0] === 'harness' && args[1] === 'say' ? 3_600_000 : 120_000, maxBuffer: 4 * 1024 * 1024,
   });
   return stdout;
@@ -1203,6 +1224,8 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
     return { seat, status: 'skipped-off',
       ...(config.mode === 'live-safe' ? { modeDowngradeReason: '자리 목록에 없음 (loops.seat.seats)' } : {}) };
   }
+  // Every process this turn starts runs through the installed CLI in the seat's own folder (`seats/<role>`, always fresh).
+  const run = deps.run ?? ((args: string[]): Promise<string> => defaultRun(args, seat, deps.launchSeat));
   const now = (deps.now ?? (() => new Date()))();
   const path = seatLedgerPath(seat, deps.root ?? effectiveInstanceRoot(), now);
   const directory = dirname(path);
@@ -1276,7 +1299,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
             current: `기한 ${waited}분 경과 · 칸 상태 ${cell?.status ?? '질문 미해결'}`, question, answer: '재측상 미해결이므로 보류를 권고한다',
             options, recommendation, confidence: '중간 — 기한 경과와 미해결을 재측함', ifUntouched: '질문/칸은 미해결로 남는다',
             evidence: `${proposal.item!.evidence ?? '원천 근거 미기재'} · ${note} · ${decisionRef(seat, proposal.item!)}` });
-          await (deps.run ?? defaultRun)(['decisions', 'raise', '--title', `${seat}: ${question}`, '--category', 'other',
+          await run(['decisions', 'raise', '--title', `${seat}: ${question}`, '--category', 'other',
             '--s', material.scqa.s, '--c', material.scqa.c, '--q', material.scqa.q, '--a', material.scqa.a,
             '--pending-question', material.pendingQuestion,
             '--option', 'a=승인:사람 판단으로 진행', '--option', 'b=보류:진행하지 않음',
@@ -1313,7 +1336,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
           const inputs = receivedInputs!;
           const evidence = judgmentEvidence;
           if (!evidence) throw new Error('cross-check judgment requires receiving-seat evidence');
-          const output = JSON.parse((await (deps.run ?? defaultRun)(['agent', '--json', '--no-tools',
+          const output = JSON.parse((await run(['agent', '--json', '--no-tools',
             `[${receiver} 자리 · 역할 docs/roles/${receiver}.md] ${from} 자리의 결정 초안을 교차 확인한다. 아래 실제 근거만 사용하고 모르는 사실은 지어내지 마라. JSON 하나만 반환: {"agree":boolean,"note":"근거를 포함한 메모","resolves":boolean}. 이웃 자리에서 직접 해결할 수 있을 때만 resolves=true. 초안: ${draft}\n역할: ${inputs.role}\n${receiver} 체크리스트 근거:\n${evidence || '(없음)'}`])).trim()) as { reply?: unknown };
           const value: unknown = typeof output.reply === 'string' ? JSON.parse(output.reply) : output;
           return value as CrossCheckJudgment;
@@ -1472,7 +1495,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
     const inquiry = item.source === 'seat-question' ? null : revisedProposal && item.source === 'checklist'
       ? ledger.find((row) => row.status === 'awaiting-resolution' && row.item && itemKey(row.item) === itemKey(item))?.inquiry ?? null
       : unfinished?.inquiry ?? await (deps.inquire ?? (async (asking: SeatId, work: SeatItem) => { try {
-      const output = JSON.parse((await (deps.run ?? defaultRun)(['agent', '--json', '--no-tools',
+      const output = JSON.parse((await run(['agent', '--json', '--no-tools',
         `[${asking} 자리 · 역할 docs/roles/${asking}.md] 이 항목을 판단할 근거가 부족한 경우에만 다른 자리 또는 사람에게 질문한다. 근거가 충분하면 null. JSON 객체 하나만 반환: null 또는 {"to":"OP|TC|MK|UX|CEO","question":"필요한 근거를 묻는 질문"}. 항목: ${work.id} ${work.title}\n내용: ${work.text}\n역할: ${(deps.read ?? defaultRead)(join(deps.repo ?? repoRoot, 'docs', 'roles', `${asking}.md`)).slice(0, 4_000)}`])).trim()) as { reply?: unknown };
       const value: unknown = typeof output?.reply === 'string' ? JSON.parse(output.reply) : output;
       if (value === null) return null;
@@ -1491,7 +1514,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
       ? unfinished?.answer ? { answer: unfinished.answer } : unfinished?.inquiry ? unfinished.inquiry : await (deps.reply ?? (async (receiver: SeatId, question: string, from: SeatId) => {
       const evidence = inputs.checklist.map((candidate) =>
         `${candidate.id} · ${candidate.title} (판 ${candidate.version}, ${candidate.kind})${candidate.evidence?.trim() ? ` · 근거: ${candidate.evidence.trim()}` : ''}`).join('\n').slice(0, 8_000);
-      const output = JSON.parse((await (deps.run ?? defaultRun)(['agent', '--json', '--no-tools',
+      const output = JSON.parse((await run(['agent', '--json', '--no-tools',
         `[${receiver} 자리 · 역할 docs/roles/${receiver}.md] ${from} 자리의 질문에 근거를 갖고 답하라. 아래 ${receiver} 자리의 실제 체크리스트 근거에 없는 사실은 지어내지 마라. 모르면 사람 결정이 필요한 질문을 작성하라. JSON 하나만 반환: {"answer":"근거를 포함한 답"} 또는 {"to":"CEO","question":"결정할 질문"}. 질문: ${question}\n역할: ${inputs.role}\n${receiver} 체크리스트 근거:\n${evidence || '(없음)'}`])).trim()) as { reply?: unknown };
       const value: unknown = typeof output.reply === 'string' ? JSON.parse(output.reply) : output;
       if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid seat reply');
@@ -1592,7 +1615,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
                     question: ask.question, answer: '해소 근거 확인 전까지 보류를 권고한다', options, recommendation,
                     confidence: answer ? '중간 — 이웃 응답을 확인함' : '낮음 — 기한 내 이웃 응답 없음',
                     ifUntouched: '사람 판단 전 집행하지 않는다', evidence: `${item.evidence ?? '원천 근거 미기재'} · ${decisionRef(seat, item)}` });
-                  await (deps.run ?? defaultRun)(['decisions', 'raise', '--title', `${seat}: ${ask.question}`, '--category', 'other',
+                  await run(['decisions', 'raise', '--title', `${seat}: ${ask.question}`, '--category', 'other',
                     '--s', material.scqa.s, '--c', material.scqa.c, '--q', material.scqa.q, '--a', material.scqa.a,
                     '--pending-question', material.pendingQuestion,
                     '--option', 'a=승인:사람 판단으로 진행', '--option', 'b=보류:진행하지 않음',
@@ -1656,7 +1679,6 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
       return entry;
     }
   }
-  const run = deps.run ?? defaultRun;
   let outcome: string | undefined;
   try { outcome = (JSON.parse(await run(['harness', 'budget', '--json'])) as { outcome?: string }).outcome; }
   catch { /* failed budget observation is never permission to launch */ }

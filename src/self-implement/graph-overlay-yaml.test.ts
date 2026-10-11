@@ -54,6 +54,22 @@ patch:
     }]);
   });
 
+  test('`---` 로 나눈 문서는 문서마다 오버레이 하나로 읽고 오류 경로에 문서 번호가 붙는다', () => {
+    const doc = (id: string, extra = 'applies_when: attempts >= 1') => `overlay_id: ${id}\ntarget: self-implement\nstage: runtime\n${extra}\npatch:\n  - { op: replace, path: /version, value: 2 }\n`;
+    const ok = parseGraphOverlayYaml(`# 머리말\n---\n${doc('a')}---\n${doc('b')}`, 'multi.yaml');
+    expect(ok.errors).toEqual([]);
+    expect(ok.overlays.map((o) => o.overlayId)).toEqual(['a', 'b']);
+    expect(ok.overlay?.overlayId).toBe('a');
+
+    const bad = parseGraphOverlayYaml(`---\n${doc('a')}---\n${doc('b', '')}`, 'multi.yaml');
+    expect(bad.overlays).toEqual([]);
+    expect(bad.overlay).toBeUndefined();
+    expect(bad.errors).toEqual([{ path: 'multi.yaml#1/applies_when', message: 'applies_when 이 없거나 문자열이 아니다' }]);
+
+    const dup = parseGraphOverlayYaml(`---\n${doc('a')}---\n${doc('a')}`, 'multi.yaml');
+    expect(dup.errors.map((e) => e.message)).toEqual(["overlay_id 'a' 가 한 파일에서 중복이다"]);
+  });
+
   test('실물 graphs/overlays/ 를 오류 0 으로 읽는다', () => {
     const result = loadGraphOverlays(join(ROOT, 'graphs/overlays'));
     expect({ errors: result.errors, scanned: result.scannedFiles > 0 }).toEqual({ errors: [], scanned: true });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { debug, type DebugEvent } from './log.js';
-import { LOG_DIET_KEYS, LOG_DIET_WINDOW_MS, LogDietGuard } from './log-diet.js';
+import { LOG_DIET_KEYS, LOG_DIET_SUMMARY_MIN_INTERVAL_MS, LOG_DIET_WINDOW_MS, LogDietGuard } from './log-diet.js';
 
 const record = (category: string, event: string, data: unknown, extras: Partial<DebugEvent> = {}) =>
   ({ category, event, data, ...extras });
@@ -68,8 +68,10 @@ describe('LogDietGuard', () => {
     const error = record('tox.loop', 'tick', { active: 1 }, { level: 'error' });
     expect(Array.from({ length: 3 }, () => guard.admit(error).pass)).toEqual([true, true, true]);
     for (const level of ['warn', 'critical'] as const) {
-      expect(guard.admit(record('tox.loop', 'tick', { active: 1 }, { level })).pass).toBe(true);
-      expect(guard.admit(record('tox.loop', 'tick', { active: 1 }, { level })).pass).toBe(true);
+      const registered = record('tox.loop', 'tick', { active: 1 }, { level });
+      expect([guard.admit(registered).pass, guard.admit(registered).pass]).toEqual([true, level === 'critical']);
+      const outside = record('test.diet', 'outside', { active: 1 }, { level });
+      expect([guard.admit(outside).pass, guard.admit(outside).pass]).toEqual([true, true]);
     }
     const first = record('tox.loop', 'tick', { active: 1, runId: 'run-1' });
     const second = record('tox.loop', 'tick', { active: 1, runId: 'run-2' });
@@ -102,15 +104,19 @@ describe('LogDietGuard', () => {
     expect(guard.admit(rec).pass).toBe(false);
   });
 
-  it('only the six policy keys are eligible, with log.diet always bypassing', () => {
+  it('only the nine policy keys are eligible, with log.diet always bypassing', () => {
     const guard = new LogDietGuard({ now: () => 0 });
-    expect(Object.keys(LOG_DIET_KEYS)).toHaveLength(6);
-    for (const key of ['harness.queue/attributed', 'seat.loop/queue-retryable', 'pod-lease/admit-by-usage', 'pty.manifest/output-bytes-flushed']) {
+    expect(Object.keys(LOG_DIET_KEYS)).toHaveLength(9);
+    for (const key of ['harness.queue/attributed', 'seat.loop/queue-retryable', 'pod-lease/admit-by-usage']) {
       const [category, event] = key.split('/');
       expect([guard.admit(record(category, event, {})).pass, guard.admit(record(category, event, {})).pass]).toEqual([true, true]);
     }
+    for (const key of ['pty.manifest/output-bytes-flushed', 'llm.credential/provider-key-missing', 'llm.credential/provider-key-resolved']) {
+      const [category, event] = key.split('/');
+      expect([guard.admit(record(category, event, {})).pass, guard.admit(record(category, event, {})).pass]).toEqual([true, false]);
+    }
     expect([guard.admit(record('log.diet', 'suppressed', {})).pass, guard.admit(record('log.diet', 'suppressed', {})).pass]).toEqual([true, true]);
-    expect(guard.drain()).toEqual([]);
+    expect(guard.drain().map(summary => summary.count)).toEqual([1, 1, 1]);
   });
 
   it('off bypasses five identical records and accumulates no summaries', () => {
@@ -148,9 +154,60 @@ describe('LogDietGuard', () => {
     expect(guard.drain()).toEqual([]);
     expect(guard.admit(rec).pass).toBe(true);
   });
+
+  it('conserves ten suppressed records in one released count under the summary cadence', () => {
+    let time = 0;
+    const guard = new LogDietGuard({ now: () => time });
+    expect(guard.flushPending()).toEqual([]); // release baseline at t=0
+    const rec = record('pty.manifest', 'output-bytes-flushed', { registry: 'pty' });
+    expect(guard.admit(rec).pass).toBe(true);
+    for (let i = 1; i <= 10; i++) {
+      time = i * 100;
+      expect(guard.admit(rec).pass).toBe(false);
+    }
+    expect(guard.flushPending()).toEqual([]); // cadence not reached — counts stay pending
+    expect(guard.flushPending()).toEqual([]);
+    time = LOG_DIET_SUMMARY_MIN_INTERVAL_MS;
+    expect(guard.flushPending()).toEqual([{
+      category: 'pty.manifest', event: 'output-bytes-flushed', count: 10,
+      windowMs: LOG_DIET_WINDOW_MS,
+      firstSuppressedAt: new Date(100).toISOString(),
+      lastSuppressedAt: new Date(1_000).toISOString(),
+    }]);
+    expect(guard.flushPending()).toEqual([]); // the same count is never released twice
+  });
+
+  it('releases pending summaries early once stream pressure reaches the cap', () => {
+    let time = 0;
+    const guard = new LogDietGuard({ now: () => time, summaryMaxPending: 2 });
+    expect(guard.flushPending()).toEqual([]);
+    for (const key of ['llm.credential/provider-key-resolved', 'pty.manifest/output-bytes-flushed', 'llm.credential/provider-key-missing']) {
+      const [category, event] = key.split('/');
+      const rec = record(category, event, { key });
+      expect(guard.admit(rec).pass).toBe(true);
+      time += 10;
+      expect(guard.admit(rec).pass).toBe(false);
+    }
+    expect(time).toBeLessThan(LOG_DIET_SUMMARY_MIN_INTERVAL_MS);
+    expect(guard.flushPending().map(summary => summary.count)).toEqual([1, 1, 1]);
+  });
 });
 
 describe('DebugLog sink wiring', () => {
+  it('an interval-held summary is still released by the exit drain (no count lost at shutdown)', () => {
+    const guard = new LogDietGuard({ now: () => 0 });
+    expect(guard.flushPending()).toEqual([]); // opens the summary interval at t=0
+    captureSink(events => {
+      for (let i = 0; i < 5; i++) debug.log('input.cursor.claim', 'chat-main', { owner: 'exit-drain' });
+      const summaries = () => events.filter(e => e.category === 'log.diet' && e.event === 'suppressed');
+      debug.flush();
+      expect(summaries()).toHaveLength(0); // held back by the interval
+      expect(process.listenerCount('exit')).toBeGreaterThan(0);
+      debug.drainLogDietPending();
+      expect(summaries()).toMatchObject([{ data: { count: 4, category: 'input.cursor.claim', event: 'chat-main' } }]);
+    }, guard);
+  });
+
   it('sends one original and one count-four summary to sinks on flush', () => {
     captureSink(events => {
       for (let i = 0; i < 5; i++) debug.log('input.cursor.claim', 'chat-main', { owner: 'chat' });
@@ -161,29 +218,33 @@ describe('DebugLog sink wiring', () => {
     });
   });
 
-  it('keeps the same-value minute window across flushes while emitting each pending count once', () => {
+  it('holds summary rows to the flush cadence while keeping the same-value minute window', () => {
     let time = 0;
     captureSink(events => {
       const log = () => debug.log('input.cursor.claim', 'chat-main', { owner: 'chat' });
+      const originals = () => events.filter(e => e.category === 'input.cursor.claim' && e.event === 'chat-main');
+      const suppressed = () => events.filter(e => e.category === 'log.diet' && e.event === 'suppressed');
       log();
-      debug.flush();
+      debug.flush(); // release baseline at t=0
       time = 1_000;
       log();
-      expect(events.filter(e => e.category === 'input.cursor.claim' && e.event === 'chat-main')).toHaveLength(1);
+      expect(originals()).toHaveLength(1);
       debug.flush();
-      expect(events.filter(e => e.category === 'log.diet' && e.event === 'suppressed'))
-        .toMatchObject([{ data: { count: 1 } }]);
-      debug.flush();
-      expect(events.filter(e => e.category === 'log.diet' && e.event === 'suppressed')).toHaveLength(1);
+      expect(suppressed()).toHaveLength(0); // cadence not reached — no summary row yet
       time = 2_000;
       log();
       debug.flush();
-      expect(events.filter(e => e.category === 'input.cursor.claim' && e.event === 'chat-main')).toHaveLength(1);
-      expect(events.filter(e => e.category === 'log.diet' && e.event === 'suppressed'))
-        .toMatchObject([{ data: { count: 1 } }, { data: { count: 1 } }]);
+      expect(originals()).toHaveLength(1);
+      expect(suppressed()).toHaveLength(0);
+      time = LOG_DIET_SUMMARY_MIN_INTERVAL_MS;
+      debug.flush();
+      expect(suppressed())
+        .toMatchObject([{ data: { count: 2, category: 'input.cursor.claim', event: 'chat-main' } }]);
+      debug.flush();
+      expect(suppressed()).toHaveLength(1); // one row carries both folded records, emitted once
       time = 61_000;
       log();
-      expect(events.filter(e => e.category === 'input.cursor.claim' && e.event === 'chat-main')).toHaveLength(2);
+      expect(originals()).toHaveLength(2);
     }, new LogDietGuard({ now: () => time }));
   });
 

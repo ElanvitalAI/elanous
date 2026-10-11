@@ -13,7 +13,7 @@ function deps(over: Partial<ErrorReportDeps> & { calls?: Array<{ url: string; bo
   let t = 1_000_000;
   return {
     configDir: () => over.configDir?.() ?? dir(),
-    settings: () => ({ enabled: true, identity: false }),
+    settings: () => ({ enabled: true, identity: false, consented: true }),
     nexusMeta: async () => ({ alive: true, version: '0.2.8', instance: hash12('/x') }),
     enabledByEnvironment: () => true,
     now: () => (t += 1),
@@ -77,6 +77,30 @@ test('off switch, tests and the test universe never reach the network', async ()
   expect(calls).toHaveLength(0);
 });
 
+test('before first-run notice new and previously queued reports never reach hooks; after notice the queued report can retry', async () => {
+  const d = dir();
+  const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+  let shown = false;
+  let now = 1_000_000;
+  const ds = deps({ calls, configDir: () => d, now: () => now,
+    settings: () => ({ enabled: true, identity: false, consented: shown }),
+    nexusMeta: async () => { throw Error('no network metadata before notice'); },
+  });
+  expect(await reportError({ code: 'pre-notice', message: 'offline', surface: 'cli' }, ds))
+    .toEqual({ sent: false, reason: 'awaiting-notice' });
+  const pending = join(d, 'error-reports', 'pending.json');
+  expect(existsSync(pending)).toBe(true);
+  expect(JSON.parse(readFileSync(pending, 'utf8')).report.code).toBe('pre-notice');
+  now += 24 * 60 * 60_000 + 1;
+  expect(await retryPendingErrorReport(ds)).toEqual({ sent: false, reason: 'awaiting-notice' });
+  expect(calls).toHaveLength(0);
+  shown = true;
+  expect(await retryPendingErrorReport(ds)).toEqual({ sent: true, reportId: 'er_TEST' });
+  expect(calls).toHaveLength(1);
+  expect(calls[0]!.url).toBe(ERROR_REPORT_URL);
+  expect(existsSync(pending)).toBe(false);
+});
+
 test('a failed send keeps exactly one copy and retries it at most once a day, then clears it', async () => {
   const d = dir();
   let now = 5_000_000;
@@ -94,4 +118,22 @@ test('a failed send keeps exactly one copy and retries it at most once a day, th
   now += 24 * 60 * 60_000 + 1;
   expect(await retryPendingErrorReport(ds)).toEqual({ sent: true, reportId: 'er_LATER' });
   expect(existsSync(pending)).toBe(false);
+});
+
+test('first-run notice line names identity fields only when identity reporting is on', async () => {
+  const { errorReportNoticeLine } = await import('./report.js');
+  expect(errorReportNoticeLine(undefined)).toContain('익명 진단을');
+  expect(errorReportNoticeLine({ identity: false, email: 'a@b.c' })).toContain('익명 진단을');
+  expect(errorReportNoticeLine({ identity: true, email: 'a@b.c' })).toContain('설정된 신원(이메일)을');
+  expect(errorReportNoticeLine({ identity: true, email: 'a@b.c', telegramUser: 'u' })).toContain('설정된 신원(이메일·텔레그램 사용자)을');
+  // identity on but no field set: the report carries none, so the notice says anonymous.
+  expect(errorReportNoticeLine({ identity: true })).toContain('익명 진단을');
+  for (const settings of [{ identity: true }, { identity: true, email: 'a@b.c' }, { identity: false, email: 'a@b.c', telegramUser: 'u' }, { identity: true, email: 'a@b.c', telegramUser: 'u' }]) {
+    const report = buildErrorReport({ code: 'c', message: 'm', surface: 'cli' }, { installId: 'i', settings: { enabled: true, ...settings }, nexus: { alive: false }, at: new Date(0).toISOString() }) as unknown as Record<string, unknown>;
+    const line = errorReportNoticeLine(settings);
+    const sentFields = ['email', 'telegramUser'].filter((field) => JSON.stringify(report).includes(`"${field}"`));
+    expect(line.includes('익명 진단을')).toBe(sentFields.length === 0);
+    if ('email' in settings) expect(line.includes('이메일')).toBe(sentFields.includes('email'));
+    if ('telegramUser' in settings) expect(line.includes('텔레그램 사용자')).toBe(sentFields.includes('telegramUser'));
+  }
 });

@@ -1233,6 +1233,21 @@ function countAddressableLines(contents: string): number {
 }
 
 const TRACED_PATH_LIST_ITEM = /^\s*(?:[-*+]|\d+[.)])\s+(.+)$/;
+const TRACED_PATH_LEADING_LIST_MARKERS = /^(?:\s*(?:[-*+]|\d+[.)])\s+)+/;
+const TRACED_PATH_EVIDENCE_TAG = /^\[(?:code|skill|memory|doc|pty|unknown)\]\s+/;
+// 2026-10-11 — 저작기가 «목록 기호 두 겹»(`- - src/x.ts` · `- 1. src/x.ts` · `- [code] - src/x.ts`)을 쓰면
+//   한 겹만 벗긴 남은 «- src/…» 를 경로로 읽어 `traced path does not exist: - src/…` ERROR 를 냈다
+//   (Pod 저작에서 자식이 결과 줄 없이 죽음 · 오늘 no-result-line 18건의 공용 원인). 기호·태그를 반복해서 벗긴다.
+function tracedPathListItem(line: string): string | undefined {
+  const item = TRACED_PATH_LIST_ITEM.exec(line)?.[1];
+  if (item === undefined) return undefined;
+  let evidence = item;
+  for (;;) {
+    const next = evidence.replace(TRACED_PATH_LEADING_LIST_MARKERS, '').replace(TRACED_PATH_EVIDENCE_TAG, '');
+    if (next === evidence) return evidence;
+    evidence = next;
+  }
+}
 // ⛔⭐⭐⭐ 2026-08-11 — 이 문면은 «통하지 않는 처방»을 첫 번째로 권하고 있었다.
 //   옛 문면: *"Re-authoring the same input may produce different evidence; **retry before changing the ask**."*
 //   📏 실측(두 트랙 합산): 그 말대로 «재저작»만 반복했더니 ***0/4***. ask 에 «식별자 앵커»를 넣자 ***2/2***.
@@ -1355,9 +1370,8 @@ export function tracedPathReferences(document: string): TracedPathReference[] {
   if (!section) return [];
   const references: TracedPathReference[] = [];
   for (const line of section.split(/\r?\n/)) {
-    const item = TRACED_PATH_LIST_ITEM.exec(line)?.[1];
-    if (!item) continue;
-    const evidence = item.replace(/^\[(?:code|skill|memory|doc|pty|unknown)\]\s+/, '');
+    const evidence = tracedPathListItem(line);
+    if (!evidence) continue;
     if (isTracedPathsEvidenceUnavailable(evidence) || isTracedPathExclusionDescription(evidence)) continue;
     // 설명 구분자는 **공백으로 둘러싼** em dash 또는 hyphen 뿐이다 — 파일명 안의 dash 를 설명 구분자로 오인하지 않는다.
     // 경로 칸 안의 복수 경로는 **공백으로 둘러싼** 가운뎃점만 본다 — 파일명 안의 `·` 를 가르지 않는다.
@@ -1367,10 +1381,12 @@ export function tracedPathReferences(document: string): TracedPathReference[] {
     for (const fragment of pathField.split(' · ')) {
       const trimmed = fragment.trim();
       if (!trimmed) continue;
-      const unwrapped = stripInlineCode(trimmed);
+      // 10-11 재발 — 저작기가 «`- src/…`» 처럼 목록 기호를 백틱 «안»에 쓰면 바깥 기호만 벗긴 뒤 백틱을 벗겨
+      //   «- src/…» 가 경로로 남았다(AUTHOR-DECOMPOSE-KNOB · MODEL-BENCH-SCORES 부검). 백틱을 벗긴 뒤 한 번 더 벗긴다.
+      const unwrapped = stripInlineCode(trimmed).replace(TRACED_PATH_LEADING_LIST_MARKERS, '');
       const match = TRACED_PATH_LINE.exec(unwrapped);
       // 두 번 벗긴다 — 줄번호가 백틱 **안**(`p:42`)일 수도 **밖**(`p`:42)일 수도 있다.
-      const path = match ? stripInlineCode(match[1].trim()) : undefined;
+      const path = match ? stripInlineCode(match[1].trim()).replace(TRACED_PATH_LEADING_LIST_MARKERS, '') : undefined;
       if (!path) continue;
       references.push({ path, line: match?.[2] ? Number(match[2]) : null, endLine: match?.[3] ? Number(match[3]) : null });
     }
@@ -1461,9 +1477,8 @@ export function lintGoalFile(document: string, branch: string, deps: GoalFileLin
   const { prohibitionSymbolStartingLineCount, permissionSymbolStartingLineCount, mixedSymbolLineCount } = symbolStartingLineCounts(document);
   const { exhaustiveRequestWordingCount, blanketBehaviorPreservationCount, namedPreservationTargetCount, removalFormDecisionConditionCount } = goalAuthorKnownShapeCounts(ask);
   const tracedPathExclusionCount = (markdownSection(document, 'TRACED PATHS')?.split(/\r?\n/) ?? [])
-    .map((line) => TRACED_PATH_LIST_ITEM.exec(line)?.[1])
-    .filter((item): item is string => item !== undefined
-      && isTracedPathExclusionDescription(item.replace(/^\[(?:code|skill|memory|doc|pty|unknown)\]\s+/, ''))).length;
+    .map((line) => tracedPathListItem(line))
+    .filter((item): item is string => item !== undefined && isTracedPathExclusionDescription(item)).length;
   const selfQuestionSubjectViolations = detectSelfQuestionSubjectViolations(document);
   const launchDeclarationClassification = artifactLaunchDeclarationClassification(document);
   const headings = canonicalBlocks(document);
@@ -1694,7 +1709,7 @@ export function lintGoalFile(document: string, branch: string, deps: GoalFileLin
     });
   }
   const unavailableTracedPathEvidence = markdownSection(document, 'TRACED PATHS')?.split(/\r?\n/)
-    .map((line) => TRACED_PATH_LIST_ITEM.exec(line)?.[1])
+    .map((line) => tracedPathListItem(line))
     .find((item): item is string => item !== undefined && isTracedPathsEvidenceUnavailable(item));
   if (unavailableTracedPathEvidence) {
     const requiresTracedPaths = goalType === null || goalType === 'implement';

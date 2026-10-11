@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { SupervisorJobResult } from '../self-dev/run-supervisor.js';
-import { LIVE_MOVE_EFFECT_UNKNOWN, LIVE_REVIEW_EFFECT_PENDING, LIVE_REVIEW_EFFECT_REQUESTED, liveMoveEffect, liveMoveHistoryEntry, recordLiveMoveHistory } from './live-move-history.js';
+import { HAND_MOVE_KINDS, LIVE_MOVE_EFFECT_UNKNOWN, LIVE_REVIEW_EFFECT_PENDING, LIVE_REVIEW_EFFECT_REQUESTED, liveMoveEffect, liveMoveHistoryEntry, recordHandMove, recordLiveMoveHistory } from './live-move-history.js';
 import type { TaskAgentLiveMove } from './live-moves.js';
 import { recordTaskAgentShadowMove } from './shadow.js';
 import { nextMoveFor, readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
@@ -186,5 +186,57 @@ describe('TA-LIVE-MOVE-CARD-HISTORY — live-move 마다 카드 history 한 줄'
       { at: '2', event: 'live-move', kind: 'review', executed: false, executorResult: 'shadow', detail: 'judged', effect: 'none — shadow (not executed)' },
     ] };
     expect(nextMoveFor(card).reason).toBe('failed/needs-owner — exit 1');
+  });
+});
+
+describe('HAND-MOVE-LEDGER — 자리가 손으로 마무리한 수 한 줄', () => {
+  test('failed 카드의 다음 수 사유는 hand-move 줄이 뒤에 와도 실패 사유 그대로', () => {
+    const card: TaskCard = { id: 'ta-hm', text: 't', createdAt: '', status: 'failed', history: [
+      { at: '1', event: 'failed', detail: 'failed/needs-owner — exit 1' },
+      { at: '2', event: 'hand-move', kind: 'split', detail: '한 런에 안 끝나 조각만 남겼다' },
+    ] };
+    expect(nextMoveFor(card).reason).toBe('failed/needs-owner — exit 1');
+  });
+
+  test('한 줄(kind·by·detail·pr?) — 기존 history 는 그대로, 덧붙이기만', () => {
+    const f = fixture();
+    const before = f.card().history;
+    const outcome = recordHandMove(f.statePath, 'ta-hist-1',
+      { at: '2026-10-11T09:00:00.000Z', kind: 'trim-scope', by: 'MK', detail: '라이브 시뮬레이션 칸을 판정 뒤로 잘랐다', pr: 13045 });
+    expect(outcome).toEqual({ written: true, entry: {
+      at: '2026-10-11T09:00:00.000Z', event: 'hand-move', kind: 'trim-scope', by: 'MK',
+      detail: '라이브 시뮬레이션 칸을 판정 뒤로 잘랐다', pr: 13045,
+    } });
+    // 원장(디스크) — 기존 줄은 그대로, 한 줄만 더.
+    const after = f.card().history;
+    expect(after.slice(0, before.length)).toEqual(before);
+    expect(after.length).toBe(before.length + 1);
+    expect(after.at(-1)).toEqual({
+      at: '2026-10-11T09:00:00.000Z', event: 'hand-move', kind: 'trim-scope', by: 'MK',
+      detail: '라이브 시뮬레이션 칸을 판정 뒤로 잘랐다', pr: 13045,
+    } as never);
+    // pr 은 선택 — 안 주면 칸이 없다(0 을 지어내지 않는다).
+    const noPr = recordHandMove(f.statePath, 'ta-hist-1',
+      { at: '2026-10-11T09:05:00.000Z', kind: 'second-opinion', by: 'TC', detail: '다른 모델 의견으로 판정선을 다시 봤다' });
+    expect(noPr).toEqual({ written: true, entry: {
+      at: '2026-10-11T09:05:00.000Z', event: 'hand-move', kind: 'second-opinion', by: 'TC',
+      detail: '다른 모델 의견으로 판정선을 다시 봤다',
+    } });
+    expect(f.card().history.length).toBe(before.length + 2);
+  });
+
+  test('모르는 kind 는 거부된다 — 원장 무변경 ⊕ 관측 한 줄 · 아는 어휘는 전부 덧붙는다', () => {
+    const f = fixture();
+    const events: string[] = [];
+    const bad = recordHandMove(f.statePath, 'ta-hist-1', { kind: 'hand-wave', by: 'MK', detail: '없는 수' }, (_c, event) => { events.push(event); });
+    expect(bad).toEqual({ written: false, reason: 'unknown hand-move kind: hand-wave (known: exempt-failure|reapply-diff|trim-scope|split|second-opinion)' });
+    // 쓰기 시도 자체를 하지 않는다 — 원장은 그대로.
+    expect(f.card().history).toEqual([{ at: '2026-10-10T00:00:00.000Z', event: 'run-bound', detail: 'run-x', runId: 'run-x' }]);
+    expect(events).toEqual(['hand-move-history-failed']);
+    // 아는 다섯 종류는 모두 덧붙는다.
+    for (const kind of HAND_MOVE_KINDS) {
+      expect(recordHandMove(f.statePath, 'ta-hist-1', { kind, by: 'OP', detail: 'd' }, () => {}).written).toBe(true);
+    }
+    expect(f.card().history.length).toBe(1 + 5);
   });
 });

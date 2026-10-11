@@ -1,5 +1,5 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { basename, join, relative, resolve } from 'node:path';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Command } from 'commander';
 import {
@@ -57,7 +57,8 @@ import { branchLineageSlug, findSiblingPrs } from './pr-lineage.js';
 import { parseReleaseNoteSection } from '../release-loop/release-note.js';
 import { landingFreezeMessage } from '../release-loop/landing-freeze.js';
 import { admitLandingMerge } from '../self-implement/frozen-merges.js';
-import { verifyOverlapEvidence } from './pr-land-overlap-evidence.js';
+import { verifyAncestorAutoPass, verifyOverlapEvidence } from './pr-land-overlap-evidence.js';
+import { taskAgentStatePath } from '../task-agent/task-hand.js';
 import { enqueueL8ShadowQueue, runL8ShadowQueue, shadowPrNumber, statusL8ShadowQueue, type L8ShadowQueueDeps } from '../self-implement/l8-merge-queue.js';
 
 export { branchLineageSlug, findSiblingPrs };
@@ -107,6 +108,8 @@ export interface PrLandDeps {
   resolveBase?: (run: CmdRunner, cwd: string, explicit?: string) => string | undefined;
   currentBranch?: (cwd: string) => string | undefined;
   readFile?: (path: string) => string;
+  /** 증거 파일 없는 already-ancestor 자동 판정이 리뷰 결과를 찾는 자리(기본 `<TA 상태 디렉터리>/review-results`). */
+  reviewResultsDir?: string;
   listUnfinishedRuns?: () => FederatedUnfinishedRunLedgerQuery | readonly FederatedUnfinishedRunLedgerEntry[];
   queryRunningRuns?: () => RunningRunsResult;
   listOpenPrs?: () => readonly { number: number; headRefName: string }[] | null;
@@ -1038,6 +1041,8 @@ const SOURCE_SPLIT_PR_LIST_LIMIT = 200;
  */
 const MERGED_PR_LOOKUP_RUNAWAY_CAP = 1000;
 const SOURCE_LOOKUP_FAILED_LINE = '⚠ source: 브랜치 조회에 실패해 갈래를 내지 못했습니다.';
+/** BENCH-ISOLATED-ARMS — 벤치 팔 PR 라벨(착지 금지). */
+export const BENCH_LABEL = 'elanous:bench';
 
 type MergedPrHeadRefsLookup = {
   map: Map<number, string>;
@@ -1616,9 +1621,23 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     if (verdict.ok) {
       out.log(verdict.mode === 'already-ancestor'
         ? `✓ overlap-evidence: already-ancestor — 겹친 최근 착지 ${overlappingLandings.length}개가 전부 head ${opts.expectedHead!.slice(0, 12)} 의 조상 · review pass must-fix 0 (${verdict.reviewResult})`
-        : `✓ overlap-evidence: ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} ⊂ head ${opts.expectedHead!.slice(0, 12)} · gate passed on that base · review pass must-fix 0 (${verdict.reviewResult})`);
+        : verdict.mode === 'base-advanced-disjoint'
+          ? `✓ overlap-evidence: base-advanced-disjoint — gate base ${verdict.gateBase.slice(0, 12)} ⊂ head ${opts.expectedHead!.slice(0, 12)} · ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} 까지 ${verdict.windowCommits}개 커밋이 PR 파일을 안 건드린다 · review pass|warn must-fix 0 (${verdict.reviewResult})`
+          : `✓ overlap-evidence: ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} ⊂ head ${opts.expectedHead!.slice(0, 12)} · gate passed on that base · review pass must-fix 0 (${verdict.reviewResult})`);
     }
     else out.error(`✗ overlap-evidence: ${verdict.reason}`);
+  } else if (pinned && overlapDecision?.outcome === 'unavailable') {
+    // 증거 파일이 없을 때 — 겹친 착지가 전부 머리의 조상이고 표준 자리의 리뷰가 pass|warn ⊕ must-fix 0 이면 통과(아니면 종전 거부).
+    const verdict = verifyAncestorAutoPass({
+      pr: Number(opts.pr), expectedHead: opts.expectedHead!, cwd, run, readFile, overlappingLandings,
+      reviewResultsDir: deps.reviewResultsDir ?? join(dirname(taskAgentStatePath()), 'review-results'),
+      listDir: (dir) => readdirSync(dir),
+    });
+    overlapEvidenceAccepted = verdict.ok;
+    if (verdict.ok) {
+      out.log(`✓ overlap-evidence: already-ancestor-auto — 겹친 최근 착지 ${overlappingLandings.length}개가 전부 head ${opts.expectedHead!.slice(0, 12)} 의 조상 · review pass|warn must-fix 0 (${verdict.reviewResult})`);
+    }
+    else out.error(`✗ ancestor-auto: ${verdict.reason}`);
   }
   if (pinned && overlapDecision && overlapDecision.outcome !== 'user-merge' && !overlapEvidenceAccepted) {
     out.error('✗ expected-head: overlap merge approval unavailable for the reviewed head');
@@ -1695,6 +1714,37 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     }
   }
 
+  // LAND-BASE-GUARD-ORDER — 재사용할 PR 의 base·라벨은 upsert «전에» 본다(10-11 #26150: upsert 가 base 를 main 으로
+  //   바꾼 뒤에 읽어 #26117 base-guard 가 무력 · 거부돼도 PR 이 바뀌어 남았다). 거부는 PR 을 건드리지 않는다.
+  // LAND-BASE-MAIN-GUARD — 재사용한 PR 의 base 가 기본 가지가 아니면 병합 «전에» 거부한다(10-11 #26022 가 bench/base-night-* 로 병합됨).
+  //   명시 --base 를 준 경우만 통과한다. 못 읽은 base 는 종전 흐름대로 둔다(병합 뒤 되읽기).
+  // BENCH-ISOLATED-ARMS — `elanous:bench` 라벨 PR 은 벤치 팔 산출이라 착지하지 않는다(승자는 주인이 main 위로 따로 수확).
+  //   명시 --base 로도 통과하지 않는다. 못 읽은 라벨은 base-guard 와 같이 종전 흐름대로 둔다.
+  const refuseReusedPr = (url: string): number | undefined => {
+    const reusedNumber = /\/(\d+)$/.exec(url)?.[1] ?? url;
+    if (!opts.base?.trim()) {
+      const reusedBase = run('gh', ['pr', 'view', url, '--json', 'baseRefName', '--jq', '.baseRefName'], { cwd });
+      const reusedBaseName = reusedBase.ok ? reusedBase.out.trim() : '';
+      if (reusedBaseName && reusedBaseName !== baseBranchName) {
+        record('base-guard', false, { url, prBase: reusedBaseName, expected: baseBranchName });
+        out.error(`✗ base-guard: base=${reusedBaseName} ≠ ${baseBranchName} · gh pr edit ${reusedNumber} --base ${baseBranchName} 뒤 다시`);
+        return 1;
+      }
+    }
+    const reusedLabels = run('gh', ['pr', 'view', url, '--json', 'labels', '--jq', '.labels[].name'], { cwd });
+    if (reusedLabels.ok && reusedLabels.out.split('\n').some((name) => name.trim() === BENCH_LABEL)) {
+      record('bench-guard', false, { url, label: BENCH_LABEL });
+      out.error(`✗ bench-guard: #${reusedNumber} 은 ${BENCH_LABEL} 벤치 팔 PR 이라 착지하지 않는다 · 승자 diff 를 main 위 새 가지로 옮겨 착지`);
+      return 1;
+    }
+    return undefined;
+  };
+  const guardedBeforeUpsert = !hold && !!existing.url;
+  if (guardedBeforeUpsert) {
+    const refused = refuseReusedPr(existing.url!);
+    if (refused !== undefined) return refused;
+  }
+
   // A pinned, already-reviewed commit must not go through upsertPr (git add/commit/force-push/PR edit).
   const upsert = pinned
     ? existing.status === 'ok OUTPUT' && existing.url === pinnedUrl
@@ -1703,7 +1753,8 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     : manager.upsertPr({
     branch,
     worktreePath: cwd,
-    base,
+    // 기존 PR 재사용이면 명시 --base 일 때만 넘긴다 — 추론한 base 는 PR 을 main 으로 재타기팅한다(#26150).
+    ...(opts.base?.trim() || !existing.url ? { base } : {}),
     draft: hold,
     title: title ?? `Land ${branch}`,
     // ⛔⭐ 본문 기본값도 «내용이 있는» 쪽으로 — 종전 34자 플레이스홀더는 ***아무에게도 쓸모가 없었고***
@@ -1739,6 +1790,12 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     record('hold', true, { url: upsert.url, reused: upsert.reused });
     out.log(`✓ hold: ${upsert.url} — 병합하지 않고 쌓아 둡니다. 같은 브랜치에서 다시 pr land --hold 하면 이 PR에 커밋이 더 쌓입니다.`);
     return 0;
+  }
+
+  // 착지 전 PR 을 못 찾았는데(조회 실패) upsert 가 기존 PR 을 재사용했다면 여기서 한 번 더 본다.
+  if (upsert.reused && !guardedBeforeUpsert) {
+    const refused = refuseReusedPr(upsert.url);
+    if (refused !== undefined) return refused;
   }
 
   const prNumber = Number(/\/(\d+)$/.exec(upsert.url)?.[1]);

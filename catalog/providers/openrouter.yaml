@@ -2,6 +2,8 @@
 # ⛔ 모델 YAML 은 «손으로 두지 않는다» — `catalogFromDiscovery: true` 라 발견 스냅숏
 #    (`openrouter` 소스 · /api/v1/models)에서 `openrouter/<vendor>/<model>` 로 접힌다.
 #    근거·결정 = 내부 문서 `RESEARCH-kimi-qwen-glm-and-openrouter-provider-implementation-2026-09-23`
+#  ⚠️ 2026-10-11 예외(CATALOG-DEEPSEEK-FLASH): 창·출력·단가·기본 effort 를 «공급자 엔드포인트»로 실측해 못 박아야 하는
+#    모델만 `catalog/models/openrouter/` 에 손 레코드를 둔다 — YAML 이 폴드를 이긴다(loader.ts foldDiscoveredModels).
 id: openrouter
 displayName: OpenRouter
 aliases: []

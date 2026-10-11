@@ -120,6 +120,8 @@ export function singleRunAsJobResult(feature: string, r: SelfImplementResultWith
     ...(r.abandonedClassification?.classification
       ? { failureClassification: r.abandonedClassification.classification } : {}),
     ...(r.decomposeProposal ? { decomposeProposal: r.decomposeProposal } : {}),
+    ...(r.rework ? { rework: r.rework } : {}),
+    ...(r.review?.reviewed && r.review.mustFix?.length ? { reviewMustFix: r.review.mustFix } : {}),
     ...(r.goalPlanRevision ? { goalPlanRevision: r.goalPlanRevision } : {}),
     ...(r.salvage !== undefined ? { salvage: r.salvage } : {}),
     ...(r.review?.reviewed === true && r.review.verdict === 'pass'
@@ -240,8 +242,10 @@ export async function runSelfImplementCliCommand(
           }
         : undefined;
 
+      const initialJob = singleRunAsJobResult(feature, result);
       await superviseRun({
-        initial: [singleRunAsJobResult(feature, result)],
+        initial: [initialJob],
+        repairGoalExecution: true,
         limits,
         ...(deliverableEye ? { observeDeliverables: deliverableEye } : {}),
         ...(opts.supervise.onDecision ? { onDecision: opts.supervise.onDecision } : {}),
@@ -250,11 +254,12 @@ export async function runSelfImplementCliCommand(
         },
         // ⛔ 단일의 「다시 걸기」는 «같은 골을 다시»다 — 연합의 resumeFrom 과 다르다.
         //   ⇒ 그래서 판정은 «같고» 집행만 여기서 안다(superviseRun 은 그것을 모른다).
-        rerun: async () => {
-          const next = await exec(spec, pipelineDeps ? { pipelineDeps } : undefined);
+        rerun: async (_, invocation) => {
+          const repairGoal = invocation.repairGoals?.[initialJob.taskId];
+          const next = await exec(repairGoal ? { ...spec, input: { ...spec.input, text: repairGoal } } : spec, pipelineDeps ? { pipelineDeps } : undefined);
           result = next.result;
           exitCode = next.exitCode;
-          return [singleRunAsJobResult(feature, next.result)];
+          return [{ ...singleRunAsJobResult(feature, next.result), taskId: initialJob.taskId }];
         },
       });
     }

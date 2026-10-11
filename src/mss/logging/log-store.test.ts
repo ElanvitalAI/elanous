@@ -143,6 +143,142 @@ describe('LogStore writer contention', () => {
   }, 15_000);
 });
 
+const LOG_STORE_TEST_WRITE_BUSY_TIMEOUT_MS = 5_000;
+
+describe('LogStore busy retry', () => {
+  function lockedStore(label: string): { dir: string; store: LogStore; lock: Database } {
+    const dir = mkdtempSync(join(tmpdir(), `elanous-log-busy-retry-${label}-`));
+    const path = join(dir, 'logs.db');
+    const store = new LogStore(path);
+    (store as unknown as { db: Database }).db.run('PRAGMA busy_timeout = 0');
+    const lock = new Database(path);
+    lock.run('BEGIN IMMEDIATE');
+    return { dir, store, lock };
+  }
+
+  it('buffers a locked batch and prepends it to the next successful transaction', () => {
+    const { dir, store, lock } = lockedStore('piggyback');
+    const observed: LogRecord[] = [];
+    const off = debug.registerSink({ name: 'busy-retry-test', emit: (row) => observed.push(row) });
+    try {
+      const dropped = [
+        { rec: rec({ category: 'busy.first', event: 'held-a' }), surface: 'cli' },
+        { rec: rec({ category: 'busy.first', event: 'held-b' }), surface: 'cli' },
+        { rec: rec({ category: 'busy.alpha', event: 'held-c' }), surface: 'cli' },
+        { rec: rec({ category: 'busy.beta', event: 'held-d' }), surface: 'cli' },
+      ];
+      expect(() => store.insertBatch(dropped)).toThrow(/locked|busy/i);
+      expect(store.count()).toBe(0);
+      lock.run('COMMIT');
+      store.insertBatch([{ rec: rec({ category: 'busy.second', event: 'next' }), surface: 'cli' }]);
+      expect(store.query({ exactCategories: ['busy.first', 'busy.alpha', 'busy.beta', 'busy.second'] }).map((row) => row.event).sort())
+        .toEqual(['held-a', 'held-b', 'held-c', 'held-d', 'next']);
+      expect(observed.some((row) => row.category === 'store.sqlite' && row.event === 'busy-lost'
+        && (row.data as { rows?: number; categories?: string[] }).rows === 4
+        && (row.data as { categories?: string[] }).categories?.join(',') === 'busy.first,busy.alpha,busy.beta')).toBe(true);
+      expect(observed.some((row) => row.category === 'store.sqlite' && row.event === 'busy-recovered'
+        && (row.data as { rows?: number; attempts?: number }).rows === 4
+        && (row.data as { attempts?: number }).attempts === 2)).toBe(true);
+    } finally {
+      try { lock.run('ROLLBACK'); } catch { /* already committed */ }
+      lock.close();
+      off();
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('emits retry-exhausted with the exact rows after three failed attempts', () => {
+    const { dir, store, lock } = lockedStore('exhausted');
+    const observed: LogRecord[] = [];
+    const off = debug.registerSink({ name: 'busy-retry-exhausted-test', emit: (row) => observed.push(row) });
+    try {
+      for (const event of ['first', 'second', 'third']) {
+        expect(() => store.insertBatch([{ rec: rec({ category: 'busy.exhausted', event }), surface: 'cli' }])).toThrow(/locked|busy/i);
+      }
+      const exhausted = observed.filter((row) => row.category === 'store.sqlite' && row.event === 'busy-lost'
+        && (row.data as { reason?: string }).reason === 'retry-exhausted');
+      expect(exhausted.map((row) => (row.data as { droppedRows: number }).droppedRows)).toEqual([1]);
+      expect(store.count()).toBe(0);
+    } finally {
+      try { lock.run('ROLLBACK'); } catch { /* cleanup */ }
+      lock.close();
+      off();
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('bun CLI exits within baseline plus two seconds during logs.db lock contention', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-log-busy-retry-cli-'));
+    const repoRoot = join(import.meta.dir, '../../..');
+    const dbPath = join(dir, 'logs', 'logs.db');
+    const seed = new LogStore(dbPath);
+    seed.close();
+    const action = JSON.stringify({
+      kind: 'retry', variant: 'wait', taskId: 'busy-cli-test', rationale: 'busy retry process exit',
+      pr: 0, runId: 'busy-cli-run', original: 'test', checklistId: '',
+    });
+    const command = [process.execPath, join(repoRoot, 'bin/elanous.mjs'), `--test=${dir}`, 'autopilot', 'task-agent-action', action];
+    const env = { ...process.env, NODE_ENV: 'development' };
+    const runCli = async (): Promise<{ ms: number; stderr: string }> => {
+      const started = Date.now();
+      const proc = Bun.spawn(command, { cwd: repoRoot, env, stdout: 'pipe', stderr: 'pipe' });
+      const [code, stderr, stdout] = await Promise.all([proc.exited, new Response(proc.stderr).text(), new Response(proc.stdout).text()]);
+      if (code !== 0) throw new Error(`CLI exited ${code}: ${stderr} ${stdout}`);
+      return { ms: Date.now() - started, stderr };
+    };
+    try {
+      const baselineMs = (await runCli()).ms;
+      // Hold the write lock past the 5s write busy_timeout so the child really hits SQLITE_BUSY and buffers rows.
+      const lockHoldMs = LOG_STORE_TEST_WRITE_BUSY_TIMEOUT_MS + 2_000;
+      const lock = new Database(dbPath);
+      lock.run('BEGIN IMMEDIATE');
+      const release = setTimeout(() => { try { lock.run('COMMIT'); } catch { /* child already closed or test cleanup */ } }, lockHoldMs);
+      let contended = { ms: 0, stderr: '' };
+      try { contended = await runCli(); }
+      finally {
+        clearTimeout(release);
+        try { lock.run('ROLLBACK'); } catch { /* already committed */ }
+        lock.close();
+      }
+      expect(contended.stderr).toMatch(/\[store\.sqlite\] busy-lost \{[^\n]*"op":"insertBatch"[^\n]*"rows":\d+/);
+      // Exit is measured from lock release: a lingering retry timer would keep the child alive past this bound.
+      expect(contended.ms).toBeLessThanOrEqual(lockHoldMs + baselineMs + 2_000);
+      const persisted = LogStore.openReadOnly(dbPath);
+      try { expect(persisted.count()).toBeGreaterThan(0); }
+      finally { persisted.close(); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 120_000);
+
+  it('caps buffered rows at 2,000 by dropping the oldest rows first', () => {
+    const { dir, store, lock } = lockedStore('cap');
+    const observed: LogRecord[] = [];
+    const off = debug.registerSink({ name: 'busy-retry-cap-test', emit: (row) => observed.push(row) });
+    try {
+      const batch = Array.from({ length: 2_001 }, (_, index) => ({
+        rec: rec({ category: 'busy.cap', event: `row-${index}` }), surface: 'cli',
+      }));
+      expect(() => store.insertBatch(batch)).toThrow(/locked|busy/i);
+      expect(observed.some((row) => row.category === 'store.sqlite' && row.event === 'busy-lost'
+        && (row.data as { reason?: string; droppedRows?: number }).reason === 'retry-buffer-full'
+        && (row.data as { droppedRows?: number }).droppedRows === 1)).toBe(true);
+      lock.run('COMMIT');
+      store.insertBatch([{ rec: rec({ category: 'busy.cap', event: 'trigger' }), surface: 'cli' }]);
+      expect(store.count()).toBe(2_001);
+      expect(store.query({ exactCategories: ['busy.cap'], events: ['row-0'] })).toHaveLength(0);
+      expect(store.query({ exactCategories: ['busy.cap'], events: ['row-1'] })).toHaveLength(1);
+      expect(store.query({ exactCategories: ['busy.cap'], events: ['trigger'] })).toHaveLength(1);
+    } finally {
+      try { lock.run('ROLLBACK'); } catch { /* already committed */ }
+      lock.close();
+      off();
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('LogStore host identity', () => {
   it('inserts inherited host ID with explicit data.hostId precedence and empty fallback', () => {
     const previous = process.env.ELANOUS_HOST_ID;

@@ -377,7 +377,7 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     const d = decideNextRun({ results: [lockRace('a'), lockRace('b')] });
     expect(d.action).toBe('relaunch');
     expect(d.why).toContain('그대로 재실행 2');
-    expect(appendRound([], [lockRace('a'), lockRace('b')])).toEqual([{ round: 0, landed: 0, actionable: 2 }]);
+    expect(appendRound([], [lockRace('a'), lockRace('b')])).toEqual([{ round: 0, landed: 0, actionable: 2, noPrTaskIds: ['a', 'b'] }]);
   });
 
   test('⭐ 착지가 «하나라도» 있으면 제자리가 아니다 — 계속 돈다', () => {
@@ -470,7 +470,7 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     ];
     const results = [unfinished('a')];
     expect(countBaseCompleted(results)).toBe(0);
-    expect(appendRound(history, results)[2]).toEqual({ round: 2, landed: 0, baseCompleted: 0, base: 'bench/x', actionable: 1 });
+    expect(appendRound(history, results)[2]).toEqual({ round: 2, landed: 0, baseCompleted: 0, base: 'bench/x', actionable: 1, noPrTaskIds: ['a'] });
     const decision = decideNextRun({ results, history, limits: { maxRounds: 9, stallRounds: 2 } });
     expect(decision.stopReason).toBe('no-progress');
     expect(decision.why).toContain('base=bench/x 기준 완료 0 · 착지 0');
@@ -481,9 +481,9 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     const second = [worktreeCompleted('a'), lockRace('b')];
     const history = appendRound([], first);
     const next = appendRound(history, second)[1]!;
-    expect(history[0]).toEqual({ round: 0, landed: 0, actionable: 2 });
+    expect(history[0]).toEqual({ round: 0, landed: 0, actionable: 2, noPrTaskIds: ['a', 'b'] });
     expect(countLanded(second)).toBe(1);
-    expect(next).toEqual({ round: 1, landed: 1, actionable: 1 });
+    expect(next).toEqual({ round: 1, landed: 1, actionable: 1, noPrTaskIds: ['b'] });
     expect(madeProgress(history[0], next)).toBe(true);
     const decision = decideNextRun({ results: second, history, limits: { maxRounds: 9, stallRounds: 1 } });
     expect(decision.action).toBe('relaunch');
@@ -500,14 +500,14 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
 
   test('appendRound — 라운드 기록이 «잰 값»으로 쌓인다', () => {
     let h = appendRound([], [merged('a'), lockRace('b')]);
-    expect(h).toEqual([{ round: 0, landed: 1, actionable: 1 }]);
+    expect(h).toEqual([{ round: 0, landed: 1, actionable: 1, noPrTaskIds: ['b'] }]);
     h = appendRound(h, [merged('b')]);
     expect(h[1]).toEqual({ round: 1, landed: 1, actionable: 0 });
   });
 
   test('appendRound는 결정의 이미 정규화된 review must-fix 추이를 다음 제자리 비교용 이력에 보존한다', () => {
     const history = appendRound([], [lockRace('retry')], 'improving');
-    expect(history).toEqual([{ round: 0, landed: 0, actionable: 1, reviewMustFixTrend: 'improving' }]);
+    expect(history).toEqual([{ round: 0, landed: 0, actionable: 1, reviewMustFixTrend: 'improving', noPrTaskIds: ['retry'] }]);
     expect(madeProgress(history[0], { round: 1, landed: 0, actionable: 1, reviewMustFixTrend: 'stable' })).toBe(false);
   });
 
@@ -1264,5 +1264,150 @@ describe('단일 경로 «실물 흐름» — 골 선언 → 타깃 → 눈 → 
       rerun: async (prev) => prev,
     });
     expect(decisions[0]!.deliverableObservation).toBe('not-attempted');
+  });
+});
+
+describe('merge conflict relaunch', () => {
+  const header = '참고 가지: self-impl/big — 앞 런 구현. 최신 main 위에서 같은 의도를 다시 구현하되 이 가지의 diff 를 참고';
+  const stageConflict = (id: string) => ({ taskId: id, feature: `goal ${id}`, status: 'failed', stage: 'merge-conflict', mergeReason: 'main-sync-conflict-unresolved' }) as never;
+  const harvestableConflict = (id = 'big', feature = 'goal big') => ({
+    taskId: id, feature, status: 'failed', stage: 'merge-conflict', branch: 'self-impl/big', harvestable: true,
+    mergeReason: 'main-sync-conflict-unresolved',
+  }) as never;
+  const quiet = { taskAgentShadow: false as const, sweepPendingMerges: async () => ({ pending: 0, merged: 0 }) };
+
+  test('stage merge-conflict 첫 번은 relaunch-on-main · 슈퍼바이저 action relaunch', () => {
+    const decision = decideNextRun({ results: [stageConflict('a')] });
+    expect(decision).toMatchObject({ action: 'relaunch', relaunchOnMain: ['a'], needsHuman: [] });
+    expect(decision.classifications).toEqual([expect.objectContaining({ kind: 'main-sync-blocked', action: 'relaunch-on-main' })]);
+    expect(decision.relaunchGoals).toBeUndefined();
+  });
+
+  test('harvestable merge-conflict 첫 번도 수확 대기로 멈추지 않고 재발사하며 골 머리에 보존 가지를 적는다', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const decision = decideNextRun({ results: [harvestableConflict()] });
+      expect(decision).toMatchObject({ action: 'relaunch', relaunchOnMain: ['big'] });
+      expect(decision.stopReason).toBeUndefined();
+      expect(decision.relaunchGoals?.big).toBe(`${header}\ngoal big`);
+      expect(log).toHaveBeenCalledWith('self-dev.supervisor', 'merge-conflict-relaunch', { taskId: 'big', branch: 'self-impl/big', attempt: 1 });
+    } finally { log.mockRestore(); }
+  });
+
+  test('같은 조각 두 번째 main-sync-blocked 는 지금처럼 needs-human / harvestable-awaiting-human', () => {
+    const first = decideNextRun({ results: [harvestableConflict()] });
+    const history = appendRound([], [harvestableConflict()], undefined, first);
+    expect(history[0]).toMatchObject({ mainSyncRelaunchTaskIds: ['big'], mainSyncRelaunchFeatures: ['goal big', `${header}\ngoal big`] });
+    // 재발사가 새 taskId 와 재발사 골 문면으로 돌아와도 같은 조각이다.
+    const again = harvestableConflict('big-2', `${header}\ngoal big`);
+    expect(decideNextRun({ results: [again], history })).toMatchObject({ action: 'stop', stopReason: 'harvestable-awaiting-human', relaunchOnMain: [] });
+
+    const stageFirst = decideNextRun({ results: [stageConflict('a')] });
+    const stageHistory = appendRound([], [stageConflict('a')], undefined, stageFirst);
+    expect(decideNextRun({ results: [stageConflict('a')], history: stageHistory })).toMatchObject({
+      action: 'stop', stopReason: 'needs-human', relaunchOnMain: [], needsHuman: ['a'],
+    });
+  });
+
+  test('다른 단계에서 멈춘 harvestable 은 지금처럼 수확 대기다', () => {
+    const timedOut = { taskId: 'late', feature: 'late', status: 'failed', stage: 'timed-out', branch: 'self-impl/late', harvestable: true } as never;
+    expect(decideNextRun({ results: [timedOut] })).toMatchObject({ action: 'stop', stopReason: 'harvestable-awaiting-human' });
+  });
+
+  test('다른 실패 종류의 판정은 그대로다 — 재시도 후보에 relaunchOnMain 이 섞이지 않는다', () => {
+    const decision = decideNextRun({ results: [lockRace('3'), unconverged('0')] });
+    expect(decision).toMatchObject({ action: 'relaunch', relaunchOnMain: [], rerunnable: ['3'], reworkable: ['0'] });
+    expect(decision.relaunchGoals).toBeUndefined();
+  });
+
+  test('superviseRun 은 재발사 골을 rerun 에 넘기고 같은 조각의 두 번째에서 수확 대기로 멈춘다', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const invocations: Array<Record<string, string> | undefined> = [];
+    const decisions: string[] = [];
+    try {
+      const out = await superviseRun({
+        initial: [harvestableConflict()],
+        ...quiet,
+        onDecision: (decision) => { decisions.push(`${decision.action}:${decision.stopReason ?? ''}`); },
+        rerun: async (_previous, invocation) => {
+          invocations.push(invocation.repairGoals);
+          return [harvestableConflict('big-2', invocation.repairGoals!.big!)];
+        },
+      });
+      expect(invocations).toEqual([{ big: `${header}\ngoal big` }]);
+      expect(decisions).toEqual(['relaunch:', 'stop:harvestable-awaiting-human']);
+      expect(out.map((result) => result.taskId)).toEqual(['big-2']);
+    } finally { log.mockRestore(); }
+  });
+});
+
+describe('AUT-NO-PROGRESS-RETRY-LOOP — PR 없이 2라운드 연속 실패면 세 번째 Pod 를 띄우지 않는다', () => {
+  // 부검 run-1166bcd1 · run-1bde4815 · run-427bd632 · run-46a02f42 — 세 번째 Pod 가 BackoffLimitExceeded container=Error/2.
+  const podFailed = (id: string, message: string, extra: Record<string, unknown> = {}) => ({
+    taskId: id, feature: id, status: 'failed', stage: 'gate-failed',
+    error: { code: 'SELF_IMPL_FAILED', message }, ...extra,
+  }) as never;
+  const msgA0 = 'pod job failed: BackoffLimitExceeded container=Error/2 (round 0, a)';
+  const msgB0 = 'pod job failed: BackoffLimitExceeded container=Error/2 (round 0, b)';
+  const msgA1 = 'pod job failed: BackoffLimitExceeded container=Error/2 (round 1, a)';
+  const msgB1 = `pod job failed: BackoffLimitExceeded container=Error/2 (round 1, b) ${'x'.repeat(400)}`;
+
+  test('① 라운드 0·1 모두 같은 후보가 failed ⊕ PR 없음이면 history 1 에서 stop·no-progress · why 에 자식 종료 사유', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const history = appendRound([], [podFailed('a', msgA0), podFailed('b', msgB0)]);
+      expect(history).toHaveLength(1);
+      expect(history[0]!.noPrTaskIds).toEqual(['a', 'b']);
+      const d = decideNextRun({ results: [podFailed('a', msgA1), podFailed('b', msgB1)], history });
+      expect(d.action).toBe('stop');
+      expect(d.stopReason).toBe('no-progress');
+      expect(d.why).toContain('PR 없이 2라운드 연속 실패 — 같은 골 재시도 대신 골·불변식 개정 또는 hold');
+      expect(d.why).toContain(msgA1);
+      expect(d.why).toContain(msgB1.slice(0, 200));
+      expect(d.why).not.toContain(msgB1.slice(0, 201));
+      expect(log).toHaveBeenCalledWith('self-dev.supervisor', 'no-pr-streak-stop', {
+        taskIds: ['a', 'b'], round: 1, errors: [msgA1, msgB1.slice(0, 200)],
+      });
+    } finally { log.mockRestore(); }
+  });
+
+  test('① superviseRun — 두 번째 라운드에서 서므로 재발사(Pod)는 한 번뿐이다', async () => {
+    let reruns = 0;
+    const decisions: string[] = [];
+    await superviseRun({
+      initial: [podFailed('a', msgA0)],
+      rerun: async () => { reruns++; return [podFailed('a', msgA1)]; },
+      onDecision: (decision) => decisions.push(`${decision.action}:${decision.stopReason ?? ''}`),
+      taskAgentShadow: false,
+    });
+    expect(reruns).toBe(1);
+    expect(decisions).toEqual(['relaunch:', 'stop:no-progress']);
+  });
+
+  test('② 라운드 1 에서 그 후보가 PR 을 가지거나 리뷰 추이가 improving 이면 기존대로 relaunch', () => {
+    const history = appendRound([], [podFailed('a', msgA0)]);
+    expect(decideNextRun({ results: [podFailed('a', msgA1, { prNumber: 4242 })], history }).action).toBe('relaunch');
+    const improving = decideNextRun({ results: [podFailed('a', msgA1)], history, reviewMustFixTrend: 'improving' });
+    expect(improving.action).toBe('relaunch');
+    expect(improving.stopReason).toBeUndefined();
+    // 후보 «전부»가 직전에도 PR 없이 실패했어야 선다 — 새 후보가 섞이면 서지 않는다.
+    expect(decideNextRun({ results: [podFailed('a', msgA1), podFailed('fresh', msgB1)], history }).action).toBe('relaunch');
+  });
+
+  test('③ noPrTaskIds 칸이 없는 옛 이력이면 가드가 서지 않는다(«안 쟀다»)', () => {
+    const legacy: SupervisorRound[] = [{ round: 0, landed: 0, actionable: 1 }];
+    const d = decideNextRun({ results: [podFailed('a', msgA1)], history: legacy });
+    expect(d.action).toBe('relaunch');
+    expect(d.stopReason).toBeUndefined();
+  });
+
+  test('④ 호출자가 stallRounds 를 기본보다 늘렸으면 가드가 서지 않는다(0.2.24 컷 회귀 · orchestrate-cli 라운드 상한)', () => {
+    const history = appendRound([], [podFailed('a', msgA0)]);
+    const relaxed = decideNextRun({ results: [podFailed('a', msgA1)], history, limits: { maxRounds: 9, stallRounds: 99 } });
+    expect(relaxed.action).toBe('relaunch');
+    expect(relaxed.stopReason).toBeUndefined();
+    const standard = decideNextRun({ results: [podFailed('a', msgA1)], history, limits: { maxRounds: 9, stallRounds: 2 } });
+    expect(standard.action).toBe('stop');
+    expect(standard.stopReason).toBe('no-progress');
   });
 });

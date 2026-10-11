@@ -1,9 +1,12 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, setDefaultTimeout, test } from 'bun:test';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { decideReplicationRole, hasSeenGeneration, leaseHostName } from './standby-role';
+
+// The real hq-standby.sh children need more than bun's 5 s default under load (TEST-CLI-SPAWN-TIMEOUT).
+setDefaultTimeout(60_000);
 
 const dirs: string[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
@@ -89,7 +92,7 @@ function runBody(mode: string, role: string, env: Record<string, string> = {}) {
   if (!env.NO_STATE) { mkdirSync(join(dir, '.elanous', 'release'), { recursive: true }); writeFileSync(join(dir, '.elanous', 'release', 'features.sqlite'), ''); }
   if (env.REAL_VERIFY === '1') mkdirSync(join(dir, '.elanous-standby'));
   const r = spawnSync('sh', [join(import.meta.dir, 'hq-standby.sh'), mode], {
-    encoding: 'utf8',
+    encoding: 'utf8', timeout: 60_000,
     env: { PATH: `${bin}:/usr/bin:/bin`, HOME: dir, HQ_REP_PEER: 'mbp', HQ_REP_DEFAULT_SOURCE: 'MacBookProM5', REAL_BUN: process.execPath, VERIFY_SCRIPT: join(import.meta.dir, 'standby-verify.ts'), HQ_REP_CONFIG_DIR: join(dir, '.elanous'), ...env, ...(env.STATE_SUB ? { HQ_REP_STATE_DIR: join(dir, env.STATE_SUB) } : {}) },
   });
   let lines: string[] = [];

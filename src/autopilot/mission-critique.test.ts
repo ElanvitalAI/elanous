@@ -281,6 +281,39 @@ describe('reviewToPhaseFields — [CRITIQUE:*] 각인용 매핑(rebuild 경로 �
   });
 });
 
+// ── 칸 MISSION-CRITIQUE-FAILCLOSED(REVIEW-NO-VERDICT-FAILCLOSED #25937) — «판정 없음 = 통과 아님» ──
+describe('parseLLMCritique — fail-closed 판정(VERDICT 줄 없으면 pass 가 아니다)', () => {
+  it('VERDICT 줄 없는 응답 → pass 가 아니다 + 사유 finding(기존 bullet 추출은 보존)', () => {
+    const p = parseLLMCritique('구현이 의도와 정합해 보인다.\n- 사소한 네이밍 지적');
+    expect(p.verdict).not.toBe('pass');
+    expect(p.verdict).toBe('warn');
+    expect(p.findings.join(' ')).toContain('VERDICT');
+    expect(p.findings).toContain('사소한 네이밍 지적');
+    expect(p.findings.length).toBeLessThanOrEqual(4);
+  });
+  it('빈 응답 → pass 가 아니다', () => {
+    expect(parseLLMCritique('').verdict).not.toBe('pass');
+  });
+  it('본문 중간 VERDICT 는 판정으로 안 읽는다(줄 머리만 인정)', () => {
+    const p = parseLLMCritique('결론을 쓰자면 VERDICT: PASS 라고 하고 싶지만 근거가 없다.\n- 지적 a');
+    expect(p.verdict).not.toBe('pass');
+    expect(p.verdict).toBe('warn');
+  });
+  it('줄 머리 VERDICT 는 그대로 읽는다(들여쓰기 허용 · PASS/WARN/FAIL)', () => {
+    expect(parseLLMCritique('  VERDICT: FAIL\n- 미배선').verdict).toBe('fail');
+    expect(parseLLMCritique('VERDICT: pass').verdict).toBe('pass');
+    expect(parseLLMCritique('VERDICT: WARN\n- 지적').verdict).toBe('warn');
+  });
+  it('판정 줄 없는 LLM 응답은 병합(critiquePhaseWithLLM)에서도 pass 로 승격되지 않는다', async () => {
+    const r = await critiquePhaseWithLLM(
+      { planBody: 'src/a.ts 확장', changedFiles: ['src/a.ts'], diff: '' },
+      async () => '판정 줄이 없는 비평 응답입니다.\n- 지적 a',
+    );
+    expect(r.verdict).not.toBe('pass');
+    expect(r.findings.join(' ')).toContain('[LLM]');
+  });
+});
+
 describe('renderReview', () => {
   it('fail 렌더 — must/should 섹션', () => {
     const md = renderReview({ verdict: 'fail', mustFix: ['미배선'], shouldFix: ['네이밍'] });

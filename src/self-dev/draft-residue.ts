@@ -23,11 +23,14 @@ export interface PrTerminalRecord {
   ownerSource: 'seat' | 'card' | 'unknown';
   card: string | null;
   at: string;
+  /** Which host-regate gate failed and why — null for every other terminal. */
+  hostRegateFailure: { step: string; detail: string; os: string } | null;
 }
 export interface PodTerminalInput {
   childRunId: string;
   state: 'complete' | 'failed' | 'aborted';
-  disposition?: { prNumber?: number | null; prUrl?: string | null; checkedHeadCommit?: string | null; stage?: string; merged?: boolean; ok?: boolean } | null;
+  disposition?: { prNumber?: number | null; prUrl?: string | null; checkedHeadCommit?: string | null; stage?: string; merged?: boolean; ok?: boolean;
+    hostRegate?: { passed: boolean; failures: Array<{ step: string; detail: string }>; os: string } | null } | null;
   env?: Readonly<Record<string, string | undefined>>;
   prBody?: string;
   goalText?: string;
@@ -47,13 +50,22 @@ export function classifyPodTerminal(input: PodTerminalInput): PrTerminalRecord {
   const card = cardOf(input.prBody) ?? cardOf(input.goalText);
   const seat = input.env?.ELANOUS_HARNESS_SEAT;
   const ownerSource = seat === 'OP' || seat === 'TC' || seat === 'MK' || seat === 'UX' ? 'seat' : card ? 'card' : 'unknown';
+  const hostRegate = d?.hostRegate;
+  const firstFailure = hostRegate?.passed === false && Array.isArray(hostRegate.failures) ? hostRegate.failures[0] : undefined;
+  const hostRegateFailure = d?.stage === 'host-regate-failed' && hostRegate?.passed === false
+    ? { step: typeof firstFailure?.step === 'string' && firstFailure.step ? firstFailure.step : 'unknown',
+      detail: typeof firstFailure?.detail === 'string' && firstFailure.detail
+        ? firstFailure.detail.split(/\s+/).filter(Boolean).join(' ').slice(0, 300)
+        : 'failures empty',
+      os: hostRegate.os }
+    : null;
   return {
     childRunId: input.childRunId, prNumber, prUrl, repository,
     headSha: typeof d?.checkedHeadCommit === 'string' && /^[a-f0-9]{40}$/i.test(d.checkedHeadCommit) ? d.checkedHeadCommit : null,
     terminalClass: !d ? 'failed-pr-unobserved' : d.merged === true ? 'landed'
       : prNumber === null ? 'failed-no-pr'
         : input.state === 'complete' && d.ok !== false ? 'merge-ready-not-merged' : 'failed-with-pr',
-    stage: d?.stage ?? null,
+    stage: d?.stage ?? null, hostRegateFailure,
     owner: ownerSource === 'seat' ? seat! : ownerSource === 'card' ? card! : 'unknown',
     ownerSource, card, at: input.at ?? new Date().toISOString(),
   };

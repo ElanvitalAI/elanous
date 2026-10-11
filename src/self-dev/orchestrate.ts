@@ -23,6 +23,7 @@ import { parentUnlandedProgressLine } from './run-supervisor.js';
 import { mkdirSync, openSync, writeFileSync, closeSync, renameSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { goalPathFromArgv, launchRegistryDir, removeLaunchBinding, writeLaunchBinding } from '../harness/launch-registry.js';
+import { adoptRunCard } from '../task-agent/run-adopt.js';
 import { availableParallelism, cpus } from 'node:os';
 import { selfDevRunsDir } from './run-store.js';
 import { HARNESS_RUN_ID_ENV, normalizeRunId } from '../harness/harness-space.js';
@@ -369,6 +370,11 @@ export type TriageAction =
   | 'decompose-and-retry'
   /** 기존 조각을 치환하거나 재실행하지 않고 수리 조각을 추가한다. */
   | 'add-repair-task'
+  /**
+   * main 정합(LLM 충돌 해결)이 막힌 조각을 «조각당 한 번» 최신 main 위에서 다시 건다.
+   * 보존 가지는 지우지 않고 재발사 골의 참고로만 쓴다. 두 번째부터는 `needs-human`.
+   */
+  | 'relaunch-on-main'
   /** 실패가 아니었다(전송 불일치) — 건드리지 않는다. */
   | 'no-action'
   /** 모른다 — 사람이 본다. */
@@ -386,7 +392,11 @@ export interface FailureClassification {
 }
 
 /** 순수: 분류 → 다음 행동. ⛔ 한 자리에서만 정한다(소비자가 각자 매핑하면 갈린다). */
-export function triageActionFor(kind: FailureKind): TriageAction {
+export function triageActionFor(
+  kind: FailureKind,
+  /** `main-sync-blocked` 만 읽는다 — 이 조각의 재발사 한 번을 이미 썼으면 true. */
+  options: { mainSyncRelaunchSpent?: boolean } = {},
+): TriageAction {
   switch (kind) {
     case 'transient': return 'rerun';
     case 'blocked-upstream': return 'rerun-after-upstream';
@@ -396,12 +406,20 @@ export function triageActionFor(kind: FailureKind): TriageAction {
     case 'deliverable-broken':
     case 'oversized-goal': return 'add-repair-task';
     case 'false-failure': return 'no-action';
+    case 'main-sync-blocked': return options.mainSyncRelaunchSpent === true ? 'needs-human' : 'relaunch-on-main';
     case 'awaiting-human':
     case 'parent-unlanded':
-    case 'main-sync-blocked':
     case 'provider-rejected': return 'needs-human';
     default: return 'needs-human';
   }
+}
+
+/**
+ * main 정합 충돌로 멈춘 결과만 «최신 main 위 재발사» 후보다. harvestable 이라도 다른 단계(timed-out 등)에서
+ * 멈춘 결과는 후보가 아니다 — 지금처럼 사람이 수확한다.
+ */
+export function isMainSyncRelaunchCandidate(result: Pick<SelfDevJobResult, 'stage'>): boolean {
+  return result.stage === 'merge-conflict';
 }
 
 const LEDGER_FAILURE_KIND: Partial<Record<AbandonedClassification, FailureKind>> = {
@@ -588,6 +606,8 @@ export function failureFromDeployFindings(
 export function classifyFailures(
   results: SelfDevJobResult[],
   queryPreflight?: PreflightLogQuery,
+  /** 이 조각이 main 정합 재발사 한 번을 이미 썼나 — 생략은 «감독 없음» 이라 종전대로 needs-human. */
+  mainSyncRelaunchSpent?: (result: SelfDevJobResult) => boolean,
 ): FailureClassification[] {
   return results.flatMap((result) => {
     const preflightIdentifiers = [...new Set([result.runId, result.taskId].filter((id): id is string => Boolean(id)))];
@@ -603,7 +623,10 @@ export function classifyFailures(
       taskId: result.taskId,
       stage: result.stage ?? null,
       kind,
-      action: triageActionFor(kind),
+      action: triageActionFor(kind, {
+        // 생략 = 감독 없이 도는 경로(재발사할 주체가 없다) — 종전대로 needs-human. 재발사는 감독이 이력으로 셀 때만.
+        mainSyncRelaunchSpent: !isMainSyncRelaunchCandidate(result) || !mainSyncRelaunchSpent || mainSyncRelaunchSpent(result) === true,
+      }),
       ...(awaitingHuman ?? failureObservationFields(error?.code ?? 'UNKNOWN', error?.message ?? '')),
     }];
   });
@@ -651,8 +674,12 @@ export function triageRun(
   hasUnmeasuredDeliverables = false,
   /** Optional injected lookup of launch preflight observations; absence remains unknown. */
   queryPreflight?: PreflightLogQuery,
+  /** 이 조각이 main 정합 재발사 한 번을 이미 썼나 — 생략은 «감독 없음» 이라 종전대로 needs-human. */
+  mainSyncRelaunchSpent?: (result: SelfDevJobResult) => boolean,
 ): {
   classifications: FailureClassification[];
+  /** ⭐ main 정합이 막힌 조각 중 «첫 번» — 사람 수확 대신 최신 main 위에서 다시 건다. */
+  relaunchOnMain: string[];
   /** 그대로 다시 걸면 되는 조각(일시적·상류대기). */
   rerunnable: string[];
   /** 다시 걸 수는 있으나 같은 결과일 수 있는 조각(수렴 실패). */
@@ -678,21 +705,23 @@ export function triageRun(
     failureFromDeployFindings(taskId, observation.target, observation.findings));
   const classifications = [
     ...deployClassifications,
-    ...classifyFailures(results, queryPreflight),
+    ...classifyFailures(results, queryPreflight, mainSyncRelaunchSpent),
   ];
   const pick = (a: TriageAction) => classifications.filter((c) => c.action === a).map((c) => c.taskId);
   const rerunnable = [...pick('rerun'), ...pick('rerun-after-upstream')];
   const reworkable = pick('rework');
   const decomposable = pick('decompose-and-retry');
   const repairable = [...new Set(pick('add-repair-task'))];  // ⛔ finding 이 여럿이면 같은 taskId 가 겹친다
+  const relaunchOnMain = [...new Set(pick('relaunch-on-main'))];
   return {
     classifications,
+    relaunchOnMain,
     rerunnable,
     reworkable,
     decomposable,
     repairable,
     needsHuman: pick('needs-human'),
-    actionable: rerunnable.length + reworkable.length + decomposable.length + repairable.length > 0,
+    actionable: rerunnable.length + reworkable.length + decomposable.length + repairable.length + relaunchOnMain.length > 0,
     deliverableUnmeasured,
   };
 }
@@ -897,7 +926,11 @@ export function writeRunPidRecord(runId: string, runsDir: string = selfDevRunsDi
     const cwd = process.cwd();
     const goalPath = goalPathFromArgv(process.argv, cwd);
     writeLaunchBinding(runId, { pid: process.pid, startedAt: Date.now() - Math.floor(process.uptime() * 1000), argv0: process.argv0,
-      cwd, ...(goalPath ? { goalPath } : {}), runsDir: resolve(runsDir) }, registryDir);
+      cwd, ...(goalPath ? { goalPath } : {}), runsDir: resolve(runsDir),
+      ...(process.env.ELANOUS_POD_NAME ? { podName: process.env.ELANOUS_POD_NAME } : {}),
+      ...(process.env.ELANOUS_TASK_CARD_ID ? { taskCardId: process.env.ELANOUS_TASK_CARD_ID } : {}) }, registryDir);
+    try { adoptRunCard({ runId, cwd, goalPath, runsDir, env: process.env }); }
+    catch (error) { try { debug.log('task-agent', 'run-adopt-failed', { runId, error: String(error) }); } catch { /* launch must continue */ } }
   }
   return pidPath;
 }
@@ -1381,6 +1414,8 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
           ...(disp?.completionDisposition ? { completionDisposition: disp.completionDisposition } : {}),
           ...(disp?.failureClassification ? { failureClassification: disp.failureClassification } : {}),
           ...(disp?.providerErrors ? { providerErrors: disp.providerErrors } : {}),
+          ...(disp?.rework ? { rework: disp.rework } : {}),
+          ...(disp?.mustFix ? { reviewMustFix: disp.mustFix } : {}),
           ...(goalCauseObservedFromFailureClassification(disp?.failureClassification) === true
             ? { goalCauseObserved: true } : {}),
           ...(disp?.runId ? { runId: disp.runId } : {}),

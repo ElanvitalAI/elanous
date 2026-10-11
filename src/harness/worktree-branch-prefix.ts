@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { branchGoalId } from '../cli/pr-lineage.js';
 
 /** Prefix for disposable worktree branches created by self-implement and inspected by harness clean.
  * A successfully merged run cleans up its own worktree.
@@ -30,4 +31,12 @@ export function plannedSelfImplBranch(feature: string, goalId?: string, runId?: 
   const readable = slug.replace(/-[0-9a-f]{8}$/, '');
   const digest = createHash('sha256').update(id).digest('hex').slice(0, 8);
   return `${WORKTREE_BRANCH_PREFIX}goalid-${id}-${readable}-${digest}${runSuffix}`;
+}
+
+/** 같은 골의 재실행이 공유하는 «안정한» 계보 키. `plannedSelfImplBranch` 가 싣는 `goalid-<id>-` 구간만 읽는다 —
+ *  feature 문구·다이제스트·런 접미(`-r<runId>`)는 재실행마다 달라지므로 키에 넣지 않는다.
+ *  ⛔ 골 식별자가 없는 옛 브랜치는 `null` — 읽기용 슬러그는 서로 다른 골이 같은 값을 낼 수 있어(`grounded-N-…`) 키가 될 수 없다. */
+export function branchLineageKey(branch: string): string | null {
+  const id = branchGoalId(branch);
+  return id ? `goalid:${id.toLowerCase()}` : null;
 }

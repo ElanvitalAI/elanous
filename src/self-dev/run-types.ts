@@ -63,6 +63,12 @@ export interface SelfDevGoal {
   hotPaths?: string[];
 }
 
+export type ReviewRework = {
+  trend: 'unmeasured' | 'improving' | 'stable' | 'worsening' | 'oscillating';
+  signature: string;
+  rounds: number;
+};
+
 export interface SelfDevJobResult {
   taskId: string;
   feature: string;
@@ -115,6 +121,12 @@ export interface SelfDevJobResult {
   /** Self review verdict bound to the PR head observed by the child; absent if either observation is missing. */
   /** TA-LAND-MUSTFIX-ZERO — `mustFixCount` is the review's must-fix list length; absent = unknown (the land gate fails closed). */
   selfReview?: { verdict: 'pass' | 'fail'; head: string; mustFixCount?: number };
+  /** Measured child review history; absence means not observed, not a negative oscillation result. */
+  rework?: ReviewRework;
+  /** taskId whose review-oscillation repair produced this result (explicit lineage across a new taskId). */
+  oscillationRepairOf?: string;
+  /** Verbatim final reviewer must-fix items for a bounded helper repair. */
+  reviewMustFix?: string[];
   /** Whether the child review actually ran; omitted preserves legacy producers. */
   reviewed?: boolean;
   /** Why the child did not run review; omitted preserves legacy review-unobserved handling. */
@@ -172,6 +184,7 @@ export type SupervisorStopReason =
   | 'step-timeout'
   | 'decomposable-no-progress'
   | 'review-unobserved'
+  | 'review-oscillating'
   | 'deliverable-unobserved'
   | 'deliverable-merged';
 

@@ -158,6 +158,29 @@ export function selectEnhanceLlm(
   return { model, effort: opts.reasoningEffort ?? validEnvEffort ?? planning?.effort ?? 'high', modelSource, effortSource };
 }
 
+/**
+ * ⭐ AUTHOR-DECOMPOSE-KNOB(0.2.24 · G7 #25848) — 골 쪼개기·적대 비평의 `streamLLM` 두 호출이 따를 노브.
+ *   `selectEnhanceLlm` 과 «같은 규칙»으로 planning 역할을 푼다: ELANOUS_PROMPT_ENHANCE_MODEL/EFFORT →
+ *   `roleLlm.planning`(`resolveRoleLlm('planning', …)`). 규칙의 «유일한» 차이는 model 폴백이다 —
+ *   인핸서는 자기 기본(`tierModel('better')`)으로 떨어지지만, 이 길은 아무것도 설정되지 않으면
+ *   `undefined` 를 돌려 호출자가 `model` 을 아예 전달하지 않게 한다(프로바이더 기본 모델 = 종전 동작).
+ *   effort 는 `selectEnhanceLlm` 과 같은 `high` 폴백이며, 두 노브는 따로 풀린다 —
+ *   effort 만 세팅돼도 모델은 종전 기본 그대로다.
+ */
+export function selectPlanningLlm(
+  env: NodeJS.ProcessEnv = process.env,
+  config: UserConfig = getUserConfig(),
+): { model: string | undefined; effort: 'low' | 'medium' | 'high' } {
+  const planning = config.roleLlm?.planning;
+  const model = env.ELANOUS_PROMPT_ENHANCE_MODEL
+    || (planning && (planning.model || planning.tier || planning.provider)
+      ? resolveRoleLlm('planning', { config, overrides: {} }).model
+      : undefined);
+  const envEffort = env.ELANOUS_PROMPT_ENHANCE_EFFORT;
+  const validEnvEffort = envEffort === 'low' || envEffort === 'medium' || envEffort === 'high' ? envEffort : undefined;
+  return { model, effort: validEnvEffort ?? planning?.effort ?? 'high' };
+}
+
 /** 스캐폴드 생성 LLM 시스템 프롬프트 — 가산·원문불가침 규율. */
 const enhanceSystem = (deliverableHint?: string, wantsScqa = false, checklistUse: ChecklistUse = 'coverage-gate'): string =>
   [

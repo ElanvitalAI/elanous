@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
-import { listChecklist } from '../release-loop/checklist.js';
+import { listChecklist, type Checklist, type ChecklistItem } from '../release-loop/checklist.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
 import { getSchedule } from '../release-loop/release-schedule.js';
 import { history } from '../release-loop/feature-store.js';
@@ -78,6 +78,49 @@ test('missing schedule in the real ledger returns 컷 미정 without an error', 
   const result = dispatchReleaseStatus({ version: '0.2.14' }, { latestRun: () => null });
   expect(result.text).toContain('0.2.14 · 컷 미정');
   expect((result.structured.releases as Array<{ schedule: unknown }>)[0]?.schedule).toBeNull();
+});
+
+test('schedule, blocked and landed actions return Korean summaries from injected release evidence', () => {
+  const now = new Date('2026-10-11T03:00:00.000Z');
+  const data = (version: string, items: ChecklistItem[] = []): Checklist => ({ version, released: '0.2.10', dev: version, history: [], items });
+  const schedule = dispatchReleaseStatus({ action: 'schedule' }, {
+    devVersion: () => '0.2.10', checklist: version => data(version),
+    schedules: () => [
+      { version: '0.2.13', cutAt: '2026-10-13T00:00:00.000Z', landBy: '2026-10-13T03:00:00.000Z', updatedAt: '', updatedBy: '' },
+      { version: '0.2.12', cutAt: '2026-10-12T00:00:00.000Z', landBy: '2026-10-12T03:00:00.000Z', updatedAt: '', updatedBy: '' },
+    ],
+  });
+  expect(schedule.text).toContain('다음 컷 시각:');
+  expect(schedule.text).toContain('0.2.12 컷 10-12(월) 09:00 KST');
+  expect(schedule.text.indexOf('0.2.12')).toBeLessThan(schedule.text.indexOf('0.2.13'));
+  expect(schedule.structured.schedules).toHaveLength(2);
+
+  const blocked = dispatchReleaseStatus({ action: 'blocked', version: '0.2.11' }, {
+    devVersion: () => '0.2.10', checklist: version => data(version, [
+      { id: 'RED', title: '빨강 칸', status: 'red', updatedAt: '', updatedBy: '' },
+      { id: 'HOLD', title: '보류 칸', status: 'yellow', disposition: 'block', updatedAt: '', updatedBy: '' },
+      { id: 'MOVE', title: '이동 칸', status: 'yellow', disposition: 'move', updatedAt: '', updatedBy: '' },
+    ]),
+  });
+  expect(blocked.text).toContain('막힌 칸 2개');
+  expect(blocked.text).toContain('RED 빨강 칸 · 빨강');
+  expect(blocked.text).toContain('HOLD 보류 칸 · 보류');
+  expect(blocked.text).not.toContain('MOVE');
+  expect(blocked.structured.blocked).toHaveLength(2);
+
+  let observedNow: Date | undefined;
+  const landed = dispatchReleaseStatus({ action: 'landed' }, {
+    now, mergedPrsLast24h: at => { observedNow = at; return 3; },
+  });
+  expect(landed.text).toBe('어제 착지: 최근 24시간 병합 PR 3건');
+  expect(landed.structured).toMatchObject({ mergedPrsLast24h: 3, since: '2026-10-10T03:00:00.000Z', until: now.toISOString() });
+  expect(observedNow).toBe(now);
+});
+
+test('existing core dispatch reaches the new release_status action without another tool registration', async () => {
+  fixture();
+  const result = await buildCoreTools().dispatch('release_status', { action: 'schedule' }) as { text: string };
+  expect(result.text).toBe('다음 컷 시각: 일정 없음');
 });
 
 test('owner approval adds exactly one ledger item and history by owner; core dispatch does not take identity from args', async () => {

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createStaleInstallCheck, formatStaleInstallNotice, readCurrentInstalledCommit, readDashboardBootCommit, STALE_INSTALL_CHECK_INTERVAL_MS, versionedDashboardInstallDir } from './stale-install-check.js';
+import { buildStaleInstallRelaunchCommand, createStaleInstallCheck, formatStaleInstallNotice, readCurrentInstalledCommit, readDashboardBootCommit, STALE_INSTALL_CHECK_INTERVAL_MS, versionedDashboardInstallDir } from './stale-install-check.js';
 
 const oldCommit = 'a'.repeat(40);
 const newCommit = 'b'.repeat(40);
@@ -102,4 +102,28 @@ describe('stale install check', () => {
       expect(readCurrentInstalledCommit(root)).toBeUndefined();
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+});
+
+test('stale-install notice stays one line without stacking across five version changes', () => {
+  let notice = '';
+  for (let version = 1; version <= 5; version += 1) {
+    notice = formatStaleInstallNotice({
+      state: 'changed',
+      bootCommit: `b00000${version}`,
+      installedCommit: `i00000${version}`,
+    }, version);
+    expect(notice.split(/\r?\n/)).toHaveLength(1);
+    expect(notice.match(/새 판이 깔렸습니다/g)).toHaveLength(1);
+    expect(notice).toContain(`i00000${version}`);
+    for (let previousVersion = 1; previousVersion < version; previousVersion += 1) {
+      expect(notice).not.toContain(`i00000${previousVersion}`);
+    }
+  }
+});
+
+test('relaunch command includes the given session id', () => {
+  const sessionId = 'session-123';
+  const command = buildStaleInstallRelaunchCommand(sessionId);
+  expect(command).toContain(sessionId);
+  expect(command).toBe('elanous --resume "session-123"');
 });

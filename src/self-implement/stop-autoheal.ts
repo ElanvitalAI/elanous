@@ -15,12 +15,19 @@
  *   evidence-uncovered → derive-evidence-rejudge  런 출력·시험·배선에서 증거를 끌어내 1회 재판정
  *   review-repeat · review-out-of-scope · fabric · launch-failed · unclassified → needs-owner(새 라운드 없음)
  *
+ * 사다리의 «출처»: `graphs/overlays/stop-heal-ladder.yaml` 이 갈래마다 처방 노드(id = 처방 이름)를 선언한다.
+ *    그 갈래에 얹힌 오버레이가 더한 노드 id 가 처방이다(source='graph'). 선언이 없거나 못 읽으면
+ *    위 표(`AUTOHEAL_ACTION_BY_CLASS`)로 간다(source='code-default'). 둘이 같은 답을 내는지는 시험이 문다.
+ *
  * 모드 `tools.selfImplement.autoheal.mode` = `shadow`(기본: 할 일을 원장에만 적고 손대지 않는다) | `live`.
  * ⛔ live 에서도 행동은 주입 seam 으로만 한다 — seam 이 없는 행동은 `needs-owner`(action-unwired)로 떨어진다.
  *    «안 이어진 손»을 「고쳤다」로 읽지 않게.
  * 관측 = `debug.log('self-implement.autoheal', …)` ⊕ 원장 `event='autoheal'`.
  */
 import { debug } from '../debug/log.js';
+import { applyGraphOverlays, defaultOverlaysDir, loadGraphOverlays, selectOverlays, type GraphOverlaySpec } from './graph-overlay-yaml.js';
+import type { GraphTemplateSpec } from './graph-yaml.js';
+import { GRAPH_SPECS } from './graph-templates.js';
 import { appendRunLedgerEntry, loadRunLedger, type RunLedgerEntry, type RunLedgerWriter } from './run-ledger.js';
 import type { RunStopClass, RunStopRecord } from './run-stop.js';
 
@@ -47,6 +54,58 @@ export const AUTOHEAL_ACTION_BY_CLASS: Readonly<Record<RunStopClass, AutohealAct
   'launch-failed': 'needs-owner',
   unclassified: 'needs-owner',
 };
+
+/** 처방 노드 id 로 인정하는 이름 — 오버레이가 더한 노드 중 이 넷만 처방으로 읽는다. */
+const HEAL_ACTION_NODE_IDS: ReadonlySet<string> = new Set<Exclude<AutohealAction, 'needs-owner'>>([
+  'clean-workspace-regate', 'rebase-regate', 'resume-from-salvage', 'derive-evidence-rejudge',
+]);
+
+/** 처방이 «어디서» 왔나 — `graph` = 그 갈래에 얹힌 오버레이가 더한 노드 · `code-default` = 위 표. */
+export type AutohealActionSource = 'graph' | 'code-default';
+
+export interface AutohealPick {
+  action: AutohealAction;
+  source: AutohealActionSource;
+  /** source='graph' 일 때 그 처방 노드를 더한 오버레이. */
+  overlayId?: string;
+}
+
+/** 사다리를 읽어 오는 자리 — 활성 템플릿 선언 ⊕ 오버레이 목록. 시험이 갈아 끼운다. */
+export interface AutohealLadder {
+  template: GraphTemplateSpec | undefined;
+  overlays: readonly GraphOverlaySpec[];
+}
+
+function loadDefaultLadder(): AutohealLadder {
+  return { template: GRAPH_SPECS['self-implement'], overlays: loadGraphOverlays(defaultOverlaysDir()).overlays };
+}
+
+/**
+ * 갈래 → 처방. 그 `stop_class` 에 얹힌 오버레이가 활성 템플릿에 더한 처방 노드 id 를 고른다.
+ * ⛔ 오버레이가 없거나 · 조건 키가 없거나 · 로드·적용이 실패하거나 · 처방 노드가 정확히 하나가 아니면
+ *    «조용히» 코드 표로 간다 — 그 사실은 `source` 가 말한다. 던지지 않는다.
+ */
+export function pickAutohealAction(cls: RunStopClass, loadLadder: () => AutohealLadder = loadDefaultLadder): AutohealPick {
+  const codeDefault: AutohealPick = { action: AUTOHEAL_ACTION_BY_CLASS[cls] ?? 'needs-owner', source: 'code-default' };
+  try {
+    const { template, overlays } = loadLadder();
+    if (!template) return codeDefault;
+    const { applied } = selectOverlays(overlays, { graphId: template.graphId, stage: 'heal', state: { stop_class: cls } });
+    const declared = new Set(template.nodes.map((node) => node.nodeId));
+    for (const overlay of applied) {
+      const result = applyGraphOverlays(template, [overlay]);
+      if (!result.ok) {
+        observe('overlay-rejected', { stopClass: cls, overlayId: overlay.overlayId, rejections: result.rejections.map((r) => r.kind) });
+        continue;
+      }
+      const added = result.template.nodes.map((node) => node.nodeId).filter((id) => !declared.has(id) && HEAL_ACTION_NODE_IDS.has(id));
+      if (added.length === 1) return { action: added[0] as AutohealAction, source: 'graph', overlayId: overlay.overlayId };
+    }
+  } catch (error) {
+    observe('ladder-unreadable', { stopClass: cls, error: error instanceof Error ? error.message : String(error) });
+  }
+  return codeDefault;
+}
 
 /** 설정 원값 → 모드. 모르는 값은 «좁은 쪽»(shadow). */
 export function parseAutohealMode(raw: unknown): AutohealMode {
@@ -84,6 +143,10 @@ export interface AutohealResult {
   runId: string;
   class: RunStopClass;
   action: AutohealAction;
+  /** 처방을 «어디서» 골랐나 — 그래프 선언 또는 코드 표. */
+  source: AutohealActionSource;
+  /** source='graph' 일 때 처방 노드를 더한 오버레이. */
+  overlayId?: string;
   mode: AutohealMode;
   outcome: AutohealOutcome;
   /** needs-owner 일 때 사람이 볼 이유(멈춘 원인 그대로 또는 행동 실패). */
@@ -98,6 +161,8 @@ export interface AutohealDeps {
   /** 가드용 원장 읽기 — 기본 `loadRunLedger(runId)`. null = 원장 없음(첫 시도). */
   loadLedger?: (runId: string) => readonly RunLedgerEntry[] | null;
   writeLedger?: RunLedgerWriter;
+  /** 사다리 선언 읽기 — 기본은 활성 템플릿 ⊕ `graphs/overlays`. 던지면 코드 표로 간다. */
+  loadLadder?: () => AutohealLadder;
 }
 
 /**
@@ -128,8 +193,8 @@ function observe(event: string, data: Record<string, unknown>): void {
 export async function autohealFromStop(ctx: AutohealContext, deps: AutohealDeps = {}): Promise<AutohealResult> {
   const mode = deps.mode ?? DEFAULT_AUTOHEAL_MODE;
   const cls = ctx.record.class;
-  const action = AUTOHEAL_ACTION_BY_CLASS[cls] ?? 'needs-owner';
-  const base = { runId: ctx.runId, class: cls, action, mode };
+  const { action, source, overlayId } = pickAutohealAction(cls, deps.loadLadder);
+  const base = { runId: ctx.runId, class: cls, action, source, ...(overlayId ? { overlayId } : {}), mode };
 
   let ledger: readonly RunLedgerEntry[] | null = null;
   try {
@@ -144,6 +209,8 @@ export async function autohealFromStop(ctx: AutohealContext, deps: AutohealDeps 
     observe('already-attempted', base);
     return { ...base, outcome: 'already-attempted' };
   }
+
+  observe('action-source', { stopClass: cls, action, source, overlayId: overlayId ?? null });
 
   let outcome: AutohealOutcome;
   let reason: string | undefined;

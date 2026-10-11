@@ -5,9 +5,11 @@ import { join } from 'node:path';
 import { computeVerdict, okCell, renderOverview, unmeasured, unmeasuredCells, verdictExitCode, type OverviewSnapshot } from './overview.js';
 import { collectOverview, launchableCells, ownerRows, parseEtime, parseSince, summarizeParents } from './overview-collect.js';
 import { lineTime, parseDispatcherCapacity, readDispatcherBeats, readDispatcherCapacity, readSeatEraHanded } from './overview-seat-era.js';
+import { createOverviewCache } from './overview-cache.js';
 import { mkdirSync, utimesSync } from 'node:fs';
 import type { Checklist, ChecklistItem } from '../release-loop/checklist.js';
 import type { TaskCard } from '../task-agent/task-hand.js';
+import { measureLandingThroughput } from '../task-agent/cover.js';
 
 const AT = '2026-10-08T00:30:00.000Z';
 
@@ -112,6 +114,22 @@ describe('표기 — 못 잼은 0 이 아니다', () => {
     expect(text).toContain('끝 못 잼(not yet)');
     expect(unmeasuredCells(s)).toEqual(['tasks.done: not yet', 'machines.node-c: 하트비트 없음']);
     expect(text.split('\n')[0]).toBe('✅ 흐름 정상 (flowing)');
+    expect(text).not.toContain('처리량(');
+  });
+
+  test('optional throughput adds one line and unmeasured throughput remains explicit', () => {
+    const s = base();
+    s.throughput = okCell(measureLandingThroughput({
+      taskAgentActions: [], allLands: [], launched: 327, cardPrs: 10, pendingLandingAgeSeconds: [],
+    }), 'daily launch/PR/TASK-AGENT sources', AT);
+    const rendered = renderOverview(s, computeVerdict(s), { elapsedMs: 12 });
+    expect(rendered).toContain('처리량(1d) 발사 327 → 카드 PR 10 → TA 착지 0');
+    expect(rendered.match(/처리량\(/g)).toHaveLength(1);
+
+    s.throughput = unmeasured('daily throughput', 'launch source unavailable');
+    const unknown = renderOverview(s, computeVerdict(s), { elapsedMs: 12 });
+    expect(unknown).toContain('못 잼(launch source unavailable) [daily throughput]');
+    expect(unmeasuredCells(s)).toContain('throughput: launch source unavailable');
   });
 });
 
@@ -177,6 +195,138 @@ describe('수집 조각', () => {
     expect(parseSince(undefined).ms).toBe(3_600_000);
     expect(parseSince('30m').ms).toBe(1_800_000);
     expect(() => parseSince('abc')).toThrow();
+  });
+});
+
+describe('overview cache — 10 s snapshot and 60 s background Pod measurement', () => {
+  test('memo expires at 10 seconds without changing verdict rules', async () => {
+    let clock = Date.parse(AT);
+    let collects = 0;
+    const cache = createOverviewCache({ now: () => clock, collect: async () => { collects++; return base(); }, measurePods: async () => [],
+      schedule: () => ({ unref() {} }) as ReturnType<typeof setInterval> });
+    try {
+      expect((await cache.get()).verdict).toBe('flowing');
+      clock += 9_999;
+      expect((await cache.get()).cacheAgeMs).toBe(9_999);
+      expect(collects).toBe(1);
+      clock++;
+      expect((await cache.get()).cacheAgeMs).toBe(0);
+      expect(collects).toBe(2);
+    } finally { cache.stop(); }
+  });
+  test('a slow collection reports its age from collection start, and distinct keys are bounded', async () => {
+    let clock = Date.parse(AT);
+    let collects = 0;
+    const cache = createOverviewCache({ now: () => clock,
+      collect: async () => { collects++; clock += 4_000; return base(); },
+      measurePods: async () => [], schedule: () => ({ unref() {} }) as ReturnType<typeof setInterval> });
+    try {
+      expect((await cache.get()).cacheAgeMs).toBe(4_000);
+      clock += 5_999;
+      expect((await cache.get()).cacheAgeMs).toBe(9_999);
+      expect(collects).toBe(1);
+      for (let i = 0; i < 40; i++) await cache.get({ owner: `owner-${i}` });
+      expect(cache.memoSize()).toBeLessThanOrEqual(32);
+      // A full memo of fresh keys: re-reading existing keys within 10 s never evicts or re-collects them.
+      const fresh = createOverviewCache({ now: () => clock, collect: async () => { collects++; return base(); },
+        measurePods: async () => [], schedule: () => ({ unref() {} }) as ReturnType<typeof setInterval> });
+      try {
+        for (let i = 0; i < 32; i++) await fresh.get({ owner: `k-${i}` });
+        const before = collects;
+        for (let round = 0; round < 2; round++) for (let i = 0; i < 32; i++) await fresh.get({ owner: `k-${i}` });
+        expect(collects).toBe(before);
+        expect(fresh.memoSize()).toBe(32);
+      } finally { fresh.stop(); }
+    } finally { cache.stop(); }
+  });
+  test('a failed refresh keeps the true collection age, says so, and delays the retry by the memo window', async () => {
+    let clock = Date.parse(AT);
+    let collects = 0;
+    let fail = false;
+    const cache = createOverviewCache({ now: () => clock,
+      collect: async () => { collects++; if (fail) throw new Error('ledger unreadable'); return base(); },
+      measurePods: async () => [], schedule: () => ({ unref() {} }) as ReturnType<typeof setInterval> });
+    try {
+      expect((await cache.get()).refreshFailed).toBeNull();
+      fail = true;
+      clock += 10_000;
+      const failed = await cache.get();
+      expect(collects).toBe(2);
+      expect(failed.cacheAgeMs).toBe(10_000);
+      expect(failed.refreshFailed).toBe('ledger unreadable');
+      clock += 5_000;
+      const held = await cache.get();
+      expect(collects).toBe(2);
+      expect(held.cacheAgeMs).toBe(15_000);
+      fail = false;
+      clock += 5_000;
+      const recovered = await cache.get();
+      expect(collects).toBe(3);
+      expect(recovered).toMatchObject({ cacheAgeMs: 0, refreshFailed: null });
+    } finally { cache.stop(); }
+  });
+  test('a Pod failure or 120 s staleness shows on a memo hit, not after the memo expires', async () => {
+    let clock = Date.parse(AT);
+    let tick = () => {};
+    let fail = false;
+    let collects = 0;
+    const cache = createOverviewCache({ now: () => clock,
+      collect: async () => { collects++; const s = base(); s.machines.pods = [{ context: 'pool-a', capacity: 2, occupied: unmeasured('pool', 'awaiting') }]; return s; },
+      measurePods: async () => { if (fail) throw new Error('kubectl down'); return [{ context: 'pool-a', occupied: 1, reason: null, observedAt: clock }]; },
+      schedule: (fn) => { tick = fn; return ({ unref() {} }) as ReturnType<typeof setInterval>; } });
+    try {
+      await cache.get();
+      tick();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      clock += 10_000;
+      expect((await cache.get()).machines.pods[0]?.occupied.value).toBe(1);
+      expect(collects).toBe(2);
+      // Within the 10 s memo: the measurement fails.
+      fail = true;
+      tick();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      clock += 1_000;
+      const failed = await cache.get();
+      expect(collects).toBe(2);
+      expect(failed.cacheAgeMs).toBe(1_000);
+      expect(failed.machines.pods[0]?.occupied).toMatchObject({ value: null, status: 'unmeasured', reason: 'kubectl down' });
+      // A good reading, then it ages past 120 s while a fresh memo is served.
+      fail = false;
+      tick();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      clock += 119_000;
+      expect((await cache.get()).machines.pods[0]?.occupied.value).toBe(1);
+      const collectsAtMemo = collects;
+      clock += 1_000;
+      const stale = await cache.get();
+      expect(collects).toBe(collectsAtMemo);
+      expect(stale.machines.pods[0]?.occupied).toMatchObject({ value: null, status: 'unmeasured', reason: '낡음(120초)' });
+    } finally { cache.stop(); }
+  });
+  test('Pod measurement only runs on background tick; failures and stale values remain unmeasured', async () => {
+    let clock = Date.parse(AT);
+    let tick = () => {};
+    let interval = 0;
+    let calls = 0;
+    const cache = createOverviewCache({ now: () => clock,
+      collect: async () => { const s = base(); s.machines.pods = [{ context: 'pool-a', capacity: 2, occupied: unmeasured('pool', 'awaiting') }]; return s; },
+      measurePods: async () => { calls++; return [{ context: 'pool-a', occupied: calls === 1 ? 1 : null, reason: 'unavailable', observedAt: clock }]; },
+      schedule: (fn, ms) => { tick = fn; interval = ms; return ({ unref() {} }) as ReturnType<typeof setInterval>; } });
+    try {
+      expect((await cache.get()).machines.pods[0]?.occupied.value).toBeNull();
+      expect(calls).toBe(0);
+      expect(interval).toBe(60_000);
+      tick();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      clock += 10_000;
+      expect((await cache.get()).machines.pods[0]?.occupied.value).toBe(1);
+      clock += 120_000;
+      expect((await cache.get()).machines.pods[0]?.occupied).toMatchObject({ value: null, status: 'unmeasured', reason: '낡음(120초)' });
+      tick();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      clock += 10_000;
+      expect((await cache.get()).machines.pods[0]?.occupied).toMatchObject({ value: null, status: 'unmeasured', reason: 'unavailable' });
+    } finally { cache.stop(); }
   });
 });
 

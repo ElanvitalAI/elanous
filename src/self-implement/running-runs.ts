@@ -566,13 +566,83 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
   }
 }
 
+function isPartialRunningRuns(result: RunningRunsResult): boolean {
+  return (result.count !== undefined && typeof result.count !== 'number' && result.count.count === null)
+    || result.completeness === 'partial' || hasUnreadableLedgerObservation(result.ledger) || (result.unreadable?.length ?? 0) > 0;
+}
+
+function runningRunsLowerBound(result: RunningRunsResult): number {
+  return result.count !== undefined && typeof result.count !== 'number'
+    ? result.count.lowerBound : result.counts.running + result.counts['probable-running'];
+}
+
+function runningRunsUnreadable(result: RunningRunsResult): readonly UnreadableRunningRunsLedger[] {
+  return result.unreadable ?? (result.count !== undefined && typeof result.count !== 'number' ? result.count.unreadable : []);
+}
+
+export interface RunProgressRow {
+  readonly runId: string;
+  readonly status: RunningRunStatus;
+  /** null = no phase observed; never rendered as «none». */
+  readonly lastPhase: string | null;
+  readonly lastPhaseObservedAt: string | null;
+  readonly lastActivityTimestamp: string | null;
+  /** Milliseconds since lastActivityTimestamp; null when the timestamp is absent or unparseable. */
+  readonly elapsedMs: number | null;
+  readonly ptyRefs: readonly string[];
+  readonly phaseObservation: RunningRunPhaseObservation;
+}
+
+export function buildRunProgressRows(result: RunningRunsResult, nowMs: number = Date.now()): RunProgressRow[] {
+  return result.entries.map((entry) => {
+    const activityMs = entry.lastActivityTimestamp === null ? Number.NaN : Date.parse(entry.lastActivityTimestamp);
+    return {
+      runId: entry.runId,
+      status: entry.status,
+      lastPhase: entry.lastPhase ?? null,
+      lastPhaseObservedAt: entry.lastPhaseObservedAt ?? null,
+      lastActivityTimestamp: entry.lastActivityTimestamp,
+      elapsedMs: Number.isFinite(activityMs) ? Math.max(0, nowMs - activityMs) : null,
+      ptyRefs: entry.ptyRefs.map((ref) => `${ref.instance}:${ref.id}`),
+      phaseObservation: entry.phaseObservation ?? 'not-observed',
+    };
+  });
+}
+
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1000);
+  const days = Math.floor(totalSeconds / 86_400);
+  const hours = Math.floor((totalSeconds % 86_400) / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  if (days > 0) return `${days}d${hours}h`;
+  if (hours > 0) return `${hours}h${minutes}m`;
+  if (minutes > 0) return `${minutes}m${seconds}s`;
+  return `${seconds}s`;
+}
+
+export function renderRunProgressTable(result: RunningRunsResult, nowMs: number = Date.now()): string {
+  const partial = isPartialRunningRuns(result);
+  const header = partial
+    ? `부분 관측 — 최소 ${runningRunsLowerBound(result)} (읽지 못한 원장: ${runningRunsUnreadable(result).map((item) => `${item.dir}:${item.reason}`).join(',') || '없음'})`
+    : `도는 런 ${result.counts.running + result.counts['probable-running']} (확인 ${result.counts.running} · 추정 ${result.counts['probable-running']})`;
+  const rows = buildRunProgressRows(result, nowMs).map((row) => {
+    const phaseUnreadable = row.phaseObservation === 'unreadable' || row.phaseObservation === 'partially-unreadable';
+    const phase = row.lastPhase ?? (phaseUnreadable ? '미관측 (단계 저장소 읽기 실패)' : '미관측');
+    const phaseAt = row.lastPhaseObservedAt ?? '미관측';
+    const progress = row.lastActivityTimestamp === null
+      ? '미관측'
+      : `${row.lastActivityTimestamp} (경과 ${row.elapsedMs === null ? '알 수 없음' : formatElapsed(row.elapsedMs)})`;
+    return `${row.runId} · ${row.status} · 단계 ${phase} · 진입 ${phaseAt} · 마지막 진전 ${progress} · pty ${row.ptyRefs.join(',') || '없음'}`;
+  });
+  return [header, ...rows].join('\n');
+}
+
 export function renderRunningRuns(result: RunningRunsResult): string {
   const lingeringLaunchParents = result.lingeringLaunchParents ?? { observation: 'indeterminate' } as const;
-  const partial = (result.count !== undefined && typeof result.count !== 'number' && result.count.count === null)
-    || result.completeness === 'partial' || hasUnreadableLedgerObservation(result.ledger) || (result.unreadable?.length ?? 0) > 0;
-  const lowerBound = result.count !== undefined && typeof result.count !== 'number'
-    ? result.count.lowerBound : result.counts.running + result.counts['probable-running'];
-  const unreadable = result.unreadable ?? (result.count !== undefined && typeof result.count !== 'number' ? result.count.unreadable : []);
+  const partial = isPartialRunningRuns(result);
+  const lowerBound = runningRunsLowerBound(result);
+  const unreadable = runningRunsUnreadable(result);
   return [
     partial
       ? `running runs: unknown (at least ${lowerBound}) unreadable: ${unreadable.map((item) => `${item.dir}:${item.reason}`).join(',')}`

@@ -93,11 +93,16 @@ describe('explicit OpenRouter Pod child', () => {
       for (const invalid of ['openrouter/z-ai/', 'openrouter//glm', 'openrouter/z-ai/glm/extra']) {
         expect(() => resolveImplementationChildModel('openrouter', invalid)).toThrow('--child-llm-model 알 수 없음');
       }
+      // 2026-10-11 CATALOG-DEEPSEEK-FLASH: `model`(glm-5.3-flash)은 이제 손 YAML(catalog/models/openrouter/)이 있어
+      //   스냅숏 없이도 카탈로그에 있다 ⇒ 「카탈로그 검증이 막는다」는 손 레코드가 «없는» id 로 잰다.
+      const unlisted = 'openrouter/acme/not-in-catalog';
       process.env.ELANOUS_CATALOG_DISCOVERY_SNAPSHOT = '/nonexistent/openrouter-catalog-snapshot.json';
-      expect(() => resolveImplementationChildModel('openrouter', model)).toThrow('--child-llm-model 알 수 없음');
+      expect(() => resolveImplementationChildModel('openrouter', unlisted)).toThrow('--child-llm-model 알 수 없음');
+      expect(resolveImplementationChildModel('openrouter', model).resolvedId).toBe(model);
       delete process.env.ELANOUS_CATALOG_DISCOVERY_SNAPSHOT;
       process.env.NODE_ENV = 'production';
-      expect(() => resolveImplementationChildModel('openrouter', model)).toThrow('--child-llm-model 알 수 없음');
+      expect(() => resolveImplementationChildModel('openrouter', unlisted)).toThrow('--child-llm-model 알 수 없음');
+      expect(resolveImplementationChildModel('openrouter', model).resolvedId).toBe(model);
     } finally {
       if (previous === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = previous;
       if (previousSnapshot === undefined) delete process.env.ELANOUS_CATALOG_DISCOVERY_SNAPSHOT;

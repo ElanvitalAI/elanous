@@ -299,8 +299,10 @@ export async function stopHarnessRun(runId: string, deps: HarnessStopDeps, conte
   const targets = dryRun ? [] : contexts && contexts.length > 0 ? [...contexts] : deps.kubeContexts();
   let jobsDeleted = 0;
   for (const context of targets) {
-    const r = deps.kubectl(['--context', context, '-n', deps.namespace, 'delete', 'job', '-l', `elanous.run=${runId}`, '--wait=false']);
-    if (r.status === 0) jobsDeleted += r.stdout.split('\n').filter((line) => line.startsWith('job.batch/')).length;
+    // `-o name` → «job.batch/<name>» 한 줄씩. 맨 출력은 «job.batch "<name>" deleted» 라 «job.batch/» 로만 세면
+    //   지워도 늘 0 이었다(10-11 · 여섯 번 «0개 지움» 뒤 Pod Terminating). 두 꼴을 다 센다.
+    const r = deps.kubectl(['--context', context, '-n', deps.namespace, 'delete', 'job', '-l', `elanous.run=${runId}`, '--wait=false', '-o', 'name']);
+    if (r.status === 0) jobsDeleted += r.stdout.split('\n').filter((line) => /^job\.batch(?:\/|\s+")/.test(line.trim())).length;
     else debug.log('harness.stop', 'job-delete-failed', { runId, context, error: r.stderr.slice(0, 200) }, { level: 'warn' });
   }
   const result: HarnessStopResult = { runId, ...(given !== runId ? { givenRunId: given } : {}), process: processState, ...(record ? { pid: record.pid } : {}), candidates, scanned: scan.status === 'ok', pidRecordFound: record !== null, dryRun, jobsDeleted, contexts: targets };

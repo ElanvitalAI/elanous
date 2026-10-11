@@ -3,6 +3,7 @@
 #   bash scripts/fleet/node-setup.sh <호스트> [--check]
 #   <호스트>  ssh 로 닿는 이름(예: node-b · node-c) — 이 맥에서 `ssh -o BatchMode=yes <호스트> true` 가 돼야 한다.
 #   --check  영구 설정을 바꾸지 않고 상태만 본다(단계마다 ✓ · ✗ · → 할 일). DNS 점검용 Pod 는 잠깐 만들었다 지운다.
+#   원격 `uname -s` = Linux(WSL Ubuntu 등)면 brew·OrbStack·Chrome·~/.zshenv 대신 리눅스 갈래(scripts/fleet/node-setup-linux.sh)를 탄다.
 # ⭐ 단계마다 «이미 돼 있으면 건너뛴다» — 몇 번 돌려도 같은 결과(재현 가능한 셋업).
 # ⛔ 원격의 다른 컨테이너·앱은 건드리지 않는다. 이 맥의 ~/.kube/config 는 바꾸기 전에 백업한다.
 set -u
@@ -20,6 +21,9 @@ echo "▶ 노드 $HOST$([ $CHECK = 1 ] && echo ' (점검만)')"
 
 # 1. ssh
 R true >/dev/null 2>&1 && ok "ssh" || { bad "ssh 불통 — 이 맥에서 ssh 키·Tailscale 확인"; exit 1; }
+# 1b. 원격 OS — Linux(WSL Ubuntu 등)면 리눅스 갈래(scripts/fleet/node-setup-linux.sh · apt·docker-ce·k3d install.sh). 맥은 아래 종전 단계 그대로.
+NODE_OS="$(R 'uname -s' 2>/dev/null)"
+if [ "$NODE_OS" = Linux ]; then . "$ROOT/scripts/fleet/node-setup-linux.sh"; linux_base; else
 # 2. brew · docker(OrbStack)
 R 'command -v brew' >/dev/null && ok "brew" || bad "brew 없음 — https://brew.sh 로 먼저 설치(사람이)"
 if R 'docker info --format "{{.ServerVersion}}"' >/dev/null 2>&1; then ok "docker $(R 'docker info --format "{{.ServerVersion}} cpu={{.NCPU}} mem={{.MemTotal}}"')"; else bad "docker 없음·꺼짐 — OrbStack 을 설치·실행(사람이 · ⛔ OrbStack 내장 k8s 는 NetworkPolicy 를 집행 안 한다 · k3d 를 쓴다)"; fi
@@ -36,6 +40,7 @@ if R 'test -f ~/.docker-fleet/config.json && DOCKER_CONFIG=~/.docker-fleet docke
 elif [ $CHECK = 1 ]; then todo "~/.docker-fleet(키체인 없는 docker 설정)"
 else R 'mkdir -p ~/.docker-fleet && ctx=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser(\"~/.docker/config.json\"))).get(\"currentContext\",\"\"))" 2>/dev/null); printf "{\"currentContext\": \"%s\"}\n" "$ctx" > ~/.docker-fleet/config.json; [ -e ~/.docker-fleet/contexts ] || ln -s ~/.docker/contexts ~/.docker-fleet/contexts; [ -e ~/.docker-fleet/cli-plugins ] || [ ! -d ~/.docker/cli-plugins ] || ln -s ~/.docker/cli-plugins ~/.docker-fleet/cli-plugins'
   R 'DOCKER_CONFIG=~/.docker-fleet docker info >/dev/null 2>&1 && DOCKER_CONFIG=~/.docker-fleet docker buildx version >/dev/null 2>&1' && ok "플릿 docker 설정 (~/.docker-fleet 생성 · buildx)" || bad "플릿 docker 설정으로 docker 에 못 붙는다"; fi
+fi
 # 3. bun — 이 맥과 «같은 판»(시험 샤딩은 판이 같아야 비교된다).
 #    ⛔ 원격에 «다른 판» bun 이 이미 있으면 덮어쓰지 않는다(그 기계의 다른 일이 쓴다) — ~/.bun-<판> 에 나란히 둔다.
 #    ⛔ 나란히 설치할 땐 설치기가 셸 설정에 PATH 를 덧붙여 기본 bun 을 가로채지 않게, 셸 설정 파일을 전후로 되돌린다.
@@ -46,6 +51,7 @@ elif [ "$side" = "$BUN_VER" ]; then ok "bun $side (~/.bun-$BUN_VER · 기본 bun
 elif [ $CHECK = 1 ]; then todo "bun $BUN_VER 설치(기본 bun ${have:-없음} — $([ -n "$have" ] && echo '건드리지 않고 ~/.bun-'"$BUN_VER"' 에 나란히' || echo '~/.bun'))"
 elif [ -z "$have" ]; then R "curl -fsSL https://bun.sh/install | bash -s bun-v$BUN_VER >/dev/null 2>&1"; [ "$(R 'bun --version')" = "$BUN_VER" ] && ok "bun $BUN_VER (설치 · ~/.bun)" || bad "bun 설치 실패"
 else R "for f in .zshrc .bashrc .bash_profile .zprofile .profile .config/fish/config.fish; do [ -f \$HOME/\$f ] && cp -p \$HOME/\$f \$HOME/\$f.fleet-bak; done; curl -fsSL https://bun.sh/install | BUN_INSTALL=\$HOME/.bun-$BUN_VER bash -s bun-v$BUN_VER >/dev/null 2>&1; for f in .zshrc .bashrc .bash_profile .zprofile .profile .config/fish/config.fish; do [ -f \$HOME/\$f.fleet-bak ] && mv \$HOME/\$f.fleet-bak \$HOME/\$f; done"; [ "$(R "$FLEET_BUN --version")" = "$BUN_VER" ] && ok "bun $BUN_VER (설치 · ~/.bun-$BUN_VER · 기본 bun $have 그대로)" || bad "bun 나란히 설치 실패"; fi
+if [ "$NODE_OS" = Linux ]; then linux_tools; else
 # 4. Chrome (CDP 시험 레인 · 이 맥과 같은 조건)
 if R 'test -d "/Applications/Google Chrome.app"'; then ok "Chrome"
 elif [ $CHECK = 1 ]; then todo "Chrome 설치"
@@ -54,8 +60,10 @@ else R 'brew install --cask google-chrome >/tmp/fleet-chrome.log 2>&1' && ok "Ch
 if R 'command -v k3d' >/dev/null; then ok "k3d $(R 'k3d version | head -1 | cut -d" " -f3')"
 elif [ $CHECK = 1 ]; then todo "k3d 설치"
 else R 'brew install k3d >/tmp/fleet-k3d.log 2>&1' && ok "k3d (설치)" || bad "k3d 설치 실패"; fi
+fi
 # 6. 클러스터 elanous-pool — API 를 0.0.0.0:<포트> 로 · 인증서 SAN = 호스트 이름 ⊕ tailnet 이름
 TSNAME="$(R '(tailscale status --self --json 2>/dev/null || /Applications/Tailscale.app/Contents/MacOS/Tailscale status --self --json 2>/dev/null) | python3 -c "import json,sys;print(json.load(sys.stdin)[\"Self\"][\"DNSName\"].rstrip(\".\"))"' 2>/dev/null)"
+if [ "$NODE_OS" = Linux ]; then linux_tsname; fi
 # 5b. 노드 로컬 레지스트리 — 델타 판올림(대표 2026-09-26): 원격 빌드가 여기로 push 하면 «없는 층만» 올라가고
 #     Pod 는 커밋 태그로 pull 한다(종전 `k3d image import` 는 4GB 전체를 클러스터 저장소로 매번 복사했다).
 REGISTRY="${ELANOUS_FLEET_REGISTRY:-elanous-registry}"; REG_PORT="${ELANOUS_FLEET_REGISTRY_PORT:-5050}"
@@ -74,9 +82,11 @@ fi
 # 🪞 호스트 git 미러(대표 09-29) — Pod 는 GitHub 대신 이 미러에서 clone 한다(`ELANOUS_POD_HOST_MIRROR` · #21929).
 #   bare 미러 = 원격 ~/mirror/elanous-agent.git(없으면 만든다 · 갱신은 이 맥의 크론이 push). 클러스터 노드에 읽기 전용으로 붙인다.
 MIRROR_DIR='$HOME/mirror'; MIRROR_MOUNT=/mirror-host
+if [ "$NODE_OS" = Linux ]; then linux_mirror; else
 if R "test -d ~/mirror/elanous-agent.git"; then ok "호스트 git 미러 ~/mirror/elanous-agent.git"
 elif [ $CHECK = 1 ]; then todo "호스트 git 미러 ~/mirror/elanous-agent.git 생성(git init --bare) ⊕ 이 맥에서 첫 push"
 else R "mkdir -p ~/mirror && git init -q --bare ~/mirror/elanous-agent.git" && ok "호스트 git 미러 (생성 · 첫 push 는 이 맥 크론)" || { bad "미러 생성 실패"; exit 1; }; fi
+fi
 # 클러스터가 그 레지스트리를 쓰나 ⊕ 미러가 붙어 있나 — 둘 중 하나라도 아니면(옛 클러스터) 돌고 있는 Job 이 없을 때만 다시 만든다.
 #   ⛔ k3d 는 볼륨을 «클러스터 생성 때만» 붙인다 — 붙이려면 다시 만들 수밖에 없다.
 REG_WIRED=0; R "docker exec k3d-$CLUSTER-server-0 cat /etc/rancher/k3s/registries.yaml 2>/dev/null | grep -q k3d-$REGISTRY" && REG_WIRED=1
@@ -177,6 +187,7 @@ kubectl --context "$CTX" --request-timeout=10s -n elanous-test delete "pod/$DNS_
 v="$(kubectl --context "$CTX" --request-timeout=10s get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}' 2>/dev/null)"
 want="${K3S_IMAGE##*:}"; want="${want/-k3s/+k3s}"
 [ "$v" = "$want" ] && ok "k3s $v" || bad "k3s ${v:-응답 없음} ≠ 기대 $want"
+if [ "$NODE_OS" = Linux ]; then linux_handoff; fi
 echo
 if [ $FAIL = 0 ] && [ $TODO -gt 0 ]; then echo "→ $HOST 할 일 $TODO — --check 없이 다시 돌리면 채운다"; exit 2
 elif [ $FAIL = 0 ]; then echo "✓ $HOST 준비됨 — 풀에 넣기: ELANOUS_POD_POOL='…,$CTX@$HOST:<상한>#k3d-$REGISTRY:$REG_PORT'"; else echo "✗ $HOST 미완 — 위 ✗ 를 먼저"; fi

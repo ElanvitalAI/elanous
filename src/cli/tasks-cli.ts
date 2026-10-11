@@ -9,9 +9,10 @@ import { readNexusRuntime } from '../nexus/runtime.js';
 import { checklistDevVersion } from '../release-loop/checklist.js';
 import { cardsBoard, countBoardTasks, INTERNAL_PACK_PROJECT, mergeBoards, releasePackBoard, type BoardNode } from '../task-agent/board.js';
 import type { Task } from '../task-orchestrator/types.js';
-import { cardPrNumber, COMPLETION_KINDS, handTask, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, nextMoveFor, resolveHandText, readTaskAgentState, readTaskCard, taskAgentStatePath as taskStatePathDefault, shellQuote, TA_LAND_ENV, TASK_CARD_PREFIX, TASK_SEATS, type CompletionKind, type TaskCard, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
+import { cardPrNumber, CLOSED_BY_HAND_EVENT, closeTaskCard, COMPLETION_KINDS, handTask, updateTaskCard, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, nextMoveFor, resolveHandText, readTaskAgentState, readTaskCard, taskAgentStatePath as taskStatePathDefault, shellQuote, TA_LAND_ENV, TASK_CARD_PREFIX, TASK_SEATS, type CompletionKind, type TaskCard, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
 import { readCardSalvageBranch, refreshCardRunBinding, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
 import { captureReviewResults } from '../task-agent/review-result-capture.js';
+import { HAND_MOVE_KINDS, recordHandMove } from '../task-agent/live-move-history.js';
 import { advanceMission, handMission, MissionAdvanceError, openMissionIds, recordPieceRef, type AdvanceMissionResult, type MissionDecompose, type PieceEvidenceReader } from '../task-agent/mission.js';
 import { formatTaskAgentCover, measureTaskAgentCover, type CoverRow, type TaskAgentCoverInput } from '../task-agent/cover.js';
 import { LogStore, STORE_SAFETY_MAX, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
@@ -44,9 +45,13 @@ export interface TasksCliDeps {
   remoteLedgerMirror?: (card: TaskCard) => void;
   /** `tasks parents` 의 낡은 부모 보고 의존(시험 주입). */
   staleParents?: import('../task-agent/parent-host.js').StaleParentDeps;
+  /** `tasks adopt-runs` 의 백필 의존(시험 주입 · 등록부·상태 파일). */
+  adoptRuns?: import('../task-agent/run-adopt.js').RunAdoptDeps;
   /** `tasks cover` logs 조회 seam. 기본은 등록된 모든 우주(운영 ⊕ test)의 logs.db 를 read-only 로 연다 —
    *  pr land 는 작업 트리마다 파생 test 우주에 기록되므로 현재 우주만 읽으면 분모가 늘 0 이다. */
   coverLogs?: (query: LogQuery) => LogStoreRow[] | CoverLogRead;
+  /** `tasks cover --by-card` 카드 원장 읽기 seam(읽기 전용). 플래그가 있을 때만 부른다. 기본 = TA 카드 원장(task-agent-actions.json). null = 못 읽음. */
+  coverCards?: () => CoverCardRow[] | null | Promise<CoverCardRow[] | null>;
   /** TA-REJUDGE-ON-HEAD — `tasks rejudge` 의 판단 의존(시험 주입 · 기본 = 설정 liveMoves ⊕ 실물 gh·리뷰·재게이트·land). */
   rejudge?: Partial<import('../task-agent/rejudge-on-head.js').RejudgeDeps>;
   /** TA-REJUDGE-ON-HEAD — `tasks regate-run` 의 재게이트(시험 주입 · 기본 `runHostRegate`). */
@@ -469,9 +474,31 @@ function coverEvents<T>(rows: readonly LogStoreRow[], category: string, event: s
   return events;
 }
 
+export interface CoverCardRow { id: string; createdAt: string }
+
+/**
+ * 분모 = TA 카드 원장(`task-agent-actions.json` · `ta-…` id) — 분자 `task-agent`/`action` 로그의 taskId 가 이 id 다.
+ * (task-cards CardStore 의 UUID 카드는 taskId 와 겹치지 않아 언제나 0/N 을 «잰 값처럼» 그린다 — 리뷰 must-fix.)
+ */
+function readCoverCards(statePath: string): CoverCardRow[] {
+  const tasks = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {};
+  return Object.values(tasks).filter((card) => typeof card?.id === 'string' && typeof card.createdAt === 'string')
+    .map(({ id, createdAt }) => ({ id, createdAt }));
+}
+
+/** Cards whose createdAt falls in the window; an unparsable createdAt is not placed in any window. */
+export function coverCardsInWindow(cards: readonly CoverCardRow[] | null, window: { sinceMs?: number; untilMs?: number }): { id: string }[] | null {
+  if (cards === null) return null;
+  return cards.filter(({ createdAt }) => {
+    const time = Date.parse(createdAt);
+    return Number.isFinite(time) && (window.sinceMs === undefined || time >= window.sinceMs) && (window.untilMs === undefined || time <= window.untilMs);
+  }).map(({ id }) => ({ id }));
+}
+
 export function readTaskAgentCover(
   window: { sinceMs?: number; untilMs?: number } = {},
   query: NonNullable<TasksCliDeps['coverLogs']> = queryCoverLogs,
+  taskCards?: readonly { id: string }[] | null,
 ): { rows: CoverRow[]; limitReached: boolean; unreadableStores: number } {
   let unreadableStores = 0;
   const read = (category: 'task-agent' | 'pr.land', event: 'action' | 'step'): { rows: LogStoreRow[]; limitReached: boolean } | null => {
@@ -490,10 +517,11 @@ export function readTaskAgentCover(
   const input: TaskAgentCoverInput = {
     taskAgentActions: actions === null ? null : coverEvents(actions, 'task-agent', 'action', (data) =>
       typeof data.kind === 'string' && typeof data.result === 'string'
-        ? { kind: data.kind as NonNullable<TaskAgentCoverInput['taskAgentActions']>[number]['kind'], result: data.result } : null),
+        ? { kind: data.kind as NonNullable<TaskAgentCoverInput['taskAgentActions']>[number]['kind'], result: data.result, ...(typeof data.taskId === 'string' ? { taskId: data.taskId } : {}) } : null),
     allLands: lands === null ? null : coverEvents(lands, 'pr.land', 'step', (data) =>
       typeof data.step === 'string' && typeof data.ok === 'boolean' ? { step: data.step, ok: data.ok } : null),
     truncated,
+    ...(taskCards === undefined ? {} : { taskCards }),
   };
   return { rows: measureTaskAgentCover(input), limitReached: truncated.taskAgentActions || truncated.allLands, unreadableStores };
 }
@@ -516,7 +544,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .option('--until <iso>', '끝 시각 (ISO)')
     .option('--json', 'JSON 출력')
     .option('--lines', '동사별 한 줄 요약 출력 (읽기 전용)')
-    .action((opts: { since?: string; until?: string; json?: boolean; lines?: boolean }) => {
+    .option('--by-card', 'review·retry·green 분모를 카드 원장(창 안 createdAt 카드 수)으로 센다 (읽기 전용)')
+    .action(async (opts: { since?: string; until?: string; json?: boolean; lines?: boolean; byCard?: boolean }) => {
       const parseIso = (value: string | undefined, flag: string): number | undefined => {
         if (value === undefined) return undefined;
         const time = Date.parse(value);
@@ -527,7 +556,16 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         const sinceMs = parseIso(opts.since, '--since');
         const untilMs = parseIso(opts.until, '--until');
         if (sinceMs !== undefined && untilMs !== undefined && sinceMs > untilMs) throw new Error('--since 가 --until 보다 늦다');
-        const { rows, limitReached, unreadableStores } = readTaskAgentCover({ sinceMs, untilMs }, deps.coverLogs);
+        let taskCards: { id: string }[] | null | undefined;
+        if (opts.byCard) {
+          let cards: CoverCardRow[] | null;
+          try { cards = await (deps.coverCards ?? (() => readCoverCards(deps.taskStatePath ?? taskStatePathDefault())))(); } catch (error) {
+            cards = null;
+            try { debug.log('task-agent.cover', 'by-card-unreadable', { error: String(error).slice(-200) }, { level: 'warn' }); } catch { /* fail-soft */ }
+          }
+          taskCards = coverCardsInWindow(cards, { sinceMs, untilMs });
+        }
+        const { rows, limitReached, unreadableStores } = readTaskAgentCover({ sinceMs, untilMs }, deps.coverLogs, taskCards);
         const limitWarning = limitReached ? `조회 상한 ${COVER_QUERY_LIMIT} 도달 — 더 오래된 사건이 있을 수 있다(절단된 수를 전체로 읽지 말 것)` : null;
         const storeWarning = unreadableStores > 0 ? `logs.db ${unreadableStores}개를 못 읽었다 — 그 우주의 사건은 수에 없다(«없다»로 읽지 말 것)` : null;
         if (opts.json) out(JSON.stringify({ rows, limitReached, unreadableStores, ...(limitWarning ? { warning: limitWarning } : {}), ...(storeWarning ? { storeWarning } : {}) }));
@@ -677,6 +715,61 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
       }
     });
 
+  tasks.command('hand-move <id>')
+    .description('HAND-MOVE-LEDGER — 자리가 손으로 마무리한 수(기존 실패 면제 · diff 재적용 · 범위 자르기 · 쪼개기 · 다른 모델 의견)를 그 카드 history 에 한 줄로 남긴다 — live-move 와 같은 원장 칸 · 기존 줄은 건드리지 않는다')
+    .requiredOption('--kind <kind>', `손으로 쓴 수 (${HAND_MOVE_KINDS.join('|')})`)
+    .requiredOption('--by <seat>', '남긴 자리(예: OP·MK·TC·UX)')
+    .requiredOption('--detail <text>', '무엇을 했나 — 한 줄')
+    .option('--pr <number>', '관련 PR 번호')
+    .action(async (id: string, opts: { kind: string; by: string; detail: string; pr?: string }) => {
+      await registerTaskAgentSink(deps.registerSink);
+      const pr = opts.pr === undefined ? undefined : Number(opts.pr);
+      if (pr !== undefined && (!Number.isInteger(pr) || pr <= 0)) { out(`--pr 은 자연수다: ${opts.pr}`); process.exitCode = 1; return; }
+      const outcome = recordHandMove(deps.taskStatePath ?? taskStatePathDefault(), id,
+        { kind: opts.kind, by: opts.by, detail: opts.detail, ...(pr !== undefined ? { pr } : {}) });
+      try {
+        debug.log('task-agent', 'hand-move', outcome.written
+          ? { card: id, kind: outcome.entry.kind, by: outcome.entry.by, ...(outcome.entry.pr !== undefined ? { pr: outcome.entry.pr } : {}) }
+          : { card: id, kind: opts.kind, by: opts.by, reason: outcome.reason });
+      } catch { /* fail-soft */ }
+      if (!outcome.written) { out(`hand-move 한 줄을 못 남겼다 — ${outcome.reason}`); process.exitCode = 1; return; }
+      out([id, 'hand-move', outcome.entry.kind, outcome.entry.by, outcome.entry.detail, ...(outcome.entry.pr !== undefined ? [`pr ${outcome.entry.pr}`] : [])].join('\t'));
+    });
+
+  tasks.command('close <cardId>')
+    .description('과제 카드를 손으로 닫는다 — 상태를 failed 로 두고 사유를 history(closed-by-hand)에 한 줄 남긴다 · 없는 카드 id 는 거부(exit 1)')
+    .requiredOption('--reason <사유>', '닫는 사유(비면 거부)')
+    .option('--by <seat>', '닫은 자리(예: OP·MK·TC·UX)', 'operator')
+    .option('--json', 'JSON 출력')
+    .action(async (cardId: string, opts: { reason: string; by: string; json?: boolean }) => {
+      await registerTaskAgentSink(deps.registerSink);
+      const statePath = deps.taskStatePath ?? taskStatePathDefault();
+      try {
+        let found: TaskCard | undefined;
+        let changed = false;
+        const updated = updateTaskCard(statePath, cardId, (current) => {
+          if (!current) return undefined;
+          found = current;
+          const next = closeTaskCard(current, { reason: opts.reason, by: opts.by, at: new Date().toISOString() });
+          if (next === current) return undefined; // 이미 손으로 닫힘 — 다시 쓰지 않는다(멱등)
+          changed = true;
+          return next;
+        });
+        if (!found) { out(`과제 카드 없음: ${cardId}`); process.exitCode = 1; return; }
+        const card: TaskCard = updated ?? found;
+        const from = (found as TaskCard).status;
+        // 이미 닫힌 카드면 «저장된» 사유를 낸다 — 새로 준 사유는 원장에 없다.
+        const stored = [...card.history].reverse().find((item) => item.event === CLOSED_BY_HAND_EVENT);
+        const reason = changed ? opts.reason.trim() : (stored?.reason ?? stored?.detail ?? opts.reason.trim());
+        if (changed) { try { debug.log('task-agent', 'card-closed-by-hand', { id: cardId, from, by: opts.by, reason }); } catch { /* fail-soft */ } }
+        if (opts.json) out(JSON.stringify({ id: card.id, from, to: card.status, reason, ...(changed ? {} : { already: true }) }));
+        else out([card.id, card.status, changed ? 'closed-by-hand' : 'already-closed-by-hand', changed ? opts.by : (stored?.by ?? '-'), reason].join('\t'));
+      } catch (error) {
+        out(error instanceof Error ? error.message : '과제 카드 닫기 실패');
+        process.exitCode = 1;
+      }
+    });
+
   tasks.command('parents')
     .description('낡은 하니스 부모 보고(읽기 전용 · 죽이지 않는다) — 나이 ≥ N 시간이고 런 원장이 끝났거나(run-status) Pod 이 없는 `harness say|ask` 부모')
     .option('--older-than <hours>', '나이 하한(시간)', '6')
@@ -701,6 +794,18 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
       out(`하니스 부모 ${report.scanned} · 나이 ≥ ${hours}h 중 낡음 후보 ${report.rows.length}${report.podRunsMeasured ? '' : ' · ⚠ Pod 목록 못 잼(원장 근거만)'} — 읽기 전용(죽이지 않는다)`);
       out('pid\t나이h\t자리\t판\t런\t사유');
       for (const row of report.rows) out([row.pid, row.ageHours, row.seat ?? '-', row.version ?? '-', row.runId ?? '-', row.reasons.join(',')].join('\t'));
+    });
+
+  tasks.command('adopt-runs')
+    .description('TA-OWN-ALL-RUNS 백필 — 발사 등록부의 이 우주 런 중 카드 없는 것에 `ta-<runId>` 카드를 만든다(발사 훅 이전 런 몫 · 있으면 건드리지 않는다)')
+    .option('--json', 'JSON 출력')
+    .action(async (opts: { json?: boolean }) => {
+      const { adoptUncardedRuns } = await import('../task-agent/run-adopt.js');
+      const report = adoptUncardedRuns({ ...(deps.taskStatePath ? { statePath: deps.taskStatePath } : {}), ...deps.adoptRuns });
+      try { debug.log('task-agent', 'run-adopt-backfill', report); } catch { /* fail-soft */ }
+      if (opts.json) { out(JSON.stringify(report)); return; }
+      const skipped = Object.entries(report.skipped).sort(([a], [b]) => a.localeCompare(b)).map(([reason, n]) => `${reason} ${n}`).join(' · ') || '없음';
+      out(`등록부 런 ${report.scanned} · 카드 만듦 ${report.adopted} · 건너뜀 ${skipped}`);
     });
 
   tasks.command('board')

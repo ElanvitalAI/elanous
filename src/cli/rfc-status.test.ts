@@ -75,3 +75,34 @@ test('docs CLI command is registered and scans only the provided repository', ()
     expect(result).toContain('completed\t모름\t모름\t모름\tdocs/manual/MANUAL-A.md\t-\t-\tdocs/RFC-A.md');
   });
 });
+
+test('rfc-status appends hub backlink and family omission counts', () => {
+  fixture((root) => {
+    writeFileSync(join(root, 'docs', 'INDEX-loop-agents-and-harness-rfcs.md'),
+      '[Loop RFC](RFC-loop-backlink-gap.md)\n');
+    writeFileSync(join(root, 'docs', 'RFC-loop-backlink-gap.md'), '# RFC — 루프 연결 점검\n');
+    writeFileSync(join(root, 'docs', 'RFC-harness-unlisted.md'), '# RFC — 하니스 미등재 항목\n');
+
+    let output = '';
+    runRfcStatus({}, root, (text) => { output += text; });
+
+    expect(output.trimEnd().split('\n').at(-1)).toBe('허브 연결: 되돌림 없음 1 · 미등재 1');
+  });
+});
+
+test('rfc-status hub line — a hub-linked backlink and a listed family RFC are not counted; no hub is «못 셈», not 0', () => {
+  fixture((root) => {
+    writeFileSync(join(root, 'docs', 'INDEX-loop-agents-and-harness-rfcs.md'), '[Graph RFC](RFC-graph-linked.md)\n');
+    writeFileSync(join(root, 'docs', 'RFC-graph-linked.md'),
+      '# RFC — 그래프 연결됨\n> 🔗 연결 참조: [허브](INDEX-loop-agents-and-harness-rfcs.md)\n\n## 본문\n');
+    let output = '';
+    runRfcStatus({}, root, (text) => { output += text; });
+    expect(output.trimEnd().split('\n').at(-1)).toBe('허브 연결: 되돌림 없음 0 · 미등재 0');
+  });
+  fixture((root) => {
+    writeFileSync(join(root, 'docs', 'RFC-loop-orphan.md'), '# RFC — 루프 고아\n');
+    let output = '';
+    runRfcStatus({}, root, (text) => { output += text; });
+    expect(output.trimEnd().split('\n').at(-1)).toContain('허브 연결: 못 셈');
+  });
+});

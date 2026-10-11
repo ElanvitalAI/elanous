@@ -182,13 +182,34 @@ export async function fetchGrokUsage(
   }
 }
 
-/** 이 조회는 구독 풀 잔량·리셋을 주지 않는다. 0·빈칸·미상과 다른 값. */
+/** 주간 사용률·리셋이 없거나 유효하지 않은 응답에서 구독 축이 제공되지 않음을 나타낸다. */
 export const GROK_SUBSCRIPTION_AXIS = {
   status: 'unavailable',
   reason: 'query-does-not-supply',
 } as const;
 
-/** 원본 크레딧 사용률·창·금액류 → 크레딧 축. ⛔ 구독 축으로 전용하지 않는다. */
+/** billing 쿼리가 주간 창과 사용률을 함께 돌려준 경우에만 실제 구독 잔량을 구성한다. */
+export function grokUsageToSubscriptionAxis(usage: GrokUsage):
+  | { readonly status: 'available'; readonly remainingPercent: number; readonly resetsAt: number; readonly windowKind: 'weekly' }
+  | typeof GROK_SUBSCRIPTION_AXIS {
+  const end = usage.periodEnd === null ? Number.NaN : Date.parse(usage.periodEnd);
+  if (
+    usage.periodType !== 'USAGE_PERIOD_TYPE_WEEKLY'
+    || usage.usedPercent === null
+    || !Number.isFinite(usage.usedPercent)
+    || usage.usedPercent < 0
+    || usage.usedPercent > 100
+    || !Number.isFinite(end)
+  ) return GROK_SUBSCRIPTION_AXIS;
+  return {
+    status: 'available',
+    remainingPercent: 100 - usage.usedPercent,
+    resetsAt: end,
+    windowKind: 'weekly',
+  };
+}
+
+/** 원본 크레딧 사용률·창·금액류 → 크레딧 축. ⛔ 크레딧 숫자만으로 구독 잔량을 만들지 않는다. */
 export function grokUsageToCreditAxis(usage: GrokUsage): {
   readonly status: 'ok';
   readonly usedPercent: number | null;

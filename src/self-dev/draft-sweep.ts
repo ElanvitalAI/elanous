@@ -4,6 +4,7 @@ import { decideDraft, draftClaimComment, draftClaimState, draftReleaseComment, l
 import { cardPrNumber, draftTaskOwner, type TaskCard } from '../task-agent/task-hand.js';
 import type { PrTerminalRecord } from './draft-residue.js';
 import { branchLineageSlug } from '../cli/pr-lineage.js';
+import { branchLineageKey } from '../harness/worktree-branch-prefix.js';
 
 export interface SweepDraft extends DraftTriagePr {
   readonly title: string;
@@ -60,6 +61,12 @@ export interface DraftSweepAdapters {
   getReviewGate?(draft: SweepDraft, repository: string): Promise<SweepReviewGate | undefined>;
   /** One PR by number (any state); undefined means it could not be read. Only overlap metrics need it. */
   getPr?(repository: string, number: number): Promise<SweepMergedPr | undefined>;
+  /**
+   * Stops the still-live run behind a draft that a newer, also live, same-lineage run supersedes (`--apply` only).
+   * Must reject when the run could not be stopped — the draft is then neither labelled nor closed.
+   * Absent ⇒ a live duplicate is kept, never closed.
+   */
+  supersedeRun?(draft: SweepDraft, repository: string, newer: SweepDraft): Promise<void>;
 }
 
 /** Review PASS and gate posture used only by the daily old-draft count. */
@@ -136,6 +143,19 @@ export interface DraftMetrics {
   readonly converted48h: number;
   readonly cohort48h: number;
   readonly conversion48h: number | null;
+}
+
+/** Default maximum unclaimed open harness drafts for one seat. */
+export const DRAFT_NEEDS_OWNER_SEAT_CAP = 15;
+
+/** Compare one seat's observed needsOwner count; the caller supplies counts of open drafts by seat. */
+export function isSeatDraftNeedsOwnerOverCap(
+  seat: string,
+  needsOwnerBySeat: Readonly<Record<string, number>>,
+  cap = DRAFT_NEEDS_OWNER_SEAT_CAP,
+): boolean {
+  const count = Object.hasOwn(needsOwnerBySeat, seat) ? needsOwnerBySeat[seat] : undefined;
+  return typeof count === 'number' && Number.isFinite(count) && count > cap;
 }
 
 export async function collectDraftMetrics(repository: string, adapters: Pick<DraftSweepAdapters, 'listDrafts' | 'listRecentClosed' | 'getActiveClaimOwner'>, now: Date): Promise<DraftMetrics> {
@@ -444,6 +464,7 @@ const stalledLabel = label('close', 'stalled');
 const supersededLabel = label('close', 'superseded');
 const approvalLabel = PR_LABELS.find((entry) => entry.axis === 'state' && entry.sweep.action === 'none')?.name;
 const keepLabel = PR_LABELS.find((entry) => entry.sweep.action === 'exclude')?.name;
+const benchLabel = PR_LABELS.find((entry) => entry.name === 'elanous:bench')!.name;
 const releaseHoldLabel = PR_LABELS.find((entry) => entry.axis === 'addon' && entry.sweep.action === 'none')?.name;
 const harvestableLabel = PR_LABELS.find((entry) => entry.name === 'elanous:harvestable')!.name;
 const PAGE_SIZE = 100;
@@ -596,7 +617,24 @@ export async function mapBounded<T, R>(items: readonly T[], limit: number, work:
 }
 
 function harnessDraft(draft: SweepDraft): boolean {
+  // BENCH-ISOLATED-ARMS — a bench arm PR is comparison material: the sweep never marks, supersedes or closes it.
+  if (draft.labels.includes(benchLabel)) return false;
   return draft.branch.startsWith('self-impl/') || draft.labels.some((name) => name.startsWith('elanous:'));
+}
+
+/**
+ * The newest open draft of the same goal lineage that was created strictly after `draft` — a rerun
+ * (e.g. a forced requeue) of the same goal. Reads only the branch, so a draft with no task card still has a lineage.
+ * ⛔ A branch without a goal id has no lineage key and never matches.
+ */
+export function newerLineageDraft(draft: SweepDraft, openDrafts: readonly SweepDraft[]): SweepDraft | undefined {
+  const key = branchLineageKey(draft.branch);
+  const created = Date.parse(draft.createdAt);
+  if (key === null || !Number.isFinite(created)) return undefined;
+  return openDrafts
+    .filter((pr) => pr.number !== draft.number && branchLineageKey(pr.branch) === key
+      && Number.isFinite(Date.parse(pr.createdAt)) && Date.parse(pr.createdAt) > created)
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt) || b.number - a.number)[0];
 }
 
 /**
@@ -842,6 +880,71 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     const ageHours = (now.getTime() - Date.parse(draft.createdAt)) / 3_600_000;
     const idleHours = typeof draft.updatedAt === 'string' && Number.isFinite(Date.parse(draft.updatedAt))
       ? (now.getTime() - Date.parse(draft.updatedAt)) / 3_600_000 : NaN;
+    // A newer open draft of the same goal lineage (a rerun, e.g. a forced requeue) supersedes this one even when
+    // its running claim is fresh or its run is still live. Holds, merged twins and the title-based duplicate rule keep their priority.
+    const lineageNewer = contradiction || draft.labels.includes(harvestableLabel) ? undefined : newerLineageDraft(draft, drafts);
+    if (lineageNewer) {
+      const base = decideDraft({ draft, runStatus, mergedTwins: merged, openDrafts: drafts, liveBranches,
+        finalRunResult, ageHours: runStatus ? ageHours : idleHours });
+      if (!base.reason.startsWith('label:') && !base.reason.startsWith('superseded-by #') && !base.reason.startsWith('duplicate-of-open #')) {
+        const live = (status: string | undefined, branch: string) => status === 'running' || status === 'probable-running'
+          || (status !== 'self-implement.result final' && liveBranches.has(branch));
+        const runLive = live(runStatus, draft.branch);
+        const lineageKey = branchLineageKey(draft.branch);
+        const reason = `duplicate-of-open #${lineageNewer.number} (lineage ${lineageKey})${runLive ? ` · stop run ${draft.runId ?? 'unknown'}` : ''}`;
+        // Every lineage outcome that does not close falls through to the existing rules (preservation contract):
+        // a duplicate this rule cannot settle is decided exactly as it was before this rule existed.
+        const fallThrough = (why: string) => {
+          try { debug.log('self-dev.draft-sweep', 'lineage-fall-through', { number: draft.number, newer: lineageNewer.number, lineageKey, why }); } catch { /* fail-soft */ }
+        };
+        if (runLive && !adapters.supersedeRun) fallThrough('lineage-duplicate-run-live');
+        // Safety (OP 10-11): a live run is stopped only when the newer run of the same lineage is itself live —
+        // never trade a running attempt for one that already ended or was never observed running.
+        else if (runLive && !live(statuses.get(lineageNewer.number), lineageNewer.branch)) fallThrough('lineage-newer-run-not-live');
+        else if (closes >= closeCap) {
+          record({ number: draft.number, action: 'keep', reason: 'close-cap', applied: false });
+          continue;
+        } else {
+          let stopFailed = false;
+          // --apply only: the run is stopped before anything is written; a stop that cannot be confirmed writes nothing.
+          if (apply && runLive) {
+            const observed = { number: draft.number, newer: lineageNewer.number, runId: draft.runId ?? null, newerRunId: lineageNewer.runId ?? null, lineageKey };
+            try {
+              await adapters.supersedeRun!(draft, repository, lineageNewer);
+              try { debug.log('self-dev.draft-sweep', 'supersede-run', observed); } catch { /* fail-soft */ }
+            } catch (error) {
+              stopFailed = true;
+              try { debug.log('self-dev.draft-sweep', 'supersede-run-failed', { ...observed, reason: sweepFailureReason(error) }, { level: 'warn' }); } catch { /* fail-soft */ }
+            }
+          }
+          if (stopFailed) fallThrough('supersede-run-failed');
+          else {
+            // A close is counted against the cap only once it is decided here; a failed write gives the slot back.
+            closes += 1;
+            const entry: DraftSweepEntry = { number: draft.number, action: 'close', reason, statusLabel: supersededLabel, applied: false };
+            record(entry);
+            if (!apply) continue;
+            let labelsChanged = false;
+            try {
+              if (!draft.labels.includes(supersededLabel)) {
+                await adapters.setLabels(repository, draft.number, {
+                  add: supersededLabel, remove: states.map((state) => state.name).filter((name) => name !== supersededLabel),
+                });
+                labelsChanged = true;
+              }
+              await adapters.closeDraft(repository, draft.number,
+                `Draft sweep: ${reason} (https://github.com/${repository}/pull/${lineageNewer.number}). Branch preserved.`);
+              entry.applied = true;
+            } catch (error) {
+              if (labelsChanged) entry.partialApplied = true;
+              else closes -= 1;
+              entry.error = String(error);
+            }
+            continue;
+          }
+        }
+      }
+    }
     // An unobserved claim may still have a merged twin: liveness/holds retain their priority,
     // but a superseded draft must not be hidden by the six-hour claim window.
     const mergedDecision = isClaimed ? decideDraft({ draft, runStatus, mergedTwins: merged, openDrafts: drafts, liveBranches,

@@ -15,7 +15,10 @@
 //         `kimi` 는 *"unknown provider"* 라 «아무것도» 말하지 않는다)
 //
 // ⛔ 「셋을 구현하라」도 「union 에서 지우라」도 ***이 자의 주장이 아니다.*** 이 자는 «드러내기»만 한다.
-import { describe, it, expect } from 'bun:test';
+import { afterAll, beforeAll, describe, it, expect } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { LLM_TIER_MAP_BY_PROVIDER, TIER_PROVIDERS } from './llm-tier-map.js';
 import { MODEL_TIERS } from './types.js';
 
@@ -80,6 +83,22 @@ describe('provider 배선 계약 — 사다리가 약속한 것이 «생성되�
 });
 
 describe('wip 계열의 안내가 «실제로 도는 길»을 가리킨다 (2026-09-23)', () => {
+  // ⛔ ZAI-CODING-PLAN-PROVIDER(10-11) — `glm` 은 `ZAI_API_KEY` 가 있으면 «직결로 선다». 이 판정은 «키 없음» 전제를
+  //   이름으로 세운다(키 캐시는 파일이라 env 만 지우면 안 된다 · `_resetKeyCacheForTests` 머리말).
+  const savedEnv = { cacheDir: process.env.ELANOUS_KEY_CACHE_DIR, zai: process.env.ZAI_API_KEY };
+  let emptyCacheDir = '';
+  beforeAll(async () => {
+    emptyCacheDir = mkdtempSync(join(tmpdir(), 'wip-guide-nokey-'));
+    process.env.ELANOUS_KEY_CACHE_DIR = emptyCacheDir;
+    delete process.env.ZAI_API_KEY;
+    (await import('../config.js'))._resetKeyCacheForTests();
+  });
+  afterAll(async () => {
+    if (savedEnv.cacheDir === undefined) delete process.env.ELANOUS_KEY_CACHE_DIR; else process.env.ELANOUS_KEY_CACHE_DIR = savedEnv.cacheDir;
+    if (savedEnv.zai === undefined) delete process.env.ZAI_API_KEY; else process.env.ZAI_API_KEY = savedEnv.zai;
+    rmSync(emptyCacheDir, { recursive: true, force: true });
+    (await import('../config.js'))._resetKeyCacheForTests();
+  });
   it('kimi·qwen·glm 의 안내 속 모델은 openrouter 사다리에 선 모델이다', async () => {
     const shippingOpenRouter = new Set(MODEL_TIERS.map((t) => LLM_TIER_MAP_BY_PROVIDER.openrouter[t].model));
     for (const provider of ['kimi', 'qwen', 'glm']) {

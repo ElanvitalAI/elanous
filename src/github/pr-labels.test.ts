@@ -9,7 +9,7 @@ describe('PR label registry', () => {
       'elanous:running', 'elanous:stalled', 'elanous:idea-approval', 'elanous:superseded',
     ]);
     expect(labelsForAxis('addon').map(({ name }) => name)).toEqual([
-      'elanous:keep', 'elanous:release-hold', 'elanous:idea-stale', 'elanous:needs-rebase', 'elanous:harvestable',
+      'elanous:keep', 'elanous:release-hold', 'elanous:idea-stale', 'elanous:needs-rebase', 'elanous:bench', 'elanous:harvestable',
     ]);
     expect(labelsForAxis('origin').map(({ name }) => name)).toEqual([
       'elanous:from-harness', 'elanous:from-intake', 'elanous:from-linear',

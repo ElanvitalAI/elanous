@@ -174,6 +174,8 @@ export interface AgentBackend {
   args: string[];
   /** 구독 모드 위해 스크럽할 env 키(API 과금 회피). */
   scrubEnv?: string[];
+  /** 이 실행에만 덧씌울 env(스크럽 뒤 · 바깥 값을 «덮는다»). CODEX-CREDITS-STEP 재시도가 크레딧 계정의 `CODEX_HOME` 을 싣는다. */
+  env?: Readonly<Record<string, string>>;
   /** 초기 신뢰/권한 프롬프트 처리 — 스크린 보고 필요 시 키 입력. 처리했으면 true. */
   handleTrust?(screen: string, write: (s: string) => void): boolean;
 }
@@ -341,6 +343,7 @@ export function resolveBackendSpawn(
       forcedEnv.push(key);
     }
   }
+  for (const [key, value] of Object.entries(backend.env ?? {})) env[key] = value;
   let nestedEnvRemovedCount = 0;
   for (const key of NESTED_AGENT_ENV_BLOCKLIST) {
     if (key in env) {
@@ -464,6 +467,10 @@ export function resolveDefaultBackend(
       debug.log('agent-mission.backend', 'fallback-switch', { from: 'codex', to: decision.backend, reason: 'codex-exhausted' });
       return decision.backend === 'claude' ? claudeBackend : grokBackend;
     }
+    if (decision.action === 'codex-credits') {
+      // CODEX-CREDITS-STEP — 체인 마지막 칸: codex 로 «돌아와» 선불 크레딧으로 계속(판정 쪽이 이미 관측을 남겼다).
+      debug.log('agent-mission.backend', 'fallback-codex-credits', { from: 'codex', to: 'codex', reason: 'chain-last-step' });
+    }
   } catch (err) {
     debug.log('agent-mission.backend', 'fallback-failed', { message: (err as Error)?.message }, { level: 'warn' });
   }
@@ -522,10 +529,17 @@ export function decideRuntimeFallback(
   failure: unknown,
   currentStep: FallbackStep,
   state: RuntimeFallbackState,
-  decide: (input: { currentStep: FallbackStep; currentCredentialRateLimited: true }) => { action: string; backend?: string },
+  decide: (input: { currentStep: FallbackStep; currentCredentialRateLimited: true }) => { action: string; backend?: string; to?: { readonly name: string; readonly home: string } },
 ): AgentBackend | null {
   if (classifyAuthError(failure).errorKind !== 'rate-limited' || state.descents >= state.maxDescents) return null;
   const decision = decide({ currentStep, currentCredentialRateLimited: true });
+  // CODEX-CREDITS-STEP — grok 등이 한도로 죽고 체인의 다음 칸이 `codex-credits` 면 codex 로 돌아온다(크레딧 · 한 번만).
+  if (decision.action === 'codex-credits') {
+    if (state.attemptedSteps.has('codex-credits')) return null;
+    // 판정이 고른 크레딧 계정(잔액 많은 순)의 홈으로 자식 codex 를 띄운다 — 없으면 호스트 CODEX_HOME 그대로.
+    const home = decision.to?.home?.trim();
+    return home ? { ...codexBackend, env: { CODEX_HOME: home } } : codexBackend;
+  }
   if (decision.action !== 'switch-backend') return null;
   const nextStep = decision.backend === 'grok' ? 'grok' : decision.backend === 'claude' ? 'claude-pty' : null;
   if (!nextStep || state.attemptedSteps.has(nextStep)) return null;
@@ -642,7 +656,7 @@ export interface AgentMissionDeps {
   /** Inject controller responses while keeping the production control loop. */
   controlStream?: StreamLLMFn;
   resolvePtyWebAddress?: typeof resolvePtyWebAddress;
-  resolveRunFallback?: (input: { currentStep: FallbackStep; currentCredentialRateLimited: true }) => { action: string; backend?: string };
+  resolveRunFallback?: (input: { currentStep: FallbackStep; currentCredentialRateLimited: true }) => { action: string; backend?: string; to?: { readonly name: string; readonly home: string } };
   /** 재귀 재시도 사이에만 전달되는 런 로컬 폴백 진행 상태. */
   runtimeFallback?: RuntimeFallbackContext;
   reemitPtyUsage?: typeof reemitPtyUsage;
@@ -2310,7 +2324,8 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     });
     if (nextBackend && !deps.isMissionAborted?.()) {
       decisionEvent({ step: 'recover', text: `Switching ${backend.name} to ${nextBackend.name}`, detail: { blocked: control.termination.message, action: `Retry with ${nextBackend.name}` } });
-      const nextStep: FallbackStep = nextBackend.name === 'grok' ? 'grok' : nextBackend.name === 'claude' ? 'claude-pty' : 'codex-rotate';
+      // runtime 이 codex 로 «돌아오는» 길은 `codex-credits` 칸뿐이다(decideRuntimeFallback) — 그 칸을 시도한 것으로 적는다.
+      const nextStep: FallbackStep = nextBackend.name === 'grok' ? 'grok' : nextBackend.name === 'claude' ? 'claude-pty' : 'codex-credits';
       stopLive();
       if (h.pid) await (deps.terminateProcessTree ?? terminateMissionProcessTree)(h.pid);
       try { h.kill(); } catch { /* noop */ }

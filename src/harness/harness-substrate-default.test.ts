@@ -3,15 +3,17 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
-import { getUserConfig, saveUserConfig, setUserConfigOverlay, type UserConfig } from '../user-config.js';
+import { buildUserConfig, getUserConfig, saveUserConfig, setUserConfigOverlay, type UserConfig } from '../user-config.js';
 import * as podDispatch from './harness-pod-dispatch.js';
-import { harnessLaunchPolicyConfig, resolveHarnessSubstrate } from './harness-substrate-default.js';
+import { AUTO_LOCAL_MIN_AVAILABLE_MEMORY_BYTES, checkHarnessPodPool, harnessLaunchPolicyConfig, nextLocalLaneCap, resolveHarnessSubstrate, routeAutoSubstrate } from './harness-substrate-default.js';
+import { debug } from '../debug/log.js';
 import { devAskPodDispatchInput } from './harness-substrate-default.js';
 import { installHarnessCliCommand } from './harness-cli-command.js';
 import { resolveCodexQuotaPolicy, codexPolicyAllowsCredits } from '../oauth/codex-quota-policy.js';
 import { normalizeFallbackChain } from '../oauth/fallback-chain.js';
 import { planPodProvider } from '../task-orchestrator/surfaces/pod-account-broker.js';
 import { resolvePodPoolSpec } from '../task-orchestrator/surfaces/pod-pool.js';
+import { recommendConcurrency, type PoolLeaseMeasure } from '../task-orchestrator/surfaces/pod-lease.js';
 import { program } from '../index.js';
 import * as podPool from '../task-orchestrator/surfaces/pod-pool.js';
 import * as podSurface from '../task-orchestrator/surfaces/self-implement-pod.js';
@@ -95,7 +97,9 @@ test('selfOrchestrateCmd uses operational policy under NODE_ENV=test with a miss
   const derivedRoot = join(root, 'derived');
   mkdirSync(operationalRoot);
   mkdirSync(derivedRoot);
-  const operational = { llm: { codexQuotaPolicy: 'credits', codexAccountRotationThresholdPercentByAccount: { team: 97, other: 99 }, fallbackChain: ['codex-rotate'] }, harness: { podPool: 'pool-node-b@node-b:8' } };
+  // SUBSCRIPTION-EXHAUST-REROUTE: this test measures the codex account plan, so the Pod child default (openrouter) is off —
+  //   otherwise the result depends on whether the runner has an OpenRouter key.
+  const operational = { llm: { codexQuotaPolicy: 'credits', codexAccountRotationThresholdPercentByAccount: { team: 97, other: 99 }, fallbackChain: ['codex-rotate'] }, harness: { podPool: 'pool-node-b@node-b:8' }, tools: { selfImplement: { podChildDefault: 'off' } } };
   writeFileSync(join(operationalRoot, 'config.json'), JSON.stringify(operational));
   const originalHome = process.env.HOME;
   const originalXdg = process.env.XDG_CONFIG_HOME;
@@ -224,6 +228,27 @@ test('selfOrchestrateCmd uses operational policy under NODE_ENV=test with a miss
       expect((providerPlans.at(-1) as Extract<accountBroker.PodProviderPlan, { provider: null }>).reasons.join(' ')).toContain('grok: 구독 자격 없음');
       expect(warnings.filter((line) => line.includes('launch policy: 파생 시험 우주 정책이 없거나 운영과 다르다'))).toHaveLength(1);
     } finally { usable.mockRestore(); }
+
+    // SUBSCRIPTION-EXHAUST-REROUTE — runtime wiring: with no --child-llm-* and no podChildDefault in the operational
+    //   policy, the real `self orchestrate --substrate pod` action hands the Pod spawn an openrouter/glm-5.3 child and
+    //   never asks the codex account broker.
+    writeFileSync(join(operationalRoot, 'config.json'), JSON.stringify({ ...operational, tools: { selfImplement: {} } }));
+    writeFileSync(join(derivedRoot, 'config.json'), JSON.stringify({ ...operational, tools: { selfImplement: {} } }));
+    const originalOrKey = process.env.OPENROUTER_API_KEY;
+    process.env.OPENROUTER_API_KEY = 'fixture-openrouter-key';
+    const spawnOptions: Array<Record<string, unknown>> = [];
+    const actualSpawn = podSurface.podSelfImplementSpawn;
+    const spawn = spyOn(podSurface, 'podSelfImplementSpawn').mockImplementation(((options: Record<string, unknown>) => { spawnOptions.push(options); return actualSpawn(options as never); }) as never);
+    try {
+      const brokerCalls = broker.mock.calls.length;
+      await program.parseAsync(['node', 'elanous', 'self', 'orchestrate', 'default probe', '--substrate', 'pod', '--no-pod-rebuild', '--no-supervise', '--json']);
+      expect(broker.mock.calls.length).toBe(brokerCalls);
+      expect(spawnOptions.at(-1)).toMatchObject({ provider: 'openrouter', childModel: 'openrouter/z-ai/glm-5.3', childProviderExplicit: true, account: 'openrouter' });
+      expect((spawnOptions.at(-1)!.passEnv as string[])).toContain('OPENROUTER_API_KEY');
+    } finally {
+      spawn.mockRestore();
+      if (originalOrKey === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = originalOrKey;
+    }
   } finally {
     process.argv.splice(process.argv.lastIndexOf('--harness-internal'), 1);
     orchestrateCommand.setOptionValue('goalFile', originalGoalFiles);
@@ -345,6 +370,147 @@ test('an explicit config-dir remains isolated even when the state dir was stampe
 });
 const context = () => 'current-context';
 
+const spareHost = {
+  podAdmission: { recommended: 0, limitedBy: 'memory' as const },
+  load1: 3, cores: 8, availableMemoryBytes: AUTO_LOCAL_MIN_AVAILABLE_MEMORY_BYTES, localLaneOpen: true,
+};
+
+describe('next local lane cap', () => {
+  const request = {
+    current: 30, wanted: 50, lastRaisedAtMs: null, nowMs: 1_000_000,
+    load1: 3, cores: 8,
+  };
+
+  test('raises a 30→50 request by at most five and emits the lane-step observation', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      expect(nextLocalLaneCap(request)).toEqual({ cap: 35, action: 'raise', reason: 'local-load-spare' });
+      expect(log).toHaveBeenCalledWith('harness.guardian', 'lane-step', {
+        ...request, cap: 35, action: 'raise', reason: 'local-load-spare',
+      });
+    } finally { log.mockRestore(); }
+  });
+
+  test('holds another increase before fifteen minutes, then permits it at the boundary', () => {
+    const lastRaisedAtMs = 1_000_000;
+    expect(nextLocalLaneCap({ ...request, current: 35, lastRaisedAtMs, nowMs: lastRaisedAtMs + 15 * 60 * 1000 - 1 }))
+      .toEqual({ cap: 35, action: 'hold', reason: 'raise-cooldown' });
+    expect(nextLocalLaneCap({ ...request, current: 35, lastRaisedAtMs, nowMs: lastRaisedAtMs + 15 * 60 * 1000 }))
+      .toEqual({ cap: 40, action: 'raise', reason: 'local-load-spare' });
+  });
+
+  test('lowers the cap immediately when load reaches the core count', () => {
+    expect(nextLocalLaneCap({ ...request, load1: 8 }))
+      .toEqual({ cap: 25, action: 'lower', reason: 'local-load-overloaded' });
+  });
+
+  test('holds when load or core count is unreadable', () => {
+    expect(nextLocalLaneCap({ ...request, load1: null }))
+      .toEqual({ cap: 30, action: 'hold', reason: 'load-unreadable' });
+    expect(nextLocalLaneCap({ ...request, cores: null }))
+      .toEqual({ cap: 30, action: 'hold', reason: 'load-unreadable' });
+    expect(nextLocalLaneCap({ ...request, load1: Number.NaN }))
+      .toEqual({ cap: 30, action: 'hold', reason: 'load-unreadable' });
+  });
+});
+
+describe('auto substrate routing', () => {
+  test('real lease recommendation limited by memory feeds auto routing', () => {
+    const gi = 1024 ** 3;
+    const measure: PoolLeaseMeasure = { members: [{
+      context: 'pool-node-b', capacity: 8, running: 0, pending: 0, unleasedRunning: 0,
+      memoryLimitBytes: 0, allocatableMemoryBytes: 8 * gi, allocatableCpuMillicores: 8_000,
+      availableMemoryByNodeBytes: [8 * gi], reason: null,
+    }] };
+    const admission = recommendConcurrency(measure, { capacity: 8, accounts: 1, perAccount: 1 });
+    expect(admission).toMatchObject({ recommended: 0, limitedBy: 'memory' });
+    expect(routeAutoSubstrate({ ...spareHost, podAdmission: admission }))
+      .toEqual({ substrate: 'local', reason: 'pod-memory-blocked-local-spare' });
+  });
+
+  test('memory-limited Pod admission and a spare launch host take local with one reason', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      expect(routeAutoSubstrate(spareHost)).toEqual({ substrate: 'local', reason: 'pod-memory-blocked-local-spare' });
+      expect(resolveHarnessSubstrate({ flag: { substrate: 'auto' }, config: config('pod', 'pool-node-b@node-b:8'), autoSignals: spareHost, env: {}, currentContext: context }))
+        .toEqual({ substrate: 'local', pool: null, source: 'flag' });
+      expect(log).toHaveBeenCalledWith('harness.substrate', 'route', { substrate: 'local', reason: 'pod-memory-blocked-local-spare', source: 'flag' });
+    } finally { log.mockRestore(); }
+  });
+
+  test('Pod remains the auto default with exactly one reason when any local prerequisite fails', () => {
+    for (const [signals, reason] of [
+      [{ ...spareHost, podAdmission: { recommended: 1, limitedBy: 'memory' as const } }, 'pod-admission-not-memory-blocked'],
+      [{ ...spareHost, podAdmission: { recommended: 0, limitedBy: 'capacity' as const } }, 'pod-admission-not-memory-blocked'],
+      [{ ...spareHost, podAdmission: null }, 'pod-admission-unobserved'],
+      [{ ...spareHost, podAdmission: { recommended: null, limitedBy: null } }, 'pod-admission-unobserved'],
+      [{ ...spareHost, podAdmission: { recommended: 0, limitedBy: null } }, 'pod-admission-unobserved'],
+      [{ ...spareHost, localLaneOpen: false }, 'local-lane-closed'],
+      [{ ...spareHost, load1: 4 }, 'local-load-not-spare'],
+      [{ ...spareHost, load1: null }, 'local-load-not-spare'],
+      [{ ...spareHost, cores: 0 }, 'local-load-not-spare'],
+      [{ ...spareHost, availableMemoryBytes: AUTO_LOCAL_MIN_AVAILABLE_MEMORY_BYTES - 1 }, 'local-memory-not-spare'],
+      [{ ...spareHost, availableMemoryBytes: null }, 'local-memory-not-spare'],
+    ] as const) expect(routeAutoSubstrate(signals)).toEqual({ substrate: 'pod', reason });
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      expect(resolveHarnessSubstrate({ flag: { substrate: 'auto' }, config: config('pod', 'cfg'), env: {}, currentContext: context }))
+        .toEqual({ substrate: 'pod', pool: 'cfg', source: 'flag' });
+      expect(resolveHarnessSubstrate({ flag: { substrate: 'auto' }, config: config('pod', 'cfg'), autoSignals: { ...spareHost, load1: 4 }, env: {}, currentContext: context }))
+        .toEqual({ substrate: 'pod', pool: 'cfg', source: 'flag' });
+      expect(log).toHaveBeenCalledWith('harness.substrate', 'route', { substrate: 'pod', reason: 'local-load-not-spare', source: 'flag' });
+    } finally { log.mockRestore(); }
+  });
+
+  test('auto without admission signals keeps Pod and records unobserved rather than known-unblocked', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      expect(resolveHarnessSubstrate({ flag: { substrate: 'auto' }, config: config('pod', 'cfg'), env: {}, currentContext: context }))
+        .toEqual({ substrate: 'pod', pool: 'cfg', source: 'flag' });
+      expect(log).toHaveBeenCalledWith('harness.substrate', 'route', { substrate: 'pod', reason: 'pod-admission-unobserved', source: 'flag' });
+      expect(log).not.toHaveBeenCalledWith('harness.substrate', 'route', { substrate: 'pod', reason: 'pod-admission-not-memory-blocked', source: 'flag' });
+    } finally { log.mockRestore(); }
+  });
+
+  test('a config file auto survives the real loader and routes pod by default with an observed route', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'substrate-auto-config-'));
+    try {
+      const path = join(dir, 'config.json');
+      writeFileSync(path, JSON.stringify({ harness: { substrate: 'auto', podPool: 'cfg' } }));
+      const loaded = buildUserConfig(path);
+      expect(loaded.harness?.substrate).toBe('auto');
+      const log = spyOn(debug, 'log').mockImplementation(() => {});
+      try {
+        expect(resolveHarnessSubstrate({ config: loaded, env: {}, currentContext: context }))
+          .toEqual({ substrate: 'pod', pool: 'cfg', source: 'config' });
+        expect(log.mock.calls.filter(([category, event]) => category === 'harness.substrate' && event === 'route'))
+          .toEqual([['harness.substrate', 'route', { substrate: 'pod', reason: 'pod-admission-unobserved', source: 'config' }]]);
+      } finally { log.mockRestore(); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('NaN host observations never authorize local', () => {
+    expect(routeAutoSubstrate({ ...spareHost, availableMemoryBytes: Number.NaN })).toEqual({ substrate: 'pod', reason: 'local-memory-not-spare' });
+    expect(routeAutoSubstrate({ ...spareHost, availableMemoryBytes: Number.POSITIVE_INFINITY })).toEqual({ substrate: 'pod', reason: 'local-memory-not-spare' });
+    expect(routeAutoSubstrate({ ...spareHost, cores: Number.NaN })).toEqual({ substrate: 'pod', reason: 'local-load-not-spare' });
+    expect(routeAutoSubstrate({ ...spareHost, load1: Number.NaN })).toEqual({ substrate: 'pod', reason: 'local-load-not-spare' });
+  });
+
+  test('an injected auto config routes while explicit flags retain priority', () => {
+    const autoConfig: Pick<UserConfig, 'harness' | 'pod'> = { harness: { substrate: 'auto', podPool: 'cfg' } };
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      expect(resolveHarnessSubstrate({ config: autoConfig, autoSignals: spareHost, env: {}, currentContext: context }))
+        .toEqual({ substrate: 'local', pool: null, source: 'config' });
+      expect(resolveHarnessSubstrate({ flag: { substrate: 'pod' }, config: autoConfig, autoSignals: spareHost, env: {}, currentContext: context }))
+        .toEqual({ substrate: 'pod', pool: 'cfg', source: 'flag' });
+      expect(resolveHarnessSubstrate({ flag: { substrate: 'local' }, config: autoConfig, autoSignals: { ...spareHost, localLaneOpen: false }, env: {}, currentContext: context }))
+        .toEqual({ substrate: 'local', pool: null, source: 'flag' });
+      expect(log.mock.calls.filter(([category, event]) => category === 'harness.substrate' && event === 'route')).toHaveLength(1);
+    } finally { log.mockRestore(); }
+  });
+});
+
 describe('harness substrate default', () => {
   let previousPool: string | undefined;
   beforeEach(() => {
@@ -356,6 +522,8 @@ describe('harness substrate default', () => {
     if (previousPool === undefined) delete process.env.ELANOUS_POD_POOL;
     else process.env.ELANOUS_POD_POOL = previousPool;
   });
+  /** POD-POOL-UNCAPPED-SPEC — a passing pre-launch pool check, so tests never shell out to kubectl. */
+  const poolCheckOk = (pool: string) => ({ ok: true, ready: [pool], dropped: [] });
 
   test('flag, config, default and four pool layers', () => {
     expect(resolveHarnessSubstrate({ config: config(), env: {}, currentContext: context })).toEqual({ substrate: 'local', pool: null, source: 'default' });
@@ -363,7 +531,7 @@ describe('harness substrate default', () => {
     expect(resolveHarnessSubstrate({ flag: { substrate: 'local' }, config: config('pod', 'cfg'), env: {}, currentContext: context })).toEqual({ substrate: 'local', pool: null, source: 'flag' });
     expect(resolveHarnessSubstrate({ flag: { substrate: 'pod', podPool: 'flag' }, config: config('local', 'cfg'), env: { ELANOUS_POD_POOL: 'env' }, currentContext: context })).toEqual({ substrate: 'pod', pool: 'flag', source: 'flag' });
     expect(resolveHarnessSubstrate({ config: config('pod', 'cfg'), env: { ELANOUS_POD_POOL: 'env' }, currentContext: context })).toEqual({ substrate: 'pod', pool: 'env', source: 'config' });
-    expect(resolveHarnessSubstrate({ config: config('pod'), env: {}, currentContext: context })).toEqual({ substrate: 'pod', pool: 'current-context', source: 'config' });
+    expect(resolveHarnessSubstrate({ config: config('pod'), env: {}, currentContext: context, poolCheck: poolCheckOk })).toEqual({ substrate: 'pod', pool: 'current-context', source: 'config' });
     expect(resolveHarnessSubstrate({ flag: { podPool: 'flag-only' }, config: config('pod', 'cfg'), env: {}, currentContext: context })).toEqual({ substrate: 'pod', pool: 'flag-only', source: 'config' });
   });
 
@@ -379,6 +547,52 @@ describe('harness substrate default', () => {
   test('configured pod without a reachable pool fails rather than running local', () => {
     expect(() => resolveHarnessSubstrate({ config: config('pod'), env: {}, currentContext: () => undefined }))
       .toThrow('`--substrate local` 로 명시하라');
+  });
+
+  // POD-POOL-UNCAPPED-SPEC — «없는 kube 문맥»은 조용히 넘어가지 않는다: 발사 전 풀 점검이 먼저 거부한다
+  //   (10-10 프로브: 문맥은 있는데 클러스터가 없으니 recommended=0 으로 35분 정지 · 6런).
+  test('an implicit kube context that fails the pre-launch pool check is refused before launch', () => {
+    const checked: string[] = [];
+    const poolCheck = (pool: string) => {
+      checked.push(pool);
+      return { ok: false, ready: [], dropped: [{ context: pool, reason: 'Unable to connect to the server: dial tcp: i/o timeout' }] };
+    };
+    expect(() => resolveHarnessSubstrate({ config: config('pod'), env: {}, currentContext: () => 'k3d-gone', poolCheck }))
+      .toThrow('현재 컨텍스트 「k3d-gone」 이 발사 전 풀 점검을 넘지 못했다');
+    expect(() => resolveHarnessSubstrate({ flag: { substrate: 'pod' }, config: config(), env: {}, currentContext: () => 'k3d-gone', poolCheck }))
+      .toThrow('dial tcp: i/o timeout');
+    expect(checked).toEqual(['k3d-gone', 'k3d-gone']);
+  });
+
+  test('a context that passes the pre-launch check resolves exactly as before (substrate · pool · source)', () => {
+    expect(resolveHarnessSubstrate({ config: config('pod'), env: {}, currentContext: () => 'k3d-elanous-pool', poolCheck: poolCheckOk }))
+      .toEqual({ substrate: 'pod', pool: 'k3d-elanous-pool', source: 'config' });
+  });
+
+  test('an explicit pool (flag · env · config) is not gated here — the launch site runs checkPodPool for it', () => {
+    const refuse = () => { throw new Error('must not run the context check for an explicit pool'); };
+    expect(resolveHarnessSubstrate({ flag: { substrate: 'pod', podPool: 'pool-node-b@node-b:8' }, config: config(), env: {}, currentContext: () => 'k3d-gone', poolCheck: refuse }).pool).toBe('pool-node-b@node-b:8');
+    expect(resolveHarnessSubstrate({ config: config('pod'), env: { ELANOUS_POD_POOL: 'env-pool' }, currentContext: () => 'k3d-gone', poolCheck: refuse }).pool).toBe('env-pool');
+    expect(resolveHarnessSubstrate({ config: config('pod', 'cfg-pool'), env: {}, currentContext: () => 'k3d-gone', poolCheck: refuse }).pool).toBe('cfg-pool');
+  });
+
+  test('kubectl that cannot run at all is «unmeasured», not «unfit»; an unparseable context is a measured refusal', () => {
+    expect(resolveHarnessSubstrate({ config: config('pod'), env: {}, currentContext: () => 'k3d-elanous-pool',
+      poolCheck: (pool) => ({ ok: true, ready: [], dropped: [{ context: pool, reason: 'rc=null' }], unmeasured: 'kubectl 을 실행할 수 없다' }) }).pool).toBe('k3d-elanous-pool');
+    expect(checkHarnessPodPool('bad context')).toMatchObject({ ok: false, ready: [], dropped: [{ context: 'bad context', reason: expect.stringContaining('못 읽는 노드') }] });
+  });
+
+  test('only a missing kubectl (spawn ENOENT) is «unmeasured»; a kubectl timeout is a measured refusal', () => {
+    const missing = checkHarnessPodPool('k3d-elanous-pool', () => ({ status: null, stdout: '', stderr: 'Error: spawnSync kubectl ENOENT' }));
+    expect(missing).toMatchObject({ ok: true, ready: [], unmeasured: 'kubectl 을 실행할 수 없다' });
+    const timedOut = checkHarnessPodPool('k3d-elanous-pool', () => ({ status: null, stdout: '', stderr: 'Error: spawnSync kubectl ETIMEDOUT' }));
+    expect(timedOut.ok).toBe(false);
+    expect(timedOut.unmeasured).toBeUndefined();
+    expect(timedOut.dropped).toEqual([{ context: 'k3d-elanous-pool', reason: expect.stringContaining('ETIMEDOUT') }]);
+    const answered = checkHarnessPodPool('k3d-elanous-pool', () => ({ status: 1, stdout: '', stderr: 'Error from server (NotFound): namespaces "elanous-test" not found' }));
+    expect(answered).toMatchObject({ ok: false, ready: [] });
+    expect(answered.unmeasured).toBeUndefined();
+    expect(checkHarnessPodPool('k3d-elanous-pool', () => ({ status: 0, stdout: '', stderr: '' }))).toEqual({ ok: true, ready: ['k3d-elanous-pool'], dropped: [] });
   });
 
   test('user configuration parses and persists both harness fields', () => {

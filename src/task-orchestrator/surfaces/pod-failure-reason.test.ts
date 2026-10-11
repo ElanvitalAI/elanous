@@ -1,5 +1,51 @@
 import { describe, expect, test } from 'bun:test';
-import { extractPodFailureReason } from './pod-failure-reason.js';
+import { classifyPodExit, extractPodFailureReason, POD_EXIT_CLASSES } from './pod-failure-reason.js';
+
+describe('classifyPodExit', () => {
+  test('exports the closed class set and preserves terminal metadata fields', () => {
+    expect(POD_EXIT_CLASSES).toEqual([
+      'oom-killed', 'deadline-exceeded', 'gh-login-failed', 'pod-secret', 'ask-reprompt',
+      'child-unconverged', 'child-error', 'no-result-line', 'unknown',
+    ]);
+    expect(classifyPodExit({
+      errorCode: 'pod-secret', containerReason: 'Error', containerExitCode: 2, jobReason: 'BackoffLimitExceeded', logs: '',
+    })).toEqual({
+      class: 'pod-secret', errorCode: 'pod-secret', containerReason: 'Error', exitCode: 2,
+      jobReason: 'BackoffLimitExceeded', tail: [],
+    });
+  });
+
+  test('applies the terminal metadata precedence', () => {
+    expect(classifyPodExit({ jobReason: 'DeadlineExceeded', containerReason: 'OOMKilled', containerExitCode: 7, logs: '' }).class).toBe('deadline-exceeded');
+    expect(classifyPodExit({ containerReason: 'OOMKilled', containerExitCode: 7, logs: '' }).class).toBe('oom-killed');
+    expect(classifyPodExit({ containerExitCode: 7, logs: '' }).class).toBe('gh-login-failed');
+    expect(classifyPodExit({ errorCode: 'pod-secret', jobReason: 'DeadlineExceeded', logs: '' }).class).toBe('pod-secret');
+  });
+
+  test('classifies failed child results and ask reprompt lines', () => {
+    const row = JSON.stringify({ kind: 'self', ok: false, result: { stage: 'soft-stopped', ok: false } });
+    expect(classifyPodExit({ jobReason: 'BackoffLimitExceeded', containerReason: 'Error', containerExitCode: 2, logs: row }).class)
+      .toBe('child-unconverged');
+    expect(classifyPodExit({ logs: '[ask] implementation_target is missing; please provide a target' }).class).toBe('ask-reprompt');
+  });
+
+  test('uses child-error only when no result line exists and otherwise closes unknown cases', () => {
+    expect(classifyPodExit({ logs: 'Error: child failed' }).class).toBe('child-error');
+    expect(classifyPodExit({ logs: JSON.stringify({ kind: 'self', ok: true, result: { stage: 'merged', ok: true } }) }).class).toBe('unknown');
+    expect(classifyPodExit({ logs: '' }).class).toBe('no-result-line');
+  });
+
+  test('excludes bookkeeping-only output from the bounded tail', () => {
+    const result = classifyPodExit({ logs: [
+      'ELANOUS_POD_STATUS /home/ubuntu/private/status',
+      '[graph] collect fail (0.28s)',
+      'at /home/ubuntu/private/worker.ts:42',
+    ].join(String.fromCharCode(10)) });
+    expect(result.class).toBe('no-result-line');
+    expect(result.tail).toEqual([]);
+    expect(result.tail.join('\\n')).not.toContain('/home/');
+  });
+});
 
 describe('extractPodFailureReason', () => {
   test('takes the last error line, not the last bookkeeping line or a preceding error', () => {
@@ -137,4 +183,13 @@ test('POD-NORESULT: a readable error line still wins over the result row, and no
   expect(extractPodFailureReason({ logs: 'plain progress line\n', result: null })).toBe('사유 못 읽음: 로그에 읽을 수 있는 오류 줄 없음');
   expect(extractPodFailureReason({ logs: 'plain progress line\n', result: { stage: '  ', prUrl: 'https://x' } })).toBe('사유 못 읽음: 로그에 읽을 수 있는 오류 줄 없음');
   expect(extractPodFailureReason({ logs: '', containerReason: 'OOMKilled', result: { stage: 'review-blocked' } })).toBe('OOMKilled: 컨테이너 메모리 한도 초과');
+});
+
+test('classifyPodExit — a non-terminal progress JSON line mentioning error is not a child error line; /home/ paths fold in tail', () => {
+  const progressOnly = classifyPodExit({ logs: '{"kind":"progress","note":"retry after error"}\n' });
+  expect(progressOnly.class).toBe('no-result-line');
+  const childError = classifyPodExit({ logs: 'Error: child failed at /home/ubuntu/repo/x.ts\n' });
+  expect(childError.class).toBe('child-error');
+  expect(childError.tail.join('\n')).toContain('~/repo/x.ts');
+  expect(childError.tail.join('\n')).not.toContain('/home/');
 });

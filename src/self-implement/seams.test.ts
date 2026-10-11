@@ -4298,8 +4298,9 @@ describe('implement seam 두 갈래가 같은 조립기를 쓴다 (구조 가드
     expect(source).not.toContain('transcript.slice(-2000)');
   });
 
-  test('⭐ PTY·spawnSync 두 갈래가 buildImplementReport 를 부른다(호출 2회)', () => {
-    expect(source.match(/buildImplementReport\(/g) ?? []).toHaveLength(2);
+  // CLAUDE-IMPL-LANE(10-11) — 셋째 갈래 claude-acp(구독 ACP 구현기)도 같은 조립기를 쓴다.
+  test('⭐ PTY·spawnSync·claude-acp 세 갈래가 buildImplementReport 를 부른다(호출 3회)', () => {
+    expect(source.match(/buildImplementReport\(/g) ?? []).toHaveLength(3);
   });
 });
 

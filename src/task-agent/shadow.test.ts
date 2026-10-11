@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from 'bun:test';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { taskAgentStatePath } from './task-hand.js';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { writeTaskCards, type TaskCard } from './task-hand.js';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -82,20 +82,59 @@ describe('TASK-AGENT-SHADOW — 멈춤 확정 → 판단부 → 실행부(shadow
 
   test('supervisor taskId differs from card id: unique launched feature resolves card without custom lookup', async () => {
     const { worktree, card, target } = deliveryFixture();
-    const statePath = taskAgentStatePath();
-    mkdirSync(join(statePath, '..'), { recursive: true });
+    // 운영 상태 파일(taskAgentStatePath)을 덮어쓰지 않는다 — 임시 statePath 를 주입한다.
+    const statePath = join(mkdtempSync(join(tmpdir(), 'shadow-state-')), 'task-agent-actions.json');
     const unique = `research-${Date.now()}-${Math.random()}`;
-    const original = existsSync(statePath) ? readFileSync(statePath, 'utf8') : undefined;
-    try {
-      writeFileSync(statePath, JSON.stringify({ tasks: { 'ta-real': { ...card, id: 'ta-real', text: unique } } }));
-      const out = await recordTaskAgentShadowMove({ runId: 'run-shadow', stopReason: 'converged', results: [job({ taskId: 'self-dev-other', feature: unique, ok: true, worktreePath: worktree })] }, { log: () => {} });
-      expect(out.executorKind).toBe('deliver');
-      expect(out.wouldDo).toContain(join(target, 'elanous-out', 'ta-real'));
-      expect(existsSync(target)).toBe(false);
-    } finally {
-      if (original === undefined) unlinkSync(statePath);
-      else writeFileSync(statePath, original);
-    }
+    writeFileSync(statePath, JSON.stringify({ tasks: { 'ta-real': { ...card, id: 'ta-real', text: unique } } }));
+    const out = await recordTaskAgentShadowMove({ runId: 'run-shadow', stopReason: 'converged', results: [job({ taskId: 'self-dev-other', feature: unique, ok: true, worktreePath: worktree })] }, { log: () => {}, statePath });
+    expect(out.executorKind).toBe('deliver');
+    expect(out.wouldDo).toContain(join(target, 'elanous-out', 'ta-real'));
+    expect(existsSync(target)).toBe(false);
+  });
+
+  test('card lookup order: taskId → unique runId (TA-LIVE-LAND-2) → unique feature; ambiguous runId does not guess', async () => {
+    // 운영 상태 파일(taskAgentStatePath)을 덮어쓰지 않는다 — 임시 statePath 를 주입한다 · 상속 env 도 비운다(결정적).
+    const path = join(mkdtempSync(join(tmpdir(), 'shadow-run-card-')), 'task-agent-actions.json');
+    const card = (id: string, runId: string, text: string): TaskCard => ({ id, runId, text, createdAt: '', status: 'launched', history: [] });
+    const observations: Array<Record<string, unknown>> = [];
+    const log = (_category: string, _event: string, data: Record<string, unknown>) => observations.push(data);
+    const deps = { log, statePath: path, env: {} };
+    writeFileSync(path, JSON.stringify({ tasks: { 'ta-run': card('ta-run', 'run-target', 'a different goal') } }));
+    const input = { runId: 'run-target', stopReason: 'needs-human' as const, results: [job({ taskId: 'unknown', feature: 'unmatched', prNumber: 12 })] };
+    await recordTaskAgentShadowMove(input, deps);
+    expect(observations.at(-1)?.card).toBe('ta-run');
+    writeTaskCards(path, [card('ta-direct', 'other', 'direct'), card('ta-feature', 'other2', 'unmatched')]);
+    // 런 id 에 유일하게 묶인 카드가 발사 문장 일치보다 앞선다(main TA-LIVE-LAND-2 순서).
+    await recordTaskAgentShadowMove(input, deps);
+    expect(observations.at(-1)?.card).toBe('ta-run');
+    await recordTaskAgentShadowMove({ ...input, results: [job({ taskId: 'ta-direct', feature: 'unmatched', prNumber: 12 })] }, deps);
+    expect(observations.at(-1)?.card).toBe('ta-direct');
+    writeTaskCards(path, [card('ta-run-two', 'run-target', 'different')]);
+    // 런 id 가 둘에 묶이면 추측하지 않고 유일한 발사 문장으로 간다.
+    await recordTaskAgentShadowMove(input, deps);
+    expect(observations.at(-1)?.card).toBe('ta-feature');
+    await recordTaskAgentShadowMove({ ...input, results: [job({ taskId: 'unknown', feature: 'no match', prNumber: 12 })] }, deps);
+    expect(observations.at(-1)?.card).toBeNull();
+  });
+
+  test('Pod child run: judge fallback finds the run-owned card only through an exactly equal inherited ELANOUS_RUN_ID; a different value misses with a reason', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'shadow-env-run-')), 'task-agent-actions.json');
+    const card: TaskCard = { id: 'ta-run-parent', runId: 'run-parent', text: 'adopted goal', createdAt: '', status: 'launched', history: [] };
+    writeFileSync(path, JSON.stringify({ tasks: { [card.id]: card } }));
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const log = (_c: string, event: string, data: Record<string, unknown>) => events.push({ event, data });
+    // 결과의 taskId·문장은 카드와 다르고 입력 runId 는 Pod 자식 것 — 성공한 결과(작업 트리)라 판단부 조회를 탄다.
+    const input = { runId: 'run-child', stopReason: 'needs-human' as const, results: [job({ taskId: 'self-dev-x', feature: 'authored goal', ok: true, worktreePath: '/tmp/wt-env', prNumber: 12 })] };
+    await recordTaskAgentShadowMove(input, { log, statePath: path, env: { ELANOUS_RUN_ID: 'run-parent' } });
+    expect(events.find((entry) => entry.event === 'shadow-move')?.data).toMatchObject({ card: 'ta-run-parent', completion: 'code-pr' });
+    expect(events.some((entry) => entry.event === 'run-card-fallback-missed')).toBe(false);
+    events.length = 0;
+    await recordTaskAgentShadowMove(input, { log, statePath: path, env: { ELANOUS_RUN_ID: 'run-parent-2' } });
+    expect(events.find((entry) => entry.event === 'shadow-move')?.data).toMatchObject({ card: null, completion: null });
+    const missed = events.filter((entry) => entry.event === 'run-card-fallback-missed');
+    expect(missed).toHaveLength(1);
+    expect(missed[0]!.data).toMatchObject({ runId: 'run-child', inheritedRunId: 'run-parent-2' });
+    expect(String(missed[0]!.data.reason)).toContain('ELANOUS_RUN_ID run-parent-2: no card has this runId');
   });
 
   test('live caller delivers verified report with no PR', async () => {
@@ -250,7 +289,9 @@ describe('종결 종류를 판단부 입력·shadow-move 관측에 싣는다 (RF
     });
     expect(pr.reason).toBe('완주했으나 PR 병합 근거 대기');
     expect(logged.at(-1)).toMatchObject({ completion: 'code-pr' });
-    await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'no-progress', results: [job()] }, { log });
+    // 카드를 안 본 경우 — 상속 ELANOUS_RUN_ID·기본 상태 파일(같은 프로세스의 다른 시험이 남긴 카드)에 기대지 않게 비운다.
+    const emptyState = join(mkdtempSync(join(tmpdir(), 'shadow-no-card-')), 'task-agent-actions.json');
+    await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'no-progress', results: [job()] }, { log, env: {}, statePath: emptyState });
     expect(logged.at(-1)).toMatchObject({ completion: null });
     const legacy = await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
       readCard: () => ({ ...card, completion: undefined }), log,

@@ -101,11 +101,25 @@ export const STORE_SAFETY_MAX = 100_000;
 export const LOG_STORE_READONLY_BUSY_TIMEOUT_MS = 2_000;
 const LOG_STORE_WRITE_BUSY_TIMEOUT_MS = 5_000;
 const LOG_STORE_OPEN_RETRY_DELAYS_MS = [100, 200, 400, 800, 1600] as const;
+const LOG_STORE_BUSY_RETRY_MAX_ATTEMPTS = 3;
+const LOG_STORE_BUSY_RETRY_BUFFER_MAX_ROWS = 2_000;
+type LogStoreInsertRow = { rec: LogRecord; surface: string };
+type LogStoreRetryBatch = { rows: LogStoreInsertRow[]; attempts: number; preserveRows: boolean };
 const sqliteOpenWait = new Int32Array(new SharedArrayBuffer(4));
 let pendingBusyOpenLosses: Array<{ path: string; loss: { store: 'logs'; op: 'open'; waitedMs: number } }> = [];
-
 function sqliteBusy(error: unknown): boolean {
   return /SQLITE_BUSY|SQLITE_LOCKED|database is locked|database is busy/i.test(String(error));
+}
+
+function emitInsertBusyLost(data: Record<string, unknown>): void {
+  try { process.stderr.write(`[store.sqlite] busy-lost ${JSON.stringify(data)}\n`); } catch { /* diagnostics must not block callers */ }
+  try { debug.log('store.sqlite', 'busy-lost', data); } catch { /* diagnostics must not block callers */ }
+}
+
+function topCategories(rows: readonly LogStoreInsertRow[]): string[] {
+  const counts = new Map<string, number>();
+  for (const { rec } of rows) counts.set(rec.category, (counts.get(rec.category) ?? 0) + 1);
+  return [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 3).map(([category]) => category);
 }
 
 export class LogCursorNotFoundError extends Error {
@@ -196,6 +210,7 @@ export class LogStore {
   readonly instance: string;
   /** read-only open (LF7-b 연합 조회) — 스키마 생성/마이그레이션/insert 불가. */
   readonly readonly: boolean;
+  private busyRetryBuffer: LogStoreRetryBatch[] = [];
 
   /** 타 인스턴스 스토어의 연합 조회용 read-only open — "연합은 read-only 로만"
    *  불변식의 구조적 집행(마이그레이션 포함 어떤 write 도 발생 불가). */
@@ -296,10 +311,12 @@ export class LogStore {
     })();
   }
 
-  /** 배치 insert(단일 트랜잭션). 실패는 throw — fail-soft 는 호출측(StoreSink)
-   *  책임(ops-log 의 recordOpsEvent/Safe 분업 동형). */
+  /** 배치 insert(단일 트랜잭션). SQLITE_BUSY 는 bounded in-memory buffer 후 throw — fail-soft 는 호출측(StoreSink) 책임. */
   insertBatch(rows: Array<{ rec: LogRecord; surface: string }>, opts: { preserveRows?: boolean } = {}): void {
     if (rows.length === 0) return;
+    const retrying = this.busyRetryBuffer;
+    const current: LogStoreRetryBatch = { rows, attempts: 0, preserveRows: opts.preserveRows === true };
+    const batches = [...retrying, current];
     const stmt = this.db.prepare(
       `INSERT INTO logs (ts, ts_ms, level, instance, host_id, surface, category, event, session_id, trace_id, data)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -307,8 +324,8 @@ export class LogStore {
     const decisionRow = this.db.prepare(`SELECT id FROM logs WHERE instance = ? AND category = 'loop.steward' AND event = 'decision'
       AND json_valid(data) AND json_extract(data, '$.runId') = ? ORDER BY id DESC LIMIT 1`);
     const updateDecision = this.db.prepare(`UPDATE logs SET ts = ?, ts_ms = ?, level = ?, surface = ?, data = ? WHERE id = ?`);
-    const insertAll = this.db.transaction((batch: Array<{ rec: LogRecord; surface: string }>) => {
-      for (const { rec, surface } of batch) {
+    const insertAll = this.db.transaction((batch: Array<{ row: LogStoreInsertRow; preserveRows: boolean }>) => {
+      for (const { row: { rec, surface }, preserveRows } of batch) {
         const tsMs = Date.parse(rec.ts);
         const timestamp = Number.isFinite(tsMs) ? tsMs : Date.now();
         const level = deriveLogLevel(rec);
@@ -316,7 +333,7 @@ export class LogStore {
         const runId = rec.category === 'loop.steward' && rec.event === 'decision' &&
           rec.data && typeof rec.data === 'object' && !Array.isArray(rec.data)
           ? (rec.data as Record<string, unknown>).runId : undefined;
-        const existing = !opts.preserveRows && typeof runId === 'string' && runId
+        const existing = !preserveRows && typeof runId === 'string' && runId
           ? decisionRow.get(this.instance, runId) as { id: number } | undefined : undefined;
         if (existing) {
           updateDecision.run(rec.ts, timestamp, level, surface, data, existing.id);
@@ -340,14 +357,43 @@ export class LogStore {
         );
       }
     });
+    const allRows = batches.flatMap((batch) => batch.rows.map((row) => ({ row, preserveRows: batch.preserveRows })));
     const startedAt = Date.now();
     try {
-      insertAll(rows);
+      insertAll(allRows);
+      this.busyRetryBuffer = [];
+      for (const batch of retrying) {
+        try { debug.log('store.sqlite', 'busy-recovered', { rows: batch.rows.length, attempts: batch.attempts + 1 }); }
+        catch { /* diagnostics must not affect writes */ }
+      }
     } catch (error) {
-      if (sqliteBusy(error)) {
-        const loss = { store: 'logs', op: 'insertBatch', waitedMs: Date.now() - startedAt };
-        try { process.stderr.write(`[store.sqlite] busy-lost ${JSON.stringify(loss)}\n`); } catch { /* diagnostics must not block callers */ }
-        debug.log('store.sqlite', 'busy-lost', loss);
+      if (!sqliteBusy(error)) throw error;
+      emitInsertBusyLost({
+        store: 'logs', op: 'insertBatch', waitedMs: Date.now() - startedAt,
+        rows: allRows.length, categories: topCategories(allRows.map(({ row }) => row)),
+      });
+      const retained: LogStoreRetryBatch[] = [];
+      for (const batch of batches) {
+        const attempts = batch.attempts + 1;
+        if (attempts >= LOG_STORE_BUSY_RETRY_MAX_ATTEMPTS) {
+          emitInsertBusyLost({ store: 'logs', op: 'insertBatch', reason: 'retry-exhausted', droppedRows: batch.rows.length });
+        } else {
+          retained.push({ ...batch, attempts });
+        }
+      }
+      let bufferedRows = retained.reduce((count, batch) => count + batch.rows.length, 0);
+      let droppedRows = 0;
+      while (bufferedRows > LOG_STORE_BUSY_RETRY_BUFFER_MAX_ROWS && retained.length > 0) {
+        const oldest = retained[0]!;
+        const drop = Math.min(bufferedRows - LOG_STORE_BUSY_RETRY_BUFFER_MAX_ROWS, oldest.rows.length);
+        oldest.rows.splice(0, drop);
+        bufferedRows -= drop;
+        droppedRows += drop;
+        if (oldest.rows.length === 0) retained.shift();
+      }
+      this.busyRetryBuffer = retained;
+      if (droppedRows > 0) {
+        emitInsertBusyLost({ store: 'logs', op: 'insertBatch', reason: 'retry-buffer-full', droppedRows });
       }
       throw error;
     }
@@ -835,6 +881,7 @@ export class StoreSink implements LogSink {
     const batch = this.buf;
     this.buf = [];
     try {
+      // insertBatch retries SQLITE_BUSY batches on the next write; this sink remains fail-soft on final failure.
       this.store.insertBatch(batch);
     } catch {
       /* fail-soft — 파일 트레일이 진실원. 배치는 버린다(재시도 루프 금지 —

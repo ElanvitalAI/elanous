@@ -9,6 +9,7 @@ import { requestConfirmation, type ConfirmOpts, type ConfirmResult } from '../hi
 import { devVersion, checklistDevVersion, listChecklist, summarizeChecklist, type Checklist, type ChecklistItem } from '../release-loop/checklist.js';
 import { add, move, validateVersion } from '../release-loop/feature-store.js';
 import { formatKst, formatSchedule, getSchedule, listSchedules, setSchedule, type ReleaseSchedule } from '../release-loop/release-schedule.js';
+import { mergedPrsLast24h as countMergedPrsLast24h } from '../release-loop/placement.js';
 import { latestGraphRun, type GraphRunState } from '../graph-runner/runner.js';
 import { formatElanousCard, type ElanousCard } from './elanous-card.js';
 
@@ -24,6 +25,7 @@ export const RELEASE_STATUS_SPEC: LLMToolSpec = {
   parameters: { type: 'object', properties: {
     version: { type: 'string', description: '조회할 판. 생략하면 개발 판과 다음 판.' },
     topic: { type: 'string', enum: ['status', 'features', 'cell', 'schedule', 'ops'], description: '읽을 대상(기본 status).' },
+    action: { type: 'string', enum: ['schedule', 'blocked', 'landed'], description: '짧은 읽기 요약: 다음 컷 일정·막힌 칸·최근 24시간 병합 PR.' },
     id: { type: 'string', description: 'topic=cell 때 찾을 칸 id(필수).' },
   }, required: [] },
 };
@@ -57,6 +59,7 @@ export interface ReleaseToolDeps {
   add?: typeof add;
   move?: typeof move;
   setSchedule?: typeof setSchedule;
+  mergedPrsLast24h?: (now?: Date) => number;
 }
 
 function nextVersion(version: string): string {
@@ -129,6 +132,42 @@ export function dispatchReleaseStatus(args: Record<string, unknown>, deps: Relea
     return { text: facts.length ? facts.map(fact => JSON.stringify(fact)).join('\n') : '운영 개관: 관측된 사실 없음', structured: { facts } };
   }
   const dev = checklistDevVersion(deps.devVersion?.() ?? devVersion());
+  if (args.action !== undefined) {
+    const action = args.action;
+    if (typeof action !== 'string' || !['schedule', 'blocked', 'landed'].includes(action)) {
+      throw new Error('action 은 schedule, blocked, landed 중 하나여야 합니다');
+    }
+    if (action === 'schedule') {
+      const released = checklist(dev).released;
+      const schedules = (deps.schedules ?? listSchedules)()
+        .filter(row => requested ? row.version === requested : !released || versionOrder(row.version, released) > 0)
+        .sort((a, b) => versionOrder(a.version, b.version));
+      const text = schedules.length ? `다음 컷 시각:\n${schedules.map(formatSchedule).join('\n')}` : '다음 컷 시각: 일정 없음';
+      debug.log('release.tool', 'status', { action, version: requested ?? dev });
+      return { text, structured: { schedules: schedules.map(row => ({ version: row.version, cutAt: row.cutAt, landBy: row.landBy,
+        publishAt: row.publishAt ?? null, freezeFrom: row.freezeFrom ?? null, freezeUntil: row.freezeUntil ?? null })) } };
+    }
+    if (action === 'blocked') {
+      const versions = requested ? [requested as string] : [dev, nextVersion(dev)];
+      const blocked = versions.flatMap(version => {
+        validateVersion(version);
+        return checklist(version).items
+          .filter(item => item.status === 'red' || (item.status === 'yellow' && item.disposition === 'block'))
+          .map(item => ({ version, id: item.id, title: firstLine(item.title), status: item.status, disposition: item.disposition ?? null, owner: item.owner ?? null }));
+      });
+      const text = blocked.length ? `막힌 칸 ${blocked.length}개:\n${blocked.map(item => `${item.version} · ${item.id} ${item.title} · ${item.status === 'red' ? '빨강' : '보류'}${item.owner ? ` · 담당 ${item.owner}` : ''}`).join('\n')}` : '막힌 칸 없음';
+      debug.log('release.tool', 'status', { action, version: requested ?? versions.join(',') });
+      return { text, structured: { blocked } };
+    }
+    const now = deps.now ?? new Date();
+    const merged = (deps.mergedPrsLast24h ?? countMergedPrsLast24h)(now);
+    debug.log('release.tool', 'status', { action, since: new Date(now.getTime() - 86_400_000).toISOString(), until: now.toISOString(), merged });
+    return { text: `어제 착지: 최근 24시간 병합 PR ${merged}건`, structured: {
+      mergedPrsLast24h: merged,
+      since: new Date(now.getTime() - 86_400_000).toISOString(),
+      until: now.toISOString(),
+    } };
+  }
   if (topic === 'features' || topic === 'cell' || topic === 'schedule') {
     let result: { text: string; structured: Record<string, unknown> };
     if (topic === 'features') {

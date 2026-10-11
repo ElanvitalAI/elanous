@@ -388,7 +388,7 @@ describe('elanous pr land', () => {
         '✓ model-hardcode-gate: scripts/ci-model-hardcode-gate.ts PASS — no new hardcoded model id.',
         '✓ daemon-port-gate: scripts/ci-daemon-port-gate.ts PASS — no new daemon port literals.',
         '[test-interference-gate] 해당 없음 — 변경 시험 파일 0개 (간섭 검사는 2개 이상 필요).',
-        '[land-global-checks] 해당 없음 — 바뀐 파일 0개가 전역 검사 표(4줄)의 꼴에 안 걸린다.',
+        expect.stringMatching(/^\[land-global-checks\] 해당 없음 — 바뀐 파일 0개가 전역 검사 표\(\d+줄\)의 꼴에 안 걸린다\.$/),
         // ⭐ 안드로이드를 안 만진 착지라 게이트가 «깨어나지 않았다»고 «말한다».
         //    ⛔ 그 자리에 「PASS — 실제로 돌았다」가 오면 안 된다 — 안 돌았기 때문이다.
         '[android-gate] 해당 없음 — 변경 0개 중 apps/android/ 아래 파일 0개.',
@@ -831,6 +831,7 @@ describe('elanous pr land', () => {
     expect(logs).toEqual([]);
   });
 
+  // LAND-BASE-MAIN-GUARD 뒤: 기본 가지가 아닌 재사용 PR base 는 «명시 --base» 일 때만 착지한다.
   it('uses origin and preserves a slash-containing reused PR base when no remote has that name', async () => {
     const { manager } = fakeManager({
       upsertPr: () => ({ ok: true, url: 'https://github.com/example/repo/pull/42', reused: true }),
@@ -847,13 +848,17 @@ describe('elanous pr land', () => {
         : { ok: false, out: '' };
     };
 
-    expect(await runPrLand({}, { ...baseDeps, run, manager, out: sink.out })).toBe(0);
+    expect(await runPrLand({ base: 'release/2026' }, { ...baseDeps, run, manager, out: sink.out })).toBe(0);
     expect(sink.logs).toContain('✓ merge: squash https://github.com/example/repo/pull/42 → release/2026');
     expect(sink.logs.at(-1)).toBe('⚠ local HEAD does not contain the landed result; create a new branch directly from remote origin with: git branch <new-branch> origin/release/2026');
     expect(sink.logs.join('\n')).not.toContain('git fetch');
     expect(sink.logs.join('\n')).not.toContain('git pull');
     expect(sink.logs.join('\n')).not.toContain('git checkout');
+    // BENCH-ISOLATED-ARMS: the reused PR's labels are read once before the merge (bench-guard), then the base once after it.
     expect(viewCalls).toEqual([{
+      cmd: 'gh',
+      args: ['pr', 'view', 'https://github.com/example/repo/pull/42', '--json', 'labels', '--jq', '.labels[].name'],
+    }, {
       cmd: 'gh',
       args: ['pr', 'view', 'https://github.com/example/repo/pull/42', '--json', 'baseRefName', '--jq', '.baseRefName'],
     }]);
@@ -1147,7 +1152,12 @@ describe('elanous pr land', () => {
     const TIP = 'b'.repeat(40);
     const URL = 'https://github.com/example/repo/pull/51';
     const LANDINGS = ['aaa111bbb222ccc333ddd444eee555fff666aaa', 'bbb222ccc333ddd444eee555fff666aaa111bbb'];
-    function pinnedRun(opts: { ancestor?: boolean; landingAncestors?: readonly string[] } = {}) {
+    const GATE_BASE = 'c'.repeat(40);
+    const WINDOW_A = 'e'.repeat(40);
+    const WINDOW_B = 'f'.repeat(40);
+    const FORK = '9'.repeat(40);
+    type WindowOpts = { gateBaseInHead?: boolean; gateBaseInTip?: boolean; tipLocal?: boolean; windowLog?: string; windowLogOk?: boolean };
+    function pinnedRun(opts: { ancestor?: boolean; landingAncestors?: readonly string[]; window?: WindowOpts } = {}) {
       const inner = landRun(overlapLog, 'src/land.ts\n', '');
       const commands: Array<{ cmd: string; args: readonly string[] }> = [];
       const run = (cmd: string, args: readonly string[]) => {
@@ -1163,6 +1173,16 @@ describe('elanous pr land', () => {
         if (cmd === 'git' && command === 'status --porcelain') return { ok: true, out: '' };
         if (cmd === 'git' && command === 'ls-remote origin refs/heads/main') return { ok: true, out: `${TIP}\trefs/heads/main\n` };
         if (cmd === 'git' && command === `merge-base --is-ancestor ${TIP} ${HEAD}`) return { ok: opts.ancestor ?? true, out: '' };
+        const w = opts.window;
+        if (w && cmd === 'git') {
+          if (command === `merge-base --is-ancestor ${GATE_BASE} ${HEAD}`) return { ok: w.gateBaseInHead ?? true, out: '' };
+          if (command === `merge-base --is-ancestor ${GATE_BASE} ${TIP}`) return { ok: w.gateBaseInTip ?? true, out: '' };
+          if (command === `cat-file -e ${TIP}^{commit}`) return { ok: w.tipLocal ?? true, out: '' };
+          if (command === `merge-base ${TIP} ${HEAD}`) return { ok: true, out: `${FORK}\n` };
+          if (args[0] === 'log' && args.includes('--first-parent') && args.at(-1) === `${GATE_BASE}..${TIP}`) {
+            return { ok: w.windowLogOk ?? true, out: w.windowLog ?? `\u0001${WINDOW_A}\n\nsrc/other.ts\n\u0001${WINDOW_B}\n\ndocs/x.md\n` };
+          }
+        }
         if (cmd === 'git' && args[0] === 'merge-base' && args[1] === '--is-ancestor' && args[3] === HEAD) return { ok: (opts.landingAncestors ?? []).includes(args[2]!), out: '' };
         return inner.run(cmd, args);
       };
@@ -1215,7 +1235,16 @@ describe('elanous pr land', () => {
       ['gate ran on a stale base', {}, { gateBase: 'c'.repeat(40) }, 'gate-base-stale'],
       ['review carries a must-fix', {}, { review: { mustFix: ['fix it'] } }, 'review-must-fix-1'],
       ['review is for another head', {}, { review: { headCommit: 'd'.repeat(40) } }, 'review-head-mismatch'],
-      ['review verdict is warn', {}, { review: { verdict: 'warn' } }, 'review-verdict-warn'],
+      ['review verdict is fail', {}, { review: { verdict: 'fail' } }, 'review-verdict-fail'],
+      ['review verdict is warn but must-fix count is unknown', {}, { review: { verdict: 'warn', mustFix: [1] } }, 'review-must-fix-unknown'],
+      ['review verdict is warn with a must-fix', {}, { review: { verdict: 'warn', mustFix: ['x'] } }, 'review-must-fix-1'],
+      ['review is warn but not reviewed', {}, { review: { verdict: 'warn', reviewed: false } }, 'review-not-reviewed'],
+      ['base advanced and a window commit touches a PR file', { ancestor: false, window: { windowLog: `\u0001${WINDOW_A}\n\nsrc/land.ts\n\u0001${WINDOW_B}\n\ndocs/x.md\n` } }, { gateBase: GATE_BASE }, 'base-stale-overlap'],
+      ['base advanced but the gate base is not in the head', { ancestor: false, window: { gateBaseInHead: false } }, { gateBase: GATE_BASE }, 'not-rebased'],
+      ['gate base is not in the current base tip', { window: { gateBaseInTip: false } }, { gateBase: GATE_BASE }, 'gate-base-stale'],
+      ['the base window cannot be listed', { ancestor: false, window: { windowLogOk: false } }, { gateBase: GATE_BASE }, 'base-window-unmeasured'],
+      ['the base tip cannot be fetched', { ancestor: false, window: { tipLocal: false } }, { gateBase: GATE_BASE }, 'base-window-unmeasured'],
+      ['base advanced disjoint but review is warn with unknown must-fix', { ancestor: false, window: {} }, { gateBase: GATE_BASE, review: { verdict: 'warn', mustFix: [1] } }, 'review-must-fix-unknown'],
       ['review file is outside a review-results directory', {}, { reviewDir: 'elsewhere' }, 'review-path-not-for-this-pr-head'],
       ['review file name has no card part', {}, { card: '' }, 'review-path-not-for-this-pr-head'],
     ] as const)('rejects when %s and keeps the old refusal', async (_label, runOpts, files, reason) => {
@@ -1233,6 +1262,65 @@ describe('elanous pr land', () => {
         expect(seen).toEqual([expect.objectContaining({ decision: 'rejected', reason: expect.stringContaining(reason) })]);
       } finally {
         logged.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('review verdict warn with zero must-fix lands the pinned head (same rule as canAuto)', async () => {
+      const { run } = pinnedRun();
+      const { manager, calls } = pinnedManager();
+      const sink = output();
+      const { dir, evidence } = evidenceFiles({ review: { verdict: 'warn' } });
+      try {
+        expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence }, { ...baseDeps, run, manager, out: sink.out })).toBe(0);
+        expect(calls).toContain('merge');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      ['the head is not rebased onto the advanced tip', false],
+      ['the head already contains the advanced tip', true],
+    ] as const)('base-advanced-disjoint: gate base is in the head and no window commit touches a PR file → lands (%s)', async (_label, ancestor) => {
+      const { run, commands } = pinnedRun({ ancestor, window: {} });
+      const { manager, calls } = pinnedManager();
+      const sink = output();
+      const { dir, evidence } = evidenceFiles({ gateBase: GATE_BASE, review: { verdict: 'warn' } });
+      const logged = spyOn(debug, 'log').mockImplementation(() => {});
+      try {
+        expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence }, { ...baseDeps, run, manager, out: sink.out })).toBe(0);
+        expect(calls).toContain('merge');
+        expect(sink.logs.some((line) => line.startsWith('✓ overlap-evidence: base-advanced-disjoint'))).toBe(true);
+        expect(commands.some(({ cmd, args }) => cmd === 'git' && args[0] === 'fetch')).toBe(false);
+        expect(commands.some(({ cmd, args }) => cmd === 'git' && args.join(' ') === `diff --name-only --no-renames ${FORK} ${HEAD}`)).toBe(true);
+        const seen = logged.mock.calls.filter((call) => call[0] === 'pr.land' && call[1] === 'overlap-evidence').map((call) => call[2]);
+        expect(seen).toEqual([expect.objectContaining({ decision: 'accepted', reason: 'base-advanced-disjoint', baseTip: TIP, gateBase: GATE_BASE, windowCommits: 2 })]);
+      } finally {
+        logged.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('base-advanced-disjoint fetches the tip without writing refs when it is not local', async () => {
+      let fetched = false;
+      const { run: inner } = pinnedRun({ ancestor: false, window: {} });
+      const run = (cmd: string, args: readonly string[]) => {
+        if (cmd === 'git' && args[0] === 'fetch') { fetched = true; return { ok: true, out: '' }; }
+        if (cmd === 'git' && args.join(' ') === `cat-file -e ${TIP}^{commit}`) return { ok: fetched, out: '' };
+        return inner(cmd, args);
+      };
+      const { manager, calls } = pinnedManager();
+      const sink = output();
+      const { dir, evidence } = evidenceFiles({ gateBase: GATE_BASE });
+      const seenArgs: string[][] = [];
+      try {
+        expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence }, {
+          ...baseDeps, run: (cmd, args) => { if (cmd === 'git' && args[0] === 'fetch') seenArgs.push([...args]); return run(cmd, args); }, manager, out: sink.out,
+        })).toBe(0);
+        expect(calls).toContain('merge');
+        expect(seenArgs).toEqual([['fetch', '--quiet', '--no-write-fetch-head', '--refmap=', 'origin', 'refs/heads/main']]);
+      } finally {
         rmSync(dir, { recursive: true, force: true });
       }
     });

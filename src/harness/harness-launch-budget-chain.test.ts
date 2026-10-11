@@ -36,25 +36,26 @@ describe('harness launch budget — empty chain (L6b2 incident 10-03)', () => {
     expect(warning).toContain('outside the budget gate');
   });
 
-  // #24276(LLM-SHARE): 발사 관문은 grok «못 쟀다»를 통과로 보지 않는다(주간 사용률 80% 상한을 실제로 적용).
-  //   codex 의 «못 쟀다»만 경고와 함께 발사한다.
-  test('unmeasured codex launches with its own warning; unmeasured grok does not launch', () => {
+  // 발사 관문은 grok «못 쟀다»도 codex 와 같은 꼴로 경고와 함께 발사한다.
+  // 잰 주간 사용률에만 80% 상한을 적용한다.
+  test('unmeasured grok launches with unmeasuredProvider grok', () => {
     const noUsage = { ...inputs([{ provider: 'openai-codex' }, { provider: 'grok' }]), codexCandidates: [{ name: 'default' }], grokUsedPercent: undefined } as BudgetInputs;
     const codex = harnessLaunchBudgetDecision(noUsage);
     expect(codex.decision).toEqual(expect.objectContaining({ action: 'proceed', provider: 'openai-codex' }));
     expect(codex.warning).toContain('openai-codex usage unmeasured');
     expect(codex.unmeasuredProvider).toBe('openai-codex');
     const grok = harnessLaunchBudgetDecision(noUsage, { childLlmProvider: 'grok' });
-    expect(grok.decision).toEqual(expect.objectContaining({ action: 'stop', reasons: ['grok: 모름'] }));
-    expect(grok.unmeasuredProvider).toBeUndefined();
+    expect(grok.decision).toEqual(expect.objectContaining({ action: 'proceed', provider: 'grok', reasons: ['grok: 모름'] }));
+    expect(grok.warning).toContain('grok usage unmeasured');
+    expect(grok.unmeasuredProvider).toBe('grok');
   });
 
-  test('measured exhausted codex falls through to measured grok under the launch cap, never to unmeasured grok', () => {
+  test('measured exhausted codex falls through to measured grok under the launch cap, and to unmeasured grok', () => {
     const mixed = { ...inputs([{ provider: 'openai-codex' }, { provider: 'grok' }]), codexCandidates: [{ name: 'default', usedPercent: 95 }], grokUsedPercent: undefined } as BudgetInputs;
     const unmeasured = harnessLaunchBudgetDecision(mixed);
-    expect(unmeasured.decision.action).toBe('stop');
-    expect(unmeasured.warning).toBeUndefined();
-    expect(unmeasured.unmeasuredProvider).toBeUndefined();
+    expect(unmeasured.decision).toEqual(expect.objectContaining({ action: 'next-provider', provider: 'grok' }));
+    expect(unmeasured.warning).toContain('grok usage unmeasured');
+    expect(unmeasured.unmeasuredProvider).toBe('grok');
     const measured = harnessLaunchBudgetDecision({ ...mixed, grokUsedPercent: 48 });
     expect(measured.decision).toEqual(expect.objectContaining({ action: 'next-provider', provider: 'grok' }));
     expect(measured.warning).toBeUndefined();

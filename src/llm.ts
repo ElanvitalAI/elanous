@@ -21,6 +21,7 @@ import {
 } from './config.js';
 import { debug, redactSecrets, redactSecretText } from './debug/log.js';
 import { llmUsageCostFields } from './budget/llm-cost.js';
+import { accumulateByokUsage } from './llm/openrouter-byok-cost.js';
 import { ToolCallTiming } from './chat/tool-call-timing.js';
 import {
   dispatchWithParallelSafety,
@@ -41,6 +42,8 @@ import {
 } from './session-runtime/retry-policy.js';
 import { fetchApiWithRetry, OverloadFailoverError, type FetchApiWithRetryOpts } from './session-runtime/retry-api.js';
 import { BedrockProvider, isBedrockCompatibleModel, makeBedrockProvider } from './llm/bedrock-provider.js';
+import { makeZaiCodingPlanProvider, zaiCodingPlanAvailable } from './llm/zai-coding-plan.js';
+import { isOpenRouterDeepSeekWireModel, nonEmptyReasoningDetails, openRouterDeepSeekCatalogEffort, openRouterDeepSeekEffort, openRouterDeepSeekRequestExtras, openRouterNeedsKimiToolSchema } from './llm/openrouter-deepseek.js';
 import { resolveModelAlias } from './intelligence-map/model-alias.js';
 import { BUILTIN_CATALOG, reasoningEffortCeiling as reasoningEffortCeilingOf } from './intelligence-map/model-catalog.js';
 import { inferProviderFromModel as registryInferProviderFromModel } from './registry/normalize.js';
@@ -94,7 +97,8 @@ export interface ProviderToolMeta { thoughtSignature?: string; reasoningDetails?
 export interface ToolArgsInvalid { chars: number; finishReason: string | null }
 
 export type ContentBlock =
-  | { type: 'text';  text: string }
+  /** `providerMeta` — OR-DEEPSEEK-TUNE: OpenRouter deepseek/* 의 «도구 없는» assistant 턴 추론(reasoning_details) 운반. 다른 경로는 안 싣는다. */
+  | { type: 'text';  text: string; providerMeta?: ProviderToolMeta }
   | { type: 'image'; mediaType: string; base64: string }
   | { type: 'audio'; mediaType: string; base64: string }
   | { type: 'video'; mediaType: string; base64: string }
@@ -318,7 +322,9 @@ export type LLMStreamEvent =
       source?: string;
       revisedPrompt?: string;
     }
-  | { type: 'usage'; usage: import('./prompt-cache/types.js').LLMUsage };
+  | { type: 'usage'; usage: import('./prompt-cache/types.js').LLMUsage }
+  /** OR-DEEPSEEK-TUNE — 도구 호출이 없는 턴의 OpenRouter `reasoning_details`(스트림 끝에 한 번). deepseek/* 에서만 나온다. */
+  | { type: 'reasoning_details'; details: Array<Record<string, unknown>> };
 
 /** Tool-calling forcing (opencode parity · 2026-07-09). `'auto'` (default) lets
  *  the model decide; `'required'` forces at least one tool call; `'none'` blocks
@@ -338,6 +344,8 @@ export interface LLMOpts {
   onUsage?(usage: LLMUsage): void;
   /** Optional model role attached to this request's usage observation. */
   usageRole?: ModelRole;
+  /** Optional streamLLM usage-ledger site override (defaults to "stream-llm"). */
+  usageSite?: string;
   /**
    * ⭐⭐⭐ `B3`(2026-08-19 · 대표 지시 ②) — ***턴 «안»으로 들어오는 사용자 발화의 배수구.***
    *
@@ -473,6 +481,8 @@ export interface ToOpenAIMessagesOpts {
   acceptUserMessageImages?: boolean;
   /** OpenRouter 전용 — 도구 호출이 든 어시스턴트 메시지에 `reasoning_details` 를 되돌린다. 다른 제공자엔 안 싣는다(모르는 칸 400 방지). */
   echoReasoningDetails?: boolean;
+  /** OR-DEEPSEEK-TUNE — deepseek/* 만: 도구 없는 assistant 턴에도 되돌리고, 빈 조각은 걷는다(`src/llm/openrouter-deepseek.ts`). */
+  deepSeekReplay?: boolean;
 }
 
 /**
@@ -561,9 +571,10 @@ function toOpenAIMessages(
       .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
       .map(b => b.text)
       .join('');
-    const reasoningDetails = opts.echoReasoningDetails
+    const foundDetails = opts.echoReasoningDetails
       ? toolUses.find((t) => t.providerMeta?.reasoningDetails?.length)?.providerMeta?.reasoningDetails
       : undefined;
+    const reasoningDetails = opts.deepSeekReplay ? nonEmptyReasoningDetails(foundDetails) : foundDetails;
     return [{
       role: m.role,
       content: textContent || null,
@@ -589,8 +600,12 @@ function toOpenAIMessages(
   // Composer Q3=B is the primary handler; this is the wire-side
   // defensive fallback for non-vision OpenAI / Grok / local routes.
   const acceptUserImages = opts.acceptUserMessageImages ?? true;
+  const textTurnDetails = opts.deepSeekReplay && m.role === 'assistant'
+    ? nonEmptyReasoningDetails(blocks.find((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text' && !!b.providerMeta?.reasoningDetails?.length)?.providerMeta?.reasoningDetails)
+    : undefined;
   return [{
     role: m.role,
+    ...(textTurnDetails ? { reasoning_details: textTurnDetails } : {}),
     content: blocks.map(block => {
       if (block.type === 'text') return { type: 'text', text: block.text };
       if (block.type === 'image') {
@@ -1126,7 +1141,7 @@ export async function* parseOpenAISSELines(
   /** OR-TOOLARGS-REPAIR (2026-10-10) — `flagInvalidToolArgs` 가 참이면(OpenRouter 경로) 인자 JSON 파싱 실패를
    *  `{}` 로 «조용히» 바꾸지 않고 `argsInvalid` 표지를 단다(도구 루프가 실행을 막는다) ⊕ 관측을 남긴다.
    *  ⛔ 생략·거짓이면 종전과 바이트 동일(다른 공급자 무변경). */
-  parseOpts: { flagInvalidToolArgs?: boolean } = {},
+  parseOpts: { flagInvalidToolArgs?: boolean; emitTrailingReasoningDetails?: boolean } = {},
 ): AsyncGenerator<LLMStreamEvent, void, unknown> {
   const flagInvalidToolArgs = parseOpts.flagInvalidToolArgs === true;
   const { parseOpenAIUsage } = await import('./prompt-cache/openai.js');
@@ -1352,6 +1367,11 @@ export async function* parseOpenAISSELines(
     yield { type: 'reasoning', kind: 'inline_delta', delta: tail.reasoningDelta };
   }
   yield* emitHarmonyTools(tail.toolCalls);
+  // OR-DEEPSEEK-TUNE — 도구 호출에 실리지 못한 추론(텍스트만 낸 턴)을 끝에 한 번 낸다. deepseek/* 만 켠다.
+  if (parseOpts.emitTrailingReasoningDetails) {
+    const details = takeReasoningDetails();
+    if (details) yield { type: 'reasoning_details', details };
+  }
 }
 
 /** Pick a stable provider name for `fetchApiWithRetry` telemetry from
@@ -1430,7 +1450,8 @@ async function* streamOpenAIEvents(
   try {
     // OR-TOOLARGS-REPAIR — 깨진 도구 인자 표지는 OpenRouter 엔드포인트에서만 켠다(다른 공급자 무변경).
     const flagInvalidToolArgs = inferOpenAIProviderName(url) === 'openrouter';
-    for await (const ev of parseOpenAISSELines(sseLineStream(response.body!), flagInvalidToolArgs ? { flagInvalidToolArgs } : {})) {
+    const emitTrailingReasoningDetails = flagInvalidToolArgs && typeof body?.model === 'string' && isOpenRouterDeepSeekWireModel(body.model);
+    for await (const ev of parseOpenAISSELines(sseLineStream(response.body!), flagInvalidToolArgs ? { flagInvalidToolArgs, ...(emitTrailingReasoningDetails ? { emitTrailingReasoningDetails } : {}) } : {})) {
       if (ev.type === 'text') textChars += ev.delta.length;
       else if (ev.type === 'tool_call') toolCalls++;
       yield ev;
@@ -4294,6 +4315,26 @@ function finalizeStreamingProviderModel(provider: LLMProvider, model: string): {
   return { provider: finalizedProvider, model: finalized.model };
 }
 
+/** ZAI-POD-CHILD(10-11 실측 · si-task-aaf5d691e4ed) — 레지스트리는 `glm-` 접두를 local 로 본다.
+ *  활성 provider 가 `glm`(`ELANOUS_LLM_PROVIDER=glm` 포함)일 때 모델 이름으로 provider 를 고르는 길
+ *  (gate 진단·리뷰 `getProvider(model)`)이 local 로 떨어져 «Local LLM unavailable» 로 죽었다.
+ *  ⇒ 그때만 설정 경로(`getProviderForConfig`)를 탄다 — 키가 있으면 Z.ai 공급자, 없으면 OpenRouter 안내 오류.
+ *  활성 provider 가 glm 이 아니면 undefined(종전 그대로). */
+function activeGlmProviderForModel(model: string): LLMProvider | undefined {
+  if (!model.trim().toLowerCase().startsWith('glm-')) return undefined;
+  let cfg: UserConfig;
+  try {
+    const { getUserConfig } = require('./user-config.js') as typeof import('./user-config.js');
+    cfg = getUserConfig();
+  } catch (e) {
+    debug.log('llm.router', 'getProvider.glm-config-unreadable', { requestedModel: model, error: e instanceof Error ? e.message : String(e) }, { level: 'warn' });
+    return undefined;
+  }
+  if (cfg.llm.provider !== 'glm') return undefined;
+  debug.log('llm.router', 'getProvider.glm-active', { requestedModel: model }, { level: 'info' });
+  return getProviderForConfig(cfg, model);
+}
+
 /**
  * Pick a provider based on the model name. If model is undefined, use first
  * available provider (preferring DEFAULT_PROVIDER env var if set).
@@ -4305,6 +4346,8 @@ export function getProvider(model?: string): LLMProvider {
     // ids (e.g. `claude-opus-4-7`) so prefix matching works. Existing
     // full ids pass through unchanged.
     const resolved = resolveModelAlias(model) ?? model;
+    const glmDirect = activeGlmProviderForModel(resolved);
+    if (glmDirect) return glmDirect;
     // Preserve the historical Chat Completions route for gpt-* model-only
     // requests, including future ids that the current catalog does not list.
     if (resolved.toLowerCase().startsWith('gpt-')) return PROVIDERS.openai!;
@@ -4443,6 +4486,7 @@ export function buildMessagesWithContext(
 // Re-export converters so tests/adapters can assert wire-format correctness.
 export { toOpenAIMessage, toOpenAIMessages, toAnthropicMessage, systemToAnthropicString };
 export { usesAdaptiveThinking, mapReasoningLevelToAnthropicThinking, mapReasoningLevelToAnthropicEffort, sseLineStream, retryOptsFor }; // src/llm/bedrock-provider.ts
+export { makeOpenAICompatProvider, makeOpenRouterProvider }; // src/llm/zai-coding-plan.ts
 
 /**
  * Best-effort classification of whether a model accepts image inputs.
@@ -4502,7 +4546,7 @@ export function isLikelyVisionModel(model: string | undefined): boolean {
 // ⭐ OPENROUTER-OPTIMIZE G9 — `reportedCostUsd`(OpenRouter `usage.cost`)도 싣는다. 빠지면 `stream-llm` 행이
 //   실청구액을 잃고 카탈로그 추정(대개 `cost.kind=unknown`)으로 떨어진다(리뷰·저작 행 실측).
 //   합산은 토큰 칸과 같은 규약이다 — OpenAI 호환 스트림은 `usage` 를 마지막 청크에 «한 번» 싣는다(누적 반복 보고 아님).
-type ObservedUsage = Pick<LLMUsage, 'inputTokens' | 'outputTokens' | 'cacheReadInputTokens' | 'cacheCreationInputTokens' | 'reportedCostUsd'>;
+type ObservedUsage = Pick<LLMUsage, 'inputTokens' | 'outputTokens' | 'cacheReadInputTokens' | 'cacheCreationInputTokens' | 'reportedCostUsd' | 'byok' | 'upstreamCostUsd'>;
 
 type ProviderTextResult =
   | { ok: true; full: string; usage: ObservedUsage | 'unmeasured' }
@@ -4513,7 +4557,7 @@ function accumulateUsage(usage: ObservedUsage | undefined, received: LLMUsage): 
   for (const field of ['inputTokens', 'outputTokens', 'cacheReadInputTokens', 'cacheCreationInputTokens', 'reportedCostUsd'] as const) {
     if (received[field] !== undefined) total[field] = (total[field] ?? 0) + received[field];
   }
-  return total;
+  return accumulateByokUsage(total, received); // OR-BYOK-COST
 }
 
 async function consumeProviderText(
@@ -4637,7 +4681,7 @@ export async function streamLLM(
     if (consumed.ok) {
       if (consumed.usage !== 'unmeasured') {
         try {
-          logAgentTurnUsage(activeModel, consumed.usage, { providerName: activeProvider.name, site: 'stream-llm', role: opts.usageRole });
+          logAgentTurnUsage(activeModel, consumed.usage, { providerName: activeProvider.name, site: opts.usageSite ?? 'stream-llm', role: opts.usageRole });
         } catch { /* best-effort observation */ }
       }
       debug.log('llm', 'outcome', { provider: activeProvider.name, status: 'ok', kind: 'streamLLM', durationMs: Date.now() - started });
@@ -8214,11 +8258,16 @@ export async function streamLLMWithTools(
       },
     };
   }
+  // OR-DEEPSEEK-TUNE — 마지막 턴의 «도구 없는» 추론(deepseek/* 만 채워진다). 매 턴 시작에 비운다.
+  let turnReasoningDetails: Array<Record<string, unknown>> | undefined;
   const emitTurnComplete = (finalAssistantText?: string): void => {
     if (finalAssistantText && finalAssistantText.length > 0) {
       history.push({
         role: 'assistant',
-        content: [{ type: 'text', text: finalAssistantText }],
+        content: [{
+          type: 'text', text: finalAssistantText,
+          ...(turnReasoningDetails ? { providerMeta: { reasoningDetails: turnReasoningDetails } } : {}),
+        }],
       });
     }
     handlers.onTurnComplete?.(history.slice(initialHistoryLen));
@@ -8427,6 +8476,7 @@ export async function streamLLMWithTools(
       }
     }
     let turnText = '';
+    turnReasoningDetails = undefined;
     const pendingCalls: Array<{
       id: string;
       name: string;
@@ -8642,6 +8692,8 @@ export async function streamLLMWithTools(
         turnText += ev.delta;
         fullText += ev.delta;
         handlers.onText(ev.delta, fullText);
+      } else if (ev.type === 'reasoning_details') {
+        turnReasoningDetails = ev.details;
       } else if (ev.type === 'tool_call') {
         pendingCalls.push({
           id: ev.id,
@@ -10938,7 +10990,8 @@ function makeOpenAICompatProvider(
         throw new Error(`${name} unavailable: configure apiKey via \`elanous setup\``);
       }
       const activeModel = opts.model || model;
-      const tools = toOpenAITools(opts.tools, name === 'openrouter' && openRouterWireModel(activeModel).startsWith('moonshotai/'));
+      const tools = toOpenAITools(opts.tools, name === 'openrouter' && openRouterNeedsKimiToolSchema(openRouterWireModel(activeModel)));
+      const deepSeek = name === 'openrouter' && isOpenRouterDeepSeekWireModel(openRouterWireModel(activeModel));
       // OR-TOOLCHOICE-PASS (2026-10-10) — OpenRouter 경로만 호출자 toolChoice 를 싣는다.
       //   ⛔ grok/openai 호환 경로는 손대지 않는다(무회귀). toolChoice 가 없거나 tools 가 없으면 키 자체를 안 싣는다.
       const toolChoice = name === 'openrouter' && tools
@@ -10967,7 +11020,11 @@ function makeOpenAICompatProvider(
         acceptToolImagesViaFollowup: followup,
         acceptUserMessageImages: followup,
         ...(name === 'openrouter' ? { echoReasoningDetails: true } : {}),
+        ...(deepSeek ? { deepSeekReplay: true } : {}),
       }));
+      // OR-DEEPSEEK-TUNE — deepseek/* 만: 설정 기본값의 상류 고정(명시 라우팅이 없을 때) ⊕ 관측 `deepseek-replay`.
+      const deepSeekProvider = deepSeek ? openRouterDeepSeekRequestExtras(openRouterWireModel(activeModel), wireMessages,
+        (wire.extraBody as { provider?: unknown } | undefined)?.provider, cfg.openrouter?.providerPreferences, cfg.openrouter?.upstreamPins) : {};
       // OR-ANTHROPIC-CACHE (2026-10-10) — OpenRouter 뒤 anthropic/* · moonshotai/* 만 cache_control 중단점을 싣는다.
       //   ⛔ 다른 OpenRouter 모델과 grok/openai/local 호환 경로는 이 분기를 안 탄다 — 본문 바이트 동일(무회귀).
       const cacheFamily = name === 'openrouter' ? openRouterPromptCacheFamily(openRouterWireModel(activeModel)) : null;
@@ -11013,6 +11070,7 @@ function makeOpenAICompatProvider(
           ...(tools ? { tools } : {}),
           ...(toolChoice !== undefined ? { tool_choice: toolChoice } : {}),
           ...(wire.extraBody ?? {}),
+          ...deepSeekProvider,
           // OpenRouter alone resolves per-call effort against the configured level and catalog default.
           ...(name === 'openrouter'
             ? openRouterReasoningField(activeModel, opts.reasoningEffort, cfg.reasoningLevel)
@@ -11112,7 +11170,7 @@ const OPENROUTER_REASONING_EFFORT: Record<string, 'low' | 'medium' | 'high'> = {
 };
 function openRouterReasoningField(
   model: string, requested: string | undefined, configured: UCLLMConfig['reasoningLevel'],
-): { reasoning?: { effort: 'low' | 'medium' | 'high' }; verbosity?: 'low' | 'medium' | 'high' } {
+): { reasoning?: { effort: 'low' | 'medium' | 'high' | 'xhigh' }; verbosity?: 'low' | 'medium' | 'high' } {
   const wireModel = openRouterWireModel(model);
   // The catalog's model-specific open-weight verdict, not a vendor/slug prefix,
   // gates the default: an unregistered release may be closed-weight.
@@ -11121,13 +11179,18 @@ function openRouterReasoningField(
     (entry) => entry.id === slug && entry.openWeight === true,
   );
   const configEffort = configured === 'off' ? undefined : configured;
-  const source = requested !== undefined ? 'call' : configured !== undefined ? 'config' : openWeight ? 'default' : 'none';
-  const effort = requested ?? (configured !== undefined ? configEffort : openWeight ? 'medium' : undefined);
-  const sent = effort !== undefined && Object.hasOwn(OPENROUTER_REASONING_EFFORT, effort)
-    ? OPENROUTER_REASONING_EFFORT[effort] : undefined;
+  // OR-DEEPSEEK-TUNE — deepseek/* 의 기본은 카탈로그 손 레코드(YAML `reasoning`) · 없으면 아래 기존 폴백.
+  const catalogEffort = requested === undefined && configured === undefined ? openRouterDeepSeekCatalogEffort(model) : undefined;
+  const source = requested !== undefined ? 'call' : configured !== undefined ? 'config' : catalogEffort ? 'catalog' : openWeight ? 'default' : 'none';
+  const effort = requested ?? (configured !== undefined ? configEffort : catalogEffort ?? (openWeight ? 'medium' : undefined));
+  // OR-DEEPSEEK-TUNE — DeepSeek V4 는 자기 표(xhigh·max→xhigh · off→칸 없음 · src/llm/openrouter-deepseek.ts).
+  const deepSeekEffort = openRouterDeepSeekEffort(wireModel, effort);
+  const sent = deepSeekEffort !== undefined ? (deepSeekEffort ?? undefined)
+    : effort !== undefined && Object.hasOwn(OPENROUTER_REASONING_EFFORT, effort)
+      ? OPENROUTER_REASONING_EFFORT[effort] : undefined;
   const field = sent ? (wireModel.startsWith('anthropic/') ? 'verbosity' : 'reasoning') : 'none';
   debug.log('llm.openrouter', 'reasoning', { model, requested: requested ?? null, sent: sent ?? null, source, field });
-  return field === 'verbosity' ? { verbosity: sent }
+  return field === 'verbosity' ? { verbosity: sent as 'low' | 'medium' | 'high' }
     : field === 'reasoning' ? { reasoning: { effort: sent! } } : {};
 }
 
@@ -11532,8 +11595,16 @@ export function getProviderForConfig(
   model?: string,
 ): LLMProvider {
   const { provider } = userConfig.llm;
+  // CLAUDE-IMPL-LANE(10-11) — `claude-acp` 는 LLM provider 가 아니라 구독 ACP 구현 실행기 선택이다.
+  //   여기서 풀리면 모델 이름(claude-…)이 anthropic(API 키 provider)으로 넘어가 «구독» 런이 API 로 과금된다 → 거부.
+  //   구현은 implement seam 의 claude-acp 갈래(src/self-implement/claude-acp-implement.ts)만 쓴다.
+  if ((provider as string) === 'claude-acp') {
+    throw new Error('claude-acp 는 LLM provider 가 아니다 — 구독 ACP 구현 레인 전용(src/self-implement/claude-acp-implement.ts) · API provider 로 풀지 않는다');
+  }
   // ⛔ 2026-09-23 — `kimi`·`qwen`·`glm` 은 union·사다리에 있지만 «직결» 배선이 없다(사다리 `wip`).
   //   종전엔 `unknown provider: kimi` 로 «아무것도» 안 말하고 죽었다. 이제 실제로 도는 길이 있다(`openrouter`).
+  // ZAI-CODING-PLAN-PROVIDER(대표 10-11) — `ZAI_API_KEY` 가 있을 때만 glm 직결. 없으면 아래 안내 그대로(src/llm/zai-coding-plan.ts).
+  if (provider === 'glm' && zaiCodingPlanAvailable()) return makeZaiCodingPlanProvider({ ...userConfig.llm, model: model || userConfig.llm.model });
   const direct = OPENROUTER_ROUTE_FOR_WIP_PROVIDER[provider as keyof typeof OPENROUTER_ROUTE_FOR_WIP_PROVIDER];
   if (direct) {
     throw new Error(

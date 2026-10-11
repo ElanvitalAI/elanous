@@ -67,14 +67,14 @@ async function drive(turns: readonly Turn[], opts: GoalLoopOptions) {
   }
 }
 
-describe('GOAL-LOOP-INTENT-STALL — OpenRouter 한정 재촉', () => {
+describe('GOAL-LOOP-INTENT-STALL — 목록 provider 재촉', () => {
   test('상한은 2 이고 재촉 문면은 새 상수 하나다', () => {
     expect(GOAL_INTENT_STALL_MAX_REPROMPTS).toBe(2);
     expect(GOAL_INTENT_STALL_PROMPT).toContain('도구를 호출');
     expect(GOAL_INTENT_STALL_PROMPT).not.toBe(GOAL_CONTINUATION_PROMPT);
   });
 
-  for (const provider of ['openai-codex', 'grok', 'anthropic', null] as const) {
+  for (const provider of ['local', null] as const) {
     test(`(a) provider=${provider} — 텍스트만 낸 첫 턴은 오늘처럼 바로 text-only-accept (재촉 0)`, async () => {
       const r = await drive([{ text: STALL_TEXT }], { intentStallProvider: provider });
       expect(r.calls).toBe(1);
@@ -194,12 +194,23 @@ describe('GOAL-LOOP-INTENT-STALL — OpenRouter 한정 재촉', () => {
     expect(r.result).toEqual({ finalText: '설명만 합니다', iterations: 3, stopReason: 'end_turn', goalComplete: false });
   });
 
-  test('(d) codex — 같은 순서에서 가드가 꺼진 provider 는 오늘처럼 바로 수용한다(재촉 0)', async () => {
+  test('(d) 목록 밖 provider(local) — 같은 순서에서 가드가 꺼진 provider 는 오늘처럼 바로 수용한다(재촉 0)', async () => {
     const turns: Turn[] = [{ text: '읽었습니다', messages: [readFileUse] }, { text: '설명만 합니다' }];
-    const cx = await drive(turns, { intentStallProvider: 'openai-codex' });
+    const cx = await drive(turns, { intentStallProvider: 'local' });
     expect(cx.calls).toBe(2);
     expect(cx.count('intent-stall-midrun')).toBe(0);
     expect(cx.count('intent-stall-reprompt')).toBe(0);
     expect(cx.result).toEqual({ finalText: '설명만 합니다', iterations: 2, stopReason: 'end_turn', goalComplete: false });
   });
+});
+
+describe('GOAL-LOOP-INTENT-STALL — 모든 구현 provider', () => {
+  for (const provider of ['openai-codex', 'anthropic', 'grok', 'bedrock']) {
+    test(`${provider} 구현 자식도 «도구 0회·텍스트만» 첫 턴을 재촉한다`, async () => {
+      const r = await drive([{ text: STALL_TEXT }, { text: '읽었습니다', messages: [readFileUse] }, { text: '완료', messages: [completeUse] }], { intentStallProvider: provider });
+      expect(r.count('intent-stall-reprompt')).toBe(1);
+      expect(r.count('text-only-accept')).toBe(0);
+      expect(r.events.find((e) => e.event === 'start')?.data).toMatchObject({ intentStallGuard: true, intentStallProvider: provider });
+    });
+  }
 });

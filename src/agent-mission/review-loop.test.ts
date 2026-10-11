@@ -1,6 +1,7 @@
-import { describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import * as llm from '../llm.js';
+import { setUserConfigOverlay } from '../user-config.js';
 import { buildReworkMission, classifyReview, extractAppliedReviewItems, fetchAppliedReviewItemsForBranch, fetchLatestReview, judgeAndFinalize, prepareReviewLoopContext, runReviewLoop, runReworkMission, type LatestReviewSource } from './review-loop.js';
 import { buildJudgePrompt, parseJudge, type AcpJudgeResult } from './acp-judge.js';
 import { format } from '../agent-substrate/pr-comment-meta.js';
@@ -30,6 +31,34 @@ const reviewedSource = () => source({ reviews: [{ body: 'LGTM — please merge',
 const reviewLoopFiles = JSON.stringify({ files: [{ path: 'src/example.ts', additions: 1, deletions: 0 }] });
 
 describe('review-loop 분류 실패와 심판 범위 관측', () => {
+  // classifyReview 는 #25822 부터 resolveRoleLlm('classify') 로 provider 를 먼저 푼다 — classify 를 고정하지 않으면
+  // 전역 provider 해석이 주변 자격증명에 기대어(test:deterministic 은 키를 지운다) streamLLM 목에 닿기 전에 던진다.
+  beforeEach(() => { setUserConfigOverlay(config => ({ ...config, roleLlm: { ...config.roleLlm, classify: { provider: 'gemini', model: 'classify-review-fixture' } } })); });
+  afterEach(() => { setUserConfigOverlay(null); });
+  test('classify 역할 overlay 모델·provider·usageRole 을 함께 전달한다', async () => {
+    const stream = spyOn(llm, 'streamLLM').mockResolvedValue('{"verdict":"ok","asks":[],"reason":"clean"}');
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      setUserConfigOverlay(config => ({ ...config, roleLlm: { ...config.roleLlm, classify: { provider: 'gemini', model: 'classify-review-fixture' } } }));
+      expect((await classifyReview('LGTM')).verdict).toBe('ok');
+      expect(stream.mock.calls[0]?.[2]).toMatchObject({ model: 'classify-review-fixture', provider: llm.PROVIDERS.gemini, usageRole: 'classify', maxTokens: 700, temperature: 0.1 });
+      expect(log.mock.calls.find(([category, event]) => category === 'llm.role-pin' && event === 'resolved')?.[2])
+        .toMatchObject({ site: 'classify-review', role: 'classify', model: 'classify-review-fixture', provider: 'gemini', source: 'config-role' });
+    } finally { log.mockRestore(); stream.mockRestore(); setUserConfigOverlay(null); }
+  });
+
+  test('역할 해석 실패도 ambiguous · llm-call-failure 를 유지한다', async () => {
+    const stream = spyOn(llm, 'streamLLM').mockResolvedValue('{}');
+    try {
+      setUserConfigOverlay(config => ({ ...config, roleLlm: { ...config.roleLlm, classify: { provider: 'gemini', model: 'classify-review-fixture' } } }));
+      const saved = llm.PROVIDERS.gemini;
+      delete llm.PROVIDERS.gemini;
+      try {
+        expect(await classifyReview('LGTM')).toMatchObject({ verdict: 'ambiguous', classificationSource: 'llm-call-failure' });
+        expect(stream).not.toHaveBeenCalled();
+      } finally { llm.PROVIDERS.gemini = saved!; }
+    } finally { stream.mockRestore(); setUserConfigOverlay(null); }
+  });
   test.each([
     ['문자열', 'provider overloaded', 'provider overloaded'],
     ['객체', { provider: 'anthropic', status: 503 }, '{"provider":"anthropic","status":503}'],

@@ -23,6 +23,7 @@
 // event with cacheReadInputTokens absent (treated as 0 downstream).
 
 import type { LLMUsage } from './types.js';
+import { readOpenRouterByokUsage } from '../llm/openrouter-byok-cost.js';
 
 /** Extract LLMUsage from an OpenAI streaming chunk. Returns null when
  *  the chunk has no usage object (every chunk except the final one
@@ -71,6 +72,8 @@ export function parseOpenAIUsage(event: unknown): LLMUsage | null {
     out.reasoningOutputTokens = r.completion_tokens_details.reasoning_tokens;
   }
   if (typeof r.cost === 'number' && Number.isFinite(r.cost) && r.cost >= 0) out.reportedCostUsd = r.cost;
+  // OR-BYOK-COST — BYOK 호출이면 `byok` ⊕ `upstreamCostUsd`(비-BYOK 이면 아무 칸도 안 더한다 · 종전 바이트).
+  Object.assign(out, readOpenRouterByokUsage(event));
   const keys = Object.keys(out).filter(k => k !== 'provider');
   return keys.length === 0 ? null : out;
 }

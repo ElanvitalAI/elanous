@@ -62,15 +62,17 @@ async function run(model?: string, opts: Record<string, unknown> = {}) {
   return { provider, sent, events };
 }
 
+// ⭐ BEDROCK-RUNTIME-PATH: 아래 mantle 시험들은 mantle 이 «실제로 내는» 모델(`anthropic.claude-sonnet-5` · 📏 GET /v1/models)로 잰다 —
+//   5.5 는 runtime 경로로 갔다(src/llm/bedrock-runtime.test.ts). mantle 바이트는 종전과 같다.
 test('request body: Anthropic messages shape on the Bedrock messages endpoint · bedrock model id · cache markers', async () => {
-  const { sent, provider } = await run('claude-sonnet-5-5');
+  const { sent, provider } = await run('claude-sonnet-5');
   expect(provider.name).toBe('bedrock');
   expect(sent).toHaveLength(1);
   const { url, headers, body } = sent[0]!;
   expect(url).toBe('https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages');
   expect(headers['anthropic-version']).toBe('2023-06-01');
   expect(headers['anthropic-beta']).toBeUndefined();
-  expect(body.model).toBe('anthropic.claude-sonnet-5-5');
+  expect(body.model).toBe('anthropic.claude-sonnet-5');
   expect(body.stream).toBe(true);
   expect(body.messages.map((m: any) => m.role)).toEqual(['user', 'assistant', 'user']);
   // 캐시 4슬롯 — Anthropic 공급자와 같은 자리(system·tools 꼬리 · history).
@@ -83,16 +85,16 @@ test('request body: Anthropic messages shape on the Bedrock messages endpoint ·
 });
 
 test('promptCache:false strips every cache marker', async () => {
-  const { sent } = await run(undefined, { promptCache: false });
+  const { sent } = await run('anthropic.claude-sonnet-5', { promptCache: false });
   expect(JSON.stringify(sent[0]!.body)).not.toContain('cache_control');
-  expect(sent[0]!.body.model).toBe('anthropic.claude-sonnet-5-5');
+  expect(sent[0]!.body.model).toBe('anthropic.claude-sonnet-5');
 });
 
 test('response parsing: text · tool_call · one usage event with cachedInput', async () => {
   const logs: Array<[string, string, any]> = [];
   const spy = spyOn(debug, 'log').mockImplementation(((c: string, e: string, d: any) => { logs.push([c, e, d]); }) as typeof debug.log);
   try {
-    const { events } = await run('bedrock/claude-haiku-5-5');
+    const { events } = await run('bedrock/claude-sonnet-5');
     expect(events.filter((e) => e.type === 'text').map((e) => (e as any).delta).join('')).toBe('hello');
     const call = events.find((e) => e.type === 'tool_call') as any;
     expect(call).toMatchObject({ id: 'toolu_1', name: 'Read', args: { path: 'a.ts' } });
@@ -101,7 +103,7 @@ test('response parsing: text · tool_call · one usage event with cachedInput', 
     expect(usage[0].usage.cacheReadInputTokens).toBe(4096);
     expect(usage[0].usage.outputTokens).toBe(30);
     const obs = logs.find(([c, e]) => c === 'llm.bedrock' && e === 'usage');
-    expect(obs?.[2]).toMatchObject({ provider: 'bedrock', model: 'anthropic.claude-haiku-5-5', cachedInput: 4096, outputTokens: 30 });
+    expect(obs?.[2]).toMatchObject({ provider: 'bedrock', model: 'anthropic.claude-sonnet-5', cachedInput: 4096, outputTokens: 30 });
     // ⛔ 자격 값이 관측에 실리지 않는다.
     expect(JSON.stringify(logs)).not.toContain('AKIDFAKE');
   } finally {
@@ -153,7 +155,7 @@ test('IMDS-only host (region, no credential signal) → available candidate; cha
 test('explicit provider=bedrock routes to the bedrock provider (config)', () => {
   const p = getProviderForConfig({ llm: { provider: 'bedrock', model: 'anthropic.claude-sonnet-5-5' } } as UserConfig);
   expect(p.name).toBe('bedrock');
-  expect(p.defaultModel).toBe('anthropic.claude-sonnet-5-5');
+  expect(p.defaultModel).toBe('global.anthropic.claude-sonnet-5-5');
   const bare = getProviderForConfig({ llm: { provider: 'bedrock', model: 'claude-sonnet-5-5' } } as UserConfig);
   expect(bare.name).toBe('bedrock');
 });
@@ -183,8 +185,10 @@ test('invariants: other providers unchanged · bedrock never chosen automaticall
 });
 
 test('--child-llm-provider bedrock resolves to the wire id; unknown model is refused', () => {
-  expect(resolveImplementationChildModel('bedrock', 'claude-sonnet-5-5').resolvedId).toBe('anthropic.claude-sonnet-5-5');
-  expect(resolveImplementationChildModel('bedrock', 'bedrock/claude-opus-5-5').resolvedId).toBe('anthropic.claude-opus-5-5');
+  // BEDROCK-RUNTIME-PATH: 5.5 별칭은 전역 추론 프로필(runtime)로 푼다.
+  expect(resolveImplementationChildModel('bedrock', 'claude-sonnet-5-5').resolvedId).toBe('global.anthropic.claude-sonnet-5-5');
+  expect(resolveImplementationChildModel('bedrock', 'bedrock/claude-opus-5-5').resolvedId).toBe('global.anthropic.claude-opus-5-5');
+  expect(resolveImplementationChildModel('bedrock', 'anthropic.claude-sonnet-5').resolvedId).toBe('anthropic.claude-sonnet-5');
   expect(resolveImplementationChildModel('bedrock', 'anthropic.claude-haiku-5-5').tier).toBe('cheap');
   // 표의 supportsThinking 이 해석 결과로 흘러간다(자식 추론 배선이 읽는 칸).
   expect(resolveImplementationChildModel('bedrock', 'claude-sonnet-5-5').supportsThinking).toBe(true);
@@ -226,7 +230,7 @@ test('child env relays AWS_* only for bedrock', () => {
 test('provider name lists carry bedrock together (no single-list drift)', () => {
   expect(CONFIG_LLM_PROVIDER_NAMES).toContain('bedrock');
   expect(RUNTIME_LLM_PROVIDER_NAMES).toContain('bedrock');
-  expect(PROVIDER_DEFAULT_MODEL.bedrock).toBe('anthropic.claude-sonnet-5-5');
+  expect(PROVIDER_DEFAULT_MODEL.bedrock).toBe('global.anthropic.claude-sonnet-5-5');
   expect(Object.keys(PROVIDERS)).toContain('bedrock');
   // isKnownProviderName 경유 — 알려진 provider 라야 config 라우팅이 «unknown provider» 로 죽지 않는다.
   expect(getProviderForConfig({ llm: { provider: 'bedrock' } } as UserConfig).name).toBe('bedrock');
@@ -245,7 +249,7 @@ test('retry re-signs the request (SigV4 x-amz-date freshness) via fetchApiWithRe
     return new Response(STREAM, { status: 200, headers: { 'content-type': 'text/event-stream' } });
   }) as typeof fetch);
   try {
-    const p = makeBedrockProvider({ provider: 'bedrock' } as UserConfig['llm'], {
+    const p = makeBedrockProvider({ provider: 'bedrock', model: 'anthropic.claude-sonnet-5' } as UserConfig['llm'], {
       env: ENV,
       resolveCredentials: async () => FAKE,
       sign: async ({ headers }) => ({ ...headers, authorization: `sig-${++signs}` }),
@@ -309,17 +313,16 @@ test('malicious AWS_REGION → unavailable and zero sends (no credentials leave 
   expect(sends).toBe(0);
 });
 
-test('Pod path refuses bedrock until the Pod PR lands (fail-closed, no silent codex)', () => {
+test('Pod path names bedrock (never a silent codex) — the AWS Secret gate runs before launch (pod-bedrock-child.test.ts)', () => {
   const r = podNamedChildProvider('bedrock', { grokSubscription: true, grokApiKey: true, openrouterKey: true }, 'anthropic.claude-sonnet-5-5');
-  expect(r.provider).toBeUndefined();
-  expect(r.refuse).toMatch(/bedrock/);
+  expect(r).toEqual({ provider: 'bedrock' });
 });
 
 test('requests never follow redirects (credential headers cannot leave the validated host)', async () => {
-  const { sent } = await run();
+  const { sent } = await run('anthropic.claude-sonnet-5');
   expect(sent).toHaveLength(1);
   const inits: RequestInit[] = [];
-  const p = makeBedrockProvider({ provider: 'bedrock' } as UserConfig['llm'], {
+  const p = makeBedrockProvider({ provider: 'bedrock', model: 'anthropic.claude-sonnet-5' } as UserConfig['llm'], {
     env: { AWS_REGION: 'us-east-1', AWS_BEARER_TOKEN_BEDROCK: 'tok-fake' },
     send: async (_url, init) => { inits.push(init); return new Response(STREAM, { status: 200 }); },
   });
@@ -349,19 +352,19 @@ test('cache marker placement is byte-identical to the Anthropic provider (system
     return new Response(STREAM, { status: 200, headers: { 'content-type': 'text/event-stream' } });
   }) as unknown as typeof fetch);
   try {
-    const anth = getProviderForConfig({ llm: { provider: 'anthropic', model: 'claude-sonnet-5-5', apiKey: 'sk-ant-test' } } as UserConfig);
+    const anth = getProviderForConfig({ llm: { provider: 'anthropic', model: 'claude-sonnet-5', apiKey: 'sk-ant-test' } } as UserConfig);
     for await (const _ of anth.streamChat!(messages, { tools })) { /* */ }
   } finally {
     fetchSpy.mockRestore();
   }
   let bedrockBody: any;
-  const p = makeBedrockProvider({ provider: 'bedrock', model: 'claude-sonnet-5-5' } as UserConfig['llm'], {
+  const p = makeBedrockProvider({ provider: 'bedrock', model: 'claude-sonnet-5' } as UserConfig['llm'], {
     env: { AWS_REGION: ' us-east-1 ', AWS_BEARER_TOKEN_BEDROCK: 'tok-fake' },
     send: async (_url, init) => { bedrockBody = JSON.parse(String(init.body)); return new Response(STREAM, { status: 200 }); },
   });
   for await (const _ of p.streamChat!(messages, { tools })) { /* */ }
-  expect(bedrockBody.model).toBe('anthropic.claude-sonnet-5-5');
-  expect(anthropicBody.model).toBe('claude-sonnet-5-5');
+  expect(bedrockBody.model).toBe('anthropic.claude-sonnet-5');
+  expect(anthropicBody.model).toBe('claude-sonnet-5');
   // 모델 칸 말고는 같은 몸 — 캐시 표지 위치(system 꼬리 · tools 꼬리 · history · anchor)까지 그대로.
   const strip = ({ model: _m, ...rest }: any) => rest;
   expect(strip(bedrockBody)).toEqual(strip(anthropicBody));
@@ -369,4 +372,33 @@ test('cache marker placement is byte-identical to the Anthropic provider (system
   expect(marked[0]).toBe(true);                       // anchor(messages[0])
   expect(marked[marked.length - 2]).toBe(true);       // history(N-2)
   expect(marked[marked.length - 1]).toBe(false);      // 마지막 user 턴엔 표지 없음
+});
+
+test('a 403 body naming the IAM principal never carries the ARN or account id into the error (BEDROCK-CHECK 10-11 smoke)', async () => {
+  const body = JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'User: arn:aws:iam::123456789012:user/x is not authorized to perform: bedrock-mantle:CreateInference on resource: arn:aws:bedrock-mantle:ap-northeast-2:123456789012:project/default' } });
+  const p = makeBedrockProvider({ provider: 'bedrock' } as UserConfig['llm'], {
+    env: ENV, resolveCredentials: async () => FAKE,
+    sign: async ({ headers }) => headers,
+    send: async () => new Response(body, { status: 403 }),
+  });
+  const err = await (async () => { for await (const _ of p.streamChat!([{ role: 'user', content: 'x' }])) { /* */ } })().then(() => null, (e: Error) => e);
+  expect(err?.message).toContain('Bedrock API 403');
+  expect(err?.message).toContain('bedrock-mantle:CreateInference');
+  expect(err?.message).not.toContain('123456789012');
+  expect(err?.message).not.toMatch(/arn:aws/);
+});
+
+test('the production path (fetchApiWithRetry → ApiHttpError) also masks the ARN and account id, keeping status', async () => {
+  const body = JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'User: arn:aws:iam::123456789012:user/x is not authorized to perform: bedrock-mantle:CreateInference' } });
+  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async () => new Response(body, { status: 403 })) as unknown as typeof fetch);
+  const logSpy = spyOn(debug, 'log').mockImplementation((() => {}) as typeof debug.log);
+  try {
+    const p = makeBedrockProvider({ provider: 'bedrock' } as UserConfig['llm'], { env: ENV, resolveCredentials: async () => FAKE, sign: async ({ headers }) => headers });
+    const err = await (async () => { for await (const _ of p.streamChat!([{ role: 'user', content: 'x' }])) { /* */ } })().then(() => null, (e: Error & { status?: number; bodyText?: string }) => e);
+    expect(err?.name).toBe('ApiHttpError');
+    expect(err?.status).toBe(403);
+    expect(err?.message).toContain('bedrock-mantle:CreateInference');
+    expect(`${err?.message} ${err?.bodyText}`).not.toContain('123456789012');
+    expect(`${err?.message} ${err?.bodyText}`).not.toMatch(/arn:aws/);
+  } finally { fetchSpy.mockRestore(); logSpy.mockRestore(); }
 });

@@ -72,6 +72,22 @@ const EXECUTOR_VARIANT: Partial<Record<TaskMove, RetryVariant>> = {
   alternative: 'alternative',
 };
 
+/** 사다리 R4 — 실행부 허용 목록에 올릴 수 있는 재발사 계열 수(설정 `taskAgent.liveMoves` 어휘 그대로). */
+export const LIVE_RETRY_MOVES = ['narrow-relaunch', 'wait-retry', 'salvage-relaunch', 'alternative'] as const satisfies readonly TaskMove[];
+export type LiveRetryMove = typeof LIVE_RETRY_MOVES[number];
+
+const RETRY_MOVE_OF_VARIANT: Record<RetryVariant, LiveRetryMove> = {
+  narrow: 'narrow-relaunch',
+  wait: 'wait-retry',
+  salvage: 'salvage-relaunch',
+  alternative: 'alternative',
+};
+
+/** 실행부 `retry` 가 어느 수인가 — 갈래 없는 재발사(리뷰 fail 의 must-fix 재발사)는 «좁혀 재발사»다. */
+export function retryMoveOf(variant?: RetryVariant): LiveRetryMove {
+  return RETRY_MOVE_OF_VARIANT[variant ?? 'narrow'];
+}
+
 function base(input: TaskJudgeInput): Omit<TaskJudgement, 'executorKind'> {
   if (input.deliveryEvidence) return input.deliveryEvidence.ok
     ? { move: 'propose-green', stage: 'closing', reason: `전달 근거 확인: ${input.deliveryEvidence.files.join(', ')}` }

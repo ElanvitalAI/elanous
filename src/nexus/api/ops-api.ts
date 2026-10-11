@@ -9,6 +9,8 @@ import { jsonResponse } from './json-response.js';
 import { operatorSignal } from './operator.js';
 import { createSeatsCache, todayKst } from './ops-seats.js';
 import { liveSeatsSources } from './ops-seats-sources.js';
+import { createOverviewCache } from '../../ops/overview-cache.js';
+import { parseSince } from '../../ops/overview-collect.js';
 import type { MetaApiOpts } from './meta-api.js';
 
 const VERSION = /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/;
@@ -17,6 +19,11 @@ const DATE = /^\d{4}-\d{2}-\d{2}$/;
 let seatsCache: ReturnType<typeof createSeatsCache> | null = null;
 /** Tests swap the sources; production builds them lazily on first use. */
 export function setSeatsCacheForTest(cache: ReturnType<typeof createSeatsCache> | null): void { seatsCache = cache; }
+let overviewCache: ReturnType<typeof createOverviewCache> | null = null;
+export function setOverviewCacheForTest(cache: ReturnType<typeof createOverviewCache> | null): void {
+  overviewCache?.stop();
+  overviewCache = cache;
+}
 const LOG_PATH = /^\/v1\/ops\/release\/runs\/([^/]+)\/nodes\/([^/]+)\/log$/;
 
 interface RunNode { nodeId: string; ok?: unknown; output?: unknown; startedAt?: unknown; endedAt?: unknown }
@@ -190,6 +197,17 @@ export function handleOpsApi(req: Request, metaApi: MetaApiOpts | undefined): Re
     response.headers.set('cache-control', 'no-store');
     return response;
   };
+  if (pathname === '/v1/ops/overview') {
+    let since: ReturnType<typeof parseSince>;
+    try { since = parseSince(url.searchParams.get('since') ?? undefined); }
+    catch { return jsonResponse({ error: 'invalid-since' }, 400); }
+    const version = url.searchParams.get('version');
+    if (version !== null && !VERSION.test(version)) return jsonResponse({ error: 'invalid-version' }, 400);
+    overviewCache ??= createOverviewCache();
+    return overviewCache.get({ sinceMs: since.ms, sinceLabel: since.label,
+      ...(version ? { version } : {}), ...(url.searchParams.has('owner') ? { owner: url.searchParams.get('owner')! } : {}) })
+      .then((overview) => served(jsonResponse(overview)), () => jsonResponse({ error: 'overview-unavailable' }, 500));
+  }
   if (pathname === '/v1/ops/seats') {
     const date = url.searchParams.get('date') ?? todayKst();
     if (!DATE.test(date) || Number.isNaN(Date.parse(`${date}T00:00:00+09:00`))) return jsonResponse({ error: 'invalid-date' }, 400);

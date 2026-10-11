@@ -620,6 +620,78 @@ export const BUILTIN_CATALOG: ModelCatalog = {
       notes: 'Apache 2.0 · 397B MoE · Q4 ~220GB · M3 Ultra 512GB only',
     },
 
+    // ── DeepSeek V4 · OpenRouter `openrouter/deepseek/<id>` 전용 (OR-DEEPSEEK-TUNE · 2026-10-11)
+    // id 는 OpenRouter slug(`deepseek/` 뒤) 그대로 — llm.ts openRouterReasoningField 가 이 id 로 openWeight 를
+    // 찾는다. 기본 effort 는 YAML 손 레코드(catalog/models/openrouter/ · #26055)의 `reasoning` 이 정본이고,
+    // 레코드가 없을 때만 이 openWeight 폴백(medium)을 탄다. 단가 = deepseek 공급자 엔드포인트 평시가
+    // (v4.1-flash·v4-pro-0813 은 #26055 와 같은 값) · 나머지는 /api/v1/models 목록가(2026-10-11 실측).
+    // effort 상한 xhigh(OpenRouter 는 max 를 400 으로 거부 → src/llm/openrouter-deepseek.ts 가 max→xhigh).
+    // provider 'other' — 직결 deepseek 공급자는 없다(새 공급자 이름을 만들지 않는다).
+    {
+      id: 'deepseek-v4-flash',
+      provider: 'other',
+      family: 'deepseek',
+      contextWindow: 1_048_576,
+      inputPerMtok: 0.03,
+      outputPerMtok: 1.28,
+      local: false,
+      openWeight: true,
+      localPullable: false,
+      tags: ['coding', 'moe', 'cheap', 'open-weight', 'long-context'],
+      bestFor: ['cheap-agentic', 'open-weight-bench'],
+      reasoningEffortCeiling: 'xhigh',
+      releasedAt: '2026-04-24',
+      notes: 'OpenRouter deepseek/deepseek-v4-flash · 1M ctx',
+    },
+    {
+      id: 'deepseek-v4.1-flash',
+      provider: 'other',
+      family: 'deepseek',
+      contextWindow: 1_048_576,
+      inputPerMtok: 0.15,
+      outputPerMtok: 0.60,
+      local: false,
+      openWeight: true,
+      localPullable: false,
+      tags: ['coding', 'moe', 'cheap', 'open-weight', 'long-context'],
+      bestFor: ['cheap-agentic', 'open-weight-bench'],
+      reasoningEffortCeiling: 'xhigh',
+      releasedAt: '2026-09-10',
+      notes: 'OpenRouter deepseek/deepseek-v4.1-flash · 1M ctx',
+    },
+    {
+      id: 'deepseek-v4-pro',
+      provider: 'other',
+      family: 'deepseek',
+      contextWindow: 1_048_576,
+      inputPerMtok: 0.2088,
+      outputPerMtok: 0.4176,
+      local: false,
+      openWeight: true,
+      localPullable: false,
+      tags: ['coding', 'moe', 'open-weight', 'flagship', 'long-context'],
+      bestFor: ['open-frontier', 'open-weight-bench'],
+      reasoningEffortCeiling: 'xhigh',
+      releasedAt: '2026-04-24',
+      notes: 'OpenRouter deepseek/deepseek-v4-pro · 0423 Preview 별칭 — 고정판은 deepseek-v4-pro-0813',
+    },
+    {
+      id: 'deepseek-v4-pro-0813',
+      provider: 'other',
+      family: 'deepseek',
+      contextWindow: 1_048_576,
+      inputPerMtok: 0.66,
+      outputPerMtok: 1.98,
+      local: false,
+      openWeight: true,
+      localPullable: false,
+      tags: ['coding', 'moe', 'open-weight', 'flagship', 'long-context'],
+      bestFor: ['open-frontier', 'open-weight-bench'],
+      reasoningEffortCeiling: 'xhigh',
+      releasedAt: '2026-08-13',
+      notes: 'OpenRouter deepseek/deepseek-v4-pro-0813 · 날짜 고정판',
+    },
+
     // ── GLM 5.x (Zhipu) · `api.z.ai` / `open.bigmodel.cn` · OpenAI-compat
     // GLM-5.1 (2026-04-07) is the current flagship — 754B MoE / 40B
     // active under MIT. All recent GLM models (4.6+) are open-weight,

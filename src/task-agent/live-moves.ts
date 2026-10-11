@@ -7,21 +7,29 @@
  *   회수한 pass 는 그 틱의 판단부·land 관문 입력(`selfReview`)이 될 뿐 land 판정 로직은 그대로다.
  * - `propose-green`: 카드에 green «제안»(`greenProposal`)만 적는다 — 체크리스트는 손대지 않는다.
  * - `propose-land`: 카드·현재 머리의 self review 통과(pass «또는» warn ⊕ must-fix 0 · TA-LAND-WARN-MUSTFIX0)·non-draft 를 확인하고 기존 `pr land` 를 머리 고정으로 한 번 부른다.
+ * - 사다리 R4: `narrow-relaunch` · `wait-retry` · `salvage-relaunch` · `alternative` 도 허용 목록 어휘다 — 실제 발사는 실행부
+ *   `executeNextAction`(`actions.ts`)이 «목록 ⊕ 같은 수 2회 상한 ⊕ 회당 1건 ⊕ 부하 관문»을 모두 넘을 때만 한다.
+ * - `decision-card`: 막힌 과제를 «근거(서명 · 화면 · must-fix)» 붙은 결정 카드로 올린다 — 근거가 하나도 없으면 카드를 올리지 않는다.
+ *   카드는 종전 실행부와 같은 `decisions raise` 모양이라 OP 거르기(`seat-loop/op-decide.ts`)가 그대로 본다 · 같은 근거는 카드 history 로 한 번만.
  * - 설정 `taskAgent.liveMoves`(config > env `ELANOUS_TASK_AGENT_LIVE_MOVES` > 없음). 모르는 항목은 경고하고 버린다.
  * - 관측: 실행한 수마다 `debug.log('task-agent', 'live-move', {kind, card, ok, detail, live:true})`.
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { closeSync, mkdirSync, openSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { closeSync, mkdirSync, openSync, readFileSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
 import { findGitDir } from '../git-fs/locate.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig, userConfigPath } from '../user-config.js';
 import type { DetachedSpawn } from '../cli/tasks-cli.js';
-import { taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
+import { LIVE_MOVE_HISTORY_EVENT, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
+import { LIVE_RETRY_MOVES } from './judge.js';
+import { decisionCardGrounds, decisionRaiseArgs, type DecisionCardEvidence, type NextAction } from './actions.js';
 import { reviewResultPath } from './review-result-capture.js';
+import { buildPriorFixContext, PRIOR_FIX_SCOPE_LINE, priorFixBlock, priorFixObservation, type PriorDiffReader, type PriorFixContext } from './review-prior-fix.js';
 import { createLandWorktree, localHead, observeLandWorktree, type LandWorktree, type LandWorktreeFailure, type LandWorktreeInput, type LandWorktreeRemoval } from './land-worktree.js';
 
-export const TASK_AGENT_LIVE_MOVES = ['review', 'propose-green', 'propose-land'] as const;
+export const TASK_AGENT_LIVE_MOVES = ['review', 'propose-green', 'propose-land', 'decision-card', ...LIVE_RETRY_MOVES] as const;
 export type TaskAgentLiveMove = typeof TASK_AGENT_LIVE_MOVES[number];
 export const TASK_AGENT_LIVE_MOVES_ENV = 'ELANOUS_TASK_AGENT_LIVE_MOVES';
 
@@ -70,11 +78,15 @@ export interface LiveMoveDeps {
    * TA-REVIEW-RESULT-CAPTURE — `capture.resultPath` 가 오면 자식 `--json` stdout 을 그 파일로 받는다(회수 = `review-result-capture.ts`).
    */
   requestReview?: (pr: number, intent: string, cwd?: string, capture?: { resultPath: string }) => Promise<void>;
+  /** REVIEW-CONVERGE-PRIOR-FIX — 같은 PR 재리뷰의 직전 머리 → 지금 머리 diff(시험 주입 · 기본 = `git diff --numstat`). */
+  priorDiff?: PriorDiffReader;
   /** Fresh PR head and draft flag for landing; separate from the unchanged review lookup. */
   landPrHead?: (pr: number, cwd: string) => Promise<(PrHeadView & { isDraft: boolean }) | null>;
   /** One existing pr land operation; inject in tests instead of invoking the CLI. */
   /** TA-REJUDGE-ON-HEAD — `opts.overlapEvidence` 가 있으면 `pr land --overlap-evidence <file>` 로 넘긴다(없으면 종전 인자). */
   land?: (pr: number, head: string, cwd: string, opts?: { overlapEvidence?: string }) => Promise<{ status: number; stdout: string; stderr?: string }>;
+  /** `decision-card` — `decisions raise` 한 번(시험 주입 · 기본 = 같은 우주의 CLI 자식). */
+  raiseDecision?: (args: string[]) => Promise<{ status: number; stdout: string; stderr?: string }>;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
   /** TA-LAND-WORKTREE — cwd HEAD 읽기 · PR 머리 임시 워크트리 만들기(시험 주입 · 기본 = git). */
   landWorktree?: { localHead?: (cwd: string) => string | null; create?: (input: LandWorktreeInput) => Promise<LandWorktree | LandWorktreeFailure> };
@@ -87,6 +99,8 @@ export interface LiveMoveResult {
   reviewRepo?: { resolved: boolean; source?: ReviewRepoCandidate['source']; cwd?: string; proof?: 'head-sha' | 'branch'; reason: string };
   /** TA-REVIEW-RESULT-CAPTURE — 띄운 review 의 결과 파일(자식 stdout) — 실행한 review 에만 실린다. */
   resultPath?: string;
+  /** TA-LAND-RETRY-ON-INFRA — 실행한 land 의 그 머리 몇 번째 시도인가 · 실패면 갈래(infra|judgement|base-stale)·사유·재시도 가능 여부. */
+  landAttempt?: { attempt: number; class?: LandFailureClass; reason?: string; retryAllowed?: boolean };
 }
 
 export interface PrHeadView { head: string; state: string; branch?: string; url?: string }
@@ -242,11 +256,13 @@ export async function defaultLand(pr: number, head: string, cwd: string, opts: {
     child.once('error', reject);
     child.once('close', (code) => {
       if (code !== 0) { resolveResult({ status: code ?? 1, stdout, stderr }); return; }
+      // TA-LAND-RETRY-ON-INFRA — 왜 미확인인지 «마지막 줄»로 가른다(꼬리 300자에서도 남게): 못 읽음 = 인프라 · 읽었는데 MERGED 아님 = 판정.
+      const unconfirmed = (line: string, before = stderr || stdout || 'landing completed without confirmed merge') => ({ status: 1, stdout, stderr: `${before.slice(-(299 - line.length))}\n${line}` });
       void defaultLandPrHead(pr, cwd).then((view) => {
         resolveResult(view?.state === 'MERGED'
           ? { status: 0, stdout, stderr }
-          : { status: 1, stdout, stderr: (stderr || stdout || 'landing completed without confirmed merge').slice(-300) });
-      }).catch((error) => resolveResult({ status: 1, stdout, stderr: String(error).slice(-300) }));
+          : unconfirmed(view ? `✗ ta-land: pr land exited 0 but PR is ${view.state}` : '✗ ta-land: merge state unreadable after pr land exit 0'));
+      }).catch((error) => resolveResult(unconfirmed('✗ ta-land: merge state unreadable after pr land exit 0', String(error))));
     });
   });
 }
@@ -269,13 +285,17 @@ export async function defaultLandPrHead(pr: number, cwd: string): Promise<(PrHea
   } catch { return null; }
 }
 
-export function liveReviewIntent(card: TaskCard, runId: string | null, stopReason: string): string {
+/**
+ * REVIEW-CONVERGE-PRIOR-FIX — `prior` 는 같은 PR 의 두 번째 이후 리뷰에만 온다: «직전 반영분»에 직전 머리 범위·diff·must-fix 를,
+ * 범위 경계에 «바뀌지 않은 줄의 새 must-fix 는 근거 줄» 한 줄을 붙인다. 없으면(첫 리뷰) 종전 문면 바이트 그대로.
+ */
+export function liveReviewIntent(card: TaskCard, runId: string | null, stopReason: string, prior?: PriorFixContext | null): string {
   const goal = card.text.split('\n')[0]!.trim().slice(0, 300);
   return [
     `목표: ${goal}`,
     `수용기준: 과제 카드 ${card.id} 원문 —\n${card.text.trim().slice(0, 4000)}`,
-    `직전 반영분: 런 ${runId ?? '-'} 이 ${stopReason} 로 멈춤 — 수확 가능`,
-    '의도적 범위 경계: task-agent live review 요청(TA-JUDGE-LIVE-SAFE) — 리뷰만 한다 · 착지·재발사는 이 요청의 결정이 아니다',
+    `직전 반영분: 런 ${runId ?? '-'} 이 ${stopReason} 로 멈춤 — 수확 가능${prior ? `\n${priorFixBlock(prior)}` : ''}`,
+    `의도적 범위 경계: task-agent live review 요청(TA-JUDGE-LIVE-SAFE) — 리뷰만 한다 · 착지·재발사는 이 요청의 결정이 아니다${prior ? `\n${PRIOR_FIX_SCOPE_LINE}` : ''}`,
   ].join('\n');
 }
 
@@ -321,18 +341,25 @@ export async function executeLiveReview(
   const at = (deps.now ?? (() => new Date()))().toISOString();
   // TA-REVIEW-RESULT-CAPTURE — 머리마다 한 번이라 경로도 머리마다 하나다. 요청 칸에 먼저 적는다(회수가 이 칸을 본다).
   const resultPath = reviewResultPath(path, card.id, pr, head.head);
-  const claim = { claimed: false, missing: false };
+  const claim: { claimed: boolean; missing: boolean; before?: TaskCard } = { claimed: false, missing: false };
   updateTaskCard(path, card.id, (current) => {
     if (!current) { claim.missing = true; return undefined; }
     // 머리 «이력»으로 본다 — A→B→A 로 돌아와도 A 는 다시 요청하지 않는다.
     if ((current.reviewRequests ?? []).some((entry) => entry.pr === pr && entry.head === head!.head)) return undefined;
     claim.claimed = true;
+    claim.before = current;
     return { ...current, reviewRequests: [...(current.reviewRequests ?? []), { pr, head: head!.head, at, resultPath }] };
   });
   if (claim.missing) return observe(deps, withRepo({ kind, executed: false, card: card.id, ok: false, detail: 'task card not in state file' }));
   if (!claim.claimed) return observe(deps, withRepo({ kind, executed: false, card: card.id, ok: true, detail: `already requested for #${pr} head ${head.head.slice(0, 12)}` }));
   try {
-    const intent = liveReviewIntent(card, ctx.runId, ctx.stopReason);
+    // REVIEW-CONVERGE-PRIOR-FIX — 같은 PR 의 직전 요청(잠금 안에서 본 이력)이 있으면 그 라운드를 intent 에 싣는다 · 맥락을 못 만들면 종전 문면.
+    let prior: PriorFixContext | null = null;
+    try { prior = claim.before ? buildPriorFixContext(claim.before, pr, head.head, { ...(cwd ? { cwd } : {}), ...(deps.priorDiff ? { priorDiff: deps.priorDiff } : {}) }) : null; } catch { prior = null; }
+    if (prior) {
+      try { (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', 'review-prior-fix-filled', priorFixObservation(card.id, pr, prior)); } catch { /* fail-soft */ }
+    }
+    const intent = liveReviewIntent(card, ctx.runId, ctx.stopReason, prior);
     await (deps.requestReview ? deps.requestReview(pr, intent, cwd, { resultPath }) : defaultRequestReview(pr, intent, cwd, { resultPath }));
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
@@ -344,13 +371,155 @@ export async function executeLiveReview(
   return observe(deps, withRepo({ kind, executed: true, card: card.id, ok: true, detail: `review requested for #${pr} head ${head.head.slice(0, 12)}`, resultPath }));
 }
 
+/**
+ * TA-LAND-RETRY-ON-INFRA — land 실패를 둘로 가른다.
+ *
+ * - 왜: «같은 머리에 land 한 번»이 TA 쪽 인프라 결손(호스트에 PR 머리 트리가 없어 `✗ expected-head: … matching local HEAD and clean
+ *   worktree required`)에 그 한 번을 써 버렸고, 결손을 고친(#26037) 뒤에도 같은 머리는 `already attempted` 로 막혀 사람이 머리를
+ *   흔들어야 했다(2026-10-11 #26030 · 카드 ta-20261010-c6b53b).
+ * - `infra` — 아래 «명시적 허용 목록»에 있는 사유만. 같은 머리에 한 번 더(머리당 총 `LAND_ATTEMPTS_PER_HEAD_ON_INFRA`).
+ * - `judgement` — 그 밖 전부(must-fix · 겹침 관문 · 머리 바뀜 · 동결 · 게이트 · 충돌 · 목록에 없는 ✗ 줄 · 기록 없는 옛 시도) — 종전대로 한 번 끝(fail-closed).
+ * - 판독 근거: `pr land` 의 실제 출력 줄(`src/cli/pr-cli.ts` 의 `✗ <관문>:` 문면 그대로)과 `executeLiveLand` 의 사유.
+ * - 임시 워크트리 «생성 실패»는 여기 오지 않는다 — #26037 이 land 를 부르지 않고 시도 기록을 «되돌린다»(시도를 안 쓴다).
+ * - `base-stale` — REJUDGE base-stale(OVERLAP-EVIDENCE-BASE-WINDOW 짝 · #26060): 겹침 증거의 게이트 base 뒤에 main 이 «PR 파일을 건드리며»
+ *   움직였다(`✗ overlap-evidence: base-stale-overlap: …` ⊕ 딸린 `✗ expected-head: overlap merge approval unavailable …` 줄 «만»).
+ *   같은 머리 «즉시» 재시도는 없다(`retryAllowed:false`) — 재판정 틱이 새 base 위 재게이트를 청하고, 그 재게이트가 «통과한 뒤»
+ *   (`executeLiveLand` ctx `gateAt` = 그 재게이트 요청 시각)에만 이 시도는 «소비됨»으로 빠진다. judgement·infra 와 섞이지 않는다.
+ */
+export const LAND_ATTEMPTS_PER_HEAD_ON_INFRA = 2;
+export type LandFailureClass = 'infra' | 'judgement' | 'base-stale';
+
+/** `pr land` 출력 줄 → 인프라 사유. ⛔ 줄 «전체»가 맞아야 한다 — 비슷한 문면을 넓게 받지 않는다. */
+export const LAND_INFRA_OUTPUT_REASONS: ReadonlyArray<{ reason: string; line: RegExp }> = [
+  // 머리 고정 사전 조건 — gh 로 본 PR(OPEN·non-draft·머리)은 executeLiveLand 가 «직전에» 확인했다 · 남는 원인은 로컬 HEAD·더러운 트리·gh 조회 실패.
+  { reason: 'precondition-local-head-clean-tree', line: /^✗ expected-head: PR OPEN non-draft, matching local HEAD and clean worktree required$/ },
+  { reason: 'precondition-branch', line: /^✗ branch: (?:PR head branch와 현재 브랜치가 다릅니다\.|현재 브랜치를 해석하지 못했습니다\.)$/ },
+  { reason: 'base-unresolved', line: /^✗ base: 비교 base를 선택하지 못했습니다\.$/ },
+  { reason: 'git-read-failed', line: /^✗ granularity: (?:비교 base를 해석하지 못했습니다\.|로컬 git log 를 읽지 못했습니다\.)$/ },
+  { reason: 'gh-lookup-failed', line: /^✗ find: / },
+  { reason: 'gh-merge-state-unknown', line: /^✗ merge: squash merge (?:결과를 모름 \(상태 미확정\)|상태 되읽기 실패)$/ },
+  // defaultLand — `pr land` 가 0 으로 끝났는데 병합 상태를 gh 로 다시 못 읽었다(병합됐으면 다음 시도는 MERGED 로 관문 앞에서 멈춘다).
+  { reason: 'gh-merge-state-unreadable', line: /^✗ ta-land: merge state unreadable after pr land exit 0$/ },
+];
+/** 인프라 사유에 «딸려 나오는» 줄 — 그 사유가 같이 있을 때만 판정 거절로 세지 않는다. */
+const LAND_INFRA_CONSEQUENCE_LINES: ReadonlyArray<{ of: string; line: RegExp }> = [
+  { of: 'gh-lookup-failed', line: /^✗ upsert-ready: gh: pinned PR is not the branch open PR$/ },
+];
+/** REJUDGE base-stale — 겹침 증거의 게이트 base 가 낡았고 그 사이 착지가 PR 파일을 건드렸다(`pr land` · #26060 문면). */
+const LAND_BASE_STALE_LINE = /^✗ overlap-evidence: (base-stale-overlap: .*)$/;
+/** base-stale 에 «딸려 나오는» 줄 — 증거가 거절되면 `pr land` 가 이어서 낸다(그 줄만 있으면 판정 거절로 세지 않는다). */
+const LAND_BASE_STALE_CONSEQUENCE_LINES: readonly RegExp[] = [/^✗ expected-head: overlap merge approval unavailable for the reviewed head$/];
+/** 실패가 아닌 ✗ 줄 — `pr land` 가 «계속합니다»로 넘어간다(판정에 쓰지 않는다). */
+const LAND_NON_FATAL_LINES: readonly RegExp[] = [/^✗ active-run-files: .*계속합니다\.?$/];
+/** executeLiveLand 쪽 인프라 사유(출력 줄이 아니라 실행 사실). */
+export const LAND_INFRA_EXECUTOR_REASONS = ['land-process-error', 'land-no-result-line'] as const;
+const [LAND_PROCESS_ERROR, LAND_NO_RESULT_LINE] = LAND_INFRA_EXECUTOR_REASONS;
+
+const RESULT_MARK = /^(?:\[dry-run\] )?[✓✗⚠⏳]/u;
+
+export interface LandFailureClassification { class: LandFailureClass; reason: string }
+
+/**
+ * 실패한 land 의 출력(또는 던진 오류)을 가른다 — 목록에 없는 ✗ 줄이 «하나라도» 있으면 판정 거절이다.
+ * `thrown` = land 를 띄우거나 기다리다 던졌다(프로세스 오류).
+ */
+export function classifyLandFailure(outcome: { status: number; stdout?: string; stderr?: string } | { thrown: string }): LandFailureClassification {
+  if ('thrown' in outcome) return { class: 'infra', reason: LAND_PROCESS_ERROR };
+  const lines = `${outcome.stdout ?? ''}\n${outcome.stderr ?? ''}`.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const marked = lines.filter((line) => RESULT_MARK.test(line));
+  // 결과 줄이 «하나도» 없이 0 아닌 코드로 끝났다 — 관문까지 못 간 채 죽었다(크래시 · 신호).
+  if (!marked.length) return outcome.status !== 0 ? { class: 'infra', reason: LAND_NO_RESULT_LINE } : { class: 'judgement', reason: 'no-failure-line' };
+  const failures = marked.map((line) => line.replace(/^\[dry-run\] /, '')).filter((line) => line.startsWith('✗') && !LAND_NON_FATAL_LINES.some((re) => re.test(line)));
+  const infra = new Set<string>();
+  const unlisted: string[] = [];
+  for (const line of failures) {
+    const hit = LAND_INFRA_OUTPUT_REASONS.find((entry) => entry.line.test(line));
+    if (hit) infra.add(hit.reason); else unlisted.push(line);
+  }
+  const judged = unlisted.filter((line) => !LAND_INFRA_CONSEQUENCE_LINES.some((entry) => infra.has(entry.of) && entry.line.test(line)));
+  // REJUDGE base-stale — 거절 줄이 base-stale-overlap(⊕ 딸린 줄) «뿐»이고 인프라 사유가 없을 때만. 하나라도 다른 ✗ 줄이 섞이면 judgement(fail-closed).
+  const stale = judged.map((line) => LAND_BASE_STALE_LINE.exec(line)?.[1]).find((reason): reason is string => !!reason);
+  if (stale && !infra.size && judged.every((line) => LAND_BASE_STALE_LINE.test(line) || LAND_BASE_STALE_CONSEQUENCE_LINES.some((re) => re.test(line)))) {
+    return { class: 'base-stale', reason: stale.slice(0, 160) };
+  }
+  if (judged.length) return { class: 'judgement', reason: judged[0]!.slice(0, 120) };
+  if (infra.size) return { class: 'infra', reason: [...infra].join('+') };
+  return { class: 'judgement', reason: 'no-failure-line' };
+}
+
+type LandAttempt = NonNullable<TaskCard['landAttempts']>[number];
+type LandWorktreeCreateFailure = { pr: number; head: string; at: string; reason: string };
+declare module './task-hand.js' {
+  interface TaskCard { landWorktreeCreateFailures?: LandWorktreeCreateFailure[] }
+}
+const sameHeadOf = (pr: number, head: string) => (entry: LandAttempt) => entry.pr === pr && entry.head.toLowerCase() === head.toLowerCase();
+
+function landWorktreeCreateCap(): number {
+  try {
+    const config = JSON.parse(readFileSync(userConfigPath(), 'utf8')) as { tasks?: { landWorktreeCreateCap?: unknown } };
+    const configured = config.tasks?.landWorktreeCreateCap;
+    return typeof configured === 'number' && Number.isSafeInteger(configured) && configured > 0 ? configured : 3;
+  } catch { return 3; }
+}
+
+function consecutiveLandWorktreeCreateFailures(card: TaskCard, pr: number, head: string): LandWorktreeCreateFailure[] {
+  const entries = (card.landWorktreeCreateFailures ?? []).filter((entry) => entry.pr === pr);
+  const last = entries.at(-1);
+  return last?.head.toLowerCase() === head.toLowerCase()
+    ? entries.filter((entry) => entry.head.toLowerCase() === head.toLowerCase())
+    : [];
+}
+
+function recordLandWorktreeCreateFailure(card: TaskCard, failure: LandWorktreeCreateFailure): TaskCard {
+  const samePr = (card.landWorktreeCreateFailures ?? []).filter((entry) => entry.pr !== failure.pr);
+  const samePrHead = (card.landWorktreeCreateFailures ?? []).filter((entry) => entry.pr === failure.pr && entry.head.toLowerCase() === failure.head.toLowerCase());
+  return { ...card, landWorktreeCreateFailures: [...samePr, ...samePrHead, failure] };
+}
+
+function clearLandWorktreeCreateFailures(card: TaskCard, pr: number): TaskCard {
+  const remaining = (card.landWorktreeCreateFailures ?? []).filter((entry) => entry.pr !== pr);
+  const { landWorktreeCreateFailures: _removed, ...rest } = card;
+  return { ...rest, ...(remaining.length ? { landWorktreeCreateFailures: remaining } : {}) };
+}
+
+function cappedLandWorktreeReason(failures: readonly LandWorktreeCreateFailure[], cap: number): string {
+  return `land worktree create capped (${failures.length}/${cap}): ${failures.at(-1)?.reason ?? 'unknown'}`;
+}
+
+function observeLandWorktreeCreateCapped(deps: LiveMoveDeps, data: { card: string; pr: number; head: string; failures: number; cap: number; reason: string }): void {
+  try { (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', 'land-worktree-create-capped', data); } catch { /* fail-soft */ }
+}
+
+/** 같은 머리에 한 번 더 시도해도 되나 — 앞 시도가 «전부» 끝났고(ok:false) «전부» infra 이고 상한 밑일 때만. */
+function landRetryAllowed(prior: readonly LandAttempt[]): boolean {
+  return prior.length > 0 && prior.length < LAND_ATTEMPTS_PER_HEAD_ON_INFRA && prior.every((entry) => entry.ok === false && entry.class === 'infra');
+}
+
+/**
+ * REJUDGE base-stale — `gateAt`(새 base 위 재게이트를 «요청한» 시각) 앞의 base-stale 시도는 그 재게이트가 통과해 소비됐다 —
+ * 같은 머리 land 판단에서 뺀다. 나머지(infra·judgement·그 뒤의 시도)는 종전 규칙 그대로.
+ */
+export function openLandAttempts<T extends Pick<LandAttempt, 'at' | 'class'>>(prior: readonly T[], gateAt?: string): T[] {
+  if (!gateAt) return [...prior];
+  const since = Date.parse(gateAt);
+  return prior.filter((entry) => !(entry.class === 'base-stale' && Number.isFinite(since) && Date.parse(entry.at) < since));
+}
+
+/** 카드의 이 PR·머리에 인프라 재시도가 남았나(재판정 틱이 «머리 그대로»여도 land 단계까지 가게). */
+export function landRetryPending(card: Pick<TaskCard, 'landAttempts'>, pr: number, head: string): boolean {
+  return landRetryAllowed((card.landAttempts ?? []).filter(sameHeadOf(pr, head)));
+}
+
+export const LAND_RETRY_ON_INFRA_EVENT = 'land-retry-on-infra';
+
 const landedCycles = new Set<string>();
 
 /** `propose-land` — only a passing self review (pass or warn, with must-fix 0) of this exact OPEN, non-draft head may invoke pr land. */
 export async function executeLiveLand(
   card: TaskCard | undefined, pr: number | undefined,
   ctx: { runId?: string | null; cycleId?: string; cwd?: string; produced?: { headCommit?: string; branch?: string; prUrl?: string }; review?: { verdict: 'pass' | 'warn' | 'fail'; head: string; /** TA-LAND-WARN-MUSTFIX0 — `false` 면 리뷰가 실제로 안 돌았다 → land 거부. 슈퍼바이저 입력은 reviewed 리뷰로만 만들어져 칸이 없다. */ reviewed?: boolean };
-    /** TA-REJUDGE-ON-HEAD — 겹침 증거 파일(있으면 land 에 넘길 뿐 · 판정은 그대로). */ overlapEvidence?: string },
+    /** TA-REJUDGE-ON-HEAD — 겹침 증거 파일(있으면 land 에 넘길 뿐 · 판정은 그대로). */ overlapEvidence?: string;
+    /** REJUDGE base-stale — 증거의 재게이트를 요청한 시각 · 그 앞의 base-stale 시도는 소비됨(`openLandAttempts`). */ gateAt?: string },
   deps: LiveMoveDeps = {},
 ): Promise<LiveMoveResult> {
   const kind = 'land' as const;
@@ -390,12 +559,26 @@ export async function executeLiveLand(
   if (cycle && landedCycles.has(cycle)) return reject(card.id, `cycle ${cycle} already landed — stays shadow`, reviewRepo);
   const path = deps.statePath ?? taskAgentStatePath();
   const at = (deps.now ?? (() => new Date()))().toISOString();
+  const local = (deps.landWorktree?.localHead ?? localHead)(cwd);
+  const needsLandWorktree = !!local && local.toLowerCase() !== view.head.toLowerCase();
+  const createCap = landWorktreeCreateCap();
   let claimed = false;
   let missing = false;
+  let cappedReason: string | undefined;
+  // TA-LAND-RETRY-ON-INFRA — 같은 머리의 앞 시도들(잠금 안에서 읽은 «지금» 카드) · 재시도면 그 근거.
+  let prior: LandAttempt[] = [];
   try {
     updateTaskCard(path, card.id, (current) => {
       if (!current) { missing = true; return undefined; }
-      if ((current.landAttempts ?? []).some(entry => entry.pr === pr && entry.head.toLowerCase() === view!.head.toLowerCase())) return undefined;
+      if (needsLandWorktree) {
+        const failures = consecutiveLandWorktreeCreateFailures(current, pr, view!.head);
+        if (failures.length >= createCap) {
+          cappedReason = cappedLandWorktreeReason(failures, createCap);
+          return undefined;
+        }
+      }
+      prior = openLandAttempts((current.landAttempts ?? []).filter(sameHeadOf(pr, view!.head)), ctx.gateAt);
+      if (prior.length && !landRetryAllowed(prior)) return undefined;
       claimed = true;
       return { ...current, landAttempts: [...(current.landAttempts ?? []), { pr, head: view!.head, at }] };
     });
@@ -403,14 +586,23 @@ export async function executeLiveLand(
     return reject(card.id, `land attempt could not be recorded: ${String(error).slice(-250)}`, reviewRepo);
   }
   if (missing) return reject(card.id, 'task card not in state file', reviewRepo);
-  if (!claimed) return observe(deps, withRepo({ kind, card: card.id, ok: true, executed: false, detail: `already attempted land for #${pr} head ${view.head.slice(0, 12)}` }));
+  if (cappedReason) return reject(card.id, cappedReason, reviewRepo);
+  if (!claimed) {
+    const last = prior.at(-1);
+    const why = last ? ` (attempts ${prior.length} · last ${last.ok === false ? `class ${last.class ?? 'unclassified'}${last.reason ? ` ${last.reason}` : ''}` : last.ok === true ? 'ok' : 'unfinished'})` : '';
+    return observe(deps, withRepo({ kind, card: card.id, ok: true, executed: false, detail: `already attempted land for #${pr} head ${view.head.slice(0, 12)}${why}` }));
+  }
+  const attempt = prior.length + 1;
+  if (attempt > 1) {
+    const last = prior.at(-1)!;
+    try { (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', LAND_RETRY_ON_INFRA_EVENT, { card: card.id, pr, head: view.head, attempt, reason: last.reason ?? 'unknown', class: 'infra', decision: 'retrying' }); } catch { /* fail-soft */ }
+  }
   if (cycle) landedCycles.add(cycle);
   // TA-LAND-WORKTREE — `pr land --expected-head` 는 «로컬 HEAD = 고정 머리»를 요구한다. cwd 가 다른 머리면(Pod 런 PR · 호스트 checkout)
   //   PR 머리의 임시 워크트리에서 부르고 끝나면 걷는다. 같은 머리(로컬 런 작업 트리)거나 HEAD 를 못 읽으면 종전 그대로 cwd 에서.
   let landCwd = cwd;
   let worktree: LandWorktree | undefined;
-  const local = (deps.landWorktree?.localHead ?? localHead)(cwd);
-  if (local && local.toLowerCase() !== view.head.toLowerCase()) {
+  if (needsLandWorktree && local) {
     let made: LandWorktree | LandWorktreeFailure;
     try {
       made = await (deps.landWorktree?.create ?? createLandWorktree)({ card: card.id, pr, head: view.head, branch: view.branch, repoCwd: cwd, statePath: path });
@@ -418,6 +610,15 @@ export async function executeLiveLand(
     if ('reason' in made) {
       const reason = made.reason;
       observeLandWorktree({ card: card.id, pr, head: view.head, created: made.created, removed: made.removed, reason }, deps.log);
+      let failures: LandWorktreeCreateFailure[] = [];
+      let recordFailureError: unknown;
+      try {
+        updateTaskCard(path, card.id, (current) => {
+          if (!current) return undefined;
+          failures = [...consecutiveLandWorktreeCreateFailures(current, pr, view!.head), { pr, head: view!.head, at, reason }];
+          return recordLandWorktreeCreateFailure(current, { pr, head: view!.head, at, reason });
+        });
+      } catch (error) { recordFailureError = error; }
       // land 를 부르지 않았다 — 이 머리의 시도 기록과 주기 표시를 되돌려 다음 틱이 다시 시도할 수 있게 한다.
       if (cycle) landedCycles.delete(cycle);
       try {
@@ -429,16 +630,30 @@ export async function executeLiveLand(
         observeLandWorktree({ card: card.id, pr, head: view.head, created: made.created, removed: made.removed, reason: `land attempt release failed: ${String(error).slice(-200)}` }, deps.log);
         return reject(card.id, `PR #${pr} land worktree unavailable: ${reason} · attempt release failed (head stays attempted)`, reviewRepo);
       }
+      if (recordFailureError) return reject(card.id, `PR #${pr} land worktree unavailable: ${reason} · failure record failed: ${String(recordFailureError).slice(-200)}`, reviewRepo);
+      if (failures.length >= createCap) {
+        const capped = cappedLandWorktreeReason(failures, createCap);
+        if (failures.length === createCap) observeLandWorktreeCreateCapped(deps, { card: card.id, pr, head: view.head, failures: failures.length, cap: createCap, reason });
+        return reject(card.id, capped, reviewRepo);
+      }
       return reject(card.id, `PR #${pr} land worktree unavailable: ${reason}`, reviewRepo);
     }
     worktree = made;
     landCwd = made.cwd;
+    // 실패 장부 정리는 fail-soft — 정리 쓰기 실패로 정상 착지를 막지 않는다(막으면 잡아 둔 landAttempts 가 남아 그 head 가 영영 «already attempted»).
+    try {
+      updateTaskCard(path, card.id, (current) => current?.landWorktreeCreateFailures?.some((entry) => entry.pr === pr)
+        ? clearLandWorktreeCreateFailures(current, pr) : undefined);
+    } catch (error) {
+      try { (deps.log ?? ((c, e, d) => debug.log(c, e, d, { level: 'warn' })))('task-agent', 'land-worktree-create-failures-clear-failed', { card: card.id, pr, head: view.head, error: String(error).slice(-200) }); } catch { /* fail-soft */ }
+    }
     observeLandWorktree({ card: card.id, pr, head: view.head, created: true, removed: false, reason: `cwd HEAD ${local.slice(0, 12)} ≠ PR head ${view.head.slice(0, 12)}` }, deps.log);
   }
   // 증거 경로는 «원래» cwd 기준으로 고정한다 — 임시 트리로 cwd 를 바꿔도 상대경로가 다른 파일을 가리키지 않게(같은 cwd 면 그대로).
   const overlapEvidence = ctx.overlapEvidence && worktree ? resolve(cwd, ctx.overlapEvidence) : ctx.overlapEvidence;
   let ok = false;
   let detail: string;
+  let failure: LandFailureClassification | undefined;
   try {
     // The CLI rechecks the pinned PR/head immediately before merge, after its own gates and freeze admission.
     const outcome = overlapEvidence
@@ -446,7 +661,14 @@ export async function executeLiveLand(
       : await (deps.land ?? defaultLand)(pr, view.head, landCwd);
     ok = outcome.status === 0;
     detail = (ok ? outcome.stdout || `land merged #${pr} head ${view.head.slice(0, 12)}` : outcome.stderr || outcome.stdout || `exit ${outcome.status}`).slice(-300);
-  } catch (error) { detail = (error instanceof Error ? error.message : String(error)).slice(-300); }
+    if (!ok) failure = classifyLandFailure(outcome);
+  } catch (error) {
+    detail = (error instanceof Error ? error.message : String(error)).slice(-300);
+    failure = classifyLandFailure({ thrown: detail });
+  }
+  const retryAllowed = failure?.class === 'infra' && attempt < LAND_ATTEMPTS_PER_HEAD_ON_INFRA;
+  // 인프라 실패로 재시도가 남으면 주기 표시도 푼다 — 같은 주기 id(재판정 틱의 `rejudge:<card>:<head>`)가 그 한 번을 막지 않게.
+  if (retryAllowed && cycle) landedCycles.delete(cycle);
   if (worktree) {
     // 성공이든 실패든 걷는다.
     let removal: LandWorktreeRemoval;
@@ -454,15 +676,38 @@ export async function executeLiveLand(
     observeLandWorktree({ card: card.id, pr, head: view.head, created: true, removed: removal.removed, ...(removal.branchRemoved !== undefined ? { branchRemoved: removal.branchRemoved } : {}),
       reason: removal.reason ?? `land ${ok ? 'ok' : 'failed'} — removed` }, deps.log);
   }
+  const landAttempt: LiveMoveResult['landAttempt'] = failure
+    ? { attempt, class: failure.class, reason: failure.reason, retryAllowed }
+    : { attempt };
+  if (failure) {
+    try {
+      (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', LAND_RETRY_ON_INFRA_EVENT, {
+        card: card.id, pr, head: view.head, attempt, reason: failure.reason, class: failure.class,
+        decision: retryAllowed ? 'retry-allowed' : failure.class === 'infra' ? 'retry-exhausted' : failure.class === 'base-stale' ? 'base-stale-awaiting-regate' : 'no-retry',
+      });
+    } catch { /* fail-soft */ }
+  }
   try {
     updateTaskCard(path, card.id, (current) => current?.landAttempts?.some(entry => entry.pr === pr && entry.head === view!.head && entry.at === at)
-      ? { ...current, landAttempts: current.landAttempts.map(entry => entry.pr === pr && entry.head === view!.head && entry.at === at ? { ...entry, ok, detail } : entry) }
+      ? {
+        ...current,
+        landAttempts: current.landAttempts.map(entry => entry.pr === pr && entry.head === view!.head && entry.at === at
+          ? { ...entry, ok, detail, ...(failure ? { class: failure.class, reason: failure.reason } : {}) } : entry),
+        // TA-LAND-RETRY-ON-INFRA — 실패한 시도마다 카드 history 한 줄(logs 창이 지나도 «왜 다시 했나/안 했나»가 남게).
+        ...(failure ? { history: [...(current.history ?? []), {
+          at, event: LAND_RETRY_ON_INFRA_EVENT, kind: failure.class, pr, head: view!.head,
+          effect: retryAllowed ? 'retry-allowed' : failure.class === 'infra' ? 'retry-exhausted' : failure.class === 'base-stale' ? 'awaiting-regate' : 'no-retry',
+          detail: failure.class === 'base-stale'
+            ? `attempt ${attempt} · base-stale → 재게이트 대기 (land again only after a re-gate on a new base passes) · ${failure.reason}`
+            : `attempt ${attempt}/${failure.class === 'infra' ? LAND_ATTEMPTS_PER_HEAD_ON_INFRA : attempt} · ${failure.reason}`,
+        }] } : {}),
+      }
       : undefined);
   } catch (error) {
-    return observe(deps, withRepo({ kind, card: card.id, ok: false, executed: true,
+    return observe(deps, withRepo({ kind, card: card.id, ok: false, executed: true, landAttempt,
       detail: `land ${ok ? 'succeeded' : 'failed'} but card update failed: ${String(error).slice(-230)}` }));
   }
-  return observe(deps, withRepo({ kind, card: card.id, ok, executed: true, detail }));
+  return observe(deps, withRepo({ kind, card: card.id, ok, executed: true, detail, landAttempt }));
 }
 
 /** `propose-green` — 비지 않은 근거가 있을 때만 카드에 제안을 적는다(한 번). 체크리스트는 쓰지 않는다. */
@@ -483,4 +728,89 @@ export function executeLiveGreenProposal(card: TaskCard | undefined, evidence: R
   if (wrote.missing) return observe(deps, { kind, executed: false, card: card.id, ok: false, detail: 'task card not in state file' });
   if (!wrote.proposed) return observe(deps, { kind, executed: false, card: card.id, ok: true, detail: 'already proposed' });
   return observe(deps, { kind, executed: true, card: card.id, ok: true, detail: `green proposed (${Object.values(refs).join(', ')}) · checklist untouched` });
+}
+
+export interface LiveDecisionCardContext {
+  runId: string | null; stopReason: string; reason: string; pr?: number;
+  risk?: NextAction['risk'];
+  /** 서명 · 화면 · must-fix — 하나도 비지 않아야 카드가 올라간다. */
+  evidence: DecisionCardEvidence;
+}
+
+const DECISION_SIGNATURE_KEEP = 300;
+const DECISION_SCREEN_KEEP = 1500;
+
+/** 같은 런 · 사유 · 근거면 같은 지문 — 카드 history 의 «이미 올렸다» 판정 키. */
+export function decisionCardFingerprint(runId: string | null, reason: string, evidence: { signature?: string; screen?: string; mustFix: readonly string[] }): string {
+  return createHash('sha1').update(JSON.stringify([runId, reason, evidence.signature ?? null, evidence.screen ?? null, evidence.mustFix])).digest('hex').slice(0, 12);
+}
+
+/** `decisions raise` 를 같은 우주의 CLI 자식으로 한 번 부른다 — 카드는 결정 원장에 들어가 OP 거르기가 읽는다. */
+export async function defaultRaiseDecision(args: string[]): Promise<{ status: number; stdout: string; stderr?: string }> {
+  const { ELANOUS_CLI_ENTRY } = await import('../cli/tasks-cli.js');
+  const { getElanousConfigDirOverride } = await import('../elanous-config-dir.js');
+  const { effectiveInstanceRoot } = await import('../instance/resolve.js');
+  const argv = [resolve(ELANOUS_CLI_ENTRY), '--config-dir', getElanousConfigDirOverride() ?? effectiveInstanceRoot(), ...args];
+  return new Promise((resolveResult, reject) => {
+    const child = spawn(process.execPath, argv, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk: Buffer) => { stdout = (stdout + chunk.toString()).slice(-300); });
+    child.stderr.on('data', (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-300); });
+    child.once('error', reject);
+    child.once('close', (code) => resolveResult({ status: code ?? 1, stdout, stderr }));
+  });
+}
+
+/**
+ * `decision-card` — 막힌 과제를 근거 붙은 결정 카드로 올린다. 근거(서명 · 화면 · must-fix)가 하나도 없으면 «올리지 않는다».
+ * 같은 지문의 카드는 한 번만(카드 history 의 `live-move` 줄 · 먼저 적고 올린다) · 올리기 실패는 줄을 걷어 다음 틱이 다시 시도한다.
+ */
+export async function executeLiveDecisionCard(card: TaskCard | undefined, ctx: LiveDecisionCardContext, deps: LiveMoveDeps = {}): Promise<LiveMoveResult> {
+  const kind = 'decision-card' as const;
+  if (!card) return observe(deps, { kind, executed: false, card: null, ok: false, detail: 'no task card — stays shadow' });
+  const grounds = decisionCardGrounds(ctx.evidence);
+  if (!grounds.length) return observe(deps, { kind, executed: false, card: card.id, ok: false, detail: 'no evidence (signature · screen · must-fix) — no card raised' });
+  const signature = ctx.evidence.signature?.trim().slice(0, DECISION_SIGNATURE_KEEP) || undefined;
+  const screen = ctx.evidence.screen?.trim().slice(-DECISION_SCREEN_KEEP) || undefined;
+  const mustFix = (ctx.evidence.mustFix ?? []).filter((fix) => typeof fix === 'string' && fix.trim()).map((fix) => fix.trim());
+  const mark = `fp:${decisionCardFingerprint(ctx.runId, ctx.reason, { ...(signature ? { signature } : {}), ...(screen ? { screen } : {}), mustFix })}`;
+  const path = deps.statePath ?? taskAgentStatePath();
+  const at = (deps.now ?? (() => new Date()))().toISOString();
+  const ours = (entry: TaskCard['history'][number]) => entry.event === LIVE_MOVE_HISTORY_EVENT && entry.kind === kind && !!entry.detail?.includes(mark);
+  const claim = { claimed: false, missing: false };
+  updateTaskCard(path, card.id, (current) => {
+    if (!current) { claim.missing = true; return undefined; }
+    if ((current.history ?? []).some(ours)) return undefined;
+    claim.claimed = true;
+    return { ...current, history: [...(current.history ?? []), {
+      at, event: LIVE_MOVE_HISTORY_EVENT, kind, executed: false, executorResult: 'live' as const,
+      detail: `decision card claimed · ${mark}`, ...(ctx.runId ? { runId: ctx.runId } : {}), ...(ctx.pr !== undefined ? { pr: ctx.pr } : {}),
+      effect: 'none — decision card claimed, not yet raised',
+    }] };
+  });
+  if (claim.missing) return observe(deps, { kind, executed: false, card: card.id, ok: false, detail: 'task card not in state file' });
+  if (!claim.claimed) return observe(deps, { kind, executed: false, card: card.id, ok: true, detail: `already raised for ${mark}` });
+  const evidence = JSON.stringify({
+    card: card.id, runId: ctx.runId, pr: ctx.pr ?? null, stopReason: ctx.stopReason, grounds,
+    ...(signature ? { signature } : {}), ...(screen ? { screen } : {}), mustFix, selected: kind, reason: ctx.reason,
+  });
+  const args = decisionRaiseArgs({ taskId: card.id, reason: ctx.reason, ...(ctx.risk ? { risk: ctx.risk } : {}), evidence });
+  let failure: string | undefined;
+  try {
+    const outcome = await (deps.raiseDecision ?? defaultRaiseDecision)(args);
+    if (outcome.status !== 0) failure = (outcome.stderr || outcome.stdout || `exit ${outcome.status}`).slice(-250);
+  } catch (error) { failure = (error instanceof Error ? error.message : String(error)).slice(-250); }
+  const mine = (entry: TaskCard['history'][number]) => ours(entry) && entry.at === at;
+  const detail = failure ? `decisions raise failed: ${failure}` : `decision card raised (${grounds.join(' · ')}) · ${mark}`;
+  try {
+    updateTaskCard(path, card.id, (current) => current?.history?.some(mine)
+      ? { ...current, history: failure
+        ? current.history.filter((entry) => !mine(entry))
+        : current.history.map((entry) => mine(entry) ? { ...entry, executed: true, ok: true, detail, effect: `decision card raised · grounds ${grounds.join('+')} · decision ledger (OP filter reads it)` } : entry) }
+      : undefined);
+  } catch (error) {
+    return observe(deps, { kind, executed: !failure, card: card.id, ok: false, detail: `${detail} but card update failed: ${String(error).slice(-200)}` });
+  }
+  return observe(deps, { kind, executed: !failure, card: card.id, ok: !failure, detail });
 }

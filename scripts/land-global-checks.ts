@@ -25,6 +25,9 @@ export const LAND_GLOBAL_CHECKS: readonly LandGlobalCheck[] = [
   { pattern: /^docs\/ops\/machines\.yaml$/, test: 'test/machines-ledger-data.test.ts', why: '기계 원장 데이터 ↔ 생성 Markdown(#24729)' },
   // 새 CLI 하위 명령은 `src/index.ts` 또는 `src/cli/` 의 등록 모듈에서 생긴다 — 입구 목록 시험(#24661).
   { pattern: /^src\/(?:index|cli\/(?:[^/]+\/)*[^/]+)(?<!\.test)\.ts$/, test: 'src/index.test.ts', why: 'CLI 입구·하위 명령 목록(#24661)' },
+  // src/cli/ 밖의 명령 등록 모듈(`*-cli.ts` · `*-cli-command.ts`)도 하위 명령을 더한다 — 10-11 #26232 가
+  //   src/harness/harness-cli-command.ts 에 `harness progress` 를 더해 index.test 목록 스냅샷을 깨고 main 을 붉혔다.
+  { pattern: /^src\/(?:[^/]+\/)+[^/]+-cli(?:-command)?(?<!\.test)\.ts$/, test: 'src/index.test.ts', why: 'src/cli 밖 명령 등록 모듈의 하위 명령 목록(10-11 #26232)' },
 ];
 
 /** 바뀐 파일 → 끌려오는 전역 시험(표 순서 · 중복 없음). */

@@ -27,7 +27,32 @@ export function registerGuardianCommands(program: Command): void {
         const cfg = getUserConfig();
         // Live activation (and crontab retirement) is a separate operational change.
         if (cfg.guardian?.mode === 'live') throw new Error('guardian live activation is outside GUARD-ONE-a');
-        const result = await guardianTick(new Date(), plan, { config: cfg });
+        // The shadow observation is for the tick's entry time, however long the GC's evidence collection takes.
+        const tickAt = new Date();
+        // Local orphan GC is separate from the guardian's shadow-only schedule execution.
+        const orphanGc = cfg.guardian?.orphanGc ?? 'shadow';
+        try {
+          // off never loads the collector, so no ps snapshot is taken.
+          if (orphanGc !== 'off') {
+            // Loading the collector is inside the guard too: a GC that cannot even load only observes.
+            const { runMachineHeartbeat } = await import('../ops/machine-heartbeat.js');
+            await runMachineHeartbeat(plan.jobs.filter((job): job is typeof job & { command: string; cron: string } =>
+              job.source === 'crontab' && job.run_via === 'crontab' && !!job.enabled
+              && typeof job.command === 'string' && typeof job.cron === 'string')
+              .map(job => ({ command: job.command, cron: job.cron })), { timeZone: plan.timeZone, mode: orphanGc });
+          } else {
+            // Still one decision line per tick, so «switched off» is distinguishable from «tick never ran».
+            const { debug } = await import('../debug/log.js');
+            debug.log('ops.orphan-cli', 'decision', { mode: 'off', candidates: 0, collected: 0, alreadyEvidenced: 0, killed: 0 });
+          }
+        } catch (error) {
+          // The logger import is inside the guard as well: if it is the failing module, the shadow tick still runs.
+          try {
+            const { debug } = await import('../debug/log.js');
+            debug.log('ops.orphan-cli', 'observation-failed', { error: String(error) });
+          } catch { /* guardian shadow still runs */ }
+        }
+        const result = await guardianTick(tickAt, plan, { config: cfg });
         await writeStdoutJson(JSON.stringify(result, null, 2) + '\n');
       } finally { db.close(); }
     });

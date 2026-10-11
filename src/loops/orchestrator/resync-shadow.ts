@@ -10,11 +10,15 @@ import {
   type LlmMergeOutcome, type MergeGitSeam,
 } from '../../autopilot/build/llm-conflict-merge.js';
 
-type ResyncVerdict = 'saved' | 'merge-ok-tests-failed' | 'merge-ok-no-tests' | 'unresolved' | 'guard-tripped' | 'error';
+type ResyncVerdict = 'saved' | 'merge-ok-tests-failed' | 'merge-ok-no-tests' | 'unresolved' | 'guard-tripped' | 'push-rejected' | 'error';
+export type ResyncShadowMode = 'shadow' | 'live';
 interface ResyncShadowEntry {
   at: string;
   pr: number;
   head: string;
+  mode: ResyncShadowMode;
+  pushed: boolean;
+  labelRemoved: boolean;
   verdict: ResyncVerdict;
   status: LlmMergeOutcome['status'] | 'error';
   resolvedFiles: string[];
@@ -28,6 +32,7 @@ export interface ResyncShadowDeps {
   repoRoot?: string;
   instanceRoot?: string;
   runGh?: (args: string[]) => string;
+  runGit?: (args: string[]) => void;
   resolve?: (file: string, conflicted: string) => Promise<string>;
   gitSeam?: MergeGitSeam;
   runTests?: (cwd: string, files: string[]) => { ok: boolean; failedTests?: string[]; noTests?: boolean };
@@ -134,9 +139,10 @@ function defaultRunTests(cwd: string, files: string[]): { ok: boolean; failedTes
   return failedTests.length ? { ok: false, failedTests } : { ok: true };
 }
 
-/** Re-merge open conflicts only in disposable detached worktrees; no remote writes. */
-export async function runResyncShadow(max = 3, deps: ResyncShadowDeps = {}): Promise<ResyncShadowSummary> {
+/** Re-merge open conflicts only in disposable detached worktrees; shadow mode never writes to remotes. */
+export async function runResyncShadow(max = 3, deps: ResyncShadowDeps = {}, mode: ResyncShadowMode = 'shadow'): Promise<ResyncShadowSummary> {
   if (!Number.isSafeInteger(max) || max < 0) throw new Error('--max must be a nonnegative integer');
+  if (mode !== 'shadow' && mode !== 'live') throw new Error('mode must be shadow or live');
   const repoRoot = deps.repoRoot ?? resolve(import.meta.dir, '../../..');
   const gh = deps.runGh ?? ((args: string[]) => command('gh', args, repoRoot));
   const observed: unknown = JSON.parse(gh(['pr', 'list', '--state', 'open', '--json', 'number,headRefName,mergeable,isDraft,labels', '--limit', '1000']));
@@ -146,6 +152,7 @@ export async function runResyncShadow(max = 3, deps: ResyncShadowDeps = {}): Pro
     throw new Error('incomplete or invalid PR observation');
   const candidates = (observed as OpenPr[]).filter(pr => pr.headRefName.startsWith('self-impl/')
     && pr.mergeable === 'CONFLICTING'
+    && (mode === 'shadow' || pr.labels.some(label => label.name === 'elanous:needs-rebase'))
     && !pr.labels.some(label => label.name === 'elanous:stalled' || label.name === 'elanous:superseded'))
     .sort((a, b) => a.number - b.number).slice(0, max);
   const ledger = join(deps.instanceRoot ?? effectiveInstanceRoot(), 'orchestrator', 'resync-shadow.jsonl');
@@ -154,6 +161,7 @@ export async function runResyncShadow(max = 3, deps: ResyncShadowDeps = {}): Pro
   for (const pr of candidates) {
     const entry: ResyncShadowEntry = {
       at: (deps.now?.() ?? new Date()).toISOString(), pr: pr.number, head: pr.headRefName,
+      mode, pushed: false, labelRemoved: false,
       verdict: 'error', status: 'error', resolvedFiles: [], testFiles: [],
     };
     let tmp: string | undefined;
@@ -179,6 +187,21 @@ export async function runResyncShadow(max = 3, deps: ResyncShadowDeps = {}): Pro
           if (!test.ok) entry.failedTests = test.failedTests?.length ? test.failedTests : ['test runner failed'];
         }
       } else entry.verdict = outcome.status === 'conflict-unresolved' || outcome.status === 'up-to-date' ? 'unresolved' : 'error';
+      if (mode === 'live' && entry.verdict === 'saved') {
+        try {
+          (deps.runGit ?? (args => { command('git', args, tmp!); }))(
+            ['push', 'origin', `HEAD:refs/heads/${pr.headRefName}`]);
+          entry.pushed = true;
+          gh(['pr', 'edit', String(pr.number), '--remove-label', 'elanous:needs-rebase']);
+          entry.labelRemoved = true;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          // push 가 이미 됐으면 원격은 살았다 — verdict 는 saved 로 두고 라벨 실패만 남긴다(다음 회차가 같은 PR 을 다시 고를 수 있다).
+          // push 실패는 거부 문구(rejected · non-fast-forward)일 때만 push-rejected · 인증·네트워크·시간초과는 error.
+          if (!entry.pushed) entry.verdict = /rejected|non-fast-forward|fetch first/i.test(message) ? 'push-rejected' : 'error';
+          entry.failedTests = [message];
+        }
+      }
     } catch (error) {
       entry.verdict = 'error';
       entry.failedTests = [error instanceof Error ? error.message : String(error)];
@@ -199,6 +222,9 @@ export async function runResyncShadow(max = 3, deps: ResyncShadowDeps = {}): Pro
     mkdirSync(dirname(ledger), { recursive: true });
     appendFileSync(ledger, `${JSON.stringify(entry)}\n`);
     debug.log('loop.orchestrator', 'resync-shadow', { pr: entry.pr, verdict: entry.verdict, status: entry.status });
+    if (mode === 'live') debug.log('loop.orchestrator', 'resync-live', {
+      pr: entry.pr, verdict: entry.verdict, pushed: entry.pushed, labelRemoved: entry.labelRemoved,
+    });
     if (entry.verdict !== 'error') tried++;
     if (entry.verdict === 'saved') saved++;
   }
@@ -211,13 +237,14 @@ if (import.meta.main) {
   try {
     const args = process.argv.slice(2);
     if (args.includes('--help')) {
-      console.log('Usage: bun src/loops/orchestrator/resync-shadow.ts [--max N] [--json]');
+      console.log('Usage: bun src/loops/orchestrator/resync-shadow.ts [--max N] [--live] [--json]');
     } else {
       const index = args.indexOf('--max');
-      if (args.some((arg, i) => arg !== '--json' && arg !== '--max' && (index < 0 || i !== index + 1))
-        || (index >= 0 && (index === args.length - 1 || args.lastIndexOf('--max') !== index))) throw new Error('usage: resync-shadow.ts [--max N] [--json]');
+      if (args.some((arg, i) => arg !== '--json' && arg !== '--live' && arg !== '--max' && (index < 0 || i !== index + 1))
+        || (index >= 0 && (index === args.length - 1 || args.lastIndexOf('--max') !== index))) throw new Error('usage: resync-shadow.ts [--max N] [--live] [--json]');
       const max = index < 0 ? 3 : Number(args[index + 1]);
-      const summary = await runResyncShadow(max);
+      const mode: ResyncShadowMode = args.includes('--live') ? 'live' : 'shadow';
+      const summary = await runResyncShadow(max, {}, mode);
       console.log(process.argv.includes('--json') ? JSON.stringify(summary) : `resync-shadow candidates=${summary.candidates} tried=${summary.tried} saved=${summary.saved} savedRatio=${summary.savedRatio === null ? 'n/a' : `${(summary.savedRatio * 100).toFixed(1)}%`}`);
     }
   } catch (error) {

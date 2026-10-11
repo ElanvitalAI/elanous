@@ -32,9 +32,17 @@ test('새 CLI 하위 명령(src/index.ts · src/cli/ 등록 모듈)은 src/index
   expect(landGlobalChecks(['src/dashboard/index.ts'])).toEqual([]);
 });
 
+// 10-11 #26232 — src/cli 밖 명령 등록 모듈이 하위 명령을 더해 index.test 목록 스냅샷을 깼다(main 빨강).
+test('src/cli 밖의 *-cli.ts · *-cli-command.ts 도 src/index.test.ts 를 끌어온다', () => {
+  expect(landGlobalChecks(['src/harness/harness-cli-command.ts'])).toEqual(['src/index.test.ts']);
+  expect(landGlobalChecks(['src/loops/loop-cli.ts'])).toEqual(['src/index.test.ts']);
+  expect(landGlobalChecks(['src/harness/harness-cli-command.test.ts'])).toEqual([]);
+  expect(landGlobalChecks(['src/harness/harness-stop.ts'])).toEqual([]);
+});
+
 test('여러 꼴이 겹치면 표 순서로 한 번씩만 끌어온다', () => {
   expect(landGlobalChecks(['src/cli/a-cli.ts', 'apps/pwa/a.tsx', 'apps/pwa/b.tsx', 'release/next.md', 'docs/ops/machines.yaml']))
-    .toEqual(LAND_GLOBAL_CHECKS.map(({ test: file }) => file));
+    .toEqual([...new Set(LAND_GLOBAL_CHECKS.map(({ test: file }) => file))]);
 });
 
 test('표가 가리키는 시험 파일은 저장소에 실제로 있다', () => {

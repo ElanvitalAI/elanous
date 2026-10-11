@@ -21,8 +21,14 @@
 import type { RotationCandidate } from './codex-account-rotation.js';
 import type { ClaudePtyMaturity } from './claude-pty-maturity.js';
 
-/** 체인에 놓을 수 있는 칸. ⛔ 모르는 이름은 «조용히 건너뛰지 않고» 거부한다(오타 방어). */
-export const FALLBACK_STEPS = ['codex-rotate', 'grok', 'claude-pty', 'openrouter'] as const;
+/** 체인에 놓을 수 있는 칸. ⛔ 모르는 이름은 «조용히 건너뛰지 않고» 거부한다(오타 방어).
+ *
+ *  ⭐ `codex-credits`(CODEX-CREDITS-STEP · 2026-10-10) — «마지막 수단»으로 codex 를 «선불 크레딧»으로 쓴다.
+ *    한도 정책이 `fallback`(크레딧 ✗)이면 회전은 찬 계정에 «머물지» 않고(`no-candidate`) 체인의 다음 칸(grok)으로 간다.
+ *    그 grok 마저 못 쓰면 갈 곳이 없었다 — 이 칸을 grok «뒤»에 두면 그때만 크레딧으로 돌아온다.
+ *    ⛔ 첫 칸의 크레딧 금지(`codexQuotaPolicy`)는 그대로다 — 이 칸은 «체인이 여기까지 왔을 때»만 돈을 쓴다.
+ *    ⛔ 기본 체인에는 «없다» — 돈이라 사람이 config 에 «명시»할 때만 켜진다. */
+export const FALLBACK_STEPS = ['codex-rotate', 'grok', 'claude-pty', 'openrouter', 'codex-credits'] as const;
 export type FallbackStep = (typeof FALLBACK_STEPS)[number];
 
 /** 기본 체인 — ⛔⭐ **2026-08-20 에 `grok` 이 «기본»으로 들어왔다**(대표 지시).
@@ -80,6 +86,14 @@ export type FallbackDecision =
   | { readonly action: 'switch-backend'; readonly backend: 'grok' | 'claude' }
   /** 명시한 유료 OpenRouter 모델로 전환한다. 호출부가 모델을 바꾸지 못하면 실행하지 않는다. */
   | { readonly action: 'switch-backend'; readonly backend: 'openrouter'; readonly model: string }
+  /** codex 로 «돌아와» 선불 크레딧으로 계속한다 — 체인의 `codex-credits` 칸(마지막 수단 · 유료).
+   *  `skipped` 는 «왜 앞 칸들을 못 썼나»(관측용 · 비밀 없음). */
+  | {
+    readonly action: 'codex-credits';
+    readonly skipped: readonly { readonly step: FallbackStep; readonly why: StayReason }[];
+    /** 크레딧으로 쓸 계정(잔액 많은 순 첫 계정) — 순수 판정은 비우고, 수집기(`resolveRunFallback`)가 채운다. */
+    readonly to?: RotationCandidate;
+  }
   /** 아무것도 안 한다 — 이유를 «값으로» 남긴다. */
   | { readonly action: 'stay'; readonly why: StayReason };
 
@@ -103,7 +117,9 @@ export type StayReason =
   /** 유료 OpenRouter 모델 또는 키가 없다. */
   | 'openrouter-unavailable'
   /** claude PTY 의 최근 표본이 성숙 관문을 통과하지 못했거나 읽히지 않는다. */
-  | 'claude-pty-immature';
+  | 'claude-pty-immature'
+  /** 체인에 `codex-credits` 가 있는데 크레딧 잔액이 «확인된» codex 계정이 없다(모름 포함 — 돈이라 fail-closed). */
+  | 'codex-credits-unavailable';
 
 type FallbackRunPosition =
   | { readonly currentCredentialRateLimited?: false; readonly currentStep?: FallbackStep }
@@ -140,6 +156,11 @@ export type FallbackInput = {
    * ⛔ 이 함수는 config 를 읽지 않는다 — 호출자가 이 칸을 준다.
    */
   readonly stayOnResetCreditAvailable?: boolean;
+  /**
+   * 크레딧 잔액이 «확인된»(잔액 > 0 · 보유 ≠ false) codex 계정이 하나라도 있나 — `codex-credits` 칸만 읽는다.
+   * ⛔ 생략·false 는 그 칸을 «건너뛴다»(돈이라 「모른다」를 통과로 접지 않는다 — grok 의 unknown 통과와 «반대»).
+   */
+  readonly codexCreditsAvailable?: boolean;
 } & FallbackRunPosition;
 
 /**
@@ -162,9 +183,9 @@ export function decideFallback(input: FallbackInput): FallbackDecision {
   const {
     rotation, chain, currentStep, currentCredentialRateLimited = false,
     grokAvailable, grokQuota = 'unknown', claudePtyMaturity, stayOnResetCreditAvailable = false,
-    openrouterFallbackModel, openrouterAvailable = false,
+    openrouterFallbackModel, openrouterAvailable = false, codexCreditsAvailable = false,
   } = input;
-  const openrouter = { model: openrouterFallbackModel, available: openrouterAvailable };
+  const openrouter = { model: openrouterFallbackModel, available: openrouterAvailable, codexCreditsAvailable };
 
   if (currentCredentialRateLimited) {
     if (currentStep === undefined) return { action: 'stay', why: 'chain-exhausted' };
@@ -202,12 +223,15 @@ export function stayReasonWhenCodexAxisEnds(
   return 'chain-exhausted';
 }
 
+/** 칸 판정에 필요한 «나머지» 재료 — OpenRouter 모델·키, codex 크레딧 잔액 확인. */
+type StepExtras = { readonly model?: string; readonly available: boolean; readonly codexCreditsAvailable?: boolean };
+
 function stepAfterCodex(
   chain: readonly FallbackStep[],
   grokAvailable: boolean,
   grokQuota: 'usable' | 'exhausted' | 'unknown',
   claudePtyMaturity: ClaudePtyMaturity | undefined,
-  openrouter: { readonly model?: string; readonly available: boolean },
+  openrouter: StepExtras,
   whyIfNone: StayReason,
 ): FallbackDecision {
   return stepAfter(chain, 'codex-rotate', grokAvailable, grokQuota, claudePtyMaturity, openrouter, whyIfNone);
@@ -219,31 +243,39 @@ function stepAfter(
   grokAvailable: boolean,
   grokQuota: 'usable' | 'exhausted' | 'unknown',
   claudePtyMaturity: ClaudePtyMaturity | undefined,
-  openrouter: { readonly model?: string; readonly available: boolean },
+  openrouter: StepExtras,
   whyIfNone: StayReason,
 ): FallbackDecision {
   const idx = currentStep === undefined ? -1 : chain.indexOf(currentStep);
   const rest = idx === -1 ? chain : chain.slice(idx + 1);
   let unavailableWhy: StayReason | undefined;
+  // `codex-credits` 칸이 «왜 앞 칸을 못 썼나»를 값으로 남긴다(관측 — 비밀 없음).
+  const skipped: { step: FallbackStep; why: StayReason }[] = [];
+  const skip = (step: FallbackStep, why: StayReason): void => { unavailableWhy = why; skipped.push({ step, why }); };
   for (const step of rest) {
+    if (step === 'codex-credits') {
+      // ⛔ 크레딧은 돈이다 — 잔액이 «확인된» 계정이 없으면 건너뛴다(「모른다」는 통과가 «아니다»).
+      if (openrouter.codexCreditsAvailable !== true) { skip(step, 'codex-credits-unavailable'); continue; }
+      return { action: 'codex-credits', skipped };
+    }
     if (step === 'openrouter') {
       const model = openrouter.model?.trim();
       if (!openrouter.available || !model || !/^openrouter\/[^/\s]+\/[^\s]+$/.test(model)) {
-        unavailableWhy = 'openrouter-unavailable';
+        skip(step, 'openrouter-unavailable');
         continue;
       }
       return { action: 'switch-backend', backend: 'openrouter', model };
     }
     if (step === 'grok') {
       // 자격 부재와 소진은 다른 값이다. 다음 칸이 있으면 그 칸을 살핀다.
-      if (!grokAvailable) { unavailableWhy = 'grok-unavailable'; continue; }
+      if (!grokAvailable) { skip(step, 'grok-unavailable'); continue; }
       // 「모른다」는 통과시킨다 — 못 읽었다고 갈 곳을 없애지 않는다.
-      if (grokQuota === 'exhausted') { unavailableWhy = 'grok-exhausted'; continue; }
+      if (grokQuota === 'exhausted') { skip(step, 'grok-exhausted'); continue; }
       return { action: 'switch-backend', backend: 'grok' };
     }
     if (step === 'claude-pty') {
       // 미성숙·못 읽음은 «건너뛴다» — 뒤에 다른 칸이 있으면 그 칸을 본다(없으면 이 사유로 머문다).
-      if (claudePtyMaturity?.mature !== true) { unavailableWhy = 'claude-pty-immature'; continue; }
+      if (claudePtyMaturity?.mature !== true) { skip(step, 'claude-pty-immature'); continue; }
       return { action: 'switch-backend', backend: 'claude' };
     }
   }
@@ -259,6 +291,8 @@ export function describeFallback(decision: FallbackDecision): string {
       return decision.backend === 'openrouter'
         ? `백엔드 전환 → openrouter (${decision.model} · API 과금)`
         : `백엔드 전환 → ${decision.backend} (구독)`;
+    case 'codex-credits':
+      return `codex 크레딧으로 계속 (마지막 칸 · 선불 크레딧 과금${decision.skipped.length ? ` · 건너뜀 ${decision.skipped.map((s) => `${s.step}:${s.why}`).join(', ')}` : ''})`;
     case 'stay':
       return `전환 없음 (${decision.why})`;
   }
@@ -295,24 +329,28 @@ export function grokQuotaFromCreditAxis(axis: {
 /**
  * budget 스냅샷 → 폴백 판정이 쓰는 세 값.
  *
- * ⭐ 공급자가 「리밋이 찼다」고 «말한» 것을 우리 산술보다 «먼저» 본다
+ * ⭐ 공급자가 「리밋이 찼다」고 «말한» 것을 weekly window 산술보다 «먼저» 본다
  *   (`UsageSnapshot.rateLimitReached` 주석의 그 권위를 그대로 따른다).
  * ⛔ 스냅샷이 없거나 판단할 재료가 없으면 `'unknown'` 이다 — 「소진」으로 접지 «않는다».
  * ⛔ 이 함수는 «네트워크를 안 친다» — 이미 채워진 캐시를 받는다.
  */
 export function grokQuotaFromUsageSnapshot(snapshot: {
   readonly rateLimitReached?: string;
+  readonly windows?: readonly { readonly kind: string; readonly remainingPercent: number }[];
   readonly credits?: { readonly hasCredits?: boolean; readonly unlimited?: boolean };
 } | null | undefined): 'usable' | 'exhausted' | 'unknown' {
   if (!snapshot) return 'unknown';
-  // ⛔ 공급자 판정이 이긴다 — 우리가 used >= limit 로 추론하지 않는다.
+  // ⛔ 공급자 판정이 이긴다 — 주간 창 판정보다 앞선다.
   if (typeof snapshot.rateLimitReached === 'string' && snapshot.rateLimitReached.length > 0) return 'exhausted';
+  const weekly = snapshot.windows?.find((window) => window.kind === 'weekly');
+  if (weekly && Number.isFinite(weekly.remainingPercent) && weekly.remainingPercent >= 0 && weekly.remainingPercent <= 100) {
+    return weekly.remainingPercent === 0 ? 'exhausted' : 'usable';
+  }
   const credits = snapshot.credits;
   if (!credits) return 'unknown';
   if (credits.unlimited === true) return 'usable';
   // ⛔⭐ `hasCredits` 는 브랜드마다 «다른 것»을 뜻할 수 있다 — grok 은 「선불 잔액이 있나」다.
-  //   ⇒ 사용률 창(rateLimitReached)이 이미 위에서 판정을 냈고, 여기 오면 그 신호가 «없다».
-  //   그러면 hasCredits=false 하나로 「소진」을 단정하지 «않는다» — 「모른다」가 정직하다.
+  //   ⇒ 주간 quota 창이 없으면 hasCredits=false 하나로 「소진」을 단정하지 «않는다» — 「모른다」가 정직하다.
   if (credits.hasCredits === true) return 'usable';
   return 'unknown';
 }

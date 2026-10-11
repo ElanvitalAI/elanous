@@ -4,6 +4,9 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { checkCompletionEvidence } from './completion-evidence.js';
+import { judgeNextMove } from './judge.js';
+import { cardsBoard } from './board.js';
+import { dispatchDeliverableCompletion, handTask, readTaskCard, readTaskAgentState } from './task-hand.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
 import { openSchedulesDb } from '../domains/schedule-registry.js';
 
@@ -15,7 +18,60 @@ function schedule(db: Database, id: string, status: string | null) {
   db.run(`INSERT INTO schedule_registry (id, name, source, category, last_status) VALUES (?, 'brief', 'test', 'report', ?)`, [id, status]);
 }
 
-describe('completion evidence (read-only, temporary root)', () => {
+describe('completion evidence (temporary root)', () => {
+  test('non-PR deliverable card closes on an output path or HTTP(S) link only with receipt', async () => {
+    const dir = temp();
+    const statePath = join(dir, 'task-agent-actions.json');
+    writeFileSync(statePath, JSON.stringify({ landingDay: '2026-10-10', failureCounts: { previous: 1 } }));
+    writeFileSync(join(dir, 'report.md'), '# Delivered report');
+    const { card, move } = await handTask({
+      id: 'ta-deliverable-1', text: 'Send the report', completion: 'deliverable',
+      project: { id: 'report-project', target: dir }, statePath,
+    });
+    expect(move.kind).toBe('launch');
+    expect(card.completion).toBe('deliverable');
+    if (card.completion !== 'deliverable') throw new Error('deliverable completion was not persisted');
+    expect(card.pr).toBeUndefined();
+    expect(card.project?.target).toBe(dir);
+    expect(readTaskCard(card.id, statePath)).toEqual(card);
+    expect(readTaskAgentState(statePath)).toEqual({
+      landingDay: '2026-10-10', failureCounts: { previous: 1 }, tasks: { [card.id]: card },
+    });
+
+    const missingReceipt = checkCompletionEvidence(card.completion, { dir, ref: 'report.md' });
+    expect(missingReceipt).toEqual({ ok: false, ref: 'report.md', missing: ['수신 확인'] });
+    expect(judgeNextMove({ completion: card.completion, evidence: missingReceipt }).move).toBe('narrow-relaunch');
+    expect(readTaskCard(card.id, statePath)?.greenProposal).toBeUndefined();
+    expect(dispatchDeliverableCompletion(card.id, { ref: 'report.md' }, statePath)).toBe(false);
+    expect(readTaskCard(card.id, statePath)?.greenProposal).toBeUndefined();
+    expect(dispatchDeliverableCompletion(card.id, { ref: 'absent.md', receipt: true }, statePath)).toBe(false);
+    expect(readTaskCard(card.id, statePath)?.greenProposal).toBeUndefined();
+    for (const ref of ['report.md', 'https://example.org/report']) {
+      const evidence = checkCompletionEvidence(card.completion, { dir, ref, receipt: true });
+      expect(evidence).toEqual({ ok: true, ref, missing: [] });
+      expect(judgeNextMove({ completion: card.completion, evidence })).toMatchObject({
+        move: 'propose-green', stage: 'closing', reason: `확인 증거 ${ref} 근거로 칸 green 제안 — deliverable`,
+      });
+    }
+    expect(dispatchDeliverableCompletion(card.id, { ref: 'report.md', receipt: true }, statePath, () => new Date('2026-10-10T00:00:00.000Z'))).toBe(true);
+    const persisted = readTaskCard(card.id, statePath);
+    expect(persisted?.greenProposal).toEqual({ at: '2026-10-10T00:00:00.000Z', checklistId: null,
+      evidence: { [card.id]: JSON.stringify({ ref: 'report.md', receipt: true }) } });
+    expect(dispatchDeliverableCompletion(card.id, { ref: 'https://example.org/report', receipt: true }, statePath)).toBe(false);
+    expect(persisted?.pr).toBeUndefined();
+    expect(cardsBoard(statePath)[0]?.children?.[0]).toMatchObject({ id: card.id, completion: 'deliverable', status: 'done' });
+    expect(readTaskAgentState(statePath)).toEqual({
+      landingDay: '2026-10-10', failureCounts: { previous: 1 },
+      tasks: { [card.id]: persisted },
+    });
+    const linkHand = await handTask({ id: 'ta-deliverable-link', text: 'Send the link', completion: 'deliverable',
+      project: { id: 'report-project', target: dir }, statePath });
+    expect(dispatchDeliverableCompletion(linkHand.card.id, { ref: 'https://example.org/report', receipt: true }, statePath)).toBe(true);
+    expect(readTaskCard(linkHand.card.id, statePath)?.greenProposal?.evidence).toEqual({
+      [linkHand.card.id]: JSON.stringify({ ref: 'https://example.org/report', receipt: true }),
+    });
+  });
+
   test('deliverable: output path must point to a nonempty file within the task directory', () => {
     const dir = temp();
     const output = join(dir, 'output.txt');

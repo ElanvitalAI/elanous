@@ -1,11 +1,15 @@
-import { expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { expect, spyOn, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { collectOutcomes, launch, planLaunches, raiseHitl, readLaunchLedger, type LaunchDeps } from './launch.js';
 import type { ScheduledDecision, TriageIssue } from './triage.js';
 import { subscribeInsideEvent } from '../nexus/api/inside-events.js';
 import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { setGitCommandRunnerForTesting } from '../git-fs/runner.js';
+import { installedCliArgv, resolveHqLaunchSeat } from '../hq/seats.js';
+import { registeredSeats } from '../seat-address/seat-address.js';
+import { runSeatLoopOnce, seatLedgerPath, seatLoopLaunchCommand, seatLoopLaunchSeat, type SeatDeps } from '../seat-loop/seat-loop.js';
 
 const runId = 'run-12345678-1234-1234-1234-123456789abc';
 const issues: TriageIssue[] = Array.from({ length: 5 }, (_, n) => ({ identifier: `ELA-${n + 1}`, ref: `ref-${n + 1}`, title: `Build ${n + 1}`, body: `Body ${n + 1}\n출처: telegram` }));
@@ -485,4 +489,134 @@ test('the sentence goes after `--`, so a title starting with a dash is not read 
     expect(argv[sep + 1]).toBe('--base evil\nb');
     expect(argv.filter(arg => arg === '--base')).toHaveLength(1);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── HQ-STEW · TASK-AGENT(OP 디스패처): 스튜어드·자리 루프는 «자리 폴더(seats/<역할>)» ⊕ «설치본 CLI» 위에서 시작한다 ──
+// 반증: 어느 발사 명령·원장 행에도 클론(소스 트리) 경로 0 · 자리 목록은 코드가 아니라 레지스트리에서 읽는다.
+const sourceTree = resolve(import.meta.dir, '../..');
+const installedEntry = resolve(import.meta.dir, '../../bin/elanous.mjs');
+
+/** Process-free HQ house: `house.json` plus one detached `seats/<role>` per registry seat; git answers come from the test runner. */
+const hqHouse = () => {
+  const temp = realpathSync(mkdtempSync(join(tmpdir(), 'steward-seat-house-')));
+  const home = join(temp, 'home');
+  const house = join(temp, 'registered-house');
+  const hqRoot = join(home, 'elanous-hq');
+  const repo = join(hqRoot, 'repo.git');
+  const seats = registeredSeats().map(({ id }) => id);
+  mkdirSync(house, { recursive: true });
+  mkdirSync(repo, { recursive: true });
+  for (const seat of seats) mkdirSync(join(hqRoot, 'seats', seat), { recursive: true });
+  writeFileSync(join(hqRoot, 'house.json'),
+    `${JSON.stringify({ home: { kind: 'home', path: house, source: 'cli-resolved' }, sandboxes: {} }, null, 2)}\n`);
+  setGitCommandRunnerForTesting((_cwd, args) => {
+    const command = args.join(' ');
+    if (command === 'rev-parse --is-bare-repository') return { status: 0, stdout: 'true\n', stderr: '' };
+    if (command === 'worktree list --porcelain') return { status: 0,
+      stdout: [repo, ...seats.map(seat => join(hqRoot, 'seats', seat))].map(path => `worktree ${path}\n`).join(''), stderr: '' };
+    if (command === 'symbolic-ref --quiet HEAD') return { status: 1, stdout: '', stderr: '' };
+    if (command === 'rev-parse --git-common-dir') return { status: 0, stdout: `${repo}\n`, stderr: '' };
+    throw new Error(`unexpected git in the seat house fixture: ${command}`);
+  });
+  const priorHome = process.env.HOME;
+  const priorConfigDir = getElanousConfigDirOverride();
+  process.env.HOME = home;
+  setElanousConfigDir(house);
+  return { root: hqRoot, house, seats, close: (): void => {
+    setGitCommandRunnerForTesting(undefined);
+    if (priorHome === undefined) delete process.env.HOME;
+    else process.env.HOME = priorHome;
+    if (priorConfigDir === undefined) resetElanousConfigDir();
+    else setElanousConfigDir(priorConfigDir);
+    rmSync(temp, { recursive: true, force: true });
+  } };
+};
+
+test('the installed-CLI argv names runtime and entry by absolute path — one owner for steward and seat loop', () => {
+  expect(installedCliArgv(['hq', 'seat', 'OP'])).toEqual([process.execPath, installedEntry, 'hq', 'seat', 'OP']);
+  expect(installedCliArgv()).toEqual([process.execPath, installedEntry]);
+});
+
+test('seat loop starts every registry seat in its own seats/<role> folder and leaves house.json untouched', () => {
+  const house = hqHouse();
+  try {
+    const ledgerBefore = readFileSync(join(house.root, 'house.json'), 'utf8');
+    expect(house.seats).toContain('OP');
+    for (const seat of house.seats) {
+      const command = seatLoopLaunchCommand(seat, ['harness', 'budget', '--json']);
+      // The seat folder is the registry-validated house view — never a clone or worktree of this checkout.
+      expect(command.cwd).toBe(join(house.root, 'seats', seat));
+      expect(command.cwd).toBe(resolveHqLaunchSeat(seat, house.house, { root: house.root }));
+      expect(command.cwd).toBe(seatLoopLaunchSeat(seat));
+      expect(command.cwd.startsWith(sourceTree)).toBe(false);
+      // The entrypoint is the installed CLI by absolute path, so no cwd-relative `bin/elanous.mjs` is resolved.
+      expect(command.argv[0]).toBe(process.execPath);
+      expect(command.argv[1]).toBe(installedEntry);
+      expect(isAbsolute(command.argv[1]!)).toBe(true);
+      expect(command.argv).not.toContain('bin/elanous.mjs');
+      // The state universe travels into the seat folder unchanged.
+      expect(command.argv[2]).toBe('--config-dir');
+      expect(command.argv.slice(4)).toEqual(['harness', 'budget', '--json']);
+      expect(command.env.ELANOUS_STATE_DIR).toBe(command.argv[3]);
+    }
+    // The seat list is read from the registry: an unregistered seat has no launch folder at all.
+    expect(() => seatLoopLaunchCommand('NOT-A-SEAT', ['harness', 'budget', '--json']))
+      .toThrow('refusing to launch from the source tree');
+    // The launch lookup is read-only: house.json keeps both its bytes and its format.
+    expect(readFileSync(join(house.root, 'house.json'), 'utf8')).toBe(ledgerBefore);
+    expect(Object.keys(JSON.parse(ledgerBefore) as Record<string, unknown>)).toEqual(['home', 'sandboxes']);
+    expect((JSON.parse(ledgerBefore) as { home: unknown }).home)
+      .toEqual({ kind: 'home', path: house.house, source: 'cli-resolved' });
+  } finally { house.close(); }
+});
+
+test('a seat turn resolves the seat folder before starting any process and its ledger row carries no source-tree path', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'seat-turn-launch-'));
+  const at = new Date('2026-10-04T20:40:00Z');
+  try {
+    const resolved: string[] = [];
+    const deps: SeatDeps = { root: dir, repo: dir, now: () => at, config: { mode: 'on', seats: ['TC'] },
+      read: (path) => { try { return readFileSync(path, 'utf8'); } catch { return ''; } },
+      versions: () => ['0.2.9'], schedules: () => [{ version: '0.2.9', cutAt: '2099-01-01T00:00:00Z' }],
+      checklistItems: () => [{ id: 'HQ-STEW', owner: 'TC', title: '기기 검증', status: 'red' }],
+      pullRequests: async () => [], running: () => [], inquire: () => null,
+      launchSeat: (seat) => { resolved.push(seat); throw new Error('seats/TC is not registered in house.json'); } };
+    // A missing seat folder stops the turn; it never falls back to the tree this code was loaded from.
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-budget');
+    expect(resolved).toEqual(['TC']);
+    const ledger = readFileSync(seatLedgerPath('TC', dir, at), 'utf8');
+    expect(ledger.trim().split('\n').map(row => JSON.parse(row) as Record<string, unknown>).at(-1))
+      .toMatchObject({ seat: 'TC', status: 'skipped-budget', action: 'skipped-budget', item: { id: 'HQ-STEW' } });
+    expect(ledger).not.toContain(sourceTree);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('steward read commands run in the registered OP seat through the installed CLI, not in the source tree', () => {
+  const house = hqHouse();
+  const dir = root();
+  const calls: Array<{ args: string[]; cwd?: string }> = [];
+  const spawnSync = spyOn(Bun, 'spawnSync').mockImplementation(((args: ArrayLike<string>, options?: { cwd?: string }) => {
+    calls.push({ args: Array.from(args), cwd: options?.cwd });
+    return { exitCode: 1, stdout: Buffer.from(''), stderr: Buffer.from('run ledger unavailable') };
+  }) as unknown as typeof Bun.spawnSync);
+  try {
+    const ledger = readLaunchLedger(dir);
+    ledger.launches['ELA-1'] = { issue: 'ELA-1', title: 'Build', source: 'cli', command: 'say', status: 'launched', runId };
+    expect(collectOutcomes(ledger, { root: dir, ledger, settings: { mode: 'live', launch: 'live' } })).toEqual([]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.cwd).toBe(join(house.root, 'seats', 'OP'));
+    expect(calls[0]!.cwd!.startsWith(sourceTree)).toBe(false);
+    expect(calls[0]!.args[0]).toBe(process.execPath);
+    expect(calls[0]!.args[1]).toBe(installedEntry);
+    expect(calls[0]!.args).not.toContain('bin/elanous.mjs');
+    expect(calls[0]!.args.filter(arg => arg !== '--test')).toEqual([process.execPath, installedEntry, 'self', 'run-ledger', runId, '--json']);
+    // An unavailable run ledger stays `running`, and the launch ledger keeps its format.
+    expect(ledger.launches['ELA-1']?.status).toBe('running');
+    expect(Object.keys(JSON.parse(readFileSync(join(dir, 'steward', 'launches.json'), 'utf8')) as Record<string, unknown>))
+      .toEqual(['launches', 'hitl']);
+  } finally {
+    spawnSync.mockRestore();
+    house.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

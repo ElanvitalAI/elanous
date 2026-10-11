@@ -19,6 +19,10 @@ export interface LaunchBinding {
   readonly goalPath?: string;
   /** The `self-dev-runs` directory that holds this run's `pid.json` — tells a stop which universe launched it. */
   readonly runsDir?: string;
+  /** `ELANOUS_POD_NAME` at launch — a Pod child's run (TA backfill skips it like the launch-time hook does). */
+  readonly podName?: string;
+  /** `ELANOUS_TASK_CARD_ID` at launch — a handed run that already owns a card (TA backfill skips it). */
+  readonly taskCardId?: string;
 }
 
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -72,6 +76,8 @@ export function readLaunchBinding(runId: string, dir = launchRegistryDir()): Lau
       ...(typeof value.argv0 === 'string' ? { argv0: value.argv0 } : {}),
       ...(typeof value.goalPath === 'string' && isAbsolute(value.goalPath) ? { goalPath: value.goalPath } : {}),
       ...(typeof value.runsDir === 'string' && isAbsolute(value.runsDir) ? { runsDir: value.runsDir } : {}),
+      ...(typeof value.podName === 'string' && value.podName ? { podName: value.podName } : {}),
+      ...(typeof value.taskCardId === 'string' && value.taskCardId ? { taskCardId: value.taskCardId } : {}),
     };
   } catch { return null; }
 }

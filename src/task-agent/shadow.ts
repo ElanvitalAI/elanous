@@ -58,8 +58,26 @@ export interface TaskAgentShadowDeps {
   liveMoves?: ReadonlySet<TaskAgentLiveMove>;
   /** live 수의 부작용(리뷰 띄우기·PR 머리 조회·상태 파일) — 시험은 주입한다. */
   live?: LiveMoveDeps;
+  /** 카드 조회 상태 파일(시험 주입 · 운영 파일을 건드리지 않게). 기본 = `live.statePath` ⊕ `taskAgentStatePath()`. */
+  statePath?: string;
   /** Process env for the launched-run id (`ELANOUS_RUN_ID`) — test seam; default process.env. */
   env?: NodeJS.ProcessEnv;
+}
+
+/** 카드 조회 상태 파일 — 조회 경로 전부가 같은 파일을 본다. */
+function cardStatePath(deps: TaskAgentShadowDeps): string {
+  return deps.statePath ?? deps.live?.statePath ?? taskAgentStatePath();
+}
+
+/** 카드 «원장»(기록·회수 대상) — 카드를 읽은 파일과 같다. 주입한 카드 리더(`readCard`)만 있으면 `live.statePath` 가 없을 때 모른다. */
+function cardLedgerPath(deps: TaskAgentShadowDeps): string | undefined {
+  return deps.readCard ? deps.live?.statePath : cardStatePath(deps);
+}
+
+/** live 수의 의존 — 실행부가 적는 원장(리뷰 요청·착지 시도)도 카드를 읽은 파일과 같게 맞춘다. */
+function liveMoveDeps(deps: TaskAgentShadowDeps): LiveMoveDeps {
+  const ledger = cardLedgerPath(deps);
+  return { ...(deps.log ? { log: deps.log } : {}), ...deps.live, ...(ledger ? { statePath: ledger } : {}) };
 }
 
 /** 파일 산출물로 전달(elanous-out)하는 종결 종류 — 그 밖의 code-pr 밖 종류는 확인 증거를 판단부에서 기다린다. */
@@ -156,7 +174,7 @@ function shadowCompletion(card: TaskCard | undefined, lookupFailed: boolean): Co
 export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, deps: TaskAgentShadowDeps = {}): Promise<TaskAgentShadowMove> {
   // TA-REVIEW-RESULT-CAPTURE — 판단 «전»에 지난 live review 의 결과 파일을 회수한다(카드 원장을 아는 때만 · 던지지 않는다).
   //   대기 중인 요청이 없으면 아무것도 쓰지 않는다(결과 파일 없는 카드의 동작은 종전과 같다).
-  const reviewLedger = deps.live?.statePath ?? (deps.readCard ? undefined : taskAgentStatePath());
+  const reviewLedger = cardLedgerPath(deps);
   if (reviewLedger) {
     try { captureReviewResults(reviewLedger, { ...(deps.live?.now ? { now: deps.live.now } : {}), ...(deps.log ? { log: deps.log } : {}) }); } catch (error) {
       // fail-soft — 판단은 계속하되 원인은 남긴다.
@@ -167,12 +185,14 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
   let card: TaskCard | undefined;
   let cardLookupFailed = false;
   try {
-    card = successful ? (deps.readCard ?? readTaskCard)(successful.taskId) : undefined;
+    card = successful ? (deps.readCard ? deps.readCard(successful.taskId) : readTaskCard(successful.taskId, cardStatePath(deps))) : undefined;
     if (!card && successful && !deps.readCard) {
-      const tasks = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(taskAgentStatePath()).tasks ?? {};
+      const tasks = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(cardStatePath(deps)).tasks ?? {};
       const matches = Object.values(tasks).filter(candidate => candidate.status === 'launched' && candidate.text === successful.feature);
       if (matches.length === 1) card = matches[0];
     }
+    // TA-OWN-ALL-RUNS — 런 소유 카드: 입력 runId ⊕ 상속 ELANOUS_RUN_ID(Pod 자식의 부모 런) 중 카드 runId 와 «정확히» 같은 것만.
+    if (!card && !deps.readCard) card = runCardFor(input.runId, deps);
   } catch {
     // Card lookup is optional; preserve the original PR judgement when unavailable — but mark the completion kind as unmeasured.
     cardLookupFailed = true;
@@ -282,7 +302,7 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
             ...(prResult.branch ? { branch: prResult.branch } : {}),
             ...(prResult.prUrl ? { prUrl: prResult.prUrl } : {}),
           } } : {}),
-        }, { ...(deps.log ? { log: deps.log } : {}), ...deps.live });
+        }, liveMoveDeps(deps));
     } else if (liveKind === 'propose-land') {
       liveMove = await executeLiveLand(boundCard, prResult?.prNumber,
         { runId: input.runId, cycleId: input.cycleId, review: selfReview,
@@ -292,12 +312,12 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
             ...(prResult.branch ? { branch: prResult.branch } : {}),
             ...(prResult.prUrl ? { prUrl: prResult.prUrl } : {}),
           } } : {}),
-        }, { ...(deps.log ? { log: deps.log } : {}), ...deps.live });
+        }, liveMoveDeps(deps));
     } else {
       const evidence: Record<string, string> = {};
       if (boundCard && !delivery && judgeInput.prState === 'MERGED' && prResult) evidence[boundCard.id] = `#${prResult.prNumber}`;
       else if (boundCard && delivery && deps.mode === 'live' && executorResult === 'done') evidence[boundCard.id] = join(delivery.projectTarget, 'elanous-out', boundCard.id);
-      liveMove = executeLiveGreenProposal(boundCard, evidence, { ...(deps.log ? { log: deps.log } : {}), ...deps.live });
+      liveMove = executeLiveGreenProposal(boundCard, evidence, liveMoveDeps(deps));
     }
   }
   // 판단한 수마다 live/shadow 를 남긴다 — OP 가 «오판 건수»·«그림자 일치율»을 카드·수 종류로 잰다.
@@ -313,6 +333,29 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
     shadowDetail: move.wouldDo ?? move.reason,
   }, deps);
   return liveMove ? { ...move, liveMove } : move;
+}
+
+/**
+ * 런 id 폴백 — 입력 runId(슈퍼바이저 · Pod 면 자식 런) → 상속 `ELANOUS_RUN_ID`(발사기가 넘긴 부모 런) 순으로,
+ * 카드 runId 와 정확히 같고 그 카드가 하나뿐일 때만 쓴다. 못 찾으면 추측하지 않고 이유 한 줄을 남긴다(조용한 미스 0).
+ */
+function runCardFor(runId: string | null | undefined, deps: TaskAgentShadowDeps): TaskCard | undefined {
+  const own = runId?.trim() || undefined;
+  const inherited = (deps.env ?? process.env)[HARNESS_RUN_ID_ENV]?.trim() || undefined;
+  if (!own && !inherited) return undefined;
+  const tasks = Object.values(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(cardStatePath(deps)).tasks ?? {});
+  const tried: Array<{ source: 'run' | 'env'; id: string; bound: number }> = [];
+  for (const [source, id] of [['run', own], ['env', inherited]] as const) {
+    if (!id || tried.some((entry) => entry.id === id)) continue;
+    const bound = tasks.filter((candidate) => candidate.runId === id);
+    if (bound.length === 1) return bound[0];
+    tried.push({ source, id, bound: bound.length });
+  }
+  const reason = tried.map((entry) => `${entry.source === 'env' ? `env ${HARNESS_RUN_ID_ENV}` : 'runId'} ${entry.id}: ${entry.bound === 0 ? 'no card has this runId' : `${entry.bound} cards share this runId (ambiguous)`}`).join(' · ');
+  try {
+    (deps.log ?? ((c: string, e: string, d: Record<string, unknown>) => debug.log(c, e, d)))('task-agent', 'run-card-fallback-missed', { runId: own ?? null, inheritedRunId: inherited ?? null, tried, reason });
+  } catch { /* fail-soft */ }
+  return undefined;
 }
 
 /**
@@ -334,7 +377,7 @@ function recordLiveMoveOnCard(
   };
   try {
     if (!move.card) { fail('no task card bound to this move'); return; }
-    const statePath = deps.live?.statePath ?? (deps.readCard ? undefined : taskAgentStatePath());
+    const statePath = cardLedgerPath(deps);
     if (!statePath) { fail('card ledger unknown (injected readCard without live.statePath)'); return; }
     const card = move.card;
     // live 인데 실행부 결과가 없으면 «무엇이 일어났는지» 모른다 — 줄을 지어내지 않고 이유를 남긴다.
@@ -358,11 +401,11 @@ function recordLiveMoveOnCard(
 function liveCardFor(results: readonly SupervisorJobResult[], deps: TaskAgentShadowDeps, runId?: string | null): TaskCard | undefined {
   try {
     for (const result of results) {
-      const found = deps.readCard ? deps.readCard(result.taskId) : readTaskCard(result.taskId, deps.live?.statePath);
+      const found = deps.readCard ? deps.readCard(result.taskId) : readTaskCard(result.taskId, cardStatePath(deps));
       if (found) return found;
     }
     if (deps.readCard) return undefined;
-    const tasks = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(deps.live?.statePath ?? taskAgentStatePath()).tasks ?? {};
+    const tasks = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(cardStatePath(deps)).tasks ?? {};
     // TA-LIVE-LAND-2 — a Pod run's results carry the orchestrator task id, not the card id, and its feature may be the
     // authored goal rather than the handed sentence. `tasks hand --live` launched this process with ELANOUS_RUN_ID = the
     // card's runId (TA-CARD-RUN-LINK); the supervisor's runId may be the Pod child's. Either id bound to exactly one card is the match.
@@ -373,6 +416,7 @@ function liveCardFor(results: readonly SupervisorJobResult[], deps: TaskAgentSha
     }
     const features = new Set(results.map((result) => result.feature));
     const matches = Object.values(tasks).filter(candidate => candidate.status === 'launched' && features.has(candidate.text));
+    // runId ⊕ 상속 ELANOUS_RUN_ID 는 위에서 이미 봤다(판단부의 runCardFor 가 미스 이유를 남긴다).
     return matches.length === 1 ? matches[0] : undefined;
   } catch { return undefined; }
 }

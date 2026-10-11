@@ -4,8 +4,10 @@ import * as codexModels from '../codex/models.js';
 import { findCodexModel } from '../codex/models.js';
 import { findGeminiModel } from '../gemini/models.js';
 import { findGrokModel } from '../grok/models.js';
+import { debug } from '../debug/log.js';
+import { logAgentTurnUsage } from '../llm.js';
 import * as userConfig from '../user-config.js';
-import { estimateLlmCost, llmUsageCostFields, readLlmConfigPricing, longContextPricing } from './llm-cost.js';
+import { bedrockPricingModelId, estimateLlmCost, llmUsageCostFields, readLlmConfigPricing, longContextPricing } from './llm-cost.js';
 
 const MILLION = 1_000_000;
 const noOverlay = { configPricing: {} };
@@ -327,6 +329,88 @@ describe('pricing lookup chain (BACKLOG C1·C2)', () => {
     expect(normalizePricingModelId('claude-haiku-4-5-20251001')).toBe('claude-haiku-4-5');
     expect(normalizePricingModelId('openrouter/anthropic/claude-sonnet-5')).toBe('claude-sonnet-5');
     expect(normalizePricingModelId('openrouter/moonshotai/kimi-k3')).toBe('openrouter/moonshotai/kimi-k3');
+  });
+  it('normalizes Bedrock model ids and version suffixes to bare Claude pricing ids', () => {
+    expect(bedrockPricingModelId('bedrock/claude-haiku-5-5-v1:0')).toBe('claude-haiku-5-5');
+    expect(bedrockPricingModelId('ap-northeast-2.anthropic.claude-sonnet-5-5-v1:0')).toBe('claude-sonnet-5-5');
+    expect(bedrockPricingModelId('anthropic.claude-opus-5-5-v1:0')).toBe('claude-opus-5-5');
+  });
+  it('Bedrock wire ids (us./global. regions) take the Bedrock table, never the 1st-party cache rate', () => {
+    const usage = { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: MILLION, cacheCreationInputTokens: 0 };
+    // 캐시 읽기만 1M — Bedrock sonnet 0.1 · 1st-party 는 다르다. 1st-party 카탈로그가 Bedrock id 를 가로채면 이 값이 바뀐다.
+    expect(llmUsageCostFields('us.anthropic.claude-sonnet-5-5', usage, noOverlay, 'api').cost).toMatchObject({ kind: 'known', usd: 0.1, source: 'bedrock-catalog' });
+    expect(llmUsageCostFields('global.anthropic.claude-sonnet-5-5', usage, noOverlay, 'api').cost).toMatchObject({ kind: 'known', usd: 0.1, source: 'bedrock-catalog' });
+    const firstParty = llmUsageCostFields('claude-sonnet-5-5', usage, noOverlay, 'api').cost;
+    expect(firstParty).toMatchObject({ kind: 'known', source: 'catalog' });
+    expect((firstParty as { usd: number }).usd).not.toBe(0.1);
+    // 표에 없는 Bedrock 모델은 지어내지 않고 unknown.
+    expect(llmUsageCostFields('bedrock/zai.glm-5', usage, noOverlay, 'api').cost).toMatchObject({ kind: 'unknown' });
+  });
+
+  it('prices Bedrock usage with Bedrock cache rates through llmUsageCostFields', () => {
+    const sonnet = llmUsageCostFields('global.anthropic.claude-sonnet-5-5', {
+      inputTokens: MILLION,
+      outputTokens: MILLION,
+      cacheReadInputTokens: MILLION,
+      cacheCreationInputTokens: MILLION,
+    }, noOverlay, 'api');
+    expect(sonnet.cost).toMatchObject({ kind: 'known', usd: 14.6, source: 'bedrock-catalog' });
+
+    const haiku = llmUsageCostFields('bedrock/claude-haiku-5-5', {
+      inputTokens: MILLION,
+      outputTokens: MILLION,
+      cacheReadInputTokens: MILLION,
+      cacheCreationInputTokens: MILLION,
+    }, noOverlay, 'api');
+    expect(haiku.cost).toMatchObject({ kind: 'known', usd: 0.735, source: 'bedrock-catalog' });
+
+    const opus = llmUsageCostFields('anthropic.claude-opus-5-5', {
+      inputTokens: MILLION,
+      outputTokens: MILLION,
+      cacheReadInputTokens: MILLION,
+      cacheCreationInputTokens: MILLION,
+    }, noOverlay, 'api');
+    expect(opus.cost).toMatchObject({ kind: 'known', usd: 29.2, source: 'bedrock-catalog' });
+  });
+  it('keeps first-party claude-sonnet-5-5 pricing and catalog source unchanged', () => {
+    const firstParty = estimateLlmCost({
+      model: 'claude-sonnet-5-5',
+      inputTokens: MILLION,
+      outputTokens: MILLION,
+      cacheReadInputTokens: MILLION,
+      cacheCreationInputTokens: MILLION,
+    }, noOverlay);
+    expect(firstParty).toMatchObject({ kind: 'known', usd: 14.7, source: 'catalog' });
+    expect(firstParty).not.toMatchObject({ source: 'bedrock-catalog' });
+  });
+  it('wires Bedrock pricing into the existing llm.usage observation caller', () => {
+    const spy = spyOn(debug, 'log');
+    const model = 'global.anthropic.claude-sonnet-5-5';
+    try {
+      logAgentTurnUsage(model, {
+        provider: 'anthropic',
+        inputTokens: MILLION,
+        outputTokens: MILLION,
+        cacheReadInputTokens: MILLION,
+        cacheCreationInputTokens: MILLION,
+      }, { providerName: 'bedrock', site: 'bedrock-cost-test' });
+      const row = spy.mock.calls.find((call) =>
+        call[0] === 'llm.usage'
+        && call[1] === 'llm-usage'
+        && (call[2] as { site?: string })?.site === 'bedrock-cost-test');
+      expect(row).toBeDefined();
+      expect(row![2]).toMatchObject({
+        model,
+        billingProvider: 'bedrock',
+        inputTokens: MILLION,
+        outputTokens: MILLION,
+        cacheReadInputTokens: MILLION,
+        cacheCreationInputTokens: MILLION,
+      });
+      expect((row![2] as { cost: unknown }).cost).toMatchObject({ kind: 'known', usd: 14.6, source: 'bedrock-catalog' });
+    } finally {
+      spy.mockRestore();
+    }
   });
   it('a date-suffixed claude id is priced (was unknown)', () => {
     const r = estimateLlmCost({ model: 'claude-haiku-4-5-20251001', inputTokens: MILLION, outputTokens: 0 });

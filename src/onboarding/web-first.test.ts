@@ -29,7 +29,7 @@ test('real CLI first run waits for health before printing a claimable setup link
     const child = Bun.spawn([process.execPath, cli, `--test=${dir}`], {
       cwd: resolve(import.meta.dir, '../..'), env, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore',
     });
-    const timer = setTimeout(() => child.kill(), 15_000);
+    const timer = setTimeout(() => child.kill(), 30_000);
     try {
       const [stdout, stderr, exitCode] = await Promise.all([
         new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
@@ -46,7 +46,7 @@ test('real CLI first run waits for health before printing a claimable setup link
     server.stop(true);
     rmSync(dir, { recursive: true, force: true });
   }
-}, 25_000);
+}, 35_000);
 
 const configuredLlm = { llm: { provider: 'openai', apiKey: 'sk-test-not-a-real-key' } };
 
@@ -73,7 +73,7 @@ test('real CLI does not print a link when health responds with an error', async 
         ELANOUS_RUN_CONTEXT: 'production', DISPLAY: '', WAYLAND_DISPLAY: '' },
       stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
     });
-    const timer = setTimeout(() => child.kill(), 15_000);
+    const timer = setTimeout(() => child.kill(), 30_000);
     try {
       const [stdout, stderr, exitCode] = await Promise.all([
         new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
@@ -87,7 +87,7 @@ test('real CLI does not print a link when health responds with an error', async 
     server.stop(true);
     rmSync(dir, { recursive: true, force: true });
   }
-}, 25_000);
+}, 35_000);
 
 test('real CLI honors explicit webFirst=false without probing health or issuing a link', async () => {
   const dir = mkdtempSync(join(resolve(import.meta.dir, '../..'), '.web-first-disabled-'));
@@ -100,7 +100,7 @@ test('real CLI honors explicit webFirst=false without probing health or issuing 
         ELANOUS_RUN_CONTEXT: 'production', DISPLAY: '', WAYLAND_DISPLAY: '' },
       stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
     });
-    const timer = setTimeout(() => child.kill(), 15_000);
+    const timer = setTimeout(() => child.kill(), 30_000);
     try {
       const [stdout, stderr, exitCode] = await Promise.all([
         new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
@@ -111,7 +111,7 @@ test('real CLI honors explicit webFirst=false without probing health or issuing 
       expect(stdout + stderr).toContain('대시보드는 stdin TTY');
     } finally { clearTimeout(timer); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
-}, 25_000);
+}, 35_000);
 
 test('real CLI setup --terminal selects the terminal wizard without a TTY or web link', async () => {
   const dir = mkdtempSync(join(resolve(import.meta.dir, '../..'), '.web-first-terminal-'));
@@ -121,7 +121,7 @@ test('real CLI setup --terminal selects the terminal wizard without a TTY or web
       env: { ...process.env, ELANOUS_HOME: dir, HOME: dir, XDG_CONFIG_HOME: dir, ELANOUS_RUN_CONTEXT: 'production' },
       stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
     });
-    const timer = setTimeout(() => child.kill(), 20_000);
+    const timer = setTimeout(() => child.kill(), 30_000);
     try {
       const [stdout, stderr, exitCode] = await Promise.all([
         new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
@@ -131,7 +131,7 @@ test('real CLI setup --terminal selects the terminal wizard without a TTY or web
       expect(stdout + stderr).not.toContain('/setup#t=');
     } finally { clearTimeout(timer); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
-}, 25_000);
+}, 35_000);
 
 const daemon = (tailnet?: string, port = 4321): NexusShowResult => ({
   exitCode: 0, status: 'unregistered',
@@ -167,6 +167,38 @@ test('disabled and --terminal never inspect daemon or issue tokens', async () =>
   }
 });
 
+test('bare first run with no daemon switches to offline TUI without launching or waiting', async () => {
+  for (const result of [{ exitCode: 1, status: 'absent' }, { exitCode: 1, status: 'registered', instance: { alive: false } }] as NexusShowResult[]) {
+    let starts = 0;
+    let probes = 0;
+    const { deps, lines } = fixture({
+      startIfMissing: false, showNexus: async () => result,
+      startDaemon: async () => { starts++; throw Error('must not start'); },
+      probeHealth: async () => { probes++; return false; },
+    });
+    const began = Date.now();
+    expect(await runWebFirstSetup(deps)).toBe('fallback');
+    expect(Date.now() - began).toBeLessThan(3_000);
+    expect({ starts, probes }).toEqual({ starts: 0, probes: 0 });
+    expect(lines).toEqual(['오프라인 모드']);
+  }
+});
+
+test('bare first run with a healthy daemon still shows the web link without starting it', async () => {
+  const { deps, lines } = fixture({ startIfMissing: false, startDaemon: async () => { throw Error('must not start'); } });
+  expect(await runWebFirstSetup(deps)).toBe('link-shown');
+  expect(lines).toContain('http://127.0.0.1:4321/setup#t=secret%2B%2F%3D');
+});
+
+test('bare first run checks running daemon health only once before offline fallback', async () => {
+  let probes = 0;
+  const { deps, lines } = fixture({ startIfMissing: false, probeHealth: async () => { probes++; return false; },
+    startDaemon: async () => { throw Error('must not start'); } });
+  expect(await runWebFirstSetup(deps)).toBe('fallback');
+  expect(probes).toBe(1);
+  expect(lines).toEqual(['오프라인 모드']);
+});
+
 test('daemon absent or registered but dead starts background and waits for health before issuing', async () => {
   for (const result of [{ exitCode: 1, status: 'absent' }, { exitCode: 1, status: 'registered', instance: { alive: false } }] as NexusShowResult[]) {
     const calls: string[] = [];
@@ -180,6 +212,7 @@ test('daemon absent or registered but dead starts background and waits for healt
     expect(await runWebFirstSetup(deps)).toBe('link-shown');
     expect(calls).toEqual(['show', 'start', 'show', 'http://127.0.0.1:4321/v1/health', 'issue']);
     expect(lines).toContain('http://127.0.0.1:4321/setup#t=secret%2B%2F%3D');
+    expect(lines[0]).toBe('웹 셋업을 위해 데몬을 시작합니다.');
     const event = debug.events(20).filter(e => e.category === 'onboarding.web-first').at(-1);
     expect(event?.event).toBe('link-shown');
     expect((event?.data as { ms: number })?.ms).toBeLessThan(15_000);
@@ -254,8 +287,10 @@ test('daemon launch failure or unhealthy daemon falls back with one reason and n
       issueSetupLinkToken: async () => { issued = true; return { token: 'secret' }; },
     });
     expect(await runWebFirstSetup(deps)).toBe('fallback');
-    expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain(expected);
+    expect(lines).toEqual([
+      '웹 셋업을 위해 데몬을 시작합니다.',
+      expect.stringContaining(expected),
+    ]);
     expect(issued).toBe(false);
   }
 }, 16_000);

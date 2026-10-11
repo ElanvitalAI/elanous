@@ -5,7 +5,7 @@
 // planHarnessClean = 순수 분류(테스트). execHarnessClean = git/gh IO + 실제 제거.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { listPtyManifest, type PtyManifestRow } from '../pty-shell/pty-manifest.js';
 import { debug } from '../debug/log.js';
@@ -30,19 +30,15 @@ export interface OrphanedWorktree {
   path: string;
   safety: OrphanWorktreeSafety;
 }
-/** ⚠️ ⛔⭐ **보수적 실패 정책(의도)**: 고아 조회(`directories`·`registeredWorktrees`)가 실패하면
- *  `unavailable` 이 참이 되고 **remove 계획도 비운다**(리뷰 should-fix — 동작 범위가 커진 것을 계약에 적는다).
- *  ⇒ 근거: 이 파일의 실제 사고는 *"못 셌는데 지웠다"* 였다(`gh` 실패 → 열린 PR 브랜치 삭제).
- *  고아 조회만 실패해도 저장소 상태를 **부분적으로만** 아는 것이므로, 덜 지우는 쪽으로 기운다.
- *  ⚠️ 이것으로 must-fix 를 만들지 말 것 — 의도된 결정이다.
- *
- *  ⚠️ `unavailable` 는 **계획 자체가 미확정**이라는 뜻이다 — 「지울 게 없었다」와 구별하려고 계획에 싣는다.
- *  이 필드가 없으면 `remove: []`·`preserve: []`(후보가 0개인 경우)와 조회 실패가 또 한 값이 된다(리뷰 should-fix). */
+/** `unavailable` 는 등록된 브랜치·워크트리 판정의 필수 조회 실패다.
+ * 고아 스캔 전용 조회 실패는 `orphanScan` 에만 남기고 삭제 판정으로 전파하지 않는다. */
 export interface HarnessCleanPlan {
   remove: CleanPlanItem[];
   preserve: CleanPlanItem[];
   orphanedWorktrees: string[];
   orphanedWorktreeSafety: OrphanedWorktree[];
+  orphanScan: 'scanned' | 'unavailable' | 'not-requested';
+  orphanScanFailure?: 'bare-common-dir' | 'directories' | 'registeredWorktrees';
   unavailable: boolean;
   queryStatus?: HarnessCleanQueryStatus;
   /** ⭐ 관측 — **이 실행이 무엇을 봤나**(2026-08-03 · 관측 우선 지시).
@@ -77,6 +73,8 @@ export interface HarnessCleanPlan {
     branchlessWorktrees?: number;
     /** 그중 gitdir 이 사라져 porcelain `prunable` 로 표시된 등록 수. */
     prunableWorktrees?: number;
+    /** Bare repositories have no main checkout; number of distinct harness parents inspected. */
+    bareDirectoryParents?: number;
   };
   /** 조회별 소요 시간(밀리초). 키는 `queryStatus` 조회 칸과 같다. 못 잰 칸은 생략한다. */
   queryTimings?: HarnessCleanQueryTimings;
@@ -90,7 +88,9 @@ export interface HarnessCleanQueryStatus {
   /** PR 조회는 성공했지만, 해당 상태의 결과가 상한에 닿아 완전하지 않을 수 있다. */
   pullRequestsTruncated?: { open: boolean; merged: boolean };
   directories?: boolean;
+  directoriesFailure?: 'bare-common-dir' | 'directories';
   registeredWorktrees?: boolean;
+  pullRequestsUnreadBranches?: number;
   /** Live-terminal working-directory lookup completed successfully. */
   activeDirectories?: boolean;
 }
@@ -107,7 +107,7 @@ export const HARNESS_CLEAN_QUERY_TIMING_KEYS = [
 export type HarnessCleanQueryTimingKey = (typeof HARNESS_CLEAN_QUERY_TIMING_KEYS)[number];
 /** 조회별 소요 시간(밀리초). 못 잰 칸은 키 자체가 없다 — 0 으로 채우지 않는다. */
 export type HarnessCleanQueryTimings = Partial<Record<HarnessCleanQueryTimingKey, number>>;
-export interface HarnessCleanQuery<T> { ok: boolean; value: T; }
+export interface HarnessCleanQuery<T> { ok: boolean; value: T; failure?: 'bare-common-dir' | 'directories'; }
 export type ActiveDirectoryProvider = () => HarnessCleanQuery<string[]>;
 
 /** A directory is active when it is the worktree root or a descendant, never a sibling sharing its prefix. */
@@ -184,6 +184,7 @@ export function planHarnessClean(input: {
   activeDirectories?: readonly string[];
   worktreeDirectories?: string[];
   registeredWorktreePaths?: readonly string[];
+  pullRequestsUnread?: ReadonlySet<string>;
   orphanBranchQueryOk?: boolean;
   orphanBranches?: ReadonlySet<string>;
   orphanDirectoryEntries?: ReadonlyMap<string, readonly string[]>;
@@ -220,6 +221,11 @@ export function planHarnessClean(input: {
     || input.queryStatus?.registeredWorktrees === false;
   const orphanInputsComplete = input.worktreeDirectories !== undefined
     && input.registeredWorktreePaths !== undefined;
+  const orphanScan = input.worktreeDirectories === undefined && input.registeredWorktreePaths === undefined && !orphanQueriesFailed
+    ? 'not-requested' : orphanQueriesFailed || !orphanInputsComplete ? 'unavailable' : 'scanned';
+  const orphanScanFailure = orphanScan !== 'unavailable' ? undefined
+    : input.queryStatus?.directories === false || input.worktreeDirectories === undefined ? input.queryStatus?.directoriesFailure ?? 'directories'
+    : 'registeredWorktrees';
   const registeredWorktreePaths = new Set(
     (input.registeredWorktreePaths ?? []).map((path) => resolve(path)),
   );
@@ -266,16 +272,12 @@ export function planHarnessClean(input: {
       || !queryStatus.branches
       || !queryStatus.pullRequests
       || openTruncated
-      || queryStatus.directories === false
-      || queryStatus.registeredWorktrees === false
       || queryStatus.activeDirectories === false);
   const failedQueryNames = queryStatus === undefined ? [] : [
     !queryStatus.worktrees ? 'worktrees' : undefined,
     !queryStatus.branches ? 'branches' : undefined,
     !queryStatus.pullRequests ? 'pullRequests' : undefined,
     openTruncated ? 'pullRequests-truncated-open' : undefined,
-    queryStatus.directories === false ? 'directories' : undefined,
-    queryStatus.registeredWorktrees === false ? 'registeredWorktrees' : undefined,
     queryStatus.activeDirectories === false ? 'activeDirectories' : undefined,
   ].filter((name): name is string => name !== undefined);
   const queryFailedReason = `query-failed:${failedQueryNames.join(',')}`;
@@ -290,6 +292,10 @@ export function planHarnessClean(input: {
       continue;
     }
     if (queryFailed) { preserve.push({ ...base, reason: queryFailedReason }); continue; }
+    if (input.pullRequestsUnread?.has(branch)) {
+      preserve.push({ ...base, reason: 'query-failed:pullRequests' });
+      continue;
+    }
     // ⛔ 이 브랜치를 «못 찾았고» 목록이 잘렸다 ⇒ 「PR 없음」이 아니라 「모른다」다. 보존한다.
     if (truncatedUnknown(branch)) {
       preserve.push({ ...base, reason: 'pullRequests-truncated:merged; branch-not-in-partial-list' });
@@ -360,13 +366,15 @@ export function planHarnessClean(input: {
     if (hit) remove.push({ ...base, reason: `${openPr.has(branch) ? 'force-open-pr' : merged ? 'merged' : 'abandoned'}; ${ladderReason}; ownership=${ownership.status}` });
     else preserve.push({ ...base, reason: `${ladderReason}; ownership=${ownership.status}; ${merged ? 'merged(not-in-mode)' : 'not-in-mode'}` });
   }
-  // ⛔ 후보가 0개여도 `unavailable` 로 「못 셌다」가 남는다 — 그것이 이 골의 전부다.
+  // 필수 조회 실패는 unavailable, 고아 전용 조회 실패는 orphanScan 으로 별도 관측한다.
   const queryTimings = compactQueryTimings(input.queryTimings);
   return {
     remove,
     preserve,
     orphanedWorktrees,
     orphanedWorktreeSafety,
+    orphanScan,
+    ...(orphanScanFailure ? { orphanScanFailure } : {}),
     unavailable: queryFailed,
     ...(queryStatus ? { queryStatus } : {}),
     ...(queryTimings ? { queryTimings } : {}),
@@ -569,18 +577,22 @@ export function listHarnessBranches(branchPrefix: string, run: GitRunner = defau
   };
 }
 
-export function listAllHarnessBranches(): HarnessCleanQuery<string[]> {
-  const result = git(['for-each-ref', '--format=%(refname:short)', 'refs/heads', 'refs/remotes']);
+export function listAllHarnessBranches(run: GitRunner = defaultGitRunner): HarnessCleanQuery<string[]> {
+  const result = git(['for-each-ref', '--format=%(refname:short)', 'refs/heads', 'refs/remotes'], run);
   return {
     ok: result.ok,
     value: result.ok ? result.out.split('\n').map((s) => s.trim()).filter(Boolean) : [],
   };
 }
 
-export function listDirectoryEntries(paths: readonly string[]): HarnessCleanQuery<Map<string, string[]>> {
+export function listDirectoryEntries(paths: readonly string[], expired: () => boolean = () => false): HarnessCleanQuery<Map<string, string[]>> {
   const entries = new Map<string, string[]>();
   try {
-    for (const path of paths) entries.set(path, readdirSync(path).sort());
+    for (const path of paths) {
+      // Deadline between reads: an unfinished listing is a failed query (orphans stay unjudged), never partial «ok».
+      if (expired()) return { ok: false, value: new Map() };
+      entries.set(path, readdirSync(path).sort());
+    }
     return { ok: true, value: entries };
   } catch {
     return { ok: false, value: new Map() };
@@ -598,39 +610,99 @@ export function listRegisteredWorktreePaths(run: GitRunner = defaultGitRunner): 
     : { ok: false, value: [] };
 }
 
-/** Physical child directories under the **main** repository's worktree parent.
- *  ⛔⭐ 「sibling」이 아니다 — 이제 `configuredWorktreeRoot()` 아래의
- *  `<뿌리>/<repository scope>/<저장소>.worktrees` 다(리뷰 8R should-fix · 동명 저장소 충돌 방지).
- *  Read-only; failure stays distinct from an empty result. */
-export function listHarnessWorktreeDirectories(repoRoot?: string, run: GitRunner = defaultGitRunner, worktreeRoot = configuredWorktreeRoot()): HarnessCleanQuery<string[]> {
-  // ⛔⭐⭐⭐ 뿌리를 `process.cwd()` 로도, `--show-toplevel` 로도 정하지 않는다(리뷰 must-fix).
-  //   ***연결된 worktree 안에서 부르면 `--show-toplevel` 은 그 worktree 를 답한다*** ⇒
-  //   `<linked>.worktrees` 라는 없는 경로를 보고 그 ENOENT 가 「고아 없음」이 된다(실제 고아를 놓친다).
-  //   실측(이 저장소):
-  //     --show-toplevel  → …/monad-agent.worktrees/self-impl-…-54c0b4a0
-  //     --git-common-dir → …/monad-agent/.git          ⇒ 그 부모가 **주 저장소 루트**
-  //   ⇒ `--git-common-dir` 로 주 저장소를 구하고, 못 물으면 **못 셌다**(`ok:false`)로 둔다.
-  const root = repoRoot ?? (() => {
-    const r = gitStdout(['rev-parse', '--path-format=absolute', '--git-common-dir'], run);
-    if (!r.ok || r.value.length === 0) return null;
-    const commonDir = r.value;
-    return basename(commonDir) === '.git' ? dirname(commonDir) : null;
-  })();
-  if (!root) return { ok: false, value: [] };
-  const parent = worktreeParentDir(root, worktreeRoot);
-  try {
-    return {
-      ok: true,
-      value: readdirSync(parent, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => join(parent, entry.name))
-        .sort(),   // ⭐ 결정적 순서
-    };
-  } catch (error) {
-    // ⭐ 뿌리가 확정된 뒤의 ENOENT 는 진짜 「`.worktrees` 가 아직 없다」이므로 성공·빈 목록이 맞다.
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { ok: true, value: [] };
-    return { ok: false, value: [] };
+/** Ownership marker written per harness worktree (`harness-worktree-add.ts` · `readWorktreeProvenance`). */
+const HARNESS_OWNER_CONFIG_KEY = 'elanous.harness.owner';
+
+/** Physical child directories of every relevant harness parent. Read-only; unknown stays distinct from empty. */
+export function listHarnessWorktreeDirectories(
+  repoRoot?: string,
+  run: GitRunner = defaultGitRunner,
+  worktreeRoot = configuredWorktreeRoot(),
+): HarnessCleanQuery<string[]> & { scope?: { rootKind: 'main' | 'bare'; parents: number } } {
+  let rootKind: 'main' | 'bare' = 'main';
+  let missingRegistrations = 0;
+  let roots: string[];
+  if (repoRoot) {
+    roots = [repoRoot];
+  } else {
+    // A linked checkout's top level is not the main root. The common directory identifies it.
+    const common = gitStdout(['rev-parse', '--path-format=absolute', '--git-common-dir'], run);
+    if (!common.ok || !common.value) return { ok: false, value: [], failure: 'directories' };
+    if (basename(common.value) === '.git') {
+      roots = [dirname(common.value)];
+    } else {
+      const bare = gitStdout([`--git-dir=${common.value}`, 'rev-parse', '--is-bare-repository'], run);
+      if (!bare.ok || bare.value !== 'true') return { ok: false, value: [], failure: 'bare-common-dir' };
+      rootKind = 'bare';
+      const registered = listRegisteredWorktreePaths(run);
+      if (!registered.ok) {
+        // Already known to be bare: keep that scope observable even though nothing was read.
+        debug.log('harness.clean', 'directories-scope', { rootKind, candidates: 0, parents: 0, entries: 0, ok: false, failedCode: 'worktree-list' });
+        return { ok: false, value: [], failure: 'directories', scope: { rootKind, parents: 0 } };
+      }
+      // A registered checkout is excluded as a «harness child» only when git records harness
+      // ownership on that worktree (`elanous.harness.owner`, written by harness-worktree-add) —
+      // independent of whether its launching checkout is still registered (review r4).
+      // Path shape alone never excludes (review r2–r3): a human checkout anywhere, or a child whose
+      // marker is absent/unreadable, stays a candidate — its parent is normally ENOENT (adds
+      // nothing), and an unreadable one fails closed. The `.worktrees` parent test below only
+      // narrows which checkouts are worth a git call: every harness child sits directly under one.
+      const markers = gitStdout(['config', '--get', 'extensions.worktreeConfig'], run);
+      const markersPossible = markers.ok && markers.value === 'true';
+      // 'unknown' = the marker could not be read (git exit ≠ 0/1): ownership is undecidable, so the
+      // whole inventory is unknown — never fold it into «no marker» (review r5).
+      const ownership = (path: string): 'harness' | 'not-harness' | 'unknown' => {
+        if (!markersPossible || !basename(dirname(resolve(path))).endsWith('.worktrees')) return 'not-harness';
+        const owner = runGitWithRetry(['-C', path, 'config', '--worktree', '--get', HARNESS_OWNER_CONFIG_KEY], run);
+        if (owner.status === 0) return owner.stdout.trim() ? 'harness' : 'not-harness';
+        return owner.status === 1 ? 'not-harness' : 'unknown';
+      };
+      roots = [];
+      // A registration whose directory is already gone (porcelain `prunable`) is not a candidate:
+      // there is nothing to read under it, and asking git for its marker fails (rc=128 «cannot
+      // change to») — that must not turn into «ownership unreadable» for the whole inventory (review).
+      let missing = 0;
+      for (const path of registered.value) {
+        if (resolve(path) === resolve(common.value)) continue;
+        if (!existsSync(path)) { missing += 1; continue; }
+        const kind = ownership(path);
+        if (kind === 'unknown') {
+          debug.log('harness.clean', 'directories-scope', { rootKind, candidates: 0, parents: 0, entries: 0, missing, ok: false, failedCode: 'ownership-unreadable' });
+          return { ok: false, value: [], failure: 'directories', scope: { rootKind, parents: 0 } };
+        }
+        if (kind === 'not-harness') roots.push(path);
+      }
+      missingRegistrations = missing;
+    }
   }
+  const candidates = [...new Set(roots.map((root) => worktreeParentDir(root, worktreeRoot)))].sort();
+  // `parents` = parents that exist and were actually read (ENOENT candidates are not «seen»).
+  //   On failure it is how many were read before the failing one — the human line never claims
+  //   more than was inspected (review r2 should-fix).
+  let read = 0;
+  const scopeOf = () => (rootKind === 'bare' ? { scope: { rootKind, parents: read } } : {});
+  const entries = new Set<string>();
+  for (const parent of candidates) {
+    try {
+      // A privileged test runner can read mode 000; it is still unreadable for its owner.
+      if (rootKind === 'bare' && (statSync(parent).mode & 0o444) === 0) throw Object.assign(new Error('unreadable'), { code: 'EACCES' });
+      for (const entry of readdirSync(parent, { withFileTypes: true })) {
+        if (entry.isDirectory()) entries.add(join(parent, entry.name));
+      }
+      read += 1;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') continue;
+      // Fail-closed, but not silent: the bare scope stays observable on the failure path.
+      debug.log('harness.clean', 'directories-scope', {
+        rootKind, candidates: candidates.length, parents: read, entries: entries.size, missing: missingRegistrations, ok: false, failedCode: code ?? 'unknown',
+      });
+      return { ok: false, value: [], failure: 'directories', ...scopeOf() };
+    }
+  }
+  const value = [...entries].sort();
+  debug.log('harness.clean', 'directories-scope', { rootKind, candidates: candidates.length, parents: read, entries: value.length, missing: missingRegistrations, ok: true });
+  return { ok: true, value, ...scopeOf() };
 }
 
 export type HarnessPrBranches = {
@@ -699,7 +771,7 @@ export function createGhRunner(spawnGh: GhSpawnSync = spawnSync): GhRunner {
 
 const defaultGhRunner: GhRunner = createGhRunner();
 
-type HarnessPrQuery = HarnessCleanQuery<HarnessPrBranches> & { failure?: string };
+type HarnessPrQuery = Omit<HarnessCleanQuery<HarnessPrBranches>, 'failure'> & { failure?: string; unread?: Set<string> };
 
 const HARNESS_PR_LOOKUP_BATCH_SIZE = 50;
 
@@ -769,13 +841,24 @@ function queryHarnessPrBatch(branches: readonly string[], repo: string | undefin
 export function harnessPrBranches(branches: readonly string[], repo?: string, runGh: GhRunner = defaultGhRunner): HarnessPrQuery {
   const open = new Set<string>();
   const merged = new Set<string>();
+  const unread = new Set<string>();
+  let successful = 0;
+  let failure: string | undefined;
   for (let start = 0; start < branches.length; start += HARNESS_PR_LOOKUP_BATCH_SIZE) {
-    const batch = queryHarnessPrBatch(branches.slice(start, start + HARNESS_PR_LOOKUP_BATCH_SIZE), repo, runGh);
-    if (!batch.ok) return batch;
+    const slice = branches.slice(start, start + HARNESS_PR_LOOKUP_BATCH_SIZE);
+    const batch = queryHarnessPrBatch(slice, repo, runGh);
+    if (!batch.ok) {
+      for (const branch of slice) unread.add(branch);
+      failure ??= batch.failure;
+      continue;
+    }
+    successful++;
     for (const branch of batch.value.open) open.add(branch);
     for (const branch of batch.value.merged) merged.add(branch);
   }
-  return { ok: true, value: { open, merged, truncated: { open: false, merged: false } } };
+  if (!successful && unread.size) return { ...unavailableHarnessPrQuery(failure), unread };
+  return { ok: true, value: { open, merged, truncated: { open: false, merged: false } },
+    ...(unread.size ? { unread, ...(failure ? { failure } : {}) } : {}) };
 }
 
 function parseCommitCount(value: string): number | undefined {
@@ -898,6 +981,10 @@ export interface HarnessCleanResult {
   removed: CleanPlanItem[];
   failed: Array<{ branch: string; error: string }>;
   dryRun: boolean;
+  deferred?: CleanPlanItem[];
+  window?: { offset: number; size: number; total: number; unseenOutsideWindow: number };
+  /** A caller deadline (`expired`) stopped at least one non-git read; the plan is a failed-query subset. */
+  expired?: boolean;
 }
 
 /** 실 정리 — dryRun 이면 계획만. 열린 PR 은 force 아니면 보존. */
@@ -907,6 +994,11 @@ export function execHarnessClean(opts: {
   force?: boolean;
   branchPrefix?: string;
   repo?: string;
+  window?: { offset: number; size: number };
+  /** Only planned items are eligible; remaining items are deferred, not deleted. */
+  shouldRemove?: (item: CleanPlanItem, removed: number) => boolean;
+  /** GC does not force-remove worktrees; existing CLI behavior remains the default. */
+  forceWorktreeRemove?: boolean;
   /** ⭐ git 실행기 주입(테스트 전용 · 무인 리뷰 must-fix). 생략하면 실제 git 이다.
    *  ⛔ 왜 **조회까지** 받나: 측정만 주입하면 배선 테스트가 여전히 **로컬 저장소에 어떤 브랜치가
    *  있는지에 의존**한다. CI·detached checkout 에서는 스코프가 0이 되어 아무것도 못 잰다.
@@ -920,7 +1012,15 @@ export function execHarnessClean(opts: {
   readWorktreeProvenance?: WorktreeProvenanceReader;
   /** Live-directory lookup seam. Defaults to the shared PTY manifest provider. */
   activeDirectoryProvider?: ActiveDirectoryProvider;
+  /** Caller deadline (GC tick budget). Once true, the non-git reads below (worktree directory listing,
+   *  live-directory provider, orphan directory entries) are not started and count as failed queries. */
+  expired?: () => boolean;
 }): HarnessCleanResult {
+  let expiredHit = false;
+  const pastDeadline = (): boolean => {
+    if (opts.expired?.()) { expiredHit = true; return true; }
+    return false;
+  };
   const branchPrefix = opts.branchPrefix ?? WORKTREE_BRANCH_PREFIX;
   const run = opts.run ?? defaultGitRunner;
   // ⭐ git 한 번으로 「걸린 것 · 등록 총수 · detached」를 함께 얻는다(무인 리뷰 4R).
@@ -929,37 +1029,50 @@ export function execHarnessClean(opts: {
   const worktreeSnapshot = worktreesTimed.value;
   const worktrees: HarnessCleanQuery<WorktreeEntry[]> = { ok: worktreeSnapshot.ok, value: worktreeSnapshot.value.entries };
   const branchesTimed = measureQueryMs(() => listHarnessBranches(branchPrefix, run));
-  const branches = branchesTimed.value;
-  // The existing branch listing is the bounded input to PR lookup; no repository-wide PR pagination.
-  const pullRequestsTimed = measureQueryMs(() => harnessPrBranches(branches.value, opts.repo, opts.runGh));
+  const listedBranches = branchesTimed.value;
+  const sorted = [...new Set([...listedBranches.value, ...worktrees.value.map((w) => w.branch)])].sort();
+  const offset = opts.window ? Math.min(Math.max(0, opts.window.offset), sorted.length) : 0;
+  const windowBranches = opts.window ? sorted.slice(offset, offset + Math.max(0, opts.window.size)) : sorted;
+  const selected = new Set(windowBranches);
+  const branches = { ...listedBranches, value: listedBranches.value.filter((branch) => selected.has(branch)) };
+  const scopedWorktrees = worktrees.value.filter((worktree) => selected.has(worktree.branch));
+  // Only branches in this window reach PR lookup and safety measurement.
+  const pullRequestsTimed = measureQueryMs(() => harnessPrBranches(windowBranches, opts.repo, opts.runGh));
   const pullRequests = pullRequestsTimed.value;
-  const directoriesTimed = measureQueryMs(() => listHarnessWorktreeDirectories());
+  // execHarnessClean calls the directory query before planning orphans; for bare repositories
+  // it counts each registered source checkout's harness parent, failing closed if any is unreadable.
+  const directoriesTimed = measureQueryMs((): ReturnType<typeof listHarnessWorktreeDirectories> => pastDeadline()
+    ? { ok: false, value: [], failure: 'directories' } : listHarnessWorktreeDirectories(undefined, run));
   const worktreeDirectories = directoriesTimed.value;
   const registeredTimed = measureQueryMs(() => listRegisteredWorktreePaths(run));
   const registeredWorktreePaths = registeredTimed.value;
-  const activeTimed = measureQueryMs(() => (opts.activeDirectoryProvider ?? listActiveTerminalDirectories)());
+  const activeTimed = measureQueryMs((): HarnessCleanQuery<string[]> => pastDeadline()
+    ? { ok: false, value: [] } : (opts.activeDirectoryProvider ?? listActiveTerminalDirectories)());
   const activeDirectories = activeTimed.value;
-  const orphanBranches = listAllHarnessBranches();
+  const orphanBranches = listAllHarnessBranches(run);
   const provisionalOrphans = worktreeDirectories.ok && registeredWorktreePaths.ok
     ? worktreeDirectories.value.filter((path) => !new Set(registeredWorktreePaths.value.map((registered) => resolve(registered))).has(resolve(path)))
     : [];
-  const orphanDirectoryEntries = listDirectoryEntries(provisionalOrphans);
-  const branchSafety = measureBranchSafety(worktrees.value, branches.value, run);
+  const orphanDirectoryEntries = listDirectoryEntries(provisionalOrphans, pastDeadline);
+  const branchSafety = measureBranchSafety(scopedWorktrees, branches.value, run);
   const queryStatus = {
     worktrees: worktrees.ok,
     branches: branches.ok,
     pullRequests: pullRequests.ok,
     ...(pullRequests.failure ? { pullRequestsFailure: pullRequests.failure } : {}),
     pullRequestsTruncated: pullRequests.value.truncated,
+    pullRequestsUnreadBranches: pullRequests.unread?.size ?? 0,
     directories: worktreeDirectories.ok,
+    ...(!worktreeDirectories.ok ? { directoriesFailure: worktreeDirectories.failure ?? 'directories' as const } : {}),
     registeredWorktrees: registeredWorktreePaths.ok,
     activeDirectories: activeDirectories.ok,
   };
   const plan = planHarnessClean({
-    worktrees: worktrees.value,
+    worktrees: scopedWorktrees,
     branches: branches.value,
-    worktreeDirectories: worktreeDirectories.value,
-    registeredWorktreePaths: registeredWorktreePaths.value,
+    worktreeDirectories: worktreeDirectories.ok ? worktreeDirectories.value : undefined,
+    registeredWorktreePaths: registeredWorktreePaths.ok ? registeredWorktreePaths.value : undefined,
+    pullRequestsUnread: pullRequests.unread,
     activeDirectories: activeDirectories.value,
     orphanBranchQueryOk: orphanBranches.ok,
     orphanBranches: new Set(orphanBranches.value),
@@ -993,7 +1106,7 @@ export function execHarnessClean(opts: {
   plan.scope = {
     branchPrefix,
     matchedWorktrees: worktrees.value.length,
-    matchedBranches: branches.value.length,
+    matchedBranches: listedBranches.value.length,
     // ⛔ 실패면 «싣지 않는다» — 0 으로 접으면 「접두 밖이 없다」와 「못 셌다」가 같은 값이 된다.
     // ⭐ 두 수는 **한 스냅샷**에서 온다(리뷰 `S1`) — 따로 재면 그 사이 변동으로 「안 본 수」가 음수가 된다.
     ...(worktreeSnapshot.ok
@@ -1002,6 +1115,9 @@ export function execHarnessClean(opts: {
         branchlessWorktrees: worktreeSnapshot.value.branchless,
         prunableWorktrees: worktreeSnapshot.value.prunable,
       }
+      : {}),
+    ...(worktreeDirectories.scope?.rootKind === 'bare'
+      ? { bareDirectoryParents: worktreeDirectories.scope.parents }
       : {}),
   };
   const preservedByReason = Object.fromEntries([...new Set(plan.preserve.map((item) => item.reason))]
@@ -1013,6 +1129,8 @@ export function execHarnessClean(opts: {
     preserve: plan.preserve.length,
     preservedByReason,
     orphanedWorktrees: plan.orphanedWorktrees.length,
+    orphanScan: plan.orphanScan,
+    pullRequestsUnreadBranches: queryStatus.pullRequestsUnreadBranches,
     safe: orphanSafety.safe,
     unsafe: orphanSafety.unsafe,
     unknown: orphanSafety.unknown,
@@ -1029,23 +1147,26 @@ export function execHarnessClean(opts: {
     ...(plan.scope.registeredWorktrees === undefined ? {} : { registeredWorktrees: plan.scope.registeredWorktrees }),
     ...(plan.scope.prunableWorktrees === undefined ? {} : { prunableWorktrees: plan.scope.prunableWorktrees }),
   });
-  if (opts.dryRun) return { plan, removed: [], failed: [], dryRun: true };
+  const window = opts.window ? { offset, size: windowBranches.length, total: sorted.length,
+    unseenOutsideWindow: sorted.length - windowBranches.length } : undefined;
+  if (opts.dryRun) return { plan, removed: [], failed: [], dryRun: true,
+    ...(opts.shouldRemove ? { deferred: plan.remove } : {}), ...(window ? { window } : {}), ...(expiredHit ? { expired: true } : {}) };
   const removed: CleanPlanItem[] = [];
   const failed: Array<{ branch: string; error: string }> = [];
+  const deferred: CleanPlanItem[] = [];
   for (const item of plan.remove) {
+    if (opts.shouldRemove && !opts.shouldRemove(item, removed.length)) { deferred.push(item); continue; }
     let ok = true; let err = '';
-    // ⛔⭐⭐⭐ 삭제도 **같은 실행기**로 한다(무인 리뷰 must-fix — 내가 만든 안전 결함).
-    //   조회·측정만 주입받고 삭제는 기본 실행기로 두면, 가짜를 주입한 호출이 `dryRun:false` 일 때
-    //   ***가짜 계획으로 진짜 저장소를 지운다.***
-    //   ⚠️ 정확히 말하면 **쓰기 경로는 전부 주입을 탄다**. 비파괴 조회 하나(`listAllHarnessBranches`)는
-    //     아직 기본 실행기를 쓴다 — 지우지 않으므로 안전 문제는 아니고, 배선 결정성에도 영향이 없다
-    //     (그 값은 고아 **브랜치** 판정에만 쓰인다). 넓히려면 별도 골로.
-    if (item.path) { const r = git(['worktree', 'remove', '--force', item.path], run); if (!r.ok) { ok = false; err = r.out.slice(0, 120); } }
-    const b = git(['branch', '-D', item.branch], run); if (!b.ok) { ok = false; err = err || b.out.slice(0, 120); }
+    // Both lookup and deletion use the same injected git runner.
+    if (item.path) { const r = git(['worktree', 'remove', ...(opts.forceWorktreeRemove === false ? [] : ['--force']), item.path], run); if (!r.ok) { ok = false; err = r.out.slice(0, 120); } }
+    if (ok || opts.forceWorktreeRemove !== false) {
+      const b = git(['branch', '-D', item.branch], run);
+      if (!b.ok) { ok = false; err = err || b.out.slice(0, 120); }
+    }
     if (ok) { removed.push(item); debug.log('harness.clean', 'removed', { branch: item.branch, reason: item.reason, hadWorktree: !!item.path }); }
     else { failed.push({ branch: item.branch, error: err }); debug.log('harness.clean', 'remove-fail', { branch: item.branch, error: err }, { level: 'error' }); }
   }
-  return { plan, removed, failed, dryRun: false };
+  return { plan, removed, failed, dryRun: false, ...(opts.shouldRemove ? { deferred } : {}), ...(window ? { window } : {}), ...(expiredHit ? { expired: true } : {}) };
 }
 
 /** 사람 화면 보존 목록 한도 — 이 수를 넘기면 보존 항목을 더 찍지 않고 생략 사실을 말한다.
@@ -1070,7 +1191,7 @@ export function renderHarnessCleanReport(
   //   실제 워크트리는 `self-impl/` 156개였고, 화면은 그 사실 없이 "정리 대상 없음"만 찍었다.
   const scope = res.plan.scope;
   if (scope) {
-    L.push(`스코프 prefix=${scope.branchPrefix} · 걸린 worktree ${scope.matchedWorktrees} · 브랜치 ${scope.matchedBranches}`);
+    L.push(`스코프 prefix=${scope.branchPrefix} · 걸린 worktree ${scope.matchedWorktrees} · 브랜치 ${scope.matchedBranches}${scope.bareDirectoryParents === undefined ? '' : ` · bare 저장소 · 부모 ${scope.bareDirectoryParents} 곳을 봤다`}`);
     const registered = scope.registeredWorktrees;
     if (registered !== undefined) {
       L.push(`등록 워크트리 ${registered}(primary 포함)${(scope.prunableWorktrees ?? 0) > 0 ? ` · 끊어진 등록 ${scope.prunableWorktrees}` : ''}`);

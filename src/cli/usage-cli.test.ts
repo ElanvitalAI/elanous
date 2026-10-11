@@ -29,6 +29,7 @@ describe('usage runs', () => {
         row({ runId: 'run-a', model: 'm', billingProvider: 'gateway', billing: 'api', hostId: 'h2', outputTokens: 3, cost: { kind: 'unknown' } }),
         row({ runId: 'run-b', model: 'm', billingProvider: 'gateway', billing: 'api', cost: { kind: 'known', usd: 10 } }),
         row({ runId: 'run-a', model: 'm', billingProvider: 'gateway', billing: 'subscription', cost: { kind: 'included', apiEquivalentUsd: 4 } }),
+        row({ origin: 'pod', originalData: JSON.stringify({ runId: 'run-a', model: 'pod-only', billingProvider: 'gateway', billing: 'api', cost: { kind: 'known', usd: 99 } }) }),
         row({ runId: 'run-a' }, 'llm.other'), row('{broken'),
       ];
     };
@@ -44,6 +45,65 @@ describe('usage runs', () => {
     ]);
     expect((await run(['runs'], read))[0]).toContain('unknownCostCalls=1');
     expect(await run(['runs', '--run', 'missing', '--json'], read)).toEqual(['[]']);
+  });
+
+  it('aggregates stage, model, and account axes and keeps missing axes in a (none) bucket', async () => {
+    const read = () => [
+      row({ runId: 'a', stage: 'authoring', role: 'planning', model: 'm-author', account: 'acct-a', inputTokens: 2 }),
+      row({ runId: 'b', role: 'implement', model: 'm-impl', account: 'acct-b', outputTokens: 3 }),
+      row({ runId: 'c', inputTokens: 5 }),
+      row({ origin: 'pod', originalData: JSON.stringify({ runId: 'd', model: 'm-pod', account: 'acct-a', role: 'review', inputTokens: 7 }) }),
+      row({ runId: 'e', role: 'gate', model: 'm-gate', account: 'acct-c', inputTokens: 11 }),
+      row({ runId: 'f', role: 'research', model: 'm-other', account: 'acct-d', inputTokens: 13 }),
+      row({ runId: 'g', stage: 'custom', model: 'm-custom', account: 'acct-e', inputTokens: 17 }),
+      row({ runId: 'h', role: 'planning', model: 'm-plan', account: 'acct-f', inputTokens: 19 }),
+    ];
+    const byStage = JSON.parse((await run(['runs', '--by', 'stage', '--json'], read))[0]!);
+    const stages = Object.fromEntries(byStage.map((entry: { stage: string }) => [entry.stage, entry]));
+    expect(stages).toMatchObject({
+      authoring: { calls: 2, inputTokens: 21 },
+      implement: { calls: 1, outputTokens: 3 },
+      '(none)': { calls: 1, inputTokens: 5 },
+      review: { calls: 1, inputTokens: 7 },
+      gate: { calls: 1, inputTokens: 11 },
+      '기타': { calls: 2, inputTokens: 30 },
+    });
+    expect(byStage).toHaveLength(6);
+
+    const byModel = JSON.parse((await run(['runs', '--by', 'model', '--json'], read))[0]!);
+    expect(byModel).toMatchObject([
+      { model: 'm-author', calls: 1 },
+      { model: 'm-impl', calls: 1 },
+      { model: '(none)', calls: 1 },
+      { model: 'm-pod', calls: 1 },
+      { model: 'm-gate', calls: 1 },
+      { model: 'm-other', calls: 1 },
+      { model: 'm-custom', calls: 1 },
+      { model: 'm-plan', calls: 1 },
+    ]);
+
+    const byAccount = JSON.parse((await run(['runs', '--by', 'account', '--json'], read))[0]!);
+    expect(byAccount).toMatchObject([
+      { account: 'acct-a', calls: 2 },
+      { account: 'acct-b', calls: 1 },
+      { account: '(none)', calls: 1 },
+      { account: 'acct-c', calls: 1 },
+      { account: 'acct-d', calls: 1 },
+      { account: 'acct-e', calls: 1 },
+      { account: 'acct-f', calls: 1 },
+    ]);
+  });
+
+  it('rejects invalid --by values before reading logs', async () => {
+    const lines: string[] = [];
+    const command = new Command();
+    registerUsageCommand(command, {
+      readRunLogs: () => { throw new Error('reader called'); },
+      out: { log: (line) => lines.push(line) },
+      exit: (code) => { throw new Error(`exit ${code}`); },
+    });
+    await expect(command.parseAsync(['usage', 'runs', '--by', 'invalid'], { from: 'user' })).rejects.toThrow('exit 2');
+    expect(lines).toEqual(['⛔ --by 는 run | role | stage | model | account']);
   });
 
   it('rejects invalid --since before reading the store', async () => {

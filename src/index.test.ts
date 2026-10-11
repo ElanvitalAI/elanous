@@ -3943,6 +3943,8 @@ describe('harness orchestrate canonical entrance capability', () => {
     'orchestrate',
     'plan',
     'processes',
+    // 📈 도는 런 진도 표 — `harness progress`(RUN-PROGRESS-TRACE #26232).
+    'progress',
     // 📋 자리별 발사 대기열 — `harness queue`(AUTOQ-LOOP #23651).
     'queue',
     'replay',

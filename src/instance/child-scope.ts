@@ -2,7 +2,7 @@ import { debug } from '../debug/log.js';
 import { getUserConfig, type SelfImplementChildInstanceMode } from '../user-config.js';
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { effectiveInstanceRoot, prodInstanceRoot, treeDerivedRootFor } from './resolve.js';
+import { effectiveInstanceRoot, prodInstanceRoot, measureUniverse, treeDerivedRootFor, universeMismatch, type UniverseMeasure } from './resolve.js';
 
 interface ChildInstanceScope {
   configDir?: string;
@@ -69,6 +69,33 @@ function instanceScopeLog(event: string, data: Record<string, unknown>, warn = f
   debug.log('instance.identity', event, data, warn ? { level: 'warn' } : undefined);
 }
 
+/**
+ * 부모가 도장(`ELANOUS_STATE_DIR`)으로 물려준 우주와 이 프로세스가 실제로 쓰는 우주를 대조한다.
+ * 다르면 `instance.identity universe-mismatch` 경고 한 줄을 남긴다 — 막지 않고 적기만 한다.
+ * 도장이 없으면(사람이 직접 띄운 입구) 비교할 부모가 없으므로 조용하다.
+ */
+export function observeUniverseMismatch(
+  deps: { stamp?: string | undefined; effectiveRoot?: () => string; log?: ChildInstanceScopeDeps['log'] } = {},
+): { parentRoot: string; childRoot: string } | null {
+  const stamp = 'stamp' in deps ? deps.stamp : process.env.ELANOUS_STATE_DIR;
+  const mismatch = universeMismatch(stamp, (deps.effectiveRoot ?? effectiveInstanceRoot)());
+  if (mismatch) (deps.log ?? instanceScopeLog)('universe-mismatch', { ...mismatch, why: 'child resolved a different universe than the one its parent stamped' }, true);
+  return mismatch;
+}
+
+/**
+ * 읽을 우주가 비어 있으면 «0» 이 아니라 «측정 불가(빈 우주)» 라고 `instance.identity universe-unmeasurable` 로 적는다.
+ * 새 test 우주는 늘 비어 있으므로 경고(warn)가 아니라 정보 한 줄이다 — 막지 않고 적기만 한다.
+ */
+export function observeEmptyUniverse(
+  root: string,
+  deps: { entries?: (dir: string) => string[]; log?: ChildInstanceScopeDeps['log'] } = {},
+): UniverseMeasure {
+  const measure = measureUniverse(root, deps.entries);
+  if (!measure.measurable) (deps.log ?? instanceScopeLog)('universe-unmeasurable', { root, reason: measure.reason, why: '읽을 우주가 비어 있어 0 이 아니라 측정 불가로 취급한다' });
+  return measure;
+}
+
 /** Resolve the current universe once; operational parents derive an isolated child universe by default. */
 export function childInstanceScope(deps: ChildInstanceScopeDeps = {}): ChildInstanceScope {
   const elanousBinRoot = resolve(import.meta.dir, '../..');
@@ -77,6 +104,10 @@ export function childInstanceScope(deps: ChildInstanceScopeDeps = {}): ChildInst
   const parentIsProduction = root === prodRoot;
   const mode = (deps.childInstanceMode ?? configuredChildInstanceMode)();
   const log = deps.log ?? instanceScopeLog;
+  if (!deps.effectiveRoot) {
+    observeUniverseMismatch({ effectiveRoot: () => root, log });
+    observeEmptyUniverse(root, { log });
+  }
 
   const readProvider = deps.rawProviderAt ?? rawLlmProviderAt;
   /** 자식이 갈 우주의 provider 가 운영과 어긋나는지 «한 칸»으로 남긴다. 판정하지 않고 적기만 한다. */

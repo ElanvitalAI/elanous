@@ -5,6 +5,9 @@ import { effectiveInstanceRoot, prodInstanceRoot, treeDerivedRootFor } from '../
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { buildUserConfig, getUserConfig, type UserConfig } from '../user-config.js';
 import { resolveCodexQuotaPolicy } from '../oauth/codex-quota-policy.js';
+import { debug } from '../debug/log.js';
+import type { PoolLeaseRecommendation } from '../task-orchestrator/surfaces/pod-lease.js';
+import type { PodPoolMember, PoolKubectl } from '../task-orchestrator/surfaces/pod-pool.js';
 
 /** Key-order-insensitive JSON so equal per-account caps written in another order do not warn. */
 function stableJson(value: unknown): string {
@@ -79,22 +82,154 @@ export interface ResolvedHarnessSubstrate {
   source: 'flag' | 'config' | 'default';
 }
 
-/** Only inspect the current context when no explicit pool is available. Never turn a failed Pod selection into local. */
+/** Conservative local headroom for one standard harness goal (the Pod lease's default per-goal size). */
+export const AUTO_LOCAL_MIN_AVAILABLE_MEMORY_BYTES = 16 * 1024 ** 3;
+
+export interface AutoSubstrateSignals {
+  /** A blocked memory admission has recommended=0 and limitedBy=memory; unknown is not blocked. */
+  podAdmission: Pick<PoolLeaseRecommendation, 'recommended' | 'limitedBy'> | null;
+  load1: number | null;
+  cores: number | null;
+  availableMemoryBytes: number | null;
+  localLaneOpen: boolean;
+}
+
+export interface AutoSubstrateDecision {
+  substrate: HarnessSubstrate;
+  reason: string;
+}
+
+export interface NextLocalLaneCapInput {
+  current: number;
+  wanted: number;
+  lastRaisedAtMs: number | null;
+  nowMs: number;
+  load1: number | null;
+  cores: number | null;
+}
+
+export interface NextLocalLaneCapDecision {
+  cap: number;
+  action: 'raise' | 'hold' | 'lower';
+  reason: string;
+}
+
+/** Decide one conservative local-lane cap adjustment from the current observations. */
+export function nextLocalLaneCap({ current, wanted, lastRaisedAtMs, nowMs, load1, cores }: NextLocalLaneCapInput): NextLocalLaneCapDecision {
+  let decision: NextLocalLaneCapDecision;
+  if (load1 === null || cores === null || !Number.isFinite(load1) || !Number.isFinite(cores) || load1 < 0 || cores <= 0) {
+    decision = { cap: current, action: 'hold', reason: 'load-unreadable' };
+  } else if (load1 >= cores) {
+    decision = { cap: Math.max(0, current - 5), action: 'lower', reason: 'local-load-overloaded' };
+  } else if (!Number.isFinite(current) || !Number.isFinite(wanted) || !Number.isFinite(nowMs)) {
+    decision = { cap: current, action: 'hold', reason: 'cap-or-time-unreadable' };
+  } else if (wanted <= current) {
+    decision = { cap: current, action: 'hold', reason: 'no-increase-requested' };
+  } else if (load1 >= cores / 2) {
+    decision = { cap: current, action: 'hold', reason: 'local-load-not-spare' };
+  } else if (lastRaisedAtMs !== null && (!Number.isFinite(lastRaisedAtMs) || nowMs - lastRaisedAtMs < 15 * 60 * 1000)) {
+    decision = { cap: current, action: 'hold', reason: 'raise-cooldown' };
+  } else {
+    decision = { cap: Math.min(wanted, current + 5), action: 'raise', reason: 'local-load-spare' };
+  }
+  debug.log('harness.guardian', 'lane-step', { current, wanted, lastRaisedAtMs, nowMs, load1, cores, ...decision });
+  return decision;
+}
+
+/** Pure routing judgment. Missing/invalid observations are not evidence that the host has room. */
+export function routeAutoSubstrate(signals: AutoSubstrateSignals): AutoSubstrateDecision {
+  const { podAdmission, load1, cores, availableMemoryBytes, localLaneOpen } = signals;
+  if (podAdmission === null || podAdmission.recommended === null || podAdmission.limitedBy === null)
+    return { substrate: 'pod', reason: 'pod-admission-unobserved' };
+  if (podAdmission.recommended !== 0 || podAdmission.limitedBy !== 'memory')
+    return { substrate: 'pod', reason: 'pod-admission-not-memory-blocked' };
+  if (!localLaneOpen) return { substrate: 'pod', reason: 'local-lane-closed' };
+  if (cores === null || !Number.isFinite(cores) || cores <= 0 || load1 === null || !Number.isFinite(load1) || load1 < 0 || load1 >= cores / 2)
+    return { substrate: 'pod', reason: 'local-load-not-spare' };
+  if (availableMemoryBytes === null || !Number.isFinite(availableMemoryBytes) || availableMemoryBytes < AUTO_LOCAL_MIN_AVAILABLE_MEMORY_BYTES)
+    return { substrate: 'pod', reason: 'local-memory-not-spare' };
+  return { substrate: 'local', reason: 'pod-memory-blocked-local-spare' };
+}
+
+/**
+ * POD-POOL-UNCAPPED-SPEC — the pre-launch pool check of an «implicit» Pod pool (the current kube context),
+ * reported in context names. `unmeasured` = kubectl itself could not run, so nothing was measured:
+ * «unknown» is not «unfit» (same rule as LAUNCH-STALL's unreadable member memory).
+ */
+export interface HarnessPoolCheck {
+  ok: boolean;
+  ready: string[];
+  dropped: { context: string; reason: string }[];
+  unmeasured?: string | null;
+}
+
+/** `checkPodPool` over one pool spec — a kube context that cannot answer before launch is refused, not silently kept. */
+export function checkHarnessPodPool(pool: string, run?: PoolKubectl): HarnessPoolCheck {
+  // Lazy require: the Pod surface pulls `bun:ffi`, and only a Pod launch without an explicit pool needs it.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const surface = require('../task-orchestrator/surfaces/pod-pool.js') as typeof import('../task-orchestrator/surfaces/pod-pool.js');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const leaseKubectl = run ?? (require('../task-orchestrator/surfaces/pod-lease.js') as typeof import('../task-orchestrator/surfaces/pod-lease.js')).leaseKubectl;
+  let members: PodPoolMember[];
+  try { members = surface.parsePodPool(pool); }
+  catch (error) {
+    return { ok: false, ready: [], dropped: [{ context: pool, reason: error instanceof Error ? error.message : String(error) }] };
+  }
+  let calls = 0;
+  let unrunnable = 0;
+  const kubectl: PoolKubectl = (args, input) => {
+    const r = leaseKubectl(args, input);
+    calls++;
+    // Only «kubectl is not installed» (spawn ENOENT) is no verdict about the cluster. A kubectl that started but
+    // timed out (status null · ETIMEDOUT) is a cluster that did not answer — that stays a measured refusal.
+    if (r.status === null && /\bENOENT\b/.test(r.stderr)) unrunnable++;
+    return r;
+  };
+  const checked = surface.checkPodPool(members, kubectl);
+  if (!checked.ok && calls > 0 && unrunnable === calls) return { ok: true, ready: [], dropped: checked.dropped, unmeasured: 'kubectl 을 실행할 수 없다' };
+  return { ok: checked.ok, ready: checked.ready.map((m) => m.context), dropped: checked.dropped };
+}
+
+/** Only inspect the current context when no explicit pool is available. Never turn an explicit Pod selection into local. */
 export function resolveHarnessSubstrate({ flag, config, env, currentContext = () => {
   const result = spawnSync('kubectl', ['config', 'current-context'], { encoding: 'utf8', timeout: 5000 });
   return result.status === 0 ? result.stdout?.trim() : undefined;
-} }: {
-  flag?: { substrate?: HarnessSubstrate; podPool?: string };
+}, autoSignals, poolCheck = checkHarnessPodPool }: {
+  flag?: { substrate?: HarnessSubstrate | 'auto'; podPool?: string };
   config?: Pick<UserConfig, 'harness' | 'pod'>;
   env?: NodeJS.ProcessEnv;
   currentContext?: () => string | undefined;
+  /** Signals must come from the launch host and Pod admission, not a worktree's cached config. */
+  autoSignals?: AutoSubstrateSignals;
+  /** POD-POOL-UNCAPPED-SPEC — pre-launch check of the implicit kube context; tests inject it instead of shelling out. */
+  poolCheck?: (pool: string) => HarnessPoolCheck;
 }): ResolvedHarnessSubstrate {
-  const substrate = flag?.substrate ?? config?.harness?.substrate ?? 'local';
-  if (substrate !== 'local' && substrate !== 'pod') throw new Error('harness.substrate: local 또는 pod 만 허용한다');
+  const requested = flag?.substrate ?? config?.harness?.substrate ?? 'local';
+  if (requested !== 'local' && requested !== 'pod' && requested !== 'auto') throw new Error('harness.substrate: local, pod 또는 auto 만 허용한다');
   const source = flag?.substrate ? 'flag' : config?.harness?.substrate ? 'config' : 'default';
+  // Missing signals mean admission was not observed, not that the Pod has room.
+  const decision = requested === 'auto' ? routeAutoSubstrate(autoSignals ?? {
+    podAdmission: null, load1: null, cores: null, availableMemoryBytes: null, localLaneOpen: false,
+  }) : null;
+  const substrate: HarnessSubstrate = requested === 'auto' ? decision!.substrate : requested;
+  if (decision) debug.log('harness.substrate', 'route', { substrate, reason: decision.reason, source });
   if (substrate === 'local') return { substrate, pool: null, source };
-  const pool = flag?.podPool?.trim() || env?.ELANOUS_POD_POOL?.trim() || config?.harness?.podPool?.trim() || config?.pod?.pool?.trim() || currentContext()?.trim();
-  if (!pool) throw new Error('harness.substrate=pod: Pod 풀 또는 현재 컨텍스트에 닿지 못했다 — 풀을 설정하거나 `--substrate local` 로 명시하라');
+  const explicit = flag?.podPool?.trim() || env?.ELANOUS_POD_POOL?.trim() || config?.harness?.podPool?.trim() || config?.pod?.pool?.trim();
+  const pool = explicit || currentContext()?.trim();
+  if (!pool) throw new Error(`harness.substrate=${decision ? `auto→pod(${decision.reason})` : 'pod'}: Pod 풀 또는 현재 컨텍스트에 닿지 못했다 — 풀을 설정하거나 \`--substrate local\` 로 명시하라`);
+  // POD-POOL-UNCAPPED-SPEC — an explicit pool is the operator's own statement and gets `checkPodPool` at the launch
+  //   site (`src/index.ts` self orchestrate · `src/loops/orchestrator/tick.ts` · `pod-command-job.ts`). The implicit
+  //   kube context had no such gate: a context whose cluster is gone, or whose `elanous-test` namespace is missing,
+  //   sailed through here and then sat on `recommended=0` for 35 minutes (10-10 probe, 6 runs). Check before launch.
+  if (!explicit) {
+    const checked = poolCheck(pool);
+    debug.log('harness.substrate', 'pool-check', { pool, origin: 'current-context', ok: checked.ok, ready: checked.ready, dropped: checked.dropped, unmeasured: checked.unmeasured ?? null });
+    if (!checked.ok) {
+      const why = checked.dropped.map((d) => `${d.context}: ${d.reason}`).join(' · ') || '노드가 하나도 준비되지 않았다';
+      throw new Error(`harness.substrate=pod: 현재 컨텍스트 「${pool}」 이 발사 전 풀 점검을 넘지 못했다 — ${why} · 풀을 설정하거나 \`--substrate local\` 로 명시하라`);
+    }
+    if (checked.unmeasured) debug.log('harness.substrate', 'pool-check-unmeasured', { pool, reason: checked.unmeasured }, { level: 'warn' });
+  }
   return { substrate, pool, source };
 }
 

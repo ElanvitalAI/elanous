@@ -32,6 +32,11 @@ export interface LLMUsage {
   /** provider 가 «응답에 실어 보낸» 실제 청구액(USD) — OpenRouter `usage.cost`(요청에 `usage:{include:true}`).
    *  ⭐ 추정(카탈로그 단가)이 아니라 청구 사실이다 — 비용 판정이 이것을 먼저 쓴다(BACKLOG C7). */
   reportedCostUsd?: number;
+  /** OR-BYOK-COST — OpenRouter `usage.is_byok === true`(상류 키로 청구된 호출 · OR `cost` 는 0). */
+  byok?: true;
+  /** OR-BYOK-COST — OpenRouter `usage.cost_details.upstream_inference_cost`(상류 키로 실제 청구된 USD).
+   *  ⛔ 칸이 없거나 숫자가 아니면 «없다»(=미상) — 0 으로 꾸미지 않는다. */
+  upstreamCostUsd?: number;
 }
 
 /** Back-compat alias for callers that imported `AnthropicUsage` from

@@ -2,7 +2,7 @@
 
 **S:** Elanous sends `/v1/outbound` messages through Telegram by default. It also has a Discord webhook sender and a Pushcut sender. The existing `routes`/`awayRoutes` fan out to the listed channels.
 
-**C:** The connector comparison in [RESEARCH-plugins-connectors-baseline](../../../내부 문서 `RESEARCH-plugins-connectors-baseline-2026-09-30`) observes Hermes `plugins/platforms/*` and OpenClaw `extensions/<channel>/openclaw.plugin.json`, with auth-dependent chat connectors dormant until configured. Elanous likewise must not imply that declaring a channel activates an uninstalled connector. Outbound webhook delivery is not a full messaging bot: Discord webhook sends cannot read messages, handle slash commands, or acknowledge buttons. Telegram's inbound bot commands use a separate poller. The outbound router now dispatches built-in senders through a common adapter registry, but this does not migrate all inbound consumers.
+**C:** An internal connector comparison observes Hermes `plugins/platforms/*` and OpenClaw `extensions/<channel>/openclaw.plugin.json`, with auth-dependent chat connectors dormant until configured. Elanous likewise must not imply that declaring a channel activates an uninstalled connector. Outbound webhook delivery is not a full messaging bot: Discord webhook sends cannot read messages, handle slash commands, or acknowledge buttons. Telegram's inbound bot commands use a separate poller. The outbound router now dispatches built-in senders through a common adapter registry, but this does not migrate all inbound consumers.
 
 **Q:** How do I provision and check these senders without assuming an unsupported channel works?
 

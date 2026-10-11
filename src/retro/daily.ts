@@ -13,10 +13,10 @@
  * RFC: 내부 문서 `RFC-retro-loop-daily-weekly-insight-2026-10-07` §1 (§0 표가 첫 판의 정답지).
  */
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
+import { spawnElanousSync } from '../instance/spawn-elanous.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { getUserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
@@ -251,10 +251,10 @@ export type RetroDeps = { now?: Date; readFacts?: (since: string, root: string) 
 const repoRoot = resolve(import.meta.dir, '..', '..');
 
 function readFactsViaCli(since: string, root: string, configDir: string, repo = repoRoot): unknown {
-  const args = ['bin/elanous.mjs', ...(root === prodInstanceRoot() ? [] : [`--test=${root}`]), 'retro', 'facts', '--since', since, '--json', '--config-dir', resolve(configDir)];
-  const result = spawnSync('bun', args, { cwd: repo, encoding: 'utf8', timeout: 570_000, maxBuffer: 64 * 1024 * 1024 });
-  if (result.error || result.status !== 0) throw new Error(`retro facts failed: ${result.error?.message || result.stderr?.trim() || `exit ${result.status ?? 'unknown'}`}`);
-  return JSON.parse(result.stdout);
+  const args = [...(root === prodInstanceRoot() ? [] : [`--test=${root}`]), 'retro', 'facts', '--since', since, '--json', '--config-dir', resolve(configDir)];
+  const result = spawnElanousSync(args, { bin: join(repo, 'bin/elanous.mjs'), stateDir: root, cwd: repo, encoding: 'utf8', timeout: 570_000, maxBuffer: 64 * 1024 * 1024 });
+  if (result.error || result.status !== 0) throw new Error(`retro facts failed: ${result.error?.message || String(result.stderr ?? '').trim() || `exit ${result.status ?? 'unknown'}`}`);
+  return JSON.parse(String(result.stdout));
 }
 
 /** 최근 판 열 개의 체크리스트에서 green/done 칸을 모은다(예: DRAFT3 0.2.12 · DRAFT-TRIAGE 0.2.18). 못 읽은 판은 건너뛴다. */

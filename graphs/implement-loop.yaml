@@ -32,6 +32,9 @@
 #   ⛔⭐ 그리고 ***「거른 뒤의 가장 이른 행」을 「원장의 바닥」으로 읽지 마라*** — 그 둘은 다른 값이다.
 #      바닥을 재려면 그 «필터를 빼고» 같은 이벤트의 가장 이른 행을 본다.
 
+# L0 여정 단계 목록(journey_stage 닫힌 집합) — 노드별 선언 커버리지의 분모.
+# 입구 · 저작 · 배치 · 실행 · 착지 · 실패 갈래 · 종료 (RFC ARG §L0).
+journey_stages: [entry, author, dispatch, run, land, recover, end]
 # ⛔⭐ `graph_id` 는 «원장의 조인 키»다 — 바꾸면 옛 표본과 «비교 불가»가 된다.
 #   📏 2026-09-08 실측: 원장에 graphId="self-implement" 로 15건이 이미 쌓였다.
 #   📌 RFC §4.2 는 이 템플릿을 `implement-loop` 이라 불렀지만, ***코드·원장이 쓰는 이름이 canonical***이다.
@@ -72,6 +75,7 @@ runner_inputs: [ask_text, goal, worktree, branch, review-intent, head-sha, base-
 nodes:
   - node_id: author
     group: author
+    journey_stage: author
     kind: agent
     recipe: goal-author
     max_visits: 2
@@ -84,6 +88,7 @@ nodes:
 
   - node_id: plan
     group: author
+    journey_stage: author
     kind: agent
     recipe: harness-plan-rfc
     max_visits: 2
@@ -96,6 +101,7 @@ nodes:
 
   - node_id: decompose
     group: author
+    journey_stage: author
     kind: judge
     recipe: fabric-decompose-adapter
     max_visits: 12
@@ -108,6 +114,7 @@ nodes:
 
   - node_id: implement
     group: build
+    journey_stage: run
     kind: agent
     recipe: headless-goal-loop        # seams.implement → 자식 PTY
     max_visits: 12
@@ -122,6 +129,7 @@ nodes:
 
   - node_id: gate
     group: verify
+    journey_stage: run
     kind: gate
     recipe: gate-baseline              # 변경 파일 «범위» · 새 회귀만
     max_visits: 11
@@ -136,6 +144,7 @@ nodes:
 
   - node_id: review
     group: verify
+    journey_stage: run
     kind: judge
     recipe: pr-reviewer                # agent-substrate/pr-reviewer
     max_visits: 11
@@ -150,6 +159,7 @@ nodes:
 
   - node_id: rework
     group: verify
+    journey_stage: run
     kind: agent
     recipe: headless-goal-loop         # 같은 루프의 다음 라운드
     max_visits: 10
@@ -164,6 +174,7 @@ nodes:
 
   - node_id: main-sync
     group: land
+    journey_stage: land
     kind: git
     recipe: seams-git-merge-main       # LLM 충돌해결 포함
     max_visits: 2
@@ -176,6 +187,7 @@ nodes:
 
   - node_id: regate
     group: land
+    journey_stage: land
     kind: gate
     recipe: gate-baseline              # 충돌해결 «뒤» 재-gate
     max_visits: 2
@@ -188,6 +200,7 @@ nodes:
 
   - node_id: open-pr
     group: land
+    journey_stage: land
     kind: git
     recipe: seams-gh-open-pr
     # 📏 실측 2026-09-08 (원장 30일 · 전 우주 · 걸음 191개 소급 계산):
@@ -204,6 +217,7 @@ nodes:
 
   - node_id: merge
     group: land
+    journey_stage: land
     kind: git
     recipe: seams-gh-merge-squash
     # 📏 실측 2026-09-08 (원장 30일 · 전 우주 · 걸음 191개 소급 계산):
@@ -222,6 +236,7 @@ nodes:
   # ───────── 여정 앞단: 입구 → 대기열 → 발사 관문 → 배치 ─────────
   - node_id: intake
     group: entry
+    journey_stage: entry
     kind: observe
     recipe: harness-entrance            # src/harness/harness-cli-command.ts (say · ask · TUI /harness)
     max_visits: 1
@@ -233,6 +248,7 @@ nodes:
 
   - node_id: queue
     group: entry
+    journey_stage: entry
     kind: gate
     recipe: harness-queue               # src/harness/harness-queue.ts (directSay 플래그 · 기본 끔 → 건너뜀)
     max_visits: 1
@@ -244,6 +260,7 @@ nodes:
 
   - node_id: launch-gate
     group: entry
+    journey_stage: entry
     kind: gate
     recipe: pre-launch-gate             # harness-cli-command.ts preLaunchGate (예산 · 같은 골 활성 런)
     max_visits: 1
@@ -255,6 +272,7 @@ nodes:
 
   - node_id: dispatch
     group: dispatch
+    journey_stage: dispatch
     kind: judge
     recipe: harness-substrate-select    # resolveLaunchSubstrate → substrate = local | pod
     max_visits: 2
@@ -267,6 +285,7 @@ nodes:
   # ───────── Pod 배치 (substrate == pod 일 때만 — local 은 건너뛴다) ─────────
   - node_id: pool-admit
     group: dispatch-pod
+    journey_stage: dispatch
     kind: gate
     recipe: pod-pool-admission          # src/task-orchestrator/surfaces/self-implement-pod.ts (입장 · 멤버 슬롯 · 메모리 등급)
     max_visits: 4
@@ -278,6 +297,7 @@ nodes:
 
   - node_id: image-sync
     group: dispatch-pod
+    journey_stage: dispatch
     kind: gate
     recipe: pod-pool-image-sync         # src/task-orchestrator/surfaces/pod-pool.ts syncPoolImages (멤버별 · pack 한 번)
     max_visits: 4
@@ -289,6 +309,7 @@ nodes:
 
   - node_id: credential-refresh
     group: dispatch-pod
+    journey_stage: dispatch
     kind: gate
     recipe: pod-credential-prerefresh   # self-implement-pod.ts podCodexCredentialWithPrerefresh
     max_visits: 4
@@ -301,6 +322,7 @@ nodes:
   # ───────── 착지: 동결 검사 → (보류) → 병합 → 회수 ─────────
   - node_id: freeze-check
     group: land
+    journey_stage: land
     kind: gate
     recipe: landing-freeze-admission    # src/self-implement/frozen-merges.ts admitLandingMerge (병합 직전 한 곳)
     max_visits: 4
@@ -312,6 +334,7 @@ nodes:
 
   - node_id: hold
     group: land
+    journey_stage: land
     kind: hitl
     recipe: frozen-merge-queue          # frozen-merges.ts queueFrozenMerge → sweepFrozenMerges 가 해제 뒤 재개
     max_visits: 4
@@ -323,6 +346,7 @@ nodes:
 
   - node_id: cleanup
     group: land
+    journey_stage: land
     kind: git
     recipe: post-merge-cleanup          # src/self-implement/orchestrator.ts (워크트리 ⊕ 브랜치 회수)
     max_visits: 1
@@ -335,6 +359,7 @@ nodes:
   # ───────── 실패 쪽: 결과 해석 → 수확 → heal → 다음 한 수 ─────────
   - node_id: result-parse
     group: recover
+    journey_stage: recover
     kind: observe
     recipe: pod-failure-reason          # src/task-orchestrator/surfaces/pod-failure-reason.ts
     max_visits: 4
@@ -346,6 +371,7 @@ nodes:
 
   - node_id: salvage
     group: recover
+    journey_stage: recover
     kind: git
     recipe: salvage-branch              # salvage/si-task-<job>/… (Pod Job 이 push · salvage-branches.ts 가 읽는다)
     max_visits: 4
@@ -355,8 +381,11 @@ nodes:
       tools: git-write
       outputs: [salvage_ref]
 
+  # 🩹 멈춤 갈래(stop_class)별 처방 노드는 «여기 없다» — 런타임 오버레이 `graphs/overlays/stop-heal-ladder.yaml` 이
+  #   `heal` 에서 `on: stop_class` 간선으로 갈라지는 노드(id = 처방 이름)를 얹는다. 읽는 쪽 = `stop-autoheal.ts`.
   - node_id: heal
     group: recover
+    journey_stage: recover
     kind: judge
     recipe: heal-intake                 # src/self-implement/heal-intake.ts (호스트에서만)
     max_visits: 4
@@ -368,6 +397,7 @@ nodes:
 
   - node_id: next-move
     group: recover
+    journey_stage: recover
     kind: judge
     recipe: task-agent-judge            # src/task-agent/judge.ts (판단부 → 실행부)
     max_visits: 4
@@ -379,6 +409,7 @@ nodes:
 
   - node_id: stopped
     group: end
+    journey_stage: end
     kind: observe
     recipe: journey-stopped             # 거절·포기 — 종결
     max_visits: 1

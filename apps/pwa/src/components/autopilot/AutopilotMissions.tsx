@@ -14,7 +14,10 @@ import {
   AutopilotApi, EXECUTION_MODEL_META, missionSchedulesHref,
   type MissionSummary, type MissionTrace, type DerivedStatus, type DerivedJob, type TriageResult,
 } from '@/lib/autopilot-api';
-import { missionStaleness } from '@/lib/mission-staleness';
+import {
+  MISSION_ROLLUP_UNMEASURED_HINT, isMissionTerminalStatus, missionRollupLabel,
+  missionStaleChip, missionStaleHint, missionStaleness,
+} from '@/lib/mission-staleness';
 
 const STATUS_META: Record<DerivedStatus, { icon: string; tone: string; label: string }> = {
   ok: { icon: '✅', tone: 'text-emerald-300', label: '정상' },
@@ -42,12 +45,20 @@ function TaskProgressChips({ counts, total }: { counts?: Record<string, number>;
 }
 
 function RollupChips({ r }: { r: MissionSummary['derived'] }) {
-  if (!r || r.total === 0) return <span className="text-xs text-muted-foreground">파생 0</span>;
+  // ⚠️ «파생 미측정»(롤업 결손)과 «파생 0»(실측 0건)은 다른 값 — 문면은 lib SSOT(missionRollupLabel).
+  if (!r || r.total === 0) {
+    return (
+      <span
+        className="text-xs text-muted-foreground"
+        {...(r ? {} : { title: MISSION_ROLLUP_UNMEASURED_HINT })}
+      >{missionRollupLabel(r)}</span>
+    );
+  }
   const chip = (n: number, s: DerivedStatus) =>
     n > 0 ? <span key={s} className={['text-xs', STATUS_META[s].tone].join(' ')}>{STATUS_META[s].icon}{n}</span> : null;
   return (
     <span className="flex items-center gap-1.5">
-      <span className="text-xs text-muted-foreground">파생 {r.total}</span>
+      <span className="text-xs text-muted-foreground">{missionRollupLabel(r)}</span>
       {chip(r.ok, 'ok')}{chip(r.stale, 'stale')}{chip(r.error, 'error')}{chip(r.active, 'active')}{chip(r.pending, 'pending')}
     </span>
   );
@@ -102,13 +113,21 @@ function MaterializeForm({ api, m, onDone }: { api: AutopilotApi; m: MissionSumm
   );
 }
 
-function MissionCard({ api, m }: { api: AutopilotApi; m: MissionSummary }) {
+// ⚠️ `export` 는 «테스트가 카드를 실제로 렌더해 판정선을 증명하기» 위한 것이다(추가 전용 —
+//    이 파일의 공개 진입점 `AutopilotMissions` 의 이름·시그니처는 그대로다). 카드가 `useDaemon()`
+//    컨텍스트 밖에서는 못 뜨므로 목록을 통해서는 카드를 렌더할 수가 없다.
+export function MissionCard({ api, m, onMutate }: { api: AutopilotApi; m: MissionSummary; onMutate: () => void }) {
   const isHuman = m.isAutopilot === false;   // 사람 intake 미션(autopilot 메타 없음)
   const [open, setOpen] = useState(false);
   const [trace, setTrace] = useState<MissionTrace | null>(null);
   const [busy, setBusy] = useState(false);
   const meta = m.model ? EXECUTION_MODEL_META[m.model] : null;
   const staleness = missionStaleness(m.updatedAt, Date.now(), { status: m.status });
+  // 마지막 갱신을 못 읽은 미션(`null`)은 «멈춤»으로 치지 않는다 — 근거 없이는 사람을 놀래지 않는다.
+  const stale = staleness?.stale ? staleness : null;
+  // ⚠️ «닫기 제안»의 끝은 미션 cancel(파생 잡 release · **되돌릴 수 없음**)다. 목록 카드의
+  // 한 번 클릭이 곧바로 그것을 부르지 않게 «제안(확인창 열기) → 종료 확인» 2단계로 쪼갠다.
+  const [confirmClose, setConfirmClose] = useState(false);
 
   const loadTrace = useCallback(async () => {
     setBusy(true);
@@ -130,8 +149,15 @@ function MissionCard({ api, m }: { api: AutopilotApi; m: MissionSummary }) {
 
   const cancel = useCallback(async () => {
     setCancelling(true); setActionMsg(null);
-    try { await api.missionAction(m.id, 'cancel'); await loadTrace(); } catch { /* fail-soft */ } finally { setCancelling(false); }
-  }, [api, m.id, loadTrace]);
+    try {
+      await api.missionAction(m.id, 'cancel');
+      setConfirmClose(false);
+      await loadTrace();
+      // 목록 재조회 — 종료된 미션은 «N일 멈춤» 칩·«닫기 제안»이 사라진 새 상태로 돌아온다
+      // (재조회가 없으면 사람은 «내 클릭이 먹었나»를 알 수 없고 두 번째 cancel 을 누르게 된다).
+      onMutate();
+    } catch { /* fail-soft */ } finally { setCancelling(false); }
+  }, [api, m.id, loadTrace, onMutate]);
 
   const approve = useCallback(async () => {
     setApproving(true); setActionMsg(null);
@@ -159,20 +185,70 @@ function MissionCard({ api, m }: { api: AutopilotApi; m: MissionSummary }) {
             <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground ring-1 ring-border">{m.source}</span>
             {awaitingApproval
               ? <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-300 ring-1 ring-amber-500/40">승인 대기</span>
-              : !staleness?.stale && <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground ring-1 ring-border">{m.status}</span>}
+              : <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground ring-1 ring-border">{m.status}</span>}
             {m.reviewDue && <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] text-amber-300 ring-1 ring-amber-500/30">⚠ 30일+ 리뷰</span>}
             {isHuman ? <TaskProgressChips counts={m.taskCounts} total={m.taskCount} /> : <RollupChips r={m.derived} />}
-            {staleness?.stale && <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-300 ring-1 ring-amber-500/30">{staleness.days}일 멈춤 · 마지막 갱신 {staleness.lastUpdated}</span>}
+            {/* ⚠️ 상태 뱃지는 «N일 멈춤» 칩과 «공존»한다 — `running` 을 가리면 «도는 중에 멈췄다»가
+                아니라 «상태를 모른다»가 된다. 문면·기준은 lib SSOT(missionStaleChip / missionStaleHint):
+                카드가 문구를 조립하면 `STALE_MISSION_DAYS` 가 두 곳에서 늙는다. */}
+            {stale && (
+              <span
+                className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-300 ring-1 ring-amber-500/30"
+                title={missionStaleHint()}
+              >{missionStaleChip(stale)}</span>
+            )}
           </div>
           <p className="truncate text-sm text-foreground/90">{m.goal}</p>
           <p className="font-mono text-[10px] text-muted-foreground">{m.id}</p>
         </div>
         </button>
-        {staleness?.stale && !isHuman && (
-          <Button size="sm" variant="outline" disabled={cancelling} onClick={() => void cancel()}
-            className="mr-3 mt-3 shrink-0 border-amber-500/40 text-amber-300 hover:text-amber-200">
-            {cancelling ? '종료 중…' : '닫기 제안'}
-          </Button>
+        {stale && !isHuman && (
+          <div className="mr-3 mt-3 flex shrink-0 flex-col items-end gap-1.5">
+            <Button size="sm" variant="outline" disabled={cancelling}
+              onClick={() => setConfirmClose((v) => !v)}
+              aria-expanded={confirmClose} aria-controls={`mission-close-confirm-${m.id}`}
+              className="border-amber-500/40 text-amber-300 hover:text-amber-200">
+              {cancelling ? '종료 중…' : '닫기 제안'}
+            </Button>
+            {confirmClose && (
+              <div id={`mission-close-confirm-${m.id}`} role="group" aria-label="미션 종료 확인"
+                className="w-60 space-y-1.5 rounded-md border border-amber-500/40 bg-amber-500/5 p-2">
+                <p className="text-[11px] leading-snug text-amber-200/90">{missionStaleHint()}</p>
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  {stale.days}일째 갱신 없음 · 파생 잡까지 release 되며 되돌릴 수 없다.
+                </p>
+                <div className="flex items-center justify-end gap-1.5">
+                  <Button size="sm" variant="ghost" disabled={cancelling}
+                    className="h-7 px-2 text-[11px] text-muted-foreground"
+                    onClick={() => setConfirmClose(false)}>
+                    취소
+                  </Button>
+                  <Button size="sm" variant="outline" disabled={cancelling}
+                    className="h-7 border-rose-500/50 px-2 text-[11px] text-rose-300 hover:text-rose-200"
+                    onClick={() => void cancel()}>
+                    {cancelling ? '종료 중…' : '종료 확인'}
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {stale && isHuman && (
+          <div className="mr-3 mt-3 flex shrink-0 flex-col items-end gap-1.5">
+            {/* 사람(Intake→TOX) 미션은 이 카드가 «종료»할 수 없다 — lifecycle 소유가 Task 보드다.
+                그래도 멈춘 미션에 아무 출구가 없으면 사람은 이 목록에서 막힌다 ⇒
+                같은 앰버 «닫기 제안»으로 보이고, 출구는 «소유자가 있는 곳»(/tasks)으로 잇는다. */}
+            <Link
+              href="/tasks"
+              title={`${stale.days}일째 갱신 없음 · ${missionStaleHint()}`}
+              className="inline-flex h-8 items-center rounded-md border border-amber-500/40 px-3 text-xs font-medium text-amber-300 hover:text-amber-200"
+            >
+              닫기 제안 — 작업 보드
+            </Link>
+            <span className="max-w-[15rem] text-right text-[11px] leading-snug text-muted-foreground">
+              {stale.days}일째 갱신 없음 · 사람 미션은 작업 보드에서 닫습니다
+            </span>
+          </div>
         )}
       </div>
       {open && isHuman && (
@@ -231,7 +307,7 @@ function MissionCard({ api, m }: { api: AutopilotApi; m: MissionSummary }) {
               })}
             </ul>
           )}
-          {trace && m.status !== 'done' && m.status !== 'proposed' && (
+          {trace && !isMissionTerminalStatus(m.status) && !awaitingApproval && (
             <div className="mt-2 flex items-center gap-2">
               <Button size="sm" variant="ghost" disabled={cancelling} onClick={() => void cancel()}
                 className="text-rose-400 hover:text-rose-300">
@@ -331,6 +407,10 @@ export function AutopilotMissions({ api }: { api: AutopilotApi }) {
 
   useEffect(() => { void load(); }, [load]);
 
+  // 카드 안의 상태 변경(«닫기 제안» 확인 = cancel)이 목록으로 되돌아오는 길 —
+  // 카드마다 새 화살표를 만들지 않게 `load` 에 매인 안정 참조 하나로 준다.
+  const reload = useCallback(() => { void load(); }, [load]);
+
   const autopilotCount = missions?.filter((m) => m.isAutopilot).length ?? 0;
   const humanCount = (missions?.length ?? 0) - autopilotCount;
 
@@ -352,7 +432,7 @@ export function AutopilotMissions({ api }: { api: AutopilotApi }) {
       )}
       {missions && missions.length > 0 && (
         <div className="space-y-2">
-          {missions.map((m) => <MissionCard key={m.id} api={api} m={m} />)}
+          {missions.map((m) => <MissionCard key={m.id} api={api} m={m} onMutate={reload} />)}
         </div>
       )}
     </div>

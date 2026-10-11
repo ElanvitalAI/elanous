@@ -91,6 +91,17 @@ export function rollupDerived(derived: DerivedJob[]): MissionRollup {
 
 export interface TracePaths { schedulesDb?: string; tasksDb?: string; surfaceEventsDb?: string }
 
+/** 크론 행 목록 → 파생물(순수 · 행→DerivedJob 매핑의 «단일 소유»).
+ *  ⛔ 목록 화면(`/v1/missions` 카드)도 이 함수를 쓴다 — 크론 매핑을 두 번
+ *  쓰면 「트레이스는 stale 인데 카드는 ok」 갈림이 생긴다.
+ *  `staleIds` 는 `scheduleHealth(rows).stale` 로 «한 번» 구해 넣는다. */
+export function cronRowsToDerived(
+  rows: readonly ScheduleRow[],
+  staleIds: ReadonlySet<string>,
+): DerivedJob[] {
+  return rows.map(r => cronToDerived(r, staleIds.has(r.id)));
+}
+
 /** 크론 파생물 — schedule_registry.autopilot_id = apmId + scheduleHealth 상태. */
 function fetchCronDerived(apmId: string, schedulesDb?: string): DerivedJob[] {
   try {
@@ -98,7 +109,7 @@ function fetchCronDerived(apmId: string, schedulesDb?: string): DerivedJob[] {
     try {
       const rows = listSchedules(db);
       const staleIds = new Set(scheduleHealth(rows).stale.map(s => s.id));
-      return rows.filter(r => r.autopilot_id === apmId).map(r => cronToDerived(r, staleIds.has(r.id)));
+      return cronRowsToDerived(rows.filter(r => r.autopilot_id === apmId), staleIds);
     } finally { db.close(); }
   } catch { return []; }
 }

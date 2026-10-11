@@ -11,6 +11,7 @@ import { runGitCommand } from '../git-fs/runner.js';
 import * as llm from '../llm.js';
 import type { LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
+import { resolveRoleLlm } from '../user-config.js';
 import { releasePathHold, releasePathHoldShouldPost, releasePathHoldComment, releasePathHoldCommentsArgs, releasePrFilePaths, RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
 import { runAgentMission, resolveBackend, type AgentMissionResult, type EvidenceMode } from './driver.js';
 import { judgeWithAcp, prepareJudgeDiff } from './acp-judge.js';
@@ -439,8 +440,13 @@ asks: reinforce 일 때 codex 가 반영할 **구체 지적 목록**(각 한 줄
 JSON 만: {"verdict":"...","asks":["..."],"reason":"..."}`;
   const messages: LLMMessage[] = [{ role: 'system', content: sys }, { role: 'user', content: body.slice(0, 6000) }];
   let raw = '';
-  try { raw = await llm.streamLLM(messages, () => {}, { maxTokens: 700, temperature: 0.1 }); }
-  catch (e) { return { verdict: 'ambiguous', asks: [], reason: `분류 오류: ${describeThrownValue(e)}`, classificationSource: 'llm-call-failure' }; }
+  try {
+    const resolved = resolveRoleLlm('classify');
+    const provider = llm.PROVIDERS[resolved.provider];
+    if (!provider) throw new Error(`Unknown classify provider: ${resolved.provider}`);
+    debug.log('llm.role-pin', 'resolved', { site: 'classify-review', role: 'classify', model: resolved.model, provider: resolved.provider, source: resolved.source });
+    raw = await llm.streamLLM(messages, () => {}, { model: resolved.model, provider, usageRole: 'classify', maxTokens: 700, temperature: 0.1 });
+  } catch (e) { return { verdict: 'ambiguous', asks: [], reason: `분류 오류: ${describeThrownValue(e)}`, classificationSource: 'llm-call-failure' }; }
   const jm = raw.match(/\{[\s\S]*\}/);
   if (!jm) return { verdict: 'ambiguous', asks: [], reason: 'JSON 파싱 실패', classificationSource: 'llm' };
   try {

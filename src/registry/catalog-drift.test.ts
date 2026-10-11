@@ -108,7 +108,8 @@ describe('catalog drift — 파생 핀이 catalog SSoT 와 정합(2026-07-15)', 
       // 📏 2026-10-11 (BEDROCK-PROVIDER #25966): Bedrock 와이어 id(`anthropic.` 접두)는 카탈로그 레코드가 없다 —
       //   가격·창은 1st-party `claude-*-5-5` 레코드와 «같은 모델»이지만 Bedrock 단가는 파트너 책정이라 비용 표는 범위 밖.
       //   사다리 status 는 `wip`(실호출 전). 레코드를 더하면 이 줄을 지운다.
-      bedrock: ['anthropic.claude-haiku-5-5', 'anthropic.claude-opus-5-5', 'anthropic.claude-sonnet-5-5'],
+      // 📏 10-11 BEDROCK-RUNTIME-PATH: 사다리 id 가 전역 추론 프로필(`global.anthropic.…`)로 옮겨 갔다 — 레코드 없음은 같다.
+      bedrock: ['global.anthropic.claude-haiku-5-5', 'global.anthropic.claude-opus-5-5', 'global.anthropic.claude-sonnet-5-5'],
     });
 
     // ⭐ 그리고 ***닿는 쪽은 「전부」 닿아야 한다*** — 이 줄이 본래 목적(회귀 방어)이다.

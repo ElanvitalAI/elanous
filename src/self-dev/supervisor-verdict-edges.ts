@@ -18,6 +18,7 @@ export const SUPERVISOR_VERDICT_EDGES = {
   'step-timeout': { meaning: 'step budget exhausted', next: 'human-gate' },
   'decomposable-no-progress': { meaning: 'stalled with a decomposition proposal', next: 'scope-decompose' },
   'review-unobserved': { meaning: 'review was not observed', next: 'self-review' },
+  'review-oscillating': { meaning: 'review oscillation needs a human decision (its one repair is spent or cannot run here)', next: 'human-gate' },
   'deliverable-unobserved': { meaning: 'deliverable was not observed', next: 'self-review' },
   'deliverable-merged': { meaning: 'deliverable is merged', next: 'harvest' },
 } as const satisfies Record<SupervisorStopReason, SupervisorVerdictEdge>;

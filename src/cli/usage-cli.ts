@@ -60,13 +60,85 @@ function readRunLogs(query: LogQuery): LogStoreRow[] {
   }
 }
 
-function usageData(row: LogStoreRow): RunUsageInput | null {
+type UsageAxis = 'stage' | 'model' | 'account';
+type ExtendedRunUsageInput = RunUsageInput & { stage?: string | null; account?: string | null };
+type AxisUsageRow = {
+  stage?: string;
+  model?: string;
+  account?: string;
+  hostIds: string[];
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  reasoningOutputTokens: number;
+  usdKnown: number;
+  unknownCostCalls: number;
+  includedCalls: number;
+  apiEquivalentUsd: number;
+};
+
+function usageData(row: LogStoreRow, unwrapPod = false): ExtendedRunUsageInput | null {
   if (row.category !== 'llm.usage' || row.event !== 'llm-usage' || !row.data) return null;
   try {
-    const value: unknown = JSON.parse(row.data);
+    let value: unknown = JSON.parse(row.data);
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-    return value as RunUsageInput;
+    const wrapper = value as { origin?: unknown; originalData?: unknown };
+    if (unwrapPod && wrapper.origin === 'pod') {
+      value = typeof wrapper.originalData === 'string' ? JSON.parse(wrapper.originalData) : wrapper.originalData;
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    }
+    return value as ExtendedRunUsageInput;
   } catch { return null; }
+}
+
+function stageForUsage(data: ExtendedRunUsageInput): string {
+  const stages = ['authoring', 'implement', 'review', 'gate'];
+  if (typeof data.stage === 'string' && data.stage.length > 0) return stages.includes(data.stage) ? data.stage : '기타';
+  // 역할 대체: 저작 호출은 role 'planning' 으로 실린다(ModelRole 에 authoring 이 없다) → authoring 단계로 센다.
+  const role = data.role === 'planning' ? 'authoring' : data.role;
+  if (typeof role === 'string' && role.length > 0) return stages.includes(role) ? role : '기타';
+  return '(none)';
+}
+
+function rollupByAxis(inputs: readonly ExtendedRunUsageInput[], axis: UsageAxis): AxisUsageRow[] {
+  const groups = new Map<string, ExtendedRunUsageInput[]>();
+  for (const data of inputs) {
+    const value = axis === 'stage' ? stageForUsage(data)
+      : axis === 'model' ? (data.model || '(none)')
+        : (data.account || '(none)');
+    const group = groups.get(value) ?? [];
+    group.push(data);
+    groups.set(value, group);
+  }
+  return [...groups].map(([value, group]) => {
+    const rows = rollupRunUsage(group);
+    const result: AxisUsageRow = {
+      [axis]: value,
+      hostIds: [...new Set(rows.flatMap((row) => row.hostIds))],
+      calls: rows.reduce((sum, row) => sum + row.calls, 0),
+      inputTokens: rows.reduce((sum, row) => sum + row.inputTokens, 0),
+      outputTokens: rows.reduce((sum, row) => sum + row.outputTokens, 0),
+      cacheReadInputTokens: rows.reduce((sum, row) => sum + row.cacheReadInputTokens, 0),
+      cacheCreationInputTokens: rows.reduce((sum, row) => sum + row.cacheCreationInputTokens, 0),
+      reasoningOutputTokens: rows.reduce((sum, row) => sum + row.reasoningOutputTokens, 0),
+      usdKnown: rows.reduce((sum, row) => sum + row.usdKnown, 0),
+      unknownCostCalls: rows.reduce((sum, row) => sum + row.unknownCostCalls, 0),
+      includedCalls: rows.reduce((sum, row) => sum + row.includedCalls, 0),
+      apiEquivalentUsd: rows.reduce((sum, row) => sum + row.apiEquivalentUsd, 0),
+    };
+    return result;
+  }).sort((a, b) => b.calls - a.calls);
+}
+
+function isUsageAxis(value: string): value is 'run' | 'role' | UsageAxis {
+  return value === 'run' || value === 'role' || value === 'stage' || value === 'model' || value === 'account';
+}
+
+function formatAxisUsage(row: AxisUsageRow, axis: UsageAxis): string {
+  const value = row[axis] ?? '(none)';
+  return `${axis}=${value}  hosts=${row.hostIds.join(',') || '(none)'}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  cacheRead=${row.cacheReadInputTokens}  cacheCreation=${row.cacheCreationInputTokens}  reasoning=${row.reasoningOutputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}`;
 }
 
 function defaultCreditPlan(): CodexCreditPlan | null {
@@ -94,15 +166,15 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
 
   usage
     .command('runs')
-    .description('저장된 llm-usage 로그를 런 또는 역할·호출 자리별로 집계한다')
+    .description('저장된 llm-usage 로그를 런·역할·단계·모델·계정별로 집계한다')
     .option('--run <runId>', '런 ID 정확 일치')
-    .option('--by <axis>', '집계 축 (run | role)', 'run')
+    .option('--by <axis>', '집계 축 (run | role | stage | model | account)', 'run')
     .option(...LOGS_SINCE_OPTION)
     .option('--json', '집계 행 JSON 출력')
     .action((opts: { run?: string; by: string; since?: string; json?: boolean }, command: Command) => {
       const json = opts.json || command.optsWithGlobals<{ json?: boolean }>().json;
-      if (opts.by !== 'run' && opts.by !== 'role') {
-        out.log('⛔ --by 는 run | role');
+      if (!isUsageAxis(opts.by)) {
+        out.log('⛔ --by 는 run | role | stage | model | account');
         exit(2);
         return;
       }
@@ -116,8 +188,19 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
         exactCategories: ['llm.usage'], events: ['llm-usage'],
         ...(sinceMs !== undefined ? { sinceMs } : {}),
       });
-      const inputs = rows.map(usageData).filter((data): data is RunUsageInput => data !== null)
+      const unwrapPod = opts.by === 'stage' || opts.by === 'model' || opts.by === 'account';
+      const inputs = rows.map((row) => usageData(row, unwrapPod)).filter((data): data is ExtendedRunUsageInput => data !== null)
         .filter((data) => opts.run === undefined || data.runId === opts.run);
+      if (opts.by === 'stage' || opts.by === 'model' || opts.by === 'account') {
+        const report = rollupByAxis(inputs, opts.by);
+        if (json) {
+          out.log(JSON.stringify(report, null, 2));
+          return;
+        }
+        if (report.length === 0) { out.log('(일치하는 런 사용량 없음)'); return; }
+        for (const row of report) out.log(formatAxisUsage(row, opts.by));
+        return;
+      }
       const report = rollupRunUsage(inputs, { by: opts.by });
       if (opts.by === 'role') report.sort((a, b) => b.calls - a.calls);
       if (json) {

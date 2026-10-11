@@ -85,6 +85,14 @@ function childBedrockEnv(provider: string): Record<string, string> {
   return provider === 'bedrock' ? bedrockChildRelayEnv() : {};
 }
 
+/** ZAI-POD-CHILD — glm(Z.ai GLM Coding Plan) 자격은 «env»(`ZAI_API_KEY` · Pod 에선 secretKeyRef)에 산다 — 키 캐시 파일이 없는 Pod 에선
+ *  replace env 라 릴레이가 없으면 자식이 직결을 못 탄다. 카탈로그 envKey(`ZHIPU_API_KEY`)와 다른 이름이라 따로 넘긴다(값은 싣기만 · 어디에도 안 찍는다). */
+function childZaiEnv(provider: string): Record<string, string> {
+  if (provider !== 'glm') return {};
+  const key = process.env.ZAI_API_KEY?.trim();
+  return key ? { ZAI_API_KEY: key } : {};
+}
+
 /** The family classifier is model-id based, so preserve local-provider identity
  * across the replace-env child boundary without changing non-local model IDs. */
 function childRelayModel(provider: string, model: string): string {
@@ -110,6 +118,7 @@ export function childLlmSelectionEnv(selection?: ChildLlmSelection): Record<stri
       ...childProviderKeyEnv(provider),
       ...childLocalEndpointEnv(provider),
       ...childBedrockEnv(provider),
+      ...childZaiEnv(provider),
     };
   }
   // ⛔⭐ 상속 갈래도 local 이면 «주소»를 같이 넘긴다(BACKLOG B12 · 2026-09-25).
@@ -122,5 +131,6 @@ export function childLlmSelectionEnv(selection?: ChildLlmSelection): Record<stri
     ...(inheritedProvider ? childLocalEndpointEnv(inheritedProvider) : {}),
     // 상속 갈래도 bedrock 이면 AWS_* 를 같이 넘긴다(명시 갈래와 같은 규칙 — replace env 라 자동 상속이 없다).
     ...(inheritedProvider ? childBedrockEnv(inheritedProvider) : {}),
+    ...(inheritedProvider ? childZaiEnv(inheritedProvider) : {}),
   };
 }

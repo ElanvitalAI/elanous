@@ -12,7 +12,13 @@
  *   ③ land: 재게이트 통과 ⊕ 회수한 리뷰가 지금 머리의 pass «또는» warn ⊕ reviewed ⊕ must-fix 0(TA-LAND-WARN-MUSTFIX0)이면 겹침 증거 파일
  *      (`<state>/overlap-evidence/<card>-<pr>-<head12>.json` = {pr, head, gate:{head, baseCommit, passed}, reviewResult} · #26023 꼴)을
  *      쓰고 `executeLiveLand` 를 «다시 부른다»(판정 로직 무변경 · 증거를 완전히 못 갖추면 land 하지 않는다 — fail-closed).
- * - 상한: 같은 머리는 재게이트·리뷰 각 한 번 · 카드·PR 당 재게이트한 머리 `REJUDGE_HEAD_CAP` 개까지 — 넘으면 사유 줄을 남기고 멈춘다.
+ *      LAND-ORDER-LEDGER — executeLiveLand 직후 겹침 쌍·착지 순서 원장(`land-order-ledger.ts` · `<state>/land-order-ledger.jsonl`)에
+ *      한 줄을 붙인다(같은 pr+head 한 줄 · 쓰기 실패는 삼킨다 — land 결과 무변 · 관측 `task-agent.land-order` appended|append-failed).
+ * - 상한: 같은 머리는 재게이트·리뷰 각 한 번 · 카드·PR 당 재게이트 `REJUDGE_HEAD_CAP` 번까지 — 넘으면 사유 줄을 남기고 멈춘다.
+ * - REJUDGE base-stale(OVERLAP-EVIDENCE-BASE-WINDOW 짝 · #26060): land 가 `base-stale-overlap`(재게이트 base 뒤 착지가 PR 파일을 건드렸다)으로
+ *   거절되면 그 시도는 `base-stale` 갈래로 적히고(judgement 1회 규칙과 섞이지 않는다), 다음 틱이 «같은 머리»를 새 base 위에서 한 번 더
+ *   재게이트한다(`staleBase` = 낡은 base · 멱등 키 = 머리 ⊕ staleBase · 상한에 포함). 그 재게이트가 통과하고 base 가 실제로 바뀌었을 때만
+ *   새 baseCommit 으로 증거를 다시 써 land 한다(`gateAt` 으로 앞 base-stale 시도를 소비) — 관측 `rejudge-on-head {step:'regate', reason:'base-stale-overlap …'}`.
  * - 대상: 카드에 묶인 PR(URL 로 저장소 확인) ⊕ 그 PR 로 TA 가 이미 리뷰를 요청한 카드(= 런이 멈춰 TA 판단이 시작됐다).
  * - 사람의 hold(draft PR)는 뒤집지 않는다 — 재게이트(`noMerge`)와 land 관문이 draft 를 거부한다.
  * - 허용: 설정 `taskAgent.liveMoves` 그대로 — 재게이트·land 는 `propose-land`, 리뷰 재요청은 `review` 가 있을 때만(없으면 «했을 수»).
@@ -24,9 +30,10 @@ import { spawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';
 import type { DetachedSpawn } from '../cli/tasks-cli.js';
+import { appendLandOrderRow, joinLandOrderRow } from './land-order-ledger.js';
 import { recordLiveMoveHistory } from './live-move-history.js';
-import { defaultPrHead, defaultReviewRepoCandidates, executeLiveLand, executeLiveReview, type LiveMoveDeps, type LiveMoveResult, type PrHeadView, type ReviewRepoCandidate, type TaskAgentLiveMove } from './live-moves.js';
-import { capturedLandReview, captureReviewResults, pendingReviewResults } from './review-result-capture.js';
+import { defaultPrHead, defaultReviewRepoCandidates, executeLiveLand, executeLiveReview, landRetryPending, type LiveMoveDeps, type LiveMoveResult, type PrHeadView, type ReviewRepoCandidate, type TaskAgentLiveMove } from './live-moves.js';
+import { capturedLandReview, captureReviewResults, parseReviewResultOutput, pendingReviewResults, type ParsedReviewResult } from './review-result-capture.js';
 import { cardPrNumber, readTaskCard, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
 
 export const REJUDGE_ON_HEAD_EVENT = 'rejudge-on-head';
@@ -50,8 +57,16 @@ export interface RejudgeDeps {
 }
 
 const safe = (value: string) => value.replace(/[^A-Za-z0-9._-]/g, '_');
-export function regateResultPath(statePath: string, cardId: string, pr: number, head: string): string {
-  return join(dirname(statePath), 'regate-results', `${safe(cardId)}-${pr}-${safe(head.slice(0, 12))}.json`);
+export function regateResultPath(statePath: string, cardId: string, pr: number, head: string, staleBase?: string): string {
+  const suffix = staleBase ? `-from-${safe(staleBase.slice(0, 12))}` : '';
+  return join(dirname(statePath), 'regate-results', `${safe(cardId)}-${pr}-${safe(head.slice(0, 12))}${suffix}.json`);
+}
+
+/** REJUDGE base-stale — 이 재게이트(요청 시각 `since`) «뒤»에 같은 머리 land 가 base-stale 로 거절된 마지막 시도. */
+export function baseStaleAttemptAfter(card: Pick<TaskCard, 'landAttempts'>, pr: number, head: string, since: string): NonNullable<TaskCard['landAttempts']>[number] | undefined {
+  const from = Date.parse(since);
+  return (card.landAttempts ?? []).filter((entry) => entry.pr === pr && entry.head.toLowerCase() === head.toLowerCase() && entry.ok === false
+    && entry.class === 'base-stale' && Number.isFinite(from) && Date.parse(entry.at) >= from).at(-1);
 }
 export function overlapEvidencePath(statePath: string, cardId: string, pr: number, head: string): string {
   return join(dirname(statePath), 'overlap-evidence', `${safe(cardId)}-${pr}-${safe(head.slice(0, 12))}.json`);
@@ -183,47 +198,60 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   const step = (s: RejudgeStep, decision: string, reason: string, record: boolean) => emit({ card: card!.id, pr, fromHead, toHead, step: s, decision, reason }, record);
 
   // 머리가 런 멈춤 때 그대로면 재판정하지 않는다 — 그 머리의 재게이트·리뷰·land 판단은 멈춤 때의 판단(슈퍼바이저 틱)이 이미 했다.
-  if (!regates.length && judgedHead && sameHead(toHead, judgedHead)) return target('head-unchanged', `PR #${pr} head is still the judged head`, pr, fromHead, toHead);
+  //   TA-LAND-RETRY-ON-INFRA — 단, 그 머리의 land 가 TA 쪽 인프라 결손으로 실패해 재시도가 남았으면 아래 ①②③ 을 그대로 탄다
+  //   (재게이트·회수한 리뷰·겹침 증거를 다시 갖춘 뒤에만 land — 관문은 그대로).
+  if (!regates.length && judgedHead && sameHead(toHead, judgedHead) && !landRetryPending(card, pr, toHead)) return target('head-unchanged', `PR #${pr} head is still the judged head`, pr, fromHead, toHead);
 
-  // ① 재게이트 — 지금 머리의 기록.
-  const regate = regates.find((entry) => sameHead(entry.head, toHead));
-  if (!regate) {
+  // ① 재게이트 — 지금 머리의 «마지막» 기록(REJUDGE base-stale 로 같은 머리를 다시 잰 기록이 뒤에 붙는다).
+  const regate = regates.filter((entry) => sameHead(entry.head, toHead)).at(-1);
+  // REJUDGE base-stale — 이 머리의 통과한 재게이트로 land 했더니 base-stale-overlap 으로 거절됐다 → 새 base 위에서 한 번 더 잰다.
+  const stale = regate?.passed === true ? baseStaleAttemptAfter(card, pr, toHead, regate.at) : undefined;
+  const staleBase = stale ? regate?.baseCommit : undefined;
+  if (stale && !staleBase) {
+    step('regate', 'not-regating', `base-stale-overlap on head ${toHead.slice(0, 12)} but the stale regate has no baseCommit — needs owner`, true);
+    return outcomes;
+  }
+  if (!regate || staleBase) {
+    const why = staleBase ? `base-stale-overlap — gate base ${staleBase.slice(0, 12)} went stale (${(stale!.reason ?? '').replace(/^base-stale-overlap:\s*/, '').slice(0, 160)})` : '';
     if (regates.length >= REJUDGE_HEAD_CAP) {
-      step('regate', 'cap-reached', `re-gated ${regates.length} heads already (cap ${REJUDGE_HEAD_CAP}) — no more rejudge; needs owner`, true);
+      step('regate', 'cap-reached', `${why ? `${why} · ` : ''}re-gated ${regates.length} times already (cap ${REJUDGE_HEAD_CAP}) — no more rejudge; needs owner`, true);
       return outcomes;
     }
-    if (!deps.liveMoves.has('propose-land')) step('regate', 'would-regate', 'propose-land not enabled in taskAgent.liveMoves — shadow', false);
+    if (!deps.liveMoves.has('propose-land')) step('regate', 'would-regate', `${why ? `${why} · ` : ''}propose-land not enabled in taskAgent.liveMoves — shadow`, false);
     else {
       const at = now().toISOString();
-      const resultPath = regateResultPath(statePath, card.id, pr, toHead);
+      const resultPath = regateResultPath(statePath, card.id, pr, toHead, staleBase);
       let claimed = false;
       let capped = false;
       updateTaskCard(statePath, card.id, (current) => {
         const held = (current?.regates ?? []).filter((entry) => entry.pr === pr);
-        if (!current || held.some((entry) => sameHead(entry.head, toHead))) return undefined;
+        // 멱등 — 처음 재게이트는 «머리», base-stale 재게이트는 «머리 ⊕ 낡은 base» 가 키다(같은 머리·같은 base 로 두 번 안 잰다).
+        if (!current || held.some((entry) => sameHead(entry.head, toHead) && (staleBase ? entry.staleBase !== undefined && sameHead(entry.staleBase, staleBase) : true))) return undefined;
         // 상한은 잠금 안의 «지금» 카드로 다시 잰다 — 다른 머리를 본 두 틱이 겹쳐도 상한을 넘지 않게.
         if (held.length >= REJUDGE_HEAD_CAP) { capped = true; return undefined; }
         claimed = true;
-        return { ...current, regates: [...(current.regates ?? []), { pr, head: toHead, at, resultPath }] };
+        return { ...current, regates: [...(current.regates ?? []), { pr, head: toHead, at, resultPath, ...(staleBase ? { staleBase } : {}) }] };
       });
       if (capped) {
-        step('regate', 'cap-reached', `re-gated ${REJUDGE_HEAD_CAP} heads already (cap ${REJUDGE_HEAD_CAP} · claim-time recheck) — no more rejudge; needs owner`, true);
+        step('regate', 'cap-reached', `${why ? `${why} · ` : ''}re-gated ${REJUDGE_HEAD_CAP} times already (cap ${REJUDGE_HEAD_CAP} · claim-time recheck) — no more rejudge; needs owner`, true);
         return outcomes;
       }
       if (claimed) {
         try {
           mkdirSync(dirname(resultPath), { recursive: true });
           await (deps.requestRegate ?? defaultRequestRegate)({ card: card.id, pr, head: toHead, repoRoot: cwd, resultPath });
-          step('regate', 'regate-requested', `host regate (noMerge) launched detached → ${resultPath}`, true);
+          step('regate', 'regate-requested', `${why ? `${why} · re-gate on a new base · ` : ''}host regate (noMerge) launched detached → ${resultPath}`, true);
         } catch (error) {
           const detail = `regate launch failed: ${(error instanceof Error ? error.message : String(error)).slice(-200)}`;
           updateTaskCard(statePath, card.id, (current) => current?.regates?.some((entry) => entry.pr === pr && entry.head === toHead && entry.at === at)
             ? { ...current, regates: current.regates.map((entry) => entry.pr === pr && entry.head === toHead && entry.at === at ? { ...entry, passed: false, status: 'unmeasured', detail } : entry) }
             : undefined);
-          step('regate', 'regate-failed', detail, true);
+          step('regate', 'regate-failed', `${why ? `${why} · ` : ''}${detail}`, true);
         }
       }
     }
+    // base-stale 재게이트는 그 결과가 나와야 land 한다 — 낡은 base 의 증거로 이번 틱에 다시 land 하지 않는다.
+    if (staleBase) return outcomes;
   } else if (regate.passed === undefined) {
     step('regate', 'awaiting-regate-result', 'host regate still running', false);
   }
@@ -254,6 +282,11 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
     step('land', 'not-landing', regate ? (regate.passed === false ? `host regate not passed: ${regate.detail ?? regate.status ?? 'unknown'}` : 'host regate still running') : 'no host regate for this head', regate?.passed === false);
     return outcomes;
   }
+  // REJUDGE base-stale — 새 base 위 재게이트가 «같은» base 로 돌아왔다 — 증거가 또 낡았다고 거절될 것이므로 land 하지 않는다(재게이트도 멱등 키로 0).
+  if (regate.staleBase && regate.baseCommit && sameHead(regate.baseCommit, regate.staleBase)) {
+    step('land', 'not-landing', `base-stale-overlap — re-gate on head ${toHead.slice(0, 12)} returned the same base ${regate.staleBase.slice(0, 12)} (did not advance) — no land, no further re-gate on this base; needs owner`, true);
+    return outcomes;
+  }
   if (!deps.liveMoves.has('propose-land')) { step('land', 'would-land', 'propose-land not enabled in taskAgent.liveMoves — shadow', false); return outcomes; }
 
   // ③ land — 겹침 증거(#26023 꼴)를 «완전히» 쓴 뒤에만 executeLiveLand 를 그대로 부른다. 증거를 못 갖추면 land 하지 않는다(fail-closed).
@@ -263,21 +296,43 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
     return outcomes;
   }
   const overlapEvidence = overlapEvidencePath(statePath, card.id, pr, toHead);
+  // #26023 꼴 그대로 — 증거 «파일» 내용은 무변 · 아래 원장 조인이 같은 모양을 쓴다(cardId 는 메모리에서만 싣는다).
+  const overlapEvidenceContent = { pr, head: toHead, gate: { head: toHead, baseCommit: regate.baseCommit, passed: true }, reviewResult };
   try {
     mkdirSync(dirname(overlapEvidence), { recursive: true });
     // 임시 파일에 쓰고 바꿔 끼운다 — 겹친 틱이 같은 경로를 다시 써도 land 가 반쯤 쓴 JSON 을 읽지 않게.
     const tmp = `${overlapEvidence}.${process.pid}.${Date.now()}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ pr, head: toHead, gate: { head: toHead, baseCommit: regate.baseCommit, passed: true }, reviewResult }, null, 2));
+    writeFileSync(tmp, JSON.stringify(overlapEvidenceContent, null, 2));
     renameSync(tmp, overlapEvidence);
   } catch (error) {
     step('land', 'not-landing', `overlap evidence write failed: ${(error instanceof Error ? error.message : String(error)).slice(-200)}`, true);
     return outcomes;
   }
   const before = { reviewRequests: latest.reviewRequests, landAttempts: latest.landAttempts };
-  const landed = await executeLiveLand(latest, pr, { runId: card.runId ?? null, cycleId: `rejudge:${card.id}:${toHead}`, cwd, review, overlapEvidence },
+  // 주기 id — base-stale 재게이트 뒤의 land 는 새 base 를 붙여 앞 land 의 주기 표시(모듈 전역)와 갈린다 · gateAt 이 앞 base-stale 시도를 소비한다.
+  const cycleId = `rejudge:${card.id}:${toHead}${regate.staleBase ? `:${regate.baseCommit.slice(0, 12)}` : ''}`;
+  const landed = await executeLiveLand(latest, pr, { runId: card.runId ?? null, cycleId, cwd, review, overlapEvidence, gateAt: regate.at },
     { ...live, ...(deps.log ? { log: deps.log } : {}) });
+  // LAND-ORDER-LEDGER — executeLiveLand 직후 원장 한 줄(같은 pr+head 는 한 줄만). 쓰기가 실패해도 land 결과는 그대로(삼킨다).
+  const landOrderLog = (event: 'appended' | 'append-failed') => { try { log('task-agent.land-order', event, { pr, head: toHead }); } catch { /* fail-soft */ } };
+  try {
+    // review-results 파일을 못 읽으면 reviewVerdict 'missing' — 0 으로 쓰지 않는다(land 판정의 회수 결과와는 별개 파일).
+    let reviewForLedger: ParsedReviewResult | null = null;
+    try { reviewForLedger = parseReviewResultOutput(read(reviewResult)); } catch { reviewForLedger = null; }
+    appendLandOrderRow(statePath, joinLandOrderRow({
+      overlapEvidence: { ...overlapEvidenceContent, cardId: card.id },
+      reviewResult: reviewForLedger, landed, at: now().toISOString(),
+    }));
+    landOrderLog('appended');
+  } catch {
+    landOrderLog('append-failed');
+  }
   recordMove(statePath, card.id, card.runId, 'propose-land', landed, pr, before, now, deps.log);
-  step('land', landed.executed && landed.ok ? 'landed' : 'land-rejected', `${landed.detail} · overlap-evidence ${overlapEvidence}`, true);
+  // TA-LAND-RETRY-ON-INFRA — 실패한 시도는 갈래·사유·재시도 여부를 사유 줄에 싣는다(다음 틱이 왜 다시 하는지/안 하는지).
+  const attempt = landed.landAttempt?.class
+    ? ` · land-class ${landed.landAttempt.class} (${landed.landAttempt.reason}) · attempt ${landed.landAttempt.attempt} · ${landed.landAttempt.class === 'base-stale' ? 'base-stale → re-gate on a new base next tick (cap counts)' : landed.landAttempt.retryAllowed ? 'retry allowed on this head' : 'no retry on this head'}`
+    : '';
+  step('land', landed.executed && landed.ok ? 'landed' : 'land-rejected', `${landed.detail}${attempt} · overlap-evidence ${overlapEvidence}`, true);
   return outcomes;
 }
 

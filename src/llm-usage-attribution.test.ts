@@ -6,14 +6,16 @@ import { setUserConfigOverlay } from './user-config.js';
 async function observeAttempts(run: () => Promise<unknown>) {
   const done: Record<string, unknown>[] = [];
   const errors: Record<string, unknown>[] = [];
+  const usage: Record<string, unknown>[] = [];
   const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'llm.usage') usage.push((data ?? {}) as Record<string, unknown>);
     if (event !== 'streamLLM') return;
     if (category === 'llm.router.done') done.push((data ?? {}) as Record<string, unknown>);
     if (category === 'llm.router.error') errors.push((data ?? {}) as Record<string, unknown>);
   });
   try {
     await run();
-    return { done, errors };
+    return { done, errors, usage };
   } finally {
     log.mockRestore();
   }
@@ -56,6 +58,30 @@ test('streamLLM attributes measured and unmeasured usage to its active model', a
       textChars: 'unmeasured'.length,
       usage: 'unmeasured',
     }),
+  ]);
+});
+
+test('streamLLM usageSite overrides the ledger site and omission keeps the default', async () => {
+  const provider: LLMProvider = {
+    name: 'usage-site-provider',
+    defaultModel: 'usage-site-model',
+    available: () => true,
+    async *chat() { yield 'unused'; },
+    async *streamChat() {
+      yield { type: 'usage', usage: { inputTokens: 4, outputTokens: 2 } };
+      yield { type: 'text', delta: 'answer' };
+    },
+  };
+
+  const observed = await observeAttempts(async () => {
+    await streamLLM([{ role: 'user', content: 'question' }], () => {}, { provider, usageSite: 'custom-site' });
+    await streamLLM([{ role: 'user', content: 'question' }], () => {}, { provider });
+  });
+
+  expect(observed.errors).toEqual([]);
+  expect(observed.usage).toEqual([
+    expect.objectContaining({ site: 'custom-site' }),
+    expect.objectContaining({ site: 'stream-llm' }),
   ]);
 });
 

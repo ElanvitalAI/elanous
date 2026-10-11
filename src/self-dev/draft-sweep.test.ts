@@ -1,6 +1,7 @@
 import { describe, expect, it, spyOn } from 'bun:test';
 import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
-import { DRAFT_SWEEP_CLOSE_CAP, resolveDraftSweepCloseCap, collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type OverlapMetricAdapters, type OverlapPreflightRow, draftSweepDaily, runDraftSweep, supersedeDraftsOnMerge, sweepFailureReason, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from './draft-sweep.js';
+import { DRAFT_NEEDS_OWNER_SEAT_CAP, isSeatDraftNeedsOwnerOverCap, DRAFT_SWEEP_CLOSE_CAP, resolveDraftSweepCloseCap, collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type OverlapMetricAdapters, type OverlapPreflightRow, draftSweepDaily, newerLineageDraft, runDraftSweep, supersedeDraftsOnMerge, sweepFailureReason, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from './draft-sweep.js';
+import { branchLineageKey } from '../harness/worktree-branch-prefix.js';
 import { RELEASE_PATH_LABEL } from './release-path-guard.js';
 import { debug } from '../debug/log.js';
 import { activeClaimOwnerFromBodies, activeClaimRunIdFromBodies, lastClaimReleaseAtFromBodies } from '../harness/harness-cli-command.js';
@@ -232,6 +233,20 @@ describe('supersedeDraftsOnMerge', () => {
   });
 });
 
+describe('seat needsOwner cap', () => {
+  it('is true only when a seat exceeds the default cap of 15', () => {
+    expect(DRAFT_NEEDS_OWNER_SEAT_CAP).toBe(15);
+    const counts = { OP: 15, TC: 16, MK: 0 };
+    expect(isSeatDraftNeedsOwnerOverCap('OP', counts)).toBe(false);
+    expect(isSeatDraftNeedsOwnerOverCap('TC', counts)).toBe(true);
+    expect(isSeatDraftNeedsOwnerOverCap('MK', counts)).toBe(false);
+    expect(isSeatDraftNeedsOwnerOverCap('UX', counts)).toBe(false);
+    expect(isSeatDraftNeedsOwnerOverCap('OP', counts, 14)).toBe(true);
+    expect(isSeatDraftNeedsOwnerOverCap('TC', counts, 16)).toBe(false);
+    expect(isSeatDraftNeedsOwnerOverCap('constructor', counts)).toBe(false);
+  });
+});
+
 describe('draft metrics', () => {
   it('counts open inventory, oldest age and missing claim owner; converts only merged PRs within 48h of creation', async () => {
     const rows = [draft(1, { createdAt: '2026-09-29T00:00:00Z', updatedAt: '2026-09-29T23:00:00Z' }),
@@ -326,7 +341,7 @@ describe('automatic draft claim lifecycle', () => {
     const fixture = fixtureFor(rows, cards);
     const record: PrTerminalRecord = { childRunId: R, prNumber: 501, prUrl: 'https://github.com/owner/repo/pull/501',
       repository: 'owner/repo', headSha: null, terminalClass: 'merge-ready-not-merged', stage: null,
-      owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() };
+      owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString(), hostRegateFailure: null  };
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
       await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, apply: true, now, closeCap: 1, alreadyClosed: 1 });
@@ -345,7 +360,7 @@ describe('automatic draft claim lifecycle', () => {
       expect(activeClaimOwnerFromBodies(fixture.comments.get(501)!)).toBeUndefined();
       expect(record).toEqual({ childRunId: R, prNumber: 501, prUrl: 'https://github.com/owner/repo/pull/501',
         repository: 'owner/repo', headSha: null, terminalClass: 'merge-ready-not-merged', stage: null,
-        owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() });
+        owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString(), hostRegateFailure: null  });
       expect(result.closed).toBe(0);
       expect(fixture.calls.filter((call) => call.startsWith('close:'))).toHaveLength(0);
       expect(log).toHaveBeenCalledWith('draft.residue', 'claim-released', { prNumber: 501, owner: 'UX', runId: R, reason: 'merge-ready-not-merged' });
@@ -357,7 +372,7 @@ describe('automatic draft claim lifecycle', () => {
     const fixture = fixtureFor([row], [card('same-pr', 550)]);
     fixture.comments.get(550)!.push(`🔧 처리 중 — owner TC · ${now.toISOString()} · run run-unrelated`);
     fixture.setTerminals([{ childRunId: R, prNumber: 550, prUrl: null, repository: 'owner/repo', headSha: null,
-      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString(), hostRegateFailure: null  }]);
     await sweep(fixture.adapters, true);
     expect(fixture.comments.get(550)).toHaveLength(1);
     expect(fixture.labels.get(550)).toContain(running);
@@ -382,7 +397,7 @@ describe('automatic draft claim lifecycle', () => {
     expect(fixture.comments.get(901)).toEqual([`🔧 처리 중 — owner UX · ${now.toISOString()} · run ${R}`]);
     fixture.comments.get(901)!.push(`🔧 처리 중 — owner UX · ${now.toISOString()} · run ${opener.runId}`);
     fixture.setTerminals([{ childRunId: R, prNumber: 901, repository: 'owner/repo', prUrl: null,
-      headSha: null, terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+      headSha: null, terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString(), hostRegateFailure: null  }]);
     await sweep(fixture.adapters, true);
     expect(fixture.comments.get(901)?.at(-1)).toBe(`🔧 처리 끝 — ${now.toISOString()} · run ${opener.runId} · failed-with-pr`);
     expect(fixture.labels.get(901)).not.toContain(running);
@@ -394,7 +409,7 @@ describe('automatic draft claim lifecycle', () => {
     fixture.comments.get(802)!.push(`🔧 처리 중 — owner UX · ${now.toISOString()} · run ${R}`);
     fixture.comments.get(802)!.push(`🔧 처리 끝 — ${now.toISOString()} · run ${R} · failed-with-pr`);
     fixture.setTerminals([{ childRunId: R, prNumber: 802, repository: 'owner/repo', prUrl: null, headSha: null,
-      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString(), hostRegateFailure: null  }]);
     await sweep(fixture.adapters, true);
     expect(fixture.comments.get(802)).toHaveLength(2);
     expect(fixture.labels.get(802)).not.toContain(running);
@@ -431,7 +446,7 @@ describe('automatic draft claim lifecycle', () => {
     const fixture = fixtureFor([row], [card('one', 803)]);
     fixture.comments.get(803)!.push(`🔧 처리 중 — owner UX · ${now.toISOString()} · run ${R}`);
     fixture.setTerminals([{ childRunId: R, prNumber: 803, prUrl: null, repository: 'owner/repo', headSha: null,
-      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString(), hostRegateFailure: null  }]);
     const comment = fixture.adapters.commentDraft!;
     let fail = true;
     fixture.adapters.commentDraft = async (...args) => {
@@ -514,7 +529,7 @@ describe('automatic draft claim lifecycle', () => {
     const fixture = fixtureFor([row], [card('one', 808)]);
     fixture.comments.get(808)!.push(`🔧 처리 중 — owner TC · ${now.toISOString()} · run ${R}`);
     fixture.setTerminals([{ childRunId: R, prNumber: 808, prUrl: null, repository: 'owner/repo', headSha: null,
-      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString(), hostRegateFailure: null  }]);
     await sweep(fixture.adapters, true);
     expect(fixture.comments.get(808)).toHaveLength(1);
     expect(fixture.labels.get(808)).toContain(running);
@@ -524,7 +539,7 @@ describe('automatic draft claim lifecycle', () => {
   it('keeps a label-only partial claim when the run terminal is attributed to another seat', async () => {
     const fixture = fixtureFor([draft(810, { labels: [running], updatedAt: now.toISOString() })], [card('one', 810)]);
     fixture.setTerminals([{ childRunId: R, prNumber: 810, prUrl: null, repository: 'owner/repo', headSha: null,
-      terminalClass: 'failed-with-pr', stage: null, owner: 'TC', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+      terminalClass: 'failed-with-pr', stage: null, owner: 'TC', ownerSource: 'seat', card: null, at: now.toISOString(), hostRegateFailure: null  }]);
     await sweep(fixture.adapters, true);
     expect(fixture.labels.get(810)).toContain(running);
     expect(fixture.comments.get(810)).toHaveLength(0);
@@ -544,7 +559,7 @@ describe('automatic draft claim lifecycle', () => {
     expect(fixture.comments.get(809)).toHaveLength(0);
     fail = false;
     fixture.setTerminals([{ childRunId: R, prNumber: 809, prUrl: null, repository: 'owner/repo', headSha: null,
-      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString(), hostRegateFailure: null  }]);
     const released = await sweep(fixture.adapters, true);
     expect(released.entries[0]).toMatchObject({ action: 'keep', reason: 'claim-released', applied: true });
     expect(fixture.labels.get(809)).not.toContain(running);
@@ -559,7 +574,7 @@ describe('automatic draft claim lifecycle', () => {
     const fixture = fixtureFor([row], [card('one', 701)]);
     fixture.comments.get(701)!.push(`🔧 처리 중 — owner TC · ${now.toISOString()} · run other-run`);
     fixture.setTerminals([{ childRunId: R, prNumber: 701, prUrl: null, repository: 'other/repo', headSha: null,
-      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString(), hostRegateFailure: null  }]);
     await sweep(fixture.adapters, true);
     expect(fixture.comments.get(701)).toHaveLength(1);
     expect(fixture.labels.get(701)).toContain(running);
@@ -878,6 +893,16 @@ describe('runDraftSweep', () => {
       `label:1:${running}=>${stalled}`, expect.stringContaining('close:1:Draft sweep: 처리 중 표식이 6시간 갱신 없음'),
       `label:2:${stalled}=>${superseded}`, 'close:2:Draft sweep: superseded-by #10 (https://github.com/owner/repo/pull/10). Branch preserved.',
     ]);
+  });
+
+  it('leaves a bench arm draft (elanous:bench) alone: no stalled close, no label write', async () => {
+    const bench = 'elanous:bench';
+    const old = new Date(now.getTime() - (STALLED_DRAFT_HOURS + 1) * 3_600_000).toISOString();
+    const fixture = make([draft(1, { labels: [stalled], createdAt: old }),
+      draft(2, { labels: [stalled, bench], branch: 'bench/x/glm-abc123', createdAt: old })]);
+    const result = await sweep(fixture.adapters, true);
+    expect(result.entries.map(({ number, action }) => [number, action])).toEqual([[1, 'close'], [2, 'keep']]);
+    expect(fixture.calls.some((call) => call.startsWith('label:2:') || call.startsWith('close:2:'))).toBe(false);
   });
 
   it('observes the aging boundary and only marks a recent ended run stalled without closing it', async () => {
@@ -1235,5 +1260,95 @@ describe('runDraftSweep — unobserved runs (🅢 lead decision 2026-09-28)', ()
       expect(sweepFailureReason(failure)).toBe('gh: Command failed');
       expect(log).toHaveBeenCalledWith('drafts.cleanup', 'failed', { reason: 'gh: Command failed' });
     } finally { log.mockRestore(); }
+  });
+});
+
+describe('runDraftSweep — lineage key (forceRequeue duplicates)', () => {
+  const fresh = '2026-09-29T23:30:00Z';
+  const older = (options: Partial<SweepDraft> = {}) => draft(1, {
+    title: 'old attempt', branch: 'self-impl/goalid-abc-foo-11111111-raaaaaa', createdAt: '2026-09-29T22:00:00Z', updatedAt: fresh, ...options,
+  });
+  const newer = (options: Partial<SweepDraft> = {}) => draft(2, {
+    title: 'requeued attempt', branch: 'self-impl/goalid-abc-bar-22222222-rbbbbbb', createdAt: '2026-09-29T23:00:00Z', updatedAt: fresh, ...options,
+  });
+  const mutations = (calls: string[]) => calls.filter((call) => /^(label|close|stop):/.test(call));
+
+  it('forceRequeue duplicate run is superseded by lineage key', async () => {
+    const fixture = make([older(), newer()]);
+    fixture.statuses.set(1, 'running');
+    fixture.setLive(new Set([older().branch, newer().branch]));
+    fixture.adapters.supersedeRun = async (pr, _repo, by) => { fixture.calls.push(`stop:${pr.number}:${by.number}`); };
+    const result = await sweep(fixture.adapters, true);
+    expect(result.entries[0]).toMatchObject({ number: 1, action: 'close', reason: 'duplicate-of-open #2 (lineage goalid:abc) · stop run run-1', statusLabel: superseded, applied: true });
+    expect(result.entries[1]).toMatchObject({ number: 2, action: 'keep' });
+    expect(mutations(fixture.calls)).toEqual([
+      'stop:1:2', `label:1:${running}=>${superseded}`,
+      'close:1:Draft sweep: duplicate-of-open #2 (lineage goalid:abc) · stop run run-1 (https://github.com/owner/repo/pull/2). Branch preserved.',
+    ]);
+  });
+
+  it('never stops a live run when the newer same-lineage run is not live itself — the existing rules decide', async () => {
+    const onlyOlderLive = (fixture: ReturnType<typeof make>) => { fixture.statuses.set(1, 'running'); fixture.setLive(new Set([older().branch])); };
+    const baseline = await withoutLineage(onlyOlderLive);
+    const fixture = make([older(), newer()]);
+    onlyOlderLive(fixture);
+    fixture.adapters.supersedeRun = async () => { fixture.calls.push('stop'); };
+    const result = await sweep(fixture.adapters, true);
+    expect(result.entries[0]).toEqual(baseline);
+    expect(fixture.calls).not.toContain('stop');
+  });
+
+  // What the existing rules decide for the same older draft when no same-lineage rerun exists (the newer draft is another goal).
+  const withoutLineage = async (configure: (fixture: ReturnType<typeof make>) => void) => {
+    const plain = make([older(), newer({ branch: 'self-impl/goalid-other-bar-22222222-rbbbbbb' })]);
+    configure(plain);
+    return (await sweep(plain.adapters, true)).entries[0];
+  };
+
+  it('falls through to the existing rules when nothing can stop the live run, or when stopping fails (no lineage close, no cap spent)', async () => {
+    const liveRun = (fixture: ReturnType<typeof make>) => { fixture.statuses.set(1, 'running'); fixture.setLive(new Set([older().branch, newer().branch])); };
+    const baseline = await withoutLineage(liveRun);
+    const live = make([older(), newer()]);
+    liveRun(live);
+    const kept = await sweep(live.adapters, true);
+    expect(kept.entries[0]).toEqual(baseline);
+    expect(kept.entries[0]?.reason).not.toContain('lineage');
+
+    const failing = make([older(), newer()]);
+    liveRun(failing);
+    failing.adapters.supersedeRun = async () => { throw new Error('stop refused'); };
+    const failed = await sweep(failing.adapters, true);
+    expect(failed.entries[0]).toEqual(baseline);
+    expect(failed.closed ?? 0).toBe(0);
+  });
+
+  it('closes an ended older draft without stopping anything, and previews without writing', async () => {
+    const fixture = make([older(), newer()]);
+    fixture.adapters.supersedeRun = async () => { fixture.calls.push('stop'); };
+    const preview = await sweep(fixture.adapters);
+    expect(preview.entries[0]).toMatchObject({ number: 1, action: 'close', applied: false });
+    expect(mutations(fixture.calls)).toEqual([]);
+    const applied = await sweep(fixture.adapters, true);
+    expect(applied.entries[0]).toMatchObject({ number: 1, action: 'close', applied: true });
+    expect(fixture.calls).not.toContain('stop');
+  });
+
+  it('leaves held drafts, other goals and branches without a goal id alone', async () => {
+    const held = make([older({ labels: [keep] }), newer()]);
+    expect((await sweep(held.adapters, true)).entries[0]).toMatchObject({ number: 1, action: 'keep', reason: `label:${keep}` });
+    const other = make([older(), newer({ branch: 'self-impl/goalid-def-bar-22222222-rbbbbbb' })]);
+    expect((await sweep(other.adapters)).entries[0]?.reason).not.toContain('lineage');
+    const legacy = make([older({ branch: 'self-impl/foo-11111111-raaaaaa' }), newer({ branch: 'self-impl/foo-22222222-rbbbbbb' })]);
+    expect((await sweep(legacy.adapters)).entries[0]?.reason).not.toContain('lineage');
+    expect(mutations(held.calls)).toEqual([]);
+  });
+
+  it('derives one stable lineage key across run suffixes and reworded features', () => {
+    expect(branchLineageKey('self-impl/goalid-ABC-foo-11111111-raaaaaa')).toBe('goalid:abc');
+    expect(branchLineageKey('self-impl/goalid-abc-other-words-99999999')).toBe('goalid:abc');
+    expect(branchLineageKey('self-impl/foo-11111111-raaaaaa')).toBeNull();
+    expect(branchLineageKey('feat/goalid-abc-x')).toBeNull();
+    expect(newerLineageDraft(older(), [older(), newer(), draft(3, { createdAt: '2026-09-29T23:10:00Z', branch: 'self-impl/goalid-abc-z-33333333' })])?.number).toBe(3);
+    expect(newerLineageDraft(newer(), [older(), newer()])).toBeUndefined();
   });
 });

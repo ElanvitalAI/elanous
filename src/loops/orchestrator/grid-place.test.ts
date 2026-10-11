@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -9,6 +9,8 @@ import { addHarnessQueue, harnessQueuePath, listHarnessQueue, queueLaunchArgs, s
 import { runSeatLoopOnce } from '../../seat-loop/seat-loop.js';
 import { placeOnGrid, type GridHost } from './grid-place.js';
 import { runOrchestratorNode, type TickDeps } from './tick.js';
+
+setDefaultTimeout(60_000);
 
 const hosts: GridHost[] = [
   { name: 'node-b', capabilities: new Set(['pod']), available: true },
@@ -651,7 +653,7 @@ test('real pool readiness feeds the place node without an injected inventory', a
     const env = { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_CONFIG_DIR: root, ELANOUS_GRAPH_CONTEXT: context,
       ELANOUS_POD_POOL: 'pool-node-b@node-b:8,pool-node-c@node-c:2' };
     for (const node of ['intake', 'split', 'place']) {
-      const result = spawnSync('bun', [join(import.meta.dir, 'tick.ts'), node, '--window', '08'], { env, encoding: 'utf8' });
+      const result = spawnSync('bun', [join(import.meta.dir, 'tick.ts'), node, '--window', '08'], { env, encoding: 'utf8', timeout: 60_000 });
       expect(result.status, `${node}: ${result.stderr.slice(-500)}`).toBe(0);
     }
     const state = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'grid-pool.json'), 'utf8')) as { cells: Array<{ id: string; kind?: string }>; steps: Array<{ reason: string }> };
@@ -665,7 +667,7 @@ test('real pool readiness feeds the place node without an injected inventory', a
     if (previous.state === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous.state;
     rmSync(root, { recursive: true, force: true });
   }
-}, 30_000);
+}, 60_000);
 
 test('unknown inventory is not recorded as a null host', async () => {
   const root = mkdtempSync(join(tmpdir(), 'grid-unknown-test-'));
@@ -718,12 +720,12 @@ test('actual tick.ts place entry reads the supplied inventory when node-b is blo
     await runOrchestratorNode('split', deps);
     const env = { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_CONFIG_DIR: root, ELANOUS_GRAPH_CONTEXT: context,
       ELANOUS_GRID_HOSTS: JSON.stringify(inventory) };
-    const result = spawnSync('bun', [join(import.meta.dir, 'tick.ts'), 'place', '--window', '08'], { env, encoding: 'utf8' });
+    const result = spawnSync('bun', [join(import.meta.dir, 'tick.ts'), 'place', '--window', '08'], { env, encoding: 'utf8', timeout: 60_000 });
     expect(result.status).toBe(0);
     const state = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'grid-entry.json'), 'utf8')) as { steps: Array<{ reason: string }> };
     expect(state.steps.map(step => step.reason)).toContain('would-host:C1:node-c');
   } finally { rmSync(root, { recursive: true, force: true }); }
-}, 30_000);
+}, 60_000);
 
 async function runLiveWithEnvInventory(runId: string, gridHosts: string): Promise<{ root: string; cardId: string; reasons: string[] }> {
   const root = mkdtempSync(join(tmpdir(), `${runId}-`));

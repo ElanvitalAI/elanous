@@ -2460,7 +2460,7 @@ describe('triageRun — 실패를 «다음 행동»으로 옮긴다', () => {
     expect(classifyFailure(result)).toBe('false-failure');
     expect(triageActionFor(classifyFailure(result)!)).toBe('no-action');
   });
-  test('failed · merge-conflict · report-deficit 는 needs-human 이고 reworkable 은 비어 있다', () => {
+  test('failed · merge-conflict · report-deficit 는 첫 번 relaunch-on-main 이고 reworkable 은 비어 있다', () => {
     const result = {
       taskId: 'main-sync',
       feature: 'main-sync',
@@ -2469,12 +2469,53 @@ describe('triageRun — 실패를 «다음 행동»으로 옮긴다', () => {
       failureClassification: 'report-deficit',
     } as never;
     expect(classifyFailure(result)).toBe('main-sync-blocked');
-    expect(triageActionFor('main-sync-blocked')).toBe('needs-human');
-    const t = triageRun([result]);
-    expect(t.needsHuman).toEqual(['main-sync']);
+    expect(triageActionFor('main-sync-blocked')).toBe('relaunch-on-main');
+    // 감독 없이 도는 경로(재발사 셈 없음)는 종전대로 needs-human — 재발사할 주체가 없다.
+    const unsupervised = triageRun([result]);
+    expect(unsupervised.relaunchOnMain).toEqual([]);
+    expect(unsupervised.needsHuman).toEqual(['main-sync']);
+    expect(unsupervised.actionable).toBe(false);
+    const t = triageRun([result], undefined, false, undefined, () => false);
+    expect(t.relaunchOnMain).toEqual(['main-sync']);
+    expect(t.needsHuman).toEqual([]);
     expect(t.reworkable).toEqual([]);
+    expect(t.actionable).toBe(true);
     expect(summarizeFailureKinds([result])).toEqual({
       falseFailure: 0, unconverged: 0, unclassified: 0, transient: 0, blockedUpstream: 0, unconvergedDecomposable: 0, mainSyncBlocked: 1,
+    });
+  });
+
+  describe('merge conflict relaunch', () => {
+    const conflict = { taskId: 'main-sync', feature: 'main-sync', status: 'failed', stage: 'merge-conflict' } as never;
+    const harvestable = {
+      taskId: 'big', feature: 'big', status: 'failed', stage: 'merge-conflict',
+      branch: 'self-impl/big', harvestable: true, mergeReason: 'main-sync-conflict-unresolved',
+    } as never;
+
+    test('stage merge-conflict 첫 번은 relaunch-on-main, 같은 조각 두 번째는 needs-human', () => {
+      expect(classifyFailures([conflict], undefined, () => false)[0]?.action).toBe('relaunch-on-main');
+      expect(classifyFailures([conflict])[0]?.action).toBe('needs-human');
+      const spent = triageRun([conflict], undefined, false, undefined, () => true);
+      expect(spent.relaunchOnMain).toEqual([]);
+      expect(spent.needsHuman).toEqual(['main-sync']);
+      expect(spent.actionable).toBe(false);
+      expect(triageActionFor('main-sync-blocked', { mainSyncRelaunchSpent: true })).toBe('needs-human');
+    });
+
+    test('harvestable merge-conflict 첫 번도 relaunch-on-main 이고 두 번째는 needs-human', () => {
+      expect(triageRun([harvestable], undefined, false, undefined, () => false).relaunchOnMain).toEqual(['big']);
+      expect(triageRun([harvestable], undefined, false, undefined, (r) => r.taskId === 'big').needsHuman).toEqual(['big']);
+    });
+
+    test('다른 단계에서 멈춘 harvestable 은 재발사 후보가 아니다', () => {
+      const timedOut = { taskId: 'late', feature: 'late', status: 'failed', stage: 'timed-out', branch: 'self-impl/late', harvestable: true } as never;
+      expect(classifyFailures([timedOut])[0]).toMatchObject({ kind: 'main-sync-blocked', action: 'needs-human' });
+    });
+
+    test('다른 실패 종류의 action 은 그대로다', () => {
+      for (const kind of ['transient', 'unconverged', 'blocked-upstream', 'awaiting-human', 'provider-rejected', 'unclassified'] as const) {
+        expect(triageActionFor(kind, { mainSyncRelaunchSpent: false })).toBe(triageActionFor(kind));
+      }
     });
   });
 

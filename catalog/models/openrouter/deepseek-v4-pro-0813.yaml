@@ -1,0 +1,39 @@
+id: openrouter/deepseek/deepseek-v4-pro-0813
+provider: openrouter
+displayName: DeepSeek V4 Pro 0813 (OpenRouter)
+family: deepseek-v4
+# ⭐ 2026-10-11 MK(CATALOG-DEEPSEEK-FLASH) — 손 레코드. 발견 폴드(`catalogFromDiscovery`)는 시험 런타임·스냅숏 없는
+#    기계에서 «0항목»이라 창·출력·단가·기본 effort 를 아무도 몰랐다. YAML 이 폴드를 이긴다(loader.ts foldDiscoveredModels).
+# ⛔ GA 판(0813)만 둔다 — 0423 Preview `deepseek/deepseek-v4-pro` ⊕ 별칭 `~deepseek/deepseek-pro-latest` 는 OP 결정으로 «안 넣는다».
+# 🔌 상류 = streamlake (DeepSeek 공식 아님 · 계정 Guardrails 로 공식 엔드포인트 차단 · 2턴째 캐시 0.94 실측 ·
+#    UX #26061 `llm.openrouter.upstreamPins` 기본값과 짝 · 차순위 alibaba). ⇒ 아래 값은 «실제로 도는 상류»의 값이다.
+# 📏 수치 출처 — OpenRouter 공개 API 실호출 2026-10-10T20:12Z (인증 없음):
+#   GET /api/v1/models/deepseek/deepseek-v4-pro-0813/endpoints — tag `streamlake`(deepseek-v4-pro-20260813):
+#     context_length 1024000 · max_completion_tokens 384000 · uptime_last_30m 100 · reasoning·reasoning_effort·tools 지원
+#     청구가 prompt $0.66 · completion $1.98 · input_cache_read $0.022 /MTok · discount 0.5 · 시간대 가산(overrides) 없음
+# 💲 ⚠️ 판촉 할인 중이다(discount 0.5 · 2026-10-11 실측). `pricing` 칸에는 «정가»를 적는다.
+#    정가 = 청구가 / (1 − 0.5) → $1.32 / $3.96 · 캐시 $0.044. API 가 정가를 직접 주지 않아 계산한 값이다.
+#    할인가(지금 실제 청구): $0.66 / $1.98 · 캐시 $0.022 — 2026-10-11.
+#    참고: 차순위 alibaba(tag `alibaba`)는 창 1000000 · 출력 393216 · discount 0 · UTC 00–14시 약 2배 가산이 있다.
+contextSize: 1024000
+outputMaxTokens: 384000
+vision: null
+# 기본 effort — OR supported_parameters 에 reasoning_effort 가 있다. 관례(pro 계열 = high · gpt-5.5-pro·gemini-3.1-pro-preview)를 따른다.
+#   ⚠️ xhigh·max 접힘은 UX OR-DEEPSEEK-TUNE 몫 · provider effortControl=false(wire 미적재)는 이 레코드가 바꾸지 않는다.
+reasoning: high
+toolCalling: native-openai
+streamingProtocol: sse
+pricing:
+  inputPerMTok: 1.32
+  outputPerMTok: 3.96
+  cachedInputPerMTok: 0.044
+deprecated: null
+tokenizer: unknown
+kind: chat
+# 출시일 — 엔드포인트 이름의 날짜(deepseek-v4-pro-20260813). /api/v1/models `created` 는 2026-08-12(UTC).
+releaseDate: 2026-08-13
+discoveryMeta:
+  source: manual
+  lastSeen: 2026-10-11
+  autoFilled: false
+  confidence: high

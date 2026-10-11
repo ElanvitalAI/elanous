@@ -16,6 +16,8 @@ import { HARNESS_RUN_ID_ENV, mintRunId, normalizeRunId } from '../harness/harnes
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { withFileLockSync } from '../storage/file-lock.js';
+import { checkCompletionEvidence, deliverableReceiptEvidence } from './completion-evidence.js';
+import { judgeNextMove } from './judge.js';
 
 export interface ResolveHandTextDeps {
   cwd: string;
@@ -83,7 +85,7 @@ export function taskCardLabelContext(card: Pick<TaskCard, 'id'>): TaskCardLabelC
  * 과제 종결 종류(RFC-loop-agent-map §A4b③) — 비면 code-pr(PR 병합)로 읽는다.
  * code-pr 밖의 종류는 «확인 증거»(`judge.ts` TaskJudgeInput.evidence)로 종결한다 — 증거를 만드는 일은 DEFAULT-HANDS 몫.
  */
-export const COMPLETION_KINDS = ['code-pr', 'artifact', 'research-report', 'ops-action', 'content', 'watch-brief', 'decision-support'] as const;
+export const COMPLETION_KINDS = ['code-pr', 'artifact', 'research-report', 'ops-action', 'content', 'watch-brief', 'decision-support', 'deliverable'] as const;
 export type CompletionKind = typeof COMPLETION_KINDS[number];
 
 /**
@@ -92,6 +94,8 @@ export type CompletionKind = typeof COMPLETION_KINDS[number];
  */
 export interface TaskCardEvent {
   at: string; event: string; detail?: string; runId?: string; pr?: number;
+  /** `closed-by-hand` 줄만 — 닫은 사유 · 닫은 자리(`closeTaskCard`). */
+  reason?: string; by?: string;
   kind?: string; executed?: boolean; ok?: boolean; executorResult?: 'shadow' | 'live'; head?: string; effect?: string;
   /** TA-REVIEW-RESULT-CAPTURE — review live-move 줄 · 결과 줄(`live-move-result`)의 결과 파일 경로. */
   resultPath?: string;
@@ -102,6 +106,8 @@ export interface TaskCardEvent {
 export const LIVE_MOVE_HISTORY_EVENT = 'live-move';
 /** TA-REVIEW-RESULT-CAPTURE — 떼어 띄운 리뷰의 결과(또는 «결과 없음») 줄 — live-move 줄처럼 상태 사유 판정에서 뺀다. */
 export const LIVE_MOVE_RESULT_EVENT = 'live-move-result';
+/** HAND-MOVE-LEDGER — 자리가 손으로 마무리한 수 줄(`recordHandMove`) — 관측 기록이라 live-move 줄처럼 상태 사유 판정에서 뺀다. */
+export const HAND_MOVE_HISTORY_EVENT = 'hand-move';
 export interface TaskCardMove { kind: 'launch' | 'wait'; command?: string[]; reason: string }
 export interface TaskCard {
   id: string;
@@ -159,9 +165,17 @@ export interface TaskCard {
    * TA-REJUDGE-ON-HEAD — 런 멈춤 «뒤» 머리마다 한 번 돌린 호스트 재게이트(병합 없음 · 떼어 띄움). 결과는 `resultPath` 파일에서
    * 다음 틱이 회수해 passed·status·baseCommit·detail 을 채운다(비어 있으면 아직 도는 중 · 없는 칸을 «통과»로 읽지 않는다).
    */
-  regates?: Array<{ pr: number; head: string; at: string; resultPath?: string; passed?: boolean; status?: string; baseCommit?: string; detail?: string }>;
-  /** Live land attempts, claimed before invocation, once per PR head even if the command fails. */
-  landAttempts?: Array<{ pr: number; head: string; at: string; ok?: boolean; detail?: string }>;
+  regates?: Array<{ pr: number; head: string; at: string; resultPath?: string; passed?: boolean; status?: string; baseCommit?: string; detail?: string;
+    /** REJUDGE base-stale — 같은 머리를 새 base 위에서 다시 잰 재게이트면, land 가 낡았다고 거절한 앞 재게이트의 base(멱등 키 = 머리 ⊕ 이 base). */
+    staleBase?: string }>;
+  /**
+   * Live land attempts, claimed before invocation, once per PR head even if the command fails.
+   * TA-LAND-RETRY-ON-INFRA — a failed attempt carries `class`/`reason`: `infra` (TA-side, allow-listed) leaves one more attempt on
+   * the same head (`LAND_ATTEMPTS_PER_HEAD_ON_INFRA`); `judgement` · unknown reason · no class (older record) closes the head.
+   * REJUDGE base-stale — `base-stale` (overlap evidence gate base went stale with PR-file overlap) waits for a re-gate on a new base;
+   * only after that re-gate passes is the attempt consumed (`openLandAttempts`) and the same head may land once more.
+   */
+  landAttempts?: Array<{ pr: number; head: string; at: string; ok?: boolean; detail?: string; class?: 'infra' | 'judgement' | 'base-stale'; reason?: string }>;
   /** TA-LIVE-LAND-2 — `tasks hand --ta-land`: this card's run leaves the merge to the task agent (propose-land). */
   taLand?: true;
   /** TASKS-HAND-CHILD-LLM — `tasks hand --child-llm <provider>/<model> [--child-llm-effort <level>]` → 발사 인자 `--child-llm-provider/-model/-effort`. */
@@ -279,6 +293,16 @@ export function readTaskCard(id: string, path = taskAgentStatePath()): TaskCard 
   return readState(path).tasks?.[id];
 }
 
+export const CLOSED_BY_HAND_EVENT = 'closed-by-hand';
+
+/** 카드를 손으로 닫는다 — 상태를 `failed` 로 두고 history 에 한 줄(`closed-by-hand`)을 남긴다. 이미 손으로 닫은 카드는 그대로 돌려준다(멱등). */
+export function closeTaskCard(card: TaskCard, input: { reason: string; by: string; at: string }): TaskCard {
+  const reason = input.reason.trim();
+  if (!reason) throw new Error('닫는 사유(reason)가 비어 있다');
+  if (card.status === 'failed' && card.history.some((item) => item.event === CLOSED_BY_HAND_EVENT)) return card;
+  return { ...card, status: 'failed', history: [...card.history, { at: input.at, event: CLOSED_BY_HAND_EVENT, kind: CLOSED_BY_HAND_EVENT, detail: reason, reason, by: input.by }] };
+}
+
 /** 첫 수의 elanous 인자(진입점·--config-dir 앞붙임은 launcher 몫). */
 export function launchArgs(card: Pick<TaskCard, 'text' | 'seat' | 'childLlm'>): string[] {
   const child = card.childLlm
@@ -298,8 +322,8 @@ export function nextMoveFor(card: TaskCard, landed?: ReadonlySet<string>): TaskC
   if (card.status !== 'launched' && unmet.length > 0) return { kind: 'wait', reason: `after ${unmet.join(', ')}${landed ? '' : ' · 착지 미확인'}` };
   if (card.status === 'handed') return { kind: 'launch', command: launchArgs(card), reason: '넘겨받은 과제 — 첫 발사' };
   if (card.status === 'launch-failed') return { kind: 'launch', command: launchArgs(card), reason: '직전 발사 실패 — 다시 발사' };
-  // live-move 줄(관측 기록)은 실패 사유가 아니다 — 그 줄을 뺀 마지막 칸이 사유다(live-move 줄 없는 카드는 종전과 같다).
-  if (card.status === 'failed') return { kind: 'wait', reason: card.history.filter((item) => item.event !== LIVE_MOVE_HISTORY_EVENT && item.event !== LIVE_MOVE_RESULT_EVENT).at(-1)?.detail ?? '런 실패 — PR·수확 가지 없음' };
+  // live-move·hand-move 줄(관측 기록)은 실패 사유가 아니다 — 그 줄을 뺀 마지막 칸이 사유다(live-move 줄 없는 카드는 종전과 같다).
+  if (card.status === 'failed') return { kind: 'wait', reason: card.history.filter((item) => item.event !== LIVE_MOVE_HISTORY_EVENT && item.event !== LIVE_MOVE_RESULT_EVENT && item.event !== HAND_MOVE_HISTORY_EVENT).at(-1)?.detail ?? '런 실패 — PR·수확 가지 없음' };
   return { kind: 'wait', reason: '발사됨 — 런 멈춤을 슈퍼바이저 그림자 판단(task-agent.shadow-move)이 받는다' };
 }
 
@@ -369,6 +393,29 @@ export class TaskLaunchError extends Error {
 }
 
 export interface HandTaskResult { card: TaskCard; move: TaskCardMove; mode: 'shadow' | 'live'; launched: boolean; cwd?: string }
+
+/** Dispatch evidence for a handed deliverable card; unlike handTask, this never launches work. */
+export function dispatchDeliverableCompletion(id: string, input: { ref: string; receipt?: boolean }, path: string, now: () => Date = () => new Date()): boolean {
+  const card = readTaskCard(id, path);
+  if (card?.completion !== 'deliverable' || !card.project?.target || card.pr !== undefined || card.status === 'failed' || card.status === 'launch-failed') return false;
+  const evidence = checkCompletionEvidence('deliverable', { dir: card.project.target, ...input });
+  if (judgeNextMove({ completion: card.completion, evidence }).move !== 'propose-green') {
+    try { debug.log('task-agent', 'deliverable-rejected', { taskId: id, ref: input.ref, missing: evidence.missing }); } catch { /* fail-soft */ }
+    return false;
+  }
+  const receiptEvidence = deliverableReceiptEvidence(evidence.ref);
+  const at = now().toISOString();
+  let closed = false;
+  updateTaskCard(path, id, (current) => {
+    if (current?.completion !== 'deliverable' || current.pr !== undefined || current.greenProposal || !current.project || current.project.target !== card.project?.target || current.status === 'failed' || current.status === 'launch-failed') return undefined;
+    const fresh = checkCompletionEvidence('deliverable', { dir: current.project.target, ...input });
+    if (judgeNextMove({ completion: current.completion, evidence: fresh }).move !== 'propose-green') return undefined;
+    closed = true;
+    return { ...current, greenProposal: { at, checklistId: current.checklistId ?? null, evidence: { [id]: receiptEvidence } } };
+  });
+  try { debug.log('task-agent', closed ? 'deliverable-closed' : 'deliverable-rejected', { taskId: id, ref: evidence.ref, ...(closed ? {} : { missing: ['already-proposed-or-changed'] }) }); } catch { /* fail-soft */ }
+  return closed;
+}
 
 export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const text = opts.text.trim();
@@ -440,7 +487,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   if (!opts.launcher) throw new Error('--live 인데 launcher 가 없다');
   const runId = mintRunId();
   const launchId = `tl-${randomBytes(6).toString('hex')}`;
-  const context: TaskLaunchContext = { runId, launchId, env: { [HARNESS_RUN_ID_ENV]: runId, ...(card.taLand ? { [TA_LAND_ENV]: '1' } : {}) }, cardLabelContext: taskCardLabelContext(card) };
+  const context: TaskLaunchContext = { runId, launchId, env: { [HARNESS_RUN_ID_ENV]: runId, ELANOUS_TASK_CARD_ID: card.id, ...(card.taLand ? { [TA_LAND_ENV]: '1' } : {}) }, cardLabelContext: taskCardLabelContext(card) };
   let receipt: void | TaskLaunchReceipt;
   try {
     receipt = await opts.launcher(move.command!, project?.target, context);

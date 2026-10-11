@@ -19,6 +19,7 @@
  * Cf. PLAN-parallel-self-dev-orchestrator-2026-07-21.
  */
 import { lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import type { ReviewRework } from '../../self-dev/run-types.js';
 import { oldDoorInternalEnv } from '../../self-dev/old-door.js';
 import { selfDevRunsDir } from '../../self-dev/run-store.js';
 import { debug } from '../../debug/log.js';
@@ -89,6 +90,7 @@ export interface SelfImplementDisposition {
   reviewVerdict?: 'pass' | 'warn' | 'fail';
   /** 마지막 리뷰의 must-fix 수(`review.mustFix.length`). 같은 조건. */
   reviewMustFixCount?: number;
+  rework?: ReviewRework;
   mustFix?: string[];
 }
 
@@ -463,6 +465,16 @@ export function parseSelfImplementJson(stdout: string): SelfImplementDisposition
       const o = JSON.parse(line) as Record<string, unknown>;
       if (typeof o.stage !== 'string' && typeof o.ok !== 'boolean') continue;
       const failureClassification = failureClassificationFromJson(o);
+      const rawRework = o.rework && typeof o.rework === 'object' && !Array.isArray(o.rework)
+        ? o.rework as Record<string, unknown> : undefined;
+      const rework = rawRework
+        && typeof rawRework.trend === 'string'
+        && ['unmeasured', 'improving', 'stable', 'worsening', 'oscillating'].includes(rawRework.trend)
+        && typeof rawRework.signature === 'string'
+        && typeof rawRework.rounds === 'number' && Number.isSafeInteger(rawRework.rounds) && rawRework.rounds >= 1
+        // A measured trend needs two reviews, a direction change three — a contradictory pair is not an observation.
+        && (rawRework.trend === 'unmeasured' ? rawRework.rounds === 1 : rawRework.rounds >= (rawRework.trend === 'oscillating' ? 3 : 2))
+        ? { trend: rawRework.trend as ReviewRework['trend'], signature: rawRework.signature, rounds: rawRework.rounds } : undefined;
       const mapped: SelfImplementDisposition = {
         ...(typeof o.stage === 'string' ? { stage: o.stage } : {}),
         ...(typeof o.ok === 'boolean' ? { ok: o.ok } : {}),
@@ -499,7 +511,13 @@ export function parseSelfImplementJson(stdout: string): SelfImplementDisposition
           ? { providerErrors: o.providerErrors as SelfImplementDisposition['providerErrors'] } : {}),
         ...(typeof o.runId === 'string' && o.runId.trim() ? { runId: o.runId, childRunId: o.runId } : {}),
         ...reviewGateFields(o),
-        ...(Array.isArray(o.mustFix) && o.mustFix.every((item) => typeof item === 'string') ? { mustFix: o.mustFix as string[] } : {}),
+        ...(rework ? { rework } : {}),
+        ...(Array.isArray(o.mustFix) && o.mustFix.every((item) => typeof item === 'string') ? { mustFix: o.mustFix as string[] }
+          : o.review && typeof o.review === 'object' && !Array.isArray(o.review)
+            && (o.review as { reviewed?: unknown }).reviewed === true
+            && Array.isArray((o.review as { mustFix?: unknown }).mustFix)
+            && ((o.review as { mustFix: unknown[] }).mustFix).every((item) => typeof item === 'string')
+            ? { mustFix: (o.review as { mustFix: string[] }).mustFix } : {}),
       };
       reportUnmappedDispositionFields(o, mapped);
       return mapped;

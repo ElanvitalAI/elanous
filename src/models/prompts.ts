@@ -63,7 +63,8 @@ export function getModelFamily(modelId: string | undefined): ModelFamily {
   // OpenRouter gateway ids only (`openrouter/<vendor>/<model>`). Bare vendor ids such as
   // `qwen/qwen3-coder-30b` stay 'other' on purpose: LM Studio publishes native ids in that
   // same shape (see getModelTier's local pattern), and this family must not reach local runs.
-  if (m.startsWith('openrouter/') && (m.includes('glm') || m.includes('kimi') || m.includes('qwen'))) {
+  // OR-DEEPSEEK-TUNE (2026-10-11) — `openrouter/deepseek/*` 도 같은 군(종전 'other' → 도구 규율 null).
+  if (m.startsWith('openrouter/') && (m.includes('glm') || m.includes('kimi') || m.includes('qwen') || m.startsWith('openrouter/deepseek/'))) {
     return 'open-weight';
   }
   return 'other';

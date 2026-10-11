@@ -34,6 +34,7 @@ import { isWorktreeInUse, listActiveTerminalDirectories } from '../harness/harne
 import { readWorktreePorcelain } from './abandoned-classification.js';
 import { recordHarnessWorktreeGoalMetadata, recordHarnessWorktreeProvenance, type HarnessWorktreeGoalMetadata } from '../harness/harness-worktree-add.js';
 import { runGitCommand } from '../git-fs/runner.js';
+import { BENCH_LABEL, BENCH_LOG_CATEGORY, benchIdFromBase, parseBenchArmBranch } from '../bench/bench.js';
 import { provisionDerivedUniverse } from '../instance/provision.js';
 import { DEFAULT_GATE_STEPS, runIntegrityGate, type GateResult, type GateStepName } from '../autopilot/build/integrity-gate.js';
 import { androidFilesIn, runAndroidUnitTestGate } from '../../scripts/ci-android-unit-tests.js';
@@ -94,6 +95,7 @@ import { isSupervisorDecisionSection, splitGoalSections, supervisorGoalDigest } 
 import type { SupervisionReworkSource } from './supervision-vocabulary.js';
 import type { ReworkBudgetVerdict } from './run-outcome.js';
 import { pickImplementRoleForGoal, runHeadlessGoalLoopPty } from './headless-elanous-driver.js';
+import { isClaudeAcpChild, runClaudeAcpImplement } from './claude-acp-implement.js';
 import { childLlmSelectionEnv } from '../agent/run-context.js';
 import { observeExternalEvent } from '../context-bus/external-events.js';
 import { buildLlmHitlRelay, SIDE_EFFECT_RE } from '../harness/llm-hitl-relay.js';
@@ -1067,6 +1069,8 @@ export interface DefaultSeamsOptions {
   buildLlmHitlRelay?: typeof buildLlmHitlRelay;
   /** 테스트용 PTY executor 주입. */
   runHeadlessGoalLoopPty?: typeof runHeadlessGoalLoopPty;
+  /** CLAUDE-IMPL-LANE 시험 주입 — claude-acp 자식의 구독 ACP 구현 실행. */
+  runClaudeAcpImplement?: typeof runClaudeAcpImplement;
   /** 테스트용 PTY 가용성 주입. */
   ptyAvailable?: () => boolean;
   /** Tests may inject the shared provenance writer to exercise the self-implement failure contract. */
@@ -1367,6 +1371,8 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
   const removeCleanupWorktree = o.removeWorktree ?? removeWorktree;
   const runCleanupGitCommand = o.runGitCommand ?? runGitCommand;
   const baselineRefs = new Map<string, string>();
+  // BENCH-ISOLATED-ARMS — 벤치 base(`bench/<id>/base`) 위에서 만든 작업 트리 → bench id.
+  const benchWorktrees = new Map<string, string>();
   const gateVerifyOrdinals = new Map<string, number>();
   const gateVerifyIdentity = (runId: string | undefined) => {
     if (!runId?.trim()) return { runId: runId === undefined ? null : runId, ordinal: null };
@@ -1535,6 +1541,18 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
     defaultBranchRef,
     // ★ G2(2026-07-21) — 호출부가 해석한 대상만 PR 직전에 정합한다.
     mergeMain: async (worktreePath, mergeTarget) => {
+      // BENCH-ISOLATED-ARMS ③ — 벤치 팔은 main 에 정합하지 않는다: 판정은 고정 base 위 게이트·시험·리뷰.
+      //   ⭐ 표지는 둘 중 하나 — 이 프로세스가 벤치 base 로 만든 트리이거나, 트리 가지가 `bench/<id>/<arm>` 이다
+      //   (재개 프로세스는 앞의 Map 이 비어 있으므로 가지 이름으로 다시 안다).
+      const benchArm = benchWorktrees.has(worktreePath) ? undefined : (() => {
+        const head = runGitCommand(worktreePath, ['rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8', timeout: GIT_TIMEOUT });
+        return head.status === 0 ? parseBenchArmBranch(String(head.stdout).trim()) : null;
+      })();
+      const benchId = benchWorktrees.get(worktreePath) ?? benchArm?.id;
+      if (benchId) {
+        debug.log(BENCH_LOG_CATEGORY, 'main-sync-skipped', { benchId, worktreePath, mergeTarget, source: benchWorktrees.has(worktreePath) ? 'base' : 'branch' });
+        return { status: 'up-to-date' as const };
+      }
       const { mergeMainIntoWorktreeWithLlm } = await import('../autopilot/build/llm-conflict-merge.js');
       return mergeMainIntoWorktreeWithLlm(worktreePath, mergeTarget);
     },
@@ -1586,6 +1604,8 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         ...(runId ? { currentOwner: `dev:${runId}` } : {}),
       });
       if (r.resolvedBase) baselineRefs.set(r.path, r.resolvedBase);
+      const benchId = benchIdFromBase(base);
+      if (benchId) benchWorktrees.set(r.path, benchId);
       const provenance = runId ? {
         owner: `dev:${runId}`,
         command: 'elanous dev',
@@ -1686,6 +1706,28 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         ...(runId ? { runId } : {}),
       });
       const prompt = featurePrompt(feature, cwd, o.reviewerContext);
+      // CLAUDE-IMPL-LANE — claude-acp 는 PTY 자식(`elanous chat` → getProvider)으로 보내지 않는다:
+      //   거기서는 모델 이름(claude-…)이 anthropic(API 키 provider)으로 풀려 «구독» 런이 API 로 과금된다(#26277 보류 판독).
+      //   구독 ACP 구현기만 쓰고, 구독 확인이 안 되면 실패로 끝낸다(다른 공급자로 조용히 새지 않는다).
+      if (isClaudeAcpChild(childLlm)) {
+        const outcome = await (o.runClaudeAcpImplement ?? runClaudeAcpImplement)({
+          cwd, prompt, ...(childLlm?.model ? { model: childLlm.model } : {}), ...(runId ? { runId } : {}),
+        });
+        if (outcome.kind === 'refused') {
+          debug.log('self-implement', 'implement.result', { reached: false, changed: false, transport: 'claude-acp', refused: outcome.reason, ...(runId ? { runId } : {}) });
+          return { ok: false, summary: `claude-acp 구현 레인 거부: ${outcome.reason}` };
+        }
+        const changed = worktreeHasChanges(cwd, harnessSeededPaths ?? []);
+        // 도구 호출 수 = 허가를 요청한 호출(허가 ⊕ 거부) — ACP 는 읽기 전용 호출 일부를 묻지 않으니 하한이다.
+        const toolCalls = outcome.result.allowed + outcome.result.denied;
+        debug.log('self-implement', 'implement.result', { reached: true, changed, toolCalls, transport: 'claude-acp', allowed: outcome.result.allowed, denied: outcome.result.denied, ...(runId ? { runId } : {}) });
+        return {
+          ok: changed,
+          ...buildImplementReport(outcome.result.text, { changed, toolCalls, reached: true, timedOut: false }),
+          toolCalls,
+          terminalStatus: { reached: true, changed, toolCalls, timedOut: false },
+        };
+      }
       // S4 P2b/P3: input은 관측만 하며, done만 config와 stall 확증을 모두 만족할 때 부모 대기를 끝낸다.
       // 이 종료-보고 규칙은 self-implement child에만 적용한다. 범용 brain의 기본 프롬프트를 바꾸지 않는다.
       const brain = createSelfImplementControlBrain({ goal: feature });
@@ -2436,7 +2478,11 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         commitMessage: title,
         ...(resolvedBase ? { base: resolvedBase } : {}),
         ...(draft !== undefined ? { draft } : {}),
-        ...(labels?.length ? { labels } : {}),
+        // BENCH-ISOLATED-ARMS ② — base 가 `bench/<id>/base` 면 라벨 `elanous:bench` 를 더한다.
+        ...(() => {
+          const all = benchIdFromBase(resolvedBase) && !labels?.includes(BENCH_LABEL) ? [...(labels ?? []), BENCH_LABEL] : labels;
+          return all?.length ? { labels: all } : {};
+        })(),
       });
       if (!outcome.ok) throw new Error(`self-implement PR ${outcome.reason} 실패: ${outcome.detail}`);
       const number = Number.parseInt(outcome.url.match(/\/pull\/(\d+)/)?.[1] ?? '', 10);

@@ -1,5 +1,6 @@
 import type { GraphRunState } from '../../src/graph-runner/runner.js';
 import { publicWaiverReason } from './known-issues-node.js';
+import { checkGateExecutorChoice, type GateExecutor } from './gate-executor.js';
 
 export interface AcceptedRegression { id: string; note: string }
 
@@ -50,4 +51,44 @@ export function releaseResumeWaiver(
   }
   return { nodeId: opts.waive, reason, acceptedRegressions: releaseResumeAcceptedRegressions(state,
     [...(opts.acceptedRegressions ?? []), { id: `waive:${opts.waive}`, note: reason }]) };
+}
+
+/** GATE-HOST-EXECUTOR — one explicit executor switch, recorded on the run (`GraphRunState.inputOverrides`). */
+export interface GateExecutorOverride {
+  kind: 'gate-executor';
+  at: string;
+  from: string;
+  set: { gateExecutor: GateExecutor; gateRemote?: string };
+  /** Input keys removed — switching back to pod drops the host an earlier override added (the original had none). */
+  unset?: Array<'gateRemote'>;
+  previous: { gateExecutor: unknown; gateRemote: unknown };
+}
+
+/**
+ * Switch the gate executor of a resumed release run. Not a waiver: the gate node runs again (the restart must be at or
+ * before gate) and produces a normal verdict; only where its sweep runs changes.
+ */
+export function releaseResumeGateExecutor(state: GraphRunState, opts: { from: string; executor: unknown; host?: unknown; at?: string }): GateExecutorOverride {
+  const input = state.input;
+  if (!input || typeof input !== 'object' || Array.isArray(input) || typeof (input as { version?: unknown }).version !== 'string') throw new Error('release run has no input');
+  const saved = input as { gateExecutor?: unknown; gateRemote?: unknown; gatePodPool?: unknown };
+  // Host executor without --gate-host: the run's own gateRemote (release.loop.gateRemote when it started), like `release run`.
+  const choice = checkGateExecutorChoice(opts.executor, opts.executor === 'host' && opts.host === undefined ? saved.gateRemote : opts.host);
+  if (choice.executor === 'pod' && (typeof saved.gatePodPool !== 'string' || !saved.gatePodPool.trim())) {
+    throw new Error('--gate-executor pod requires the saved run input gatePodPool');
+  }
+  const start = state.path.indexOf(opts.from);
+  if (start < 0) throw new Error(`--from ${opts.from} is not a node on the saved path`);
+  const gate = state.path.indexOf('gate');
+  // A restart after gate keeps the recorded verdict — switching its executor there would record a choice nothing used.
+  if (gate >= 0 && start > gate) throw new Error('--gate-executor needs a resume that re-runs gate (--from gate or earlier)');
+  // Back to pod: restore the gateRemote the run started with (an earlier host override replaced it).
+  const firstHost = choice.executor === 'pod' ? state.inputOverrides?.find((item) => item.kind === 'gate-executor' && item.set.gateRemote !== undefined) : undefined;
+  const restored = firstHost ? firstHost.previous.gateRemote : undefined;
+  return {
+    kind: 'gate-executor', at: opts.at ?? new Date().toISOString(), from: opts.from,
+    set: { gateExecutor: choice.executor, ...(choice.host ? { gateRemote: choice.host } : typeof restored === 'string' ? { gateRemote: restored } : {}) },
+    ...(firstHost && typeof restored !== 'string' ? { unset: ['gateRemote' as const] } : {}),
+    previous: { gateExecutor: saved.gateExecutor ?? null, gateRemote: saved.gateRemote ?? null },
+  };
 }

@@ -1,9 +1,10 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { runFirstRun } from './first-run.js';
+import { orderProviderChoices, runFirstRun } from './first-run.js';
+import { debug } from '../debug/log.js';
 import { unattendedNextStepLine } from './entry-hints.js';
 import { buildUserConfig, saveUserConfig } from '../user-config.js';
 import { needsFirstRun, needsOnboarding } from '../onboarding.js';
@@ -34,13 +35,13 @@ describe('first run', () => {
     } finally { f.cleanup(); }
   });
 
-  test('input 0: detects subscriptions in codex → grok → claude order and saves ready', async () => {
+  test('input 0: a single detected subscription (codex beside Claude agent-cli) saves ready without asking', async () => {
     const f = fixture();
     try {
       const cfg = buildUserConfig(f.path);
       let asked = 0;
       const result = await runFirstRun({ path: f.path, config: cfg, isTTY: true,
-        detectProviders: async () => [detected('claude-code', 'agent-cli'), detected('grok'), detected('openai-codex')],
+        detectProviders: async () => [detected('claude-code', 'agent-cli'), detected('openai-codex')],
         chooseProvider: async () => { asked++; return 'grok'; },
       });
       expect(result).toEqual({ outcome: 'ready', provider: 'openai-codex', inputs: 0 });
@@ -150,16 +151,108 @@ describe('first run', () => {
     } finally { f.cleanup(); }
   });
 
-  test('available Claude agent-cli is adopted without a second login flag', async () => {
+  test('claude-code-only detection never saves provider anthropic silently', async () => {
     const f = fixture();
     try {
+      const lines: string[] = [];
       const result = await runFirstRun({ path: f.path, isTTY: false,
         detectProviders: async () => [detected('claude-code', 'agent-cli')],
+        chooseProvider: async () => { throw new Error('prompted'); }, print: (line) => lines.push(line),
+      });
+      expect(result).toEqual({ outcome: 'needs-llm', inputs: 0 });
+      expect(buildUserConfig(f.path).onboarding.ready).toBeUndefined();
+      expect(buildUserConfig(f.path).llm.provider).not.toBe('anthropic');
+      expect(lines.join('\n')).toContain('claude-code 구독');
+      expect(lines).toContain('eln setup llm 으로 고르세요');
+    } finally { f.cleanup(); }
+  });
+
+  test('claude-code-only detection on a TTY asks once and never pre-picks anthropic', async () => {
+    const f = fixture();
+    try {
+      const seen: Array<readonly string[]> = [];
+      const result = await runFirstRun({ path: f.path, isTTY: true, print: () => {},
+        detectProviders: async () => [detected('claude-code', 'agent-cli')],
+        chooseProvider: async (list) => { seen.push(list); return null; },
+      });
+      expect(result).toEqual({ outcome: 'cancelled', inputs: 1 });
+      expect(seen).toEqual([[]]);
+      expect(buildUserConfig(f.path).onboarding.ready).toBeUndefined();
+    } finally { f.cleanup(); }
+  });
+
+  test('two detected subscriptions on a TTY ask once with detected first', async () => {
+    const f = fixture();
+    try {
+      const cfg = buildUserConfig(f.path);
+      cfg.llm.rotation = [{ provider: 'grok', apiKey: 'grok-key' }];
+      const seen: Array<readonly string[]> = [];
+      const result = await runFirstRun({ path: f.path, config: cfg, isTTY: true, print: () => {},
+        detectProviders: async () => [detected('claude-code', 'agent-cli'), detected('grok'), detected('openai-codex')],
+        chooseProvider: async (list) => { seen.push(list); return 'grok'; },
+      });
+      expect(result).toEqual({ outcome: 'ready', provider: 'grok', inputs: 1 });
+      expect(seen).toEqual([['openai-codex', 'grok']]);
+      expect(orderProviderChoices(['openai-codex', 'grok'])).toEqual(['openai-codex', 'grok', 'anthropic']);
+      expect(orderProviderChoices(['grok'])).toEqual(['grok', 'openai-codex', 'anthropic']);
+      expect(buildUserConfig(f.path).llm.provider).toBe('grok');
+    } finally { f.cleanup(); }
+  });
+
+  test('two detected subscriptions on non-TTY stop at needs-llm and name them', async () => {
+    const f = fixture();
+    try {
+      const lines: string[] = [];
+      const result = await runFirstRun({ path: f.path, isTTY: false,
+        detectProviders: async () => [detected('grok'), detected('openai-codex')],
+        chooseProvider: async () => { throw new Error('prompted'); }, print: (line) => lines.push(line),
+      });
+      expect(result).toEqual({ outcome: 'needs-llm', inputs: 0 });
+      expect(lines.join('\n')).toContain('감지: grok 구독 · codex 구독 → 둘 이상 감지되어 고르세요');
+      expect(buildUserConfig(f.path).onboarding.ready).toBeUndefined();
+    } finally { f.cleanup(); }
+  });
+
+  test('detection line names what was detected and chosen', async () => {
+    const f = fixture();
+    try {
+      const lines: string[] = [];
+      const result = await runFirstRun({ path: f.path, isTTY: false, print: (line) => lines.push(line),
+        detectProviders: async () => [detected('openai-codex'), detected('claude-code', 'agent-cli')],
+      });
+      expect(result).toEqual({ outcome: 'ready', provider: 'openai-codex', inputs: 0 });
+      expect(lines).toEqual(['감지: codex 구독 · claude-code 구독 → openai-codex']);
+    } finally { f.cleanup(); }
+  });
+
+  test('codex-only detection still becomes ready with zero inputs', async () => {
+    const f = fixture();
+    try {
+      const result = await runFirstRun({ path: f.path, isTTY: true, print: () => {},
+        detectProviders: async () => [detected('openai-codex')],
         chooseProvider: async () => { throw new Error('prompted'); },
       });
-      expect(result).toEqual({ outcome: 'ready', provider: 'anthropic', inputs: 0 });
+      expect(result).toEqual({ outcome: 'ready', provider: 'openai-codex', inputs: 0 });
+      expect(buildUserConfig(f.path).llm.provider).toBe('openai-codex');
       expect(buildUserConfig(f.path).onboarding.ready).toBe(true);
     } finally { f.cleanup(); }
+  });
+
+  test('ledger event format is unchanged: onboarding.first-run detected → ready with {providers, inputs}', async () => {
+    const f = fixture();
+    const logged: Array<{ event: string; data: unknown }> = [];
+    const spy = spyOn(debug, 'log').mockImplementation((category: string, event: string, data?: unknown) => {
+      if (category === 'onboarding.first-run') logged.push({ event, data });
+    });
+    try {
+      await runFirstRun({ path: f.path, isTTY: false, print: () => {},
+        detectProviders: async () => [detected('openai-codex'), detected('claude-code', 'agent-cli')],
+      });
+      expect(logged).toEqual([
+        { event: 'detected', data: { providers: ['openai-codex', 'claude-code'], inputs: 0 } },
+        { event: 'ready', data: { providers: ['openai-codex', 'claude-code'], inputs: 0 } },
+      ]);
+    } finally { spy.mockRestore(); f.cleanup(); }
   });
 
   test('unavailable agent-cli is not adopted', async () => {
@@ -260,7 +353,7 @@ describe('first run', () => {
       });
       processChild.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
       let timedOut = false;
-      const timeout = setTimeout(() => { timedOut = true; processChild.kill('SIGTERM'); }, 12000);
+      const timeout = setTimeout(() => { timedOut = true; processChild.kill('SIGTERM'); }, 45000);
       const status = await new Promise<number | null>((resolve, reject) => {
         processChild.once('error', reject);
         processChild.once('close', (code) => resolve(code));
@@ -270,6 +363,10 @@ describe('first run', () => {
       expect(timedOut).toBe(false);
       expect(child.status).toBe(0);
       expect(child.stdout).toContain('[elanous] provider: openai-codex');
+      expect(child.stdout).toContain('오프라인 모드');
+      expect(child.stdout).toContain('오류 보고 안내:');
+      expect(child.stdout.indexOf('오류 보고 안내:')).toBeLessThan(child.stdout.indexOf('\x1b[?1049h'));
+      expect(child.stdout.indexOf('오프라인 모드')).toBeLessThan(child.stdout.indexOf('\x1b[?1049h'));
       expect(child.stdout.indexOf('\x1b[?1049h')).toBeGreaterThan(child.stdout.indexOf('[elanous] provider: openai-codex'));
       expect(child.stdout + child.stderr).not.toContain('eln setup llm');
       expect(child.stdout + child.stderr).not.toContain('Step 1');
@@ -277,8 +374,59 @@ describe('first run', () => {
       const saved = buildUserConfig(join(configDir, 'config.json'));
       expect(saved.onboarding).toMatchObject({ ready: true, completed: false });
       expect(saved.llm.provider).toBe('openai-codex');
+      expect(saved.errorReports?.noticeShown).toBe(true);
     } finally { f.cleanup(); }
-  }, 20000);
+  }, 60000);
+
+  test('spawned CLI: bare first run with no daemon reaches the first-screen gate within 3s and does not mark the notice shown without a TTY', async () => {
+    const f = fixture();
+    try {
+      const home = join(f.dir, 'home');
+      const configDir = join(f.dir, 'cfg');
+      mkdirSync(home);
+      mkdirSync(configDir);
+      const env = { ...process.env, HOME: home, CODEX_HOME: join(home, '.codex'),
+        CLAUDE_CONFIG_DIR: join(home, '.claude'), XDG_CONFIG_HOME: '',
+        ELANOUS_LLM_PROVIDER: '', ELANOUS_ESCALATE_PROVIDER: '', LOCAL_LLM_URL: '' };
+      const cli = [process.execPath, resolve(import.meta.dir, '../../bin/elanous.mjs'), '--test', '--config-dir', configDir];
+      const cwd = resolve(import.meta.dir, '../..');
+      // Warm Bun's transpile cache for this HOME once; the budget is elanous's own path, not a cold compile.
+      spawnSync(cli[0]!, [...cli.slice(1), '--version'], { cwd, env, input: '', encoding: 'utf8', timeout: 30000 });
+      writeFileSync(join(configDir, 'config.json'), JSON.stringify({
+        llm: { provider: 'anthropic', apiKey: 'timing-cli-secret', model: 'claude-sonnet-4' },
+        onboarding: { completed: false },
+        errorReports: { identity: true, email: 'person@example.org' },
+      }));
+      const began = Date.now();
+      let offlineAt = -1;
+      const proc = spawn(cli[0]!, cli.slice(1), { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+      const run = { stdout: '', stderr: '', status: null as number | null, error: undefined as Error | undefined };
+      proc.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+        run.stdout += chunk;
+        if (offlineAt < 0 && run.stdout.includes('오프라인 모드')) offlineAt = Date.now() - began;
+      });
+      proc.stderr.setEncoding('utf8').on('data', (chunk: string) => { run.stderr += chunk; });
+      const killer = setTimeout(() => proc.kill('SIGTERM'), 30000);
+      run.status = await new Promise<number | null>((done, fail) => { proc.once('error', fail); proc.once('close', done); })
+        .finally(() => clearTimeout(killer));
+      const elapsed = Date.now() - began;
+      expect(run.error).toBeUndefined();
+      // Exit 1 at the stdin-TTY gate = the point where the dashboard would draw its first screen.
+      expect(run.status).toBe(1);
+      expect(run.stderr).toContain('stdin TTY');
+      // The daemon decision (the old 12s health wait) is made within 3s of spawn.
+      expect(offlineAt).toBeGreaterThanOrEqual(0);
+      expect(offlineAt).toBeLessThanOrEqual(3000);
+      // Whole path to the first-screen gate: far below the old 12s wait (measured 1.3–3.2s at load 12;
+      // the variance is first-run provider detection after the decision, outside this cell).
+      expect(elapsed).toBeLessThan(6000);
+      expect(run.stdout).toContain('오프라인 모드');
+      expect(run.stdout + run.stderr).not.toContain('웹 셋업을 위해 데몬을 시작');
+      // No TTY → no dashboard → nobody saw a notice: it is neither printed nor recorded as shown.
+      expect(run.stdout).not.toContain('오류 보고 안내:');
+      expect(buildUserConfig(join(configDir, 'config.json')).errorReports?.noticeShown).toBeUndefined();
+    } finally { f.cleanup(); }
+  }, 70000);
 
   test('spawned CLI: empty HOME and closed stdin take real bare entry without Step 1', () => {
     const f = fixture();
@@ -297,7 +445,7 @@ describe('first run', () => {
       };
       const child = spawnSync(process.execPath,
         [resolve(import.meta.dir, '../../bin/elanous.mjs'), '--test', '--config-dir', configDir],
-        { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 12000 });
+        { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 20000 });
       const text = child.stdout + child.stderr;
       expect(child.error).toBeUndefined();
       expect(child.status).toBe(0);
@@ -308,7 +456,7 @@ describe('first run', () => {
       writeFileSync(join(configDir, 'config.json'), JSON.stringify({ onboarding: { completed: true } }));
       const completed = spawnSync(process.execPath,
         [resolve(import.meta.dir, '../../bin/elanous.mjs'), '--test', '--config-dir', configDir],
-        { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 12000 });
+        { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 20000 });
       expect(completed.error).toBeUndefined();
       expect(completed.status).toBe(1);
       expect(completed.stderr).toContain('stdin TTY');
@@ -321,7 +469,7 @@ describe('first run', () => {
       }));
       const configured = spawnSync(process.execPath,
         [resolve(import.meta.dir, '../../bin/elanous.mjs'), '--test', '--config-dir', configDir],
-        { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 12000 });
+        { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 20000 });
       expect(configured.error).toBeUndefined();
       expect(configured.status).toBe(1);
       expect(configured.stderr).toContain('stdin TTY');
@@ -332,5 +480,5 @@ describe('first run', () => {
       });
       expect(buildUserConfig(join(configDir, 'config.json')).onboarding).toMatchObject({ ready: true, completed: false });
     } finally { f.cleanup(); }
-  }, 20000);
+  }, 65000);
 });

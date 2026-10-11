@@ -4,6 +4,7 @@ import { describe, expect, it } from 'bun:test';
 import { Command } from 'commander';
 import { visibleWidth } from '../tui.js';
 import { grokUsageToSnapshot } from './fetchers/grok.js';
+import { grokQuotaFromUsageSnapshot } from '../oauth/fallback-chain.js';
 import { collectUnifiedUsage, formatUnifiedUsage, formatUsageCompact } from './unified-usage.js';
 import { registerUsageCommand } from '../cli/usage-cli.js';
 import { executeUsageSlash } from '../skills/tools/usage-slash.js';
@@ -80,7 +81,10 @@ describe('collectUnifiedUsage — 계정 행 × 크레딧 축 × 구독 축', ()
     expect(codex[1]!.subscription.status).toBe('available');
     const grok = report.rows.find((r) => r.provider === 'grok')!;
     expect(grok.credits.status).toBe('ok');
-    expect(grok.subscription).toEqual({ status: 'unavailable', reason: 'query-does-not-supply' });
+    expect(grok.subscription).toEqual({
+      status: 'available', remainingPercent: 58,
+      resetsAt: Date.parse('2026-08-14T13:07:00Z'), windowKind: 'weekly',
+    });
     expect(homes).toEqual(['/tmp/codex-default', '/tmp/codex-team']);
     expect(process.env.CODEX_HOME).not.toBe('/tmp/codex-team');
   });
@@ -103,7 +107,7 @@ describe('collectUnifiedUsage — 계정 행 × 크레딧 축 × 구독 축', ()
     expect(text).toContain('codex  accounts=1  (하나뿐)');
   });
 
-  it('Grok 구독 축은 0·빈칸이 아니라 query-does-not-supply 다', async () => {
+  it('Grok 주간 quota 를 subscription 축으로 실제 읽고 credits 축은 보존한다', async () => {
     const report = await collectUnifiedUsage({
       listCodexAccounts: () => [],
       fetchCodex: async () => { throw new Error('codex should not run when no accounts'); },
@@ -113,15 +117,24 @@ describe('collectUnifiedUsage — 계정 행 × 크레딧 축 × 구독 축', ()
     const grok = report.rows.find((r) => r.provider === 'grok')!;
     expect(grok.credits.status).toBe('ok');
     if (grok.credits.status === 'ok') expect(grok.credits.usedPercent).toBe(42);
-    expect(grok.subscription).toEqual({ status: 'unavailable', reason: 'query-does-not-supply' });
+    expect(grok.subscription).toEqual({
+      status: 'available', remainingPercent: 58,
+      resetsAt: Date.parse('2026-08-14T13:07:00Z'), windowKind: 'weekly',
+    });
+    const snapshot = grokUsageToSnapshot(GROK_OK, 1);
+    expect(snapshot.windows).toEqual([{
+      kind: 'weekly', windowMinutes: 10_080, limit: 100,
+      used: 42, remainingPercent: 58, resetsAt: Date.parse('2026-08-14T13:07:00Z'),
+    }]);
+    expect(grokQuotaFromUsageSnapshot(snapshot)).toBe('usable');
     const text = formatUnifiedUsage(report);
     expect(text).toContain('credits.usedPercent');
     expect(text).toContain('42%');
-    expect(text).toContain('unavailable (query-does-not-supply)');
+    expect(text).toContain('available remaining=58% weekly');
     const subLine = text.split('\n').find((l) => l.includes('grok') && l.includes('default'));
     expect(subLine).toBeDefined();
     expect(subLine).toContain('42%');
-    expect(subLine).toContain('unavailable (query-does-not-supply)');
+    expect(subLine).toContain('available remaining=58% weekly');
     expect(subLine).not.toMatch(/available remaining=42/);
   });
 
@@ -282,13 +295,15 @@ describe('formatUsageCompact — 계정별 한 줄 TUI 문면', () => {
   });
 });
 
-describe('grokUsageToSnapshot — 크레딧 사용률을 RateWindow 에 넣지 않는다', () => {
-  it('windows 는 비어 있고 credits 만 있다', () => {
+describe('grokUsageToSnapshot — 실제 주간 할당량 창과 크레딧은 별도 축이다', () => {
+  it('weekly query values populate the quota window and prepaid credits stay separate', () => {
     const snap = grokUsageToSnapshot(GROK_OK, 1);
     expect(snap.provider).toBe('grok');
-    expect(snap.windows).toEqual([]);
+    expect(snap.windows).toEqual([{
+      kind: 'weekly', windowMinutes: 10_080, limit: 100,
+      used: 42, remainingPercent: 58, resetsAt: Date.parse('2026-08-14T13:07:00Z'),
+    }]);
     expect(snap.credits?.balance).toBe(3);
-    expect(JSON.stringify(snap)).not.toContain('remainingPercent');
   });
 });
 
@@ -405,7 +420,10 @@ describe('collectGrokRows — 계정 수는 자격에서 파생한다', () => {
     expect(grok[0]!.soleAccount).toBe(true);
     expect(report.accountCounts.grok).toBe(1);
     expect(grok[0]!.credits.status).toBe('ok');
-    expect(grok[0]!.subscription).toEqual({ status: 'unavailable', reason: 'query-does-not-supply' });
+    expect(grok[0]!.subscription).toEqual({
+      status: 'available', remainingPercent: 58,
+      resetsAt: Date.parse('2026-08-14T13:07:00Z'), windowKind: 'weekly',
+    });
   });
 
   it('자격이 없으면 grok 행이 없고 accountCounts.grok 은 0 이다', async () => {

@@ -4,7 +4,9 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { registerAutopilotCommands } from '../cli/autopilot-cli.js';
-import { executeNextAction, readDeliveryEvidence, type ActionDeps, type NextAction } from './actions.js';
+import { executeNextAction, failureKey, readDeliveryEvidence, type ActionDeps, type NextAction } from './actions.js';
+import { judgeNextMove, LIVE_RETRY_MOVES, retryMoveOf, SAME_MOVE_FAILURE_LIMIT } from './judge.js';
+import { resolveTaskAgentLiveMoves } from './live-moves.js';
 
 test('deliver live copies and checks evidence then proposes green without PR; shadow copies nothing', async () => {
   const root = mkdtempSync(join(tmpdir(), 'action-deliver-'));
@@ -223,6 +225,18 @@ test('failures from two processes add up through incrementFailure (no stale over
   expect(await executeNextAction({ ...action, kind: 'retry', mustFix: ['fix it'] }, { ...f.deps, failureCounts: { [JSON.stringify(['TASK', 'retry'])]: 2 } })).toBe('decision');
 });
 
+test('TA-LIVE-RETRY: bare relaunch and the narrow variant are one move — the cap sees their failures together', async () => {
+  const f = fake();
+  const counts = { [JSON.stringify(['TASK', 'retry'])]: 1, [JSON.stringify(['TASK', 'retry', 'narrow'])]: 1 };
+  let launched = 0;
+  const base = f.deps.command;
+  f.deps.command = async args => { if (args[0] === 'harness') launched++; return base(args); };
+  expect(await executeNextAction({ ...action, kind: 'retry', variant: 'narrow' }, { ...f.deps, failureCounts: { ...counts } })).toBe('decision');
+  expect(await executeNextAction({ ...action, kind: 'retry', mustFix: ['fix it'] }, { ...f.deps, failureCounts: { ...counts } })).toBe('decision');
+  expect(launched).toBe(0);
+  expect(await executeNextAction({ ...action, kind: 'retry', variant: 'salvage', salvageBranch: 'salvage/x' }, { ...f.deps, failureCounts: { ...counts } })).not.toBe('decision');
+});
+
 test('an unreadable merge state keeps the reserved slot (it may have merged)', async () => {
   const f = fake();
   let released = 0;
@@ -232,5 +246,126 @@ test('an unreadable merge state keeps the reserved slot (it may have merged)', a
   f.deps.command = async args => args[0] === 'gh' && args.includes('state,mergeCommit') ? { status: 1, stdout: '', stderr: 'rate limited' } : base(args);
   await executeNextAction({ ...action, kind: 'land' }, f.deps);
   expect(released).toBe(0);
+});
+
+// TA-LIVE-RETRY — 사다리 R4: 재발사 계열 넷을 실행부 허용 목록에 올린다 · 같은 수 2회 상한 · 회당 1건 · 부하 관문.
+const VARIANT_OF = { 'narrow-relaunch': 'narrow', 'wait-retry': 'wait', 'salvage-relaunch': 'salvage', alternative: 'alternative' } as const;
+const retry = (variant: NextAction['variant'], over: Partial<NextAction> = {}): NextAction => ({ ...action, kind: 'retry', ...(variant ? { variant } : {}), ...over });
+const harnessCalls = (calls: string[][]) => calls.filter(c => c[0] === 'harness');
+
+test('R4 live: the four retry moves are vocabulary of taskAgent.liveMoves', () => {
+  const resolved = resolveTaskAgentLiveMoves([...LIVE_RETRY_MOVES, 'review', 'relaunch'], {}, () => {});
+  const expected: string[] = [...LIVE_RETRY_MOVES, 'review'];
+  const moves: string[] = [...resolved.moves];
+  expect(moves.sort()).toEqual(expected.sort());
+  expect(resolved.ignored).toEqual(['relaunch']);
+  expect(LIVE_RETRY_MOVES.map(move => retryMoveOf(VARIANT_OF[move]))).toEqual([...LIVE_RETRY_MOVES]);
+  expect(retryMoveOf(undefined)).toBe('narrow-relaunch');
+});
+
+test('R4 live: allow-listed narrow · salvage · alternative launch once each, wait only leaves a marker', async () => {
+  for (const [variant, hint] of [['narrow', 'Narrow relaunch'], ['salvage', 'Salvage relaunch'], ['alternative', 'Alternative approach']] as const) {
+    const f = fake();
+    f.deps.liveMoves = new Set(LIVE_RETRY_MOVES);
+    expect(await executeNextAction(retry(variant), f.deps)).toBe('done');
+    expect(harnessCalls(f.calls)).toHaveLength(1);
+    expect(f.calls[0]![2]).toContain(hint);
+  }
+  const f = fake();
+  f.deps.liveMoves = new Set(LIVE_RETRY_MOVES);
+  expect(await executeNextAction(retry('wait'), f.deps)).toBe('waiting');
+  expect(f.calls).toHaveLength(0);
+});
+
+test('R4 live: a retry move missing from the allow-list stays shadow without any command', async () => {
+  const f = fake();
+  f.deps.liveMoves = new Set(['review', 'narrow-relaunch']);
+  expect(await executeNextAction(retry('salvage'), f.deps)).toBe('shadow');
+  expect(await executeNextAction(retry('wait'), f.deps)).toBe('shadow');
+  expect(await executeNextAction(retry('alternative'), f.deps)).toBe('shadow');
+  expect(f.calls).toHaveLength(0);
+  expect(f.events.at(-1)).toMatchObject({ result: 'shadow', reason: expect.stringContaining('alternative not in live allow-list') });
+  expect(await executeNextAction(retry('narrow'), f.deps)).toBe('done');
+});
+
+test('R4 live: without an allow-list or gates the retry path is unchanged', async () => {
+  const f = fake();
+  expect(await executeNextAction(retry('salvage'), f.deps)).toBe('done');
+  expect(await executeNextAction(retry('salvage'), f.deps)).toBe('done');
+  expect(harnessCalls(f.calls)).toHaveLength(2);
+});
+
+test('R4 live: one relaunch per cycle — the second retry of the same cycle is shadow', async () => {
+  const f = fake();
+  f.deps.liveMoves = new Set(LIVE_RETRY_MOVES);
+  f.deps.retryLaunches = { count: 0 };
+  expect(await executeNextAction(retry('narrow'), f.deps)).toBe('done');
+  expect(await executeNextAction(retry('alternative', { taskId: 'OTHER' }), f.deps)).toBe('shadow');
+  expect(await executeNextAction(retry('wait'), f.deps)).toBe('waiting');
+  expect(harnessCalls(f.calls)).toHaveLength(1);
+  expect(f.events.some(e => (e as { reason: string }).reason.includes('one relaunch per cycle'))).toBe(true);
+  expect(f.deps.retryLaunches.count).toBe(1);
+  f.deps.retryLaunches = { count: 0 };
+  expect(await executeNextAction(retry('narrow', { taskId: 'OTHER' }), f.deps)).toBe('done');
+});
+
+test('R4 live: a failed launch still uses the cycle slot', async () => {
+  const f = fake();
+  f.deps.retryLaunches = { count: 0 };
+  f.deps.command = async args => { f.calls.push(args); return { status: 1, stdout: '', stderr: 'boom' }; };
+  expect(await executeNextAction(retry('narrow'), f.deps)).toBe('failed');
+  expect(await executeNextAction(retry('salvage'), f.deps)).toBe('shadow');
+  expect(harnessCalls(f.calls)).toHaveLength(1);
+});
+
+test('R4 live: load gate — at or above loadMax (or unreadable) stays shadow, below launches, wait is not gated', async () => {
+  const gate = (load: number | null) => ({ loadMax: 100, load1: () => load });
+  for (const load of [100, 250, null, Number.NaN]) {
+    const f = fake();
+    f.deps.loadGate = gate(load);
+    expect(await executeNextAction(retry('narrow'), f.deps)).toBe('shadow');
+    expect(f.calls).toHaveLength(0);
+    expect(f.events.at(-1)).toMatchObject({ reason: expect.stringContaining('load gate') });
+    expect(await executeNextAction(retry('wait'), f.deps)).toBe('waiting');
+  }
+  const open = fake();
+  open.deps.loadGate = gate(99.9);
+  expect(await executeNextAction(retry('narrow'), open.deps)).toBe('done');
+  expect(harnessCalls(open.calls)).toHaveLength(1);
+});
+
+test('R4 live: a shadowed retry does not use the cycle slot', async () => {
+  const f = fake();
+  f.deps.retryLaunches = { count: 0 };
+  f.deps.loadGate = { loadMax: 10, load1: () => 50 };
+  expect(await executeNextAction(retry('narrow'), f.deps)).toBe('shadow');
+  expect(f.deps.retryLaunches.count).toBe(0);
+});
+
+test('R4 live: same task and same move never launches a third time (judge ⊕ executor share the counts)', async () => {
+  const f = fake();
+  f.deps.liveMoves = new Set(LIVE_RETRY_MOVES);
+  f.deps.failureCounts = {};
+  f.deps.command = async args => { f.calls.push(args); return { status: args[0] === 'harness' ? 1 : 0, stdout: '', stderr: 'boom' }; };
+  const launchedBy: Record<string, number> = {};
+  for (let tick = 0; tick < 8; tick++) {
+    const failures = Object.fromEntries(LIVE_RETRY_MOVES.map(move =>
+      [move, f.deps.failureCounts![failureKey({ taskId: 'TASK', kind: 'retry', variant: VARIANT_OF[move] })] ?? 0]));
+    const judged = judgeNextMove({ stopReason: 'no-progress', failures });
+    f.deps.retryLaunches = { count: 0 };
+    const before = harnessCalls(f.calls).length;
+    await executeNextAction({ ...action, kind: judged.executorKind!, ...(judged.executorVariant ? { variant: judged.executorVariant } : {}) }, f.deps);
+    if (harnessCalls(f.calls).length > before) launchedBy[judged.move] = (launchedBy[judged.move] ?? 0) + 1;
+  }
+  expect(launchedBy).toEqual({ 'narrow-relaunch': SAME_MOVE_FAILURE_LIMIT, alternative: 1 });
+  expect(f.calls.filter(c => c[0] === 'decisions').length).toBeGreaterThan(0);
+});
+
+test('R4 live: the executor itself refuses the move once it failed SAME_MOVE_FAILURE_LIMIT times', async () => {
+  const f = fake();
+  f.deps.liveMoves = new Set(LIVE_RETRY_MOVES);
+  f.deps.failureCounts = { [failureKey({ taskId: 'TASK', kind: 'retry', variant: 'salvage' })]: SAME_MOVE_FAILURE_LIMIT };
+  expect(await executeNextAction(retry('salvage'), f.deps)).toBe('decision');
+  expect(harnessCalls(f.calls)).toHaveLength(0);
 });
 

@@ -18,6 +18,7 @@ import { RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
 import { parsePodPool, PodPoolScheduler } from '../task-orchestrator/surfaces/pod-pool.js';
 import { podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { Command } from 'commander';
+import { assessRunningRuns, buildRunProgressRows, renderRunProgressTable } from '../self-implement/running-runs.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
 import { GRAPH_SPECS } from '../self-implement/graph-templates.js';
 import type { GraphOverlaySpec } from '../self-implement/graph-overlay-yaml.js';
@@ -3694,6 +3695,32 @@ test('draft sweep gh calls pass an explicit env built from process.env (cron min
   expect(calls.length).toBeGreaterThan(0);
   expect(calls.filter((call) => !/\benv\b/.test(call))).toEqual([]);
   expect(source).toContain('const env = ghAutomationEnv(process.env);');
+});
+
+test('harness progress: queries running runs as harness.progress and prints the progress table; --json prints the same row array', async () => {
+  const callers: (string | undefined)[] = [];
+  const result = assessRunningRuns([{ runId: 'run-p', lifecycle: 'live', ledgerDirectory: '/state/run-p', lastActivityTimestamp: '2026-10-11T00:00:00.000Z' } as never], {
+    refs: [{ instance: 'prod', id: 'pty-p', kind: 'shell', alive: true, runId: 'run-p' }], unreadable: [],
+  });
+  const progress = {
+    query: ((options?: { caller?: string }) => { callers.push(options?.caller); return result; }) as never,
+    nowMs: () => Date.parse('2026-10-11T00:30:00.000Z'),
+  };
+  const program = new Command().exitOverride();
+  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness', progress });
+  const printed: string[] = [];
+  const original = console.log;
+  console.log = (...args: unknown[]) => { printed.push(args.map(String).join(' ')); };
+  try {
+    await program.parseAsync(['node', 'elanous', 'harness', 'progress']);
+    await program.parseAsync(['node', 'elanous', 'harness', 'progress', '--json']);
+  } finally {
+    console.log = original;
+  }
+  expect(callers).toEqual(['harness.progress', 'harness.progress']);
+  expect(printed[0]).toBe(renderRunProgressTable(result, Date.parse('2026-10-11T00:30:00.000Z')));
+  expect(printed[0]).toContain('run-p · running · 단계 미관측 · 진입 미관측 · 마지막 진전 2026-10-11T00:00:00.000Z (경과 30m0s) · pty prod:pty-p');
+  expect(JSON.parse(printed[1]!)).toEqual(buildRunProgressRows(result, Date.parse('2026-10-11T00:30:00.000Z')));
 });
 
 

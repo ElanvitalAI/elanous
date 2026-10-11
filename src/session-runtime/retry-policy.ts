@@ -225,7 +225,8 @@ export function providerNamesFromFallbackChain(chain: readonly string[]): string
   const out: string[] = [];
   const seen = new Set<string>();
   for (const step of chain) {
-    const name = step === 'grok' ? 'grok' : step === 'codex-rotate' ? 'openai-codex' : undefined;
+    // `codex-credits`(체인 마지막 칸 · 크레딧)도 provider 는 openai-codex 다 — 이미 앞에 있으면 중복이라 빠진다.
+    const name = step === 'grok' ? 'grok' : step === 'codex-rotate' || step === 'codex-credits' ? 'openai-codex' : undefined;
     if (!name || seen.has(name)) continue;
     seen.add(name);
     out.push(name);

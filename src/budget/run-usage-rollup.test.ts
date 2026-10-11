@@ -146,6 +146,6 @@ describe('usage runs --by role', () => {
     registerUsageCommand(command, { readRunLogs: () => { throw new Error('read logs'); },
       out: { log: (line) => lines.push(line) }, exit: (code) => { throw new Error(`exit ${code}`); } });
     expect(command.parseAsync(['usage', 'runs', '--by', 'nope'], { from: 'user' })).rejects.toThrow('exit 2');
-    expect(lines).toEqual(['⛔ --by 는 run | role']);
+    expect(lines).toEqual(['⛔ --by 는 run | role | stage | model | account']);
   });
 });

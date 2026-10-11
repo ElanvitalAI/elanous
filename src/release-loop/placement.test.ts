@@ -57,7 +57,7 @@ test('merged PR throughput is measured from the first-class query within the exa
     } finally { process.chdir(cwd); rmSync(outside, { recursive: true, force: true }); }
   }
   finally { if (path === undefined) delete process.env.PATH; else process.env.PATH = path; }
-});
+}, 60_000);
 
 test('P0 next; P1 named deadline; P2 earliest capacity, seat cap and predecessor after its release', () => {
   setup();
@@ -68,7 +68,7 @@ test('P0 next; P1 named deadline; P2 earliest capacity, seat cap and predecessor
   expect(() => placeCell({ ...cell('blocked', 'P0'), predecessors: ['ordinary'] }, deps())).toThrow('배치할 판이 없다');
   expect(listChecklist('0.2.16').items[0]).toMatchObject({ priority: 'P2', predecessors: ['ordinary'] });
   expect(placeCell(cell('overflow'), { ...deps(), seatCap: { TC: 1 } }).version).toBe('0.2.17');
-});
+}, 60_000);
 
 test('rubric grades defer discretionary P3, keep P1/P2 earliest, and leave priority distinct', () => {
   setup();
@@ -82,7 +82,7 @@ test('rubric grades defer discretionary P3, keep P1/P2 earliest, and leave prior
   expect(() => placeCell({ ...cell('drop'), grade: 'P4' }, deps())).toThrow('루브릭 P4 칸은 합치거나 빼야 한다');
   expect(() => placeCell({ ...cell('invalid'), grade: 'P0' as 'P1' }, options)).toThrow('잘못된 루브릭 등급');
   expect(listChecklist('0.2.17').items).toHaveLength(0);
-});
+}, 60_000);
 
 test('cards-supplied rubric grade changes only discretionary release order, not ledger priority or capacity', () => {
   setup();
@@ -96,7 +96,7 @@ test('cards-supplied rubric grade changes only discretionary release order, not 
   expect(low.displaced).toEqual([]);
   expect(listChecklist('0.2.16').items).toHaveLength(0);
   expect(listChecklist('0.2.17').items.map((item) => item.id)).toEqual(['full']);
-});
+}, 60_000);
 
 test('rubric P3 remains bounded by capacity, deadline and predecessor releases', () => {
   setup();
@@ -108,7 +108,7 @@ test('rubric P3 remains bounded by capacity, deadline and predecessor releases',
   expect(() => placeCell({ ...cell('too-late'), grade: 'P3', predecessors: ['full'], deadlineVersion: '0.2.16' }, options)).toThrow('배치할 판이 없다');
   expect(listChecklist('0.2.16').items).toHaveLength(0);
   expect(listChecklist('0.2.17').items.map((item) => item.id)).toEqual(['full']);
-});
+}, 60_000);
 
 test('rubric P3 cannot defer an existing predecessor onto or past its dependent', () => {
   setup();
@@ -117,7 +117,7 @@ test('rubric P3 cannot defer an existing predecessor onto or past its dependent'
   expect(placeCell({ ...cell('base'), grade: 'P3' }, { ...deps(), merged24h: 10 }).version).toBe('0.2.14');
   expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['base']);
   expect(checklistHistory('base').filter((row) => row.field === 'move')).toHaveLength(0);
-});
+}, 60_000);
 
 test('rubric grade is not a ledger priority or a rebalance score', () => {
   setup();
@@ -129,14 +129,14 @@ test('rubric grade is not a ledger priority or a rebalance score', () => {
   const near = new Date('2026-10-07T01:00:00Z');
   expect(rebalance('0.2.17', { now: near, merged24h: 10, dryRun: true }).decisions.map((row) => row.id)).toEqual(['deferred']);
   expect(listChecklist('0.2.17').items.map((item) => item.id)).toEqual(['deferred']);
-});
+}, 60_000);
 
 test('P0 incident goes to next release even if its old P2 deadline has expired', () => {
   setup();
   addItem('0.2.14', { ...cell('incident'), deadlineVersion: '0.2.14' });
   const later = new Date('2026-10-05T03:00:00Z');
   expect(placeCell({ ...cell('incident', 'P0'), deadlineVersion: '0.2.14' }, { now: later, merged24h: 10 }).version).toBe('0.2.15');
-});
+}, 60_000);
 
 test('P1 displaces P2 into next release, with persisted move reason; dry run leaves ledger untouched', () => {
   setup();
@@ -149,13 +149,13 @@ test('P1 displaces P2 into next release, with persisted move reason; dry run lea
   expect(placeCell(p1, deps()).displaced).toEqual(preview.displaced);
   expect(checklistHistory('flex').at(-1)).toMatchObject({ field: 'move', from: '0.2.15', to: '0.2.16', reason: expect.stringContaining('P1 urgent') });
   expect(listChecklist('0.2.15').items.map((item) => item.id)).toEqual(['existing', 'urgent']);
-});
+}, 60_000);
 
 test('release without landing deadline cannot borrow its cut time as placement capacity', () => {
   setup();
   const schedules = [setSchedule('0.2.18', { cutAt: '2026-10-07T12:00Z' }, 'OP')];
   expect(() => placeCell(cell('no-deadline'), { ...deps(), schedules })).toThrow('배치할 판이 없다');
-});
+}, 60_000);
 
 test('one displacement cannot hide an overfull release or exceed the destination seat cap', () => {
   setup();
@@ -169,7 +169,7 @@ test('one displacement cannot hide an overfull release or exceed the destination
   addItem('0.2.16', { ...cell('seat-full') });
   expect(() => placeCell({ ...cell('urgent', 'P1'), deadlineVersion: '0.2.15' }, { ...deps(), seatCap: { TC: 1 } })).toThrow('배치할 판이 없다');
   expect(listChecklist('0.2.15').items.map((item) => item.id)).toEqual(['flex', 'other']);
-});
+}, 60_000);
 
 test('P1 cannot displace a P2 predecessor onto its dependent in the next release', () => {
   setup();
@@ -180,7 +180,7 @@ test('P1 cannot displace a P2 predecessor onto its dependent in the next release
   expect(listChecklist('0.2.15').items.map((item) => item.id)).toEqual(['base', 'other']);
   expect(listChecklist('0.2.16').items.map((item) => item.id)).toEqual(['dependent']);
   expect(checklistHistory('base').filter((row) => row.field === 'move')).toHaveLength(0);
-});
+}, 60_000);
 
 test('P1 displaces an independent P2, not a predecessor of a cell in a later release', () => {
   setup();
@@ -193,7 +193,7 @@ test('P1 displaces an independent P2, not a predecessor of a cell in a later rel
   expect(listChecklist('0.2.16').items.map((item) => item.id).sort()).toEqual(['dependent', 'flex']);
   expect(checklistHistory('base').filter((row) => row.field === 'move')).toHaveLength(0);
   expect(checklistHistory('flex').at(-1)).toMatchObject({ field: 'move', reason: expect.stringContaining('P1 urgent') });
-});
+}, 60_000);
 
 test('existing cell cannot move onto or past a dependent in a later release', () => {
   setup();
@@ -204,7 +204,7 @@ test('existing cell cannot move onto or past a dependent in a later release', ()
   expect(() => placeCell(cell('base'), { now: later, merged24h: 10 })).toThrow('배치할 판이 없다');
   expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['base']);
   expect(checklistHistory('base').filter((row) => row.field === 'move')).toHaveLength(0);
-});
+}, 60_000);
 
 test('existing cell priority override persists in the checklist and capacity rule uses the next release', () => {
   setup();
@@ -212,7 +212,7 @@ test('existing cell priority override persists in the checklist and capacity rul
   expect(placeCell(cell('existing', 'P0'), deps()).version).toBe('0.2.14');
   expect(listChecklist('0.2.14').items[0]?.priority).toBe('P0');
   expect(checklistHistory('existing').find((row) => row.field === 'priority')).toMatchObject({ field: 'priority', from: 'P2', to: 'P0' });
-});
+}, 60_000);
 
 test('freeze window holds operational rollout only — the frozen release still takes cells, including a P1 deadline', () => {
   setup();
@@ -221,7 +221,7 @@ test('freeze window holds operational rollout only — the frozen release still 
   expect(placeCell(cell('ordinary'), { now: duringFreeze, merged24h: 10 }).version).toBe('0.2.15');
   expect(listChecklist('0.2.15').items.map((item) => item.id)).toContain('ordinary');
   expect(placeCell({ ...cell('event', 'P1'), deadlineVersion: '0.2.15' }, { now: duringFreeze, merged24h: 10 }).version).toBe('0.2.15');
-});
+}, 60_000);
 
 test('backlog 0.9.0 is a placement source only: its cell moves out to a dated release and nothing is placed into it', () => {
   setup();
@@ -234,7 +234,24 @@ test('backlog 0.9.0 is a placement source only: its cell moves out to a dated re
   for (const version of ['0.2.14', '0.2.15', '0.2.16', '0.2.17']) for (let i = 0; i < 2; i++) addItem(version, { id: `fill-${version}-${i}`, title: 'fill', owner: 'MK' });
   expect(() => placeCell(cell('nowhere'), { ...deps(), merged24h: 1, seatCap: {} })).toThrow('배치할 판이 없다');
   expect(listChecklist('0.9.0').items.map((item) => item.id)).not.toContain('nowhere');
-});
+}, 60_000);
+
+test('a second forward rollover needs a 쪼개기/닫기/\u{1F451} reason; first rollover and pull stay as before', () => {
+  setup();
+  const options = { ...deps(), merged24h: 10 };
+  addItem('0.2.14', { id: 'carry', title: 'carry', owner: 'TC' });
+  // 첫 이월은 그대로 통과한다.
+  seatMove('carry', '0.2.14', '0.2.15', 'TC', 'capacity', options);
+  expect(listChecklist('0.2.15').items.map((item) => item.id)).toContain('carry');
+  // 두 번째 이월은 접두 없는 이유로 거부된다.
+  expect(() => seatMove('carry', '0.2.15', '0.2.16', 'TC', 'again', options)).toThrow('두 번째 이월');
+  expect(listChecklist('0.2.15').items.map((item) => item.id)).toContain('carry');
+  expect(listChecklist('0.2.16').items.map((item) => item.id)).not.toContain('carry');
+  // «쪼개기:» 접두 이유로는 통과한다.
+  seatMove('carry', '0.2.15', '0.2.16', 'TC', '쪼개기: 둘로 나눈다', options);
+  expect(listChecklist('0.2.16').items.map((item) => item.id)).toContain('carry');
+  expect(checklistHistory('carry').at(-1)).toMatchObject({ field: 'move', reason: '쪼개기: 둘로 나눈다' });
+}, 60_000);
 
 test('seat moves only its own cell one release with reason; other owner pull denied with COO request', () => {
   setup();
@@ -244,7 +261,7 @@ test('seat moves only its own cell one release with reason; other owner pull den
   expect(() => seatMove('mk', '0.2.14', '0.2.16', 'MK', 'skip')).toThrow('COO 에 요청');
   seatMove('mk', '0.2.14', '0.2.15', 'MK/sub', 'capacity', { ...deps(), merged24h: 10 });
   expect(checklistHistory('mk').at(-1)).toMatchObject({ reason: 'capacity', by: 'MK/sub' });
-});
+}, 60_000);
 
 test('CLI place/rebalance dry runs preserve ledger; seat CLI denies foreign pull with COO request', async () => {
   setup();
@@ -291,7 +308,7 @@ test('CLI place/rebalance dry runs preserve ledger; seat CLI denies foreign pull
     if (path === undefined) delete process.env.PATH; else process.env.PATH = path;
     if (previous === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = previous;
   }
-});
+}, 60_000);
 
 test('CLI refuses to assert P2 for a cell without recorded priority', async () => {
   setup();
@@ -309,7 +326,7 @@ test('CLI refuses to assert P2 for a cell without recorded priority', async () =
     output.mockRestore();
     if (previous === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = previous;
   }
-});
+}, 60_000);
 
 test('rebalance checks cumulative PR/seat capacity and does not move a predecessor onto its dependent', () => {
   setup();
@@ -324,7 +341,7 @@ test('rebalance checks cumulative PR/seat capacity and does not move a predecess
   expect(rebalance('0.2.14', { now: near, merged24h: 20 }).decisions.map((row) => row.id)).toEqual(['second']);
   expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['base']);
   expect(checklistHistory('base').filter((row) => row.field === 'move')).toHaveLength(0);
-});
+}, 60_000);
 
 test('CEO load blocks rebalance with named adjustments and CLI never calls the blocked cell absent', async () => {
   setup();
@@ -367,7 +384,7 @@ test('CEO load blocks rebalance with named adjustments and CLI never calls the b
     if (path === undefined) delete process.env.PATH; else process.env.PATH = path;
     if (track === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = track;
   }
-});
+}, 60_000);
 
 test('rebalance enforces cumulative destination PR capacity across seats', () => {
   setup();
@@ -378,7 +395,7 @@ test('rebalance enforces cumulative destination PR capacity across seats', () =>
   expect(listChecklist('0.2.15').items).toHaveLength(0);
   expect(rebalance('0.2.14', { now: near, merged24h: 4 }).decisions.map((row) => row.id)).toEqual(['tc']);
   expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['mk']);
-});
+}, 60_000);
 
 test('rebalance defers lower rubric score first and leaves the higher score in the current release', () => {
   setup();
@@ -392,7 +409,7 @@ test('rebalance defers lower rubric score first and leaves the higher score in t
   expect(listChecklist('0.2.15').items.map((item) => item.id)).toEqual(['lo']);
   expect(result.decisions[0]?.reason).toBe('0.2.14 착지 마감 2시간 전 미시작 칸 이월 · 루브릭 0');
   expect(checklistHistory('lo').at(-1)?.reason).toBe(result.decisions[0]?.reason);
-});
+}, 60_000);
 
 test('rebalance sorts scored cells before unscored cells and preserves original order for ties', () => {
   setup();
@@ -410,7 +427,7 @@ test('rebalance sorts scored cells before unscored cells and preserves original 
     '0.2.14 착지 마감 2시간 전 미시작 칸 이월',
   ]);
   expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['plain-first', 'score-first', 'score-second', 'plain-second']);
-});
+}, 60_000);
 
 test('seat move rejects deadline, capacity, and dependent constraints before writing history (a freeze window does not block it)', () => {
   setup();
@@ -425,7 +442,7 @@ test('seat move rejects deadline, capacity, and dependent constraints before wri
   addItem('0.2.15', { ...cell('dependent'), owner: 'MK', predecessors: ['flex'] });
   expect(() => seatMove('flex', '0.2.14', '0.2.15', 'TC', 'delay', options)).toThrow('의존 칸');
   expect(checklistHistory('flex').filter((row) => row.field === 'move')).toHaveLength(0);
-});
+}, 60_000);
 
 test('same priority places the accelerator cell first by displacing an unmarked peer', () => {
   setup();
@@ -437,7 +454,7 @@ test('same priority places the accelerator cell first by displacing an unmarked 
   expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['accel']);
   expect(listChecklist('0.2.14').items[0]?.accelerator).toBe(true);
   expect(checklistHistory('ordinary').at(-1)).toMatchObject({ field: 'move', reason: expect.stringContaining('가속 등급 accel') });
-});
+}, 60_000);
 
 test('an accelerator cell still takes the earliest version with room and displaces nobody', () => {
   setup();
@@ -445,7 +462,7 @@ test('an accelerator cell still takes the earliest version with room and displac
   expect(decision.version).toBe('0.2.14');
   expect(decision.displaced).toEqual([]);
   expect(listChecklist('0.2.14').items[0]?.accelerator).toBe(true);
-});
+}, 60_000);
 
 test('a P1 accelerator keeps the P1 rule of pushing a P2 cell', () => {
   setup();
@@ -453,7 +470,7 @@ test('a P1 accelerator keeps the P1 rule of pushing a P2 cell', () => {
   const decision = placeCell({ ...cell('accel', 'P1'), deadlineVersion: '0.2.14', accelerator: true }, { ...deps(), seatCap: { TC: 1 }, merged24h: 2 });
   expect(decision.version).toBe('0.2.14');
   expect(decision.displaced.map((row) => row.id)).toEqual(['low']);
-});
+}, 60_000);
 
 test('the accelerator flag round-trips on the ledger and can be cleared', () => {
   setup();
@@ -463,7 +480,7 @@ test('the accelerator flag round-trips on the ledger and can be cleared', () => 
   expect(checklistHistory('X').find((row) => row.field === 'accelerator')).toMatchObject({ from: null, to: true, by: 'OP' });
   setItem('0.2.16', 'X', { accelerator: null }, 'OP');
   expect(listChecklist('0.2.16').items[0]?.accelerator).toBeUndefined();
-});
+}, 60_000);
 
 test('rebalance moves only unstarted yellow cells in two-hour pre-deadline window', () => {
   setup();
@@ -482,7 +499,7 @@ test('rebalance moves only unstarted yellow cells in two-hour pre-deadline windo
   expect(rebalance('0.2.15', { now: new Date('2026-10-05T11:00:00Z'), merged24h: 10 }).decisions.map((row) => row.id)).toEqual(['new']);
   expect(listChecklist('0.2.15').items.map((item) => item.id)).toEqual(['late']);
   expect(before).toEqual(['new', 'late']);
-});
+}, 60_000);
 
 test('ORCH-LIVE-1008: a released copy of an id never blocks placement (open copy wins); two open copies still do', () => {
   setup();
@@ -502,7 +519,7 @@ test('ORCH-LIVE-1008: a released copy of an id never blocks placement (open copy
   expect(placeCell(cell('INSIDE1'), { ...deps(), released: '0.2.13', dryRun: true }).version).not.toBe('0.2.11');
   addItem('0.2.14', { id: 'INSIDE1', title: 'INSIDE1 twice', owner: 'TC' }, { allowDuplicateId: true });
   expect(() => placeCell(cell('fresh2'), { ...deps(), released: '0.2.13', dryRun: true })).toThrow('여러 판의 같은 칸: INSIDE1');
-});
+}, 60_000);
 
 test('ORCH-LIVE-1008: a pre-existing dependency violation elsewhere on the board does not block an unrelated placement', () => {
   setup();
@@ -512,7 +529,7 @@ test('ORCH-LIVE-1008: a pre-existing dependency violation elsewhere on the board
   // a placement that depends on a cell is still placed after it
   const after = placeCell({ ...cell('needs-after'), predecessors: ['after'] }, { ...deps(), released: '0.2.13', dryRun: true }).version;
   expect(['0.2.16', '0.2.17']).toContain(after);
-});
+}, 60_000);
 
 test('ORCH-LIVE-1008: a released cell that once depended on an id does not pin a seat move of the open cell', () => {
   setup();
@@ -520,7 +537,7 @@ test('ORCH-LIVE-1008: a released cell that once depended on an id does not pin a
   addItem('0.2.14', { id: 'mk2', title: 'MK cell', owner: 'MK' });
   addItem('0.2.10', { id: 'OLDDEP', title: 'old dependent', owner: 'MK', predecessors: ['mk2'] }, { allowDuplicateId: true });
   expect(() => seatMove('mk2', '0.2.14', '0.2.15', 'MK', 'capacity', { ...deps(), merged24h: 10, released: '0.2.13', dryRun: true })).not.toThrow();
-});
+}, 60_000);
 
 
 test('ORCH-LIVE-1008: rebalance and seat moves of an open cell are not blocked by a released copy of its id or a released dependent', () => {
@@ -536,4 +553,4 @@ test('ORCH-LIVE-1008: rebalance and seat moves of an open cell are not blocked b
   addItem('0.2.10', { id: 'mkdup', title: 'old mk', owner: 'MK' }, { allowDuplicateId: true });
   addItem('0.2.14', { id: 'mkdup', title: 'MK cell', owner: 'MK' }, { allowDuplicateId: true });
   expect(() => seatMove('mkdup', '0.2.14', '0.2.15', 'MK', 'capacity', { ...deps(), merged24h: 10, released: '0.2.13', dryRun: true })).not.toThrow();
-});
+}, 60_000);

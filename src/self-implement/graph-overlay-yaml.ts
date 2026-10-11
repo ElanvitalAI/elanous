@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parse as parseYaml } from 'yaml';
+import { parse as parseYaml, parseAllDocuments } from 'yaml';
 import { inspectPipelineGraph, type PipelineGraphDefect } from './pipeline-shape.js';
 import { edgeMapOf, type GraphParseIssue, type GraphTemplateSpec } from './graph-yaml.js';
 import { evaluateOverlayCondition } from './graph-overlay-condition.js';
@@ -15,7 +15,8 @@ import type { OverlayPatch } from './graph-overlay.js';
  *    ⑴ 얹은 «결과»에 위상 검사를 다시 건다 — 노드 집합이 그대로여도 도달 가능성은 바뀐다
  *    ⑵ 계약이 빠진 노드를 «거부»한다 — 권한 없는 노드가 조용히 들어오는 것을 막는다
  *    ⑶ 무엇을 얹었는지를 «값»으로 낸다 — 사후에 「왜 이 걸음인가」를 답하려면 필요하다 */
-export type OverlayStage = 'launch' | 'runtime';
+/** `heal` = 멈춤 갈래 사다리 전용 — `stop-autoheal.ts` 만 고른다. 실행기의 launch·runtime 선택에는 «안» 잡힌다. */
+export type OverlayStage = 'launch' | 'runtime' | 'heal';
 
 export interface OverlayPatchOp {
   readonly op: 'add' | 'replace' | 'remove';
@@ -33,19 +34,52 @@ export interface GraphOverlaySpec {
 }
 
 export interface OverlayParseResult {
+  /** 첫 오버레이 — 한 파일에 하나만 둔 기존 선언의 읽기 자리. */
   readonly overlay?: GraphOverlaySpec;
+  /** 파일이 선언한 오버레이 전부. `---` 로 문서를 나누면 한 파일에 여럿이다. 오류가 하나라도 있으면 비어 있다. */
+  readonly overlays: readonly GraphOverlaySpec[];
   readonly errors: readonly GraphParseIssue[];
 }
 
-const STAGES = new Set<OverlayStage>(['launch', 'runtime']);
+const STAGES = new Set<OverlayStage>(['launch', 'runtime', 'heal']);
 const OPS = new Set(['add', 'replace', 'remove']);
 
-/** ⛔ 던지지 않는다 — 파서 계약은 `graph-yaml.ts` 와 같다. */
+/** ⛔ 던지지 않는다 — 파서 계약은 `graph-yaml.ts` 와 같다.
+ *  한 파일 = 문서 하나가 기본이다. `---` 로 나눈 여러 문서는 문서마다 오버레이 하나로 읽는다
+ *  (오류 경로는 `<label>#<문서 번호>`). 문서가 하나면 읽는 법도 오류 문면도 예전과 같다. */
 export function parseGraphOverlayYaml(source: string, label = '<inline>'): OverlayParseResult {
-  const errors: GraphParseIssue[] = [];
   let raw: unknown;
   try { raw = parseYaml(source); }
-  catch (error) { return { errors: [{ path: label, message: `YAML 파싱 실패: ${error instanceof Error ? error.message : String(error)}` }] }; }
+  catch (error) {
+    const documents = parseAllDocuments(source);
+    if (documents.length > 1 && documents.every((document) => document.errors.length === 0)) {
+      return overlaysFromDocuments(documents.map((document) => document.toJS() as unknown), label);
+    }
+    return { overlays: [], errors: [{ path: label, message: `YAML 파싱 실패: ${error instanceof Error ? error.message : String(error)}` }] };
+  }
+  const parsed = overlayFromRaw(raw, label);
+  return { ...(parsed.overlay ? { overlay: parsed.overlay } : {}), overlays: parsed.overlay ? [parsed.overlay] : [], errors: parsed.errors };
+}
+
+function overlaysFromDocuments(raws: readonly unknown[], label: string): OverlayParseResult {
+  const errors: GraphParseIssue[] = [];
+  const overlays: GraphOverlaySpec[] = [];
+  for (const [index, raw] of raws.entries()) {
+    const parsed = overlayFromRaw(raw, `${label}#${index}`);
+    errors.push(...parsed.errors);
+    if (parsed.overlay) overlays.push(parsed.overlay);
+  }
+  const seen = new Set<string>();
+  for (const overlay of overlays) {
+    if (seen.has(overlay.overlayId)) errors.push({ path: `${label}/overlay_id`, message: `overlay_id '${overlay.overlayId}' 가 한 파일에서 중복이다` });
+    seen.add(overlay.overlayId);
+  }
+  if (errors.length > 0) return { overlays: [], errors };
+  return { overlay: overlays[0]!, overlays, errors };
+}
+
+function overlayFromRaw(raw: unknown, label: string): { overlay?: GraphOverlaySpec; errors: GraphParseIssue[] } {
+  const errors: GraphParseIssue[] = [];
   if (raw === null || typeof raw !== 'object') return { errors: [{ path: label, message: 'YAML 최상위가 맵이 아니다' }] };
   const doc = raw as Record<string, unknown>;
 
@@ -198,7 +232,7 @@ export function loadGraphOverlays(dir: string): OverlayLoadResult {
     catch (error) { errors.push({ path: file, message: `읽기 실패: ${error instanceof Error ? error.message : String(error)}` }); continue; }
     const result = parseGraphOverlayYaml(source, file);
     errors.push(...result.errors);
-    if (result.overlay) overlays.push(result.overlay);
+    overlays.push(...result.overlays);
   }
   return { overlays, errors, scannedFiles: files.length };
 }

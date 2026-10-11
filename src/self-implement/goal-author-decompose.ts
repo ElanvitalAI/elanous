@@ -5,6 +5,7 @@ import { llmDecomposeSteps } from '../harness/llm-decompose.js';
 import { GOAL_AUTHOR_COARSE_MAX_SLICES } from '../task-orchestrator/generator-prompt.js';
 import { getDefaultLogStore } from '../mss/logging/log-store.js';
 import { emitDecision } from '../live/detail-switch.js';
+import { selectPlanningLlm } from '../prompt-enhance/enhance.js';
 import type { GoalAuthorDeps } from './goal-author.js';
 
 const GOAL_STEPS_DECOMPOSED_EVENT = 'goal-steps-decomposed';
@@ -64,10 +65,17 @@ export function createGoalAuthorDecomposeSteps(
 ): NonNullable<GoalAuthorDeps['decomposeSteps']> {
   return async (objective, options) => {
     const { streamLLM } = await import('../llm.js');
+    // ⭐ AUTHOR-DECOMPOSE-KNOB(0.2.24 · G7 #25848) — 쪼개기·적대 비평의 두 streamLLM 호출이 인핸서와
+    //   «같은 규칙»으로 planning 노브(roleLlm.planning ⊕ ELANOUS_PROMPT_ENHANCE_MODEL/EFFORT)를 따른다.
+    //   미설정이면 종전 그대로 — model 은 아예 전달하지 않는다(streamLLM 기본 모델) ⊕ effort 는 high.
+    const { model, effort } = selectPlanningLlm();
+    const llmOpts: { model?: string; reasoningEffort: 'low' | 'medium' | 'high' } = model === undefined
+      ? { reasoningEffort: effort }
+      : { model, reasoningEffort: effort };
     let decompositionRationale: string | undefined;
     const steps = await llmDecomposeSteps(
       objective,
-      (input) => streamLLM([{ role: 'user', content: input.prompt }], () => {}, { reasoningEffort: 'high' }).then((text) => ({ text })),
+      (input) => streamLLM([{ role: 'user', content: input.prompt }], () => {}, llmOpts).then((text) => ({ text })),
       { ...(options?.context ? { context: options.context } : {}), maxTasks: GOAL_AUTHOR_COARSE_MAX_SLICES, promptProfile: 'goal-author-coarse', ...(signal ? { signal } : {}), onRationale: (rationale) => { decompositionRationale = rationale; } },
     );
     const heft = classifyHeft(objective);
@@ -120,7 +128,7 @@ export function createGoalAuthorDecomposeSteps(
       return finalSteps;
     };
     if (!reviewExecuted) return finalize(steps, decompositionRationale);
-    const critic = (prompt: string) => streamLLM([{ role: 'user', content: prompt }], () => {}, { reasoningEffort: 'high' });
+    const critic = (prompt: string) => streamLLM([{ role: 'user', content: prompt }], () => {}, llmOpts);
 
     try {
       const critique = await adversarialPlanCritique(objective, steps, critic, options?.context);

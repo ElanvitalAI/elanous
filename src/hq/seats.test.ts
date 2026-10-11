@@ -42,7 +42,7 @@ beforeEach(() => {
   mkdirSync(home);
   fixture();
 });
-afterEach(() => rmSync(temp, { recursive: true, force: true }));
+afterEach(() => rmSync(temp, { recursive: true, force: true }), 120_000);
 
 test('empty HOME: init → seat → work new → merge into bare remote → done, with premerge refusal', () => {
   const root = join(home, 'elanous-hq');
@@ -139,6 +139,137 @@ test('work done accepts a clean squash-landed tip with a nonempty changed-file l
   expect(done.status, done.stderr).toBe(0);
   expect(existsSync(work)).toBe(false);
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeUndefined();
+}, 120_000);
+
+test('work done reclaims a squash landed before main subsequently edits the same path', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  expect(hq('work', 'new', 'TC', 'older-squash').status).toBe(0);
+  const work = join(root, 'work', 'TC-older-squash');
+  writeFileSync(join(work, 'feature'), 'landed\n');
+  git(['add', 'feature'], work);
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'feature'], work);
+  writeFileSync(join(seed, 'feature'), 'landed\n');
+  git(['add', 'feature'], seed);
+  git(['commit', '-m', 'squash landed'], seed);
+  writeFileSync(join(seed, 'feature'), 'later edit\n');
+  git(['add', 'feature'], seed);
+  git(['commit', '-m', 'later edit'], seed);
+  git(['push', 'origin', 'main'], seed);
+  const done = hq('work', 'done', 'TC', 'older-squash');
+  expect(done.status, done.stderr).toBe(0);
+  expect(existsSync(work)).toBe(false);
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes).toEqual({});
+}, 120_000);
+
+test('work done refuses paths matching main at different times but never together', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  expect(hq('work', 'new', 'TC', 'partial').status).toBe(0);
+  const work = join(root, 'work', 'TC-partial');
+  writeFileSync(join(work, 'first'), 'a\n');
+  writeFileSync(join(work, 'second'), 'b\n');
+  git(['add', 'first', 'second'], work);
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'both'], work);
+  const ownTip = git(['rev-parse', 'HEAD'], work);
+  writeFileSync(join(seed, 'first'), 'a\n');
+  git(['add', 'first'], seed);
+  git(['commit', '-m', 'only first'], seed);
+  writeFileSync(join(seed, 'first'), 'replaced\n');
+  writeFileSync(join(seed, 'second'), 'b\n');
+  git(['add', 'first', 'second'], seed);
+  git(['commit', '-m', 'only second'], seed);
+  git(['push', 'origin', 'main'], seed);
+  const refused = hq('work', 'done', 'TC', 'partial');
+  expect(refused.status).toBe(1);
+  expect(refused.stderr).toContain('not merged');
+  expect(existsSync(work)).toBe(true);
+  expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', 'refs/heads/work/TC-partial'])).toBe(ownTip);
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
+}, 120_000);
+
+test('work done reclaims a detached landed PR head differing from the registered work branch', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  expect(hq('work', 'new', 'TC', 'pr-head').status).toBe(0);
+  const work = join(root, 'work', 'TC-pr-head');
+  const ownTip = git(['rev-parse', 'HEAD'], work);
+  git(['switch', '-c', 'work/TC-pr-head-from-pr'], work);
+  writeFileSync(join(work, 'feature'), 'landed\n');
+  git(['add', 'feature'], work);
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'PR head'], work);
+  const head = git(['rev-parse', 'HEAD'], work);
+  git(['checkout', '--detach'], work);
+  writeFileSync(join(seed, 'feature'), 'landed\n');
+  git(['add', 'feature'], seed);
+  git(['commit', '-m', 'squash landed'], seed);
+  git(['push', 'origin', 'main'], seed);
+  const done = hq('work', 'done', 'TC', 'pr-head');
+  expect(done.status, done.stderr).toBe(0);
+  expect(existsSync(work)).toBe(false);
+  expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', 'refs/heads/work/TC-pr-head-from-pr'])).toBe(head);
+  expect(command('git', ['--git-dir', join(root, 'repo.git'), 'rev-parse', '--verify', '--quiet', 'refs/heads/work/TC-pr-head']).status).toBe(1);
+  expect(ownTip).not.toBe(head);
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes).toEqual({});
+}, 120_000);
+
+test('work done restores a detached landed head if removal is blocked by an index lock', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  expect(hq('work', 'new', 'TC', 'detached-busy').status).toBe(0);
+  const work = join(root, 'work', 'TC-detached-busy');
+  const ownTip = git(['rev-parse', 'HEAD'], work);
+  git(['checkout', '--detach'], work);
+  writeFileSync(join(work, 'landed'), 'landed\n');
+  git(['add', 'landed'], work);
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'head'], work);
+  const head = git(['rev-parse', 'HEAD'], work);
+  writeFileSync(join(seed, 'landed'), 'landed\n');
+  git(['add', 'landed'], seed);
+  git(['commit', '-m', 'squash landed'], seed);
+  git(['push', 'origin', 'main'], seed);
+  const lock = join(git(['rev-parse', '--absolute-git-dir'], work), 'index.lock');
+  writeFileSync(lock, '');
+  const refused = hq('work', 'done', 'TC', 'detached-busy');
+  rmSync(lock);
+  expect(refused.status).toBe(1);
+  expect(refused.stderr).toContain('index.lock');
+  expect(existsSync(work)).toBe(true);
+  expect(git(['rev-parse', 'HEAD'], work)).toBe(head);
+  expect(command('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], work).status).toBe(1);
+  expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', 'refs/heads/work/TC-detached-busy'])).toBe(ownTip);
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toEqual({ kind: 'sandbox', path: join(work, '.elanous-test'), owner: 'TC' });
+  expect(hq('work', 'done', 'TC', 'detached-busy').status).toBe(0);
+  expect(existsSync(work)).toBe(false);
+}, 120_000);
+
+test('work done refuses an unlanded detached PR head even when the registered branch landed', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  expect(hq('work', 'new', 'TC', 'unfinished-head').status).toBe(0);
+  const work = join(root, 'work', 'TC-unfinished-head');
+  const ownTip = git(['rev-parse', 'HEAD'], work);
+  git(['switch', '--detach'], work);
+  writeFileSync(join(work, 'unfinished'), 'keep\n');
+  git(['add', 'unfinished'], work);
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'unfinished'], work);
+  const head = git(['rev-parse', 'HEAD'], work);
+  const refused = hq('work', 'done', 'TC', 'unfinished-head');
+  expect(refused.status).toBe(1);
+  expect(existsSync(work)).toBe(true);
+  expect(git(['rev-parse', 'HEAD'], work)).toBe(head);
+  expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', 'refs/heads/work/TC-unfinished-head'])).toBe(ownTip);
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
 }, 120_000);
 
 test('work done keeps a worktree whose different attached branch has an unlanded current tip', () => {

@@ -140,6 +140,19 @@ edges: []
     expect(graphVersionHash(loaded.template!)).not.toBe(graphVersionHash(changed.template!));
   });
 
+  test('L0 단계 목록과 노드 journey_stage 를 파싱하고 목록 밖의 값은 거절한다', () => {
+    const source = 'graph_id: t\nversion: 1\nentry_node: a\nterminal_nodes: [a]\njourney_stages: [entry, run]\nnodes: [{ node_id: a, kind: agent, recipe: r, max_visits: 1, journey_stage: run }]\nedges: []';
+    const parsed = parseGraphTemplateYaml(source, 'journey.yaml');
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.template?.journeyStages).toEqual(['entry', 'run']);
+    expect(parsed.template?.nodes[0]?.journeyStage).toBe('run');
+    expect(compileGraphTemplate(parsed.template!).template.nodes[0]?.journeyStage).toBe('run');
+    expect(parseGraphTemplateYaml(source.replace('journey_stage: run', 'journey_stage: unknown')).errors.some((error) => error.path === '<inline>/nodes/0/journey_stage')).toBe(true);
+    expect(parseGraphTemplateYaml(source.replace('journey_stages: [entry, run]', 'journey_stages: [run, run]')).errors)
+      .toEqual([expect.objectContaining({ path: '<inline>/journey_stages' })]);
+    expect(parseGraphTemplateYaml(source.replace('journey_stage: run', 'journey_stage: 3')).errors.some((error) => error.path === '<inline>/nodes/0/journey_stage')).toBe(true);
+  });
+
   test('문서 전용 gate 건너뛰기 정책의 선언과 미선언을 파싱·컴파일까지 그대로 보존한다', () => {
     const base = 'graph_id: t\nversion: 1\nentry_node: a\nterminal_nodes: [a]\nnodes: [{ node_id: a, kind: agent, recipe: r, max_visits: 1 }]\nedges: []';
     const declared = parseGraphTemplateYaml(`docs_only_gate_skip: true\n${base}`, 'declared.yaml');
@@ -330,5 +343,27 @@ describe('RFC §5 2단계 — 위상 검사를 «YAML 에» 건다', () => {
     expect(kinds.has('unreachable-node')).toBe(true);
     expect(kinds.has('undefined-destination')).toBe(true);
     expect(kinds.has('inescapable-cycle')).toBe(true);
+  });
+});
+
+describe('ARG-UNIT-CALL — subgraph unit call parsing', () => {
+  const doc = (node: string, top = '') => `graph_id: g\nversion: 1\n${top}entry_node: a\nterminal_nodes: [done]\nnodes:\n  - ${node}\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\nedges:\n  - { from: a, on: outcome, map: { done: done } }\n`;
+  test('a subgraph without call keeps its pre-unit meaning', () => {
+    const parsed = parseGraphTemplateYaml(doc('{ node_id: a, kind: subgraph, recipe: test, max_visits: 1 }'));
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.template?.nodes[0]?.call).toBeUndefined();
+  });
+  test('a unit call carries call, budget and contract; malformed calls are rejected', () => {
+    const ok = parseGraphTemplateYaml(doc('{ node_id: a, kind: subgraph, recipe: none, max_visits: 1, call: unit-x@^2, budget: { inner_steps: 5 }, contract: { inputs: [i], outputs: [o] } }'));
+    expect(ok.errors).toEqual([]);
+    expect(ok.template?.nodes[0]).toMatchObject({ call: 'unit-x@^2', budget: { innerSteps: 5 } });
+    const bad = parseGraphTemplateYaml(doc('{ node_id: a, kind: subgraph, recipe: test, max_visits: 1, call: unit-x@latest }'));
+    expect(bad.errors.map(e => e.path).sort()).toEqual(['<inline>/nodes/0/budget/inner_steps', '<inline>/nodes/0/call', '<inline>/nodes/0/contract', '<inline>/nodes/0/recipe']);
+    expect(parseGraphTemplateYaml(doc('{ node_id: a, kind: agent, recipe: test, max_visits: 1, call: unit-x@1 }')).errors.length).toBeGreaterThan(0);
+  });
+  test('unit header must match terminal_nodes', () => {
+    const node = '{ node_id: a, kind: agent, recipe: test, max_visits: 1 }';
+    expect(parseGraphTemplateYaml(doc(node, 'unit: { inputs: [i], outputs: [o], exits: [done] }\n')).template?.unit).toEqual({ inputs: ['i'], outputs: ['o'], exits: ['done'] });
+    expect(parseGraphTemplateYaml(doc(node, 'unit: { inputs: [i], outputs: [o], exits: [other] }\n')).errors.some(e => e.path === '<inline>/unit')).toBe(true);
   });
 });

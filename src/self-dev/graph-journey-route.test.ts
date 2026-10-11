@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { GRAPH_SPECS } from '../self-implement/graph-templates.js';
 import type { GraphOverlaySpec } from '../self-implement/graph-overlay-yaml.js';
-import { intakeTakesQueue, routeJourneyEdge, setJourneyOverlaysForTesting } from './graph-journey-route.js';
+import { freezeCheckHolds, intakeTakesQueue, routeJourneyEdge, setJourneyOverlaysForTesting } from './graph-journey-route.js';
 
 afterEach(() => setJourneyOverlaysForTesting(undefined));
 
@@ -67,5 +67,34 @@ describe('HARNESS-FULL-GRAPH 2판 — 경로를 그래프가 정한다', () => {
     expect(intakeTakesQueue('direct', { source: 'graph', to: 'queue' }, true)).toBe(true);
     expect(intakeTakesQueue('direct', { source: 'graph', to: 'queue' }, false)).toBe(false);
     expect(intakeTakesQueue('queued', { source: 'code-default', to: null }, true)).toBe(true);
+  });
+
+  const freezeEdge = base.edges.findIndex((edge) => edge.from === 'freeze-check');
+  const approvalRequired: GraphOverlaySpec = {
+    overlayId: 'test-approval-required', target: 'self-implement', stage: 'launch', appliesWhen: 'freeze == open',
+    // merge 는 이 간선에서만 닿으므로 fallback 으로 도달성을 남겨야 위상 검사를 통과한다.
+    patch: [
+      { op: 'replace', path: `/edges/${freezeEdge}/map/open`, value: 'hold' },
+      { op: 'add', path: `/edges/${freezeEdge}/fallback`, value: [{ node: 'merge', requires: [] }] },
+    ],
+  } as GraphOverlaySpec;
+
+  test('freeze-check overlay routes open to hold', () => {
+    expect(freezeEdge).toBeGreaterThanOrEqual(0);
+    setJourneyOverlaysForTesting([approvalRequired]);
+    const route = routeJourneyEdge('freeze-check', 'open', { freeze: 'open' });
+    expect(route).toMatchObject({ to: 'hold', source: 'graph', overlays: ['test-approval-required'] });
+    expect(freezeCheckHolds('open', route)).toBe(true);
+    expect(freezeCheckHolds('frozen', route)).toBe(false);
+    expect(freezeCheckHolds('taken', route)).toBe(false);
+  });
+
+  test('code-default keeps the admission', () => {
+    setJourneyOverlaysForTesting([]);
+    for (const label of ['open', 'frozen', 'taken'] as const) {
+      expect(freezeCheckHolds(label, routeJourneyEdge('freeze-check', label, { freeze: label }))).toBe(false);
+    }
+    expect(freezeCheckHolds('open', { source: 'code-default', to: null })).toBe(false);
+    expect(freezeCheckHolds('open', { source: 'code-default', to: 'hold' })).toBe(false);
   });
 });

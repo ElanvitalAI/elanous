@@ -13,7 +13,16 @@ import {
   type TypecheckError,
 } from '../src/typecheck-ratchet.js';
 import { debug } from '../src/debug/log.js';
-import { tscEnv } from '../src/typecheck-ratchet.js';
+import {
+  ROOT_PLACEHOLDER,
+  baselineCacheEnabled,
+  computeBaselineCacheKey,
+  lookupBaselineCache,
+  storeBaselineCache,
+  toPlaceholderPaths,
+  type BaselineCacheOptions,
+} from './tsc-baseline-cache.js';
+import { TSC_OOM_RETRY_HEAP_MB, TSC_HEAP_MB, tscEnv } from '../src/typecheck-ratchet.js';
 
 /** Inherited GIT_DIR / GIT_WORK_TREE would make `--cwd <other tree>` still read the launcher's repo. */
 function gitEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
@@ -40,19 +49,26 @@ function sh(cmd: string, cwd = process.cwd()): string {
 
 export type TscRun = { out: string; ran: boolean; why?: string };
 
-export { TSC_HEAP_MB, tscEnv } from '../src/typecheck-ratchet.js';
+export { TSC_HEAP_MB, TSC_OOM_RETRY_HEAP_MB, tscEnv } from '../src/typecheck-ratchet.js';
 /** V8 힙 부족의 얼굴 — 「타입 에러」와 «다른 값»이다. */
 const OOM = /heap out of memory|Ineffective mark-compacts near heap limit/;
 
 /** tsc 실행 결과 — 실행 여부와 진단 출력을 분리한다. */
 export function runTsc(cmd: string, exec = execSync): TscRun {
-  try {
-    const out = exec(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: tscEnv(), maxBuffer: 64 * 1024 * 1024 }) as unknown as string;
-    return { out: String(out ?? ''), ran: true };
-  } catch (error: unknown) {
-    const e = error as { status?: number | null; signal?: string | null; stdout?: string; stderr?: string; code?: string };
-    const out = `${e.stdout ?? ''}${e.stderr ?? ''}`;
-    if (OOM.test(out)) return { out, ran: false, why: `tsc 가 V8 힙 부족(OOM)으로 죽었다 — 타입 에러가 아니다 (NODE_OPTIONS=${tscEnv().NODE_OPTIONS})` };
+  type Attempt = { out: string; error?: { status?: number | null; signal?: string | null; code?: string } };
+  const run = (env: NodeJS.ProcessEnv): Attempt => {
+    try {
+      const out = exec(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, maxBuffer: 64 * 1024 * 1024 }) as unknown as string;
+      return { out: String(out ?? '') };
+    } catch (error: unknown) {
+      const e = error as { status?: number | null; signal?: string | null; stdout?: string; stderr?: string; code?: string };
+      return { out: `${e.stdout ?? ''}${e.stderr ?? ''}`, error: e };
+    }
+  };
+  const result = (attempt: Attempt, env: NodeJS.ProcessEnv): TscRun => {
+    const { out, error: e } = attempt;
+    if (OOM.test(out)) return { out, ran: false, why: `tsc 가 V8 힙 부족(OOM)으로 죽었다 — 타입 에러가 아니다 (NODE_OPTIONS=${env.NODE_OPTIONS})` };
+    if (!e) return { out, ran: true };
     if (e.signal || e.code === 'ENOENT' || e.status === null || e.status === undefined) {
       return { out, ran: false, why: `tsc 실행 실패 (signal=${String(e.signal)} code=${String(e.code)} status=${String(e.status)})` };
     }
@@ -64,7 +80,23 @@ export function runTsc(cmd: string, exec = execSync): TscRun {
       return { out, ran: false, why: `tsc 가 종료코드 ${e.status} 로 끝났는데 TS 진단이 한 건도 없다(래퍼 실패로 본다)` };
     }
     return { out, ran: true };
-  }
+  };
+
+  const initialEnv = tscEnv();
+  const initial = run(initialEnv);
+  if (!OOM.test(initial.out)) return result(initial, initialEnv);
+
+  const retryEnv = {
+    ...initialEnv,
+    NODE_OPTIONS: `${(initialEnv.NODE_OPTIONS ?? '').replace(/--max-old-space-size(?:=|\s+)\d+/g, '').trim()} --max-old-space-size=${TSC_OOM_RETRY_HEAP_MB}`.trim(),
+  };
+  const retryResult = result(run(retryEnv), retryEnv);
+  debug.log('harness.host-regate', 'tsc-oom-retry', {
+    heapFrom: TSC_HEAP_MB,
+    heapTo: TSC_OOM_RETRY_HEAP_MB,
+    result: retryResult,
+  });
+  return retryResult;
 }
 
 export type ChangedTsFiles = {
@@ -784,7 +816,27 @@ export function rebaseWorktreePaths(diagnostics: readonly TypecheckError[], work
   return diagnostics.map((diagnostic) => ({ ...diagnostic, line: rebase(diagnostic.line), file: rebase(diagnostic.file) }));
 }
 
-export function readMergeBaseDiagnostics(base: string, command: string, cwd = process.cwd(), run = runTsc): BaselineDiagnostics {
+export type BaselineCacheIo = BaselineCacheOptions & { log?: (message: string) => void };
+
+/**
+ * 같은 base 커밋 ⊕ 같은 명령 ⊕ 같은 설정 해시면 저장된 진단을 재사용한다(워크트리·tsc 0회).
+ * 캐시의 어떤 실패도 던지지 않는다 — miss 로 떨어져 아래 측정이 그대로 돈다.
+ */
+function lookupCachedBaseline(key: string, command: string, cwd: string, cacheIo: BaselineCacheIo): BaselineDiagnostics | undefined {
+  const lookup = lookupBaselineCache(key, cacheIo);
+  const result = lookup.result === 'hit' ? 'hit' : lookup.result === 'corrupt' ? 'corrupt' : 'miss';
+  cacheIo.log?.(`[tsc-gate] typecheck baseline-cache ${result === 'hit' ? 'hit' : 'miss'} ${key.slice(0, 12)}`);
+  debug.log('typecheck.gate', 'baseline-cache', { result, key, command });
+  if (lookup.result !== 'hit') return undefined;
+  return { diagnostics: rebaseWorktreePaths(lookup.diagnostics, ROOT_PLACEHOLDER, cwd) };
+}
+
+export function readMergeBaseDiagnostics(base: string, command: string, cwd = process.cwd(), run = runTsc, cacheIo: BaselineCacheIo = {}): BaselineDiagnostics {
+  const cacheKey = baselineCacheEnabled(cacheIo.env ?? process.env) ? computeBaselineCacheKey(base, command, cwd, cacheIo) : undefined;
+  if (cacheKey) {
+    const cached = lookupCachedBaseline(cacheKey, command, cwd, cacheIo);
+    if (cached) return cached;
+  }
   const workspace = mkdtempSync(join(tmpdir(), 'ci-typecheck-baseline-'));
   const worktree = join(workspace, 'base');
   try {
@@ -798,7 +850,11 @@ export function readMergeBaseDiagnostics(base: string, command: string, cwd = pr
       execSync(cmd, { ...options, cwd: worktree, maxBuffer: 64 * 1024 * 1024, env: tscEnv() }) as string) as typeof execSync;
     const result = run(command, baselineExec);
     if (!result.ran) return { unavailable: result.why ?? '기준 worktree tsc 실행 실패' };
-    return { diagnostics: rebaseWorktreePaths(parseTypecheckErrors(result.out), worktree, cwd) };
+    const measured = parseTypecheckErrors(result.out);
+    if (cacheKey && !storeBaselineCache(cacheKey, command, toPlaceholderPaths(measured, worktree), cacheIo)) {
+      debug.log('typecheck.gate', 'baseline-cache', { result: 'store-failed', key: cacheKey, command });
+    }
+    return { diagnostics: rebaseWorktreePaths(measured, worktree, cwd) };
   } catch (error) {
     return { unavailable: error instanceof Error ? error.message : String(error) };
   } finally {
@@ -889,8 +945,9 @@ function inspectTscResult(tsc: TscRun, changed: ReadonlySet<string>, baseline: R
 export function runGate(io: Partial<GateIo> = {}): void {
   const cwd = io.cwd ?? process.cwd();
   const defaultChanged = () => changedTsFiles((cmd) => sh(cmd, cwd), process.env, cwd, io.baseRef);
-  const { changedTsFiles: getChanged = defaultChanged, runTscCmd = (cmd: string) => runTsc(cmd, ((command, options) => execSync(command, { ...options, cwd, env: tscExecEnv(options?.env) })) as typeof execSync), log = (message: string) => console.log(message), warn = (message: string) => console.warn(message), error = (message: string) => console.error(message), exit = ((code: number) => process.exit(code)) as GateIo['exit'] } = io;
-  const readBaselineDiagnostics = io.readBaselineDiagnostics ?? ((base: string, command: string) => readMergeBaseDiagnostics(base, command, cwd));
+  const defaultRunTsc = (cmd: string) => runTsc(cmd, ((command, options) => execSync(command, { ...options, cwd, env: tscExecEnv(options?.env) })) as typeof execSync);
+  const { changedTsFiles: getChanged = defaultChanged, runTscCmd = defaultRunTsc, log = (message: string) => console.log(message), warn = (message: string) => console.warn(message), error = (message: string) => console.error(message), exit = ((code: number) => process.exit(code)) as GateIo['exit'] } = io;
+  const readBaselineDiagnostics = io.readBaselineDiagnostics ?? ((base: string, command: string) => readMergeBaseDiagnostics(base, command, cwd, runTsc, { log }));
   // Set 주입은 기존 테스트 심이며 기준 revision이 없다. 실제 ChangedTsFiles 경로만 Git 관측을 요구한다.
   const requiredExportFields = io.requiredExportFields ?? ((changed: ReadonlySet<string>, base: string) => base === 'injected test seam'
     ? { fields: [], removedSymbols: [], parameterIncreases: [] }

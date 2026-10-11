@@ -103,3 +103,9 @@ export function intakeTakesQueue(label: 'queued' | 'direct', route: Pick<Journey
   const graphQueues = route.source === 'graph' ? route.to === 'queue' : label === 'queued';
   return graphQueues && eligible;
 }
+
+/** 병합 직전 동결 검사의 «승인 요구» — 동결이 아닌(open) 병합을 그래프가 hold 로 보내면 true.
+ *  ⛔ 그래프가 답을 못 내면(code-default) false — 오늘의 입장 판정 그대로. 동결·선점(frozen·taken)은 이미 코드가 정했다. */
+export function freezeCheckHolds(label: 'open' | 'frozen' | 'taken', route: Pick<JourneyRoute, 'source' | 'to'>): boolean {
+  return label === 'open' && route.source === 'graph' && route.to === 'hold';
+}

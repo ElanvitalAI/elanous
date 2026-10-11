@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
-import { resolveHqLaunchSeat } from '../hq/seats.js';
+import { installedCliArgv, resolveHqLaunchSeat } from '../hq/seats.js';
 import { debug } from '../debug/log.js';
 import { publishInsideEvent } from '../nexus/api/inside-events.js';
 import { redactSecrets } from '../task-cards/card-store.js';
@@ -56,7 +56,7 @@ const DEFAULT_POOL = 'pool-node-b@node-b:8';
 // `harness budget --json` outcomes: proceed | next-provider | wait-reset | stop. next-provider still runs (the harness switches provider itself).
 const BUDGET_PROCEED: readonly string[] = ['proceed', 'next-provider'];
 const launchMode = (settings: StewardSettings): 'off' | 'shadow' | 'live' => launchModeOf(settings.mode ?? settings.launch ?? 'shadow');
-const cli = (args: string[]) => [process.execPath, resolve(import.meta.dir, '../../bin/elanous.mjs'), ...(process.env.NODE_ENV === 'test' ? ['--test'] : []), ...args];
+const cli = (args: string[]) => installedCliArgv([...(process.env.NODE_ENV === 'test' ? ['--test'] : []), ...args]);
 const sourceOf = (issue: TriageIssue): string => /^출처: (telegram|pwa|tui|cli)$/m.exec(issue.body)?.[1] ?? `linear:${issue.identifier}`;
 const promptOf = (issue: TriageIssue): string => `${issue.title}\n${issue.body.slice(0, 1500)}`;
 const argvFor = (issue: TriageIssue, settings: StewardSettings): string[] =>
@@ -108,7 +108,8 @@ function stewardLaunchSeat(): string {
   return resolveHqLaunchSeat('OP', getElanousConfigDir());
 }
 
-function runCommand(args: string[], cwd = resolve(import.meta.dir, '../..')): { exitCode: number; stdout: string; stderr: string } {
+/** Read commands run in the registered OP seat as well: the tree this module was loaded from may be a stale clone. */
+function runCommand(args: string[], cwd = stewardLaunchSeat()): { exitCode: number; stdout: string; stderr: string } {
   const result = Bun.spawnSync(args, { cwd, stdout: 'pipe', stderr: 'pipe' });
   return { exitCode: result.exitCode, stdout: result.stdout.toString(), stderr: result.stderr.toString() };
 }

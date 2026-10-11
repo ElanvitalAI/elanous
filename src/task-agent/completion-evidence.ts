@@ -5,6 +5,11 @@ import type { DecisionLedger } from '../decisions/decision-ledger.js';
 import { getLastStatus } from '../domains/schedule-registry.js';
 
 export type CompletionEvidenceKind = 'research-report' | 'artifact' | 'content' | 'ops-action' | 'watch-brief' | 'decision-support' | 'deliverable';
+/** Card evidence stays a string in the existing ledger; retain both the checked output reference and the confirmed receipt. */
+export function deliverableReceiptEvidence(ref: string): string {
+  return JSON.stringify({ ref, receipt: true });
+}
+
 export interface CompletionEvidenceDeps {
   ledger?: Pick<DecisionLedger, 'list'>;
   schedulesDb?: Database;

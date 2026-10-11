@@ -89,6 +89,50 @@ test('graph YAML triggers.schedule fires through the workflow scheduler into gra
   }
 }, 30000);
 
+test('graph triggers.webhook fires one graph tick', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-cli-webhook-'));
+  dirs.push(dir);
+  const stateRoot = join(dir, 'state');
+  const graph = join(dir, 'graph.yaml');
+  const executed = join(dir, 'executed');
+  writeFileSync(join(dir, 'recipes.yaml'), `a:\n  command: "printf x >> '${executed}'"\n`);
+  writeFileSync(graph, `graph_id: cli-webhook\nversion: 1\nentry_node: a\nterminal_nodes: [done]\ntriggers:\n  webhook: { method: POST, path: /hooks/graph }\nnodes:\n  - { node_id: a, kind: agent, recipe: 'cmd:a', max_visits: 1, notify: false }\n  - { node_id: done, kind: gate, max_visits: 1 }\nedges:\n  - { from: a, to: done }\n`);
+  const child = Bun.spawn(['bun', join(root, 'bin/elanous.mjs'), `--test=${stateRoot}`, 'graph', 'tick', 'graph.yaml', '--webhook'], {
+    cwd: dir, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, ELANOUS_STATE_DIR: stateRoot },
+  });
+  try {
+    const reader = child.stdout.getReader();
+    let out = '';
+    const deadline = Date.now() + 20_000;
+    let pending: ReturnType<typeof reader.read> | undefined;
+    while (!/http:\/\/127\.0\.0\.1:\d+/.test(out) && Date.now() < deadline) {
+      pending ??= reader.read();
+      const chunk = await Promise.race([pending, Bun.sleep(500).then(() => undefined)]);
+      if (!chunk) continue;
+      pending = undefined;
+      if (chunk.done) break;
+      out += new TextDecoder().decode(chunk.value);
+    }
+    const base = out.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0];
+    expect(base).toBeDefined();
+    expect(existsSync(executed)).toBe(false);
+    const missing = await fetch(`${base}/hooks/other`, { method: 'POST', body: '{}' });
+    expect(missing.status).toBe(404);
+    expect(existsSync(executed)).toBe(false);
+    const hit = await fetch(`${base}/hooks/graph`, { method: 'POST', body: '{}' });
+    expect(hit.status).toBe(202);
+    const body = await hit.json() as { ok: boolean; runId: string; workflow: string };
+    expect(body).toMatchObject({ ok: true, workflow: 'graph:cli-webhook' });
+    expect(typeof body.runId).toBe('string');
+    expect(readFileSync(executed, 'utf8')).toBe('x');
+    const runs = readdirSync(join(stateRoot, 'graph-runs', 'cli-webhook')).filter(name => name.endsWith('.json'));
+    expect(runs).toEqual([`${body.runId}.json`]);
+  } finally {
+    child.kill('SIGTERM');
+    await child.exited;
+  }
+}, 30000);
+
 test('a scheduled mine graph refuses a later peer edit without killing its schedule', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'graph-cli-mine-schedule-'));
   dirs.push(dir);

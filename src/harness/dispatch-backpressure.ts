@@ -36,7 +36,9 @@ const constants = { BUILD_STOP, BUILD_SLOW, QUEUE_STOP, QUEUE_SLOW, UNKNOWN_CAP 
 const valid = (value: unknown): BackpressureSignal =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 'unknown';
 
-/** Fixed, reviewable thresholds; observations are normalized before any arithmetic. */
+/** Fixed, reviewable thresholds; observations are normalized before any arithmetic.
+ * Existing caller: the inline `.action(...)` callback registered by `queue.command('backpressure')` in src/harness/harness-cli-command.ts calls `decideBackpressure(signals, { maxPerCycle: opts.max === undefined ? 6 : Number(opts.max) })`.
+ */
 export function decideBackpressure(input: BackpressureSignals, { maxPerCycle = 6 }: { maxPerCycle?: number } = {}) {
   const max = Number.isSafeInteger(maxPerCycle) && maxPerCycle >= 0 ? maxPerCycle : 6;
   const signals: BackpressureSignals = {
@@ -81,7 +83,13 @@ export function decideBackpressure(input: BackpressureSignals, { maxPerCycle = 6
     budget = Math.min(budget, signals.queueDepth >= QUEUE_STOP ? 0 : Math.floor(max / 2));
     reasons.push('queue-depth');
   }
-  if (signals.staleParents !== 'unknown' && signals.staleParents > 0) reasons.push(`stale-parents:${signals.staleParents}`);
+  if (signals.staleParents !== 'unknown' && signals.staleParents > 0) {
+    reasons.push(`outdated-version-parents:${signals.staleParents} (legacy observation alias: stale-parents:${signals.staleParents}; 살아 있는 런 · 예산 안 깎음 · 낡은 부모 후보는 eln tasks parents)`);
+    // Co-occurrence only: staleParents is local ps, admitWaiting includes remote hosts — not proof that this parent is the one waiting.
+    if (signals.admitWaiting !== 'unknown' && signals.admitWaiting > 0) {
+      reasons.push('restart-stale-parent:approval-wait');
+    }
+  }
   return { launchBudget: Math.max(0, Math.min(max, Math.floor(budget))), reasons, signals, constants };
 }
 

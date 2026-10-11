@@ -250,7 +250,7 @@ describe('③ the unmeasured reason reaches the light-rc result', () => {
         dispatch: async (opts: DispatchOptions) => opts.runLocal(),
       }));
       await cmd.parseAsync(['release', 'light-rc', '--version', '0.2.23', '--base', 'abc123', '--local', '--json'], { from: 'user' });
-    } finally { write.mockRestore(); err.mockRestore(); log.mockRestore(); process.exitCode = priorExitCode; }
+    } finally { write.mockRestore(); err.mockRestore(); log.mockRestore(); process.exitCode = priorExitCode ?? 0; }
     const childLine = out.join('');
     expect(JSON.parse(childLine)).toMatchObject({ ok: false, introduced: null, unmeasured: REASON });
     const parent = await runLightRc('0.2.23', { base: 'abc123', log: () => {} }, deps({

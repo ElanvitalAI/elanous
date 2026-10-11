@@ -9257,6 +9257,25 @@ describe('lintGoalFile · TRACED PATHS 의 인라인 코드 표기', () => {
     expect(tracedFindings('1. src/present.ts — 설명')).toEqual([]);
   });
 
+  test('목록 기호가 두 겹이어도(저작기 산출 꼴 · 10-11 no-result-line 18건) 경로만 읽는다', () => {
+    for (const line of ['- - src/present.ts — 설명', '- 1. src/present.ts — 설명', '1. - src/present.ts', '- [code] - src/present.ts — 설명', '* [code] 2. `src/present.ts`:2 — 설명']) {
+      expect(tracedPathReferences(canonical(line)).map((reference) => reference.path)).toEqual(['src/present.ts']);
+      expect(tracedFindings(line)).toEqual([]);
+    }
+  });
+
+  test('목록 기호가 백틱 «안»에 있어도 경로만 읽는다(10-11 재발 · AUTHOR-DECOMPOSE-KNOB · MODEL-BENCH-SCORES)', () => {
+    for (const line of ['- `- src/present.ts`', '- [code] `- src/present.ts` — 설명', '1. `1. src/present.ts`:2 — 설명']) {
+      expect(tracedPathReferences(canonical(line)).map((reference) => reference.path)).toEqual(['src/present.ts']);
+      expect(tracedFindings(line)).toEqual([]);
+    }
+    expect(tracedFindings('- `- src/absent.ts`').map((finding) => finding.message)).toEqual(['traced path does not exist: src/absent.ts']);
+  });
+
+  test('목록 기호를 반복해 벗겨도 실재하지 않는 경로는 여전히 ERROR 다', () => {
+    expect(tracedFindings('- - src/absent.ts — 설명').map((finding) => finding.message)).toEqual(['traced path does not exist: src/absent.ts']);
+  });
+
   test('공백으로 둘러싼 하이픈은 설명 구분자로 보고 경로만 읽는다', () => {
     expect(tracedPathReferences(canonical('1. src/present.ts - 설명'))).toEqual([
       { path: 'src/present.ts', line: null, endLine: null },

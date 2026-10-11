@@ -322,7 +322,7 @@ describe('planHarnessClean — 조회 신뢰 상태', () => {
     expect(planFrom({ worktrees: true, branches: true, pullRequests: false }).preserve[0]?.reason)
       .toBe('query-failed:pullRequests');
     expect(planFrom({ worktrees: false, branches: true, pullRequests: true, directories: false }).preserve[0]?.reason)
-      .toBe('query-failed:worktrees,directories');
+      .toBe('query-failed:worktrees'); // orphan-only queries no longer leak into branch preserve reasons
   });
 
   it('모든 질의가 성공하면 query-failed 사유 없이 기존 분류를 유지한다', () => {
@@ -514,16 +514,18 @@ describe('planHarnessClean — orphaned worktree observation', () => {
     expect(plan.unavailable).toBe(false);
   });
 
-  it('고아 조회가 실패하면 unavailable이며 고아 판정을 하지 않는다', () => {
+  it('고아 조회가 실패하면 고아 판정만 끄고 브랜치 제거 계획은 유지한다', () => {
     const plan = planHarnessClean({
       ...base,
       worktreeDirectories: ['/wt/dev/registered', '/wt/dev/orphaned'],
       registeredWorktreePaths: ['/wt/dev/registered'],
       queryStatus: { worktrees: true, branches: true, pullRequests: true, directories: false, registeredWorktrees: true },
     });
-    expect(plan.unavailable).toBe(true);
+    expect(plan.unavailable).toBe(false);
+    expect(plan.orphanScan).toBe('unavailable');
+    expect(plan.orphanScanFailure).toBe('directories');
     expect(plan.orphanedWorktrees).toEqual([]);
-    expect(plan.remove).toEqual([]);
+    expect(plan.remove.map((item) => item.branch)).toEqual(['dev/registered']);
   });
 
   it('PR 조회 실패에도 성공적으로 판정한 고아 관측을 보존하고 remove에 넣지 않는다', () => {
@@ -794,14 +796,15 @@ describe('planHarnessClean — 고아 판정 입력 완결성 (리뷰 must-fix)'
     expect(p.orphanedWorktrees).toEqual([]);
   });
 
-  it('디렉터리 조회가 실패하면 고아 판정을 하지 않고 unavailable 이다', () => {
+  it('디렉터리 조회가 실패하면 고아 판정만 하지 않는다', () => {
     const p = planHarnessClean({ activeDirectories: [],
       worktrees: [wt('dev/a')], branches: ['dev/a'], ...emptyPr, mode: 'abandoned',
       queryStatus: { ...ok, directories: false },
       worktreeDirectories: [], registeredWorktreePaths: ['/wt/dev/a'],
     });
     expect(p.orphanedWorktrees).toEqual([]);
-    expect(p.unavailable).toBe(true);
+    expect(p.orphanScan).toBe('unavailable');
+    expect(p.unavailable).toBe(false);
   });
 });
 

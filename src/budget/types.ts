@@ -158,18 +158,24 @@ export type ResetCreditExpiryAxis =
   | { readonly status: 'expired'; readonly expiresAt: string; readonly hasUnknownExpiry: boolean };
 
 export interface AccountUsageRow {
-  readonly provider: 'codex' | 'grok' | 'openrouter';
+  /** `zai` = GLM Coding Plan(ZAI-CODING-PLAN-PROVIDER) — `ZAI_API_KEY` 가 있을 때만 행이 생긴다. */
+  readonly provider: 'codex' | 'grok' | 'openrouter' | 'zai';
   readonly accountName: string;
   readonly accountCount: number;
   readonly soleAccount: boolean;
   readonly credits: CreditAxis;
   readonly subscription: SubscriptionAxis;
   readonly resetCredits: ResetCreditExpiryAxis;
+  /** 행 끝에 붙는 한 줄(출처·실수치) — 없으면 종전 문면과 바이트 동일. */
+  readonly note?: string;
 }
 
 export interface UnifiedUsageReport {
   readonly rows: readonly AccountUsageRow[];
-  readonly accountCounts: Readonly<Record<'codex' | 'grok' | 'openrouter', number>>;
+  /** `zai` 는 키가 있을 때만 실린다(없으면 종전 JSON 과 같다). */
+  readonly accountCounts: Readonly<Record<'codex' | 'grok' | 'openrouter', number>> & { readonly zai?: number };
+  /** GLM Coding Plan 상세(창 · 우리 적산 · 잔액 사용 · 마지막 한도 코드) — 키가 있을 때만. */
+  readonly zaiCodingPlan?: import('../llm/zai-coding-plan.js').ZaiUsageView;
 }
 
 export interface TurnSummary {

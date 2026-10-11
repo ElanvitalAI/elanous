@@ -2,7 +2,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
-import { streamLLM } from '../llm.js';
+import * as llm from '../llm.js';
+import { resolveRoleLlm } from '../user-config.js';
 import { emitDecision, type DecisionEvent } from '../live/detail-switch.js';
 import { OFFICIAL_INDEX_KEYS } from '../market/official-keys.js';
 import { verifyIndex, type MarketplaceIndex } from '../market/signed-index.js';
@@ -80,10 +81,14 @@ function parseNeeds(raw: string, vocabulary: readonly string[]): string[] {
 }
 
 async function inferNeeds(mission: string, vocabulary: readonly string[]): Promise<string> {
-  return streamLLM([
+  const resolved = resolveRoleLlm('classify');
+  const provider = llm.PROVIDERS[resolved.provider];
+  if (!provider) throw new Error(`Unknown classify provider: ${resolved.provider}`);
+  debug.log('llm.role-pin', 'resolved', { site: 'resource-ladder', role: 'classify', model: resolved.model, provider: resolved.provider, source: resolved.source });
+  return llm.streamLLM([
     { role: 'system', content: `Identify at most five concrete tool/service/skill capabilities required for this mission. Reply ONLY with JSON {"needs":["capability"]}. No credentials, tokens, URLs, or mission text in the output. If a relevant label appears in this verified official marketplace vocabulary, use that exact label; otherwise use a concrete capability. If uncertain, return an empty list.\nVerified labels: ${JSON.stringify(vocabulary)}` },
     { role: 'user', content: mission },
-  ], () => {}, { maxTokens: 200, temperature: 0 });
+  ], () => {}, { model: resolved.model, provider, usageRole: 'classify', maxTokens: 200, temperature: 0 });
 }
 
 async function readOfficialIndex(): Promise<{ marketplaceBytes: Uint8Array; signatureText: string }> {

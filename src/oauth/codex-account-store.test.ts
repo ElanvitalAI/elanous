@@ -5,7 +5,8 @@
 // 회전이 `reset-credit-unknown` 으로 건강한 기본 계정에서 도망친다.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { writeAvailabilityState, writeQuotaSignal } from '../budget/codex-reset-credit-state.js';
@@ -15,6 +16,7 @@ import { saveTokens } from './store.js';
 import {
   _resetCodexRotationPinForTesting,
   _setCodexAccountOutboundSenderForTesting,
+  _setCreditSpendAlertLockWaitMsForTesting,
   _setRotationConfigReaderForTesting,
   autoConsumeCodexResetCredit,
   inspectCodexRotation,
@@ -27,9 +29,13 @@ const madeDirs: string[] = [];
 const original = {
   state: process.env.ELANOUS_STATE_DIR,
   home: process.env.CODEX_HOME,
+  account: process.env.ELANOUS_CODEX_ACCOUNT,
+  run: process.env.ELANOUS_RUN_ID,
 };
 
 beforeEach(() => {
+  delete process.env.ELANOUS_CODEX_ACCOUNT;
+  delete process.env.ELANOUS_RUN_ID;
   _setCodexAccountOutboundSenderForTesting(() => true);
 });
 
@@ -38,6 +44,10 @@ afterEach(() => {
   else process.env.ELANOUS_STATE_DIR = original.state;
   if (original.home === undefined) delete process.env.CODEX_HOME;
   else process.env.CODEX_HOME = original.home;
+  if (original.account === undefined) delete process.env.ELANOUS_CODEX_ACCOUNT;
+  else process.env.ELANOUS_CODEX_ACCOUNT = original.account;
+  if (original.run === undefined) delete process.env.ELANOUS_RUN_ID;
+  else process.env.ELANOUS_RUN_ID = original.run;
   _setRotationConfigReaderForTesting(null);
   _setCodexAccountOutboundSenderForTesting(null);
   _resetCodexRotationPinForTesting();
@@ -396,6 +406,188 @@ describe('CODEX-ORDER ② — 리셋권 자동 소비(주입 가짜만 · 실물
       expect(t.events.filter((e) => e.event === 'reset-consume-skipped').every((e) => e.data.reason === 'test-runtime-guard')).toBe(true);
     } finally { t.restore(); }
   });
+});
+
+test('다른 계정의 리셋권 후보가 실행 판정과 자동 소비 테스트 가드에 닿는다', async () => {
+  const root = isolatedRoot('codex-other-reset-');
+  const defaultHome = join(root, 'default-home');
+  const teamHome = join(root, 'team-home');
+  for (const home of [defaultHome, teamHome]) mkdirSync(home, { recursive: true });
+  const store = join(root, 'auth.json');
+  saveTokens('openai-codex', tokens(), { mirrorCodex: false, codexHome: defaultHome }, store);
+  saveTokens('openai-codex:team', tokens(), { mirrorCodex: false, codexHome: teamHome }, store);
+  writeQuotaSignal(undefined, 100, defaultHome); writeAvailabilityState(0, defaultHome);
+  writeQuotaSignal(undefined, 100, teamHome); writeAvailabilityState(1, teamHome);
+  _setRotationConfigReaderForTesting(() => ({ llm: { codexCreditsAllowed: true } }));
+  const recorded: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+  const originalLog = debug.log;
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, data: Record<string, unknown>) => {
+    recorded.push({ category, event, data });
+  }) as typeof debug.log;
+  try {
+    const env = { CODEX_HOME: defaultHome } as NodeJS.ProcessEnv;
+    const snapshot = inspectCodexRotation(env, { storePath: store });
+    expect(snapshot.candidates.find((c) => c.name === 'team')?.resetCreditAvailability).toBe('available');
+    expect(snapshot.reason).toBe('reset-credit-available');
+    expect(resolveCodexAccountForRun(env, { storePath: store }).name).toBe('default');
+    await new Promise((r) => setTimeout(r, 10));
+    expect(recorded.filter((e) => e.category === 'oauth.codex-account' && e.event === 'rotation')).toEqual([
+      expect.objectContaining({ category: 'oauth.codex-account', event: 'rotation', data: expect.objectContaining({ reason: 'reset-credit-available', resetCreditAccount: 'team' }) }),
+    ]);
+    expect(recorded.filter((e) => e.category === 'codex.rotation' && e.event === 'reset-consume-skipped' && e.data.reason === 'test-runtime-guard')).toHaveLength(1);
+  } finally { (debug as { log: typeof debug.log }).log = originalLog; }
+});
+
+test('발송 비활성화·false·예외는 일일 알림을 차지하지 않고 성공 후에만 기록한다', () => {
+  const root = isolatedRoot('codex-credit-retry-');
+  const home = join(root, 'home');
+  mkdirSync(home);
+  const store = join(root, 'auth.json');
+  const counterPath = join(root, 'budget', 'codex-credit-spend-alert.json');
+  saveTokens('openai-codex', tokens(), { mirrorCodex: false, codexHome: home }, store);
+  writeQuotaSignal(undefined, 100, home); writeAvailabilityState(0, home);
+  const logs: Array<{ event: string; level?: string }> = [];
+  const originalLog = debug.log;
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, _data: unknown, opts?: { level?: string }) => {
+    if (category === 'oauth.codex-account') logs.push({ event, level: opts?.level });
+  }) as typeof debug.log;
+  try {
+    const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
+    _setRotationConfigReaderForTesting(() => ({ llm: { codexCreditsAllowed: true, codexAccountAlerts: false } }));
+    resolveCodexAccountForRun(env, { storePath: store, counterPath });
+    expect(existsSync(counterPath)).toBe(false);
+    _setRotationConfigReaderForTesting(() => ({ llm: { codexCreditsAllowed: true } }));
+    _setCodexAccountOutboundSenderForTesting(() => false);
+    resolveCodexAccountForRun(env, { storePath: store, counterPath });
+    expect(existsSync(counterPath)).toBe(false);
+    _setCodexAccountOutboundSenderForTesting(() => { throw new Error('sender failure'); });
+    resolveCodexAccountForRun(env, { storePath: store, counterPath });
+    expect(existsSync(counterPath)).toBe(false);
+    let sent = 0;
+    _setCodexAccountOutboundSenderForTesting(() => { sent++; return true; });
+    resolveCodexAccountForRun(env, { storePath: store, counterPath });
+    resolveCodexAccountForRun(env, { storePath: store, counterPath });
+    expect(sent).toBe(1);
+    expect(JSON.parse(readFileSync(counterPath, 'utf8')).accounts).toEqual(['default']);
+    expect(logs.filter((log) => log.event === 'credit-spend-start' && log.level === 'warn')).toHaveLength(1);
+    expect(logs.filter((log) => log.event === 'outbound-suppressed')).toHaveLength(1);
+    expect(logs.filter((log) => log.event === 'outbound-failed')).toHaveLength(1);
+    expect(logs.filter((log) => log.event === 'credit-spend-alert-skipped')).toHaveLength(1);
+  } finally { (debug as { log: typeof debug.log }).log = originalLog; }
+});
+
+function creditLockFixture(prefix: string) {
+  const root = isolatedRoot(prefix);
+  const home = join(root, 'home');
+  mkdirSync(home);
+  const store = join(root, 'auth.json');
+  const counterPath = join(root, 'budget', 'codex-credit-spend-alert.json');
+  mkdirSync(join(root, 'budget'));
+  saveTokens('openai-codex', tokens(), { mirrorCodex: false, codexHome: home }, store);
+  writeQuotaSignal(undefined, 100, home); writeAvailabilityState(0, home);
+  _setRotationConfigReaderForTesting(() => ({ llm: { codexCreditsAllowed: true } }));
+  const sent: string[] = [];
+  _setCodexAccountOutboundSenderForTesting((text) => { sent.push(text); return true; });
+  const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
+  return { root, store, counterPath, lockPath: `${counterPath}.lock`, sent, env, day: new Date().toISOString().slice(0, 10) };
+}
+
+test('죽은 소유자의 오래된 잠금 파일은 걷고 알림을 보낸 뒤 잠금을 남기지 않는다', () => {
+  const t = creditLockFixture('codex-credit-lock-');
+  writeFileSync(t.lockPath, '99999999');
+  const old = new Date(Date.now() - 121_000);
+  utimesSync(t.lockPath, old, old);
+  resolveCodexAccountForRun(t.env, { storePath: t.store, counterPath: t.counterPath });
+  expect(t.sent).toHaveLength(1);
+  expect(existsSync(t.lockPath)).toBe(false);
+  expect(JSON.parse(readFileSync(t.counterPath, 'utf8'))).toEqual({ day: t.day, accounts: ['default'] });
+});
+
+test('다른 런이 잠금을 쥐고 있으면 풀릴 때까지 기다려, 그 런이 쓴 카운터를 읽고 이 계정 알림을 보낸다', async () => {
+  const t = creditLockFixture('codex-credit-contended-');
+  const events: string[] = [];
+  const originalLog = debug.log;
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string) => {
+    if (category === 'oauth.codex-account') events.push(event);
+  }) as typeof debug.log;
+  writeFileSync(t.lockPath, 'other');
+  const child = spawn('sh', ['-c', `sleep 0.6; printf '%s' '${JSON.stringify({ day: t.day, accounts: ['team'] })}' > '${t.counterPath}'; rm -f '${t.lockPath}'`], { stdio: 'ignore' });
+  try {
+    const started = Date.now();
+    resolveCodexAccountForRun(t.env, { storePath: t.store, counterPath: t.counterPath });
+    expect(Date.now() - started).toBeGreaterThan(400);
+    expect(t.sent).toHaveLength(1);
+    expect(t.sent[0]).toContain('account: default');
+    expect(JSON.parse(readFileSync(t.counterPath, 'utf8'))).toEqual({ day: t.day, accounts: ['team', 'default'] });
+    expect(events).toContain('credit-spend-start');
+    expect(events).not.toContain('credit-spend-alert-lock-timeout');
+    expect(existsSync(t.lockPath)).toBe(false);
+    resolveCodexAccountForRun(t.env, { storePath: t.store, counterPath: t.counterPath });
+    expect(t.sent).toHaveLength(1);
+    expect(events).toContain('credit-spend-alert-skipped');
+  } finally {
+    (debug as { log: typeof debug.log }).log = originalLog;
+    child.kill();
+  }
+});
+
+test('살아 있는 잠금이 상한을 넘겨도 알림을 잃지 않는다 — 잠금 없이 보내고 남의 잠금은 안 지운다', () => {
+  const t = creditLockFixture('codex-credit-timeout-');
+  const events: string[] = [];
+  const originalLog = debug.log;
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string) => {
+    if (category === 'oauth.codex-account') events.push(event);
+  }) as typeof debug.log;
+  writeFileSync(t.lockPath, 'other');
+  _setCreditSpendAlertLockWaitMsForTesting(150);
+  try {
+    resolveCodexAccountForRun(t.env, { storePath: t.store, counterPath: t.counterPath });
+    expect(t.sent).toHaveLength(1);
+    expect(events).toContain('credit-spend-alert-lock-timeout');
+    expect(events).toContain('credit-spend-start');
+    expect(readFileSync(t.lockPath, 'utf8')).toBe('other');
+  } finally {
+    _setCreditSpendAlertLockWaitMsForTesting(null);
+    (debug as { log: typeof debug.log }).log = originalLog;
+  }
+});
+
+test('크레딧 지출 시작 알림은 계정별 UTC 일자에 한 번만 발송한다', () => {
+  const root = isolatedRoot('codex-credit-alert-');
+  const home = join(root, 'default-home');
+  mkdirSync(home, { recursive: true });
+  const store = join(root, 'auth.json');
+  const counterPath = join(root, 'budget', 'codex-credit-spend-alert.json');
+  saveTokens('openai-codex', tokens(), { mirrorCodex: false, codexHome: home }, store);
+  writeQuotaSignal(undefined, 100, home); writeAvailabilityState(0, home);
+  _setRotationConfigReaderForTesting(() => ({ llm: { codexCreditsAllowed: true } }));
+  const sent: Array<{ text: string; kind?: string }> = [];
+  _setCodexAccountOutboundSenderForTesting((text, kind) => { sent.push({ text, kind }); return true; });
+  const recorded: Array<{ event: string; data: Record<string, unknown>; level?: string }> = [];
+  const originalLog = debug.log;
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, data: Record<string, unknown>, options?: { level?: string }) => {
+    if (category === 'oauth.codex-account') recorded.push({ event, data, level: options?.level });
+  }) as typeof debug.log;
+  try {
+    const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
+    resolveCodexAccountForRun(env, { storePath: store, counterPath });
+    resolveCodexAccountForRun(env, { storePath: store, counterPath });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.kind).toBe('alert');
+    expect(sent[0]?.text).toContain('💳 Codex credits in use');
+    expect(sent[0]?.text).toContain('account: default');
+    expect(sent[0]?.text).toContain('reason: credits-allowed');
+    expect(sent[0]?.text).toContain('usage: default=100%');
+    expect(sent[0]?.text).not.toMatch(/balance|amount|₩|\$/i);
+    const day = new Date().toISOString().slice(0, 10);
+    expect(JSON.parse(readFileSync(counterPath, 'utf8'))).toEqual({ day, accounts: ['default'] });
+    expect(recorded.filter((e) => e.event === 'credit-spend-start')).toEqual([
+      expect.objectContaining({ data: { account: 'default', reason: 'credits-allowed', day }, level: 'warn' }),
+    ]);
+    expect(recorded.filter((e) => e.event === 'credit-spend-alert-skipped')).toEqual([
+      expect.objectContaining({ data: { account: 'default', reason: 'already-alerted-today' } }),
+    ]);
+  } finally { (debug as { log: typeof debug.log }).log = originalLog; }
 });
 
 describe('OR-FALLBACK-TIER-1 — resolveRunFallback 이 config 의 openrouter 모델·키 존재를 판정에 싣는다', () => {

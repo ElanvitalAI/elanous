@@ -79,6 +79,41 @@ describe('parseReviewResult — VERDICT + MUST-FIX/SHOULD-FIX 파싱', () => {
     expect(parseReviewResult('VERDICT: FAIL\nMUST-FIX:\n- (없음)').mustFix).toEqual(['PR 리뷰 FAIL — 재작업 필요(구체 지적 미파싱).']);
     expect(parseReviewResult('VERDICT: WARN\nMUST-FIX:\n- 없음 — 인증 검사가 없어 권한 없이 배포 가능').mustFix).toHaveLength(1);
   });
+  it('REVIEW-MUSTFIX-NONE-SENTINEL ① — 괄호 안 «수용기준 충족» 설명·«·» 구분자 표지는 0건으로 접는다', () => {
+    for (const sentinel of [
+      '(없음 — 수용기준 충족)', '(없음 — 수용 기준을 모두 충족함)', '(없음 · 수용기준 충족)', '(none — acceptance criteria met)',
+      '(none — acceptance criteria are all met)', '(없음 · 블로커 수준의 결함은 발견되지 않음)',
+    ]) {
+      expect(parseReviewResult(`VERDICT: PASS\nMUST-FIX:\n- ${sentinel}`).mustFix).toEqual([]);
+    }
+  });
+  it('REVIEW-MUSTFIX-NONE-SENTINEL ② — 괄호 없는 «없음 — 수용기준 미충족» 과 괄호 안 미충족 설명은 지적으로 남긴다', () => {
+    for (const finding of ['없음 — 수용기준 미충족: 시험 0', '없음 — 수용기준 충족', '(없음 — 수용기준 미충족: 시험 0)', '(없음 · 리뷰 테스트가 배선되지 않음)']) {
+      expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${finding}`).mustFix).toEqual([finding]);
+    }
+  });
+  it('REVIEW-MUSTFIX-NONE-SENTINEL ④ — 괄호 안 «없음 — 무소견 머리 + 긴 근거»는 길이 무관 0건(10-11 TC pr land review-must-fix-1)', () => {
+    for (const sentinel of [
+      '(없음 — 수용기준 충족: 머리말에 KNOWHOW 링크가 반영됨, 표의 각 항목이 읽기 전용 확인 명령을 달고 있으며 기존 문서 줄 인용 시험도 그대로 통과한다는 실측이 PR 본문에 있다)',
+      "(없음 — 수용기준 3항 모두 충족: 신규 테스트 파일 존재 · 원장 쓰기 실패 경로가 config set 을 실패시키지 않음(`'failed'` 반환 + warn, 테스트로 검증) · 기존 명령 무변경)",
+      '(none — acceptance criteria met: the new branch is wired into parseReviewResult, both positive and negative cases are covered by tests, and no unrelated files change)',
+    ]) {
+      expect(parseReviewResult(`VERDICT: PASS\nMUST-FIX:\n- ${sentinel}`).mustFix).toEqual([]);
+    }
+  });
+  it('REVIEW-MUSTFIX-NONE-SENTINEL ⑤ — «없음 —» 뒤가 결함 서술이거나 근거에 역접이 있으면 지적으로 남긴다', () => {
+    for (const finding of [
+      '(없음 — 하지만 머리 고정 착지에서 overlap-evidence 경로가 깨진다: 리뷰 결과 파일을 못 읽는다)',
+      '(없음 — 수용기준 충족: 다만 새 정규식이 실행 경로에 배선되지 않아 실제로는 아무것도 접지 않는다)',
+      '(none — acceptance criteria met, but the new export is never called from pr land)',
+      '새 판정이 overlap-evidence 경로에서 호출되지 않는다 — 수용기준 충족이라 적었지만 배선이 없다',
+    ]) {
+      expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${finding}`).mustFix).toEqual([finding]);
+    }
+  });
+  it('REVIEW-MUSTFIX-NONE-SENTINEL ③ — FAIL ⊕ «(없음 — 수용기준 충족)» 만이면 최소 1 블로커 보장', () => {
+    expect(parseReviewResult('VERDICT: FAIL\nMUST-FIX:\n- (없음 — 수용기준 충족)').mustFix).toEqual(['PR 리뷰 FAIL — 재작업 필요(구체 지적 미파싱).']);
+  });
   it('VERDICT 부재 → pass 폴백', () => {
     expect(parseReviewResult('음').verdict).toBe('pass');
   });

@@ -2,8 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
-import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
+import { getElanousConfigDir, getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { observeModelInputTokens } from '../harness/model-input-observation.js';
 import { publishInsideEvent } from '../nexus/api/inside-events.js';
@@ -22,7 +23,7 @@ import { psProcessStartMs, START_TOLERANCE_MS } from '../harness/harness-stop.js
 import { executeBashNode } from '../workflow-runtime/nodes/bash.js';
 import { interpolate } from '../workflow-runtime/variables.js';
 import type { BashNode, NodeExecContext, WorkflowDeps } from '../workflow-runtime/types.js';
-import { releaseResumeAcceptedRegressions, releaseResumeWaiver, type AcceptedRegression } from '../../scripts/release-loop/resume.js';
+import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeWaiver, type AcceptedRegression, type GateExecutorOverride } from '../../scripts/release-loop/resume.js';
 
 type BashRun = WorkflowDeps['runBash'];
 
@@ -51,10 +52,14 @@ export interface GraphRunState {
   graphSnapshot?: { graphSha: string; recipesSha: string };
   graphPath?: string;
   variant?: { overlayId: string; goal: string; plan: GraphVariantPlan };
+  parentRunId?: string;
+  unitCalls?: Array<{ node: string; unit: string; version: number; hash: string; childRunId: string; exit: string; steps: number }>;
   growth?: GraphGrowth[];
   growthRejections?: Array<{ from: string; outcome: string; reason: string }>;
   growthPark?: { from: string; outcome: string; reason: string; decisionId: string; decisionRef: string; growth: GraphGrowth; command?: GrowthCommand; approval?: string };
   resume?: { from: string; at: string; previousStatus: GraphRunState['status']; graph?: 'snapshot' | 'current' };
+  /** GATE-HOST-EXECUTOR — every explicit input change a resume made (what was set and what it replaced), oldest first. */
+  inputOverrides?: GateExecutorOverride[];
   executed: number;
   dryRun: boolean;
   statePath: string;
@@ -74,7 +79,11 @@ export interface GraphRunOptions {
   releaseWaiver?: { nodeId: string; reason: string; requestedRegressions: AcceptedRegression[]; acceptedRegressions: AcceptedRegression[] };
   /** Release-only: add accepted issues independently of a waiver at a restart boundary. */
   releaseAcceptedRegressions?: { requested: AcceptedRegression[]; acceptedRegressions: AcceptedRegression[] };
+  /** Release-only (GATE-HOST-EXECUTOR): run the restarted gate on this executor — recorded in `inputOverrides`, never a waiver. */
+  releaseGateExecutor?: { executor: string; host?: string };
   useCurrentGraph?: boolean;
+  /** Internal unit invocation context, propagated only by runGraph. */
+  unitContext?: { parentRunId: string; ancestors: readonly string[]; remainingSteps: number };
   /**
    * RELEASE-LEDGER-UNIVERSE — stamp every cmd: child with this run's ledger root (`ELANOUS_STATE_DIR`).
    * Without it a child launched from a non-leader tree (`bun scripts/...` with cwd = that tree) re-resolves
@@ -389,6 +398,55 @@ function nextNode(edges: readonly GraphEdgeSpec[], nodeId: string, exitOutcome: 
   return edge.map?.[exitOutcome] ?? edge.fallback?.[0]?.node;
 }
 
+type ResolvedUnit = { path: string; template: GraphTemplateSpec; hash: string };
+
+function resolveUnit(call: string, callerPath: string): ResolvedUnit {
+  const [id, requested] = call.split('@');
+  const repo = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+  const directories = [join(dirname(callerPath), 'units'), dirname(callerPath), join(repo, 'graphs', 'units'), join(getElanousConfigDir(), 'graphs', 'units')];
+  for (const dir of directories) {
+    if (!existsSync(dir)) continue;
+    const matches = readdirSync(dir).filter(file => /\.ya?ml$/.test(file) && file !== 'recipes.yaml' && file !== 'recipes.yml').flatMap(file => {
+      const path = join(dir, file);
+      const source = readFileSync(path, 'utf8');
+      const header: unknown = parseYaml(source);
+      if (!header || typeof header !== 'object' || Array.isArray(header) || (header as Record<string, unknown>).graph_id !== id) return [];
+      const parsed = parseGraphTemplateYaml(source, path);
+      if (parsed.errors.length) throw new Error(parsed.errors.map(e => `${e.path}: ${e.message}`).join('\n'));
+      const template = parsed.template!;
+      return template.unit && (requested === String(template.version) || requested === `^${template.version}`)
+        ? [{ path, template, hash: createHash('sha256').update(source).digest('hex') }] : [];
+    });
+    if (matches.length > 1) throw new Error(`ambiguous unit: ${call}`);
+    if (matches.length) return matches[0]!;
+  }
+  throw new Error(`unit not found: ${call}`);
+}
+
+function validateUnitCalls(graph: GraphTemplateSpec, path: string, ancestors: readonly string[] = []): Map<string, ResolvedUnit> {
+  if (ancestors.includes(graph.graphId)) throw new Error(`unit cycle: ${[...ancestors, graph.graphId].join(' -> ')}`);
+  if (ancestors.length > 3) throw new Error('unit nesting exceeds depth 3');
+  const result = new Map<string, ResolvedUnit>();
+  for (const node of graph.nodes) {
+    if (node.kind !== 'subgraph' || node.call === undefined) continue;
+    const unit = resolveUnit(node.call!, path);
+    const contract = node.contract!;
+    const edge = graph.edges.find(e => e.from === node.nodeId);
+    if (!unit.template.unit || contract.inputs.length !== unit.template.unit.inputs.length ||
+        contract.inputs.some(key => !unit.template.unit!.inputs.includes(key)) ||
+        contract.outputs.length !== unit.template.unit.outputs.length ||
+        contract.outputs.some(key => !unit.template.unit!.outputs.includes(key)) || edge?.on !== 'outcome' ||
+        !edge.map || Object.keys(edge.map).length !== unit.template.unit.exits.length ||
+        unit.template.unit.exits.some(exit => !Object.hasOwn(edge.map!, exit))) {
+      debug.log('graph.unit', 'contract-mismatch', { graphId: graph.graphId, nodeId: node.nodeId, call: node.call });
+      throw new Error(`unit contract mismatch: ${node.nodeId} -> ${node.call}`);
+    }
+    validateUnitCalls(unit.template, unit.path, [...ancestors, graph.graphId]);
+    result.set(node.nodeId, unit);
+  }
+  return result;
+}
+
 export async function runGraph(path: string, options: GraphRunOptions = {}): Promise<GraphRunState> {
   if (options.resumeRunId && options.runId) throw new Error('runId and resumeRunId cannot be combined');
   if (options.fromNodeId && !options.resumeRunId) throw new Error('--from requires --resume');
@@ -396,6 +454,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   if (options.variant && options.resumeRunId) throw new Error('variant cannot be combined with --resume');
   if (options.releaseWaiver && (!options.resumeRunId || options.fromNodeId !== options.releaseWaiver.nodeId)) throw new Error('release waiver requires --resume --from <waived node>');
   if (options.releaseAcceptedRegressions && (!options.resumeRunId || !options.fromNodeId || options.releaseWaiver)) throw new Error('accepted regressions require a release resume boundary');
+  if (options.releaseGateExecutor && (!options.resumeRunId || !options.fromNodeId)) throw new Error('gate executor override requires a release resume boundary');
   const root = options.deps?.root ?? effectiveInstanceRoot();
   const matchingRuns = options.resumeRunId && !options.resumeGraphId
     ? listGraphRuns(root).runs.filter((run) => run.runId === options.resumeRunId && run.graphPath === resolve(path)) : [];
@@ -428,6 +487,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   const variant = options.variant ? createGraphVariant({ template: graph, ...options.variant }) : undefined;
   if (variant && !variant.ok) throw new Error(`graph variant rejected: ${JSON.stringify(variant.rejections)}`);
   if (variant?.ok) graph = variant.template;
+  const units = validateUnitCalls(graph, path, options.unitContext?.ancestors);
   const variantSource = variant?.ok ? stringifyYaml({ ...document,
     nodes: graph.nodes.map((node, index) => ({
       ...((document.nodes as Record<string, unknown>[])[index] ?? {}), node_id: node.nodeId, kind: node.kind,
@@ -506,6 +566,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   if (options.resumeRunId && state.growth?.length && graphMode === 'current' && state.sourceHash !== approvalSourceHash) {
     throw new Error('graph or recipes changed since grown run');
   }
+  if (options.unitContext) {
+    if (state.parentRunId !== undefined && state.parentRunId !== options.unitContext.parentRunId) throw new Error('unit parent run changed');
+    state.parentRunId = options.unitContext.parentRunId;
+  }
   if (state.growth?.length) graph = withGrowth(graph, state.growth);
   let waivedRecord: GraphRunState['nodes'][number] | undefined;
   if (options.fromNodeId) {
@@ -576,6 +640,22 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       // Restarting at or before a waived node drops its waiver record, so its accepted issue goes with it.
       state.input = { ...(state.input as Record<string, unknown>),
         acceptedRegressions: releaseResumeAcceptedRegressions(state, [], options.fromNodeId) };
+    }
+    if (options.releaseGateExecutor) {
+      if (graphId !== 'release-loop') throw new Error('gate executor override requires the release-loop graph');
+      const override = releaseResumeGateExecutor(state, { from: options.fromNodeId, executor: options.releaseGateExecutor.executor, host: options.releaseGateExecutor.host });
+      const next: Record<string, unknown> = { ...(state.input as Record<string, unknown>), ...override.set };
+      for (const key of override.unset ?? []) delete next[key];
+      state.input = next;
+      state.inputOverrides = [...(state.inputOverrides ?? []), override];
+      debug.log('graph.runs', 'input-override', { graphId, runId, ...override });
+    }
+    if (state.unitCalls) {
+      const calls = state.unitCalls;
+      state.unitCalls = calls.filter(call => {
+        const keep = state.path.slice(0, from).filter(nodeId => nodeId === call.node).length;
+        return calls.filter(item => item.node === call.node).indexOf(call) < keep;
+      });
     }
     state.path = state.path.slice(0, from);
     state.nodes = state.nodes.slice(0, from);
@@ -659,7 +739,11 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     if (state.status === 'done' || state.status === 'failed' || state.status === 'budget-exceeded') state.finishedAt ??= new Date().toISOString();
     persistOwnedRun(state, runnerOwner);
   };
-  const log = options.deps?.log ?? ((event: string, data: Record<string, unknown>) => debug.log('graph.runner', event, data));
+  const baseLog = options.deps?.log ?? ((event: string, data: Record<string, unknown>) => debug.log('graph.runner', event, data));
+  // RFC §U: every event of a unit (child) run carries its parentRunId.
+  const log = options.unitContext
+    ? (event: string, data: Record<string, unknown>) => baseLog(event, { ...data, parentRunId: options.unitContext!.parentRunId })
+    : baseLog;
   const visits = new Map<string, number>();
   for (const nodeId of state.path) visits.set(nodeId, (visits.get(nodeId) ?? 0) + 1);
   let current: string | undefined = options.fromNodeId ?? state.pending?.nodeId ?? state.path.at(-1) ?? graph.entryNode;
@@ -685,7 +769,9 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const completed = state.nodes.at(-1);
     const resumingCompleted = options.resumeRunId !== undefined && !options.fromNodeId && completed?.nodeId === current &&
       state.path.at(-1) === current && !resumingPending;
-    if (!resumingPending && !resumingCompleted && (visits.get(current) ?? 0) >= node.maxVisits) {
+    const usedSteps = state.path.length + (state.unitCalls ?? []).reduce((sum, call) => sum + call.steps, 0);
+    if (!resumingPending && !resumingCompleted && ((visits.get(current) ?? 0) >= node.maxVisits ||
+        (options.unitContext && usedSteps >= options.unitContext.remainingSteps))) {
       state.status = 'budget-exceeded';
       log('budget-exceeded', { graphId, runId, nodeId: current });
       persist();
@@ -795,6 +881,81 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       error = result.error ? redactCredentials(result.error) : undefined;
       state.executed++;
     }
+    let unitExecuted = false;
+    if (units.has(current) && !waiving && state.dryRun && !resumingCompleted) {
+      // Dry run plans the walk only: no child run, no unit event, no unitCalls entry; the first declared exit stands in.
+      output = JSON.stringify({ outcome: units.get(current)!.template.unit!.exits[0], dryRun: true });
+    } else if (units.has(current) && !waiving && !resumingCompleted) {
+      const unit = units.get(current)!;
+      const contract = node.contract!;
+      const previous: Record<string, unknown> = Object.create(null);
+      for (const record of state.nodes) previous[record.nodeId] = lastJsonObject(record.output) ?? record.output;
+      const supplied = state.input && typeof state.input === 'object' && !Array.isArray(state.input)
+        ? state.input as Record<string, unknown> : {};
+      const inputs: Record<string, unknown> = Object.create(null);
+      for (const key of contract.inputs) {
+        const value = Object.hasOwn(supplied, key) ? supplied[key] : previous[key];
+        if (value !== undefined) inputs[key] = value;
+      }
+      const alreadySpent = state.path.length + (state.unitCalls ?? []).reduce((sum, call) => sum + call.steps, 0);
+      const remaining = options.unitContext ? options.unitContext.remainingSteps - alreadySpent : Infinity;
+      const childRunId = randomUUID();
+      const info = { graphId, runId, nodeId: current, unit: unit.template.graphId, childRunId, parentRunId: runId };
+      let entered = false;
+      try {
+        for (const key of contract.inputs) if (!Object.hasOwn(inputs, key)) throw new Error(`unit input missing: ${current}.${key}`);
+        if (createHash('sha256').update(readFileSync(unit.path, 'utf8')).digest('hex') !== unit.hash)
+          throw new Error(`unit source changed before call: ${current}`);
+        debug.log('graph.unit', 'enter', info);
+        log('graph.unit', { ...info, phase: 'enter' });
+        entered = true;
+        const child = await runGraph(unit.path, { runId: childRunId, input: inputs, dryRun: false,
+          pinChildUniverse: options.pinChildUniverse,
+          unitContext: { parentRunId: runId, ancestors: [...(options.unitContext?.ancestors ?? []), graphId],
+            remainingSteps: Math.min(node.budget!.innerSteps, remaining) }, deps: options.deps });
+        const steps = child.path.length + (child.unitCalls ?? []).reduce((sum, call) => sum + call.steps, 0);
+        const childExit = child.status === 'done' || child.status === 'failed' ? child.path.at(-1) : undefined;
+        // The last successful record carrying every contracted output is the source;
+        // intervening nodes (including terminal gates) need not reproduce those fields.
+        const values = child.nodes.reduce<Record<string, unknown> | undefined>((found, record) => {
+          if (!record.ok || !record.executed) return found;
+          const value = lastJsonObject(record.output) ??
+            (record.output && typeof record.output === 'object' && !Array.isArray(record.output)
+              ? record.output as Record<string, unknown> : undefined);
+          return value && contract.outputs.every(key => Object.hasOwn(value, key)) ? value : found;
+        }, undefined) ?? {};
+        state.unitCalls ??= [];
+        state.unitCalls.push({ node: current, unit: unit.template.graphId, version: unit.template.version,
+          hash: unit.hash, childRunId, exit: childExit ?? child.status, steps });
+        if (child.status === 'awaiting-approval') throw new Error(`unit cannot pause for approval: ${current}`);
+        if (child.status === 'budget-exceeded' || steps > node.budget!.innerSteps || steps > remaining) {
+          debug.log('graph.unit', 'budget-exhausted', { ...info, steps, innerSteps: node.budget!.innerSteps });
+          log('graph.unit', { ...info, phase: 'budget-exhausted', steps });
+          throw new Error(`unit inner_steps exceeded: ${current}`);
+        }
+        if (!childExit || !unit.template.unit!.exits.includes(childExit)) throw new Error(`unit exit missing: ${current}`);
+        if (child.status === 'done' && childExit === 'failed') throw new Error(`unit exit mismatch: ${current}`);
+        const result: Record<string, unknown> = { outcome: childExit };
+        for (const key of contract.outputs) {
+          if (!Object.hasOwn(values, key)) throw new Error(`unit output missing: ${current}.${key}`);
+          result[key] = values[key];
+        }
+        output = JSON.stringify(result);
+        ok = child.status === 'done';
+        debug.log('graph.unit', 'exit', { ...info, exit: childExit, steps });
+        log('graph.unit', { ...info, phase: 'exit', exit: childExit, steps });
+      } catch (cause) {
+        ok = false;
+        error = cause instanceof Error ? cause.message : String(cause);
+        if (entered) {
+          debug.log('graph.unit', 'exit', { ...info, error });
+          log('graph.unit', { ...info, phase: 'exit', error });
+        }
+      }
+      // A rejected invocation has no child ledger and did not execute a unit.
+      unitExecuted = existsSync(graphRunPath(unit.template.graphId, childRunId, root));
+      if (unitExecuted) state.executed++;
+    }
     if (prompt && !waiving && !state.dryRun && !resumingCompleted) {
       const outputs: Record<string, { ok: boolean; output: unknown; durationMs: number }> = Object.create(null);
       for (const previous of state.nodes) outputs[previous.nodeId] = { ok: previous.ok, output: lastJsonObject(previous.output) ?? previous.output ?? null, durationMs: 0 };
@@ -833,7 +994,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       if (approval && !state.dryRun && !command) {
         output = JSON.stringify({ outcome: ok ? 'approved' : 'rejected', ...(state.pending?.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending?.decidedAt ?? null });
       }
-      state.nodes.push({ nodeId: current, ok, exit, executed: !waiving && ((!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun)), ...((waiving || ((command || prompt || approval) && (!state.dryRun || !!command?.dry_run_command))) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
+      state.nodes.push({ nodeId: current, ok, exit, executed: !waiving && ((!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun) || unitExecuted), ...((waiving || units.has(current) || ((command || prompt || approval) && (!state.dryRun || !!command?.dry_run_command))) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
         ...(waiving ? { waiver: { reason: options.releaseWaiver!.reason, at: nodeEndedAt, original: { exit: waivedRecord!.exit, ...(waivedRecord!.output === undefined ? {} : { output: waivedRecord!.output }), ...(waivedRecord!.error === undefined ? {} : { error: waivedRecord!.error }) } } } : {}),
         ...(approval && state.pending ? { ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt } : {}),
         startedAt: nodeStartedAt, endedAt: nodeEndedAt, seconds });
@@ -842,7 +1003,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       delete state.pending;
       delete state.approvalSourceHash;
     }
-    const reported = waiving || (prompt && !state.dryRun) || (command && (!state.dryRun || command.dry_run_command)) ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
+    const reported = waiving || units.has(current) || (prompt && !state.dryRun) || (command && (!state.dryRun || command.dry_run_command)) ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
     const namedOutcome = typeof reported === 'string' ? reported : undefined;
     console.error(`[graph] ${current} ${ok ? 'ok' : 'fail'} (${seconds.toFixed(2)}s)`);
     debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds, exit });

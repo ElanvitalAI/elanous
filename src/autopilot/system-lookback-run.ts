@@ -2,7 +2,7 @@
 //
 // system-lookback.ts 는 순수(의심 소스 매핑 + 프롬프트 빌더)였고, "실제 LLM 조사·소스 read 는
 // 배선측이 수행"이라 명시돼 있었다. 이 모듈이 그 배선이다: 모순 신호 → 의심 소스 파일 READ-ONLY
-// 발췌 → buildLookbackPrompt → Opus(claude-opus-4-8) 조사 → 결함 리포트. 수정 권한 없음(READ-ONLY).
+// 발췌 → buildLookbackPrompt → 역할 audit 이 고른 모델 조사 → 결함 리포트. 수정 권한 없음(READ-ONLY).
 //
 // escalate(mission-tool)가 시스템 결함 의심(systemSuspect) 페이즈에서 이 러너를 호출해 결함
 // 리포트를 얻고, 그 리포트를 수리 미션 골에 실어 스폰한다(system-repair-spawn). 진단 해상도 사다리
@@ -12,18 +12,24 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ContradictionSignal } from './contradiction-detector.js';
 import { buildLookbackPrompt, suspectSourceFiles } from './system-lookback.js';
+import { resolveRoleLlm } from '../user-config.js';
+import { debug } from '../debug/log.js';
 
-/** R3 조사 LLM 호출 seam — 기본은 Opus(claude-opus-4-8·READ-ONLY 진단). 테스트/재사용 위해 주입 가능.
- *  llmReviewCritique(mission-se-bridge) 와 같은 streamLLM 패턴(모델만 Opus·진단은 길게 maxTokens 2500). */
+/** R3 조사 LLM 호출 seam — 역할 audit 모델(READ-ONLY 진단). 테스트/재사용 위해 주입 가능. */
 async function opusLookback(prompt: string): Promise<string> {
-  const { streamLLM, resolveDefaultProvider, getProvider } = await import('../llm.js');
-  const model = process.env.ELANOUS_LOOKBACK_MODEL || 'claude-opus-4-8';
-  // ★ claude 모델은 prefix 매칭(getProvider)으로 anthropic 확정(dogfood 2026-07-13 발견) —
-  //   resolveDefaultProvider 는 user-config provider(codex 등)를 모델 무관하게 반환해 claude 를
-  //   codex 로 오라우팅한다(Codex 400: model not supported). 폴백 방어까지.
-  const provider = model.startsWith('claude-') ? getProvider(model) : resolveDefaultProvider(model);
+  const { streamLLM, resolveDefaultProvider, getProvider, PROVIDERS } = await import('../llm.js');
+  const override = process.env.ELANOUS_LOOKBACK_MODEL;
+  const resolved = override ? undefined : resolveRoleLlm('audit');
+  const model = override || resolved!.model;
+  // 명시 env 모델의 provider 선택은 종전과 동일하다.
+  const provider = override
+    ? (model.startsWith('claude-') ? getProvider(model) : resolveDefaultProvider(model))
+    : PROVIDERS[resolved!.provider];
+  const providerName = override ? provider?.name : resolved!.provider;
+  if (!provider) throw new Error(`Unknown audit provider: ${providerName}`);
+  debug.log('llm.role-pin', 'resolved', { site: 'system-lookback', role: 'audit', model, provider: providerName, source: override ? 'env' : resolved!.source });
   return streamLLM([{ role: 'user', content: prompt }], () => {}, {
-    model, maxTokens: 2500, ...(provider ? { provider } : {}),
+    model, provider, usageRole: 'audit', maxTokens: 2500,
   });
 }
 

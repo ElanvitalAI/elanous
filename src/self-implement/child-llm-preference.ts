@@ -11,9 +11,12 @@ import type {
 import { DEFAULT_BUDGET_GATE } from '../user-config.js';
 import { debug } from '../debug/log.js';
 
+/** 체인 한 칸. `codexCredits` = `llm.fallbackChain` 의 `codex-credits` 칸(codex 를 선불 크레딧으로 · 마지막 수단). */
+export type ChildLlmChainSlot = ChildLlmChainEntry & { readonly codexCredits?: true };
+
 export interface ResolvedChildLlmPreference {
   mode: ChildLlmPreferenceMode;
-  chain: ChildLlmChainEntry[];
+  chain: ChildLlmChainSlot[];
   budgetGate: {
     minHeadroomPercent: number;
     onShortfall: BudgetGateOnShortfall;
@@ -27,6 +30,8 @@ export type ChildLlmPreferenceInput = Pick<UserConfig, 'tools' | 'llm'> & Partia
 const FALLBACK_NAME_TO_PROVIDER: Readonly<Record<string, string>> = {
   'codex-rotate': 'openai-codex',
   grok: 'grok',
+  // CODEX-CREDITS-STEP — provider 는 같은 codex 지만 «크레딧 칸»이라 따로 센다(아래 중복 판정).
+  'codex-credits': 'openai-codex',
 };
 
 function warnPreference(detail: string): void {
@@ -39,15 +44,18 @@ function warnPreference(detail: string): void {
 }
 
 /** `llm.fallbackChain` 이름을 자식 프로바이더 칸으로 옮긴다. 모르는 이름은 경고하고 건너뛴다. */
-export function chainFromFallbackNames(names: readonly string[] | undefined): ChildLlmChainEntry[] {
-  const chain: ChildLlmChainEntry[] = [];
+export function chainFromFallbackNames(names: readonly string[] | undefined): ChildLlmChainSlot[] {
+  const chain: ChildLlmChainSlot[] = [];
   for (const name of names ?? []) {
     const provider = FALLBACK_NAME_TO_PROVIDER[name];
     if (!provider) {
       warnPreference(`llm.fallbackChain 의 모르는 이름 '${name}' 을 건너뜀`);
       continue;
     }
-    if (!chain.some((entry) => entry.provider === provider)) chain.push({ provider });
+    const codexCredits = name === 'codex-credits';
+    if (!chain.some((entry) => entry.provider === provider && (entry.codexCredits === true) === codexCredits)) {
+      chain.push(codexCredits ? { provider, codexCredits: true } : { provider });
+    }
   }
   return chain;
 }
@@ -60,7 +68,7 @@ export function resolveChildLlmPreference(config: ChildLlmPreferenceInput): Reso
   const mode: ChildLlmPreferenceMode = explicitMode ?? (provider ? 'pinned' : 'auto');
   const modeSource: ResolvedChildLlmPreference['source']['mode'] = explicitMode ? 'explicit' : 'inferred';
 
-  let chain: ChildLlmChainEntry[];
+  let chain: ChildLlmChainSlot[];
   let chainSource: ResolvedChildLlmPreference['source']['chain'];
   if (mode === 'pinned') {
     // 계정 회전은 여기 없다. provider 없는 model 은 pinned 가 아니다.

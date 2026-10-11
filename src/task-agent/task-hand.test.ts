@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { registerTasksCommands, spawnDetachedConfirmed, type DetachedSpawn } from '../cli/tasks-cli.js';
 import { debug } from '../debug/log.js';
-import { draftTaskOwner, handTask, launchArgs, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, TASK_CARD_LABEL, taskCardLabelContext, TaskAgentStateError, type TaskCard, type TaskLaunchContext } from './task-hand.js';
+import { closeTaskCard, draftTaskOwner, handTask, launchArgs, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, TASK_CARD_LABEL, taskCardLabelContext, TaskAgentStateError, type TaskCard, type TaskLaunchContext } from './task-hand.js';
 
 test('only a unique launched code-PR card owns the PR or its opening run', () => {
   const base: TaskCard = { id: 'ta-one', text: 'draft', createdAt: '2026-10-10T00:00:00Z',
@@ -37,6 +37,16 @@ async function cli(args: string[], deps: Parameters<typeof registerTasksCommands
     return { lines, code: process.exitCode };
   } finally { process.exitCode = previous ?? 0; }
 }
+
+test('closeTaskCard — failed 로 닫고 history 한 줄을 더한다 · 빈 사유는 던진다 · 이미 닫은 카드는 그대로(멱등)', () => {
+  const card: TaskCard = { id: 'ta-c', text: 't', createdAt: '2026-10-11T00:00:00.000Z', status: 'launched', history: [{ at: '2026-10-11T00:00:00.000Z', event: 'launch' }] };
+  const closed = closeTaskCard(card, { reason: ' 대체됨 ', by: 'OP', at: '2026-10-11T01:00:00.000Z' });
+  expect(closed.status).toBe('failed');
+  expect(closed.history).toEqual([card.history[0]!, { at: '2026-10-11T01:00:00.000Z', event: 'closed-by-hand', kind: 'closed-by-hand', detail: '대체됨', reason: '대체됨', by: 'OP' }]);
+  expect(card.status).toBe('launched');
+  expect(() => closeTaskCard(card, { reason: '  ', by: 'OP', at: 'x' })).toThrow();
+  expect(closeTaskCard(closed, { reason: '또', by: 'TC', at: '2026-10-11T02:00:00.000Z' })).toBe(closed);
+});
 
 test('resolveHandText classifies paths with injected IO, trims only for metadata and rejects invalid files', () => {
   const cwd = '/some/working/directory';
@@ -104,7 +114,7 @@ test('live handTask 는 카드 라벨 맥락을 기존 launcher 호출에 싣고
   expect(calls[0]!.cwd).toBe(target);
   expect(calls[0]!.context).toMatchObject({
     cardLabelContext: { cardId: result.card.id, labels: { [TASK_CARD_LABEL]: result.card.id } },
-    env: { ELANOUS_RUN_ID: calls[0]!.context!.runId },
+    env: { ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: result.card.id },
   });
   expect(calls[0]!.context!.launchId).toStartWith('tl-');
   expect(result).toMatchObject({ mode: 'live', launched: true, cwd: target, move: { kind: 'launch', command: calls[0]!.args }, card: { status: 'launched', runId: calls[0]!.context!.runId, launchId: calls[0]!.context!.launchId } });
@@ -329,8 +339,8 @@ test('TA-LIVE-LAND-2: task hand --ta-land --live writes card taLand and launches
   expect(code).toBe(0);
   expect(calls).toHaveLength(1);
   expect(calls[0]!.args).toEqual(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'ship it']);
-  expect(calls[0]!.context!.env).toEqual({ ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TA_LAND: '1' });
-  const cards = Object.values(readTaskAgentState<{ tasks: Record<string, { taLand?: boolean; runId?: string }> }>(path).tasks);
+  const cards = Object.values(readTaskAgentState<{ tasks: Record<string, { id: string; taLand?: boolean; runId?: string }> }>(path).tasks);
+  expect(calls[0]!.context!.env).toEqual({ ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: cards[0]!.id, ELANOUS_TA_LAND: '1' });
   expect(cards).toHaveLength(1);
   expect(cards[0]).toMatchObject({ taLand: true, runId: calls[0]!.context!.runId });
   expect(lines.join('\n')).toContain('ELANOUS_TA_LAND=1');
@@ -344,8 +354,8 @@ test('TA-LIVE-LAND-2: without --ta-land the card has no taLand and the launch en
     taskLauncher: (_args, _cwd, context) => { calls.push({ context }); return { runId: context!.runId }; },
   });
   expect(code).toBe(0);
-  expect(calls[0]!.context!.env).toEqual({ ELANOUS_RUN_ID: calls[0]!.context!.runId });
-  const cards = Object.values(readTaskAgentState<{ tasks: Record<string, { taLand?: boolean }> }>(path).tasks);
+  const cards = Object.values(readTaskAgentState<{ tasks: Record<string, { id: string; taLand?: boolean }> }>(path).tasks);
+  expect(calls[0]!.context!.env).toEqual({ ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: cards[0]!.id });
   expect(Object.hasOwn(cards[0]!, 'taLand')).toBe(false);
 });
 

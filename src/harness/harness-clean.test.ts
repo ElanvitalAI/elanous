@@ -709,6 +709,7 @@ function syntheticCleanResult(over: Partial<HarnessCleanPlan> = {}) {
       preserve: [] as HarnessCleanPlan['preserve'],
       orphanedWorktrees: [] as string[],
       orphanedWorktreeSafety: [] as HarnessCleanPlan['orphanedWorktreeSafety'],
+      orphanScan: 'not-requested' as const,
       unavailable: false,
       ...over,
     },

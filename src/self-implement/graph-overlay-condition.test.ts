@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { evaluateOverlayCondition, parseOverlayCondition } from './graph-overlay-condition.js';
+import { buildRuntimeOverlayState, evaluateOverlayCondition, parseOverlayCondition } from './graph-overlay-condition.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -73,6 +73,31 @@ describe('RFC §5 4단계 — applies_when 을 «코드»가 판정한다', () =
       expect(evaluateOverlayCondition(condition, { [key]: value })).toEqual({ kind: 'key-absent', key });
     }
     expect(evaluateOverlayCondition('main_sync_conflict == true', { main_sync_conflict: 'true' })).toEqual({ kind: 'key-absent', key: 'main_sync_conflict' });
+  });
+
+  test('buildRuntimeOverlayState carries attempts always and every other key only when known', () => {
+    expect(buildRuntimeOverlayState({ attempts: 0 })).toEqual({ attempts: 0 });
+    const full = buildRuntimeOverlayState({
+      attempts: 2, goalId: 'g1', stopClass: 'review-repeat', reviewRepeat: 0,
+      siblingOverlap: false, mainSyncConflict: true, authorGrade: 'full',
+    });
+    expect(full).toEqual({
+      attempts: 2, goal_id: 'g1', stop_class: 'review-repeat', review_repeat: 0,
+      sibling_overlap: false, main_sync_conflict: true, author_grade: 'full',
+    });
+    expect(Object.keys(buildRuntimeOverlayState({ attempts: 1, stopClass: 'main-sync' }))).toEqual(['attempts', 'stop_class']);
+    expect(Object.keys(buildRuntimeOverlayState({ attempts: 1, reviewRepeat: 3 }))).toEqual(['attempts', 'review_repeat']);
+  });
+
+  test('buildRuntimeOverlayState leaves non-boolean sibling_overlap / main_sync_conflict and unusable author_grade key-absent', () => {
+    const state = buildRuntimeOverlayState({
+      attempts: 1, siblingOverlap: 'true', mainSyncConflict: 1, authorGrade: '', reviewRepeat: Number.NaN,
+    });
+    expect(state).toEqual({ attempts: 1 });
+    for (const key of ['sibling_overlap', 'main_sync_conflict', 'author_grade', 'review_repeat']) expect(Object.hasOwn(state, key)).toBe(false);
+    expect(evaluateOverlayCondition('sibling_overlap == true', state)).toEqual({ kind: 'key-absent', key: 'sibling_overlap' });
+    expect(Object.hasOwn(buildRuntimeOverlayState({ attempts: 1, siblingOverlap: null, authorGrade: 7 }), 'sibling_overlap')).toBe(false);
+    expect(evaluateOverlayCondition('sibling_overlap == true', buildRuntimeOverlayState({ attempts: 1, siblingOverlap: true }))).toEqual({ kind: 'applies' });
   });
 
   test('조건이 «없는» 오버레이는 항상 후보다', () => {

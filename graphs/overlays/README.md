@@ -18,7 +18,7 @@
 ```yaml
 overlay_id: patient-research
 target: default-loop
-stage: launch            # launch | runtime
+stage: launch            # launch | runtime | heal(멈춤 갈래 사다리 전용 · stop-autoheal 만 읽는다)
 patch:
   - op: replace
     path: /nodes/2/max_visits

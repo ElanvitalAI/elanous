@@ -3,16 +3,72 @@
 //   · openrouter without toolChoice → body unchanged (no tool_choice key)
 //   · codex · claude(anthropic) · grok (and the openai compat path) → body unchanged by this fix
 // Fake fetch via spyOn (never mock.module).
-import { expect, spyOn, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from './debug/log.js';
 import { getProviderForConfig, openRouterToolChoice, toChatToolChoice, toResponsesToolChoice, type LLMToolSpec, type ToolChoice } from './llm.js';
+import { saveTokens } from './oauth/store.js';
 import type { UserConfig } from './user-config.js';
 
 const tools: LLMToolSpec[] = [{ name: 'demo', description: 'demo', parameters: { type: 'object', properties: { a: { type: 'string' } } } }];
 const messages = [{ role: 'user' as const, content: 'hello' }];
+
+// ── TOOLCHOICE-SEAMS-INTERFERENCE (2026-10-11) — 공유 상태 격리 ───────────────────────────
+//
+// 이 파일이 재는 것은 «요청 본문»이고, 그 본문은 프로세스 밖 상태 **두 곳**에 닿아 있다:
+//   ① `ELANOUS_RUN_ID` — OpenRouter sticky routing(`openRouterStickySessionKey`)이 본문에
+//      `session_id` 를 싣는다 ⇒ 키 순서 기대(`['model','messages','tools','usage','provider','stream']`)가
+//      깨진다. `test/preload-isolation.ts` 가 프로세스 시작 때 한 번 지우지만, **묶음에서 앞서 돈
+//      파일이 다시 심으면** 되살아난다.
+//      📏 실측: 이 키를 «쓰는» 테스트 파일 26개(`grep -rl "process.env.ELANOUS_RUN_ID = " --include=*.test.ts src test scripts | wc -l`),
+//        그리고 이 키를 심은 preload 와 함께 이 파일을 돌리면 `+ "session_id"` diff 로 1건이 진다.
+//   ② codex 자격 — 호스트 `auth.json`(elanous 스토어 ⊕ `$CODEX_HOME` 미러)이 «있으면» Responses
+//      경로(`tool_choice` 있음), «없으면» API-key 경로(`tool_choice` 없음)로 갈린다
+//      (`src/llm.ts` makeCodexProvider · `loadFreshCodexAuthState`). 게이트 Pod 마다 값이 다르다.
+// ⇒ 둘 다 **이 파일 안에서** 못 박는다(제품 코드 무접촉).
+let envSnapshot: Record<string, string | undefined> = {};
+
+beforeEach(() => {
+  envSnapshot = { ...process.env };
+  delete process.env.ELANOUS_RUN_ID;
+  delete process.env.ELANOUS_SESSION_ID;
+});
+
+afterEach(() => {
+  for (const key of Object.keys(process.env)) if (!(key in envSnapshot)) delete process.env[key];
+  for (const [key, value] of Object.entries(envSnapshot)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+
+/** ② codex 자격을 «호스트 상태와 무관하게» Responses 경로로 고정한다 — 임의 토큰을 격리 스토어에 심는다.
+ *  `XDG_CONFIG_HOME` 이 `authStorePath()` 를 옮기고, 빈 `CODEX_HOME` 이 호스트 `~/.codex/auth.json`
+ *  미러가 그 토큰을 덮지 못하게 막는다. 만료는 1시간 뒤(`CODEX_REFRESH_BUFFER_MS` 120초 밖)라
+ *  갱신=네트워크 호출이 일어나지 않는다. env 복원은 위 afterEach 가 한다. */
+async function withCodexResponsesCredential(run: () => Promise<void>): Promise<void> {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-or-toolchoice-codex-'));
+  try {
+    const xdg = join(root, 'xdg');
+    mkdirSync(join(xdg, 'elanous'), { recursive: true });
+    mkdirSync(join(root, 'codex-home'), { recursive: true });
+    process.env.XDG_CONFIG_HOME = xdg;
+    process.env.CODEX_HOME = join(root, 'codex-home');
+    process.env.ELANOUS_SUPPRESS_XDG_WARNING = '1';
+    delete process.env.ELANOUS_CODEX_ACCOUNT;   // 기본 계정(storeKey 'openai-codex') 고정
+    saveTokens('openai-codex', {
+      accessToken: 'test-access-token',
+      refreshToken: 'test-refresh-token',
+      expiresAt: Date.now() + 3_600_000,
+      tokenType: 'Bearer',
+    }, { authMode: 'chatgpt', mirrorCodex: false }, join(xdg, 'elanous', 'auth.json'));
+    await run();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
 
 async function captureBody(llm: Record<string, unknown>, opts: { toolChoice?: ToolChoice; tools?: LLMToolSpec[] | null }) {
   const bodies: string[] = [];
@@ -122,34 +178,15 @@ test('invariant: grok and the openai compat path still drop toolChoice (byte-ide
   }
 });
 
-test('invariant: codex body keeps its Responses-API tool_choice (toResponsesToolChoice) and is otherwise unchanged', async () => {
-  // The Responses-API body (where toResponsesToolChoice applies) is the OAuth path; with only an
-  // apiKey codex falls back to /chat/completions. Give the test its own OAuth mirror in an isolated
-  // HOME/CODEX_HOME instead of depending on whatever ~/.codex/auth.json the host happens to have.
-  const saved = { HOME: process.env.HOME, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME, CODEX_HOME: process.env.CODEX_HOME };
-  const root = mkdtempSync(join(tmpdir(), 'or-toolchoice-codex-'));
-  process.env.HOME = root;
-  process.env.XDG_CONFIG_HOME = root;
-  process.env.CODEX_HOME = join(root, 'codex-home');
-  mkdirSync(process.env.CODEX_HOME, { recursive: true });
-  const jwt = `header.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.signature`;
-  writeFileSync(join(process.env.CODEX_HOME, 'auth.json'), JSON.stringify({ tokens: { access_token: jwt, refresh_token: 'mirror-refresh' } }));
-  try {
-    const llm = { provider: 'openai-codex', model: 'gpt-5.6', apiKey: 'sk-test' };
-    const without = JSON.parse(await captureBody(llm, {}));
-    expect('tool_choice' in without).toBe(false);
-    expect('input' in without).toBe(true); // Responses-API shape, not /chat/completions
-    for (const tc of ['required', { name: 'demo' }] as ToolChoice[]) {
-      const body = JSON.parse(await captureBody(llm, { toolChoice: tc }));
-      expect(body.tool_choice).toBe(toResponsesToolChoice(tc) as string);
-      delete body.tool_choice;
-      expect(body).toEqual(without);
-    }
-  } finally {
-    for (const [k, v] of Object.entries(saved)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
-    rmSync(root, { recursive: true, force: true });
+test('invariant: codex body keeps its Responses-API tool_choice (toResponsesToolChoice) and is otherwise unchanged', () => withCodexResponsesCredential(async () => {
+  const llm = { provider: 'openai-codex', model: 'gpt-5.6', apiKey: 'sk-test' };
+  const without = JSON.parse(await captureBody(llm, {}));
+  expect('tool_choice' in without).toBe(false);
+  expect('input' in without).toBe(true); // Responses-API shape, not /chat/completions
+  for (const tc of ['required', { name: 'demo' }] as ToolChoice[]) {
+    const body = JSON.parse(await captureBody(llm, { toolChoice: tc }));
+    expect(body.tool_choice).toBe(toResponsesToolChoice(tc) as string);
+    delete body.tool_choice;
+    expect(body).toEqual(without);
   }
-});
+}));

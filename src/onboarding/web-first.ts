@@ -15,6 +15,8 @@ export interface WebFirstSetupDeps {
   /** Whether a person is at a terminal (stdin TTY). Without one the web path only uses a daemon that is already up. */
   isTty?: boolean;
   terminal?: boolean;
+  /** Bare first run never starts or waits for a missing daemon; explicit setup retains web launch. */
+  startIfMissing?: boolean;
   startedAt?: number;
   showNexus?: () => Promise<NexusShowResult>;
   startDaemon?: () => Promise<BgLaunchResult>;
@@ -67,9 +69,13 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
   let shown: NexusShowResult | undefined;
   try { shown = await show(); } catch { /* A missing daemon may make inspection fail. */ }
   const running = shown?.status === 'unregistered' || (shown?.status === 'registered' && shown.instance?.alive === true);
+  if (deps.startIfMissing === false && !running) {
+    print('오프라인 모드');
+    observe('fallback', 'offline');
+    return 'fallback';
+  }
   // A script, pipe or CI run never starts a daemon on its own: without a terminal the web path
-  // only uses a daemon that already answers health once. (install.sh runs first setup with
-  // stdin on /dev/tty, so the install → web path still starts one.)
+  // only uses a daemon that already answers health once.
   if ((deps.isTty ?? (process.stdin.isTTY === true)) !== true) {
     const rest = running ? shown?.urls?.rest.loopback : undefined;
     const up = rest && shown?.urls?.pwa.loopback
@@ -78,6 +84,12 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
   }
   const deadline = Date.now() + STARTUP_TIMEOUT_MS;
   if (!running || !shown?.urls?.pwa.loopback) {
+    if (deps.startIfMissing === false) {
+      print('오프라인 모드');
+      observe('fallback', 'offline');
+      return 'fallback';
+    }
+    print('웹 셋업을 위해 데몬을 시작합니다.');
     let launch: BgLaunchResult;
     try {
       launch = await (deps.startDaemon ?? (() => runBgLaunch({ out: { log: () => {}, error: () => {} } })))();
@@ -98,8 +110,14 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
         }
       }
     } catch { /* A daemon may not have published its URLs yet. */ }
+    if (deps.startIfMissing === false) break;
     const remaining = deadline - Date.now();
     if (remaining > 0) await Bun.sleep(Math.min(200, remaining));
+  }
+  if (!healthy && deps.startIfMissing === false) {
+    print('오프라인 모드');
+    observe('fallback', 'offline');
+    return 'fallback';
   }
   if (!healthy) return fallback(running ? 'daemon-health-unavailable' : 'daemon-health-timeout');
 

@@ -275,6 +275,142 @@ sandboxTest('a test file the PR deleted is skipped, and only-deleted tests count
   expect(JSON.parse(readFileSync(f.ledger, 'utf8'))).toMatchObject({ verdict: 'saved', testFiles: ['value.test.ts', 'deleted.test.ts'] });
 }, 30_000);
 
+test('resync live pushes a saved merge without force and removes needs-rebase', async () => {
+  const f = fixture();
+  const pushCalls: string[][] = [];
+  const editCalls: string[][] = [];
+  const summary = await runResyncShadow(3, {
+    repoRoot: f.work, instanceRoot: f.state,
+    runGh: args => {
+      if (args[0] === 'pr' && args[1] === 'list') {
+        return JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', mergeable: 'CONFLICTING',
+          isDraft: true, labels: [{ name: 'elanous:needs-rebase' }] }]);
+      }
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ files: [{ path: 'value.test.ts' }] });
+      if (args[0] === 'pr' && args[1] === 'edit') { editCalls.push(args); return ''; }
+      throw new Error(`unexpected gh: ${args.join(' ')}`);
+    },
+    runGit: args => { pushCalls.push(args); },
+    resolve: async () => "export const value = 'combined';\n",
+    runTests: () => ({ ok: true }),
+  }, 'live');
+  expect(summary).toEqual({ candidates: 1, tried: 1, saved: 1, savedRatio: 1 });
+  expect(pushCalls).toEqual([['push', 'origin', 'HEAD:refs/heads/self-impl/conflicted']]);
+  expect(pushCalls.flat().some(arg => arg === '--force' || arg === '-f')).toBe(false);
+  expect(editCalls).toEqual([['pr', 'edit', '12', '--remove-label', 'elanous:needs-rebase']]);
+  expect(JSON.parse(readFileSync(f.ledger, 'utf8'))).toMatchObject({ mode: 'live', verdict: 'saved', pushed: true, labelRemoved: true });
+  expect(f.worktrees()).toBe(`worktree ${f.work}\nHEAD ${git(f.work, 'rev-parse', 'HEAD')}\nbranch refs/heads/main`);
+}, 60_000);
+
+for (const scenario of [
+  { name: 'merge-ok-tests-failed', resolve: async () => "export const value = 'combined';\n", runTests: () => ({ ok: false, failedTests: ['failed'] }), expected: 'merge-ok-tests-failed' },
+  { name: 'unresolved', resolve: async (_file: string, conflict: string) => conflict, runTests: () => ({ ok: true }), expected: 'unresolved' },
+  { name: 'guard-tripped', resolve: async () => '[LLM PROVIDER BLOCKED] unavailable\n', runTests: () => ({ ok: true }), expected: 'guard-tripped' },
+  { name: 'error', resolve: async () => "export const value = 'combined';\n", runTests: () => { throw new Error('test sandbox unavailable'); }, expected: 'error' },
+] as const) {
+  test(`resync live ${scenario.name} never pushes or removes labels`, async () => {
+    const f = fixture();
+    const pushCalls: string[][] = [];
+    const editCalls: string[][] = [];
+    await runResyncShadow(3, {
+      repoRoot: f.work, instanceRoot: f.state,
+      runGh: args => {
+        if (args[0] === 'pr' && args[1] === 'list') {
+          return JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', mergeable: 'CONFLICTING',
+            isDraft: true, labels: [{ name: 'elanous:needs-rebase' }] }]);
+        }
+        if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ files: [{ path: 'value.test.ts' }] });
+        if (args[0] === 'pr' && args[1] === 'edit') { editCalls.push(args); return ''; }
+        throw new Error(`unexpected gh: ${args.join(' ')}`);
+      },
+      runGit: args => { pushCalls.push(args); },
+      resolve: scenario.resolve,
+      runTests: scenario.runTests,
+    }, 'live');
+    expect(pushCalls).toEqual([]);
+    expect(editCalls).toEqual([]);
+    expect(JSON.parse(readFileSync(f.ledger, 'utf8'))).toMatchObject({
+      mode: 'live', verdict: scenario.expected, pushed: false, labelRemoved: false,
+    });
+  }, 30_000);
+}
+
+test('resync live — a pushed merge whose label removal fails stays saved; a non-reject push failure is error', async () => {
+  for (const scenario of [
+    { name: 'label', git: () => {}, edit: () => { throw new Error('gh: label edit failed'); }, verdict: 'saved', pushed: true, labelRemoved: false },
+    { name: 'auth', git: () => { throw new Error('fatal: Authentication failed'); }, edit: () => '', verdict: 'error', pushed: false, labelRemoved: false },
+  ] as const) {
+    const f = fixture();
+    await runResyncShadow(3, {
+      repoRoot: f.work, instanceRoot: f.state,
+      runGh: args => {
+        if (args[0] === 'pr' && args[1] === 'list') {
+          return JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', mergeable: 'CONFLICTING',
+            isDraft: true, labels: [{ name: 'elanous:needs-rebase' }] }]);
+        }
+        if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ files: [{ path: 'value.test.ts' }] });
+        if (args[0] === 'pr' && args[1] === 'edit') return scenario.edit();
+        throw new Error(`unexpected gh: ${args.join(' ')}`);
+      },
+      runGit: () => { scenario.git(); },
+      resolve: async () => "export const value = 'combined';\n",
+      runTests: () => ({ ok: true }),
+    }, 'live');
+    expect(JSON.parse(readFileSync(f.ledger, 'utf8'))).toMatchObject({
+      mode: 'live', verdict: scenario.verdict, pushed: scenario.pushed, labelRemoved: scenario.labelRemoved,
+    });
+  }
+});
+
+test('resync live excludes CONFLICTING PRs without needs-rebase', async () => {
+  const f = fixture();
+  const pushCalls: string[][] = [];
+  const summary = await runResyncShadow(3, {
+    repoRoot: f.work, instanceRoot: f.state,
+    runGh: args => args[0] === 'pr' && args[1] === 'list'
+      ? JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', mergeable: 'CONFLICTING', isDraft: true, labels: [] }])
+      : f.runGh(args),
+    runGit: args => { pushCalls.push(args); },
+  }, 'live');
+  expect(summary).toEqual({ candidates: 0, tried: 0, saved: 0, savedRatio: null });
+  expect(pushCalls).toEqual([]);
+  expect(() => readFileSync(f.ledger, 'utf8')).toThrow();
+});
+
+test('resync live records a rejected push and continues with the next candidate', async () => {
+  const f = fixture();
+  const pushCalls: string[][] = [];
+  const editCalls: string[][] = [];
+  const runGh = (args: string[]) => {
+    if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([12, 13].map(number => ({
+      number, headRefName: 'self-impl/conflicted', mergeable: 'CONFLICTING', isDraft: true,
+      labels: [{ name: 'elanous:needs-rebase' }],
+    })));
+    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ files: [{ path: 'value.test.ts' }] });
+    if (args[0] === 'pr' && args[1] === 'edit') { editCalls.push(args); return ''; }
+    throw new Error(`unexpected gh: ${args.join(' ')}`);
+  };
+  const summary = await runResyncShadow(3, {
+    repoRoot: f.work, instanceRoot: f.state, runGh,
+    runGit: args => {
+      pushCalls.push(args);
+      if (pushCalls.length === 1) throw new Error('non-fast-forward');
+    },
+    resolve: async () => "export const value = 'combined';\n",
+    runTests: () => ({ ok: true }),
+  }, 'live');
+  expect(summary).toEqual({ candidates: 2, tried: 2, saved: 1, savedRatio: 0.5 });
+  expect(pushCalls).toEqual([
+    ['push', 'origin', 'HEAD:refs/heads/self-impl/conflicted'],
+    ['push', 'origin', 'HEAD:refs/heads/self-impl/conflicted'],
+  ]);
+  expect(editCalls).toEqual([['pr', 'edit', '13', '--remove-label', 'elanous:needs-rebase']]);
+  expect(readFileSync(f.ledger, 'utf8').trim().split('\n').map(line => JSON.parse(line))).toMatchObject([
+    { pr: 12, verdict: 'push-rejected', pushed: false, labelRemoved: false, failedTests: ['non-fast-forward'] },
+    { pr: 13, verdict: 'saved', pushed: true, labelRemoved: true },
+  ]);
+});
+
 test('junitCounts reads the runner report and returns null without one', () => {
   expect(junitCounts('<testsuites name="bun test" tests="2" assertions="2" failures="1" skipped="0"><testsuite><testcase name="a" /><testcase name="b"><failure message="x"/></testcase></testsuite></testsuites>'))
     .toEqual({ tests: 2, failures: 1, failed: ['b'] });

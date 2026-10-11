@@ -7,12 +7,15 @@ import type { SupervisorJobResult, SupervisorStopReason } from '../self-dev/run-
 import { getUserConfig, reloadUserConfig, userConfigPath } from '../user-config.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import type { LandWorktree, LandWorktreeFailure, LandWorktreeInput } from './land-worktree.js';
-import { defaultPrHead, defaultRequestReview, defaultReviewRepoCandidates, executeLiveLand, executeLiveReview, liveLandArgs, liveReviewArgs, type PrHeadView, type ReviewRepoCandidate, resolveTaskAgentLiveMoves, TASK_AGENT_LIVE_MOVES_ENV, type TaskAgentLiveMove } from './live-moves.js';
+import { decisionRaiseArgs, executeNextAction } from './actions.js';
+import { defaultPrHead, defaultRequestReview, defaultReviewRepoCandidates, executeLiveDecisionCard, executeLiveLand, executeLiveReview, type LiveDecisionCardContext, liveLandArgs, liveReviewArgs, type PrHeadView, type ReviewRepoCandidate, resolveTaskAgentLiveMoves, TASK_AGENT_LIVE_MOVES_ENV, type TaskAgentLiveMove } from './live-moves.js';
 import { recordTaskAgentShadowMove } from './shadow.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
 
 const HEAD_A = 'a'.repeat(40);
 const HEAD_B = 'b'.repeat(40);
+const HEAD_C = 'c'.repeat(40);
+const worktreeCreateFailures = (card: TaskCard) => card.landWorktreeCreateFailures;
 const job = (over: Partial<SupervisorJobResult> = {}): SupervisorJobResult =>
   ({ taskId: 'ta-live-1', feature: 'feature ask', status: 'done', ...over }) as SupervisorJobResult;
 
@@ -212,10 +215,16 @@ describe('TA-JUDGE-LIVE-SAFE — 안전한 수만 실제로', () => {
 describe('taskAgent.liveMoves 해석 — config > env > 없음 · 모르는 항목은 경고하고 버린다', () => {
   test('모르는 항목 → 경고 · 허용으로 읽지 않는다', () => {
     const warned: Array<Record<string, unknown>> = [];
-    const out = resolveTaskAgentLiveMoves(['review', 'relaunch', 'decision-card', 3], {}, (_c, event, data) => { warned.push({ event, ...data }); });
+    const out = resolveTaskAgentLiveMoves(['review', 'relaunch', 'retry-forever', 3], {}, (_c, event, data) => { warned.push({ event, ...data }); });
     expect([...out.moves]).toEqual(['review']);
-    expect(out.ignored).toEqual(['relaunch', 'decision-card', '3']);
-    expect(warned).toEqual([expect.objectContaining({ event: 'live-moves-ignored', ignored: ['relaunch', 'decision-card', '3'], source: 'config' })]);
+    expect(out.ignored).toEqual(['relaunch', 'retry-forever', '3']);
+    expect(warned).toEqual([expect.objectContaining({ event: 'live-moves-ignored', ignored: ['relaunch', 'retry-forever', '3'], source: 'config' })]);
+  });
+
+  test("'decision-card' 는 허용 항목이다 — 설정에서 명시하면 읽힌다", () => {
+    const out = resolveTaskAgentLiveMoves(['decision-card'], {}, () => {});
+    expect([...out.moves]).toEqual(['decision-card']);
+    expect(out.ignored).toEqual([]);
   });
 
   test('config 가 env 를 이긴다 · config 없으면 env · 둘 다 없으면 빈 집합', () => {
@@ -541,6 +550,103 @@ describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => 
     expect(await executeLiveLand(t.card(), 51, { ...t.ctx, cycleId: 'wt-fail-cycle' }, retry.live)).toMatchObject({ executed: true, ok: true });
   });
 
+  test('recordTaskAgentShadowMove reaches executeLiveLand: three create failures cap the next tick and log once', async () => {
+    const t = landFixture();
+    const configDir = mkdtempSync(join(tmpdir(), 'ta-land-create-cap-default-'));
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({}));
+    setElanousConfigDir(configDir);
+    try {
+      const createCalls: LandWorktreeInput[] = [];
+      const live = {
+        ...t.live,
+        landWorktree: {
+          localHead: () => HEAD_B,
+          create: async (input: LandWorktreeInput): Promise<LandWorktree | LandWorktreeFailure> => {
+            createCalls.push(input);
+            return { reason: `create failed ${createCalls.length}`, created: false, removed: null };
+          },
+        },
+      };
+      const throughDispatcher = (runId: string) => recordTaskAgentShadowMove({
+        runId, stopReason: 'needs-human', results: [job({ prNumber: 51, harvestable: true, worktreePath: '/tmp/land-wt' })], selfReview: reviewed,
+      }, { ...t.f.deps(['propose-land']), live });
+      let third: Awaited<ReturnType<typeof throughDispatcher>> | undefined;
+      for (let tick = 1; tick <= 3; tick++) third = await throughDispatcher(`create-cap-${tick}`);
+      expect(createCalls).toHaveLength(3);
+      expect(t.calls).toHaveLength(0);
+      expect(third?.liveMove?.detail).toBe('land worktree create capped (3/3): create failed 3');
+      expect(worktreeCreateFailures(t.card())).toHaveLength(3);
+
+      const fourth = await throughDispatcher('create-cap-4');
+      expect(fourth.liveMove?.detail).toBe('land worktree create capped (3/3): create failed 3');
+      expect(createCalls).toHaveLength(3);
+      expect(t.calls).toHaveLength(0);
+      expect(t.f.logs.filter(entry => entry.event === 'land-worktree-create-capped')).toEqual([
+        expect.objectContaining({ data: { card: 'ta-live-1', pr: 51, head: HEAD_A, failures: 3, cap: 3, reason: 'create failed 3' } }),
+      ]);
+    } finally { resetElanousConfigDir(); }
+  });
+
+  test('successful worktree creation clears the same PR failure count', async () => {
+    const t = landFixture();
+    // 개발자 실제 설정(tasks.landWorktreeCreateCap)에 흔들리지 않게 빈 설정 디렉터리로 고정한다(기본 상한 3).
+    const configDir = mkdtempSync(join(tmpdir(), 'ta-land-create-cap-iso-'));
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({}));
+    setElanousConfigDir(configDir);
+    try {
+      let createCalls = 0;
+      const live = {
+        ...t.live,
+        landWorktree: {
+          localHead: () => HEAD_B,
+          create: async (): Promise<LandWorktree | LandWorktreeFailure> => {
+            createCalls++;
+            if (createCalls === 1) return { reason: 'first create failed', created: false, removed: null };
+            return { cwd: '/state/land-worktrees/success', cleanup: () => ({ removed: true }) };
+          },
+        },
+        land: async () => ({ status: 0, stdout: 'merged' }),
+      };
+      await executeLiveLand(t.card(), 51, { ...t.ctx, cycleId: 'create-reset-1' }, live);
+      expect(worktreeCreateFailures(t.card())).toHaveLength(1);
+      expect((await executeLiveLand(t.card(), 51, { ...t.ctx, cycleId: 'create-reset-2' }, live)).ok).toBe(true);
+      expect(createCalls).toBe(2);
+      expect(worktreeCreateFailures(t.card())).toBeUndefined();
+    } finally { resetElanousConfigDir(); }
+  });
+
+  test('a new PR head starts a fresh worktree-create retry count', async () => {
+    const t = landFixture();
+    // 개발자 실제 설정(tasks.landWorktreeCreateCap)에 흔들리지 않게 빈 설정 디렉터리로 고정한다(기본 상한 3).
+    const configDir = mkdtempSync(join(tmpdir(), 'ta-land-create-cap-iso-'));
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({}));
+    setElanousConfigDir(configDir);
+    try {
+      const createCalls: LandWorktreeInput[] = [];
+      const live = {
+        ...t.live,
+        landWorktree: {
+          localHead: () => HEAD_C,
+          create: async (input: LandWorktreeInput): Promise<LandWorktree | LandWorktreeFailure> => {
+            createCalls.push(input);
+            if (input.head === HEAD_A) return { reason: 'old head create failed', created: false, removed: null };
+            return { cwd: '/state/land-worktrees/new-head', cleanup: () => ({ removed: true }) };
+          },
+        },
+        land: async () => ({ status: 0, stdout: 'merged' }),
+      };
+      for (let tick = 1; tick <= 3; tick++) {
+        await executeLiveLand(t.card(), 51, { ...t.ctx, cycleId: `old-head-${tick}` }, live);
+      }
+      expect(worktreeCreateFailures(t.card())).toHaveLength(3);
+      t.setView({ head: HEAD_B, state: 'OPEN', isDraft: false });
+      const retried = await executeLiveLand(t.card(), 51, { ...t.ctx, review: { ...reviewed, head: HEAD_B }, cycleId: 'new-head' }, live);
+      expect(retried).toMatchObject({ executed: true, ok: true });
+      expect(createCalls.filter(input => input.head === HEAD_B)).toHaveLength(1);
+      expect(worktreeCreateFailures(t.card())).toBeUndefined();
+    } finally { resetElanousConfigDir(); }
+  });
+
   test('land fails in the temp worktree → still removed', async () => {
     const t = landFixture();
     const w = worktreeSeam(t, { local: HEAD_B });
@@ -608,7 +714,8 @@ describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => 
 
   test('failed invocation records last 300 chars and is not retried for this PR/head', async () => {
     const t = landFixture();
-    t.live.land = async () => ({ status: 1, stdout: '', stderr: 'e'.repeat(350) });
+    // TA-LAND-RETRY-ON-INFRA — 관문 줄(✓)이 있는 판정 실패(목록 밖)라야 «한 번 끝»이다 · 결과 줄 없는 죽음은 인프라(land-retry-on-infra.test.ts).
+    t.live.land = async () => ({ status: 1, stdout: '✓ branch: feature', stderr: 'e'.repeat(350) });
     const out = await executeLiveLand(t.card(), 51, t.ctx, t.live);
     expect(out).toMatchObject({ ok: false, executed: true, detail: 'e'.repeat(300) });
     expect(t.card().landAttempts?.[0]).toMatchObject({ ok: false, detail: 'e'.repeat(300) });
@@ -914,5 +1021,103 @@ describe('TA-LIVE-REVIEW-POD — 작업 트리 없는 런(Pod)의 live review �
   test('PR 머리 조회는 브랜치·URL 도 싣는다', async () => {
     const gh = () => ({ status: 0, stdout: JSON.stringify({ headRefOid: HEAD_A, headRefName: BRANCH, state: 'OPEN', url: PR_URL }) });
     expect(await defaultPrHead(24738, '/tmp/x', gh)).toEqual({ head: HEAD_A, state: 'OPEN', branch: BRANCH, url: PR_URL });
+  });
+});
+
+describe('TA-LIVE-DECISION — 막힌 과제를 근거 붙은 결정 카드로', () => {
+  const ctx = (evidence: LiveDecisionCardContext['evidence'], over: Partial<LiveDecisionCardContext> = {}): LiveDecisionCardContext =>
+    ({ runId: 'run-live', stopReason: 'no-progress', reason: 'blocked twice on the same screen', pr: 9, evidence, ...over });
+  const harness = () => {
+    const f = fixture();
+    const raised: string[][] = [];
+    let status = 0;
+    const deps = { statePath: f.statePath, log: () => {}, raiseDecision: async (args: string[]) => { raised.push(args); return { status, stdout: '', stderr: status ? 'ledger locked' : '' }; } };
+    return { f, raised, deps, fail: () => { status = 1; }, heal: () => { status = 0; }, card: () => readTaskCard('ta-live-1', f.statePath)! };
+  };
+  const refOf = (args: string[]) => JSON.parse(args[args.indexOf('--ref') + 1]!) as Record<string, unknown>;
+
+  test('근거 없는 카드 0 — 서명·화면·must-fix 가 모두 비면 올리지 않고 카드 기록도 안 남긴다', async () => {
+    const t = harness();
+    for (const evidence of [{}, { signature: '   ' }, { screen: '' }, { mustFix: [] }, { mustFix: ['  ', ''] }, { signature: ' ', screen: ' ', mustFix: [' '] }]) {
+      const out = await executeLiveDecisionCard(t.card(), ctx(evidence), t.deps);
+      expect(out).toMatchObject({ kind: 'decision-card', ok: false, executed: false, detail: 'no evidence (signature · screen · must-fix) — no card raised' });
+    }
+    expect(t.raised).toHaveLength(0);
+    expect(t.card().history).toEqual([]);
+  });
+
+  test('근거 하나만 있어도 올린다 — 카드 --ref 에 그 근거와 근거 칸 이름이 실린다', async () => {
+    const t = harness();
+    const out = await executeLiveDecisionCard(t.card(), ctx({ signature: 'sig-abc' }), t.deps);
+    expect(out).toMatchObject({ kind: 'decision-card', ok: true, executed: true, card: 'ta-live-1' });
+    expect(t.raised).toHaveLength(1);
+    const args = t.raised[0]!;
+    expect(args.slice(0, 2)).toEqual(['decisions', 'raise']);
+    expect(args[args.indexOf('--title') + 1]).toBe('ta-live-1: blocked twice on the same screen');
+    expect(args[args.indexOf('--category') + 1]).toBe('other');
+    expect(refOf(args)).toMatchObject({ card: 'ta-live-1', runId: 'run-live', pr: 9, grounds: ['signature'], signature: 'sig-abc', mustFix: [], selected: 'decision-card' });
+    expect(refOf(args)).not.toHaveProperty('screen');
+    const rows = t.card().history.filter((entry) => entry.event === 'live-move' && entry.kind === 'decision-card');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ executed: true, ok: true, executorResult: 'live', runId: 'run-live', pr: 9 });
+    expect(rows[0]!.detail).toContain('decision card raised (signature)');
+  });
+
+  test('서명·화면·must-fix 셋이 다 실린다 — 화면은 꼬리만 · 서명은 머리만 자른다', async () => {
+    const t = harness();
+    const screen = `${'x'.repeat(2000)}TAIL`;
+    await executeLiveDecisionCard(t.card(), ctx({ signature: `S${'s'.repeat(400)}`, screen, mustFix: [' fix one ', '', 'fix two'] }), t.deps);
+    const ref = refOf(t.raised[0]!);
+    expect(ref.grounds).toEqual(['signature', 'screen', 'must-fix']);
+    expect(ref.mustFix).toEqual(['fix one', 'fix two']);
+    expect((ref.signature as string).length).toBe(300);
+    expect((ref.screen as string).length).toBe(1500);
+    expect((ref.screen as string).endsWith('TAIL')).toBe(true);
+  });
+
+  test('같은 근거 둘째 틱 0 · 근거가 바뀌면 새 카드', async () => {
+    const t = harness();
+    await executeLiveDecisionCard(t.card(), ctx({ mustFix: ['a'] }), t.deps);
+    const again = await executeLiveDecisionCard(t.card(), ctx({ mustFix: ['a'] }), t.deps);
+    expect(again).toMatchObject({ ok: true, executed: false });
+    expect(again.detail).toMatch(/^already raised for fp:[0-9a-f]{12}$/);
+    expect(t.raised).toHaveLength(1);
+    await executeLiveDecisionCard(t.card(), ctx({ mustFix: ['b'] }), t.deps);
+    expect(t.raised).toHaveLength(2);
+    expect(t.card().history.filter((entry) => entry.kind === 'decision-card')).toHaveLength(2);
+  });
+
+  test('올리기 실패 → 카드 기록을 걷어 다음 틱이 다시 시도한다', async () => {
+    const t = harness();
+    t.fail();
+    const failed = await executeLiveDecisionCard(t.card(), ctx({ screen: 'stuck' }), t.deps);
+    expect(failed).toMatchObject({ ok: false, executed: false });
+    expect(failed.detail).toBe('decisions raise failed: ledger locked');
+    expect(t.card().history).toEqual([]);
+    t.heal();
+    const retried = await executeLiveDecisionCard(t.card(), ctx({ screen: 'stuck' }), t.deps);
+    expect(retried).toMatchObject({ ok: true, executed: true });
+    expect(t.raised).toHaveLength(2);
+  });
+
+  test('위험 표지는 종전 실행부와 같은 범주로 간다(돈 → money) · 카드·원장 없음은 올리지 않는다', async () => {
+    const t = harness();
+    await executeLiveDecisionCard(t.card(), ctx({ signature: 's' }, { risk: 'money' }), t.deps);
+    expect(t.raised[0]![t.raised[0]!.indexOf('--category') + 1]).toBe('money');
+    expect(await executeLiveDecisionCard(undefined, ctx({ signature: 's' }), t.deps)).toMatchObject({ ok: false, executed: false, card: null });
+    const ghost = { ...t.card(), id: 'ta-ghost' };
+    expect(await executeLiveDecisionCard(ghost, ctx({ signature: 's' }), t.deps)).toMatchObject({ ok: false, executed: false, detail: 'task card not in state file' });
+    expect(t.raised).toHaveLength(1);
+  });
+
+  test('보존 — 종전 실행부의 decision 카드 인자와 --ref 만 빼고 같다', async () => {
+    const t = harness();
+    const sent: string[][] = [];
+    await executeNextAction({ kind: 'decision', taskId: 'ta-live-1', rationale: 'blocked twice on the same screen', pr: 9, runId: 'run-live', original: 'x', checklistId: '' },
+      { mode: 'live', command: async (args) => { sent.push(args); return { status: 0, stdout: '' }; }, observe: () => {} });
+    await executeLiveDecisionCard(t.card(), ctx({ signature: 'sig' }), t.deps);
+    const strip = (args: string[]) => args.map((arg, at) => args[at - 1] === '--ref' ? '<ref>' : arg);
+    expect(strip(t.raised[0]!)).toEqual(strip(sent[0]!));
+    expect(sent[0]).toEqual(decisionRaiseArgs({ taskId: 'ta-live-1', reason: 'blocked twice on the same screen', evidence: sent[0]![sent[0]!.indexOf('--ref') + 1]! }));
   });
 });

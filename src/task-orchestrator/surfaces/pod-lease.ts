@@ -40,6 +40,8 @@ export function leaseKubectl(args: readonly string[], input?: string): { status:
 export interface PodLeaseMember {
   context: string;
   capacity: number;
+  /** POD-POOL-UNCAPPED-SPEC — `capacity` came from the spec default (`:N` absent), not from the operator. */
+  capacityDefaulted?: boolean;
   running: number | null;
   pending: number | null;
   /** Job names of Pending harness Pods already included in pending (used to avoid counting the same Job's host lease twice). */
@@ -94,7 +96,12 @@ export interface PoolLeaseMeasure {
 
 export interface PoolLeaseRecommendation {
   recommended: number | null;
-  limitedBy: 'capacity' | 'memory' | null;
+  /**
+   * What stopped admission: `memory` = node memory headroom · `capacity` = the pool slot budget ·
+   * `pool-cap` = POD-POOL-UNCAPPED-SPEC — a member whose cap came from the spec default (`:N` absent → 2) is
+   * already at/over that cap, so the pool spec itself (not memory, not a configured budget) is the bound.
+   */
+  limitedBy: 'capacity' | 'memory' | 'pool-cap' | null;
   reason: string | null;
   capacitySlots: number | null;
   memorySlots: number | null;
@@ -392,7 +399,7 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
   const kubectl = deps.kubectl ?? leaseKubectl;
   return { members: members.map((member) => {
     const base = ['--context', member.context, '--request-timeout=10s'];
-    const result: PodLeaseMember = { context: member.context, capacity: member.capacity, running: null, pending: null, unleasedRunning: null, memoryLimitBytes: null, allocatableMemoryBytes: null, allocatableCpuMillicores: null, availableMemoryByNodeBytes: null, reason: null };
+    const result: PodLeaseMember = { context: member.context, capacity: member.capacity, ...(member.capacityDefaulted ? { capacityDefaulted: true } : {}), running: null, pending: null, unleasedRunning: null, memoryLimitBytes: null, allocatableMemoryBytes: null, allocatableCpuMillicores: null, availableMemoryByNodeBytes: null, reason: null };
     try {
       const nodes = kubectl([...base, 'get', 'nodes', '-o', 'json']);
       const jobs = kubectl([...base, '-n', 'elanous-test', 'get', 'jobs', '-l', 'elanous.substrate=pod', '-o', 'json']);
@@ -635,7 +642,7 @@ export function recommendConcurrency(measure: PoolLeaseMeasure, options: { capac
   if (goalBytes === null || goalBytes <= 0) return { ...empty, reason: '측정 불가: perGoalMemory' };
   const admission = admissionByUsage(measure, goalBytes, options.perGoalMemory !== undefined);
   if (!measure.members.length || measure.members.some((m) => m.running === null || m.pending === null || m.unleasedRunning === null || m.allocatableMemoryBytes === null || m.memoryLimitBytes === null || m.allocatableCpuMillicores === null || m.availableMemoryByNodeBytes === null)) {
-    debug.log('pod-lease', 'admit-by-usage', { samples: admission.samples, p95Bytes: admission.p95Bytes, admitBytes: admission.admitBytes, fallback: admission.fallback, recommended: null, limitedBy: null });
+    debug.log('pod-lease', 'admit-by-usage', { samples: admission.samples, p95Bytes: admission.p95Bytes, admitBytes: admission.admitBytes, fallback: admission.fallback, recommended: null, limitedBy: null, capacity: options.capacity, capacitySlots: null, memorySlots: null, running: null, pending: null });
     return { ...empty, reason: `측정 불가: cluster${measure.members.map((m) => m.reason ? ` ${m.context}: ${m.reason}` : '').join('')}` };
   }
   if (!Number.isSafeInteger(options.capacity) || options.capacity < 0) return { ...empty, reason: '측정 불가: capacity' };
@@ -680,9 +687,14 @@ export function recommendConcurrency(measure: PoolLeaseMeasure, options: { capac
     Math.floor((m.allocatableMemoryBytes! - m.memoryLimitBytes!) / liteBytes))), 0);
   const memoryBound = Math.min(memorySlots, placeableSlots);
   const recommended = Math.max(0, Math.min(capacitySlots, memoryBound) - eligibleUnleasedRunning);
-  const limitedBy = memoryBound < capacitySlots ? 'memory' : 'capacity';
+  // POD-POOL-UNCAPPED-SPEC — `capacity ≤ occupied` on a member whose cap is the spec default (`:N` absent → 2) means
+  // the «uncapped» pool spec is what admits nothing. Name it `pool-cap`, not the generic `capacity`, so a launch that
+  // sits on `recommended=0` says in its first admit line that the pool spec never declared a cap of its own.
+  const defaultCapFull = capacitySlots <= 0 && measure.members.some((m) => m.capacityDefaulted === true
+    && m.reason !== 'dns' && m.running !== null && m.pending !== null && m.running + m.pending >= m.capacity);
+  const limitedBy: PoolLeaseRecommendation['limitedBy'] = memoryBound < capacitySlots ? 'memory' : defaultCapFull ? 'pool-cap' : 'capacity';
   if (unleasedRunning > 0) debug.log('pod-lease', 'unleased', { unleasedRunning, running, recommended });
-  debug.log('pod-lease', 'admit-by-usage', { samples: admission.samples, p95Bytes: admission.p95Bytes, admitBytes: admission.admitBytes, fallback: admission.fallback, recommended, limitedBy });
+  debug.log('pod-lease', 'admit-by-usage', { samples: admission.samples, p95Bytes: admission.p95Bytes, admitBytes: admission.admitBytes, fallback: admission.fallback, recommended, limitedBy, capacity: options.capacity, capacitySlots, memorySlots, running, pending });
   return { recommended, limitedBy, reason: measure.members.some((m) => m.reason === 'dns') ? 'dns' : null, capacitySlots, memorySlots, liteMemorySlots, placeableSlots, accountSlots, running, pending, pendingJobs, unleasedRunning, admission };
 }
 

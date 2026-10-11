@@ -23,7 +23,7 @@ import { listRunLedgers, loadFederatedRunLedger, loadRunLedger, queryRunScreenKe
 import { classifyPodExitStop, recordRunStop, runStopRecorded, RUN_STOP_EVENT } from '../self-implement/run-stop.js';
 import { ensureOpenRouterChildModelLive, resolveChildLlmEffort, resolveImplementationChildModel } from '../self-dev/dev-cli.js';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
-import { queryRunningRuns } from '../self-implement/running-runs.js';
+import { buildRunProgressRows, queryRunningRuns, renderRunProgressTable } from '../self-implement/running-runs.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
 import { collectDraftMetrics, collectOverlapMetrics, DRAFT_SWEEP_CONCURRENCY, mapBounded, resolveDraftSweepCloseCap, runDraftSweep, sweepFailureReason, type DraftSweepAdapters, type DraftSweepResult, type OverlapMetricAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from '../self-dev/draft-sweep.js';
 import { readAskPreflightRowsSince, readSalvagedRowsSince } from '../self-dev/ask-launch-io.js';
@@ -58,6 +58,9 @@ import type { MissionSolveOutcome } from './mission-solve-loop.js';
 import { formatAxis, formatAxisObservations, inspectAskMarkers, inspectUnpressedDecisionSignals } from '../../scripts/ask-marker-check.js';
 import { enterJourneyNode, ensureJourneyKey, exitJourneyNode, JOURNEY_KEY_ENV, passJourneyNode, withJourneyNode } from '../self-dev/graph-journey-nodes.js';
 import { intakeTakesQueue, readJourneyEdge, recordJourneyEdge } from '../self-dev/graph-journey-route.js';
+import { appendBenchLedger, BENCH_LOG_CATEGORY, benchBaseBranch, defaultBenchGitRun, ensureBenchBase, nextBenchRound, parseBenchSpec, readBenchLedger, type BenchBase, type BenchGitRun } from '../bench/bench.js';
+import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { codeRevision } from '../version/code-revision.js';
 
 let harnessPlanRfcForTesting: typeof runHarnessPlanRfc | undefined;
 let harnessAskMarkerInspectorForTesting: ((ask: string) => readonly string[]) | undefined;
@@ -144,6 +147,17 @@ export interface HarnessAskSayChildLlmOptions extends HarnessAskSayOptions {
   childLlmProvider?: string;
   childLlmModel?: string;
   childLlmEffort?: string;
+  /** BENCH-ISOLATED-ARMS — `<id>[:<base-sha>]` · base 를 `bench/<id>/base` 로 고정한다(`--base` 와 함께 못 쓴다). */
+  bench?: string;
+}
+
+/** BENCH-ISOLATED-ARMS — 시험이 실제 원격·운영 config 를 안 건드리게 주입한다. */
+export interface HarnessBenchDeps {
+  readonly git?: BenchGitRun;
+  readonly configDir?: string;
+  readonly imageCommit?: () => string | null;
+  /** 부모(이 발사 프로세스)가 도는 코드 커밋 — 기본 `codeRevision()`(코드 자신의 위치 · cwd 무관). */
+  readonly codeCommit?: () => string | null;
 }
 
 export interface HarnessPlanOptions extends HarnessAskSayOptions {
@@ -288,7 +302,8 @@ function registerHarnessAskSayOptions(command: Command): Command {
     .option('--pod-pool <spec>', 'pod: 풀 — 인자 > ELANOUS_POD_POOL > harness.podPool > 기존 pod.pool > 현재 컨텍스트')
     .addOption(new Option('--pod-memory <tier>', 'pod: 메모리 등급 — lite(2Gi · 문서·조사·네트워크 스킬 골 · OOM 이면 high 로 한 번 재시도) | standard(16Gi) | high(32Gi) · 없으면 골 문면 `Pod 메모리: <등급>` 한 줄 · 그것도 없으면 골이 apps/pwa/ 를 담을 때 high').choices(['lite', 'standard', 'high']))
     .option('--after <goal-or-pr>', 'pod: 선행 — 이 골 ID(16자) 또는 PR(#N) 이 병합될 때까지 Pod 발사가 큐에서 이유와 함께 기다린다(병합 없이 닫히면 blocked) · 골 문면 `선행: #N` 한 줄과 같다 · 대상 파일만 겹치면 선행이 아니다(경고만)')
-    .option('--source <spec>', 'pod: 원천 — commit:<40자 sha> | pr:<정수> | worktree:<경로> | files:<경로>[,<경로>…] · `--substrate pod` 와 함께');
+    .option('--source <spec>', 'pod: 원천 — commit:<40자 sha> | pr:<정수> | worktree:<경로> | files:<경로>[,<경로>…] · `--substrate pod` 와 함께')
+    .option('--bench <id[:sha]>', '벤치 팔 — base 를 bench/<id>/base 로 고정(없으면 sha·생략 시 origin/main 으로 만든다 · 있으면 sha 일치 확인 · 불일치 거부) · 팔 가지 bench/<id>/<arm> · PR 라벨 elanous:bench · PR 직전 main 동기화 생략 · 원장 elanous bench ls <id>');
 }
 
 function registerHarnessPlanOptions(command: Command): Command {
@@ -793,6 +808,36 @@ async function readHarnessLaunchBudget(
   }
 }
 
+type BenchLaunchRow = Parameters<typeof appendBenchLedger>[0];
+
+/** BENCH-ISOLATED-ARMS ④ — 원장 «launched» 줄. ⛔ 원장을 못 써도 발사는 막지 않는다(관측 `bench`/`ledger-unwritten`). */
+function recordBenchLaunch(bench: BenchBase, opts: HarnessAskSayChildLlmOptions, substrate: string, entrance: string, deps: HarnessBenchDeps): BenchLaunchRow {
+  const configDir = deps.configDir ?? getElanousConfigDir();
+  const childLlmModel = opts.childLlmModel?.trim() || null;
+  let round = 1;
+  try { round = nextBenchRound(readBenchLedger(bench.id, configDir), childLlmModel); } catch { /* 못 읽으면 1 — 줄에 그대로 남는다 */ }
+  let imageCommit: string | null = null;
+  try { imageCommit = deps.imageCommit ? deps.imageCommit() : getUserConfig().harness?.imageCommit ?? null; } catch { imageCommit = null; }
+  // ⭐ base sha 와 «다른 칸»이다 — base 는 자식 작업 가지의 출발점일 뿐, 부모·Pod 발사 코드는 지금 도는 코드다
+  //   (10-11 사고: 부모를 base 의 옛 트리에서 띄워 옛 발사 코드가 provider 를 조용히 바꿨다).
+  let parentCodeCommit: string | null = null;
+  try { parentCodeCommit = deps.codeCommit ? deps.codeCommit() : codeRevision() ?? null; } catch { parentCodeCommit = null; }
+  const row: BenchLaunchRow = {
+    ts: new Date().toISOString(), event: 'launched', benchId: bench.id, baseBranch: bench.branch, baseSha: bench.sha,
+    parentCodeCommit, imageCommit, childLlmProvider: opts.childLlmProvider?.trim() || null, childLlmModel, round,
+    entrance, substrate, ...(opts.seat ? { seat: opts.seat } : {}),
+  };
+  try { appendBenchLedger(row, configDir); }
+  catch (error) { try { debug.log(BENCH_LOG_CATEGORY, 'ledger-unwritten', { benchId: bench.id, event: 'launched', reason: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ } }
+  return row;
+}
+
+function recordBenchFinish(launched: BenchLaunchRow, deps: HarnessBenchDeps): void {
+  const exitCode = typeof process.exitCode === 'number' ? process.exitCode : Number(process.exitCode ?? 0) || 0;
+  try { appendBenchLedger({ ...launched, ts: new Date().toISOString(), event: 'finished', exitCode }, deps.configDir ?? getElanousConfigDir()); }
+  catch (error) { try { debug.log(BENCH_LOG_CATEGORY, 'ledger-unwritten', { benchId: launched.benchId, event: 'finished', reason: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ } }
+}
+
 async function dispatchHarnessAskSay(
   opts: HarnessAskSayChildLlmOptions & HarnessDryRunOpts,
   dryRunPreview: {
@@ -806,6 +851,7 @@ async function dispatchHarnessAskSay(
   queueDeps?: HarnessQueueDeps,
   immediateLaunch?: HarnessQueueDeps['launch'],
   immediateExit?: () => Promise<number>,
+  benchDeps: HarnessBenchDeps = {},
 ): Promise<void> {
   // HARNESS-FULL-GRAPH — 여정 조인 키는 이 발사 동안만 환경에 싣는다(자식은 그동안 물려받는다).
   const journeyPreset = Boolean(process.env[JOURNEY_KEY_ENV]?.trim());
@@ -815,6 +861,29 @@ async function dispatchHarnessAskSay(
     if (refusePodChildProviderBeforeLaunch(resolveHarnessSubstrate({ flag: opts as HarnessSubstrateOpts, config: getUserConfig(), env: process.env }), opts)) return;
     if (opts.childLlmModel !== undefined) await ensureOpenRouterChildModelLive(opts.childLlmProvider, opts.childLlmModel, { persist: !isHarnessDryRun(opts) });
     assertHarnessChildLlmModel(opts);
+    // BENCH-ISOLATED-ARMS ① — 기준선 가지를 발사 «전»에 고정한다(꼴이 틀리거나 sha 가 어긋나면 발사 0).
+    let bench: BenchBase | undefined;
+    if (opts.bench !== undefined) {
+      const spec = parseBenchSpec(opts.bench);
+      if (opts.base !== undefined) {
+        console.error(`❌ --bench 와 --base 는 함께 못 쓴다 — 벤치 base 는 ${benchBaseBranch(spec.id)} 로 정해진다`);
+        process.exitCode = 2;
+        return;
+      }
+      if (isHarnessDryRun(opts)) {
+        console.log(`[dry-run] bench: ${spec.id} → base ${benchBaseBranch(spec.id)} (${spec.sha ?? '가지가 있으면 그 sha · 없으면 발사 시점 origin/main'}) · 원격 변경 없음`);
+      } else {
+        try {
+          bench = ensureBenchBase(spec, benchDeps.git ?? defaultBenchGitRun(process.cwd()));
+        } catch (error) {
+          try { debug.log(BENCH_LOG_CATEGORY, 'base-refused', { benchId: spec.id, requestedSha: spec.sha ?? null, reason: error instanceof Error ? error.message : String(error) }); } catch { /* observation is fail-soft */ }
+          throw error;
+        }
+        try { debug.log(BENCH_LOG_CATEGORY, 'base-ensured', { benchId: bench.id, branch: bench.branch, sha: bench.sha, created: bench.created }); } catch { /* observation is fail-soft */ }
+        console.error(`🧪 bench ${bench.id} — base ${bench.branch} @ ${bench.sha.slice(0, 12)}${bench.created ? ' (새로 만듦)' : ' (기존 가지 · sha 일치)'}`);
+        opts = { ...opts, base: bench.branch };
+      }
+    }
     if (isHarnessDryRun(opts)) {
       resolveLaunchSubstrate(opts);
       printHarnessLaunchDryRun(dryRunPreview);
@@ -857,7 +926,9 @@ async function dispatchHarnessAskSay(
       resolveNestedElanousOption(opts);
       const flags: string[] = [];
       const values: Array<[string, string | undefined]> = [
-        ['--base', opts.base], ['--target', opts.target], ['--correlation', opts.correlation],
+        // 벤치는 «--bench id:sha» 로 넘긴다 — 대기열 자식이 sha 를 다시 확인하고 원장 줄을 쓴다.
+        ['--base', bench ? undefined : opts.base], ['--bench', bench ? `${bench.id}:${bench.sha}` : undefined],
+        ['--target', opts.target], ['--correlation', opts.correlation],
         ['--goal-type', opts.goalType], ...(dryRunPreview.entrance === 'cli-harness-say' ? [['--author-grade', opts.authorGradeSource === 'flag' ? opts.authorGrade : undefined] as [string, string | undefined]] : []), ['--child-llm-provider', opts.childLlmProvider],
         ['--child-llm-model', opts.childLlmModel], ['--child-llm-effort', opts.childLlmEffort],
         ['--pod-pool', (opts as HarnessSubstrateOpts).podPool], ['--pod-memory', (opts as HarnessSubstrateOpts).podMemory],
@@ -937,8 +1008,10 @@ async function dispatchHarnessAskSay(
       else delete process.env.ELANOUS_HARNESS_SEAT;
       // 배치 노드 — 실행 칸(local | pod)이 그 출구 라벨이고, YAML 의 decompose 간선(on: substrate)이 그 값으로 갈린다.
       passJourneyNode('dispatch', { ...journey, outcome: resolved.substrate });
+      const benchRow = bench ? recordBenchLaunch(bench, stampedOpts, resolved.substrate, dryRunPreview.entrance, benchDeps) : undefined;
       try { await dispatch(resolved, stampedOpts); }
       finally {
+        if (benchRow) recordBenchFinish(benchRow, benchDeps);
         if (previous === undefined) delete process.env.ELANOUS_HARNESS_SEAT;
         else process.env.ELANOUS_HARNESS_SEAT = previous;
       }
@@ -2299,8 +2372,16 @@ export type GithubDraftSweepAdapters = DraftSweepAdapters & {
   runLedgerMatches(): readonly RunLedgerMatch[];
 };
 
+/** DRAFT-LINEAGE-ONE-1 — how the sweep stops a superseded run: `harness stop` (process ⊕ Pod Job by run label). */
+export type DraftSweepStopRun = (runId: string) => Promise<Pick<import('./harness-stop.js').HarnessStopResult, 'process' | 'jobsDeleted' | 'scanned'>>;
+const defaultDraftSweepStopRun: DraftSweepStopRun = async (runId) => {
+  const { stopHarnessRun, defaultHarnessStopDeps } = await import('./harness-stop.js');
+  return stopHarnessRun(runId, defaultHarnessStopDeps());
+};
+
 export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: DraftSweepGitExecute = runGitCommand, cwd = process.cwd(),
-  executeAsync: (args: string[]) => Promise<string> = execute === executeGh ? executeGhAsync : async (args) => execute(args)): GithubDraftSweepAdapters {
+  executeAsync: (args: string[]) => Promise<string> = execute === executeGh ? executeGhAsync : async (args) => execute(args),
+  stopRun: DraftSweepStopRun = defaultDraftSweepStopRun): GithubDraftSweepAdapters {
   const inventory = async (repository: string, state: 'open' | 'closed'): Promise<GithubPull[]> => {
     // ⛔ A large repository has tens of thousands of closed PRs (2026-09-28: 21k → «exceeded pagination limit», no sweep at all).
     //    Merged twins only matter after the oldest open draft was opened, so the closed listing stops at that time.
@@ -2568,10 +2649,25 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
     commentDraft: async (repository, number, body) => { execute(['pr', 'comment', String(number), '--repo', repository, '--body', body]); },
     removeLabel: async (repository, number, name) => { execute(['pr', 'edit', String(number), '--repo', repository, '--remove-label', name]); },
     getReviewGate: async (draft, repository) => reviewGateForDraft(draft, repository),
+    // DRAFT-LINEAGE-ONE-1 — the sweep calls this only with `--apply`, only for a live run whose newer same-lineage run
+    // is live too. The run id must come from this PR's own ledger owner; a stop that cannot be confirmed rejects, so
+    // the draft is neither labelled nor closed.
+    supersedeRun: async (draft) => {
+      if (!draft.runId) throw new Error(`run id of #${draft.number} unknown (no single ledger owner) — not stopping`);
+      const stopped = await stopRun(draft.runId);
+      // `absent` after a complete process-table scan = nothing left to stop (a dead run whose worktree remains) — confirmed.
+      const confirmed = stopped.process === 'stopped' || stopped.process === 'killed' || stopped.jobsDeleted > 0
+        || (stopped.process === 'absent' && stopped.scanned);
+      if (!confirmed) {
+        throw new Error(`run ${draft.runId} not confirmed stopped (process ${stopped.process} · jobs ${stopped.jobsDeleted} · scanned ${stopped.scanned})`);
+      }
+    },
   };
 }
 
 export interface HarnessDraftSweepDeps {
+  /** DRAFT-LINEAGE-ONE-1 test seam for the real adapter's run stop; omitted ⇒ `harness stop`. */
+  readonly stopRun?: DraftSweepStopRun;
   readonly adapters?: DraftSweepAdapters;
   /** Optional overlap source injection; tests do not read GitHub or logs.db. */
   readonly overlapAdapters?: OverlapMetricAdapters;
@@ -2729,7 +2825,7 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
           throw new HarnessCliInputError(`invalid --repo (expected owner/name): ${repository}`);
         }
         // One adapter instance per sweep: its open listing and ledger scan are shared with the RUN-TTL step.
-        const github = deps.adapters ? undefined : githubDraftSweepAdapters(deps.execute);
+        const github = deps.adapters ? undefined : githubDraftSweepAdapters(deps.execute, undefined, undefined, undefined, deps.stopRun);
         const configCap = deps.closeCapConfig
           ? deps.closeCapConfig()
           : (() => { try { return getUserConfig().tools?.selfImplement?.draftSweepCloseCap; } catch { return undefined; } })();
@@ -3022,6 +3118,8 @@ export interface HarnessCliCommandDeps {
   say?: HarnessSayHandler;
   /** Observe-only Pod host dispatch seam. */
   podDispatchTask?: (input: DispatchTaskInput, deps?: DispatchTaskDeps) => ReturnType<typeof dispatchTask>;
+  /** BENCH-ISOLATED-ARMS — 벤치 base 고정·원장 주입(시험). */
+  bench?: HarnessBenchDeps;
   launchGate?: PreLaunchGateDeps & { readBudget?: () => Promise<BudgetDecision | 'unknown'> };
   plan?: HarnessPlanHandler;
   /** ⭐ `plan` 주입이 «없을 때» 가는 기본 분기. 시험이 이 자리로 «CLI 의 기본 배선»을 문다
@@ -3029,6 +3127,8 @@ export interface HarnessCliCommandDeps {
   planRfc?: typeof runHarnessPlanRfc;
   mission?: HarnessMissionHandler;
   missionLoop?: HarnessMissionLoopHandler;
+  /** `harness progress` 가 도는 런 관측을 읽는 자리(시험 주입). 기본은 queryRunningRuns. */
+  progress?: { query?: typeof queryRunningRuns; nowMs?: () => number };
 }
 
 export function installHarnessCliCommand(program: Command, deps: HarnessCliCommandDeps): Command {
@@ -3082,6 +3182,21 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
           for (const row of selected) console.log(`${row.at} run ${row.runId} · seat=${row.seat ?? '-'} entrance=${row.entrance ?? '-'} reason=${row.reason} · status=${row.status} signal=${row.signal ?? '-'}`);
           for (const burst of bursts) console.log(`${burst.firstAt}–${burst.lastAt} 묶음 ${burst.reason} ×${burst.count} · seat=${burst.seat ?? '-'} entrance=${burst.entrance ?? '-'} · ${burst.runIds.join(', ')}`);
         }
+      } catch (error) {
+        console.error(humanErrorLine(error));
+        process.exitCode = 1;
+      }
+    });
+  harnessCmd.command('progress').description('도는 골마다 진도를 한 표로 읽는다 — 단계 · 진입 시각 · 마지막 진전 · pty (읽기 전용)')
+    .option('--json', '같은 행 배열을 JSON 으로 출력')
+    .action((opts: { json?: boolean }) => {
+      try {
+        const result = (deps.progress?.query ?? queryRunningRuns)({ caller: 'harness.progress' });
+        const nowMs = (deps.progress?.nowMs ?? Date.now)();
+        if (opts.json) {
+          console.log(JSON.stringify(buildRunProgressRows(result, nowMs)));
+          if (result.completeness === 'partial') console.error(renderRunProgressTable(result, nowMs).split('\n')[0]);
+        } else console.log(renderRunProgressTable(result, nowMs));
       } catch (error) {
         console.error(humanErrorLine(error));
         process.exitCode = 1;
@@ -3194,7 +3309,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
             }
             return resolved.substrate === 'pod' ? onPod(stampedOpts, 'cli-harness-ask', goalPath, resolved.pool!, deps.podDispatchTask) : (announceLocalChildProvider(stampedOpts), ask(goalPath, normalizeHarnessAskSayOptions(stampedOpts)));
           },
-          deps.launchGate, queueDeps, immediateLaunch, queueDeps.launch ? undefined : immediateExit,
+          deps.launchGate, queueDeps, immediateLaunch, queueDeps.launch ? undefined : immediateExit, deps.bench,
         );
       });
   }
@@ -3227,7 +3342,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
               ? onPod(stampedOpts, 'cli-harness-say', sentence.join(' '), resolved.pool!, deps.podDispatchTask, harnessAuthorOnPod())
               : (announceLocalChildProvider(stampedOpts), say(sentence, normalizeHarnessAskSayOptions(stampedOpts)));
           },
-          deps.launchGate, queueDeps, immediateLaunch, queueDeps.launch ? undefined : immediateExit,
+          deps.launchGate, queueDeps, immediateLaunch, queueDeps.launch ? undefined : immediateExit, deps.bench,
         );
       });
   }

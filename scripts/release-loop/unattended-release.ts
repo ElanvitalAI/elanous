@@ -12,6 +12,7 @@ import { runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { releaseRunUniverse } from './release-universe.js';
 import { baseVersion, isStableVersion, nextPrereleaseVersion, type PrereleaseKind } from './release-version.js';
 import { publishAtError } from './publish-at.js';
+import { checkGateExecutorChoice, type GateExecutor } from './gate-executor.js';
 
 const VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
@@ -39,7 +40,10 @@ export interface ReleaseRunInput extends ReleaseLoopConfig {
   version: string;
   previousVersion: string;
   cutCommit?: string;
-  gatePodPool: string;
+  /** Required for the pod executor (the default); a host-executor run may have none. */
+  gatePodPool?: string;
+  /** GATE-HOST-EXECUTOR — absent = pod (today's input, byte-identical); `host` sweeps on `gateRemote`. */
+  gateExecutor?: GateExecutor;
   forceFreeze?: boolean;
   publishAt?: string;
   /** RELEASE-BRANCH: version-release cuts release/<v> from main HEAD and bumps only the branch. */
@@ -104,22 +108,32 @@ export function releaseLoopConfig(configPath = getElanousConfigDirOverride() ? j
   return raw.release?.loop ?? {};
 }
 
-export function buildReleaseRunInput(version: string, deps: UnattendedReleaseDeps = {}, cutCommit?: string): ReleaseRunInput {
+/** GATE-HOST-EXECUTOR — the operator's explicit executor choice (`--gate-executor` / `--gate-host`); absent = pod. */
+export interface GateExecutorRequest { executor?: string; host?: string }
+
+export function buildReleaseRunInput(version: string, deps: UnattendedReleaseDeps = {}, cutCommit?: string, gate: GateExecutorRequest = {}): ReleaseRunInput {
   const config = deps.config ?? releaseLoopConfig(deps.configPath);
+  if (gate.executor === undefined && gate.host !== undefined) throw new Error('--gate-host requires --gate-executor host');
+  const choice = gate.executor === undefined ? undefined
+    : checkGateExecutorChoice(gate.executor, gate.executor === 'host' ? gate.host ?? config.gateRemote : gate.host);
   const pool = config.gatePodPool;
-  if (typeof pool !== 'string' || !pool.trim()) throw new Error('release.loop.gatePodPool is required before graph execution');
+  const hasPool = typeof pool === 'string' && !!pool.trim();
+  // The pod executor (the default) stays fail-closed on a missing pool; an explicit host executor does not need one.
+  if (choice?.executor !== 'host' && !hasPool) throw new Error('release.loop.gatePodPool is required before graph execution');
   const previousVersion = latestPublishedPreviousVersion(baseVersion(version), deps.ledgerRoot);
   return {
     ...config,
     version, previousVersion,
     ...(cutCommit !== undefined ? { cutCommit } : {}),
-    gatePodPool: pool.trim(),
+    ...(hasPool ? { gatePodPool: pool.trim() } : {}),
+    ...(choice ? { gateExecutor: choice.executor } : {}),
+    ...(choice?.host ? { gateRemote: choice.host } : {}),
   };
 }
 
 /** Fail closed at the entry boundary, before any graph node can change a release. */
 export async function runUnattendedRelease(
-  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string },
+  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string },
   deps: UnattendedReleaseDeps = {},
 ): Promise<{ input: ReleaseRunInput; dryRun: boolean; state?: GraphRunState }> {
   // RELEASE-BRANCH (10-06): the default cut is a release branch, so main keeps landing and the run no longer needs a
@@ -135,7 +149,7 @@ export async function runUnattendedRelease(
     }
   }
   const version = resolveRunVersion(opts.version, opts.prerelease, deps);
-  const input = buildReleaseRunInput(version, deps, opts.cutCommit);
+  const input = buildReleaseRunInput(version, deps, opts.cutCommit, { executor: opts.gateExecutor, host: opts.gateHost });
   if (opts.publishAt !== undefined) {
     const invalid = publishAtError(opts.publishAt);
     if (invalid) throw new Error(invalid);
@@ -143,7 +157,8 @@ export async function runUnattendedRelease(
   }
   if (opts.forceFreeze) input.forceFreeze = true;
   if (branchCut) input.branchCut = true;
-  debug.log('release.run', 'input', { version, requested: opts.version, branchCut, prerelease: opts.prerelease ?? null, dryRun: opts.dryRun === true });
+  debug.log('release.run', 'input', { version, requested: opts.version, branchCut, prerelease: opts.prerelease ?? null, dryRun: opts.dryRun === true,
+    ...(input.gateExecutor ? { gateExecutor: input.gateExecutor, gateHost: input.gateExecutor === 'host' ? input.gateRemote ?? null : null } : {}) });
   if (opts.dryRun) return { input, dryRun: true };
   if (opts.prerelease) {
     // A rehearsal neither judges nor carries the stable version's checklist cells.

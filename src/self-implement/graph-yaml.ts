@@ -24,12 +24,16 @@ export interface GraphNodeSpec {
   readonly kind: GraphNodeKind | (string & {});
   readonly recipe: string;
   readonly maxVisits: number;
+  /** L0 journey-stage declaration (optional for other graph templates). */
+  readonly journeyStage?: string;
   readonly progress?: readonly string[];
   readonly phases?: readonly string[];
   readonly terminalStages?: readonly string[];
   /** ⭐ 「아크마다 한 번」처럼 «한 노드가 여럿 돈다」를 값으로. 없으면 한 번이다. */
   readonly fanOut?: string;
   readonly contract?: GraphNodeContract;
+  readonly call?: string;
+  readonly budget?: { readonly innerSteps: number };
 }
 
 export interface GraphEdgeSpec {
@@ -50,11 +54,13 @@ export interface GraphTemplateSpec {
   readonly version: number;
   readonly entryNode: string;
   readonly terminalNodes: readonly string[];
+  readonly journeyStages?: readonly string[];
   /** 문서 전용 변경이면 gate 노드를 건너뛸 수 있다는 템플릿 정책. */
   readonly docsOnlyGateSkip?: boolean;
   readonly state?: readonly string[];
   /** ⭐ 런 계약(선택) — 이 그래프가 «기본으로» 요구하는 실행 칸 등. 발사 인자가 덮는다(graph-run-contract.ts). */
   readonly runContract?: GraphRunContractSpec;
+  readonly unit?: { readonly inputs: readonly string[]; readonly outputs: readonly string[]; readonly exits: readonly string[] };
   readonly nodes: readonly GraphNodeSpec[];
   readonly edges: readonly GraphEdgeSpec[];
 }
@@ -102,6 +108,12 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
   const terminalNodes = asArray(doc.terminal_nodes).filter((v): v is string => typeof v === 'string');
   if (terminalNodes.length === 0) errors.push({ path: `${label}/terminal_nodes`, message: 'terminal_nodes 가 비었다 — 끝날 수 없는 그래프다' });
 
+  const journeyStages = doc.journey_stages;
+  if (journeyStages !== undefined && (!Array.isArray(journeyStages) || journeyStages.length === 0
+    || !journeyStages.every((stage) => typeof stage === 'string' && stage.trim())
+    || new Set(journeyStages).size !== journeyStages.length)) {
+    errors.push({ path: `${label}/journey_stages`, message: 'journey_stages 는 중복 없는 비어 있지 않은 문자열 목록이어야 한다' });
+  }
   const nodes: GraphNodeSpec[] = [];
   for (const [index, entry] of asArray(doc.nodes).entries()) {
     const at = `${label}/nodes/${index}`;
@@ -126,6 +138,13 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       errors.push({ path: `${at}/max_visits`, message: 'max_visits 는 1 이상의 정수여야 한다' });
       continue;
     }
+    if (n.journey_stage !== undefined && (typeof n.journey_stage !== 'string' || !n.journey_stage.trim()
+      || (Array.isArray(journeyStages) && !journeyStages.includes(n.journey_stage)))) {
+      errors.push({ path: `${at}/journey_stage`, message: typeof n.journey_stage === 'string' && n.journey_stage.trim()
+        ? `journey_stage '${n.journey_stage}' 가 journey_stages 목록에 없다`
+        : 'journey_stage 는 비어 있지 않은 문자열이어야 한다' });
+      continue;
+    }
     const contractRaw = n.contract as Record<string, unknown> | undefined;
     const contract: GraphNodeContract | undefined = contractRaw && typeof contractRaw === 'object'
       ? {
@@ -134,17 +153,38 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
           outputs: asArray(contractRaw.outputs).filter((v): v is string => typeof v === 'string'),
         }
       : undefined;
+    // A subgraph node becomes a unit call only when it names `call:`; without it the node keeps the
+    // pre-unit meaning (catalog role / recipe node), so existing declarations stay valid.
+    if (kind === 'subgraph' && (n.call !== undefined || n.budget !== undefined)) {
+      if (typeof n.call !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*@(?:\^?[1-9]\d*)$/.test(n.call))
+        errors.push({ path: `${at}/call`, message: 'call 은 id@정수판 또는 id@^주판이어야 한다' });
+      const budget = n.budget as Record<string, unknown> | undefined;
+      if (!budget || typeof budget !== 'object' || Array.isArray(budget) ||
+          !Number.isSafeInteger(budget.inner_steps) || (budget.inner_steps as number) < 1 || Object.keys(budget).some(key => key !== 'inner_steps'))
+        errors.push({ path: `${at}/budget/inner_steps`, message: 'inner_steps 는 1 이상의 안전한 정수여야 한다' });
+      if (!contractRaw || !Array.isArray(contractRaw.inputs) || !contractRaw.inputs.every(v => typeof v === 'string') ||
+          !Array.isArray(contractRaw.outputs) || !contractRaw.outputs.every(v => typeof v === 'string'))
+        errors.push({ path: `${at}/contract`, message: 'subgraph 에는 inputs·outputs 계약이 필요하다' });
+      if (recipe !== 'none') errors.push({ path: `${at}/recipe`, message: 'subgraph 는 recipe 를 실행하지 않는다' });
+    } else if (kind !== 'subgraph' && (n.call !== undefined || n.budget !== undefined)) {
+      errors.push({ path: at, message: 'call·budget 은 subgraph 전용이다' });
+    }
     // ⛔ 계약이 없으면 「이 노드가 무엇을 할 수 있나」를 답할 수 없다 — 경고로 남긴다(거절은 오버레이 쪽).
     if (contract === undefined) warnings.push({ path: `${at}/contract`, message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' });
     else if (contract.tools === '') warnings.push({ path: `${at}/contract/tools`, message: 'tools 가 비었다' });
 
     nodes.push({
       nodeId, kind, recipe, maxVisits,
+      ...(typeof n.journey_stage === 'string' ? { journeyStage: n.journey_stage } : {}),
       ...(Array.isArray(n.progress) ? { progress: n.progress.filter((v): v is string => typeof v === 'string') } : {}),
       ...(Array.isArray(n.phases) ? { phases: n.phases.filter((v): v is string => typeof v === 'string') } : {}),
       ...(Array.isArray(n.terminal_stages) ? { terminalStages: n.terminal_stages.filter((v): v is string => typeof v === 'string') } : {}),
       ...(typeof n.fan_out === 'string' ? { fanOut: n.fan_out } : {}),
       ...(contract ? { contract } : {}),
+      ...(kind === 'subgraph' && typeof n.call === 'string' ? { call: n.call } : {}),
+      ...(kind === 'subgraph' && n.budget && typeof n.budget === 'object' && !Array.isArray(n.budget) &&
+        typeof (n.budget as Record<string, unknown>).inner_steps === 'number'
+        ? { budget: { innerSteps: (n.budget as { inner_steps: number }).inner_steps } } : {}),
     });
   }
   if (nodes.length === 0) errors.push({ path: `${label}/nodes`, message: '노드가 하나도 없다' });
@@ -198,6 +238,20 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
   if (entryNode !== undefined && !known.has(entryNode)) errors.push({ path: `${label}/entry_node`, message: `'${entryNode}' 는 선언된 노드가 아니다` });
   for (const t of terminalNodes) if (!known.has(t)) errors.push({ path: `${label}/terminal_nodes`, message: `'${t}' 는 선언된 노드가 아니다` });
 
+  let unit: GraphTemplateSpec['unit'];
+  if (doc.unit !== undefined) {
+    const rawUnit = doc.unit as Record<string, unknown>;
+    if (!rawUnit || typeof rawUnit !== 'object' || Array.isArray(rawUnit) ||
+        Object.keys(rawUnit).some(key => !['inputs', 'outputs', 'exits'].includes(key)) ||
+        !['inputs', 'outputs', 'exits'].every(key => Array.isArray(rawUnit[key]) &&
+          (rawUnit[key] as unknown[]).every(v => typeof v === 'string' && v.length > 0) &&
+          new Set(rawUnit[key] as string[]).size === (rawUnit[key] as string[]).length) ||
+        !(rawUnit.exits as string[]).length ||
+        (rawUnit.exits as string[]).some(exit => !terminalNodes.includes(exit)) ||
+        terminalNodes.some(exit => !(rawUnit.exits as string[]).includes(exit))) {
+      errors.push({ path: `${label}/unit`, message: 'unit 의 inputs·outputs·exits 및 terminal_nodes 가 일치해야 한다' });
+    } else unit = { inputs: rawUnit.inputs as string[], outputs: rawUnit.outputs as string[], exits: rawUnit.exits as string[] };
+  }
   const runContract = parseGraphRunContract(doc.run_contract);
   if (runContract.error) errors.push({ path: `${label}/run_contract`, message: runContract.error });
   let loop: GraphTemplateSpec['loop'];
@@ -225,6 +279,8 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
   return {
     template: {
       graphId: graphId!, version: version!, entryNode: entryNode!, terminalNodes, nodes, edges,
+      ...(unit ? { unit } : {}),
+      ...(Array.isArray(journeyStages) ? { journeyStages: journeyStages as string[] } : {}),
       ...(loop ? { loop } : {}),
       ...(typeof doc.docs_only_gate_skip === 'boolean' ? { docsOnlyGateSkip: doc.docs_only_gate_skip } : {}),
       ...(Array.isArray(doc.state) ? { state: doc.state.filter((v): v is string => typeof v === 'string') } : {}),

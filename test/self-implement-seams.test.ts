@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, spyOn } from 'bun:test';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import { debug } from '../src/debug/log.js';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -8,6 +8,34 @@ import { assertBaseBranchOnOrigin, buildPrBody, defaultSeams, resolveCompletionD
 import { DEFAULT_BRANCH_WORKTREE_BASE } from '../src/git-fs/worktree.js';
 import { setGitCommandRunnerForTesting } from '../src/git-fs/runner.js';
 import type { PrManager } from '../src/autopilot/pr-manager.js';
+
+// ── TOOLCHOICE-SEAMS-INTERFERENCE (2026-10-11) — 공유 상태 격리 ───────────────────────────
+//
+// «큰 묶음(plan B 정식 게이트 순서)에서만» 이 파일의 «PTY 폴백 강등 관측» 6건이 지던 원인은
+// **프로세스 공유 env** 다 — 재귀 상한 `ELANOUS_NEST_DEPTH`·`ELANOUS_MAX_NEST_DEPTH` →
+// `nestCapReached()`(src/agent/nest-depth.ts). 상한이 서면 `defaultSeams().implement` 는 자식을
+// 스폰하지 않고 `nest-cap: …` 으로 **조기 반환**하므로, 폴백 관측을 재는 6건이 한꺼번에 진다.
+// ⛔ 그 값은 «앞서 돈 파일이 심어서» 올 수도 있고 «하니스가 자식에게 **상속**시켜서» 올 수도 있다 —
+//   `test/preload-isolation.ts` 는 `ELANOUS_RUN_ID`·space 키는 지우지만 **재귀 깊이는 지우지 않는다**
+//   (실측: 이 Pod 의 `printenv ELANOUS_NEST_DEPTH` = 1 · 상한 기본 5). 깊이가 상한에 닿은 체인에서
+//   돌면 이 파일은 **단독 실행에서도** 6건이 진다.
+// 📏 재현 실측(진단 단계): `ELANOUS_NEST_DEPTH=9` ⊕ `ELANOUS_MAX_NEST_DEPTH=3` 을 심은 preload 로
+//   이 파일을 돌리면 50 pass / 7 fail 이고, 그중 6건이 그 6건이며 진단 문면이
+//   `nest-cap: 재귀 상한(3중·현재 9) 도달 — self-build 중단(액자 폭주 방지)` 이다.
+//   같은 preload 로 격리(아래)를 넣은 뒤엔 57 pass / 0 fail.
+// ⇒ 매 테스트 앞에서 env 를 스냅샷하고 뒤에 되돌린다 — 남이 심은 값이 못 들어오고, 이 파일이
+//   심은 값도 남에게 못 새어나간다(양방향 차단).
+let envSnapshot: Record<string, string | undefined> = {};
+
+beforeEach(() => { envSnapshot = { ...process.env }; });
+
+afterEach(() => {
+  for (const key of Object.keys(process.env)) if (!(key in envSnapshot)) delete process.env[key];
+  for (const [key, value] of Object.entries(envSnapshot)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
 
 function gitTestEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
@@ -848,6 +876,67 @@ describe('resolveCompletionDisposition', () => {
 describe('defaultSeams.implement — PTY 폴백 강등 관측', () => {
   const degraded = ['live-progress', 'registry', 'non-blocking-parent', 'pty-identity'];
 
+  // ⛔ 이 6건이 «큰 묶음에서만» 지던 두 원인을 여기서 끊는다(제품 코드 무접촉):
+  //   ① 재귀 상한 env(위 파일 머리 주석) — `nestCapReached()` 가 서면 implement 가 조기 반환한다.
+  //   ② `implement` 가 cwd 에서 하는 «실제 호스트 작업» — 파생 우주 물질화(provisionDerivedUniverse)
+  //      · `resolveMainRepoRoot` git 탐색 · `worktreeHasChanges` 의 `git status`/`merge-base`/`diff`.
+  //      repo 작업트리(`process.cwd()`)를 주면 그 비용이 «그 작업트리의 그때 상태»에 따라 뛴다
+  //      (untracked·수정 파일 수, git index 온도, `node_modules` 유무).
+  //      📏 실측(같은 프로세스·같은 부하): `worktreeHasChanges(repo 작업트리)` 311ms ↔
+  //         `worktreeHasChanges(임시 cwd)` 13ms · `implement(repo 작업트리)` 682~801ms/호출 ↔
+  //         `implement(임시 cwd)` 376~576ms/호출. 변경 전 이 6건은 11.73초였고(60초 제한 실행),
+  //         짝 실행에서 `unavailable 폴백` 한 건이 8980ms 로 **bun 기본 5초 제한**에 걸려 죽었다
+  //         (`^ this test timed out after 5000ms`) — 묶음의 CPU 경합에선 그 6건이 같이 넘는다.
+  //      ⛔ 게다가 변경 전 모양은 시험이 «재는 대상 repo» 안에 `.elanous-test/` 를 만들었다
+  //         (실측: 그 실행 시각으로 `.elanous-test/.gitignore` 가 생성됐다).
+  //      ⇒ 격리 임시 cwd ⊕ `elanousBinRoot` 주입으로 그 작업을 끊는다. 관측·툴콜 계약은 그대로 잰다.
+  let implementCwd = '';
+  let implementBinRoot = '';
+
+  // ⛔ 그리고 «첫 호출»만 내는 프로세스 1회성 냉 비용(lazy import · config 최초 구성 · 관측 sink
+  //   초기화)이 있다 — 그것이 bun 기본 5초 제한을 넘는 쪽은 항상 이 describe 의 **첫** 테스트다.
+  //   📏 실측: 묶음 실행에서 `unavailable 폴백` 한 건만 `[5794.46ms] ^ this test timed out after
+  //   5000ms` 로 죽고 나머지 5건은 통과(짝 실행에서도 같은 자리가 8980ms). 유휴 프로세스 실측도
+  //   같은 모양이다 — `implement(임시 cwd)` 1호출 576ms → 2·3호출 449·376ms.
+  //   ⇒ 그 비용은 이 테스트가 재는 «폴백 관측»이 아니므로 timed 구간 밖(beforeAll)에서 한 번 태운다.
+  //   ⛔ env 는 여기서 잠깐 빌리고 «반드시» 되돌린다 — beforeAll 은 파일 단위 스냅샷(beforeEach)보다
+  //   먼저 돌므로, 되돌리지 않으면 이 파일이 뒤따르는 파일들을 오염시킨다.
+  beforeAll(async () => {
+    const savedDepth = process.env.ELANOUS_NEST_DEPTH;
+    const savedMax = process.env.ELANOUS_MAX_NEST_DEPTH;
+    const warmCwd = mkdtempSync(join(tmpdir(), 'elanous-seams-implement-warm-'));
+    const warmBinRoot = mkdtempSync(join(tmpdir(), 'elanous-seams-implement-warmbin-'));
+    try {
+      process.env.ELANOUS_NEST_DEPTH = '0';
+      delete process.env.ELANOUS_MAX_NEST_DEPTH;
+      await defaultSeams({
+        ptyAvailable: () => false,
+        elanousBinRoot: warmBinRoot,
+        spawnSync: (() => ({ status: 0, stdout: 'GOAL-COMPLETE\n', stderr: '', signal: null })) as never,
+      }).implement({ cwd: warmCwd, feature: 'warm-up', runId: 'run-pty-fallback-warm-up' });
+    } finally {
+      if (savedDepth === undefined) delete process.env.ELANOUS_NEST_DEPTH;
+      else process.env.ELANOUS_NEST_DEPTH = savedDepth;
+      if (savedMax === undefined) delete process.env.ELANOUS_MAX_NEST_DEPTH;
+      else process.env.ELANOUS_MAX_NEST_DEPTH = savedMax;
+      rmSync(warmCwd, { recursive: true, force: true });
+      rmSync(warmBinRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  beforeEach(() => {
+    process.env.ELANOUS_NEST_DEPTH = '0';
+    delete process.env.ELANOUS_MAX_NEST_DEPTH;
+    implementCwd = mkdtempSync(join(tmpdir(), 'elanous-seams-implement-cwd-'));
+    implementBinRoot = mkdtempSync(join(tmpdir(), 'elanous-seams-implement-bin-'));
+  });
+
+  afterEach(() => {
+    for (const dir of [implementCwd, implementBinRoot]) rmSync(dir, { recursive: true, force: true });
+    implementCwd = '';
+    implementBinRoot = '';
+  });
+
   async function observeFallback(opts: {
     ptyAvailable: () => boolean;
     runHeadlessGoalLoopPty?: () => ReturnType<typeof import('../src/self-implement/headless-elanous-driver.js').runHeadlessGoalLoopPty>;
@@ -859,9 +948,10 @@ describe('defaultSeams.implement — PTY 폴백 강등 관측', () => {
     try {
       const result = await defaultSeams({
         ptyAvailable: opts.ptyAvailable,
+        elanousBinRoot: implementBinRoot,
         ...(opts.runHeadlessGoalLoopPty ? { runHeadlessGoalLoopPty: opts.runHeadlessGoalLoopPty as never } : {}),
         spawnSync: (() => ({ status: 0, stdout: 'GOAL-COMPLETE\n', stderr: '', signal: null })) as never,
-      }).implement!({ cwd: process.cwd(), feature: 'x', runId: 'run-pty-fallback-observation' });
+      }).implement!({ cwd: implementCwd, feature: 'x', runId: 'run-pty-fallback-observation' });
       expect(result.summary).toContain('GOAL-COMPLETE');
     } finally {
       log.mockRestore();
@@ -907,11 +997,12 @@ describe('defaultSeams.implement — PTY 폴백 강등 관측', () => {
   it('PTY 성공 반환의 toolCalls 는 이미 센 값과 같다', async () => {
     const returned = await defaultSeams({
       ptyAvailable: () => true,
+      elanousBinRoot: implementBinRoot,
       runHeadlessGoalLoopPty: async () => ({
         ok: true, reachedCompletion: false, transcript: '화면',
         toolCalls: 0, timedOut: false, exitReason: 'child-exit', exitCode: 0, ptyId: 'pty-test',
       }),
-    }).implement({ cwd: process.cwd(), feature: 'x', runId: 'run-toolcalls-pty-return' });
+    }).implement({ cwd: implementCwd, feature: 'x', runId: 'run-toolcalls-pty-return' });
     expect(returned.toolCalls).toBe(0);
   });
 
@@ -919,10 +1010,11 @@ describe('defaultSeams.implement — PTY 폴백 강등 관측', () => {
     const transcript = 'head\n⏺ Bash(ls)\nGOAL-COMPLETE\n';
     const returned = await defaultSeams({
       ptyAvailable: () => false,
+      elanousBinRoot: implementBinRoot,
       spawnSync: ((_cmd: string, _args: readonly string[]) => ({
         status: 0, stdout: transcript, stderr: '', signal: null,
       })) as never,
-    }).implement({ cwd: process.cwd(), feature: 'x', runId: 'run-toolcalls-sync-return' });
+    }).implement({ cwd: implementCwd, feature: 'x', runId: 'run-toolcalls-sync-return' });
     expect(returned.toolCalls).toBe((transcript.match(/⏺\s+\w+\(/g) || []).length);
   });
 });

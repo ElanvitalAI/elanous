@@ -8,7 +8,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { spawn, spawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import * as nodeFs from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import ts from 'typescript';
 import { withTestHome } from '../../test/helpers/with-test-home.js';
 
 import {
@@ -27,6 +28,90 @@ import { HARNESS_SPACE_KINDS } from '../harness/harness-space.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
+
+// TEST-CLI-SPAWN-TIMEOUT — lint for the named files: every subprocess call (helpers included — a helper is checked where it
+// spawns, so a test that only calls the helper cannot hide it) carries an options object with `timeout` ≥ 60s, and a file
+// that spawns sets `setDefaultTimeout(≥ 60s)` so the test itself outlives its child (bun's 5 s default under Pod cold start).
+const SPAWN_TIMEOUT_LINT_FILES = ['src/cli/logs-cli.test.ts', 'src/seat-loop/seat-loop.test.ts',
+  'src/loops/registry-all.test.ts', 'src/loops/orchestrator/grid-place.test.ts', 'scripts/hq/standby-role.test.ts'];
+const SPAWN_CALLEES = new Set(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'exec', 'execSync']);
+const SPAWN_TIMEOUT_MIN_MS = 60_000;
+
+function numericLiteralMs(node: ts.Expression | undefined): number | undefined {
+  return node && ts.isNumericLiteral(node) ? Number(node.text.replace(/_/g, '')) : undefined;
+}
+
+/** Violations as `file:line: reason`. Pure over the source text (the self-test feeds it synthetic files). */
+function spawnTimeoutViolations(file: string, text: string): string[] {
+  const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
+  const line = (node: ts.Node) => source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
+  const violations: string[] = [];
+  // `const run = promisify(execFile)` makes `run(...)` a subprocess call too.
+  const aliases = new Set<string>();
+  const collect = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && ts.isCallExpression(node.initializer)
+      && ts.isIdentifier(node.initializer.expression) && node.initializer.expression.text === 'promisify'
+      && node.initializer.arguments[0] && ts.isIdentifier(node.initializer.arguments[0]) && SPAWN_CALLEES.has(node.initializer.arguments[0].text)) {
+      aliases.add(node.name.text);
+    }
+    ts.forEachChild(node, collect);
+  };
+  collect(source);
+  let spawns = 0;
+  let defaultTimeout: number | undefined;
+  const walk = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression;
+      const name = ts.isIdentifier(callee) ? callee.text
+        : ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression) && callee.expression.text === 'Bun' ? `Bun.${callee.name.text}` : undefined;
+      if (name === 'setDefaultTimeout') defaultTimeout = numericLiteralMs(node.arguments[0]);
+      if (name && (SPAWN_CALLEES.has(name) || aliases.has(name) || name === 'Bun.spawn' || name === 'Bun.spawnSync')) {
+        spawns++;
+        const timeouts = node.arguments.filter(ts.isObjectLiteralExpression)
+          .flatMap((options) => options.properties.filter((property): property is ts.PropertyAssignment =>
+            ts.isPropertyAssignment(property) && property.name.getText(source) === 'timeout'));
+        const ms = timeouts.length ? numericLiteralMs(timeouts[0]!.initializer) : undefined;
+        if (ms === undefined || ms < SPAWN_TIMEOUT_MIN_MS) {
+          violations.push(`${file}:${line(node)}: ${name}(…) without timeout ≥ ${SPAWN_TIMEOUT_MIN_MS}ms (${timeouts.length ? timeouts[0]!.initializer.getText(source) : 'none'})`);
+        }
+      }
+    }
+    ts.forEachChild(node, walk);
+  };
+  walk(source);
+  if (spawns > 0 && (defaultTimeout === undefined || defaultTimeout < SPAWN_TIMEOUT_MIN_MS)) {
+    violations.push(`${file}: spawns ${spawns}× but setDefaultTimeout(≥ ${SPAWN_TIMEOUT_MIN_MS}) is ${defaultTimeout ?? 'missing'}`);
+  }
+  return violations;
+}
+
+it('CLI spawn timeout lint: the named files spawn only with timeout ≥ 60s and a 60s test default', () => {
+  const violations = SPAWN_TIMEOUT_LINT_FILES.flatMap((file) =>
+    spawnTimeoutViolations(file, readFileSync(resolve(import.meta.dir, '../..', file), 'utf8')));
+  expect(violations).toEqual([]);
+});
+
+it('CLI spawn timeout lint catches a helper that spawns without a limit, even when the test only calls the helper', () => {
+  // The blind spot of the first draft (review must-fix): the spawn lives in a helper, the test body never names spawn.
+  const helper = [
+    "import { setDefaultTimeout, test } from 'bun:test';",
+    "import { spawnSync, execFile } from 'node:child_process';",
+    "import { promisify } from 'node:util';",
+    'setDefaultTimeout(60_000);',
+    "function runCli(args: string[]) { return spawnSync(process.execPath, ['bin/elanous.mjs', ...args], { encoding: 'utf8' }); }",
+    "const run = promisify(execFile);",
+    "test('x', async () => { runCli(['--version']); await run('bun', ['-e', '1'], { timeout: 5_000 }); });",
+  ].join('\n');
+  const found = spawnTimeoutViolations('src/loops/registry-all.test.ts', helper);
+  expect(found).toEqual([
+    expect.stringContaining('registry-all.test.ts:5: spawnSync(…) without timeout'),
+    expect.stringContaining('registry-all.test.ts:7: run(…) without timeout ≥ 60000ms (5_000)'),
+  ]);
+  // A file that spawns with a limit but leaves bun's 5 s test default is caught too.
+  expect(spawnTimeoutViolations('a.test.ts', "import { spawnSync } from 'node:child_process';\nspawnSync('bun', [], { timeout: 60_000 });"))
+    .toEqual([expect.stringContaining('setDefaultTimeout(≥ 60000) is missing')]);
+  expect(spawnTimeoutViolations('b.test.ts', "setDefaultTimeout(60_000);\nBun.spawnSync(['bun'], { timeout: 120_000 });")).toEqual([]);
+});
 
 describe('logs --top-failures', () => {
   it('uses the selected store and time window; default mode still renders individual lines', async () => {
@@ -763,7 +848,7 @@ describe('Pod child observation gap', () => {
       ], {
         cwd: process.cwd(),
         env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: stateDir, ELANOUS_CONFIG_DIR: stateDir },
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000,
       });
       let stdout = '';
       let stderr = '';
@@ -800,7 +885,7 @@ describe('Pod child observation gap', () => {
       });
       expect(json.stderr).not.toContain('Pod 에서 돈 런 2개');
     } finally { rmSync(home, { recursive: true, force: true }); }
-  }, 30_000);
+  }, 60_000);
 
   it('uses the first run-origin even when another event precedes it', () => {
     const home = realpathSync(mkdtempSync(join(tmpdir(), 'elanous-logs-pod-late-origin-')));
@@ -819,12 +904,12 @@ describe('Pod child observation gap', () => {
     try {
       const result = spawnSync(process.execPath, ['bin/elanous.mjs', 'logs', '--instance', 'prod', '--since', String(now - 60_000), '--until', String(now), '--event', 'pre-pr-sync'], {
         cwd: process.cwd(), env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: stateDir, ELANOUS_CONFIG_DIR: stateDir },
-        encoding: 'utf8', timeout: 30_000,
+        encoding: 'utf8', timeout: 60_000,
       });
       expect(result.status).toBe(0);
       expect(result.stderr).toContain('Pod 에서 돈 런 1개');
     } finally { rmSync(home, { recursive: true, force: true }); }
-  }, 30_000);
+  }, 60_000);
 
   it('counts selected registered instance ledgers without a logs.db, including when no store opens', async () => {
     const home = realpathSync(mkdtempSync(join(tmpdir(), 'elanous-logs-pod-no-db-')));
@@ -975,7 +1060,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
   /** 실물 진입점 — `bin/elanous.mjs logs` 가 같은 결과를 내는지(배선) 이 describe 에서 한 번 잰다. */
   function runLogsReal(args: string[], home: string, env: NodeJS.ProcessEnv = {}) {
     return spawnSync(process.execPath, ['bin/elanous.mjs', 'logs', ...args], {
-      cwd: process.cwd(), env: { ...process.env, HOME: home, TZ: 'UTC', ...env }, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
+      cwd: process.cwd(), env: { ...process.env, HOME: home, TZ: 'UTC', ...env }, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 60_000,
     });
   }
 
@@ -1028,7 +1113,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, 60_000);
 
   it('레지스트리 또는 대상 DB가 없으면 등록·안 본 스토어를 0으로 거짓 보고하지 않는다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-no-registered-store-'));
@@ -1355,7 +1440,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     new LogStore(dbPath).close();
     const child = spawn(process.execPath, ['bin/elanous.mjs', 'logs', '--instance', 'prod', '--follow'], {
-      cwd: process.cwd(), env: { ...process.env, HOME: home, TZ: 'UTC' }, stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: process.cwd(), env: { ...process.env, HOME: home, TZ: 'UTC' }, stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000,
     });
     let stderr = '';
     try {
@@ -1378,7 +1463,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       await new Promise<void>((resolve) => child.once('exit', () => resolve()));
       rmSync(home, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, 60_000);
 
   it('0건 --event 오타는 찍힌 가까운 이름을 stderr에만 내고 저장소 부재를 단정하지 않는다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-event-name-hint-'));
@@ -1936,7 +2021,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
-  });
+  }, 150_000);
 
   it('--json 상한 메타는 레코드 JSONL과 같은 완료 대기 stdout write에 포함된다', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'elanous-logs-json-limit-write-'));
@@ -2688,12 +2773,12 @@ describe('buildQuery — 옵션 → LogQuery', () => {
         localMidnight: buildQuery({ since: '2026-08-05 00:00' }).query.sinceMs,
       }));
     `], {
-      cwd: process.cwd(), env: { ...process.env, TZ: 'Asia/Seoul' }, encoding: 'utf8',
+      cwd: process.cwd(), env: { ...process.env, TZ: 'Asia/Seoul' }, encoding: 'utf8', timeout: 60_000,
     });
     expect(probe.status).toBe(0);
     const { dateOnly, localMidnight } = JSON.parse(probe.stdout);
     expect(dateOnly).toBe(localMidnight);
-  });
+  }, 60_000);
 
   it('무효 level/since/limit → error', () => {
     expect(buildQuery({ level: 'loud' }).error).toContain('--level');
@@ -3307,7 +3392,7 @@ describe('runLogsCli — remote /v1/logs', () => {
       }});
       writeFileSync(${JSON.stringify(portFile)}, String(srv.port));
     `);
-    const child = spawn(process.execPath, [serverJs], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [serverJs], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 180_000 });
     // ⛔ 조건이 t=0 에 «거짓»이어야 한다 — 포트 파일은 아직 없다.
     const deadline = Date.now() + 30_000;
     while (!existsSync(portFile) && Date.now() < deadline) await Bun.sleep(50);
@@ -3376,7 +3461,7 @@ describe('runLogsCli — remote /v1/logs', () => {
       }});
       writeFileSync(${JSON.stringify(join(home, 'port'))}, String(srv.port));
     `);
-    const server = spawn(process.execPath, [serverJs], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const server = spawn(process.execPath, [serverJs], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 180_000 });
     try {
       // 포트가 «생길 때까지» 기다린다 — ⛔ 조건이 t=0 에 거짓이어야 한다(파일이 아직 없다).
       const portFile = join(home, 'port');

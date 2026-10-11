@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { debug } from '../../debug/log.js';
-import { checkPodPool, genericConfigPodPool, measureMemberOccupancy, parsePodPool, PodPoolScheduler, preferredMembers, type PodPlacement, resolvePodPoolSpec, syncPoolImage, syncPoolImages, type MemberOccupancy, type RemoteRun } from './pod-pool.js';
+import { checkPodPool, genericConfigPodPool, measureMemberOccupancy, parsePodPool, PodPoolScheduler, POD_POOL_DEFAULT_CAPACITY, preferredMembers, type PodPlacement, resolvePodPoolSpec, syncPoolImage, syncPoolImages, type MemberOccupancy, type RemoteRun } from './pod-pool.js';
 import { podPlacementKind, podSelfImplementSpawn, type Kubectl } from './self-implement-pod.js';
 import { HostPoolLease } from '../../pod-lease/host-lease.js';
 import { loadRunLedger } from '../../self-implement/run-ledger.js';
@@ -12,12 +12,26 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
   test('parses context[@ssh][:capacity] in priority order', () => {
     expect(parsePodPool('pool-node-b@node-b:12, k3d-elanous-h1, pool-node-c@node-c:3')).toEqual([
       { context: 'pool-node-b', sshHost: 'node-b', capacity: 12, k3dCluster: 'elanous-pool' },
-      { context: 'k3d-elanous-h1', capacity: 2, k3dCluster: 'elanous-h1' },
+      // POD-POOL-UNCAPPED-SPEC — no `:N`: the default cap 2, marked as defaulted so admission can name it.
+      { context: 'k3d-elanous-h1', capacity: 2, capacityDefaulted: true, k3dCluster: 'elanous-h1' },
       { context: 'pool-node-c', sshHost: 'node-c', capacity: 3, k3dCluster: 'elanous-pool' },
     ]);
     expect(() => parsePodPool('a:0')).toThrow('상한은 1 이상');
     expect(() => parsePodPool('a,a')).toThrow('겹친다');
     expect(() => parsePodPool('bad node')).toThrow('못 읽는 노드');
+  });
+
+  test('POD-POOL-UNCAPPED-SPEC: a spec without `:N` carries the default cap 2 and says it was defaulted', () => {
+    expect(POD_POOL_DEFAULT_CAPACITY).toBe(2);
+    expect(parsePodPool('k3d-elanous-pool')).toEqual([
+      { context: 'k3d-elanous-pool', capacity: 2, capacityDefaulted: true, k3dCluster: 'elanous-pool' },
+    ]);
+    // An explicit `:2` is the operator's own number — no marker, so admission keeps saying `capacity`.
+    expect(parsePodPool('k3d-elanous-pool:2')).toEqual([
+      { context: 'k3d-elanous-pool', capacity: 2, k3dCluster: 'elanous-pool' },
+    ]);
+    expect(parsePodPool('pool-node-b@node-b:8,k3d-elanous-h1,pool-node-c@node-c:0').map((m) => [m.context, m.capacity, m.capacityDefaulted ?? false]))
+      .toEqual([['pool-node-b', 8, false], ['k3d-elanous-h1', 2, true]]);
   });
 
   test('two registry addresses stay attached to their members through lookup and build', async () => {
@@ -902,6 +916,28 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     expect(r.get('pool-node-c')!.detail).toContain('keychain locked');
     const again = await syncPoolImages(parsePodPool('pool-node-b@node-b:2'), 'img', 'new', { run, remoteBuild, ship });
     expect(again.get('pool-node-b')?.action).toBe('fresh');   // 같은 판이면 아무것도 안 한다
+  });
+
+  test('registry-less node-c build failure reaches the real ship/import check', async () => {
+    const target = 'target';
+    let remoteLabel = 'old';
+    let imports = 0;
+    const run: RemoteRun = (_host, cmd) => {
+      if (cmd.includes('docker inspect k3d-elanous-registry') || cmd.includes('/tags/list')) return { status: 1, stdout: '', stderr: '' };
+      if (cmd.startsWith('k3d image import')) {
+        imports++;
+        return { status: 1, stdout: '', stderr: "ERRO failed to delete tools node 'k3d-elanous-pool-tools': Error response from daemon: No such container: k3d-elanous-pool-tools" };
+      }
+      return { status: 0, stdout: remoteLabel, stderr: '' };
+    };
+    const result = await syncPoolImages(parsePodPool('pool-node-c@node-c:1'), 'img', target, {
+      run, remoteBuild: async () => ({ ok: false, detail: 'pack failed' }), waitMaxMs: 0,
+      inspect: () => ({ status: 0, stdout: target }),
+      transfer: () => { remoteLabel = target; return { status: 0, stderr: '' }; },
+    });
+    expect(imports).toBe(1);
+    expect(result.get('pool-node-c')).toMatchObject({ ok: true, action: 'shipped' });
+    expect(result.get('pool-node-c')!.detail).toContain('pack failed');
   });
 
   // 🩸 2026-10-06 MINIH-PACK: 멤버마다 build.sh 가 같은 트리에서 pack 을 동시에 돌려 한쪽이 «⛔ pack» 으로 빠졌다.

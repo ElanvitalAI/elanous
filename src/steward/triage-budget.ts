@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { debug } from '../debug/log.js';
 import type { TriageDecision, TriageIssue } from './triage.js';
+import { InvalidWorkingBackwardsDraft } from './working-backwards.js';
 
 export interface HashedTriageDecision extends TriageDecision {
   inputHash: string;
@@ -124,4 +125,65 @@ export async function triageWithinBudget({ issues, previous, judge, tracks, conc
   }
   debug.log('steward.triage', 'budget', stats);
   return { decisions, stats };
+}
+
+export interface CarriedDraft<T> {
+  wish: T;
+  /** `deadline` = never started before the stage deadline; `timeout` = per-item or stage deadline hit mid-draft. */
+  reason: 'timeout' | 'deadline' | 'error';
+}
+
+type DraftOutcome<T> = { kind: 'drafted' } | { kind: 'invalid' } | { kind: 'carried'; reason: CarriedDraft<T>['reason'] };
+
+export async function draftWithinBudget<T>({ wishes, draft, concurrency = 4, perItemMs = 120_000, deadlineMs = 240_000, now = Date.now }: {
+  wishes: T[];
+  /** `expired` rejects once this item's own deadline passes; drafts should race their slow calls against it. */
+  draft: (wish: T, expired: Promise<never>) => Promise<void>;
+  concurrency?: number;
+  perItemMs?: number;
+  deadlineMs?: number;
+  now?: () => number;
+}): Promise<{ drafted: T[]; carried: Array<CarriedDraft<T>>; invalid: T[]; stats: { drafted: number; carried: number; invalid: number } }> {
+  const end = now() + deadlineMs;
+  const slots = Number.isFinite(concurrency) ? Math.max(1, Math.floor(concurrency)) : 4;
+  const outcomes: Array<DraftOutcome<T> | undefined> = new Array(wishes.length);
+  let stageTimer: ReturnType<typeof setTimeout> | undefined;
+  const stageExpired = new Promise<void>(resolve => { stageTimer = setTimeout(resolve, Math.max(0, end - now())); });
+  const timedOut = Symbol('draft-timeout');
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (cursor < wishes.length) {
+      const remaining = end - now();
+      if (remaining <= 0) return;
+      const index = cursor++;
+      let itemTimer: ReturnType<typeof setTimeout> | undefined;
+      const expired = new Promise<never>((_, reject) => { itemTimer = setTimeout(() => reject(timedOut), Math.min(perItemMs, remaining)); });
+      // The draft may finish without ever racing this promise — never leave its rejection unhandled.
+      expired.catch(() => undefined);
+      const work = Promise.resolve().then(() => draft(wishes[index]!, expired));
+      const settled = work.then(() => undefined, () => undefined);
+      try {
+        await Promise.race([work, expired]);
+        outcomes[index] = { kind: 'drafted' };
+      } catch (error) {
+        outcomes[index] = error instanceof InvalidWorkingBackwardsDraft ? { kind: 'invalid' }
+          : { kind: 'carried', reason: error === timedOut ? 'timeout' : 'error' };
+        // A timed-out draft keeps its concurrency slot until the underlying call settles or the stage ends.
+        await Promise.race([settled, stageExpired]);
+      } finally { if (itemTimer) clearTimeout(itemTimer); }
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: Math.min(slots, wishes.length) }, () => worker()));
+  } finally { if (stageTimer) clearTimeout(stageTimer); }
+  const result = { drafted: [] as T[], carried: [] as Array<CarriedDraft<T>>, invalid: [] as T[] };
+  for (const [index, wish] of wishes.entries()) {
+    const outcome = outcomes[index];
+    if (outcome?.kind === 'drafted') result.drafted.push(wish);
+    else if (outcome?.kind === 'invalid') result.invalid.push(wish);
+    else result.carried.push({ wish, reason: outcome?.kind === 'carried' ? outcome.reason : 'deadline' });
+  }
+  const stats = { drafted: result.drafted.length, carried: result.carried.length, invalid: result.invalid.length };
+  debug.log('steward.triage', 'draft-budget', stats);
+  return { ...result, stats };
 }

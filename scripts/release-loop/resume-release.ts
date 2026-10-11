@@ -10,7 +10,7 @@ import { lastJsonObject, runGraph, type GraphRunState } from '../../src/graph-ru
 import { releaseRunUniverse } from './release-universe.js';
 import { isReleaseVersion } from './release-version.js';
 import { changedFilesBetween, clearPartialPlan, planPartialRegate, writePartialPlan } from './gate-partial.js';
-import { releaseResumeAcceptedRegressions, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
+import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
 
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
 
@@ -168,14 +168,19 @@ function savedGraphPath(statePath: string): string | undefined {
 }
 
 /** Refresh the branch tip, then restart the failed run at `from` with the saved graph snapshot. */
-export async function resumeReleaseRun(opts: { runId: string; from: string; partial?: boolean; waive?: string; reason?: string; acceptedRegressions?: AcceptedRegression[] }, deps: ResumeReleaseDeps = {}): Promise<{ tip: TipRefresh; partial: PartialOutcome; state: GraphRunState }> {
+export async function resumeReleaseRun(opts: { runId: string; from: string; partial?: boolean; waive?: string; reason?: string; acceptedRegressions?: AcceptedRegression[]; gateExecutor?: string; gateHost?: string }, deps: ResumeReleaseDeps = {}): Promise<{ tip: TipRefresh; partial: PartialOutcome; state: GraphRunState }> {
   if (opts.from === 'version-release') throw new Error('--from version-release would cut again — resume at a later node');
   // RELEASE-LEDGER-UNIVERSE: decide the universe once; the run lookup and every resumed node use it.
   deps = { ...deps, root: releaseRunUniverse({ root: deps.root }) };
   const statePath = join(deps.root!, 'graph-runs', 'release-loop', `${safeRunId(opts.runId)}.json`);
   let waiverCommit: string | undefined;
-  const original = opts.waive !== undefined || opts.reason !== undefined || opts.acceptedRegressions !== undefined
+  if (opts.gateHost !== undefined && opts.gateExecutor === undefined) throw new Error('--gate-host requires --gate-executor host');
+  const original = opts.waive !== undefined || opts.reason !== undefined || opts.acceptedRegressions !== undefined || opts.gateExecutor !== undefined
     ? JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState : undefined;
+  // GATE-HOST-EXECUTOR: checked before the tip refresh writes anything; the runner checks it again under the resume lock.
+  const gateExecutor = original && opts.gateExecutor !== undefined
+    ? releaseResumeGateExecutor(original, { from: opts.from, executor: opts.gateExecutor, host: opts.gateHost }) : undefined;
+  if (gateExecutor) debug.log('release-loop.resume', 'gate-executor', { runId: opts.runId, from: opts.from, executor: gateExecutor.set.gateExecutor, host: gateExecutor.set.gateRemote ?? null, previous: gateExecutor.previous });
   const waiver = original && (opts.waive !== undefined || opts.reason !== undefined)
     ? releaseResumeWaiver(original, opts) : undefined;
   const acceptedRegressions = original && opts.acceptedRegressions !== undefined && !waiver
@@ -202,6 +207,7 @@ export async function resumeReleaseRun(opts: { runId: string; from: string; part
   const state = await (deps.graph ?? runGraph)(graphPath, { resumeRunId: opts.runId, fromNodeId: opts.from, pinChildUniverse: true,
     ...(waiver ? { releaseWaiver: { ...waiver, requestedRegressions: opts.acceptedRegressions ?? [] } } : {}),
     ...(acceptedRegressions ? { releaseAcceptedRegressions: { requested: opts.acceptedRegressions!, acceptedRegressions } } : {}),
+    ...(gateExecutor ? { releaseGateExecutor: { executor: gateExecutor.set.gateExecutor, ...(opts.gateHost !== undefined ? { host: opts.gateHost } : {}) } } : {}),
     deps: { root: deps.root, ...(deps.runBash ? { runBash: deps.runBash } : {}) } });
   return { tip, partial, state };
 }

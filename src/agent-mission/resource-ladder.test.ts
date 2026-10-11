@@ -1,4 +1,7 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test, spyOn } from 'bun:test';
+import * as llm from '../llm.js';
+import { debug } from '../debug/log.js';
+import { setUserConfigOverlay } from '../user-config.js';
 import { generateIndexKeyPair, signIndex, verifyIndex, type MarketplaceIndex } from '../market/signed-index.js';
 import { OFFICIAL_INDEX_KEYS } from '../market/official-keys.js';
 import { planMissionResources, type ResourceLadderDeps } from './resource-ladder.js';
@@ -39,6 +42,19 @@ function fixture(overrides: Partial<ResourceLadderDeps> = {}): ResourceLadderDep
 }
 
 describe('planMissionResources', () => {
+  test('기본 inferNeeds 경로는 classify 역할 overlay 모델을 보낸다', async () => {
+    const stream = spyOn(llm, 'streamLLM').mockResolvedValue('{"needs":[]}');
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      setUserConfigOverlay(config => ({ ...config, roleLlm: { ...config.roleLlm, classify: { provider: 'gemini', model: 'resource-fixture' } } }));
+      const { inferNeeds: _injected, ...deps } = fixture({ readOfficialIndex: async () => { throw new Error('offline'); } });
+      const plan = await planMissionResources('Inspect resources', deps);
+      expect(plan.needs).toEqual([]);
+      expect(stream.mock.calls[0]?.[2]).toMatchObject({ model: 'resource-fixture', provider: llm.PROVIDERS.gemini, usageRole: 'classify', maxTokens: 200, temperature: 0 });
+      expect(log.mock.calls.find(([category, event]) => category === 'llm.role-pin' && event === 'resolved')?.[2])
+        .toMatchObject({ site: 'resource-ladder', role: 'classify', model: 'resource-fixture', provider: 'gemini', source: 'config-role' });
+    } finally { log.mockRestore(); stream.mockRestore(); setUserConfigOverlay(null); }
+  });
   test('signed official name mention selects elanous-basics and vocabulary contains the index labels', async () => {
     const basics: MarketplaceIndex = { ...index, plugins: [{
       ...index.plugins[0]!, name: 'elanous-basics',

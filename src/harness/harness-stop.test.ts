@@ -19,7 +19,7 @@ function fakeDeps(o: { record?: { pid: number; startedAt: number } | null; start
     kubeContexts: () => o.contexts ?? ['ctx-a'],
     kubectl: (args) => {
       kubectlCalls.push([...args]);
-      return { status: 0, stdout: Array.from({ length: o.jobs ?? 0 }, (_, n) => `job.batch/si-task-${n} deleted`).join('\n'), stderr: '' };
+      return { status: 0, stdout: Array.from({ length: o.jobs ?? 0 }, (_, n) => `job.batch/si-task-${n}`).join('\n'), stderr: '' };
     },
     namespace: 'elanous-test',
     graceMs: 1_000,
@@ -44,7 +44,7 @@ describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭�
       expect(r.runId).toBe(full);
       expect(formatHarnessStop(r).split('\n')[0]).toBe(`↳ run-4ce91e08 → ${full}(전체)`);
       expect(f.signals).toEqual([[4242, 'SIGTERM']]);
-      expect(f.kubectlCalls).toEqual([['--context', 'ctx-a', '-n', 'elanous-test', 'delete', 'job', '-l', `elanous.run=${full}`, '--wait=false']]);
+      expect(f.kubectlCalls).toEqual([['--context', 'ctx-a', '-n', 'elanous-test', 'delete', 'job', '-l', `elanous.run=${full}`, '--wait=false', '-o', 'name']]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -157,7 +157,7 @@ describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭�
     const r = await stopHarnessRun('run-abc', f.deps);
     expect(r.process).toBe('stopped');
     expect(f.signals).toEqual([[4242, 'SIGTERM']]);
-    expect(f.kubectlCalls).toEqual([['--context', 'ctx-a', '-n', 'elanous-test', 'delete', 'job', '-l', 'elanous.run=run-abc', '--wait=false']]);
+    expect(f.kubectlCalls).toEqual([['--context', 'ctx-a', '-n', 'elanous-test', 'delete', 'job', '-l', 'elanous.run=run-abc', '--wait=false', '-o', 'name']]);
     expect(r.jobsDeleted).toBe(2);
   });
 
@@ -353,5 +353,26 @@ describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭�
       expect(readPidRecordFrom(dir, 'run-bad')).toBeNull();
       expect(readPidRecordFrom(dir, 'run-missing')).toBeNull();
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+// 10-11: real `kubectl delete` prints «job.batch "<name>" deleted» (and «job.batch/<name>» with -o name) — the count read
+//   only the fake «job.batch/» form, so six real stops reported «0개 지움» while their Pods were Terminating.
+describe('harness stop — 실 kubectl 출력 꼴로 지운 Job 수를 센다', () => {
+  for (const [label, stdout] of [
+    ['-o name', 'job.batch/si-task-a\njob.batch/si-task-b\n'],
+    ['default', 'job.batch "si-task-a" deleted\njob.batch "si-task-b" deleted\n'],
+  ] as const) {
+    test(`${label} output counts 2`, async () => {
+      const f = fakeDeps({ record: null, starts: [null] });
+      f.deps.kubectl = () => ({ status: 0, stdout, stderr: '' });
+      const r = await stopHarnessRun('run-abc', f.deps);
+      expect(r.jobsDeleted).toBe(2);
+    });
+  }
+  test('«No resources found» counts 0', async () => {
+    const f = fakeDeps({ record: null, starts: [null] });
+    f.deps.kubectl = () => ({ status: 0, stdout: '', stderr: 'No resources found' });
+    expect((await stopHarnessRun('run-abc', f.deps)).jobsDeleted).toBe(0);
   });
 });

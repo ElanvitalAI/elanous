@@ -428,6 +428,80 @@ export interface VersionPruneOutcome {
   skipped?: string;
 }
 
+export interface RailSafeProcessListing {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  error?: Error;
+}
+
+export interface AssessRailSafeInput {
+  entries: ReadonlyArray<{ name: string; mtimeMs: number }>;
+  current: string;
+  daemonSha: string;
+  keep: number;
+  versionsDir: string;
+  listProcesses?: (pattern: string) => RailSafeProcessListing;
+  readProcessCommand?: (pid: string) => string | null;
+  isReleaseRunActive?: () => boolean;
+}
+
+/** Shadow probes must never stall the install: a hung pgrep/ps reads as «no process» (status null). */
+const RAIL_SAFE_PROBE_TIMEOUT_MS = 5_000;
+
+function pgrepProcesses(pattern: string): RailSafeProcessListing {
+  const result = spawnSync('pgrep', ['-f', pattern], { encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER, timeout: RAIL_SAFE_PROBE_TIMEOUT_MS });
+  return { status: result.status, stdout: result.stdout ?? '', stderr: result.error?.message ?? result.stderr ?? '', ...(result.error ? { error: result.error } : {}) };
+}
+
+function processCommand(pid: string): string | null {
+  const result = spawnSync('ps', ['-p', pid, '-o', 'command='], { encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER, timeout: RAIL_SAFE_PROBE_TIMEOUT_MS });
+  return result.status === 0 ? (result.stdout ?? '').trim() || null : null;
+}
+
+function listedProcessCommands(listing: RailSafeProcessListing, readCommand: (pid: string) => string | null): string[] {
+  if (listing.status !== 0) return [];
+  return listing.stdout.split(/\r?\n/).flatMap((line) => {
+    const entry = line.trim();
+    if (!entry) return [];
+    if (!/^\d+$/.test(entry)) return [entry];
+    const command = readCommand(entry);
+    return command ? [command] : [];
+  });
+}
+
+function pgrepPathPattern(path: string): string {
+  return path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Shadow-only observation: determine whether a prune plan targets an argv-held version or a release run is active. */
+export function assessRailSafe(input: AssessRailSafeInput): {
+  wouldBlock: boolean;
+  reasons: Array<'held-version' | 'release-run-active'>;
+  heldVersions: string[];
+  releaseRunActive: boolean;
+} {
+  const plan = planVersionPrune(input.entries, input.current, input.daemonSha, input.keep);
+  const listProcesses = input.listProcesses ?? pgrepProcesses;
+  const readCommand = input.readProcessCommand ?? processCommand;
+  const heldVersions = plan.removed.filter((name) => {
+    const path = join(input.versionsDir, name);
+    try {
+      return listedProcessCommands(listProcesses(pgrepPathPattern(path)), readCommand).some((argv) => argv.includes(path));
+    } catch { return false; }
+  });
+  let releaseRunActive = false;
+  try {
+    releaseRunActive = input.isReleaseRunActive?.() ?? listedProcessCommands(
+      listProcesses('release[[:space:]]+(run|resume)'), readCommand,
+    ).some((argv) => /release\s+(?:run|resume)/.test(argv));
+  } catch { releaseRunActive = false; }
+  const reasons: Array<'held-version' | 'release-run-active'> = [];
+  if (heldVersions.length) reasons.push('held-version');
+  if (releaseRunActive) reasons.push('release-run-active');
+  return { wouldBlock: reasons.length > 0, reasons, heldVersions, releaseRunActive };
+}
+
 /**
  * 야간 자동 설치는 하룻밤에 한 판(약 641MB · 2026-09-24 실측)을 쌓는다. 설치기는 옛 판을 안 지운다.
  * 남기는 것: `current` 가 가리키는 판 · 지금 데몬이 도는 판(판정의 `from` sha) · 최근 `keep` 판(롤백용).
@@ -664,6 +738,12 @@ export interface ReleaseUpdateDeps {
   listPruneProcesses?: ProcessListing;
   /** Per-process cwd/executable probe; when absent the host's lsof is used. */
   scanPruneProcess?: ProcessScan;
+  /** Shadow-only rail-safe process listing override. */
+  listRailSafeProcesses?: (pattern: string) => RailSafeProcessListing;
+  /** Resolves pgrep's PID-only output to a command line; defaults to `ps -p <pid> -o command=`. */
+  readRailSafeProcessCommand?: (pid: string) => string | null;
+  /** Shadow-only release-run detector override. */
+  isReleaseRunActive?: () => boolean;
   /** 릴리스 기준 URL 주입 — 환경변수와 설치 출처보다 우선한다. */
   releaseBase?: string;
 }
@@ -740,10 +820,14 @@ export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps:
   }
   let previous = '';
   let previousBuild = '';
+  let previousCommit = '';
   let replacedDev: { from: string; to: string } | null = null;
   try {
     const metadata: unknown = JSON.parse(readFileSync(join(prefix, 'install.json'), 'utf8'));
     previousBuild = installedBuild(metadata);
+    if (typeof metadata === 'object' && metadata !== null && typeof (metadata as { commit?: unknown }).commit === 'string') {
+      previousCommit = (metadata as { commit: string }).commit;
+    }
     if (typeof metadata === 'object' && metadata !== null && (metadata as { channel?: unknown }).channel === 'dev') {
       const fromDir = typeof (metadata as { versionDir?: unknown }).versionDir === 'string' ? (metadata as { versionDir: string }).versionDir : '';
       replacedDev = { from: fromDir, to: '' };
@@ -757,6 +841,26 @@ export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps:
     const result = spawnSync(command, args, { cwd, encoding: 'utf8', input, maxBuffer: SPAWN_MAX_BUFFER, env: { ...process.env, ...env, PATH: childPath() } });
     return { status: result.status, stderr: result.error?.message ?? result.stderr ?? '' };
   });
+  let railSafeEntries: Array<{ name: string; mtimeMs: number }> = [];
+  try {
+    railSafeEntries = readdirSync(join(prefix, 'versions'), { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => ({ name: entry.name, mtimeMs: statSync(join(prefix, 'versions', entry.name)).mtimeMs }));
+  } catch { /* shadow observation cannot change the install decision */ }
+  let railSafe: ReturnType<typeof assessRailSafe> = { wouldBlock: false, reasons: [], heldVersions: [], releaseRunActive: false };
+  try {
+    railSafe = assessRailSafe({
+      entries: railSafeEntries,
+      current: previous,
+      daemonSha: previousCommit,
+      keep: options.keep ?? 3,
+      versionsDir: join(prefix, 'versions'),
+      ...(deps.listRailSafeProcesses ? { listProcesses: deps.listRailSafeProcesses } : {}),
+      ...(deps.readRailSafeProcessCommand ? { readProcessCommand: deps.readRailSafeProcessCommand } : {}),
+      ...(deps.isReleaseRunActive ? { isReleaseRunActive: deps.isReleaseRunActive } : {}),
+    });
+  } catch { /* shadow observation cannot change the install decision */ }
+  try { debug.log('self-update.rail-safe', 'shadow', railSafe); } catch { /* shadow observation never changes update decisions */ }
   try {
     const install = run('bash', ['-s', '--', '--no-modify-path', '--prefix', prefix], prefix, installer, envLiteral({ ELANOUS_VERSION: version ?? '', ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: base }));
     if (install.status !== 0) return fail(1, `설치 실패: ${install.stderr.trim() || install.status}`);

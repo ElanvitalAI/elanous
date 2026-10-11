@@ -31,7 +31,8 @@ export {
   type PrEvidenceInput,
 } from './pr-evidence-artifact.js';
 import { judgePredictionAccuracy } from './judge-prediction-accuracy.js';
-import { classifyPodReviewBudgetResidue, measureReviewFindingRecurrence, type ReviewFindingRecurrence } from './review-finding-recurrence.js';
+import { classifyPodReviewBudgetResidue, measureReviewFindingRecurrence, type ReviewFindingRecurrence, type RecurrenceFinding } from './review-finding-recurrence.js';
+import type { ReviewRework } from '../self-dev/run-types.js';
 import { createHash } from 'node:crypto';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { writeGoalDocumentAtomic } from './goal-document-write.js';
@@ -80,7 +81,7 @@ import { releasePathHold, releasePathHoldComment, RELEASE_PATH_LABEL } from '../
 import { emitDecision } from '../live/detail-switch.js';
 import { reworkDecision } from './decision-events.js';
 import type { LogSink } from '../mss/logging/sink.js';
-import type { LogQuery, LogStoreRow } from '../mss/logging/log-store.js';
+import { LogStore, logsDbPath, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
 import { refreshCodexQuotaSignals } from '../budget/codex-quota-refresh.js';
 import { inspectActiveProvider, type ActiveProviderInfo } from '../provider-summary.js';
 import { recordHitlEvent } from '../self-dev/hitl-log.js';
@@ -151,6 +152,7 @@ export { slugifyFeature } from '../harness/worktree-branch-prefix.js';
 import { AUTO_REVIEW_LABEL, resolveAutoReviewLabels } from './context-capsule.js';
 import { GOAL_TYPES, extractVerbatimOriginalAsk, leadingGoalMetadata, parseAskFile, parseGoalType, type GoalType } from './goal-author.js';
 import { renderRoundSummaryCard, type RoundSummaryEntry } from './round-summary-card.js';
+import { computeFlexSignals } from './flex-signals.js';
 import { resolveAdaptiveMaxReworkDecision, resolveEscalateTier, resolveEscalateTarget, buildReworkFeature, failIndicator, isRepeatedUnverifiedOnlyGateFailure, unverifiedRepeatKey, appendReworkHistory, truncateReworkHistoryByItem, applyReworkBudgetDecision, parseContractConflictRelaxation, parseReworkBudgetDecision, resolveReworkBudgetCarry, stripReworkBudgetHeaders, countConsecutiveMustFixIds, mergeReworkNotes, resolveReworkKind, type ReworkPlanRevision, type ReworkNotePart } from './rework-policy.js';
 import type { SupervisionReworkSource } from './supervision-vocabulary.js';
 import { classifyReworkBudgetShadow } from './classify-shadow.js';
@@ -246,11 +248,12 @@ import { persistReviewArtifact, type ReviewArtifactWriter } from '../agent-subst
 import { createArtifactStore } from '../artifact/index.js';
 import { mapStageToRunStatus, type SelfImplementStage } from './run-status-mapping.js';
 import type { LifecycleScreenComparison } from './lifecycle-screen-scoreboard.js';
+import { buildRuntimeOverlayState } from './graph-overlay-condition.js';
 import { activeTemplate, decideTemplate, graphAuthorityFields, nodeNameForStage, overlayDecisionObservation, resolveGraphAuthorityForUserConfig, routeGate, visitBudgetOf } from './graph-authority.js';
 import type { GraphTemplate } from './graph-templates.js';
 import { defaultOverlaysDir, loadGraphOverlays, type GraphOverlaySpec } from './graph-overlay-yaml.js';
-import { graphIdentityOf, pipelineNodeEntryPayload } from './graph-templates.js';
-import { AMBIGUOUS_STAGES, checkPipelineTraversal, nodesForStage, pipelineGraphIdentity, type PipelineNodeId, type PipelineTraversalCheck } from './pipeline-shape.js';
+import { graphIdentityOf, measureL0Coverage, pipelineNodeEntryPayload } from './graph-templates.js';
+import { AMBIGUOUS_STAGES, checkPipelineTraversal, nodesForStage, pipelineGraphIdentity, TERMINAL_STAGES_BY_NODE, type PipelineNodeId, type PipelineTraversalCheck } from './pipeline-shape.js';
 import { appendGateWorktreeFreshnessEvidence, gateEvidenceNote } from '../harness/review-adapter.js';
 import { diffHeaderPaths } from '../agent-substrate/self-review-cli.js';
 import { format as formatPrComment, type PrCommentRole } from '../agent-substrate/pr-comment-meta.js';
@@ -786,7 +789,9 @@ function changedFileIsInsideDeclaredTarget(changedFile: string, declaredPath: st
   const target = normalizeDeclaredScopePath(declaredPath);
   if (!file || !target) return false;
   return file === target || file.startsWith(`${target}/`)
-    || (target.endsWith('.ts') && !target.endsWith('.test.ts') && file === `${target.slice(0, -3)}.test.ts`);
+    || (target.endsWith('.ts') && !target.endsWith('.test.ts') && file === `${target.slice(0, -3)}.test.ts`)
+    // SCOPE-LOCKFILE-PAIR — 선언한 package.json 을 고치면 같은 폴더의 bun.lock 이 따라 바뀐다(10-11 TSGO-TRIAL 이 bun.lock 하나로 보류).
+    || ((target === 'package.json' || target.endsWith('/package.json')) && file === `${target.slice(0, -'package.json'.length)}bun.lock`);
 }
 
 function parseDeclaredTargetPathsFromAsk(askText: string): { readable: boolean; paths: readonly string[] } {
@@ -803,10 +808,20 @@ function parseDeclaredTargetPathsFromAsk(askText: string): { readable: boolean; 
   return { readable: true, paths: [...new Set(paths.filter(Boolean))] };
 }
 
+// SCOPE-NEW-FILES-LINE — 칸 문면은 새로 만들 파일을 «신설:» 줄로 따로 적는다(OP D칸 규칙). 그 줄도 선언 범위다.
+//   10-11 FLEX-SIGNALS run-95799887: 칸이 적은 신설 파일 둘을 «범위 밖»으로 세어 구현을 보류했다.
+const DECLARED_NEW_FILES_LINE = /^\s*(?:신설|new\s*files?)\s*[:：]\s*(.*)$/i;
+
 function declaredPathsFromGoalDocumentText(document: string): { readable: boolean; paths: readonly string[] } {
   const originalAsk = extractVerbatimOriginalAsk(document)?.ask ?? null;
   if (originalAsk === null) return { readable: false, paths: [] };
-  return parseDeclaredTargetPathsFromAsk(originalAsk);
+  const declared = parseDeclaredTargetPathsFromAsk(originalAsk);
+  if (!declared.readable) return declared;
+  const newFiles = originalAsk.split(/\r?\n/).flatMap((line) => {
+    const match = DECLARED_NEW_FILES_LINE.exec(line);
+    return match ? parseDeclaredTargetPathsFromAsk(`대상 경로: ${match[1]}`).paths : [];
+  });
+  return newFiles.length > 0 ? { readable: true, paths: [...new Set([...declared.paths, ...newFiles])] } : declared;
 }
 
 /** Only paths explicitly designated as targets in the ask or piece text protect an intentional revert. */
@@ -2280,6 +2295,7 @@ export interface SelfImplementResult {
   branch?: string;
   gate?: SelfImplementGateResult;
   review?: SelfImplementReview;
+  rework?: ReviewRework;
   /** Worktree commit observed while this review ran; not inferred from the later PR head. */
   reviewedHeadCommit?: string;
   completionDisposition?: SelfImplementCompletionDisposition;
@@ -3569,6 +3585,29 @@ async function autohealRecordedStop(stopEntry: RunLedgerEntry, s: SelfImplementS
   }
 }
 
+export function measureReviewRework(counts: readonly number[], findings: readonly (readonly RecurrenceFinding[])[]): ReviewRework {
+  const deltas = counts.slice(1).map((count, index) => Math.sign(count - counts[index]!));
+  const directions = deltas.filter((delta) => delta !== 0);
+  const seen = new Set<string>();
+  let resurfaced = false;
+  for (let index = 0; index < findings.length; index++) {
+    const ids = new Set(findings[index]!.map((finding) => finding.id));
+    if (index > 0 && [...ids].some((id) => seen.has(id) && !findings[index - 1]!.some((finding) => finding.id === id))) {
+      const prior = findings.slice(0, index - 1).reverse().find((round) => round.some((finding) => ids.has(finding.id)));
+      if (prior && measureReviewFindingRecurrence(findings[index], prior)?.normalizedRepeatedReviewFindingCount) resurfaced = true;
+    }
+    for (const id of ids) seen.add(id);
+  }
+  const trend: ReviewRework['trend'] = resurfaced || directions.some((delta) => delta !== directions[0])
+    ? 'oscillating'
+    : counts.length < 2 ? 'unmeasured'
+    : deltas.every((delta) => delta < 0) ? 'improving'
+    : deltas.every((delta) => delta === 0) ? 'stable'
+    : counts.at(-1)! > counts[0]! && deltas.every((delta) => delta >= 0) ? 'worsening'
+    : 'stable';
+  return { trend, signature: [...new Set((findings.at(-1) ?? []).map((finding) => finding.id))].sort().join(','), rounds: counts.length };
+}
+
 export async function runSelfImplement(opts: SelfImplementOptions): Promise<SelfImplementResult> {
   if (opts.childLlm && (typeof opts.childLlm.provider !== 'string' || !opts.childLlm.provider.trim() || typeof opts.childLlm.model !== 'string' || !opts.childLlm.model.trim())) {
     throw new Error('childLlm.provider and childLlm.model must both be non-empty');
@@ -3633,6 +3672,13 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
   let roundCount = 0;
   let lastTier: EscalateTier | undefined;
   let lastReviewFindings: string[] | undefined;
+  let measuredRework: ReviewRework | undefined;
+  const withMeasuredRework = (result: SelfImplementResult): SelfImplementResult => {
+    if (!measuredRework) return result;
+    const classification = result.abandonedClassification?.classification;
+    // An empty must-fix set stays an empty signature: a bare classification prefix would make two clean reviews «match».
+    return { ...result, rework: { ...measuredRework, signature: `${classification && measuredRework.signature ? `${classification}:` : ''}${measuredRework.signature}` } };
+  };
   let reviewFindingRoundCount = 0;
   const verbatimReviewFindingOccurrences = new Map<string, number>();
   const normalizedReviewFindingFirstSeenRounds = new Map<string, number>();
@@ -3982,6 +4028,62 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
   const finalizeTraversal = (): void => {
     if (traversalFinalized) return;
     traversalFinalized = true;
+    if (terminalResult?.ok && runGraphTemplate?.graphId === 'self-implement') {
+      const entered = new Set<string>(traversedNodes);
+      let journeyRowsRead = false;
+      const path = logsDbPath();
+      if (existsSync(path)) {
+        let store: LogStore | undefined;
+        try {
+          store = LogStore.openReadOnly(path);
+          const join = journeyJoinFields();
+          const rows = [
+            ...store.queryByDataKeys({ exactCategories: ['self-implement'], runIds: [runId] }),
+            ...(join.journeyKey ? store.queryAll({ exactCategories: ['self-implement'], events: ['pipeline-node-entry'], grep: join.journeyKey }) : []),
+            ...(join.queueLaunchId ? store.queryAll({ exactCategories: ['self-implement'], events: ['pipeline-node-entry'], grep: join.queueLaunchId }) : []),
+          ];
+          for (const row of rows) {
+            if (row.event !== 'pipeline-node-entry' || !row.data) continue;
+            let data: { runId?: string; journeyKey?: string; queueLaunchId?: string; graphId?: string; graphVersion?: string; node?: string; phase?: string };
+            try { data = JSON.parse(row.data); } catch { continue; }
+            const sameRun = data.runId === runId || (data.runId === undefined && (
+              (join.journeyKey !== undefined && data.journeyKey === join.journeyKey)
+              || (join.queueLaunchId !== undefined && data.queueLaunchId === join.queueLaunchId)
+            ));
+            if (sameRun && data.phase === 'journey' && data.graphId === runGraphTemplate.graphId && data.graphVersion === runGraphTemplate.version && typeof data.node === 'string') {
+              entered.add(data.node);
+              journeyRowsRead = true;
+            }
+          }
+        } catch { /* observation failure must not fail the run */ }
+        finally { store?.close(); }
+      }
+      // Only nodes this process runs (TERMINAL_STAGES_BY_NODE) can be «skipped» with certainty:
+      // their non-entry here means the condition was false. Nodes run by other processes
+      // (author · intake · dispatch · pod …) that were not joined stay «unjoined» — not
+      // skipped and not accounted — so the walk ratio can fall below 1.0.
+      const skipped = new Set<string>();
+      const unjoined: string[] = [];
+      for (const node of runGraphTemplate.nodes) {
+        if (entered.has(node.nodeId)) continue;
+        if (!Object.hasOwn(TERMINAL_STAGES_BY_NODE, node.nodeId)) { unjoined.push(node.nodeId); continue; }
+        const condition = node.nodeId === 'rework' ? 'gate/review passed'
+          : node.nodeId === 'main-sync' || node.nodeId === 'regate' ? 'mergeMain && commitWork'
+          : 'completion disposition';
+        observeOuter('node-skipped', {
+          ...graphIdentityOf(runGraphTemplate), ...journeyJoinFields(),
+          node: node.nodeId, reason: 'condition', condition,
+        }, { category: 'graph.path' });
+        skipped.add(node.nodeId);
+      }
+      const coverage = measureL0Coverage(runGraphTemplate, entered, skipped);
+      observeOuter('l0-coverage', {
+        ...graphIdentityOf(runGraphTemplate), ...journeyJoinFields(),
+        ...coverage,
+        journeyRowsRead,
+        unjoinedNodes: unjoined,
+      }, { category: 'graph.path' });
+    }
     try {
       const checked = terminalNode
         ? (opts.seams.checkPipelineTraversal ?? checkPipelineTraversal)(traversedNodes, terminalNode)
@@ -4147,6 +4249,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       },
       observeRoundExecution,
       observeReviewFindings,
+      (rework) => { measuredRework = rework; },
       setRunGraphIdentity,
       (template) => { runGraphTemplate = template; },
       // ⭐ 「요구 증거 충족」을 받아 결과에 실어 원장까지 나른다(`JDG-T60`)
@@ -4200,7 +4303,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
     if (lastCredentialFailure) {
       observeOuter('credential-failure-observed', { count: credentialFailureCount, ...lastCredentialFailure });
     }
-    terminalResult = withEvidenceCoverage(addressedResult);
+    terminalResult = withEvidenceCoverage(withMeasuredRework(addressedResult));
     // runSelfImplement is the terminal caller: retain every existing PR/ledger/log observation and append one stop fact.
     if ((addressedResult.stage === 'aborted' || (addressedResult.mergeReason && addressedResult.mergeReason !== 'auto')) && !runStopRecorded(runId)) {
       const reason = addressedResult.mergeReason;
@@ -4263,7 +4366,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
     });
     observeRunRollup(observeOuter, addressedResult, roundClassifications, roundCount, capturedPrNumber, openPrInvoked);
     observeProgressDelivery();
-    return addressedResult;
+    return terminalResult;
   } catch (e) {
     if (e instanceof StepTimeoutError) {
       observeOuter('step-timeout', { step: e.step, ms: e.ms, branch, feature: opts.feature.slice(0, 80) }, { level: 'warn' });
@@ -4296,7 +4399,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       if (lastCredentialFailure) {
         observeOuter('credential-failure-observed', { count: credentialFailureCount, ...lastCredentialFailure });
       }
-      terminalResult = addressedResult;   // ⛔ 이 분기(StepTimeoutError)는 스코프가 달라 부착 헬퍼가 «안 보인다» — 타임아웃 런은 달성 근사값이 «없다»(0 으로 채우지 않는다)
+      terminalResult = withMeasuredRework(addressedResult);   // ⛔ 이 분기(StepTimeoutError)는 스코프가 달라 달성 근사값은 «없다»(0 으로 채우지 않는다)
       observeDeclaredScopeDiff(observeOuter, {
         goalFile: opts.goalFile,
         changedFiles: opts.goalFile && addressedResult.worktreePath
@@ -4338,7 +4441,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       });
       observeRunRollup(observeOuter, addressedResult, roundClassifications, roundCount, capturedPrNumber, openPrInvoked);
       observeProgressDelivery();
-      return addressedResult;
+      return terminalResult;
     }
     recordHitlEvent({
       kind: 'escalation',
@@ -4767,6 +4870,7 @@ async function runSelfImplementInner(
   onWorktreeCreated: (path: string) => void = () => {},
   onRoundExecution: (tier: EscalateTier) => void = () => {},
   onReviewFindings: (round: number, mustFix: readonly string[]) => void = () => {},
+  onReworkMeasured: (rework: ReviewRework) => void = () => {},
   /** ⭐ 이 런이 «따르는» 그래프 신원 — 맥락이 정해진 «직후» 한 번 불린다.
    *  ⛔ 이것이 없으면 걸음은 YAML 을 따르고 «신원은 옛 TS 상수»를 따라 둘이 갈린다. */
   onGraphResolved: (identity: { graphId: string; graphVersion: string }) => void = () => {},
@@ -4858,9 +4962,11 @@ async function runSelfImplementInner(
     writeFileSync(graphFile, stringify({
       graph_id: variantSpec.graphId, version: variantSpec.version,
       entry_node: variantSpec.entryNode, terminal_nodes: variantSpec.terminalNodes,
+      ...(variantSpec.journeyStages ? { journey_stages: variantSpec.journeyStages } : {}),
       ...(variantSpec.runContract ? { run_contract: variantSpec.runContract } : {}),
       nodes: variantSpec.nodes.map(n => ({
         node_id: n.nodeId, kind: n.kind, recipe: n.recipe, max_visits: n.maxVisits,
+        ...(n.journeyStage ? { journey_stage: n.journeyStage } : {}),
         ...(n.progress ? { progress: n.progress } : {}), ...(n.phases ? { phases: n.phases } : {}),
         ...(n.terminalStages ? { terminal_stages: n.terminalStages } : {}),
         ...(n.fanOut ? { fan_out: n.fanOut } : {}), ...(n.contract ? { contract: n.contract } : {}),
@@ -4907,12 +5013,12 @@ async function runSelfImplementInner(
       const lastStop = entries?.slice().reverse().find((entry) => entry.event === 'stop');
       if (lastStop && isRunStopClass(lastStop.data.class)) stopClass = readRunStopRecord(lastStop)?.class;
     } catch { /* Unreadable STOP-RECORD is unknown, not an invented class. */ }
-    const runtimeOverlayState = {
+    const runtimeOverlayState = buildRuntimeOverlayState({
       attempts: round,
-      ...(opts.goalId === undefined ? {} : { goal_id: opts.goalId }),
-      ...(stopClass === undefined ? {} : { stop_class: stopClass }),
-      ...(reviewRepeat === undefined ? {} : { review_repeat: reviewRepeat }),
-    };
+      ...(opts.goalId === undefined ? {} : { goalId: opts.goalId }),
+      ...(stopClass === undefined ? {} : { stopClass }),
+      ...(reviewRepeat === undefined ? {} : { reviewRepeat }),
+    });
     const decision = decideTemplate({
       goalType: graphGoalType,
       authority: graphAuthority,
@@ -5266,6 +5372,8 @@ async function runSelfImplementInner(
   /** Review-budget leftovers and the body that carried them, so a later merge drafts from the same text. */
   let preparedReviewBudgetPrBody: string | undefined;
   const reviewMustFixCountHistory: number[] = [];
+  const reviewedFindings: RecurrenceFinding[][] = [];
+  const structuredRework = (): ReviewRework => measureReviewRework(reviewMustFixCountHistory, reviewedFindings);
   const reviewMustFixTrend = (): string => {
     if (reviewMustFixCountHistory.length < 2) return '아직 못 잰다';
     return reviewMustFixCountHistory.every((count, index) => index === 0 || count < reviewMustFixCountHistory[index - 1]!)
@@ -6777,6 +6885,25 @@ async function runSelfImplementInner(
         ...(repeatedWithRound === undefined ? {} : { repeatedWithRound }), omittedRounds,
       }, { category: 'self-dev.rework' });
     }
+    if (round > 0) {
+      // ⛔ 관측 전용 — 계산은 순수 함수가, 기록은 `observe`(= 런 원장)가 한다. 판정·분기·오버레이 상태는 건드리지 않는다.
+      try {
+        const latestEntry = roundSummaryEntries[roundSummaryEntries.length - 1];
+        const gateRoundIds = latestEntry?.kind === 'gate'
+          ? roundSummaryEntries.filter((entry) => entry.kind === 'gate').map((entry) => entry.failedIds)
+          : [];
+        observe('flex-signals', {
+          round,
+          ...computeFlexSignals({
+            gateFailedIdsByRound: gateRoundIds,
+            failureAttributions: reworkKind === 'gate' ? gate.baselineFailures?.map(({ attribution }) => attribution) : undefined,
+            reviewRepeat,
+            round,
+            plannedRounds: effectiveMax,
+          }),
+        });
+      } catch { /* observation must not interrupt rework */ }
+    }
     const refutationGuidanceEligible = round > 0 && refutableFindings.length > 0;
     const dispatchedRefutationGuidance = refutationGuidancePresented(feature, refutationGuidanceEligible);
     pendingPlanRevision = undefined;
@@ -7518,6 +7645,8 @@ async function runSelfImplementInner(
       });
       if (review.reviewed) {
         reviewMustFixCountHistory.push(review.mustFix.length);
+        reviewedFindings.push(review.mustFix.map((item) => ({ id: stableMustFixId(item), item })));
+        onReworkMeasured(structuredRework());
         // The next runtime overlay sees completed review rounds, not consecutive repeats of one finding.
         reviewRepeat = reviewMustFixCountHistory.length - 1;
       }

@@ -1,0 +1,38 @@
+id: openrouter/deepseek/deepseek-v4.1-flash
+provider: openrouter
+displayName: DeepSeek V4.1 Flash (OpenRouter)
+family: deepseek-v4
+# ⭐ 2026-10-11 MK(CATALOG-DEEPSEEK-FLASH) — 손 레코드(근거는 deepseek-v4-pro-0813.yaml 머리말과 같다).
+# 🔌 상류 = deepinfra/fp8 (DeepSeek 공식 아님 · 계정 Guardrails 로 공식 엔드포인트 차단 ·
+#    UX #26061 `llm.openrouter.upstreamPins` 기본값과 짝). ⇒ 아래 값은 «실제로 도는 상류»의 값이다.
+# 📏 수치 출처 — OpenRouter 공개 API 실호출 2026-10-10T20:08Z (인증 없음):
+#   GET /api/v1/models/deepseek/deepseek-v4.1-flash/endpoints — tag `deepinfra/fp8`(deepseek-v4.1-flash-20260910 · quantization fp8):
+#     context_length 1048576 · max_completion_tokens 131072 · uptime_last_30m 100 · reasoning·reasoning_effort·tools 지원
+#     청구가 prompt $0.14 · completion $0.42 · input_cache_read $0.0042 /MTok · discount 0.3 · 시간대 가산(overrides) 없음
+# 💲 ⚠️ 판촉 할인 중이다(discount 0.3 · 2026-10-11 실측). `pricing` 칸에는 «정가»를 적는다.
+#    정가 = 청구가 / (1 − 0.3) → $0.20 / $0.60 · 캐시 $0.006. API 가 정가를 직접 주지 않아 계산한 값이다
+#    (같은 규칙으로 StreamLake·Baidu 의 할인가를 되돌리면 목록가 $0.30 과 맞는다).
+#    할인가(지금 실제 청구): $0.14 / $0.42 · 캐시 $0.0042 — 2026-10-11.
+contextSize: 1048576
+outputMaxTokens: 131072
+# 입력 모달리티 text+image (architecture.input_modalities)
+vision: images
+# 기본 effort — OR supported_parameters 에 reasoning_effort 가 있다. 관례(flash 계열 = medium · gemini-3.5-flash·gpt-5.4-mini)를 따른다.
+#   ⚠️ xhigh·max 접힘은 UX OR-DEEPSEEK-TUNE 몫.
+reasoning: medium
+toolCalling: native-openai
+streamingProtocol: sse
+pricing:
+  inputPerMTok: 0.20
+  outputPerMTok: 0.60
+  cachedInputPerMTok: 0.006
+deprecated: null
+tokenizer: unknown
+kind: chat
+# 출시일 — 엔드포인트 이름의 날짜(deepseek-v4.1-flash-20260910) · /api/v1/models `created` 도 2026-09-10(UTC).
+releaseDate: 2026-09-10
+discoveryMeta:
+  source: manual
+  lastSeen: 2026-10-11
+  autoFilled: false
+  confidence: high

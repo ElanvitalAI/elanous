@@ -561,6 +561,24 @@ class DebugLog {
     for (const summary of summaries) this.log('log.diet', 'suppressed', summary);
   }
 
+  /** LOG-DIET-2 — summaries are now spaced by the diet window, so a short-lived process could exit
+   *  holding folded counts. On the first suppression we arm one exit drain that force-releases them
+   *  (and flushes the sinks synchronously) so a held-back release never drops a count at shutdown. */
+  private _logDietExitArmed = false;
+  private armLogDietExitDrain(): void {
+    if (this._logDietExitArmed) return;
+    this._logDietExitArmed = true;
+    const drain = (): void => { try { this.drainLogDietPending(); } catch { /* exit path must not throw */ } };
+    process.once('beforeExit', drain);
+    process.once('exit', drain);
+  }
+
+  /** Force-release every pending diet summary (ignores the summary interval) and flush sinks. */
+  drainLogDietPending(): void {
+    if (this._logDietGuard) this.emitLogDietSummaries(this._logDietGuard.flushPending(true));
+    this.flush();
+  }
+
   /** Force any buffered events to disk immediately. */
   flush(): void {
     if (this._logDietGuard) this.emitLogDietSummaries(this._logDietGuard.flushPending());
@@ -615,7 +633,7 @@ class DebugLog {
     if (this._logDietGuard) {
       const decision = this._logDietGuard.admit(rec);
       this.emitLogDietSummaries(decision.summaries);
-      if (!decision.pass) return;
+      if (!decision.pass) { this.armLogDietExitDrain(); return; }
     }
 
     // Ring buffer — always populated when at least one sink is live so

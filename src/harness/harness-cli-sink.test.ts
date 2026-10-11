@@ -274,6 +274,7 @@ describe('harness CLI sink hook', () => {
       '--pod-memory',
       '--after',
       '--source',
+      '--bench',
     ]);
   });
 
@@ -368,6 +369,7 @@ describe('harness CLI sink hook', () => {
       '--pod-memory',
       '--after',
       '--source',
+      '--bench',
       '--author-grade',
     ]);
   });

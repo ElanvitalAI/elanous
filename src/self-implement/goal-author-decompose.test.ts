@@ -1,10 +1,19 @@
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
+import * as llmDecomposeActual from '../harness/llm-decompose.js';
+import * as adversarialPlanActual from '../harness/adversarial-plan.js';
+import * as llmActual from '../llm.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetLiveDetailCacheForTesting, writeLiveDetail } from '../live/detail-switch.js';
 import { setUserConfigOverlay } from '../user-config.js';
+
+// ⭐ R-TST23 — mock.module 은 process-wide 레지스트리를 치환하므로, 퇴장길 afterAll 에서
+//    원본 구현으로 되돌린다(아래 세 스냅샷은 namespace import 를 mock 투입 «전» 에 펼친 것).
+const llmDecomposeOriginal = { ...llmDecomposeActual };
+const adversarialPlanOriginal = { ...adversarialPlanActual };
+const llmOriginal = { ...llmActual };
 
 const originalSteps = ['inspect seam', 'implement red-team', 'verify regression', 'record evidence'];
 const revisedSteps = ['inspect seam', 'implement red-team', 'verify regression', 'record evidence', 'check fail-open behavior'];
@@ -14,22 +23,43 @@ let critique: { revisedSteps: string[]; issues: string[]; byAxis?: { scope: stri
 let critiqueError: Error | undefined;
 let critiqueCalls = 0;
 let decompositionOptions: Record<string, unknown> | undefined;
+let decomposeCallablePrompt: string | undefined;
+let criticPrompt: string | undefined;
+let captureStreamLlm = false;
+const streamLlmCalls: { messages: unknown[]; opts: object | undefined }[] = [];
 let stateRoot: string;
 let originalStateDir: string | undefined;
 
 mock.module('../harness/llm-decompose.js', () => ({
-  llmDecomposeSteps: async (_objective: string, _callable: unknown, options?: Record<string, unknown>) => {
+  llmDecomposeSteps: async (_objective: string, callable: unknown, options?: Record<string, unknown>) => {
     decompositionOptions = options;
+    if (decomposeCallablePrompt !== undefined && typeof callable === 'function') {
+      await (callable as (input: { prompt: string }) => Promise<{ text: string }>)({ prompt: decomposeCallablePrompt });
+    }
     if (rationale !== undefined) (options?.onRationale as ((reason: string) => void) | undefined)?.(rationale);
     return decomposition;
   },
 }));
 
 mock.module('../harness/adversarial-plan.js', () => ({
-  adversarialPlanCritique: async () => {
+  adversarialPlanCritique: async (_objective: string, _steps: string[], critic: unknown, _context?: unknown) => {
     critiqueCalls += 1;
     if (critiqueError) throw critiqueError;
+    if (criticPrompt !== undefined && typeof critic === 'function') {
+      await (critic as (prompt: string) => Promise<string>)(criticPrompt);
+    }
     return critique;
+  },
+}));
+
+// ⭐ AUTHOR-DECOMPOSE-KNOB — 쪼개기 callable ⊕ 비평 critic 이 부르는 streamLLM 의 실물 인자를 녹음한다.
+//    캡처가 꺼져 있으면 실모듈에 그대로 위임한다(기존 시험은 지금과 한 칸도 다르지 않게).
+mock.module('../llm.js', () => ({
+  ...llmActual,
+  streamLLM: async (...args: Parameters<typeof llmActual.streamLLM>) => {
+    if (!captureStreamLlm) return llmActual.streamLLM(...args);
+    streamLlmCalls.push({ messages: args[0], opts: args[2] });
+    return 'MOCK STREAM LLM TEXT';
   },
 }));
 
@@ -52,6 +82,10 @@ beforeEach(() => {
   critiqueError = undefined;
   critiqueCalls = 0;
   decompositionOptions = undefined;
+  decomposeCallablePrompt = undefined;
+  criticPrompt = undefined;
+  captureStreamLlm = false;
+  streamLlmCalls.length = 0;
   _setRecentStepCountReaderForTesting();
   _setCreateGoalAuthorDecomposeStepsForTesting();
   setUserConfigOverlay((config) => ({
@@ -548,4 +582,112 @@ describe('createGoalAuthorDecomposeSteps adversarial red-team', () => {
       log.mockRestore();
     }
   });
+});
+
+describe('AUTHOR-DECOMPOSE-KNOB planning LLM selection', () => {
+  test('routes the decompose and critic streamLLM calls through the roleLlm.planning model·effort when set', async () => {
+    const savedEnvModel = process.env.ELANOUS_PROMPT_ENHANCE_MODEL;
+    const savedEnvEffort = process.env.ELANOUS_PROMPT_ENHANCE_EFFORT;
+    delete process.env.ELANOUS_PROMPT_ENHANCE_MODEL;
+    delete process.env.ELANOUS_PROMPT_ENHANCE_EFFORT;
+    setUserConfigOverlay((config) => ({
+      ...config,
+      tools: { ...config.tools, selfImplement: { ...config.tools.selfImplement, observeOnly: false } },
+      // provider 를 명시해야 전역 provider 해석(자격 증명 필요)을 안 탄다 — 키 없는 게이트 Pod 에서 NoLlmProviderAvailableError(0.2.24 게이트).
+      roleLlm: { ...config.roleLlm, planning: { provider: 'openai-codex', model: 'planning-knob-model', effort: 'medium' } },
+    }));
+    decomposeCallablePrompt = 'DECOMPOSE PROMPT MARKER';
+    criticPrompt = 'CRITIC PROMPT MARKER';
+    captureStreamLlm = true;
+    try {
+      const steps = await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: true })('implement a robust goal author seam');
+      expect(steps).toEqual(originalSteps);
+      expect(streamLlmCalls.length).toBe(2);
+      const [decomposeCall, criticCall] = streamLlmCalls;
+      expect(decomposeCall?.messages).toEqual([{ role: 'user', content: 'DECOMPOSE PROMPT MARKER' }]);
+      expect(decomposeCall?.opts).toStrictEqual({ model: 'planning-knob-model', reasoningEffort: 'medium' });
+      expect(criticCall?.messages).toEqual([{ role: 'user', content: 'CRITIC PROMPT MARKER' }]);
+      expect(criticCall?.opts).toStrictEqual({ model: 'planning-knob-model', reasoningEffort: 'medium' });
+    } finally {
+      captureStreamLlm = false;
+      decomposeCallablePrompt = undefined;
+      criticPrompt = undefined;
+      if (savedEnvModel === undefined) delete process.env.ELANOUS_PROMPT_ENHANCE_MODEL;
+      else process.env.ELANOUS_PROMPT_ENHANCE_MODEL = savedEnvModel;
+      if (savedEnvEffort === undefined) delete process.env.ELANOUS_PROMPT_ENHANCE_EFFORT;
+      else process.env.ELANOUS_PROMPT_ENHANCE_EFFORT = savedEnvEffort;
+    }
+  });
+
+  test('keeps the default model and high effort for both calls when no planning knob is set', async () => {
+    const savedEnvModel = process.env.ELANOUS_PROMPT_ENHANCE_MODEL;
+    const savedEnvEffort = process.env.ELANOUS_PROMPT_ENHANCE_EFFORT;
+    delete process.env.ELANOUS_PROMPT_ENHANCE_MODEL;
+    delete process.env.ELANOUS_PROMPT_ENHANCE_EFFORT;
+    setUserConfigOverlay((config) => {
+      const roleLlm = { ...config.roleLlm };
+      delete roleLlm.planning;
+      return {
+        ...config,
+        tools: { ...config.tools, selfImplement: { ...config.tools.selfImplement, observeOnly: false } },
+        roleLlm,
+      };
+    });
+    decomposeCallablePrompt = 'DECOMPOSE PROMPT MARKER';
+    criticPrompt = 'CRITIC PROMPT MARKER';
+    captureStreamLlm = true;
+    try {
+      const steps = await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: true })('implement a robust goal author seam');
+      expect(steps).toEqual(originalSteps);
+      expect(streamLlmCalls.length).toBe(2);
+      for (const call of streamLlmCalls) {
+        expect(call.opts).toStrictEqual({ reasoningEffort: 'high' });
+      }
+    } finally {
+      captureStreamLlm = false;
+      decomposeCallablePrompt = undefined;
+      criticPrompt = undefined;
+      if (savedEnvModel === undefined) delete process.env.ELANOUS_PROMPT_ENHANCE_MODEL;
+      else process.env.ELANOUS_PROMPT_ENHANCE_MODEL = savedEnvModel;
+      if (savedEnvEffort === undefined) delete process.env.ELANOUS_PROMPT_ENHANCE_EFFORT;
+      else process.env.ELANOUS_PROMPT_ENHANCE_EFFORT = savedEnvEffort;
+    }
+  });
+
+  test('routes the calls through ELANOUS_PROMPT_ENHANCE_MODEL/EFFORT ahead of the planning spec', async () => {
+    const savedEnvModel = process.env.ELANOUS_PROMPT_ENHANCE_MODEL;
+    const savedEnvEffort = process.env.ELANOUS_PROMPT_ENHANCE_EFFORT;
+    process.env.ELANOUS_PROMPT_ENHANCE_MODEL = 'env-knob-model';
+    process.env.ELANOUS_PROMPT_ENHANCE_EFFORT = 'low';
+    setUserConfigOverlay((config) => ({
+      ...config,
+      tools: { ...config.tools, selfImplement: { ...config.tools.selfImplement, observeOnly: false } },
+      roleLlm: { ...config.roleLlm, planning: { provider: 'openai-codex', model: 'planning-knob-model', effort: 'medium' } },
+    }));
+    decomposeCallablePrompt = 'DECOMPOSE PROMPT MARKER';
+    criticPrompt = 'CRITIC PROMPT MARKER';
+    captureStreamLlm = true;
+    try {
+      await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: true })('implement a robust goal author seam');
+      expect(streamLlmCalls.length).toBe(2);
+      for (const call of streamLlmCalls) {
+        expect(call.opts).toStrictEqual({ model: 'env-knob-model', reasoningEffort: 'low' });
+      }
+    } finally {
+      captureStreamLlm = false;
+      decomposeCallablePrompt = undefined;
+      criticPrompt = undefined;
+      if (savedEnvModel === undefined) delete process.env.ELANOUS_PROMPT_ENHANCE_MODEL;
+      else process.env.ELANOUS_PROMPT_ENHANCE_MODEL = savedEnvModel;
+      if (savedEnvEffort === undefined) delete process.env.ELANOUS_PROMPT_ENHANCE_EFFORT;
+      else process.env.ELANOUS_PROMPT_ENHANCE_EFFORT = savedEnvEffort;
+    }
+  });
+});
+
+afterAll(() => {
+  // ⭐ R-TST23 — 치환했던 세 모듈을 원본 구현으로 복구한다(mock.module 은 자동 복구되지 않는다).
+  mock.module('../harness/llm-decompose.js', () => llmDecomposeOriginal);
+  mock.module('../harness/adversarial-plan.js', () => adversarialPlanOriginal);
+  mock.module('../llm.js', () => llmOriginal);
 });

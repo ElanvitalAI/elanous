@@ -425,12 +425,16 @@ const OPENROUTER: TierMap = {
 //   ⛔ bedrock 은 명시 선택 전용 — 이 표는 `--role-llm <role>=bedrock/<tier>` 같은 «명시» 해석에만 쓰인다.
 //   ⚠️ status = `wip`: 실 AWS 호출(계정별 5.5 접근 조건)을 아직 안 쟀고, 셋업 키 감지 표(PROVIDER_ENV_SPEC)에도
 //      없다(자격이 API 키가 아니라 AWS 체인이라). 첫 실호출 스모크 뒤 `shipping` 으로 올린다.
+//   ⭐ BEDROCK-RUNTIME-PATH(10-11): 메시지 엔드포인트(mantle)에 5.5 가 없어(📏 `GET /v1/models`) 사다리 id 를 전역 추론 프로필
+//      `global.anthropic.…`(runtime 경로 · bedrock.ts BEDROCK_MODELS 의 `route` 칸)로 옮겼다. 공급자 이름은 그대로 `bedrock`.
+//      📏 budget·balanced(haiku/sonnet 5.5)는 runtime 실호출 200 실측(ap-northeast-2) · opus 5.5 는 «추론 프로필 목록에 있음»까지만(호출 0).
+//      status 는 그대로 `wip` — `shipping` 은 셋업 키 감지 표(PROVIDER_ENV_SPEC) 칸을 요구한다(provider-wiring-contract 시험 · 범위 밖).
 const BEDROCK: TierMap = {
-  budget:   { model: 'anthropic.claude-haiku-5-5',  reasoningLevel: 'off',    label: 'Claude Haiku 5.5 (Bedrock)',  rationale: 'Fast · cheap · bulk/classification', status: 'wip' },
-  balanced: { model: 'anthropic.claude-sonnet-5-5', reasoningLevel: 'off',    label: 'Claude Sonnet 5.5 (Bedrock)', rationale: 'Default · everyday coding (BEDROCK_DEFAULT_MODEL)', status: 'wip' },
-  better:   { model: 'anthropic.claude-opus-5-5',   reasoningLevel: 'medium', label: 'Claude Opus 5.5 · thinking medium (Bedrock)', rationale: 'ANTHROPIC better 와 같은 배치(구현 = Opus 5.5)', status: 'wip' },
-  best:     { model: 'anthropic.claude-opus-5-5',   reasoningLevel: 'medium', label: 'Claude Opus 5.5 · thinking medium (Bedrock)', rationale: 'Best reasoning · architecture', status: 'wip' },
-  loaded:   { model: 'anthropic.claude-opus-5-5',   reasoningLevel: 'high',   label: 'Claude Opus 5.5 · extended thinking (Bedrock)', rationale: 'Loaded · deep multi-step', status: 'wip' },
+  budget:   { model: 'global.anthropic.claude-haiku-5-5',  reasoningLevel: 'off',    label: 'Claude Haiku 5.5 (Bedrock)',  rationale: 'Fast · cheap · bulk/classification', status: 'wip' },
+  balanced: { model: 'global.anthropic.claude-sonnet-5-5', reasoningLevel: 'off',    label: 'Claude Sonnet 5.5 (Bedrock)', rationale: 'Default · everyday coding (BEDROCK_DEFAULT_MODEL)', status: 'wip' },
+  better:   { model: 'global.anthropic.claude-opus-5-5',   reasoningLevel: 'medium', label: 'Claude Opus 5.5 · thinking medium (Bedrock)', rationale: 'ANTHROPIC better 와 같은 배치(구현 = Opus 5.5)', status: 'wip' },
+  best:     { model: 'global.anthropic.claude-opus-5-5',   reasoningLevel: 'medium', label: 'Claude Opus 5.5 · thinking medium (Bedrock)', rationale: 'Best reasoning · architecture', status: 'wip' },
+  loaded:   { model: 'global.anthropic.claude-opus-5-5',   reasoningLevel: 'high',   label: 'Claude Opus 5.5 · extended thinking (Bedrock)', rationale: 'Loaded · deep multi-step', status: 'wip' },
 };
 
 /** 가격·창 미측정이라 기존 tier 배치를 바꾸지 않고 명시 모델로만 고르는 칸.

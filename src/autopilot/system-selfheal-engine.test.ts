@@ -2,7 +2,10 @@
 // R3 룩백 러너 + 수리 미션 스폰 + phaseGateInputs/systemSuspect 추출. Opus 강제는 se-bridge
 // 통합(별도) — 여기선 순수/seam 주입 경계를 검증(실 LLM·실 ~/.elanous·실 spawn 미접촉).
 
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, spyOn } from 'bun:test';
+import * as llm from '../llm.js';
+import { debug } from '../debug/log.js';
+import { setUserConfigOverlay } from '../user-config.js';
 import { phaseGateInputs, phaseSystemSuspectSignals, buildPhaseOutcomeFromSummary } from './mission-phase-diagnosis.js';
 import { runSystemLookback } from './system-lookback-run.js';
 import { buildRepairGoal, spawnSystemRepairMission } from './system-repair-spawn.js';
@@ -64,6 +67,47 @@ describe('runSystemLookback', () => {
     expect(r.investigated).toBe(false);
     expect(r.report).toContain('폴백');
     expect(r.report).toContain('files-touched-but-empty-diff');
+  });
+});
+
+describe('runSystemLookback role pin', () => {
+  it('audit overlay 를 호출하고 LLM 실패는 결정론 폴백으로 끝난다', async () => {
+    const old = process.env.ELANOUS_LOOKBACK_MODEL;
+    const stream = spyOn(llm, 'streamLLM').mockResolvedValue('결함 보고');
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      delete process.env.ELANOUS_LOOKBACK_MODEL;
+      setUserConfigOverlay(config => ({ ...config, roleLlm: { ...config.roleLlm, audit: { provider: 'gemini', model: 'audit-fixture' } } }));
+      const args = { phaseTitle: 't', signals: [SUSPECT_SIGNAL], repoRoot: process.cwd() };
+      const result = await runSystemLookback(args);
+      expect(result.investigated).toBe(true);
+      expect(stream.mock.calls[0]?.[2]).toMatchObject({ model: 'audit-fixture', provider: llm.PROVIDERS.gemini, usageRole: 'audit', maxTokens: 2500 });
+      expect(log.mock.calls.find(([category, event]) => category === 'llm.role-pin' && event === 'resolved')?.[2])
+        .toMatchObject({ site: 'system-lookback', role: 'audit', model: 'audit-fixture', provider: 'gemini', source: 'config-role' });
+      const saved = llm.PROVIDERS.gemini;
+      delete llm.PROVIDERS.gemini;
+      try {
+        const unresolved = await runSystemLookback(args);
+        expect(unresolved.investigated).toBe(false);
+        expect(unresolved.report).toContain('폴백');
+      } finally { llm.PROVIDERS.gemini = saved!; }
+      stream.mockImplementation(async () => { throw new Error('unavailable'); });
+      const failed = await runSystemLookback(args);
+      expect(failed.investigated).toBe(false);
+      expect(failed.report).toContain('폴백');
+      process.env.ELANOUS_LOOKBACK_MODEL = 'claude-env-lookback';
+      stream.mockResolvedValue('env 보고');
+      await runSystemLookback(args);
+      expect(stream.mock.calls.at(-1)?.[2]).toMatchObject({ model: 'claude-env-lookback', provider: llm.PROVIDERS.anthropic, usageRole: 'audit' });
+      expect(log.mock.calls.filter(([category, event]) => category === 'llm.role-pin' && event === 'resolved').at(-1)?.[2])
+        .toMatchObject({ site: 'system-lookback', role: 'audit', model: 'claude-env-lookback', provider: 'anthropic', source: 'env' });
+    } finally {
+      log.mockRestore();
+      stream.mockRestore();
+      setUserConfigOverlay(null);
+      if (old === undefined) delete process.env.ELANOUS_LOOKBACK_MODEL;
+      else process.env.ELANOUS_LOOKBACK_MODEL = old;
+    }
   });
 });
 

@@ -1,0 +1,35 @@
+id: openrouter/z-ai/glm-5.3-flash
+provider: openrouter
+displayName: GLM 5.3 Flash (OpenRouter)
+family: glm-5
+# ⭐ 2026-10-11 MK(CATALOG-DEEPSEEK-FLASH) — 손 레코드(근거는 deepseek-v4-pro-0813.yaml 머리말과 같다).
+#   ⚠️ 이 id(`openrouter/z-ai/…`)는 사다리의 `glm` provider id(`glm-5.3-flash`)와 «다른 id» 다 — 그 구멍(catalog-drift 시험의 glm 줄)은 닫지 않는다.
+# 📏 수치 출처 — OpenRouter 공개 API 실호출 2026-10-10T19:30Z (인증 없음):
+#   ⑴ GET /api/v1/models/z-ai/glm-5.3-flash/endpoints — «Z.AI» 1st-party 공급자 엔드포인트(glm-5.3-flash-20260826 · fp8):
+#      context_length 1048576 · max_completion_tokens 131072 · prompt $0.15 · completion $0.50 · input_cache_read $0.03 /MTok · discount 0
+#   ⑵ GET /api/v1/models — context_length 1048576 · top_provider.max_completion_tokens 943717 · 같은 단가
+#      ⚠️ ⑵ 의 출력은 «다른 공급자» 값이다. deepseek 팔과 같은 원칙(제조사 자체 엔드포인트)으로 ⑴ 을 쓴다.
+#      공급자를 고정하지 않으면 출력 상한은 공급자마다 다르다(131072 ~ 943718).
+# 💲 판촉 할인(discount) 0 · 시간대 가산 없음.
+contextSize: 1048576
+outputMaxTokens: 131072
+# 입력 모달리티 text+image+video (architecture.input_modalities) — 칸이 하나라 images 로 적는다.
+vision: images
+# 기본 effort — OR supported_parameters 에 reasoning_effort 가 있다. 관례(flash 계열 = medium)를 따른다.
+reasoning: medium
+toolCalling: native-openai
+streamingProtocol: sse
+pricing:
+  inputPerMTok: 0.15
+  outputPerMTok: 0.50
+  cachedInputPerMTok: 0.03
+deprecated: null
+tokenizer: unknown
+kind: chat
+# 출시일 — 엔드포인트 이름의 날짜(glm-5.3-flash-20260826) · /api/v1/models `created` 도 2026-08-26(UTC).
+releaseDate: 2026-08-26
+discoveryMeta:
+  source: manual
+  lastSeen: 2026-10-11
+  autoFilled: false
+  confidence: high

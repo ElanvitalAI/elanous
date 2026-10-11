@@ -13,20 +13,33 @@ export interface FirstRunDeps {
   path?: string;
   detectProviders?: () => Promise<DetectedProvider[]>;
   isTTY?: boolean;
-  chooseProvider?: () => Promise<LLMProviderName | null>;
+  chooseProvider?: (detected: readonly LLMProviderName[]) => Promise<LLMProviderName | null>;
   print?: (message: string) => void;
   saveConfig?: (config: UserConfig, path: string) => void;
 }
 
-async function chooseProvider(): Promise<LLMProviderName | null> {
+const CHOICE_BASE: readonly LLMProviderName[] = ['openai-codex', 'grok', 'anthropic'];
+const CHOICE_LABEL: Partial<Record<LLMProviderName, string>> = { 'openai-codex': 'Codex', grok: 'Grok', anthropic: 'Claude' };
+const SUBSCRIPTION_PRIORITY = ['openai-codex', 'grok', 'anthropic', 'gemini', 'openai', 'openrouter'] as const;
+
+/** Menu order: detected subscriptions first (in priority order), then the remaining base choices. */
+export function orderProviderChoices(detected: readonly LLMProviderName[] = []): LLMProviderName[] {
+  return [...detected, ...CHOICE_BASE.filter((name) => !detected.includes(name))];
+}
+
+async function chooseProvider(detected: readonly LLMProviderName[] = []): Promise<LLMProviderName | null> {
+  const choices = orderProviderChoices(detected);
+  const menu = choices.map((name, i) => `${i + 1} ${CHOICE_LABEL[name] ?? name}`).join(', ');
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const answer = (await rl.question('Choose LLM (1 Codex, 2 Grok, 3 Claude; Enter to cancel): ')).trim();
-    return ({ '1': 'openai-codex', '2': 'grok', '3': 'anthropic' } as Record<string, LLMProviderName>)[answer] ?? null;
+    const answer = (await rl.question(`Choose LLM (${menu}; Enter to cancel): `)).trim();
+    return choices[Number(answer) - 1] ?? null;
   } finally {
     rl.close();
   }
 }
+
+const detectionLabel = (provider: string) => `${provider === 'openai-codex' ? 'codex' : provider} 구독`;
 
 export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
   outcome: 'ready' | 'needs-llm' | 'cancelled'; provider?: string; inputs: number;
@@ -50,21 +63,31 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
     : undefined;
   const configured = existing && existing.source !== 'none'
     ? cfg.llm.provider : undefined;
-  const picked = (['openai-codex', 'grok', 'claude-code', 'anthropic', 'gemini', 'openai', 'openrouter'] as const)
-    .find((name) => providers.includes(name));
-  let provider: LLMProviderName | null | undefined = configured ??
-    (picked === 'claude-code' ? 'anthropic' : picked as LLMProviderName | undefined);
+  // claude-code is detected but has no subscription path in elanous: mapping it to the 'anthropic'
+  // API-key provider would save a provider whose first call fails for a subscription-only user.
+  const usable = SUBSCRIPTION_PRIORITY.filter((name) => providers.includes(name));
+  const detectionLine = (outcome: string) => `감지: ${providers.map(detectionLabel).join(' · ')} → ${outcome}`;
+  const needsLlm = (inputs: number, extra: string[] = []) => {
+    print('eln setup llm 으로 고르세요');
+    for (const line of extra) print(line);
+    observe('needs-llm', inputs);
+    return { outcome: 'needs-llm' as const, inputs };
+  };
+  let provider: LLMProviderName | null | undefined = configured ?? (usable.length === 1 ? usable[0] : undefined);
+  if (!configured && provider) print(detectionLine(provider));
   let inputs = 0;
   if (!provider) {
+    if (providers.length > 0) {
+      print(detectionLine(usable.length === 0
+        ? 'claude-code 구독은 구독으로 쓸 수 있는 경로가 없어 자동 선택하지 않음'
+        : '둘 이상 감지되어 고르세요'));
+    }
     if ((deps.isTTY ?? process.stdin.isTTY) !== true) {
-      print('eln setup llm 으로 고르세요');
       // FIRST-CHAT-NONTTY — bare `elanous` with no TTY gets the same one-line next step as the other entrances.
-      print(unattendedNextStepLine());
-      observe('needs-llm', 0);
-      return { outcome: 'needs-llm', inputs: 0 };
+      return needsLlm(0, [unattendedNextStepLine()]);
     }
     inputs = 1;
-    provider = await (deps.chooseProvider ?? chooseProvider)();
+    provider = await (deps.chooseProvider ?? chooseProvider)(usable);
     if (!provider) return { outcome: 'cancelled', inputs };
     observe('chosen', inputs);
   }
@@ -74,11 +97,7 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
         baseProvider: cfg.llm.provider, baseApiKey: cfg.llm.apiKey,
       })
     : undefined;
-  if (inputs === 1 && credential?.source === 'none') {
-    print('eln setup llm 으로 고르세요');
-    observe('needs-llm', inputs);
-    return { outcome: 'needs-llm', inputs };
-  }
+  if (inputs === 1 && credential?.source === 'none') return needsLlm(inputs);
   (deps.saveConfig ?? saveUserConfig)({
     ...cfg,
     llm: { ...cfg.llm, provider,

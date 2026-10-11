@@ -65,6 +65,7 @@ import { findGrokModel, GROK_MODELS } from '../grok/models.js';
 import { resolveModelAlias } from '../intelligence-map/model-alias.js';
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
 import { BEDROCK_DEFAULT_MODEL, BEDROCK_MODELS, findBedrockModel, resolveBedrockModelId } from '../llm/bedrock.js';
+import { ZAI_CODING_DEFAULT_MODEL, ZAI_CODING_MODELS } from '../llm/zai-coding-plan.js';
 
 /** `dev --plan` 도움말이 가리키는 대응 문. ⛔ 도움말에 이 문자열을 리터럴로 다시 적지 마라. */
 export const DEV_PLAN_REPLACEMENT = 'elanous harness say';
@@ -1097,6 +1098,9 @@ export async function executeDevSelfRun(
     retainConfirmedMerge(result);
     await superviseRun({
       initial: [initialJob],
+      // A review-oscillation repair goal runs through the existing piece executor (fragment re-execution with the
+      // authored goal as its feature). Without that executor the rerun could only replay the same goal — declare false.
+      repairGoalExecution: supervise.executePiece !== undefined,
       enrich: (results) => hydrateDevGoalCauseObserved(
         hydrateDevDecomposeProposals(results, supervise.readProposals ?? readDecomposeProposals),
       ),
@@ -1157,7 +1161,24 @@ export async function executeDevSelfRun(
           }) + orderingNote,
         };
       },
-      rerun: async (previous, { relaunch }) => {
+      rerun: async (previous, { relaunch, repairGoals }) => {
+        const repairJobs = previous.flatMap((job) => repairGoals?.[job.taskId] === undefined ? [] : [{ job, goal: repairGoals[job.taskId]! }]);
+        if (repairJobs.length > 0 && supervise.executePiece !== undefined) {
+          if (recordRestart('relaunch', previous.at(-1)!)) return [];
+          executedRounds += 1;
+          // Every authored repair goal runs (one per oscillating task), each keeping its task's goal feature so a
+          // second oscillation is recognised as «already repaired».
+          const repaired: ReturnType<typeof asSupervisorJobResult>[] = [];
+          for (const { job, goal } of repairJobs) {
+            try { debug.log('self-dev.supervisor', 'oscillation-repair.executed', { surface: 'dev', taskId: job.taskId, chars: goal.length }); } catch { /* fail-open */ }
+            const repairResult = recordResult(await supervise.executePiece(goal));
+            retainConfirmedMerge(repairResult);
+            if (shardResults === undefined) result = repairResult;
+            repaired.push({ ...asSupervisorJobResult(job.feature, repairResult), oscillationRepairOf: job.taskId });
+          }
+          // Jobs without a repair goal are not dropped: their last result stays in the round for the next decision.
+          return [...repaired, ...previous.filter((job) => repairGoals?.[job.taskId] === undefined)];
+        }
         if (promotedPieces !== undefined) {
           const pieces = promotedPieces;
           promotedPieces = undefined;
@@ -1340,12 +1361,19 @@ export function normalizeChildLlmProvider(provider: string): string {
     : p;
 }
 
+/** CLAUDE-IMPL-LANE — claude-acp = Claude 구독 ACP 구현 레인(src/agent-substrate/acp-implementer.ts). 모델 카탈로그·사다리는 anthropic 과 같다. */
+function childModelCatalogProvider(provider: string): string {
+  const normalized = normalizeChildLlmProvider(provider);
+  return normalized === 'claude-acp' ? 'anthropic' : normalized;
+}
+
 function isKnownChildLlmProvider(provider: string): boolean {
-  return ['grok', 'anthropic', 'gemini', 'openai', 'openai-codex', 'local', 'openrouter', 'bedrock'].includes(normalizeChildLlmProvider(provider));
+  // ZAI-POD-CHILD (0.2.24) — glm = Z.ai GLM Coding Plan 직결(`ZAI_API_KEY` · src/llm/zai-coding-plan.ts). Pod 자식이 `--child-llm-provider glm` 으로 뜬다.
+  return ['grok', 'anthropic', 'claude-acp', 'gemini', 'openai', 'openai-codex', 'local', 'openrouter', 'bedrock', 'glm'].includes(normalizeChildLlmProvider(provider));
 }
 
 function findPickerCatalogModel(provider: string, id: string): CatalogModelView | undefined {
-  switch (normalizeChildLlmProvider(provider)) {
+  switch (childModelCatalogProvider(provider)) {
     case 'grok': return findGrokModel(id);
     case 'anthropic': return findClaudeModel(id);
     case 'gemini': return findGeminiModel(id);
@@ -1353,12 +1381,15 @@ function findPickerCatalogModel(provider: string, id: string): CatalogModelView 
     case 'openai-codex': return findCodexModel(id);
     case 'openrouter': return findOpenRouterChildModel(id);
     case 'bedrock': return findBedrockChildModel(id);
+    case 'glm': return (ZAI_CODING_MODELS as readonly string[]).includes(id)
+      ? { id, tier: /flash/i.test(id) ? 'budget' : 'balanced', supportsThinking: true, recommended: id === ZAI_CODING_DEFAULT_MODEL }
+      : undefined;
     default: return undefined;
   }
 }
 
 /** BEDROCK-PROVIDER — `anthropic.claude-sonnet-5-5` · `bedrock/claude-sonnet-5-5` · (provider=bedrock 일 때) `claude-sonnet-5-5`
- *  를 받아 와이어 id(`anthropic.` 접두)로 해석한다. 표 밖은 «모른다» → 거부(다른 provider 와 같은 규율). */
+ *  를 받아 와이어 id 로 해석한다(5.5 = 전역 추론 프로필 `global.anthropic.…` · BEDROCK-RUNTIME-PATH). 표 밖은 «모른다» → 거부(다른 provider 와 같은 규율). */
 function findBedrockChildModel(id: string): CatalogModelView | undefined {
   const entry = findBedrockModel(id);
   if (!entry) return undefined;
@@ -1394,7 +1425,7 @@ function tierFromBuiltin(tags: readonly string[] | undefined): string {
 }
 
 function findBuiltinCatalogModel(provider: string, id: string): CatalogModelView | undefined {
-  const expected = normalizeChildLlmProvider(provider);
+  const expected = childModelCatalogProvider(provider);
   const entry = BUILTIN_CATALOG.models.find((model) => (
     model.id === id && normalizeChildLlmProvider(model.provider) === expected
   ));
@@ -1408,7 +1439,7 @@ function findBuiltinCatalogModel(provider: string, id: string): CatalogModelView
 }
 
 function listImplementationChildModelCandidates(provider: string): string[] {
-  const expected = normalizeChildLlmProvider(provider);
+  const expected = childModelCatalogProvider(provider);
   const picker = (() => {
     switch (expected) {
       case 'grok': return GROK_MODELS.map((model) => model.id);
@@ -1418,6 +1449,7 @@ function listImplementationChildModelCandidates(provider: string): string[] {
       case 'openai-codex': return CODEX_MODELS.map((model) => model.id);
       case 'openrouter': return [...new Set(MODEL_TIERS.map((t) => LLM_TIER_MAP_BY_PROVIDER.openrouter[t].model))];
       case 'bedrock': return BEDROCK_MODELS.map((model) => model.id);
+      case 'glm': return [...ZAI_CODING_MODELS];
       default: return [];
     }
   })();
@@ -1576,10 +1608,12 @@ export function grokWeeklyUsedPctFromUsageJson(stdout: string): number | undefin
 /** `elanous usage --json` 의 grok 행 → 잔량 판정. 한 행이라도 100% 미만이면 usable, 모두 100% 이상이면 exhausted. */
 export function grokQuotaFromUsageJson(stdout: string): 'usable' | 'exhausted' | 'unknown' {
   try {
-    const parsed = JSON.parse(stdout) as { rows?: Array<{ provider?: string; credits?: { status?: string; usedPercent?: number | null } }> };
+    const parsed = JSON.parse(stdout) as { rows?: Array<{ provider?: string; credits?: { status?: string; periodType?: string | null; usedPercent?: unknown } }> };
     const percents = (parsed.rows ?? [])
-      .filter((row) => row.provider === 'grok' && row.credits?.status === 'ok' && typeof row.credits.usedPercent === 'number')
-      .map((row) => row.credits!.usedPercent as number);
+      .filter((row) => row.provider === 'grok' && row.credits?.status === 'ok'
+        && row.credits.periodType === 'USAGE_PERIOD_TYPE_WEEKLY')
+      .map((row) => row.credits?.usedPercent)
+      .filter((pct): pct is number => typeof pct === 'number' && Number.isFinite(pct) && pct >= 0 && pct <= 100);
     if (percents.length === 0) return 'unknown';
     return percents.some((p) => p < 100) ? 'usable' : 'exhausted';
   } catch {
@@ -1722,7 +1756,7 @@ function announceChildLlmInterpretation(
 export const CHILD_LLM_DEFAULT_TIER = 'better' as const;
 
 export function defaultChildLlmModel(provider: string): string {
-  return tierModel(CHILD_LLM_DEFAULT_TIER, provider as never);
+  return tierModel(CHILD_LLM_DEFAULT_TIER, childModelCatalogProvider(provider) as never);
 }
 
 export type ChildLlmConfigSnapshot = { provider?: string; model?: string };

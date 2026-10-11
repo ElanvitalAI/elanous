@@ -1,6 +1,10 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, spyOn } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import * as llm from '../llm.js';
+import { debug } from '../debug/log.js';
+import { setUserConfigOverlay } from '../user-config.js';
 import {
-  feasibilityBudget, parseScopeNegotiation, proposeScopeNegotiation, formatNegotiationCard,
+  feasibilityBudget, parseScopeNegotiation, proposeScopeNegotiation, formatNegotiationCard, defaultJudge,
   type NegotiateInput,
 } from './mission-feasibility-negotiate.js';
 
@@ -46,9 +50,60 @@ describe('proposeScopeNegotiation (judge 주입·fail-soft)', () => {
     expect(n.needsHitl).toBe(true);
   });
 
+  it('역할 provider 해석 실패도 needsHitl 협상으로 끝난다', async () => {
+    const saved = llm.PROVIDERS.gemini;
+    try {
+      setUserConfigOverlay(config => ({ ...config, roleLlm: { ...config.roleLlm, planning: { provider: 'gemini', model: 'planning-fixture' } } }));
+      delete llm.PROVIDERS.gemini;
+      const result = await proposeScopeNegotiation(input({}), { judge: defaultJudge });
+      expect(result).toMatchObject({ kind: 'replan', needsHitl: true });
+      expect(result.rationale).toContain('fail-soft');
+    } finally { llm.PROVIDERS.gemini = saved!; setUserConfigOverlay(null); }
+  });
+
   it('judge 미주입(test) → replan 폴백', async () => {
     const n = await proposeScopeNegotiation(input({}));
     expect(n.kind).toBe('replan');
+  });
+});
+
+describe('defaultJudge role pin', () => {
+  it('기본 하드코딩 모델 없이 planning overlay 를 쓰고 env 가 우선한다', async () => {
+    const oldNegotiate = process.env.ELANOUS_NEGOTIATE_MODEL;
+    const oldDecompose = process.env.ELANOUS_DECOMPOSE_MODEL;
+    const stream = spyOn(llm, 'streamLLM').mockResolvedValue('{"kind":"replan"}');
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      delete process.env.ELANOUS_NEGOTIATE_MODEL;
+      delete process.env.ELANOUS_DECOMPOSE_MODEL;
+      for (const path of ['mission-feasibility-negotiate.ts', 'system-lookback-run.ts']) {
+        expect(readFileSync(new URL(path, import.meta.url), 'utf8')).not.toContain('claude-opus-4-8');
+      }
+      setUserConfigOverlay(config => ({ ...config, roleLlm: { ...config.roleLlm, planning: { provider: 'gemini', model: 'planning-fixture' } } }));
+      await defaultJudge('test');
+      expect(stream.mock.calls[0]?.[2]).toMatchObject({ model: 'planning-fixture', provider: llm.PROVIDERS.gemini, usageRole: 'planning', reasoningEffort: 'medium' });
+      process.env.ELANOUS_NEGOTIATE_MODEL = 'claude-env-fixture';
+      await defaultJudge('test');
+      expect(stream.mock.calls[1]?.[2]).toMatchObject({ model: 'claude-env-fixture', provider: llm.PROVIDERS.anthropic, usageRole: 'planning' });
+      delete process.env.ELANOUS_NEGOTIATE_MODEL;
+      process.env.ELANOUS_DECOMPOSE_MODEL = 'claude-decompose-fixture';
+      await defaultJudge('test');
+      expect(stream.mock.calls[2]?.[2]).toMatchObject({ model: 'claude-decompose-fixture', provider: llm.PROVIDERS.anthropic, usageRole: 'planning' });
+      const pins = log.mock.calls.filter(([category, event]) => category === 'llm.role-pin' && event === 'resolved');
+      expect(pins.map(([, , data]) => data)).toEqual([
+        expect.objectContaining({ site: 'feasibility-negotiate', role: 'planning', model: 'planning-fixture', provider: 'gemini', source: 'config-role' }),
+        expect.objectContaining({ site: 'feasibility-negotiate', role: 'planning', model: 'claude-env-fixture', provider: 'anthropic', source: 'env' }),
+        expect.objectContaining({ site: 'feasibility-negotiate', role: 'planning', model: 'claude-decompose-fixture', provider: 'anthropic', source: 'env' }),
+      ]);
+    } finally {
+      log.mockRestore();
+      stream.mockRestore();
+      setUserConfigOverlay(null);
+      if (oldNegotiate === undefined) delete process.env.ELANOUS_NEGOTIATE_MODEL;
+      else process.env.ELANOUS_NEGOTIATE_MODEL = oldNegotiate;
+      if (oldDecompose === undefined) delete process.env.ELANOUS_DECOMPOSE_MODEL;
+      else process.env.ELANOUS_DECOMPOSE_MODEL = oldDecompose;
+    }
   });
 });
 

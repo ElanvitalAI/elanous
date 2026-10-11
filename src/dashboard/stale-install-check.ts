@@ -12,6 +12,17 @@ export type StaleInstallResult = {
 
 export const STALE_INSTALL_CHECK_INTERVAL_MS = 60_000;
 
+/**
+ * Builds the command that relaunches the TUI on the same daemon session: `elanous --resume <id>` boots the dashboard,
+ * loads that session (ACP session/load) and replays its turns (src/index.ts resumeSessionId · dashboard acp-boot).
+ * The user-facing hint and its key binding land with the dashboard wiring slice (`r` is the render toggle today).
+ * Intentional wiring boundary: the dashboard owns the key binding and executes this command;
+ * this scoped helper only constructs it and does not spawn a child process.
+ */
+export function buildStaleInstallRelaunchCommand(sessionId: string): string {
+  return `elanous --resume ${JSON.stringify(sessionId)}`;
+}
+
 export function formatStaleInstallNotice(result: StaleInstallResult, notifiedCount: number): string {
   const message = `새 판이 깔렸습니다 (부팅 판 ${result.bootCommit!.slice(0, 7)} → 지금 ${result.installedCommit!.slice(0, 7)}) · TUI 를 다시 띄우면 새 판으로 돕니다`;
   return notifiedCount >= 2 ? `${message} · 이 TUI 가 뜬 뒤 ${notifiedCount}번째 새 판` : message;

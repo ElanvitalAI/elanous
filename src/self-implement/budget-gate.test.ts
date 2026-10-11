@@ -153,14 +153,16 @@ describe('decideLaunchBudget only', () => {
       decision: expect.objectContaining({ action: 'proceed', provider: 'openai-codex' }),
       unmeasuredProvider: 'openai-codex',
     }));
-    expect(decideLaunchBudget(input({ codex: [], chain: [{ provider: 'grok' }] })).decision.action).toBe('stop');
-    expect(decideLaunchBudget(input({ codex: [], chain: [{ provider: 'grok' }] })).unmeasuredProvider).toBeUndefined();
+    expect(decideLaunchBudget(input({ codex: [], chain: [{ provider: 'grok' }] })).decision.action).toBe('proceed');
+    expect(decideLaunchBudget(input({ codex: [], chain: [{ provider: 'grok' }] })).unmeasuredProvider).toBe('grok');
   });
 
-  it('grok 잔량을 못 재면 발사 관문이 거부하고, 80% 이상은 상한을 넘긴 것으로 거부한다', () => {
+  it('grok 잔량을 못 재면 발사 관문은 통과하고, 80% 이상은 상한을 넘긴 것으로 거부한다', () => {
     const unmeasured = input({ codex: [{ name: 'default', usedPercent: 100, reached: true }], chain: [{ provider: 'grok' }] });
-    expect(decideLaunchBudget(unmeasured).decision.action).toBe('stop');
+    expect(decideLaunchBudget(unmeasured).decision.action).toBe('proceed');
+    expect(decideLaunchBudget(unmeasured).unmeasuredProvider).toBe('grok');
     expect(decideLaunchBudget(unmeasured).decision.reasons.join(' ')).toContain('grok: 모름');
+    expect(decideBudget(unmeasured).action).toBe('stop');
     const overCap = input({
       codex: [],
       grok: 80,

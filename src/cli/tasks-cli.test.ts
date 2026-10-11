@@ -7,6 +7,7 @@ import { join, relative } from 'node:path';
 import { debug } from '../debug/log.js';
 import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
 import type { LogStoreRow } from '../mss/logging/log-store.js';
+import { readTaskCard, writeTaskCards, type TaskCard } from '../task-agent/task-hand.js';
 import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TasksCliDeps } from './tasks-cli.js';
 
 const token = 'secret-acp-token-sentinel';
@@ -150,6 +151,47 @@ test('tasks cover --json takes a federated read and says how many stores it coul
   expect(body.rows[0]).toEqual({ verb: 'land', byTaskAgent: 1, total: 4, observedActions: 1, ratio: 0.25, state: 'measured', liveActions: 1, shadowActions: 0, stewardTransition: 'observed' });
   expect(body.unreadableStores).toBe(2);
   expect(body.storeWarning).toContain('2개를 못 읽었다');
+});
+
+test('tasks cover --by-card reads the injected card ledger inside the window; without the flag it never calls coverCards', async () => {
+  const logs = (query: { exactCategories?: string[]; events?: string[] }) => {
+    const payloads = query.exactCategories?.[0] === 'task-agent'
+      ? [{ kind: 'review', result: 'done', taskId: 'c1' }, { kind: 'review', result: 'done', taskId: 'c1' }, { kind: 'review', result: 'done', taskId: 'c2' }, { kind: 'review', result: 'done', taskId: 'old' }]
+      : [{ step: 'merge', ok: true }];
+    return payloads.map((data) => ({ category: query.exactCategories![0], event: query.events![0], data: JSON.stringify(data) }) as LogStoreRow);
+  };
+  let calls = 0;
+  const coverCards = () => {
+    calls++;
+    return [
+      { id: 'c1', createdAt: '2026-10-05T00:00:00.000Z' }, { id: 'c2', createdAt: '2026-10-06T00:00:00.000Z' },
+      { id: 'c3', createdAt: '2026-10-07T00:00:00.000Z' }, { id: 'old', createdAt: '2026-09-01T00:00:00.000Z' },
+    ];
+  };
+  const withFlag = await run(['tasks', 'cover', '--by-card', '--json', '--since', '2026-10-01T00:00:00Z'], { coverLogs: logs, coverCards });
+  expect(calls).toBe(1);
+  expect(JSON.parse(withFlag.lines[0]!).rows[1]).toMatchObject({ verb: 'review', byTaskAgent: 2, total: 3, state: 'measured' });
+  expect(JSON.parse(withFlag.lines[0]!).rows[0]).toMatchObject({ verb: 'land', total: 1 });
+  const unreadable = await run(['tasks', 'cover', '--by-card', '--json'], { coverLogs: logs, coverCards: () => null });
+  expect(JSON.parse(unreadable.lines[0]!).rows[1]).toMatchObject({ verb: 'review', byTaskAgent: null, total: null, state: 'unreadable' });
+  calls = 0;
+  const plain = await run(['tasks', 'cover', '--json'], { coverLogs: logs, coverCards });
+  expect(calls).toBe(0);
+  expect(JSON.parse(plain.lines[0]!).rows[1]).toMatchObject({ verb: 'review', total: null, state: 'no-denominator' });
+});
+
+test('tasks cover --by-card default reader uses the TA card ledger (ta- ids) — the same ids the task-agent action log carries', async () => {
+  const statePath = join(mkdtempSync(join(tmpdir(), 'tasks-cli-cover-ta-')), 'task-agent-actions.json');
+  const card = (id: string, createdAt: string): TaskCard => ({ id, text: id, createdAt, status: 'launched', history: [] });
+  writeTaskCards(statePath, [card('ta-20261005-aaaaaa', '2026-10-05T00:00:00.000Z'), card('ta-20261006-bbbbbb', '2026-10-06T00:00:00.000Z'), card('ta-20260901-cccccc', '2026-09-01T00:00:00.000Z')]);
+  const logs = (query: { exactCategories?: string[]; events?: string[] }) => {
+    const payloads = query.exactCategories?.[0] === 'task-agent'
+      ? [{ kind: 'review', result: 'done', taskId: 'ta-20261005-aaaaaa' }, { kind: 'review', result: 'done', taskId: 'ta-20260901-cccccc' }]
+      : [{ step: 'merge', ok: true }];
+    return payloads.map((data) => ({ category: query.exactCategories![0], event: query.events![0], data: JSON.stringify(data) }) as LogStoreRow);
+  };
+  const out = await run(['tasks', 'cover', '--by-card', '--json', '--since', '2026-10-01T00:00:00Z'], { coverLogs: logs, taskStatePath: statePath });
+  expect(JSON.parse(out.lines[0]!).rows[1]).toMatchObject({ verb: 'review', byTaskAgent: 1, total: 2, state: 'measured' });
 });
 
 test('task hand inlines a relative multiline goal file and logs the carried sentence exactly once', async () => {
@@ -343,7 +385,51 @@ test('index wires tasks instead of the retirement stub, and scheduler stays reti
   registerTasksCommands(program);
   const command = program.commands.find((entry) => entry.name() === 'tasks');
   expect(command?.aliases()).toContain('task');
-  expect(command?.commands.map((entry) => entry.name())).toEqual(['cover', 'list', 'hand', 'parents', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'approve']);
+  expect(command?.commands.map((entry) => entry.name())).toEqual(['cover', 'list', 'hand', 'hand-move', 'close', 'parents', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'approve']);
+});
+
+test('tasks hand-move — 카드 history 에 손으로 쓴 한 줄을 남긴다 · 모르는 kind 는 원장을 건드리지 않는다', async () => {
+  const statePath = join(mkdtempSync(join(tmpdir(), 'tasks-cli-handmove-')), 'task-agent-actions.json');
+  const seed: TaskCard = { id: 'card-hm', text: '칸 하나', createdAt: '2026-10-11T00:00:00.000Z', status: 'handed',
+    history: [{ at: '2026-10-11T00:00:00.000Z', event: 'hand', detail: '넘김' }] };
+  writeTaskCards(statePath, [seed]);
+  const ok = await run(['tasks', 'hand-move', 'card-hm', '--kind', 'split', '--by', 'OP', '--detail', '한 런에 안 끝나 조각만 남겼다', '--pr', '13045'], { taskStatePath: statePath });
+  expect(ok.code ?? 0).toBe(0);
+  expect(ok.lines).toEqual(['card-hm\thand-move\tsplit\tOP\t한 런에 안 끝나 조각만 남겼다\tpr 13045']);
+  const card = readTaskCard('card-hm', statePath)!;
+  expect(card.history.length).toBe(2);
+  expect(card.history[0]).toEqual(seed.history[0]);
+  expect(card.history[1]).toMatchObject({ event: 'hand-move', kind: 'split', by: 'OP', detail: '한 런에 안 끝나 조각만 남겼다', pr: 13045 });
+  const bad = await run(['tasks', 'hand-move', 'card-hm', '--kind', 'wing-it', '--by', 'OP', '--detail', 'x'], { taskStatePath: statePath });
+  expect(bad.code).toBe(1);
+  expect(bad.lines.join('\n')).toContain('wing-it');
+  expect(readTaskCard('card-hm', statePath)!.history.length).toBe(2);
+});
+
+test('tasks close — 카드를 failed 로 닫고 사유를 history 에 남긴다 · 없는 카드 id 는 exit 1 로 거부하고 원장을 건드리지 않는다', async () => {
+  const statePath = join(mkdtempSync(join(tmpdir(), 'tasks-cli-close-')), 'task-agent-actions.json');
+  const seed: TaskCard = { id: 'ta-close', text: '칸 하나', createdAt: '2026-10-11T00:00:00.000Z', status: 'launched',
+    history: [{ at: '2026-10-11T00:00:00.000Z', event: 'launch', detail: '발사' }] };
+  writeTaskCards(statePath, [seed]);
+  const ok = await run(['tasks', 'close', 'ta-close', '--reason', '다른 골로 대체됨', '--by', 'OP'], { taskStatePath: statePath });
+  expect(ok.code ?? 0).toBe(0);
+  expect(ok.lines).toEqual(['ta-close\tfailed\tclosed-by-hand\tOP\t다른 골로 대체됨']);
+  const card = readTaskCard('ta-close', statePath)!;
+  expect(card.status).toBe('failed');
+  expect(card.history.length).toBe(2);
+  expect(card.history[0]).toEqual(seed.history[0]);
+  expect(card.history[1]).toMatchObject({ event: 'closed-by-hand', kind: 'closed-by-hand', reason: '다른 골로 대체됨', by: 'OP' });
+  const before = readFileSync(statePath, 'utf8');
+  const again = await run(['tasks', 'close', 'ta-close', '--reason', '다시', '--json'], { taskStatePath: statePath });
+  expect(JSON.parse(again.lines.at(-1)!)).toEqual({ id: 'ta-close', from: 'failed', to: 'failed', reason: '다른 골로 대체됨', already: true });
+  expect(readTaskCard('ta-close', statePath)!.history.length).toBe(2);
+  const unknown = await run(['tasks', 'close', 'ta-nope', '--reason', 'x'], { taskStatePath: statePath });
+  expect(unknown.code).toBe(1);
+  expect(unknown.lines.join('\n')).toContain('ta-nope');
+  expect(readFileSync(statePath, 'utf8')).toBe(before);
+  const blank = await run(['tasks', 'close', 'ta-close', '--reason', '   '], { taskStatePath: statePath });
+  expect(blank.code).toBe(1);
+  expect(readFileSync(statePath, 'utf8')).toBe(before);
 });
 
 test('an isolated universe without an acp-token still lists — no Authorization header is sent', async () => {
@@ -469,6 +555,20 @@ test('STOP-RECORD launch-failed: through task hand --live the card is launch-fai
   expect(cards[0]!.history[0]!.detail).toContain('child rc=2: error: bad argv');
   expect(written).toHaveLength(1);
   expect(written[0]!.data).toMatchObject({ class: 'launch-failed' });
+});
+
+test('tasks adopt-runs backfills uncarded registry runs into the injected state file only', async () => {
+  const { writeLaunchBinding } = await import('../harness/launch-registry.js');
+  const root = mkdtempSync(join(tmpdir(), 'tasks-adopt-runs-'));
+  const statePath = join(root, 'task-agent-actions.json');
+  const registryDir = join(root, 'registry');
+  writeLaunchBinding('run-backfill', { pid: 1, startedAt: 1, cwd: root, runsDir: join(root, 'self-dev-runs') }, registryDir);
+  writeLaunchBinding('run-foreign', { pid: 1, startedAt: 1, cwd: root, runsDir: join(root, 'test', 'self-dev-runs') }, registryDir);
+  const first = await run(['tasks', 'adopt-runs', '--json'], { taskStatePath: statePath, adoptRuns: { registryDir, log: () => {} } });
+  expect(JSON.parse(first.lines[0] ?? '{}')).toEqual({ scanned: 2, adopted: 1, skipped: { 'universe-mismatch': 1 } });
+  expect(Object.keys(JSON.parse(readFileSync(statePath, 'utf8')).tasks)).toEqual(['ta-run-backfill']);
+  const again = await run(['tasks', 'adopt-runs'], { taskStatePath: statePath, adoptRuns: { registryDir, log: () => {} } });
+  expect(again.lines).toEqual(['등록부 런 2 · 카드 만듦 0 · 건너뜀 already-carded 1 · universe-mismatch 1']);
 });
 
 test('TA-LIVE-MOVE-CARD-HISTORY — tasks show <card> reads the card ledger and prints live-move lines (shadow ok = —)', async () => {

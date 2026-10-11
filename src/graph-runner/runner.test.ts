@@ -59,6 +59,211 @@ edges:
   return { graph, root };
 }
 
+function unitFixture(innerSteps = 3): { graph: string; root: string; unit: string } {
+  const root = mkdtempSync(join(tmpdir(), 'graph-unit-'));
+  dirs.push(root);
+  const unitDir = join(root, 'units');
+  mkdirSync(unitDir);
+  const graph = join(root, 'graph.yaml');
+  const unit = join(unitDir, 'worker.yaml');
+  writeFileSync(join(root, 'recipes.yaml'), '{}\n');
+  writeFileSync(join(unitDir, 'recipes.yaml'), `produce:
+  command: >-
+    bun -e 'const c=JSON.parse(require("fs").readFileSync(process.env.ELANOUS_GRAPH_CONTEXT,"utf8")); console.log(JSON.stringify({answer:c.input.request==="hello"?"world":"unexpected"}))'
+`);
+  writeFileSync(graph, `graph_id: parent
+version: 1
+entry_node: invoke
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: invoke
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: worker@1
+    budget: { inner_steps: ${innerSteps} }
+    contract: { inputs: [request], tools: read-only, outputs: [answer] }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: invoke, on: outcome, map: { done: done, failed: failed } }
+`);
+  writeFileSync(unit, `graph_id: worker
+version: 1
+unit: { inputs: [request], outputs: [answer], exits: [done, failed] }
+entry_node: produce
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: produce, kind: agent, recipe: 'cmd:produce', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: produce, on: outcome, map: { ok: done, fail: failed } }
+`);
+  return { graph, root, unit };
+}
+
+test('subgraph runs a child with contracted input/output and linked ledgers plus enter/exit events', async () => {
+  const { graph, root } = unitFixture();
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const parent = await runGraph(graph, { runId: 'parent-1', input: { request: 'hello' }, deps: { root,
+    log: (event, data) => { events.push({ event, data }); },
+  } });
+  expect(parent.status).toBe('done');
+  expect(parent.path).toEqual(['invoke', 'done']);
+  expect(parent.unitCalls).toHaveLength(1);
+  const childRunId = parent.unitCalls![0]!.childRunId;
+  expect(typeof childRunId).toBe('string');
+  expect(parent.unitCalls![0]).toMatchObject({ node: 'invoke', unit: 'worker', version: 1, hash: expect.any(String),
+    exit: 'done', steps: 2 });
+  expect(parent.nodes[0]).toMatchObject({ executed: true, output: '{"outcome":"done","answer":"world"}' });
+  const child = JSON.parse(readFileSync(join(root, 'graph-runs', 'worker', `${childRunId}.json`), 'utf8'));
+  expect(child).toMatchObject({ runId: childRunId, graphId: 'worker', parentRunId: parent.runId, status: 'done', input: { request: 'hello' } });
+  expect(JSON.parse(readFileSync(parent.statePath, 'utf8')).unitCalls).toEqual(parent.unitCalls);
+  expect(events.filter(entry => entry.event === 'graph.unit')).toMatchObject([
+    { data: { phase: 'enter', runId: parent.runId, childRunId } },
+    { data: { phase: 'exit', runId: parent.runId, childRunId, exit: 'done', steps: 2 } },
+  ]);
+  expect(debug.events(500).filter(entry => entry.category === 'graph.unit' &&
+    (entry.data as { runId?: string })?.runId === parent.runId).map(entry => entry.event)).toEqual(['enter', 'exit']);
+});
+
+test('subgraph reads contracted output from the producing record despite intervening nodes', async () => {
+  const { graph, root, unit } = unitFixture(4);
+  writeFileSync(join(root, 'units', 'recipes.yaml'), `${readFileSync(join(root, 'units', 'recipes.yaml'), 'utf8')}inspect:\n  command: 'echo inspected'\n`);
+  writeFileSync(unit, readFileSync(unit, 'utf8')
+    .replace("  - { node_id: done, kind: gate", "  - { node_id: inspect, kind: agent, recipe: 'cmd:inspect', max_visits: 1 }\n  - { node_id: done, kind: gate")
+    .replace('map: { ok: done, fail: failed } }', 'map: { ok: inspect, fail: failed } }\n  - { from: inspect, on: outcome, map: { ok: done, fail: failed } }'));
+  const run = await runGraph(graph, { input: { request: 'hello' }, deps: { root,
+    runBash: async (_body, opts) => ({ stdout: opts.env?.ELANOUS_GRAPH_CONTEXT &&
+      JSON.parse(readFileSync(opts.env.ELANOUS_GRAPH_CONTEXT, 'utf8')).nodeId === 'produce'
+      ? '{"answer":"world"}' : 'inspected', stderr: '', exitCode: 0 }),
+  } });
+  expect(run.status).toBe('done');
+  expect(run.nodes[0]?.output).toBe('{"outcome":"done","answer":"world"}');
+  expect(run.unitCalls?.[0]?.steps).toBe(3);
+});
+
+test('subgraph rejects incompatible contracts, missing inputs/outputs, over-budget work and cycles', async () => {
+  const { graph, root, unit } = unitFixture();
+  const original = readFileSync(graph, 'utf8');
+  const deps = { root, runBash: async () => ({ stdout: '{"answer":"world"}', stderr: '', exitCode: 0 }) };
+  writeFileSync(graph, original.replace('outputs: [answer]', 'outputs: [other]'));
+  await expect(runGraph(graph, { input: { request: 'hello' }, deps })).rejects.toThrow('unit contract mismatch');
+  expect(existsSync(join(root, 'graph-runs'))).toBe(false);
+  writeFileSync(graph, original);
+  const rejectedEvents: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const noInput = await runGraph(graph, { deps: { ...deps, log: (event, data) => { rejectedEvents.push({ event, data }); } } });
+  expect(rejectedEvents.filter(entry => entry.event === 'graph.unit')).toEqual([]);
+  expect(noInput.status).toBe('failed');
+  expect(noInput.nodes[0]).toMatchObject({ executed: false, error: expect.stringContaining('unit input missing') });
+  expect(noInput.executed).toBe(0);
+  expect(JSON.parse(readFileSync(noInput.statePath, 'utf8')).nodes[0].executed).toBe(false);
+  expect(noInput.unitCalls).toBeUndefined();
+  expect(existsSync(join(root, 'graph-runs', 'worker'))).toBe(false);
+  const noOutput = await runGraph(graph, { input: { request: 'hello' }, deps: { root,
+    runBash: async () => ({ stdout: '{}', stderr: '', exitCode: 0 }) } });
+  expect(noOutput.status).toBe('failed');
+  expect(noOutput.nodes[0]?.error).toContain('unit output missing');
+  writeFileSync(graph, original.replace('inner_steps: 3', 'inner_steps: 1'));
+  const budget = await runGraph(graph, { input: { request: 'hello' }, deps });
+  expect(budget.status).toBe('failed');
+  expect(budget.nodes[0]?.error).toContain('unit inner_steps exceeded');
+  writeFileSync(graph, original);
+  writeFileSync(unit, readFileSync(unit, 'utf8').replace('  - { node_id: produce, kind: agent, recipe: \'cmd:produce\', max_visits: 1 }',
+    '  - { node_id: produce, kind: subgraph, recipe: none, max_visits: 1, call: worker@1, budget: { inner_steps: 4 }, contract: { inputs: [request], tools: read-only, outputs: [answer] } }')
+    .replace('map: { ok: done, fail: failed }', 'map: { done: done, failed: failed }'));
+  await expect(runGraph(graph, { input: { request: 'hello' }, deps })).rejects.toThrow('unit cycle');
+});
+
+test('unit source changed after validation has no enter/exit or child ledger', async () => {
+  const { graph, root, unit } = unitFixture();
+  const events: string[] = [];
+  const run = await runGraph(graph, { input: { request: 'hello' }, deps: { root,
+    beforeNode: () => { if (events.length === 0) writeFileSync(unit, `${readFileSync(unit, 'utf8')}\n`); events.push('visited'); },
+    log: event => { if (event === 'graph.unit') events.push(event); },
+  } });
+  expect(run.status).toBe('failed');
+  expect(run.nodes[0]).toMatchObject({ executed: false, error: expect.stringContaining('unit source changed before call') });
+  expect(run.executed).toBe(0);
+  expect(JSON.parse(readFileSync(run.statePath, 'utf8')).nodes[0].executed).toBe(false);
+  expect(events).not.toContain('graph.unit');
+  expect(run.unitCalls).toBeUndefined();
+  expect(existsSync(join(root, 'graph-runs', 'worker'))).toBe(false);
+});
+
+test('nested units reject a fourth level before any command, and child failure keeps both ledgers linked', async () => {
+  const { graph, root, unit } = unitFixture();
+  const source = readFileSync(unit, 'utf8');
+  const unitDir = join(root, 'units');
+  for (const [id, next] of [['worker', 'level-2'], ['level-2', 'level-3'], ['level-3', 'level-4']] as const) {
+    const content = source.replace('graph_id: worker', `graph_id: ${id}`)
+      .replace('  - { node_id: produce, kind: agent, recipe: \'cmd:produce\', max_visits: 1 }',
+        `  - { node_id: produce, kind: subgraph, recipe: none, max_visits: 1, call: ${next}@1, budget: { inner_steps: 20 }, contract: { inputs: [request], tools: read-only, outputs: [answer] } }`)
+      .replace('map: { ok: done, fail: failed }', 'map: { done: done, failed: failed }');
+    writeFileSync(join(unitDir, `${id}.yaml`), content);
+  }
+  writeFileSync(join(unitDir, 'level-4.yaml'), source.replace('graph_id: worker', 'graph_id: level-4'));
+  let calls = 0;
+  await expect(runGraph(graph, { input: { request: 'hello' }, deps: { root, runBash: async () => {
+    calls++;
+    return { stdout: '', stderr: '', exitCode: 0 };
+  } } })).rejects.toThrow('unit nesting exceeds depth 3');
+  expect(calls).toBe(0);
+  writeFileSync(unit, source);
+  const failed = await runGraph(graph, { input: { request: 'hello' }, deps: { root,
+    runBash: async () => ({ stdout: '{"answer":"unavailable"}', stderr: '', exitCode: 1 }) } });
+  expect(failed.status).toBe('failed');
+  expect(failed.unitCalls).toHaveLength(1);
+  const child = JSON.parse(readFileSync(join(root, 'graph-runs', 'worker', `${failed.unitCalls![0]!.childRunId}.json`), 'utf8'));
+  expect(child.parentRunId).toBe(failed.runId);
+  expect(child.status).toBe('failed');
+  expect(failed.unitCalls![0]!.exit).toBe('failed');
+});
+
+test('subgraph dry run plans the walk without a child run, unit event or unitCalls entry', async () => {
+  const { graph, root } = unitFixture();
+  const events: string[] = [];
+  let calls = 0;
+  const run = await runGraph(graph, { dryRun: true, input: { request: 'hello' }, deps: { root,
+    runBash: async () => { calls++; return { stdout: '{"answer":"world"}', stderr: '', exitCode: 0 }; },
+    log: event => { events.push(event); } } });
+  expect(run.status).toBe('done');
+  expect(run.path).toEqual(['invoke', 'done']);
+  expect(run.nodes[0]).toMatchObject({ executed: false });
+  expect(run.executed).toBe(0);
+  expect(run.unitCalls).toBeUndefined();
+  expect(calls).toBe(0);
+  expect(events).not.toContain('graph.unit');
+  expect(existsSync(join(root, 'graph-runs', 'worker'))).toBe(false);
+});
+
+test('child unit events carry parentRunId; contract mismatch and budget exhaustion emit graph.unit events', async () => {
+  const { graph, root } = unitFixture();
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const parent = await runGraph(graph, { input: { request: 'hello' }, deps: { root, log: (event, data) => { events.push({ event, data }); } } });
+  const childRunId = parent.unitCalls![0]!.childRunId;
+  const childEvents = events.filter(entry => entry.data.runId === childRunId);
+  expect(childEvents.length).toBeGreaterThan(0);
+  expect(childEvents.every(entry => entry.data.parentRunId === parent.runId)).toBe(true);
+  expect(events.filter(entry => entry.data.runId === parent.runId).some(entry => 'parentRunId' in entry.data && entry.event !== 'graph.unit')).toBe(false);
+
+  const original = readFileSync(graph, 'utf8');
+  writeFileSync(graph, original.replace('outputs: [answer]', 'outputs: [other]'));
+  await expect(runGraph(graph, { input: { request: 'hello' }, deps: { root } })).rejects.toThrow('unit contract mismatch');
+  expect(debug.events(500).some(entry => entry.category === 'graph.unit' && entry.event === 'contract-mismatch' &&
+    (entry.data as { nodeId?: string })?.nodeId === 'invoke')).toBe(true);
+
+  writeFileSync(graph, original.replace('inner_steps: 3', 'inner_steps: 1'));
+  const budgetEvents: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const budget = await runGraph(graph, { input: { request: 'hello' }, deps: { root,
+    runBash: async () => ({ stdout: '{"answer":"world"}', stderr: '', exitCode: 0 }),
+    log: (event, data) => { budgetEvents.push({ event, data }); } } });
+  expect(budget.status).toBe('failed');
+  expect(budgetEvents.filter(entry => entry.event === 'graph.unit' && entry.data.runId === budget.runId).map(entry => entry.data.phase))
+    .toEqual(['enter', 'budget-exhausted', 'exit']);
+});
+
 test('installed plugin graphs receive only their own credential environment', async () => {
   const root = mkdtempSync(join(tmpdir(), 'graph-credential-'));
   dirs.push(root);
@@ -180,6 +385,9 @@ test('two successful commands reach done and persist both outcomes', async () =>
   expect(result.status).toBe('done');
   expect(result.path).toEqual(['first', 'second', 'done']);
   expect(result.executed).toBe(2);
+  expect(result.unitCalls).toBeUndefined();
+  expect(result.parentRunId).toBeUndefined();
+  expect(result.statePath).toBe(join(root, 'graph-runs', 'test-graph', 'success.json'));
   expect(existsSync(join(root, 'heal', 'inbox.jsonl'))).toBe(false);
   expect(JSON.parse(readFileSync(result.statePath, 'utf8')).nodes.slice(0, 2)).toEqual([
     { nodeId: 'first', ok: true, exit: 0, executed: true, output: '', startedAt: expect.any(String), endedAt: expect.any(String), seconds: expect.any(Number) },
@@ -193,6 +401,19 @@ function expectNodeTimes(record: { startedAt?: string; endedAt?: string; seconds
   expect(Date.parse(record!.startedAt!)).toBeLessThanOrEqual(Date.parse(record!.endedAt!));
   expect(record!.seconds).toBeGreaterThanOrEqual(0);
 }
+
+test('legacy dotted run identifiers keep their filename and reload on restart', async () => {
+  const { graph, root } = fixture('exit 1');
+  const failed = await runGraph(graph, { runId: 'legacy.run-1', deps: { root } });
+  expect(failed.statePath).toBe(join(root, 'graph-runs', 'test-graph', 'legacy.run-1.json'));
+  expect(latestGraphRun('test-graph', root)?.runId).toBe('legacy.run-1');
+  expect(failed.status).toBe('failed');
+  const resumed = await runGraph(graph, { resumeRunId: 'legacy.run-1', fromNodeId: 'first', deps: { root,
+    runBash: async () => ({ stdout: '', stderr: '', exitCode: 0 }) } });
+  expect(resumed.status).toBe('done');
+  expect(resumed.statePath).toBe(failed.statePath);
+  expect(resumed.resume?.from).toBe('first');
+});
 
 test('GRAPH-NODE-TIMES: each run node records start, end and seconds in the ledger, and no running node is left behind', async () => {
   const { graph, root } = fixture('sleep 0.2');

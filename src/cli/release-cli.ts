@@ -5,8 +5,8 @@
 //   elanous release tag --version <x.y.z> --source <commit> [--yes]
 //   elanous release verify  [--version <x.y.z>]
 //   elanous release notes   --from <ref> [--to <ref>]
-//   elanous release run     --version <x.y.z> [--prerelease rc] [--main-cut | --cut-commit <sha>] [--publish-at <iso>] [--dry-run] [--json] [--if-ready]
-//   elanous release resume  --run <runId> --from <node> [--waive <node> --reason <text>] [--accepted-regressions <json>] [--json]
+//   elanous release run     --version <x.y.z> [--prerelease rc] [--main-cut | --cut-commit <sha>] [--publish-at <iso>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--dry-run] [--json] [--if-ready]
+//   elanous release resume  --run <runId> --from <node> [--waive <node> --reason <text>] [--accepted-regressions <json>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--json]
 //   elanous release auto-start [--window-minutes <n>] [--apply] [--json]
 //   elanous release rehearsal tick [--apply] [--checkout <dir>] [--json]
 //   elanous release preflight --version <x.y.z> [--publish-at <iso>] [--json]   (컷 30분 전 사전 점검 · 읽기 전용 · ⛔ 있으면 exit 1)
@@ -989,7 +989,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .action(async (o: { version: string; base: string; pick: string[]; append?: boolean; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => cutReleaseBranch({ ...o, log }), () => true);
     });
-  const runAction = async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {
+  const runAction = async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; gateExecutor?: string; gateHost?: string; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {
       // Only the rc rehearsal channel is operated for now (alpha/beta stay valid version shapes, not run options).
       if (o.prerelease !== undefined && o.prerelease !== 'rc') {
         const message = `--prerelease supports rc only: ${o.prerelease}`;
@@ -1038,7 +1038,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           const outcome = await runReleaseIfReady(o.version, {
             ledgerRoot: releaseRunDeps.ledgerRoot,
             readiness: (version, options) => releaseReadiness(version, { ledgerRoot: releaseRunDeps.ledgerRoot, checklist: releaseRunDeps.checklist, ...options }),
-            run: () => runUnattendedRelease({ version: o.version, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, publishAt: o.publishAt }, releaseRunDeps),
+            run: () => runUnattendedRelease({ version: o.version, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost }, releaseRunDeps),
           });
           if (outcome.skipped) {
             if (o.json) await writeStdoutJson(`${JSON.stringify(outcome)}\n`);
@@ -1066,7 +1066,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         }
       }
       await jsonAction(o.json, async (log) => {
-        const result = await runUnattendedRelease({ version: o.version, dryRun: o.dryRun, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, publishAt: o.publishAt }, releaseRunDeps);
+        const result = await runUnattendedRelease({ version: o.version, dryRun: o.dryRun, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost }, releaseRunDeps);
         log(`${result.dryRun ? '· 드라이런' : '▶ 릴리스 루프'} ${result.input.version} · 입력 ${JSON.stringify(result.input)}`);
         return result;
       }, (r) => r.dryRun || r.state?.status === 'done' || r.state?.status === 'awaiting-approval');
@@ -1081,8 +1081,10 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--if-ready', '준비되지 않았으면 사유를 출력하고 성공으로 건너뛴다')
     .option('--publish-at <iso>', '승인·선행 노드 통과 뒤 지정 시각까지 발행 대기(오프셋 포함 ISO 시각)')
     .option('--force-freeze', '동결 중 게이트·발행 강행(관측 기록) — 가지 컷은 동결이 필요 없다 · 동결은 비상 스위치로 남는다')
+    .option('--gate-executor <pod|host>', 'gate 노드 실행기(기본 pod) — host 는 Pod 대신 SSH 호스트의 깨끗한 클론에서 같은 판정(면제 아님)')
+    .option('--gate-host <ssh-host>', '--gate-executor host 의 SSH 호스트(기본 release.loop.gateRemote)')
     .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
-    .action(async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; json?: boolean }) => { await runAction(o); });
+    .action(async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; gateExecutor?: string; gateHost?: string; json?: boolean }) => { await runAction(o); });
   release.command('preflight')
     .description('컷 30분 전 사전 점검(읽기 전용) — 체크리스트 게이트 모의 · 발행 뒤 칸 · run --dry-run 입력 · 동결 · 일정/게이트 실측. ⛔ 있으면 exit 1')
     .requiredOption('--version <v>', '점검할 판(x.y.z)')
@@ -1128,8 +1130,10 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--waive <node>', '저장된 실패 노드 한 개를 면제(--from 은 그 노드 그대로)')
     .option('--reason <text>', '면제 사유 — 공개 알려진 문제에 들어갈 사용자 영향 설명')
     .option('--accepted-regressions <json>', '알려진 문제 추가 입력 JSON 배열 [{"id":"…","note":"…"}]')
+    .option('--gate-executor <pod|host>', '다시 도는 gate 의 실행기 전환(--from gate 이전만) — 런 입력에 기록 · 면제 아님')
+    .option('--gate-host <ssh-host>', '--gate-executor host 의 SSH 호스트(기본 저장된 런 입력 gateRemote)')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { run: string; from: string; partial?: boolean; waive?: string; reason?: string; acceptedRegressions?: string; json?: boolean }) => {
+    .action(async (o: { run: string; from: string; partial?: boolean; waive?: string; reason?: string; acceptedRegressions?: string; gateExecutor?: string; gateHost?: string; json?: boolean }) => {
       await jsonAction(o.json, async (log) => {
         let acceptedRegressions: AcceptedRegression[] | undefined;
         if (o.acceptedRegressions !== undefined) {
@@ -1143,12 +1147,17 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         const result = await resumeReleaseRun({ runId: o.run, from: o.from, partial: o.partial,
           ...(o.waive === undefined ? {} : { waive: o.waive }),
           ...(o.reason === undefined ? {} : { reason: o.reason }),
-          ...(o.acceptedRegressions === undefined ? {} : { acceptedRegressions }) });
+          ...(o.acceptedRegressions === undefined ? {} : { acceptedRegressions }),
+          ...(o.gateExecutor === undefined ? {} : { gateExecutor: o.gateExecutor }),
+          ...(o.gateHost === undefined ? {} : { gateHost: o.gateHost }) });
+        const override = result.state.inputOverrides?.at(-1);
+        if (o.gateExecutor !== undefined && override) log(`⇄ gate 실행기 ${override.set.gateExecutor}${override.set.gateRemote ? ` @ ${override.set.gateRemote}` : ''} (런 입력에 기록 · 면제 아님)`);
         if (result.partial.requested) log(result.partial.applied
           ? `◐ 부분 재검: ${result.partial.files}파일 · 나머지는 앞 게이트(${result.partial.priorCommit.slice(0, 12)}) 결과를 잇는다`
           : `● 전체 게이트로: ${result.partial.reason}`);
         log(`${result.tip.changed ? `↻ ${result.tip.branch} ${result.tip.from.slice(0, 12)} → ${result.tip.to.slice(0, 12)} (백업 ${result.tip.backup})` : `· ${result.tip.branch} 끝 그대로 ${result.tip.to.slice(0, 12)}`} · ${o.from} 부터 → ${result.state.status}`);
-        return { tip: result.tip, partial: result.partial, status: result.state.status, runId: result.state.runId };
+        return { tip: result.tip, partial: result.partial, status: result.state.status, runId: result.state.runId,
+          ...(o.gateExecutor !== undefined && result.state.inputOverrides?.length ? { gateExecutor: result.state.inputOverrides.at(-1) } : {}) };
       }, (r) => r.status === 'done' || r.status === 'awaiting-approval');
     });
   release.command('rehearsal').description('판 일정에서 컷 전 가벼운 RC 두 단계').command('tick')

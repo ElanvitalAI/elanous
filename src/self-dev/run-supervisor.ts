@@ -1,8 +1,9 @@
 // ── 런 슈퍼바이저 — 「끝까지 돌린다」를 «판정»으로 만든다 ───────────────────────
 
-import { hasDelivered, triageRun, type FailureClassification } from './orchestrate.js';
+import { hasDelivered, resumeKey, triageRun, type FailureClassification } from './orchestrate.js';
 import type { DeployVerifyFinding } from '../harness/browser-verify.js';
-import type { SelfDevJobResult, SupervisorStopReason, SupervisorNext } from './run-types.js';
+import type { SelfDevJobResult, SupervisorStopReason, SupervisorNext, ReviewRework } from './run-types.js';
+import { authorRepairGoal } from '../harness/helper-repair.js';
 export type { SupervisorStopReason } from './run-types.js';
 import { recordSelfDevRunSupervisorStop, selfDevRunsDir } from './run-store.js';
 import { debug } from '../debug/log.js';
@@ -23,6 +24,21 @@ export interface SupervisorRound {
   base?: string;
   actionable: number;
   reviewMustFixTrend?: SupervisorDecision['reviewMustFixTrend'];
+  signatures?: Record<string, string>;
+  oscillationRepairTaskIds?: string[];
+  /** Feature of each `oscillationRepairTaskIds` entry (same index) — reruns that mint a new taskId per round keep the goal. */
+  oscillationRepairFeatures?: string[];
+  /** Authored repair goal texts of that round, by taskId. */
+  oscillationRepairGoals?: Record<string, string>;
+  /** Tasks whose one main-sync relaunch this round used. */
+  mainSyncRelaunchTaskIds?: string[];
+  /** Original feature and relaunch goal text of those tasks — a rerun may mint a new taskId, so the piece is also found by goal. */
+  mainSyncRelaunchFeatures?: string[];
+  /**
+   * Tasks of this round that ended `status=failed` without a PR. Omitted when there are none — and on older
+   * history, which never measured it, so the no-PR streak guard reads it as «not measured» and stays off.
+   */
+  noPrTaskIds?: string[];
 }
 
 export const SUPERVISOR_STOP_REASONS = [
@@ -39,6 +55,7 @@ export const SUPERVISOR_STOP_REASONS = [
   'step-timeout',
   'decomposable-no-progress',
   'review-unobserved',
+  'review-oscillating',
   'deliverable-unobserved',
   'deliverable-merged',
 ] as const satisfies readonly SupervisorStopReason[];
@@ -69,12 +86,18 @@ export interface SupervisorDecision {
   reworkable: string[];
   decomposable: string[];
   repairable: string[];
+  /** Pieces whose main sync is blocked for the first time — relaunched on the latest main instead of waiting for a human. */
+  relaunchOnMain: string[];
+  /** Relaunch goal by taskId for the `relaunchOnMain` pieces that kept a branch; the rerun receives these as `repairGoals`. */
+  relaunchGoals?: Record<string, string>;
   needsHuman: string[];
   classifications: FailureClassification[];
   deliverableObservation: 'not-attempted' | 'failed' | 'observed';
   deliverableUnmeasured: boolean;
   deliverableMergeCompleteness: 'unmeasured' | 'complete' | 'incomplete';
-  reviewMustFixTrend: 'unmeasured' | 'improving' | 'stable' | 'worsening';
+  reviewMustFixTrend: ReviewRework['trend'];
+  oscillation?: { taskIds: string[]; helper: 'review-oscillation'; signature: string; repairGoals?: Record<string, string>; heldTaskIds?: string[] };
+  pendingDecision?: 'attempt-care-escalation';
 }
 
 export interface SupervisorLimits {
@@ -127,7 +150,19 @@ function awaitingHumanStopWhy(classifications: readonly FailureClassification[])
 }
 
 function countActionable(t: ReturnType<typeof triageRun>): number {
-  return t.rerunnable.length + t.reworkable.length + t.decomposable.length + t.repairable.length;
+  return t.rerunnable.length + t.reworkable.length + t.decomposable.length + t.repairable.length + t.relaunchOnMain.length;
+}
+
+/** The goal a main-sync relaunch runs: the same goal text under one head line naming the preserved branch. */
+export function mainSyncRelaunchGoal(feature: string, branch: string): string {
+  return `참고 가지: ${branch} — 앞 런 구현. 최신 main 위에서 같은 의도를 다시 구현하되 이 가지의 diff 를 참고\n${feature}`;
+}
+
+/** A piece gets one main-sync relaunch: spent when an earlier round recorded its task or its goal (original or relaunch text). */
+function mainSyncRelaunchSpent(history: readonly SupervisorRound[]): (result: SelfDevJobResult) => boolean {
+  const taskIds = new Set(history.flatMap((entry) => entry.mainSyncRelaunchTaskIds ?? []));
+  const features = new Set(history.flatMap((entry) => entry.mainSyncRelaunchFeatures ?? []).map(resumeKey));
+  return (result) => taskIds.has(result.taskId) || features.has(resumeKey(result.feature));
 }
 
 type GoalPlanRevisionObservation = SelfDevJobResult['goalPlanRevision'];
@@ -172,6 +207,13 @@ export type SupervisorJobResult = SelfDevJobResult & {
   next?: SupervisorNext;
 };
 
+export function aggregateReviewTrend(results: readonly SelfDevJobResult[]): ReviewRework['trend'] | undefined {
+  const trends = results.flatMap((result) => result.rework ? [result.rework.trend] : []);
+  if (!trends.length) return undefined;
+  const severity: readonly ReviewRework['trend'][] = ['unmeasured', 'improving', 'stable', 'worsening', 'oscillating'];
+  return severity[Math.max(...trends.map((trend) => severity.indexOf(trend)))];
+}
+
 export function decideNextRun(input: {
   results: readonly SupervisorJobResult[];
   history?: readonly SupervisorRound[];
@@ -181,7 +223,9 @@ export function decideNextRun(input: {
   reviewed?: boolean;
   reviewReason?: string;
   deliverableMerge?: { readonly expected: number; readonly merged: number };
-  reviewMustFixTrend?: 'improving' | 'stable' | 'worsening';
+  reviewMustFixTrend?: ReviewRework['trend'];
+  /** True: the rerun consumes the authored goal. False: it cannot, so oscillation stops for a human. Undefined: pure decision. */
+  repairGoalExecution?: boolean;
 }): SupervisorDecision {
   const results = [...input.results];
   const history = [...(input.history ?? [])];
@@ -198,7 +242,16 @@ export function decideNextRun(input: {
   const handedOffIds = new Set(handedOff.map((result) => result.taskId));
   const deployFindings = input.deployFindings === undefined ? undefined
     : new Map([...input.deployFindings].filter(([taskId]) => !handedOffIds.has(taskId)));
-  const t = triageRun(activeResults, deployFindings, observation === 'failed');
+  const t = triageRun(activeResults, deployFindings, observation === 'failed', undefined, mainSyncRelaunchSpent(history));
+  const relaunchGoals: Record<string, string> = Object.fromEntries(activeResults.flatMap((result) =>
+    t.relaunchOnMain.includes(result.taskId) && result.branch
+      ? [[result.taskId, mainSyncRelaunchGoal(result.feature, result.branch)]] : []));
+  const noteMainSyncRelaunch = (): void => {
+    for (const taskId of t.relaunchOnMain) {
+      const branch = activeResults.find((result) => result.taskId === taskId)?.branch ?? null;
+      try { debug.log('self-dev.supervisor', 'merge-conflict-relaunch', { taskId, branch, attempt: 1 }); } catch { /* fail-open */ }
+    }
+  };
   const round = history.length;
   const landed = countLanded(results);
   const baseCompleted = countBaseCompleted(results);
@@ -230,6 +283,8 @@ export function decideNextRun(input: {
     reworkable: t.reworkable,
     decomposable: t.decomposable,
     repairable: t.repairable,
+    relaunchOnMain: t.relaunchOnMain,
+    ...(Object.keys(relaunchGoals).length > 0 ? { relaunchGoals } : {}),
     needsHuman: t.needsHuman,
     classifications: t.classifications,
   };
@@ -244,8 +299,10 @@ export function decideNextRun(input: {
     };
   }
 
-  const harvestable = results.filter((result) => result.harvestable === true && !!result.branch);
-  if (harvestable.length > 0) {
+  // A first main-sync block is relaunched before it is judged harvestable; the spent ones stop for a human as before.
+  const harvestable = results.filter((result) => result.harvestable === true && !!result.branch
+    && !t.relaunchOnMain.includes(result.taskId));
+  if (harvestable.length > 0 && t.relaunchOnMain.length === 0) {
     return {
       ...base,
       action: 'stop',
@@ -308,6 +365,7 @@ export function decideNextRun(input: {
     && t.reworkable.length === 0
     && t.decomposable.length === 0
     && t.repairable.length === 0
+    && t.relaunchOnMain.length === 0
   ) {
     return {
       ...base,
@@ -335,7 +393,7 @@ export function decideNextRun(input: {
   }
 
   // Only stop when every candidate for the next round is blocked by observed quota exhaustion.
-  const retryIds = [...new Set([...t.rerunnable, ...t.reworkable, ...t.decomposable, ...t.repairable])];
+  const retryIds = [...new Set([...t.rerunnable, ...t.reworkable, ...t.decomposable, ...t.repairable, ...t.relaunchOnMain])];
   if (retryIds.length > 0 && retryIds.every((taskId) => results.some((result) =>
     result.taskId === taskId && result.providerErrors?.category === 'quota'))) {
     const failures = results.filter((result) => retryIds.includes(result.taskId));
@@ -375,7 +433,7 @@ export function decideNextRun(input: {
       }
       // 🩸 2026-09-24 🅕: 결말을 가른 것은 공급자 오류 수가 아니라 «리뷰가 시간 안에 판정을 냈나»였다(n=3 · step-timeout 0·1·2
       //   가 결말과 같은 순서). 제자리의 원인이 단계 시간 초과면 «골을 의심하라» 대신 그 이름을 댄다.
-      const stalledRetryIds = [...new Set([...t.rerunnable, ...t.reworkable, ...t.decomposable, ...t.repairable])];
+      const stalledRetryIds = [...new Set([...t.rerunnable, ...t.reworkable, ...t.decomposable, ...t.repairable, ...t.relaunchOnMain])];
       const timedOut = results.filter((result) => stalledRetryIds.includes(result.taskId) && result.stage === 'timed-out');
       if (stalledRetryIds.length > 0 && timedOut.length === stalledRetryIds.length) {
         const providerNote = timedOut.some((result) => result.providerErrors)
@@ -397,6 +455,85 @@ export function decideNextRun(input: {
     }
   }
 
+  // AUT-NO-PROGRESS-RETRY-LOOP — 같은 후보가 PR 없이 두 라운드 연속 실패하면 세 번째 Pod 를 띄우지 않는다
+  //   (부검 run-1166bcd1 · run-1bde4815 · run-427bd632 · run-46a02f42). 직전 라운드가 noPrTaskIds 를 안 쟀으면 서지 않는다.
+  //   호출자가 stallRounds 를 기본보다 늘렸으면(제자리 인내를 늘림) 서지 않는다 — 0.2.24 컷 회귀(orchestrate-cli.test 라운드 상한 둘).
+  const previousNoPr = history.at(-1)?.noPrTaskIds;
+  if (previousNoPr !== undefined && retryIds.length > 0 && stallRounds <= DEFAULT_STALL_ROUNDS) {
+    const failedNoPr = (taskId: string) => activeResults.find((result) => result.taskId === taskId
+      && result.status === 'failed' && result.prNumber === undefined);
+    const streak = retryIds.every((taskId) => previousNoPr.includes(taskId) && failedNoPr(taskId) !== undefined);
+    if (streak && !madeProgress(history.at(-1), thisRound)) {
+      const errors = retryIds.flatMap((taskId) => {
+        const message = failedNoPr(taskId)?.error?.message;
+        return message ? [message.slice(0, 200)] : [];
+      });
+      try { debug.log('self-dev.supervisor', 'no-pr-streak-stop', { taskIds: retryIds, round, errors }); } catch { /* fail-open */ }
+      return {
+        ...base,
+        action: 'stop',
+        stopReason: 'no-progress',
+        why: ['PR 없이 2라운드 연속 실패 — 같은 골 재시도 대신 골·불변식 개정 또는 hold', ...errors].join(' · '),
+      };
+    }
+  }
+
+  const preceding = history.at(-1);
+  const oscillating = activeResults.filter((result) => retryIds.includes(result.taskId) && result.rework
+    && (result.rework.trend === 'oscillating'
+      || !!result.rework.signature && preceding?.signatures?.[result.taskId] === result.rework.signature));
+  if (oscillating.length > 0) {
+    // Repaired = same taskId, explicit lineage (`oscillationRepairOf`), or a feature that IS an authored repair goal
+    // text (orchestrate runs it as the piece's feature) — never a mere shared original feature.
+    const isRepaired = (result: SupervisorJobResult): boolean => history.some((entry) =>
+      (entry.oscillationRepairTaskIds ?? []).some((id, index) => id === result.taskId || id === result.oscillationRepairOf
+        || (entry.oscillationRepairFeatures?.[index] !== undefined && entry.oscillationRepairFeatures[index] === result.feature
+          && Object.values(entry.oscillationRepairGoals ?? {}).includes(result.feature))));
+    // Per task: a task that already got its one oscillation repair is held for a human; a fresh one may get it.
+    const fresh = oscillating.filter((result) => !isRepaired(result));
+    const held = [...new Set(oscillating.filter(isRepaired).map((result) => result.taskId))];
+    const repairGoals: Record<string, string> = Object.fromEntries(fresh.flatMap((result) => {
+      const goal = result.prNumber && result.reviewMustFix?.length
+        ? authorRepairGoal({ pr: result.prNumber, category: 'review-oscillation', originalRequest: result.feature,
+          mustFix: result.reviewMustFix }) : null;
+      return goal ? [[result.taskId, goal]] : [];
+    }));
+    // A caller that declares it cannot run the authored goal (false), or one that can but has no goal for every fresh
+    // oscillating task, would turn add-repair-task into a same-strategy relaunch — stop for a human instead.
+    // Undefined is the pure decision (caller unknown): it names the first repair as the goal contract asks.
+    const cannotRepair = fresh.length > 0 && (input.repairGoalExecution === false
+      || (input.repairGoalExecution === true && fresh.some((result) => !repairGoals[result.taskId])));
+    const action = fresh.length === 0 || cannotRepair ? 'stop' : 'add-repair-task';
+    const taskIds = action === 'stop'
+      ? [...new Set(oscillating.map((result) => result.taskId))]
+      : [...new Set(fresh.map((result) => result.taskId))];
+    const signatureOf = (results: readonly SupervisorJobResult[]): string => results.map((result) => result.rework!.signature).join(' · ') || '(서명 없음)';
+    const signature = oscillating.filter((result) => taskIds.includes(result.taskId)).map((result) => result.rework!.signature).join(' · ');
+    const withoutHeld = (ids: readonly string[]): string[] => ids.filter((id) => !held.includes(id));
+    try { debug.log('self-dev.supervisor', 'oscillation-seen', { taskIds, signature, trend: reviewMustFixTrend, action, ...(held.length ? { held } : {}) }); } catch { /* fail-open */ }
+    if (action === 'add-repair-task') noteMainSyncRelaunch();
+    return {
+      ...base,
+      ...(action === 'add-repair-task' && held.length > 0 ? {
+        rerunnable: withoutHeld(base.rerunnable), reworkable: withoutHeld(base.reworkable),
+        decomposable: withoutHeld(base.decomposable), repairable: withoutHeld(base.repairable),
+        needsHuman: [...new Set([...base.needsHuman, ...held])],
+      } : {}),
+      action,
+      ...(action === 'stop' ? { stopReason: 'review-oscillating' as const } : {}),
+      oscillation: { taskIds, helper: 'review-oscillation', signature, ...(Object.keys(repairGoals).length ? { repairGoals } : {}),
+        ...(action === 'add-repair-task' && held.length ? { heldTaskIds: held } : {}) },
+      pendingDecision: 'attempt-care-escalation',
+      why: fresh.length === 0
+        ? `리뷰 진동 반복 — ${signatureOf(oscillating)} · 사람 결정 필요(같은 전략 재발사 금지)`
+        : cannotRepair
+          ? `리뷰 진동 — ${signatureOf(oscillating)} · ${input.repairGoalExecution === false ? '이 감독 경로가 수리 골 실행을 선언하지 않았다(미선언 또는 불가)' : '수리 원문/PR 관측 불가'} · 사람 결정 필요(같은 전략 재발사 금지)`
+          : `리뷰 진동 — ${signatureOf(fresh)} · review-oscillation 수리 조각을 한 번 붙인다${input.repairGoalExecution === true ? '' : '(실행 배선 미선언 — 결정 칸만)'}${held.length ? ` · 이미 수리한 조각 ${held.join(', ')} 은 사람 결정 대기` : ''}`,
+    };
+  }
+
+  noteMainSyncRelaunch();
+
   if (t.repairable.length > 0) {
     return {
       ...base,
@@ -408,7 +545,7 @@ export function decideNextRun(input: {
   return {
     ...base,
     action: 'relaunch',
-    why: `다시 건다 — 그대로 재실행 ${t.rerunnable.length} · 재작업 ${t.reworkable.length} · 분해 ${t.decomposable.length} · 수리 ${t.repairable.length} · 라운드 ${round + 1}/${maxRounds}`,
+    why: `다시 건다 — 그대로 재실행 ${t.rerunnable.length} · 재작업 ${t.reworkable.length} · 분해 ${t.decomposable.length} · 수리 ${t.repairable.length}${t.relaunchOnMain.length > 0 ? ` · main 위 재발사 ${t.relaunchOnMain.length}` : ''} · 라운드 ${round + 1}/${maxRounds}`,
   };
 }
 
@@ -416,22 +553,46 @@ export function appendRound(
   history: readonly SupervisorRound[],
   results: readonly SupervisorJobResult[],
   reviewMustFixTrend?: SupervisorDecision['reviewMustFixTrend'],
+  decision?: SupervisorDecision,
 ): SupervisorRound[] {
-  const t = triageRun(results.filter((result) => result.salvage !== 'launched'));
+  const t = triageRun(results.filter((result) => result.salvage !== 'launched'), undefined, false, undefined, mainSyncRelaunchSpent(history));
   const baseCompleted = countBaseCompleted(results);
   const base = roundBase(results);
+  const noPrTaskIds = results.filter((result) => result.status === 'failed' && result.prNumber === undefined)
+    .map((result) => result.taskId);
   return [...history, {
     round: history.length,
     landed: countLanded(results),
     ...(baseCompleted > 0 || base !== undefined ? { baseCompleted, ...(base === undefined ? {} : { base }) } : {}),
     actionable: countActionable(t),
     ...(reviewMustFixTrend === undefined ? {} : { reviewMustFixTrend }),
+    ...(results.some((result) => result.rework?.signature)
+      ? { signatures: Object.fromEntries(results.filter((result) => result.rework?.signature).map((result) => [result.taskId, result.rework!.signature])) } : {}),
+    ...(decision && decision.action !== 'stop' && decision.relaunchOnMain.length > 0 ? {
+      mainSyncRelaunchTaskIds: decision.relaunchOnMain,
+      mainSyncRelaunchFeatures: decision.relaunchOnMain.flatMap((id) => [
+        results.find((result) => result.taskId === id)?.feature,
+        decision.relaunchGoals?.[id],
+      ].filter((feature): feature is string => feature !== undefined)),
+    } : {}),
+    ...(decision?.action === 'add-repair-task' && decision.oscillation ? (() => {
+      // Each repaired task is recorded under its original goal feature and, when a rerun runs the authored goal as
+      // the piece's new feature (orchestrate), under that repair text too — so the repair's own oscillation stops.
+      const pairs = decision.oscillation.taskIds.flatMap((id) => {
+        const feature = results.find((result) => result.taskId === id)?.feature ?? '';
+        const repairGoal = decision.oscillation!.repairGoals?.[id];
+        return repairGoal === undefined ? [[id, feature]] : [[id, feature], [id, repairGoal]];
+      });
+      return { oscillationRepairTaskIds: pairs.map(([id]) => id!), oscillationRepairFeatures: pairs.map(([, feature]) => feature!),
+        ...(decision.oscillation.repairGoals ? { oscillationRepairGoals: decision.oscillation.repairGoals } : {}) };
+    })() : {}),
+    ...(noPrTaskIds.length > 0 ? { noPrTaskIds } : {}),
   }];
 }
 
 export interface SuperviseRunOptions {
   initial: readonly SupervisorJobResult[];
-  rerun: (previous: readonly SupervisorJobResult[], invocation: { relaunch: true }) => Promise<readonly SupervisorJobResult[]>;
+  rerun: (previous: readonly SupervisorJobResult[], invocation: { relaunch: true; repairGoals?: Record<string, string> }) => Promise<readonly SupervisorJobResult[]>;
   limits?: SupervisorLimits;
   enrich?: (results: readonly SupervisorJobResult[]) => readonly SupervisorJobResult[];
   onDecision?: (decision: SupervisorDecision) => void;
@@ -443,6 +604,8 @@ export interface SuperviseRunOptions {
   runStore?: { runId?: string; operatorDir?: string; dir?: string; isolatedDir?: string };
   observe?: (event: string, data: Record<string, unknown>) => void;
   sweepPendingMerges?: typeof sweepFrozenMerges;
+  /** True only when rerun consumes `invocation.repairGoals`; omitted or false → a review oscillation stops for a human. */
+  repairGoalExecution?: boolean;
   /**
    * TASK-AGENT-SHADOW — 멈춤이 확정되면 판단부를 그림자로 부른다(기본 `recordTaskAgentShadowMove`).
    * `false` 면 끈다. 던져도 런의 결말은 바뀌지 않는다(fail-soft).
@@ -512,6 +675,9 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
     const decision = decideNextRun({
       results,
       history,
+      // Undeclared = cannot run the repair goal: an add-repair-task would otherwise be a same-strategy relaunch.
+      repairGoalExecution: opts.repairGoalExecution === true,
+      ...(aggregateReviewTrend(results) ? { reviewMustFixTrend: aggregateReviewTrend(results) } : {}),
       ...(opts.limits ? { limits: opts.limits } : {}),
       ...(observed.deployFindings ? { deployFindings: observed.deployFindings } : {}),
       deliverableObservation: observed.state,
@@ -616,8 +782,15 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
       return results;
     }
 
-    history = appendRound(history, results, decision.reviewMustFixTrend);
-    results = [...await opts.rerun(results, { relaunch: true })];
+    history = appendRound(history, results, decision.reviewMustFixTrend, decision);
+    // Tasks that already had their one oscillation repair are held for a human — they are not handed to the rerun,
+    // but their results stay in the round so the human hand-off (and the final review-oscillating stop) keeps them.
+    const held = decision.oscillation?.heldTaskIds ?? [];
+    const heldResults = results.filter((result) => held.includes(result.taskId));
+    const repairGoals = { ...decision.relaunchGoals, ...decision.oscillation?.repairGoals };
+    const rerunResults = await opts.rerun(held.length ? results.filter((result) => !held.includes(result.taskId)) : results,
+      { relaunch: true, ...(Object.keys(repairGoals).length > 0 ? { repairGoals } : {}) });
+    results = [...rerunResults, ...heldResults.filter((heldResult) => !rerunResults.some((result) => result.taskId === heldResult.taskId))];
 
     try {
       opts.onRound?.(results);

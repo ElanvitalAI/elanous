@@ -1,12 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { debug } from '../../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
-import { readFailureInbox } from '../../self-implement/heal-intake.js';
+import { readFailureInbox, startHealLoop, type FailureEvent } from '../../self-implement/heal-intake.js';
 import { appendRunLedgerEntry, runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
 import { collectPodLedgers, createPodLedgerFollower, parsePodLedgerChunks } from './pod-ledger-collect.js';
 
@@ -65,6 +65,52 @@ describe('pod run-ledger collection', () => {
       resetElanousConfigDir();
       rmSync(host, { recursive: true, force: true });
       rmSync(otherHost, { recursive: true, force: true });
+    }
+  });
+
+  test('판정선 POD-HEAL-HOST: one failed Pod run surfaces exactly one host heal-loop run and a second recovery folds', async () => {
+    const host = mkdtempSync(join(tmpdir(), 'pod-heal-verdict-host-'));
+    const ambient = mkdtempSync(join(tmpdir(), 'pod-heal-verdict-ambient-'));
+    const dir = runLedgerDir(host);
+    const at = '2026-10-08T11:00:00.000Z';
+    const jsonl = [
+      { timestamp: at, runId, event: 'start', data: { origin } },
+      { timestamp: at, runId, event: 'run-status', data: { runStatus: 'failed' } },
+    ].map(entry => JSON.stringify(entry) + '\n').join('');
+    const started: Array<{ file: string; runId: string; failureEvent: FailureEvent; root: string }> = [];
+    const run = async (file: string, options: Parameters<typeof startHealLoop>[1]) => {
+      started.push({ file, runId: options.runId, failureEvent: options.input.failureEvent, root: options.deps.root });
+    };
+    // The real host starter (inbox → claim → cap) with only the graph execution stubbed, and the
+    // Pod/test guards explicitly off: this is the host process, not the Pod that failed.
+    const startLoop = (file: string, options: Parameters<typeof startHealLoop>[1]) => startHealLoop(file, options, {}, run);
+    const settle = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+    try {
+      setElanousConfigDir(ambient);
+      const logs = transfer(runId, jsonl).join('\n');
+      const collect = () => collectPodLedgers(logs, { dir, log: () => {}, emit: () => {}, startHealLoop: startLoop });
+      collect();
+      await settle();
+      expect(started).toHaveLength(1);
+      expect(started[0]!.file).toBe(join(import.meta.dir, '../../../graphs/heal/heal-loop.yaml'));
+      expect(started[0]!.runId).toMatch(/^heal-[a-f0-9]{64}$/);
+      expect(started[0]!.root).toBe(host);
+      expect(started[0]!.failureEvent).toEqual({ source: 'harness-run', kind: 'pod-run', ref: runId, summary: `Pod run ${runId} failed`, at });
+      expect(existsSync(join(host, 'heal', 'starts', `${started[0]!.runId}.json`))).toBe(true);
+      expect(readFailureInbox({}, host)).toEqual([started[0]!.failureEvent]);
+      expect(readFailureInbox({}, ambient)).toEqual([]);
+      collect();
+      await settle();
+      expect(started).toHaveLength(1);
+      expect(readFailureInbox({}, host)).toHaveLength(1);
+      expect(readFailureInbox({}, ambient)).toEqual([]);
+      const recorded = () => debug.events(200).filter(entry => entry.category === 'heal.intake' && entry.event === 'recorded'
+        && (entry.data as { ref?: string }).ref === runId);
+      expect(recorded().slice(-2).map(entry => (entry.data as { folded: boolean }).folded)).toEqual([false, true]);
+    } finally {
+      resetElanousConfigDir();
+      rmSync(host, { recursive: true, force: true });
+      rmSync(ambient, { recursive: true, force: true });
     }
   });
 

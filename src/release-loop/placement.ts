@@ -6,7 +6,7 @@ import { resolveRepositoryName } from '../harness/repository-name.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { userConfigPath } from '../user-config.js';
-import { addItem, listChecklist, ownerMatches, parseOwner, setItem, validateCeoLoad, type ChecklistItem } from './checklist.js';
+import { addItem, checklistHistory, listChecklist, ownerMatches, parseOwner, setItem, validateCeoLoad, type ChecklistItem } from './checklist.js';
 import { assignedVersions, move, releasedVersion } from './feature-store.js';
 import { debug } from '../debug/log.js';
 import { kstDay, listSchedules, type ReleaseSchedule } from './release-schedule.js';
@@ -406,9 +406,24 @@ export function rebalance(version: string, deps: PlacementDeps = {}): RebalanceR
   return result;
 }
 
+/** Reasons that justify a second forward rollover of the same cell (대표 10-10 «계속 이월되지 않게»). */
+const SECOND_ROLLOVER_REASON_PREFIXES: readonly string[] = ['쪼개기:', '닫기:', '\u{1F451}:'];
+
+/** Forward moves (to > from) already recorded for this cell across every release. */
+function priorForwardMoves(id: string): number {
+  return checklistHistory(id).filter((row) => row.field === 'move'
+    && typeof row.from === 'string' && typeof row.to === 'string'
+    && versionOrder(row.to, row.from) > 0).length;
+}
+
 /** A seat may defer its own cell one release, never pull another owner's cell forward. */
 export function seatMove(id: string, from: string, to: string, by: string, reason: string, deps: PlacementDeps = {}): void {
   if (!reason.trim()) throw new CliUserError('이동 이유가 필요하다');
+  const trimmed = reason.trim();
+  // A second rollover is only deliberate: split, closure, or a king's order.
+  if (versionOrder(to, from) > 0 && priorForwardMoves(id) >= 1
+    && !SECOND_ROLLOVER_REASON_PREFIXES.some((prefix) => trimmed.startsWith(prefix)))
+    throw new CliUserError(`${id}: 두 번째 이월은 «쪼개기:»·«닫기:»·«\u{1F451}:» 로 시작하는 이유만 허용한다 — 첫 이월 이후 계속 이월되지 않게`);
   const rows = [...(deps.schedules ?? listSchedules())].sort((a, b) => versionOrder(a.version, b.version));
   const backlog = deps.backlog ?? BACKLOG_VERSIONS;
   const next = rows.find((row) => versionOrder(row.version, from) > 0 && !backlog.includes(row.version));

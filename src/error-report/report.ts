@@ -31,7 +31,7 @@ export interface ErrorReport {
   at: string; consent: true;
 }
 
-export interface ErrorReportSettings { enabled: boolean; identity: boolean; email?: string; telegramUser?: string }
+export interface ErrorReportSettings { enabled: boolean; identity: boolean; consented?: boolean; email?: string; telegramUser?: string }
 
 export interface ErrorReportDeps {
   configDir?: () => string;
@@ -100,10 +100,18 @@ export function buildErrorReport(input: ErrorReportInput, ctx: { installId: stri
   return report;
 }
 
+/** First-run notice: says what is actually sent — identity fields go along only when errorReports.identity is on. */
+export function errorReportNoticeLine(config: { identity?: boolean; email?: string; telegramUser?: string } | undefined): string {
+  const fields = [config?.email ? '이메일' : '', config?.telegramUser ? '텔레그램 사용자' : ''].filter(Boolean).join('·');
+  // Mirrors buildErrorReport: a field goes along only when identity is on AND the field is set.
+  const who = config?.identity === true && fields ? `진단과 함께 설정된 신원(${fields})을` : '익명 진단을';
+  return `오류 보고 안내: 오류 발생 시 ${who} 운영팀에 전송합니다. 끄려면 \`elanous config set errorReports.enabled false\`.`;
+}
+
 function defaultSettings(): ErrorReportSettings {
   try {
     const er = getUserConfig().errorReports;
-    return { enabled: er?.enabled !== false, identity: er?.identity === true, ...(er?.email ? { email: er.email } : {}), ...(er?.telegramUser ? { telegramUser: er.telegramUser } : {}) };
+    return { enabled: er?.enabled !== false, consented: er?.noticeShown === true, identity: er?.identity === true, ...(er?.email ? { email: er.email } : {}), ...(er?.telegramUser ? { telegramUser: er.telegramUser } : {}) };
   } catch { return { enabled: false, identity: false }; }
 }
 
@@ -137,10 +145,17 @@ export async function reportError(input: ErrorReportInput, deps: ErrorReportDeps
     if (!settings.enabled) return { sent: false, reason: 'disabled' };
     const now = (deps.now ?? Date.now)();
     const key = `${input.code}\u0000${input.message.slice(0, 200)}`;
+    const configDir = (deps.configDir ?? getElanousConfigDir)();
+    if (settings.consented !== true) {
+      const report = buildErrorReport(input, {
+        installId: installId(configDir), settings, nexus: { alive: false }, at: new Date(now).toISOString(),
+      });
+      keepPending(report, configDir, deps);
+      return { sent: false, reason: 'awaiting-notice' };
+    }
     const previous = lastSent.get(key);
     if (previous !== undefined && now - previous < SAME_ERROR_GAP_MS) return { sent: false, reason: 'recently-sent' };
     lastSent.set(key, now);
-    const configDir = (deps.configDir ?? getElanousConfigDir)();
     const report = buildErrorReport(input, {
       installId: installId(configDir), settings, nexus: await (deps.nexusMeta ?? defaultNexusMeta)(), at: new Date(now).toISOString(),
     });
@@ -186,7 +201,9 @@ function keepPending(report: ErrorReport, configDir: string, deps: ErrorReportDe
 export async function retryPendingErrorReport(deps: ErrorReportDeps = {}): Promise<ReportOutcome> {
   try {
     if (!(deps.enabledByEnvironment ?? defaultEnabledByEnvironment)()) return { sent: false, reason: 'environment' };
-    if (!(deps.settings ?? defaultSettings)().enabled) return { sent: false, reason: 'disabled' };
+    const settings = (deps.settings ?? defaultSettings)();
+    if (!settings.enabled) return { sent: false, reason: 'disabled' };
+    if (settings.consented !== true) return { sent: false, reason: 'awaiting-notice' };
     const configDir = (deps.configDir ?? getElanousConfigDir)();
     const file = pendingFile(configDir);
     if (!existsSync(file)) return { sent: false, reason: 'none' };

@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from 'bun:test';
 import type { GrokCredential } from './credential.js';
-import { describeGrokUsage, mergeGrokUsage, parseGrokBilling, parseMoney, fetchGrokUsage, GROK_SUBSCRIPTION_AXIS, grokUsageToCreditAxis } from './usage.js';
+import { describeGrokUsage, mergeGrokUsage, parseGrokBilling, parseMoney, fetchGrokUsage, grokUsageToSubscriptionAxis, grokUsageToCreditAxis } from './usage.js';
 
 // ── 실측 픽스처 ──────────────────────────────────────────────────────────────
 const CREDITS_VIEW = {
@@ -241,8 +241,8 @@ describe('describeGrokUsage — ⛔ 「모른다」를 0 으로 찍지 않는다
   });
 });
 
-describe('grokUsageToCreditAxis — 크레딧 축만, 구독 축은 주지 않는다', () => {
-  it('usedPercent 를 크레딧 축으로 옮기고 구독 축은 query-does-not-supply 다', () => {
+describe('Grok billing usage axes — weekly quota and credits remain separate', () => {
+  it('usedPercent 를 크레딧 축에 그대로 두고 크레딧 객체에는 구독 필드를 넣지 않는다', () => {
     const usage = parseGrokBilling({
       creditUsagePercent: 42,
       currentPeriod: { type: 'USAGE_PERIOD_TYPE_WEEKLY', start: '2026-08-07T13:07:00Z', end: '2026-08-14T13:07:00Z' },
@@ -253,8 +253,21 @@ describe('grokUsageToCreditAxis — 크레딧 축만, 구독 축은 주지 않�
     expect(credits.usedPercent).toBe(42);
     expect(credits.periodType).toBe('USAGE_PERIOD_TYPE_WEEKLY');
     expect(credits.prepaidBalance).toBe(3);
-    expect(GROK_SUBSCRIPTION_AXIS).toEqual({ status: 'unavailable', reason: 'query-does-not-supply' });
     expect(JSON.stringify(credits)).not.toContain('remainingPercent');
-    expect(JSON.stringify(GROK_SUBSCRIPTION_AXIS)).not.toContain('42');
+  });
+
+  it('weekly provider quota is read from the billing query and kept distinct from credits', () => {
+    const usage = parseGrokBilling({
+      creditUsagePercent: 42,
+      currentPeriod: { type: 'USAGE_PERIOD_TYPE_WEEKLY', start: '2026-08-07T13:07:00Z', end: '2026-08-14T13:07:00Z' },
+      prepaidBalance: 3,
+    })!;
+    expect(grokUsageToSubscriptionAxis(usage)).toEqual({
+      status: 'available', remainingPercent: 58,
+      resetsAt: Date.parse('2026-08-14T13:07:00Z'), windowKind: 'weekly',
+    });
+    expect(grokUsageToSubscriptionAxis(parseGrokBilling({ prepaidBalance: 3 })!)).toEqual({
+      status: 'unavailable', reason: 'query-does-not-supply',
+    });
   });
 });

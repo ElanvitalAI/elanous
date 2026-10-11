@@ -106,12 +106,25 @@ export function buildCritiquePrompt(input: { planBody: string; changedFiles: str
   ].join('\n');
 }
 
-/** LLM 응답 파싱 → verdict + findings. 순수함수(LLM node 규칙). */
+/** 판정 줄 — «줄 머리» VERDICT 만 판정으로 읽는다(본문 중간 인용·설명 속 «VERDICT:» 오인 방지).
+ *  들여쓰기는 허용(mission-engine 의 미션 판정 파서와 같은 앵커). */
+const CRITIQUE_VERDICT_LINE = /^[ \t]*VERDICT:\s*(PASS|WARN|FAIL)/im;
+/** 판정 줄이 없을 때 findings 에 남기는 fail-closed 사유(REVIEW-NO-VERDICT-FAILCLOSED #25937). */
+const NO_VERDICT_FINDING = '비평 판정 줄(VERDICT) 없음 — 판정 없음은 통과가 아니다(fail-closed · REVIEW-NO-VERDICT-FAILCLOSED #25937)';
+const MAX_CRITIQUE_FINDINGS = 4;
+
+/** LLM 응답 파싱 → verdict + findings. 순수함수(LLM node 규칙).
+ *  ⛔ 판정 줄이 «없으면» pass 로 기본하지 않는다(칸 MISSION-CRITIQUE-FAILCLOSED · #25937):
+ *  «판정 없음 = 통과 아님» ⇒ verdict 'warn' + 사유 finding.
+ *  'fail' 이 아니라 'warn' 인 이유 — 소비측(nocturnal-runner)은 critique verdict==='fail' 에
+ *  gate-failed(재구현 요구)를 건다. «비평가 응답의 형식 결함»을 «구현 훼손」으로
+ *  오귀속시키는 것이다. 'warn' 은 PR 본문(renderCritique)·자율 원장에 그대로 표시되어 사람(HITL)이 판단한다.
+ *  (post-PR 리뷰 축 parseReviewResult 는 substrate 가 `reviewed:false` 로 같은 fail-closed 를 이미 한다.) */
 export function parseLLMCritique(text: string): { verdict: CritiqueResult['verdict']; findings: string[] } {
-  const vm = /VERDICT:\s*(PASS|WARN|FAIL)/i.exec(text);
-  const verdict = (vm ? vm[1]!.toLowerCase() : 'pass') as CritiqueResult['verdict'];
-  const findings = text.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('- ')).map((l) => l.slice(2).trim()).slice(0, 4);
-  return { verdict, findings };
+  const bullets = text.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('- ')).map((l) => l.slice(2).trim());
+  const vm = CRITIQUE_VERDICT_LINE.exec(text);
+  if (!vm) return { verdict: 'warn', findings: [NO_VERDICT_FINDING, ...bullets].slice(0, MAX_CRITIQUE_FINDINGS) };
+  return { verdict: vm[1]!.toLowerCase() as CritiqueResult['verdict'], findings: bullets.slice(0, MAX_CRITIQUE_FINDINGS) };
 }
 
 /** ★ R1 결정론 + LLM 비평(대표 2026-07-12) — 결정론(R0) 먼저, llmReview 주입 시 LLM 심층 비평

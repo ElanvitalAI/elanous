@@ -1,12 +1,13 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join, dirname, resolve } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
 import { Database } from 'bun:sqlite';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import * as registry from './registry.js';
 import { cronMatches } from '../domains/cron-match.js';
 import { resolveTimeZone } from '../time/format.js';
+import type { ScheduleRow } from '../domains/schedule-registry.js';
 import type { LoopEntry, LoopRun } from './registry.js';
 
 type LoopState = 'off' | 'unregistered' | 'failing' | 'late' | 'unknown' | 'alive';
@@ -23,6 +24,15 @@ export interface CheckEntry {
   lastRunAt?: string;
   lastStatus?: string;
   recentStatuses?: string[];
+  /** Inventory sighting of the scheduled registration (schedule-registry `last_seen`, refreshed on each inventory — not the first sighting); never represented as an execution. */
+  observedSince?: string;
+  /** Optional launcher evidence; absent values are not inferred from a missing heartbeat. */
+  health?: 'healthy' | 'degraded';
+  endsAt?: string;
+  installedVersion?: string;
+  expectedVersion?: string;
+  /** Registry graph path, supplied only by graph inventory. */
+  file?: string;
   enabled: boolean;
   registered: boolean;
 }
@@ -57,6 +67,110 @@ export function checkLoops(entries: CheckEntry[], now: Date, opts: { failureStat
     } else { state = 'alive'; reason = 'within expected interval'; }
     return { ...entry, state, reason };
   });
+}
+
+export type ScheduleFinding = { id: string; owner?: string; kind: 'late' | 'failing' | 'degraded' | 'end-expired' | 'version-mismatch'; reason: string; lastRunAt?: string };
+
+/** Additional scheduler evidence is evaluated only when supplied; the six-state CLI contract stays intact. */
+export function scheduleFindings(results: CheckResult[], now: Date): ScheduleFinding[] {
+  const findings: ScheduleFinding[] = [];
+  for (const row of results) {
+    if (!row.enabled || !row.registered) continue;
+    const common = { id: row.id, ...(row.owner ? { owner: row.owner } : {}),
+      ...(row.lastRunAt ? { lastRunAt: row.lastRunAt } : {}) };
+    if (row.state === 'late' || row.state === 'failing') findings.push({ ...common, kind: row.state, reason: row.reason });
+    else if (row.state === 'unknown' && !row.lastRunAt && row.observedSince && row.dueAt &&
+        Number.isFinite(Date.parse(row.observedSince)) && Number.isFinite(Date.parse(row.dueAt)) &&
+        Date.parse(row.observedSince) < Date.parse(row.dueAt))
+      findings.push({ ...common, kind: 'late', reason: `no run since observed registration ${row.observedSince}` });
+    if (row.health === 'degraded') findings.push({ ...common, kind: 'degraded', reason: 'launcher degraded' });
+    if (row.endsAt && Number.isFinite(Date.parse(row.endsAt)) && Date.parse(row.endsAt) <= now.getTime())
+      findings.push({ ...common, kind: 'end-expired', reason: `launcher ended at ${row.endsAt}` });
+    if (row.installedVersion && row.expectedVersion && row.installedVersion !== row.expectedVersion)
+      findings.push({ ...common, kind: 'version-mismatch', reason: `installed ${row.installedVersion}; expected ${row.expectedVersion}` });
+  }
+  return findings;
+}
+
+export function daemonScheduleEntries(rows: readonly ScheduleRow[], now: Date): CheckEntry[] {
+  return rows.filter(row => row.enabled && row.cron && (row.run_via === 'elanous' || row.run_via === 'trigger'))
+    .map(row => ({ id: row.id, owner: 'OP', enabled: true, registered: true, dueAt: dueBefore(row.cron!, now) ?? undefined,
+      ...(row.last_seen ? { observedSince: row.last_seen } : {}),
+      ...(row.last_run ? { lastRunAt: row.last_run } : {}),
+      ...(row.last_status ? { lastStatus: row.last_status, recentStatuses: [row.last_status] } : {}),
+    }));
+}
+
+export function versionEvidence(entries: CheckEntry[], repoRoot: string, stateRoot: string): CheckEntry[] {
+  return entries.map(entry => {
+    if (!entry.file || !/^[\w./-]+\.ya?ml$/.test(entry.file) || entry.file.split('/').includes('..')) return entry;
+    const graphPath = resolve(repoRoot, entry.file);
+    if (!graphPath.startsWith(resolve(repoRoot) + '/')) return entry;
+    const runsPath = join(stateRoot, 'graph-runs', entry.id);
+    try {
+      if (!existsSync(graphPath) || !existsSync(runsPath)) return entry;
+      const latest = readdirSync(runsPath).filter(name => name.endsWith('.json') && !name.endsWith('.decision.json'))
+        .sort((a, b) => statSync(join(runsPath, b)).mtimeMs - statSync(join(runsPath, a)).mtimeMs)[0];
+      if (!latest) return entry;
+      const run = JSON.parse(readFileSync(join(runsPath, latest), 'utf8')) as { graphId?: string; variant?: unknown; graphSnapshot?: { graphSha?: string } };
+      if (run.graphId !== entry.id || run.variant || !run.graphSnapshot?.graphSha) return entry;
+      const installedVersion = run.graphSnapshot.graphSha;
+      const current = createHash('sha256').update(readFileSync(graphPath)).digest('hex');
+      return { ...entry, installedVersion, expectedVersion: current };
+    } catch (error) {
+      debug.log('loop.checker', 'version-unavailable', { id: entry.id, reason: String(error) });
+      return entry;
+    }
+  });
+}
+
+export function launcherEvidence(entries: CheckEntry[], root: string): CheckEntry[] {
+  const path = join(root, 'msg', 'messages.db');
+  if (!existsSync(path)) return entries;
+  try {
+    const db = new Database(path, { readonly: true });
+    try {
+      if (!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='loop_signals'").get()) return entries;
+      const signals = db.query('SELECT loop_id, health, ends_at FROM loop_signals').all() as Array<{
+        loop_id: string; health: string; ends_at: string | null;
+      }>;
+      const byId = new Map(signals.map(signal => [signal.loop_id, signal]));
+      return entries.map(entry => {
+        const signal = byId.get(entry.id);
+        return signal ? { ...entry, ...(signal.health === 'degraded' ? { health: 'degraded' as const } : {}),
+          ...(signal.ends_at ? { endsAt: signal.ends_at } : {}) } : entry;
+      });
+    } finally { db.close(); }
+  } catch (error) {
+    debug.log('loop.checker', 'launcher-evidence-unavailable', { reason: String(error) });
+    return entries;
+  }
+}
+
+// Extend only an observed healthy launcher that is still heartbeating. The CAS prevents replacing a renewed lease.
+export function extendHealthyLauncher(root: string, finding: ScheduleFinding, now: Date): boolean {
+  if (finding.kind !== 'end-expired' || !Number.isFinite(now.getTime())) return false;
+  const path = join(root, 'msg', 'messages.db');
+  if (!existsSync(path)) return false;
+  const db = new Database(path);
+  try {
+    db.exec('PRAGMA busy_timeout = 10000');
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = db.query('SELECT at, health, ends_at FROM loop_signals WHERE loop_id=?')
+        .get(finding.id) as { at: string; health: string; ends_at: string | null } | null;
+      const age = row ? now.getTime() - Date.parse(row.at) : NaN;
+      if (!row || row.health !== 'healthy' || !Number.isFinite(age) || age < 0 || age > 15 * 60_000 ||
+          !row.ends_at || !Number.isFinite(Date.parse(row.ends_at)) || Date.parse(row.ends_at) > now.getTime()) {
+        db.exec('COMMIT');
+        return false;
+      }
+      const result = db.query('UPDATE loop_signals SET ends_at=? WHERE loop_id=? AND at=? AND health=? AND ends_at=?')
+        .run(new Date(now.getTime() + 15 * 60_000).toISOString(), finding.id, row.at, row.health, row.ends_at);
+      db.exec('COMMIT');
+      return result.changes === 1;
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  } finally { db.close(); }
 }
 
 export function countLoopStates(results: CheckResult[]): LoopCounts {
@@ -118,8 +232,14 @@ export interface CheckerDeps {
 }
 
 /** Appends only new daily keys to the seat request journal; never rewrites existing lines. */
-export function notifyOwners(results: CheckResult[], deps: CheckerDeps = {}): number {
-  const eligible = results.filter(result => result.owner && (result.state === 'late' || result.state === 'failing'));
+export function notifyOwners(results: CheckResult[], deps: CheckerDeps = {}, findings: ScheduleFinding[] = [], escalation = false): number {
+  const eligible = [
+    ...results.filter(result => result.owner && (result.state === 'late' || result.state === 'failing'))
+      .map(result => ({ ...result, alertState: result.state })),
+    ...findings.filter(result => result.owner && (result.kind !== 'late' && result.kind !== 'failing' ||
+      !results.some(row => row.id === result.id && row.state === result.kind)))
+      .map(result => ({ ...result, alertState: result.kind })),
+  ].filter(result => escalation ? result.owner !== 'OP' : true);
   if (!eligible.length) return 0;
   const now = deps.now ?? new Date();
   const path = join(deps.root ?? effectiveInstanceRoot(), 'seat-requests', 'requests.jsonl');
@@ -132,19 +252,38 @@ export function notifyOwners(results: CheckResult[], deps: CheckerDeps = {}): nu
     lock.exec('BEGIN EXCLUSIVE');
     try {
       const existing = new Set<string>();
+      const ownerRequests = new Map<string, { queuedAt?: string; status?: string }>();
       if (existsSync(path)) {
         for (const line of readFileSync(path, 'utf8').split('\n')) {
           if (line.trim()) {
-            const row = JSON.parse(line) as { key?: string };
-            if (row.key) existing.add(row.key);
+            const row = JSON.parse(line) as { key?: string; queuedAt?: string; status?: string };
+            if (row.key) {
+              existing.add(row.key);
+              ownerRequests.set(row.key, row);
+            }
           }
         }
       }
       let added = 0;
       for (const result of eligible) {
-        const key = `loopcheck:${result.id}:${now.toISOString().slice(0, 10)}:${result.state}`;
+        const ownerKey = `loopcheck:${result.id}:${now.toISOString().slice(0, 10)}:${result.alertState}`;
+        let requestKey = ownerKey;
+        if (escalation) {
+          const yesterday = new Date(now.getTime() - 24 * 3600_000).toISOString().slice(0, 10);
+          const priorKey = `loopcheck:${result.id}:${yesterday}:${result.alertState}`;
+          const prior = ownerRequests.get(priorKey);
+          if (prior?.status === 'queued' && prior.queuedAt &&
+              now.getTime() - Date.parse(prior.queuedAt) >= 30 * 60_000 && !existing.has(`${priorKey}:op`))
+            requestKey = priorKey;
+        }
+        const key = escalation ? `${requestKey}:op` : ownerKey;
         if (existing.has(key)) continue;
-        const row = { key, receiptId: key, seat: result.owner, text: `${result.id} ${result.state} — 마지막 ${result.lastRunAt ?? '없음'} · ${result.reason}`,
+        if (escalation) {
+          const request = ownerRequests.get(requestKey);
+          if (!request || request.status !== 'queued' || !request.queuedAt ||
+              now.getTime() - Date.parse(request.queuedAt) < 30 * 60_000) continue;
+        }
+        const row = { key, receiptId: key, seat: escalation ? 'OP' : result.owner, text: `${result.id} ${result.alertState} — 마지막 ${result.lastRunAt ?? '없음'} · ${result.reason}`,
           status: 'queued', queuedAt: now.toISOString(), source: 'loop-checker' };
         appendFileSync(path, JSON.stringify(row) + '\n');
         existing.add(key);

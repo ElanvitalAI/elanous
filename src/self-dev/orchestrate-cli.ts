@@ -421,6 +421,9 @@ export async function runSelfOrchestrateCliCommand(
       await recordRoundPrs(results);
       results = await superviseRun({
         initial: results,
+        // The add-repair-task branch below runs each authored review-oscillation repair goal as that goal's new
+        // feature (a fresh piece, same goal id) — the supervisor records the repair text, so a second oscillation stops.
+        repairGoalExecution: true,
         limits,
         enrich: (rs) => backfillDecomposeProposals([...rs], deps),
         onDecision: (decision) => {
@@ -431,9 +434,28 @@ export async function runSelfOrchestrateCliCommand(
         onRound: (rs) => { try { baseRuntime.checkpoint?.([...rs]); } catch { /* fail-open */ } },
         // ⭐ 방금 끝난 결과를 넘긴다 — orchestrateSelfDev 가 classifyResumeDisposition 으로
         //   skip/rerun 을 갈라준다(재발명 0 · 착지한 조각은 다시 안 돈다).
-        rerun: async (previous) => {
+        rerun: async (previous, invocation) => {
           let addedRepairIds: string[] = [];
-          if (currentDecision?.action === 'add-repair-task') {
+          // A requested repair that cannot be bound to exactly one goal is held (not relaunched with the old strategy).
+          const unrepairedHold: string[] = [];
+          if (invocation.repairGoals) {
+            const replacements = new Map<SelfDevGoal, string>();
+            for (const [taskId, repairGoal] of Object.entries(invocation.repairGoals)) {
+              const source = previous.find((result) => result.taskId === taskId);
+              const matches = source ? currentGoals.filter((goal) => resumeKey(goal.feature) === resumeKey(source.feature)) : [];
+              if (matches.length === 1 && !replacements.has(matches[0]!)) replacements.set(matches[0]!, repairGoal);
+              else unrepairedHold.push(taskId);
+            }
+            currentGoals = currentGoals.map((goal) => replacements.has(goal) ? { ...goal, feature: replacements.get(goal)! } : goal);
+            spec = buildSelfOrchestrateDevSpec(currentGoals, input.concurrency);
+            try {
+              debug.log('self-dev.supervisor', 'oscillation-repair.executed', {
+                surface: 'orchestrate', replaced: replacements.size, requested: Object.keys(invocation.repairGoals).length, held: unrepairedHold,
+              });
+            } catch { /* fail-open */ }
+          }
+          // A review-oscillation decision attaches only its authored repair goals (above) — never deliverable fragments too.
+          if (currentDecision?.action === 'add-repair-task' && !currentDecision.oscillation) {
             const appended = appendRepairFragments(currentGoals, currentDecision.classifications, {
               seenFingerprints: repairFingerprints,
               addedCount: repairFragmentsAdded,
@@ -487,7 +509,7 @@ export async function runSelfOrchestrateCliCommand(
           baseRuntime = runtimeWithParentRequest();
           // ⛔⭐ 판정이 「사람이 볼 것」이라 한 조각은 집행이 다시 돌리지 않는다 — 판정과 집행이 갈리면
           //   `pr-opened` 조각이 duplicate-risk 로 재실행돼 PR 이 겹친다(2026-09-25 실측).
-          const resumeHold = currentDecision?.needsHuman ?? [];
+          const resumeHold = [...new Set([...(currentDecision?.needsHuman ?? []), ...unrepairedHold])];
           // The engine's resume lookup is last-result-wins for each normalized feature.
           // Use that exact predecessor, not any earlier task sharing the same feature.
           const selectedPrior = new Map(previous.map((result) => [resumeKey(result.feature), result.taskId]));

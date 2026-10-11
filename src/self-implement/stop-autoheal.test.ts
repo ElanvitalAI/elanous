@@ -1,9 +1,12 @@
-import { beforeEach, describe, expect, test } from 'bun:test';
+import { beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { debug } from '../debug/log.js';
+import { defaultOverlaysDir, loadGraphOverlays, selectOverlays } from './graph-overlay-yaml.js';
+import { GRAPH_SPECS } from './graph-templates.js';
 import type { RunLedgerEntry } from './run-ledger.js';
 import { RUN_STOP_CLASSES, type RunStopClass, type RunStopRecord } from './run-stop.js';
 import {
   AUTOHEAL_ACTION_BY_CLASS, AUTOHEAL_EVENT, autohealAlreadyAttempted, autohealFromStop, parseAutohealMode,
-  resetAutohealProcessMemory, type AutohealAction, type AutohealActions,
+  pickAutohealAction, resetAutohealProcessMemory, type AutohealAction, type AutohealActions, type AutohealLadder,
 } from './stop-autoheal.js';
 
 beforeEach(() => { resetAutohealProcessMemory(); });
@@ -174,5 +177,92 @@ describe('STOP-AUTOHEAL one-attempt guard', () => {
     expect(autohealAlreadyAttempted(ledger, 'main-sync', 'live')).toBe(false);
     expect(autohealAlreadyAttempted(ledger, 'pod-died', 'shadow')).toBe(false);
     expect(autohealAlreadyAttempted(null, 'pod-died', 'shadow')).toBe(false);
+  });
+});
+
+function ladderFromDisk(): AutohealLadder {
+  return {
+    template: GRAPH_SPECS['self-implement'],
+    overlays: loadGraphOverlays(defaultOverlaysDir()).overlays.filter((overlay) => overlay.overlayId.startsWith('stop-heal-ladder-')),
+  };
+}
+
+describe('STOP-AUTOHEAL ladder declaration (graphs/overlays/stop-heal-ladder.yaml)', () => {
+  test('every stop class picks the same action from the overlay as from the code table', async () => {
+    for (const cls of RUN_STOP_CLASSES) {
+      const picked = pickAutohealAction(cls);
+      expect({ cls, action: picked.action }).toEqual({ cls, action: AUTOHEAL_ACTION_BY_CLASS[cls] });
+      expect(picked.source).toBe(AUTOHEAL_ACTION_BY_CLASS[cls] === 'needs-owner' ? 'code-default' : 'graph');
+      const res = await autohealFromStop({ runId: `r-${cls}`, record: record(cls) }, { mode: 'shadow', ...memLedger() });
+      expect(res.action).toBe(AUTOHEAL_ACTION_BY_CLASS[cls]);
+    }
+  });
+
+  test('missing ladder overlay falls back to code-default with source recorded', async () => {
+    const empty: AutohealLadder = { template: ladderFromDisk().template, overlays: [] };
+    const led = memLedger();
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const res = await autohealFromStop({ runId: 'r1', record: record('pod-died') }, { mode: 'shadow', loadLadder: () => empty, ...led });
+      expect(res).toMatchObject({ action: 'resume-from-salvage', source: 'code-default', outcome: 'would-act' });
+      expect(res.overlayId).toBeUndefined();
+      expect(led.entries[0]!.data).toMatchObject({ source: 'code-default', action: 'resume-from-salvage' });
+      expect(log).toHaveBeenCalledWith('self-implement.autoheal', 'action-source', {
+        stopClass: 'pod-died', action: 'resume-from-salvage', source: 'code-default', overlayId: null,
+      });
+    } finally { log.mockRestore(); }
+  });
+
+  test('an unreadable ladder or a missing template falls back to the code table', () => {
+    expect(pickAutohealAction('main-sync', () => { throw new Error('ENOENT'); })).toEqual({ action: 'rebase-regate', source: 'code-default' });
+    expect(pickAutohealAction('main-sync', () => ({ template: undefined, overlays: ladderFromDisk().overlays })))
+      .toEqual({ action: 'rebase-regate', source: 'code-default' });
+  });
+
+  test('an overlay whose node nothing reaches is rejected and the code table answers', () => {
+    const ladder = ladderFromDisk();
+    const broken = ladder.overlays.map((overlay) => overlay.overlayId === 'stop-heal-ladder-main-sync'
+      ? { ...overlay, patch: overlay.patch.filter((op) => (op.value as { from?: string } | undefined)?.from !== 'heal') }
+      : overlay);
+    expect(pickAutohealAction('main-sync', () => ({ ...ladder, overlays: broken }))).toEqual({ action: 'rebase-regate', source: 'code-default' });
+  });
+
+  test('applied overlay id is recorded with the action', async () => {
+    const led = memLedger();
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const res = await autohealFromStop({ runId: 'r1', record: record('evidence-uncovered') }, { mode: 'shadow', ...led });
+      expect(res).toMatchObject({ action: 'derive-evidence-rejudge', source: 'graph', overlayId: 'stop-heal-ladder-evidence-uncovered' });
+      expect(led.entries[0]!.data).toMatchObject({
+        action: 'derive-evidence-rejudge', source: 'graph', overlayId: 'stop-heal-ladder-evidence-uncovered', phase: 'result',
+      });
+      expect(log).toHaveBeenCalledWith('self-implement.autoheal', 'action-source', {
+        stopClass: 'evidence-uncovered', action: 'derive-evidence-rejudge', source: 'graph', overlayId: 'stop-heal-ladder-evidence-uncovered',
+      });
+    } finally { log.mockRestore(); }
+  });
+
+  test('the executor\'s launch and runtime overlay selection never picks the ladder, even with stop_class in state', () => {
+    const graphId = GRAPH_SPECS['self-implement']!.graphId;
+    const overlays = loadGraphOverlays(defaultOverlaysDir()).overlays;
+    expect(overlays.filter((overlay) => overlay.overlayId.startsWith('stop-heal-ladder-')).map((overlay) => overlay.stage))
+      .toEqual(['heal', 'heal', 'heal', 'heal']);
+    for (const cls of RUN_STOP_CLASSES) {
+      for (const stage of ['launch', 'runtime'] as const) {
+        const { applied } = selectOverlays(overlays, { graphId, stage, state: { stop_class: cls } });
+        expect({ cls, stage, ladder: applied.filter((overlay) => overlay.overlayId.startsWith('stop-heal-ladder-')).length })
+          .toEqual({ cls, stage, ladder: 0 });
+      }
+    }
+  });
+
+  test('the declared node, not the table, decides — a redeclared ladder changes the action', () => {
+    const ladder = ladderFromDisk();
+    const redeclared = ladder.overlays.map((overlay) => overlay.overlayId === 'stop-heal-ladder-pod-died'
+      ? { ...overlay, appliesWhen: 'stop_class == fabric' }
+      : overlay);
+    expect(pickAutohealAction('fabric', () => ({ ...ladder, overlays: redeclared }))).toEqual({
+      action: 'resume-from-salvage', source: 'graph', overlayId: 'stop-heal-ladder-pod-died',
+    });
   });
 });

@@ -5,7 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
 import { enterJourneyNode, exitJourneyNode, passJourneyNode, withJourneyNodeSync } from '../self-dev/graph-journey-nodes.js';
-import { routeJourneyEdge } from '../self-dev/graph-journey-route.js';
+import { freezeCheckHolds, routeJourneyEdge } from '../self-dev/graph-journey-route.js';
 import { beginLandingMerge, type LandingFreeze } from '../release-loop/landing-freeze.js';
 
 /** `manual`: the owning repository could not be determined — a sweep never resumes it; a person does. */
@@ -194,8 +194,13 @@ export function admitLandingMerge(
     () => admitLandingMergeUnobserved(heldEntry, root, hooks, claimKey, opts));
   const freezeLabel = admission.kind === 'merge' ? 'open' : admission.kind === 'held' ? 'frozen' : 'taken';
   exitJourneyNode('freeze-check', { provenance: 'admit-landing-merge', outcome: freezeLabel, ...(pr === undefined ? {} : { data: { pr } }) });
-  // 2판: 간선 판독을 남긴다(관측). 승인 요구(open→hold) 강제는 0.2.22 — 보류 사유 값이 먼저다(RFC §3).
-  routeJourneyEdge('freeze-check', freezeLabel, { freeze: freezeLabel });
+  const route = routeJourneyEdge('freeze-check', freezeLabel, { freeze: freezeLabel });
+  // 그래프가 열린 병합을 hold 로 보내면(launch 오버레이의 «승인 요구») 병합하지 않고 보류한다. 답이 없으면 오늘 판정 그대로.
+  if (admission.kind === 'merge' && freezeCheckHolds(freezeLabel, route)) {
+    admission.end();
+    passJourneyNode('hold', { provenance: 'admit-landing-merge', outcome: 'graph-hold', ...(pr === undefined ? {} : { data: { pr } }) });
+    return { kind: 'held', freeze: { reason: 'graph freeze-check → hold', startedAt: new Date().toISOString(), until: null, by: 'graph' } };
+  }
   return admission;
 }
 

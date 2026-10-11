@@ -1,3 +1,5 @@
+import type { RunStopClass } from './run-stop.js';
+
 /** ⭐ RFC §5 «4단계» — `applies_when` 을 «코드»가 판정한다.
  *
  *  ⛔⭐ **표현식 엔진을 만들지 않는다.** 문법이 넓어지면 오버레이가 «작은 프로그램»이 되고,
@@ -29,6 +31,32 @@ export function parseOverlayCondition(source: string): OverlayConditionParse {
   const numeric = Number(rawLiteral);
   const literal = rawLiteral!.length > 0 && Number.isFinite(numeric) ? numeric : rawLiteral!;
   return { ok: true, condition: { key: key!, operator: operator as OverlayConditionOperator, literal } };
+}
+
+/** Inputs known at a runtime overlay decision. Every field except `attempts` may be unknown. */
+export interface RuntimeOverlayStateInput {
+  readonly attempts: number;
+  readonly goalId?: string;
+  readonly stopClass?: RunStopClass;
+  readonly reviewRepeat?: number;
+  /** Only a real boolean is a measurement. */
+  readonly siblingOverlap?: unknown;
+  readonly mainSyncConflict?: unknown;
+  /** Only a non-empty string is a measurement. */
+  readonly authorGrade?: unknown;
+}
+
+/** ⛔ 아는 값만 싣는다 — 모르면 키를 «뺀다». 0·false·빈 문자열을 지어내지 않는다. */
+export function buildRuntimeOverlayState(input: RuntimeOverlayStateInput): Record<string, unknown> {
+  return {
+    attempts: input.attempts,
+    ...(input.goalId === undefined ? {} : { goal_id: input.goalId }),
+    ...(input.stopClass === undefined ? {} : { stop_class: input.stopClass }),
+    ...(typeof input.reviewRepeat === 'number' && Number.isFinite(input.reviewRepeat) ? { review_repeat: input.reviewRepeat } : {}),
+    ...(typeof input.siblingOverlap === 'boolean' ? { sibling_overlap: input.siblingOverlap } : {}),
+    ...(typeof input.mainSyncConflict === 'boolean' ? { main_sync_conflict: input.mainSyncConflict } : {}),
+    ...(typeof input.authorGrade === 'string' && input.authorGrade.length > 0 ? { author_grade: input.authorGrade } : {}),
+  };
 }
 
 export type OverlayConditionVerdict =

@@ -11,7 +11,7 @@
 // 2 예산(§8-5·config-first): maxStalls(언제 협상) · maxReplans(언제 partial 포기). a6230f 실측 튜닝.
 // 제1원칙: 협상 제안을 debug.log('mission.negotiate')로 관측.
 
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig, resolveRoleLlm } from '../user-config.js';
 import { debug } from '../debug/log.js';
 
 export interface FeasibilityBudget {
@@ -104,16 +104,17 @@ function buildNegotiatePrompt(input: NegotiateInput, overBudget: boolean): strin
   ].filter(Boolean).join('\n');
 }
 
-async function defaultJudge(prompt: string): Promise<string> {
-  // ★ 모델 기반 provider 라우팅(2026-07-14) — 협상은 강한 추론이 핵심이라 기본 opus 4.8(대표 셋업).
-  //   getProvider(model)로 모델 계열 라우팅(claude-* → anthropic·env/config 키)해 활성 provider(codex 등)
-  //   무관하게 지목 모델이 닿는다. resolveDefaultProvider(활성 반환)면 opus 를 codex 로 보내 400→fail-soft.
-  //   env(ELANOUS_NEGOTIATE_MODEL·ELANOUS_DECOMPOSE_MODEL)로 override 가능.
-  const { streamLLM, getProvider } = await import('../llm.js');
-  const model = process.env.ELANOUS_NEGOTIATE_MODEL || process.env.ELANOUS_DECOMPOSE_MODEL || 'claude-opus-4-8';
-  const provider = getProvider(model);
+export async function defaultJudge(prompt: string): Promise<string> {
+  const { streamLLM, getProvider, PROVIDERS } = await import('../llm.js');
+  const override = process.env.ELANOUS_NEGOTIATE_MODEL || process.env.ELANOUS_DECOMPOSE_MODEL;
+  const resolved = override ? undefined : resolveRoleLlm('planning');
+  const model = override || resolved!.model;
+  const provider = override ? getProvider(model) : PROVIDERS[resolved!.provider];
+  const providerName = override ? provider.name : resolved!.provider;
+  if (!provider) throw new Error(`Unknown planning provider: ${providerName}`);
+  debug.log('llm.role-pin', 'resolved', { site: 'feasibility-negotiate', role: 'planning', model, provider: providerName, source: override ? 'env' : resolved!.source });
   return streamLLM([{ role: 'user', content: prompt }], () => {}, {
-    model, reasoningEffort: 'medium', ...(provider ? { provider } : {}),
+    model, provider, usageRole: 'planning', reasoningEffort: 'medium',
   });
 }
 

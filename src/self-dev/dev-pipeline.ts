@@ -15,7 +15,8 @@
 //   self 는 backend 리스트 항목이 아니라 transport 축을 붕괴시키는 특수 갈래. 감독 축도 self=turn 레벨.
 
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { benchArmBranchForBase } from '../bench/bench.js';
 import { readFileSync } from 'node:fs';
 import { dispatchTask, type DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
 import { getNestDepth } from '../agent/nest-depth.js';
@@ -609,7 +610,11 @@ export function toSelfImplementOptions(text: string, plan: ResolvedDevPlan, seam
     ...(s.naturalLanguageDispatch ? { naturalLanguageDispatch: true } : {}),
     ...(s.childLlm ? { childLlm: s.childLlm } : {}),
     ...(s.correlationId !== undefined ? { correlationId: s.correlationId } : {}),
-    ...(s.branchName ? { branchName: s.branchName } : {}),
+    // BENCH-ISOLATED-ARMS ② — base 가 `bench/<id>/base` 면 팔 가지 `bench/<id>/<arm>` (명시 branchName 이 이긴다).
+    ...(() => {
+      const branchName = s.branchName ?? benchArmBranchForBase(plan.base, s.childLlm?.model, process.env.ELANOUS_RUN_ID?.trim() || randomUUID());
+      return branchName ? { branchName } : {};
+    })(),
     ...(s.maxReworkRounds !== undefined ? { maxReworkRounds: s.maxReworkRounds } : {}),
     launch: resolveLaunchStamp({ entrance: plan.entrance, queueId: process.env.ELANOUS_HARNESS_QUEUE_LAUNCH }),
   };

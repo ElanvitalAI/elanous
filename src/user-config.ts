@@ -180,8 +180,11 @@ export interface LLMConfig {
   baseUrl?: string;
   /** OpenRouter 설정 한 곳(두 골이 같은 키를 쓴다):
    *  - `providerPreferences` — 상류 라우팅 선호; 도구 가능 기본값(require_parameters·allow_fallbacks)을 얕게 덮는다(OR-LLM-ROUTING-1).
-   *  - `fallbackModel` — 유료 OpenRouter 폴백 모델; 체인에 openrouter 를 명시하고 모델·키를 모두 줄 때만 선택된다(OR-FALLBACK-TIER-1). */
-  openrouter?: { providerPreferences?: Record<string, unknown>; fallbackModel?: string };
+   *  - `fallbackModel` — 유료 OpenRouter 폴백 모델; 체인에 openrouter 를 명시하고 모델·키를 모두 줄 때만 선택된다(OR-FALLBACK-TIER-1).
+   *  - `upstreamPins` — 모델별 상류 고정 `{ "<wire id>": ["<상류 slug>", …] }`(OR-DEEPSEEK-TUNE · 지금은 deepseek/* 만 읽는다).
+   *    기본값 = `src/llm/openrouter-upstream-pins.config.ts` · 모델별로 덮는다 · `[]` = 그 모델 고정 안 함.
+   *    `providerPreferences` 에 order·only·allow_fallbacks 가 있으면 그쪽이 이긴다. */
+  openrouter?: { providerPreferences?: Record<string, unknown>; fallbackModel?: string; upstreamPins?: Record<string, string[]> };
   /** Ordered rotation of providers the user can cycle through with
    *  `elanous provider:rotate` / `/provider next`. Each entry is a
    *  full (provider, model, apiKey, baseUrl) tuple that gets
@@ -225,8 +228,16 @@ export interface LLMConfig {
    *  `within-quota`(한도 안에서만 · 전부 차면 멈춤) · `fallback`(한도 안 ⊕ 폴백 체인 · 기본) · `credits`(크레딧까지).
    *  회전·Pod 배분·폴백·매시 한도 알림이 «이 한 값»을 같이 읽는다. 없으면 옛 `codexCreditsAllowed` 를 읽는다. */
   codexQuotaPolicy?: 'within-quota' | 'fallback' | 'credits';
+  /** SUBSCRIPTION-EXHAUST-REROUTE (0.2.24) — codex 선불 크레딧 «예비분». 잔액이 이 값 이하로 «알려지면» 크레딧을 쓰지 않고
+   *  회전이 `no-candidate` 를 내 폴백(우선 openrouter)으로 넘긴다. 잔액을 모르면 종전. 없으면 2000(`DEFAULT_CODEX_CREDIT_RESERVE`). */
+  codexCreditReserve?: number;
   /** Grok weekly launch usage ceiling (percent); defaults to 80. */
   grokWeeklyCapPct?: number;
+  /** 대표 2026-10-11 ZAI-CODING-PLAN-PROVIDER — `glm` 직결(Z.ai 코딩 엔드포인트 · `ZAI_API_KEY` 가 있을 때만 선다).
+   *  `overage` = 플랜 창이 차면 무엇을 하나(codex `codexQuotaPolicy` 와 같은 축 · `src/llm/zai-coding-plan.ts` 가 canonical):
+   *  `stop`(멈춤 · 기본) · `balance`(계정 잔액 «extra usage» 로 계속 · 잔액/월 상한이면 OpenRouter) · `openrouter`(바로 OpenRouter).
+   *  `maxConcurrent` = 프로세스당 동시 호출 상한(기본 3). */
+  zaiCodingPlan?: { overage?: 'stop' | 'balance' | 'openrouter'; maxConcurrent?: number };
   /** ⭐⭐ codex 가 «소진된 뒤» 갈 곳을 «순서»로 정한다 (대표 2026-08-13).
    *
    *  값: `['codex-rotate', 'grok']` 등 — 아는 칸은 `FALLBACK_STEPS`, 모르는 이름은 버린다(관측에 남는다).
@@ -1173,6 +1184,9 @@ export interface SelfImplementToolConfig {
    *  Overload failover (OVERLOAD-FAILOVER) may move an unpinned codex child to
    *  grok. A pinned codex provider is never moved. */
   childLlm?: ChildLlmPreferenceConfig;
+  /** SUBSCRIPTION-EXHAUST-REROUTE (0.2.24) — `--child-llm-*` 없이 뜬 Pod 구현 자식의 기본 모델.
+   *  `{ provider, model? }` · `'off'`(종전 codex 기본). 없으면 `openrouter/z-ai/glm-5.3`. 원값 — `resolvePodChildDefault` 가 검사한다. */
+  podChildDefault?: unknown;
   /** ⭐ PR-open 사전 승인 (2026-07-26 · 대표 결정 "오토 선호 · 기본 ON").
    *
    *  self-build 가 gate 를 통과하면 **PR 을 자동 개설**한다(기본 `true`).
@@ -1497,8 +1511,10 @@ export interface ChatCompactConfig {
 
 /** ER1 — 액티브 덤퍼(오류 자동 보고). 기본 켬(첫 실행 안내 한 번 · 대표 10-01) · 신원(email/telegramUser)은 따로 «예»일 때만. */
 export interface ErrorReportsConfig {
-  /** false = never send. Absent = on (the first-run notice says how to turn it off). */
+  /** false = never send. Absent retains the feature but sending waits for the first-run notice. */
   enabled?: boolean;
+  /** Persisted only after the first-run notice was shown to a person. */
+  noticeShown?: boolean;
   /** true = also send email / telegramUser below with each report. Default false. */
   identity?: boolean;
   email?: string;
@@ -1511,6 +1527,7 @@ export function parseErrorReportsConfig(raw: unknown): ErrorReportsConfig | unde
   const out: ErrorReportsConfig = {};
   if (r.enabled === false || r.enabled === 'false') out.enabled = false;
   else if (r.enabled === true || r.enabled === 'true') out.enabled = true;
+  if (r.noticeShown === true) out.noticeShown = true;
   if (r.identity === true || r.identity === 'true') out.identity = true;
   if (typeof r.email === 'string' && r.email.trim()) out.email = r.email.trim();
   if (typeof r.telegramUser === 'string' && r.telegramUser.trim()) out.telegramUser = r.telegramUser.trim();
@@ -2749,7 +2766,7 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
     runDevHarness,
     selfOrchestrate,
     nativeStructure,
-    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalRecordInDoc, goalAuthorPersistentGrounding, fabricDecompose, fabricDecomposeAutoPathThreshold, autoOpenPr, draftOnStop, salvageRetention, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation, ...(childLlm ? { childLlm } : {}), ...(runTtlHours !== undefined ? { runTtlHours } : {}), ...(draftSweepCloseCap !== undefined ? { draftSweepCloseCap } : {}), ...(runTtl ? { runTtl } : {}), ...(autoheal ? { autoheal } : {}) },
+    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalRecordInDoc, goalAuthorPersistentGrounding, fabricDecompose, fabricDecomposeAutoPathThreshold, autoOpenPr, draftOnStop, salvageRetention, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation, ...(childLlm ? { childLlm } : {}), ...(selfImplRaw.podChildDefault !== undefined ? { podChildDefault: selfImplRaw.podChildDefault } : {}), ...(runTtlHours !== undefined ? { runTtlHours } : {}), ...(draftSweepCloseCap !== undefined ? { draftSweepCloseCap } : {}), ...(runTtl ? { runTtl } : {}), ...(autoheal ? { autoheal } : {}) },
   };
 }
 
@@ -3809,7 +3826,7 @@ export interface UserConfig {
   starter?: { topics?: string[] };
   /** GUARD-ONE-a: omitted means shadow. `live` is parsed for the later cutover, but `elanous guardian tick`
    *  refuses it until a human-confirmed operational change (GUARD-ONE-a ships shadow only). */
-  guardian?: { mode?: 'shadow' | 'live' };
+  guardian?: { mode?: 'shadow' | 'live'; /** Orphan CLI GC on the guardian tick: off = no ps collection, shadow (default) = evidence only, on = evidence then SIGTERM. */ orphanGc?: 'off' | 'shadow' | 'on' };
   /** TA-JUDGE-LIVE-SAFE: task-agent judge moves executed for real. Only `review` · `propose-green` are honoured
    *  (`src/task-agent/live-moves.ts` drops anything else with a warning). Absent = env ELANOUS_TASK_AGENT_LIVE_MOVES, else none (pure shadow). */
   taskAgent?: { liveMoves?: string[]; parentHost?: { host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number } | Array<{ host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number }> };
@@ -3837,7 +3854,7 @@ export interface UserConfig {
   loops?: { owners?: Record<string, EventSeat>; defaultOwner?: EventSeat; orchestrator?: OrchestratorLoopConfig; steward?: { mode?: StewardLoopMode; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig; persona?: PersonaLoopConfig };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
-  harness?: { edgeRail?: { canaryOkRuns?: number; failureMultiplier?: number; minSamples?: number }; /** Goal authoring grade; absent or invalid config resolves to full. */ authorGrade?: 'full' | 'lite'; revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; /** Optional GitHub repository name (owner/repo), distinct from the local defaultRepo path. */ repo?: string; substrate?: 'local' | 'pod'; podPool?: string; /** IMAGE-ONE-SOURCE: Pod 발사가 당길 기준 이미지 커밋(hex 12~40 · 레지스트리 태그 = 앞 12자리). 없으면 종전대로 HEAD 비교·굽기. */ imageCommit?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>>; /** Direct `harness say|ask` goes through the seat queue first (ONEDOOR-2). Absent = env ELANOUS_HARNESS_QUEUE_DIRECT_SAY, else off. */ directSay?: boolean; /** SEAT-CAP-STALE: a run whose last ledger progress is older than this stops holding its seat. Absent = env ELANOUS_HARNESS_QUEUE_STALE_RUN_MINUTES, else 30. */ staleRunMinutes?: number; /** Seat-less runs count in one bucket with this cap instead of every seat. Absent = env ELANOUS_HARNESS_QUEUE_UNKNOWN_SEAT_CAP, else 2. */ unknownSeatCap?: number; /** QUEUE-BURST: most launches one scheduled tick may make (30 s apart, each within seat cap and Pod pool headroom). Absent or invalid = 5; 1 = one launch per tick. */ burstMax?: number }; /** `harness say` 문장을 Pod 안에서 저작부터 돌릴지. 생략·false = 끔(호스트가 저작). */ authorOnPod?: boolean; /** SIBLING-RESYNC-ON-MERGE: most open sibling PR file inventories fetched per merge. Absent or invalid = 40. */ siblingResync?: { maxFetch?: number }; /** Stopped-PR repair goals: shadow records only (default); live enqueues them. */ helper?: { repair?: 'shadow' | 'live'; /** Live launches allowed per UTC day. Absent or invalid means 3. */ repairPerDay?: number };
+  harness?: { edgeRail?: { canaryOkRuns?: number; failureMultiplier?: number; minSamples?: number }; /** Goal authoring grade; absent or invalid config resolves to full. */ authorGrade?: 'full' | 'lite'; revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; /** Optional GitHub repository name (owner/repo), distinct from the local defaultRepo path. */ repo?: string; /** `auto` = SUBSTRATE-ROUTE: routeAutoSubstrate 가 pod/local 을 고른다(신호가 없으면 pod). */ substrate?: 'local' | 'pod' | 'auto'; podPool?: string; /** IMAGE-ONE-SOURCE: Pod 발사가 당길 기준 이미지 커밋(hex 12~40 · 레지스트리 태그 = 앞 12자리). 없으면 종전대로 HEAD 비교·굽기. */ imageCommit?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>>; /** Direct `harness say|ask` goes through the seat queue first (ONEDOOR-2). Absent = env ELANOUS_HARNESS_QUEUE_DIRECT_SAY, else off. */ directSay?: boolean; /** SEAT-CAP-STALE: a run whose last ledger progress is older than this stops holding its seat. Absent = env ELANOUS_HARNESS_QUEUE_STALE_RUN_MINUTES, else 30. */ staleRunMinutes?: number; /** Seat-less runs count in one bucket with this cap instead of every seat. Absent = env ELANOUS_HARNESS_QUEUE_UNKNOWN_SEAT_CAP, else 2. */ unknownSeatCap?: number; /** QUEUE-BURST: most launches one scheduled tick may make (30 s apart, each within seat cap and Pod pool headroom). Absent or invalid = 5; 1 = one launch per tick. */ burstMax?: number }; /** `harness say` 문장을 Pod 안에서 저작부터 돌릴지. 생략·false = 끔(호스트가 저작). */ authorOnPod?: boolean; /** SIBLING-RESYNC-ON-MERGE: most open sibling PR file inventories fetched per merge. Absent or invalid = 40. */ siblingResync?: { maxFetch?: number }; /** Stopped-PR repair goals: shadow records only (default); live enqueues them. */ helper?: { repair?: 'shadow' | 'live'; /** Live launches allowed per UTC day. Absent or invalid means 3. */ repairPerDay?: number };
   /** Nested elanous launches. Only depth 0 may set `allow`. Absent or any other value refuses. A depth >= 1 `--nested-elanous allow` is ignored. */
   nestedElanous?: 'allow' | 'refuse';
   /** Maximum nested elanous depth; safe positive integer, default 2. */
@@ -4140,10 +4157,13 @@ function parseGuardianConfig(raw: unknown): UserConfig['guardian'] {
     warnUserConfigDrop('guardian', '섹션이 객체가 아니다 — 버림');
     return undefined;
   }
-  const mode = (raw as Record<string, unknown>).mode;
-  if (mode === 'shadow' || mode === 'live') return { mode };
-  if (mode !== undefined) warnUserConfigDrop('guardian.mode', 'shadow 또는 live 가 아니다 — 버림');
-  return undefined;
+  const { mode, orphanGc } = raw as Record<string, unknown>;
+  const out: NonNullable<UserConfig['guardian']> = {};
+  if (mode === 'shadow' || mode === 'live') out.mode = mode;
+  else if (mode !== undefined) warnUserConfigDrop('guardian.mode', 'shadow 또는 live 가 아니다 — 버림');
+  if (orphanGc === 'off' || orphanGc === 'shadow' || orphanGc === 'on') out.orphanGc = orphanGc;
+  else if (orphanGc !== undefined) warnUserConfigDrop('guardian.orphanGc', `off|shadow|on 이 아니다(${JSON.stringify(orphanGc)}) — 버리고 shadow 로 진행`);
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** Parse optional ops fields independently; invalid settings cannot silently select a cron cwd. */
@@ -5095,7 +5115,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
           ...(typeof unknownCap === 'number' && Number.isSafeInteger(unknownCap) && unknownCap >= 0 ? { unknownSeatCap: unknownCap } : {}),
         };
       })() },
-      ...(harness.substrate === 'local' || harness.substrate === 'pod' ? { substrate: harness.substrate } : {}),
+      ...(harness.substrate === 'local' || harness.substrate === 'pod' || harness.substrate === 'auto' ? { substrate: harness.substrate } : {}),
       ...(typeof harness.podPool === 'string' && harness.podPool.trim() ? { podPool: harness.podPool.trim() } : {}),
       ...(() => {
         if (harness.imageCommit === undefined) return {};
@@ -5198,10 +5218,14 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
         if (!router || typeof router !== 'object' || Array.isArray(router)) return undefined;
         const preferences = (router as Record<string, unknown>).providerPreferences;
         const fallbackModel = (router as Record<string, unknown>).fallbackModel;
+        const upstreamPins = (router as Record<string, unknown>).upstreamPins;
         const out = {
           ...(preferences && typeof preferences === 'object' && !Array.isArray(preferences)
             ? { providerPreferences: { ...preferences } as Record<string, unknown> } : {}),
           ...(typeof fallbackModel === 'string' ? { fallbackModel } : {}),
+          ...(upstreamPins && typeof upstreamPins === 'object' && !Array.isArray(upstreamPins)
+            ? { upstreamPins: Object.fromEntries(Object.entries(upstreamPins as Record<string, unknown>)
+              .filter((e): e is [string, string[]] => Array.isArray(e[1]) && e[1].every((x) => typeof x === 'string'))) } : {}),
         };
         return Object.keys(out).length > 0 ? out : undefined;
       })(),
@@ -5235,8 +5259,22 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       // ⛔ 같은 모양(문자열 배열)이라 아래 fallbackChain 과 «같은 자»를 쓴다.
       codexCreditsAllowed: llm.codexCreditsAllowed === true ? true : undefined,
       codexQuotaPolicy: isCodexQuotaPolicy(llm.codexQuotaPolicy) ? llm.codexQuotaPolicy : undefined,
+      codexCreditReserve: typeof llm.codexCreditReserve === 'number' && Number.isFinite(llm.codexCreditReserve) && llm.codexCreditReserve >= 0
+        ? llm.codexCreditReserve : undefined,
       grokWeeklyCapPct: typeof llm.grokWeeklyCapPct === 'number' && Number.isFinite(llm.grokWeeklyCapPct)
         && llm.grokWeeklyCapPct >= 0 && llm.grokWeeklyCapPct <= 100 ? llm.grokWeeklyCapPct : LLM_DEFAULTS.grokWeeklyCapPct,
+      // ⛔ 타입·파서·재노출 «셋»이 다 있어야 노브가 산다(형제 주석의 실측) — 재노출은 saveUserConfig 의 llm 블록.
+      zaiCodingPlan: (() => {
+        const z = llm.zaiCodingPlan;
+        if (!z || typeof z !== 'object' || Array.isArray(z)) return undefined;
+        const overage = (z as Record<string, unknown>).overage;
+        const maxConcurrent = (z as Record<string, unknown>).maxConcurrent;
+        const out = {
+          ...(overage === 'stop' || overage === 'balance' || overage === 'openrouter' ? { overage: overage as 'stop' | 'balance' | 'openrouter' } : {}),
+          ...(typeof maxConcurrent === 'number' && Number.isSafeInteger(maxConcurrent) && maxConcurrent >= 1 ? { maxConcurrent } : {}),
+        };
+        return Object.keys(out).length > 0 ? out : undefined;
+      })(),
       codexAccountOrder: Array.isArray(llm.codexAccountOrder)
         ? llm.codexAccountOrder.filter((v: unknown): v is string => typeof v === 'string' && v.length > 0)
         : undefined,
@@ -6520,7 +6558,9 @@ export function saveUserConfig(
       // ★ 2026-09-28: 타입·파서에만 넣고 이 whitelist 를 빠뜨려 `config set llm.codexCreditsAllowed true` 가 «직렬화 드롭» 됐다(#21375 직후 운영 실측).
       codexCreditsAllowed: cfg.llm.codexCreditsAllowed,
       codexQuotaPolicy: cfg.llm.codexQuotaPolicy,
+      codexCreditReserve: cfg.llm.codexCreditReserve,
       grokWeeklyCapPct: cfg.llm.grokWeeklyCapPct,
+      zaiCodingPlan: cfg.llm.zaiCodingPlan,
       fallbackChain: cfg.llm.fallbackChain,
       openrouter: cfg.llm.openrouter,
       reviewFallbackModels: cfg.llm.reviewFallbackModels,

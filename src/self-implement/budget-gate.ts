@@ -2,8 +2,8 @@
 // 회전·사용량 저장소·선호 해석은 기존 함수를 부른다. 여기선 다시 만들지 않는다.
 
 import type { RotationCandidate } from '../oauth/codex-account-rotation.js';
-import { inspectCodexRotation } from '../oauth/codex-account-store.js';
-import { codexPolicyAllowsCredits } from '../oauth/codex-quota-policy.js';
+import { DEFAULT_CODEX_CREDIT_RESERVE, inspectCodexRotation } from '../oauth/codex-account-store.js';
+import { codexPolicyAllowsCredits, codexPolicyAllowsFallback } from '../oauth/codex-quota-policy.js';
 import { getUsageStore } from '../budget/usage-store.js';
 import type { UsageSnapshot } from '../budget/types.js';
 import { debug } from '../debug/log.js';
@@ -35,7 +35,7 @@ export interface BudgetCodexCandidate {
 
 export interface DecideBudgetInput {
   readonly preference: {
-    readonly chain: readonly { readonly provider: string; readonly model?: string }[];
+    readonly chain: readonly { readonly provider: string; readonly model?: string; readonly codexCredits?: true }[];
     readonly budgetGate: { readonly onShortfall: BudgetGateOnShortfall };
   };
   readonly codexCandidates: readonly BudgetCodexCandidate[];
@@ -44,6 +44,8 @@ export interface DecideBudgetInput {
   readonly maxUsedPercent: BudgetGateMaxUsedPercent;
   /** codex 한도 정책이 credits 인가(`codexPolicyAllowsCredits` · 회전·Pod 배분과 같은 해석). 없으면 false. */
   readonly codexCreditsAllowed?: boolean;
+  /** SUBSCRIPTION-EXHAUST-REROUTE — `llm.codexCreditReserve`. 잔액이 이 값 «초과»인 계정만 크레딧 후보다. 없으면 종전(> 0). */
+  readonly codexCreditReserve?: number;
 }
 
 export interface BudgetDecision {
@@ -59,6 +61,13 @@ export interface BudgetInputs {
   readonly grokUsedPercent: number | undefined;
   readonly maxUsedPercent: BudgetGateMaxUsedPercent;
   readonly codexCreditsAllowed?: boolean;
+  readonly codexCreditReserve?: number;
+}
+
+/** `llm.codexCreditReserve` from the same config the preference was read from — invalid or absent = default. */
+function budgetCreditReserve(config: ChildLlmPreferenceInput): number {
+  const raw = (config as { llm?: { codexCreditReserve?: unknown } }).llm?.codexCreditReserve;
+  return typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_CODEX_CREDIT_RESERVE;
 }
 
 const WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
@@ -109,11 +118,15 @@ function codexCandidateUsable(candidate: BudgetCodexCandidate, cap: number | und
 
 /** BUDGET-GATE(10-05) — 정책이 credits 면 구독 % 가 차도 크레딧 잔액이 «확인된» 계정으로 계속 간다(Pod 배분과 같은 결론).
  *  잔액을 모르면 쓰지 않는다 — 크레딧은 돈이라 fail-closed. 잔액이 가장 큰 계정 하나를 돌려준다. */
-function codexCreditCandidate(input: DecideBudgetInput): BudgetCodexCandidate | undefined {
-  if (input.codexCreditsAllowed !== true) return undefined;
+function codexCreditCandidate(input: DecideBudgetInput, creditsStep = false): BudgetCodexCandidate | undefined {
+  // `codex-credits` 칸은 «체인이 거기까지 왔을 때»만 크레딧을 연다 — 정책(첫 칸)의 크레딧 금지와 별개다.
+  if (input.codexCreditsAllowed !== true && !creditsStep) return undefined;
+  // The credits step (new spend path) defaults to the reserve when none was passed — money, fail-closed; the policy path keeps > 0.
+  const floor = typeof input.codexCreditReserve === 'number' && Number.isFinite(input.codexCreditReserve) && input.codexCreditReserve >= 0
+    ? input.codexCreditReserve : creditsStep && input.codexCreditsAllowed !== true ? DEFAULT_CODEX_CREDIT_RESERVE : 0;
   return input.codexCandidates
     .filter((candidate) => candidate.hasCredits !== false
-      && typeof candidate.creditBalance === 'number' && Number.isFinite(candidate.creditBalance) && candidate.creditBalance > 0)
+      && typeof candidate.creditBalance === 'number' && Number.isFinite(candidate.creditBalance) && candidate.creditBalance > floor)
     .sort((a, b) => (b.creditBalance! - a.creditBalance!) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))[0];
 }
 
@@ -121,7 +134,19 @@ function slotUsable(
   provider: string,
   input: DecideBudgetInput,
   allowUnmeasured = false,
+  codexCreditsSlot = false,
 ): { usable: boolean; reason: string; unmeasured?: boolean } {
+  if (provider === CODEX_PROVIDER && codexCreditsSlot) {
+    // CODEX-CREDITS-STEP — 잔액이 «확인된» 계정만(모르면 못 쓴다 · 돈이라 fail-closed). 미측정 통과도 «없다».
+    const credit = codexCreditCandidate(input, true);
+    if (!credit) {
+      // 칸에 «닿았지만» 잔액 확인된 계정이 없다 — 실패한 도달도 남긴다.
+      try { debug.log('budget.gate', 'codex-credits-step', { outcome: 'skipped', why: 'codex-credits-unavailable' }); } catch { /* observation is fail-soft */ }
+    }
+    return credit
+      ? { usable: true, reason: `codex-credits: ${credit.name} 크레딧 잔액 ${credit.creditBalance} (체인 마지막 칸 · 과금)` }
+      : { usable: false, reason: 'codex-credits: 잔액이 확인된 계정 없음' };
+  }
   if (provider === CODEX_PROVIDER) {
     const cap = capFor(input.maxUsedPercent, CODEX_PROVIDER);
     const measuredUsable = input.codexCandidates.some((candidate) => codexCandidateUsable(candidate, cap));
@@ -139,16 +164,19 @@ function slotUsable(
   }
   if (provider === GROK_PROVIDER) {
     const configured = capFor(input.maxUsedPercent, GROK_PROVIDER);
-    // 발사 관문은 `elanous usage` 와 같은 주간 사용률에 80% 상한을 실제로 적용한다.
-    // «못 쟀다»(undefined)는 통과가 아니다. decideBudget 은 설정 상한을 그대로 쓴다.
+    // 발사 관문은 잰 주간 사용률에만 80% 상한을 적용한다.
+    // «못 쟀다»(undefined)는 allowUnmeasured 일 때 통과하고 unmeasured 를 남긴다(codex 와 같은 꼴).
+    // decideBudget 은 설정 상한을 그대로 쓰고 모름을 통과로 보지 않는다.
     const cap = allowUnmeasured ? LAUNCH_GROK_USED_PERCENT_CAP : configured;
     const known = typeof input.grokUsedPercent === 'number' && Number.isFinite(input.grokUsedPercent);
-    const usable = cap === undefined
+    const measuredUsable = cap === undefined
       ? known
       : known && (input.grokUsedPercent as number) < cap;
+    const unmeasured = allowUnmeasured && !known;
     return {
-      usable,
+      usable: measuredUsable || unmeasured,
       reason: formatGrokReason(input.grokUsedPercent, cap),
+      ...(unmeasured ? { unmeasured: true } : {}),
     };
   }
   return { usable: false, reason: `${provider}: 예산 판정 없음` };
@@ -176,13 +204,19 @@ function decideBudgetWithPolicy(input: DecideBudgetInput, allowUnmeasured: boole
   let firstUnusable = false;
   for (let index = 0; index < input.preference.chain.length; index++) {
     const slot = input.preference.chain[index]!;
-    const judged = slotUsable(slot.provider, input, allowUnmeasured);
+    const judged = slotUsable(slot.provider, input, allowUnmeasured, slot.codexCredits === true);
     reasons.push(judged.reason);
     if (!judged.usable) {
       if (index === 0) firstUnusable = true;
       continue;
     }
     const action: BudgetAction = index === 0 || !firstUnusable ? 'proceed' : 'next-provider';
+    if (slot.codexCredits === true) {
+      try {
+        // 체인이 «마지막 칸»(유료)에 닿을 때마다 한 줄 — 앞 칸을 왜 못 썼나는 reasons 가 말한다(비밀 없음).
+        debug.log('budget.gate', 'codex-credits-step', { outcome: 'credits', action, reasons, launch: allowUnmeasured }, { level: 'warn' });
+      } catch { /* observation is fail-soft */ }
+    }
     return {
       decision: {
         action,
@@ -230,8 +264,12 @@ export interface ReadBudgetInputsDeps {
 /** 설정·codex 회전·grok 스냅숏을 읽어 판정 입력을 만든다. 판정 자체는 하지 않는다. */
 export function readBudgetInputs(deps: ReadBudgetInputsDeps = {}): BudgetInputs {
   const config = deps.config ?? deps.loadConfig?.() ?? loadLiveConfig();
-  const preference = resolveChildLlmPreference(config);
+  const resolved = resolveChildLlmPreference(config);
   const rotation = (deps.inspectCodex ?? inspectCodexRotation)();
+  // 정책 within-quota(한도 안에서만)는 크레딧을 «절대» 안 쓴다 — `codex-credits` 칸도 뺀다(회전·폴백 판정과 같은 해석).
+  const preference = rotation.policy && !codexPolicyAllowsFallback(rotation.policy.policy)
+    ? { ...resolved, chain: resolved.chain.filter((slot) => slot.codexCredits !== true) }
+    : resolved;
   const snapshot = deps.grokSnapshot
     ? deps.grokSnapshot()
     : getUsageStore().getSnapshot('grok');
@@ -242,7 +280,9 @@ export function readBudgetInputs(deps: ReadBudgetInputsDeps = {}): BudgetInputs 
     grokUsedPercent: grokWeeklyUsedPercent(snapshot),
     maxUsedPercent,
     // 회전·Pod 배분과 같은 해석(`resolveCodexQuotaPolicy` → `codexPolicyAllowsCredits`)을 읽는다 — 다시 짓지 않는다.
-    ...(rotation.policy && codexPolicyAllowsCredits(rotation.policy.policy) ? { codexCreditsAllowed: true } : {}),
+    ...(rotation.policy && codexPolicyAllowsCredits(rotation.policy.policy) ? { codexCreditsAllowed: true, codexCreditReserve: budgetCreditReserve(config) }
+      // CODEX-CREDITS-STEP — the `codex-credits` slot keeps the same reserve (a credit spend below it is the case the reserve exists for).
+      : preference.chain.some((slot) => slot.codexCredits === true) ? { codexCreditReserve: budgetCreditReserve(config) } : {}),
   };
 }
 

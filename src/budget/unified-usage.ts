@@ -9,6 +9,7 @@ import { createCodexFetcher, type CodexFetcherOpts } from './fetchers/codex.js';
 import {
   fetchGrokUsage,
   GROK_SUBSCRIPTION_AXIS,
+  grokUsageToSubscriptionAxis,
   grokUsageToCreditAxis,
   type GrokUsageResult,
 } from '../grok/usage.js';
@@ -20,6 +21,10 @@ import { envLiteral } from '../platform/env-literal.js';
 import { describeResetCreditExpiry } from './codex-reset-credit-state.js';
 import { visibleWidth } from '../tui.js';
 import { listCodexResetCredits, type CodexResetCreditsResult } from './codex-reset-credits.js';
+import {
+  buildZaiUsageView, fetchZaiQuota, getZaiApiKey, readZaiLedger,
+  type ZaiLedgerRecord, type ZaiQuotaResult, type ZaiUsageView,
+} from '../llm/zai-coding-plan.js';
 import type {
   AccountUsageRow,
   CreditAxis,
@@ -50,22 +55,91 @@ export interface UnifiedUsageDeps {
   /** 결정 2026-09-23 — OpenRouter 선불 크레딧 조회 seam. 없으면 실키로 `/api/v1/credits`. */
   readonly openRouterKey?: () => string | undefined;
   readonly fetchOpenRouterImpl?: typeof fetch;
+  /** ZAI-CODING-PLAN-PROVIDER seam — 키 «있음» 판정(값은 안 쓴다) · 공식 조회 · 원장. */
+  readonly zaiKey?: () => string | undefined;
+  readonly fetchZaiQuota?: () => Promise<ZaiQuotaResult>;
+  readonly readZaiLedger?: () => ZaiLedgerRecord[];
 }
 
 export async function collectUnifiedUsage(deps: UnifiedUsageDeps = {}): Promise<UnifiedUsageReport> {
-  const [codexRows, grokRows, openRouterRows] = await Promise.all([
+  const [codexRows, grokRows, openRouterRows, zai] = await Promise.all([
     collectCodexRows(deps),
     collectGrokRows(deps),
     collectOpenRouterRows(deps),
+    collectZaiRows(deps),
   ]);
   return {
-    rows: [...codexRows, ...grokRows, ...openRouterRows],
+    rows: [...codexRows, ...grokRows, ...openRouterRows, ...(zai?.rows ?? [])],
     accountCounts: {
       codex: codexRows.length,
       grok: grokRows.length,
       openrouter: openRouterRows.length,
+      // ⛔ 키가 없으면 칸 자체를 안 싣는다 — 종전 JSON·문면과 바이트 동일.
+      ...(zai ? { zai: 1 } : {}),
     },
+    ...(zai ? { zaiCodingPlan: zai.view } : {}),
   };
+}
+
+/** ZAI-CODING-PLAN-PROVIDER — GLM Coding Plan 의 5h·주 창 ⊕ 잔액(extra usage) 사용.
+ *  ⓒ 공식 조회(`/api/monitor/usage/quota/limit`)가 되면 그 값 · 안 되면 ⓐ 우리 적산 ⊕ ⓑ 429 리셋 시각으로 «추정».
+ *  ⛔ 키가 없으면 행을 «안» 만든다. ⛔ 시험 런타임은 seam 이 없으면 «키 없음»(키 캐시는 파일이라 스크럽을 통과한다). */
+async function collectZaiRows(deps: UnifiedUsageDeps): Promise<{ rows: AccountUsageRow[]; view: ZaiUsageView } | null> {
+  // ⛔ 시험 런타임(NODE_ENV=test)은 seam 이 없으면 «env 의 ZAI_API_KEY 만» 본다 — 키 캐시 «파일»은 env 스크럽을 통과해
+  //   seam 을 모르는 옛 usage 시험이 실제 Z.ai 를 치게 되기 때문이다. env 로 키를 주면 test 에서도 행이 선다.
+  const key = (deps.zaiKey ?? (process.env.NODE_ENV === 'test' ? () => process.env.ZAI_API_KEY?.trim() || undefined : () => getZaiApiKey()))();
+  if (!key) return null;
+  const nowMs = (deps.now ?? Date.now)();
+  // ⛔ 조회가 «던져도» usage 전체를 죽이지 않는다 — 실패는 결과값으로 바꿔 추정 표로 간다.
+  const quota: ZaiQuotaResult = await (deps.fetchZaiQuota ?? (() => fetchZaiQuota()))()
+    .catch((error: unknown) => ({ status: 'error' as const, detail: error instanceof Error ? error.message : String(error) }));
+  const view = buildZaiUsageView(quota, (deps.readZaiLedger ?? (() => readZaiLedger()))(), nowMs);
+  const base = { provider: 'zai' as const, accountCount: 1, soleAccount: true, resetCredits: { status: 'not-applicable' } as const };
+  const sourceLabel = { official: '공식', next_flush_time: 'next_flush_time', estimated: '추정' } as const;
+  const rows: AccountUsageRow[] = view.windows.map((w) => {
+    const windowMs = w.window === '5h' ? 5 * 3_600_000 : 7 * 86_400_000;
+    const usedPercent = w.limit > 0 ? Math.round((w.used / w.limit) * 1000) / 10 : null;
+    const end = w.resetAt !== null && isValidEpochMs(w.resetAt) ? new Date(w.resetAt) : null;
+    const kind: WindowKind = w.window === '5h' ? 'session' : 'weekly';
+    return {
+      ...base,
+      accountName: w.window === '5h' ? 'plan-5h' : 'plan-week',
+      credits: {
+        status: 'ok',
+        usedPercent,
+        periodType: kind,
+        periodStart: end ? new Date(end.getTime() - windowMs).toISOString() : null,
+        periodEnd: end?.toISOString() ?? null,
+        monthlyLimit: null,
+        used: w.used,
+        onDemandCap: null,
+        onDemandUsed: null,
+        prepaidBalance: null,
+        balance: null,
+        hasCredits: null,
+        unlimited: false,
+      },
+      // 리셋 시각을 모르면 «available» 로 NaN 을 흘리지 않는다.
+      subscription: usedPercent === null || !end
+        ? { status: 'unavailable', reason: 'query-does-not-supply' }
+        : { status: 'available', remainingPercent: Math.round((100 - usedPercent) * 10) / 10, resetsAt: end.getTime(), windowKind: kind },
+      // ⓐ 우리 적산을 공식 값 옆에 같이 둔다 — 공식은 정수 크레딧으로 내려 작은 호출이 0 으로 보인다(10-11 실측).
+      note: `${w.used}/${w.limit} 크레딧 · 출처=${sourceLabel[w.source]}${w.resetAt === null ? ' · 리셋 시각 모름' : ''}`
+        + (w.source === 'official' ? ` · elanous 적산 ${w.window === '5h' ? view.local.fiveHour.used : view.local.weekly.used}` : ''),
+    };
+  });
+  rows.push({
+    ...base,
+    accountName: 'extra-usage',
+    credits: {
+      status: 'ok', usedPercent: null, periodType: 'extra-usage', periodStart: null, periodEnd: null,
+      monthlyLimit: null, used: view.balanceCredits, onDemandCap: null, onDemandUsed: null,
+      prepaidBalance: null, balance: null, hasCredits: null, unlimited: false,
+    },
+    subscription: { status: 'unavailable', reason: 'not-a-subscription' },
+    note: `잔액 사용 ${view.balanceCredits} 크레딧(추정 · 최근 7일)${view.lastLimit ? ` · 마지막 한도 코드 ${view.lastLimit.code}` : ''}`,
+  });
+  return { rows, view };
 }
 
 async function collectCodexRows(deps: UnifiedUsageDeps): Promise<AccountUsageRow[]> {
@@ -138,7 +212,11 @@ async function collectGrokRows(deps: UnifiedUsageDeps): Promise<AccountUsageRow[
     resetCredits: { status: 'not-applicable' } as const,
   };
   if (result.status === 'ok') {
-    return [{ ...base, credits: grokUsageToCreditAxis(result.usage) }];
+    return [{
+      ...base,
+      subscription: grokUsageToSubscriptionAxis(result.usage),
+      credits: grokUsageToCreditAxis(result.usage),
+    }];
   }
   if (result.status === 'no-subscription') {
     return [{ ...base, credits: { status: 'no-subscription' } }];
@@ -284,7 +362,7 @@ export function formatUsageCompact(report: UnifiedUsageReport, options: { width:
     const reset = subscription.status === 'available' ? subscription.resetsAt
       : credits.status === 'ok' && credits.periodEnd ? Date.parse(credits.periodEnd) : Number.NaN;
     const periodLabel = period ? `${formatCompactPeriod(period)} ` : '';
-    const when = period === 'prepaid-usd' ? '' : !isValidEpochMs(reset)
+    const when = period === 'prepaid-usd' || period === 'extra-usage' ? '' : !isValidEpochMs(reset)
       ? ` · ${periodLabel}시각 모름`
       : reset <= options.nowMs
         ? ` · ${periodLabel}재조회 필요`
@@ -351,6 +429,8 @@ export function formatUnifiedUsage(report: UnifiedUsageReport): string {
     const count = report.accountCounts[provider];
     lines.push(`  ${provider}  accounts=${count}${count === 1 ? '  (하나뿐)' : count === 0 ? '  (없음)' : ''}`);
   }
+  // ⛔ 키가 없으면 줄을 안 낸다 — 종전 문면과 바이트 동일.
+  if (report.accountCounts.zai !== undefined) lines.push(`  zai  accounts=${report.accountCounts.zai}  (GLM Coding Plan)`);
   lines.push('  provider    account     accounts  credits.usedPercent  credits.window              window-resets-in       reset-credit-expiry                  subscription');
   for (const row of report.rows) {
     lines.push(formatRow(row));
@@ -364,7 +444,7 @@ function formatRow(row: AccountUsageRow): string {
   const resetsIn = formatWindowResetsIn(row.credits);
   const resetCredits = formatResetCreditExpiryCell(row.resetCredits);
   const subscription = formatSubscriptionCell(row.subscription);
-  return `  ${row.provider.padEnd(10)} ${row.accountName.padEnd(11)} ${String(row.accountCount).padEnd(8)} ${credits.padEnd(20)} ${window.padEnd(26)} ${resetsIn.padEnd(22)} ${resetCredits.padEnd(36)} ${subscription}`;
+  return `  ${row.provider.padEnd(10)} ${row.accountName.padEnd(11)} ${String(row.accountCount).padEnd(8)} ${credits.padEnd(20)} ${window.padEnd(26)} ${resetsIn.padEnd(22)} ${resetCredits.padEnd(36)} ${subscription}${row.note ? `  — ${row.note}` : ''}`;
 }
 
 function formatResetCreditExpiryCell(expiry: ResetCreditExpiryAxis): string {
@@ -381,6 +461,7 @@ function formatResetCreditExpiryCell(expiry: ResetCreditExpiryAxis): string {
 
 function formatCreditsCell(credits: CreditAxis): string {
   if (credits.status !== 'ok') return credits.status;
+  if (credits.periodType === 'extra-usage') return `${credits.used ?? 0} cr`;
   if (credits.usedPercent === null) return 'unknown';
   // 선불 달러 — 퍼센트만으로는 «얼마 남았나»를 못 읽는다.
   if (credits.periodType === 'prepaid-usd' && credits.balance !== null) return `${credits.usedPercent}% ($${credits.balance} left)`;
@@ -390,6 +471,7 @@ function formatCreditsCell(credits: CreditAxis): string {
 function formatCreditsWindow(credits: CreditAxis): string {
   if (credits.status !== 'ok') return '—';
   if (credits.periodType === 'prepaid-usd') return 'prepaid (창 없음)';
+  if (credits.periodType === 'extra-usage') return 'extra-usage (잔액)';
   const type = credits.periodType ?? '—';
   if (credits.periodStart && credits.periodEnd) {
     return `${type} ${credits.periodStart.slice(0, 10)}~${credits.periodEnd.slice(0, 10)}`;
@@ -407,7 +489,7 @@ function formatCreditsWindow(credits: CreditAxis): string {
  */
 export function formatWindowResetsIn(credits: CreditAxis, nowMs: number = Date.now()): string {
   if (credits.status !== 'ok') return '—';
-  if (credits.periodType === 'prepaid-usd') return 'n/a (리셋 없음)';
+  if (credits.periodType === 'prepaid-usd' || credits.periodType === 'extra-usage') return 'n/a (리셋 없음)';
   const end = credits.periodEnd ? Date.parse(credits.periodEnd) : Number.NaN;
   if (!Number.isFinite(end)) return 'unknown';
   const remainMs = end - nowMs;

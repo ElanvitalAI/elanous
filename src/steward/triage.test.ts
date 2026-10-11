@@ -12,6 +12,8 @@ import { debug } from '../debug/log.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { setInProcessOutbound } from '../domains/outbound-alert.js';
 import { DEFAULT_KIND_ROLES, isTradingKind } from '../domains/telegram-kind-route.js';
+import { emitLoopHeartbeat } from '../loops/neighbor-runtime.js';
+import { launcherEvidence } from '../loops/checker.js';
 
 // #25512: live launch resolves the registered HQ OP view from the real HOME; tests run from an isolated view instead.
 const testLaunchSeat = (): string => tmpdir();
@@ -34,6 +36,120 @@ test('steward config parses alert threshold and ignores invalid thresholds', () 
       writeFileSync(path, JSON.stringify({ loops: { steward: { alertAfterFailures: invalid } } }));
       expect(buildUserConfig(path).loops?.steward?.alertAfterFailures).toBeUndefined();
     }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('sync owns a 15-minute registry check; shadow observes, live wakes owners, never bypasses launch', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-schedule-watch-'));
+  const at = new Date('2026-10-04T12:00:00Z');
+  const fetchFn = (async () => Response.json({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } })) as unknown as typeof fetch;
+  let reads = 0;
+  let current = at;
+  const deps = { root, fetch: fetchFn, getSecret: async () => 'key', now: () => current,
+    scheduleInventory: () => { reads++; return [{ id: 'late-graph', owner: 'TC', enabled: true, registered: true,
+      lastRunAt: '2026-10-04T11:00:00Z', expectEveryMinutes: 15 }]; } };
+  try {
+    await runStewardStage('sync', { ...deps, launchSettings: { mode: 'off' } });
+    expect(reads).toBe(0);
+    await runStewardStage('sync', { ...deps, launchSettings: { mode: 'shadow' } });
+    expect(reads).toBe(1);
+    expect(existsSync(join(root, 'seat-requests', 'requests.jsonl'))).toBe(false);
+    current = new Date('2026-10-04T12:14:59Z');
+    await runStewardStage('sync', { ...deps, launchSettings: { mode: 'live' } });
+    expect(reads).toBe(1);
+    current = new Date('2026-10-04T12:15:00Z');
+    await runStewardStage('sync', { ...deps, launchSettings: { mode: 'live' } });
+    expect(reads).toBe(2);
+    expect(JSON.parse(readFileSync(join(root, 'seat-requests', 'requests.jsonl'), 'utf8').trim())).toMatchObject({ seat: 'TC', source: 'loop-checker' });
+    current = new Date('2026-10-04T12:45:00Z');
+    await runStewardStage('sync', { ...deps, launchSettings: { mode: 'live' } });
+    const notices = readFileSync(join(root, 'seat-requests', 'requests.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(notices.map(row => row.seat)).toEqual(['TC', 'OP']);
+    expect(notices[1]!.key).toBe(`${notices[0]!.key}:op`);
+    expect(existsSync(join(root, 'steward', 'launches.json'))).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a broken schedule check is observed and never stops the Linear sync', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-schedule-broken-'));
+  const fetchFn = (async () => Response.json({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } })) as unknown as typeof fetch;
+  try {
+    mkdirSync(join(root, 'steward'), { recursive: true });
+    writeFileSync(join(root, 'steward', 'schedule-check.json'), '{not json');
+    await runStewardStage('sync', { root, fetch: fetchFn, getSecret: async () => 'key', now: () => new Date('2026-10-04T12:00:00Z'),
+      launchSettings: { mode: 'live' }, scheduleInventory: () => { throw new Error('inventory exploded'); } });
+    expect(existsSync(join(root, 'steward', 'issues.json'))).toBe(true);
+    writeFileSync(join(root, 'steward', 'schedule-check.json'), JSON.stringify({ at: '2026-10-04T11:00:00Z' }));
+    rmSync(join(root, 'steward', 'issues.json'));
+    await runStewardStage('sync', { root, fetch: fetchFn, getSecret: async () => 'key', now: () => new Date('2026-10-04T12:00:00Z'),
+      launchSettings: { mode: 'live' }, scheduleInventory: () => { throw new Error('inventory exploded'); } });
+    expect(existsSync(join(root, 'steward', 'issues.json'))).toBe(true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('live sync extends a fresh healthy launcher lease, shadow does not mutate it', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-lease-'));
+  const fetchFn = (async () => Response.json({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } })) as unknown as typeof fetch;
+  const now = new Date('2026-10-04T12:00:00Z');
+  const entry = { id: 'active', owner: 'TC', enabled: true, registered: true, lastRunAt: '2026-10-04T11:59:00Z', expectEveryMinutes: 15 };
+  try {
+    emitLoopHeartbeat(root, 'active', 'healthy', new Date('2026-10-04T11:50:00Z'), '2026-10-04T11:55:00Z');
+    const deps = { root, fetch: fetchFn, getSecret: async () => 'key', now: () => now,
+      scheduleInventory: () => launcherEvidence([entry], root) };
+    await runStewardStage('sync', { ...deps, launchSettings: { mode: 'shadow' } });
+    expect(launcherEvidence([entry], root)[0]?.endsAt).toBe('2026-10-04T11:55:00Z');
+    emitLoopHeartbeat(root, 'active', 'healthy', new Date('2026-10-04T12:14:00Z'), '2026-10-04T11:55:00Z');
+    await runStewardStage('sync', { ...deps, now: () => new Date('2026-10-04T12:15:00Z'), launchSettings: { mode: 'live' } });
+    expect(launcherEvidence([entry], root)[0]?.endsAt).toBe('2026-10-04T12:30:00.000Z');
+    expect(existsSync(join(root, 'seat-requests', 'requests.jsonl'))).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('live sync routes expired degraded or stale launchers to their owner instead of extending their lease', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-stale-lease-'));
+  const fetchFn = (async () => Response.json({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } })) as unknown as typeof fetch;
+  const now = new Date('2026-10-04T12:00:00Z');
+  const entry = { id: 'stale-launcher', owner: 'MK', enabled: true, registered: true,
+    lastRunAt: '2026-10-04T11:59:00Z', expectEveryMinutes: 15 };
+  try {
+    emitLoopHeartbeat(root, entry.id, 'degraded', new Date('2026-10-04T11:50:00Z'), '2026-10-04T11:55:00Z');
+    await runStewardStage('sync', { root, fetch: fetchFn, getSecret: async () => 'key', now: () => now,
+      launchSettings: { mode: 'live' }, scheduleInventory: () => launcherEvidence([entry], root) });
+    expect(launcherEvidence([entry], root)[0]?.endsAt).toBe('2026-10-04T11:55:00Z');
+    const requests = readFileSync(join(root, 'seat-requests', 'requests.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(requests.map(row => [row.seat, row.key])).toEqual([
+      ['MK', 'loopcheck:stale-launcher:2026-10-04:degraded'],
+      ['MK', 'loopcheck:stale-launcher:2026-10-04:end-expired'],
+    ]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('live sync detects managed never-fired schedule after two missed fires', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-never-fired-'));
+  const fetchFn = (async () => Response.json({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } })) as unknown as typeof fetch;
+  try {
+    await runStewardStage('sync', { root, fetch: fetchFn, getSecret: async () => 'key',
+      launchSettings: { mode: 'live' }, now: () => new Date('2026-10-04T12:00:00Z'),
+      scheduleInventory: () => [], daemonSchedules: () => [{ id: 'never-fired', enabled: 1,
+        cron: '*/15 * * * *', run_via: 'trigger', last_seen: '2026-10-04T11:00:00Z', last_run: null,
+      } as import('../domains/schedule-registry.js').ScheduleRow] });
+    expect(JSON.parse(readFileSync(join(root, 'seat-requests', 'requests.jsonl'), 'utf8').trim()))
+      .toMatchObject({ seat: 'OP', key: 'loopcheck:never-fired:2026-10-04:late' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('sync also checks enabled daemon schedule inventory without launching or changing Linear rows', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-daemon-watch-'));
+  const fetchFn = (async () => Response.json({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } })) as unknown as typeof fetch;
+  try {
+    await runStewardStage('sync', { root, fetch: fetchFn, getSecret: async () => 'key',
+      launchSettings: { mode: 'live' }, now: () => new Date('2026-10-04T12:00:00Z'),
+      scheduleInventory: () => [], daemonSchedules: () => [{ id: 'daemon-job', enabled: 1, cron: '*/15 * * * *',
+        run_via: 'trigger', last_run: '2026-10-04T11:00:00Z' } as import('../domains/schedule-registry.js').ScheduleRow],
+      spawnLaunch: () => { throw new Error('watch cannot launch'); } });
+    expect(JSON.parse(readFileSync(join(root, 'seat-requests', 'requests.jsonl'), 'utf8').trim())).toMatchObject({ seat: 'OP', source: 'loop-checker' });
+    expect(readFileSync(join(root, 'steward', 'issues.json'), 'utf8')).toBe('[]');
+    expect(existsSync(join(root, 'steward', 'launches.json'))).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

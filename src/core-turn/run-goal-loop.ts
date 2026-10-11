@@ -212,9 +212,10 @@ export const GOAL_INTENT_STALL_PROMPT = [
 /** 재촉 상한 — 이 횟수를 쓰고도 텍스트만이면 종전 ④(텍스트 수용)로 그대로 떨어진다. */
 export const GOAL_INTENT_STALL_MAX_REPROMPTS = 2;
 
-/** 재촉 가드가 켜지는 provider — ⭐ 이번 조각은 OpenRouter(오픈웨이트 모델) 구현 자식 «한정»이다
- *  (OP 10-10 결정 · 실측 GLM Flash 첫 턴 40토큰 말만 하고 abandoned). 다른 provider 는 종전 그대로. */
-export const GOAL_INTENT_STALL_PROVIDERS: ReadonlySet<string> = new Set(['openrouter']);
+/** 재촉 가드가 켜지는 provider — 구현 자식을 내는 provider 전부(10-11 · 첫 조각 #25876 은 OpenRouter 한정이었다 ·
+ *  실측 GLM Flash 첫 턴 40토큰 말만 하고 abandoned). 재촉은 «도구 0회·텍스트만» 턴에만 걸리므로 도구를 부르는 자식에는 영향이 없다.
+ *  목록 밖 provider(local 등)는 종전 그대로 바로 수용한다. */
+export const GOAL_INTENT_STALL_PROVIDERS: ReadonlySet<string> = new Set(['openrouter', 'openai-codex', 'anthropic', 'grok', 'bedrock']);
 
 /** evidence 누락 complete 재주입 — update_goal(complete) 를 호출했으나 evidence 가 비었을 때. */
 export const GOAL_EVIDENCE_REQUIRED_PROMPT = [
@@ -280,7 +281,7 @@ export interface GoalLoopOptions {
   controlSpaceId?: string | null;
   /** Test seam — file-backed child liveness heartbeat. Default starts the workspace-file writer. */
   startLivenessHeartbeat?: typeof startChildLivenessHeartbeat;
-  /** GOAL-LOOP-INTENT-STALL — 구현 자식의 LLM provider. `openrouter` 일 때만 «도구 0회·텍스트만» 턴을
+  /** GOAL-LOOP-INTENT-STALL — 구현 자식의 LLM provider. GOAL_INTENT_STALL_PROVIDERS 에 있을 때만 «도구 0회·텍스트만» 턴을
    *  최대 2번 재촉한다. 생략하면 harness role 이 executor 인 프로세스에서만 활성 provider 로 푼다.
    *  null = 가드 꺼짐. 시험은 이 인자를 명시해 env 에 기대지 않는다. */
   intentStallProvider?: string | null;

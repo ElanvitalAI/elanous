@@ -38,3 +38,16 @@ test('llm.codexQuotaPolicy 는 config set → get 왕복에서 살아남는다',
   expect(got.status).toBe(0);
   expect(got.stdout.trim().split('\n').at(-1)).toContain('within-quota');
 }, 60_000);
+
+// SUBSCRIPTION-EXHAUST-REROUTE (0.2.24) — 새 칸 둘도 같은 직렬화 whitelist 를 지난다.
+test('llm.codexCreditReserve 와 tools.selfImplement.podChildDefault 는 config set → get 왕복에서 살아남는다', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'codex-reserve-cfg-'));
+  dirs.push(dir);
+  const cli = (...args: string[]) => spawnSync(process.execPath, ['bin/elanous.mjs', '--config-dir', dir, 'config', ...args], { cwd: join(import.meta.dir, '..'), encoding: 'utf8' });
+  expect(cli('set', 'llm.codexCreditReserve', '1500').status).toBe(0);
+  expect(cli('get', 'llm.codexCreditReserve').stdout.trim().split('\n').at(-1)).toBe('1500');
+  expect(cli('set', 'tools.selfImplement.podChildDefault', 'off').status).toBe(0);
+  expect(cli('get', 'tools.selfImplement.podChildDefault').stdout.trim().split('\n').at(-1)).toContain('off');
+  // 앞 칸이 뒤 칸 쓰기에 지워지지 않는다(설치본 config set 이 새 칸을 떨군 사례).
+  expect(cli('get', 'llm.codexCreditReserve').stdout.trim().split('\n').at(-1)).toBe('1500');
+}, 120_000);

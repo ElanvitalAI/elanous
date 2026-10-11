@@ -54,6 +54,45 @@ describe('syncPoolImage · same image ID', () => {
   });
 });
 
+describe('syncPoolImage · remote k3d import tools-node cleanup race', () => {
+  for (const stderr of [
+    "INFO[0000] imported image successfully\nERRO[0001] failed to import images: failed to delete tools node 'k3d-x-tools': Error response from daemon: No such container: k3d-x-tools",
+    "ERRO[0001] failed to delete tools node 'k3d-x-tools': Error response from daemon: removal of container k3d-x-tools is already in progress",
+  ]) {
+    test(`cleanup-only rc=1 ships: ${stderr.includes('No such container') ? 'No such container' : 'already in progress'}`, () => {
+      const dir = mkdtempSync(join(tmpdir(), 'ship-import-race-'));
+      const commands: string[] = [];
+      const run: RemoteRun = (host, script) => {
+        commands.push(`${host} ${script}`);
+        if (script.startsWith('k3d image import')) return { status: 1, stdout: '', stderr };
+        return { status: 0, stdout: existsSync(join(dir, 'label')) ? readFileSync(join(dir, 'label'), 'utf8') : 'old', stderr: '' };
+      };
+      const r = syncPoolImage(member, 'img', 'target', { run, inspect: () => ({ status: 0, stdout: 'target' }), transfer: () => { writeFileSync(join(dir, 'label'), 'target'); return { status: 0, stderr: '' }; }, lock: { dir } });
+      expect(commands).toContain('hostx k3d image import img -c x');
+      expect(r).toMatchObject({ ok: true, action: 'shipped' });
+    });
+  }
+
+  for (const stderr of [
+    'failed to load image: disk full',
+    "ERRO failed to delete tools node 'k3d-x-tools': Error response from daemon: No such container: k3d-x-tools; failed to load image",
+    "ERRO failed to delete tools node 'k3d-x-tools': Error response from daemon: No such container: k3d-x-tools\nWARN failed to load image",
+  ]) {
+    test(`other import error remains failed: ${stderr}`, () => {
+      const dir = mkdtempSync(join(tmpdir(), 'ship-import-error-'));
+      let imports = 0;
+      const run: RemoteRun = (_host, script) => {
+        if (script.startsWith('k3d image import')) { imports++; return { status: 1, stdout: '', stderr }; }
+        return { status: 0, stdout: existsSync(join(dir, 'label')) ? readFileSync(join(dir, 'label'), 'utf8') : 'old', stderr: '' };
+      };
+      const r = syncPoolImage(member, 'img', 'target', { run, inspect: () => ({ status: 0, stdout: 'target' }), transfer: () => { writeFileSync(join(dir, 'label'), 'target'); return { status: 0, stderr: '' }; }, lock: { dir } });
+      expect(imports).toBe(1);
+      expect(r).toMatchObject({ ok: false, action: 'failed' });
+      expect(r.detail).toContain('k3d import rc=1:');
+    });
+  }
+});
+
 describe('syncPoolImage · one ship per host', () => {
   test('a waiter re-checks after the lock and skips when another process shipped', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ship-lock-'));

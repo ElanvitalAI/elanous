@@ -7,7 +7,9 @@ import { buildUserConfig } from '../user-config.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
-import { checkLoops, dueBefore, entriesFromRegistry, notifyOwners, observeLoopCheck, previousLoopFire } from './checker.js';
+import { createHash } from 'node:crypto';
+import { checkLoops, daemonScheduleEntries, dueBefore, entriesFromRegistry, launcherEvidence, notifyOwners, observeLoopCheck, previousLoopFire, scheduleFindings, versionEvidence, extendHealthyLauncher } from './checker.js';
+import { emitLoopHeartbeat } from './neighbor-runtime.js';
 import { registerLoopCommands } from './loop-cli.js';
 import { listAllLoops, listLoops, type LoopEntry } from './registry.js';
 
@@ -31,6 +33,97 @@ const entries = [
   { ...base, id: 'new', expectEveryMinutes: 10 },
   { ...base, id: 'healthy', expectEveryMinutes: 10, lastRunAt: '2026-10-04T11:55:00Z', lastStatus: 'done' },
 ];
+
+test('observed never-fired schedule becomes late only after two actual fires, without changing CLI unknown state', () => {
+  const row = { ...base, id: 'never-fired', observedSince: '2026-10-04T11:00:00Z',
+    dueAt: '2026-10-04T11:45:00Z' };
+  const checked = checkLoops([row], now);
+  expect(checked[0]?.state).toBe('unknown');
+  expect(scheduleFindings(checked, now)).toMatchObject([{ id: 'never-fired', kind: 'late' }]);
+  expect(scheduleFindings(checkLoops([{ ...row, observedSince: '2026-10-04T11:46:00Z' }], now), now)).toEqual([]);
+  expect(scheduleFindings(checkLoops([{ ...row, observedSince: undefined }], now), now)).toEqual([]);
+});
+
+test('healthy fresh launcher lease extends once; stale or degraded launcher is not silently healed', () => {
+  const dir = root();
+  emitLoopHeartbeat(dir, 'active', 'healthy', new Date('2026-10-04T11:50:00Z'), '2026-10-04T11:55:00Z');
+  const finding = { id: 'active', kind: 'end-expired' as const, reason: 'expired' };
+  expect(extendHealthyLauncher(dir, finding, now)).toBe(true);
+  const db = new Database(join(dir, 'msg', 'messages.db'));
+  try {
+    expect(db.query('SELECT ends_at FROM loop_signals WHERE loop_id=?').get('active')).toEqual({ ends_at: '2026-10-04T12:15:00.000Z' });
+  } finally { db.close(); }
+  expect(extendHealthyLauncher(dir, finding, now)).toBe(false);
+  emitLoopHeartbeat(dir, 'stale', 'healthy', new Date('2026-10-04T11:40:00Z'), '2026-10-04T11:55:00Z');
+  emitLoopHeartbeat(dir, 'broken', 'degraded', new Date('2026-10-04T11:50:00Z'), '2026-10-04T11:55:00Z');
+  expect(extendHealthyLauncher(dir, { ...finding, id: 'stale' }, now)).toBe(false);
+  expect(extendHealthyLauncher(dir, { ...finding, id: 'broken' }, now)).toBe(false);
+});
+
+test('daemon schedule inventory adds only enabled managed rows and does not duplicate crontab ownership', () => {
+  const rows = [
+    { id: 'daemon-job', enabled: 1, cron: '*/15 * * * *', run_via: 'elanous', last_run: '2026-10-04T11:10:00Z', last_status: 'ok' },
+    { id: 'disabled', enabled: 0, cron: '*/15 * * * *', run_via: 'trigger' },
+    { id: 'cron-job', enabled: 1, cron: '*/15 * * * *', run_via: 'crontab' },
+  ] as import('../domains/schedule-registry.js').ScheduleRow[];
+  const adapted = daemonScheduleEntries(rows, now);
+  expect(adapted.map(row => row.id)).toEqual(['daemon-job']);
+  expect(checkLoops(adapted, now)[0]).toMatchObject({ state: 'late', owner: 'OP' });
+});
+
+test('graph snapshot hash gives a registry-relative version mismatch without guessing missing run versions', () => {
+  const dir = root();
+  mkdirSync(join(dir, 'graphs'), { recursive: true });
+  mkdirSync(join(dir, 'graph-runs', 'my-graph'), { recursive: true });
+  const graph = 'graph_id: my-graph\nversion: 2\n';
+  writeFileSync(join(dir, 'graphs', 'my-graph.yaml'), graph);
+  const hash = createHash('sha256').update('graph_id: my-graph\nversion: 1\n').digest('hex');
+  writeFileSync(join(dir, 'graph-runs', 'my-graph', 'old.json'), JSON.stringify({ graphId: 'my-graph', graphSnapshot: { graphSha: hash } }));
+  const entry = { ...base, id: 'my-graph', file: 'graphs/my-graph.yaml', lastRunAt: '2026-10-04T11:59:00Z', expectEveryMinutes: 15 };
+  expect(scheduleFindings(checkLoops(versionEvidence([entry], dir, dir), now), now).map(f => f.kind)).toEqual(['version-mismatch']);
+  expect(versionEvidence([{ ...entry, id: 'missing' }], dir, dir)[0]?.expectedVersion).toBeUndefined();
+  writeFileSync(join(dir, 'graph-runs', 'my-graph', 'old.json'), JSON.stringify({ graphId: 'my-graph', variant: { overlayId: 'custom' }, graphSnapshot: { graphSha: hash } }));
+  expect(versionEvidence([entry], dir, dir)[0]?.expectedVersion).toBeUndefined();
+});
+
+test('scheduler findings include grounded launcher signals and version drift without changing the six-state table', () => {
+  const dir = root();
+  emitLoopHeartbeat(dir, 'launcher', 'degraded', new Date('2026-10-04T11:30:00Z'), '2026-10-04T11:55:00Z');
+  const adapted = launcherEvidence([{ ...base, id: 'launcher', owner: 'TC', lastRunAt: '2026-10-04T11:59:00Z',
+    expectEveryMinutes: 15, installedVersion: '1', expectedVersion: '2' }], dir);
+  const checked = checkLoops(adapted, now);
+  expect(checked[0]!.state).toBe('alive');
+  expect(scheduleFindings(checked, now).map(row => row.kind)).toEqual(['degraded', 'end-expired', 'version-mismatch']);
+  expect(notifyOwners(checked, { root: dir, now }, scheduleFindings(checked, now))).toBe(3);
+  expect(notifyOwners(checked, { root: dir, now }, scheduleFindings(checked, now))).toBe(0);
+  expect(readFileSync(join(dir, 'seat-requests', 'requests.jsonl'), 'utf8').trim().split('\n')).toHaveLength(3);
+  expect(scheduleFindings(checkLoops([{ ...base, id: 'no-signal', expectEveryMinutes: 15 }], now), now)).toEqual([]);
+});
+
+test('OP receives only still-queued owner requests after two 15-minute ticks', () => {
+  const dir = root();
+  const checked = checkLoops([{ ...base, id: 'broken', owner: 'MK', expectEveryMinutes: 15, lastRunAt: '2026-10-04T11:00:00Z' }], now);
+  expect(notifyOwners(checked, { root: dir, now })).toBe(1);
+  expect(notifyOwners(checked, { root: dir, now: new Date('2026-10-04T12:29:59Z') }, [], true)).toBe(0);
+  expect(notifyOwners(checked, { root: dir, now: new Date('2026-10-04T12:30:00Z') }, [], true)).toBe(1);
+  expect(notifyOwners(checked, { root: dir, now: new Date('2026-10-04T12:45:00Z') }, [], true)).toBe(0);
+  const lines = readFileSync(join(dir, 'seat-requests', 'requests.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(lines.map(row => row.seat)).toEqual(['MK', 'OP']);
+  expect(lines[1].key).toBe(`${lines[0].key}:op`);
+  const resolvedDir = root();
+  expect(notifyOwners(checked, { root: resolvedDir, now })).toBe(1);
+  const resolvedPath = join(resolvedDir, 'seat-requests', 'requests.jsonl');
+  const resolved = JSON.parse(readFileSync(resolvedPath, 'utf8').trim());
+  writeFileSync(resolvedPath, `${JSON.stringify(resolved)}\n${JSON.stringify({ ...resolved, status: 'done' })}\n`);
+  expect(notifyOwners(checked, { root: resolvedDir, now: new Date('2026-10-04T12:45:00Z') }, [], true)).toBe(0);
+  const crossing = root();
+  const midnight = new Date('2026-10-04T23:45:00Z');
+  notifyOwners(checked, { root: crossing, now: midnight });
+  expect(notifyOwners(checked, { root: crossing, now: new Date('2026-10-05T00:15:00Z') }, [], true)).toBe(1);
+  const requests = readFileSync(join(crossing, 'seat-requests', 'requests.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(requests.map(row => row.seat)).toEqual(['MK', 'OP']);
+  expect(requests[1].key).toBe(`${requests[0].key}:op`);
+});
 
 test('six ordered classifications and journal idempotency, preserving existing bytes', () => {
   const dir = root();

@@ -12,6 +12,7 @@ export const TYPECHECK_GATE_CONFIG = 'tsconfig.gate.json';
  * ⚠️ 호출자가 이미 `--max-old-space-size` 를 줬으면 «그것을» 존중한다(덮지 않는다).
  */
 export const TSC_HEAP_MB = 20480;
+export const TSC_OOM_RETRY_HEAP_MB = 32768;
 export function tscEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const cur = base.NODE_OPTIONS ?? '';
   if (/--max-old-space-size[= ]/.test(cur)) return base;

@@ -23,6 +23,7 @@ export interface GraphTemplateNode {
   readonly kind: GraphNodeSpec['kind'];
   /** 그 노드의 재방문 상한. ⛔ 지금의 rework 상한이 «여기로 올라올» 자리다(RFC §4.1). */
   readonly maxVisits: number;
+  readonly journeyStage?: string;
   /** YAML recipe identifier; existing orchestrator does not execute it. */
   readonly recipe?: string;
   /** YAML이 선언한 선택 계약. 관측용이며 실행 권한을 강제하지 않는다. */
@@ -34,6 +35,7 @@ export interface GraphTemplate {
   readonly version: string;
   readonly entryNode: string;
   readonly terminalNodes: readonly string[];
+  readonly journeyStages?: readonly string[];
   /** YAML 템플릿이 선언한 문서 전용 변경의 gate 건너뛰기 정책. */
   readonly docsOnlyGateSkip?: boolean;
   /** 선언된 런 계약(선택) — 런 시작 때 발사 인자·부모 계약과 함께 한 번 해석된다. */
@@ -104,7 +106,7 @@ export function defaultGraphsDir(): string {
   return join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'graphs');
 }
 
-export type DiscardedGraphNodeField = Exclude<keyof GraphNodeSpec, 'nodeId' | 'kind' | 'maxVisits' | 'recipe' | 'contract'>;
+export type DiscardedGraphNodeField = Exclude<keyof GraphNodeSpec, 'nodeId' | 'kind' | 'maxVisits' | 'journeyStage' | 'recipe' | 'contract'>;
 
 export interface GraphTemplateCompilation {
   readonly template: GraphTemplate;
@@ -129,12 +131,14 @@ export function compileGraphTemplate(spec: GraphTemplateSpec): GraphTemplateComp
       version: String(spec.version),
       entryNode: spec.entryNode,
       terminalNodes: spec.terminalNodes,
+      ...(spec.journeyStages === undefined ? {} : { journeyStages: spec.journeyStages }),
       ...(spec.docsOnlyGateSkip !== undefined ? { docsOnlyGateSkip: spec.docsOnlyGateSkip } : {}),
       ...(spec.runContract !== undefined ? { runContract: spec.runContract } : {}),
       nodes: spec.nodes.map((n) => ({
         nodeId: n.nodeId,
         kind: n.kind,
         maxVisits: n.maxVisits,
+        ...(n.journeyStage === undefined ? {} : { journeyStage: n.journeyStage }),
         ...(n.recipe === undefined ? {} : { recipe: n.recipe }),
         ...(n.contract === undefined ? {} : { contract: n.contract }),
       })),
@@ -322,6 +326,34 @@ export function goalTypesWithoutTemplate(): readonly GoalType[] {
 export function inspectAllTemplates(): Array<{ graphId: string; defects: PipelineGraphDefect[] }> {
   return Object.values(GRAPH_TEMPLATES)
     .map((t) => ({ graphId: t.graphId, defects: inspectPipelineGraph(t.edges, t.entryNode) }));
+}
+
+/** L0 ratios are distinct: stages represented by nodes, and nodes accounted for by this run. */
+export function measureL0Coverage(
+  template: GraphTemplate,
+  enteredNodes: Iterable<string>,
+  skippedNodes: Iterable<string>,
+): {
+  declarationCoverage: number | null;
+  traversalCoverage: number | null;
+  declaredStageCount: number;
+  listedStageCount: number;
+  accountedNodeCount: number;
+  declaredNodeCount: number;
+} {
+  const stages = template.journeyStages ?? [];
+  const declaredStages = new Set(template.nodes.map((node) => node.journeyStage).filter((stage): stage is string => stage !== undefined && stages.includes(stage)));
+  const accounted = new Set([...enteredNodes, ...skippedNodes]);
+  const declaredNodeCount = template.nodes.length;
+  const accountedNodeCount = template.nodes.filter((node) => accounted.has(node.nodeId)).length;
+  return {
+    declarationCoverage: stages.length ? declaredStages.size / stages.length : null,
+    traversalCoverage: declaredNodeCount ? accountedNodeCount / declaredNodeCount : null,
+    declaredStageCount: declaredStages.size,
+    listedStageCount: stages.length,
+    accountedNodeCount,
+    declaredNodeCount,
+  };
 }
 
 /** ⭐ 원장에 실을 «그래프 신원» — ⛔ 옛 TS 상수가 아니라 «지금 도는 템플릿»을 따른다.

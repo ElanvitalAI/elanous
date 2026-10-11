@@ -8,6 +8,10 @@ import { getUserConfig } from '../user-config.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { loopEvent } from '../loops/observe.js';
+import { checkLoops, daemonScheduleEntries, entriesFromRegistry, extendHealthyLauncher, launcherEvidence, notifyOwners, scheduleFindings, versionEvidence, type CheckEntry } from '../loops/checker.js';
+import { listSchedules, schedulesDbPath, type ScheduleRow } from '../domains/schedule-registry.js';
+import { Database } from 'bun:sqlite';
+import { defaultLoopRoot, listAllLoops, listLoops } from '../loops/registry.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { redactSecrets } from '../task-cards/card-store.js';
 import { directiveHash } from './directive.js';
@@ -17,7 +21,7 @@ import { planLaunches, launch, collectOutcomes, raiseHitl, readLaunchLedger, sav
 import { listFabricExecutionCandidates } from '../self-dev/fabric-plan-core.js';
 import { InvalidWorkingBackwardsDraft, recordWorkingBackwardsOnCards } from './working-backwards.js';
 import { CardStore } from '../task-cards/card-store.js';
-import { triageWithinBudget } from './triage-budget.js';
+import { draftWithinBudget, triageWithinBudget } from './triage-budget.js';
 import { askSteward, classifyIssue, installedCapabilities, planIssues, ruleJudgment, unsafeReason, type ClassifiedIssue, type StewardAsk } from './triage-plan.js';
 import { failureAlertText, markStageStart, markStageEnd, readFailureStreak, shouldAlert, writeFailureStreak, type FailureStreak, type StewardStage } from './failure-streak.js';
 
@@ -59,6 +63,8 @@ export interface StewardDeps {
   ask?: StewardAsk;
   /** Maximum time for each working-backwards wish draft in schedule (milliseconds). */
   draftItemMs?: number;
+  /** Maximum time for the whole wish-drafting phase in schedule (milliseconds); wishes still undrafted are carried. */
+  draftDeadlineMs?: number;
   launchSettings?: Pick<StewardSettings, 'mode' | 'launch' | 'maxParallel' | 'podPool'>;
   launchCommand?: LaunchDeps['command'];
   spawnLaunch?: LaunchDeps['spawn'];
@@ -68,6 +74,9 @@ export interface StewardDeps {
   outcomeNotify?: Pick<OutcomeNotifyDeps, 'document' | 'message' | 'worktreeCommand' | 'loadOrigin' | 'loadOrigins'>;
   /** Internal command boundary: the current sync has already claimed this pid. */
   stageOwnedByCommand?: boolean;
+  /** Isolated scheduler inventory for this tick; production reads the unified registry. */
+  scheduleInventory?: () => CheckEntry[];
+  daemonSchedules?: () => ScheduleRow[];
 }
 
 /** rescue launches/harvests like live (HQ-SEAT). */
@@ -314,6 +323,61 @@ function logStageFailure(root: string, stage: StewardStage, reason: string): voi
   if (runId) try { rmSync(tickDecisionPath(root, runId), { force: true }); } catch { /* Observation must not change the failure. */ }
   logTickDecision(root, 'failed', `${stage}: ${reason}`);
 }
+const SCHEDULE_CHECK_MS = 15 * 60_000;
+
+/** Called by runStewardStage(sync) under its stage slot, never from the checker CLI. */
+async function checkStewardSchedules(root: string, settings: StewardSettings, deps: StewardDeps): Promise<void> {
+  const now = (deps.now ?? (() => new Date()))();
+  const marker = join(root, 'steward', 'schedule-check.json');
+  let previous: { at?: string } = {};
+  try { previous = JSON.parse(readFileSync(marker, 'utf8')) as typeof previous; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  const elapsed = now.getTime() - Date.parse(previous.at ?? '');
+  if (Number.isFinite(elapsed) && elapsed >= 0 && elapsed < SCHEDULE_CHECK_MS) return;
+  const inventory = deps.scheduleInventory ?? (() => {
+    const repo = deps.root ? process.cwd() : defaultLoopRoot();
+    const registryOptions = { now, root: repo, stateRoot: root,
+      ...(deps.root ? { schedules: [] } : {}) };
+    const { entries } = entriesFromRegistry({ now, listAllLoops: () => listAllLoops(registryOptions) });
+    const graphs = listLoops(registryOptions);
+    const byId = new Map(graphs.map(graph => [graph.id, graph.file]));
+    return versionEvidence(launcherEvidence(entries.map(entry => byId.has(entry.id)
+      ? { ...entry, file: byId.get(entry.id) } : entry), root), repo, root);
+  });
+  const daemonRows = deps.daemonSchedules ?? (() => {
+    const path = deps.root ? join(root, 'schedules.db') : schedulesDbPath();
+    if (!existsSync(path)) return [];
+    try {
+      const db = new Database(path, { readonly: true });
+      try { return listSchedules(db); } finally { db.close(); }
+    } catch (error) {
+      debug.log('steward.schedule-check', 'daemon-inventory-unavailable', { reason: redactSecretText(String(error)) });
+      return [];
+    }
+  });
+  const entries = inventory();
+  const seen = new Set(entries.map(entry => entry.id));
+  const checked = checkLoops([...entries, ...daemonScheduleEntries(daemonRows(), now).filter(row => !seen.has(row.id))], now);
+  const findings = scheduleFindings(checked, now);
+  if (settings.mode === 'live') {
+    let recovered = 0;
+    const unresolved = findings.filter(finding => {
+      try {
+        if (extendHealthyLauncher(root, finding, now)) { recovered++; return false; }
+      } catch (error) {
+        debug.log('steward.schedule-check', 'recovery-failed', { id: finding.id, reason: redactSecretText(String(error)) });
+      }
+      return true;
+    });
+    const remainingChecks = checked.filter(row => unresolved.some(finding => finding.id === row.id && finding.kind === row.state));
+    const ownerRequests = notifyOwners(remainingChecks, { root, now }, unresolved);
+    const opEscalations = notifyOwners(remainingChecks, { root, now }, unresolved, true);
+    debug.log('steward.schedule-check', 'routing', { ownerRequests, opEscalations, recovered });
+  }
+  debug.log('steward.schedule-check', 'checked', { count: checked.length, findings: findings.length, mode: settings.mode });
+  writeFileSync(marker, JSON.stringify({ at: now.toISOString() }));
+}
+
 function readState(path: string): { issues: Record<string, string>; digestDay?: string } {
   try { return JSON.parse(readFileSync(path, 'utf8')) as ReturnType<typeof readState>; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { issues: {} }; throw error; }
@@ -343,6 +407,11 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
   const runId = (graphRunId() ?? process.env.ELANOUS_RUN_ID?.trim()) || `steward-stage-${randomUUID()}`;
   let outcome: 'ok' | 'fail' = 'fail';
   try {
+  if (stage === 'sync') {
+    // The schedule check is an add-on to sync: its failure is observed, never allowed to stop the Linear sync.
+    try { await checkStewardSchedules(root, settings, deps); }
+    catch (error) { debug.log('steward.schedule-check', 'failed', { reason: redactSecretText(String(error)) }, { level: 'warn' }); }
+  }
   const key = await (deps.getSecret ?? getSecretAsync)('connector.linear.apiKey');
   if (!key) throw new Error('connector.linear.apiKey missing');
   if (stage === 'sync') {
@@ -420,27 +489,19 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
       const carried = new Set<string>();
       if (store) try {
         recordTriageOnCards(wishes, issues, { root, store, now: deps.now });
-        for (const wish of wishes) {
-          const timedOut = Symbol('draft-timeout');
-          let timer: ReturnType<typeof setTimeout> | undefined;
-          const timeout = new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(timedOut), deps.draftItemMs ?? 120_000);
-          });
-          // The draft may finish without ever racing this promise (no ask needed) — never leave its rejection unhandled.
-          timeout.catch(() => undefined);
-          try {
-            // Bound the ask itself so a late answer cannot write to a store closed after this tick.
-            const ask: StewardAsk = (prompt, role) => Promise.race([(deps.ask ?? askSteward)(prompt, role), timeout]);
-            await recordWorkingBackwardsOnCards([wish], issues, store, ask);
-          } catch (error) {
-            if (error instanceof InvalidWorkingBackwardsDraft) {
-              invalid.add(wish.issue);
-              debug.log('steward.stage', 'draft-invalid', { issue: wish.issue });
-            } else {
-              carried.add(wish.issue);
-              debug.log('steward.schedule', 'draft-carried', { issue: wish.issue, reason: error === timedOut ? 'timeout' : 'error' });
-            }
-          } finally { if (timer) clearTimeout(timer); }
+        const outcome = await draftWithinBudget({
+          wishes, perItemMs: deps.draftItemMs ?? 120_000, deadlineMs: deps.draftDeadlineMs ?? 240_000,
+          // Bound the ask itself so a late answer cannot write to a store closed after this tick.
+          draft: (wish, expired) => recordWorkingBackwardsOnCards([wish], issues, store,
+            (prompt, role) => Promise.race([(deps.ask ?? askSteward)(prompt, role), expired])),
+        });
+        for (const wish of outcome.invalid) {
+          invalid.add(wish.issue);
+          debug.log('steward.stage', 'draft-invalid', { issue: wish.issue });
+        }
+        for (const { wish, reason } of outcome.carried) {
+          carried.add(wish.issue);
+          debug.log('steward.schedule', 'draft-carried', { issue: wish.issue, reason });
         }
       } finally { if (!deps.cardStore) store.close(); }
       if (invalid.size || carried.size) rows = rows.map(row => invalid.has(row.issue)

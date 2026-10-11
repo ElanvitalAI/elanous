@@ -14,6 +14,8 @@ type ParseResult = Ledger[] | { error: Incomplete[]; ledgers: Ledger[] };
 const NON_PROGRESS_EVENTS = new Set(['progress-delivery-outcome']);
 const REEMIT_EXCLUDED_PREFIX = 'progress-delivery';
 type Emit = (category: string, event: string, data: Record<string, unknown>) => void;
+/** Heal-loop starter seam — defaults to the real `startHealLoop` inside `recordFailureEvent`. */
+type StartHealLoop = Parameters<typeof recordFailureEvent>[2];
 
 /** Reemit only complete ledger records; offsets name the first byte of each line in the Pod ledger. */
 function reemitLedgerLines(jsonl: string, runId: string, startOffset: number, emit: Emit): number {
@@ -93,7 +95,7 @@ export function parsePodLedgerChunks(logs: string): ParseResult {
   return error.length ? { error, ledgers } : ledgers;
 }
 
-function intakeCollectedFailure(runId: string, dir: string, log: Emit): void {
+function intakeCollectedFailure(runId: string, dir: string, log: Emit, startHealLoop?: StartHealLoop): void {
   let ledger: ReturnType<typeof loadRunLedger>;
   try { ledger = loadRunLedger(runId, dir); }
   catch { return; }
@@ -104,8 +106,10 @@ function intakeCollectedFailure(runId: string, dir: string, log: Emit): void {
   if (terminal?.data.runStatus !== 'failed' || !terminal.timestamp || !Number.isFinite(Date.parse(terminal.timestamp))
     || ledger.slice(terminalIndex + 1).some(entry => !TRAILING_BOOKKEEPING_EVENTS.includes(entry.event as typeof TRAILING_BOOKKEEPING_EVENTS[number]))) return;
   try {
+    // POD-HEAL-HOST — the recovered Pod failure is recorded into the HOST universe (`dirname(dir)`),
+    // so the host heal loop triages it (harvest + narrowed relaunch) instead of dying inside the Pod.
     recordFailureEvent({ source: 'harness-run', kind: 'pod-run', ref: runId,
-      summary: `Pod run ${runId} failed`, at: terminal.timestamp }, dirname(dir));
+      summary: `Pod run ${runId} failed`, at: terminal.timestamp }, dirname(dir), startHealLoop);
   } catch (error) {
     log('self-implement.pod', 'heal-intake-failed', { runId, reason: error instanceof Error ? error.message : String(error) });
   }
@@ -115,11 +119,13 @@ function intakeCollectedFailure(runId: string, dir: string, log: Emit): void {
  *  except a ledger that THIS run's live follower created (`replace`): that one is a partial copy and the final is complete. */
 export function collectPodLedgers(
   logs: string,
-  { dir = runLedgerDir(), log = defaultPodReemit(), emit = defaultPodReemit(), replace = new Set<string>() }: {
+  { dir = runLedgerDir(), log = defaultPodReemit(), emit = defaultPodReemit(), replace = new Set<string>(), startHealLoop }: {
     dir?: string;
     log?: (category: string, event: string, data: Record<string, unknown>) => void;
     emit?: Emit;
     replace?: ReadonlySet<string>;
+    /** Which starter receives a recovered Pod failure (POD-HEAL-HOST 판정선 measurement); default = real `startHealLoop`. */
+    startHealLoop?: StartHealLoop;
   } = {},
 ): void {
   const parsed = parsePodLedgerChunks(logs);
@@ -136,7 +142,7 @@ export function collectPodLedgers(
       const newLines = Buffer.from(jsonl).subarray(previousBytes).toString('utf8');
       reemitLedgerLines(newLines, runId, previousBytes, emit);
       log('self-implement.pod', 'ledger-collected', { runId, lines: jsonl.split('\n').filter(Boolean).length, bytes: Buffer.byteLength(jsonl) });
-      intakeCollectedFailure(runId, dir, log);
+      intakeCollectedFailure(runId, dir, log, startHealLoop);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
         // A reattached Job may have already delivered this exact complete snapshot.
@@ -145,7 +151,7 @@ export function collectPodLedgers(
           const existing = readFileSync(runLedgerPath(runId, dir));
           const identical = existing.equals(Buffer.from(jsonl));
           log('self-implement.pod', identical ? 'ledger-collect-already-complete' : 'ledger-collect-skipped', { runId, reason: 'exists' });
-          if (identical) intakeCollectedFailure(runId, dir, log);
+          if (identical) intakeCollectedFailure(runId, dir, log, startHealLoop);
         } catch (readError) {
           log('self-implement.pod', 'ledger-collect-incomplete', { runId, reason: readError instanceof Error ? readError.message : String(readError) });
         }

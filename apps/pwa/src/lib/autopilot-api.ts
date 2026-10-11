@@ -104,6 +104,9 @@ export interface MissionCardWire {
   taskStatusCounts: Record<string, number>;
   surfaceKindCounts: Record<string, number>;
   autopilot: MissionAutopilotWire | null;
+  /** 파생 작업 롤업(태스크 + 크론) — 서버 `summarise`(src/nexus/api/missions.ts)가 계산해 싣는다.
+   *  결손이면(구 서버) 카드의 RollupChips 는 «파생 미측정»을 그린다(«파생 0»과 다른 문면 · missionRollupLabel). */
+  derived?: MissionRollup;
   createdAt: number; updatedAt: number; closedAt: number | null;
 }
 
@@ -133,6 +136,7 @@ export function missionCardToSummary(w: MissionCardWire): MissionSummary {
     reviewDue: false,
     createdAt: new Date(w.createdAt).toISOString(),
     updatedAt: w.updatedAt,
+    derived: w.derived,
     isAutopilot: a != null,
     toxStatus: w.status,
     taskCount: w.taskCount,

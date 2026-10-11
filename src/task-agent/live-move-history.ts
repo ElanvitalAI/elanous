@@ -10,7 +10,7 @@
  */
 import { debug } from '../debug/log.js';
 import type { LiveMoveResult, TaskAgentLiveMove } from './live-moves.js';
-import { LIVE_MOVE_HISTORY_EVENT, updateTaskCard, type TaskCard, type TaskCardEvent } from './task-hand.js';
+import { HAND_MOVE_HISTORY_EVENT, LIVE_MOVE_HISTORY_EVENT, updateTaskCard, type TaskCard, type TaskCardEvent } from './task-hand.js';
 
 export const LIVE_MOVE_EFFECT_UNKNOWN = 'unknown';
 /** 리뷰는 떼어 띄운다(`defaultRequestReview` · stdio ignore) — 판정·must-fix·reviewRoute 는 그 리뷰 자기 관측에만 있다. */
@@ -127,6 +127,92 @@ export function recordLiveMoveHistory(
       log('task-agent', 'live-move-history-failed', {
         card: cardId, kind: input.kind, executorResult: input.executorResult, executed: input.result?.executed ?? false, reason: outcome.reason,
       });
+    } catch { /* fail-soft */ }
+  }
+  return outcome;
+}
+
+/**
+ * HAND-MOVE-LEDGER — 자리가 손으로 마무리한 수(기존 실패 면제 · diff 재적용 · 범위 자르기 · 쪼개기 · 다른 모델 의견)도
+ * 같은 원장 칸(카드 history)에 한 줄로 남긴다.
+ * - 어휘는 다섯뿐(`HAND_MOVE_KINDS`) — 모르는 kind 는 거부한다(지어낸 줄을 원장에 남기지 않는다).
+ * - 쓰기 길은 live-move 와 같은 `updateTaskCard` — 기존 history 항목은 건드리지 않고 덧붙이기만.
+ */
+/** 카드 history 의 hand-move 줄 이벤트 이름(정의는 task-hand.ts — 상태 사유 판정이 같은 상수로 뺀다). */
+export { HAND_MOVE_HISTORY_EVENT };
+
+/** 자리가 손으로 쓸 수 있는 수의 어휘(칸 문면 그대로 다섯) — 이 밖은 거부된다. */
+export const HAND_MOVE_KINDS = ['exempt-failure', 'reapply-diff', 'trim-scope', 'split', 'second-opinion'] as const;
+export type HandMoveKind = typeof HAND_MOVE_KINDS[number];
+
+export function isHandMoveKind(kind: string): kind is HandMoveKind {
+  return (HAND_MOVE_KINDS as readonly string[]).includes(kind);
+}
+
+export interface HandMoveHistoryInput {
+  /** 손으로 쓴 수의 종류 — `HAND_MOVE_KINDS` 밖이면 거부된다. */
+  kind: string;
+  /** 남긴 자리(예: OP·MK·TC·UX) — 누가 손으로 마무리했나. */
+  by: string;
+  /** 무엇을 했나 — 한 줄. */
+  detail: string;
+  /** 관련 PR(있으면). */
+  pr?: number;
+  /** 줄 시각(시험 주입 · 기본 지금). */
+  at?: string;
+}
+
+/** hand-move 줄의 history 칸 — `by` 는 `TaskCardEvent` 밖 칸이라 확장 인터페이스로 달린다. */
+export interface HandMoveHistoryEntry extends TaskCardEvent {
+  event: typeof HAND_MOVE_HISTORY_EVENT;
+  kind: HandMoveKind;
+  by: string;
+  detail: string;
+}
+
+export function handMoveHistoryEntry(input: HandMoveHistoryInput & { at: string; kind: HandMoveKind }): HandMoveHistoryEntry {
+  return {
+    at: input.at,
+    event: HAND_MOVE_HISTORY_EVENT,
+    kind: input.kind,
+    by: input.by,
+    detail: input.detail,
+    ...(input.pr !== undefined ? { pr: input.pr } : {}),
+  };
+}
+
+export type HandMoveHistoryOutcome = { written: true; entry: HandMoveHistoryEntry } | { written: false; reason: string };
+
+/**
+ * 자리가 손으로 마무리한 수 한 줄을 카드 history 에 덧붙인다(`recordLiveMoveHistory` 와 같은 길 · 같은 계약).
+ * 던지지 않는다 — 모르는 kind · 카드 없음 · 쓰기 실패는 관측으로 남기고 결과로 돌려준다.
+ */
+export function recordHandMove(
+  statePath: string, cardId: string, input: HandMoveHistoryInput,
+  log: (category: string, event: string, data: Record<string, unknown>) => void = (c, e, d) => debug.log(c, e, d, { level: 'warn' }),
+): HandMoveHistoryOutcome {
+  if (!isHandMoveKind(input.kind)) {
+    const reason = `unknown hand-move kind: ${input.kind} (known: ${HAND_MOVE_KINDS.join('|')})`;
+    try {
+      log('task-agent', 'hand-move-history-failed', { card: cardId, kind: input.kind, by: input.by, reason });
+    } catch { /* fail-soft */ }
+    return { written: false, reason };
+  }
+  const entry = handMoveHistoryEntry({ ...input, kind: input.kind, at: input.at ?? new Date().toISOString() });
+  let missing = false;
+  let outcome: HandMoveHistoryOutcome;
+  try {
+    updateTaskCard(statePath, cardId, (current) => {
+      if (!current) { missing = true; return undefined; }
+      return { ...current, history: [...(current.history ?? []), entry] };
+    });
+    outcome = missing ? { written: false, reason: 'task card not in state file' } : { written: true, entry };
+  } catch (error) {
+    outcome = { written: false, reason: (error instanceof Error ? error.message : String(error)).slice(-300) };
+  }
+  if (!outcome.written) {
+    try {
+      log('task-agent', 'hand-move-history-failed', { card: cardId, kind: input.kind, by: input.by, reason: outcome.reason });
     } catch { /* fail-soft */ }
   }
   return outcome;

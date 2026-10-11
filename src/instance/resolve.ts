@@ -56,6 +56,30 @@ export function resolveInstance(deps: ResolveDeps = {}): InstanceResolution {
   return { kind: 'test', root: normRoot(join(process.cwd(), '.elanous-test')), layer: 'default', why: '소스 트리 밖 실행(격리)' };
 }
 
+/** 부모가 도장으로 물려준 우주와 자식이 실제로 쓰는 우주가 다른가. 비어 있는 쪽은 비교하지 않는다. */
+export function universeMismatch(parentRoot: string | undefined, childRoot: string | undefined): { parentRoot: string; childRoot: string } | null {
+  const parent = parentRoot?.trim();
+  const child = childRoot?.trim();
+  if (!parent || !child) return null;
+  const p = normRoot(parent);
+  const c = normRoot(child);
+  return p === c ? null : { parentRoot: p, childRoot: c };
+}
+
+export type UniverseMeasure = { measurable: true } | { measurable: false; reason: '빈 우주' };
+
+/** 읽을 우주가 비어 있으면 «0» 이 아니라 «측정 불가» 로 말해야 한다. 디렉터리가 없거나 항목이 하나도 없으면 빈 우주다. */
+export function measureUniverse(root: string, entries: (dir: string) => string[] = defaultEntries): UniverseMeasure {
+  return entries(root).length > 0 ? { measurable: true } : { measurable: false, reason: '빈 우주' };
+}
+
+function defaultEntries(dir: string): string[] {
+  try {
+    const { readdirSync } = require('node:fs') as typeof import('node:fs');
+    return readdirSync(dir);
+  } catch { return []; }
+}
+
 /** 명시 config-dir 이 없으면 state-dir 과 config-dir 을 같은 우주로 유지한다. */
 export function configDirFollowingStateDir(
   explicitConfigDir: string | undefined,

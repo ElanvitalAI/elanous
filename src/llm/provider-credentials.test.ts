@@ -4,7 +4,10 @@
 //    provider 만 anthropic 으로 바뀌고 apiKey 는 openai-codex 것이 따라갔기 때문. 아래 첫 테스트가
 //    **정확히 그 시나리오**를 재현한다 — 되돌리면 그 테스트가 실패한다.
 import { test, expect, describe } from 'bun:test';
-import { providerEnvKey, isKeylessProvider, resolveProviderCredential } from './provider-credentials.js';
+import { providerEnvKey, isKeylessProvider, resolveProviderCredential, observeCredentialResolution } from './provider-credentials.js';
+import { debug } from '../debug/log.js';
+import type { DebugEvent } from '../debug/log.js';
+import { LOG_DIET_SUMMARY_MIN_INTERVAL_MS, LogDietGuard } from '../debug/log-diet.js';
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
 
 describe('providerEnvKey — SSOT(catalog 파생 + 명시 오버레이)', () => {
@@ -208,5 +211,38 @@ describe('local endpoint precedence (BACKLOG B13)', () => {
   test('LOCAL_LLM_URL does not leak into other providers', () => {
     const rot = [{ provider: 'grok', model: 'g', baseUrl: 'https://x.test/v1', label: 'g' }] as never;
     expect(resolveProviderCredential({ provider: 'grok', rotation: rot, env: { LOCAL_LLM_URL: 'http://node-b:1234/v1' } }).baseUrl).toBe('https://x.test/v1');
+  });
+});
+
+// LOG-DIET-2 (0.2.24) — emit 지점(`observeCredentialResolution`) → `debug.log` → `LogDietGuard.admit` 배선.
+describe('observeCredentialResolution × LOG-DIET (칸 LOG-DIET-2)', () => {
+  test('반복 provider-key-missing warn 은 원본 한 행 + 접힌 카운트 하나로 남는다', () => {
+    let time = 0;
+    const events: DebugEvent[] = [];
+    const previousGuard = debug.setLogDietGuard(new LogDietGuard({ now: () => time }));
+    const unregister = debug.registerSink({ name: 'log-diet-credential-test', emit: event => events.push(event) });
+    try {
+      const resolved = resolveProviderCredential({ provider: 'grok', env: {} });
+      expect(resolved.source).toBe('none');
+      observeCredentialResolution('grok', resolved, 'escalate');
+      const missing = () => events.filter(e => e.category === 'llm.credential' && e.event === 'provider-key-missing');
+      expect(missing()).toHaveLength(1);
+      expect(missing()[0]).toMatchObject({ level: 'warn' });
+      for (let i = 0; i < 20; i++) {
+        time += 100;
+        observeCredentialResolution('grok', resolved, 'escalate');
+      }
+      expect(missing()).toHaveLength(1); // warn 이어도 «등록된» 절식 키라 접힌다
+      time = LOG_DIET_SUMMARY_MIN_INTERVAL_MS;
+      debug.flush();
+      const summary = events.filter(e => e.category === 'log.diet' && e.event === 'suppressed');
+      expect(summary).toHaveLength(1);
+      expect(summary[0]!.data).toMatchObject({
+        category: 'llm.credential', event: 'provider-key-missing', count: 20,
+      });
+    } finally {
+      unregister();
+      debug.setLogDietGuard(previousGuard);
+    }
   });
 });

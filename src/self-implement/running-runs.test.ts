@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import type { LogStore, LogStoreRow } from '../mss/logging/log-store.js';
 import { SELF_IMPLEMENT_PROGRESS_STAGES } from './orchestrator.js';
 import { debug } from '../debug/log.js';
-import { assessLingeringLaunchParents, assessRunningRuns, collectObservedRunPhases, queryRunningRuns, renderRunningRuns } from './running-runs.js';
+import { assessLingeringLaunchParents, assessRunningRuns, buildRunProgressRows, collectObservedRunPhases, queryRunningRuns, renderRunProgressTable, renderRunningRuns } from './running-runs.js';
 import { queryFederatedUnfinishedRunLedgers, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery } from './run-ledger.js';
 
 const ledger = (
@@ -797,7 +797,7 @@ test('same-process second query within one second reuses mtime-checked ledger fa
   const root = mkdtempSync(join(tmpdir(), 'running-runs-file-mtime-'));
   const directory = join(root, 'run-ledger');
   mkdirSync(directory);
-  const count = 5_100;
+  const count = 8_100;
   for (let n = 0; n < count; n += 1) {
     const runId = `run-00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`;
     writeFileSync(join(directory, `${runId}.jsonl`), `${JSON.stringify({ timestamp: '2026-10-09T00:00:00.000Z', runId, event: 'run-status', data: { runStatus: 'completed' } })}\n`);
@@ -833,6 +833,72 @@ test('same-process second query within one second reuses mtime-checked ledger fa
     rmSync(root, { recursive: true, force: true });
   }
 }, 120_000);
+
+const completedLedgerLine = (runId: string): string => `${JSON.stringify({ timestamp: '2026-10-09T00:00:00.000Z', runId, event: 'run-status', data: { runStatus: 'completed' } })}\n`;
+const fixtureRunId = (n: number): string => `run-00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`;
+const quietDeps = (directory: string) => ({
+  ledgerDirectories: () => [directory],
+  ptyTargets: () => [],
+  listPtyRefs: () => ({ refs: [], unreadable: [] }),
+  readRunPhases: () => ({ events: [], targetCount: 0, unreadableTargets: [] }),
+  observeQuery: () => {},
+});
+
+test('noCache bypasses the process-lifetime ledger cache without evicting it', () => {
+  const root = mkdtempSync(join(tmpdir(), 'running-runs-nocache-'));
+  const directory = join(root, 'run-ledger');
+  mkdirSync(directory);
+  const count = 300;
+  for (let n = 0; n < count; n += 1) writeFileSync(join(directory, `${fixtureRunId(n)}.jsonl`), completedLedgerLine(fixtureRunId(n)));
+  const deps = quietDeps(directory);
+  try {
+    const cold = queryRunningRuns({}, deps);
+    const bypassed = queryRunningRuns({ noCache: true }, deps);
+    const warm = queryRunningRuns({}, deps);
+    expect([cold.ledger.cacheHits, cold.ledger.cacheMisses]).toEqual([0, count]);
+    expect([bypassed.ledger.cacheHits, bypassed.ledger.cacheMisses]).toEqual([0, count]);
+    expect([warm.ledger.cacheHits, warm.ledger.cacheMisses]).toEqual([count, 0]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('ledger cache invalidates by mtime and size checks only — no file watcher in the query path', async () => {
+  const { readFileSync } = await import('node:fs');
+  for (const file of ['running-runs.ts', 'run-ledger.ts']) {
+    const source = readFileSync(join(import.meta.dir, file), 'utf8');
+    expect(source).not.toMatch(/\bwatch(File)?\s*\(/);
+    expect(source).not.toMatch(/from 'node:fs\/promises'[^;]*\bwatch\b|\bFSWatcher\b/);
+  }
+});
+
+test('a process that queried running runs exits promptly without being held open by the cache', () => {
+  const root = mkdtempSync(join(tmpdir(), 'running-runs-exit-'));
+  const directory = join(root, 'run-ledger');
+  mkdirSync(directory);
+  for (let n = 0; n < 200; n += 1) writeFileSync(join(directory, `${fixtureRunId(n)}.jsonl`), completedLedgerLine(fixtureRunId(n)));
+  const script = join(root, 'query-twice.ts');
+  writeFileSync(script, [
+    `import { queryRunningRuns } from ${JSON.stringify(join(import.meta.dir, 'running-runs.ts'))};`,
+    `const deps = { ledgerDirectories: () => [${JSON.stringify(directory)}], ptyTargets: () => [], listPtyRefs: () => ({ refs: [], unreadable: [] }), readRunPhases: () => ({ events: [], targetCount: 0, unreadableTargets: [] }), observeQuery: () => {} };`,
+    'queryRunningRuns({}, deps);',
+    'const second = queryRunningRuns({}, deps);',
+    'console.log(JSON.stringify({ hits: second.ledger.cacheHits, misses: second.ledger.cacheMisses }));',
+  ].join('\n'));
+  try {
+    const start = performance.now();
+    const child = Bun.spawnSync([process.execPath, script], { cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe', timeout: 30_000 });
+    const elapsedMs = performance.now() - start;
+    expect(child.exitCode).toBe(0);
+    expect(JSON.parse(child.stdout.toString().trim().split('\n').at(-1)!)).toEqual({ hits: 200, misses: 0 });
+    // 잡으려는 회귀 = 캐시가 프로세스를 붙잡아 끝나지 않는 것(#24938) — spawnSync timeout(30s)에 걸리지 않았음이 1차 근거, 시간 상한은 Pod 콜드 기동을 감안해 넉넉히.
+    expect(child.signalCode ?? null).toBeNull();
+    expect(elapsedMs).toBeLessThanOrEqual(20_000);
+    console.log(`RUNNING_RUNS_EXIT exitMs=${elapsedMs.toFixed(1)} boundMs=20000`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
 
 test('isolated running-runs CLI scans 8001 ledgers and exits within 15 seconds', () => {
   const root = mkdtempSync(join(tmpdir(), 'running-runs-cli-state-'));
@@ -887,4 +953,59 @@ test('distinguishes unreadable phase observation from no observed phase without 
   expect(notObserved.entries).toEqual([expect.objectContaining({ status: 'running', presence: 'ledger-live-and-pty-observed', reason: 'ledger-live-and-pty-alive', lifecycle: 'live', phaseObservation: 'not-observed', lastPhase: null, lastPhaseObservedAt: null })]);
   expect(unreadable.entries).toEqual([expect.objectContaining({ status: 'running', presence: 'ledger-live-and-pty-observed', reason: 'ledger-live-and-pty-alive', lifecycle: 'live', phaseObservation: 'unreadable', lastPhase: null, lastPhaseObservedAt: null })]);
   expect(renderRunningRuns(unreadable)).toContain('phaseObservation=unreadable lastPhase=none lastPhaseObservedAt=none');
+});
+
+const progressLedgerQuery = (overrides: Partial<FederatedUnfinishedRunLedgerQuery> = {}): FederatedUnfinishedRunLedgerQuery => ({
+  entries: [ledger('run-a', 'live', '/state/run-a', '2026-09-12T07:00:00.000Z'), ledger('run-b', 'live')],
+  ledgerDirectories: [], goalsDirectory: '/goals', unreadableLedgerCount: 0, unreadableLedgerDirectoryCount: 0,
+  reconciledTerminatedElsewhereCount: 0, scope: 'self-implement-run-ledger-federated', note: 'fixture',
+  missingLedgerDirectoryCount: 0, unreadableLedgerDirectoryAccessCount: 0, indeterminateLedgerDirectoryCount: 0,
+  ...overrides,
+});
+
+const progressDeps = (overrides: Partial<FederatedUnfinishedRunLedgerQuery> = {}) => ({
+  queryLedgers: () => progressLedgerQuery(overrides),
+  ptyTargets: () => [],
+  listPtyRefs: () => ({ refs: [
+    { instance: 'prod', id: 'pty-a', kind: 'shell' as const, alive: true, runId: 'run-a' },
+    { instance: 'prod', id: 'pty-b', kind: 'shell' as const, alive: true, runId: 'run-b' },
+  ], unreadable: [] }),
+  readRunPhases: () => ({ events: [
+    { runId: 'run-a', phase: 'implementing', observedAt: '2026-09-12T07:05:07.000Z' },
+  ], targetCount: 1, unreadableTargets: [] }),
+});
+
+test('renderRunProgressTable emits one line per run with phase, entry time, last progress with elapsed, and pty refs', () => {
+  const result = queryRunningRuns({}, progressDeps());
+  const nowMs = Date.parse('2026-09-12T08:02:03.000Z');
+  const lines = renderRunProgressTable(result, nowMs).split('\n');
+
+  expect(lines).toHaveLength(3);
+  expect(lines[0]).toBe('도는 런 2 (확인 2 · 추정 0)');
+  expect(lines[1]).toBe('run-a · running · 단계 implementing · 진입 2026-09-12T07:05:07.000Z · 마지막 진전 2026-09-12T07:00:00.000Z (경과 1h2m) · pty prod:pty-a');
+  expect(lines[2]).toBe('run-b · running · 단계 미관측 · 진입 미관측 · 마지막 진전 미관측 · pty prod:pty-b');
+  expect(lines.some((line) => line.includes('부분 관측'))).toBe(false);
+  expect(buildRunProgressRows(result, nowMs)).toEqual([
+    expect.objectContaining({ runId: 'run-a', status: 'running', lastPhase: 'implementing', lastPhaseObservedAt: '2026-09-12T07:05:07.000Z', lastActivityTimestamp: '2026-09-12T07:00:00.000Z', elapsedMs: 3_723_000, ptyRefs: ['prod:pty-a'] }),
+    expect.objectContaining({ runId: 'run-b', lastPhase: null, lastPhaseObservedAt: null, lastActivityTimestamp: null, elapsedMs: null, ptyRefs: ['prod:pty-b'] }),
+  ]);
+});
+
+test('renderRunProgressTable leads with a partial-observation header and never writes an unreadable zero as none', () => {
+  const partial = queryRunningRuns({}, { ...progressDeps({ entries: [], unreadableLedgerDirectoryAccessCount: 1, unreadableLedgerDirectoryCount: 1 }), listPtyRefs: () => ({ refs: [], unreadable: [] }) });
+  const rendered = renderRunProgressTable(partial, 0);
+
+  expect(partial.completeness).toBe('partial');
+  expect(rendered.split('\n')[0]).toStartWith('부분 관측 — 최소 0');
+  expect(rendered).not.toContain('도는 런 0');
+});
+
+test('renderRunProgressTable marks a run whose phase store was unreadable as unobserved with the reason', () => {
+  const result = queryRunningRuns({}, {
+    ...progressDeps(),
+    readRunPhases: () => { throw new Error('logs unavailable'); },
+  });
+  const line = renderRunProgressTable(result, 0).split('\n')[1];
+
+  expect(line).toContain('단계 미관측 (단계 저장소 읽기 실패)');
 });

@@ -11,6 +11,7 @@ import { findGrokModel } from '../grok/models.js';
 import { getUserConfig } from '../user-config.js';
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
 import { getCatalog } from '../registry/loader.js';
+import { byokCostFor, type ByokActualCost, type ByokPartialCost } from '../llm/openrouter-byok-cost.js';
 
 export interface LlmPricingUsd {
   inputPerM: number;
@@ -22,6 +23,13 @@ export interface LlmPricingUsd {
    *  캐시 단가가 없으면 기본 캐시 단가를 입력 단가와 «같은 비율»로 올린다(추정 — 공식 표가 캐시 단가도 입력과 같은 배수로 올린다). */
   longContext?: { thresholdTokens: number; inputPerM: number; outputPerM: number; cacheReadPerM?: number; cacheWritePerM?: number };
 }
+
+/** AWS Bedrock Global Standard prices, USD per million tokens (AWS pricing API, ap-northeast-2). */
+export const BEDROCK_PRICING_USD: Readonly<Record<string, LlmPricingUsd>> = {
+  'claude-haiku-5-5': { inputPerM: 0.1, outputPerM: 0.5, cacheWritePerM: 0.125, cacheReadPerM: 0.01 },
+  'claude-sonnet-5-5': { inputPerM: 2, outputPerM: 10, cacheWritePerM: 2.5, cacheReadPerM: 0.1 },
+  'claude-opus-5-5': { inputPerM: 4, outputPerM: 20, cacheWritePerM: 5, cacheReadPerM: 0.2 },
+};
 
 export interface LlmCostUsage {
   model: string;
@@ -46,7 +54,7 @@ export type LlmCostEstimate =
       kind: 'known';
       model: string;
       usd: number;
-      source: 'catalog' | 'config' | 'registry';
+      source: 'catalog' | 'bedrock-catalog' | 'config' | 'registry';
       cacheReadPricedAt: 'cache-read' | 'input-rate';
       cacheWritePricedAt: 'cache-write' | 'input-rate';
       /** 장문맥 단가로 매겼으면 `'long-context'` — 없으면 기본 단가. */
@@ -56,7 +64,7 @@ export type LlmCostEstimate =
       kind: 'partial';
       model: string;
       usd: number;
-      source: 'catalog' | 'config' | 'registry';
+      source: 'catalog' | 'bedrock-catalog' | 'config' | 'registry';
       cacheReadPricedAt: 'cache-read' | 'input-rate';
       cacheWritePricedAt: 'cache-write' | 'input-rate';
       pricedTier?: 'long-context';
@@ -147,6 +155,21 @@ export function normalizePricingModelId(model: string): string {
   return m;
 }
 
+/** Normalize a Bedrock Anthropic model id to its bare Claude pricing id. */
+export function bedrockPricingModelId(model: string): string {
+  return model.trim()
+    .replace(/^bedrock\//, '')
+    .replace(/^[a-z0-9-]+\.anthropic\./i, '')
+    .replace(/^anthropic\./, '')
+    .replace(/-v1:0$/, '');
+}
+
+function isBedrockPricingModel(model: string): boolean {
+  const trimmed = model.trim();
+  return /^(?:bedrock\/|[a-z0-9-]+\.anthropic\.|anthropic\.)/i.test(trimmed)
+    && bedrockPricingModelId(trimmed).startsWith('claude-');
+}
+
 /** 저장소의 모델 정본(intelligence-map BUILTIN_CATALOG) — 손 카탈로그 넷에 없는 모델(Claude 5 계열 등)의 입력·출력 단가.
  *  캐시 단가는 거기 없다 → Anthropic 모델은 공식 규칙(읽기 0.1× · 쓰기 5분 1.25×)으로 파생한다. 다른 벤더는 입력 단가로 매기고
  *  `cacheReadPricedAt: 'input-rate'` 로 그 사실을 드러낸다(추측하지 않는다). */
@@ -174,8 +197,8 @@ function registryPricing(model: string): LlmPricingUsd | undefined {
 function resolvePricing(
   model: string,
   opts?: EstimateLlmCostOptions,
-): { pricing: LlmPricingUsd; source: 'catalog' | 'config' | 'registry' } | undefined {
-  // ⭐ 순서: 손 카탈로그(정확) → 정규화 id → config 오버레이 → 저장소 정본 → 레지스트리. 앞이 이긴다.
+): { pricing: LlmPricingUsd; source: 'catalog' | 'bedrock-catalog' | 'config' | 'registry' } | undefined {
+  // ⭐ 순서: 손 카탈로그(정확) → 정규화 id → config 오버레이 → Bedrock 표 → 저장소 정본 → 레지스트리. 앞이 이긴다.
   const normalized = normalizePricingModelId(model);
   for (const id of normalized === model ? [model] : [model, normalized]) {
     const catalog = catalogPricing(id);
@@ -184,6 +207,10 @@ function resolvePricing(
   for (const id of normalized === model ? [model] : [model, normalized]) {
     const overlay = opts?.configPricing?.[id];
     if (validPricing(overlay)) return { pricing: overlay, source: 'config' };
+  }
+  if (isBedrockPricingModel(model)) {
+    const bedrock = BEDROCK_PRICING_USD[bedrockPricingModelId(model)];
+    if (validPricing(bedrock)) return { pricing: bedrock, source: 'bedrock-catalog' };
   }
   const builtin = builtinCatalogPricing(normalized);
   if (validPricing(builtin)) return { pricing: builtin, source: 'catalog' };
@@ -297,11 +324,16 @@ export function llmUsageCostFields(
   usage: Omit<LlmCostUsage, 'model'>,
   opts?: EstimateLlmCostOptions,
   billing?: BillingRoute,
-): { cost: LlmCostEstimate | IncludedLlmCost | ActualLlmCost } {
+): { cost: LlmCostEstimate | IncludedLlmCost | ActualLlmCost | ByokActualCost | ByokPartialCost } {
   const resolved = opts ?? { configPricing: readLlmConfigPricing() };
   const estimate = estimateLlmCost({ model, ...usage }, resolved);
   // ⛔⭐ 구독을 API 단가로 «known» 이라 적지 않는다 — 09-25 벤치에서 codex 구독 팔이 `$7.81 known` 으로 보였다.
   // ⭐ BACKLOG C7 — provider 가 실어 보낸 «실제 청구액»이 있으면 그것이 비용이다(추정은 곁에 남긴다).
+  // OR-BYOK-COST — BYOK 면 «OR 청구 + 상류 청구»가 비용이다(상류를 모르면 partial · 0 으로 가정하지 않는다).
+  if (billing !== 'subscription' && billing !== 'local') {
+    const byok = byokCostFor(model, usage as Parameters<typeof byokCostFor>[1], estimate.kind === 'known' || estimate.kind === 'partial' ? estimate.usd : undefined);
+    if (byok) return { cost: byok };
+  }
   const reported = (usage as { reportedCostUsd?: unknown }).reportedCostUsd;
   if (typeof reported === 'number' && Number.isFinite(reported) && billing !== 'subscription' && billing !== 'local') {
     return { cost: { kind: 'actual', model, usd: reported, source: 'provider-reported', ...(estimate.kind === 'known' || estimate.kind === 'partial' ? { estimateUsd: estimate.usd } : {}) } };

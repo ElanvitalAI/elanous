@@ -24,6 +24,9 @@ import type { ReferencedFileReader } from '../self-implement/goal-file-reader.js
 import type { SubscriptionReviewerSpec } from '../user-config.js';
 import { listRunLedgers, lookupPrGoalAcceptance, lookupRunLedger, type PrGoalAcceptanceLookup, type RunLedgerEntry, type RunLedgerLookup } from '../self-implement/run-ledger.js';
 
+/** SUBSCRIPTION-EXHAUST-REROUTE — API reviewer when the configured `roleLlm.reviewer` lane is unavailable (off codex). */
+export const ROLE_REVIEWER_FALLBACK_MODEL = 'openrouter/z-ai/glm-5.3';
+
 export interface SelfReviewCliOpts {
   intent?: string | undefined;
   model?: string | undefined;
@@ -54,8 +57,13 @@ export interface SelfReviewCliDeps {
    *  (`#7486` 리뷰 must-fix · 실제로 `index.ts` 래퍼가 그렇게 한 번 떨어뜨렸다). */
   reviewPullRequest(input: ReviewInput, llm: (prompt: string, images?: readonly ReviewImage[]) => Promise<string>): Promise<ReviewResult>;
   renderReview(review: ReviewResult): string;
-  /** 기본 경로 리뷰어 LLM(API). */
-  makeApiLlm(model: string): (prompt: string) => Promise<string>;
+  /**
+   * 기본 경로 리뷰어 LLM(API).
+   * `o.pinProvider` — 명시 `--model` 일 때 true: 구현은 streamLLM 의 provider 를 그 모델의 provider 로 고정해
+   * 라우터 폴백(grok 등)으로 조용히 넘어가지 않고 실패를 오류로 낸다.
+   * `o.onResolved` — streamLLM 이 «실제로 응답한» provider·model 을 알린다.
+   */
+  makeApiLlm(model: string, o?: { pinProvider?: boolean; onResolved?: (provider: string, model: string) => void }): (prompt: string) => Promise<string>;
   /** `--acp` 경로 리뷰어 LLM(독립 프로세스). */
   /**
    * ⭐ `P4b` — 두 번째 인자가 **멀티미디어 통로**다.
@@ -76,6 +84,11 @@ export interface SelfReviewCliDeps {
   makeRoleReviewerLlm?(spec: SubscriptionReviewerSpec, o: { timeoutMs: number }):
     | { llm: (prompt: string, images?: readonly ReviewImage[]) => Promise<string>; backend: string }
     | { reason: string };
+  /**
+   * SUBSCRIPTION-EXHAUST-REROUTE — API model used when `roleLlm.reviewer` is configured (no explicit flag) but its
+   * lane is unavailable or fails. Absent seam or empty answer = the codex-ladder default as before.
+   */
+  roleFallbackModel?(): string | undefined;
   /** 관측 sink 등록 — ⭐ 이 호출이 분기 밖에 있는지가 이 트랙의 계약이다. */
   registerSink(surface: string): Promise<void>;
   /** `data` 는 payload 객체 — 순수 헬퍼가 만든 관측 타입도 그대로 받는다(인덱스 시그니처 강요 금지). */
@@ -95,6 +108,8 @@ export interface SelfReviewCliDeps {
 
 export interface SelfReviewCliOutcome {
   results: Array<Record<string, unknown>>;
+  /** 리뷰하지 못한 PR 수(`gh pr diff` 실패 · ACP 리뷰 reviewed=false) — json·비json 둘 다 센다. index.ts 가 1 이상이면 rc=1. */
+  failed: number;
 }
 
 interface GhResult {
@@ -1175,7 +1190,7 @@ export async function runSelfReviewCliCommand(
       invalidPrArgs: safeInvalidPrArgs,
     }, { level: 'warn' });
     deps.error(`PR 인자가 올바르지 않습니다: ${safeInvalidPrArgs.join(', ')}. PR 번호는 숫자 형식이어야 합니다 (예: elanous self review 5502).`);
-    return { results: [] };
+    return { results: [], failed: 0 };
   }
 
   const useAcp = opts.acp === true;
@@ -1197,11 +1212,19 @@ export async function runSelfReviewCliCommand(
   if (useAcp) {
     acpReviewLLM = deps.makeAcpLlm({ backend: acpBackend, ...(acpModel ? { model: acpModel } : {}), timeoutMs: acpTimeoutSec * 1000 });
   }
-  const model = useAcp ? `acp:${acpBackend}${acpModel ? `/${acpModel}` : ''}` : (opts.model || deps.envModel() || tierModel('better'));
   // ⭐ Reviewer selection source. An explicit flag always wins byte-for-byte; only without one does
   //    `roleLlm.reviewer` (the harness's reviewer row) pick the ACP lane. Worst case = today's API review.
   const explicitReviewerFlag = opts.acp === true || Boolean(opts.acpBackend) || Boolean(opts.acpModel?.trim()) || Boolean(opts.model?.trim());
   const reviewerSource: 'cli' | 'role-config' | 'default' = explicitReviewerFlag ? 'cli' : opts.roleReviewer ? 'role-config' : 'default';
+  // SUBSCRIPTION-EXHAUST-REROUTE (0.2.24): when `roleLlm.reviewer` is configured but its lane is unavailable
+  //   (10-11 prod: «Claude subscription usage unavailable or at harness cap (60%)»), the API fallback was the codex
+  //   ladder default (`tierModel('better')` = gpt-6-sol) — the CLI read roleLlm.reviewer, then spent codex anyway.
+  //   ⇒ the role-config lane falls back to `roleFallbackModel()` (off codex) when the seam gives one. Explicit flag
+  //   and ELANOUS_PR_REVIEW_MODEL still win; no seam / no answer = today's default byte-for-byte.
+  const envModel = deps.envModel();
+  const roleFallbackModel = !useAcp && !opts.model && !envModel && reviewerSource === 'role-config'
+    ? deps.roleFallbackModel?.()?.trim() || undefined : undefined;
+  const model = useAcp ? `acp:${acpBackend}${acpModel ? `/${acpModel}` : ''}` : (opts.model || envModel || roleFallbackModel || tierModel('better'));
   let roleReviewer: { llm: (prompt: string, images?: readonly ReviewImage[]) => Promise<string>; model: string } | undefined;
   let roleReviewerUnavailableReason: string | undefined;
   let roleReviewerAvailabilityMs: number | undefined;
@@ -1223,6 +1246,7 @@ export async function runSelfReviewCliCommand(
       deps.log('role-reviewer-fallback', {
         reviewerSource, roleReviewerProvider: opts.roleReviewer.provider, roleReviewerAvailabilityMs,
         stage: 'availability', reason: roleReviewerUnavailableReason, fallbackModel: safeLogText(model),
+        fallbackModelSource: roleFallbackModel ? 'role-fallback' : 'default',
       }, { level: 'warn' });
     }
   }
@@ -1234,6 +1258,7 @@ export async function runSelfReviewCliCommand(
     ...(roleReviewerUnavailableReason ? { roleReviewerFallbackReason: roleReviewerUnavailableReason } : {}),
   });
   const results: Array<Record<string, unknown>> = [];
+  let failed = 0;
   const providedReviewerContext = loadReviewerContext(opts, deps.readReferencedFile);
   const hasProvidedReviewerContext = (opts.contextOrder?.length ?? 0) > 0 || (opts.context?.length ?? 0) > 0 || (opts.contextText?.length ?? 0) > 0;
   for (const pr of prArgs) {
@@ -1311,6 +1336,7 @@ export async function runSelfReviewCliCommand(
       const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
       if (opts.json) results.push({ pr, error: err, ...contextOutput, ...comparisonData, ...(mismatchWarning ?? {}) });
       else deps.error(`PR ${pr}: ${err}\n${reviewerContextStatus}`);
+      failed += 1;
       continue;
     }
     // ⭐ S2(2026-07-30) — 리뷰 증거를 **이 PR 이 저작한 변경**으로 좁힌다. 실측 7건에서 1건만
@@ -1375,7 +1401,12 @@ export async function runSelfReviewCliCommand(
     }
     const startedAt = deps.now();
     // Role-config lane builds the API reviewer only when it falls back (`made().api` stays 0 on ACP success).
-    const llmReview = roleReviewer ? undefined : (acpReviewLLM ?? deps.makeApiLlm(model));
+    const responded: { provider?: string; model?: string } = {};
+    const makeApi = () => deps.makeApiLlm(model, {
+      pinProvider: Boolean(opts.model?.trim()),
+      onResolved: (provider, respondedModel) => { responded.provider = provider; responded.model = respondedModel; },
+    });
+    const llmReview = roleReviewer ? undefined : (acpReviewLLM ?? makeApi());
     // ⛔ evidenceNote 는 **별도 채널**이다 — phaseIntent 에 섞으면 의도 채널이 오염된다(실측: 그렇게
     //   했다가 intent 배선 테스트 3개가 즉시 깨졌다).
     // ⛔ 사람 `--intent`(phaseIntent) 와 골 acceptance 는 다른 인자 — 충돌하지 않고, 충돌해도 intent 가 이긴다.
@@ -1414,7 +1445,7 @@ export async function runSelfReviewCliCommand(
         }, { level: 'warn' });
       }
     }
-    let review = roleReview ?? await deps.reviewPullRequest(reviewInput, llmReview ?? acpReviewLLM ?? deps.makeApiLlm(model));
+    let review = roleReview ?? await deps.reviewPullRequest(reviewInput, llmReview ?? acpReviewLLM ?? makeApi());
     let selectedModel = roleReview && roleReviewer ? roleReviewer.model : model;
     let reviewRoute: 'api' | 'acp' | 'acp-fallback' = useAcp || roleReview ? 'acp' : 'api';
     let fallbackAttempted = false;
@@ -1463,6 +1494,11 @@ export async function runSelfReviewCliCommand(
       ...(fallbackFailures.length ? { fallbackFailures } : {}),
       ...(skippedAcpFallbackBackends.length ? { skippedAcpFallbackBackends } : {}),
     };
+    // API 경로로 «성공한» 리뷰만 응답 provider·model 을 싣는다(요청 model 과 다르면 둘 다 보인다).
+    //   ⚠️ streamLLM 의 onResolvedProvider 는 시도 «전»에 불린다 — 실패한 리뷰에 실으면 응답 안 한 provider 를 «응답했다»로 적는다.
+    const respondedOutput = reviewRoute === 'api' && review.reviewed === true && responded.provider
+      ? { respondedProvider: responded.provider, respondedModel: responded.model }
+      : {};
     // ⚠️ `buildReviewObservation` drops unknown keys — the selection rides next to it, not inside it.
     const reviewerSelection = {
       ...reviewerSourceObservation(),
@@ -1492,14 +1528,17 @@ export async function runSelfReviewCliCommand(
     if (useAcp && review.reviewed === false) {
       const err = 'ACP 리뷰 실행 실패(reviewed=false) — 관측: elanous logs --category acp-review';
       const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
-      if (opts.json) results.push({ pr, error: err, ...review, verdict: null, ...reviewProvenance, ...reviewerSelection, ...provenance, ...contextOutput });
+      if (opts.json) results.push({ pr, error: err, ...review, verdict: null, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...provenance, ...contextOutput });
       else deps.error(`PR ${pr}: ${err}\n${renderProvenance(diffRead)}\n${reviewerContextStatus}`);
+      failed += 1;
       continue;
     }
     const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
     const jsonReview = review.reviewed === true ? review : { ...review, verdict: null };
-    if (opts.json) results.push({ pr, model: selectedModel, ...jsonReview, ...reviewProvenance, ...reviewerSelection, ...provenance, ...contextOutput, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles, ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) });
+    if (opts.json) results.push({ pr, model: selectedModel, ...jsonReview, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...provenance, ...contextOutput, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles, ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) });
     else deps.print(`\n━━ PR ${pr} (${selectedModel}) ━━\n${renderProvenance(diffRead)}\n${evidenceLine}\n${reviewerContextStatus}\n${deps.renderReview(review)}`);
+    // REVIEW-ERROR-RC — 기본(API)·role 경로가 1차·폴백 모두 실패해 reviewed≠true 로 끝나도 «못 리뷰한 PR» 이다(verdict:null).
+    if (review.reviewed !== true) failed += 1;
   }
-  return { results };
+  return { results, failed };
 }

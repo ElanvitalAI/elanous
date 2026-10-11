@@ -132,7 +132,7 @@ describe('GOAL-LOOP-MIDRUN-STALL — 도구 뒤 말뿐인 턴 재촉(런당 1회
     expect(r.result).toMatchObject({ stopReason: 'max_iterations', goalComplete: false, iterations: 2 });
   });
 
-  for (const provider of ['openai-codex', 'grok', 'anthropic', null] as const) {
+  for (const provider of ['local', null] as const) {
     test(`가드 꺼짐(provider=${provider}) — 도구 뒤 텍스트만 턴은 재촉 0 · 오늘처럼 바로 text-only-accept`, async () => {
       const r = await drive([
         { text: '읽었습니다', messages: [readFileUse] },

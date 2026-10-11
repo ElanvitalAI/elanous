@@ -33,6 +33,7 @@ import { parseGoalType } from './goal-author.js';
 import type { DocumentReferenceStatus } from './self-implement-runtime.js';
 import { DEV_PIPELINE_SINK_SURFACE } from './self-cli-sink-surface.js';
 import { PIPELINE_EDGES_BY_NODE, PIPELINE_GRAPH_ID, TERMINAL_STAGES_BY_NODE, pipelineGraphIdentity, pipelineGraphVersion, type PipelineNodeId } from './pipeline-shape.js';
+import { GRAPH_TEMPLATES, measureL0Coverage } from './graph-templates.js';
 
 const isolatedStateDir = mkdtempSync(join(tmpdir(), 'elanous-orchestrator-goal-run-store-'));
 const priorStateDir = process.env.ELANOUS_STATE_DIR;
@@ -99,6 +100,103 @@ beforeEach(() => {
   }));
 });
 afterEach(() => { setUserConfigOverlay(null); });
+
+describe('L0 graph.path skipped-node attribution', () => {
+  test('joined journey entries are not mislabeled skipped', async () => {
+    const { LogStore, logsDbPath } = await import('../mss/logging/log-store.js');
+    const { mkdirSync } = await import('node:fs');
+    const { dirname } = await import('node:path');
+    const original = debug.log;
+    const entries: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const key = `journey-l0-${crypto.randomUUID()}`;
+    const runId = `run-${crypto.randomUUID()}`;
+    const previousKey = process.env.ELANOUS_JOURNEY_KEY;
+    process.env.ELANOUS_JOURNEY_KEY = key;
+    (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
+      entries.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    mkdirSync(dirname(logsDbPath()), { recursive: true });
+    const store = new LogStore(logsDbPath());
+    try {
+      store.insertBatch([
+        { rec: {
+          ts: new Date().toISOString(), category: 'self-implement', event: 'pipeline-node-entry',
+          data: { journeyKey: key, phase: 'journey', graphId: 'self-implement', graphVersion: GRAPH_TEMPLATES['self-implement']!.version, node: 'pool-admit' },
+        }, surface: 'test' },
+        { rec: {
+          ts: new Date().toISOString(), category: 'self-implement', event: 'pipeline-node-entry',
+          data: { journeyKey: key, phase: 'journey', graphId: 'self-implement', graphVersion: 'stale-version', node: 'image-sync' },
+        }, surface: 'test' },
+        { rec: {
+          ts: new Date().toISOString(), category: 'self-implement', event: 'pipeline-node-entry',
+          data: { journeyKey: key, runId: 'another-run', phase: 'journey', graphId: 'self-implement', graphVersion: GRAPH_TEMPLATES['self-implement']!.version, node: 'credential-refresh' },
+        }, surface: 'test' },
+      ]);
+      const result = await runSelfImplement({ feature: 'L0 joined journey', runId, autoMerge: false, seams: revSeams({}) });
+      expect(result.ok).toBe(true);
+      expect(entries.filter((entry) => entry.event === 'node-skipped' && entry.data.node === 'pool-admit')).toHaveLength(0);
+      // Out-of-process nodes that were not joined are «unjoined», never relabeled as skipped.
+      expect(entries.filter((entry) => entry.event === 'node-skipped' && entry.data.node === 'image-sync')).toHaveLength(0);
+      expect(entries.filter((entry) => entry.event === 'node-skipped' && entry.data.node === 'credential-refresh')).toHaveLength(0);
+      const coverage = entries.find((entry) => entry.event === 'l0-coverage')?.data;
+      expect(coverage).toMatchObject({ runId, journeyRowsRead: true, declarationCoverage: 1 });
+      expect(coverage?.unjoinedNodes).toEqual(expect.arrayContaining(['image-sync', 'credential-refresh']));
+      expect(coverage?.unjoinedNodes).not.toContain('pool-admit');
+      expect(coverage?.traversalCoverage as number).toBeLessThan(1);
+    } finally {
+      store.close();
+      (debug as { log: typeof debug.log }).log = original;
+      if (previousKey === undefined) delete process.env.ELANOUS_JOURNEY_KEY;
+      else process.env.ELANOUS_JOURNEY_KEY = previousKey;
+    }
+  });
+
+  test('coverage does not count undeclared nodes, duplicate visits, or missing stages', () => {
+    const template = GRAPH_TEMPLATES['self-implement']!;
+    const first = template.nodes[0]!.nodeId;
+    const measured = measureL0Coverage(template, [first, first, 'not-declared'], []);
+    expect(measured.accountedNodeCount).toBe(1);
+    expect(measured.traversalCoverage).toBe(1 / template.nodes.length);
+    expect(measured.declarationCoverage).toBe(1);
+    expect(measureL0Coverage({ ...template, journeyStages: ['entry', 'missing'] }, [], []).declarationCoverage).toBe(0.5);
+    expect(measureL0Coverage({ ...template, journeyStages: [], nodes: [] }, [], [])).toMatchObject({ declarationCoverage: null, traversalCoverage: null });
+  });
+  test('successful worktree run records conditional pipeline nodes not entered, without relabeling existing events', async () => {
+    const entries: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+    const result = await runSelfImplement({ feature: 'L0 conditional skip', completion: 'worktree-only', memory: false,
+      seams: seams({ writeRunLedger: (entry) => entries.push(entry) }),
+    });
+    expect(result.ok).toBe(true);
+    const skips = entries.filter((entry) => entry.event === 'node-skipped');
+    const template = GRAPH_TEMPLATES['self-implement']!;
+    const entered = new Set(entries.filter((entry) => entry.event === 'pipeline-node-entry').map((entry) => entry.data.node));
+    const skipped = new Set(skips.map((entry) => entry.data.node));
+    const inProcess = new Set(Object.keys(TERMINAL_STAGES_BY_NODE));
+    expect([...skipped].sort()).toEqual(template.nodes.map((node) => node.nodeId).filter((id) => !entered.has(id) && inProcess.has(id)).sort());
+    expect(['pool-admit', 'image-sync', 'credential-refresh'].some((id) => skipped.has(id))).toBe(false);
+    expect(skips.every((entry) => entry.data.reason === 'condition' && entry.data.graphId === 'self-implement')).toBe(true);
+    const coverage = entries.find((entry) => entry.event === 'l0-coverage');
+    const unjoined = template.nodes.map((node) => node.nodeId).filter((id) => !entered.has(id) && !inProcess.has(id));
+    expect(unjoined.length).toBeGreaterThan(0);
+    expect(coverage?.data).toMatchObject({ graphId: template.graphId, graphVersion: template.version,
+      declarationCoverage: 1, journeyRowsRead: false, declaredNodeCount: template.nodes.length,
+      accountedNodeCount: template.nodes.length - unjoined.length, unjoinedNodes: unjoined,
+      traversalCoverage: (template.nodes.length - unjoined.length) / template.nodes.length,
+      listedStageCount: template.journeyStages!.length });
+    expect(entries.some((entry) => entry.event === 'pipeline-node-entry' && entry.data.node === 'implement')).toBe(true);
+    expect(entries.some((entry) => entry.event === 'pipeline-traversal-shadow')).toBe(true);
+  });
+
+  test('aborted run does not fabricate a completed skip accounting', async () => {
+    const entries: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+    const result = await runSelfImplement({ feature: 'L0 aborted', seams: seams({
+      implement: async () => ({ ok: false, summary: 'aborted' }), writeRunLedger: entry => entries.push(entry),
+    }) });
+    expect(result.stage).toBe('aborted');
+    expect(entries.filter((entry) => entry.event === 'node-skipped')).toEqual([]);
+    expect(entries.filter((entry) => entry.event === 'l0-coverage')).toEqual([]);
+  });
+});
 
 describe('run stop ledger attribution', () => {
   test('implement aborted adds exactly one stop without replacing existing ledger events', async () => {
@@ -16238,6 +16336,27 @@ describe('declaredScopeUnmadeLine — ***「하나도 안 만들었나」만 말
 });
 
 describe('detectDeclaredScopeDiff — 선언한 대상 밖 변경', () => {
+  // SCOPE-LOCKFILE-PAIR — 10-11 TSGO-TRIAL: a declared package.json change rewrote bun.lock, which was held as out-of-scope.
+  test('a declared package.json covers the bun.lock beside it, not other lockfiles', () => {
+    const scope = detectDeclaredScopeDiff({
+      goalDocument: goalDocumentWithDeclaredTargets('package.json · apps/pwa/package.json'),
+      changedFiles: ['package.json', 'bun.lock', 'apps/pwa/bun.lock', 'apps/other/bun.lock'],
+    });
+    expect(scope.outsideNames).toEqual(['apps/other/bun.lock']);
+  });
+  // SCOPE-NEW-FILES-LINE — 10-11 FLEX-SIGNALS: «신설:» 줄의 새 파일을 범위 밖으로 세어 구현을 보류했다.
+  test('files on the «신설:» line are inside the declared scope', () => {
+    const scope = detectDeclaredScopeDiff({
+      goalDocument: goalDocumentWithDeclaredTargets('src/a.ts\n신설: src/new.ts · src/new.test.ts'),
+      changedFiles: ['src/a.ts', 'src/new.ts', 'src/new.test.ts', 'src/other.ts'],
+    });
+    expect(scope.outsideNames).toEqual(['src/other.ts']);
+    expect(scope.declaredCount).toBe(3);
+  });
+  test('a «신설:» line without a target-path first line stays unreadable', () => {
+    const doc = goalDocumentWithDeclaredTargets('src/a.ts').replace('대상 경로: src/a.ts', '신설: src/new.ts');
+    expect(detectDeclaredScopeDiff({ goalDocument: doc, changedFiles: ['src/new.ts'] }).status).toBe('unknown');
+  });
   test('declared source includes its exact sibling test, not other tests', () => {
     const scope = detectDeclaredScopeDiff({
       goalDocument: goalDocumentWithDeclaredTargets('src/in.ts'),

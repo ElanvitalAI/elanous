@@ -1,0 +1,17 @@
+graph_id: harness-gc
+loop:
+  title: Harness GC
+  description: Reclaim only ladder-safe harness worktrees and merged branch-only refs in bounded ticks
+  owner: OP
+  trigger:
+    cron: '*/10 * * * *'
+    events: [manual]
+version: 1
+entry_node: tick
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: tick, kind: agent, recipe: 'cmd:harness-gc-tick', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: tick, on: outcome, map: { ok: done, skipped: done, fail: failed, error: failed } }

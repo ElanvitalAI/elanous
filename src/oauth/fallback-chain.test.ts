@@ -408,12 +408,19 @@ describe('grokQuotaFromUsageSnapshot — 공급자 판정이 «우리 산술보�
     expect(grokQuotaFromUsageSnapshot({})).toBe('unknown');
   });
 
+  it('주간 quota 창이 있으면 provider 사용률로 소진·사용 가능을 가른다', () => {
+    expect(grokQuotaFromUsageSnapshot({ windows: [{ kind: 'weekly', remainingPercent: 58 }] })).toBe('usable');
+    expect(grokQuotaFromUsageSnapshot({ windows: [{ kind: 'weekly', remainingPercent: 0 }] })).toBe('exhausted');
+    expect(grokQuotaFromUsageSnapshot({ windows: [{ kind: 'weekly', remainingPercent: Number.NaN }] })).toBe('unknown');
+    expect(grokQuotaFromUsageSnapshot({ windows: [{ kind: 'monthly', remainingPercent: 0 }] })).toBe('unknown');
+  });
+
   it('unlimited 가 hasCredits 보다 앞이다', () => {
     expect(grokQuotaFromUsageSnapshot({ credits: { unlimited: true, hasCredits: false } })).toBe('usable');
   });
 
-  // ⛔⭐ 뒤집었다 — 스냅샷 경로엔 사용률 창이 없고, `hasCredits` 는 브랜드마다 «다른 것»을 뜻한다.
-  //   ⇒ 그 하나로 「소진」을 «단정하지 않는다». 「모른다」가 정직하고, 「모른다」는 통과다.
+  // ⛔⭐ `hasCredits` 는 브랜드마다 «다른 것»을 뜻한다.
+  //   ⇒ Grok 의 주간 창이 없는 때 그 하나로 「소진」을 «단정하지 않는다». 「모른다」가 정직하고, 「모른다」는 통과다.
   it('hasCredits=false «하나»로는 소진을 단정하지 않는다 — unknown 이다', () => {
     expect(grokQuotaFromUsageSnapshot({ credits: { hasCredits: false, unlimited: false } })).toBe('unknown');
     expect(grokQuotaFromUsageSnapshot({ credits: { hasCredits: true, unlimited: false } })).toBe('usable');

@@ -6,6 +6,8 @@
  * ⛔ «못 잼»은 `value:null` ⊕ `reason` 이다 — 절대 0 으로 읽지 않는다(판정도 그렇다).
  */
 
+import { formatLandingThroughput, type LandingThroughput } from '../task-agent/cover.js';
+
 export type CellStatus = 'ok' | 'unmeasured' | 'partial';
 export interface Cell<T> {
   value: T | null;
@@ -84,6 +86,8 @@ export interface OverviewSnapshot {
     parents: Cell<ParentsInfo>;
   };
   landings: Cell<{ count: number; recent: string[] }>;
+  /** Optional until launch/PR/age sources are wired; existing snapshots keep their exact output. */
+  throughput?: Cell<LandingThroughput>;
   loops: LoopRow[];
 }
 
@@ -176,6 +180,7 @@ export function unmeasuredCells(s: OverviewSnapshot): string[] {
   for (const h of s.machines.hosts) visit(`machines.${h.name}`, h.load);
   for (const p of s.machines.pods) visit(`pods.${p.context}`, p.occupied);
   visit('machines.parents', s.machines.parents); visit('landings', s.landings);
+  if (s.throughput) visit('throughput', s.throughput);
   for (const l of s.loops) visit(`loops.${l.name}`, l.beat);
   return out;
 }
@@ -215,6 +220,9 @@ export function renderOverview(s: OverviewSnapshot, v: VerdictResult, meta: { el
   lines.push(`       Pod ${s.machines.pods.map((p) => `${p.context} ${show(p.occupied, String)}/${p.capacity}`).join(' · ') || '못 잼(풀 설정 없음)'}`);
   lines.push(`       하니스 부모(이 기계) ${show(s.machines.parents, (p) => `${p.count} · 6h 넘음 ${p.staleOver6h}${p.oldestHours !== null ? ` · 최고 ${p.oldestHours}h` : ''}`)}`);
   lines.push(`착지   ${s.since} ${show(s.landings, (l) => `${l.count}`)} [${s.landings.source}]`);
+  if (s.throughput) {
+    lines.push(`${show(s.throughput, formatLandingThroughput)} [${s.throughput.source}]`);
+  }
   for (const l of s.loops) {
     lines.push(`루프   ${l.name}${l.era === 'seat-era' ? ' [자리 시대 원천]' : ''} ${show(l.beat, (b) => `${kst(b.lastAt)} (${Math.round(b.ageSeconds / 60)}분 전)${b.alive === null ? '' : b.alive ? ' 살아 있음' : ' 프로세스 없음'}${l.staleAfterSeconds === null ? ' · 주기 미상(판정 제외)' : ''}`)}`);
   }

@@ -1,11 +1,15 @@
 // BEDROCK-PROVIDER — 자격·리전·서명·모델 id 순수 시험. ⛔ 실 AWS 호출 0 · 실 자격 값 0(가짜 값만).
 import { expect, test } from 'bun:test';
 import { redactSecretText } from '../debug/log.js';
+import type { BedrockOpenAIPath } from './bedrock.js';
 import {
   BEDROCK_DEFAULT_MODEL,
   BedrockCredentialsUnresolvedError,
   bedrockAvailable,
   bedrockCanonicalClaudeId,
+  bedrockMantleOpenAIUrl,
+  bedrockRegionFor,
+  bedrockRouteFor,
   bedrockCredentialSignal,
   bedrockCredentialSignalLabel,
   sanitizeCredentialErrorName,
@@ -25,9 +29,11 @@ const noFiles = { readText: () => undefined };
 const FAKE = { accessKeyId: 'AKIDFAKEFAKEFAKE', secretAccessKey: 'fake-secret-not-real' };
 
 test('model ids: alias · bare claude · wire passthrough · canonical', () => {
-  expect(resolveBedrockModelId('bedrock/claude-sonnet-5-5')).toBe('anthropic.claude-sonnet-5-5');
-  expect(resolveBedrockModelId('claude-haiku-5-5')).toBe('anthropic.claude-haiku-5-5');
-  expect(resolveBedrockModelId('anthropic.claude-opus-5-5')).toBe('anthropic.claude-opus-5-5');
+  // BEDROCK-RUNTIME-PATH: 5.5 는 mantle 에 없다(📏 GET /v1/models) ⇒ 별칭·접두 없는 id 모두 전역 추론 프로필로.
+  expect(resolveBedrockModelId('bedrock/claude-sonnet-5-5')).toBe('global.anthropic.claude-sonnet-5-5');
+  expect(resolveBedrockModelId('claude-haiku-5-5')).toBe('global.anthropic.claude-haiku-5-5');
+  expect(resolveBedrockModelId('anthropic.claude-opus-5-5')).toBe('global.anthropic.claude-opus-5-5');
+  expect(resolveBedrockModelId('claude-sonnet-5')).toBe('anthropic.claude-sonnet-5');
   expect(resolveBedrockModelId('us.anthropic.claude-sonnet-5-5')).toBe('us.anthropic.claude-sonnet-5-5');
   expect(resolveBedrockModelId(undefined)).toBe(BEDROCK_DEFAULT_MODEL);
   expect(bedrockCanonicalClaudeId('global.anthropic.claude-sonnet-5-5')).toBe('claude-sonnet-5-5');
@@ -35,9 +41,59 @@ test('model ids: alias · bare claude · wire passthrough · canonical', () => {
   expect(isBedrockModelId('bedrock/claude-sonnet-5-5')).toBe(true);
   expect(isBedrockModelId('claude-sonnet-5-5')).toBe(false);
   expect(isBedrockModelId('gpt-6-sol')).toBe(false);
-  expect(findBedrockModel('claude-sonnet-5-5')?.id).toBe('anthropic.claude-sonnet-5-5');
+  expect(findBedrockModel('claude-sonnet-5-5')?.id).toBe('global.anthropic.claude-sonnet-5-5');
   expect(findBedrockModel('bedrock/claude-haiku-5-5')?.tier).toBe('cheap');
   expect(findBedrockModel('claude-sonnet-9-9')).toBeUndefined();
+});
+
+test('mantle-openai rows: alias → wire id → route + path (Anthropic resolution unchanged)', () => {
+  const rows: Array<[string, BedrockOpenAIPath]> = [
+    ['openai.gpt-6-sol', '/openai/v1/chat/completions'],
+    ['openai.gpt-6-luna', '/openai/v1/chat/completions'],
+    ['zai.glm-5', '/v1/chat/completions'],
+    ['zai.glm-4.7-flash', '/v1/chat/completions'],
+    ['deepseek.v3.2', '/v1/chat/completions'],
+    ['moonshotai.kimi-k2.5', '/v1/chat/completions'],
+    ['qwen.qwen3-coder-next', '/v1/chat/completions'],
+    ['minimax.minimax-m2.5', '/v1/chat/completions'],
+    ['mistral.devstral-2-123b', '/v1/chat/completions'],
+  ];
+  for (const [id, path] of rows) {
+    expect(resolveBedrockModelId(`bedrock/${id}`)).toBe(id);
+    expect(isBedrockModelId(`bedrock/${id}`)).toBe(true);
+    expect(isBedrockModelId(id)).toBe(true);
+    expect(bedrockRouteFor(id)).toBe('mantle-openai');
+    expect(findBedrockModel(`bedrock/${id}`)?.openaiPath).toBe(path);
+    expect(bedrockRegionFor(id, 'ap-northeast-2')).toBe('us-east-1');
+    expect(bedrockMantleOpenAIUrl('us-east-1', id)).toBe(`https://bedrock-mantle.us-east-1.api.aws${path}`);
+  }
+  // Anthropic 행·해석은 종전과 같다.
+  expect(bedrockRouteFor(resolveBedrockModelId('bedrock/claude-sonnet-5-5'))).toBe('runtime');
+  expect(bedrockRouteFor('anthropic.claude-sonnet-5')).toBe('mantle');
+  expect(bedrockRegionFor('global.anthropic.claude-sonnet-5-5', 'ap-northeast-2')).toBe('ap-northeast-2');
+  // 표 밖 id·무효 리전은 URL 을 만들지 않는다.
+  expect(() => bedrockMantleOpenAIUrl('us-east-1', 'zai.glm-9')).toThrow(/표에 없다/);
+  expect(() => bedrockMantleOpenAIUrl('us-east-1', 'anthropic.claude-sonnet-5')).toThrow(/표에 없다/);
+  expect(() => bedrockMantleOpenAIUrl('us-east-1@evil.example/', 'zai.glm-5')).toThrow(/리전 값/);
+});
+
+test('mantle-openai signed request: service bedrock-mantle · accept SSE · stream:true · bearer goes as Authorization', async () => {
+  let service: string | undefined;
+  const req = await buildSignedBedrockRequest({
+    region: 'us-east-1', body: { model: 'openai.gpt-6-sol', messages: [] }, env: {},
+    resolveCredentials: async () => FAKE,
+    sign: async ({ headers, service: s }) => { service = s; return { ...headers, authorization: 'AWS4-HMAC-SHA256 test' }; },
+  });
+  expect(req.url).toBe('https://bedrock-mantle.us-east-1.api.aws/openai/v1/chat/completions');
+  expect(service).toBe('bedrock-mantle');
+  expect(req.headers.accept).toBe('text/event-stream');
+  expect(req.headers['anthropic-version']).toBeUndefined();
+  expect(JSON.parse(req.body).stream).toBe(true);
+  const bearer = await buildSignedBedrockRequest({
+    region: 'us-east-1', body: { model: 'zai.glm-5', messages: [] }, env: { AWS_BEARER_TOKEN_BEDROCK: 'tok-fake' },
+  });
+  expect(bearer.headers.authorization).toBe('Bearer tok-fake');
+  expect(bearer.headers['x-api-key']).toBeUndefined();
 });
 
 test('region: env first, then active profile region from config text, else undefined', () => {

@@ -75,6 +75,35 @@ describe('Pod terminal residue', () => {
     }
   });
 
+  test('host-regate failure reason survives classification and the pr-terminal ledger row (AUT-HOST-REGATE-REASON-LOST)', async () => {
+    const rawDetail = `error\n  TS2345:   Argument of type 'string' is not assignable to parameter of type 'number'. ${'noise '.repeat(120)}`;
+    const folded = rawDetail.split(/\s+/).filter(Boolean).join(' ').slice(0, 300);
+    const failed = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      hostRegate: { passed: false, failures: [{ step: 'typecheck', detail: rawDetail }], os: 'ubuntu-24.04' } } });
+    expect(failed.hostRegateFailure).toEqual({ step: 'typecheck', detail: folded, os: 'ubuntu-24.04' });
+    expect(failed.hostRegateFailure?.detail.length).toBeLessThanOrEqual(300);
+    const empty = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      hostRegate: { passed: false, failures: [], os: 'ubuntu-24.04' } } });
+    expect(empty.hostRegateFailure).toEqual({ step: 'unknown', detail: 'failures empty', os: 'ubuntu-24.04' });
+    const others = [
+      classifyPodTerminal({ ...input, disposition: { ...input.disposition, stage: 'landed', merged: true, ok: true,
+        hostRegate: { passed: false, failures: [{ step: 'typecheck', detail: rawDetail }], os: 'ubuntu-24.04' } } }),
+      classifyPodTerminal({ ...input, disposition: { ...input.disposition, stage: 'gate-failed', ok: false,
+        hostRegate: { passed: false, failures: [{ step: 'isolation-gate', detail: rawDetail }], os: 'ubuntu-24.04' } } }),
+      classifyPodTerminal({ ...input, disposition: { ...input.disposition } }),
+      classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+        hostRegate: { passed: true, failures: [], os: 'ubuntu-24.04' } } }),
+    ];
+    expect(others.map((record) => record.hostRegateFailure)).toEqual([null, null, null, null]);
+    const f = fixture();
+    try {
+      expect(await applyPodTerminal(failed, f.ctx)).toEqual({ status: 'recorded' });
+      const terminals = loadRunLedger(runId, f.dir)?.filter((row) => row.event === 'pr-terminal');
+      expect(terminals).toEqual([expect.objectContaining({ data: expect.objectContaining({
+        childRunId: runId, hostRegateFailure: { step: 'typecheck', detail: folded, os: 'ubuntu-24.04' } }) })]);
+    } finally { f.cleanup(); }
+  });
+
   test('supersedes only older verified same-goal drafts, labels before closing, and respects protected, unrelated and card-only PRs', async () => {
     const current = pr(200, 'self-impl/new-goalid-abc123-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
     const f = fixture(current, [

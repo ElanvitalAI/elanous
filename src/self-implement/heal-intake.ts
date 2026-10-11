@@ -170,7 +170,11 @@ function withInboxLock<T>(file: string, work: () => T): T {
   finally { rmdirSync(lock); }
 }
 
-/** One durable JSON line per failure; repeat source+ref within an hour is folded. */
+/** One durable JSON line per failure; repeat source+ref within an hour is folded.
+ *  POD-HEAL-HOST — the loop start itself is refused inside a Pod (`startHealLoop` → `skipped-in-pod`):
+ *  a loop started there dies with the Pod. The line stays in the inbox, and the host re-records the
+ *  recovered Pod ledger failure into the HOST universe (`pod-ledger-collect.ts` → `intakeCollectedFailure`),
+ *  so the host heal loop triages it (harvest + narrowed relaunch). */
 export function recordFailureEvent(event: FailureEvent, root = effectiveInstanceRoot(), startLoop: StartHealLoop = startHealLoop): { folded: boolean } {
   if (!['release-run', 'harness-run', 'loop-tick', 'cron'].includes(event.source) ||
       !event.kind || !event.ref || !event.summary || !Number.isFinite(Date.parse(event.at))) {

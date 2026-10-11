@@ -24,7 +24,30 @@ describe('dispatch backpressure decision', () => {
     const result = decideBackpressure(roomy(), { maxPerCycle: 6 });
     expect(result.launchBudget).toBe(3);
     expect(result.reasons).toContain('podRecommended−admitWaiting');
-    expect(result.reasons).toContain('stale-parents:3');
+    expect(result.reasons.some((reason) => reason.startsWith('outdated-version-parents:3 '))).toBe(true);
+    expect(result.reasons).toContain('outdated-version-parents:3 (legacy observation alias: stale-parents:3; 살아 있는 런 · 예산 안 깎음 · 낡은 부모 후보는 eln tasks parents)');
+    expect(result.reasons.filter((reason) => reason.startsWith('stale-parents:'))).toHaveLength(0);
+    expect(result.launchBudget).toBe(decideBackpressure({ ...roomy(), staleParents: 0 }, { maxPerCycle: 6 }).launchBudget);
+  });
+  test('three parents from other installed versions appear under the renamed observational reason only', () => {
+    const signals = readBackpressureSignals(observed({ ps: () => [
+      'bun /home/u/.local/share/elanous/versions/old-a/bin/elanous.mjs harness say a',
+      'bun /home/u/.local/share/elanous/versions/old-b/bin/elanous.mjs harness ask b',
+      'bun /home/u/.local/share/elanous/versions/old-c/bin/elanous.mjs harness say c',
+    ].join('\n') }));
+    const result = decideBackpressure(signals);
+    expect(result.reasons.some((reason) => reason.startsWith('outdated-version-parents:3 '))).toBe(true);
+    expect(result.reasons.filter((reason) => reason.startsWith('stale-parents:'))).toHaveLength(0);
+    expect(result.launchBudget).toBe(decideBackpressure({ ...signals, staleParents: 0 }).launchBudget);
+  });
+  test('outdated installed parent waiting for approval gets a restart recommendation without changing budget', () => {
+    const waiting = decideBackpressure(roomy(), { maxPerCycle: 6 });
+    expect(waiting.launchBudget).toBe(3);
+    expect(waiting.reasons).toContain('restart-stale-parent:approval-wait');
+    expect(decideBackpressure({ ...roomy(), admitWaiting: 0 }).reasons).not.toContain('restart-stale-parent:approval-wait');
+    expect(decideBackpressure({ ...roomy(), staleParents: 0 }).reasons).not.toContain('restart-stale-parent:approval-wait');
+    expect(decideBackpressure({ ...roomy(), admitWaiting: 'unknown' }).reasons).not.toContain('restart-stale-parent:approval-wait');
+    expect(decideBackpressure({ ...roomy(), staleParents: 'unknown' }).reasons).not.toContain('restart-stale-parent:approval-wait');
   });
   test('starvation and remote build storm both stop launches despite pod capacity', () => {
     const result = decideBackpressure({ ...roomy(), admitStarvedOver30m: 1, podRecommended: 27,
@@ -214,7 +237,7 @@ describe('harness queue backpressure CLI', () => {
       await program.parseAsync(['harness', 'queue', 'backpressure', ...args], { from: 'user' });
       return { lines, errors, verdicts, exitCode: process.exitCode };
     } finally {
-      console.log = log; console.error = error; debug.log = record; process.exitCode = exitCode;
+      console.log = log; console.error = error; debug.log = record; process.exitCode = exitCode ?? 0;
     }
   }
   test('json with timeout and capped local logs emits one verdict, budget 1 and exit 0', async () => {
@@ -229,6 +252,23 @@ describe('harness queue backpressure CLI', () => {
     expect(outcome.verdicts).toEqual([expect.objectContaining({ category: 'traffic.backpressure', event: 'verdict' })]);
     expect(outcome.exitCode).toBeUndefined();
   }, 30_000);
+  test('CLI reports approval starvation and recommends restarting an installed parent after version changes', async () => {
+    const deps = observed({ queue: () => [], ps: () =>
+      'bun /home/u/.local/share/elanous/versions/old-v/bin/elanous.mjs harness say x',
+      podRecommended: () => 8, logs: () => [admission(32, 'run-a', 0), admission(1, 'run-a', 0)] });
+    const before = await invoke(['--json'], { ...deps, currentVersion: () => 'old-v' });
+    expect(JSON.parse(before.lines[0]!).signals.staleParents).toBe(0);
+    expect(JSON.parse(before.lines[0]!).reasons).not.toContain('restart-stale-parent:approval-wait');
+    const outcome = await invoke(['--json'], { ...deps, currentVersion: () => 'current-v' });
+    expect(outcome.lines).toHaveLength(1);
+    expect(JSON.parse(outcome.lines[0]!)).toMatchObject({ launchBudget: 0, signals: {
+      admitWaiting: 1, admitStarvedOver30m: 1, staleParents: 1,
+    } });
+    expect(JSON.parse(outcome.lines[0]!).reasons).toEqual(expect.arrayContaining([
+      'admit-starved', 'outdated-version-parents:1 (legacy observation alias: stale-parents:1; 살아 있는 런 · 예산 안 깎음 · 낡은 부모 후보는 eln tasks parents)', 'restart-stale-parent:approval-wait',
+    ]));
+    expect(outcome.verdicts).toHaveLength(1);
+  });
   test('text output and --max validation/exit codes', async () => {
     const text = await invoke(['--max', '2'], observed({ ps: () => 'docker ps\n', queue: () => [] }));
     expect(text.lines).toEqual([expect.stringMatching(/^발사 예산 2 · 이유 /)]);

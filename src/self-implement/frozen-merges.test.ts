@@ -2,6 +2,9 @@ import { expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setJourneyOverlaysForTesting } from '../self-dev/graph-journey-route.js';
+import { GRAPH_SPECS } from './graph-templates.js';
+import type { GraphOverlaySpec } from './graph-overlay-yaml.js';
 import { disableLandingFreeze, enableLandingFreeze } from '../release-loop/landing-freeze.js';
 import { admitLandingMerge as realAdmitLandingMerge, claimPath, owningRepoRoot, pendingFrozenMerges, queueFrozenMerge, sweepFrozenMerges as realSweepFrozenMerges, tryLandingLock, type FrozenMerge } from './frozen-merges.js';
 
@@ -406,4 +409,24 @@ test('a repository reached through a symlink is the same repository: one queue e
     if (first.kind === 'merge') first.end(true);
     expect(pendingFrozenMerges(state)).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('freeze-check overlay holds an open merge; without an answer the admission is unchanged', () => {
+  const root = mkdtempSync(join(tmpdir(), 'frozen-merge-graph-hold-'));
+  try {
+    const edge = GRAPH_SPECS['self-implement']!.edges.findIndex((item) => item.from === 'freeze-check');
+    setJourneyOverlaysForTesting([{
+      overlayId: 'test-approval-required', target: 'self-implement', stage: 'launch', appliesWhen: 'freeze == open',
+      patch: [
+        { op: 'replace', path: `/edges/${edge}/map/open`, value: 'hold' },
+        { op: 'add', path: `/edges/${edge}/fallback`, value: [{ node: 'merge', requires: [] }] },
+      ],
+    } as GraphOverlaySpec]);
+    expect(admitLandingMerge(entry, root, {}, entry).kind).toBe('held');
+    // the held attempt released its landing marker and claim: a later lander is not «taken»
+    setJourneyOverlaysForTesting([]);
+    const open = admitLandingMerge(entry, root, {}, entry);
+    expect(open.kind).toBe('merge');
+    if (open.kind === 'merge') open.end();
+  } finally { setJourneyOverlaysForTesting(undefined); rmSync(root, { recursive: true, force: true }); }
 });

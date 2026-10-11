@@ -10,7 +10,9 @@ import { TabRegistry } from '../state/tab-registry.js';
 import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
 import { NexusEventBus } from './event-bus.js';
 import { routeRequest } from './http-server.js';
-import { readReleaseRuns } from './ops-api.js';
+import { readReleaseRuns, setOverviewCacheForTest } from './ops-api.js';
+import { createOverviewCache } from '../../ops/overview-cache.js';
+import { okCell, unmeasured, type OverviewSnapshot } from '../../ops/overview.js';
 import { gateShardsPath, writeGateShards } from '../../release-loop/gate-shards.js';
 
 const SECRET = 'op-proxy-secret-0123456789abcdef';
@@ -18,7 +20,12 @@ const API_KEY = 'sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456';
 const OWNER = 'owner-token';
 const dirs: string[] = [];
 
+// The legacy XDG config is pointed at a per-test temp dir and restored — never the person's own.
+const originalXdgConfig = process.env.XDG_CONFIG_HOME;
 afterEach(() => {
+  setOverviewCacheForTest(null);
+  if (originalXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = originalXdgConfig;
   resetUserConfig();
   resetElanousConfigDir();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -27,6 +34,11 @@ afterEach(() => {
 function fixture(enabled: boolean | undefined) {
   const dir = mkdtempSync(join(tmpdir(), 'ops-api-'));
   dirs.push(dir);
+  const xdgConfig = join(dir, 'xdg');
+  process.env.XDG_CONFIG_HOME = xdgConfig;
+  const legacyDir = join(xdgConfig, 'elanous');
+  mkdirSync(legacyDir, { recursive: true });
+  if (enabled !== undefined) writeFileSync(join(legacyDir, 'config.json'), JSON.stringify({ operator: { enabled, proxySecretFile: join(dir, 'secret') } }));
   setElanousConfigDir(dir);
   resetUserConfig();
   if (enabled !== undefined) writeFileSync(join(dir, 'config.json'), JSON.stringify({ operator: { enabled, proxySecretFile: join(dir, 'secret') } }));
@@ -49,10 +61,86 @@ function fixture(enabled: boolean | undefined) {
   return { dir, send, run };
 }
 
+test('overview: routeRequest reuses operator gate, no-store, snapshot memo and background-only Pod measurement', async () => {
+  const { send } = fixture(true);
+  let clock = Date.now();
+  let collects = 0;
+  let podCalls = 0;
+  let tick = () => {};
+  let interval = 0;
+  const cell = <T>(value: T) => okCell(value, 'test ledger', new Date(clock).toISOString());
+  const collect = async (): Promise<OverviewSnapshot> => {
+    collects++;
+    return {
+      generatedAt: new Date(clock).toISOString(), instanceRoot: '/test', since: '최근 1h',
+      release: { version: cell('0.2.24'), run: cell('none' as const), schedule: cell('none' as const), checklist: cell({ green: 1, yellow: 0, red: 0, done: 0, p0Yellow: 0 }) },
+      tasks: { byOwner: cell({}), done: unmeasured('test', 'not connected'),
+        launchable: cell({ count: 0, ids: [], skipped: { noTargetPath: 0, predecessorOpen: 0, alreadyHanded: 0 }, interim: true }),
+        capacity: cell({ podUsed: 0, podTarget: 2, localUsed: 0, localMax: 0, free: 2 }) },
+      machines: { hosts: [], pods: [{ context: 'pool-a', capacity: 2, occupied: unmeasured('pod pool', 'pending') }], parents: cell({ count: 0, staleOver6h: 0, oldestHours: null }) },
+      landings: cell({ count: 0, recent: [] }), loops: [],
+    };
+  };
+  setOverviewCacheForTest(createOverviewCache({ now: () => clock, collect, measurePods: async () => {
+    podCalls++;
+    return [{ context: 'pool-a', occupied: 1, reason: null, observedAt: clock }];
+  }, schedule: (fn, ms) => { interval = ms; tick = fn; return ({ unref() {} }) as ReturnType<typeof setInterval>; } }));
+  const headers = { 'x-elanous-operator': SECRET };
+  expect((await send('/v1/ops/overview'))?.status).toBe(403);
+  expect((await send('/v1/ops/overview', { 'x-elanous-operator': 'forged-forged-forged-forged' }))?.status).toBe(403);
+  expect(collects).toBe(0);
+  expect((await send('/v1/ops/overview?since=bad', headers))?.status).toBe(400);
+  const started = performance.now();
+  const first = await send('/v1/ops/overview', headers);
+  const durationMs = performance.now() - started;
+  expect(durationMs).toBeLessThan(2_000);
+  expect(first?.status).toBe(200);
+  expect(first?.headers.get('cache-control')).toBe('no-store');
+  const body = await first?.json() as { verdict: string; reasons: string[]; machines: OverviewSnapshot['machines']; cacheAgeMs: number };
+  expect(body.verdict).toBe('supply-empty');
+  expect(body.reasons[0]).toContain('빈 자리 2');
+  expect(body.machines.pods[0]?.occupied).toMatchObject({ value: null, status: 'unmeasured' });
+  expect(podCalls).toBe(0);
+  expect(interval).toBe(60_000);
+  clock += 9_999;
+  expect((await (await send('/v1/ops/overview', { authorization: `Bearer ${OWNER}` }))?.json() as { cacheAgeMs: number }).cacheAgeMs).toBe(9_999);
+  expect(collects).toBe(1);
+  tick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  clock++;
+  const refreshed = await (await send('/v1/ops/overview', headers))?.json() as { machines: OverviewSnapshot['machines'] };
+  expect(refreshed.machines.pods[0]?.occupied.value).toBe(1);
+  expect(collects).toBe(2);
+  expect(podCalls).toBe(1);
+  expect((await send('/v1/ops/release/runs', headers))?.status).toBe(200);
+});
+
+test('overview default background snapshot: first read returns pending promptly and repeated reads remain available', async () => {
+  const { send } = fixture(true);
+  const start = performance.now();
+  const first = await send('/v1/ops/overview', { 'x-elanous-operator': SECRET });
+  expect(performance.now() - start).toBeLessThan(2_000);
+  expect(first?.status).toBe(200);
+  expect((await first?.json() as { verdict: string }).verdict).toBe('unobservable');
+  const second = await send('/v1/ops/overview', { 'x-elanous-operator': SECRET });
+  expect(second?.status).toBe(200);
+  expect((await second?.json() as { generatedAt: string }).generatedAt).toBeTruthy();
+  // The real worker collection lands: a version only the request carries comes back measured.
+  const path = '/v1/ops/overview?version=9.9.77';
+  const pendingRead = await (await send(path, { 'x-elanous-operator': SECRET }))?.json() as { release: { version: { value: string | null } } };
+  expect(pendingRead.release.version.value).toBeNull();
+  let collected: { release: { version: { value: string | null; status: string } } } | undefined;
+  for (let attempt = 0; attempt < 100 && collected?.release.version.value !== '9.9.77'; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    collected = await (await send(path, { 'x-elanous-operator': SECRET }))?.json() as typeof collected;
+  }
+  expect(collected?.release.version).toMatchObject({ value: '9.9.77', status: 'ok' });
+}, 30_000);
+
 test('default install with owner bearer refuses all ops data', async () => {
   const { send, run } = fixture(undefined);
   run('run-1', '2026-10-02T00:00:00Z');
-  for (const path of ['/v1/ops/release/runs', '/v1/ops/release/runs/run-1/nodes/version-release/log', '/v1/ops/checklist?version=0.2.9']) {
+  for (const path of ['/v1/ops/overview', '/v1/ops/release/runs', '/v1/ops/release/runs/run-1/nodes/version-release/log', '/v1/ops/checklist?version=0.2.9']) {
     const response = await send(path, { authorization: `Bearer ${OWNER}` });
     expect(response?.status).toBe(403);
     expect(await response?.json()).toEqual({ error: 'forbidden' });

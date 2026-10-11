@@ -613,6 +613,34 @@ else if (args.includes('logs')) console.log('Name: kubernetes.default.svc.cluste
     expect(recommend([], 0, node('1024Gi'))).toMatchObject({ recommended: 20, limitedBy: 'capacity', accountSlots: 0 });
     expect(recommend(Array.from({ length: 20 }, () => pod('Running')), 0, node('1024Gi'))).toMatchObject({ recommended: 0, limitedBy: 'capacity' });
   });
+  /**
+   * POD-POOL-UNCAPPED-SPEC judgment line (10-10 probe: 6 runs, 35 minutes of silence) — launching
+   * `--pod-pool k3d-elanous-pool` (no `:N` → default cap 2) at a cluster already Running 15 must not read as a
+   * plain `recommended=0 limitedBy=capacity`: the first admit line names the pool cap and its size.
+   */
+  test('uncapped pool spec at its default cap: the first admit log says limitedBy=pool-cap · capacity=2', () => {
+    const jobs = JSON.stringify({ items: [{ metadata: { name: 'harness-job', labels: { 'elanous.substrate': 'pod' }, annotations: { [POD_HOST_LEASE_ANNOTATION]: 'true' } } }] });
+    const kubectl: PoolKubectl = (args) => {
+      expect(args.slice(0, 3)).toEqual(['--context', 'k3d-elanous-pool', '--request-timeout=10s']);
+      if (args.includes('nodes')) return { status: 0, stdout: node('1024Gi'), stderr: '' };
+      if (args.includes('jobs')) return { status: 0, stdout: jobs, stderr: '' };
+      return { status: 0, stdout: JSON.stringify({ items: Array.from({ length: 15 }, () => pod('Running', '1Gi')) }), stderr: '' };
+    };
+    const members = parsePodPool('k3d-elanous-pool');
+    const measure = measurePoolLease(members, { kubectl, dns: () => 'ready' });
+    expect(measure.members[0]).toMatchObject({ context: 'k3d-elanous-pool', capacity: 2, capacityDefaulted: true, running: 15, pending: 0 });
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const decision = recommendConcurrency(measure, { capacity: members.reduce((n, m) => n + m.capacity, 0), accounts: 0, perAccount: 0 });
+      expect(decision).toMatchObject({ recommended: 0, limitedBy: 'pool-cap', capacitySlots: 0, running: 15, pending: 0 });
+      const admit = log.mock.calls.filter((c) => c[0] === 'pod-lease' && c[1] === 'admit-by-usage');
+      expect(admit).toHaveLength(1);
+      expect(admit[0]![2]).toMatchObject({ limitedBy: 'pool-cap', capacity: 2, capacitySlots: 0, memorySlots: 63, running: 15, pending: 0 });
+    } finally { log.mockRestore(); }
+    // The operator's own `:2` on the same cluster keeps today's word — `pool-cap` is for the «no cap declared» spec.
+    const explicit = recommendConcurrency(measurePoolLease(parsePodPool('k3d-elanous-pool:2'), { kubectl, dns: () => 'ready' }), { capacity: 2, accounts: 0, perAccount: 0 });
+    expect(explicit).toMatchObject({ recommended: 0, limitedBy: 'capacity', capacitySlots: 0 });
+  });
   test('configured per-goal memory and per-account slots are applied without usage percentages', () => {
     expect(recommendConcurrency(measured([pod('Running')], node('64Gi')), { capacity: 20, accounts: 1, perAccount: 2, perGoalMemory: '32Gi' })).toMatchObject({ memorySlots: 1, accountSlots: 1, recommended: 1 });
   });
