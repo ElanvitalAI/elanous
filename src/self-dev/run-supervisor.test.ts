@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { saveSelfDevRun, loadSelfDevRun, selfDevRunsDir } from './run-store.js';
-import { decideNextRun, superviseRun, madeProgress, countLanded, countBaseCompleted, appendRound, SUPERVISOR_STOP_REASONS, type SupervisorRound, type SupervisorStopReason } from './run-supervisor.js';
+import { decideNextRun, superviseRun, madeProgress, countLanded, countBaseCompleted, appendRound, noPrStreakKey, SUPERVISOR_STOP_REASONS, type SupervisorRound, type SupervisorStopReason } from './run-supervisor.js';
 
 const merged = (id: string) => ({ taskId: id, feature: id, status: 'done', stage: 'merged', merged: true }) as never;
 const worktreeCompleted = (id: string) => ({ taskId: id, feature: id, status: 'done', stage: 'worktree-completed' }) as never;
@@ -377,7 +377,7 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     const d = decideNextRun({ results: [lockRace('a'), lockRace('b')] });
     expect(d.action).toBe('relaunch');
     expect(d.why).toContain('그대로 재실행 2');
-    expect(appendRound([], [lockRace('a'), lockRace('b')])).toEqual([{ round: 0, landed: 0, actionable: 2, noPrTaskIds: ['a', 'b'] }]);
+    expect(appendRound([], [lockRace('a'), lockRace('b')])).toEqual([{ round: 0, landed: 0, actionable: 2, noPrTaskIds: ['a', 'b'], noPrFeatureKeys: ['a', 'b'] }]);
   });
 
   test('⭐ 착지가 «하나라도» 있으면 제자리가 아니다 — 계속 돈다', () => {
@@ -470,7 +470,7 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     ];
     const results = [unfinished('a')];
     expect(countBaseCompleted(results)).toBe(0);
-    expect(appendRound(history, results)[2]).toEqual({ round: 2, landed: 0, baseCompleted: 0, base: 'bench/x', actionable: 1, noPrTaskIds: ['a'] });
+    expect(appendRound(history, results)[2]).toEqual({ round: 2, landed: 0, baseCompleted: 0, base: 'bench/x', actionable: 1, noPrTaskIds: ['a'], noPrFeatureKeys: ['a'] });
     const decision = decideNextRun({ results, history, limits: { maxRounds: 9, stallRounds: 2 } });
     expect(decision.stopReason).toBe('no-progress');
     expect(decision.why).toContain('base=bench/x 기준 완료 0 · 착지 0');
@@ -481,9 +481,9 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     const second = [worktreeCompleted('a'), lockRace('b')];
     const history = appendRound([], first);
     const next = appendRound(history, second)[1]!;
-    expect(history[0]).toEqual({ round: 0, landed: 0, actionable: 2, noPrTaskIds: ['a', 'b'] });
+    expect(history[0]).toEqual({ round: 0, landed: 0, actionable: 2, noPrTaskIds: ['a', 'b'], noPrFeatureKeys: ['a', 'b'] });
     expect(countLanded(second)).toBe(1);
-    expect(next).toEqual({ round: 1, landed: 1, actionable: 1, noPrTaskIds: ['b'] });
+    expect(next).toEqual({ round: 1, landed: 1, actionable: 1, noPrTaskIds: ['b'], noPrFeatureKeys: ['b'] });
     expect(madeProgress(history[0], next)).toBe(true);
     const decision = decideNextRun({ results: second, history, limits: { maxRounds: 9, stallRounds: 1 } });
     expect(decision.action).toBe('relaunch');
@@ -500,14 +500,14 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
 
   test('appendRound — 라운드 기록이 «잰 값»으로 쌓인다', () => {
     let h = appendRound([], [merged('a'), lockRace('b')]);
-    expect(h).toEqual([{ round: 0, landed: 1, actionable: 1, noPrTaskIds: ['b'] }]);
+    expect(h).toEqual([{ round: 0, landed: 1, actionable: 1, noPrTaskIds: ['b'], noPrFeatureKeys: ['b'] }]);
     h = appendRound(h, [merged('b')]);
     expect(h[1]).toEqual({ round: 1, landed: 1, actionable: 0 });
   });
 
   test('appendRound는 결정의 이미 정규화된 review must-fix 추이를 다음 제자리 비교용 이력에 보존한다', () => {
     const history = appendRound([], [lockRace('retry')], 'improving');
-    expect(history).toEqual([{ round: 0, landed: 0, actionable: 1, reviewMustFixTrend: 'improving', noPrTaskIds: ['retry'] }]);
+    expect(history).toEqual([{ round: 0, landed: 0, actionable: 1, reviewMustFixTrend: 'improving', noPrTaskIds: ['retry'], noPrFeatureKeys: ['retry'] }]);
     expect(madeProgress(history[0], { round: 1, landed: 0, actionable: 1, reviewMustFixTrend: 'stable' })).toBe(false);
   });
 
@@ -1366,7 +1366,7 @@ describe('AUT-NO-PROGRESS-RETRY-LOOP — PR 없이 2라운드 연속 실패면 �
       expect(d.why).toContain(msgB1.slice(0, 200));
       expect(d.why).not.toContain(msgB1.slice(0, 201));
       expect(log).toHaveBeenCalledWith('self-dev.supervisor', 'no-pr-streak-stop', {
-        taskIds: ['a', 'b'], round: 1, errors: [msgA1, msgB1.slice(0, 200)],
+        taskIds: ['a', 'b'], featureKeys: ['a', 'b'], pairedBy: ['feature-key'], round: 1, errors: [msgA1, msgB1.slice(0, 200)],
       });
     } finally { log.mockRestore(); }
   });
@@ -1409,5 +1409,63 @@ describe('AUT-NO-PROGRESS-RETRY-LOOP — PR 없이 2라운드 연속 실패면 �
     const standard = decideNextRun({ results: [podFailed('a', msgA1)], history, limits: { maxRounds: 9, stallRounds: 2 } });
     expect(standard.action).toBe('stop');
     expect(standard.stopReason).toBe('no-progress');
+  });
+
+  // NO-PR-STREAK-FEATURE-KEY — rework 가 라운드마다 taskId 를 새로 만든다(run-27b03878: task:1ded008a8aeb → task:f54a6e6fca25
+  //   → task:fade5a6931a4 · feature 문면 같음). 짝은 taskId 가 아니라 «같은 조각»(정규화 feature)으로 맞춘다.
+  const feature = 'Fix the supervisor no-PR streak guard.';
+  test('⑤ 라운드마다 taskId 가 바뀌어도 feature 가 같은 PR 없음 두 라운드면 stop·no-progress ⊕ 관측 no-pr-streak-stop', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const history = appendRound([], [podFailed('task:1ded008a8aeb', msgA0, { feature })]);
+      expect(history[0]!.noPrTaskIds).toEqual(['task:1ded008a8aeb']);
+      expect(history[0]!.noPrFeatureKeys).toEqual(['fix the supervisor no-pr streak guard']);
+      // 공백·대소문자·끝 구두점만 다른 같은 문면도 같은 조각이다.
+      const d = decideNextRun({
+        results: [podFailed('task:f54a6e6fca25', msgA1, { feature: '  fix the  Supervisor no-PR streak guard ' })], history,
+      });
+      expect(d.action).toBe('stop');
+      expect(d.stopReason).toBe('no-progress');
+      expect(d.why).toContain('PR 없이 2라운드 연속 실패');
+      expect(log).toHaveBeenCalledWith('self-dev.supervisor', 'no-pr-streak-stop', {
+        taskIds: ['task:f54a6e6fca25'], featureKeys: ['fix the supervisor no-pr streak guard'], pairedBy: ['feature-key'],
+        round: 1, errors: [msgA1],
+      });
+    } finally { log.mockRestore(); }
+  });
+
+  test('⑤ superviseRun — rework 가 taskId 를 새로 만들어도 재발사(Pod)는 한 번뿐이다', async () => {
+    let reruns = 0;
+    const decisions: string[] = [];
+    await superviseRun({
+      initial: [podFailed('task:1ded008a8aeb', msgA0, { feature })],
+      rerun: async () => { reruns++; return [podFailed(`task:rework-${reruns}`, msgA1, { feature })]; },
+      onDecision: (decision) => decisions.push(`${decision.action}:${decision.stopReason ?? ''}`),
+      taskAgentShadow: false,
+    });
+    expect(reruns).toBe(1);
+    expect(decisions).toEqual(['relaunch:', 'stop:no-progress']);
+  });
+
+  test('⑥ 음성 — taskId 가 바뀌고 feature 도 다르면 가드가 서지 않는다', () => {
+    const history = appendRound([], [podFailed('task:1ded008a8aeb', msgA0, { feature })]);
+    const d = decideNextRun({ results: [podFailed('task:f54a6e6fca25', msgA1, { feature: 'Add a different piece' })], history });
+    expect(d.action).toBe('relaunch');
+    expect(d.stopReason).toBeUndefined();
+  });
+
+  test('⑦ 키를 안 잰 옛 원장(noPrTaskIds 만)은 지금처럼 taskId 로 짝을 맞춘다', () => {
+    const legacy: SupervisorRound[] = [{ round: 0, landed: 0, actionable: 1, noPrTaskIds: ['task:1ded008a8aeb'] }];
+    expect(decideNextRun({ results: [podFailed('task:f54a6e6fca25', msgA1, { feature })], history: legacy }).action).toBe('relaunch');
+    const same = decideNextRun({ results: [podFailed('task:1ded008a8aeb', msgA1, { feature })], history: legacy });
+    expect(same.action).toBe('stop');
+    expect(same.stopReason).toBe('no-progress');
+  });
+
+  test('noPrStreakKey — 공백·대소문자·끝 구두점만 정리하고 feature 가 없으면 빈 키', () => {
+    expect(noPrStreakKey('  Fix   It. ')).toBe('fix it');
+    expect(noPrStreakKey('Fix it?!…')).toBe('fix it');
+    expect(noPrStreakKey('fix it · v2')).toBe('fix it · v2');
+    expect(noPrStreakKey(undefined)).toBe('');
   });
 });

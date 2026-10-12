@@ -37,6 +37,8 @@ function fixture() {
       prHead: async (_pr: number, _cwd?: string): Promise<{ head: string; state: string } | null> => ({ head, state: 'OPEN' }),
       requestReview: async (pr: number, intent: string, _cwd?: string): Promise<void> => { reviews.push({ pr, intent }); },
     },
+    // TA-WIRING-CHECK — 병합 PR 배선 관측이 실물 `gh pr diff` 로 나가지 않게(밀폐).
+    wiring: { prDiff: () => '', loadLedger: () => null },
   });
   return { statePath, logs, reviews, deps, setHead: (next: string) => { head = next; }, commands: () => commands };
 }
@@ -58,7 +60,9 @@ describe('TA-JUDGE-LIVE-SAFE — 안전한 수만 실제로', () => {
       expect(absent.executorResult === null || absent.executorResult === 'shadow').toBe(true);
     }
     expect(f.reviews).toHaveLength(0);
-    expect(f.logs.every((entry) => entry.event === 'shadow-move' && entry.data.live === false && entry.data.liveExecuted === false)).toBe(true);
+    // TA-WIRING-CHECK — 병합 PR 은 판단 뒤 wiring-shadow 관측 한 줄을 더 남긴다(move 불변 · 관측 전용).
+    expect(f.logs.filter((entry) => entry.event === 'wiring-shadow')).toHaveLength(1);
+    expect(f.logs.filter((entry) => entry.event !== 'wiring-shadow').every((entry) => entry.event === 'shadow-move' && entry.data.live === false && entry.data.liveExecuted === false)).toBe(true);
     const card = readTaskCard('ta-live-1', f.statePath)!;
     expect(card.greenProposal).toBeUndefined();
     expect(card.reviewRequests).toBeUndefined();
@@ -90,7 +94,7 @@ describe('TA-JUDGE-LIVE-SAFE — 안전한 수만 실제로', () => {
     const card = readTaskCard('ta-live-1', f.statePath)!;
     expect(card.greenProposal).toBeUndefined();
     expect(card.reviewRequests).toBeUndefined();
-    expect(f.logs.map((entry) => [entry.event, entry.data.live, entry.data.liveExecuted])).toEqual([['shadow-move', false, false], ['shadow-move', false, false]]);
+    expect(f.logs.filter((entry) => entry.event !== 'wiring-shadow').map((entry) => [entry.event, entry.data.live, entry.data.liveExecuted])).toEqual([['shadow-move', false, false], ['shadow-move', false, false]]);
   });
 
   test("['propose-green'] + 병합 근거 → 제안 한 번 · 리뷰는 안 한다 · 체크리스트 명령 0", async () => {

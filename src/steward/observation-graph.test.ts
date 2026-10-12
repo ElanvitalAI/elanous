@@ -46,9 +46,11 @@ globalThis.fetch = async (_url, init) => {
 const outbound = await import(${JSON.stringify(join(repo, 'src/domains/outbound-alert.ts'))});
 mock.module(${JSON.stringify(join(repo, 'src/domains/outbound-alert.ts'))}, () => ({ ...outbound, deliver: () => true }));
 `);
-    writeFileSync(join(dir, 'recipes.yaml'), stringify(Object.fromEntries(stages.map(name => [
+    // TA-REJUDGE-PERIODIC — the rejudge node runs as installed (no config in the isolated universe → disabled, no rejudge).
+    expect(installed.nodes[0]?.node_id === 'rejudge' && recipes['steward-rejudge']?.command).toContain('src/steward/rejudge-tick.ts');
+    writeFileSync(join(dir, 'recipes.yaml'), stringify({ 'steward-rejudge': recipes['steward-rejudge'], ...Object.fromEntries(stages.map(name => [
       `steward-${name}`, { ...recipes[`steward-${name}`], command: `bun --preload ${JSON.stringify(preload)} ${recipes[`steward-${name}`]!.command.slice(4)}` },
-    ]))));
+    ])) }));
     const isolated = join(root, '.elanous-test');
     const stateDir = join(isolated, 'steward');
     mkdirSync(stateDir, { recursive: true });
@@ -58,7 +60,7 @@ mock.module(${JSON.stringify(join(repo, 'src/domains/outbound-alert.ts'))}, () =
     expect(run.code, `${run.stderr}\n${run.stdout}`).toBe(0);
     const result = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { status: string; path: string[] };
     expect(result.status).toBe('done');
-    expect(result.path).toEqual(['sync', 'triage', 'schedule', 'report', 'done']);
+    expect(result.path).toEqual(['rejudge', 'sync', 'triage', 'schedule', 'report', 'done']);
     expect(existsSync(join(isolated, 'logs', 'logs.db')), run.stdout).toBe(true);
     const tickLookup = await command(['bun', cli, `--test=${isolated}`, 'logs', '--category', 'loop.steward', '--event', 'decision', '--json', '--json-data', '--limit', '20'], root);
     expect(tickLookup.code, `${tickLookup.stderr}\n${tickLookup.stdout}`).toBe(0);
@@ -66,6 +68,10 @@ mock.module(${JSON.stringify(join(repo, 'src/domains/outbound-alert.ts'))}, () =
     expect(tickRows.filter(row => row.category === 'loop.steward' && row.event === 'decision').map(row => [row.data?.verdict, row.data?.reason, row.data?.goalId])).toEqual([
       ['reported', 'daily digest sent', undefined],
     ]);
+    const rejudgeLookup = await command(['bun', cli, `--test=${isolated}`, 'logs', '--category', 'loop.steward', '--event', 'rejudge-tick', '--json', '--json-data', '--limit', '20'], root);
+    expect(rejudgeLookup.code, `${rejudgeLookup.stderr}\n${rejudgeLookup.stdout}`).toBe(0);
+    expect(rejudgeLookup.stdout.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line) as { event?: string; data?: { decision?: string } })
+      .filter(row => row.event === 'rejudge-tick').map(row => row.data?.decision)).toEqual(['disabled']);
     const lookup = await command(['bun', cli, `--test=${isolated}`, 'logs', '--category', 'steward.', '--event', 'decision', '--json', '--json-data', '--limit', '20'], root);
     expect(lookup.code, `${lookup.stderr}\n${lookup.stdout}`).toBe(0);
     const records = lookup.stdout.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line) as { category?: string; event?: string; data?: { kind: string; target: string; wouldAct: boolean } });

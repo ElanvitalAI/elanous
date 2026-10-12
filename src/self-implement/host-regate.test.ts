@@ -1,9 +1,10 @@
-import { afterAll, describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, spyOn, test } from 'bun:test';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, realpathSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireSlot, defaultInterference, needsPwaBuild, runHostRegate, type HostRegateDeps } from './host-regate.js';
+import { regateFailureFacts } from './regate-detail.js';
 import { MAX_INSPECTED_TEST_FILES } from '../../scripts/ci-test-interference-gate.js';
 import { releasePathHoldComment } from '../self-dev/release-path-guard.js';
 import { enableLandingFreeze, disableLandingFreeze } from '../release-loop/landing-freeze.js';
@@ -11,6 +12,7 @@ import { sweepFrozenMerges } from './frozen-merges.js';
 import { syncMergedPrChecklist } from '../release-loop/merged-pr-checklist.js';
 import { addItem, listChecklist } from '../release-loop/checklist.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { debug } from '../debug/log.js';
 
 const testFreezeRoot = mkdtempSync(join(tmpdir(), 'host-regate-freeze-'));
 afterAll(() => rmSync(testFreezeRoot, { recursive: true, force: true }));
@@ -185,7 +187,7 @@ describe('host regate: never merge without a measured host pass', () => {
       expect(snapshot.items.find(({ id }) => id === 'X')).toMatchObject({ id: 'X', evidence: '#42', status: 'yellow' });
       expect(snapshot.history.filter(({ field }) => field === 'evidence.add')).toHaveLength(1);
       expect(snapshot.history.filter(({ field }) => field === 'status')).toHaveLength(0);
-      expect(events).toEqual(['merged-pr-evidence-added']);
+      expect(events).toEqual(['merged-pr-cell-source', 'merged-pr-evidence-added']);
     } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -428,6 +430,38 @@ describe('host regate: never merge without a measured host pass', () => {
     expect(calls.filter((call) => call.startsWith('gh pr comment')).length).toBe(1);
   });
 
+  test('merge rejected by a base race: explicit reason wins even if the head moves before the re-read (HOST-REGATE-REASON-LOST)', async () => {
+    const { deps, calls } = mock();
+    const command = deps.command!;
+    const reason = 'GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest)';
+    let rejected = false;
+    deps.command = (bin, args, cwd, env) => {
+      if (bin === 'gh' && args[1] === 'merge') { rejected = true; return { status: 1, stdout: '', stderr: `${'warning: noise\n'.repeat(60)}${reason}` }; }
+      if (rejected && bin === 'gh' && args.join(' ') === 'pr view 42 --json headRefOid,baseRefName,baseRefOid,state,isDraft') return { status: 0, stdout: JSON.stringify({ headRefOid: 'e'.repeat(40), baseRefName: 'main', baseRefOid: BASE, state: 'OPEN', isDraft: false }), stderr: '' };
+      return command(bin, args, cwd, env);
+    };
+    const result = await runHostRegate(input, deps);
+    expect(result.failures[0]).toMatchObject({ step: 'merge', expectedHead: HEAD, actualHead: 'e'.repeat(40), mergeFailureKind: 'base-modified' });
+    expect(result.failures[0]?.detail.endsWith(reason)).toBe(true);
+    const comment = calls.find((call) => call.startsWith('gh pr comment'));
+    expect(comment).toContain(`kind=base-modified · expectedHead=${HEAD} · actualHead=${'e'.repeat(40)}`);
+    // The comment keeps the tail too — the GraphQL reason after 60 noise lines is not cut at 180 characters.
+    expect(comment).toContain(reason);
+  });
+
+  test('merge rejected after the head moved: actual head differs and kind is head-moved', async () => {
+    const { deps } = mock();
+    const command = deps.command!;
+    let merged = false;
+    deps.command = (bin, args, cwd, env) => {
+      if (bin === 'gh' && args[1] === 'merge') { merged = true; return { status: 1, stdout: '', stderr: 'GraphQL: Pull request is not mergeable' }; }
+      if (merged && bin === 'gh' && args.join(' ') === 'pr view 42 --json headRefOid,baseRefName,baseRefOid,state,isDraft') return { status: 0, stdout: JSON.stringify({ headRefOid: 'e'.repeat(40), baseRefName: 'main', baseRefOid: BASE, state: 'OPEN', isDraft: false }), stderr: '' };
+      return command(bin, args, cwd, env);
+    };
+    const result = await runHostRegate(input, deps);
+    expect(result.failures[0]).toMatchObject({ step: 'merge', expectedHead: HEAD, actualHead: 'e'.repeat(40), mergeFailureKind: 'head-moved' });
+  });
+
   test('merge call returns 0 but PR is not MERGED: unmeasured, not passed', async () => {
     const { deps } = mock();
     const command = deps.command!;
@@ -508,6 +542,57 @@ describe('host regate: never merge without a measured host pass', () => {
     expect(result).toMatchObject({ passed: false, failures: [{ step: 'merge-conflict' }] });
     expect(calls.some((call) => call.startsWith('bun scripts/ci-typecheck-changed.ts'))).toBe(false);
     expect(calls.some((call) => call.startsWith('gh pr merge'))).toBe(false);
+  });
+
+  test('integration conflict records the unmerged files before the slot reset (HOST-REGATE-REASON-LOST)', async () => {
+    const { deps, calls } = mock();
+    const command = deps.command!;
+    deps.command = (bin, args, cwd, env) => {
+      const call = `${bin} ${args.join(' ')}`;
+      if (call === `git merge --no-ff --no-commit ${HEAD}`) { calls.push(call); return { status: 1, stdout: '', stderr: 'CONFLICT (content): Merge conflict in src/x.ts\nAutomatic merge failed' }; }
+      if (call === 'git diff --name-only -z --diff-filter=U') { calls.push(call); return { status: 0, stdout: ' src/leading.ts\0src/y.ts\0src/x.ts\0src/한글 name.ts\0', stderr: '' }; }
+      return command(bin, args, cwd, env);
+    };
+    const result = await runHostRegate(input, deps);
+    expect(result.failures[0]).toMatchObject({ step: 'merge-conflict', expectedHead: HEAD, conflictFiles: [' src/leading.ts', 'src/x.ts', 'src/y.ts', 'src/한글 name.ts'], mergeFailureKind: 'conflict' });
+    expect(calls.find((call) => call.startsWith('gh pr comment'))).toContain('conflicts= src/leading.ts,src/x.ts,src/y.ts,src/한글 name.ts');
+    expect(calls.indexOf('git diff --name-only -z --diff-filter=U')).toBeLessThan(calls.indexOf('git reset --hard'));
+  });
+
+  test('integration conflict falls back to the CONFLICT lines when the unmerged list is empty', async () => {
+    const { deps } = mock();
+    const command = deps.command!;
+    deps.command = (bin, args, cwd, env) => (bin === 'git' && args.join(' ') === `merge --no-ff --no-commit ${HEAD}`
+      ? { status: 1, stdout: '', stderr: 'CONFLICT (content): Merge conflict in src/x.ts\nCONFLICT (modify/delete): src/z.ts deleted in HEAD and modified in aaaa.' }
+      : bin === 'git' && args.join(' ') === 'diff --name-only -z --diff-filter=U'
+        ? { status: 0, stdout: '', stderr: '' }
+        : command(bin, args, cwd, env));
+    expect((await runHostRegate(input, deps)).failures[0]?.conflictFiles).toEqual(['src/x.ts', 'src/z.ts']);
+  });
+
+  test('long merge stdout retains every conflict when unmerged lookup fails', async () => {
+    const { deps, calls } = mock();
+    const command = deps.command!;
+    const paths = Array.from({ length: 202 }, (_, i) => `src/conflict-${String(i).padStart(3, '0')}.ts`);
+    const output = `${'noise\n'.repeat(1500)}${paths.map((path) => `CONFLICT (content): Merge conflict in ${path}`).join('\n')}\nmerge failed`;
+    deps.command = (bin, args, cwd, env) => {
+      const call = `${bin} ${args.join(' ')}`;
+      if (call === `git merge --no-ff --no-commit ${HEAD}`) { calls.push(call); return { status: 1, stdout: output, stderr: 'Automatic merge failed' }; }
+      if (call === 'git diff --name-only -z --diff-filter=U') { calls.push(call); return { status: 128, stdout: '', stderr: 'diff unavailable' }; }
+      return command(bin, args, cwd, env);
+    };
+    const failure = (await runHostRegate(input, deps)).failures[0]!;
+    expect(failure.conflictFiles).toEqual(paths);
+    expect(regateFailureFacts(failure)).toMatchObject({ conflictFiles: paths.slice(0, 200), conflictFilesOmitted: 2 });
+    expect(calls.find((call) => call.startsWith('gh pr comment'))).toContain(' +197 more (total 202)');
+  });
+
+  test('merge step failure with no unmerged path and no CONFLICT line is not called a conflict', async () => {
+    const { deps } = mock();
+    const command = deps.command!;
+    deps.command = (bin, args, cwd, env) => (bin === 'git' && args.join(' ') === `merge --no-ff --no-commit ${HEAD}`
+      ? { status: 128, stdout: '', stderr: 'fatal: refusing to merge unrelated histories' } : command(bin, args, cwd, env));
+    expect((await runHostRegate(input, deps)).failures[0]).toMatchObject({ step: 'merge-conflict', conflictFiles: [], mergeFailureKind: 'other' });
   });
 
   test('interference failure: no merge, a single-line failure comment', async () => {
@@ -609,6 +694,8 @@ describe('host regate: never merge without a measured host pass', () => {
     } });
     const result = await runHostRegate(input, deps);
     expect(result.failures[0]?.step).toBe('pr-head');
+    expect(result.failures[0]).toMatchObject({ expectedHead: HEAD, actualHead: 'd'.repeat(40) });
+    expect(calls.find((call) => call.startsWith('gh pr comment'))).toContain(`expectedHead=${HEAD} · actualHead=${'d'.repeat(40)}`);
     expect(calls.some((call) => call.startsWith('git worktree add'))).toBe(false);
     expect(calls.some((call) => call.startsWith('gh pr merge'))).toBe(false);
   });
@@ -1001,7 +1088,147 @@ describe('host regate interference: neighbour tests never push the selection ove
     await runHostRegate(input, deps);
     const entry = logged.find((l) => l.event === 'unmeasured');
     expect(entry?.data.failedStep).toBe('test-interference');
-    expect(entry?.data.detail).toBe(`x${'y'.repeat(299)}`);
+    // HOST-REGATE-REASON-LOST (2nd): the log keeps the bounded detail (head ⊕ tail ≤ 4KB), no longer the first 300 characters.
+    expect(entry?.data.detail).toBe(`x${'y'.repeat(400)}`);
     expect(entry?.data.neighborsTrimmed).toBe(12);
+  });
+});
+
+describe('host regate interference: changed sources select reverse importers before folder neighbors', () => {
+  const roots: string[] = [];
+  afterAll(() => { for (const root of roots) rmSync(root, { recursive: true, force: true }); });
+
+  function repo(files: Record<string, string>): string {
+    const root = mkdtempSync(join(tmpdir(), 'host-regate-importers-'));
+    roots.push(root);
+    for (const [path, content] of Object.entries(files)) {
+      mkdirSync(join(root, path, '..'), { recursive: true });
+      writeFileSync(join(root, path), content);
+    }
+    execFileSync('git', ['init', '-q'], { cwd: root });
+    execFileSync('git', ['add', '-A'], { cwd: root });
+    return root;
+  }
+
+  const measured = (paths: readonly string[]) => ({
+    order: [...paths], isolated: [], combined: { status: 'measured', fail: 0 }, status: 'no-interference',
+    isolatedFailures: 0, combinedFailures: 0, difference: 0,
+  }) as never;
+
+  test('a changed source selects a cross-folder importing test even with no changed test files', async () => {
+    const root = repo({
+      'src/a.ts': 'export const value = 1;\n',
+      'test/x.test.ts': "import '../src/a.ts';\n",
+    });
+    const selected: string[][] = [];
+    const verdict = await defaultInterference(['src/a.ts'], root, {
+      run: async (paths) => {
+        selected.push([...paths]);
+        return { stdout: 'Ran 1 test across 1 file\n0 fail', stderr: '', exitCode: 0, signal: null };
+      },
+    });
+    expect(verdict.passed).toBe(true);
+    expect(selected).toEqual([['test/x.test.ts']]);
+  });
+
+  test('changed tests take priority over importer tests, which take priority over neighbors', async () => {
+    const files: Record<string, string> = {
+      'src/a.ts': 'export const value = 1;\n',
+      'test/x.test.ts': "import '../src/a.ts';\n",
+      'src/big/neighbor.test.ts': '',
+    };
+    const changedTests = Array.from({ length: MAX_INSPECTED_TEST_FILES - 1 }, (_, i) => `src/big/change-${i}.test.ts`);
+    for (const path of changedTests) files[path] = '';
+    const root = repo(files);
+    const seen: string[][] = [];
+    const verdict = await defaultInterference(['src/a.ts', ...changedTests], root, {
+      detect: async (paths) => { seen.push([...paths]); return measured(paths); },
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toHaveLength(MAX_INSPECTED_TEST_FILES);
+    expect(seen[0]).toEqual(expect.arrayContaining([...changedTests, 'test/x.test.ts']));
+    expect(seen[0]).not.toContain('src/big/neighbor.test.ts');
+    expect(verdict.importerTrimmed).toBeUndefined();
+    expect(verdict.neighborsTrimmed).toBe(1);
+  });
+
+  test('overflow keeps importers and trims folder neighbors first', async () => {
+    const files: Record<string, string> = {
+      'src/a.ts': 'export const value = 1;\n',
+      'src/big/change.test.ts': '',
+      'test/x.test.ts': "import '../src/a.ts';\n",
+    };
+    for (let i = 0; i < 8; i++) files[`src/big/neighbor-${i}.test.ts`] = '';
+    const root = repo(files);
+    const seen: string[][] = [];
+    const verdict = await defaultInterference(['src/a.ts', 'src/big/change.test.ts'], root, {
+      detect: async (paths) => { seen.push([...paths]); return measured(paths); },
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toHaveLength(MAX_INSPECTED_TEST_FILES);
+    expect(seen[0]).toContain('test/x.test.ts');
+    expect(seen[0].filter((path) => path.startsWith('src/big/neighbor-'))).toHaveLength(6);
+    expect(verdict.neighborsTrimmed).toBe(2);
+    expect(verdict.importerTrimmed).toBeUndefined();
+  });
+
+  test('records importer trimming when changed tests consume most of the cap', async () => {
+    const files: Record<string, string> = {
+      'src/a.ts': 'export const value = 1;\n',
+      'src/changed.test.ts': '',
+    };
+    for (let i = 0; i < MAX_INSPECTED_TEST_FILES + 1; i++) files[`test/importer-${i}.test.ts`] = "import '../src/a.ts';\n";
+    const root = repo(files);
+    const seen: string[][] = [];
+    const logged = spyOn(debug, 'log');
+    try {
+      const verdict = await defaultInterference(['src/a.ts', 'src/changed.test.ts'], root, {
+        detect: async (paths) => { seen.push([...paths]); return measured(paths); },
+      });
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toHaveLength(MAX_INSPECTED_TEST_FILES);
+      expect(seen[0]).toContain('src/changed.test.ts');
+      expect(seen[0].filter((path) => path.startsWith('test/importer-'))).toHaveLength(MAX_INSPECTED_TEST_FILES - 1);
+      expect(verdict.importerTrimmed).toBe(2);
+      expect(logged).toHaveBeenCalledWith('harness.host-regate', 'test-select', expect.objectContaining({
+        changed: 1, importers: MAX_INSPECTED_TEST_FILES - 1, neighbors: 0, trimmed: 2, importerTrimmed: 2,
+      }));
+    } finally { logged.mockRestore(); }
+  });
+
+  test('verifyOnly-style neighbors false adds neither importer nor folder neighbor tests', async () => {
+    const root = repo({
+      'src/a.ts': 'export const value = 1;\n',
+      'test/x.test.ts': "import '../src/a.ts';\n",
+    });
+    const logged = spyOn(debug, 'log');
+    try {
+      const verdict = await defaultInterference(['src/a.ts'], root, { neighbors: false });
+      expect(verdict.passed).toBe(true);
+      expect(logged).toHaveBeenCalledWith('harness.host-regate', 'test-select', {
+        changed: 0, importers: 0, neighbors: 0, trimmed: 0,
+      });
+    } finally { logged.mockRestore(); }
+  });
+
+  test('index construction failure preserves changed and folder-neighbor selection and records observation', async () => {
+    const root = repo({
+      'src/a.ts': 'export const value = 1;\n',
+      'src/area/change.test.ts': '',
+      'src/area/neighbor.test.ts': '',
+    });
+    const seen: string[][] = [];
+    const logged = spyOn(debug, 'log');
+    try {
+      const verdict = await defaultInterference(['src/a.ts', 'src/area/change.test.ts'], root, {
+        buildImporterTestIndex: () => null,
+        detect: async (paths) => { seen.push([...paths]); return measured(paths); },
+      });
+      expect(verdict.passed).toBe(true);
+      expect(seen).toEqual([['src/area/change.test.ts', 'src/area/neighbor.test.ts']]);
+      expect(logged).toHaveBeenCalledWith('harness.host-regate', 'test-select', expect.objectContaining({
+        changed: 1, importers: 0, neighbors: 1, trimmed: 0, observation: 'importer 못 셌다',
+      }));
+    } finally { logged.mockRestore(); }
   });
 });

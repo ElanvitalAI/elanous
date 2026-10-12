@@ -53,7 +53,7 @@ async function cli(args: string[]): Promise<{ output: string; errors: string; co
   } finally {
     console.log = log;
     console.error = error;
-    process.exitCode = exitCode;
+    process.exitCode = exitCode ?? 0;
   }
 }
 

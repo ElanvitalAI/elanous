@@ -365,6 +365,9 @@ export interface DispatchOptions {
   /** argv for the remote run (the tool re-invoked with `--local` so it never recurses). */
   remoteArgv: RemoteArgv;
   refs?: string[];
+  /** Exact commit to run remotely instead of the repo's HEAD (RELEASE-DAILY-LIGHT-RC ① — light-rc measures origin/main,
+   *  not the seat tree it was started from). */
+  commit?: string;
   installPwa?: boolean;
   payloadFiles?: PayloadFile[];
   json?: boolean;
@@ -413,7 +416,7 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
   let outcome: RemoteRunOutcome;
   for (;;) {
     try {
-      outcome = runOnRemote({ repo: opts.repo, host, mirror: settings.mirror, argv: opts.remoteArgv, refs: opts.refs, installPwa: opts.installPwa, payloadFiles: opts.payloadFiles, hostCap: settings.hostCap }, deps.runner);
+      outcome = runOnRemote({ repo: opts.repo, host, mirror: settings.mirror, argv: opts.remoteArgv, refs: opts.refs, ...(opts.commit !== undefined ? { commit: opts.commit } : {}), installPwa: opts.installPwa, payloadFiles: opts.payloadFiles, hostCap: settings.hostCap }, deps.runner);
     } catch (error) {
       outcome = { kind: 'infra', reason: `exception: ${error instanceof Error ? error.message : String(error)}` };
     }

@@ -15,6 +15,24 @@ function root(): string { const dir = mkdtempSync(join(tmpdir(), 'release-checkl
 afterEach(() => { resetElanousConfigDir(); for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('release checklist ledger', () => {
+  test('predecessors: an id from any version is accepted, an id from no version is refused on add and set (CELL-DEPENDS-ID)', () => {
+    root();
+    addItem('0.2.18', { id: 'BASE', title: 'base in another version' });
+    addItem('0.2.19', { id: 'SAME', title: 'base in this version' });
+    addItem('0.2.19', { id: 'DEP', title: 'depends across versions', predecessors: ['BASE', 'SAME'] });
+    expect(listChecklist('0.2.19').items.find((item) => item.id === 'DEP')?.predecessors).toEqual(['BASE', 'SAME']);
+    expect(() => addItem('0.2.19', { id: 'GHOST', title: 'ghost dep', predecessors: ['NO-SUCH-CELL'] })).toThrow('없는 선행 칸: NO-SUCH-CELL');
+    expect(listChecklist('0.2.19').items.some((item) => item.id === 'GHOST')).toBe(false);
+    const before = JSON.stringify(listChecklist('0.2.19').items.find((item) => item.id === 'DEP'));
+    expect(() => setItem('0.2.19', 'DEP', { predecessors: ['BASE', 'NO-SUCH-CELL'] }, 'MK')).toThrow(CliUserError);
+    expect(JSON.stringify(listChecklist('0.2.19').items.find((item) => item.id === 'DEP'))).toBe(before);
+    setItem('0.2.19', 'DEP', { predecessors: ['BASE'] }, 'MK');
+    expect(listChecklist('0.2.19').items.find((item) => item.id === 'DEP')?.predecessors).toEqual(['BASE']);
+    expect(() => setItem('0.2.19', 'DEP', { predecessors: ['DEP'] }, 'MK')).toThrow('잘못된 선행 칸');
+    setItem('0.2.19', 'DEP', { predecessors: [] }, 'MK');
+    expect(listChecklist('0.2.19').items.find((item) => item.id === 'DEP')?.predecessors).toEqual([]);
+  });
+
   test('refs: --ref adds real repo documents once, rejects missing paths, and stays absent on cells without refs', () => {
     root();
     addItem('0.2.18', { id: 'R1', title: 'refs cell', refs: ['package.json'] });

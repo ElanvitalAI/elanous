@@ -5,9 +5,15 @@ loop:
     cron: '*/15 8-23 * * *'
     events: [directive, linear-webhook]
 version: 1
-entry_node: sync
+entry_node: rejudge
 terminal_nodes: [done, failed]
 nodes:
+  # TA-REJUDGE-PERIODIC — `tasks rejudge --all` on a cadence (off unless taskAgent.rejudgeEveryMinutes > 0).
+  # First so a Linear outage in sync cannot starve it; either outcome continues to sync.
+  - node_id: rejudge
+    kind: agent
+    recipe: cmd:steward-rejudge
+    max_visits: 1
   - node_id: sync
     kind: agent
     recipe: cmd:steward-sync
@@ -31,6 +37,9 @@ nodes:
     kind: gate
     max_visits: 1
 edges:
+  - from: rejudge
+    on: outcome
+    map: { ok: sync, fail: sync }
   - from: sync
     on: outcome
     map: { ok: triage, fail: failed }

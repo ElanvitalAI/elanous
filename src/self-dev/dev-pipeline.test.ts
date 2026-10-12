@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import {
   planDevPipeline, runDevPipeline, toSelfImplementOptions, toAgentMissionSpec,
   resolveDevInputText, applyManualGoalEvidenceRequirement, DevPipelineError, WIRED_DISPATCHES, buildDefaultSelfImplementSeams, devResultOk,
-  selectUnmannedToolReviewer, unmannedToolReviewerRateFromConfig, DEFAULT_UNMANNED_TOOL_REVIEWER_RATE,
+  selectUnmannedToolReviewer, unmannedToolReviewerRateFromConfig, DEFAULT_UNMANNED_TOOL_REVIEWER_RATE, reviewRolePinnedForLaunch,
   buildAgentMissionDevSpec, executeAgentMissionReroute, acpBackendName, toAcpAgentArgs, normalizeAcpResult, defaultDispatchAcp,
   buildSelfImplementDevSpec, selfImplementExitCode, executeSelfImplementReroute,
   buildSelfImplementPlanDevSpec, executeSelfImplementPlanReroute,
@@ -3487,6 +3487,31 @@ describe('무인 경로 도구 리뷰어 고르기', () => {
     expect(picked.review.canSelfRead).toBe(true);
     expect(skipped.review.canSelfRead).toBe(false);
     expect(picked.review.canSelfRead).not.toBe(skipped.review.canSelfRead);
+  });
+
+  it('TOOL-REVIEWER-ROLE-PIN: ELANOUS_ROLE_LLM_REVIEW 고정이면 추첨이 뽑음을 내도 도구 리뷰어로 안 바꾸고 role-pinned 를 남긴다', async () => {
+    const previous = process.env.ELANOUS_ROLE_LLM_REVIEW;
+    process.env.ELANOUS_ROLE_LLM_REVIEW = JSON.stringify({ provider: 'openrouter', model: 'z-ai/glm-5.3' });
+    try {
+      for (const sample of [0, 0.05, 0.5]) {
+        const prepared = await prepareUnmannedReview({ toolReviewerRate: 1, toolReviewerSample: sample });
+        expect(prepared.review.canSelfRead).toBe(false);
+        expect(prepared.events).toEqual([expect.objectContaining({ picked: false, rate: 1, skipped: 'role-pinned', roleSource: 'environment' })]);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_ROLE_LLM_REVIEW;
+      else process.env.ELANOUS_ROLE_LLM_REVIEW = previous;
+    }
+    const unpinned = await prepareUnmannedReview({ toolReviewerRate: 1, toolReviewerSample: 0 });
+    expect(unpinned.review.canSelfRead).toBe(true);
+    expect(unpinned.events[0]).not.toHaveProperty('skipped');
+  });
+
+  it('TOOL-REVIEWER-ROLE-PIN: 발사 고정(flag·environment)만 고정이고 config 기본·기준선은 추첨을 유지한다', () => {
+    expect(reviewRolePinnedForLaunch('flag')).toBe(true);
+    expect(reviewRolePinnedForLaunch('environment')).toBe(true);
+    expect(reviewRolePinnedForLaunch('config-role')).toBe(false);
+    expect(reviewRolePinnedForLaunch('default')).toBe(false);
   });
 
   it('호출자가 llmReview 를 주입하면 고르기를 건너뛰고 선언하지 않는다', async () => {

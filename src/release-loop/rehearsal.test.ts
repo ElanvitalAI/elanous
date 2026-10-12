@@ -20,7 +20,7 @@ const roots: string[] = [];
 const newRoot = () => { const root = mkdtempSync(join(tmpdir(), 'release-rehearsal-')); roots.push(root); return root; };
 afterEach(() => { resetElanousConfigDir(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const stamp = (root: string, step: StepId) => JSON.parse(readFileSync(join(root, 'release', schedule.version, 'rehearsal', `${step}.json`), 'utf8'));
-const rc = (overrides: Partial<LightRcResult> = {}): LightRcResult => ({ version: schedule.version, base: 'abc', introduced: 0, preexisting: 3, unclassified: 0, alwaysInclude: 1, alwaysIncludeMissing: [], shards: 4, remote: 'node-b', gateExitCode: 0, ok: true, ...overrides });
+const rc = (overrides: Partial<LightRcResult> = {}): LightRcResult => ({ version: schedule.version, base: 'abc', measuredCommit: 'c'.repeat(40), worktreeHead: 'c'.repeat(40), importerTests: 0, unmeasured: null, introduced: 0, preexisting: 3, unclassified: 0, alwaysInclude: 1, alwaysIncludeMissing: [], shards: 4, remote: 'node-b', gateExitCode: 0, ok: true, ...overrides });
 function harness(now: Date, result: LightRcResult = rc(), dirty = false) {
   const calls: string[] = [], notifications: string[] = [], gitCalls: string[] = [];
   const deps: RehearsalDeps = {
@@ -449,7 +449,7 @@ test('CLI apply accepts injected clock and checkout, emits one JSON result and c
     await cli.parseAsync(['release', 'rehearsal', 'tick', '--apply', '--checkout', '/fake/checkout', '--json'], { from: 'user' });
     await cli.parseAsync(['release', 'rehearsal', 'tick', '--apply', '--checkout', '/fake/checkout', '--json'], { from: 'user' });
     expect(process.exitCode).toBe(0);
-  } finally { process.exitCode = exit; process.stdout.write = original; console.error = oldError; }
+  } finally { process.exitCode = exit ?? 0; process.stdout.write = original; console.error = oldError; }
   expect(output).toHaveLength(2);
   expect(JSON.parse(output[0]!)).toMatchObject({ ok: true, status: 'due', stamps: [{ outcome: 'ok' }] });
   expect(JSON.parse(output[1]!)).toMatchObject({ ok: true, status: 'not-yet' });
@@ -474,7 +474,7 @@ test('CLI apply reports unmeasured and no-checkout as failures without suppressi
       await cli.parseAsync(['release', 'rehearsal', 'tick', '--apply', ...(missing ? [] : ['--checkout', '/fake/checkout']), '--json'], { from: 'user' });
       expect(process.exitCode).toBe(1);
     } finally {
-      process.exitCode = exit;
+      process.exitCode = exit ?? 0;
       process.stdout.write = original;
       console.error = oldError;
       if (env === undefined) delete process.env.ELANOUS_REHEARSAL_GIT_CWD; else process.env.ELANOUS_REHEARSAL_GIT_CWD = env;
@@ -506,7 +506,7 @@ test('CLI exposes failed notification in JSON and retries delivery without rerun
     await cli.parseAsync(['release', 'rehearsal', 'tick', '--apply', '--checkout', '/fake/checkout', '--json'], { from: 'user' });
     expect(process.exitCode).toBe(0);
     expect(JSON.parse(output[1]!)).toMatchObject({ ok: true, notificationFailures: 0 });
-  } finally { process.exitCode = exit; process.stdout.write = original; console.error = oldError; }
+  } finally { process.exitCode = exit ?? 0; process.stdout.write = original; console.error = oldError; }
   expect(h.calls).toEqual([schedule.version]);
   expect(h.notifications).toHaveLength(1);
 });
@@ -524,7 +524,7 @@ test('CLI apply marks a failed RC gate as failed JSON, not a successful rehearsa
     console.error = () => {};
     await cli.parseAsync(['release', 'rehearsal', 'tick', '--apply', '--checkout', '/fake/checkout', '--json'], { from: 'user' });
     expect(process.exitCode).toBe(1);
-  } finally { process.exitCode = exit; process.stdout.write = original; console.error = oldError; }
+  } finally { process.exitCode = exit ?? 0; process.stdout.write = original; console.error = oldError; }
   expect(output).toHaveLength(1);
   expect(JSON.parse(output[0]!)).toMatchObject({ ok: false, stamps: [{ outcome: 'error', result: { ok: false, gateExitCode: 1 } }] });
   expect(h.notifications).toHaveLength(1);

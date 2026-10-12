@@ -74,7 +74,7 @@ test('intake ingest aliases merge with canonical seat, and unknown seats fail wi
       expect(process.exitCode).toBe(2);
       expect(errors).toEqual(['알 수 없는 자리: INVALID']);
       expect(listIntakeItems(root)).toHaveLength(1);
-    } finally { console.error = original; process.exitCode = oldExit; }
+    } finally { console.error = original; process.exitCode = oldExit ?? 0; }
   } finally {
     if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = previous;

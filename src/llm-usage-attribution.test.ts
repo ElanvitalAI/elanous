@@ -1,7 +1,23 @@
 import { expect, spyOn, test } from 'bun:test';
 import { debug } from './debug/log.js';
+import { judgeGoalTurn } from './goals/judge.js';
+import { analyzeDiff } from './grok.js';
+import * as llm from './llm.js';
 import { PROVIDERS, streamLLM, type LLMProvider } from './llm.js';
 import { setUserConfigOverlay } from './user-config.js';
+
+function bypassProvider(name: string, model: string, text: string, usage: { inputTokens: number; outputTokens: number }): LLMProvider {
+  return {
+    name,
+    defaultModel: model,
+    available: () => true,
+    async *chat() { yield text; },
+    async *streamChat() {
+      yield { type: 'usage', usage };
+      yield { type: 'text', delta: text };
+    },
+  };
+}
 
 async function observeAttempts(run: () => Promise<unknown>) {
   const done: Record<string, unknown>[] = [];
@@ -116,5 +132,45 @@ test('streamLLM attributes a 503 failure and fallback success to their respectiv
     for (const provider of Object.values(PROVIDERS)) provider.streamChat = originalStreams.get(provider.name);
     grokAvailable.mockRestore();
     setUserConfigOverlay(null);
+  }
+});
+
+test('judge and grok bypass paths each leave one llm.usage row', async () => {
+  const judgeProvider = bypassProvider(
+    'judge-bypass',
+    'judge-model',
+    '{"verdict":"continue","summary":"still working","confidence":0.8}',
+    { inputTokens: 9, outputTokens: 4 },
+  );
+  const grokProvider = bypassProvider(
+    'grok-bypass',
+    'grok-model',
+    '{"deltas":[],"summary":"ok"}',
+    { inputTokens: 6, outputTokens: 2 },
+  );
+  const resolve = spyOn(llm, 'resolveDefaultProvider').mockReturnValue(judgeProvider);
+  const getForConfig = spyOn(llm, 'getProviderForConfig').mockReturnValue(grokProvider);
+  const anyAvail = spyOn(llm, 'anyProviderAvailable').mockReturnValue(true);
+  try {
+    const observed = await observeAttempts(async () => {
+      await judgeGoalTurn({ objective: 'x', lastAssistantTurn: 'y' });
+      await analyzeDiff({
+        skillName: 's',
+        server: 'h',
+        service: 'svc',
+        localOnly: [],
+        remoteOnly: [],
+        modified: [],
+        envDeltas: [],
+      });
+    });
+    expect(observed.usage).toEqual([
+      expect.objectContaining({ site: 'goals.judge', model: 'judge-model', billingProvider: 'judge-bypass', inputTokens: 9, outputTokens: 4 }),
+      expect.objectContaining({ site: 'grok.direct', model: 'grok-model', billingProvider: 'grok-bypass', inputTokens: 6, outputTokens: 2 }),
+    ]);
+  } finally {
+    resolve.mockRestore();
+    getForConfig.mockRestore();
+    anyAvail.mockRestore();
   }
 });

@@ -18,6 +18,7 @@ import {
   parseGateLogTestRuns,
   type PrEvidenceInput,
 } from './pr-evidence-artifact.js';
+import { REVIEW_DEFERRED_TO_HOST_MERGE_REASON } from './review-deferred-to-host.js';
 import { assessImplementationArtifactCompleteness } from './implementation-artifact-completeness.js';
 import { runContractAtNode, type RunContract } from './graph-run-contract.js';
 export {
@@ -91,6 +92,7 @@ import { classifyError } from '../session-runtime/retry-policy.js';
 import { decomposeSelfDevGoal, inferHotPaths, type SelfDevDecomposeOptions } from '../self-dev/decompose.js';
 import { boundaryGlobs, boundaryViolations } from './goal-boundary.js';
 import { askAtExecution, type ExecutionClarificationResult } from './execution-clarification.js';
+import { classifyOutOfScope } from './scope-adjacency.js';
 import { targetScopedGoalText } from './goal-text-path-scope.js';
 import { dropStaleReverts, type RevertGuardResult } from './revert-guard.js';
 import type { SelfDevGoalType } from '../self-dev/orchestrate.js';
@@ -157,10 +159,11 @@ import { resolveAdaptiveMaxReworkDecision, resolveEscalateTier, resolveEscalateT
 import type { SupervisionReworkSource } from './supervision-vocabulary.js';
 import { classifyReworkBudgetShadow } from './classify-shadow.js';
 import { createReworkBudgetJudgment, REWORK_BUDGET_JUDGMENT, reworkBudgetEvidenceForObservation, reworkBudgetWorkflow } from './rework-budget-judgment.js';
+import { formatGateFailedId, type PremiseReviewCard, type PremiseReviewInput } from './premise-review.js';
 import { runWorkflowToCompletion } from '../workflow-runtime/executor.js';
 import { mapReworkVerdict, supervisionObservationFields } from './supervision-vocabulary.js';
 import { resolveRunOutcome } from './run-outcome.js';
-import { authorLimitationCountFromGoal, harvestEvidenceLines, harvestedEvidenceObservation, MAX_HARVESTED_EVIDENCE_CHARS, parseOffDiffEvidence, requiredEvidenceFromGoal, runRequiredEvidenceChecks, coverRequiredEvidence, formatUncoveredEvidenceFeedback, type OffDiffEvidenceParse } from './off-diff-evidence.js';
+import { authorLimitationCountFromGoal, harvestEvidenceLines, harvestedEvidenceObservation, MAX_HARVESTED_EVIDENCE_CHARS, parseOffDiffEvidence, requiredEvidenceFromGoal, runRequiredEvidenceChecks, coverRequiredEvidence, settleUncoveredEvidence, formatUncoveredEvidenceFeedback, type OffDiffEvidenceParse } from './off-diff-evidence.js';
 import { pressDecisionSignals, type DecisionSignalPressResult } from './decision-signal-press.js';
 import { inspectDecisionObservations, inspectDecisionSignalKinds, inspectDecisionSignalObservations } from '../../scripts/ask-marker-check.js';
 
@@ -580,6 +583,8 @@ export interface SelfImplementReview {
   reviewed: boolean;
   /** 리뷰가 실행되지 않은 실패 사유. 리뷰 엔진이 제공한 경우에만 관측으로 전달한다. */
   failureReason?: string;
+  /** REVIEW-ACP-POD ②-b — 리뷰를 발사 호스트(Claude ACP)로 미뤘다. `reviewed` 는 거짓 그대로다(통과가 아니다). */
+  deferredToHost?: true;
   /** 리뷰 엔진이 실제로 사용한 diff 예산. 없는 값은 미검토/no-diff 등으로, 완전한 diff의 증거가 아니다. */
   diffTruncated?: boolean;
   diffShownChars?: number;
@@ -817,11 +822,20 @@ function declaredPathsFromGoalDocumentText(document: string): { readable: boolea
   if (originalAsk === null) return { readable: false, paths: [] };
   const declared = parseDeclaredTargetPathsFromAsk(originalAsk);
   if (!declared.readable) return declared;
-  const newFiles = originalAsk.split(/\r?\n/).flatMap((line) => {
+  const newFiles = declaredNewFilePaths(originalAsk);
+  return newFiles.length > 0 ? { readable: true, paths: [...new Set([...declared.paths, ...newFiles])] } : declared;
+}
+
+function declaredNewFilePaths(askText: string): readonly string[] {
+  return askText.split(/\r?\n/).flatMap((line) => {
     const match = DECLARED_NEW_FILES_LINE.exec(line);
     return match ? parseDeclaredTargetPathsFromAsk(`대상 경로: ${match[1]}`).paths : [];
   });
-  return newFiles.length > 0 ? { readable: true, paths: [...new Set([...declared.paths, ...newFiles])] } : declared;
+}
+
+/** P3 전제의 경계 — ask 머리줄 «대상 경로:» ⊕ «신설:» 줄의 합집합. 못 읽으면 빈 목록(그때 P3 는 unknown). */
+function declaredPremiseScopePaths(askText: string): string[] {
+  return [...new Set([...parseDeclaredTargetPathsFromAsk(askText).paths, ...declaredNewFilePaths(askText)])];
 }
 
 /** Only paths explicitly designated as targets in the ask or piece text protect an intentional revert. */
@@ -6446,7 +6460,21 @@ async function runSelfImplementInner(
         judgmentStarted = true;
         const judgmentCallLLM = s.judgmentCallLLM;
         if (diagnosedDecision?.verdict !== 'CONTRACT-CONFLICT' && !judgmentCallLLM) throw new Error('rework-budget@v1 requires a judgment provider');
-        const judgmentProvider = judgmentCallLLM ? createReworkBudgetJudgment(judgmentCallLLM) : undefined;
+        // FLEX-RFC §A-③ — UNCONVERGEABLE 직전의 전제 되짚기 입력. 이 루프 뒤쪽 «flex-signals» 관측(6895~)과 같은
+        // 실제 런 값으로 조립한다. 이 생산 배선이 없으면 카드는 시험에서만 세워지고 원장에는 남지 않는다.
+        const premiseLatestEntry = roundSummaryEntries[roundSummaryEntries.length - 1];
+        const premiseInput: PremiseReviewInput = {
+          runId,
+          gateFailedIdsByRound: premiseLatestEntry?.kind === 'gate'
+            ? roundSummaryEntries.filter((entry) => entry.kind === 'gate').map((entry) => entry.failedIds)
+            : [],
+          failureAttributions: reworkKind === 'gate' && gate ? gate.baselineFailures?.map(({ attribution }) => attribution) : undefined,
+          reviewRepeat,
+          round,
+          plannedRounds: effectiveMax,
+          targetPaths: declaredPremiseScopePaths(opts.feature),
+        };
+        const judgmentProvider = judgmentCallLLM ? createReworkBudgetJudgment(judgmentCallLLM, { premiseInput }) : undefined;
         try {
           const result = diagnosedDecision?.verdict === 'CONTRACT-CONFLICT'
             ? undefined
@@ -6628,6 +6656,17 @@ async function runSelfImplementInner(
             : { evidence: null };
           observe('rework-budget', { round, verdict: parsedDecision.verdict, reason: parsedDecision.reason.slice(0, 240), effectiveMaxBefore: before, effectiveMaxAfter: effectiveMax, carriedBudgetBefore, carriedBudgetAfter: judgedEffectiveMax, historyRounds: priorHistory.length, kind: reworkKind, applied: budgetDecision.applied, stopped: budgetDecision.stop, exit: budgetDecision.exit, shadowed: budgetDecision.shadowed === true, repeatedBlockingFindingCount: repeatedBlockingIds?.length ?? null, repeatedBlockingFindingIds: repeatedBlockingIds ?? null, normalizedRepeatedReviewFindingCount: recurrence?.normalizedRepeatedReviewFindingCount ?? null, ordinaryRepeatedReviewFindingCount: recurrence?.ordinaryRepeatedReviewFindingCount ?? null, previouslyDismissedRepeatedReviewFindingCount: recurrence?.previouslyDismissedRepeatedReviewFindingCount ?? null, citedReviewSymbolRepeatCount: recurrence?.citedReviewSymbolRepeatCount ?? null, citedReviewSymbolBaseNameRepeatCount: recurrence?.citedReviewSymbolBaseNameRepeatCount ?? null, reviewFindingComparableCount: recurrence?.comparableFindings ?? null, reviewFindingKeyRepeatCount: recurrence?.reviewFindingKeyRepeatCount ?? null, ...recurrenceDisagreementObservation, ...evidenceObservation, judgePredictedBefore: predictionAccuracyForObservation.predicted, judgeFulfilledBefore: predictionAccuracyForObservation.fulfilled, judgeMissedBefore: predictionAccuracyForObservation.missed, judgePendingBefore: predictionAccuracyForObservation.pending, ...(budgetDecision.shadowed ? { wouldExit: budgetDecision.wouldExit } : {}), ...(budgetDecision.contractConflictDisposition ? { contractConflictDisposition: budgetDecision.contractConflictDisposition } : {}), ...(pendingPlanRevision?.relaxation ? { contractConflictRelaxation: { ...pendingPlanRevision.relaxation, reason: pendingPlanRevision.reason, application: pendingPlanRevision.application?.status ?? 'failed' } } : {}), ...supervisionObservation }, { ...(budgetDecision.exit === 'blocked' ? { level: 'warn' as const } : {}), compact: { stringMax: 256, arrayMax: 6, maxDepth: 5 } });
           if (parsedDecision.verdict === 'UNCONVERGEABLE' && budgetDecision.stop && budgetDecision.exit === 'blocked') {
+            // FLEX-RFC §A-③(0.2.25 FLEX-PREMISE-REVIEW) — 확정된 UNCONVERGEABLE 의 전제 되짚기 카드를
+            // «별도 원장 사건»으로 남긴다. 카드는 판정 provider 가 UNCONVERGEABLE 을 «내기 전에» 세웠다
+            // (createReworkBudgetJudgment 가 premiseInput 으로 buildPremiseCard 를 부른다) — 이 자리는 그
+            // 카드를 원장에 옮기기만 한다. 카드가 없으면 사건도 없다.
+            const evidenceRecord: unknown = evidenceObservation.evidence;
+            const premiseReview = typeof evidenceRecord === 'object' && evidenceRecord !== null
+              ? (evidenceRecord as { premiseReview?: PremiseReviewCard }).premiseReview
+              : undefined;
+            if (premiseReview) {
+              observe('premise-review', { round, runId: premiseReview.runId, findings: premiseReview.findings, proposal: premiseReview.proposal ?? null }, { level: 'warn' as const, compact: { stringMax: 256, arrayMax: 6, maxDepth: 5 } });
+            }
             try {
               const shadow = inferDecompositionShadow(opts.feature);
               observe('decomposition-shadow', { round, ...shadow });
@@ -7130,8 +7169,12 @@ async function runSelfImplementInner(
     offDiffEvidence = parseOffDiffEvidence(evidenceText);
     const requiredEvidence = requiredEvidenceFromGoal(opts.feature);
     const limitationCount = authorLimitationCountFromGoal(opts.feature);
-    runRequiredEvidenceChecks(opts.feature, wt.path, runId);
-    const coverage = coverRequiredEvidence(requiredEvidence, offDiffEvidence.items);
+    const evidenceChecks = runRequiredEvidenceChecks(opts.feature, wt.path, runId);
+    const tagCoverage = coverRequiredEvidence(requiredEvidence, offDiffEvidence.items);
+    // EVIDENCE-WIRING-EXEMPT — a requirement whose own `|| bun test …` check passed is covered by what the harness measured.
+    const settledByCheck = settleUncoveredEvidence(tagCoverage.uncovered, { checks: evidenceChecks, required: requiredEvidence });
+    if (settledByCheck.coveredByCheck.length) debug.log('self-implement.evidence', 'covered-by-check', { round, tags: settledByCheck.coveredByCheck });
+    const coverage = { ...tagCoverage, uncovered: settledByCheck.uncovered, uncoveredCount: settledByCheck.uncovered.length };
     evidenceCoverage = requiredEvidence.length || limitationCount
       ? {
         required: requiredEvidence.length,
@@ -7226,21 +7269,35 @@ async function runSelfImplementInner(
       // 🩸 10-09: 범위 타입검사 임시 tsconfig(.elanous-typecheck-scope-*.json · scoped-typecheck-config.ts)가 옛 가지에 커밋된 뒤 지워지면
       //   «추적 파일 삭제» 라 impact=critical → 결정 카드가 «irreversible» 로 대표에게 갔다(D-20·35·43·80). 하니스 임시물은 범위 판정 밖이다.
       const scope = detectDeclaredScopeDiff({ goalDocument, changedFiles: gateRouteFiles?.filter(file => !harnessSeededPaths.includes(file) && !isHarnessTempArtifact(file)), nameCap: gateRouteFiles?.length });
-      if (scope.status === 'known' && scope.outsideCount !== null && scope.outsideCount > 0) {
-        const result: ExecutionClarificationResult = await (s.askExecutionClarification ?? askAtExecution)({
+      // SCOPE-HELD-DELIVER — no declared target means the declaration was unreadable (e.g. paths listed with spaces), not
+      // that every edit is outside it: treat it like an unknown declaration and go on to the gate.
+      if (scope.status === 'known' && scope.declaredCount === 0 && (scope.outsideCount ?? 0) > 0) {
+        observe('execution-scope-undeclared', { outsideCount: scope.outsideCount });
+        progress('implementing', `⚠️ 대상 경로를 하나도 못 읽었다 — 범위 밖 ${scope.outsideCount}개를 묻지 않고 게이트로 간다`);
+      } else if (scope.status === 'known' && scope.outsideCount !== null && scope.outsideCount > 0) {
+        const impact = scope.outsideNames.some(file => {
+          if (existsSync(join(wt.path, file))) return false;
+          const tracked = runGitCommand(wt.path, ['ls-files', '--error-unmatch', '--', file], { encoding: 'utf8', timeout: 20_000 });
+          return tracked.status === 0;
+        }) ? 'critical' : 'high';
+        const declaredPaths = declaredPathsFromGoalDocumentText(goalDocument!).paths;
+        const { adjacent, other } = classifyOutOfScope(scope.outsideNames, declaredPaths);
+        // Only edits next to a declared file, none of them a deletion: the gate judges them — nobody has to answer first.
+        const adjacentOnly = impact !== 'critical' && !scope.nameCapReached && other.length === 0 && adjacent.length === scope.outsideCount;
+        if (adjacentOnly) {
+          observe('execution-scope-adjacent-accepted', { outsideCount: scope.outsideCount, adjacent });
+          progress('implementing', `범위 밖 인접 편집 ${adjacent.length}개(대상과 같은 폴더) — 묻지 않고 게이트로 간다: ${adjacent.join(' · ')}`);
+        }
+        const result: ExecutionClarificationResult = adjacentOnly ? { choice: 'Expand scope', by: 'assumed' } : await (s.askExecutionClarification ?? askAtExecution)({
           id: 'execution_scope', decision: 'Changing files outside the authored target paths',
           prompt: 'Implementation changed files outside the authored target paths. Keep the original scope or expand it?',
           whyNow: 'Continuing to gate or publish these edits would expand the requested scope.',
-          impact: scope.outsideNames.some(file => {
-            if (existsSync(join(wt.path, file))) return false;
-            const tracked = runGitCommand(wt.path, ['ls-files', '--error-unmatch', '--', file], { encoding: 'utf8', timeout: 20_000 });
-            return tracked.status === 0;
-          }) ? 'critical' : 'high',
+          impact,
           options: [
             { label: 'Stay in scope', description: 'Do not accept out-of-scope changes.', recommended: true },
             { label: 'Expand scope', description: 'Accept the changed files outside the target paths.' },
           ],
-        }, { runId, outsideFiles: scope.outsideNames, outsideCount: scope.outsideCount, declaredPaths: declaredPathsFromGoalDocumentText(goalDocument!).paths }, { writeRunLedger: s.writeRunLedger });
+        }, { runId, outsideFiles: scope.outsideNames, outsideCount: scope.outsideCount, declaredPaths }, { writeRunLedger: s.writeRunLedger });
         if ('parked' in result || 'deferred' in result || result.choice !== 'Expand scope') {
           finalizeSupervisorDeliveries('execution-scope-not-approved');
           observe('execution-scope-held', { outsideCount: scope.outsideCount, disposition: 'parked' in result ? 'parked' : 'in-scope-only' });
@@ -7487,7 +7544,7 @@ async function runSelfImplementInner(
       }
       lastGateUnverifiedKey = unverifiedRepeatKey(gate.unverified);
       roundSummaryEntries.push({ round, kind: 'gate', tried: impl.summary.replace(/\s+/g, ' ').trim().slice(0, 200),
-        failedIds: gate.baselineFailures?.map(({ name, file, attribution }) => `${name}@${file ?? '?'} (${attribution})`),
+        failedIds: gate.baselineFailures?.map(formatGateFailedId),
         filesTouched: gateRouteFiles,
       });
       round++;
@@ -7831,6 +7888,14 @@ async function runSelfImplementInner(
         continue;
       }
     }
+    // EVIDENCE-WIRING-EXEMPT — a commandless [preservation] is covered once the changed-file gate passed.
+    if (gate.passed && evidenceCoverage?.uncoveredCount) {
+      const settledByGate = settleUncoveredEvidence(evidenceCoverage.uncovered, { gatePassed: true, required: requiredEvidenceFromGoal(opts.feature) });
+      if (settledByGate.coveredByGate.length) {
+        debug.log('self-implement.evidence', 'covered-by-gate', { round, tags: settledByGate.coveredByGate });
+        evidenceCoverage = { ...evidenceCoverage, uncovered: settledByGate.uncovered, uncoveredCount: settledByGate.uncovered.length };
+      }
+    }
     if (gate.passed && autoMergeEnabled(opts) && evidenceCoverage?.uncoveredCount && !uncoveredFeedbackUsed && round < effectiveMax) {
       const uncovered = [...evidenceCoverage.uncovered];
       const nextRound = round + 1;
@@ -7869,8 +7934,11 @@ async function runSelfImplementInner(
     ? { completionDisposition }
     : {};
   const reviewReal = !!review?.reviewed;
+  // REVIEW-ACP-POD ②-b — 호스트가 병합하는(mergeByHost) 런에서만 «미룬 리뷰»를 merge-ready 로 받는다. 판정은 호스트 ACP 리뷰가 한다.
+  //   ⛔ 그 밖의 런에선 종전 그대로 no-real-review(HITL) — 리뷰 없이 병합하는 길을 새로 열지 않는다.
+  const reviewDeferredToHost = !reviewReal && review?.deferredToHost === true && opts.mergeByHost === true && review.mustFix.length === 0;
   const reviewedHeadResult = reviewReal && reviewedHeadCommit ? { reviewedHeadCommit } : {};
-  const reviewDiffComplete = review?.diffTruncated === false;
+  const reviewDiffComplete = review?.diffTruncated === false || reviewDeferredToHost;
   const requiredEvidenceMissing = evidenceCoverage !== undefined && evidenceCoverage.uncoveredCount > 0;
   const { latestSignalIncomplete } = signalIncompleteState(roundClassifications);
   const autoMerge = autoMergeEnabled(opts);
@@ -7880,7 +7948,7 @@ async function runSelfImplementInner(
   //   종전 `verdict !== 'fail'` 만 보던 이 자리에서 auto 가 됐다(#25914 · #25934 · #25918 실물).
   //   ⭐ 반사가 must-fix 를 «전부» 기각하면 위에서 `review.mustFix = []` 로 비우므로 그 길은 종전 그대로다.
   const reviewMustFixCount = review?.mustFix?.length ?? 0;
-  let canAuto = !gateTimeoutUnmeasured && autoMerge && reviewReal && review!.verdict !== 'fail' && reviewMustFixCount === 0 && reviewDiffComplete && !requiredEvidenceMissing && !latestSignalIncomplete && !decisionSignalRed;
+  let canAuto = !gateTimeoutUnmeasured && autoMerge && (reviewReal || reviewDeferredToHost) && review!.verdict !== 'fail' && reviewMustFixCount === 0 && reviewDiffComplete && !requiredEvidenceMissing && !latestSignalIncomplete && !decisionSignalRed;
   // ⭐⭐ 통과의 «이유»를 둘로 가른다 — ⛔ 막지는 «않는다»(대표 판단 2026-08-11: ⓐ 문면만).
   //   📏 근거(`JDG-T36` · merge-decision 300건 전수): `verifyByBreaking` 이 실린 8건의 auto 중 ***5건***이
   //     ***ran=true 인데 distinguishes=0***(아무것도 안 가르는 자기검증)이었고, 그 다섯이 «전부»
@@ -7891,7 +7959,8 @@ async function runSelfImplementInner(
   //     그건 `skippedReason` 이 이미 가른다. 그래서 여기 조건에 넣지 않는다.
   const verifyInconclusive = gate.verifyByBreaking?.ran === true && (gate.verifyByBreaking.distinguishes ?? 0) === 0;
   const verifyNothingAtBase = verifyInconclusive && (gate.verifyByBreaking?.missingAtBase ?? 0) > 0;
-  let mergeReason = canAuto ? (verifyNothingAtBase ? 'review-clean-verify-nothing-at-base' : verifyInconclusive ? 'review-clean-verify-inconclusive' : 'review-clean-armed')
+  let mergeReason = canAuto && reviewDeferredToHost ? REVIEW_DEFERRED_TO_HOST_MERGE_REASON
+    : canAuto ? (verifyNothingAtBase ? 'review-clean-verify-nothing-at-base' : verifyInconclusive ? 'review-clean-verify-inconclusive' : 'review-clean-armed')
     : gateTimeoutUnmeasured ? GATE_TIMEOUT_UNMEASURED_MERGE_REASON
     : !autoMerge ? 'no-auto-flag'
       : requiredEvidenceMissing ? 'required-evidence-uncovered'
@@ -8311,7 +8380,7 @@ async function runSelfImplementInner(
     if (opts.mergeByHost) {
       observe('merge-ready', { number: pr.number, checkedHeadCommit });
       progress('pr-opened', `호스트 재게이트 대기 (#${pr.number})`);
-      return { ok: true, stage: 'merge-ready', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, checkedHeadCommit: checkedHeadCommit!, prUrl: pr.url, prNumber: pr.number };
+      return { ok: true, stage: 'merge-ready', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, ...(reviewDeferredToHost ? { mergeReason } : {}), checkedHeadCommit: checkedHeadCommit!, prUrl: pr.url, prNumber: pr.number };
     }
     // Landing freeze: the in-flight marker is written before the freeze is read, so a `freeze on` racing this merge waits.
     // The resume sweep merges from the repository that owns the run worktree (the worktree itself may be cleaned up).

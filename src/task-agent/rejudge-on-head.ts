@@ -19,6 +19,10 @@
  *   거절되면 그 시도는 `base-stale` 갈래로 적히고(judgement 1회 규칙과 섞이지 않는다), 다음 틱이 «같은 머리»를 새 base 위에서 한 번 더
  *   재게이트한다(`staleBase` = 낡은 base · 멱등 키 = 머리 ⊕ staleBase · 상한에 포함). 그 재게이트가 통과하고 base 가 실제로 바뀌었을 때만
  *   새 baseCommit 으로 증거를 다시 써 land 한다(`gateAt` 으로 앞 base-stale 시도를 소비) — 관측 `rejudge-on-head {step:'regate', reason:'base-stale-overlap …'}`.
+ * - TA-REJUDGE-REBASE-LOOP: 그 1회가 «같은 base» 로 돌아오거나 stale 재게이트에 `baseCommit` 이 없으면 needs-owner 로 멈추지 않는다. origin/main 을
+ *   fetch 한 뒤 PR 가지에 3-way merge(rerere 켬 · ⛔ rebase/force-push/reset/파일째 checkout) 하고 일반 push 로 새 머리를 만든 다음, 그 머리는 기존
+ *   ①②③ 사슬을 탄다. 머리마다 1회 · 카드당 `CATCH_UP_CAP`(기본 2)회. 충돌이면 `merge --abort` ⊕ needs-owner(`main 따라잡기 충돌 · 파일 …`).
+ *   관측 `rejudge-on-head {step:'catch-up', decision: pushed|conflict|cap-reached, fromBase, toBase, newHead}`.
  * - 대상: 카드에 묶인 PR(URL 로 저장소 확인) ⊕ 그 PR 로 TA 가 이미 리뷰를 요청한 카드(= 런이 멈춰 TA 판단이 시작됐다).
  * - 사람의 hold(draft PR)는 뒤집지 않는다 — 재게이트(`noMerge`)와 land 관문이 draft 를 거부한다.
  * - 허용: 설정 `taskAgent.liveMoves` 그대로 — 재게이트·land 는 `propose-land`, 리뷰 재요청은 `review` 가 있을 때만(없으면 «했을 수»).
@@ -26,7 +30,8 @@
  *   한 줄(`event:'rejudge-on-head'` · 같은 머리·같은 단계·같은 판단은 한 번).
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';
 import type { DetachedSpawn } from '../cli/tasks-cli.js';
@@ -39,18 +44,37 @@ import { cardPrNumber, readTaskCard, taskAgentStatePath, updateTaskCard, type Ta
 export const REJUDGE_ON_HEAD_EVENT = 'rejudge-on-head';
 /** 카드·PR 당 재게이트하는 머리 수 상한(머리가 바뀔 때마다 하나) — 넘으면 멈추고 사람에게 넘긴다. */
 export const REJUDGE_HEAD_CAP = 3;
+/** 카드당 origin/main 따라잡기(merge⊕push) 상한 — 넘으면 멈추고 사람에게 넘긴다. 머리마다 1회. */
+export const CATCH_UP_CAP = 2;
 /** 떼어 띄운 재게이트 결과를 기다리는 상한 — 지나도 파일이 없으면 «결과 없음»으로 적는다(같은 머리는 다시 안 돌린다). */
 export const REGATE_RESULT_WAIT_MS = 90 * 60_000;
 
-export type RejudgeStep = 'regate' | 'review' | 'land' | 'target';
-export interface RejudgeOutcome { card: string; pr: number | null; fromHead: string | null; toHead: string | null; step: RejudgeStep; decision: string; reason: string }
+export type RejudgeStep = 'regate' | 'review' | 'land' | 'target' | 'catch-up';
+export type CatchUpDecision = 'pushed' | 'conflict' | 'cap-reached' | 'failed';
+export interface RejudgeOutcome {
+  card: string; pr: number | null; fromHead: string | null; toHead: string | null; step: RejudgeStep; decision: string; reason: string;
+  fromBase?: string; toBase?: string; newHead?: string;
+}
 
 export interface RegateRequest { card: string; pr: number; head: string; repoRoot: string; resultPath: string }
+export interface CatchUpRequest { cwd: string; pr: number; head: string; branch?: string; fromBase?: string; worktreePath?: string }
+export interface CatchUpResult {
+  decision: Exclude<CatchUpDecision, 'cap-reached'>;
+  reason: string;
+  fromBase?: string;
+  toBase?: string;
+  newHead?: string;
+  files?: string[];
+  pushArgs?: string[];
+}
+export type CatchUpGit = (cwd: string, args: string[]) => { status: number | null; stdout: string; stderr: string };
 export interface RejudgeDeps {
   live?: LiveMoveDeps;
   liveMoves: ReadonlySet<TaskAgentLiveMove>;
   /** 재게이트를 떼어 띄운다 — 시험은 주입한다. 기본은 `tasks regate-run` 자식(stdio ignore · 결과는 파일). */
   requestRegate?: (request: RegateRequest) => Promise<void>;
+  /** TA-REJUDGE-REBASE-LOOP — origin/main 을 PR 가지에 3-way merge 하고 일반 push. 시험은 주입한다. */
+  catchUpMain?: (request: CatchUpRequest) => Promise<CatchUpResult>;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
   /** 시험 seam — 결과 파일 읽기(없으면 ENOENT). */
   readFile?: (path: string) => string;
@@ -103,6 +127,83 @@ export function parseRegateResult(text: string, pr: number, head: string): Regat
 
 const sameUrl = (a: string, b: string) => a.trim().replace(/\/+$/, '').toLowerCase() === b.trim().replace(/\/+$/, '').toLowerCase();
 const sameHead = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+
+const defaultCatchUpGit: CatchUpGit = (cwd, args) => {
+  const r = spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 120_000 });
+  return { status: r.status, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? '') };
+};
+
+export function catchUpWorktreePath(statePath: string, cardId: string, pr: number, head: string): string {
+  return join(dirname(statePath), 'catch-up-worktrees', `${safe(cardId)}-${pr}-${safe(head.slice(0, 12))}`);
+}
+
+const gitSha = (text: string): string | null => {
+  const value = text.trim();
+  return /^[0-9a-f]{40}$/i.test(value) ? value : null;
+};
+
+const catchUpFail = (reason: string, extra: Partial<CatchUpResult> = {}): CatchUpResult => ({ decision: 'failed', reason, ...extra });
+
+/**
+ * origin/main 을 PR 머리에 3-way merge(rerere 켬) 하고 일반 push 한다.
+ * ⛔ rebase · force-push · reset · 남의 가지 파일째 checkout — 충돌이면 merge --abort.
+ */
+export async function defaultCatchUpMain(request: CatchUpRequest, git: CatchUpGit = defaultCatchUpGit): Promise<CatchUpResult> {
+  const repo = request.cwd;
+  const work = request.worktreePath ?? join(tmpdir(), `ta-catch-up-${request.pr}-${safe(request.head.slice(0, 12))}-${process.pid}`);
+  const gitRepo = (args: string[]) => git(repo, args);
+  const gitWork = (args: string[]) => git(work, args);
+  const fromBase = request.fromBase;
+  if (!request.branch) return catchUpFail('PR head branch name unknown', { fromBase });
+
+  const fetchMain = gitRepo(['fetch', 'origin', 'refs/heads/main']);
+  if (fetchMain.status !== 0) return catchUpFail(`origin/main fetch failed: ${(fetchMain.stderr || fetchMain.stdout).trim().slice(-200)}`, { fromBase });
+  const toBase = gitSha(gitRepo(['rev-parse', 'FETCH_HEAD']).stdout);
+  if (!toBase) return catchUpFail('origin/main sha unreadable', { fromBase });
+
+  const fetchPr = gitRepo(['fetch', 'origin', `pull/${request.pr}/head`]);
+  if (fetchPr.status !== 0) return catchUpFail(`fetch pull/${request.pr}/head failed: ${(fetchPr.stderr || fetchPr.stdout).trim().slice(-200)}`, { fromBase, toBase });
+  const fetchedHead = gitSha(gitRepo(['rev-parse', 'FETCH_HEAD']).stdout);
+  if (!fetchedHead || !sameHead(fetchedHead, request.head)) {
+    return catchUpFail(`fetched PR head ${(fetchedHead ?? '?').slice(0, 12)} ≠ ${request.head.slice(0, 12)}`, { fromBase, toBase });
+  }
+
+  const added = gitRepo(['worktree', 'add', '--detach', work, request.head]);
+  if (added.status !== 0) return catchUpFail(`worktree add failed: ${(added.stderr || added.stdout).trim().slice(-200)}`, { fromBase, toBase });
+  const cleanup = () => { gitRepo(['worktree', 'remove', '--force', work]); };
+
+  gitWork(['config', 'rerere.enabled', 'true']);
+  const merge = gitWork(['merge', '--no-ff', toBase, '-m', `catch-up: merge origin/main into PR #${request.pr}`]);
+  if (merge.status !== 0) {
+    const files = gitWork(['diff', '--name-only', '--diff-filter=U']).stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+    gitWork(['merge', '--abort']);
+    cleanup();
+    return {
+      decision: 'conflict',
+      reason: `main 따라잡기 충돌 · 파일 ${files.join(', ') || '(unknown)'}`,
+      fromBase, toBase, files,
+    };
+  }
+  const newHead = gitSha(gitWork(['rev-parse', 'HEAD']).stdout);
+  if (!newHead) { cleanup(); return catchUpFail('merge produced no head sha', { fromBase, toBase }); }
+  const pushArgs = ['push', 'origin', `HEAD:${request.branch}`];
+  const push = gitWork(pushArgs);
+  cleanup();
+  if (push.status !== 0) return catchUpFail(`push failed: ${(push.stderr || push.stdout).trim().slice(-200)}`, { fromBase, toBase, newHead, pushArgs });
+  return {
+    decision: 'pushed',
+    reason: `merged origin/main ${toBase.slice(0, 12)} → head ${newHead.slice(0, 12)}`,
+    fromBase, toBase, newHead, pushArgs,
+  };
+}
+
+/** 실제로 «시도한» 따라잡기 기록(pushed·conflict·failed) — `cap-reached`·`would-catch-up` 표지는 시도가 아니다. */
+const CATCH_UP_ATTEMPT_EFFECTS: ReadonlySet<string> = new Set(['pushed', 'conflict', 'failed']);
+
+function catchUpHistory(card: Pick<TaskCard, 'history'>, pr: number) {
+  return (card.history ?? []).filter((item) => item.event === REJUDGE_ON_HEAD_EVENT && item.kind === 'catch-up' && item.pr === pr
+    && typeof item.effect === 'string' && CATCH_UP_ATTEMPT_EFFECTS.has(item.effect));
+}
 
 /** 카드의 PR URL 과 같은 PR 을 돌려주는 후보 저장소 — 못 찾으면 이유. */
 async function resolveCardPr(card: TaskCard, pr: number, url: string, deps: LiveMoveDeps): Promise<{ cwd: string; view: PrHeadView } | { reason: string }> {
@@ -195,7 +296,50 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   const { cwd, view } = found;
   const toHead = view.head;
   if (view.state !== 'OPEN') return target('pr-not-open', `PR #${pr} is ${view.state}`, pr, fromHead, toHead);
-  const step = (s: RejudgeStep, decision: string, reason: string, record: boolean) => emit({ card: card!.id, pr, fromHead, toHead, step: s, decision, reason }, record);
+  const step = (s: RejudgeStep, decision: string, reason: string, record: boolean, extra: Partial<RejudgeOutcome> = {}) =>
+    emit({ card: card!.id, pr, fromHead, toHead, step: s, decision, reason, ...extra }, record);
+
+  const tryCatchUp = async (fromBase: string | undefined, why: string): Promise<boolean> => {
+    const prior = catchUpHistory(card!, pr);
+    // 상한은 «실제 push» 만 센다 — 충돌·실패 뒤 사람이 새 머리를 올리면 다시 시도할 수 있어야 한다.
+    const pushed = prior.filter((item) => item.effect === 'pushed').length;
+    if (pushed >= CATCH_UP_CAP) {
+      step('catch-up', 'cap-reached', `${why} · catch-up pushed ${pushed} times already (cap ${CATCH_UP_CAP}) — needs owner`, true, { fromBase });
+      return true;
+    }
+    if (prior.some((item) => item.head && sameHead(item.head, toHead))) {
+      step('catch-up', 'cap-reached', `${why} · already catch-up on this head — needs owner`, true, { fromBase });
+      return true;
+    }
+    if (!deps.liveMoves.has('propose-land')) {
+      step('catch-up', 'would-catch-up', `${why} · propose-land not enabled in taskAgent.liveMoves — shadow`, false, { fromBase });
+      return true;
+    }
+    let result: CatchUpResult;
+    try {
+      result = await (deps.catchUpMain ?? defaultCatchUpMain)({
+        cwd, pr, head: toHead, branch: view.branch, fromBase,
+        worktreePath: catchUpWorktreePath(statePath, card!.id, pr, toHead),
+      });
+    } catch (error) {
+      result = { decision: 'failed', reason: `catch-up threw: ${(error instanceof Error ? error.message : String(error)).slice(-200)}`, fromBase };
+    }
+    const extra: Partial<RejudgeOutcome> = {
+      ...(result.fromBase ? { fromBase: result.fromBase } : fromBase ? { fromBase } : {}),
+      ...(result.toBase ? { toBase: result.toBase } : {}),
+      ...(result.newHead ? { newHead: result.newHead } : {}),
+    };
+    if (result.decision === 'pushed') {
+      step('catch-up', 'pushed', result.reason, true, extra);
+      return true;
+    }
+    if (result.decision === 'conflict') {
+      step('catch-up', 'conflict', result.reason, true, extra);
+      return true;
+    }
+    step('catch-up', result.decision, `${why} · ${result.reason} — needs owner`, true, extra);
+    return true;
+  };
 
   // 머리가 런 멈춤 때 그대로면 재판정하지 않는다 — 그 머리의 재게이트·리뷰·land 판단은 멈춤 때의 판단(슈퍼바이저 틱)이 이미 했다.
   //   TA-LAND-RETRY-ON-INFRA — 단, 그 머리의 land 가 TA 쪽 인프라 결손으로 실패해 재시도가 남았으면 아래 ①②③ 을 그대로 탄다
@@ -208,7 +352,7 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   const stale = regate?.passed === true ? baseStaleAttemptAfter(card, pr, toHead, regate.at) : undefined;
   const staleBase = stale ? regate?.baseCommit : undefined;
   if (stale && !staleBase) {
-    step('regate', 'not-regating', `base-stale-overlap on head ${toHead.slice(0, 12)} but the stale regate has no baseCommit — needs owner`, true);
+    await tryCatchUp(undefined, `base-stale-overlap on head ${toHead.slice(0, 12)} but the stale regate has no baseCommit`);
     return outcomes;
   }
   if (!regate || staleBase) {
@@ -282,9 +426,9 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
     step('land', 'not-landing', regate ? (regate.passed === false ? `host regate not passed: ${regate.detail ?? regate.status ?? 'unknown'}` : 'host regate still running') : 'no host regate for this head', regate?.passed === false);
     return outcomes;
   }
-  // REJUDGE base-stale — 새 base 위 재게이트가 «같은» base 로 돌아왔다 — 증거가 또 낡았다고 거절될 것이므로 land 하지 않는다(재게이트도 멱등 키로 0).
+  // REJUDGE base-stale — 새 base 위 재게이트가 «같은» base 로 돌아왔다 → origin/main 따라잡기(merge⊕push) 후 새 머리 재게이트.
   if (regate.staleBase && regate.baseCommit && sameHead(regate.baseCommit, regate.staleBase)) {
-    step('land', 'not-landing', `base-stale-overlap — re-gate on head ${toHead.slice(0, 12)} returned the same base ${regate.staleBase.slice(0, 12)} (did not advance) — no land, no further re-gate on this base; needs owner`, true);
+    await tryCatchUp(regate.staleBase, `base-stale-overlap — re-gate on head ${toHead.slice(0, 12)} returned the same base ${regate.staleBase.slice(0, 12)} (did not advance)`);
     return outcomes;
   }
   if (!deps.liveMoves.has('propose-land')) { step('land', 'would-land', 'propose-land not enabled in taskAgent.liveMoves — shadow', false); return outcomes; }

@@ -1,7 +1,8 @@
 // ── ACP Claude Code 를 «구현» 실행기로 (CLAUDE-IMPL-LANE · `--child-llm-provider claude-acp`) ──
 //
 // acp-reviewer.ts 의 짝이다. 리뷰어는 read-only 라 읽기 툴만 허가하지만, 구현 실행기는 런 워크트리 안에서
-// 쓰기·실행을 허가해야 한다. 그래서 approver 가 «워크트리 밖 경로 쓰기»를 구조적으로 거부한다.
+// 쓰기·실행을 허가해야 한다. 대표 대표 결정(10-12): ACP 세션 권한 모드는 호스트 설정(auto)을 그대로 두고
+// 바꾸지 않으며, approver 가 불려도 «워크트리 밖 경로 쓰기»를 거부하지 않고 허가하되 insideWorktree 로 관측한다.
 // 자식은 claude 구독 ACP 어댑터(`claude-agent-acp`)이며 env 는 subscriptionReviewerSpawn 의 과금 스크럽
 // (ANTHROPIC_API_KEY 등 제거)을 그대로 쓴다 — 지우지 않으면 구독이 아니라 API 로 과금된다.
 import { isAbsolute, relative, resolve } from 'node:path';
@@ -23,6 +24,8 @@ export interface ImplementerPermissionRequest {
 export interface ImplementerPermissionDecision {
   tool: string;
   path: string | null;
+  /** 판정에 쓴 경로가 워크트리 안인가 — 경로가 없으면 null. 밖이어도 허가한다(대표 10-12); 이 칸이 그 관측이다. */
+  insideWorktree: boolean | null;
   decision: 'allow' | 'deny';
 }
 
@@ -37,18 +40,20 @@ function insideWorktree(worktree: string, target: string): boolean {
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 
-/** 허가 판정(순수 함수). 쓰기 계열(edit·delete·move)은 모든 경로가 워크트리 안일 때만 허가하고,
- *  실행(execute)은 cwd 가 워크트리라 허가한다. 읽기 계열은 허가, 그 외는 경로가 있고 전부 안쪽일 때만 허가(보수적). */
+/** 허가 판정(순수 함수). 쓰기 계열(edit·delete·move)은 경로가 있으면 워크트리 안팎을 가리지 않고 허가한다
+ *  (대표 10-12 — 밖 쓰기 거부를 걷었다 · insideWorktree 로 관측만 한다). 실행(execute)·읽기 계열은 허가,
+ *  그 외(모르는 kind)는 경로가 있을 때만 허가 — 경로 없는 쓰기·모르는 요청은 여전히 거부. */
 export function decideImplementerPermission(req: ImplementerPermissionRequest, worktree: string): ImplementerPermissionDecision {
   const paths = requestedPaths(req.rawInput);
   const outside = paths.find((p) => !insideWorktree(worktree, p));
   const tool = req.title.slice(0, 80);
   const shown = outside ?? paths[0] ?? null;
-  const verdict = (allow: boolean): ImplementerPermissionDecision => ({ tool, path: shown, decision: allow ? 'allow' : 'deny' });
-  if (req.kind && WRITE_TOOL_KINDS.has(req.kind)) return verdict(paths.length > 0 && outside === undefined);
+  const inside = paths.length === 0 ? null : outside === undefined;
+  const verdict = (allow: boolean): ImplementerPermissionDecision => ({ tool, path: shown, insideWorktree: inside, decision: allow ? 'allow' : 'deny' });
+  if (req.kind && WRITE_TOOL_KINDS.has(req.kind)) return verdict(paths.length > 0);
   if (req.kind === 'execute') return verdict(true);
   if (isReadOnlyReviewTool(req.kind, req.title)) return verdict(true);
-  return verdict(paths.length > 0 && outside === undefined);
+  return verdict(paths.length > 0);
 }
 
 export interface AcpImplementerOpts {
@@ -96,7 +101,9 @@ export function makeAcpImplementer(opts: AcpImplementerOpts): (prompt: string) =
       permissionApprover: async (req) => {
         const verdict = decideImplementerPermission(req, opts.worktree);
         if (verdict.decision === 'allow') allowed++; else denied++;
-        debug.log(OBS, 'permission', { ...verdict });
+        debug.log(OBS, 'permission', {
+          tool: verdict.tool, path: verdict.path, insideWorktree: verdict.insideWorktree, allowed: verdict.decision === 'allow',
+        });
         return verdict.decision === 'allow';
       },
     };

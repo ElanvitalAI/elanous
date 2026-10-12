@@ -113,7 +113,7 @@ export interface RunShellDispatchResult extends Record<string, unknown> {
    *  follow in the structured fields below. */
   output: string;
   exitCode: number | null;
-  outcome: ShellResult['outcome'];
+  outcome: ShellResult['outcome'] | 'started';
   elapsedMs: number;
   stdout: string;
   stderr: string;
@@ -260,6 +260,38 @@ async function dispatchViaRunner(args: {
     ...(args.signal !== undefined ? { signal: args.signal } : {}),
   };
   const handle = runnerDispatch(req, args.deps);
+  if (args.mode === 'bg') {
+    const bgStartedAt = Date.now();
+    void handle.result.then(
+      (result) => {
+        debug.log('skill-tool.shell', 'bg-finished', {
+          handle: handle.id,
+          exitCode: result.exitCode ?? null,
+          durationMs: result.durationMs,
+        });
+      },
+      (err: unknown) => {
+        debug.log('skill-tool.shell', 'bg-finished', {
+          handle: handle.id,
+          exitCode: null,
+          durationMs: Date.now() - bgStartedAt,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      },
+    );
+    return {
+      output: `RunShell outcome=started handle=${handle.id} bg=${handle.id}`,
+      exitCode: null,
+      outcome: 'started',
+      elapsedMs: 0,
+      stdout: '',
+      stderr: '',
+      truncated: false,
+      approvalKey: `runner:${handle.id}`,
+      sandboxed: false,
+      sandboxTool: 'none',
+    };
+  }
   const result = await handle.result;
   return runnerToLegacyResult(handle.id, result);
 }

@@ -349,6 +349,29 @@ describe('runPodCommand', () => {
     expect(pool.snapshot()).toEqual({ 'pool-node-b': 0 });
   });
 
+  test('GATE-MULTI-HOST: a Job whose status stays unreadable (member gone mid-Job) throws after statusUnreadableMs instead of polling forever; omitted = keeps polling', async () => {
+    const member: PodPoolMember = { context: 'pool-node-c', sshHost: 'node-c', capacity: 2, k3dCluster: 'elanous-pool' };
+    const run = (statusUnreadableMs: number | undefined, polls: { n: number }) => {
+      const pool = new PodPoolScheduler([member]);
+      return { pool, done: runPodCommand({ command: ['true'], poolScheduler: pool, name: 'gate-lost-member', ...(statusUnreadableMs !== undefined ? { statusUnreadableMs } : {}),
+        sleep: async () => { if (++polls.n > 5) throw new Error('still polling'); },
+        kubectl: (args) => args.some((arg) => arg.includes('.status.conditions'))
+          ? { status: 1, stdout: '', stderr: 'Unable to connect to the server: dial tcp: i/o timeout' }
+          : { status: 0, stdout: '', stderr: '' },
+        syncImages: async () => new Map([[member.context, { ok: true, action: 'fresh' as const, detail: 'ready', ms: 1 }]]),
+        imageCommit: null, env: {}, configHostMirror: () => undefined, artifactsRoot: '/tmp/pod-command-lost-member-test', log: () => {},
+      }) };
+    };
+    const bounded = { n: 0 };
+    const a = run(0, bounded);
+    await expect(a.done).rejects.toThrow(/Job 상태를 0초 동안 못 읽었다\(pool-node-c\)/);
+    expect(bounded.n).toBe(0);
+    expect(a.pool.snapshot()).toEqual({ 'pool-node-c': 0 });
+    const unbounded = { n: 0 };
+    await expect(run(undefined, unbounded).done).rejects.toThrow('still polling');
+    expect(unbounded.n).toBe(6);
+  });
+
   test('pool registry tag uses IfNotPresent for both the isolation gate and child', async () => {
     const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool', registry: 'k3d-elanous-registry:5050' };
     const ref = 'k3d-elanous-registry:5050/elanous-harness:abcdef123456';

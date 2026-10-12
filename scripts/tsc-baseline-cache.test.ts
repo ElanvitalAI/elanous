@@ -11,6 +11,7 @@ import {
   lookupBaselineCache,
   storeBaselineCache,
   toPlaceholderPaths,
+  workingTreeInstallKey,
 } from './tsc-baseline-cache.js';
 
 const COMMAND = 'bunx tsc --noEmit -p tsconfig.gate.json';
@@ -78,9 +79,10 @@ describe('tsc baseline cache', () => {
     expect('diagnostics' in second && second.diagnostics.some((entry) => entry.line.includes(`rootDir '${repo}'`))).toBe(true);
     expect(git(['worktree', 'list', '--porcelain']).match(/^worktree /gm)).toHaveLength(1);
     const key = jsonFiles()[0]!.replace(/\.json$/, '');
+    const install = workingTreeInstallKey(repo)!.slice(0, 12);
     expect(lines).toEqual([
-      `[tsc-gate] typecheck baseline-cache miss ${key.slice(0, 12)}`,
-      `[tsc-gate] typecheck baseline-cache hit ${key.slice(0, 12)}`,
+      `[tsc-gate] typecheck baseline-cache miss ${key.slice(0, 12)} installKey ${install}`,
+      `[tsc-gate] typecheck baseline-cache hit ${key.slice(0, 12)} installKey ${install}`,
     ]);
   });
 
@@ -135,6 +137,43 @@ describe('tsc baseline cache', () => {
     expect(jsonFiles()).toHaveLength(2);
   });
 
+  test('same base with a different working-tree bun.lock misses the cache', () => {
+    const counter = { runs: 0 };
+    const lines: string[] = [];
+    readMergeBaseDiagnostics('HEAD', COMMAND, repo, makeRun(counter), { dir: cacheDir, log: (message) => lines.push(message) });
+    // 작업 트리의 «깔린 판»만 바꾼다 — base 커밋(sha ⊕ 설정 해시)은 그대로다.
+    writeFileSync(join(repo, 'bun.lock'), 'lock-1-installed-differently\n');
+    readMergeBaseDiagnostics('HEAD', COMMAND, repo, makeRun(counter), { dir: cacheDir, log: (message) => lines.push(message) });
+    expect(counter.runs).toBe(2);
+    expect(jsonFiles()).toHaveLength(2);
+    const installKeys = lines.map((line) => line.match(/installKey ([0-9a-f]{12})$/)?.[1]);
+    expect(installKeys).toHaveLength(2);
+    expect(installKeys.every(Boolean)).toBe(true);
+    expect(installKeys[0]).not.toBe(installKeys[1]);
+  });
+
+  test('working-tree install key: root bun.lock read failure disables, apps/pwa/bun.lock read failure folds to absent', () => {
+    const eacces = (): Buffer => { throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); };
+    expect(workingTreeInstallKey(repo, { readInstallFile: (path) => (path.endsWith(join('apps', 'pwa', 'bun.lock')) ? Buffer.from('pwa') : eacces()) })).toBeUndefined();
+    const rootOnly = workingTreeInstallKey(repo, { readInstallFile: (path) => (path.endsWith(join('apps', 'pwa', 'bun.lock')) ? eacces() : Buffer.from('root')) });
+    expect(rootOnly).toMatch(/^[0-9a-f]{64}$/);
+    const withPwa = workingTreeInstallKey(repo, { readInstallFile: (path) => Buffer.from(path.endsWith(join('apps', 'pwa', 'bun.lock')) ? 'pwa' : 'root') });
+    expect(withPwa).toMatch(/^[0-9a-f]{64}$/);
+    expect(withPwa).not.toBe(rootOnly);
+  });
+
+  test('unreadable working-tree bun.lock disables the cache', () => {
+    const counter = { runs: 0 };
+    const lines: string[] = [];
+    rmSync(join(repo, 'bun.lock'));
+    readMergeBaseDiagnostics('HEAD', COMMAND, repo, makeRun(counter), { dir: cacheDir, log: (message) => lines.push(message) });
+    readMergeBaseDiagnostics('HEAD', COMMAND, repo, makeRun(counter), { dir: cacheDir, log: (message) => lines.push(message) });
+    expect(counter.runs).toBe(2);
+    expect(jsonFiles()).toHaveLength(0);
+    // 키를 못 만들면 hit/miss 줄 자체가 안 찍힌다 — 캐시가 꺼진 것이다.
+    expect(lines).toHaveLength(0);
+  });
+
   test('unavailable baseline is not stored', () => {
     const counter = { runs: 0 };
     const failed = readMergeBaseDiagnostics('HEAD', COMMAND, repo, makeRun(counter, false), { dir: cacheDir });
@@ -156,7 +195,7 @@ describe('tsc baseline cache', () => {
     const again = readMergeBaseDiagnostics('HEAD', COMMAND, repo, makeRun(counter), { dir: cacheDir, log: (message) => lines.push(message) });
     expect(counter.runs).toBe(2);
     expect('diagnostics' in again && again.diagnostics).toHaveLength(2);
-    expect(lines[0]).toMatch(/baseline-cache miss [0-9a-f]{12}$/);
+    expect(lines[0]).toMatch(/baseline-cache miss [0-9a-f]{12} installKey [0-9a-f]{12}$/);
     expect(JSON.parse(readFileSync(file, 'utf8')).diagnostics).toHaveLength(2);
   });
 

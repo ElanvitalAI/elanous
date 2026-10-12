@@ -371,6 +371,12 @@ export interface RunPodCommandOptions {
   runId?: string;
   name?: string;
   pollMs?: number;
+  /**
+   * GATE-MULTI-HOST — throw once the Job's status has been unreadable (`kubectl get job` failing) this long, instead of
+   * polling forever: a pool member that died mid-Job (host off · tailnet drop) then frees its caller to place the work
+   * elsewhere. Omitted = poll without a bound (unchanged for every caller but the release gate).
+   */
+  statusUnreadableMs?: number;
   kubectl?: Kubectl;
   /** A caller-owned scheduler is self-capped: acquires count only its own Jobs, never cluster occupancy (POOLGLOBAL-REG). */
   poolScheduler?: PodPoolScheduler;
@@ -536,10 +542,18 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       throw new Error(applied.stderr.trim() || 'pod command: Job 적용 실패');
     }
     let state: 'complete' | 'failed' = 'failed';
+    let unreadableSince: number | null = null;
     for (;;) {
       const got = kubectl(['-n', namespace, 'get', 'job', name, '-o', 'jsonpath={.status.conditions[*].type}']);
       const finished = jobFinished(got.stdout);
       if (finished) { state = finished; break; }
+      if (got.status !== 0 && options.statusUnreadableMs !== undefined) {
+        unreadableSince ??= Date.now();
+        if (Date.now() - unreadableSince >= options.statusUnreadableMs) {
+          log('pod.command', 'job-status-unreadable', { job: name, context, unreadableMs: Date.now() - unreadableSince, error: (got.stderr ?? '').trim().slice(0, 300) });
+          throw new Error(`pod command: Job 상태를 ${Math.round(options.statusUnreadableMs / 1000)}초 동안 못 읽었다(${context}) — ${(got.stderr ?? '').trim().split('\n').pop()?.slice(0, 200) ?? ''}`);
+        }
+      } else unreadableSince = null;
       await sleep(options.pollMs ?? 15_000);
     }
     const logsResult = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child']);

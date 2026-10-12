@@ -13,6 +13,9 @@
 //   bun scripts/ux-sim.ts --computer-use normal --from-run <runId> --save-trajectory <name> # 이름으로 저장
 //   bun scripts/ux-sim.ts --computer-use normal --trajectory <name> # 저장한 궤적을 재생
 //   bun scripts/ux-sim.ts --list-trajectories # 저장한 궤적과 출처 목록
+//   bun scripts/ux-sim.ts --fault cred-expiry # 결함 주입: grok 구독 만료 임박 × 갱신 결과 → 디스패처·발사 판정
+//   bun scripts/ux-sim.ts --fault pod-death   # 결함 주입: PARTIAL 줄을 남긴 Pod 가 SIGTERM 으로 지워짐 → 호스트 재방출 판정
+//   bun scripts/ux-sim.ts --fault pool-cap    # 결함 주입: --pod-pool 에 :N 이 빠진 풀 → 승인 판정(limitedBy)
 //
 // ⛔ 이 CLI 는 «실제 위젯 render()» 를 부른다 — 흉내 렌더러가 아니다.
 import { simRenderLogFrame } from '../src/ux-sim/render-frame.js';
@@ -33,7 +36,7 @@ const argv = process.argv.slice(2);
 //  ⛔ 그래서 「알려진 플래그」를 «한 곳»에 두고, 그 밖의 `--` 인자는 거부한다.
 const KNOWN_FLAGS = new Set([
   '--list', '--list-trajectories', '--computer-use', '--trajectory', '--from-run',
-  '--save-trajectory', '--esc', '--queue', '--width', '--height', '--draft',
+  '--save-trajectory', '--esc', '--queue', '--width', '--height', '--draft', '--fault',
 ]);
 {
   const unknown = argv.filter((a) => a.startsWith('--') && !KNOWN_FLAGS.has(a.split('=')[0]));
@@ -45,6 +48,32 @@ const KNOWN_FLAGS = new Set([
   }
 }
 if (argv.includes('--list')) { console.log([...PHASES, 'computer-use: normal | capture-stalls | capture-fails | target-missing'].join('\n')); process.exit(0); }
+
+{
+  // `--fault=<이름>` 꼴도 받는다 — KNOWN_FLAGS 는 등호 꼴을 통과시키므로 여기서 놓치면 조용히 기본 국면으로 빠진다.
+  const eq = argv.find((a) => a.startsWith('--fault='));
+  if (eq) argv.splice(argv.indexOf(eq), 1, '--fault', eq.slice('--fault='.length));
+}
+if (argv.includes('--fault')) {
+  const fault = argv[argv.indexOf('--fault') + 1];
+  if (fault === 'cred-expiry') {
+    const { credExpirySweep, renderCredExpiry } = await import('../src/ux-sim/fault-cred-expiry.js');
+    console.log(renderCredExpiry(credExpirySweep()).join('\n'));
+    process.exit(0);
+  }
+  if (fault === 'pod-death') {
+    const { simPodDeath, renderPodDeath } = await import('../src/ux-sim/fault-pod-death.js');
+    console.log(renderPodDeath(simPodDeath()).join('\n'));
+    process.exit(0);
+  }
+  if (fault === 'pool-cap') {
+    const { poolCapSweep, renderPoolCap } = await import('../src/ux-sim/fault-pool-cap.js');
+    console.log(renderPoolCap(poolCapSweep()).join('\n'));
+    process.exit(0);
+  }
+  console.error(`⛔ 모르는 결함이다: ${fault ?? '(없음)'} — 아는 것: cred-expiry · pod-death · pool-cap`);
+  process.exit(2);
+}
 
 if (argv.includes('--list-trajectories')) {
   const { listSavedBrowserActionTrajectories } = await import('../src/harness/browser-trajectory.js');

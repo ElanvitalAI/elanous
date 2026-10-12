@@ -171,6 +171,11 @@ describe('already-ancestor-auto — 증거 파일 없이', () => {
     expect(auto(head, reviewResultsDir, [landed])).toEqual({ ok: false, reason: 'review-must-fix-1' });
   });
 
+  it('PR-LAND-MUSTFIX-NONE — must-fix 칸이 «(없음 — 수용기준 충족 …)» 표지 한 줄뿐이면 0 으로 보고 통과', () => {
+    const { landed, head, reviewResultsDir } = ancestorScenario({ verdict: 'pass', mustFix: ['(없음 — 수용기준 충족: 관문이 리뷰 출력과 같은 판정을 쓴다)'] });
+    expect(auto(head, reviewResultsDir, [landed])).toMatchObject({ ok: true, mode: 'already-ancestor-auto' });
+  });
+
   it('같은 머리의 리뷰 중 하나라도 must-fix 가 남으면 거부(처음 통과한 하나로 승인하지 않는다)', () => {
     const { landed, head, reviewResultsDir } = ancestorScenario({ verdict: 'pass' });
     writeFileSync(join(reviewResultsDir, `TA-2-51-${head.slice(0, 12)}.json`), JSON.stringify({

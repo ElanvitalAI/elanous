@@ -5,8 +5,9 @@
 // behaviour — so `openrouter/openai/gpt-5*` deliberately stays 'other' (pinned in ①).
 //
 // Two halves:
-//   ① UNCHANGED — every id outside `openrouter/openai/` keeps the exact fingerprint it had on
-//      origin/main c25df7b58e (measured there, before this change, with this same function).
+//   ① UNCHANGED — ids outside `openrouter/openai/` keep their fingerprint from
+//      origin/main c25df7b58e, except three open-weight ids remeasured after the
+//      shared prompt changed on the 0.2.25 cut.
 //      If a later PR changes addon/discipline TEXT on purpose, re-measure the shared constants
 //      below by printing `await fingerprint(id)` on that PR's base — ① guards the family split,
 //      not the wording.
@@ -102,7 +103,8 @@ function toolHintKept(model: string): number {
 
 type Fp = Awaited<ReturnType<typeof fingerprint>>;
 
-// Shared sha values (measured on origin/main c25df7b58e).
+// Shared sha values: origin/main c25df7b58e, with open-weight discipline/turn
+// remeasured on the 0.2.25 cut after the shared prompt changed.
 const EMPTY = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 const GPT_ADDON = '9e31146d530121080d0c6e9cdfd40b16721a15803fc86b713a9dd14cca371be2';
 const CODEX_ADDON = 'fb553a1ac45cdf93055abf248bb7ca25442af7f5a3af249b8130363729de8500';
@@ -111,8 +113,8 @@ const GROK_DISCIPLINE = '49ada854d200fe9355c03f4726a0bc7efb853f9d30d6454f72a7bd1
 const PLAIN_TURN = '847b7010258182a01a4397318734230e382b2f34e4d11c87a46ccafdf4e1ede2';
 const CODEX_TURN = 'c04fb52dfc902dd0d1d717cae28bf5b90a87ddd54fb120f11784677d5942ee54';
 const GROK_TURN = '3a5d0f0fcbb0c71febf9e7cac424b3fa9d7f2c0dd3f823b7f32ed93a175853e6';
-const OW_DISCIPLINE = '59031199c0281b7691f51446ab10d0b9890fe1b54538faad8c6b1c633e446e42';
-const OW_TURN = '67c529da960add918d7acbd1f7615ce2e6d6783951062388e1a0541e2777dd5a';
+const OW_DISCIPLINE = 'ebaf067a0b19a2786d7bfb7bf8fe19bd2372c8b84c0a379be233de68fe98ee0c';
+const OW_TURN = '8b8bbf102a8f727df291ec5187bb8c602eef29709efc14f19f94ec7aed857303';
 const GPT_VARIANT = 'b4f6ad80c0ff6f754885731dfac362632fcad657246a01e6121a3a52e1f5d182';
 const CLAUDE_VARIANT = '35db6bb6bf5931f8bc9a0580aec77187ebaf96b9a32616280faedd3fbba7b04c';
 const CODEX_VARIANT = 'eb32cd567fa95301f945c1b24258144be0c520f7e5c75130a504deef5f6c7098';

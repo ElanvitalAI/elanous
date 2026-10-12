@@ -336,7 +336,7 @@ test('CLI reports durable decision with failed delivery and can retry only the a
   expect(decided).toContain('⚠ 답 전달 실패(auq:q1:abcde');
   expect(decided).toContain(`elanous decisions retry-answer ${entry.id}`);
   expect(process.exitCode).toBe(3);
-  process.exitCode = exitBefore;
+  process.exitCode = exitBefore ?? 0;
   const events = readFileSync(join(stateDir, 'decisions', 'decisions.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
   expect(events.at(-1)).toMatchObject({ type: 'decided', id: entry.id, choice: 'a' });
   expect(JSON.parse(run('show', entry.id, '--json'))).toMatchObject({ status: 'decided', choice: 'a', note: 'Private memo' });
@@ -451,7 +451,7 @@ test('CLI decide with no pending question at all reports the failed delivery and
   const exitBefore = process.exitCode;
   const out = JSON.parse(run('decide', entry.id, 'b', '--json'));
   expect(process.exitCode).toBe(3);
-  process.exitCode = exitBefore;
+  process.exitCode = exitBefore ?? 0;
   expect(out).toMatchObject({ status: 'decided', choice: 'b', delivery: { ok: false, questionId: 'auq:qmissing:abcde' } });
   const events = readFileSync(join(stateDir, 'decisions', 'decisions.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
   expect(events.filter((event: { type: string }) => event.type === 'decided')).toHaveLength(1);

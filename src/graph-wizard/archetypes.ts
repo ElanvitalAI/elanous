@@ -2,18 +2,20 @@
  * 마법사 «원형» — 사람이 말로 자주 시키는 일의 뼈대 셋. graphs/** 의 운영 템플릿(개발·출시 루프)은
  * «모아서 요약해 보내기» 같은 말과 낱말이 안 겹쳐 엉뚱한 기반(lecture-note)을 골랐다(10-08 라이브 실측).
  * 원형은 기반 후보 «맨 앞»에 서고, 키워드가 겹치는 만큼 점수를 얻는다.
+ * 각 원형은 그래프 값어치 신호를 둘 이상 실린다(G1 검증 judge · G2 되돌림 간선 ⊕ max_visits ≥ 2 · G3 승인 hitl · G4 갈래) —
+ * 단순 나열은 스킬 사슬이지 그래프가 아니다(RFC SW-GRAPH-SMELL · generate.ts graphSignals 로 잰다).
  */
 export interface WizardArchetype { id: string; description: string; keywords: string[]; text: string }
 
 export const WIZARD_ARCHETYPES: readonly WizardArchetype[] = [
   {
     id: 'wizard-collect-summarize-send',
-    description: '모아서 요약해 보내기 — 검색·수집 → 요약 → 텔레그램/알림 발송 (브리핑·다이제스트·동향)',
+    description: '모아서 요약해 보내기 — 검색·수집 → 요약 → 출처 대조(판정·되돌림) → 텔레그램/알림 발송 (브리핑·다이제스트·동향)',
     keywords: ['뉴스', '모아', '수집', '검색', '찾아', '요약', '정리', '보내', '알려', '텔레그램', '브리핑', '동향', '소식', 'news', 'digest', 'summary'],
     text: `graph_id: wizard-collect-summarize-send
 loop:
   title: 모아서 요약해 보내기
-  description: 검색으로 모은 내용을 요약해 텔레그램으로 보낸다
+  description: 검색으로 모은 내용을 요약하고 출처와 대조해 텔레그램으로 보낸다
   trigger:
     cron: "0 8 * * *"
 version: 1
@@ -21,13 +23,15 @@ entry_node: collect
 terminal_nodes: [done, failed]
 nodes:
   - { node_id: collect, kind: agent, recipe: 'cmd:collect', max_visits: 1 }  # 수집 | web-search | 검색어
-  - { node_id: summarize, kind: agent, recipe: 'cmd:summarize', max_visits: 1 }  # 요약 | summarize | 핵심 5줄 한국어
+  - { node_id: summarize, kind: agent, recipe: 'cmd:summarize', max_visits: 2 }  # 요약 | summarize | 핵심 5줄 한국어
+  - { node_id: check, kind: judge, recipe: 'cmd:check', max_visits: 2 }  # 출처 대조 | check | 요약이 수집 결과와 일치하는가
   - { node_id: send, kind: agent, recipe: 'cmd:send', max_visits: 1 }  # 텔레그램 발송 | telegram-send
   - { node_id: done, kind: gate, recipe: none, max_visits: 1 }  # 완료
   - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }  # 실패
 edges:
   - { from: collect, on: outcome, map: { ok: summarize, fail: failed } }
-  - { from: summarize, on: outcome, map: { ok: send, fail: failed } }
+  - { from: summarize, on: outcome, map: { ok: check, fail: failed } }
+  - { from: check, on: outcome, map: { ok: send, rework: summarize, fail: failed } }
   - { from: send, on: outcome, map: { ok: done, fail: failed } }
 `,
   },
@@ -60,12 +64,12 @@ edges:
   },
   {
     id: 'wizard-research-approve-publish',
-    description: '조사해 정리하고 승인 뒤 게시 — 조사 → 표/초안 정리 → 사람 승인 → 게시',
+    description: '조사해 정리하고 승인 뒤 게시 — 조사 → 표/초안 정리 → 출처 대조(판정·되돌림) → 사람 승인 → 게시',
     keywords: ['조사', '가격', '경쟁', '표', '정리', '승인', '올려', '게시', '노션', '초안', '블로그', '보고서'],
     text: `graph_id: wizard-research-approve-publish
 loop:
   title: 조사해 정리하고 승인 뒤 게시
-  description: 조사한 내용을 표로 정리하고 사람 승인 뒤 게시한다
+  description: 조사한 내용을 표로 정리하고 출처와 대조해 사람 승인 뒤 게시한다
   trigger:
     events: [manual]
 version: 1
@@ -73,14 +77,16 @@ entry_node: research
 terminal_nodes: [done, failed]
 nodes:
   - { node_id: research, kind: agent, recipe: 'cmd:research', max_visits: 1 }  # 조사 | web-search | 조사 주제
-  - { node_id: tabulate, kind: agent, recipe: 'cmd:tabulate', max_visits: 1 }  # 표로 정리 | llm | 결과를 마크다운 표로 정리
+  - { node_id: tabulate, kind: agent, recipe: 'cmd:tabulate', max_visits: 2 }  # 표로 정리 | llm | 결과를 마크다운 표로 정리
+  - { node_id: check, kind: judge, recipe: 'cmd:check', max_visits: 2 }  # 출처 대조 | check | 표가 조사 결과와 일치하는가
   - { node_id: approve, kind: hitl, recipe: 'approval:approve', max_visits: 1 }  # 게시 승인 | approval
   - { node_id: publish, kind: agent, recipe: 'cmd:publish', max_visits: 1 }  # 게시 | custom | 게시처에 올리기
   - { node_id: done, kind: gate, recipe: none, max_visits: 1 }  # 완료
   - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }  # 실패
 edges:
   - { from: research, on: outcome, map: { ok: tabulate, fail: failed } }
-  - { from: tabulate, on: outcome, map: { ok: approve, fail: failed } }
+  - { from: tabulate, on: outcome, map: { ok: check, fail: failed } }
+  - { from: check, on: outcome, map: { ok: approve, rework: tabulate, fail: failed } }
   - { from: approve, on: outcome, map: { ok: publish, fail: failed } }
   - { from: publish, on: outcome, map: { ok: done, fail: failed } }
 `,

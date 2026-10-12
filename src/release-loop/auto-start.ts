@@ -1,3 +1,4 @@
+import { debug } from '../debug/log.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 import { releaseReadiness, type ReleaseReadiness } from '../../scripts/release-loop/release-readiness.js';
 import { listSchedules, type ReleaseSchedule } from './release-schedule.js';
@@ -21,7 +22,7 @@ export type AutoStartResult =
   | { status: 'no-cut' }
   | { status: 'planned'; version: string; cutAt: string }
   | { status: 'skipped'; version: string; reason: AutoStartDeferral['reason'] }
-  | { status: 'started'; version: string; cutAt: string };
+  | { status: 'started'; version: string; cutAt: string; publishAt?: string };
 
 export interface AutoStartOptions {
   windowMinutes: number;
@@ -30,7 +31,7 @@ export interface AutoStartOptions {
   ledgerRoot?: string;
   schedules?: (root: string) => ReleaseSchedule[];
   readiness?: (version: string, ledgerRoot: string, now: Date) => ReleaseReadiness;
-  launch?: (version: string) => void | AutoStartDeferral | Promise<void | AutoStartDeferral>;
+  launch?: (version: string, launchOptions?: { publishAt?: string }) => void | AutoStartDeferral | Promise<void | AutoStartDeferral>;
 }
 
 /** Select from the release schedule; the existing `release run --if-ready` owns the launch-time lock and guards. */
@@ -40,12 +41,13 @@ export async function autoStartScheduledRelease(options: AutoStartOptions): Prom
   // Validate the window even when the ledger has no rows.
   const schedule = selectScheduledCut((options.schedules ?? listSchedules)(root), now, options.windowMinutes);
   if (!schedule) return { status: 'no-cut' };
-  const { version, cutAt } = schedule;
+  const { version, cutAt, publishAt } = schedule;
   if (!options.apply) return { status: 'planned', version, cutAt };
   const readiness = (options.readiness ?? ((v, ledgerRoot, at) => releaseReadiness(v, { ledgerRoot, now: () => at })))(version, root, now);
   if (!readiness.ready) return { status: 'skipped', version, reason: readiness.reason };
   if (!options.launch) throw new Error('auto-start apply requires a launch callback');
-  const launched = await options.launch(version);
+  const launched = await options.launch(version, publishAt != null ? { publishAt: publishAt } : {});
   if (launched?.deferred) return { status: 'skipped', version, reason: launched.reason };
-  return { status: 'started', version, cutAt };
+  debug.log('release.schedule', 'auto-start', { version, cutAt, publishAt: publishAt ?? null });
+  return { status: 'started', version, cutAt, ...(publishAt != null ? { publishAt: publishAt } : {}) };
 }

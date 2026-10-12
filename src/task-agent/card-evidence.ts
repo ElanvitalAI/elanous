@@ -13,7 +13,7 @@ import { readRunExits, type RunExit } from '../harness/harness-incidents.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
-import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
+import { appendRunLedgerEntry, type RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { cardPrNumber, taskAgentStatePath, updateTaskCard, readTaskCard, type TaskCard } from './task-hand.js';
 import { judgeNextMove, type TaskJudgeInput } from './judge.js';
 import { remoteParentAlive, type SshRunner } from './parent-host.js';
@@ -341,4 +341,91 @@ export async function refreshCardRunBinding(cardId: string, statePath = taskAgen
     try { debug.log('task-agent', 'card-pr-bound', { card: cardId, runId: next.runId ?? null, pr: next.pr.number, url: next.pr.url ?? null, childRunId: next.runChildId ?? null }); } catch { /* fail-soft */ }
   }
   return { card: next, evidence };
+}
+
+/** TA-WIRING-CHECK — `live-verified` 원장 줄의 이벤트 이름 · 카드 런 원장에 적는다. */
+export const WIRING_LIVE_VERIFIED_EVENT = 'live-verified';
+
+export interface WiringLiveVerifiedInput { pr: number; ref: string; ok: boolean }
+export interface WiringLiveVerifiedDeps { ledgerDir?: string; now?: () => Date }
+export type WiringLiveVerifiedOutcome = { written: true; entry: RunLedgerEntry } | { written: false; reason: string };
+
+/**
+ * 실물 1회를 돌린 뒤 남기는 기록 — 카드 런 원장에 `live-verified {pr, ref, ok, card}` 한 줄.
+ * `ref`(실물로 돌린 명령·화면 근거)가 비거나 카드에 런이 없거나 PR 번호가 자연수가 아니면 거부하고 쓰지 않는다.
+ */
+export function recordWiringLiveVerified(card: Pick<TaskCard, 'id' | 'runId'>, input: WiringLiveVerifiedInput, deps: WiringLiveVerifiedDeps = {}): WiringLiveVerifiedOutcome {
+  const ref = typeof input.ref === 'string' ? input.ref.trim() : '';
+  if (!ref) return { written: false, reason: 'ref 가 비었다 — 실물로 돌린 명령·화면 근거 한 줄이 필요하다' };
+  if (!Number.isSafeInteger(input.pr) || input.pr <= 0) return { written: false, reason: `pr 은 자연수다: ${input.pr}` };
+  if (!card.runId) return { written: false, reason: `카드 ${card.id} 에 런(runId)이 없다 — 기록할 원장이 없다` };
+  const entry: RunLedgerEntry = {
+    timestamp: (deps.now ?? (() => new Date()))().toISOString(),
+    runId: card.runId,
+    event: WIRING_LIVE_VERIFIED_EVENT,
+    data: { pr: input.pr, ref, ok: input.ok, card: card.id },
+  };
+  try {
+    appendRunLedgerEntry(entry, deps.ledgerDir);
+  } catch (error) {
+    return { written: false, reason: `원장 쓰기 실패: ${(error instanceof Error ? error.message : String(error)).slice(0, 200)}` };
+  }
+  return { written: true, entry };
+}
+
+export interface WiringEvidence {
+  /** 이 PR 이 배선(진입점·명령 등록·호출자 대입)을 바꿨나 — 그렇다면 실물 1회가 필요하다. */
+  required: boolean;
+  /** 카드 런 원장에 이 PR 의 `live-verified` ok 기록이 있나. */
+  liveRunRecorded: boolean;
+  /** 근거를 못 읽었다(gh 실패 · 원장 읽기 실패) — 관측만 하고 green 을 막지 않는다. */
+  unknown: boolean;
+}
+
+export interface WiringEvidenceDeps {
+  /** 카드 — 없으면 liveRunRecorded 는 false. */
+  card?: Pick<TaskCard, 'id' | 'runId'>;
+  /** `gh pr diff <pr>` 의 통합 diff 원문 — 한 번만 부른다(시험 주입). */
+  prDiff?: (pr: number) => string | Promise<string>;
+  loadLedger?: (runId: string) => RunLedgerEntry[] | null;
+}
+
+const WIRING_PATH = /(^|\/)(bin|scripts|cli)\/|(^|\/)[^/]*(install|auth|entrypoint)[^/]*$/i;
+const NON_WIRING_PATH = /^docs\/|\.md$|\.test\.[cm]?[jt]sx?$/;
+const WIRING_LINE = /\bregisterCommand\b|\.command\(|\.set\(|\.on\(|\bhandlers(?:\.\w+|\[[^\]]+\])\s*=(?!=)/;
+
+async function defaultPrDiff(pr: number): Promise<string> {
+  const { execFile } = await import('node:child_process');
+  return new Promise((resolveDiff, reject) => {
+    execFile('gh', ['pr', 'diff', String(pr)], { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024 }, (error, stdout) => (error ? reject(error) : resolveDiff(stdout)));
+  });
+}
+
+/** 순수 — 통합 diff 가 배선을 바꾸나. 문서·시험 파일은 보지 않는다. */
+export function diffTouchesWiring(diff: string): boolean {
+  for (const chunk of diff.split(/^diff --git /m)) {
+    const path = /^\S+ b\/(\S+)/.exec(chunk)?.[1] ?? '';
+    if (path && NON_WIRING_PATH.test(path)) continue;
+    if (path && WIRING_PATH.test(path)) return true;
+    const added = chunk.split('\n').filter((line) => line.startsWith('+') && !line.startsWith('+++'));
+    if (added.some((line) => WIRING_LINE.test(line))) return true;
+  }
+  return false;
+}
+
+/**
+ * 수집기 — 판단부(judge.ts) 밖에서만 gh 를 부른다. PR diff 는 «한 번» 읽고, gh·원장 읽기 실패는 던지지 않고 `unknown: true` 로 돌려준다.
+ */
+export async function collectWiringEvidence(pr: number, deps: WiringEvidenceDeps = {}): Promise<WiringEvidence> {
+  let unknown = false;
+  let required = false;
+  try { required = diffTouchesWiring(await (deps.prDiff ?? defaultPrDiff)(pr)); } catch { unknown = true; }
+  let liveRunRecorded = false;
+  if (deps.card?.runId) {
+    try {
+      const entries = (deps.loadLedger ?? await defaultLoadLedger())(deps.card.runId) ?? [];
+      liveRunRecorded = entries.some((entry) => entry.event === WIRING_LIVE_VERIFIED_EVENT && entry.data?.ok === true && entry.data?.pr === pr);
+    } catch { unknown = true; }
+  }
+  return { required, liveRunRecorded, unknown };
 }

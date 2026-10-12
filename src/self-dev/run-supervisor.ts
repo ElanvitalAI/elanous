@@ -39,6 +39,25 @@ export interface SupervisorRound {
    * history, which never measured it, so the no-PR streak guard reads it as «not measured» and stays off.
    */
   noPrTaskIds?: string[];
+  /**
+   * Piece key (normalized feature — {@link noPrStreakKey}) of each `noPrTaskIds` entry, same index. A rework round mints a
+   * new taskId for the same piece (run-27b03878: task:1ded008a8aeb → task:f54a6e6fca25 → task:fade5a6931a4), so the no-PR
+   * streak pairs rounds by this key. Omitted on older history — the guard then pairs by taskId as before.
+   */
+  noPrFeatureKeys?: string[];
+}
+
+/** Failed without a PR — a result that carries either a PR number or a PR URL has one (fixtures and older producers set only one). */
+function failedWithoutPr(result: SupervisorJobResult): boolean {
+  return result.status === 'failed' && result.prNumber === undefined && !result.prUrl;
+}
+
+/**
+ * «Same piece» key for the no-PR streak guard: the feature text with whitespace collapsed, lower-cased and trailing
+ * punctuation dropped. Empty when the result carries no feature — the caller then falls back to the taskId.
+ */
+export function noPrStreakKey(feature: unknown): string {
+  return typeof feature === 'string' ? resumeKey(feature).replace(/[\s.,;:!?。…·]+$/u, '') : '';
 }
 
 export const SUPERVISOR_STOP_REASONS = [
@@ -458,17 +477,27 @@ export function decideNextRun(input: {
   // AUT-NO-PROGRESS-RETRY-LOOP — 같은 후보가 PR 없이 두 라운드 연속 실패하면 세 번째 Pod 를 띄우지 않는다
   //   (부검 run-1166bcd1 · run-1bde4815 · run-427bd632 · run-46a02f42). 직전 라운드가 noPrTaskIds 를 안 쟀으면 서지 않는다.
   //   호출자가 stallRounds 를 기본보다 늘렸으면(제자리 인내를 늘림) 서지 않는다 — 0.2.24 컷 회귀(orchestrate-cli.test 라운드 상한 둘).
+  //   NO-PR-STREAK-FEATURE-KEY — 짝은 taskId 가 아니라 «같은 조각»(noPrFeatureKeys)으로 맞춘다: rework 가 라운드마다 taskId 를
+  //   새로 만들어 taskId 짝은 운영에서 한 번도 안 섰다(run-27b03878). 키를 안 잰 옛 원장·feature 없는 결과는 taskId 로(fail-open).
   const previousNoPr = history.at(-1)?.noPrTaskIds;
+  const previousNoPrKeys = history.at(-1)?.noPrFeatureKeys;
   if (previousNoPr !== undefined && retryIds.length > 0 && stallRounds <= DEFAULT_STALL_ROUNDS) {
-    const failedNoPr = (taskId: string) => activeResults.find((result) => result.taskId === taskId
-      && result.status === 'failed' && result.prNumber === undefined);
-    const streak = retryIds.every((taskId) => previousNoPr.includes(taskId) && failedNoPr(taskId) !== undefined);
+    const failedNoPr = (taskId: string) => activeResults.find((result) => result.taskId === taskId && failedWithoutPr(result));
+    const keyOf = (taskId: string): string => noPrStreakKey(activeResults.find((result) => result.taskId === taskId)?.feature);
+    const pairedBy = (taskId: string): 'feature-key' | 'task-id' =>
+      previousNoPrKeys !== undefined && keyOf(taskId) !== '' ? 'feature-key' : 'task-id';
+    const sameAsPrevious = (taskId: string): boolean => pairedBy(taskId) === 'feature-key'
+      ? previousNoPrKeys!.includes(keyOf(taskId))
+      : previousNoPr.includes(taskId);
+    const streak = retryIds.every((taskId) => sameAsPrevious(taskId) && failedNoPr(taskId) !== undefined);
     if (streak && !madeProgress(history.at(-1), thisRound)) {
       const errors = retryIds.flatMap((taskId) => {
         const message = failedNoPr(taskId)?.error?.message;
         return message ? [message.slice(0, 200)] : [];
       });
-      try { debug.log('self-dev.supervisor', 'no-pr-streak-stop', { taskIds: retryIds, round, errors }); } catch { /* fail-open */ }
+      try { debug.log('self-dev.supervisor', 'no-pr-streak-stop', {
+        taskIds: retryIds, featureKeys: retryIds.map(keyOf), pairedBy: [...new Set(retryIds.map(pairedBy))], round, errors,
+      }); } catch { /* fail-open */ }
       return {
         ...base,
         action: 'stop',
@@ -558,8 +587,9 @@ export function appendRound(
   const t = triageRun(results.filter((result) => result.salvage !== 'launched'), undefined, false, undefined, mainSyncRelaunchSpent(history));
   const baseCompleted = countBaseCompleted(results);
   const base = roundBase(results);
-  const noPrTaskIds = results.filter((result) => result.status === 'failed' && result.prNumber === undefined)
-    .map((result) => result.taskId);
+  const noPrResults = results.filter(failedWithoutPr);
+  const noPrTaskIds = noPrResults.map((result) => result.taskId);
+  const noPrFeatureKeys = noPrResults.map((result) => noPrStreakKey(result.feature));
   return [...history, {
     round: history.length,
     landed: countLanded(results),
@@ -586,7 +616,7 @@ export function appendRound(
       return { oscillationRepairTaskIds: pairs.map(([id]) => id!), oscillationRepairFeatures: pairs.map(([, feature]) => feature!),
         ...(decision.oscillation.repairGoals ? { oscillationRepairGoals: decision.oscillation.repairGoals } : {}) };
     })() : {}),
-    ...(noPrTaskIds.length > 0 ? { noPrTaskIds } : {}),
+    ...(noPrTaskIds.length > 0 ? { noPrTaskIds, noPrFeatureKeys } : {}),
   }];
 }
 

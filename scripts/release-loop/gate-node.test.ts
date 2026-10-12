@@ -1385,6 +1385,71 @@ test('cut Pod loads two baseline junit reports, logs the plan and writes planned
   } finally { log.mockRestore(); }
 });
 
+test('judgeGate plans cut and swept baseline from the prior ledger JUnit; the longest file sets the LPT critical path without changing shards.json', async () => {
+  const { root, instanceRoot, ledgerRoot, runner: fixtureRunner } = fake([], [], false);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts', 'src/d.test.ts'];
+  const source = join(ledgerRoot, 'release/1.0.0/gate-logs/cut');
+  mkdirSync(source, { recursive: true });
+  writeFileSync(join(source, 'pod-0.junit.xml'), `<testsuites>${files.map((file, index) => `<testsuite file="${file}" time="${index === 0 ? 100 : 1}"/>`).join('')}</testsuites>`);
+  const assigned: Array<{ tree: string; files: string[] }> = [];
+  let cutBoard: { v: number; version: string; updatedAt: string; shards: Array<Record<string, unknown>> } | undefined;
+  const observations: unknown[] = [];
+  const spy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'release-loop.gate' && event === 'pod-shard-plan') observations.push(data);
+  });
+  try {
+    const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+      if (cmd === 'rg') return { rc: 1, output: '' };
+      if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: cwd.endsWith('/baseline') ? BASE : CUT };
+      if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: args.includes('-z') ? 'src/a.test.ts\0' : `${files.join('\n')}\n` };
+      return fixtureRunner.command(cmd, args, cwd);
+    }, async (o) => {
+      const paths = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+      const tree = o.source?.kind === 'commit' && o.source.sha === BASE ? 'baseline' : 'cut';
+      assigned.push({ tree, files: paths });
+      const artifactsDir = join(root, `lpt-${assigned.length}`);
+      mkdirSync(artifactsDir);
+      const fails = tree === 'cut' && paths.includes(files[0]!) ? [A] : [];
+      writeFileSync(join(artifactsDir, 'shard.log'), `${fails.length ? 'src/a.test.ts:\n(fail) A [1.00ms]\n' : ''}${paths.length - fails.length} pass\n${fails.length} fail\nRan ${paths.length} tests across ${paths.length} files.\n`);
+      writeFileSync(join(artifactsDir, 'shard.rc'), `${fails.length ? 1 : 0}\n`);
+      return { exitCode: 0, artifactsDir, job: 'fake' };
+    }, new PodPoolScheduler([{ context: 'pool-test', capacity: 2, k3dCluster: 'test' }]));
+    runner.add = fixtureRunner.add;
+    runner.remove = fixtureRunner.remove;
+    runner.snapshot = fixtureRunner.snapshot;
+    runner.removeSnapshot = fixtureRunner.removeSnapshot;
+    const sweep = runner.sweep;
+    runner.sweep = async (tree, logDir, pod, only) => {
+      const result = await sweep(tree, logDir, pod, only);
+      if (tree.endsWith('/cut')) cutBoard = JSON.parse(readFileSync(gateShardsPath('1.0.1', ledgerRoot), 'utf8'));
+      return result;
+    };
+    const result = await judgeGate({ ...options(instanceRoot), ledgerRoot, repo, pod: { pool: 'pool-test', shards: 2 } }, runner);
+    expect(result).toMatchObject({ outcome: 'ok', baselineSource: 'swept', baselineDeferred: { cutFiles: 1, swept: 1 }, preexisting: 1 });
+    expect(assigned).toEqual([
+      { tree: 'cut', files: [files[0]!] }, { tree: 'cut', files: files.slice(1) },
+      { tree: 'baseline', files: [files[0]!] },
+    ]);
+    expect(observations).toEqual([
+      { shards: 2, known: 4, unknown: 0, maxPlannedSeconds: 100, source },
+      { shards: 1, known: 1, unknown: 0, maxPlannedSeconds: 100, source },
+    ]);
+    expect(cutBoard).toBeDefined();
+    const board = cutBoard!;
+    expect(Object.keys(board).sort()).toEqual(['shards', 'updatedAt', 'v', 'version']);
+    expect(board.v).toBe(1);
+    expect(board.version).toBe('1.0.1');
+    expect(board.shards).toHaveLength(2);
+    expect(board.shards.map((row) => row.plannedMin)).toEqual([1.7, 0.1]);
+    for (const row of board.shards) {
+      expect(Object.keys(row).sort()).toEqual(['endedAt', 'id', 'plannedMin', 'rc', 'state']);
+      expect(row.state).toBe('done');
+    }
+  } finally { spy.mockRestore(); }
+});
+
 test('the Pod sweep never assigns an integration-only file and logs that it left it out (0.2.7 run 5 install.test stall)', async () => {
   const { root, instanceRoot, ledgerRoot, runner: fixtureRunner } = fake([], []);
   const repo = join(root, 'repo');
@@ -3177,3 +3242,139 @@ test('GATE-MEM-ADMIT: sweep — the shard waits with a visible reason, then laun
   writeFileSync(context, JSON.stringify({ input: { commit: CUT, version: '1.0.1', previousVersion: '1.0.0', gatePodPool: 'p', gatePodAdmissionWaitSeconds: 45 }, outputs: {} }));
   expect(parseOptions(['--json'], { ELANOUS_GRAPH_CONTEXT: context })).toMatchObject({ pod: { pool: 'p', admissionWaitSeconds: 45 } });
 });
+
+// GATE-MULTI-HOST (0.2.25 · 대표) — the gate pool is a host roster: shards spread over its members, each shard's member is
+// recorded (shard json · pod-shard log · shards.json), and an unreachable member hands its shards to the others.
+function multiHostRig(members: Array<{ context: string; sshHost: string; capacity: number }>, fileCount: number, failOn: (context: string) => boolean) {
+  const root = mkdtempSync(join(tmpdir(), 'gate-multi-host-'));
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = Array.from({ length: fileCount }, (_, i) => `src/m-${String(i).padStart(2, '0')}.test.ts`);
+  const placements: Array<{ context: string; files: string[]; ok: boolean }> = [];
+  const active = new Map<string, number>();
+  const peak = new Map<string, number>();
+  const command: GateRunner['command'] = async (cmd, args) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: 'c'.repeat(40) };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return { rc: 0, output: '' };
+  };
+  // Stands in for runPodCommand: places through the gate's scheduler, then fails on a lost member (image sync / apply
+  // over a dead ssh/kubectl) or runs every part cleanly.
+  const pod = async (o: RunPodCommandOptions) => {
+    const pool = o.poolScheduler!;
+    let member = await pool.tryAcquire(undefined, undefined, { selfCapped: true });
+    while (!member) { await Bun.sleep(5); member = await pool.tryAcquire(undefined, undefined, { selfCapped: true }); }
+    const parts = [...o.command[2]!.matchAll(/run_part \d+ ([^&]*)/g)].map((m) => [...m[1]!.matchAll(/'\.\/([^']+)'/g)].map((f) => f[1]!));
+    try {
+      active.set(member.context, (active.get(member.context) ?? 0) + 1);
+      peak.set(member.context, Math.max(peak.get(member.context) ?? 0, active.get(member.context)!));
+      await Bun.sleep(20);
+      const ok = !failOn(member.context);
+      placements.push({ context: member.context, files: parts.flat(), ok });
+      if (!ok) throw new Error(`pod command: 이미지 판을 못 맞췄다: ssh: connect to host ${member.sshHost}: Operation timed out`);
+      const dir = join(root, o.name!);
+      mkdirSync(dir);
+      writeFileSync(join(dir, 'install.rc'), '0\n');
+      parts.forEach((part, index) => {
+        writeFileSync(join(dir, `part-${index}.log`), `${part.map((file) => `${file}:\n(pass) case [1.00ms]`).join('\n')}\n${part.length} pass\n0 fail\nRan ${part.length} tests across ${part.length} files.\n`);
+        writeFileSync(join(dir, `part-${index}.rc`), '0\n');
+      });
+      return { exitCode: 0, artifactsDir: dir, job: o.name! };
+    } finally {
+      active.set(member.context, active.get(member.context)! - 1);
+      pool.release(member);
+    }
+  };
+  const scheduler = new PodPoolScheduler(members.map((m) => ({ ...m, k3dCluster: 'elanous-pool' })));
+  const runner = createGateRunner(repo, undefined, command, pod, scheduler, () => '');
+  return { root, repo, files, runner, placements, peak };
+}
+
+function gateEvents() {
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const spy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'release-loop.gate') events.push({ event, data: data as Record<string, unknown> });
+  });
+  return { events, restore: () => spy.mockRestore() };
+}
+
+const ROSTER = [
+  { context: 'pool-node-b', sshHost: 'node-b', capacity: 4 },
+  { context: 'pool-node-c', sshHost: 'node-c', capacity: 2 },
+  { context: 'pool-wsl', sshHost: 'host-e-wsl', capacity: 2 },
+];
+
+test('GATE-MULTI-HOST: shards are split across the roster hosts (no member over its cap) and each shard records its host', async () => {
+  const { root, repo, files, runner, placements, peak } = multiHostRig(ROSTER, 16, () => false);
+  const { events, restore } = gateEvents();
+  const shardsFile = join(root, 'shards.json');
+  let result: Awaited<ReturnType<GateRunner['sweep']>>;
+  try { result = await runner.sweep(repo, join(root, 'logs'), { pool: 'roster', shards: 8, stallSeconds: 0, probeMember: () => true, shardsFile: { path: shardsFile, version: '0.2.25' } }); }
+  finally { restore(); rmSync(root, { recursive: true, force: true, maxRetries: 0 }); }
+  expect(result!.rc).toBe(0);
+  expect(result!.output).toContain(`Ran ${files.length} tests across ${files.length} files.`);
+  // Free-share placement fills every member in proportion to its cap — not 8 shards on one host.
+  const used = new Set(placements.map((p) => p.context));
+  expect(used.size).toBeGreaterThanOrEqual(2);
+  for (const m of ROSTER) expect(peak.get(m.context) ?? 0).toBeLessThanOrEqual(m.capacity);
+  const shardLogs = events.filter((e) => e.event === 'pod-shard');
+  expect(shardLogs).toHaveLength(8);
+  expect(shardLogs.every((e) => ROSTER.some((m) => m.context === e.data.host))).toBe(true);
+  expect(new Set(shardLogs.map((e) => e.data.host)).size).toBe(used.size);
+  expect(events.find((e) => e.event === 'pod-roster')?.data).toMatchObject({ multiHost: true, probe: true, members: ROSTER.map((m) => ({ context: m.context, host: m.sshHost, capacity: m.capacity })) });
+  expect(events.some((e) => e.event === 'pod-member-down' || e.event === 'pod-shard-host-retry')).toBe(false);
+}, 30_000);
+
+test('GATE-MULTI-HOST: when one host is unreachable the rest take its shards — the gate passes, the lost host is skipped from then on', async () => {
+  const { root, repo, files, runner, placements } = multiHostRig(ROSTER, 16, (context) => context === 'pool-node-c');
+  const { events, restore } = gateEvents();
+  const probed: string[] = [];
+  const shardsFile = join(root, 'shards.json');
+  let result: Awaited<ReturnType<GateRunner['sweep']>>;
+  let board: ReturnType<typeof readGateShards> = null;
+  let shardJson: Array<Record<string, unknown>> = [];
+  try {
+    result = await runner.sweep(repo, join(root, 'logs'), { pool: 'roster', shards: 8, stallSeconds: 0, shardsFile: { path: shardsFile, version: '0.2.25' },
+      probeMember: (m) => { probed.push(m.context); return m.context !== 'pool-node-c'; } });
+    board = readGateShards(shardsFile);
+    shardJson = Array.from({ length: 8 }, (_, i) => JSON.parse(readFileSync(join(root, 'logs', `pod-${i}.json`), 'utf8')) as Record<string, unknown>);
+  } finally { restore(); rmSync(root, { recursive: true, force: true, maxRetries: 0 }); }
+  // Every file measured exactly once on a live host — no split, no stalled shard, no gate failure.
+  expect(result!.rc).toBe(0);
+  expect(result!.output).toContain(`Ran ${files.length} tests across ${files.length} files.`);
+  expect(placements.filter((p) => p.ok).flatMap((p) => p.files).sort()).toEqual(files);
+  expect(placements.filter((p) => p.ok).every((p) => p.context !== 'pool-node-c')).toBe(true);
+  const lost = placements.filter((p) => !p.ok);
+  expect(lost.length).toBeGreaterThanOrEqual(1);
+  expect(lost.every((p) => p.context === 'pool-node-c')).toBe(true);
+  // Probed once: after that node-c is skipped for placement (only shards already placed there fail over).
+  expect(probed).toEqual(['pool-node-c']);
+  expect(events.filter((e) => e.event === 'pod-member-down').map((e) => e.data)).toEqual([
+    { member: 'pool-node-c', host: 'node-c', shard: expect.any(Number), error: expect.stringContaining('ssh: connect to host node-c'), remaining: ['pool-node-b', 'pool-wsl'] },
+  ]);
+  // Only the shards already placed on node-c (≤ its cap) fail; each fails over once — node-c is never chosen again.
+  expect(lost.length).toBeLessThanOrEqual(2);
+  expect(events.filter((e) => e.event === 'pod-shard-host-retry').map((e) => e.data.attempt)).toEqual(lost.map(() => 1));
+  expect(events.some((e) => /^pod-shard-(?:cap-)?split$|^pod-shard-isolate$/.test(e.event))).toBe(false);
+  // Evidence: the root shard json and the board carry the host; a shard that failed over ends on a live host.
+  expect(shardJson.every((j) => typeof j.host === 'string')).toBe(true);
+  expect(board?.shards.map((row) => row.state)).toEqual(Array(8).fill('done'));
+  expect(board?.shards.every((row) => row.host === 'pool-node-b' || row.host === 'pool-wsl')).toBe(true);
+}, 30_000);
+
+test('GATE-MULTI-HOST: a one-member pool keeps the old path — a failed launch is never probed or host-retried', async () => {
+  let calls = 0;
+  const { root, repo, runner } = multiHostRig([{ context: 'pool-node-b', sshHost: 'node-b', capacity: 4 }], 2, () => ++calls === 1);
+  const { events, restore } = gateEvents();
+  const probed: string[] = [];
+  let error: unknown;
+  try { await runner.sweep(repo, join(root, 'logs'), { pool: 'pool-node-b', shards: 1, stallSeconds: 0, probeMember: (m) => { probed.push(m.context); return false; } }); }
+  catch (caught) { error = caught; }
+  finally { restore(); rmSync(root, { recursive: true, force: true, maxRetries: 0 }); }
+  expect(error).toBeUndefined();
+  expect(probed).toEqual([]);
+  expect(events.some((e) => e.event === 'pod-member-down' || e.event === 'pod-shard-host-retry')).toBe(false);
+  // The old job-failed path: the 2-file root shard splits in halves.
+  expect(events.some((e) => e.event === 'pod-shard-split')).toBe(true);
+}, 30_000);

@@ -1,11 +1,13 @@
-import { describe, expect, test } from 'bun:test';
+import { beforeEach, describe, expect, test } from 'bun:test';
 import { gradePhaseCompletability } from '../autopilot/mission-phase-granularity.js';
 import { debug } from '../debug/log.js';
+import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
+import { clearLaunchRoleLlmOverrides, getUserConfig } from '../user-config.js';
 import type {
   GoalAuthoringGroundingDeps,
   GoalAuthoringGroundingResult,
 } from '../self-implement/goal-authoring-grounding.js';
-import type { SelfDevDecomposition } from './decompose.js';
+import { decomposeModel, type SelfDevDecomposition } from './decompose.js';
 import {
   decomposeFabricRequest,
   decomposeSelfDevGoalWithFabric,
@@ -579,5 +581,82 @@ describe('decomposeFabricRequest', () => {
     });
 
     expect(result.status).toBe('grounding-empty');
+  });
+});
+
+// ROLE-RELAY-SPLIT — 이 어댑터의 기본 resolve(src/self-dev/fabric-decompose-adapter.ts:
+// defaultFabricResolve)가 모델을 고르는 길. 순수 선택자 decomposeModel(src/self-dev/
+// decompose.ts · 단일 소유)을 공유한다 — 리뷰 모델 env ELANOUS_PR_REVIEW_MODEL 은
+// 어댑터 기본에 «새어 들지» 않는다.
+describe('decomposeModel — fabric adapter default model role (ROLE-RELAY-SPLIT)', () => {
+  // 해석 사다리가 읽는 전역(발사 override)을 지워 테스트를 결정론으로 만든다.
+  beforeEach(() => clearLaunchRoleLlmOverrides());
+
+  /** roleLlm 없이 provider 를 local 로 고정 — 티어 사다리가 결정론이 된다. */
+  function bareConfig() {
+    const config = getUserConfig();
+    return {
+      ...config,
+      llm: { ...config.llm, provider: 'local' as const, baseUrl: 'http://fabric-decompose.invalid/v1', model: 'test-fabric-decompose-model' },
+      roleLlm: undefined,
+      roleModels: undefined,
+      roleModelTiers: undefined,
+    };
+  }
+
+  /** 사다리가 읽는 env 만 바꾸고 끝나면 원래 값으로 되돌린다. */
+  function withEnv(changes: Record<string, string | undefined>, run: () => void): void {
+    const saved = Object.keys(changes).map((name) => [name, process.env[name]] as const);
+    for (const [name, value] of Object.entries(changes)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    try { run(); } finally {
+      for (const [name, value] of saved) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  }
+
+  test('ELANOUS_PR_REVIEW_MODEL 만 있으면 어댑터 기본에 새지 않는다 — planning 기본', () => {
+    withEnv({
+      ELANOUS_PR_REVIEW_MODEL: 'review-env-model-x',
+      ELANOUS_SKILL_PLAN_MODEL: undefined,
+      ELANOUS_ROLE_LLM_PLANNING: undefined,
+    }, () => {
+      const resolution = decomposeModel(undefined, { config: bareConfig() });
+      expect(resolution.model).not.toBe('review-env-model-x');
+      expect(resolution.model).toBe(lookupLlmTierSpec('local', 'best').model);
+      expect(resolution.source).toBe('default');
+    });
+  });
+
+  test('roleLlm.planning 설정 → 그 모델', () => {
+    withEnv({
+      ELANOUS_PR_REVIEW_MODEL: 'review-env-model-x',
+      ELANOUS_SKILL_PLAN_MODEL: undefined,
+      ELANOUS_ROLE_LLM_PLANNING: undefined,
+    }, () => {
+      const resolution = decomposeModel(undefined, {
+        config: { ...bareConfig(), roleLlm: { planning: { model: 'pinned-planning-model' } } },
+      });
+      expect(resolution.model).toBe('pinned-planning-model');
+      expect(resolution.source).toBe('config');
+    });
+  });
+
+  test('명시 model 인자 → 인자가 이긴다', () => {
+    withEnv({
+      ELANOUS_PR_REVIEW_MODEL: 'review-env-model-x',
+      ELANOUS_SKILL_PLAN_MODEL: undefined,
+      ELANOUS_ROLE_LLM_PLANNING: undefined,
+    }, () => {
+      const resolution = decomposeModel('explicit-decompose-model', {
+        config: { ...bareConfig(), roleLlm: { planning: { model: 'pinned-planning-model' } } },
+      });
+      expect(resolution.model).toBe('explicit-decompose-model');
+      expect(resolution.source).toBe('explicit');
+    });
   });
 });

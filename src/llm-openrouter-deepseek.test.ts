@@ -76,7 +76,60 @@ test('① 실 OpenRouter 배선: deepseek 요청에 open-weight 도구 규율이
   expect(bodies[0].model).toBe('deepseek/deepseek-v4.1-flash');
 });
 
-// ② effort 표
+// ①-a GLM-PROMPT-TUNE(2026-10-11): 규율 상수는 src/llm/open-weight-discipline.ts 로 옮겼고 줄 둘이 더해졌다.
+//    새 두 줄(Read 증거·완료 선언 전 시험 결과)이 open-weight(GLM) 요청에만 실린다 — codex·claude 는 불변.
+const TUNE_READ_LINE = '- 증거·근거로 적는 파일은 이번 작업에서 Read 로 연 파일만 — Grep·Glob 결과만으로 내용을 단정하지 마라.';
+const TUNE_IMPL_LINE = '- 구현을 끝냈다고 말하기 전에 바꾼 파일과 돌린 시험 명령·결과를 적어라.';
+
+async function captureToolBodies(model: string): Promise<string[]> {
+  const bodies: string[] = [];
+  const mock = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
+    bodies.push(String(init?.body));
+    return sse([{ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }] }]);
+  }) as typeof fetch);
+  try {
+    const provider = getProviderForConfig({ llm: { provider: 'openrouter', model, apiKey: 'k' } } as unknown as UserConfig);
+    await streamLLMWithTools([{ role: 'user', content: 'go' }], { onText() {}, dispatchTool: async () => 'ok' },
+      { provider, tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }], maxTurns: 2, model });
+  } finally {
+    mock.mockRestore();
+  }
+  return bodies;
+}
+
+test('①-a GLM(open-weight) 요청에 튜닝 두 줄이 실린다 — 상수 재수출 경로 포함', async () => {
+  expect(OPEN_WEIGHT_TOOL_DISCIPLINE).toContain(TUNE_READ_LINE);
+  expect(OPEN_WEIGHT_TOOL_DISCIPLINE).toContain(TUNE_IMPL_LINE);
+  const bodies = await captureToolBodies(GLM);
+  expect(bodies.length).toBeGreaterThan(0);
+  const all = bodies.join('\n');
+  expect(all).toContain('[open-weight tool-use discipline]');
+  expect(all).toContain(TUNE_READ_LINE);
+  expect(all).toContain(TUNE_IMPL_LINE);
+});
+
+test('①-a 대조: codex·claude 요청에는 튜닝 두 줄이 실리지 않는다', async () => {
+  for (const [provider, model] of [['openai-codex', 'gpt-5.6-terra'], ['anthropic', 'claude-sonnet-4-5']] as const) {
+    const bodies: string[] = [];
+    const mock = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
+      bodies.push(String(init?.body));
+      return sse([{ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }] }]);
+    }) as typeof fetch);
+    try {
+      const prov = getProviderForConfig({ llm: { provider, model, apiKey: 'k' } } as unknown as UserConfig);
+      await streamLLMWithTools([{ role: 'user', content: 'go' }], { onText() {}, dispatchTool: async () => 'ok' },
+        { provider: prov, tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }], maxTurns: 1, model });
+    } finally {
+      mock.mockRestore();
+    }
+    expect(bodies.length).toBeGreaterThan(0);
+    const all = bodies.join('\n');
+    expect(all).not.toContain('[open-weight tool-use discipline]');
+    expect(all).not.toContain(TUNE_READ_LINE);
+    expect(all).not.toContain(TUNE_IMPL_LINE);
+  }
+});
+
 test('② DeepSeek V4: xhigh·max → xhigh · off/모르는 값 → 칸 없음 · 나머지는 그대로', async () => {
   for (const [req, sent] of [['xhigh', 'xhigh'], ['max', 'xhigh'], ['high', 'high'], ['medium', 'medium'], ['low', 'low'], ['minimal', 'low']] as const) {
     expect((await capture(FLASH, hello, { reasoningEffort: req })).reasoning).toEqual({ effort: sent });

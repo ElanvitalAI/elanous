@@ -683,8 +683,9 @@ function isLongNoFindingBracket(text: string): boolean {
   return NO_FINDING_HEAD.test(remark) && !LONG_REMARK_DISSENT.test(remark);
 }
 /** must-fix 항목이 «지적 없음» 표지인가 — must-fix 를 세는 자리는 전부 `parseReviewResult` 를 거친다
- *  (`self review --json` 의 `mustFix` → TA `parseReviewResultOutput` → `pr land --overlap-evidence` 의 `review-must-fix-N`). */
-function isNoneSentinelFinding(finding: string): boolean {
+ *  (`self review --json` 의 `mustFix` → TA `parseReviewResultOutput` → `pr land --overlap-evidence` 의 `review-must-fix-N`).
+ *  ⭐ export — `parseReviewResultOutput` 가 «같은» 판정으로 저장된 결과의 표지 줄을 다시 접는다(PR-LAND-MUSTFIX-NONE · 복제 금지). */
+export function isNoneSentinelFinding(finding: string): boolean {
   const text = finding.trim();
   if (BARE_SENTINEL.test(text)) return true;
   const bracketed = BRACKETED_SENTINEL.exec(text);
@@ -763,6 +764,25 @@ function reviewedResultFromRaw(raw: string, runId: string | undefined, pass?: { 
     });
   } catch { /* Observation must not prevent the review. */ }
   return { verdict: 'pass', mustFix: [], shouldFix: [], reviewed: false, failureReason: NO_VERDICT_LINE_REASON };
+}
+
+/** REVIEW-PROMPT-SIZE — llmReview 호출 하나(단일·청크 패스)마다 프롬프트·응답 크기를 남긴다.
+ *  관측이 리뷰를 막지 않는다(다른 review.* 관측과 같은 계약). */
+function logReviewPromptSize(
+  prompt: string,
+  response: string,
+  pass: { pass: number; chunked: boolean },
+  runId: string | undefined,
+): void {
+  try {
+    debug.log('review.prompt-size', 'call', {
+      pass: pass.pass,
+      promptChars: prompt.length,
+      responseChars: response.length,
+      chunked: pass.chunked,
+      ...(runId !== undefined ? { runId } : {}),
+    });
+  } catch { /* Observation must not prevent the review. */ }
 }
 
 function failureReasonText(error: unknown): string {
@@ -916,10 +936,11 @@ export async function reviewPullRequest(
             + ' 「여기 안 보인다」를 결함으로 판정하지 마십시오.',
           ].filter(Boolean).join('\n'),
         };
-        passResults.push(reviewedResultFromRaw(await llmReview(
-          buildReviewPrompt(passInput, passBudget, '', passContext[index]?.budget),
-          reviewImages.length > 0 && index === 0 ? reviewImages : undefined,
-        ), input.reviewContext?.runId, { index, of: plan.passes.length }));
+        const passPrompt = buildReviewPrompt(passInput, passBudget, '', passContext[index]?.budget);
+        const passImages = reviewImages.length > 0 && index === 0 ? reviewImages : undefined;
+        const passRaw = await llmReview(passPrompt, passImages);
+        logReviewPromptSize(passPrompt, passRaw, { pass: index + 1, chunked: true }, input.reviewContext?.runId);
+        passResults.push(reviewedResultFromRaw(passRaw, input.reviewContext?.runId, { index, of: plan.passes.length }));
       }
       return {
         ...foldReviewResults(passResults),
@@ -943,10 +964,9 @@ export async function reviewPullRequest(
         } : {}),
       };
     }
-    const raw = await llmReview(
-      buildReviewPrompt(input, diffBudget, referencedContext.text, singleContextBudget),
-      reviewImages.length > 0 ? reviewImages : undefined,
-    );
+    const prompt = buildReviewPrompt(input, diffBudget, referencedContext.text, singleContextBudget);
+    const raw = await llmReview(prompt, reviewImages.length > 0 ? reviewImages : undefined);
+    logReviewPromptSize(prompt, raw, { pass: 1, chunked: false }, input.reviewContext?.runId);
     return {
       ...reviewedResultFromRaw(raw, input.reviewContext?.runId),
       diffBudget: {

@@ -8215,6 +8215,45 @@ describe('runSelfImplement — docs Markdown 대량 삭제 auto-merge guard', ()
     expect(openPrCalls.at(-1)?.draft).toBe(false);
   });
 
+  describe('REVIEW-ACP-POD ②-b: a review deferred to the host', () => {
+    const deferredSeams = () => {
+      const calls = { merge: 0 };
+      const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+      s.reviewDiff = async () => ({ verdict: 'warn', mustFix: [], shouldFix: [], summary: '(deferred)', reviewed: false, failureReason: 'deferred-to-host', deferredToHost: true });
+      s.mergePr = async () => { calls.merge++; return { merged: true }; };
+      s.readPrCommitShas = async () => ({ baseCommit: 'b'.repeat(40), headCommit: 'a'.repeat(40) });
+      return { s, calls };
+    };
+
+    test('mergeByHost: the deferred non-review reaches merge-ready and says so in mergeReason (host ACP decides)', async () => {
+      const { s, calls } = deferredSeams();
+      const result = await runSelfImplement({ feature: 'deferred to host', mergeByHost: true, seams: s });
+      expect(calls.merge).toBe(0);
+      expect(result.stage).toBe('merge-ready');
+      expect(result.checkedHeadCommit).toBe('a'.repeat(40));
+      expect(result.mergeReason).toBe('review-deferred-to-host');
+      expect(result.review?.reviewed).toBe(false);
+      expect(result.reviewedHeadCommit).toBeUndefined();
+    });
+
+    test('without mergeByHost the same deferred review is no review — no-real-review, never merged', async () => {
+      const { s, calls } = deferredSeams();
+      const result = await runSelfImplement({ feature: 'deferred local', autoMerge: true, seams: s });
+      expect(calls.merge).toBe(0);
+      expect(result.stage).not.toBe('merged');
+      expect(result.stage).not.toBe('merge-ready');
+      expect(result.mergeReason).toBe('no-real-review');
+    });
+
+    test('a plain reviewed=false (no deferral flag) under mergeByHost still stops as no-real-review', async () => {
+      const { s } = deferredSeams();
+      s.reviewDiff = async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: '(x)', reviewed: false, failureReason: 'acp-error' });
+      const result = await runSelfImplement({ feature: 'unreviewed host', mergeByHost: true, seams: s });
+      expect(result.stage).not.toBe('merge-ready');
+      expect(result.mergeReason).toBe('no-real-review');
+    });
+  });
+
   describe('FREEZE-POD: a Pod child never merges its own PR', () => {
     const podEnv = async <T>(fn: () => Promise<T>): Promise<T> => {
       const saved = { sub: process.env.ELANOUS_SUBSTRATE, name: process.env.ELANOUS_POD_NAME };
@@ -11278,6 +11317,51 @@ describe('runSelfImplement — rework budget judgment', () => {
     expect(evidenceReads).toBe(0);
     expect(launches).toBe(0);
     expect(events.filter((entry) => entry.event === 'rework-salvage')).toHaveLength(0);
+  });
+
+  // ⭐ FLEX-PREMISE-REVIEW(0.2.25 · FLEX-RFC §A-③) — 확정된 UNCONVERGEABLE 은 전제 되짚기 카드를
+  //   «별도 원장 사건»('premise-review')으로 남긴다. 카드 자체는 판정 provider 가 판정 안에서 세우고
+  //   (생산 경로가 createReworkBudgetJudgment 에 premiseInput 을 넘긴다), 이 시험은 그 카드가 원장에
+  //   도달하는 배선을 잰다 — 카드가 없으면 사건도 없다.
+  test('확정된 UNCONVERGEABLE 은 premise-review 카드를 별도 원장 사건으로 남긴다', async () => {
+    const original = debug.log;
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
+      events.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      const s = seams({ gateResults: [false, false] });
+      s.diagnose = async () => 'BUDGET: UNCONVERGEABLE\nREASON: 반복 지적';
+      s.judgmentCallLLM = async () => 'UNCONVERGEABLE';
+      // P3 경로를 실제로 지나게 — 대상 경로를 선언하고, 게이트가 그 밖의 시험 파일에서 실패한다.
+      s.gate = async () => ({
+        passed: false, log: 'gate failed',
+        baselineFailures: [{ name: 'other red', file: 'src/other/place.test.ts', baselinePresence: 'missing', attribution: 'introduced' }],
+        reflectGateFacts: { introduced: 1, preexisting: 0, unknown: 0 },
+      });
+      const feature = '대상 경로: src/self-implement/flex-signals.ts\n신설: src/self-implement/premise-review.ts\n전제 되짚기 배선';
+      const result = await runSelfImplement({ feature, goalFile: budgetGoalFile(), writeGoalExecutionRecord: () => {}, maxReworkRounds: 2, reworkBudgetShadowStop: false, seams: s });
+      expect(result.outcome).toBe('abandoned');
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+    const premiseEvents = events.filter((entry) => entry.event === 'premise-review');
+    const budgetEvents = events.filter((entry) => entry.event === 'rework-budget');
+    expect(premiseEvents).toHaveLength(1);
+    const card = premiseEvents[0]!.data as { runId: unknown; findings: Array<{ premise: unknown; verdict: unknown; evidence: unknown }>; proposal: unknown };
+    expect(typeof card.runId).toBe('string');
+    expect(card.findings).toHaveLength(5);
+    expect(card.findings.find((finding) => finding.premise === 'P3')).toEqual({ premise: 'P3', verdict: 'wrong', evidence: 'src/other/place.test.ts' });
+    expect(card.proposal).toEqual({ premise: 'P3', verdict: 'wrong', evidence: 'src/other/place.test.ts' });
+    for (const finding of card.findings) {
+      expect(typeof finding.premise).toBe('string');
+      expect(['ok', 'wrong', 'unknown'] as unknown[]).toContain(finding.verdict);
+      expect('evidence' in finding).toBe(true);
+    }
+    // 카드는 rework-budget 사건의 증거에도 실린다 — 두 사건은 같은 판정에서 나온 것이다.
+    const unconvergeableBudget = events.filter((entry) => entry.event === 'rework-budget' && entry.data.verdict === 'UNCONVERGEABLE');
+    const lastBudget = unconvergeableBudget[unconvergeableBudget.length - 1]!;
+    expect(lastBudget.data.evidence).toMatchObject({ premiseReview: { runId: card.runId } });
   });
 
   test('diagnose가 이력·골·kind·현재 상한을 받고 항목별·최근 라운드 상한이 적용된다', async () => {
@@ -14604,7 +14688,8 @@ describe('evidenceCoverage 가 리뷰 컨텍스트까지 간다 (JDG-S4/S5)', ()
         'goal',
         '## REQUIRED EVIDENCE',
         '- [wiring] changed unit is reached from the existing caller',
-        '- [preservation] existing condition remains unchanged',
+        // EVIDENCE-WIRING-EXEMPT: a commandless [preservation] is now covered by a passed gate — the real gap is [requested].
+        '- [requested] the requested behavior holds',
         '## 답하지 못하는 것',
         '- Author limitation: changed unit is reached from the existing caller',
       ].join('\n');
@@ -14630,7 +14715,7 @@ describe('evidenceCoverage 가 리뷰 컨텍스트까지 간다 (JDG-S4/S5)', ()
         evidenceCoverageMeasured: true,
         requiredEvidence: 2,
         coveredByLimitationEvidence: ['wiring'],
-        uncoveredEvidence: ['preservation'],
+        uncoveredEvidence: ['requested'],
         coveredByLimitationCount: 1,
         uncoveredCount: 1,
       }),

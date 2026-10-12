@@ -1,4 +1,5 @@
 import { executeClassifyNode } from '../workflow-runtime/nodes/classify.js';
+import { buildPremiseCard, type PremiseReviewCard, type PremiseReviewInput } from './premise-review.js';
 import { SUPERVISION_REWORK_SOURCES, type SupervisionReworkSource } from './supervision-vocabulary.js';
 import type { ClassifyNode, JudgmentContext, JudgmentResult, NodeExecContext, WorkflowDefinition, WorkflowDeps } from '../workflow-runtime/types.js';
 
@@ -22,6 +23,8 @@ interface ObservedValue {
 interface ReworkBudgetEvidence {
   observations: Record<'goal' | 'outcome' | 'history' | 'kind', ObservedValue>;
   modelReasoning: string;
+  /** UNCONVERGEABLE 직전에 세운 premise-review 카드(FLEX-RFC §A-③). 카드를 안 만든 판정에는 키가 없다. */
+  premiseReview?: PremiseReviewCard | undefined;
 }
 
 type EvidencedJudgmentResult = JudgmentResult & { evidence: ReworkBudgetEvidence };
@@ -108,7 +111,13 @@ export function reworkBudgetEvidenceForObservation(readEvidence: () => unknown):
   }
 }
 
-export function createReworkBudgetJudgment(callLLM: WorkflowDeps['callLLM']) {
+/** `createReworkBudgetJudgment` 의 선택 인자 — 주지 않으면 카드 없이 지금 동작 그대로. */
+export interface ReworkBudgetJudgmentOpts {
+  /** UNCONVERGEABLE 판정 직전에 세울 premise-review 카드의 입력(값 객체). */
+  premiseInput?: PremiseReviewInput | undefined;
+}
+
+export function createReworkBudgetJudgment(callLLM: WorkflowDeps['callLLM'], opts: ReworkBudgetJudgmentOpts = {}) {
   let latestEvidence: ReworkBudgetEvidence | undefined;
   const provider = async (contractId: string, ctx: JudgmentContext): Promise<JudgmentResult> => {
     if (contractId !== REWORK_BUDGET_JUDGMENT) {
@@ -145,6 +154,7 @@ export function createReworkBudgetJudgment(callLLM: WorkflowDeps['callLLM']) {
       toolPolicy: {},
     };
     let modelReasoning = '';
+    let premiseReview: PremiseReviewCard | undefined;
     const result = await executeClassifyNode(node, execContext, {
       callLLM: async (args) => {
         modelReasoning = await callLLM(args);
@@ -152,7 +162,11 @@ export function createReworkBudgetJudgment(callLLM: WorkflowDeps['callLLM']) {
       },
       runBash: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     });
-    const evidence = (): ReworkBudgetEvidence => ({ observations, modelReasoning });
+    const evidence = (): ReworkBudgetEvidence => ({
+      observations,
+      modelReasoning,
+      ...(premiseReview === undefined ? {} : { premiseReview }),
+    });
     const evidenced = (judgment: JudgmentResult): EvidencedJudgmentResult => {
       const resultWithEvidence = withEvidence(judgment, evidence());
       latestEvidence = resultWithEvidence.evidence;
@@ -172,7 +186,13 @@ export function createReworkBudgetJudgment(callLLM: WorkflowDeps['callLLM']) {
           + ` expected one of EXTEND|SUFFICIENT|UNCONVERGEABLE`,
       });
     }
-    return evidenced({ ok: true, output: picked, verdict: mapReworkBudgetVerdict(picked, kind) });
+    const verdict = mapReworkBudgetVerdict(picked, kind);
+    // FLEX-RFC §A-③ — UNCONVERGEABLE 을 «내기 전에» 전제를 되짚는다. 카드는 기존 증거 관측에 실려
+    // 원장('rework-budget' 사건)으로 나간다 — 사건 형식은 그대로, 카드는 증거 안의 추가 칸이다.
+    if (picked === 'UNCONVERGEABLE' && opts.premiseInput !== undefined) {
+      premiseReview = buildPremiseCard(opts.premiseInput);
+    }
+    return evidenced({ ok: true, output: picked, verdict });
   };
   return Object.assign(provider, { evidenceForObservation: () => latestEvidence });
 }

@@ -1,3 +1,4 @@
+import { formatGateFailedId } from './premise-review.js';
 import { describe, expect, it } from 'bun:test';
 import { runWorkflowToCompletion } from '../workflow-runtime/executor.js';
 import type { JudgmentContext, RunWorkflowOpts, WorkflowDeps } from '../workflow-runtime/types.js';
@@ -254,5 +255,79 @@ describe('rework-budget@v1 — 분류가 안 읽혔을 때', () => {
     //    ⇒ 원본이 필요해지면 `classify.ts` 가 실어야 하고, 그때 이 시험이 «깨져서» 알려 준다.
     expect(empty.error).toBe(wrong.error);
     expect(empty.error).toContain('unknown');
+  });
+});
+
+// FLEX-RFC §A-③ — UNCONVERGEABLE 직전에 세우는 premise-review 카드. 카드는 기존 증거 관측에 실려
+// 원장('rework-budget' 사건)으로 나간다 — 증거 관측 꼴은 카드가 있을 때만 `premiseReview` 칸이 더해진다.
+describe('rework-budget@v1 — premise-review 카드', () => {
+  it('UNCONVERGEABLE 직전에 카드를 세워 증거·원장 관측에 남긴다', async () => {
+    const provider = createReworkBudgetJudgment(async () => 'UNCONVERGEABLE', {
+      premiseInput: {
+        runId: 'run-premise-wire',
+        gateFailedIdsByRound: [
+          [
+            formatGateFailedId({ name: 'flex works', file: 'src/self-implement/flex-signals.test.ts', attribution: 'introduced' }),
+            formatGateFailedId({ name: 'other red', file: 'src/other/place.test.ts', attribution: 'introduced' }),
+          ],
+        ],
+        failureAttributions: ['introduced', 'introduced'],
+        round: 3,
+        plannedRounds: 3,
+        targetPaths: ['src/self-implement/flex-signals.ts'],
+      },
+    });
+    const result = await provider(REWORK_BUDGET_JUDGMENT, { kind: 'review', goal: 'input' });
+    expect(result).toMatchObject({
+      ok: true,
+      output: 'UNCONVERGEABLE',
+      verdict: 'abandon',
+      evidence: {
+        modelReasoning: 'UNCONVERGEABLE',
+        premiseReview: {
+          runId: 'run-premise-wire',
+          proposal: { premise: 'P3', verdict: 'wrong', evidence: 'src/other/place.test.ts' },
+        },
+      },
+    });
+    expect(reworkBudgetEvidenceForObservation(provider.evidenceForObservation)).toEqual({
+      evidence: {
+        observations: {
+          goal: { state: 'present', value: 'input' },
+          outcome: { state: 'missing' },
+          history: { state: 'missing' },
+          kind: { state: 'present', value: 'review' },
+        },
+        modelReasoning: 'UNCONVERGEABLE',
+        premiseReview: {
+          runId: 'run-premise-wire',
+          findings: [
+            { premise: 'P1', verdict: 'unknown', evidence: '못 잼' },
+            { premise: 'P2', verdict: 'ok', evidence: 'preexisting 0/2' },
+            { premise: 'P3', verdict: 'wrong', evidence: 'src/other/place.test.ts' },
+            { premise: 'P4', verdict: 'unknown', evidence: '못 잼' },
+            { premise: 'P5', verdict: 'unknown', evidence: '못 잼' },
+          ],
+          proposal: { premise: 'P3', verdict: 'wrong', evidence: 'src/other/place.test.ts' },
+        },
+      },
+    });
+  });
+
+  it('카드 입력을 주지 않으면 UNCONVERGEABLE 도 증거 꼴을 바꾸지 않는다', async () => {
+    const provider = createReworkBudgetJudgment(async () => 'UNCONVERGEABLE');
+    const result = await provider(REWORK_BUDGET_JUDGMENT, { kind: 'review', goal: 'input' });
+    expect(result).toMatchObject({ ok: true, output: 'UNCONVERGEABLE', verdict: 'abandon' });
+    expect(reworkBudgetEvidenceForObservation(provider.evidenceForObservation)).toEqual({
+      evidence: {
+        observations: {
+          goal: { state: 'present', value: 'input' },
+          outcome: { state: 'missing' },
+          history: { state: 'missing' },
+          kind: { state: 'present', value: 'review' },
+        },
+        modelReasoning: 'UNCONVERGEABLE',
+      },
+    });
   });
 });

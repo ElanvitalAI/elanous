@@ -151,6 +151,7 @@ describe('confirmed main merge checklist sync', () => {
       expect(f.items[0]).toMatchObject({ status: 'green', evidence: '#43' });
       expect(f.items[1]).toMatchObject({ status: 'yellow' });
       expect(events).toEqual([
+        { event: 'merged-pr-cell-source', data: { pr: 43, id: 'X', source: 'title' } },
         { event: 'merged-pr-evidence-added', data: { version: '0.2.12', id: 'X', pr: 43, ref: '#43' } },
         { event: 'merged-pr-status-green', data: { version: '0.2.12', id: 'X', pr: 43, from: 'red', to: 'green' } },
       ]);
@@ -243,7 +244,7 @@ describe('confirmed main merge checklist sync', () => {
       syncMergedPrChecklist(53, f.root, undefined, f.deps);
       expect(f.calls).toEqual(['evidence X #53']);
       expect(f.items[0]).toMatchObject({ status: 'yellow', evidence: '#53' });
-      expect(f.events).toEqual(['merged-pr-evidence-added']);
+      expect(f.events).toEqual(['merged-pr-cell-source', 'merged-pr-evidence-added', 'merged-pr-cell-source']);
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   });
 
@@ -304,7 +305,7 @@ describe('confirmed main merge checklist sync', () => {
       log: (_category, event) => { events.push(event); },
     });
     expect(writes).toEqual(['0.2.12 Y #57']);
-    expect(events).toEqual(['merged-pr-cell-ambiguous', 'merged-pr-evidence-added']);
+    expect(events).toEqual(['merged-pr-cell-source', 'merged-pr-cell-source', 'merged-pr-cell-ambiguous', 'merged-pr-evidence-added']);
   });
 
   test('SQLite-only checklist version is discovered without a schedule or a legacy directory', () => {
@@ -355,7 +356,7 @@ describe('confirmed main merge checklist sync', () => {
       syncMergedPrChecklist(48, f.root, join(f.root, 'missing-goal.txt'), f.deps);
       expect(f.calls).toEqual(['evidence X #48']);
       expect(f.items[0]).toMatchObject({ status: 'yellow', evidence: '#48' });
-      expect(f.events).toEqual(['merged-pr-goal-unreadable', 'merged-pr-evidence-added']);
+      expect(f.events).toEqual(['merged-pr-goal-unreadable', 'merged-pr-cell-source', 'merged-pr-evidence-added']);
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   });
 
@@ -373,10 +374,48 @@ describe('confirmed main merge checklist sync', () => {
     try {
       syncMergedPrChecklist(44, f.root, undefined, f.deps);
       expect(f.calls).toEqual([]);
-      expect(f.events).toEqual(['merged-pr-cell-not-found']);
+      expect(f.events).toEqual(['merged-pr-cell-source', 'merged-pr-cell-not-found']);
       f.deps.readPr = () => ({ state: 'MERGED', baseRefName: 'other', title: '칸: Y', body: '', mergedAt: '2026-10-02T00:00:00Z' });
       syncMergedPrChecklist(45, f.root, undefined, f.deps);
       expect(f.calls).toEqual([]);
+      expect(f.events).toEqual(['merged-pr-cell-source', 'merged-pr-cell-not-found']);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  test('body 칸: A · B designates both cells for evidence', () => {
+    const f = fixture([item('A'), item('B')], 'misc', '칸: A · B');
+    try {
+      const events: Array<{ event: string; data: unknown }> = [];
+      syncMergedPrChecklist(60, f.root, undefined, { ...f.deps, log: (_c, event, data) => { events.push({ event, data }); } });
+      expect(f.calls).toEqual(['evidence A #60', 'evidence B #60']);
+      expect(f.items[0]).toMatchObject({ status: 'yellow', evidence: '#60' });
+      expect(f.items[1]).toMatchObject({ status: 'yellow', evidence: '#60' });
+      expect(events.filter(({ event }) => event === 'merged-pr-cell-source')).toEqual([
+        { event: 'merged-pr-cell-source', data: { pr: 60, id: 'A', source: 'body' } },
+        { event: 'merged-pr-cell-source', data: { pr: 60, id: 'B', source: 'body' } },
+      ]);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  test('goal file - 칸 id: X designates X when body and title have no cell', () => {
+    const f = fixture([item('X')], 'misc', 'background', '- 칸 id: X\n');
+    try {
+      const events: Array<{ event: string; data: unknown }> = [];
+      syncMergedPrChecklist(61, f.root, f.path, { ...f.deps, log: (_c, event, data) => { events.push({ event, data }); } });
+      expect(f.calls).toEqual(['evidence X #61']);
+      expect(f.items[0]).toMatchObject({ status: 'yellow', evidence: '#61' });
+      expect(events.filter(({ event }) => event === 'merged-pr-cell-source')).toEqual([
+        { event: 'merged-pr-cell-source', data: { pr: 61, id: 'X', source: 'goal' } },
+      ]);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  test('칸: Y inside a quote or code block is not a designation', () => {
+    const f = fixture([item('Y')], 'misc', '> 칸: Y\n```\n칸: Y\n```\n');
+    try {
+      syncMergedPrChecklist(62, f.root, undefined, f.deps);
+      expect(f.calls).toEqual([]);
+      expect(f.items[0]?.evidence).toBeUndefined();
       expect(f.events).toEqual(['merged-pr-cell-not-found']);
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   });

@@ -43,8 +43,13 @@ export interface AnnotateIntakeLensResult {
   capped: boolean;
 }
 
+/** 렌즈가 판정하는 갈래 — 하루 상한을 갈래별로 번갈아 나눈다(한 갈래가 많아도 다른 갈래가 0 이 되지 않게). */
+export type LensLane = 'outbox' | 'github' | 'x';
+export const LENS_LANES: readonly LensLane[] = ['outbox', 'github', 'x'];
+
 interface GroupedItem {
   id: string;
+  lane?: LensLane;
   facts: { fact: string; current: string }[];
   url?: string;
 }
@@ -88,7 +93,7 @@ function groupOutbox(root: string, day: string): GroupedItem[] {
       if (!id || !fact) continue;
       let group = groups.get(id);
       if (!group) {
-        group = { id, facts: [] };
+        group = { id, lane: 'outbox', facts: [] };
         groups.set(id, group);
         order.push(id);
       }
@@ -113,10 +118,37 @@ function ledgerLensItems(root: string, day: string, existing: ReadonlySet<string
         .map((fact) => ({ fact, current: '' }));
       if (!facts.length) continue;
       seen.add(item.id);
-      items.push({ id: item.id, facts, url: item.url });
+      items.push({ id: item.id, lane: source, facts, url: item.url });
     }
   }
   return items;
+}
+
+/**
+ * 남은 몫(remaining)을 갈래별로 번갈아 채운다 — 매 칸마다 «이미 판정된 수 ⊕ 이번에 고른 수»가 가장 적은 갈래에서
+ * 하나를 꺼낸다(동점이면 LENS_LANES 순서). 비거나 다 쓴 갈래의 몫은 남은 갈래로 넘어간다. 총량은 remaining 을 넘지 않는다.
+ */
+export function fairLensBatch<T extends { id: string; lane?: LensLane }>(
+  pending: readonly T[],
+  doneByLane: Readonly<Partial<Record<LensLane, number>>>,
+  remaining: number,
+): T[] {
+  const queues = new Map<LensLane, T[]>(LENS_LANES.map((lane) => [lane, []]));
+  for (const item of pending) queues.get(item.lane ?? 'outbox')!.push(item);
+  const used = new Map<LensLane, number>(LENS_LANES.map((lane) => [lane, doneByLane[lane] ?? 0]));
+  const picked = new Set<string>();
+  for (let n = 0; n < remaining; n++) {
+    let best: LensLane | undefined;
+    for (const lane of LENS_LANES) {
+      if (!queues.get(lane)!.length) continue;
+      if (best === undefined || used.get(lane)! < used.get(best)!) best = lane;
+    }
+    if (best === undefined) break;
+    picked.add(queues.get(best)!.shift()!.id);
+    used.set(best, used.get(best)! + 1);
+  }
+  // 원래 순서를 지킨다(흡수 → GitHub → X).
+  return pending.filter((item) => picked.has(item.id));
 }
 
 function judgedIds(file: string): Set<string> {
@@ -171,10 +203,20 @@ export async function annotateIntakeLens(
   const pending = items.filter((item) => !done.has(item.id));
   const remaining = Math.max(0, LENS_DAILY_CAP - done.size);
   const capped = pending.length > remaining;
-  const batch = pending.slice(0, remaining);
+  const doneByLane: Partial<Record<LensLane, number>> = {};
+  for (const item of items) {
+    if (!done.has(item.id)) continue;
+    const lane = item.lane ?? 'outbox';
+    doneByLane[lane] = (doneByLane[lane] ?? 0) + 1;
+  }
+  const batch = capped ? fairLensBatch(pending, doneByLane, remaining) : pending;
   if (capped) {
-    const skippedIds = pending.slice(remaining).map((item) => item.id);
+    const chosen = new Set(batch.map((item) => item.id));
+    const skippedIds = pending.filter((item) => !chosen.has(item.id)).map((item) => item.id);
+    const byLane = (list: readonly GroupedItem[]) => Object.fromEntries(LENS_LANES.map((lane) =>
+      [lane, list.filter((item) => (item.lane ?? 'outbox') === lane).length]));
     log('capped', { day, total: pending.length, judged: batch.length, skippedIds,
+      pendingByLane: byLane(pending), judgedByLane: byLane(batch), doneByLane,
       ...(skippedIds.length ? { marker: `외 ${skippedIds.length}건 · 원장 \`elanous intake items\`` } : {}) });
   }
   const judgeOne = deps.judge ?? ((input: LensJudgeInput) => defaultJudge(input));

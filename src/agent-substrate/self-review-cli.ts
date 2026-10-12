@@ -14,6 +14,9 @@
 //
 // index.ts 의 액션은 옵션 파싱과 실제 의존 배선만 남는다(얇은 껍데기).
 
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { tierModel } from '../llm/model-defaults.js';
 import { buildReviewObservation, safeLogText } from './review-observation.js';
 import { DEFAULT_REVIEW_BACKEND } from './acp-reviewer.js';
@@ -75,13 +78,13 @@ export interface SelfReviewCliDeps {
    *
    * ⚠️ API 백엔드(`makeApiLlm`)는 이 인자를 안 받는다 — ACP 경로만 이미지를 나른다.
    */
-  makeAcpLlm(o: { backend: string; model?: string; timeoutMs: number }): (prompt: string, images?: readonly ReviewImage[]) => Promise<string>;
+  makeAcpLlm(o: { backend: string; model?: string; timeoutMs: number; cwd?: string }): (prompt: string, images?: readonly ReviewImage[]) => Promise<string>;
   /**
    * Reviewer ACP lane selected by `roleLlm.reviewer` (no explicit flag). Returns the LLM when the
    * subscription is usable, or a reason code when it is not — the caller then reviews on the API
    * exactly as before. Absent seam = the lane is unavailable (`role-reviewer-seam-missing`).
    */
-  makeRoleReviewerLlm?(spec: SubscriptionReviewerSpec, o: { timeoutMs: number }):
+  makeRoleReviewerLlm?(spec: SubscriptionReviewerSpec, o: { timeoutMs: number; cwd?: string }):
     | { llm: (prompt: string, images?: readonly ReviewImage[]) => Promise<string>; backend: string }
     | { reason: string };
   /**
@@ -1164,6 +1167,65 @@ export function renderReviewerContextStatus(loaded: LoadedReviewerContext, decom
   return `Reviewer context: ${loaded.items.length} loaded, ${loaded.failed.length} not loaded.${source}${truncation}${decompositionStatus}${labels ? `\n${labels}` : ''}${failures ? `\n${failures}` : ''}`;
 }
 
+/**
+ * 머지된 PR 의 사후 리뷰 격리 — 리뷰어 cwd 가 main 최신이면 그 뒤 수리를 인용한다.
+ * `merged` 는 그 PR 의 머지 커밋, `open` 은 종전(cwd 불변), `unpinnable` 은 MERGED 인데 머지 커밋을 못 구한 경우다.
+ */
+type PrMergeState =
+  | { kind: 'open' }
+  | { kind: 'merged'; commit: string }
+  | { kind: 'unpinnable'; reason: 'merge-commit-unknown' };
+
+function readPrMergeState(pr: string, deps: SelfReviewCliDeps): PrMergeState {
+  const view = deps.gh(['pr', 'view', pr, '--json', 'state,mergeCommit'], 15_000);
+  if (view.status !== 0) return { kind: 'open' };
+  try {
+    const parsed = JSON.parse(view.stdout) as { state?: unknown; mergeCommit?: { oid?: unknown } | null };
+    if (parsed?.state !== 'MERGED') return { kind: 'open' };
+    const oid = parsed.mergeCommit?.oid;
+    return typeof oid === 'string' && COMMIT_OID.test(oid)
+      ? { kind: 'merged', commit: oid }
+      : { kind: 'unpinnable', reason: 'merge-commit-unknown' };
+  } catch {
+    return { kind: 'open' };
+  }
+}
+
+interface ReviewWorktree {
+  cwd: string;
+  commit: string;
+  /** 멱등 — 두 번 불러도 안전하다. */
+  remove(): void;
+}
+
+type ReviewWorktreeResult = ReviewWorktree | { reason: 'no-git-seam' | 'worktree-add-failed' };
+
+function createDetachedReviewWorktree(commit: string, deps: SelfReviewCliDeps): ReviewWorktreeResult {
+  const git = deps.git;
+  if (!git) return { reason: 'no-git-seam' };
+  const parent = mkdtempSync(join(tmpdir(), 'elanous-review-pin-'));
+  const cwd = join(parent, 'wt');
+  const add = () => git(['worktree', 'add', '--detach', cwd, commit], 120_000);
+  let added = add();
+  if (added.status !== 0) {
+    git(['fetch', 'origin', commit], 120_000);
+    added = add();
+  }
+  let removed = false;
+  const remove = (): void => {
+    if (removed) return;
+    removed = true;
+    git(['worktree', 'remove', '--force', cwd], 60_000);
+    rmSync(parent, { recursive: true, force: true });
+    // ⛔ `git worktree prune` 은 부르지 않는다 — 저장소 «전체»의 stale 메타데이터를 지워 남의 worktree 까지 건드린다.
+  };
+  if (added.status !== 0) {
+    remove();
+    return { reason: 'worktree-add-failed' };
+  }
+  return { cwd, commit, remove };
+}
+
 /** `elanous self review <pr...>` 본문. read-only — 머지하지 않는다. */
 /**
  * `self review --json` stdout 한 줄 — 결과가 하나면 객체, 여럿이면 배열. index.ts 액션이 이것을 그대로 쓴다.
@@ -1177,6 +1239,20 @@ export async function runSelfReviewCliCommand(
   prArgs: string[],
   opts: SelfReviewCliOpts,
   deps: SelfReviewCliDeps,
+): Promise<SelfReviewCliOutcome> {
+  const pins: ReviewWorktree[] = [];
+  try {
+    return await runSelfReviewCliCommandPinned(prArgs, opts, deps, pins);
+  } finally {
+    for (const pin of pins) pin.remove();
+  }
+}
+
+async function runSelfReviewCliCommandPinned(
+  prArgs: string[],
+  opts: SelfReviewCliOpts,
+  deps: SelfReviewCliDeps,
+  pins: ReviewWorktree[],
 ): Promise<SelfReviewCliOutcome> {
   // 관측 sink는 모든 종료 경로보다 먼저 등록해 거부도 운영 로그에 남긴다.
   await deps.registerSink('self-review');
@@ -1272,6 +1348,7 @@ export async function runSelfReviewCliCommand(
     // ⛔ `relation-unknown` 도 경고한다(위 주석 · 리뷰가 두 라운드 반복 지적) — 그 밖 unavailable 은 조용하다.
     //    ⭐ 경고 여부 판정은 `localHeadWarningDetails` 한 곳에 있다(호출부에서 같은 함수를 두 번 부르지 않는다).
     const mismatchWarning = localHeadWarningDetails(localHeadComparison);
+    const mergeState = readPrMergeState(pr, deps);
     const view = deps.gh(['pr', 'view', pr, '--json', 'title,body'], 15_000);
     let prView: { title?: string; body?: string } | undefined;
     if (view.status === 0) {
@@ -1399,6 +1476,36 @@ export async function runSelfReviewCliCommand(
       else deps.print(`\n━━ PR ${pr} (${primaryModel}) ━━\n${renderStaleRefusal(diffRead)}\n${reviewerContextStatus}`);
       continue;
     }
+    // ⭐ 머지된 PR 만 머지 커밋 detached worktree 에서 리뷰한다 — main 최신이 아니라 그 PR 이 머지된 시점의 코드를 본다.
+    //    열린 PR 은 종전 그대로(cwd = process.cwd() · 리뷰어 심이 cwd 를 받지 않는다).
+    let reviewPin: ReviewWorktree | undefined;
+    let reviewCwdPinFallbackReason: string | undefined;
+    // cwd 를 받는 레인(ACP · role 리뷰어)일 때만 worktree 를 뜬다 — API 리뷰어는 cwd 를 안 받으므로 떠도 그 위에서 돌지 않는다.
+    const pinLane = useAcp || Boolean(roleReviewer && opts.roleReviewer && deps.makeRoleReviewerLlm);
+    let rolePinned = false;
+    if (!pinLane) {
+      // 비-ACP 레인 — 격리하지 않는다(종전 그대로 · reviewCwdCommit 없음).
+    } else if (mergeState.kind === 'merged') {
+      const made = createDetachedReviewWorktree(mergeState.commit, deps);
+      if ('cwd' in made) {
+        reviewPin = made;
+        pins.push(made);
+      } else reviewCwdPinFallbackReason = made.reason;
+    } else if (mergeState.kind === 'unpinnable') reviewCwdPinFallbackReason = mergeState.reason;
+    const reviewCwd = reviewPin?.cwd;
+    const prAcpReviewLLM = reviewCwd && useAcp
+      ? deps.makeAcpLlm({ backend: acpBackend, ...(acpModel ? { model: acpModel } : {}), timeoutMs: acpTimeoutSec * 1000, cwd: reviewCwd })
+      : acpReviewLLM;
+    let prRoleReviewer = roleReviewer;
+    if (reviewCwd && roleReviewer && opts.roleReviewer && deps.makeRoleReviewerLlm) {
+      try {
+        const pinned = deps.makeRoleReviewerLlm(opts.roleReviewer, { timeoutMs: acpTimeoutSec * 1000, cwd: reviewCwd });
+        if ('llm' in pinned) { prRoleReviewer = { llm: pinned.llm, model: `acp:${pinned.backend}` }; rolePinned = true; }
+        else reviewCwdPinFallbackReason = 'role-reviewer-cwd-unavailable';
+      } catch {
+        reviewCwdPinFallbackReason = 'role-reviewer-cwd-unavailable';
+      }
+    }
     const startedAt = deps.now();
     // Role-config lane builds the API reviewer only when it falls back (`made().api` stays 0 on ACP success).
     const responded: { provider?: string; model?: string } = {};
@@ -1406,7 +1513,7 @@ export async function runSelfReviewCliCommand(
       pinProvider: Boolean(opts.model?.trim()),
       onResolved: (provider, respondedModel) => { responded.provider = provider; responded.model = respondedModel; },
     });
-    const llmReview = roleReviewer ? undefined : (acpReviewLLM ?? makeApi());
+    const llmReview = prRoleReviewer ? undefined : (prAcpReviewLLM ?? makeApi());
     // ⛔ evidenceNote 는 **별도 채널**이다 — phaseIntent 에 섞으면 의도 채널이 오염된다(실측: 그렇게
     //   했다가 intent 배선 테스트 3개가 즉시 깨졌다).
     // ⛔ 사람 `--intent`(phaseIntent) 와 골 acceptance 는 다른 인자 — 충돌하지 않고, 충돌해도 intent 가 이긴다.
@@ -1426,10 +1533,10 @@ export async function runSelfReviewCliCommand(
     let roleReview: ReviewResult | undefined;
     let roleReviewerFallbackReason = roleReviewerUnavailableReason;
     let roleReviewMs: number | undefined;
-    if (roleReviewer) {
+    if (prRoleReviewer) {
       const roleStartedAt = deps.now();
       try {
-        const attempt = await deps.reviewPullRequest(reviewInput, roleReviewer.llm);
+        const attempt = await deps.reviewPullRequest(reviewInput, prRoleReviewer.llm);
         if (attempt.reviewed === true) roleReview = attempt;
         // Code, not the reviewer's raw failure text (same rule as the throw path above).
         else roleReviewerFallbackReason = 'acp-review-not-completed';
@@ -1445,8 +1552,8 @@ export async function runSelfReviewCliCommand(
         }, { level: 'warn' });
       }
     }
-    let review = roleReview ?? await deps.reviewPullRequest(reviewInput, llmReview ?? acpReviewLLM ?? makeApi());
-    let selectedModel = roleReview && roleReviewer ? roleReviewer.model : model;
+    let review = roleReview ?? await deps.reviewPullRequest(reviewInput, llmReview ?? prAcpReviewLLM ?? makeApi());
+    let selectedModel = roleReview && prRoleReviewer ? prRoleReviewer.model : model;
     let reviewRoute: 'api' | 'acp' | 'acp-fallback' = useAcp || roleReview ? 'acp' : 'api';
     let fallbackAttempted = false;
     let fallbackBackend: string | undefined;
@@ -1466,7 +1573,7 @@ export async function runSelfReviewCliCommand(
         try {
           const fallbackReview = await deps.reviewPullRequest(
             reviewInput,
-            deps.makeAcpLlm({ backend, timeoutMs: acpTimeoutSec * 1000 }),
+            deps.makeAcpLlm({ backend, timeoutMs: acpTimeoutSec * 1000, ...(reviewCwd ? { cwd: reviewCwd } : {}) }),
           );
           if (fallbackReview.reviewed === true) {
             review = fallbackReview;
@@ -1482,6 +1589,14 @@ export async function runSelfReviewCliCommand(
         }
       }
     }
+    reviewPin?.remove();
+    // reviewCwdCommit 은 «최종 판정을 낸 LLM 이 실제로 그 cwd 를 받았을 때만» 싣는다(role 실패 → API 폴백이면 안 싣는다).
+    const reviewedOnPin = Boolean(reviewPin) && (roleReview ? rolePinned : reviewRoute === 'acp-fallback' ? true : reviewRoute === 'acp' && useAcp);
+    if (reviewPin && !reviewedOnPin) reviewCwdPinFallbackReason ??= 'final-reviewer-not-pinned';
+    const reviewCwdOutput = {
+      ...(reviewPin && reviewedOnPin ? { reviewCwdCommit: reviewPin.commit } : {}),
+      ...(reviewCwdPinFallbackReason ? { reviewCwdPinFallbackReason } : {}),
+    };
     if (!fallbackAttempted) {
       fallbackNotAttemptedReason = useAcp ? 'explicit-acp' : 'primary-review-succeeded';
     }
@@ -1522,20 +1637,21 @@ export async function runSelfReviewCliCommand(
         goalLoaded: goalAcceptance.goalLoaded,
         acceptanceChars: goalAcceptance.acceptanceChars,
         ...reviewerSelection,
+        ...reviewCwdOutput,
       },
       { level: review.reviewed === false ? 'warn' : 'info' });
     // --acp 는 대표가 명시 요청한 리뷰 — fail-soft(reviewed=false)면 조용히 pass 하지 말고 표면화(관측=acp-review).
     if (useAcp && review.reviewed === false) {
       const err = 'ACP 리뷰 실행 실패(reviewed=false) — 관측: elanous logs --category acp-review';
       const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
-      if (opts.json) results.push({ pr, error: err, ...review, verdict: null, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...provenance, ...contextOutput });
+      if (opts.json) results.push({ pr, error: err, ...review, verdict: null, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...reviewCwdOutput, ...provenance, ...contextOutput });
       else deps.error(`PR ${pr}: ${err}\n${renderProvenance(diffRead)}\n${reviewerContextStatus}`);
       failed += 1;
       continue;
     }
     const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
     const jsonReview = review.reviewed === true ? review : { ...review, verdict: null };
-    if (opts.json) results.push({ pr, model: selectedModel, ...jsonReview, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...provenance, ...contextOutput, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles, ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) });
+    if (opts.json) results.push({ pr, model: selectedModel, ...jsonReview, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...reviewCwdOutput, ...provenance, ...contextOutput, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles, ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) });
     else deps.print(`\n━━ PR ${pr} (${selectedModel}) ━━\n${renderProvenance(diffRead)}\n${evidenceLine}\n${reviewerContextStatus}\n${deps.renderReview(review)}`);
     // REVIEW-ERROR-RC — 기본(API)·role 경로가 1차·폴백 모두 실패해 reviewed≠true 로 끝나도 «못 리뷰한 PR» 이다(verdict:null).
     if (review.reviewed !== true) failed += 1;

@@ -1107,17 +1107,18 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .description('가벼운 RC 점검 — 직전 판 컷(또는 --base) 이후 변경 범위 self gate ⊕ 상시 목록(release/light-rc-always.txt)을 원격 게이트 호스트에서 · 새 회귀(introduced>0)면 exit 1')
     .requiredOption('--version <v>', '점검할 판(x.y.z)')
     .option('--base <ref>', '비교 기준(기본: git merge-base origin/main origin/release/<원장 직전 판>)')
+    .option('--head <ref>', '잴 커밋(기본: git fetch origin main 뒤 origin/main — 작업 트리 HEAD 가 아니다 · 다르면 분리 체크아웃에서 잰다)')
     .option('--remote <host>', '게이트 호스트(기본 config gateRemote.host)')
     .option('--local', '원격 대신 이 기계에서 돌린다(원격 자식이 이것으로 다시 불린다)')
     .option('--shards <n>', '시험 분할 수', '4')
     .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
-    .action(async (o: { version: string; base?: string; remote?: string; local?: boolean; shards: string; json?: boolean }) => {
+    .action(async (o: { version: string; base?: string; head?: string; remote?: string; local?: boolean; shards: string; json?: boolean }) => {
       // The root strips `--local` from argv (remote-bookmark attach) before Commander sees it — same read as `self gate`.
       const local = !!o.local || process.argv.slice(2).includes('--local');
       await jsonAction(o.json, async (log) => {
         if (o.remote !== undefined && local) throw new Error('release light-rc: --remote and --local cannot be combined');
         const shards = Number(o.shards);
-        const result = await runLightRc(o.version, { base: o.base, remote: o.remote, local, shards, ledgerRoot: releaseRunDeps.ledgerRoot, log: (l) => console.error(l) }, lightRcDeps);
+        const result = await runLightRc(o.version, { base: o.base, head: o.head, remote: o.remote, local, shards, ledgerRoot: releaseRunDeps.ledgerRoot, log: (l) => console.error(l) }, lightRcDeps);
         for (const line of formatLightRc(result)) log(line);
         return result;
       }, (r) => r.ok);
@@ -1126,7 +1127,8 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .description('실패한 릴리스 런을 이어 달린다 — cut-branch --append 로 고친 release/<v> 새 끝을 version-release 기록에 반영(빨리감기만·상태 백업) 뒤 --from 노드부터')
     .requiredOption('--run <runId>', '실패한 release-loop 런 ID')
     .requiredOption('--from <node>', '다시 시작할 노드(예: gate)')
-    .option('--partial', 'GATE-PARTIAL — --from gate 에서 앞 게이트 뒤 바뀐 시험 파일 ⊕ 앞 실패 파일만 다시 돈다(시험·문서만 바뀐 경우 · 아니면 전체 게이트로)')
+    .option('--partial', 'GATE-PARTIAL — --from gate 에서 바뀐 시험 ⊕ 앞 실패 ⊕ 바뀐 코드에 import 로 닿는 시험만 다시 돈다(끝이 움직인 --from gate 는 기본 · 의심이면 전체 게이트)')
+    .option('--no-partial', 'GATE-REUSE-BY-DIFF 기본 부분 재검을 끄고 전체 게이트')
     .option('--waive <node>', '저장된 실패 노드 한 개를 면제(--from 은 그 노드 그대로)')
     .option('--reason <text>', '면제 사유 — 공개 알려진 문제에 들어갈 사용자 영향 설명')
     .option('--accepted-regressions <json>', '알려진 문제 추가 입력 JSON 배열 [{"id":"…","note":"…"}]')
@@ -1153,7 +1155,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         const override = result.state.inputOverrides?.at(-1);
         if (o.gateExecutor !== undefined && override) log(`⇄ gate 실행기 ${override.set.gateExecutor}${override.set.gateRemote ? ` @ ${override.set.gateRemote}` : ''} (런 입력에 기록 · 면제 아님)`);
         if (result.partial.requested) log(result.partial.applied
-          ? `◐ 부분 재검: ${result.partial.files}파일 · 나머지는 앞 게이트(${result.partial.priorCommit.slice(0, 12)}) 결과를 잇는다`
+          ? `◐ 부분 재검${result.partial.auto ? '(기본)' : ''}: ${result.partial.files}파일${result.partial.closure ? ` (코드 닿음 ${result.partial.closure.reached} · 닫힘 불투명 ${result.partial.closure.opaque})` : ''} · 나머지는 앞 게이트(${result.partial.priorCommit.slice(0, 12)}) 결과를 잇는다`
           : `● 전체 게이트로: ${result.partial.reason}`);
         log(`${result.tip.changed ? `↻ ${result.tip.branch} ${result.tip.from.slice(0, 12)} → ${result.tip.to.slice(0, 12)} (백업 ${result.tip.backup})` : `· ${result.tip.branch} 끝 그대로 ${result.tip.to.slice(0, 12)}`} · ${o.from} 부터 → ${result.state.status}`);
         return { tip: result.tip, partial: result.partial, status: result.state.status, runId: result.state.runId,
@@ -1184,14 +1186,14 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         const result = await autoStartScheduledRelease({
           windowMinutes: Number(o.windowMinutes), apply: o.apply, ledgerRoot: scheduleLedgerRoot(),
           readiness: (version, ledgerRoot, now) => releaseReadiness(version, { ledgerRoot, now: () => now, checklist: releaseRunDeps.checklist }),
-          launch: async (version) => {
-            const ran = await runAction({ version, ifReady: true, json: false }, log);
+          launch: async (version, launchOptions) => {
+            const ran = await runAction({ version, ifReady: true, publishAt: launchOptions?.publishAt, json: false }, log);
             if (ran && typeof ran === 'object' && ran.deferred) return ran;
             if (ran !== true) throw new Error(`release run 미시작 또는 실패: ${version}`);
           },
         });
         if (result.status === 'planned') log(`· 미리 보기 ${result.version} · 컷 ${result.cutAt} · 실행하려면 --apply`);
-        else if (result.status === 'started') log(`▶ 릴리스 시작 ${result.version} · 컷 ${result.cutAt}`);
+        else if (result.status === 'started') log(`▶ 릴리스 시작 ${result.version} · 컷 ${result.cutAt}${result.publishAt ? ` · 발행 ${result.publishAt}` : ''}`);
         else if (result.status === 'skipped') log(`· 릴리스 연기 ${result.version} · ${result.reason}`);
         else log('· 선택할 컷 없음');
         return result;

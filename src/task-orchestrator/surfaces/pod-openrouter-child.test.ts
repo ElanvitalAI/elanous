@@ -3,9 +3,27 @@ import { debug } from '../../debug/log.js';
 import { podNamedChildProvider, podChildLlmArgs, podSelfImplementSpawn, POD_OPENROUTER_REVIEWER_PINS, resolvePodOpenRouterReviewer, type Kubectl } from './self-implement-pod.js';
 import { resolveRoleLlm, type UserConfig } from '../../user-config.js';
 import { resolveImplementationChildModel } from '../../self-dev/dev-cli.js';
+import { stablePodManifestText } from './pod-manifest-test-normalize.js';
 
 const model = 'openrouter/z-ai/glm-5.3-flash';
 const key = 'test-openrouter-secret-not-in-job';
+
+test('manifest comparison keeps timestamps outside the budget snapshot', () => {
+  const applied = [{ kind: 'Job', metadata: { measuredAt: 7 }, spec: { template: { spec: { containers: [{
+    env: [{ name: 'ELANOUS_BUDGET_SNAPSHOT', value: JSON.stringify({ measuredAt: 123, provider: 'openrouter' }) }],
+  }] } } } }, { kind: 'Secret', metadata: { measuredAt: 9 } }];
+  const stable = JSON.parse(stablePodManifestText(applied));
+  expect(stable[0].metadata.measuredAt).toBe(7);
+  expect(stable[1].metadata.measuredAt).toBe(9);
+  expect(JSON.parse(stable[0].spec.template.spec.containers[0].env[0].value)).toEqual({ measuredAt: 0, provider: 'openrouter' });
+  const changed = structuredClone(applied);
+  changed[0]!.spec!.template.spec.containers[0]!.env[0]!.value = '{ "measuredAt":123,"provider":"openrouter"}';
+  expect(stablePodManifestText(changed)).not.toBe(stablePodManifestText(applied));
+  changed[0]!.spec!.template.spec.containers[0]!.env[0]!.value = '{"provider":"openrouter"}';
+  expect(() => stablePodManifestText(changed)).toThrow('exactly one numeric measuredAt');
+  changed[0]!.spec!.template.spec.containers[0]!.env = [];
+  expect(() => stablePodManifestText(changed)).toThrow('requires a budget snapshot');
+});
 
 function capture() {
   const applied: Array<Record<string, any>> = [];
@@ -210,8 +228,7 @@ describe('explicit OpenRouter Pod child', () => {
           runs.push([...codex.applied, ...grok.applied]);
         }
       } finally { log.mockRestore(); }
-      const strip = (applied: Record<string, any>[]) => JSON.stringify(applied.filter((entry) => entry.kind === 'Job' || entry.kind === 'Secret'))
-        .replace(/run-[0-9a-f-]{36}/g, 'run-<id>');   // 런 id 만 매번 새로 뽑힌다 — 나머지는 바이트 그대로여야 한다
+      const strip = stablePodManifestText;
       expect(strip(runs[0]!)).toBe(strip(runs[1]!));
       expect(strip(runs[0]!)).not.toContain('ELANOUS_ROLE_LLM_');
       expect(events).toEqual([]);

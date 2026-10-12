@@ -7,12 +7,41 @@
  */
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { debug } from '../debug/log.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 import { listChecklist, type ChecklistStatus } from '../release-loop/checklist.js';
-import { readTaskAgentState, type CompletionKind, type TaskCard } from './task-hand.js';
+import { buildRunProgressRows, queryRunningRuns, type RunningRunsResult, type RunProgressRow } from '../self-implement/running-runs.js';
+import {
+  cardPrNumber, CLOSED_BY_HAND_EVENT, HAND_MOVE_HISTORY_EVENT, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, readTaskAgentState,
+  type CompletionKind, type TaskCard,
+} from './task-hand.js';
 
 export type BoardLevel = 'project' | 'goal' | 'milestone' | 'task';
 export type BoardStatus = 'open' | 'done' | 'blocked';
+
+/** 카드 원장(task-agent-actions.json)에 적힌 사실만 — 없는 칸은 null(지어내지 않는다). */
+export interface BoardTaskLedger {
+  runId: string | null;
+  pr: number | null;
+  /** 카드 상태(handed · launched · launch-failed · failed). */
+  lastStatus: TaskCard['status'];
+  /** 관측 기록(live-move · hand-move)을 뺀 history 의 마지막 줄. */
+  lastEvent: { at: string; event: string; detail: string | null } | null;
+  /** 카드가 failed · launch-failed 일 때 마지막 줄의 사유(예: `failed/needs-owner — exit 1 · pod-failure`). 그 밖에는 null. */
+  exitReason: string | null;
+}
+
+/** `GET /api/task-agent/board` 응답 — progress 는 진전 관측(`queryRunningRuns`)을 싣는다; 관측을 못 얻으면 null(0을 «없다»로 쓰지 않는다). */
+export interface TaskAgentBoardResponse { board: BoardNode[]; progress: TaskAgentBoardProgress | null }
+
+/** 진전 관측 칸 — 행은 기존 `RunProgressRow` 형식 그대로(새 행 형식을 만들지 않는다). 과제 노드와는 `ledger.runId` ↔ `rows[].runId` 로만 짝짓는다(ledger 에 새 칸은 없다). */
+export interface TaskAgentBoardProgress {
+  readonly rows: readonly RunProgressRow[];
+  /** 관측이 부분(running 수가 `{ count: null, lowerBound }` 꼴이거나 읽지 못한 원장 unreadable 이 있으면)이면 true · 아니면 false. */
+  readonly partial: boolean;
+  /** 부분 관측일 때의 최소 running 수 · 완전 관측이면 null. */
+  readonly lowerBound: number | null;
+}
 
 export interface BoardNode {
   level: BoardLevel;
@@ -21,6 +50,8 @@ export interface BoardNode {
   status: BoardStatus;
   /** 과제 노드만 — 카드의 종결 종류(비면 code-pr 로 읽는다 · 칸은 싣지 않는다). */
   completion?: CompletionKind;
+  /** 과제 노드만 · `cardsBoard(…, { ledger: true })` 일 때만 — 카드 원장에서 읽은 런·PR·마지막 상태·종료 이유. */
+  ledger?: BoardTaskLedger;
   /** 부모 노드 id(프로젝트는 없다). */
   parent?: string;
   /** 프로젝트 노드만 — 프로젝트 없는 카드의 자리(id 는 빈 문자열이라 실제 프로젝트 id 와 겹치지 않는다). */
@@ -60,8 +91,28 @@ function cardStatus(card: TaskCard): BoardStatus {
   return card.greenProposal ? 'done' : 'open';
 }
 
-/** 과제 카드 → 프로젝트 트리. 프로젝트 없는 카드는 «무소속»(`unassigned: true` · id '') 아래 — 어떤 프로젝트 id 로도 걸러지지 않는다. */
-export function cardsBoard(statePath: string): BoardNode[] {
+function cardLedger(card: TaskCard): BoardTaskLedger {
+  const last = (card.history ?? [])
+    .filter((item) => item.event !== LIVE_MOVE_HISTORY_EVENT && item.event !== LIVE_MOVE_RESULT_EVENT && item.event !== HAND_MOVE_HISTORY_EVENT)
+    .at(-1);
+  const ended = card.status === 'failed' || card.status === 'launch-failed';
+  // ⚠️ 종료 이유 = «관측 줄을 뺀 마지막 줄»의 detail 만 본다 — 그 줄이 detail 없는 run-bound·pr-bound 면 null(지어내지 않음 · 앞줄을 거슬러 찾지 않는다).
+  //   관측 줄 거르기는 task-hand.ts(wait 사유)와 같은 셋이다 — 공용 헬퍼로 묶는 것은 다음 조각(UX 수확 리뷰 should-fix).
+  const reason = last ? (last.event === CLOSED_BY_HAND_EVENT ? last.reason ?? last.detail : last.detail) : undefined;
+  return {
+    runId: card.runId ?? null,
+    pr: cardPrNumber(card) ?? null,
+    lastStatus: card.status,
+    lastEvent: last ? { at: last.at, event: last.event, detail: last.detail ?? null } : null,
+    exitReason: ended ? reason ?? null : null,
+  };
+}
+
+/**
+ * 과제 카드 → 프로젝트 트리. 프로젝트 없는 카드는 «무소속»(`unassigned: true` · id '') 아래 — 어떤 프로젝트 id 로도 걸러지지 않는다.
+ * `ledger: true` 면 과제 노드마다 카드 원장 사실(`ledger`)을 붙인다 — 기본(CLI)은 그대로다.
+ */
+export function cardsBoard(statePath: string, options: { ledger?: boolean } = {}): BoardNode[] {
   const projects: BoardNode[] = [];
   const cards = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {};
   for (const card of Object.values(cards)) {
@@ -77,11 +128,49 @@ export function cardsBoard(statePath: string): BoardNode[] {
     milestone.children!.push({
       level: 'task', id: card.id, title: card.text, status: cardStatus(card),
       ...(card.completion ? { completion: card.completion } : {}),
+      ...(options.ledger ? { ledger: cardLedger(card) } : {}),
       parent: milestone.id,
     });
   }
   for (const project of projects) aggregate(project);
   return projects;
+}
+
+/** `taskAgentBoard` 주입 자리 — 시험은 관측을 갈아끼워 결정성을 얻는다. */
+export interface TaskAgentBoardDeps {
+  /** 진전 관측. 기본 = `queryRunningRuns({ caller: 'task-agent.board' })`. 던지면 progress=null — 보드는 그대로 돌려준다. */
+  readonly runningRuns?: () => RunningRunsResult;
+  /** 경과 계산의 기준 시각(`buildRunProgressRows` 의 nowMs) · 기본 = Date.now(). */
+  readonly nowMs?: number;
+  /** 진전 관측을 돌릴지 — 기본 false(progress=null · «요청 안 함»). ⛔ 운영 원장에서 queryRunningRuns 는 동기 수 초(10-12 실측 4.3초)라
+   *  데몬 이벤트 루프를 멈춘다 → 라우트는 `?progress=1` 일 때만 켠다(UX 수확 리뷰 should-fix). runningRuns 를 주입하면 이 값과 무관하게 돈다. */
+  readonly withProgress?: boolean;
+}
+
+/** 관측 결과 → progress 칸. running 수가 `{ count: null, lowerBound }` 꼴이거나 읽지 못한 원장(unreadable)이 있으면 부분 관측으로 친다. */
+function runProgressFrom(result: RunningRunsResult, nowMs: number): TaskAgentBoardProgress {
+  const objectCount = result.count !== undefined && typeof result.count !== 'number' ? result.count : null;
+  // 판정 출처는 관측 결과의 completeness 가 1순위 — count 꼴·unreadable 은 그것이 없을 때의 보조다.
+  const partial = result.completeness === 'partial' || objectCount !== null || (result.unreadable?.length ?? 0) > 0;
+  return {
+    rows: buildRunProgressRows(result, nowMs),
+    partial,
+    lowerBound: partial ? (objectCount !== null ? objectCount.lowerBound : result.counts.running + result.counts['probable-running']) : null,
+  };
+}
+
+/** 읽기 전용 — 원장이 없으면 빈 보드. 원장이 손상됐으면 `TaskAgentStateError` 를 그대로 던진다(빈 보드로 속이지 않는다). progress 는 진전 관측을 싣는다 — 관측이 던지면 progress=null(0을 «없다»로 쓰지 않는다) · 보드는 그대로. */
+export function taskAgentBoard(statePath: string, deps: TaskAgentBoardDeps = {}): TaskAgentBoardResponse {
+  const board = cardsBoard(statePath, { ledger: true });
+  if (!deps.runningRuns && !deps.withProgress) return { board, progress: null };
+  const observe = deps.runningRuns ?? (() => queryRunningRuns({ caller: 'task-agent.board' }));
+  let progress: TaskAgentBoardProgress | null = null;
+  try {
+    progress = runProgressFrom(observe(), deps.nowMs ?? Date.now());
+  } catch (error) {
+    debug.log('task-agent', 'board-progress-unavailable', { error: error instanceof Error ? error.message : String(error) });
+  }
+  return { board, progress };
 }
 
 function releaseStatus(status: ChecklistStatus): BoardStatus {

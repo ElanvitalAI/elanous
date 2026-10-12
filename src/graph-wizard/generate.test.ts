@@ -8,7 +8,7 @@ import { WIZARD_ARCHETYPES } from './archetypes.js';
 import { runWizardStep, runWizardStepWithRetries } from './steps.js';
 import { createPack } from '../knowledge/kgs/pack.js';
 import { KgsSqliteStore, setKgsDbPathOverride, _resetKgsStoreSingleton } from '../knowledge/kgs/sqlite-store.js';
-import { GraphWizardInputError, HARNESS_EXAMPLE, parseNodeAnnotations, stepIssues, WORKFLOW_EXAMPLE, generateGraphFromPrompt, pickBaseTemplate, listWizardTemplates, summarizeChange, validateWizardYaml, wizardGraphId } from './generate.js';
+import { GraphWizardInputError, HARNESS_EXAMPLE, parseNodeAnnotations, stepIssues, WORKFLOW_EXAMPLE, generateGraphFromPrompt, graphSignals, pickBaseTemplate, listWizardTemplates, summarizeChange, validateWizardYaml, wizardGraphId } from './generate.js';
 
 const graphsDir = join(import.meta.dir, '../../graphs');
 const fenced = (yaml: string, extra = '') => `${extra}SLUG: news digest\nSUMMARY: 뉴스 요약 그래프\n\`\`\`yaml\n${yaml}\`\`\`\n`;
@@ -237,4 +237,52 @@ test('ids never collide with an existing graph and base picking prefers runnable
   expect(pickBaseTemplate('경쟁 제품 가격을 조사해서 표로 정리하고 내가 승인하면 노션에 올려', templates)?.template.id).toBe('wizard-research-approve-publish');
   expect(pickBaseTemplate('강의 자료 노트', templates)?.template.runnable).toBe(true);
   expect(summarizeChange('harness', undefined, HARNESS_EXAMPLE)).toContain('새 그래프');
+});
+
+test('linear chain yields smell: linear-chain warning', async () => {
+  const linear = `graph_id: linear-brief
+loop:
+  title: 모아서 보내기
+version: 1
+entry_node: collect
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: collect, kind: agent, recipe: 'cmd:collect', max_visits: 1 }  # 수집 | web-search | 오늘 AI 뉴스
+  - { node_id: summarize, kind: agent, recipe: 'cmd:summarize', max_visits: 1 }  # 요약 | summarize | 핵심 5줄 한국어
+  - { node_id: send, kind: agent, recipe: 'cmd:send', max_visits: 1 }  # 텔레그램 발송 | telegram-send
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }  # 완료
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }  # 실패
+edges:
+  - { from: collect, on: outcome, map: { ok: summarize, fail: failed } }
+  - { from: summarize, on: outcome, map: { ok: send, fail: failed } }
+  - { from: send, on: outcome, map: { ok: done, fail: failed } }
+`;
+  const llm = stub([fenced(linear)]);
+  const result = await generateGraphFromPrompt({ prompt: '뉴스 모아서 요약해 텔레그램으로 보내' }, { callLLM: llm.callLLM, graphsDir, existingIds: () => new Set() });
+  expect(result.ok).toBe(true);
+  // 경고는 실패가 아니다 — issues 는 그대로 비어 있고(칸 내리기 제안일 뿐 생성을 막지 않는다), G 신호 수가 문면에 박힌다.
+  expect(result.issues).toEqual([]);
+  expect(result.warnings?.join('\n')).toContain('smell: linear-chain — G 신호 0 · 칸 내리기(스킬 사슬) 또는 유닛 끼우기(unit-verify = G1·G2 · 승인 노드 = G3) 제안');
+  const rich = stub([fenced(HARNESS_EXAMPLE)]);
+  const grounded = await generateGraphFromPrompt({ prompt: '뉴스' }, { callLLM: rich.callLLM, graphsDir, existingIds: () => new Set() });
+  expect(grounded.ok).toBe(true);
+  expect(grounded.warnings).toBeUndefined();
+});
+
+test('each archetype has at least two G signals', () => {
+  for (const archetype of WIZARD_ARCHETYPES) {
+    const signals = graphSignals(archetype.text);
+    expect(signals.total).toBeGreaterThanOrEqual(2);
+    expect(Object.values(signals.counted).filter((count) => count > 0).length).toBeGreaterThanOrEqual(2);
+    expect(validateWizardYaml('harness', archetype.text)).toEqual([]);
+    expect(stepIssues(archetype.text, parseNodeAnnotations(archetype.text))).toEqual([]);
+  }
+});
+
+test('G5–G7 are reported as not counted, not zero', () => {
+  const signals = graphSignals(HARNESS_EXAMPLE);
+  expect(signals.notCounted).toEqual(['G5', 'G6', 'G7']);
+  expect(Object.keys(signals.counted)).toEqual(['G1', 'G2', 'G3', 'G4']);
+  expect(signals.counted).toEqual({ G1: 1, G2: 1, G3: 1, G4: 1 });
+  expect(signals.total).toBe(4);
 });

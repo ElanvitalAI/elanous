@@ -200,6 +200,9 @@ export interface LLMConfig {
    *    이 축은 «같은 provider 안에서 어느 계정의 토큰을 쓸지»를 바꾼다.
    *  리셋 크레딧 자동 소비는 별도 일일 상한으로 제한한다. */
   codexAccountRotation?: boolean;
+  /** REVIEW-ACP-POD — Pod merge-ready PR 을 병합 전에 호스트 Claude ACP(구독)로 리뷰한다. `true` 일 때만 켜진다(기본 꺼짐 = 종전).
+   *  env `ELANOUS_POD_HOST_ACP_REVIEW` 가 이 값보다 앞선다. ACP 를 못 쓰면 종전 길(Pod 리뷰 → 재게이트). */
+  podHostAcpReview?: boolean;
   /** ⭐⭐ codex 계정 «알림» — 회전·리셋크레딧 소비를 텔레그램 등 outbound 로 보낼지.
    *  ⛔ **기본 ON** — `false` 일 때만 조용해진다.
    *  ⛔⭐ 위 `codexAccountRotation` 과 «다른 축»이다(대표 지시 2026-08-17 *"회전을 끄라는 게
@@ -3829,7 +3832,7 @@ export interface UserConfig {
   guardian?: { mode?: 'shadow' | 'live'; /** Orphan CLI GC on the guardian tick: off = no ps collection, shadow (default) = evidence only, on = evidence then SIGTERM. */ orphanGc?: 'off' | 'shadow' | 'on' };
   /** TA-JUDGE-LIVE-SAFE: task-agent judge moves executed for real. Only `review` · `propose-green` are honoured
    *  (`src/task-agent/live-moves.ts` drops anything else with a warning). Absent = env ELANOUS_TASK_AGENT_LIVE_MOVES, else none (pure shadow). */
-  taskAgent?: { liveMoves?: string[]; parentHost?: { host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number } | Array<{ host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number }> };
+  taskAgent?: { liveMoves?: string[]; /** TA-REJUDGE-PERIODIC — steward tick runs `tasks rejudge --all` every N minutes (absent/0 = off). */ rejudgeEveryMinutes?: number; /** 1-minute load average above which that tick is skipped (default 60). */ rejudgeMaxLoad?: number; parentHost?: { host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number } | Array<{ host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number }> };
   events?: EventsConfig;
   /** GATE-REMOTE — see GateRemoteConfig. Absent = defaults (auto on · node-b · load 20 · cap 2). */
   gateRemote?: GateRemoteConfig;
@@ -4140,15 +4143,24 @@ function parseTaskAgentConfig(raw: unknown): UserConfig['taskAgent'] {
     return undefined;
   }
   const parentHost = parseTaskAgentParentHost((raw as Record<string, unknown>).parentHost);
+  // TA-REJUDGE-PERIODIC — 음이 아닌 유한수만 산다(0 = 끔). 그 밖은 경고하고 버린다(= 끔 · 기본 부하 상한).
+  const rejudge: { rejudgeEveryMinutes?: number; rejudgeMaxLoad?: number } = {};
+  for (const key of ['rejudgeEveryMinutes', 'rejudgeMaxLoad'] as const) {
+    const value = (raw as Record<string, unknown>)[key];
+    if (value === undefined) continue;
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) rejudge[key] = value;
+    else warnUserConfigDrop(`taskAgent.${key}`, `음이 아닌 수가 아니다(${JSON.stringify(value)}) — 버림`);
+  }
+  const extras = { ...rejudge, ...(parentHost ? { parentHost } : {}) };
   const liveMoves = (raw as Record<string, unknown>).liveMoves;
-  if (liveMoves === undefined) return parentHost ? { parentHost } : undefined;
+  if (liveMoves === undefined) return Object.keys(extras).length ? extras : undefined;
   // 설정이 «있으면» 환경 변수로 내려가지 않는다 — 배열이 아니면 빈 목록(fail-closed), 문자열 밖 항목은 글자로 바꿔 넘겨
   // 실행부가 «모르는 항목»으로 경고하고 버리게 한다(유효한 항목은 산다).
   if (!Array.isArray(liveMoves)) {
     warnUserConfigDrop('taskAgent.liveMoves', '배열이 아니다 — 빈 목록(실행 0)');
-    return { liveMoves: [], ...(parentHost ? { parentHost } : {}) };
+    return { liveMoves: [], ...extras };
   }
-  return { liveMoves: liveMoves.map((entry) => typeof entry === 'string' ? entry : JSON.stringify(entry) ?? String(entry)), ...(parentHost ? { parentHost } : {}) };
+  return { liveMoves: liveMoves.map((entry) => typeof entry === 'string' ? entry : JSON.stringify(entry) ?? String(entry)), ...extras };
 }
 
 function parseGuardianConfig(raw: unknown): UserConfig['guardian'] {
@@ -5240,6 +5252,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       goalLoop: parseGoalLoop(llm.goalLoop),
       memoryJudge: parseMemoryJudge(llm.memoryJudge),
       codexInspectExempt: llm.codexInspectExempt === true ? true : undefined,
+      podHostAcpReview: llm.podHostAcpReview === true ? true : undefined,
       // ⛔⭐ 「false 만 끈다」 — 미설정·true 는 undefined 로 두어 기본 ON 을 유지한다(대표 결정 ②).
       //   ⚠️ 이 줄이 «없으면» 타입만 있고 파서가 안 읽어 ***노브가 no-op 이 된다***(실측으로 잡았다).
       codexAccountRotation: llm.codexAccountRotation === false ? false : undefined,
@@ -6550,6 +6563,7 @@ export function saveUserConfig(
       goalLoop: cfg.llm.goalLoop,
       memoryJudge: cfg.llm.memoryJudge,
       codexInspectExempt: cfg.llm.codexInspectExempt,
+      podHostAcpReview: cfg.llm.podHostAcpReview,
       codexAccountRotation: cfg.llm.codexAccountRotation,
       codexAccountAlerts: cfg.llm.codexAccountAlerts,
       codexAccountRotationThresholdPercent: cfg.llm.codexAccountRotationThresholdPercent,

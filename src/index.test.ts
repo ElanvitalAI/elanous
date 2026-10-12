@@ -114,6 +114,12 @@ describe('know CLI entry', () => {
     expect(program.commands.map(command => command.name())).toContain('know');
   });
 
+  test('index registers resource status next to loop without changing their existing commands', () => {
+    const names = program.commands.map(command => command.name());
+    expect(names.indexOf('resource')).toBe(names.indexOf('loop') + 1);
+    expect(program.commands.find(command => command.name() === 'resource')?.commands.map(command => command.name())).toEqual(['status']);
+  });
+
   test('elanous know AUTHOR-POD --json routes injected readers through the Commander action', async () => {
     const root = new Command();
     const queries: string[] = [];

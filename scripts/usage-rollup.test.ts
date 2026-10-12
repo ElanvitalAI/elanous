@@ -2,7 +2,7 @@
 // 칸: mk · 0.2.24 · TASK-AGENT(OP 디스패처) · 2026-10-11.
 import { describe, expect, test } from 'bun:test';
 import { tierModel } from '../src/llm/model-defaults.js';
-import { parseRollupArgs, renderRollupLine, rollup } from './usage-rollup.js';
+import { dedupePodRollupRows, parseRollupArgs, renderRollupLine, rollup } from './usage-rollup.js';
 
 // ⛔ 모델 이름을 박지 않는다 — 사다리에서 파생한다(model-hardcode-gate 규율 · 2026-09-25).
 const MODEL = tierModel('balanced', 'openai');
@@ -76,5 +76,20 @@ describe('usage-rollup --partial', () => {
     const r = rollup(rows);
     expect(r.truncated).toBe(true);
     expect(r.rows).toEqual([{ site: 'agent-turn', provider: 'openai', model: MODEL, calls: 2, inputTokens: 150, outputTokens: 6, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, cacheCreationUnmeasuredCalls: 0, usdKnown: 0.5, unknownCostCalls: 1, includedCalls: 0, apiEquivalentUsd: 0 }]);
+  });
+});
+
+// ⭐ METER-POD-ROLLUP-GAP-2 — 호스트 소비처(bench-report · `elanous usage`)가 쓰는 같은 dedup 규칙.
+describe('dedupePodRollupRows (host dedup)', () => {
+  test('keeps the most complete row per podRollupKey in first-seen position, and every unkeyed row', () => {
+    const rows = [
+      { id: 'a-p2', data: { podRollupKey: 'A', partial: true, partialSeq: 2 } },
+      { id: 'plain-1', data: {} },
+      { id: 'a-p5', data: { podRollupKey: 'A', partial: true, partialSeq: 5 } },
+      { id: 'b-final', data: { podRollupKey: 'B' } },
+      { id: 'b-p9', data: { podRollupKey: 'B', partial: true, partialSeq: 9 } },
+      { id: 'plain-2', data: {} },
+    ];
+    expect(dedupePodRollupRows(rows, (r) => r.data).map((r) => r.id)).toEqual(['a-p5', 'plain-1', 'b-final', 'plain-2']);
   });
 });

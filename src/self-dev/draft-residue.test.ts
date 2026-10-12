@@ -68,6 +68,7 @@ describe('Pod terminal residue', () => {
     ]);
     expect(classifyPodTerminal({ ...input, env: {}, prBody: '칸: TA-LIVE-LAND' })).toMatchObject({ owner: 'TA-LIVE-LAND', ownerSource: 'card' });
     expect(classifyPodTerminal({ ...input, env: {} })).toMatchObject({ owner: 'unknown', ownerSource: 'unknown' });
+    expect(classifyPodTerminal({ ...input, disposition: { ...input.disposition, branch: 'self-impl/with-pr' } }).branch).toBe('self-impl/with-pr');
     for (const record of [merged, noPr, unobserved]) {
       const f = fixture();
       try { await applyPodTerminal(record, f.ctx); expect(f.calls.some((call) => call.includes('harvestable'))).toBe(false); }
@@ -75,13 +76,56 @@ describe('Pod terminal residue', () => {
     }
   });
 
+  test('timed-out stage with a branch and no PR classifies as timed-out-harvestable and carries branch (AUT-TIMEOUT-NO-HARVEST)', async () => {
+    const timedOut = classifyPodTerminal({
+      childRunId: runId, state: 'failed',
+      disposition: { stage: 'timed-out', ok: false, branch: 'self-impl/timeout-goalid-abc123-run' },
+      env: { ELANOUS_HARNESS_SEAT: 'TC' }, at: '2026-10-09T12:00:00Z',
+    });
+    expect(timedOut).toMatchObject({
+      terminalClass: 'timed-out-harvestable',
+      branch: 'self-impl/timeout-goalid-abc123-run',
+      prNumber: null,
+      stage: 'timed-out',
+    });
+    expect(classifyPodTerminal({ ...input, disposition: { stage: 'abandoned', ok: false } }).terminalClass).toBe('failed-no-pr');
+    expect(classifyPodTerminal(input).terminalClass).toBe('failed-with-pr');
+    expect(classifyPodTerminal({ ...input, disposition: { ...input.disposition, merged: true } }).terminalClass).toBe('landed');
+    expect(classifyPodTerminal({ childRunId: runId, state: 'failed', disposition: { stage: 'timed-out', ok: false } }).terminalClass).toBe('failed-no-pr');
+    expect(classifyPodTerminal({
+      childRunId: runId, state: 'failed',
+      disposition: { ...input.disposition, stage: 'timed-out', ok: false, branch: 'self-impl/with-pr' },
+    }).terminalClass).toBe('failed-with-pr');
+    const f = fixture();
+    try {
+      // 첫 조각은 분류만 — apply 는 PR 이 없으니 지금처럼 건너뛰고 gh 효과 0.
+      expect(await applyPodTerminal(timedOut, f.ctx)).toMatchObject({ status: 'skipped' });
+      expect(f.calls.some((call) => call.includes('harvestable'))).toBe(false);
+      expect(loadRunLedger(runId, f.dir)?.filter((row) => row.event === 'pr-terminal')).toEqual([
+        expect.objectContaining({ data: expect.objectContaining({ terminalClass: 'timed-out-harvestable', branch: 'self-impl/timeout-goalid-abc123-run' }) }),
+      ]);
+    } finally { f.cleanup(); }
+  });
+
   test('host-regate failure reason survives classification and the pr-terminal ledger row (AUT-HOST-REGATE-REASON-LOST)', async () => {
     const rawDetail = `error\n  TS2345:   Argument of type 'string' is not assignable to parameter of type 'number'. ${'noise '.repeat(120)}`;
-    const folded = rawDetail.split(/\s+/).filter(Boolean).join(' ').slice(0, 300);
+    const folded = rawDetail.split(/\s+/).filter(Boolean).join(' ');
     const failed = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
       hostRegate: { passed: false, failures: [{ step: 'typecheck', detail: rawDetail }], os: 'ubuntu-24.04' } } });
     expect(failed.hostRegateFailure).toEqual({ step: 'typecheck', detail: folded, os: 'ubuntu-24.04' });
-    expect(failed.hostRegateFailure?.detail.length).toBeLessThanOrEqual(300);
+    // HOST-REGATE-REASON-LOST (2nd): the ~800-char detail is no longer cut at 300 — the whole folded text survives.
+    expect(failed.hostRegateFailure?.detail.length).toBeGreaterThan(300);
+    // A merge failure keeps its tail (the GraphQL reason), the heads and the kind; a long detail stays bounded.
+    const reason = 'GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest)';
+    const merge = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      hostRegate: { passed: false, os: 'darwin', failures: [{ step: 'merge', detail: `Error: ${'x'.repeat(9000)} ${reason}`,
+        expectedHead: 'a'.repeat(40), actualHead: 'a'.repeat(40), mergeFailureKind: 'base-modified' }] } } });
+    expect(merge.hostRegateFailure).toMatchObject({ step: 'merge', expectedHead: 'a'.repeat(40), actualHead: 'a'.repeat(40), mergeFailureKind: 'base-modified', os: 'darwin' });
+    expect(merge.hostRegateFailure?.detail.endsWith(reason)).toBe(true);
+    expect(merge.hostRegateFailure?.detail.length).toBeLessThanOrEqual(4096);
+    const conflict = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      hostRegate: { passed: false, os: 'darwin', failures: [{ step: 'merge-conflict', detail: 'CONFLICT', conflictFiles: ['src/a.ts', 'src/b.ts'], actualHead: 'not-a-sha' }] } } });
+    expect(conflict.hostRegateFailure).toEqual({ step: 'merge-conflict', detail: 'CONFLICT', conflictFiles: ['src/a.ts', 'src/b.ts'], os: 'darwin' });
     const empty = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
       hostRegate: { passed: false, failures: [], os: 'ubuntu-24.04' } } });
     expect(empty.hostRegateFailure).toEqual({ step: 'unknown', detail: 'failures empty', os: 'ubuntu-24.04' });

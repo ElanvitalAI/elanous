@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
+import { runGraph, STOPPED_NODE_ERROR, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { Command } from 'commander';
 import { registerReleaseCommands } from '../../src/cli/release-cli.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
@@ -152,6 +152,75 @@ if (process.argv[2] === 'rev-list') console.log('0');
     expect(readFileSync(notes, 'utf8')).toContain('- Help does not close when requested.');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+for (const shape of ['stopped', 'sweep-incomplete', 'killed'] as const) {
+  test(`RELEASE-WAIVE-UNMEASURED: a ${shape} gate is waived end to end — the ledger records the reason and why it was unmeasured`, async () => {
+    const root = mkdtempSync(join(tmpdir(), `release-waiver-unmeasured-${shape}-`));
+    const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+    const bin = join(root, 'bin');
+    const docsTree = join(root, 'docs-tree');
+    const notes = join(docsTree, 'release/public/docs/releases', `${VERSION}.md`);
+    const ran: string[] = [];
+    const runBash = async (body: string, opts: { env?: NodeJS.ProcessEnv }) => {
+      const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string };
+      ran.push(ctx.nodeId);
+      if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
+      // killed: the real runner path — the node's runBash rejects (signal / idle timeout), so the ledger keeps exit null.
+      if (ctx.nodeId === 'gate' && shape === 'killed') throw new Error('process terminated by SIGTERM');
+      if (ctx.nodeId === 'gate') return { exitCode: 2, stdout: JSON.stringify({ outcome: 'error', verdict: 'fail', commit: SHA, introduced: [], preexisting: 0,
+        error: 'pod sweep incomplete: stalled shards 3', stalledShards: [{ shard: 3, files: ['a.test.ts'], reason: 'no-output' }] }) + '\n', stderr: '' };
+      if (ctx.nodeId === 'docs') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', branch: `release-docs/${VERSION}`, worktree: docsTree }) + '\n', stderr: '' };
+      if (ctx.nodeId === 'known-issues') {
+        const child = spawnSync('bash', ['-c', body], { cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...opts.env, PATH: `${bin}:${process.env.PATH}` } });
+        return { exitCode: child.status ?? 2, stdout: child.stdout, stderr: child.stderr };
+      }
+      return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
+    };
+    const git = (args: string[]) => args[0] === 'ls-remote' ? `${SHA}\trefs/heads/release/${VERSION}` : args[0] === 'rev-parse' ? SHA : '';
+    try {
+      mkdirSync(join(docsTree, 'release/public/docs/releases'), { recursive: true });
+      mkdirSync(bin);
+      writeFileSync(join(bin, 'elanous'), '#!/usr/bin/env node\nprocess.exit(3);\n');
+      writeFileSync(join(bin, 'git'), `#!/usr/bin/env node
+if (process.argv[2] === 'rev-list') console.log('0');
+`);
+      chmodSync(join(bin, 'elanous'), 0o755);
+      chmodSync(join(bin, 'git'), 0o755);
+      writeFileSync(notes, '# Release\n');
+      const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, previousVersion: '0.2.18' }, deps: { root, runBash } });
+      expect(first.status).toBe('failed');
+      expect(first.path.slice(-2)).toEqual(['gate', 'failed']);
+      const stateFile = join(root, 'graph-runs', 'release-loop', `${first.runId}.json`);
+      if (shape === 'stopped') {
+        // The ledger `graph runs stop` leaves when it cuts a running gate (manageGraphRun): the gate is the last record.
+        const saved = JSON.parse(readFileSync(stateFile, 'utf8')) as GraphRunState;
+        saved.path.pop(); saved.nodes.pop();
+        saved.nodes[saved.nodes.length - 1] = { nodeId: 'gate', ok: false, exit: null, executed: false, error: STOPPED_NODE_ERROR, endedAt: '2026-10-12T00:10:00.000Z' };
+        saved.executed = saved.nodes.filter((node) => node.executed).length;
+        writeFileSync(stateFile, `${JSON.stringify(saved, null, 2)}\n`);
+      }
+      const original = (JSON.parse(readFileSync(stateFile, 'utf8')) as GraphRunState).nodes.find((node) => node.nodeId === 'gate')!;
+      const reason = 'Release checks finished on a second machine because the main check run was interrupted';
+      await expect(resumeReleaseRun({ runId: first.runId, from: 'gate', waive: 'gate' }, { root, graphPath, git, runBash })).rejects.toThrow('supplied together');
+      const gateRuns = ran.filter((node) => node === 'gate').length;
+      const resumed = await resumeReleaseRun({ runId: first.runId, from: 'gate', waive: 'gate', reason }, { root, graphPath, git, runBash });
+      expect(resumed.state.status).toBe('done');
+      // The waived gate never runs again.
+      expect(ran.filter((node) => node === 'gate').length).toBe(gateRuns);
+      const gate = resumed.state.nodes.find((node) => node.nodeId === 'gate')!;
+      expect(gate).toMatchObject({ ok: true, executed: false, exit: 0, waiver: { reason, at: expect.any(String),
+        unmeasured: shape === 'stopped' ? `stopped: ${STOPPED_NODE_ERROR}` : shape === 'killed' ? expect.stringMatching(/^no-verdict: gate process ended with exit null and no result line — .*SIGTERM/)
+          : 'sweep incomplete: pod sweep incomplete: stalled shards 3 · stalled shards 1 (no-output×1)',
+        original: { exit: original.exit, ...(original.output === undefined ? {} : { output: original.output }), ...(original.error === undefined ? {} : { error: original.error }) } } });
+      const saved = JSON.parse(readFileSync(stateFile, 'utf8')) as GraphRunState;
+      expect(saved.nodes.find((node) => node.nodeId === 'gate')?.waiver).toEqual(gate.waiver);
+      expect((saved.input as { acceptedRegressions: unknown[] }).acceptedRegressions).toEqual([{ id: 'waive:gate', note: reason }]);
+      expect(readFileSync(notes, 'utf8')).toContain(`- ${reason}.`);
+      // Already waived: a second waiver on the same run is refused (the run is done, and the gate record carries a waiver).
+      await expect(resumeReleaseRun({ runId: first.runId, from: 'gate', waive: 'gate', reason }, { root, graphPath, git, runBash })).rejects.toThrow();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+}
 
 test('accepted regressions without a waiver are persisted and delivered to the graph and known-issues node', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-accepted-resume-'));

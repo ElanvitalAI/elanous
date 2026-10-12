@@ -4,8 +4,9 @@ import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AmbiguousHarnessStopRunIdError, discoverStopProcesses, formatHarnessStop, readPidRecordFrom, stopGoalPathFromLedger, stopHarnessRun, stopRunIdCandidates, START_TOLERANCE_MS, type HarnessStopDeps } from './harness-stop.js';
+import { debug } from '../debug/log.js';
 
-function fakeDeps(o: { record?: { pid: number; startedAt: number } | null; starts: Array<number | null>; contexts?: string[]; jobs?: number; table?: string; scanFailed?: boolean; goalPath?: string | null; cwd?: (pid: number) => string | null }) {
+function fakeDeps(o: { record?: { pid: number; startedAt: number } | null; starts: Array<number | null>; contexts?: string[]; jobs?: number; table?: string; scanFailed?: boolean; goalPath?: string | null; cwd?: (pid: number) => string | null; kubectlScript?: (args: readonly string[]) => { status: number; stdout: string; stderr: string } }) {
   const signals: Array<[number, NodeJS.Signals]> = [];
   const kubectlCalls: string[][] = [];
   let i = 0;
@@ -19,6 +20,7 @@ function fakeDeps(o: { record?: { pid: number; startedAt: number } | null; start
     kubeContexts: () => o.contexts ?? ['ctx-a'],
     kubectl: (args) => {
       kubectlCalls.push([...args]);
+      if (o.kubectlScript) return o.kubectlScript(args);
       return { status: 0, stdout: Array.from({ length: o.jobs ?? 0 }, (_, n) => `job.batch/si-task-${n}`).join('\n'), stderr: '' };
     },
     namespace: 'elanous-test',
@@ -166,7 +168,9 @@ describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭�
     const r = await stopHarnessRun('run-abc', f.deps);
     expect(r.process).toBe('owner-mismatch');
     expect(f.signals).toEqual([]);
-    expect(f.kubectlCalls).toHaveLength(1);
+    // Job 삭제는 그대로 — 라벨 delete(elanous.run ⊕ child-run 폴백)이 문맥마다 그대로 간다. 빈 답이라 none 으로 가른다.
+    expect(f.kubectlCalls.filter((a) => a.includes('delete'))).toHaveLength(2);
+    expect(r.jobDeletes.map((j) => j.outcome)).toEqual(['none']);
   });
 
   test('기록이 없으면 absent · 신호 0 · Job 삭제는 그대로', async () => {
@@ -174,7 +178,9 @@ describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭�
     const r = await stopHarnessRun('run-abc', f.deps);
     expect(r.process).toBe('absent');
     expect(f.signals).toEqual([]);
-    expect(f.kubectlCalls.map((a) => a[1])).toEqual(['c1', 'c2']);
+    // 각 문맥에 라벨 delete(elanous.run ⊕ child-run 폴백)이 간다.
+    expect(f.kubectlCalls.filter((a) => a.includes('delete')).map((a) => a[1]).sort()).toEqual(['c1', 'c1', 'c2', 'c2']);
+    expect(r.jobDeletes.map((j) => `${j.context}:${j.outcome}`)).toEqual(['c1:none', 'c2:none']);
   });
 
   test('제한 시간 안에 안 끝나면 같은 프로세스일 때만 SIGKILL', async () => {
@@ -187,7 +193,8 @@ describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭�
   test('명시한 문맥만 쓴다 · 잘못된 run id 는 거부', async () => {
     const f = fakeDeps({ record: null, starts: [null], contexts: ['should-not-be-used'] });
     await stopHarnessRun('run-abc', f.deps, ['only-this']);
-    expect(f.kubectlCalls.map((a) => a[1])).toEqual(['only-this']);
+    // 조회·삭제·폴백 호출 전부 지정한 문맥에만 간다.
+    expect([...new Set(f.kubectlCalls.map((a) => a[1]))]).toEqual(['only-this']);
     await expect(stopHarnessRun('run abc; rm', f.deps)).rejects.toThrow('invalid run id');
   });
 
@@ -321,7 +328,9 @@ describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭�
     f.deps.scanProcesses = () => { throw new Error('ps denied'); };
     const r = await stopHarnessRun('run-abc', f.deps);
     expect(r.process).toBe('unmeasured');
-    expect(f.kubectlCalls).toHaveLength(1);
+    // Pod 정리는 계속 — 라벨 delete(elanous.run ⊕ child-run 폴백)이 그대로 간다.
+    expect(f.kubectlCalls.filter((a) => a.includes('delete'))).toHaveLength(2);
+    expect(r.jobDeletes.map((j) => j.outcome)).toEqual(['none']);
   });
 
   test('pid.json 시작 시각 불일치와 표의 같은 PID 가 겹쳐도 신호를 보내지 않는다', async () => {
@@ -353,6 +362,88 @@ describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭�
       expect(readPidRecordFrom(dir, 'run-bad')).toBeNull();
       expect(readPidRecordFrom(dir, 'run-missing')).toBeNull();
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('문맥마다 Job 삭제 결과를 가른다 — none·unreachable·pods-only 는 서로 다른 출력 한 줄', async () => {
+    const kubectlScript = (args: readonly string[]) => {
+      const context = args[1]!;
+      if (context === 'ctx-unreachable') return { status: 1, stdout: '', stderr: 'connection refused' };
+      if (context === 'ctx-pods-only' && args.includes('delete')) return { status: 0, stdout: '', stderr: '' };
+      if (context === 'ctx-pods-only') return { status: 0, stdout: 'pod/si-run-abc-1\npod/si-run-abc-2', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const f = fakeDeps({ starts: [null], contexts: ['ctx-none', 'ctx-unreachable', 'ctx-pods-only'], kubectlScript });
+    const r = await stopHarnessRun('run-abc', f.deps);
+    expect(r.jobsDeleted).toBe(0);
+    expect(r.jobDeletes.map((j) => `${j.context}:${j.outcome}:${j.matchedBy}`)).toEqual([
+      'ctx-none:none:null',
+      'ctx-unreachable:unreachable:null',
+      'ctx-pods-only:pods-only:null',
+    ]);
+    // --json: 문맥별 분류가 결과 객체에 실린다.
+    const json = JSON.parse(JSON.stringify(r)) as { jobDeletes: Array<{ context: string; outcome: string; matchedBy: string | null }> };
+    expect(json.jobDeletes.map((j) => `${j.context}:${j.outcome}:${j.matchedBy}`)).toEqual([
+      'ctx-none:none:null',
+      'ctx-unreachable:unreachable:null',
+      'ctx-pods-only:pods-only:null',
+    ]);
+    const out = formatHarnessStop(r).split('\n');
+    const lineOf = (context: string) => out.find((line) => line.includes(context))!;
+    const lines = [lineOf('ctx-none'), lineOf('ctx-unreachable'), lineOf('ctx-pods-only')];
+    expect(new Set(lines).size).toBe(3);
+    expect(lines[0]).toContain('없음 (라벨 맞는 Job 0)');
+    expect(lines[1]).toContain('못 닿음 (kubectl 실패: connection refused)');
+    expect(lines[2]).toContain('같은 라벨 Pod 2 남음');
+    // 경계: 지우는 것은 job 뿐이다 · namespace 기본값 유지 · unreachable 문맥은 첫 실패에 끝난다.
+    expect(f.kubectlCalls.every((a) => a.includes('elanous-test'))).toBe(true);
+    for (const call of f.kubectlCalls.filter((a) => a.includes('delete'))) expect(call[5]).toBe('job');
+    expect(f.kubectlCalls.some((a) => a.includes('delete') && a.includes('pods'))).toBe(false);
+    expect(f.kubectlCalls.filter((a) => a[1] === 'ctx-unreachable')).toHaveLength(1);
+  });
+
+  test('elanous.run 이 0 이면 elanous.child-run 라벨 Job 을 지운다(matchedBy 기록)', async () => {
+    const f = fakeDeps({ starts: [null], kubectlScript: (args) => {
+      if (args.includes('delete') && args.includes('elanous.run=run-abc')) return { status: 0, stdout: '', stderr: '' };
+      if (args.includes('delete') && args.includes('elanous.child-run=run-abc')) return { status: 0, stdout: 'job.batch/si-task-7 deleted', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    } });
+    const r = await stopHarnessRun('run-abc', f.deps);
+    expect(r.jobsDeleted).toBe(1);
+    expect(r.jobDeletes).toEqual([{ context: 'ctx-a', outcome: 'deleted', matchedBy: 'elanous.child-run', deleted: 1 }]);
+    expect(f.kubectlCalls[0]).toContain('elanous.run=run-abc');
+    expect(f.kubectlCalls[1]).toContain('elanous.child-run=run-abc');
+    // 지울 Job 을 찾았으니 Pod 조회는 하지 않는다.
+    expect(f.kubectlCalls).toHaveLength(2);
+    expect(formatHarnessStop(r)).toContain('1개 지움 (라벨 elanous.child-run)');
+    // 경계: 직접 지우는 것은 라벨 일치 Job 뿐 — delete 호출은 job 만 겨냥하고 namespace 기본값을 유지한다.
+    for (const call of f.kubectlCalls) {
+      expect(call[4]).toBe('delete');
+      expect(call[5]).toBe('job');
+      expect(call[3]).toBe('elanous-test');
+    }
+  });
+
+  test('관측 harness.stop job-delete 가 문맥·outcome·matchedBy 를 남긴다', async () => {
+    const events: Array<{ data: unknown }> = [];
+    const off = debug.registerSink({ name: 'harness-stop-job-delete', emit: (rec) => { if (rec.category === 'harness.stop' && rec.event === 'job-delete') events.push({ data: rec.data }); } });
+    try {
+      const f = fakeDeps({ starts: [null], contexts: ['ctx-mixed', 'ctx-empty'], kubectlScript: (args) => {
+        if (args[1] === 'ctx-mixed' && args.includes('delete') && args.includes('elanous.run=run-obs')) return { status: 0, stdout: 'job.batch/si-obs-1 deleted', stderr: '' };
+        if (args[1] === 'ctx-mixed' && args.includes('delete')) return { status: 0, stdout: '', stderr: '' };
+        if (args[1] === 'ctx-mixed') return { status: 0, stdout: 'pod/si-obs-9', stderr: '' };
+        return { status: 0, stdout: '', stderr: '' };
+      } });
+      await stopHarnessRun('run-obs', f.deps);
+      // 계약 칸만 가린다 — 실행 칸 귀속(substrate·hostId 등)은 환경이 덧붙인다.
+      const row = (data: unknown) => {
+        const d = data as { runId?: string; context?: string; outcome?: string; matchedBy?: string | null; deleted?: number };
+        return JSON.stringify({ runId: d.runId, context: d.context, outcome: d.outcome, matchedBy: d.matchedBy, ...(d.deleted !== undefined ? { deleted: d.deleted } : {}) });
+      };
+      expect(events.map((e) => row(e.data))).toEqual([
+        JSON.stringify({ runId: 'run-obs', context: 'ctx-mixed', outcome: 'deleted', matchedBy: 'elanous.run', deleted: 1 }),
+        JSON.stringify({ runId: 'run-obs', context: 'ctx-empty', outcome: 'none', matchedBy: null }),
+      ]);
+    } finally { off(); }
   });
 });
 

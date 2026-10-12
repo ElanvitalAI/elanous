@@ -21,6 +21,15 @@ export function getStudyNoteSaveDir(): string | null {
   return join(vaultRoot, ...sub.split('/'));
 }
 
+const SAVE_SKIP_NOTICE =
+  '저장 안 됨 · OBSIDIAN_VAULT_ROOT 가 없다 · 고칠 한 줄: export OBSIDIAN_VAULT_ROOT=<vault 경로>';
+
+/** target 이 obsidian 인데 saveDir 이 없으면 세 칸 안내, 아니면 null. */
+export function saveSkipNotice(target: string, saveDir: string | null): string | null {
+  if (target === 'obsidian' && saveDir == null) return SAVE_SKIP_NOTICE;
+  return null;
+}
+
 /* ── Artifact persistence (Cloud STT path) ── */
 
 export async function prepareRunDir(saveDir: string, meta: VideoMeta, videoId: string): Promise<string> {

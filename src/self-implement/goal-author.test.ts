@@ -8338,7 +8338,7 @@ describe('verbatimOriginalAsk — 골 문서에서 «사람의 ask 만» 떼어 
 describe('goal-file lint origins', () => {
   const tags: readonly GoalFileLintTag[] = [
     'canonical-structure', 'evidence-section', 'boundary-size', 'launch-branch', 'unanswered-clarification',
-    'shell-damage', 'traced-path', 'grounding-evidence', 'empty-result-population',
+    'shell-damage', 'traced-path', 'traced-path-new', 'grounding-evidence', 'empty-result-population',
     'decision-signal-numeric-source', 'decision-signal-numeric-coverage', 'decision-signal-proxy-expectation',
     'out-of-target-requirement', 'heading-form-marker', 'blanket-invariant', 'self-question-subject',
     'artifact-launch-declaration', 'all-negative-signals', 'unreadable-signals', 'alternative-signals', 'count-observation',
@@ -8347,7 +8347,7 @@ describe('goal-file lint origins', () => {
 
   test('has one explicit origin entry for every existing lint tag', () => {
     expect(Object.keys(GOAL_FILE_LINT_ORIGINS).sort()).toEqual([...tags].sort());
-    expect(Object.values(GOAL_FILE_LINT_ORIGINS).filter((origin) => origin.kind === 'known-incident')).toHaveLength(16);
+    expect(Object.values(GOAL_FILE_LINT_ORIGINS).filter((origin) => origin.kind === 'known-incident')).toHaveLength(17);
     expect(Object.values(GOAL_FILE_LINT_ORIGINS).filter((origin) => origin.kind === 'unknown-origin')).toHaveLength(9);
     for (const origin of Object.values(GOAL_FILE_LINT_ORIGINS)) {
       if (origin.kind === 'known-incident') {

@@ -42,6 +42,7 @@ import {
 } from './session-runtime/retry-policy.js';
 import { fetchApiWithRetry, OverloadFailoverError, type FetchApiWithRetryOpts } from './session-runtime/retry-api.js';
 import { BedrockProvider, isBedrockCompatibleModel, makeBedrockProvider } from './llm/bedrock-provider.js';
+import { OPEN_WEIGHT_TOOL_DISCIPLINE } from './llm/open-weight-discipline.js';
 import { makeZaiCodingPlanProvider, zaiCodingPlanAvailable } from './llm/zai-coding-plan.js';
 import { isOpenRouterDeepSeekWireModel, nonEmptyReasoningDetails, openRouterDeepSeekCatalogEffort, openRouterDeepSeekEffort, openRouterDeepSeekRequestExtras, openRouterNeedsKimiToolSchema } from './llm/openrouter-deepseek.js';
 import { resolveModelAlias } from './intelligence-map/model-alias.js';
@@ -5165,14 +5166,9 @@ const LOCAL_TOOL_DISCIPLINE = [
   '- 범위 읽기만으로 판단할 수 없을 때에만 전체 읽기를 선택하고, 읽은 뒤에는 다음 행동을 계속 결정하라.',
 ].join('\n');
 
-/** OpenRouter(`openrouter/…`) GLM·Kimi·Qwen 전용 도구 호출 규율 — 다른 군 상수와 합성하지 않는 독립 상수. */
-export const OPEN_WEIGHT_TOOL_DISCIPLINE = [
-  '[open-weight tool-use discipline]',
-  '- 도구로 할 수 있는 일은 이번 응답에서 바로 도구를 호출하라. "먼저 읽겠다" 또는 "확인하겠다" 같은 계획만 말하고 응답을 끝내지 마라.',
-  '- 작업을 시작하는 첫 응답에는 도구 호출이 하나 이상 있어야 한다.',
-  '- 도구 호출 인자는 해당 도구의 스키마에 맞는 JSON 으로 내라.',
-  '- 충분한 근거가 모이면 도구 호출 없이 최종 답을 평문으로 써서 끝내라.',
-].join('\n');
+// ⭐ 2026-10-11 GLM-PROMPT-TUNE: 상수 정의는 `src/llm/open-weight-discipline.ts` 로 옮겼다(llm.ts 동결 RFC #25983).
+//    llm.ts 는 이 재수출만 남긴다 — 기존 임포트 경로(`./llm.js`)를 그대로 지킨다.
+export { OPEN_WEIGHT_TOOL_DISCIPLINE };
 
 /** 모델군 → 그 군에 주입할 툴 규율(없으면 `null`). **능력 술어 판** — 2026-08-14.
  *

@@ -9,15 +9,20 @@
 //   credits      — 한도 안 ⊕ 크레딧(찬 계정을 선불 크레딧으로 계속). 크레딧도 떨어져 요청이 한도 오류를 내면 폴백 체인.
 //
 // ⛔ 옛 키 `llm.codexCreditsAllowed: true` 는 `credits` 로 읽는다(새 키가 있으면 새 키가 이긴다).
+// ⭐ 새 자리 = `policy/llm.yaml` 의 `credits.codex`(use→credits · fallback→fallback · never→within-quota).
+//   풀이 순서: env → 정책 파일(파일 출처일 때만) → 옛 `llm.codexQuotaPolicy` → 옛 `llm.codexCreditsAllowed` → fallback.
+//   옛 키는 지우지 않고 읽기만 한다(적용·가려짐은 `codex.policy` 관측으로 남는다).
 // ⛔ 못 읽거나 모르는 값이면 `fallback` — 크레딧은 돈이라 fail-closed(종전 기본과 같다).
+
+import { debug } from '../debug/log.js';
 
 export const CODEX_QUOTA_POLICIES = ['within-quota', 'fallback', 'credits'] as const;
 export type CodexQuotaPolicy = (typeof CODEX_QUOTA_POLICIES)[number];
 
 export interface ResolvedCodexQuotaPolicy {
   readonly policy: CodexQuotaPolicy;
-  /** 어디서 정해졌나 — `config`(새 키) · `legacy-credits`(옛 `codexCreditsAllowed`) · `default` · `invalid`(모르는 값 → 기본). */
-  readonly source: 'env' | 'config' | 'legacy-credits' | 'default' | 'invalid';
+  /** 어디서 정해졌나 — `policy-file`(policy/llm.yaml credits.codex) · `config`(옛 `codexQuotaPolicy`) · `legacy-credits`(옛 `codexCreditsAllowed`) · `default` · `invalid`(모르는 값 → 기본). */
+  readonly source: 'env' | 'policy-file' | 'config' | 'legacy-credits' | 'default' | 'invalid';
 }
 
 export const CODEX_QUOTA_POLICY_LABEL: Readonly<Record<CodexQuotaPolicy, string>> = {
@@ -30,16 +35,40 @@ export function isCodexQuotaPolicy(value: unknown): value is CodexQuotaPolicy {
   return typeof value === 'string' && (CODEX_QUOTA_POLICIES as readonly string[]).includes(value);
 }
 
+/** `policy/llm.yaml` 의 `credits.codex` 값. `unreadable` = 파일이 있는데 깨졌거나 못 읽음(fail-closed 로 fallback). */
+export type CodexQuotaPolicyFileValue = 'use' | 'fallback' | 'never' | 'unreadable';
+
+const FILE_VALUE_TO_POLICY: Readonly<Record<Exclude<CodexQuotaPolicyFileValue, 'unreadable'>, CodexQuotaPolicy>> = {
+  use: 'credits',
+  fallback: 'fallback',
+  never: 'within-quota',
+};
+
 export function resolveCodexQuotaPolicy(
   llm: { readonly codexQuotaPolicy?: unknown; readonly codexCreditsAllowed?: unknown } | undefined,
+  file?: CodexQuotaPolicyFileValue,
 ): ResolvedCodexQuotaPolicy {
   // A Pod has no copy of the host config; the launcher hands the host's policy down in this variable
   // (09-29: without it every Pod child fell back to grok while all three accounts still had credits).
   const fromEnv = process.env.ELANOUS_CODEX_QUOTA_POLICY?.trim();
   if (fromEnv && isCodexQuotaPolicy(fromEnv)) return { policy: fromEnv, source: 'env' };
+  // 정책 파일이 깨졌으면 옛 키가 credits 라 해도 따르지 않는다 — 크레딧은 돈이라 닫는다.
+  if (file === 'unreadable') return { policy: 'fallback', source: 'invalid' };
   const raw = llm?.codexQuotaPolicy;
-  if (isCodexQuotaPolicy(raw)) return { policy: raw, source: 'config' };
-  if (llm?.codexCreditsAllowed === true) return { policy: 'credits', source: 'legacy-credits' };
+  const legacy: { key: string; value: unknown; policy: CodexQuotaPolicy } | undefined = isCodexQuotaPolicy(raw)
+    ? { key: 'llm.codexQuotaPolicy', value: raw, policy: raw }
+    : llm?.codexCreditsAllowed === true ? { key: 'llm.codexCreditsAllowed', value: true, policy: 'credits' } : undefined;
+  if (file !== undefined) {
+    const policy = FILE_VALUE_TO_POLICY[file];
+    if (legacy && legacy.policy !== policy) debug.log('codex.policy', 'legacy-key-shadowed', { key: legacy.key, legacy: legacy.value, file });
+    return { policy, source: 'policy-file' };
+  }
+  if (legacy) {
+    debug.log('codex.policy', 'legacy-key-applied', { key: legacy.key, value: legacy.value });
+    return legacy.key === 'llm.codexQuotaPolicy'
+      ? { policy: legacy.policy, source: 'config' }
+      : { policy: 'credits', source: 'legacy-credits' };
+  }
   if (raw !== undefined) return { policy: 'fallback', source: 'invalid' };
   return { policy: 'fallback', source: 'default' };
 }

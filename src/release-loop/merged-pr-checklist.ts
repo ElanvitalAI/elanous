@@ -38,7 +38,18 @@ export function syncMergedPrChecklist(number: number, cwd: string, goalFile?: st
   // The audit matcher owns explicit-label and evidence decisions on both PR surfaces.
   // The shared matcher only accepts a whole `칸: X` line. A designated label in the body (`칸: X — …` at a line head)
   // or in the title is restated as such a line; prose mentions are not (the audit command's contract is unchanged).
-  const designated = [...goalCells(pr.body ?? ''), ...titleCells(pr.title)];
+  // Goal-file ids join that set: `칸: X` lines plus `- 칸 id: A · B` declarations (not-declared excluded).
+  const fromBody = goalCells(pr.body ?? '');
+  const fromTitle = titleCells(pr.title);
+  const fromGoal = goal ? goalFileCells(goal) : new Set<string>();
+  const designated = [...new Set([...fromBody, ...fromTitle, ...fromGoal])];
+  for (const id of designated) {
+    log('release.checklist', 'merged-pr-cell-source', {
+      pr: number,
+      id,
+      source: fromBody.has(id) ? 'body' : fromTitle.has(id) ? 'title' : 'goal',
+    });
+  }
   // Only the restated labels go to the matcher — raw body text (quotes, fences, indented code) never does.
   const prForMatch = { ...merged, title: '', body: designated.map((id) => `칸: ${id}`).join('\n') };
   const matches = [...new Set(versions)].flatMap((version) => {
@@ -86,9 +97,13 @@ export function syncMergedPrChecklist(number: number, cwd: string, goalFile?: st
   for (const id of missing) log('release.checklist', 'merged-pr-cell-not-found', { pr: number, id });
 }
 
-const LABEL_IDS = '([A-Za-z0-9_-]+(?:[ \\t]*,[ \\t]*[A-Za-z0-9_-]+)*)';
+const LABEL_IDS = '([A-Za-z0-9_-]+(?:[ \\t]*(?:,|·)[ \\t]*[A-Za-z0-9_-]+)*)';
 const LABEL_END = '(?=[ \\t]*$|[ \\t]+[—–·(-])';
 const DESIGNATION = new RegExp(`^ {0,3}(?:#{1,6}[ \\t]+|[-*][ \\t]+)?칸[ \\t]*:[ \\t]*${LABEL_IDS}${LABEL_END}`);
+
+function idsInLabel(captured: string): string[] {
+  return captured.split(/[,·]/).map((id) => id.trim()).filter(Boolean);
+}
 
 /** Lines of a Markdown document outside fenced code (closed only by the same marker, at least as long), 4-space
  *  indented code and `>` quotes — the only lines that may designate a cell or declare completion. */
@@ -109,13 +124,28 @@ function proseLines(text: string): string[] {
   return lines;
 }
 
-/** Cell ids a document designates on a line head: `칸: X[, Y]`, optionally after a heading or list marker. */
+/** Cell ids a document designates on a line head: `칸: X[, Y]` or `칸: X · Y`, optionally after a heading or list marker. */
 export function goalCells(goal: string): Set<string> {
   const ids = new Set<string>();
   for (const line of proseLines(goal)) {
     const label = DESIGNATION.exec(line);
     if (!label) continue;
-    for (const id of label[1]!.split(',')) ids.add(id.trim());
+    for (const id of idsInLabel(label[1]!)) ids.add(id);
+  }
+  return ids;
+}
+
+/** Goal-file designations: `칸:` lines plus `- 칸 id: A · B` declarations (same shape as goalChecklistIds). */
+function goalFileCells(goal: string): Set<string> {
+  const ids = goalCells(goal);
+  for (const line of proseLines(goal)) {
+    if (!line.startsWith('- 칸 id: ')) continue;
+    const declared = line.slice('- 칸 id: '.length).trim();
+    if (!declared || declared === 'not declared') continue;
+    for (const id of declared.split(' · ')) {
+      const trimmed = id.trim();
+      if (trimmed) ids.add(trimmed);
+    }
   }
   return ids;
 }
@@ -129,7 +159,7 @@ export function declaresCompletion(goal: string): boolean {
 export function titleCells(title: string): Set<string> {
   const ids = new Set<string>();
   for (const label of title.matchAll(new RegExp(`(?<![A-Za-z0-9가-힣])칸[ \\t]*:[ \\t]*${LABEL_IDS}${LABEL_END}`, 'g'))) {
-    for (const id of label[1]!.split(',')) ids.add(id.trim());
+    for (const id of idsInLabel(label[1]!)) ids.add(id);
   }
   return ids;
 }

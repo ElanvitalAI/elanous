@@ -10,9 +10,11 @@ export interface Project {
   name: string;
   primaryFolder?: string;
   createdAt: string;
+  relations?: Array<{ type: 'dependsOn' | 'derivedFrom' | 'partOf' | 'deploysTo'; target: string }>;
 }
 
 const PROJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const RELATION_TYPES = new Set(['dependsOn', 'derivedFrom', 'partOf', 'deploysTo']);
 
 function validId(id: unknown): id is string {
   return typeof id === 'string' && PROJECT_ID.test(id);
@@ -26,7 +28,25 @@ function validateProject(value: unknown): Project {
     || (item.primaryFolder !== undefined && (typeof item.primaryFolder !== 'string' || !isAbsolute(item.primaryFolder)))) {
     throw new Error('invalid project record');
   }
+  if (item.relations !== undefined) {
+    if (!Array.isArray(item.relations)) throw new Error('invalid project record');
+    const seen = new Set<string>();
+    for (const rel of item.relations) {
+      if (!rel || typeof rel !== 'object' || Array.isArray(rel)) throw new Error('invalid project record');
+      const edge = rel as Record<string, unknown>;
+      if (!RELATION_TYPES.has(edge.type as string) || !validId(edge.target) || edge.target === item.id) {
+        throw new Error('invalid project record');
+      }
+      const key = `${edge.type}\0${edge.target}`;
+      if (seen.has(key)) throw new Error('invalid project record');
+      seen.add(key);
+    }
+  }
   return value as Project;
+}
+
+export function relationsOf(project: Project): Array<{ type: 'dependsOn' | 'derivedFrom' | 'partOf' | 'deploysTo'; target: string }> {
+  return project.relations ?? [];
 }
 
 export class ProjectStore {

@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Command } from 'commander';
 import { runSelfGateCli, type SelfGateCliOptions, type SelfGateCliResult } from '../self-implement/gate-cli.js';
+import { GATE_CALLER_TEST_LIMIT } from '../self-implement/gate-scope.js';
 import { GATE_REMOTE_DEFAULTS, type DispatchDeps, type DispatchOptions, type GateRemoteRunner } from '../self-implement/gate-remote.js';
 import { registerReleaseCommands } from '../cli/release-cli.js';
-import { LIGHT_RC_ALWAYS_FILE, LIGHT_RC_UNKNOWN_HOST, parseAlwaysIncludeList, runLightRc, type LightRcDeps } from './light-rc.js';
+import { LIGHT_RC_ALWAYS_FILE, LIGHT_RC_UNKNOWN_HOST, parseAlwaysIncludeList, resolveMeasuredCommit, runLightRc, type LightRcDeps } from './light-rc.js';
 
 const REPO = resolve(import.meta.dir, '../..');
 const dirs: string[] = [];
@@ -98,12 +99,16 @@ function gateResult(over: Partial<SelfGateCliResult> = {}): SelfGateCliResult {
   };
 }
 
+const MAIN_SHA = 'c'.repeat(40);
+/** Fake git: rev-parse (HEAD and origin/main alike) answers MAIN_SHA — the tree is at the measured commit. */
+const fakeGit = (args: string[]) => ({ rc: 0, stdout: args[0] === 'rev-parse' ? `${MAIN_SHA}\n` : 'abc123\n' });
+
 function localDeps(over: Partial<LightRcDeps> = {}, gate: SelfGateCliResult = gateResult()) {
   const calls: SelfGateCliOptions[] = [];
   const dispatched: DispatchOptions[] = [];
   const deps: LightRcDeps = {
     cwd: REPO,
-    git: () => ({ rc: 0, stdout: 'abc123\n' }),
+    git: fakeGit,
     previousVersion: () => '0.2.18',
     runGate: (_cwd, options) => { calls.push(options); return gate; },
     dispatch: async (opts: DispatchOptions) => { dispatched.push(opts); return opts.runLocal(); },
@@ -115,9 +120,12 @@ function localDeps(over: Partial<LightRcDeps> = {}, gate: SelfGateCliResult = ga
 describe('runLightRc (LIGHT-RC ⑶)', () => {
   test('③ no --base: merge-base of the previous cut is the base · shards 4 · the six always-include paths · one gate call', async () => {
     const gitCalls: string[][] = [];
-    const { calls, dispatched, deps } = localDeps({ git: (args) => { gitCalls.push(args); return { rc: 0, stdout: 'abc123\n' }; } });
+    const { calls, dispatched, deps } = localDeps({ git: (args) => { gitCalls.push(args); return fakeGit(args); } });
     const result = await runLightRc('0.2.19', { log: () => {} }, deps);
-    expect(gitCalls).toEqual([['merge-base', 'origin/main', 'origin/release/0.2.18']]);
+    expect(gitCalls).toEqual([
+      ['fetch', '--quiet', 'origin', 'main'], ['rev-parse', '--verify', '--quiet', 'origin/main^{commit}'], ['rev-parse', 'HEAD'],
+      ['merge-base', 'origin/main', 'origin/release/0.2.18'],
+    ]);
     expect(calls).toHaveLength(1);
     expect(calls[0]!.base).toBe('abc123');
     expect(calls[0]!.shards).toBe(4);
@@ -139,12 +147,12 @@ describe('runLightRc (LIGHT-RC ⑶)', () => {
   });
 
   test('④ previous release branch missing ⇒ the same error', async () => {
-    const { deps } = localDeps({ git: () => ({ rc: 1, stdout: '' }) });
+    const { deps } = localDeps({ git: (args) => args[0] === 'merge-base' ? { rc: 1, stdout: '' } : fakeGit(args) });
     await expect(runLightRc('0.2.19', { log: () => {} }, deps)).rejects.toThrow('--base 로 준다');
   });
 
   test('an explicit --base skips the ledger and git lookup', async () => {
-    const { calls, deps } = localDeps({ previousVersion: () => { throw new Error('must not read'); }, git: () => { throw new Error('must not run'); } });
+    const { calls, deps } = localDeps({ previousVersion: () => { throw new Error('must not read'); }, git: (args) => { if (args[0] === 'merge-base') throw new Error('must not run'); return fakeGit(args); } });
     await runLightRc('0.2.19', { base: 'deadbeef', shards: 2, log: () => {} }, deps);
     expect(calls[0]).toMatchObject({ base: 'deadbeef', shards: 2 });
   });
@@ -160,15 +168,20 @@ describe('runLightRc (LIGHT-RC ⑶)', () => {
     });
     const result = await runLightRc('0.2.19', { base: 'abc123', remote: 'node-b', log: () => {} }, deps);
     expect(calls).toHaveLength(0);
-    expect(argv).toEqual(['bun', 'bin/elanous.mjs', 'release', 'light-rc', '--version', '0.2.19', '--base', 'f'.repeat(40), '--shards', '4', '--local', '--json']);
+    expect(argv).toEqual(['bun', 'bin/elanous.mjs', 'release', 'light-rc', '--version', '0.2.19', '--base', 'f'.repeat(40), '--head', MAIN_SHA, '--shards', '4', '--local', '--json']);
     expect(result).toMatchObject({ introduced: 2, preexisting: 3, alwaysIncludeMissing: ['x.test.ts'], remote: 'node-b', ok: false });
   });
 
   test('default host through the real dispatch: the result names the host the gate ran on, not local', async () => {
     const sha = 'a'.repeat(40);
     let script = '';
+    const localCalls: string[][] = [];
     const runner: GateRemoteRunner = {
-      local: (_cmd, args) => args[0] === 'rev-parse' ? { rc: 0, stdout: `${sha}\n`, stderr: '' } : { rc: 0, stdout: '', stderr: '' },
+      local: (_cmd, args) => {
+        localCalls.push(args);
+        return args[0] === 'rev-parse' ? { rc: 0, stdout: `${sha}\n`, stderr: '' }
+          : args[0] === 'cat-file' ? { rc: 0, stdout: 'commit\n', stderr: '' } : { rc: 0, stdout: '', stderr: '' };
+      },
       ssh: (_host, body) => {
         script = body;
         // The child prints its own result (remote: null — it ran locally on the host); the dispatch adds host · remote:true.
@@ -179,6 +192,11 @@ describe('runLightRc (LIGHT-RC ⑶)', () => {
     const result = await runLightRc('0.2.19', { base: sha, log: () => {} }, deps);
     expect(calls).toHaveLength(0);
     expect(script).toContain("'release' 'light-rc' '--version' '0.2.19'");
+    // ① the measured commit (origin/main), not the tree's HEAD, is what goes to the host and what the child measures.
+    expect(localCalls).toContainEqual(['cat-file', '-t', MAIN_SHA]);
+    expect(localCalls.some((args) => args[0] === 'push' && args.includes(`${MAIN_SHA}:refs/elanous/gate/${MAIN_SHA}`))).toBe(true);
+    expect(script).toContain(`'--head' '${MAIN_SHA}'`);
+    expect(result.measuredCommit).toBe(MAIN_SHA);
     expect(result).toMatchObject({ remote: 'gatehost', introduced: 0, preexisting: 1, ok: true });
   });
 
@@ -234,5 +252,118 @@ describe('release light-rc CLI (LIGHT-RC ⑷)', () => {
     const out = await runCli(gateResult({ baseline: { introduced: 0, preexisting: 4, unknown: 0, preconditionUnmet: 0 } }), '--json');
     expect(process.exitCode).toBe(0);
     expect(JSON.parse(out[0]!)).toMatchObject({ ok: true, introduced: 0, preexisting: 4 });
+  });
+});
+
+describe('RELEASE-DAILY-LIGHT-RC ① — light-rc measures origin/main, not the tree it started in', () => {
+  const SEAT_HEAD = 'e'.repeat(40);
+  const seatGit = (calls: string[][] = []) => (args: string[]) => {
+    calls.push(args);
+    if (args[0] === 'rev-parse') return { rc: 0, stdout: `${args[1] === 'HEAD' ? SEAT_HEAD : MAIN_SHA}\n` };
+    return { rc: 0, stdout: 'abc123\n' };
+  };
+
+  test('a tree whose HEAD is not origin/main runs the gate in a detached checkout of origin/main · says so · cleans up', async () => {
+    const checkouts: string[] = [];
+    let cleaned = 0;
+    const gateDirs: string[] = [];
+    const lines: string[] = [];
+    const { calls, deps } = localDeps({
+      git: seatGit(),
+      checkout: (sha) => { checkouts.push(sha); return { dir: REPO, cleanup: () => { cleaned += 1; } }; },
+      runGate: (cwd, options) => { gateDirs.push(cwd); calls.push(options); return gateResult(); },
+    });
+    const result = await runLightRc('0.2.25', { base: 'abc123', local: true, log: (line) => lines.push(line) }, deps);
+    expect(checkouts).toEqual([MAIN_SHA]);
+    expect(cleaned).toBe(1);
+    expect(gateDirs).toEqual([REPO]);
+    expect(result).toMatchObject({ measuredCommit: MAIN_SHA, worktreeHead: SEAT_HEAD });
+    expect(lines.some((line) => line.startsWith(`ⓘ light-rc measures ${MAIN_SHA.slice(0, 12)} (origin/main)`) && line.includes(SEAT_HEAD.slice(0, 12)))).toBe(true);
+  });
+
+  test('a tree already at origin/main measures in place — no checkout, no differs line', async () => {
+    const lines: string[] = [];
+    const { deps } = localDeps({ checkout: () => { throw new Error('must not check out'); } });
+    const result = await runLightRc('0.2.25', { base: 'abc123', local: true, log: (line) => lines.push(line) }, deps);
+    expect(result).toMatchObject({ measuredCommit: MAIN_SHA, worktreeHead: MAIN_SHA });
+    expect(lines.some((line) => line.startsWith('ⓘ light-rc measures'))).toBe(false);
+  });
+
+  test('the checkout is removed even when the gate throws', async () => {
+    let cleaned = 0;
+    const { deps } = localDeps({
+      git: seatGit(),
+      checkout: () => ({ dir: REPO, cleanup: () => { cleaned += 1; } }),
+      runGate: () => { throw new Error('gate exploded'); },
+    });
+    await expect(runLightRc('0.2.25', { base: 'abc123', local: true, log: () => {} }, deps)).rejects.toThrow('gate exploded');
+    expect(cleaned).toBe(1);
+  });
+
+  test('an explicit --head is measured as given (no fetch) · a failed fetch is said and the local origin/main measured', () => {
+    const calls: string[][] = [];
+    expect(resolveMeasuredCommit(REPO, MAIN_SHA, { git: seatGit(calls) }, () => {}).measuredCommit).toBe(MAIN_SHA);
+    expect(calls.some((args) => args[0] === 'fetch')).toBe(false);
+    const lines: string[] = [];
+    const failing = (args: string[]) => args[0] === 'fetch' ? { rc: 128, stdout: '' } : seatGit()(args);
+    expect(resolveMeasuredCommit(REPO, undefined, { git: failing }, (line) => lines.push(line)).measuredCommit).toBe(MAIN_SHA);
+    expect(lines.some((line) => line.includes('git fetch origin main rc=128'))).toBe(true);
+  });
+
+  test('an unresolvable head is an error, never a silent fall back to the tree HEAD', () => {
+    const git = (args: string[]) => args[0] === 'rev-parse' && args[1] !== 'HEAD' ? { rc: 1, stdout: '' } : seatGit()(args);
+    expect(() => resolveMeasuredCommit(REPO, 'nope', { git }, () => {})).toThrow('cannot resolve nope');
+  });
+
+  test('the local gate is asked for importer tests (②)', async () => {
+    const { calls, deps } = localDeps();
+    await runLightRc('0.2.25', { base: 'abc123', local: true, log: () => {} }, deps);
+    expect(calls[0]!.includeImporterTests).toBe(true);
+  });
+});
+
+describe('RELEASE-DAILY-LIGHT-RC ② — self gate includeImporterTests lifts the caller cap for importers', () => {
+  // The plain self gate runs at most GATE_CALLER_TEST_LIMIT caller tests; a day of landings changes many sources, so the
+  // rest (overflow) were only reported — 0.2.24 shipped 20 regressions from source-only changes.
+  const N = GATE_CALLER_TEST_LIMIT + 5;
+  const users = Array.from({ length: N }, (_, i) => `src/u${String(i).padStart(2, '0')}.test.ts`);
+  function importerRepo(): string {
+    const cwd = tempRepo();
+    mkdirSync(join(cwd, 'src'));
+    writeFileSync(join(cwd, 'src/x.ts'), 'export const x = 1;\n');
+    for (const user of users) writeFileSync(join(cwd, user), "import { x } from './x';\ntest('x', () => { x; });\n");
+    return cwd;
+  }
+  function importerDeps() {
+    const { ran, deps } = quietGateDeps(() => ({ status: 0, stdout: '1 pass\n', stderr: '' }));
+    return {
+      ran,
+      deps: {
+        ...deps,
+        changedFiles: () => ({ files: ['src/x.ts'], baseRef: 'base-sha' }),
+        runCommand: (_cmd: string, args: readonly string[]) => args[0] === 'grep' ? { status: 0, stdout: `${users.join('\n')}\n`, stderr: '' }
+          : args[0] === 'ls-files' ? { status: 0, stdout: ['src/x.ts', ...users].join('\n'), stderr: '' } : { status: 0, stdout: '', stderr: '' },
+      },
+    };
+  }
+
+  test('a source-only change runs every test that imports it, past the caller cap (reason=changed-source-importer)', () => {
+    const { ran, deps } = importerDeps();
+    const result = runSelfGateCli(importerRepo(), { base: 'base-sha', includeImporterTests: true }, deps);
+    expect(new Set(ran.flat())).toEqual(new Set(users));
+    expect(result.importerTestsAdded).toHaveLength(5);
+    expect(result.lines.some((line) => line.startsWith('importer tests added: 5 (reason=changed-source-importer · '))).toBe(true);
+    expect(result.lines.some((line) => line.startsWith('unrun importer tests: 0;'))).toBe(true);
+    expect(result.lines.some((line) => line.startsWith('⚠️ caller test cap exceeded'))).toBe(false);
+  });
+
+  test('without the option the plain self gate keeps its cap (overflow reported, not run · no added line)', () => {
+    const { ran, deps } = importerDeps();
+    const result = runSelfGateCli(importerRepo(), { base: 'base-sha' }, deps);
+    expect(ran.flat()).toHaveLength(GATE_CALLER_TEST_LIMIT);
+    expect(result.importerTestsAdded).toEqual([]);
+    expect(result.lines.some((line) => line.startsWith('importer tests added'))).toBe(false);
+    expect(result.lines.some((line) => line.startsWith('unrun importer tests: 5'))).toBe(true);
+    expect(result.lines.some((line) => line.startsWith('⚠️ caller test cap exceeded'))).toBe(true);
   });
 });

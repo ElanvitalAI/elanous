@@ -772,10 +772,11 @@ describe('preview/terminal.ts — node-pty 는 «부를 때» 싣는다', () => 
   // ⛔ 주석에 적힌 설명 문면이 걸리지 않도록 «import 문 자체»만 본다.
   const importLines = SRC.split('\n').filter((line) => /^\s*import\b/.test(line));
 
-  test('⛔ 최상위 «값» import 가 없다 (타입 import 는 런타임에 지워지므로 허용)', () => {
-    const ptyImports = importLines.filter((line) => line.includes("'node-pty'"));
-    expect(ptyImports.length).toBeGreaterThan(0);           // 타입 import 는 있어야 정상
-    for (const line of ptyImports) expect(line).toMatch(/^\s*import\s+type\b/);
+  // ⛔ 타입 import 도 «없어야» 한다(10-11 LINUX-SELF-UPDATE-NODEPTY) — 런타임엔 지워지지만 PWA `next build` 가
+  //   이 파일을 타입 검사하므로, node-pty(optionalDependency)가 빠진 리눅스 설치에서 «Cannot find module» 로 빌드가 죽었다.
+  test('⛔ 최상위 import 가 없다 (타입 import 도 — PWA 빌드가 타입 검사한다)', () => {
+    const ptyImports = importLines.filter((line) => /['"]node-pty(\/[^'"]*)?['"]/.test(line));
+    expect(ptyImports).toEqual([]);
   });
 
   test('✅ 유일한 런타임 사용처가 «지연 require» 다', () => {

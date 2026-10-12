@@ -3,7 +3,8 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { integrateTrain, planTrain, runTrain, type TrainCandidate, type TrainGit, type TrainObservation } from './merge-train.js';
+import { integrateTrain, planTrain, runTrain, tangledPairs, type TrainCandidate, type TrainGit, type TrainObservation } from './merge-train.js';
+import { enqueueL8ShadowQueue, runL8ShadowQueue, statusL8ShadowQueue } from './l8-merge-queue.js';
 
 const candidates = Array.from({ length: 8 }, (_, index): TrainCandidate => ({ number: index + 1, head: 'a'.repeat(40), files: [`${index}.ts`] }));
 const dirs: string[] = [];
@@ -36,6 +37,16 @@ function fixture() {
   git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'main changed');
   return { repo, base: git(repo, 'rev-parse', 'HEAD'), first, second, conflict };
 }
+
+test('tangledPairs combines reversed pairs and returns only pairs at the threshold', () => {
+  expect(tangledPairs([
+    { pr: 5, with: 7 }, { pr: 7, with: 5 }, { pr: 5, with: 7 }, { pr: 8, with: 9 },
+  ])).toEqual([{ first: 5, then: 7, failures: 3 }]);
+  expect(tangledPairs([{ pr: 5, with: 7 }])).toEqual([]);
+  expect(tangledPairs([{ pr: 5, with: 7 }, { pr: 7, with: 5 }, { pr: 8, with: 9 }])).toEqual([
+    { first: 5, then: 7, failures: 2 },
+  ]);
+});
 
 test('planTrain selects disjoint PRs in order and defers overlap and unmeasured files', () => {
   const input: TrainCandidate[] = [
@@ -199,3 +210,64 @@ test('conflicting PR is excluded from gate while remaining PRs pass', async () =
   });
   expect(verdict.verdicts).toEqual([{ number: 1, verdict: 'pass' }, { number: 2, verdict: 'conflict' }, { number: 3, verdict: 'pass' }]);
 });
+
+test('shadow queue with two non-overlapping PRs runs one train gate and records the verdict without merging', async () => {
+  const { repo, base, first, second } = fixture();
+  const viewFor = (head: string, path: string) => JSON.stringify({
+    headRefOid: head, baseRefName: 'main', state: 'OPEN', isDraft: false, isCrossRepository: false, files: [{ path }],
+  });
+  const fetchHeads = new Map<string, string>([
+    ['refs/heads/main', base], ['refs/pull/7/head', first], ['refs/pull/8/head', second],
+  ]);
+  let lastFetch = 'refs/heads/main';
+  const calls: string[] = [];
+  const real = (bin: string, args: readonly string[], cwd: string) => {
+    const r = spawnSync(bin, [...args], { cwd, encoding: 'utf8' });
+    return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+  };
+  const execute = (bin: string, args: readonly string[], cwd: string) => {
+    calls.push([bin, ...args].join(' '));
+    if (bin === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+      return Number(args[2]) === 7
+        ? { status: 0, stdout: viewFor(first, 'first.txt'), stderr: '' }
+        : { status: 0, stdout: viewFor(second, 'second.txt'), stderr: '' };
+    }
+    if (bin === 'git' && args[0] === 'fetch' && fetchHeads.has(args[2] ?? '')) {
+      lastFetch = args[2]!;
+      return { status: 0, stdout: '', stderr: '' };
+    }
+    if (bin === 'git' && args[0] === 'rev-parse' && args[1] === 'FETCH_HEAD') {
+      return { status: 0, stdout: `${fetchHeads.get(lastFetch)!}\n`, stderr: '' };
+    }
+    return real(bin, args, cwd);
+  };
+  await enqueueL8ShadowQueue(repo, 7, { command: execute, observeEnqueue: () => {} });
+  await enqueueL8ShadowQueue(repo, 8, { command: execute, observeEnqueue: () => {} });
+  const headBefore = git(repo, 'rev-parse', 'HEAD');
+  let gateCalls = 0;
+  const gateBatches: number[][] = [];
+  const trainCalls: string[] = [];
+  const verdict = await runL8ShadowQueue(repo, {
+    command: execute,
+    trainGit: (args, cwd) => { trainCalls.push(['git', ...args].join(' ')); return real('git', args, cwd); },
+    trainGate: (_repo, baseSha) => async (commitSha: string, prNumbers: readonly number[]): Promise<'pass'> => {
+      gateCalls++;
+      gateBatches.push([...prNumbers]);
+      expect(baseSha).toBe(base);
+      expect(commitSha).toMatch(/^[0-9a-f]{40}$/);
+      return 'pass';
+    },
+  });
+  expect(gateCalls).toBe(1);
+  expect(gateBatches).toEqual([[7, 8]]);
+  expect(verdict).toMatchObject({ number: 7, verdict: 'pass', base });
+  const state = await statusL8ShadowQueue(repo, { command: execute });
+  expect(state.pending).toEqual([]);
+  expect(state.verdicts.map(({ number, verdict }) => ({ number, verdict }))).toEqual([
+    { number: 7, verdict: 'pass' }, { number: 8, verdict: 'pass' },
+  ]);
+  expect(git(repo, 'rev-parse', 'HEAD')).toBe(headBefore);
+  expect(calls.some((line) => /\bgit push\b|\bgh pr merge\b|\bupdate-ref\b|\bworktree\b|\bcheckout\b/.test(line))).toBe(false);
+  expect(trainCalls.some((line) => /\bgit push\b|\bupdate-ref\b|\bcheckout\b/.test(line))).toBe(false);
+  expect(trainCalls.some((line) => line.includes('commit-tree'))).toBe(true);
+}, 30_000);

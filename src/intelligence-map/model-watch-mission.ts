@@ -21,7 +21,13 @@ import { lookupLlmTierSpec } from '../model-tier/index.js';
 import type { LlmRunner } from '../model-tier/preset-suggest-llm.js';
 import type { LLMProviderName } from '../user-config.js';
 import { getUserConfig } from '../user-config.js';
-import { runModelWatchIntake, type WatchIntakeResult, type WatchPage } from './model-watch-intake.js';
+import {
+  detectPriceChanges,
+  formatPriceChange,
+  runModelWatchIntake,
+  type WatchIntakeResult,
+  type WatchPage,
+} from './model-watch-intake.js';
 
 export function getModelWatchProposalPath(home: string = homedir()): string {
   return join(home, '.elanous', 'model-watch-proposals.jsonl');
@@ -91,6 +97,13 @@ export async function runModelIntelligenceWatch(
     await safeLog(log, 'intelligence-map.model-watch', 'incomplete-classification', {
       sources: abnormalEmptySources,
       line: `Classification incomplete for zero-candidate sources: ${abnormalEmptySources.join(', ')}`,
+    });
+  }
+  const priceChanges = detectPriceChanges(result);
+  if (priceChanges.length > 0) {
+    await safeLog(log, 'intelligence-map.model-watch', 'price-changes', {
+      changes: priceChanges,
+      line: `Price changes vs catalog: ${priceChanges.map(formatPriceChange).join('; ')}`,
     });
   }
   await safeLog(log, 'intelligence-map.model-watch', 'pass', {

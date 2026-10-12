@@ -24,7 +24,7 @@ import {
   codexAccountThresholdPercent,
   type RotationCandidate,
 } from './codex-account-rotation.js';
-import { codexPolicyAllowsCredits, codexPolicyAllowsFallback, resolveCodexQuotaPolicy, type CodexQuotaPolicy, type ResolvedCodexQuotaPolicy } from './codex-quota-policy.js';
+import { codexPolicyAllowsCredits, codexPolicyAllowsFallback, resolveCodexQuotaPolicy, type CodexQuotaPolicy, type CodexQuotaPolicyFileValue, type ResolvedCodexQuotaPolicy } from './codex-quota-policy.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { debug } from '../debug/log.js';
 import {
@@ -238,11 +238,21 @@ function pinnedAccountExhausted(home: string, accountName: string): boolean {
 
 /** codex 한도 정책(`llm.codexQuotaPolicy` · 옛 `codexCreditsAllowed`) — 못 읽으면 `fallback`(크레딧은 돈이라 fail-closed). */
 export function codexQuotaPolicyFromConfig(): CodexQuotaPolicy {
-  try { return resolveCodexQuotaPolicy(configReader().llm).policy; } catch { return 'fallback'; }
+  try { return resolveCodexQuotaPolicy(configReader().llm, codexQuotaPolicyFileValue()).policy; } catch { return 'fallback'; }
+}
+
+/** `policy/llm.yaml` 의 `credits.codex` — 파일 출처일 때만 값을 낸다(없거나 다른 출처면 undefined). 파일이 깨졌거나 못 읽으면 `unreadable`. */
+function codexQuotaPolicyFileValue(): CodexQuotaPolicyFileValue | undefined {
+  try {
+    const loaded = loadLlmPolicy({ legacyConfig: {} });
+    if (!loaded.filePresent) return undefined;
+    if (!loaded.valid) return 'unreadable';
+    return loaded.sources['credits.codex'] === 'file' ? loaded.policy.credits.codex : undefined;
+  } catch { return 'unreadable'; }
 }
 
 function inspectedQuotaPolicy(): ResolvedCodexQuotaPolicy {
-  try { return resolveCodexQuotaPolicy(configReader().llm); } catch { return { policy: 'fallback', source: 'default' }; }
+  try { return resolveCodexQuotaPolicy(configReader().llm, codexQuotaPolicyFileValue()); } catch { return { policy: 'fallback', source: 'default' }; }
 }
 
 /** 지금 계정의 크레딧 신호 — 판정 입력 두 칸. 신호를 이 계정에 귀속할 수 없으면 비운다(모른다). */
@@ -491,7 +501,7 @@ function acquireCreditSpendAlertLock(path: string, account: string): boolean {
 /** UTC 일자별 성공한 계정 알림만 기록한다. 잠근 채 발송하여 동시 런도 중복 발송하지 않는다. */
 function notifyCreditSpendStart(
   account: string,
-  reason: 'credits-allowed' | 'credit-pace',
+  reason: 'credits-allowed' | 'credit-pace' | 'credits-rotated',
   usage: readonly RotationCandidate[],
   now: number,
   counterPath: string,
@@ -793,11 +803,14 @@ export function resolveCodexAccountForRun(
   });
   observeRotation(decision, current.name);
   // 발송 의무는 이 실행 경로에서 잠금 해제까지 기다린 뒤 하루 카운터에 기록한다.
-  if ((decision.reason === 'credits-allowed' || decision.reason === 'credit-pace') && !deps.counterPath && isUnderTestRunner(process.env)) {
+  // CREDIT-SPEND-ORDER(10-12) — «다른 계정의 선불 크레딧으로 옮김»(`rotated` ⊕ creditEntry)도 크레딧 진입이다.
+  const creditSpendReason = decision.reason === 'credits-allowed' || decision.reason === 'credit-pace' ? decision.reason
+    : decision.reason === 'rotated' && decision.creditEntry ? 'credits-rotated' as const : undefined;
+  if (creditSpendReason && !deps.counterPath && isUnderTestRunner(process.env)) {
     // 시험 러너 가드(autoConsume 의 test-runtime-guard 와 같은 관용구) — 카운터를 주입 안 한 시험이 실제 카운터·송신기에 닿지 않는다.
     debug.log('oauth.codex-account', 'credit-spend-alert-skipped', { account: decision.to?.name ?? current.name, reason: 'test-runtime-guard' });
-  } else if (decision.reason === 'credits-allowed' || decision.reason === 'credit-pace') {
-    notifyCreditSpendStart(decision.to?.name ?? current.name, decision.reason, candidates, now,
+  } else if (creditSpendReason) {
+    notifyCreditSpendStart(decision.to?.name ?? current.name, creditSpendReason, candidates, now,
       deps.counterPath ?? join(codexCredentialRoot(), 'budget', 'codex-credit-spend-alert.json'));
   }
   // 순서 ② — 구독 남은 계정이 없고 리셋권이 있으면 «스스로 1개» 쓴다(일일 상한 · 비동기 · 이번 호출은 종전대로 머문다).

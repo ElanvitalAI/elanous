@@ -1,11 +1,12 @@
 // Unified usage assembly — injected fetch, no live credentials, no network.
 
 import { describe, expect, it } from 'bun:test';
+import { debug } from '../debug/log.js';
 import { Command } from 'commander';
 import { visibleWidth } from '../tui.js';
 import { grokUsageToSnapshot } from './fetchers/grok.js';
 import { grokQuotaFromUsageSnapshot } from '../oauth/fallback-chain.js';
-import { collectUnifiedUsage, formatUnifiedUsage, formatUsageCompact } from './unified-usage.js';
+import { collectUnifiedUsage, formatUnifiedUsage, formatUsageCompact, resetClaudeUsageCacheForTest } from './unified-usage.js';
 import { registerUsageCommand } from '../cli/usage-cli.js';
 import { executeUsageSlash } from '../skills/tools/usage-slash.js';
 import { parseGrokBilling } from '../grok/usage.js';
@@ -161,10 +162,164 @@ describe('collectUnifiedUsage — 계정 행 × 크레딧 축 × 구독 축', ()
   });
 });
 
+describe('claude 구독 행 — 5시간 창 ⊕ 7일 창 (2026-10-11)', () => {
+  const noOthers = {
+    listCodexAccounts: () => [] as { name: string; storeKey: string }[],
+    resolveGrokCredential: () => null,
+    openRouterKey: () => undefined,
+  };
+  const claudeSnap = (): UsageSnapshot => ({
+    provider: 'claude',
+    windows: [
+      { kind: 'session', windowMinutes: 300, limit: 100, used: 8, remainingPercent: 92, resetsAt: Date.parse('2026-10-11T07:00:00Z') },
+      { kind: 'weekly', windowMinutes: 10_080, limit: 100, used: 77, remainingPercent: 23, resetsAt: Date.parse('2026-10-14T07:00:00Z') },
+    ],
+    fetchedAt: 1,
+    source: 'oauth-api',
+  });
+
+  it('토큰이 없으면 claude 행을 안 만든다 — 0행 ≠ 0% 사용', async () => {
+    const r = await collectUnifiedUsage({ ...noOthers, resolveClaudeToken: () => null });
+    expect(r.rows.some((x) => x.provider === 'claude')).toBe(false);
+    // 토큰이 없으면 칸·줄 자체를 안 싣는다 — 종전 JSON·문면과 바이트 동일(zai 와 같은 접기).
+    expect(r.accountCounts.claude).toBeUndefined();
+    expect('claude' in r.accountCounts).toBe(false);
+    expect(formatUnifiedUsage(r)).not.toContain('claude');
+  });
+
+  it('토큰이 있으면 5시간 창은 credits 축 · 7일 창은 subscription 축에 리셋 시각과 함께', async () => {
+    const r = await collectUnifiedUsage({ ...noOthers, resolveClaudeToken: () => 'tok', fetchClaude: async () => claudeSnap() });
+    const row = r.rows.find((x) => x.provider === 'claude')!;
+    expect(row.accountName).toBe('default');
+    expect(row.accountCount).toBe(1);
+    expect(row.soleAccount).toBe(true);
+    expect(row.credits).toMatchObject({
+      status: 'ok',
+      usedPercent: 8,
+      periodType: 'session',
+      periodStart: '2026-10-11T02:00:00.000Z',
+      periodEnd: '2026-10-11T07:00:00.000Z',
+    });
+    expect(row.subscription).toEqual({
+      status: 'available', remainingPercent: 23,
+      resetsAt: Date.parse('2026-10-14T07:00:00Z'), windowKind: 'weekly',
+    });
+    expect(row.resetCredits).toEqual({ status: 'not-applicable' });
+    const text = formatUnifiedUsage(r);
+    expect(text).toContain('claude  accounts=1  (하나뿐)');
+    const claudeLine = text.split('\n').find((l) => l.includes('claude') && l.includes('default'))!;
+    expect(claudeLine).toContain('8%');
+    expect(claudeLine).toContain('session 2026-10-11~2026-10-11');
+    expect(claudeLine).toContain('available remaining=23% weekly');
+  });
+
+  it('조회가 실패하면 그 행만 error 로 접고 다른 행은 산다', async () => {
+    const r = await collectUnifiedUsage({
+      ...noOthers,
+      resolveClaudeToken: () => 'tok',
+      fetchClaude: async () => { throw new Error('Claude OAuth usage 401'); },
+    });
+    const row = r.rows.find((x) => x.provider === 'claude')!;
+    expect(row.credits).toEqual({ status: 'error', detail: 'Claude OAuth usage 401' });
+    expect(row.subscription).toEqual({ status: 'unavailable', reason: 'query-does-not-supply' });
+  });
+});
+
+describe('claude 조회 실패 — 다른 공급자 행은 산다 (CLAUDE-USAGE-WINDOW)', () => {
+  it('토큰 해석기가 던지면 행 0 · usage/claude-token-resolve-failed 관측', async () => {
+    const seen: unknown[] = [];
+    const off = debug.registerSink({ name: 'claude-token-resolve-failed', emit: (record) => { if (record.category === 'usage' && record.event === 'claude-token-resolve-failed') seen.push(record.data); } });
+    let r: Awaited<ReturnType<typeof collectUnifiedUsage>>;
+    try {
+      r = await collectUnifiedUsage({
+        listCodexAccounts: () => [], resolveGrokCredential: () => null, openRouterKey: () => undefined,
+        resolveClaudeToken: () => { throw new Error('credentials.json corrupt'); },
+      });
+    } finally { off(); }
+    expect(r.rows.some((x) => x.provider === 'claude')).toBe(false);
+    expect('claude' in r.accountCounts).toBe(false);
+    expect(seen).toContainEqual({ detail: 'credentials.json corrupt' });
+  });
+
+  it('claude 가 429 로 실패해도 codex·grok 행은 ok 그대로 · claude 만 error 한 행', async () => {
+    const r = await collectUnifiedUsage({
+      listCodexAccounts: () => [{ name: 'default', storeKey: 'openai-codex' }],
+      loadCodexHome: () => '/tmp/codex-default',
+      fetchCodex: async () => codexSnap(50, 50),
+      fetchGrok: async () => grokOk(),
+      resolveGrokCredential: () => GROK_CREDENTIAL,
+      openRouterKey: () => undefined,
+      resolveClaudeToken: () => 'tok',
+      fetchClaude: async () => { throw new Error('Claude OAuth usage 429 Too Many Requests'); },
+    });
+    expect(r.rows.find((x) => x.provider === 'codex')!.credits.status).toBe('ok');
+    expect(r.rows.find((x) => x.provider === 'grok')!.credits.status).toBe('ok');
+    const claude = r.rows.filter((x) => x.provider === 'claude');
+    expect(claude).toHaveLength(1);
+    expect(claude[0]!.credits).toEqual({ status: 'error', detail: 'Claude OAuth usage 429 Too Many Requests' });
+    expect(r.accountCounts.claude).toBe(1);
+  });
+});
+
+describe('claude 조회 캐시 — 성공 15분 · 실패 5분 · 토큰이 키 (nexus 30초 폴링 vs OAuth 429)', () => {
+  const noOthers = {
+    listCodexAccounts: () => [] as { name: string; storeKey: string }[],
+    resolveGrokCredential: () => null,
+    openRouterKey: () => undefined,
+  };
+  const snap: UsageSnapshot = {
+    provider: 'claude',
+    windows: [{ kind: 'session', windowMinutes: 300, limit: 100, used: 8, remainingPercent: 92, resetsAt: Date.parse('2026-10-11T07:00:00Z') }],
+    fetchedAt: 1,
+    source: 'oauth-api',
+  };
+
+  it('성공은 15분 안 재사용 · 15분 넘으면 다시 조회 · 토큰이 바뀌면 다시 조회', async () => {
+    resetClaudeUsageCacheForTest();
+    let calls = 0;
+    let now = 1_000_000;
+    const run = (token = 'tok') => collectUnifiedUsage({
+      ...noOthers, now: () => now, resolveClaudeToken: () => token,
+      fetchClaudeUncached: async () => { calls += 1; return snap; },
+    });
+    await run();
+    now += 14 * 60_000;
+    await run();
+    expect(calls).toBe(1);
+    await run('other-token');
+    expect(calls).toBe(2);
+    now += 16 * 60_000;
+    const r = await run('other-token');
+    expect(calls).toBe(3);
+    expect(r.rows.find((x) => x.provider === 'claude')!.credits).toMatchObject({ status: 'ok', usedPercent: 8 });
+    resetClaudeUsageCacheForTest();
+  });
+
+  it('실패(429)도 5분 재사용해 같은 error 행 · 5분 넘으면 다시 조회', async () => {
+    resetClaudeUsageCacheForTest();
+    let calls = 0;
+    let now = 1_000_000;
+    const run = () => collectUnifiedUsage({
+      ...noOthers, now: () => now, resolveClaudeToken: () => 'tok',
+      fetchClaudeUncached: async () => { calls += 1; throw new Error('Claude OAuth usage 429'); },
+    });
+    const a = await run();
+    now += 4 * 60_000;
+    const b = await run();
+    expect(calls).toBe(1);
+    expect(b.rows.find((x) => x.provider === 'claude')!.credits).toEqual(a.rows.find((x) => x.provider === 'claude')!.credits);
+    now += 2 * 60_000;
+    await run();
+    expect(calls).toBe(2);
+    resetClaudeUsageCacheForTest();
+  });
+});
+
 describe('formatUsageCompact — 계정별 한 줄 TUI 문면', () => {
   it('주간·월간·일간을 번역하고 상대·기기 지역 시각으로 표기한다', async () => {
     const nowMs = Date.parse('2026-10-28T12:14:00Z');
     const report = await collectUnifiedUsage({
+      zaiKey: () => undefined, // 셸·Pod 의 ZAI_API_KEY 에 기대지 않는다(밀폐)
       listCodexAccounts: () => [{ name: 'team', storeKey: 'team' }],
       loadCodexHome: () => '/tmp/team',
       fetchCodex: async () => codexSnap(25, 75, { resetsAt: nowMs + 3 * 3_600_000 }),
@@ -194,6 +349,7 @@ describe('formatUsageCompact — 계정별 한 줄 TUI 문면', () => {
   it('크레딧은 큰 수에 쉼표를 찍고 작은 수는 소수 한 자리까지 표기하며 0은 0으로 쓴다', async () => {
     const nowMs = Date.parse('2026-10-02T10:00:00Z');
     const report = await collectUnifiedUsage({
+      zaiKey: () => undefined, // 셸·Pod 의 ZAI_API_KEY 에 기대지 않는다(밀폐)
       listCodexAccounts: () => [{ name: 'default', storeKey: 'openai-codex' }],
       loadCodexHome: () => '/tmp/default',
       fetchCodex: async () => ({
@@ -223,6 +379,7 @@ describe('formatUsageCompact — 계정별 한 줄 TUI 문면', () => {
 
   it('긴 계정명만 생략하고 숫자를 보존하며 모르는 축은 잔량 모름으로 쓴다', async () => {
     const report = await collectUnifiedUsage({
+      zaiKey: () => undefined, // 셸·Pod 의 ZAI_API_KEY 에 기대지 않는다(밀폐)
       listCodexAccounts: () => [{ name: '매우긴계정이름'.repeat(30), storeKey: 'team' }, { name: 'unknown', storeKey: 'unknown' }],
       loadCodexHome: (key) => key,
       fetchCodex: async ({ codexHome }) => {
@@ -248,6 +405,7 @@ describe('formatUsageCompact — 계정별 한 줄 TUI 문면', () => {
 
   it('선불에 리셋을 지어내지 않고, 알 수 없는 기간과 제어문자 계정도 한 줄로 제한한다', async () => {
     const report = await collectUnifiedUsage({
+      zaiKey: () => undefined, // 셸·Pod 의 ZAI_API_KEY 에 기대지 않는다(밀폐)
       listCodexAccounts: () => [{ name: 'team\nnext', storeKey: 'team' }],
       loadCodexHome: () => '/tmp/team',
       fetchCodex: async () => codexSnap(40, 60),
@@ -271,6 +429,7 @@ describe('formatUsageCompact — 계정별 한 줄 TUI 문면', () => {
 
   it('좁은 폭은 실제 셀 폭으로 제한하고 숫자의 일부를 출력하지 않는다', async () => {
     const report = await collectUnifiedUsage({
+      zaiKey: () => undefined, // 셸·Pod 의 ZAI_API_KEY 에 기대지 않는다(밀폐)
       listCodexAccounts: () => [{ name: '📦계정'.repeat(20), storeKey: 'team' }],
       loadCodexHome: () => '/tmp/team',
       fetchCodex: async () => codexSnap(12.5, 87.5),
@@ -477,5 +636,57 @@ describe('openrouter 선불 크레딧 행 (2026-09-23)', () => {
     expect(a.rows.find((x) => x.provider === 'openrouter')!.credits).toEqual({ status: 'unauthorized' });
     const b = await collectUnifiedUsage({ ...noCodexGrok, openRouterKey: () => 'k', fetchOpenRouterImpl: res(200, { credits: 1 }) });
     expect(b.rows.find((x) => x.provider === 'openrouter')!.credits).toEqual({ status: 'error', detail: 'upstream-shape' });
+  });
+});
+
+// CREDIT-READOUT 첫 조각 — 한 공급자의 예외가 usage «전체» 를 죽이지 않는다(Promise.allSettled ⊕ 그 공급자만 error 한 행).
+describe('collectUnifiedUsage — 공급자별 실패 격리 (CREDIT-READOUT)', () => {
+  const healthyCodexGrok = {
+    listCodexAccounts: () => [{ name: 'default', storeKey: 'openai-codex' }],
+    loadCodexHome: () => '/tmp/codex-default',
+    fetchCodex: async () => codexSnap(50, 50),
+    fetchGrok: async () => grokOk(),
+    resolveGrokCredential: () => GROK_CREDENTIAL,
+  };
+
+  it('openRouterKey seam 이 throw 해도 codex·grok 행은 그대로 · openrouter 는 credits.status error 한 행 · usage/provider-failed 관측', async () => {
+    const failed: unknown[] = [];
+    const off = debug.registerSink({ name: 'credit-readout-provider-failed', emit: (record) => { if (record.category === 'usage' && record.event === 'provider-failed') failed.push(record.data); } });
+    let report: Awaited<ReturnType<typeof collectUnifiedUsage>>;
+    try {
+      report = await collectUnifiedUsage({
+        ...healthyCodexGrok,
+        openRouterKey: () => { throw new Error('keychain locked'); },
+      });
+    } finally { off(); }
+    expect(report.rows.filter((r) => r.provider === 'codex')).toHaveLength(1);
+    expect(report.rows.find((r) => r.provider === 'grok')!.credits.status).toBe('ok');
+    const openrouter = report.rows.filter((r) => r.provider === 'openrouter');
+    expect(openrouter).toHaveLength(1);
+    expect(openrouter[0]!.credits).toEqual({ status: 'error', detail: 'keychain locked' });
+    expect(failed).toContainEqual(expect.objectContaining({ provider: 'openrouter', detail: 'keychain locked' }));
+  });
+
+  it('실패 행도 계정 수로 센다 — accountCounts.openrouter 는 1', async () => {
+    const report = await collectUnifiedUsage({
+      ...healthyCodexGrok,
+      openRouterKey: () => { throw new Error('keychain locked'); },
+    });
+    expect(report.accountCounts.openrouter).toBe(1);
+  });
+
+  it('zaiKey seam 이 throw 해도 나머지 셋(codex · grok · openrouter) 행이 산다', async () => {
+    const report = await collectUnifiedUsage({
+      ...healthyCodexGrok,
+      openRouterKey: () => 'k',
+      fetchOpenRouterImpl: (async () => new Response(JSON.stringify({ data: { total_credits: 10, total_usage: 1 } }), { status: 200 })) as unknown as typeof fetch,
+      zaiKey: () => { throw new Error('zai key read failed'); },
+    });
+    expect(report.rows.filter((r) => r.provider === 'codex')).toHaveLength(1);
+    expect(report.rows.filter((r) => r.provider === 'grok')).toHaveLength(1);
+    expect(report.rows.find((r) => r.provider === 'openrouter')!.credits.status).toBe('ok');
+    const zai = report.rows.filter((r) => r.provider === 'zai');
+    expect(zai).toHaveLength(1);
+    expect(zai[0]!.credits.status).toBe('error');
   });
 });

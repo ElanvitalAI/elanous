@@ -2,6 +2,7 @@ import type { Command } from 'commander';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { hqCliWriteAllowed, type HqDeps } from '../hq/hq.js';
 import { isIsolatedLedgerWriteRoot } from '../hq/ledger-write-target.js';
+import { appendDuty, listDuties, type DutyStatus } from '../seat-loop/duty-ledger.js';
 import { closeSeatRequests, listSeatRequests, type SeatRequestStatus } from '../seat-dispatch/seat-request-ledger.js';
 
 function duration(value: string): number {
@@ -48,5 +49,29 @@ export function registerSeatRequestsCommands(seat: Command, deps: { root?: () =>
         });
         for (const row of rows) console.log(`${opts.dryRun ? 'would close' : 'closed'} ${row.key} ${row.status}: ${row.reason}`);
       } catch (error) { console.error(`seat requests close: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+    });
+  const duty = seat.command('duty').description('자리 임무 원장 기록·조회');
+  duty.command('add <seat> <duty>').description('임무 한 줄을 원장에 덧붙임')
+    .requiredOption('--source <source>', '임무의 출처')
+    .option('--ref <ref>', '근거 참조')
+    .option('--status <status>', 'standing|done|missed', 'standing')
+    .action((seatId: string, dutyText: string, opts: { source: string; ref?: string; status: string }) => {
+      try {
+        const row = appendDuty((deps.root ?? effectiveInstanceRoot)(), {
+          seat: seatId, duty: dutyText, source: opts.source, status: opts.status as DutyStatus,
+          ...(opts.ref === undefined ? {} : { ref: opts.ref }),
+        }, deps.now);
+        console.log(`added ${row.seat} ${row.status}: ${row.duty}`);
+      } catch (error) { console.error(`seat duty add: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+    });
+  duty.command('ls').description('임무 원장 조회 (at 순서)')
+    .option('--seat <seat>', '자리 ID')
+    .option('--json', 'JSON 출력')
+    .action((opts: { seat?: string; json?: boolean }) => {
+      try {
+        const rows = listDuties((deps.root ?? effectiveInstanceRoot)(), { seat: opts.seat });
+        if (opts.json) console.log(JSON.stringify(rows));
+        else for (const row of rows) console.log(`${row.at} ${row.seat} ${row.status} ${row.duty} (${row.source}${row.ref ? ` ${row.ref}` : ''})`);
+      } catch (error) { console.error(`seat duty ls: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
     });
 }

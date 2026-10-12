@@ -10,11 +10,11 @@ import { checklistDevVersion } from '../release-loop/checklist.js';
 import { cardsBoard, countBoardTasks, INTERNAL_PACK_PROJECT, mergeBoards, releasePackBoard, type BoardNode } from '../task-agent/board.js';
 import type { Task } from '../task-orchestrator/types.js';
 import { cardPrNumber, CLOSED_BY_HAND_EVENT, closeTaskCard, COMPLETION_KINDS, handTask, updateTaskCard, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, nextMoveFor, resolveHandText, readTaskAgentState, readTaskCard, taskAgentStatePath as taskStatePathDefault, shellQuote, TA_LAND_ENV, TASK_CARD_PREFIX, TASK_SEATS, type CompletionKind, type TaskCard, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
-import { readCardSalvageBranch, refreshCardRunBinding, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
+import { readCardSalvageBranch, recordWiringLiveVerified, refreshCardRunBinding, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
 import { captureReviewResults } from '../task-agent/review-result-capture.js';
 import { HAND_MOVE_KINDS, recordHandMove } from '../task-agent/live-move-history.js';
 import { advanceMission, handMission, MissionAdvanceError, openMissionIds, recordPieceRef, type AdvanceMissionResult, type MissionDecompose, type PieceEvidenceReader } from '../task-agent/mission.js';
-import { formatTaskAgentCover, measureTaskAgentCover, type CoverRow, type TaskAgentCoverInput } from '../task-agent/cover.js';
+import { formatSevenVerbLive, formatTaskAgentCover, measureSevenVerbLive, measureTaskAgentCover, type CoverRow, type SevenVerbLive, type TaskAgentCoverInput } from '../task-agent/cover.js';
 import { LogStore, STORE_SAFETY_MAX, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
 import { resolveLogTargets } from './logs-cli.js';
 
@@ -41,6 +41,8 @@ export interface TasksCliDeps {
   releaseBoard?: () => BoardNode[];
   /** `tasks show`·`advance` 의 런 근거 읽기(시험 주입) — 기본 = 런 원장(이 우주 ⊕ 연합) ⊕ 호스트 logs 의 Pod job-finished. */
   cardRunEvidence?: CardRunEvidenceDeps;
+  /** `tasks live-verified` 가 적는 런 원장 디렉터리(시험 주입). 기본 = `runLedgerDir()`. */
+  liveVerifiedLedgerDir?: string;
   /** HARNESS-PARENT-ON-MSB1 — 원격 부모 카드의 원장 거울(시험 주입). 기본 = ssh 로 `<prodRoot>/remote-parents/<host>/run-ledger`. */
   remoteLedgerMirror?: (card: TaskCard) => void;
   /** `tasks parents` 의 낡은 부모 보고 의존(시험 주입). */
@@ -174,6 +176,7 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
     try { preflight = parentHostModule.preflightParentHost({ target, localVersion: deps.localVersion ?? parentHostModule.localElanousVersion(), launchHoldActive, ...(deps.ssh ? { ssh: deps.ssh } : {}) }); }
     catch (error) { failed(target, [`preflight-error: ${error instanceof Error ? error.message : String(error)}`]); continue; }
     if (!preflight.ok) { failed(target, preflight.gaps, preflight.facts); continue; }
+    if (preflight.warnings.length) notice(`⚠ ${target.host} 자격: ${preflight.warnings.join(' · ')}`);
     try {
       const launched = parentHostModule.launchRemoteParent(target, args, context.env, deps.ssh);
       try { debug.log('task-agent', 'parent-host-launched', { host: target.host, runId: context.runId, pid: launched.pid, log: launched.log }); } catch { /* fail-soft */ }
@@ -499,7 +502,7 @@ export function readTaskAgentCover(
   window: { sinceMs?: number; untilMs?: number } = {},
   query: NonNullable<TasksCliDeps['coverLogs']> = queryCoverLogs,
   taskCards?: readonly { id: string }[] | null,
-): { rows: CoverRow[]; limitReached: boolean; unreadableStores: number } {
+): { rows: CoverRow[]; sevenVerbs: SevenVerbLive; limitReached: boolean; unreadableStores: number } {
   let unreadableStores = 0;
   const read = (category: 'task-agent' | 'pr.land', event: 'action' | 'step'): { rows: LogStoreRow[]; limitReached: boolean } | null => {
     try {
@@ -523,7 +526,7 @@ export function readTaskAgentCover(
     truncated,
     ...(taskCards === undefined ? {} : { taskCards }),
   };
-  return { rows: measureTaskAgentCover(input), limitReached: truncated.taskAgentActions || truncated.allLands, unreadableStores };
+  return { rows: measureTaskAgentCover(input), sevenVerbs: measureSevenVerbLive(input), limitReached: truncated.taskAgentActions || truncated.allLands, unreadableStores };
 }
 
 export function registerTasksCommands(program: Command, deps: TasksCliDeps = {}): void {
@@ -565,12 +568,15 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           }
           taskCards = coverCardsInWindow(cards, { sinceMs, untilMs });
         }
-        const { rows, limitReached, unreadableStores } = readTaskAgentCover({ sinceMs, untilMs }, deps.coverLogs, taskCards);
+        const { rows, sevenVerbs, limitReached, unreadableStores } = readTaskAgentCover({ sinceMs, untilMs }, deps.coverLogs, taskCards);
         const limitWarning = limitReached ? `조회 상한 ${COVER_QUERY_LIMIT} 도달 — 더 오래된 사건이 있을 수 있다(절단된 수를 전체로 읽지 말 것)` : null;
         const storeWarning = unreadableStores > 0 ? `logs.db ${unreadableStores}개를 못 읽었다 — 그 우주의 사건은 수에 없다(«없다»로 읽지 말 것)` : null;
-        if (opts.json) out(JSON.stringify({ rows, limitReached, unreadableStores, ...(limitWarning ? { warning: limitWarning } : {}), ...(storeWarning ? { storeWarning } : {}) }));
+        if (opts.json) out(JSON.stringify({ rows, sevenVerbs, limitReached, unreadableStores, ...(limitWarning ? { warning: limitWarning } : {}), ...(storeWarning ? { storeWarning } : {}) }));
         else {
-          if (opts.lines) for (const row of rows) out(formatTaskAgentCover(row));
+          if (opts.lines) {
+            for (const row of rows) out(formatTaskAgentCover(row));
+            out(formatSevenVerbLive(sevenVerbs));
+          }
           else {
             out('동사\t대신\t전체\t비율\t상태\t관측 사건');
             for (const row of rows) out(`${row.verb}\t${row.byTaskAgent ?? '-'}\t${row.total ?? '-'}\t${row.ratio ?? '-'}\t${row.state}\t${row.observedActions ?? '-'}`);
@@ -734,6 +740,24 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
       } catch { /* fail-soft */ }
       if (!outcome.written) { out(`hand-move 한 줄을 못 남겼다 — ${outcome.reason}`); process.exitCode = 1; return; }
       out([id, 'hand-move', outcome.entry.kind, outcome.entry.by, outcome.entry.detail, ...(outcome.entry.pr !== undefined ? [`pr ${outcome.entry.pr}`] : [])].join('\t'));
+    });
+
+  tasks.command('live-verified <card>')
+    .description('TA-WIRING-CHECK — 실물 1회를 돌린 뒤 그 카드 런 원장에 live-verified {pr, ref, ok, card} 한 줄을 남긴다 · --ref(실물로 돌린 명령·화면 근거)가 비면 거부')
+    .requiredOption('--pr <number>', '실물로 확인한 PR 번호')
+    .requiredOption('--ref <근거>', '실물로 돌린 명령·화면 근거 한 줄(비면 거부)')
+    .option('--fail', '실물이 실패했다(ok=false)')
+    .action(async (cardId: string, opts: { pr: string; ref: string; fail?: boolean }) => {
+      await registerTaskAgentSink(deps.registerSink);
+      const pr = Number(opts.pr);
+      if (!Number.isInteger(pr) || pr <= 0) { out(`--pr 은 자연수다: ${opts.pr}`); process.exitCode = 1; return; }
+      let card: TaskCard | undefined;
+      try { card = readTaskCard(cardId, deps.taskStatePath); } catch (error) { out(error instanceof Error ? error.message : '과제 카드 읽기 실패'); process.exitCode = 1; return; }
+      if (!card) { out(`과제 카드 없음: ${cardId}`); process.exitCode = 1; return; }
+      const outcome = recordWiringLiveVerified(card, { pr, ref: opts.ref, ok: !opts.fail }, deps.liveVerifiedLedgerDir ? { ledgerDir: deps.liveVerifiedLedgerDir } : {});
+      if (!outcome.written) { out(`live-verified 한 줄을 못 남겼다 — ${outcome.reason}`); process.exitCode = 1; return; }
+      try { debug.log('task-agent', 'wiring-live-verified', { card: card.id, runId: card.runId ?? null, pr, ok: outcome.entry.data.ok }); } catch { /* fail-soft */ }
+      out([card.id, 'live-verified', `pr ${pr}`, outcome.entry.data.ok ? 'ok' : 'fail', outcome.entry.data.ref].join('\t'));
     });
 
   tasks.command('close <cardId>')

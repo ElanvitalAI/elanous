@@ -187,10 +187,9 @@ describe('web-search registry', () => {
   });
 
   test('searchWeb falls through when first provider is unavailable', async () => {
-    _resetWebSearchProvidersForTests();
-    // Grok is registered but presumably no key in test env → unavailable.
-    // Add a stub AFTER grok — cascade should still reach it since grok
-    // says unavailable.
+    _resetWebSearchProvidersForTests(false);
+    addWebSearchProvider(stubProvider({ id: 'unavailable', available: () => false }));
+    // Keep the test independent of built-in providers such as ddg-free.
     addWebSearchProvider(stubProvider());
     const r = await searchWeb({ query: 'x' });
     expect(r.providerName).toBe('stub');
@@ -208,7 +207,7 @@ describe('web-search registry', () => {
   });
 
   test('cascades through providers when earlier ones throw', async () => {
-    _resetWebSearchProvidersForTests();
+    _resetWebSearchProvidersForTests(false);
     addWebSearchProviderFirst(stubProvider({
       id: 'broken',
       search: async () => { throw new Error('boom'); },
@@ -243,9 +242,8 @@ describe('WebSearch tool', () => {
   });
 
   test('surfaces WebSearchUnavailableError with a clear message', async () => {
-    // No additional providers registered; grok won't be available
-    // in test env → unavailable cascade.
-    _resetWebSearchProvidersForTests();
+    _resetWebSearchProvidersForTests(false);
+    addWebSearchProvider(stubProvider({ id: 'unavailable', available: () => false }));
     await expect(dispatchWebSearch({ query: 'anything' }))
       .rejects.toThrow(/web-search|unavailable/i);
   });

@@ -60,7 +60,7 @@ test('harness say dispatches once through the production CLI handler', async () 
     expect(calls[0]).toMatchObject({ goalText: goal, spec: { entrance: 'cli-harness-say' } });
   } finally {
     setRunDevAskFromGoalFileDepsForTesting(undefined);
-    process.exitCode = previousExitCode;
+    process.exitCode = previousExitCode ?? 0;
   }
 }));
 

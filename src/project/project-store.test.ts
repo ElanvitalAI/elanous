@@ -2,10 +2,10 @@ import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parse } from 'yaml';
+import { parse, stringify } from 'yaml';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { createProject, getProject, listProjects, ProjectStore, suggestProjectForFolder } from './project-store.js';
+import { createProject, getProject, listProjects, ProjectStore, relationsOf, suggestProjectForFolder } from './project-store.js';
 
 let root: string;
 beforeEach(() => {
@@ -76,4 +76,64 @@ test('folder suggestion matches through a symlinked root (macOS /var → /privat
   const viaLink = createProject({ name: 'Linked', primaryFolder: join(root, 'link', 'proj') });
   expect(suggestProjectForFolder(join(realDir, 'src'))?.id).toBe(viaLink.id);
   expect(suggestProjectForFolder(join(root, 'link', 'proj', 'src'))?.id).toBe(viaLink.id);
+});
+
+test('rejects unknown relation type or a target that is not a project id as an invalid project record', () => {
+  const created = createProject({ name: 'Source' });
+  const other = createProject({ name: 'Other' });
+  const file = join(root, 'projects', `${created.id}.yaml`);
+  const base = { id: created.id, name: created.name, createdAt: created.createdAt };
+  writeFileSync(file, stringify({ ...base, relations: [{ type: 'blockedBy', target: other.id }] }));
+  expect(() => getProject(created.id)).toThrow('invalid project record');
+  writeFileSync(file, stringify({ ...base, relations: [{ type: 'dependsOn', target: 'not-an-id' }] }));
+  expect(() => getProject(created.id)).toThrow('invalid project record');
+});
+
+test('rejects a self-edge and a duplicate type+target pair as an invalid project record', () => {
+  const created = createProject({ name: 'Source' });
+  const other = createProject({ name: 'Other' });
+  const file = join(root, 'projects', `${created.id}.yaml`);
+  const base = { id: created.id, name: created.name, createdAt: created.createdAt };
+  writeFileSync(file, stringify({ ...base, relations: [{ type: 'partOf', target: created.id }] }));
+  expect(() => getProject(created.id)).toThrow('invalid project record');
+  writeFileSync(file, stringify({
+    ...base,
+    relations: [
+      { type: 'dependsOn', target: other.id },
+      { type: 'dependsOn', target: other.id },
+    ],
+  }));
+  expect(() => getProject(created.id)).toThrow('invalid project record');
+});
+
+test('reads legacy yaml without relations unchanged', () => {
+  const created = createProject({ name: 'Legacy' });
+  writeFileSync(
+    join(root, 'projects', `${created.id}.yaml`),
+    stringify({ id: created.id, name: created.name, createdAt: created.createdAt }),
+  );
+  const loaded = getProject(created.id);
+  expect(loaded).toEqual({ id: created.id, name: created.name, createdAt: created.createdAt });
+  expect(loaded).not.toHaveProperty('relations');
+  expect(relationsOf(loaded!)).toEqual([]);
+});
+
+test('round-trips all four relation types through save and read', () => {
+  const created = createProject({ name: 'Hub' });
+  const a = createProject({ name: 'A' });
+  const b = createProject({ name: 'B' });
+  const c = createProject({ name: 'C' });
+  const d = createProject({ name: 'D' });
+  const relations = [
+    { type: 'dependsOn' as const, target: a.id },
+    { type: 'derivedFrom' as const, target: b.id },
+    { type: 'partOf' as const, target: c.id },
+    { type: 'deploysTo' as const, target: d.id },
+  ];
+  const record = { id: created.id, name: created.name, createdAt: created.createdAt, relations };
+  writeFileSync(join(root, 'projects', `${created.id}.yaml`), stringify(record));
+  const loaded = getProject(created.id);
+  expect(loaded).toEqual(record);
+  expect(relationsOf(loaded!)).toEqual(relations);
+  expect(listProjects().find(item => item.id === created.id)).toEqual(record);
 });

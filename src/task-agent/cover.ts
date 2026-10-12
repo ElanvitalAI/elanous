@@ -157,3 +157,68 @@ export function formatTaskAgentCover(row: CoverRow): string {
   const value = (count: number | null): string => count === null ? '-' : String(count);
   return `${row.verb}: TA ${value(row.byTaskAgent)}/${value(row.total)} (${row.ratio === null ? '-' : `${(row.ratio * 100).toFixed(1)}%`}) · live ${value(row.liveActions)} · shadow ${value(row.shadowActions)} · steward-transition ${row.stewardTransition}`;
 }
+
+/** 7동사의 이름 — 리뷰·착지·수리·검증·저작·구현·정리 (decision·deliver 는 7동사 밖이라 세지 않는다). */
+export type SevenVerbName = '리뷰' | '착지' | '수리' | '검증' | '저작' | '구현' | '정리';
+
+/** no-source 는 출처 배선이 아직 없는 동사 · unreadable 은 TASK-AGENT 행동 원장을 못 읽은 것이다. */
+export type SevenVerbState = 'live' | 'shadow-only' | 'none' | 'no-source' | 'unreadable';
+
+/** 7동사 출처 표의 한 칸 — source 는 그 동사를 관측하는 TASK-AGENT action kind, null 이면 출처가 아직 없다. */
+export interface SevenVerbSource {
+  verb: SevenVerbName;
+  source: Exclude<NextActionKind, 'decision' | 'deliver'> | null;
+}
+
+/** TA-THEME-VERBS-LIVE — 7동사와 출처 표(코드로 고정). 저작·구현·정리의 출처 배선은 다음 조각. */
+export const SEVEN_VERB_SOURCES: readonly SevenVerbSource[] = [
+  { verb: '리뷰', source: 'review' },
+  { verb: '착지', source: 'land' },
+  { verb: '수리', source: 'retry' },
+  { verb: '검증', source: 'green' },
+  { verb: '저작', source: null },
+  { verb: '구현', source: null },
+  { verb: '정리', source: null },
+];
+
+/** 동사 하나의 관측 — 원장을 못 읽었으면 liveDone·shadow 는 null(0 이 아니다). */
+export interface SevenVerbLiveRow {
+  verb: SevenVerbName;
+  source: SevenVerbSource['source'];
+  liveDone: number | null;
+  shadow: number | null;
+  state: SevenVerbState;
+}
+
+/** 합계 — liveVerbs 는 원장을 못 읽었으면 null(0 으로 쓰지 않는다) · measuredVerbs 는 출처 있는 동사 수. */
+export interface SevenVerbLive {
+  verbs: SevenVerbLiveRow[];
+  liveVerbs: number | null;
+  measuredVerbs: number;
+}
+
+/** live = 창 안에 result done 인 non-shadow 사건 ≥1. 원장이 null 이거나 절단되었으면 전부 unreadable. */
+export function measureSevenVerbLive(input: TaskAgentCoverInput): SevenVerbLive {
+  const unreadable = input.taskAgentActions === null || input.truncated?.taskAgentActions === true;
+  const verbs = SEVEN_VERB_SOURCES.map(({ verb, source }): SevenVerbLiveRow => {
+    if (unreadable) return { verb, source, liveDone: null, shadow: null, state: 'unreadable' };
+    if (source === null) return { verb, source: null, liveDone: null, shadow: null, state: 'no-source' };
+    const actions = input.taskAgentActions!.filter((action) => action.kind === source);
+    const liveDone = actions.filter((action) => action.result === 'done').length;
+    const shadow = actions.filter((action) => action.result === 'shadow').length;
+    return { verb, source, liveDone, shadow, state: liveDone >= 1 ? 'live' : shadow >= 1 ? 'shadow-only' : 'none' };
+  });
+  return {
+    verbs,
+    liveVerbs: unreadable ? null : verbs.filter((row) => row.state === 'live').length,
+    measuredVerbs: SEVEN_VERB_SOURCES.filter((row) => row.source !== null).length,
+  };
+}
+
+/** 한 줄 요약 — 못 읽었으면 n 자리를 `-` 로 적는다(0 으로 읽히지 않게). */
+export function formatSevenVerbLive(measurement: SevenVerbLive): string {
+  const total = SEVEN_VERB_SOURCES.length;
+  if (measurement.liveVerbs === null) return `${total}동사 live -/${total} · 못 잼(행동 원장 null·절단)`;
+  const noSource = measurement.verbs.filter((row) => row.state === 'no-source').map((row) => row.verb).join('·');
+  return `${total}동사 live ${measurement.liveVerbs}/${total}${noSource ? ` · 출처 없음 ${noSource}` : ''}`;
+}

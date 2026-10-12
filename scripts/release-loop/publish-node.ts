@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { WARNING_ONLY } from './auto-approve-node.js';
 import { beginLandingMerge, landingFreezeMessage } from '../../src/release-loop/landing-freeze.js';
 import { debug } from '../../src/debug/log.js';
+import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import { prereleaseKind } from './release-version.js';
 import { publishAtError } from './publish-at.js';
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandRunner } from './node-verdict.js';
@@ -115,6 +116,11 @@ export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: str
 }
 
 if (import.meta.main) {
+  // GATE-OBS2-2 — the release graph spawns this node as its own process, which inherits no daemon sink. Without this the
+  // `release-loop.publish / result` event (the one that says whether the irreversible publication actually happened) stayed
+  // in the file trail and `elanous logs` read 0 rows. Same pattern as gate-node.ts and auto-approve-node.ts (GATE-OBS2-1).
+  // Observability must never stop the publication node — a failed sink registration is skipped (fail-soft).
+  try { await registerStandaloneLogSink('release-loop'); } catch { /* fail-soft: the verdict still goes to stdout */ }
   let version = '';
   try { version = readGraphContext().input.version; process.exitCode = finishNode('publish', version, runPublish()); }
   catch (error) { process.exitCode = finishNode('publish', version, errorResult(error)); }

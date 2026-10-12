@@ -10,6 +10,7 @@ import type { Command } from 'commander';
 import { collectUnifiedUsage, formatUnifiedUsage } from '../budget/unified-usage.js';
 import { consumeCodexResetCredits, listCodexResetCredits } from '../budget/codex-reset-credits.js';
 import { rollupRunUsage, type RunUsageInput } from '../budget/run-usage-rollup.js';
+import { dedupePodRollupRows } from '../../scripts/usage-rollup.js';
 import { formatUsageOutcomes, outcomeTableHasCodexGrokUnknown, queryUsageOutcomes, type UsageOutcomesDeps, type UsageOutcomesReport } from '../budget/usage-outcomes.js';
 import { LogStore, logsDbPath, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
 import { LOGS_SINCE_OPTION, parseSince } from './logs-cli.js';
@@ -189,7 +190,8 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
         ...(sinceMs !== undefined ? { sinceMs } : {}),
       });
       const unwrapPod = opts.by === 'stage' || opts.by === 'model' || opts.by === 'account';
-      const inputs = rows.map((row) => usageData(row, unwrapPod)).filter((data): data is ExtendedRunUsageInput => data !== null)
+      // ⭐ METER-POD-ROLLUP-GAP-2 — Pod 사용량 재방출 행(podRollupKey)은 «더 완전한 한 행»만 센다(키 없는 행은 그대로).
+      const inputs = dedupePodRollupRows(rows.map((row) => usageData(row, unwrapPod)).filter((data): data is ExtendedRunUsageInput => data !== null))
         .filter((data) => opts.run === undefined || data.runId === opts.run);
       if (opts.by === 'stage' || opts.by === 'model' || opts.by === 'account') {
         const report = rollupByAxis(inputs, opts.by);

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { MAX_OFF_DIFF_EVIDENCE_RESULT_CHARS, MAX_HARVESTED_EVIDENCE_CHARS, authorLimitationCountFromGoal, harvestEvidenceLines, harvestedEvidenceObservation, buildImplementReport, requiredEvidenceFromGoal, renderRequiredEvidencePrompt, runRequiredEvidenceChecks, coverRequiredEvidence, parseOffDiffEvidence, OFF_DIFF_EVIDENCE_PROMPT, tailWithOmissionMarker } from './off-diff-evidence.js';
+import { goalDeclaresNoWiring, settleUncoveredEvidence, MAX_OFF_DIFF_EVIDENCE_RESULT_CHARS, MAX_HARVESTED_EVIDENCE_CHARS, authorLimitationCountFromGoal, harvestEvidenceLines, harvestedEvidenceObservation, buildImplementReport, requiredEvidenceFromGoal, renderRequiredEvidencePrompt, runRequiredEvidenceChecks, coverRequiredEvidence, parseOffDiffEvidence, OFF_DIFF_EVIDENCE_PROMPT, tailWithOmissionMarker } from './off-diff-evidence.js';
 import { buildReviewIntent } from '../agent-substrate/review-intent.js';
 import { featurePrompt } from './seams.js';
 
@@ -709,5 +709,42 @@ describe('coverRequiredEvidence — 판정은 태그 동등이지 해석이 아�
     expect(authorLimitationCountFromGoal(withLimitation)).toBe(1);
     expect(authorLimitationCountFromGoal('## 답하지 못하는 것\n- 없다.')).toBe(0);
     expect(authorLimitationCountFromGoal(withLimitation)).toBe(authorLimitationCountFromGoal(withLimitation));
+  });
+});
+
+describe('EVIDENCE-WIRING-EXEMPT', () => {
+  test('a goal that rules wiring out exempts [wiring] as a declared limitation; other goals keep it', () => {
+    for (const marker of ['배선·부작용 0(순수 함수만)', '배선 0', '순수 함수만', 'no wiring', 'pure function only']) {
+      expect(goalDeclaresNoWiring(`ask: ${marker}`)).toBe(true);
+      const [wiring] = requiredEvidenceFromGoal(`ask: ${marker}\n## REQUIRED EVIDENCE\n- [wiring] caller connection`);
+      expect(wiring?.coveredByLimitation).toBeDefined();
+      expect(coverRequiredEvidence([wiring!], []).uncovered).toEqual([]);
+    }
+    for (const text of ['배선 03 건', '배선한다', 'wire it from runTrain']) expect(goalDeclaresNoWiring(text)).toBe(false);
+    const [kept] = requiredEvidenceFromGoal('ask: wire it\n## REQUIRED EVIDENCE\n- [wiring] caller connection');
+    expect(kept?.coveredByLimitation).toBeUndefined();
+  });
+
+  test('a passing bun test check covers its tag; a failing, empty or non-bun check does not', () => {
+    const run = (command: string, exitCode: number | null, stderr: string, stdout = '') => ({ tag: 'requested', command, exitCode, stdout, stderr, durationMs: 1 });
+    const pass = run("bun test -- 'a.test.ts'", 0, ' 5 pass\n 0 fail\nRan 5 tests');
+    expect(settleUncoveredEvidence(['requested'], { checks: [pass] })).toEqual({ uncovered: [], coveredByCheck: ['requested'], coveredByGate: [] });
+    for (const bad of [run("bun test -- 'a.test.ts'", 1, ' 4 pass\n 1 fail'), run("bun test -- 'a.test.ts'", 0, ' 0 pass\n 0 fail'),
+      run('echo ok', 0, '', ' 5 pass\n 0 fail'), run("bun test -- 'a.test.ts'", null, '')]) {
+      expect(settleUncoveredEvidence(['requested'], { checks: [bad] }).uncovered).toEqual(['requested']);
+    }
+  });
+
+  test('a commandless [preservation] is covered by a passed gate; one with its own command, or a failed gate, is not', () => {
+    const required = requiredEvidenceFromGoal('## REQUIRED EVIDENCE\n- [preservation] still true\n- [other] something');
+    expect(settleUncoveredEvidence(['preservation', 'other'], { gatePassed: true, required })).toEqual({ uncovered: ['other'], coveredByCheck: [], coveredByGate: ['preservation'] });
+    expect(settleUncoveredEvidence(['preservation'], { gatePassed: false, required }).uncovered).toEqual(['preservation']);
+    const withCommand = requiredEvidenceFromGoal('## REQUIRED EVIDENCE\n- [preservation] still true || exit 1');
+    expect(settleUncoveredEvidence(['preservation'], { gatePassed: true, required: withCommand }).uncovered).toEqual(['preservation']);
+  });
+
+  test('the check run keeps stderr — where bun test writes its summary', () => {
+    const [r] = runRequiredEvidenceChecks("## REQUIRED EVIDENCE\n- [s] stderr || printf ' 1 pass\\n 0 fail\\n' >&2", process.cwd());
+    expect(r).toMatchObject({ exitCode: 0, stdout: '', stderr: ' 1 pass\n 0 fail\n' });
   });
 });

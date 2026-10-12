@@ -12,6 +12,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { isNoneSentinelFinding } from '../agent-substrate/pr-reviewer.js';
 import { debug } from '../debug/log.js';
 import { LIVE_MOVE_RESULT_EVENT, readTaskAgentState, updateTaskCard, type TaskCard, type TaskCardEvent } from './task-hand.js';
 
@@ -63,7 +64,8 @@ export function parseReviewResultOutput(text: string): ParsedReviewResult | null
       ...(Number.isSafeInteger(prRaw) && prRaw > 0 ? { pr: prRaw } : {}),
       verdict: typeof v.verdict === 'string' ? v.verdict : null,
       reviewed: typeof v.reviewed === 'boolean' ? v.reviewed : null,
-      mustFix: Array.isArray(v.mustFix) && v.mustFix.every((fix) => typeof fix === 'string') ? v.mustFix.length : null,
+      // PR-LAND-MUSTFIX-NONE — 저장된 결과(옛 판 리뷰 · 다른 경로)에 «(없음 — …)» 표지 줄이 남아 있어도 리뷰 출력과 «같은» 판정으로 0 으로 센다.
+      mustFix: Array.isArray(v.mustFix) && v.mustFix.every((fix) => typeof fix === 'string') ? v.mustFix.filter((fix) => !isNoneSentinelFinding(fix)).length : null,
       reviewRoute: typeof v.reviewRoute === 'string' ? v.reviewRoute : null,
       head: typeof v.headCommit === 'string' && SHA40.test(v.headCommit) ? v.headCommit : null,
       error: typeof v.error === 'string' ? v.error : null,

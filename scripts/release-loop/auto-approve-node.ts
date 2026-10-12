@@ -2,6 +2,7 @@
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
+import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { emitNodeResult, readGraphContext, type GraphContext } from './node-verdict.js';
 import { regressWarning, validatedTuiRegress } from './tui-node-checks.js';
@@ -78,6 +79,11 @@ export function runAutoApprove(context: GraphContext = readGraphContext(), deps:
 }
 
 if (import.meta.main) {
+  // GATE-OBS2-1 — the release graph spawns this node as its own process, which inherits no daemon sink. Without this the
+  // `release-loop.approve / auto-decision` event (the one that says why a release was or was not published unattended)
+  // stayed in the file trail and `elanous logs` read 0 rows. Same pattern as gate-node.ts.
+  // Observability must never stop the release node from emitting its verdict — a failed sink registration is skipped.
+  try { await registerStandaloneLogSink('release-loop'); } catch { /* fail-soft: the decision still goes to stdout */ }
   try {
     const result = runAutoApprove();
     emitNodeResult(result);

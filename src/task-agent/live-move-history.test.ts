@@ -33,6 +33,8 @@ function fixture() {
       land: async (pr: number) => { lands.push(pr); return { status: 0, stdout: 'merged' }; },
       ...over,
     },
+    // TA-WIRING-CHECK — 병합 PR 배선 관측이 실물 `gh pr diff` 로 나가지 않게(밀폐).
+    wiring: { prDiff: () => '', loadLedger: () => null },
   });
   const card = () => readTaskCard('ta-hist-1', statePath)!;
   const liveLines = () => card().history.filter((item) => item.event === 'live-move');

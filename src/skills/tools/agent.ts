@@ -44,7 +44,7 @@ import { enhanceAgentResultWithSeed } from '../../agent/seed.js';
 import { resolveAgent } from '../../agent/loader.js';
 import { resolveAgentLayered } from '../../agent/definition-registry.js';
 import type { AgentDefinition } from '../../agent/types.js';
-import { getSessionCwd } from '../../session/working-dir.js';
+import { getSessionCwd, setSessionCwd } from '../../session/working-dir.js';
 import {
   agentCacheKey, dedupeStub, logDedupHit, type SessionCache,
   DEDUP_CASCADE_HALT_THRESHOLD, CONSECUTIVE_DEDUP_BLOCK_THRESHOLD,
@@ -485,6 +485,11 @@ export async function dispatchAgent(
   } else if (isolation === 'worktree') {
     const { enterWorktreeRuntime } = await import('../../tool-runtime/git-worktree-runtimes.js');
     const wtName = `${spawnName ?? definition.name}-${debugCorrelationId}`.replace(/[^a-zA-Z0-9._/-]/g, '-');
+    // enterWorktreeRuntime.run mutates the parent session cwd via
+    // setSessionCwd(path, 'tool'). Capture and restore so Agent(isolation:
+    // 'worktree') never leaks the child's worktree into the parent status
+    // line — enter_worktree (human-invoked) still moves cwd intentionally.
+    const parentCwd = getSessionCwd();
     try {
       const wt = await enterWorktreeRuntime.run({ name: wtName }, { surface: 'skill' as any });
       childCwd = wt.path;
@@ -506,6 +511,16 @@ export async function dispatchAgent(
         requestedIsolation: 'worktree',
         reason: message,
       }, { level: 'warn' });
+    } finally {
+      const afterCwd = getSessionCwd();
+      if (afterCwd !== parentCwd) {
+        setSessionCwd(parentCwd, 'tool');
+        debug.log('agent.spawn', 'worktree-parent-cwd-restored', {
+          agent: definition.name,
+          from: afterCwd,
+          to: parentCwd,
+        });
+      }
     }
   } else {
     childCwd = opts.cwd ?? getSessionCwd();

@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { formatLandingThroughput, formatTaskAgentCover, measureLandingThroughput, measureTaskAgentCover } from './cover.js';
+import { formatLandingThroughput, formatSevenVerbLive, formatTaskAgentCover, measureLandingThroughput, measureSevenVerbLive, measureTaskAgentCover } from './cover.js';
 
 test('daily landing funnel reproduces the 10-08 launch, card PR, and TASK-AGENT landing formula', () => {
   const row = measureLandingThroughput({
@@ -110,6 +110,54 @@ test('one-line formatter preserves measured and unknown denominators', () => {
   expect(formatTaskAgentCover(unreadable[0]!)).toBe('land: TA -/- (-) · live - · shadow - · steward-transition unmeasured');
   const incomplete = measureTaskAgentCover({ taskAgentActions: null, allLands: [{ step: 'merge', ok: true }] });
   expect(formatTaskAgentCover(incomplete[0]!)).toBe('land: TA -/1 (-) · live - · shadow - · steward-transition unmeasured');
+});
+
+test('review and land done are live, retry shadow is shadow-only, and liveVerbs counts only live verbs', () => {
+  const measured = measureSevenVerbLive({
+    taskAgentActions: [
+      { kind: 'review', result: 'done' }, { kind: 'land', result: 'done' }, { kind: 'retry', result: 'shadow' },
+    ],
+    allLands: [],
+  });
+  expect(measured.verbs).toEqual([
+    { verb: '리뷰', source: 'review', liveDone: 1, shadow: 0, state: 'live' },
+    { verb: '착지', source: 'land', liveDone: 1, shadow: 0, state: 'live' },
+    { verb: '수리', source: 'retry', liveDone: 0, shadow: 1, state: 'shadow-only' },
+    { verb: '검증', source: 'green', liveDone: 0, shadow: 0, state: 'none' },
+    { verb: '저작', source: null, liveDone: null, shadow: null, state: 'no-source' },
+    { verb: '구현', source: null, liveDone: null, shadow: null, state: 'no-source' },
+    { verb: '정리', source: null, liveDone: null, shadow: null, state: 'no-source' },
+  ]);
+  expect(measured.liveVerbs).toBe(2);
+  expect(measured.measuredVerbs).toBe(4);
+  expect(formatSevenVerbLive(measured)).toBe('7동사 live 2/7 · 출처 없음 저작·구현·정리');
+});
+
+test('저작·구현·정리 are no-source and never join liveVerbs, even with actions in the window', () => {
+  const measured = measureSevenVerbLive({
+    taskAgentActions: [{ kind: 'review', result: 'done' }, { kind: 'land', result: 'done' }, { kind: 'retry', result: 'done' }, { kind: 'green', result: 'done' }],
+    allLands: [],
+  });
+  expect(measured.verbs.filter((row) => row.state === 'no-source').map((row) => row.verb)).toEqual(['저작', '구현', '정리']);
+  expect(measured.liveVerbs).toBe(4);
+  expect(formatSevenVerbLive(measured)).toBe('7동사 live 4/7 · 출처 없음 저작·구현·정리');
+});
+
+test('null or truncated taskAgentActions marks every verb unreadable and liveVerbs null, not 0', () => {
+  const unreadable = measureSevenVerbLive({ taskAgentActions: null, allLands: [] });
+  expect(unreadable.verbs.every((row) => row.state === 'unreadable')).toBe(true);
+  expect(unreadable.verbs.every((row) => row.liveDone === null && row.shadow === null)).toBe(true);
+  expect(unreadable.liveVerbs).toBe(null);
+  expect(unreadable.measuredVerbs).toBe(4);
+  expect(formatSevenVerbLive(unreadable)).toBe('7동사 live -/7 · 못 잼(행동 원장 null·절단)');
+
+  const truncated = measureSevenVerbLive({
+    taskAgentActions: [{ kind: 'review', result: 'done' }],
+    allLands: [],
+    truncated: { taskAgentActions: true, allLands: false },
+  });
+  expect(truncated.verbs.every((row) => row.state === 'unreadable')).toBe(true);
+  expect(truncated.liveVerbs).toBe(null);
 });
 
 test('card denominator counts distinct cards with a done action per verb, leaving land untouched', () => {

@@ -27,7 +27,7 @@ function fixture() {
       ...(status === 'queued' ? { receiptId: `receipt-${key}` } : { ref: `pwa:${key}` }) }) + '\n');
   const rows = () => readFileSync(path, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
   return { root, path, run, append, rows, output, errors, cleanup: () => {
-    log.mockRestore(); error.mockRestore(); process.exitCode = exit; rmSync(root, { recursive: true, force: true });
+    log.mockRestore(); error.mockRestore(); process.exitCode = exit ?? 0; rmSync(root, { recursive: true, force: true });
   } };
 }
 

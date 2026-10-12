@@ -41,7 +41,7 @@ test('Commander add/recur/candidates --json round-trip, find/show and actor iden
     expect(JSON.parse(run('candidates', '--json'))).toEqual([]);
   } finally {
     stderr.mockRestore();
-    process.exitCode = exitCode;
+    process.exitCode = exitCode ?? 0;
     if (before === undefined) delete process.env.AI_AGENT; else process.env.AI_AGENT = before;
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -86,7 +86,7 @@ test('import --json previews an isolated repository without writing; --apply use
     expect(new LessonLedger({ stateDir }).get(sampleId)).toMatchObject({ owner: 'TC', occurrence_count: 1, history: [{ by: 'TC', event: 'add' }] });
   } finally {
     stderr.mockRestore();
-    process.exitCode = exitCode;
+    process.exitCode = exitCode ?? 0;
     process.chdir(beforeCwd);
     if (beforeActor === undefined) delete process.env.AI_AGENT; else process.env.AI_AGENT = beforeActor;
     rmSync(repo, { recursive: true, force: true });

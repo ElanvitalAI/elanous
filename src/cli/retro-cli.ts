@@ -1,8 +1,10 @@
 import { existsSync } from 'node:fs';
 import type { Command } from 'commander';
+import { readRunExits } from '../harness/harness-incidents.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
 
-type RetroFact = { store: string; at: string; category: string; event: string; kind: 'draft-birth' | 'draft-death' | 'stop-reason' | 'ta-outcome'; data: unknown };
+type RetroFact = { store: string; at: string; category: string; event: string; kind: 'draft-birth' | 'draft-death' | 'stop-reason' | 'ta-outcome' | 'incident'; data: unknown };
 
 const FACT_EVENTS = new Map<string, RetroFact['kind']>([
   ['rework-blocked-draft-pr', 'draft-birth'],
@@ -21,7 +23,7 @@ export function parseRetroSince(value: string, now = Date.now()): number {
   return now - duration;
 }
 
-export function collectRetroFacts(sinceMs: number, targets: readonly { name: string; dbPath: string }[] = [{ name: 'current', dbPath: logsDbPath() }]): { facts: RetroFact[]; unavailable: string[] } {
+export function collectRetroFacts(sinceMs: number, targets: readonly { name: string; dbPath: string }[] = [{ name: 'current', dbPath: logsDbPath() }], incidentRoot?: string): { facts: RetroFact[]; unavailable: string[] } {
   const facts: RetroFact[] = [];
   const unavailable: string[] = [];
   const untilMs = Date.now();
@@ -53,13 +55,20 @@ export function collectRetroFacts(sinceMs: number, targets: readonly { name: str
       } finally { store.close(); }
     } catch { unavailable.push(target.name); }
   }
+  try {
+    for (const row of readRunExits(incidentRoot ?? effectiveInstanceRoot())) {
+      if (Date.parse(row.at) < sinceMs) continue;
+      facts.push({ store: 'incidents', at: row.at, category: 'harness.incident', event: row.reason, kind: 'incident',
+        data: { runId: row.runId, seat: row.seat, entrance: row.entrance } });
+    }
+  } catch { unavailable.push('incidents'); }
   facts.sort((a, b) => b.at.localeCompare(a.at));
   return { facts, unavailable };
 }
 
 export function registerRetroCommands(program: Command): void {
   program.command('retro').description('Read-only retrospective facts from existing logs')
-    .command('facts').description('Draft births/deaths, stop reasons and task-agent outcomes')
+    .command('facts').description('Draft births/deaths, stop reasons, task-agent outcomes and run incidents')
     .option('--since <duration>', 'Lookback duration', '24h')
     .option('--json', 'JSON output')
     .action((opts: { since: string; json?: boolean }) => {

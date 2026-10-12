@@ -693,7 +693,7 @@ describe('harness substrate default', () => {
       process.exitCode = 0;
     } finally {
       console.error = original;
-      process.exitCode = previousExit;
+      process.exitCode = previousExit ?? 0;
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
     }

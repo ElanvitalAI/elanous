@@ -173,7 +173,9 @@ export async function runIntakeDigestCli(
         const { getUserConfig } = await import('../user-config.js');
         return sendTelegramReport(getUserConfig(), text, { markdown: true, kind: 'intake' });
       })();
-    debug.log('intake.digest', 'telegram', { day, absorbed: d.absorbed.length, goals: d.goals.length, sent });
+    const judgedCount = (entries: { verdict: string }[] | undefined) => (entries ?? []).filter((entry) => entry.verdict !== '판정 대기').length;
+    debug.log('intake.digest', 'telegram', { day, absorbed: d.absorbed.length, goals: d.goals.length,
+      github: d.githubNew?.length ?? 0, githubJudged: judgedCount(d.githubNew), x: d.xTrends?.length ?? 0, xJudged: judgedCount(d.xTrends), sent });
     if (seat && sent) recordSeatBriefed(root, seat, day, d.absorbed.map((entry) => entry.id));
     if (seat === 'user') debug.log('watch.default', 'brief', { topics: (await import('../intake-plane/intake-sources.js')).listSources({ seat }, root).length, items: d.absorbed.length, sent });
     console.log(sent ? `텔레그램 보고 채널로 보냈다 (${day} · 흡수 ${d.absorbed.length} · 골 후보 ${d.goals.length})` : '텔레그램 보고 채널 설정이 없다(telegram.reportChannel) — 보내지 않음');

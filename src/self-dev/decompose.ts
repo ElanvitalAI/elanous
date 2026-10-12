@@ -14,8 +14,12 @@
  *
  * Cf. PLAN-parallel-self-dev-orchestrator-2026-07-21 §6 (S2).
  */
-import { tierModel } from '../llm/model-defaults.js';
 import { debug } from '../debug/log.js';
+import {
+  resolveRoleModel,
+  type ModelResolutionSource,
+  type UserConfig,
+} from '../user-config.js';
 import {
   gradePhaseCompletability,
   type CompletabilitySizeSignals,
@@ -598,9 +602,39 @@ export async function decomposeSelfDevGoal(
   return finalizeDecomposition(feature, goals, decomposition, opts, parsedGoals.length > 0 ? arcHint : undefined, parsedGoals.length - foldedGoals.length);
 }
 
+/** Where the decompose model came from — `'explicit'` is the caller's `model` argument layer. */
+export type DecomposeModelSource = 'explicit' | ModelResolutionSource;
+
+export interface DecomposeModelResolution {
+  model: string;
+  source: DecomposeModelSource;
+}
+
+export interface DecomposeModelDeps {
+  /** Config handed to the planning-role default; omitted uses the user config. */
+  config?: UserConfig;
+}
+
+/**
+ * ROLE-RELAY-SPLIT — the decompose model selector (pure).
+ *
+ * An explicit `model` argument wins; the default is the existing planning-role
+ * resolver `resolveRoleModel('planning')` (env `ELANOUS_SKILL_PLAN_MODEL` ·
+ * `roleLlm.planning` · tier `best` — the same tier the old default used), NOT
+ * the review env `ELANOUS_PR_REVIEW_MODEL`: changing the review model must
+ * not drag the decompose model along.
+ */
+export function decomposeModel(explicit?: string, deps: DecomposeModelDeps = {}): DecomposeModelResolution {
+  const pinned = explicit?.trim();
+  if (pinned) return { model: pinned, source: 'explicit' };
+  const resolved = resolveRoleModel('planning', deps.config);
+  return { model: resolved.model, source: resolved.source };
+}
+
 /** Default LLM seam — lazy `streamLLM` wire (kept out of the test path). */
 async function defaultDecomposeLlm(model?: string): Promise<SelfDevDecomposeLlm> {
   const { streamLLM } = await import('../llm.js');
-  const m = model || process.env.ELANOUS_PR_REVIEW_MODEL || tierModel('best');
-  return (prompt: string) => streamLLM([{ role: 'user', content: prompt }], () => {}, { model: m, reasoningEffort: 'low' });
+  const { model: resolved, source } = decomposeModel(model);
+  debug.log('self-dev.decompose', 'model', { model: resolved, source });
+  return (prompt: string) => streamLLM([{ role: 'user', content: prompt }], () => {}, { model: resolved, reasoningEffort: 'low' });
 }

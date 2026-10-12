@@ -338,17 +338,32 @@ test('GATE-PARTIAL resume: the graph is resumed at the run’s own saved path; -
     // Each resume backs the state up under a timestamped name (exclusive) — give every call its own instant.
     let tick = 0;
     const now = () => new Date(Date.UTC(2026, 9, 7, 0, 0, tick++));
+    // GATE-REUSE-BY-DIFF: the tip tree the import closure reads (git objects of the tip in production).
+    const files: Record<string, string> = { 'scripts/audit.test.ts': '', 'src/x.test.ts': '', 'src/other.test.ts': '',
+      'src/release-loop/gate.ts': '', 'src/release-loop/gate.test.ts': "import './gate';" };
+    const closureTree = () => ({ files: Object.keys(files), read: (path: string) => files[path], preload: [] });
     write();
-    const applied = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now });
+    const applied = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now, closureTree });
     expect(paths).toEqual(['/elsewhere/wt-release/graphs/release/release-loop.yaml']);
     expect(applied.partial).toEqual({ requested: true, applied: true, files: 2, priorCommit: old });
     expect(JSON.parse(readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8'))).toMatchObject({ forCommit: tip, files: ['scripts/audit.test.ts', 'src/x.test.ts'] });
-    // A source change: fall back to a full gate — and the old plan for this version is removed, not reused.
+    // A code change: the tests reaching it join the plan (GATE-REUSE-BY-DIFF); src/other.test.ts is reused.
     write();
     changed = 'scripts/audit.test.ts\nsrc/release-loop/gate.ts\n';
-    const fell = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now });
+    const reached = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now, closureTree });
+    expect(reached.partial).toEqual({ requested: true, applied: true, files: 3, priorCommit: old, closure: { reached: 2, opaque: 0 } });
+    expect(JSON.parse(readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8')).files).toEqual(['scripts/audit.test.ts', 'src/release-loop/gate.test.ts', 'src/x.test.ts']);
+    // A non-code change (or an unreadable tip tree): fall back to a full gate — and the old plan is removed, not reused.
+    write();
+    changed = 'scripts/audit.test.ts\npackage.json\n';
+    const fell = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now, closureTree });
     expect(fell.partial).toMatchObject({ requested: true, applied: false, reason: expect.stringContaining('non-test change') });
     expect(() => readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8')).toThrow();
+    write();
+    changed = 'src/release-loop/gate.ts\n';
+    const blindTree = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now,
+      closureTree: () => { throw new Error('bad object'); } });
+    expect(blindTree.partial).toMatchObject({ requested: true, applied: false, reason: expect.stringContaining('tip tree unreadable') });
     // A failing diff: full gate with the reason — the already refreshed tip never strands the resume.
     write();
     const throwingGit = (args: string[]) => { if (args[0] === 'diff') throw new Error('bad object'); return git(args); };
@@ -357,16 +372,32 @@ test('GATE-PARTIAL resume: the graph is resumed at the run’s own saved path; -
     // A corrupt prior gate record: fall back to a full gate with the reason (never an exception mid-resume).
     write();
     writeFileSync(join(ledger, 'release', '0.2.18', 'gate-failures.json'), '{broken');
-    const corrupt = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now });
+    const corrupt = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now, closureTree });
     expect(corrupt.partial).toMatchObject({ requested: true, applied: false, reason: expect.stringContaining('unreadable gate record') });
     writeFileSync(join(ledger, 'release', '0.2.18', 'gate-failures.json'), JSON.stringify({ commit: old, failures: ['src/x.test.ts > slow'] }));
     // Without --partial: no plan, full gate — and a plan left from before is removed even when resuming at another node.
     write();
     changed = 'scripts/audit.test.ts\n';
-    await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now });
+    await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now, closureTree });
     write();
-    const full = await resumeReleaseRun({ runId: 'r', from: 'cutoff' }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now });
+    const full = await resumeReleaseRun({ runId: 'r', from: 'cutoff' }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now, closureTree });
     expect(full.partial).toEqual({ requested: false });
+    expect(() => readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8')).toThrow();
+    // GATE-REUSE-BY-DIFF: `--from gate` on a moved tip plans by default; `--no-partial` (partial: false) is a full gate.
+    write();
+    changed = 'src/release-loop/gate.ts\n';
+    const auto = await resumeReleaseRun({ runId: 'r', from: 'gate' }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now, closureTree });
+    expect(auto.partial).toEqual({ requested: true, applied: true, files: 2, priorCommit: old, auto: true, closure: { reached: 1, opaque: 0 } });
+    expect(JSON.parse(readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8')).files).toEqual(['src/release-loop/gate.test.ts', 'src/x.test.ts']);
+    write();
+    const optOut = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: false }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now, closureTree });
+    expect(optOut.partial).toEqual({ requested: false });
+    expect(() => readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8')).toThrow();
+    // The default falls back with its reason (never an exception), e.g. when no complete prior gate record exists.
+    write();
+    rmSync(join(ledger, 'release', '0.2.18', 'gate-failures.json'));
+    const noRecord = await resumeReleaseRun({ runId: 'r', from: 'gate' }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now, closureTree });
+    expect(noRecord.partial).toMatchObject({ requested: true, applied: false, auto: true, reason: expect.stringContaining('no complete gate record') });
     expect(() => readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8')).toThrow();
   } finally { rmSync(root, { recursive: true, force: true }); rmSync(ledger, { recursive: true, force: true }); }
 });

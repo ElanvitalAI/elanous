@@ -31,6 +31,7 @@ import {
   buildHarnessProcessReport,
   classifyHarnessProcess,
   classifyHarnessPodExit,
+  recordHarnessPodStop,
   harnessPodRunId,
   defaultLookupHarnessProcessLedger,
   formatHarnessProcessElapsed,
@@ -123,7 +124,7 @@ describe('harness CLI command', () => {
     } finally {
       console.error = originalError;
       debug.log = originalLog;
-      process.exitCode = undefined;
+      process.exitCode = 0;
       if (prev === undefined) delete process.env.ELANOUS_NESTED_DEPTH;
       else process.env.ELANOUS_NESTED_DEPTH = prev;
     }
@@ -427,7 +428,7 @@ describe('harness CLI command', () => {
         expect(launches).toHaveLength(3);
         await program.parseAsync(['node', 'elanous', 'harness', 'say', 'explicit-substrate', '--seat', 'MK', '--substrate', 'local']);
         expect(launches.at(-1)).toEqual(['harness', 'say', 'explicit-substrate', '--seat', 'MK', '--substrate', 'local']);
-      } finally { setUserConfigOverlay(null); process.exitCode = before; rmSync(root, { recursive: true, force: true }); }
+      } finally { setUserConfigOverlay(null); process.exitCode = before ?? 0; rmSync(root, { recursive: true, force: true }); }
     });
 
     test('capped unmarked say persists once, reports its own blocking reason and launches zero', async () => {
@@ -450,7 +451,7 @@ describe('harness CLI command', () => {
         expect(listHarnessQueue(queue)).toMatchObject([{ status: 'queued', waitingReason: 'seat TC: 1/1 (injectedCap.TC=1 · releaseGate.TC=4 · seatCaps.TC=8)' }]);
         expect(launches).toHaveLength(0);
         expect(process.exitCode).toBe(0);
-      } finally { process.exitCode = before; rmSync(root, { recursive: true, force: true }); }
+      } finally { process.exitCode = before ?? 0; rmSync(root, { recursive: true, force: true }); }
     });
 
     test('an existing queue head keeps a new direct say waiting without launching a different item', async () => {
@@ -472,7 +473,7 @@ describe('harness CLI command', () => {
           { status: 'queued', waitingReason: '앞선 대기열 항목 차례' }]);
         expect(launches).toEqual([]);
         expect(process.exitCode).toBe(0);
-      } finally { process.exitCode = oldExit; rmSync(root, { recursive: true, force: true }); }
+      } finally { process.exitCode = oldExit ?? 0; rmSync(root, { recursive: true, force: true }); }
     });
 
     test('a direct say launched at once through the real queue launcher keeps the child output, cwd and exit code; a second say for the same cell is refused', async () => {
@@ -559,7 +560,7 @@ describe('harness CLI command', () => {
             expect(lines.some((line) => line.startsWith('다른 대기열 tick 이 이미 발사했다'))).toBe(false);
             expect(process.exitCode).toBe(1);
           }
-        } finally { process.exitCode = oldExit; rmSync(root, { recursive: true, force: true }); }
+        } finally { process.exitCode = oldExit ?? 0; rmSync(root, { recursive: true, force: true }); }
       }
     });
 
@@ -590,7 +591,7 @@ describe('harness CLI command', () => {
         expect(log.mock.calls.filter(([category, event]) => category === 'harness.queue' && event === 'bypass'))
           .toEqual([['harness.queue', 'bypass', { seat: 'UX', reason: '--no-queue' }]]);
       } finally {
-        log.mockRestore(); process.exitCode = oldExit;
+        log.mockRestore(); process.exitCode = oldExit ?? 0;
         if (oldLaunch === undefined) delete process.env.ELANOUS_HARNESS_QUEUE_LAUNCH;
         else process.env.ELANOUS_HARNESS_QUEUE_LAUNCH = oldLaunch;
         if (oldSeat === undefined) delete process.env.ELANOUS_HARNESS_SEAT;
@@ -730,7 +731,7 @@ describe('harness CLI command', () => {
           results: [{ runId, status: 'done', stage: 'merged', prNumber: 42 }] },
       });
       expect(process.exitCode).toBe(0);
-    } finally { process.exitCode = previousExit; rmSync(root, { recursive: true, force: true }); }
+    } finally { process.exitCode = previousExit ?? 0; rmSync(root, { recursive: true, force: true }); }
   });
 
   test('goal missing run ledger or goal document is explicit and exits 1 in human and JSON modes', async () => {
@@ -763,7 +764,7 @@ describe('harness CLI command', () => {
         expect(parsed[missing === '원장에 없음' ? 'runState' : 'goalFile']).toBeNull();
         expect(process.exitCode).toBe(1);
       }
-    } finally { process.exitCode = previousExit; rmSync(root, { recursive: true, force: true }); }
+    } finally { process.exitCode = previousExit ?? 0; rmSync(root, { recursive: true, force: true }); }
   });
 
   test('drafts metrics JSON includes overlap from injected adapters and preserves draft counts when overlap throws', async () => {
@@ -801,7 +802,7 @@ describe('harness CLI command', () => {
       expect(lines).toHaveLength(1);
       expect(JSON.parse(lines[0]!)).toEqual({ ...measured, overlap: null });
       expect(process.exitCode).toBe(0);
-    } finally { process.exitCode = previousExit; }
+    } finally { process.exitCode = previousExit ?? 0; }
   });
 
   test('draft sweep is installed by default; dry-run and apply pass repository and actions through the CLI', async () => {
@@ -920,7 +921,7 @@ describe('harness CLI command', () => {
       if (gh === undefined) delete process.env.GH_REPO;
       else process.env.GH_REPO = gh;
       setUserConfigOverlay(null);
-      process.exitCode = previousExit;
+      process.exitCode = previousExit ?? 0;
       rmSync(outside, { recursive: true, force: true });
     }
   });
@@ -1090,7 +1091,7 @@ describe('harness CLI command', () => {
         expect(writes).toEqual([]);
         expect(process.exitCode).toBe(1);
       }
-    } finally { process.exitCode = previousExit; }
+    } finally { process.exitCode = previousExit ?? 0; }
   });
 
   test('drafts claim refuses idea-approval or ready PR without any gh writes', async () => {
@@ -1114,7 +1115,7 @@ describe('harness CLI command', () => {
         labels = [];
         draft = false;
       }
-    } finally { process.exitCode = previousExit; }
+    } finally { process.exitCode = previousExit ?? 0; }
   });
 
   test('drafts claim and release refuse closed or merged drafts without gh writes', async () => {
@@ -1139,7 +1140,7 @@ describe('harness CLI command', () => {
         }
       }
       expect(requests).toEqual(Array.from({ length: 4 }, () => ['api', 'repos/my/repo/pulls/123']));
-    } finally { process.exitCode = previousExit; }
+    } finally { process.exitCode = previousExit ?? 0; }
   });
 
   test('merge-time GitHub adapter reuses open-draft inventory and liveness without listing closed PRs', async () => {
@@ -1527,7 +1528,7 @@ describe('harness CLI command', () => {
       expect(JSON.parse(lines.at(-1)!)).toMatchObject({ repository: 'default/repo', apply: true,
         complete: false, entries: [], error: 'GitHub listing failed' });
       expect(process.exitCode).toBe(1);
-    } finally { process.exitCode = prior; }
+    } finally { process.exitCode = prior ?? 0; }
   });
   test('draft sweep prints the first gh error as one line with no stack and exits non-zero', async () => {
     const lines: string[] = [];
@@ -1585,7 +1586,7 @@ describe('harness CLI command', () => {
         rmSync(checkout, { recursive: true, force: true });
       }
     } finally {
-      process.exitCode = prior;
+      process.exitCode = prior ?? 0;
       log.mockRestore();
     }
   });
@@ -1707,7 +1708,7 @@ describe('harness CLI command', () => {
       expect(observed[0]).toBe('1234567890abcdef');
       expect(observed).toHaveLength(2);
       expect(process.exitCode).toBe(0);
-    } finally { process.exitCode = previousExit; rmSync(goal, { force: true }); }
+    } finally { process.exitCode = previousExit ?? 0; rmSync(goal, { force: true }); }
   });
 
   test('ask keeps its default options without graph authority forwarding', async () => {
@@ -1779,7 +1780,7 @@ describe('harness CLI command', () => {
       expect(process.exitCode).toBe(2);
       expect(errors).toEqual(['❌ git 저장소가 필요합니다 — `git init` 하거나 `--yes` 로 다시 · (다음 판: 그림자 저장소 — RFC P19)']);
     } finally {
-      process.exitCode = prior;
+      process.exitCode = prior ?? 0;
     }
   });
 
@@ -1825,7 +1826,7 @@ describe('harness CLI command', () => {
     } finally {
       dispatch.mockRestore();
       log.mockRestore();
-      process.exitCode = previousExit;
+      process.exitCode = previousExit ?? 0;
     }
   });
 
@@ -1855,7 +1856,7 @@ describe('harness CLI command', () => {
       await program.parseAsync(['node', 'elanous', 'harness', 'say', 'a request', '--substrate', 'pod', '--pod-pool', 'pool-test:1']);
       expect(loadRunLedger(runId, runLedgerDir(root))!.filter((entry) => entry.event === 'stop')).toHaveLength(1);
     } finally {
-      dispatch.mockRestore(); log.mockRestore(); process.exitCode = exit;
+      dispatch.mockRestore(); log.mockRestore(); process.exitCode = exit ?? 0;
       if (previous === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous;
       rmSync(root, { recursive: true, force: true });
     }
@@ -1903,7 +1904,7 @@ describe('harness CLI command', () => {
       expect(process.exitCode).toBe(0);
     } finally {
       dispatch.mockRestore();
-      process.exitCode = exit;
+      process.exitCode = exit ?? 0;
       rmSync(goal, { force: true });
     }
   });
@@ -1918,7 +1919,7 @@ describe('harness CLI command', () => {
       await program.parseAsync(['node', 'elanous', 'harness', 'say', 'write guide', '--goal-type', 'document', '--substrate', 'pod', '--pod-pool', 'pool-test:1']);
       expect(dispatch.mock.calls[0]?.[0]).toMatchObject({ entrance: 'cli-harness-say', input: 'write guide', goalType: 'document' });
       expect(dispatch.mock.calls[0]?.[0].podMemory).toBeUndefined();
-    } finally { dispatch.mockRestore(); process.exitCode = previousExit; }
+    } finally { dispatch.mockRestore(); process.exitCode = previousExit ?? 0; }
   });
 
   test('real harness ask/say entrances forward the pool to self orchestration; N=2 holds a third kubectl Job apply', async () => {
@@ -2005,7 +2006,7 @@ describe('harness CLI command', () => {
       controllers.forEach((controller) => controller.abort());
       for (const name of applied) completed.add(name);
       await Promise.all(jobs.map((job) => job.done));
-      process.exitCode = previousExit;
+      process.exitCode = previousExit ?? 0;
       rmSync(goal, { force: true });
     }
   }, 20_000);
@@ -2026,7 +2027,7 @@ describe('harness CLI command', () => {
       expect(process.exitCode).toBe(0);
     } finally {
       dispatch.mockRestore();
-      process.exitCode = exit;
+      process.exitCode = exit ?? 0;
     }
   });
 
@@ -2233,7 +2234,7 @@ describe('harness CLI command', () => {
       }
     } finally {
       dispatch.mockRestore();
-      process.exitCode = previousExit;
+      process.exitCode = previousExit ?? 0;
       if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
       else process.env.ELANOUS_STATE_DIR = previousState;
       rmSync(root, { recursive: true, force: true });
@@ -2348,7 +2349,7 @@ describe('harness CLI command', () => {
       const stopped = await captureError(() => sayProgram.parseAsync(['node', 'elanous', 'harness', 'say', 'write', 'goal', '--substrate', 'pod', '--pod-pool', 'pool-test:1']));
       expect(stopped).toEqual(['런이 멈췄다(SIGTERM) — `harness stop` 이나 세션 종료일 수 있다 · 그 전까지 만든 PR 은 남아 있다']);
       expect(process.exitCode).toBe(143);
-    } finally { dispatch.mockRestore(); process.exitCode = previousExit; }
+    } finally { dispatch.mockRestore(); process.exitCode = previousExit ?? 0; }
   });
 
   test('ask and say expose and forward opaque --correlation without exposing it to plan or mission', async () => {
@@ -3075,7 +3076,7 @@ describe('harness CLI command', () => {
         expect(sayLines).toContain(`[dry-run] target: ${realpathSync('/tmp')} · outside-home`);
         expect(process.exitCode).toBe(0);
       } finally {
-        process.exitCode = previousExit;
+        process.exitCode = previousExit ?? 0;
       }
 
       expect(received).toEqual([]);
@@ -3723,6 +3724,32 @@ test('harness progress: queries running runs as harness.progress and prints the 
   expect(JSON.parse(printed[1]!)).toEqual(buildRunProgressRows(result, Date.parse('2026-10-11T00:30:00.000Z')));
 });
 
+test('harness progress --json: an unreadable ledger without completeness=partial still puts the partial-observation header on stderr', async () => {
+  const base = assessRunningRuns([{ runId: 'run-q', lifecycle: 'live', ledgerDirectory: '/state/run-q' } as never], { refs: [], unreadable: [] });
+  const result = { ...base, ledger: { ...base.ledger, unreadableLedgerCount: 1 } };
+  expect(result.completeness).toBeUndefined();
+  const progress = { query: (() => result) as never, nowMs: () => Date.parse('2026-10-11T00:30:00.000Z') };
+  const program = new Command().exitOverride();
+  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness', progress });
+  const printed: string[] = [];
+  const errors: string[] = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args: unknown[]) => { printed.push(args.map(String).join(' ')); };
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  try {
+    await program.parseAsync(['node', 'elanous', 'harness', 'progress', '--json']);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+  expect(JSON.parse(printed[0]!)).toEqual(buildRunProgressRows(result, Date.parse('2026-10-11T00:30:00.000Z')));
+  expect(errors).toHaveLength(1);
+  expect(errors[0]).toStartWith('부분 관측 — 최소');
+  expect(errors[0]).toContain('읽지 못한 원장: 목록 미관측');
+  expect(errors[0]).not.toContain('없음');
+});
+
 
 test.skipIf(process.platform !== 'darwin')('macOS pid-bound handle: SIGTERM reaches the same process; a gone pid is refused (PROC1 · no pidfd on darwin)', async () => {
   const child = spawn('sleep', ['30']);
@@ -3735,4 +3762,87 @@ test.skipIf(process.platform !== 'darwin')('macOS pid-bound handle: SIGTERM reac
   // The process is gone: a fresh handle cannot be bound and a stale one must not signal.
   expect(() => openHarnessProcessHandle(child.pid!)).toThrow();
   expect(() => handle.signal('SIGTERM')).toThrow();
+});
+
+describe('recordHarnessPodStop — AUT-POD-EXIT-UNCLASSIFIED wiring', () => {
+  const noLedger = () => null;
+  const unknownDeps = { loadLedger: noLedger, hasJobApplied: () => true, supervisorDecision: () => undefined, loadCheckpoint: () => null };
+  const uniqueRunId = (tag: string) => `run-podexit-${tag}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const capture = () => {
+    const entries: Array<{ event: string; data: Record<string, unknown> }> = [];
+    return { entries, write: (entry: { event: string; data: Record<string, unknown> }) => { entries.push(entry); } };
+  };
+
+  test('① an unknown exit whose child died on ENOSPC records podExitClass child-error ⊕ the tail in the stop line', () => {
+    const runId = uniqueRunId('enospc');
+    const output = [`[self-dev] launching run ${runId}`, 'installing dependencies', 'Error: ENOSPC: no space left on device, write'].join('\n');
+    const classified = classifyHarnessPodExit({ status: 1 }, output, { ...unknownDeps, runId });
+    expect(classified.reason).toBe('unknown');
+    const logSpy = spyOn(debug, 'log');
+    const { entries, write } = capture();
+    try {
+      expect(recordHarnessPodStop(runId, 1, classified, output, { loadLedger: noLedger, write: write as never })).toBe(true);
+      expect(logSpy.mock.calls.some(([category, event, data]) => category === 'harness.pod' && event === 'exit-classified-detail'
+        && (data as { podExitClass?: string; tailLines?: number }).podExitClass === 'child-error'
+        && (data as { tailLines?: number }).tailLines === 3)).toBe(true);
+    } finally { logSpy.mockRestore(); }
+    expect(entries).toHaveLength(1);
+    const data = entries[0]!.data;
+    expect(entries[0]!.event).toBe('stop');
+    expect(data.podExitClass).toBe('child-error');
+    expect(data.cause).toBe('Pod exit 1: child-error — Error: ENOSPC: no space left on device, write');
+    expect(data.tail).toEqual([`[self-dev] launching run ${runId}`, 'installing dependencies', 'Error: ENOSPC: no space left on device, write']);
+    expect(data.class).toBe('unclassified');
+  });
+
+  test('① the tail keeps at most five lines of at most 240 characters each', () => {
+    const runId = uniqueRunId('bound');
+    const long = `Error: ${'x'.repeat(400)}`;
+    const output = ['l1', 'l2', 'l3', 'l4', 'l5', 'l6', long].join('\n');
+    const { entries, write } = capture();
+    expect(recordHarnessPodStop(runId, 1, { reason: 'unknown', lines: ['Pod 실행 여부 또는 종료 이유를 확인하지 못했다'] }, output, { loadLedger: noLedger, write: write as never })).toBe(true);
+    const tail = entries[0]!.data.tail as string[];
+    expect(tail).toHaveLength(5);
+    expect(tail[0]).toBe('l3');
+    expect(tail.every((line) => Array.from(line).length <= 240)).toBe(true);
+  });
+
+  test('② an already classified reason (no-launch) writes the same stop line as before — no podExitClass, no tail', () => {
+    const runId = uniqueRunId('nolaunch');
+    const output = 'Error: ENOSPC: no space left on device';
+    const { entries, write } = capture();
+    const logSpy = spyOn(debug, 'log');
+    try {
+      expect(recordHarnessPodStop(runId, 1, { reason: 'no-launch', lines: ['Pod 실행에 닿지 못했다 — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라'] }, output, { loadLedger: noLedger, write: write as never })).toBe(true);
+      expect(logSpy.mock.calls.some(([, event]) => event === 'exit-classified-detail')).toBe(false);
+    } finally { logSpy.mockRestore(); }
+    expect(Object.keys(entries[0]!.data).sort()).toEqual(['cause', 'class', 'evidenceRef', 'nextMove']);
+    expect(entries[0]!.data).toEqual({
+      class: 'launch-failed',
+      cause: 'Pod exit 1: no-launch — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라',
+      evidenceRef: `logs:harness.pod/exit-classified:${runId}`,
+      nextMove: 'Check Pod launch gate and pool, then relaunch',
+    });
+  });
+
+  test('② OOMKilled stays byte-identical too', () => {
+    const runId = uniqueRunId('oom');
+    const { entries, write } = capture();
+    expect(recordHarnessPodStop(runId, 137, { reason: 'OOMKilled', lines: ['Pod 종료 출력에서 확인한 원인: OOMKilled'] }, 'OOMKilled', { loadLedger: noLedger, write: write as never })).toBe(true);
+    expect(entries[0]!.data).toEqual({
+      class: 'pod-died', cause: 'Pod exit 137: OOMKilled', evidenceRef: `logs:harness.pod/exit-classified:${runId}`,
+      nextMove: 'Inspect Pod exit classification and harvest the branch before relaunch',
+    });
+  });
+
+  test('③ an empty output reads as podExitClass unknown with an empty tail, without throwing', () => {
+    for (const output of ['', undefined]) {
+      const runId = uniqueRunId('empty');
+      const { entries, write } = capture();
+      expect(recordHarnessPodStop(runId, 1, { reason: 'unknown', lines: ['Pod 실행 여부 또는 종료 이유를 확인하지 못했다'] }, output, { loadLedger: noLedger, write: write as never })).toBe(true);
+      expect(entries[0]!.data.podExitClass).toBe('unknown');
+      expect(entries[0]!.data.tail).toEqual([]);
+      expect(entries[0]!.data.cause).toBe('Pod exit 1: unknown');
+    }
+  });
 });

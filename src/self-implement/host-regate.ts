@@ -10,6 +10,8 @@ import { releaseGitDiffPaths, releasePathHold, releasePathHoldShouldPost, releas
 import { detectTestInterference, parseFailureCount, runBunTest } from '../../scripts/detect-test-interference.js';
 import { MAX_INSPECTED_TEST_FILES, runTestInterferenceGate } from '../../scripts/ci-test-interference-gate.js';
 import { pwaGraph, pwaReach } from '../../scripts/ci-pwa-build-gate.js';
+import { classifyMergeFailure, clipRegateDetail, parseConflictFiles, type HostRegateFailure } from './regate-detail.js';
+import { buildImporterTestIndex, isTestPath } from './importer-test-index.js';
 
 /** Use pr-land's PWA reachability (including its undecidable-graph build fallback), not a blanket src/** trigger. */
 export function needsPwaBuild(files: readonly string[], repoRoot: string, graph: (root: string) => ReturnType<typeof pwaGraph> = pwaGraph): boolean {
@@ -29,8 +31,8 @@ export function provideCheckoutDependencies(candidate: string, sourceRoot: strin
 }
 
 export interface HostRegateInput { prNumber: number; headCommit: string; repoRoot: string; goalFile?: string; verifyOnly?: boolean; /** TA-LIVE-LAND-2: run the full landing gates (release-path hold · neighbours · PR re-read) but stop before the freeze admission and `gh pr merge` — the task agent lands it later via `pr land --expected-head`. */ noMerge?: true; /** Called by a resume sweep that already holds this PR's claim. */ resumed?: true }
-export interface HostRegateResult { passed: boolean; failures: Array<{ step: string; detail: string }>; os: string; status?: 'passed' | 'failed' | 'unmeasured' | 'frozen'; /** verifyOnly: 실제로 얹어 잰 base 끝 */ baseCommit?: string }
-export type InterferenceVerdict = { passed: boolean; detail?: string; unmeasured?: boolean; /** neighbour tests left out so the selection fits the inspection cap */ neighborsTrimmed?: number };
+export interface HostRegateResult { passed: boolean; failures: HostRegateFailure[]; os: string; status?: 'passed' | 'failed' | 'unmeasured' | 'frozen'; /** verifyOnly: 실제로 얹어 잰 base 끝 */ baseCommit?: string }
+export type InterferenceVerdict = { passed: boolean; detail?: string; unmeasured?: boolean; /** neighbour tests left out so the selection fits the inspection cap */ neighborsTrimmed?: number; /** importer tests left out after changed tests and all selected neighbors take priority */ importerTrimmed?: number };
 export type HostRegateDeps = {
   command?: (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv) => { status: number | null; stdout: string; stderr: string };
   interference?: (files: readonly string[], cwd: string) => Promise<InterferenceVerdict>;
@@ -56,41 +58,91 @@ const defaultCommand: NonNullable<HostRegateDeps['command']> = (bin, args, cwd, 
 };
 
 /** The informational pr-land gate always returns zero; enforce its measured report and the combined test result instead. */
-export async function defaultInterference(files: readonly string[], cwd: string, opts: { neighbors?: boolean; detect?: typeof detectTestInterference } = {}): Promise<InterferenceVerdict> {
+export async function defaultInterference(files: readonly string[], cwd: string, opts: {
+  neighbors?: boolean;
+  detect?: typeof detectTestInterference;
+  run?: (files: readonly string[], cwd: string) => ReturnType<typeof runBunTest>;
+  buildImporterTestIndex?: typeof buildImporterTestIndex;
+} = {}): Promise<InterferenceVerdict> {
   const tests = [...new Set(files.filter((file) => /\.test\.tsx?$/.test(file)))].sort();
   const changed = new Set(tests);
+  const changedSources = [...new Set(files.filter((file) => /\.(?:[cm]?[jt]sx?)$/.test(file) && !isTestPath(file)))].sort();
+  const importers = new Set<string>();
   const neighbors = new Set<string>();
-  // verifyOnly(승인 탭)는 «이 PR 이 바꾼 시험»만 잰다 — 이웃의 기존 실패가 이 PR 을 막지 않게
-  //   (2026-09-28 #21239 실측: scripts/lib 이웃 9 · nl-routing-measurement 기존 1 fail).
+  let importerIndexFailed = false;
+
+  // verifyOnly measures changed tests only; it deliberately does not construct or add importer/folder tests.
+  if (opts.neighbors !== false && changedSources.length > 0) {
+    try {
+      const listed = spawnSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], { cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
+      if (listed.status !== 0 || listed.error) importerIndexFailed = true;
+      else {
+        const paths = listed.stdout.split('\0').filter(Boolean);
+        const testPaths = paths.filter(isTestPath);
+        const sourcePaths = [...new Set([
+          ...paths.filter((path) => /\.(?:[cm]?[jt]sx?)$/.test(path) && !isTestPath(path)),
+          ...changedSources,
+        ])];
+        const index = (opts.buildImporterTestIndex ?? buildImporterTestIndex)(cwd, testPaths, sourcePaths);
+        if (!index) importerIndexFailed = true;
+        else for (const source of changedSources) {
+          for (const test of index.testsBySource.get(source) ?? []) if (!changed.has(test)) importers.add(test);
+        }
+      }
+    } catch {
+      importerIndexFailed = true;
+    }
+  }
+
+  // Existing folder neighbors remain the final, lowest-priority selection tier.
   if (opts.neighbors !== false) for (const file of tests) {
     for (const sibling of readdirSync(join(cwd, dirname(file)))) {
       const path = join(dirname(file), sibling);
       if (/\.test\.tsx?$/.test(sibling) && !changed.has(path)) neighbors.add(path);
     }
   }
-  // 이웃이 간섭 관문의 상한(MAX_INSPECTED_TEST_FILES)을 넘기면 그 관문이 잘라 «영영 측정 불가»가 된다
-  //   (2026-10-08 #25180·#25187 실측: src/self-implement 시험 175 · src/seat-loop 11). 바뀐 시험은 전부 두고 남는 칸만 이웃으로 채운다.
-  //   바뀐 시험만으로 상한을 넘으면 정직하게 «측정 불가»로 남는다.
+  for (const importer of importers) neighbors.delete(importer);
+
+  const sortedImporters = [...importers].sort();
   const sortedNeighbors = [...neighbors].sort();
   const room = Math.max(0, MAX_INSPECTED_TEST_FILES - tests.length);
-  const kept = tests.length > MAX_INSPECTED_TEST_FILES ? sortedNeighbors : sortedNeighbors.slice(0, room);
-  const neighborsTrimmed = sortedNeighbors.length - kept.length;
-  const trimmed = neighborsTrimmed > 0 ? { neighborsTrimmed } : {};
-  const trimNote = neighborsTrimmed > 0 ? ` · neighbours trimmed ${neighborsTrimmed} to fit inspection cap ${MAX_INSPECTED_TEST_FILES}` : '';
-  const selected = [...tests, ...kept].sort();
+  const keptImporters = sortedImporters.slice(0, room);
+  const importerTrimmed = sortedImporters.length - keptImporters.length;
+  const neighborRoom = Math.max(0, room - keptImporters.length);
+  const keptNeighbors = sortedNeighbors.slice(0, neighborRoom);
+  const neighborsTrimmed = sortedNeighbors.length - keptNeighbors.length;
+  const trimmedCount = importerTrimmed + neighborsTrimmed;
+  const trimmed = {
+    ...(neighborsTrimmed > 0 ? { neighborsTrimmed } : {}),
+    ...(importerTrimmed > 0 ? { importerTrimmed } : {}),
+  };
+  const trimSummary = [
+    ...(neighborsTrimmed > 0 ? [`neighbours trimmed ${neighborsTrimmed}`] : []),
+    ...(importerTrimmed > 0 ? [`importer tests trimmed ${importerTrimmed}`] : []),
+  ].join(', ');
+  const trimNote = trimmedCount > 0 ? ` · ${trimSummary} to fit inspection cap ${MAX_INSPECTED_TEST_FILES}` : '';
+  const selected = [...tests, ...keptImporters, ...keptNeighbors].sort();
+  debug.log('harness.host-regate', 'test-select', {
+    changed: tests.length,
+    importers: keptImporters.length,
+    neighbors: keptNeighbors.length,
+    trimmed: trimmedCount,
+    ...(importerIndexFailed ? { observation: 'importer 못 셌다' } : {}),
+    ...(importerTrimmed > 0 ? { importerTrimmed } : {}),
+  });
   if (!selected.length) return { passed: true };
   // 간섭 관문은 시험 파일이 둘 이상일 때만 잰다 — 하나면 간섭이라는 말이 없으니 그 파일을 한 번 돌려 실패 수로 본다.
   if (selected.length === 1) {
-    const run = await runBunTest(selected, undefined, cwd);
+    const run = await (opts.run ?? ((paths, dir) => runBunTest(paths, undefined, dir)))(selected, cwd);
     const fail = run.signal || run.exitCode === null ? null : parseFailureCount(`${run.stdout}${run.stderr}`);
-    if (fail === null) return { passed: false, unmeasured: true, detail: `single test run unmeasured: ${selected[0]}` };
-    return fail === 0 ? { passed: true } : { passed: false, detail: `${selected[0]} — ${fail} fail` };
+    if (fail === null) return { passed: false, unmeasured: true, ...trimmed, detail: `single test run unmeasured: ${selected[0]}` };
+    return fail === 0 ? { passed: true, ...trimmed } : { passed: false, ...trimmed, detail: `${selected[0]} — ${fail} fail` };
   }
   // The informational pr-land gate always returns zero; its measured report is the verdict.
   let report: Awaited<ReturnType<typeof detectTestInterference>> | undefined;
   await runTestInterferenceGate({
     args: ['--changed-files', ...selected], log: () => {},
-    detect: async (paths) => (report = await (opts.detect ?? detectTestInterference)(paths, (batch) => runBunTest(batch, undefined, cwd))),
+    detect: async (paths) => (report = await (opts.detect ?? detectTestInterference)(paths, (batch) => (opts.run ?? ((selectedPaths, dir) => runBunTest(selectedPaths, undefined, dir)))(batch, cwd))),
   });
   if (!report || report.status === 'unmeasurable' || selected.length > report.order.length) return { passed: false, unmeasured: true, ...trimmed, detail: `test interference measurement unavailable or truncated (selected ${selected.length}, changed tests ${tests.length}, cap ${MAX_INSPECTED_TEST_FILES})${trimNote}` };
   if (report.isolatedFailures !== 0 || report.combinedFailures !== 0 || report.status === 'interference') {
@@ -186,14 +238,16 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
   let landed = false;
   let verifiedBase: string | undefined;
   let interferenceNote: Record<string, unknown> = {};
-  const result = (event: 'passed' | 'failed' | 'unmeasured', step?: string, detail?: string): HostRegateResult => {
-    if (step) failures.push({ step, detail: detail ?? 'unknown' });
-    log(event, { pr: input.prNumber, files, os: process.platform, ...interferenceNote, ...(step ? { failedStep: step, detail: (detail ?? 'unknown').slice(0, 300) } : {}) });
+  // HOST-REGATE-REASON-LOST: `facts` carries the expected/actual head, conflict files and merge failure kind of the
+  //   pr-head · merge-conflict · merge steps; the detail keeps a bounded head ⊕ tail instead of the first 300 characters.
+  const result = (event: 'passed' | 'failed' | 'unmeasured', step?: string, detail?: string, facts: Omit<HostRegateFailure, 'step' | 'detail'> = {}): HostRegateResult => {
+    if (step) failures.push({ step, detail: clipRegateDetail(detail ?? 'unknown'), ...facts });
+    log(event, { pr: input.prNumber, files, os: process.platform, ...interferenceNote, ...(step ? { failedStep: step, detail: clipRegateDetail(detail ?? 'unknown'), ...facts } : {}) });
     return { passed: event === 'passed', failures, os: process.platform, ...(input.verifyOnly ? { status: event, ...(verifiedBase ? { baseCommit: verifiedBase } : {}) } : {}) };
   };
   const run = (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv): string => {
     const r = command(bin, args, cwd, env);
-    if (r.status !== 0) throw new Error((r.stderr || r.stdout || `${bin} exited ${r.status}`).trim().slice(0, 300));
+    if (r.status !== 0) throw new Error(clipRegateDetail((r.stderr || r.stdout || `${bin} exited ${r.status}`).trim()));
     return r.stdout.trim();
   };
   try {
@@ -201,10 +255,13 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     release = await (deps.acquire ?? acquireSlot)(input.repoRoot);
     type PrView = { headRefOid?: string; baseRefName?: string; baseRefOid?: string; state?: string; isDraft?: boolean };
     const readPr = (): PrView => JSON.parse(run('gh', ['pr', 'view', String(input.prNumber), '--json', 'headRefOid,baseRefName,baseRefOid,state,isDraft'], input.repoRoot));
+    const prHeadFailure = (seen: PrView): HostRegateResult => result('unmeasured', 'pr-head',
+      `PR head, base commit, ready state or open state unavailable or changed (state=${seen.state ?? 'unknown'} · isDraft=${String(seen.isDraft)} · base=${seen.baseRefName ?? 'unknown'}@${seen.baseRefOid ?? 'unknown'})`,
+      { expectedHead: input.headCommit, actualHead: typeof seen.headRefOid === 'string' ? seen.headRefOid : null });
     let view: PrView;
     try { view = readPr(); }
     catch (e) { return result('unmeasured', 'pr-view', String(e)); }
-    if (view.headRefOid !== input.headCommit || view.state !== 'OPEN' || view.isDraft !== false || !view.baseRefName || !/^[0-9a-f]{40}$/i.test(view.baseRefOid ?? '')) return result('unmeasured', 'pr-head', 'PR head, base commit, ready state or open state unavailable or changed');
+    if (view.headRefOid !== input.headCommit || view.state !== 'OPEN' || view.isDraft !== false || !view.baseRefName || !/^[0-9a-f]{40}$/i.test(view.baseRefOid ?? '')) return prHeadFailure(view);
     const baseRefName = view.baseRefName;
     // verifyOnly(승인 탭): PR 에 기록된 base(baseRefOid)는 main 의 «지금 끝»보다 늙을 수 있다 — 지금 끝에 얹어 잰다.
     let baseCommit = view.baseRefOid!;
@@ -230,7 +287,7 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
           await new Promise((resolve) => setTimeout(resolve, 1_000));
           view = readPr();
           if (view.headRefOid !== input.headCommit || view.state !== 'OPEN' || view.isDraft !== false || view.baseRefName !== baseRefName || !/^[0-9a-f]{40}$/i.test(view.baseRefOid ?? '')) {
-            return result('unmeasured', 'pr-head', 'PR head, base commit, ready state or open state unavailable or changed');
+            return prHeadFailure(view);
           }
           baseCommit = view.baseRefOid!;
           run('git', ['fetch', 'origin', `refs/heads/${baseRefName}`], input.repoRoot);
@@ -285,8 +342,29 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
       }
       // Materialize the proposed merge of this exact PR head into the observed base.
       // A clean head checkout cannot expose integration breaks introduced by the base.
-      try { run('git', ['merge', '--no-ff', '--no-commit', input.headCommit], worktree); }
-      catch (e) { return result('failed', 'merge-conflict', String(e)); }
+      // Parse the raw merge output before bounding the failure detail; a middle CONFLICT line can vanish from a 4KB head+tail clip.
+      let mergeOutput: string | undefined;
+      try {
+        const merge = command('git', ['merge', '--no-ff', '--no-commit', input.headCommit], worktree);
+        if (merge.status !== 0) {
+          mergeOutput = ([merge.stdout, merge.stderr].filter(Boolean).join('\n') || `git merge exited ${merge.status}`).trim();
+          throw new Error(mergeOutput);
+        }
+      }
+      catch (e) {
+        // Read the unmerged paths before the finally block resets the slot; fall back to the CONFLICT lines.
+        let unmerged: string[] = [];
+        // -z keeps exact paths; bypass run() because its stdout.trim() would alter a leading/trailing space in a filename.
+        try {
+          const diff = command('git', ['diff', '--name-only', '-z', '--diff-filter=U'], worktree);
+          if (diff.status === 0) unmerged = diff.stdout.split('\0').filter(Boolean);
+        } catch { /* fall back below */ }
+        const detail = mergeOutput ?? String(e);
+        const conflictFiles = unmerged.length ? [...new Set(unmerged)].sort() : parseConflictFiles(detail);
+        // No unmerged path and no CONFLICT line (e.g. unrelated histories) is not called a conflict.
+        const kind = conflictFiles.length ? 'conflict' as const : classifyMergeFailure(detail);
+        return result('failed', 'merge-conflict', detail, { expectedHead: input.headCommit, conflictFiles, mergeFailureKind: kind });
+      }
       run('git', ['-c', 'user.name=elanous host regate', '-c', 'user.email=regate@localhost', 'commit', '-m', 'host regate integration candidate'], worktree);
       if (run('git', ['rev-parse', 'HEAD^1'], worktree) !== baseCommit || run('git', ['rev-parse', 'HEAD^2'], worktree) !== input.headCommit) throw new Error('integration parents do not match PR base and checked head');
       if (!deps.command && !existsSync(join(worktree, 'scripts/ci-typecheck-changed.ts'))) throw new Error('typecheck gate unavailable in checked worktree');
@@ -300,8 +378,13 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
       if (buildPwa && existsSync(join(worktree, 'apps/pwa'))) provide('apps/pwa', 'next');
     } catch (e) { return result('unmeasured', 'worktree', String(e)); }
     try {
-      const interference = await (deps.interference ?? ((f: readonly string[], c: string) => defaultInterference(f, c, { neighbors: !input.verifyOnly })))(files, worktree);
-      if (interference.neighborsTrimmed) interferenceNote = { neighborsTrimmed: interference.neighborsTrimmed, interferenceDetail: (interference.detail ?? '').slice(0, 300) };
+      const interferenceOptions = { neighbors: !input.verifyOnly };
+      const interference = await (deps.interference ?? ((f: readonly string[], c: string) => defaultInterference(f, c, interferenceOptions)))(files, worktree);
+      if (interference.neighborsTrimmed || interference.importerTrimmed) interferenceNote = {
+        ...(interference.neighborsTrimmed ? { neighborsTrimmed: interference.neighborsTrimmed } : {}),
+        ...(interference.importerTrimmed ? { importerTrimmed: interference.importerTrimmed } : {}),
+        interferenceDetail: (interference.detail ?? '').slice(0, 300),
+      };
       if (!interference.passed) return result(interference.unmeasured ? 'unmeasured' : 'failed', 'test-interference', interference.detail);
     } catch (e) { return result('unmeasured', 'test-interference', String(e)); }
     // Landing can also be initiated by the host after the child gate; judge the checked PR here too.
@@ -344,7 +427,13 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     // The marker and claim are held through the merge «and» its confirmation; released in the outer finally.
     endLanding = landing.end;
     try { run('gh', ['pr', 'merge', String(input.prNumber), '--squash', '--match-head-commit', input.headCommit], input.repoRoot); }
-    catch (e) { return result('failed', 'merge', String(e)); }
+    catch (e) {
+      // Tell a base race from a moved head from a conflict: re-read the PR head once (null = could not read).
+      let actualHead: string | null = null;
+      try { const after = readPr(); actualHead = typeof after.headRefOid === 'string' ? after.headRefOid : null; } catch { /* stays null */ }
+      const detail = String(e);
+      return result('failed', 'merge', detail, { expectedHead: input.headCommit, actualHead, mergeFailureKind: classifyMergeFailure(detail, input.headCommit, actualHead) });
+    }
     type MergedView = { state?: string; mergeCommit?: { oid?: string } | null };
     let merged: MergedView;
     try { merged = JSON.parse(run('gh', ['pr', 'view', String(input.prNumber), '--json', 'state,mergeCommit'], input.repoRoot)); }
@@ -393,8 +482,13 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     try { release?.(); }
     catch (e) { log('unmeasured', { pr: input.prNumber, files, os: process.platform, failedStep: 'lock', detail: String(e) }); }
     if (failures.length && failures[0]?.step !== 'release-path-hold') {
-      const { step, detail } = failures[0]!;
-      const body = `호스트 재게이트 실패(${process.platform}): ${step} — ${detail.replace(/\s+/g, ' ').slice(0, 180)}`;
+      const { step, detail, mergeFailureKind, conflictFiles, expectedHead, actualHead } = failures[0]!;
+      const facts = [mergeFailureKind ? `kind=${mergeFailureKind}` : '',
+        expectedHead ? `expectedHead=${expectedHead}` : '',
+        actualHead !== undefined ? `actualHead=${actualHead ?? 'unreadable'}` : '',
+        conflictFiles?.length ? `conflicts=${conflictFiles.slice(0, 5).join(',')}${conflictFiles.length > 5 ? ` +${conflictFiles.length - 5} more (total ${conflictFiles.length})` : ''}` : '',
+      ].filter(Boolean).join(' · ');
+      const body = `호스트 재게이트 실패(${process.platform}): ${step}${facts ? ` [${facts}]` : ''} — ${clipRegateDetail(detail.replace(/\s+/g, ' '))}`;
       try { run('gh', ['pr', 'comment', String(input.prNumber), '--body', body], input.repoRoot); }
       catch (e) { log('unmeasured', { pr: input.prNumber, files, os: process.platform, failedStep: 'comment', detail: String(e) }); }
     }

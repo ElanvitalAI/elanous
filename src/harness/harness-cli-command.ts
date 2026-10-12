@@ -19,11 +19,12 @@ import { Command, Option } from 'commander';
 import { runGitCommand } from '../git-fs/runner.js';
 import { GOAL_TYPES, lintGoalFile, parseGoalId, parseGoalType, resolveGoalAuthorGrade, tracedPathReferences, type GoalAuthorGrade, type GoalAuthorGradeSelection, type GoalType } from '../self-implement/goal-author.js';
 import { templateForGoalType } from '../self-implement/graph-templates.js';
-import { listRunLedgers, loadFederatedRunLedger, loadRunLedger, queryRunScreenKey, runLedgerDir, type RunLedgerMatch } from '../self-implement/run-ledger.js';
+import { appendRunLedgerEntry, listRunLedgers, loadFederatedRunLedger, loadRunLedger, queryRunScreenKey, runLedgerDir, type RunLedgerEntry, type RunLedgerMatch, type RunLedgerWriter } from '../self-implement/run-ledger.js';
+import { classifyPodExit, type PodExitClass } from '../task-orchestrator/surfaces/pod-failure-reason.js';
 import { classifyPodExitStop, recordRunStop, runStopRecorded, RUN_STOP_EVENT } from '../self-implement/run-stop.js';
 import { ensureOpenRouterChildModelLive, resolveChildLlmEffort, resolveImplementationChildModel } from '../self-dev/dev-cli.js';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
-import { buildRunProgressRows, queryRunningRuns, renderRunProgressTable } from '../self-implement/running-runs.js';
+import { buildRunProgressRows, isPartialRunningRuns, queryRunningRuns, renderRunProgressTable } from '../self-implement/running-runs.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
 import { collectDraftMetrics, collectOverlapMetrics, DRAFT_SWEEP_CONCURRENCY, mapBounded, resolveDraftSweepCloseCap, runDraftSweep, sweepFailureReason, type DraftSweepAdapters, type DraftSweepResult, type OverlapMetricAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from '../self-dev/draft-sweep.js';
 import { readAskPreflightRowsSince, readSalvagedRowsSince } from '../self-dev/ask-launch-io.js';
@@ -34,11 +35,10 @@ import { debug } from '../debug/log.js';
 import { installHarnessSalvageCommand, installHarnessSalvageRetentionCommand } from './harness-salvage-cli.js';
 import { decideNestedElanousLaunch, readNestedElanousDepth } from './nested-elanous-policy.js';
 import { dispatchTask, type DispatchTaskInput, type DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
-import { launchRequestId, preLaunchGate, type PreLaunchGateDeps } from '../execution-loop/launch-gate.js';
+import { harnessLaunchBudgetDecision, launchRequestId, preLaunchGate, resolveLaunchBudget, type PreLaunchGateDeps } from '../execution-loop/launch-gate.js';
 import { PR_LABELS } from '../github/pr-labels.js';
 import { ghAutomationEnv } from '../autopilot/pr-manager.js';
-import { CODEX_PROVIDER, GROK_PROVIDER, decideBudget, decideLaunchBudget, readBudgetInputsLive, type BudgetDecision, type BudgetInputs } from '../self-implement/budget-gate.js';
-import { DEFAULT_FALLBACK_CHAIN } from '../oauth/fallback-chain.js';
+import { decideBudget, readBudgetInputsLive, type BudgetDecision, type BudgetInputs } from '../self-implement/budget-gate.js';
 import { installDeliverableVerifyCliCommand, type InstallDeliverableVerifyCliDeps } from './deliverable-verify-cli.js';
 import { getUserConfig } from '../user-config.js';
 import type { SiblingResyncAdapters, SiblingResyncResult, SiblingRunTarget } from '../self-implement/sibling-resync.js';
@@ -701,7 +701,7 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
     const classified = classifyHarnessPodExit({ status }, output, { ...(runId ? { runId } : {}) });
     recordClassifiedHarnessPodExit(runId ?? harnessPodRunId(output), classified.reason, status,
       { entrance, seat: o.seat, output });
-    recordHarnessPodStop(runId ?? harnessPodRunId(output), status, classified);
+    recordHarnessPodStop(runId ?? harnessPodRunId(output), status, classified, output);
     for (const line of classified.lines) console.error(line);
     process.exitCode = status;
   }
@@ -716,23 +716,60 @@ export function recordHarnessPodStop(
   runId: string | undefined,
   status: number,
   classified: { reason: string; lines: string[] },
-  deps: { loadLedger?: typeof loadRunLedger; record?: typeof recordRunStop } = {},
+  output?: string,
+  deps: { loadLedger?: typeof loadRunLedger; record?: typeof recordRunStop; write?: RunLedgerWriter } = {},
 ): boolean {
   if (!runId) return false;
   try {
     if (runStopRecorded(runId)) return false;
     if ((deps.loadLedger ?? loadRunLedger)(runId)?.some((entry) => entry.event === RUN_STOP_EVENT)) return false;
+    const nextMove = classified.reason === 'no-launch' ? 'Check Pod launch gate and pool, then relaunch'
+      : 'Inspect Pod exit classification and harvest the branch before relaunch';
+    const evidenceRef = `logs:harness.pod/exit-classified:${runId}`;
+    // AUT-POD-EXIT-UNCLASSIFIED ⓑ — only an unclassified exit reads the child output; classified reasons stay byte-identical.
+    const detail = classified.reason === 'unknown' ? podExitDetail(runId, status, output) : undefined;
+    if (detail) {
+      const write = deps.write ?? ((entry: RunLedgerEntry) => appendRunLedgerEntry(entry));
+      (deps.record ?? recordRunStop)({
+        runId, site: 'pod-exit', class: classifyPodExitStop(classified.reason),
+        cause: `Pod exit ${status}: ${detail.podExitClass}${detail.lead ? ` — ${detail.lead}` : ''}`,
+        evidenceRef, nextMove,
+      }, (entry) => write({ ...entry, data: { ...entry.data, podExitClass: detail.podExitClass, tail: detail.tail } }));
+      return true;
+    }
     // The classified line is our own one-line verdict («Pod 안 자식이 실패했다 — OOMKilled»), not the raw output tail.
     const verdict = classified.lines[0]?.split(' — ').slice(1).join(' — ').trim();
     (deps.record ?? recordRunStop)({
       runId, site: 'pod-exit', class: classifyPodExitStop(classified.reason),
       cause: `Pod exit ${status}: ${classified.reason}${verdict ? ` — ${verdict}` : ''}`,
-      evidenceRef: `logs:harness.pod/exit-classified:${runId}`,
-      nextMove: classified.reason === 'no-launch' ? 'Check Pod launch gate and pool, then relaunch'
-        : 'Inspect Pod exit classification and harvest the branch before relaunch',
-    });
+      evidenceRef, nextMove,
+    }, ...(deps.write ? [deps.write] : []));
     return true;
   } catch { return false; /* ledger observation cannot change Pod output or exit */ }
+}
+
+const POD_EXIT_TAIL_LINES = 5;
+const POD_EXIT_TAIL_LINE_CHARS = 240;
+const POD_EXIT_CAUSE_LEAD_CHARS = 160;
+
+/**
+ * The closed Pod exit class ⊕ the last meaningful output lines for an exit the host could not classify.
+ * Empty output is no evidence at all — `unknown` with an empty tail, never a guess. Fail-soft: a throw reads as `unknown`.
+ */
+function podExitDetail(runId: string, status: number, output: string | undefined): { podExitClass: PodExitClass; tail: string[]; lead: string } {
+  let podExitClass: PodExitClass = 'unknown';
+  let tail: string[] = [];
+  if (output?.trim()) {
+    try {
+      const exit = classifyPodExit({ logs: output, containerExitCode: status });
+      podExitClass = exit.class;
+      tail = exit.tail.slice(-POD_EXIT_TAIL_LINES).map((line) => Array.from(line).slice(0, POD_EXIT_TAIL_LINE_CHARS).join(''));
+    } catch { podExitClass = 'unknown'; tail = []; }
+  }
+  // The last meaningful line is where the child died (`Error: ENOSPC …`) — earlier tail lines are context.
+  const lead = Array.from(tail.at(-1) ?? '').slice(0, POD_EXIT_CAUSE_LEAD_CHARS).join('');
+  try { debug.log('harness.pod', 'exit-classified-detail', { runId, podExitClass, tailLines: tail.length }); } catch { /* observation is fail-soft */ }
+  return { podExitClass, tail, lead };
 }
 
 /**
@@ -754,39 +791,7 @@ function refusePodChildProviderBeforeLaunch(resolved: ResolvedHarnessSubstrate, 
   return true;
 }
 
-const LAUNCH_BUDGET_PROVIDER: Readonly<Record<string, string>> = { 'codex-rotate': CODEX_PROVIDER, grok: GROK_PROVIDER };
-
-/**
- * L6 발사 관문의 예산 입력 보정 — 발사 우주의 config 에 체인이 없으면(작업 트리 = 시험 우주) 막지 않고
- * 코드 기본 체인으로 판단한다. `--child-llm-provider` 를 명시했으면 그것이 체인이다(예산 판정 밖 provider 는 통과).
- */
-export function harnessLaunchBudgetDecision(
-  inputs: BudgetInputs,
-  opts: { readonly childLlmProvider?: string; readonly childLlmModel?: string } = {},
-): { readonly decision: BudgetDecision; readonly warning?: string; readonly unmeasuredProvider?: string } {
-  const explicit = opts.childLlmProvider?.trim();
-  const judged = (selected: BudgetInputs) => {
-    const { decision, unmeasuredProvider } = decideLaunchBudget(selected);
-    return { decision, ...(unmeasuredProvider ? { unmeasuredProvider, warning: `budget: ${unmeasuredProvider} usage unmeasured — launching` } : {}) };
-  };
-  if (explicit) {
-    if (explicit !== CODEX_PROVIDER && explicit !== GROK_PROVIDER) {
-      return {
-        decision: { action: 'proceed', provider: explicit, ...(opts.childLlmModel ? { model: opts.childLlmModel } : {}), reasons: [`${explicit}: 명시 provider — 예산 판정 밖`] },
-        warning: `budget: ${explicit} is outside the budget gate — launched as requested`,
-      };
-    }
-    const chain = [{ provider: explicit, ...(opts.childLlmModel ? { model: opts.childLlmModel } : {}) }];
-    return judged({ ...inputs, preference: { ...inputs.preference, chain } });
-  }
-  if (inputs.preference.chain.length > 0) return judged(inputs);
-  const chain = DEFAULT_FALLBACK_CHAIN.map((step) => ({ provider: LAUNCH_BUDGET_PROVIDER[step] ?? step }));
-  const result = judged({ ...inputs, preference: { ...inputs.preference, chain } });
-  return {
-    ...result,
-    warning: `budget: no chain in this universe's config — judged with the code default ${DEFAULT_FALLBACK_CHAIN.join(',')}${result.warning ? ` · ${result.warning}` : ''}`,
-  };
-}
+export { harnessLaunchBudgetDecision } from '../execution-loop/launch-gate.js';
 
 async function readHarnessLaunchBudget(
   opts: { readonly childLlmProvider?: string; readonly childLlmModel?: string } = {},
@@ -1036,8 +1041,12 @@ async function dispatchHarnessAskSay(
     }
     enterJourneyNode('launch-gate', journey);
     const decision = await withJourneyNode('launch-gate', journey, async () => {
-      const budget = await (gate.readBudget ?? (() => readHarnessLaunchBudget(opts)))();
-      return preLaunchGate({ goalId, budget, forceLaunch: opts.forceGate === true }, gate);
+      const { budget, budgetSource, snapshotAgeSec } = await resolveLaunchBudget({
+        provider: opts.childLlmProvider,
+        measureLocal: gate.readBudget ?? (() => readHarnessLaunchBudget(opts)),
+        env: gate.readBudget ? { ELANOUS_SUBSTRATE: 'local' } : process.env,   // an injected budget reader is a host measurement, whatever substrate runs the test
+      });
+      return preLaunchGate({ goalId, budget, budgetSource, ...(snapshotAgeSec !== undefined ? { snapshotAgeSec } : {}), forceLaunch: opts.forceGate === true }, gate);
     });
     exitJourneyNode('launch-gate', { ...journey, outcome: decision.action === 'proceed' ? 'pass' : 'refuse', data: { action: decision.action } });
     if (decision.action !== 'proceed') {
@@ -3195,7 +3204,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
         const nowMs = (deps.progress?.nowMs ?? Date.now)();
         if (opts.json) {
           console.log(JSON.stringify(buildRunProgressRows(result, nowMs)));
-          if (result.completeness === 'partial') console.error(renderRunProgressTable(result, nowMs).split('\n')[0]);
+          if (isPartialRunningRuns(result)) console.error(renderRunProgressTable(result, nowMs).split('\n')[0]);
         } else console.log(renderRunProgressTable(result, nowMs));
       } catch (error) {
         console.error(humanErrorLine(error));

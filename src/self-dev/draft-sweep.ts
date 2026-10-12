@@ -121,7 +121,23 @@ export interface DraftSweepResult {
    * harvestable (review PASS and gate pass), and blocked (must-fix remains).
    */
   daily?: DraftSweepDaily;
+  /**
+   * Same-lineage rule outcomes this tick (DRAFT-SWEEP-LINEAGE-HARVESTABLE): closes it decided (harvestable among them)
+   * and every candidate it let fall through to the older rules, by reason.
+   */
+  lineage?: DraftSweepLineageCounts;
   error?: string;
+}
+
+export interface DraftSweepLineageCounts {
+  closed: number;
+  harvestableClosed: number;
+  fallThrough: Record<string, number>;
+}
+
+/** A review counts as passed only on an observed PASS with no must-fix left. */
+function reviewPassed(posture: SweepReviewGate | undefined): boolean {
+  return posture?.review === 'pass' && posture.mustFix !== true;
 }
 
 /** Daily old-draft census. `date` is the sweep clock's UTC calendar day. */
@@ -769,6 +785,13 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
   let unobserved = 0;
   let claimed = 0;
   let claimExpired = 0;
+  const lineageCounts: DraftSweepLineageCounts = { closed: 0, harvestableClosed: 0, fallThrough: {} };
+  result.lineage = lineageCounts;
+  // Review posture for the harvestable lineage check, reusing the census lookups (one lookup per PR per tick).
+  const postureFor = async (pr: SweepDraft): Promise<SweepReviewGate | undefined> => {
+    if (!reviewGate.has(pr.number)) reviewGate.set(pr.number, await adapters.getReviewGate!(pr, repository));
+    return reviewGate.get(pr.number);
+  };
   for (const listedDraft of drafts) {
     const draft = { ...listedDraft, labels: [...listedDraft.labels], latestFileChanges: latestFileChanges.get(listedDraft.number) };
     let releasedThisTick = false;
@@ -882,7 +905,10 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       ? (now.getTime() - Date.parse(draft.updatedAt)) / 3_600_000 : NaN;
     // A newer open draft of the same goal lineage (a rerun, e.g. a forced requeue) supersedes this one even when
     // its running claim is fresh or its run is still live. Holds, merged twins and the title-based duplicate rule keep their priority.
-    const lineageNewer = contradiction || draft.labels.includes(harvestableLabel) ? undefined : newerLineageDraft(draft, drafts);
+    // DRAFT-SWEEP-LINEAGE-HARVESTABLE (10-12): a harvestable draft is no longer skipped — the skip left 70+ harvestable
+    // reruns open until the 24h idle expiry. It is still protected when its own review passed and the newer one's did not.
+    const harvestable = draft.labels.includes(harvestableLabel);
+    const lineageNewer = contradiction ? undefined : newerLineageDraft(draft, drafts);
     if (lineageNewer) {
       const base = decideDraft({ draft, runStatus, mergedTwins: merged, openDrafts: drafts, liveBranches,
         finalRunResult, ageHours: runStatus ? ageHours : idleHours });
@@ -895,9 +921,24 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
         // Every lineage outcome that does not close falls through to the existing rules (preservation contract):
         // a duplicate this rule cannot settle is decided exactly as it was before this rule existed.
         const fallThrough = (why: string) => {
-          try { debug.log('self-dev.draft-sweep', 'lineage-fall-through', { number: draft.number, newer: lineageNewer.number, lineageKey, why }); } catch { /* fail-soft */ }
+          lineageCounts.fallThrough[why] = (lineageCounts.fallThrough[why] ?? 0) + 1;
+          try { debug.log('self-dev.draft-sweep', 'lineage-fall-through', { number: draft.number, newer: lineageNewer.number, lineageKey, why, harvestable }); } catch { /* fail-soft */ }
         };
-        if (runLive && !adapters.supersedeRun) fallThrough('lineage-duplicate-run-live');
+        // A harvestable draft yields only to a newer draft at least as complete: an observed review PASS on the old one
+        // is kept unless the newer one passed review too. Unobservable review posture keeps the old draft (fail-closed).
+        let harvestProtection: string | undefined;
+        if (harvestable) {
+          if (!adapters.getReviewGate) harvestProtection = 'lineage-harvestable-review-unobserved';
+          else {
+            try {
+              const [oldPosture, newPosture] = [await postureFor(draft), await postureFor(lineageNewer)];
+              if (oldPosture === undefined) harvestProtection = 'lineage-harvestable-review-unobserved';
+              else if (reviewPassed(oldPosture) && !reviewPassed(newPosture)) harvestProtection = 'lineage-harvestable-review-pass-protected';
+            } catch { harvestProtection = 'lineage-harvestable-review-unobserved'; }
+          }
+        }
+        if (harvestProtection) fallThrough(harvestProtection);
+        else if (runLive && !adapters.supersedeRun) fallThrough('lineage-duplicate-run-live');
         // Safety (OP 10-11): a live run is stopped only when the newer run of the same lineage is itself live —
         // never trade a running attempt for one that already ended or was never observed running.
         else if (runLive && !live(statuses.get(lineageNewer.number), lineageNewer.branch)) fallThrough('lineage-newer-run-not-live');
@@ -921,6 +962,8 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
           else {
             // A close is counted against the cap only once it is decided here; a failed write gives the slot back.
             closes += 1;
+            lineageCounts.closed += 1;
+            if (harvestable) lineageCounts.harvestableClosed += 1;
             const entry: DraftSweepEntry = { number: draft.number, action: 'close', reason, statusLabel: supersededLabel, applied: false };
             record(entry);
             if (!apply) continue;
@@ -937,7 +980,11 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
               entry.applied = true;
             } catch (error) {
               if (labelsChanged) entry.partialApplied = true;
-              else closes -= 1;
+              else {
+                closes -= 1;
+                lineageCounts.closed -= 1;
+                if (harvestable) lineageCounts.harvestableClosed -= 1;
+              }
               entry.error = String(error);
             }
             continue;
@@ -1052,6 +1099,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     }
   }
   timing('decide', drafts.length);
+  try { debug.log('self-dev.draft-sweep', 'lineage-summary', { ...lineageCounts, apply }); } catch { /* fail-soft */ }
   try { debug.log('self-dev.draft-sweep', 'timing', { phase: 'total', ms: Date.now() - started, count: drafts.length, closed: closes, closeCap, closeCapSource }); } catch { /* fail-soft */ }
   result.unobserved = unobserved;
   // `closed` stays «closed by this sweep»; replay closes only consume the shared cap (alreadyClosed).

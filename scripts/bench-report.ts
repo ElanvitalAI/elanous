@@ -13,6 +13,7 @@
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { dedupePodRollupRows } from './usage-rollup.js';
 
 export interface LogRow { category?: string; event?: string; data?: Record<string, unknown> | null }
 export interface ArmDecl { id: string; provider: string; model: string | null }
@@ -38,6 +39,40 @@ export interface ArmReport {
   gatePassed: boolean | null;
   reviewVerdict: string | null;
   reviewMustFixCount: number | null;
+}
+
+export interface ProbeJudgment {
+  model: string;
+  runs: number;
+  passed: number;
+  failed: number;
+  unmeasured: number;
+  verdict: 'pass' | 'fail' | 'unmeasured';
+}
+
+export function judgeProbe(
+  arms: readonly ArmReport[],
+  opts?: { passNumerator?: number; passDenominator?: number },
+): ProbeJudgment[] {
+  const passNumerator = opts?.passNumerator ?? 8;
+  const passDenominator = opts?.passDenominator ?? 9;
+  const groups = new Map<string, { runs: number; passed: number; failed: number; unmeasured: number }>();
+  for (const arm of arms) {
+    const model = arm.declared?.model ?? '못 이음';
+    const group = groups.get(model) ?? { runs: 0, passed: 0, failed: 0, unmeasured: 0 };
+    group.runs++;
+    if (arm.gatePassed === null || arm.leakCalls === null) group.unmeasured++;
+    else if (arm.gatePassed === true && arm.leakCalls === 0) group.passed++;
+    else group.failed++;
+    groups.set(model, group);
+  }
+  return [...groups].map(([model, counts]) => ({
+    model,
+    ...counts,
+    verdict: counts.unmeasured > 0
+      ? 'unmeasured'
+      : counts.passed * passDenominator >= counts.runs * passNumerator ? 'pass' : 'fail',
+  }));
 }
 
 const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
@@ -99,7 +134,8 @@ export function buildBenchReport(rows: readonly LogRow[], runId: string): { runI
     a.reviewMustFixCount = typeof r.data!.reviewMustFixCount === 'number' ? r.data!.reviewMustFixCount : null;
   }
   const leak = new Map<string, number>();
-  for (const r of mine) {
+  // ⭐ METER-POD-ROLLUP-GAP-2 — 같은 Pod 의 재방출(부분 ⊕ 최종 · abort ⊕ resume)은 podRollupKey 로 한 번만 센다(팔 사용량 이중계상 방지).
+  for (const r of dedupePodRollupRows(mine, (row) => (row.event === 'llm-usage' ? row.data ?? {} : {}))) {
     if (r.event !== 'llm-usage') continue;
     const site = str(r.data!.site);
     const id = str(r.data!.armId);
@@ -203,6 +239,15 @@ export function renderBenchReport(rep: ReturnType<typeof buildBenchReport>): str
   lines.push(leaked.length
     ? `⛔ 팔 밖 모델로 간 호출이 있다(${leaked.join(', ')}) — 이 판으로 팔을 비교하지 않는다.`
     : '⛔ 한 판(팔당 N=1)이다 — 결론이 아니라 관측이다. 비교는 팔마다 표본이 쌓인 뒤에.');
+  const probe = judgeProbe(rep.arms);
+  lines.push(
+    '',
+    '## 프로브 판정',
+    '',
+    '| 모델 | 통과/런 | 판정 |',
+    '|---|---:|---|',
+    ...probe.map((row) => `| ${row.model} | ${row.passed}/${row.runs} | ${row.verdict} |`),
+  );
   return lines.join('\n');
 }
 

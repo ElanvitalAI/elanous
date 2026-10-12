@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as yaml } from 'yaml';
 import { decideGraphApproval, runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
+import { collectGraphEvents } from '../../src/graph-runner/graph-notify.js';
 import { runPrLand as realRunPrLand } from '../../src/cli/pr-cli.js';
 import { ClaimsLedger } from '../../src/claims/claims-ledger.js';
 import { addItem, setItem } from '../../src/release-loop/checklist.js';
@@ -358,16 +359,66 @@ test('0.2.14 published graph executes the real story recipe into the isolated re
   } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 });
 
-test('graph recipes carry start notices and measured long-node timeouts', () => {
-  const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as { nodes: Array<{ node_id: string; notify?: string; max_visits: number }> };
+type GraphNotifySetting = boolean | string | { on?: string | string[]; enabled?: boolean };
+type ReleaseGraphNode = { node_id: string; notify?: GraphNotifySetting; max_visits: number };
+
+const GRAPH_NOTIFY_KNOWN = new Set(['always', 'all', 'node', 'ok', 'fail', 'success', 'failure', 'approval']);
+
+function notifyOnValues(notify: GraphNotifySetting | undefined): string[] {
+  if (notify === undefined || typeof notify === 'boolean') return [];
+  if (typeof notify === 'string') return [notify];
+  if (notify.on === undefined) return [];
+  return Array.isArray(notify.on) ? notify.on : [notify.on];
+}
+
+test('graph recipes carry fail notices and measured long-node timeouts', () => {
+  const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as { nodes: ReleaseGraphNode[] };
   const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { timeout_ms?: number; command?: string; approval?: string }>;
   for (const node of graph.nodes) expect(node.max_visits).toBe(1);
-  expect(graph.nodes.filter((node) => node.notify === 'start').map((node) => node.node_id)).toEqual(['gate', 'pwa', 'prepare']);
+  expect(graph.nodes.filter((node) => notifyOnValues(node.notify).length > 0 && notifyOnValues(node.notify).every((value) => value === 'fail')).map((node) => node.node_id)).toEqual(['gate', 'pwa', 'prepare']);
   expect(recipes.gate?.timeout_ms).toBe(14_400_000);
   expect(recipes.pwa?.timeout_ms).toBe(1_800_000);
   expect(recipes.prepare?.timeout_ms).toBe(1_800_000);
   expect(recipes.publish?.approval).toContain('되돌릴 수 없다');
   expect(recipes['publish-command']?.command).toContain('publish-node.ts');
+});
+
+test('publish and verify notify on ok and fail, and no node uses an unknown notify value', () => {
+  const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as { nodes: ReleaseGraphNode[] };
+  for (const id of ['publish', 'verify'] as const) {
+    const values = notifyOnValues(graph.nodes.find((node) => node.node_id === id)?.notify);
+    expect(values).toContain('ok');
+    expect(values).toContain('fail');
+  }
+  for (const node of graph.nodes) {
+    for (const value of notifyOnValues(node.notify)) {
+      expect(GRAPH_NOTIFY_KNOWN.has(value)).toBe(true);
+    }
+  }
+  expect(graph.nodes.some((node) => notifyOnValues(node.notify).includes('start'))).toBe(false);
+});
+
+test('collectGraphEvents emits exactly one publish event for a fake publish-ok run', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-publish-notify-'));
+  try {
+    const graphsDir = join(root, 'graphs');
+    mkdirSync(graphsDir);
+    writeFileSync(join(graphsDir, 'release-loop.yaml'), readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8'));
+    const runDir = join(root, 'graph-runs', 'release-loop');
+    mkdirSync(runDir, { recursive: true });
+    const runId = 'run-publish-ok';
+    const statePath = join(runDir, `${runId}.json`);
+    const state: GraphRunState = {
+      graphId: 'release-loop', runId, status: 'done', path: ['publish'],
+      nodes: [{ nodeId: 'publish', ok: true, exit: 0, executed: true }],
+      executed: 1, dryRun: false, statePath,
+    };
+    writeFileSync(statePath, JSON.stringify(state));
+    const events = collectGraphEvents({ root, graphsDir });
+    expect(events).toHaveLength(1);
+    expect(events.filter((event) => event.nodeId === 'publish')).toHaveLength(1);
+    expect(events[0]).toMatchObject({ graphId: 'release-loop', nodeId: 'publish', kind: 'node', status: 'ok' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('measured graph decision publishes without human approval', async () => {

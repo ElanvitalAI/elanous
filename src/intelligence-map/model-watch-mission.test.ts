@@ -100,6 +100,61 @@ describe('runModelIntelligenceWatch', () => {
     }
   });
 
+  test('reports a catalog price change as a log line while the ledger record keeps its keys', async () => {
+    const temp = temporaryHome();
+    const events: Array<{ event: string; data: unknown }> = [];
+    try {
+      writeCatalog(temp.home, [{
+        id: 'priced-model', provider: 'openai', family: 'gpt', contextWindow: 1000,
+        inputPerMtok: 5, outputPerMtok: 15, local: false, tags: [], bestFor: [],
+        classification: { source: 'manual' },
+      }]);
+      await runModelIntelligenceWatch({
+        fetchPages: async () => [{ source: 'pricing', text: 'pricing page' }],
+        runLlm: async () => JSON.stringify({
+          models: [{ id: 'priced-model', provider: 'openai', inputPerMtok: 2.5, outputPerMtok: 15 }],
+        }),
+        log: (_category, event, data) => { events.push({ event, data }); },
+      }, { home: temp.home });
+
+      const change = events.find(({ event }) => event === 'price-changes');
+      expect(change?.data).toMatchObject({
+        changes: [{ id: 'priced-model', field: 'inputPerMtok', before: 5, after: 2.5 }],
+        line: 'Price changes vs catalog: priced-model input $5→$2.5 /Mtok',
+      });
+      const record = JSON.parse(readFileSync(getModelWatchProposalPath(temp.home), 'utf8'));
+      expect(Object.keys(record)).toEqual(['ts', 'added', 'updated', 'candidates', 'perSource']);
+    } finally {
+      temp.dispose();
+    }
+  });
+
+  test('emits no price-changes event for an unpriced catalog entry or an unchanged price', async () => {
+    const temp = temporaryHome();
+    const events: string[] = [];
+    try {
+      writeCatalog(temp.home, [
+        { id: 'unpriced', provider: 'openai', family: 'gpt', contextWindow: 1, inputPerMtok: 0, outputPerMtok: 0, local: false, tags: [], bestFor: [], classification: { source: 'manual' } },
+        { id: 'same', provider: 'openai', family: 'gpt', contextWindow: 1, inputPerMtok: 3, outputPerMtok: 9, local: false, tags: [], bestFor: [], classification: { source: 'manual' } },
+      ]);
+      await runModelIntelligenceWatch({
+        fetchPages: async () => [{ source: 'pricing', text: 'pricing page' }],
+        runLlm: async () => JSON.stringify({
+          models: [
+            { id: 'unpriced', provider: 'openai', inputPerMtok: 1, outputPerMtok: 2 },
+            { id: 'same', provider: 'openai', inputPerMtok: 3, outputPerMtok: 9 },
+          ],
+        }),
+        log: (_category, event) => { events.push(event); },
+      }, { home: temp.home });
+
+      expect(events).toContain('pass');
+      expect(events).not.toContain('price-changes');
+    } finally {
+      temp.dispose();
+    }
+  });
+
   test('isolates synchronous and asynchronous logger failures while returning the intake result', async () => {
     const temp = temporaryHome();
     let calls = 0;

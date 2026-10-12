@@ -7,16 +7,19 @@ import { debug } from '../debug/log.js';
 import { PR_LABELS } from '../github/pr-labels.js';
 import { appendRunLedgerEntry, listRunLedgers, loadRunLedger, runLedgerDir, type RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
+import { clipRegateDetail, regateFailureFacts, type HostRegateFailure } from '../self-implement/regate-detail.js';
 import { DRAFT_SWEEP_CLOSE_CAP } from './draft-sweep.js';
 import { PROTECTED_LABELS, sameVerifiedGoal, type DraftTriagePr } from './draft-triage-rules.js';
 
-export type PodTerminalClass = 'landed' | 'merge-ready-not-merged' | 'failed-with-pr' | 'failed-no-pr' | 'failed-pr-unobserved';
+export type PodTerminalClass = 'landed' | 'merge-ready-not-merged' | 'failed-with-pr' | 'failed-no-pr' | 'failed-pr-unobserved' | 'timed-out-harvestable';
 export interface PrTerminalRecord {
   childRunId: string;
   prNumber: number | null;
   prUrl: string | null;
   repository: string | null;
   headSha: string | null;
+  /** Copied from disposition.branch when present; null when the child did not name a branch. */
+  branch?: string | null;
   terminalClass: PodTerminalClass;
   stage: string | null;
   owner: string;
@@ -24,13 +27,16 @@ export interface PrTerminalRecord {
   card: string | null;
   at: string;
   /** Which host-regate gate failed and why — null for every other terminal. */
-  hostRegateFailure: { step: string; detail: string; os: string } | null;
+  /** HOST-REGATE-REASON-LOST: detail keeps a bounded head ⊕ tail (4KB); pr-head · merge steps add the expected/actual
+   *  head, merge-conflict adds the conflicted files, merge adds the failure kind (race · moved head · conflict · policy). */
+  hostRegateFailure: (HostRegateFailure & { os: string }) | null;
 }
 export interface PodTerminalInput {
   childRunId: string;
   state: 'complete' | 'failed' | 'aborted';
   disposition?: { prNumber?: number | null; prUrl?: string | null; checkedHeadCommit?: string | null; stage?: string; merged?: boolean; ok?: boolean;
-    hostRegate?: { passed: boolean; failures: Array<{ step: string; detail: string }>; os: string } | null } | null;
+    branch?: string | null;
+    hostRegate?: { passed: boolean; failures: HostRegateFailure[]; os: string } | null } | null;
   env?: Readonly<Record<string, string | undefined>>;
   prBody?: string;
   goalText?: string;
@@ -47,6 +53,7 @@ export function classifyPodTerminal(input: PodTerminalInput): PrTerminalRecord {
   const prUrl = typeof d?.prUrl === 'string' ? d.prUrl : null;
   const match = prUrl && /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)\/?$/.exec(prUrl);
   const repository = match && Number(match[3]) === prNumber ? `${match[1]}/${match[2]}` : null;
+  const branch = typeof d?.branch === 'string' && d.branch.trim() ? d.branch.trim() : null;
   const card = cardOf(input.prBody) ?? cardOf(input.goalText);
   const seat = input.env?.ELANOUS_HARNESS_SEAT;
   const ownerSource = seat === 'OP' || seat === 'TC' || seat === 'MK' || seat === 'UX' ? 'seat' : card ? 'card' : 'unknown';
@@ -55,14 +62,16 @@ export function classifyPodTerminal(input: PodTerminalInput): PrTerminalRecord {
   const hostRegateFailure = d?.stage === 'host-regate-failed' && hostRegate?.passed === false
     ? { step: typeof firstFailure?.step === 'string' && firstFailure.step ? firstFailure.step : 'unknown',
       detail: typeof firstFailure?.detail === 'string' && firstFailure.detail
-        ? firstFailure.detail.split(/\s+/).filter(Boolean).join(' ').slice(0, 300)
+        ? clipRegateDetail(firstFailure.detail.split(/\s+/).filter(Boolean).join(' '))
         : 'failures empty',
+      ...regateFailureFacts(firstFailure),
       os: hostRegate.os }
     : null;
   return {
-    childRunId: input.childRunId, prNumber, prUrl, repository,
+    childRunId: input.childRunId, prNumber, prUrl, repository, branch,
     headSha: typeof d?.checkedHeadCommit === 'string' && /^[a-f0-9]{40}$/i.test(d.checkedHeadCommit) ? d.checkedHeadCommit : null,
     terminalClass: !d ? 'failed-pr-unobserved' : d.merged === true ? 'landed'
+      : prNumber === null && d.stage === 'timed-out' && branch ? 'timed-out-harvestable'
       : prNumber === null ? 'failed-no-pr'
         : input.state === 'complete' && d.ok !== false ? 'merge-ready-not-merged' : 'failed-with-pr',
     stage: d?.stage ?? null, hostRegateFailure,
@@ -282,7 +291,7 @@ export async function replayPodTerminals(options: DraftResidueReplayOptions = {}
     for (const terminal of terminals) {
       const record = terminal.data as unknown as PrTerminalRecord;
       if (typeof record.childRunId !== 'string' || typeof record.owner !== 'string'
-        || !['landed', 'merge-ready-not-merged', 'failed-with-pr', 'failed-no-pr', 'failed-pr-unobserved'].includes(record.terminalClass)
+          || !['landed', 'merge-ready-not-merged', 'failed-with-pr', 'failed-no-pr', 'failed-pr-unobserved', 'timed-out-harvestable'].includes(record.terminalClass)
         || (record.prNumber !== null && (!Number.isSafeInteger(record.prNumber) || record.prNumber <= 0))
         || (record.repository !== null && (typeof record.repository !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(record.repository)))) {
         throw new Error(`Invalid terminal record: ${ledgerRunId}`);
@@ -338,6 +347,7 @@ export async function applyPodTerminal(record: PrTerminalRecord, ctx: DraftResid
       adapters.appendLedger({ runId: ctx.ledgerRunId, event: 'pr-terminal', data: { ...record } }, ctx.ledgerDir);
       log('terminal-recorded');
     }
+    // AUT-TIMEOUT-NO-HARVEST 첫 조각은 «분류만» — 그 branch 로 PR 을 여는 효과는 다음 조각(원격 가지 존재·기존 PR 확인 관문과 함께).
     if (record.terminalClass === 'failed-no-pr' || record.terminalClass === 'failed-pr-unobserved' || record.prNumber === null) {
       acknowledge('complete', 0);
       return skipped(record.terminalClass);

@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test';
-import { buildEssentialMessage } from './morning-essential.js';
+import { buildEssentialMessage, synthesizeEssentialBrief, type EssentialSynthOpts } from './morning-essential.js';
 import type { MorningSources } from './morning-synthesis.js';
 
 function fakeSources(over: Partial<MorningSources> = {}): MorningSources {
@@ -110,5 +110,46 @@ describe('morning-essential — buildEssentialMessage', () => {
     expect(msg.indexOf('🎯 *결론*')).toBeLessThan(msg.indexOf('📊 *매력도 Δ*'));
     expect(msg.indexOf('📊 *매력도 Δ*')).toBeLessThan(msg.indexOf('🗺 *섹터순환*'));
     expect(msg.indexOf('🗺 *섹터순환*')).toBeLessThan(msg.indexOf('🇺🇸 *미국장*'));
+  });
+});
+
+describe('synthesizeEssentialBrief model seam (SWAP-BENCH-CRON 첫 조각)', () => {
+  type ProviderFor = NonNullable<EssentialSynthOpts['providerFor']>;
+  const fakeProvider = (text: string) => ({
+    name: 'fake',
+    async *streamChat() { yield { type: 'text' as const, delta: text }; },
+  }) as unknown as ReturnType<ProviderFor>;
+
+  test('ⓐ opts.model 이면 주입 providerFor 가 그 model 을 받고 스트림 텍스트가 trim 되어 돌아온다', async () => {
+    const seen: (string | undefined)[] = [];
+    const out = await synthesizeEssentialBrief('# 상세', {
+      model: 'z-ai/glm-5.3-flash',
+      available: () => true,
+      providerFor: (_cfg, model) => { seen.push(model); return fakeProvider('  [관전] 반도체 강세.  \n'); },
+    });
+    expect(seen).toEqual(['z-ai/glm-5.3-flash']);
+    expect(out).toBe('[관전] 반도체 강세.');
+  });
+
+  test('ⓑ model 없으면 providerFor 둘째 인자는 undefined(지금과 같은 기본 경로)', async () => {
+    const calls: unknown[][] = [];
+    const out = await synthesizeEssentialBrief('# 상세', {
+      available: () => true,
+      providerFor: (...args) => { calls.push(args); return fakeProvider('서사'); },
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]![1]).toBeUndefined();
+    expect(out).toBe('서사');
+  });
+
+  test('ⓒ available()=false 면 provider 를 부르지 않고 빈 문자열', async () => {
+    let called = 0;
+    const out = await synthesizeEssentialBrief('# 상세', {
+      model: 'z-ai/glm-5.3-flash',
+      available: () => false,
+      providerFor: () => { called++; return fakeProvider('x'); },
+    });
+    expect(out).toBe('');
+    expect(called).toBe(0);
   });
 });

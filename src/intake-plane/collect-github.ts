@@ -29,6 +29,9 @@ export const DEFAULT_GITHUB_STAR_DAYS = 30;
  */
 export const DEFAULT_GITHUB_STAR_PER_QUERY = 20;
 
+/** 하루당 별 증가 상위 이 개수 행만 README 를 싣고 `surge.score` 를 받는다. */
+const GITHUB_SURGE_TOP = 3;
+
 export interface GithubStarRepo {
   fullName: string;
   url: string;
@@ -223,7 +226,7 @@ export async function collectGithubStars(
   }).sort((a, b) => (b.starsPerDay ?? -Infinity) - (a.starsPerDay ?? -Infinity) || b.stars - a.stars);
   const readmes = new Map<string, string>();
   if (!opts.dryRun) {
-    for (const row of repos.slice(0, 3)) {
+    for (const row of repos.slice(0, GITHUB_SURGE_TOP)) {
       try {
         readmes.set(row.repo, `README:\n${(await (opts.fetchReadme ?? ghApiFetchReadme)(row.repo)).slice(0, 1_500)}`);
       } catch {
@@ -231,7 +234,7 @@ export async function collectGithubStars(
       }
     }
   }
-  const raws: RawIntakeItem[] = repos.map((row) => ({
+  const raws: RawIntakeItem[] = repos.map((row, rank) => ({
     url: row.url,
     title: row.title,
     // 모든 행 첫 줄에 라이선스: SPDX · 확인된 부재는 «없음» · 응답이 알려 주지 않으면 «미상»(없음으로 읽지 않는다).
@@ -240,6 +243,8 @@ export async function collectGithubStars(
       stars: row.stars,
       ...(row.starsDelta !== undefined ? { starsDelta: row.starsDelta } : {}),
       ...(row.starsPerDay !== undefined ? { starsPerDay: row.starsPerDay } : {}),
+      // 급등 상위 3 행(README 를 싣는 그 셋)만 1위 3 · 2위 2 · 3위 1 — pickAbsorbQueue 가 `.score` 로 앞세운다.
+      ...(rank < GITHUB_SURGE_TOP ? { 'surge.score': GITHUB_SURGE_TOP - rank } : {}),
     },
   }));
   const result: CollectGithubResult = {

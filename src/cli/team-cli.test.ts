@@ -31,7 +31,7 @@ async function validate(file: string): Promise<{ code: number; output: string[];
   } finally {
     console.log = log;
     console.error = error;
-    process.exitCode = previous;
+    process.exitCode = previous ?? 0;
   }
 }
 

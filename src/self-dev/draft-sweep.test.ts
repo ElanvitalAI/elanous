@@ -1343,6 +1343,78 @@ describe('runDraftSweep — lineage key (forceRequeue duplicates)', () => {
     expect(mutations(held.calls)).toEqual([]);
   });
 
+  // DRAFT-SWEEP-LINEAGE-HARVESTABLE (10-12): the lineage rule used to skip every harvestable draft.
+  describe('harvestable drafts', () => {
+    const harvestable = PR_LABELS.find((entry) => entry.name === 'elanous:harvestable')!.name;
+    // Closes and superseded labels only — the pre-existing stalled marking of an ended run is not this rule's business.
+    const supersedes = (calls: string[]) => calls.filter((call) => call.startsWith('close:') || call.endsWith(`=>${superseded}`));
+    const withReviews = (postures: Record<number, SweepReviewGate | undefined>) => {
+      const fixture = make([older({ labels: [harvestable] }), newer({ labels: [harvestable] })]);
+      fixture.statuses.set(1, 'self-implement.result final');
+      fixture.adapters.getReviewGate = async (pr) => postures[pr.number];
+      return fixture;
+    };
+
+    it('a harvestable draft with a newer same-lineage PR is classified duplicate-of-open', async () => {
+      const fixture = withReviews({ 1: {}, 2: {} });
+      const log = spyOn(debug, 'log').mockImplementation(() => {});
+      try {
+        const result = await sweep(fixture.adapters, true);
+        expect(result.entries[0]).toMatchObject({ number: 1, action: 'close', reason: 'duplicate-of-open #2 (lineage goalid:abc)', statusLabel: superseded, applied: true });
+        expect(supersedes(fixture.calls)).toEqual([
+          `label:1:=>${superseded}`,
+          'close:1:Draft sweep: duplicate-of-open #2 (lineage goalid:abc) (https://github.com/owner/repo/pull/2). Branch preserved.',
+        ]);
+        expect(result.lineage).toEqual({ closed: 1, harvestableClosed: 1, fallThrough: {} });
+        expect(log).toHaveBeenCalledWith('self-dev.draft-sweep', 'lineage-summary', { closed: 1, harvestableClosed: 1, fallThrough: {}, apply: true });
+      } finally { log.mockRestore(); }
+    });
+
+    it('closes an older review-pass draft when the newer one passed review too', async () => {
+      const result = await sweep(withReviews({ 1: { review: 'pass', gate: 'pass' }, 2: { review: 'pass' } }).adapters);
+      expect(result.entries[0]).toMatchObject({ number: 1, action: 'close', reason: 'duplicate-of-open #2 (lineage goalid:abc)' });
+    });
+
+    it('protects an older review-pass draft whose newer rerun has not passed review (falls through to the harvestable rule)', async () => {
+      for (const newerPosture of [undefined, {}, { review: 'fail' as const }, { review: 'pass' as const, mustFix: true }]) {
+        const fixture = withReviews({ 1: { review: 'pass', gate: 'pass' }, 2: newerPosture });
+        const result = await sweep(fixture.adapters, true);
+        expect(result.entries[0]).toMatchObject({ number: 1, action: 'keep', reason: 'harvestable' });
+        expect(result.lineage).toEqual({ closed: 0, harvestableClosed: 0, fallThrough: { 'lineage-harvestable-review-pass-protected': 1 } });
+        expect(supersedes(fixture.calls)).toEqual([]);
+      }
+    });
+
+    it('keeps a harvestable draft whose review posture cannot be observed (fail-closed)', async () => {
+      const absent = make([older({ labels: [harvestable] }), newer({ labels: [harvestable] })]);
+      absent.statuses.set(1, 'self-implement.result final');
+      const noAdapter = await sweep(absent.adapters, true);
+      expect(noAdapter.entries[0]).toMatchObject({ number: 1, action: 'keep', reason: 'harvestable' });
+      expect(noAdapter.lineage?.fallThrough).toEqual({ 'lineage-harvestable-review-unobserved': 1 });
+      const unread = await sweep(withReviews({ 2: { review: 'pass' } }).adapters, true);
+      expect(unread.entries[0]).toMatchObject({ number: 1, action: 'keep', reason: 'harvestable' });
+      const throwing = withReviews({});
+      throwing.adapters.getReviewGate = async () => { throw new Error('gh down'); };
+      expect((await sweep(throwing.adapters, true)).entries[0]).toMatchObject({ number: 1, action: 'keep', reason: 'harvestable' });
+    });
+
+    it('still leaves held, bench and other-goal harvestable drafts alone, and spends the close cap', async () => {
+      const bench = PR_LABELS.find((entry) => entry.name === 'elanous:bench')!.name;
+      for (const extra of [keep, bench, RELEASE_PATH_LABEL]) {
+        const held = make([older({ labels: [harvestable, extra] }), newer()]);
+        held.adapters.getReviewGate = async () => ({});
+        expect((await sweep(held.adapters, true)).entries[0]?.reason).toBe(`label:${extra}`);
+        expect(supersedes(held.calls)).toEqual([]);
+      }
+      const other = withReviews({ 1: {}, 2: {} });
+      const otherGoal = make([older({ labels: [harvestable] }), newer({ branch: 'self-impl/goalid-def-bar-22222222-rbbbbbb' })]);
+      otherGoal.adapters.getReviewGate = other.adapters.getReviewGate;
+      expect((await sweep(otherGoal.adapters)).entries[0]?.reason).not.toContain('lineage');
+      const capped = await runDraftSweep({ repository: 'owner/repo', adapters: withReviews({ 1: {}, 2: {} }).adapters, now, closeCap: 1, alreadyClosed: 1 });
+      expect(capped.entries[0]).toMatchObject({ number: 1, action: 'keep', reason: 'close-cap' });
+    });
+  });
+
   it('derives one stable lineage key across run suffixes and reworded features', () => {
     expect(branchLineageKey('self-impl/goalid-ABC-foo-11111111-raaaaaa')).toBe('goalid:abc');
     expect(branchLineageKey('self-impl/goalid-abc-other-words-99999999')).toBe('goalid:abc');

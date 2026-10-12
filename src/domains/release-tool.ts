@@ -21,6 +21,7 @@ export const RELEASE_STATUS_SPEC: LLMToolSpec = {
     + 'topic=cell: id 칸 하나의 상태·근거와 살핀 판.\n'
     + 'topic=schedule: 발행 이후 판의 컷·착지·발행·동결 일정.\n'
     + 'topic=ops: 도는 런·발행·늦은 스케줄·자리·열린 결정의 출처 있는 개관.\n'
+    + 'topic 과 action 을 동시에 쓰지 않는다 — 둘 중 하나만: topic 은 읽을 대상, action 은 짧은 요약.\n'
     + '발행·버전·피처·체크리스트·칸·컷·일정·운영 상태 질문은 Grep·ListDir·파일 검색보다 이 도구를 먼저 부른다 — 그 답은 파일이 아니라 원장에 있다.',
   parameters: { type: 'object', properties: {
     version: { type: 'string', description: '조회할 판. 생략하면 개발 판과 다음 판.' },
@@ -121,6 +122,9 @@ function cellView(item: ChecklistItem) {
 export function dispatchReleaseStatus(args: Record<string, unknown>, deps: ReleaseToolDeps = {}): { text: string; structured: Record<string, unknown> } {
   const topic = args.topic === undefined ? 'status' : args.topic;
   if (typeof topic !== 'string' || !['status', 'features', 'cell', 'schedule', 'ops'].includes(topic)) throw new Error('topic 은 status, features, cell, schedule, ops 중 하나');
+  if (args.topic !== undefined && args.action !== undefined) {
+    throw new Error(`topic 과 action 을 동시에 보낼 수 없습니다 — 둘 중 하나만: topic=${topic} 는 읽을 대상, action 은 짧은 요약(schedule·blocked·landed)`);
+  }
   const requested = args.version;
   if (requested !== undefined && (typeof requested !== 'string' || !requested.trim())) throw new Error('판 이름이 필요합니다');
   const checklist = deps.checklist ?? listChecklist;

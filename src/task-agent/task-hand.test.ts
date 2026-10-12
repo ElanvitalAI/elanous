@@ -106,7 +106,7 @@ test('live handTask 는 카드 라벨 맥락을 기존 launcher 호출에 싣고
   const calls: Array<{ args: string[]; cwd?: string; context?: TaskLaunchContext }> = [];
   const result = await handTask({
     id: 'ta-20261009-label01', text: '  write report  ', completion: 'research-report',
-    project: { id: 'p1', target }, seat: 'TC', live: true, statePath: path,
+    project: { id: 'p1', target }, seat: 'TC', checklistId: 'CELL-1', live: true, statePath: path,
     launcher: (args, cwd, context) => { calls.push({ args, cwd, context }); return { runId: context!.runId }; },
   });
   expect(calls).toHaveLength(1);
@@ -114,7 +114,7 @@ test('live handTask 는 카드 라벨 맥락을 기존 launcher 호출에 싣고
   expect(calls[0]!.cwd).toBe(target);
   expect(calls[0]!.context).toMatchObject({
     cardLabelContext: { cardId: result.card.id, labels: { [TASK_CARD_LABEL]: result.card.id } },
-    env: { ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: result.card.id },
+    env: { ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: result.card.id, ELANOUS_POD_SLOT_ID: 'CELL-1', ELANOUS_POD_OWNER_KIND: 'seat', ELANOUS_POD_OWNER_ID: 'TC' },
   });
   expect(calls[0]!.context!.launchId).toStartWith('tl-');
   expect(result).toMatchObject({ mode: 'live', launched: true, cwd: target, move: { kind: 'launch', command: calls[0]!.args }, card: { status: 'launched', runId: calls[0]!.context!.runId, launchId: calls[0]!.context!.launchId } });

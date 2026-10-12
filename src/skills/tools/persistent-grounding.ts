@@ -153,6 +153,16 @@ function rejectionSample(value: string): string {
   return value.slice(0, EVIDENCE_REJECTION_SAMPLE_PREFIX_LENGTH);
 }
 
+function stripLeadingListMarkers(line: string): string {
+  let stripped = line;
+  let previous: string;
+  do {
+    previous = stripped;
+    stripped = stripped.replace(/^\s*(?:[-*+•]|\d+[.)])\s+/, '');
+  } while (stripped !== previous);
+  return stripped;
+}
+
 function verifiedEvidenceFromCompletion(evidence: string, readFiles: Set<string>): { files: string[]; evidence: string[]; rejection: EvidenceRejection } {
   const lines = evidence.split(/\r?\n/).filter((line) => line.trim());
   const rejection: {
@@ -185,7 +195,7 @@ function verifiedEvidenceFromCompletion(evidence: string, readFiles: Set<string>
     return hasPath && insideRoot && unreadPaths.length === 0 && hasMeaningfulText;
   });
   const files = Array.from(new Set(verifiedLines.flatMap(repositoryRelativeCodePaths)));
-  return { files, evidence: verifiedLines, rejection };
+  return { files, evidence: verifiedLines.map(stripLeadingListMarkers), rejection };
 }
 
 function groundingMessages(goal: string, terms: readonly string[]): LLMMessage[] {

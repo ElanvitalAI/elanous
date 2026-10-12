@@ -9,6 +9,7 @@ import { writeQuotaSignal } from '../budget/codex-reset-credit-state.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { inspectCodexRotation, resolveCodexAccountForRun, _setCodexAccountOutboundSenderForTesting } from './codex-account-store.js';
 import { saveTokens } from './store.js';
+import { debug } from '../debug/log.js';
 describe('일별 선불 크레딧 페이스', () => {
   const current = { name: 'third', storeKey: 'k-third', home: '/h/third', source: 'default' } as const;
   const team = { name: 'team', storeKey: 'k-team', home: '/h/team', reached: true, usedPercent: 100, creditBalance: 65_833, hasCredits: true };
@@ -80,8 +81,18 @@ test('policy + ledger + quota signal feed both inspection and runtime rotation',
     expect(resolveCodexAccountForRun(env, { storePath }).name).toBe('team');
     recordCreditBalances({ team: 62_000 }, new Date());
     writeQuotaSignal(undefined, 100, homes.team, undefined, { balance: 62_000, hasCredits: true });
-    expect(inspectCodexRotation(env, { storePath }).reason).toBe('no-candidate'); // 둘 다 찬 구독 · 페이스 몫 참 → 머문다
-    expect(resolveCodexAccountForRun(env, { storePath }).name).not.toBe('team'); // 페이스 몫이 차면 team 크레딧으로 안 간다
+    // 페이스 몫이 차면 페이스 갈래는 닫힌다. 정책 `credits.codex: use`(#26407 부터 파일이 실제로 읽힌다)라
+    //   지출 순서 «다른 계정 구독 → 리셋권 → 선불 크레딧»의 마지막 칸으로 내려간다 — 지금 계정(third)은 크레딧 0 이라
+    //   크레딧이 남은 team 으로 옮긴다(CREDIT-SPEND-ORDER 10-12: 이 이동은 «크레딧 진입» 표지를 단다).
+    const afterPace = inspectCodexRotation(env, { storePath });
+    expect(afterPace.reason).toBe('rotated');
+    expect(afterPace.to).toBe('team');
+    expect(decideCodexRotation({
+      current: { name: 'third', storeKey: 'k-third', home: homes.third!, source: 'default' }, explicit: false, enabled: true,
+      currentReached: true, currentUsedPercent: 100, resetCreditAvailability: 'unavailable', creditsAllowed: true,
+      currentCreditBalance: 0, currentHasCredits: false, creditPace: { active: false },
+      candidates: [{ name: 'team', storeKey: 'k-team', home: homes.team!, reached: true, usedPercent: 100, creditBalance: 62_000, hasCredits: true }],
+    }).creditEntry).toBe(true);
   } finally {
     _setCodexAccountOutboundSenderForTesting(null);
     resetElanousConfigDir();
@@ -118,4 +129,56 @@ describe('크레딧 정책 — 크레딧이 더 남은 계정으로 (09-28)', ()
     const d = decideCodexRotation({ ...base, candidates: [cand('default', 19_787, true), cand('team', 29_998, true), cand('third', 25_000, true)] } as never);
     expect(d.to?.name).toBe('team');
   });
+});
+
+describe('CREDIT-SPEND-ORDER — 크레딧 진입은 머물든 옮기든 💳 알림 ⊕ credit-spend-start (10-12 S2)', () => {
+  function fixture(scen: 'stay' | 'move') {
+    const root = mkdtempSync(join(tmpdir(), `codex-credit-entry-${scen}-`));
+    setElanousConfigDir(root);
+    mkdirSync(join(root, 'policy'), { recursive: true });
+    writeFileSync(join(root, 'policy/llm.yaml'), 'credits:\n  codex: use\n');
+    const storePath = join(root, 'auth.json');
+    const homes: Record<string, string> = {};
+    for (const name of ['team', 'third']) {
+      homes[name] = join(root, name); mkdirSync(homes[name]!, { recursive: true });
+      saveTokens(`openai-codex:${name}`, { accessToken: 'a', refreshToken: 'r', expiresAt: null }, { mirrorCodex: false, codexHome: homes[name] }, storePath);
+    }
+    saveTokens('openai-codex', { accessToken: 'a', refreshToken: 'r', expiresAt: null }, { mirrorCodex: false, codexHome: homes.third }, storePath);
+    // 모든 구독 100% · 리셋권 없음 — 크레딧 단계.
+    writeQuotaSignal(undefined, 100, homes.third, undefined, scen === 'stay' ? { balance: 50_000, hasCredits: true } : { balance: 0, hasCredits: false });
+    writeQuotaSignal(undefined, 100, homes.team, undefined, scen === 'stay' ? { balance: 0, hasCredits: false } : { balance: 60_000, hasCredits: true });
+    const sent: string[] = [];
+    _setCodexAccountOutboundSenderForTesting((text) => { sent.push(text); return true; });
+    const events: string[] = [];
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category: string, event: string, ...rest: unknown[]) => {
+      if (category === 'oauth.codex-account') events.push(event);
+      return (originalLog as (...a: unknown[]) => void).call(debug, category, event, ...rest);
+    }) as typeof debug.log;
+    const env = { ELANOUS_CODEX_ACCOUNT: '', CODEX_HOME: homes.third } as NodeJS.ProcessEnv;
+    const counterPath = join(root, 'budget', 'codex-credit-spend-alert.json');
+    const cleanup = () => {
+      (debug as { log: typeof debug.log }).log = originalLog;
+      _setCodexAccountOutboundSenderForTesting(null);
+      resetElanousConfigDir();
+      rmSync(root, { recursive: true, force: true });
+    };
+    return { storePath, env, counterPath, sent, events, cleanup };
+  }
+  for (const [scen, reason, account] of [['stay', 'credits-allowed', 'default'], ['move', 'credits-rotated', 'team']] as const) {
+    test(`${scen}: ${account} 크레딧으로(지금 계정 = 기본 슬롯 · third 홈) — 💳 1통 · credit-spend-start 1 · 둘째 호출 중복 0`, () => {
+      const t = fixture(scen);
+      try {
+        const r1 = resolveCodexAccountForRun(t.env, { storePath: t.storePath, counterPath: t.counterPath });
+        const r2 = resolveCodexAccountForRun(t.env, { storePath: t.storePath, counterPath: t.counterPath });
+        expect([r1.name, r2.name]).toEqual([account, account]);
+        const credit = t.sent.filter((text) => text.startsWith('💳 Codex credits in use'));
+        expect(credit).toHaveLength(1);
+        expect(credit[0]).toContain(`account: ${account}`);
+        expect(credit[0]).toContain(`reason: ${reason}`);
+        expect(t.events.filter((e) => e === 'credit-spend-start')).toHaveLength(1);
+        expect(t.events.filter((e) => e === 'credit-spend-alert-skipped')).toHaveLength(1); // 둘째 호출 = already-alerted-today
+      } finally { t.cleanup(); }
+    });
+  }
 });

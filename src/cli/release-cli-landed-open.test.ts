@@ -71,7 +71,7 @@ describe('landed-but-yellow --open', () => {
       expect(h.logs).toEqual(['— 0.2.13 —', '✅ CL-AUTO 근거 #123', '붙임 1 · 건너뜀(언급만) 1', '판 1 · 붙임 합 1 · 건너뜀(언급만) 합 1']);
       expect(h.observations).toEqual([{ versions: ['0.2.13'], added: 1, skippedMention: 1 }]);
       expect(process.exitCode).toBe(0);
-    } finally { process.exitCode = exit; h.restore(); }
+    } finally { process.exitCode = exit ?? 0; h.restore(); }
   });
 
   test('둘 열린 판은 semver 순, 판별 evidenceAdd 와 합계 · JSON 배열 plan · 중복 gh 없음', async () => {
@@ -95,7 +95,7 @@ describe('landed-but-yellow --open', () => {
       expect(h.observations).toEqual([{ versions: ['0.2.12', '0.2.13', '0.2.15'], added: 3, skippedMention: 1 }]);
       expect(h.errors).toContain('붙임 1 · 건너뜀(언급만) 1');
       expect(h.errors.some((line) => line.startsWith('판 '))).toBe(false);
-    } finally { process.exitCode = exit; h.restore(); }
+    } finally { process.exitCode = exit ?? 0; h.restore(); }
   });
 
   test('여러 열린 판 사람 출력은 판별 머리와 기존 줄, 마지막 합계를 갖는다', async () => {
@@ -151,7 +151,7 @@ describe('landed-but-yellow --open', () => {
       await h.run('--open', '--json');
       expect(JSON.parse(h.stdout.at(-1)!)).toEqual([]);
       expect(h.gh).toEqual([]);
-    } finally { process.exitCode = exit; h.restore(); }
+    } finally { process.exitCode = exit ?? 0; h.restore(); }
   });
 
   test('open search starts at the earliest updatedAt of all open non-green cells', async () => {

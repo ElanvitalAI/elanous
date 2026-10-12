@@ -313,7 +313,7 @@ describe('autopilot task-agent-action — 손상된 상태 파일', () => {
       process.stderr.write = origErr;
       process.stdout.write = origOut;
       resetElanousConfigDir();
-      process.exitCode = previous;
+      process.exitCode = previous ?? 0;
     }
     expect(Number(code)).toBe(1);
     expect(stderr.join('')).toContain('덮어쓰지 않고 멈춘다');

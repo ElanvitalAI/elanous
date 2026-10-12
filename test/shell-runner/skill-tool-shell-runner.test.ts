@@ -1,4 +1,10 @@
 import { describe, test, expect } from 'bun:test';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { debug } from '../../src/debug/log.js';
+import { dispatchRunShell } from '../../src/skills/tools/shell.js';
+import { setShellRunnerDeps, resetShellRunnerDeps } from '../../src/shell-runner/dispatch.js';
+import { createFileCaptureEngine } from '../../src/shell-runner/file-engine.js';
 
 import {
   buildShellListTool,
@@ -187,6 +193,86 @@ describe('dispatchShellPoll', () => {
     expect(out.output).not.toContain('cap=');
     expect(out.userExposure).toBe(null);
     expect(out.capability).toBe(null);
+  });
+});
+
+describe('RunShell background mode', () => {
+  test('bg mode returns before the command finishes and records a completion notice', async () => {
+    let resolveCommand!: () => void;
+    const commandFinished = new Promise<void>((resolve) => { resolveCommand = resolve; });
+    const fakeSpawn = () => {
+      const child = new EventEmitter() as any;
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.stdin = new PassThrough();
+      child.kill = () => true;
+      void commandFinished.then(() => {
+        child.stdout.end();
+        child.stderr.end();
+        child.emit('exit', 0, null);
+      });
+      return child;
+    };
+    const registry = createShellRegistry();
+    setShellRunnerDeps({ registry, fileEngine: createFileCaptureEngine({ spawnFn: fakeSpawn }) });
+    const seen: Array<{ category: string; event: string; data?: unknown }> = [];
+    const off = debug.registerSink({
+      name: 'skill-tool-shell-bg-capture',
+      emit: (record) => seen.push({ category: record.category, event: record.event, data: record.data }),
+    });
+    try {
+      const started = await dispatchRunShell({ command: ['slow-command'], mode: 'bg' });
+      expect(started.outcome).toBe('started');
+      expect(started.exitCode).toBeNull();
+      expect(started.output).toMatch(/^RunShell outcome=started handle=.+ bg=.+$/);
+      expect(registry.size()).toBe(1);
+      expect(seen.some((record) => record.category === 'skill-tool.shell' && record.event === 'bg-finished')).toBe(false);
+
+      resolveCommand();
+      await registry.list()[0]!.result;
+      await Promise.resolve();
+      const notice = seen.find((record) => record.category === 'skill-tool.shell' && record.event === 'bg-finished');
+      expect(notice?.data).toMatchObject({ handle: registry.list()[0]!.id, exitCode: 0 });
+      expect(typeof (notice?.data as { durationMs?: unknown }).durationMs).toBe('number');
+    } finally {
+      off();
+      resetShellRunnerDeps();
+    }
+  });
+
+  test('bg result rejection is handled and records a completion notice', async () => {
+    let rejectResult!: (reason: Error) => void;
+    const result = new Promise<ShellResult>((_resolve, reject) => { rejectResult = reject; });
+    const handle = fakeHandle('rejected-bg', { mode: 'bg' });
+    Object.defineProperty(handle, 'result', { value: result });
+    const registry = createShellRegistry();
+    setShellRunnerDeps({
+      registry,
+      fileEngine: { kind: 'file', run: () => handle },
+    });
+    const seen: Array<{ category: string; event: string; data?: unknown }> = [];
+    const off = debug.registerSink({
+      name: 'skill-tool-shell-bg-rejection-capture',
+      emit: (record) => seen.push({ category: record.category, event: record.event, data: record.data }),
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const started = await dispatchRunShell({ command: ['rejecting-command'], mode: 'bg' });
+      expect(started.outcome).toBe('started');
+      rejectResult(new Error('command failed'));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      const notices = seen.filter((record) => record.category === 'skill-tool.shell' && record.event === 'bg-finished');
+      expect(notices).toHaveLength(1);
+      expect(notices[0]?.data).toMatchObject({ handle: 'rejected-bg', exitCode: null, error: 'command failed' });
+      expect(typeof (notices[0]?.data as { durationMs?: unknown }).durationMs).toBe('number');
+      expect(unhandled).toHaveLength(0);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      off();
+      resetShellRunnerDeps();
+    }
   });
 });
 

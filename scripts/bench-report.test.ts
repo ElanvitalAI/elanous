@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { buildBenchReport, renderBenchReport, buildBn1Comparison, renderBn1Comparison, type LogRow, type Bn1Input } from './bench-report.js';
+import { tierModel } from '../src/llm/model-defaults.js';
+import { buildBenchReport, renderBenchReport, buildBn1Comparison, renderBn1Comparison, judgeProbe, type ArmReport, type LogRow, type Bn1Input } from './bench-report.js';
 
 const R = 'run-1';
 const rows: LogRow[] = [
@@ -20,6 +21,34 @@ const rows: LogRow[] = [
   { event: 'llm-usage', data: { runId: R, site: 'agent-turn', armId: 'pod/claude', model: 'claude-sonnet-5', inputTokens: 7 } },
 ];
 
+describe('probe judgment', () => {
+  const probeArm = (index: number, overrides: Partial<ArmReport> = {}): ArmReport => ({
+    armId: `pod/probe-${index}`,
+    declared: { id: `probe-${index}`, provider: 'openrouter', model: 'model-a' },
+    stage: null, prUrl: null, durationMs: null, calls: 0, inputTokens: 0, outputTokens: 0,
+    cacheReadInputTokens: 0, usdKnown: 0, unknownCostCalls: 0, includedCalls: 0,
+    apiEquivalentUsd: 0, models: [], leakCalls: 0, gatePassed: true,
+    reviewVerdict: null, reviewMustFixCount: null,
+    ...overrides,
+  });
+
+  test('uses the default 8/9 threshold, counts fallback leaks as failures, and preserves unmeasured nulls', () => {
+    const eightPasses = Array.from({ length: 9 }, (_, index) => probeArm(index, index === 8 ? { gatePassed: false } : {}));
+    expect(judgeProbe(eightPasses)).toEqual([{ model: 'model-a', runs: 9, passed: 8, failed: 1, unmeasured: 0, verdict: 'pass' }]);
+    const sevenPasses = Array.from({ length: 9 }, (_, index) => probeArm(index, index >= 7 ? { leakCalls: 1 } : {}));
+    expect(judgeProbe(sevenPasses)).toEqual([{ model: 'model-a', runs: 9, passed: 7, failed: 2, unmeasured: 0, verdict: 'fail' }]);
+    const unknown = Array.from({ length: 9 }, (_, index) => probeArm(index, index === 0 ? { gatePassed: null } : index === 8 ? { gatePassed: false } : {}));
+    expect(judgeProbe(unknown)).toEqual([{ model: 'model-a', runs: 9, passed: 7, failed: 1, unmeasured: 1, verdict: 'unmeasured' }]);
+  });
+
+  test('groups by declared model and labels undeclared arms as 못 이음', () => {
+    expect(judgeProbe([probeArm(1), probeArm(2, { declared: null })])).toEqual([
+      { model: 'model-a', runs: 1, passed: 1, failed: 0, unmeasured: 0, verdict: 'pass' },
+      { model: '못 이음', runs: 1, passed: 1, failed: 0, unmeasured: 0, verdict: 'pass' },
+    ]);
+  });
+});
+
 describe('bench report (RFC F5)', () => {
   const rep = buildBenchReport(rows, R);
   const by = Object.fromEntries(rep.arms.map((a) => [a.armId, a]));
@@ -29,7 +58,12 @@ describe('bench report (RFC F5)', () => {
   });
   test('counts calls that left the declared model (arm = one model)', () => {
     expect(by['pod/claude']!.leakCalls).toBe(4);
-    expect(renderBenchReport(rep)).toContain('이 판으로 팔을 비교하지 않는다');
+    const rendered = renderBenchReport(rep);
+    expect(rendered).toContain('이 판으로 팔을 비교하지 않는다');
+    expect(rendered).toContain('## 프로브 판정');
+    expect(rendered).toContain('| 모델 | 통과/런 | 판정 |');
+    expect(rendered).toMatch(/\| [^|]+ \| 0\/1 \| unmeasured \|/); // 모델 이름은 위 픽스처가 정한다 — 여기서 다시 박지 않는다(model-hardcode-gate)
+    expect(rendered).toContain('| openrouter/moonshotai/kimi-k3 | 0/1 | unmeasured |');
   });
   test('a zero-call arm without armId stays unjoined, not zero-filled', () => {
     expect(rep.unjoinedJobs).toBe(1);
@@ -140,5 +174,19 @@ describe('E4 — 게이트·리뷰 칸 (2026-09-25)', () => {
     expect(text).toContain('| 게이트 | 리뷰(must-fix) |');
     expect(text).toContain('| 통과 | warn (0) |');
     expect(text).toContain('| 모름 | 모름 |');
+  });
+});
+
+// ⭐ METER-POD-ROLLUP-GAP-2 — 같은 Pod 의 PARTIAL ⊕ 최종 재방출(같은 podRollupKey)은 팔 사용량에 한 번만 들어간다.
+describe('bench report — pod rollup re-emit dedup', () => {
+  test('a partial and a final re-emit of the same Pod bucket count once (the final wins)', () => {
+    const model = tierModel('balanced', 'openai');
+    const key = `si-d|si-d-xyz|run-d|pod-rollup:agent-turn|openai|${model}`;
+    const base = { runId: 'run-d', site: 'pod-rollup:agent-turn', armId: 'pod/d', job: 'si-d', model, podRollupKey: key };
+    const r = buildBenchReport([
+      { category: 'llm.usage', event: 'llm-usage', data: { ...base, calls: 2, inputTokens: 20, partial: true, partialSeq: 4, cost: { usd: 0.2 } } },
+      { category: 'llm.usage', event: 'llm-usage', data: { ...base, calls: 5, inputTokens: 50, cost: { usd: 0.5 } } },
+    ], 'run-d');
+    expect(r.arms.find((a) => a.armId === 'pod/d')).toMatchObject({ calls: 5, inputTokens: 50, usdKnown: 0.5 });
   });
 });

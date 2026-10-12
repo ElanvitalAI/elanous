@@ -55,7 +55,8 @@ describe('makeAcpImplementer', () => {
     }
   });
 
-  it('a write outside the worktree is denied and logged', async () => {
+  // 대표 대표 결정 10-12: 밖 쓰기 거부를 걷었다 — 밖 쓰기도 허가하고 insideWorktree:false 로 관측만 남긴다.
+  it('a write outside the worktree is allowed and observed with insideWorktree:false', async () => {
     let approver: AcpPermissionApprover | undefined;
     const events: Array<{ category: string; event: string; data?: Record<string, unknown> }> = [];
     const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
@@ -67,7 +68,7 @@ describe('makeAcpImplementer', () => {
       selectSessionModel: async () => null,
       prompt: async () => {
         const req = (rawInput: unknown) => ({ backendId: 'claude', sessionId: 'session-1', title: 'Write', kind: 'edit', rawInput, options: [] });
-        expect(await approver!(req({ file_path: '/etc/passwd' }))).toBe(false);
+        expect(await approver!(req({ file_path: '/etc/passwd' }))).toBe(true);
         expect(await approver!(req({ file_path: `${WORKTREE}/src/a.ts` }))).toBe(true);
         return { stopReason: 'end_turn' };
       },
@@ -79,15 +80,30 @@ describe('makeAcpImplementer', () => {
         worktree: WORKTREE,
         createAgent: (opts) => { approver = opts.permissionApprover; return agent; },
       })('implement');
-      expect(result).toMatchObject({ allowed: 1, denied: 1 });
+      expect(result).toMatchObject({ allowed: 2, denied: 0 });
       const permissions = events.filter((e) => e.category === 'agent-substrate.acp-implementer' && e.event === 'permission');
       expect(permissions.map((e) => e.data)).toEqual([
-        { tool: 'Write', path: '/etc/passwd', decision: 'deny' },
-        { tool: 'Write', path: `${WORKTREE}/src/a.ts`, decision: 'allow' },
+        { tool: 'Write', path: '/etc/passwd', insideWorktree: false, allowed: true },
+        { tool: 'Write', path: `${WORKTREE}/src/a.ts`, insideWorktree: true, allowed: true },
       ]);
     } finally {
       log.mockRestore();
     }
+  });
+
+  it('keeps the host ACP permission mode (auto) — never switches the session mode to ask', async () => {
+    const modeCalls: unknown[] = [];
+    const agent = {
+      start: async () => {}, newSession: async () => 'session-1', selectSessionModel: async () => null,
+      setSessionMode: async (...args: unknown[]) => { modeCalls.push(['setSessionMode', ...args]); },
+      setSessionModel: async (...args: unknown[]) => { modeCalls.push(['setSessionModel', ...args]); },
+      prompt: async () => ({ stopReason: 'end_turn' }), stop: async () => {}, cancel: async () => {},
+    } as unknown as AcpAgent;
+    let seen: AcpAgentOpts | undefined;
+    await makeAcpImplementer({ worktree: WORKTREE, model: 'sonnet', createAgent: (o) => { seen = o; return agent; } })('implement');
+    await makeAcpImplementer({ worktree: WORKTREE, resumeSessionId: 'old', createAgent: () => ({ ...agent, loadSession: async () => ({}) }) as unknown as AcpAgent })('continue');
+    expect(modeCalls).toEqual([]);
+    expect(JSON.stringify(seen)).not.toMatch(/permissionMode|"default"|acceptEdits/);
   });
 
   it('resumes an existing session with loadSession instead of newSession', async () => {
@@ -109,23 +125,30 @@ describe('makeAcpImplementer', () => {
 });
 
 describe('decideImplementerPermission', () => {
-  it('denies write kinds outside the worktree, including relative escapes and missing paths', () => {
-    expect(decideImplementerPermission({ title: 'Edit', kind: 'edit', rawInput: { file_path: '/etc/hosts' } }, WORKTREE).decision).toBe('deny');
-    expect(decideImplementerPermission({ title: 'Edit', kind: 'edit', rawInput: { file_path: '../other/a.ts' } }, WORKTREE).decision).toBe('deny');
-    expect(decideImplementerPermission({ title: 'Edit', kind: 'edit', rawInput: {} }, WORKTREE).decision).toBe('deny');
+  // 대표 대표 결정 10-12: 밖 쓰기도 허가한다(거부 → 허가) — 밖인지는 insideWorktree 로만 남는다. 경로 없는 쓰기는 여전히 거부.
+  it('allows write kinds outside the worktree (relative escapes too) but marks them insideWorktree:false; a path-less write is still denied', () => {
+    expect(decideImplementerPermission({ title: 'Edit', kind: 'edit', rawInput: { file_path: '/etc/hosts' } }, WORKTREE))
+      .toEqual({ tool: 'Edit', path: '/etc/hosts', insideWorktree: false, decision: 'allow' });
+    expect(decideImplementerPermission({ title: 'Edit', kind: 'edit', rawInput: { file_path: '../other/a.ts' } }, WORKTREE))
+      .toMatchObject({ insideWorktree: false, decision: 'allow' });
+    expect(decideImplementerPermission({ title: 'Edit', kind: 'edit', rawInput: {} }, WORKTREE))
+      .toEqual({ tool: 'Edit', path: null, insideWorktree: null, decision: 'deny' });
     expect(decideImplementerPermission({ title: 'Move', kind: 'move', rawInput: { source: 'a.ts', destination: '/tmp/b.ts' } }, WORKTREE))
-      .toEqual({ tool: 'Move', path: '/tmp/b.ts', decision: 'deny' });
+      .toEqual({ tool: 'Move', path: '/tmp/b.ts', insideWorktree: false, decision: 'allow' });
   });
 
   it('allows write kinds inside the worktree, reads, and execution at the worktree cwd', () => {
-    expect(decideImplementerPermission({ title: 'Edit', kind: 'edit', rawInput: { file_path: 'src/a.ts' } }, WORKTREE).decision).toBe('allow');
+    expect(decideImplementerPermission({ title: 'Edit', kind: 'edit', rawInput: { file_path: 'src/a.ts' } }, WORKTREE))
+      .toMatchObject({ insideWorktree: true, decision: 'allow' });
     expect(decideImplementerPermission({ title: 'Read', kind: 'read', rawInput: { file_path: '/etc/hosts' } }, WORKTREE).decision).toBe('allow');
     expect(decideImplementerPermission({ title: 'Bash', kind: 'execute', rawInput: { command: 'bun test' } }, WORKTREE).decision).toBe('allow');
   });
 
-  it('is conservative for unknown kinds: only a path-bearing request inside the worktree passes', () => {
+  // 대표 대표 결정 10-12: 모르는 kind 도 경로가 있으면 안팎 무관 허가(밖 거부를 걷었다) — 경로 없는 요청만 거부.
+  it('unknown kinds: a path-bearing request passes inside or outside; a path-less one is denied', () => {
     expect(decideImplementerPermission({ title: 'Write File', rawInput: { file_path: 'a.ts' } }, WORKTREE).decision).toBe('allow');
-    expect(decideImplementerPermission({ title: 'Write File', rawInput: { file_path: '/root/a.ts' } }, WORKTREE).decision).toBe('deny');
+    expect(decideImplementerPermission({ title: 'Write File', rawInput: { file_path: '/root/a.ts' } }, WORKTREE))
+      .toMatchObject({ insideWorktree: false, decision: 'allow' });
     expect(decideImplementerPermission({ title: 'Mystery' }, WORKTREE).decision).toBe('deny');
   });
 });

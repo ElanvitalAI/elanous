@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import type { LogStore, LogStoreRow } from '../mss/logging/log-store.js';
 import { SELF_IMPLEMENT_PROGRESS_STAGES } from './orchestrator.js';
 import { debug } from '../debug/log.js';
-import { assessLingeringLaunchParents, assessRunningRuns, buildRunProgressRows, collectObservedRunPhases, queryRunningRuns, renderRunProgressTable, renderRunningRuns } from './running-runs.js';
+import { assessLingeringLaunchParents, assessRunningRuns, buildRunProgressRows, collectObservedRunPhases, isPartialRunningRuns, queryRunningRuns, renderRunProgressTable, renderRunningRuns } from './running-runs.js';
 import { queryFederatedUnfinishedRunLedgers, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery } from './run-ledger.js';
 
 const ledger = (
@@ -998,6 +998,13 @@ test('renderRunProgressTable leads with a partial-observation header and never w
   expect(partial.completeness).toBe('partial');
   expect(rendered.split('\n')[0]).toStartWith('부분 관측 — 최소 0');
   expect(rendered).not.toContain('도는 런 0');
+  expect(isPartialRunningRuns(partial)).toBe(true);
+  expect(isPartialRunningRuns(queryRunningRuns({}, progressDeps()))).toBe(false);
+  const clean = queryRunningRuns({}, progressDeps());
+  const countsOnly = { ...clean, ledger: { ...clean.ledger, unreadableLedgerCount: 1 } };
+  expect(countsOnly.completeness).not.toBe('partial');
+  expect(isPartialRunningRuns(countsOnly)).toBe(true);
+  expect(isPartialRunningRuns({ ...clean, unreadable: [{ dir: '/state/x', reason: 'unreadable-ledger' as const }] })).toBe(true);
 });
 
 test('renderRunProgressTable marks a run whose phase store was unreadable as unobserved with the reason', () => {

@@ -19,7 +19,6 @@
 // just its mental model (active vs alternate buffer, viewport,
 // cursor, cell attrs).
 
-import type { IPty } from 'node-pty';
 import * as fs from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 import { Terminal } from '@xterm/headless';
@@ -104,6 +103,17 @@ export interface PreviewTerminalOpts {
   onRawOutput?: (chunk: string) => void;
 }
 
+// ⛔ `import type { IPty } from 'node-pty'` 도 두지 않는다 — PWA `next build` 가 이 파일까지 타입 검사하는데,
+//   node-pty 는 optionalDependency 라 리눅스(WSL)·게이트 Pod 설치에서 빠지면 «Cannot find module 'node-pty'»
+//   로 빌드가 죽고 self-update 가 매번 실패한다(LINUX-SELF-UPDATE-NODEPTY · 10-11). 이 파일이 실제로 쓰는 면만 둔다.
+/** node-pty `IPty` 중 이 파일이 부르는 면(pid · resize · kill · onExit). master fd 는 resolveMasterFd 가 비공개 칸에서 읽는다. */
+export interface NodePtyHandle {
+  readonly pid: number;
+  resize(cols: number, rows: number): void;
+  kill(signal?: string): void;
+  onExit(listener: (e: { exitCode: number | null; signal?: number }) => void): unknown;
+}
+
 /** Shared so tests can override (fake pty) — the default is node-pty. */
 export type SpawnFn = (shell: string, args: string[], opts: {
   name: string;
@@ -111,7 +121,7 @@ export type SpawnFn = (shell: string, args: string[], opts: {
   rows: number;
   cwd: string;
   env: Record<string, string>;
-}) => IPty;
+}) => NodePtyHandle;
 
 // ⛔⭐ `node-pty` 를 «최상위»에서 싣지 않는다 — 이 모듈은 dashboard·shell-runner 등 다섯 곳이
 //   정적으로 끌어오므로, 최상위 import 면 ***PTY 를 안 쓰는 명령(`--version`)까지*** 네이티브 바인딩을
@@ -124,7 +134,7 @@ export type SpawnFn = (shell: string, args: string[], opts: {
 const defaultSpawn: SpawnFn = (shell, args, o) => {
   // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-explicit-any
   const pty: any = require('node-pty');
-  return pty.spawn(shell, args, o as any) as IPty;
+  return pty.spawn(shell, args, o as any) as NodePtyHandle;
 };
 
 /** node-pty 네이티브 `resize(fd, cols, rows)` 를 임의의 master fd(우리 dup)에 부른다. 'ok' 또는 실패 사유. */
@@ -163,7 +173,7 @@ export interface PreviewRegistryDeps {
 }
 
 export class PreviewTerminal {
-  private pty: IPty | null = null;
+  private pty: NodePtyHandle | null = null;
   private dupFd: number = -1;
   /** ★ P0b-2 — useRegistry 모드일 때 공유 버스 핸들(dup-fd 대신). null=dup-fd 경로(기본). */
   private registryHandle: PtyHandle | null = null;
@@ -470,7 +480,7 @@ export class PreviewTerminal {
   /** node-pty doesn't publish its master fd as a stable field; dig
    *  through the plausible private slots in order of most-to-least
    *  likely so a minor library revision doesn't bite us. */
-  private resolveMasterFd(p: IPty): number | null {
+  private resolveMasterFd(p: NodePtyHandle): number | null {
     const any = p as any;
     const fd = any._fd
       ?? any._socket?._handle?.fd

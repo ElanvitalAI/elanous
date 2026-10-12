@@ -17,6 +17,7 @@ import {
   ROOT_PLACEHOLDER,
   baselineCacheEnabled,
   computeBaselineCacheKey,
+  workingTreeInstallKey,
   lookupBaselineCache,
   storeBaselineCache,
   toPlaceholderPaths,
@@ -819,22 +820,23 @@ export function rebaseWorktreePaths(diagnostics: readonly TypecheckError[], work
 export type BaselineCacheIo = BaselineCacheOptions & { log?: (message: string) => void };
 
 /**
- * 같은 base 커밋 ⊕ 같은 명령 ⊕ 같은 설정 해시면 저장된 진단을 재사용한다(워크트리·tsc 0회).
+ * 같은 base 커밋 ⊕ 같은 명령 ⊕ 같은 설정 해시 ⊕ 같은 작업 트리 설치 키면 저장된 진단을 재사용한다(워크트리·tsc 0회).
  * 캐시의 어떤 실패도 던지지 않는다 — miss 로 떨어져 아래 측정이 그대로 돈다.
  */
-function lookupCachedBaseline(key: string, command: string, cwd: string, cacheIo: BaselineCacheIo): BaselineDiagnostics | undefined {
+function lookupCachedBaseline(key: string, command: string, cwd: string, cacheIo: BaselineCacheIo, installKey?: string): BaselineDiagnostics | undefined {
   const lookup = lookupBaselineCache(key, cacheIo);
   const result = lookup.result === 'hit' ? 'hit' : lookup.result === 'corrupt' ? 'corrupt' : 'miss';
-  cacheIo.log?.(`[tsc-gate] typecheck baseline-cache ${result === 'hit' ? 'hit' : 'miss'} ${key.slice(0, 12)}`);
-  debug.log('typecheck.gate', 'baseline-cache', { result, key, command });
+  cacheIo.log?.(`[tsc-gate] typecheck baseline-cache ${result === 'hit' ? 'hit' : 'miss'} ${key.slice(0, 12)} installKey ${installKey?.slice(0, 12) ?? 'n/a'}`);
+  debug.log('typecheck.gate', 'baseline-cache', { result, key, command, installKey: installKey ?? null });
   if (lookup.result !== 'hit') return undefined;
   return { diagnostics: rebaseWorktreePaths(lookup.diagnostics, ROOT_PLACEHOLDER, cwd) };
 }
 
 export function readMergeBaseDiagnostics(base: string, command: string, cwd = process.cwd(), run = runTsc, cacheIo: BaselineCacheIo = {}): BaselineDiagnostics {
   const cacheKey = baselineCacheEnabled(cacheIo.env ?? process.env) ? computeBaselineCacheKey(base, command, cwd, cacheIo) : undefined;
+  const installKey = cacheKey ? workingTreeInstallKey(cwd, cacheIo) : undefined;
   if (cacheKey) {
-    const cached = lookupCachedBaseline(cacheKey, command, cwd, cacheIo);
+    const cached = lookupCachedBaseline(cacheKey, command, cwd, cacheIo, installKey);
     if (cached) return cached;
   }
   const workspace = mkdtempSync(join(tmpdir(), 'ci-typecheck-baseline-'));

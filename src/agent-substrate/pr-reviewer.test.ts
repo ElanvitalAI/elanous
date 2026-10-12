@@ -9,6 +9,87 @@ import {
   isScopeRevertMustFix, NO_VERDICT_LINE_REASON, type ReviewInput, type ReviewerContextItem,
 } from './pr-reviewer.js';
 
+describe('reviewPullRequest — REVIEW-PROMPT-SIZE 관측(review.prompt-size 범주)', () => {
+  it('REVIEW-PROMPT-SIZE — 리뷰 1회 → review.prompt-size 이벤트에 promptChars·responseChars 가 실림', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const response = 'VERDICT: PASS\nMUST-FIX:\n- (없음)\nSHOULD-FIX:\n- 사소한 네이밍';
+    const prompts: string[] = [];
+    const llmReview = (prompt: string) => {
+      prompts.push(prompt);
+      return Promise.resolve(response);
+    };
+    try {
+      const result = await reviewPullRequest(
+        { prDiff: 'diff --git a/x.ts b/x.ts\n@@ -1 +1 @@\n-a\n+b\n', phaseIntent: 'x 고침' },
+        llmReview,
+      );
+      expect(result.reviewed).toBe(true);
+      const call = log.mock.calls.find(([category, event]) => category === 'review.prompt-size' && event === 'call');
+      expect(call).toBeDefined();
+      expect(call![2]).toMatchObject({ pass: 1, promptChars: prompts[0]!.length, responseChars: response.length, chunked: false });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('REVIEW-PROMPT-SIZE — 청크 패스마다 review.prompt-size 이벤트가 남는다(chunked=true·pass 번호)', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const prompts: string[] = [];
+    const llmReview = (prompt: string) => {
+      prompts.push(prompt);
+      return Promise.resolve('VERDICT: PASS');
+    };
+    const original = process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+    try {
+      process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = '2000';
+      const file = (name: string) => `diff --git a/${name}.ts b/${name}.ts\n@@ -1 +1 @@\n-a\n+${'x'.repeat(1800)}\n`;
+      const result = await reviewPullRequest({ prDiff: file('a') + file('b'), phaseIntent: 'x 고침' }, llmReview);
+      expect(result.reviewed).toBe(true);
+      const calls = log.mock.calls.filter(([category, event]) => category === 'review.prompt-size' && event === 'call');
+      expect(calls).toHaveLength(prompts.length);
+      expect(prompts.length).toBeGreaterThanOrEqual(2);
+      calls.forEach(([category, event, data], index) => {
+        expect(category).toBe('review.prompt-size');
+        expect(event).toBe('call');
+        expect(data).toMatchObject({ pass: index + 1, promptChars: prompts[index]!.length, responseChars: 'VERDICT: PASS'.length, chunked: true });
+      });
+    } finally {
+      if (original === undefined) delete process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+      else process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = original;
+      log.mockRestore();
+    }
+  });
+
+  it('REVIEW-PROMPT-SIZE — 관측 sink 가 실패해도 리뷰는 돈다(fail-soft 계약)', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string) => {
+      if (category === 'review.prompt-size' && event === 'call') throw new Error('sink unavailable');
+    }) as typeof debug.log);
+    try {
+      const result = await reviewPullRequest(
+        { prDiff: 'diff --git a/x.ts b/x.ts\n@@ -1 +1 @@\n-a\n+b\n', phaseIntent: 'x 고침' },
+        () => Promise.resolve('VERDICT: WARN'),
+      );
+      expect(result.reviewed).toBe(true);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('REVIEW-PROMPT-SIZE — runId 가 있으면 이벤트에 실린다', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      await reviewPullRequest(
+        { prDiff: 'diff --git a/x.ts b/x.ts\n@@ -1 +1 @@\n-a\n+b\n', phaseIntent: 'x 고침', reviewContext: { runId: 'run-1' } },
+        () => Promise.resolve('VERDICT: PASS'),
+      );
+      const call = log.mock.calls.find(([category, event]) => category === 'review.prompt-size' && event === 'call');
+      expect(call![2]).toMatchObject({ runId: 'run-1' });
+    } finally {
+      log.mockRestore();
+    }
+  });
+});
+
 describe('reviewDiffCharLimit — 기본 예산·환경변수 계약', () => {
   it('기본 64,000자, 유효 override, 2,000 미만 무시 및 50,000자 diff 비절단', () => {
     const original = process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;

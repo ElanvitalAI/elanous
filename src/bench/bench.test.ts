@@ -10,7 +10,9 @@ import {
 } from './bench.js';
 import { registerBenchCommands } from '../cli/bench-cli.js';
 import { installHarnessCliCommand } from '../harness/harness-cli-command.js';
+import { listHarnessQueue, type HarnessQueueDeps } from '../harness/harness-queue.js';
 import { planDevPipeline, toSelfImplementOptions } from '../self-dev/dev-pipeline.js';
+import { setUserConfigOverlay } from '../user-config.js';
 import type { SelfImplementSeams } from '../self-implement/orchestrator.js';
 import { defaultSeams } from '../self-implement/seams.js';
 import { debug } from '../debug/log.js';
@@ -278,5 +280,51 @@ describe('BENCH-ISOLATED-ARMS harness ask --bench (CLI 배선)', () => {
     expect(bases).toEqual(['main']);
     expect(git.calls).toEqual([]);
     expect(existsSync(join(dir, 'bench'))).toBe(false);
+  });
+
+  test('대기열 경로 --bench 전달 — argv 에 --bench x:<sha> 있고 --base 는 없다', async () => {
+    const dir = tmp('bench-cli-queue-');
+    const goal = join(dir, 'goal.md');
+    writeFileSync(goal, '대상 경로: src/x.ts\n');
+    const queue: HarnessQueueDeps = {
+      root: dir, authorShadow: () => {}, idleRequest: () => {},
+      processes: () => [{ pid: 900, seat: 'TC' }], cap: () => 1,
+      pool: () => ({ running: 0, pending: 0, reserved: 0, limit: 8 }),
+      launch: async () => { throw new Error('queue must wait'); }, log: () => {},
+    };
+    const program = new Command().exitOverride();
+    installHarnessCliCommand(program, {
+      registerSink: async () => {}, resolveSurface: async () => 'harness',
+      ask: async () => { throw new Error('parent must not dispatch'); },
+      say: async () => {},
+      bench: { git: fakeGit(new Map()).run, configDir: dir, imageCommit: () => 'd'.repeat(12) },
+      queue,
+    });
+    const oldExit = process.exitCode;
+    const oldFlag = process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY;
+    const oldLaunch = process.env.ELANOUS_HARNESS_QUEUE_LAUNCH;
+    const err = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      delete process.env.ELANOUS_HARNESS_QUEUE_LAUNCH;
+      process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY = '1';
+      setUserConfigOverlay((config) => ({
+        ...config,
+        harness: { ...config.harness, queue: { ...config.harness?.queue, directSay: true } },
+        loops: { ...config.loops, orchestrator: { ...config.loops?.orchestrator!, seatTrees: { TC: [process.cwd()] } } },
+      }));
+      process.exitCode = 0;
+      await program.parseAsync(['node', 'elanous', 'harness', 'ask', goal, '--bench', `x:${SHA}`, '--substrate', 'local']);
+      const argv = listHarnessQueue(queue)[0]?.launchArgs ?? [];
+      expect(argv.slice(argv.indexOf('--bench'), argv.indexOf('--bench') + 2)).toEqual(['--bench', `x:${SHA}`]);
+      expect(argv).not.toContain('--base');
+    } finally {
+      err.mockRestore();
+      setUserConfigOverlay(null);
+      process.exitCode = oldExit ?? 0;
+      if (oldFlag === undefined) delete process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY;
+      else process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY = oldFlag;
+      if (oldLaunch === undefined) delete process.env.ELANOUS_HARNESS_QUEUE_LAUNCH;
+      else process.env.ELANOUS_HARNESS_QUEUE_LAUNCH = oldLaunch;
+    }
   });
 });

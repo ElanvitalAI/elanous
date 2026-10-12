@@ -232,7 +232,7 @@ describe('askAtExecution', () => {
         runId: 'run-owner-scope', feature: 'implement scoped change', goalFile, memory: false,
         writeGoalExecutionRecord: () => {}, writeGoalRunRecord: () => {},
         seams: seams({
-          changedFilesForGateRoute: () => ['src/outside.ts'],
+          changedFilesForGateRoute: () => ['lib/outside.ts'],
           writeRunLedger: entry => { events.push(entry); },
           askExecutionClarification: (choice, ctx, deps) => askAtExecution(choice, ctx, {
             ...deps, createId: () => 'scope-owner-question',
@@ -279,7 +279,7 @@ describe('askAtExecution', () => {
       const result = await runSelfImplement({ runId, feature: 'implement scoped change', goalFile, memory: false,
         writeGoalExecutionRecord: () => {}, writeGoalRunRecord: () => {},
         seams: seams({
-          changedFilesForGateRoute: () => ['src/outside.ts'],
+          changedFilesForGateRoute: () => ['lib/outside.ts'],
           writeRunLedger: () => {},
           askExecutionClarification: (candidate, context, deps) => askAtExecution(candidate, context, {
             ...deps, createId: () => questionId,
@@ -440,7 +440,7 @@ describe('askAtExecution', () => {
           openPr: async () => { opened++; return { url: 'https://pr/7', number: 7 }; },
         }),
       });
-      const held = await run(['src/outside.ts'], 'Stay in scope');
+      const held = await run(['lib/outside.ts'], 'Stay in scope');
       expect(asked).toEqual(['run-execution-scope-test:high:Stay in scope']);
       expect(held).toMatchObject({ ok: false, stage: 'soft-stopped' });
       expect(gates).toBe(0);
@@ -448,14 +448,49 @@ describe('askAtExecution', () => {
       await run(['src/inside.ts'], 'Stay in scope');
       expect(asked).toHaveLength(1);
       expect(gates).toBe(1);
-      await run(['src/outside.ts'], 'Expand scope');
+      await run(['lib/outside.ts'], 'Expand scope');
       expect(asked).toHaveLength(2);
       expect(gates).toBe(2);
-      const parked = await run(['src/outside.ts'], 'parked');
+      const parked = await run(['lib/outside.ts'], 'parked');
       expect(parked).toMatchObject({ ok: false, stage: 'parked', detail: 'critical-unanswered: scope-question-1' });
       expect(mapStageToRunStatus(parked.stage)).toEqual({ runStatus: 'parked' });
       expect(runLedger).toContainEqual(expect.objectContaining({ event: 'run-status', data: expect.objectContaining({ stage: 'parked', runStatus: 'parked' }) }));
       expect(gates).toBe(2);
+      // SCOPE-HELD-DELIVER: edits only next to a declared file (same folder) go to the gate without a question.
+      const adjacent = await run(['src/inside.ts', 'src/helper.ts', 'src/plugin.json'], 'Stay in scope');
+      expect(asked).toHaveLength(3);
+      expect(gates).toBe(3);
+      expect(adjacent).toMatchObject({ ok: true });
+      // One file elsewhere among them: the question comes back.
+      await run(['src/helper.ts', 'lib/outside.ts'], 'Stay in scope');
+      expect(asked).toHaveLength(4);
+      expect(gates).toBe(3);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('SCOPE-HELD-DELIVER: an unreadable declaration (no declared target) is not «everything outside» — no question, the gate runs', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'execution-scope-undeclared-'));
+    const goalFile = join(directory, 'goal.txt');
+    // Paths listed with spaces are rejected by the declaration parser (has-whitespace): zero declared targets.
+    writeFileSync(goalFile, ['## PROBLEM', 'Original ask (verbatim, unmodified):', '```',
+      '대상 경로: src/a.ts src/b.ts', 'Implement the change.', '```', ''].join('\n'));
+    let asked = 0;
+    let gates = 0;
+    try {
+      const result = await runSelfImplement({ runId: 'run-scope-undeclared', feature: 'implement', goalFile, memory: false,
+        writeGoalExecutionRecord: () => {}, writeGoalRunRecord: () => {},
+        seams: seams({
+          changedFilesForGateRoute: () => ['src/a.ts', 'lib/c.ts'],
+          writeRunLedger: () => {},
+          askExecutionClarification: async () => { asked++; return { choice: 'Stay in scope', by: 'owner' }; },
+          gate: async () => { gates++; return { passed: true, log: 'ok' }; },
+        }),
+      });
+      expect(result).toMatchObject({ ok: true });
+      expect(asked).toBe(0);
+      expect(gates).toBe(1);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

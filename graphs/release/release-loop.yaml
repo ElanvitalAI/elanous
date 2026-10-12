@@ -16,11 +16,11 @@ nodes:
   - { node_id: checklist-gate, kind: gate, recipe: 'cmd:checklist-gate', max_visits: 1 }
   # cmd:docs dispatches by graph node ID: bounded prefetch before gate, TUI join after upgrade, docs write after both.
   - { node_id: prefetch, kind: agent, recipe: 'cmd:docs', max_visits: 1 }
-  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1, notify: start }
+  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1, notify: { on: [fail] } }
   - { node_id: mac-smoke, kind: gate, recipe: 'cmd:mac-smoke', max_visits: 1 }
   - { node_id: export-check, kind: gate, recipe: 'cmd:export-check', max_visits: 1 }
-  - { node_id: pwa, kind: gate, recipe: 'cmd:pwa', max_visits: 1, notify: start }
-  - { node_id: prepare, kind: agent, recipe: 'cmd:prepare', max_visits: 1, notify: start }
+  - { node_id: pwa, kind: gate, recipe: 'cmd:pwa', max_visits: 1, notify: { on: [fail] } }
+  - { node_id: prepare, kind: agent, recipe: 'cmd:prepare', max_visits: 1, notify: { on: [fail] } }
   - { node_id: upgrade, kind: gate, recipe: 'cmd:upgrade', max_visits: 1 }
   - { node_id: tui, kind: gate, recipe: 'cmd:docs', max_visits: 1 }
   - { node_id: docs, kind: agent, recipe: 'cmd:docs', max_visits: 1 }
@@ -28,10 +28,10 @@ nodes:
   - { node_id: notes-check, kind: gate, recipe: 'cmd:notes-check', max_visits: 1 }
   - { node_id: auto-approve, kind: gate, recipe: 'cmd:auto-approve', max_visits: 1 }
   - { node_id: approve-publish, kind: hitl, recipe: 'approval:publish', max_visits: 1 }
-  - { node_id: publish, kind: git, recipe: 'cmd:publish-command', max_visits: 1 }
+  - { node_id: publish, kind: git, recipe: 'cmd:publish-command', max_visits: 1, notify: { on: [ok, fail] } }
   - { node_id: npm-publish, kind: git, recipe: 'cmd:npm-publish', max_visits: 1 }
   - { node_id: docs-land, kind: git, recipe: 'cmd:docs-land', max_visits: 1 }
-  - { node_id: verify, kind: gate, recipe: 'cmd:verify', max_visits: 1 }
+  - { node_id: verify, kind: gate, recipe: 'cmd:verify', max_visits: 1, notify: { on: [ok, fail] } }
   - { node_id: vault-note, kind: gate, recipe: 'cmd:vault-note', max_visits: 1 }
   - { node_id: release-story, kind: gate, recipe: 'cmd:release-story', max_visits: 1 }
   - { node_id: ops-upgrade, kind: agent, recipe: 'cmd:ops-upgrade', max_visits: 1 }

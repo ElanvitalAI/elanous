@@ -12,6 +12,7 @@ import { getUserConfig } from '../user-config.js';
 import { dateKey } from '../time/format.js';
 import { cardIndexPath, CardStore, type TaskCard } from '../task-cards/card-store.js';
 import { loadIntakeLedger, type IntakeItem } from './items.js';
+import { RequirementLedger } from '../requirements/requirement-ledger.js';
 import { parseRubric, rubricGrade, rubricScore } from '../release-loop/rubric.js';
 
 export type RequirementSource = 'directive' | 'intake' | 'grounding' | 'coordination' | 'linear';
@@ -67,6 +68,8 @@ export interface FunnelOptions {
   allowedLicenses?: readonly string[];
   placement?: PlacementDeps;
   adopt?: (candidate: RequirementCandidate, version: string, cellId: string, evidence: string) => void;
+  /** REQ-INTAKE-ALL (0.2.25) piece 1: REQ-LEDGER side-record — every candidate captured once (idempotent on candidate id); adopted decisions fold to `placed`. */
+  ledger?: RequirementLedger;
 }
 
 /** How many of the last 24 hours' unlinked directives the single P0 brief line names (the full backlog is one count). */
@@ -170,6 +173,15 @@ export function runRequirementFunnel(options: FunnelOptions): RequirementFunnelR
       cellId, version: placement.version, rubric });
     if (!isDirective) used++;
   }
+  // REQ-INTAKE-ALL (0.2.25) piece 1: record every funnel candidate into the REQ-LEDGER side-ledger
+  // (idempotent on candidate id). The ledger is a side-record — a capture failure must not change the
+  // funnel result or any other command's default behavior (preservation contract).
+  if (options.ledger) {
+    try { captureFunnelCandidates(decisions, options.ledger); }
+    catch (error) {
+      debug.log('intake.requirement-funnel', 'ledger-capture-failed', { error: error instanceof Error ? error.message : String(error) });
+    }
+  }
   const unlinkedDirectives = [...directiveCandidates(options.historicalDirectives ?? []).filter(candidate =>
     candidate.text && Number.isFinite(Date.parse(candidate.receivedAt)) && Date.parse(candidate.receivedAt) <= now.getTime()
     && !linkFor(candidate, cells) && !arrivals.some(arrival => arrival.id === candidate.id)),
@@ -202,7 +214,46 @@ export function runRequirementFunnel(options: FunnelOptions): RequirementFunnelR
   return { counts, candidates: groups.size, decisions, unlinkedDirectives, briefItems };
 }
 
-/** Existing ledgers only; no source collector or sender is started here. */
+/**
+ * REQ-INTAKE-ALL (0.2.25) piece 1 — record the funnel's five entrances (directive · intake · grounding ·
+ * coordination · linear) into the REQ-LEDGER. Each decision captures one row per candidate (its `sources`
+ * members) with status `captured`, kind fixed to `fr`, source {kind, at: receivedAt}, statement = one-line
+ * text and tags = [priority] (the funnel's own P1 default when the candidate carries none). Idempotent on
+ * candidate id — re-running adds no rows. Adopted decisions fold their rows to `placed`. Per source with
+ * fresh rows it emits debug.log('requirements.intake', 'captured', {source, count}). Ledger validation
+ * (secret-shape rejection, allowlist) stays REQ-LEDGER's share; kind classification (REQ-KINDS) is a later
+ * piece — kind is fixed to `fr` here.
+ */
+export function captureFunnelCandidates(candidates: readonly RequirementDecision[], ledger: RequirementLedger): void {
+  const statuses = new Map(ledger.list().map(row => [row.id, row.status] as const));
+  const fresh = new Map<RequirementSource, number>();
+  for (const decision of candidates) {
+    for (const candidate of decision.sources) {
+      if (statuses.has(candidate.id)) continue;
+      // One bad candidate (secret-shaped text · unparseable time) must not stop the rest of the capture.
+      try {
+        const at = new Date(candidate.receivedAt).toISOString(); // ledger takes UTC `…Z` only; sources may carry offsets
+        ledger.capture({ id: candidate.id, statement: oneLine(candidate.text), kind: 'fr',
+          source: { kind: candidate.source, at }, tags: [candidate.priority ?? 'P1'] });
+      } catch (error) {
+        debug.log('intake.requirement-funnel', 'ledger-capture-failed', { id: candidate.id, source: candidate.source,
+          error: error instanceof Error ? error.message : String(error) });
+        continue;
+      }
+      statuses.set(candidate.id, 'captured');
+      fresh.set(candidate.source, (fresh.get(candidate.source) ?? 0) + 1);
+    }
+    if (decision.status !== 'adopted') continue;
+    for (const candidate of decision.sources) {
+      if (statuses.get(candidate.id) !== 'captured') continue;
+      ledger.place(candidate.id);
+      statuses.set(candidate.id, 'placed');
+    }
+  }
+  for (const [source, count] of fresh) debug.log('requirements.intake', 'captured', { source, count });
+}
+
+/** Existing ledgers only; no source collector or sender is started here. Side effect: captures every candidate into this universe's REQ-LEDGER (REQ-INTAKE-ALL). */
 export function readRequirementFunnel(options: { stateDir?: string; now?: Date; mode?: 'shadow' | 'live'; dailyCap?: number;
   allowedLicenses?: readonly string[]; grounding?: readonly IncomingRequirement[]; coordination?: readonly IncomingRequirement[];
   linear?: readonly IncomingRequirement[]; placement?: PlacementDeps } = {}): RequirementFunnelResult {
@@ -276,6 +327,7 @@ export function readRequirementFunnel(options: { stateDir?: string; now?: Date; 
     grounding: today(options.grounding ?? fromQueue('outbox/grounding.jsonl')),
     coordination: today(options.coordination ?? cardRequests.coordination), linear: today(options.linear ?? cardRequests.linear) }, historicalDirectives, cells, now, mode,
     dailyCap, adoptedToday: todayCount, allowedLicenses, placement: { ...options.placement, schedules },
+    ledger: new RequirementLedger({ stateDir }),
     adopt: (candidate, version, cellId, evidence) => {
       placeCell({ id: cellId, title: candidate.text, owner: candidate.owner ?? 'OP', priority: candidate.priority ?? 'P1',
         predecessors: [], ...(candidate.deadlineVersion ? { deadlineVersion: candidate.deadlineVersion } : {}) }, { ...options.placement, now, schedules });

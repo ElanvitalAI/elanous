@@ -487,7 +487,10 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   if (!opts.launcher) throw new Error('--live 인데 launcher 가 없다');
   const runId = mintRunId();
   const launchId = `tl-${randomBytes(6).toString('hex')}`;
-  const context: TaskLaunchContext = { runId, launchId, env: { [HARNESS_RUN_ID_ENV]: runId, ELANOUS_TASK_CARD_ID: card.id, ...(card.taLand ? { [TA_LAND_ENV]: '1' } : {}) }, cardLabelContext: taskCardLabelContext(card) };
+  const context: TaskLaunchContext = { runId, launchId, env: { [HARNESS_RUN_ID_ENV]: runId, ELANOUS_TASK_CARD_ID: card.id,
+    ...(card.checklistId ? { ELANOUS_POD_SLOT_ID: card.checklistId } : {}),
+    ...(card.seat ? { ELANOUS_POD_OWNER_KIND: 'seat', ELANOUS_POD_OWNER_ID: card.seat } : {}),
+    ...(card.taLand ? { [TA_LAND_ENV]: '1' } : {}) }, cardLabelContext: taskCardLabelContext(card) };
   let receipt: void | TaskLaunchReceipt;
   try {
     receipt = await opts.launcher(move.command!, project?.target, context);

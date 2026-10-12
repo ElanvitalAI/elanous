@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { debug } from '../../debug/log.js';
-import { checkPodPool, genericConfigPodPool, measureMemberOccupancy, parsePodPool, PodPoolScheduler, POD_POOL_DEFAULT_CAPACITY, preferredMembers, type PodPlacement, resolvePodPoolSpec, syncPoolImage, syncPoolImages, type MemberOccupancy, type RemoteRun } from './pod-pool.js';
+import { checkPodPool, genericConfigPodPool, measureMemberOccupancy, parsePodPool, podWorkLabels, PodPoolScheduler, POD_POOL_DEFAULT_CAPACITY, preferredMembers, type PodPlacement, resolvePodPoolSpec, syncPoolImage, syncPoolImages, type MemberOccupancy, type RemoteRun } from './pod-pool.js';
 import { podPlacementKind, podSelfImplementSpawn, type Kubectl } from './self-implement-pod.js';
 import { HostPoolLease } from '../../pod-lease/host-lease.js';
 import { loadRunLedger } from '../../self-implement/run-ledger.js';
@@ -260,6 +260,48 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     const [local, remote] = parsePodPool('k3d-elanous-h1:1,pool-node-b@node-b:1');
     expect(syncPoolImage(local!, 'img', 'abc123', run)).toMatchObject({ ok: true, action: 'local' });
     expect(syncPoolImage(remote!, 'img', 'abc123', run)).toMatchObject({ ok: true, action: 'fresh' });
+  });
+
+  test('pool Job apply carries task-card owner, checklist slot and work labels onto Job and Pod without changing placement', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-work-labels-'));
+    const manifests: Array<{ metadata: { labels: Record<string, string> }; spec: { template: { metadata: { labels: Record<string, string> } } } }> = [];
+    const contexts: string[] = [];
+    const kubectl: Kubectl = (args, input) => {
+      if (args.includes('apply') && input) {
+        const object = JSON.parse(input);
+        if (object.kind === 'Job') { manifests.push(object); contexts.push(args[1]!); }
+      }
+      if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: 'Complete', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const pool = new PodPoolScheduler(parsePodPool('big:4,small:1'), {
+      status: () => ({ recommended: 1, accountSlots: 0, limitedBy: 'capacity', reason: null, capacitySlots: 5, memorySlots: 5, placeableSlots: 5, running: 0, pending: 0 }),
+      occupancy: () => ({ big: { occupied: 1 }, small: { occupied: 0 } }),
+      hostLease: new HostPoolLease('work-labels', { dir: join(root, 'lease') }),
+    });
+    try {
+      const spawn = podSelfImplementSpawn({ kubectl, pool, imageCommit: null, pollMs: 1, sleep: async () => {},
+        env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: 'run-work-labels', ELANOUS_POD_MEMORY_TIER: 'lite', ELANOUS_POD_GOAL_TYPE: 'document', ELANOUS_POD_OWNER_KIND: 'steward', ELANOUS_POD_OWNER_ID: 'default', ELANOUS_POD_TASK_CARD: 'ta-20261008-abc123', ELANOUS_POD_SLOT_ID: 'RES-FLOOR-POD-LABELS' },
+        credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }),
+      });
+      expect((await spawn({ spaceId: 'labelled', feature: 'Write docs' }).done).exitCode).toBe(0);
+      expect(manifests).toHaveLength(1);
+      expect(contexts).toEqual(['small']);
+      const expected = { 'elanous.owner-kind': 'steward', 'elanous.owner-id': 'default', 'elanous.task-card': 'ta-20261008-abc123', 'elanous.checklist': 'RES-FLOOR-POD-LABELS', 'elanous.work': 'lite' };
+      expect(manifests[0]!.metadata.labels).toMatchObject(expected);
+      expect(manifests[0]!.spec.template.metadata.labels).toMatchObject(expected);
+      expect(pool.snapshot()).toEqual({ big: 0, small: 0 });
+      const author = podSelfImplementSpawn({ kubectl, pool, imageCommit: null, pollMs: 1, sleep: async () => {},
+        env: { ELANOUS_STATE_DIR: root, ELANOUS_POD_AUTHOR_ON_POD: '1', ELANOUS_POD_MEMORY_TIER: 'lite' },
+        credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }),
+      });
+      expect((await author({ spaceId: 'author-label', feature: 'Write docs' }).done).exitCode).toBe(0);
+      expect(manifests[1]!.metadata.labels['elanous.work']).toBe('authoring');
+      expect(manifests[1]!.spec.template.metadata.labels['elanous.work']).toBe('authoring');
+      expect(podWorkLabels({ work: 'harness' })).toEqual({ 'elanous.work': 'harness' });
+      expect(podWorkLabels({ ownerKind: 'external', ownerId: 'bad owner', work: 'authoring' })).toEqual({ 'elanous.work': 'authoring' });
+      expect(podWorkLabels({ ownerKind: 'seat', ownerId: 'TC', taskCard: 'not a card', slotId: 'slot with spaces', work: 'harness' })).toEqual({ 'elanous.owner-kind': 'seat', 'elanous.owner-id': 'TC', 'elanous.work': 'harness' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   test('every kubectl call of a pooled job carries that node\'s --context, and the slot is released', async () => {

@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { parse as yaml } from 'yaml';
+import { LogStore } from '../../src/mss/logging/log-store.js';
 import { runAutoApprove, WARNING_ONLY } from './auto-approve-node.js';
 import type { GraphContext } from './node-verdict.js';
 import { runPublish, waitForAssets } from './publish-node.js';
@@ -202,3 +204,31 @@ test('REL3: probes the public download URL for the tag', () => {
   waitForAssets(run as never, 'ElanvitalAI/elanous', 'v0.2.8', ['SHA256SUMS'], 0, () => {});
   expect(urls).toEqual(['https://github.com/ElanvitalAI/elanous/releases/download/v0.2.8/SHA256SUMS']);
 });
+
+// GATE-OBS2-2 — the release graph runs publish as its own process; that child inherits no daemon sink, so without
+// registerStandaloneLogSink its `release-loop.publish / result` event (whether the irreversible publication happened)
+// stays in the file trail and `elanous logs` reads 0 rows. Same proof shape as gate-node-log-sink.test.ts.
+test('a publish process spawned like the graph does writes release-loop.publish events to its own logs.db', () => {
+  const REPO = resolve(import.meta.dir, '../..');
+  const root = mkdtempSync(join(tmpdir(), 'publish-node-log-sink-'));
+  const env: Record<string, string | undefined> = { ...process.env, HOME: root, ELANOUS_STATE_DIR: root, ELANOUS_CONFIG_DIR: root };
+  delete env.ELANOUS_GRAPH_CONTEXT;
+  // NODE_ENV=test turns the default store off; the graph child runs without it, and the state dir above keeps it isolated.
+  delete env.NODE_ENV;
+  try {
+    const run = spawnSync('bun', ['scripts/release-loop/publish-node.ts'], { cwd: REPO, env, encoding: 'utf8', timeout: 50_000 });
+    // Invalid input is the cheap path: no publication side effects, but the final `result` event is still logged.
+    expect(run.status).toBe(2);
+    const lines = run.stdout.trim().split('\n');
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0]!).outcome).toBe('error');
+    const dbPath = join(root, 'logs', 'logs.db');
+    expect(existsSync(dbPath)).toBe(true);
+    const store = LogStore.openReadOnly(dbPath);
+    try {
+      const rows = store.query({ exactCategories: ['release-loop.publish'] });
+      expect(rows.map((row) => row.event)).toContain('result');
+      expect(rows.every((row) => row.surface === 'release-loop')).toBe(true);
+    } finally { store.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 60_000);

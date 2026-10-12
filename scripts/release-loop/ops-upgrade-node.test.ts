@@ -19,39 +19,108 @@ const feedGood = { status: 0, stdout: `{"ok":true,"version":"0.2.7","commit":"${
 let cleaned = 0;
 const tagSource = (): FeedSource => ({ checkout: '/tmp/tag-tree', commit: TAG, deps: 'linked', cleanup: () => { cleaned++; } });
 
-test('checkout install fetches tag, detaches, then updates without release version', () => {
-  withContext({ opsHosts: ['local'], opsRestart: true }, () => {
+test('rail checkout installs are skipped with the rail-source judgment line', () => {
+  withContext({ opsHosts: ['local', 'node-b'], opsRestart: true }, () => {
     const calls: Array<[string, string[], string | undefined]> = [];
     const run: CommandRunner = (cmd, args, cwd) => {
       calls.push([cmd, args, cwd]);
-      if (cmd === 'git') return { status: 0, stdout: args[0] === 'rev-parse' ? 'abc123\n' : '', stderr: '' };
-      if (args[0] === 'update') return { status: 0, stdout: '{"exitCode":0,"installedVersion":"0.2.7-abcdef123456"}\n', stderr: '' };
-      return { status: 0, stdout: calls.filter(([c]) => c === 'elanous').length === 1 ? '0.2.6 old\n' : '0.2.7-abcdef123456 new\n', stderr: '' };
+      if (cmd === 'ssh' && args[1]?.startsWith('cat ')) {
+        return { status: 0, stdout: JSON.stringify({ source: '/ops/rail-checkout', commit: TAG }), stderr: '' };
+      }
+      if (cmd === 'ssh' && args[1]?.startsWith('git -C ')) return { status: 0, stdout: 'true\n', stderr: '' };
+      if (cmd === 'git' && args[0] === 'rev-parse') return { status: 0, stdout: 'true\n', stderr: '' };
+      if (cmd === 'ssh' && args[1]?.includes("elanous '--version'")) return { status: 0, stdout: '0.2.6 old\n', stderr: '' };
+      if (args[0] === '--version') return { status: 0, stdout: '0.2.6 old\n', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
     };
-    const result = runOpsUpgrade(run, { installSource: () => '/ops/private-checkout', exists: () => false });
-    expect(result).toMatchObject({ outcome: 'ok', feed: 'skipped-no-path', hosts: [{ host: 'local', ok: true, after: '0.2.7-abcdef123456 new' }] });
-    expect(calls.filter(([cmd]) => cmd === 'git')).toEqual([
-      ['git', ['status', '--porcelain', '--untracked-files=all'], '/ops/private-checkout'],
-      ['git', ['fetch', '--tags'], '/ops/private-checkout'],
-      ['git', ['rev-parse', '--verify', 'refs/tags/v0.2.7^{commit}'], '/ops/private-checkout'],
-      ['git', ['checkout', '--detach', 'v0.2.7'], '/ops/private-checkout'],
-    ]);
-    expect(calls[5]).toEqual(['elanous', ['update', '--json', '--restart'], undefined]);
+    const result = runOpsUpgrade(run, { installSource: () => '/ops/rail-checkout', exists: () => false });
+    expect(result).toMatchObject({ outcome: 'ok', feed: 'skipped-no-path', hosts: [
+      { host: 'local', ok: true, before: '0.2.6 old', after: '0.2.6 old', skipped: 'rail-source' },
+      { host: 'node-b', ok: true, before: '0.2.6 old', after: '0.2.6 old', skipped: 'rail-source' },
+    ] });
+    expect(calls.some(([, args]) => args.some((arg) => arg === 'update'))).toBe(false);
+    expect(calls.some(([cmd, args]) => cmd === 'git' && args[0] === 'checkout')).toBe(false);
   });
 });
 
-test('dirty checkout and missing tag fail without running update', () => {
-  for (const failure of ['dirty', 'tag']) withContext({ opsHosts: ['local'] }, () => {
+test('absolute release archive sources are not mistaken for rail checkouts', () => {
+  withContext({ opsHosts: ['local'] }, () => {
+    let versions = 0;
+    let updated = false;
+    const result = runOpsUpgrade((cmd, args) => {
+      if (cmd === 'git') return { status: 128, stdout: '', stderr: 'not a git repository' };
+      if (args[0] === 'update') { updated = true; return good; }
+      if (args[0] === '--version') return { status: 0, stdout: ++versions === 1 ? '0.2.6 old\n' : '0.2.7 new\n', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    }, { installSource: () => '/tmp/elanous-release.tar.gz', exists: () => false });
+    expect(result).toMatchObject({ outcome: 'ok', hosts: [{ host: 'local', ok: true, after: '0.2.7 new' }] });
+    expect(updated).toBe(true);
+  });
+});
+
+test('installed commits descended from the release tag are skipped with kept-ahead judgment line', () => {
+  withContext({ opsHosts: ['local'], opsRestart: true }, () => {
+    const calls: Array<[string, string[]]> = [];
+    const result = runOpsUpgrade((cmd, args) => {
+      calls.push([cmd, args]);
+      if (cmd === 'git' && args[0] === 'merge-base') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === '--version') return { status: 0, stdout: '0.2.8 rail-build\n', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    }, { installSource: () => 'https://releases.example/elanous', installCommit: () => TAG, exists: () => false });
+    expect(result).toMatchObject({ outcome: 'ok', feed: 'skipped-no-path', hosts: [
+      { host: 'local', ok: true, before: '0.2.8 rail-build', after: '0.2.8 rail-build', skipped: 'kept-ahead' },
+    ] });
+    expect(calls.some(([, args]) => args.includes('update'))).toBe(false);
+  });
+});
+
+test('remote commit ancestry is fail-closed when the local checkout lacks the installed object', () => {
+  withContext({ opsHosts: ['node-b'] }, () => {
+    const calls: Array<[string, string[]]> = [];
+    const result = runOpsUpgrade((cmd, args) => {
+      calls.push([cmd, args]);
+      if (cmd === 'ssh' && args[1]?.startsWith('cat ')) {
+        return { status: 0, stdout: JSON.stringify({ source: 'https://releases.example/elanous', commit: 'd'.repeat(40) }), stderr: '' };
+      }
+      if (cmd === 'git' && args[0] === 'merge-base') return { status: 128, stdout: '', stderr: 'commit object missing' };
+      if (args[1]?.includes("'--version'")) return { status: 0, stdout: '0.2.8 rail-build\n', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    }, { exists: () => false });
+
+    expect(result).toMatchObject({ outcome: 'ok', hosts: [
+      { host: 'node-b', ok: true, before: '0.2.8 rail-build', after: '0.2.8 rail-build', skipped: 'kept-ahead' },
+    ] });
+    expect(calls.some(([cmd, args]) => cmd === 'git' && args[0] === 'merge-base')).toBe(true);
+    expect(calls.some(([cmd, args]) => cmd === 'ssh' && args[1]?.includes("'update'"))).toBe(false);
+  });
+});
+
+test('a known non-descendant commit still proceeds to the release update', () => {
+  withContext({ opsHosts: ['local'] }, () => {
+    let updated = false;
+    const result = runOpsUpgrade((cmd, args) => {
+      if (cmd === 'git' && args[0] === 'merge-base') return { status: 1, stdout: '', stderr: '' };
+      if (args[0] === 'update') { updated = true; return good; }
+      if (args[0] === '--version') return { status: 0, stdout: updated ? '0.2.7 new\n' : '0.2.6 old\n', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    }, { installSource: () => 'https://releases.example/elanous', installCommit: () => 'd'.repeat(40), exists: () => false });
+
+    expect(result).toMatchObject({ outcome: 'ok', hosts: [{ host: 'local', ok: true, after: '0.2.7 new' }] });
+    expect(updated).toBe(true);
+  });
+});
+
+test('release-source update failures remain failures without checkout mutation', () => {
+  withContext({ opsHosts: ['local'] }, () => {
     const calls: string[] = [];
     const result = runOpsUpgrade((cmd, args) => {
       calls.push(`${cmd} ${args.join(' ')}`);
-      if (cmd === 'git' && args[0] === 'status' && failure === 'dirty') return { status: 0, stdout: ' M package.json\n', stderr: '' };
-      if (cmd === 'git' && args[0] === 'rev-parse' && failure === 'tag') return { status: 1, stdout: '', stderr: 'not a valid tag' };
-      return { status: 0, stdout: cmd === 'git' ? '' : '0.2.6 old\n', stderr: '' };
-    }, { installSource: () => '/ops/private-checkout', exists: () => false });
+      if (args[0] === 'update') return { status: 1, stdout: '', stderr: 'update failed' };
+      return { status: 0, stdout: '0.2.6 old\n', stderr: '' };
+    }, { installSource: () => 'https://releases.example/elanous', exists: () => false });
     expect(result.outcome).toBe('fail');
-    expect(result.hosts[0]?.error).toContain(failure === 'dirty' ? '체크아웃 변경 있음' : '태그 없음');
-    expect(calls.some((call) => call.includes(' update '))).toBe(false);
+    expect(result.hosts[0]?.error).toContain('update failed');
+    expect(calls.some((call) => call.includes('git'))).toBe(false);
   });
 });
 
@@ -213,13 +282,15 @@ test('failed internal feed skips remotes, continues local and records the feed f
       if (cmd === 'bun') return { status: 1, stdout: '', stderr: 'pack failed\n' };
       return args[0] === 'update' ? good : { status: 0, stdout: '0.2.7 abc\n', stderr: '' };
     }, { installSource: () => null, feedSource: tagSource });
-    expect(calls.map(([cmd]) => cmd)).toEqual(['bun', 'elanous', 'elanous', 'elanous']);
+    expect(calls.filter(([cmd]) => cmd === 'bun')).toHaveLength(1);
+    expect(calls.filter(([cmd, args]) => cmd === 'ssh' && args[1]?.startsWith('cat '))).toHaveLength(2);
+    expect(calls.filter(([cmd]) => cmd === 'elanous')).toHaveLength(3);
     expect(result.outcome).toBe('fail');
     expect(result.feed).toBe('failed');
     expect(result.hosts).toEqual([
-      { host: 'node-b', ok: false, before: '', after: '', skipped: '내부 피드 발행 실패', error: '내부 피드 발행 실패: pack failed' },
+      { host: 'node-b', ok: false, before: '0.2.7 abc', after: '', skipped: '내부 피드 발행 실패', error: '내부 피드 발행 실패: pack failed' },
       { host: 'local', ok: true, before: '0.2.7 abc', after: '0.2.7 abc' },
-      { host: 'msb2', ok: false, before: '', after: '', skipped: '내부 피드 발행 실패', error: '내부 피드 발행 실패: pack failed' },
+      { host: 'msb2', ok: false, before: '0.2.7 abc', after: '', skipped: '내부 피드 발행 실패', error: '내부 피드 발행 실패: pack failed' },
     ]);
   });
 });
@@ -374,7 +445,7 @@ test('failed tag dependency install fails the feed, skips remotes and preserves 
         { host: 'local', ok: true },
       ] });
       expect(calls.filter(([cmd]) => cmd === 'bun')).toEqual([['bun', ['install', '--frozen-lockfile'], tree]]);
-      expect(calls.filter(([cmd]) => cmd === 'ssh')).toHaveLength(0);
+      expect(calls.filter(([cmd, args]) => cmd === 'ssh' && args[1]?.startsWith('cat '))).toHaveLength(1);
       expect(calls.filter(([cmd, args]) => cmd === 'elanous' && args[0] === 'update')).toHaveLength(1);
       expect(calls).toContainEqual(['git', ['worktree', 'remove', '--force', tree], repo]);
       expect(existsSync(tree)).toBe(false);

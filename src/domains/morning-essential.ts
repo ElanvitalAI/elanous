@@ -7,6 +7,7 @@
 
 import { getUserConfig } from '../user-config.js';
 import { getProviderForConfig, anyProviderAvailable, textOnly, type LLMMessage } from '../llm.js';
+import { debug } from '../debug/log.js';
 import { marketClock } from './finance.js';
 import { renderSemisEssential } from './kg-semis.js';
 import { feedBySource } from './morning-synthesis.js';
@@ -116,11 +117,25 @@ const ESSENTIAL_SYSTEM = `너는 Conatus 투자 아침 브리핑의 편집자다
 - 매매 지시(사라/팔라/비중 조절) 금지. 관찰과 유의점만. 최종 판단은 verify+HITL.
 - 담백하고 신중한 톤. 이모지 최소.`;
 
+/** synthesizeEssentialBrief 모델 자리(A/B 첫 조각) — 미지정이면 지금과 같은 기본 경로. */
+export interface EssentialSynthOpts {
+  /** 지정하면 getProviderForConfig(cfg, model) 로 부른다. */
+  model?: string;
+  /** provider 주입(시험용). 미지정이면 getProviderForConfig. */
+  providerFor?: (cfg: ReturnType<typeof getUserConfig>, model?: string) => ReturnType<typeof getProviderForConfig>;
+  /** 가용성 주입(시험용). 미지정이면 anyProviderAvailable. */
+  available?: () => boolean;
+}
+
 /** 상세 markdown 을 입력으로 LLM 시장서사 종합. provider 없거나 실패 시 ''(에센셜은 결정론만). */
-export async function synthesizeEssentialBrief(detailMarkdown: string): Promise<string> {
-  if (!anyProviderAvailable()) return '';
+export async function synthesizeEssentialBrief(detailMarkdown: string, opts: EssentialSynthOpts = {}): Promise<string> {
+  const { model, providerFor, available } = opts;
+  if (!(available ?? anyProviderAvailable)()) return '';
   try {
-    const provider = getProviderForConfig(getUserConfig());
+    const cfg = getUserConfig();
+    if (model) debug.log('domains.llm', 'cron-model', { domain: 'morning-essential', model: model ?? null });
+    const resolve = providerFor ?? getProviderForConfig;
+    const provider = model ? resolve(cfg, model) : resolve(cfg);
     if (!provider.streamChat) return '';
     // 토큰 절약: 상세를 앞부분 위주로 트림(핵심 섹션이 상단).
     const digest = detailMarkdown.slice(0, 6000);

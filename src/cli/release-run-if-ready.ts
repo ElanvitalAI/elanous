@@ -2,6 +2,8 @@ import { closeSync, mkdirSync, openSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
+import { adviseLaunch, compareLaunchAdvice } from '../harness/launch-advice.js';
+import type { QueuePool } from '../harness/harness-queue.js';
 import type { ReleaseReadiness } from '../../scripts/release-loop/release-readiness.js';
 
 export type ReleaseIfReadySkip = { skipped: true; reason: Exclude<ReleaseReadiness, { ready: true }>['reason']; detail: string };
@@ -12,6 +14,8 @@ export async function runReleaseIfReady<T>(version: string, deps: {
   ledgerRoot?: string;
   pid?: number;
   now?: () => Date;
+  advice?: typeof adviseLaunch;
+  pool?: () => QueuePool | undefined;
 }): Promise<ReleaseIfReadySkip | { skipped: false; result: T }> {
   const skip = (readiness: Exclude<ReleaseReadiness, { ready: true }>): ReleaseIfReadySkip => {
     const detail = readiness.reason === 'checklist-blocked'
@@ -40,6 +44,13 @@ export async function runReleaseIfReady<T>(version: string, deps: {
     const insideLock = await deps.readiness(version, { isPidAlive: () => false });
     if (!insideLock.ready) return skip(insideLock);
     debug.log('release-loop.readiness', 'ready', { version });
+    try {
+      const advice = (deps.advice ?? adviseLaunch)({ pool: deps.pool?.(), caller: 'release-run' });
+      const { kind } = compareLaunchAdvice(advice, 'launched');
+      debug.log('resource.advice', 'launch-advice', { caller: 'release-run', verdict: advice.verdict, why: advice.why, actual: 'launched', kind, version });
+    } catch {
+      // Shadow only: a throwing advice seam must never affect the launch decision or result.
+    }
     return { skipped: false, result: await deps.run() };
   } finally {
     closeSync(fd);

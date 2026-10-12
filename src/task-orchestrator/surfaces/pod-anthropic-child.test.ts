@@ -4,6 +4,7 @@ import { podChildLlmArgs, podNamedChildProvider, podSelfImplementSpawn, type Kub
 import { POD_CHILD_PROVIDERS, podChildProviderOf, podChildProviderRefusal } from './pod-child-providers.js';
 import { podChildProviderLaunchRefusal } from '../../harness/harness-cli-command.js';
 import { resolveImplementationChildModel } from '../../self-dev/dev-cli.js';
+import { stablePodManifestText } from './pod-manifest-test-normalize.js';
 
 // POD-ANTHROPIC-PROVIDER (0.2.24 · 대표 10-10 키 Pod 탑재 승인) — anthropic 자식 Pod.
 // ⛔ 운영 자격을 읽지 않는다: 키는 전부 주입 심(anthropicKey · readKeyCache · env)으로만 준다.
@@ -154,8 +155,7 @@ describe('POD-ANTHROPIC-PROVIDER — one list for the launch gate and the Pod', 
         await podSelfImplementSpawn({ credentials: codexCreds, kubectl: codex.kubectl, sleep: async () => {}, readKeyCache: cache, ...knob })({ feature: 'implement', spaceId: 'codex-invariant' }).done;
         await podSelfImplementSpawn({ provider: 'grok', grokCredentials: () => ({ grokApiKey: 'test-grok-key', ghToken: 'gh-test' }), grokApiKeyOptIn: true, kubectl: grok.kubectl, sleep: async () => {}, readKeyCache: cache, ...knob })({ feature: 'implement', spaceId: 'grok-invariant' }).done;
         await podSelfImplementSpawn({ provider: 'openrouter', childModel: 'openrouter/z-ai/glm-5.3', openrouterGhToken: () => 'gh-test', kubectl: openrouter.kubectl, sleep: async () => {}, readKeyCache: cache, ...knob })({ feature: 'implement', spaceId: 'or-invariant' }).done;
-        runs.push(JSON.stringify([...codex.applied, ...grok.applied, ...openrouter.applied].filter((entry) => entry.kind === 'Job' || entry.kind === 'Secret'))
-          .replace(/run-[0-9a-f-]{36}/g, 'run-<id>'));   // 런 id 만 매번 새로 뽑힌다 — 나머지는 바이트 그대로여야 한다
+        runs.push(stablePodManifestText([...codex.applied, ...grok.applied, ...openrouter.applied]));
       }
     } finally { log.mockRestore(); }
     expect(runs[0]!.length).toBeGreaterThan(0);

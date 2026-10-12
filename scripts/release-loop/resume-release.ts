@@ -10,6 +10,7 @@ import { lastJsonObject, runGraph, type GraphRunState } from '../../src/graph-ru
 import { releaseRunUniverse } from './release-universe.js';
 import { isReleaseVersion } from './release-version.js';
 import { changedFilesBetween, clearPartialPlan, planPartialRegate, writePartialPlan } from './gate-partial.js';
+import { gitClosureTree, testsReachingChanged, type ClosureTree } from './gate-closure.js';
 import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
 
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
@@ -29,7 +30,14 @@ export interface ResumeReleaseDeps {
   now?: () => Date;
   /** Machine release ledger (gate-failures.json of the prior gate) — default releaseLedgerRoot(). */
   ledgerRoot?: string;
+  /** GATE-REUSE-BY-DIFF: the tip tree for the import closure — default read from git objects of the tip commit. */
+  closureTree?: (commit: string) => ClosureTree;
 }
+
+/** CLI entry files: a production file that only names one (help text, a goal's command line) does not run it. */
+const CLI_ENTRIES = ['bin/elanous.mjs', 'src/index.ts'] as const;
+/** The gate's own test-file set (gate-node sweep: `git ls-files '*.test.*'` filtered by this). */
+const GATE_TEST = /\.test\.(?:tsx?|jsx?|mts|cts)$/;
 
 export interface TipRefresh { version: string; branch: string; from: string; to: string; changed: boolean; statePath: string; backup?: string }
 
@@ -114,18 +122,25 @@ export function refreshReleaseBranchTip(runId: string, deps: ResumeReleaseDeps =
   return { version, branch, from: recorded, to, changed: true, statePath, backup };
 }
 
-/** GATE-PARTIAL outcome of a resume — applied (plan written) or the reason it fell back to a full gate. */
-export type PartialOutcome = { requested: false } | { requested: true; applied: true; files: number; priorCommit: string } | { requested: true; applied: false; reason: string };
+/** GATE-PARTIAL outcome of a resume — applied (plan written) or the reason it fell back to a full gate. `auto` marks the
+ *  default plan of `--from gate` (GATE-REUSE-BY-DIFF); `closure` is set when code changes were followed. */
+export type PartialOutcome = { requested: false }
+  | { requested: true; applied: true; files: number; priorCommit: string; auto?: true; closure?: { reached: number; opaque: number } }
+  | { requested: true; applied: false; reason: string; auto?: true };
 
-/** Build (or clear) the partial re-gate plan for the new tip. Fail-closed: any doubt leaves a full gate. */
+/** Build (or clear) the partial re-gate plan for the new tip. Fail-closed: any doubt leaves a full gate.
+ *  GATE-REUSE-BY-DIFF: `--from gate` on a moved tip plans by default (`partial: undefined`); `partial: false` opts out. */
 function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean }, deps: ResumeReleaseDeps): PartialOutcome {
   const root = deps.root ?? effectiveInstanceRoot();
-  // Any resume starts from no plan: one without --partial (from whatever node) never inherits an older plan.
+  // Any resume starts from no plan: one without a partial plan (from whatever node) never inherits an older plan.
   clearPartialPlan(root, tip.version);
-  if (!opts.partial) return { requested: false };
+  const auto = opts.partial === undefined;
+  // The default applies only where it can help: a gate re-run on a tip that moved. An unchanged tip re-uses its own
+  // shard results by commit already.
+  if (opts.partial === false || (auto && (opts.from !== 'gate' || !tip.changed))) return { requested: false };
   const fallback = (reason: string): PartialOutcome => {
-    debug.log('release-loop.resume', 'partial-fallback', { version: tip.version, reason });
-    return { requested: true, applied: false, reason };
+    debug.log('release-loop.resume', 'partial-fallback', { version: tip.version, reason, auto });
+    return { requested: true, applied: false, reason, ...(auto ? { auto: true as const } : {}) };
   };
   if (opts.from !== 'gate') return fallback('--partial only applies to --from gate');
   if (!tip.changed) return fallback('release branch tip unchanged — nothing new to re-check');
@@ -151,12 +166,23 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
     // The tip is already refreshed — a failed diff must not strand the resume: run the full gate and say why.
     return fallback(`changed files unreadable: ${String(error instanceof Error ? error.message : error).slice(0, 200)}`);
   }
+  // The tip tree (git objects of tip.to, never the working tree): existence of planned tests ⊕ the import closure.
+  let tree: ClosureTree;
+  try { tree = (deps.closureTree ?? ((commit: string) => gitClosureTree(deps.repo ?? process.cwd(), commit)))(tip.to); }
+  catch (error) { return fallback(`tip tree unreadable: ${String(error instanceof Error ? error.message : error).slice(0, 200)}`); }
+  const tracked = new Set(tree.files);
+  const tests = tree.files.filter((file) => GATE_TEST.test(file));
   const planned = planPartialRegate({ version: tip.version, priorCommit: tip.from, forCommit: tip.to, changedFiles: changed,
-    priorFailures: prior.failures as string[], priorErrors: (prior.errors ?? []) as string[] });
+    priorFailures: prior.failures as string[], priorErrors: (prior.errors ?? []) as string[],
+    existsAtTip: (file) => tracked.has(file),
+    closure: (changedCode) => testsReachingChanged(tree, changedCode, tests, { cliEntries: CLI_ENTRIES }) });
   if (!planned.ok) return fallback(planned.reason);
+  if (planned.plan.files.length >= tests.length) return fallback(`every test is re-run (${tests.length}) — full gate`);
   const path = writePartialPlan(root, planned.plan);
-  debug.log('release-loop.resume', 'partial-planned', { version: tip.version, priorCommit: tip.from, commit: tip.to, files: planned.plan.files.length, path });
-  return { requested: true, applied: true, files: planned.plan.files.length, priorCommit: tip.from };
+  debug.log('release-loop.resume', 'partial-planned', { version: tip.version, priorCommit: tip.from, commit: tip.to, files: planned.plan.files.length,
+    tests: tests.length, auto, path, ...(planned.closure ? { reached: planned.closure.reached, opaque: planned.closure.opaque } : {}) });
+  return { requested: true, applied: true, files: planned.plan.files.length, priorCommit: tip.from,
+    ...(auto ? { auto: true as const } : {}), ...(planned.closure ? { closure: planned.closure } : {}) };
 }
 
 /** The graph file the run started from — a snapshot run refuses any other path (the installed CLI's own copy differs). */
@@ -183,6 +209,7 @@ export async function resumeReleaseRun(opts: { runId: string; from: string; part
   if (gateExecutor) debug.log('release-loop.resume', 'gate-executor', { runId: opts.runId, from: opts.from, executor: gateExecutor.set.gateExecutor, host: gateExecutor.set.gateRemote ?? null, previous: gateExecutor.previous });
   const waiver = original && (opts.waive !== undefined || opts.reason !== undefined)
     ? releaseResumeWaiver(original, opts) : undefined;
+  if (waiver) debug.log('release-loop.resume', 'waiver', { runId: opts.runId, node: waiver.nodeId, reason: waiver.reason, unmeasured: waiver.unmeasured ?? null });
   const acceptedRegressions = original && opts.acceptedRegressions !== undefined && !waiver
     ? releaseResumeAcceptedRegressions(original, opts.acceptedRegressions, opts.from) : undefined;
   // A waived verdict may reuse its original commit. A moved tip still requires a full re-gate.

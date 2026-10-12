@@ -154,6 +154,59 @@ export function parsePodPool(spec: string): PodPoolMember[] {
  */
 export type PodPlacementKind = 'lite' | 'standard';
 
+/** Identity carried by a launched pool Job and its Pod; absent source fields stay absent. */
+export interface PodWorkIdentity {
+  ownerKind?: 'seat' | 'steward' | 'orchestrator' | 'external';
+  ownerId?: string;
+  taskCard?: string;
+  slotId?: string;
+  work?: 'harness' | 'authoring' | 'lite';
+}
+
+/** Kubernetes label values cannot exceed 63 characters or contain arbitrary card/owner text. */
+export function podWorkLabels(identity: PodWorkIdentity): Record<string, string> {
+  const value = (raw: string | undefined): string | undefined => {
+    const cleaned = (raw ?? '').replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 63).replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '');
+    return cleaned || undefined;
+  };
+  const ownerId = identity.ownerId && value(identity.ownerId) === identity.ownerId ? identity.ownerId : undefined;
+  const taskCard = identity.taskCard && value(identity.taskCard) === identity.taskCard ? identity.taskCard : undefined;
+  const slotId = identity.slotId && value(identity.slotId) === identity.slotId ? identity.slotId : undefined;
+  return {
+    ...(identity.ownerKind && ownerId ? { 'elanous.owner-kind': identity.ownerKind, 'elanous.owner-id': ownerId } : {}),
+    ...(taskCard ? { 'elanous.task-card': taskCard } : {}),
+    ...(slotId ? { 'elanous.checklist': slotId } : {}),
+    ...(identity.work ? { 'elanous.work': identity.work } : {}),
+  };
+}
+
+/** Minih standard-Job policy, independent of the configured pool member capacity. Not wired into allocation. */
+export type MinihLocation = 'home' | 'external';
+
+export function minihStandardCapacity(location: MinihLocation): number {
+  return location === 'home' ? 1 : 2;
+}
+
+/** A drain withholds new slots until occupancy falls to the target; it never evicts Running Pods. */
+export function decideMinihDrain(location: MinihLocation, runningPods: number, pendingPods = 0): {
+  capacity: number;
+  runningPods: number;
+  drainNewAdmissions: boolean;
+  availableSlots: number;
+} {
+  if (![runningPods, pendingPods].every((count) => Number.isSafeInteger(count) && count >= 0)) {
+    throw new RangeError('node-c occupancy must be non-negative whole Pods');
+  }
+  const capacity = minihStandardCapacity(location);
+  const occupied = runningPods + pendingPods;
+  return {
+    capacity,
+    runningPods,
+    drainNewAdmissions: occupied > capacity,
+    availableSlots: Math.max(0, capacity - occupied),
+  };
+}
+
 export interface PodPlacement {
   readonly member: string;
   readonly kind: PodPlacementKind | null;

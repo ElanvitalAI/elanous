@@ -523,8 +523,9 @@ test('ORCH-LIVE-1008: a released copy of an id never blocks placement (open copy
 
 test('ORCH-LIVE-1008: a pre-existing dependency violation elsewhere on the board does not block an unrelated placement', () => {
   setup();
-  addItem('0.2.14', { id: 'before', title: 'before', owner: 'MK', predecessors: ['after'] });
+  // CELL-DEPENDS-ID: a predecessor must exist when it is named, so the predecessor goes in first — same board.
   addItem('0.2.15', { id: 'after', title: 'after', owner: 'MK' });
+  addItem('0.2.14', { id: 'before', title: 'before', owner: 'MK', predecessors: ['after'] });
   expect(placeCell(cell('unrelated'), { ...deps(), released: '0.2.13', dryRun: true }).version).toMatch(/^0\.2\.1[4-7]$/);
   // a placement that depends on a cell is still placed after it
   const after = placeCell({ ...cell('needs-after'), predecessors: ['after'] }, { ...deps(), released: '0.2.13', dryRun: true }).version;

@@ -11,7 +11,8 @@
 // PAUSE+ASK in the loop. Drift is more dangerous than a confirm.
 
 import { debug } from '../debug/log.js';
-import { getProvider, resolveDefaultProvider, type LLMMessage, type LLMOpts } from '../llm.js';
+import { getProvider, logAgentTurnUsage, resolveDefaultProvider, type LLMMessage, type LLMOpts } from '../llm.js';
+import type { LLMUsage } from '../prompt-cache/types.js';
 import type { GoalJudgeVerdict } from './types.js';
 
 export interface JudgeInput {
@@ -180,15 +181,28 @@ export async function judgeGoalTurn(
     });
 
     let text = '';
+    let usage: LLMUsage = {};
     try {
-      const stream = provider.chat(messages, llmOpts);
       const t0 = Date.now();
-      for await (const chunk of stream) {
-        text += chunk;
-        if (opts.timeoutMs && Date.now() - t0 > opts.timeoutMs) {
-          throw new Error(`judge timeout after ${opts.timeoutMs}ms`);
+      if (provider.streamChat) {
+        for await (const ev of provider.streamChat(messages, llmOpts)) {
+          if (ev.type === 'text' && ev.delta) text += ev.delta;
+          else if (ev.type === 'usage') usage = { ...usage, ...ev.usage };
+          if (opts.timeoutMs && Date.now() - t0 > opts.timeoutMs) {
+            throw new Error(`judge timeout after ${opts.timeoutMs}ms`);
+          }
+        }
+      } else {
+        for await (const chunk of provider.chat(messages, llmOpts)) {
+          text += chunk;
+          if (opts.timeoutMs && Date.now() - t0 > opts.timeoutMs) {
+            throw new Error(`judge timeout after ${opts.timeoutMs}ms`);
+          }
         }
       }
+      try {
+        logAgentTurnUsage(opts.model ?? provider.defaultModel, usage, { providerName: provider.name, site: 'goals.judge' });
+      } catch { /* best-effort observation */ }
     } catch (err) {
       debug.log('goal', 'judge.error', { attempt, message: (err as Error).message }, { level: 'error' });
       // On timeout / abort, return null so the loop can pause-ask

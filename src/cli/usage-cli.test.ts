@@ -202,3 +202,16 @@ describe('usage outcomes', () => {
     expect(table).toContain('no-progress=1');
   });
 });
+
+// ⭐ METER-POD-ROLLUP-GAP-2 — `elanous usage` 도 Pod 재방출(같은 podRollupKey)을 한 번만 센다.
+describe('usage runs — pod rollup re-emit dedup', () => {
+  it('counts a partial and a final re-emit of the same Pod bucket once (final wins); unkeyed rows are untouched', async () => {
+    const read = () => [
+      row({ runId: 'run-p', model: 'm', billingProvider: 'gateway', billing: 'api', inputTokens: 2, podRollupKey: 'K', partial: true, partialSeq: 3, cost: { kind: 'known', usd: 1 } }),
+      row({ runId: 'run-p', model: 'm', billingProvider: 'gateway', billing: 'api', inputTokens: 9, podRollupKey: 'K', cost: { kind: 'known', usd: 4 } }),
+      row({ runId: 'run-p', model: 'm', billingProvider: 'gateway', billing: 'api', inputTokens: 1, cost: { kind: 'known', usd: 0.5 } }),
+    ];
+    const [first] = JSON.parse((await run(['runs', '--run', 'run-p', '--json'], read))[0]!);
+    expect(first).toMatchObject({ calls: 2, inputTokens: 10, usdKnown: 4.5 });
+  });
+});

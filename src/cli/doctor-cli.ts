@@ -40,6 +40,7 @@ import type { LlmInventory } from '../llm/local-manager/types.js';
 import { buildDoctorBundle } from './doctor-bundle.js';
 import { uploadDoctorBundle } from './doctor-bundle-upload.js';
 import { checkNodeModules, formatNodeModulesCheck, nodeModulesTrees } from './doctor-node-modules.js';
+import { formatHostDoctorLines, runHostDoctor, type HostDoctorExpected, type HostDoctorRemote } from '../fleet/host-doctor.js';
 
 function defaultCheckPythonEnv(): { status: 'ok' | 'fixable' | 'manual'; evidence: string; remedy?: string } {
   const c = checkPythonEnv(false);
@@ -198,6 +199,10 @@ export interface DoctorCliDeps extends DoctorOptions, Pick<DoctorFixDeps, 'home'
   /** Inject the upload transport and consent for isolated CLI tests. */
   uploadFetch?: typeof globalThis.fetch;
   confirmBundleUpload?: (message: string) => Promise<boolean>;
+  /** `doctor host` 원격 실행(시험 seam) — 기본 = ssh BatchMode · `local` 이면 이 기계. */
+  hostDoctorRemote?: HostDoctorRemote;
+  /** `doctor host` 가 대조할 HQ 실측값(설치 판 · 이미지 핀) — 없으면 해당 점검은 unmeasured. */
+  hostDoctorExpected?: HostDoctorExpected;
 }
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -1239,6 +1244,22 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
       const checks = dirs.map(checkNodeModules);
       out.log(json ? JSON.stringify(opts.all ? checks : checks[0], null, 2) : checks.map(formatNodeModulesCheck).join('\n'));
       if (checks.some((check) => check.status !== 'ok')) setExitCode(1);
+    });
+  doctor.command('host')
+    .description('Check whether a fleet host stands ready for its role (read-only · setup-status shape)')
+    .argument('<host>', "ssh name, or 'local' for this machine")
+    .option('--role <role>', 'host role: worker or hq', 'worker')
+    .option('--json', 'structured output')
+    .action((host: string, opts: { role: string; json?: boolean }, command: Command) => {
+      if (opts.role !== 'worker' && opts.role !== 'hq') {
+        err.error('--role must be worker or hq');
+        setExitCode(1);
+        return;
+      }
+      const json = opts.json === true || command.parent?.opts().json === true;
+      const report = runHostDoctor({ host, role: opts.role, remote: deps.hostDoctorRemote, expected: deps.hostDoctorExpected });
+      out.log(json ? JSON.stringify(report, null, 2) : formatHostDoctorLines(report).join('\n'));
+      if (!report.ok) setExitCode(1);
     });
   doctor
     .option('--credentials', 'show per-credential details in human-readable output')

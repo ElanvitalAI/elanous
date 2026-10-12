@@ -2,9 +2,13 @@
 // changed — not the whole 24-shard sweep again (0.2.18: two timeout fixes on top of an 84-minute gate meant another full
 // gate). The plan is opt-in (`release resume --from gate --partial`) and fail-closed: any non-test source change, a prior
 // gate record for another commit, or a missing record means «full gate», never a guess.
+// GATE-REUSE-BY-DIFF (0.2.25): a code change no longer forces the full sweep — with the tip's import closure
+// (gate-closure.ts) the plan adds every test that can reach a changed file, and every test whose closure is opaque.
+// `release resume --from gate` now plans this by default when the tip moved (`--no-partial` = full gate).
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
+import { CODE_FILE, type ClosureVerdict } from './gate-closure';
 
 export interface PartialPlan {
   version: string;
@@ -12,7 +16,7 @@ export interface PartialPlan {
   priorCommit: string;
   /** The commit this plan is for — a gate on any other commit ignores it. */
   forCommit: string;
-  /** Test files re-run: changed test files ⊕ files of the prior failures. */
+  /** Test files re-run: changed test files ⊕ files of the prior failures ⊕ tests reaching a changed code file. */
   files: string[];
   priorFailures: string[];
   priorErrors: string[];
@@ -37,19 +41,43 @@ export function testFileOfId(id: string): string {
 
 /** Decide whether a partial re-gate is safe for `changedFiles` (prior → for). Never guesses: any doubt is a full gate. */
 export function planPartialRegate(input: { version: string; priorCommit: string; forCommit: string; changedFiles: readonly string[];
-  priorFailures: readonly string[]; priorErrors: readonly string[] }):
-  { ok: true; plan: PartialPlan } | { ok: false; reason: string } {
+  priorFailures: readonly string[]; priorErrors: readonly string[];
+  /** GATE-REUSE-BY-DIFF: the tests reaching these changed code files (seeds include changed tests). Without it any
+   *  non-test change is a full gate. */
+  closure?: (changedCode: string[]) => ClosureVerdict;
+  /** Tracked at the tip — a deleted changed test is not re-run (nothing to run); a deleted prior-failure file is a full
+   *  gate (its failure can be neither re-measured nor carried). Without it every changed test is planned. */
+  existsAtTip?: (file: string) => boolean }):
+  { ok: true; plan: PartialPlan; closure?: { reached: number; opaque: number } } | { ok: false; reason: string } {
   if (!/^[0-9a-f]{40}$/i.test(input.priorCommit) || !/^[0-9a-f]{40}$/i.test(input.forCommit)) return { ok: false, reason: 'commit is not a full sha' };
   if (input.priorCommit === input.forCommit) return { ok: false, reason: 'no new commit since the prior gate' };
   const source = input.changedFiles.filter((file) => !TEST_FILE.test(file) && !isInert(file));
-  if (source.length) return { ok: false, reason: `non-test change → full gate: ${source.slice(0, 5).join(', ')}${source.length > 5 ? ` (+${source.length - 5})` : ''}` };
+  const list = (files: string[]) => `${files.slice(0, 5).join(', ')}${files.length > 5 ? ` (+${files.length - 5})` : ''}`;
+  // Only code is followed through the closure: a changed fixture, JSON, lockfile, config or script is a full gate.
+  const notCode = source.filter((file) => !CODE_FILE.test(file));
+  if (source.length && (!input.closure || notCode.length)) return { ok: false, reason: `non-test change → full gate: ${list(notCode.length ? notCode : source)}` };
+  let reaching: string[] = [];
+  let closure: { reached: number; opaque: number } | undefined;
+  if (source.length) {
+    let verdict: ClosureVerdict;
+    try { verdict = input.closure!(input.changedFiles.filter((file) => CODE_FILE.test(file))); }
+    catch (error) { return { ok: false, reason: `import closure unreadable → full gate: ${String(error instanceof Error ? error.message : error).slice(0, 200)}` }; }
+    if (!verdict.ok) return { ok: false, reason: verdict.reason };
+    const unsafe = verdict.tests.filter((file) => !TEST_FILE.test(file) || file.split('/').includes('..'));
+    if (unsafe.length) return { ok: false, reason: `closure selected a test path the plan cannot carry → full gate: ${list(unsafe)}` };
+    reaching = verdict.tests;
+    closure = { reached: verdict.reached, opaque: verdict.opaque };
+  }
   let failureFiles: string[];
   try { failureFiles = [...input.priorFailures, ...input.priorErrors].map(testFileOfId); }
   catch (error) { return { ok: false, reason: String(error instanceof Error ? error.message : error) }; }
-  const files = [...new Set([...input.changedFiles.filter((file) => TEST_FILE.test(file)), ...failureFiles])].sort();
+  const exists = input.existsAtTip ?? (() => true);
+  const gone = failureFiles.filter((file) => !exists(file));
+  if (gone.length) return { ok: false, reason: `prior failure file deleted at the tip → full gate: ${list(gone)}` };
+  const files = [...new Set([...input.changedFiles.filter((file) => TEST_FILE.test(file) && exists(file)), ...failureFiles, ...reaching])].sort();
   if (!files.length) return { ok: false, reason: 'nothing to re-run' };
   return { ok: true, plan: { version: input.version, priorCommit: input.priorCommit, forCommit: input.forCommit, files,
-    priorFailures: [...input.priorFailures], priorErrors: [...input.priorErrors] } };
+    priorFailures: [...input.priorFailures], priorErrors: [...input.priorErrors] }, ...(closure ? { closure } : {}) };
 }
 
 export function writePartialPlan(root: string, plan: PartialPlan): string {

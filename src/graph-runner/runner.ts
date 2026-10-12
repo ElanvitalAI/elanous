@@ -41,7 +41,7 @@ export interface GraphRunState {
   /** startedAt/endedAt (ISO) and seconds are written when the node runs; ledgers before GRAPH-NODE-TIMES (0.2.19) have none. */
   nodes: Array<{ nodeId: string; ok: boolean; exit: number | null; executed: boolean; output?: unknown; error?: string; decidedBy?: string; decidedAt?: string;
     startedAt?: string; endedAt?: string; seconds?: number;
-    waiver?: { reason: string; at: string; original: { exit: number | null; output?: unknown; error?: string } } }>;
+    waiver?: { reason: string; at: string; /** RELEASE-WAIVE-UNMEASURED — why the waived gate had no verdict. */ unmeasured?: string; original: { exit: number | null; output?: unknown; error?: string } } }>;
   /** The node now running and when it started; cleared when its record is written. */
   currentNode?: { nodeId: string; startedAt: string };
   input?: unknown;
@@ -76,7 +76,7 @@ export interface GraphRunOptions {
   resumeGraphId?: string;
   fromNodeId?: string;
   /** Release-only: accept the recorded failed node without executing it, and expose its regression to known-issues. */
-  releaseWaiver?: { nodeId: string; reason: string; requestedRegressions: AcceptedRegression[]; acceptedRegressions: AcceptedRegression[] };
+  releaseWaiver?: { nodeId: string; reason: string; requestedRegressions: AcceptedRegression[]; acceptedRegressions: AcceptedRegression[]; unmeasured?: string };
   /** Release-only: add accepted issues independently of a waiver at a restart boundary. */
   releaseAcceptedRegressions?: { requested: AcceptedRegression[]; acceptedRegressions: AcceptedRegression[] };
   /** Release-only (GATE-HOST-EXECUTOR): run the restarted gate on this executor — recorded in `inputOverrides`, never a waiver. */
@@ -358,6 +358,9 @@ export function decideGraphApproval(graphId: string, runId: string, decision: 'a
   return applyRecordedDecision(state);
 }
 
+/** The record `graph runs stop` writes for the node it cut (release resume reads it as an unmeasured gate). */
+export const STOPPED_NODE_ERROR = 'stopped before node completed';
+
 /** 노드 stdout 의 «마지막 비어 있지 않은 줄»이 JSON 객체면 그것을 구조 산출로 본다(아니면 없음). */
 export function lastJsonObject(stdout: unknown): Record<string, unknown> | undefined {
   if (typeof stdout !== 'string') return undefined;
@@ -611,7 +614,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     if (options.releaseWaiver) {
       if (graphId !== 'release-loop') throw new Error('release waiver requires the release-loop graph');
       const checked = releaseResumeWaiver(state, { from: options.fromNodeId, waive: options.releaseWaiver.nodeId, reason: options.releaseWaiver.reason, acceptedRegressions: options.releaseWaiver.requestedRegressions });
-      if (!checked || JSON.stringify(checked.acceptedRegressions) !== JSON.stringify(options.releaseWaiver.acceptedRegressions)) throw new Error('release waiver input changed before restart');
+      if (!checked || JSON.stringify(checked.acceptedRegressions) !== JSON.stringify(options.releaseWaiver.acceptedRegressions) ||
+        checked.unmeasured !== options.releaseWaiver.unmeasured) throw new Error('release waiver input changed before restart');
       const route = new Set<string>();
       let cursor: string | undefined = nextNode(graph.edges, options.fromNodeId, 'ok', 'ok');
       while (cursor && !route.has(cursor) && cursor !== 'known-issues') {
@@ -995,7 +999,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         output = JSON.stringify({ outcome: ok ? 'approved' : 'rejected', ...(state.pending?.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending?.decidedAt ?? null });
       }
       state.nodes.push({ nodeId: current, ok, exit, executed: !waiving && ((!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun) || unitExecuted), ...((waiving || units.has(current) || ((command || prompt || approval) && (!state.dryRun || !!command?.dry_run_command))) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
-        ...(waiving ? { waiver: { reason: options.releaseWaiver!.reason, at: nodeEndedAt, original: { exit: waivedRecord!.exit, ...(waivedRecord!.output === undefined ? {} : { output: waivedRecord!.output }), ...(waivedRecord!.error === undefined ? {} : { error: waivedRecord!.error }) } } } : {}),
+        ...(waiving ? { waiver: { reason: options.releaseWaiver!.reason, at: nodeEndedAt, ...(options.releaseWaiver!.unmeasured === undefined ? {} : { unmeasured: options.releaseWaiver!.unmeasured }), original: { exit: waivedRecord!.exit, ...(waivedRecord!.output === undefined ? {} : { output: waivedRecord!.output }), ...(waivedRecord!.error === undefined ? {} : { error: waivedRecord!.error }) } } } : {}),
         ...(approval && state.pending ? { ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt } : {}),
         startedAt: nodeStartedAt, endedAt: nodeEndedAt, seconds });
     }
@@ -1160,7 +1164,7 @@ export function manageGraphRun(graphId: string, runId: string, action: 'stop' | 
     // One stop instant for the node end, finishedAt and stoppedAt — never before the running node's start.
     const stopMs = running === undefined ? Date.now() : Math.max(Date.now(), Date.parse(running));
     if (state.path.length === state.nodes.length + 1) {
-      state.nodes.push({ nodeId: state.path.at(-1)!, ok: false, exit: null, executed: false, error: 'stopped before node completed',
+      state.nodes.push({ nodeId: state.path.at(-1)!, ok: false, exit: null, executed: false, error: STOPPED_NODE_ERROR,
         // The stop instant is always the node end; a start (and so seconds) exists only when the ledger named the running
         // node — a run begun by a runner before GRAPH-NODE-TIMES did not, and a guessed start would be a false time.
         endedAt: new Date(stopMs).toISOString(),

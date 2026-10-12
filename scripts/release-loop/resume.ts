@@ -1,4 +1,4 @@
-import type { GraphRunState } from '../../src/graph-runner/runner.js';
+import { lastJsonObject, STOPPED_NODE_ERROR, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { publicWaiverReason } from './known-issues-node.js';
 import { checkGateExecutorChoice, type GateExecutor } from './gate-executor.js';
 
@@ -28,11 +28,66 @@ export function releaseResumeAcceptedRegressions(state: GraphRunState, additions
   return combined;
 }
 
+const SWEEP_INCOMPLETE = /^(?:pod sweep incomplete|sweep incomplete|[\w-]+ shard incomplete)\b/;
+
+/**
+ * RELEASE-WAIVE-UNMEASURED — why the saved gate record at `index` carries no verdict, or undefined when it does (or may).
+ * Fail-closed: only three shapes count, each read from what the runner and gate-node actually write:
+ *  ① stopped — `graph runs stop` wrote {ok:false, executed:false, exit:null, error:STOPPED_NODE_ERROR} as the run's last record;
+ *  ② no verdict — the gate process ended with exit null (signal, idle timeout, or a spawn that failed) and printed no result line at
+ *     all (no output line is a JSON object with an `outcome`), so the run went gate → failed. A verdict followed by more
+ *     log lines and then a kill is still a verdict: refused;
+ *  ③ sweep incomplete — gate-node printed outcome `error` (no verdict: the baseline comparison never ran, so `introduced`
+ *     is still the empty initial list) and the error is an incomplete sweep (stalled shards / no tests ran). The finished
+ *     shards' counts go into the detail. Any other error (cleanup, baseline persistence, …) may follow a verdict: refused.
+ * An `outcome: fail` (introduced > 0), an introduced list that is not empty, or an already-waived record is never unmeasured.
+ */
+/** Any output line that is a JSON object naming an `outcome` — a verdict was printed, whatever came after it. */
+function printedVerdict(output: unknown): boolean {
+  if (typeof output !== 'string') return false;
+  return output.split('\n').some((line) => {
+    const text = line.trim();
+    if (!text.startsWith('{')) return false;
+    try { const value = JSON.parse(text) as unknown; return !!value && typeof value === 'object' && 'outcome' in value; } catch { return false; }
+  });
+}
+
+export function gateUnmeasuredDetail(state: GraphRunState, index: number): string | undefined {
+  const record = state.nodes[index];
+  if (!record || record.nodeId !== 'gate' || state.path[index] !== 'gate' || record.ok !== false || record.waiver !== undefined) return undefined;
+  if (state.nodes.some((saved) => saved.nodeId === 'gate' && saved !== record)) return undefined;
+  const last = index === state.path.length - 1 && index === state.nodes.length - 1;
+  if (last && record.executed === false && record.exit === null && record.error === STOPPED_NODE_ERROR && record.output === undefined) {
+    return `stopped: ${STOPPED_NODE_ERROR}${typeof record.seconds === 'number' ? ` after ${record.seconds}s` : ''}`;
+  }
+  const failedAfter = index === state.path.length - 2 && state.path.at(-1) === 'failed' && state.nodes.at(-1)?.nodeId === 'failed'
+    && state.nodes.length === state.path.length;
+  if (!failedAfter || record.executed !== true) return undefined;
+  const result = lastJsonObject(record.output);
+  if (result === undefined) {
+    if (record.exit !== null || printedVerdict(record.output)) return undefined;
+    return `no-verdict: gate process ended with exit null and no result line${record.error ? ` — ${record.error.split('\n')[0]!.slice(0, 120)}` : ''}`;
+  }
+  if (result.outcome !== 'error' || !Array.isArray(result.introduced) || result.introduced.length !== 0) return undefined;
+  const error = typeof result.error === 'string' ? result.error : '';
+  if (!SWEEP_INCOMPLETE.test(error)) return undefined;
+  // The detail keeps what WAS measured: each stalled shard's reason and the finished shards' counts (failures there are
+  // not yet split into introduced vs pre-existing — the baseline comparison never ran).
+  const stalled = Array.isArray(result.stalledShards) ? result.stalledShards as Array<{ reason?: unknown }> : [];
+  const reasons = new Map<string, number>();
+  for (const shard of stalled) reasons.set(String(shard?.reason ?? 'unknown'), (reasons.get(String(shard?.reason ?? 'unknown')) ?? 0) + 1);
+  const summary = result.partialSummary as { pass?: unknown; fail?: unknown; errors?: unknown; ran?: unknown } | undefined;
+  const measured = summary && typeof summary === 'object'
+    ? ` · finished shards measured pass ${String(summary.pass)} fail ${String(summary.fail)} errors ${String(summary.errors)} ran ${String(summary.ran)}` : '';
+  return `sweep incomplete: ${error.split('\n')[0]!.slice(0, 200)}`
+    + (stalled.length ? ` · stalled shards ${stalled.length} (${[...reasons].map(([reason, count]) => `${reason}×${count}`).join(', ')})` : '') + measured;
+}
+
 /** Only the recorded failure at the restart boundary may be waived. `--from` is never a waiver. */
 export function releaseResumeWaiver(
   state: GraphRunState,
   opts: { from: string; waive?: string; reason?: string; acceptedRegressions?: AcceptedRegression[] },
-): { nodeId: string; reason: string; acceptedRegressions: AcceptedRegression[] } | undefined {
+): { nodeId: string; reason: string; acceptedRegressions: AcceptedRegression[]; unmeasured?: string } | undefined {
   if ((opts.waive === undefined) !== (opts.reason === undefined)) throw new Error('--waive <node> and --reason <text> must be supplied together');
   if (opts.waive !== undefined && !opts.waive.trim()) throw new Error('--waive must not be empty');
   if (opts.waive === undefined) return undefined;
@@ -41,13 +96,23 @@ export function releaseResumeWaiver(
   publicWaiverReason(reason);
   if (opts.from !== opts.waive) throw new Error('--from must name the waived node; --from alone does not waive a failure');
   const index = state.path.indexOf(opts.waive);
-  if (index < 0 || state.path.lastIndexOf(opts.waive) !== index || state.nodes[index]?.nodeId !== opts.waive || state.nodes[index]?.ok !== false ||
+  const unique = index >= 0 && state.path.lastIndexOf(opts.waive) === index;
+  // RELEASE-WAIVE-UNMEASURED (OP 10-12): a gate cut before any verdict is the only gate that may be waived — a measured gate
+  // failure or an already-waived gate stays refused (fail-closed below), and the ledger records why it was unmeasured.
+  const unmeasured = opts.waive === 'gate' && unique ? gateUnmeasuredDetail(state, index) : undefined;
+  if (unmeasured !== undefined) {
+    return { nodeId: opts.waive, reason, unmeasured, acceptedRegressions: releaseResumeAcceptedRegressions(state,
+      [...(opts.acceptedRegressions ?? []), { id: `waive:${opts.waive}`, note: reason }]) };
+  }
+  if (!unique || state.path.lastIndexOf(opts.waive) !== index || state.nodes[index]?.nodeId !== opts.waive || state.nodes[index]?.ok !== false ||
     state.nodes[index]?.executed !== true || state.path.at(-2) !== opts.waive || state.path.at(-1) !== 'failed' || state.nodes.at(-1)?.nodeId !== 'failed') {
     throw new Error(`--waive ${opts.waive} requires the failed executable node on the saved path`);
   }
   // Only user-visible, non-publication checks can become accepted regressions; build, safety and approval gates stay blocking.
+  // A measured gate failure (outcome fail / introduced > 0, or any error that is not an incomplete sweep) lands here too.
   if (!['mac-smoke', 'tui'].includes(opts.waive)) {
-    throw new Error(`--waive ${opts.waive} cannot waive a safety, side-effect or approval node`);
+    throw new Error(`--waive ${opts.waive} cannot waive a safety, side-effect or approval node`
+      + (opts.waive === 'gate' ? ' (only an unmeasured gate — stopped, killed or sweep incomplete — may be waived)' : ''));
   }
   return { nodeId: opts.waive, reason, acceptedRegressions: releaseResumeAcceptedRegressions(state,
     [...(opts.acceptedRegressions ?? []), { id: `waive:${opts.waive}`, note: reason }]) };

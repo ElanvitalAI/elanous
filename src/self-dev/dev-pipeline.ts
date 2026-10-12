@@ -26,6 +26,7 @@ import { createRepositoryReferencedFileReader, type ReferencedFileReader } from 
 import { parseGoalDocumentClarifications } from '../self-implement/goal-author-clarification.js';
 import { requiredEvidenceFromGoal } from '../self-implement/off-diff-evidence.js';
 import { debug } from '../debug/log.js';
+import { REVIEW_DEFERRED_TO_HOST_ENV, reviewDeferredToHostFromEnv } from '../self-implement/review-deferred-to-host.js';
 import { releasePathHold, releasePathHoldComment, RELEASE_PATH_LABEL } from './release-path-guard.js';
 import { runGitCommand } from '../git-fs/runner.js';
 import type { GitRunResult } from '../git-fs/retry.js';
@@ -41,7 +42,7 @@ import type { IngestionEntry } from '../agent-substrate/execution/ingestion-poli
 import type { ReviewerContextItem } from '../agent-substrate/pr-reviewer.js';
 import { resolveRunIdentity, type RunIdSource } from '../harness/harness-space.js';
 import { addSelfDevRunParticipant, processBirthId, saveSelfDevRun } from './run-store.js';
-import { getUserConfig, resolveRoleLlm } from '../user-config.js';
+import { getUserConfig, resolveRoleLlm, type RoleLlmSource } from '../user-config.js';
 import { reviewReasoningEffort } from '../model-tier/review-effort.js';
 import { getProvider, inferProviderFromModel } from '../llm.js';
 import { buildReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback, reviewFallbackModelsFromConfig, runSubscriptionReviewer, type SubscriptionReviewerDeps } from './review-provider-fallback.js';
@@ -1051,14 +1052,27 @@ export function unmannedToolReviewerRateFromConfig(
   return DEFAULT_UNMANNED_TOOL_REVIEWER_RATE;
 }
 
-function observeUnmannedToolReviewerSelection(selection: UnmannedToolReviewerSelection): void {
+function observeUnmannedToolReviewerSelection(selection: UnmannedToolReviewerSelection, skipped?: { reason: 'role-pinned'; roleSource: RoleLlmSource }): void {
   try {
     debug.log('self-dev.reviewer', 'tool-reviewer.select', {
       picked: selection.picked,
       rate: selection.rate,
       sample: selection.sample,
+      ...(skipped ? { skipped: skipped.reason, roleSource: skipped.roleSource } : {}),
     });
   } catch { /* fail-soft */ }
+}
+
+/**
+ * TOOL-REVIEWER-ROLE-PIN — a review role pinned for THIS launch (`--role-llm review=…` flag, or the Pod's
+ * `ELANOUS_ROLE_LLM_REVIEW` env pin) is a declaration that every review in the run uses that model; the
+ * unmanned tool-reviewer lottery must not swap it out (10-10 OR probe #25906: the draw picked the ACP
+ * reviewer and skipped the glm-5.3 pin, so bench arms got different reviewers). `environment` also covers the
+ * older `ELANOUS_PR_REVIEW_MODEL` env model pin. Config `roleLlm.review` is a standing default, not a per-launch
+ * pin — it keeps the lottery.
+ */
+export function reviewRolePinnedForLaunch(source: RoleLlmSource): boolean {
+  return source === 'flag' || source === 'environment';
 }
 
 async function defaultMakeUnmannedToolReviewLLM(): Promise<UnmannedToolReviewLLM> {
@@ -1085,6 +1099,8 @@ export async function buildDefaultSelfImplementSeams(
     makeToolReviewLLM?: () => UnmannedToolReviewLLM | Promise<UnmannedToolReviewLLM>;
     subscriptionReviewerDeps?: SubscriptionReviewerDeps;
     makeSubscriptionReviewLLM?: (spawn: ReturnType<typeof import('./review-provider-fallback.js').subscriptionReviewerSpawn>) => (prompt: string) => Promise<string>;
+    /** REVIEW-ACP-POD ②-b 시험 주입 — 기본은 env `ELANOUS_REVIEW_DEFERRED_TO_HOST=1`(발사 호스트가 싣는다). */
+    reviewDeferredToHost?: boolean;
   } = {},
 ): Promise<SelfImplementSeams> {
   const { defaultSeams } = await import('../self-implement/seams.js');
@@ -1139,11 +1155,14 @@ export async function buildDefaultSelfImplementSeams(
   let reviewerCanSelfRead: boolean | undefined;
   if (reviewerIsDefaultApiCall) {
     const rate = parseUnmannedToolReviewerRate(deps.toolReviewerRate) ?? unmannedToolReviewerRateFromConfig();
-    const sample = typeof deps.toolReviewerSample === 'number' && Number.isFinite(deps.toolReviewerSample)
-      ? deps.toolReviewerSample
-      : (deps.toolReviewerRoll ?? Math.random)();
-    const selection = selectUnmannedToolReviewer(rate, sample);
-    observeUnmannedToolReviewerSelection(selection);
+    const rolePinned = reviewRolePinnedForLaunch(reviewRole.source);
+    const sample = rolePinned
+      ? 1
+      : typeof deps.toolReviewerSample === 'number' && Number.isFinite(deps.toolReviewerSample)
+        ? deps.toolReviewerSample
+        : (deps.toolReviewerRoll ?? Math.random)();
+    const selection = rolePinned ? { picked: false, rate, sample } : selectUnmannedToolReviewer(rate, sample);
+    observeUnmannedToolReviewerSelection(selection, rolePinned ? { reason: 'role-pinned', roleSource: reviewRole.source } : undefined);
     if (selection.picked) {
       llmReview = await (deps.makeToolReviewLLM ?? defaultMakeUnmannedToolReviewLLM)();
       reviewerCanSelfRead = true;
@@ -1164,6 +1183,11 @@ export async function buildDefaultSelfImplementSeams(
       reviewerCanSelfRead = undefined;
     }
   }
+  // REVIEW-ACP-POD ②-b — 발사 호스트가 Claude ACP 로 리뷰할 때만 실린다. 리뷰 심이 api 리뷰어를 부르지 않는다(판정은 호스트).
+  const reviewDeferredToHost = deps.reviewDeferredToHost ?? reviewDeferredToHostFromEnv(process.env);
+  if (reviewDeferredToHost) {
+    try { debug.log('self-dev.review-fallback', 'review-deferred-to-host', { env: REVIEW_DEFERRED_TO_HOST_ENV, source: deps.reviewDeferredToHost !== undefined ? 'option' : 'env' }); } catch { /* fail-soft */ }
+  }
   const opensPr = plan.completion !== 'worktree-only';
   const target = plan.target === undefined ? undefined : revalidateHarnessTarget(plan.target);
   if (target?.status === 'outside-home') {
@@ -1181,6 +1205,7 @@ export async function buildDefaultSelfImplementSeams(
     ...(plan.self?.activityGraceSec !== undefined ? { implementActivityGraceSec: plan.self.activityGraceSec } : {}),
     llmReview,
     ...(subscriptionReviewLLM ? { subscriptionReviewLLM } : {}),
+    ...(reviewDeferredToHost ? { reviewDeferredToHost: true } : {}),
     ...(reviewerCanSelfRead !== undefined ? { reviewerCanSelfRead } : {}),
     ...(deps.reviewScopeDiff ? { reviewScopeDiff: deps.reviewScopeDiff } : {}),
     onProgress: ({ stage, message }) => {

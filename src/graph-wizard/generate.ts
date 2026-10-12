@@ -52,6 +52,8 @@ export interface GraphWizardResult {
   recipes?: string;
   /** 실행 가능성 증명: 그 recipes 로 `graph run --dry-run` 을 걸어 본 결과. 하니스만. */
   dryRun?: { status: string; path: string[] };
+  /** 검증을 통과했지만 곁들인 경고(생성 실패 아님) — 예: «smell: linear-chain» 과 칸 내리기·유닛 끼우기 제안. */
+  warnings?: string[];
 }
 
 export interface GraphWizardDeps {
@@ -301,6 +303,74 @@ export function validateWizardYaml(kind: GraphKind, yaml: string): string[] {
     }
   }
   return issues;
+}
+
+/** 그래프 값어치 신호(RFC SW-GRAPH-SMELL · G1~G7) — 기계로 셀 수 있는 넷만 센다. */
+export interface GraphSignals {
+  /** G1 검증 노드 = kind judge|gate 비종단 노드의 결과 map 이 둘 이상으로 갈림 · G2 되돌림 루프 = 뒤로 가는 간선(이미 지난 노드로) ⊕ 그 노드 max_visits ≥ 2 · G3 승인 지점 = kind hitl 노드 · G4 갈래 = 비종단 노드의 결과 map 이 종단 아닌 서로 다른 둘 이상으로 갈림 */
+  counted: { G1: number; G2: number; G3: number; G4: number };
+  /** 못 셈 표시 — G5(재개)·G6(병렬)·G7(해상도). 0 으로 지어내지 않는다. */
+  notCounted: readonly ['G5', 'G6', 'G7'];
+  /** counted 넷의 합 — 둘 이상이면 그래프 값어치가 있다. */
+  total: number;
+}
+
+const GRAPH_SIGNALS_NOT_COUNTED = ['G5', 'G6', 'G7'] as const;
+
+/** 순수 함수 — YAML 텍스트만 받아 센다(LLM·파일·실행 0). 못 세는 신호는 0 으로 지어내지 않고 «못 셈»으로 둔다. */
+export function graphSignals(yaml: string): GraphSignals {
+  const counted = { G1: 0, G2: 0, G3: 0, G4: 0 };
+  const none = (): GraphSignals => ({ counted, notCounted: GRAPH_SIGNALS_NOT_COUNTED, total: 0 });
+  let doc: {
+    entry_node?: unknown; terminal_nodes?: unknown;
+    nodes?: Array<{ node_id?: unknown; kind?: unknown; max_visits?: unknown }>;
+    edges?: Array<{ from?: unknown; to?: unknown; map?: unknown }>;
+  } | null;
+  try { doc = parseYaml(yaml) as typeof doc; } catch { return none(); }
+  if (!doc) return none();
+  const nodes = (Array.isArray(doc.nodes) ? doc.nodes : []).filter((n) => n != null && typeof n.node_id === 'string');
+  const ids = new Set(nodes.map((n) => n.node_id as string));
+  const kindOf = new Map(nodes.map((n) => [n.node_id as string, typeof n.kind === 'string' ? n.kind : '']));
+  const visitsOf = new Map(nodes.map((n) => [n.node_id as string, Number(n.max_visits) || 0]));
+  const terminals = new Set((Array.isArray(doc.terminal_nodes) ? doc.terminal_nodes : []).map((t) => String(t)));
+  const targetsOf = new Map<string, Set<string>>();
+  for (const edge of Array.isArray(doc.edges) ? doc.edges : []) {
+    if (edge == null || typeof edge.from !== 'string' || !ids.has(edge.from)) continue;
+    const tos = typeof edge.to === 'string' ? [edge.to]
+      : edge.map && typeof edge.map === 'object'
+        ? Object.values(edge.map as Record<string, unknown>).filter((to): to is string => typeof to === 'string') : [];
+    const targets = targetsOf.get(edge.from) ?? new Set<string>();
+    for (const to of tos) if (ids.has(to)) targets.add(to);
+    if (targets.size > 0) targetsOf.set(edge.from, targets);
+  }
+  const entry = typeof doc.entry_node === 'string' && ids.has(doc.entry_node) ? doc.entry_node : undefined;
+  /** entry 에서 avoid 노드를 거치지 않고 닿는 노드들 = «이미 지난 노드»(avoid = 되돌림 간선의 출발 노드). entry 자신도 지난 노드로 센다. */
+  const passedBefore = (avoid?: string): ReadonlySet<string> => {
+    if (!entry) return new Set<string>();
+    const visited = new Set<string>([entry]);
+    const queue = [entry];
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      if (current === avoid) continue;
+      for (const to of targetsOf.get(current) ?? []) if (!visited.has(to)) { visited.add(to); queue.push(to); }
+    }
+    return visited;
+  };
+  for (const node of nodes) {
+    const id = node.node_id as string;
+    const targets = targetsOf.get(id) ?? new Set<string>();
+    if (kindOf.get(id) === 'hitl') counted.G3 += 1;
+    if (terminals.has(id)) continue;
+    if ((kindOf.get(id) === 'judge' || kindOf.get(id) === 'gate') && targets.size >= 2) counted.G1 += 1;
+    if ([...targets].filter((to) => !terminals.has(to)).length >= 2) counted.G4 += 1;
+  }
+  for (const [from, targets] of targetsOf) {
+    for (const to of targets) {
+      if (terminals.has(to) || (visitsOf.get(to) ?? 0) < 2) continue;
+      if (to === from ? passedBefore().has(from) : passedBefore(from).has(to)) counted.G2 += 1;
+    }
+  }
+  return { counted, notCounted: GRAPH_SIGNALS_NOT_COUNTED, total: counted.G1 + counted.G2 + counted.G3 + counted.G4 };
 }
 
 /** 노드 줄 끝 주석 `# 이름 | 단계 | 인자` 를 읽는다. 흐름식 노드 줄에서만. */
@@ -562,11 +632,17 @@ export async function generateGraphFromPrompt(req: GraphWizardRequest, deps: Gra
   }
   attempts = Math.min(attempts, maxAttempts);
   const ok = issues.length === 0;
+  // «선형 사슬» 냄새(SW-GRAPH-SMELL) — 경고만, 생성 실패가 아니다. 값어치 신호가 둘 이하면 칸 내리기·유닛 끼우기를 제안한다.
+  const warnings: string[] = [];
+  if (kind === 'harness' && ok) {
+    const signals = graphSignals(yaml);
+    if (signals.total <= 1) warnings.push(`smell: linear-chain — G 신호 ${signals.total} · 칸 내리기(스킬 사슬) 또는 유닛 끼우기(unit-verify = G1·G2 · 승인 노드 = G3) 제안`);
+  }
   const counted = summarizeChange(kind, editing ? req.currentYaml : undefined, yaml);
   const summary = llmSummary ? `${llmSummary} (${counted})` : counted;
   debug.log('graph.wizard', ok ? 'validated' : 'failed', { id, kind, base, attempts, editing, issues: issues.slice(0, 10), summary, dryRun: dryRun?.status, ms: Date.now() - startedAt });
   const labels = Object.fromEntries(Object.entries(steps).filter(([, v]) => v.label).map(([k, v]) => [k, v.label!]));
-  return { ok, id, yaml, ...(base ? { base } : {}), ...(base && baseReason ? { baseReason } : {}), issues, attempts, summary, labels, steps, ...(recipes ? { recipes } : {}), ...(dryRun ? { dryRun } : {}) };
+  return { ok, id, yaml, ...(base ? { base } : {}), ...(base && baseReason ? { baseReason } : {}), issues, attempts, summary, labels, steps, ...(recipes ? { recipes } : {}), ...(dryRun ? { dryRun } : {}), ...(warnings.length ? { warnings } : {}) };
 }
 
 /** v1 이름 유지 — 생성 YAML 의 노드 주석(단계·인자)으로 실제 recipes.yaml 을 낸다(v1 의 «미구현» 자리표시를 대체). */

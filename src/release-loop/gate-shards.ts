@@ -21,6 +21,8 @@ export interface GateShard {
   waitReason?: string;
   /** 계획 분 — 남은 시간 추정의 재료. */
   plannedMin?: number;
+  /** GATE-MULTI-HOST — 이 조각(가장 최근 시도)이 놓인 풀 멤버(kubectl 컨텍스트). 놓이기 전엔 없다. */
+  host?: string;
 }
 
 /** 게이트 노드의 판정 결과 — 끝난 조각의 rc≠0 을 «새로 생긴 실패»와 «기존 실패»로 가른 수. */
@@ -58,11 +60,13 @@ function shardOf(value: unknown): GateShard | null {
   const rc = num(raw.rc);
   const waitReason = str(raw.waitReason);
   const plannedMin = num(raw.plannedMin);
+  const host = str(raw.host, 120);
   return {
     id, state,
     ...(startedAt ? { startedAt } : {}), ...(endedAt ? { endedAt } : {}),
     ...(installSec !== undefined ? { installSec } : {}), ...(rc !== undefined ? { rc } : {}),
     ...(waitReason ? { waitReason } : {}), ...(plannedMin !== undefined ? { plannedMin } : {}),
+    ...(host ? { host } : {}),
   };
 }
 

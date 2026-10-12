@@ -74,6 +74,9 @@ interface RotationDecision {
   readonly resetCreditAccount?: string;
   /** SUBSCRIPTION-EXHAUST-REROUTE — 크레딧 예비분에 닿아 `no-candidate` 로 넘겼을 때만 있다(잔액은 «알려진» 값). */
   readonly creditReserveHit?: { readonly balance: number; readonly reserve: number };
+  /** CREDIT-SPEND-ORDER — 구독·리셋권이 다 없어 «다른 계정의 선불 크레딧»으로 옮긴 `rotated` 일 때만 true.
+   *  이 이동도 크레딧 진입이다 — 호출부가 💳 알림 ⊕ `credit-spend-start` 를 낸다(10-12 S2: 이 갈래만 알림 0). */
+  readonly creditEntry?: true;
 }
 
 /** ⛔ 비공개 — 호출자는 객체 리터럴로 준다(구조적 타이핑). */
@@ -261,7 +264,7 @@ export function decideCodexRotation(input: RotationInput): RotationDecision {
       const curHas = input.currentHasCredits ?? self?.hasCredits;
       const currentDry = curHas === false || (typeof cur === 'number' && cur <= floor);
       if (richest && (currentDry || (typeof cur === 'number' && richest.creditBalance! > cur * 1.2))) {
-        return { reason: 'rotated', candidateCount, accountThresholds, to: richest };
+        return { reason: 'rotated', candidateCount, accountThresholds, to: richest, creditEntry: true };
       }
       // 🩸 10-11: 크레딧이 0 이 돼도 여기 머물러 codex 로 계속 쐈다. 잔액이 «알려져 있고» 예비분 이하이며
       //   예비분을 넘는 다른 계정도 없으면 «갈 곳 없음» — 폴백 체인이 다음 칸을 정한다. 모르면 종전대로 머문다.

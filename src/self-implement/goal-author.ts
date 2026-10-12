@@ -50,6 +50,7 @@ import type { HarnessGroundingProvenance } from './context-capsule.js';
 import { hasGoalStepCodeName } from './goal-step-code-name.js';
 import { targetScopedGoalText } from './goal-text-path-scope.js';
 import { parseReleaseNoteSection } from '../release-loop/release-note.js';
+import { declaredNewFilePaths } from './goal-new-paths.js';
 
 // ⭐ `situation`/`complication` 은 **선택**이다 — 안 오면 `scqaNarrative` 가 종전 문면을 쓴다.
 //   ⛔ 필수로 만들지 않는다: 그러면 인핸싱이 폴백으로 떨어진 저작(LLM 실패·`disabled`)이 전부 죽는다.
@@ -371,7 +372,7 @@ function endGoalAuthorPhase(phase: GoalAuthorTimedPhase, startedAt: number, auth
 
 export type GoalFileLintLevel = 'ERROR' | 'WARN';
 
-export type GoalFileLintTag = 'canonical-structure' | 'evidence-section' | 'boundary-size' | 'launch-branch' | 'unanswered-clarification' | 'shell-damage' | 'traced-path' | 'grounding-evidence' | 'empty-result-population' | 'decision-signal-numeric-source' | 'decision-signal-numeric-coverage' | 'decision-signal-proxy-expectation' | 'out-of-target-requirement' | 'heading-form-marker' | 'blanket-invariant' | 'self-question-subject' | 'artifact-launch-declaration' | 'all-negative-signals' | 'unreadable-signals' | 'alternative-signals' | 'count-observation' | 'identifier-name-observation' | 'self-reported-observation' | 'default-invocation-observation' | 'release-note';
+export type GoalFileLintTag = 'canonical-structure' | 'evidence-section' | 'boundary-size' | 'launch-branch' | 'unanswered-clarification' | 'shell-damage' | 'traced-path' | 'traced-path-new' | 'grounding-evidence' | 'empty-result-population' | 'decision-signal-numeric-source' | 'decision-signal-numeric-coverage' | 'decision-signal-proxy-expectation' | 'out-of-target-requirement' | 'heading-form-marker' | 'blanket-invariant' | 'self-question-subject' | 'artifact-launch-declaration' | 'all-negative-signals' | 'unreadable-signals' | 'alternative-signals' | 'count-observation' | 'identifier-name-observation' | 'self-reported-observation' | 'default-invocation-observation' | 'release-note';
 
 type GoalFileLintOrigin =
   | { readonly kind: 'known-incident'; readonly incident: string; readonly reference: string }
@@ -389,6 +390,7 @@ export const GOAL_FILE_LINT_ORIGINS: Record<GoalFileLintTag, GoalFileLintOrigin>
   'unanswered-clarification': { kind: 'known-incident', incident: 'deferred clarifications passed lint and later killed launch', reference: 'git:50dc445cc (#6703)' },
   'shell-damage': { kind: 'known-incident', incident: 'code fences were read as empty inline code', reference: 'git:92937e8f3 (#6403)' },
   'traced-path': { kind: 'known-incident', incident: 'missing files and lines escaped pre-launch validation', reference: 'git:777973f23 (#6423)' },
+  'traced-path-new': { kind: 'known-incident', incident: 'goals declaring a not-yet-existing file as new were still hit with the traced-path missing ERROR, so authors listed nonexistent paths as existing ones and the Pod ended no-result-line (MODEL-BENCH-SCORES twice plus four UX cells)', reference: 'goal cell AUTHOR-NEW-FILE-PATHS (0.2.24)' },
   'grounding-evidence': { kind: 'unknown-origin', label: 'ORIGIN-UNKNOWN' },
   'empty-result-population': { kind: 'unknown-origin', label: 'ORIGIN-UNKNOWN' },
   'decision-signal-numeric-source': { kind: 'known-incident', incident: 'authored Expected result omitted numeric source and coverage', reference: 'git:7e6c02799 (#9847)' },
@@ -1722,13 +1724,21 @@ export function lintGoalFile(document: string, branch: string, deps: GoalFileLin
     });
   }
   if (deps.readReferencedFile) {
+    // AUTHOR-NEW-FILE-PATHS — 문서가 «새로 만들 파일»로 선언한 경로. 실행 쪽 범위 검사와 같은 줄을 읽는다.
+    const declaredNew = new Set(declaredNewFilePaths(document));
     for (const reference of tracedPathReferences(document)) {
       const result = deps.readReferencedFile(reference.path);
       const normalized = typeof result === 'string' ? { kind: 'ok' as const, contents: result }
         : result === null ? { kind: 'missing' as const }
         : result;
       if (normalized.kind === 'missing') {
-        findings.push({ level: 'ERROR', tag: 'traced-path', message: `traced path does not exist: ${reference.path}` });
+        // AUTHOR-NEW-FILE-PATHS — 선언된 새 파일은 저작 시점에 없는 것이 정상이다: ERROR 가 아니라 WARN.
+        if (declaredNew.has(reference.path)) {
+          findings.push({ level: 'WARN', tag: 'traced-path-new', message: `traced path is declared new: ${reference.path}` });
+          debug.log('self-implement.author', 'traced-path-new', { path: reference.path });
+        } else {
+          findings.push({ level: 'ERROR', tag: 'traced-path', message: `traced path does not exist: ${reference.path}` });
+        }
       } else if (normalized.kind === 'outside-repository') {
         findings.push({ level: 'ERROR', tag: 'traced-path', message: `traced path is outside repository: ${reference.path}` });
       } else if (normalized.kind === 'directory') {

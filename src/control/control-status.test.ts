@@ -1,4 +1,7 @@
-import { expect, test } from 'bun:test';
+import { afterAll, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { collectControlStatus, type ControlStatusDeps } from './control-status.js';
 import type { DriftReport } from '../cli/config-drift.js';
 
@@ -13,8 +16,12 @@ const drift = (overrides: { prodStatus?: DriftReport['prodStatus']; registryOk?:
     missingInDerived: 0, extraInDerived: 0, valueDiffers: 1, groups: [] })),
 });
 
+const emptyInstallRoot = mkdtempSync(join(tmpdir(), 'elanous-control-status-empty-'));
+afterAll(() => { rmSync(emptyInstallRoot, { recursive: true, force: true }); });
+
 const deps: ControlStatusDeps = {
   now: () => now,
+  installRoot: emptyInstallRoot,
   readLease: () => ({ record: { holder: 'node-b', generation: 7, state: 'held', acquiredAt: 1, renewedAt: 2, ttlSeconds: 600 }, ageSeconds: 4, expired: false }),
   readFreeze: () => freeze,
   readLoops: () => ({ scope: 'registry', entries: [
@@ -75,4 +82,28 @@ test('missing measurements never masquerade as zero or healthy', async () => {
     readDrift: () => drift({ prodStatus: 'unreadable', registryOk: false, compared: 0, unreadable: 1, keys: 0 }),
   });
   for (const index of [0, 5, 6]) expect(rows[index]).toMatchObject({ state: 'unmeasured', text: '못 쟀다', reason: expect.any(String) });
+});
+
+test('version row reads the local install.json and stays unmeasured when it is missing', async () => {
+  const present = mkdtempSync(join(tmpdir(), 'elanous-control-status-install-'));
+  const absent = mkdtempSync(join(tmpdir(), 'elanous-control-status-absent-'));
+  const broken = mkdtempSync(join(tmpdir(), 'elanous-control-status-broken-'));
+  try {
+    writeFileSync(join(present, 'install.json'), JSON.stringify({ version: '0.2.25', commit: '5fda696427ab' }));
+    const measured = await collectControlStatus({ ...deps, installRoot: present });
+    expect(measured[1]).toEqual({ row: '판', state: 'ok', text: '설치본 0.2.25 · 5fda696427ab' });
+    expect(measured.filter((_, i) => i !== 1)).toEqual((await collectControlStatus(deps)).filter((_, i) => i !== 1));
+
+    const missing = await collectControlStatus({ ...deps, installRoot: absent });
+    expect(missing[1]).toMatchObject({ row: '판', state: 'unmeasured', text: '못 쟀다', reason: '이 기계 install.json 없음' });
+
+    writeFileSync(join(broken, 'install.json'), '{');
+    const unreadable = await collectControlStatus({ ...deps, installRoot: broken });
+    expect(unreadable[1]).toMatchObject({ row: '판', state: 'unmeasured', text: '못 쟀다', reason: '이 기계 install.json 파싱 실패' });
+
+    const injected = await collectControlStatus({ ...deps, installRoot: present, readVersion: () => ({ row: '판', state: 'ok', text: 'injected' }) });
+    expect(injected[1]).toEqual({ row: '판', state: 'ok', text: 'injected' });
+  } finally {
+    for (const dir of [present, absent, broken]) rmSync(dir, { recursive: true, force: true });
+  }
 });

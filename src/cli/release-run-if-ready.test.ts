@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -137,4 +137,47 @@ test('pre-existing lock is not overwritten or deleted', async () => fixture(asyn
   const result = await runReleaseIfReady(version, { ledgerRoot: root, readiness: ready, run: async () => { throw new Error('must not run'); } });
   expect(result).toMatchObject({ skipped: true, reason: 'already-running' });
   expect(readFileSync(lock, 'utf8')).toBe('owned elsewhere');
+}));
+
+test('ready path records exactly one shadow launch-advice with caller release-run and default unknown verdict', async () => fixture(async (root) => {
+  const events: Array<{ category: string; reason: string; data: Record<string, unknown> }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, reason, data) => { events.push({ category, reason, data: data as Record<string, unknown> }); });
+  try {
+    const result = await runReleaseIfReady(version, { ledgerRoot: root, readiness: ready, run: async () => 'graph' });
+    expect(result).toEqual({ skipped: false, result: 'graph' });
+    const adviceLogs = events.filter((event) => event.category === 'resource.advice' && event.reason === 'launch-advice');
+    expect(adviceLogs.length).toBe(1);
+    expect(adviceLogs[0]).toEqual({ category: 'resource.advice', reason: 'launch-advice',
+      data: { caller: 'release-run', verdict: 'unknown', why: 'pool unavailable or incomplete', actual: 'launched', kind: 'advice-unknown', version } });
+  } finally { log.mockRestore(); }
+}));
+
+test('a throwing advice seam is swallowed and run() still returns the same result', async () => fixture(async (root) => {
+  let graphCalls = 0;
+  const events: Array<{ category: string; reason: string }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, reason) => { events.push({ category, reason }); });
+  try {
+    const result = await runReleaseIfReady(version, { ledgerRoot: root, readiness: ready,
+      advice: () => { throw new Error('advice exploded'); },
+      run: async () => { graphCalls++; return 'same'; } });
+    expect(result).toEqual({ skipped: false, result: 'same' });
+    expect(graphCalls).toBe(1);
+    expect(events.filter((event) => event.category === 'resource.advice')).toEqual([]);
+  } finally { log.mockRestore(); }
+}));
+
+test('checklist-blocked and already-running skips record zero launch-advice', async () => fixture(async (root) => {
+  const events: Array<{ category: string; reason: string }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, reason) => { events.push({ category, reason }); });
+  try {
+    const blocked = await runReleaseIfReady(version, { ledgerRoot: root,
+      readiness: () => ({ ready: false, reason: 'checklist-blocked', details: { ...gate, ok: false, red: ['K1'] } }),
+      run: async () => 'graph' });
+    expect(blocked).toEqual({ skipped: true, reason: 'checklist-blocked', detail: 'K1' });
+    mkdirSync(join(root, 'release', version), { recursive: true });
+    writeFileSync(join(root, 'release', version, 'run.lock'), 'owned elsewhere');
+    const running = await runReleaseIfReady(version, { ledgerRoot: root, readiness: ready, run: async () => 'graph' });
+    expect(running).toEqual({ skipped: true, reason: 'already-running', detail: 'run.lock already exists' });
+    expect(events.filter((event) => event.category === 'resource.advice')).toEqual([]);
+  } finally { log.mockRestore(); }
 }));

@@ -68,7 +68,9 @@ function stripModuleQuery(specifier: string): string {
   return cut === -1 ? specifier : specifier.slice(0, cut);
 }
 
-function sourceCandidates(testPath: string, specifier: string): readonly string[] {
+/** Candidate repo paths of a relative specifier from `testPath` (any importer works — GATE-REUSE-BY-DIFF reuses it for
+ *  the release gate's import closure). */
+export function sourceCandidates(testPath: string, specifier: string): readonly string[] {
   const base = normalize(join(dirname(testPath), stripModuleQuery(specifier)));
   const suffix = extname(base);
   if (suffix) return (EMITTED_SOURCE_SUFFIXES[suffix] ?? [suffix]).map((extension) => `${base.slice(0, -suffix.length)}${extension}`);

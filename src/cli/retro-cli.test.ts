@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
@@ -38,9 +38,9 @@ test('retro facts reads the requested event families within the time window with
     store.close();
     expect(parseRetroSince('24h', now)).toBe(now - 86400000);
     expect(() => parseRetroSince('0h', now)).toThrow('--since');
-    const result = collectRetroFacts(parseRetroSince('24h', now), [{ name: 'fixture', dbPath: path }]);
+    const result = collectRetroFacts(parseRetroSince('24h', now), [{ name: 'fixture', dbPath: path }], dir);
     expect(result.unavailable).toEqual([]);
-    expect(collectRetroFacts(parseRetroSince('24h', now), [{ name: 'missing', dbPath: join(dir, 'missing.db') }])).toEqual({ facts: [], unavailable: ['missing'] });
+    expect(collectRetroFacts(parseRetroSince('24h', now), [{ name: 'missing', dbPath: join(dir, 'missing.db') }], dir)).toEqual({ facts: [], unavailable: ['missing'] });
     expect(result.facts.map(f => f.kind)).toEqual(['stop-reason', 'ta-outcome', 'ta-outcome', 'stop-reason', 'draft-death', 'draft-birth']);
     expect(result.facts.at(-1)?.data).toEqual({ number: 2 });
     expect(result.facts.find(f => f.event === 'decision')?.data).toEqual({ action: 'stop', stopReason: 'provider-exhausted' });
@@ -54,6 +54,54 @@ test('retro facts reads the requested event families within the time window with
     const unchanged = LogStore.openReadOnly(path);
     try { expect(unchanged.query({ sinceMs: now - 26 * 3600000, limit: 100 })).toHaveLength(17); }
     finally { unchanged.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('retro facts reads run incidents newer than --since and keeps the four existing kinds', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'retro-incidents-'));
+  try {
+    const now = Date.now();
+    const incidentRoot = join(dir, 'root');
+    mkdirSync(join(incidentRoot, 'incidents'), { recursive: true });
+    const rows = [
+      { runId: 'old', reason: 'crash', status: 1, signal: null, at: new Date(now - 30 * 3600000).toISOString(), seat: 'TC', entrance: 'dev' },
+      { runId: 'new', reason: 'killed', status: null, signal: 'SIGKILL', at: new Date(now - 1000).toISOString(), seat: 'MK', entrance: 'harness' },
+    ];
+    writeFileSync(join(incidentRoot, 'incidents', '2026-10-11.jsonl'), `${rows.map(row => JSON.stringify(row)).join('\n')}\n`);
+    const path = join(dir, 'logs.db');
+    const store = new LogStore(path);
+    store.insertBatch([{ rec: { ts: new Date(now - 500).toISOString(), category: 'self-dev.supervisor', event: 'resolved', data: { stopReason: 'no-progress' } }, surface: 'test' }]);
+    store.close();
+    const result = collectRetroFacts(now - 24 * 3600000, [{ name: 'fixture', dbPath: path }], incidentRoot);
+    expect(result.unavailable).toEqual([]);
+    expect(result.facts.filter(f => f.kind === 'incident')).toEqual([
+      { store: 'incidents', at: rows[1]!.at, category: 'harness.incident', event: 'killed', kind: 'incident', data: { runId: 'new', seat: 'MK', entrance: 'harness' } },
+    ]);
+    expect(result.facts.filter(f => f.kind !== 'incident').map(f => f.kind)).toEqual(['stop-reason']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('retro facts: missing incidents dir yields no incident facts and nothing unavailable', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'retro-incidents-missing-'));
+  try {
+    expect(collectRetroFacts(Date.now() - 3600000, [], dir)).toEqual({ facts: [], unavailable: [] });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('retro facts: unreadable incidents are reported unavailable while logs.db facts remain', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'retro-incidents-throw-'));
+  try {
+    const now = Date.now();
+    const incidentRoot = join(dir, 'root');
+    mkdirSync(incidentRoot, { recursive: true });
+    writeFileSync(join(incidentRoot, 'incidents'), 'not a directory');
+    const path = join(dir, 'logs.db');
+    const store = new LogStore(path);
+    store.insertBatch([{ rec: { ts: new Date(now - 500).toISOString(), category: 'self-dev.supervisor', event: 'resolved', data: { stopReason: 'no-progress' } }, surface: 'test' }]);
+    store.close();
+    const result = collectRetroFacts(now - 3600000, [{ name: 'fixture', dbPath: path }], incidentRoot);
+    expect(result.unavailable).toEqual(['incidents']);
+    expect(result.facts.map(f => f.kind)).toEqual(['stop-reason']);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

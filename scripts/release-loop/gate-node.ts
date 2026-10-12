@@ -14,12 +14,13 @@ import { loadEnvKnownFailures, splitKnownEnv } from './env-known-failures';
 import { baselineFromCutLogs } from './baseline-from-logs';
 import { mergePartialFailures, readPartialPlan, testFileOfId } from './gate-partial';
 import { logPlanWalltime, planDurations, planShards, readFileMemory } from './shard-plan';
+import { readJunitFileSeconds } from './gate-method';
 import { deriveCdpTestPatterns } from '../test-deterministic';
 import { emitNodeResult, readGraphContext } from './node-verdict.js';
 import { isGateExecutor, type GateExecutor } from './gate-executor.js';
 import { runPodCommand, parsePodCpu, resolvePodCpu, type RunPodCommandOptions, type PodCommandResult, type PodCpu } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import { POD_BUN_CACHE_HOST_PATH, parseInstallSeconds, podBunCacheVolume } from '../../src/task-orchestrator/surfaces/pod-bun-cache.js';
-import { PodPoolScheduler, parsePodPool, checkPodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+import { PodPoolScheduler, parsePodPool, checkPodPool, defaultRemoteRun, type PodPoolMember } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { POD_INSTALL_SLOTS_DEFAULT, POD_INSTALL_SLOTS_HOST_PATH, installSlotScript } from '../../src/task-orchestrator/surfaces/pod-install-slots.js';
 import { gateDepsInstallScript, parseGateDeps } from '../../src/task-orchestrator/surfaces/pod-gate-deps.js';
 import { gateShardsPath, recordGateShardsVerdict, writeGateShards, type GateShard } from '../../src/release-loop/gate-shards.js';
@@ -76,7 +77,13 @@ export interface GateOptions {
     /** How often the stall watch reads the live log (ms); omitted = {@link GATE_POD_STALL_POLL_MS}. */
     stallPollMs?: number;
     /** GATE-LIVE-OBS — the shard state file (`gateShardsPath(version)`) this sweep keeps current; absent = not written. */
-    shardsFile?: { path: string; version: string } };
+    shardsFile?: { path: string; version: string };
+    /** GATE-MULTI-HOST — is this pool member reachable (kubectl ns ⊕ ssh)? Injected by tests; absent = the real probe on
+     *  the gate's own pool · an injected pool without it never marks a member down (unchanged). */
+    probeMember?: (member: PodPoolMember) => boolean;
+    /** GATE-MULTI-HOST — seconds a placed shard's Job status may stay unreadable before the shard counts as lost with its
+     *  member; omitted = {@link GATE_MEMBER_UNREADABLE_SECONDS_DEFAULT}. Only a pool of two or more members uses it. */
+    memberUnreadableSeconds?: number };
 }
 export interface GateResult {
   outcome: 'ok' | 'regression' | 'error';
@@ -696,6 +703,18 @@ export const GATE_ADMISSION_WAIT_SECONDS_DEFAULT = 300;
 export type GateAdmissionOutcome = 'granted' | 'admission-timeout' | 'admission-error' | 'off';
 export interface GateAdmissionResult { outcome: GateAdmissionOutcome; waitedMs: number; reason?: string; release: () => void }
 export const gateAdmissionWaitText = (reading: string | null) => `메모리 여유 대기(admission) · ${reading ?? '측정 전'}`.slice(0, 160);
+/**
+ * GATE-MULTI-HOST (0.2.25 · 대표) — the gate pool is a host roster (`release.loop.gatePodPool` =
+ * `pool-node-b@node-b:N,pool-node-c@node-c:M,…`); shards spread over it by free share (selfCapped). A member that fails a
+ * shard's launch or goes silent mid-Job is probed; if it is unreachable it leaves the roster for the rest of this gate and
+ * the shard runs again on the others — one dead host no longer stops the gate. One-member pools keep the old behaviour.
+ */
+export const GATE_MEMBER_UNREADABLE_SECONDS_DEFAULT = 600;
+export function defaultGateMemberProbe(member: PodPoolMember): boolean {
+  if (!checkPodPool([member], defaultKubectl).ok) return false;
+  return !member.sshHost || defaultRemoteRun(member.sshHost, 'true').status === 0;
+}
+
 export function poolGateAdmission(pool: PodPoolScheduler): GateAdmission {
   return { acquire: (signal) => pool.acquireAdmission(signal, undefined, { gate: true }), waitReason: () => pool.waitReason() };
 }
@@ -840,9 +859,30 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     });
     const stallWatch = stallSeconds > 0 && !!liveLog;
     debug.log('release-loop.gate', 'pod-stall-watch', { stallSeconds, source: pod.stallSeconds !== undefined ? 'config' : 'default', enabled: stallWatch });
+    // GATE-MULTI-HOST: members found unreachable during this gate — skipped for placement while any other member is left.
+    const downMembers = new Set<string>();
+    const multiHost = poolScheduler.members.length > 1;
+    const probeMember = pod.probeMember ?? (poolOverride ? undefined : defaultGateMemberProbe);
+    const memberUnreadableSeconds = pod.memberUnreadableSeconds ?? GATE_MEMBER_UNREADABLE_SECONDS_DEFAULT;
+    if (!Number.isFinite(memberUnreadableSeconds) || memberUnreadableSeconds < 0) throw new Error('invalid pod sweep options');
+    debug.log('release-loop.gate', 'pod-roster', { members: poolScheduler.members.map((m) => ({ context: m.context, host: m.sshHost ?? null, capacity: m.capacity })),
+      dropped: ready?.dropped ?? [], multiHost, probe: !!probeMember });
+    /** True when the shard's member is (now) known unreachable — a newly found one is logged and leaves the roster. */
+    const memberLost = (context: string, shard: number, error: string): boolean => {
+      if (downMembers.has(context)) return true;
+      const member = poolScheduler.members.find((m) => m.context === context);
+      if (!multiHost || !probeMember || !member) return false;
+      let reachable: boolean;
+      try { reachable = probeMember(member); } catch { reachable = false; }
+      if (reachable) return false;
+      downMembers.add(context);
+      debug.log('release-loop.gate', 'pod-member-down', { member: context, host: member.sshHost ?? null, shard, error: error.slice(0, 300),
+        remaining: poolScheduler.members.filter((m) => !downMembers.has(m.context)).map((m) => m.context) }, { level: 'warn' });
+      return true;
+    };
     const jobLogTail = (job: PodCommandResult): string => {
       if (podLogTail) return podLogTail(job);
-      for (const member of poolScheduler.members) {
+      for (const member of poolScheduler.members.filter((m) => !downMembers.has(m.context))) {
         const logs = defaultKubectl(['--context', member.context, '-n', 'elanous-test', 'logs', `job/${job.job}`, '-c', 'child', '--tail=200']);
         if (logs.status === 0 && logs.stdout) return logs.stdout;
       }
@@ -882,16 +922,18 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     // Pending/Running in the cluster and the next admission reading counts it, so holding the lease would count it twice.
     const trackedPool = (shard: number, retry: boolean, placed: (member: NonNullable<Awaited<ReturnType<PodPoolScheduler['tryAcquire']>>>) => void = () => {}): PodPoolScheduler => ({
       members: poolScheduler.members,
-      tryAcquire: async (...args: Parameters<PodPoolScheduler['tryAcquire']>) => {
-        const member = await poolScheduler.tryAcquire(...args);
+      tryAcquire: async (...[skip, onEmpty, mode]: Parameters<PodPoolScheduler['tryAcquire']>) => {
+        // GATE-MULTI-HOST: a lost member is skipped while another member is left (all lost = the old behaviour).
+        const anyLeft = poolScheduler.members.some((m) => !downMembers.has(m.context));
+        const member = await poolScheduler.tryAcquire(downMembers.size && anyLeft ? new Set([...(skip ?? []), ...downMembers]) : skip, onEmpty, mode);
         if (member) placed(member);
-        if (member) markShard(shard, { state: retry ? 'retry' : 'running', startedAt: board[shard]?.startedAt ?? new Date().toISOString() }, ['waitReason']);
+        if (member) markShard(shard, { state: retry ? 'retry' : 'running', startedAt: board[shard]?.startedAt ?? new Date().toISOString(), host: member.context }, ['waitReason']);
         else markShard(shard, { waitReason: 'Pod 자리 대기' });
         return member;
       },
       release: (member: Parameters<PodPoolScheduler['release']>[0]) => poolScheduler.release(member),
     }) as unknown as PodPoolScheduler;
-    const runShard = async (paths: string[], shard: number, depth = 0, branch = '', retriedNoOutput = false, fresh = pod.freshShards === true, parentAttempt?: string): Promise<{ runs: ShardRun[]; stalled: NonNullable<GateResult['stalledShards']> }> => {
+    const runShard = async (paths: string[], shard: number, depth = 0, branch = '', retriedNoOutput = false, fresh = pod.freshShards === true, parentAttempt?: string, hostRetries = 0): Promise<{ runs: ShardRun[]; stalled: NonNullable<GateResult['stalledShards']> }> => {
       // 파일별 소요는 junit 으로 남긴다 — 콘솔 요약(판정 원천)은 그대로이고, 느린 시험 목록(K10 D4)·계층 분리(D2)의 자가 된다.
       // GATE-TIMEOUT-HEAL: parts (each with its own junit) under a soft deadline inside this shard's own Job deadline.
       const shardDeadline = shardDeadlineSeconds(estimated(paths), deadlineSeconds);
@@ -910,6 +952,9 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       let jobExitCode: number | undefined;
       let lastFile: string | undefined;
       let jobFailed = false;
+      let jobError = '';
+      /** GATE-MULTI-HOST — the member this shard's Job was placed on (recorded in the shard json / log / board). */
+      let placedOn: string | undefined;
       let timedOut = false;
       let finished: string[] = [];
       let unfinishedLog: string | undefined;
@@ -960,7 +1005,8 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           } }) : undefined;
         const placed = admitted.release;
         const job = await podCommand({
-          pool: pod.pool, poolScheduler: trackedPool(shard, depth > 0 || branch !== '', (member) => { jobContext = member.context; placed(); }), clone: true, source: { kind: 'commit', sha: commit }, deadlineSeconds: shardDeadline,
+          pool: pod.pool, poolScheduler: trackedPool(shard, depth > 0 || branch !== '', (member) => { jobContext = member.context; placedOn = member.context; placed(); }), clone: true, source: { kind: 'commit', sha: commit }, deadlineSeconds: shardDeadline,
+          ...(multiHost ? { statusUnreadableMs: memberUnreadableSeconds * 1000 } : {}),
           ...(bunCache ? { bunCache } : {}),
           ...(installSlots > 0 ? { installSlots: POD_INSTALL_SLOTS_HOST_PATH } : {}),
           ...(pod.cpu ? { cpu: pod.cpu } : {}),
@@ -982,12 +1028,16 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           try { lastFile = lastStartedTestFile(jobLogTail(job).split(/\r?\n/).slice(-200).join('\n'), paths); }
           catch { /* Log retrieval is diagnostic; do not hide the stalled shard. */ }
         }
-      } catch {
+      } catch (error) {
         jobFailed = true;
+        jobError = error instanceof Error ? error.message : String(error);
       }
       // A launch that failed before placement still gives its admission back (release is idempotent).
       admitted?.release();
       const durationMs = Date.now() - start;
+      const fileSeconds = junit === undefined ? undefined : Object.fromEntries(readJunitFileSeconds(junit));
+      const testSeconds = fileSeconds === undefined ? undefined : Object.values(fileSeconds).reduce((sum, seconds) => sum + seconds, 0);
+      const podOverheadSeconds = testSeconds === undefined ? undefined : Math.max(0, durationMs / 1000 - testSeconds);
       // A reused shard keeps its files as they are — rewriting would replace the measured durationMs the next release plans by.
       if (logDir && !reused && !descent) {
         mkdirSync(logDir, { recursive: true });
@@ -1004,12 +1054,14 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         if (unfinishedLog !== undefined) writeFileSync(unfinishedDestination, unfinishedLog, { mode: 0o600 });
         else rmSync(unfinishedDestination, { force: true });
         writeFileSync(join(logDir, `pod-${shard}${branch}.json`), JSON.stringify({ durationMs, rc: rc ?? null,
-          ...(stall ? { reason: 'stall', finishedFiles: 0, stallSeconds: stall.seconds, sinceCheckoutMs: stall.sinceCheckoutMs } : timedOut ? { reason: 'timeout', finishedFiles: finished.length } : {}), files: paths, plannedSeconds: estimated(paths), deadlineSeconds: shardDeadline, shardCount: shards.length, commit, runKey, attemptId, ...(parentAttempt ? { parentAttempt } : {}), jobExitCode: jobExitCode ?? null, jobFailed,
+          ...(stall ? { reason: 'stall', finishedFiles: 0, stallSeconds: stall.seconds, sinceCheckoutMs: stall.sinceCheckoutMs } : timedOut ? { reason: 'timeout', finishedFiles: finished.length } : {}), files: paths, plannedSeconds: estimated(paths), deadlineSeconds: shardDeadline, shardCount: shards.length, commit, runKey, attemptId, ...(parentAttempt ? { parentAttempt } : {}), jobExitCode: jobExitCode ?? null, jobFailed, ...(placedOn ? { host: placedOn } : {}),
+          ...(fileSeconds !== undefined ? { fileSeconds, testSeconds, podOverheadSeconds } : {}),
           ...(admitted && admitted.outcome !== 'off' ? { admission: admitted.outcome, admissionWaitMs: admitted.waitedMs } : {}) }) + '\n', { mode: 0o600 });
       }
       const installSeconds = parseInstallSeconds(output ?? '');
       // GATE-TIMEOUT-HEAL ③: a cut shard is «reason: timeout» (with the files that still finished), not a bare rc=null.
-      if (!reused && !descent) debug.log('release-loop.gate', 'pod-shard', { shard, files: paths, durationMs, rc: rc ?? null, attempt: depth + 1, installSeconds, gateDeps: parseGateDeps(output ?? ''), deadlineSeconds: shardDeadline, parts: parts.length,
+      if (!reused && !descent) debug.log('release-loop.gate', 'pod-shard', { shard, files: paths, durationMs, rc: rc ?? null, attempt: depth + 1, installSeconds, gateDeps: parseGateDeps(output ?? ''), deadlineSeconds: shardDeadline, parts: parts.length, ...(placedOn ? { host: placedOn } : {}),
+        ...(testSeconds !== undefined ? { testSeconds } : {}),
         ...(stall ? { reason: 'stall', finishedFiles: 0, stallSeconds: stall.seconds } : timedOut ? { reason: 'timeout', finishedFiles: finished.length } : {}) });
       if (!reused && !descent) markShard(shard, { ...(installSeconds !== null ? { installSec: installSeconds } : {}), ...(rc !== undefined ? { rc } : {}), ...(timedOut ? { state: 'timeout' as const } : {}) });
       let clean = output?.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
@@ -1063,6 +1115,13 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       if (reused && reason) {
         debug.log('release-loop.gate', 'pod-shard-resume-miss', { shard, branch, reason });
         return runShard(paths, shard, depth, branch, retriedNoOutput, true, parentAttempt);
+      }
+      // GATE-MULTI-HOST: the Job failed because its member is gone (launch failed · status unreadable) — not the shard's
+      // fault, so no split: the same files run again on the members left. Bounded by the roster size.
+      if (jobFailed && placedOn && hostRetries < poolScheduler.members.length && memberLost(placedOn, shard, jobError)
+        && poolScheduler.members.some((m) => !downMembers.has(m.context))) {
+        debug.log('release-loop.gate', 'pod-shard-host-retry', { shard, branch, files: paths.length, lostMember: placedOn, attempt: hostRetries + 1 }, { level: 'warn' });
+        return runShard(paths, shard, depth, `${branch}-h${hostRetries}`, retriedNoOutput, undefined, attemptId, hostRetries + 1);
       }
       // GATE-TIMEOUT-HEAL ④: a Pod that died before any test ran (no outbox · jobExitCode≠0 — 0.2.19: isolated retries
       // ending with exit 5, the source checkout) gets the same one fresh retry as «no output» instead of stalling the sweep.
@@ -1436,8 +1495,9 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         if (trustedKnown) knownFailures = [...trustedKnown.failures, ...(trustedKnown.errors ?? []), ...loadEnvKnownFailures(repo)];
       } catch (error) { debug.log('release-loop.gate', 'known-failures-unavailable', { error: String(error) }); }
     }
+    const durationSource = join(ledger, 'release', opts.baselineVersion, 'gate-logs', 'cut');
     const cutRun = await runner.sweep(cutTree, join(root, 'release', opts.version, 'gate-logs', partial ? 'cut-partial' : 'cut'),
-      opts.pod ? { ...opts.pod, durationSource: join(ledger, 'release', opts.baselineVersion, 'gate-logs', 'cut'), ...(knownFailures.length ? { knownFailures } : {}),
+      opts.pod ? { ...opts.pod, durationSource, ...(knownFailures.length ? { knownFailures } : {}),
         // GATE-LIVE-OBS: the release ledger's shards.json (UX #24782) — never the run tree's universe; an explicit
         // --ledger-root (tests) keeps it in that ledger.
         shardsFile: { path: opts.ledgerRoot ? gateShardsPath(opts.version, opts.ledgerRoot) : gateShardsPath(opts.version), version: opts.version } } : undefined,
@@ -1526,7 +1586,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         // K9b — the baseline is swept on the same Pod pool as the cut, not on this host (0.2.6: an hour of local baseline
         // after a 23-minute Pod cut).
         const baseRun = await runner.sweep(baseTree!, join(root, 'release', opts.version, 'gate-logs', 'baseline'),
-          opts.pod ? { ...opts.pod, durationSource: join(ledger, 'release', opts.baselineVersion, 'gate-logs', 'cut') } : undefined,
+          opts.pod ? { ...opts.pod, durationSource } : undefined,
           present);
         baseline = await localStalled(baseRun, baseTree!, baseSha, 'baseline');
       } else baseline = { failures: [], errors: [] };

@@ -5,7 +5,7 @@ import { loadCatalog, type CatalogIoOpts } from '../intelligence-map/model-catal
 import { getModelWatchProposalPath, runModelIntelligenceWatch, type ModelWatchDeps } from '../intelligence-map/model-watch-mission.js';
 import { fetchProviderModelPages, type ModelWatchFetchResult } from '../intelligence-map/model-watch-fetch.js';
 import type { ModelCandidate } from '../intelligence-map/model-classifier.js';
-import type { WatchIntakeResult } from '../intelligence-map/model-watch-intake.js';
+import { detectPriceChanges, formatPriceChange, type PriceChange, type WatchIntakeResult } from '../intelligence-map/model-watch-intake.js';
 import type { LlmRunner } from '../model-tier/preset-suggest-llm.js';
 
 export interface ModelWatchCliResult {
@@ -14,6 +14,7 @@ export interface ModelWatchCliResult {
   failures: ModelWatchFetchResult['failures'];
   proposal: Pick<WatchIntakeResult['proposal'], 'added' | 'updated'>;
   candidates: WatchIntakeResult['candidates'];
+  priceChanges: PriceChange[];
   perSource: WatchIntakeResult['perSource'];
 }
 
@@ -93,6 +94,7 @@ export async function runModelWatchCli(deps: ModelWatchCliDeps = {}): Promise<Mo
     failures: fetched.failures,
     proposal: { added: intake.proposal.added, updated: intake.proposal.updated },
     candidates: intake.candidates,
+    priceChanges: detectPriceChanges(intake),
     perSource: intake.perSource,
   };
 }
@@ -103,6 +105,7 @@ export function formatModelWatchResult(result: ModelWatchCliResult): string {
     `Proposal: ${result.proposal.added.length} added, ${result.proposal.updated.length} updated (not applied).`,
   ];
   if (result.candidates.length > 0) lines.push(`Candidates: ${result.candidates.map((candidate) => candidate.id).join(', ')}`);
+  if (result.priceChanges.length > 0) lines.push(`Price changes: ${result.priceChanges.map(formatPriceChange).join('; ')}`);
   const abnormalEmptySources = Object.entries(result.perSource)
     .filter(([, source]) => source.candidateCount === 0 && source.status !== 'completed')
     .map(([source]) => source);

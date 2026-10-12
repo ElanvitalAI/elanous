@@ -15,8 +15,11 @@ export interface UsageRow { site: string; provider: string; model: string; calls
 
 type UsageData = { site?: string; provider?: string; billingProvider?: string; model?: string; inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; cost?: { kind?: string; usd?: number }; podRollupKey?: string; partial?: boolean; partialSeq?: number; partialAt?: string };
 
+/** 재방출 행 dedup 에 필요한 칸만 — 호스트 소비처(bench-report · `elanous usage`)도 같은 규칙을 쓴다. */
+export type PodRollupKeyed = { podRollupKey?: unknown; partial?: unknown; partialSeq?: unknown; partialAt?: unknown };
+
 /** 같은 podRollupKey 두 행 중 어느 쪽이 더 완전한가 — 최종 > 부분 · 부분끼리는 seq 큰 쪽 · 같으면 at 늦은 쪽. 완전히 같으면 앞 행을 둔다. */
-function rollupRowBeats(next: UsageData, kept: UsageData): boolean {
+function rollupRowBeats(next: PodRollupKeyed, kept: PodRollupKeyed): boolean {
   const nextFinal = next.partial !== true;
   const keptFinal = kept.partial !== true;
   if (nextFinal !== keptFinal) return nextFinal;
@@ -27,31 +30,42 @@ function rollupRowBeats(next: UsageData, kept: UsageData): boolean {
   return String(next.partialAt ?? '') > String(kept.partialAt ?? '');
 }
 
+/** ⭐ METER-POD-ROLLUP-GAP-2 — 같은 Pod 사용량의 재방출(부분 ⊕ 최종 · abort ⊕ resume)을 podRollupKey 로 한 번만 남긴다.
+ *  들어온 순서가 아니라 «더 완전한 행»을 남기고(rollupRowBeats), 키 없는 행은 그대로 다 둔다(순서 보존). */
+export function dedupePodRollupRows<T>(rows: readonly T[], dataOf: (row: T) => PodRollupKeyed = (row) => row as PodRollupKeyed): T[] {
+  const kept: T[] = [];
+  const keptIndexByKey = new Map<string, number>();
+  for (const row of rows) {
+    const d = dataOf(row);
+    if (typeof d.podRollupKey === 'string') {
+      const at = keptIndexByKey.get(d.podRollupKey);
+      if (at !== undefined) {
+        if (rollupRowBeats(d, dataOf(kept[at]!))) kept[at] = row;
+        continue;
+      }
+      keptIndexByKey.set(d.podRollupKey, kept.length);
+    }
+    kept.push(row);
+  }
+  return kept;
+}
+
 export function rollup(lines: readonly string[]): { rows: UsageRow[]; truncated: boolean } {
   const by = new Map<string, UsageRow>();
   // ⭐ MF-3c0d253e — 같은 Pod 사용량의 재방출(부분 ⊕ 최종 · abort ⊕ resume)은 podRollupKey 로 한 번만 센다(이중계상 방지).
   //   들어온 순서가 아니라 «더 완전한 행»을 남긴다(최종 > 부분 · seq · at — rollupRowBeats).
   //   키가 없는 행(기존 경로 전부)은 종전과 동작·바이트 그대로다.
   let truncated = false;
-  const entries: UsageData[] = [];
-  const keptIndexByPodRollupKey = new Map<string, number>();
+  const parsed: UsageData[] = [];
   for (const line of lines) {
     if (/limitReached=true|truncated/.test(line) && !line.startsWith('{')) truncated = true;
     if (!line.startsWith('{')) continue;
     let r: { event?: string; data?: Record<string, unknown> };
     try { r = JSON.parse(line); } catch { continue; }
     if (r.event !== 'llm-usage' || !r.data) continue;
-    const d = r.data as UsageData;
-    if (typeof d.podRollupKey === 'string') {
-      const keptIndex = keptIndexByPodRollupKey.get(d.podRollupKey);
-      if (keptIndex !== undefined) {
-        if (rollupRowBeats(d, entries[keptIndex]!)) entries[keptIndex] = d;
-        continue;
-      }
-      keptIndexByPodRollupKey.set(d.podRollupKey, entries.length);
-    }
-    entries.push(d);
+    parsed.push(r.data as UsageData);
   }
+  const entries = dedupePodRollupRows(parsed);
   for (const d of entries) {
     const provider = d.billingProvider ?? d.provider ?? '?';   // ⭐ 과금 주체 우선(B10)
     const key = `${d.site ?? '?'}|${provider}|${d.model ?? '?'}`;

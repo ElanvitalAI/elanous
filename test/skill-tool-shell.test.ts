@@ -224,8 +224,8 @@ describe('NT-C1b-1 — mode parameter opts into shell-runner dispatch', () => {
       // on the registry layer itself; entries persist until unregister).
       expect(registry.size()).toBeGreaterThanOrEqual(1);
       const bg = await dispatchRunShell({ command: ['echo', 'x'], mode: 'bg' });
-      expect(bg.outcome).toBe('exit');
-      expect(bg.stdout).toContain('from-runner');
+      expect(bg.outcome).toBe('started');
+      expect(bg.stdout).toBe('');
       expect(bg.approvalKey.startsWith('runner:')).toBe(true);
     } finally {
       resetShellRunnerDeps();

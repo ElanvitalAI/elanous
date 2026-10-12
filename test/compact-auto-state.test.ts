@@ -15,6 +15,7 @@ import {
   setVerifyProbeEnabled,
   type CompactProvider,
 } from '../src/compact';
+import { runVerifyProbe } from '../src/compact/verify-probe';
 import type { LLMMessage } from '../src/llm';
 
 function archDir(): string {
@@ -195,5 +196,58 @@ describe('Wave 5 · Layer 5 fallback truncate', () => {
       { provider, policy: { archiveDir: archDir() } },
     );
     expect(r.diagnostics.layer5FallbackTruncated).toBe(0);
+  });
+});
+
+describe('MK 0.2.25 · verify-probe status with injected stream', () => {
+  const slice: LLMMessage[] = [
+    { role: 'user', content: 'edit src/x.ts' },
+    { role: 'assistant', content: 'done' },
+  ];
+
+  test('runVerifyProbe status pass/fail/error with injected stream', async () => {
+    // ⓐ probe replies 'none' → pass, ok true
+    const pass = await runVerifyProbe({
+      summary: 'edited src/x.ts',
+      originalSlice: slice,
+      stream: async () => 'none',
+    });
+    expect(pass.status).toBe('pass');
+    expect(pass.ok).toBe(true);
+
+    // ⓑ probe reports a lost detail → fail, ok false
+    const fail = await runVerifyProbe({
+      summary: 'edited a file',
+      originalSlice: slice,
+      stream: async () => 'lost the file path src/x.ts',
+    });
+    expect(fail.status).toBe('fail');
+    expect(fail.ok).toBe(false);
+
+    // ⓒ injected stream throws → error, fail-open keeps ok true
+    const error = await runVerifyProbe({
+      summary: 'edited src/x.ts',
+      originalSlice: slice,
+      stream: async () => {
+        throw new Error('boom');
+      },
+    });
+    expect(error.status).toBe('error');
+    expect(error.ok).toBe(true);
+
+    // ⓓ summarizerModel reaches the stream's 3rd arg and the result model
+    let seenOpts: any;
+    const model = await runVerifyProbe({
+      summary: 'edited src/x.ts',
+      originalSlice: slice,
+      summarizerModel: 'z-ai/glm-5.3',
+      stream: async (_msgs: LLMMessage[], _onChunk: any, opts: any) => {
+        seenOpts = opts;
+        return 'none';
+      },
+    });
+    expect(seenOpts).toEqual({ model: 'z-ai/glm-5.3' });
+    expect(model.model).toBe('z-ai/glm-5.3');
+    expect(model.status).toBe('pass');
   });
 });

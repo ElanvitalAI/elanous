@@ -85,6 +85,7 @@ test('tasks cover --lines uses the one-line formatter on the read-only observati
     'review: TA 0/- (-) · live 0 · shadow 1 · steward-transition unmeasured',
     'retry: TA 0/- (-) · live 0 · shadow 0 · steward-transition unmeasured',
     'green: TA 0/- (-) · live 0 · shadow 0 · steward-transition unmeasured',
+    '7동사 live 1/7 · 출처 없음 저작·구현·정리',
   ]);
 });
 
@@ -151,6 +152,30 @@ test('tasks cover --json takes a federated read and says how many stores it coul
   expect(body.rows[0]).toEqual({ verb: 'land', byTaskAgent: 1, total: 4, observedActions: 1, ratio: 0.25, state: 'measured', liveActions: 1, shadowActions: 0, stewardTransition: 'observed' });
   expect(body.unreadableStores).toBe(2);
   expect(body.storeWarning).toContain('2개를 못 읽었다');
+});
+
+test('tasks cover --json includes the seven-verb live measurement', async () => {
+  const action = (kind: string, result: string) => ({ category: 'task-agent', event: 'action', data: JSON.stringify({ kind, result }) }) as LogStoreRow;
+  const merge = { category: 'pr.land', event: 'step', data: JSON.stringify({ step: 'merge', ok: true }) } as LogStoreRow;
+  const result = await run(['tasks', 'cover', '--json'], {
+    coverLogs: (query) => query.exactCategories?.[0] === 'task-agent'
+      ? [action('review', 'done'), action('land', 'done'), action('retry', 'shadow')]
+      : [merge],
+  });
+  const body = JSON.parse(result.lines[0]!);
+  expect(body.sevenVerbs).toEqual({
+    verbs: [
+      { verb: '리뷰', source: 'review', liveDone: 1, shadow: 0, state: 'live' },
+      { verb: '착지', source: 'land', liveDone: 1, shadow: 0, state: 'live' },
+      { verb: '수리', source: 'retry', liveDone: 0, shadow: 1, state: 'shadow-only' },
+      { verb: '검증', source: 'green', liveDone: 0, shadow: 0, state: 'none' },
+      { verb: '저작', source: null, liveDone: null, shadow: null, state: 'no-source' },
+      { verb: '구현', source: null, liveDone: null, shadow: null, state: 'no-source' },
+      { verb: '정리', source: null, liveDone: null, shadow: null, state: 'no-source' },
+    ],
+    liveVerbs: 2,
+    measuredVerbs: 4,
+  });
 });
 
 test('tasks cover --by-card reads the injected card ledger inside the window; without the flag it never calls coverCards', async () => {
@@ -385,7 +410,7 @@ test('index wires tasks instead of the retirement stub, and scheduler stays reti
   registerTasksCommands(program);
   const command = program.commands.find((entry) => entry.name() === 'tasks');
   expect(command?.aliases()).toContain('task');
-  expect(command?.commands.map((entry) => entry.name())).toEqual(['cover', 'list', 'hand', 'hand-move', 'close', 'parents', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'approve']);
+  expect(command?.commands.map((entry) => entry.name())).toEqual(['cover', 'list', 'hand', 'hand-move', 'live-verified', 'close', 'parents', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'approve']);
 });
 
 test('tasks hand-move — 카드 history 에 손으로 쓴 한 줄을 남긴다 · 모르는 kind 는 원장을 건드리지 않는다', async () => {

@@ -51,7 +51,7 @@ function fixture(options: { now?: () => Date; send?: (markdown: string) => numbe
   };
   return {
     root, ledger, run, output, errors, brief,
-    cleanup: () => { process.exitCode = exit; rmSync(root, { recursive: true, force: true }); },
+    cleanup: () => { process.exitCode = exit ?? 0; rmSync(root, { recursive: true, force: true }); },
   };
 }
 

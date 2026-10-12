@@ -1079,6 +1079,12 @@ test('/log twelve subcommands emit no debug lines', async () => {
   }
 });
 
+test('dashboard shell slash registration preserves its command aliases', () => {
+  const registeredNames = buildDashboardSlashRegistry().names();
+  expect(registeredNames).toContain('shell');
+  expect(registeredNames).toContain('sh');
+});
+
 test('dashboard runtime registration catalog does not retain retired harness names as display differences', () => {
   expect(DASHBOARD_SLASH_CATALOG_BASELINE.registeredOnly).not.toContain('ask');
   expect(DASHBOARD_SLASH_CATALOG_BASELINE.registeredOnly).not.toContain('say');

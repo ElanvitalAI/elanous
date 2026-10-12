@@ -566,7 +566,7 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
   }
 }
 
-function isPartialRunningRuns(result: RunningRunsResult): boolean {
+export function isPartialRunningRuns(result: RunningRunsResult): boolean {
   return (result.count !== undefined && typeof result.count !== 'number' && result.count.count === null)
     || result.completeness === 'partial' || hasUnreadableLedgerObservation(result.ledger) || (result.unreadable?.length ?? 0) > 0;
 }
@@ -624,7 +624,7 @@ function formatElapsed(ms: number): string {
 export function renderRunProgressTable(result: RunningRunsResult, nowMs: number = Date.now()): string {
   const partial = isPartialRunningRuns(result);
   const header = partial
-    ? `부분 관측 — 최소 ${runningRunsLowerBound(result)} (읽지 못한 원장: ${runningRunsUnreadable(result).map((item) => `${item.dir}:${item.reason}`).join(',') || '없음'})`
+    ? `부분 관측 — 최소 ${runningRunsLowerBound(result)} (읽지 못한 원장: ${runningRunsUnreadable(result).map((item) => `${item.dir}:${item.reason}`).join(',') || '목록 미관측'})`
     : `도는 런 ${result.counts.running + result.counts['probable-running']} (확인 ${result.counts.running} · 추정 ${result.counts['probable-running']})`;
   const rows = buildRunProgressRows(result, nowMs).map((row) => {
     const phaseUnreadable = row.phaseObservation === 'unreadable' || row.phaseObservation === 'partially-unreadable';

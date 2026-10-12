@@ -192,7 +192,7 @@ describe('③ the unmeasured reason reaches the light-rc result', () => {
     documentsWithoutDerivedTests: [], alwaysIncludeMissing: [], ...over,
   });
   const deps = (over: Partial<LightRcDeps>): LightRcDeps => ({
-    cwd: REPO, git: () => ({ rc: 0, stdout: 'abc123\n' }), previousVersion: () => '0.2.22', ...over,
+    cwd: REPO, git: (args: string[]) => ({ rc: 0, stdout: args[0] === 'rev-parse' ? `${'c'.repeat(40)}\n` : 'abc123\n' }), previousVersion: () => '0.2.22', ...over,
   });
 
   test('self gate --shards: the unmeasured line text is also on the result (unmeasuredReason)', () => {

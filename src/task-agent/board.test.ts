@@ -8,8 +8,13 @@ import { registerTasksCommands, type TasksCliDeps } from '../cli/tasks-cli.js';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { addItem, checklistDevVersion, setItem } from '../release-loop/checklist.js';
-import { cardsBoard, countBoardTasks, mergeBoards, releasePackBoard, type BoardNode } from './board.js';
+import { startNexusHttpServer } from '../nexus/api/http-server.js';
+import { NexusEventBus } from '../nexus/api/event-bus.js';
+import { createNexusState } from '../nexus/state/state.js';
+import { TabRegistry } from '../nexus/state/tab-registry.js';
+import { cardsBoard, countBoardTasks, mergeBoards, releasePackBoard, taskAgentBoard, type BoardNode, type TaskAgentBoardResponse } from './board.js';
 import { handTask, readTaskCard, type TaskCard } from './task-hand.js';
+import { buildRunProgressRows, type RunningRunAssessment, type RunningRunsResult, type RunningRunStatus } from '../self-implement/running-runs.js';
 
 const dirs: string[] = [];
 function tempDir(prefix: string): string { const dir = mkdtempSync(join(tmpdir(), prefix)); dirs.push(dir); return dir; }
@@ -28,6 +33,40 @@ async function cli(args: string[], deps: TasksCliDeps): Promise<{ lines: string[
 }
 
 const card = (id: string, over: Partial<TaskCard> = {}): TaskCard => ({ id, text: `task ${id}`, createdAt: '2026-10-07T00:00:00.000Z', status: 'handed', history: [], ...over });
+
+const RUNS_NOW = Date.parse('2026-10-12T02:30:00.000Z');
+
+/** 완전 관측을 기본으로 하는 관측 결과 fixture — over 로 부분 관측(count `{ count: null, lowerBound }` 꼴 · unreadable)으로 갈아끼운다. */
+function runsObservation(over: Partial<RunningRunsResult> = {}): RunningRunsResult {
+  const entries = over.entries ?? [];
+  const counts: Record<RunningRunStatus, number> = over.counts ?? { running: 0, 'probable-running': 0, 'ended-unclosed': 0, unknown: 0 };
+  const scope = { runsNotYetInLedgerDuringAuthoringAreNotCounted: true, includesTest: false } as const;
+  const base: RunningRunsResult = {
+    completeness: 'complete', count: 0, unreadable: [],
+    entries, counts, total: entries.length, countedStatuses: ['running', 'probable-running'],
+    quantities: {
+      counts: { value: counts, population: 'all assessed runs', observation: scope },
+      total: { value: entries.length, population: 'all assessed runs', observation: scope },
+      entries: { value: entries.length, population: 'all assessed runs', observation: scope },
+      running: { value: counts.running + counts['probable-running'], population: 'assessed runs whose status is in countedStatuses', observation: scope },
+    },
+    observation: scope,
+    ledger: { ledgerDirectories: [], unreadableLedgerCount: 0, unreadableLedgerDirectoryCount: 0, missingLedgerDirectoryCount: 0, unreadableLedgerDirectoryAccessCount: 0, indeterminateLedgerDirectoryCount: 0 },
+    pty: { unreadable: [], observedRefCount: 0, withoutRunIdCount: 0, notCountedRefCount: 0 },
+    phases: { targetCount: 0, readableTargetCount: 0, unreadableTargetCount: 0, unreadableTargets: [], discardedNonStageEventCount: 0 },
+  };
+  return { ...base, ...over };
+}
+
+function runEntry(runId: string, over: Partial<RunningRunAssessment> = {}): RunningRunAssessment {
+  return {
+    runId, status: 'probable-running', presence: 'ledger-live-pty-not-observed', reason: 'ledger-without-live-pty',
+    lifecycle: 'live', lastActivityTimestamp: '2026-10-12T02:00:00.000Z',
+    phaseObservation: 'not-observed', lastPhase: null, lastPhaseObservedAt: null,
+    ptyUpdatedAt: null, ledgerDirectories: [], ptyRefs: [],
+    ...over,
+  };
+}
 
 function ledgerHash(root: string): string {
   const hash = createHash('sha256');
@@ -158,6 +197,114 @@ describe('보드 일반형 — 프로젝트 › 목표 › 이정표 › 과제 
     expect(releasePackBoard('9.9.9', tempDir('task-board-empty-'))).toEqual([]);
   });
 
+  test('taskAgentBoard — 카드마다 runId·PR·마지막 상태·종료 이유가 붙고 progress.rows 는 주입 관측을 buildRunProgressRows 그대로 싣는다(ledger 와는 runId 로만 짝짓는다 · 새 칸 0) · 원장은 바이트 그대로', () => {
+    const path = join(tempDir('task-board-ledger-facts-'), 'task-agent-actions.json');
+    const project = { id: 'p1', target: '/tmp' };
+    writeFileSync(path, JSON.stringify({ tasks: {
+      'ta-run': card('ta-run', { project, status: 'launched', runId: 'run-1', pr: { number: 77, url: 'https://x/pull/77' },
+        history: [{ at: 't1', event: 'run-bound', runId: 'run-1' }, { at: 't2', event: 'live-move', kind: 'review' }] }),
+      'ta-dead': card('ta-dead', { project, status: 'failed', runId: 'run-2', pr: 5,
+        history: [{ at: 't3', event: 'failed', detail: 'failed/needs-owner — exit 1 · pod-failure' }, { at: 't4', event: 'hand-move', detail: 'noise' }] }),
+      'ta-closed': card('ta-closed', { project, status: 'failed', history: [{ at: 't5', event: 'closed-by-hand', detail: 'd', reason: '중복 카드' }] }),
+      'ta-new': card('ta-new', { project }),
+    } }));
+    const before = readFileSync(path, 'utf8');
+    const observation = runsObservation({
+      entries: [runEntry('run-1', { status: 'running', presence: 'ledger-live-and-pty-observed', reason: 'ledger-live-and-pty-alive', lastPhase: 'review', lastPhaseObservedAt: '2026-10-12T02:10:00.000Z', phaseObservation: 'observed' })],
+      counts: { running: 1, 'probable-running': 0, 'ended-unclosed': 0, unknown: 0 },
+      count: 1,
+    });
+    const response = taskAgentBoard(path, { runningRuns: () => observation, nowMs: RUNS_NOW });
+    expect(response.progress).toEqual({ rows: buildRunProgressRows(observation, RUNS_NOW), partial: false, lowerBound: null });
+    expect(response.progress!.rows[0]).toMatchObject({ runId: 'run-1', status: 'running', lastPhase: 'review', elapsedMs: 30 * 60_000, phaseObservation: 'observed' });
+    expect(readFileSync(path, 'utf8')).toBe(before);
+    const tasks = Object.fromEntries(response.board[0]!.children!.map((node) => [node.id, node.ledger]));
+    expect(tasks['ta-run']).toEqual({ runId: 'run-1', pr: 77, lastStatus: 'launched', lastEvent: { at: 't1', event: 'run-bound', detail: null }, exitReason: null });
+    expect(tasks['ta-dead']).toEqual({ runId: 'run-2', pr: 5, lastStatus: 'failed',
+      lastEvent: { at: 't3', event: 'failed', detail: 'failed/needs-owner — exit 1 · pod-failure' }, exitReason: 'failed/needs-owner — exit 1 · pod-failure' });
+    expect(tasks['ta-closed']).toMatchObject({ runId: null, pr: null, exitReason: '중복 카드' });
+    expect(tasks['ta-new']).toEqual({ runId: null, pr: null, lastStatus: 'handed', lastEvent: null, exitReason: null });
+  });
+
+  test('progress — 부분 관측(count `{ count: null, lowerBound }` 꼴 · unreadable)이면 partial=true·lowerBound=최소 수 · 완전 관측이면 partial=false·lowerBound=null', () => {
+    const path = join(tempDir('task-board-progress-partial-'), 'task-agent-actions.json');
+    writeFileSync(path, JSON.stringify({ tasks: { 'ta-run': card('ta-run', { project: { id: 'p1', target: '/tmp' }, runId: 'run-1' }) } }));
+    const unreadable = [{ dir: '/led/unread', reason: 'unreadable-ledger' }] as const;
+    const objectCount = runsObservation({
+      completeness: 'partial',
+      count: { count: null, lowerBound: 1, unreadable },
+      unreadable,
+      entries: [runEntry('run-1')],
+      counts: { running: 0, 'probable-running': 1, 'ended-unclosed': 0, unknown: 0 },
+    });
+    expect(taskAgentBoard(path, { runningRuns: () => objectCount, nowMs: RUNS_NOW }).progress)
+      .toEqual({ rows: buildRunProgressRows(objectCount, RUNS_NOW), partial: true, lowerBound: 1 });
+    const unreadableOnly = runsObservation({
+      count: 1,
+      unreadable,
+      entries: [runEntry('run-1', { status: 'running', presence: 'ledger-live-and-pty-observed', reason: 'ledger-live-and-pty-alive' })],
+      counts: { running: 1, 'probable-running': 0, 'ended-unclosed': 0, unknown: 0 },
+    });
+    expect(taskAgentBoard(path, { runningRuns: () => unreadableOnly, nowMs: RUNS_NOW }).progress)
+      .toEqual({ rows: buildRunProgressRows(unreadableOnly, RUNS_NOW), partial: true, lowerBound: 1 });
+    const complete = runsObservation({ entries: [runEntry('run-1')], counts: { running: 0, 'probable-running': 1, 'ended-unclosed': 0, unknown: 0 }, count: 1 });
+    expect(taskAgentBoard(path, { runningRuns: () => complete, nowMs: RUNS_NOW }).progress)
+      .toEqual({ rows: buildRunProgressRows(complete, RUNS_NOW), partial: false, lowerBound: null });
+  });
+
+  test('관측 함수가 던지면 progress=null · 보드는 그대로 · task-agent board-progress-unavailable 관측 로그를 남긴다(0을 «없다»로 쓰지 않는다)', () => {
+    const path = join(tempDir('task-board-progress-unavailable-'), 'task-agent-actions.json');
+    writeFileSync(path, JSON.stringify({ tasks: { 'ta-x': card('ta-x', { project: { id: 'p1', target: '/tmp' }, runId: 'run-x' }) } }));
+    const unavailable: unknown[] = [];
+    const off = debug.registerSink({ name: 'task-board-progress-capture', emit: (record) => { if (record.category === 'task-agent' && record.event === 'board-progress-unavailable') unavailable.push(record.data); } });
+    try {
+      const response = taskAgentBoard(path, { runningRuns: () => { throw new Error('progress query failed'); } });
+      expect(response.progress).toBeNull();
+      expect(response.board).toEqual(cardsBoard(path, { ledger: true }));
+      expect(unavailable).toContainEqual(expect.objectContaining({ error: 'progress query failed' }));
+    } finally { off(); }
+  });
+
+  test('taskAgentBoard — 원장이 없으면 빈 보드 · 파일도 만들지 않는다 · CLI 기본 트리는 ledger 칸이 없다', () => {
+    const dir = tempDir('task-board-no-ledger-');
+    const path = join(dir, 'task-agent-actions.json');
+    expect(taskAgentBoard(path, { runningRuns: () => runsObservation() })).toEqual({ board: [], progress: { rows: [], partial: false, lowerBound: null } });
+    expect(readdirSync(dir)).toEqual([]);
+    writeFileSync(path, JSON.stringify({ tasks: { 'ta-a': card('ta-a', { runId: 'r' }) } }));
+    expect(JSON.stringify(cardsBoard(path))).not.toContain('ledger');
+  });
+
+  test('GET /api/task-agent/board — 인증 필수(401) · 읽기 전용(405) · 원장 없음=빈 보드 · 손상=503', async () => {
+    const dir = tempDir('task-board-http-');
+    const path = join(dir, 'task-agent-actions.json');
+    const state = createNexusState({ nexusVersion: 'test', phase: 'test' });
+    const server = startNexusHttpServer({
+      state, registry: new TabRegistry(state), eventBus: new NexusEventBus(),
+      metaApi: { bearerToken: 'test-token', noAuth: false }, taskAgentStatePath: path,
+      startPort: 45000 + Math.floor(Math.random() * 2000),
+    });
+    const headers = { authorization: 'Bearer test-token', 'sec-fetch-site': 'cross-site' };
+    const url = `${server.url}/api/task-agent/board`;
+    try {
+      const anonymous = await fetch(url, { headers: { 'sec-fetch-site': 'cross-site' } });
+      expect(anonymous.status).toBe(401);
+      expect((await fetch(url, { method: 'POST', headers, body: '{}' })).status).toBe(405);
+      const empty = await fetch(url, { headers });
+      const emptyBody = await empty.json() as TaskAgentBoardResponse;
+      expect(empty.status).toBe(200);
+      expect(emptyBody.board).toEqual([]);
+      // 기본 응답은 진전 관측을 돌리지 않는다(동기 수 초 · 데몬 루프 보호) — progress=null 이고 호스트 원장을 읽지 않는다.
+      expect(emptyBody.progress).toBeNull();
+      writeFileSync(path, JSON.stringify({ tasks: { 'ta-h': card('ta-h', { project: { id: 'p1', target: '/tmp' }, status: 'launched', runId: 'run-h', pr: 9 }) } }));
+      const body = await (await fetch(url, { headers })).json() as TaskAgentBoardResponse;
+      expect(body.board[0]!.children![0]).toMatchObject({ id: 'ta-h', ledger: { runId: 'run-h', pr: 9, lastStatus: 'launched', exitReason: null } });
+      expect(body.progress).toBeNull();
+      writeFileSync(path, '{broken');
+      const broken = await fetch(url, { headers });
+      expect([broken.status, await broken.json()]).toEqual([503, { error: 'task-agent-ledger-unreadable' }]);
+    } finally { server.stop(); }
+  });
+
   test('두 어댑터를 합치면 같은 프로젝트 id 는 한 노드 · 입력은 바뀌지 않는다', () => {
     const cards: BoardNode[] = [{ level: 'project', id: 'elanous', title: 'elanous', status: 'done', children: [{ level: 'task', id: 'ta-x', title: 'x', status: 'done', parent: 'elanous' }] }];
     const pack: BoardNode[] = [{ level: 'project', id: 'elanous', title: 'elanous (내부 팩)', status: 'open', children: [{ level: 'milestone', id: '0.2.19', title: '판 0.2.19', status: 'open', parent: 'elanous', children: [{ level: 'task', id: 'K1', title: 'k', status: 'open', parent: '0.2.19' }] }] }];
@@ -168,5 +315,19 @@ describe('보드 일반형 — 프로젝트 › 목표 › 이정표 › 과제 
     expect(countBoardTasks(merged)).toBe(2);
     expect(cards[0]!.children).toHaveLength(1);
     expect(cards[0]!.status).toBe('done');
+  });
+});
+
+describe('progress 는 요청할 때만 · completeness 를 따른다 (UX 수확 리뷰 should-fix)', () => {
+  test('주입도 withProgress 도 없으면 관측을 돌리지 않고 progress=null', () => {
+    const path = join(tempDir('task-board-progress-off-'), 'task-agent-actions.json');
+    expect(taskAgentBoard(path)).toEqual({ board: [], progress: null });
+    expect(taskAgentBoard(path, { withProgress: false })).toEqual({ board: [], progress: null });
+  });
+
+  test('completeness=partial 이면 count·unreadable 이 없어도 partial=true', () => {
+    const path = join(tempDir('task-board-progress-completeness-'), 'task-agent-actions.json');
+    const observation = { ...runsObservation(), completeness: 'partial' as const };
+    expect(taskAgentBoard(path, { runningRuns: () => observation, nowMs: RUNS_NOW }).progress?.partial).toBe(true);
   });
 });

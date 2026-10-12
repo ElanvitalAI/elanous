@@ -10,7 +10,7 @@ import { fetchSupadataTranscript, judgeTranscriptSufficiency } from '../src/tran
 import { downloadAudio, splitAudio } from '../src/audio.js';
 import { transcribeChunks } from '../src/stt.js';
 import { summarize, parseMetaFromSummary } from '../src/summarize.js';
-import { getSaveDir, saveMarkdown, prepareRunDir, persistArtifacts } from '../src/obsidian.js';
+import { getSaveDir, saveMarkdown, prepareRunDir, persistArtifacts, saveSkipNotice } from '../src/obsidian.js';
 import { classifyDomain, stagingEnabled, stagingSubdir } from '../src/domain-staging.js';
 import { buildStudyNote } from '../src/study-note.js';
 import { decideRoute } from '../src/router.js';
@@ -203,6 +203,7 @@ async function main() {
     });
     console.log(`  저장 완료: ${savedPath}`);
   }
+  const skipNotice = savedPath === null ? saveSkipNotice(route.target, saveDir) : null;
 
   if (flags.print) {
     console.log('\n---BEGIN_YOUTUBE_MASTER_MARKDOWN---\n');
@@ -211,6 +212,8 @@ async function main() {
   }
 
   outputSignals(route);
+
+  if (skipNotice) console.log(skipNotice);
 }
 
 // ── Transcript acquisition (auto-fallback) ──

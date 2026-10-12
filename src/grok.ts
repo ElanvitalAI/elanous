@@ -14,7 +14,8 @@
 import type { GrokAnalysis, DiffResult, EnvDelta } from './types.js';
 import * as ui from './ui.js';
 import { getUserConfig } from './user-config.js';
-import { getProviderForConfig, anyProviderAvailable, textOnly, type LLMMessage } from './llm.js';
+import { getProviderForConfig, anyProviderAvailable, logAgentTurnUsage, type LLMMessage } from './llm.js';
+import type { LLMUsage } from './prompt-cache/types.js';
 
 /** True when any provider (env OR user-config, including Codex OAuth)
  *  can answer. Thin wrapper around llm.anyProviderAvailable() kept
@@ -34,19 +35,24 @@ async function callAnalyzer(prompt: string, systemPrompt?: string): Promise<stri
   if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
   messages.push({ role: 'user', content: prompt });
 
-  const events = provider.streamChat
-    ? provider.streamChat(messages, { temperature: 0.1, maxTokens: 1024 })
-    : null;
+  const llmOpts = { temperature: 0.1, maxTokens: 1024 };
   let text = '';
-  if (events) {
-    for await (const delta of textOnly(events)) text += delta;
+  let usage: LLMUsage = {};
+  if (provider.streamChat) {
+    for await (const ev of provider.streamChat(messages, llmOpts)) {
+      if (ev.type === 'text' && ev.delta) text += ev.delta;
+      else if (ev.type === 'usage') usage = { ...usage, ...ev.usage };
+    }
   } else {
     // Fallback to text-only chat (shouldn't happen — every provider
     // ships streamChat now).
-    for await (const chunk of provider.chat(messages, { temperature: 0.1, maxTokens: 1024 })) {
+    for await (const chunk of provider.chat(messages, llmOpts)) {
       text += chunk;
     }
   }
+  try {
+    logAgentTurnUsage(provider.defaultModel, usage, { providerName: provider.name, site: 'grok.direct' });
+  } catch { /* best-effort observation */ }
   return text;
 }
 

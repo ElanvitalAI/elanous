@@ -1,5 +1,7 @@
 import { readHqLease } from '../hq/hq.js';
 import { fileLeaseStore } from '../hq/lease.js';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
@@ -20,6 +22,8 @@ export interface ControlStatusRow {
 export interface ControlStatusDeps {
   readLease?: () => ReturnType<typeof readHqLease> | Promise<ReturnType<typeof readHqLease>>;
   readVersion?: () => ControlStatusRow | Promise<ControlStatusRow>;
+  /** Prefix that holds this machine's install.json. Defaults to ~/.local/share/elanous. */
+  installRoot?: string;
   readResources?: () => ControlStatusRow | Promise<ControlStatusRow>;
   readCredentials?: () => ControlStatusRow | Promise<ControlStatusRow>;
   readFreeze?: () => ReturnType<typeof readLandingFreeze> | Promise<ReturnType<typeof readLandingFreeze>>;
@@ -30,6 +34,31 @@ export interface ControlStatusDeps {
 }
 
 const missing = (row: ControlStatusRowName, reason: string): ControlStatusRow => ({ row, state: 'unmeasured', text: '못 쟀다', reason });
+
+function localInstallRoot(): string {
+  return join(homedir(), '.local', 'share', 'elanous');
+}
+
+/** This machine's install.json only — daemon and public versions stay unconnected. */
+function localInstallVersionRow(installRoot = localInstallRoot()): ControlStatusRow {
+  let raw: string;
+  try {
+    raw = readFileSync(join(installRoot, 'install.json'), 'utf8');
+  } catch (error) {
+    return missing('판', (error as NodeJS.ErrnoException).code === 'ENOENT' ? '이 기계 install.json 없음' : '이 기계 install.json 읽기 실패');
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return missing('판', '이 기계 install.json 파싱 실패');
+    const record = parsed as { version?: unknown; commit?: unknown };
+    const version = typeof record.version === 'string' ? record.version.trim() : '';
+    const sha = typeof record.commit === 'string' ? record.commit.trim() : '';
+    if (!version || !sha) return missing('판', '이 기계 install.json에 판·sha 없음');
+    return { row: '판', state: 'ok', text: `설치본 ${version} · ${sha}` };
+  } catch {
+    return missing('판', '이 기계 install.json 파싱 실패');
+  }
+}
 
 /** Read-only snapshot: each source fails independently; no lease renewal, freeze mutation or config sync. */
 export async function collectControlStatus(deps: ControlStatusDeps = {}): Promise<ControlStatusRow[]> {
@@ -55,7 +84,7 @@ export async function collectControlStatus(deps: ControlStatusDeps = {}): Promis
     return { row: '집', state: expired ? 'warn' : 'ok',
       text: `본부 ${record.holder} · 세대 ${record.generation} · ${ageSeconds}초 전 · ${expired ? '만료' : '유효'}` };
   });
-  await add('판', deps.readVersion ?? (() => missing('판', '기계별 install.json·데몬 판·공개 판 원천 미연결')));
+  await add('판', deps.readVersion ?? (() => localInstallVersionRow(deps.installRoot)));
   await add('자원', deps.readResources ?? (() => missing('자원', '기계별 Pod 실행/대기/실패·풀 상한·호스트 부하 원천 미연결')));
   await add('자격', deps.readCredentials ?? (() => missing('자격', '계정별 만료·쿼터·갱신자 원천 미연결')));
   await add('동결·몫', async () => {

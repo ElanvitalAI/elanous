@@ -23,6 +23,13 @@ export const LOG_DIET_KEYS: Readonly<Record<string, 'repeat' | 'consecutive'>> =
   // read it back from logs and count rows (`admissionCounts`) — it is a judgment-path event.
 };
 
+/** LOG-DIET-2 — per-key fold windows (ms). "State echo" keys whose value rarely changes fold on a
+ *  longer window than the default 60s, so a slow-rotation emitter (one row per question per tick)
+ *  stays folded instead of re-admitting every window. Keys not listed here keep the guard default. */
+export const LOG_DIET_KEY_WINDOW_MS: Readonly<Record<string, number>> = {
+  'hitl.card-bridge/skipped': 30 * 60_000,
+};
+
 export interface LogDietSummary {
   category: string;
   event: string;
@@ -44,6 +51,8 @@ interface Stream {
   sessionId?: string;
   value: string;
   lastEmittedAt: number;
+  /** Fold window pinned at stream creation: `keyWindowMs[key] ?? windowMs`. */
+  windowMs: number;
   count: number;
   firstSuppressedAt?: string;
   lastSuppressedAt?: string;
@@ -66,6 +75,7 @@ function stableValue(value: unknown): string {
 
 export class LogDietGuard {
   private readonly windowMs: number;
+  private readonly keyWindowMs: Readonly<Record<string, number>>;
   private readonly now: () => number;
   private readonly keys: Readonly<Record<string, Policy>>;
   private readonly maxStreams: number;
@@ -76,8 +86,9 @@ export class LogDietGuard {
   private lastSummaryReleaseAt = Number.NEGATIVE_INFINITY;
   private pendingStreams = 0;
 
-  constructor(opts: { windowMs?: number; now?: () => number; keys?: Readonly<Record<string, Policy>>; maxStreams?: number; summaryMinIntervalMs?: number; summaryMaxPending?: number } = {}) {
+  constructor(opts: { windowMs?: number; keyWindowMs?: Readonly<Record<string, number>>; now?: () => number; keys?: Readonly<Record<string, Policy>>; maxStreams?: number; summaryMinIntervalMs?: number; summaryMaxPending?: number } = {}) {
     this.windowMs = opts.windowMs ?? LOG_DIET_WINDOW_MS;
+    this.keyWindowMs = opts.keyWindowMs ?? LOG_DIET_KEY_WINDOW_MS;
     this.now = opts.now ?? Date.now;
     this.keys = opts.keys ?? LOG_DIET_KEYS;
     this.maxStreams = Math.max(1, opts.maxStreams ?? 2000);
@@ -92,7 +103,7 @@ export class LogDietGuard {
       category: stream.category,
       event: stream.event,
       count: stream.count,
-      windowMs: this.windowMs,
+      windowMs: stream.windowMs,
       firstSuppressedAt: stream.firstSuppressedAt!,
       lastSuppressedAt: stream.lastSuppressedAt!,
       ...(stream.runId !== undefined ? { runId: stream.runId } : {}),
@@ -121,12 +132,13 @@ export class LogDietGuard {
       ? [rec.category, rec.event, value]
       : [rec.category, rec.event, sessionId, runId]);
     const time = this.now();
+    const windowMs = this.keyWindowMs[`${rec.category}/${rec.event}`] ?? this.windowMs;
     const summaries: LogDietSummary[] = [];
     const stream = this.streams.get(key);
     if (stream) {
       this.streams.delete(key); // Evict the least recently observed flow.
       this.streams.set(key, stream);
-      if ((policy === 'repeat' || stream.value === value) && time - stream.lastEmittedAt < this.windowMs) {
+      if ((policy === 'repeat' || stream.value === value) && time - stream.lastEmittedAt < stream.windowMs) {
         if (stream.count === 0) this.pendingStreams++;
         stream.count++;
         const at = new Date(time).toISOString();
@@ -154,7 +166,7 @@ export class LogDietGuard {
     this.streams.set(key, { category: rec.category, event: rec.event,
       ...(typeof runId === 'string' ? { runId } : {}),
       ...(sessionId !== undefined ? { sessionId } : {}),
-      value, lastEmittedAt: time, count: 0 });
+      value, lastEmittedAt: time, windowMs, count: 0 });
     return { pass: true, summaries };
   }
 

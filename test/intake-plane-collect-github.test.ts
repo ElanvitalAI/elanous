@@ -13,7 +13,7 @@ import {
   type GithubStarRepo,
   type SearchGithubRepos,
 } from '../src/intake-plane/collect-github.js';
-import { listIntakeItems } from '../src/intake-plane/items.js';
+import { ingestIntakeItems, listIntakeItems, pickAbsorbQueue } from '../src/intake-plane/items.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
@@ -160,6 +160,32 @@ test('README 는 별 총합이 아니라 starsPerDay 상위 3개만 받으며 �
     .toBe('라이선스: 미상\nacme/slow desc');
   expect(readFileSync(githubStarsFile(r), 'utf8').trim().split('\n').at(-1))
     .toBe(JSON.stringify({ day: DAY, repo: 'acme/slow', stars: 9991 }));
+});
+
+test('상위 3 행 raw 에만 surge.score(3·2·1)가 붙고 pickAbsorbQueue 가 그 셋을 다른 github 행보다 먼저 고른다', async () => {
+  const r = root();
+  mkdirSync(join(r, 'intake'), { recursive: true });
+  writeFileSync(githubStarsFile(r), [
+    { day: '2026-09-25', repo: 'acme/fast', stars: 10 },
+    { day: '2026-09-25', repo: 'acme/second', stars: 20 },
+    { day: '2026-09-25', repo: 'acme/third', stars: 30 },
+    { day: '2026-09-25', repo: 'acme/fourth', stars: 40 },
+  ].map((snapshot) => JSON.stringify(snapshot)).join('\n') + '\n');
+  ingestIntakeItems(r, 'github', [
+    { url: 'https://github.com/late/one', title: 'late/one', text: 'late one', observedAt: '2999-01-01T00:00:00.000Z', signals: { stars: 5 } },
+    { url: 'https://github.com/late/two', title: 'late/two', text: 'late two', observedAt: '2999-01-01T00:00:00.000Z', signals: { stars: 5 } },
+  ]);
+  await collectGithubStars(r, fake({ [GITHUB_STAR_QUERIES[0]]: [
+    repo('acme/fourth', 41), repo('acme/third', 33), repo('acme/second', 30), repo('acme/fast', 110),
+  ] }), { day: DAY });
+  const items = listIntakeItems(r, { source: 'github' });
+  const score = (name: string) => items.find((item) => item.title === name)?.signals['github.surge.score'];
+  expect([score('acme/fast'), score('acme/second'), score('acme/third')]).toEqual([3, 2, 1]);
+  for (const name of ['acme/fourth', 'late/one', 'late/two']) {
+    expect(Object.prototype.hasOwnProperty.call(items.find((item) => item.title === name)?.signals ?? {}, 'github.surge.score')).toBe(false);
+  }
+  const picked = pickAbsorbQueue(r, { max: 3, dryRun: true });
+  expect(picked.map((item) => item.title)).toEqual(['acme/fast', 'acme/second', 'acme/third']);
 });
 
 test('dry-run 은 README 조회 없이 기존 저장소 결과만 돌려준다', async () => {

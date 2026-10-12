@@ -323,6 +323,8 @@ interface RequiredEvidenceCheckRun {
   readonly command: string;
   readonly exitCode: number | null;
   readonly stdout: string;
+  /** EVIDENCE-WIRING-EXEMPT — `bun test` writes its «N pass / 0 fail» summary to stderr. */
+  readonly stderr: string;
   readonly durationMs: number;
 }
 
@@ -368,7 +370,10 @@ export function requiredEvidenceFromGoal(goal: string): RequiredEvidenceItem[] {
     //   들여쓰기는 한다(바이트 동일이 계약이면 렌더링을 못 한다 · 리뷰 2R 에 대한 내 정정).
     items.push({ tag, raw: raw.trim(), ...(verifyCommand ? { verifyCommand } : {}) });
   }
+  const noWiring = goalDeclaresNoWiring(goal);
   return items.map((item) => {
+    // EVIDENCE-WIRING-EXEMPT — a goal whose boundary says «no wiring / pure function only» cannot show a caller in its diff.
+    if (item.tag === 'wiring' && noWiring) return { ...item, coveredByLimitation: NO_WIRING_LIMITATION };
     const description = item.raw.replace(/^\s*[-*]\s*\[[^\]]+\]\s*/, '').split(REQUIRED_EVIDENCE_COMMAND_SEPARATOR, 1)[0]?.trim() ?? '';
     const normalizedDescription = normalizeLimitationText(description);
     const matchingRequirements = items.filter((candidate) => normalizeLimitationText(
@@ -380,7 +385,40 @@ export function requiredEvidenceFromGoal(goal: string): RequiredEvidenceItem[] {
   });
 }
 
-/** 골 작성자가 요구 줄에 명시한 셸 체크만 하니스 worktree에서 관측한다. 결과는 판정에 연결하지 않는다. */
+/** EVIDENCE-WIRING-EXEMPT — the goal itself rules wiring out: «배선 0», «배선·부작용 0», «순수 함수만», «no wiring», «pure function only». */
+const NO_WIRING_MARKER = /배선\s*(?:[·⋅,/]\s*부작용\s*)?0(?![\d.])|배선\s*없음|순수\s*함수만|\bno wiring\b|\bpure functions? only\b/iu;
+const NO_WIRING_LIMITATION = 'goal boundary declares no wiring (pure function only)';
+export function goalDeclaresNoWiring(goal: string): boolean {
+  return NO_WIRING_MARKER.test(goal);
+}
+
+/** A `bun test` check that ran its tests and failed none: rc 0 ⊕ «N pass» (N ≥ 1) ⊕ «0 fail» in its output. */
+function bunTestCheckPassed(run: RequiredEvidenceCheckRun): boolean {
+  if (run.exitCode !== 0 || !/(?:^|[\s;&|(])bun\s+(?:run\s+)?test\b/.test(run.command)) return false;
+  const output = `${run.stdout}\n${run.stderr}`;
+  return /(?:^|\n)\s*[1-9]\d*\s+pass\b/.test(output) && /(?:^|\n)\s*0\s+fail\b/.test(output);
+}
+
+/** EVIDENCE-WIRING-EXEMPT — settle what the child's tags left uncovered with what the harness measured itself:
+ *  a requirement whose own `|| bun test …` check passed (tests ran, 0 fail) is covered by that check; a commandless
+ *  [preservation] is covered when the changed-file gate was measured and passed (the existing tests still hold).
+ *  Anything else stays uncovered — no wording is interpreted. */
+export function settleUncoveredEvidence(
+  uncovered: readonly string[],
+  measured: { checks?: readonly RequiredEvidenceCheckRun[]; required?: readonly RequiredEvidenceItem[]; gatePassed?: boolean },
+): { uncovered: string[]; coveredByCheck: string[]; coveredByGate: string[] } {
+  const passedTags = new Set((measured.checks ?? []).filter(bunTestCheckPassed).map(({ tag }) => tag));
+  const withCommand = new Set((measured.required ?? []).filter(({ verifyCommand }) => verifyCommand).map(({ tag }) => tag));
+  const coveredByCheck = uncovered.filter((tag) => passedTags.has(tag));
+  const coveredByGate = measured.gatePassed === true
+    ? uncovered.filter((tag) => tag === 'preservation' && !passedTags.has(tag) && !withCommand.has(tag))
+    : [];
+  const settled = new Set([...coveredByCheck, ...coveredByGate]);
+  return { uncovered: uncovered.filter((tag) => !settled.has(tag)), coveredByCheck, coveredByGate };
+}
+
+/** 골 작성자가 요구 줄에 명시한 셸 체크를 하니스 worktree에서 관측한다. `bun test` 체크의 통과는
+ *  settleUncoveredEvidence 가 그 요구의 덮임으로 받는다(EVIDENCE-WIRING-EXEMPT). */
 export function runRequiredEvidenceChecks(goal: string, cwd: string, runId?: string): RequiredEvidenceCheckRun[] {
   const identity = resolveRunIdentity({ explicit: runId });
   const checks = requiredEvidenceFromGoal(goal).flatMap(({ tag, verifyCommand }) => verifyCommand ? [{ tag, command: verifyCommand }] : []);
@@ -392,6 +430,7 @@ export function runRequiredEvidenceChecks(goal: string, cwd: string, runId?: str
       command,
       exitCode: result.status,
       stdout: tailWithOmissionMarker(result.stdout ?? '', MAX_OFF_DIFF_EVIDENCE_RESULT_CHARS),
+      stderr: tailWithOmissionMarker(result.stderr ?? '', MAX_OFF_DIFF_EVIDENCE_RESULT_CHARS),
       durationMs: Date.now() - startedAt,
     };
   });

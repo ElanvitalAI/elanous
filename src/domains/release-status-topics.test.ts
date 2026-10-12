@@ -114,3 +114,19 @@ test('ops preserves operational facts including unreadable; invalid topic throws
   expect(out.text).toContain('unreadable');
   expect(() => dispatchReleaseStatus({ topic: 'weather' }, fixture())).toThrow('topic 은 status, features, cell, schedule, ops 중 하나');
 });
+
+test('topic and action together throw naming both; action-only and topic-only keep their response shapes', () => {
+  const deps = fixture({ checklist: v => data(v, [item('Y', 'yellow')]) });
+  for (const action of ['schedule', 'blocked', 'landed'] as const) {
+    expect(() => dispatchReleaseStatus({ topic: 'features', action }, deps)).toThrow(
+      'topic 과 action 을 동시에 보낼 수 없습니다 — 둘 중 하나만: topic=features 는 읽을 대상, action 은 짧은 요약(schedule·blocked·landed)',
+    );
+  }
+  expect(() => dispatchReleaseStatus({ topic: 'ops', action: 'landed' }, deps)).toThrow('topic=ops 는 읽을 대상');
+  const actionOnly = dispatchReleaseStatus({ action: 'blocked' }, deps);
+  expect(actionOnly.text).toBe('막힌 칸 없음');
+  expect(actionOnly.structured).toEqual({ blocked: [] });
+  const topicOnly = dispatchReleaseStatus({ topic: 'features' }, deps);
+  expect(topicOnly.structured).toMatchObject({ total: 1, truncated: false, counts: { yellow: 1 } });
+  expect(topicOnly.text).toContain('1칸');
+});

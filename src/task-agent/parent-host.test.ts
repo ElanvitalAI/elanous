@@ -7,7 +7,7 @@ import { defaultTaskLauncher, type DetachedSpawn } from '../cli/tasks-cli.js';
 import { debug } from '../debug/log.js';
 import { LogStore, StoreSink } from '../mss/logging/log-store.js';
 import {
-  judgeParentHostFacts, releaseCore, launchRemoteParent, mirrorRemoteRunLedgers, RemoteParentNotLaunchedError, parseEtime, parseHarnessParents, preflightParentHost, remoteLaunchScript,
+  judgeParentHostCredentials, judgeParentHostFacts, releaseCore, launchRemoteParent, mirrorRemoteRunLedgers, RemoteParentNotLaunchedError, parseEtime, parseHarnessParents, preflightParentHost, preflightScript, remoteLaunchScript,
   remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs, resolveParentHost, resolveParentHosts, orderParentHosts, readParentHostCapacity, staleHarnessParents, type ParentHostConfig, type SshRunner,
 } from './parent-host.js';
 import { handTask } from './task-hand.js';
@@ -450,6 +450,68 @@ describe('defaultTaskLauncher — 불확실한 원격 발사는 로컬로 다시
     const spawn: DetachedSpawn = () => { local++; throw new Error('no'); };
     await expect(defaultTaskLauncher(['harness', 'say', 'g'], undefined, context, { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn })).rejects.toThrow('불확실');
     expect(local).toBe(0);
+  });
+});
+
+describe('LLM 자격 사실 — 막지 않고 경고', () => {
+  const FULL = `${GOOD_FACTS}codexAccounts=3\ngrok=1\nopenrouter=1\n`;
+  const judge = (facts: Record<string, string>) => judgeParentHostFacts(facts, { localVersion: '0.2.20-dev.0', launchHoldActive: false });
+
+  test('host with one codex account and no grok credential yields warnings but no gaps', () => {
+    const result = preflightParentHost({ target: TARGET, localVersion: '0.2.20-dev.0', launchHoldActive: false, ssh: stubSsh([{ match: /--version/, stdout: `${GOOD_FACTS}codexAccounts=1\nopenrouter=1\n` }]) });
+    expect(result.gaps).toEqual([]);
+    expect(result.ok).toBe(true);
+    expect(result.warnings).toEqual(['codex-accounts-low', 'grok-credential-missing']);
+  });
+
+  test('fully credentialed host yields no warnings', () => {
+    const result = preflightParentHost({ target: TARGET, localVersion: '0.2.20-dev.0', launchHoldActive: false, ssh: stubSsh([{ match: /--version/, stdout: FULL }]) });
+    expect(result).toMatchObject({ ok: true, gaps: [], warnings: [] });
+  });
+
+  test('credential facts never turn into gaps; unreachable host has no credential warnings', () => {
+    const facts = { version: '0.2.20-dev.0', config: '1', podPool: '1', repo: '1', kubectl: '1', codexAccounts: '0', grok: '', openrouter: '' };
+    expect(judge(facts)).toEqual([]);
+    expect(judgeParentHostCredentials(facts)).toEqual(['codex-accounts-low', 'grok-credential-missing', 'openrouter-key-missing']);
+    expect(judgeParentHostCredentials({ unreachable: 'rc=255' })).toEqual([]);
+  });
+
+  test('launcher warns with the host name and still launches remotely', async () => {
+    const runId = 'run-cafe0000-3333-4444-5555-666677778888';
+    const ssh = stubSsh([{ match: /--version/, stdout: `${GOOD_FACTS}codexAccounts=1\n` }, { match: /nohup/, stdout: 'pid=4545\n' }]);
+    const notices: string[] = [];
+    const receipt = await defaultTaskLauncher(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'g'], undefined, { runId, launchId: 'tl-c', env: { ELANOUS_RUN_ID: runId } },
+      { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn: () => { throw new Error('로컬 발사가 불리면 안 된다'); }, notice: (line) => notices.push(line) });
+    expect(receipt).toMatchObject({ parentHost: { host: 'node-b', pid: 4545 } });
+    expect(notices).toEqual(['⚠ node-b 자격: codex-accounts-low · grok-credential-missing · openrouter-key-missing']);
+  });
+
+  test('preflight script measures existence and counts only — real shell on a fake HOME', () => {
+    const home = mkdtempSync(join(tmpdir(), 'cred-facts-'));
+    const cwd = mkdtempSync(join(tmpdir(), 'cred-cwd-'));
+    mkdirSync(join(home, '.elanous'), { recursive: true });
+    mkdirSync(join(home, '.grok'), { recursive: true });
+    mkdirSync(join(home, '.cache'), { recursive: true });
+    const run = () => {
+      const facts: Record<string, string> = {};
+      for (const line of localShell(home)('h', preflightScript({ host: 'h', cwd }), 20_000).stdout.split('\n')) {
+        const at = line.indexOf('=');
+        if (at > 0) facts[line.slice(0, at)] = line.slice(at + 1);
+      }
+      return facts;
+    };
+    const before = run();
+    expect(before.codexAccounts).toBe('0');
+    expect(before.grok).toBeUndefined();
+    expect(before.openrouter).toBeUndefined();
+
+    const secret = 'SECRET-TOKEN-VALUE';
+    writeFileSync(join(home, '.elanous/auth.json'), JSON.stringify({ version: 1, providers: { 'openai-codex': { accessToken: secret }, 'openai-codex:team': { accessToken: secret }, anthropic: { accessToken: secret } } }, null, 2));
+    writeFileSync(join(home, '.grok/auth.json'), JSON.stringify({ 'https://auth.x.ai::abc': { key: secret, expires_at: '2030-01-01T00:00:00Z' } }));
+    writeFileSync(join(home, '.cache/openrouter_api_key'), secret);
+    const after = run();
+    expect(after).toMatchObject({ codexAccounts: '2', grok: '1', openrouter: '1' });
+    expect(JSON.stringify(after)).not.toContain(secret);
   });
 });
 

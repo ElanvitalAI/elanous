@@ -102,6 +102,14 @@ export function statusChangesSince(history: readonly ChecklistHistory[], sinceIs
   return history.filter((entry) => entry.field === 'status' && Date.parse(entry.at) >= since);
 }
 
+/** CELL-DEPENDS-ID: a predecessor must name a cell that exists in SOME version — this one (data.items) or any other (otherItems). */
+function assertPredecessorsExist(predecessors: readonly string[] | undefined, data: Checklist, otherItems: (id: string) => store.ChecklistCollision[]): void {
+  for (const id of predecessors ?? []) {
+    if (data.items.some((item) => item.id === id) || otherItems(id).length) continue;
+    throw new CliUserError(`없는 선행 칸: ${JSON.stringify(id).slice(1, -1)}`, '어느 판에도 없는 id 다 — release checklist status --json 으로 칸 id 를 확인한다');
+  }
+}
+
 function mutate(v: string, apply: (data: Checklist, otherItems: (id: string) => store.ChecklistCollision[]) => boolean): Checklist {
   // addItem/setItem/claimItem/removeItem/seedFromRoadmap reach the generation-fenced ledger write here.
   return decodeClaimHistory(store.mutate(v, store.releasedVersion(), devVersion(), apply));
@@ -244,6 +252,7 @@ export function addItem(v: string, input: { id: string; title: string; refs?: st
       console.error(`⚠ 중복 id: ${displayedId} — ${collisions.map((item) => `${item.version} · 담당 ${JSON.stringify(item.owner ?? '-').slice(1, -1)} · ${item.title.replace(/\s+/g, ' ').slice(0, 40)}`).join(' / ')}`);
       if (!options.allowDuplicateId) throw new CliUserError(`다른 판에 이미 있는 칸: ${displayedId}`, '--allow-duplicate-id 로 허용');
     }
+    assertPredecessorsExist(input.predecessors, data, otherItems);
     const by = process.env.ELANOUS_TRACK || 'cli';
     const at = new Date().toISOString();
     const item: ChecklistItem = { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), ...(input.kind !== undefined ? { kind: input.kind } : {}), ...(input.priority !== undefined ? { priority: input.priority } : {}), ...(input.predecessors !== undefined ? { predecessors: input.predecessors } : {}), ...(input.deadlineVersion !== undefined ? { deadlineVersion: input.deadlineVersion } : {}), ...(input.ceoMinutes !== undefined ? { ceoMinutes: input.ceoMinutes } : {}), ...(input.ceoDate !== undefined ? { ceoDate: input.ceoDate } : {}), ...(input.accelerator === true ? { accelerator: true as const } : {}), ...(refs ? { refs } : {}), updatedAt: at, updatedBy: by };
@@ -254,7 +263,7 @@ export function addItem(v: string, input: { id: string; title: string; refs?: st
 }
 
 export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; refs?: string[]; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean | null }, by: string): Checklist {
-  return mutate(v, (data) => {
+  return mutate(v, (data, otherItems) => {
     const item = data.items.find((i) => i.id === id);
     if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
     if (patch.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(patch.status)) throw new CliUserError(`잘못된 상태: ${patch.status}`);
@@ -262,6 +271,7 @@ export function setItem(v: string, id: string, patch: { status?: ChecklistStatus
     if (patch.kind !== undefined && !CHECKLIST_KINDS.includes(patch.kind)) throw new CliUserError(`잘못된 종류: ${patch.kind}`, 'screen|postpub');
     if (patch.priority !== undefined && !['P0', 'P1', 'P2'].includes(patch.priority)) throw new CliUserError(`잘못된 우선순위: ${patch.priority}`);
     if (patch.predecessors !== undefined && (!Array.isArray(patch.predecessors) || patch.predecessors.some((p) => typeof p !== 'string' || !p.trim() || p === id))) throw new CliUserError('잘못된 선행 칸');
+    assertPredecessorsExist(patch.predecessors, data, otherItems);
     if (patch.deadlineVersion !== undefined) store.validateVersion(patch.deadlineVersion);
     if (patch.accelerator !== undefined && patch.accelerator !== true && patch.accelerator !== null) throw new CliUserError('가속 등급은 true(부여) 또는 null(해제)이다');
     validateCeoLoad(patch);

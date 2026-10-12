@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { landOrderLedgerPath } from './land-order-ledger.js';
 import { classifyLandFailure, liveLandArgs, type TaskAgentLiveMove } from './live-moves.js';
-import { defaultRequestRegate, overlapEvidencePath, parseRegateResult, REJUDGE_HEAD_CAP, regateResultPath, regateRunArgs, rejudgeCandidates, rejudgeCardOnHead, type RegateRequest } from './rejudge-on-head.js';
+import { CATCH_UP_CAP, defaultCatchUpMain, defaultRequestRegate, overlapEvidencePath, parseRegateResult, REJUDGE_HEAD_CAP, regateResultPath, regateRunArgs, rejudgeCandidates, rejudgeCardOnHead, type CatchUpGit, type CatchUpRequest, type CatchUpResult, type RegateRequest } from './rejudge-on-head.js';
 import { reviewResultPath } from './review-result-capture.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
 
@@ -36,24 +36,31 @@ function fixture(opts: { regates?: TaskCard['regates']; landAttempts?: TaskCard[
   const regateRequests: RegateRequest[] = [];
   const reviewRequests: Array<{ pr: number; resultPath?: string }> = [];
   const lands: Array<{ pr: number; head: string; overlapEvidence?: string }> = [];
+  const catchUpRequests: CatchUpRequest[] = [];
   let regateOutcome: ((request: RegateRequest) => void) | undefined;
   let reviewOutcome: ((path: string) => void) | undefined;
+  let catchUpOutcome: ((request: CatchUpRequest) => CatchUpResult | Promise<CatchUpResult>) | undefined;
   // TA-LAND-RETRY-ON-INFRA — land 결과 차례(비면 병합 성공).
   const landOutcomes: Array<{ status: number; stdout: string; stderr?: string }> = [];
   const deps = (moves: TaskAgentLiveMove[] = ['review', 'propose-land']) => ({
     liveMoves: new Set(moves),
     log: (_c: string, event: string, data: Record<string, unknown>) => { logs.push({ event, data }); },
     requestRegate: async (request: RegateRequest) => { regateRequests.push(request); regateOutcome?.(request); },
+    catchUpMain: async (request: CatchUpRequest) => {
+      catchUpRequests.push(request);
+      if (!catchUpOutcome) return { decision: 'failed' as const, reason: 'catchUpMain not stubbed', fromBase: request.fromBase };
+      return await catchUpOutcome(request);
+    },
     live: {
       statePath,
       now: () => clock,
       repoCandidates: () => [{ source: 'host' as const, cwd: '/repo' }],
-      prHead: async () => ({ head, state: 'OPEN', url: URL }),
+      prHead: async () => ({ head, state: 'OPEN', url: URL, branch: 'feature' }),
       requestReview: async (pr: number, _intent: string, _cwd?: string, capture?: { resultPath: string }) => {
         reviewRequests.push({ pr, ...(capture ? { resultPath: capture.resultPath } : {}) });
         if (capture && reviewOutcome) { mkdirSync(dirname(capture.resultPath), { recursive: true }); reviewOutcome(capture.resultPath); }
       },
-      landPrHead: async () => ({ head, state: 'OPEN', isDraft: false, url: URL }),
+      landPrHead: async () => ({ head, state: 'OPEN', isDraft: false, url: URL, branch: 'feature' }),
       land: async (pr: number, landHead: string, _cwd: string, o?: { overlapEvidence?: string }) => {
         lands.push({ pr, head: landHead, ...(o?.overlapEvidence ? { overlapEvidence: o.overlapEvidence } : {}) });
         return landOutcomes.shift() ?? { status: 0, stdout: 'merged' };
@@ -65,12 +72,13 @@ function fixture(opts: { regates?: TaskCard['regates']; landAttempts?: TaskCard[
     writeFileSync(request.resultPath, JSON.stringify({ pr: request.pr, head: request.head, passed, status: passed ? 'passed' : 'failed', ...(passed ? { baseCommit: BASE } : {}), failures: passed ? [] : [{ step: 'typecheck', detail: 'error TS1' }], ...over }));
   };
   return {
-    statePath, logs, regateRequests, reviewRequests, lands, deps, writeRegate,
+    statePath, logs, regateRequests, reviewRequests, lands, catchUpRequests, deps, writeRegate,
     card: () => readTaskCard('ta-rj-1', statePath)!,
     setHead: (value: string) => { head = value; },
     setClock: (iso: string) => { clock = new Date(iso); },
     onRegate: (fn: typeof regateOutcome) => { regateOutcome = fn; },
     onReview: (fn: typeof reviewOutcome) => { reviewOutcome = fn; },
+    onCatchUp: (fn: typeof catchUpOutcome) => { catchUpOutcome = fn; },
     queueLand: (...next: typeof landOutcomes) => { landOutcomes.push(...next); },
     decisions: () => logs.filter((entry) => entry.event === 'rejudge-on-head').map((entry) => `${entry.data.step}:${entry.data.decision}`),
   };
@@ -281,9 +289,10 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     expect(f.regateRequests).toHaveLength(2);
   });
 
-  test('REJUDGE base-stale — 같은 머리·같은 base 로는 재게이트를 두 번 안 한다(틱 반복 · 결과 base 가 그대로면 land 도 0)', async () => {
+  test('REJUDGE base-stale — 같은 머리·같은 base 로는 재게이트를 두 번 안 한다(틱 반복 · 결과 base 가 그대로면 catch-up)', async () => {
     const f = fixture();
     const H = '45'.repeat(20);
+    const NEW = 'aa'.repeat(20);
     await readyB(f, H);
     f.queueLand(STALE_LAND);
     await rejudgeCardOnHead('ta-rj-1', f.deps());
@@ -294,16 +303,26 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     await rejudgeCardOnHead('ta-rj-1', f.deps());
     expect(f.regateRequests).toHaveLength(2);
     expect(f.decisions()).toContain('regate:awaiting-regate-result');
-    // 재게이트가 «같은» base(BASE)로 돌아왔다 — 새 base 가 아니다: land 0 · 재게이트 0 · 사유 줄.
+    // 재게이트가 «같은» base(BASE)로 돌아왔다 — 멱등 키로 재게이트 0 · catch-up merge·push 1회.
     f.writeRegate(true, { baseCommit: BASE })(f.regateRequests[1]!);
+    f.onCatchUp(async (request) => ({
+      decision: 'pushed', reason: 'merged origin/main', fromBase: request.fromBase, toBase: BASE2, newHead: NEW, pushArgs: ['push', 'origin', 'HEAD:feature'],
+    }));
     f.setClock('2026-10-11T01:30:00.000Z');
-    await rejudgeCardOnHead('ta-rj-1', f.deps());
-    f.setClock('2026-10-11T01:40:00.000Z');
     await rejudgeCardOnHead('ta-rj-1', f.deps());
     expect(f.regateRequests).toHaveLength(2);
     expect(f.lands).toHaveLength(1);
-    expect(f.decisions().at(-1)).toBe('land:not-landing');
-    expect(lastReason(f)).toContain('base-stale-overlap');
+    expect(f.catchUpRequests).toHaveLength(1);
+    expect(f.catchUpRequests[0]).toMatchObject({ head: H, fromBase: BASE, branch: 'feature' });
+    expect(f.decisions().at(-1)).toBe('catch-up:pushed');
+    expect(f.logs.filter((entry) => entry.event === 'rejudge-on-head' && entry.data.step === 'catch-up').at(-1)!.data).toMatchObject({
+      step: 'catch-up', decision: 'pushed', fromBase: BASE, toBase: BASE2, newHead: NEW,
+    });
+    // 같은 머리 다음 틱 — 이미 이 머리에 catch-up 했으므로 0.
+    f.setClock('2026-10-11T01:40:00.000Z');
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.catchUpRequests).toHaveLength(1);
+    expect(f.regateRequests).toHaveLength(2);
   });
 
   test(`REJUDGE base-stale — 재요청도 상한(${REJUDGE_HEAD_CAP})에 든다 · 넘으면 멈춤 ⊕ 사유`, async () => {
@@ -494,6 +513,192 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     const base = liveLandArgs('/e/bin/elanous.mjs', '/u', 30, B, '/repo');
     expect(base).toEqual(['/e/bin/elanous.mjs', '--config-dir', '/u', 'pr', 'land', '--cwd', '/repo', '--pr', '30', '--expected-head', B]);
     expect(liveLandArgs('/e/bin/elanous.mjs', '/u', 30, B, '/repo', '/s/overlap-evidence/x.json')).toEqual([...base, '--overlap-evidence', '/s/overlap-evidence/x.json']);
+  });
+
+  const NEW_HEAD = 'ab'.repeat(20);
+  const catchUpLog = (f: ReturnType<typeof fixture>) => f.logs.filter((entry) => entry.event === 'rejudge-on-head' && entry.data.step === 'catch-up').at(-1)?.data;
+
+  test('catch-up — 같은 base 재게이트 → merge·push 1회 → 새 머리 재게이트 요청', async () => {
+    const f = fixture();
+    const H = '48'.repeat(20);
+    await readyB(f, H);
+    f.queueLand(STALE_LAND);
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    f.onRegate(f.writeRegate(true, { baseCommit: BASE }));
+    f.setClock('2026-10-11T01:20:00.000Z');
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    f.onCatchUp(async (request) => {
+      f.setHead(NEW_HEAD);
+      return { decision: 'pushed', reason: 'merged origin/main', fromBase: request.fromBase, toBase: BASE2, newHead: NEW_HEAD, pushArgs: ['push', 'origin', 'HEAD:feature'] };
+    });
+    f.setClock('2026-10-11T01:30:00.000Z');
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.catchUpRequests).toHaveLength(1);
+    expect(['push', 'origin', 'HEAD:feature']).not.toContain('--force');
+    expect(catchUpLog(f)).toMatchObject({ step: 'catch-up', decision: 'pushed', fromBase: BASE, toBase: BASE2, newHead: NEW_HEAD });
+    expect(f.lands).toHaveLength(1);
+    f.onRegate(f.writeRegate(true, { baseCommit: BASE2 }));
+    f.onReview((path) => writeFileSync(path, reviewJson(NEW_HEAD)));
+    f.setClock('2026-10-11T01:40:00.000Z');
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.regateRequests.map((request) => request.head)).toEqual([H, H, NEW_HEAD]);
+    expect(f.decisions()).toContain('regate:regate-requested');
+    expect(f.regateRequests[2]!.resultPath).toBe(regateResultPath(f.statePath, 'ta-rj-1', 30, NEW_HEAD));
+  });
+
+  test('catch-up — stale 재게이트에 baseCommit 없음 → 같은 길(merge·push)', async () => {
+    const H = '49'.repeat(20);
+    const f = fixture({
+      regates: [{ pr: 30, head: H, at: '2026-10-11T00:40:00.000Z', passed: true, status: 'passed' }],
+      landAttempts: [{ pr: 30, head: H, at: '2026-10-11T00:50:00.000Z', ok: false, detail: STALE_LAND.stderr, class: 'base-stale', reason: 'base-stale-overlap: gate x' }],
+    });
+    f.setHead(H);
+    f.onCatchUp(async (request) => ({
+      decision: 'pushed', reason: 'merged origin/main', fromBase: request.fromBase, toBase: BASE2, newHead: NEW_HEAD, pushArgs: ['push', 'origin', 'HEAD:feature'],
+    }));
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.regateRequests).toEqual([]);
+    expect(f.catchUpRequests).toHaveLength(1);
+    expect(f.catchUpRequests[0]).toMatchObject({ head: H, branch: 'feature' });
+    expect(f.catchUpRequests[0]!.fromBase).toBeUndefined();
+    expect(catchUpLog(f)).toMatchObject({ step: 'catch-up', decision: 'pushed', toBase: BASE2, newHead: NEW_HEAD });
+    expect(f.lands).toEqual([]);
+  });
+
+  test('catch-up — merge 충돌 → abort ⊕ needs-owner', async () => {
+    const f = fixture();
+    const H = '4a'.repeat(20);
+    await readyB(f, H);
+    f.queueLand(STALE_LAND);
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    f.onRegate(f.writeRegate(true, { baseCommit: BASE }));
+    f.setClock('2026-10-11T01:20:00.000Z');
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    f.onCatchUp(async (request) => ({
+      decision: 'conflict', reason: 'main 따라잡기 충돌 · 파일 src/x.ts', fromBase: request.fromBase, toBase: BASE2, files: ['src/x.ts'],
+    }));
+    f.setClock('2026-10-11T01:30:00.000Z');
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.catchUpRequests).toHaveLength(1);
+    expect(f.lands).toHaveLength(1);
+    expect(f.regateRequests).toHaveLength(2);
+    expect(catchUpLog(f)).toMatchObject({ step: 'catch-up', decision: 'conflict', fromBase: BASE, toBase: BASE2 });
+    expect(lastReason(f)).toContain('main 따라잡기 충돌 · 파일 src/x.ts');
+    expect(f.card().history.at(-1)).toMatchObject({ event: 'rejudge-on-head', kind: 'catch-up', effect: 'conflict' });
+  });
+
+  test(`catch-up — N(${CATCH_UP_CAP}) 회 뒤 cap-reached`, async () => {
+    const H = '4b'.repeat(20);
+    const pathH = reviewResultPath(join(mkdtempSync(join(tmpdir(), 'ta-rejudge-cap-')), 'x'), 'ta-rj-1', 30, H);
+    const f = fixture({
+      regates: [{ pr: 30, head: H, at: '2026-10-11T00:40:00.000Z', passed: true, status: 'passed', baseCommit: BASE, staleBase: BASE }],
+    });
+    mkdirSync(dirname(pathH), { recursive: true });
+    writeFileSync(pathH, reviewJson(H));
+    const prior = Array.from({ length: CATCH_UP_CAP }, (_, i) => ({
+      at: `2026-10-11T00:5${i}:00.000Z`, event: 'rejudge-on-head' as const, kind: 'catch-up', pr: 30, head: `${i}`.repeat(40), effect: 'pushed', detail: 'prior',
+    }));
+    writeTaskCards(f.statePath, [{
+      ...f.card(),
+      reviewRequests: [...(f.card().reviewRequests ?? []), { pr: 30, head: H, at: '2026-10-11T00:45:00.000Z', resultPath: pathH }],
+      history: [
+        ...f.card().history,
+        { at: '2026-10-11T00:46:00.000Z', event: 'live-move-result', kind: 'review', pr: 30, head: H, verdict: 'pass', reviewed: true, mustFix: 0, reviewRoute: 'api', resultPath: pathH, effect: 'review result captured · verdict pass · reviewed true · must-fix 0' },
+        ...prior,
+      ],
+    }]);
+    f.setHead(H);
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.catchUpRequests).toEqual([]);
+    expect(f.regateRequests).toEqual([]);
+    expect(f.lands).toEqual([]);
+    expect(f.decisions().at(-1)).toBe('catch-up:cap-reached');
+    expect(catchUpLog(f)).toMatchObject({ step: 'catch-up', decision: 'cap-reached', fromBase: BASE });
+  });
+
+  test('catch-up — 상한은 «실제 push» 만 센다(충돌 ⊕ cap-reached 표지 뒤 새 머리는 다시 시도)', async () => {
+    // 옛 머리 X 에서 충돌 → 다음 틱 같은 머리 «already catch-up» cap-reached 표지 → 사람이 새 머리 H 를 올렸다.
+    const H = '4c'.repeat(20);
+    const X = '4d'.repeat(20);
+    const pathH = reviewResultPath(join(mkdtempSync(join(tmpdir(), 'ta-rejudge-cap-attempt-')), 'x'), 'ta-rj-1', 30, H);
+    const f = fixture({
+      regates: [{ pr: 30, head: H, at: '2026-10-11T00:40:00.000Z', passed: true, status: 'passed', baseCommit: BASE, staleBase: BASE }],
+    });
+    mkdirSync(dirname(pathH), { recursive: true });
+    writeFileSync(pathH, reviewJson(H));
+    writeTaskCards(f.statePath, [{
+      ...f.card(),
+      reviewRequests: [...(f.card().reviewRequests ?? []), { pr: 30, head: H, at: '2026-10-11T00:45:00.000Z', resultPath: pathH }],
+      history: [
+        ...f.card().history,
+        { at: '2026-10-11T00:46:00.000Z', event: 'live-move-result', kind: 'review', pr: 30, head: H, verdict: 'pass', reviewed: true, mustFix: 0, reviewRoute: 'api', resultPath: pathH, effect: 'review result captured · verdict pass · reviewed true · must-fix 0' },
+        { at: '2026-10-11T00:30:00.000Z', event: 'rejudge-on-head' as const, kind: 'catch-up', pr: 30, head: X, effect: 'conflict', detail: 'main 따라잡기 충돌 · 파일 src/x.ts' },
+        { at: '2026-10-11T00:35:00.000Z', event: 'rejudge-on-head' as const, kind: 'catch-up', pr: 30, head: X, effect: 'cap-reached', detail: 'already catch-up on this head — needs owner' },
+      ],
+    }]);
+    f.setHead(H);
+    f.onCatchUp(async (request) => ({
+      decision: 'pushed', reason: 'merged origin/main', fromBase: request.fromBase, toBase: BASE2, newHead: NEW_HEAD, pushArgs: ['push', 'origin', 'HEAD:feature'],
+    }));
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.catchUpRequests).toHaveLength(1);
+    expect(f.catchUpRequests[0]).toMatchObject({ head: H });
+    expect(catchUpLog(f)).toMatchObject({ step: 'catch-up', decision: 'pushed', newHead: NEW_HEAD });
+  });
+
+  test('catch-up — push 인자에 --force 0', async () => {
+    const calls: string[][] = [];
+    const work = '/tmp/ta-catch-up-wt';
+    const git: CatchUpGit = (cwd, args) => {
+      calls.push([cwd, ...args]);
+      if (args[0] === 'fetch' && args[2] === 'refs/heads/main') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'fetch' && args[2]?.startsWith('pull/')) return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'rev-parse' && args[1] === 'FETCH_HEAD') {
+        const prev = calls.at(-2)?.slice(1).join(' ') ?? '';
+        return { status: 0, stdout: prev.includes('refs/heads/main') ? BASE2 : B, stderr: '' };
+      }
+      if (args[0] === 'worktree' && args[1] === 'add') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'config') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'merge' && args[1] === '--no-ff') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { status: 0, stdout: NEW_HEAD, stderr: '' };
+      if (args[0] === 'push') return { status: 0, stdout: 'ok', stderr: '' };
+      if (args[0] === 'worktree' && args[1] === 'remove') return { status: 0, stdout: '', stderr: '' };
+      return { status: 1, stdout: '', stderr: `unexpected ${args.join(' ')}` };
+    };
+    const result = await defaultCatchUpMain({ cwd: '/repo', pr: 30, head: B, branch: 'feature', fromBase: BASE, worktreePath: work }, git);
+    expect(result).toMatchObject({ decision: 'pushed', fromBase: BASE, toBase: BASE2, newHead: NEW_HEAD });
+    expect(result.pushArgs).toEqual(['push', 'origin', 'HEAD:feature']);
+    expect(result.pushArgs?.includes('--force') || result.pushArgs?.includes('-f')).toBeFalsy();
+    const push = calls.find((entry) => entry[1] === 'push');
+    expect(push).toEqual([work, 'push', 'origin', 'HEAD:feature']);
+    expect(push?.includes('--force') || push?.includes('-f')).toBeFalsy();
+    expect(calls.some((entry) => entry.includes('rebase') || entry.includes('reset') || entry.includes('--force-with-lease'))).toBe(false);
+    expect(calls.some((entry) => entry[1] === 'config' && entry[2] === 'rerere.enabled')).toBe(true);
+    expect(calls.some((entry) => entry[1] === 'merge' && entry[2] === '--no-ff')).toBe(true);
+  });
+
+  test('catch-up — defaultCatchUpMain 충돌이면 merge --abort ⊕ 파일 목록', async () => {
+    const calls: string[][] = [];
+    const work = '/tmp/ta-catch-up-conflict';
+    const git: CatchUpGit = (_cwd, args) => {
+      calls.push(args);
+      if (args[0] === 'fetch') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'rev-parse' && args[1] === 'FETCH_HEAD') {
+        const prev = calls.at(-2)?.join(' ') ?? '';
+        return { status: 0, stdout: prev.includes('refs/heads/main') ? BASE2 : B, stderr: '' };
+      }
+      if (args[0] === 'worktree') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'config') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'merge' && args[1] === '--no-ff') return { status: 1, stdout: '', stderr: 'CONFLICT' };
+      if (args[0] === 'diff') return { status: 0, stdout: 'src/x.ts\nsrc/y.ts\n', stderr: '' };
+      if (args[0] === 'merge' && args[1] === '--abort') return { status: 0, stdout: '', stderr: '' };
+      return { status: 1, stdout: '', stderr: `unexpected ${args.join(' ')}` };
+    };
+    const result = await defaultCatchUpMain({ cwd: '/repo', pr: 30, head: B, branch: 'feature', fromBase: BASE, worktreePath: work }, git);
+    expect(result).toMatchObject({ decision: 'conflict', fromBase: BASE, toBase: BASE2, files: ['src/x.ts', 'src/y.ts'] });
+    expect(result.reason).toBe('main 따라잡기 충돌 · 파일 src/x.ts, src/y.ts');
+    expect(calls.some((entry) => entry[0] === 'merge' && entry[1] === '--abort')).toBe(true);
+    expect(calls.some((entry) => entry[0] === 'push')).toBe(false);
   });
 
   test('defaultRequestRegate — 같은 우주·진입점의 `tasks regate-run` 을 PR 저장소에서 떼어 띄운다(stdio ignore)', async () => {

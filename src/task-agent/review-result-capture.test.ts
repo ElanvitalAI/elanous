@@ -44,6 +44,8 @@ function fixture() {
       landPrHead: async () => ({ head: HEAD, state: 'OPEN', isDraft: false }),
       land: async (pr: number, head: string) => { lands.push({ pr, head }); return { status: 0, stdout: 'merged' }; },
     },
+    // TA-WIRING-CHECK — 병합 PR 배선 관측이 실물 `gh pr diff` 로 나가지 않게(밀폐).
+    wiring: { prDiff: () => '', loadLedger: () => null },
   });
   const card = () => readTaskCard('ta-rr-1', statePath)!;
   const lines = (event: string) => card().history.filter((item) => item.event === event);
@@ -67,6 +69,17 @@ describe('TA-REVIEW-RESULT-CAPTURE — 떼어 띄운 self review 결과를 파�
     expect(parseReviewResultOutput('')).toBeNull();
     // must-fix 목록이 아니면 «0» 이 아니라 «모름»(null) · 짧은 머리는 싣지 않는다.
     expect(parseReviewResultOutput(JSON.stringify({ pr: 21, verdict: 'pass', reviewed: true, mustFix: 'x', headCommit: 'abc', error: 'odd' }))).toMatchObject({ mustFix: null, head: null });
+  });
+
+  test('PR-LAND-MUSTFIX-NONE — 저장된 mustFix 의 «(없음 — …)» 표지 줄은 리뷰 출력과 같은 판정으로 0 · 진짜 지적은 1 · 빈 배열 0', () => {
+    const none = '(없음 — 수용기준 충족: 관문 파서가 리뷰 출력과 같은 판정을 쓴다)';
+    expect(parseReviewResultOutput(reviewJson({ mustFix: [none] }))?.mustFix).toBe(0);
+    expect(parseReviewResultOutput(reviewJson({ mustFix: ['none'] }))?.mustFix).toBe(0);
+    expect(parseReviewResultOutput(reviewJson({ mustFix: ['src/x.ts: 새 export 가 호출부에서 안 불린다'] }))?.mustFix).toBe(1);
+    expect(parseReviewResultOutput(reviewJson({ mustFix: [none, 'src/x.ts: 실제 블로커'] }))?.mustFix).toBe(1);
+    // 머리가 결함 서술이면 표지가 아니다 — 지적으로 남긴다.
+    expect(parseReviewResultOutput(reviewJson({ mustFix: ['(없음 — 하지만 X 가 깨진다)'] }))?.mustFix).toBe(1);
+    expect(parseReviewResultOutput(reviewJson({ mustFix: [] }))?.mustFix).toBe(0);
   });
 
   test('defaultRequestReview — resultPath 가 오면 stdout 만 그 파일로(stdin·stderr 버림 · 떼어 띄움 유지) · 디렉터리를 만든다', async () => {

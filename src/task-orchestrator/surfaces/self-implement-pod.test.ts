@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { appendRunLedgerEntry, loadRunLedger, runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
 import { tmpdir } from 'node:os';
+import { tierModel } from '../../llm/model-defaults.js';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import * as childProcess from 'node:child_process';
@@ -16,9 +17,13 @@ import { CONTROL_INBOX_DIR_ENV } from '../../harness/control-inbox.js';
 import { podFragmentFinished, readPodFragment } from '../../harness/self-send-target.js';
 import { resetLiveDetailCacheForTesting } from '../../live/detail-switch.js';
 import { LEASE_KUBECTL_MAX_BUFFER, measurePoolLease, recommendConcurrency } from './pod-lease.js';
-import { POD_JOB_DEADLINE_SECONDS, POD_LOGS_KEEP_BYTES, defaultKubectl, hostCredentials, k8sLabelValue, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podEarlySalvageScript, podGithubWatchdogScript, podGitPushGuardScript, POD_GH_STALE_SECONDS, podSelfImplementSpawn, recordPodSalvage, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
+import { POD_JOB_DEADLINE_SECONDS, POD_LOGS_KEEP_BYTES, defaultKubectl, hostCredentials, k8sLabelValue, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podEarlySalvageScript, podGithubWatchdogScript, podGitPushGuardScript, POD_GH_STALE_SECONDS, podSelfImplementSpawn as realPodSelfImplementSpawn, recordPodSalvage, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
 import type { PodSource } from './pod-source-receive.js';
 import { defaultGrokModel } from '../../grok/models.js';
+
+// Unit fakes opt out explicitly; a supplied kubectl adapter in product code still measures on the host.
+const podSelfImplementSpawn: typeof realPodSelfImplementSpawn = (options = {}) =>
+  realPodSelfImplementSpawn(options.kubectl ? { budgetSnapshot: () => undefined, ...options } : options);
 import { loadTokens } from '../../oauth/store.js';
 import { resolveCodexAccount } from '../../oauth/codex-account.js';
 import { statSync } from 'node:fs';
@@ -600,7 +605,9 @@ test('the host detail switch reaches only matching Pod runs before expiry withou
     expect([secret.kind, job.kind]).toEqual(['Secret', 'Job']);
     const child = job.spec.template.spec.containers[0];
     const detailEnv = child.env.filter((entry: { name: string }) => entry.name === 'ELANOUS_LIVE_DETAIL_UNTIL');
-    const baseline = podJobManifest({ name: job.metadata.name, namespace: 'elanous-test', image: 'elanous-harness:local', repoUrl: 'https://github.com/ElanvitalAI/elanous', args: ['--open-pr', '--no-supervise'], passEnv: [], deadlineSeconds: POD_JOB_DEADLINE_SECONDS, runId: child.env.find((entry: { name: string }) => entry.name === 'ELANOUS_RUN_ID').value, parentRunId: parent, hostId: child.env.find((entry: { name: string }) => entry.name === 'ELANOUS_HOST_ID')?.value });
+    const baseline = podJobManifest({ name: job.metadata.name, namespace: 'elanous-test', image: 'elanous-harness:local', workIdentity: { work: 'harness' }, repoUrl: 'https://github.com/ElanvitalAI/elanous', args: ['--open-pr', '--no-supervise'], passEnv: [], deadlineSeconds: POD_JOB_DEADLINE_SECONDS, runId: child.env.find((entry: { name: string }) => entry.name === 'ELANOUS_RUN_ID').value, parentRunId: parent, hostId: child.env.find((entry: { name: string }) => entry.name === 'ELANOUS_HOST_ID')?.value });
+    expect(job.metadata.labels['elanous.work']).toBe('harness');
+    expect(job.spec.template.metadata.labels['elanous.work']).toBe('harness');
     const preserved = structuredClone(job);
     preserved.spec.template.spec.containers[0].env = child.env.filter((entry: { name: string }) => entry.name !== 'ELANOUS_LIVE_DETAIL_UNTIL');
     // POD9 execution identity annotations are launch-specific; the rest must match the baseline manifest.
@@ -2398,7 +2405,7 @@ describe('podSelfImplementSpawn', () => {
 });
 
 // RFC F2 — Pod 의 토큰·비용 rollup 한 줄 → 호스트 llm-usage 재방출.
-import { podUsageMissingReason, reemitPodUsage, podSigtermTrapScript } from './self-implement-pod.js';
+import { podUsageMissingReason, podUsageReemitPlan, reemitPodUsage, podSigtermTrapScript, POD_USAGE_PARTIAL_SEQ_FILE } from './self-implement-pod.js';
 import { rollup, renderRollupLine } from '../../../scripts/usage-rollup.js';
 
 describe('pod usage rollup — round 2 must-fix', () => {
@@ -2452,6 +2459,167 @@ describe('pod usage rollup — round 2 must-fix', () => {
     expect(out).toContain('TRAP_ROLLUP_FIRED');   // trap 이 롤업을 실제로 쐈다 — grace 안에 발화했다
     expect(Date.now() - t0).toBeLessThan(30_000); // (a) wait 가 trap 에 즉시 끊겼다(grace 스케일 안에 종료)
   }, 25_000);
+});
+
+// ⭐ METER-POD-ROLLUP-GAP-2 — trap PARTIAL 의 seq 전달 ⊕ 재시도 Pod 가 같은 job·runId 를 써도 접히지 않는 키.
+describe('pod usage rollup — gap 2 (trap seq · attempt key)', () => {
+  const collect = () => { const rows: Array<{ c: string; e: string; d: Record<string, unknown> }> = []; return { rows, log: (c: string, e: string, d: Record<string, unknown>) => rows.push({ c, e, d }) }; };
+  const MODEL = tierModel('balanced', 'openai');
+  const bucket = { site: 'agent-turn', provider: 'openai', model: MODEL, calls: 3, inputTokens: 300, outputTokens: 30, cacheReadInputTokens: 0, usdKnown: 0.3, unknownCostCalls: 0 };
+  const fakeRollupDir = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-gap2-'));
+    mkdirSync(join(dir, 'scripts'), { recursive: true });
+    writeFileSync(join(dir, 'scripts', 'usage-rollup.ts'), 'console.log("ROLLUP_ARGS " + process.argv.slice(2).join(" "));\n');
+    return dir;
+  };
+  const sigterm = async (dir: string, script: string, waitMs: number) => {
+    // 표본기 간격 0분 — 긴 `sleep` 자식이 stdout 파이프를 붙잡지 않게(실물 Pod 에선 trap 의 exit 로 컨테이너가 같이 끝난다).
+    const proc = Bun.spawn(['bash', '-c', script], { cwd: dir, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, ELANOUS_USAGE_PARTIAL_MINUTES: '0' } });
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    proc.kill();
+    const [code, out] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
+    return { code, out };
+  };
+
+  test('partial rollup: real sampler + real SIGTERM — the trap PARTIAL carries the sampler seq + 1 (so it is the most complete)', async () => {
+    const dir = fakeRollupDir();
+    const seqFile = join(dir, 'seq');
+    const manifest = podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60 }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } };
+    const sampler = manifest.spec.template.spec.containers[0]!.args[0]!.split('\n').find((line) => line.startsWith('(usage_partial_seq=0;'))!.replaceAll(POD_USAGE_PARTIAL_SEQ_FILE, seqFile);
+    const script = ['set -u', 'si_pid=""', sampler, podSigtermTrapScript(seqFile), 'sleep 300 & si_pid=$!', 'wait "$si_pid"; rc=$?', 'exit $rc'].join('\n');
+    const { code, out } = await sigterm(dir, script, 2500);
+    expect(code).toBe(143);
+    expect(out).not.toMatch(/--partial(?! --seq)/);                        // seq 없는 PARTIAL 은 더는 없다
+    const seqs = [...out.matchAll(/ROLLUP_ARGS --since 12h --partial --seq (\d+)/g)].map((m) => Number(m[1]));
+    expect(seqs).toContain(1);                                             // 표본기가 실제로 돌았다
+    const max = Math.max(...seqs);
+    expect(max).toBeGreaterThan(1);
+    expect(seqs.filter((n) => n === max)).toHaveLength(1);                 // 가장 큰 seq 는 하나 = trap(표본기 seq + 1) — 표본기를 먼저 끊었다
+  }, 25_000);
+
+  test('partial rollup: trap seq falls back to 1 when the seq file is missing or not a number (rc 143 kept)', async () => {
+    for (const content of [null, 'garbage', '08']) {
+      const dir = fakeRollupDir();
+      const seqFile = join(dir, 'seq');
+      if (content !== null) writeFileSync(seqFile, `${content}\n`);
+      const script = ['set -u', 'si_pid=""', podSigtermTrapScript(seqFile), 'sleep 300 & si_pid=$!', 'wait "$si_pid"; rc=$?', 'exit $rc'].join('\n');
+      const { code, out } = await sigterm(dir, script, 600);
+      expect(code).toBe(143);
+      expect(out).toContain(`ROLLUP_ARGS --since 12h --partial --seq ${content === '08' ? 9 : 1}`);
+    }
+  }, 25_000);
+
+  test('partial rollup: a usage-limit/gh-login retry (same job · same runId · new Pod) is not folded into the first attempt; partial ⊕ final of one Pod still is', () => {
+    const line = (podName: string, partial: boolean, seq = 1) => renderRollupLine({ measured: true, truncated: false, runId: 'run-retry', podName, rows: [bucket] }, { partial, seq });
+    const emit = (logs: string) => { const c = collect(); reemitPodUsage(logs, 'si-retry', c.log); return c.rows.filter((x) => x.c === 'llm.usage').map((x) => JSON.stringify({ event: 'llm-usage', data: x.d })); };
+    const attempts = [...emit(line('si-retry-aaaaa', true, 3)), ...emit(line('si-retry-bbbbb', false))];
+    expect(rollup(attempts).rows.find((x) => x.site === 'pod-rollup:agent-turn')?.calls).toBe(2);
+    const onePod = [...emit(line('si-retry-aaaaa', true, 3)), ...emit(line('si-retry-aaaaa', false))];
+    expect(rollup(onePod).rows.find((x) => x.site === 'pod-rollup:agent-turn')?.calls).toBe(1);
+  });
+});
+
+// ⭐ METER-POD-ROLLUP-GAP-3 — 런 «도중» 호스트가 쥔 PARTIAL ⊕ 결손 행의 종료 사유(10-12 canary run-4c6a70b1: Pod 삭제 뒤 PARTIAL 유실).
+describe('pod usage rollup — gap 3 (live PARTIAL capture · missing exit reason)', () => {
+  const collect = () => { const rows: Array<{ c: string; e: string; d: Record<string, unknown> }> = []; return { rows, log: (c: string, e: string, d: Record<string, unknown>) => rows.push({ c, e, d }) }; };
+  const MODEL = tierModel('balanced', 'openai');
+  const bucket = { site: 'agent-turn', provider: 'openai', model: MODEL, calls: 4, inputTokens: 400, outputTokens: 40, cacheReadInputTokens: 0, usdKnown: 0.4, unknownCostCalls: 0 };
+  const partial = (seq: number) => renderRollupLine({ measured: true, truncated: false, runId: 'run-live', podName: 'si-live-aaaaa', rows: [bucket] }, { partial: true, seq });
+
+  test('a PARTIAL seen during the run is re-emitted when the Pod\'s final logs are gone', () => {
+    const { rows, log } = collect();
+    expect(reemitPodUsage('', 'si-live', log, undefined, { reason: 'logs-unavailable', runId: 'run-live', livePartialLine: partial(3) })).toBe(1);
+    const usage = rows.filter((x) => x.c === 'llm.usage');
+    expect(usage).toHaveLength(1);
+    expect(usage[0]!.d).toMatchObject({ site: 'pod-rollup:agent-turn', model: MODEL, calls: 4, partial: true, partialSeq: 3, partialSource: 'live-capture', podRunId: 'run-live' });
+    expect(rows.some((x) => x.e === 'usage-rollup-missing')).toBe(false);
+    expect(rows.find((x) => x.e === 'usage-rollup')?.d).toMatchObject({ partial: true, seq: 3, partialSource: 'live-capture' });
+  });
+
+  test('end-of-run lines still win over the live capture (final > PARTIAL in logs > live PARTIAL)', () => {
+    const finalLine = renderRollupLine({ measured: true, truncated: false, runId: 'run-live', podName: 'si-live-aaaaa', rows: [bucket] }, { partial: false, seq: 1 });
+    const a = collect(); reemitPodUsage(finalLine, 'si-live', a.log, undefined, { reason: 'stopped', livePartialLine: partial(2) });
+    expect(a.rows.find((x) => x.c === 'llm.usage')?.d.partial).toBeUndefined();
+    const b = collect(); reemitPodUsage(partial(5), 'si-live', b.log, undefined, { reason: 'stopped', livePartialLine: partial(2) });
+    expect(b.rows.find((x) => x.c === 'llm.usage')?.d).toMatchObject({ partial: true, partialSeq: 5 });
+    expect(b.rows.find((x) => x.c === 'llm.usage')?.d.partialSource).toBeUndefined();
+  });
+
+  test('missing row carries the exit reason (and the closed Pod exit class when known)', () => {
+    const { rows, log } = collect();
+    expect(reemitPodUsage('', 'si-gone', log, undefined, { reason: 'sigterm-143', runId: 'run-gone', podExitClass: 'no-result-line', livePartialLine: 'not a partial line' })).toBe(0);
+    expect(rows.find((x) => x.e === 'usage-rollup-missing')?.d).toEqual({ job: 'si-gone', reason: 'sigterm-143', podExitClass: 'no-result-line', runId: 'run-gone' });
+    expect(rows.find((x) => x.c === 'llm.usage')?.d).toMatchObject({ site: 'pod-rollup:missing', measured: false, reason: 'sigterm-143', podExitClass: 'no-result-line', runId: 'run-gone', podRollupKey: 'run-gone|missing' });
+  });
+
+  test('podUsageReemitPlan (pure, no kubectl): Pod killed by SIGTERM after a PARTIAL — live PARTIAL re-emitted; without it the missing row carries reason ⊕ podExitClass', () => {
+    const exit = { state: 'failed' as const, failedReason: 'BackoffLimitExceeded', containerReason: 'Error', containerExitCode: 143 };
+    const live = podUsageReemitPlan({ job: 'si-sim', runId: 'run-sim', logs: '', livePartialLine: partial(4), exit });
+    expect(live.source).toBe('partial-live');
+    expect(live.rows.find((r) => r.category === 'llm.usage')?.data).toMatchObject({ site: 'pod-rollup:agent-turn', partial: true, partialSeq: 4, partialSource: 'live-capture' });
+    const gone = podUsageReemitPlan({ job: 'si-sim', runId: 'run-sim', logs: 'child started\n', livePartialLine: null, exit });
+    expect(gone.source).toBe('missing');
+    expect(gone.rows.find((r) => r.category === 'llm.usage')?.data).toMatchObject({ site: 'pod-rollup:missing', measured: false, reason: 'sigterm-143', podExitClass: 'no-result-line', runId: 'run-sim' });
+    expect(gone.rows.find((r) => r.event === 'usage-rollup-missing')?.data).toMatchObject({ reason: 'sigterm-143', podExitClass: 'no-result-line' });
+    // 로그도 사라졌으면 사유는 logs-unavailable · 완료/abort 는 분류를 싣지 않는다.
+    expect(podUsageReemitPlan({ job: 'j', logs: '', exit }).rows.find((r) => r.category === 'llm.usage')?.data.reason).toBe('logs-unavailable');
+    expect(podUsageReemitPlan({ job: 'j', logs: 'x\n', exit: { state: 'aborted' } }).rows.find((r) => r.category === 'llm.usage')?.data.podExitClass).toBeUndefined();
+    expect(podUsageReemitPlan({ job: 'j', logs: partial(9), exit: { state: 'complete' } }).source).toBe('partial-log');
+    expect(podUsageReemitPlan({ job: 'j', logs: renderRollupLine({ measured: true, truncated: false, runId: 'r', rows: [bucket] }, { partial: false, seq: 1 }), exit: { state: 'complete' } }).source).toBe('final');
+  });
+
+  test('host poll loop: the PARTIAL captured mid-run is re-emitted after the Pod (and its logs) disappear; missing row is not written', async () => {
+    const usage: Array<Record<string, unknown>> = [];
+    const pod: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const off = debug.registerSink({ name: 'gap3-live-capture', emit: (record) => {
+      if (record.category === 'llm.usage' && record.event === 'llm-usage') usage.push(record.data as Record<string, unknown>);
+      if (record.category === 'self-implement.pod' && ['usage-partial-captured', 'usage-rollup-missing'].includes(record.event)) pod.push({ event: record.event, data: record.data as Record<string, unknown> });
+    } });
+    let polls = 0;
+    const sinceCalls: Array<readonly string[]> = [];
+    const kubectl: Kubectl = (args) => {
+      if (args.includes('current-context')) return { status: 0, stdout: 'ctx', stderr: '' };
+      if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+      if (args.some((a) => a.includes('conditions[?(@.type=="Failed")].reason'))) return { status: 0, stdout: 'BackoffLimitExceeded', stderr: '' };
+      if (args.includes('get') && args.includes('pods')) return { status: 0, stdout: '', stderr: '' };   // Pod 는 이미 지워졌다
+      if (args.includes('get') && args.includes('job')) return { status: 0, stdout: polls++ < 3 ? '' : 'Failed', stderr: '' };
+      if (args.includes('logs')) {
+        // 런 도중(--since 표본)엔 PARTIAL 이 보이고, Job 이 끝난 뒤엔 Pod 가 사라져 로그를 못 읽는다.
+        if (args.some((a) => a.startsWith('--since='))) { sinceCalls.push(args); return { status: 0, stdout: `noise\n${partial(sinceCalls.length)}\nmore noise\n`, stderr: '' }; }
+        return { status: 1, stdout: '', stderr: 'pods not found' };
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    try {
+      await podSelfImplementSpawn({ kubectl, credentials: CREDS, env: {}, sleep: async () => {}, usagePartialCapturePolls: 1 })({ feature: 'x', spaceId: 'gap3-live' }).done;
+      expect(sinceCalls.length).toBeGreaterThan(0);
+      const rows = usage.filter((d) => d.job === podJobName('gap3-live'));
+      expect(rows.some((d) => d.site === 'pod-rollup:missing')).toBe(false);
+      expect(rows.find((d) => d.site === 'pod-rollup:agent-turn')).toMatchObject({ partial: true, partialSeq: sinceCalls.length, partialSource: 'live-capture', calls: 4 });
+      expect(pod.some((p) => p.event === 'usage-partial-captured')).toBe(true);
+      expect(pod.some((p) => p.event === 'usage-rollup-missing')).toBe(false);
+    } finally { off(); }
+  });
+
+  test('host poll loop: without any PARTIAL, the missing row carries the exit reason of the failed Pod', async () => {
+    const usage: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'gap3-missing-reason', emit: (record) => {
+      if (record.category === 'llm.usage' && record.event === 'llm-usage') usage.push(record.data as Record<string, unknown>);
+    } });
+    const kubectl: Kubectl = (args) => {
+      if (args.includes('current-context')) return { status: 0, stdout: 'ctx', stderr: '' };
+      if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+      if (args.some((a) => a.includes('conditions[?(@.type=="Failed")].reason'))) return { status: 0, stdout: 'BackoffLimitExceeded', stderr: '' };
+      if (args.includes('get') && args.includes('pods')) return { status: 0, stdout: '2026-10-12T06:10:00Z\tError\t143\n', stderr: '' };
+      if (args.includes('get') && args.includes('job')) return { status: 0, stdout: 'Failed', stderr: '' };
+      if (args.includes('logs')) return { status: 0, stdout: 'child started\n', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    try {
+      await podSelfImplementSpawn({ kubectl, credentials: CREDS, env: {}, sleep: async () => {} })({ feature: 'x', spaceId: 'gap3-missing' }).done;
+      expect(usage.find((d) => d.job === podJobName('gap3-missing') && d.site === 'pod-rollup:missing')).toMatchObject({ measured: false, reason: 'sigterm-143', podExitClass: 'no-result-line' });
+    } finally { off(); }
+  });
 });
 
 describe('pod usage rollup', () => {
@@ -2536,7 +2704,7 @@ describe('pod usage rollup', () => {
     const out: Array<{ c: string; e: string; d: Record<string, unknown> }> = [];
     expect(reemitPodUsage('pod died\n', 'si-143', (c, e, d) => out.push({ c, e, d }), undefined, { reason: 'sigterm-143', runId: 'run-143' })).toBe(0);
     expect(out).toHaveLength(2);
-    expect(out[0]).toEqual({ c: 'self-implement.pod', e: 'usage-rollup-missing', d: { job: 'si-143' } });
+    expect(out[0]).toEqual({ c: 'self-implement.pod', e: 'usage-rollup-missing', d: { job: 'si-143', reason: 'sigterm-143', runId: 'run-143' } });   // METER-POD-ROLLUP-GAP-3 — 결손 이벤트도 사유를 싣는다
     expect(out[1]).toEqual({ c: 'llm.usage', e: 'llm-usage', d: { site: 'pod-rollup:missing', measured: false, reason: 'sigterm-143', job: 'si-143', runId: 'run-143', substrate: 'pod', podRollupKey: 'run-143|missing' } });
   });
   test('podUsageMissingReason maps logs availability, exit codes and job reasons onto the enumeration', () => {
@@ -2567,7 +2735,8 @@ describe('pod usage rollup', () => {
     expect(script).toContain('[ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h || echo');
     expect(script.split('\n').filter((line) => line.includes('usage-rollup.ts --since 12h') && !line.includes('--partial'))).toHaveLength(1);
     // 정리 순서 — 부분 표본기도 mem 표본기 뒤, tail 앞에 죽고 기다린다.
-    expect(script.indexOf('kill "$usage_partial_pid"')).toBeGreaterThan(script.indexOf('kill "$mem_sampler_pid"'));
+    // (METER-POD-ROLLUP-GAP-2 — trap 도 표본기를 끊으므로 «정리 블록» 쪽 = 마지막 kill 로 잰다.)
+    expect(script.lastIndexOf('kill "$usage_partial_pid"')).toBeGreaterThan(script.indexOf('kill "$mem_sampler_pid"'));
     expect(script.indexOf('wait "$usage_partial_pid"')).toBeGreaterThan(script.indexOf('wait "$mem_sampler_pid"'));
     expect(script.indexOf('wait "$usage_partial_pid"')).toBeLessThan(script.lastIndexOf('tail -n 1 /tmp/si.out'));
   });
@@ -3413,6 +3582,9 @@ fi
       // POD9 adds the execution identity annotations (attempt 1 on a first launch).
       expect(job.metadata.annotations?.['elanous.dev/attempt']).toBe('1');
       expectedHumanJob.metadata.annotations = job.metadata.annotations;
+      // Only the newly requested work label is added; the human-token script, env and Secret stay unchanged.
+      expectedHumanJob.metadata.labels['elanous.work'] = 'harness';
+      expectedHumanJob.spec.template.metadata.labels['elanous.work'] = 'harness';
       // POD-DIET (10-06) raised the default memory request 4Gi → 6Gi; everything else stays byte-identical.
       expectedHumanJob.spec.template.spec.containers[0].resources.requests.memory = '6Gi';
       // POD-CPU-REQUEST-RIGHTSIZE (10-09) lowered the harness CPU request 1 → 250m (limit 4 unchanged).
@@ -3422,6 +3594,9 @@ fi
       const round2Script = (s: string) => s
         .replace("trap '{ [ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h --partial; } || true' TERM", `si_pid=\"\"\n${podSigtermTrapScript()}`)
         .replace(`elanous self implement "$(cat /creds/feature)" --json '--open-pr' '--no-supervise' > /tmp/si.out 2>&1; rc=$?`, `elanous self implement "$(cat /creds/feature)" --json '--open-pr' '--no-supervise' > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?`);
+      // METER-POD-ROLLUP-GAP-2 — 표본기가 방금 낸 seq 를 파일에 적는다(trap 이 +1 해 마지막 PARTIAL 의 seq 를 가장 크게 한다).
+      const gap2Script = (s: string) => s.replace('usage_partial_seq=$((usage_partial_seq+1)); [ -f scripts', `usage_partial_seq=$((usage_partial_seq+1)); printf '%s\\n' "$usage_partial_seq" > ${POD_USAGE_PARTIAL_SEQ_FILE} 2>/dev/null || true; [ -f scripts`);
+      expectedHumanJob.spec.template.spec.containers[0].args[0] = gap2Script(expectedHumanJob.spec.template.spec.containers[0].args[0] as string);
       expectedHumanJob.spec.template.spec.containers[0].args[0] = round2Script(expectedHumanJob.spec.template.spec.containers[0].args[0] as string);
       // GROK-CHILD-GIT-GUARD (10-11) installs the pre-push guard right after `gh auth setup-git`; everything else is unchanged.
       const frozenArgs = expectedHumanJob.spec.template.spec.containers[0].args as string[];
@@ -3990,4 +4165,78 @@ describe('pod git push guard', () => {
     expect(setup).toBeGreaterThan(-1);
     expect(guard).toBeGreaterThan(setup);
   });
+});
+
+describe('BUDGET-SNAPSHOT-TO-POD — the host budget snapshot rides the Job env', () => {
+  const snapshotEnv = (job: { spec: { template: { spec: { containers: Array<{ env: Array<{ name: string; value?: string }> }> } } } }) =>
+    job.spec.template.spec.containers[0]!.env.filter((entry) => entry.name === 'ELANOUS_BUDGET_SNAPSHOT');
+
+  test('the default host measurement reaches Job and Pod even with an injected kubectl adapter', async () => {
+    const { k, calls } = fakeKubectl(['Complete'], '');
+    const result = await realPodSelfImplementSpawn({
+      kubectl: k, credentials: CREDS, env: {}, pollMs: 1,
+      budgetInputDeps: {
+        config: { tools: { selfImplement: { childLlm: { mode: 'auto', chain: [{ provider: 'openai-codex' }, { provider: 'grok' }] } } }, llm: {} } as never,
+        inspectCodex: (() => ({ candidates: [{ name: 'team', usedPercent: 95 }] })) as never,
+        grokSnapshot: () => undefined,
+        readLiveGrok: async () => 7,
+      },
+    })({ feature: 'fix it', spaceId: 'budget-host-default' }).done;
+    expect(result.exitCode).toBe(0);
+    const job = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!)).find((item) => item.kind === 'Job');
+    const carried = snapshotEnv(job);
+    expect(carried).toHaveLength(1);
+    const snapshot = JSON.parse(carried[0]!.value!);
+    expect(snapshot.provider).toBe('grok');
+    expect(snapshot.decision.action).toBe('next-provider');
+    expect(JSON.stringify(job.spec.template)).toContain('ELANOUS_BUDGET_SNAPSHOT');
+  });
+
+  test('a measured snapshot for the Job provider reaches the Pod env as numbers and names only, never the Secret', async () => {
+    const asked: unknown[] = [];
+    const { k, calls } = fakeKubectl(['Complete'], '');
+    const result = await podSelfImplementSpawn({
+      kubectl: k, credentials: CREDS, env: {}, pollMs: 1,
+      budgetSnapshot: (childLlm) => { asked.push(childLlm); return { provider: 'openai-codex', remaining: 42, window: 'weekly', measuredAt: 1_000, host: 'host-a', decision: { action: 'next-provider', provider: 'grok' } }; },
+    })({ feature: 'fix it', spaceId: 'budget-snapshot-carried' }).done;
+    expect(result.exitCode).toBe(0);
+    expect(asked).toEqual([{}]);
+    const [secret, job] = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!));
+    const carried = snapshotEnv(job);
+    expect(carried).toHaveLength(1);
+    expect(JSON.parse(carried[0]!.value!)).toEqual({ provider: 'openai-codex', remaining: 42, window: 'weekly', measuredAt: 1_000, host: 'host-a', decision: { action: 'next-provider', provider: 'grok' } });
+    expect(Object.keys(secret.stringData).filter((key) => key.includes('BUDGET'))).toEqual([]);
+  });
+
+  test('the host verdict answers the same child-LLM question the Pod harness gate will ask', async () => {
+    const asked: unknown[] = [];
+    const { k } = fakeKubectl(['Complete'], '');
+    const result = await podSelfImplementSpawn({
+      kubectl: k, credentials: CREDS, env: {}, pollMs: 1, provider: 'openai-codex', childProviderExplicit: true,
+      budgetSnapshot: (childLlm) => { asked.push(childLlm); return undefined; },
+    })({ feature: 'fix it', spaceId: 'budget-snapshot-explicit' }).done;
+    expect(result.exitCode).toBe(0);
+    expect(asked).toEqual([{ provider: 'openai-codex' }]);
+  });
+
+  test('a failed or empty host measurement carries no snapshot and still launches', async () => {
+    for (const budgetSnapshot of [() => undefined, () => { throw new Error('usage unreadable'); }, async () => { throw new Error('usage unreadable'); }]) {
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {}, pollMs: 1, budgetSnapshot })({ feature: 'fix it', spaceId: 'budget-snapshot-absent' }).done;
+      expect(result.exitCode).toBe(0);
+      const job = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!)).find((item) => item.kind === 'Job');
+      expect(snapshotEnv(job)).toEqual([]);
+    }
+  });
+
+  test('a stuck host measurement gives the Job its admission back after 10 seconds', async () => {
+    const { k, calls } = fakeKubectl(['Complete'], '');
+    const result = await podSelfImplementSpawn({
+      kubectl: k, credentials: CREDS, env: {}, pollMs: 1,
+      budgetSnapshot: () => new Promise(() => {}),
+    })({ feature: 'fix it', spaceId: 'budget-snapshot-stuck' }).done;
+    expect(result.exitCode).toBe(0);
+    const job = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!)).find((item) => item.kind === 'Job');
+    expect(snapshotEnv(job)).toEqual([]);
+  }, 20_000);
 });

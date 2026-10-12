@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { annotateIntakeLens, type LensJudgeInput } from './lens.js';
+import { annotateIntakeLens, fairLensBatch, LENS_DAILY_CAP, type LensJudgeInput } from './lens.js';
 import { shapeIntakeItem, type IntakeItem } from './items.js';
 
 const DAY = '2026-10-05';
@@ -118,17 +118,26 @@ test('E1 and ledger items share the daily cap; the digest-style cap marker recor
   try {
     const deps = { judge, log: (event: string, data: Record<string, unknown>) => { if (event === 'capped') caps.push(data); } };
     expect(await annotateIntakeLens(root, DAY, deps)).toEqual({ judged: 20, skipped: 0, failed: 0, capped: true });
-    expect(calls).toEqual([SAME, OTHER, ...ordered.slice(0, 18).map((row) => row.id)]);
-    expect(caps[0]).toEqual({ day: DAY, total: 23, judged: 20, skippedIds: ordered.slice(18).map((row) => row.id), marker: '외 3건 · 원장 `elanous intake items`' });
+    // 갈래별로 번갈아 채운다 — E1 2 를 다 쓴 뒤 GitHub·X 가 9 씩 나눠 갖는다.
+    const gh = rows.filter((row) => row.sources.includes('github'));
+    const xs = rows.filter((row) => row.sources.includes('x'));
+    expect(calls).toEqual([SAME, OTHER, ...gh.slice(0, 9).map((row) => row.id), ...xs.slice(0, 9).map((row) => row.id)]);
+    const skippedIds = [...gh.slice(9), ...xs.slice(9)].map((row) => row.id);
+    expect(ordered).toHaveLength(21);
+    expect(caps[0]).toEqual({ day: DAY, total: 23, judged: 20, skippedIds,
+      pendingByLane: { outbox: 2, github: 11, x: 10 }, judgedByLane: { outbox: 2, github: 9, x: 9 }, doneByLane: {},
+      marker: '외 3건 · 원장 `elanous intake items`' });
     expect(await annotateIntakeLens(root, DAY, deps)).toEqual({ judged: 0, skipped: 20, failed: 0, capped: true });
     expect(calls).toHaveLength(20);
-    expect(caps[1]).toEqual({ day: DAY, total: 3, judged: 0, skippedIds: ordered.slice(18).map((row) => row.id), marker: '외 3건 · 원장 `elanous intake items`' });
+    expect(caps[1]).toEqual({ day: DAY, total: 3, judged: 0, skippedIds,
+      pendingByLane: { outbox: 0, github: 2, x: 1 }, judgedByLane: { outbox: 0, github: 0, x: 0 }, doneByLane: { outbox: 2, github: 9, x: 9 },
+      marker: '외 3건 · 원장 `elanous intake items`' });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('E1 retains priority when it fills the cap and all deferred IDs enter the digest marker', async () => {
+test('a full E1 day no longer starves GitHub and X: each lane gets a turn under the cap', async () => {
   const { root, review } = fixture();
   const additional = Array.from({ length: 19 }, (_, n) => ({ id: `e1-${n}`, fact: `E1 fact ${n}`, current: '' }));
   writeFileSync(review, readFileSync(review, 'utf8') + additional.map((row) => JSON.stringify(row)).join('\n') + '\n');
@@ -143,9 +152,41 @@ test('E1 retains priority when it fills the cap and all deferred IDs enter the d
       log: (event, data) => { if (event === 'capped') caps.push(data); },
     });
     expect(result).toEqual({ judged: 20, skipped: 0, failed: 0, capped: true });
-    expect(calls).toEqual([SAME, OTHER, ...additional.slice(0, 18).map((row) => row.id)]);
+    expect(calls).toEqual([SAME, OTHER, ...additional.slice(0, 16).map((row) => row.id), github.id, x.id]);
     expect(caps[0]).toEqual({ day: DAY, total: 23, judged: 20,
-      skippedIds: [additional[18]!.id, github.id, x.id], marker: '외 3건 · 원장 `elanous intake items`' });
+      skippedIds: additional.slice(16).map((row) => row.id),
+      pendingByLane: { outbox: 21, github: 1, x: 1 }, judgedByLane: { outbox: 18, github: 1, x: 1 }, doneByLane: {},
+      marker: '외 3건 · 원장 `elanous intake items`' });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// S1 시뮬(10-12 06:4x): 흡수 10 · GitHub 166 · X 10 이면 옛 순서 채우기는 X 를 0 으로 남겼다(판정 E1 10 · GitHub 10 · X 0).
+test('S1: absorbed 10 · GitHub 166 · X 10 → GitHub ≥1 and X ≥1 judged, total ≤ cap', async () => {
+  const { root, review } = fixture();
+  const e1 = Array.from({ length: 8 }, (_, n) => ({ id: `e1-${n}`, fact: `E1 fact ${n}`, current: '' }));
+  writeFileSync(review, readFileSync(review, 'utf8') + e1.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  const gh = Array.from({ length: 166 }, (_, n) => ledgerRow('github', n));
+  const xs = Array.from({ length: 10 }, (_, n) => ledgerRow('x', 1000 + n));
+  writeFileSync(join(root, 'intake', 'items.jsonl'), [...gh, ...xs].map((row) => JSON.stringify(row)).join('\n') + '\n');
+  const calls: string[] = [];
+  try {
+    const result = await annotateIntakeLens(root, DAY, {
+      judge: async ({ id }) => { calls.push(id); return { lensVerdict: '참고', why: '지금은 참조만 한다.', target: 'intake' }; },
+      log: () => {},
+    });
+    expect(result.capped).toBe(true);
+    expect(calls.length).toBeLessThanOrEqual(LENS_DAILY_CAP);
+    const ghIds = new Set(gh.map((row) => row.id));
+    const xIds = new Set(xs.map((row) => row.id));
+    expect(calls.filter((id) => ghIds.has(id)).length).toBeGreaterThanOrEqual(1);
+    expect(calls.filter((id) => xIds.has(id)).length).toBeGreaterThanOrEqual(1);
+    // 운영 모양(10-11): 흡수 10 ⊕ 뉴스 6 이 이미 줄을 써 남은 몫이 4 일 때도 GitHub·X 가 나눠 갖는다.
+    expect(fairLensBatch(
+      [...gh.slice(0, 5).map((row) => ({ id: row.id, lane: 'github' as const })), ...xs.slice(0, 5).map((row) => ({ id: row.id, lane: 'x' as const }))],
+      { outbox: 10 }, 4,
+    ).map((item) => item.lane)).toEqual(['github', 'github', 'x', 'x']);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -89,3 +89,34 @@ test('already published version is skipped before launch', async () => {
     launch: () => { launched = true; } })).toEqual({ status: 'skipped', version: '0.2.8', reason: 'already-published' });
   expect(launched).toBe(false);
 });
+
+test('a schedule with publishAt passes it to the launch callback', async () => {
+  setup();
+  setSchedule('0.2.8', { publishAt: '2026-10-04T21:00+09:00' }, 'OP', root);
+  let launchedOptions: { publishAt?: string } | undefined;
+  expect(await autoStartScheduledRelease({ ledgerRoot: root, windowMinutes: 15, now: new Date(cut), apply: true,
+    readiness: () => ({ ready: true, reason: 'ready', details: { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] } }),
+    launch: (_version, launchOptions) => { launchedOptions = launchOptions; },
+  })).toEqual({ status: 'started', version: '0.2.8', cutAt: cut, publishAt: '2026-10-04T12:00:00.000Z' });
+  expect(launchedOptions).toEqual({ publishAt: '2026-10-04T12:00:00.000Z' });
+});
+
+test('a schedule without publishAt launches without a publishAt', async () => {
+  setup();
+  let launchedOptions: { publishAt?: string } | undefined;
+  expect(await autoStartScheduledRelease({ ledgerRoot: root, windowMinutes: 15, now: new Date(cut), apply: true,
+    readiness: () => ({ ready: true, reason: 'ready', details: { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] } }),
+    launch: (_version, launchOptions) => { launchedOptions = launchOptions; },
+  })).toEqual({ status: 'started', version: '0.2.8', cutAt: cut });
+  expect(launchedOptions).toEqual({});
+  expect(launchedOptions?.publishAt).toBeUndefined();
+});
+
+test('the started result carries the schedule publishAt', async () => {
+  setup();
+  setSchedule('0.2.8', { publishAt: '2026-10-04T21:00+09:00' }, 'OP', root);
+  expect(await autoStartScheduledRelease({ ledgerRoot: root, windowMinutes: 15, now: new Date(cut), apply: true,
+    readiness: () => ({ ready: true, reason: 'ready', details: { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] } }),
+    launch: () => {},
+  })).toEqual({ status: 'started', version: '0.2.8', cutAt: cut, publishAt: '2026-10-04T12:00:00.000Z' });
+});

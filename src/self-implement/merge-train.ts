@@ -16,6 +16,25 @@ export type TrainObservation = {
   gatesPerLanding: number;
 };
 export type TrainGit = (args: readonly string[], repo: string) => { status: number | null; stdout: string; stderr: string };
+export type TangledPair = { first: number; then: number; failures: number };
+
+export function tangledPairs(
+  failures: readonly { pr: number; with: number }[],
+  { threshold = 2 }: { threshold?: number } = {},
+): TangledPair[] {
+  const counts = new Map<string, TangledPair>();
+  for (const failure of failures) {
+    const first = Math.min(failure.pr, failure.with);
+    const then = Math.max(failure.pr, failure.with);
+    const key = `${first}:${then}`;
+    const pair = counts.get(key);
+    if (pair) pair.failures++;
+    else counts.set(key, { first, then, failures: 1 });
+  }
+  return [...counts.values()]
+    .filter((pair) => pair.failures >= threshold)
+    .sort((left, right) => left.first - right.first || left.then - right.then);
+}
 
 export function planTrain(candidates: readonly TrainCandidate[], { maxBatch }: { maxBatch: number }): { batch: TrainCandidate[]; deferred: TrainDeferred[] } {
   if (!Number.isSafeInteger(maxBatch) || maxBatch < 1) throw new Error('maxBatch must be a positive integer');

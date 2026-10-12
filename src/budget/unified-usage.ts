@@ -3,9 +3,12 @@
 // Codex: enumerate known account names, fetch each via the existing
 // ProviderFetcher with CODEX_HOME on the child env only.
 // Grok: this wiring has no multi-account list — 0 or 1 current-credential row.
-// Claude / Gemini are intentionally out of this landing.
+// Claude Code (2026-10-11 CLAUDE-USAGE-WINDOW): subscription row — 5-hour window
+// (credits axis) + 7-day window (subscription axis), from the OAuth usage endpoint.
+// Gemini is intentionally out of this landing.
 
 import { createCodexFetcher, type CodexFetcherOpts } from './fetchers/codex.js';
+import { createClaudeFetcher, resolveClaudeAccessToken } from './fetchers/claude.js';
 import {
   fetchGrokUsage,
   GROK_SUBSCRIPTION_AXIS,
@@ -20,6 +23,7 @@ import { loadTokens } from '../oauth/store.js';
 import { envLiteral } from '../platform/env-literal.js';
 import { describeResetCreditExpiry } from './codex-reset-credit-state.js';
 import { visibleWidth } from '../tui.js';
+import { debug } from '../debug/log.js';
 import { listCodexResetCredits, type CodexResetCreditsResult } from './codex-reset-credits.js';
 import {
   buildZaiUsageView, fetchZaiQuota, getZaiApiKey, readZaiLedger,
@@ -28,6 +32,7 @@ import {
 import type {
   AccountUsageRow,
   CreditAxis,
+  RateWindow,
   ResetCreditExpiryAxis,
   SubscriptionAxis,
   UnifiedUsageReport,
@@ -59,25 +64,179 @@ export interface UnifiedUsageDeps {
   readonly zaiKey?: () => string | undefined;
   readonly fetchZaiQuota?: () => Promise<ZaiQuotaResult>;
   readonly readZaiLedger?: () => ZaiLedgerRecord[];
+  /** Claude Code OAuth 토큰 해석 심 — 없으면 조회를 안 탄다(토큰 없음 = 행 없음). */
+  readonly resolveClaudeToken?: () => string | null;
+  /** Claude 사용량 조회 심 — `createClaudeFetcher().fetch()` 모양. */
+  readonly fetchClaude?: () => Promise<UsageSnapshot>;
+  /** 캐시 «아래»의 원 조회 심 — 주면 15분/5분 캐시를 거친다(`fetchClaude` 는 캐시를 우회한다). */
+  readonly fetchClaudeUncached?: () => Promise<UsageSnapshot>;
+}
+
+/** 공급자별 실패 격리(2026-10-11) — collector 가 «try 밖에서» 던지면 그 공급자만 한 error 행으로 바꾼다.
+ *  ⛔ 종전 `Promise.all` 은 한 공급자의 예외(예: 키 조회 seam throw)가 usage «전체» 를 죽였다.
+ *    `allSettled` 로 바꾸고 rejected 는 여기서 한 행으로 접는다 — 다른 공급자 행은 그대로 산다. */
+type ZaiOutcome = { rows: AccountUsageRow[]; view: ZaiUsageView };
+
+function isolateProviderRows(
+  provider: AccountUsageRow['provider'],
+  settled: PromiseSettledResult<AccountUsageRow[] | ZaiOutcome | null>,
+): { rows: AccountUsageRow[]; zai: ZaiOutcome | null } {
+  if (settled.status === 'fulfilled') {
+    const value = settled.value;
+    if (value === null) return { rows: [], zai: null };
+    if (Array.isArray(value)) return { rows: value, zai: null };
+    return { rows: value.rows, zai: value };
+  }
+  const detail = settled.reason instanceof Error ? settled.reason.message : String(settled.reason);
+  debug.log('usage', 'provider-failed', { provider, detail });
+  return {
+    rows: [{
+      provider,
+      accountName: 'default',
+      accountCount: 1,
+      soleAccount: true,
+      credits: { status: 'error', detail },
+      subscription: { status: 'unavailable', reason: 'query-does-not-supply' },
+      resetCredits: { status: 'unavailable', detail },
+    }],
+    zai: null,
+  };
 }
 
 export async function collectUnifiedUsage(deps: UnifiedUsageDeps = {}): Promise<UnifiedUsageReport> {
-  const [codexRows, grokRows, openRouterRows, zai] = await Promise.all([
+  const [codexSettled, claudeSettled, grokSettled, openRouterSettled, zaiSettled] = await Promise.allSettled([
     collectCodexRows(deps),
+    collectClaudeRows(deps),
     collectGrokRows(deps),
     collectOpenRouterRows(deps),
     collectZaiRows(deps),
   ]);
+  const codex = isolateProviderRows('codex', codexSettled);
+  const claude = isolateProviderRows('claude', claudeSettled);
+  const grok = isolateProviderRows('grok', grokSettled);
+  const openRouter = isolateProviderRows('openrouter', openRouterSettled);
+  const zai = isolateProviderRows('zai', zaiSettled);
+  const zaiRows = zai.zai?.rows ?? zai.rows;
   return {
-    rows: [...codexRows, ...grokRows, ...openRouterRows, ...(zai?.rows ?? [])],
+    rows: [...codex.rows, ...claude.rows, ...grok.rows, ...openRouter.rows, ...zaiRows],
     accountCounts: {
-      codex: codexRows.length,
-      grok: grokRows.length,
-      openrouter: openRouterRows.length,
+      codex: codex.rows.length,
+      grok: grok.rows.length,
+      openrouter: openRouter.rows.length,
+      // ⛔ claude 도 토큰이 없으면(행 0) 칸을 안 싣는다 — 종전 JSON·문면과 바이트 동일(0행 ≠ 0% 사용).
+      ...(claude.rows.length > 0 ? { claude: claude.rows.length } : {}),
       // ⛔ 키가 없으면 칸 자체를 안 싣는다 — 종전 JSON·문면과 바이트 동일.
-      ...(zai ? { zai: 1 } : {}),
+      // 종전과 같게: 조회가 성공했으면(창이 비어도) zai 1 · 실패해 error 행만 남았어도 1(실패 행도 센다).
+      ...(zai.zai || zai.rows.length > 0 ? { zai: 1 } : {}),
     },
-    ...(zai ? { zaiCodingPlan: zai.view } : {}),
+    ...(zai.zai ? { zaiCodingPlan: zai.zai.view } : {}),
+  };
+}
+
+/** 실 OAuth usage 엔드포인트는 5~10분 간격에도 429 를 낸다(fetchers/claude.ts 머리말 · 기본 주기 15분).
+ *  nexus `/api/usage` 는 30초 캐시로 이 조립을 부르므로, 기본 조회 경로(심 없음)는 성공 스냅숏을 15분 재사용한다. */
+const CLAUDE_USAGE_CACHE_MS = 15 * 60_000;
+/** 실패(429 등)도 5분 재사용한다 — 429 가 이어지는 동안 30초마다 다시 치지 않게. */
+const CLAUDE_USAGE_FAILURE_CACHE_MS = 5 * 60_000;
+type ClaudeUsageCacheEntry = { readonly at: number; readonly token: string } & (
+  | { readonly ok: true; readonly snap: UsageSnapshot }
+  | { readonly ok: false; readonly error: unknown });
+let claudeUsageCache: ClaudeUsageCacheEntry | null = null;
+
+/** 시험 전용 — 모듈 캐시를 비운다. */
+export function resetClaudeUsageCacheForTest(): void {
+  claudeUsageCache = null;
+}
+
+async function fetchClaudeCached(token: string, nowMs: number, fetchRaw: () => Promise<UsageSnapshot>): Promise<UsageSnapshot> {
+  const c = claudeUsageCache;
+  // 캐시 키 = 토큰 — 토큰이 바뀌면(재로그인·계정 교체) 옛 계정 값을 새 행으로 보이지 않는다.
+  if (c && c.token === token && nowMs - c.at < (c.ok ? CLAUDE_USAGE_CACHE_MS : CLAUDE_USAGE_FAILURE_CACHE_MS)) {
+    if (c.ok) return c.snap;
+    throw c.error;
+  }
+  try {
+    const snap = await fetchRaw();
+    claudeUsageCache = { at: nowMs, token, ok: true, snap };
+    return snap;
+  } catch (error) {
+    claudeUsageCache = { at: nowMs, token, ok: false, error };
+    throw error;
+  }
+}
+
+/** Claude Code 구독 행 — 5시간 창(credits 축) ⊕ 7일 창(subscription 축).
+ *  ⛔ 토큰이 없으면 행을 «안» 만든다(0행 ≠ 0% 사용) — openrouter·zai 키와 같은 접기. */
+async function collectClaudeRows(deps: UnifiedUsageDeps): Promise<AccountUsageRow[]> {
+  // ⛔ 시험 런타임은 심이 없으면 «토큰 없음»으로 본다 — 실제 자격 파일을 읽으면
+  //   심을 모르는 옛 시험이 실제 네트워크를 치게 된다(openrouter·zai 키와 같은 이유).
+  const resolveToken = deps.resolveClaudeToken
+    ?? (process.env.NODE_ENV === 'test' ? () => null : resolveClaudeAccessToken);
+  let token: string | null;
+  try {
+    token = resolveToken();
+  } catch (err) {
+    // 자격 파일이 깨진 경우를 «토큰 없음»과 가를 수 있게 관측만 남긴다(행은 안 만든다).
+    debug.log('usage', 'claude-token-resolve-failed', { detail: err instanceof Error ? err.message : String(err) });
+    token = null;
+  }
+  if (!token) return [];
+  const base = {
+    provider: 'claude' as const,
+    accountName: 'default',
+    accountCount: 1,
+    soleAccount: true,
+    resetCredits: { status: 'not-applicable' } as const,
+  };
+  const tokenKey = token;
+  const fetchClaude = deps.fetchClaude ?? (() => fetchClaudeCached(
+    tokenKey, (deps.now ?? Date.now)(), deps.fetchClaudeUncached ?? (() => createClaudeFetcher().fetch())));
+  try {
+    const snap = await fetchClaude();
+    const fiveHour = snap.windows.find((w) => w.model === undefined && w.kind === 'session');
+    const weekly = snap.windows.find((w) => w.model === undefined && w.kind === 'weekly');
+    return [{ ...base, credits: claudeCreditsFromWindow(fiveHour), subscription: claudeSubscriptionFromWindow(weekly) }];
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    debug.log('usage', 'claude-fetch-failed', { detail });
+    return [{
+      ...base,
+      credits: { status: 'error', detail },
+      subscription: { status: 'unavailable', reason: 'query-does-not-supply' },
+    }];
+  }
+}
+
+function claudeCreditsFromWindow(window: RateWindow | undefined): CreditAxis {
+  const periodEnd = window && isValidEpochMs(window.resetsAt) ? new Date(window.resetsAt) : null;
+  const periodStartEpoch = periodEnd !== null && window !== undefined && isPositiveFinite(window.windowMinutes)
+    ? periodEnd.getTime() - window.windowMinutes * 60_000
+    : null;
+  const periodStart = periodStartEpoch !== null && isValidDateMs(periodStartEpoch) ? new Date(periodStartEpoch) : null;
+  return {
+    status: 'ok',
+    usedPercent: window ? window.used : null,
+    periodType: window?.kind ?? null,
+    periodStart: periodStart?.toISOString() ?? null,
+    periodEnd: periodEnd?.toISOString() ?? null,
+    monthlyLimit: null,
+    used: window ? window.used : null,
+    onDemandCap: null,
+    onDemandUsed: null,
+    prepaidBalance: null,
+    balance: null,
+    hasCredits: null,
+    unlimited: null,
+  };
+}
+
+function claudeSubscriptionFromWindow(window: RateWindow | undefined): SubscriptionAxis {
+  if (!window) return { status: 'unavailable', reason: 'query-does-not-supply' };
+  return {
+    status: 'available',
+    remainingPercent: window.remainingPercent,
+    resetsAt: window.resetsAt,
+    windowKind: window.kind,
   };
 }
 
@@ -428,6 +587,11 @@ export function formatUnifiedUsage(report: UnifiedUsageReport): string {
   for (const provider of ['codex', 'grok', 'openrouter'] as const) {
     const count = report.accountCounts[provider];
     lines.push(`  ${provider}  accounts=${count}${count === 1 ? '  (하나뿐)' : count === 0 ? '  (없음)' : ''}`);
+  }
+  // ⛔ claude 토큰이 없으면 줄을 안 낸다 — 종전 문면과 바이트 동일.
+  if (report.accountCounts.claude !== undefined) {
+    const count = report.accountCounts.claude;
+    lines.push(`  claude  accounts=${count}${count === 1 ? '  (하나뿐)' : ''}  (Claude Code 구독 · 5시간 창 ⊕ 7일 창)`);
   }
   // ⛔ 키가 없으면 줄을 안 낸다 — 종전 문면과 바이트 동일.
   if (report.accountCounts.zai !== undefined) lines.push(`  zai  accounts=${report.accountCounts.zai}  (GLM Coding Plan)`);

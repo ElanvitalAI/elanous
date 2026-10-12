@@ -1,4 +1,3 @@
-import { tierModel } from '../llm/model-defaults.js';
 import { statSync } from 'node:fs';
 import { resolve, sep } from 'node:path';
 import {
@@ -9,6 +8,7 @@ import {
 } from '../autopilot/mission-rfc-author.js';
 import {
   DEFAULT_MAX_TASKS,
+  decomposeModel,
   decomposeSelfDevGoal,
   type SelfDevDecomposeLlm,
   type SelfDevDecomposeOptions,
@@ -70,9 +70,16 @@ export type FabricDecomposeRequestResult =
   | { status: 'grounding-failed'; message: string; cause: unknown }
   | { status: 'grounding-empty'; message: string; grounding: GoalAuthoringGroundingResult };
 
+/**
+ * Default fabric resolve seam — lazy `streamLLM` wire. The model comes from the
+ * shared planning-role selector `decomposeModel` (src/self-dev/decompose.ts),
+ * so the review env `ELANOUS_PR_REVIEW_MODEL` cannot retarget fabric
+ * decomposition (ROLE-RELAY-SPLIT).
+ */
 async function defaultFabricResolve(prompt: string): Promise<string> {
   const { streamLLM } = await import('../llm.js');
-  const model = process.env.ELANOUS_PR_REVIEW_MODEL || tierModel('best');
+  const { model, source } = decomposeModel();
+  debug.log('self-dev.decompose', 'model', { model, source });
   return streamLLM([{ role: 'user', content: prompt }], () => {}, { model, reasoningEffort: 'low' });
 }
 

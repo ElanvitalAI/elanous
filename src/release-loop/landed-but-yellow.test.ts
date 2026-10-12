@@ -56,7 +56,7 @@ async function cli(args: string[], prs: MergedChecklistPr[] = merges, options: {
     expect(setItem).not.toHaveBeenCalled();
     return { stdout, stderr, calls, reads, evidenceCalls, events, exitCode: process.exitCode };
   } finally {
-    log.mockRestore(); error.mockRestore(); write.mockRestore(); debugLog.mockRestore(); setItem.mockRestore(); process.exitCode = previous;
+    log.mockRestore(); error.mockRestore(); write.mockRestore(); debugLog.mockRestore(); setItem.mockRestore(); process.exitCode = previous ?? 0;
     resetElanousConfigDir();
     rmSync(root, { recursive: true, force: true });
   }

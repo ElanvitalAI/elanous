@@ -24,7 +24,7 @@ async function run(request: string, decision: 'plugin' | 'workflow' | null) {
     return { calls, lines, exitCode: process.exitCode };
   } finally {
     console.log = oldLog;
-    process.exitCode = oldExitCode;
+    process.exitCode = oldExitCode ?? 0;
   }
 }
 

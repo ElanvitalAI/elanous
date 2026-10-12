@@ -13,6 +13,7 @@ import { installSlotScript } from '../../src/task-orchestrator/surfaces/pod-inst
 import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import type { RunPodCommandOptions } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import { readGateShards } from '../../src/release-loop/gate-shards.js';
+import { readFileDurations } from './shard-plan';
 import { debug } from '../../src/debug/log.js';
 
 const CUT = 'a'.repeat(40);
@@ -83,7 +84,9 @@ test('reproduction: the real Pod shell cut by its soft deadline leaves the finis
   mkdirSync(home);
   fakeTools(join(root, 'bin'));
   const parts = [['src/a.test.ts', 'src/b.test.ts'], ['src/slow.test.ts', 'src/c.test.ts']];
-  const shell = gateShardShell({ parts, cdpPatterns: [], softSeconds: 3, cachePrefix: '', installSlots: 0 });
+  // Locally /proc/1 is the long-lived host, unlike the freshly started Pod whose age the shell subtracts.
+  const shell = gateShardShell({ parts, cdpPatterns: [], softSeconds: 3, cachePrefix: '', installSlots: 0 })
+    .replace(/^pod_age=\$\(awk.*$/m, 'pod_age=0');
   const started = Date.now();
   const run = spawnSync('bash', ['-c', shell], { cwd: repo, encoding: 'utf8', timeout: 25_000,
     env: { PATH: `${join(root, 'bin')}:/usr/bin:/bin`, HOME: home, TMPDIR_FIRED: root } });
@@ -185,6 +188,33 @@ test('reproduction through the sweep: a cut shard is reason=timeout, keeps its f
   expect(typeof board!.shards[0]!.endedAt).toBe('string');
 });
 
+test('pod shard records outer JUnit file seconds, total test seconds, nonnegative overhead, and logs the test seconds', async () => {
+  const files = ['src/a.test.ts', 'src/b.test.ts'];
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'release-loop.gate') events.push({ event, data: data as Record<string, unknown> });
+  });
+  const { root, repo, runner } = sweepRunner(files, async (o, parts) => {
+    const dir = join(root, o.name!);
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'install.rc'), '0\n');
+    writeFileSync(join(dir, 'part-0.log'), summary(parts[0]!));
+    writeFileSync(join(dir, 'part-0.rc'), '0\n');
+    writeFileSync(join(dir, 'part-0.junit.xml'), '<testsuites><testsuite file="src/a.test.ts" time="2"><testsuite file="src/nested.test.ts" time="90"/></testsuite><testsuite file="src/b.test.ts" time="3"/></testsuites>');
+    return { exitCode: 0, artifactsDir: dir, job: 'fake' };
+  });
+  try {
+    const result = await runner.sweep(repo, join(root, 'logs'), { pool: 'pool-test', shards: 1 });
+    expect(result.rc).toBe(0);
+  } finally { log.mockRestore(); }
+  const meta = JSON.parse(readFileSync(join(root, 'logs', 'pod-0.json'), 'utf8'));
+  expect(meta.fileSeconds).toEqual({ 'src/a.test.ts': 2, 'src/b.test.ts': 3 });
+  expect(meta.testSeconds).toBe(5);
+  expect(meta.podOverheadSeconds).toBe(Math.max(0, meta.durationMs / 1000 - 5));
+  expect(events.find(({ event }) => event === 'pod-shard')?.data.testSeconds).toBe(5);
+  expect([...readFileDurations(join(root, 'logs'))]).toEqual([['src/a.test.ts', 2], ['src/b.test.ts', 3]]);
+});
+
 test('a cut shard whose finished files have a failure keeps that failure for the verdict and retries it with the unfinished files', async () => {
   const files = Array.from({ length: 30 }, (_, i) => `src/f-${String(i).padStart(2, '0')}.test.ts`);
   const failing = new Set([files[3]!]);
@@ -228,6 +258,30 @@ test('④ an isolated Pod that dies before its tests (exit 5 · no outbox) gets 
   expect(runs).toBe(2);
   expect(result.rc).toBe(0);
   expect(result.output).toContain('Ran 1 test');
+});
+
+test('pod shard without JUnit leaves timing fields unmeasured', async () => {
+  const files = ['src/only.test.ts'];
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'release-loop.gate') events.push({ event, data: data as Record<string, unknown> });
+  });
+  const { root, repo, runner } = sweepRunner(files, async (o, parts) => {
+    const dir = join(root, o.name!);
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'install.rc'), '0\n');
+    writeFileSync(join(dir, 'part-0.log'), summary(parts[0]!));
+    writeFileSync(join(dir, 'part-0.rc'), '0\n');
+    return { exitCode: 0, artifactsDir: dir, job: 'fake' };
+  });
+  try {
+    expect((await runner.sweep(repo, join(root, 'logs'), { pool: 'pool-test', shards: 1 })).rc).toBe(0);
+  } finally { log.mockRestore(); }
+  const meta = JSON.parse(readFileSync(join(root, 'logs', 'pod-0.json'), 'utf8'));
+  expect(meta).not.toHaveProperty('fileSeconds');
+  expect(meta).not.toHaveProperty('testSeconds');
+  expect(meta).not.toHaveProperty('podOverheadSeconds');
+  expect(events.find(({ event }) => event === 'pod-shard')?.data).not.toHaveProperty('testSeconds');
 });
 
 test('per-shard deadlines and install slots reach the Pod; 0 slots turns the throttle off', async () => {

@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { formatUncoveredEvidenceFeedback, coverRequiredEvidence, parseOffDiffEvidence, requiredEvidenceFromGoal } from './off-diff-evidence.js';
 import { runSelfImplement } from './orchestrator.js';
@@ -118,6 +121,39 @@ describe('uncovered required-evidence feedback', () => {
       expect(result).toMatchObject({ stage: 'pr-opened', mergeReason: 'required-evidence-uncovered' });
     } finally {
       (debug as { log: typeof debug.log }).log = original;
+    }
+  });
+  test('EVIDENCE-WIRING-EXEMPT: a pure-function goal is not held when its own bun test check passed and the gate passed', async () => {
+    const pure = ['goal: 순수 함수만 · 배선 0', '## REQUIRED EVIDENCE',
+      "- [requested] requested criteria hold || echo bun test >/dev/null; printf ' 2 pass\\n 0 fail\\n' >&2",
+      '- [preservation] grounded preservation criteria hold',
+      '- [wiring] caller connection'].join('\n');
+    const calls: number[] = [];
+    const worktree = mkdtempSync(join(tmpdir(), 'evidence-wiring-exempt-'));
+    const events: Array<{ category: string; event: string; data: unknown }> = [];
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      events.push({ category, event, data });
+    }) as typeof debug.log;
+    try {
+      await runSelfImplement({ feature: pure, mergeByHost: true, maxReworkRounds: 2, seams: seams({
+        // The goal's own check runs in the worktree: give it a real directory.
+        createWorktree: async ({ branch, base }) => ({ path: worktree, branch, base, resolvedBase: 'a'.repeat(40), invokedHead: 'a'.repeat(40) }),
+        implement: async () => { calls.push(1); return { ok: true, summary: 'done (no EVIDENCE lines written)' }; },
+        reviewDiff,
+        mergePr: async () => { throw new Error('a host-merge run never merges inside the run'); },
+      }) });
+      // No evidence feedback round: wiring is exempt, requested is covered by its check, preservation by the gate.
+      expect(calls).toHaveLength(1);
+      expect(events.some(({ event }) => event === 'uncovered-feedback')).toBe(false);
+      expect(events.filter(({ event }) => event === 'covered-by-check').map(({ data }) => (data as { tags: string[] }).tags)).toEqual([['requested']]);
+      expect(events.filter(({ event }) => event === 'covered-by-gate').map(({ data }) => (data as { tags: string[] }).tags)).toEqual([['preservation']]);
+      const decision = events.filter(({ event }) => event === 'merge-decision').at(-1)?.data as { reason: string; uncoveredEvidence: string[] };
+      expect(decision.reason).not.toBe('required-evidence-uncovered');
+      expect(decision.uncoveredEvidence).toEqual([]);
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+      rmSync(worktree, { recursive: true, force: true });
     }
   });
 });

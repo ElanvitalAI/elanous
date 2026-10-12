@@ -1,6 +1,6 @@
 /**
  * 승격 착지의 base 쪽 tsc 진단을 «main 커밋별로 한 번만» 재고 재사용하는 캐시.
- * 키 = base sha ⊕ tsc 명령 ⊕ 설정 파일(base 커밋에서 git show 로 읽은 내용) 해시 ⊕ tsc 판.
+ * 키 = base sha ⊕ tsc 명령 ⊕ 설정 파일(base 커밋에서 git show 로 읽은 내용) 해시 ⊕ 작업 트리 설치 키(bun.lock 실물) ⊕ tsc 판.
  * 값 = rebase 전 정규화 진단(워크트리 절대 경로는 «<ROOT>» 자리표로 저장).
  * ⛔ 캐시 실패는 호출자에게 던지지 않는다 — 읽기·쓰기 모두 miss 로 떨어진다.
  */
@@ -13,7 +13,7 @@ import type { TypecheckError } from '../src/typecheck-ratchet.js';
 
 export const ROOT_PLACEHOLDER = '<ROOT>';
 export const BASELINE_CACHE_MAX_ENTRIES = 50;
-const CACHE_FORMAT = 1;
+const CACHE_FORMAT = 2;
 
 /** 키에 들어가는 «기준 커밋의 설정 파일» — 이 중 하나라도 달라지면 같은 sha 라도 다른 진단이다. */
 export const BASELINE_CACHE_CONFIG_FILES = ['tsconfig.gate.json', 'apps/pwa/tsconfig.json', 'tsconfig.pwa-env.json', 'tsconfig.json', 'bun.lock'] as const;
@@ -24,6 +24,8 @@ export interface BaselineCacheOptions {
   env?: NodeJS.ProcessEnv;
   /** git 실행 심 — 출력 바이트를 돌려주고 실패하면 던진다. */
   git?: (args: string[], cwd: string) => Buffer;
+  /** 작업 트리 설치 파일 읽기 심 — 파일 바이트를 돌려주고 읽을 수 없으면 던진다. */
+  readInstallFile?: (path: string) => Buffer;
   /** tsc 판 조회 심. */
   tscVersion?: (cwd: string) => string;
   maxEntries?: number;
@@ -59,6 +61,27 @@ function defaultTscVersion(cwd: string): string {
   }
 }
 
+/** 키에 들어가는 «작업 트리에 실제로 깔린 판» — base 쪽 bun.lock 이 같아도 설치가 다르면 진단이 다르다. */
+const BASELINE_CACHE_INSTALL_FILES = ['bun.lock', 'apps/pwa/bun.lock'] as const;
+
+/**
+ * 지금 트리에 실제로 깔린 판의 키 — 작업 트리 루트 `bun.lock`(⊕ 있으면 `apps/pwa/bun.lock`) 파일 해시.
+ * 루트 `bun.lock` 을 못 읽으면 undefined(호출자는 캐시 없이 잰다 — base 키 규율과 같다) · `apps/pwa/bun.lock` 은 못 읽으면 absent.
+ */
+export function workingTreeInstallKey(cwd: string, options: Pick<BaselineCacheOptions, 'readInstallFile'> = {}): string | undefined {
+  const read = options.readInstallFile ?? ((path: string) => readFileSync(path));
+  const files: Record<string, string> = {};
+  for (const file of BASELINE_CACHE_INSTALL_FILES) {
+    try {
+      files[file] = createHash('sha256').update(read(join(cwd, file))).digest('hex');
+    } catch {
+      if (file === 'bun.lock') return undefined;
+      files[file] = 'absent';
+    }
+  }
+  return createHash('sha256').update(JSON.stringify(files)).digest('hex');
+}
+
 /** 키를 못 만들면(base 를 sha 로 풀 수 없음 등) undefined — 호출자는 캐시 없이 잰다. */
 export function computeBaselineCacheKey(base: string, command: string, cwd: string, options: BaselineCacheOptions = {}): string | undefined {
   try {
@@ -73,8 +96,10 @@ export function computeBaselineCacheKey(base: string, command: string, cwd: stri
         files[file] = 'absent';
       }
     }
+    const install = workingTreeInstallKey(cwd, options);
+    if (install === undefined) return undefined;
     const tsc = (options.tscVersion ?? defaultTscVersion)(cwd);
-    return createHash('sha256').update(JSON.stringify({ format: CACHE_FORMAT, sha, command, files, tsc })).digest('hex');
+    return createHash('sha256').update(JSON.stringify({ format: CACHE_FORMAT, sha, command, files, install, tsc })).digest('hex');
   } catch {
     return undefined;
   }

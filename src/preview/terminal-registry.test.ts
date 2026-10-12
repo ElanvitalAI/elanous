@@ -1,6 +1,7 @@
 // P0b-2 — PreviewTerminal 의 registry-backed 모드(useRegistry:true) 테스트. dup-fd 대신 공유
 //   registry 버스(startPty/onPtyEvent)로 spawn·출력수신·write/resize/stop 위임되는지 DI 로 검증.
 //   (mock.module 은 프로세스 전역 오염 → 주입 seam 사용. 기본 dup-fd 경로는 라이브라 여기서 미검증.)
+import { readFileSync } from 'node:fs';
 import { test, expect, describe } from 'bun:test';
 import { PreviewTerminal, type PreviewRegistryDeps } from './terminal.js';
 
@@ -90,4 +91,12 @@ describe('PreviewTerminal useRegistry (P0b-2 · 공유 버스 흡수)', () => {
     expect(s.handle.kills).toEqual(['SIGHUP']);
     expect(s.unregistered).toEqual(['preview_abc']);
   });
+});
+
+// LINUX-SELF-UPDATE-NODEPTY — PWA `next build` 가 이 파일을 타입 검사하므로, node-pty(optionalDependency)가 빠진
+//   리눅스 설치에서 빌드가 죽지 않으려면 «정적» import 가 하나도 없어야 한다(런타임은 require 로 늦게 싣는다).
+test('terminal.ts 는 node-pty 를 정적으로 import 하지 않는다(import type 포함)', () => {
+  const src = readFileSync(new URL('./terminal.ts', import.meta.url), 'utf8');
+  expect(src).not.toMatch(/^\s*import\b[^;]*['"]node-pty(\/[^'"]*)?['"]/m);
+  expect(src).not.toMatch(/\bimport\(\s*['"]node-pty/);
 });

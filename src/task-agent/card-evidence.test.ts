@@ -8,7 +8,8 @@ import { podRunResultLine } from '../task-orchestrator/surfaces/self-implement-p
 import { incidentLastLines } from '../harness/harness-incidents.js';
 import { debug } from '../debug/log.js';
 import { appendRunLedgerEntry, loadRunLedger, runLedgerDir, runLedgerPath, type RunLedgerEntry } from '../self-implement/run-ledger.js';
-import { bindCardEvidence, ledgerLoader, readCardSalvageBranch, refreshCardRunBinding, salvageBranchOf, type CardRunEvidenceDeps } from './card-evidence.js';
+import { bindCardEvidence, collectWiringEvidence, ledgerLoader, readCardSalvageBranch, recordWiringLiveVerified, refreshCardRunBinding, salvageBranchOf, type CardRunEvidenceDeps } from './card-evidence.js';
+import { recordTaskAgentShadowMove } from './shadow.js';
 import { advanceMission, handMission, type PieceEvidenceReader } from './mission.js';
 import { handTask, readTaskCard, type TaskLaunchContext } from './task-hand.js';
 
@@ -659,4 +660,103 @@ test('DRAFT-NOT-ARCHIVE: when host and Pod child both salvaged, the later timest
     [CHILD]: [at(CHILD, 'salvage/run-0199ff/child', '2026-10-07T02:00:00.000Z')],
   });
   expect((await readCardSalvageBranch({ runId, createdAt: '2026-10-07T00:00:00.000Z' }, hostLater)).salvageBranch).toBe('salvage/run-0199aa/host');
+});
+
+const diffOf = (path: string, ...added: string[]) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1,1 +1,${added.length + 1} @@\n context\n${added.map((line) => `+${line}`).join('\n')}\n`;
+
+test('TA-WIRING-CHECK ① recordWiringLiveVerified: 카드 런 원장에 live-verified 한 줄 · ref 빈 값은 거부', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'task-wiring-ledger-'));
+  const card = { id: 'ta-wire', runId: RUN };
+  const outcome = recordWiringLiveVerified(card, { pr: 77, ref: 'elanous tasks list → 0 error', ok: true }, { ledgerDir: dir });
+  expect(outcome.written).toBe(true);
+  const rows = (loadRunLedger(RUN, dir) ?? []).filter((row) => row.event === 'live-verified');
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({ runId: RUN, event: 'live-verified', data: { pr: 77, ref: 'elanous tasks list → 0 error', ok: true, card: 'ta-wire' } });
+  for (const ref of ['', '   ']) {
+    expect(recordWiringLiveVerified(card, { pr: 77, ref, ok: true }, { ledgerDir: dir })).toMatchObject({ written: false });
+  }
+  expect(recordWiringLiveVerified({ id: 'ta-none' }, { pr: 77, ref: 'x', ok: true }, { ledgerDir: dir })).toMatchObject({ written: false });
+  expect((loadRunLedger(RUN, dir) ?? []).filter((row) => row.event === 'live-verified')).toHaveLength(1);
+});
+
+test('TA-WIRING-CHECK ② 호출자 대입(handlers.deploy = deploy)만 바뀐 패치 → required true', async () => {
+  const prDiff = async () => diffOf('src/task-agent/dispatcher.ts', '  handlers.deploy = deploy;');
+  expect(await collectWiringEvidence(77, { prDiff })).toEqual({ required: true, liveRunRecorded: false, unknown: false });
+  expect((await collectWiringEvidence(77, { prDiff: () => diffOf('src/x.ts', "  program.command('x');") })).required).toBe(true);
+  expect((await collectWiringEvidence(77, { prDiff: () => diffOf('src/cli/tasks-cli.ts', '  const a = 1;') })).required).toBe(true);
+});
+
+test('TA-WIRING-CHECK ③ 문서·시험 파일만 바뀐 패치 → required false', async () => {
+  const prDiff = () => diffOf('docs/x.md', 'handlers.deploy = deploy;') + diffOf('src/cli/tasks-cli.test.ts', "program.command('x');", 'registry.set(a, b);');
+  expect(await collectWiringEvidence(77, { prDiff })).toEqual({ required: false, liveRunRecorded: false, unknown: false });
+  expect((await collectWiringEvidence(77, { prDiff: () => diffOf('src/task-agent/judge.ts', '  if (a === b) return;') })).required).toBe(false);
+});
+
+test('TA-WIRING-CHECK ④ prDiff 가 던지면 unknown true · 예외 없음 · gh 는 한 번만', async () => {
+  let calls = 0;
+  const result = await collectWiringEvidence(77, { prDiff: () => { calls++; throw new Error('gh: HTTP 502'); } });
+  expect(result).toEqual({ required: false, liveRunRecorded: false, unknown: true });
+  expect(calls).toBe(1);
+  let once = 0;
+  await collectWiringEvidence(77, { prDiff: () => { once++; return diffOf('bin/x.mjs', 'a'); } });
+  expect(once).toBe(1);
+});
+
+test('TA-WIRING-CHECK ⑤ 카드 런 원장에 ok 기록이 있으면 liveRunRecorded true (실패·다른 PR·원장 읽기 실패는 아니다)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'task-wiring-ledger-'));
+  const card = { id: 'ta-wire', runId: RUN };
+  const prDiff = () => diffOf('bin/x.mjs', 'a');
+  const loadLedger = (id: string) => loadRunLedger(id, dir);
+  expect((await collectWiringEvidence(77, { card, prDiff, loadLedger })).liveRunRecorded).toBe(false);
+  recordWiringLiveVerified(card, { pr: 77, ref: 'ran it', ok: false }, { ledgerDir: dir });
+  recordWiringLiveVerified(card, { pr: 78, ref: 'ran it', ok: true }, { ledgerDir: dir });
+  expect((await collectWiringEvidence(77, { card, prDiff, loadLedger })).liveRunRecorded).toBe(false);
+  recordWiringLiveVerified(card, { pr: 77, ref: 'ran it', ok: true }, { ledgerDir: dir });
+  expect(await collectWiringEvidence(77, { card, prDiff, loadLedger })).toEqual({ required: true, liveRunRecorded: true, unknown: false });
+  expect(await collectWiringEvidence(77, { card, prDiff, loadLedger: () => { throw new Error('unreadable'); } })).toMatchObject({ liveRunRecorded: false, unknown: true });
+});
+
+test('TA-WIRING-CHECK ⑤b 기본 원장 경로(주입 없음) — 기본 writer 로 남긴 ok 기록을 기본 loader 가 읽는다', async () => {
+  const card = { id: 'ta-wire-default', runId: `${RUN}-wiring-default` };
+  const prDiff = () => diffOf('bin/x.mjs', 'a');
+  expect(await collectWiringEvidence(91, { card, prDiff })).toEqual({ required: true, liveRunRecorded: false, unknown: false });
+  expect(recordWiringLiveVerified(card, { pr: 91, ref: 'ran it', ok: true })).toMatchObject({ written: true });
+  expect(readFileSync(runLedgerPath(card.runId, runLedgerDir()), 'utf8')).toContain('"event":"live-verified"');
+  expect(await collectWiringEvidence(91, { card, prDiff })).toEqual({ required: true, liveRunRecorded: true, unknown: false });
+});
+
+test('TA-WIRING-CHECK ② tasks live-verified: 카드 런 원장에 한 줄 · --fail 은 ok=false · 빈 근거·없는 카드는 exit 1', async () => {
+  const path = statePath();
+  const dir = mkdtempSync(join(tmpdir(), 'task-wiring-ledger-'));
+  const { launcher } = fakeLauncher();
+  const { card } = await handTask({ text: 'ship it', live: true, statePath: path, launcher });
+  const runId = readTaskCard(card.id, path)!.runId!;
+  const deps = { taskStatePath: path, liveVerifiedLedgerDir: dir };
+  const ok = await cli(['tasks', 'live-verified', card.id, '--pr', '77', '--ref', 'elanous tasks list → 0 error'], deps);
+  expect(ok.code).toBeFalsy();
+  expect(ok.lines[0]).toContain('live-verified');
+  const failed = await cli(['tasks', 'live-verified', card.id, '--pr', '77', '--ref', 'second run', '--fail'], deps);
+  expect(failed.code).toBeFalsy();
+  expect((loadRunLedger(runId, dir) ?? []).filter((row) => row.event === 'live-verified').map((row) => row.data)).toEqual([
+    { pr: 77, ref: 'elanous tasks list → 0 error', ok: true, card: card.id },
+    { pr: 77, ref: 'second run', ok: false, card: card.id },
+  ]);
+  expect((await cli(['tasks', 'live-verified', card.id, '--pr', '77', '--ref', ' '], deps)).code).toBe(1);
+  expect((await cli(['tasks', 'live-verified', 'ta-missing', '--pr', '77', '--ref', 'x'], deps)).code).toBe(1);
+  expect((await cli(['tasks', 'live-verified', card.id, '--pr', 'abc', '--ref', 'x'], deps)).code).toBe(1);
+  expect((loadRunLedger(runId, dir) ?? []).filter((row) => row.event === 'live-verified')).toHaveLength(2);
+});
+
+test('TA-WIRING-CHECK ④ shadow: 병합 PR 판단 뒤 wiring-shadow 를 관측만 한다 · move 불변', async () => {
+  const path = statePath();
+  const { launcher } = fakeLauncher();
+  const { card } = await handTask({ text: 'ship it', live: true, statePath: path, launcher });
+  const input = { runId: readTaskCard(card.id, path)!.runId!, stopReason: 'converged' as const, results: [{ taskId: card.id, feature: 'ship it', status: 'done', prNumber: 77, merged: true } as never] };
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const log = (_category: string, event: string, data: Record<string, unknown>) => events.push({ event, data });
+  const base = await recordTaskAgentShadowMove(input, { log, statePath: path, liveMoves: new Set(), wiring: { prDiff: () => diffOf('src/task-agent/dispatcher.ts', 'handlers.deploy = deploy;'), loadLedger: () => null } });
+  const broken = await recordTaskAgentShadowMove(input, { log: () => {}, statePath: path, liveMoves: new Set(), wiring: { prDiff: () => { throw new Error('gh down'); } } });
+  expect(events.find((row) => row.event === 'wiring-shadow')?.data).toEqual({ card: card.id, pr: 77, required: true, liveRunRecorded: false, unknown: false });
+  expect(broken.move).toBe(base.move);
+  expect(base.move).toBe('propose-green');
 });

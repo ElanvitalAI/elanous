@@ -15,6 +15,7 @@
 import { fileURLToPath } from 'node:url';
 import { judgePredictionAccuracy, mustFixTrendFromHistory, renderJudgeOwnSignals, renderJudgePredictionAccuracy } from './judge-prediction-accuracy.js';
 import { isElanousRuntimeArtifactPath } from './gate-scope.js';
+import { buildPrConclusionCard, firstParagraphOf, prConclusionCardHeader } from '../context-card/index.js';
 import { spawn, spawnSync, execFile } from 'node:child_process';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -71,6 +72,7 @@ import { ghAutomationEnv, makePrManager, type PrManager } from '../autopilot/pr-
 import { defaultSpawnGh, lookupOpenDraftPrs } from '../cli/logs-abandoned-draft-prs.js';
 import { loadRunLedger, runLedgerDir } from './run-ledger.js';
 import { readdirSync } from 'node:fs';
+import { REVIEW_DEFERRED_TO_HOST_FAILURE } from './review-deferred-to-host.js';
 import { budgetReviewerContext, reviewDiffBudgetObservation, reviewPullRequest, renderReview, type ReviewerContextItem } from '../agent-substrate/pr-reviewer.js';
 import { buildReviewIntent, type ReviewIntentInput } from '../agent-substrate/review-intent.js';
 import { OFF_DIFF_EVIDENCE_PROMPT, requiredEvidenceFromGoal, renderRequiredEvidencePrompt, tailWithOmissionMarker } from './off-diff-evidence.js';
@@ -849,16 +851,34 @@ export function changedFileTypecheck(
   }
 }
 
-/** 헤드리스 elanous 가 이 feature 를 구현하도록 주입하는 프롬프트. goal-loop 계약 + 검증된 클린-빌드
- *  앵커(측정→운영·[[REPORT-gemma-goalloop-lever-2026-07-20]])를 명시. 앵커가 gemma 를 99 로 끌어올렸고
- *  강한 모델엔 무해 — self-run 어느 provider 든 동일 규율. */
-export function buildPrBody(cwd: string, body: string): string {
-  const templatePath = join(cwd, '.github', 'pull_request_template.md');
-  if (!existsSync(templatePath)) return body;
-  const template = readFileSync(templatePath, 'utf8').trim();
-  return template ? `${template}\n\n${body}` : body;
+export interface PrBodyConclusionInput {
+  /** 결론줄 «포인터:» 에 붙일 원본 위치(원문 전문을 가리키는 참조). */
+  readonly pointers?: readonly string[];
+  /** 원문 본문을 읽지 못한 경우 — «결론: 확인 불가» 로 떨어진다. */
+  readonly unreadable?: boolean;
 }
 
+/** RFC context-diet §3a — PR 본문 첫 단락을 «결론: <한 줄> · 포인터: <원본>» 결론줄로 앞세우고
+ *  원문 본문은 결론줄 아래 그대로 둔다(지우지 않는다). 결론이 없으면 «결론: 없음(원문에 결론 없음)». */
+export function buildPrBody(cwd: string, body: string, conclusion?: PrBodyConclusionInput): string {
+  const card = buildPrConclusionCard({
+    id: 'pr-body-conclusion',
+    firstParagraph: firstParagraphOf(body),
+    ...(conclusion?.unreadable ? { unreadable: true } : {}),
+    pointers: [...(conclusion?.pointers ?? [])],
+    source: 'pr-body',
+    updatedAt: new Date().toISOString(),
+  });
+  const header = prConclusionCardHeader(card);
+  const templatePath = join(cwd, '.github', 'pull_request_template.md');
+  const template = existsSync(templatePath) ? readFileSync(templatePath, 'utf8').trim() : '';
+  const withConclusion = `${header}\n\n${body}`;
+  return template ? `${template}\n\n${withConclusion}` : withConclusion;
+}
+
+/** 헤드리스 elanous 가 이 feature 를 구현하도록 주입하는 프롬프트. goal-loop 계약 + 검증된 클린-빌드
+ * 앵커(측정→운영·[[REPORT-gemma-goalloop-lever-2026-07-20]])를 명시. 앵커가 gemma 를 99 로 끌어올렸고
+ * 강한 모델엔 무해 — self-run 어느 provider 든 동일 규율. */
 export function featurePrompt(feature: string, cwd?: string, reviewerContext?: readonly ReviewerContextItem[]): string {
   const worktreeNotice = cwd?.trim()
     ? `작업 디렉토리는 \`${cwd}\`다. 이 트리 안에서만 편집하고, 경로가 필요하면 추측하지 말고 이 경로를 기준으로 삼아라.`
@@ -1063,6 +1083,9 @@ export interface DefaultSeamsOptions {
    * ⛔ llmReview 시그니처는 그대로(prompt-in/text-out · 도구 채널 없음).
    */
   reviewerCanSelfRead?: boolean;
+  /** REVIEW-ACP-POD ②-b — 참이면 reviewDiff 가 리뷰어를 부르지 않고 `reviewed=false` ⊕ `failureReason=deferred-to-host` 를 낸다
+   *  (발사 호스트가 Claude ACP 로 리뷰한다). 기본 거짓 = 종전. */
+  reviewDeferredToHost?: boolean;
   /** CLI가 적재한 리뷰어 컨텍스트. 비어 있으면 기존 ReviewInput 형태를 유지한다. */
   reviewerContext?: ReviewerContextItem[];
   /** 기존 LLM HITL relay builder의 테스트 seam. 생성 실패 시 기본 dispatch를 그대로 유지한다. */
@@ -2585,6 +2608,18 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
             verdict: 'pass' as const, mustFix: [], shouldFix: [], summary: '(변경 없음)', reviewed: false,
             failureReason: 'no-diff',
             ...(o.reviewerCanSelfRead !== undefined ? { canSelfRead: o.reviewerCanSelfRead } : {}),
+          };
+        }
+        if (o.reviewDeferredToHost) {
+          // REVIEW-ACP-POD ②-b — 리뷰어 호출 0. ⛔ 통과로 꾸미지 않는다(reviewed=false) — 판정은 호스트 ACP 리뷰가 맡는다.
+          debug.log('self-implement', 'review.done', {
+            verdict: 'warn', reviewed: false, reason: REVIEW_DEFERRED_TO_HOST_FAILURE,
+            ...(ctx?.round !== undefined ? { round: ctx.round } : {}),
+          });
+          try { emitDecision(reviewDecision({ runId: ctx?.runId, verdict: 'warn', reviewed: false, reason: REVIEW_DEFERRED_TO_HOST_FAILURE })); } catch { /* observation must not change the review result */ }
+          return {
+            verdict: 'warn' as const, mustFix: [], shouldFix: [], summary: '(리뷰를 호스트 Claude ACP 리뷰로 미뤘다)', reviewed: false,
+            failureReason: REVIEW_DEFERRED_TO_HOST_FAILURE, deferredToHost: true as const,
           };
         }
         const intentInput = toReviewIntentInput(ctx);

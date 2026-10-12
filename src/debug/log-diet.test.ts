@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { debug, type DebugEvent } from './log.js';
-import { LOG_DIET_KEYS, LOG_DIET_SUMMARY_MIN_INTERVAL_MS, LOG_DIET_WINDOW_MS, LogDietGuard } from './log-diet.js';
+import { LOG_DIET_KEYS, LOG_DIET_KEY_WINDOW_MS, LOG_DIET_SUMMARY_MIN_INTERVAL_MS, LOG_DIET_WINDOW_MS, LogDietGuard } from './log-diet.js';
 
 const record = (category: string, event: string, data: unknown, extras: Partial<DebugEvent> = {}) =>
   ({ category, event, data, ...extras });
@@ -191,6 +191,55 @@ describe('LogDietGuard', () => {
     expect(time).toBeLessThan(LOG_DIET_SUMMARY_MIN_INTERVAL_MS);
     expect(guard.flushPending().map(summary => summary.count)).toEqual([1, 1, 1]);
   });
+
+  it('card-bridge skips fold on the 30-minute per-key window, not the 60-second default', () => {
+    let time = 0;
+    const guard = new LogDietGuard({ now: () => time });
+    const rec = record('hitl.card-bridge', 'skipped', { questionId: 'q-1', reason: 'expired' });
+    expect(guard.admit(rec).pass).toBe(true); // t=0 — first row admitted
+    time = 60_000;
+    expect(guard.admit(rec).pass).toBe(false); // t=60s — still folded (legacy window elapsed, per-key has not)
+    time = 29 * 60_000;
+    expect(guard.admit(rec).pass).toBe(false); // t=29m — still folded
+    time = 30 * 60_000;
+    const admitted = guard.admit(rec); // t=30m — per-key window elapsed, re-admitted
+    expect(admitted.pass).toBe(true);
+    expect(admitted.summaries).toEqual([{
+      category: 'hitl.card-bridge', event: 'skipped', count: 2,
+      windowMs: LOG_DIET_KEY_WINDOW_MS['hitl.card-bridge/skipped'],
+      firstSuppressedAt: new Date(60_000).toISOString(),
+      lastSuppressedAt: new Date(29 * 60_000).toISOString(),
+    }]);
+    expect(admitted.summaries[0]!.windowMs).toBe(1_800_000);
+    expect(guard.drain()).toEqual([]);
+  });
+
+  it('keys without a per-key window keep the 60-second default (tox.loop/tick)', () => {
+    let time = 0;
+    const guard = new LogDietGuard({ now: () => time });
+    expect(LOG_DIET_KEY_WINDOW_MS['tox.loop/tick']).toBeUndefined();
+    const rec = record('tox.loop', 'tick', { active: 1 });
+    expect(guard.admit(rec).pass).toBe(true); // t=0
+    time = 30_000;
+    expect(guard.admit(rec).pass).toBe(false); // mid-window — folded
+    time = 60_000;
+    const admitted = guard.admit(rec); // default window elapsed — re-admitted
+    expect(admitted.pass).toBe(true);
+    expect(admitted.summaries).toMatchObject([{ count: 1, windowMs: LOG_DIET_WINDOW_MS }]);
+  });
+
+  it('keyWindowMs: {} restores the legacy 60-second window for card-bridge skips', () => {
+    let time = 0;
+    const guard = new LogDietGuard({ now: () => time, keyWindowMs: {} });
+    const rec = record('hitl.card-bridge', 'skipped', { questionId: 'q-1', reason: 'expired' });
+    expect(guard.admit(rec).pass).toBe(true); // t=0
+    time = 1_000;
+    expect(guard.admit(rec).pass).toBe(false); // folded
+    time = 60_000;
+    const admitted = guard.admit(rec); // 60s elapsed — re-admitted like before per-key windows
+    expect(admitted.pass).toBe(true);
+    expect(admitted.summaries).toMatchObject([{ count: 1, windowMs: LOG_DIET_WINDOW_MS }]);
+  });
 });
 
 describe('DebugLog sink wiring', () => {
@@ -271,5 +320,20 @@ describe('DebugLog sink wiring', () => {
       expect(events.filter(e => e.category === 'test.diet' && e.event === 'outside')).toHaveLength(5);
       expect(events.filter(e => e.category === 'log.diet')).toHaveLength(0);
     });
+  });
+
+  it('26 waiting questions over 30 ticks (10 minutes) cost 26 originals and no diet summary', () => {
+    let time = 0;
+    captureSink(events => {
+      const questionIds = Array.from({ length: 26 }, (_, index) => `question-${index}`);
+      for (let tick = 0; tick < 30; tick++) {
+        time = tick * 20_000;
+        for (const questionId of questionIds) debug.log('hitl.card-bridge', 'skipped', { questionId, reason: 'expired' });
+      }
+      const originals = () => events.filter(e => e.category === 'hitl.card-bridge' && e.event === 'skipped');
+      const summaries = () => events.filter(e => e.category === 'log.diet' && e.event === 'suppressed');
+      expect(originals()).toHaveLength(26); // one row per question — every tick after the first folds
+      expect(summaries()).toHaveLength(0); // the 30-minute window keeps every count pending
+    }, new LogDietGuard({ now: () => time }));
   });
 });

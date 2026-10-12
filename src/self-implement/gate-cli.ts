@@ -16,7 +16,7 @@ import { publicExposureFiles, runExposeGate } from './expose-gate.js';
 import { getUserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
 import { buildDocumentGuardianIndex, formatDocumentGuardians } from './document-guardian-index.js';
-import { buildImporterTestIndex, isTestPath, type ImporterTestIndex } from './importer-test-index.js';
+import { buildImporterTestIndex, importerTestsNotInRunSet, isTestPath, type ImporterTestIndex } from './importer-test-index.js';
 import { buildRouteConsumerTestIndex } from './route-consumer-test-index.js';
 import { gitChangedFiles, observeGateBaselineLocation } from './seams.js';
 import {
@@ -33,6 +33,9 @@ export interface SelfGateCliOptions {
   /** LIGHT-RC (0.2.19) — repository-relative test paths run on every call, whatever changed. Existing ones join the
    *  run (deduplicated, same introduced/preexisting baseline as the rest); missing ones go to `alwaysIncludeMissing`. */
   alwaysInclude?: readonly string[];
+  /** RELEASE-DAILY-LIGHT-RC ② — run every tracked test that imports a changed (non-test) source, past the caller cap
+   *  (importer index · reason=changed-source-importer). Off by default: the plain `self gate` scope is unchanged. */
+  includeImporterTests?: boolean;
 }
 
 interface ProcessResult {
@@ -115,6 +118,8 @@ export interface SelfGateCliResult {
   documentsWithoutDerivedTests: readonly string[];
   /** `alwaysInclude` paths that do not exist in the tree (empty when none were given). */
   alwaysIncludeMissing: readonly string[];
+  /** RELEASE-DAILY-LIGHT-RC ② — importer tests added because `includeImporterTests` was set (empty otherwise). */
+  importerTestsAdded?: readonly string[];
   /** New vs. already-present failures (unknown/preconditionUnmet = failures it could not classify). Absent = the test
    *  step did not produce a measurement (e.g. shards unmeasured). */
   baseline?: { introduced: number; preexisting: number; unknown: number; preconditionUnmet: number };
@@ -605,9 +610,20 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
   const alwaysIncludeMissing = alwaysInclude.filter((path) => !exists(path));
   const scopedTests = scope.testArgs ?? [];
   const alwaysIncludeExtra = alwaysInclude.filter((path) => exists(path) && !scopedTests.includes(path));
-  const testFiles = [...scopedTests, ...alwaysIncludeExtra];
-  const skipTestStep = scope.skipTestStep && alwaysIncludeExtra.length === 0;
-  const unrunImporterTotal = lookupFailed ? null : (scope.importerTestsNotRun?.total ?? 0);
+  // RELEASE-DAILY-LIGHT-RC ② — the scope already runs importer tests as callers, but capped (GATE_CALLER_TEST_LIMIT);
+  // a day of landings overflows that cap and source-only regressions went unrun (0.2.24: 20). Opt-in: every importer.
+  const changedSources = selection.files.filter((path) => !isTestPath(path));
+  const importerTestsAdded = options.includeImporterTests && availableIndex
+    ? [...new Set(changedSources.flatMap((source) => availableIndex.testsBySource.get(source) ?? []))]
+      .filter((path) => exists(path) && !scopedTests.includes(path) && !alwaysIncludeExtra.includes(path)).sort()
+    : [];
+  const testFiles = [...scopedTests, ...alwaysIncludeExtra, ...importerTestsAdded];
+  const skipTestStep = scope.skipTestStep && alwaysIncludeExtra.length === 0 && importerTestsAdded.length === 0;
+  const importerTestsNotRun = options.includeImporterTests && availableIndex
+    ? importerTestsNotInRunSet(availableIndex, changedSources, testFiles) : scope.importerTestsNotRun;
+  const unrunImporterTotal = lookupFailed ? null : (importerTestsNotRun?.total ?? 0);
+  // Overflowed callers that ② ran anyway are not «not run».
+  const callerTestsOverflow = scope.callerTestsOverflow.filter(({ file }) => !importerTestsAdded.includes(file));
   const importerLookupFailed = Boolean(lookupFailed);
   const lines = [
     // ⛔⭐ 「changed=0」을 «초록»으로 읽는 사고가 났다(2026-09-02 · 🅕 보고 · 🅣 재현).
@@ -630,14 +646,17 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
     documentGuardianLine(cwd, scope.documentPaths, deps.runCommand),
     // 🚨 러너 우주 «밖» — 형제들과 같은 정책으로 «말만» 한다(`OBS-T418`).
     formatUnrunnableChangeKinds(selection.files),
-    formatUnrunImporterTests(scope.importerTestsNotRun, lookupFailed),
+    formatUnrunImporterTests(importerTestsNotRun, lookupFailed),
     `caller tests: ${lookupFailed ? `lookup failed (${lookupFailed})` : scope.callerTests.map(({ file, reasons }) => `${file} (${reasons.join('+')})`).join(', ') || (routeIndex?.lookupFailures.length ? 'route lookup incomplete' : '(none)')}`,
     ...(routeIndex?.lookupFailures.length ? [`⚠️ caller route base lookup failed — unmeasured: ${routeIndex.lookupFailures.map(({ source, reason }) => `${source} (${reason})`).join(', ')}`] : []),
-    ...(scope.callerTestsOverflow.length ? [`⚠️ caller test cap exceeded — not run: ${scope.callerTestsOverflow.map(({ file, reasons }) => `${file} (${reasons.join('+')})`).join(', ')}`] : []),
+    ...(callerTestsOverflow.length ? [`⚠️ caller test cap exceeded — not run: ${callerTestsOverflow.map(({ file, reasons }) => `${file} (${reasons.join('+')})`).join(', ')}`] : []),
     changedTestCountNote(cwd, selection.files, selection.baseRef, deps.runCommand, deps.readFile),
     // Only printed when the caller asked for always-include paths — the plain `self gate` output is unchanged.
     ...(options.alwaysInclude !== undefined
       ? [`always include: ${alwaysInclude.length - alwaysIncludeMissing.length}/${alwaysInclude.length} (added ${alwaysIncludeExtra.length}${alwaysIncludeMissing.length ? ` · missing: ${alwaysIncludeMissing.join(', ')}` : ''})`]
+      : []),
+    ...(options.includeImporterTests
+      ? [`importer tests added: ${lookupFailed ? `lookup failed (${lookupFailed})` : `${importerTestsAdded.length} (reason=changed-source-importer${importerTestsAdded.length ? ` · ${importerTestsAdded.join(', ')}` : ''})`}`]
       : []),
   ];
   if (expose.log) lines.push(expose.log);
@@ -664,7 +683,7 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
   if (skipTestStep) {
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
-    return { exitCode: androidPassed && iosPassed && pwaPassed && policyPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles: [], unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, baseline: { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 } };
+    return { exitCode: androidPassed && iosPassed && pwaPassed && policyPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles: [], unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, importerTestsAdded, baseline: { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 } };
   }
 
   if (options.shards !== undefined) {
@@ -700,7 +719,7 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
       exitCode: aggregate.status !== 'passed' || !policyPassed || !androidPassed || !iosPassed || !pwaPassed || !expose.passed ? 1 : 0,
       lines, changedFiles: selection.files, testFiles, unverified: scope.unverified,
       documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests,
-      alwaysIncludeMissing, ...(shardBaseline ? { baseline: shardBaseline } : {}),
+      alwaysIncludeMissing, importerTestsAdded, ...(shardBaseline ? { baseline: shardBaseline } : {}),
       ...(unmeasuredReason !== undefined ? { unmeasuredReason } : {}),
     };
   }
@@ -711,7 +730,7 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
     lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, `tests: pass (${testFiles.length} files)`));
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
-    return { exitCode: policyPassed && androidPassed && iosPassed && pwaPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, baseline: { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 } };
+    return { exitCode: policyPassed && androidPassed && iosPassed && pwaPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, importerTestsAdded, baseline: { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 } };
   }
 
   if (worktreeLog.includes('deterministic environment setup failed')) lines.push(worktreeLog);
@@ -733,5 +752,5 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
   lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, formatGateBaselineNote(report, unrunImporterTotal ?? 0)));
   const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
   const exitCode = !androidPassed || !iosPassed || !pwaPassed || !policyPassed || !expose.passed || report.introduced > 0 || report.unknown > 0 || report.preconditionUnmet > 0 ? 1 : 0;
-  return { exitCode, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, baseline: { introduced: report.introduced, preexisting: report.preexisting, unknown: report.unknown, preconditionUnmet: report.preconditionUnmet } };
+  return { exitCode, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, importerTestsAdded, baseline: { introduced: report.introduced, preexisting: report.preexisting, unknown: report.unknown, preconditionUnmet: report.preconditionUnmet } };
 }

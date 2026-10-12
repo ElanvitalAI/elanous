@@ -9,7 +9,7 @@ import { prereleaseKind } from './release-version.js';
 interface HostResult { host: string; ok: boolean; before: string; after: string; error?: string; skipped?: string; hooks?: string; restart?: 'no-service' }
 /** Where the internal feed is packed from: a checkout of the release tag, never the run's working tree. */
 export interface FeedSource { checkout: string; commit: string; deps: 'linked' | 'installed'; cleanup: () => void }
-interface OpsUpgradeDeps { exists?: (path: string) => boolean; installSource?: () => string | null; feedSource?: (version: string) => FeedSource }
+interface OpsUpgradeDeps { exists?: (path: string) => boolean; installSource?: () => string | null; installCommit?: () => string | null; feedSource?: (version: string) => FeedSource }
 
 /** Detached worktree at refs/tags/v<version> with the PWA built — the feed ships what was released (10-04 0.2.11:
  *  packing process.cwd() shipped main HEAD ee689ad2 as «0.2.11» to node-b·cloud-vm instead of the cut 31129c91). */
@@ -52,16 +52,24 @@ export function tagFeedSource(run: CommandRunner, repo: string = process.cwd()):
   };
 }
 
-function localInstallSource(): string | null {
+function installMetadata(text: string): { source: string | null; commit: string | null } {
   try {
-    const data: unknown = JSON.parse(readFileSync(join(homedir(), '.local/share/elanous/install.json'), 'utf8'));
-    return data && typeof data === 'object' && 'source' in data && typeof data.source === 'string' ? data.source : null;
-  } catch { return null; }
+    const data: unknown = JSON.parse(text);
+    if (!data || typeof data !== 'object') return { source: null, commit: null };
+    return {
+      source: 'source' in data && typeof data.source === 'string' ? data.source : null,
+      commit: 'commit' in data && typeof data.commit === 'string' ? data.commit : null,
+    };
+  } catch { return { source: null, commit: null }; }
 }
 
-function installedMatches(installed: unknown, version: string, checkout: boolean): boolean {
-  return installed === version || checkout && typeof installed === 'string'
-    && installed.startsWith(`${version}-`) && /^[0-9a-f]{12}$/.test(installed.slice(version.length + 1));
+function localInstallMetadata(): { source: string | null; commit: string | null } {
+  try { return installMetadata(readFileSync(join(homedir(), '.local/share/elanous/install.json'), 'utf8')); }
+  catch { return { source: null, commit: null }; }
+}
+
+function installedMatches(installed: unknown, version: string): boolean {
+  return installed === version;
 }
 
 function missingService(data: Record<string, unknown> | undefined): boolean {
@@ -116,17 +124,21 @@ export function runOpsUpgrade(run: CommandRunner = runCommand, deps: OpsUpgradeD
   }
   const results: HostResult[] = [];
   for (const host of hosts as string[]) {
-    const source = host === 'local' ? (deps.installSource ?? localInstallSource)() : null;
-    const checkout = host === 'local' && source !== null && isAbsolute(source);
-    const path = checkout ? 'checkout' as const : 'release' as const;
+    // Injected install metadata replaces the machine's install.json entirely — a test that injects only the source
+    //   must not inherit this machine's real commit (that turned update cases into kept-ahead skips).
+    const injected = deps.installSource !== undefined || deps.installCommit !== undefined;
+    let metadata: { source: string | null; commit: string | null } = host !== 'local'
+      ? { source: null, commit: null }
+      : injected
+        ? { source: deps.installSource?.() ?? null, commit: deps.installCommit?.() ?? null }
+        : localInstallMetadata();
+    let source = metadata.source;
+    let railSource = false;
+    let path: 'checkout' | 'release' = 'release';
     const record = (result: HostResult) => {
       results.push(result);
       debug.log('release-loop.ops-upgrade', 'host', { host, path, restart: result.restart ?? (context.input.opsRestart === true ? result.ok ? 'ok' : 'failed' : 'skipped'), ok: result.ok });
     };
-    if (host !== 'local' && feedError) {
-      record({ host, ok: false, before: '', after: '', skipped: '내부 피드 발행 실패', error: feedError });
-      continue;
-    }
     const command = (args: string[]): CommandResult => host === 'local'
       ? run('elanous', args)
       // The installer's own bin dir comes first — a --no-modify-path install (the bot VM) has elanous only there.
@@ -134,35 +146,41 @@ export function runOpsUpgrade(run: CommandRunner = runCommand, deps: OpsUpgradeD
     let before = '';
     let after = '';
     try {
+      if (host !== 'local') {
+        const installed = run('ssh', [host, `cat "$HOME/.local/share/elanous/install.json" 2>/dev/null || true`]);
+        if (installed.status === 0) metadata = installMetadata(installed.stdout);
+      }
+      source = metadata.source;
+      if (source !== null && isAbsolute(source)) {
+        const repository = host === 'local'
+          ? run('git', ['rev-parse', '--is-inside-work-tree'], source)
+          : run('ssh', [host, `git -C ${quote(source)} rev-parse --is-inside-work-tree`]);
+        railSource = repository.status === 0 && firstLine(repository.stdout) === 'true';
+      }
+      path = railSource ? 'checkout' : 'release';
       const previous = command(['--version']);
       if (previous.status === 0) before = firstLine(previous.stdout);
-      if (checkout) {
-        const git = (args: string[]) => run('git', args, source!);
-        const dirty = git(['status', '--porcelain', '--untracked-files=all']);
-        if (dirty.status !== 0 || dirty.stdout.trim()) {
-          record({ host, ok: false, before, after, error: dirty.status === 0 ? '체크아웃 변경 있음' : `체크아웃 상태 확인 실패: ${reason(dirty)}` });
-          continue;
-        }
-        const fetched = git(['fetch', '--tags']);
-        if (fetched.status !== 0) {
-          record({ host, ok: false, before, after, error: `태그 가져오기 실패: ${reason(fetched)}` });
-          continue;
-        }
-        const tag = git(['rev-parse', '--verify', `refs/tags/v${version}^{commit}`]);
-        if (tag.status !== 0 || !tag.stdout.trim()) {
-          record({ host, ok: false, before, after, error: `태그 없음: v${version}` });
-          continue;
-        }
-        const moved = git(['checkout', '--detach', `v${version}`]);
-        if (moved.status !== 0) {
-          record({ host, ok: false, before, after, error: `체크아웃 전환 실패: ${reason(moved)}` });
+      if (railSource) {
+        record({ host, ok: true, before, after: before, skipped: 'rail-source' });
+        continue;
+      }
+      const installedCommit = metadata.commit;
+      if (installedCommit && /^[0-9a-f]{40,64}$/.test(installedCommit)) {
+        const ahead = run('git', ['merge-base', '--is-ancestor', `refs/tags/v${version}`, installedCommit]);
+        // Only exit 1 proves non-ancestry; missing local objects must not permit a potentially destructive downgrade.
+        if (ahead.status !== 1) {
+          record({ host, ok: true, before, after: before, skipped: 'kept-ahead' });
           continue;
         }
       }
-      const updated = command(['update', ...(checkout || host !== 'local' && feedPath !== undefined ? [] : ['--version', version]), '--json', ...(context.input.opsRestart === true ? ['--restart'] : [])]);
+      if (host !== 'local' && feedError) {
+        record({ host, ok: false, before, after: '', skipped: '내부 피드 발행 실패', error: feedError });
+        continue;
+      }
+      const updated = command(['update', ...(host !== 'local' && feedPath !== undefined ? [] : ['--version', version]), '--json', ...(context.input.opsRestart === true ? ['--restart'] : [])]);
       const updateResult = lastResult(updated);
       const noService = host !== 'local' && context.input.opsRestart === true && updateResult?.exitCode === 1 && missingService(updateResult);
-      if ((!noService && (updated.status !== 0 || updateResult?.exitCode !== 0)) || !installedMatches(updateResult?.installedVersion, version, checkout)) {
+      if ((!noService && (updated.status !== 0 || updateResult?.exitCode !== 0)) || !installedMatches(updateResult?.installedVersion, version)) {
         const error = (updated.status === 0 && updateResult?.exitCode === 0 || noService)
           ? `설치판 불일치 (기대 ${version}, 실제 ${String(updateResult?.installedVersion)})` : reason(updated);
         record({ host, ok: false, before, after, error });
@@ -174,7 +192,7 @@ export function runOpsUpgrade(run: CommandRunner = runCommand, deps: OpsUpgradeD
         continue;
       }
       after = firstLine(current.stdout);
-      if (!installedMatches(after.split(/\s+/)[0], version, checkout)) {
+      if (!installedMatches(after.split(/\s+/)[0], version)) {
         record({ host, ok: false, before, after, error: `올렸는데 판이 그대로 (기대 ${version}, 실제 ${after || '없음'})` });
         continue;
       }
@@ -198,14 +216,17 @@ export function runOpsUpgrade(run: CommandRunner = runCommand, deps: OpsUpgradeD
     feed: feedError ? 'failed' as const : feedPath === undefined ? 'skipped-no-path' as const : 'published' as const, hosts: results };
 }
 
-if (import.meta.main) {
+function main(): void {
   let version = '';
   try {
     version = readGraphContext().input.version;
     // RELEASE-REHEARSAL-RC: a prerelease never lands docs on main or upgrades the operating hosts.
-    process.exitCode = finishNode('ops-upgrade', version, prereleaseKind(version) !== null
-      ? { outcome: 'ok', verdict: 'pass', summary: `ops-upgrade skipped — ${version} is a prerelease`, skipped: 'prerelease' }
-      : runOpsUpgrade());
+    const result = prereleaseKind(version) !== null
+      ? { outcome: 'ok' as const, verdict: 'pass' as const, summary: `ops-upgrade skipped — ${version} is a prerelease`, skipped: 'prerelease' }
+      : runOpsUpgrade(runCommand);
+    process.exitCode = finishNode('ops-upgrade', version, result);
   }
   catch (error) { process.exitCode = finishNode('ops-upgrade', version, errorResult(error)); }
 }
+
+if (import.meta.main) main();

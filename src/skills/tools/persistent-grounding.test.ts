@@ -197,6 +197,80 @@ describe('persistent grounding', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  test('승인된 evidence에서 반복 목록 표지만 벗기고 표지 없는 줄은 그대로 보존한다', async () => {
+    const root = worktree();
+    writeFileSync(join(root, 'src', 'a.ts'), 'export const a = true;\n');
+    try {
+      const result = await groundPersistently('strip evidence list markers', root, {
+        runGoalLoop: async (ctx) => {
+          const callCtx = { callId: 'evidence-list-markers', sessionId: ctx.sessionId, signal: ctx.signal };
+          await ctx.dispatchTool('Read', { file_path: 'src/a.ts' }, callCtx);
+          return complete(ctx, [
+            '2. src/a.ts',
+            '- src/a.ts — x',
+            '- 2. src/a.ts — y',
+            '  src/a.ts:   unchanged text  ',
+          ].join('\n'));
+        },
+      });
+      expect(result).toEqual(expect.objectContaining({
+        files: ['src/a.ts'],
+        evidence: [
+          'src/a.ts',
+          'src/a.ts — x',
+          'src/a.ts — y',
+          '  src/a.ts:   unchanged text  ',
+        ],
+      }));
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('목록 표지 제거 전후 승인 수와 evidence 거절 분류가 동일하다', async () => {
+    const root = worktree();
+    const original = debug.log.bind(debug) as typeof debug.log;
+    const logs: { category: string; event: string; data: unknown }[] = [];
+    (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => { logs.push({ category, event, data }); }) as typeof debug.log;
+    try {
+      const run = async (acceptedLine: string) => {
+        logs.length = 0;
+        const result = await groundPersistently('compare evidence list marker policy', root, {
+          runGoalLoop: async (ctx) => {
+            const callCtx = { callId: 'evidence-marker-equivalence', sessionId: ctx.sessionId, signal: ctx.signal };
+            await ctx.dispatchTool('Read', { file_path: 'src/candidate.ts' }, callCtx);
+            return complete(ctx, [
+              acceptedLine,
+              'no path evidence',
+              'docs/outside.ts: outside-root evidence',
+              'src/not-read.ts: unread evidence',
+              'src/candidate.ts',
+            ].join('\n'));
+          },
+        });
+        const finished = logs.find((log) => log.category === 'grounding.persistent' && log.event === 'finished');
+        return {
+          result,
+          evidenceCount: (finished?.data as { evidenceCount: number }).evidenceCount,
+          rejection: (finished?.data as { evidenceRejection: unknown }).evidenceRejection,
+        };
+      };
+      const marked = await run('- 2. src/candidate.ts — relevant');
+      const unmarked = await run('src/candidate.ts — relevant');
+      expect(marked.evidenceCount).toBe(unmarked.evidenceCount);
+      expect(marked.result?.evidence).toHaveLength(unmarked.result?.evidence.length ?? 0);
+      expect(marked.rejection).toEqual(unmarked.rejection);
+      expect(marked.rejection).toEqual({
+        noPath: 1,
+        outsideRoot: 1,
+        notRead: 2,
+        noMeaningfulText: 1,
+        samples: ['no path evidence', 'docs/outside.ts', 'src/not-read.ts'],
+      });
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('apps 증거는 Read된 경로만 승인하고 미Read 경로를 거부한다', async () => {
     const root = worktreeWithRoots(['apps/pwa/src']);
     try {

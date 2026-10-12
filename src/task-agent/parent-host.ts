@@ -192,9 +192,9 @@ export function remoteParentAlive(parentHost: { host: string; pid?: number; runI
 }
 
 /** 발사 전 점검 결과 — `gaps` 가 비어야 원격으로 띄운다. */
-export interface ParentHostPreflight { ok: boolean; gaps: string[]; facts: Record<string, string> }
+export interface ParentHostPreflight { ok: boolean; gaps: string[]; warnings: string[]; facts: Record<string, string> }
 
-/** 원격 사실 한 번에 — key=value 줄. */
+/** 원격 사실 한 번에 — key=value 줄. LLM 자격은 «존재·개수»만 센다(값을 읽지도 찍지도 않는다). */
 export function preflightScript(target: ParentHostConfig): string {
   const elanous = remotePath(target.elanous ?? DEFAULT_REMOTE_ELANOUS);
   const configDir = remotePath(target.configDir ?? DEFAULT_REMOTE_CONFIG_DIR);
@@ -204,6 +204,9 @@ export function preflightScript(target: ParentHostConfig): string {
     `grep -Eq '"podPool"[[:space:]]*:[[:space:]]*"[^"[:space:]]+' ${configDir}/config.json 2>/dev/null && echo podPool=1`,
     `(cd ${shellQuote(target.cwd)} 2>/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2>&1) && echo repo=1`,
     `command -v kubectl >/dev/null 2>&1 && echo kubectl=1`,
+    `n=$(grep -Ec '^[[:space:]]*"openai-codex(:[^"]*)?"[[:space:]]*:[[:space:]]*\\{' ${configDir}/auth.json 2>/dev/null); echo "codexAccounts=\${n:-0}"`,
+    `{ grep -Eq '"key"[[:space:]]*:[[:space:]]*"[^"]+"' "$HOME/.grok/auth.json" 2>/dev/null || [ -n "\${XAI_API_KEY:-}\${GROK_API_KEY:-}\${GROK_CODE_XAI_API_KEY:-}" ]; } && echo grok=1`,
+    `{ [ -s "\${ELANOUS_KEY_CACHE_DIR:-$HOME/.cache}/openrouter_api_key" ] || [ -n "\${OPENROUTER_API_KEY:-}" ]; } && echo openrouter=1`,
     `true`,
   ].join('; ');
 }
@@ -242,6 +245,16 @@ export function judgeParentHostFacts(facts: Record<string, string>, input: Omit<
   return gaps;
 }
 
+/** 순수 판정 — 원격 LLM 자격 사실 → 경고 목록(막지 않는다 · gaps 와 별개). 못 닿은 호스트는 사실이 없으므로 경고도 없다. */
+export function judgeParentHostCredentials(facts: Record<string, string>): string[] {
+  if (facts.unreachable) return [];
+  const warnings: string[] = [];
+  if (!(Number(facts.codexAccounts) > 1)) warnings.push('codex-accounts-low');
+  if (facts.grok !== '1') warnings.push('grok-credential-missing');
+  if (facts.openrouter !== '1') warnings.push('openrouter-key-missing');
+  return warnings;
+}
+
 export function preflightParentHost(input: PreflightInput): ParentHostPreflight {
   const ssh = input.ssh ?? defaultSshRunner;
   const facts: Record<string, string> = {};
@@ -252,7 +265,18 @@ export function preflightParentHost(input: PreflightInput): ParentHostPreflight 
     if (at > 0) facts[line.slice(0, at).trim()] = line.slice(at + 1).trim();
   }
   const gaps = judgeParentHostFacts(facts, { localVersion: input.localVersion, launchHoldActive: input.launchHoldActive, podPoolOverride: Boolean(input.target.podPool) });
-  return { ok: gaps.length === 0, gaps, facts };
+  const warnings = judgeParentHostCredentials(facts);
+  if (warnings.length) {
+    try {
+      debug.log('task-agent.parent-host', 'credential-warning', {
+        host: input.target.host,
+        codexAccounts: Number(facts.codexAccounts) || 0,
+        grok: facts.grok === '1' ? 1 : 0,
+        openrouter: facts.openrouter === '1' ? 1 : 0,
+      });
+    } catch { /* fail-soft */ }
+  }
+  return { ok: gaps.length === 0, gaps, warnings, facts };
 }
 
 /** 원격이 «확실히 안 띄웠다»고 답했다 — 호출부가 로컬로 돌아가도 중복 발사가 아니다. */

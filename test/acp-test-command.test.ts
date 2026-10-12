@@ -69,5 +69,5 @@ test('acp test canonicalizes aliases through the agent manager and records the s
 });
 
 afterEach(() => {
-  process.exitCode = undefined;
+  process.exitCode = 0;
 });

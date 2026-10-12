@@ -28,6 +28,8 @@ import { TA_LAND_ENV } from '../../task-agent/task-hand.js';
 import { appendRunLedgerEntry, loadRunLedger, runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
 import type { GoalExecutionRecord } from '../../self-implement/orchestrator.js';
 import { runHostRegate, type HostRegateResult } from '../../self-implement/host-regate.js';
+import { resolvePodHostAcpReview, runPodHostAcpReview, type PodHostAcpReviewOutcome } from './pod-host-acp-review.js';
+import { REVIEW_DEFERRED_TO_HOST_ENV, REVIEW_DEFERRED_TO_HOST_MERGE_REASON } from '../../self-implement/review-deferred-to-host.js';
 import { classifyPodTerminal, applyPodTerminal, podTerminalPrBody, type PrTerminalRecord, type DraftResidueContext } from '../../self-dev/draft-residue.js';
 
 export const POD_CONTROL_INBOX_DIR = '/tmp/elanous-control.inbox';
@@ -50,7 +52,7 @@ export const POD_JOB_DEADLINE_SECONDS = 10_800;
 // POD-DIET (10-06 03:47~05:18 · node-b goal Pods · 89 one-minute samples · 42 Pods): per-Pod observed max median 4.6Gi ·
 // p75 6.2Gi · p90 11.7Gi — 23/42 went above the old 4Gi request, so the scheduler over-packed. 6Gi ≈ p75; limits stay.
 // Node allocatable ≈ 343Gi ≫ 25 × 6Gi. One-minute samples can miss the true peak (lower bound).
-import type { PodPlacement, PodPlacementKind, PodPoolMember, PodPoolScheduler } from './pod-pool.js';
+import { podWorkLabels, type PodWorkIdentity, type PodPlacement, type PodPlacementKind, type PodPoolMember, type PodPoolScheduler } from './pod-pool.js';
 export { POD_CHILD_REQUESTS } from './pod-lease.js';
 import { measurePoolLease, recommendConcurrency, POD_CHILD_REQUESTS, POD_HOST_LEASE_ANNOTATION, POD_JOB_TTL_AFTER_FINISHED_SECONDS, LEASE_KUBECTL_MAX_BUFFER, memoryQuantityBytes } from './pod-lease.js';
 import { ACTUAL_SUBSTRATE_ENV, RUN_CONTRACT_ENV, carryRunContract, completionFloorFor } from '../../self-implement/graph-run-contract.js';
@@ -67,9 +69,11 @@ import { enterJourneyNode, exitJourneyNode, passJourneyNode } from '../../self-d
 import { routeJourneyEdge } from '../../self-dev/graph-journey-route.js';
 import { selectLiveDetail } from '../../live/detail-switch.js';
 import { authStorePath } from '../../oauth/store.js';
-import { grokAuthFilePath, isGrokSubscriptionExpiring, refreshGrokSubscriptionToken, resolveGrokCredential } from '../../grok/credential.js';
+import { grokAuthFilePath, isGrokSubscriptionExpiring, refreshGrokSubscriptionToken, resolveGrokCredential, type GrokRefreshOutcome } from '../../grok/credential.js';
 import { defaultGrokModel } from '../../grok/models.js';
 import { resolveHostId } from '../../platform/host-id.js';
+import { BUDGET_SNAPSHOT_ENV, encodeBudgetSnapshot, harnessLaunchBudgetDecision, type BudgetSnapshot } from '../../execution-loop/launch-gate.js';
+import type { ReadBudgetInputsDeps } from '../../self-implement/budget-gate.js';
 import { envLiteral } from '../../platform/env-literal.js';
 import { LLM_TIER_MAP_BY_PROVIDER, lookupLlmTierSpec, type LlmTierProvider } from '../../model-tier/llm-tier-map.js';
 import { parseSelfImplementJson, type SelfImplementJobDone, type SelfImplementJobSpawn } from './self-implement.js';
@@ -84,7 +88,7 @@ import { resolveBedrockRegion, validBedrockRegion } from '../../llm/bedrock.js';
 import { ZAI_POD_EGRESS_LABEL, checkZaiPodSecret, countActiveZaiJobs, decideZaiPodSlot, zaiOverflowChildArgs, zaiPodEnv, type ZaiPodSpec } from './pod-zai-child.js';
 import { ZAI_CODING_DEFAULT_MODEL, ZAI_OPENROUTER_FALLBACK_MODEL, zaiSettingsFromConfig, type ZaiCodingPlanSettings } from '../../llm/zai-coding-plan.js';
 import { selectEnhanceLlm } from '../../prompt-enhance/enhance.js';
-import { extractPodFailureReason, podTerminalRow } from './pod-failure-reason.js';
+import { classifyPodExit, extractPodFailureReason, podTerminalRow, type PodExitClass } from './pod-failure-reason.js';
 import { OLD_DOOR_STAMP_ENV } from '../../self-dev/old-door.js';
 
 export type Kubectl = (args: readonly string[], input?: string) => { status: number | null; stdout: string; stderr: string };
@@ -110,6 +114,10 @@ export interface PodSpawnOptions {
   rotationAccounts?: readonly string[];
   /** 미지정이면 종전 Codex Job. */
   provider?: PodChildProvider;
+  /** Host launch-gate verdict for this Job's child LLM (test seam) — the Pod gate follows it instead of judging again. Default: the host's own `harness` launch-gate decision (chain ⊕ user caps). */
+  budgetSnapshot?: (childLlm: PodBudgetChildLlm) => Promise<BudgetSnapshot | undefined> | BudgetSnapshot | undefined;
+  /** Input reader seam; the host still runs its normal budget decision and Job propagation. */
+  budgetInputDeps?: ReadBudgetInputsDeps & { readLiveGrok?: () => Promise<number | undefined> };
   /** Child model/effort chosen at launch (`--child-llm-model/--child-llm-effort`) — carried into the Pod child. */
   childModel?: string;
   childEffort?: string;
@@ -142,11 +150,17 @@ export interface PodSpawnOptions {
   /** Job 수명 상한(초). */
   deadlineSeconds?: number;
   pollMs?: number;
+  /** METER-POD-ROLLUP-GAP-3 — 런 도중 PARTIAL 표본을 거두는 폴 간격 수(시험 seam · 기본 POD_USAGE_PARTIAL_CAPTURE_MS ÷ pollMs). */
+  usagePartialCapturePolls?: number;
   /** LAUNCH-STALL: ms a launch may wait in one stage before `launch-stalled` (test seam; default harness.launchStallMinutes · 15 min). */
   launchStallMs?: number;
   kubectl?: Kubectl;
   /** Host-side regate (injected for Pod tests). */
   hostRegate?: (input: { prNumber: number; headCommit: string; repoRoot: string; goalFile?: string; noMerge?: true }) => Promise<HostRegateResult>;
+  /** REVIEW-ACP-POD — Pod merge-ready PR 을 호스트 Claude ACP 로 리뷰한 뒤 재게이트(opt-in · 옵션 → env `ELANOUS_POD_HOST_ACP_REVIEW` → config `llm.podHostAcpReview`). */
+  hostAcpReview?: boolean;
+  /** REVIEW-ACP-POD — 호스트 ACP 리뷰 seam(시험 주입 · 기본 `runPodHostAcpReview`). */
+  podHostAcpReview?: (input: { prNumber: number; headCommit: string; repoRoot: string; job?: string }) => Promise<PodHostAcpReviewOutcome>;
   /**
    * TA-LIVE-LAND-2 — `taskAgent.liveMoves` (test seam; default reads the user config). Consulted only when the run carries
    * the `ELANOUS_TA_LAND=1` marker (`tasks hand --ta-land`): with `propose-land` the host re-gates but leaves the merge to
@@ -219,6 +233,52 @@ export function podJobName(spaceId: string): string {
   const slug = spaceId.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
   const hash = createHash('sha256').update(spaceId).digest('hex').slice(0, 8);
   return `si-${slug || 'job'}-${hash}`.replace(/-+/g, '-').slice(0, 58);
+}
+
+/** The child LLM the Pod's delegated `harness say/ask` will be launched with — the question the host verdict answers. */
+export interface PodBudgetChildLlm { provider?: string; model?: string }
+
+/** The one host-side budget verdict a Pod Job carries (BUDGET-SNAPSHOT-TO-POD). Fail-soft: no snapshot means the Pod marks the budget unmeasured. */
+function hostBudgetSnapshot(childLlm: PodBudgetChildLlm, options: PodSpawnOptions, env: NodeJS.ProcessEnv, job: string): Promise<BudgetSnapshot | undefined> | BudgetSnapshot | undefined {
+  const unavailable = (error: unknown): undefined => {
+    try { debug.log('self-implement.pod', 'budget-snapshot-unavailable', { job, provider: childLlm.provider ?? null, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); } catch { /* observation is fail-soft */ }
+    return undefined;
+  };
+  let measurement: Promise<BudgetSnapshot | undefined> | BudgetSnapshot | undefined;
+  try {
+    measurement = options.budgetSnapshot ? options.budgetSnapshot(childLlm) : measureHostBudgetSnapshot(childLlm, env, options.budgetInputDeps);
+  } catch (error) { return unavailable(error); }
+  if (!(measurement instanceof Promise)) return measurement;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(unavailable(new Error('host budget snapshot timed out after 10s'))), 10_000);
+  });
+  return Promise.race([measurement, deadline]).catch(unavailable).finally(() => { if (timer) clearTimeout(timer); });
+}
+
+/** The host runs the same launch-gate judgement the Pod would (chain ⊕ the user's caps) and ships the verdict, not raw usage to re-judge. */
+async function measureHostBudgetSnapshot(childLlm: PodBudgetChildLlm, env: NodeJS.ProcessEnv, inputDeps?: ReadBudgetInputsDeps & { readLiveGrok?: () => Promise<number | undefined> }): Promise<BudgetSnapshot | undefined> {
+  const host = resolveHostId(env);
+  const measuredAt = Date.now();
+  const { readBudgetInputsLive, CODEX_PROVIDER, GROK_PROVIDER } = await import('../../self-implement/budget-gate.js');
+  const inputs = await readBudgetInputsLive(inputDeps);
+  const { decision } = harnessLaunchBudgetDecision(inputs, { ...(childLlm.provider ? { childLlmProvider: childLlm.provider } : {}), ...(childLlm.model ? { childLlmModel: childLlm.model } : {}) });
+  const provider = decision.provider ?? childLlm.provider ?? 'chain';
+  const used = provider === GROK_PROVIDER
+    ? inputs.grokUsedPercent
+    : provider === CODEX_PROVIDER
+      ? (() => {
+          const percents = inputs.codexCandidates
+            .map((candidate) => candidate.reached === true ? 100 : candidate.usedPercent)
+            .filter((percent): percent is number => typeof percent === 'number' && Number.isFinite(percent));
+          return percents.length === 0 ? undefined : Math.min(...percents);
+        })()
+      : undefined;
+  return {
+    provider, ...(used !== undefined ? { remaining: Math.min(100, Math.max(0, 100 - used)) } : {}), window: 'weekly', measuredAt, host,
+    ...(childLlm.provider ? { requested: childLlm.provider } : {}),
+    decision: { action: decision.action, ...(decision.provider ? { provider: decision.provider } : {}), ...(decision.model ? { model: decision.model } : {}) },
+  };
 }
 
 /** «3시간 안 만료» — 선갱신 대상이라는 표지(다른 자격 오류와 구분한다). */
@@ -403,10 +463,16 @@ export type PodGrokSkipReason = 'missing' | 'expiring' | 'refresh-failed';
 
 /** GROK-OPTIONAL (10-05) — may this launch plan put grok in the Pod's chain at all?
  *  The Pod copy must outlive the Job (POD_GROK_MIN_VALIDITY_MS), so an expiring subscription that the host cannot
- *  refresh is «not available» here: the plan drops grok and goes on with codex instead of failing every launch. */
+ *  refresh is «not available» here: the plan drops grok and goes on with codex instead of failing every launch.
+ *  AUT-GROK-CRED-EXPIRY-NO-LAUNCH (10-12): the refresh is already attempted once (`grok models`), but
+ *  `refreshGrokSubscriptionToken` reports failure as a «value», never a throw — so a missing/broken CLI used to be
+ *  read as `expiring`. The outcome is now classified (`failed`/`no-credential` → `refresh-failed`, `unchanged` →
+ *  `expiring`) and every unusable verdict also lands as `harness.pod`/`grok-credential-unusable` so the autopsy and
+ *  the dispatcher can group same-cause no-launches. ⛔ Never switches the provider here (billing path unchanged). */
 export function podGrokSubscriptionUsable(opts: {
   home?: string; env?: NodeJS.ProcessEnv;
-  refresh?: () => void; isExpiring?: () => boolean; expiresAt?: () => string | null;
+  /** Test seam — the host refresh. A returned outcome is classified; `void` counts as an attempt that did not fail. */
+  refresh?: () => GrokRefreshOutcome | void; isExpiring?: () => boolean; expiresAt?: () => string | null;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
 } = {}): { usable: true } | { usable: false; reason: PodGrokSkipReason; expiresAt: string | null } {
   const log = opts.log ?? ((category, event, data) => debug.log(category, event, data));
@@ -418,19 +484,35 @@ export function podGrokSubscriptionUsable(opts: {
       return all.sort().at(-1) ?? null;
     } catch { return null; }
   };
-  const skip = (reason: PodGrokSkipReason) => {
+  const skip = (reason: PodGrokSkipReason, refreshOutcome: GrokRefreshOutcome | 'threw' | 'not-attempted') => {
     const at = expiresAt();
-    try { log('pod.grok-credentials', 'skipped', { reason, expiresAt: at }); } catch { /* observation is fail-soft */ }
+    try { log('pod.grok-credentials', 'skipped', { reason, expiresAt: at, refreshOutcome }); } catch { /* observation is fail-soft */ }
+    try { log('harness.pod', 'grok-credential-unusable', { reason, expiresAt: at, refreshOutcome, minValidityMs: POD_GROK_MIN_VALIDITY_MS }); } catch { /* fail-soft */ }
     return { usable: false as const, reason, expiresAt: at };
   };
   const credential = resolveGrokCredential({ home: opts.home, env: opts.env });
-  if (credential?.kind !== 'subscription') return skip('missing');
+  if (credential?.kind !== 'subscription') return skip('missing', 'not-attempted');
   const expiring = opts.isExpiring ?? (() => isGrokSubscriptionExpiring({ home: opts.home, bufferMs: POD_GROK_MIN_VALIDITY_MS }));
   if (!expiring()) return { usable: true };
-  let refreshed = true;
-  try { (opts.refresh ?? (() => { refreshGrokSubscriptionToken({ home: opts.home }); }))(); } catch { refreshed = false; }
+  let outcome: GrokRefreshOutcome | 'threw' = 'unchanged';
+  try { outcome = (opts.refresh ?? (() => refreshGrokSubscriptionToken({ home: opts.home })))() ?? 'unchanged'; } catch { outcome = 'threw'; }
   if (!expiring()) return { usable: true };
-  return skip(refreshed ? 'expiring' : 'refresh-failed');
+  return skip(outcome === 'failed' || outcome === 'no-credential' || outcome === 'threw' ? 'refresh-failed' : 'expiring', outcome);
+}
+
+/** AUT-GROK-CRED-EXPIRY-NO-LAUNCH — read-only launch check for dispatchers: no refresh, no CLI spawn, no log.
+ *  `ready:false` means a Pod launch that names grok will be refused (or drop grok) unless a refresh extends the token. */
+export function grokLaunchReadiness(opts: { home?: string; env?: NodeJS.ProcessEnv; now?: () => number } = {}):
+  { ready: true; expiresAt: string | null } | { ready: false; reason: 'missing' | 'expiring'; expiresAt: string | null } {
+  const credential = resolveGrokCredential({ home: opts.home, env: opts.env });
+  let at: string | null = null;
+  try {
+    const scopes = JSON.parse(readFileSync(grokAuthFilePath(opts.home), 'utf8')) as Record<string, { expires_at?: unknown }>;
+    at = Object.values(scopes).flatMap((s) => (s && typeof s.expires_at === 'string' ? [s.expires_at] : [])).sort().at(-1) ?? null;
+  } catch { /* no auth file */ }
+  if (credential?.kind !== 'subscription') return { ready: false, reason: 'missing', expiresAt: at };
+  const expiring = isGrokSubscriptionExpiring({ home: opts.home, bufferMs: POD_GROK_MIN_VALIDITY_MS, ...(opts.now ? { now: opts.now } : {}) });
+  return expiring ? { ready: false, reason: 'expiring', expiresAt: at } : { ready: true, expiresAt: at };
 }
 
 /** The one launch line for a skipped grok copy — the reader sees why grok left this run's chain. */
@@ -861,11 +943,17 @@ export function podDelegatedChildLlm(args: readonly string[]): { provider: strin
  *    짧게(≤8s) 백그라운드로 쏘고 `exit 143` 으로 원래 rc 를 보존한다 — podUsageMissingReason 의 `sigterm-143`
  *    분기가 실물 경로로 도달한다(시험은 합성 exitCode:143 이 아니라 실물 신호로 잰다).
  *  ⛔ 롤업 실패는 rc 를 바꾸지 않는다(각 단계 `|| true`). trap 몸통은 짧게 유지한다(골 ①). */
-export function podSigtermTrapScript(): string {
-  return `trap '{ [ -n "$si_pid" ] && kill "$si_pid" 2>/dev/null || true; { [ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h --partial; } & si_rollup_pid=$!; for si_i in 1 2 3 4 5 6 7 8; do kill -0 "$si_rollup_pid" 2>/dev/null || break; sleep 1; done; kill "$si_rollup_pid" 2>/dev/null || true; wait "$si_rollup_pid" 2>/dev/null || true; exit 143; }' TERM`;
+/** METER-POD-ROLLUP-GAP-2 — 부분 롤업 표본기가 «방금 낸 seq» 를 적는 파일. trap 은 여기에 +1 해 마지막 PARTIAL 이 가장 큰 seq 를 갖게 한다
+ *  (표본기는 서브셸이라 변수가 trap 에 안 보인다 · 없거나 숫자가 아니면 0 으로 보고 1 을 쓴다). */
+export const POD_USAGE_PARTIAL_SEQ_FILE = '/tmp/si.usage-partial-seq';
+
+export function podSigtermTrapScript(seqFile: string = POD_USAGE_PARTIAL_SEQ_FILE): string {
+  // ⭐ METER-POD-ROLLUP-GAP-2 — trap PARTIAL 은 `--seq <표본기 seq + 1>` 로 낸다(전엔 seq 가 늘 1 이라 dedup 에서 앞선 표본에 졌다) ·
+  //   표본기를 먼저 끊어 trap 뒤에 옛 표본이 «마지막 줄»로 끼어들지 않게 한다.
+  return `trap '{ [ -n "$si_pid" ] && kill "$si_pid" 2>/dev/null || true; [ -n "\${usage_partial_pid:-}" ] && kill "$usage_partial_pid" 2>/dev/null || true; si_seq=$(cat ${seqFile} 2>/dev/null || true); case "$si_seq" in ""|*[!0-9]*) si_seq=0;; esac; si_seq=$((10#$si_seq + 1)); { [ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h --partial --seq "$si_seq"; } & si_rollup_pid=$!; for si_i in 1 2 3 4 5 6 7 8; do kill -0 "$si_rollup_pid" 2>/dev/null || break; sleep 1; done; kill "$si_rollup_pid" 2>/dev/null || true; wait "$si_rollup_pid" 2>/dev/null || true; exit 143; }' TERM`;
 }
 
-export function podJobManifest(o: { name: string; namespace: string; image: string; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; memoryRequest?: string; goalDoc?: string; /** AUTHOR-POD2 — run `harness say` on /creds/feature inside the Pod (authoring happens off the host). */ authorSentence?: boolean; authorGrade?: 'full' | 'lite'; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number; /** Which goal execution and attempt this Job is — a resumed host verifies it before following the Job (POD9). */ execution?: { key: string; attempt: number }; hostLeaseAdmitted?: boolean; /** POD-ROLE-LLM — OpenRouter 자식 Pod 에 리뷰어용 codex 자격을 깐다. */ reviewerCodexAuth?: boolean; /** BEDROCK-PROVIDER ② — bedrock 자식만: 이름 있는 AWS Secret 의 키(secretKeyRef) ⊕ 리전 ⊕ 이그레스 라벨. */ bedrock?: BedrockPodSpec; /** ZAI-POD-CHILD — glm(ZAI) 자식만: 이름 있는 ZAI Secret 의 키(secretKeyRef) ⊕ 이그레스·동시 상한 라벨(Pod ⊕ Job). */ zai?: ZaiPodSpec }): Record<string, unknown> {
+export function podJobManifest(o: { name: string; namespace: string; image: string; workIdentity?: PodWorkIdentity; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; memoryRequest?: string; goalDoc?: string; /** AUTHOR-POD2 — run `harness say` on /creds/feature inside the Pod (authoring happens off the host). */ authorSentence?: boolean; authorGrade?: 'full' | 'lite'; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number; /** Which goal execution and attempt this Job is — a resumed host verifies it before following the Job (POD9). */ execution?: { key: string; attempt: number }; hostLeaseAdmitted?: boolean; /** POD-ROLE-LLM — OpenRouter 자식 Pod 에 리뷰어용 codex 자격을 깐다. */ reviewerCodexAuth?: boolean; /** BEDROCK-PROVIDER ② — bedrock 자식만: 이름 있는 AWS Secret 의 키(secretKeyRef) ⊕ 리전 ⊕ 이그레스 라벨. */ bedrock?: BedrockPodSpec; /** ZAI-POD-CHILD — glm(ZAI) 자식만: 이름 있는 ZAI Secret 의 키(secretKeyRef) ⊕ 이그레스·동시 상한 라벨(Pod ⊕ Job). */ zai?: ZaiPodSpec }): Record<string, unknown> {
   const quoted = o.args.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(' ');
   const childProviderIndex = o.args.indexOf('--child-llm-provider');
   const childModelIndex = o.args.indexOf('--child-llm-model');
@@ -916,7 +1004,7 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
     `(while :; do { mem=$(if [ -r /sys/fs/cgroup/memory.current ]; then cat /sys/fs/cgroup/memory.current; elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then cat /sys/fs/cgroup/memory/memory.usage_in_bytes; else printf -- -; fi); top=$(ps -eo rss=,comm=,args= --sort=-rss | head -5 | awk 'function encode(s) { gsub(/%/, "%25", s); gsub(/:/, "%3A", s); gsub(/ /, "%20", s); gsub(/\\t/, "%09", s); return s } { rss=$1; name=$2; sub(/^[[:space:]]*[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]*/, ""); n=split($0, a, /[[:space:]]+/); cmd="<redacted>"; if (name=="sleep" && a[2]=="30") cmd="sleep 30" (n>2 ? " <redacted>" : ""); else if (name=="bun") { cmd="bun <redacted>"; if (a[2]=="test") cmd="bun test <redacted>"; else if (a[2]=="run") cmd="bun run <redacted>"; else if ((a[2]=="x" || a[2]=="exec") && a[3]=="tsc") cmd="bun x tsc <redacted>" } else if (name=="tsc") cmd="tsc <redacted>"; else if (name=="elanous") { cmd="elanous <redacted>"; if (a[2]=="self") cmd="elanous self <redacted>"; else if (a[2]=="harness") cmd="elanous harness <redacted>" } else if (name=="node") cmd="node <redacted>"; if (name=="sleep" && cmd=="<redacted>") cmd="sleep <redacted>"; else if (cmd=="<redacted>" && name!="bash" && name!="sh") name="other"; printf " %s:%s:%s", rss, encode(name), encode(substr(cmd,1,120)) }'); printf "ELANOUS_MEM %s %s%s\\n" "$(date +%s)" "$mem" "$top"; } || true; sleep 15 || break; done) & mem_sampler_pid=$!`,
     ...(o.appCredential ? [podGithubWatchdogScript(o.githubStaleSeconds ?? POD_GH_STALE_SECONDS)] : []),
     // METER-POD-ROLLUP-GAP — 부분 롤업 표본기: 최종 줄까지 못 사는 Pod 도 N 분마다(기본 5 · ELANOUS_USAGE_PARTIAL_MINUTES) PARTIAL 줄을 하나씩 남긴다.
-    `(usage_partial_seq=0; while :; do { usage_partial_seq=$((usage_partial_seq+1)); [ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h --partial --seq "$usage_partial_seq" || true; } || true; usage_partial_sleep=$(( \${ELANOUS_USAGE_PARTIAL_MINUTES:-5} * 60 )); sleep "$usage_partial_sleep" || break; done) & usage_partial_pid=$!`,
+    `(usage_partial_seq=0; while :; do { usage_partial_seq=$((usage_partial_seq+1)); printf '%s\\n' "$usage_partial_seq" > ${POD_USAGE_PARTIAL_SEQ_FILE} 2>/dev/null || true; [ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h --partial --seq "$usage_partial_seq" || true; } || true; usage_partial_sleep=$(( \${ELANOUS_USAGE_PARTIAL_MINUTES:-5} * 60 )); sleep "$usage_partial_sleep" || break; done) & usage_partial_pid=$!`,
     // ⭐ MF-d3b5a70f — si_pid 초기화 + trap: 메인 명령을 아래에서 `& si_pid=$!` 로 띄우고 `wait "$si_pid"` 로
     //    기다려야 trap 이 grace 안에 발화한다(bash 는 foreground 명령 실행 중 trap 을 미룬다). trap 은
     //    podSigtermTrapScript() 가 내놓는다(수신 측 reemitPodUsage 포맷과 계약을 같은 파일 안에서 공유).
@@ -997,7 +1085,7 @@ if [ "$found" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi`,
   return {
     apiVersion: 'batch/v1',
     kind: 'Job',
-    metadata: { name: o.name, namespace: o.namespace, labels: { 'elanous.substrate': 'pod', 'elanous.job': o.name, ...podRunLabels(o), ...(o.zai ? { [ZAI_POD_EGRESS_LABEL]: 'true' } : {}) },
+    metadata: { name: o.name, namespace: o.namespace, labels: { 'elanous.substrate': 'pod', 'elanous.job': o.name, ...podRunLabels(o), ...(o.workIdentity ? podWorkLabels(o.workIdentity) : {}), ...(o.zai ? { [ZAI_POD_EGRESS_LABEL]: 'true' } : {}) },
       ...((o.execution || o.hostLeaseAdmitted) ? { annotations: { ...(o.execution ? { [POD_EXECUTION_KEY_ANNOTATION]: o.execution.key, [POD_ATTEMPT_ANNOTATION]: String(o.execution.attempt) } : {}), ...(o.hostLeaseAdmitted ? { [POD_HOST_LEASE_ANNOTATION]: 'true' } : {}) } } : {}) },
     spec: {
       backoffLimit: 0,
@@ -1005,7 +1093,7 @@ if [ "$found" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi`,
       activeDeadlineSeconds: o.deadlineSeconds,
       template: {
         // ⭐ Pod 라벨 — local 팔만 `elanous.egress/local-llm` 을 단다. docker/h1/policy-local-llm.yaml 이 그 라벨에만 호스트 LLM 포트 «하나»를 연다.
-        metadata: { labels: { 'elanous.job': o.name, ...podRunLabels(o), ...(o.armEnv?.ELANOUS_LLM_PROVIDER === 'local' ? { 'elanous.egress/local-llm': 'true' } : {}), ...(o.bedrock ? { [BEDROCK_POD_EGRESS_LABEL]: 'true' } : {}), ...(o.zai ? { [ZAI_POD_EGRESS_LABEL]: 'true' } : {}) } },
+        metadata: { labels: { 'elanous.job': o.name, ...podRunLabels(o), ...(o.workIdentity ? podWorkLabels(o.workIdentity) : {}), ...(o.armEnv?.ELANOUS_LLM_PROVIDER === 'local' ? { 'elanous.egress/local-llm': 'true' } : {}), ...(o.bedrock ? { [BEDROCK_POD_EGRESS_LABEL]: 'true' } : {}), ...(o.zai ? { [ZAI_POD_EGRESS_LABEL]: 'true' } : {}) } },
         spec: {
           restartPolicy: 'Never',
           securityContext: { runAsUser: 1000, fsGroup: 1000 },
@@ -1705,11 +1793,20 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           ...(authorChoice.modelSource !== 'default' ? { ELANOUS_PROMPT_ENHANCE_MODEL: authorChoice.model } : {}),
           ...(authorChoice.effortSource !== 'default' ? { ELANOUS_PROMPT_ENHANCE_EFFORT: authorChoice.effort } : {}),
         } : {};
-        const jobArmEnv = grounding || credentialRelay || githubRelay || env.ELANOUS_DISPATCH_RECORDED === '1' || options.armEnv || detailUntil || seat || env.ELANOUS_POD_AUTHOR_ON_POD === '1' || reviewerPin
+        const budgetRead = hostBudgetSnapshot(podDelegatedChildLlm(jobArgs) ?? {}, options, env, name);
+        const budgetSnapshot = budgetRead instanceof Promise ? await budgetRead : budgetRead;
+        // REVIEW-ACP-POD ②-b — 호스트가 병합 전에 Claude ACP 로 리뷰할 런이면 Pod 안 api 리뷰를 «호스트로 미룬다»(리뷰 둘 = 돈 두 번 방지).
+        //   ⛔ 자동 병합(merge-by-host) 런만 — 호스트 리뷰 문은 merge-ready 에서만 열린다. kubectl 주입(=시험)이면 사용자 설정을 읽지 않는다.
+        const reviewDeferredToHost = input.autoMerge === true
+          && resolvePodHostAcpReview(options.hostAcpReview, env, options.kubectl ? () => undefined : getUserConfig).enabled;
+        if (reviewDeferredToHost) debug.log('self-implement.pod', 'review-deferred-armed', { job: name, env: REVIEW_DEFERRED_TO_HOST_ENV, ...(reviewerPin ? { reviewerPinUnused: reviewerPin } : {}) });
+        const jobArmEnv = grounding || credentialRelay || githubRelay || env.ELANOUS_DISPATCH_RECORDED === '1' || options.armEnv || detailUntil || seat || env.ELANOUS_POD_AUTHOR_ON_POD === '1' || reviewerPin || reviewDeferredToHost || budgetSnapshot
           ? {
               ...armEnv,
+              ...(budgetSnapshot ? { [BUDGET_SNAPSHOT_ENV]: encodeBudgetSnapshot(budgetSnapshot) } : {}),
               ...authorEnv,
               ...(reviewerPin ? { [roleLlmEnvName('review')]: reviewerPin } : {}),
+              ...(reviewDeferredToHost ? { [REVIEW_DEFERRED_TO_HOST_ENV]: '1' } : {}),
               ...(detailUntil ? { ELANOUS_LIVE_DETAIL_UNTIL: detailUntil } : {}),
               ...(env.ELANOUS_DISPATCH_RECORDED === '1' ? { ELANOUS_DISPATCH_RECORDED: '1' } : {}),
               ...(seat === 'OP' || seat === 'TC' || seat === 'MK' || seat === 'UX' ? { ELANOUS_HARNESS_SEAT: seat } : {}),
@@ -1732,7 +1829,16 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         debug.log('self-implement.pod', 'memory-request', { spaceId: input.spaceId, job: name,
           tier: oomRetried ? retryTier : memoryTier, reason: oomRetried ? 'OOMKilled' : memoryReason,
           memoryLimit, memoryRequest });
-        const job = podJobManifest({ name, namespace, image: jobImage, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), args: jobArgs, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? { authorSentence: true, ...(env.ELANOUS_POD_AUTHOR_GRADE === 'lite' || env.ELANOUS_POD_AUTHOR_GRADE === 'full' ? { authorGrade: env.ELANOUS_POD_AUTHOR_GRADE } : {}) } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, memoryRequest, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission, ...(reviewerCredential ? { reviewerCodexAuth: true } : {}), ...(bedrockSpec ? { bedrock: bedrockSpec } : {}), ...(zaiSpec ? { zai: zaiSpec } : {}) });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
+        const ownerKind = env.ELANOUS_POD_OWNER_KIND;
+        const workIdentity: PodWorkIdentity = {
+          ...(ownerKind === 'seat' || ownerKind === 'steward' || ownerKind === 'orchestrator' || ownerKind === 'external'
+            ? { ownerKind, ownerId: env.ELANOUS_POD_OWNER_ID } : seat === 'OP' || seat === 'TC' || seat === 'MK' || seat === 'UX'
+              ? { ownerKind: 'seat', ownerId: seat } : {}),
+          taskCard: env.ELANOUS_POD_TASK_CARD ?? env.ELANOUS_TASK_CARD_ID,
+          slotId: env.ELANOUS_POD_SLOT_ID,
+          work: !goalDoc && env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? 'authoring' : (oomRetried ? retryTier : memoryTier) === 'lite' ? 'lite' : 'harness',
+        };
+        const job = podJobManifest({ name, namespace, image: jobImage, workIdentity, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), args: jobArgs, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? { authorSentence: true, ...(env.ELANOUS_POD_AUTHOR_GRADE === 'lite' || env.ELANOUS_POD_AUTHOR_GRADE === 'full' ? { authorGrade: env.ELANOUS_POD_AUTHOR_GRADE } : {}) } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, memoryRequest, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission, ...(reviewerCredential ? { reviewerCodexAuth: true } : {}), ...(bedrockSpec ? { bedrock: bedrockSpec } : {}), ...(zaiSpec ? { zai: zaiSpec } : {}) });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
         const carriedBranch = goalDoc ? 'goal-doc' as const : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? 'author' as const : undefined;
         const carriedChildLlm = carriedBranch ? podDelegatedChildLlm(jobArgs) : undefined;
         const a = kubectl(['apply', '-f', '-'], JSON.stringify(job));
@@ -1793,6 +1899,10 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         let abortLogs = '';
         // ⭐ 런 «도중» 원장 증분 회수 — 호스트 슈퍼바이저가 Pod 걸음을 실시간으로 본다(🅣 요청 · 힐 루프 runtime 성형의 전제).
         const follower = createPodLedgerFollower({ runId: liveChildRunId, dir: ledgerDir, exec: (script) => kubectl(['-n', namespace, 'exec', `job/${name}`, '-c', 'child', '--', 'sh', '-c', script]) });
+        // ⭐ METER-POD-ROLLUP-GAP-3 — 런 «도중» 마지막 PARTIAL 줄을 호스트가 쥔다: Pod 가 지워지면(SIGTERM 등) 종료 로그에서 PARTIAL 이 사라진다.
+        let livePartialLine: string | null = null;
+        let pollsSinceCapture = 0;
+        const capturePolls = Math.max(1, options.usagePartialCapturePolls ?? Math.round(POD_USAGE_PARTIAL_CAPTURE_MS / Math.max(1, options.pollMs ?? 15_000)));
         for (;;) {
           if (input.signal?.aborted) {
             // METER-POD-ROLLUP-GAP — Job 삭제 «전»에 로그를 한 번 거둔다: PARTIAL 줄이 삭제와 함께 사라지면 사용량이 0 처럼 보인다.
@@ -1852,6 +1962,18 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             }
           }
           try { follower?.poll(); } catch (e) { debug.log('self-implement.pod', 'ledger-live-unavailable', { job: name, reason: e instanceof Error ? e.message : String(e) }); }
+          if (++pollsSinceCapture >= capturePolls) {
+            pollsSinceCapture = 0;
+            try {
+              const sampled = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child', `--since=${POD_USAGE_PARTIAL_CAPTURE_SINCE}`]);
+              const seen = sampled.status === 0 ? lastPodUsagePartialLine(sampled.stdout) : null;
+              // 창 안에 새 줄이 없으면 앞서 쥔 줄을 지킨다(덮어 지우지 않는다).
+              if (seen) {
+                livePartialLine = seen;
+                debug.log('self-implement.pod', 'usage-partial-captured', { job: name, bytes: seen.length });
+              }
+            } catch (e) { debug.log('self-implement.pod', 'usage-partial-capture-failed', { job: name, reason: e instanceof Error ? e.message : String(e) }); }
+          }
           await sleep(options.pollMs ?? 15_000);
         }
         let logs = '';
@@ -1891,7 +2013,9 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         // ⭐ 호스트 단가로 다시 매긴다(BACKLOG C1b) — Pod 엔 레지스트리 스냅숏이 없다.
         const { estimateLlmCost } = await import('../../budget/llm-cost.js');
         // METER-POD-ROLLUP-GAP — 최종 줄 → 마지막 PARTIAL 폴백 → 결손 행(measured:false · 종료 사유): 사용량이 0 처럼 보이는 침묵을 남기지 않는다.
-        reemitPodUsage(logs, name, undefined, (u) => estimateLlmCost(u) as { kind: string; usd?: number }, { reason: podUsageMissingReason({ failedReason, exitCode: containerExitCode, logsAvailable: Boolean(logs) }), runId: liveChildRunId });
+        // METER-POD-ROLLUP-GAP-3 — 판정은 kubectl 없는 순수 함수(podUsageReemitPlan)가 하고 여기선 행을 내보내기만 한다(ux-sim 심이 같은 함수를 부른다).
+        const usagePlan = podUsageReemitPlan({ job: name, runId: liveChildRunId, logs, livePartialLine, exit: { state, failedReason, containerReason, containerExitCode } }, (u) => estimateLlmCost(u) as { kind: string; usd?: number });
+        for (const row of usagePlan.rows) debug.log(row.category, row.event, row.data);
         const parsed = parseSelfImplementJson(logs);
         const terminal = parseSelfImplementJson(logs.trimEnd().split('\n').at(-1) ?? '');
         const nextAccount = codexAccounts?.find((candidate) => candidate !== account);
@@ -1936,7 +2060,38 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             if (!taLandOwner) debug.log('self-implement.pod', 'ta-land-marker-ignored', { job: name, pr: prNumber ?? null,
               reason: unreadable !== null ? 'live-moves-unreadable' : 'propose-land-not-enabled', ...(unreadable !== null ? { error: unreadable } : {}) });
           }
+          // REVIEW-ACP-POD — opt-in: 재게이트 «전»에 호스트 Claude ACP(구독) 리뷰. must-fix 면 병합하지 않고 PR 을 연 채 둔다.
+          //   ⛔ 못 쓰면(refused) 종전 길 그대로 — Pod 리뷰 결과로 재게이트한다(다른 공급자로 새지 않는다 · 관측 `acp-review-refused`).
+          //   ⛔ kubectl 주입(=시험)이면 사용자 설정을 읽지 않는다.
+          let hostAcpMustFix: Extract<PodHostAcpReviewOutcome, { status: 'must-fix' }> | undefined;
+          // REVIEW-ACP-POD ②-b — Pod 가 리뷰를 «미뤘다»면(mergeReason) 호스트 ACP 리뷰가 «유일한» 리뷰다:
+          //   스위치가 그 사이 꺼졌어도 리뷰한다 · 못 하면(refused) 병합하지 않는다(fail-closed — 리뷰 없이 병합 0).
+          const podReviewDeferred = disposition.mergeReason === REVIEW_DEFERRED_TO_HOST_MERGE_REASON;
+          let hostAcpUnavailable: string | undefined;
+          const hostAcpSwitch = resolvePodHostAcpReview(options.hostAcpReview, env, options.kubectl ? () => undefined : getUserConfig);
+          if ((hostAcpSwitch.enabled || podReviewDeferred) && Number.isSafeInteger(prNumber) && prNumber && headCommit && /^[0-9a-f]{40}$/i.test(headCommit)) {
+            const hostRoot = findGitDir(process.cwd())?.root;
+            const outcome: PodHostAcpReviewOutcome = hostRoot
+              ? await (options.podHostAcpReview ?? ((i) => runPodHostAcpReview(i, { env })))({ prNumber, headCommit, repoRoot: hostRoot, job: name })
+              : { status: 'refused', reason: 'host repository unavailable' };
+            if (outcome.status === 'refused' && !hostRoot) debug.log('self-implement.pod', 'acp-review-refused', { job: name, pr: prNumber, reason: outcome.reason }, { level: 'warn' });
+            debug.log('self-implement.pod', 'host-acp-review-gate', { job: name, pr: prNumber, source: hostAcpSwitch.enabled ? hostAcpSwitch.source : 'pod-deferred', podReviewDeferred, status: outcome.status, ...(outcome.status === 'refused' ? { reason: outcome.reason, path: podReviewDeferred ? 'hold-pr' : 'pod-review' } : { mustFix: outcome.mustFix }) });
+            if (outcome.status === 'must-fix') hostAcpMustFix = outcome;
+            if (outcome.status === 'refused' && podReviewDeferred) hostAcpUnavailable = outcome.reason;
+          }
           let regate: HostRegateResult;
+          if (hostAcpUnavailable !== undefined) {
+            // ⛔ Pod 안 리뷰가 없다 — 재게이트·병합으로 가면 «리뷰 없이 병합»이다. PR 을 연 채 둔다.
+            debug.log('self-implement.pod', 'host-acp-review-unavailable', { job: name, pr: prNumber ?? null, head: headCommit ?? null, reason: hostAcpUnavailable }, { level: 'warn' });
+            try { (options.ghComment ?? defaultGhComment)(prNumber!, `호스트 Claude ACP 리뷰를 못 했다(${hostAcpUnavailable.replace(/\s+/g, ' ').slice(0, 200)}) — Pod 안 리뷰는 호스트로 미뤄져 없으므로 자동 병합하지 않는다(REVIEW-ACP-POD ②-b).`); }
+            catch (error) { debug.log('self-implement.pod', 'host-acp-review-comment-failed', { job: name, pr: prNumber ?? null, detail: (error instanceof Error ? error.message : String(error)).slice(0, 200) }); }
+            disposition = { ...disposition, stage: 'pr-opened', merged: false, ok: false, mergeReason: 'host-acp-review-unavailable' };
+          } else if (hostAcpMustFix) {
+            const body = [`호스트 Claude ACP 리뷰: must-fix ${hostAcpMustFix.mustFix}건 — 자동 병합하지 않는다(REVIEW-ACP-POD).`, ...hostAcpMustFix.findings.map((f, i) => `${i + 1}. ${f.replace(/\s+/g, ' ').slice(0, 400)}`)].join('\n');
+            try { (options.ghComment ?? defaultGhComment)(prNumber!, body); }
+            catch (error) { debug.log('self-implement.pod', 'host-acp-review-comment-failed', { job: name, pr: prNumber ?? null, detail: (error instanceof Error ? error.message : String(error)).slice(0, 200) }); }
+            disposition = { ...disposition, stage: 'pr-opened', merged: false, ok: false, mergeReason: 'host-acp-review-must-fix' };
+          } else {
           if (!Number.isSafeInteger(prNumber) || !prNumber || !headCommit || !/^[0-9a-f]{40}$/i.test(headCommit)) {
             debug.log('harness.host-regate', 'unmeasured', { pr: prNumber ?? null, files: [], os: process.platform, failedStep: 'pod-result' });
             regate = { passed: false, failures: [{ step: 'pod-result', detail: 'missing PR number or checked head commit' }], os: process.platform };
@@ -1968,6 +2123,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           } else {
             if (taLandOwner) debug.log('self-implement.pod', 'ta-land-owner', { job: name, pr: prNumber ?? null, head: headCommit ?? null, regatePassed: false });
             disposition = { ...disposition, stage: frozen || releaseHold ? 'pr-opened' : regate.passed ? 'merged' : 'host-regate-failed', merged: regate.passed && !frozen, hostRegate: regate, ok: regate.passed || releaseHold || frozen };
+          }
           }
         }
         const childFailure = state === 'failed' && !oomKilled && failedReason !== 'DeadlineExceeded'
@@ -2220,18 +2376,34 @@ export function podUsageMissingReason(input: { logsAvailable: boolean; exitCode?
   return 'stopped';
 }
 
-export function reemitPodUsage(logs: string, job: string, log: (category: string, event: string, data: Record<string, unknown>) => void = (c, e, d) => debug.log(c, e, d), reprice?: PodRowReprice, missing?: { reason: PodUsageMissingReason; runId?: string | null }): number {
+const POD_USAGE_PARTIAL_PREFIX = 'ELANOUS_USAGE_ROLLUP_PARTIAL ';
+
+/** METER-POD-ROLLUP-GAP-3 — 로그 덩어리에서 «마지막» PARTIAL 줄(없으면 null). 런 도중 표본과 종료 로그가 같은 판정을 쓴다. */
+export function lastPodUsagePartialLine(logs: string): string | null {
+  return logs.split('\n').reverse().find((l) => l.startsWith(POD_USAGE_PARTIAL_PREFIX)) ?? null;
+}
+
+/** METER-POD-ROLLUP-GAP-3 — 호스트가 런 «도중» 거두는 PARTIAL 표본 간격(Pod 표본기 기본 5분과 맞춘다) ⊕ 그때 읽는 로그 창(표본 간격 둘 ⊕ 여유). */
+export const POD_USAGE_PARTIAL_CAPTURE_MS = 5 * 60_000;
+export const POD_USAGE_PARTIAL_CAPTURE_SINCE = '11m';
+
+export function reemitPodUsage(logs: string, job: string, log: (category: string, event: string, data: Record<string, unknown>) => void = (c, e, d) => debug.log(c, e, d), reprice?: PodRowReprice, missing?: { reason: PodUsageMissingReason; runId?: string | null; podExitClass?: PodExitClass | null; livePartialLine?: string | null }): number {
   const lines = logs.split('\n').reverse();
   const line = lines.find((l) => l.startsWith('ELANOUS_USAGE_ROLLUP '));
   // ⭐ METER-POD-ROLLUP-GAP — 최종 줄이 없으면 마지막 PARTIAL 줄로 폴백한다(부분 롤업 표본기가 남긴 줄).
-  const partialLine = line ? null : lines.find((l) => l.startsWith('ELANOUS_USAGE_ROLLUP_PARTIAL '));
+  // ⭐ METER-POD-ROLLUP-GAP-3 — 종료 로그에도 PARTIAL 이 없으면(Pod 가 지워져 로그가 사라졌다) 런 «도중» 호스트가 거둔 마지막 PARTIAL 로.
+  const logPartial = line ? null : lastPodUsagePartialLine(logs);
+  const livePartial = line || logPartial || !missing?.livePartialLine?.startsWith(POD_USAGE_PARTIAL_PREFIX) ? null : missing.livePartialLine;
+  const partialLine = logPartial ?? livePartial;
   if (!line && !partialLine) {
-    log('self-implement.pod', 'usage-rollup-missing', { job });
+    // ⭐ METER-POD-ROLLUP-GAP-3 — 결손 이벤트에도 종료 사유를 싣는다(옛 줄은 {job} 뿐이라 «왜 없나» 를 못 물었다).
+    const why = missing ? { reason: missing.reason, ...(missing.podExitClass ? { podExitClass: missing.podExitClass } : {}), ...(missing.runId ? { runId: missing.runId } : {}) } : {};
+    log('self-implement.pod', 'usage-rollup-missing', { job, ...why });
     // ⭐ 결손 행 — «측정 불가» 를 한 줄로 남긴다: 0 처럼 보이지 않게.
-    if (missing) log('llm.usage', 'llm-usage', { site: 'pod-rollup:missing', measured: false, reason: missing.reason, job, ...(missing.runId ? { runId: missing.runId } : {}), substrate: 'pod', podRollupKey: `${missing.runId ?? job}|missing` });
+    if (missing) log('llm.usage', 'llm-usage', { site: 'pod-rollup:missing', measured: false, ...why, job, substrate: 'pod', podRollupKey: `${missing.runId ?? job}|missing` });
     return 0;
   }
-  const prefix = line ? 'ELANOUS_USAGE_ROLLUP ' : 'ELANOUS_USAGE_ROLLUP_PARTIAL ';
+  const prefix = line ? 'ELANOUS_USAGE_ROLLUP ' : POD_USAGE_PARTIAL_PREFIX;
   let parsed: { measured?: boolean; truncated?: boolean; runId?: string | null; armId?: string | null; podName?: string | null; nodeName?: string | null; hostId?: string | null; seq?: number; at?: string; rows?: Array<Record<string, unknown>> };
   try { parsed = JSON.parse((line ?? partialLine)!.slice(prefix.length)); } catch { log('self-implement.pod', 'usage-rollup-unparsable', { job }); return 0; }
   const rows = parsed.rows ?? [];
@@ -2249,14 +2421,49 @@ export function reemitPodUsage(logs: string, job: string, log: (category: string
       substrate: 'pod', job, ...(parsed.runId ? { podRunId: parsed.runId } : {}), ...(parsed.armId ? { armId: parsed.armId } : {}),
       // ⭐ MF-3c0d253e — 재방출 행의 downstream dedup 키: 같은 Pod(job·runId)의 같은 버킷(site·provider·model)은
       //   부분(seq 달라도)·최종·abort⊕resume 재방출이 몇 번 만나도 집계(rollup)에서 한 번만 센다. 키 없는 기존 행은 종전대로.
-      podRollupKey: `${job}|${parsed.runId ?? ''}|pod-rollup:${String(r.site)}|${String(r.provider)}|${String(r.model)}`,
+      //   ⭐ METER-POD-ROLLUP-GAP-2 — podName 을 키에 넣는다: gh-login·usage-limit 재시도는 «같은 job 이름·runId» 로 새 Pod 를 띄우므로
+      //   (podJobName 은 spaceId 결정적) 그것 없이는 서로 다른 시도의 사용량이 한 번으로 접혀 앞 시도분이 사라진다.
+      podRollupKey: `${job}|${parsed.podName ?? ''}|${parsed.runId ?? ''}|pod-rollup:${String(r.site)}|${String(r.provider)}|${String(r.model)}`,
       ...(parsed.podName ? { podName: parsed.podName } : {}), ...(parsed.nodeName ? { nodeName: parsed.nodeName } : {}), ...(parsed.hostId ? { podHostId: parsed.hostId } : {}),
       // ⭐ PARTIAL 폴백 재방출 꼬리표 — 최종 줄 행은 그대로(부분이 아님을 꾸미지 않는다).
-      ...(partialLine ? { partial: true, ...(parsed.seq !== undefined ? { partialSeq: parsed.seq } : {}), ...(parsed.at !== undefined ? { partialAt: parsed.at } : {}) } : {}),
+      ...(partialLine ? { partial: true, ...(parsed.seq !== undefined ? { partialSeq: parsed.seq } : {}), ...(parsed.at !== undefined ? { partialAt: parsed.at } : {}), ...(livePartial ? { partialSource: 'live-capture' } : {}) } : {}),
     });
   }
-  log('self-implement.pod', 'usage-rollup', { job, rows: rows.length, measured: parsed.measured ?? null, truncated: parsed.truncated ?? null, ...(partialLine ? { partial: true, ...(parsed.seq !== undefined ? { seq: parsed.seq } : {}), ...(parsed.at !== undefined ? { at: parsed.at } : {}) } : {}) });
+  log('self-implement.pod', 'usage-rollup', { job, rows: rows.length, measured: parsed.measured ?? null, truncated: parsed.truncated ?? null, ...(partialLine ? { partial: true, ...(parsed.seq !== undefined ? { seq: parsed.seq } : {}), ...(parsed.at !== undefined ? { at: parsed.at } : {}), ...(livePartial ? { partialSource: 'live-capture' } : {}) } : {}) });
   return rows.length;
+}
+
+/** METER-POD-ROLLUP-GAP-3 — 호스트 사용량 재방출 판정의 «순수» 입력·출력(kubectl·debug 없음). */
+export interface PodUsageReemitInput {
+  job: string;
+  runId?: string | null;
+  /** Job 이 끝난 뒤 거둔 로그(Pod 가 사라졌으면 ''). */
+  logs: string;
+  /** 런 «도중» 호스트가 본 마지막 `ELANOUS_USAGE_ROLLUP_PARTIAL` 줄(없으면 null). */
+  livePartialLine?: string | null;
+  /** 종료 정보 — state 가 'failed' 일 때만 classifyPodExit 분류를 싣는다. */
+  exit: { state: 'complete' | 'failed' | 'aborted'; failedReason?: string | null; containerReason?: string | null; containerExitCode?: number | null };
+}
+export interface PodUsageReemitPlan {
+  /** 어느 줄로 재방출했나 — final(최종 줄) · partial-log(끝 로그의 PARTIAL) · partial-live(런 도중 본 PARTIAL) · missing(결손 행) · unparsable. */
+  source: 'final' | 'partial-log' | 'partial-live' | 'missing' | 'unparsable';
+  /** 그대로 debug.log(category, event, data) 로 내보낼 행들(llm-usage 행 ⊕ self-implement.pod 요약/결손 이벤트). */
+  rows: Array<{ category: string; event: string; data: Record<string, unknown> }>;
+}
+
+/** METER-POD-ROLLUP-GAP-3 — 끝 로그 ⊕ 런 도중 PARTIAL ⊕ 종료 정보 → 재방출할 행/결손 행. 호스트 Job 경로와 ux-sim 심이 «같은» 함수를 부른다. */
+export function podUsageReemitPlan(input: PodUsageReemitInput, reprice?: PodRowReprice): PodUsageReemitPlan {
+  const { job, logs, exit } = input;
+  const reason = podUsageMissingReason({ failedReason: exit.failedReason ?? undefined, exitCode: exit.containerExitCode ?? null, logsAvailable: Boolean(logs) });
+  const podExitClass = exit.state === 'failed' ? classifyPodExit({ containerReason: exit.containerReason ?? null, containerExitCode: exit.containerExitCode ?? null, jobReason: exit.failedReason || null, logs }).class : null;
+  const rows: PodUsageReemitPlan['rows'] = [];
+  reemitPodUsage(logs, job, (category, event, data) => rows.push({ category, event, data }), reprice, { reason, runId: input.runId ?? null, podExitClass, livePartialLine: input.livePartialLine ?? null });
+  const usage = rows.find((r) => r.category === 'llm.usage');
+  const source: PodUsageReemitPlan['source'] = rows.some((r) => r.event === 'usage-rollup-missing') ? 'missing'
+    : rows.some((r) => r.event === 'usage-rollup-unparsable') ? 'unparsable'
+      : rows.find((r) => r.event === 'usage-rollup')?.data.partialSource === 'live-capture' ? 'partial-live'
+        : rows.find((r) => r.event === 'usage-rollup')?.data.partial === true || usage?.data.partial === true ? 'partial-log' : 'final';
+  return { source, rows };
 }
 
 /** 이 기계가 Pod 칸을 쓸 수 있나(클러스터 · 이미지) — 발사 전 한 번. */

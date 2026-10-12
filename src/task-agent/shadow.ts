@@ -17,6 +17,7 @@ import type { SupervisorJobResult, SupervisorStopReason } from '../self-dev/run-
 import { executeNextAction, type DeliveryKind, type NextAction } from './actions.js';
 import { judgeNextMove, type TaskJudgeInput, type TaskJudgement } from './judge.js';
 import { HARNESS_RUN_ID_ENV } from '../harness/harness-space.js';
+import { collectWiringEvidence, type WiringEvidenceDeps } from './card-evidence.js';
 import { recordLiveMoveHistory } from './live-move-history.js';
 import { capturedSelfReview, captureReviewResults, hasCapturedPass } from './review-result-capture.js';
 import { configuredTaskAgentLiveMoves, defaultPrHead, executeLiveGreenProposal, executeLiveLand, executeLiveReview, type LiveMoveDeps, type LiveMoveResult, type TaskAgentLiveMove } from './live-moves.js';
@@ -60,6 +61,8 @@ export interface TaskAgentShadowDeps {
   live?: LiveMoveDeps;
   /** 카드 조회 상태 파일(시험 주입 · 운영 파일을 건드리지 않게). 기본 = `live.statePath` ⊕ `taskAgentStatePath()`. */
   statePath?: string;
+  /** TA-WIRING-CHECK — 배선 근거 수집 의존(시험 주입 · 기본 = gh pr diff 한 번 ⊕ 카드 런 원장). */
+  wiring?: Omit<WiringEvidenceDeps, 'card'>;
   /** Process env for the launched-run id (`ELANOUS_RUN_ID`) — test seam; default process.env. */
   env?: NodeJS.ProcessEnv;
 }
@@ -325,6 +328,15 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
     ...move, completion: shadowCompletion(card, cardLookupFailed), card: liveCard?.id ?? null, live, liveExecuted: liveMove?.executed ?? false, ...(liveMove ? { liveOk: liveMove.ok } : {}),
     ...(reviewFromCapture ? { reviewSource: 'captured-review-result' } : {}),
   });
+  // TA-WIRING-CHECK — 병합 PR 은 판단한 «뒤» 배선 근거를 관측만 한다(move 불변 · 실패는 unknown 으로 남기고 던지지 않는다).
+  if (judgeInput.prState === 'MERGED' && typeof judgeInput.pr === 'number' && !delivery && liveCard) {
+    try {
+      const wiring = await collectWiringEvidence(judgeInput.pr, { ...deps.wiring, card: liveCard });
+      (deps.log ?? ((category, event, data) => debug.log(category, event, data)))('task-agent', 'wiring-shadow', {
+        card: liveCard.id, pr: judgeInput.pr, required: wiring.required, liveRunRecorded: wiring.liveRunRecorded, unknown: wiring.unknown,
+      });
+    } catch { /* fail-soft — 관측일 뿐 판단을 막지 않는다 */ }
+  }
   // TA-LIVE-MOVE-CARD-HISTORY — live-move 수(review·propose-green·propose-land)는 실행이든 그림자든 그 카드 history 에 한 줄.
   // 결정·실행이 끝난 «뒤»에 덧붙이기만 한다(반환값·관측 무변경) · 실패는 관측만(live-move 를 막지 않는다).
   if (liveKind !== null) recordLiveMoveOnCard({

@@ -6,6 +6,7 @@ import { podChildLlmArgs, podNamedChildProvider, podSelfImplementSpawn, type Kub
 import { POD_CHILD_PROVIDERS, podChildProviderOf, podLaunchProviderOptions } from './pod-child-providers.js';
 import { BEDROCK_POD_EGRESS_LABEL, BEDROCK_POD_SECRET_NAME, checkBedrockPodSecret } from './pod-bedrock-child.js';
 import { podChildProviderLaunchRefusal } from '../../harness/harness-cli-command.js';
+import { stablePodManifestText } from './pod-manifest-test-normalize.js';
 
 // BEDROCK-PROVIDER ② (0.2.24 · 대표 10-10 «bedrock Pod 에만 secretKeyRef») — bedrock 자식 Pod.
 // ⛔ 운영 자격·실 kubectl 을 읽지 않는다: Secret 은 «키 이름»을 내는 가짜 kubectl 로만 흉내 낸다.
@@ -126,7 +127,7 @@ describe('BEDROCK-PROVIDER ② — bedrock child Pods', () => {
         await podSelfImplementSpawn({ provider: 'anthropic', childModel: 'claude-haiku-5-5', anthropicKey: () => 'test-anthropic-key', openrouterGhToken: () => 'gh-test', kubectl: runs.anthropic.kubectl, sleep: async () => {}, readKeyCache: cache, env: knob.env })({ feature: 'implement', spaceId: 'anthropic-invariant' }).done;
         const manifests = Object.values(runs).flatMap((r) => r.applied).filter((entry) => entry.kind === 'Job' || entry.kind === 'Secret');
         expect(manifests).toHaveLength(8);
-        const text = JSON.stringify(manifests).replace(/run-[0-9a-f-]{36}/g, 'run-<id>');   // 런 id 만 매번 새로 뽑힌다
+        const text = stablePodManifestText(manifests);
         expect(text).not.toContain('AWS_');
         expect(text).not.toContain(BEDROCK_POD_EGRESS_LABEL);
         expect(text).not.toContain(SENTINEL);
@@ -227,7 +228,7 @@ describe('BEDROCK-POD-PROVIDER-DROP — the launch hands bedrock to the Pod as p
         await podSelfImplementSpawn({ ...opts, credentials: codexCreds, kubectl: run.kubectl, sleep: async () => {}, env: {} })({ feature: 'implement', spaceId: 'codex-default' }).done;
         const manifests = run.applied.filter((entry) => entry.kind === 'Job' || entry.kind === 'Secret');
         expect(manifests).toHaveLength(2);
-        texts.push(JSON.stringify(manifests).replace(/run-[0-9a-f-]{36}/g, 'run-<id>'));
+        texts.push(stablePodManifestText(manifests));
       }
     } finally { log.mockRestore(); }
     expect(texts[0]).not.toContain('--child-llm-provider');

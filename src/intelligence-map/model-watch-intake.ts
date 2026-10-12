@@ -103,6 +103,46 @@ export async function runModelWatchIntake(
   return { candidates, proposal, perSource };
 }
 
+export type PriceField = 'inputPerMtok' | 'outputPerMtok';
+
+export interface PriceChange {
+  id: string;
+  field: PriceField;
+  /** Price currently in the catalog (USD per 1M tokens). */
+  before: number;
+  /** Price the watched page reports. */
+  after: number;
+}
+
+const PRICE_FIELDS: readonly PriceField[] = ['inputPerMtok', 'outputPerMtok'];
+
+/** Price differences between the catalog and the watched pages. The merge
+ *  only fills undefined fields, so a repriced model shows up in
+ *  `proposal.updated` with no trace of the new price — this reports it.
+ *  A catalog price of 0 means "not priced yet" and is not a change. */
+export function detectPriceChanges(result: Pick<WatchIntakeResult, 'candidates' | 'proposal'>): PriceChange[] {
+  const current = new Map(result.proposal.catalog.models.map((model) => [model.id, model]));
+  const updated = new Set(result.proposal.updated);
+  const changes: PriceChange[] = [];
+  for (const candidate of result.candidates) {
+    const entry = current.get(candidate.id);
+    if (!entry || !updated.has(candidate.id)) continue;
+    for (const field of PRICE_FIELDS) {
+      const before = entry[field];
+      const after = candidate[field];
+      if (typeof after !== 'number' || !Number.isFinite(after) || after < 0) continue;
+      if (typeof before !== 'number' || before <= 0 || before === after) continue;
+      changes.push({ id: candidate.id, field, before, after });
+    }
+  }
+  return changes;
+}
+
+export function formatPriceChange(change: PriceChange): string {
+  const label = change.field === 'inputPerMtok' ? 'input' : 'output';
+  return `${change.id} ${label} $${change.before}→$${change.after} /Mtok`;
+}
+
 function errorMessage(error: unknown): string {
   try {
     const message = error instanceof Error ? error.message : String(error);

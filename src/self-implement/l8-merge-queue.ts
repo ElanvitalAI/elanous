@@ -5,6 +5,9 @@ import { join } from 'node:path';
 import { NEXT_MD_PATH, resolveNextMdConflict } from '../release-loop/next-md-merge.js';
 import { defaultLlmResolve, mergeMainWithLlmResolve, type MergeGitSeam } from '../autopilot/build/llm-conflict-merge.js';
 import { getDefaultLogStore } from '../mss/logging/log-store.js';
+import { debug } from '../debug/log.js';
+import { integrateTrain, planTrain, runTrain, type TrainCandidate, type TrainDeferred, type TrainGit } from './merge-train.js';
+import { trainGateOnHost, type TrainGate } from './train-gate-remote.js';
 
 type Command = (bin: string, args: readonly string[], cwd: string) => { status: number | null; stdout: string; stderr: string };
 export type L8MergeQueueInput = { number: number; cwd: string; matchHeadCommit: string };
@@ -29,7 +32,16 @@ export type L8MergeQueueDeps = {
   acquire?: (cwd: string) => Promise<() => void>;
 };
 
-export type L8ShadowVerdict = { number: number; head: string; base?: string; verdict: 'pass' | 'conflict' | 'fail'; detail?: string; tests: string[]; at: string };
+export type L8ShadowVerdict = {
+  number: number;
+  head: string;
+  base?: string;
+  /** 'unmeasured' is written only by the shadow merge train (LAND-QUEUE): a gate that never ran is never a fail. */
+  verdict: 'pass' | 'conflict' | 'fail' | 'unmeasured';
+  detail?: string;
+  tests: string[];
+  at: string;
+};
 export type L8ShadowQueueItem = {
   number: number;
   head: string;
@@ -52,6 +64,12 @@ export type L8ShadowQueueDeps = L8MergeQueueDeps & {
   observe?: (verdict: L8ShadowVerdict) => void | Promise<void>;
   observeEnqueue?: (entry: L8ShadowEnqueueObservation) => void | Promise<void>;
   resolveConflict?: (file: string, conflicted: string, target: string, worktree: string) => Promise<string>;
+  /** Shadow merge train gate seam (default: trainGateOnHost over the real gate-remote runner, host node-b). */
+  trainGate?: (repo: string, baseSha: string) => TrainGate;
+  /** Shadow merge train integration git seam (default: the queue's own command executor). */
+  trainGit?: TrainGit;
+  /** Maximum PRs per shadow train batch (default 2). */
+  trainMaxBatch?: number;
 };
 
 function shadowCommand(execute: Command, bin: string, args: string[], cwd: string): string {
@@ -162,13 +180,73 @@ export async function enqueueL8ShadowQueue(cwd: string, number: number, deps: L8
   });
 }
 
-/** Evaluate one pinned queue head against freshly fetched main. Never push or call a merge API. */
+/** LAND-QUEUE — shadow merge train: planTrain → integrateTrain → runTrain(trainGateOnHost) when the queue holds
+ *  two or more measured, non-overlapping PRs. Per-PR verdicts (pass · culprit · unmeasured) land in the queue
+ *  ledger and in debug.log ('self-implement.merge-train' · 'shadow-verdict'). Shadow only: no push, no merge API;
+ *  the single-PR evaluation path in runL8ShadowQueue stays untouched for every queue this train cannot take. */
+async function runShadowMergeTrain(
+  state: L8ShadowQueueState,
+  path: string,
+  cwd: string,
+  run: (bin: string, args: string[], where?: string) => string,
+  execute: Command,
+  plan: { batch: TrainCandidate[]; deferred: TrainDeferred[] },
+  deps: L8ShadowQueueDeps,
+): Promise<L8ShadowVerdict | null> {
+  for (const item of plan.batch) {
+    const view = JSON.parse(run('gh', ['pr', 'view', String(item.number), '--json', 'headRefOid,baseRefName,state,isDraft,isCrossRepository'], cwd)) as {
+      headRefOid?: string; baseRefName?: string; state?: string; isDraft?: boolean; isCrossRepository?: boolean;
+    };
+    if (view.headRefOid !== item.head || view.baseRefName !== 'main' || view.state !== 'OPEN'
+      || view.isDraft !== false || view.isCrossRepository !== false) throw new Error(`queued PR #${item.number} changed or is not ready`);
+  }
+  run('git', ['fetch', 'origin', 'refs/heads/main'], cwd);
+  const base = run('git', ['rev-parse', 'FETCH_HEAD'], cwd);
+  if (!/^[0-9a-f]{40}$/i.test(base)) throw new Error('main commit unavailable');
+  for (const item of plan.batch) {
+    run('git', ['fetch', 'origin', `refs/pull/${item.number}/head`], cwd);
+    if (run('git', ['rev-parse', 'FETCH_HEAD'], cwd) !== item.head) throw new Error(`fetched PR head changed: #${item.number}`);
+  }
+  const trainGit: TrainGit = deps.trainGit ?? ((args, repo) => execute('git', args, repo));
+  const gate = (deps.trainGate ?? ((repo: string, baseSha: string) => trainGateOnHost({ repo, baseSha })))(cwd, base);
+  const result = await runTrain(plan.batch, {
+    integrate: (batch) => integrateTrain(cwd, base, batch, trainGit),
+    gate,
+    deferred: plan.deferred,
+    // The train's observation channel is debug.log (LAND-QUEUE); the ledger below carries the authoritative state.
+    observe: (data) => { debug.log('self-implement.merge-train', 'shadow-verdict', data); },
+  });
+  const at = new Date().toISOString();
+  const batchNumbers = plan.batch.map((item) => item.number);
+  const verdicts: L8ShadowVerdict[] = result.verdicts.map((entry) => ({
+    number: entry.number,
+    head: plan.batch.find((item) => item.number === entry.number)!.head,
+    base,
+    verdict: entry.verdict,
+    detail: `merge train shadow · batch [${batchNumbers.join(',')}] · gatesRun ${result.gatesRun}`,
+    tests: [],
+    at,
+  }));
+  state.pending = state.pending.filter((item) => !batchNumbers.includes(item.number));
+  state.verdicts.push(...verdicts);
+  writeShadowQueue(path, state);
+  return verdicts[0] ?? null;
+}
+
+/** Evaluate one pinned queue head against freshly fetched main — or, when the queue holds two or more measured,
+ *  non-overlapping PRs, one shadow merge train. Never push or call a merge API. */
 export async function runL8ShadowQueue(cwd: string, deps: L8ShadowQueueDeps = {}): Promise<L8ShadowVerdict | null> {
   return withShadowQueue(cwd, deps, async (state, path) => {
     const item = state.pending[0];
     if (!item) return null;
     const execute = deps.command ?? command;
     const run = (bin: string, args: string[], where = cwd) => shadowCommand(execute, bin, args, where);
+    // LAND-QUEUE — two or more measured, non-overlapping queued PRs evaluate as one shadow merge train first.
+    const trainPlan = planTrain(
+      state.pending.map((pending) => ({ number: pending.number, head: pending.head, files: pending.files, filesUnmeasured: pending.filesUnmeasured })),
+      { maxBatch: deps.trainMaxBatch ?? 2 },
+    );
+    if (trainPlan.batch.length >= 2) return runShadowMergeTrain(state, path, cwd, run, execute, trainPlan, deps);
     const verdict: L8ShadowVerdict = { number: item.number, head: item.head, verdict: 'fail', tests: [], at: new Date().toISOString() };
     const view = JSON.parse(run('gh', ['pr', 'view', String(item.number), '--json', 'headRefOid,baseRefName,state,isDraft,isCrossRepository'])) as {
       headRefOid?: string; baseRefName?: string; state?: string; isDraft?: boolean; isCrossRepository?: boolean;

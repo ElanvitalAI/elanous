@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
-import { activeRunsForGoal, launchRequestId, preLaunchGate } from './launch-gate.js';
+import { BUDGET_SNAPSHOT_ENV, activeRunsForGoal, encodeBudgetSnapshot, harnessLaunchBudgetDecision, launchRequestId, preLaunchGate, resolveLaunchBudget, type BudgetSnapshot } from './launch-gate.js';
+import type { BudgetInputs } from '../self-implement/budget-gate.js';
 import { ORIGINAL_ASK_MARKER } from '../self-implement/goal-author.js';
 import type { QueriedRunningRunsResult, RunningRunAssessment } from '../self-implement/running-runs.js';
 import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
@@ -179,5 +180,126 @@ describe('preLaunchGate', () => {
     expect(preLaunchGate({ goalId, budget, forceLaunch: true }, { activeRuns: () => [runId] }).action).toBe('proceed');
     expect(preLaunchGate({ goalId, forceLaunch: true, budget: { action: 'stop', reasons: ['exhausted'] } }, { activeRuns: () => [runId] }).action).toBe('blocked-budget');
     expect(preLaunchGate({ goalId, forceLaunch: true, budget: { action: 'wait-reset', reasons: ['reset'] } }, { activeRuns: () => [runId] }).action).toBe('wait-reset');
+  });
+});
+
+describe('Pod budget snapshot', () => {
+  const now = Date.parse('2026-10-11T10:00:00Z');
+  const snapshot = (overrides: Partial<BudgetSnapshot> = {}): BudgetSnapshot => ({
+    provider: 'grok', remaining: 90, window: 'weekly', measuredAt: now - 60_000, host: 'host-1', decision: { action: 'proceed', provider: 'grok' }, ...overrides,
+  });
+  const podEnv = (value?: string): NodeJS.ProcessEnv => ({ ELANOUS_SUBSTRATE: 'pod', ...(value === undefined ? {} : { [BUDGET_SNAPSHOT_ENV]: value }) });
+  const neverMeasure = async (): Promise<'unknown'> => { throw new Error('the Pod measured locally'); };
+  /** A host-side launch-gate verdict, reached exactly as the host does it (chain ⊕ the user's caps). */
+  const hostVerdict = (chain: string[], codexUsed: number, grokUsed: number) => harnessLaunchBudgetDecision({
+    preference: { mode: 'auto', chain: chain.map((provider) => ({ provider })), budgetGate: { minHeadroomPercent: 0, onShortfall: 'stop' }, source: { mode: 'inferred', chain: 'fallbackChain' } },
+    codexCandidates: [{ name: 'default', usedPercent: codexUsed }],
+    grokUsedPercent: grokUsed,
+    maxUsedPercent: { 'openai-codex': 95, grok: 80 },
+  } as unknown as BudgetInputs).decision;
+
+  test('a fresh parent snapshot decides the Pod gate', async () => {
+    const logs: Array<{ event: string; data: any }> = [];
+    const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'execution-loop.launch-gate') logs.push({ event, data });
+    });
+    try {
+      const ok = await resolveLaunchBudget({ env: podEnv(encodeBudgetSnapshot(snapshot())), now: () => now, measureLocal: neverMeasure });
+      expect(ok).toMatchObject({ budgetSource: 'snapshot', snapshotAgeSec: 60, budget: { action: 'proceed', provider: 'grok' } });
+      expect(preLaunchGate({ goalId, ...ok }, { activeRuns: () => [] }).action).toBe('proceed');
+      const spent = await resolveLaunchBudget({ env: podEnv(encodeBudgetSnapshot(snapshot({ remaining: 10, decision: { action: 'stop' } }))), now: () => now, measureLocal: neverMeasure });
+      expect(spent.budgetSource).toBe('snapshot');
+      expect(preLaunchGate({ goalId, ...spent }, { activeRuns: () => [] }).action).toBe('blocked-budget');
+      expect(logs.filter(({ event }) => event === 'decision').map(({ data }) => [data.budgetSource, data.snapshotAgeSec])).toEqual([['snapshot', 60], ['snapshot', 60]]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('codex 95% with grok next in the chain: the host verdict is grok and the Pod does not block', async () => {
+    const verdict = hostVerdict(['openai-codex', 'grok'], 96, 20);
+    expect(verdict).toMatchObject({ action: 'next-provider', provider: 'grok' });
+    const resolved = await resolveLaunchBudget({
+      env: podEnv(encodeBudgetSnapshot(snapshot({ provider: 'openai-codex', remaining: 4, decision: { action: verdict.action, provider: verdict.provider! } }))),
+      now: () => now, measureLocal: neverMeasure,
+    });
+    expect(resolved).toMatchObject({ budgetSource: 'snapshot', budget: { action: 'next-provider', provider: 'grok' } });
+    expect(preLaunchGate({ goalId, ...resolved }, { activeRuns: () => [] }).action).toBe('proceed');
+  });
+
+  test('a host verdict that blocks blocks the Pod too', async () => {
+    const verdict = hostVerdict(['openai-codex', 'grok'], 96, 85);
+    expect(verdict.action).toBe('stop');
+    const resolved = await resolveLaunchBudget({
+      env: podEnv(encodeBudgetSnapshot(snapshot({ provider: 'openai-codex', remaining: 4, decision: { action: verdict.action } }))),
+      now: () => now, measureLocal: neverMeasure,
+    });
+    expect(resolved.budgetSource).toBe('snapshot');
+    expect(preLaunchGate({ goalId, ...resolved }, { activeRuns: () => [] }).action).toBe('blocked-budget');
+    const waiting = await resolveLaunchBudget({ env: podEnv(encodeBudgetSnapshot(snapshot({ decision: { action: 'wait-reset' } }))), now: () => now, measureLocal: neverMeasure });
+    expect(preLaunchGate({ goalId, ...waiting }, { activeRuns: () => [] }).action).toBe('wait-reset');
+  });
+
+  test('the Pod never re-judges usage itself — numbers past a code cap still follow the host verdict', async () => {
+    const resolved = await resolveLaunchBudget({ env: podEnv(encodeBudgetSnapshot(snapshot({ remaining: 1, decision: { action: 'proceed', provider: 'grok' } }))), now: () => now, measureLocal: neverMeasure });
+    expect(resolved.budget).toMatchObject({ action: 'proceed', provider: 'grok' });
+  });
+
+  test('a stale or missing snapshot, or one without a host verdict, marks unmeasured and proceeds', async () => {
+    const stale = await resolveLaunchBudget({ env: podEnv(encodeBudgetSnapshot(snapshot({ measuredAt: now - 16 * 60_000, remaining: 0, decision: { action: 'stop' } }))), now: () => now, measureLocal: neverMeasure });
+    expect(stale).toEqual({ budget: 'unknown', budgetSource: 'unmeasured', snapshotAgeSec: 960 });
+    const missing = await resolveLaunchBudget({ env: podEnv(), now: () => now, measureLocal: neverMeasure });
+    expect(missing).toEqual({ budget: 'unknown', budgetSource: 'unmeasured' });
+    const garbage = await resolveLaunchBudget({ env: podEnv('{not json'), now: () => now, measureLocal: neverMeasure });
+    expect(garbage.budgetSource).toBe('unmeasured');
+    const noVerdict = await resolveLaunchBudget({ env: podEnv(encodeBudgetSnapshot(snapshot({ remaining: 0, decision: undefined }))), now: () => now, measureLocal: neverMeasure });
+    expect(noVerdict).toEqual({ budget: 'unknown', budgetSource: 'unmeasured', snapshotAgeSec: 60 });
+    const otherProvider = await resolveLaunchBudget({ env: podEnv(encodeBudgetSnapshot(snapshot({ requested: 'grok' }))), provider: 'openai-codex', now: () => now, measureLocal: neverMeasure });
+    expect(otherProvider.budgetSource).toBe('unmeasured');
+    const chainVerdictForExplicitAsk = await resolveLaunchBudget({ env: podEnv(encodeBudgetSnapshot(snapshot())), provider: 'grok', now: () => now, measureLocal: neverMeasure });
+    expect(chainVerdictForExplicitAsk.budgetSource).toBe('unmeasured');
+    for (const resolved of [stale, missing, noVerdict]) expect(preLaunchGate({ goalId, ...resolved }, { activeRuns: () => [] }).action).toBe('proceed');
+  });
+
+  test('a fresh host stop verdict survives small Pod clock skew, while a far-future snapshot is unmeasured', async () => {
+    const fresh = encodeBudgetSnapshot(snapshot({ measuredAt: now + 2_000, decision: { action: 'stop' } }));
+    const accepted = await resolveLaunchBudget({ env: podEnv(fresh), now: () => now, measureLocal: neverMeasure });
+    expect(accepted).toMatchObject({ budgetSource: 'snapshot', snapshotAgeSec: -2, budget: { action: 'stop' } });
+    expect(preLaunchGate({ goalId: 'clock-skew', ...accepted }, { activeRuns: () => [] }).action).toBe('blocked-budget');
+    const future = encodeBudgetSnapshot(snapshot({ measuredAt: now + 31_000, decision: { action: 'stop' } }));
+    expect(await resolveLaunchBudget({ env: podEnv(future), now: () => now, measureLocal: neverMeasure })).toEqual({ budget: 'unknown', budgetSource: 'unmeasured', snapshotAgeSec: -31 });
+  });
+
+  test('the Pod gate never re-measures locally when a snapshot exists, for grok, codex and zai alike', async () => {
+    for (const provider of ['grok', 'openai-codex', 'zai']) {
+      let measured = 0;
+      const resolved = await resolveLaunchBudget({
+        env: podEnv(encodeBudgetSnapshot(snapshot({ provider, requested: provider, decision: { action: 'proceed', provider } }))), provider, now: () => now,
+        measureLocal: async () => { measured += 1; return 'unknown'; },
+      });
+      expect(resolved.budgetSource).toBe('snapshot');
+      expect(measured).toBe(0);
+    }
+    const codex = await resolveLaunchBudget({ env: podEnv(encodeBudgetSnapshot(snapshot({ provider: 'codex', requested: 'codex', remaining: 3, decision: { action: 'stop' } }))), provider: 'codex-rotate', now: () => now, measureLocal: neverMeasure });
+    expect(codex.budget).toMatchObject({ action: 'stop' });
+  });
+
+  test('outside a Pod the host measures as before and the snapshot env is ignored', async () => {
+    let measured = 0;
+    const decision = { action: 'proceed' as const, reasons: [] };
+    const resolved = await resolveLaunchBudget({
+      env: { [BUDGET_SNAPSHOT_ENV]: encodeBudgetSnapshot(snapshot()) },
+      measureLocal: async () => { measured += 1; return decision; },
+    });
+    expect(resolved).toEqual({ budget: decision, budgetSource: 'local' });
+    expect(measured).toBe(1);
+  });
+
+  test('the snapshot carries numbers and names only', () => {
+    const encoded = encodeBudgetSnapshot({ ...snapshot({ requested: 'grok', decision: { action: 'proceed', provider: 'grok', reasons: ['account secret-reason'], token: 'secret-verdict' } as never }), token: 'secret-value' } as BudgetSnapshot);
+    const parsed = JSON.parse(encoded);
+    expect(Object.keys(parsed).sort()).toEqual(['decision', 'host', 'measuredAt', 'provider', 'remaining', 'requested', 'window']);
+    expect(Object.keys(parsed.decision).sort()).toEqual(['action', 'provider']);
+    expect(encoded).not.toContain('secret');
   });
 });

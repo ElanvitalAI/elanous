@@ -162,7 +162,7 @@ describe('self-implement PR upsert and template', () => {
     try {
       mkdirSync(join(root, '.github'));
       writeFileSync(join(root, '.github', 'pull_request_template.md'), '## Summary\n\n## Test plan\n');
-      expect(buildPrBody(root, '## 구현 요약\n변경')).toBe('## Summary\n\n## Test plan\n\n## 구현 요약\n변경');
+      expect(buildPrBody(root, '## 구현 요약\n변경')).toBe('## Summary\n\n## Test plan\n\n결론: ## 구현 요약 변경\n\n## 구현 요약\n변경');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -186,7 +186,7 @@ describe('self-implement PR upsert and template', () => {
       const pr = await defaultSeams({ prManager }).openPr({ title: 'title', body: 'body', head: 'self-impl/feature', draft: true, labels: ['auto-review'], cwd: root });
       expect(pr).toEqual({ url: 'https://github.com/o/r/pull/42', number: 42 });
       expect(calls).toEqual([{
-        branch: 'self-impl/feature', worktreePath: root, title: 'title', body: '## Summary\n\nbody',
+        branch: 'self-impl/feature', worktreePath: root, title: 'title', body: '## Summary\n\n결론: body\n\nbody',
         commitMessage: 'title', draft: true, labels: ['auto-review'],
       }]);
     } finally {

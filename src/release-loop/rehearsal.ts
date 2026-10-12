@@ -290,7 +290,7 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
             stamp.sha = gitResult(git, ['rev-parse', 'HEAD'], checkout);
             if (!stamp.sha) throw new Error('git rev-parse HEAD returned no sha');
             const regressionFiles: string[] = [];
-            const result = await (deps.lightRc ?? ((version, cwd) => runLightRc(version, { ledgerRoot: root, log: (line) => {
+            const result = await (deps.lightRc ?? ((version, cwd) => runLightRc(version, { ledgerRoot: root, head: stamp.sha, log: (line) => {
               for (const entry of line.split(/\r?\n/)) {
                 const file = /^- introduced: (.+?)(?: > |$)/.exec(entry)?.[1];
                 if (file && regressionFiles.length < 3) regressionFiles.push(file);

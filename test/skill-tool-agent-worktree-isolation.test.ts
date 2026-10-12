@@ -7,7 +7,7 @@ import { globalAgentRegistry } from '../src/agent/registry.js';
 import type { AgentDefinition } from '../src/agent/types.js';
 import type { LLMProvider } from '../src/llm.js';
 import { debug } from '../src/debug/log.js';
-import { __resetSessionWorkingDir, setSessionCwd } from '../src/session/working-dir.js';
+import { __resetSessionWorkingDir, getSessionCwd, setSessionCwd } from '../src/session/working-dir.js';
 import { enterWorktreeRuntime } from '../src/tool-runtime/git-worktree-runtimes.js';
 
 let worktreeRun: (req: { name: string }) => Promise<{ path: string; branch: string }>;
@@ -148,5 +148,56 @@ describe('dispatchAgent worktree isolation', () => {
     };
 
     await expect(dispatchAgent(args('worktree'), opts())).rejects.toThrow('EnterWorktree: branch already exists');
+  });
+
+  test('restores the parent session cwd when worktree entry fails after moving it', async () => {
+    const parentCwd = mkdtempSync(join(tmpdir(), 'agent-parent-cwd-fail-'));
+    const strayWorktree = mkdtempSync(join(tmpdir(), 'agent-wt-stray-'));
+    setSessionCwd(parentCwd, 'tool');
+    worktreeRun = async () => {
+      setSessionCwd(strayWorktree, 'tool');
+      throw new Error('EnterWorktree: branch already exists');
+    };
+
+    try {
+      await expect(dispatchAgent(args('worktree'), opts())).rejects.toThrow('EnterWorktree: branch already exists');
+      expect(getSessionCwd()).toBe(parentCwd);
+    } finally {
+      rmSync(parentCwd, { recursive: true, force: true });
+      rmSync(strayWorktree, { recursive: true, force: true });
+    }
+  });
+
+  test('spawning a worktree-isolated agent leaves the parent session cwd unchanged', async () => {
+    const parentCwd = mkdtempSync(join(tmpdir(), 'agent-parent-cwd-'));
+    const firstWorktree = mkdtempSync(join(tmpdir(), 'agent-wt-a-'));
+    const secondWorktree = mkdtempSync(join(tmpdir(), 'agent-wt-b-'));
+    setSessionCwd(parentCwd, 'tool');
+    let spawnCount = 0;
+    worktreeRun = async (req) => {
+      spawnCount += 1;
+      const path = spawnCount === 1 ? firstWorktree : secondWorktree;
+      // Mirror enterWorktreeRuntime: it mutates the parent session cwd.
+      setSessionCwd(path, 'tool');
+      return { path, branch: `agent/${req.name}` };
+    };
+
+    try {
+      const first = await dispatchAgent(args('worktree'), opts());
+      expect(getSessionCwd()).toBe(parentCwd);
+      expect(first.cwd).toBe(firstWorktree);
+      expect(first.isolation).toBe('worktree');
+
+      const second = await dispatchAgent(args('worktree'), opts());
+      expect(getSessionCwd()).toBe(parentCwd);
+      expect(second.cwd).toBe(secondWorktree);
+      expect(second.isolation).toBe('worktree');
+      expect(first.cwd).not.toBe(second.cwd);
+      expect(debug.tail(40).join('\n')).toContain('[agent.spawn] worktree-parent-cwd-restored');
+    } finally {
+      rmSync(parentCwd, { recursive: true, force: true });
+      rmSync(firstWorktree, { recursive: true, force: true });
+      rmSync(secondWorktree, { recursive: true, force: true });
+    }
   });
 });

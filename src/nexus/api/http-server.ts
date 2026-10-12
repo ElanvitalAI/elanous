@@ -505,6 +505,8 @@ export interface NexusHttpServerOpts {
   draftMetrics?: DraftMetricsSource;
   decisions?: Pick<DecisionsRouteDeps, 'ledger'>;
   opsBoard?: Pick<OpsBoardDeps, 'openStore'>;
+  /** `GET /api/task-agent/board` 의 원장 경로 — 생략하면 인스턴스의 task-agent-actions.json. */
+  taskAgentStatePath?: string;
   cardFollowup?: CardFollowupJobs;
   skillExec?: SkillExecJobs;
   execRequests?: ExecRequestRunner;
@@ -942,6 +944,8 @@ let cardFollowupJobs: CardFollowupJobs | undefined;
 function defaultCardFollowupJobs(): CardFollowupJobs {
   return cardFollowupJobs ??= createCardFollowupJobs();
 }
+
+const TASK_AGENT_BOARD_PATH = '/api/task-agent/board';
 
 let skillExecJobs: SkillExecJobs | undefined;
 function defaultSkillExecJobs(): SkillExecJobs {
@@ -1520,6 +1524,24 @@ export async function routeRequest(
       authorize: request => !!opts.metaApi && opts.metaApi.noAuth !== true && checkAuth(request, opts.metaApi),
       ...opts.opsBoard,
     });
+  }
+  // TASKS-ON-TA-LEDGER — 읽기 전용 · 이 경로는 `/v1/` 밖이라 default-deny 관문이 못 덮는다 → 여기서 owner 인증을 직접 건다.
+  if (pathname === TASK_AGENT_BOARD_PATH) {
+    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (method !== 'GET') return jsonResponse({ error: 'method-not-allowed', method }, 405);
+    // 동적 import — 다른 무거운 라우트(skill-exec · card-followup)와 같은 꼴: task-agent 모듈 트리를 데몬 기동 경로에 싣지 않는다.
+    const [{ taskAgentBoard }, { taskAgentStatePath }] = await Promise.all([import('../../task-agent/board.js'), import('../../task-agent/task-hand.js')]);
+    try {
+      // progress 관측은 동기 수 초라 요청이 명시할 때만(`?progress=1`) — 기본 응답은 progress=null(UX 수확 리뷰 should-fix).
+      const withProgress = new URL(req.url, 'http://local').searchParams.get('progress') === '1';
+      const response = taskAgentBoard(opts.taskAgentStatePath ?? taskAgentStatePath(), { withProgress });
+      debug.log('task-agent', 'board-served', { projects: response.board.length });
+      return jsonResponse(response);
+    } catch (error) {
+      debug.log('task-agent', 'board-read-failed', { error: error instanceof Error ? error.message : String(error) });
+      return jsonResponse({ error: 'task-agent-ledger-unreadable' }, 503);
+    }
   }
   if (method === 'GET' && pathname === DECISIONS_PATH) {
     return handleDecisions(req, {
