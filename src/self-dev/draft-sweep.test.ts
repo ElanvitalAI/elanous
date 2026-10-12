@@ -1,6 +1,6 @@
 import { describe, expect, it, spyOn } from 'bun:test';
 import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
-import { DRAFT_NEEDS_OWNER_SEAT_CAP, isSeatDraftNeedsOwnerOverCap, DRAFT_SWEEP_CLOSE_CAP, resolveDraftSweepCloseCap, collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type OverlapMetricAdapters, type OverlapPreflightRow, draftSweepDaily, newerLineageDraft, runDraftSweep, supersedeDraftsOnMerge, sweepFailureReason, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from './draft-sweep.js';
+import { DRAFT_NEEDS_OWNER_SEAT_CAP, isSeatDraftNeedsOwnerOverCap, DRAFT_SWEEP_CLOSE_CAP, resolveDraftSweepCloseCap, collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type OverlapMetricAdapters, type OverlapPreflightRow, draftSweepDaily, newerLineageDraft, runDraftSweep, supersedeDraftsOnMerge, sweptReasonLabel, sweepFailureReason, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from './draft-sweep.js';
 import { branchLineageKey } from '../harness/worktree-branch-prefix.js';
 import { RELEASE_PATH_LABEL } from './release-path-guard.js';
 import { debug } from '../debug/log.js';
@@ -15,12 +15,14 @@ const superseded = state('superseded');
 const approval = state('idea-approval');
 const keep = PR_LABELS.find((entry) => entry.sweep.action === 'exclude')!.name;
 const now = new Date('2026-09-30T00:00:00Z');
+expect(new Set(['superseded-by #90', 'superseded-by #91 (all-files-landed)', 'duplicate-of-open #2', 'claim-expired (final)', 'stale-unobserved', 'harvest-expired', 'stale-ended-run', 'unexpected'].map(sweptReasonLabel))).toEqual(new Set(['superseded-by', 'duplicate-of-open', 'claim-expired', 'stale-unobserved', 'harvest-expired', 'stale-ended-run', 'other'].map((kind) => `elanous:swept:${kind}`)));
 const draft = (number: number, options: Partial<SweepDraft> = {}): SweepDraft => ({
   number, title: `Goal ${number}`, branch: `self-impl/goalid-${number.toString(16)}-run`,
   labels: [running], createdAt: '2026-09-28T00:00:00Z', updatedAt: '2026-09-28T00:00:00Z', runId: `run-${number}`, ...options,
 });
 const make = (drafts: SweepDraft[], merged: SweepMergedPr[] = []) => {
   const calls: string[] = [];
+  const sweptLabels: string[] = [];
   const statuses = new Map<number, string | undefined>(drafts.map((pr) => [pr.number, 'ended-unclosed']));
   let live: ReadonlySet<string> | undefined = new Set();
   const adapters: DraftSweepAdapters = {
@@ -28,10 +30,16 @@ const make = (drafts: SweepDraft[], merged: SweepMergedPr[] = []) => {
     listMerged: async (page, size) => { calls.push(`merged:${page}`); return merged.slice((page - 1) * size, page * size); },
     getRunStatus: async (pr) => statuses.get(pr.number),
     listLiveBranches: async () => live,
-    setLabels: async (_repo, n, change) => { calls.push(`label:${n}:${change.remove.join(',')}=>${change.add}`); },
-    closeDraft: async (_repo, n, comment) => { calls.push(`close:${n}:${comment}`); },
+    setLabels: async (_repo, n, change) => {
+      if (change.add.startsWith('elanous:swept:')) sweptLabels.push(`${n}:${change.add}`);
+      else calls.push(`label:${n}:${change.remove.join(',')}=>${change.add}`);
+    },
+    closeDraft: async (_repo, n, ...rest) => {
+      expect(rest).toHaveLength(0);
+      calls.push(`close:${n}`);
+    },
   };
-  return { calls, statuses, adapters, setLive: (value: ReadonlySet<string> | undefined) => { live = value; } };
+  return { calls, sweptLabels, statuses, adapters, setLive: (value: ReadonlySet<string> | undefined) => { live = value; } };
 };
 const sweep = (adapters: DraftSweepAdapters, apply = false) => runDraftSweep({ repository: 'owner/repo', adapters, apply, now });
 
@@ -55,8 +63,10 @@ describe('supersedeDraftsOnMerge', () => {
     try {
       const result = await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: fixture.adapters });
       expect(result).toEqual({ closed: [1], kept: [2, 3, 4, 5, 6, 9] });
+      expect(fixture.sweptLabels).toEqual(['1:elanous:swept:superseded-by']);
+      expect(log).toHaveBeenCalledWith('self-dev.draft-sweep', 'closed', { pr: 1, reason: 'superseded-by #90' });
       expect(fixture.calls.filter((call) => call.startsWith('label:') || call.startsWith('close:'))).toEqual([
-        `label:1:${stalled}=>${superseded}`, 'close:1:Draft sweep: superseded-by #90 (https://github.com/owner/repo/pull/90). Branch preserved.',
+        `label:1:${stalled}=>${superseded}`, 'close:1',
       ]);
       expect(log).toHaveBeenCalledWith('drafts.cleanup', 'superseded-on-merge', { merged: 90, closed: [1], kept: [2, 3, 4, 5, 6, 9] });
     } finally { log.mockRestore(); }
@@ -105,7 +115,7 @@ describe('supersedeDraftsOnMerge', () => {
       failLabels = false;
       expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: fixture.adapters }))
         .toEqual({ closed: [1], kept: [] });
-      expect(github).toEqual({ open: false, labels: [superseded] });
+      expect(github).toEqual({ open: false, labels: [superseded, 'elanous:swept:superseded-by'] });
     } finally { log.mockRestore(); }
   });
 
@@ -114,14 +124,14 @@ describe('supersedeDraftsOnMerge', () => {
     const github = new Map<number, { open: boolean; labels: string[] }>([[1, { open: true, labels: [stalled] }]]);
     fixture.adapters.setLabels = async (_repo, number, change) => {
       const pr = github.get(number)!;
-      pr.labels = [...pr.labels.filter((label) => !change.remove.includes(label)), change.add];
+      pr.labels = [...new Set([...pr.labels.filter((label) => !change.remove.includes(label)), change.add])];
       fixture.calls.push(`label:${number}`);
     };
     fixture.adapters.closeDraft = async () => { throw new Error('close unavailable'); };
     expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: fixture.adapters }))
       .toEqual({ closed: [], kept: [1] });
-    expect(github.get(1)).toEqual({ open: true, labels: [superseded] });
-    expect(fixture.calls.filter((call) => call.startsWith('label:'))).toEqual(['label:1']);
+    expect(github.get(1)).toEqual({ open: true, labels: [superseded, 'elanous:swept:superseded-by'] });
+    expect(fixture.calls.filter((call) => call.startsWith('label:'))).toEqual(['label:1', 'label:1']);
 
     // Review must-fix (GOODHART): the claimed retry is the periodic sweep itself — clear the fault and run the real
     // runDraftSweep against the same GitHub state; the draft must end closed and still labelled superseded.
@@ -139,7 +149,7 @@ describe('supersedeDraftsOnMerge', () => {
       now: new Date('2026-10-02T00:00:00Z') });
     expect(swept.complete).toBe(true);
     expect(swept.entries.find((entry) => entry.number === 1)?.action).toBe('close');
-    expect(github.get(1)).toEqual({ open: false, labels: [superseded] });
+    expect(github.get(1)).toEqual({ open: false, labels: [superseded, 'elanous:swept:superseded-by'] });
     expect(fixture.calls.filter((call) => call.startsWith('close:'))).toEqual(['close:1']);
   });
 
@@ -175,9 +185,9 @@ describe('supersedeDraftsOnMerge', () => {
       .toEqual({ closed: [22, 23], kept: [21, 24, 25, 26] });
     expect(fixture.calls.filter((call) => call.startsWith('label:') || call.startsWith('close:'))).toEqual([
       `label:22:${stalled}=>${superseded}`,
-      'close:22:Draft sweep: superseded-by #90 (https://github.com/owner/repo/pull/90). Branch preserved.',
+      'close:22',
       `label:23:${stalled}=>${superseded}`,
-      'close:23:Draft sweep: superseded-by #90 (https://github.com/owner/repo/pull/90). Branch preserved.',
+      'close:23',
     ]);
   });
 
@@ -745,7 +755,7 @@ describe('runDraftSweep', () => {
       expect(fixture.calls).toContain('drafts:2');
       expect(fixture.calls.filter((call) => call.startsWith('drafts:'))).toEqual(['drafts:1', 'drafts:2']);
       expect(fixture.calls.filter((call) => call.startsWith('label:') || call.startsWith('close:'))).toEqual([
-        `label:1:${stalled}=>${superseded}`, 'close:1:Draft sweep: duplicate-of-open #2. Branch preserved.',
+        `label:1:${stalled}=>${superseded}`, 'close:1',
       ]);
       expect(log).toHaveBeenCalledWith('drafts.cleanup', 'decided', { number: 1, action: 'close', reason: 'duplicate-of-open #2' });
     } finally { log.mockRestore(); }
@@ -758,7 +768,7 @@ describe('runDraftSweep', () => {
     const result = await sweep(fixture.adapters, true);
     expect(result.entries[0]).toMatchObject({ action: 'close', reason: 'duplicate-of-open #2', statusLabel: superseded, applied: true });
     expect(fixture.calls.filter((call) => call.startsWith('label:') || call.startsWith('close:'))).toEqual([
-      `label:1:${running}=>${superseded}`, 'close:1:Draft sweep: duplicate-of-open #2. Branch preserved.',
+      `label:1:${running}=>${superseded}`, 'close:1',
     ]);
   });
 
@@ -875,7 +885,7 @@ describe('runDraftSweep', () => {
       statusLabel: superseded, applied: true });
     expect(fixture.calls.filter((call) => call.startsWith('label:') || call.startsWith('close:'))).toEqual([
       `label:1:${stalled}=>${superseded}`,
-      'close:1:Draft sweep: superseded-by #90 (all-files-landed) (https://github.com/owner/repo/pull/90). Branch preserved.',
+      'close:1',
     ]);
   });
 
@@ -890,8 +900,8 @@ describe('runDraftSweep', () => {
       { number: 2, action: 'close', reason: 'superseded-by #10', statusLabel: superseded, applied: true },
     ]);
     expect(fixture.calls.filter((call) => call.startsWith('label:') || call.startsWith('close:'))).toEqual([
-      `label:1:${running}=>${stalled}`, expect.stringContaining('close:1:Draft sweep: 처리 중 표식이 6시간 갱신 없음'),
-      `label:2:${stalled}=>${superseded}`, 'close:2:Draft sweep: superseded-by #10 (https://github.com/owner/repo/pull/10). Branch preserved.',
+      `label:1:${running}=>${stalled}`, expect.stringContaining('close:1'),
+      `label:2:${stalled}=>${superseded}`, 'close:2',
     ]);
   });
 
@@ -942,7 +952,7 @@ describe('runDraftSweep', () => {
       { number: 1, action: 'close', reason: 'stale-ended-run', statusLabel: stalled,
         applied: false, partialApplied: true, error: 'Error: close denied #1' },
       { number: 2, action: 'close', reason: 'stale-ended-run', statusLabel: stalled,
-        applied: false, error: 'Error: close denied #2' },
+        applied: false, partialApplied: true, error: 'Error: close denied #2' },
     ]);
     expect(fixture.calls.filter((call) => call.startsWith('label:'))).toEqual([`label:1:=>${stalled}`]);
   });
@@ -993,7 +1003,7 @@ describe('runDraftSweep — unobserved runs (🅢 lead decision 2026-09-28)', ()
       [1, 'close', 'stale-unobserved'], [2, 'keep', 'unobserved'], [3, 'keep', 'live'],
     ]);
     expect(result.entries[0]!.statusLabel).toBe(stalled);
-    expect(fixture.calls.find((call) => call.startsWith('close:1:'))).toContain('run unobserved');
+    expect(fixture.sweptLabels).toContain('1:elanous:swept:stale-unobserved');
     expect(fixture.calls.some((call) => call.startsWith('close:2') || call.startsWith('close:3'))).toBe(false);
     expect(result).toMatchObject({ unobserved: 2, closed: 1 });
   });
@@ -1018,9 +1028,9 @@ describe('runDraftSweep — unobserved runs (🅢 lead decision 2026-09-28)', ()
     expect(result).toMatchObject({ claimed: 1, claimExpired: 2, closed: 1 });
     expect(fixture.calls.filter((call) => call.startsWith('label:') || call.startsWith('close:'))).toEqual([
       `label:12:${running}=>${stalled}`,
-      expect.stringContaining('close:12:Draft sweep: 처리 중 표식이 6시간 갱신 없음 — 런·워크트리 없음 · 주인 T'),
+      expect.stringContaining('close:12'),
     ]);
-    expect(fixture.calls.find((call) => call.startsWith('close:12:'))).toContain('Branch preserved');
+    expect(fixture.sweptLabels).toContain('12:elanous:swept:claim-expired');
   });
 
   it('closes already merged running drafts as superseded regardless of claim age, but retains live and human holds', async () => {
@@ -1040,8 +1050,8 @@ describe('runDraftSweep — unobserved runs (🅢 lead decision 2026-09-28)', ()
     ]);
     expect(result).toMatchObject({ claimed: 1, claimExpired: 1, closed: 2 });
     expect(fixture.calls.filter((call) => call.startsWith('label:') || call.startsWith('close:'))).toEqual([
-      `label:41:${running}=>${superseded}`, 'close:41:Draft sweep: superseded-by #141 (https://github.com/owner/repo/pull/141). Branch preserved.',
-      `label:42:${running}=>${superseded}`, 'close:42:Draft sweep: superseded-by #142 (https://github.com/owner/repo/pull/142). Branch preserved.',
+      `label:41:${running}=>${superseded}`, 'close:41',
+      `label:42:${running}=>${superseded}`, 'close:42',
     ]);
   });
 
@@ -1118,7 +1128,7 @@ describe('runDraftSweep — unobserved runs (🅢 lead decision 2026-09-28)', ()
     fixture.statuses.set(36, undefined);
     const result = await sweep(fixture.adapters, true);
     expect(result.entries.map(({ action, reason }) => [action, reason])).toEqual([['close', 'superseded-by #136']]);
-    expect(fixture.calls.filter((call) => call.startsWith('close:'))).toEqual(['close:36:Draft sweep: superseded-by #136 (https://github.com/owner/repo/pull/136). Branch preserved.']);
+    expect(fixture.calls.filter((call) => call.startsWith('close:'))).toEqual(['close:36']);
   });
 
   it('keeps an old running draft with updatedAt undefined and no observable run untouched in apply mode', async () => {
@@ -1283,7 +1293,7 @@ describe('runDraftSweep — lineage key (forceRequeue duplicates)', () => {
     expect(result.entries[1]).toMatchObject({ number: 2, action: 'keep' });
     expect(mutations(fixture.calls)).toEqual([
       'stop:1:2', `label:1:${running}=>${superseded}`,
-      'close:1:Draft sweep: duplicate-of-open #2 (lineage goalid:abc) · stop run run-1 (https://github.com/owner/repo/pull/2). Branch preserved.',
+      'close:1',
     ]);
   });
 
@@ -1363,7 +1373,7 @@ describe('runDraftSweep — lineage key (forceRequeue duplicates)', () => {
         expect(result.entries[0]).toMatchObject({ number: 1, action: 'close', reason: 'duplicate-of-open #2 (lineage goalid:abc)', statusLabel: superseded, applied: true });
         expect(supersedes(fixture.calls)).toEqual([
           `label:1:=>${superseded}`,
-          'close:1:Draft sweep: duplicate-of-open #2 (lineage goalid:abc) (https://github.com/owner/repo/pull/2). Branch preserved.',
+          'close:1',
         ]);
         expect(result.lineage).toEqual({ closed: 1, harvestableClosed: 1, fallThrough: {} });
         expect(log).toHaveBeenCalledWith('self-dev.draft-sweep', 'lineage-summary', { closed: 1, harvestableClosed: 1, fallThrough: {}, apply: true });

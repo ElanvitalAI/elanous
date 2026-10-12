@@ -11,9 +11,10 @@ export { currentNodeId };
 const FINISHED_RUN = ['done', 'completed', 'failed', 'cancelled', 'aborted', 'success', 'succeeded', 'error'];
 const runClock = new Intl.DateTimeFormat('ko-KR', { timeZone: 'Asia/Seoul', year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 
-export function ReleaseRunsContent({ result, version, versions = [], selectedRun, openedNodeId, log, onVersion, onRun, onNode, releaseStrip }: {
+export function ReleaseRunsContent({ result, version, versions = [], selectedRun, unmatchedRunId, openedNodeId, log, onVersion, onRun, onNode, onStripRun }: {
   result: OpsResult<ReleaseRun[]> | null;
-  releaseStrip?: React.ReactNode;
+  unmatchedRunId?: string | null;
+  onStripRun?: (run: ReleaseRun) => void;
   version: string;
   versions?: string[];
   selectedRun: ReleaseRun | null;
@@ -26,11 +27,14 @@ export function ReleaseRunsContent({ result, version, versions = [], selectedRun
   if (result?.kind === 'forbidden' || log?.kind === 'forbidden') return <p>운영자만 볼 수 있습니다</p>;
   const runs = result?.kind === 'ready' ? result.data : [];
   const filtered = version ? runs.filter((run) => run.version === version) : runs;
-  const selected = selectedRun ? filtered.find((run) => run.runId === selectedRun.runId) ?? null : null;
+  const matches = selectedRun ? filtered.filter((run) => run.runId === selectedRun.runId) : [];
+  const selected = matches.length === 1 ? matches[0]! : null;
+  const runMismatch = result?.kind === 'ready' && (selectedRun !== null && !selected || !!unmatchedRunId);
   const choices = [...new Set([...versions, ...runs.map((run) => run.version).filter((v): v is string => !!v)])];
   if (version && !choices.includes(version)) choices.push(version);
   return <main className="mx-auto w-full min-w-0 max-w-4xl space-y-6 overflow-x-hidden px-4 py-6 text-foreground">
-    {releaseStrip}
+    {runMismatch ? <p role="status">발행 진행 · 노드 흐름: 런이 달라 못 잼</p>
+      : onStripRun && <ReleaseStrip result={result} selectedRun={selected} expectedRunId={selected?.runId} onSelect={onStripRun} />}
     <header className="space-y-1"><p className="text-sm text-muted-foreground">운영 / 릴리스</p><h1 className="text-2xl font-semibold">릴리스</h1></header>
     <label className="block space-y-2 text-sm font-medium">판
       <input aria-label="판" list="ops-release-versions" className="block w-full max-w-xs rounded-md border bg-background p-2" value={version} onChange={(event) => onVersion(event.target.value)} placeholder="전체 판" />
@@ -47,7 +51,7 @@ export function ReleaseRunsContent({ result, version, versions = [], selectedRun
           <time aria-label="시작 시각 (KST)" className="block break-all text-sm text-muted-foreground" dateTime={run.startedAt}>{Number.isFinite(Date.parse(run.startedAt)) ? `${runClock.format(new Date(run.startedAt))} KST` : '시각 미기록'}</time>
         </button>)}
       </section>
-      {selected && <section className="min-w-0 space-y-3" aria-label="노드 진행" data-run-id={selected.runId}>
+      {selected && !runMismatch && <section className="min-w-0 space-y-3" aria-label="노드 진행" data-run-id={selected.runId}>
         <h2 className="font-semibold">노드 흐름 <span className="text-sm font-normal text-muted-foreground">· {selected.version ?? '판 미상'} · {selected.status}</span></h2>
         <ReleaseFlow run={selected} openedNodeId={openedNodeId} onNode={onNode} />
         {openedNodeId && selected.path.includes(openedNodeId)
@@ -137,8 +141,9 @@ export function ReleaseRunsView(): React.ReactNode {
 
   const activeVersion = version === null ? latestVersion : version;
   const versionRuns = result?.kind === 'ready' ? result.data.filter((run) => !activeVersion || run.version === activeVersion) : [];
-  const selected = versionRuns.find((run) => run.runId === selectedRunId)
-    ?? latestReleaseRun({ kind: 'ready', data: versionRuns }, Date.now()) ?? versionRuns[0];
+  const selected = selectedRunId
+    ? versionRuns.find((run) => run.runId === selectedRunId)
+    : latestReleaseRun({ kind: 'ready', data: versionRuns }, Date.now()) ?? versionRuns[0];
   const effectiveVersion = activeVersion ?? selected?.version ?? '';
   const selectedId = selected?.runId;
   useEffect(() => {
@@ -172,7 +177,7 @@ export function ReleaseRunsView(): React.ReactNode {
   if (denied) return <p>운영자만 볼 수 있습니다</p>;
   const visibleNode = openedNode && openedNode.runId === selectedId ? openedNode.nodeId : null;
   const visibleLog = log && log.runId === selectedId && log.nodeId === visibleNode ? log.result : null;
-  return <ReleaseRunsContent result={result} version={effectiveVersion} versions={versions} selectedRun={selected ?? null} openedNodeId={visibleNode}
-    log={visibleLog} onVersion={selectVersion} onRun={selectRun} onNode={selectNode}
-    releaseStrip={<ReleaseStrip result={result} selectedRun={selected ?? null} onSelect={selectStripRun} />} />;
+  return <ReleaseRunsContent result={result} version={effectiveVersion} versions={versions} selectedRun={selected ?? null}
+    unmatchedRunId={selectedRunId && !selected ? selectedRunId : null} openedNodeId={visibleNode}
+    log={visibleLog} onVersion={selectVersion} onRun={selectRun} onNode={selectNode} onStripRun={selectStripRun} />;
 }

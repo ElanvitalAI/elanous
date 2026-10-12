@@ -2,11 +2,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { parse as parseYaml } from 'yaml';
 import { defaultProbeHostEnvironment, defaultReadInstallPrefix, formatDoctorReport as renderDoctorReport, humanBreaks, registerDoctorCommand, runDoctor, setFetchHealthSpawnForTest, summarizeDoctorCapabilities } from './doctor-cli.js';
 import { checkReadiness } from './doctor-readiness.js';
+import { debug } from '../debug/log.js';
 import { applySudoFixes } from './doctor-fix.js';
 import type { UserConfig } from '../user-config.js';
 
@@ -195,6 +196,44 @@ describe('doctor CLI', () => {
     expect(advised.codes).toEqual(base.codes);
     const json = await run(['--advise', '--json']);
     expect(JSON.parse(json.text).advise).toMatchObject({ ok: false, provider: 'auto', model: '(none)', reason: hint });
+  });
+
+  test('doctor --advise offers one operations-pack item with the observed value and logs acceptance or rejection', async () => {
+    for (const accepted of [true, false]) {
+      const lines: string[] = [];
+      const events: Array<{ category: string; event: string; data: unknown }> = [];
+      const observation = spyOn(debug, 'log').mockImplementation((category, event, data) => { events.push({ category, event, data }); });
+      const program = new Command();
+      try {
+        registerDoctorCommand(program, {
+          ...options({ readiness: { provider: 'grok', ghOnPath: false, ghAuthStatus: null } }),
+          resolveAdviceProvider: () => ({ provider: 'grok', model: 'grok-test', auth: 'oauth' }),
+          adviseLlm: async () => JSON.stringify({ summary: 'use the configured fallback', order: [
+            { readinessId: 'gh-auth', why: 'gh authentication is unavailable' },
+            { readinessId: 'provider-decision', why: 'second recommendation must not be presented' },
+          ], manual: [] }),
+          adviceInteractive: true,
+          confirmAdvice: async () => {
+            expect(lines.join('\n')).toContain('운영 팩 항목 id: gh-auth');
+            expect(lines.join('\n')).toContain('현재 관측값: manual: gh is not on PATH');
+            return accepted;
+          },
+          out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+        });
+        await program.parseAsync(['doctor', '--advise'], { from: 'user' });
+        const proposal = lines.find((line) => line.includes('운영 팩 항목 id: gh-auth'))!;
+        expect(proposal).toContain('운영 팩 항목 id: gh-auth');
+        expect(proposal).toContain('현재 관측값: manual: gh is not on PATH');
+        expect(proposal).not.toContain('second recommendation must not be presented');
+        expect(lines.join('\n')).toContain(`응답: ${accepted ? '수락' : '거절'}`);
+        expect(events.filter((entry) => entry.category === 'doctor.advise' && ['accepted', 'rejected'].includes(entry.event)))
+          .toEqual([{ category: 'doctor.advise', event: accepted ? 'accepted' : 'rejected', data: {
+            itemId: 'gh-auth', observedValue: 'manual: gh is not on PATH', applied: 0,
+          } }]);
+      } finally {
+        observation.mockRestore();
+      }
+    }
   });
 
   test('no-LLM advice uses the measured provider-decision remedy rather than inventing a command', async () => {

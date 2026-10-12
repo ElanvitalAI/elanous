@@ -2490,6 +2490,12 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
       });
       if (result.kind === 'launch') {
         ctx.chatLines.push(ctx.accent(`  ✅ 전제 검사 통과 — 골: ${result.goalFile}`));
+        const { resolveObserveOnlyDecision } = await import('../../self-implement/observe-only.js');
+        if (resolveObserveOnlyDecision().enabled) {
+          ctx.chatLines.push(ctx.muted('  관측 전용이라 런을 발사하지 않았습니다 · 코드도 안 바꿨습니다'));
+          ctx.chatLines.push(ctx.muted('     조회: elanous logs --category self-implement --since 10m'));
+          return;
+        }
         // ⭐ 런을 «띄운다» — detached 라 이 TUI 를 닫아도 런은 산다.
         //   ⛔ spawn 을 여기서 새로 쓰지 않는다 — `launchDevGoalFileDetached` «한 자리»가 인자·env 를 갖는다.
         //   ⛔ 그리고 「띄웠다」와 「끝났다」는 다른 값이다 — 이 표면은 «띄운 것»까지만 말한다.

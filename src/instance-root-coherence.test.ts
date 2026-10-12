@@ -31,29 +31,29 @@ afterEach(() => {
   }
 });
 
-describe('tree-derived source universe', () => {
-  test('legacy switch cannot disable source-tree isolation', () => {
+describe('source-tree universe selection', () => {
+  test('legacy switch cannot grant an implicit test universe or override an explicit one', () => {
     setTreeDerivedTestForTesting(false);
     expect(treeDerivedTestEnabled()).toBe(true);
-    expect(treeDerivedRootFor(process.cwd())).toBe(join(process.cwd(), '.elanous-test'));
+    const testRoot = treeDerivedRootFor(process.cwd());
+    if (testRoot === null) throw new Error('This test requires a source tree');
+    expect(testRoot).toBe(join(process.cwd(), '.elanous-test'));
     expect(resolveInstance({ installedCopy: false })).toMatchObject({
-      kind: 'test', root: join(process.cwd(), '.elanous-test'), layer: 'tree-derived',
+      kind: 'prod', root: join(homedir(), '.elanous'), layer: 'default',
     });
-    expect(resolveInstance({ installedCopy: false, treeTestRoot: null })).toMatchObject({
-      kind: 'test', root: join(process.cwd(), '.elanous-test'), layer: 'default',
+    expect(resolveInstance({ installedCopy: false, explicitFlagRoot: testRoot })).toMatchObject({
+      kind: 'test', root: testRoot, layer: 'explicit-flag',
     });
   });
 });
 
 describe('checkInstanceRootCoherence', () => {
-  test('소스 트리 기본(양축 미설정) → 둘 다 파생 테스트 루트 → coherent', () => {
+  test('소스 트리 기본(양축 미설정) → 둘 다 운영 루트 → coherent', () => {
     resetElanousConfigDir();
     delete process.env.ELANOUS_STATE_DIR;
     const c = checkInstanceRootCoherence();
-    const treeRoot = treeDerivedRootFor(process.cwd());
-    if (treeRoot === null) throw new Error('This test requires a source tree');
-    expect(c.configDir).toBe(treeRoot);
-    expect(c.stateDir).toBe(treeRoot);
+    expect(c.configDir).toBe(join(homedir(), '.elanous'));
+    expect(c.stateDir).toBe(join(homedir(), '.elanous'));
     expect(c.coherent).toBe(true);
   });
 
@@ -115,10 +115,12 @@ describe('assertInstanceRootCoherence', () => {
 describe('checkProdSpawnFootgun (backlog #1)', () => {
   // footgun = nested(depth>0) AND interactive(TTY) AND resolver-backed prod.
   // interactive 는 주입해 TTY 비의존 결정 테스트. 진리표 전 조합 확인.
-  test('ELANOUS_STATE_DIR 비어도 3층 파생 격리 자식이면 prod 아님 (env predicate 회귀 방지)', () => {
+  test('ELANOUS_STATE_DIR 비어도 명시 config 격리 자식이면 prod 아님 (env predicate 회귀 방지)', () => {
     process.env.ELANOUS_NEST_DEPTH = '1';
     delete process.env.ELANOUS_STATE_DIR;
-    setTreeDerivedTestForTesting(true);
+    const testRoot = treeDerivedRootFor(process.cwd());
+    if (testRoot === null) throw new Error('This test requires a source tree');
+    setElanousConfigDir(testRoot);
     resetEffectiveInstanceRoot();
     const f = checkProdSpawnFootgun({ interactive: true });
     expect(f.prod).toBe(false);

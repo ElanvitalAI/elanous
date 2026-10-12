@@ -4,7 +4,7 @@ import type { CdpClient } from '../browser-cdp/client.js';
 import type { DecisionEvent } from '../live/detail-switch.js';
 import { join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { setTreeDerivedTestForTesting } from '../instance/resolve.js';
+import { prodInstanceRoot, setTreeDerivedTestForTesting } from '../instance/resolve.js';
 
 const URL = 'https://auth.openai.com/oauth/authorize?secret=never-log-this';
 const page = (changes: Partial<LoginSnapshot> = {}): LoginSnapshot => ({ url: URL, text: 'Approve access', inputs: [], buttons: ['Authorize'], ...changes });
@@ -47,13 +47,14 @@ describe('browser profile universe', () => {
     }
   });
 
-  test('follows a tree-derived test universe even without a state env override', () => {
+  test('uses the operating universe without an explicit state override, even in a source tree', () => {
     const previous = process.env.ELANOUS_STATE_DIR;
     try {
       delete process.env.ELANOUS_STATE_DIR;
+      // The retired tree-derived seam cannot select a test universe.
       setTreeDerivedTestForTesting(true);
       expect(browserProfileDir()).toBe(join(elanousStateRoot(), 'browser-profile'));
-      expect(browserProfileDir()).toContain('.elanous-test');
+      expect(browserProfileDir()).toBe(join(prodInstanceRoot(), 'browser-profile'));
     } finally {
       setTreeDerivedTestForTesting(undefined);
       if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;

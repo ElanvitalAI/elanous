@@ -19,6 +19,26 @@ function cli(root: string, ...args: string[]) {
 }
 
 describe('release checklist five-surface parity at the real CLI entrance', () => {
+  test('CELL-PATH-GATE: add and retitle warn in shadow mode, while --kind ops persists apart from screen', () => {
+    const root = mkdtempSync(join(tmpdir(), 'release-cli-path-'));
+    setElanousConfigDir(root);
+    try {
+      const missing = cli(root, 'add', 'PATH-CODE', '대상 경로: src/no-such-release-cell.ts', '--version', version);
+      expect(missing.exitCode).toBe(0);
+      expect(missing.stderr).toContain('origin/main에 없는 파일');
+      const declared = cli(root, 'retitle', 'PATH-CODE', '대상 경로: src/new-release-cell.ts\n신설: src/new-release-cell.ts', '--version', version);
+      expect(declared.exitCode).toBe(0);
+      expect(declared.stderr).not.toContain('⚠ 대상 경로:');
+      const ops = cli(root, 'add', 'OPS', '운영 확인', '--kind', 'ops', '--version', version);
+      expect(ops.exitCode).toBe(0);
+      expect(ops.stderr).not.toContain('⚠ 대상 경로:');
+      expect(listChecklist(version).items.find((item) => item.id === 'OPS')).toMatchObject({ dispatchKind: 'ops' });
+      expect(listChecklist(version).items.find((item) => item.id === 'OPS')?.kind).toBeUndefined();
+      const bad = cli(root, 'add', 'BAD', 'bad', '--kind', 'bogus', '--version', version);
+      expect(bad.exitCode).not.toBe(0);
+      expect(bad.stderr).toContain('잘못된 발사 종류');
+    } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+  }, 120_000);
   test('three green cells: only the screen without a parity line warns; status/list expose its id without blocking', () => {
     const root = mkdtempSync(join(tmpdir(), 'release-cli-parity-'));
     setElanousConfigDir(root);

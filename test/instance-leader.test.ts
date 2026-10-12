@@ -8,7 +8,7 @@ import { resolveInstance } from '../src/instance/resolve.js';
 import { registerLeaderCommands } from '../src/cli/leader-cli.js';
 
 describe('execution origin without leader authority', () => {
-  test('installed build operates and source checkout isolates even if cwd differs', () => {
+  test('installed build and source checkout both use the operating house by default', () => {
     const dir = realpathSync(mkdtempSync(join(tmpdir(), 'elanous-installed-')));
     try {
       const script = join(dir, 'versions/1.0.0/node_modules/elanous/bin/elanous.mjs');
@@ -25,7 +25,7 @@ describe('execution origin without leader authority', () => {
       expect(treeFromScriptPath(sourceScript)).toBe(checkout);
       expect(resolveSelfTree(sourceScript, dir)).toBe(checkout);
       expect(isInstalledCopyScript(sourceScript)).toBe(false);
-      expect(resolveInstance({ installedCopy: isInstalledCopyScript(sourceScript), treeTestRoot: join(checkout, '.elanous-test') }).kind).toBe('test');
+      expect(resolveInstance({ installedCopy: isInstalledCopyScript(sourceScript), treeTestRoot: join(checkout, '.elanous-test') }).kind).toBe('prod');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

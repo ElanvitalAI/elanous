@@ -1,5 +1,8 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { registerDoctorCommand } from '../cli/doctor-cli.js';
 import {
   HOST_DOCTOR_CHECKS,
@@ -9,9 +12,14 @@ import {
   normalizeArch,
   formatHostDoctorLines,
   runHostDoctor,
+  checkHostMembership,
   type HostDoctorExpected,
   type HostDoctorRemote,
 } from './host-doctor.js';
+import { loadMachineLedger, validateMachineLedger } from '../machines/machine-ledger.js';
+import type { ResourceView } from '../control-plane/ledger.js';
+import { debug } from '../debug/log.js';
+import type { UserConfig } from '../user-config.js';
 
 const PLATFORM_PROBES: Record<string, string> = {
   'uname -s': 'Linux',
@@ -51,6 +59,88 @@ const HEALTHY: Record<string, string> = {
 };
 
 const HQ: HostDoctorExpected = { installVersion: '0.2.25', imagePin: 'ghcr.io/elanous/elanous:0.2.25' };
+
+const intent = validateMachineLedger({
+  title: 'Fleet', policy: ['intent'], devices: [], rules: [], changes: [],
+  machines: [{ id: 'node-c', name: 'node-c', specs: 'M4', locationStatus: 'active', role: 'worker', duties: 'tasks',
+    fleet: { sshName: 'node-c', role: 'worker', platform: 'linux', podPool: 'pool-node-c:8', cap: 8 } }],
+});
+const liveMachine = (attrs: Record<string, unknown> = { role: 'worker' }): ResourceView => ({
+  id: 'machine:node-c', kind: 'machine', machine: 'node-c', name: 'node-c', owner: 'node-c', attrs,
+  observedAt: 1, ttlMs: 600_000, ageMs: 1, expired: false,
+});
+const parentHosts = [{ host: 'node-c', podPool: 'pool-node-c:8', approvalCapacity: 8 }];
+
+describe('fleet membership: live registry is source, YAML is intent', () => {
+  test('repository node-c intent exposes operating parent-host 8/8 as drift', () => {
+    const ledger = loadMachineLedger(join(import.meta.dir, '../..'));
+    const parentHosts = [{ host: 'node-c', podPool: 'k3d-elanous-pool:8', approvalCapacity: 8 }];
+    const checks = checkHostMembership('node-c', 'darwin', { intent: ledger, machines: null, parentHosts });
+    expect(checks.map(({ id, status }) => [id, status])).toEqual([
+      ['registry.member', 'unmeasured'], ['parentHost.member', 'fail'],
+    ]);
+    expect(checks[1]?.expected).toContain('pool-node-c@node-c:6');
+    const report = runHostDoctor({ host: 'node-c', remote: remoteFrom({ ...HEALTHY, 'uname -s': 'Darwin' }),
+      expected: HQ, membership: { intent: ledger, machines: null, parentHosts } });
+    expect(formatHostDoctorLines(report)).toContainEqual(expect.stringContaining('✗ parentHost.member'));
+  });
+
+  test('cap zero means intentionally disabled and rejects a configured parent entry', () => {
+    const disabled = validateMachineLedger({ ...intent,
+      machines: intent.machines.map((machine) => ({ ...machine, fleet: { ...machine.fleet!, cap: 0 } })) });
+    expect(checkHostMembership('node-c', 'linux', { intent: disabled, machines: [], parentHosts: [] })[1]?.status).toBe('pass');
+    expect(checkHostMembership('node-c', 'linux', { intent: disabled, machines: [], parentHosts })[1]?.status).toBe('fail');
+  });
+  test('live machine, matching role and configured parent pass and appear in doctor output', () => {
+    const membership = { intent, machines: [liveMachine()], parentHosts };
+    const checks = checkHostMembership('node-c', 'linux', membership);
+    expect(checks.map(({ id, status }) => [id, status])).toEqual([['registry.member', 'pass'], ['parentHost.member', 'pass']]);
+    const report = runHostDoctor({ host: 'node-c', remote: remoteFrom(HEALTHY), expected: HQ, membership });
+    expect(report.ok).toBe(true);
+    expect(formatHostDoctorLines(report)).toContainEqual(expect.stringContaining('✓ registry.member'));
+    expect(report.checks).toHaveLength(12);
+  });
+
+  test('missing, expired and role-mismatched machine are fail, not an empty successful registry', () => {
+    for (const machines of [[], [{ ...liveMachine(), expired: true }], [liveMachine({ role: 'hq' })]]) {
+      const [registry] = checkHostMembership('node-c', 'linux', { intent, machines, parentHosts });
+      expect(registry?.status).toBe('fail');
+    }
+    expect(checkHostMembership('node-c', 'linux', { intent, machines: [liveMachine()], parentHosts: [] })[1]?.status).toBe('fail');
+    expect(checkHostMembership('node-c', 'linux', { intent, machines: [liveMachine()], parentHosts: [{ ...parentHosts[0]!, podPool: 'wrong' }] })[1]?.status).toBe('fail');
+  });
+
+  test('Nexus machine identity uses machine field even when display name differs', () => {
+    const renamed = { ...liveMachine(), name: 'display-label' };
+    expect(checkHostMembership('node-c', 'linux', { intent, machines: [renamed], parentHosts })[0]?.status).toBe('pass');
+  });
+
+  test('unreachable registry and absent role are unmeasured; parent mismatch remains fail', () => {
+    const checks = checkHostMembership('node-c', 'linux', { intent, machines: null, parentHosts: [] });
+    expect(checks.map(({ status }) => status)).toEqual(['unmeasured', 'fail']);
+    expect(checkHostMembership('node-c', 'linux', { intent, machines: [liveMachine({})], parentHosts })[0]?.status).toBe('unmeasured');
+    expect(checkHostMembership('node-c', null, { intent, machines: [liveMachine()], parentHosts })[0]?.status).toBe('unmeasured');
+    expect(checkHostMembership('node-c', 'linux', { intent: null, machines: [], parentHosts })[0]?.status).toBe('unmeasured');
+    const errors = checkHostMembership('node-c', 'linux', {
+      intent, machines: null, machinesError: 'control HTTP 500', parentHosts: null, parentHostsError: 'config unreadable',
+    });
+    expect(errors[0]?.observed).toContain('control HTTP 500');
+    expect(errors[1]?.observed).toContain('config unreadable');
+    const noCheckout = checkHostMembership('node-c', 'linux', {
+      intent: null, intentError: 'ENOENT', machines: [], parentHosts,
+    });
+    expect(noCheckout[0]?.observed).toContain('repository checkout required');
+    expect(noCheckout[0]?.observed).toContain('ENOENT');
+    const events: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((category, event) => { if (category === 'fleet.doctor') events.push(event); });
+    try {
+      const report = runHostDoctor({ host: 'node-c', remote: remoteFrom(HEALTHY), expected: HQ,
+        membership: { intent, machines: [liveMachine({})], parentHosts } });
+      expect(formatHostDoctorLines(report)).toContain('⚠ registry.member unmeasured: machine attrs.role unavailable');
+      expect(events).toContain('membership-unmeasured');
+    } finally { log.mockRestore(); }
+  });
+});
 
 describe('host doctor platform detection', () => {
   test('darwin — uname -s Darwin', () => {
@@ -149,6 +239,7 @@ describe('host doctor setup-status shape', () => {
       setExitCode: () => {},
       hostDoctorRemote: remoteFrom(HEALTHY),
       hostDoctorExpected: HQ,
+      hostDoctorMembership: async () => ({ intent, machines: [liveMachine()], parentHosts }),
     });
     await program.parseAsync(['node', 'elanous', 'doctor', 'host', 'node-c', '--json']);
     const parsed = JSON.parse(outputs.join('\n')) as ReturnType<typeof runHostDoctor>;
@@ -156,7 +247,87 @@ describe('host doctor setup-status shape', () => {
     expect(parsed.missing).toEqual([]);
     expect(parsed.fixHref).toBeNull();
     expect(parsed.ok).toBe(true);
-    expect(parsed.checks.length).toBe(10);
+    expect(parsed.checks.length).toBe(12);
+  });
+
+  test('doctor host CLI includes injected Nexus and parent-host membership readings', async () => {
+    const outputs: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      out: { log: (line) => outputs.push(line) }, setExitCode: () => {},
+      hostDoctorRemote: remoteFrom(HEALTHY), hostDoctorExpected: HQ,
+      hostDoctorMembership: async () => ({ intent, machines: [liveMachine()], parentHosts }),
+    });
+    await program.parseAsync(['node', 'elanous', 'doctor', 'host', 'node-c', '--json']);
+    const report = JSON.parse(outputs.join('\n')) as ReturnType<typeof runHostDoctor>;
+    expect(report.checks.at(-2)?.id).toBe('registry.member');
+    expect(report.checks.at(-1)?.id).toBe('parentHost.member');
+    expect(report.ok).toBe(true);
+  });
+
+  test('doctor host assembles default membership sources when no membership stub is supplied', async () => {
+    const outputs: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      out: { log: (line) => outputs.push(line) }, setExitCode: () => {},
+      hostDoctorRemote: remoteFrom(HEALTHY), hostDoctorExpected: HQ,
+      userConfig: { taskAgent: { parentHost: parentHosts } } as UserConfig,
+      hostDoctorMachineResources: async () => [],
+    });
+    await program.parseAsync(['node', 'elanous', 'doctor', 'host', 'node-c', '--json']);
+    const report = JSON.parse(outputs.join('\n')) as ReturnType<typeof runHostDoctor>;
+    expect(report.checks.map((check) => check.id)).toContain('registry.member');
+    expect(report.checks.map((check) => check.id)).toContain('parentHost.member');
+    expect(report.checks.find((check) => check.id === 'parentHost.member')?.status).toBe('fail');
+    expect(report.checks.find((check) => check.id === 'parentHost.member')?.expected).toContain('pool-node-c@node-c:6');
+  });
+
+  test('doctor host reports missing checkout and parent config read errors as unmeasured causes', async () => {
+    const repositoryRoot = mkdtempSync(join(tmpdir(), 'host-doctor-no-ledger-'));
+    try {
+      const outputs: string[] = [];
+      const program = new Command();
+      registerDoctorCommand(program, {
+        repositoryRoot,
+        out: { log: (line) => outputs.push(line) }, setExitCode: () => {},
+        hostDoctorRemote: remoteFrom(HEALTHY), hostDoctorExpected: HQ,
+        getUserConfig: () => { throw new Error('config unreadable'); },
+        hostDoctorMachineResources: async () => { throw new Error('control HTTP 500'); },
+      });
+      await program.parseAsync(['node', 'elanous', 'doctor', 'host', 'node-c', '--json']);
+      const report = JSON.parse(outputs.join('\n')) as ReturnType<typeof runHostDoctor>;
+      expect(report.checks.find((check) => check.id === 'registry.member')?.observed).toContain('repository checkout required');
+      expect(report.checks.find((check) => check.id === 'parentHost.member')?.observed).toContain('repository checkout required');
+      const configuredOutputs: string[] = [];
+      const configuredProgram = new Command();
+      registerDoctorCommand(configuredProgram, {
+        repositoryRoot: join(import.meta.dir, '../..'),
+        out: { log: (line) => configuredOutputs.push(line) }, setExitCode: () => {},
+        hostDoctorRemote: remoteFrom(HEALTHY), hostDoctorExpected: HQ,
+        getUserConfig: () => { throw new Error('config unreadable'); },
+        hostDoctorMachineResources: async () => { throw new Error('control HTTP 500'); },
+      });
+      await configuredProgram.parseAsync(['node', 'elanous', 'doctor', 'host', 'node-c', '--json']);
+      const configuredReport = JSON.parse(configuredOutputs.join('\n')) as ReturnType<typeof runHostDoctor>;
+      expect(configuredReport.checks.find((check) => check.id === 'parentHost.member')?.observed).toContain('config unreadable');
+      expect(configuredReport.checks.find((check) => check.id === 'registry.member')?.observed).toContain('control HTTP 500');
+    } finally { rmSync(repositoryRoot, { recursive: true, force: true }); }
+  });
+
+  test('doctor host treats a null parentHost setting as unmeasured rather than crashing', async () => {
+    const outputs: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      repositoryRoot: join(import.meta.dir, '../..'),
+      out: { log: (line) => outputs.push(line) }, setExitCode: () => {},
+      hostDoctorRemote: remoteFrom(HEALTHY), hostDoctorExpected: HQ,
+      userConfig: { taskAgent: { parentHost: null } } as unknown as UserConfig,
+      hostDoctorMachineResources: async () => [],
+    });
+    await program.parseAsync(['node', 'elanous', 'doctor', 'host', 'node-c', '--json']);
+    const report = JSON.parse(outputs.join('\n')) as ReturnType<typeof runHostDoctor>;
+    expect(report.checks.find((check) => check.id === 'parentHost.member')?.status).toBe('unmeasured');
+    expect(report.checks.find((check) => check.id === 'parentHost.member')?.observed).toContain('taskAgent.parentHost is null');
   });
 });
 

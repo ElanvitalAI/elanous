@@ -56,30 +56,36 @@ afterEach(() => {
   process.exitCode = 0;
 });
 
-describe.concurrent('config get universe warning', () => {
-  test('tree-derived test warns once on stderr and preserves stdout value', async () => {
-    const env = { ...process.env };
+describe.concurrent('config get universe selection', () => {
+  test('source CLI reads the operating house by default and --test reads an isolated house', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'elanous-config-universe-'));
+    const home = join(root, 'home');
+    const testRoot = join(root, 'test');
+    const cli = new URL('../bin/elanous.mjs', import.meta.url).pathname;
+    const env: Record<string, string | undefined> = { ...process.env, HOME: home };
     delete env.ELANOUS_STATE_DIR;
     delete env.ELANOUS_CONFIG_DIR;
-    const child = Bun.spawn(['bun', 'bin/elanous.mjs', 'config', 'get', 'llm.provider'], {
-      cwd: process.cwd(), env, stdout: 'pipe', stderr: 'pipe',
-    });
-    const [stdout, stderr, code] = await Promise.all([
-      new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
-    ]);
-    expect(code).toBe(0);
-    expect(stderr.trim().split('\n')).toEqual(['⚠️ test 우주의 config를 읽습니다 — 운영 값은 --config-dir ~/.elanous']);
-    expect(stdout.trim()).toBeTruthy();
-
-    const explicit = Bun.spawn(['bun', 'bin/elanous.mjs', '--config-dir', join(process.cwd(), '.elanous-test'), 'config', 'get', 'llm.provider'], {
-      cwd: process.cwd(), env, stdout: 'pipe', stderr: 'pipe',
-    });
-    const [explicitStdout, explicitStderr, explicitCode] = await Promise.all([
-      new Response(explicit.stdout).text(), new Response(explicit.stderr).text(), explicit.exited,
-    ]);
-    expect(explicitCode).toBe(0);
-    expect(explicitStderr).toBe('');
-    expect(explicitStdout).toBe(stdout);
+    delete env.ELANOUS_TEST_STATE_DIR;
+    try {
+      mkdirSync(join(home, '.elanous'), { recursive: true });
+      mkdirSync(testRoot, { recursive: true });
+      await writeFile(join(home, '.elanous', 'config.json'), JSON.stringify({ llm: { provider: 'openai-codex' } }));
+      await writeFile(join(testRoot, 'config.json'), JSON.stringify({ llm: { provider: 'grok' } }));
+      for (const [args, expected] of [
+        [['config', 'get', 'llm.provider'], 'openai-codex'],
+        [[`--test=${testRoot}`, 'config', 'get', 'llm.provider'], 'grok'],
+      ] as const) {
+        const child = Bun.spawn(['bun', cli, ...args], { cwd: root, env, stdout: 'pipe', stderr: 'pipe' });
+        const [stdout, stderr, code] = await Promise.all([
+          new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+        ]);
+        expect(code).toBe(0);
+        expect(stderr).toBe('');
+        expect(stdout.trim()).toBe(expected);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test('--config-dir selects the requested config value rather than the default universe', async () => {

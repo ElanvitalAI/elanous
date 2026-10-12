@@ -515,14 +515,14 @@ describe('LLM 자격 사실 — 막지 않고 경고', () => {
   });
 });
 
-describe('TA-LIVE-LAND-2 — a ta-land run needs a local parent', () => {
+describe('TA-LAND-REMOTE-PARENT — a ta-land run may use a remote parent', () => {
   const runId = 'run-aaaa2222-3333-4444-5555-666677778888';
   const localSpawn = (counter: { n: number }): DetachedSpawn => () => {
     counter.n++;
     return { pid: 1, once(event: string, listener: () => void) { if (event === 'spawn') queueMicrotask(listener); return this; }, removeListener() { return this; }, unref() {} } as unknown as ReturnType<DetachedSpawn>;
   };
 
-  test('ELANOUS_TA_LAND=1 → no ssh at all · one local spawn · fallback gap ta-land-needs-local-parent', async () => {
+  test('ELANOUS_TA_LAND=1 → remote ssh with marker and --no-auto-merge · no local spawn', async () => {
     const { debug } = await import('../debug/log.js');
     const { spyOn } = await import('bun:test');
     const logged: Array<Record<string, unknown>> = [];
@@ -536,12 +536,17 @@ describe('TA-LIVE-LAND-2 — a ta-land run needs a local parent', () => {
       const context = { runId, launchId: 'tl-y', env: { ELANOUS_RUN_ID: runId, ELANOUS_TA_LAND: '1' } };
       const receipt = await defaultTaskLauncher(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'g'], undefined, context,
         { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn: localSpawn(counter), earlyExitWindowMs: 0, notice: (line) => notices.push(line) });
-      expect(ssh.calls).toEqual([]);
-      expect(counter.n).toBe(1);
-      expect(receipt).toEqual({ runId });
-      expect(logged).toEqual([expect.objectContaining({ host: 'node-b', runId, gaps: ['ta-land-needs-local-parent'] })]);
+      const launches = ssh.calls.filter((call) => call.includes('nohup'));
+      expect(launches).toHaveLength(1);
+      const launch = launches[0]!;
+      expect(launch).toContain('ELANOUS_TA_LAND=1');
+      expect(launch).toContain('--no-auto-merge');
+      expect(launch).not.toContain('--merge-by-host');
+      expect(counter.n).toBe(0);
+      expect(receipt).toMatchObject({ runId, parentHost: { host: 'node-b', pid: 4242 } });
+      expect(logged).toEqual([]);
       expect(notices).toHaveLength(1);
-      expect(notices[0]).toContain('ta-land-needs-local-parent');
+      expect(notices[0]).toContain('자격:');
     } finally { spy.mockRestore(); }
   });
 

@@ -1,6 +1,6 @@
 /** Changed-file tsc gate with a visible ratchet for pre-existing test-only debt. */
 import { execFileSync, execSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import ts from 'typescript';
@@ -13,6 +13,7 @@ import {
   type TypecheckError,
 } from '../src/typecheck-ratchet.js';
 import { debug } from '../src/debug/log.js';
+import { reverseImportAffectedRoots, type AffectedRoots } from '../src/self-implement/pwa-import-graph.js';
 import {
   ROOT_PLACEHOLDER,
   baselineCacheEnabled,
@@ -876,6 +877,10 @@ export type GateIo = {
   cwd?: string;
   /** Explicit base revision. Same rule as TSC_BASE_REF, without reading the process environment. */
   baseRef?: string;
+  /** Source of TSC_GATE_ROOTS / ELANOUS_TSC_AFFECTED_ROOTS. Defaults to process.env. */
+  env?: NodeJS.ProcessEnv;
+  /** Changed gate sources → themselves plus their direct importers. Defaults to the repository import-graph reader. */
+  affectedRoots?: (cwd: string, changed: ReadonlySet<string>) => AffectedRoots;
   log: (message: string) => void;
   warn: (message: string) => void;
   error: (message: string) => void;
@@ -943,6 +948,47 @@ function inspectTscResult(tsc: TscRun, changed: ReadonlySet<string>, baseline: R
   error('\n건드린 src/scripts 파일과 baseline 밖 test 파일은 tsc 클린이어야 합니다(touch-clean).');
   return false;
 }
+
+/** Above this many roots a narrowed program stops being much smaller than the whole one. */
+export const TSC_GATE_ROOT_LIMIT = 400;
+/** Files tsconfig.gate.json compiles as roots (its `include`); other changed .ts files are never part of that program. */
+const GATE_ROOT_SOURCE = /^(?:src|scripts|test)\/.*\.ts$/;
+
+export type RootPlan =
+  | { mode: 'affected'; roots: string[]; changedCount: number }
+  | { mode: 'full'; fallbackReason: string; roots?: number };
+
+/** Narrow the root-config check to changed files ∪ direct importers, or say why the whole program must run. */
+export function planRootCheck(input: {
+  wholeRepository: boolean;
+  rootChanged: ReadonlySet<string>;
+  env: NodeJS.ProcessEnv;
+  cwd: string;
+  affectedRoots: (cwd: string, changed: ReadonlySet<string>) => AffectedRoots;
+}): RootPlan {
+  if (input.wholeRepository) return { mode: 'full', fallbackReason: '승격(저장소 전체 검사)' };
+  if (input.env.ELANOUS_TSC_AFFECTED_ROOTS === '0') return { mode: 'full', fallbackReason: 'ELANOUS_TSC_AFFECTED_ROOTS=0' };
+  if (input.env.TSC_GATE_ROOTS === 'full') return { mode: 'full', fallbackReason: 'TSC_GATE_ROOTS=full' };
+  const gateChanged = new Set([...input.rootChanged].filter((file) => GATE_ROOT_SOURCE.test(file)));
+  if (gateChanged.size === 0) return { mode: 'full', fallbackReason: 'tsconfig.gate.json 루트에 드는 변경 파일 없음' };
+  let computed: AffectedRoots;
+  try { computed = input.affectedRoots(input.cwd, gateChanged); }
+  catch (cause) { return { mode: 'full', fallbackReason: `루트 계산 실패: ${cause instanceof Error ? cause.message : String(cause)}` }; }
+  if (computed.failure !== undefined) return { mode: 'full', fallbackReason: `루트 계산 실패: ${computed.failure}` };
+  if (!computed.roots || [...gateChanged].some((file) => !computed.roots?.has(file))) {
+    return { mode: 'full', fallbackReason: '루트 계산 실패: 변경 파일 누락' };
+  }
+  const roots = [...computed.roots].filter((file) => GATE_ROOT_SOURCE.test(file)).sort();
+  if (roots.length > TSC_GATE_ROOT_LIMIT) return { mode: 'full', fallbackReason: `루트 ${roots.length}개 > 상한 ${TSC_GATE_ROOT_LIMIT}`, roots: roots.length };
+  return { mode: 'affected', roots, changedCount: gateChanged.size };
+}
+/**
+ * K-OP-039 · 노하우를 «도구 출력»에 싣는 첫 조각(대표 2026-10-12 «어떤 에이전트가 와도 같은 수준»).
+ * 승격된 전체 판정은 `apps/pwa/node_modules` 가 없으면 «가짜» PWA 타입 에러만 낸다 —
+ * 10-12 하루 TC·UX 두 자리가 같은 가짜 TS2322(ChatMessage.tsx)로 코드를 고치려 했다.
+ * 카드(내부 문서 `KNOWHOW` K-OP-039)의 처방 문면을 그대로 도구 출력에 싣는다.
+ */
+const PWA_DEPS_MISSING_HINT = '환경: apps/pwa 의존성 없음 — (cd apps/pwa && bun install --frozen-lockfile) 뒤 재실행 · 코드 결함 아님(K-OP-039)';
 
 export function runGate(io: Partial<GateIo> = {}): void {
   const cwd = io.cwd ?? process.cwd();
@@ -1053,6 +1099,14 @@ export function runGate(io: Partial<GateIo> = {}): void {
   }, { level: 'info' });
   log(`[tsc-gate] root 설정 범위 ${rootScope.size}개 관측 (apps/pwa/** 제외).`);
   if (runsPwa) log(`[tsc-gate] PWA 설정 범위 ${pwaScope.size}개 관측.`);
+  // ⛔ K-OP-039: 승격된 전체 판정은 apps/pwa 의존성 없이는 «가짜» PWA 타입 에러만 낸다(환경 문제 · 코드 결함 아님).
+  //    그 오류를 내기 «전에» 이 한 줄로 멈춘다(환경 줄이 곧 마지막 줄 = 판정) — 의존성이 있으면 아래
+  //    판정 규칙·출력 형식은 기존 그대로다. «못 쟀다 ≠ 통과» — PWA 미측정을 통과로 접지 않는다.
+  if (wholeRepository && !existsSync(join(cwd, 'apps/pwa/node_modules'))) {
+    error(`[tsc-gate] ${PWA_DEPS_MISSING_HINT}`);
+    exit(1);
+    return;
+  }
   const tscBin = existsSync(join(cwd, 'node_modules/.bin/tsc')) ? 'node_modules/.bin/tsc' : 'npx tsc';
   const baseline = readTestTypecheckBaseline(cwd);
   const rootCommand = `${tscBin} --noEmit -p ${TYPECHECK_GATE_CONFIG}`;
@@ -1061,7 +1115,32 @@ export function runGate(io: Partial<GateIo> = {}): void {
   const rootPromotionBaseline = wholeRepository ? readBaselineDiagnostics(base, rootCommand) : undefined;
   const pwaPromotionBaseline = wholeRepository && runsPwa ? readBaselineDiagnostics(base, pwaCommand) : undefined;
   const pwaEnvPromotionBaseline = wholeRepository && runsPwaEnv ? readBaselineDiagnostics(base, pwaEnvCommand) : undefined;
-  const rootTsc = runTscCmd(rootCommand);
+  let rootPlan = planRootCheck({ wholeRepository, rootChanged, env: io.env ?? process.env, cwd, affectedRoots: io.affectedRoots ?? reverseImportAffectedRoots });
+  let rootsConfig: string | undefined;
+  if (rootPlan.mode === 'affected') {
+    rootsConfig = `tsconfig.gate-roots.${process.pid}.${Date.now()}.json`;
+    try {
+      // `include` is replaced (not merged) so only the listed roots plus ambient declarations enter the program.
+      writeFileSync(join(cwd, rootsConfig), JSON.stringify({ extends: `./${TYPECHECK_GATE_CONFIG}`, include: ['src/**/*.d.ts', 'scripts/**/*.d.ts', 'test/**/*.d.ts'], files: rootPlan.roots }, null, 2), { flag: 'wx' });
+    } catch (cause) {
+      if (rootsConfig && (cause as NodeJS.ErrnoException).code !== 'EEXIST') {
+        try { rmSync(join(cwd, rootsConfig), { force: true }); }
+        catch { /* The full-program fallback still runs if cleanup is unavailable. */ }
+      }
+      rootsConfig = undefined;
+      rootPlan = { mode: 'full', fallbackReason: `임시 tsconfig 쓰기 실패: ${cause instanceof Error ? cause.message : String(cause)}`, roots: rootPlan.roots.length };
+    }
+  }
+  if (rootPlan.mode === 'affected') {
+    log(`[tsc-gate] 영향 루트 ${rootPlan.roots.length}개 (변경 ${rootPlan.changedCount} + importer·전역 선언 ${rootPlan.roots.length - rootPlan.changedCount}) — 임시 tsconfig 로 root 검사.`);
+    debug.log('typecheck.gate', 'roots', { mode: 'affected', roots: rootPlan.roots.length, fallbackReason: null }, { level: 'info' });
+  } else {
+    log(`[tsc-gate] 영향 루트 ${rootPlan.roots ?? '?'}개(전체로 폴백: ${rootPlan.fallbackReason})`);
+    debug.log('typecheck.gate', 'roots', { mode: 'full', roots: rootPlan.roots ?? null, fallbackReason: rootPlan.fallbackReason }, { level: 'info' });
+  }
+  let rootTsc: TscRun;
+  try { rootTsc = runTscCmd(rootsConfig ? `${tscBin} --noEmit -p ${rootsConfig}` : rootCommand); }
+  finally { if (rootsConfig) rmSync(join(cwd, rootsConfig), { force: true }); }
   let unmeasured = !rootTsc.ran;
   let passed = inspectTscResult(rootTsc, rootScope, baseline, error, warn, wholeRepository, ['apps/pwa/'], [], rootPromotionBaseline);
   if (runsPwa) {

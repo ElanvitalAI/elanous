@@ -4,11 +4,63 @@ import { chmod, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { openSurfaceEventsDb } from '../src/domains/surface-events.js';
 import { DecisionLedger } from '../src/decisions/decision-ledger.js';
 import { listCoordEvents, parseCoordHeader } from '../src/context-bus/coord-events.js';
+import { MsgStore } from '../src/msg/msg-store.js';
+import { runBridge } from './coord-msg-bridge.js';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 
 const script = resolve(import.meta.dir, 'coord-post.sh');
+
+test('successful channel post mirrors each recipient; S1 bridge recovers a partial msg failure', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'coord-msg-dual-'));
+  const file = join(dir, 'body.md');
+  const bin = join(dir, 'bin');
+  await mkdir(bin);
+  await writeFile(file, '**[MK]** {{TS}} → OP · TC · 보고 · MSG\n본문\n🙋 UX\n');
+  await writeFile(join(bin, 'bun'), `#!/bin/sh\ncase "$*" in\n  *"gh pr comment"*)\n    while [ "$#" -gt 1 ]; do\n      if [ "$1" = "--body-file" ]; then cp "$2" "$CAPTURE"; break; fi\n      shift\n    done\n    echo 'https://github.com/o/r/issues/1#issuecomment-65001'; exit "\${GH_RC:-0}" ;;\n  *"msg post"*"--to TC"*) if [ "\${FAIL_TC:-0}" = 1 ]; then exit 2; fi ;;\nesac\nexec '${process.execPath}' "$@"\n`);
+  await chmod(join(bin, 'bun'), 0o755);
+  const env = { ...process.env, CH_PR: '99999999', COORD_ID: 'MK', ELANOUS_STATE_DIR: dir,
+    ELANOUS_CONFIG_DIR: join(dir, 'config'), CAPTURE: join(dir, 'sent-body.md'), PATH: `${bin}:${process.env.PATH ?? ''}` };
+  // Call the real script from outside the repository, with a caller-relative body path.
+  const send = (overrides: Record<string, string> = {}) => spawnSync('bash', [script, 'body.md'], {
+    cwd: dir, encoding: 'utf8', env: { ...env, ...overrides },
+  });
+  expect(send({ GH_RC: '1' }).status).toBe(1);
+  expect(existsSync(join(dir, 'msg', 'messages.db'))).toBe(false);
+  const partial = send({ FAIL_TC: '1' });
+  expect(partial.status, partial.stderr).toBe(0);
+  expect(partial.stderr).toContain('msg 원장 기록 실패: TC');
+  const sentBody = await readFile(join(dir, 'sent-body.md'), 'utf8');
+  // Re-running coord-post would create a new GitHub comment ID. Recovery reads the original
+  // comment through S1 and inserts only TC with that comment's existing provenance key.
+  const before = new MsgStore(join(dir, 'msg', 'messages.db'));
+  try {
+    expect(before.list('TC')).toEqual([]);
+    expect(before.list('OP')[0]!.body).toBe(sentBody);
+    expect(before.list('UX')[0]!.body).toBe(sentBody);
+  } finally { before.close(); }
+  const oldState = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = dir;
+  try {
+    expect(runBridge(['--seat', 'TC', '--channel', '26146'], () => [{
+      id: 65001, body: sentBody, created_at: '2026-10-12T10:00:00Z',
+      html_url: 'https://github.com/o/r/issues/1#issuecomment-65001',
+    }])).toMatchObject({ picked: 1, added: 1 });
+  } finally {
+    if (oldState === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = oldState;
+  }
+  const store = new MsgStore(join(dir, 'msg', 'messages.db'));
+  try {
+    for (const to of ['OP', 'TC', 'UX']) {
+      expect(store.list(to)).toHaveLength(1);
+      expect(store.list(to)[0]).toMatchObject({ from: 'MK', to, kind: 'coord', body: sentBody });
+    }
+    expect(store.list('MK')).toEqual([]);
+    expect(store.db.query('SELECT COUNT(*) AS count FROM msg_messages').get()).toEqual({ count: 3 });
+  } finally { store.close(); }
+}, 60_000);
 
 test('successful send records one event with the comment URL; failure and dry-run record none', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'coord-ledger-'));
@@ -239,7 +291,9 @@ describe('coord-post.sh — 봉투 v2 경고는 발신을 막지 않는다', () 
     expect(misplaced.stderr).toContain('글 종류(요청·결정·사고·보고·정정)가 없다');
     const two = await send('**[MK]** {{TS}} → TC · UX · 요청 · K6 · 기한 12:40');
     expect(two.status).toBe(0);
-    expect(two.stderr).not.toContain('⚠️');
+    expect(two.stderr).not.toContain('⚠️ 첫 줄');
+    expect(two.stderr).not.toContain('⚠️ 받는 이');
+    expect(two.stderr).toContain('⚠️ 채널 댓글 ID를 못 읽어 msg 반영을 건너뛴다');
   }, 60_000);
 
   test('요청의 칸 누락과 빈 기한은 경고하지만 발신한다', async () => {

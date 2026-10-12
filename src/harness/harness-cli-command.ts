@@ -25,6 +25,8 @@ import { classifyPodExitStop, recordRunStop, runStopRecorded, RUN_STOP_EVENT } f
 import { ensureOpenRouterChildModelLive, resolveChildLlmEffort, resolveImplementationChildModel } from '../self-dev/dev-cli.js';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
 import { buildRunProgressRows, isPartialRunningRuns, queryRunningRuns, renderRunProgressTable } from '../self-implement/running-runs.js';
+import { launchBindingRunIds, readLaunchBinding } from './launch-registry.js';
+import { psProcessStartMs } from './harness-stop.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
 import { collectDraftMetrics, collectOverlapMetrics, DRAFT_SWEEP_CONCURRENCY, mapBounded, resolveDraftSweepCloseCap, runDraftSweep, sweepFailureReason, type DraftSweepAdapters, type DraftSweepResult, type OverlapMetricAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from '../self-dev/draft-sweep.js';
 import { readAskPreflightRowsSince, readSalvagedRowsSince } from '../self-dev/ask-launch-io.js';
@@ -2391,6 +2393,7 @@ const defaultDraftSweepStopRun: DraftSweepStopRun = async (runId) => {
 export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: DraftSweepGitExecute = runGitCommand, cwd = process.cwd(),
   executeAsync: (args: string[]) => Promise<string> = execute === executeGh ? executeGhAsync : async (args) => execute(args),
   stopRun: DraftSweepStopRun = defaultDraftSweepStopRun): GithubDraftSweepAdapters {
+  const ensuredSweepLabels = new Set<string>();
   const inventory = async (repository: string, state: 'open' | 'closed'): Promise<GithubPull[]> => {
     // ⛔ A large repository has tens of thousands of closed PRs (2026-09-28: 21k → «exceeded pagination limit», no sweep at all).
     //    Merged twins only matter after the oldest open draft was opened, so the closed listing stops at that time.
@@ -2642,11 +2645,19 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
         .map((line) => line.slice('branch refs/heads/'.length).trim()));
     },
     setLabels: async (repository, number, change) => {
+      if (change.add.startsWith('elanous:swept:')) {
+        const key = `${repository}:${change.add}`;
+        if (!ensuredSweepLabels.has(key)) {
+          execute(['label', 'create', change.add, '--repo', repository, '--color', '6A737D',
+            '--description', 'Draft sweep close reason; reopen this PR to restore it', '--force']);
+          ensuredSweepLabels.add(key);
+        }
+      }
       execute(['pr', 'edit', String(number), '--repo', repository, '--add-label', change.add,
         ...change.remove.flatMap((name) => ['--remove-label', name])]);
     },
-    closeDraft: async (repository, number, comment) => {
-      execute(['pr', 'close', String(number), '--repo', repository, '--comment', comment]);
+    closeDraft: async (repository, number) => {
+      execute(['pr', 'close', String(number), '--repo', repository]);
     },
     getClaimOwner: async (repository, number) => claimCommentOwner(repository, number, execute),
     getActiveClaimOwner: async (repository, number) => activeClaimOwnerFromBodies(await claimCommentsFor(repository, number)),
@@ -3137,7 +3148,13 @@ export interface HarnessCliCommandDeps {
   mission?: HarnessMissionHandler;
   missionLoop?: HarnessMissionLoopHandler;
   /** `harness progress` 가 도는 런 관측을 읽는 자리(시험 주입). 기본은 queryRunningRuns. */
-  progress?: { query?: typeof queryRunningRuns; nowMs?: () => number };
+  progress?: {
+    query?: typeof queryRunningRuns;
+    nowMs?: () => number;
+    bindingRunIds?: typeof launchBindingRunIds;
+    readBinding?: typeof readLaunchBinding;
+    processStartMs?: typeof psProcessStartMs;
+  };
 }
 
 export function installHarnessCliCommand(program: Command, deps: HarnessCliCommandDeps): Command {
@@ -3198,8 +3215,33 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
     });
   harnessCmd.command('progress').description('도는 골마다 진도를 한 표로 읽는다 — 단계 · 진입 시각 · 마지막 진전 · pty (읽기 전용)')
     .option('--json', '같은 행 배열을 JSON 으로 출력')
-    .action((opts: { json?: boolean }) => {
+    .option('--pid <number>', '기록된 로컬 PID 에 연결된 런 한 건만 조회')
+    .action((opts: { json?: boolean; pid?: string }) => {
       try {
+        if (opts.pid !== undefined) {
+          const pid = Number(opts.pid);
+          if (!Number.isSafeInteger(pid) || pid <= 1) {
+            console.error('❌ --pid 는 2 이상의 정수여야 합니다');
+            process.exitCode = 2;
+            return;
+          }
+          const bindings = (deps.progress?.bindingRunIds ?? launchBindingRunIds)()
+            .map((runId) => ({ runId, binding: (deps.progress?.readBinding ?? readLaunchBinding)(runId) }))
+            .filter(({ binding }) => binding?.pid === pid);
+          const binding = bindings.length === 1 && !bindings[0]!.binding?.podName ? bindings[0] : undefined;
+          const startedAt = binding ? (deps.progress?.processStartMs ?? psProcessStartMs)(pid) : null;
+          // ps lstart has second precision. A wider stop-oriented tolerance would attribute a reused PID to this run.
+          const observed = binding && startedAt !== null
+            && startedAt === Math.floor(binding.binding!.startedAt / 1_000) * 1_000;
+          const result = observed
+            ? (deps.progress?.query ?? queryRunningRuns)({ runIds: [binding.runId], caller: 'harness.progress.pid' })
+            : null;
+          const row = result ? buildRunProgressRows(result, (deps.progress?.nowMs ?? Date.now)())
+            .find((item) => item.runId === binding!.runId && item.status !== 'ended-unclosed' && item.status !== 'unknown') : undefined;
+          if (opts.json) console.log(JSON.stringify({ pid, observation: row ? 'observed' : 'unobserved', runId: row?.runId ?? null, progress: row ?? null }));
+          else console.log(row ? `pid ${pid} · ${renderRunProgressTable({ ...result!, entries: result!.entries.filter((item) => item.runId === row.runId) }, (deps.progress?.nowMs ?? Date.now)()).split('\n').slice(1).join('\n')}` : `pid ${pid} · 미관측`);
+          return;
+        }
         const result = (deps.progress?.query ?? queryRunningRuns)({ caller: 'harness.progress' });
         const nowMs = (deps.progress?.nowMs ?? Date.now)();
         if (opts.json) {

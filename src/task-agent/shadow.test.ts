@@ -7,7 +7,8 @@ import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { superviseRun, type SupervisorJobResult, type SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import { executeNextAction } from './actions.js';
-import { recordTaskAgentShadowMove, selectDeliveryCandidates, shadowJudgeInput } from './shadow.js';
+import { recordTaskAgentShadowMove, replayRemoteCardMoves, REMOTE_CARD_MOVE_PENDING, selectDeliveryCandidates, shadowJudgeInput } from './shadow.js';
+import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
 
 const job = (over: Partial<SupervisorJobResult> = {}): SupervisorJobResult =>
   ({ taskId: 't', feature: 'feature ask', status: 'done', ...over }) as SupervisorJobResult;
@@ -135,6 +136,115 @@ describe('TASK-AGENT-SHADOW — 멈춤 확정 → 판단부 → 실행부(shadow
     expect(missed).toHaveLength(1);
     expect(missed[0]!.data).toMatchObject({ runId: 'run-child', inheritedRunId: 'run-parent-2' });
     expect(String(missed[0]!.data.reason)).toContain('ELANOUS_RUN_ID run-parent-2: no card has this runId');
+  });
+
+  test('원격 Pod 카드 파일이 없어도 전달된 카드 id 로 미결 수를 런 원장에 보존하고 live 실행은 보류한다', async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), 'remote-card-child-')), 'task-agent-actions.json');
+    const queued: RunLedgerEntry[] = [];
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const out = await recordTaskAgentShadowMove({ runId: 'run-child-1', stopReason: 'needs-human', results: [job({ taskId: 'orchestrator-task', feature: 'authored goal', prNumber: 26761 })] }, {
+      statePath, env: { ELANOUS_POD_NAME: 'pod-a', ELANOUS_PARENT_RUN_ID: 'run-parent-1', ELANOUS_TASK_CARD_ID: 'ta-real-card' },
+      liveMoves: new Set(['review']), queueMove: (entry) => queued.push(entry),
+      log: (_c, event, data) => events.push({ event, data }),
+    });
+    expect(out.move).toBe('review');
+    expect(out.liveMove).toBeUndefined();
+    expect(events.find((event) => event.event === 'shadow-move')?.data).toMatchObject({ card: 'ta-real-card', cardBinding: 'pending', live: false });
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ runId: 'run-child-1', event: REMOTE_CARD_MOVE_PENDING,
+      data: { card: 'ta-real-card', parentRunId: 'run-parent-1', kind: 'review', pr: 26761, executorResult: 'shadow' } });
+  });
+
+  test('원격 Pod 의 카드 id 가 같아도 부모 runId 가 다른 현지 카드는 결선하지 않는다', async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), 'remote-card-wrong-')), 'task-agent-actions.json');
+    writeTaskCards(statePath, [{ id: 'ta-real-card', runId: 'run-other-parent', text: 'same goal', createdAt: '', status: 'launched', history: [] }]);
+    const queued: RunLedgerEntry[] = [];
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    await recordTaskAgentShadowMove({ runId: 'run-child-1', stopReason: 'needs-human', results: [job({ feature: 'same goal', prNumber: 26761 })] }, {
+      statePath, env: { ELANOUS_POD_NAME: 'pod-a', ELANOUS_PARENT_RUN_ID: 'run-parent-1', ELANOUS_TASK_CARD_ID: 'ta-real-card' },
+      liveMoves: new Set(['review']), queueMove: (entry) => queued.push(entry),
+      log: (_c, event, data) => events.push({ event, data }),
+    });
+    expect(events.find((entry) => entry.event === 'shadow-move')?.data).toMatchObject({ card: 'ta-real-card', cardBinding: 'pending', live: false });
+    expect(queued).toHaveLength(1);
+    expect(JSON.parse(await Bun.file(statePath).text()).tasks['ta-real-card'].history).toEqual([]);
+  });
+
+  test('원격 Pod 에 부모 runId 가 없으면 같은 id 의 현지 카드도 live 결선하지 않는다', async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), 'remote-card-no-parent-')), 'task-agent-actions.json');
+    writeTaskCards(statePath, [{ id: 'ta-real-card', runId: 'run-parent-1', text: 'same goal', createdAt: '', status: 'launched', history: [] }]);
+    const queued: RunLedgerEntry[] = [];
+    const out = await recordTaskAgentShadowMove({ runId: 'run-child-1', stopReason: 'needs-human', results: [job({ feature: 'same goal', prNumber: 26761 })] }, {
+      statePath, env: { ELANOUS_POD_NAME: 'pod-a', ELANOUS_TASK_CARD_ID: 'ta-real-card' },
+      liveMoves: new Set(['review']), queueMove: (entry) => queued.push(entry), log: () => {},
+    });
+    expect(out.liveMove).toBeUndefined();
+    expect(out.cardBinding).toBe('pending');
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.data).toMatchObject({ card: 'ta-real-card', parentRunId: null });
+    expect(JSON.parse(await Bun.file(statePath).text()).tasks['ta-real-card'].history).toEqual([]);
+  });
+
+  test('원격 카드 미결 수의 원장 기록 실패를 호출자에게 돌려준다', async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), 'remote-card-queue-failed-')), 'task-agent-actions.json');
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const out = await recordTaskAgentShadowMove({ runId: 'run-child-1', stopReason: 'needs-human', results: [job({ prNumber: 26761 })] }, {
+      statePath, env: { ELANOUS_POD_NAME: 'pod-a', ELANOUS_PARENT_RUN_ID: 'run-parent-1' },
+      liveMoves: new Set(['review']), queueMove: () => { throw new Error('ledger unavailable'); },
+      log: (_category, event, data) => events.push({ event, data }),
+    });
+    expect(out.cardBinding).toBe('queue-failed');
+    expect(out.liveMove).toBeUndefined();
+    expect(events.map(({ event }) => event)).toContain('card-binding-queue-failed');
+    expect(events.find(({ event }) => event === 'shadow-move')?.data.cardBinding).toBe('queue-failed');
+  });
+
+  test('카드 ID 없는 원격 Pod 는 현지 문장·taskId 카드를 추정하지 않고 HQ 역조회 대기열로 보낸다', async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), 'remote-card-no-id-')), 'task-agent-actions.json');
+    writeTaskCards(statePath, [{ id: 'ta-stale-local', runId: 'run-child-1', text: 'same goal', createdAt: '', status: 'launched', history: [] }]);
+    const queued: RunLedgerEntry[] = [];
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const input = { runId: 'run-child-1', stopReason: 'needs-human' as const,
+      results: [job({ taskId: 'ta-stale-local', feature: 'same goal', prNumber: 26761 })] };
+    const remote = await recordTaskAgentShadowMove(input, {
+      statePath, env: { ELANOUS_POD_NAME: 'pod-a', ELANOUS_PARENT_RUN_ID: 'run-parent-1' },
+      liveMoves: new Set(['review']), queueMove: (entry) => queued.push(entry),
+      log: (_c, event, data) => events.push({ event, data }),
+    });
+    expect(remote.liveMove).toBeUndefined();
+    expect(events.find((entry) => entry.event === 'shadow-move')?.data).toMatchObject({ card: null, cardBinding: 'pending', live: false });
+    expect(queued[0]?.data).toMatchObject({ card: null, parentRunId: 'run-parent-1' });
+    expect(JSON.parse(await Bun.file(statePath).text()).tasks['ta-stale-local'].history).toEqual([]);
+    const local = await recordTaskAgentShadowMove(input, {
+      statePath: join(mkdtempSync(join(tmpdir(), 'local-card-no-id-')), 'task-agent-actions.json'), env: {},
+      liveMoves: new Set(['review']), log: () => {},
+    });
+    expect(local.liveMove).toMatchObject({ kind: 'review', executed: false, card: null, ok: false });
+  });
+
+  test('HQ 는 원격 자식 미결 수를 부모 runId 간선으로 회수하며 중복 조회·다른 카드 id 를 거부한다', async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), 'remote-card-hq-')), 'task-agent-actions.json');
+    const card: TaskCard = { id: 'ta-hq-card', runId: 'run-parent-1', parentHost: { host: 'wsl' },
+      text: 'handed sentence', createdAt: new Date().toISOString(), status: 'launched', history: [] };
+    writeTaskCards(statePath, [card]);
+    const parent: RunLedgerEntry[] = [{ runId: card.runId!, event: 'pod-child-run', data: { childRunId: 'run-child-1' } }];
+    const child: RunLedgerEntry[] = [
+      { timestamp: '2026-10-12T12:00:00.000Z', runId: 'run-child-1', event: REMOTE_CARD_MOVE_PENDING,
+        data: { id: '00000000-0000-4000-8000-000000000001', card: card.id, parentRunId: card.runId, kind: 'review', pr: 26761, detail: 'review needed' } },
+      { timestamp: '2026-10-12T12:01:00.000Z', runId: 'run-child-1', event: REMOTE_CARD_MOVE_PENDING,
+        data: { id: '00000000-0000-4000-8000-000000000002', card: 'ta-other-card', parentRunId: card.runId, kind: 'review', pr: 26762, detail: 'wrong card' } },
+      { timestamp: '2026-10-12T12:02:00.000Z', runId: 'run-child-1', event: REMOTE_CARD_MOVE_PENDING,
+        data: { id: '00000000-0000-4000-8000-000000000003', card: null, parentRunId: card.runId, kind: 'propose-land', pr: 26761, detail: 'runId fallback' } },
+    ];
+    const evidence = { loadLedger: (id: string) => id === card.runId ? parent : id === 'run-child-1' ? child : null,
+      podFinishes: () => [] };
+    expect(await replayRemoteCardMoves(card.id, statePath, evidence)).toBe(2);
+    expect(await replayRemoteCardMoves(card.id, statePath, evidence)).toBe(0);
+    const written = JSON.parse(await Bun.file(statePath).text()).tasks[card.id].history;
+    expect(written.map((entry: { sourceId?: string }) => entry.sourceId)).toEqual([
+      '00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000003',
+    ]);
+    expect(written[1]).toMatchObject({ event: 'live-move', kind: 'propose-land', executorResult: 'shadow', pr: 26761, runId: 'run-child-1' });
   });
 
   test('live caller delivers verified report with no PR', async () => {
@@ -309,5 +419,45 @@ describe('종결 종류를 판단부 입력·shadow-move 관측에 싣는다 (RF
     expect(out.move).toBe('wait');
     expect(out.reason).toBe('완주했으나 PR 병합 근거 대기 · 종결 종류 미확인(카드 조회 실패)');
     expect(logged.at(-1)).toMatchObject({ completion: 'unmeasured' });
+  });
+
+  test('decision-card live 배선은 실제 실패 근거를 받은 카드에 한 번 올린다', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'shadow-decision-live-')), 'task-agent-actions.json');
+    const card: TaskCard = { id: 'ta-decision', text: 'feature ask', createdAt: '', status: 'launched', runId: 'run-decision', history: [] };
+    writeTaskCards(path, [card]);
+    const raised: string[][] = [];
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const out = await recordTaskAgentShadowMove({ runId: 'run-decision', stopReason: 'max-rounds', results: [job({
+      status: 'failed', error: { code: 'implement-abort', message: 'child stopped after budget' }, reviewMustFix: ['missing contract'],
+    })] }, {
+      statePath: path, liveMoves: new Set(['decision-card']),
+      live: { statePath: path, raiseDecision: async (args) => { raised.push(args); return { status: 0, stdout: '' }; } },
+      log: (_category, event, data) => { events.push({ event, data }); },
+    });
+    expect(out.move).toBe('decision-card');
+    expect(out.liveMove).toMatchObject({ kind: 'decision-card', card: 'ta-decision', executed: true, ok: true });
+    expect(raised).toHaveLength(1);
+    expect(raised[0]!.join(' ')).toContain('child stopped after budget');
+    expect(raised[0]!.join(' ')).toContain('missing contract');
+    expect(events.find((entry) => entry.event === 'shadow-move')?.data).toMatchObject({ card: 'ta-decision', live: true, liveExecuted: true });
+  });
+
+  test('decision-card는 근거가 없으면 발신하지 않고 설정에 없으면 그림자 관측을 유지한다', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'shadow-decision-empty-')), 'task-agent-actions.json');
+    writeTaskCards(path, [{ id: 'ta-decision-empty', text: 'feature ask', createdAt: '', status: 'launched', runId: 'run-empty', history: [] }]);
+    const raised: string[][] = [];
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const input = { runId: 'run-empty', stopReason: 'max-rounds' as const, results: [job()] };
+    const deps = { statePath: path, live: { statePath: path, raiseDecision: async (args: string[]) => { raised.push(args); return { status: 0, stdout: '' }; } },
+      log: (_category: string, event: string, data: Record<string, unknown>) => { events.push({ event, data }); } };
+    const noEvidence = await recordTaskAgentShadowMove(input, { ...deps, liveMoves: new Set(['decision-card']) });
+    expect(noEvidence.liveMove).toMatchObject({ kind: 'decision-card', executed: false, ok: false });
+    expect(raised).toHaveLength(0);
+    events.length = 0;
+    const shadow = await recordTaskAgentShadowMove(input, { ...deps, liveMoves: new Set() });
+    expect(shadow.move).toBe('decision-card');
+    expect(shadow.liveMove).toBeUndefined();
+    expect(events.find((entry) => entry.event === 'shadow-move')?.data).toMatchObject({ live: false, liveExecuted: false });
+    expect(raised).toHaveLength(0);
   });
 });

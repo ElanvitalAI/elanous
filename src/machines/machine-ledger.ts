@@ -10,6 +10,16 @@ export interface MachineRow {
   locationStatus: string;
   role: string;
   duties: string;
+  /** Fleet intent only. Live membership comes from Nexus machine resources. */
+  fleet?: MachineFleetIntent;
+}
+
+export interface MachineFleetIntent {
+  sshName: string;
+  role: 'worker' | 'hq';
+  platform: 'darwin' | 'linux' | 'wsl';
+  podPool: string;
+  cap: number;
 }
 
 export interface DeviceRow {
@@ -59,18 +69,36 @@ export function validateMachineLedger(value: unknown): MachineLedger {
   keys(data, ['title', 'policy', 'machines', 'devices', 'rules', 'changes'], 'ledger');
   if (!Array.isArray(data.machines) || !Array.isArray(data.devices)) throw new Error('invalid machines or devices');
   const ids = new Set<string>();
-  const rows = <T extends { id: string }>(entries: unknown[], fields: string[], label: string): T[] => entries.map((entry, index) => {
+  const rows = <T extends { id: string }>(entries: unknown[], fields: string[], label: string, extraFields: string[] = []): T[] => entries.map((entry, index) => {
     const row = record(entry, `${label}[${index}]`);
-    keys(row, fields, label);
+    keys(row, [...fields, ...extraFields], label);
     const result = Object.fromEntries(fields.map((field) => [field, text(row[field], `${label}.${field}`)])) as T;
     if (!idPattern.test(result.id) || ids.has(result.id)) throw new Error(`empty, duplicate or invalid id: ${result.id}`);
     ids.add(result.id);
     return result;
   });
+  const machines = rows<MachineRow>(data.machines, ['id', 'name', 'specs', 'locationStatus', 'role', 'duties'], 'machines', ['fleet']);
+  const sshNames = new Set<string>();
+  for (let index = 0; index < machines.length; index++) {
+    const raw = record(data.machines[index], `machines[${index}]`);
+    if (raw.fleet === undefined) continue;
+    const fleet = record(raw.fleet, `machines[${index}].fleet`);
+    keys(fleet, ['sshName', 'role', 'platform', 'podPool', 'cap'], 'fleet');
+    const sshName = text(fleet.sshName, 'fleet.sshName');
+    const role = text(fleet.role, 'fleet.role');
+    const platform = text(fleet.platform, 'fleet.platform');
+    const podPool = text(fleet.podPool, 'fleet.podPool');
+    if (!idPattern.test(sshName) || sshNames.has(sshName)) throw new Error(`duplicate or invalid fleet.sshName: ${sshName}`);
+    if (role !== 'worker' && role !== 'hq') throw new Error(`invalid fleet.role: ${role}`);
+    if (platform !== 'darwin' && platform !== 'linux' && platform !== 'wsl') throw new Error(`invalid fleet.platform: ${platform}`);
+    if (!Number.isSafeInteger(fleet.cap) || (fleet.cap as number) < 0) throw new Error('invalid fleet.cap');
+    sshNames.add(sshName);
+    machines[index]!.fleet = { sshName, role, platform, podPool, cap: fleet.cap as number };
+  }
   return {
     title: text(data.title, 'title'),
     policy: list(data.policy, 'policy'),
-    machines: rows<MachineRow>(data.machines, ['id', 'name', 'specs', 'locationStatus', 'role', 'duties'], 'machines'),
+    machines,
     devices: rows<DeviceRow>(data.devices, ['id', 'name', 'status', 'purpose'], 'devices'),
     rules: list(data.rules, 'rules'),
     changes: list(data.changes, 'changes'),

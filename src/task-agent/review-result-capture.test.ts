@@ -1,12 +1,14 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { debug } from '../debug/log.js';
 import type { DetachedSpawn } from '../cli/tasks-cli.js';
 import type { SupervisorJobResult } from '../self-dev/run-supervisor.js';
 import { LIVE_REVIEW_EFFECT_PENDING } from './live-move-history.js';
 import { defaultRequestReview, type TaskAgentLiveMove } from './live-moves.js';
-import { capturedSelfReview, captureReviewResults, parseReviewResultOutput, REVIEW_RESULT_MISSING_EFFECT, REVIEW_RESULT_UNREADABLE_EFFECT, reviewResultPath } from './review-result-capture.js';
+import { regateResultPath } from './rejudge-on-head.js';
+import { capturedSelfReview, captureReviewResults, parseReviewResultOutput, rejudgeCompletedTaskReview, REVIEW_RESULT_MISSING_EFFECT, REVIEW_RESULT_UNREADABLE_EFFECT, reviewResultPath, TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_RESULT_ENV, TA_REVIEW_COMPLETION_STATE_ENV } from './review-result-capture.js';
 import { recordTaskAgentShadowMove } from './shadow.js';
 import { nextMoveFor, readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
 
@@ -20,6 +22,7 @@ const reviewJson = (over: Record<string, unknown> = {}) => JSON.stringify({
 function fixture() {
   const statePath = join(mkdtempSync(join(tmpdir(), 'ta-review-result-')), 'task-agent-actions.json');
   const seed: TaskCard = { id: 'ta-rr-1', text: 'feature ask', checklistId: 'CELL-R', createdAt: '2026-10-10T00:00:00.000Z', status: 'launched',
+    pr: { number: 21, url: 'https://github.com/o/r/pull/21' },
     history: [{ at: '2026-10-10T00:00:00.000Z', event: 'run-bound', detail: 'run-x', runId: 'run-x' }] };
   writeTaskCards(statePath, [seed]);
   const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
@@ -57,6 +60,209 @@ function fixture() {
 }
 
 describe('TA-REVIEW-RESULT-CAPTURE — 떼어 띄운 self review 결과를 파일로 받아 카드로 되돌린다', () => {
+  test('detached review completion harvests only its bound TA land card and rejudges once', async () => {
+    const f = fixture();
+    const resultPath = reviewResultPath(f.statePath, 'ta-rr-1', 21, HEAD);
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true, reviewRequests: [{ pr: 21, head: HEAD, at: '2026-10-10T12:00:00.000Z', resultPath }] }]);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, `${reviewJson()}\n`);
+    const env = { [TA_REVIEW_COMPLETION_CARD_ENV]: 'ta-rr-1', [TA_REVIEW_COMPLETION_STATE_ENV]: f.statePath, [TA_REVIEW_COMPLETION_RESULT_ENV]: resultPath };
+    const calls: string[] = [];
+    expect(await rejudgeCompletedTaskReview(env, async (id, statePath) => { calls.push(`${id}:${statePath}`); return [{ decision: 'would-land', pr: 21, toHead: HEAD }]; })).toBe(true);
+    expect(calls).toEqual([`ta-rr-1:${f.statePath}`]);
+    expect(f.lines('live-move-result')).toHaveLength(1);
+    expect(await rejudgeCompletedTaskReview(env, async () => { calls.push('duplicate'); })).toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(await rejudgeCompletedTaskReview({ ...env, [TA_REVIEW_COMPLETION_RESULT_ENV]: `${resultPath}.other` }, async () => { calls.push('wrong'); })).toBe(false);
+    expect(calls).toHaveLength(1);
+  });
+
+  test('review completion still rejudges once when another reader harvested the result first', async () => {
+    const f = fixture();
+    const resultPath = reviewResultPath(f.statePath, 'ta-rr-1', 21, HEAD);
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true, reviewRequests: [{ pr: 21, head: HEAD, at: '2026-10-10T12:00:00.000Z', resultPath }] }]);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, `${reviewJson()}\n`);
+    expect(captureReviewResults(f.statePath, { cardIds: ['ta-rr-1'] }).map((item) => item.status)).toEqual(['captured']);
+    const env = { [TA_REVIEW_COMPLETION_CARD_ENV]: 'ta-rr-1', [TA_REVIEW_COMPLETION_STATE_ENV]: f.statePath, [TA_REVIEW_COMPLETION_RESULT_ENV]: resultPath };
+    let calls = 0;
+    expect(await rejudgeCompletedTaskReview(env, async () => { calls++; return [{ decision: 'would-land', pr: 21, toHead: HEAD }]; })).toBe(true);
+    expect(await rejudgeCompletedTaskReview(env, async () => { calls++; })).toBe(false);
+    expect(calls).toBe(1);
+  });
+
+  test('review completion cannot mark old head after rejudge moved to a newer head', async () => {
+    const f = fixture();
+    const resultPath = reviewResultPath(f.statePath, 'ta-rr-1', 21, HEAD);
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true, reviewRequests: [{ pr: 21, head: HEAD, at: '2026-10-10T12:00:00.000Z', resultPath }] }]);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, reviewJson());
+    const env = { [TA_REVIEW_COMPLETION_CARD_ENV]: 'ta-rr-1', [TA_REVIEW_COMPLETION_STATE_ENV]: f.statePath, [TA_REVIEW_COMPLETION_RESULT_ENV]: resultPath };
+    let calls = 0;
+    await expect(rejudgeCompletedTaskReview(env, async () => {
+      calls++;
+      return [{ decision: 'would-regate', pr: 21, toHead: 'c'.repeat(40) }];
+    })).rejects.toThrow('head does not match');
+    expect(calls).toBe(2);
+    expect(f.card().history.some((item) => item.event === 'async-result-rejudge')).toBe(false);
+  });
+
+  test('bound review completion records land as a shadow decision with zero live calls', async () => {
+    const f = fixture();
+    const resultPath = reviewResultPath(f.statePath, 'ta-rr-1', 21, HEAD);
+    const regatePath = regateResultPath(f.statePath, 'ta-rr-1', 21, HEAD);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    mkdirSync(dirname(regatePath), { recursive: true });
+    writeFileSync(resultPath, reviewJson());
+    writeFileSync(regatePath, JSON.stringify({ pr: 21, head: HEAD, passed: true, status: 'passed', baseCommit: 'c'.repeat(40), failures: [] }));
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+      reviewRequests: [{ pr: 21, head: HEAD, at: '2026-10-10T12:00:00.000Z', resultPath }],
+      regates: [{ pr: 21, head: HEAD, at: '2026-10-10T12:01:00.000Z', resultPath: regatePath }] }]);
+    const env = { [TA_REVIEW_COMPLETION_CARD_ENV]: 'ta-rr-1', [TA_REVIEW_COMPLETION_STATE_ENV]: f.statePath, [TA_REVIEW_COMPLETION_RESULT_ENV]: resultPath };
+    const live: string[] = [];
+    const shadow: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+      if (event === 'rejudge-shadow' && data && typeof data === 'object') shadow.push(data as Record<string, unknown>);
+    });
+    try {
+      expect(await rejudgeCompletedTaskReview(env, undefined, { liveMoves: new Set(['review', 'propose-land']), live: {
+        statePath: f.statePath, repoCandidates: () => [{ source: 'host', cwd: dirname(f.statePath) }],
+        prHead: async () => ({ head: HEAD, state: 'OPEN', branch: 'feature', url: 'https://github.com/o/r/pull/21' }),
+        requestReview: async () => { live.push('review'); },
+        land: async () => { live.push('land'); return { status: 0, stdout: 'merged' }; },
+      }, requestRegate: async () => { live.push('regate'); } })).toBe(true);
+      expect(shadow).toMatchObject([{ card: 'ta-rr-1', head12: HEAD.slice(0, 12), decision: 'land' }]);
+      expect(live).toEqual([]);
+      expect(f.card().landAttempts).toBeUndefined();
+    } finally { log.mockRestore(); }
+  });
+
+  test('review completion does not mark success after the card is rebound during rejudge', async () => {
+    const f = fixture();
+    const resultPath = reviewResultPath(f.statePath, 'ta-rr-1', 21, HEAD);
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+      reviewRequests: [{ pr: 21, head: HEAD, at: '2026-10-10T12:00:00.000Z', resultPath }] }]);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, reviewJson());
+    const env = { [TA_REVIEW_COMPLETION_CARD_ENV]: 'ta-rr-1', [TA_REVIEW_COMPLETION_STATE_ENV]: f.statePath, [TA_REVIEW_COMPLETION_RESULT_ENV]: resultPath };
+    expect(await rejudgeCompletedTaskReview(env, async () => {
+      writeTaskCards(f.statePath, [{ ...f.card(), pr: { number: 22, url: 'https://github.com/o/r/pull/22' } }]);
+      return [{ decision: 'would-land', pr: 21, toHead: HEAD }];
+    })).toBe(true);
+    expect(f.card().history.some((item) => item.event === 'async-result-rejudge')).toBe(false);
+  });
+
+  test('review completion releases its claim after a rejudge exception', async () => {
+    const f = fixture();
+    const resultPath = reviewResultPath(f.statePath, 'ta-rr-1', 21, HEAD);
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true, reviewRequests: [{ pr: 21, head: HEAD, at: '2026-10-10T12:00:00.000Z', resultPath }] }]);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, `${reviewJson()}\n`);
+    const env = { [TA_REVIEW_COMPLETION_CARD_ENV]: 'ta-rr-1', [TA_REVIEW_COMPLETION_STATE_ENV]: f.statePath, [TA_REVIEW_COMPLETION_RESULT_ENV]: resultPath };
+    let calls = 0;
+    expect(await rejudgeCompletedTaskReview(env, async () => {
+      expect(f.card().history.some((item) => item.event === 'async-result-rejudge')).toBe(false);
+      if (++calls === 1) throw new Error('transient');
+      return [{ decision: 'would-land', pr: 21, toHead: HEAD }];
+    })).toBe(true);
+    expect(calls).toBe(2);
+    expect(await rejudgeCompletedTaskReview(env, async () => { calls++; })).toBe(false);
+    expect(f.card().history.some((item) => item.event === 'async-result-rejudge' && item.effect === 'completion callback succeeded')).toBe(true);
+  });
+
+  test('missing or unreadable review result never records a completed rejudge', async () => {
+    for (const unreadable of [false, true]) {
+      const f = fixture();
+      const resultPath = reviewResultPath(f.statePath, 'ta-rr-1', 21, HEAD);
+      writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+        reviewRequests: [{ pr: 21, head: HEAD, at: '2026-10-10T12:00:00.000Z', resultPath }] }]);
+      if (unreadable) { mkdirSync(dirname(resultPath), { recursive: true }); mkdirSync(resultPath); }
+      const env = { [TA_REVIEW_COMPLETION_CARD_ENV]: 'ta-rr-1', [TA_REVIEW_COMPLETION_STATE_ENV]: f.statePath, [TA_REVIEW_COMPLETION_RESULT_ENV]: resultPath };
+      let calls = 0;
+      expect(await rejudgeCompletedTaskReview(env, async () => { calls++; })).toBe(false);
+      expect(calls).toBe(0);
+      expect(f.card().history.some((item) => item.event === 'async-result-rejudge')).toBe(false);
+    }
+  });
+
+  test('review completion rejects a captured event with the wrong PR or malformed SHA', async () => {
+    for (const event of [{ pr: 22, head: HEAD }, { pr: 21, head: 'bad-head' }]) {
+      const f = fixture();
+      const resultPath = reviewResultPath(f.statePath, 'ta-rr-1', 21, HEAD);
+      writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+        reviewRequests: [{ pr: 21, head: HEAD, at: '2026-10-10T12:00:00.000Z', resultPath }],
+        history: [...f.card().history, { at: '2026-10-10T12:01:00.000Z', event: 'live-move-result', kind: 'review', resultPath,
+          pr: event.pr, head: event.head, reviewed: true, effect: 'review result captured' }] }]);
+      const env = { [TA_REVIEW_COMPLETION_CARD_ENV]: 'ta-rr-1', [TA_REVIEW_COMPLETION_STATE_ENV]: f.statePath, [TA_REVIEW_COMPLETION_RESULT_ENV]: resultPath };
+      let calls = 0;
+      expect(await rejudgeCompletedTaskReview(env, async () => { calls++; })).toBe(false);
+      expect(calls).toBe(0);
+      expect(f.card().history.some((item) => item.event === 'async-result-rejudge')).toBe(false);
+    }
+  });
+
+  test('unbound review completion input does not harvest a different pending result', async () => {
+    const f = fixture();
+    const resultPath = reviewResultPath(f.statePath, 'ta-rr-1', 21, HEAD);
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+      reviewRequests: [{ pr: 21, head: HEAD, at: '2026-10-10T12:00:00.000Z', resultPath }] }]);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, reviewJson());
+    const env = { [TA_REVIEW_COMPLETION_CARD_ENV]: 'ta-rr-1', [TA_REVIEW_COMPLETION_STATE_ENV]: f.statePath,
+      [TA_REVIEW_COMPLETION_RESULT_ENV]: `${resultPath}.unbound` };
+    expect(await rejudgeCompletedTaskReview(env)).toBe(false);
+    expect(f.card().history.some((item) => item.event === 'live-move-result')).toBe(false);
+  });
+
+  test('review completion does not mark a returned failed rejudge as success', async () => {
+    const f = fixture();
+    const resultPath = reviewResultPath(f.statePath, 'ta-rr-1', 21, HEAD);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, reviewJson());
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+      reviewRequests: [{ pr: 21, head: HEAD, at: '2026-10-10T12:00:00.000Z', resultPath }] }]);
+    const env = { [TA_REVIEW_COMPLETION_CARD_ENV]: 'ta-rr-1', [TA_REVIEW_COMPLETION_STATE_ENV]: f.statePath, [TA_REVIEW_COMPLETION_RESULT_ENV]: resultPath };
+    let calls = 0;
+    await expect(rejudgeCompletedTaskReview(env, async () => { calls++; return [{ decision: 'land-rejected' }]; })).rejects.toThrow('land-rejected');
+    expect(calls).toBe(2);
+    await expect(rejudgeCompletedTaskReview(env, async () => { calls++; return [{ ok: false }]; })).rejects.toThrow('ok:false');
+    expect(calls).toBe(4);
+    expect(f.card().history.some((item) => item.event === 'async-result-rejudge')).toBe(false);
+  });
+
+  test('review completion does not mark an empty or missing rejudge decision as success', async () => {
+    for (const result of [undefined, []]) {
+      const f = fixture();
+      const resultPath = reviewResultPath(f.statePath, 'ta-rr-1', 21, HEAD);
+      mkdirSync(dirname(resultPath), { recursive: true });
+      writeFileSync(resultPath, reviewJson());
+      writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+        reviewRequests: [{ pr: 21, head: HEAD, at: '2026-10-10T12:00:00.000Z', resultPath }] }]);
+      const env = { [TA_REVIEW_COMPLETION_CARD_ENV]: 'ta-rr-1', [TA_REVIEW_COMPLETION_STATE_ENV]: f.statePath, [TA_REVIEW_COMPLETION_RESULT_ENV]: resultPath };
+      await expect(rejudgeCompletedTaskReview(env, async () => result)).rejects.toThrow('no decision');
+      expect(f.card().history.some((item) => item.event === 'async-result-rejudge')).toBe(false);
+    }
+  });
+
+  test('review completion rejects a result after the card PR was rebound', async () => {
+    const f = fixture();
+    const resultPath = reviewResultPath(f.statePath, 'ta-rr-1', 21, HEAD);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, reviewJson());
+    writeTaskCards(f.statePath, [{ ...f.card(), pr: { number: 22, url: 'https://github.com/o/r/pull/22' }, taLand: true,
+      reviewRequests: [{ pr: 21, head: HEAD, at: '2026-10-10T12:00:00.000Z', resultPath }] }]);
+    const env = { [TA_REVIEW_COMPLETION_CARD_ENV]: 'ta-rr-1', [TA_REVIEW_COMPLETION_STATE_ENV]: f.statePath, [TA_REVIEW_COMPLETION_RESULT_ENV]: resultPath };
+    const decisions: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+      if (event === 'rejudge-on-head' && data && typeof data === 'object' && 'decision' in data) decisions.push(String(data.decision));
+    });
+    try {
+      expect(await rejudgeCompletedTaskReview(env)).toBe(false);
+      expect(decisions).toEqual([]);
+      expect(f.card().history.some((item) => item.event === 'async-result-rejudge')).toBe(false);
+    } finally { log.mockRestore(); }
+  });
+
   test('parseReviewResultOutput — 섞인 stdout 에서 마지막 JSON 객체 줄 · 못 읽으면 null', () => {
     expect(parseReviewResultOutput(`  → [self-review] noise\n${reviewJson({ mustFix: ['a', 'b'], verdict: 'warn' })}\n`)).toEqual({
       pr: 21, verdict: 'warn', reviewed: true, mustFix: 2, reviewRoute: 'api', head: HEAD, error: null,

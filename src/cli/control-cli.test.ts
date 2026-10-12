@@ -1,5 +1,5 @@
 import { setDefaultTimeout, afterEach, expect, spyOn, test } from 'bun:test';
-import { runControlServe } from './control-cli.js';
+import { listMachineResources, runControlServe } from './control-cli.js';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -12,6 +12,24 @@ const roots: string[] = [];
 const children: Array<ReturnType<typeof Bun.spawn>> = [];
 const entry = resolve(import.meta.dir, '../../bin/elanous.mjs');
 const cwd = resolve(import.meta.dir, '../..');
+
+test('doctor machine query distinguishes a reachable empty registry from an unreadable registry', async () => {
+  const queryToken = 'a'.repeat(64);
+  const options = { primaryUrl: 'http://127.0.0.1:12345', queryToken };
+  const calls: URL[] = [];
+  const empty = await listMachineResources({ ...options, fetch: async (input, init) => {
+    calls.push(input as URL);
+    expect((init?.headers as Record<string, string>).authorization).toBe(`Bearer ${queryToken}`);
+    return Response.json({ resources: [] });
+  } });
+  expect(empty).toEqual([]);
+  expect(calls[0]?.searchParams.get('kind')).toBe('machine');
+  await expect(listMachineResources({ ...options, fetch: async () => { throw new Error('offline'); } })).rejects.toThrow('offline');
+  await expect(listMachineResources({ ...options, fetch: async () => Response.json({ resources: 'bad' }) })).rejects.toThrow('invalid machine resource response');
+  const isolated = root();
+  await expect(listMachineResources({ root: isolated })).rejects.toThrow('control query token unavailable');
+  expect(existsSync(join(isolated, 'control', 'tokens.json'))).toBe(false);
+});
 
 function root() {
   const dir = mkdtempSync(join(tmpdir(), 'elanous-control-cli-'));

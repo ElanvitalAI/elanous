@@ -52,6 +52,18 @@ const checklist = (f: ReturnType<typeof fixture>, version: string, items: unknow
 };
 const entries = (f: ReturnType<typeof fixture>) => f.deps.read!(seatLedgerPath('TC', f.root, now)).trim().split('\n').map((v) => JSON.parse(v));
 
+test('CELL-PATH-GATE: only code and legacy checklist cells reach the seat dispatcher', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.10', [
+      { id: 'LEGACY', title: 'legacy', status: 'yellow', owner: 'TC' },
+      { id: 'CODE', title: 'code', status: 'yellow', owner: 'TC', dispatchKind: 'code' },
+      ...(['ops', 'measure', 'decision', 'umbrella'] as const).map((dispatchKind) => ({ id: dispatchKind, title: dispatchKind, status: 'yellow', owner: 'TC', dispatchKind })),
+    ]);
+    expect((await gatherSeatInputs('TC', f.deps)).checklist.map((item) => item.id)).toEqual(['CODE', 'LEGACY']);
+  } finally { f.close(); }
+});
+
 const neighborConfig = (mode: 'shadow' | 'live-safe') => ({ mode, seats: ['MK'], neighbors: { MK: [
   { id: 'op-seat', exchange: ['status' as const], heartbeat: { everyMinutes: 10, missedTicks: 2 },
     onAbsent: { action: 'escalate' as const, delegateTo: 'orchestrator' } },

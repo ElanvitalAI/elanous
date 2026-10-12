@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
-import { addItem, cellsReferencingDoc, claimItem, checklistGate, checklistHistory, cutChecklistGate, devVersion, lintDocRefs, listChecklist, normalizeRefs, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
+import { addItem, cellsReferencingDoc, claimItem, checklistGate, checklistHistory, cutChecklistGate, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
 import * as features from './feature-store.js';
 
 const roots: string[] = [];
@@ -15,6 +15,38 @@ function root(): string { const dir = mkdtempSync(join(tmpdir(), 'release-checkl
 afterEach(() => { resetElanousConfigDir(); for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('release checklist ledger', () => {
+  test('CELL-PATH-GATE: shadow warning names missing origin/main paths and existing title/ref/merged PR candidates', () => {
+    const existing = new Set(['src/real.ts', 'src/ref.ts', 'src/merged.ts']);
+    const deps = { existsAtMain: (path: string) => existing.has(path), mergedPrFiles: (number: number) => number === 12345 ? ['src/merged.ts', 'src/gone.ts'] : [] };
+    const result = inspectChecklistTargetPaths({ title: '대상 경로: src/missing.ts · src/real.ts\n경계: src/ref.ts', evidence: '병합 #12345', refs: ['src/ref.ts#part'] }, deps);
+    expect(result.targets).toEqual(['src/missing.ts', 'src/real.ts']);
+    expect(result.warnings).toEqual(['src/missing.ts: origin/main에 없는 파일 · 신설: 둘째 줄 선언 필요']);
+    expect(result.candidates).toEqual(['src/real.ts', 'src/ref.ts', 'src/merged.ts']);
+    expect(inspectChecklistTargetPaths({ title: '작업 설명', refs: ['src/ref.ts'] }, deps).warnings).toEqual(['첫 줄 대상 경로가 없다']);
+    expect(inspectChecklistTargetPaths({ title: '대상 경로: src/missing.ts\n신설: src/missing.ts' }, deps).warnings).toEqual([]);
+    expect(inspectChecklistTargetPaths({ title: '대상 경로: src/missing.ts\n신설: 신규 모듈' }, deps).warnings).toEqual([]);
+    expect(inspectChecklistTargetPaths({ title: '대상 경로: src/missing.ts\n신설:' }, deps).warnings).toEqual([]);
+    expect(inspectChecklistTargetPaths({ title: '설명만 있음\n신설:' }, deps).warnings).toEqual(['첫 줄 대상 경로가 없다']);
+    expect(inspectChecklistTargetPaths({ title: '운영 판정', dispatchKind: 'ops' }, deps).warnings).toEqual([]);
+  });
+
+  test('CELL-PATH-GATE: dispatch kind persists apart from screen/postpub and leaves release gates unchanged', () => {
+    root();
+    addItem('9.9.9', { id: 'SCREEN', title: 'screen', kind: 'screen', dispatchKind: 'ops' });
+    addItem('9.9.9', { id: 'POST', title: 'postpub', kind: 'postpub', dispatchKind: 'measure', priority: 'P0' });
+    addItem('9.9.9', { id: 'CODE', title: 'code', dispatchKind: 'code' });
+    setItem('9.9.9', 'SCREEN', { status: 'green' }, 'MK');
+    setItem('9.9.9', 'CODE', { status: 'green' }, 'MK');
+    const rows = listChecklist('9.9.9').items;
+    expect(rows.find((item) => item.id === 'SCREEN')).toMatchObject({ kind: 'screen', dispatchKind: 'ops' });
+    expect(rows.find((item) => item.id === 'POST')).toMatchObject({ kind: 'postpub', dispatchKind: 'measure' });
+    expect(rows.find((item) => item.id === 'CODE')).toMatchObject({ dispatchKind: 'code' });
+    expect(summarizeChecklist(listChecklist('9.9.9'))).toMatchObject({ green: 2, yellow: 1 });
+    expect(checklistGate('9.9.9')).toMatchObject({ ok: true, postpub: ['POST'], parity: [{ id: 'SCREEN', why: '근거에 짝: 줄이 없다' }] });
+    setItem('9.9.9', 'CODE', { dispatchKind: 'decision' }, 'MK');
+    expect(listChecklist('9.9.9').items.find((item) => item.id === 'CODE')?.dispatchKind).toBe('decision');
+    expect(() => addItem('9.9.9', { id: 'BAD', title: 'bad', dispatchKind: 'bogus' as 'code' })).toThrow('잘못된 발사 종류');
+  });
   test('predecessors: an id from any version is accepted, an id from no version is refused on add and set (CELL-DEPENDS-ID)', () => {
     root();
     addItem('0.2.18', { id: 'BASE', title: 'base in another version' });

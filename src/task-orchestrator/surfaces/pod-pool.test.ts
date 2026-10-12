@@ -264,7 +264,7 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
 
   test('pool Job apply carries task-card owner, checklist slot and work labels onto Job and Pod without changing placement', async () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-work-labels-'));
-    const manifests: Array<{ metadata: { labels: Record<string, string> }; spec: { template: { metadata: { labels: Record<string, string> } } } }> = [];
+    const manifests: Array<{ metadata: { labels: Record<string, string> }; spec: { template: { metadata: { labels: Record<string, string> }; spec: { containers: Array<{ env: Array<{ name: string; value?: string }> }> } } } }> = [];
     const contexts: string[] = [];
     const kubectl: Kubectl = (args, input) => {
       if (args.includes('apply') && input) {
@@ -290,6 +290,7 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
       const expected = { 'elanous.owner-kind': 'steward', 'elanous.owner-id': 'default', 'elanous.task-card': 'ta-20261008-abc123', 'elanous.checklist': 'RES-FLOOR-POD-LABELS', 'elanous.work': 'lite' };
       expect(manifests[0]!.metadata.labels).toMatchObject(expected);
       expect(manifests[0]!.spec.template.metadata.labels).toMatchObject(expected);
+      expect(manifests[0]!.spec.template.spec.containers[0].env).toContainEqual({ name: 'ELANOUS_TASK_CARD_ID', value: 'ta-20261008-abc123' });
       expect(pool.snapshot()).toEqual({ big: 0, small: 0 });
       const author = podSelfImplementSpawn({ kubectl, pool, imageCommit: null, pollMs: 1, sleep: async () => {},
         env: { ELANOUS_STATE_DIR: root, ELANOUS_POD_AUTHOR_ON_POD: '1', ELANOUS_POD_MEMORY_TIER: 'lite' },

@@ -142,10 +142,20 @@ function migrateLegacySessions(): void {
 }
 
 function stateRoot(): string {
-  const base = process.env.XDG_STATE_HOME && process.env.XDG_STATE_HOME.trim()
-    ? process.env.XDG_STATE_HOME
-    : join(homedir(), '.local', 'state');
-  return join(base, 'elanous');
+  const universe = process.env.ELANOUS_STATE_DIR?.trim();
+  const root = universe
+    ? join(universe, 'elanous')
+    : join(
+      process.env.XDG_STATE_HOME && process.env.XDG_STATE_HOME.trim()
+        ? process.env.XDG_STATE_HOME
+        : join(homedir(), '.local', 'state'),
+      'elanous',
+    );
+  try {
+    const { debug } = require('../debug/log.js') as typeof import('../debug/log.js');
+    debug.log('session.active', 'pointer-root', { root, universe });
+  } catch { /* 관측 실패가 포인터 경로 결정을 막지 않는다 */ }
+  return root;
 }
 
 function indexPath(root: string = sessionRoot()): string { return join(root, 'index.json'); }

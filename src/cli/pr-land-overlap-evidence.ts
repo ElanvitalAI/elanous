@@ -11,12 +11,12 @@
  *      ⓐ `gate.baseCommit` 이 고정 머리의 조상 ⊕ 지금 끝의 조상이고 ⓑ 창 `gate.baseCommit..지금 끝`의 커밋이 «하나도»
  *      PR 의 바뀐 파일(머리 vs merge-base)을 안 건드리면 통과(관측 reason `base-advanced-disjoint`).
  *      겹치면 `base-stale-overlap`(REJUDGE 가 재게이트를 청한다) · 못 재면 `base-window-unmeasured` · ⓐ 가 아니면 종전 사유.
- *   ③ 리뷰 — 증거가 가리키는 `review-results/<card>-<pr>-<head12>.json`(TA 가 받는 `self review --json` stdout)이
- *      같은 PR·같은 머리에 대해 `reviewed:true` · `verdict ∈ {pass, warn}` · must-fix 가 «잰 수» 0 인가
+ *   ③ 리뷰 — 증거가 가리키는 `review-results/<card>-<pr>-<head접두 10~40>.json`(TA 가 받는 `self review --json` stdout)이
+ *      파일명에서 같은 PR·머리 접두이고 내용에서 전체 PR·머리가 정확히 같으며 `reviewed:true` · `verdict ∈ {pass, warn}` · must-fix 가 «잰 수» 0 인가
  *      (자동 병합 canAuto · TA-LAND-WARN-MUSTFIX0 과 같은 규칙 — must-fix 를 못 셌으면 거부).
  *   ⓐ 이미 조상(TC #26019 실측) — 겹친 최근 착지 커밋이 «전부» 고정 머리의 조상이면 그 겹침은 이미 그 머리의 게이트·리뷰에
  *      반영됐다 ⇒ ①② 없이 ③ 만으로 통과(관측 reason `already-ancestor`). 하나라도 조상이 아니면 ①②③ 전부.
- *   ⓐ' 증거 파일이 없을 때(`verifyAncestorAutoPass`) — 같은 ⓐ 를 표준 자리 `review-results/*-<pr>-<head12>.json` 만으로 잰다
+ *   ⓐ' 증거 파일이 없을 때(`verifyAncestorAutoPass`) — 같은 ⓐ 를 표준 자리 `review-results/*-<pr>-<head접두 10~40>.json` 만으로 잰다
  *      (관측 reason `already-ancestor-auto`). 조상이 아닌 착지가 하나라도 있거나 리뷰 결과가 없으면 거부.
  *   하나라도 못 재거나 어긋나면 거부 — 호출부는 종전 거부를 그대로 낸다(fail-closed).
  * - 관측: `pr.land` · `overlap-evidence` (decision · reason · 잰 값).
@@ -33,7 +33,7 @@ interface OverlapEvidenceFile {
   head: string;
   /** ①② 경로에서만 필수 — 겹친 착지가 전부 조상(already-ancestor)이면 생략해도 된다. */
   gate?: { head: string; baseCommit: string; passed: boolean };
-  /** `self review --json` stdout 을 받은 파일(TA: `<state>/review-results/<card>-<pr>-<head12>.json`). */
+  /** `self review --json` stdout 을 받은 파일(TA: `<state>/review-results/<card>-<pr>-<head접두 10~40>.json`); 내용의 전체 head도 확인한다. */
   reviewResult: string;
 }
 
@@ -65,9 +65,14 @@ const COMMIT_MARK = '\u0001';
 
 function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'>, e: Partial<OverlapEvidenceFile>, head: string, baseTip?: string): { ok: false; reason: string; baseTip?: string } | { ok: true; reviewResult: string } {
   if (typeof e.reviewResult !== 'string' || !e.reviewResult) return { ok: false, reason: 'review-missing', baseTip };
-  // TA 가 받는 자리(`<state>/review-results/<card>-<pr>-<head12>.json` · reviewResultPath)만 — 아무 디렉터리의 같은 이름은 안 받는다.
+  // TA 가 받는 자리(`<state>/review-results/<card>-<pr>-<head접두 10~40>.json` · reviewResultPath)만; 내용의 전체 head도 확인한다.
+  const resultName = basename(e.reviewResult);
+  const resultMatch = /^([A-Za-z0-9][A-Za-z0-9._-]*)-(\d+)-([a-f0-9]{10,40})\.json$/i.exec(resultName);
   if (basename(dirname(e.reviewResult)) !== 'review-results'
-    || !new RegExp(`^[A-Za-z0-9][A-Za-z0-9._-]*-${input.pr}-${head.slice(0, 12)}\\.json$`, 'i').test(basename(e.reviewResult))) {
+    || !resultMatch
+    || Number(resultMatch[2]) !== input.pr
+    || resultMatch[3]!.length < 10
+    || !head.startsWith(resultMatch[3]!.toLowerCase())) {
     return { ok: false, reason: 'review-path-not-for-this-pr-head', baseTip };
   }
   let text: string;
@@ -206,7 +211,7 @@ export interface VerifyAncestorAutoInput {
   cwd: string;
   run: CmdRunner;
   readFile: (path: string) => string;
-  /** 표준 자리 `<state>/review-results` — 이 안의 `*-<pr>-<head12>.json` 만 본다. */
+  /** 표준 자리 `<state>/review-results` — 이 안의 `*-<pr>-<head접두 10~40>.json`만 후보로 보고 내용의 전체 head를 확인한다. */
   reviewResultsDir: string;
   listDir: (dir: string) => readonly string[];
   /** 겹침 관문이 찾은 «겹친» 최근 착지 커밋들. */
@@ -222,10 +227,13 @@ function checkAncestorAuto(input: VerifyAncestorAutoInput): AncestorAutoVerdict 
   if (notAncestor !== undefined) return { ok: false, reason: `ancestor-auto-not-ancestor: ${notAncestor.slice(0, 12)} is not an ancestor of ${head.slice(0, 12)}` };
   let names: readonly string[];
   try { names = input.listDir(input.reviewResultsDir); } catch { return { ok: false, reason: 'review-missing' }; }
-  const suffix = new RegExp(`-${input.pr}-${head.slice(0, 12)}\\.json$`, 'i');
-  // 같은 <pr>-<head12> 리뷰가 여럿이면 «전부» 통과해야 한다 — 하나라도 거부면 거부(fail-closed · 처음 통과한 하나로 승인하지 않는다).
+  const filename = new RegExp(`^[A-Za-z0-9][A-Za-z0-9._-]*-${input.pr}-([a-f0-9]{10,40})\\.json$`, 'i');
+  // 같은 PR·머리 접두의 리뷰가 여럿이면 «전부» 통과해야 한다 — 내용 headCommit 이 정확히 맞아야 승인한다.
   let accepted: string | undefined;
-  for (const name of [...names].filter((n) => suffix.test(n)).sort()) {
+  for (const name of [...names].filter((n) => {
+    const match = filename.exec(n);
+    return Boolean(match && match[1]!.length >= 10 && head.startsWith(match[1]!.toLowerCase()));
+  }).sort()) {
     const review = checkReview(input, { reviewResult: join(input.reviewResultsDir, name) }, head);
     if (!review.ok) return { ok: false, reason: review.reason };
     accepted = review.reviewResult;

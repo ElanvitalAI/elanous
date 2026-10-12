@@ -11,6 +11,38 @@ setDefaultTimeout(60_000);
 
 const fixture = () => ({ title: 'Machine ledger', policy: ['YAML only'], machines: [{ id: 'mbp', name: 'mbp', specs: 'M5', locationStatus: 'office', role: 'work', duties: 'build' }], devices: [{ id: 'phone', name: 'Phone', status: 'active', purpose: 'demo' }], rules: ['no secrets'], changes: ['initial'] });
 
+test('fleet intent validates role, platform, capacity, unique ssh name, and secret-free fields', () => {
+  const fleet = { sshName: 'node-b', role: 'worker', platform: 'darwin', podPool: 'k3d-elanous-pool:8', cap: 8 } as const;
+  const withFleet = (overrides: Record<string, unknown>) => ({ ...fixture(), machines: [{ ...fixture().machines[0], fleet: { ...fleet, ...overrides } }] });
+  expect(validateMachineLedger(withFleet({})).machines[0]?.fleet).toEqual(fleet);
+  for (const override of [
+    { role: 'admin' }, { platform: 'windows' }, { cap: -1 }, { cap: 1.5 },
+    { sshName: '100.64.1.2' }, { podPool: 'token=abc123' }, { unknown: 'value' },
+  ]) expect(() => validateMachineLedger(withFleet(override))).toThrow();
+  const duplicate = withFleet({});
+  duplicate.machines.push({ ...duplicate.machines[0]!, id: 'second' });
+  expect(() => validateMachineLedger(duplicate)).toThrow('duplicate or invalid fleet.sshName');
+});
+
+test('repository fleet intent agrees with duties and dated decision for each parent host', () => {
+  const ledger = loadMachineLedger(join(import.meta.dir, '../..'));
+  const fleet = (id: string) => ledger.machines.find((machine) => machine.id === id)!;
+  const expected = [
+    ['node-b', 'k3d-elanous-pool:56', 20],
+    ['node-c', 'pool-node-c@node-c:6', 6],
+    ['host-e', 'k3d-elanous-pool:4', 4],
+  ] as const;
+  for (const [id, pool, cap] of expected) {
+    expect(fleet(id).fleet?.podPool).toBe(pool);
+    expect(fleet(id).fleet?.cap).toBe(cap);
+    expect(ledger.changes.at(-1)).toContain(`\`${pool}\`/approvalCapacity ${cap}`);
+  }
+  expect(fleet('node-b').duties).toContain('`pool-node-b@node-b:8`');
+  expect(fleet('node-b').duties).toContain('`k3d-elanous-pool:56`(approvalCapacity 20)');
+  expect(fleet('node-c').duties).toContain('`pool-node-c@node-c:6`(approvalCapacity 6');
+  expect(fleet('host-e').fleet?.sshName).toBe('host-e-wsl');
+});
+
 test('ledger rejects malformed fields, ids and secret-like values on load and edit', () => {
   const root = mkdtempSync(join(tmpdir(), 'machine-ledger-'));
   mkdirSync(join(root, 'docs/ops'), { recursive: true });

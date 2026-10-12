@@ -51,6 +51,9 @@ import { hasGoalStepCodeName } from './goal-step-code-name.js';
 import { targetScopedGoalText } from './goal-text-path-scope.js';
 import { parseReleaseNoteSection } from '../release-loop/release-note.js';
 import { declaredNewFilePaths } from './goal-new-paths.js';
+import { classifyGoalCommandExecution, type GoalCommandExecutionResult } from './goal-command-execution.js';
+export { classifyGoalCommandExecution } from './goal-command-execution.js';
+export type { GoalCommandExecutionKind, GoalCommandExecutionResult, GoalCommandExecutionClassification } from './goal-command-execution.js';
 
 // ⭐ `situation`/`complication` 은 **선택**이다 — 안 오면 `scqaNarrative` 가 종전 문면을 쓴다.
 //   ⛔ 필수로 만들지 않는다: 그러면 인핸싱이 폴백으로 떨어진 저작(LLM 실패·`disabled`)이 전부 죽는다.
@@ -437,33 +440,6 @@ export function canonicalStructureFinding(
   Object.defineProperty(finding, 'check', { value: check, enumerable: false });
   if (orderCause) Object.defineProperty(finding, 'orderCause', { value: orderCause, enumerable: false });
   return finding;
-}
-
-export type GoalCommandExecutionKind = 'success' | 'missing-command' | 'argument-problem' | 'execution-failure';
-
-export interface GoalCommandExecutionResult {
-  readonly status: number | null;
-  readonly stderr: string;
-}
-
-export interface GoalCommandExecutionClassification {
-  readonly kind: GoalCommandExecutionKind;
-  readonly log: string;
-}
-
-/** Classifies an already-observed Commander result without executing a command. */
-export function classifyGoalCommandExecution(result: GoalCommandExecutionResult): GoalCommandExecutionClassification {
-  // A clean exit is authoritative: stderr text from a successful command is not a failure signal.
-  if (result.status === 0) return { kind: 'success', log: 'command completed successfully' };
-
-  const stderr = result.stderr;
-  if (stderr.includes('unknown command') || stderr.includes('unknown option')) {
-    return { kind: 'missing-command', log: 'command is not recognized; this may be not yet implemented rather than a defect' };
-  }
-  if (stderr.includes('missing required argument') || stderr.includes('required option')) {
-    return { kind: 'argument-problem', log: 'command requires a missing argument or option' };
-  }
-  return { kind: 'execution-failure', log: `command execution failed with code ${String(result.status)}` };
 }
 
 /** Optional repository-bounded source reader. Legacy null means the referenced path is missing. */

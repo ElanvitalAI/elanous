@@ -18,14 +18,24 @@ export function cliRootVisibleFor(name: string, role: Role, { showAll }: { showA
   return grade === 'stable' || (role === 'contributor' && (grade === 'beta' || grade === 'tool'));
 }
 
-/** Only help is filtered: Commander still dispatches explicitly typed commands. */
-export function filterCliRootHelp(commands: readonly Command[], role: Role, showAll: boolean): { shown: number; hidden: number } {
+/** Root --help first screen (SETUP-HELP-SLIM): the three stable onboarding commands. */
+export const FIRST_SCREEN_COMMANDS: readonly string[] = ['start', 'setup', 'ask'];
+
+/**
+ * Only help is filtered: Commander still dispatches explicitly typed commands.
+ * firstScreen narrows the visible set to FIRST_SCREEN_COMMANDS and showAll wins over it;
+ * the caller opts in per role — the wired default (deferred slice) enables it for the
+ * general role only, so owner/contributor keep today's list.
+ */
+export function filterCliRootHelp(commands: readonly Command[], role: Role, showAll: boolean, firstScreen: boolean = false): { shown: number; hidden: number } {
+  const firstScreenActive = firstScreen && !showAll;
   let shown = 0;
   let hidden = 0;
   for (const command of commands) {
     const grade = cliRootMaturity(command.name(), commands);
     if (!grade) throw new Error(`cliRoot 에 등급 없는 명령: ${command.name()}`);
-    const visible = cliRootVisibleFor(command.name(), role, { showAll }, commands);
+    const visible = cliRootVisibleFor(command.name(), role, { showAll }, commands)
+      && (!firstScreenActive || FIRST_SCREEN_COMMANDS.includes(command.name()));
     (command as Command & { _hidden: boolean })._hidden = !visible;
     if (visible) shown++;
     else hidden++;

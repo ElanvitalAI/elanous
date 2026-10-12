@@ -965,6 +965,7 @@ import {
   enterSessionControlMode,
   exitSessionControlMode,
   isSessionControlActive,
+  routeDevHarnessSubmitIntent,
   parseSessionControlSlash,
   parseSessionSurfaceSlash,
   resolveSessionInputModeFromChatMode,
@@ -1023,7 +1024,7 @@ import { expandPromptReferences } from '../prompt/references.js';
 import { spawnCodingAgent, CodingAgentBinaryMissing } from '../terminal/coding-agent.js';
 import type { TerminalSession } from '../terminal/session-registry.js';
 import { createSessionPickerModal } from '../session/picker-modal.js';
-import { listSessions as listChatSessionsForResume } from '../session/index.js';
+import { listSessions as listChatSessionsForResume, adoptSession as adoptChatSession, setActiveSessionId as markActiveChatSession } from '../session/index.js';
 // TUI 부활 S-b — 타임트래블 포크 엔진 (codex ForkSnapshot 동형 · 2026-07-09
 // 이식 후 호출처 0 이던 방치 자산 회수). 순수 히스토리 절단 로직만 소비;
 // 영속은 세션 스토어(forkSessionFromHistory)가 담당한다.
@@ -1179,6 +1180,20 @@ import { buildDebugCallStack } from '../debug/call-stack.js';
 import { buildAstGrepHostTool } from '../skills/tools/ast-grep.js';
 import { buildLspHostTool } from '../skills/tools/lsp/index.js';
 import { PluginHost } from '../plugins/core/host.js';
+
+/** Register the same L2 host tools used by the live TUI before each turn's catalog is assembled. */
+export function registerDashboardCoreHostTools(host: Pick<PluginHost, 'registerHostTool'>): void {
+  const coreMod = require('../domains/core-tools.js') as typeof import('../domains/core-tools.js');
+  const core = coreMod.buildCoreTools();
+  for (const spec of core.specs) {
+    host.registerHostTool({
+      name: spec.name,
+      description: spec.description,
+      parameters: spec.parameters,
+      handler: async (args) => core.dispatch(spec.name, args as Record<string, unknown>),
+    });
+  }
+}
 import { registerDashboardPaneHostTools } from './panes/host-tools.js';
 import { DEFAULT_THEME_TOKENS, mergeThemeTokens, resolveThemeTokens, type ThemeTokenInput, type ThemeTokens } from '../theme/tokens.js';
 import { resolveActiveTheme, setActivePresetInConfig } from './render/theme-resolver.js';
@@ -1407,6 +1422,8 @@ const isPluginBusy = (host: { active(): { plugin: { isBusy?: (s: any) => boolean
 // ── Main dashboard ──
 
 export interface ShowDashboardOptions {
+  /** Internal startup timing signal for the first successfully flushed dashboard frame. */
+  onFirstFrameRendered?: () => void;
   /** Force debug sinks on at launch (file + mirror). Equivalent to
    *  typing `/debug on` immediately after startup. Paired with
    *  chatOnly=true by the `elanous --debug` CLI flag so every traced
@@ -1501,6 +1518,16 @@ export function buildDashboardTurnTypeaheadPromptZone(input: TurnTypeaheadPrompt
   };
 }
 
+/** The chat-main submit branch calls this before any model dispatch. Keeping
+ * the decision here lets the dashboard test execute the same entry point. */
+export function resolveDashboardHarnessSubmitIntent(
+  text: string,
+  options: Parameters<typeof resolveDashboardChatMainSubmitIntent>[1],
+  resolveIntent: typeof resolveDashboardChatMainSubmitIntent = resolveDashboardChatMainSubmitIntent,
+) {
+  return routeDevHarnessSubmitIntent(resolveIntent(text, options));
+}
+
 /** 프롬프트 zone 에 관측만 덧입힌다 — 렌더 산출은 `inner` 가 소유한다.
  *
  *  ⭐ **왜 뽑았나**(무인 리뷰 must-fix · 2026-08-01): 종전엔 이 래퍼가 `zones.push({...})` 안에
@@ -1567,6 +1594,7 @@ export interface DashboardFrameInput {
   promptCaret: CursorState | null;
   suppressPromptArea: boolean;
   onEssentialFrameCursorDecision?: (observation: EssentialFrameCursorObservation) => void;
+  onFrameWriteComplete?: (error?: Error | null) => void;
 }
 
 export interface EssentialFrameCursorObservation {
@@ -1612,6 +1640,7 @@ export function renderDashboardFrame(
     overlay: input.overlay,
     force: input.force,
     cursor: paintCursor(essentialDecision.cursor ?? input.coordinatorCursor ?? null),
+    onWriteComplete: input.onFrameWriteComplete,
   });
   input.onEssentialFrameCursorDecision?.({
     caret: essentialDecision.cursor,
@@ -1901,6 +1930,7 @@ export function renderDashboardFirstScreenBand(input: {
 }
 
 export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<DashboardAction> {
+  let firstDashboardFrameRendered = false;
   await awaitGlobalPersonaLoad().catch(() => {});
   const dashboardQuitConfirmationState = createQuitConfirmationState();
   const signalQuitConfirmationState = createQuitConfirmationState();
@@ -1910,7 +1940,11 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
     closeTui();
   };
   const exitDashboardTui = (): void => {
-    closeDashboardForExit({ closeTui: closeDashboardTui, confirmationState: dashboardQuitConfirmationState });
+    closeDashboardForExit({
+      closeTui: closeDashboardTui,
+      confirmationState: dashboardQuitConfirmationState,
+      getSessionId: (): string | undefined => acpSessionIdRef.current ?? undefined,
+    });
   };
   // ⭐⭐⭐ `N1` — 신호 경로(`SIGINT`/`SIGTERM`)와 저수준 `Ctrl+C` 도 같은 종료를 타게 «등록»한다.
   //   ⛔ 종전엔 그 둘만 세션 안내를 «못 받았다»(일곱 경로 중 다섯만 받았다).
@@ -1920,6 +1954,7 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
       closeTui: () => { /* 신호 경로: cleanup() 이 이미 복원했다 */ },
       confirmationState: signalQuitConfirmationState,
       forceQuit: true,
+      getSessionId: (): string | undefined => acpSessionIdRef.current ?? undefined,
     });
   });
   // E3 (§7.4 TS baseline reduction · 2026-05-17) — forward declarations
@@ -3342,6 +3377,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   //   ⛔ `attachedSessionId`(대화 세션)와 «다른 축»이다 — 루프는 ACP 세션으로 스코프를 연다.
   //   ⚠️ 세션은 이 함수 «뒤»에서 만들어지므로 참조로 둔다(호출 시점엔 채워져 있다).
   const acpSessionIdRef: { current: string | null } = { current: null };
+  const adoptedAcpSessionIds = new Set<string>();
+  let activeAcpSessionId: string | null = null;
   const activeSessionIdForTypeahead = (): string | null => acpSessionIdRef.current;
   const paintTurnTypeaheadEcho = (): void => {
     const { rows: tr, cols: tc } = termSize();
@@ -10014,16 +10051,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   //   family(전 surface 기본) — 이로써 TUI 에서도 "P2 왜 실패?" 를 엘라누스가 툴로 상황판단한다.
   //   fail-soft: 코어 도구 로드 실패가 대시보드 부팅을 막지 않는다.
   try {
-    const coreMod = require('../domains/core-tools.js') as typeof import('../domains/core-tools.js');
-    const core = coreMod.buildCoreTools();
-    for (const spec of core.specs) {
-      pluginHost.registerHostTool({
-        name: spec.name,
-        description: spec.description,
-        parameters: spec.parameters,
-        handler: async (args) => core.dispatch(spec.name, args as Record<string, unknown>),
-      });
-    }
+    registerDashboardCoreHostTools(pluginHost);
   } catch { /* fail-soft */ }
   // LSP (Phase L3 of 내부 문서 `ROADMAP-lsp-integration`) — structural /
   // symbol-level source queries via typescript-language-server. Pool
@@ -11530,6 +11558,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // ⭐ Single flush: resolve the prompt caret after overlays.
     const frameCursorDecision = display.cursorDecision();
     renderDashboardFrame(baseLines, composeDashboardFrameWithCoordinatorModal(display, {
+      onFrameWriteComplete: firstDashboardFrameRendered ? undefined : (error) => {
+        if (error || firstDashboardFrameRendered) return;
+        firstDashboardFrameRendered = true;
+        try { opts.onFirstFrameRendered?.(); } catch { /* timing must not break dashboard */ }
+      },
       overlay: modalFrame,
       force: forceFromCoordinator || modalKey !== lastModalKey,
       cursorOwner: frameCursorDecision.owner,
@@ -17422,7 +17455,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           // resource_link blocks so dropped screenshots and PDFs flow
           // naturally to the agent. debug.log gates the snapshot so
           // off-state stays zero-cost.
-          const submitIntent = resolveDashboardChatMainSubmitIntent(input.text, {
+          const submitIntent = resolveDashboardHarnessSubmitIntent(input.text, {
             stickyBackend: dashboardAcpChat.getSticky(),
             source: input.externalSubmitSource,
           });
@@ -17443,7 +17476,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           }
           if (submitIntent.kind === 'submit-turn' && submitIntent.route === 'sticky-acp') {
             await runDashboardChatMainSubmitIntent({
-              submit: createDashboardChatMainTurnSubmit(submitIntent),
+              submit: createDashboardChatMainTurnSubmit({
+                ...submitIntent,
+                sessionId: submitIntent.sessionId ?? dashboardAcpSession.currentSessionId,
+              }),
               beforeExecute: (submit) => {
                 maybeEmitDashboardSubmitQuickPass({
                   submit,
@@ -19186,16 +19222,19 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           do {
             const turnText = goalLoopUserText ?? tok.text;
             await runDashboardChatMainSubmitIntent({
-              submit: createDashboardChatMainTurnSubmit(
-                submitIntent.kind === 'submit-turn' && submitIntent.route === 'plain' && goalLoopUserText === null
-                ? submitIntent
-                : {
-                  kind: 'submit-turn',
-                  source: { kind: 'keyboard', surface: 'dashboard-chat-main' },
-                  text: turnText,
-                  route: goalLoopUserText === null ? 'plain' : 'plain',
-                },
-              ),
+              submit: createDashboardChatMainTurnSubmit({
+                ...(submitIntent.kind === 'submit-turn' && submitIntent.route === 'plain' && goalLoopUserText === null
+                  ? submitIntent
+                  : {
+                    kind: 'submit-turn' as const,
+                    source: { kind: 'keyboard' as const, surface: 'dashboard-chat-main' },
+                    text: turnText,
+                    route: 'plain' as const,
+                  }),
+                sessionId: submitIntent.kind === 'submit-turn'
+                  ? submitIntent.sessionId ?? dashboardAcpSession.currentSessionId
+                  : dashboardAcpSession.currentSessionId,
+              }),
               beforeExecute: (submit) => {
                 maybeEmitDashboardSubmitQuickPass({
                   submit,
@@ -19245,6 +19284,29 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               break;
             }
           } while (goalLoopUserText !== null);
+
+          // SESSION-RESUME-ISOLATED: 완료된 턴의 ACP 세션을 원장에 등록하고 active 로 지정한다.
+          // 서버의 완료-채택(persistCompletedTuiAcpTurn)은 origin_session 메타가 실렸을 때만
+          // 도는데, 격리 우주 첫 턴에는 origin 세션이 없어 메타가 안 실린다 — 여기가 그 갭을 닫는다.
+          const completedAcpSessionId = dashboardAcpSession.currentSessionId;
+          if (completedAcpSessionId) {
+            acpSessionIdRef.current = completedAcpSessionId;
+            // 원격 데몬 세션의 원장은 데몬이 소유한다. 로컬 등록은 세션마다 한 번만 한다.
+            if (!daemonAttached && activeAcpSessionId !== completedAcpSessionId) {
+              try {
+                if (!adoptedAcpSessionIds.has(completedAcpSessionId)) {
+                  adoptChatSession(completedAcpSessionId, { source: 'tui', transport: 'acp' });
+                  adoptedAcpSessionIds.add(completedAcpSessionId);
+                }
+                markActiveChatSession(completedAcpSessionId);
+                activeAcpSessionId = completedAcpSessionId;
+              } catch (error) {
+                // 등록 실패가 대화 흐름을 끊지 않되, 다음 턴 재시도 전 원인을 남긴다.
+                debug.log('session.adopt', 'failed', { sessionId: completedAcpSessionId, error: String(error) });
+                pushDebugLine(C.warning(`session adopt failed: ${String(error)}`));
+              }
+            }
+          }
 
           continue; // stay in input mode after chat
           } // end while (input mode loop)

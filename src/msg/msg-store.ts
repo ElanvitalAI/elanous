@@ -1,5 +1,5 @@
 import { Database } from 'bun:sqlite';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 
@@ -20,7 +20,7 @@ export interface UnreadRecipient {
   count: number;
 }
 
-const SEAT_ALIASES: Readonly<Record<string, string>> = {
+export const SEAT_ALIASES: Readonly<Record<string, string>> = {
   S: 'OP', OP: 'OP', COO: 'OP',
   T: 'MK', MK: 'MK', CMO: 'MK',
   O: 'TC', TC: 'TC', CTO: 'TC',
@@ -41,6 +41,7 @@ export function validateMessageEnvelope(input: unknown): MessageEnvelope {
   const record = input as Record<string, unknown>;
   const from = canonicalSeatId(record.from as string);
   const to = canonicalSeatId(record.to as string);
+  if (from === 'ALL') throw new Error('ALL cannot send messages');
   if (typeof record.body !== 'string' || !record.body.trim()) throw new Error('message body must be nonempty');
   if (record.kind !== undefined && (typeof record.kind !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/.test(record.kind))) {
     throw new Error('invalid message kind');
@@ -52,6 +53,13 @@ export function validateMessageEnvelope(input: unknown): MessageEnvelope {
 function validCursor(cursor: number): number {
   if (!Number.isSafeInteger(cursor) || cursor < 0) throw new Error('cursor must be a nonnegative safe integer');
   return cursor;
+}
+
+function unreadCountOn(db: Database, to: string): number {
+  return (db.query(`SELECT COUNT(*) AS count FROM msg_messages m
+    WHERE m.id > COALESCE((SELECT last_id FROM msg_cursors WHERE recipient = ?), 0)
+      AND (m.recipient = ? OR (m.recipient = 'ALL' AND m.sender <> ?))`)
+    .get(to, to, to) as { count: number }).count;
 }
 
 interface MessageRow {
@@ -88,10 +96,37 @@ export class MsgStore {
     CREATE TABLE IF NOT EXISTS msg_cursors (
       recipient TEXT PRIMARY KEY,
       last_id INTEGER NOT NULL DEFAULT 0 CHECK(last_id >= 0)
+    );
+    CREATE TABLE IF NOT EXISTS msg_provenance (
+      provenance_key TEXT PRIMARY KEY,
+      message_id INTEGER NOT NULL REFERENCES msg_messages(id)
     );`);
   }
 
   append(input: MessageEnvelope): Message {
+    return this.insertMessage(input);
+  }
+
+  /** Append once for a provenance key such as coord:<commentId>:<recipient>. */
+  appendWithProvenance(input: MessageEnvelope, provenanceKey: string): Message {
+    if (typeof provenanceKey !== 'string' || !/^coord:[^:]+:[^:]+$/.test(provenanceKey)) {
+      throw new Error('invalid message provenance key');
+    }
+    const msg = validateMessageEnvelope(input);
+    if (provenanceKey.split(':')[2] !== msg.to) throw new Error('provenance recipient does not match message recipient');
+    return this.db.transaction(() => {
+      const existing = this.db.query(`SELECT m.id, m.sender, m.recipient, m.body, m.kind, m.created_at
+        FROM msg_provenance p JOIN msg_messages m ON m.id = p.message_id WHERE p.provenance_key = ?`)
+        .get(provenanceKey) as MessageRow | null;
+      if (existing) return fromRow(existing);
+      const message = this.insertMessage(msg);
+      this.db.query('INSERT INTO msg_provenance(provenance_key, message_id) VALUES (?, ?)')
+        .run(provenanceKey, message.id);
+      return message;
+    }).immediate();
+  }
+
+  private insertMessage(input: MessageEnvelope): Message {
     const msg = validateMessageEnvelope(input);
     const createdAt = new Date().toISOString();
     const result = this.db.query(`INSERT INTO msg_messages(sender, recipient, body, kind, created_at)
@@ -104,10 +139,12 @@ export class MsgStore {
   /** Messages strictly after the supplied cursor, ordered by durable insertion ID. */
   listByRecipient(recipient: string, after: number = 0, limit: number = 100): Message[] {
     const to = canonicalSeatId(recipient);
+    if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
     validCursor(after);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
     return (this.db.query(`SELECT id, sender, recipient, body, kind, created_at FROM msg_messages
-      WHERE recipient = ? AND id > ? ORDER BY id ASC LIMIT ?`).all(to, after, limit) as MessageRow[]).map(fromRow);
+      WHERE id > ? AND (recipient = ? OR (recipient = 'ALL' AND sender <> ?))
+      ORDER BY id ASC LIMIT ?`).all(after, to, to, limit) as MessageRow[]).map(fromRow);
   }
 
   list(recipient: string, after: number = 0, limit: number = 100): Message[] {
@@ -116,12 +153,14 @@ export class MsgStore {
 
   getCursor(recipient: string): number {
     const to = canonicalSeatId(recipient);
+    if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
     return (this.db.query('SELECT last_id FROM msg_cursors WHERE recipient = ?').get(to) as { last_id: number } | null)?.last_id ?? 0;
   }
 
   /** Atomically reject future IDs and keep concurrent or stale acknowledgements from rewinding. */
   advanceCursor(recipient: string, cursor: number): number {
     const to = canonicalSeatId(recipient);
+    if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
     validCursor(cursor);
     const result = this.db.query(`INSERT INTO msg_cursors(recipient, last_id)
       SELECT ?, ? WHERE ? <= (SELECT COALESCE(MAX(id), 0) FROM msg_messages)
@@ -133,11 +172,24 @@ export class MsgStore {
 
   ack(recipient: string, cursor: number): number { return this.advanceCursor(recipient, cursor); }
 
+  unreadCount(recipient: string): number {
+    const to = canonicalSeatId(recipient);
+    if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
+    return unreadCountOn(this.db, to);
+  }
+
   unreadRecipients(): UnreadRecipient[] {
-    return this.db.query(`SELECT m.recipient AS recipient, COUNT(*) AS count
-      FROM msg_messages m LEFT JOIN msg_cursors c ON c.recipient = m.recipient
-      WHERE m.id > COALESCE(c.last_id, 0)
-      GROUP BY m.recipient ORDER BY m.recipient ASC`).all() as UnreadRecipient[];
+    return this.db.query(`WITH recipients(recipient) AS (
+        SELECT 'OP' UNION SELECT 'MK' UNION SELECT 'TC' UNION SELECT 'UX'
+        UNION SELECT recipient FROM msg_messages WHERE recipient <> 'ALL'
+        UNION SELECT recipient FROM msg_cursors WHERE recipient <> 'ALL'
+      )
+      SELECT r.recipient AS recipient, COUNT(m.id) AS count
+      FROM recipients r
+      LEFT JOIN msg_cursors c ON c.recipient = r.recipient
+      JOIN msg_messages m ON m.id > COALESCE(c.last_id, 0)
+        AND (m.recipient = r.recipient OR (m.recipient = 'ALL' AND m.sender <> r.recipient))
+      GROUP BY r.recipient ORDER BY r.recipient ASC`).all() as UnreadRecipient[];
   }
 
   unread(): UnreadRecipient[] { return this.unreadRecipients(); }
@@ -147,3 +199,13 @@ export class MsgStore {
 
 export function defaultMsgStorePath(): string { return join(elanousStateRoot(), 'msg', 'messages.db'); }
 export function openMsgStore(path?: string): MsgStore { return new MsgStore(path); }
+
+/** Observe one recipient without creating a store or advancing its acknowledgement. */
+export function readUnreadCount(recipient: string, path: string = defaultMsgStorePath()): number | null {
+  const to = canonicalSeatId(recipient);
+  if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
+  if (!existsSync(path)) return null;
+  const db = new Database(path, { readonly: true });
+  try { return unreadCountOn(db, to); }
+  finally { db.close(); }
+}

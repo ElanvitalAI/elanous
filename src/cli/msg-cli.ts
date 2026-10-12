@@ -57,13 +57,17 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
   };
 
   msg.command('post [body]').description('Post a message; use - or omit body to read stdin')
-    .option('--from <seat>').option('--to <seat>').option('--kind <kind>').option('--body <text>').option('--json')
-    .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string }) => run(async () => {
+    .option('--from <seat>').option('--to <seat>').option('--kind <kind>').option('--body <text>')
+    .option('--origin-key <key>', 'deduplicate a channel mirror by coord:<commentId>:<recipient>').option('--json')
+    .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; originKey?: string }) => run(async () => {
       const from = seat(opts.from, '--from');
       const to = seat(opts.to, '--to');
       if (body !== undefined && body !== '-' && opts.body !== undefined) throw new Error('provide body once (argument or --body)');
       const text = opts.body ?? (body !== undefined && body !== '-' ? body : await readStdin());
-      const posted = withStore(store => store.post({ from, to, body: text, ...(opts.kind === undefined ? {} : { kind: opts.kind }) }));
+      const envelope = { from, to, body: text, ...(opts.kind === undefined ? {} : { kind: opts.kind }) };
+      const posted = withStore(store => opts.originKey === undefined
+        ? store.post(envelope)
+        : store.appendWithProvenance(envelope, opts.originKey));
       emit(posted, opts.json, () => out.log(formatMessage(posted)));
     })());
 
@@ -95,7 +99,11 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     .option('--to <seat>').option('--json')
     .action((opts: CommonOptions & { to?: string }) => run(() => {
       const to = opts.to === undefined ? undefined : seat(opts.to, '--to');
-      const rows = withStore(store => store.unread().filter(row => to === undefined || row.recipient === to));
+      const rows = withStore(store => {
+        if (to === undefined) return store.unread();
+        const count = store.unreadCount(to);
+        return count ? [{ recipient: to, count }] : [];
+      });
       emit(rows, opts.json, () => {
         if (!rows.length) out.log('No unread messages.');
         for (const row of rows) out.log(`${row.recipient}: ${row.count} unread`);
@@ -104,9 +112,11 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
 
   msg.command('watch').description('Poll for new messages without acknowledging them (Ctrl-C to stop)')
     .option('--to <seat>').option('--after <id>', 'exclusive message ID (default: acknowledged cursor)')
+    .option('--since-ack', 'start from the recipient seat’s acknowledged cursor')
     .option('--interval <ms>', 'poll interval in milliseconds', '1000')
     .option('--once', 'poll once and exit').option('--json')
-    .action((opts: RecipientOptions & { interval?: string; once?: boolean }) => run(async () => {
+    .action((opts: RecipientOptions & { interval?: string; once?: boolean; sinceAck?: boolean }) => run(async () => {
+      if (opts.sinceAck && opts.after !== undefined) throw new Error('--since-ack cannot be used with --after');
       const to = seat(opts.to, '--to');
       const interval = integer(opts.interval, '--interval', 1000, 1, 60000);
       const after = opts.after === undefined ? undefined : integer(opts.after, '--after', 0, 0, Number.MAX_SAFE_INTEGER);

@@ -339,14 +339,21 @@ describe('Pod terminal residue', () => {
       listDrafts: async (page) => page === 1 ? drafts : [], listMerged: async () => [],
       listLiveBranches: async () => new Set(), getRunStatus: async () => undefined,
       setLabels: async (_repo, number, change) => { closed.push(`label:${number}:${change.add}`); },
-      closeDraft: async (_repo, number, comment) => { closed.push(`close:${number}:${comment}`); },
+      closeDraft: async (...args) => {
+        expect(args).toHaveLength(2);
+        closed.push(`close:${args[1]}`);
+      },
     };
     const result = await runDraftSweep({ repository: 'o/r', adapters, apply: true, now });
     expect(result.entries.map(({ action, reason }) => ({ action, reason }))).toEqual([
       { action: 'keep', reason: 'harvestable' }, { action: 'close', reason: 'harvest-expired' }, { action: 'keep', reason: 'unobserved' },
     ]);
     expect(result.unobserved).toBe(1);
-    expect(closed).toEqual([expect.stringContaining('label:2:'), expect.stringContaining('close:2:Draft sweep: harvest-expired')]);
+    expect(closed).toEqual([
+      'label:2:elanous:stalled',
+      'label:2:elanous:swept:harvest-expired',
+      'close:2',
+    ]);
   });
 
   test('supersede close cap leaves remaining drafts pending for the next replay without closing twice', async () => {

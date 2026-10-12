@@ -26,13 +26,15 @@ export function finishedMinutes(run: ReleaseRun): number | null {
   return Math.max(0, Math.floor((Math.max(...ends) - start) / 60_000));
 }
 
-export function ReleaseStrip({ result, onSelect, selectedRun, now = Date.now() }: {
+export function ReleaseStrip({ result, onSelect, selectedRun, expectedRunId, now = Date.now() }: {
   result: OpsResult<ReleaseRun[]> | null;
   onSelect: (run: ReleaseRun) => void;
   selectedRun?: ReleaseRun | null;
+  expectedRunId?: string;
   now?: number;
 }): React.ReactNode {
   const run = selectedRun === undefined ? latestReleaseRun(result, now) : selectedRun;
+  if (expectedRunId && run?.runId !== expectedRunId) return <p role="status">발행 진행 · 노드 흐름: 런이 달라 못 잼</p>;
   if (!run) return null;
   const index = Math.max(0, run.path.findIndex((id) => run.nodes.find((node) => node.nodeId === id)?.ok !== true));
   const currentIndex = run.path.length > 0 && run.path.every((id) => run.nodes.find((node) => node.nodeId === id)?.ok === true)

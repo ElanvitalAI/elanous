@@ -116,6 +116,14 @@ test('operational beta page is reachable from the operations navigation and moun
   expect(page.props.children.type).toBe(LoopsView);
 });
 
+test('빈 루프 화면은 쉬운말 풀이 한 줄을 보인다', () => {
+  const empty = renderToStaticMarkup(<LoopStatusContent rows={[]} state="ready" />);
+  expect(empty).toContain('등록된 루프·크론이 없습니다.');
+  expect(empty).toContain('data-plain-lead="loop"');
+  expect(empty).toContain('당번');
+  expect(renderToStaticMarkup(<LoopStatusContent rows={[loopRows([job()], now)[0]!]} state="ready" />)).not.toContain('data-plain-lead');
+});
+
 test('no registry entries and fetch failure are not shown as healthy', () => {
   expect(renderToStaticMarkup(<LoopStatusContent rows={[]} state="ready" />)).toContain('등록된 루프·크론이 없습니다');
   const failed = renderToStaticMarkup(<LoopStatusContent rows={[]} state="error" />);

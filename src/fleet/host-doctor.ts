@@ -1,5 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
+import type { ResourceView } from '../control-plane/ledger.js';
+import type { MachineLedger, MachineFleetIntent } from '../machines/machine-ledger.js';
 
 /**
  * 호스트 닥터 — 첫 조각(FLEET-DOCTOR-1 · 읽기 전용).
@@ -295,6 +297,66 @@ export interface HostDoctorOptions {
   remote?: HostDoctorRemote;
   expected?: HostDoctorExpected;
   now?: () => Date;
+  /** HQ observations: null means the source could not be read; [] means a successful empty reading. */
+  membership?: {
+    intent: MachineLedger | null;
+    machines: readonly ResourceView[] | null;
+    parentHosts: readonly { host?: string; podPool?: string; approvalCapacity?: number }[] | null;
+    intentError?: string;
+    machinesError?: string;
+    parentHostsError?: string;
+  };
+}
+
+function membershipCheck(id: string, status: HostDoctorCheckStatus, observed: string, expected: string): HostDoctorCheckResult {
+  return { id, status, observed, expected, fixKind: 'human', fix: 'compare Nexus machine registration, machines.yaml intent, and taskAgent.parentHost' };
+}
+
+/** Pure HQ comparison. A failed query is null (unmeasured); a successful empty result is a real missing host. */
+export function checkHostMembership(host: string, platform: HostDoctorPlatform | null, membership: NonNullable<HostDoctorOptions['membership']>): HostDoctorCheckResult[] {
+  const intent: MachineFleetIntent | undefined = membership.intent?.machines.find((row) => row.fleet?.sshName === host)?.fleet;
+  const registryExpected = intent ? `live machine ${host} · role ${intent.role}` : `machines.yaml fleet intent for ${host}`;
+  let registry: HostDoctorCheckResult;
+  if (membership.intent === null || membership.machines === null) {
+    registry = membershipCheck('registry.member', 'unmeasured', membership.intent === null
+      ? `intent ledger unavailable (repository checkout required)${membership.intentError ? `: ${membership.intentError}` : ''}`
+      : `Nexus machine query unavailable${membership.machinesError ? `: ${membership.machinesError}` : ''}`, registryExpected);
+  } else if (!intent) {
+    registry = membershipCheck('registry.member', 'fail', 'host absent from fleet intent', registryExpected);
+  } else {
+    // `machine` is the Nexus identity; `name` is a display label. A missing/expired record
+    // is a measured failure even when the remote platform probe did not run.
+    const rows = membership.machines.filter((row) => row.kind === 'machine' && row.machine === host && !row.expired);
+    const row = rows[0];
+    const role = row?.attrs.role;
+    if (!row) registry = membershipCheck('registry.member', 'fail', 'no live Nexus machine record', registryExpected);
+    else if (rows.length !== 1) registry = membershipCheck('registry.member', 'fail', `${rows.length} live machine records`, registryExpected);
+    else if (typeof role !== 'string') registry = membershipCheck('registry.member', 'unmeasured', 'machine attrs.role unavailable', registryExpected);
+    else if (role !== intent.role) registry = membershipCheck('registry.member', 'fail', `machine role ${role}`, registryExpected);
+    // Existence and role have been measured above; a pass still needs the platform probe.
+    else if (platform === null) registry = membershipCheck('registry.member', 'unmeasured', 'host platform unavailable', `intent platform ${intent.platform}`);
+    else if (platform !== intent.platform) registry = membershipCheck('registry.member', 'fail', `host platform ${platform}`, `intent platform ${intent.platform}`);
+    else registry = membershipCheck('registry.member', 'pass', `live machine ${host} · role ${role}`, registryExpected);
+  }
+
+  const parentExpected = intent ? `taskAgent.parentHost ${host} · ${intent.podPool} · cap ${intent.cap}` : `machines.yaml fleet intent for ${host}`;
+  let parent: HostDoctorCheckResult;
+  if (membership.intent === null || membership.parentHosts === null) {
+    parent = membershipCheck('parentHost.member', 'unmeasured', membership.intent === null
+      ? `intent ledger unavailable (repository checkout required)${membership.intentError ? `: ${membership.intentError}` : ''}`
+      : `taskAgent.parentHost unavailable${membership.parentHostsError ? `: ${membership.parentHostsError}` : ''}`, parentExpected);
+  } else if (!intent) {
+    parent = membershipCheck('parentHost.member', 'fail', 'host absent from fleet intent', parentExpected);
+  } else {
+    const rows = membership.parentHosts.filter((row) => row.host === host);
+    const row = rows[0];
+    if (intent.cap === 0) parent = membershipCheck('parentHost.member', rows.length === 0 ? 'pass' : 'fail', rows.length === 0 ? 'disabled in both intent and parent config' : 'disabled host still in parent config', 'host absent from taskAgent.parentHost (cap 0)');
+    else if (!row) parent = membershipCheck('parentHost.member', 'fail', 'host absent from taskAgent.parentHost', parentExpected);
+    else if (rows.length !== 1 || row.podPool !== intent.podPool || row.approvalCapacity !== intent.cap) {
+      parent = membershipCheck('parentHost.member', 'fail', `host entries ${rows.length} · pool ${row.podPool ?? '(missing)'} · cap ${row.approvalCapacity ?? '(missing)'}`, parentExpected);
+    } else parent = membershipCheck('parentHost.member', 'pass', `host ${host} · pool ${row.podPool} · cap ${row.approvalCapacity}`, parentExpected);
+  }
+  return [registry, parent];
 }
 
 /** 원격 `uname -s` ⊕ `/proc/version` 의 microsoft 로 darwin|linux|wsl. 못 재면 null. */
@@ -344,9 +406,14 @@ export function runHostDoctor(options: HostDoctorOptions): HostDoctorReport {
   const platform = reached ? detectHostDoctorPlatform(remote, host) : null;
   const arch = reached ? detectHostDoctorArch(remote, host) : null;
   const specs = HOST_DOCTOR_CHECKS.filter((spec) => spec.roles.includes(role));
-  const checks = reached
+  const remoteChecks = reached
     ? specs.map((spec) => runCheck(spec, { host, remote, role, platform, arch, expected }))
     : specs.map((spec) => unmeasuredBecauseUnreached(spec, { platform, arch, expected }));
+  const checks = [...remoteChecks, ...(role === 'worker' && options.membership ? checkHostMembership(host, platform, options.membership) : [])];
+  const mismatch = checks.filter((check) => (check.id === 'registry.member' || check.id === 'parentHost.member') && check.status === 'fail');
+  if (mismatch.length) debug.log('fleet.doctor', 'membership-mismatch', { host, checks: mismatch.map((check) => ({ id: check.id, observed: check.observed, expected: check.expected })) });
+  const membershipUnmeasured = checks.filter((check) => (check.id === 'registry.member' || check.id === 'parentHost.member') && check.status === 'unmeasured');
+  if (membershipUnmeasured.length) debug.log('fleet.doctor', 'membership-unmeasured', { host, checks: membershipUnmeasured.map((check) => ({ id: check.id, observed: check.observed })) });
   const fail = checks.filter((check) => check.status === 'fail').map((check) => check.id);
   const unmeasured = checks.filter((check) => check.status === 'unmeasured').map((check) => check.id);
   const measuredAt = (options.now ?? (() => new Date()))().toISOString();
@@ -365,9 +432,13 @@ export function runHostDoctor(options: HostDoctorOptions): HostDoctorReport {
   };
 }
 
-/** 사람 출력 한 줄씩 — «✓|✗|→ <id> <한 줄>» 문법(node-setup.sh --check 와 같다). */
+/** 사람 출력 한 줄씩 — 기본은 «✓|✗|→ <id> <한 줄>»(node-setup.sh --check),
+ *  membership 미측정은 눈에 보이는 «⚠ <id> unmeasured: <원인>»을 쓴다. */
 export function formatHostDoctorLines(report: HostDoctorReport): string[] {
   return report.checks.map((check) => {
+    if ((check.id === 'registry.member' || check.id === 'parentHost.member') && check.status === 'unmeasured') {
+      return `⚠ ${check.id} unmeasured: ${check.observed}`;
+    }
     const mark = check.status === 'pass' ? '✓' : check.status === 'fail' ? '✗' : '→';
     const detail = check.status === 'fail' ? `${check.observed} (expected: ${check.expected})` : check.observed;
     return `${mark} ${check.id} ${detail}`;

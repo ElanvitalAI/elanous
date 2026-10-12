@@ -2,12 +2,12 @@ import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { Command } from 'commander';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { registerTasksCommands, spawnDetachedConfirmed, type DetachedSpawn } from '../cli/tasks-cli.js';
 import { debug } from '../debug/log.js';
-import { closeTaskCard, draftTaskOwner, handTask, launchArgs, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, TASK_CARD_LABEL, taskCardLabelContext, TaskAgentStateError, type TaskCard, type TaskLaunchContext } from './task-hand.js';
+import { closeTaskCard, draftTaskOwner, handTask, launchArgs, nextMoveFor, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, TASK_CARD_LABEL, taskCardLabelContext, TaskAgentStateError, type TaskCard, type TaskLaunchContext } from './task-hand.js';
 
 test('only a unique launched code-PR card owns the PR or its opening run', () => {
   const base: TaskCard = { id: 'ta-one', text: 'draft', createdAt: '2026-10-10T00:00:00Z',
@@ -37,6 +37,22 @@ async function cli(args: string[], deps: Parameters<typeof registerTasksCommands
     return { lines, code: process.exitCode };
   } finally { process.exitCode = previous ?? 0; }
 }
+
+test('launched 카드 nextMove는 종료 run-status 원장을 반영하되 live 재판정 CLI를 제안하지 않는다', async () => {
+  const runId = 'run-0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee';
+  const dir = mkdtempSync(join(tmpdir(), 'task-hand-ledger-'));
+  const ledgerPath = join(dir, `${runId}.jsonl`);
+  const card: TaskCard = { id: 'ta-ended', text: 'done', createdAt: '2026-10-12T00:00:00Z', status: 'launched', history: [], runId,
+    pr: { number: 19, url: 'https://github.com/o/r/pull/19' }, reviewRequests: [{ pr: 19, head: 'a'.repeat(40), at: '2026-10-12T00:01:00Z' }] };
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(ledgerPath, JSON.stringify({ runId, event: 'run-status', data: { runStatus: 'succeeded' } }) + String.fromCharCode(10));
+  const move = nextMoveFor(card, undefined, { ledgerDir: dir });
+  expect(move).toEqual({ kind: 'wait', reason: '런 원장 종료 — succeeded · 그림자 재판정은 완료 훅이 기록' });
+  expect(nextMoveFor({ ...card, pr: undefined }, undefined, { ledgerDir: dir })).toEqual({
+    kind: 'wait', reason: '런 원장 종료 — succeeded · PR 없음',
+  });
+  expect(move.command).toBeUndefined();
+});
 
 test('closeTaskCard — failed 로 닫고 history 한 줄을 더한다 · 빈 사유는 던진다 · 이미 닫은 카드는 그대로(멱등)', () => {
   const card: TaskCard = { id: 'ta-c', text: 't', createdAt: '2026-10-11T00:00:00.000Z', status: 'launched', history: [{ at: '2026-10-11T00:00:00.000Z', event: 'launch' }] };
@@ -133,7 +149,12 @@ test('shadow hand → 카드 1장 · 명령에 --merge-by-host · launcher 안 �
   const path = statePath();
   writeFileSync(path, JSON.stringify({ landingDay: '2026-10-06', landingsToday: 2, failureCounts: { k: 1 } }));
   let launched = 0;
-  const { lines, code } = await cli(['task', 'hand', 'fix the widget', '--seat', 'TC', '--checklist', 'CELL-1'], { taskStatePath: path, taskLauncher: () => { launched++; } });
+  const text = '대상 경로: src/task-agent/task-hand.ts\nfix the widget';
+  const { lines, code } = await cli(['task', 'hand', text, '--seat', 'TC', '--checklist', 'CELL-1'], {
+    taskStatePath: path,
+    taskLauncher: () => { launched++; },
+    releaseBoard: () => [{ level: 'task', id: 'CELL-1', title: 'fix the widget', status: 'open' }],
+  });
   expect(code).toBeFalsy();
   expect(launched).toBe(0);
   expect(lines.join('\n')).toContain('--merge-by-host');
@@ -142,7 +163,7 @@ test('shadow hand → 카드 1장 · 명령에 --merge-by-host · launcher 안 �
   expect(disk).toMatchObject({ landingDay: '2026-10-06', landingsToday: 2, failureCounts: { k: 1 } });
   const cards = Object.values(disk.tasks) as Array<Record<string, unknown>>;
   expect(cards).toHaveLength(1);
-  expect(cards[0]).toMatchObject({ text: 'fix the widget', seat: 'TC', checklistId: 'CELL-1', status: 'handed', history: [] });
+  expect(cards[0]).toMatchObject({ text, seat: 'TC', checklistId: 'CELL-1', status: 'handed', history: [] });
   expect(String(cards[0]!.id)).toStartWith('ta-');
   expect(typeof cards[0]!.createdAt).toBe('string');
 });

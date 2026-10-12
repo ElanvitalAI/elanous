@@ -2,7 +2,10 @@
 # coord-post.sh — 조율 채널 발신 «한 자리». 시각과 명시적 값을 본문에 안전하게 넣는다.
 # 사용: scripts/coord-post.sh [--set KEY=VALUE]... <본문파일>
 set -u
-CANON="docs/manual/MANUAL-multi-agent-coordination-channel-2026-07-28.md"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || { echo '⛔ 스크립트 위치를 못 읽었다' >&2; exit 3; }
+REPO_ROOT=$(dirname -- "$SCRIPT_DIR")
+CLI="$REPO_ROOT/bin/elanous.mjs"
+CANON="$REPO_ROOT/docs/manual/MANUAL-multi-agent-coordination-channel-2026-07-28.md"
 
 resolve_pr() {
   [ -f "$CANON" ] || return 0
@@ -40,7 +43,7 @@ BODY="${1:-}"
 grep -q '{{TS}}' "$BODY" || echo "⚠️ 본문에 {{TS}} 자리표시가 «없다» — 시각을 손으로 적지 않았는지 확인하라" >&2
 
 # 트랙 신원은 «정본 한 곳»에서 읽는다 — scripts/coord-tracks.json. 못 읽으면 추측하지 않고 선다.
-TRACKS_FILE="$(dirname "$0")/coord-tracks.json"
+TRACKS_FILE="$SCRIPT_DIR/coord-tracks.json"
 # 신원 = 2글자 id(OP·MK·TC·UX…) ⊕ 옛 한 글자 alias(S·T·O·F — 전환기엔 받되 경고). 목록은 정본에서만.
 IDS=$(grep -o '"id": *"[A-Z][A-Z]*"' "$TRACKS_FILE" 2>/dev/null | sed 's/.*"\([A-Z]*\)"$/\1/' | tr '\n' ' ')
 ALIASES=$(grep -o '"alias": *"[A-Z][A-Z]*"' "$TRACKS_FILE" 2>/dev/null | sed 's/.*"\([A-Z]*\)"$/\1/' | tr '\n' ' ')
@@ -192,7 +195,7 @@ if [ "${COORD_DRY_RUN:-}" = "1" ]; then
   exit 0
 fi
 
-POST_OUTPUT=$(bun bin/elanous.mjs gh pr comment "$PR" --body-file "$TMP" 2>&1)
+POST_OUTPUT=$(bun "$CLI" gh pr comment "$PR" --body-file "$TMP" 2>&1)
 RC=$?
 printf '%s\n' "$POST_OUTPUT" | tail -2
 VIA=""
@@ -204,11 +207,11 @@ if [ "$RC" -ne 0 ] && printf '%s' "$POST_OUTPUT" | grep -qiE 'rate limit|Somethi
   FIRSTOUT=$(head -1 "$TMP")
   # issues 코멘트 목록은 오래된 순이고 정렬 인자를 안 받는다 ⇒ 최근 10분만 since 로 자른다.
   SINCE10=$(date -u -v-10M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '-10 min' +%Y-%m-%dT%H:%M:%SZ)
-  if bun bin/elanous.mjs gh api "repos/{owner}/{repo}/issues/$PR/comments?since=$SINCE10&per_page=100" --jq '.[].body | split("\n")[0]' 2>/dev/null | grep -qxF -- "$FIRSTOUT"; then
+  if bun "$CLI" gh api "repos/{owner}/{repo}/issues/$PR/comments?since=$SINCE10&per_page=100" --jq '.[].body | split("\n")[0]' 2>/dev/null | grep -qxF -- "$FIRSTOUT"; then
     echo "[coord-post] 같은 첫 줄이 이미 채널에 있다 — GraphQL 이 실제로는 올렸다(이중 발신 안 함)" >&2
     exit 0
   fi
-  POST_OUTPUT=$(bun bin/elanous.mjs gh api -X POST "repos/{owner}/{repo}/issues/$PR/comments" -F "body=@$TMP" -q .html_url 2>&1)
+  POST_OUTPUT=$(bun "$CLI" gh api -X POST "repos/{owner}/{repo}/issues/$PR/comments" -F "body=@$TMP" -q .html_url 2>&1)
   RC=$?
   printf '%s\n' "$POST_OUTPUT" | tail -2
   VIA=" · REST 폴백"
@@ -224,13 +227,43 @@ POST_URL=$(printf '%s\n' "$POST_OUTPUT" | grep -oE 'https://github\.com/[^[:spac
 # test universe (OP 10-04 18:00). An explicit ELANOUS_STATE_DIR is the caller's chosen universe and wins;
 # otherwise prefer the installed CLI (resolves prod from any tree), else pin the source CLI to prod.
 if [ -n "${ELANOUS_STATE_DIR:-}" ]; then
-  RECORD=(bun bin/elanous.mjs coord event record)
+  RECORD=(bun "$CLI" coord event record)
+  MESSAGE=(bun "$CLI" msg post)
 elif command -v eln >/dev/null 2>&1; then
   RECORD=(eln coord event record)
+  MESSAGE=(eln msg post)
 else
-  RECORD=(env ELANOUS_STATE_DIR="$HOME/.elanous" bun bin/elanous.mjs --config-dir "$HOME/.elanous" coord event record)
+  RECORD=(env ELANOUS_STATE_DIR="$HOME/.elanous" bun "$CLI" --config-dir "$HOME/.elanous" coord event record)
+  MESSAGE=(env ELANOUS_STATE_DIR="$HOME/.elanous" bun "$CLI" --config-dir "$HOME/.elanous" msg post)
 fi
 if ! "${RECORD[@]}" --seat "$ID" --header "$(head -1 "$TMP")" --url "$POST_URL" >/dev/null 2>&1; then
   echo '⚠️ 맥락 원장 기록 실패(발신은 됐다)' >&2
 fi
+# S1's channel reader and this sender must agree on recipients. Keep the complete sent body
+# for msg, while the provenance key makes a later S1 scan (or a partial retry) idempotent.
+COMMENT_ID=${POST_URL##*#issuecomment-}
+if [ "$COMMENT_ID" = "$POST_URL" ] || ! [[ "$COMMENT_ID" =~ ^[0-9]+$ ]]; then
+  echo '⚠️ 채널 댓글 ID를 못 읽어 msg 반영을 건너뛴다(발신은 됐다 · S1 다리가 회수)' >&2
+  exit 0
+fi
+ROUTES=$(bun -e '
+  import { readFileSync } from "node:fs";
+  import { join } from "node:path";
+  import { pathToFileURL } from "node:url";
+  const { routeCoordComment } = await import(pathToFileURL(join(process.argv[3], "coord-msg-bridge.ts")).href);
+  const { canonicalSeatId } = await import(pathToFileURL(join(process.argv[3], "../src/msg/msg-store.ts")).href);
+  const route = routeCoordComment(readFileSync(process.argv[2], "utf8"));
+  if (!route || route.sender !== canonicalSeatId(process.argv[1])) process.exit(2);
+  console.log(route.recipients.join("\n"));
+' "$ID" "$TMP" "$SCRIPT_DIR") || {
+  echo '⚠️ msg 수신자 해석 실패(발신은 됐다 · S1 다리가 회수)' >&2
+  exit 0
+}
+while IFS= read -r RECIPIENT; do
+  [ -n "$RECIPIENT" ] || continue
+  if ! "${MESSAGE[@]}" --from "$ID" --to "$RECIPIENT" --kind coord \
+      --origin-key "coord:$COMMENT_ID:$RECIPIENT" < "$TMP" >/dev/null; then
+    echo "⚠️ msg 원장 기록 실패: $RECIPIENT(발신은 됐다 · S1 다리가 회수)" >&2
+  fi
+done <<< "$ROUTES"
 exit 0

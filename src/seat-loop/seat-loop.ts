@@ -85,7 +85,7 @@ export type SeatDeps = {
   /** Release schedules (version · cutAt) — a version is open while its cut is still ahead. Default reads the release ledger; unreadable ⇒ no checklist candidates (fail closed). */
   schedules?: () => Array<{ version: string; cutAt: string; landBy?: string | null }>;
   /** Checklist items of one version — default reads the release ledger DB (checklist.json is only a legacy import source since REL5b). */
-  checklistItems?: (version: string) => Array<{ id: string; title: string; status: string; owner?: string | null; disposition?: string; evidence?: string }>;
+  checklistItems?: (version: string) => Array<{ id: string; title: string; status: string; owner?: string | null; disposition?: string; evidence?: string; dispatchKind?: string }>;
   /** Optional injected traffic/handoff snapshots; defaults read the OP files. */
   trafficSignal?: TrafficSignalRead;
   handedCells?: ReadonlySet<string>;
@@ -588,6 +588,10 @@ export async function gatherSeatInputs(seat: string, deps: SeatDeps = {}, ledger
     }
     for (const item of items) {
       if (item.owner === seat && (item.status === 'yellow' || item.status === 'red')) {
+        if (item.dispatchKind && item.dispatchKind !== 'code') {
+          debug.log('seat.loop', 'skip-non-code-cell', { id: item.id, version, dispatchKind: item.dispatchKind });
+          continue;
+        }
         if (signal?.hold?.includes(item.id)) {
           debug.log('seat.loop', 'skip-signal-cell', { id: item.id, why: 'hold' });
           continue;

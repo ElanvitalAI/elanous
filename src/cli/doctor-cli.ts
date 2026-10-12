@@ -27,7 +27,7 @@ import {
   type ReadinessReport,
   type SubstrateSignals,
 } from './doctor-readiness.js';
-import { debug } from '../debug/log.js';
+import { debug, redactSecretText } from '../debug/log.js';
 import { resolveDaemonEndpoint, type ResolveDaemonEndpointOpts } from '../nexus/daemon-endpoint.js';
 import { applyDoctorFixes, applyGitInstall, applyServiceRestart, applySudoFixes, planDoctorFixes, type DoctorFixDeps, type DoctorFixItem } from './doctor-fix.js';
 import { ADVISABLE_DOCTOR_FIX_IDS, adviseDoctorFixes, type DoctorAdvice } from './doctor-llm-assist.js';
@@ -40,7 +40,10 @@ import type { LlmInventory } from '../llm/local-manager/types.js';
 import { buildDoctorBundle } from './doctor-bundle.js';
 import { uploadDoctorBundle } from './doctor-bundle-upload.js';
 import { checkNodeModules, formatNodeModulesCheck, nodeModulesTrees } from './doctor-node-modules.js';
-import { formatHostDoctorLines, runHostDoctor, type HostDoctorExpected, type HostDoctorRemote } from '../fleet/host-doctor.js';
+import { formatHostDoctorLines, runHostDoctor, type HostDoctorExpected, type HostDoctorOptions, type HostDoctorRemote } from '../fleet/host-doctor.js';
+import { listMachineResources } from './control-cli.js';
+import type { ResourceView } from '../control-plane/ledger.js';
+import { loadMachineLedger } from '../machines/machine-ledger.js';
 
 function defaultCheckPythonEnv(): { status: 'ok' | 'fixable' | 'manual'; evidence: string; remedy?: string } {
   const c = checkPythonEnv(false);
@@ -203,9 +206,14 @@ export interface DoctorCliDeps extends DoctorOptions, Pick<DoctorFixDeps, 'home'
   hostDoctorRemote?: HostDoctorRemote;
   /** `doctor host` 가 대조할 HQ 실측값(설치 판 · 이미지 핀) — 없으면 해당 점검은 unmeasured. */
   hostDoctorExpected?: HostDoctorExpected;
+  /** HQ membership readings; injected tests need no live Nexus. */
+  hostDoctorMembership?: () => Promise<NonNullable<HostDoctorOptions['membership']>>;
+  /** Nexus machine query seam; tests can exercise the default assembly without contacting a live service. */
+  hostDoctorMachineResources?: () => Promise<ResourceView[]>;
 }
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+const observationError = (error: unknown): string => redactSecretText(error instanceof Error ? error.message : String(error)).slice(0, 200);
 const tavilyNames = new Set(['TAVILY_API_KEY', 'TAVILY_KEY']);
 
 function defaultCodeRevision(): string | undefined {
@@ -1211,6 +1219,52 @@ function formatDoctorAdvice(advice: DoctorAdvice): string {
   ].join('\n');
 }
 
+function formatDoctorAdviceProposal(advice: DoctorAdvice, report: DoctorReport): { text: string; itemId: string; observedValue: string } | null {
+  const proposal = advice.ok ? advice.order[0] : undefined;
+  if (!proposal) return null;
+  const observation = report.readiness?.items.find((item) => item.id === proposal.readinessId);
+  if (!observation) return null;
+  const observedValue = `${observation.status}: ${observation.evidence}`;
+  return {
+    itemId: proposal.readinessId,
+    observedValue,
+    text: [
+      `LLM 제안: ${proposal.why}`,
+      `운영 팩 항목 id: ${proposal.readinessId}`,
+      `현재 관측값: ${observedValue}`,
+    ].join('\n'),
+  };
+}
+
+async function recordDoctorAdviceResponse(
+  proposal: { itemId: string; observedValue: string },
+  accepted: boolean,
+): Promise<void> {
+  debug.log('doctor.advise', accepted ? 'accepted' : 'rejected', {
+    itemId: proposal.itemId,
+    observedValue: proposal.observedValue,
+    applied: 0,
+  });
+}
+
+async function presentDoctorAdviceProposal(
+  advice: DoctorAdvice,
+  report: DoctorReport,
+  deps: DoctorCliDeps,
+  json: boolean,
+  announce: (text: string) => void,
+): Promise<{ proposal: { itemId: string; observedValue: string }; response: boolean | null; text: string } | null> {
+  const formatted = formatDoctorAdviceProposal(advice, report);
+  if (!formatted) return null;
+  const proposal = { itemId: formatted.itemId, observedValue: formatted.observedValue };
+  const interactive = deps.adviceInteractive ?? (process.stdin.isTTY === true && (json ? process.stderr.isTTY === true : process.stdout.isTTY === true));
+  if (!interactive) return { proposal, response: null, text: formatted.text };
+  announce(formatted.text);
+  const accepted = await (deps.confirmAdvice ?? ((message) => confirmDoctorAdvice(message, json)))('이 제안을 수락할까요? [y/N] ');
+  await recordDoctorAdviceResponse(proposal, accepted);
+  return { proposal, response: accepted, text: `${formatted.text}\n응답: ${accepted ? '수락' : '거절'}` };
+}
+
 async function confirmDoctorAdvice(message: string, json: boolean): Promise<boolean> {
   const prompt = createInterface({ input: process.stdin, output: json ? process.stderr : process.stdout });
   try { return /^(y|yes)$/i.test((await prompt.question(message)).trim()); }
@@ -1246,18 +1300,39 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
       if (checks.some((check) => check.status !== 'ok')) setExitCode(1);
     });
   doctor.command('host')
-    .description('Check whether a fleet host stands ready for its role (read-only · setup-status shape)')
-    .argument('<host>', "ssh name, or 'local' for this machine")
+    .description('Check whether a fleet host stands ready (read-only; membership needs a repository checkout and a named remote worker)')
+    .argument('<host>', "SSH name in fleet intent; an unknown name fails membership; 'local' checks readiness without membership")
     .option('--role <role>', 'host role: worker or hq', 'worker')
     .option('--json', 'structured output')
-    .action((host: string, opts: { role: string; json?: boolean }, command: Command) => {
+    .action(async (host: string, opts: { role: string; json?: boolean }, command: Command) => {
       if (opts.role !== 'worker' && opts.role !== 'hq') {
         err.error('--role must be worker or hq');
         setExitCode(1);
         return;
       }
       const json = opts.json === true || command.parent?.opts().json === true;
-      const report = runHostDoctor({ host, role: opts.role, remote: deps.hostDoctorRemote, expected: deps.hostDoctorExpected });
+      let membership: HostDoctorOptions['membership'];
+      if (opts.role === 'worker' && host !== 'local') {
+        if (deps.hostDoctorMembership) membership = await deps.hostDoctorMembership();
+        else {
+          let intent: NonNullable<HostDoctorOptions['membership']>['intent'] = null;
+          let machines: NonNullable<HostDoctorOptions['membership']>['machines'] = null;
+          let parentHosts: NonNullable<HostDoctorOptions['membership']>['parentHosts'] = null;
+          let intentError: string | undefined;
+          let machinesError: string | undefined;
+          let parentHostsError: string | undefined;
+          try { intent = loadMachineLedger(deps.repositoryRoot ?? repositoryRoot); } catch (error) { intentError = observationError(error); }
+          try { machines = await (deps.hostDoctorMachineResources ?? listMachineResources)(); } catch (error) { machinesError = observationError(error); }
+          try {
+            // UserConfig permits one parent object or an array of parent objects, never a bare host string.
+            const configured = (deps.userConfig ?? (deps.getUserConfig ?? getUserConfig)()).taskAgent?.parentHost;
+            if (configured === null) parentHostsError = 'taskAgent.parentHost is null';
+            else parentHosts = configured === undefined ? [] : Array.isArray(configured) ? configured : [configured];
+          } catch (error) { parentHostsError = observationError(error); }
+          membership = { intent, machines, parentHosts, intentError, machinesError, parentHostsError };
+        }
+      }
+      const report = runHostDoctor({ host, role: opts.role, remote: deps.hostDoctorRemote, expected: deps.hostDoctorExpected, membership });
       out.log(json ? JSON.stringify(report, null, 2) : formatHostDoctorLines(report).join('\n'));
       if (!report.ok) setExitCode(1);
     });
@@ -1404,10 +1479,17 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
       // Planning never writes; existing repairs require --yes, while git alone can use affirmative TTY consent.
       const plan = planDoctorFixes(fixes);
       const advice = opts.advise ? await requestDoctorAdvice(report, plan, deps) : undefined;
+      const proposal = advice && !opts.fix ? await presentDoctorAdviceProposal(advice, report, deps, opts.json === true, (text) => {
+        if (opts.json) err.error(text);
+        else out.log(text);
+      }) : null;
       if (!opts.fix) {
         out.log(opts.json
-          ? JSON.stringify({ ...report, advise: advice }, null, 2)
-          : [formatDoctorReport(report, { credentials: opts.credentials }), formatDoctorAdvice(advice!)].join('\n'));
+          ? JSON.stringify({ ...report, advise: advice, ...(proposal ? { adviceProposal: { itemId: proposal.proposal.itemId, observedValue: proposal.proposal.observedValue, response: proposal.response } } : {}) }, null, 2)
+          : [
+            formatDoctorReport(report, { credentials: opts.credentials }),
+            proposal?.response === null ? proposal.text : proposal ? `응답: ${proposal.response ? '수락' : '거절'}` : formatDoctorAdvice(advice!),
+          ].join('\n'));
         if (report.requiredMissing?.length) setExitCode(1);
         return;
       }

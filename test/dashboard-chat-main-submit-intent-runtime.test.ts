@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   createDashboardChatMainTurnSubmit,
@@ -12,6 +15,49 @@ import {
 } from '../src/session/index.js';
 
 describe('runDashboardChatMainSubmitIntent', () => {
+  it('uses the live ACP session for TUI submit logs when the isolated active pointer is absent', async () => {
+    const previousStateDir = process.env.ELANOUS_STATE_DIR;
+    const stateDir = mkdtempSync(join(tmpdir(), 'tui-submit-session-'));
+    const events: DebugEvent[] = [];
+    const wasFileEnabled = debug.status().file;
+    const wasDiagEnabled = debug.status().diag;
+    process.env.ELANOUS_STATE_DIR = stateDir;
+    debug.setFileEnabled(true);
+    debug.setDiagEnabled(true);
+    const unregister = debug.registerSink({
+      name: 'tui-submit-acp-session-test',
+      emit: (event) => { events.push(event); },
+    });
+    try {
+      expect(getActiveSessionId()).toBeNull();
+      const submit = createDashboardChatMainTurnSubmit({
+        kind: 'submit-turn',
+        source: { kind: 'keyboard', surface: 'dashboard-chat-main' },
+        text: 'first turn',
+        route: 'plain',
+        sessionId: 'elanous-session-live',
+      });
+      expect(submit.sessionId).toBe('elanous-session-live');
+      await runDashboardChatMainSubmitIntent({
+        submit,
+        runStickyAcpDispatch: () => {},
+        runPlainTurn: async () => {},
+      });
+    } finally {
+      unregister();
+      debug.setDiagEnabled(wasDiagEnabled);
+      debug.setFileEnabled(wasFileEnabled);
+      if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousStateDir;
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+    expect(events.filter((event) => event.category === 'input.submit')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: 'create', session_id: 'elanous-session-live' }),
+      expect.objectContaining({ event: 'execute.begin', session_id: 'elanous-session-live' }),
+      expect.objectContaining({ event: 'execute.ok', session_id: 'elanous-session-live' }),
+    ]));
+  });
+
   it('creates sticky ACP turn submits from submit intents', () => {
     expect(createDashboardChatMainTurnSubmit({
       kind: 'submit-turn',

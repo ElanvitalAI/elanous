@@ -5,7 +5,7 @@ import { expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { defaultHarnessStopDeps, readPidRecordFrom, stopHarnessRun } from '../harness/harness-stop.js';
+import { defaultHarnessStopDeps, psProcessStartMs, readPidRecordFrom, stopHarnessRun } from '../harness/harness-stop.js';
 
 test('a run that has only written its early pid record is found by harness stop (dry run)', async () => {
   const runsDir = mkdtempSync(join(tmpdir(), 'hs1-runs-'));
@@ -19,6 +19,11 @@ test('a run that has only written its early pid record is found by harness stop 
     expect(new TextDecoder().decode(value)).toContain('ready');
     const record = readPidRecordFrom(runsDir, runId);
     expect(record?.pid).toBe(child.pid);
+    // The writer must store the same second-resolution birth time that progress observes.
+    // Date.now() - uptime can land across a second boundary and hide a live run.
+    const observedStart = psProcessStartMs(child.pid!);
+    expect(observedStart).not.toBeNull();
+    expect(record?.startedAt).toBe(observedStart!);
     const result = await stopHarnessRun(runId, defaultHarnessStopDeps({
       readPidRecord: (id) => readPidRecordFrom(runsDir, id),
       readGoalPath: () => null,

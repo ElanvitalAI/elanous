@@ -42,6 +42,7 @@ beforeEach(() => {
 
 const treeRoot = treeDerivedRootFor(process.cwd());
 if (treeRoot === null) throw new Error('This test requires a source tree');
+const operatingRoot = join(homedir(), '.elanous');
 
 afterEach(() => {
   process.argv = savedArgv;
@@ -115,7 +116,7 @@ describe('applyConfigDirFlagFromArgv · side-effecting bootstrap', () => {
     process.argv = ['bun', 'src/index.ts', 'nexus', 'run'];
     const dir = applyConfigDirFlagFromArgv();
     expect(dir).toBeUndefined();
-    expect(getElanousConfigDir()).toBe(treeRoot);
+    expect(getElanousConfigDir()).toBe(operatingRoot);
   });
 });
 
@@ -124,17 +125,17 @@ describe('getElanousConfigDir · resolver-state isolation', () => {
     setElanousConfigDir('/tmp/explicit-contamination');
     expect(getElanousConfigDir()).toBe('/tmp/explicit-contamination');
     resetElanousConfigDir();
-    expect(getElanousConfigDir()).toBe(treeRoot);
+    expect(getElanousConfigDir()).toBe(operatingRoot);
   });
 
   it('restores ELANOUS_STATE_DIR independently through environment cleanup', () => {
     process.env.ELANOUS_STATE_DIR = '/tmp/state-contamination';
     expect(getElanousConfigDir()).toBe('/tmp/state-contamination');
     delete process.env.ELANOUS_STATE_DIR;
-    expect(getElanousConfigDir()).toBe(treeRoot);
+    expect(getElanousConfigDir()).toBe(operatingRoot);
   });
 
-  it('resetting a memoized tree root resolves a different source tree', () => {
+  it('resetting a memoized root does not infer a universe from another source tree', () => {
     const first = mkdtempSync(join(tmpdir(), 'config-dir-first-'));
     const second = mkdtempSync(join(tmpdir(), 'config-dir-second-'));
     const originalArgv = process.argv;
@@ -144,15 +145,15 @@ describe('getElanousConfigDir · resolver-state isolation', () => {
       process.argv = [originalArgv[0] ?? 'bun', join(first, 'bin', 'elanous.mjs')];
       const firstRoot = join(first, '.elanous-test');
       expect(treeDerivedRootFor(first)).toBe(firstRoot);
-      expect(getElanousConfigDir()).toBe(firstRoot);
+      expect(getElanousConfigDir()).toBe(operatingRoot);
 
       process.argv = [originalArgv[0] ?? 'bun', join(second, 'bin', 'elanous.mjs')];
       const secondRoot = join(second, '.elanous-test');
       expect(treeDerivedRootFor(second)).toBe(secondRoot);
       expect(secondRoot).not.toBe(firstRoot);
-      expect(getElanousConfigDir()).toBe(firstRoot);
+      expect(getElanousConfigDir()).toBe(operatingRoot);
       resetEffectiveInstanceRoot();
-      expect(getElanousConfigDir()).toBe(secondRoot);
+      expect(getElanousConfigDir()).toBe(operatingRoot);
     } finally {
       process.argv = originalArgv;
       rmSync(first, { recursive: true, force: true });
@@ -167,18 +168,18 @@ describe('getElanousConfigDir · resolver-state isolation', () => {
     resetElanousConfigDir();
     expect(getElanousConfigDir()).toBe('/tmp/state-contamination');
     delete process.env.ELANOUS_STATE_DIR;
-    expect(getElanousConfigDir()).toBe(treeRoot);
+    expect(getElanousConfigDir()).toBe(operatingRoot);
   });
 });
 
 describe('getElanousConfigDir · resolution order (env-var-free)', () => {
-  it('defaults to the tree-derived test universe when nothing is set', () => {
-    expect(getElanousConfigDir()).toBe(treeRoot);
+  it('defaults to the operating house when nothing is set', () => {
+    expect(getElanousConfigDir()).toBe(operatingRoot);
   });
 
   it('IGNORES ELANOUS_DAEMON_DIR env var (removed 2026-05-13)', () => {
     process.env.ELANOUS_DAEMON_DIR = '/tmp/env-must-be-ignored';
-    expect(getElanousConfigDir()).toBe(treeRoot);
+    expect(getElanousConfigDir()).toBe(operatingRoot);
   });
 
   it('honours programmatic override', () => {
@@ -192,13 +193,13 @@ describe('getElanousConfigDir · resolution order (env-var-free)', () => {
     expect(process.env.ELANOUS_DAEMON_DIR).toBeUndefined();
   });
 
-  it('resetElanousConfigDir falls back to the tree-derived test universe regardless of the retired env', () => {
+  it('resetElanousConfigDir falls back to the operating house regardless of the retired env', () => {
     setElanousConfigDir('/tmp/will-be-cleared');
     resetElanousConfigDir();
-    expect(getElanousConfigDir()).toBe(treeRoot);
+    expect(getElanousConfigDir()).toBe(operatingRoot);
     // Even with a stray env var, the resolver remains env-blind.
     process.env.ELANOUS_DAEMON_DIR = '/tmp/still-ignored';
-    expect(getElanousConfigDir()).toBe(treeRoot);
+    expect(getElanousConfigDir()).toBe(operatingRoot);
   });
 
   it('setElanousConfigDir rejects empty strings', () => {
@@ -255,7 +256,7 @@ describe('ignored ELANOUS_CONFIG_DIR · process-wide observation', () => {
         const { roots, events } = JSON.parse(readFileSync(resultFile, 'utf8')) as {
           roots: string[]; events: Array<{ data: { env: string; resolved: string; source: string } }>;
         };
-        const actual = scenario.flag ?? scenario.state ?? treeRoot;
+        const actual = scenario.flag ?? scenario.state ?? operatingRoot;
         expect(roots).toEqual(Array(scenario.calls).fill(actual));
         const divergent = scenario.name === 'divergent' || scenario.name === 'repeated' || scenario.name === 'different-flag' || scenario.name === 'default';
         expect(child.stderr).toBe(divergent

@@ -7,7 +7,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateIndexKeyPair, signIndex } from '../../market/signed-index.js';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
-import { installPlugin, listInstalledPlugins, removePlugin, resolvePluginSource, withLedgerLock, type InstallEvent } from './plugin-install.js';
+import { installPlugin, listInstalledPlugins, pluginInstallPath, removePlugin, resolvePluginSource, withLedgerLock, type InstallEvent } from './plugin-install.js';
+import { loadPluginManifestFromDir } from '../core/manifest.js';
 import { addMarket } from './market-fetch.js';
 import { getNodeKind, registerNodeKind, unregisterPluginNodeKind, getNodeKindRegistration } from '../../graph-kinds/registry.js';
 
@@ -671,4 +672,52 @@ describe('plugin installation — 🅢 must-fix follow-up (09-29)', () => {
     expect(() => withLedgerLock(root, () => 'ran', null)).toThrow(/timed out/);
     expect(Date.now() - started).toBeGreaterThanOrEqual(9_000);
   }, 20_000);
+});
+
+// [wiring] installPlugin hands the PluginManifest normalized by loadPluginManifestFromDir
+// into the install path via pluginInstallPath. These tests pin that regression: with a
+// manifest present and with the manifest-absent fallback, the destination must carry
+// manifest.id and manifest.version — never an undefined segment.
+describe('plugin installation — normalized manifest wiring ([wiring] installPlugin → pluginInstallPath)', () => {
+  test('manifest present: destination embeds the normalized manifest id and version', async () => {
+    const root = fixture();
+    const pkg = packageAt(join(root, 'source'), 'manifest-plugin', '2.4.6');
+    const manifest = loadPluginManifestFromDir(pkg, { id: 'manifest-plugin' }).manifest;
+    const installed = await installPlugin(pkg, { root, yes: true });
+    expect(installed.path).toBe(pluginInstallPath(root, 'local', manifest));
+    expect(installed.path).toBe(join(root, 'plugins', 'local', 'manifest-plugin', '2.4.6'));
+    expect(installed.path).not.toContain('undefined');
+    expect(existsSync(installed.path)).toBe(true);
+  });
+
+  test('manifest absent: loadPluginManifestFromDir fallback still defines id and version for the install path', async () => {
+    const root = fixture();
+    const pkg = join(root, 'no-manifest');
+    mkdirSync(join(pkg, 'skills', 'orphan-skill'), { recursive: true });
+    writeFileSync(join(pkg, 'skills', 'orphan-skill', 'SKILL.md'), '---\nname: orphan-skill\n---\n');
+    writeFileSync(join(pkg, 'plugin.ts'), 'export default {}');
+    const manifest = loadPluginManifestFromDir(pkg, { id: 'no-manifest' }).manifest;
+    expect(manifest.id).toBe('no-manifest');
+    expect(manifest.version).toBe('0.0.0');
+    const installed = await installPlugin(pkg, { root, yes: true });
+    expect(installed.path).toBe(pluginInstallPath(root, 'local', manifest));
+    expect(installed.path).toBe(join(root, 'plugins', 'local', 'no-manifest', '0.0.0'));
+    expect(installed.path).not.toContain('undefined');
+    expect(existsSync(installed.path)).toBe(true);
+  });
+
+  test('market install: pluginInstallPath receives source.market with the normalized manifest identity', async () => {
+    const root = fixture();
+    const market = join(root, 'markets', 'wiring-market');
+    mkdirSync(market, { recursive: true });
+    packageAt(join(market, 'source'), 'wiring-plugin', '3.1.4');
+    writeFileSync(join(market, 'marketplace.json'), JSON.stringify({ name: 'wiring-market', plugins: [
+      { name: 'wiring-plugin', version: '3.1.4', source: { source: 'local', path: 'source' } },
+    ] }));
+    const manifest = loadPluginManifestFromDir(join(market, 'source'), { id: 'wiring-plugin' }).manifest;
+    const installed = await installPlugin('wiring-plugin@wiring-market', { root, allowUnsigned: true, yes: true });
+    expect(installed.path).toBe(pluginInstallPath(root, 'wiring-market', manifest));
+    expect(installed.path).toBe(join(root, 'plugins', 'wiring-market', 'wiring-plugin', '3.1.4'));
+    expect(installed.path).not.toContain('undefined');
+  });
 });

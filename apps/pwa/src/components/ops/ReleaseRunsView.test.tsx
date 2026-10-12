@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { act, create } from 'react-test-renderer';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import { currentNodeId, ReleaseRunsContent, ReleaseRunsView } from './ReleaseRunsView';
+import { ReleaseStrip } from './ReleaseStrip';
 import ReleasePage from '../../app/ops/release/page';
 import type { ReleaseRun, OpsResult } from '@/lib/ops-api';
 
@@ -73,6 +74,22 @@ describe('OPS1 release runs', () => {
       onVersion={() => {}} onRun={() => {}} onNode={() => {}} />);
     expect(html).not.toContain('aria-label="노드 진행"');
     expect(html).toContain('aria-label="런 목록"');
+    expect(html).toContain('런이 달라 못 잼');
+    expect(html).not.toContain('aria-label="발행 진행"');
+  });
+  test('ambiguous ledger run ids cannot mix the strip and flow; a matching run uses one id', () => {
+    const duplicate = { ...run, status: 'failed', path: ['other'], nodes: [{ nodeId: 'other', ok: false, summary: '다른 런' }] };
+    const view = (data: ReleaseRun[]) => renderToStaticMarkup(<ReleaseRunsContent result={{ kind: 'ready', data }}
+      version="0.2.9" selectedRun={run} openedNodeId={null} log={null}
+      onVersion={() => {}} onRun={() => {}} onNode={() => {}} onStripRun={() => {}} />);
+    const mixed = view([run, duplicate]);
+    expect(mixed).toContain('런이 달라 못 잼');
+    expect(mixed).not.toContain('aria-label="발행 진행"');
+    expect(mixed).not.toContain('aria-label="노드 진행"');
+    const matched = view([run]);
+    expect(matched).toContain('aria-label="발행 진행" data-run-id="r1"');
+    expect(matched).toContain('aria-label="노드 진행" data-run-id="r1"');
+    expect(matched).not.toContain('못 잼');
   });
   test('client effect polls running runs every 10 seconds, pauses while hidden, stops after completion and on 403', async () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -185,6 +202,41 @@ describe('OPS1 release runs', () => {
       expect(chips()).toEqual(['✓ first', '✓ waiting', '✓ last']);
       expect(flow().findAllByType('li').map((node) => node.props['data-node-state'])).toEqual(['done', 'done', 'done']);
       expect(tree!.root.findByProps({ 'aria-label': '런 목록' }).findAllByType('button')[1]!.props['aria-pressed']).toBe(true);
+    } finally {
+      if (tree) await act(async () => { tree!.unmount(); });
+      restoreGlobal('window', originalWindow);
+      restoreGlobal('document', originalDocument);
+    }
+  });
+  test('strip rejects an id different from the flow rather than showing nodes from another run', () => {
+    const another = { ...run, runId: 'another', path: ['other-node'], nodes: [{ nodeId: 'other-node', ok: null, summary: '다른 런' }] };
+    const html = renderToStaticMarkup(<ReleaseStrip result={{ kind: 'ready', data: [another] }} selectedRun={another}
+      expectedRunId="r1" onSelect={() => {}} />);
+    expect(html).toContain('런이 달라 못 잼');
+    expect(html).not.toContain('aria-label="발행 진행"');
+    expect(html).not.toContain('other-node');
+  });
+  test('a selected run removed by polling is not silently replaced by the latest run', async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+    const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+    const timers = new Map<number, () => void>();
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: { location: { search: '?run=r1' },
+      setInterval: (fn: () => void) => { timers.set(1, fn); return 1; }, clearInterval: () => { timers.clear(); } } });
+    Object.defineProperty(globalThis, 'document', { configurable: true, value: { hidden: false, addEventListener: () => {}, removeEventListener: () => {} } });
+    const other = { ...run, runId: 'other', startedAt: new Date(Date.now() - 60_000).toISOString(), path: ['other-node'], nodes: [{ nodeId: 'other-node', ok: null, summary: '다른 런' }] };
+    let runs = [run, other];
+    const client = { fetchResponse: async () => new Response(JSON.stringify(runs)) };
+    const daemon = { config: { baseUrl: '', token: '', provider: '' }, setConfig: () => {}, client: client as never, sessionId: 'test', setSessionId: () => {} };
+    let tree: ReturnType<typeof create> | undefined;
+    try {
+      await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ReleaseRunsView /></DaemonContext.Provider>); });
+      expect(tree!.root.findByProps({ 'aria-label': '발행 진행' }).props['data-run-id']).toBe('r1');
+      runs = [other];
+      await act(async () => { for (const tick of [...timers.values()]) tick(); });
+      expect(JSON.stringify(tree!.toJSON())).toContain('런이 달라 못 잼');
+      expect(tree!.root.findAllByProps({ 'aria-label': '발행 진행' })).toHaveLength(0);
+      expect(tree!.root.findAllByProps({ 'aria-label': '노드 진행' })).toHaveLength(0);
     } finally {
       if (tree) await act(async () => { tree!.unmount(); });
       restoreGlobal('window', originalWindow);

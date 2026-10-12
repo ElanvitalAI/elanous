@@ -14,13 +14,20 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { isNoneSentinelFinding } from '../agent-substrate/pr-reviewer.js';
 import { debug } from '../debug/log.js';
-import { LIVE_MOVE_RESULT_EVENT, readTaskAgentState, updateTaskCard, type TaskCard, type TaskCardEvent } from './task-hand.js';
+import { LIVE_MOVE_RESULT_EVENT, cardPrNumber, readTaskAgentState, readTaskCard, updateTaskCard, type TaskCard, type TaskCardEvent } from './task-hand.js';
+import type { RejudgeDeps } from './rejudge-on-head.js';
 
 export const REVIEW_RESULT_MISSING_EFFECT = 'review process produced no result';
 /** 결과 파일은 있는데 읽지 못했다(EACCES 등) — «결과 없음»과 가른다(결과가 있었을 수 있다). */
 export const REVIEW_RESULT_UNREADABLE_EFFECT = 'review result file unreadable';
+/** Detached self review child: only this card and exact result file may trigger a completion tick. */
+export const TA_REVIEW_COMPLETION_CARD_ENV = 'ELANOUS_TA_REVIEW_COMPLETION_CARD';
+export const TA_REVIEW_COMPLETION_STATE_ENV = 'ELANOUS_TA_REVIEW_COMPLETION_STATE';
+export const TA_REVIEW_COMPLETION_RESULT_ENV = 'ELANOUS_TA_REVIEW_COMPLETION_RESULT';
 /** 리뷰 한 판(1차 ⊕ 폴백 · ACP 300s 상한 여러 번)을 넉넉히 덮는 대기 상한 — 이 안에는 «아직»으로 본다. */
 export const REVIEW_RESULT_WAIT_MS = 90 * 60_000;
+
+const reviewRejudgeInFlight = new Set<string>();
 
 const SHA40 = /^[0-9a-f]{40}$/i;
 
@@ -88,6 +95,8 @@ export function pendingReviewResults(card: TaskCard): ReviewRequest[] {
 export interface CaptureReviewResultsOptions {
   /** 이 카드들만 본다 — 없으면 상태 파일의 모든 카드. */
   cardIds?: readonly string[];
+  /** A detached completion callback may only harvest its own result file. */
+  resultPaths?: readonly string[];
   now?: () => Date;
   /** 시험 seam — 결과 파일 읽기(없으면 ENOENT 를 던진다). */
   readFile?: (path: string) => string;
@@ -123,6 +132,7 @@ export function captureReviewResults(statePath: string, opts: CaptureReviewResul
     if (!card) continue;
     for (const request of pendingReviewResults(card)) {
       const resultPath = request.resultPath!;
+      if (opts.resultPaths && !opts.resultPaths.includes(resultPath)) continue;
       let text: string | null = null;
       let readError: string | null = null;
       let unreadable = false;
@@ -182,6 +192,59 @@ export function captureReviewResults(statePath: string, opts: CaptureReviewResul
     }
   }
   return out;
+}
+
+/** Run after the detached review child has fully written its JSON stdout. Never infer a card from PR alone. */
+export async function rejudgeCompletedTaskReview(
+  env: Record<string, string | undefined> = process.env,
+  rejudge?: (cardId: string, statePath: string) => Promise<unknown>,
+  rejudgeDeps?: RejudgeDeps,
+): Promise<boolean> {
+  const cardId = env[TA_REVIEW_COMPLETION_CARD_ENV];
+  const statePath = env[TA_REVIEW_COMPLETION_STATE_ENV];
+  const resultPath = env[TA_REVIEW_COMPLETION_RESULT_ENV];
+  if (!cardId || !statePath || !resultPath) return false;
+  const before = readTaskCard(cardId, statePath);
+  const bound = before?.reviewRequests?.find((item) => item.resultPath === resultPath);
+  if (before?.status !== 'launched' || before.taLand !== true || !bound || cardPrNumber(before) !== bound.pr
+    || !SHA40.test(bound.head) || (before.history ?? []).some((item) => item.event === 'async-result-rejudge' && item.resultPath === resultPath)) return false;
+  captureReviewResults(statePath, { cardIds: [cardId], resultPaths: [resultPath] });
+  const key = `${statePath}\0${cardId}\0${resultPath}`;
+  if (reviewRejudgeInFlight.has(key)) return false;
+  const card = readTaskCard(cardId, statePath);
+  const request = card?.reviewRequests?.find((item) => item.resultPath === resultPath);
+  if (card?.status !== 'launched' || card.taLand !== true || !request || cardPrNumber(card) !== request.pr
+    || !(card.history ?? []).some((item) => item.event === LIVE_MOVE_RESULT_EVENT && item.resultPath === resultPath && item.kind === 'review'
+      && item.pr === request.pr && SHA40.test(request.head) && SHA40.test(item.head ?? '')
+      && item.effect?.startsWith('review result captured') && item.reviewed === true && item.head?.toLowerCase() === request.head.toLowerCase())
+    || (card.history ?? []).some((item) => item.event === 'async-result-rejudge' && item.resultPath === resultPath)) return false;
+  reviewRejudgeInFlight.add(key);
+  try {
+    const run = async (): Promise<unknown> => {
+      if (rejudgeDeps) {
+        const { rejudgeShadowCard } = await import('./rejudge-on-head.js');
+        return rejudgeShadowCard(cardId, statePath, rejudgeDeps, { pr: request.pr, head: request.head, kind: 'review', resultPath });
+      } else if (rejudge) return rejudge(cardId, statePath);
+      else {
+        const { rejudgeAsyncResultCard } = await import('./rejudge-on-head.js');
+        return rejudgeAsyncResultCard(cardId, statePath, {}, { pr: request.pr, head: request.head, kind: 'review', resultPath });
+      }
+    };
+    const { requireCompletedHeadRejudge } = await import('./rejudge-on-head.js');
+    try { requireCompletedHeadRejudge(await run(), request.pr, request.head); }
+    catch { requireCompletedHeadRejudge(await run(), request.pr, request.head); } // Bounded retry; no marker on failed outcomes.
+    updateTaskCard(statePath, cardId, (current) => current?.status === 'launched' && current.taLand === true && cardPrNumber(current) === request.pr
+      && (current.reviewRequests ?? []).some((item) => item.pr === request.pr && SHA40.test(item.head) && item.head.toLowerCase() === request.head.toLowerCase() && item.resultPath === resultPath)
+      && (current.history ?? []).some((item) => item.event === LIVE_MOVE_RESULT_EVENT && item.resultPath === resultPath && item.kind === 'review'
+        && item.pr === request.pr && SHA40.test(item.head ?? '') && item.head?.toLowerCase() === request.head.toLowerCase()
+        && item.reviewed === true && item.effect?.startsWith('review result captured'))
+      && !(current.history ?? []).some((item) => item.event === 'async-result-rejudge' && item.resultPath === resultPath)
+      ? { ...current, history: [...(current.history ?? []), { at: new Date().toISOString(), event: 'async-result-rejudge', kind: 'review', pr: request.pr, head: request.head, resultPath, effect: 'completion callback succeeded' }] }
+      : undefined);
+  } finally {
+    reviewRejudgeInFlight.delete(key);
+  }
+  return true;
 }
 
 /**

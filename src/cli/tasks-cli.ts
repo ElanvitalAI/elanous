@@ -1,17 +1,22 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { loadRunLedger as loadRunLedgerSync } from '../self-implement/run-ledger.js';
+import { goalRunDbPath, loadGoalRunQuery } from '../self-implement/goal-run-store.js';
+import { loadGoalAskRecords } from '../self-implement/goal-ask-store.js';
 import { join, resolve } from 'node:path';
 import { InvalidArgumentError, Option, type Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { readNexusRuntime } from '../nexus/runtime.js';
 import { checklistDevVersion } from '../release-loop/checklist.js';
+import { assignedVersions, releasedVersion, validateVersion } from '../release-loop/feature-store.js';
+import { compareVersions } from '../directives/version-at.js';
 import { cardsBoard, countBoardTasks, INTERNAL_PACK_PROJECT, mergeBoards, releasePackBoard, type BoardNode } from '../task-agent/board.js';
 import type { Task } from '../task-orchestrator/types.js';
-import { cardPrNumber, CLOSED_BY_HAND_EVENT, closeTaskCard, COMPLETION_KINDS, handTask, updateTaskCard, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, nextMoveFor, resolveHandText, readTaskAgentState, readTaskCard, taskAgentStatePath as taskStatePathDefault, shellQuote, TA_LAND_ENV, TASK_CARD_PREFIX, TASK_SEATS, type CompletionKind, type TaskCard, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
+import { cardPrNumber, CLOSED_BY_HAND_EVENT, closeTaskCard, COMPLETION_KINDS, handTask, updateTaskCard, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, nextMoveFor, resolveHandText, readTaskAgentState, readTaskCard, taskAgentStatePath as taskStatePathDefault, shellQuote, TASK_CARD_PREFIX, TASK_SEATS, type CompletionKind, type TaskCard, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
 import { readCardSalvageBranch, recordWiringLiveVerified, refreshCardRunBinding, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
 import { captureReviewResults } from '../task-agent/review-result-capture.js';
+import { replayRemoteCardMoves } from '../task-agent/shadow.js';
 import { HAND_MOVE_KINDS, recordHandMove } from '../task-agent/live-move-history.js';
 import { advanceMission, handMission, MissionAdvanceError, openMissionIds, recordPieceRef, type AdvanceMissionResult, type MissionDecompose, type PieceEvidenceReader } from '../task-agent/mission.js';
 import { formatSevenVerbLive, formatTaskAgentCover, measureSevenVerbLive, measureTaskAgentCover, type CoverRow, type SevenVerbLive, type TaskAgentCoverInput } from '../task-agent/cover.js';
@@ -38,7 +43,9 @@ export interface TasksCliDeps {
   /** `task advance` 의 착지 근거 읽기(시험 주입). 기본 = `predecessorState`(gh · 런 원장). */
   pieceEvidence?: PieceEvidenceReader;
   /** `task board` 의 내부 팩 어댑터(시험 주입). 기본 = 현재 판(`checklistDevVersion()`)의 `releasePackBoard` — 읽기만. */
-  releaseBoard?: () => BoardNode[];
+  releaseBoard?: (version?: string) => BoardNode[];
+  /** `tasks hand --checklist` 판 목록(시험 주입). 기본은 발행 전 체크리스트가 있는 판 전부. */
+  releaseVersions?: () => string[];
   /** `tasks show`·`advance` 의 런 근거 읽기(시험 주입) — 기본 = 런 원장(이 우주 ⊕ 연합) ⊕ 호스트 logs 의 Pod job-finished. */
   cardRunEvidence?: CardRunEvidenceDeps;
   /** `tasks live-verified` 가 적는 런 원장 디렉터리(시험 주입). 기본 = `runLedgerDir()`. */
@@ -54,10 +61,16 @@ export interface TasksCliDeps {
   coverLogs?: (query: LogQuery) => LogStoreRow[] | CoverLogRead;
   /** `tasks cover --by-card` 카드 원장 읽기 seam(읽기 전용). 플래그가 있을 때만 부른다. 기본 = TA 카드 원장(task-agent-actions.json). null = 못 읽음. */
   coverCards?: () => CoverCardRow[] | null | Promise<CoverCardRow[] | null>;
+  /** Read-only authored goal provenance; null means the authoring ledger could not be read. */
+  coverGoalAsks?: () => { authorRunId: string; goalId: string; createdAt: string }[] | null;
+  /** Read-only terminal goal records; null means the goal ledger could not be read. */
+  coverGoalRuns?: () => { goalId: string; outcome: string; stage?: string; startedAt: string; completedAt?: string }[] | null;
   /** TA-REJUDGE-ON-HEAD — `tasks rejudge` 의 판단 의존(시험 주입 · 기본 = 설정 liveMoves ⊕ 실물 gh·리뷰·재게이트·land). */
   rejudge?: Partial<import('../task-agent/rejudge-on-head.js').RejudgeDeps>;
   /** TA-REJUDGE-ON-HEAD — `tasks regate-run` 의 재게이트(시험 주입 · 기본 `runHostRegate`). */
   hostRegate?: (input: import('../self-implement/host-regate.js').HostRegateInput) => Promise<import('../self-implement/host-regate.js').HostRegateResult>;
+  /** Isolated regate-run tests can disable the asynchronous completion callback explicitly. */
+  regateCompletion?: false;
 }
 
 /** `<조각id>=<값>` 반복 인자. */
@@ -152,8 +165,8 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
     try { debug.log('task-agent', 'parent-host-fallback', { host: target.host, runId: context.runId, gaps, facts }); } catch { /* fail-soft */ }
     notice(`[parent-host] ${target.host} 로 못 띄움 — ${multi ? '다음 호스트 또는 로컬 발사로 간다' : '로컬 발사로 간다'}: ${gaps.join(' · ')}`);
   };
-  if (cwd || context.env[TA_LAND_ENV] === '1') {
-    failed(targets[0]!, [cwd ? 'project-target-is-local' : 'ta-land-needs-local-parent']);
+  if (cwd) {
+    failed(targets[0]!, ['project-target-is-local']);
     return null;
   }
   let launchHoldActive = false;
@@ -502,6 +515,7 @@ export function readTaskAgentCover(
   window: { sinceMs?: number; untilMs?: number } = {},
   query: NonNullable<TasksCliDeps['coverLogs']> = queryCoverLogs,
   taskCards?: readonly { id: string }[] | null,
+  goalReaders: Pick<TasksCliDeps, 'coverGoalAsks' | 'coverGoalRuns'> = {},
 ): { rows: CoverRow[]; sevenVerbs: SevenVerbLive; limitReached: boolean; unreadableStores: number } {
   let unreadableStores = 0;
   const read = (category: 'task-agent' | 'pr.land', event: 'action' | 'step'): { rows: LogStoreRow[]; limitReached: boolean } | null => {
@@ -517,16 +531,51 @@ export function readTaskAgentCover(
   const actions = actionRead?.rows ?? null;
   const lands = landRead?.rows ?? null;
   const truncated = { taskAgentActions: actionRead?.limitReached === true, allLands: landRead?.limitReached === true };
+  const inWindow = (value: string): boolean => {
+    const time = Date.parse(value);
+    return Number.isFinite(time) && (window.sinceMs === undefined || time >= window.sinceMs) && (window.untilMs === undefined || time <= window.untilMs);
+  };
+  let goalAsks: ReturnType<NonNullable<TasksCliDeps['coverGoalAsks']>> = null;
+  let goalRuns: ReturnType<NonNullable<TasksCliDeps['coverGoalRuns']>> = null;
+  let goalAsksTruncated = false;
+  let goalRunsTruncated = false;
+  try {
+    if (goalReaders.coverGoalAsks) goalAsks = goalReaders.coverGoalAsks();
+    else {
+      const asks = loadGoalAskRecords({ limit: COVER_QUERY_LIMIT }, goalRunDbPath());
+      goalAsksTruncated = asks.length >= COVER_QUERY_LIMIT;
+      goalAsks = asks;
+    }
+  } catch { goalAsks = null; }
+  try {
+    if (goalReaders.coverGoalRuns) goalRuns = goalReaders.coverGoalRuns();
+    else {
+      const runs = loadGoalRunQuery({ limit: COVER_QUERY_LIMIT }, goalRunDbPath());
+      goalRunsTruncated = runs?.truncated ?? false;
+      goalRuns = runs?.records.map(({ goalId, record }) => ({
+        goalId, outcome: record.outcome, stage: record.stage, startedAt: record.startedAt ?? '', completedAt: record.completedAt,
+      })) ?? null;
+    }
+  } catch { goalRuns = null; }
+  const authoredGoalIds = new Set(goalAsks?.map((ask) => ask.goalId) ?? []);
   const input: TaskAgentCoverInput = {
     taskAgentActions: actions === null ? null : coverEvents(actions, 'task-agent', 'action', (data) =>
       typeof data.kind === 'string' && typeof data.result === 'string'
         ? { kind: data.kind as NonNullable<TaskAgentCoverInput['taskAgentActions']>[number]['kind'], result: data.result, ...(typeof data.taskId === 'string' ? { taskId: data.taskId } : {}) } : null),
     allLands: lands === null ? null : coverEvents(lands, 'pr.land', 'step', (data) =>
       typeof data.step === 'string' && typeof data.ok === 'boolean' ? { step: data.step, ok: data.ok } : null),
-    truncated,
+    truncated: { ...truncated, goalAsks: goalAsksTruncated, goalRuns: goalRunsTruncated },
+    // Authoring may start before this window; completion is the event being counted.
+    goalAsks,
+    goalRuns: goalRuns && (window.sinceMs !== undefined || window.untilMs !== undefined)
+      ? goalRuns.some((run) => authoredGoalIds.has(run.goalId)
+          && run.stage === 'merged' && (run.outcome === 'completed' || run.outcome === 'merged')
+          && !Number.isFinite(Date.parse(run.completedAt ?? '')))
+        ? null : goalRuns.filter((run) => inWindow(run.completedAt ?? ''))
+      : goalRuns,
     ...(taskCards === undefined ? {} : { taskCards }),
   };
-  return { rows: measureTaskAgentCover(input), sevenVerbs: measureSevenVerbLive(input), limitReached: truncated.taskAgentActions || truncated.allLands, unreadableStores };
+  return { rows: measureTaskAgentCover(input), sevenVerbs: measureSevenVerbLive(input), limitReached: truncated.taskAgentActions || truncated.allLands || goalAsksTruncated || goalRunsTruncated, unreadableStores };
 }
 
 export function registerTasksCommands(program: Command, deps: TasksCliDeps = {}): void {
@@ -568,7 +617,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           }
           taskCards = coverCardsInWindow(cards, { sinceMs, untilMs });
         }
-        const { rows, sevenVerbs, limitReached, unreadableStores } = readTaskAgentCover({ sinceMs, untilMs }, deps.coverLogs, taskCards);
+        const { rows, sevenVerbs, limitReached, unreadableStores } = readTaskAgentCover({ sinceMs, untilMs }, deps.coverLogs, taskCards, deps);
         const limitWarning = limitReached ? `조회 상한 ${COVER_QUERY_LIMIT} 도달 — 더 오래된 사건이 있을 수 있다(절단된 수를 전체로 읽지 말 것)` : null;
         const storeWarning = unreadableStores > 0 ? `logs.db ${unreadableStores}개를 못 읽었다 — 그 우주의 사건은 수에 없다(«없다»로 읽지 말 것)` : null;
         if (opts.json) out(JSON.stringify({ rows, sevenVerbs, limitReached, unreadableStores, ...(limitWarning ? { warning: limitWarning } : {}), ...(storeWarning ? { storeWarning } : {}) }));
@@ -624,6 +673,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .description('TASK-AGENT 에 과제 한 줄을 넘긴다 — 카드를 적고 첫 수(harness say --substrate pod --merge-by-host)를 고른다 · 기본 shadow(발사 0) · `--mission` 이면 조각 카드 ⊕ 선후로 쪼개 선행 없는 조각만 넘긴다')
     .addOption(new Option('--seat <seat>', `과제 자리 (${TASK_SEATS.join('|')})`).choices([...TASK_SEATS]))
     .option('--checklist <cellId>', '릴리스 체크리스트 칸 id')
+    .option('--version <version>', '체크리스트 판 고정(생략하면 발행 전 판을 가까운 순서로 탐색)')
     .addOption(new Option('--completion <kind>', `종결 종류 (${COMPLETION_KINDS.join('|')} · 기본 code-pr = PR 병합)`).choices([...COMPLETION_KINDS]))
     .option('--mission <text>', '미션 문면 — 조각(`- …`·`① …`·`1. …` ⊕ `after: 1`)으로 나열돼 있으면 결정론, 아니면 분해기로 쪼갠다')
     .option('--project <id>', '프로젝트 id — --target 과 함께')
@@ -635,7 +685,72 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .option('--child-llm <provider/model>', 'TASKS-HAND-CHILD-LLM — 구현 자식 LLM(예: grok/grok-4.7) → 발사 인자 --child-llm-provider <provider> --child-llm-model <model> · «첫» `/` 에서만 가른다(모델 id 의 `/` 는 보존) · openrouter 는 모델 id 가 openrouter/ 접두를 포함하므로 전체를 모델로(openrouter/z-ai/glm-5.3 → --child-llm-model openrouter/z-ai/glm-5.3) · 카드 childLlm · 안 주면 명령·카드 무변경')
     .option('--child-llm-effort <level>', '구현 자식 추론 노력 → 발사 인자 --child-llm-effort(검증은 하니스 · --child-llm 과 함께)')
     .option('--json', 'JSON 출력')
-    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; completion?: CompletionKind; mission?: string; project?: string; target?: string; goal?: string; milestone?: string; live?: boolean; taLand?: boolean; childLlm?: string; childLlmEffort?: string; json?: boolean }) => {
+    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; version?: string; completion?: CompletionKind; mission?: string; project?: string; target?: string; goal?: string; milestone?: string; live?: boolean; taLand?: boolean; childLlm?: string; childLlmEffort?: string; json?: boolean }) => {
+      const suppliedText = text !== undefined;
+      if (opts.version !== undefined && opts.checklist === undefined) {
+        out('--version 은 --checklist 와 함께 준다');
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.checklist !== undefined) {
+        const findTitle = (nodes: BoardNode[]): string | undefined => {
+          for (const node of nodes) {
+            if (node.level === 'task' && node.id === opts.checklist) return node.title;
+            const nested = node.children ? findTitle(node.children) : undefined;
+            if (nested !== undefined) return nested;
+          }
+          return undefined;
+        };
+        if (opts.version !== undefined) {
+          try { validateVersion(opts.version); }
+          catch (error) {
+            out(error instanceof Error ? error.message : String(error));
+            process.exitCode = 1;
+            return;
+          }
+        }
+        const versions = opts.version !== undefined ? [opts.version]
+          : [checklistDevVersion(), ...(deps.releaseVersions?.() ?? (deps.releaseBoard ? [] : (() => {
+            const released = releasedVersion();
+            return assignedVersions().filter((version) => !released || compareVersions(version, released) > 0);
+          })()))];
+        const current = checklistDevVersion();
+        const orderedVersions = [...new Set(versions)].sort((a, b) => {
+          if (a === current) return -1;
+          if (b === current) return 1;
+          const aFuture = compareVersions(a, current) > 0;
+          const bFuture = compareVersions(b, current) > 0;
+          if (aFuture !== bFuture) return aFuture ? -1 : 1;
+          return aFuture ? compareVersions(a, b) : compareVersions(b, a);
+        });
+        const matches: Array<{ version: string; title: string }> = [];
+        for (const version of orderedVersions) {
+          try {
+            const title = findTitle((deps.releaseBoard ?? releasePackBoard)(version));
+            if (title !== undefined) matches.push({ version, title });
+          } catch (error) {
+            if (opts.version !== undefined) {
+              out(`체크리스트 판 읽기 실패: ${version}`);
+              process.exitCode = 1;
+              return;
+            }
+            console.error(`⚠ 체크리스트 판 ${version} 읽기 실패 — 다른 판 계속 조회: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        const title = matches[0]?.title;
+        if (title === undefined) {
+          out(`체크리스트 칸 없음: ${opts.checklist}`);
+          process.exitCode = 1;
+          return;
+        }
+        if (matches.length > 1) console.error(`⚠ 체크리스트 칸 ${opts.checklist} 중복: ${matches.map((match) => match.version).join(', ')} — 가장 가까운 판 ${matches[0]!.version} 선택 (--version 으로 고정 가능)`);
+        if (opts.mission === undefined && text === undefined) text = title;
+      }
+      if (opts.checklist !== undefined && opts.mission === undefined && suppliedText && !text!.split(/\r?\n/, 1)[0]!.startsWith('대상 경로:')) {
+        out('칸 문면을 쓰려면 문면 인자를 빼라');
+        process.exitCode = 1;
+        return;
+      }
       await registerTaskAgentSink(deps.registerSink);
       if ((text === undefined) === (opts.mission === undefined)) {
         out('과제 한 줄 «또는» --mission <문면> 중 하나만 준다');
@@ -712,7 +827,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           out(`${result.card.id}\t${result.mode}\t${result.launched ? 'launched' : 'not launched'}`);
           out(`elanous ${result.move.command!.map(shellQuote).join(' ')}`);
           if (result.cwd) out(`(cwd: ${result.cwd})`);
-          if (result.card.taLand) out('(ta-land — 발사 env ELANOUS_TA_LAND=1 · 로컬 부모 · taskAgent.liveMoves 에 propose-land 가 있으면 병합은 TASK-AGENT 몫, 없으면 종전대로 호스트 병합)');
+          if (result.card.taLand) out('(ta-land — 발사 env ELANOUS_TA_LAND=1 · 원격 또는 로컬 부모 · taskAgent.liveMoves 에 propose-land 가 있으면 병합은 TASK-AGENT 몫, 없으면 종전대로 호스트 병합)');
           if (!result.launched) out('(shadow — 띄우지 않았다 · 띄우려면 --live)');
         }
       } catch (error) {
@@ -961,6 +1076,9 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           for (const cardId of bindable) {
             // HARNESS-PARENT-ON-MSB1: 원격 부모 런은 원장이 그 호스트에 있다 — HQ 거울로 먼저 당긴다(읽기 전용).
             await mirrorRemoteCardLedger(cardId, deps);
+            try { await replayRemoteCardMoves(cardId, deps.taskStatePath ?? taskStatePathDefault(), deps.cardRunEvidence ?? {}); } catch (error) {
+              try { debug.log('task-agent', 'card-binding-replay-failed', { card: cardId, reason: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+            }
             try { await refreshCardRunBinding(cardId, deps.taskStatePath ?? taskStatePathDefault(), deps.cardRunEvidence ?? {}); } catch (error) {
               // 근거 없음으로 보인다 — 원장 부재와 갈리게 실패는 남긴다.
               try { debug.log('task-agent', 'card-bind-failed', { card: cardId, via: 'show', error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
@@ -1040,6 +1158,10 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
       const liveMoves = deps.rejudge?.liveMoves ?? await configuredTaskAgentLiveMoves();
       const all = [];
       for (const cardId of ids) {
+        await mirrorRemoteCardLedger(cardId, deps);
+        try { await replayRemoteCardMoves(cardId, statePath, deps.cardRunEvidence ?? {}); } catch (error) {
+          try { debug.log('task-agent', 'card-binding-replay-failed', { card: cardId, reason: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+        }
         let outcomes: Awaited<ReturnType<typeof rejudgeCardOnHead>>;
         try { outcomes = await rejudgeCardOnHead(cardId, { ...deps.rejudge, liveMoves, live: { ...deps.rejudge?.live, statePath } }); } catch (error) {
           // 카드 하나의 예외가 --all 의 나머지 카드 판단을 멈추지 않게 — 사유를 남기고 다음 카드로.
@@ -1073,6 +1195,14 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
       try { debug.log('task-agent', 'regate-run', { card: opts.card, ...record, failures: result.failures.slice(0, 3) }); } catch { /* fail-soft */ }
       mkdir(dir(opts.out), { recursive: true });
       write(opts.out, JSON.stringify(record));
+      if (deps.regateCompletion !== false) {
+        try {
+          const { rejudgeCompletedTaskRegate } = await import('../task-agent/rejudge-on-head.js');
+          await rejudgeCompletedTaskRegate(opts.card, pr, opts.head, opts.out, deps.taskStatePath ?? taskStatePathDefault(), undefined, deps.rejudge);
+        } catch (error) {
+          try { debug.log('task-agent', 'regate-completion-rejudge-failed', { card: opts.card, pr, head: opts.head, reason: String(error).slice(-300) }, { level: 'warn' }); } catch { /* fail-soft */ }
+        }
+      }
       if (!result.passed) process.exitCode = 1;
     });
 

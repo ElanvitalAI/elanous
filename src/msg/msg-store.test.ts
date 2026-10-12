@@ -22,6 +22,7 @@ describe('message identity and envelope', () => {
     expect(canonicalSeatId(' agent-7 ')).toBe('AGENT-7');
     expect(canonicalSeatId('constructor')).toBe('CONSTRUCTOR');
     expect(canonicalSeatId('toString')).toBe('TOSTRING');
+    expect(canonicalSeatId('all')).toBe('ALL');
     for (const invalid of ['', ' ', '../OP', 'a b', '⚠', 'x'.repeat(65)]) expect(() => canonicalSeatId(invalid)).toThrow();
     expect(() => canonicalSeatId(12 as unknown as string)).toThrow();
   });
@@ -43,6 +44,44 @@ describe('message identity and envelope', () => {
 });
 
 describe('durable message log and cursor', () => {
+  test('ALL is one topic row, delivered through each recipient cursor except the sender', () => {
+    const store = new MsgStore(':memory:');
+    try {
+      const broadcast = store.post({ from: 'OP', to: 'ALL', body: 'notice', kind: 'memo' });
+      expect(store.db.query('SELECT COUNT(*) AS count FROM msg_messages').get()).toEqual({ count: 1 });
+      expect(store.list('OP')).toEqual([]);
+      for (const recipient of ['MK', 'TC', 'UX']) expect(store.list(recipient)).toEqual([broadcast]);
+      expect(store.unread()).toEqual([
+        { recipient: 'MK', count: 1 }, { recipient: 'TC', count: 1 }, { recipient: 'UX', count: 1 },
+      ]);
+      expect(store.unreadCount('COORDINATOR')).toBe(1);
+      expect(store.ack('MK', broadcast.id)).toBe(broadcast.id);
+      expect(store.list('MK', store.getCursor('MK'))).toEqual([]);
+      expect(store.unreadCount('MK')).toBe(0);
+      expect(store.unreadCount('TC')).toBe(1);
+      expect(store.unread().find(row => row.recipient === 'MK')).toBeUndefined();
+      expect(() => store.post({ from: 'ALL', to: 'MK', body: 'invalid' })).toThrow('ALL cannot send');
+      expect(() => store.list('ALL')).toThrow('ALL is a topic');
+    } finally { store.close(); }
+  });
+
+  test('DM and ALL share insertion order and one acknowledgement cursor without changing DM rows', () => {
+    const store = new MsgStore(':memory:');
+    try {
+      const dm = store.post({ from: 'TC', to: 'MK', body: 'direct' });
+      const all = store.post({ from: 'OP', to: 'ALL', body: 'everyone' });
+      store.post({ from: 'MK', to: 'ALL', body: 'everyone except MK' });
+      expect(store.list('MK').map(message => [message.id, message.to, message.body])).toEqual([
+        [dm.id, 'MK', 'direct'], [all.id, 'ALL', 'everyone'],
+      ]);
+      expect(store.list('MK', dm.id).map(message => message.id)).toEqual([all.id]);
+      expect(store.unreadCount('MK')).toBe(2);
+      store.ack('MK', all.id);
+      expect(store.unreadCount('MK')).toBe(0);
+      expect(store.unreadCount('TC')).toBe(2);
+    } finally { store.close(); }
+  });
+
   test('persist across reopen; recipient paging uses exclusive ID cursor and never acks on read', () => {
     const path = diskPath();
     const first = new MsgStore(path);
@@ -74,6 +113,87 @@ describe('durable message log and cursor', () => {
       expect(third.append({ from: 'OP', to: 'MK', body: 'third' }).id).toBeGreaterThan(b!);
       expect(third.unreadRecipients()).toEqual([{ recipient: 'MK', count: 1 }, { recipient: 'UX', count: 1 }]);
     } finally { third.close(); }
+  });
+
+  test('inserts provenance-backed messages once per comment and recipient', () => {
+    const store = new MsgStore(':memory:');
+    try {
+      const input = { from: 'OP', to: 'MK', body: 'comment 65001', kind: 'coord' };
+      const first = store.appendWithProvenance(input, 'coord:65001:MK');
+      const duplicate = store.appendWithProvenance(input, 'coord:65001:MK');
+      const otherRecipient = store.appendWithProvenance({ ...input, to: 'UX' }, 'coord:65001:UX');
+
+      expect(duplicate).toEqual(first);
+      expect(otherRecipient.id).not.toBe(first.id);
+      expect(store.listByRecipient('MK')).toEqual([first]);
+      expect(store.listByRecipient('UX')).toEqual([otherRecipient]);
+      expect(store.db.query('SELECT provenance_key FROM msg_provenance ORDER BY provenance_key').all())
+        .toEqual([{ provenance_key: 'coord:65001:MK' }, { provenance_key: 'coord:65001:UX' }]);
+      expect(() => store.appendWithProvenance(input, 'coord:65001:UX')).toThrow('provenance recipient does not match message recipient');
+      expect(() => store.appendWithProvenance(input, 'coord:65001')).toThrow('invalid message provenance key');
+    } finally { store.close(); }
+  });
+
+  test('provenance deduplication survives reopening the ledger', () => {
+    const path = diskPath();
+    const firstStore = new MsgStore(path);
+    let firstId: number;
+    try {
+      firstId = firstStore.appendWithProvenance(
+        { from: 'OP', to: 'MK', body: 'comment 65002', kind: 'coord' }, 'coord:65002:MK',
+      ).id;
+    } finally { firstStore.close(); }
+
+    const reopened = new MsgStore(path);
+    try {
+      const duplicate = reopened.appendWithProvenance(
+        { from: 'OP', to: 'MK', body: 'comment 65002', kind: 'coord' }, 'coord:65002:MK',
+      );
+      expect(duplicate.id).toBe(firstId!);
+      expect(reopened.listByRecipient('MK')).toEqual([duplicate]);
+      expect(reopened.db.query('SELECT COUNT(*) AS count FROM msg_provenance').get())
+        .toEqual({ count: 1 });
+    } finally { reopened.close(); }
+  });
+
+  test('two concurrent connections return the same message for one provenance key', async () => {
+    const path = diskPath();
+    const marker = `${path}.race`;
+    const moduleUrl = new URL('./msg-store.ts', import.meta.url).href;
+    const childScript = `
+      import { existsSync, writeFileSync } from 'node:fs';
+      const [moduleUrl, dbPath, marker, index] = process.argv.slice(1);
+      const { MsgStore } = await import(moduleUrl);
+      const store = new MsgStore(dbPath);
+      try {
+        writeFileSync(marker + index, 'ready');
+        const deadline = Date.now() + 10000;
+        while (!existsSync(marker + (index === '0' ? '1' : '0'))) {
+          if (Date.now() > deadline) throw new Error('peer did not become ready');
+          await Bun.sleep(5);
+        }
+        const message = store.appendWithProvenance(
+          { from: 'OP', to: 'MK', body: 'same comment', kind: 'coord' }, 'coord:65003:MK',
+        );
+        console.log(message.id);
+      } finally { store.close(); }
+    `;
+    const children = [0, 1].map(index => Bun.spawn(
+      [process.execPath, '-e', childScript, moduleUrl, path, marker, String(index)],
+      { stdout: 'pipe', stderr: 'pipe' },
+    ));
+    const results = await Promise.all(children.map(async child => ({
+      code: await child.exited,
+      id: (await new Response(child.stdout).text()).trim(),
+      error: (await new Response(child.stderr).text()).trim(),
+    })));
+    expect(results.map(result => result.error)).toEqual(['', '']);
+    expect(results.map(result => result.code)).toEqual([0, 0]);
+    expect(results[0]!.id).toBe(results[1]!.id);
+    const store = new MsgStore(path);
+    try {
+      expect(store.listByRecipient('MK')).toHaveLength(1);
+    } finally { store.close(); }
   });
 
   test('rejects future cursors and keeps acknowledgements monotonic across two connections', () => {

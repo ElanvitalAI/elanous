@@ -18,6 +18,7 @@ import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { withFileLockSync } from '../storage/file-lock.js';
 import { checkCompletionEvidence, deliverableReceiptEvidence } from './completion-evidence.js';
 import { judgeNextMove } from './judge.js';
+import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 
 export interface ResolveHandTextDeps {
   cwd: string;
@@ -94,6 +95,8 @@ export type CompletionKind = typeof COMPLETION_KINDS[number];
  */
 export interface TaskCardEvent {
   at: string; event: string; detail?: string; runId?: string; pr?: number;
+  /** 원격 미결 수를 HQ 에 한 번만 회수하기 위한 원장 사건 id. */
+  sourceId?: string;
   /** `closed-by-hand` 줄만 — 닫은 사유 · 닫은 자리(`closeTaskCard`). */
   reason?: string; by?: string;
   kind?: string; executed?: boolean; ok?: boolean; executorResult?: 'shadow' | 'live'; head?: string; effect?: string;
@@ -167,7 +170,9 @@ export interface TaskCard {
    */
   regates?: Array<{ pr: number; head: string; at: string; resultPath?: string; passed?: boolean; status?: string; baseCommit?: string; detail?: string;
     /** REJUDGE base-stale — 같은 머리를 새 base 위에서 다시 잰 재게이트면, land 가 낡았다고 거절한 앞 재게이트의 base(멱등 키 = 머리 ⊕ 이 base). */
-    staleBase?: string }>;
+    staleBase?: string;
+    /** TA-READY-BEFORE-REGATE — draft 때문에 실패한 같은 머리를 ready 뒤 딱 한 번 다시 잰다. */
+    readyRetry?: true }>;
   /**
    * Live land attempts, claimed before invocation, once per PR head even if the command fails.
    * TA-LAND-RETRY-ON-INFRA — a failed attempt carries `class`/`reason`: `infra` (TA-side, allow-listed) leaves one more attempt on
@@ -316,7 +321,8 @@ export function launchArgs(card: Pick<TaskCard, 'text' | 'seat' | 'childLlm'>): 
  * 이유에 «착지 미확인»을 단다(착지했다/안 했다를 단정하지 않는다).
  * 미션 카드는 스스로 발사하지 않는다 · 아직 안 뜬 조각의 선행이 덜 착지했으면 `wait after <id>`.
  */
-export function nextMoveFor(card: TaskCard, landed?: ReadonlySet<string>): TaskCardMove {
+export function nextMoveFor(card: TaskCard, landed?: ReadonlySet<string>, deps: { ledgerDir?: string } = {}): TaskCardMove {
+  // Completion callbacks record a shadow decision; do not suggest the live CLI here.
   if (card.pieces) return { kind: 'wait', reason: `미션 — 조각 ${card.pieces.length}장이 선후대로 발사된다` };
   const unmet = (card.after ?? []).filter((id) => !landed?.has(id));
   if (card.status !== 'launched' && unmet.length > 0) return { kind: 'wait', reason: `after ${unmet.join(', ')}${landed ? '' : ' · 착지 미확인'}` };
@@ -324,6 +330,16 @@ export function nextMoveFor(card: TaskCard, landed?: ReadonlySet<string>): TaskC
   if (card.status === 'launch-failed') return { kind: 'launch', command: launchArgs(card), reason: '직전 발사 실패 — 다시 발사' };
   // live-move·hand-move 줄(관측 기록)은 실패 사유가 아니다 — 그 줄을 뺀 마지막 칸이 사유다(live-move 줄 없는 카드는 종전과 같다).
   if (card.status === 'failed') return { kind: 'wait', reason: card.history.filter((item) => item.event !== LIVE_MOVE_HISTORY_EVENT && item.event !== LIVE_MOVE_RESULT_EVENT && item.event !== HAND_MOVE_HISTORY_EVENT).at(-1)?.detail ?? '런 실패 — PR·수확 가지 없음' };
+  if (card.status === 'launched' && card.runId) {
+    try {
+      const ledger = loadRunLedger(card.runId, deps.ledgerDir ?? runLedgerDir());
+      const terminal = ledger?.filter((entry) => entry.event === 'run-status').at(-1);
+      if (terminal && ['succeeded', 'failed', 'cancelled', 'abandoned'].includes(String(terminal.data.runStatus))) {
+        if (cardPrNumber(card) === undefined) return { kind: 'wait', reason: `런 원장 종료 — ${terminal.data.runStatus} · PR 없음` };
+        return { kind: 'wait', reason: `런 원장 종료 — ${terminal.data.runStatus} · 그림자 재판정은 완료 훅이 기록` };
+      }
+    } catch { /* 원장 결손·손상은 종료로 단정하지 않는다. */ }
+  }
   return { kind: 'wait', reason: '발사됨 — 런 멈춤을 슈퍼바이저 그림자 판단(task-agent.shadow-move)이 받는다' };
 }
 

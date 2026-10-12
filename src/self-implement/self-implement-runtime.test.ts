@@ -123,8 +123,8 @@ describe('selfImplementRuntime — feature/goals 배타 계약', () => {
       throw new Error('goals execution must not start');
     });
 
-    await expect(selfImplementRuntime.run({}, ctx)).rejects.toThrow('exactly one of `feature` or `goals` is required');
-    await expect(selfImplementRuntime.run({ feature: 'single', goals: ['parallel'] }, ctx)).rejects.toThrow('exactly one of `feature` or `goals` is required');
+    await expect(selfImplementRuntime.run({}, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('exactly one of `feature` or `goals` is required') });
+    await expect(selfImplementRuntime.run({ feature: 'single', goals: ['parallel'] }, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('exactly one of `feature` or `goals` is required') });
     expect(featureCalls).toBe(0);
     expect(goalsCalls).toBe(0);
   });
@@ -139,7 +139,39 @@ describe('selfImplementRuntime — feature/goals 배타 계약', () => {
 
     const result = await selfImplementRuntime.run({ feature: 'single feature' }, ctx);
 
-    expect(result).toMatchObject({ ok: true, output: '[self-implement] observed by central CLI' });
+    expect(result).toMatchObject({ ok: true, kind: 'observed-only', observed: true, missing: ['runId', 'node'] });
+    expect(result.output).toContain('관측 전용이라 런을 발사하지 않았습니다');
+  });
+
+  test('중앙 CLI 오류는 failed 꼴로 이유와 다음 행동을 돌려준다', async () => {
+    _setSelfImplementCliCommandForTesting(async () => ({ ok: false, message: 'goal author failed' } as never));
+    const result = await selfImplementRuntime.run({ feature: 'single feature' }, ctx);
+    expect(result).toMatchObject({ ok: false, kind: 'failed', reason: 'goal author failed', missing: ['runId', 'node'] });
+    expect(result.output).toContain('goal author failed');
+    expect(result.output).toContain('이 턴에서 파일을 직접 편집하지 마세요');
+    expect(result.next).toContain('다시 요청');
+  });
+
+  test('런 결과 실패는 launched로 포장하지 않고 실제 런 식별자를 보존한다', async () => {
+    _setSelfImplementCliCommandForTesting(async () => ({
+      ok: true, kind: 'self', exitCode: 1,
+      result: { ok: false, stage: 'gate-failed', detail: 'typecheck failed', runId: 'run-fail', node: 'gate' },
+    } as never));
+    const result = await selfImplementRuntime.run({ feature: 'single feature' }, ctx);
+    expect(result).toMatchObject({ ok: false, kind: 'failed', reason: 'typecheck failed', runId: 'run-fail', node: 'gate', missing: [], next: 'eln self run run-fail' });
+    expect(result.output).toContain('typecheck failed');
+    expect(result.output).toContain('이 턴에서 파일을 직접 편집하지 마세요');
+  });
+
+  test('성공 응답이어도 런 ID가 없으면 pending 문면으로 남긴다', async () => {
+    _setSelfImplementCliCommandForTesting(async () => ({
+      ok: true, kind: 'self', exitCode: 0,
+      result: { ok: true, stage: 'pr-declined', node: 'open-pr' },
+    } as never));
+    const result = await selfImplementRuntime.run({ feature: 'ID 미관측' }, ctx);
+    expect(result).toMatchObject({ ok: true, kind: 'pending', missing: ['runId'], next: 'eln self running-runs' });
+    expect(result.output).toContain('런 식별자는 아직 미관측');
+    expect(result.output).not.toContain('하니스가 맡았습니다');
   });
 
   test('실행 원본 세션을 SelfImplement CLI의 명시 parentSessionId로 전달한다', async () => {
@@ -179,6 +211,160 @@ describe('selfImplementRuntime — feature/goals 배타 계약', () => {
     expect(featureResult.ok).toBe(true);
     expect(receivedGoals).toEqual({ goals: [{ feature: 'parallel goal', autoMerge: false }] });
     expect(goalsResult.ok).toBe(true);
+    expect(goalsResult).toMatchObject({
+      kind: 'pending', next: 'eln self running-runs\n일치하는 런이 없으면 ID 미확정 골을 다시 요청', missing: ['runId', 'node'],
+      goalResults: [{ goal: '골 1', status: 'done' }],
+    });
+  });
+
+  test('다중 골 완료는 관측된 런 ID와 골별 상태를 보존하고, 일부 실패는 원본 이유를 반환한다', async () => {
+    _setSelfImplementOrchestrateForTesting(async () => [
+      { feature: '성공 골', status: 'done', runId: 'run-real-1', stage: 'pr-opened' },
+      { feature: '실패 골', status: 'failed', runId: 'run-real-2', error: { code: 'GATE', message: 'typecheck failed' } },
+    ] as never);
+    const mixed = await selfImplementRuntime.run({ goals: ['성공 골', '실패 골'] }, ctx);
+    expect(mixed).toMatchObject({
+      ok: false, kind: 'failed', missing: ['node'], reason: '실패 골: typecheck failed',
+      goalResults: [
+        { goal: '성공 골', status: 'done', runId: 'run-real-1', stage: 'pr-opened' },
+        { goal: '실패 골', status: 'failed', runId: 'run-real-2', reason: 'typecheck failed' },
+      ],
+    });
+    expect(mixed.output).toContain('실패 골: failed · 런 run-real-2 · 이유 typecheck failed');
+
+    _setSelfImplementOrchestrateForTesting(async () => [
+      { feature: '성공 골', status: 'done', runId: 'run-real-1', stage: 'pr-opened' },
+    ] as never);
+    const done = await selfImplementRuntime.run({ goals: ['성공 골'] }, ctx);
+    expect(done).toMatchObject({
+      ok: true, kind: 'launched', next: 'eln self run run-real-1', missing: ['node'],
+      goalResults: [{ goal: '성공 골', status: 'done', runId: 'run-real-1', stage: 'pr-opened' }],
+    });
+    expect(done.output).toContain('다음 조회: eln self run run-real-1');
+    expect(done.output).toContain('이 턴에서 파일을 직접 편집하지 마세요');
+
+    _setSelfImplementOrchestrateForTesting(async () => [
+      { feature: '진행 골', status: 'running', runId: 'run-live-1' },
+    ] as never);
+    const running = await selfImplementRuntime.run({ goals: ['진행 골'] }, ctx);
+    expect(running).toMatchObject({
+      ok: true, kind: 'launched', next: 'eln self run run-live-1', missing: ['node'],
+      goalResults: [{ goal: '진행 골', status: 'running', runId: 'run-live-1' }],
+    });
+  });
+
+  test('병렬 골의 여러 런 ID는 각각 실행 가능한 조회 명령으로 안내한다', async () => {
+    _setSelfImplementOrchestrateForTesting(async () => [
+      { feature: '첫 골', status: 'running', runId: 'run-first' },
+      { feature: '둘째 골', status: 'running', runId: 'run-second' },
+    ] as never);
+    const result = await selfImplementRuntime.run({ goals: ['첫 골', '둘째 골'] }, ctx);
+    expect(result.next).toBe('eln self run run-first\neln self run run-second');
+    expect(result.output).toContain('eln self run run-first\neln self run run-second');
+    expect(result.output).not.toContain('eln self runs');
+  });
+
+  test('병렬 골의 확인 ID·미확정 ID·실패를 각각 조회와 재요청으로 안내한다', async () => {
+    _setSelfImplementOrchestrateForTesting(async () => [
+      { feature: '확정 골', status: 'running', runId: 'run-confirmed' },
+      { feature: '미확정 골', status: 'running' },
+      { feature: '실패 골', status: 'failed', error: { code: 'GATE', message: 'gate failed' } },
+    ] as never);
+    const mixed = await selfImplementRuntime.run({ goals: ['확정 골', '미확정 골', '실패 골'] }, ctx);
+    expect(mixed).toMatchObject({ kind: 'failed', reason: '실패 골: gate failed' });
+    expect(mixed.next).toBe('eln self run run-confirmed\neln self running-runs\n일치하는 런이 없으면 ID 미확정 골을 다시 요청\n실패·차단 이유를 확인한 뒤 해당 골을 다시 요청');
+    expect(mixed.output).toContain(mixed.next!);
+
+    _setSelfImplementOrchestrateForTesting(async () => [
+      { feature: '첫 미확정 골', status: 'running' },
+      { feature: '둘째 미확정 골', status: 'running' },
+    ] as never);
+    const allPending = await selfImplementRuntime.run({ goals: ['첫 미확정 골', '둘째 미확정 골'] }, ctx);
+    expect(allPending).toMatchObject({ kind: 'pending' });
+    expect(allPending.next).toBe('eln self running-runs\n일치하는 런이 없으면 ID 미확정 골을 다시 요청');
+    expect(allPending.output).toContain(allPending.next!);
+  });
+
+  test('결과에서 안내하는 self 조회 하위 명령은 실제 CLI 도움말에 있다', async () => {
+    _setSelfImplementOrchestrateForTesting(async () => [{ feature: '미확정 골', status: 'running' }] as never);
+    const pending = await selfImplementRuntime.run({ goals: ['미확정 골'] }, ctx);
+    _setSelfImplementOrchestrateForTesting(async () => [{ feature: '확정 골', status: 'running', runId: 'run-confirmed' }] as never);
+    const launched = await selfImplementRuntime.run({ goals: ['확정 골'] }, ctx);
+    const command = Bun.spawnSync([process.execPath, join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs'), 'self', '--help'], { cwd: join(import.meta.dir, '..', '..') });
+    expect(command.exitCode).toBe(0);
+    const help = new TextDecoder().decode(command.stdout);
+    const queryLines = [pending.next, launched.next].flatMap(next => next?.split('\n').filter(line => line.startsWith('eln self ')) ?? []);
+    expect(queryLines).toHaveLength(2);
+    for (const next of queryLines) {
+      const subcommand = next.split(' ')[2];
+      expect(help).toContain(`${subcommand} [options]`);
+    }
+  });
+
+  test('선행 PR 미착지 차단은 pending이 아니며 선행 PR 조회와 재실행을 안내한다', async () => {
+    _setSelfImplementOrchestrateForTesting(async () => [
+      { feature: '차단 골', status: 'blocked', blockReason: 'parent-unlanded', parentPrNumber: 123 },
+    ] as never);
+    const blocked = await selfImplementRuntime.run({ goals: ['차단 골'] }, ctx);
+    expect(blocked).toMatchObject({
+      ok: false, kind: 'failed', next: 'eln gh pr view 123\n선행 PR 착지 뒤 차단된 골을 재실행하세요',
+      reason: '차단 골: 선행 PR #123 미착지',
+      goalResults: [{ goal: '차단 골', status: 'blocked', parentPrNumber: 123, reason: '선행 PR #123 미착지' }],
+    });
+    expect(blocked.output).toContain('선행 PR 착지 뒤 차단된 골을 재실행하세요');
+    expect(blocked.output).toContain('이 턴에서 파일을 직접 편집하지 마세요');
+
+    _setSelfImplementOrchestrateForTesting(async () => [
+      { feature: '차단 골', status: 'blocked', blockReason: 'parent-unlanded', parentPrNumber: 123 },
+      { feature: '진행 골', status: 'running', runId: 'run-concurrent' },
+    ] as never);
+    const mixed = await selfImplementRuntime.run({ goals: ['차단 골', '진행 골'] }, ctx);
+    expect(mixed.next).toBe('eln gh pr view 123\neln self run run-concurrent\n선행 PR 착지 뒤 차단된 골을 재실행하세요');
+  });
+
+  test('서로 다른 두 선행 PR과 별도 실패 골의 후속 행동을 모두 보존한다', async () => {
+    _setSelfImplementOrchestrateForTesting(async () => [
+      { feature: '첫 차단', status: 'blocked', blockReason: 'parent-unlanded', parentPrNumber: 123 },
+      { feature: '둘째 차단', status: 'blocked', blockReason: 'parent-unlanded', parentPrNumber: 456 },
+      { feature: '별도 실패', status: 'failed', error: { code: 'GATE', message: 'typecheck failed' } },
+    ] as never);
+    const result = await selfImplementRuntime.run({ goals: ['첫 차단', '둘째 차단', '별도 실패'] }, ctx);
+    expect(result).toMatchObject({ kind: 'failed', reason: expect.stringContaining('별도 실패: typecheck failed') });
+    expect(result.next).toBe('eln gh pr view 123\neln gh pr view 456\n선행 PR 착지 뒤 차단된 골을 재실행하세요\n실패·차단 이유를 확인한 뒤 해당 골을 다시 요청');
+    expect(result.output).toContain(result.next!);
+  });
+
+  test('선행 PR 번호가 없는 차단과 이유 미관측 차단에 PR 착지를 지어내지 않는다', async () => {
+    _setSelfImplementOrchestrateForTesting(async () => [
+      { feature: '선행 골', status: 'blocked', blockReason: 'parent-unlanded' },
+    ] as never);
+    const parentBlocked = await selfImplementRuntime.run({ goals: ['선행 골'] }, ctx);
+    expect(parentBlocked.output).toContain('선행 골 상태를 확인한 뒤 해당 골을 재실행하세요');
+    expect(parentBlocked.output).not.toContain('선행 PR 착지 뒤');
+
+    _setSelfImplementOrchestrateForTesting(async () => [
+      { feature: '이유 미관측 골', status: 'blocked' },
+    ] as never);
+    const unknownBlocked = await selfImplementRuntime.run({ goals: ['이유 미관측 골'] }, ctx);
+    expect(unknownBlocked).toMatchObject({ kind: 'failed', next: '실패·차단 이유를 확인한 뒤 해당 골을 다시 요청', reason: '이유 미관측 골: 이유 미관측' });
+    expect(unknownBlocked.output).toContain('차단 이유를 확인한 뒤 해당 골을 다시 요청');
+    expect(unknownBlocked.output).not.toContain('선행 PR 착지 뒤');
+
+    _setSelfImplementOrchestrateForTesting(async () => [
+      { feature: '원인 미관측 골', status: 'blocked', parentPrNumber: 456 },
+    ] as never);
+    const unrelatedPr = await selfImplementRuntime.run({ goals: ['원인 미관측 골'] }, ctx);
+    expect(unrelatedPr).toMatchObject({ kind: 'failed', next: '실패·차단 이유를 확인한 뒤 해당 골을 다시 요청' });
+    expect(unrelatedPr.output).toContain('차단 이유를 확인한 뒤 해당 골을 다시 요청');
+    expect(unrelatedPr.output).not.toContain('eln gh pr view 456');
+    expect(unrelatedPr.output).not.toContain('선행 PR 착지 뒤');
+  });
+
+  test('골 결과 0건은 화면 출력에도 실패 이유와 다음 행동을 밝힌다', async () => {
+    _setSelfImplementOrchestrateForTesting(async () => []);
+    const empty = await selfImplementRuntime.run({ goals: ['빈 결과'] }, ctx);
+    expect(empty).toMatchObject({ ok: false, kind: 'failed', reason: '골 결과가 0건이라 상태 미관측', next: '골 결과가 0건이라 상태를 확인한 뒤 다시 요청', missing: ['runId', 'node'], goalResults: [] });
+    expect(empty.output).toContain('실패/차단: 골 결과가 0건이라 상태 미관측 · 다음: 골 결과가 0건이라 상태를 확인한 뒤 다시 요청');
   });
 });
 
@@ -247,8 +433,8 @@ describe('selfImplementRuntime — arcHint 분해 연결', () => {
     await selfImplementRuntime.run({ goals: ['composite request'], decompose: true }, ctx);
 
     expect(received).toEqual({ options: { observation: { goalId: undefined, runId: null } } });
-    await expect(selfImplementRuntime.run({ goals: ['composite request'], decompose: true, arcHint: 1 }, ctx)).rejects.toThrow('`arcHint` must be an integer from 2 to 6');
-    await expect(selfImplementRuntime.run({ goals: ['composite request'], arcHint: 2 }, ctx)).rejects.toThrow('`arcHint` requires `decompose=true`');
+    await expect(selfImplementRuntime.run({ goals: ['composite request'], decompose: true, arcHint: 1 }, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('`arcHint` must be an integer from 2 to 6') });
+    await expect(selfImplementRuntime.run({ goals: ['composite request'], arcHint: 2 }, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('`arcHint` requires `decompose=true`') });
   });
 });
 
@@ -406,6 +592,11 @@ describe('selfImplementRuntime — Fabric 분해 opt-in', () => {
       expect(result).toMatchObject({ ok, fabricDecomposition: { status, outcome } });
       expect(result.output).toContain(`Fabric decomposition ${status} (${outcome})`);
       if (status !== 'authored-empty') expect(result.output).toContain(`${status} reason`);
+      if (ok) {
+        expect(result).toMatchObject({ kind: 'observed-only', observed: true, missing: ['runId', 'node'] });
+        expect(result.output).toContain('관측 전용이라 런을 발사하지 않았습니다');
+        expect(result.output).toContain('직접 Write/Edit 하지 마세요');
+      } else expect(result.output).toContain('이 턴에서 파일을 직접 편집하지 마세요');
     } finally {
       log.mockRestore();
     }
@@ -459,15 +650,16 @@ describe('selfImplementRuntime — 관측 전용', () => {
     expect(logs).toContainEqual(expect.objectContaining({ observeOnly: true, observeOnlySource: 'flag' }));
   });
 
-  test('⛔ fail-closed: config 조회가 실패하면 런을 시작하지 않고 오류를 전파한다', async () => {
+  test('⛔ fail-closed: config 조회가 실패하면 런을 시작하지 않고 failed 결과를 반환한다', async () => {
     _setObserveOnlyConfigReaderForTesting(() => { throw new Error('observe-only config unavailable'); });
-    await expect(selfImplementRuntime.run({ feature: 'fail-closed' }, ctx))
-      .rejects.toThrow('observe-only config unavailable');
+    const result = await selfImplementRuntime.run({ feature: 'fail-closed' }, ctx);
+    expect(result).toMatchObject({ kind: 'failed', reason: expect.stringContaining('observe-only config unavailable'), missing: ['runId', 'node'] });
+    expect(result.output).toContain('이 턴에서 파일을 직접 편집하지 마세요');
   });
 
   test('feature 검증은 관측 전용보다 앞선다 — 빈 feature 는 그대로 거부', async () => {
     _setObserveOnlyConfigReaderForTesting(() => true);
-    await expect(selfImplementRuntime.run({ feature: '   ' }, ctx)).rejects.toThrow('`feature` is required');
+    await expect(selfImplementRuntime.run({ feature: '   ' }, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('`feature` is required') });
   });
 
   test('요청 observe_only=true는 config off에서도 관측 전용 결정으로 전달되어 런을 시작하지 않는다', async () => {
@@ -721,10 +913,8 @@ describe('selfImplementRuntime — 중앙 CLI 경유', () => {
       max_wait: 77,
     }, ctx);
 
-    expect(result).toEqual(expect.objectContaining({
-      ok: true,
-      output: '[self-implement] observed by central CLI',
-    }));
+    expect(result).toEqual(expect.objectContaining({ ok: true, kind: 'observed-only', observed: true }));
+    expect(result.output).toContain('코드도 안 바꿨습니다');
     expect(captured).toEqual(expect.objectContaining({
       plan: true,
       openPr: true,
@@ -801,7 +991,8 @@ describe('selfImplementRuntime — 다중 골 중앙 CLI 경유', () => {
       runtime: {},
     });
     expect(result).toEqual(expect.objectContaining({ ok: true }));
-    expect(result.output).toBe('[self-implement] parallel 1 goal · done 1');
+    expect(result.output).toContain('[self-implement] parallel 1 goal · done 1');
+    expect(result).toMatchObject({ goalResults: [{ goal: '골 1', status: 'done' }] });
   });
 
   test('다중 골의 감독과 라운드 상한을 중앙 실행기까지 전달하고 수신·전달 관측을 남긴다', async () => {
@@ -866,7 +1057,7 @@ describe('selfImplementRuntime — 다중 골 중앙 CLI 경유', () => {
       return { ok: true, exitCode: 0, results: [] };
     });
 
-    await expect(selfImplementRuntime.run({ goals: ['병렬 골'], ...incompatible }, ctx)).rejects.toThrow(message);
+    await expect(selfImplementRuntime.run({ goals: ['병렬 골'], ...incompatible }, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining(message) });
     expect(centralCalls).toBe(0);
   });
 
@@ -970,7 +1161,7 @@ describe('selfImplementRuntime — 다중 골 중앙 CLI 경유', () => {
       return { ok: false, exitCode: 1, message: 'central stop reason' };
     });
 
-    await expect(selfImplementRuntime.run({ goals: ['복합 골'], decompose: true }, ctx)).rejects.toThrow('central stop reason');
+    await expect(selfImplementRuntime.run({ goals: ['복합 골'], decompose: true }, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('central stop reason') });
     expect(centralInput).toEqual({
       goals: [{ id: 'part', feature: '분해된 골', autoMerge: false }],
       parentRequest: '복합 골',
@@ -995,7 +1186,7 @@ describe('selfImplementRuntime — 다중 골 중앙 CLI 경유', () => {
     });
 
     await expect(selfImplementRuntime.run({ goals: ['첫 원문 골', '둘째 원문 골'], decompose: true }, ctx))
-      .rejects.toThrow('requires exactly one composite goal');
+      .resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('requires exactly one composite goal') });
     // ⛔ 거부는 «중앙 심에 닿기 전»이어야 한다 — 닿은 뒤 거부하면 절반 실행된다.
     expect(centralCalled).toBe(false);
   });
@@ -1338,11 +1529,11 @@ describe('selfImplementRuntime — 문서 참조', () => {
 
   test('비문자열 런타임 입력은 실행 전에 거부한다', async () => {
     installSuccessfulSeams(() => { throw new Error('implementation must not start'); });
-    await expect(selfImplementRuntime.run({ feature: 1 } as never, ctx)).rejects.toThrow('`feature` must be a string');
-    await expect(selfImplementRuntime.run({ feature: 'valid', base: false } as never, ctx)).rejects.toThrow('`base` must be a string');
-    await expect(selfImplementRuntime.run({ feature: 'valid', draft: 'false' } as never, ctx)).rejects.toThrow('`draft` must be a boolean');
-    await expect(selfImplementRuntime.run({ feature: 'valid', ground: 'true' } as never, ctx)).rejects.toThrow('`ground` must be a boolean');
-    await expect(selfImplementRuntime.run({ feature: 'valid', documentReferences: ['README.md', 1] } as never, ctx)).rejects.toThrow('`documentReferences` must be an array of strings');
+    await expect(selfImplementRuntime.run({ feature: 1 } as never, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('`feature` must be a string') });
+    await expect(selfImplementRuntime.run({ feature: 'valid', base: false } as never, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('`base` must be a string') });
+    await expect(selfImplementRuntime.run({ feature: 'valid', draft: 'false' } as never, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('`draft` must be a boolean') });
+    await expect(selfImplementRuntime.run({ feature: 'valid', ground: 'true' } as never, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('`ground` must be a boolean') });
+    await expect(selfImplementRuntime.run({ feature: 'valid', documentReferences: ['README.md', 1] } as never, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('`documentReferences` must be an array of strings') });
   });
 
   test('관측 전용도 해석 성공과 미발견 상태를 보이고 실행하지 않는다', async () => {
@@ -1373,7 +1564,7 @@ describe('관측 전용 판정의 출처는 하나다', () => {
       { cwd: '/tmp', signal: new AbortController().signal, entry: 'elanous-apparatus' } as never,
       async () => { daemonRunnerCalls += 1; throw new Error('runner must not start'); },
     );
-    expect(viaDaemon).toEqual({ observed: true });
+    expect(viaDaemon).toEqual(expect.objectContaining({ kind: 'observed-only', observed: true, missing: ['runId', 'node'] }));
     expect(daemonRunnerCalls).toBe(0);
   });
 });
@@ -1555,23 +1746,27 @@ describe('selfImplementRuntime — opt-in non-blocking return', () => {
     expect(resolved).toBe(true);
     expect(result.ok).toBe(true);
     expect(result.stage).toBe('pr-declined');
-    expect(result.runId).toBeUndefined();
+    expect(result.runId).toBe('run-unidentified');
     expect(result.invocationMode).toBeUndefined();
     expect(harness.receivedRunId()).toBeUndefined();
   });
 
-  test('스위치를 켜면 하니스가 도는 중에 runId가 든 값이 돌아온다', async () => {
+  test('스위치를 켜면 하니스가 도는 중에 미확정 ID를 숨긴 pending 값이 돌아온다', async () => {
     const harness = installGatedCli();
     try {
       const result = await selfImplementRuntime.run({ feature: '즉시 반환', non_blocking: true }, ctx);
       expect(harness.completed()).toBe(false);
       expect(result.ok).toBe(true);
       expect(result.invocationMode).toBe('non-blocking');
-      expect(result.runId).toEqual(expect.stringMatching(/^run-/));
-      expect(result.output).toContain(result.runId!);
+      expect(result).toMatchObject({ kind: 'pending', missing: ['runId', 'node'] });
+      expect(result.requestId).toMatch(/^run-/);
+      expect(result.next).toContain(`--grep ${result.requestId}`);
+      expect(result.next).toContain('runtime.non-blocking-failed');
+      expect(result.output).toContain('발사 증거 아님');
+      expect(result.runId).toBeUndefined();
       await waitUntil(harness.started);
       expect(harness.completed()).toBe(false);
-      expect(harness.receivedRunId()).toBe(result.runId);
+      expect(harness.receivedRunId()).toMatch(/^run-/);
     } finally {
       harness.release();
       await waitUntil(harness.completed);
@@ -1582,13 +1777,56 @@ describe('selfImplementRuntime — opt-in non-blocking return', () => {
     const harness = installGatedCli();
     const result = await selfImplementRuntime.run({ feature: '백그라운드 완주', non_blocking: true }, ctx);
     expect(harness.completed()).toBe(false);
-    expect(result.runId).toBeDefined();
+    expect(result).toMatchObject({ kind: 'pending', missing: ['runId', 'node'] });
+    expect(result.runId).toBeUndefined();
     await waitUntil(harness.started);
-    expect(harness.receivedRunId()).toBe(result.runId);
+    expect(harness.receivedRunId()).toMatch(/^run-/);
     harness.release();
     await waitUntil(harness.completed);
     expect(harness.completed()).toBe(true);
-    expect(harness.receivedRunId()).toBe(result.runId);
+    expect(harness.receivedRunId()).toMatch(/^run-/);
+  });
+
+  test.each([
+    ['실패 결과', async () => ({ ok: false, message: 'goal author failed' } as never), 'goal author failed'],
+    ['예외', async () => { throw new Error('runner unavailable'); }, 'runner unavailable'],
+  ] as const)('비블로킹 %s는 요청 ID로 조회할 실패 이유와 다음 행동을 남긴다', async (_case, cli, reason) => {
+    const observations: Record<string, unknown>[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((_category: string, event: string, data?: Record<string, unknown>) => {
+      if (event === 'runtime.non-blocking-failed') observations.push(data ?? {});
+    }) as never);
+    _setSelfImplementCliCommandForTesting(cli);
+    try {
+      const pending = await selfImplementRuntime.run({ feature: '비블로킹 실패 조회', non_blocking: true }, ctx);
+      await waitUntil(() => observations.length > 0);
+      expect(pending).toMatchObject({ kind: 'pending', missing: ['runId', 'node'] });
+      expect(pending.requestId).toMatch(/^run-/);
+      expect(pending.runId).toBeUndefined();
+      expect(pending.next).toContain(`--grep ${pending.requestId}`);
+      expect(observations[0]).toMatchObject({ requestId: pending.requestId, kind: 'failed', reason, next: expect.stringContaining('다시 요청') });
+      expect(observations[0]).not.toHaveProperty('runId');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('비블로킹 완료도 같은 요청 ID와 확인된 런 ID를 함께 기록한다', async () => {
+    const observations: Record<string, unknown>[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((_category: string, event: string, data?: Record<string, unknown>) => {
+      if (event === 'runtime.non-blocking-completed') observations.push(data ?? {});
+    }) as never);
+    _setSelfImplementCliCommandForTesting(async (_feature, opts) => ({
+      ok: true, kind: 'self', exitCode: 0,
+      result: { ok: true, stage: 'pr-opened', runId: opts.runId, node: 'open-pr' },
+    } as never));
+    try {
+      const pending = await selfImplementRuntime.run({ feature: '비블로킹 완료 조회', non_blocking: true }, ctx);
+      await waitUntil(() => observations.length > 0);
+      expect(pending.runId).toBeUndefined();
+      expect(observations[0]).toMatchObject({ requestId: pending.requestId, kind: 'launched', runId: pending.requestId, next: `eln self run ${pending.requestId}` });
+    } finally {
+      log.mockRestore();
+    }
   });
 
   test('호출 방식은 runtime.invocation-mode 관측에 blocking/non-blocking 값으로 구별된다', async () => {
@@ -1611,9 +1849,11 @@ describe('selfImplementRuntime — opt-in non-blocking return', () => {
       const nonBlocking = await selfImplementRuntime.run({ feature: '관측 비블로킹', non_blocking: true }, ctx);
       await waitUntil(() => received.length >= 2);
       expect(modes).toContainEqual(expect.objectContaining({ mode: 'blocking' }));
-      expect(modes).toContainEqual(expect.objectContaining({ mode: 'non-blocking', runId: nonBlocking.runId }));
+      expect(modes).toContainEqual(expect.objectContaining({ mode: 'non-blocking', runId: expect.stringMatching(/^run-/) }));
+      expect(nonBlocking).toMatchObject({ kind: 'pending', missing: ['runId', 'node'] });
+      expect(nonBlocking.runId).toBeUndefined();
       expect(received[0]).toBeUndefined();
-      expect(received[1]).toBe(nonBlocking.runId);
+      expect(received[1]).toMatch(/^run-/);
     } finally {
       log.mockRestore();
     }
@@ -1645,19 +1885,24 @@ describe('selfImplementRuntime — opt-in non-blocking return', () => {
   function captureProductionObservationWriter(): {
     runIds: string[];
     completed: () => boolean;
+    completion: () => Record<string, unknown> | undefined;
     restore: () => void;
   } {
     const runIds: string[] = [];
     let completed = false;
+    let completion: Record<string, unknown> | undefined;
     const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
       if (category !== 'self-implement') return;
       if (event === 'progress-delivery-outcome' && typeof data?.runId === 'string') runIds.push(data.runId);
-      if (event === 'runtime.non-blocking-completed' || event === 'runtime.non-blocking-failed') completed = true;
+      if (event === 'runtime.non-blocking-completed' || event === 'runtime.non-blocking-failed') {
+        completion = data;
+        completed = true;
+      }
     }) as never);
-    return { runIds, completed: () => completed, restore: () => log.mockRestore() };
+    return { runIds, completed: () => completed, completion: () => completion, restore: () => log.mockRestore() };
   }
 
-  test('non_blocking 반환 runId·주입 CLI runId·하니스 관측 runId 가 하나다', async () => {
+  test('non_blocking은 내부 runId를 하니스에 전달하지만 확정 전 반환에서는 숨긴다', async () => {
     installFakeHarnessSeams();
     const writer = captureProductionObservationWriter();
     let receivedRunId: string | undefined;
@@ -1674,19 +1919,19 @@ describe('selfImplementRuntime — opt-in non-blocking return', () => {
     try {
       const result = await selfImplementRuntime.run({ feature: '손잡이 일치', non_blocking: true }, ctx);
       await waitUntil(() => writer.runIds.length > 0, 5000);
-      expect(result.runId).toMatch(/^run-/);
-      const returnedRunId = result.runId;
-      if (typeof returnedRunId !== 'string') throw new Error('expected returned runId');
-      expect(receivedRunId).toBe(returnedRunId);
-      expect(writer.runIds[0]).toBe(returnedRunId);
-      expect(new Set(writer.runIds)).toEqual(new Set([returnedRunId]));
+      expect(result).toMatchObject({ kind: 'pending', missing: ['runId', 'node'] });
+      expect(result.runId).toBeUndefined();
+      expect(receivedRunId).toMatch(/^run-/);
+      if (typeof receivedRunId !== 'string') throw new Error('expected internal runId');
+      expect(writer.runIds[0]).toBe(receivedRunId);
+      expect(new Set(writer.runIds)).toEqual(new Set([receivedRunId]));
     } finally {
       await waitUntil(writer.completed, 5000).catch(() => undefined);
       writer.restore();
     }
   });
 
-  test('스위치를 주지 않으면 반환 키 집합에 runId·invocationMode 가 없다', async () => {
+  test('블로킹도 실제 런 식별자를 반환하고 invocationMode 는 없다', async () => {
     _setSelfImplementCliCommandForTesting(async () => ({
       ok: true,
       kind: 'self',
@@ -1700,15 +1945,16 @@ describe('selfImplementRuntime — opt-in non-blocking return', () => {
       },
     }));
     const result = await selfImplementRuntime.run({ feature: '블로킹 키 집합' }, ctx);
-    expect(Object.keys(result).sort()).toEqual(['node', 'ok', 'output', 'stage']);
-    expect(result).not.toHaveProperty('runId');
+    expect(result).toMatchObject({ kind: 'launched', runId: 'run-blocking-internal', next: 'eln self run run-blocking-internal', missing: [] });
     expect(result).not.toHaveProperty('invocationMode');
   });
 
-  test('runId 전달을 끊으면 반환 식별자와 production writer 입력이 갈린다', async () => {
+  test('runId 전달을 끊으면 내부 선할당 ID와 production writer 입력이 갈린다', async () => {
     installFakeHarnessSeams();
     const writer = captureProductionObservationWriter();
+    let allocatedRunId: string | undefined;
     _setSelfImplementCliCommandForTesting(async (feature, opts, deps) => {
+      allocatedRunId = opts.runId;
       const { runId: _dropped, ...disconnected } = opts;
       return runSelfImplementCliCommand(feature, disconnected, {
         ...deps,
@@ -1721,10 +1967,12 @@ describe('selfImplementRuntime — opt-in non-blocking return', () => {
     try {
       const result = await selfImplementRuntime.run({ feature: '연결 단절', non_blocking: true }, ctx);
       await waitUntil(() => writer.runIds.length > 0, 5000);
-      expect(result.runId).toMatch(/^run-/);
-      const returnedRunId = result.runId;
-      if (typeof returnedRunId !== 'string') throw new Error('expected returned runId');
-      expect(writer.runIds[0]).not.toBe(returnedRunId);
+      expect(result).toMatchObject({ kind: 'pending', missing: ['runId', 'node'] });
+      expect(result.runId).toBeUndefined();
+      expect(allocatedRunId).toMatch(/^run-/);
+      expect(writer.runIds[0]).not.toBe(allocatedRunId);
+      await waitUntil(writer.completed, 5000);
+      expect(writer.completion()).toMatchObject({ requestId: allocatedRunId, kind: 'failed', runId: writer.runIds[0], reason: expect.stringContaining('no approvePr seam'), next: `eln self run ${writer.runIds[0]}` });
     } finally {
       await waitUntil(writer.completed, 5000).catch(() => undefined);
       writer.restore();

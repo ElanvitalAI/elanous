@@ -7,6 +7,7 @@ import { resetUserConfig } from '../user-config.js';
 import { findNativeTool, isNativeToolModelExposed } from '../native-tool-catalog.js';
 import { registerAllDefaultToolRuntimes } from '../tool-runtime/index.js';
 import { listToolRuntimes } from '../tool-runtime/registry.js';
+import { CORE_TOOL_SPECS } from '../domains/core-tools.js';
 
 const CODING_SURFACES = ['coding/turn', 'coding/agent'] as const;
 const NON_CODING_SURFACES: readonly SessionSurfaceId[] = ['research/turn', 'research/agent', 'control/agent', 'ops-ui/agent', 'ops-fleet/agent'];
@@ -47,11 +48,12 @@ function toolNames(
   rich: boolean,
   preferredSurfaceId?: SessionSurfaceId,
   config: object = {},
+  userText = '',
 ): string[] {
   return withModelSurfaceConfig(config, () => {
     registerAllDefaultToolRuntimes();
     return buildSessionRuntimeToolSpecs({
-      userText: '',
+      userText,
       hostTools: [],
       runtimeTools: listToolRuntimes('tui'),
       pluginTools: [],
@@ -70,6 +72,64 @@ function difference(left: readonly string[], right: readonly string[]): string[]
 describe('essential fixed catalog and coding profile parity', () => {
   const essentialNames = withDefaultModelSurface(() => toolNames(false));
 
+  it('exposes the registered logs_query host tool in essential mode and honors availability', () => {
+    registerAllDefaultToolRuntimes();
+    const runtimes = listToolRuntimes('tui');
+    const hostTools = CORE_TOOL_SPECS.map(spec => ({
+      ...spec,
+      handler: async () => ({}),
+    }));
+    const logsSpec = CORE_TOOL_SPECS.find(spec => spec.name === 'logs_query');
+    expect(logsSpec).toBeDefined();
+    const essentialWithLogs = buildSessionRuntimeToolSpecs({
+      userText: '최근 로그를 조회해줘',
+      hostTools,
+      runtimeTools: runtimes,
+      pluginTools: [],
+      optionalTools: [],
+      rich: false,
+    });
+    expect(essentialWithLogs.find(spec => spec.name === 'logs_query')).toMatchObject({
+      name: logsSpec?.name,
+      description: logsSpec?.description,
+      parameters: logsSpec?.parameters,
+    });
+    expect(essentialWithLogs.filter(spec => spec.name === 'logs_query')).toHaveLength(1);
+
+    const withoutLogs = buildSessionRuntimeToolSpecs({
+      userText: '최근 로그를 조회해줘',
+      hostTools: hostTools.filter(tool => tool.name !== 'logs_query'),
+      runtimeTools: runtimes,
+      pluginTools: [],
+      optionalTools: [],
+      rich: false,
+    });
+    expect(essentialWithLogs.filter(spec => spec.name !== 'logs_query'))
+      .toEqual(withoutLogs);
+
+    const unavailable = buildSessionRuntimeToolSpecs({
+      userText: '최근 로그를 조회해줘',
+      hostTools,
+      runtimeTools: runtimes,
+      pluginTools: [],
+      optionalTools: [],
+      toolAvailability: { logs_query: false },
+      rich: false,
+    });
+    expect(unavailable.map(spec => spec.name)).not.toContain('logs_query');
+
+    const controlTools = buildSessionRuntimeToolSpecs({
+      userText: '지금 자율 운영 상태',
+      hostTools,
+      runtimeTools: runtimes,
+      pluginTools: [],
+      optionalTools: [],
+      preferredSurfaceId: 'control/agent',
+      rich: true,
+    });
+    expect(controlTools.map(spec => spec.name)).not.toContain('logs_query');
+  });
+
   it('does not expose tools only in either rich coding profile', () => {
     for (const surfaceId of CODING_SURFACES) {
       const richNames = toolNames(true, surfaceId);
@@ -79,6 +139,18 @@ describe('essential fixed catalog and coding profile parity', () => {
         throw new Error(`${PARITY_GUARD} ${surfaceId} rich-only tools: ${richOnly.join(', ')}`);
       }
     }
+  });
+
+  it('a dev-harness phrase drops Edit and Write from the essential TUI tool list and keeps SelfImplement', () => {
+    const currentEssentialNames = toolNames(false);
+    const harnessNames = toolNames(false, undefined, {}, '하니스로 구현해줘: src/ux-sim/fault-pool-cap.ts');
+    expect(harnessNames).not.toContain('Edit');
+    expect(harnessNames).not.toContain('Write');
+    expect(harnessNames).toContain('SelfImplement');
+    expect(harnessNames).toEqual(currentEssentialNames.filter(name => name !== 'Edit' && name !== 'Write'));
+
+    const ordinaryNames = toolNames(false, undefined, {}, '이 파일을 확인해줘');
+    expect(ordinaryNames).toEqual(currentEssentialNames);
   });
 
   it('honors catalog explicit-only policy while retaining SelfImplement', () => {

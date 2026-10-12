@@ -9,7 +9,8 @@ import { recordSelfDevRunSupervisorStop, selfDevRunsDir } from './run-store.js';
 import { debug } from '../debug/log.js';
 import { sweepFrozenMerges } from '../self-implement/frozen-merges.js';
 import { routeSupervisorVerdict } from './supervisor-verdict-edges.js';
-import { recordTaskAgentShadowMove, type TaskAgentShadowInput } from '../task-agent/shadow.js';
+import { recordTaskAgentShadowMove, runCardFor, type TaskAgentShadowInput } from '../task-agent/shadow.js';
+import { cardPrNumber, taskAgentStatePath } from '../task-agent/task-hand.js';
 
 export interface SupervisorRound {
   round: number;
@@ -641,6 +642,12 @@ export interface SuperviseRunOptions {
    * `false` 면 끈다. 던져도 런의 결말은 바뀌지 않는다(fail-soft).
    */
   taskAgentShadow?: ((input: TaskAgentShadowInput) => unknown) | false;
+  /** TA-LAND-AFTER-REVIEW — false disables the hook; function replaces only the final rejudge for isolated tests. */
+  taskAgentRejudge?: ((cardId: string, statePath: string) => Promise<unknown>) | false;
+  /** Test-only external I/O for the real completion rejudge. The decision and shadow gate remain production code. */
+  taskAgentRejudgeExternal?: Parameters<typeof import('../task-agent/rejudge-on-head.js').rejudgeAsyncResultCard>[2];
+  /** Isolated state ledger for the terminal rejudge test; production uses the active instance. */
+  taskAgentStatePath?: string;
   observeDeliverables?: () => Promise<{
     readonly deployFindings: ReadonlyMap<string, { target: string; findings?: readonly DeployVerifyFinding[] | readonly unknown[] }>;
     readonly unmeasured: readonly unknown[];
@@ -656,6 +663,23 @@ function resolveSupervisorStopStorage(runStore: SuperviseRunOptions['runStore'])
   if (runStore?.operatorDir !== undefined) return { path: runStore.operatorDir, source: 'operator-dir' };
   if (runStore?.dir !== undefined) return { path: runStore.dir, source: 'run-store-dir' };
   return { path: selfDevRunsDir(), source: 'process-default' };
+}
+
+/** The supervisor's terminal hook, limited to a uniquely run-bound TA land card. */
+export async function rejudgeTerminalTaskCard(runId: string | null, deps: {
+  statePath?: string;
+  env?: NodeJS.ProcessEnv;
+  rejudgeCard?: (cardId: string, statePath: string) => Promise<unknown>;
+  external?: Parameters<typeof import('../task-agent/rejudge-on-head.js').rejudgeAsyncResultCard>[2];
+} = {}): Promise<void> {
+  const statePath = deps.statePath ?? taskAgentStatePath();
+  const card = runCardFor(runId, { statePath, ...(deps.env ? { env: deps.env } : {}) });
+  if (!card || card.status !== 'launched' || card.taLand !== true || cardPrNumber(card) === undefined) return;
+  const { rejudgeAsyncResultCard } = await import('../task-agent/rejudge-on-head.js');
+  const result = await (deps.rejudgeCard ?? ((id, path) => rejudgeAsyncResultCard(id, path, deps.external)))(card.id, statePath);
+  const { requireSuccessfulRejudge } = await import('../task-agent/rejudge-on-head.js');
+  requireSuccessfulRejudge(result);
+  try { debug.log('task-agent', 'terminal-rejudge', { runId, card: card.id }); } catch { /* fail-soft */ }
 }
 
 export async function superviseRun(opts: SuperviseRunOptions): Promise<SupervisorJobResult[]> {
@@ -807,6 +831,16 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
             ...(selfReview ? { selfReview } : {}), cycleId: `${runId ?? 'unknown'}:${decision.round}` });
         } catch (error) {
           try { debug.log('task-agent', 'shadow-move-failed', { runId, stopReason: decision.stopReason, error: String(error) }); } catch { /* fail-open */ }
+        }
+        if (opts.taskAgentRejudge !== false) {
+          const rejudgeOptions = { ...(opts.taskAgentStatePath ? { statePath: opts.taskAgentStatePath } : {}), ...(opts.taskAgentRejudge ? { rejudgeCard: opts.taskAgentRejudge } : {}), ...(opts.taskAgentRejudgeExternal ? { external: opts.taskAgentRejudgeExternal } : {}) };
+          try { await rejudgeTerminalTaskCard(runId, rejudgeOptions); }
+          catch (error) {
+            try { await rejudgeTerminalTaskCard(runId, rejudgeOptions); }
+            catch (retryError) {
+              try { debug.log('task-agent', 'terminal-rejudge-failed', { runId, stopReason: decision.stopReason, error: String(retryError), firstError: String(error), attempts: 2 }); } catch { /* fail-open */ }
+            }
+          }
         }
       }
       return results;

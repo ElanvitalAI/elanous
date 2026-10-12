@@ -33,7 +33,7 @@ export interface DraftSweepAdapters {
   /** Undefined means liveness could not be established. */
   listLiveBranches(repository: string): Promise<ReadonlySet<string> | undefined>;
   setLabels(repository: string, number: number, change: { add: string; remove: readonly string[] }): Promise<void>;
-  closeDraft(repository: string, number: number, comment: string): Promise<void>;
+  closeDraft(repository: string, number: number): Promise<void>;
   /** Resolve the latest claim comment owner; a failed lookup must not authorize a close. */
   getClaimOwner?(repository: string, number: number): Promise<string | undefined>;
   /** Current owner, accounting for a later claim release; only draft metrics need this distinction. */
@@ -478,6 +478,23 @@ const label = (action: 'mark-stalled' | 'close', name?: string): string => {
 const runningLabel = label('mark-stalled');
 const stalledLabel = label('close', 'stalled');
 const supersededLabel = label('close', 'superseded');
+
+/** Keep repository labels bounded; the complete reason and PR number live in the closed event. */
+export function sweptReasonLabel(reason: string): string {
+  const kinds = ['superseded-by', 'duplicate-of-open', 'claim-expired', 'stale-unobserved',
+    'harvest-expired', 'stale-ended-run'] as const;
+  const kind = kinds.find((name) => reason === name || reason.startsWith(`${name} `)) ?? 'other';
+  return `elanous:swept:${kind}`;
+}
+
+async function closeSweptDraft(adapters: Pick<DraftSweepAdapters, 'setLabels' | 'closeDraft'>,
+  repository: string, number: number, reason: string, onLabelApplied?: () => void): Promise<void> {
+  await adapters.setLabels(repository, number, { add: sweptReasonLabel(reason), remove: [] });
+  onLabelApplied?.();
+  await adapters.closeDraft(repository, number);
+  try { debug.log('self-dev.draft-sweep', 'closed', { pr: number, reason }); } catch { /* fail-soft */ }
+}
+
 const approvalLabel = PR_LABELS.find((entry) => entry.axis === 'state' && entry.sweep.action === 'none')?.name;
 const keepLabel = PR_LABELS.find((entry) => entry.sweep.action === 'exclude')?.name;
 const benchLabel = PR_LABELS.find((entry) => entry.name === 'elanous:bench')!.name;
@@ -572,8 +589,7 @@ export async function supersedeDraftsOnMerge(input: {
       try {
         // Label first: a failed label write must never strand a closed, unlabelled PR outside open-draft sweeps.
         if (!draft.labels.includes(supersededLabel)) await adapters.setLabels(repository, draft.number, { add: supersededLabel, remove });
-        await adapters.closeDraft(repository, draft.number,
-          `Draft sweep: superseded-by #${merged.number} (https://github.com/${repository}/pull/${merged.number}). Branch preserved.`);
+        await closeSweptDraft(adapters, repository, draft.number, decision.reason);
         closed.push(draft.number);
       } catch (failure) {
         kept.push(draft.number);
@@ -975,8 +991,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
                 });
                 labelsChanged = true;
               }
-              await adapters.closeDraft(repository, draft.number,
-                `Draft sweep: ${reason} (https://github.com/${repository}/pull/${lineageNewer.number}). Branch preserved.`);
+              await closeSweptDraft(adapters, repository, draft.number, reason, () => { labelsChanged = true; });
               entry.applied = true;
             } catch (error) {
               if (labelsChanged) entry.partialApplied = true;
@@ -1035,11 +1050,10 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       if (!apply || action !== 'close') continue;
       let labelsChanged = false;
       try {
-        const owner = await adapters.getClaimOwner?.(repository, draft.number) ?? '미상';
+        await adapters.getClaimOwner?.(repository, draft.number);
         await adapters.setLabels(repository, draft.number, { add: stalledLabel, remove: [runningLabel] });
         labelsChanged = true;
-        await adapters.closeDraft(repository, draft.number,
-          `Draft sweep: 처리 중 표식이 ${CLAIM_IDLE_HOURS}시간 갱신 없음 — ${runStatus === 'self-implement.result final' ? 'self-implement.result final · 남은 워크트리는 live 아님' : '런·워크트리 없음'} · 주인 ${owner}. Closed as stalled. Branch preserved; reopen to restore.`);
+        await closeSweptDraft(adapters, repository, draft.number, entry.reason, () => { labelsChanged = true; });
         entry.applied = true;
       } catch (error) {
         if (labelsChanged) entry.partialApplied = true;
@@ -1085,12 +1099,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
         labelsChanged = true;
       }
       if (action === 'close') {
-        await adapters.closeDraft(repository, draft.number, decision.reason === 'stale-unobserved'
-          ? `Draft sweep: run unobserved — no run record reachable here, no host worktree for this branch, idle ≥${STALLED_DRAFT_HOURS}h. Closed as stalled. Branch preserved; reopen to restore.`
-          : decision.reason === 'harvest-expired'
-          ? `Draft sweep: harvest-expired — 종단이 수확 대상으로 표시한 뒤 ${STALLED_DRAFT_HOURS}h 동안 수확 없음. Branch preserved; reopen to restore.`
-          : `Draft sweep: ${decision.reason}${decision.reason.startsWith('superseded-by #')
-            ? ` (https://github.com/${repository}/pull/${decision.reason.slice('superseded-by #'.length).match(/^\d+/)![0]})` : ''}. Branch preserved.`);
+        await closeSweptDraft(adapters, repository, draft.number, reason, () => { labelsChanged = true; });
       }
       entry.applied = labelsChanged || action === 'close';
     } catch (error) {

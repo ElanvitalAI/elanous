@@ -24,7 +24,7 @@ import { ACP_BACKENDS, canonicalizeBackendId } from '../acp/backend-registry.js'
 import { buildManualReviewIntent, intentFromPr, prIntentSectionCoverage, reviewIntentTruncationFromPr, reviewIntentTruncationObservation } from './review-intent.js';
 import { budgetReviewerContext, reviewDiffBudgetObservation, splitDiffByFile, type ReviewImage, type ReviewInput, type ReviewerContextItem, type ReviewResult } from './pr-reviewer.js';
 import type { ReferencedFileReader } from '../self-implement/goal-file-reader.js';
-import type { SubscriptionReviewerSpec } from '../user-config.js';
+import { getUserConfig, type SubscriptionReviewerSpec } from '../user-config.js';
 import { listRunLedgers, lookupPrGoalAcceptance, lookupRunLedger, type PrGoalAcceptanceLookup, type RunLedgerEntry, type RunLedgerLookup } from '../self-implement/run-ledger.js';
 
 /** SUBSCRIPTION-EXHAUST-REROUTE — API reviewer when the configured `roleLlm.reviewer` lane is unavailable (off codex). */
@@ -37,6 +37,8 @@ export interface SelfReviewCliOpts {
   acpModel?: string | undefined;
   acpBackend?: string | undefined;
   configuredAcpBackend?: string | undefined;
+  /** ACP review backends excluded from automatic fallback by `acp.reviewDenyBackends`. */
+  reviewDenyBackends?: string[] | undefined;
   /** `roleLlm.reviewer` (same resolution as the harness). Used only when no explicit reviewer flag is given. */
   roleReviewer?: SubscriptionReviewerSpec | undefined;
   acpTimeout?: string | undefined;
@@ -1120,10 +1122,11 @@ function roleAcpErrorReason(error: unknown): 'acp-handshake-timeout' | 'acp-erro
 
 type AcpFallbackSkip = { backend: string; reason: string };
 
-function orderedAcpReviewFallbackBackends(configuredBackend: string | undefined): {
+function orderedAcpReviewFallbackBackends(configuredBackend: string | undefined, denyBackends: readonly string[] = []): {
   backends: string[];
   skipped: AcpFallbackSkip[];
 } {
+  const denied = new Set(denyBackends.map((backend) => backend.trim().toLowerCase()).filter(Boolean));
   const candidates = [configuredBackend, ...Object.keys(ACP_BACKENDS)]
     .map((backend) => backend?.trim())
     .filter((backend): backend is string => Boolean(backend));
@@ -1135,6 +1138,10 @@ function orderedAcpReviewFallbackBackends(configuredBackend: string | undefined)
     const spec = ACP_BACKENDS[backend];
     if (!spec || seen.has(backend)) continue;
     seen.add(backend);
+    if (denied.has(backend)) {
+      skipped.push({ backend, reason: 'denied-by-acp.reviewDenyBackends' });
+      continue;
+    }
     if (spec.unsupportedReason) {
       skipped.push({ backend, reason: spec.unsupportedReason });
       continue;
@@ -1277,7 +1284,12 @@ async function runSelfReviewCliCommandPinned(
       ? { backend: opts.configuredAcpBackend, source: 'config' as const }
       : { backend: DEFAULT_REVIEW_BACKEND, source: 'default' as const };
   const acpBackend = acpBackendResolution.backend;
-  const automaticFallbacks = orderedAcpReviewFallbackBackends(opts.configuredAcpBackend);
+  const requestedModel = opts.model?.trim() || undefined;
+  const rawReviewDenyBackends = (getUserConfig().raw?.acp as { reviewDenyBackends?: unknown } | undefined)?.reviewDenyBackends;
+  const configuredReviewDenyBackends = Array.isArray(rawReviewDenyBackends)
+    ? rawReviewDenyBackends.filter((backend): backend is string => typeof backend === 'string')
+    : [];
+  const automaticFallbacks = orderedAcpReviewFallbackBackends(opts.configuredAcpBackend, opts.reviewDenyBackends ?? configuredReviewDenyBackends);
   const fallbackAcpBackends = opts.acpBackend
     ? [canonicalizeBackendId(opts.acpBackend)]
     : automaticFallbacks.backends;
@@ -1300,6 +1312,14 @@ async function runSelfReviewCliCommandPinned(
   const envModel = deps.envModel();
   const roleFallbackModel = !useAcp && !opts.model && !envModel && reviewerSource === 'role-config'
     ? deps.roleFallbackModel?.()?.trim() || undefined : undefined;
+  if (requestedModel && /^glm-\d+(?:\.\d+)?$/i.test(requestedModel)) {
+    const canonical = requestedModel.toLowerCase() === 'glm-5.3' ? 'openrouter/z-ai/glm-5.3' : undefined;
+    const suggestion = canonical ? ` 정본 모델 ID 후보: ${canonical}` : ' `local:<model>` 또는 공급자 정본 ID를 지정하세요.';
+    const message = `모델 ID가 모호합니다: ${requestedModel}.${suggestion} 짧은 별칭을 공급자 정본 ID로 바꿔 다시 시도하세요.`;
+    deps.log('model-rejected', { requestedModel: safeLogText(requestedModel), reason: 'ambiguous-model-id', ...(canonical ? { canonicalModelCandidate: canonical } : {}) }, { level: 'warn' });
+    deps.error(message);
+    return { results: opts.json ? [{ error: message, requestedModel }] : [], failed: 1 };
+  }
   const model = useAcp ? `acp:${acpBackend}${acpModel ? `/${acpModel}` : ''}` : (opts.model || envModel || roleFallbackModel || tierModel('better'));
   let roleReviewer: { llm: (prompt: string, images?: readonly ReviewImage[]) => Promise<string>; model: string } | undefined;
   let roleReviewerUnavailableReason: string | undefined;
@@ -1558,9 +1578,9 @@ async function runSelfReviewCliCommandPinned(
     let fallbackAttempted = false;
     let fallbackBackend: string | undefined;
     let fallbackTriggerReason: string | undefined;
-    let fallbackNotAttemptedReason: 'explicit-acp' | 'primary-review-succeeded' | undefined;
+    let fallbackNotAttemptedReason: 'explicit-acp' | 'primary-review-succeeded' | 'explicit-model' | undefined;
     const fallbackFailures: Array<{ backend: string; reason: string }> = [];
-    if (!useAcp && !roleReview && review.reviewed !== true) {
+    if (!useAcp && !roleReview && !opts.acpModel?.trim() && (!requestedModel || Boolean(opts.acpBackend)) && review.reviewed !== true) {
       fallbackAttempted = true;
       fallbackTriggerReason = safeLogText(review.failureReason || 'reviewed=false', 400);
       for (const backend of fallbackAcpBackends) {
@@ -1569,6 +1589,7 @@ async function runSelfReviewCliCommandPinned(
           pr: safeLogText(pr),
           failureReason: fallbackTriggerReason,
           fallbackBackend: safeLogText(backend),
+          requestedModel: safeLogText(primaryModel),
         }, { level: 'warn' });
         try {
           const fallbackReview = await deps.reviewPullRequest(
@@ -1598,12 +1619,13 @@ async function runSelfReviewCliCommandPinned(
       ...(reviewCwdPinFallbackReason ? { reviewCwdPinFallbackReason } : {}),
     };
     if (!fallbackAttempted) {
-      fallbackNotAttemptedReason = useAcp ? 'explicit-acp' : 'primary-review-succeeded';
+      fallbackNotAttemptedReason = useAcp ? 'explicit-acp' : requestedModel && review.reviewed !== true ? 'explicit-model' : 'primary-review-succeeded';
     }
     const reviewProvenance = {
       reviewRoute,
       fallbackAttempted,
       ...(fallbackBackend ? { fallbackBackend } : {}),
+      ...(fallbackBackend ? { requestedModel: primaryModel, actualBackend: `acp:${fallbackBackend}` } : {}),
       ...(fallbackNotAttemptedReason ? { fallbackNotAttemptedReason } : {}),
       ...(fallbackTriggerReason ? { fallbackTriggerReason } : {}),
       ...(fallbackFailures.length ? { fallbackFailures } : {}),

@@ -19,6 +19,8 @@ import { parsePodPool, PodPoolScheduler } from '../task-orchestrator/surfaces/po
 import { podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { Command } from 'commander';
 import { assessRunningRuns, buildRunProgressRows, renderRunProgressTable } from '../self-implement/running-runs.js';
+import { launchRegistryDir, removeLaunchBinding, writeLaunchBinding } from './launch-registry.js';
+import { psProcessStartMs } from './harness-stop.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
 import { GRAPH_SPECS } from '../self-implement/graph-templates.js';
 import type { GraphOverlaySpec } from '../self-implement/graph-overlay-yaml.js';
@@ -842,8 +844,8 @@ describe('harness CLI command', () => {
     await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--apply']);
     expect(statuses).toEqual([[draft, 'my/repo'], [draft, 'default/repo']]);
     expect(closed).toHaveLength(1);
-    expect(closed[0]).toEqual(['default/repo', 43, expect.stringContaining('Branch preserved')]);
-    expect(labels).toEqual([]);
+    expect(closed[0]).toEqual(['default/repo', 43]);
+    expect(labels).toEqual([['default/repo', 43, { add: 'elanous:swept:stale-ended-run', remove: [] }]]);
     expect(lines.at(-2)).toContain('#43 close:');
     expect(lines.at(-1)).toBe('못 본 초안 0 · 이번에 닫음 1 · 처리 중 0 · 표식 만료 0 · 24h 넘음 1 · 정리 대상 0 · 수확 대기 0 · 막힘 0');
   });
@@ -1036,7 +1038,10 @@ describe('harness CLI command', () => {
     await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json', '--apply']);
     expect(JSON.parse(lines.at(-1)!)).toMatchObject({ apply: true,
       entries: [{ statusLabel: 'elanous:stalled', applied: true }] });
-    expect(labels).toEqual([['my/repo', 44, { add: 'elanous:stalled', remove: ['elanous:running'] }]]);
+    expect(labels).toEqual([
+      ['my/repo', 44, { add: 'elanous:stalled', remove: ['elanous:running'] }],
+      ['my/repo', 44, { add: 'elanous:swept:claim-expired', remove: [] }],
+    ]);
     expect(closed).toHaveLength(1);
   });
 
@@ -1169,9 +1174,14 @@ describe('harness CLI command', () => {
     await supersedeMergedGoalDrafts(90, '/tmp/launch-tree', gh, git);
     expect(requests[0]).toEqual(['api', 'repos/my/repo/pulls/90']);
     expect(requests.filter((args) => args[0] === 'api' && args[1]?.includes('/files?'))).toHaveLength(5);
+    expect(requests.filter((args) => args[0] === 'label')).toEqual([
+      ['label', 'create', 'elanous:swept:superseded-by', '--repo', 'my/repo', '--color', '6A737D',
+        '--description', 'Draft sweep close reason; reopen this PR to restore it', '--force'],
+    ]);
     expect(requests.filter((args) => args[0] === 'pr')).toEqual([
       ['pr', 'edit', '1', '--repo', 'my/repo', '--add-label', 'elanous:superseded', '--remove-label', 'elanous:stalled'],
-      ['pr', 'close', '1', '--repo', 'my/repo', '--comment', 'Draft sweep: superseded-by #90 (https://github.com/my/repo/pull/90). Branch preserved.'],
+      ['pr', 'edit', '1', '--repo', 'my/repo', '--add-label', 'elanous:swept:superseded-by'],
+      ['pr', 'close', '1', '--repo', 'my/repo'],
     ]);
     requests.length = 0;
     await expect(supersedeMergedGoalDrafts(90, '/tmp/launch-tree', () => { throw new Error('GitHub unavailable'); }, git))
@@ -1190,7 +1200,7 @@ describe('harness CLI command', () => {
       created_at: '2026-10-01T00:00:00Z', merged_at: '2026-10-02T00:00:00Z' };
     let observed: Record<string, unknown> = merged;
     const gh = (args: string[]) => {
-      if (args[0] === 'pr') { writes.push(args); return ''; }
+      if (args[0] === 'pr' || args[0] === 'label') { writes.push(args); return ''; }
       if (args[1] === 'repos/my/repo/pulls/90') return JSON.stringify(observed);
       if (args[1]?.includes('state=open')) return JSON.stringify([
         { number: 1, draft: true, title: 'edited goal', head: { ref: 'self-impl/old' },
@@ -1205,7 +1215,10 @@ describe('harness CLI command', () => {
     await supersedeMergedGoalDrafts(90, '/tmp/launch-tree', gh, git);
     expect(writes).toEqual([
       ['pr', 'edit', '1', '--repo', 'my/repo', '--add-label', 'elanous:superseded', '--remove-label', 'elanous:stalled'],
-      ['pr', 'close', '1', '--repo', 'my/repo', '--comment', 'Draft sweep: superseded-by #90 (https://github.com/my/repo/pull/90). Branch preserved.'],
+      ['label', 'create', 'elanous:swept:superseded-by', '--repo', 'my/repo', '--color', '6A737D',
+        '--description', 'Draft sweep close reason; reopen this PR to restore it', '--force'],
+      ['pr', 'edit', '1', '--repo', 'my/repo', '--add-label', 'elanous:swept:superseded-by'],
+      ['pr', 'close', '1', '--repo', 'my/repo'],
     ]);
     for (const invalid of [{ ...merged, merged_at: null }, { ...merged, number: 91 },
       { ...merged, head: null }, { ...merged, created_at: 'invalid' },
@@ -1246,11 +1259,18 @@ describe('harness CLI command', () => {
       ['api', 'repos/my/repo/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=2'],
     ]);
     await adapters.setLabels('my/repo', 3, { add: 'elanous:stalled', remove: ['elanous:running'] });
-    await adapters.closeDraft('my/repo', 3, 'Branch preserved.');
-    expect(requests.slice(-2)).toEqual([
+    await adapters.setLabels('my/repo', 3, { add: 'elanous:swept:superseded-by', remove: [] });
+    await adapters.closeDraft('my/repo', 3);
+    expect(requests.slice(-4)).toEqual([
       ['pr', 'edit', '3', '--repo', 'my/repo', '--add-label', 'elanous:stalled', '--remove-label', 'elanous:running'],
-      ['pr', 'close', '3', '--repo', 'my/repo', '--comment', 'Branch preserved.'],
+      ['label', 'create', 'elanous:swept:superseded-by', '--repo', 'my/repo', '--color', '6A737D',
+        '--description', 'Draft sweep close reason; reopen this PR to restore it', '--force'],
+      ['pr', 'edit', '3', '--repo', 'my/repo', '--add-label', 'elanous:swept:superseded-by'],
+      ['pr', 'close', '3', '--repo', 'my/repo'],
     ]);
+    expect(requests.some((args) => args.includes('--comment') || args[0] === 'comment')).toBe(false);
+    await adapters.setLabels('my/repo', 4, { add: 'elanous:swept:superseded-by', remove: [] });
+    expect(requests.filter((args) => args[0] === 'label' && args[1] === 'create')).toHaveLength(1);
   });
 
   test('GitHub sweep adapter supplies file coverage and harvest evidence from the merged PR', async () => {
@@ -3748,6 +3768,108 @@ test('harness progress --json: an unreadable ledger without completeness=partial
   expect(errors[0]).toStartWith('부분 관측 — 최소');
   expect(errors[0]).toContain('읽지 못한 원장: 목록 미관측');
   expect(errors[0]).not.toContain('없음');
+});
+
+test('harness progress --pid: a recorded live local binding returns only its run', async () => {
+  const result = assessRunningRuns([
+    { runId: 'run-local', lifecycle: 'live', ledgerDirectory: '/state/run-local' } as never,
+    { runId: 'run-other', lifecycle: 'live', ledgerDirectory: '/state/run-other' } as never,
+  ], { refs: [
+    { instance: 'prod', id: 'pty-local', kind: 'shell', alive: true, runId: 'run-local' },
+    { instance: 'prod', id: 'pty-other', kind: 'shell', alive: true, runId: 'run-other' },
+  ], unreadable: [] });
+  const queries: unknown[] = [];
+  const program = new Command().exitOverride();
+  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness', progress: {
+    bindingRunIds: () => ['run-local'],
+    readBinding: () => ({ pid: 4242, startedAt: 10_450, cwd: '/local' }),
+    processStartMs: () => 10_000,
+    query: ((options: unknown) => { queries.push(options); return result; }) as never,
+    nowMs: () => 20_000,
+  } });
+  const printed: string[] = [];
+  const original = console.log;
+  console.log = (...args: unknown[]) => { printed.push(args.map(String).join(' ')); };
+  try {
+    await program.parseAsync(['node', 'elanous', 'harness', 'progress', '--pid', '4242']);
+    await program.parseAsync(['node', 'elanous', 'harness', 'progress', '--pid', '4242', '--json']);
+  } finally { console.log = original; }
+  expect(queries).toEqual([
+    { runIds: ['run-local'], caller: 'harness.progress.pid' },
+    { runIds: ['run-local'], caller: 'harness.progress.pid' },
+  ]);
+  expect(printed[0]).toContain('pid 4242 · run-local · running');
+  expect(printed[0]).not.toContain('run-other');
+  expect(JSON.parse(printed[1]!)).toMatchObject({ pid: 4242, observation: 'observed', runId: 'run-local' });
+  expect(JSON.parse(printed[1]!).progress).toEqual(buildRunProgressRows(result, 20_000)[0]);
+});
+
+test('harness progress --pid: unlinked, Pod, exited and reused PIDs remain unobserved', async () => {
+  const cases = [
+    { name: 'unlinked', ids: [] as string[], binding: null, start: null },
+    { name: 'Pod', ids: ['run-remote'], binding: { pid: 4242, startedAt: 10_000, cwd: '/local', podName: 'pod-1' }, start: 10_000 },
+    { name: 'exited', ids: ['run-ended'], binding: { pid: 4242, startedAt: 10_000, cwd: '/local' }, start: null },
+    { name: 'reused', ids: ['run-reused'], binding: { pid: 4242, startedAt: 10_000, cwd: '/local' }, start: 20_000 },
+    { name: 'reused within old tolerance', ids: ['run-reused-near'], binding: { pid: 4242, startedAt: 10_450, cwd: '/local' }, start: 12_000 },
+    { name: 'ambiguous', ids: ['run-one', 'run-two'], binding: { pid: 4242, startedAt: 10_000, cwd: '/local' }, start: 10_000 },
+    { name: 'local and Pod share PID', ids: ['run-local', 'run-remote'], binding: { pid: 4242, startedAt: 10_000, cwd: '/local' }, start: 10_000 },
+  ];
+  for (const scenario of cases) {
+    let queried = false;
+    const program = new Command().exitOverride();
+    installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness', progress: {
+      bindingRunIds: () => scenario.ids,
+      readBinding: (runId) => scenario.name === 'local and Pod share PID' && runId === 'run-remote'
+        ? { ...scenario.binding!, podName: 'pod-1' } : scenario.binding,
+      processStartMs: () => scenario.start,
+      query: (() => { queried = true; throw new Error('must not query'); }) as never,
+    } });
+    const printed: string[] = [];
+    const original = console.log;
+    console.log = (...args: unknown[]) => { printed.push(args.map(String).join(' ')); };
+    try { await program.parseAsync(['node', 'elanous', 'harness', 'progress', '--pid', '4242', '--json']); }
+    finally { console.log = original; }
+    expect(printed, scenario.name).toEqual(['{"pid":4242,"observation":"unobserved","runId":null,"progress":null}']);
+    expect(queried, scenario.name).toBe(false);
+  }
+});
+
+test('harness progress --pid reads a recorded local binding from the launch registry', async () => {
+  const registry = mkdtempSync(join(tmpdir(), 'harness-progress-pid-'));
+  const runId = `run-pid-registry-${Date.now()}`;
+  const podRunId = `${runId}-pod`;
+  const startedAt = psProcessStartMs(process.pid);
+  expect(startedAt).not.toBeNull();
+  const result = assessRunningRuns([{ runId, lifecycle: 'live', ledgerDirectory: `/state/${runId}` } as never], {
+    refs: [{ instance: 'prod', id: 'pty-registry', kind: 'shell', alive: true, runId }], unreadable: [],
+  });
+  const program = new Command().exitOverride();
+  const printed: string[] = [];
+  const original = console.log;
+  const originalTmpDir = process.env.TMPDIR;
+  try {
+    process.env.TMPDIR = registry;
+    expect(writeLaunchBinding(runId, { pid: process.pid, startedAt: startedAt!, cwd: process.cwd() })).not.toBeNull();
+    expect(launchRegistryDir()).toStartWith(registry);
+    installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness', progress: {
+      query: (() => result) as never,
+    } });
+    console.log = (...args: unknown[]) => { printed.push(args.map(String).join(' ')); };
+    await program.parseAsync(['node', 'elanous', 'harness', 'progress', '--pid', String(process.pid), '--json']);
+    expect(writeLaunchBinding(podRunId, { pid: process.pid, startedAt: startedAt!, cwd: process.cwd(), podName: 'pod-1' })).not.toBeNull();
+    await program.parseAsync(['node', 'elanous', 'harness', 'progress', '--pid', String(process.pid), '--json']);
+    removeLaunchBinding(runId);
+    await program.parseAsync(['node', 'elanous', 'harness', 'progress', '--pid', String(process.pid), '--json']);
+  } finally {
+    console.log = original;
+    if (originalTmpDir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmpDir;
+    rmSync(registry, { recursive: true, force: true });
+  }
+  expect(JSON.parse(printed[0]!)).toMatchObject({ pid: process.pid, observation: 'observed', runId });
+  expect(JSON.parse(printed[1]!)).toEqual({ pid: process.pid, observation: 'unobserved', runId: null, progress: null });
+  expect(JSON.parse(printed[2]!)).toEqual({ pid: process.pid, observation: 'unobserved', runId: null, progress: null });
+  expect(printed).toHaveLength(3);
 });
 
 

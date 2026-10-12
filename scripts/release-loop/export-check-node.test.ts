@@ -7,12 +7,13 @@ import type { CommandRunner } from './node-verdict.js';
 
 const commit = 'a'.repeat(40);
 
-function check(exportStatus: number, buildStatus: number, index = false) {
+function check(exportStatus: number, buildStatus: number, index = false, pwaDependencies = true) {
   const root = mkdtempSync(join(tmpdir(), 'release-export-check-test-'));
   const repo = join(root, 'repo');
   const calls: Array<{ command: string; args: string[]; cwd?: string }> = [];
   const previous = process.env.ELANOUS_GRAPH_CONTEXT;
   mkdirSync(join(repo, 'node_modules'), { recursive: true });
+  if (pwaDependencies) mkdirSync(join(repo, 'apps', 'pwa', 'node_modules'), { recursive: true });
   process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.8', previousVersion: '0.2.7' }, outputs: { 'version-release': { commit }, gate: { outcome: 'ok' } } });
   const run: CommandRunner = (command, args, cwd) => {
     calls.push({ command, args, cwd });
@@ -66,6 +67,17 @@ test('build failure and missing index.html report the build tail', () => {
   expect(failed.calls.at(-1)?.args[1]).toBe('remove');
   const missing = check(0, 0);
   expect(missing.result).toMatchObject({ outcome: 'fail', step: 'build' });
+});
+
+test('missing PWA dependencies report the installation command and still remove the temporary worktree', () => {
+  const { result, calls, sourceGone, tempGone } = check(0, 0, false, false);
+  expect(result).toMatchObject({
+    outcome: 'fail', step: 'build',
+    tail: 'PWA dependencies missing; run bun install --cwd apps/pwa in the release-loop repository',
+  });
+  expect(calls.filter((c) => c.command === 'bun')).toHaveLength(1);
+  expect(calls.at(-1)?.args[1]).toBe('remove');
+  expect(sourceGone && tempGone).toBe(true);
 });
 
 test('successful export and public PWA build remove the temporary worktree', () => {

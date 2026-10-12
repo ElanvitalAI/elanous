@@ -978,6 +978,8 @@ export interface RenderOptions {
   force?: boolean;
   /** Physical cursor ANSI emitted after overlays as the last bytes of the frame. */
   cursor?: string;
+  /** Called after this frame finishes rendering and stdout settles. */
+  onWriteComplete?: (error?: Error | null) => void;
 }
 
 let _lastFrameLines: string[] = [];
@@ -1036,7 +1038,22 @@ export function render(lines: string[], opts: RenderOptions = {}): void {
   }
   if (opts.overlay) buf += opts.overlay;
   if (opts.cursor) buf += opts.cursor;
-  process.stdout.write(buf);
+  let writeSettled = false;
+  let writeError: Error | null | undefined;
+  let rendered = false;
+  const finishWrite = () => {
+    if (!opts.onWriteComplete || !writeSettled || !rendered) return;
+    try { opts.onWriteComplete(writeError); } catch { /* observation must not break rendering */ }
+  };
+  if (opts.onWriteComplete) {
+    process.stdout.write(buf, (error) => {
+      writeError = error;
+      writeSettled = true;
+      finishWrite();
+    });
+  } else {
+    process.stdout.write(buf);
+  }
   perf.recordStdoutWrite(buf.length, true);
   perf.markDrawEnd();
 
@@ -1053,6 +1070,8 @@ export function render(lines: string[], opts: RenderOptions = {}): void {
   if (_frameObserver) {
     try { _frameObserver(_lastFrameLines, { rows, cols }); } catch { /* swallow */ }
   }
+  rendered = true;
+  finishWrite();
 }
 
 // ── Utility ──

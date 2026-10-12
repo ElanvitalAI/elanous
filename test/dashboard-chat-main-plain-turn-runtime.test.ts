@@ -198,6 +198,12 @@ async function implementationDisciplineFromDirectRuntime(
       const config = getUserConfig();
       return {
         ...config,
+        // The isolated test env has no provider credentials, and
+        // resolveActiveProvider() throws NoLlmProviderAvailableError for
+        // provider 'auto' — pin a concrete provider so the preamble builder
+        // renders implementation-discipline bytes deterministically (same
+        // convention as dashboard-impl-discipline-native-structure.test.ts).
+        llm: { ...config.llm, provider: 'grok' },
         voice: { ...config.voice, tts: { ...config.voice.tts, drainCooldownMs: 0 } },
         chat: {
           ...config.chat,
@@ -517,5 +523,130 @@ describe('runDashboardChatMainPlainTurn', () => {
     await runDashboardChatMainPlainTurn(ctx.deps);
 
     expect(armed).toEqual([[]]);
+  });
+
+  it('logs first-token exactly once for the first non-empty text chunk with ISO coordinates', async () => {
+    const turnStartedAt = Date.now() - 50;
+    const ctx = buildDeps({
+      turnStartedAt,
+      acpSession: {
+        send: async ({ onText, onToolCall }) => {
+          onToolCall({ tool: 'bash' });
+          onText('');
+          onText('first chunk');
+          onText('second chunk');
+        },
+      },
+    });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+
+    const firstTokenEvents = ctx.debugEvents.filter(
+      event => event.category === 'chat.turn' && event.event === 'first-token',
+    );
+    expect(firstTokenEvents).toHaveLength(1);
+    const payload = firstTokenEvents[0]!.payload;
+    expect(payload.turnStartedAt).toBe(turnStartedAt);
+    expect(typeof payload.ms).toBe('number');
+    expect(payload.ms as number).toBeGreaterThanOrEqual(0);
+    expect(payload.turnStartedAtIso).toBe(new Date(turnStartedAt).toISOString());
+    expect(typeof payload.firstTokenAtIso).toBe('string');
+    expect(ctx.finalizeCalls).toEqual([{ status: 'completed', error: undefined }]);
+  });
+
+  it('emits no first-token record when every text chunk is empty', async () => {
+    const ctx = buildDeps({
+      acpSession: {
+        send: async ({ onText }) => {
+          onText('');
+          onText('');
+        },
+      },
+    });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+
+    expect(ctx.debugEvents.filter(event => event.event === 'first-token')).toHaveLength(0);
+    expect(ctx.finalizeCalls).toEqual([{ status: 'completed', error: undefined }]);
+  });
+
+  it('emits no first-token record when the turn is aborted before any text', async () => {
+    let abortCtrl: AbortController | undefined;
+    const ctx = buildDeps({
+      attachChatStreamingKeys: (ctrl) => {
+        abortCtrl = ctrl;
+        return () => {};
+      },
+      loadAttachments: async () => {
+        abortCtrl!.abort();
+      },
+    });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+
+    expect(ctx.debugEvents.filter(event => event.event === 'first-token')).toHaveLength(0);
+    expect(ctx.calls).not.toContain('acp:send');
+    expect(ctx.finalizeCalls).toEqual([{ status: 'interrupted', error: undefined }]);
+  });
+
+  it('does not count text delivered after stream cancellation as a first token', async () => {
+    let abortCtrl: AbortController | undefined;
+    const ctx = buildDeps({
+      attachChatStreamingKeys: (ctrl) => {
+        abortCtrl = ctrl;
+        return () => {};
+      },
+      acpSession: {
+        send: async ({ onText }) => {
+          abortCtrl!.abort();
+          onText('late chunk');
+        },
+      },
+    });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+
+    expect(ctx.debugEvents.filter(event => event.event === 'first-token')).toHaveLength(0);
+  });
+
+  it('keeps the turn running when the first-token debug log throws', async () => {
+    const ctx = buildDeps({
+      debugLog: (category, event) => {
+        if (category === 'chat.turn' && event === 'first-token') {
+          throw new Error('debug log exploded');
+        }
+      },
+      acpSession: {
+        send: async ({ onText }) => {
+          onText('still streams');
+        },
+      },
+    });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+
+    expect(ctx.calls).toContain('stream:onText');
+    expect(ctx.calls).toContain('record-turn-metrics');
+    expect(ctx.errorLines).toEqual([]);
+    expect(ctx.finalizeCalls).toEqual([{ status: 'completed', error: undefined }]);
+  });
+
+  it('stamps the turn-start ISO coordinate on the streaming-keys-attached record', async () => {
+    const ctx = buildDeps({ turnStartedAt: 123 });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+
+    const attached = ctx.debugEvents.find(
+      event => event.category === 'chat-main.plain-turn' && event.event === 'streaming-keys-attached',
+    );
+    expect(attached).toBeDefined();
+    expect(attached!.payload.turnStartedAtIso).toBe('1970-01-01T00:00:00.123Z');
+    expect(attached!.payload.turnStartedAt).toBe(123);
+  });
+
+  it('keeps the existing streaming-keys record when the turn timestamp is invalid', async () => {
+    const ctx = buildDeps({ turnStartedAt: Number.NaN });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+
+    const attached = ctx.debugEvents.find(
+      event => event.category === 'chat-main.plain-turn' && event.event === 'streaming-keys-attached',
+    );
+    expect(attached).toBeDefined();
+    expect(attached!.payload.userTextBytes).toBe(11);
+    expect(attached!.payload.turnStartedAtIso).toBeUndefined();
   });
 });

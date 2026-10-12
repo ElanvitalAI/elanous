@@ -555,6 +555,40 @@ describe('enhance — 체크리스트 «용도»가 프롬프트를 가른다', 
   });
 });
 
+describe('enhance — fallback reason observation', () => {
+  it('records the reason and response length without logging response text', async () => {
+    const cases = [
+      { response: new Error('stream failed'), fallbackReason: 'llm-error', replyChars: 0 },
+      { response: '  \n\t ', fallbackReason: 'empty-reply', replyChars: 5 },
+      { response: 'not JSON response', fallbackReason: 'unparsed', replyChars: 17 },
+      { response: '{"goal":"g","constraints":[],"checklist":[]}', fallbackReason: 'unparsed' },
+      { response: '{"goal":"g","constraints":["c"],"checklist":["item"]}', fallbackReason: 'none' },
+    ] as const;
+
+    for (const testCase of cases) {
+      const stream = spyOn(llm, 'streamLLM').mockImplementation(async () => {
+        if (testCase.response instanceof Error) throw testCase.response;
+        return testCase.response;
+      });
+      const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+      try {
+        const result = await enhancePrompt('raw ask');
+        const enhancedEvent = log.mock.calls.find((call) => call[0] === 'prompt-enhance' && call[1] === 'enhanced');
+        const eventData = enhancedEvent?.[2] as Record<string, unknown> | undefined;
+        expect(eventData?.fallbackReason).toBe(testCase.fallbackReason);
+        expect(typeof eventData?.replyChars).toBe('number');
+        if ('replyChars' in testCase) expect(eventData?.replyChars).toBe(testCase.replyChars);
+        else expect(eventData?.replyChars).toBe(testCase.response.length);
+        expect(JSON.stringify(eventData)).not.toContain(typeof testCase.response === 'string' ? testCase.response : testCase.response.message);
+        expect(result.enhanced).toContain('raw ask');
+      } finally {
+        log.mockRestore();
+        stream.mockRestore();
+      }
+    }
+  });
+});
+
 describe('enhance — first-token time observation (G13)', () => {
   it('logs first-token once per call with ms since request start, ignoring empty deltas', async () => {
     const clock = [1_000, 1_250, 9_999];

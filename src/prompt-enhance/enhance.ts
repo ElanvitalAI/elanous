@@ -393,6 +393,8 @@ export async function enhancePrompt(raw: string, opts: EnhanceOpts = {}): Promis
   let complication: string | undefined;
   let decisionSignal: EnhanceResult['decisionSignal'];
   let enhancedBy: 'llm' | 'fallback' = 'llm';
+  let fallbackReason: 'llm-error' | 'empty-reply' | 'unparsed' | 'none' = 'none';
+  let replyChars = 0;
   const groundedFacts = opts.groundedFacts ?? [];
   const wantsScqa = groundedFacts.length > 0;
 
@@ -439,6 +441,10 @@ export async function enhancePrompt(raw: string, opts: EnhanceOpts = {}): Promis
         try { opts.onUsage?.(usage); } catch { /* usage observation must not change enhancement */ }
       },
     });
+    replyChars = rawOut.length;
+    if (rawOut.trim().length === 0) {
+      fallbackReason = 'empty-reply';
+    }
     const parsed = parseEnhanceJson(rawOut);
     if (parsed) {
       goal = parsed.goal;
@@ -449,9 +455,11 @@ export async function enhancePrompt(raw: string, opts: EnhanceOpts = {}): Promis
       complication = parsed.complication;
       decisionSignal = parsed.decisionSignal;
     } else {
+      fallbackReason = fallbackReason === 'empty-reply' ? 'empty-reply' : 'unparsed';
       enhancedBy = 'fallback';
     }
   } catch (e) {
+    fallbackReason = 'llm-error';
     debug.log('prompt-enhance', 'llm-error', { error: String((e as { message?: string })?.message ?? e).slice(0, 160) }, { level: 'error' });
     enhancedBy = 'fallback';
   }
@@ -461,6 +469,7 @@ export async function enhancePrompt(raw: string, opts: EnhanceOpts = {}): Promis
     checklist = extractChecklistFallback(original);
     checklistProvenance = checklist.map(() => 'unknown');
     enhancedBy = 'fallback';
+    if (fallbackReason === 'none') fallbackReason = 'unparsed';
   }
   if (!constraints.length) {
     constraints = [
@@ -515,6 +524,8 @@ export async function enhancePrompt(raw: string, opts: EnhanceOpts = {}): Promis
     enhancedChars: enhanced.length,
     checklist: checklist.length,
     enhancedBy,
+    fallbackReason,
+    replyChars,
     model,
     verbatimPreserved,
     // ⭐ 관측 — 「요약을 요구했나 / 받았나 / 옮겨 적어 버렸나」를 «다른 값»으로 남긴다.

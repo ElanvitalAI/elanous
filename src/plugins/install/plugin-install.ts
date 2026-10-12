@@ -438,6 +438,13 @@ function declaresMain(packageRoot: string): boolean {
   return !existsSync(join(packageRoot, 'plugin.json')) && !existsSync(join(packageRoot, '.codex-plugin', 'plugin.json'));
 }
 
+/** [wiring] Caller: installPlugin. The PluginManifest normalized by
+ * loadPluginManifestFromDir is handed into the install path here — the install
+ * destination follows the manifest identity, never the source spec/dir name. */
+export function pluginInstallPath(root: string, market: string, manifest: PluginManifest): string {
+  return join(root, 'plugins', market, manifest.id, manifest.version);
+}
+
 export async function installPlugin(spec: string, opts: InstallOptions = {}): Promise<InstalledPlugin> {
   const root = resolve(opts.root ?? elanousStateRoot());
   const stageRoot = join(root, 'plugins', '.staging');
@@ -466,6 +473,10 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
     const manifest: PluginManifest = loadPluginManifestFromDir(join(stage, 'package'), { id: source.expectedName ?? basename(spec) }).manifest;
     if (!NAME.test(manifest.id) || !VERSION.test(manifest.version)) fail('io', 'invalid plugin name or version');
     if (source.expectedName && (manifest.id !== source.expectedName || manifest.version !== source.expectedVersion)) fail('conflict', 'market name or version differs from manifest');
+    // [wiring] installPlugin is the caller: the PluginManifest normalized above by
+    // loadPluginManifestFromDir (present manifest or the loader's manifest-absent
+    // fallback) is handed into the install path here, past the NAME/VERSION gates.
+    const destination = pluginInstallPath(root, source.market, manifest);
     const packageRoot = join(stage, 'package');
     const mainPath = inside(packageRoot, manifest.main);
     // A skills/graphs-only pack (official `elanous-basics`) declares no `main` — the default `./plugin.ts` is not a promise.
@@ -480,7 +491,6 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
       const path = inside(packageRoot, asset);
       if (!existsSync(path) || !realpathSync(path).startsWith(`${realpathSync(packageRoot)}${sep}`)) fail('io', `plugin asset not found or unsafe: ${asset}`);
     }
-    const destination = join(root, 'plugins', source.market, name, version);
     const emit = (event: InstallEvent) => opts.onEvent?.(event);
     emit({ event: 'resolve', plugin: name, version, sha256: source.sha256 });
     let security: ReturnType<typeof inspectPluginSecurity>;

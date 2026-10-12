@@ -29,6 +29,31 @@ export interface ToolSearchRunResult {
   [HYDRATED_TOOLS_KEY]?: LLMToolSpec[];
 }
 
+/** Session runtime applies this only to the fixed harness turn, using its
+ * originating userText. Both the callable catalog and visible schemas must
+ * agree, so a later model turn cannot rehydrate Edit or Write from this result. */
+export function blockWriteToolSearchHydration(result: ToolSearchRunResult): ToolSearchRunResult {
+  const hydrated = result[HYDRATED_TOOLS_KEY] ?? [];
+  const allowed = hydrated.filter((tool) => tool.name !== 'Edit' && tool.name !== 'Write');
+  if (allowed.length === hydrated.length) return result;
+  const blocked = new Set(['Edit', 'Write']);
+  const matched = result.matched.filter((name) => !blocked.has(name));
+  const schemas = allowed.length > 0
+    ? `<functions>\n${allowed.map((tool) => `<function>${JSON.stringify({
+      description: tool.description,
+      name: tool.name,
+      parameters: tool.parameters,
+    })}</function>`).join('\n')}\n</functions>`
+    : '';
+  const output = `# ToolSearch: ${matched.length} allowed match${matched.length === 1 ? '' : 'es'}\n\n${schemas}`;
+  return {
+    ...result,
+    output,
+    matched,
+    [HYDRATED_TOOLS_KEY]: allowed,
+  };
+}
+
 export const toolSearchRuntime: ToolRuntime<ToolSearchArgs, ToolSearchRunResult> = {
   id: 'tool_search',
   spec: buildToolSearchTool(),

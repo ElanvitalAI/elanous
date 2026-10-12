@@ -1,13 +1,20 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { Command } from 'commander';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, writeSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { debug } from '../debug/log.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { addItem, checklistDevVersion } from '../release-loop/checklist.js';
 import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
+import { GoalAskStore } from '../self-implement/goal-ask-store.js';
+import { GoalRunStore, goalRunDbPath } from '../self-implement/goal-run-store.js';
+import { runHostRegate } from '../self-implement/host-regate.js';
 import type { LogStoreRow } from '../mss/logging/log-store.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from '../task-agent/task-hand.js';
+import type { BoardNode } from '../task-agent/board.js';
 import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TasksCliDeps } from './tasks-cli.js';
 
 const token = 'secret-acp-token-sentinel';
@@ -35,10 +42,13 @@ function nexus() {
   return { requests, fetchNexus: fetchNexus as typeof fetch };
 }
 
-async function run(args: string[], deps: TasksCliDeps): Promise<{ lines: string[]; code: number | undefined }> {
+async function run(args: string[], deps: TasksCliDeps, readRealGoalLedgers = false): Promise<{ lines: string[]; code: number | undefined }> {
   const lines: string[] = [];
   const program = new Command().name('elanous').exitOverride();
-  registerTasksCommands(program, { ...deps, output: (line) => lines.push(line) });
+  registerTasksCommands(program, {
+    ...(args.includes('cover') && !readRealGoalLedgers ? { coverGoalAsks: () => [], coverGoalRuns: () => [] } : {}),
+    ...deps, output: (line) => lines.push(line),
+  });
   const previous = process.exitCode;
   process.exitCode = undefined;
   try {
@@ -67,6 +77,7 @@ test('tasks cover --json reads two filtered log sources and measures land withou
   ]);
   expect(JSON.parse(result.lines[0]!).rows).toContainEqual({ verb: 'land', byTaskAgent: 1, total: 4, observedActions: 2, ratio: 0.25, state: 'measured', liveActions: 2, shadowActions: 0, stewardTransition: 'observed' });
   expect(JSON.parse(result.lines[0]!).rows[1]).toEqual({ verb: 'review', byTaskAgent: 2, total: null, observedActions: 2, ratio: null, state: 'no-denominator', liveActions: 2, shadowActions: 0, stewardTransition: 'unmeasured' });
+  expect(JSON.parse(result.lines[0]!).sevenVerbs.verbs[4]).toEqual({ verb: '저작', source: 'goal-ask+goal-run', liveDone: 0, shadow: 0, state: 'none' });
 });
 
 test('tasks cover --lines uses the one-line formatter on the read-only observation path', async () => {
@@ -85,7 +96,7 @@ test('tasks cover --lines uses the one-line formatter on the read-only observati
     'review: TA 0/- (-) · live 0 · shadow 1 · steward-transition unmeasured',
     'retry: TA 0/- (-) · live 0 · shadow 0 · steward-transition unmeasured',
     'green: TA 0/- (-) · live 0 · shadow 0 · steward-transition unmeasured',
-    '7동사 live 1/7 · 출처 없음 저작·구현·정리',
+    '7동사 live 1/7 · 출처 없음 구현·정리',
   ]);
 });
 
@@ -169,13 +180,109 @@ test('tasks cover --json includes the seven-verb live measurement', async () => 
       { verb: '착지', source: 'land', liveDone: 1, shadow: 0, state: 'live' },
       { verb: '수리', source: 'retry', liveDone: 0, shadow: 1, state: 'shadow-only' },
       { verb: '검증', source: 'green', liveDone: 0, shadow: 0, state: 'none' },
-      { verb: '저작', source: null, liveDone: null, shadow: null, state: 'no-source' },
+      { verb: '저작', source: 'goal-ask+goal-run', liveDone: 0, shadow: 0, state: 'none' },
       { verb: '구현', source: null, liveDone: null, shadow: null, state: 'no-source' },
       { verb: '정리', source: null, liveDone: null, shadow: null, state: 'no-source' },
     ],
     liveVerbs: 2,
-    measuredVerbs: 4,
+    measuredVerbs: 5,
   });
+});
+
+test('tasks cover joins authored goal provenance to merged goal records inside the window', async () => {
+  const since = '2026-10-10T00:00:00Z';
+  const until = '2026-10-12T00:00:00Z';
+  const asks = [
+    { authorRunId: 'a1', goalId: 'g1', createdAt: '2026-10-01T00:00:00Z' },
+    { authorRunId: 'a2', goalId: 'g2', createdAt: since },
+    { authorRunId: 'a3', goalId: 'g3', createdAt: since },
+  ];
+  const runs = [
+    { goalId: 'g1', stage: 'merged', outcome: 'completed', startedAt: '2026-10-01T00:00:00Z', completedAt: '2026-10-11T00:00:00Z' },
+    { goalId: 'g2', stage: 'failed', outcome: 'abandoned', startedAt: since, completedAt: '2026-10-11T00:00:00Z' },
+    { goalId: 'g3', stage: 'merged', outcome: 'completed', startedAt: since, completedAt: '2026-10-13T00:00:00Z' },
+  ];
+  const coverLogs: NonNullable<TasksCliDeps['coverLogs']> = (query) => query.exactCategories?.[0] === 'task-agent'
+    ? ['review', 'land', 'retry', 'green'].map((kind) => ({ category: 'task-agent', event: 'action', data: JSON.stringify({ kind, result: 'done' }) } as LogStoreRow))
+    : [];
+  const deps = { coverLogs, coverGoalAsks: () => asks, coverGoalRuns: () => runs };
+  const result = await run(['tasks', 'cover', '--json', '--since', since, '--until', until], deps);
+  const body = JSON.parse(result.lines[0]!);
+  expect(body.sevenVerbs.verbs[4]).toEqual({ verb: '저작', source: 'goal-ask+goal-run', liveDone: 1, shadow: 0, state: 'live' });
+  expect(body.sevenVerbs.liveVerbs).toBe(5);
+  expect(body.rows[1]).toMatchObject({ verb: 'review', byTaskAgent: 1 });
+  const lines = await run(['tasks', 'cover', '--lines', '--since', since, '--until', until], deps);
+  expect(lines.lines.at(-1)).toBe('7동사 live 5/7 · 출처 없음 구현·정리');
+  const dangling = await run(['tasks', 'cover', '--json', '--since', since], { ...deps, coverGoalAsks: () => asks.filter((ask) => ask.goalId === 'g2') });
+  expect(JSON.parse(dangling.lines[0]!).sevenVerbs.verbs[4]).toMatchObject({ liveDone: 0, state: 'none' });
+  const missingRun = await run(['tasks', 'cover', '--json', '--since', since], { ...deps, coverGoalRuns: () => [] });
+  expect(JSON.parse(missingRun.lines[0]!).sevenVerbs.verbs[4]).toMatchObject({ liveDone: 0, state: 'none' });
+  const lateMerge = await run(['tasks', 'cover', '--json', '--since', since, '--until', until], {
+    ...deps, coverGoalAsks: () => asks.filter((ask) => ask.goalId === 'g3'),
+  });
+  expect(JSON.parse(lateMerge.lines[0]!).sevenVerbs.verbs[4]).toMatchObject({ liveDone: 0, state: 'none' });
+  const undatedMerge = await run(['tasks', 'cover', '--json', '--since', since, '--until', until], {
+    ...deps, coverGoalRuns: () => [{ goalId: 'g1', stage: 'merged', outcome: 'completed', startedAt: since }],
+  });
+  expect(JSON.parse(undatedMerge.lines[0]!).sevenVerbs.verbs[4]).toMatchObject({ liveDone: null, state: 'unreadable' });
+  const unrelatedUndated = await run(['tasks', 'cover', '--json', '--since', since, '--until', until], {
+    ...deps, coverGoalRuns: () => [...runs, { goalId: 'unrelated', stage: 'merged', outcome: 'completed', startedAt: since }],
+  });
+  expect(JSON.parse(unrelatedUndated.lines[0]!).sevenVerbs.verbs[4]).toMatchObject({ liveDone: 1, state: 'live' });
+  for (const broken of [{ coverGoalAsks: () => null }, { coverGoalRuns: () => { throw new Error('unreadable'); } }]) {
+    const unknown = await run(['tasks', 'cover', '--json'], { ...deps, ...broken });
+    expect(JSON.parse(unknown.lines[0]!).sevenVerbs).toMatchObject({ liveVerbs: null, verbs: expect.arrayContaining([{ verb: '저작', source: 'goal-ask+goal-run', liveDone: null, shadow: null, state: 'unreadable' }]) });
+  }
+});
+
+test('tasks cover default reader joins persisted authoring and completed merged goal records', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cover-goal-ledgers-'));
+  const goalId = '0123456789abcdef';
+  const goalFile = join(dir, 'GOAL-test.md');
+  const document = `# Goal\n- GoalId: ${goalId}\n`;
+  writeFileSync(goalFile, document);
+  setElanousConfigDir(dir);
+  try {
+    const path = goalRunDbPath();
+    const asks = new GoalAskStore(path);
+    try {
+      expect(asks.insert({ authorRunId: 'author-real', goalFile, ask: 'write goal', document })).toBe(true);
+    } finally { asks.close(); }
+    const goals = new GoalRunStore(path);
+    try {
+      goals.insert(goalFile, {
+        runId: 'run-real', stage: 'merged', outcome: 'completed', ok: true,
+        startedAt: '2026-10-10T00:00:00Z', completedAt: '2026-10-11T00:00:00Z', rounds: 1,
+      }, goalId);
+    } finally { goals.close(); }
+    const result = await run(['tasks', 'cover', '--json', '--since', '2026-10-10T00:00:00Z', '--until', '2026-10-12T00:00:00Z'], {
+      coverLogs: () => [],
+    }, true);
+    expect(result.code ?? 0).toBe(0);
+    expect(JSON.parse(result.lines[0]!).sevenVerbs.verbs[4]).toEqual({
+      verb: '저작', source: 'goal-ask+goal-run', liveDone: 1, shadow: 0, state: 'live',
+    });
+  } finally { resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('tasks cover default reader marks a bounded authoring ledger unreadable', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cover-bounded-ledger-'));
+  setElanousConfigDir(dir);
+  try {
+    const path = goalRunDbPath();
+    new GoalAskStore(path).close();
+    const db = new Database(path);
+    try {
+      db.run(`WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 100001)
+        INSERT INTO goal_ask (author_run_id, goal_id, goal_file, ask, created_at)
+        SELECT 'author-' || x, 'goal-' || x, 'goal.md', 'ask', '2026-10-11T00:00:00Z' FROM n`);
+    } finally { db.close(); }
+    const result = await run(['tasks', 'cover', '--json'], { coverLogs: () => [] }, true);
+    expect(result.code ?? 0).toBe(0);
+    const body = JSON.parse(result.lines[0]!);
+    expect(body.limitReached).toBe(true);
+    expect(body.sevenVerbs.verbs[4]).toMatchObject({ liveDone: null, state: 'unreadable' });
+  } finally { resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('tasks cover --by-card reads the injected card ledger inside the window; without the flag it never calls coverCards', async () => {
@@ -263,6 +370,194 @@ test('task hand rejects missing, directory, unreadable and empty goal files with
     expect(events).toHaveLength(paths.length);
     for (const [index, path] of paths.entries()) expect(events[index]).toMatchObject({ event: 'goal-file-rejected', data: { path, reason: reasons[index] } });
   } finally { off(); }
+});
+
+test('task hand --checklist uses the unchanged cell title when text is omitted and rejects non-path text before launch', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-checklist-hand-'));
+  const releaseBoard: BoardNode[] = [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
+    { id: 'cell-1', level: 'task', title: '대상 경로: src/thing.ts\n구현 계약 그대로', status: 'open' },
+  ] }];
+  const launcherCalls: string[][] = [];
+  const deps: TasksCliDeps = {
+    taskStatePath: join(dir, 'cards.json'), registerSink: async () => true, releaseBoard: () => releaseBoard,
+    taskLauncher: (args) => { launcherCalls.push(args); },
+  };
+
+  const omitted = await run(['tasks', 'hand', '--checklist', 'cell-1', '--live', '--json'], deps);
+  expect(omitted.code ?? 0).toBe(0);
+  expect(JSON.parse(omitted.lines[0]!).move.command.at(-1)).toBe('대상 경로: src/thing.ts\n구현 계약 그대로');
+  expect(launcherCalls).toHaveLength(1);
+  expect(launcherCalls[0]!.at(-1)).toBe('대상 경로: src/thing.ts\n구현 계약 그대로');
+
+  const valid = await run(['tasks', 'hand', '대상 경로: src/supplied.ts\n세부', '--checklist', 'cell-1', '--live', '--json'], deps);
+  expect(valid.code ?? 0).toBe(0);
+  expect(JSON.parse(valid.lines[0]!).move.command.at(-1)).toBe('대상 경로: src/supplied.ts\n세부');
+  expect(launcherCalls[1]!.at(-1)).toBe('대상 경로: src/supplied.ts\n세부');
+
+  const invalid = await run(['tasks', 'hand', '임의의 문면', '--checklist', 'cell-1', '--live'], deps);
+  expect(invalid.code).toBe(1);
+  expect(invalid.lines).toEqual(['칸 문면을 쓰려면 문면 인자를 빼라']);
+  expect(launcherCalls).toHaveLength(2);
+  expect(launcherCalls[0]!.at(-1)).toBe('대상 경로: src/thing.ts\n구현 계약 그대로');
+
+  const project = await run(['tasks', 'hand', '--checklist', 'project', '--live'], deps);
+  expect(project.code).toBe(1);
+  expect(project.lines).toEqual(['체크리스트 칸 없음: project']);
+  expect(launcherCalls).toHaveLength(2);
+  const projectWithText = await run(['tasks', 'hand', '대상 경로: src/thing.ts', '--checklist', 'project', '--live'], deps);
+  expect(projectWithText.code).toBe(1);
+  expect(projectWithText.lines).toEqual(['체크리스트 칸 없음: project']);
+  expect(launcherCalls).toHaveLength(2);
+});
+
+test('task hand --checklist reads the current release cell through the default board', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-default-checklist-'));
+  const title = '대상 경로: src/real.ts\n현재 판 칸 원문';
+  setElanousConfigDir(dir);
+  try {
+    addItem(checklistDevVersion(), { id: 'MK-DEFAULT-BOARD', title });
+    const launcherCalls: string[][] = [];
+    const result = await run(['tasks', 'hand', '--checklist', 'MK-DEFAULT-BOARD', '--live', '--json'], {
+      taskStatePath: join(dir, 'cards.json'), registerSink: async () => true,
+      taskLauncher: (args) => { launcherCalls.push(args); },
+    });
+    expect(result.code ?? 0).toBe(0);
+    expect(launcherCalls).toHaveLength(1);
+    expect(launcherCalls[0]!.at(-1)).toBe(title);
+    expect(JSON.parse(result.lines[0]!).card.text).toBe(title);
+  } finally { resetElanousConfigDir(); }
+});
+
+test('task hand default board finds an unreleased later version from the isolated checklist ledger', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-later-checklist-'));
+  const title = '대상 경로: src/later-release.ts\n다음 판 칸 원문';
+  const [major, minor, patch] = checklistDevVersion().split('.').map(Number);
+  const later = `${major}.${minor}.${patch! + 1}`;
+  setElanousConfigDir(dir);
+  try {
+    addItem(later, { id: 'MK-LATER-BOARD', title });
+    const launches: string[][] = [];
+    const result = await run(['tasks', 'hand', '--checklist', 'MK-LATER-BOARD', '--live', '--json'], {
+      taskStatePath: join(dir, 'cards.json'), registerSink: async () => true,
+      taskLauncher: (args) => { launches.push(args); },
+    });
+    expect(result.code ?? 0).toBe(0);
+    expect(JSON.parse(result.lines[0]!).card.text).toBe(title);
+    expect(launches).toHaveLength(1);
+  } finally { resetElanousConfigDir(); }
+});
+
+test('task hand finds a later open release cell, prefers the nearest duplicate, and allows --version to pin it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-any-version-'));
+  const current = checklistDevVersion();
+  const [major, minor, patch] = current.split('.').map(Number);
+  const later = `${major}.${minor}.${patch! + 1}`;
+  const latest = `${major}.${minor}.${patch! + 2}`;
+  const warnings: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { warnings.push(args.join(' ')); };
+  const launches: string[][] = [];
+  const deps: TasksCliDeps = {
+    taskStatePath: join(dir, 'cards.json'), registerSink: async () => true,
+    releaseVersions: () => [latest, current, later],
+    releaseBoard: (version) => [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
+      ...(version === later || version === latest ? [{ id: 'NEXT', level: 'task' as const, title: `대상 경로: src/${version}.ts`, status: 'open' as const }] : []),
+    ] }],
+    taskLauncher: (args) => { launches.push(args); },
+  };
+  try {
+    const next = await run(['tasks', 'hand', '--checklist', 'NEXT', '--live', '--json'], deps);
+    expect(next.code ?? 0).toBe(0);
+    expect(JSON.parse(next.lines[0]!).card.text).toBe(`대상 경로: src/${later}.ts`);
+    expect(launches[0]!.at(-1)).toBe(`대상 경로: src/${later}.ts`);
+    expect(warnings.some((line) => line.includes(`가장 가까운 판 ${later}`))).toBe(true);
+    const pinned = await run(['tasks', 'hand', '--checklist', 'NEXT', '--version', latest, '--live', '--json'], deps);
+    expect(pinned.code ?? 0).toBe(0);
+    expect(JSON.parse(pinned.lines[0]!).card.text).toBe(`대상 경로: src/${latest}.ts`);
+    const missing = await run(['tasks', 'hand', '--checklist', 'ABSENT', '--live'], deps);
+    expect(missing.code).toBe(1);
+    expect(missing.lines).toEqual(['체크리스트 칸 없음: ABSENT']);
+    expect(launches).toHaveLength(2);
+    const invalid = await run(['tasks', 'hand', '--checklist', 'NEXT', '--version', '../bad', '--live'], deps);
+    expect(invalid.code).toBe(1);
+    expect(launches).toHaveLength(2);
+    const unbound = await run(['tasks', 'hand', 'text', '--version', latest, '--live'], deps);
+    expect(unbound.code).toBe(1);
+    expect(unbound.lines).toEqual(['--version 은 --checklist 와 함께 준다']);
+  } finally { console.error = originalError; }
+});
+
+test('task hand prefers the current release cell over an older unreleased duplicate', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-current-first-'));
+  const current = checklistDevVersion();
+  const [major, minor, patch] = current.split('.').map(Number);
+  const older = `${major}.${minor}.${patch! - 1}`;
+  const warnings: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { warnings.push(args.join(' ')); };
+  try {
+    const result = await run(['tasks', 'hand', '--checklist', 'DUP', '--live', '--json'], {
+      taskStatePath: join(dir, 'cards.json'), registerSink: async () => true,
+      releaseVersions: () => [older, current],
+      releaseBoard: (version) => [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
+        { id: 'DUP', level: 'task', title: `대상 경로: src/${version}.ts`, status: 'open' },
+      ] }],
+      taskLauncher: () => {},
+    });
+    expect(result.code ?? 0).toBe(0);
+    expect(JSON.parse(result.lines[0]!).card.text).toBe(`대상 경로: src/${current}.ts`);
+    expect(warnings.some((line) => line.includes(`가장 가까운 판 ${current}`))).toBe(true);
+  } finally { console.error = originalError; }
+});
+
+test('task hand keeps the current board available and ignores a broken unrelated release board', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-broken-release-'));
+  const current = checklistDevVersion();
+  const [major, minor, patch] = current.split('.').map(Number);
+  const unrelated = `${major}.${minor}.${patch! + 1}`;
+  const title = '대상 경로: src/current.ts';
+  const warnings: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { warnings.push(args.join(' ')); };
+  try {
+    const result = await run(['tasks', 'hand', '--checklist', 'CURRENT', '--live', '--json'], {
+      taskStatePath: join(dir, 'cards.json'), registerSink: async () => true,
+      releaseVersions: () => [unrelated],
+      releaseBoard: (version) => {
+        if (version === unrelated) throw new Error('broken ledger');
+        return [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
+          { id: 'CURRENT', level: 'task', title, status: 'open' },
+        ] }];
+      },
+      taskLauncher: () => {},
+    });
+    expect(result.code ?? 0).toBe(0);
+    expect(JSON.parse(result.lines[0]!).card.text).toBe(title);
+    expect(warnings.some((line) => line.includes(`${unrelated} 읽기 실패`))).toBe(true);
+    const pinned = await run(['tasks', 'hand', '--checklist', 'CURRENT', '--version', unrelated, '--live'], {
+      taskStatePath: join(dir, 'other-cards.json'), registerSink: async () => true,
+      releaseBoard: () => { throw new Error('broken ledger'); }, taskLauncher: () => {},
+    });
+    expect(pinned.code).toBe(1);
+    expect(pinned.lines).toEqual([`체크리스트 판 읽기 실패: ${unrelated}`]);
+  } finally { console.error = originalError; }
+});
+
+test('task hand --checklist passes a non-path cell title unchanged when text is omitted', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-non-path-title-'));
+  const title = '기존 칸 문면\n둘째 줄 그대로';
+  const launcherCalls: string[][] = [];
+  const result = await run(['tasks', 'hand', '--checklist', 'cell-no-path', '--live', '--json'], {
+    taskStatePath: join(dir, 'cards.json'), registerSink: async () => true,
+    releaseBoard: () => [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
+      { id: 'cell-no-path', level: 'task', title, status: 'open' },
+    ] }],
+    taskLauncher: (args) => { launcherCalls.push(args); },
+  });
+  expect(result.code ?? 0).toBe(0);
+  expect(launcherCalls).toHaveLength(1);
+  expect(launcherCalls[0]!.at(-1)).toBe(title);
+  expect(JSON.parse(result.lines[0]!).card.text).toBe(title);
 });
 
 test('task hand preserves ordinary text and --mission without attempting to inline', async () => {
@@ -644,10 +939,69 @@ test('TA-REJUDGE-ON-HEAD — tasks regate-run runs the host regate without merge
   const result = await run(['tasks', 'regate-run', '--card', 'ta-x', '--pr', '30', '--head', 'b'.repeat(40), '--repo', '/repo', '--out', outPath], {
     registerSink: async () => true,
     hostRegate: async (input) => { seen.push(input); return { passed: true, failures: [], os: 'darwin', status: 'passed', baseCommit: 'c'.repeat(40) }; },
+    regateCompletion: false,
   });
   expect(result.code ?? 0).toBe(0);
   expect(seen).toEqual([{ prNumber: 30, headCommit: 'b'.repeat(40), repoRoot: '/repo', noMerge: true }]);
   expect(JSON.parse(readFileSync(outPath, 'utf8'))).toMatchObject({ pr: 30, head: 'b'.repeat(40), passed: true, status: 'passed', baseCommit: 'c'.repeat(40), failures: [] });
+});
+
+test('TA-LAND-AFTER-REVIEW phase ① — actual regate-run completion logs a shadow decision and executes zero live moves', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-regate-shadow-'));
+  const statePath = join(dir, 'task-agent-actions.json');
+  const head = 'b'.repeat(40);
+  const outPath = join(dir, 'regate-results', 'ta-x-30-bbbbbbbbbbbb.json');
+  const reviewPath = join(dir, 'review.json');
+  writeFileSync(reviewPath, JSON.stringify({ pr: '30', verdict: 'pass', mustFix: [], reviewed: true, headCommit: head }));
+  writeTaskCards(statePath, [{ id: 'ta-x', text: 'x', createdAt: '2026-10-12T00:00:00Z', status: 'launched', taLand: true,
+    pr: { number: 30, url: 'https://github.com/o/r/pull/30' },
+    reviewRequests: [{ pr: 30, head, at: '2026-10-12T00:01:00Z', resultPath: reviewPath }],
+    regates: [{ pr: 30, head, at: '2026-10-12T00:02:00Z', resultPath: outPath }],
+    history: [{ at: '2026-10-12T00:01:00Z', event: 'live-move-result', kind: 'review', pr: 30, head, reviewed: true,
+      verdict: 'pass', mustFix: 0, resultPath: reviewPath, effect: 'review result captured · verdict pass · reviewed true · must-fix 0' }],
+  }]);
+  const shadow: Array<Record<string, unknown>> = [];
+  const live: string[] = [];
+  let fetched = 'c'.repeat(40);
+  const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+    if (event === 'rejudge-shadow' && data && typeof data === 'object') shadow.push(data as Record<string, unknown>);
+  });
+  try {
+    const result = await run(['tasks', 'regate-run', '--card', 'ta-x', '--pr', '30', '--head', head, '--repo', dir, '--out', outPath], {
+      taskStatePath: statePath, registerSink: async () => true,
+      hostRegate: (input) => runHostRegate(input, {
+        command: (bin, args, cwd) => {
+          const call = `${bin} ${args.join(' ')}`;
+          if (call === 'git fetch origin refs/heads/main') { fetched = 'c'.repeat(40); return { status: 0, stdout: '', stderr: '' }; }
+          if (call === 'git fetch origin refs/pull/30/head') { fetched = head; return { status: 0, stdout: '', stderr: '' }; }
+          if (call === 'gh pr view 30 --json headRefOid,baseRefName,baseRefOid,state,isDraft') return {
+            status: 0, stdout: JSON.stringify({ headRefOid: head, baseRefName: 'main', baseRefOid: 'c'.repeat(40), state: 'OPEN', isDraft: false }), stderr: '',
+          };
+          if (call === 'git rev-parse --show-toplevel') return { status: 0, stdout: cwd, stderr: '' };
+          if (call === 'git rev-parse HEAD' || call === 'git rev-parse HEAD^1') return { status: 0, stdout: 'c'.repeat(40), stderr: '' };
+          if (call === 'git rev-parse HEAD^2') return { status: 0, stdout: head, stderr: '' };
+          if (call === 'git rev-parse FETCH_HEAD') return { status: 0, stdout: fetched, stderr: '' };
+          if (call === `git merge-base ${'c'.repeat(40)} ${head}`) return { status: 0, stdout: 'd'.repeat(40), stderr: '' };
+          if (call === `git diff --name-only ${'d'.repeat(40)} ${head}`) return { status: 0, stdout: 'src/feature.test.ts\n', stderr: '' };
+          if (call === `git diff --find-renames --name-status -z ${'d'.repeat(40)} ${head}`) return { status: 0, stdout: 'M\0src/feature.test.ts\0', stderr: '' };
+          return { status: 0, stdout: '', stderr: '' };
+        },
+        acquire: async () => Object.assign(() => {}, { worktree: dir }),
+        interference: async () => ({ passed: true }),
+        prodFreezeRoot: join(dir, 'operational-freeze'),
+      }),
+      rejudge: { liveMoves: new Set(['review', 'propose-land']), live: {
+        repoCandidates: () => [{ source: 'host', cwd: dir }],
+        prHead: async () => ({ head, state: 'OPEN', url: 'https://github.com/o/r/pull/30', branch: 'feature' }),
+        requestReview: async () => { live.push('review'); },
+        land: async () => { live.push('land'); return { status: 0, stdout: 'merged' }; },
+      }, requestRegate: async () => { live.push('regate'); } },
+    });
+    expect(result.code ?? 0).toBe(0);
+    expect(shadow).toMatchObject([{ card: 'ta-x', head12: head.slice(0, 12), decision: 'land' }]);
+    expect(live).toEqual([]);
+    expect(readTaskCard('ta-x', statePath)?.landAttempts).toBeUndefined();
+  } finally { log.mockRestore(); }
 });
 
 test('TA-REJUDGE-ON-HEAD — tasks rejudge --all judges each candidate card and prints step · decision', async () => {

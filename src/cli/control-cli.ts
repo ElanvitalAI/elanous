@@ -31,6 +31,35 @@ function reasonFor(error: unknown, token?: string): string {
   return token ? message.replaceAll(token, '[redacted]') : message;
 }
 
+/** Doctor's read-only live source. One malformed Nexus machine row invalidates the whole
+ *  reading: doctor reports unmeasured rather than treating a partial registry as complete. */
+export async function listMachineResources(options: { primaryUrl?: string; queryToken?: string; port?: string; root?: string; fetch?: (input: URL | RequestInfo, init?: RequestInit) => Promise<Response> } = {}): Promise<ResourceView[]> {
+  const portOverride = options.port ?? (process.env.ELANOUS_CONTROL_PORT?.trim() || undefined);
+  const primary = await resolvePrimary({
+    role: 'query',
+    ...(options.root ? { root: options.root } : {}),
+    config: { url: options.primaryUrl, tokens: options.queryToken ? { query: options.queryToken } : undefined },
+    ...(portOverride !== undefined ? { port: Number(portOverride) } : {}),
+  });
+  const token = primary.token;
+  if (!token) throw new Error('control query token unavailable');
+  const url = new URL('/v1/resources', primary.url);
+  url.searchParams.set('kind', 'machine');
+  const response = await (options.fetch ?? globalThis.fetch)(url, {
+    headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(5000),
+  });
+  if (!response.ok) throw new Error(`control HTTP ${response.status}`);
+  const body: unknown = await response.json();
+  if (!body || typeof body !== 'object' || !('resources' in body) || !Array.isArray(body.resources) ||
+      body.resources.some((row: unknown) => !row || typeof row !== 'object' ||
+        (row as ResourceView).kind !== 'machine' || typeof (row as ResourceView).machine !== 'string' ||
+        typeof (row as ResourceView).name !== 'string' || typeof (row as ResourceView).expired !== 'boolean' ||
+        !((row as ResourceView).attrs && typeof (row as ResourceView).attrs === 'object'))) {
+    throw new Error('invalid machine resource response');
+  }
+  return body.resources as ResourceView[];
+}
+
 export async function runResourcesQuery(options: { where?: string; kind?: string; port?: string; primaryUrl?: string; queryToken?: string; json?: boolean }): Promise<number> {
   let base = '';
   let token: string | undefined;

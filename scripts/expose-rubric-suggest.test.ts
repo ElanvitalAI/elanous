@@ -50,6 +50,67 @@ describe('expose rubric suggestions — measurement, not judgement', () => {
     expect(readFileSync(ledger)).toEqual(original);
   });
 
+  test('명시한 marketing blog draft 를 세 기준으로 측정하고 허용 외 경로는 거부한다', () => {
+    const blog = 'docs/marketing/BLOG-x.md';
+    const blogDir = join(root, 'docs/marketing');
+    mkdirSync(blogDir, { recursive: true });
+    writeFileSync(join(root, blog), '# Clean draft\n`elanous doctor --fix`\n');
+    try {
+      const cliRows = (): ReturnType<typeof suggestExposeRubric> => {
+        const printed: string[] = [];
+        const originalPrint = console.log;
+        try {
+          console.log = (...args) => { printed.push(args.join(' ')); };
+          expect(run(['--json', '--files', blog], root, help)).toBe(0);
+        } finally { console.log = originalPrint; }
+        return JSON.parse(printed[0]!) as ReturnType<typeof suggestExposeRubric>;
+      };
+      const [clean] = suggestExposeRubric(root, [blog], help);
+      expect(clean!.path).toBe(blog);
+      expect(clean!.criteria).toEqual({
+        reproducible: { status: 'pass', reason: '명령 1개 모두 --help 에 있음' },
+        confidential: { status: 'pass', reason: '누출 표식 없음' },
+        brand: { status: 'pass', reason: '브랜드 규칙 위반 없음' },
+      });
+      expect(cliRows()[0]).toEqual(clean);
+      writeFileSync(join(root, blog), '# Leak draft\n// Created by Example Author\n');
+      const [leaking] = suggestExposeRubric(root, [blog], help);
+      expect(leaking!.criteria.confidential.status).toBe('fail');
+      expect(cliRows()[0]!.criteria.confidential.status).toBe('fail');
+      expect(() => suggestExposeRubric(root, ['docs/marketing/other.md'], help)).toThrow();
+      expect(() => suggestExposeRubric(root, ['docs/x.md'], help)).toThrow();
+      expect(() => run(['--json', '--files', 'docs/marketing/other.md'], root, help)).toThrow();
+      expect(() => run(['--json', '--files', 'docs/x.md'], root, help)).toThrow();
+      expect(suggestExposeRubric(root, undefined, help).map((row) => row.path)).not.toContain(blog);
+    } finally { rmSync(blogDir, { recursive: true, force: true }); }
+  });
+
+  test('실제 CLI --files 는 marketing 초안만 JSON으로 내고 허용 밖 경로는 오류 종료한다', () => {
+    const script = join(import.meta.dir, 'expose-rubric-suggest.ts');
+    const blog = 'docs/marketing/BLOG-cli.md';
+    const blogDir = join(root, 'docs/marketing');
+    mkdirSync(blogDir, { recursive: true });
+    writeFileSync(join(root, blog), '# Clean blog draft\n');
+    try {
+      const clean = spawnSync('bun', [script, '--json', '--files', blog], { cwd: root, encoding: 'utf8' });
+      expect(clean.status).toBe(0);
+      const rows = JSON.parse(clean.stdout);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].path).toBe(blog);
+      expect(rows[0].criteria.confidential.status).toBe('pass');
+      writeFileSync(join(root, blog), '# Leak blog draft\n// Created by Example Author\n');
+      const leaking = spawnSync('bun', [script, '--json', '--files', blog], { cwd: root, encoding: 'utf8' });
+      expect(leaking.status).toBe(0);
+      expect(JSON.parse(leaking.stdout)[0].criteria.confidential.status).toBe('fail');
+      for (const rejected of ['docs/marketing/other.md', 'docs/x.md']) {
+        const invalid = spawnSync('bun', [script, '--json', '--files', rejected], { cwd: root, encoding: 'utf8' });
+        expect(invalid.status).toBe(2);
+        expect(invalid.stderr).toContain('문서 경로는');
+      }
+      expect(readFileSync(ledger)).toEqual(original);
+    } finally { rmSync(blogDir, { recursive: true, force: true }); }
+  });
+
   test('missing brand rules mark only brand unmeasured and keep independent passes in API, CLI and YAML patch', () => {
     const missing = join(root, 'absent-rules.yaml');
     const [row] = suggestExposeRubric(root, [path('one')], help, missing);

@@ -24,11 +24,14 @@ export function ArchitectureScene() {
   return (
     <div data-architecture-scene style={{ width: '100%', maxWidth: 1600, margin: 'auto', display: 'grid', gap: 20, fontSize: 18 }}>
       <h2 style={{ fontSize: 28, margin: 0 }}>엘라누스의 구조</h2>
-      <div aria-label="네 기둥" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: 16 }}>
-        {ARCHITECTURE_MAP.slice(0, 4).map((entry) => <MapCell key={entry.id} entry={entry} />)}
+      <div aria-label="메인" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: 16 }}>
+        {ARCHITECTURE_MAP.slice(0, 2).map((entry) => <MapCell key={entry.id} entry={entry} />)}
       </div>
-      <div aria-label="받침" style={{ width: '100%', maxWidth: 480, justifySelf: 'center' }}><MapCell entry={ARCHITECTURE_MAP[5]} /></div>
-      <div aria-label="바닥"><MapCell entry={ARCHITECTURE_MAP[4]} /></div>
+      <div aria-label="받침" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: 16 }}>
+        {ARCHITECTURE_MAP.slice(2, 4).map((entry) => <MapCell key={entry.id} entry={entry} />)}
+      </div>
+      <div aria-label="실행 이음" style={{ width: '100%', maxWidth: 480, justifySelf: 'center' }}><MapCell entry={ARCHITECTURE_MAP[4]} /></div>
+      <div aria-label="바닥"><MapCell entry={ARCHITECTURE_MAP[5]} /></div>
     </div>
   );
 }

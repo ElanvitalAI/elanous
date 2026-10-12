@@ -153,8 +153,8 @@ describe('release checklist CLI', () => {
       await run('add', 'SCREEN', '다섯 화면', '--kind', 'screen');
       await run('set', 'SCREEN', '--kind', 'postpub');
       expect(listChecklist('9.9.9').items.find((item) => item.id === 'SCREEN')?.kind).toBe('postpub');
-      await expect(run('add', 'INVALID', 'invalid', '--kind', 'bogus')).rejects.toThrow('잘못된 종류: bogus');
-      await expect(run('set', 'SCREEN', '--kind', 'bogus')).rejects.toThrow('잘못된 종류: bogus');
+      await expect(run('add', 'INVALID', 'invalid', '--kind', 'bogus')).rejects.toThrow('잘못된 발사 종류: bogus');
+      await expect(run('set', 'SCREEN', '--kind', 'bogus')).rejects.toThrow('잘못된 발사 종류: bogus');
       expect(listChecklist('9.9.9').items).toHaveLength(2);
       expect(listChecklist('9.9.9').items.find((item) => item.id === 'SCREEN')?.kind).toBe('postpub');
       const cmd = new Command(); registerReleaseCommands(cmd);

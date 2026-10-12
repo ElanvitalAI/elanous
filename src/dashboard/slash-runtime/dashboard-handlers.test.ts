@@ -26,6 +26,8 @@ import {
   type DashboardSlashContext,
 } from './dashboard-handlers.js';
 import { executeImmediateDashboardSlash } from '../input/slash-executor.js';
+import { resolveDashboardHarnessSubmitIntent } from '../index.js';
+import { resolveDashboardChatMainSlashCommand } from '../input/chat-main-slash-command.js';
 import { createDashboardLogWidgetRuntime } from '../log-widget-runtime.js';
 import type { LogSurfaceStateContract } from '../../widgets/contracts/log-surface.js';
 import { checkSlashCatalogBaseline } from './registry.js';
@@ -627,6 +629,44 @@ test('SurfaceUx bridge applies Other text only when parser-derived clarification
   expect(parseGoalDocumentClarifications(applied.document)).toEqual([
     expect.objectContaining({ questionId: 'scope', answer: 'focused implementation', answered: true }),
   ]);
+});
+
+test('fixed plain submit executes the real harness slash handler once before model dispatch', async () => {
+  runAskLaunchFlow.mockClear();
+  const phrase = '하니스로 구현해줘 src/example.ts의 오류';
+  const intent = resolveDashboardHarnessSubmitIntent(phrase, { stickyBackend: null });
+  const lines: string[] = [];
+  let modelCalls = 0;
+  const oldObserveOnly = process.env.ELANOUS_SELF_IMPLEMENT_OBSERVE_ONLY;
+  process.env.ELANOUS_SELF_IMPLEMENT_OBSERVE_ONLY = '1';
+  try {
+    if (intent.kind === 'control-turn' && intent.command === 'slash-command') {
+      const { cmdLower, args } = resolveDashboardChatMainSlashCommand(intent.commandText ?? '');
+      runAskLaunchFlow.mockImplementationOnce(async () => ({ kind: 'launch', goalFile: 'docs/goals/observed.md' }));
+      await buildDashboardSlashRegistry().dispatch(cmdLower, args, createContext(lines));
+      for (let n = 0; n < 20 && !lines.some((line) => line.includes('관측 전용이라')); n++) await Bun.sleep(10);
+    } else {
+      modelCalls += 1;
+    }
+  } finally {
+    if (oldObserveOnly === undefined) delete process.env.ELANOUS_SELF_IMPLEMENT_OBSERVE_ONLY;
+    else process.env.ELANOUS_SELF_IMPLEMENT_OBSERVE_ONLY = oldObserveOnly;
+  }
+  expect(runAskLaunchFlow).toHaveBeenCalledTimes(1);
+  expect(runAskLaunchFlow.mock.calls[0]?.[0]).toMatchObject({
+    entrance: { id: 'tui-slash-ask' },
+    askText: phrase,
+  });
+  expect(modelCalls).toBe(0);
+  expect(lines.join('\n')).toContain('docs/goals/observed.md');
+  expect(lines.join('\n')).toContain('관측 전용이라 런을 발사하지 않았습니다');
+  expect(lines.join('\n')).toContain('조회: elanous logs --category self-implement --since 10m');
+  expect(resolveDashboardHarnessSubmitIntent('src/example.ts를 읽어줘', { stickyBackend: null })).toMatchObject({
+    kind: 'submit-turn', route: 'plain',
+  });
+  expect(resolveDashboardHarnessSubmitIntent(phrase, { stickyBackend: 'codex' })).toMatchObject({
+    kind: 'submit-turn', route: 'sticky-acp',
+  });
 });
 
 test('harness enables structured clarification only when SurfaceUx is available', async () => {

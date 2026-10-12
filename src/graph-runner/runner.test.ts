@@ -379,6 +379,40 @@ test('an unverified child still running is terminated rather than accepted as an
   expect(state.nodes[0]?.ok).toBe(false);
 });
 
+test('bash recipes without timeout_ms receive a finite default timeout', async () => {
+  const { graph, root } = fixture('exit 0');
+  let timeoutMs: number | undefined;
+  const result = await runGraph(graph, { deps: { root, runBash: async (_body, opts) => {
+    timeoutMs = opts.timeoutMs;
+    return { stdout: '', stderr: '', exitCode: 0 };
+  } } });
+  expect(result.status).toBe('done');
+  expect(timeoutMs).toBe(5 * 60 * 1_000);
+});
+
+test('bash recipes preserve an explicit timeout_ms and persist timed-out execution as a failure', async () => {
+  const { graph, root } = fixture('sleep 1');
+  writeFileSync(join(root, 'recipes.yaml'), `first:\n  command: "sleep 1"\n  timeout_ms: 30\nsecond:\n  command: "exit 0"\n`);
+  const result = await runGraph(graph, { runId: 'timeout-failure', deps: { root } });
+  const saved = JSON.parse(readFileSync(result.statePath, 'utf8'));
+  expect(result.status).toBe('failed');
+  expect(result.nodes[0]).toMatchObject({ nodeId: 'first', ok: false, exit: null, executed: true, error: expect.any(String) });
+  expect(saved.status).toBe('failed');
+  expect(saved.nodes[0]).toMatchObject({ nodeId: 'first', ok: false, exit: null, executed: true, error: expect.any(String) });
+});
+
+test('bash recipes pass through an explicit timeout_ms unchanged', async () => {
+  const { graph, root } = fixture('exit 0');
+  writeFileSync(join(root, 'recipes.yaml'), `first:\n  command: "exit 0"\n  timeout_ms: 1234\nsecond:\n  command: "exit 0"\n`);
+  let timeoutMs: number | undefined;
+  const result = await runGraph(graph, { deps: { root, runBash: async (_body, opts) => {
+    timeoutMs ??= opts.timeoutMs;
+    return { stdout: '', stderr: '', exitCode: 0 };
+  } } });
+  expect(result.status).toBe('done');
+  expect(timeoutMs).toBe(1234);
+});
+
 test('two successful commands reach done and persist both outcomes', async () => {
   const { graph, root } = fixture('exit 0');
   const result = await runGraph(graph, { runId: 'success', deps: { root } });

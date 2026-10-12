@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
 import * as ui from '../ui.js';
+import * as realLogSink from '../domains/standalone-log-sink.js';
+import * as realSessionQueryTool from '../domains/session-query-tool.js';
 import { appendMessage, createSession, listSessions } from '../session/index.js';
 
 const calls: string[] = [];
@@ -12,13 +14,19 @@ let sinkShouldFail = false;
 let federationArgs: Record<string, unknown> | undefined;
 
 mock.module('../domains/standalone-log-sink.js', () => ({
+  ...realLogSink,
   registerStandaloneLogSink: async (surface: string) => {
     calls.push(`sink:${surface}`);
     if (sinkShouldFail) throw new Error('logs.db unavailable');
   },
 }));
 
+// mock 은 실제 모듈의 export 표면 전체를 페스스루 한다 — factory 가 내보내는
+// 객체가 원본 named export(SESSION_MANAGE_SPEC 등)를 빠뜨리면, 같은 Bun 프로세스
+// 샤드에서 뒤에 로드되는 시험(autopilot tool-registry 등)의 ESM 링크가
+// `SyntaxError: Export named 'SESSION_MANAGE_SPEC' not found` 로 깨진다(실측).
 mock.module('../domains/session-query-tool.js', () => ({
+  ...realSessionQueryTool,
   dispatchSessionQuery: async (args: Record<string, unknown>) => {
     federationArgs = args;
     return {

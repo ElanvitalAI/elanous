@@ -12,6 +12,24 @@ function dispatcher(warnSink: string[]) {
 }
 
 describe('shell-hook', () => {
+  test('immediate exits with unread large stdin preserve stdout and exit status', async () => {
+    const input = { turnNumber: 1, messages: [], systemPrompt: 'x'.repeat(1024 * 1024), tools: [] };
+    for (const [command, expected] of [
+      ['true', 'ok'],
+      ['exit 7', 'exit 7'],
+      ['echo \'{"systemPromptInject":"fast"}\'', 'fast'],
+    ] as const) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const d = dispatcher([]);
+        d.register(createShellHookHandler({ id: `p:fast:${attempt}`, event: 'Turn', priority: 50, command }));
+        const r = await d.dispatch('Turn', input);
+        if (expected === 'ok') expect(r.steps[0]!.status).toBe('ok');
+        else if (expected === 'fast') expect(r.output.systemPromptInject).toBe('fast');
+        else expect(r.abort?.reason).toBe(expected);
+      }
+    }
+  });
+
   test('stdout JSON object → output', async () => {
     const d = dispatcher([]);
     d.register(createShellHookHandler({

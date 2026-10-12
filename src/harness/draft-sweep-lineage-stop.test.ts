@@ -23,7 +23,7 @@ const pull = (pr: typeof OLD) => ({
 function fakeGh(calls: string[]) {
   return (args: string[]): string => {
     calls.push(args.join(' '));
-    if (args[0] === 'pr') return '';   // pr edit / pr close
+    if (args[0] === 'pr' || (args[0] === 'label' && args[1] === 'create')) return '';   // label create / pr edit / pr close
     if (args[0] !== 'api') throw new Error(`unexpected gh ${args.join(' ')}`);
     if (args[1] === 'graphql') throw new Error('GraphQL unavailable');
     const endpoint = args[1]!;
@@ -67,7 +67,7 @@ const run = async (apply: boolean, stopRun: DraftSweepStopRun, live = [OLD.branc
   try {
     const result = await runDraftSweep({ repository: 'my/repo', apply, now: new Date('2026-10-05T00:00:00Z'),
       adapters: githubDraftSweepAdapters(fakeGh(calls), git(live), '/tmp/main', undefined, stopRun) });
-    return { result, writes: calls.filter((call) => call.startsWith('pr ')), logged };
+    return { result, writes: calls.filter((call) => call.startsWith('pr ') || call.startsWith('label create ')), logged };
   } finally { log.mockRestore(); }
 };
 
@@ -80,7 +80,9 @@ test('--apply: the real adapter stops the older live run via harness stop, then 
   expect(result.entries.find((entry) => entry.number === NEW.number)).toMatchObject({ action: 'keep' });
   expect(writes).toEqual([
     expect.stringMatching(/^pr edit 30 --repo my\/repo --add-label elanous:superseded/),
-    expect.stringMatching(/^pr close 30 --repo my\/repo --comment Draft sweep: duplicate-of-open #31/),
+    expect.stringMatching(/^label create elanous:swept:duplicate-of-open --repo my\/repo /),
+    'pr edit 30 --repo my/repo --add-label elanous:swept:duplicate-of-open',
+    'pr close 30 --repo my/repo',
   ]);
   expect(logged.filter((entry) => entry.event === 'supersede-run').map((entry) => entry.data)).toEqual([
     { number: 30, newer: 31, runId: 'run-old-1111', newerRunId: 'run-new-2222', lineageKey: 'goalid:abc123' }]);
@@ -108,7 +110,7 @@ test('an unconfirmed stop writes nothing and falls through to the existing rules
 test('a dead run whose worktree remains (absent after a full process scan) counts as stopped: the draft closes', async () => {
   const { result, writes, logged } = await run(true, async () => ({ process: 'absent', jobsDeleted: 0, scanned: true }));
   expect(result.entries.find((entry) => entry.number === OLD.number)).toMatchObject({ action: 'close', applied: true });
-  expect(writes).toHaveLength(2);
+  expect(writes).toHaveLength(4);
   expect(logged.some((item) => item.event === 'supersede-run')).toBe(true);
 });
 

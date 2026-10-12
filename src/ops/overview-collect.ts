@@ -16,6 +16,7 @@ import {
   type OverviewSnapshot, type OwnerTaskRow, type ParentsInfo, type PodMemberRow, type ReleaseRunInfo, type ScheduleInfo,
 } from './overview.js';
 import { SEAT_ERA_SOURCE, readDispatcherBeats, readDispatcherCapacity, readSeatEraHanded, seatEraFeederDir } from './overview-seat-era.js';
+import { matchesOverviewOwner, normalizeOverviewOwner } from './overview-owner.js';
 
 const GB = 1024 ** 3;
 /** 하트비트 주기 30 s × 2 (RFC §A2 «낡음»). */
@@ -77,8 +78,8 @@ export function ownerRows(cards: readonly TaskCard[], sinceIso: string, ownerFil
   const rows: Record<string, OwnerTaskRow> = {};
   for (const card of cards) {
     if (!card || typeof card.createdAt !== 'string' || card.createdAt < sinceIso) continue;
-    const owner = card.seat ? `seat:${card.seat}` : 'unassigned';
-    if (ownerFilter && ownerFilter !== 'all' && owner !== ownerFilter && owner !== `seat:${ownerFilter}`) continue;
+    const owner = normalizeOverviewOwner(card.seat);
+    if (ownerFilter !== undefined && !matchesOverviewOwner(owner, ownerFilter)) continue;
     const row = rows[owner] ??= { handed: 0, launched: 0, prBound: 0, failed: 0, launchFailed: 0 };
     if (card.status === 'handed') row.handed++;
     else if (card.status === 'launched') row.launched++;

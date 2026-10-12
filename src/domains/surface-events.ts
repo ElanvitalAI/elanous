@@ -169,6 +169,22 @@ export function recordInboundTurn(
   finally { if (ownDb) db.close(); }
 }
 
+export interface SurfaceUtteranceQuery {
+  from: string;
+  to: string;
+  surface?: string;
+}
+
+/** Read every event in a half-open UTC interval without touching recall state. */
+export function querySurfaceUtterances(db: Database, opts: SurfaceUtteranceQuery): SurfaceEventRow[] {
+  const where = ["julianday(e.ts) >= julianday(?)", "julianday(e.ts) < julianday(?)", "e.direction = 'inbound'", "e.kind IN ('utterance', 'qna')"];
+  const params: string[] = [opts.from, opts.to];
+  if (opts.surface) { where.push('e.surface = ?'); params.push(opts.surface); }
+  return db.prepare(
+    `SELECT e.* FROM events e WHERE ${where.join(' AND ')} ORDER BY julianday(e.ts) ASC, e.id ASC`,
+  ).all(...params) as SurfaceEventRow[];
+}
+
 export interface QueryEventsOpts {
   query?: string;             // FTS MATCH (없으면 최근순 전체)
   surface?: string;

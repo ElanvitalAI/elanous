@@ -1,9 +1,9 @@
-// 인스턴스 우주: 명시 루트 → 부모 스탬프 → 설치본 → 소스 트리 격리.
+// 인스턴스 우주: 명시 루트 → 부모 스탬프 → 운영 집. 트리 위치는 우주를 고르지 않는다.
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 export type InstanceKind = 'prod' | 'test';
-export type ResolutionLayer = 'explicit-flag' | 'parent-stamp' | 'installed' | 'tree-derived' | 'default';
+export type ResolutionLayer = 'explicit-flag' | 'parent-stamp' | 'installed' | 'default';
 
 export interface InstanceResolution {
   kind: InstanceKind;
@@ -50,10 +50,9 @@ export function resolveInstance(deps: ResolveDeps = {}): InstanceResolution {
   }
   const installed = deps.installedCopy ?? isInstalledExecution();
   if (installed) return { kind: 'prod', root: prodRoot, layer: 'installed', why: '설치본으로 실행' };
-  const treeTestRoot = deps.treeTestRoot === undefined ? treeDerivedRootFor(process.cwd()) : deps.treeTestRoot;
-  if (treeTestRoot) return { kind: 'test', root: normRoot(treeTestRoot), layer: 'tree-derived', why: '소스 트리(격리)' };
-  // 레포 밖의 비설치 실행은 운영 권위를 얻지 않는다. 격리 루트를 cwd 에 둔다.
-  return { kind: 'test', root: normRoot(join(process.cwd(), '.elanous-test')), layer: 'default', why: '소스 트리 밖 실행(격리)' };
+  // Explicit --test selects a test root before this resolver runs. A checkout,
+  // worktree, or arbitrary cwd alone never changes the operating house.
+  return { kind: 'prod', root: prodRoot, layer: 'default', why: '명시 시험 우주가 없는 운영 집' };
 }
 
 /** 부모가 도장으로 물려준 우주와 자식이 실제로 쓰는 우주가 다른가. 비어 있는 쪽은 비교하지 않는다. */

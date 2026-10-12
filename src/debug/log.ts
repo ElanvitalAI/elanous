@@ -949,7 +949,7 @@ const SECRET_TEXT_RULES: readonly { readonly id: string; readonly re: RegExp; re
   { id: 'gcp-api-key', re: /\b(AIza)[0-9A-Za-z_-]{35}\b/g, to: '$1***' },
   { id: 'jwt', re: /\b(ey)[A-Za-z0-9_-]{10,}\.ey[A-Za-z0-9._\\/-]{10,}/g, to: '$1***' },
   // gitleaks: generic-api-key 축소판 — `key = value` 형태.
-  { id: 'generic-api-key', re: /\b(api[_-]?key|secret|password|passwd|token|credential)\b(\s*[:=]\s*)["']?[^\s"',;)]{4,}/gi, to: '$1$2***' },
+  { id: 'generic-api-key', re: /\b(access[_-]?token|refresh[_-]?token|api[_-]?key|secret|password|passwd|token|credential)\b(\s*[:=]\s*)["']?[^\s"',;)]{4,}/gi, to: '$1$2***' },
   // 환경변수 형태 `OPENROUTER_API_KEY=…` — 위 규칙은 `_API_KEY` 앞에 단어 경계가 없어 못 잡는다. 값에 글자가 있어야 한다(`MAX_TOKEN=4096` 은 그대로).
   { id: 'env-secret', re: /\b([A-Z][A-Z0-9]*_(?:[A-Z0-9]+_)*(?:API_KEY|TOKEN|SECRET|PASSWORD|ACCESS_KEY))(\s*[:=]\s*)["']?(?=[^\s"',;)]*[A-Za-z])[^\s"',;)]{8,}/g, to: '$1$2***' },
   // BEDROCK-PROVIDER — `AWS_BEARER_TOKEN_BEDROCK=…` 은 이름이 TOKEN 으로 «끝나지» 않아 위 규칙이 못 잡는다.

@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } 
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AmbiguousHarnessStopRunIdError, discoverStopProcesses, formatHarnessStop, readPidRecordFrom, stopGoalPathFromLedger, stopHarnessRun, stopRunIdCandidates, START_TOLERANCE_MS, type HarnessStopDeps } from './harness-stop.js';
+import { AmbiguousHarnessStopRunIdError, discoverStopProcesses, formatHarnessStop, psProcessStartMs, readPidRecordFrom, stopGoalPathFromLedger, stopHarnessRun, stopRunIdCandidates, START_TOLERANCE_MS, type HarnessStopDeps } from './harness-stop.js';
 import { debug } from '../debug/log.js';
 
 function fakeDeps(o: { record?: { pid: number; startedAt: number } | null; starts: Array<number | null>; contexts?: string[]; jobs?: number; table?: string; scanFailed?: boolean; goalPath?: string | null; cwd?: (pid: number) => string | null; kubectlScript?: (args: readonly string[]) => { status: number; stdout: string; stderr: string } }) {
@@ -28,6 +28,41 @@ function fakeDeps(o: { record?: { pid: number; startedAt: number } | null; start
   };
   return { deps, signals, kubectlCalls };
 }
+
+test('ps start epoch stays identical across caller time zones', () => {
+  const module = new URL('./harness-stop.ts', import.meta.url).pathname;
+  const script = `import { psProcessStartMs } from ${JSON.stringify(module)}; console.log(psProcessStartMs(${process.pid}));`;
+  const values = ['UTC', 'Asia/Seoul'].map((timezone) => {
+    const child = spawnSync('bun', ['-e', script], {
+      encoding: 'utf8', env: { ...process.env, TZ: timezone }, timeout: 10_000,
+    });
+    expect(child.status).toBe(0);
+    return Number(child.stdout.trim());
+  });
+  expect(values[0]).toBe(values[1]);
+  const currentStart = psProcessStartMs(process.pid);
+  expect(currentStart).not.toBeNull();
+  expect(values[0]).toBe(currentStart!);
+});
+
+test('ps start rejects an unreaped zombie instead of calling it live', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'harness-ps-zombie-'));
+  const module = new URL('./harness-stop.ts', import.meta.url).pathname;
+  const script = `import { psProcessStartMs } from ${JSON.stringify(module)}; console.log(psProcessStartMs(4242));`;
+  try {
+    for (const [state, expected] of [
+      ['Z+', 'null'],
+      ['S+', String(Date.parse('Mon Oct 12 14:29:35 2026 GMT'))],
+    ]) {
+      writeFileSync(join(dir, 'ps'), `#!/bin/sh\nprintf '%s\\n' 'Mon Oct 12 14:29:35 2026     ${state}'\n`, { mode: 0o755 });
+      const child = spawnSync('bun', ['-e', script], {
+        encoding: 'utf8', env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}` }, timeout: 10_000,
+      });
+      expect(child.status).toBe(0);
+      expect(child.stdout.trim()).toBe(expected);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭제', () => {
   test('유일한 원장 접두는 전체 runId 로 풀어 pid 와 Job 라벨에 함께 쓴다', async () => {
@@ -87,9 +122,7 @@ describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭�
       mkdirSync(ledger);
       for (const id of ids) writeFileSync(join(ledger, `${id}.jsonl`), '');
       mkdirSync(join(dir, 'self-dev-runs', ids[0]!), { recursive: true });
-      const ps = spawnSync('ps', ['-o', 'lstart=', '-p', String(child.pid)], { encoding: 'utf8' });
-      expect(ps.status).toBe(0);
-      const startedAt = Date.parse(ps.stdout.trim());
+      const startedAt = psProcessStartMs(child.pid!);
       expect(Number.isFinite(startedAt)).toBe(true);
       writeFileSync(join(dir, 'self-dev-runs', ids[0]!, 'pid.json'), JSON.stringify({ pid: child.pid, startedAt }));
       writeFileSync(join(bin, 'kubectl'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${kubectlCalls}'\n`, { mode: 0o755 });
@@ -204,10 +237,10 @@ describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭�
       writeFileSync(join(dir, 'run-abc.jsonl'), `${JSON.stringify({ runId: 'run-abc', event: 'start', data: { goalFile: 'docs/goals/X.md', targetRoot: '/repo' } })}\n`);
       const goalPath = stopGoalPathFromLedger('run-abc', dir);
       expect(goalPath).toBe('/repo/docs/goals/X.md');
-      expect(discoverStopProcesses('run-abc', '/repo/docs/goals/X.md', '55 Mon Sep 29 06:55:00 2026 bun bin/elanous.mjs harness ask docs/goals/X.md', () => '/repo')).toEqual({ status: 'ok', candidates: [{ pid: 55, startedAt: Date.parse('Mon Sep 29 06:55:00 2026'), via: 'argv-goal' }] });
-      const f = fakeDeps({ starts: [Date.parse('Mon Sep 29 06:55:00 2026'), null], goalPath, cwd: () => '/repo', table: '44391 Mon Sep 29 06:55:00 2026 bun bin/elanous.mjs harness ask docs/goals/X.md' });
+      expect(discoverStopProcesses('run-abc', '/repo/docs/goals/X.md', '55 Mon Sep 29 06:55:00 2026 bun bin/elanous.mjs harness ask docs/goals/X.md', () => '/repo')).toEqual({ status: 'ok', candidates: [{ pid: 55, startedAt: Date.parse('Mon Sep 29 06:55:00 2026 GMT'), via: 'argv-goal' }] });
+      const f = fakeDeps({ starts: [Date.parse('Mon Sep 29 06:55:00 2026 GMT'), null], goalPath, cwd: () => '/repo', table: '44391 Mon Sep 29 06:55:00 2026 bun bin/elanous.mjs harness ask docs/goals/X.md' });
       const r = await stopHarnessRun('run-abc', f.deps);
-      expect(r.candidates).toEqual([{ pid: 44391, startedAt: Date.parse('Mon Sep 29 06:55:00 2026'), via: 'argv-goal' }]);
+      expect(r.candidates).toEqual([{ pid: 44391, startedAt: Date.parse('Mon Sep 29 06:55:00 2026 GMT'), via: 'argv-goal' }]);
       expect(f.signals).toEqual([[44391, 'SIGTERM']]);
       expect(formatHarnessStop(r)).toContain('pid 44391 · 시작');
       expect(formatHarnessStop(r)).toContain('argv-goal');
@@ -215,15 +248,15 @@ describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭�
   });
 
   test('harness say 위치 골 경로 발사 프로세스를 찾아 TERM 1회', async () => {
-    const f = fakeDeps({ starts: [Date.parse('Mon Sep 29 06:55:00 2026'), null], goalPath: '/repo/docs/goals/X.md', cwd: () => '/repo', table: '44392 Mon Sep 29 06:55:00 2026 bun bin/elanous.mjs harness say docs/goals/X.md' });
+    const f = fakeDeps({ starts: [Date.parse('Mon Sep 29 06:55:00 2026 GMT'), null], goalPath: '/repo/docs/goals/X.md', cwd: () => '/repo', table: '44392 Mon Sep 29 06:55:00 2026 bun bin/elanous.mjs harness say docs/goals/X.md' });
     const r = await stopHarnessRun('run-abc', f.deps);
-    expect(r.candidates).toEqual([{ pid: 44392, startedAt: Date.parse('Mon Sep 29 06:55:00 2026'), via: 'argv-goal' }]);
+    expect(r.candidates).toEqual([{ pid: 44392, startedAt: Date.parse('Mon Sep 29 06:55:00 2026 GMT'), via: 'argv-goal' }]);
     expect(f.signals).toEqual([[44392, 'SIGTERM']]);
     expect(formatHarnessStop(r)).toContain('pid 44392 · 시작');
   });
 
   test('PID 1 행을 건너뛰고 뒤의 발사 프로세스를 찾아 TERM 한다', async () => {
-    const f = fakeDeps({ starts: [Date.parse('Mon Sep 29 06:55:00 2026'), null], table: [
+    const f = fakeDeps({ starts: [Date.parse('Mon Sep 29 06:55:00 2026 GMT'), null], table: [
       '1 Mon Sep 29 06:55:00 2026 bun bin/elanous.mjs self orchestrate --run-id=run-abc',
       '56 Mon Sep 29 06:55:00 2026 bun bin/elanous.mjs self orchestrate --run-id=run-abc',
     ].join('\n') });
@@ -236,7 +269,7 @@ describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭�
   test('상대 골 경로는 후보 cwd로 확인할 때만 TERM; 다른 저장소·cwd 불명은 제외', async () => {
     const row = (pid: number) => `${pid} Mon Sep 29 06:55:00 2026 bun bin/elanous.mjs harness ask docs/goals/X.md`;
     const cwd = (pid: number) => pid === 57 ? '/repo' : pid === 58 ? '/other-repo' : null;
-    const f = fakeDeps({ starts: [Date.parse('Mon Sep 29 06:55:00 2026'), null], goalPath: '/repo/docs/goals/X.md', cwd, table: [row(57), row(58), row(59)].join('\n') });
+    const f = fakeDeps({ starts: [Date.parse('Mon Sep 29 06:55:00 2026 GMT'), null], goalPath: '/repo/docs/goals/X.md', cwd, table: [row(57), row(58), row(59)].join('\n') });
     const r = await stopHarnessRun('run-abc', f.deps);
     expect(r.candidates.map(({ pid, via }) => [pid, via])).toEqual([[57, 'argv-goal']]);
     expect(f.signals).toEqual([[57, 'SIGTERM']]);
@@ -249,14 +282,14 @@ describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭�
     expect(r.candidates).toHaveLength(1);
     expect(r.candidates[0]?.via).toBe('pid.json');
     expect(f.signals).toEqual([[42, 'SIGTERM']]);
-    const other = fakeDeps({ starts: [Date.parse('Mon Sep 29 06:55:00 2026'), null], table: '43 Mon Sep 29 06:55:00 2026 bun bin/elanous.mjs self orchestrate --run-id=run-abc' });
+    const other = fakeDeps({ starts: [Date.parse('Mon Sep 29 06:55:00 2026 GMT'), null], table: '43 Mon Sep 29 06:55:00 2026 bun bin/elanous.mjs self orchestrate --run-id=run-abc' });
     expect((await stopHarnessRun('run-abc', other.deps)).candidates[0]?.via).toBe('argv-runId');
     expect(other.signals).toEqual([[43, 'SIGTERM']]);
   });
 
   test('두 발사 후보는 모두 TERM 을 먼저 받고 나서 grace 대기로 간다', async () => {
     const log: string[] = [];
-    const f = fakeDeps({ starts: [Date.parse('Mon Sep 29 06:55:00 2026'), Date.parse('Mon Sep 29 06:55:00 2026'), null, null], table: [
+    const f = fakeDeps({ starts: [Date.parse('Mon Sep 29 06:55:00 2026 GMT'), Date.parse('Mon Sep 29 06:55:00 2026 GMT'), null, null], table: [
       '70 Mon Sep 29 06:55:00 2026 bun bin/elanous.mjs self orchestrate --run-id=run-abc',
       '71 Mon Sep 29 06:55:00 2026 bun bin/elanous.mjs self orchestrate --run-id=run-abc',
     ].join('\n') });
@@ -305,7 +338,7 @@ describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭�
     const dir = mkdtempSync(join(tmpdir(), 'stop-no-ledger-'));
     try {
       expect(stopGoalPathFromLedger('run-abc', dir)).toBeNull();
-      const f = fakeDeps({ starts: [Date.parse('Mon Sep 29 06:55:00 2026'), null], table: [
+      const f = fakeDeps({ starts: [Date.parse('Mon Sep 29 06:55:00 2026 GMT'), null], table: [
         '50 Mon Sep 29 06:55:00 2026 bun bin/elanous.mjs harness ask docs/goals/X.md',
         '51 Mon Sep 29 06:55:00 2026 bun bin/elanous.mjs dev --say hello --run-id=run-abc',
       ].join('\n') });

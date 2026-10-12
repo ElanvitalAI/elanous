@@ -80,9 +80,9 @@ describe('selfImplementRuntime', () => {
     expect(params.additionalProperties).toBe(false);
   });
 
-  it('feature 누락 시 throw', async () => {
+  it('feature 누락 시 이유를 담은 failed 결과를 반환한다', async () => {
     _setSelfImplementSeamsFactoryForTesting(fakeSeamsFactory);
-    await expect(selfImplementRuntime.run({}, ctx)).rejects.toThrow(/feature/);
+    await expect(selfImplementRuntime.run({}, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('feature') });
   });
 
   it('goals-only는 네 병렬 인자를 orchestrateSelfDev로 위임한다', async () => {
@@ -98,7 +98,7 @@ describe('selfImplementRuntime', () => {
       goals: [{ feature: 'A', autoMerge: true }, { feature: 'B', autoMerge: true }],
       concurrency: 3,
     });
-    expect(result).toMatchObject({ ok: true, output: expect.stringContaining('2 goal') });
+    expect(result).toMatchObject({ ok: true, kind: 'pending', missing: ['runId', 'node'], output: expect.stringContaining('2 goal') });
   });
 
   it.each([
@@ -137,21 +137,21 @@ describe('selfImplementRuntime', () => {
     _setSelfImplementOrchestrateForTesting(async () => { orchestrateCalls += 1; return [] as never; });
     _setSelfImplementSeamsFactoryForTesting(options => { seamFactoryCalls += 1; return fakeSeamsFactory(options); });
 
-    await expect(selfImplementRuntime.run({}, ctx)).rejects.toThrow('exactly one');
-    await expect(selfImplementRuntime.run({ goals: [] }, ctx)).rejects.toThrow('non-empty');
-    await expect(selfImplementRuntime.run({ feature: 'single', goals: ['parallel'] }, ctx)).rejects.toThrow('exactly one');
-    await expect(selfImplementRuntime.run({ feature: 'single', concurrency: 2 }, ctx)).rejects.toThrow('require `goals`');
-    await expect(selfImplementRuntime.run({ goals: ['parallel'], base: 'main' }, ctx)).rejects.toThrow('`base` is only supported with `feature` because each parallel goal has its own execution context');
-    await expect(selfImplementRuntime.run({ goals: ['A'], concurrency: 0.5 }, ctx)).rejects.toThrow('positive integer');
-    await expect(selfImplementRuntime.run({ goals: ['A'], concurrency: 0 }, ctx)).rejects.toThrow('positive integer');
-    await expect(selfImplementRuntime.run({ goals: ['A', 'B'], decompose: true }, ctx)).rejects.toThrow('exactly one composite goal');
+    await expect(selfImplementRuntime.run({}, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('exactly one') });
+    await expect(selfImplementRuntime.run({ goals: [] }, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('non-empty') });
+    await expect(selfImplementRuntime.run({ feature: 'single', goals: ['parallel'] }, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('exactly one') });
+    await expect(selfImplementRuntime.run({ feature: 'single', concurrency: 2 }, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('require `goals`') });
+    await expect(selfImplementRuntime.run({ goals: ['parallel'], base: 'main' }, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('`base` is only supported with `feature` because each parallel goal has its own execution context') });
+    await expect(selfImplementRuntime.run({ goals: ['A'], concurrency: 0.5 }, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('positive integer') });
+    await expect(selfImplementRuntime.run({ goals: ['A'], concurrency: 0 }, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('positive integer') });
+    await expect(selfImplementRuntime.run({ goals: ['A', 'B'], decompose: true }, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('exactly one composite goal') });
     expect(orchestrateCalls).toBe(0);
     expect(seamFactoryCalls).toBe(0);
   });
 
-  it('goals orchestration errors propagate unchanged', async () => {
+  it('goals orchestration 예외를 이유를 담은 failed 결과로 변환한다', async () => {
     _setSelfImplementOrchestrateForTesting(async () => { throw new Error('orchestrator unavailable'); });
-    await expect(selfImplementRuntime.run({ goals: ['A'] }, ctx)).rejects.toThrow('orchestrator unavailable');
+    await expect(selfImplementRuntime.run({ goals: ['A'] }, ctx)).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('orchestrator unavailable') });
   });
 
   it('관측 전용은 호출을 기록하고 종결형 응답만 반환하며 런을 시작하지 않는다', async () => {
@@ -164,11 +164,9 @@ describe('selfImplementRuntime', () => {
 
     const res = await selfImplementRuntime.run({ feature: 'D1-01 측정 요청' }, ctx);
 
-    expect(res).toEqual({
-      output: 'SelfImplement 관측 전용 측정 모드 — 호출이 접수되어 기록되었습니다. 이 세션에서는 구현을 진행하지 않습니다. 같은 요청을 이 턴에서 직접 구현하지 말고 응답을 마무리하세요: D1-01 측정 요청',
-      ok: true,
-      observed: true,
-    });
+    expect(res).toMatchObject({ ok: true, kind: 'observed-only', observed: true, missing: ['runId', 'node'] });
+    expect(res.output).toContain('관측 전용이라 런을 발사하지 않았습니다');
+    expect(res.output).toContain('직접 Write/Edit 하지 마세요');
     expect(res.output).not.toContain('런이 시작');
     expect(res.output).not.toContain('구현이 완료');
     expect(seamFactoryCalls).toBe(0);

@@ -3647,7 +3647,8 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
   try {
     // 10-05 PODPROVIDER: record which child provider this run uses — «default» when the launch named none.
     const launch = opts.launch ?? resolveLaunchStamp();
-    const origin = { ...runOriginData(), childProvider: opts.childLlm?.provider ?? 'default', ...(opts.childLlm?.model ? { childModel: opts.childLlm.model } : {}), launch };
+    const origin = { ...runOriginData(), childProvider: opts.childLlm?.provider ?? 'default', ...(opts.childLlm?.model ? { childModel: opts.childLlm.model } : {}),
+      ...(process.env.ELANOUS_TASK_CARD_ID ? { taskCardId: process.env.ELANOUS_TASK_CARD_ID } : {}), launch };
     (opts.seams.writeRunLedger ?? appendRunLedgerEntry)({
       timestamp: new Date().toISOString(), runId, event: 'run-origin', data: origin,
       ...(opts.goalId ? { goalId: opts.goalId } : {}), ...shardIdentity,

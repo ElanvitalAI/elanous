@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { HARNESS_SPACE_ENV } from '../harness/harness-space.js';
@@ -15,11 +15,24 @@ import {
   loadSession,
   persistMessageContent,
   resolveCreateSessionOrigin,
+  getActiveSessionId,
+  setActiveSessionId,
+  clearActiveSessionId,
   toolTraceFieldsFromContent,
 } from './index.js';
 
 let root: string;
 let priorHarness: string | undefined;
+
+function withStateDir<T>(stateDir: string, run: () => T): T {
+  const previous = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = stateDir;
+  try { return run(); }
+  finally {
+    if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previous;
+  }
+}
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'session-harness-origin-'));
@@ -36,6 +49,53 @@ afterEach(() => {
 function addUser(id: string, content: string): void {
   appendMessage(id, { role: 'user', content, ts: new Date().toISOString() }, root);
 }
+
+describe('active session pointer state universe', () => {
+  test('different ELANOUS_STATE_DIR values use separate pointer files', () => {
+    const first = mkdtempSync(join(tmpdir(), 'session-pointer-universe-a-'));
+    const second = mkdtempSync(join(tmpdir(), 'session-pointer-universe-b-'));
+    const previousXdgStateHome = process.env.XDG_STATE_HOME;
+    // A regression to the old stateRoot() must still write only into this test.
+    process.env.XDG_STATE_HOME = first;
+    try {
+      withStateDir(first, () => setActiveSessionId('session-a'));
+      withStateDir(second, () => {
+        expect(getActiveSessionId()).toBeNull();
+        setActiveSessionId('session-b');
+      });
+      withStateDir(first, () => expect(getActiveSessionId()).toBe('session-a'));
+      withStateDir(second, () => expect(getActiveSessionId()).toBe('session-b'));
+      expect(existsSync(join(first, 'elanous', 'active'))).toBe(true);
+      expect(existsSync(join(second, 'elanous', 'active'))).toBe(true);
+    } finally {
+      if (previousXdgStateHome === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = previousXdgStateHome;
+      rmSync(first, { recursive: true, force: true });
+      rmSync(second, { recursive: true, force: true });
+    }
+  });
+
+  test('without ELANOUS_STATE_DIR keeps the existing XDG pointer path', () => {
+    const stateHome = mkdtempSync(join(tmpdir(), 'session-pointer-xdg-'));
+    const previousStateDir = process.env.ELANOUS_STATE_DIR;
+    const previousXdgStateHome = process.env.XDG_STATE_HOME;
+    delete process.env.ELANOUS_STATE_DIR;
+    process.env.XDG_STATE_HOME = stateHome;
+    try {
+      setActiveSessionId('default-session');
+      expect(existsSync(join(stateHome, 'elanous', 'active'))).toBe(true);
+      expect(getActiveSessionId()).toBe('default-session');
+      clearActiveSessionId();
+      expect(getActiveSessionId()).toBeNull();
+    } finally {
+      if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousStateDir;
+      if (previousXdgStateHome === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = previousXdgStateHome;
+      rmSync(stateHome, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('harness session origin — existing origin field', () => {
   test('resolveCreateSessionOrigin uses the existing origin axis, not a new field', () => {

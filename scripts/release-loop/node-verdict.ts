@@ -48,9 +48,14 @@ export function lastResult(run: CommandResult): Record<string, unknown> | undefi
   } catch { return undefined; }
 }
 
-export function finishNode(node: string, version: string, result: Record<string, unknown> & { outcome: NodeOutcome; verdict: NodeVerdict; summary: string }): number {
+export function finishNode(node: string, version: string, result: Record<string, unknown> & { outcome: NodeOutcome; verdict: NodeVerdict; summary: string; tail?: string }): number {
   debug.log(`release-loop.${node}`, 'result', { version, outcome: result.outcome });
-  emitNodeResult(result);
+  if (result.outcome === 'fail') {
+    const summary = result.summary.replace(/[\r\n]+/g, ' ').trim();
+    const tail = result.tail?.trim() ? result.tail : summary;
+    debug.log('release.node', 'failed', { node, summary, tail });
+    emitNodeResult({ ...result, summary, tail });
+  } else emitNodeResult(result);
   return result.outcome === 'ok' ? 0 : result.outcome === 'fail' ? 1 : 2;
 }
 

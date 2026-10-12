@@ -3,7 +3,7 @@
  *
  * - `review`: 수확 가능 런의 PR 에 elanous 리뷰를 «한 번» 요청한다 — PR 머리(sha)마다 한 번(카드 `reviewRequests` 이력).
  *   요청만 한다: 결과로 착지·재발사로 잇지 않는다(실행부 `executeNextAction` 의 review→land 사슬을 타지 않는다).
- *   TA-REVIEW-RESULT-CAPTURE — 자식 stdout(`--json`)은 결과 파일로 받고, 회수(`review-result-capture.ts`)는 «다음» 판단 틱이 한다 —
+ *   TA-REVIEW-RESULT-CAPTURE — 자식 stdout(`--json`)은 결과 파일로 받고, 자식 완료 뒤 해당 카드만 회수·재판정한다.
  *   회수한 pass 는 그 틱의 판단부·land 관문 입력(`selfReview`)이 될 뿐 land 판정 로직은 그대로다.
  * - `propose-green`: 카드에 green «제안»(`greenProposal`)만 적는다 — 체크리스트는 손대지 않는다.
  * - `propose-land`: 카드·현재 머리의 self review 통과(pass «또는» warn ⊕ must-fix 0 · TA-LAND-WARN-MUSTFIX0)·non-draft 를 확인하고 기존 `pr land` 를 머리 고정으로 한 번 부른다.
@@ -25,7 +25,7 @@ import type { DetachedSpawn } from '../cli/tasks-cli.js';
 import { LIVE_MOVE_HISTORY_EVENT, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
 import { LIVE_RETRY_MOVES } from './judge.js';
 import { decisionCardGrounds, decisionRaiseArgs, type DecisionCardEvidence, type NextAction } from './actions.js';
-import { reviewResultPath } from './review-result-capture.js';
+import { reviewResultPath, TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_RESULT_ENV, TA_REVIEW_COMPLETION_STATE_ENV } from './review-result-capture.js';
 import { buildPriorFixContext, PRIOR_FIX_SCOPE_LINE, priorFixBlock, priorFixObservation, type PriorDiffReader, type PriorFixContext } from './review-prior-fix.js';
 import { createLandWorktree, localHead, observeLandWorktree, type LandWorktree, type LandWorktreeFailure, type LandWorktreeInput, type LandWorktreeRemoval } from './land-worktree.js';
 
@@ -208,13 +208,18 @@ export function liveReviewArgs(entry: string, configDir: string, pr: number, int
  * 파이프가 아니라 파일 — 부모가 먼저 끝나도 자식이 EPIPE 로 죽지 않는다). 없으면 종전과 같다(stdio ignore).
  * `opts` 는 시험 몫(spawn·진입점·우주) — 기본은 실물.
  */
-export async function defaultRequestReview(pr: number, intent: string, cwd?: string, opts: { spawn?: DetachedSpawn; entry?: string; configDir?: string; resultPath?: string } = {}): Promise<void> {
+export async function defaultRequestReview(pr: number, intent: string, cwd?: string, opts: { spawn?: DetachedSpawn; entry?: string; configDir?: string; resultPath?: string; cardId?: string; statePath?: string } = {}): Promise<void> {
   const { spawnDetachedConfirmed, ELANOUS_CLI_ENTRY } = await import('../cli/tasks-cli.js');
   const { getElanousConfigDirOverride } = await import('../elanous-config-dir.js');
   const { effectiveInstanceRoot } = await import('../instance/resolve.js');
   const configDir = opts.configDir ?? getElanousConfigDirOverride() ?? effectiveInstanceRoot();
   const base = opts.spawn ?? (spawn as unknown as DetachedSpawn);
   const args = liveReviewArgs(opts.entry ?? ELANOUS_CLI_ENTRY, configDir, pr, intent);
+  const completionEnv = opts.resultPath && opts.cardId && opts.statePath ? {
+    [TA_REVIEW_COMPLETION_CARD_ENV]: opts.cardId,
+    [TA_REVIEW_COMPLETION_STATE_ENV]: opts.statePath,
+    [TA_REVIEW_COMPLETION_RESULT_ENV]: opts.resultPath,
+  } : undefined;
   if (!opts.resultPath) { await spawnDetachedConfirmed(base, process.execPath, args, undefined, cwd); return; }
   let fd: number;
   try {
@@ -229,7 +234,7 @@ export async function defaultRequestReview(pr: number, intent: string, cwd?: str
   const toFile: DetachedSpawn = (command, spawnArgs, options) =>
     (base as unknown as (c: string, a: string[], o: unknown) => ReturnType<DetachedSpawn>)(command, spawnArgs, { ...options, stdio: ['ignore', fd, 'ignore'] });
   try {
-    await spawnDetachedConfirmed(toFile, process.execPath, args, undefined, cwd);
+    await spawnDetachedConfirmed(toFile, process.execPath, args, undefined, cwd, completionEnv);
   } finally {
     try { closeSync(fd); } catch { /* the child keeps its own copy */ }
   }
@@ -360,7 +365,7 @@ export async function executeLiveReview(
       try { (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', 'review-prior-fix-filled', priorFixObservation(card.id, pr, prior)); } catch { /* fail-soft */ }
     }
     const intent = liveReviewIntent(card, ctx.runId, ctx.stopReason, prior);
-    await (deps.requestReview ? deps.requestReview(pr, intent, cwd, { resultPath }) : defaultRequestReview(pr, intent, cwd, { resultPath }));
+    await (deps.requestReview ? deps.requestReview(pr, intent, cwd, { resultPath }) : defaultRequestReview(pr, intent, cwd, { resultPath, cardId: card.id, statePath: path }));
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     updateTaskCard(path, card.id, (current) => current?.reviewRequests?.some((entry) => entry.pr === pr && entry.head === head!.head && entry.at === at)
@@ -560,11 +565,14 @@ export async function executeLiveLand(
   const path = deps.statePath ?? taskAgentStatePath();
   const at = (deps.now ?? (() => new Date()))().toISOString();
   const local = (deps.landWorktree?.localHead ?? localHead)(cwd);
+  const landKey = `land:${card.id}:${view.head.slice(0, 12)}`;
   const needsLandWorktree = !!local && local.toLowerCase() !== view.head.toLowerCase();
   const createCap = landWorktreeCreateCap();
   let claimed = false;
   let missing = false;
   let cappedReason: string | undefined;
+  // This state-file lock is the cross-process card/head land claim. Both completion workers
+  // must pass it; an unfinished or successful attempt makes the second worker skip.
   // TA-LAND-RETRY-ON-INFRA — 같은 머리의 앞 시도들(잠금 안에서 읽은 «지금» 카드) · 재시도면 그 근거.
   let prior: LandAttempt[] = [];
   try {
@@ -590,7 +598,7 @@ export async function executeLiveLand(
   if (!claimed) {
     const last = prior.at(-1);
     const why = last ? ` (attempts ${prior.length} · last ${last.ok === false ? `class ${last.class ?? 'unclassified'}${last.reason ? ` ${last.reason}` : ''}` : last.ok === true ? 'ok' : 'unfinished'})` : '';
-    return observe(deps, withRepo({ kind, card: card.id, ok: true, executed: false, detail: `already attempted land for #${pr} head ${view.head.slice(0, 12)}${why}` }));
+    return observe(deps, withRepo({ kind, card: card.id, ok: true, executed: false, detail: `already attempted land for #${pr} head ${view.head.slice(0, 12)} · ${landKey} claimed — skip${why}` }));
   }
   const attempt = prior.length + 1;
   if (attempt > 1) {

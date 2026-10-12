@@ -60,8 +60,11 @@ interface ReviewObservationInput {
   readonly fallbackAttempted?: boolean;
   /** 폴백이 실제로 시도한 백엔드. */
   readonly fallbackBackend?: string;
+  /** Explicitly requested primary model and the ACP backend that actually completed review. */
+  readonly requestedModel?: string;
+  readonly actualBackend?: string;
   /** 폴백을 시도하지 않은 이유. */
-  readonly fallbackNotAttemptedReason?: 'explicit-acp' | 'primary-review-succeeded';
+  readonly fallbackNotAttemptedReason?: 'explicit-acp' | 'primary-review-succeeded' | 'explicit-model';
   /** 1차가 왜 못 돌았나 — 폴백의 «사인». */
   readonly fallbackTriggerReason?: string;
   /** Each failed ACP fallback attempt, retained in order for diagnosis. */
@@ -80,7 +83,9 @@ interface ReviewObservation {
   readonly reviewRoute?: 'api' | 'acp' | 'acp-fallback';
   readonly fallbackAttempted?: boolean;
   readonly fallbackBackend?: string;
-  readonly fallbackNotAttemptedReason?: 'explicit-acp' | 'primary-review-succeeded';
+  readonly requestedModel?: string;
+  readonly actualBackend?: string;
+  readonly fallbackNotAttemptedReason?: 'explicit-acp' | 'primary-review-succeeded' | 'explicit-model';
   readonly fallbackTriggerReason?: string;
   readonly fallbackFailures?: readonly { backend: string; reason: string }[];
   readonly skippedAcpFallbackBackends?: readonly { backend: string; reason: string }[];
@@ -168,6 +173,8 @@ export function buildReviewObservation(input: ReviewObservationInput): ReviewObs
     ...(input.reviewRoute ? { reviewRoute: input.reviewRoute } : {}),
     ...(input.fallbackAttempted !== undefined ? { fallbackAttempted: input.fallbackAttempted } : {}),
     ...(input.fallbackBackend ? { fallbackBackend: safeLogText(input.fallbackBackend) } : {}),
+    ...(input.requestedModel ? { requestedModel: safeLogText(input.requestedModel) } : {}),
+    ...(input.actualBackend ? { actualBackend: safeLogText(input.actualBackend) } : {}),
     ...(input.fallbackNotAttemptedReason ? { fallbackNotAttemptedReason: input.fallbackNotAttemptedReason } : {}),
     ...(input.fallbackTriggerReason ? { fallbackTriggerReason: safeLogText(input.fallbackTriggerReason) } : {}),
     ...(input.fallbackFailures?.length ? {

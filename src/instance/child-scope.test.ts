@@ -47,7 +47,7 @@ async function captureChildSpawn(scope: { configDir?: string; stateDir?: string 
 }
 
 describe('childInstanceScope', () => {
-  test('[layer3] tree-derived parent resolves once and pins both child spawn axes', () => {
+  test('[default] source CLI uses operating parent while preserving isolated child spawn', () => {
     const home = mkdtempSync(join(tmpdir(), 'child-scope-home-'));
     try {
       mkdirSync(join(home, '.elanous'));
@@ -63,9 +63,11 @@ describe('childInstanceScope', () => {
         env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: '', ELANOUS_CONFIG_DIR: '', ELANOUS_NEXUS_DIR: '', ELANOUS_SESSION_ROOT: '' },
       });
       expect(result.status).toBe(0);
-      const out = JSON.parse((result.stdout ?? '').trim().split('\n').pop() ?? '{}') as { root: string; scope: { configDir?: string; stateDir?: string; elanousBinRoot: string } };
-      expect(out.root.endsWith('.elanous-test')).toBe(true);
-      expect(out.scope).toEqual({ configDir: out.root, stateDir: out.root, elanousBinRoot: expect.any(String) });
+      const out = JSON.parse((result.stdout ?? '').trim().split('\n').pop() ?? '{}') as { root: string; scope: { configDir?: string; stateDir?: string; elanousBinRoot: string; stateDirSource?: string } };
+      expect(out.root).toBe(join(home, '.elanous'));
+      expect(out.scope.configDir).toBe(out.scope.stateDir);
+      expect(out.scope.stateDir?.endsWith('.elanous-test')).toBe(true);
+      expect(out.scope.stateDirSource).toBe('derived');
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

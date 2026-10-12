@@ -117,47 +117,74 @@ test('review and land done are live, retry shadow is shadow-only, and liveVerbs 
     taskAgentActions: [
       { kind: 'review', result: 'done' }, { kind: 'land', result: 'done' }, { kind: 'retry', result: 'shadow' },
     ],
-    allLands: [],
+    allLands: [], goalAsks: [], goalRuns: [],
   });
   expect(measured.verbs).toEqual([
     { verb: '리뷰', source: 'review', liveDone: 1, shadow: 0, state: 'live' },
     { verb: '착지', source: 'land', liveDone: 1, shadow: 0, state: 'live' },
     { verb: '수리', source: 'retry', liveDone: 0, shadow: 1, state: 'shadow-only' },
     { verb: '검증', source: 'green', liveDone: 0, shadow: 0, state: 'none' },
-    { verb: '저작', source: null, liveDone: null, shadow: null, state: 'no-source' },
+    { verb: '저작', source: 'goal-ask+goal-run', liveDone: 0, shadow: 0, state: 'none' },
     { verb: '구현', source: null, liveDone: null, shadow: null, state: 'no-source' },
     { verb: '정리', source: null, liveDone: null, shadow: null, state: 'no-source' },
   ]);
   expect(measured.liveVerbs).toBe(2);
-  expect(measured.measuredVerbs).toBe(4);
-  expect(formatSevenVerbLive(measured)).toBe('7동사 live 2/7 · 출처 없음 저작·구현·정리');
+  expect(measured.measuredVerbs).toBe(5);
+  expect(formatSevenVerbLive(measured)).toBe('7동사 live 2/7 · 출처 없음 구현·정리');
 });
 
-test('저작·구현·정리 are no-source and never join liveVerbs, even with actions in the window', () => {
+test('구현·정리 remain no-source even when the four action verbs are live', () => {
   const measured = measureSevenVerbLive({
     taskAgentActions: [{ kind: 'review', result: 'done' }, { kind: 'land', result: 'done' }, { kind: 'retry', result: 'done' }, { kind: 'green', result: 'done' }],
-    allLands: [],
+    allLands: [], goalAsks: [], goalRuns: [],
   });
-  expect(measured.verbs.filter((row) => row.state === 'no-source').map((row) => row.verb)).toEqual(['저작', '구현', '정리']);
+  expect(measured.verbs.filter((row) => row.state === 'no-source').map((row) => row.verb)).toEqual(['구현', '정리']);
   expect(measured.liveVerbs).toBe(4);
-  expect(formatSevenVerbLive(measured)).toBe('7동사 live 4/7 · 출처 없음 저작·구현·정리');
+  expect(formatSevenVerbLive(measured)).toBe('7동사 live 4/7 · 출처 없음 구현·정리');
 });
 
 test('null or truncated taskAgentActions marks every verb unreadable and liveVerbs null, not 0', () => {
   const unreadable = measureSevenVerbLive({ taskAgentActions: null, allLands: [] });
-  expect(unreadable.verbs.every((row) => row.state === 'unreadable')).toBe(true);
+  expect(unreadable.verbs.filter((row) => row.source !== null).every((row) => row.state === 'unreadable')).toBe(true);
+  expect(unreadable.verbs.filter((row) => row.source === null).map((row) => row.verb)).toEqual(['구현', '정리']);
   expect(unreadable.verbs.every((row) => row.liveDone === null && row.shadow === null)).toBe(true);
   expect(unreadable.liveVerbs).toBe(null);
-  expect(unreadable.measuredVerbs).toBe(4);
-  expect(formatSevenVerbLive(unreadable)).toBe('7동사 live -/7 · 못 잼(행동 원장 null·절단)');
+  expect(unreadable.measuredVerbs).toBe(5);
+  expect(formatSevenVerbLive(unreadable)).toBe('7동사 live -/7 · 못 잼(행동·저작·골 원장 null·절단) · 출처 없음 구현·정리');
 
   const truncated = measureSevenVerbLive({
     taskAgentActions: [{ kind: 'review', result: 'done' }],
     allLands: [],
     truncated: { taskAgentActions: true, allLands: false },
   });
-  expect(truncated.verbs.every((row) => row.state === 'unreadable')).toBe(true);
+  expect(truncated.verbs.filter((row) => row.source !== null).every((row) => row.state === 'unreadable')).toBe(true);
   expect(truncated.liveVerbs).toBe(null);
+});
+
+test('authored goal joins a completed goal by id, not a dangling assigned id or failed goal', () => {
+  const input = {
+    taskAgentActions: [{ kind: 'review' as const, result: 'done' }, { kind: 'land' as const, result: 'done' }, { kind: 'retry' as const, result: 'done' }, { kind: 'green' as const, result: 'done' }],
+    allLands: [],
+    goalAsks: [
+      { authorRunId: 'author-ok', goalId: 'goal-ok' }, { authorRunId: 'author-ok', goalId: 'goal-ok' },
+      { authorRunId: 'author-ok', goalId: 'goal-ok-2' },
+      { authorRunId: 'author-failed', goalId: 'goal-failed' },
+    ],
+    goalRuns: [{ goalId: 'goal-ok', stage: 'merged', outcome: 'completed' }, { goalId: 'goal-ok-2', stage: 'merged', outcome: 'completed' }, { goalId: 'goal-failed', stage: 'failed', outcome: 'abandoned' }],
+  };
+  const measured = measureSevenVerbLive(input);
+  expect(measured.verbs[4]).toEqual({ verb: '저작', source: 'goal-ask+goal-run', liveDone: 2, shadow: 0, state: 'live' });
+  expect(measured.liveVerbs).toBe(5);
+  expect(measured.measuredVerbs).toBe(5);
+  expect(formatSevenVerbLive(measured)).toBe('7동사 live 5/7 · 출처 없음 구현·정리');
+  const dangling = measureSevenVerbLive({ ...input, goalAsks: [{ authorRunId: 'author-failed', goalId: 'goal-failed' }], goalRuns: [{ goalId: 'goal-failed', stage: 'failed', outcome: 'abandoned' }] });
+  expect(dangling.verbs[4]).toMatchObject({ liveDone: 0, state: 'none' });
+  for (const patch of [{ goalAsks: null }, { goalRuns: null }, { truncated: { taskAgentActions: false, allLands: false, goalAsks: true } }, { truncated: { taskAgentActions: false, allLands: false, goalRuns: true } }]) {
+    const unknown = measureSevenVerbLive({ ...input, ...patch });
+    expect(unknown.verbs[4]).toMatchObject({ liveDone: null, state: 'unreadable' });
+    expect(unknown.liveVerbs).toBeNull();
+    expect(formatSevenVerbLive(unknown)).toContain('출처 없음 구현·정리');
+  }
 });
 
 test('card denominator counts distinct cards with a done action per verb, leaving land untouched', () => {

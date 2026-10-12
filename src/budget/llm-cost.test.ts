@@ -342,7 +342,7 @@ describe('pricing lookup chain (BACKLOG C1·C2)', () => {
     expect(llmUsageCostFields('global.anthropic.claude-sonnet-5-5', usage, noOverlay, 'api').cost).toMatchObject({ kind: 'known', usd: 0.1, source: 'bedrock-catalog' });
     const firstParty = llmUsageCostFields('claude-sonnet-5-5', usage, noOverlay, 'api').cost;
     expect(firstParty).toMatchObject({ kind: 'known', source: 'catalog' });
-    expect((firstParty as { usd: number }).usd).not.toBe(0.1);
+    expect((firstParty as { usd: number }).usd).toBe(0.2);   // 1st-party 읽기 = 입력(2)×0.1 — Bedrock 0.1 과 «다른 값»으로 고정(음성 대조)
     // 표에 없는 Bedrock 모델은 지어내지 않고 unknown.
     expect(llmUsageCostFields('bedrock/zai.glm-5', usage, noOverlay, 'api').cost).toMatchObject({ kind: 'unknown' });
   });
@@ -422,6 +422,57 @@ describe('pricing lookup chain (BACKLOG C1·C2)', () => {
   });
   it('a truly absent model stays unknown, never zero', () => {
     expect(estimateLlmCost({ model: 'absent-model-for-test', inputTokens: 1, outputTokens: 1 })).toEqual({ kind: 'unknown', model: 'absent-model-for-test' });
+  });
+});
+
+// BEDROCK-COST-LEDGER(0.2.26) — mantle-openai 비-Anthropic Bedrock id 분류.
+// 이 id 들의 Bedrock 단가 수치 근거가 하나도 확보되지 않아 BEDROCK_PRICING_USD 에 행을 «추가하지 않았다»
+// ⇒ 지금 선택 가능한 전 id 가 unknown 에 머문다(0원으로 꾸미지 않는다). 단가 근거가 들어오면 그 칸은 known·source:'bedrock-catalog' 로 옮겨간다.
+import { BEDROCK_MODELS } from '../llm/bedrock.js';
+describe('Bedrock non-Anthropic classification (BEDROCK-COST-LEDGER 0.2.26)', () => {
+  it('every currently selectable mantle-openai non-Anthropic id stays unknown — no evidence-backed price row exists', () => {
+    const nonAnthropic = BEDROCK_MODELS.filter((m) => m.route === 'mantle-openai');
+    expect(nonAnthropic.length).toBeGreaterThan(0);
+    for (const entry of nonAnthropic) {
+      const got = estimateLlmCost({ model: entry.id, inputTokens: MILLION, outputTokens: MILLION }, noOverlay);
+      expect(got).toEqual({ kind: 'unknown', model: entry.id });
+      expect('usd' in got).toBe(false);
+    }
+  });
+
+  it('bedrock/ aliases of non-Anthropic ids stay unknown too', () => {
+    for (const model of ['bedrock/zai.glm-5', 'bedrock/openai.gpt-6-sol']) {
+      expect(estimateLlmCost({ model, inputTokens: MILLION, outputTokens: MILLION }, noOverlay)).toEqual({ kind: 'unknown', model });
+    }
+  });
+
+  it('date suffixes and us./global. prefixes do not open the Claude-only Bedrock gate', () => {
+    expect(bedrockPricingModelId('openai.gpt-6-sol')).toBe('openai.gpt-6-sol');
+    // 양성 대조 — 같은 정규화 안에서 Claude id 의 게이트는 그대로 열려 Bedrock 표로 known.
+    expect(estimateLlmCost({ model: 'global.anthropic.claude-sonnet-5-5', inputTokens: MILLION, outputTokens: 0 }, noOverlay))
+      .toMatchObject({ kind: 'known', source: 'bedrock-catalog' });
+    // 비-Anthropic id 는 접두·날짜 꼬리를 붙여도 게이트가 열리지 않는다.
+    for (const model of ['openai.gpt-6-sol-20251001', 'bedrock/zai.glm-5-20251001', 'global.zai.glm-5']) {
+      expect(estimateLlmCost({ model, inputTokens: MILLION, outputTokens: MILLION }, noOverlay)).toEqual({ kind: 'unknown', model });
+    }
+  });
+
+  it('logAgentTurnUsage keeps an honest unknown — never a zero-dressed known — for a mantle-openai id on the bedrock route', () => {
+    const spy = spyOn(debug, 'log');
+    try {
+      logAgentTurnUsage('zai.glm-5', {
+        provider: 'openai',
+        inputTokens: MILLION,
+        outputTokens: MILLION,
+      }, { providerName: 'bedrock', site: 'bedrock-cost-test' });
+      const row = spy.mock.calls.find((call) =>
+        call[0] === 'llm.usage' && call[1] === 'llm-usage' && (call[2] as { site?: string })?.site === 'bedrock-cost-test');
+      expect(row).toBeDefined();
+      expect(row![2]).toMatchObject({ model: 'zai.glm-5', billingProvider: 'bedrock' });
+      expect((row![2] as { cost: unknown }).cost).toEqual({ kind: 'unknown', model: 'zai.glm-5' });
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

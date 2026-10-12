@@ -15,8 +15,8 @@
 // Resolution order:
 //   1. Programmatic override set via `setElanousConfigDir(dir)` (incl.
 //      from the `--config-dir` CLI flag).
-//   2. State-dir via `effectiveInstanceRoot()` (including isolated source trees).
-//   3. `~/.elanous` for the installed daily-driver root.
+//   2. State-dir via `effectiveInstanceRoot()` (explicit --test or parent stamp).
+//   3. `~/.elanous` for both installed and source CLIs without an explicit test root.
 
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';

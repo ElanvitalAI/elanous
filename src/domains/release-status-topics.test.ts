@@ -115,14 +115,16 @@ test('ops preserves operational facts including unreadable; invalid topic throws
   expect(() => dispatchReleaseStatus({ topic: 'weather' }, fixture())).toThrow('topic 은 status, features, cell, schedule, ops 중 하나');
 });
 
-test('topic and action together throw naming both; action-only and topic-only keep their response shapes', () => {
+test('topic takes precedence over action; action-only and topic-only keep their response shapes', () => {
   const deps = fixture({ checklist: v => data(v, [item('Y', 'yellow')]) });
   for (const action of ['schedule', 'blocked', 'landed'] as const) {
-    expect(() => dispatchReleaseStatus({ topic: 'features', action }, deps)).toThrow(
-      'topic 과 action 을 동시에 보낼 수 없습니다 — 둘 중 하나만: topic=features 는 읽을 대상, action 은 짧은 요약(schedule·blocked·landed)',
-    );
+    const output = dispatchReleaseStatus({ topic: 'features', action }, deps);
+    expect(output.text.split('\n')[0]).toBe(`action=${action} 은 무시됨 — topic 과 같이 못 쓴다`);
+    expect(output.text.match(new RegExp(`action=${action} 은 무시됨 — topic 과 같이 못 쓴다`, 'g'))).toHaveLength(1);
+    expect(output.structured).toMatchObject({ total: 1, counts: { yellow: 1 } });
   }
-  expect(() => dispatchReleaseStatus({ topic: 'ops', action: 'landed' }, deps)).toThrow('topic=ops 는 읽을 대상');
+  const ops = dispatchReleaseStatus({ topic: 'ops', action: 'landed' }, fixture({ contextNow: () => ({ at: '', topic: null, facts: [], events: [], guide: [] }) }));
+  expect(ops.text).toBe('action=landed 은 무시됨 — topic 과 같이 못 쓴다\n운영 개관: 관측된 사실 없음');
   const actionOnly = dispatchReleaseStatus({ action: 'blocked' }, deps);
   expect(actionOnly.text).toBe('막힌 칸 없음');
   expect(actionOnly.structured).toEqual({ blocked: [] });

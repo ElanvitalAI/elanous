@@ -32,7 +32,7 @@ describe('essential dashboard catalog', () => {
       resetUserConfig();
 
       const essentialHostTools: LLMToolDef[] = [
-      ...['ops_status', 'autopilot_missions', 'self_recall', 'memory_recall', 'session_manage', 'schedule_manage', 'fact_check', 'se_build'].map(name => ({
+      ...['ops_status', 'logs_query', 'autopilot_missions', 'self_recall', 'memory_recall', 'session_manage', 'schedule_manage', 'fact_check', 'se_build'].map(name => ({
         name,
         description: name,
         parameters: { type: 'object' },
@@ -60,7 +60,7 @@ describe('essential dashboard catalog', () => {
       //       ⇒ 이 목록이 그 은퇴를 안 따라가서 이 시험이 빨갛게 남아 있었다(🅕 30차 전수 분류).
       'SelfImplement',
       'ops_status', 'autopilot_missions', 'self_recall', 'memory_recall', 'session_manage',
-      'schedule_manage', 'fact_check', 'se_build',
+      'schedule_manage', 'fact_check', 'se_build', 'logs_query',
       'Bash', 'RunShell',
       'PtyShellStart', 'PtyShellPoll', 'PtyShellSend', 'PtyShellKill', 'PtyShellList',
       'run_tests', 'elanous_skills_list', 'skill_exec', 'GetDashboardState',
@@ -124,7 +124,16 @@ describe('essential dashboard catalog', () => {
       data: expect.objectContaining({ surfaceId: 'coding/turn', toolCount: expected.length }),
     });
 
-    const unavailableInEssential = ['Bash', 'PtyShellStart', 'TerminalModalObserve'];
+    const withoutLogsHost = buildSessionRuntimeToolSpecs({
+      userText: '최근 로그를 조회해줘',
+      runtimeTools: essentialRuntimeTools,
+      hostTools: essentialHostTools.filter(tool => tool.name !== 'logs_query'),
+      optionalTools,
+      rich: false,
+    }).map(spec => spec.name);
+    expect(withoutLogsHost).not.toContain('logs_query');
+
+    const unavailableInEssential = ['Bash', 'PtyShellStart', 'TerminalModalObserve', 'logs_query'];
     expect(buildSessionRuntimeToolSpecs({
       userText: '비활성 도구도 노출되는지 점검해줘',
       hostTools: essentialHostTools,

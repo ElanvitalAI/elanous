@@ -2448,6 +2448,23 @@ describe('elanous pr land', () => {
     expect(calls).toEqual(['find']);
     expect(sink.logs.find((line) => line.startsWith('✓ land-reason:'))).toBe('✓ land-reason: 남이 기다리는 차단 해제');
   });
+
+  it('keeps pr land --dry-run without --pr on the existing branch preview path', async () => {
+    const { manager, calls } = fakeManager();
+    const sink = output();
+    const { run, commands } = landRun(overlapLog);
+    const program = new Command();
+    program.exitOverride();
+    registerPrCommands(program, { ...baseDeps, run, manager, out: sink.out });
+
+    await program.parseAsync(['pr', 'land', '--dry-run'], { from: 'user' });
+
+    expect(sink.errors).toEqual([]);
+    expect(sink.logs).toContain('✓ branch: feat/land');
+    expect(sink.logs.at(-1)).toBe('[dry-run] PR을 생성하고 ready 상태를 보장한 뒤 squash merge 합니다.');
+    expect(calls).toEqual(['find']);
+    expect(commands.some(({ cmd, args }) => cmd === 'gh' && args[0] === 'pr' && args[1] === 'view')).toBe(false);
+  });
 });
 
 describe('elanous pr granularity', () => {
@@ -3108,5 +3125,124 @@ describe('public-export-leak at landing (LEAK1)', () => {
       expect(exportLeakBlock(['scripts/x.sh'], () => clean, false, io().out, cwd)).toBe(true);
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   }, 180_000);
+});
+
+describe('pinned PR landing preview', () => {
+  it('prints the current PR head and read-only plan without running mutations', async () => {
+    const calls: string[] = [];
+    const log: string[] = [];
+    const error: string[] = [];
+    const head = 'a'.repeat(40);
+    const code = await runPrLand({ pr: '26563', expectedHead: undefined, dryRun: true }, {
+      ...baseDeps,
+      out: { log: (line: string) => log.push(line), error: (line: string) => error.push(line) },
+      run: (cmd, args) => {
+        calls.push(`${cmd} ${args.join(' ')}`);
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') return { ok: true, out: JSON.stringify({ headRefOid: head, state: 'OPEN', headRefName: 'feat/landing', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' }) };
+        throw new Error(`unexpected command: ${cmd} ${args.join(' ')}`);
+      },
+    });
+    expect(code).toBe(0);
+    expect(error).toEqual([]);
+    expect(log.join('\\n')).toContain(`PR #26563 · head ${head} · state OPEN`);
+    expect(log.join('\\n')).toContain('Landing plan (read-only preview)');
+    expect(log.join('\\n')).toContain('Mergeability: GitHub reports MERGEABLE');
+    expect(log.join('\\n')).toContain('UNMEASURED');
+    expect(log.join('\\n')).toContain('Mutations (ready/edit/create/merge, git commit/push, worktree): NOT RUN');
+    expect(calls).toEqual(['gh pr view 26563 --json headRefOid,state,headRefName,isDraft,mergeable,mergeStateStatus,url']);
+  });
+
+  it('blocks draft PR landing even when GitHub reports a clean, mergeable state', async () => {
+    const head = 'c'.repeat(40);
+    const log: string[] = [];
+    const calls: string[] = [];
+    const code = await runPrLand({ pr: '26563', dryRun: true }, {
+      ...baseDeps,
+      out: { log: (line: string) => log.push(line), error: (line: string) => { throw new Error(line); } },
+      run: (cmd, args) => {
+        calls.push(`${cmd} ${args.join(' ')}`);
+        return { ok: true, out: JSON.stringify({ headRefOid: head, state: 'OPEN', headRefName: 'feat/draft-clean', isDraft: true, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' }) };
+      },
+    });
+
+    const report = log.join('\n');
+    expect(code).toBe(0);
+    expect(report).toContain(`PR #26563 · head ${head} · state OPEN`);
+    expect(report).toContain('Draft status: GitHub reports DRAFT; landing eligibility UNMEASURED.');
+    expect(report).toContain('Mergeability: GitHub reports MERGEABLE');
+    expect(report).not.toContain('conflicts');
+    expect(report).not.toContain('DIRTY');
+    expect(report).toContain('Local HEAD/worktree, branch/base, and same-branch guard: UNMEASURED');
+    expect(report).toContain('Typecheck, isolation, mock-module restore, model-hardcode, daemon-port, test-interference, and global checks: UNMEASURED');
+    expect(report).toContain('Android, iOS, and PWA gates: CONDITIONAL / UNMEASURED');
+    expect(report).toContain('Freeze, PR base/bench guards, sibling PRs, recent landings, overlap, and approval: UNMEASURED');
+    expect(report).toContain('Mutations (ready/edit/create/merge, git commit/push, worktree): NOT RUN');
+    expect(calls).toEqual(['gh pr view 26563 --json headRefOid,state,headRefName,isDraft,mergeable,mergeStateStatus,url']);
+  });
+
+  it('rejects absent or invalid numbers, nonexistent PRs, and closed PRs', async () => {
+    for (const pr of ['', '0', 'not-a-number']) {
+      const errors: string[] = [];
+      const code = await runPrLand({ pr, dryRun: true }, { ...baseDeps, out: { log: () => {}, error: (line: string) => errors.push(line) }, run: () => { throw new Error('lookup must not run'); } });
+      expect(code).toBe(1);
+      expect(errors.join('\n')).toContain('dry-run');
+    }
+    for (const response of [
+      { ok: false, out: '' },
+      { ok: true, out: JSON.stringify({ headRefOid: 'b'.repeat(40), state: 'CLOSED' }) },
+    ]) {
+      const errors: string[] = [];
+      const code = await runPrLand({ pr: '8', dryRun: true }, {
+        ...baseDeps,
+        out: { log: () => {}, error: (line: string) => errors.push(line) },
+        run: () => response,
+      });
+      expect(code).toBe(1);
+      expect(errors.join('\n')).toContain(response.ok ? '열려 있지 않거나' : '존재하지 않거나');
+    }
+  });
+
+  it('routes --pr N --dry-run through the registered CLI with one read-only PR lookup', async () => {
+    const { manager, calls: mutations } = fakeManager();
+    const sink = output();
+    const commands: string[] = [];
+    const program = new Command();
+    program.exitOverride();
+    registerPrCommands(program, { ...baseDeps, manager, out: sink.out, run: (cmd, args) => {
+      commands.push(`${cmd} ${args.join(' ')}`);
+      if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+        return { ok: true, out: JSON.stringify({ headRefOid: 'd'.repeat(40), state: 'OPEN', headRefName: 'feat/landing', isDraft: false }) };
+      }
+      throw new Error(`unexpected command: ${cmd} ${args.join(' ')}`);
+    } });
+
+    await program.parseAsync(['pr', 'land', '--pr', '26563', '--dry-run'], { from: 'user' });
+
+    expect(sink.errors).toEqual([]);
+    expect(sink.logs.join('\n')).toContain(`PR #26563 · head ${'d'.repeat(40)}`);
+    expect(sink.logs.join('\n')).toContain('Freeze, PR base/bench guards, sibling PRs, recent landings, overlap, and approval: UNMEASURED');
+    expect(mutations).toEqual([]);
+    expect(commands).toEqual(['gh pr view 26563 --json headRefOid,state,headRefName,isDraft,mergeable,mergeStateStatus,url']);
+  });
+
+  it('rejects landing-only overlap evidence in a numbered preview before lookup', async () => {
+    const sink = output();
+    const code = await runPrLand({ pr: '26563', dryRun: true, overlapEvidence: '/tmp/evidence.json' }, {
+      ...baseDeps, out: sink.out, run: () => { throw new Error('lookup must not run'); },
+    });
+    expect(code).toBe(1);
+    expect(sink.errors.join('\n')).toContain('--overlap-evidence');
+  });
+
+  it('rejects non-object and invalid-head PR lookup responses without throwing', async () => {
+    for (const raw of ['null', '[]', '{}', JSON.stringify({ state: 'OPEN', headRefOid: 'short' })]) {
+      const sink = output();
+      const code = await runPrLand({ pr: '26563', dryRun: true }, {
+        ...baseDeps, out: sink.out, run: () => ({ ok: true, out: raw }),
+      });
+      expect(code).toBe(1);
+      expect(sink.errors.length).toBe(1);
+    }
+  });
 });
 

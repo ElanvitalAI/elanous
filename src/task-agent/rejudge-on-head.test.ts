@@ -1,12 +1,14 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { landOrderLedgerPath } from './land-order-ledger.js';
 import { classifyLandFailure, liveLandArgs, type TaskAgentLiveMove } from './live-moves.js';
-import { CATCH_UP_CAP, defaultCatchUpMain, defaultRequestRegate, overlapEvidencePath, parseRegateResult, REJUDGE_HEAD_CAP, regateResultPath, regateRunArgs, rejudgeCandidates, rejudgeCardOnHead, type CatchUpGit, type CatchUpRequest, type CatchUpResult, type RegateRequest } from './rejudge-on-head.js';
-import { reviewResultPath } from './review-result-capture.js';
+import { CATCH_UP_CAP, defaultCatchUpMain, defaultRequestRegate, overlapEvidencePath, parseRegateResult, REJUDGE_HEAD_CAP, regateResultPath, regateRunArgs, rejudgeCandidates, rejudgeCardOnHead, rejudgeAsyncResultCard, rejudgeCompletedTaskRegate, rejudgeShadowCard, remoteBoundRunTerminal, type CatchUpGit, type CatchUpRequest, type CatchUpResult, type RegateRequest } from './rejudge-on-head.js';
+import { rejudgeCompletedTaskReview, reviewResultPath, TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_RESULT_ENV, TA_REVIEW_COMPLETION_STATE_ENV } from './review-result-capture.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
+import { setUserConfigOverlay } from '../user-config.js';
+import { debug } from '../debug/log.js';
 
 const A = 'a'.repeat(40);
 const B = 'b'.repeat(40);
@@ -85,13 +87,468 @@ function fixture(opts: { regates?: TaskCard['regates']; landAttempts?: TaskCard[
 }
 
 describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트·리뷰·land 를 다시 판단한다', () => {
-  test('머리 그대로(A) → 재게이트 0 · 리뷰 재요청 0 · land 0', async () => {
+  test('taLand reviewed draft becomes ready before its first host regate', async () => {
+    const f = fixture();
+    let draft = true;
+    let readyCalls = 0;
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+      history: [{ at: '2026-10-11T00:10:00.000Z', event: 'rejudge-on-head', kind: 'review', pr: 30, head: A, effect: 'review-requested' },
+        { at: '2026-10-11T00:20:00.000Z', event: 'live-move-result', kind: 'review', pr: 30,
+          head: A, verdict: 'warn', reviewed: true, mustFix: 0, effect: 'review result captured · verdict warn · reviewed true · must-fix 0' }] }]);
+    const deps = { ...f.deps(),
+      live: { ...f.deps().live, landPrHead: async () => ({ head: A, state: 'OPEN', url: URL, isDraft: draft }) },
+      readyPr: async () => { readyCalls += 1; draft = false; return { ok: true, reason: 'ready' }; },
+    };
+    const first = await rejudgeCardOnHead(f.card().id, deps);
+    expect(first.map((item) => `${item.step}:${item.decision}`)).toContain('ready:ready-confirmed');
+    expect(first.map((item) => `${item.step}:${item.decision}`)).toContain('regate:regate-requested');
+    expect(readyCalls).toBe(1);
+    expect(f.regateRequests).toHaveLength(1);
+    await rejudgeCardOnHead(f.card().id, deps);
+    expect(readyCalls).toBe(1);
+    expect(f.regateRequests).toHaveLength(1);
+  });
+
+  test('draft-only regate failure retries the same ready head exactly once', async () => {
+    const f = fixture();
+    const reviewPath = reviewResultPath(f.statePath, 'ta-rj-1', 30, A);
+    mkdirSync(dirname(reviewPath), { recursive: true });
+    writeFileSync(reviewPath, reviewJson(A));
+    const failed = { pr: 30, head: A, at: '2026-10-11T00:40:00.000Z', passed: false, status: 'failed',
+      detail: 'pr-head: PR head, base commit, ready state or open state unavailable or changed (state=OPEN · isDraft=true)' };
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true, regates: [failed],
+      history: [{ at: '2026-10-11T00:20:00.000Z', event: 'live-move-result', kind: 'review', pr: 30,
+        head: A, verdict: 'pass', reviewed: true, mustFix: 0, effect: 'review result captured · verdict pass · reviewed true · must-fix 0' }] }]);
+    const deps = { ...f.deps(), live: { ...f.deps().live, landPrHead: async () => ({ head: A, state: 'OPEN', url: URL, isDraft: false }) },
+      readyPr: async () => { throw new Error('already ready must not invoke gh'); } };
+    f.onRegate(f.writeRegate(true));
+    const first = await rejudgeCardOnHead(f.card().id, deps);
+    expect(first.at(-1)?.decision).toBe('regate-requested');
+    expect(f.card().regates?.at(-1)?.readyRetry).toBe(true);
+    expect(f.card().regates?.at(-1)?.passed).toBeUndefined();
+    expect(f.regateRequests[0]?.resultPath).toContain('-after-ready.json');
+    expect((await rejudgeCardOnHead(f.card().id, deps)).at(-1)?.decision).toBe('landed');
+    expect(f.regateRequests).toHaveLength(1);
+    expect(f.lands).toHaveLength(1);
+  });
+
+  test('failed ready operation does not launch a host regate', async () => {
+    const f = fixture();
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+      history: [{ at: '2026-10-11T00:20:00.000Z', event: 'live-move-result', kind: 'review', pr: 30,
+        head: A, verdict: 'pass', reviewed: true, mustFix: 0, effect: 'review result captured · verdict pass · reviewed true · must-fix 0' }] }]);
+    const deps = { ...f.deps(), live: { ...f.deps().live, landPrHead: async () => ({ head: A, state: 'OPEN', url: URL, isDraft: true }) },
+      readyPr: async () => ({ ok: false, reason: 'permission denied' }) };
+    expect((await rejudgeCardOnHead(f.card().id, deps)).at(-1)?.decision).toBe('ready-failed');
+    expect(f.regateRequests).toHaveLength(0);
+    expect(f.lands).toHaveLength(0);
+  });
+
+  test('remote child terminal + exact PR binding allow one HQ review, then normal rejudge', async () => {
+    const f = fixture();
+    const child = 'run-child-1234';
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true, parentHost: { host: 'node-b', pid: 123 }, runChildId: child,
+      reviewRequests: [], history: [] }]);
+    const parentRows = [{ runId: 'run-rj', event: 'pod-child-run', data: { childRunId: child } }];
+    const childRows = [{ runId: child, event: 'pr-opened', data: { number: 30, url: URL } },
+      { runId: child, event: 'run-status', data: { runStatus: 'completed' } }];
+    const load = (id: string) => id === 'run-rj' ? parentRows : id === child ? childRows : null;
+    expect(remoteBoundRunTerminal(f.card(), load)).toBe(true);
+    expect(rejudgeCandidates({ [f.card().id]: f.card() })).toEqual([f.card().id]);
+    const deps = { ...f.deps(), remoteRunTerminal: (card: TaskCard) => remoteBoundRunTerminal(card, load) };
+    expect((await rejudgeCardOnHead(f.card().id, deps)).at(-1)?.decision).toBe('review-requested');
+    expect(f.reviewRequests).toHaveLength(1);
+    expect(f.card().reviewRequests).toHaveLength(1);
+    await rejudgeCardOnHead(f.card().id, deps);
+    expect(f.reviewRequests).toHaveLength(1);
+  });
+
+  test('remote bootstrap refuses running, unlinked, wrong-PR and local cards; review OFF remains shadow', async () => {
+    const f = fixture();
+    const child = 'run-child-1234';
+    const parentRows = [{ runId: 'run-rj', event: 'pod-child-run', data: { childRunId: child } }];
+    const childRows = [{ runId: child, event: 'pr-opened', data: { number: 30, url: URL } },
+      { runId: child, event: 'run-status', data: { runStatus: 'completed' } }];
+    const load = (id: string) => id === 'run-rj' ? parentRows : id === child ? childRows : null;
+    const remote: TaskCard = { ...f.card(), taLand: true, parentHost: { host: 'node-b', pid: 123 }, runChildId: child, reviewRequests: [], history: [] };
+    expect(remoteBoundRunTerminal(remote, (id) => id === child ? childRows.slice(0, 1) : parentRows)).toBe(false);
+    expect(remoteBoundRunTerminal(remote, (id) => id === child ? childRows : [])).toBe(false);
+    expect(remoteBoundRunTerminal(remote, (id) => id === child ? [{ ...childRows[0]!, data: { number: 31, url: URL } }, childRows[1]!] : parentRows)).toBe(false);
+    expect(remoteBoundRunTerminal({ ...remote, parentHost: undefined }, load)).toBe(false);
+    writeTaskCards(f.statePath, [remote]);
+    const deps = { ...f.deps(), remoteRunTerminal: () => false };
+    expect((await rejudgeCardOnHead(remote.id, deps)).at(-1)?.decision).toBe('not-started');
+    expect(f.reviewRequests).toHaveLength(0);
+    expect((await rejudgeCardOnHead(remote.id, { ...deps, remoteRunTerminal: () => true, liveMoves: new Set<TaskAgentLiveMove>() })).at(-1)?.decision).toBe('would-review');
+    expect(f.reviewRequests).toHaveLength(0);
+  });
+  test('result files → default async shadow rejudge → land decision log and zero land attempts', async () => {
+    const f = fixture();
+    const head = 'a7'.repeat(20);
+    const reviewPath = reviewResultPath(f.statePath, 'ta-rj-1', 30, head);
+    const regatePath = regateResultPath(f.statePath, 'ta-rj-1', 30, head);
+    mkdirSync(dirname(reviewPath), { recursive: true });
+    mkdirSync(dirname(regatePath), { recursive: true });
+    writeFileSync(reviewPath, reviewJson(head));
+    writeFileSync(regatePath, JSON.stringify({ pr: 30, head, passed: true, status: 'passed', baseCommit: BASE, failures: [] }));
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true, project: { target: dirname(f.statePath) },
+      reviewRequests: [{ pr: 30, head, at: '2026-10-11T00:40:00.000Z', resultPath: reviewPath }],
+      regates: [{ pr: 30, head, at: '2026-10-11T00:45:00.000Z', resultPath: regatePath }], history: [] }]);
+    const landCalls: string[] = [];
+    const shadow: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+      if (event === 'rejudge-shadow' && data && typeof data === 'object') shadow.push(data as Record<string, unknown>);
+    });
+    setUserConfigOverlay((cfg) => ({ ...cfg, taskAgent: { ...cfg.taskAgent, liveMoves: ['review', 'propose-land'] } }));
+    try {
+      const outcomes = await rejudgeAsyncResultCard('ta-rj-1', f.statePath, {
+        prHead: async () => ({ head, state: 'OPEN', branch: 'feature', url: URL }),
+        landPrHead: async () => ({ head, state: 'OPEN', isDraft: false, branch: 'feature', url: URL }),
+        landWorktree: { localHead: () => head },
+        land: async (_pr, landedHead) => { landCalls.push(landedHead); return { status: 0, stdout: 'merged' }; },
+      });
+      expect(outcomes.at(-1)?.decision).toBe('would-land');
+      await rejudgeAsyncResultCard('ta-rj-1', f.statePath, {
+        prHead: async () => ({ head, state: 'OPEN', branch: 'feature', url: URL }),
+        landPrHead: async () => ({ head, state: 'OPEN', isDraft: false, branch: 'feature', url: URL }),
+        landWorktree: { localHead: () => head },
+        land: async (_pr, landedHead) => { landCalls.push(landedHead); return { status: 0, stdout: 'merged' }; },
+      });
+      expect(shadow).toMatchObject([{ card: 'ta-rj-1', head12: head.slice(0, 12), decision: 'land' }]);
+      expect(shadow).toHaveLength(1);
+      const reboundReview = reviewResultPath(f.statePath, 'ta-rj-1', 31, head);
+      const reboundRegate = regateResultPath(f.statePath, 'ta-rj-1', 31, head);
+      writeFileSync(reboundReview, reviewJson(head, { pr: '31' }));
+      writeFileSync(reboundRegate, JSON.stringify({ pr: 31, head, passed: true, status: 'passed', baseCommit: BASE, failures: [] }));
+      writeTaskCards(f.statePath, [{ ...f.card(), pr: { number: 31, url: 'https://github.com/o/r/pull/31' },
+        reviewRequests: [{ pr: 31, head, at: '2026-10-11T00:50:00.000Z', resultPath: reboundReview }],
+        regates: [{ pr: 31, head, at: '2026-10-11T00:55:00.000Z', resultPath: reboundRegate }],
+        history: [...(f.card().history ?? []), { at: '2026-10-11T00:50:00.000Z', event: 'live-move-result', kind: 'review', pr: 31, head,
+          verdict: 'pass', reviewed: true, mustFix: 0, reviewRoute: 'api', resultPath: reboundReview, effect: 'review result captured' }] }]);
+      await rejudgeAsyncResultCard('ta-rj-1', f.statePath, {
+        repoCandidates: () => [{ source: 'host', cwd: dirname(f.statePath) }],
+        prHead: async () => ({ head, state: 'OPEN', branch: 'feature', url: 'https://github.com/o/r/pull/31' }),
+      });
+      expect(shadow).toHaveLength(2);
+      expect((f.card().history ?? []).filter((item) => item.event === 'rejudge-shadow').map((item) =>
+        ({ pr: item.pr, head: item.head, effect: item.effect }))).toEqual([
+        { pr: 30, head, effect: 'land' }, { pr: 31, head, effect: 'land' },
+      ]);
+      expect(f.card().landAttempts).toBeUndefined();
+      expect(landCalls).toEqual([]);
+    } finally { setUserConfigOverlay(null); log.mockRestore(); }
+  });
+
+  test('shadow decision is not recorded on a card rebound while PR head is read', async () => {
+    const f = fixture();
+    const head = 'a8'.repeat(20);
+    const reviewPath = reviewResultPath(f.statePath, 'ta-rj-1', 30, head);
+    const regatePath = regateResultPath(f.statePath, 'ta-rj-1', 30, head);
+    mkdirSync(dirname(reviewPath), { recursive: true });
+    mkdirSync(dirname(regatePath), { recursive: true });
+    writeFileSync(reviewPath, reviewJson(head));
+    writeFileSync(regatePath, JSON.stringify({ pr: 30, head, passed: true, status: 'passed', baseCommit: BASE, failures: [] }));
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+      reviewRequests: [{ pr: 30, head, at: '2026-10-11T00:40:00.000Z', resultPath: reviewPath }],
+      regates: [{ pr: 30, head, at: '2026-10-11T00:45:00.000Z', resultPath: regatePath }], history: [] }]);
+    const shadow: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+      if (event === 'rejudge-shadow' && data && typeof data === 'object') shadow.push(data as Record<string, unknown>);
+    });
+    try {
+      await rejudgeAsyncResultCard('ta-rj-1', f.statePath, {
+        repoCandidates: () => [{ source: 'host', cwd: dirname(f.statePath) }],
+        prHead: async () => {
+          writeTaskCards(f.statePath, [{ ...f.card(), pr: { number: 31, url: 'https://github.com/o/r/pull/31' } }]);
+          return { head, state: 'OPEN', branch: 'feature', url: URL };
+        },
+      });
+      expect(shadow).toEqual([]);
+      expect(f.card().history.some((entry) => entry.event === 'rejudge-shadow')).toBe(false);
+    } finally { log.mockRestore(); }
+  });
+
+  test('completed worker cannot record a shadow decision for a newer PR head', async () => {
+    const f = fixture();
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true, history: [] }]);
+    const shadow: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+      if (event === 'rejudge-shadow' && data && typeof data === 'object') shadow.push(data as Record<string, unknown>);
+    });
+    try {
+      await expect(rejudgeAsyncResultCard('ta-rj-1', f.statePath, {
+        repoCandidates: () => [{ source: 'host', cwd: dirname(f.statePath) }],
+        prHead: async () => ({ head: B, state: 'OPEN', branch: 'feature', url: URL }),
+      }, { pr: 30, head: A })).rejects.toThrow('head does not match');
+      expect(shadow).toEqual([]);
+      expect(f.card().history.some((entry) => entry.event === 'rejudge-shadow')).toBe(false);
+    } finally { log.mockRestore(); }
+  });
+
+  test('completed worker cannot record a shadow decision after its result path is replaced', async () => {
+    const f = fixture();
+    const resultPath = reviewResultPath(f.statePath, 'ta-rj-1', 30, A);
+    const request = { pr: 30, head: A, at: '2026-10-11T00:40:00.000Z', resultPath };
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true, reviewRequests: [request], history: [] }]);
+    const shadow: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+      if (event === 'rejudge-shadow' && data && typeof data === 'object') shadow.push(data as Record<string, unknown>);
+    });
+    try {
+      await rejudgeAsyncResultCard('ta-rj-1', f.statePath, {
+        repoCandidates: () => [{ source: 'host', cwd: dirname(f.statePath) }],
+        prHead: async () => {
+          writeTaskCards(f.statePath, [{ ...f.card(), reviewRequests: [{ ...request, resultPath: `${resultPath}.replacement` }] }]);
+          return { head: A, state: 'OPEN', branch: 'feature', url: URL };
+        },
+      }, { pr: 30, head: A, kind: 'review', resultPath });
+      expect(shadow).toEqual([]);
+      expect(f.card().history.some((entry) => entry.event === 'rejudge-shadow')).toBe(false);
+    } finally { log.mockRestore(); }
+  });
+
+  test('detached review and regate completion record shadow decisions without a live move', async () => {
+    const f = fixture();
+    const head = 'b7'.repeat(20);
+    f.setHead(head);
+    const resultPath = reviewResultPath(f.statePath, 'ta-rj-1', 30, head);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, reviewJson(head));
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+      reviewRequests: [{ pr: 30, head, at: '2026-10-11T00:40:00.000Z', resultPath }],
+      history: [] }]);
+    f.onRegate(f.writeRegate(true));
+    const env = { [TA_REVIEW_COMPLETION_CARD_ENV]: 'ta-rj-1', [TA_REVIEW_COMPLETION_STATE_ENV]: f.statePath, [TA_REVIEW_COMPLETION_RESULT_ENV]: resultPath };
+    expect(await rejudgeCompletedTaskReview(env, undefined, f.deps())).toBe(true);
+    expect(f.regateRequests).toHaveLength(0);
+    const regatePath = regateResultPath(f.statePath, 'ta-rj-1', 30, head);
+    mkdirSync(dirname(regatePath), { recursive: true });
+    writeFileSync(regatePath, JSON.stringify({ pr: 30, head, passed: true, status: 'passed', baseCommit: BASE, failures: [] }));
+    writeTaskCards(f.statePath, [{ ...f.card(), regates: [{ pr: 30, head, at: '2026-10-11T00:45:00.000Z', resultPath: regatePath }] }]);
+    expect(await rejudgeCompletedTaskRegate('ta-rj-1', 30, head, regatePath, f.statePath, undefined, f.deps())).toBe(true);
+    expect(f.card().regates?.[0]?.passed).toBe(true);
+    expect(f.card().history.some((entry) => entry.event === 'async-result-rejudge' && entry.resultPath === regatePath)).toBe(true);
+    expect(f.card().landAttempts).toBeUndefined();
+    expect(f.lands).toHaveLength(0);
+    expect(await rejudgeCompletedTaskRegate('ta-rj-1', 30, head, regatePath, f.statePath, undefined, f.deps())).toBe(false);
+  });
+
+  test('review and regate completion racing on one card/head execute no land in shadow phase', async () => {
+    const f = fixture();
+    const head = 'c7'.repeat(20);
+    f.setHead(head);
+    const reviewPath = reviewResultPath(f.statePath, 'ta-rj-1', 30, head);
+    const regatePath = regateResultPath(f.statePath, 'ta-rj-1', 30, head);
+    mkdirSync(dirname(reviewPath), { recursive: true });
+    mkdirSync(dirname(regatePath), { recursive: true });
+    writeFileSync(reviewPath, reviewJson(head));
+    writeFileSync(regatePath, JSON.stringify({ pr: 30, head, passed: true, status: 'passed', baseCommit: BASE, failures: [] }));
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+      reviewRequests: [{ pr: 30, head, at: '2026-10-11T00:40:00.000Z', resultPath: reviewPath }],
+      regates: [{ pr: 30, head, at: '2026-10-11T00:45:00.000Z', resultPath: regatePath }], history: [] }]);
+    const env = { [TA_REVIEW_COMPLETION_CARD_ENV]: 'ta-rj-1', [TA_REVIEW_COMPLETION_STATE_ENV]: f.statePath, [TA_REVIEW_COMPLETION_RESULT_ENV]: reviewPath };
+    await Promise.all([
+      rejudgeCompletedTaskReview(env, undefined, f.deps()),
+      rejudgeCompletedTaskRegate('ta-rj-1', 30, head, regatePath, f.statePath, undefined, f.deps()),
+    ]);
+    expect(f.lands).toHaveLength(0);
+    expect(f.card().landAttempts).toBeUndefined();
+  });
+
+  test('regate completion claims exact card/head/result once, with no recursive recall', async () => {
+    const f = fixture();
+    const resultPath = regateResultPath(f.statePath, 'ta-rj-1', 30, A);
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true, regates: [{ pr: 30, head: A, at: '2026-10-11T01:00:00.000Z', resultPath }] }]);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, JSON.stringify({ pr: 30, head: A, passed: true, baseCommit: BASE, failures: [] }));
+    const calls: string[] = [];
+    const tick = async (cardId: string, statePath: string) => { calls.push(`${cardId}:${statePath}`); return [{ decision: 'would-land', pr: 30, toHead: A }]; };
+    expect(await rejudgeCompletedTaskRegate('ta-rj-1', 30, A, resultPath, f.statePath, tick)).toBe(true);
+    expect(await rejudgeCompletedTaskRegate('ta-rj-1', 30, A, resultPath, f.statePath, tick)).toBe(false);
+    expect(await rejudgeCompletedTaskRegate('ta-rj-1', 30, B, resultPath, f.statePath, tick)).toBe(false);
+    expect(calls).toEqual([`ta-rj-1:${f.statePath}`]);
+    expect(f.card().history.filter((entry) => entry.event === 'async-result-rejudge')).toHaveLength(1);
+  });
+
+  test('regate completion cannot mark old head after rejudge moved to a newer head', async () => {
+    const f = fixture();
+    const resultPath = regateResultPath(f.statePath, 'ta-rj-1', 30, A);
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true, regates: [{ pr: 30, head: A, at: '2026-10-11T01:00:00.000Z', resultPath }] }]);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, JSON.stringify({ pr: 30, head: A, passed: true, baseCommit: BASE, failures: [] }));
+    let calls = 0;
+    await expect(rejudgeCompletedTaskRegate('ta-rj-1', 30, A, resultPath, f.statePath, async () => {
+      calls++;
+      return [{ decision: 'would-regate', pr: 30, toHead: B }];
+    })).rejects.toThrow('head does not match');
+    expect(calls).toBe(2);
+    expect(f.card().history.some((entry) => entry.event === 'async-result-rejudge')).toBe(false);
+  });
+
+  test('regate completion rejects a result for the card’s former PR', async () => {
+    const f = fixture();
+    const resultPath = regateResultPath(f.statePath, 'ta-rj-1', 30, A);
+    writeTaskCards(f.statePath, [{ ...f.card(), pr: { number: 31, url: 'https://github.com/o/r/pull/31' }, taLand: true,
+      regates: [{ pr: 30, head: A, at: '2026-10-11T01:00:00.000Z', resultPath }] }]);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, JSON.stringify({ pr: 30, head: A, passed: true, baseCommit: BASE, failures: [] }));
+    let calls = 0;
+    expect(await rejudgeCompletedTaskRegate('ta-rj-1', 30, A, resultPath, f.statePath, async () => { calls++; })).toBe(false);
+    expect(calls).toBe(0);
+    expect(f.card().history.some((entry) => entry.event === 'async-result-rejudge')).toBe(false);
+  });
+
+  test('regate completion does not mark success after the card closes during rejudge', async () => {
+    const f = fixture();
+    const resultPath = regateResultPath(f.statePath, 'ta-rj-1', 30, A);
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+      regates: [{ pr: 30, head: A, at: '2026-10-11T01:00:00.000Z', resultPath }] }]);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, JSON.stringify({ pr: 30, head: A, passed: true, baseCommit: BASE, failures: [] }));
+    expect(await rejudgeCompletedTaskRegate('ta-rj-1', 30, A, resultPath, f.statePath, async () => {
+      writeTaskCards(f.statePath, [{ ...f.card(), status: 'failed' }]);
+      return [{ decision: 'would-land', pr: 30, toHead: A }];
+    })).toBe(true);
+    expect(f.card().history.some((entry) => entry.event === 'async-result-rejudge')).toBe(false);
+  });
+
+  test('regate completion does not mark success after a conflicting result replaces its pending entry', async () => {
+    const f = fixture();
+    const resultPath = regateResultPath(f.statePath, 'ta-rj-1', 30, A);
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+      regates: [{ pr: 30, head: A, at: '2026-10-11T01:00:00.000Z', resultPath }] }]);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, JSON.stringify({ pr: 30, head: A, passed: true, baseCommit: BASE, failures: [] }));
+    expect(await rejudgeCompletedTaskRegate('ta-rj-1', 30, A, resultPath, f.statePath, async () => {
+      writeTaskCards(f.statePath, [{ ...f.card(), regates: [{ pr: 30, head: A, at: '2026-10-11T01:00:00.000Z', resultPath, passed: false }] }]);
+      return [{ decision: 'would-land', pr: 30, toHead: A }];
+    })).toBe(true);
+    expect(f.card().history.some((entry) => entry.event === 'async-result-rejudge')).toBe(false);
+  });
+
+  test('failed regate result cannot gain a success marker from a later successful rejudge', async () => {
+    const f = fixture();
+    const resultPath = regateResultPath(f.statePath, 'ta-rj-1', 30, A);
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+      regates: [{ pr: 30, head: A, at: '2026-10-11T01:00:00.000Z', resultPath }] }]);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, JSON.stringify({ pr: 30, head: A, passed: false, status: 'failed', failures: [{ step: 'typecheck', detail: 'red' }] }));
+    expect(await rejudgeCompletedTaskRegate('ta-rj-1', 30, A, resultPath, f.statePath, async () => [{ decision: 'would-land', pr: 30, toHead: A }])).toBe(true);
+    expect(f.card().history.some((entry) => entry.event === 'async-result-rejudge')).toBe(false);
+  });
+
+  test('regate completion releases its claim after a rejudge exception', async () => {
+    const f = fixture();
+    const resultPath = regateResultPath(f.statePath, 'ta-rj-1', 30, A);
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true, regates: [{ pr: 30, head: A, at: '2026-10-11T01:00:00.000Z', resultPath }] }]);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, JSON.stringify({ pr: 30, head: A, passed: true, baseCommit: BASE, failures: [] }));
+    let calls = 0;
+    expect(await rejudgeCompletedTaskRegate('ta-rj-1', 30, A, resultPath, f.statePath, async () => {
+      expect(f.card().history.some((entry) => entry.event === 'async-result-rejudge')).toBe(false);
+      if (++calls === 1) throw new Error('transient');
+      return [{ decision: 'would-land', pr: 30, toHead: A }];
+    })).toBe(true);
+    expect(calls).toBe(2);
+    expect(await rejudgeCompletedTaskRegate('ta-rj-1', 30, A, resultPath, f.statePath, async () => { calls++; })).toBe(false);
+    expect(f.card().history.some((entry) => entry.event === 'async-result-rejudge' && entry.effect === 'completion callback succeeded')).toBe(true);
+  });
+
+  test('two failed completion attempts leave the card eligible for the next rejudge cycle', async () => {
+    const f = fixture();
+    const resultPath = regateResultPath(f.statePath, 'ta-rj-1', 30, A);
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true, regates: [{ pr: 30, head: A, at: '2026-10-11T01:00:00.000Z', resultPath }] }]);
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, JSON.stringify({ pr: 30, head: A, passed: true, baseCommit: BASE, failures: [] }));
+    let calls = 0;
+    await expect(rejudgeCompletedTaskRegate('ta-rj-1', 30, A, resultPath, f.statePath, async () => {
+      calls++;
+      throw new Error('still unavailable');
+    })).rejects.toThrow('still unavailable');
+    expect(calls).toBe(2);
+    expect(f.card().history.some((entry) => entry.event === 'async-result-rejudge')).toBe(false);
+    expect(rejudgeCandidates({ [f.card().id]: f.card() })).toEqual([f.card().id]);
+  });
+
+  test('머리 그대로(A) · 리뷰 결과가 없으면 land 하지 않고 head-unchanged 로 멈춘다', async () => {
     const f = fixture();
     await rejudgeCardOnHead('ta-rj-1', f.deps());
     expect(f.regateRequests).toEqual([]);
     expect(f.reviewRequests).toEqual([]);
     expect(f.lands).toEqual([]);
     expect(f.decisions()).toEqual(['target:head-unchanged']);
+  });
+
+  test('같은 머리 · pass must-fix 0 · 기존 live는 조기 반환하고 shadow만 재게이트를 제안한다', async () => {
+    const head = A;
+    const f = fixture();
+    const reviewPath = reviewResultPath(f.statePath, 'ta-rj-1', 30, head);
+    mkdirSync(dirname(reviewPath), { recursive: true });
+    writeFileSync(reviewPath, reviewJson(head));
+    writeTaskCards(f.statePath, [{ ...f.card(),
+      reviewRequests: [{ pr: 30, head, at: '2026-10-11T00:40:00.000Z', resultPath: reviewPath }],
+      history: [{ at: '2026-10-11T00:45:00.000Z', event: 'live-move-result', kind: 'review', pr: 30, head, verdict: 'pass', reviewed: true, mustFix: 0, reviewRoute: 'api', resultPath: reviewPath }] }]);
+    f.onRegate(f.writeRegate(true));
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    await rejudgeCardOnHead('ta-rj-1', { ...f.deps(), shadowSameHead: true });
+    expect(f.decisions()).toEqual(['target:head-unchanged', 'target:head-unchanged']);
+    const shadow = await rejudgeShadowCard('ta-rj-1', f.statePath, f.deps());
+    expect(shadow.some((item) => item.decision === 'would-regate')).toBe(true);
+    expect(f.regateRequests).toEqual([]);
+    expect(f.lands).toEqual([]);
+  });
+
+  test('같은 머리 · pass must-fix 0 · 기존 통과 재게이트를 재사용해 land', async () => {
+    const head = 'cd'.repeat(20);
+    const f = fixture({ regates: [{ pr: 30, head, at: '2026-10-11T00:30:00.000Z', passed: true, status: 'passed', baseCommit: BASE }] });
+    f.setHead(head);
+    const reviewPath = reviewResultPath(f.statePath, 'ta-rj-1', 30, head);
+    mkdirSync(dirname(reviewPath), { recursive: true });
+    writeFileSync(reviewPath, reviewJson(head));
+    writeTaskCards(f.statePath, [{ ...f.card(),
+      reviewRequests: [{ pr: 30, head, at: '2026-10-11T00:40:00.000Z', resultPath: reviewPath }],
+      history: [{ at: '2026-10-11T00:45:00.000Z', event: 'live-move-result', kind: 'review', pr: 30, head, verdict: 'pass', reviewed: true, mustFix: 0, reviewRoute: 'api', resultPath: reviewPath }] }]);
+    const outcomes = await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.regateRequests).toEqual([]);
+    expect(f.lands).toEqual([{ pr: 30, head, overlapEvidence: overlapEvidencePath(f.statePath, 'ta-rj-1', 30, head) }]);
+    expect(outcomes.at(-1)).toMatchObject({ step: 'land', decision: 'landed' });
+  });
+
+  test('같은 머리 · warn must-fix 0 · 기존 통과 재게이트를 재사용해 land', async () => {
+    const head = 'e1'.repeat(20);
+    const f = fixture({ regates: [{ pr: 30, head, at: '2026-10-11T00:30:00.000Z', passed: true, status: 'passed', baseCommit: BASE }] });
+    f.setHead(head);
+    const reviewPath = reviewResultPath(f.statePath, 'ta-rj-1', 30, head);
+    mkdirSync(dirname(reviewPath), { recursive: true });
+    writeFileSync(reviewPath, reviewJson(head, { verdict: 'warn' }));
+    writeTaskCards(f.statePath, [{ ...f.card(),
+      reviewRequests: [{ pr: 30, head, at: '2026-10-11T00:40:00.000Z', resultPath: reviewPath }],
+      history: [{ at: '2026-10-11T00:45:00.000Z', event: 'live-move-result', kind: 'review', pr: 30, head, verdict: 'warn', reviewed: true, mustFix: 0, reviewRoute: 'api', resultPath: reviewPath }] }]);
+    const outcomes = await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.regateRequests).toEqual([]);
+    expect(f.lands).toHaveLength(1);
+    expect(outcomes.at(-1)).toMatchObject({ step: 'land', decision: 'landed' });
+  });
+
+  test('같은 머리 · pass must-fix 0 · 기존 live는 재게이트와 land를 새로 시작하지 않는다', async () => {
+    const f = fixture();
+    const head = 'a1'.repeat(20);
+    f.setHead(head);
+    const reviewPath = reviewResultPath(f.statePath, 'ta-rj-1', 30, head);
+    mkdirSync(dirname(reviewPath), { recursive: true });
+    writeFileSync(reviewPath, reviewJson(head));
+    const card = f.card();
+    writeTaskCards(f.statePath, [{ ...card,
+      reviewRequests: [{ pr: 30, head, at: '2026-10-11T00:40:00.000Z', resultPath: reviewPath }],
+      history: [{ at: '2026-10-11T00:45:00.000Z', event: 'live-move-result', kind: 'review', pr: 30, head, verdict: 'pass', reviewed: true, mustFix: 0, reviewRoute: 'api', resultPath: reviewPath }] }]);
+    f.onRegate(f.writeRegate(true));
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.regateRequests).toEqual([]);
+    f.setClock('2026-10-11T01:05:00.000Z');
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.card().regates).toBeUndefined();
+    expect(f.lands).toEqual([]);
+    expect(f.decisions()).toEqual(['target:head-unchanged', 'target:head-unchanged']);
   });
 
   test('머리 A→B → 재게이트 1회 ⊕ 리뷰 재요청 1회 · 같은 머리 다음 틱은 0회', async () => {
@@ -161,15 +618,15 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
   test('LAND-ORDER-LEDGER — land 단계 뒤 원장 1행(pr·head·cardId·gateBase·리뷰 판정·land 결과 · 관측 appended)', async () => {
     const f = fixture();
     // 머리는 40자 hex sha — 다른 시험과 머리(주기 표시)가 겹치지 않게 새 조합을 쓴다.
-    const G = 'a1'.repeat(20);
+    const G = 'd1'.repeat(20);
     f.setHead(G);
     f.onRegate(f.writeRegate(true));
     f.onReview((path) => writeFileSync(path, reviewJson(G)));
     await rejudgeCardOnHead('ta-rj-1', f.deps());
-    f.setClock('2026-10-11T01:10:00.000Z');
+    f.setClock('2026-10-11T01:05:00.000Z');
     await rejudgeCardOnHead('ta-rj-1', f.deps());
     const rows = readFileSync(landOrderLedgerPath(f.statePath), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-    expect(rows).toEqual([{ pr: 30, head: G, cardId: 'ta-rj-1', gateBase: BASE, reviewVerdict: 'pass', mustFix: 0, landOk: true, landClass: null, at: '2026-10-11T01:10:00.000Z' }]);
+    expect(rows).toEqual([{ pr: 30, head: G, cardId: 'ta-rj-1', gateBase: BASE, reviewVerdict: 'pass', mustFix: 0, landOk: true, landClass: null, at: '2026-10-11T01:05:00.000Z' }]);
     expect(f.logs.filter((entry) => entry.event === 'appended' || entry.event === 'append-failed'))
       .toEqual([{ event: 'appended', data: { pr: 30, head: G } }]);
   });

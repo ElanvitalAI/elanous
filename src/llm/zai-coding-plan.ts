@@ -122,6 +122,26 @@ export interface ZaiErrorClass {
   resetRaw: string | null;
 }
 
+/** Provider-neutral signal shape for supervisors coordinating plan-limit recovery. */
+export interface ProviderPlanLimitSignal {
+  provider: string;
+  kind: 'plan-limit';
+  resetAt: number | null;
+  overage: string;
+}
+
+/** Extract the structured recovery signal from a Z.ai 1308 response; unrelated errors return null. */
+export function extractZaiPlanLimitSignal(
+  status: number,
+  bodyText: string,
+  overage: string,
+): ProviderPlanLimitSignal | null {
+  const classified = classifyZaiError(status, bodyText);
+  if (!classified || classified.code !== 1308 || classified.kind !== 'plan-limit') return null;
+  return { provider: 'glm', kind: 'plan-limit', resetAt: classified.resetAt, overage };
+}
+
+
 const PLAN_LIMIT = new Set([1308, 1310]);
 const BALANCE_LIMIT = new Set([1113, 1316, 1317, 1318, 1319, 1320, 1321]);
 const PLAN_UNAVAILABLE = new Set([1309, 1311, 1313, 1314, 1315]);
@@ -433,13 +453,15 @@ export class ZaiCodingPlanLimitError extends Error {
   readonly code: number;
   readonly limitKind: ZaiLimitKind;
   readonly resetAt: number | null;
-  constructor(opts: { code: number; limitKind: ZaiLimitKind; resetAt: number | null; policy: ZaiOveragePolicy; reason: string }) {
+  readonly planLimitSignal?: ProviderPlanLimitSignal;
+  constructor(opts: { code: number; limitKind: ZaiLimitKind; resetAt: number | null; policy: ZaiOveragePolicy; reason: string; planLimitSignal?: ProviderPlanLimitSignal }) {
     const when = opts.resetAt ? ` · 리셋 ${new Date(opts.resetAt).toISOString()}` : '';
     super(`GLM Coding Plan 한도(code ${opts.code} · ${opts.limitKind}${when}) — 정책 llm.zaiCodingPlan.overage=${opts.policy}: ${opts.reason}`);
     this.name = 'ZaiCodingPlanLimitError';
     this.code = opts.code;
     this.limitKind = opts.limitKind;
     this.resetAt = opts.resetAt;
+    if (opts.planLimitSignal) this.planLimitSignal = opts.planLimitSignal;
   }
 }
 
@@ -575,6 +597,9 @@ export function makeZaiCodingPlanProvider(cfg: UCLLMConfig, deps: ZaiProviderDep
           const status = (error as { status?: unknown })?.status;
           const bodyText = (error as { bodyText?: unknown })?.bodyText;
           const cls = typeof status === 'number' && typeof bodyText === 'string' ? classifyZaiError(status, bodyText) : null;
+          const planLimitSignal = typeof status === 'number' && typeof bodyText === 'string'
+            ? extractZaiPlanLimitSignal(status, bodyText, settings.overage)
+            : null;
           if (!cls || cls.kind === 'rate' || cls.kind === 'other') {
             if (cls) debug.log('zai.coding-plan', 'error', { code: cls.code, kind: cls.kind, model: wireModel }, { level: 'warn' });
             throw error;
@@ -588,6 +613,7 @@ export function makeZaiCodingPlanProvider(cfg: UCLLMConfig, deps: ZaiProviderDep
           if (action === 'stop' || emitted) {
             throw new ZaiCodingPlanLimitError({
               code: cls.code, limitKind: cls.kind, resetAt: cls.resetAt, policy: settings.overage,
+              ...(planLimitSignal ? { planLimitSignal } : {}),
               reason: emitted ? '출력이 이미 나간 뒤라 폴백하지 않는다' : '리셋까지 멈춘다',
             });
           }

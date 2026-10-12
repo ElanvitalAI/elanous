@@ -26,6 +26,7 @@ import type { BashNode, NodeExecContext, WorkflowDeps } from '../workflow-runtim
 import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeWaiver, type AcceptedRegression, type GateExecutorOverride } from '../../scripts/release-loop/resume.js';
 
 type BashRun = WorkflowDeps['runBash'];
+const DEFAULT_BASH_TIMEOUT_MS = 5 * 60 * 1_000;
 
 export interface GraphRunState {
   graphId: string;
@@ -878,7 +879,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       env.ELANOUS_GRAPH_DRY_RUN = state.dryRun ? '1' : '0';
       env.ELANOUS_GRAPH_DIR = dirname(resolve(path));
       const ctx = { arguments: '', artifactsDir: dirname(statePath), outputs: {}, resolvedProvider: undefined, resolvedModel: undefined, toolPolicy: {}, env } as NodeExecContext;
-      const result = await executeBashNode({ id: current, type: 'bash', bash: state.dryRun ? command.dry_run_command! : command.command, ...(command.timeout_ms ? { idle_timeout: command.timeout_ms } : {}) } as BashNode, ctx, { runBash } as WorkflowDeps);
+      const result = await executeBashNode({ id: current, type: 'bash', bash: state.dryRun ? command.dry_run_command! : command.command,
+        idle_timeout: command.timeout_ms ?? DEFAULT_BASH_TIMEOUT_MS } as BashNode, ctx, { runBash } as WorkflowDeps);
       output = result.output;
       ok = result.ok;
       exit = code;

@@ -7,9 +7,16 @@ import { registerStandaloneLogSink } from '../src/domains/standalone-log-sink.js
 import { effectiveInstanceRoot } from '../src/instance/resolve.js';
 import trackData from './coord-tracks.json';
 
-type Comment = { id: number; body: string; created_at: string; html_url: string };
+export type CoordChannelComment = { id: number; body: string; created_at: string; html_url: string };
 type Options = { seat: string; channel: string; since?: string; dryRun: boolean; json: boolean };
 const seatIds = new Set(trackData.tracks.map((track) => track.id));
+
+/** Shared channel retrieval. Callers validate the complete result before changing a ledger. */
+export function fetchCoordChannelComments(channel: string, since?: string): CoordChannelComment[] {
+  const endpoint = `repos/{owner}/{repo}/issues/${channel}/comments${since ? `?since=${encodeURIComponent(since)}` : ''}`;
+  const output = execFileSync('gh', ['api', endpoint, '--paginate', '--jq', '.[]'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  return output.split('\n').filter(Boolean).map((line) => JSON.parse(line) as CoordChannelComment);
+}
 
 function options(args: string[]): Options {
   let seat = '';
@@ -98,15 +105,13 @@ async function run(args: string[]): Promise<void> {
     seat = selected.seat;
     const { channel, since, dryRun, json } = selected;
     reason = 'gh';
-    const endpoint = `repos/{owner}/{repo}/issues/${channel}/comments${since ? `?since=${encodeURIComponent(since)}` : ''}`;
-    const output = execFileSync('gh', ['api', endpoint, '--paginate', '--jq', '.[]'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-    const comments = output.split('\n').filter(Boolean).map((line) => JSON.parse(line) as unknown);
+    const comments = fetchCoordChannelComments(channel, since);
     reason = 'ledger';
     const path = join(effectiveInstanceRoot(), 'seat-requests', 'requests.jsonl');
     const seen = existingSeatComments(path);
     let picked = 0, added = 0, existing = 0;
     for (const item of comments) {
-      const comment = item as Partial<Comment>;
+      const comment = item as Partial<CoordChannelComment>;
       if (typeof comment.id !== 'number' || !Number.isSafeInteger(comment.id) || typeof comment.body !== 'string'
         || typeof comment.created_at !== 'string' || typeof comment.html_url !== 'string') throw new Error('gh api 댓글 필드가 잘못됐다');
       if (since && Date.parse(comment.created_at) < Date.parse(since)) continue;

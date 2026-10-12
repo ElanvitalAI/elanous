@@ -166,18 +166,20 @@ test('demo state is restored from storage; denied reads and writes fall back to 
   expect(host.querySelectorAll('nav button')).toHaveLength(6);
 });
 
-test('ArchitectureScene renders six mapped cells in pillar-foundation-floor order and reveals paths on expansion', async () => {
+test('ArchitectureScene renders six mapped cells in main-support-seam-floor order and reveals paths on expansion', async () => {
   await act(async () => root.render(<ArchitectureScene />));
   const map = host.querySelector('[data-architecture-scene]')!;
   expect(map.getAttribute('style')).toContain('font-size:18px');
-  expect(map.children[1].getAttribute('aria-label')).toBe('네 기둥');
+  expect(map.children[1].getAttribute('aria-label')).toBe('메인');
   expect(map.children[2].getAttribute('aria-label')).toBe('받침');
-  expect(map.children[2].getAttribute('style')).toContain('max-width:480px');
-  expect(map.children[2].getAttribute('style')).toContain('justify-self:center');
-  expect(map.children[3].getAttribute('aria-label')).toBe('바닥');
+  expect(map.children[2].getAttribute('style')).toContain('grid-template-columns');
+  expect(map.children[3].getAttribute('aria-label')).toBe('실행 이음');
+  expect(map.children[3].getAttribute('style')).toContain('max-width:480px');
+  expect(map.children[3].getAttribute('style')).toContain('justify-self:center');
+  expect(map.children[4].getAttribute('aria-label')).toBe('바닥');
   const cells = [...map.querySelectorAll('details')];
   expect(cells).toHaveLength(6);
-  for (const [index, entry] of [...ARCHITECTURE_MAP.slice(0, 4), ARCHITECTURE_MAP[5], ARCHITECTURE_MAP[4]].entries()) {
+  for (const [index, entry] of ARCHITECTURE_MAP.entries()) {
     expect(cells[index].querySelector('summary')?.textContent).toBe(entry.title);
   }
   const cell = cells[0];
@@ -562,18 +564,19 @@ test('architecture cells expand to show documented paths with at least 18px base
   const stage = host.querySelector('main')!;
   expect(stage.getAttribute('style')).toContain('font-size:18px');
   expect(host.querySelector('nav')?.getAttribute('style')).toContain('48px');
-  expect(host.querySelector('[aria-label="네 기둥"]')?.querySelectorAll('details')).toHaveLength(4);
-  const cell = host.querySelector('[aria-label="네 기둥"] details')!;
-  expect(cell.querySelector('summary')?.textContent).toContain('미션 패브릭');
+  expect(host.querySelector('[aria-label="메인"]')?.querySelectorAll('details')).toHaveLength(2);
+  const cell = host.querySelector('[aria-label="메인"] details')!;
+  expect(cell.querySelector('summary')?.textContent).toContain('루프 에이전트');
   expect(cell.hasAttribute('open')).toBe(false);
   await click(cell.querySelector('summary')!);
   expect(cell.hasAttribute('open')).toBe(true);
   expect(cell.querySelectorAll('li').length).toBeGreaterThanOrEqual(2);
   expect(cell.textContent).toContain('docs/manual/');
   const map = host.querySelector('[data-architecture-scene]')!;
-  expect(map.children[1].getAttribute('aria-label')).toBe('네 기둥');
+  expect(map.children[1].getAttribute('aria-label')).toBe('메인');
   expect(map.children[2].getAttribute('aria-label')).toBe('받침');
-  expect(map.children[3].getAttribute('aria-label')).toBe('바닥');
+  expect(map.children[3].getAttribute('aria-label')).toBe('실행 이음');
+  expect(map.children[4].getAttribute('aria-label')).toBe('바닥');
 });
 
 test('scene ⑥ receives distinct sanitized approval and denial outcomes through live SSE without leaking command text', async () => {

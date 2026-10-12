@@ -456,11 +456,36 @@ function parseGoals(req: SelfImplementRuntimeRequest): string[] | undefined {
   return goals;
 }
 
-function formatOrchestrationResults(results: readonly SelfDevJobResult[]): string {
+interface SelfImplementGoalResult {
+  goal: string;
+  status: SelfDevJobResult['status'];
+  runId?: string;
+  stage?: string;
+  reason?: string;
+  parentPrNumber?: number;
+}
+
+function observedGoalResults(results: readonly SelfDevJobResult[]): SelfImplementGoalResult[] {
+  return results.map((result, index) => ({
+    goal: result.feature || `골 ${index + 1}`,
+    status: result.status,
+    ...(result.runId ? { runId: result.runId } : {}),
+    ...(result.stage ? { stage: result.stage } : {}),
+    ...(result.error?.message || result.stopReason || result.blockReason
+      ? { reason: result.error?.message || result.stopReason || (result.blockReason === 'parent-unlanded'
+        ? result.parentPrNumber ? `선행 PR #${result.parentPrNumber} 미착지` : '선행 골 미착지'
+        : result.blockReason) }
+      : {}),
+    ...(result.parentPrNumber ? { parentPrNumber: result.parentPrNumber } : {}),
+  }));
+}
+
+function formatOrchestrationResults(results: readonly SelfDevJobResult[], goals: readonly SelfImplementGoalResult[]): string {
   const done = results.filter(result => result.status === 'done').length;
   const merged = results.filter(result => result.merged).length;
   const failed = results.filter(result => result.status === 'failed').length;
-  return `[self-implement] parallel ${results.length} goal · done ${done}${merged ? ` (병합 ${merged})` : ''}${failed ? ` · 실패 ${failed}` : ''}`;
+  const summary = `[self-implement] parallel ${results.length} goal · done ${done}${merged ? ` (병합 ${merged})` : ''}${failed ? ` · 실패 ${failed}` : ''}`;
+  return [summary, ...goals.map(goal => `- ${goal.goal}: ${goal.status} · 런 ${goal.runId ?? '미관측'}${goal.stage ? ` · 단계 ${goal.stage}` : ''}${goal.reason ? ` · 이유 ${goal.reason}` : ''}`)].join('\n');
 }
 
 export function resolveDocumentReferences(paths: readonly string[], repositoryRoot = process.cwd()): DocumentReferenceStatus[] {
@@ -476,7 +501,15 @@ function documentReferenceStatusLines(references: readonly DocumentReferenceStat
 
 function formatResult(feature: string, r: SelfImplementResult, references: readonly DocumentReferenceStatus[] = []): string {
   const head = `[self-implement] ${r.stage}`;
-  const lines: string[] = [head, ...documentReferenceStatusLines(references)];
+  const next = r.runId ? `eln self run ${r.runId}` : r.ok ? 'eln self running-runs' : '실패 이유를 확인한 뒤 다시 요청';
+  const lines: string[] = [
+    r.ok
+      ? r.runId
+        ? `하니스가 맡았습니다 · 런 ${r.runId} · 노드 ${r.node || '미관측'} · 다음 조회: ${next} · 이 턴에서 파일을 직접 편집하지 마세요`
+        : `하니스 응답을 받았지만 런 식별자는 아직 미관측입니다 · 진행 중 런 조회: ${next} · 일치하는 런이 없으면 요청을 다시 보내세요 · 이 턴에서 파일을 직접 편집하지 마세요`
+      : `하니스가 발사되지 않았거나 실패했습니다: ${r.detail ?? r.stage} · 다음: ${next} · 이 턴에서 파일을 직접 편집하지 마세요`,
+    head, ...documentReferenceStatusLines(references),
+  ];
   if (r.branch) lines.push(`branch: ${r.branch}`);
   if (r.worktreePath) lines.push(`worktree: ${r.worktreePath}`);
   if (r.stage === 'pr-opened' && r.prUrl) {
@@ -494,6 +527,12 @@ function formatResult(feature: string, r: SelfImplementResult, references: reado
 export interface SelfImplementRunResult {
   output: string;
   ok: boolean;
+  kind: 'launched' | 'observed-only' | 'failed' | 'pending';
+  next?: string;
+  reason?: string;
+  missing?: string[];
+  /** 병렬 골마다 실제로 관측된 종료 상태·식별자·이유. */
+  goalResults?: SelfImplementGoalResult[];
   // ⛔ 관측 전용 반환에는 **단계가 없다** — 아무 노드도 돌지 않았다. 없는 것을 있는 값으로 적으면
   //   «안 돌았다» 와 «어느 단계에서 끝났다» 가 같은 값이 된다(부재와 미지를 같은 값으로 적지 않는다).
   stage?: SelfImplementResult['stage'];
@@ -506,8 +545,10 @@ export interface SelfImplementRunResult {
   observed?: true;
   /** 명시적 Fabric 분해의 상태·기존 3결말·미산출 사유. */
   fabricDecomposition?: FabricDecompositionOutcome;
-  /** 즉시 반환 모드에서 할당한 런 식별자. 블로킹 기본 경로에는 없어 기존 반환 모양을 보존한다. */
+  /** 실제 런 결과에서 확인한 식별자. 선할당된 비동기 ID는 반환하지 않는다. */
   runId?: string;
+  /** 비동기 요청 조회용 상관 ID. 발사된 런의 증거가 아니다. */
+  requestId?: string;
   /** 호출이 블로킹인지 비블로킹인지. 기본 경로에는 없어 기존 반환 모양을 보존한다. */
   invocationMode?: 'blocking' | 'non-blocking';
 }
@@ -516,6 +557,7 @@ export const selfImplementRuntime: ToolRuntime<SelfImplementRuntimeRequest, Self
   id: 'self_implement',
   spec: buildSelfImplementSpec(),
   async run(req, ctx: ToolRuntimeContext): Promise<SelfImplementRunResult> {
+    try {
     const hasFeature = req.feature !== undefined;
     const hasGoals = req.goals !== undefined;
     if (hasFeature === hasGoals) {
@@ -604,7 +646,7 @@ export const selfImplementRuntime: ToolRuntime<SelfImplementRuntimeRequest, Self
     if (observeOnly.enabled) {
       const requestSummary = feature ?? goals!.join(' · ');
       debug.log('self-implement', 'runtime.observed', { surface: ctx.surface, ...(feature ? { feature: feature.slice(0, 120) } : { goals: goals!.length }), observeOnly: observeOnly.enabled, observeOnlySource: observeOnly.source });
-      return { output: `SelfImplement 관측 전용 측정 모드 — 호출이 접수되어 기록되었습니다. 이 세션에서는 구현을 진행하지 않습니다. 같은 요청을 이 턴에서 직접 구현하지 말고 응답을 마무리하세요: ${requestSummary.slice(0, 120)}${documentReferenceStatusLines(documentReferences).length ? `\n${documentReferenceStatusLines(documentReferences).join('\n')}` : ''}`, ok: true, observed: true };
+      return { output: `관측 전용이라 런을 발사하지 않았습니다 · 코드도 안 바꿨습니다 · 이 결과를 구현 실패로 읽고 직접 Write/Edit 하지 마세요. 실제 발사를 원하면 관측 전용 모드를 끈 뒤 다시 요청하세요: ${requestSummary.slice(0, 120)}${documentReferenceStatusLines(documentReferences).length ? `\n${documentReferenceStatusLines(documentReferences).join('\n')}` : ''}`, ok: true, kind: 'observed-only', observed: true, missing: ['runId', 'node'], next: '관측 전용 모드를 끈 뒤 다시 요청' };
     }
 
     const allocatedRunId = nonBlocking ? mintRunId() : undefined;
@@ -637,9 +679,14 @@ export const selfImplementRuntime: ToolRuntime<SelfImplementRuntimeRequest, Self
           fabricDecomposition = fabricDecompositionOutcome(fabricResult);
           observeFabricDecomposition(fabricDecomposition, ctx.surface, fabricResult.status === 'decomposed' ? fabricResult.goals.length : undefined);
           if (fabricResult.status !== 'decomposed') {
+            const observedOnly = fabricDecomposition.outcome !== 'llm-failed';
             return {
-              output: formatFabricDecompositionOutcome(fabricDecomposition),
-              ok: fabricDecomposition.outcome !== 'llm-failed',
+              output: `${formatFabricDecompositionOutcome(fabricDecomposition)}${observedOnly ? '\n관측 전용이라 런을 발사하지 않았습니다 · 코드도 안 바꿨습니다 · 이 결과를 구현 실패로 읽고 직접 Write/Edit 하지 마세요.' : '\n이 턴에서 파일을 직접 편집하지 마세요.'}`,
+              ok: observedOnly,
+              kind: observedOnly ? 'observed-only' : 'failed',
+              next: observedOnly ? '분해 결과를 확인하고 구현 골을 다시 요청' : '분해 실패 이유를 확인한 뒤 다시 요청',
+              missing: ['runId', 'node'],
+              ...(observedOnly ? { observed: true as const } : { reason: formatFabricDecompositionOutcome(fabricDecomposition) }),
               fabricDecomposition,
             };
           }
@@ -674,10 +721,40 @@ export const selfImplementRuntime: ToolRuntime<SelfImplementRuntimeRequest, Self
         ...(forwardedSupervise === undefined ? {} : { supervise: forwardedSupervise }),
         ...(deliverable === undefined ? {} : { deliverable }),
       });
-      const failed = results.filter(result => result.status === 'failed').length;
+      const goalResults = observedGoalResults(results);
+      const failedGoals = goalResults.filter(result => result.status === 'failed' || result.status === 'cancelled');
+      const blockedGoals = goalResults.filter(result => result.status === 'blocked');
+      const allRunsIdentified = goalResults.length > 0 && goalResults.every(result => result.runId);
+      const kind = goalResults.length === 0 || failedGoals.length > 0 || blockedGoals.length > 0 ? 'failed' : allRunsIdentified ? 'launched' : 'pending';
+      const parentBlockedPrNumbers = [...new Set(results.flatMap(result => result.status === 'blocked' && result.blockReason === 'parent-unlanded' && result.parentPrNumber ? [result.parentPrNumber] : []))];
+      const parentBlockedWithoutPr = results.some(result => result.status === 'blocked' && result.blockReason === 'parent-unlanded' && !result.parentPrNumber && !result.runId);
+      const otherFailureWithoutId = results.some(result => !result.runId && ['failed', 'cancelled', 'blocked'].includes(result.status) && result.blockReason !== 'parent-unlanded');
+      const runQueries = [...new Set(goalResults.flatMap(result => result.runId ? [`eln self run ${result.runId}`] : []))];
+      const availableQueries = [
+        ...parentBlockedPrNumbers.map(pr => `eln gh pr view ${pr}`),
+        ...runQueries,
+      ];
+      const pendingWithoutId = goalResults.some(result => !result.runId && !['failed', 'cancelled', 'blocked'].includes(result.status));
+      const next = [
+        ...availableQueries,
+        ...(pendingWithoutId ? ['eln self running-runs', '일치하는 런이 없으면 ID 미확정 골을 다시 요청'] : []),
+        ...(parentBlockedPrNumbers.length ? ['선행 PR 착지 뒤 차단된 골을 재실행하세요'] : []),
+        ...(parentBlockedWithoutPr ? ['선행 골 상태를 확인한 뒤 해당 골을 재실행하세요'] : []),
+        ...(otherFailureWithoutId ? ['실패·차단 이유를 확인한 뒤 해당 골을 다시 요청'] : []),
+      ].join('\n') || '골 결과가 0건이라 상태를 확인한 뒤 다시 요청';
+      const reason = goalResults.length === 0
+        ? '골 결과가 0건이라 상태 미관측'
+        : [...failedGoals, ...blockedGoals].map(result => `${result.goal}: ${result.reason ?? '이유 미관측'}`).join('; ');
       return {
-        output: formatOrchestrationResults(results),
-        ok: failed === 0,
+        output: formatOrchestrationResults(results, goalResults)
+          + (kind === 'failed' ? `\n실패/차단: ${reason} · 다음: ${next}` : `\n다음 조회: ${next}`)
+          + '\n이 턴에서 파일을 직접 편집하지 마세요',
+        ok: kind !== 'failed',
+        kind,
+        next,
+        missing: [ ...(goalResults.length === 0 || goalResults.some(result => !result.runId) ? ['runId'] : []), 'node' ],
+        goalResults,
+        ...(kind === 'failed' ? { reason } : {}),
         ...(fabricDecomposition ? { fabricDecomposition } : {}),
       };
     }
@@ -751,12 +828,12 @@ export const selfImplementRuntime: ToolRuntime<SelfImplementRuntimeRequest, Self
       ...(runId ? { runId } : {}),
     }, { pipelineDeps });
     if (!outcome.ok) {
-      return { output: withGoalAuthorFailure(`[self-implement] failed: ${outcome.message}`), ok: false };
+      return { output: withGoalAuthorFailure(`하니스가 발사되지 않았거나 실패했습니다: ${outcome.message} · 다음: 실패 이유를 확인한 뒤 다시 요청하세요 · 이 턴에서 파일을 직접 편집하지 마세요`), ok: false, kind: 'failed', reason: outcome.message, next: '실패 이유를 확인한 뒤 다시 요청', missing: ['runId', 'node'] };
     }
     if (outcome.kind !== 'self') {
       return {
-        output: withGoalAuthorFailure('[self-implement] observed by central CLI'),
-        ok: true,
+        output: withGoalAuthorFailure('관측 전용이라 런을 발사하지 않았습니다 · 코드도 안 바꿨습니다 · 이 결과를 구현 실패로 읽고 직접 Write/Edit 하지 마세요'),
+        ok: true, kind: 'observed-only', observed: true, missing: ['runId', 'node'], next: '관측 전용 모드를 끈 뒤 다시 요청',
       };
     }
 
@@ -764,6 +841,11 @@ export const selfImplementRuntime: ToolRuntime<SelfImplementRuntimeRequest, Self
     return {
       output: withGoalAuthorFailure(formatResult(feature, result, documentReferences)),
       ok: result.ok,
+      kind: result.ok ? (result.runId ? 'launched' : 'pending') : 'failed',
+      next: result.runId ? `eln self run ${result.runId}` : result.ok ? 'eln self running-runs' : '실패 이유를 확인한 뒤 다시 요청',
+      missing: [...(result.runId ? [] : ['runId']), ...(result.node ? [] : ['node'])],
+      ...(!result.ok ? { reason: result.detail ?? result.stage } : {}),
+      runId: result.runId,
       stage: result.stage,
       node: result.node,
       ...(result.prUrl ? { prUrl: result.prUrl } : {}),
@@ -775,28 +857,51 @@ export const selfImplementRuntime: ToolRuntime<SelfImplementRuntimeRequest, Self
 
     if (nonBlocking) {
       const runId = allocatedRunId ?? mintRunId();
+      const requestId = runId;
+      const lookup = `eln logs --category self-implement --event runtime.non-blocking-completed,runtime.non-blocking-failed --grep ${requestId} --since 3h --all --include-test`;
       void drive(runId).then(
         (result) => {
-          debug.log('self-implement', 'runtime.non-blocking-completed', {
-            runId,
+          debug.log('self-implement', result.kind === 'failed' ? 'runtime.non-blocking-failed' : 'runtime.non-blocking-completed', {
+            requestId,
+            kind: result.kind,
+            ...(result.runId ? { runId: result.runId } : {}),
+            ...(result.reason ? { reason: result.reason } : {}),
+            next: result.next ?? '요청 결과를 확인한 뒤 다시 요청',
             ok: result.ok,
             ...(result.stage === undefined ? {} : { stage: result.stage }),
-          });
+          }, result.kind === 'failed' ? { level: 'warn' } : undefined);
         },
         (error) => {
+          const reason = error instanceof Error ? error.message : String(error);
           debug.log('self-implement', 'runtime.non-blocking-failed', {
-            runId,
-            error: error instanceof Error ? error.message : String(error),
+            requestId,
+            kind: 'failed',
+            reason,
+            next: '요청과 실패 이유를 확인한 뒤 다시 요청',
           }, { level: 'warn' });
         },
       );
       return {
         ok: true,
-        runId,
+        kind: 'pending',
         invocationMode: 'non-blocking',
-        output: `[self-implement] non-blocking accepted\nrunId: ${runId}`,
+        requestId,
+        next: lookup,
+        missing: ['runId', 'node'],
+        output: `하니스 요청을 접수했습니다 · 런과 노드는 아직 미관측 · 요청 ID ${requestId}(발사 증거 아님) · 다음 조회: ${lookup} · 이 턴에서 파일을 직접 편집하지 마세요\n[self-implement] non-blocking pending`,
       };
     }
-    return drive();
+    return await drive();
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        kind: 'failed',
+        reason,
+        next: '요청과 실패 이유를 확인한 뒤 다시 요청',
+        missing: ['runId', 'node'],
+        output: `SelfImplement 실패: ${reason} · 다음: 요청과 실패 이유를 확인한 뒤 다시 요청 · 이 턴에서 파일을 직접 편집하지 마세요`,
+      };
+    }
   },
 };

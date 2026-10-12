@@ -4,6 +4,7 @@ import { getUserConfig } from '../user-config.js';
 import { resolve } from 'node:path';
 import type { ModelFamily } from '../models/prompts.js';
 import type { InputSourceKind, InputSourceRef } from '../input/input-source-kind.js';
+import type { ControlTurnIntent, SubmitTurnIntent } from '../input/input-intent.js';
 import { getSessionCwd } from '../session/working-dir.js';
 import {
   armQuickControlOnce,
@@ -22,6 +23,7 @@ import {
 import type { LLMMessage, LLMToolSpec } from '../llm.js';
 import type { LLMToolDef } from '../plugins/core/types.js';
 import type { ToolRunResult, ToolRuntime } from '../tool-runtime/types.js';
+import { blockWriteToolSearchHydration, type ToolSearchRunResult } from '../tool-runtime/tool-search-runtime.js';
 import { findNativeTool, isNativeToolModelExposed } from '../native-tool-catalog.js';
 import { hasAstGrep } from '../skills/tools/ast-grep.js';
 import { buildOmniSearchTool, omniSearchAvailable } from '../skills/tools/omni-search.js';
@@ -1731,6 +1733,8 @@ const ESSENTIAL_NATIVE_RULE_IDS = [
   'agent', 'agent-output', 'agent-reply', 'agent-stop', 'agent-list', 'self-implement', 'self-orchestrate', 'dev-harness',
 ] as const;
 const ESSENTIAL_HOST_FAMILY_IDS = ['self-ops', 'release-read'] as const;
+// Keep this TUI essential addition out of the shared control/agent self-ops family.
+const ESSENTIAL_HOST_EXTRA_NAMES = ['logs_query'] as const;
 const ESSENTIAL_RUNTIME_FAMILY_IDS = ['bash', 'run-shell', 'pty-shell', 'run-tests', 'elanous_skills_list', 'skill_exec', 'code-grounding'] as const;
 const ESSENTIAL_OPTIONAL_TOOL_NAMES = [
   'GetDashboardState',
@@ -1764,7 +1768,11 @@ function buildEssentialSessionRuntimeToolSpecs(opts: {
         .filter((tool): tool is LLMToolDef => !!tool)
         .map(toSpec)
       : [];
-  });
+  }).concat(ESSENTIAL_HOST_EXTRA_NAMES
+    .filter(name => isToolAvailable(name, opts.toolAvailability))
+    .map(name => hostByName.get(name))
+    .filter((tool): tool is LLMToolDef => !!tool)
+    .map(toSpec));
   const runtimeById = new Map(opts.runtimeTools.map(tool => [tool.id, tool] as const));
   const runtimeSpecs = ESSENTIAL_RUNTIME_FAMILY_IDS.flatMap(id => {
     const rule = RUNTIME_TOOL_FAMILY_RULE_MAP.get(id);
@@ -1833,12 +1841,23 @@ export function buildSessionRuntimeToolSpecs(opts: {
   // toolset (incident 2026-05-04 — Opus replied "no file tools in this
   // session" while Bash was actually exposed at position 7+).
   const finalSpecs: LLMToolSpec[] = opts.rich === false
-    ? buildEssentialSessionRuntimeToolSpecs({
-        hostTools: opts.hostTools,
-        runtimeTools: opts.runtimeTools ?? [],
-        optionalTools: opts.optionalTools ?? [],
-        toolAvailability: opts.toolAvailability,
-      })
+    ? (() => {
+        const essentialSpecs = buildEssentialSessionRuntimeToolSpecs({
+          hostTools: opts.hostTools,
+          runtimeTools: opts.runtimeTools ?? [],
+          optionalTools: opts.optionalTools ?? [],
+          toolAvailability: opts.toolAvailability,
+        });
+        if (!hasDevHarnessIntent(opts.userText)) return essentialSpecs;
+        const droppedNames = new Set(['Edit', 'Write']);
+        const filteredSpecs = essentialSpecs.filter(spec => !droppedNames.has(spec.name));
+        if (filteredSpecs.length !== essentialSpecs.length) {
+          debug.log('session-runtime.tools', 'harness-phrase-write-tools-dropped', {
+            dropped: ['Edit', 'Write'],
+          });
+        }
+        return filteredSpecs;
+      })()
     : [
         ...dynamicNativeTools,
         ...hostSpecs,
@@ -2084,6 +2103,10 @@ export async function dispatchSessionRuntimeTool(
   args: Record<string, unknown>,
   deps: SessionRuntimeDispatchDeps,
 ): Promise<unknown> {
+  const finishRuntimeResult = (result: unknown): unknown =>
+    name === 'ToolSearch' && isDevHarnessIntent(deps.userText ?? '')
+      ? blockWriteToolSearchHydration(result as ToolSearchRunResult)
+      : result;
   // Fix W-bis (2026-04-25): codex family always enables scoped-analysis
   // mode regardless of userText vocabulary. Rationale (see docs/RESEARCH-
   // codex-reread-pathology-2refs-2026-04-25.md): codex's search-heavy
@@ -2178,8 +2201,9 @@ export async function dispatchSessionRuntimeTool(
   const nativeRuntime = nativeRule?.preferRuntime ? deps.getToolRuntime(name) : undefined;
   if (nativeRuntime) {
     const result = await deps.dispatchToolRuntime(name, normalizedArgs, deps.toolCallId);
-    rememberCandidateListingResult(name, normalizedArgs, result, scopedAnalysis, deps.searchPlannerState);
-    return result;
+    const safeResult = finishRuntimeResult(result);
+    rememberCandidateListingResult(name, normalizedArgs, safeResult, scopedAnalysis, deps.searchPlannerState);
+    return safeResult;
   }
   if (nativeRule?.dispatch) {
     let result: unknown;
@@ -2213,8 +2237,9 @@ export async function dispatchSessionRuntimeTool(
     const isPtyTool = name.startsWith('PtyShell') || name.startsWith('pty_shell');
     if (!isPtyTool || deps.ptyDashboardOn) {
       const result = await deps.dispatchToolRuntime(name, normalizedArgs, deps.toolCallId);
-      rememberCandidateListingResult(name, normalizedArgs, result, scopedAnalysis, deps.searchPlannerState);
-      return result;
+      const safeResult = finishRuntimeResult(result);
+      rememberCandidateListingResult(name, normalizedArgs, safeResult, scopedAnalysis, deps.searchPlannerState);
+      return safeResult;
     }
   }
 
@@ -2697,6 +2722,25 @@ function hasOpsFleetIntent(text: string): boolean {
 
 function hasDevHarnessIntent(text: string): boolean {
   return hasAny(text, DEV_HARNESS_INTENT_TERMS);
+}
+
+export function isDevHarnessIntent(text: string): boolean {
+  return hasDevHarnessIntent(text);
+}
+
+/** The dashboard calls this immediately after submitIntent resolution. A
+ * fixed plain turn becomes the same control turn used by `/harness ask`, so
+ * the model dispatch branch is never reached for that turn. */
+export function routeDevHarnessSubmitIntent(
+  intent: SubmitTurnIntent | ControlTurnIntent,
+): SubmitTurnIntent | ControlTurnIntent {
+  if (intent.kind !== 'submit-turn' || intent.route !== 'plain' || !isDevHarnessIntent(intent.text)) return intent;
+  return {
+    kind: 'control-turn',
+    source: intent.source,
+    command: 'slash-command',
+    commandText: `/harness ask ${intent.text}`,
+  };
 }
 
 export function shouldExposeDevHarnessSessionTool(text: string): boolean {

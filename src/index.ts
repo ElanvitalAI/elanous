@@ -38,6 +38,7 @@ import { DEV_PIPELINE_SINK_SURFACE } from './self-implement/self-cli-sink-surfac
 import { registerPrivateLedgerCommands } from './cli/private-ledger-commands.js';
 import { registerKnowCommand } from './cli/know-cli.js';
 import { registerSeatRequestsCommands } from './cli/seat-requests-cli.js';
+import { registerSeatBootCommands } from './cli/seat-cli.js';
 import { applyTestStateDirFlagFromArgv } from './cli/test-state-dir-flag.js';
 import { applyTestFlagFromArgv, observeTestFlagOwnership, uncoveredTestFlagPaths, staleTestFlagPaths } from './cli/test-flag.js';
 import { registerPtyTakeoverCommands } from './cli/pty-takeover-cli.js';
@@ -1118,6 +1119,7 @@ hqCmd.command('fence').description('이 호스트가 임대를 쥐었을 때만 
     process.exitCode = hqFenceRun(opts.role as 'cron', command);
   });
 const seatCmd = program.command('seat').description('분배된 자리의 하루 루프와 보고');
+registerSeatBootCommands(seatCmd);
 registerSeatRequestsCommands(seatCmd);
 seatCmd.command('asks').description('최근 CTO 되묻기 왕복과 10분 판정')
   .option('--since <duration>', '조회 창 (예: 24h)', '24h')
@@ -3352,6 +3354,7 @@ coordCmd.command('events')
   });
 
 const selfCmd = program.command('self').description('Self-awareness memory — 외부 도구(Claude Code/Codex)가 구현/변경 이력을 elanous 기억에 주입·회상');
+{ const { registerSelfUtterancesCommand } = await import('./cli/self-utterances-cli.js'); registerSelfUtterancesCommand(selfCmd); }
 
 // M12 Claude Code 의존도 계기판 — `elanous self dependence [--since] [--until] [--json]`(읽기만).
 { const { registerDependenceCommand } = await import('./cli/dependence-gauge.js'); registerDependenceCommand(selfCmd); }
@@ -5744,6 +5747,19 @@ selfCmd
       envModel: () => process.env.ELANOUS_PR_REVIEW_MODEL,
     });
     if (opts.json) await writeStdoutJson(selfReviewJsonLine(results));
+    // Detached TA review: stdout is now complete in its result file. Resume only the bound card.
+    try {
+      const { rejudgeCompletedTaskReview, TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_STATE_ENV, TA_REVIEW_COMPLETION_RESULT_ENV } = await import('./task-agent/review-result-capture.js');
+      const completionEnv: Record<string, string | undefined> = {};
+      for (const key of [TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_STATE_ENV, TA_REVIEW_COMPLETION_RESULT_ENV]) {
+        const value = process.env[key];
+        if (value) completionEnv[key] = value;
+        delete process.env[key];
+      }
+      await rejudgeCompletedTaskReview(completionEnv);
+    } catch (error) {
+      try { debug.log('task-agent', 'review-completion-rejudge-failed', { reason: String(error).slice(-300) }, { level: 'warn' }); } catch { /* fail-soft */ }
+    }
     if (failed >= 1) process.exitCode = 1;
   });
 
@@ -5822,22 +5838,25 @@ selfCmd
   .description('외부 도구 발화를 elanous 기억에 주입 — origin/git/branch/cwd/시간 태그(회상이 "누가 언제 어디서" 구분). text=--text 또는 stdin')
   .option('-s, --text <text>', '발화 원문(생략 시 stdin)')
   .option('--source <origin>', 'claude-code|codex|gemini|…', 'claude-code')
+  .option('--origin <origin>', '발화 주체: human|agent (기본 agent)')
   .option('--session <id>', '세션 id')
   .option('--git-hash <hash>', '발화 시점 git HEAD(short)')
   .option('--branch <name>', 'git 브랜치')
   .option('--cwd <dir>', '작업 디렉토리')
   .option('--ts <iso>', 'ISO 시간(기본 now)')
   .option('-i, --importance <n>', '0-10 현저성', '5')
-  .action(async (opts: { text?: string; source: string; session?: string; gitHash?: string; branch?: string; cwd?: string; ts?: string; importance: string }) => {
+  .action(async (opts: { text?: string; source: string; origin?: string; session?: string; gitHash?: string; branch?: string; cwd?: string; ts?: string; importance: string }) => {
+    if (opts.origin !== undefined && opts.origin !== 'human' && opts.origin !== 'agent') { ui.error('utterance: --origin must be human or agent'); process.exitCode = 1; return; }
     let text = opts.text;
     if (!text) text = await readPipedStdin();   // ★ OBS-T3
     if (!text || !text.trim()) { ui.error('utterance: --text 또는 stdin 필요'); process.exit(1); }
     // 독립 CLI 프로세스 — 데몬 StoreSink 를 상속 안 하므로 logs.db 싱크를 붙여야
     // injectUtterance 의 `debug.log('memory.utterance','ingress')` 가 logs.db 에 닿음(제1원칙 관측).
-    const { injectUtterance } = await import('./domains/self-awareness.js');
-    const r = injectUtterance({
+    const { recordSelfUtterance } = await import('./cli/self-utterances-cli.js');
+    const r = recordSelfUtterance({
       text: text.trim(),
       origin: opts.source,
+      utteranceOrigin: opts.origin === 'human' ? 'human' : 'agent',
       ...(opts.session ? { sessionId: opts.session } : {}),
       ...(opts.gitHash ? { gitHash: opts.gitHash } : {}),
       ...(opts.branch ? { branch: opts.branch } : {}),
@@ -11722,7 +11741,10 @@ async function main(): Promise<void> {
   // 한다. 인터랙티브 TUI 는 데몬 sink 를 상속 안 하므로 안 붙이면 debug.log 가 no-op
   // (제1원칙 관측 갭 · tui-sim 드라이브에서 agent.source 0건으로 실측 2026-07-19).
   // PR#4622(self utterance CLI)·session-cli 미러. fail-open·비블로킹.
+  const bootTimer = (await import('./dashboard/boot-timing.js')).createBootTimer();
+  bootTimer.begin();
   try { await (await import('./domains/standalone-log-sink.js')).registerStandaloneLogSink('tui'); } catch { /* fail-open */ }
+  bootTimer.phase('log-sink');
   // P3(대표 2026-07-26) — footgun 관측을 logs.db 에 도달시킨다. 초반(arg 파싱 前) warnProdSpawnFootgun 은
   //   StoreSink 등록 前이라 debug.log 가 logs.db 미도달이었다(순서 갭). sink 등록 직후 관측만 재발행(stderr 중복 X).
   try { (await import('./instance-root-coherence.js')).warnProdSpawnFootgun({ emit: 'log' }); } catch { /* fail-open */ }
@@ -11732,7 +11754,9 @@ async function main(): Promise<void> {
   // so `elanous self screen` / `/v1/terminals` / (P2) PWA can see the
   // dashboard the user is actually looking at. Off unless this boots
   // (no producer in headless/daemon paths). fail-soft·비블로킹.
+  bootTimer.begin();
   try { (await import('./capture/tui-self-report.js')).startTuiSelfReport(); } catch { /* fail-soft */ }
+  bootTimer.phase('self-report');
 
   // Dashboard handles sync inline — only returns on quit
   // ⛔ stdin 이 TTY 가 아니면 «뜨지 않는다» — 뜨면 readKey 가 엔터를 지어내 초당 수백 프레임을
@@ -11745,7 +11769,14 @@ async function main(): Promise<void> {
       return;
     }
   }
-  await showDashboard(dashboardOpts);
+  bootTimer.begin();
+  await showDashboard({
+    ...dashboardOpts,
+    onFirstFrameRendered: () => {
+      bootTimer.phase('show-dashboard');
+      bootTimer.done();
+    },
+  });
   closeTui();
   // Force exit: the dashboard starts background timers (clipboard
   // poller, shimmer/blink animations) that keep the Bun event loop

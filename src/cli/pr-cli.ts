@@ -1195,6 +1195,59 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   const cwd = opts.cwd ?? process.cwd();
   const run = deps.run ?? defaultCmdRunner;
   const pinned = opts.pr !== undefined || opts.expectedHead !== undefined;
+  if (opts.dryRun && opts.pr !== undefined && opts.expectedHead === undefined) {
+    if (opts.overlapEvidence !== undefined || opts.hold) {
+      out.error('✗ dry-run: --overlap-evidence 와 --hold 는 번호 지정 읽기 전용 미리보기에서 사용할 수 없습니다.');
+      return 1;
+    }
+    const pr = Number(opts.pr);
+    if (!/^[1-9]\d*$/.test(opts.pr) || !Number.isSafeInteger(pr)) {
+      out.error('✗ dry-run: --pr 에는 양의 정수를 지정해야 합니다.');
+      return 1;
+    }
+    const viewed = run('gh', ['pr', 'view', String(pr), '--json', 'headRefOid,state,headRefName,isDraft,mergeable,mergeStateStatus,url'], { cwd });
+    if (!viewed.ok) {
+      out.error(`✗ dry-run: PR #${pr} 를 조회하지 못했습니다 — 존재하지 않거나 GitHub 조회가 실패했습니다.`);
+      return 1;
+    }
+    let value: { headRefOid?: string; state?: string; headRefName?: string; isDraft?: boolean; mergeable?: string; mergeStateStatus?: string; url?: string };
+    try {
+      const parsed: unknown = JSON.parse(viewed.out);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+      value = parsed as typeof value;
+    }
+    catch {
+      out.error(`✗ dry-run: PR #${pr} 조회 결과를 읽을 수 없습니다.`);
+      return 1;
+    }
+    if (typeof value.headRefOid !== 'string' || !/^[a-f0-9]{40}$/i.test(value.headRefOid) || value.state !== 'OPEN') {
+      out.error(`✗ dry-run: PR #${pr} 가 열려 있지 않거나 head 정보가 없습니다 (state=${value.state ?? 'unmeasured'}).`);
+      return 1;
+    }
+    out.log(`PR #${pr} · head ${value.headRefOid} · state ${value.state}${value.headRefName ? ` · branch ${value.headRefName}` : ''}`);
+    out.log('Landing plan (read-only preview):');
+    out.log(`- GitHub PR state/head: PASS (${value.state}, ${value.headRefOid})`);
+    if (value.isDraft === true) out.log('- Draft status: GitHub reports DRAFT; landing eligibility UNMEASURED.');
+    else if (value.isDraft === false) out.log('- Draft status: observed — ready for review.');
+    else if (value.isDraft !== false) out.log('- Draft status: UNMEASURED');
+    if (value.mergeable === 'CONFLICTING') out.log('- Warning: GitHub reports merge conflicts; landing eligibility UNMEASURED.');
+    else if (value.mergeable === 'MERGEABLE') out.log('- Mergeability: GitHub reports MERGEABLE; repository landing gates remain UNMEASURED.');
+    else out.log(`- Mergeability: UNMEASURED${value.mergeable ? ` (${value.mergeable})` : ''}`);
+    if (value.mergeStateStatus === 'BLOCKED' || value.mergeStateStatus === 'DIRTY' || value.mergeStateStatus === 'DRAFT') {
+      out.log(`- Warning: GitHub merge state is ${value.mergeStateStatus}; landing eligibility UNMEASURED.`);
+    } else if (value.mergeStateStatus && value.mergeStateStatus !== 'CLEAN') {
+      out.log(`- GitHub merge state: ${value.mergeStateStatus} (additional requirements may apply; landing eligibility UNMEASURED).`);
+    }
+    out.log('- Local HEAD/worktree, branch/base, and same-branch guard: UNMEASURED — local git is not run');
+    out.log('- Changed-file scope, active-run files, untracked files, plan artifacts, and deletion advisory: UNMEASURED — local files are not read');
+    out.log('- Typecheck, isolation, mock-module restore, model-hardcode, daemon-port, test-interference, and global checks: UNMEASURED — gates are not run');
+    out.log('- Public export/import, public leak, and docs CLI checks: UNMEASURED — gates are not run');
+    out.log('- Android, iOS, and PWA gates: CONDITIONAL / UNMEASURED — changed-file applicability and builds are not checked');
+    out.log('- Freeze, PR base/bench guards, sibling PRs, recent landings, overlap, and approval: UNMEASURED — not queried or approved');
+    out.log('- GitHub draft/mergeability status: observed above; this preview does not approve or merge the PR.');
+    out.log('- Mutations (ready/edit/create/merge, git commit/push, worktree): NOT RUN');
+    return 0;
+  }
   if (opts.overlapEvidence !== undefined && (!pinned || !opts.overlapEvidence.trim())) {
     out.error('✗ overlap-evidence: --overlap-evidence <file> 는 --pr ⊕ --expected-head 머리 고정 착지에서만 쓴다.');
     return 1;

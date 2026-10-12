@@ -42,6 +42,28 @@ function def(over: Partial<MissionDefinition> = {}): MissionDefinition {
 }
 
 describe('PX-4 P3 — runMissionEvaluator', () => {
+  test('immediate exit with unread large stdin keeps evaluator output and exit status', async () => {
+    const dir = scratchDir();
+    const input = {
+      missionId: 'm1', iteration: 1, workDir: dir,
+      goalContent: 'x'.repeat(1024 * 1024), sandboxContent: '',
+    };
+    for (const [command, expected] of [
+      ['echo \'{"done":true,"score":0.75}\'', 'json'],
+      ['exit 7', 'exit 7'],
+    ] as const) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const result = await runMissionEvaluator(
+          def({ evaluator: { command, format: 'json', timeoutMs: 5_000 } }), input,
+        );
+        if (expected === 'json') {
+          expect(result.done).toBe(true);
+          expect(result.score).toBe(0.75);
+        } else expect(result.error).toBe(expected);
+      }
+    }
+  });
+
   test('parses JSON stdout into MissionResult', async () => {
     const dir = scratchDir();
     writeFileSync(join(dir, 'mission.md'), 'goal');

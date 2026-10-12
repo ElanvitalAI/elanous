@@ -50,14 +50,14 @@ describe('resolveCurrentInstance', () => {
     expect(result.root).toBe(explicitRoot);
   });
 
-  test('with no flag or stamp, a source tree stays isolated even if the retired switch is disabled', () => {
+  test('with no flag or stamp, source tree location does not select test', () => {
     const result = withStateDir(undefined, () => resolveCurrentInstance({
       explicitFlagRoot: () => undefined,
       treeDerivedEnabled: () => false,
     }));
 
-    expect(result.kind).toBe('test');
-    expect(result.layer).toBe('tree-derived');
-    expect(result.root).toBe(join(process.cwd(), '.elanous-test'));
+    expect(result.kind).toBe('prod');
+    expect(result.layer).toBe('default');
+    expect(result.root).toBe(prodInstanceRoot());
   });
 });

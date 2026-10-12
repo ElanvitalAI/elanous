@@ -75,6 +75,66 @@ export function _setCreateGoalAuthorDecomposeStepsForTesting(fn?: CreateGoalAuth
 /** 진행 종료 스테이지(phase='end') — 그 외는 delta(start 제외). */
 const END_STAGES: readonly SelfImplementProgressStage[] = ['pr-opened', 'aborted', 'gate-failed', 'pr-declined'];
 
+// ⭐ 결과 네 꼴(HARNESS-RESULT-CONTRACT · RFC-tui-tool-surface-on-graph-harness §4 · 0.2.26) —
+//   종전 `{observed:true}` 한 비트는 모델이 «안 됐다 → 직접 편집»으로 읽었다(UX S1-02 · 47 도구).
+//   ⇒ launched / pending / observed-only / failed 네 꼴로 구조화해 «다음 행동»을 문면으로 고정한다.
+//   ⚠️ launched 꼴은 SelfImplementResult 필드를 **그대로 보존**한다 — runId 조인·원장 소비자 무손상.
+export type SelfImplementLaunchedToolResult = SelfImplementResult & { runId: string; kind: 'launched'; message: string; next: string; missing: string[] };
+export type SelfImplementPendingToolResult = Partial<SelfImplementResult> & { kind: 'pending'; message: string; next: string; missing: string[] };
+export type SelfImplementObservedOnlyToolResult = { kind: 'observed-only'; observed: true; message: string; next: string; missing: ['runId', 'node'] };
+export type SelfImplementFailedToolResult = Partial<SelfImplementResult> & { kind: 'failed'; reason: string; message: string; next: string; missing: string[] };
+export type SelfImplementToolResult = SelfImplementLaunchedToolResult | SelfImplementPendingToolResult | SelfImplementObservedOnlyToolResult | SelfImplementFailedToolResult;
+
+/** 하니스가 런을 맡았다 — 파일 편집은 하니스 몫이므로 모델의 직접 Write/Edit 을 문면으로 막는다. */
+export function buildLaunchedToolResult(result: SelfImplementResult): SelfImplementLaunchedToolResult | SelfImplementPendingToolResult {
+  if (!result.runId) return buildPendingToolResult(result);
+  const runId = result.runId;
+  const node = result.node || null;
+  const missing = node ? [] : ['node'];
+  const query = `eln self run ${runId}`;
+  return {
+    ...result,
+    runId,
+    kind: 'launched',
+    next: query,
+    missing,
+    message: `하니스가 맡았습니다 · 런 ${runId} · 노드 ${node ?? '미관측'} · 다음 조회: ${query} · 이 턴에서 파일을 직접 편집하지 마세요`,
+  };
+}
+
+/** 완료 또는 접수는 관측했지만 실제 런 ID가 없어 발사를 단언할 수 없다. */
+export function buildPendingToolResult(result: SelfImplementResult): SelfImplementPendingToolResult {
+  const { runId: _unconfirmedRunId, ...observed } = result;
+  return {
+    ...observed,
+    kind: 'pending',
+    next: 'eln self running-runs',
+    missing: ['runId', ...(result.node ? [] : ['node'])],
+    message: '하니스 응답을 받았지만 런 식별자는 아직 미관측입니다 · 진행 중 런 조회: eln self running-runs · 일치하는 런이 없으면 요청을 다시 보내세요 · 이 턴에서 파일을 직접 편집하지 마세요',
+  };
+}
+
+/** 관측 전용 — 런이 발사되지 «않았다»는 사실과 «구현 실패가 아니다»를 함께 말한다. */
+export function buildObservedOnlyToolResult(): SelfImplementObservedOnlyToolResult {
+  return {
+    kind: 'observed-only',
+    observed: true,
+    missing: ['runId', 'node'],
+    next: '실제 발사를 원하면 관측 전용 모드를 끈 뒤 다시 요청하세요',
+    message: '관측 전용이라 런을 발사하지 않았습니다 · 코드도 안 바꿨습니다 · 이 결과를 구현 실패로 읽고 직접 Write/Edit 하지 마세요 · 실제 발사를 원하면 관측 전용 모드를 끈 뒤 다시 요청하세요',
+  };
+}
+
+/** 거부·실패 — 이유와 다음 행동을 구조화해 모델이 재시도·포기·인계를 판단하게 한다. */
+export function buildFailedToolResult(reason: string, result?: SelfImplementResult): SelfImplementFailedToolResult {
+  const next = result?.runId ? `eln self run ${result.runId}` : '요청과 실패 이유를 확인한 뒤 다시 요청하세요';
+  return {
+    ...(result ?? {}), kind: 'failed', reason, next,
+    missing: [...(result?.runId ? [] : ['runId']), ...(result?.node ? [] : ['node'])],
+    message: `하니스가 발사되지 않았거나 실패했습니다: ${reason} · 다음: ${next} · 이 턴에서 파일을 직접 편집하지 마세요`,
+  };
+}
+
 /**
  * ★ base seam 에 막(SurfaceUx) 배선을 얹는다(P0·테스트 가능). approvePr=ux.confirm(fail-closed)·
  * onProgress=ux.progress. 코어(runSelfImplement)·다른 seam(worktree/implement/gate/openPr)은 무손상.
@@ -180,9 +240,10 @@ export async function dispatchSelfImplement(
   authorGoal: SelfImplementGoalAuthor = writeAuthoredGoal,
   runCli: RunSelfImplementCliFn = runSelfImplementCliCommand,
   seamsFactory?: SelfImplementSeamsFactory,
-): Promise<unknown> {
+): Promise<SelfImplementToolResult> {
   const feature = typeof args.feature === 'string' ? args.feature.trim() : '';
-  if (!feature) return { error: 'SelfImplement: `feature` is required' };
+  if (!feature) return buildFailedToolResult('SelfImplement: `feature` is required');
+  try {
   const base = typeof args.base === 'string' && args.base.trim() ? args.base.trim() : undefined;
   const draft = typeof args.draft === 'boolean' ? args.draft : true;
   const entry = resolveDispatchEntry(ctx);
@@ -216,7 +277,7 @@ export async function dispatchSelfImplement(
   debug.log('daemon-tools.self-implement', 'runtime.observe-only-decision', { surface: ux.surface, observeOnly: observeOnly.enabled, observeOnlySource: observeOnly.source });
   if (observeOnly.enabled) {
     debug.log('daemon-tools.self-implement', 'runtime.observed', { surface: ux.surface, observeOnly: observeOnly.enabled, observeOnlySource: observeOnly.source });
-    return { observed: true };
+    return buildObservedOnlyToolResult();
   }
 
   let goalFile: string | undefined;
@@ -298,5 +359,12 @@ export async function dispatchSelfImplement(
   // ⭐ runId 를 반드시 싣는다 — 관측이 전부 runId 로 키잉되므로(`self run <runId>`·`logs --grep`)
   //   이게 없으면 **이 경계에서 조인이 끊긴다**(N3 재측정 2026-07-28: 계약은 섰는데 로그가 못 따라갔다).
   debug.log('daemon-tools.self-implement', 'done', { runId: result.runId, stage: result.stage, ok: result.ok, pr: result.prUrl ?? null });
-  return result;
+  return !result.ok
+    ? buildFailedToolResult(result.detail ?? result.stage, result)
+    : result.runId ? buildLaunchedToolResult(result) : buildPendingToolResult(result);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    debug.log('daemon-tools.self-implement', 'failed', { reason, stage: 'dispatch' });
+    return buildFailedToolResult(reason);
+  }
 }

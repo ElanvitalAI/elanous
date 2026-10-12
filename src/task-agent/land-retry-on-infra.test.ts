@@ -52,6 +52,15 @@ function fixture(seed: Partial<TaskCard> = {}) {
 }
 
 describe('TA-LAND-RETRY-ON-INFRA — 인프라 실패는 같은 머리에 한 번 더 · 판정 거절은 한 번 끝', () => {
+  test('same card/head land claim skips the second concurrent worker with an observable key', async () => {
+    const f = fixture();
+    const results = await Promise.all([f.land('worker-one'), f.land('worker-two')]);
+    expect(results.filter((result) => result.executed)).toHaveLength(1);
+    expect(results.find((result) => !result.executed)?.detail).toContain(`land:ta-lr-1:${HEAD_A.slice(0, 12)} claimed — skip`);
+    expect(f.calls).toHaveLength(1);
+    expect(f.card().landAttempts).toMatchObject([{ pr: 30, head: HEAD_A, ok: true }]);
+  });
+
   test('#26030 재현: infra 실패 1회 → 같은 머리 재시도 허용 → 두 번째도 infra → 더 이상 안 함', async () => {
     const f = fixture();
     f.queue({ status: 1, stdout: '', stderr: EXPECTED_HEAD_LOCAL }, { status: 1, stdout: '', stderr: EXPECTED_HEAD_LOCAL });

@@ -65,6 +65,26 @@ test('enabled calls pod once and logs heavy-on-pod-shadow', async () => {
   expect(result).toBe(local);
 });
 
+test('enabled logs disagreeing Pod verdict without changing local verdict', async () => {
+  const differentPod = { ...pod, baseTip: 'different' };
+  const h = harness(() => differentPod);
+  const result = await runHeavyOnPodShadow({
+    enabled: true,
+    pr: 7,
+    head: 'deadbeef',
+    local,
+    runPod: h.runPod,
+    log: h.log,
+    warn: h.warn,
+  });
+
+  expect(h.calls).toHaveLength(1);
+  expect(h.logs).toHaveLength(1);
+  expect((h.logs[0]![2] as Record<string, unknown>).agree).toBe(false);
+  expect(h.warns).toHaveLength(0);
+  expect(result).toBe(local);
+});
+
 test('pod throw only warns and keeps local verdict', async () => {
   const h = harness(() => {
     throw new Error('pod-down');

@@ -1,6 +1,6 @@
 // RELEASE-LEDGER-UNIVERSE (0.2.20 P0) — a node subprocess launched by a graph from a non-leader tree writes its
-// ledger and logs into the run's (parent's) universe when the run pins it, and re-resolves its own tree-derived
-// universe when it does not (the 10-07 incident: wt-release nodes wrote to ⟨test:wt-release⟩ while the run was prod).
+// ledger and logs into the run's (parent's) universe when the run pins it. Without the pin, a node with no explicit
+// universe uses its operating home, independently of the source tree and the graph run's universe.
 import { afterEach, expect, setDefaultTimeout, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -68,13 +68,24 @@ test('RELEASE-LEDGER-UNIVERSE: a pinned node from a non-leader tree writes ledge
   expect(readFileSync(join(parent, 'release', '0.0.0', 'manifest.json'), 'utf8')).toBe('{}');
 });
 
-test('RELEASE-LEDGER-UNIVERSE: without the pin the same node re-resolves its own tree universe (the incident; other graphs unchanged)', async () => {
+test('RELEASE-LEDGER-UNIVERSE: without the pin the same node uses its operating home, not the graph run universe', async () => {
   const { graph, parent, tree } = setup();
-  const state = await withoutStamp(() => runGraph(graph, { deps: { root: parent } }));
-  expect(state.status).toBe('done');
-  const seen = probeOutput(state.nodes.find((node) => node.nodeId === 'probe')!.output);
-  expect(realpathSync(seen.root)).toBe(realpathSync(join(tree, '.elanous-test')));
-  expect(existsSync(join(parent, 'release'))).toBe(false);
+  const home = join(tree, '..', 'home');
+  const prod = join(home, '.elanous');
+  mkdirSync(home, { recursive: true });
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const state = await withoutStamp(() => runGraph(graph, { deps: { root: parent } }));
+    expect(state.status).toBe('done');
+    const seen = probeOutput(state.nodes.find((node) => node.nodeId === 'probe')!.output);
+    expect(seen).toMatchObject({ root: prod, configDir: prod, releaseLedger: prod, kind: 'prod' });
+    expect(existsSync(join(prod, 'release', '0.0.0', 'manifest.json'))).toBe(true);
+    expect(existsSync(join(parent, 'release'))).toBe(false);
+    expect(existsSync(join(tree, '.elanous-test'))).toBe(false);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+  }
 });
 
 test('RELEASE-LEDGER-UNIVERSE: the release entry decides prod once — a wt-release node writes into the prod release ledger', async () => {

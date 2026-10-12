@@ -81,7 +81,7 @@ export function discoverStopProcesses(runId: string, goalPath: string | null, ta
     const match = /^\s*(\d+)\s+((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\w+\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.+)$/.exec(line);
     if (!match) return { status: 'failed', reason: 'unparseable process table row' };
     const pid = Number(match[1]);
-    const startedAt = Date.parse(match[2]!);
+    const startedAt = Date.parse(`${match[2]!} GMT`);
     if (!Number.isSafeInteger(pid) || !Number.isFinite(startedAt)) return { status: 'failed', reason: 'invalid process table row' };
     if (pid <= 1) continue;
     const args = match[3]!.match(/"[^"]*"|'[^']*'|\S+/g)?.map((part) => part.replace(/^(['"])(.*)\1$/, '$2')) ?? [];
@@ -132,7 +132,9 @@ function stopProcessCwd(pid: number): string | null {
 
 function scanStopProcessTable(runId: string, goalPath: string | null): StopProcessScan {
   let r: ReturnType<typeof spawnSync>;
-  try { r = spawnSync('ps', ['-eo', 'pid=,lstart=,args='], { encoding: 'utf8', timeout: 5_000, maxBuffer: 16 * 1024 * 1024 }); }
+  try { r = spawnSync('ps', ['-eo', 'pid=,lstart=,args='], {
+    encoding: 'utf8', timeout: 5_000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, TZ: 'UTC' },
+  }); }
   catch (error) { return { status: 'failed', reason: String(error) }; }
   if (r.error || r.status !== 0 || typeof r.stdout !== 'string') return { status: 'failed', reason: String(r.error ?? r.stderr ?? `ps status ${r.status}`) };
   return discoverStopProcesses(runId, goalPath, r.stdout, stopProcessCwd);
@@ -201,13 +203,15 @@ export function pidRecordFromLaunchBinding(runId: string, registryDir = launchRe
   return { pid: binding.pid, startedAt: binding.startedAt, ...(binding.argv0 ? { argv0: binding.argv0 } : {}) };
 }
 
-/** macOS·Linux 공통 — `ps -o lstart=` 는 로컬 시각 문자열(초 단위)이다. */
+/** macOS·Linux 공통 — UTC 시작 시각과 상태를 같은 ps 관측에서 읽는다. */
 export function psProcessStartMs(pid: number): number | null {
-  const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 5_000 });
+  const r = spawnSync('ps', ['-o', 'lstart=,stat=', '-p', String(pid)], {
+    encoding: 'utf8', timeout: 5_000, env: { ...process.env, TZ: 'UTC' },
+  });
   if (r.status !== 0) return null;
-  const text = r.stdout.trim();
-  if (!text) return null;
-  const ms = Date.parse(text);
+  const match = /^\s*((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\w+\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(\S+)\s*$/.exec(r.stdout);
+  if (!match || match[2]!.startsWith('Z')) return null;
+  const ms = Date.parse(`${match[1]!} GMT`);
   return Number.isFinite(ms) ? ms : null;
 }
 

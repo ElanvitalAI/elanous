@@ -3,8 +3,11 @@ import { debug } from '../debug/log.js';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { readTaskCard, writeTaskCards, type TaskCard } from '../task-agent/task-hand.js';
+import { rejudgeCardOnHead } from '../task-agent/rejudge-on-head.js';
+import * as rejudgeOnHead from '../task-agent/rejudge-on-head.js';
 import { saveSelfDevRun, loadSelfDevRun, selfDevRunsDir } from './run-store.js';
-import { decideNextRun, superviseRun, madeProgress, countLanded, countBaseCompleted, appendRound, noPrStreakKey, SUPERVISOR_STOP_REASONS, type SupervisorRound, type SupervisorStopReason } from './run-supervisor.js';
+import { decideNextRun, superviseRun, rejudgeTerminalTaskCard, madeProgress, countLanded, countBaseCompleted, appendRound, noPrStreakKey, SUPERVISOR_STOP_REASONS, type SupervisorRound, type SupervisorStopReason } from './run-supervisor.js';
 
 const merged = (id: string) => ({ taskId: id, feature: id, status: 'done', stage: 'merged', merged: true }) as never;
 const worktreeCompleted = (id: string) => ({ taskId: id, feature: id, status: 'done', stage: 'worktree-completed' }) as never;
@@ -36,6 +39,133 @@ const falseFailure = (id: string) => ({
 }) as never;
 
 describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
+  test('default terminal helper resolves exactly its launched TA land card and calls real rejudge entry', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ta-terminal-default-'));
+    const statePath = join(dir, 'task-agent-actions.json');
+    writeTaskCards(statePath, [
+      { id: 'ta-bound', text: 'feature', createdAt: '2026-10-12T00:00:00.000Z', status: 'launched', runId: 'run-bound', taLand: true, pr: { number: 30 }, history: [] },
+      { id: 'ta-other', text: 'other', createdAt: '2026-10-12T00:00:00.000Z', status: 'launched', runId: 'run-other', taLand: true, history: [] },
+      { id: 'ta-no-pr', text: 'no PR', createdAt: '2026-10-12T00:00:00.000Z', status: 'launched', runId: 'run-no-pr', taLand: true, history: [] },
+    ]);
+    const calls: string[] = [];
+    const rejudge = spyOn(rejudgeOnHead, 'rejudgeAsyncResultCard').mockImplementation(async (id, path) => { calls.push(`${id}:${path}`); return [{ card: id, pr: 30, fromHead: null, toHead: 'f'.repeat(40), step: 'regate', decision: 'would-regate', reason: 'shadow' }]; });
+    try {
+      await rejudgeTerminalTaskCard('run-bound', { statePath, env: {} });
+      await rejudgeTerminalTaskCard('run-no-pr', { statePath, env: {} });
+      await rejudgeTerminalTaskCard('run-missing', { statePath, env: {} });
+      expect(calls).toEqual([`ta-bound:${statePath}`]);
+    } finally { rejudge.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('TA-LAND-AFTER-REVIEW — terminal stop calls the bound-card rejudge once after the shadow move', async () => {
+    const calls: string[] = [];
+    const runId = 'run-ta-terminal-1';
+    const operatorDir = mkdtempSync(join(tmpdir(), 'ta-terminal-rejudge-'));
+    const statePath = join(operatorDir, 'task-agent-actions.json');
+    const head = 'f'.repeat(40);
+    const card: TaskCard = {
+      id: 'ta-terminal-1', text: 'feature ask', createdAt: '2026-10-12T00:00:00.000Z', status: 'launched', runId, taLand: true,
+      pr: { number: 30, url: 'https://github.com/o/r/pull/30' },
+      reviewRequests: [{ pr: 30, head, at: '2026-10-12T00:01:00.000Z', resultPath: join(operatorDir, 'review.json') }],
+      history: [{ at: '2026-10-12T00:02:00.000Z', event: 'live-move-result', kind: 'review', pr: 30, head, verdict: 'pass', reviewed: true, mustFix: 0, resultPath: join(operatorDir, 'review.json'), effect: 'review result captured' }],
+    };
+    writeTaskCards(statePath, [card]);
+    try {
+      await superviseRun({
+        initial: [merged('ta-task')], runStore: { runId, operatorDir },
+        rerun: async (previous) => previous,
+        sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+        taskAgentStatePath: statePath,
+        taskAgentShadow: async () => { calls.push('shadow'); },
+        taskAgentRejudge: async (id, path) => {
+          calls.push(`rejudge:${id}`);
+          return rejudgeCardOnHead(id, {
+            liveMoves: new Set(['review', 'propose-land']),
+            live: { statePath: path, repoCandidates: () => [{ source: 'host', cwd: operatorDir }], prHead: async () => ({ head, state: 'OPEN', url: 'https://github.com/o/r/pull/30' }) },
+            requestRegate: async () => {},
+          });
+        },
+      });
+      expect(calls).toEqual(['shadow', 'rejudge:ta-terminal-1']);
+      expect(readTaskCard('ta-terminal-1', statePath)?.history.some((event) => event.event === 'rejudge-on-head' && event.effect === 'regate-requested')).toBe(false);
+    } finally { rmSync(operatorDir, { recursive: true, force: true }); }
+  });
+
+  test('terminal rejudge retries once after a transient failure', async () => {
+    const runId = 'run-ta-terminal-retry';
+    const operatorDir = mkdtempSync(join(tmpdir(), 'ta-terminal-retry-'));
+    const statePath = join(operatorDir, 'task-agent-actions.json');
+    writeTaskCards(statePath, [{ id: 'ta-terminal-retry', text: 'feature ask', createdAt: '2026-10-12T00:00:00.000Z',
+      status: 'launched', runId, taLand: true, pr: { number: 30, url: 'https://github.com/o/r/pull/30' }, history: [] }]);
+    let attempts = 0;
+    try {
+      await superviseRun({ initial: [merged('ta-task')], runStore: { runId, operatorDir },
+        rerun: async (previous) => previous, sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+        taskAgentStatePath: statePath, taskAgentShadow: async () => {},
+        taskAgentRejudge: async () => { if (++attempts === 1) throw new Error('transient'); return [{ decision: 'would-regate', pr: 30, toHead: 'f'.repeat(40) }]; },
+      });
+      expect(attempts).toBe(2);
+    } finally { rmSync(operatorDir, { recursive: true, force: true }); }
+  });
+
+  test('terminal rejudge retries empty and failed outcomes before logging success', async () => {
+    for (const first of [[], [{ decision: 'land-rejected' }]]) {
+      const runId = 'run-ta-terminal-outcome';
+      const operatorDir = mkdtempSync(join(tmpdir(), 'ta-terminal-outcome-'));
+      const statePath = join(operatorDir, 'task-agent-actions.json');
+      writeTaskCards(statePath, [{ id: 'ta-terminal-outcome', text: 'feature ask', createdAt: '2026-10-12T00:00:00.000Z',
+        status: 'launched', runId, taLand: true, pr: { number: 30, url: 'https://github.com/o/r/pull/30' }, history: [] }]);
+      let attempts = 0;
+      const events: string[] = [];
+      const log = spyOn(debug, 'log').mockImplementation((_category, event) => { events.push(event); });
+      try {
+        await superviseRun({ initial: [merged('ta-task')], runStore: { runId, operatorDir },
+          rerun: async (previous) => previous, sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+          taskAgentStatePath: statePath, taskAgentShadow: async () => {},
+          taskAgentRejudge: async () => ++attempts === 1 ? first : [{ decision: 'would-regate', pr: 30, toHead: 'f'.repeat(40) }],
+        });
+        expect(attempts).toBe(2);
+        expect(events.filter((event) => event === 'terminal-rejudge')).toHaveLength(1);
+      } finally { log.mockRestore(); rmSync(operatorDir, { recursive: true, force: true }); }
+    }
+  });
+
+  test('TA-LAND-AFTER-REVIEW phase ① — superviseRun default completion records land decision without live calls', async () => {
+    const runId = 'run-ta-shadow-default';
+    const operatorDir = mkdtempSync(join(tmpdir(), 'ta-terminal-shadow-'));
+    const statePath = join(operatorDir, 'task-agent-actions.json');
+    const head = 'f'.repeat(40);
+    const reviewPath = join(operatorDir, 'review.json');
+    const regatePath = join(operatorDir, 'regate.json');
+    writeFileSync(reviewPath, JSON.stringify({ pr: '30', verdict: 'pass', mustFix: [], reviewed: true, headCommit: head }));
+    writeFileSync(regatePath, JSON.stringify({ pr: 30, head, passed: true, status: 'passed', baseCommit: 'c'.repeat(40), failures: [] }));
+    writeTaskCards(statePath, [{ id: 'ta-terminal-shadow', text: 'feature ask', createdAt: '2026-10-12T00:00:00.000Z',
+      status: 'launched', runId, taLand: true, pr: { number: 30, url: 'https://github.com/o/r/pull/30' },
+      reviewRequests: [{ pr: 30, head, at: '2026-10-12T00:01:00.000Z', resultPath: reviewPath }],
+      regates: [{ pr: 30, head, at: '2026-10-12T00:02:00.000Z', resultPath: regatePath }], history: [] }]);
+    const shadow: Array<Record<string, unknown>> = [];
+    const live: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+      if (event === 'rejudge-shadow' && data && typeof data === 'object') shadow.push(data as Record<string, unknown>);
+    });
+    try {
+      await superviseRun({ initial: [merged('ta-task')], runStore: { runId, operatorDir },
+        rerun: async (previous) => previous, sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+        taskAgentStatePath: statePath, taskAgentShadow: async () => {},
+        taskAgentRejudgeExternal: {
+          repoCandidates: () => [{ source: 'host', cwd: operatorDir }],
+          prHead: async () => ({ head, state: 'OPEN', branch: 'feature', url: 'https://github.com/o/r/pull/30' }),
+          requestReview: async () => { live.push('review'); },
+          requestRegate: async () => { live.push('regate'); },
+          land: async () => { live.push('land'); return { status: 0, stdout: 'merged' }; },
+        },
+      });
+      expect(shadow).toMatchObject([{ card: 'ta-terminal-shadow', head12: head.slice(0, 12), decision: 'land' }]);
+      expect(live).toEqual([]);
+      expect(readTaskCard('ta-terminal-shadow', statePath)?.landAttempts).toBeUndefined();
+    } finally { log.mockRestore(); rmSync(operatorDir, { recursive: true, force: true }); }
+  });
+
   test('finished merge timeout waits for human harvest instead of no-actionable-work', () => {
     const result = { taskId: 'finished', feature: 'finished', status: 'failed' as const, stage: 'timed-out', branch: 'self-impl/finished', harvestable: true as const };
     const decision = decideNextRun({ results: [result] });

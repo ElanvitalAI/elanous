@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import type { LLMProvider, LLMStreamEvent } from '../llm.js';
 import { debug } from '../debug/log.js';
 import {
-  activeZaiLimit, appendZaiLedger, buildZaiUsageView, classifyZaiError, decideZaiAction, isZaiPeak,
+  activeZaiLimit, appendZaiLedger, buildZaiUsageView, classifyZaiError, decideZaiAction, extractZaiPlanLimitSignal, isZaiPeak,
   makeZaiCodingPlanProvider, parseZaiQuota, readZaiLedger, sumZaiLocalWindows, zaiCredits, zaiWireModel,
   ZaiCodingPlanLimitError, ZaiConcurrencyGate, ZAI_CODING_PLAN_URL,
   type ZaiLedgerRecord, type ZaiOveragePolicy,
@@ -158,6 +158,18 @@ describe('오류 판별 — 1113/1308/1310/1316~1321', () => {
     expect(classifyZaiError(500, 'not json')).toBeNull();
   });
 
+  test('1308 plan-limit 응답을 provider-neutral 신호로 추출하고 다른 오류는 null', () => {
+    const body = JSON.stringify({ error: {
+      code: '1308',
+      message: 'Usage limit reached for the past 5 hours. Resets at 2026-10-11 09:12:33.',
+    } });
+    expect(extractZaiPlanLimitSignal(429, body, 'stop')).toEqual({
+      provider: 'glm', kind: 'plan-limit', resetAt: Date.parse('2026-10-11T09:12:33+08:00'), overage: 'stop',
+    });
+    expect(extractZaiPlanLimitSignal(429, JSON.stringify({ error: { code: '1316', message: 'limit' } }), 'stop')).toBeNull();
+    expect(extractZaiPlanLimitSignal(500, 'not json', 'stop')).toBeNull();
+  });
+
   test('next_flush_time — 문면의 시각(시간대 없으면 UTC+8) · 숫자 칸', () => {
     const msg = 'Usage limit reached for the past 5 hours. Insufficient balance for extra usage. Resets at 2026-10-11 09:12:33.';
     const r = classifyZaiError(429, JSON.stringify({ error: { code: '1316', message: msg } }))!;
@@ -238,6 +250,16 @@ describe('공급자 흐름 — 적산·폴백·멈춤', () => {
       expect(orCalls).toEqual([]);
     });
   }
+
+  test('1308 한도 stop 오류에 구조화 신호를 보존한다', async () => {
+    const resetAt = Date.parse('2026-10-11T09:12:33+08:00');
+    const { provider } = setup('stop', async function* () {
+      throw apiError(429, 1308, 'Usage limit reached for 5 hours. Resets at 2026-10-11 09:12:33.');
+    });
+    await expect(drain(provider.streamChat!([{ role: 'user', content: 'hi' }], {}))).rejects.toMatchObject({
+      planLimitSignal: { provider: 'glm', kind: 'plan-limit', resetAt, overage: 'stop' },
+    });
+  });
 
   test('flash 모델도 사양의 폴백 대상(openrouter/z-ai/glm-5.3)으로 간다', async () => {
     const { provider, orCalls } = setup('openrouter', async function* () { throw apiError(429, 1308, 'Usage limit reached for 5 hours'); });

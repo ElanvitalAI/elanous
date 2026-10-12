@@ -44,6 +44,14 @@ describe('redactSecretText — gitleaks 규칙 이식(탐지)', () => {
     expect(redactSecretText('token=abcd1234efgh')).toContain('token=***');
   });
 
+  test('소문자 키의 비밀 값은 등호와 콜론 모두 가린다', () => {
+    for (const key of ['access_token', 'refresh_token', 'api_key', 'secret', 'password']) {
+      for (const separator of ['=', ': ']) {
+        expect(redactSecretText(`${key}${separator}plainsecretvalue12345`)).toBe(`${key}${separator}***`);
+      }
+    }
+  });
+
   test('환경변수 형태 — 접두 없는 값도 이름으로 가린다', () => {
     expect(redactSecretText('OPENROUTER_API_KEY=abcdef0123456789zz')).toBe('OPENROUTER_API_KEY=***');
     expect(redactSecretText('export GROK_CODE_XAI_API_KEY="q1w2e3r4t5y6"')).toBe('export GROK_CODE_XAI_API_KEY=***"');

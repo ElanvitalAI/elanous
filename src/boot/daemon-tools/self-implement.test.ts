@@ -3,7 +3,7 @@ import { test, expect, describe, beforeEach, afterEach, spyOn } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { _setCreateGoalAuthorDecomposeStepsForTesting, _setObserveOnlyConfigReaderForTesting, _setRecentStepCountReaderForTesting, buildSelfImplementDaemonSpec, buildSelfImplementSurfaceSeams, dispatchSelfImplement, parseRecentStepCountsFromLogRows, readRecentStepCountsFromLogStore, resolveDispatchEntry } from './self-implement.js';
+import { _setCreateGoalAuthorDecomposeStepsForTesting, _setObserveOnlyConfigReaderForTesting, _setRecentStepCountReaderForTesting, buildLaunchedToolResult, buildObservedOnlyToolResult, buildSelfImplementDaemonSpec, buildSelfImplementSurfaceSeams, dispatchSelfImplement, parseRecentStepCountsFromLogRows, readRecentStepCountsFromLogStore, resolveDispatchEntry, type SelfImplementLaunchedToolResult } from './self-implement.js';
 import { summarizeToolResult } from '../daemon-prompt-turn.js';
 import type { SelfImplementResult, SelfImplementSeams } from '../../self-implement/orchestrator.js';
 import type { DefaultSeamsOptions } from '../../self-implement/seams.js';
@@ -99,7 +99,7 @@ describe('dispatchSelfImplement — result addressability', () => {
       { cwd: '/tmp', signal: new AbortController().signal, entry: 'elanous-apparatus' },
       async () => expected,
     );
-    expect(result).toEqual(expected);
+    expect(result).toEqual(buildLaunchedToolResult(expected));
     const payload = JSON.parse(JSON.stringify(result)) as Record<string, unknown>;
     expect(payload.runId).toBe(expected.runId);
     expect(summarizeToolResult(payload)).toBe(`run ${expected.runId} — elanous self run ${expected.runId}`);
@@ -130,7 +130,7 @@ describe('dispatchSelfImplement — result addressability', () => {
       },
     );
     expect(calls).toBe(1);
-    expect(result).toEqual(expected);
+    expect(result).toEqual(buildLaunchedToolResult(expected));
   });
 
   test('caller-only autoMerge reaches both CLI and runner paths while args cannot enable it', async () => {
@@ -432,7 +432,7 @@ describe('dispatchSelfImplement — result addressability', () => {
       async () => expected,
       async () => ({ path: '/tmp/GOAL-feedback-failure.md' }),
     );
-    expect(result).toEqual(expected);
+    expect(result).toEqual(buildLaunchedToolResult(expected));
   });
 
   test('keeps the legacy runner input when user text is absent', async () => {
@@ -558,7 +558,7 @@ describe('dispatchSelfImplement — recentStepCounts wiring', () => {
         return { path: '/goal' };
       },
     );
-    expect(result).toEqual(expected);
+    expect(result).toEqual(buildLaunchedToolResult(expected));
     expect(authorCalls).toBe(1);
     expect(configs).toHaveLength(1);
     expect(configs[0]).toEqual({});
@@ -606,7 +606,10 @@ describe('dispatchSelfImplement — observe-only', () => {
           throw new Error('runner must not start in observe-only mode');
         },
       );
-      expect(result).toEqual({ observed: true });
+      // HARNESS-RESULT-CONTRACT(0.2.26): observe-only 는 이제 observed-only 꼴 —
+      // «런 미발사 ⊕ 코드 무변 ⊕ 구현 실패 아님»을 문면으로 말한다(직접 편집 유도 차단).
+      expect(result).toEqual(buildObservedOnlyToolResult());
+      expect((result as { message?: string }).message).toContain('런을 발사하지 않았습니다');
       expect(calls).toBe(0);
     } finally {
       setUserConfigOverlay(null);
@@ -627,23 +630,36 @@ describe('dispatchSelfImplement — observe-only', () => {
         calls += 1;
         return expected;
       });
-      expect(result).toEqual(expected);
+      // HARNESS-RESULT-CONTRACT(0.2.26): launched 꼴 — 기존 SelfImplementResult 필드는 «그대로 보존»되고
+      // kind·message 만 추가된다(보존 계약: runId 조인·원장 소비자 무손상).
       expect(calls).toBe(1);
+      const launched = result as SelfImplementLaunchedToolResult;
+      expect(launched.kind).toBe('launched');
+      expect(launched.runId).toBe(expected.runId);
+      expect(launched.ok).toBe(expected.ok);
+      expect(launched.stage).toBe(expected.stage);
+      expect(launched.node).toBe(expected.node);
+      expect(launched.outcome).toBe(expected.outcome);
+      expect(launched.message).toContain('run-observe-only-disabled');
+      expect(launched.message).toContain('open-pr');
+      expect(launched.message).toContain('eln self run run-observe-only-disabled');
     } finally {
       setUserConfigOverlay(null);
     }
   });
 
-  test('config 조회 실패: runner를 시작하지 않고 오류를 전파한다', async () => {
+  test('config 조회 실패: runner를 시작하지 않고 failed 결과를 반환한다', async () => {
     let calls = 0;
     _setObserveOnlyConfigReaderForTesting(() => {
       throw new Error('observe-only config unavailable');
     });
     try {
-      await expect(dispatchSelfImplement({ feature: 'fail-closed config read' }, ctx, async () => {
+      const result = await dispatchSelfImplement({ feature: 'fail-closed config read' }, ctx, async () => {
         calls += 1;
         throw new Error('runner must not start when config read fails');
-      })).rejects.toThrow('observe-only config unavailable');
+      });
+      expect(result).toMatchObject({ kind: 'failed', reason: 'observe-only config unavailable', missing: ['runId', 'node'] });
+      expect(result.message).toContain('다음:');
       expect(calls).toBe(0);
     } finally {
       _setObserveOnlyConfigReaderForTesting();

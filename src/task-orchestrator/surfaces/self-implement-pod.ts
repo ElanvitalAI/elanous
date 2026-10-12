@@ -1108,6 +1108,7 @@ if [ "$found" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi`,
             env: [
               ...(o.runId ? [{ name: 'ELANOUS_RUN_ID', value: o.runId }] : []),
               ...(o.parentRunId ? [{ name: 'ELANOUS_PARENT_RUN_ID', value: o.parentRunId }] : []),
+              ...(o.workIdentity?.taskCard ? [{ name: 'ELANOUS_TASK_CARD_ID', value: o.workIdentity.taskCard }] : []),
               { name: 'ELANOUS_SUBSTRATE', value: 'pod' },
               ...Object.entries(controlInboxEnv(POD_CONTROL_INBOX_DIR)).map(([name, value]) => ({ name, value })),
               // ⭐ 런 출처(🅣 RFC run-origin §A3 · #20457/#20468 칸 이름) — Pod 는 자기 elanous_id 를 쓰지 않고 «띄운 감독기»의 hostId 를 물려받는다.

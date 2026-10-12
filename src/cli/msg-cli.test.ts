@@ -53,6 +53,44 @@ test('post reads piped stdin, accepts literal body and kind; human and JSON outp
   expect(JSON.parse(f.stdout[0]!).body).toBe('from flag');
 });
 
+test('post --origin-key deduplicates a channel mirror, accepts a loop address, and rejects a mismatched key', async () => {
+  const f = fixture();
+  const args = ['--from', 'MK', '--to', 'COORDINATOR', '--kind', 'coord', '--origin-key', 'coord:65001:COORDINATOR', '--json'];
+  await f.run('post', '--body', 'first channel body', ...args);
+  const first = JSON.parse(f.stdout.at(-1)!);
+  await f.run('post', '--body', 'changed on retry', ...args);
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual(first);
+  const store = f.store();
+  try { expect(store.list('COORDINATOR')).toEqual([first]); }
+  finally { store.close(); }
+  await f.run('post', '--body', 'wrong target', '--from', 'MK', '--to', 'UX', '--origin-key', 'coord:65001:COORDINATOR');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(f.stderr.at(-1)).toContain('provenance recipient does not match');
+  const reopened = f.store();
+  try { expect(reopened.list('UX')).toEqual([]); }
+  finally { reopened.close(); }
+});
+
+test('post --to ALL reaches other seats and a loop address through the existing list, watch and unread commands', async () => {
+  const f = fixture();
+  await f.run('post', 'one row', '--from', 'OP', '--to', 'ALL', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ from: 'OP', to: 'ALL', body: 'one row' });
+  await f.run('list', '--to', 'MK', '--json');
+  const mk = JSON.parse(f.stdout.at(-1)!) as Array<{ id: number; to: string }>;
+  expect(mk).toHaveLength(1);
+  expect(mk[0]!.to).toBe('ALL');
+  await f.run('list', '--to', 'OP', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([]);
+  await f.run('unread', '--to', 'COORDINATOR', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([{ recipient: 'COORDINATOR', count: 1 }]);
+  await f.run('watch', '--to', 'TC', '--since-ack', '--once', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!).to).toBe('ALL');
+  await f.run('ack', String(mk[0]!.id), '--to', 'MK');
+  await f.run('unread', '--to', 'MK', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([]);
+  expect(f.stderr).toEqual([]);
+});
+
 test('list pages by recipient and cursor; unread and watch are read-only until explicit ack', async () => {
   const f = fixture();
   const store = f.store();
@@ -86,6 +124,32 @@ test('list pages by recipient and cursor; unread and watch are read-only until e
   expect(f.stdout.pop()).toBe('UX: 1 unread');
   const reopened = f.store();
   try { expect(reopened.getCursor('MK')).toBe(3); } finally { reopened.close(); }
+});
+
+test('watch prints only unacknowledged messages for the seat and never acks by itself', async () => {
+  const f = fixture();
+  const store = f.store();
+  try {
+    store.post({ from: 'OP', to: 'MK', body: 'acknowledged' });
+    store.ack('MK', 1);
+    store.post({ from: 'OP', to: 'MK', body: 'unacknowledged' });
+    store.post({ from: 'OP', to: 'UX', body: 'other seat' });
+  } finally { store.close(); }
+
+  const before = f.store();
+  try { expect(before.getCursor('MK')).toBe(1); } finally { before.close(); }
+
+  await f.run('watch', '--to', 'MK', '--since-ack', '--once', '--json');
+  expect(f.stdout.map(line => JSON.parse(line).id)).toEqual([2]);
+  expect(f.stderr).toEqual([]);
+
+  const after = f.store();
+  try { expect(after.getCursor('MK')).toBe(1); } finally { after.close(); }
+
+  await f.run('watch', '--to', 'MK', '--since-ack', '--after', '0', '--once');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(f.stderr.at(-1)).toBe('msg: --since-ack cannot be used with --after');
+  expect(f.stdout).toHaveLength(1);
 });
 
 test('real stdin piping and validation failure use process exit 2 without a stack', () => {

@@ -191,10 +191,15 @@ export async function runDashboardChatMainPlainTurn(
     //     「사다리가 안 걸린 것」과 「걸렸는데 키가 딴 데로 간 것」을 ***원리상 못 갈랐다***.
     // ⭐ 이 한 줄이 그 둘을 가른다 — 이 이벤트가 «있는데» typeahead 가 0이면 후자다.
     // ⛔ 행동을 바꾸지 않는다(관측만). 처방은 `RFC-tui-mid-turn-input-queue-2026-08-19` §2 Q1.
+    const startedAtDate = new Date(deps.turnStartedAt);
+    const turnStartedAtIso = Number.isFinite(startedAtDate.getTime())
+      ? startedAtDate.toISOString()
+      : undefined;
     try {
       deps.debugLog?.('chat-main.plain-turn', 'streaming-keys-attached', {
         userTextBytes: Buffer.byteLength(userText ?? '', 'utf8'),
         turnStartedAt: deps.turnStartedAt,
+        turnStartedAtIso,
       });
     } catch { /* fail-soft — 관측이 턴을 막지 않는다 */ }
     let stage = 'streaming-keys-attached';
@@ -291,11 +296,32 @@ export async function runDashboardChatMainPlainTurn(
     });
 
     if (finishIfAborted()) return;
+    // TUI-FIRST-TURN-STALL — 09:48 표본에서 llm.stream consume-start 뒤
+    // first-token 이벤트가 0건이어서 「첫 토큰까지의 구간」을 잴 표면이 없었다.
+    // turnStartedAt 를 재사용해 첫 비어 있지 않은 text chunk 에 정확히 한 번
+    // chat.turn/first-token 을 남긴다. 도구 호출이 먼저 흘러도 text 가 도착해야
+    // 기록되므로 request→first-token 구간은 그대로 측정된다. ISO 시각 좌표는
+    // pty record 및 TUI-BOOT-TIME(src/index.ts) 부팅 계측과의 대응용이다.
+    let firstTokenLogged = false;
+    const logFirstToken = (chunk: string): void => {
+      if (firstTokenLogged || !chunk || abortCtrl.signal.aborted) return;
+      firstTokenLogged = true;
+      const firstTokenAt = Date.now();
+      try {
+        deps.debugLog?.('chat.turn', 'first-token', {
+          ms: firstTokenAt - deps.turnStartedAt,
+          turnStartedAt: deps.turnStartedAt,
+          turnStartedAtIso,
+          firstTokenAtIso: new Date(firstTokenAt).toISOString(),
+        });
+      } catch { /* fail-soft — 관측이 턴을 막지 않는다 */ }
+    };
     const streamResult = await runDashboardPlainTurnStream({
       userText,
       abortCtrl,
       acpSession: deps.acpSession,
       onText: (chunk, accumulated) => {
+        logFirstToken(chunk);
         turnStreamRuntime.onText(chunk, accumulated);
       },
       onToolCall: (call) => {

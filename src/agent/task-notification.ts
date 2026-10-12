@@ -62,11 +62,39 @@ export class TaskNotificationQueue {
    *  listens to both runner events and a separate `onTaskDone` hook.
    *  Keyed by taskId. */
   private seen = new Set<string>();
+  /** Wake listeners — fired once per REAL enqueue (not on seen-dup).
+   *  TUI-SEAT-READY ③ first shard: one completion event = one wake
+   *  signal so an idle parent can open the next turn. Opening the turn
+   *  itself is deliberately NOT wired here (next shard). */
+  private wakeListeners = new Set<(n: PendingTaskNotification) => void>();
+
+  /** Register a wake listener; returns an unsubscribe function.
+   *  Listeners survive `clear()` — they belong to the wiring, not the
+   *  queue contents. */
+  onEnqueue(listener: (n: PendingTaskNotification) => void): () => void {
+    this.wakeListeners.add(listener);
+    return () => { this.wakeListeners.delete(listener); };
+  }
 
   enqueue(n: PendingTaskNotification): void {
     if (this.seen.has(n.taskId)) return;
     this.seen.add(n.taskId);
     this.queue.push(n);
+    debug.log('agent.task-notification', 'wake', { taskId: n.taskId, size: this.queue.length });
+    for (const listener of this.wakeListeners) {
+      try {
+        listener(n);
+      } catch (error) {
+        // fail-soft — a throwing wake listener must not lose the
+        // queued notification or break sibling listeners.
+        try {
+          debug.log('agent.task-notification', 'wake-listener-failed', {
+            taskId: n.taskId,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        } catch { /* */ }
+      }
+    }
   }
 
   /** Return all pending notifications AND clear the queue. Parents
@@ -85,7 +113,8 @@ export class TaskNotificationQueue {
     return this.queue.length;
   }
 
-  /** Forget everything — tests use this for isolation. */
+  /** Forget everything — tests use this for isolation. Listeners are
+   *  preserved: clear() empties queue + seen, not the wake wiring. */
   clear(): void {
     this.queue = [];
     this.seen.clear();

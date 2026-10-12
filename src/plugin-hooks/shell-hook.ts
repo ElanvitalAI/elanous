@@ -118,6 +118,7 @@ function runShell(opts: RunShellOpts): Promise<RunShellResult> {
     let stdout = '';
     let stderrBuffer = '';
     let killed = false;
+    let stdinError: string | undefined;
     const onAbort = () => {
       if (!killed) {
         killed = true;
@@ -132,6 +133,14 @@ function runShell(opts: RunShellOpts): Promise<RunShellResult> {
     opts.abortSignal.addEventListener('abort', onAbort, { once: true });
 
     child.stdout?.on('data', (chunk) => { stdout += String(chunk); });
+    // A short-lived command can close its read end before end() finishes.
+    // EPIPE says only that stdin was unread; stdout and exit status still
+    // determine the hook result. Other pipe errors are real I/O failures.
+    child.stdin?.on('error', (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EPIPE') return;
+      stdinError = `stdin error: ${err.message}`;
+      opts.onStderr(stdinError);
+    });
     child.stderr?.on('data', (chunk) => {
       stderrBuffer += String(chunk);
       let idx;
@@ -145,13 +154,19 @@ function runShell(opts: RunShellOpts): Promise<RunShellResult> {
       clearTimeout(timer);
       if (stderrBuffer.trim()) opts.onStderr(stderrBuffer.trim());
       // killed => treat as a non-zero exit so dispatcher abort.
-      resolve({ stdout, exitCode: killed ? 124 : (code ?? 1) });
+      resolve({ stdout, exitCode: killed ? 124 : stdinError ? 127 : (code ?? 1), error: stdinError });
     });
     child.on('error', (err) => {
       clearTimeout(timer);
       opts.onStderr(`spawn error: ${err.message}`);
       resolve({ stdout, exitCode: 127 });
     });
-    try { child.stdin?.end(opts.stdin); } catch { /* pipe may have closed */ }
+    try { child.stdin?.end(opts.stdin); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EPIPE') {
+        stdinError = `stdin error: ${(err as Error).message}`;
+        opts.onStderr(stdinError);
+      }
+    }
   });
 }

@@ -1,9 +1,12 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test, spyOn } from 'bun:test';
 import type { LLMToolSpec } from '../src/llm.js';
 import { debug } from '../src/debug/log.js';
 import { buildDashboardOptionalToolSpecs } from '../src/dashboard/optional-tool-spec-runtime.js';
+import { registerDashboardCoreHostTools } from '../src/dashboard/index.js';
 import { recordDashboardToolCatalog } from '../src/dashboard/tool-catalog-observability.js';
 import { buildSessionRuntimeToolSpecs } from '../src/session-runtime/index.js';
+import { PluginHost } from '../src/plugins/core/host.js';
+import { LOGS_QUERY_SPEC } from '../src/domains/logs-tool.js';
 import {
   _resetToolRuntimeRegistryForTest,
   listToolRuntimes,
@@ -25,6 +28,35 @@ function withDiag<T>(fn: () => T): T {
 }
 
 describe('dashboard tool catalog observability', () => {
+  test('live dashboard core host registration exposes and dispatches logs_query once in essential TUI', async () => {
+    const host = new PluginHost({ log: () => {}, hudSet: () => {}, requestRender: () => {}, focusPane: () => {} });
+    registerDashboardCoreHostTools(host);
+    registerAllDefaultToolRuntimes();
+    const assemble = (availability?: Record<string, boolean>) => buildSessionRuntimeToolSpecs({
+      userText: '최근 30분 task-agent 로그에서 exit-classified 몇 건이야?',
+      hostTools: host.hostLLMTools(),
+      runtimeTools: listToolRuntimes('tui'),
+      pluginTools: host.activePluginLLMTools(),
+      toolAvailability: availability,
+      rich: false,
+    });
+    const logs = assemble().filter(spec => spec.name === 'logs_query');
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toEqual(LOGS_QUERY_SPEC);
+    expect(assemble({ logs_query: false }).map(spec => spec.name)).not.toContain('logs_query');
+
+    const registered = host.hostLLMTools().find(tool => tool.name === 'logs_query');
+    expect(registered).toBeDefined();
+    const handlerCall = spyOn(registered!, 'handler');
+    try {
+      const result = await host.dispatchTool('logs_query', { sinceMinutes: 30, event: 'exit-classified' });
+      expect(result.ok).toBe(true);
+      expect(handlerCall).toHaveBeenCalledTimes(1);
+    } finally {
+      handlerCall.mockRestore();
+    }
+  });
+
   test('records every assembled tool name with its surface and assembler', () => {
     const records: Array<{ category: string; event: string; data: unknown }> = [];
     const off = debug.registerSink({

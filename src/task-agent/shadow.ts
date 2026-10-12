@@ -10,17 +10,22 @@
  * - 관측: `debug.log('task-agent', 'shadow-move', …)` → `elanous logs --category task-agent`.
  */
 import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { extname, join, relative, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
-import { readTaskAgentState, readTaskCard, taskAgentStatePath, type CompletionKind, type TaskCard } from './task-hand.js';
+import { readTaskAgentState, readTaskCard, taskAgentStatePath, TASK_CARD_PREFIX, type CompletionKind, type TaskCard } from './task-hand.js';
 import type { SupervisorJobResult, SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import { executeNextAction, type DeliveryKind, type NextAction } from './actions.js';
 import { judgeNextMove, type TaskJudgeInput, type TaskJudgement } from './judge.js';
 import { HARNESS_RUN_ID_ENV } from '../harness/harness-space.js';
-import { collectWiringEvidence, type WiringEvidenceDeps } from './card-evidence.js';
-import { recordLiveMoveHistory } from './live-move-history.js';
+import { appendRunLedgerEntry, loadRunLedger } from '../self-implement/run-ledger.js';
+import { collectWiringEvidence, readCardRunSnapshot, type WiringEvidenceDeps, type CardRunEvidenceDeps } from './card-evidence.js';
+import { remoteLedgerMirrorDir } from './parent-host.js';
+import { prodInstanceRoot } from '../instance/resolve.js';
+import { liveMoveHistoryEntry, recordLiveMoveHistory } from './live-move-history.js';
+import { updateTaskCard } from './task-hand.js';
 import { capturedSelfReview, captureReviewResults, hasCapturedPass } from './review-result-capture.js';
-import { configuredTaskAgentLiveMoves, defaultPrHead, executeLiveGreenProposal, executeLiveLand, executeLiveReview, type LiveMoveDeps, type LiveMoveResult, type TaskAgentLiveMove } from './live-moves.js';
+import { configuredTaskAgentLiveMoves, defaultPrHead, executeLiveDecisionCard, executeLiveGreenProposal, executeLiveLand, executeLiveReview, type LiveMoveDeps, type LiveMoveResult, type TaskAgentLiveMove } from './live-moves.js';
 
 export interface TaskAgentShadowInput {
   runId: string | null;
@@ -46,6 +51,8 @@ export interface TaskAgentShadowMove {
   pr: number | null;
   /** TA-JUDGE-LIVE-SAFE — `taskAgent.liveMoves` 가 이 수를 실제로 했을 때만 실린다(없으면 종전 그대로 그림자). */
   liveMove?: LiveMoveResult;
+  /** 원격 카드 결선이 미결일 때 런 원장 대기열 보존 결과. */
+  cardBinding?: 'pending' | 'queue-failed';
 }
 
 export interface TaskAgentShadowDeps {
@@ -65,7 +72,11 @@ export interface TaskAgentShadowDeps {
   wiring?: Omit<WiringEvidenceDeps, 'card'>;
   /** Process env for the launched-run id (`ELANOUS_RUN_ID`) — test seam; default process.env. */
   env?: NodeJS.ProcessEnv;
+  /** Remote pending-move ledger seam; defaults to the run ledger. */
+  queueMove?: typeof appendRunLedgerEntry;
 }
+
+export const REMOTE_CARD_MOVE_PENDING = 'task-agent-card-move-pending';
 
 /** 카드 조회 상태 파일 — 조회 경로 전부가 같은 파일을 본다. */
 function cardStatePath(deps: TaskAgentShadowDeps): string {
@@ -175,6 +186,13 @@ function shadowCompletion(card: TaskCard | undefined, lookupFailed: boolean): Co
 }
 
 export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, deps: TaskAgentShadowDeps = {}): Promise<TaskAgentShadowMove> {
+  const env = deps.env ?? process.env;
+  const remoteChild = !!env.ELANOUS_POD_NAME;
+  const hintedCard = env.ELANOUS_TASK_CARD_ID?.trim();
+  const pendingCardId = hintedCard?.startsWith(TASK_CARD_PREFIX) && hintedCard.length <= 63 && /^[A-Za-z0-9._-]+$/.test(hintedCard) ? hintedCard : null;
+  const parentRunId = env.ELANOUS_PARENT_RUN_ID?.trim() || null;
+  const matchesLaunchCard = (candidate: TaskCard | undefined): boolean => !!candidate && !!parentRunId
+    && candidate.id === pendingCardId && candidate.runId === parentRunId;
   // TA-REVIEW-RESULT-CAPTURE — 판단 «전»에 지난 live review 의 결과 파일을 회수한다(카드 원장을 아는 때만 · 던지지 않는다).
   //   대기 중인 요청이 없으면 아무것도 쓰지 않는다(결과 파일 없는 카드의 동작은 종전과 같다).
   const reviewLedger = cardLedgerPath(deps);
@@ -188,14 +206,22 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
   let card: TaskCard | undefined;
   let cardLookupFailed = false;
   try {
-    card = successful ? (deps.readCard ? deps.readCard(successful.taskId) : readTaskCard(successful.taskId, cardStatePath(deps))) : undefined;
-    if (!card && successful && !deps.readCard) {
+    // Pod 에 발사 카드 id 가 있으면 그 id 만 믿는다. 같은 문장을 가진 다른 카드가 있어도 묶지 않는다.
+    if (remoteChild) {
+      if (pendingCardId) {
+        const found = deps.readCard ? deps.readCard(pendingCardId) : readTaskCard(pendingCardId, cardStatePath(deps));
+        if (matchesLaunchCard(found)) card = found;
+      }
+    } else if (successful) {
+      card = deps.readCard ? deps.readCard(successful.taskId) : readTaskCard(successful.taskId, cardStatePath(deps));
+    }
+    if (!card && successful && !deps.readCard && !remoteChild) {
       const tasks = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(cardStatePath(deps)).tasks ?? {};
       const matches = Object.values(tasks).filter(candidate => candidate.status === 'launched' && candidate.text === successful.feature);
       if (matches.length === 1) card = matches[0];
     }
     // TA-OWN-ALL-RUNS — 런 소유 카드: 입력 runId ⊕ 상속 ELANOUS_RUN_ID(Pod 자식의 부모 런) 중 카드 runId 와 «정확히» 같은 것만.
-    if (!card && !deps.readCard) card = runCardFor(input.runId, deps);
+    if (!card && !deps.readCard && !remoteChild) card = runCardFor(input.runId, deps);
   } catch {
     // Card lookup is optional; preserve the original PR judgement when unavailable — but mark the completion kind as unmeasured.
     cardLookupFailed = true;
@@ -209,7 +235,7 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
     try {
       const reviewedPr = judgeInput.pr;
       const prRun = input.results.find((result) => result.prNumber === reviewedPr);
-      const prCard = prRun ? (card && successful?.taskId === prRun.taskId ? card : liveCardFor([prRun], deps, input.runId)) : undefined;
+      const prCard = prRun ? (remoteChild ? card : card && successful?.taskId === prRun.taskId ? card : liveCardFor([prRun], deps, input.runId)) : undefined;
       // 회수한 판정은 «리뷰한 머리»의 것이다 — 지금 PR 머리의 결과만 입력으로 쓴다(A 의 pass 로 B 를 land 쪽으로 보내지 않게 ·
       //   여러 머리 결과가 역순으로 회수돼도 지금 머리 것을 고른다). 지금 머리 = 그 런 작업 트리에서 PR 머리 조회 ·
       //   작업 트리가 없으면(Pod) 런이 낸 머리. 못 정하면 쓰지 않는다(종전처럼 review 수 → 새 머리면 새 리뷰).
@@ -278,20 +304,23 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
     move.reason = wouldDo ?? judgement.reason;
     move.wouldDo = null;
   }
-  const liveKind: TaskAgentLiveMove | null = move.move === 'review' || move.move === 'propose-green' || move.move === 'propose-land' ? move.move : null;
+  const liveKind: TaskAgentLiveMove | null = move.move === 'review' || move.move === 'propose-green' || move.move === 'propose-land' || move.move === 'decision-card' ? move.move : null;
   // 판단마다 해석한다 — 허용되지 않은 수를 판단할 때도 모르는 항목 경고가 남게.
   const liveMoves = deps.liveMoves ?? await configuredTaskAgentLiveMoves();
-  const live = liveKind !== null && liveMoves.has(liveKind);
   // 카드 id 는 모든 판단 관측에 싣는다(그림자 일치율을 카드로 잇는다) — 읽기 전용 조회.
   // live 수는 «근거 결과»에 묶는다 — PR 수는 그 PR 을 낸 결과의 카드·작업 트리, 전달은 전달한 카드(다중 결과에서 남의 카드에 쓰지 않게).
   const prResult = typeof judgeInput.pr === 'number' ? input.results.find((result) => result.prNumber === judgeInput.pr) : undefined;
-  const boundCard = delivery
+  const candidateBoundCard = delivery
     ? card
     : prResult
-      ? (card && successful?.taskId === prResult.taskId ? card : liveCardFor([prResult], deps, input.runId))
-      : undefined;
+      ? (card && (successful?.taskId === prResult.taskId || (remoteChild && pendingCardId === card.id)) ? card : liveCardFor([prResult], deps, input.runId))
+      : liveKind === 'decision-card' ? card ?? liveCardFor(input.results, deps, input.runId) : undefined;
+  const boundCard = remoteChild && !matchesLaunchCard(candidateBoundCard) ? undefined : candidateBoundCard;
   // PR 에 묶인 수는 그 PR 의 카드만 관측에 싣는다(못 찾으면 null — 다른 결과의 카드로 대체하지 않는다).
-  const liveCard = prResult || delivery ? boundCard : card ?? (cardLookupFailed ? undefined : liveCardFor(input.results, deps, input.runId));
+  const candidateLiveCard = prResult || delivery ? boundCard : card ?? (cardLookupFailed ? undefined : liveCardFor(input.results, deps, input.runId));
+  const liveCard = remoteChild && !matchesLaunchCard(candidateLiveCard) ? undefined : candidateLiveCard;
+  // 원격 Pod 는 HQ 카드 파일을 갖지 않는다. id 를 전달받아도 현지 원장이 없으면 실행 수는 보류한다.
+  const live = liveKind !== null && liveMoves.has(liveKind) && (!remoteChild || boundCard !== undefined);
   let liveMove: LiveMoveResult | undefined;
   if (live) {
     if (liveKind === 'review') {
@@ -316,6 +345,17 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
             ...(prResult.prUrl ? { prUrl: prResult.prUrl } : {}),
           } } : {}),
         }, liveMoveDeps(deps));
+    } else if (liveKind === 'decision-card') {
+      // Supervisor results carry failure text and reviewer must-fix items, but no screen tail.
+      // A stop reason alone is not evidence: the executor correctly raises no card when both are absent.
+      const evidenceResults = prResult ? [prResult] : input.results;
+      const signature = evidenceResults.find((result) => result.error?.message?.trim())?.error?.message;
+      const mustFix = evidenceResults.flatMap((result) => result.reviewMustFix ?? []);
+      liveMove = await executeLiveDecisionCard(boundCard, {
+        runId: input.runId, stopReason: input.stopReason, reason: move.reason,
+        ...(prResult ? { pr: prResult.prNumber } : {}),
+        evidence: { ...(signature ? { signature } : {}), mustFix },
+      }, liveMoveDeps(deps));
     } else {
       const evidence: Record<string, string> = {};
       if (boundCard && !delivery && judgeInput.prState === 'MERGED' && prResult) evidence[boundCard.id] = `#${prResult.prNumber}`;
@@ -323,11 +363,6 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
       liveMove = executeLiveGreenProposal(boundCard, evidence, liveMoveDeps(deps));
     }
   }
-  // 판단한 수마다 live/shadow 를 남긴다 — OP 가 «오판 건수»·«그림자 일치율»을 카드·수 종류로 잰다.
-  (deps.log ?? ((category, event, data) => debug.log(category, event, data)))('task-agent', 'shadow-move', {
-    ...move, completion: shadowCompletion(card, cardLookupFailed), card: liveCard?.id ?? null, live, liveExecuted: liveMove?.executed ?? false, ...(liveMove ? { liveOk: liveMove.ok } : {}),
-    ...(reviewFromCapture ? { reviewSource: 'captured-review-result' } : {}),
-  });
   // TA-WIRING-CHECK — 병합 PR 은 판단한 «뒤» 배선 근거를 관측만 한다(move 불변 · 실패는 unknown 으로 남기고 던지지 않는다).
   if (judgeInput.prState === 'MERGED' && typeof judgeInput.pr === 'number' && !delivery && liveCard) {
     try {
@@ -339,19 +374,51 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
   }
   // TA-LIVE-MOVE-CARD-HISTORY — live-move 수(review·propose-green·propose-land)는 실행이든 그림자든 그 카드 history 에 한 줄.
   // 결정·실행이 끝난 «뒤»에 덧붙이기만 한다(반환값·관측 무변경) · 실패는 관측만(live-move 를 막지 않는다).
-  if (liveKind !== null) recordLiveMoveOnCard({
+  if (liveKind !== null && (liveKind !== 'decision-card' || live) && (!remoteChild || liveCard)) recordLiveMoveOnCard({
     liveKind, live, liveMove, card: live ? boundCard : liveCard, runId: input.runId,
     pr: prResult?.prNumber ?? (typeof judgeInput.pr === 'number' ? judgeInput.pr : undefined),
     shadowDetail: move.wouldDo ?? move.reason,
   }, deps);
-  return liveMove ? { ...move, liveMove } : move;
+  let cardBinding: TaskAgentShadowMove['cardBinding'];
+  if (liveKind !== null && !liveCard && remoteChild) {
+    const inheritedRunId = parentRunId || env[HARNESS_RUN_ID_ENV]?.trim() || null;
+    const reason = !parentRunId ? 'parent run id absent; HQ binding required'
+      : pendingCardId ? 'card id carried but ledger unavailable' : 'card id absent; parent run lookup required';
+    try {
+      if (!input.runId) throw new Error('runId absent');
+      (deps.queueMove ?? appendRunLedgerEntry)({
+        timestamp: new Date().toISOString(), runId: input.runId, event: REMOTE_CARD_MOVE_PENDING,
+        data: { id: randomUUID(), card: pendingCardId, parentRunId: inheritedRunId, kind: liveKind, pr: move.pr,
+          detail: move.wouldDo ?? move.reason, reason, executorResult: 'shadow' },
+      });
+      cardBinding = 'pending';
+    } catch (error) {
+      cardBinding = 'queue-failed';
+      try {
+        (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', 'card-binding-queue-failed',
+          { card: pendingCardId, runId: input.runId, parentRunId: inheritedRunId, kind: liveKind, reason: error instanceof Error ? error.message : String(error) });
+      } catch { /* queue failure remains visible in the return value */ }
+    }
+    if (cardBinding === 'pending') try {
+      (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', 'card-binding-pending',
+        { card: pendingCardId, runId: input.runId, parentRunId: inheritedRunId, kind: liveKind, reason });
+    } catch { /* queued evidence remains authoritative */ }
+  }
+  // 판단 관측은 원격 미결 수를 실제 원장에 기록한 결과까지 확정한 뒤 남긴다.
+  (deps.log ?? ((category, event, data) => debug.log(category, event, data)))('task-agent', 'shadow-move', {
+    ...move, completion: shadowCompletion(card, cardLookupFailed), card: liveCard?.id ?? pendingCardId,
+    live, liveExecuted: liveMove?.executed ?? false, ...(liveMove ? { liveOk: liveMove.ok } : {}),
+    ...(cardBinding ? { cardBinding } : {}),
+    ...(reviewFromCapture ? { reviewSource: 'captured-review-result' } : {}),
+  });
+  return { ...move, ...(liveMove ? { liveMove } : {}), ...(cardBinding ? { cardBinding } : {}) };
 }
 
 /**
  * 런 id 폴백 — 입력 runId(슈퍼바이저 · Pod 면 자식 런) → 상속 `ELANOUS_RUN_ID`(발사기가 넘긴 부모 런) 순으로,
  * 카드 runId 와 정확히 같고 그 카드가 하나뿐일 때만 쓴다. 못 찾으면 추측하지 않고 이유 한 줄을 남긴다(조용한 미스 0).
  */
-function runCardFor(runId: string | null | undefined, deps: TaskAgentShadowDeps): TaskCard | undefined {
+export function runCardFor(runId: string | null | undefined, deps: TaskAgentShadowDeps): TaskCard | undefined {
   const own = runId?.trim() || undefined;
   const inherited = (deps.env ?? process.env)[HARNESS_RUN_ID_ENV]?.trim() || undefined;
   if (!own && !inherited) return undefined;
@@ -368,6 +435,54 @@ function runCardFor(runId: string | null | undefined, deps: TaskAgentShadowDeps)
     (deps.log ?? ((c: string, e: string, d: Record<string, unknown>) => debug.log(c, e, d)))('task-agent', 'run-card-fallback-missed', { runId: own ?? null, inheritedRunId: inherited ?? null, tried, reason });
   } catch { /* fail-soft */ }
   return undefined;
+}
+
+/** HQ `tasks show` 가 원격 원장 거울의 미결 수를 카드에 회수한다. 부모→자식 원장 간선과 카드 id 를 함께 확인한다. */
+export async function replayRemoteCardMoves(cardId: string, statePath: string, evidenceDeps: CardRunEvidenceDeps = {},
+  log: (category: string, event: string, data: Record<string, unknown>) => void = (c, e, d) => debug.log(c, e, d)): Promise<number> {
+  const card = readTaskCard(cardId, statePath);
+  if (!card?.runId || !card.parentHost) return 0;
+  // 원격 부모와 동일 runId 의 HQ 국소 원장은 발사 영수증만 있을 수 있다. 이 회수는 원격 거울을 우선한다.
+  const loadLedger = evidenceDeps.loadLedger ?? ((runId: string) =>
+    loadRunLedger(runId, remoteLedgerMirrorDir(prodInstanceRoot(), card.parentHost!.host)));
+  const snapshot = await readCardRunSnapshot(card, { ...evidenceDeps, loadLedger });
+  if (snapshot.readErrors?.length) {
+    log('task-agent', 'card-binding-replay-failed', { card: cardId, runId: card.runId, reason: snapshot.readErrors.join(' · ') });
+    return 0;
+  }
+  // 카드 id 가 빠진 옛 원격 줄은 부모 runId 의 유일 카드일 때만 역조회한다.
+  const matches = Object.values(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {})
+    .filter((candidate) => candidate.runId === card.runId);
+  let written = 0;
+  for (const [childRunId, entries] of Object.entries(snapshot.children)) {
+    for (const entry of entries ?? []) {
+      if (entry.event !== REMOTE_CARD_MOVE_PENDING) continue;
+      const data = entry.data;
+      const id = data.id;
+      const kind = data.kind;
+      const linked = data.card === cardId || (data.card == null && matches.length === 1 && matches[0]?.id === cardId);
+      const parentMatches = data.parentRunId == null || data.parentRunId === card.runId;
+      if (!linked || !parentMatches || typeof id !== 'string' || !/^[a-f0-9-]{36}$/i.test(id)
+        || !['review', 'propose-green', 'propose-land', 'decision-card'].includes(String(kind))) {
+        log('task-agent', 'card-binding-replay-skipped', { card: cardId, childRunId, pendingId: typeof id === 'string' ? id : null,
+          reason: !linked ? 'card mismatch or ambiguous runId' : !parentMatches ? 'parent run mismatch' : 'invalid pending move' });
+        continue;
+      }
+      const at = entry.timestamp ?? '';
+      if (!Number.isFinite(Date.parse(at))) continue;
+      const pr = Number.isSafeInteger(data.pr) && (data.pr as number) > 0 ? data.pr as number : undefined;
+      updateTaskCard(statePath, cardId, (current) => {
+        if (!current || current.runId !== card.runId || current.history.some((item) => item.sourceId === id)) return undefined;
+        const item = liveMoveHistoryEntry(current, { at, kind: kind as TaskAgentLiveMove, executorResult: 'shadow',
+          shadowDetail: typeof data.detail === 'string' ? data.detail : 'remote card binding pending', runId: childRunId,
+          ...(pr ? { pr } : {}) });
+        written++;
+        return { ...current, history: [...current.history, { ...item, sourceId: id }] };
+      });
+    }
+  }
+  if (written) log('task-agent', 'card-binding-replayed', { card: cardId, parentRunId: card.runId, written });
+  return written;
 }
 
 /**

@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { program } from '../index';
 import { buildUserConfig, parseCliHelpRole } from '../user-config';
 import { FEATURE_MATURITY } from './feature-maturity';
-import { cliRootMaturity, cliRootVisibleFor, filterCliRootHelp } from './cli-maturity';
+import { FIRST_SCREEN_COMMANDS, cliRootMaturity, cliRootVisibleFor, filterCliRootHelp } from './cli-maturity';
 
 function helpNames(command: Command): string[] {
   const lines = command.helpInformation().split('\n');
@@ -68,6 +68,28 @@ describe('MAT1a CLI root maturity', () => {
     expect(commands.find(c => c.name() === 'pty')).toBeDefined();
     expect(program.options.some(option => option.long === '--help-all')).toBe(true);
     filterCliRootHelp(commands, 'owner', false);
+  });
+
+  test('firstScreen=true shows only start/setup/ask on the first screen', () => {
+    expect(FIRST_SCREEN_COMMANDS).toEqual(['start', 'setup', 'ask']);
+    const result = filterCliRootHelp(commands, 'general', false, true);
+    expect(result).toEqual({ shown: 3, hidden: names.length - 3 });
+    expect(helpNames(program).sort()).toEqual(['ask', 'setup', 'start']);
+  });
+
+  test('showAll=true shows everything even when firstScreen=true', () => {
+    const expected = names.filter(name => cliRootVisibleFor(name, 'general', { showAll: true }));
+    const result = filterCliRootHelp(commands, 'general', true, true);
+    expect(result).toEqual({ shown: expected.length, hidden: names.length - expected.length });
+    expect(helpNames(program).sort()).toEqual(expected.sort());
+  });
+
+  test('owner role keeps the current list when firstScreen stays at its default', () => {
+    const expected = names.filter(name => cliRootVisibleFor(name, 'owner', { showAll: false }));
+    const unchanged = { shown: expected.length, hidden: names.length - expected.length };
+    expect(filterCliRootHelp(commands, 'owner', false)).toEqual(unchanged);
+    expect(filterCliRootHelp(commands, 'owner', false, false)).toEqual(unchanged);
+    expect(helpNames(program).sort()).toEqual(expected.sort());
   });
 
   test('real isolated CLI help switches roles, help-all, and direct hidden-command help', () => {

@@ -113,6 +113,51 @@ describe('TaskNotificationQueue', () => {
     q.enqueue(makePending({ taskId: 'x' }));
     expect(q.size).toBe(1);
   });
+
+  test('one completion event fires the wake listener exactly once', () => {
+    const q = new TaskNotificationQueue();
+    const events: Array<{ category: string; event: string; data?: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+      events.push({ category, event, data });
+    }) as never);
+    try {
+      const woken: string[] = [];
+      const off = q.onEnqueue((n) => woken.push(n.taskId));
+
+      q.enqueue(makePending({ taskId: 'w1' }));
+      q.enqueue(makePending({ taskId: 'w1' }));
+      expect(woken).toEqual(['w1']);
+      expect(events).toContainEqual({
+        category: 'agent.task-notification',
+        event: 'wake',
+        data: { taskId: 'w1', size: 1 },
+      });
+      expect(events.filter(e => e.category === 'agent.task-notification' && e.event === 'wake')).toHaveLength(1);
+
+      off();
+      q.enqueue(makePending({ taskId: 'w2' }));
+      expect(woken).toEqual(['w1']);
+
+      const siblingWoken: string[] = [];
+      q.onEnqueue((n) => siblingWoken.push(n.taskId));
+      q.onEnqueue(() => { throw new Error('wake boom'); });
+      q.enqueue(makePending({ taskId: 'w3' }));
+      expect(q.size).toBe(3);
+      expect(siblingWoken).toEqual(['w3']);
+      expect(events).toContainEqual({
+        category: 'agent.task-notification',
+        event: 'wake-listener-failed',
+        data: { taskId: 'w3', reason: 'wake boom' },
+      });
+
+      q.clear();
+      q.enqueue(makePending({ taskId: 'w4' }));
+      expect(q.size).toBe(1);
+      expect(siblingWoken).toEqual(['w3', 'w4']);
+    } finally {
+      log.mockRestore();
+    }
+  });
 });
 
 // ── XML rendering ──

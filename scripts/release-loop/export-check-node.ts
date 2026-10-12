@@ -48,11 +48,14 @@ export function runExportCheck(run: CommandRunner = runCommand, repoRoot = proce
             const publicDir = join(out, 'export');
             symlinkSync(join(modulesRoot, 'node_modules'), join(publicDir, 'node_modules'), 'dir');
             const pwaModules = join(modulesRoot, 'apps', 'pwa', 'node_modules');
-            if (existsSync(pwaModules) && existsSync(join(publicDir, 'apps', 'pwa'))) symlinkSync(pwaModules, join(publicDir, 'apps', 'pwa', 'node_modules'), 'dir');
-            const built = run('bun', ['bin/elanous.mjs', 'nexus', 'build'], publicDir);
-            result = built.status === 0 && existsSync(join(publicDir, 'apps', 'pwa', 'out', 'index.html'))
-              ? { outcome: 'ok', verdict: 'pass', summary: `public export and PWA build ${commit.slice(0, 12)}`, step: 'build', tail: '' }
-              : failed('build', 'PWA build or out/index.html missing', built);
+            if (!existsSync(pwaModules)) result = failed('build', 'PWA dependencies missing; run bun install --cwd apps/pwa in the release-loop repository');
+            else {
+              if (existsSync(join(publicDir, 'apps', 'pwa'))) symlinkSync(pwaModules, join(publicDir, 'apps', 'pwa', 'node_modules'), 'dir');
+              const built = run('bun', ['bin/elanous.mjs', 'nexus', 'build'], publicDir);
+              result = built.status === 0 && existsSync(join(publicDir, 'apps', 'pwa', 'out', 'index.html'))
+                ? { outcome: 'ok', verdict: 'pass', summary: `public export and PWA build ${commit.slice(0, 12)}`, step: 'build', tail: '' }
+                : failed('build', 'PWA build or out/index.html missing', built);
+            }
           }
         }
       }

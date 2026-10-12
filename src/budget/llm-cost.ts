@@ -24,7 +24,11 @@ export interface LlmPricingUsd {
   longContext?: { thresholdTokens: number; inputPerM: number; outputPerM: number; cacheReadPerM?: number; cacheWritePerM?: number };
 }
 
-/** AWS Bedrock Global Standard prices, USD per million tokens (AWS pricing API, ap-northeast-2). */
+/** AWS Bedrock Global Standard prices, USD per million tokens (AWS pricing API, ap-northeast-2).
+ *  ⛔ BEDROCK-COST-LEDGER(0.2.26) — mantle-openai 비-Anthropic Bedrock id(`openai.gpt-6-sol`·`zai.glm-5` 등
+ *  `src/llm/bedrock.ts` BEDROCK_MODELS 의 `route:'mantle-openai'` 행)는 여기에 행이 «없다»: 단가 수치 근거가
+ *  하나도 확보되지 않았다. 근거 없는 id는 `isBedrockPricingModel` 게이트(`claude-` 시작)를 지나지 않아
+ *  `unknownCost()` 로 `kind:'unknown'` 에 머문다 — 0원으로 꾸미지 않는다. */
 export const BEDROCK_PRICING_USD: Readonly<Record<string, LlmPricingUsd>> = {
   'claude-haiku-5-5': { inputPerM: 0.1, outputPerM: 0.5, cacheWritePerM: 0.125, cacheReadPerM: 0.01 },
   'claude-sonnet-5-5': { inputPerM: 2, outputPerM: 10, cacheWritePerM: 2.5, cacheReadPerM: 0.1 },

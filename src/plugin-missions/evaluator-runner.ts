@@ -137,6 +137,7 @@ function runShell(opts: RunShellOpts): Promise<RunShellResult> {
     let stderrBuf = '';
     let killed = false;
     let timedOut = false;
+    let stdinError: string | undefined;
     const kill = (timeout: boolean) => {
       if (killed) return;
       killed = true;
@@ -150,6 +151,14 @@ function runShell(opts: RunShellOpts): Promise<RunShellResult> {
     opts.abortSignal.addEventListener('abort', () => kill(false), { once: true });
 
     child.stdout?.on('data', (chunk) => { stdout += String(chunk); });
+    // Early exit may close stdin before end() finishes. A broken pipe must
+    // not replace the child's stdout/exit result; other write errors must
+    // surface as evaluator errors.
+    child.stdin?.on('error', (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EPIPE') return;
+      stdinError = `stdin error: ${err.message}`;
+      opts.onStderr(stdinError);
+    });
     child.stderr?.on('data', (chunk) => {
       stderrBuf += String(chunk);
       let idx;
@@ -164,8 +173,9 @@ function runShell(opts: RunShellOpts): Promise<RunShellResult> {
       if (stderrBuf.trim()) opts.onStderr(stderrBuf.trim());
       resolve({
         stdout,
-        exitCode: timedOut ? 124 : (code ?? 1),
+        exitCode: timedOut ? 124 : stdinError ? 127 : (code ?? 1),
         timedOut,
+        error: stdinError,
       });
     });
     child.on('error', (err) => {
@@ -173,6 +183,12 @@ function runShell(opts: RunShellOpts): Promise<RunShellResult> {
       opts.onStderr(`spawn error: ${err.message}`);
       resolve({ stdout, exitCode: 127, timedOut: false });
     });
-    try { child.stdin?.end(opts.stdin); } catch { /* pipe may have closed */ }
+    try { child.stdin?.end(opts.stdin); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EPIPE') {
+        stdinError = `stdin error: ${(err as Error).message}`;
+        opts.onStderr(stdinError);
+      }
+    }
   });
 }

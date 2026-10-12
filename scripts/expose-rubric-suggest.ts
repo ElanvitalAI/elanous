@@ -28,7 +28,7 @@ function measure(run: () => Criterion): Criterion {
 export function suggestExposeRubric(root: string, files?: readonly string[], help?: HelpRunner, rulesPath?: string): Suggestion[] {
   const names = files ?? readdirSync(join(root, DOCS)).filter((name) => name.endsWith('.md')).map((name) => `${DOCS}/${name}`);
   const paths = [...new Set(names.map((name) => relative(root, resolve(root, name)).split(sep).join('/')))];
-  if (paths.some((path) => !/^release\/public\/docs\/[^/]+\.md$/.test(path))) throw new Error('문서 경로는 release/public/docs/*.md 이어야 합니다');
+  if (paths.some((path) => !/^(?:release\/public\/docs\/[^/]+|docs\/marketing\/BLOG-[^/]+)\.md$/.test(path))) throw new Error('문서 경로는 release/public/docs/*.md 또는 docs/marketing/BLOG-*.md 이어야 합니다');
   type HelpResult = ReturnType<HelpRunner> & { failure?: string };
   let helpRuns = 0;
   const rootHelp: (args: string[]) => HelpResult = help ?? ((args) => {

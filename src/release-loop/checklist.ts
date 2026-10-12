@@ -10,6 +10,8 @@ export type ChecklistDisposition = 'move' | 'known-issue' | 'block';
 /** `screen` = a five-surface feature cell — its evidence carries a `짝:` line (MANUAL-five-surface-parity §A). `postpub` = measured after publication, outside the pre-publication gate. */
 export type ChecklistKind = 'screen' | 'postpub';
 const CHECKLIST_KINDS: readonly ChecklistKind[] = ['screen', 'postpub'];
+export type ChecklistDispatchKind = 'code' | 'ops' | 'measure' | 'decision' | 'umbrella';
+const CHECKLIST_DISPATCH_KINDS: readonly ChecklistDispatchKind[] = ['code', 'ops', 'measure', 'decision', 'umbrella'];
 export interface ChecklistItem {
   id: string;
   title: string;
@@ -27,6 +29,8 @@ export interface ChecklistItem {
   evidence?: string;
   disposition?: ChecklistDisposition;
   kind?: ChecklistKind;
+  /** Whether the seat dispatcher should launch a coding task. Missing in old rows means code. */
+  dispatchKind?: ChecklistDispatchKind;
   updatedAt: string;
   updatedBy: string;
 }
@@ -121,6 +125,37 @@ function change(data: Checklist, id: string, field: string, from: unknown, to: u
 }
 
 const REPO_ROOT = join(import.meta.dir, '..', '..');
+
+const PATH_TOKEN = /(?:^|[^A-Za-z0-9_.\/-])((?:(?:[A-Za-z0-9_.-]+\/)+)?[A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|yaml|yml|sh|py|css|html|toml|sql|rs|swift))(?![A-Za-z0-9_.\/-])/g;
+function mentionedPaths(text: string): string[] {
+  return [...text.matchAll(PATH_TOKEN)].map((match) => match[1]!).filter((path) => !path.split('/').includes('..'));
+}
+
+/** Shadow check at checklist authorship. Callers supply the origin/main file probe and merged-PR file reader. */
+export function inspectChecklistTargetPaths(input: {
+  title: string; evidence?: string; refs?: readonly string[]; dispatchKind?: ChecklistDispatchKind;
+}, deps: { existsAtMain: (path: string) => boolean; mergedPrFiles?: (number: number) => readonly string[] }): {
+  targets: string[]; warnings: string[]; candidates: string[];
+} {
+  const lines = input.title.split(/\r?\n/);
+  const first = /^대상 경로:\s*(.*)$/.exec(lines[0] ?? '');
+  const targets = first ? [...new Set(mentionedPaths(first[1]!))] : [];
+  const newFileDeclared = /^신설:\s*/.test(lines[1] ?? '');
+  const warnings: string[] = [];
+  if ((input.dispatchKind ?? 'code') === 'code') {
+    if (!first || !first[1]!.trim() || targets.length === 0) warnings.push('첫 줄 대상 경로가 없다');
+    for (const path of targets) if (!deps.existsAtMain(path) && !newFileDeclared) warnings.push(`${path}: origin/main에 없는 파일 · 신설: 둘째 줄 선언 필요`);
+  }
+  if (!warnings.length) return { targets, warnings, candidates: [] };
+  const sources = [input.title, input.evidence ?? '', ...(input.refs ?? [])].join('\n');
+  const candidates = [...new Set(mentionedPaths(sources).filter(deps.existsAtMain))];
+  for (const match of sources.matchAll(/(?:^|[^\d])#(\d{2,8})\b/g)) {
+    for (const path of deps.mergedPrFiles?.(Number(match[1])) ?? []) {
+      if (deps.existsAtMain(path) && !candidates.includes(path)) candidates.push(path);
+    }
+  }
+  return { targets, warnings, candidates };
+}
 
 /** `--ref` 문서를 찾는 뿌리들 — 이 코드의 트리 ⊕ 지금 작업 디렉토리의 git 뿌리.
  *  ⭐ 설치본(`~/.local/share/elanous/current`)에는 `docs/` 가 없다 — 저장소 안에서 부른 설치본도 저장소 문서를 인용할 수 있게. */
@@ -233,10 +268,11 @@ export function validateCeoLoad(input: { ceoMinutes?: number; ceoDate?: string }
   if (input.ceoDate !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(input.ceoDate) || !Number.isFinite(Date.parse(`${input.ceoDate}T00:00:00Z`)) || new Date(`${input.ceoDate}T00:00:00Z`).toISOString().slice(0, 10) !== input.ceoDate)) throw new CliUserError('대표 손 날짜는 YYYY-MM-DD 이어야 한다');
 }
 
-export function addItem(v: string, input: { id: string; title: string; refs?: string[]; owner?: string; kind?: ChecklistKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean }, options: { allowDuplicateId?: boolean } = {}): Checklist {
+export function addItem(v: string, input: { id: string; title: string; refs?: string[]; owner?: string; kind?: ChecklistKind; dispatchKind?: ChecklistDispatchKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean }, options: { allowDuplicateId?: boolean } = {}): Checklist {
   if (!input.id.trim()) throw new CliUserError('칸 id 가 비었다');
   if (!input.title.trim()) throw new CliUserError('칸 제목이 비었다');
   if (input.kind !== undefined && !CHECKLIST_KINDS.includes(input.kind)) throw new CliUserError(`잘못된 종류: ${input.kind}`, 'screen|postpub');
+  if (input.dispatchKind !== undefined && !CHECKLIST_DISPATCH_KINDS.includes(input.dispatchKind)) throw new CliUserError(`잘못된 발사 종류: ${input.dispatchKind}`, 'code|ops|measure|decision|umbrella');
   if (input.owner !== undefined) parseOwner(input.owner);
   if (input.priority !== undefined && !['P0', 'P1', 'P2'].includes(input.priority)) throw new CliUserError(`잘못된 우선순위: ${input.priority}`);
   if (input.predecessors !== undefined && (!Array.isArray(input.predecessors) || input.predecessors.some((p) => typeof p !== 'string' || !p.trim() || p === input.id))) throw new CliUserError('잘못된 선행 칸');
@@ -255,20 +291,21 @@ export function addItem(v: string, input: { id: string; title: string; refs?: st
     assertPredecessorsExist(input.predecessors, data, otherItems);
     const by = process.env.ELANOUS_TRACK || 'cli';
     const at = new Date().toISOString();
-    const item: ChecklistItem = { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), ...(input.kind !== undefined ? { kind: input.kind } : {}), ...(input.priority !== undefined ? { priority: input.priority } : {}), ...(input.predecessors !== undefined ? { predecessors: input.predecessors } : {}), ...(input.deadlineVersion !== undefined ? { deadlineVersion: input.deadlineVersion } : {}), ...(input.ceoMinutes !== undefined ? { ceoMinutes: input.ceoMinutes } : {}), ...(input.ceoDate !== undefined ? { ceoDate: input.ceoDate } : {}), ...(input.accelerator === true ? { accelerator: true as const } : {}), ...(refs ? { refs } : {}), updatedAt: at, updatedBy: by };
+    const item: ChecklistItem = { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), ...(input.kind !== undefined ? { kind: input.kind } : {}), ...(input.dispatchKind !== undefined ? { dispatchKind: input.dispatchKind } : {}), ...(input.priority !== undefined ? { priority: input.priority } : {}), ...(input.predecessors !== undefined ? { predecessors: input.predecessors } : {}), ...(input.deadlineVersion !== undefined ? { deadlineVersion: input.deadlineVersion } : {}), ...(input.ceoMinutes !== undefined ? { ceoMinutes: input.ceoMinutes } : {}), ...(input.ceoDate !== undefined ? { ceoDate: input.ceoDate } : {}), ...(input.accelerator === true ? { accelerator: true as const } : {}), ...(refs ? { refs } : {}), updatedAt: at, updatedBy: by };
     data.items.push(item);
     change(data, item.id, 'add', null, item, by, at);
     return true;
   });
 }
 
-export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; refs?: string[]; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean | null }, by: string): Checklist {
+export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; refs?: string[]; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; dispatchKind?: ChecklistDispatchKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean | null }, by: string): Checklist {
   return mutate(v, (data, otherItems) => {
     const item = data.items.find((i) => i.id === id);
     if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
     if (patch.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(patch.status)) throw new CliUserError(`잘못된 상태: ${patch.status}`);
     if (patch.disposition !== undefined && !['move', 'known-issue', 'block'].includes(patch.disposition)) throw new CliUserError(`잘못된 처분: ${patch.disposition}`);
     if (patch.kind !== undefined && !CHECKLIST_KINDS.includes(patch.kind)) throw new CliUserError(`잘못된 종류: ${patch.kind}`, 'screen|postpub');
+    if (patch.dispatchKind !== undefined && !CHECKLIST_DISPATCH_KINDS.includes(patch.dispatchKind)) throw new CliUserError(`잘못된 발사 종류: ${patch.dispatchKind}`, 'code|ops|measure|decision|umbrella');
     if (patch.priority !== undefined && !['P0', 'P1', 'P2'].includes(patch.priority)) throw new CliUserError(`잘못된 우선순위: ${patch.priority}`);
     if (patch.predecessors !== undefined && (!Array.isArray(patch.predecessors) || patch.predecessors.some((p) => typeof p !== 'string' || !p.trim() || p === id))) throw new CliUserError('잘못된 선행 칸');
     assertPredecessorsExist(patch.predecessors, data, otherItems);
@@ -283,7 +320,7 @@ export function setItem(v: string, id: string, patch: { status?: ChecklistStatus
         throw new CliUserError(`지금 주인: ${item.owner} — --force 로만 바꾼다`, 'release checklist claim <id> --by <자리> --force');
       }
     }
-    const fields = (['evidence', 'owner', 'status', 'disposition', 'kind', 'priority', 'predecessors', 'deadlineVersion', 'ceoMinutes', 'ceoDate', 'accelerator', 'refs'] as const).filter((field) => patch[field] !== undefined && JSON.stringify(patch[field]) !== JSON.stringify(item[field] ?? null));
+    const fields = (['evidence', 'owner', 'status', 'disposition', 'kind', 'dispatchKind', 'priority', 'predecessors', 'deadlineVersion', 'ceoMinutes', 'ceoDate', 'accelerator', 'refs'] as const).filter((field) => patch[field] !== undefined && JSON.stringify(patch[field]) !== JSON.stringify(item[field] ?? null));
     if (fields.length === 0) return false;
     const at = new Date().toISOString();
     for (const field of fields) {

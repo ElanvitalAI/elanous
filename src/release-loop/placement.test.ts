@@ -238,7 +238,7 @@ test('backlog 0.9.0 is a placement source only: its cell moves out to a dated re
 
 test('a second forward rollover needs a 쪼개기/닫기/\u{1F451} reason; first rollover and pull stay as before', () => {
   setup();
-  const options = { ...deps(), merged24h: 10 };
+  const options = { ...deps(), merged24h: 10, seatCap: { TC: 10 } };
   addItem('0.2.14', { id: 'carry', title: 'carry', owner: 'TC' });
   // 첫 이월은 그대로 통과한다.
   seatMove('carry', '0.2.14', '0.2.15', 'TC', 'capacity', options);
@@ -251,6 +251,13 @@ test('a second forward rollover needs a 쪼개기/닫기/\u{1F451} reason; first
   seatMove('carry', '0.2.15', '0.2.16', 'TC', '쪼개기: 둘로 나눈다', options);
   expect(listChecklist('0.2.16').items.map((item) => item.id)).toContain('carry');
   expect(checklistHistory('carry').at(-1)).toMatchObject({ field: 'move', reason: '쪼개기: 둘로 나눈다' });
+
+  for (const [id, reason] of [['close', '닫기: 완료 범위 고정'], ['ordered', `${String.fromCodePoint(0x1F451)}: 이번 판 착지`]] as const) {
+    addItem('0.2.14', { id, title: id, owner: 'TC' });
+    seatMove(id, '0.2.14', '0.2.15', 'TC', 'first move', options);
+    seatMove(id, '0.2.15', '0.2.16', 'TC', reason, options);
+    expect(checklistHistory(id).at(-1)).toMatchObject({ field: 'move', reason });
+  }
 }, 60_000);
 
 test('seat moves only its own cell one release with reason; other owner pull denied with COO request', () => {

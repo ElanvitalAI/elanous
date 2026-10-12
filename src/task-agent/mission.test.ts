@@ -106,7 +106,10 @@ test('readyPieces(②의 자리) — 선행이 모두 착지한 미착지 조각
 test('shadow --mission → 미션 카드 1 ⊕ 조각 카드 4 · 같은 상태 파일 · 선행 없는 조각만 launch 수 · 나머지 wait after', async () => {
   const path = statePath();
   let launched = 0;
-  const { lines, code } = await cli(['task', 'hand', '--mission', LISTED, '--seat', 'OP', '--checklist', 'CELL-X'], { taskStatePath: path, taskLauncher: () => { launched++; }, missionDecompose: noLlm });
+  const { lines, code } = await cli(['task', 'hand', '--mission', LISTED, '--seat', 'OP', '--checklist', 'CELL-X'], {
+    taskStatePath: path, taskLauncher: () => { launched++; }, missionDecompose: noLlm,
+    releaseBoard: () => [{ level: 'task', id: 'CELL-X', title: '가상 미션 칸', status: 'open' }],
+  });
   expect(code).toBeFalsy();
   expect(launched).toBe(0);
   const tasks = JSON.parse(readFileSync(path, 'utf8')).tasks as Record<string, Record<string, unknown>>;

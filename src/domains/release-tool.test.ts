@@ -117,7 +117,43 @@ test('schedule, blocked and landed actions return Korean summaries from injected
   expect(observedNow).toBe(now);
 });
 
-test('existing core dispatch reaches the new release_status action without another tool registration', async () => {
+test('topic takes precedence over a simultaneous action with one deterministic notice', () => {
+  const result = dispatchReleaseStatus({ topic: 'features', action: 'landed' }, {
+    devVersion: () => '0.2.10',
+    checklist: version => ({ version, released: '', dev: version, history: [], items: [
+      { id: 'KEEP', title: '보이는 칸', status: 'yellow', owner: 'UX', updatedAt: '', updatedBy: '' },
+    ] }),
+  });
+  expect(result.text.split('\n')[0]).toBe('action=landed 은 무시됨 — topic 과 같이 못 쓴다');
+  expect(result.text.match(/action=landed 은 무시됨 — topic 과 같이 못 쓴다/g)).toHaveLength(1);
+  expect((result.structured.items as Array<{ id: string }>).map(item => item.id)).toEqual(['KEEP']);
+});
+
+test('features applies owner and status filters and counts matching ledger entries beyond display limit', () => {
+  const items: ChecklistItem[] = Array.from({ length: 65 }, (_, index) => ({
+    id: `UX${index + 1}`, title: `UX 칸 ${index + 1}`, status: 'yellow', owner: 'UX', updatedAt: '', updatedBy: '',
+  }));
+  items.unshift({ id: 'UXRED', title: '필터 제외', status: 'red', owner: 'UX', updatedAt: '', updatedBy: '' });
+  items.push({ id: 'TCYELLOW', title: '오너 제외', status: 'yellow', owner: 'TC', updatedAt: '', updatedBy: '' });
+  const result = dispatchReleaseStatus({ topic: 'features', owner: 'UX', status: 'yellow' }, {
+    devVersion: () => '0.2.10',
+    checklist: version => ({ version, released: '', dev: version, history: [], items }),
+  });
+  expect(result.structured).toMatchObject({ total: 65, truncated: true, filters: { owner: 'UX', status: 'yellow' }, counts: { yellow: 65, red: 0 } });
+  expect((result.structured.items as ChecklistItem[])).toHaveLength(60);
+  expect((result.structured.items as ChecklistItem[]).at(-1)?.id).toBe('UX60');
+  expect(result.text).toContain('UX 칸 60');
+  expect(result.text).toContain('앞 60칸만 표시(전체 65칸)');
+});
+
+test('existing core dispatch reaches release_status topic precedence without another tool registration', async () => {
+  fixture();
+  const result = await buildCoreTools().dispatch('release_status', { topic: 'features', action: 'landed' }) as { text: string };
+  expect(result.text.split('\n')[0]).toBe('action=landed 은 무시됨 — topic 과 같이 못 쓴다');
+  expect(result.text).toContain('판 피처');
+});
+
+test('existing core dispatch preserves the standalone release_status action contract', async () => {
   fixture();
   const result = await buildCoreTools().dispatch('release_status', { action: 'schedule' }) as { text: string };
   expect(result.text).toBe('다음 컷 시각: 일정 없음');

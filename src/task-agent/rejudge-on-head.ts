@@ -23,7 +23,7 @@
  *   fetch 한 뒤 PR 가지에 3-way merge(rerere 켬 · ⛔ rebase/force-push/reset/파일째 checkout) 하고 일반 push 로 새 머리를 만든 다음, 그 머리는 기존
  *   ①②③ 사슬을 탄다. 머리마다 1회 · 카드당 `CATCH_UP_CAP`(기본 2)회. 충돌이면 `merge --abort` ⊕ needs-owner(`main 따라잡기 충돌 · 파일 …`).
  *   관측 `rejudge-on-head {step:'catch-up', decision: pushed|conflict|cap-reached, fromBase, toBase, newHead}`.
- * - 대상: 카드에 묶인 PR(URL 로 저장소 확인) ⊕ 그 PR 로 TA 가 이미 리뷰를 요청한 카드(= 런이 멈춰 TA 판단이 시작됐다).
+ * - 대상: 카드에 묶인 PR(URL 로 저장소 확인) ⊕ 기존 TA 리뷰 또는 원격 부모→자식 간선·같은 PR·자식 run-status 종결 증거.
  * - 사람의 hold(draft PR)는 뒤집지 않는다 — 재게이트(`noMerge`)와 land 관문이 draft 를 거부한다.
  * - 허용: 설정 `taskAgent.liveMoves` 그대로 — 재게이트·land 는 `propose-land`, 리뷰 재요청은 `review` 가 있을 때만(없으면 «했을 수»).
  * - 관측: `task-agent` · `rejudge-on-head {card, pr, fromHead, toHead, step, decision, reason}` — 수가 난 판단은 카드 history 에도
@@ -34,10 +34,13 @@ import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { prodInstanceRoot } from '../instance/resolve.js';
+import { loadRunLedger, type RunLedgerEntry } from '../self-implement/run-ledger.js';
 import type { DetachedSpawn } from '../cli/tasks-cli.js';
+import { remoteLedgerMirrorDir } from './parent-host.js';
 import { appendLandOrderRow, joinLandOrderRow } from './land-order-ledger.js';
 import { recordLiveMoveHistory } from './live-move-history.js';
-import { defaultPrHead, defaultReviewRepoCandidates, executeLiveLand, executeLiveReview, landRetryPending, type LiveMoveDeps, type LiveMoveResult, type PrHeadView, type ReviewRepoCandidate, type TaskAgentLiveMove } from './live-moves.js';
+import { defaultLandPrHead, defaultPrHead, defaultReviewRepoCandidates, executeLiveLand, executeLiveReview, landRetryPending, type LiveMoveDeps, type LiveMoveResult, type PrHeadView, type ReviewRepoCandidate, type TaskAgentLiveMove } from './live-moves.js';
 import { capturedLandReview, captureReviewResults, parseReviewResultOutput, pendingReviewResults, type ParsedReviewResult } from './review-result-capture.js';
 import { cardPrNumber, readTaskCard, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
 
@@ -49,7 +52,7 @@ export const CATCH_UP_CAP = 2;
 /** 떼어 띄운 재게이트 결과를 기다리는 상한 — 지나도 파일이 없으면 «결과 없음»으로 적는다(같은 머리는 다시 안 돌린다). */
 export const REGATE_RESULT_WAIT_MS = 90 * 60_000;
 
-export type RejudgeStep = 'regate' | 'review' | 'land' | 'target' | 'catch-up';
+export type RejudgeStep = 'regate' | 'review' | 'ready' | 'land' | 'target' | 'catch-up';
 export type CatchUpDecision = 'pushed' | 'conflict' | 'cap-reached' | 'failed';
 export interface RejudgeOutcome {
   card: string; pr: number | null; fromHead: string | null; toHead: string | null; step: RejudgeStep; decision: string; reason: string;
@@ -71,6 +74,12 @@ export type CatchUpGit = (cwd: string, args: string[]) => { status: number | nul
 export interface RejudgeDeps {
   live?: LiveMoveDeps;
   liveMoves: ReadonlySet<TaskAgentLiveMove>;
+  /** Only phase ① shadow callbacks may inspect a previously judged head without a regate. */
+  shadowSameHead?: boolean;
+  /** HQ mirror proof that the bound remote child has stopped. Test seam; absence fails closed. */
+  remoteRunTerminal?: (card: TaskCard) => boolean;
+  /** Make a reviewed draft PR ready; tests inject this instead of calling gh. */
+  readyPr?: (pr: number, cwd: string) => Promise<{ ok: boolean; reason: string }>;
   /** 재게이트를 떼어 띄운다 — 시험은 주입한다. 기본은 `tasks regate-run` 자식(stdio ignore · 결과는 파일). */
   requestRegate?: (request: RegateRequest) => Promise<void>;
   /** TA-REJUDGE-REBASE-LOOP — origin/main 을 PR 가지에 3-way merge 하고 일반 push. 시험은 주입한다. */
@@ -80,10 +89,147 @@ export interface RejudgeDeps {
   readFile?: (path: string) => string;
 }
 
+/** PR binding alone does not mean a remote parent has stopped. Require its child edge and terminal ledger row. */
+export function remoteBoundRunTerminal(card: TaskCard, load: (runId: string, dir: string) => RunLedgerEntry[] | null = loadRunLedger): boolean {
+  const pr = cardPrNumber(card);
+  const url = typeof card.pr === 'object' ? card.pr.url : undefined;
+  if (card.status !== 'launched' || card.taLand !== true || !card.parentHost || !card.runId || !card.runChildId || !pr || !url) return false;
+  try {
+    const dir = remoteLedgerMirrorDir(prodInstanceRoot(), card.parentHost.host);
+    const parent = load(card.runId, dir);
+    if (!parent?.some((entry) => entry.event === 'pod-child-run' && entry.data?.childRunId === card.runChildId)) return false;
+    const child = load(card.runChildId, dir);
+    return !!child?.some((entry) => entry.event === 'pr-opened' && entry.data?.number === pr && entry.data.url === url)
+      && child.some((entry) => entry.event === 'run-status' && ['completed', 'failed', 'cancelled'].includes(String(entry.data?.runStatus)));
+  } catch { return false; }
+}
+
+/** Shared completion callback for detached review and regate workers. */
+type CompletedWorker = { pr: number; head: string; kind?: 'review' | 'regate'; resultPath?: string };
+
+export async function rejudgeAsyncResultCard(
+  cardId: string, statePath: string,
+  external: Pick<LiveMoveDeps, 'repoCandidates' | 'prHead' | 'landPrHead' | 'land' | 'landWorktree' | 'requestReview'>
+    & Pick<RejudgeDeps, 'requestRegate'> = {},
+  completed?: CompletedWorker,
+): Promise<RejudgeOutcome[]> {
+  const { requestRegate, ...live } = external;
+  return rejudgeShadowCard(cardId, statePath, { live, requestRegate }, completed);
+}
+
+export async function rejudgeShadowCard(cardId: string, statePath: string, deps: Partial<RejudgeDeps> = {}, completed?: CompletedWorker): Promise<RejudgeOutcome[]> {
+  // TA-LAND-AFTER-REVIEW phase ①: completion paths observe the decision but execute no
+  // regate/review/land move. A post-landing canary will gate the separate live switch.
+  const outcomes = await rejudgeCardOnHead(cardId, { ...deps, liveMoves: new Set(), shadowSameHead: true, live: { ...deps.live, statePath } });
+  requireSuccessfulRejudge(outcomes);
+  if (completed) requireCompletedHeadRejudge(outcomes, completed.pr, completed.head);
+  const last = outcomes.at(-1);
+  if (last) {
+    const decision = last.decision === 'would-land' ? 'land' : last.decision;
+    let claimed = false;
+    try {
+      updateTaskCard(statePath, cardId, (current) => {
+        if (!current || current.status !== 'launched' || current.taLand !== true || last.pr === null
+          || cardPrNumber(current) !== last.pr || !last.toHead || !/^[0-9a-f]{40}$/i.test(last.toHead)
+          || (completed?.kind && (!completed.resultPath || !(completed.kind === 'review' ? current.reviewRequests : current.regates)
+            ?.some((entry) => entry.pr === completed.pr && sameHead(entry.head, completed.head) && entry.resultPath === completed.resultPath)))
+          || (decision === 'land' && (!capturedLandReview(current, last.pr, last.toHead)
+            || !(current.regates ?? []).some((entry) => entry.pr === last.pr && sameHead(entry.head, last.toHead!) && entry.passed === true && entry.resultPath)))
+          || (current.history ?? []).some((item) => item.event === 'rejudge-shadow' && item.pr === last.pr && item.head === last.toHead && item.effect === decision)) return undefined;
+        claimed = true;
+        return { ...current, history: [...(current.history ?? []), { at: new Date().toISOString(), event: 'rejudge-shadow', pr: last.pr, head: last.toHead ?? undefined, effect: decision, detail: last.reason }] };
+      });
+      if (claimed) debug.log('task-agent', 'rejudge-shadow', {
+        card: cardId, head12: last.toHead?.slice(0, 12) ?? null, decision, reason: last.reason,
+      });
+    } catch { /* observation must not change completion */ }
+  }
+  return outcomes;
+}
+
+/** A completed callback must not claim success when the rejudge returned a failed move. */
+export function requireSuccessfulRejudge(result: unknown): void {
+  if (result == null || (Array.isArray(result) && result.length === 0)) throw new Error('task-agent rejudge returned no decision');
+  if (result === false || (result && typeof result === 'object' && !Array.isArray(result)
+    && ('ok' in result && result.ok === false || 'success' in result && result.success === false))) {
+    throw new Error('task-agent rejudge returned failure');
+  }
+  if (!Array.isArray(result)) throw new Error('task-agent rejudge returned no decision array');
+  const failed = result.find((item) => {
+    if (item && typeof item === 'object' && 'ok' in item && item.ok === false) return true;
+    const decision = item && typeof item === 'object' && 'decision' in item ? item.decision : undefined;
+    return typeof decision === 'string' && (decision.endsWith('-failed') || decision.endsWith('-rejected')
+      || ['no-pr', 'card-unreadable', 'conflict', 'cap-reached'].includes(decision));
+  });
+  if (failed) throw new Error(`task-agent rejudge returned failure: ${String(failed.decision ?? 'ok:false')}`);
+}
+
+/** A completion marker belongs to the exact PR head whose worker result triggered it. */
+export function requireCompletedHeadRejudge(result: unknown, pr: number, head: string): void {
+  requireSuccessfulRejudge(result);
+  const last = Array.isArray(result) ? result.at(-1) : undefined;
+  if (!last || typeof last !== 'object' || last.pr !== pr || typeof last.toHead !== 'string'
+    || !/^[0-9a-f]{40}$/i.test(last.toHead) || !sameHead(last.toHead, head)) {
+    throw new Error('task-agent rejudge result head does not match completed worker head');
+  }
+}
+
+const regateRejudgeInFlight = new Set<string>();
+
+/** Regate worker has written the exact result file; claim one callback for its card/head/result. */
+export async function rejudgeCompletedTaskRegate(
+  cardId: string, pr: number, head: string, resultPath: string, statePath: string,
+  rejudge: (cardId: string, statePath: string) => Promise<unknown> = rejudgeAsyncResultCard,
+  rejudgeDeps?: Partial<RejudgeDeps>,
+): Promise<boolean> {
+  if (!/^[0-9a-f]{40}$/i.test(head)) return false;
+  const key = `${statePath}\0${cardId}\0${pr}\0${head}\0${resultPath}`;
+  if (regateRejudgeInFlight.has(key)) return false;
+  const card = readTaskCard(cardId, statePath);
+  if (card?.status !== 'launched' || card.taLand !== true || cardPrNumber(card) !== pr
+    || !(card.regates ?? []).some((entry) => entry.pr === pr && sameHead(entry.head, head) && entry.resultPath === resultPath && entry.passed === undefined)
+    || (card.history ?? []).some((entry) => entry.event === 'async-result-rejudge' && entry.pr === pr && sameHead(entry.head ?? '', head) && entry.resultPath === resultPath)) return false;
+  let text: string;
+  try { text = readFileSync(resultPath, 'utf8'); } catch { return false; }
+  const parsed = parseRegateResult(text, pr, head);
+  if (!parsed) return false;
+  regateRejudgeInFlight.add(key);
+  try {
+    const run = () => rejudgeDeps
+      ? rejudgeShadowCard(cardId, statePath, rejudgeDeps, { pr, head, kind: 'regate', resultPath })
+      : rejudge === rejudgeAsyncResultCard ? rejudgeAsyncResultCard(cardId, statePath, {}, { pr, head, kind: 'regate', resultPath }) : rejudge(cardId, statePath);
+    try { requireCompletedHeadRejudge(await run(), pr, head); } catch { requireCompletedHeadRejudge(await run(), pr, head); } // Bounded retry; no marker on failed outcomes.
+    updateTaskCard(statePath, cardId, (current) => parsed.passed === true && current?.status === 'launched' && current.taLand === true && cardPrNumber(current) === pr
+      && (current.regates ?? []).some((entry) => entry.pr === pr && sameHead(entry.head, head) && entry.resultPath === resultPath
+        && (entry.passed === undefined || entry.passed === parsed.passed))
+      && !(current.history ?? []).some((entry) => entry.event === 'async-result-rejudge' && entry.pr === pr && sameHead(entry.head ?? '', head) && entry.resultPath === resultPath)
+      ? { ...current, history: [...(current.history ?? []), { at: new Date().toISOString(), event: 'async-result-rejudge', kind: 'regate', pr, head, resultPath, effect: 'completion callback succeeded' }] }
+      : undefined);
+  } finally {
+    regateRejudgeInFlight.delete(key);
+  }
+  return true;
+}
+
 const safe = (value: string) => value.replace(/[^A-Za-z0-9._-]/g, '_');
 export function regateResultPath(statePath: string, cardId: string, pr: number, head: string, staleBase?: string): string {
   const suffix = staleBase ? `-from-${safe(staleBase.slice(0, 12))}` : '';
   return join(dirname(statePath), 'regate-results', `${safe(cardId)}-${pr}-${safe(head.slice(0, 12))}${suffix}.json`);
+}
+
+function readyRegateResultPath(statePath: string, cardId: string, pr: number, head: string): string {
+  return regateResultPath(statePath, cardId, pr, head).replace(/\.json$/, '-after-ready.json');
+}
+
+export async function defaultReadyPr(pr: number, cwd: string): Promise<{ ok: boolean; reason: string }> {
+  const run = (env: NodeJS.ProcessEnv) => spawnSync('gh', ['pr', 'ready', String(pr)], { cwd, env, encoding: 'utf8', timeout: 30_000 });
+  let result = run(process.env);
+  if (result.status !== 0) {
+    const noProxy = { ...process.env };
+    for (const key of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']) delete noProxy[key];
+    result = run(noProxy);
+  }
+  return { ok: result.status === 0, reason: (result.stderr || result.stdout || `gh pr ready exit ${result.status ?? 'unknown'}`).trim().slice(-200) };
 }
 
 /** REJUDGE base-stale — 이 재게이트(요청 시각 `since`) «뒤»에 같은 머리 land 가 base-stale 로 거절된 마지막 시도. */
@@ -258,8 +404,9 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   const pr = card ? cardPrNumber(card) : undefined;
   if (!card || pr === undefined) return target('no-pr', 'card has no bound PR');
   const reviews = (card.reviewRequests ?? []).filter((entry) => entry.pr === pr);
-  // 런이 멈춰 TA 가 이 PR 을 리뷰한 적이 있어야 재판정한다 — 도는 런의 PR 에 끼어들지 않는다.
-  if (!reviews.length) return target('not-started', 'no task-agent review on this PR yet (run not stopped/judged)', pr);
+  // 원격 부모는 node-b 의 liveMoves 가 꺼져 리뷰 이력이 0일 수 있다. HQ 거울의 종결 증거가 있을 때만 시작한다.
+  if (!reviews.length && (!card.parentHost || !(deps.remoteRunTerminal ?? remoteBoundRunTerminal)(card)))
+    return target('not-started', 'no task-agent review on this PR yet (remote terminal unproven or run not stopped/judged)', pr);
   // 떼어 띄운 재게이트 결과를 «머리와 무관하게» 먼저 회수한다 — 결과가 나오기 전에 머리가 또 바뀌어도 그 머리의 결과는 카드에 남는다.
   for (const pending of (card.regates ?? []).filter((entry) => entry.pr === pr && entry.passed === undefined && entry.resultPath)) {
     let text: string | null = null;
@@ -298,6 +445,44 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   if (view.state !== 'OPEN') return target('pr-not-open', `PR #${pr} is ${view.state}`, pr, fromHead, toHead);
   const step = (s: RejudgeStep, decision: string, reason: string, record: boolean, extra: Partial<RejudgeOutcome> = {}) =>
     emit({ card: card!.id, pr, fromHead, toHead, step: s, decision, reason, ...extra }, record);
+
+  // A remote --ta-land parent leaves its PR draft. Only a captured review for this exact
+  // head may let HQ make it ready; the regate runner deliberately rejects draft PRs.
+  let readyConfirmed = false;
+  const readyReview = card.taLand ? capturedLandReview(card, pr, toHead) : undefined;
+  if (readyReview?.mustFixCount === 0 && deps.liveMoves.has('propose-land')) {
+    let fresh: Awaited<ReturnType<NonNullable<LiveMoveDeps['landPrHead']>>>;
+    try { fresh = await (live.landPrHead ?? defaultLandPrHead)(pr, cwd); } catch { fresh = null; }
+    if (!fresh || fresh.state !== 'OPEN' || !sameHead(fresh.head, toHead) || !fresh.url || !sameUrl(fresh.url, url)) {
+      step('ready', 'ready-unconfirmed', 'fresh PR head, URL or draft state unavailable — no regate', false);
+      return outcomes;
+    }
+    if (fresh.isDraft) {
+      const result = await (deps.readyPr ?? defaultReadyPr)(pr, cwd);
+      if (!result.ok) {
+        step('ready', 'ready-failed', result.reason, true);
+        return outcomes;
+      }
+      try { fresh = await (live.landPrHead ?? defaultLandPrHead)(pr, cwd); } catch { fresh = null; }
+      if (!fresh || fresh.isDraft || fresh.state !== 'OPEN' || !sameHead(fresh.head, toHead) || !fresh.url || !sameUrl(fresh.url, url)) {
+        step('ready', 'ready-unconfirmed', 'gh pr ready returned success but the same PR/head is not confirmed ready', true);
+        return outcomes;
+      }
+      step('ready', 'ready-confirmed', `PR #${pr} head ${toHead.slice(0, 12)} is ready after captured review`, true);
+    }
+    readyConfirmed = true;
+  }
+
+  if (!reviews.length) {
+    if (!deps.liveMoves.has('review')) step('review', 'would-review', 'remote run terminal proven · review not enabled in HQ taskAgent.liveMoves — shadow', false);
+    else {
+      const before = { reviewRequests: card.reviewRequests, landAttempts: card.landAttempts };
+      const result = await executeLiveReview(card, pr, { runId: card.runId ?? null, stopReason: 'remote-run-terminal', cwd }, { ...live, ...(deps.log ? { log: deps.log } : {}) });
+      recordMove(statePath, card.id, card.runId, 'review', result, pr, before, now, deps.log);
+      step('review', result.executed ? 'review-requested' : 'review-request-failed', result.detail, true);
+    }
+    return outcomes;
+  }
 
   const tryCatchUp = async (fromBase: string | undefined, why: string): Promise<boolean> => {
     const prior = catchUpHistory(card!, pr);
@@ -341,13 +526,22 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
     return true;
   };
 
-  // 머리가 런 멈춤 때 그대로면 재판정하지 않는다 — 그 머리의 재게이트·리뷰·land 판단은 멈춤 때의 판단(슈퍼바이저 틱)이 이미 했다.
-  //   TA-LAND-RETRY-ON-INFRA — 단, 그 머리의 land 가 TA 쪽 인프라 결손으로 실패해 재시도가 남았으면 아래 ①②③ 을 그대로 탄다
-  //   (재게이트·회수한 리뷰·겹침 증거를 다시 갖춘 뒤에만 land — 관문은 그대로).
-  if (!regates.length && judgedHead && sameHead(toHead, judgedHead) && !landRetryPending(card, pr, toHead)) return target('head-unchanged', `PR #${pr} head is still the judged head`, pr, fromHead, toHead);
+  // 기존 live 경로의 같은 머리 조기 반환은 유지한다. 완료 훅의 그림자 판단만 통과 리뷰를 다시 본다.
+  if (!regates.length && judgedHead && sameHead(toHead, judgedHead) && !landRetryPending(card, pr, toHead)) {
+    const unchangedReview = capturedLandReview(card, pr, toHead);
+    if (!deps.shadowSameHead || deps.liveMoves.size !== 0 || !unchangedReview || !['pass', 'warn'].includes(unchangedReview.verdict) || unchangedReview.mustFixCount !== 0) {
+      return target('head-unchanged', `PR #${pr} head is still the judged head`, pr, fromHead, toHead);
+    }
+  }
+  // `regates` 는 PR 전체 기록이다. 현재 머리의 결과만 재사용하고, 없으면 재게이트한다.
+  const currentHeadRegate = regates.filter((entry) => sameHead(entry.head, toHead)).at(-1);
 
   // ① 재게이트 — 지금 머리의 «마지막» 기록(REJUDGE base-stale 로 같은 머리를 다시 잰 기록이 뒤에 붙는다).
-  const regate = regates.filter((entry) => sameHead(entry.head, toHead)).at(-1);
+  const regate = currentHeadRegate;
+  // A draft rejection is a stale input after the same PR becomes ready, not a permanent
+  // judgement about the code. Retry this exact head once with a separate result path.
+  const retryDraft = readyConfirmed && regate?.passed === false && /^pr-head:.*\bisDraft=true\b/.test(regate.detail ?? '')
+    && !regates.some((entry) => sameHead(entry.head, toHead) && entry.readyRetry === true);
   // REJUDGE base-stale — 이 머리의 통과한 재게이트로 land 했더니 base-stale-overlap 으로 거절됐다 → 새 base 위에서 한 번 더 잰다.
   const stale = regate?.passed === true ? baseStaleAttemptAfter(card, pr, toHead, regate.at) : undefined;
   const staleBase = stale ? regate?.baseCommit : undefined;
@@ -355,8 +549,9 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
     await tryCatchUp(undefined, `base-stale-overlap on head ${toHead.slice(0, 12)} but the stale regate has no baseCommit`);
     return outcomes;
   }
-  if (!regate || staleBase) {
-    const why = staleBase ? `base-stale-overlap — gate base ${staleBase.slice(0, 12)} went stale (${(stale!.reason ?? '').replace(/^base-stale-overlap:\s*/, '').slice(0, 160)})` : '';
+  if (!regate || staleBase || retryDraft) {
+    const why = staleBase ? `base-stale-overlap — gate base ${staleBase.slice(0, 12)} went stale (${(stale!.reason ?? '').replace(/^base-stale-overlap:\s*/, '').slice(0, 160)})`
+      : retryDraft ? 'draft rejection became stale after PR ready' : '';
     if (regates.length >= REJUDGE_HEAD_CAP) {
       step('regate', 'cap-reached', `${why ? `${why} · ` : ''}re-gated ${regates.length} times already (cap ${REJUDGE_HEAD_CAP}) — no more rejudge; needs owner`, true);
       return outcomes;
@@ -364,17 +559,19 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
     if (!deps.liveMoves.has('propose-land')) step('regate', 'would-regate', `${why ? `${why} · ` : ''}propose-land not enabled in taskAgent.liveMoves — shadow`, false);
     else {
       const at = now().toISOString();
-      const resultPath = regateResultPath(statePath, card.id, pr, toHead, staleBase);
+      const resultPath = retryDraft ? readyRegateResultPath(statePath, card.id, pr, toHead)
+        : regateResultPath(statePath, card.id, pr, toHead, staleBase);
       let claimed = false;
       let capped = false;
       updateTaskCard(statePath, card.id, (current) => {
         const held = (current?.regates ?? []).filter((entry) => entry.pr === pr);
         // 멱등 — 처음 재게이트는 «머리», base-stale 재게이트는 «머리 ⊕ 낡은 base» 가 키다(같은 머리·같은 base 로 두 번 안 잰다).
-        if (!current || held.some((entry) => sameHead(entry.head, toHead) && (staleBase ? entry.staleBase !== undefined && sameHead(entry.staleBase, staleBase) : true))) return undefined;
+        if (!current || held.some((entry) => sameHead(entry.head, toHead) && (staleBase ? entry.staleBase !== undefined && sameHead(entry.staleBase, staleBase)
+          : retryDraft ? entry.readyRetry === true : true))) return undefined;
         // 상한은 잠금 안의 «지금» 카드로 다시 잰다 — 다른 머리를 본 두 틱이 겹쳐도 상한을 넘지 않게.
         if (held.length >= REJUDGE_HEAD_CAP) { capped = true; return undefined; }
         claimed = true;
-        return { ...current, regates: [...(current.regates ?? []), { pr, head: toHead, at, resultPath, ...(staleBase ? { staleBase } : {}) }] };
+        return { ...current, regates: [...(current.regates ?? []), { pr, head: toHead, at, resultPath, ...(staleBase ? { staleBase } : {}), ...(retryDraft ? { readyRetry: true as const } : {}) }] };
       });
       if (capped) {
         step('regate', 'cap-reached', `${why ? `${why} · ` : ''}re-gated ${REJUDGE_HEAD_CAP} times already (cap ${REJUDGE_HEAD_CAP} · claim-time recheck) — no more rejudge; needs owner`, true);
@@ -395,7 +592,7 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
       }
     }
     // base-stale 재게이트는 그 결과가 나와야 land 한다 — 낡은 base 의 증거로 이번 틱에 다시 land 하지 않는다.
-    if (staleBase) return outcomes;
+    if (staleBase || retryDraft) return outcomes;
   } else if (regate.passed === undefined) {
     step('regate', 'awaiting-regate-result', 'host regate still running', false);
   }
@@ -463,10 +660,7 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
     // review-results 파일을 못 읽으면 reviewVerdict 'missing' — 0 으로 쓰지 않는다(land 판정의 회수 결과와는 별개 파일).
     let reviewForLedger: ParsedReviewResult | null = null;
     try { reviewForLedger = parseReviewResultOutput(read(reviewResult)); } catch { reviewForLedger = null; }
-    appendLandOrderRow(statePath, joinLandOrderRow({
-      overlapEvidence: { ...overlapEvidenceContent, cardId: card.id },
-      reviewResult: reviewForLedger, landed, at: now().toISOString(),
-    }));
+    appendLandOrderRow(statePath, joinLandOrderRow({ overlapEvidence: { ...overlapEvidenceContent, cardId: card.id }, reviewResult: reviewForLedger, landed, at: now().toISOString() }));
     landOrderLog('appended');
   } catch {
     landOrderLog('append-failed');
@@ -476,7 +670,9 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   const attempt = landed.landAttempt?.class
     ? ` · land-class ${landed.landAttempt.class} (${landed.landAttempt.reason}) · attempt ${landed.landAttempt.attempt} · ${landed.landAttempt.class === 'base-stale' ? 'base-stale → re-gate on a new base next tick (cap counts)' : landed.landAttempt.retryAllowed ? 'retry allowed on this head' : 'no retry on this head'}`
     : '';
-  step('land', landed.executed && landed.ok ? 'landed' : 'land-rejected', `${landed.detail}${attempt} · overlap-evidence ${overlapEvidence}`, true);
+  step('land', landed.executed && landed.ok ? 'landed'
+    : !landed.executed && landed.ok ? 'land-skipped' : 'land-rejected',
+  `${landed.detail}${attempt} · overlap-evidence ${overlapEvidence}`, true);
   return outcomes;
 }
 
@@ -487,10 +683,11 @@ function recordMove(statePath: string, cardId: string, runId: string | undefined
   } catch { /* recordLiveMoveHistory 는 스스로 관측한다 */ }
 }
 
-/** 재판정 대상 카드 — 묶인 PR ⊕ 그 PR 로 TA 리뷰를 요청한 적이 있는 카드. */
+/** 재판정 대상 카드 — 기존 리뷰 또는 HQ 가 종결 원장을 검증할 원격 부모 카드. */
 export function rejudgeCandidates(tasks: Readonly<Record<string, TaskCard>>): string[] {
   return Object.values(tasks).filter((card) => {
     const pr = cardPrNumber(card);
-    return pr !== undefined && (card.reviewRequests ?? []).some((entry) => entry.pr === pr);
+    return pr !== undefined && ((card.reviewRequests ?? []).some((entry) => entry.pr === pr)
+      || (card.status === 'launched' && card.taLand === true && !!card.parentHost && !!card.runId && !!card.runChildId));
   }).map((card) => card.id);
 }

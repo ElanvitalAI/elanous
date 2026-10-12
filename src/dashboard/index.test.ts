@@ -32,6 +32,8 @@ import {
 import { buildAdRunSetup } from '../ad-pipeline/ad-run-setup.js';
 import type { CommandRunner } from '../ad-pipeline/higgsfield-backend.js';
 import { dispatchDashboardSessionRuntimeTool } from './session-runtime-dispatch.js';
+import { HYDRATED_TOOLS_KEY } from '../skills/tools/tool-search-spec.js';
+import { toolSearchRuntime } from '../tool-runtime/tool-search-runtime.js';
 
 const repoRoot = resolve(import.meta.dir, '../..');
 const dashboard = readFileSync(resolve(repoRoot, 'src/dashboard/index.ts'), 'utf8');
@@ -236,6 +238,38 @@ describe('dashboard tool dispatch signal observation', () => {
     expect(dashboard).toContain("debug.log('dashboard.tool-dispatch-signal', 'selected', observation)");
     expect(dashboard).toContain('createEscAbortGate({');
     expect(dashboard).not.toContain("debug.log('esc.abort', 'selected'");
+  });
+
+  test('fixed harness turn blocks ToolSearch Edit and Write hydration through session dispatch', async () => {
+    const tools = ['Edit', 'Write', 'Read'].map((name) => ({
+      name, description: `${name} tool`, parameters: { type: 'object' },
+    }));
+    const result = {
+      output: `<functions>\n${tools.map((tool) => `<function>${JSON.stringify(tool)}</function>`).join('\n')}\n</functions>`,
+      matched: tools.map((tool) => tool.name),
+      unknown: [],
+      [HYDRATED_TOOLS_KEY]: tools,
+    };
+    let runtimeCalls = 0;
+    const dispatch = (userText: string, useTurnRef = false) => dispatchDashboardSessionRuntimeTool('ToolSearch', { query: 'select:Edit,Write,Read' }, {
+      ...(useTurnRef ? {} : { contextUserText: userText }),
+      turnRefUserText: useTurnRef ? userText : null,
+      muted: (line) => line,
+      pushChatLine: () => {},
+      draw: () => {},
+      getToolRuntime: (name) => name === 'ToolSearch' ? toolSearchRuntime as unknown as ToolRuntime : undefined,
+      dispatchToolRuntime: async () => { runtimeCalls += 1; return result; },
+      dispatchPluginTool: async () => ({ ok: false, error: 'plugin fallback must not run' }),
+      ptyDashboardOn: true,
+    });
+    const fixed = await dispatch('하니스로 구현해줘 src/example.ts 오류', true);
+    expect(runtimeCalls).toBe(1);
+    expect(fixed).toMatchObject({ matched: ['Read'] });
+    expect((fixed as typeof result)[HYDRATED_TOOLS_KEY].map((tool) => tool.name)).toEqual(['Read']);
+    expect((fixed as typeof result).output).not.toContain('"name":"Edit"');
+    expect((fixed as typeof result).output).not.toContain('"name":"Write"');
+    const ordinary = await dispatch('src/example.ts를 읽어줘');
+    expect(ordinary).toEqual(result);
   });
 
   test('emits queryable debug events that distinguish parent-turn from fallback signal sources', () => {

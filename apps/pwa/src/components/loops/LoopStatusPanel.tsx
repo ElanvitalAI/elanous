@@ -6,6 +6,8 @@ import { useDaemon } from '@/components/providers/DaemonProvider';
 import { FabricStageHeader } from '@/components/shell/FabricStageHeader';
 import { createLoopRowsRefresh, type LoopRow } from './loop-status';
 
+const LOOP_PLAIN_LEAD = '루프 = 당번 서는 AI — 정해진 때마다 스스로 깨어 맡은 일을 보고 기록을 남긴다.';
+
 const TONE: Record<LoopRow['verdict'], string> = {
   '살아 있음': 'bg-emerald-500/15 text-emerald-300 ring-emerald-500/30',
   '늦음': 'bg-red-500/15 text-red-300 ring-red-500/30',
@@ -21,7 +23,10 @@ function Verdict({ value }: { value: LoopRow['verdict'] }) {
 export function LoopStatusContent({ rows, state }: { rows: LoopRow[]; state: 'loading' | 'ready' | 'error' }) {
   if (state === 'loading') return <p role="status" className="text-sm text-muted-foreground">루프 현황을 읽는 중…</p>;
   if (state === 'error') return <p role="alert" className="text-sm text-red-300">루프 현황을 읽지 못했습니다. 일부 레지스트리 조회가 실패했습니다. 데몬 연결을 확인하세요.</p>;
-  if (!rows.length) return <p className="text-sm text-muted-foreground">등록된 루프·크론이 없습니다.</p>;
+  if (!rows.length) return <div>
+    <p className="text-sm text-muted-foreground">등록된 루프·크론이 없습니다.</p>
+    <p data-plain-lead="loop" className="text-xs text-muted-foreground">{LOOP_PLAIN_LEAD}</p>
+  </div>;
   return <div className="rounded-xl border border-border bg-card">
     <table className="hidden w-full table-fixed text-left text-sm md:table">
       <thead className="border-b border-border text-muted-foreground"><tr>

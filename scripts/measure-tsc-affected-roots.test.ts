@@ -36,6 +36,8 @@ test('new full-program error with passing narrowed gate is missed; matching fail
   expect(result.prs[0]?.missedDiagnostics).toEqual([{ file: 'src/a.ts', code: 'TS2322', message: 'Type string is not assignable to number.' }]);
   expect(result.exitCode).toBe(1);
   expect(missed.calls.some((call) => call.command === '/usr/bin/time' && call.args.includes('bun') && call.env?.TSC_BASE_REF === base)).toBe(true);
+  expect(missed.calls.some((call) => call.args.includes('bun') && call.env?.TSC_GATE_ROOTS === 'affected')).toBe(true);
+  expect(missed.calls.some((call) => call.args.includes('bun') && call.env?.ELANOUS_TSC_AFFECTED_ROOTS === '1')).toBe(true);
   expect(missed.removed).toEqual(['/tmp/fake-affected']);
   const same = await measureAffectedRoots('/repo', ['--prs', '1'], fake({ head: error, gate: output(1, `[tsc-gate] FAIL — 타입 에러가 있다\n${error}`) }).deps);
   expect(same.prs[0]?.verdict).toBe('same');

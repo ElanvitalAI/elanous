@@ -1,8 +1,9 @@
 // Telegram /attach /detach /sessions — the mobile-side counterpart
 // to the TUI /telegram attach|detach handoff.
 //
-// Each test gets an isolated sessions root via XDG_DATA_HOME so the
-// bindings index doesn't leak between cases. We exercise the command
+// Each test gets isolated session and active-pointer roots via
+// ELANOUS_SESSION_ROOT and ELANOUS_STATE_DIR, so bindings and the active
+// marker cannot leak between cases. We exercise the command
 // handlers the same way the real dispatcher does (parseTelegramSlash
 // → cmd.handler) so a regression in parsing or routing is visible
 // from here.
@@ -25,6 +26,9 @@ import type { UserConfig } from '../src/user-config.js';
 import type { TgIncoming } from '../src/telegram.js';
 
 let tmp: string;
+let previousStateDir: string | undefined;
+let previousSessionRoot: string | undefined;
+let previousXdgStateHome: string | undefined;
 
 beforeEach(() => {
   tmp = mkdtempSync(join(tmpdir(), 'tg-attach-'));
@@ -32,15 +36,23 @@ beforeEach(() => {
   // the stale XDG_DATA_HOME redirect no longer isolates it — these
   // commands run through the dispatcher (default root) and would
   // otherwise read/write the REAL store. ELANOUS_SESSION_ROOT points the
-  // whole store at the temp dir. State (active-session) still honors
-  // XDG_STATE_HOME.
+  // whole store at the temp dir. The active-session pointer follows
+  // ELANOUS_STATE_DIR when the deterministic test runner sets it.
+  previousStateDir = process.env.ELANOUS_STATE_DIR;
+  previousSessionRoot = process.env.ELANOUS_SESSION_ROOT;
+  previousXdgStateHome = process.env.XDG_STATE_HOME;
   process.env.ELANOUS_SESSION_ROOT = join(tmp, 'sessions');
+  process.env.ELANOUS_STATE_DIR = join(tmp, 'state');
   process.env.XDG_STATE_HOME = join(tmp, 'state');
 });
 afterEach(() => {
   rmSync(tmp, { recursive: true, force: true });
-  delete process.env.ELANOUS_SESSION_ROOT;
-  delete process.env.XDG_STATE_HOME;
+  if (previousSessionRoot === undefined) delete process.env.ELANOUS_SESSION_ROOT;
+  else process.env.ELANOUS_SESSION_ROOT = previousSessionRoot;
+  if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+  else process.env.ELANOUS_STATE_DIR = previousStateDir;
+  if (previousXdgStateHome === undefined) delete process.env.XDG_STATE_HOME;
+  else process.env.XDG_STATE_HOME = previousXdgStateHome;
 });
 
 function fakeCtx(text: string, overrides: Partial<TgIncoming> = {}): TgIncoming {

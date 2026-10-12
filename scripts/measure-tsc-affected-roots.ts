@@ -1,3 +1,10 @@
+/**
+ * Measures the changed-file gate against the whole program on recently merged PRs.
+ * The narrowed run is the gate's default root check (changed .ts ∪ direct importers), so `missed` / `same` judge that mode:
+ * the run pins TSC_GATE_ROOTS to a non-`full` value and disables the rollback switch
+ * even when the caller's shell requests a full run.
+ * `missed > 0` is reverted without a code change by running the gate with env `TSC_GATE_ROOTS=full`.
+ */
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -223,7 +230,9 @@ async function measurePr(repo: string, pr: Pr, run: Runner, platform: NodeJS.Pla
     const added = compareDiagnostics(current, baseline);
     if (added.kind === 'unavailable') throw new Error(added.reason);
     result.addedDiagnostics = added.added;
-    const gateRun = await timed(run, platform, 'bun', ['scripts/ci-typecheck-changed.ts', '--local'], worktree, { ...process.env, TSC_BASE_REF: base });
+    const gateRun = await timed(run, platform, 'bun', ['scripts/ci-typecheck-changed.ts', '--local'], worktree, {
+      ...process.env, TSC_BASE_REF: base, TSC_GATE_ROOTS: 'affected', ELANOUS_TSC_AFFECTED_ROOTS: '1',
+    });
     result.narrowed = elapsed(gateRun, platform);
     result.gateExitCode = gateRun.status;
     const seen = gateDiagnostics(gateRun, worktree);

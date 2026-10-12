@@ -23,6 +23,7 @@ import { parentUnlandedProgressLine } from './run-supervisor.js';
 import { mkdirSync, openSync, writeFileSync, closeSync, renameSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { goalPathFromArgv, launchRegistryDir, removeLaunchBinding, writeLaunchBinding } from '../harness/launch-registry.js';
+import { psProcessStartMs } from '../harness/harness-stop.js';
 import { adoptRunCard } from '../task-agent/run-adopt.js';
 import { availableParallelism, cpus } from 'node:os';
 import { selfDevRunsDir } from './run-store.js';
@@ -912,12 +913,15 @@ async function deleteLabelledJobs(runId: string, selectedTargets: readonly { con
  *  take minutes before that, and a stop in that window found «no process» (10-01 · three runs). */
 export function writeRunPidRecord(runId: string, runsDir: string = selfDevRunsDir(), registryDir: string | null = launchRegistryDir()): string {
   const pidPath = join(runsDir, runId, 'pid.json');
+  // The observer reads `ps -o lstart=`, whose precision is one second. Record that same
+  // process birth value when available so a launch near a second boundary still matches.
+  const startedAt = psProcessStartMs(process.pid) ?? Date.now() - Math.floor(process.uptime() * 1000);
   mkdirSync(join(runsDir, runId), { recursive: true });
   const temporary = `${pidPath}.${process.pid}.${randomUUID()}.tmp`;
   const fd = openSync(temporary, 'wx', 0o600);
   try {
     try {
-      writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: Date.now() - Math.floor(process.uptime() * 1000), argv0: process.argv0 }));
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt, argv0: process.argv0 }));
     } finally { closeSync(fd); }
     renameSync(temporary, pidPath);
   } catch (error) { unlinkSync(temporary); throw error; }
@@ -925,7 +929,7 @@ export function writeRunPidRecord(runId: string, runsDir: string = selfDevRunsDi
   if (registryDir !== null) {
     const cwd = process.cwd();
     const goalPath = goalPathFromArgv(process.argv, cwd);
-    writeLaunchBinding(runId, { pid: process.pid, startedAt: Date.now() - Math.floor(process.uptime() * 1000), argv0: process.argv0,
+    writeLaunchBinding(runId, { pid: process.pid, startedAt, argv0: process.argv0,
       cwd, ...(goalPath ? { goalPath } : {}), runsDir: resolve(runsDir),
       ...(process.env.ELANOUS_POD_NAME ? { podName: process.env.ELANOUS_POD_NAME } : {}),
       ...(process.env.ELANOUS_TASK_CARD_ID ? { taskCardId: process.env.ELANOUS_TASK_CARD_ID } : {}) }, registryDir);
