@@ -77,6 +77,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 ## Releases
 
 - [0.2.4](https://docs.elanous.ai/releases/0-2-4/): PTY intelligence stage two: elanous works inside Codex and Claude Code, installs a plugin from an agent's own menu, and passes one mission along several agents.
+- [0.2.25](https://docs.elanous.ai/releases/0-2-25/): Changes in 0.2.25.
 - [0.2.24](https://docs.elanous.ai/releases/0-2-24/): Changes in 0.2.24.
 - [0.2.23](https://docs.elanous.ai/releases/0-2-23/): Changes in 0.2.23.
 - [0.2.22](https://docs.elanous.ai/releases/0-2-22/): Changes in 0.2.22.

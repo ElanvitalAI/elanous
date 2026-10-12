@@ -5072,6 +5072,18 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.2.25
+
+Source: https://docs.elanous.ai/releases/0-2-25/
+
+## Behavior changes
+
+- Retro facts now includes run exit incidents in its read-only output.
+
+Plus 133 internal changes.
+
+---
+
 # 0.2.24
 
 Source: https://docs.elanous.ai/releases/0-2-24/
