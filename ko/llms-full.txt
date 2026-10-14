@@ -486,16 +486,65 @@ subscription is not silently billed as API use.
 
 ## Reaching elanous from anywhere
 
-### Tailscale — the web app on your other devices
+### Tailscale — the web app across your devices
+
+Tailscale connects your own computers and phones over a private network. With
+the web app shared from an always-on Elanous host, you can open the same
+workspace from a phone or tablet away from home, or from another computer on
+your tailnet. A headset or glasses can use it too if they have a browser that
+can open the web app. This is useful for checking work and reaching the host's
+web app remotely; it does not install Elanous on each device or make the host
+redundant.
+
+**Where this connects:** This sharing setup provides a remote-access path
+to the web app. The `pwa share enable` step does not add content to the
+absorption loop, adaptive grounding, daily external trend watching or
+marketing; those are separate workflows.
+
+Set it up in this order:
+
+1. Install Tailscale on the Elanous host and each device from
+   [tailscale.com/download](https://tailscale.com/download).
+2. Sign in on each device and join the host's tailnet. If different people
+   use their own accounts, [invite them to the tailnet](https://tailscale.com/docs/features/sharing/how-to/invite-any-user).
+   Keep Tailscale running on the host and confirm it is connected.
+3. On the host, enable sharing for the web app:
+
+   ```bash
+   elanous nexus pwa share enable
+   ```
+
+4. Open the shared URL from a browser on a signed-in phone, tablet or other
+   device. See [The web app](/surfaces/pwa#use-it-from-another-device).
+
+Check the host's Tailscale connection and its MagicDNS name with this
+read-only command:
 
 ```bash
-elanous nexus pwa share enable
+tailscale status --json
 ```
 
-publishes the web app on your private Tailscale network, so your phone,
-tablet and other computers can open it. Install Tailscale from
-[tailscale.com](https://tailscale.com/download) and sign in on each device.
-See [The web app](/surfaces/pwa#use-it-from-another-device).
+The host should report `BackendState` as `Running`; `Self.DNSName` identifies
+its MagicDNS name. Check the active Serve configuration independently with:
+
+```bash
+tailscale serve status --json
+```
+
+`elanous nexus pwa share enable` forwards the Nexus web app through Tailscale
+Serve's TLS-terminated TCP mode on the daemon's port. A successful command
+prints a URL in the form `https://<host>:<port>/app/`; use that exact URL on
+another device in the same tailnet. The port is part of the URL. In the Serve
+status JSON, find `TCP["<port>"]` using the port printed in that URL; its
+`TCPForward` should target `localhost:<port>` and `TerminateTLS` should name
+the host. If sharing fails, confirm that Tailscale is running and that the
+Nexus daemon has a known port, then retry the command. These status checks do
+not by themselves prove another device can open the app.
+
+Tailscale is optional: without it, the web app remains available on the host
+but is not shared through this tailnet path. The documented benefit here is
+remote access to the web app; no increase in automation or host availability
+has been measured for this guide.
 
 ### Telegram and Discord
 
@@ -5069,6 +5118,23 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 - The web app's Terminal shows each driven terminal side by side with a strip of what elanous just did and why; you can take over with the keyboard or mouse.
 
 - On a credit policy, the hourly limit alert adds up the credits across your Codex accounts and their combined burn rate, and says when they will run out.
+
+---
+
+# 0.2.28
+
+Source: https://docs.elanous.ai/releases/0-2-28/
+
+## Behavior changes
+
+- Failed reviews can launch a bounded commit-only repair on the same PR branch with exact-head protection and owner notification.
+- Seat messages can stream from a separate authenticated SSE post office, with durable replay and polling fallback.
+- `eln pr land --cwd` now reads TypeScript gate inputs from the selected worktree and finds an installed compiler before running; missing compiler dependencies fail with an install hint.
+- Seat messages can link replies, wait for the first answer with an explicit sender, and display ordered threads.
+- Explicit child rework escalation can use an optional same-provider model map, with env precedence and an observed target decision.
+- Telegram briefings now collect item button and reply feedback, order measured topics by weekly action rate, and keep incomplete split items eligible for retry; delivery remains at least once.
+
+Plus 103 internal changes.
 
 ---
 
