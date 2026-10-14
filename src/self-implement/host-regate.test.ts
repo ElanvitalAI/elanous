@@ -13,6 +13,7 @@ import { syncMergedPrChecklist } from '../release-loop/merged-pr-checklist.js';
 import { addItem, listChecklist } from '../release-loop/checklist.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
+import { detectTestInterference, type RunnerResult } from '../../scripts/detect-test-interference.js';
 
 const testFreezeRoot = mkdtempSync(join(tmpdir(), 'host-regate-freeze-'));
 afterAll(() => rmSync(testFreezeRoot, { recursive: true, force: true }));
@@ -36,7 +37,8 @@ function mock(overrides: Partial<HostRegateDeps> = {}) {
       if (call === 'git rev-parse HEAD') return { status: 0, stdout: BASE, stderr: '' };
       if (call === 'git rev-parse HEAD^1') return { status: 0, stdout: BASE, stderr: '' };
       if (call === 'git rev-parse HEAD^2') return { status: 0, stdout: HEAD, stderr: '' };
-      if (call === 'git rev-parse FETCH_HEAD') return { status: 0, stdout: calls.at(-2) === `git fetch origin refs/heads/main` ? BASE : HEAD, stderr: '' };
+      if (/^git rev-parse refs\/elanous\/regate\/[^ ]+\/base$/.test(call)) return { status: 0, stdout: BASE, stderr: '' };
+      if (/^git rev-parse refs\/elanous\/regate\/[^ ]+\/head$/.test(call)) return { status: 0, stdout: HEAD, stderr: '' };
       if (call === `git merge-base ${BASE} ${HEAD}`) return { status: 0, stdout: MERGE_BASE, stderr: '' };
       if (call === `git diff --name-only ${MERGE_BASE} ${HEAD}`) return { status: 0, stdout: 'src/feature.test.ts\n', stderr: '' };
       if (call === `git diff --find-renames --name-status -z ${MERGE_BASE} ${HEAD}`) return { status: 0, stdout: 'M\0src/feature.test.ts\0', stderr: '' };
@@ -52,6 +54,26 @@ function mock(overrides: Partial<HostRegateDeps> = {}) {
   };
   return { deps, calls, events };
 }
+
+test('two concurrent regates in one repo read separate base and head refs and remove only their refs', async () => {
+  const { deps, calls } = mock();
+  const results = await Promise.all([
+    runHostRegate({ ...input, noMerge: true }, deps),
+    runHostRegate({ ...input, noMerge: true }, deps),
+  ]);
+  expect(results.every((result) => result.passed)).toBe(true);
+  const fetches = calls.filter((call) => call.startsWith('git fetch --no-write-fetch-head origin +'));
+  const refs = fetches.map((call) => call.split(':').at(-1)!);
+  expect(fetches).toHaveLength(4);
+  expect(new Set(refs).size).toBe(4);
+  expect(refs.filter((ref) => ref.endsWith('/base'))).toHaveLength(2);
+  expect(refs.filter((ref) => ref.endsWith('/head'))).toHaveLength(2);
+  for (const ref of refs) {
+    expect(calls).toContain(`git rev-parse ${ref}`);
+    expect(calls).toContain(`git update-ref -d ${ref}`);
+  }
+  expect(calls.some((call) => call.includes('FETCH_HEAD'))).toBe(false);
+});
 
 describe('host regate: never merge without a measured host pass', () => {
   test('public doc changed: host calls exposure gate before merging; blocking verdict fails landing', async () => {
@@ -253,6 +275,53 @@ describe('host regate: never merge without a measured host pass', () => {
       expect(calls).toContain(`git worktree remove --force ${tree}`);
       expect(existsSync(tree)).toBe(false);
       expect(git('worktree', 'list', '--porcelain')).not.toContain(tree);
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+
+  test('a competing real Git fetch between PR fetch and verification cannot replace checked head', async () => {
+    const d = mkdtempSync(join(tmpdir(), 'host-regate-fetch-race-'));
+    const tree = join(d, 'candidate');
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: d, encoding: 'utf8' }).trim();
+    try {
+      git('init', '-q');
+      git('config', 'user.name', 'Regate Test');
+      git('config', 'user.email', 'regate@test.local');
+      writeFileSync(join(d, 'feature.test.ts'), 'base\n');
+      git('add', '.');
+      git('commit', '-qm', 'base');
+      const base = git('rev-parse', 'HEAD');
+      writeFileSync(join(d, 'feature.test.ts'), 'head\n');
+      git('commit', '-qam', 'head');
+      const head = git('rev-parse', 'HEAD');
+      writeFileSync(join(d, 'feature.test.ts'), 'competing\n');
+      git('commit', '-qam', 'competing');
+      const competing = git('rev-parse', 'HEAD');
+      git('update-ref', 'refs/heads/main', base);
+      git('update-ref', 'refs/pull/42/head', head);
+      git('update-ref', 'refs/pull/99/head', competing);
+      git('remote', 'add', 'origin', d);
+      let injected = 0;
+      const prView = JSON.stringify({ headRefOid: head, baseRefName: 'main', baseRefOid: base, state: 'OPEN', isDraft: false });
+      const deps: HostRegateDeps = {
+        acquire: async () => () => {}, makeTemp: () => tree,
+        command: (bin, args, cwd) => {
+          if (bin === 'gh') return { status: 0, stdout: prView, stderr: '' };
+          if (bin === 'bun') return { status: 0, stdout: '', stderr: '' };
+          const result = spawnSync(bin, [...args], { cwd, encoding: 'utf8' });
+          if (bin === 'git' && args[0] === 'fetch' && args.some((arg) => arg.includes('refs/pull/42/head'))) {
+            const other = spawnSync('git', ['fetch', 'origin', 'refs/pull/99/head'], { cwd, encoding: 'utf8' });
+            expect(other.status).toBe(0);
+            injected++;
+          }
+          return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+        },
+        interference: async () => ({ passed: false, detail: 'stop after verified fetch' }), log: () => {},
+      };
+      const result = await runHostRegate({ prNumber: 42, headCommit: head, repoRoot: d }, deps);
+      expect(injected).toBe(1);
+      expect(git('rev-parse', 'FETCH_HEAD')).toBe(competing);
+      expect(result.failures[0]?.step).toBe('test-interference');
+      expect(git('for-each-ref', '--format=%(refname)', 'refs/elanous/regate')).toBe('');
     } finally { rmSync(d, { recursive: true, force: true }); }
   });
 
@@ -674,7 +743,7 @@ describe('host regate: never merge without a measured host pass', () => {
     const { deps, calls, events } = mock();
     const command = deps.command!;
     deps.command = (bin, args, cwd, env) => {
-      if (bin === 'git' && args.join(' ') === 'rev-parse FETCH_HEAD') {
+      if (bin === 'git' && /^rev-parse refs\/elanous\/regate\/[^ ]+\/(base|head)$/.test(args.join(' '))) {
         calls.push(`${bin} ${args.join(' ')}`);
         return { status: 0, stdout: 'd'.repeat(40), stderr: '' };
       }
@@ -1058,6 +1127,84 @@ describe('host regate interference: neighbour tests never push the selection ove
   mkdirSync(join(root, 'src/big'), { recursive: true });
   for (let i = 0; i < 20; i++) writeFileSync(join(root, 'src/big', `n${String(i).padStart(2, '0')}.test.ts`), '');
   const clean = (paths: readonly string[]) => ({ order: [...paths], isolated: [], combined: { status: 'measured', fail: 0 }, status: 'no-interference', isolatedFailures: 0, combinedFailures: 0, difference: 0 }) as never;
+
+  test('isolated and combined failure names reach the detail and ledger without changing failure verdict', async () => {
+    const a = 'src/a.test.ts';
+    const b = 'src/b.test.ts';
+    const run = (body: string, fail: number, files: number): RunnerResult => ({
+      stdout: `${body}\n${fail} fail\nRan ${fail || 1} tests across ${files} files.\n`, stderr: '', exitCode: fail ? 1 : 0,
+    });
+    const outputs: Record<string, RunnerResult> = {
+      [a]: run(`${a}:\n(fail) isolated case [1ms]`, 1, 1),
+      [b]: run(`${b}:\n(pass) okay`, 0, 1),
+      [`${a} ${b}`]: run(`${a}:\n(fail) isolated case [1ms]\n${b}:\n(fail) combined case [1ms]`, 2, 2),
+    };
+    const verdict = await defaultInterference([a, b], root, {
+      neighbors: false,
+      detect: (paths) => detectTestInterference(paths, async (selected) => outputs[selected.join(' ')]!),
+    });
+    expect(verdict.passed).toBe(false);
+    expect(verdict.detail).toContain('isolated files=src/a.test.ts; tests=isolated case');
+    expect(verdict.detail).toContain('combined files=src/a.test.ts | src/b.test.ts; tests=isolated case | combined case');
+    const logged: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const { deps } = mock({ interference: async () => verdict, log: (event, data) => { logged.push({ event, data }); } });
+    const result = await runHostRegate(input, deps);
+    expect(result.failures[0]?.detail).toBe(verdict.detail!);
+    expect(logged.find(({ event }) => event === 'failed')?.data.detail).toBe(verdict.detail!);
+  });
+
+  test('a numeric failure summary without printed identities stays unknown', async () => {
+    const a = 'src/a.test.ts';
+    const b = 'src/b.test.ts';
+    const verdict = await defaultInterference([a, b], root, {
+      neighbors: false,
+      detect: (paths) => detectTestInterference(paths, async (selected) => ({
+        stdout: `1 fail\nRan 1 test across ${selected.length} files.\n`, stderr: '', exitCode: 1,
+      })),
+    });
+    expect(verdict.passed).toBe(false);
+    expect(verdict.detail).toContain('isolated files=unknown; tests=unknown');
+    expect(verdict.detail).toContain('combined files=unknown; tests=unknown');
+    expect(verdict.detail).not.toContain('files=src/a.test.ts');
+  });
+
+  test('a single failing selected file is not called the failed file without an output heading', async () => {
+    const verdict = await defaultInterference(['src/a.test.ts'], root, {
+      neighbors: false,
+      run: async () => ({ stdout: '1 fail\nRan 1 test across 1 file.\n', stderr: '', exitCode: 1 }),
+    });
+    expect(verdict.passed).toBe(false);
+    expect(verdict.detail).toBe('single=1 fail; files=unknown; tests=unknown');
+  });
+
+  test('failure identity lists stay within eight files and twenty tests across both runs', async () => {
+    const verdict = await defaultInterference(['src/a.test.ts', 'src/b.test.ts'], root, {
+      neighbors: false,
+      detect: async (paths) => ({
+        order: [...paths], status: 'interference', isolatedFailures: 1, combinedFailures: 2, difference: 1,
+        isolated: [{ files: [paths[0]!], status: 'measured', fail: 1,
+          failedFiles: Array.from({ length: 9 }, (_, i) => `isolated-${i}.test.ts`),
+          failedTests: Array.from({ length: 21 }, (_, i) => `isolated-case-${i}`) }],
+        combined: { files: [...paths], status: 'measured', fail: 2,
+          failedFiles: Array.from({ length: 9 }, (_, i) => `combined-${i}.test.ts`),
+          failedTests: Array.from({ length: 21 }, (_, i) => `combined-case-${i}`) },
+      }),
+    });
+    expect(verdict.detail).toContain('isolated-3.test.ts');
+    expect(verdict.detail).toContain('combined-3.test.ts');
+    expect(verdict.detail).not.toContain('isolated-4.test.ts');
+    expect(verdict.detail).not.toContain('combined-4.test.ts');
+    expect(verdict.detail).toContain('isolated-case-9');
+    expect(verdict.detail).toContain('combined-case-9');
+    expect(verdict.detail).not.toContain('isolated-case-10');
+    expect(verdict.detail).not.toContain('combined-case-10');
+    expect(verdict.detail).toContain('+5 more');
+    expect(verdict.detail).toContain('+11 more');
+    const logged: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const { deps } = mock({ interference: async () => verdict, log: (event, data) => { logged.push({ event, data }); } });
+    await runHostRegate(input, deps);
+    expect(logged.find(({ event }) => event === 'failed')?.data.detail).toBe(verdict.detail!);
+  });
 
   test('changed test in a directory with 20 siblings is measured, changed test kept, selection ≤ cap', async () => {
     const seen: string[][] = [];

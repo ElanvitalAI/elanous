@@ -477,6 +477,17 @@ describe('tools.nativeStructure provider list', () => {
     writeConfig({ tools: { selfImplement: {} } });
     expect(buildUserConfig(configPath).tools.selfImplement.goalAuthorPersistentGrounding).toBeUndefined();
   });
+
+  test('parses opt-in self-implement child escalation map without inventing a default', () => {
+    writeConfig({ tools: { selfImplement: { escalateChild: {
+      'openrouter/z-ai/glm-5.3': 'openrouter/anthropic/claude-sonnet-5.5', invalid: 42,
+    } } } });
+    expect(buildUserConfig(configPath).tools.selfImplement.escalateChild).toEqual({
+      'openrouter/z-ai/glm-5.3': 'openrouter/anthropic/claude-sonnet-5.5',
+    });
+    writeConfig({ tools: { selfImplement: {} } });
+    expect(buildUserConfig(configPath).tools.selfImplement.escalateChild).toBeUndefined();
+  });
 });
 
 describe('runtime llm model/provider compatibility', () => {

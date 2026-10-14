@@ -13,6 +13,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { isNoneSentinelFinding } from '../agent-substrate/pr-reviewer.js';
+import { repairReviewDigest } from './repair-review.js';
 import { debug } from '../debug/log.js';
 import { LIVE_MOVE_RESULT_EVENT, cardPrNumber, readTaskAgentState, readTaskCard, updateTaskCard, type TaskCard, type TaskCardEvent } from './task-hand.js';
 import type { RejudgeDeps } from './rejudge-on-head.js';
@@ -155,7 +156,7 @@ export function captureReviewResults(statePath: string, opts: CaptureReviewResul
           at: now.toISOString(), event: LIVE_MOVE_RESULT_EVENT, kind: 'review', pr: request.pr,
           ...(parsed.head ? { head: parsed.head } : {}),
           verdict: parsed.verdict, reviewed: parsed.reviewed, mustFix: parsed.mustFix, reviewRoute: parsed.reviewRoute,
-          resultPath,
+          resultPath, reviewSha256: repairReviewDigest(text!),
           effect: `review result captured · verdict ${parsed.verdict ?? 'none'} · reviewed ${parsed.reviewed ?? 'unknown'} · must-fix ${parsed.mustFix ?? 'unknown'}`,
           ...(parsed.error ? { detail: parsed.error.slice(0, 300) } : {}),
         };

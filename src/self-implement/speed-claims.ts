@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { prodInstanceRoot } from '../instance/resolve.js';
+import { prodInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { seatOfTree } from '../loops/orchestrator/traffic.js';
 import { getUserConfig, ORCHESTRATOR_DEFAULTS } from '../user-config.js';
 import { isRunStatus } from './run-status-mapping.js';
@@ -30,6 +30,7 @@ export interface SpeedClaimsMeasurement {
   rows: SpeedClaimsRow[];
   note: string;
   parent: ParentSpeedClaimsMeasurement;
+  daily: SpeedClaimsDailyMeasurement;
 }
 export interface ParentSpeedClaimsEvent {
   ts: string;
@@ -58,6 +59,32 @@ export interface ParentSpeedClaimsMeasurement {
   note: string;
 }
 
+export interface SpeedClaimsReleaseEvent {
+  ts: string;
+  version: string;
+}
+
+export interface SpeedClaimsDailyRow {
+  date: string;
+  landedPrCount: number | null;
+  releasedCount: number | null;
+}
+
+export interface SpeedClaimsDailySourceStatus {
+  status: 'measured' | 'unmeasured';
+  undatedCount: number;
+}
+
+export interface SpeedClaimsDailyMeasurement {
+  scope: 'last-30-days';
+  windowStart: string;
+  windowEnd: string;
+  landedPrs: SpeedClaimsDailySourceStatus;
+  releases: SpeedClaimsDailySourceStatus;
+  rows: SpeedClaimsDailyRow[];
+  note: string;
+}
+
 export interface SpeedClaimsOptions {
   dir?: string;
   list?: (path: string) => string[];
@@ -65,6 +92,8 @@ export interface SpeedClaimsOptions {
   readSeat?: (runId: string, ledgerDirectory: string, entries: readonly RunLedgerEntry[]) => SpeedClaimsSeat;
   readParentEvents?: () => readonly ParentSpeedClaimsEvent[];
   readParentQueue?: () => unknown;
+  now?: number;
+  readReleaseEvents?: () => readonly SpeedClaimsReleaseEvent[];
 }
 
 const NOTE = 'Child-ledger elapsed minutes from the first child event (or checkpoint creation when unavailable) to the recorded child end, including retries and resumes; this is not the parent launch-to-done interval. Only finished runs enter quartiles (linear interpolation at ranks (n-1)*p). In-progress runs (including parked) and missing, unreadable or invalid timestamps are excluded, not assigned zero. Seats come from the same state root checkpoint, launch queue or recorded launch tree; unresolved seats are counted separately. A completed run without a recorded merge is not a merge.';
@@ -192,6 +221,98 @@ function readParentQueueFromState(): unknown {
   return JSON.parse(readFileSync(join(prodInstanceRoot(), 'harness', 'queue.json'), 'utf8')) as unknown;
 }
 
+const DAILY_WINDOW_DAYS = 30;
+const DAY_MS = 86_400_000;
+const DAILY_NOTE = 'Daily rows cover the last 30 UTC calendar days ending on the measurement day. Landed PRs are child run-ledger merged events (merged=true), identified by PR number with the run id as fallback when no number is recorded, de-duplicated across runs, retries and resumes, and attributed to the earliest recorded landing timestamp. Issued releases use the release ledger publishedAt, never a tag target commit date, and are de-duplicated by version. Identities without any valid timestamp are counted as undated, never as a day. A count of zero means the day was queried and had no events; unmeasured means the source could not be queried, and the JSON value is null. Start-to-land and external-change-to-reflection timings stay with the parent and child measurements above.';
+const VERSION_TAG = /^v?\d+(?:\.\d+)+(?:-[\w.]+)?$/;
+
+interface DailyObservation {
+  key: string;
+  ts: number | null;
+}
+
+function utcDayOf(ts: number): string {
+  return new Date(ts).toISOString().slice(0, 10);
+}
+
+/** Landed-PR identity: the recorded PR number, else the run id (one run lands at most one PR). */
+function landedPrIdentity(data: unknown, runId: string): string {
+  const number = object(data)?.number;
+  if (typeof number === 'number' && Number.isInteger(number) && number > 0) return `pr-${number}`;
+  if (typeof number === 'string' && /^\d+$/.test(number.trim()) && Number(number.trim()) > 0) return `pr-${Number(number.trim())}`;
+  return runId;
+}
+
+/** De-duplicate repeated identities by their earliest valid timestamp; identities without any valid timestamp are reported as undated, never dropped silently. */
+function dailyBuckets(observations: readonly DailyObservation[]): { counts: Map<string, number>; undated: number } {
+  const earliest = new Map<string, number>();
+  const undated = new Set<string>();
+  for (const { key, ts } of observations) {
+    if (key.length === 0) continue;
+    if (ts === null) { undated.add(key); continue; }
+    const known = earliest.get(key);
+    if (known === undefined || ts < known) earliest.set(key, ts);
+  }
+  const counts = new Map<string, number>();
+  for (const ts of earliest.values()) {
+    const day = utcDayOf(ts);
+    counts.set(day, (counts.get(day) ?? 0) + 1);
+  }
+  let undatedCount = 0;
+  for (const key of undated) if (!earliest.has(key)) undatedCount++;
+  return { counts, undated: undatedCount };
+}
+
+/** Read-only daily census of landed PRs and issued releases over the last 30 UTC days. */
+function measureDailySpeedClaims(
+  landed: readonly DailyObservation[],
+  landedMeasured: boolean,
+  releases: readonly SpeedClaimsReleaseEvent[] | null,
+  now: number,
+): SpeedClaimsDailyMeasurement {
+  const windowEnd = utcDayOf(now);
+  const startMs = Date.parse(`${windowEnd}T00:00:00.000Z`) - (DAILY_WINDOW_DAYS - 1) * DAY_MS;
+  const landedBuckets = dailyBuckets(landed);
+  const releaseBuckets = releases === null
+    ? null
+    : dailyBuckets(releases.map((event) => ({ key: event.version.trim().replace(/^v(?=\d)/, ''), ts: parseTime(event.ts) })));
+  const landedComplete = landedMeasured && landedBuckets.undated === 0;
+  const releasesComplete = releaseBuckets !== null && releaseBuckets.undated === 0;
+  return {
+    scope: 'last-30-days', windowStart: utcDayOf(startMs), windowEnd,
+    landedPrs: { status: landedComplete ? 'measured' : 'unmeasured', undatedCount: landedBuckets.undated },
+    releases: { status: releasesComplete ? 'measured' : 'unmeasured', undatedCount: releaseBuckets?.undated ?? 0 },
+    rows: Array.from({ length: DAILY_WINDOW_DAYS }, (_, index) => {
+      const date = utcDayOf(startMs + index * DAY_MS);
+      return {
+        date,
+        landedPrCount: landedComplete ? (landedBuckets.counts.get(date) ?? 0) : null,
+        releasedCount: releasesComplete ? (releaseBuckets!.counts.get(date) ?? 0) : null,
+      };
+    }),
+    note: DAILY_NOTE,
+  };
+}
+
+/** Release manifests record the actual publication time; lightweight tags have no creation timestamp. */
+function readReleaseEventsFromLedger(): SpeedClaimsReleaseEvent[] {
+  const root = join(releaseLedgerRoot(), 'release');
+  const versions = readdirSync(root).filter((version) => VERSION_TAG.test(version));
+  const events: SpeedClaimsReleaseEvent[] = [];
+  for (const version of versions) {
+    // Absence and corruption are both unmeasured; only a readable manifest proves preparation.
+    const value: unknown = JSON.parse(readFileSync(join(root, version, 'release.json'), 'utf8')) as unknown;
+    const record = object(value);
+    if (record?.version !== version) throw new Error(`release manifest version mismatch: ${version}`);
+    if (!Object.hasOwn(record, 'publishedAt')) continue; // Prepared, not yet published.
+    if (typeof record.publishedAt !== 'string' || parseTime(record.publishedAt) === null) throw new Error(`invalid release publication time: ${version}`);
+    events.push({ version, ts: record.publishedAt });
+  }
+  // A checkout without tags or a release history cannot establish a queried zero.
+  if (versions.length === 0) throw new Error('release publication history unavailable');
+  return events;
+}
+
 /** Parent launch-to-done census; no child ledger id is used as a join key. */
 export function measureParentSpeedClaims(
   events: readonly ParentSpeedClaimsEvent[], queue?: unknown,
@@ -262,7 +383,13 @@ export function measureParentSpeedClaims(
 
 /** Read-only elapsed-time census of canonical local run ledgers, including unsuccessful runs. */
 export function measureSpeedClaims(options: SpeedClaimsOptions = {}): SpeedClaimsMeasurement {
+  const now = options.now ?? Date.now();
   const ledgerDirectory = resolve(options.dir ?? runLedgerDir());
+  let releaseEvents: readonly SpeedClaimsReleaseEvent[] | null = null;
+  try {
+    const events = (options.readReleaseEvents ?? readReleaseEventsFromLedger)();
+    releaseEvents = Array.isArray(events) ? events : null;
+  } catch { /* An unreadable release source marks releases unmeasured; it does not erase landed-PR observations. */ }
   let parent: ParentSpeedClaimsMeasurement;
   try {
     const events = (options.readParentEvents ?? readParentEventsFromLogs)();
@@ -272,21 +399,27 @@ export function measureSpeedClaims(options: SpeedClaimsOptions = {}): SpeedClaim
   } catch {
     parent = { ...measureParentSpeedClaims([]), status: 'cannot-measure' };
   }
-  const result: SpeedClaimsMeasurement = {
+  const result: Omit<SpeedClaimsMeasurement, 'daily'> = {
     scope: 'self-implement-run-ledger', ledgerDirectory, status: 'measured',
     completedCount: 0, inProgressCount: 0, cannotMeasureCount: 0, unknownSeatCount: 0, rows: [], note: NOTE, parent,
   };
   let files: string[];
   try { files = (options.list ?? readdirSync)(ledgerDirectory); }
-  catch { return { ...result, status: 'cannot-measure' }; }
+  catch { return { ...result, status: 'cannot-measure', daily: measureDailySpeedClaims([], false, releaseEvents, now) }; }
 
+  const landed: DailyObservation[] = [];
+  let ledgerUnreadable = false;
   const groups = new Map<string, { seat: SpeedClaimsSeat; outcome: SpeedClaimsOutcome; values: number[] }>();
   for (const file of files.sort()) {
     const runId = file.endsWith('.jsonl') ? file.slice(0, -'.jsonl'.length) : '';
     if (!CANONICAL_RUN_ID.test(runId)) continue;
     try {
       const entries = loadRunLedger(runId, ledgerDirectory, options.read);
-      if (!entries || entries.length === 0) { result.cannotMeasureCount++; continue; }
+      if (!entries || entries.length === 0) { ledgerUnreadable = true; result.cannotMeasureCount++; continue; }
+      const merges = entries.filter((entry) => entry.event === 'merged' && entry.data.merged === true);
+      const numbered = new Set(merges.map((entry) => landedPrIdentity(entry.data, runId)).filter((key) => key !== runId));
+      if (numbered.size > 1) ledgerUnreadable = true; // Conflicting PR identities cannot establish a daily count.
+      else for (const entry of merges) landed.push({ key: numbered.size === 1 ? [...numbered][0]! : runId, ts: parseTime(entry.timestamp) });
       const end = endOfRun(entries);
       const first = time(entries[0]);
       const createdAt = checkpointFor(runId, ledgerDirectory)?.createdAt;
@@ -306,14 +439,14 @@ export function measureSpeedClaims(options: SpeedClaimsOptions = {}): SpeedClaim
       group.values.push((endTime! - start) / 60_000);
       groups.set(key, group);
       result.completedCount++;
-    } catch { result.cannotMeasureCount++; }
+    } catch { result.cannotMeasureCount++; ledgerUnreadable = true; }
   }
   result.rows = [...groups.values()].map(({ seat, outcome, values }) => {
     values.sort((a, b) => a - b);
     return { seat, outcome, count: values.length, underOneMinuteCount: values.filter((minutes) => minutes < 1).length, medianMinutes: percentile(values, 0.5), q1Minutes: percentile(values, 0.25), q3Minutes: percentile(values, 0.75) };
   }).sort((a, b) => SEATS.indexOf(a.seat) - SEATS.indexOf(b.seat) || a.outcome.localeCompare(b.outcome));
   if (result.cannotMeasureCount > 0) result.status = 'cannot-measure';
-  return result;
+  return { ...result, daily: measureDailySpeedClaims(landed, !ledgerUnreadable, releaseEvents, now) };
 }
 
 export function renderSpeedClaims(result: SpeedClaimsMeasurement): string {
@@ -334,5 +467,11 @@ export function renderSpeedClaims(result: SpeedClaimsMeasurement): string {
     `parent cannot measure (excluded): ${result.parent.cannotMeasureCount}`,
     ...result.parent.rows.map((row) => `seat=${row.seat} stage=${row.stage} merged=${row.merged} count=${row.count} median=${row.medianMinutes}m q1=${row.q1Minutes}m q3=${row.q3Minutes}m`),
     `parent note: ${result.parent.note}`,
+    'daily landed PRs / issued releases (last 30 days, UTC):',
+    `daily window: ${result.daily.windowStart}..${result.daily.windowEnd}`,
+    `landed PRs status: ${result.daily.landedPrs.status} (undated: ${result.daily.landedPrs.undatedCount})`,
+    `issued releases status: ${result.daily.releases.status} (undated: ${result.daily.releases.undatedCount})`,
+    ...result.daily.rows.map((row) => `date=${row.date} landed=${row.landedPrCount ?? 'unmeasured'} released=${row.releasedCount ?? 'unmeasured'}`),
+    `daily note: ${result.daily.note}`,
   ].join('\n');
 }

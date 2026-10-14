@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../../debug/log.js';
+import { appendRunLedgerEntry } from '../../self-implement/run-ledger.js';
 import { junitCounts, runResyncShadow } from './resync-shadow.js';
 
 // The default runner isolates PR tests in `unshare --user --net` (Linux user namespaces); macOS has no unshare, so the
@@ -280,10 +281,10 @@ test('resync live pushes a saved merge without force and removes needs-rebase', 
   const pushCalls: string[][] = [];
   const editCalls: string[][] = [];
   const summary = await runResyncShadow(3, {
-    repoRoot: f.work, instanceRoot: f.state,
+    repoRoot: f.work, instanceRoot: f.state, activePrNumbers: () => new Set(),
     runGh: args => {
       if (args[0] === 'pr' && args[1] === 'list') {
-        return JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', mergeable: 'CONFLICTING',
+        return JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', mergeable: 'MERGEABLE',
           isDraft: true, labels: [{ name: 'elanous:needs-rebase' }] }]);
       }
       if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ files: [{ path: 'value.test.ts' }] });
@@ -302,6 +303,126 @@ test('resync live pushes a saved merge without force and removes needs-rebase', 
   expect(f.worktrees()).toBe(`worktree ${f.work}\nHEAD ${git(f.work, 'rev-parse', 'HEAD')}\nbranch refs/heads/main`);
 }, 60_000);
 
+test('local terminated run ledger proves the current head; unobserved and active owners cannot push', async () => {
+  const f = fixture();
+  const previous = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = f.state;
+  const runId = 'run-12345678-1234-4234-8234-123456789abc';
+  const rivalRunId = 'run-abcdef12-1234-4234-8234-123456789abc';
+  const rewindHead = git(f.work, 'rev-parse', `${f.headBefore}^`);
+  const ledgerDir = join(f.state, 'run-ledger');
+  const now = new Date().toISOString();
+  const entry = (event: string, data: Record<string, unknown>) => appendRunLedgerEntry({ runId, event, timestamp: now, data }, ledgerDir);
+  const editCalls: string[][] = [];
+  const runGh = (args: string[]) => {
+    if (args[1] === 'list') return JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', headRefOid: f.remoteHead(),
+      mergeable: 'MERGEABLE', isDraft: true, labels: [{ name: 'elanous:needs-rebase' }] }]);
+    if (args[1] === 'view') return JSON.stringify({ files: [{ path: 'value.test.ts' }] });
+    if (args[1] === 'edit') { editCalls.push(args); return ''; }
+    throw new Error(`unexpected gh: ${args.join(' ')}`);
+  };
+  let rewindOnTest = false;
+  let rivalOnTest = false;
+  const options = { repoRoot: f.work, instanceRoot: f.state, runGh,
+    resolve: async () => "export const value = 'combined';\n", runTests: () => {
+      if (rivalOnTest) {
+        appendRunLedgerEntry({ runId: rivalRunId, event: 'worktree', timestamp: now,
+          data: { branch: 'self-impl/conflicted' } }, ledgerDir);
+        appendRunLedgerEntry({ runId: rivalRunId, event: 'run-status', timestamp: now,
+          data: { runStatus: 'running' } }, ledgerDir);
+      }
+      if (rewindOnTest) git(f.work, '--git-dir', join(f.work, '..', 'remote.git'),
+        'update-ref', 'refs/heads/self-impl/conflicted', rewindHead);
+      return { ok: true };
+    } };
+  try {
+    expect((await runResyncShadow(3, options, 'live')).saved).toBe(0);
+    expect(f.remoteHead()).toBe(f.headBefore);
+    entry('worktree', { branch: 'self-impl/conflicted' });
+    entry('pr-opened', { number: 12, branch: 'self-impl/conflicted', headCommit: f.headBefore });
+    entry('run-status', { runStatus: 'running' });
+    expect((await runResyncShadow(3, options, 'live')).saved).toBe(0);
+    expect(f.remoteHead()).toBe(f.headBefore);
+    entry('run-status', { runStatus: 'completed' });
+    appendRunLedgerEntry({ runId: rivalRunId, event: 'pr-opened', timestamp: now,
+      data: { number: 12, branch: 'self-impl/conflicted' } }, ledgerDir);
+    appendRunLedgerEntry({ runId: rivalRunId, event: 'run-status', timestamp: now,
+      data: { runStatus: 'completed' } }, ledgerDir);
+    expect((await runResyncShadow(3, options, 'live')).saved).toBe(0);
+    expect(f.remoteHead()).toBe(f.headBefore);
+    rmSync(join(ledgerDir, `${rivalRunId}.jsonl`));
+    for (const data of [{ branch: 'self-impl/conflicted' }, { number: 99, branch: 'self-impl/conflicted' }]) {
+      appendRunLedgerEntry({ runId: rivalRunId, event: 'pr-opened', timestamp: now, data }, ledgerDir);
+      appendRunLedgerEntry({ runId: rivalRunId, event: 'run-status', timestamp: now,
+        data: { runStatus: 'completed' } }, ledgerDir);
+      expect((await runResyncShadow(3, options, 'live')).saved).toBe(0);
+      expect(f.remoteHead()).toBe(f.headBefore);
+      rmSync(join(ledgerDir, `${rivalRunId}.jsonl`));
+    }
+    rivalOnTest = true;
+    expect((await runResyncShadow(3, options, 'live')).saved).toBe(0);
+    expect(f.remoteHead()).toBe(f.headBefore);
+    expect(editCalls).toHaveLength(0);
+    rivalOnTest = false;
+    rmSync(join(ledgerDir, `${rivalRunId}.jsonl`));
+    rewindOnTest = true;
+    expect((await runResyncShadow(3, options, 'live')).saved).toBe(0);
+    expect(f.remoteHead()).toBe(rewindHead);
+    expect(editCalls).toHaveLength(0);
+    rewindOnTest = false;
+    git(f.work, '--git-dir', join(f.work, '..', 'remote.git'),
+      'update-ref', 'refs/heads/self-impl/conflicted', f.headBefore);
+    const saved = await runResyncShadow(3, options, 'live');
+    expect(saved).toEqual({ candidates: 1, tried: 1, saved: 1, savedRatio: 1 });
+    expect(f.remoteHead()).not.toBe(f.headBefore);
+    expect(editCalls).toEqual([['pr', 'edit', '12', '--remove-label', 'elanous:needs-rebase']]);
+    expect(JSON.parse(readFileSync(f.ledger, 'utf8').trim().split('\n').at(-1)!)).toMatchObject({
+      pr: 12, verdict: 'saved', pushed: true, beforeHead: f.headBefore, afterHead: f.remoteHead(),
+    });
+    git(f.work, 'fetch', '-q', 'origin', 'refs/heads/self-impl/conflicted');
+    git(f.work, 'checkout', '-qB', 'later-owner', 'FETCH_HEAD');
+    writeFileSync(join(f.work, 'later.ts'), 'export const later = true;\n');
+    git(f.work, 'add', 'later.ts');
+    git(f.work, 'commit', '-qm', 'another writer advanced the branch');
+    git(f.work, 'push', '-q', 'origin', 'HEAD:refs/heads/self-impl/conflicted');
+    const laterHead = f.remoteHead();
+    expect((await runResyncShadow(3, options, 'live')).candidates).toBe(0);
+    expect(f.remoteHead()).toBe(laterHead);
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previous;
+  }
+}, 60_000);
+
+for (const change of ['conflicting', 'label-removed', 'head-changed'] as const) {
+  test(`resync live skips when PR becomes ${change} during tests`, async () => {
+    const f = fixture();
+    const pushCalls: string[][] = [];
+    let changed = false;
+    const runGh = (args: string[]) => {
+      if (args[1] === 'list') return JSON.stringify([{
+        number: 12, headRefName: 'self-impl/conflicted',
+        headRefOid: changed && change === 'head-changed' ? '0'.repeat(40) : f.headBefore,
+        mergeable: changed && change === 'conflicting' ? 'CONFLICTING' : 'MERGEABLE',
+        isDraft: true,
+        labels: changed && change === 'label-removed' ? [] : [{ name: 'elanous:needs-rebase' }],
+      }]);
+      if (args[1] === 'view') return JSON.stringify({ files: [{ path: 'value.test.ts' }] });
+      throw new Error(`unexpected gh: ${args.join(' ')}`);
+    };
+    const summary = await runResyncShadow(3, {
+      repoRoot: f.work, instanceRoot: f.state, activePrNumbers: () => new Set(), runGh,
+      runGit: args => { pushCalls.push(args); },
+      resolve: async () => "export const value = 'combined';\n",
+      runTests: () => { changed = true; return { ok: true }; },
+    }, 'live');
+    expect(summary.saved).toBe(0);
+    expect(pushCalls).toEqual([]);
+    expect(f.remoteHead()).toBe(f.headBefore);
+    expect(JSON.parse(readFileSync(f.ledger, 'utf8'))).toMatchObject({ pushed: false, verdict: 'error' });
+  }, 30_000);
+}
+
 for (const scenario of [
   { name: 'merge-ok-tests-failed', resolve: async () => "export const value = 'combined';\n", runTests: () => ({ ok: false, failedTests: ['failed'] }), expected: 'merge-ok-tests-failed' },
   { name: 'unresolved', resolve: async (_file: string, conflict: string) => conflict, runTests: () => ({ ok: true }), expected: 'unresolved' },
@@ -313,10 +434,10 @@ for (const scenario of [
     const pushCalls: string[][] = [];
     const editCalls: string[][] = [];
     await runResyncShadow(3, {
-      repoRoot: f.work, instanceRoot: f.state,
+      repoRoot: f.work, instanceRoot: f.state, activePrNumbers: () => new Set(),
       runGh: args => {
         if (args[0] === 'pr' && args[1] === 'list') {
-          return JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', mergeable: 'CONFLICTING',
+          return JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', mergeable: 'MERGEABLE',
             isDraft: true, labels: [{ name: 'elanous:needs-rebase' }] }]);
         }
         if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ files: [{ path: 'value.test.ts' }] });
@@ -342,10 +463,10 @@ test('resync live — a pushed merge whose label removal fails stays saved; a no
   ] as const) {
     const f = fixture();
     await runResyncShadow(3, {
-      repoRoot: f.work, instanceRoot: f.state,
+      repoRoot: f.work, instanceRoot: f.state, activePrNumbers: () => new Set(),
       runGh: args => {
         if (args[0] === 'pr' && args[1] === 'list') {
-          return JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', mergeable: 'CONFLICTING',
+          return JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', mergeable: 'MERGEABLE',
             isDraft: true, labels: [{ name: 'elanous:needs-rebase' }] }]);
         }
         if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ files: [{ path: 'value.test.ts' }] });
@@ -362,13 +483,14 @@ test('resync live — a pushed merge whose label removal fails stays saved; a no
   }
 });
 
-test('resync live excludes CONFLICTING PRs without needs-rebase', async () => {
+test('resync live excludes CONFLICTING PRs, even with needs-rebase', async () => {
   const f = fixture();
   const pushCalls: string[][] = [];
   const summary = await runResyncShadow(3, {
-    repoRoot: f.work, instanceRoot: f.state,
+    repoRoot: f.work, instanceRoot: f.state, activePrNumbers: () => new Set(),
     runGh: args => args[0] === 'pr' && args[1] === 'list'
-      ? JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', mergeable: 'CONFLICTING', isDraft: true, labels: [] }])
+      ? JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', mergeable: 'CONFLICTING', isDraft: true,
+        labels: [{ name: 'elanous:needs-rebase' }] }])
       : f.runGh(args),
     runGit: args => { pushCalls.push(args); },
   }, 'live');
@@ -377,13 +499,70 @@ test('resync live excludes CONFLICTING PRs without needs-rebase', async () => {
   expect(() => readFileSync(f.ledger, 'utf8')).toThrow();
 });
 
+test('resync live accepts a mergeable PR marked after ancestor-auto refusal', async () => {
+  const f = fixture();
+  writeFileSync(join(f.work, 'value.ts'), "export const value = 'staged-local';\n");
+  git(f.work, 'add', 'value.ts');
+  writeFileSync(join(f.work, 'value.ts'), "export const value = 'unstaged-local';\n");
+  writeFileSync(join(f.work, 'untracked-local.txt'), 'untracked local content\n');
+  const checkoutHead = git(f.work, 'rev-parse', 'HEAD');
+  const checkoutIndex = git(f.work, 'ls-files', '--stage');
+  const checkoutStatus = git(f.work, 'status', '--porcelain=v1');
+  const checkoutTracked = readFileSync(join(f.work, 'value.ts'), 'utf8');
+  const checkoutUntracked = readFileSync(join(f.work, 'untracked-local.txt'), 'utf8');
+  const pushes: string[][] = [];
+  const summary = await runResyncShadow(3, {
+    repoRoot: f.work, instanceRoot: f.state, activePrNumbers: () => new Set(),
+    runGh: args => args[1] === 'list'
+      ? JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', mergeable: 'MERGEABLE', isDraft: true,
+        labels: [{ name: 'elanous:needs-rebase' }] }])
+      : args[1] === 'view' ? JSON.stringify({ files: [{ path: 'value.test.ts' }] }) : '',
+    runGit: args => { pushes.push(args); },
+    resolve: async () => "export const value = 'combined';\n",
+    runTests: () => ({ ok: true }),
+  }, 'live');
+  expect(summary).toEqual({ candidates: 1, tried: 1, saved: 1, savedRatio: 1 });
+  expect(pushes).toEqual([['push', 'origin', 'HEAD:refs/heads/self-impl/conflicted']]);
+  expect(git(f.work, 'rev-parse', 'HEAD')).toBe(checkoutHead);
+  expect(git(f.work, 'ls-files', '--stage')).toBe(checkoutIndex);
+  expect(git(f.work, 'status', '--porcelain=v1')).toBe(checkoutStatus);
+  expect(readFileSync(join(f.work, 'value.ts'), 'utf8')).toBe(checkoutTracked);
+  expect(readFileSync(join(f.work, 'untracked-local.txt'), 'utf8')).toBe(checkoutUntracked);
+});
+
+test('resync live never touches a PR owned by a running run or when ownership observation fails', async () => {
+  const f = fixture();
+  const runGh = (args: string[]) => {
+    if (args[1] === 'list') return JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', mergeable: 'MERGEABLE',
+      isDraft: true, labels: [{ name: 'elanous:needs-rebase' }] }]);
+    throw new Error('candidate must not be touched');
+  };
+  const blocked = await runResyncShadow(3, { repoRoot: f.work, instanceRoot: f.state, runGh,
+    activePrNumbers: numbers => { expect(numbers).toEqual([12]); return new Set([12]); } }, 'live');
+  expect(blocked.candidates).toBe(0);
+  await expect(runResyncShadow(3, { repoRoot: f.work, instanceRoot: f.state, runGh,
+    activePrNumbers: () => null }, 'live')).rejects.toThrow('active run observation unavailable');
+});
+
+test('resync live skips a labeled PR when no owning run ledger is observed', async () => {
+  const f = fixture();
+  const runGh = (args: string[]) => {
+    if (args[1] === 'list') return JSON.stringify([{ number: 12, headRefName: 'self-impl/conflicted', mergeable: 'MERGEABLE',
+      isDraft: true, labels: [{ name: 'elanous:needs-rebase' }] }]);
+    throw new Error('unknown ownership must not reach the PR');
+  };
+  // The fixture has no run ledger. An absent mapping cannot authorize a write.
+  expect(await runResyncShadow(3, { repoRoot: f.work, instanceRoot: f.state, runGh }, 'live'))
+    .toEqual({ candidates: 0, tried: 0, saved: 0, savedRatio: null });
+});
+
 test('resync live records a rejected push and continues with the next candidate', async () => {
   const f = fixture();
   const pushCalls: string[][] = [];
   const editCalls: string[][] = [];
   const runGh = (args: string[]) => {
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([12, 13].map(number => ({
-      number, headRefName: 'self-impl/conflicted', mergeable: 'CONFLICTING', isDraft: true,
+      number, headRefName: 'self-impl/conflicted', mergeable: 'MERGEABLE', isDraft: true,
       labels: [{ name: 'elanous:needs-rebase' }],
     })));
     if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ files: [{ path: 'value.test.ts' }] });
@@ -391,7 +570,7 @@ test('resync live records a rejected push and continues with the next candidate'
     throw new Error(`unexpected gh: ${args.join(' ')}`);
   };
   const summary = await runResyncShadow(3, {
-    repoRoot: f.work, instanceRoot: f.state, runGh,
+    repoRoot: f.work, instanceRoot: f.state, runGh, activePrNumbers: () => new Set(),
     runGit: args => {
       pushCalls.push(args);
       if (pushCalls.length === 1) throw new Error('non-fast-forward');

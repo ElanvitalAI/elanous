@@ -237,11 +237,20 @@ describe('원격 인자 — HQ 병합 권한을 넘기지 않는다', () => {
   });
   test('원격 셸 한 줄 — 런 id env · 따옴표 · 로그 · pid', () => {
     const script = remoteLaunchScript(TARGET, ['harness', 'say', '--merge-by-host', "it's a goal\nline2"], { ELANOUS_RUN_ID: 'run-abcd1234' });
-    expect(script).toContain("env ELANOUS_RUN_ID=run-abcd1234 nohup");
+    expect(script).toContain('env ELANOUS_RUN_ID=run-abcd1234 ELANOUS_STATE_DIR="$HOME"/.elanous nohup');
     expect(script).toContain(`"$HOME"/.local/share/elanous/bin/elanous --config-dir "$HOME"/.elanous harness say --no-auto-merge`);
     expect(script).toContain(`'it'\\''s a goal\nline2'`);
     expect(script).toContain('remote-parents/run-abcd1234.log');
     expect(script).toContain('kill -0 "$p"');
+  });
+  test('사용자 지정 절대 configDir 은 상태 env 와 --config-dir 에 그대로 쓰고 기존 자격 env 를 보존한다', () => {
+    const script = remoteLaunchScript({ ...TARGET, configDir: '/srv/elanous state' }, ['harness', 'say', '--merge-by-host'], {
+      ELANOUS_RUN_ID: 'run-abcd1234', ELANOUS_TASK_CARD_ID: 'ta-card-123', OPENROUTER_API_KEY: 'secret value', ELANOUS_STATE_DIR: '/old/worktree/.elanous-test',
+    });
+    expect(script).toContain("ELANOUS_RUN_ID=run-abcd1234 ELANOUS_TASK_CARD_ID=ta-card-123 OPENROUTER_API_KEY='secret value' ELANOUS_STATE_DIR='/srv/elanous state' nohup");
+    expect(script).toContain("--config-dir '/srv/elanous state' harness say --no-auto-merge");
+    expect(script).not.toContain('/old/worktree/.elanous-test');
+    expect(script).toContain("'/srv/elanous state/remote-parents/run-abcd1234.log'");
   });
 });
 
@@ -278,6 +287,7 @@ describe('defaultTaskLauncher — 원격 부모', () => {
     const receipt = await defaultTaskLauncher(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'g'], undefined, context, { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn: noLocal });
     expect(receipt).toMatchObject({ runId: context.runId, parentHost: { host: 'node-b', pid: 4242 } });
     expect(ssh.calls.some((call) => call.includes('--no-auto-merge') && !call.includes('--merge-by-host'))).toBe(true);
+    expect(ssh.calls.find((call) => call.includes('nohup'))).toContain('ELANOUS_STATE_DIR="$HOME"/.elanous');
   });
 
   test('점검 막힘 → 로컬로 되돌아가고 알림', async () => {
@@ -389,13 +399,29 @@ describe('원격 스크립트 — 실제 셸', () => {
   const env = { ELANOUS_RUN_ID: 'run-shell0001' };
 
   test('살아 있는 부모 → pid · 인자에 --no-auto-merge', () => {
-    const { home, cwd } = fakeHome('echo "args: $*"; echo "run=$ELANOUS_RUN_ID"; sleep 5');
-    const out = launchRemoteParent({ host: 'h', cwd }, ['harness', 'say', '--merge-by-host', "it's"], env, localShell(home));
+    const { home, cwd } = fakeHome('echo "args: $*"; echo "run=$ELANOUS_RUN_ID"; echo "state=$ELANOUS_STATE_DIR"; sleep 5');
+    const out = launchRemoteParent({ host: 'h', cwd }, ['harness', 'say', '--merge-by-host', "it's"],
+      { ...env, ELANOUS_STATE_DIR: join(cwd, '.elanous-test') }, localShell(home));
     expect(out.pid).toBeGreaterThan(0);
     const log = readFileSync(join(home, '.elanous/remote-parents/run-shell0001.log'), 'utf8');
     expect(log).toContain('args: --config-dir');
     expect(log).toContain("harness say --no-auto-merge it's");
     expect(log).toContain('run=run-shell0001');
+    expect(log).toContain(`state=${join(home, '.elanous')}`);
+    expect(log).not.toContain(`state=${join(cwd, '.elanous-test')}`);
+    try { process.kill(out.pid); } catch { /* 이미 끝남 */ }
+  });
+
+  test('사용자 지정 절대 configDir → 원격 셸에서 동일한 운영 상태 루트 사용', () => {
+    const { home, cwd } = fakeHome('echo "state=$ELANOUS_STATE_DIR"; echo "args: $*"; sleep 5');
+    const configDir = join(home, 'custom state');
+    const out = launchRemoteParent({ host: 'h', cwd, configDir }, ['harness', 'say', '--merge-by-host'],
+      { ...env, ELANOUS_STATE_DIR: join(cwd, '.elanous-test') }, localShell(home));
+    expect(out.pid).toBeGreaterThan(0);
+    const log = readFileSync(join(configDir, 'remote-parents/run-shell0001.log'), 'utf8');
+    expect(log).toContain(`state=${configDir}`);
+    expect(log).toContain(`args: --config-dir ${configDir} harness say --no-auto-merge`);
+    expect(log).not.toContain(join(cwd, '.elanous-test'));
     try { process.kill(out.pid); } catch { /* 이미 끝남 */ }
   });
 

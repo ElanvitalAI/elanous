@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { checkCompletionEvidence } from './completion-evidence.js';
 import { judgeNextMove } from './judge.js';
 import { cardsBoard } from './board.js';
-import { dispatchDeliverableCompletion, handTask, readTaskCard, readTaskAgentState } from './task-hand.js';
+import { dispatchDeliverableCompletion, readTaskCard, readTaskAgentState, writeTaskCards, type TaskCard } from './task-hand.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
 import { openSchedulesDb } from '../domains/schedule-registry.js';
 
@@ -24,11 +24,10 @@ describe('completion evidence (temporary root)', () => {
     const statePath = join(dir, 'task-agent-actions.json');
     writeFileSync(statePath, JSON.stringify({ landingDay: '2026-10-10', failureCounts: { previous: 1 } }));
     writeFileSync(join(dir, 'report.md'), '# Delivered report');
-    const { card, move } = await handTask({
-      id: 'ta-deliverable-1', text: 'Send the report', completion: 'deliverable',
-      project: { id: 'report-project', target: dir }, statePath,
-    });
-    expect(move.kind).toBe('launch');
+    // This tests evidence closure for a pre-existing launched card; 1판 hand rejects new non-code launches.
+    const card: TaskCard = { id: 'ta-deliverable-1', text: 'Send the report', completion: 'deliverable',
+      project: { id: 'report-project', target: dir }, createdAt: '2026-10-10T00:00:00.000Z', status: 'launched', history: [] };
+    writeTaskCards(statePath, [card]);
     expect(card.completion).toBe('deliverable');
     if (card.completion !== 'deliverable') throw new Error('deliverable completion was not persisted');
     expect(card.pr).toBeUndefined();
@@ -64,11 +63,11 @@ describe('completion evidence (temporary root)', () => {
       landingDay: '2026-10-10', failureCounts: { previous: 1 },
       tasks: { [card.id]: persisted },
     });
-    const linkHand = await handTask({ id: 'ta-deliverable-link', text: 'Send the link', completion: 'deliverable',
-      project: { id: 'report-project', target: dir }, statePath });
-    expect(dispatchDeliverableCompletion(linkHand.card.id, { ref: 'https://example.org/report', receipt: true }, statePath)).toBe(true);
-    expect(readTaskCard(linkHand.card.id, statePath)?.greenProposal?.evidence).toEqual({
-      [linkHand.card.id]: JSON.stringify({ ref: 'https://example.org/report', receipt: true }),
+    const linkCard: TaskCard = { ...card, id: 'ta-deliverable-link', text: 'Send the link' };
+    writeTaskCards(statePath, [linkCard]);
+    expect(dispatchDeliverableCompletion(linkCard.id, { ref: 'https://example.org/report', receipt: true }, statePath)).toBe(true);
+    expect(readTaskCard(linkCard.id, statePath)?.greenProposal?.evidence).toEqual({
+      [linkCard.id]: JSON.stringify({ ref: 'https://example.org/report', receipt: true }),
     });
   });
 

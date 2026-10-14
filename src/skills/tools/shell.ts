@@ -31,9 +31,13 @@ import {
   runShell as runnerDispatch,
   getShellRunnerDeps,
 } from '../../shell-runner/dispatch.js';
-import type { ShellResult as RunnerResult } from '../../shell-runner/types.js';
+import type { ShellHandle, ShellResult as RunnerResult } from '../../shell-runner/types.js';
 import { debug } from '../../debug/log.js';
 import { getSessionCwd } from '../../session/working-dir.js';
+import {
+  globalTaskNotificationQueue,
+  type TaskNotificationQueue,
+} from '../../agent/task-notification.js';
 
 /** LLMToolSpec — the shape surfaced to the model. Kept narrow so
  *  accidental misuse is hard: no env override, no cwd outside the
@@ -178,6 +182,62 @@ function logShellDispatch(event: string, data: Record<string, unknown>): void {
   debug.log('shell.dispatch', event, data);
 }
 
+// ── bg completion → turn notification queue (TUI-BG-SHELL) ───────────
+// When a bg-mode shell handle settles, its result is no longer awaited
+// by anyone — the spawn already returned the `outcome=started` stub.
+// To surface the eventual result we enqueue one task-notification into
+// the existing turn notification queue (injected at turn-start by
+// chat/skill-runner). One notice per handle; opening an idle turn from
+// the wake signal is deliberately NOT wired here (TUI-EVENT-TURN-QUEUE).
+
+export interface ShellCompletionNoticeInput {
+  handle: ShellHandle;
+  ok: boolean;
+  exitCode: number | null;
+  durationMs: number;
+  /** Set when ok === false — the runner's failure reason. */
+  errorMessage?: string;
+  /** Caller-supplied free-form label (RunShell's `description` arg). */
+  label?: string;
+}
+
+/** Per-handle dedup guard — module-local, keyed by the handle OBJECT.
+ *  A registry replacement may mint a NEW handle that reuses an id; the
+ *  shell layer must not swallow that fresh completion as a duplicate
+ *  settle (an id-keyed record here would). */
+const notifiedHandles = new WeakSet<ShellHandle>();
+let nextShellCompletionNoticeId = 0;
+
+/** Enqueue one bg shell-handle completion notice. Returns true when this
+ *  handle had not notified before (the notice was handed to `queue`),
+ *  false on a duplicate settle of the same handle. The queue's own
+ *  The shared queue deduplicates by taskId even after drain, so each
+ *  completed handle gets its own notification id. The original handle id
+ *  remains in the output for ShellPoll and human follow-up.
+ *  `queue` defaults to the global turn notification queue; injectable
+ *  so tests can isolate. */
+export function enqueueShellCompletionNotice(
+  input: ShellCompletionNoticeInput,
+  queue: TaskNotificationQueue = globalTaskNotificationQueue,
+): boolean {
+  if (notifiedHandles.has(input.handle)) return false;
+  notifiedHandles.add(input.handle);
+  const header = `RunShell bg handle=${input.handle.id} ${input.ok ? 'completed' : 'failed'}`;
+  const output = `${header}${input.ok || input.exitCode !== null ? ` exitCode=${input.exitCode ?? 'null'}` : ''} elapsed=${input.durationMs}ms${input.errorMessage ? ` error=${input.errorMessage}` : ''}`;
+  queue.enqueue({
+    taskId: `shell:${input.handle.id}:${++nextShellCompletionNoticeId}`,
+    agentName: 'RunShell',
+    ...(input.label ? { label: input.label } : {}),
+    state: input.ok ? 'done' : 'error',
+    output,
+    truncated: false,
+    ...(input.errorMessage ? { errorMessage: input.errorMessage } : {}),
+    durationMs: input.durationMs,
+    finishedAt: Date.now(),
+  });
+  return true;
+}
+
 export async function dispatchRunShell(
   rawArgs: Record<string, unknown>,
   opts: { signal?: AbortSignal } = {},
@@ -269,6 +329,16 @@ async function dispatchViaRunner(args: {
           exitCode: result.exitCode ?? null,
           durationMs: result.durationMs,
         });
+        const ok = result.outcome === 'exit' && result.exitCode === 0;
+        enqueueShellCompletionNotice({
+          handle,
+          ok,
+          exitCode: result.exitCode ?? null,
+          durationMs: result.durationMs,
+          ...(!ok ? { errorMessage: result.exitCode !== undefined
+            ? `exitCode=${result.exitCode}` : `outcome=${result.outcome}` } : {}),
+          ...(args.description !== undefined ? { label: args.description } : {}),
+        });
       },
       (err: unknown) => {
         debug.log('skill-tool.shell', 'bg-finished', {
@@ -276,6 +346,14 @@ async function dispatchViaRunner(args: {
           exitCode: null,
           durationMs: Date.now() - bgStartedAt,
           error: err instanceof Error ? err.message : String(err),
+        });
+        enqueueShellCompletionNotice({
+          handle,
+          ok: false,
+          exitCode: null,
+          durationMs: Date.now() - bgStartedAt,
+          errorMessage: err instanceof Error ? err.message : String(err),
+          ...(args.description !== undefined ? { label: args.description } : {}),
         });
       },
     );

@@ -78,6 +78,8 @@ type AxisUsageRow = {
   unknownCostCalls: number;
   includedCalls: number;
   apiEquivalentUsd: number;
+  /** 비용 순위 = usdKnown + apiEquivalentUsd — 구독 호출의 목록가 «그림자 비용»까지 더한 값. */
+  rankUsd: number;
 };
 
 function usageData(row: LogStoreRow, unwrapPod = false): ExtendedRunUsageInput | null {
@@ -115,6 +117,8 @@ function rollupByAxis(inputs: readonly ExtendedRunUsageInput[], axis: UsageAxis)
   }
   return [...groups].map(([value, group]) => {
     const rows = rollupRunUsage(group);
+    const usdKnown = rows.reduce((sum, row) => sum + row.usdKnown, 0);
+    const apiEquivalentUsd = rows.reduce((sum, row) => sum + row.apiEquivalentUsd, 0);
     const result: AxisUsageRow = {
       [axis]: value,
       hostIds: [...new Set(rows.flatMap((row) => row.hostIds))],
@@ -124,13 +128,14 @@ function rollupByAxis(inputs: readonly ExtendedRunUsageInput[], axis: UsageAxis)
       cacheReadInputTokens: rows.reduce((sum, row) => sum + row.cacheReadInputTokens, 0),
       cacheCreationInputTokens: rows.reduce((sum, row) => sum + row.cacheCreationInputTokens, 0),
       reasoningOutputTokens: rows.reduce((sum, row) => sum + row.reasoningOutputTokens, 0),
-      usdKnown: rows.reduce((sum, row) => sum + row.usdKnown, 0),
+      usdKnown,
       unknownCostCalls: rows.reduce((sum, row) => sum + row.unknownCostCalls, 0),
       includedCalls: rows.reduce((sum, row) => sum + row.includedCalls, 0),
-      apiEquivalentUsd: rows.reduce((sum, row) => sum + row.apiEquivalentUsd, 0),
+      apiEquivalentUsd,
+      rankUsd: usdKnown + apiEquivalentUsd,
     };
     return result;
-  }).sort((a, b) => b.calls - a.calls);
+  }).sort((a, b) => (b.rankUsd - a.rankUsd) || (b.calls - a.calls));
 }
 
 function isUsageAxis(value: string): value is 'run' | 'role' | UsageAxis {
@@ -139,7 +144,7 @@ function isUsageAxis(value: string): value is 'run' | 'role' | UsageAxis {
 
 function formatAxisUsage(row: AxisUsageRow, axis: UsageAxis): string {
   const value = row[axis] ?? '(none)';
-  return `${axis}=${value}  hosts=${row.hostIds.join(',') || '(none)'}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  cacheRead=${row.cacheReadInputTokens}  cacheCreation=${row.cacheCreationInputTokens}  reasoning=${row.reasoningOutputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}`;
+  return `${axis}=${value}  hosts=${row.hostIds.join(',') || '(none)'}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  cacheRead=${row.cacheReadInputTokens}  cacheCreation=${row.cacheCreationInputTokens}  reasoning=${row.reasoningOutputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}  rankUsd=${row.rankUsd}`;
 }
 
 function defaultCreditPlan(): CodexCreditPlan | null {

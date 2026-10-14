@@ -14,9 +14,10 @@
 //
 // index.ts 의 액션은 옵션 파싱과 실제 의존 배선만 남는다(얇은 껍데기).
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { tierModel } from '../llm/model-defaults.js';
 import { buildReviewObservation, safeLogText } from './review-observation.js';
 import { DEFAULT_REVIEW_BACKEND } from './acp-reviewer.js';
@@ -46,6 +47,8 @@ export interface SelfReviewCliOpts {
   contextText?: string[] | undefined;
   contextOrder?: Array<{ kind: 'file' | 'text'; value: string }> | undefined;
   json?: boolean | undefined;
+  /** Save completed reviews under the task-agent state's review-results directory. */
+  save?: string | undefined;
 }
 
 /** 셸/네트워크/로그 경계 — 테스트는 전부 대역으로 채운다. */
@@ -1276,6 +1279,11 @@ async function runSelfReviewCliCommandPinned(
     return { results: [], failed: 0 };
   }
 
+  if (opts.save !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(opts.save)) {
+    deps.error('--save 이름은 영문자·숫자로 시작하고 영문자·숫자·점·밑줄·하이픈만 포함해야 합니다.');
+    return { results: [], failed: 1 };
+  }
+
   const useAcp = opts.acp === true;
   const acpModel = opts.acpModel?.trim() || undefined;
   const acpBackendResolution = opts.acpBackend
@@ -1431,8 +1439,8 @@ async function runSelfReviewCliCommandPinned(
         { pr: safeLogText(pr), exit: diff.status, error: safeLogText(diff.stderr || err, 160) },
         { level: 'warn' });
       const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
-      if (opts.json) results.push({ pr, error: err, ...contextOutput, ...comparisonData, ...(mismatchWarning ?? {}) });
-      else deps.error(`PR ${pr}: ${err}\n${reviewerContextStatus}`);
+      if (opts.json || opts.save !== undefined) results.push({ pr, error: err, ...contextOutput, ...comparisonData, ...(mismatchWarning ?? {}) });
+      if (!opts.json) deps.error(`PR ${pr}: ${err}\n${reviewerContextStatus}`);
       failed += 1;
       continue;
     }
@@ -1492,8 +1500,8 @@ async function runSelfReviewCliCommandPinned(
         pr, model: primaryModel, verdict: null, mustFix: [], shouldFix: [], reviewed: false,
         refusal: 'stale-head', ...provenance, ...reviewerSourceObservation(), ...contextOutput,
       };
-      if (opts.json) results.push(refused);
-      else deps.print(`\n━━ PR ${pr} (${primaryModel}) ━━\n${renderStaleRefusal(diffRead)}\n${reviewerContextStatus}`);
+      if (opts.json || opts.save !== undefined) results.push(refused);
+      if (!opts.json) deps.print(`\n━━ PR ${pr} (${primaryModel}) ━━\n${renderStaleRefusal(diffRead)}\n${reviewerContextStatus}`);
       continue;
     }
     // ⭐ 머지된 PR 만 머지 커밋 detached worktree 에서 리뷰한다 — main 최신이 아니라 그 PR 이 머지된 시점의 코드를 본다.
@@ -1666,17 +1674,33 @@ async function runSelfReviewCliCommandPinned(
     if (useAcp && review.reviewed === false) {
       const err = 'ACP 리뷰 실행 실패(reviewed=false) — 관측: elanous logs --category acp-review';
       const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
-      if (opts.json) results.push({ pr, error: err, ...review, verdict: null, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...reviewCwdOutput, ...provenance, ...contextOutput });
-      else deps.error(`PR ${pr}: ${err}\n${renderProvenance(diffRead)}\n${reviewerContextStatus}`);
+      if (opts.json || opts.save !== undefined) results.push({ pr, error: err, ...review, verdict: null, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...reviewCwdOutput, ...provenance, ...contextOutput });
+      if (!opts.json) deps.error(`PR ${pr}: ${err}\n${renderProvenance(diffRead)}\n${reviewerContextStatus}`);
       failed += 1;
       continue;
     }
     const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
     const jsonReview = review.reviewed === true ? review : { ...review, verdict: null };
-    if (opts.json) results.push({ pr, model: selectedModel, ...jsonReview, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...reviewCwdOutput, ...provenance, ...contextOutput, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles, ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) });
-    else deps.print(`\n━━ PR ${pr} (${selectedModel}) ━━\n${renderProvenance(diffRead)}\n${evidenceLine}\n${reviewerContextStatus}\n${deps.renderReview(review)}`);
+    if (opts.json || opts.save !== undefined) results.push({ pr, model: selectedModel, ...jsonReview, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...reviewCwdOutput, ...provenance, ...contextOutput, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles, ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) });
+    if (!opts.json) deps.print(`\n━━ PR ${pr} (${selectedModel}) ━━\n${renderProvenance(diffRead)}\n${evidenceLine}\n${reviewerContextStatus}\n${deps.renderReview(review)}`);
     // REVIEW-ERROR-RC — 기본(API)·role 경로가 1차·폴백 모두 실패해 reviewed≠true 로 끝나도 «못 리뷰한 PR» 이다(verdict:null).
     if (review.reviewed !== true) failed += 1;
+    if (opts.save !== undefined) {
+      if (review.reviewed !== true || diffRead.headCommitState !== 'known' || diffRead.currentHeadCommitState !== 'known' || diffRead.currentHeadCommit !== diffRead.headCommit || diffRead.headCommit.length !== 40) {
+        deps.error(`PR ${pr}: --save 불가 — 완료된 리뷰와 확인된 40자 PR head가 필요합니다.`);
+        if (review.reviewed === true) failed += 1;
+      } else {
+        const path = join(effectiveInstanceRoot(), 'review-results', `${opts.save}-${pr}-${diffRead.headCommit.slice(0, 12)}.json`);
+        const result = results.at(-1);
+        try {
+          mkdirSync(dirname(path), { recursive: true });
+          writeFileSync(path, selfReviewJsonLine([result]));
+        } catch (error) {
+          failed += 1;
+          deps.error(`PR ${pr}: --save 실패: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
   }
   return { results, failed };
 }

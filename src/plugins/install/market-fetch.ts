@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { withFileLockSync } from '../../storage/file-lock.js';
-import { dirname, join, resolve } from 'node:path';
+import { loadPluginManifestFromDir } from '../core/manifest.js';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { userConfigPath } from '../../user-config.js';
 import { OFFICIAL_INDEX_KEYS } from '../../market/official-keys.js';
@@ -37,6 +38,36 @@ export interface MarketIndex {
   signature: 'ok';
   keyId: string;
 }
+/** Resolve only an installed, available Codex plugin package to the local-path input
+ *  already accepted by `plugin add`. Codex marketplace records are not Elanous signed indices. */
+export function codexPluginPackagePath(response: unknown, name: string, marketplace: string): string {
+  if (!NAME.test(name) || !NAME.test(marketplace)) throw new MarketFetchError('io', 'invalid Codex plugin or marketplace name');
+  const inventory = response as { marketplaces?: unknown } | null;
+  if (!inventory || !Array.isArray(inventory.marketplaces)) throw new MarketFetchError('io', 'invalid Codex plugin/list response');
+  const matches: string[] = [];
+  for (const rawMarket of inventory.marketplaces) {
+    if (!rawMarket || typeof rawMarket !== 'object') throw new MarketFetchError('io', 'invalid Codex marketplace');
+    const market = rawMarket as { name?: unknown; plugins?: unknown };
+    if (market.name !== marketplace) continue;
+    if (!Array.isArray(market.plugins)) throw new MarketFetchError('io', 'invalid Codex marketplace plugins');
+    for (const rawPlugin of market.plugins) {
+      if (!rawPlugin || typeof rawPlugin !== 'object') continue;
+      const plugin = rawPlugin as Record<string, unknown>;
+      if (plugin.name !== name || plugin.installed !== true) continue;
+      if (typeof plugin.availability === 'string' && plugin.availability.toUpperCase() !== 'AVAILABLE') continue;
+      const path = plugin.installPath ?? plugin.path;
+      if (typeof path !== 'string' || !isAbsolute(path) || !existsSync(path) || !statSync(path).isDirectory()) {
+        throw new MarketFetchError('io', 'Codex installed plugin package directory unavailable');
+      }
+      const manifest = loadPluginManifestFromDir(path, { id: name }).manifest;
+      if (manifest.id !== name) throw new MarketFetchError('io', 'Codex package name differs from inventory');
+      matches.push(path);
+    }
+  }
+  if (matches.length !== 1) throw new MarketFetchError('io', `Codex plugin not installed or ambiguous: ${name}@${marketplace}`);
+  return matches[0]!;
+}
+
 export class MarketFetchError extends Error {
   constructor(public readonly reason: 'io' | 'signature', message: string) {
     super(message);

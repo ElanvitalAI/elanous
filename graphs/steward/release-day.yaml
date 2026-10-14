@@ -1,0 +1,23 @@
+graph_id: steward-release-day
+loop:
+  title: 발행 날 그림자 판정
+  trigger:
+    cron: '*/5 * * * *'
+version: 1
+entry_node: release-day
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: release-day
+    kind: agent
+    recipe: cmd:steward-release-day
+    max_visits: 1
+  - node_id: done
+    kind: gate
+    max_visits: 1
+  - node_id: failed
+    kind: gate
+    max_visits: 1
+edges:
+  - from: release-day
+    on: outcome
+    map: { ok: done, fail: failed }

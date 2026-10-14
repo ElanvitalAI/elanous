@@ -5,9 +5,14 @@ loop:
     cron: '*/15 8-23 * * *'
     events: [directive, linear-webhook]
 version: 1
-entry_node: rejudge
+entry_node: resync
 terminal_nodes: [done, failed]
 nodes:
+  # SMART-MERGE-LIVE-TICK — update eligible PR heads before TA inspects them on this tick.
+  - node_id: resync
+    kind: agent
+    recipe: cmd:steward-resync
+    max_visits: 1
   # TA-REJUDGE-PERIODIC — `tasks rejudge --all` on a cadence (off unless taskAgent.rejudgeEveryMinutes > 0).
   # First so a Linear outage in sync cannot starve it; either outcome continues to sync.
   - node_id: rejudge
@@ -37,6 +42,9 @@ nodes:
     kind: gate
     max_visits: 1
 edges:
+  - from: resync
+    on: outcome
+    map: { ok: rejudge, fail: rejudge }
   - from: rejudge
     on: outcome
     map: { ok: sync, fail: sync }

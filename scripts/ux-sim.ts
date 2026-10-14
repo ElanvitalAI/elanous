@@ -16,6 +16,7 @@
 //   bun scripts/ux-sim.ts --fault cred-expiry # 결함 주입: grok 구독 만료 임박 × 갱신 결과 → 디스패처·발사 판정
 //   bun scripts/ux-sim.ts --fault pod-death   # 결함 주입: PARTIAL 줄을 남긴 Pod 가 SIGTERM 으로 지워짐 → 호스트 재방출 판정
 //   bun scripts/ux-sim.ts --fault pool-cap    # 결함 주입: --pod-pool 에 :N 이 빠진 풀 → 승인 판정(limitedBy)
+//   bun scripts/ux-sim.ts --fault sqlite-busy # 결함 주입: 실제 SQLite 잠금 → 로그 배치 버퍼·복구
 //
 // ⛔ 이 CLI 는 «실제 위젯 render()» 를 부른다 — 흉내 렌더러가 아니다.
 import { simRenderLogFrame } from '../src/ux-sim/render-frame.js';
@@ -71,7 +72,12 @@ if (argv.includes('--fault')) {
     console.log(renderPoolCap(poolCapSweep()).join('\n'));
     process.exit(0);
   }
-  console.error(`⛔ 모르는 결함이다: ${fault ?? '(없음)'} — 아는 것: cred-expiry · pod-death · pool-cap`);
+  if (fault === 'sqlite-busy') {
+    const { simSqliteBusy, renderSqliteBusy } = await import('../src/ux-sim/fault-sqlite-busy.js');
+    console.log(renderSqliteBusy(simSqliteBusy()).join('\n'));
+    process.exit(0);
+  }
+  console.error(`⛔ 모르는 결함이다: ${fault ?? '(없음)'} — 아는 것: cred-expiry · pod-death · pool-cap · sqlite-busy`);
   process.exit(2);
 }
 

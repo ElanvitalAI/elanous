@@ -11,6 +11,10 @@ export type SeatRequestRow = {
   text: string;
   queuedAt: string;
   reason?: string;
+  /** One-line explanation of the automated action recorded on this row. */
+  why?: string;
+  /** Pointer to the evidence supporting the action (log line, run id, ledger path, …). */
+  evidenceRef?: string;
   closedAt?: string;
   [field: string]: unknown;
 };

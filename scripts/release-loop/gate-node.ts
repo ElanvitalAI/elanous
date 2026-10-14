@@ -117,6 +117,8 @@ export interface GateResult {
 const sha = /^[0-9a-f]{7,40}$/i;
 const versionPattern = /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/;
 const failureFile = (root: string, version: string) => join(root, 'release', version, 'gate-failures.json');
+/** Judged identities live beside the machine release ledger; gate-failures.json keeps its raw baseline schema. */
+const verdictFile = (root: string, version: string) => join(root, 'release', version, 'gate-verdict.json');
 const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
 const defaultRemoteMirror = '~/mirror/elanous-agent.git';
 
@@ -1431,6 +1433,8 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
   };
   const repo = resolve(opts.repo ?? process.cwd());
   const result: GateResult = { outcome: 'error', commit: opts.commit, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 0 };
+  const preexistingIds: string[] = [];
+  let knownEnvIds: string[] = [];
   let work: string | undefined;
   let baseSnapshot = false;
   let cutFailures: SweepFailures | undefined;
@@ -1598,11 +1602,13 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     const baselineIds = [...baseline.failures, ...baseline.errors];
     const countedCut = splitKnownEnv(cutIds, known);
     const countedBaseline = splitKnownEnv(baselineIds, known);
-    result.knownEnv = countedCut.knownEnv.length;
+    knownEnvIds = countedCut.knownEnv;
+    result.knownEnv = knownEnvIds.length;
     result.knownEnvCleared = [...new Set(cutRun.passedIds ?? [])].filter((id) => known.has(id) && !cutIds.includes(id) && !cutRun.stalledEnv?.some(({ file }) => fileOf(id) === file)).sort();
     const diff = diffFailures(countedCut.counted, countedBaseline.counted);
     result.fixed = result.baselineDeferred ? null : diff.fixed.length;
-    result.preexisting = diff.common.length;
+    preexistingIds.push(...diff.common);
+    result.preexisting = preexistingIds.length;
     // GATE-BASELINE-CACHE — only the files whose new failures reproduce in isolation reach the baseline, and each
     // (commit, file, host) is run at most once across gates: this gate's cut results also seed the next gate's baseline.
     const cacheHost = opts.remote ?? 'local';
@@ -1703,10 +1709,11 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         debug.log('release-loop.gate', 'isolated-rc-nonzero-no-failures', { file, label: 'cut isolated', rc: rcOnly.rc, pass: rcOnly.pass, baseline });
       }
       for (const id of candidates) {
-        if (oldFailures.has(id)) result.preexisting++;
+        if (oldFailures.has(id)) preexistingIds.push(id);
         else result.introduced.push(id);
       }
     }
+    result.preexisting = preexistingIds.length;
     result.baselineCache = cacheStats;
     debug.log('release.gate', 'baseline-cache', { hits: cacheStats.hits, misses: cacheStats.misses, commit: baseSha });
     result.outcome = result.introduced.length ? 'regression' : 'ok';
@@ -1751,7 +1758,33 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       result.error = `baseline persistence: ${String(error)}`;
     }
   }
-  if (result.outcome !== 'error') debug.log('release-loop.gate', 'judged', { version: opts.version, commit: opts.commit, introduced: result.introduced.length, preexisting: result.preexisting });
+  if (result.outcome !== 'error') {
+    const ids = {
+      introduced: [...result.introduced].sort(),
+      knownEnv: [...knownEnvIds].sort(),
+      preexisting: [...preexistingIds].sort(),
+      loadFlaky: [...(result.loadFlaky ?? [])].sort(),
+    };
+    try {
+      const path = verdictFile(ledger, opts.version);
+      mkdirSync(dirname(path), { recursive: true });
+      const temp = join(dirname(path), `.gate-verdict-${process.pid}-${randomUUID()}.tmp`);
+      try {
+        writeFileSync(temp, JSON.stringify({ version: opts.version, commit: opts.commit, outcome: result.outcome, ...ids }, null, 2) + '\n', { mode: 0o600 });
+        chmodSync(temp, 0o600);
+        renameSync(temp, path);
+      } finally { if (existsSync(temp)) rmSync(temp); }
+    } catch (error) {
+      result.outcome = 'error';
+      result.error = `verdict persistence: ${String(error)}`;
+    }
+    if (result.outcome !== 'error') debug.log('release-loop.gate', 'judged', {
+      version: opts.version, commit: opts.commit,
+      introduced: result.introduced.length, preexisting: result.preexisting,
+      knownEnv: result.knownEnv, loadFlaky: ids.loadFlaky.length,
+      introducedIds: ids.introduced, knownEnvIds: ids.knownEnv, preexistingIds: ids.preexisting, loadFlakyIds: ids.loadFlaky,
+    });
+  }
   // GATE-LIVE-OBS-RC-WORDING ⓒ — the shards board says «판정 전» until this lands; then «새 실패 N» only (UX · gate-shards.ts).
   // Same ledger as the board's own writes (sweep's shardsFile). A write failure is logged and never changes the verdict.
   if (result.outcome !== 'error' && opts.pod) {

@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
+import type { PatentCandidate, PatentLedger } from '../patents/ledger.js';
 
 export type ClaimStatus = 'draft' | 'verified' | 'public' | 'stale' | 'retracted';
 
@@ -39,6 +40,19 @@ function iso(value: string, field: string): string {
   const date = new Date(value);
   if (!Number.isFinite(date.getTime())) throw new ClaimsInputError(`invalid ${field}: ${value}`);
   return date.toISOString();
+}
+
+function patentClaimRow(candidate: PatentCandidate, owner: string, audience: string): ClaimRow {
+  return {
+    id: candidate.id,
+    claim: candidate.title,
+    audience,
+    status: 'public',
+    owner,
+    contrast: null,
+    created_at: candidate.created_at,
+    updated_at: candidate.updated_at,
+  };
 }
 
 export class ClaimsLedger {
@@ -228,5 +242,14 @@ export class ClaimsLedger {
         history: db.query('SELECT claim_id, at, by, event, detail FROM history WHERE claim_id = ? ORDER BY rowid').all(id) as ClaimHistory[],
       };
     }));
+  }
+
+  /** 특허 원장의 공개 허용 상태 후보만 읽어 공개 주장 행으로 내온다 — 조사·명세·출원 상태 후보는 공개 주장으로 나오지 않는다. */
+  patentClaims(patents: PatentLedger, options: { owner: string; audience: string }): ClaimRow[] {
+    const owner = required(options.owner, 'owner');
+    const audience = required(options.audience, 'audience');
+    const rows = patents.listPublicCandidates().map(candidate => patentClaimRow(candidate, owner, audience));
+    debug.log('claims.ledger', 'patent-claims', { count: rows.length });
+    return rows;
   }
 }

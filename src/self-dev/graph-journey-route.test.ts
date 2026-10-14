@@ -15,6 +15,8 @@ describe('HARNESS-FULL-GRAPH 2판 — 경로를 그래프가 정한다', () => {
     expect(routeJourneyEdge('intake', 'direct').to).toBe('launch-gate');
     expect(routeJourneyEdge('decompose', 'pod').to).toBe('pool-admit');
     expect(routeJourneyEdge('decompose', 'local').to).toBe('implement');
+    expect(routeJourneyEdge('dispatch', 'fresh', { source: 'fresh' }).to).toBe('author');
+    expect(routeJourneyEdge('dispatch', 'pr-source', { source: 'pr' }).to).toBe('pool-admit');
     expect(routeJourneyEdge('freeze-check', 'open').to).toBe('merge');
     expect(routeJourneyEdge('freeze-check', 'frozen').to).toBe('hold');
     expect(routeJourneyEdge('intake', 'queued').source).toBe('graph');

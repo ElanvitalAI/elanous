@@ -426,6 +426,7 @@ function changedTestCountNote(
 
 const IMPORTER_GREP_PATHS = ['*.test.ts', '*.test.tsx', '*.test.mts', '*.test.mtsx', '*.test.cts', '*.test.ctsx', '*.test.js', '*.test.jsx', '*.test.mjs', '*.test.mjsx', '*.test.cjs', '*.test.cjsx'];
 const SOURCE_PATH_RE = /^src\/.+\.(?:[cm]?[jt]sx?)$/;
+const SCRIPT_SOURCE_PATH_RE = /^scripts\/.+\.(?:[cm]?[jt]sx?)$/;
 const SOURCE_FILE_RE = /\.(?:[cm]?[jt]sx?)$/;
 
 function buildGateImporterTestIndex(
@@ -433,7 +434,7 @@ function buildGateImporterTestIndex(
   cwd: string,
   runCommand: SelfGateCliDeps['runCommand'],
 ): ImporterTestIndex | null | { readonly lookupFailed: string } {
-  const sources = changed.filter((path) => SOURCE_PATH_RE.test(path) && !isTestPath(path));
+  const sources = changed.filter((path) => (SOURCE_PATH_RE.test(path) || SCRIPT_SOURCE_PATH_RE.test(path)) && !isTestPath(path));
   if (sources.length === 0) return null;
   const result = (runCommand ?? defaultRunCommand)('git', ['grep', '-l', '-e', '', '--', ...IMPORTER_GREP_PATHS], cwd);
   if ((result.status !== 0 && result.status !== 1) || result.error) {
@@ -596,7 +597,10 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
   if (options.shards !== undefined && (!Number.isSafeInteger(options.shards) || options.shards < 1)) throw new Error('invalid --shards count');
   const selection = (deps.changedFiles ?? ((dir, input) => defaultChangedFiles(dir, input, deps.runCommand)))(cwd, options);
   const exists = deps.exists ?? ((path) => existsSync(`${cwd}/${path}`));
-  const importerIndex = buildGateImporterTestIndex(selection.files, cwd, deps.runCommand);
+  // Caller: src/release-loop/light-rc.ts runLightRc → runSelfGateCli(dir, { ..., includeImporterTests: true }).
+  // scripts/ joins the existing importer index only for that opt-in path.
+  const importerIndex = buildGateImporterTestIndex(options.includeImporterTests
+    ? selection.files : selection.files.filter((path) => !SCRIPT_SOURCE_PATH_RE.test(path)), cwd, deps.runCommand);
   const lookupFailed = importerIndex && 'lookupFailed' in importerIndex ? importerIndex.lookupFailed : undefined;
   const availableIndex = importerIndex && !('lookupFailed' in importerIndex) ? importerIndex : undefined;
   const routeIndex = availableIndex?.testPaths

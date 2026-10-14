@@ -212,6 +212,26 @@ function groundingMessages(goal: string, terms: readonly string[]): LLMMessage[]
   }];
 }
 
+function unreadEvidencePaths(evidence: string, readFiles: ReadonlySet<string>): string[] {
+  return Array.from(new Set(evidence.split(/\r?\n/)
+    .flatMap(repositoryRelativeCodePaths)
+    .filter((path) => isCodeRootPath(path) && !readFiles.has(path)))).slice(0, 8);
+}
+
+function rejectedEvidenceFeedback(evidence: string, readFiles: ReadonlySet<string>): LLMMessage {
+  const unread = unreadEvidencePaths(evidence, readFiles);
+  const read = Array.from(readFiles).slice(0, 8);
+  return {
+    role: 'user',
+    content: [
+      'Your completion evidence was rejected because it cited a repository path that Read did not verify.',
+      `Unverified paths: ${unread.length ? unread.join(', ') : '(none in allowed code roots)'}`,
+      `Paths actually Read: ${read.length ? read.join(', ') : '(none)'}`,
+      'Try once more. Read each relevant unverified path before citing it, or remove it from the evidence. Cite only repository-relative code paths that this grounding run actually Read, each with a concrete reason. If no path is relevant, do not invent evidence.',
+    ].join('\n'),
+  };
+}
+
 /** Bounded, shared, read-only grounding loop. Failure or no candidates returns null. */
 export async function groundPersistently(goal: string, cwd: string, deps: PersistentGroundingDeps = {}): Promise<PersistentGroundingResult | null> {
   const startedAt = performance.now();
@@ -250,20 +270,53 @@ export async function groundPersistently(goal: string, cwd: string, deps: Persis
       },
     };
     const options: GoalLoopOptions = { maxIterations, objective: `Persistent repository grounding: ${goal.slice(0, 200)}` };
-    const result = await loop(ctx, options);
-    const verified = result.goalComplete && result.stopReason === 'goal_complete'
+    const first = await loop(ctx, options);
+    const firstVerified = first.goalComplete && first.stopReason === 'goal_complete'
       ? verifiedEvidenceFromCompletion(completionEvidence, readFiles)
       : {
         files: [],
         evidence: [],
         rejection: { noPath: 0, outsideRoot: 0, notRead: 0, noMeaningfulText: 0, samples: [] },
       };
+    let result = first;
+    let verified = firstVerified;
+    let feedbackRetry = false;
+    let retryIterations = 0;
+    if (firstVerified.rejection.notRead > 0) {
+      feedbackRetry = true;
+      const feedback = rejectedEvidenceFeedback(completionEvidence, readFiles);
+      completionEvidence = '';
+      try {
+        const retry = await loop({ ...ctx, sessionId: `${sessionId}-evidence-retry`, messages: [...ctx.messages, feedback] },
+          { ...options, maxIterations: 2 });
+        retryIterations = retry.iterations;
+        const retryVerified = retry.goalComplete && retry.stopReason === 'goal_complete'
+          ? verifiedEvidenceFromCompletion(completionEvidence, readFiles)
+          : null;
+        if (retryVerified) {
+          verified = {
+            files: Array.from(new Set([...firstVerified.files, ...retryVerified.files])),
+            evidence: Array.from(new Set([...firstVerified.evidence, ...retryVerified.evidence])),
+            rejection: retryVerified.rejection,
+          };
+          result = retry;
+        }
+      } catch (error) {
+        try {
+          debug.log('grounding.persistent', 'evidence-retry-failed', { sessionId,
+            reason: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200) }, { level: 'warn' });
+        } catch {
+          // A failed retry and its telemetry cannot erase evidence already verified by Read.
+        }
+      }
+    }
+    const totalIterations = first.iterations + retryIterations;
     try {
       debug.log('grounding.persistent', 'finished', {
         sessionId,
         maxIterations,
         durationMs: durationMs(),
-      iterations: result.iterations,
+      iterations: totalIterations,
       stopReason: result.stopReason,
       // ⛔ 「끝났다」가 두 뜻이다 — ⓐ 스스로 목표를 끝냈다 ⓑ 턴이 «그냥» 끝났다.
       //   📏 2026-08-11 72차 전수(400건): 후보 0인 finished 가 5건이고 ***다섯 다 end_turn*** 이었다.
@@ -273,6 +326,8 @@ export async function groundPersistently(goal: string, cwd: string, deps: Persis
       candidateCount: verified.files.length,
       evidenceCount: verified.evidence.length,
       evidenceRejection: verified.rejection,
+      feedbackRetry,
+      ...(feedbackRetry ? { firstEvidenceRejection: firstVerified.rejection } : {}),
         toolCalls,
       });
     } catch {
@@ -281,7 +336,7 @@ export async function groundPersistently(goal: string, cwd: string, deps: Persis
     return {
       files: verified.files,
       evidence: verified.evidence,
-      iterations: result.iterations,
+      iterations: totalIterations,
       stopReason: result.stopReason,
     };
   } catch (error) {

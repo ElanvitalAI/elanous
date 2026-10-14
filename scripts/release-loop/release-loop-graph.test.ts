@@ -757,7 +757,7 @@ test('publish uses docs branch notes and page slugs when prerequisites pass', ()
   const prior = process.env.ELANOUS_GRAPH_CONTEXT;
   const calls: Array<[string, string[]]> = [];
   try {
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
       'version-release': { outcome: 'ok', commit: 'a'.repeat(40) }, gate: { outcome: 'ok' }, pwa: { outcome: 'ok' }, prepare: { outcome: 'ok', out: root, commit: 'a'.repeat(40) }, upgrade: { outcome: 'ok' }, tui: { outcome: 'ok' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' },
     } });
     const result = runPublish((cmd, args) => {
@@ -781,7 +781,7 @@ test('any failed prerequisite refuses publish without calling the release comman
     for (const failed of ['gate', 'prepare', 'upgrade']) {
       const outputs: Record<string, unknown> = Object.fromEntries(['gate', 'prepare', 'upgrade', 'pwa', 'tui', 'docs'].map((node) => [node, { outcome: node === failed ? 'fail' : 'ok' }]));
       outputs['approve-publish'] = { outcome: 'approved' };
-      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
+      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
       const result = runPublish(() => { throw new Error('release publish was called'); });
       expect(result).toMatchObject({ outcome: 'fail', verdict: 'fail' });
       expect(result.summary).toContain(failed);
@@ -811,7 +811,7 @@ test('publish accepts measured automatic approval but refuses incomplete metrics
     const metrics = approval.metrics;
     expect(metrics.some((metric) => metric.name === 'mac-smoke')).toBe(true);
     const publish = (approvalOutput: Record<string, unknown>, run: Parameters<typeof runPublish>[0]) => {
-      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input, outputs: { ...outputs, 'auto-approve': approvalOutput } });
+      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input, outputs: { ...outputs, 'auto-approve': approvalOutput } });
       return runPublish(run);
     };
     const run = (cmd: string, args: string[]) => ({ status: 0, stderr: '', stdout: cmd === 'git'
@@ -840,7 +840,7 @@ test('publish accepts measured automatic approval but refuses incomplete metrics
 test('publish cannot report a tag that differs from the release CLI result', () => {
   const prior = process.env.ELANOUS_GRAPH_CONTEXT;
   try {
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
       'version-release': { outcome: 'ok', commit: 'a'.repeat(40) }, gate: { outcome: 'ok' }, pwa: { outcome: 'ok' },
       prepare: { outcome: 'ok', commit: 'a'.repeat(40), out: '/tmp/prepared' }, upgrade: { outcome: 'ok' },
       tui: { outcome: 'ok' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' },
@@ -855,7 +855,7 @@ test('publish cannot report a tag that differs from the release CLI result', () 
 test('publish refuses mismatched prepared commit without reading notes or calling release publish', () => {
   const prior = process.env.ELANOUS_GRAPH_CONTEXT;
   try {
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
       'version-release': { outcome: 'ok', commit: 'a'.repeat(40) },
       gate: { outcome: 'ok' }, pwa: { outcome: 'ok' }, prepare: { outcome: 'ok', commit: 'b'.repeat(40), out: '/tmp/prepared' },
       upgrade: { outcome: 'ok' }, tui: { outcome: 'ok' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' },
@@ -881,7 +881,7 @@ test('publish refuses failed upgrade before running any release command', () => 
   let calls = 0;
   try {
     const file = join(root, 'context.json');
-    writeFileSync(file, JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+    writeFileSync(file, JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
       gate: { outcome: 'ok' }, pwa: { outcome: 'ok' }, prepare: { outcome: 'ok' }, upgrade: { outcome: 'fail' }, tui: { outcome: 'ok' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' },
     } }));
     process.env.ELANOUS_GRAPH_CONTEXT = file;
@@ -1093,7 +1093,7 @@ test('publish refuses when approve-publish did not approve, without calling any 
     for (const approval of [undefined, { outcome: 'rejected' }, null]) {
       const outputs: Record<string, unknown> = Object.fromEntries(['gate', 'prepare', 'upgrade', 'pwa', 'tui', 'docs'].map((node) => [node, { outcome: 'ok' }]));
       if (approval !== undefined) outputs['approve-publish'] = approval;
-      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
+      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
       const result = runPublish((cmd, args) => { calls.push(`${cmd} ${args.join(' ')}`); return { status: 0, stdout: '', stderr: '' }; });
       expect(result.outcome).toBe('fail');
       expect(result.summary).toContain('approve-publish');

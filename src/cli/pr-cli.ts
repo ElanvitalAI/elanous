@@ -58,7 +58,9 @@ import { parseReleaseNoteSection } from '../release-loop/release-note.js';
 import { landingFreezeMessage } from '../release-loop/landing-freeze.js';
 import { admitLandingMerge } from '../self-implement/frozen-merges.js';
 import { verifyAncestorAutoPass, verifyOverlapEvidence } from './pr-land-overlap-evidence.js';
+import { observePrLandRefusal } from './pr-land-refusal.js';
 import { taskAgentStatePath } from '../task-agent/task-hand.js';
+import { PR_LABEL_NAMES } from '../github/pr-labels.js';
 import { enqueueL8ShadowQueue, runL8ShadowQueue, shadowPrNumber, statusL8ShadowQueue, type L8ShadowQueueDeps } from '../self-implement/l8-merge-queue.js';
 
 export { branchLineageSlug, findSiblingPrs };
@@ -1143,8 +1145,36 @@ export function runPrGranularity(opts: PrGranularityOpts = {}, deps: PrLandDeps 
 const GITHUB_MERGEABLE = new Set(['MERGEABLE', 'CONFLICTING', 'UNKNOWN']);
 const GITHUB_MERGE_STATE = new Set(['BEHIND', 'BLOCKED', 'CLEAN', 'DIRTY', 'DRAFT', 'HAS_HOOKS', 'UNKNOWN', 'UNSTABLE']);
 
+/** Read-only identity check shared by pinned landing and its dry-run. Later landing gates still run only on a real landing. */
+function inspectPinnedPr(run: CmdRunner, cwd: string, pr: number, expectedHead: string) {
+  const viewed = run('gh', ['pr', 'view', String(pr), '--json', 'headRefOid,headRefName,state,isDraft,url'], { cwd });
+  let value: { headRefOid?: string; headRefName?: string; state?: string; isDraft?: boolean; url?: string } = {};
+  try {
+    if (viewed.ok) {
+      const parsed: unknown = JSON.parse(viewed.out);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) value = parsed as typeof value;
+    }
+  } catch { /* unreadable is not approval */ }
+  const local = run('git', ['rev-parse', 'HEAD'], { cwd });
+  const dirty = run('git', ['status', '--porcelain'], { cwd });
+  const reasons: string[] = [];
+  if (value.state !== 'OPEN') reasons.push('PR is not OPEN or its state is unavailable');
+  if (value.isDraft !== false) reasons.push(value.isDraft === true ? 'PR is draft' : 'PR ready status is unavailable');
+  if (value.headRefOid?.toLowerCase() !== expectedHead.toLowerCase()) reasons.push('PR head differs from --expected-head or is unavailable');
+  if (!value.url?.endsWith(`/pull/${pr}`) || !value.headRefName) reasons.push('PR identity or head branch is unavailable');
+  if (!local.ok || local.out.trim().toLowerCase() !== expectedHead.toLowerCase()) reasons.push('local HEAD differs from --expected-head or is unavailable');
+  if (!dirty.ok || dirty.out.trim()) reasons.push(dirty.ok ? 'local worktree is dirty' : 'local worktree status is unavailable');
+  return { ok: reasons.length === 0, reasons, branch: value.headRefName, url: value.url };
+}
+
 export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): Promise<number> {
   const out = deps.out ?? liveOut;
+  // First slice: observe pinned identity/branch, overlap decision, and GitHub merge refusals.
+  // Option syntax and prerequisite gate errors do not describe a merge recovery edge.
+  const refuse = (message: string, context: { isDraft?: boolean } = {}): void => {
+    out.error(message);
+    observePrLandRefusal(message, context);
+  };
   if (opts.title !== undefined && opts.titleFile !== undefined) {
     out.error('✗ title: --title과 --title-file은 함께 사용할 수 없습니다.');
     return 1;
@@ -1248,6 +1278,31 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     out.log('- Mutations (ready/edit/create/merge, git commit/push, worktree): NOT RUN');
     return 0;
   }
+  if (opts.dryRun && pinned) {
+    const pr = Number(opts.pr);
+    if (!/^[1-9]\d*$/.test(opts.pr ?? '') || !Number.isSafeInteger(pr) || !/^[a-f0-9]{40}$/i.test(opts.expectedHead ?? '')) {
+      out.error('✗ expected-head: --pr and --expected-head (full SHA) are required together without --hold');
+      return 1;
+    }
+    if (opts.hold) {
+      out.error('✗ dry-run: --hold 는 머리 고정 읽기 전용 예행과 함께 사용할 수 없습니다.');
+      return 1;
+    }
+    if (opts.overlapEvidence !== undefined) {
+      out.error('✗ dry-run: --overlap-evidence 는 머리 고정 읽기 전용 예행에서 사용할 수 없습니다.');
+      return 1;
+    }
+    const inspected = inspectPinnedPr(run, cwd, pr, opts.expectedHead!);
+    const branch = (deps.currentBranch ?? liveCurrentBranch)(cwd);
+    const reasons = [...inspected.reasons];
+    if (!branch || branch !== inspected.branch) reasons.push('current branch differs from the PR head branch or is unavailable');
+    out.log(`[dry-run] pinned PR #${pr} · expected head ${opts.expectedHead}`);
+    for (const reason of reasons) out.log(`[dry-run] ✗ preflight: ${reason}`);
+    if (reasons.includes('PR is draft')) out.log(`[dry-run] 선행: eln gh pr ready ${pr}`);
+    if (reasons.length === 0) out.log('[dry-run] ✓ preflight: PR OPEN non-draft, matching PR/local HEAD and branch, clean worktree');
+    out.log('[dry-run] Remaining landing gates, freeze, overlap and merge: UNMEASURED; no PR or git state changed.');
+    return reasons.length === 0 ? 0 : 1;
+  }
   if (opts.overlapEvidence !== undefined && (!pinned || !opts.overlapEvidence.trim())) {
     out.error('✗ overlap-evidence: --overlap-evidence <file> 는 --pr ⊕ --expected-head 머리 고정 착지에서만 쓴다.');
     return 1;
@@ -1256,30 +1311,26 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   let pinnedUrl: string | undefined;
   if (pinned) {
     const pr = Number(opts.pr);
-    if (!/^[1-9]\d*$/.test(opts.pr ?? '') || !Number.isSafeInteger(pr) || !/^[a-f0-9]{40}$/i.test(opts.expectedHead ?? '') || opts.hold || opts.dryRun) {
-      out.error('✗ expected-head: --pr and --expected-head (full SHA) are required together without --hold/--dry-run');
+    if (!/^[1-9]\d*$/.test(opts.pr ?? '') || !Number.isSafeInteger(pr) || !/^[a-f0-9]{40}$/i.test(opts.expectedHead ?? '') || opts.hold) {
+      out.error('✗ expected-head: --pr and --expected-head (full SHA) are required together without --hold');
       return 1;
     }
-    const viewed = run('gh', ['pr', 'view', String(pr), '--json', 'headRefOid,headRefName,state,isDraft,url'], { cwd });
-    let value: { headRefOid?: string; headRefName?: string; state?: string; isDraft?: boolean; url?: string } = {};
-    try { if (viewed.ok) value = JSON.parse(viewed.out) as typeof value; } catch { /* unreadable is not approval */ }
-    const local = run('git', ['rev-parse', 'HEAD'], { cwd });
-    const dirty = run('git', ['status', '--porcelain'], { cwd });
-    if (value.state !== 'OPEN' || value.isDraft !== false || value.headRefOid?.toLowerCase() !== opts.expectedHead!.toLowerCase()
-      || !value.url?.endsWith(`/pull/${pr}`) || !value.headRefName || !local.ok || local.out.trim().toLowerCase() !== opts.expectedHead!.toLowerCase()
-      || !dirty.ok || dirty.out.trim()) {
-      out.error('✗ expected-head: PR OPEN non-draft, matching local HEAD and clean worktree required');
+    const inspected = inspectPinnedPr(run, cwd, pr, opts.expectedHead!);
+    if (!inspected.ok) {
+      refuse('✗ expected-head: PR OPEN non-draft, matching local HEAD and clean worktree required', {
+        isDraft: inspected.reasons.includes('PR is draft'),
+      });
       return 1;
     }
-    pinnedBranch = value.headRefName;
-    pinnedUrl = value.url;
+    pinnedBranch = inspected.branch;
+    pinnedUrl = inspected.url;
   }
   const resolveBase = deps.resolveBase ?? resolveDeliverableBase;
   const branch = (deps.currentBranch ?? liveCurrentBranch)(cwd);
   if (!branch || (pinned && branch !== pinnedBranch)) {
     const detail = pinned ? 'PR head branch와 현재 브랜치가 다릅니다.' : '현재 브랜치를 해석하지 못했습니다.';
     record('branch', false);
-    out.error(`✗ branch: ${detail}`);
+    refuse(`✗ branch: ${detail}`);
     return 1;
   }
   record('branch', true);
@@ -1664,6 +1715,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   const hold = !!opts.hold || overlapDecision?.outcome === 'user-hold';
   // TA-LAND-OVERLAP — 비대화형 «승인 불가»만 증거로 대신한다(사람의 hold 는 증거로 뒤집지 않는다) · 증거가 없거나 어긋나면 종전 거부 그대로.
   let overlapEvidenceAccepted = false;
+  let ancestorResyncNeeded = false;
   if (pinned && overlapDecision?.outcome === 'unavailable' && opts.overlapEvidence !== undefined) {
     const ref = resolveRemoteBranchRef(run, cwd, base);
     const verdict = verifyOverlapEvidence({
@@ -1678,7 +1730,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
           ? `✓ overlap-evidence: base-advanced-disjoint — gate base ${verdict.gateBase.slice(0, 12)} ⊂ head ${opts.expectedHead!.slice(0, 12)} · ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} 까지 ${verdict.windowCommits}개 커밋이 PR 파일을 안 건드린다 · review pass|warn must-fix 0 (${verdict.reviewResult})`
           : `✓ overlap-evidence: ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} ⊂ head ${opts.expectedHead!.slice(0, 12)} · gate passed on that base · review pass must-fix 0 (${verdict.reviewResult})`);
     }
-    else out.error(`✗ overlap-evidence: ${verdict.reason}`);
+    else refuse(`✗ overlap-evidence: ${verdict.reason}`);
   } else if (pinned && overlapDecision?.outcome === 'unavailable') {
     // 증거 파일이 없을 때 — 겹친 착지가 전부 머리의 조상이고 표준 자리의 리뷰가 pass|warn ⊕ must-fix 0 이면 통과(아니면 종전 거부).
     const verdict = verifyAncestorAutoPass({
@@ -1690,9 +1742,19 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     if (verdict.ok) {
       out.log(`✓ overlap-evidence: already-ancestor-auto — 겹친 최근 착지 ${overlappingLandings.length}개가 전부 head ${opts.expectedHead!.slice(0, 12)} 의 조상 · review pass|warn must-fix 0 (${verdict.reviewResult})`);
     }
-    else out.error(`✗ ancestor-auto: ${verdict.reason}`);
+    else {
+      refuse(`✗ ancestor-auto: ${verdict.reason}`);
+      ancestorResyncNeeded = verdict.reason.startsWith('ancestor-auto-not-ancestor:');
+    }
   }
   if (pinned && overlapDecision && overlapDecision.outcome !== 'user-merge' && !overlapEvidenceAccepted) {
+    // A clean GitHub PR can still be behind a recently landed overlapping head. Preserve the cue
+    // across hosts; the current steward tick acts only if it can also prove local run ownership.
+    if (ancestorResyncNeeded && !opts.dryRun) {
+      const marked = run('gh', ['pr', 'edit', String(opts.pr), '--add-label', PR_LABEL_NAMES.needsRebase], { cwd });
+      record('resync-marker', marked.ok, { pr: Number(opts.pr), reason: 'ancestor-auto-not-ancestor' });
+      if (!marked.ok) out.error('⚠ resync-marker: needs-rebase 라벨을 남기지 못했습니다');
+    }
     out.error('✗ expected-head: overlap merge approval unavailable for the reviewed head');
     return 1;
   }
@@ -1753,7 +1815,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     if (opts.hold) {
       out.log(`[dry-run] ${existing.url ? '기존 PR을 갱신' : 'PR을 생성'}하고 --hold 로 병합하지 않고 멈춥니다.`);
     } else {
-      out.log(`[dry-run] ${existing.url ? '기존 PR을 갱신하고 ready 상태를 보장' : 'PR을 생성하고 ready 상태를 보장'}한 뒤 squash merge 합니다.`);
+      out.log(`[dry-run] 머리 고정 없는 일반 착지: ${existing.url ? '기존 PR을 갱신하고 ready 상태를 보장' : 'PR을 생성하고 ready 상태를 보장'}한 뒤 squash merge 합니다.`);
     }
     return 0;
   }
@@ -1927,7 +1989,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
       ...(mergeable ? { mergeable } : {}),
       ...(mergeStateStatus ? { mergeStateStatus } : {}),
     });
-    out.error(`✗ merge: ${detail}`);
+    refuse(`✗ merge: ${detail}`);
     if (mergeable === 'CONFLICTING') {
       out.error('  ↳ 충돌 — 이 브랜치가 기준 브랜치의 최근 착지와 같은 줄을 고쳤다. `bun bin/elanous.mjs git fetch origin` → `bun bin/elanous.mjs git rebase origin/<기준>` 로 풀고 다시 pr land.');
     }

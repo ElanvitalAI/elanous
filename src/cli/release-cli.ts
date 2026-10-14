@@ -53,6 +53,7 @@ import { autoStartScheduledRelease, type AutoStartDeferral } from '../release-lo
 import { runRehearsalTick, type RehearsalDeps } from '../release-loop/rehearsal.js';
 import { landingFreezeMessage, LandingFrozenError, readLandingFreeze } from '../release-loop/landing-freeze.js';
 import { formatLightRc, runLightRc, type LightRcDeps } from '../release-loop/light-rc.js';
+import { registerRfcCommands } from './rfc-cli.js';
 
 export const DEFAULT_PUBLIC_REPO = 'ElanvitalAI/elanous';
 const SEMVER = /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/;
@@ -623,6 +624,7 @@ function compareReleaseVersions(a: string, b: string): number {
 }
 
 export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}, lightRcDeps: LightRcDeps = {}, rehearsalDeps: RehearsalDeps = {}): void {
+  registerRfcCommands(program);
   const release = program.command('release').description('공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)');
   const schedule = release.command('schedule').description('판별 컷·착지 마감 조회·갱신');
   const scheduleLedgerRoot = () => releaseRunDeps.ledgerRoot ?? releaseLedgerRoot();

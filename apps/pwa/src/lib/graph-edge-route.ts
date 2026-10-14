@@ -349,6 +349,18 @@ export function routeEdges(
       edge.laneY = kind === 'back'
         ? Math.max(...covered.map((box) => box.y + box.h)) + LANE_GAP + lane * LANE_STEP
         : Math.min(...covered.map((box) => box.y)) - LANE_GAP - lane * LANE_STEP;
+      if (kind === 'back') {
+        // A wrapped graph can place another row below the band before a high-numbered lane.
+        // Move the horizontal run past those cards; the side stubs remain outside the cards.
+        for (;;) {
+          const blocker = frame.find((box) => box !== edge.s && box !== edge.t
+            && box.x < edge.hi && box.x + box.w > edge.lo
+            && edge.laneY > box.y - CLEAR && edge.laneY < box.y + box.h + CLEAR);
+          if (blocker) { edge.laneY = blocker.y + blocker.h + LANE_GAP; continue; }
+          if (placed.some((other) => other !== edge && other.laneY === edge.laneY)) { edge.laneY += LANE_STEP; continue; }
+          break;
+        }
+      }
     }
   }
 

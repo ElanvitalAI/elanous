@@ -478,7 +478,7 @@ describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => 
   });
 
   // TA-LAND-WORKTREE — cwd HEAD ≠ PR 머리(Pod 런 PR · 호스트 checkout)면 PR 머리 임시 워크트리에서 land 하고 걷는다.
-  function worktreeSeam(t: ReturnType<typeof landFixture>, opts: { local: string | null; fail?: string }) {
+  function worktreeSeam(t: ReturnType<typeof landFixture>, opts: { local: string | null; branch?: string; fail?: string }) {
     const events: string[] = [];
     const created: Array<Record<string, unknown>> = [];
     const live = {
@@ -486,11 +486,12 @@ describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => 
       landPrHead: async () => ({ head: HEAD_A, state: 'OPEN', isDraft: false, branch: 'feature/pod' }),
       landWorktree: {
         localHead: (cwd: string) => { events.push(`head:${cwd}`); return opts.local; },
+        localBranch: () => opts.branch ?? 'feature/pod',
         create: async (input: LandWorktreeInput): Promise<LandWorktree | LandWorktreeFailure> => {
           created.push(input as unknown as Record<string, unknown>);
           if (opts.fail) return { reason: opts.fail, created: false, removed: null };
           events.push('create');
-          return { cwd: '/state/land-worktrees/x', cleanup: () => { events.push('cleanup'); return { removed: true }; } };
+          return { cwd: '/state/land-worktrees/x', created: true, cleanup: () => { events.push('cleanup'); return { removed: true }; } };
         },
       },
     };
@@ -506,6 +507,42 @@ describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => 
     expect(t.calls).toEqual([{ pr: 51, head: HEAD_A, cwd: '/state/land-worktrees/x' }]);
     expect(w.events).toEqual(['head:/tmp/land-wt', 'create', 'cleanup']);
     expect(t.f.logs.filter(entry => entry.event === 'land-worktree').map(entry => [entry.data.created, entry.data.removed])).toEqual([[true, false], [true, true]]);
+  });
+
+  test('a clean registered PR branch owner is used for land and never cleaned up', async () => {
+    const t = landFixture();
+    const w = worktreeSeam(t, { local: HEAD_B });
+    let cleanupCalled = false;
+    const out = await executeLiveLand(t.card(), 51, t.ctx, {
+      ...w.live, landWorktree: { ...w.live.landWorktree, create: async () => ({ cwd: '/owner/pr-branch', created: false, cleanup: () => { cleanupCalled = true; return { removed: false, reason: 'borrowed owner — left untouched' }; } }) },
+    });
+    expect(out).toMatchObject({ executed: true, ok: true });
+    expect(t.calls).toEqual([{ pr: 51, head: HEAD_A, cwd: '/owner/pr-branch' }]);
+    expect(cleanupCalled).toBe(true);
+    expect(t.f.logs.filter(entry => entry.event === 'land-worktree').map(entry => [entry.data.created, entry.data.removed])).toEqual([[false, false], [false, false]]);
+  });
+
+  test('cwd at reviewed SHA on another branch borrows the verified PR branch owner', async () => {
+    const t = landFixture();
+    const w = worktreeSeam(t, { local: HEAD_A, branch: 'host/main' });
+    const out = await executeLiveLand(t.card(), 51, t.ctx, {
+      ...w.live, landWorktree: { ...w.live.landWorktree, create: async () => ({ cwd: '/owner/pr-branch', created: false, cleanup: () => ({ removed: false, reason: 'borrowed owner — left untouched' }) }) },
+    });
+    expect(out).toMatchObject({ executed: true, ok: true });
+    expect(t.calls).toEqual([{ pr: 51, head: HEAD_A, cwd: '/owner/pr-branch' }]);
+    expect(w.created).toEqual([]);
+    expect(t.f.logs.filter(entry => entry.event === 'land-worktree').map(entry => entry.data.created)).toEqual([false, false]);
+  });
+
+  test('occupied dirty branch refuses land and emits owner path in worktree-conflict observation', async () => {
+    const t = landFixture();
+    const w = worktreeSeam(t, { local: HEAD_B });
+    const out = await executeLiveLand(t.card(), 51, t.ctx, {
+      ...w.live, landWorktree: { ...w.live.landWorktree, create: async () => ({ reason: 'worktree-conflict: owner dirty', created: false, removed: null, kind: 'worktree-conflict', ownerPath: '/owner/pr-branch' }) },
+    });
+    expect(out).toMatchObject({ executed: false, ok: false });
+    expect(t.calls).toEqual([]);
+    expect(t.f.logs.find(entry => entry.event === 'worktree-conflict')?.data).toMatchObject({ card: 'ta-live-1', pr: 51, head: HEAD_A, branch: 'feature/pod', ownerPath: '/owner/pr-branch' });
   });
 
   test('cwd HEAD = PR head (local run worktree) → no worktree, land in cwd as before', async () => {
@@ -606,7 +643,7 @@ describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => 
           create: async (): Promise<LandWorktree | LandWorktreeFailure> => {
             createCalls++;
             if (createCalls === 1) return { reason: 'first create failed', created: false, removed: null };
-            return { cwd: '/state/land-worktrees/success', cleanup: () => ({ removed: true }) };
+            return { cwd: '/state/land-worktrees/success', created: true, cleanup: () => ({ removed: true }) };
           },
         },
         land: async () => ({ status: 0, stdout: 'merged' }),
@@ -634,7 +671,7 @@ describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => 
           create: async (input: LandWorktreeInput): Promise<LandWorktree | LandWorktreeFailure> => {
             createCalls.push(input);
             if (input.head === HEAD_A) return { reason: 'old head create failed', created: false, removed: null };
-            return { cwd: '/state/land-worktrees/new-head', cleanup: () => ({ removed: true }) };
+            return { cwd: '/state/land-worktrees/new-head', created: true, cleanup: () => ({ removed: true }) };
           },
         },
         land: async () => ({ status: 0, stdout: 'merged' }),

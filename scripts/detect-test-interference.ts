@@ -26,6 +26,9 @@ export type MeasuredRun = {
   fail: number | null;
   status: 'measured' | 'unmeasurable';
   reason?: string;
+  /** Names observed in Bun's failed-test output. Absent names must not be inferred from the selected files. */
+  failedFiles?: string[];
+  failedTests?: string[];
 };
 
 export type InterferenceReport = {
@@ -61,6 +64,32 @@ export function parseFailureCount(output: string): number | null {
   return Number(failures[0]![1]);
 }
 
+/** Bun prints a file heading before its `(fail) name` lines. Only retain names actually printed by that run. */
+export function parseFailedTestNames(output: string): { files: string[]; tests: string[] } {
+  const files = new Set<string>();
+  const tests = new Set<string>();
+  let currentFile: string | undefined;
+  for (const raw of output.replace(/\x1b\[[0-9;]*m/g, '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (/^(?:\d+\s+(?:pass|fail|skip)|Ran\s+\d+\s+tests?|Bun test v)/i.test(line)) { currentFile = undefined; continue; }
+    const failure = /^\(fail\)\s+(.+?)(?:\s+\[[^\]]+\])?$/.exec(line);
+    if (failure) {
+      tests.add(failure[1]!.trim());
+      if (currentFile) files.add(currentFile);
+      continue;
+    }
+    const heading = /^(.+):$/.exec(line);
+    if (heading) currentFile = /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(heading[1]!) ? heading[1] : undefined;
+  }
+  return { files: [...files], tests: [...tests] };
+}
+
+export function failedNamesFromStreams(result: RunnerResult): { files: string[]; tests: string[] } {
+  const stdout = parseFailedTestNames(result.stdout);
+  const stderr = parseFailedTestNames(result.stderr);
+  return { files: [...new Set([...stdout.files, ...stderr.files])], tests: [...new Set([...stdout.tests, ...stderr.tests])] };
+}
+
 async function measure(files: readonly string[], runner: TestRunner): Promise<MeasuredRun> {
   try {
     const result = await runner(files);
@@ -68,9 +97,10 @@ async function measure(files: readonly string[], runner: TestRunner): Promise<Me
       return { files: [...files], fail: null, status: 'unmeasurable', reason: result.signal ? `runner terminated by ${result.signal}` : 'runner exit code unavailable' };
     }
     const fail = parseFailureCount(`${result.stdout}${result.stderr}`);
+    const names = fail !== null && fail > 0 ? failedNamesFromStreams(result) : undefined;
     return fail === null
       ? { files: [...files], fail: null, status: 'unmeasurable', reason: 'test summary unavailable, ambiguous, or ran zero files' }
-      : { files: [...files], fail, status: 'measured' };
+      : { files: [...files], fail, status: 'measured', ...(names?.files.length ? { failedFiles: names.files } : {}), ...(names?.tests.length ? { failedTests: names.tests } : {}) };
   } catch (error) {
     return { files: [...files], fail: null, status: 'unmeasurable', reason: error instanceof Error ? error.message : String(error) };
   }

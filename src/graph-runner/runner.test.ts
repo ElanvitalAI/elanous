@@ -128,6 +128,45 @@ test('subgraph runs a child with contracted input/output and linked ledgers plus
     (entry.data as { runId?: string })?.runId === parent.runId).map(entry => entry.event)).toEqual(['enter', 'exit']);
 });
 
+test('a multi-entry unit starts at the call-selected entry and rejects an undeclared entry before execution', async () => {
+  const { graph, root, unit } = unitFixture();
+  writeFileSync(unit, readFileSync(unit, 'utf8')
+    .replace('exits: [done, failed]', 'exits: [done, failed], entries: [produce, alternate]')
+    .replace('  - { node_id: done, kind: gate', "  - { node_id: alternate, kind: agent, recipe: 'cmd:produce', max_visits: 1 }\n  - { node_id: done, kind: gate")
+    .replace('  - { from: produce, on: outcome, map: { ok: done, fail: failed } }',
+      '  - { from: produce, on: outcome, map: { ok: done, fail: failed } }\n  - { from: alternate, on: outcome, map: { ok: done, fail: failed } }'));
+  const original = readFileSync(graph, 'utf8');
+  writeFileSync(graph, original.replace('    call: worker@1', '    call: worker@1\n    call_entry: alternate'));
+  const run = await runGraph(graph, { input: { request: 'hello' }, deps: { root,
+    runBash: async () => ({ stdout: '{"answer":"alternate"}', stderr: '', exitCode: 0 }),
+  } });
+  expect(run.status).toBe('done');
+  const child = JSON.parse(readFileSync(join(root, 'graph-runs', 'worker', `${run.unitCalls![0]!.childRunId}.json`), 'utf8'));
+  expect(child.path).toEqual(['alternate', 'done']);
+  expect(child.entryNodeId).toBe('alternate');
+  expect(run.unitCalls![0]?.entry).toBe('alternate');
+  expect(run.nodes[0]?.output).toBe('{"outcome":"done","answer":"alternate"}');
+
+  writeFileSync(graph, original);
+  const events: Array<Record<string, unknown>> = [];
+  const defaultRun = await runGraph(graph, { input: { request: 'hello' }, deps: { root,
+    runBash: async () => ({ stdout: '{"answer":"default"}', stderr: '', exitCode: 0 }),
+    log: (event, data) => { if (event === 'graph.unit') events.push(data); },
+  } });
+  const defaultChild = JSON.parse(readFileSync(join(root, 'graph-runs', 'worker', `${defaultRun.unitCalls![0]!.childRunId}.json`), 'utf8'));
+  expect(defaultChild.path).toEqual(['produce', 'done']);
+  expect(defaultChild.entryNodeId).toBe('produce');
+  expect(defaultRun.unitCalls![0]?.entry).toBe('produce');
+  expect(events.map(event => event.entry)).toEqual(['produce', 'produce']);
+
+  writeFileSync(graph, original.replace('    call: worker@1', '    call: worker@1\n    call_entry: missing'));
+  let invoked = 0;
+  await expect(runGraph(graph, { input: { request: 'hello' }, deps: { root,
+    runBash: async () => { invoked++; return { stdout: '{}', stderr: '', exitCode: 0 }; },
+  } })).rejects.toThrow('unit entry mismatch');
+  expect(invoked).toBe(0);
+});
+
 test('subgraph reads contracted output from the producing record despite intervening nodes', async () => {
   const { graph, root, unit } = unitFixture(4);
   writeFileSync(join(root, 'units', 'recipes.yaml'), `${readFileSync(join(root, 'units', 'recipes.yaml'), 'utf8')}inspect:\n  command: 'echo inspected'\n`);
@@ -851,29 +890,36 @@ test('real release-loop failed node writes one heal inbox line without running d
 });
 
 test('release-loop with no outgoing edge records the failed run exactly once', async () => {
-  const { graph, root } = fixture('exit 0');
-  writeFileSync(graph, readFileSync(graph, 'utf8')
-    .replace('graph_id: test-graph', 'graph_id: release-loop')
-    .replace('map: { ok: second, fail: failed }', 'map: { fail: failed }'));
-  const run = await runGraph(graph, { deps: { root } });
+  const root = mkdtempSync(join(tmpdir(), 'graph-release-no-edge-'));
+  dirs.push(root);
+  const graph = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  const source = readFileSync(graph, 'utf8').replace('ok: cutoff, fail: failed, error: failed', 'fail: failed, error: failed');
+  const local = join(root, 'release-loop.yaml');
+  writeFileSync(local, source);
+  writeFileSync(join(root, 'recipes.yaml'), readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8'));
+  const run = await runGraph(local, { deps: { root, runBash: async () => ({ stdout: '{"outcome":"ok"}', stderr: '', exitCode: 0 }) } });
   expect(run.status).toBe('failed');
-  expect(run.path).toEqual(['first']);
+  expect(run.path).toEqual(['version-release']);
   expect(readFailureInbox({}, root)).toEqual([{
     source: 'release-run', kind: 'graph-run', ref: `${run.graphId}/${run.runId}`,
-    summary: `Graph ${run.graphId}/${run.runId} failed after first (no outgoing edge)`, at: run.finishedAt!,
+    summary: `Graph ${run.graphId}/${run.runId} failed after version-release (no outgoing edge)`, at: run.finishedAt!,
   }]);
   expect(readFileSync(join(root, 'heal', 'inbox.jsonl'), 'utf8').trimEnd().split('\n')).toHaveLength(1);
 });
 
 test('a broken heal inbox does not replace either persisted release failure verdict and exposes a replay path', async () => {
   for (const branch of ['terminal', 'no-edge']) {
-    const { graph, root } = fixture(branch === 'terminal' ? 'exit 1' : 'exit 0');
-    writeFileSync(graph, readFileSync(graph, 'utf8')
-      .replace('graph_id: test-graph', 'graph_id: release-loop')
-      .replace('map: { ok: second, fail: failed }', branch === 'no-edge' ? 'map: { fail: failed }' : 'map: { ok: second, fail: failed }'));
+    const root = mkdtempSync(join(tmpdir(), 'graph-release-heal-broken-'));
+    dirs.push(root);
+    const graph = join(root, 'release-loop.yaml');
+    const source = readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8');
+    writeFileSync(graph, branch === 'no-edge' ? source.replace('ok: cutoff, fail: failed, error: failed', 'fail: failed, error: failed') : source);
+    writeFileSync(join(root, 'recipes.yaml'), readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8'));
     mkdirSync(join(root, 'heal'));
     writeFileSync(join(root, 'heal', 'inbox.jsonl'), '{invalid-json}\n');
-    const result = await runGraph(graph, { runId: `broken-${branch}`, deps: { root } });
+    const result = await runGraph(graph, { runId: `broken-${branch}`, deps: { root, runBash: async () => ({
+      stdout: branch === 'terminal' ? '{"outcome":"fail"}' : '{"outcome":"ok"}', stderr: '', exitCode: branch === 'terminal' ? 1 : 0,
+    }) } });
     expect(result.status).toBe('failed');
     expect(JSON.parse(readFileSync(result.statePath, 'utf8')).status).toBe('failed');
     expect(readFileSync(join(root, 'heal', 'inbox.jsonl'), 'utf8')).toBe('{invalid-json}\n');

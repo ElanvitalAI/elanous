@@ -56,13 +56,13 @@ test('hourly OP report includes exactly one formatted land cover line, preserves
     const result = await seatReport('OP', { root, now: () => now, config: { mode: 'shadow', reportPr: 16815 }, post: true,
       coverLogs: (query) => {
         seen.push(query.exactCategories![0]!);
-        const payloads = query.exactCategories?.[0] === 'task-agent'
-          ? [{ kind: 'land', result: 'done' }, { kind: 'land', result: 'shadow' }]
-          : [{ step: 'merge', ok: true }, { step: 'merge', ok: true }];
+        const payloads = query.events?.[0] === 'action'
+          ? [{ kind: 'land', result: 'done', taskId: 'card-a' }, { kind: 'land', result: 'shadow' }]
+          : query.events?.[0] === 'step' ? [{ step: 'merge', ok: true }, { step: 'merge', ok: true }] : [];
         return payloads.map((data) => ({ category: query.exactCategories![0], event: query.events![0], data: JSON.stringify(data) }) as import('../mss/logging/log-store.js').LogStoreRow);
       }, send: (body) => { sent.push(body); },
     });
-    expect(seen).toEqual(['task-agent', 'pr.land']);
+    expect(seen).toEqual(['task-agent', 'pr.land', 'task-agent', 'task-agent.land-order']);
     expect(result.body.match(/TASK-AGENT cover /g)).toHaveLength(1);
     expect(result.body).toContain('TASK-AGENT cover land: TA 1/2 (50.0%) · live 1 · shadow 1 · steward-transition observed');
     expect(result.body.split('\n')).toHaveLength(1);
@@ -79,20 +79,22 @@ test('OP cover does not invent a denominator when one source fails or reaches it
     const base = { root, now: () => now, config: { mode: 'shadow' as const } };
     const unreadable = await seatReport('OP', { ...base, coverLogs: (query) => {
       if (query.exactCategories?.[0] === 'pr.land') throw Error('unavailable');
-      return [{ category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'land', result: 'done' }) } as import('../mss/logging/log-store.js').LogStoreRow];
+      return query.events?.[0] === 'action'
+        ? [{ category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'land', result: 'done', taskId: 'card-a' }) } as import('../mss/logging/log-store.js').LogStoreRow]
+        : [];
     } });
     expect(unreadable.body).toContain('TASK-AGENT cover land: TA 1/- (-) · live 1 · shadow 0 · steward-transition unmeasured');
     const bounded = await seatReport('OP', { ...base, coverLogs: (query) => ({
-      rows: query.exactCategories?.[0] === 'task-agent'
-        ? [{ category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'land', result: 'done' }) } as import('../mss/logging/log-store.js').LogStoreRow]
-        : [{ category: 'pr.land', event: 'step', data: JSON.stringify({ step: 'merge', ok: true }) } as import('../mss/logging/log-store.js').LogStoreRow],
+      rows: query.events?.[0] === 'action'
+        ? [{ category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'land', result: 'done', taskId: 'card-a' }) } as import('../mss/logging/log-store.js').LogStoreRow]
+        : query.events?.[0] === 'step' ? [{ category: 'pr.land', event: 'step', data: JSON.stringify({ step: 'merge', ok: true }) } as import('../mss/logging/log-store.js').LogStoreRow] : [],
       limitReached: query.exactCategories?.[0] === 'pr.land', unreadableStores: 0, storesRead: 1,
     }) });
     expect(bounded.body).toContain('TASK-AGENT cover land: TA 1/- (-) · live 1 · shadow 0 · steward-transition unmeasured');
     const partial = await seatReport('OP', { ...base, coverLogs: (query) => ({
-      rows: query.exactCategories?.[0] === 'task-agent'
-        ? [{ category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'land', result: 'done' }) } as import('../mss/logging/log-store.js').LogStoreRow]
-        : [{ category: 'pr.land', event: 'step', data: JSON.stringify({ step: 'merge', ok: true }) } as import('../mss/logging/log-store.js').LogStoreRow],
+      rows: query.events?.[0] === 'action'
+        ? [{ category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'land', result: 'done', taskId: 'card-a' }) } as import('../mss/logging/log-store.js').LogStoreRow]
+        : query.events?.[0] === 'step' ? [{ category: 'pr.land', event: 'step', data: JSON.stringify({ step: 'merge', ok: true }) } as import('../mss/logging/log-store.js').LogStoreRow] : [],
       limitReached: false, unreadableStores: 1, storesRead: 1,
     }) });
     expect(partial.body).toContain('TASK-AGENT cover land: TA 1/1 (100.0%) · live 1 · shadow 0 · steward-transition observed (logs.db 1개 못 읽음)');

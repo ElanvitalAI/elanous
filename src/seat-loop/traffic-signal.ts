@@ -10,6 +10,13 @@ export type TrafficSignal = {
 };
 export type TrafficSignalRead = TrafficSignal | { unreadable: true } | null;
 
+/** Pure proposal classification; applying a proposal belongs to the downstream seat-message caller. */
+export function classifySeatTrafficProposal(message: string): 'hold' | 'UNHOLD' | null {
+  if (message.includes('첫 줄 확정')) return 'UNHOLD';
+  if (message.includes('손 구현 착수')) return 'hold';
+  return null;
+}
+
 const defaultPath = (name: string): string => join(homedir(), 'elanous-hq', 'seat-state', 'OP', name);
 const missing = (error: unknown): boolean => (error as NodeJS.ErrnoException).code === 'ENOENT';
 

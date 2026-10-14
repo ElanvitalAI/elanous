@@ -6,6 +6,7 @@ import { Database } from 'bun:sqlite';
 import { debug } from '../debug/log.js';
 import { ClaimsInputError, ClaimsLedger } from './claims-ledger.js';
 import { queueStaleRechecks, renderClaims } from './claims-render.js';
+import { PatentLedger } from '../patents/ledger.js';
 
 const root = () => realpathSync(mkdtempSync(join(tmpdir(), 'claims-ledger-')));
 const input = { id: 'C1', claim: '측정으로 검증된 주장.', audience: 'personal,team', owner: 'MK', contrast: '다른 도구보다 빠름' };
@@ -141,5 +142,29 @@ test('latest measurement decides freshness and equality with expiry is stale', (
     now = new Date('2026-10-06T00:00:00Z');
     expect(store.get('C1').status).toBe('stale');
     expect(store.get('C1').history.filter(h => h.event === 'stale')).toHaveLength(1);
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+});
+
+test('특허 원장의 공개 허용 후보만 공개 주장으로 읽는다 — 비공개/조사 상태 후보는 나오지 않는다', () => {
+  const stateDir = root();
+  const now = new Date('2026-10-13T00:00:00Z');
+  const store = new ClaimsLedger({ stateDir, now: () => now });
+  const patents = new PatentLedger({ stateDir, now: () => now });
+  try {
+    patents.add({ id: 'PRIVATE-A', title: '비공개 후보 A', track: '비공개', status: '조사', deadline: '2030-01-28' });
+    patents.add({ id: 'PRIVATE-B', title: '비공개 후보 B', track: '비공개', status: '명세', deadline: '2030-01-20' });
+    patents.add({ id: 'FILED-C', title: '출원 후보 C', track: '출원', status: '출원', deadline: '2030-02-28' });
+    patents.add({ id: 'PUBLIC-D', title: '공개 허용 후보 D', track: '출원', status: '공개 허용', deadline: '2030-02-28' });
+    // 판정선: 비공개/조사(·명세·출원) 상태 후보는 공개 주장으로 나오지 않고 공개 허용 상태만 읽힌다
+    const attribution = { owner: 'MK', audience: 'team' };
+    expect(store.patentClaims(patents, attribution).map(row => row.id)).toEqual(['PUBLIC-D']);
+    expect(store.patentClaims(patents, attribution)[0]).toMatchObject({ id: 'PUBLIC-D', claim: '공개 허용 후보 D', audience: 'team', status: 'public', owner: 'MK', contrast: null });
+    patents.setStatus('PRIVATE-B', '공개 허용');
+    expect(store.patentClaims(patents, attribution).map(row => row.id)).toEqual(['PRIVATE-B', 'PUBLIC-D']);
+    expect(store.patentClaims(patents, { owner: 'OP', audience: 'personal' })[0]).toMatchObject({ owner: 'OP', audience: 'personal' });
+    expect(() => store.patentClaims(patents, { owner: '', audience: 'team' })).toThrow('owner is required');
+    expect(() => store.patentClaims(patents, { owner: 'MK', audience: '' })).toThrow('audience is required');
+    // 특허 후보는 claims 저장소에 복사되지 않는다 — 원장 형식·기존 동작 보존
+    expect(store.list().map(row => row.id)).toEqual([]);
   } finally { rmSync(stateDir, { recursive: true, force: true }); }
 });

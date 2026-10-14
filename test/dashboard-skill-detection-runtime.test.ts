@@ -4,6 +4,21 @@ import {
   detectDashboardSkillRoute,
   runAbortableDashboardSkillRoute,
 } from '../src/dashboard/skill-detection-runtime.js';
+import { setUserConfigOverlay } from '../src/user-config.js';
+
+async function detectWithClassifyFixture(...args: Parameters<typeof detectDashboardSkillRoute>) {
+  // A real LLM classify route resolves its role before calling the injected stream.
+  // Pin that role explicitly so the test also runs with an empty HOME and no keys.
+  setUserConfigOverlay(config => ({
+    ...config,
+    roleLlm: { ...config.roleLlm, classify: { provider: 'gemini', model: 'dashboard-fixture' } },
+  }));
+  try {
+    return await detectDashboardSkillRoute(...args);
+  } finally {
+    setUserConfigOverlay(null);
+  }
+}
 
 describe('detectDashboardSkillRoute', () => {
   test('returns keyword detection when llm fallback is disabled', async () => {
@@ -40,7 +55,7 @@ describe('detectDashboardSkillRoute', () => {
 
   test('routes through llm fallback when enabled', async () => {
     const events: string[] = [];
-    const result = await detectDashboardSkillRoute('deploy docs', [{
+    const result = await detectWithClassifyFixture('deploy docs', [{
       name: 'deploy-skill',
       description: 'deploy docs',
       triggers: ['deploy'],
@@ -87,7 +102,7 @@ describe('detectDashboardSkillRoute', () => {
   test('forwards the supplied signal through LLM classification', async () => {
     const controller = new AbortController();
     let receivedSignal: AbortSignal | undefined;
-    await detectDashboardSkillRoute('deploy docs', [], {
+    await detectWithClassifyFixture('deploy docs', [], {
       llmFallback: true,
       keywordScoreThreshold: 2,
       llmConfidenceThreshold: 0.5,

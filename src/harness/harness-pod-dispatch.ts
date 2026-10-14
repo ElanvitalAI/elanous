@@ -43,6 +43,8 @@ export interface HarnessPodDispatchInput {
   readonly json?: boolean;
   /** 사람이 고른 원천 spec — `commit:` · `pr:` · `worktree:` · `files:`. 검증은 발사 전. */
   readonly source?: string;
+  /** Existing PR head for a commit-only repair. Requires source pr:N. */
+  readonly repairCommitOnly?: string;
   /** `--child-llm-provider/--child-llm-model/--child-llm-effort` — carried to `self orchestrate` so the Pod child uses them (10-05 PODPROVIDER). */
   readonly childLlmProvider?: string;
   readonly childLlmModel?: string;
@@ -59,10 +61,11 @@ export function podOrchestrateArgs(input: HarnessPodDispatchInput, goalFile: str
     '--substrate', 'pod',
     ...(input.podPool ? ['--pod-pool', input.podPool] : []),
     // 하니스 기본(자동 병합)을 따른다 · 끄면 PR 까지 — 어느 쪽이든 Pod 가 사라져도 결과가 남는다.
-    ...(input.autoMerge === false ? ['--open-pr'] : ['--auto-merge']),
-    ...(input.base ? ['--base', input.base] : []),
+    ...(input.repairCommitOnly ? [] : input.autoMerge === false ? ['--open-pr'] : ['--auto-merge']),
+    ...(input.repairCommitOnly && input.source ? ['--base', `pr-${input.source.slice(3)}`] : input.base ? ['--base', input.base] : []),
     ...(input.json ? ['--json'] : []),
     ...(input.source ? ['--pod-source', input.source] : []),
+    ...(input.repairCommitOnly ? ['--repair-commit-only', input.repairCommitOnly] : []),
     ...(input.childLlmProvider?.trim() ? ['--child-llm-provider', input.childLlmProvider.trim()] : []),
     ...(input.childLlmModel?.trim() ? ['--child-llm-model', input.childLlmModel.trim()] : []),
     ...(input.childLlmEffort?.trim() ? ['--child-llm-effort', input.childLlmEffort.trim()] : []),
@@ -84,6 +87,10 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
       debug.log('harness.substrate', 'source-refused', { entrance: input.entrance, source: input.source, reason });
       return 2;
     }
+  }
+  if (input.repairCommitOnly && (!/^pr:[1-9]\d*$/.test(input.source ?? '') || !/^[0-9a-f]{40}$/.test(input.repairCommitOnly) || input.autoMerge === true)) {
+    debug.log('harness.substrate', 'repair-refused', { entrance: input.entrance, reason: 'requires pr source, 40-hex head, and no auto-merge' });
+    return 2;
   }
   const env = { ...process.env, ...oldDoorInternalEnv('self-orchestrate') };
   // POD-OBS(10-06): 자식 orchestrate 는 트리 파생 우주에서 돈다 — Pod 원장 재방출을 «발사한 집»의 logs.db 에도 남기게 경로를 넘긴다.
@@ -146,7 +153,7 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
     memoryLimit: podMemoryLimitFor(goalText, env).limit });
   delete env.ELANOUS_POD_AFTER;
   if (input.after) env.ELANOUS_POD_AFTER = input.after;
-  if (input.authorOnPod) env.ELANOUS_POD_AUTHOR_ON_POD = '1';
+  if (input.authorOnPod && !input.repairCommitOnly) env.ELANOUS_POD_AUTHOR_ON_POD = '1';
   else delete env.ELANOUS_POD_AUTHOR_ON_POD;
   if (input.authorOnPod && input.authorGrade) {
     env.ELANOUS_POD_AUTHOR_GRADE = input.authorGrade;
@@ -157,7 +164,7 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
     delete env.ELANOUS_POD_AUTHOR_GRADE;
     delete env.ELANOUS_POD_AUTHOR_GRADE_SOURCE;
   }
-  if (input.entrance === 'cli-harness-ask') {
+  if (input.entrance === 'cli-harness-ask' && !input.repairCommitOnly) {
     const root = findGitDir(cwd)?.root;
     const path = resolve(cwd, input.input);
     const relativePath = root ? relative(realpathSync(root), realpathSync(path)) : '';

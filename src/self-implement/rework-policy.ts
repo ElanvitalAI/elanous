@@ -628,17 +628,74 @@ function sameProviderStep(child: ExplicitChildForEscalation): EscalateTarget | n
   return null;
 }
 
+/** escalateChild 매핑 해석 근원 — `env` 가 `config` 를 이기고, 둘 다 없으면 같은 provider 사다리(`ladder`). */
+export type EscalateTargetSource = 'config' | 'env' | 'ladder';
+
+/** `self-dev.rework`/`escalate-target` 관측 한 건. 관측 전용 — 판정·분기는 이 값을 읽지 않는다. */
+export interface EscalateTargetObservation {
+  readonly category: 'self-dev.rework';
+  readonly event: 'escalate-target';
+  readonly data: {
+    readonly source: EscalateTargetSource;
+    readonly from: string;
+    readonly to: string;
+    readonly applied: boolean;
+    /** `applied=false` 의 이유 — provider 경계 또는 불완전한 모델 ID. */
+    readonly reason?: 'cross-provider' | 'invalid-target';
+  };
+}
+
+/** 명시 자식 승급 해석 옵션. `escalateChild`(`tools.selfImplement.escalateChild` from→to 맵)는 호출부가
+ *  config 에서 읽어 전달한다 — ⚠️ Pod 안엔 운영 config 가 없다(POD-CONFIG-SNAPSHOT 전) → Pod 자식은
+ *  `ELANOUS_SELFDEV_ESCALATE_CHILD` env 로만 받는다. 관측 싱크도 호출부가 주입한다(정책은 순수 유지). */
+export interface ExplicitChildEscalateOptions {
+  readonly escalateChild?: Readonly<Record<string, string>>;
+  readonly observe?: (observation: EscalateTargetObservation) => void;
+}
+
+/** 모델 id(`openrouter/z-ai/glm-5.3` 등)의 provider 세그먼트 — 첫 `/` 앞. */
+function escalateModelProvider(model: string): string {
+  return (model.split('/')[0] ?? '').trim();
+}
+
+/** 명시 매핑은 provider/model, OpenRouter 는 openrouter/vendor/model 형태의 완전한 ID 여야 한다. */
+function validEscalateModelId(model: string): boolean {
+  const segments = model.split('/');
+  const required = segments[0] === 'openrouter' ? 3 : 2;
+  return segments.length === required && segments.every((segment) => segment.length > 0 && !/\s/.test(segment));
+}
+
+/** `ELANOUS_SELFDEV_ESCALATE_CHILD=<from>=<to>` 해석 — 첫 `=` 기준. 빈 조각·구문 파손은 매핑 없음. */
+function parseEscalateChildEnv(raw: string | undefined): { from: string; to: string } | undefined {
+  const value = raw?.trim();
+  if (!value) return undefined;
+  const separator = value.indexOf('=');
+  if (separator <= 0) return undefined;
+  const from = value.slice(0, separator).trim();
+  const to = value.slice(separator + 1).trim();
+  return from && to ? { from, to } : undefined;
+}
+
 /** 명시 자식의 승급 타깃 — 같은 provider 안에서만(위 규칙). `ELANOUS_SELFDEV_SOL_*` 는 운영자의 명시
  *  덮어쓰기라 그대로 우선한다. ⛔ `effort` 가 빈 문자열이면 «안 보낸다»는 뜻이다(OpenRouter 는 노력을
- *  보내면 덜 생각했다 — 2026-09-23 실측). */
+ *  보내면 덜 생각했다 — 2026-09-23 실측).
+ *  escalateChild 짝지기(env 가 config 를 이긴다)는 사다리(`sameProviderStep`)보다 «먼저» —
+ *  같은 provider 타깃이면 그 타깃으로, provider 가 다르면 무시 ⊕ 관측하고 사다리로 돌아간다.
+ *  둘 다 없으면 종전 그대로(바이트 불변). */
 export function resolveExplicitChildEscalateTarget(
   tier: EscalateTier,
   env: Record<string, string | undefined> = process.env,
   child?: ExplicitChildForEscalation,
+  options?: ExplicitChildEscalateOptions,
 ): EscalateTarget | null {
   if (tier === 'none') return null;
+  const sink = options?.observe;
+  const emit = sink
+    ? (data: EscalateTargetObservation['data']): void => sink({ category: 'self-dev.rework', event: 'escalate-target', data })
+    : undefined;
   const overrideModel = env.ELANOUS_SELFDEV_SOL_MODEL?.trim();
   if (overrideModel) {
+    if (child) emit?.({ source: 'env', from: child.model, to: overrideModel, applied: true });
     return {
       model: overrideModel,
       provider: env.ELANOUS_SELFDEV_SOL_PROVIDER?.trim() || child?.provider || 'openai-codex',
@@ -646,9 +703,30 @@ export function resolveExplicitChildEscalateTarget(
     };
   }
   if (child === undefined) return null;
+  const effortOverride = env.ELANOUS_SELFDEV_SOL_EFFORT?.trim();
+  // env → config 순서로 이 자식 모델에 대한 매핑을 모은다(없는 층은 건너뛴다).
+  const pairings: Array<{ source: 'env' | 'config'; to: string }> = [];
+  const envPairing = parseEscalateChildEnv(env.ELANOUS_SELFDEV_ESCALATE_CHILD);
+  if (envPairing && envPairing.from === child.model) pairings.push({ source: 'env', to: envPairing.to });
+  const configMap = options?.escalateChild;
+  const configTo = configMap && Object.hasOwn(configMap, child.model) ? configMap[child.model]?.trim() : undefined;
+  if (configTo) pairings.push({ source: 'config', to: configTo });
+  for (const pairing of pairings) {
+    if (!validEscalateModelId(pairing.to)) {
+      emit?.({ source: pairing.source, from: child.model, to: pairing.to, applied: false, reason: 'invalid-target' });
+      continue;
+    }
+    if (escalateModelProvider(pairing.to) === child.provider) {
+      emit?.({ source: pairing.source, from: child.model, to: pairing.to, applied: true });
+      return effortOverride
+        ? { model: pairing.to, provider: child.provider, effort: effortOverride }
+        : { model: pairing.to, provider: child.provider, effort: '' };
+    }
+    emit?.({ source: pairing.source, from: child.model, to: pairing.to, applied: false, reason: 'cross-provider' });
+  }
   const step = sameProviderStep(child);
   if (step === null) return null;
-  const effortOverride = env.ELANOUS_SELFDEV_SOL_EFFORT?.trim();
+  emit?.({ source: 'ladder', from: child.model, to: step.model, applied: true });
   return effortOverride ? { ...step, effort: effortOverride } : step;
 }
 

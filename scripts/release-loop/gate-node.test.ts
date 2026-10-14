@@ -95,6 +95,9 @@ test('pod counts only listed failing ids separately while still reporting a new 
   expect(calls.filter((call) => call.startsWith('sweep '))).toHaveLength(1);
   expect(calls.some((call) => call.includes(listed.split(' > ')[0]!) && call.includes('test:deterministic'))).toBe(false);
   expect(JSON.parse(readFileSync(join(instanceRoot, 'release/1.0.1/gate-failures.json'), 'utf8')).failures).toEqual([listed, B]);
+  expect(JSON.parse(readFileSync(join(dirname(instanceRoot), 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8'))).toMatchObject({
+    introduced: [B], knownEnv: [listed], preexisting: [], loadFlaky: [],
+  });
 });
 
 test('pod does not suppress an unlisted regression in the same file as a known failure', async () => {
@@ -200,6 +203,34 @@ test('cut A/B/C versus baseline A/D reruns B and C; only reproduced B is introdu
   expect(existsSync(join(root, 'release/1.0.1/gate-failures.json'))).toBe(false);
   expect(calls.filter((c) => c.startsWith('remove '))).toHaveLength(1);
   expect(calls.filter((c) => c.startsWith('removeSnapshot '))).toHaveLength(1);
+});
+
+test('judged identities persist in the machine ledger and a re-gate replaces the prior commit verdict', async () => {
+  const { root, instanceRoot, runner } = fake([A, B], [A]);
+  const path = join(root, 'machine-ledger/release/1.0.1/gate-verdict.json');
+  const events: unknown[] = [];
+  const observation = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'release-loop.gate' && event === 'judged') events.push(data);
+  });
+  try {
+    expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'regression', introduced: [B], preexisting: 1 });
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({
+      version: '1.0.1', commit: CUT, outcome: 'regression', introduced: [B], knownEnv: [], preexisting: [A], loadFlaky: [],
+    });
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(events).toContainEqual(expect.objectContaining({
+      introduced: 1, preexisting: 1, knownEnv: 0, loadFlaky: 0,
+      introducedIds: [B], knownEnvIds: [], preexistingIds: [A], loadFlakyIds: [],
+    }));
+
+    runner.sweep = async () => ({ rc: 1, output: runOutput([A]) });
+    const nextCommit = 'c'.repeat(40);
+    expect(await judgeGate({ ...options(instanceRoot), commit: nextCommit }, runner)).toMatchObject({ outcome: 'ok', introduced: [], preexisting: 1 });
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({
+      version: '1.0.1', commit: nextCommit, outcome: 'ok', introduced: [], knownEnv: [], preexisting: [A], loadFlaky: [],
+    });
+    expect(events.at(-1)).toEqual(expect.objectContaining({ commit: nextCommit, introduced: 0, preexisting: 1, introducedIds: [], preexistingIds: [A] }));
+  } finally { observation.mockRestore(); }
 });
 
 test('machine ledger baseline is reused across empty worktree universes; stale commit is swept', async () => {
@@ -2751,6 +2782,10 @@ test('GATE-INTRO-RECHECK: a timed-out new failure that passes the 60 s re-run is
     expect(graphGateResult(result, true)).toMatchObject({ verdict: 'pass' });
     expect(graphGateResult(result, true).summary).toContain('부하 흔들림 1');
     expect(events).toContainEqual({ category: 'release-loop.gate', event: 'timeout-recheck', data: { file: 'src/b.test.ts', shaped: 1, flaky: 1, recheck: 'read', remote: 'local', limitMs: GATE_TIMEOUT_RECHECK_MS } });
+    expect(JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8'))).toMatchObject({
+      introduced: [], knownEnv: [], preexisting: [], loadFlaky: [B],
+    });
+    expect(events).toContainEqual(expect.objectContaining({ category: 'release-loop.gate', event: 'judged', data: expect.objectContaining({ introduced: 0, loadFlaky: 1, loadFlakyIds: [B] }) }));
     const rows = readFileSync(loadFlakyCensusPath(join(root, 'machine-ledger')), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     expect(rows).toEqual([expect.objectContaining({ version: '1.0.1', commit: CUT, id: B, host: 'local', limitMs: GATE_TIMEOUT_RECHECK_MS })]);
     expect(statSync(loadFlakyCensusPath(join(root, 'machine-ledger'))).mode & 0o777).toBe(0o600);

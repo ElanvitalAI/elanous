@@ -5,9 +5,11 @@ import {
   EXIT_INVALID_INPUT,
   EXIT_NO_INTERFERENCE,
   EXIT_UNMEASURABLE,
+  failedNamesFromStreams,
   formatIsolatedFailureSummary,
   main,
   MAX_ISOLATED_FAILURE_FILES,
+  parseFailedTestNames,
   runBunTest,
   type BunSpawn,
   type RunnerResult,
@@ -30,6 +32,24 @@ function fakeRunner(outputs: Record<string, RunnerResult>): { runner: TestRunner
 }
 
 describe('detect test interference', () => {
+  test('keeps only file and test names printed for failures', async () => {
+    const output = 'src/a.test.ts:\n(pass) okay\n(fail) wrong answer [0.09ms]\nsrc/b.test.ts:\n(fail) other case [1.2ms]\n';
+    expect(parseFailedTestNames(output)).toEqual({ files: ['src/a.test.ts', 'src/b.test.ts'], tests: ['wrong answer', 'other case'] });
+    expect(parseFailedTestNames('(fail) name without heading [1ms]')).toEqual({ files: [], tests: ['name without heading'] });
+    expect(parseFailedTestNames('1 fail\nRan 1 test across 1 file.')).toEqual({ files: [], tests: [] });
+    expect(parseFailedTestNames('src/a.spec.ts:\n(fail) spec case [1ms]')).toEqual({ files: ['src/a.spec.ts'], tests: ['spec case'] });
+    expect(parseFailedTestNames('src/a.test.ts:\n1 fail\nRan 1 test across 1 file.\n(fail) detached case [1ms]'))
+      .toEqual({ files: [], tests: ['detached case'] });
+    expect(parseFailedTestNames('src/a.test.ts:\nother.ts:\n(fail) detached case [1ms]'))
+      .toEqual({ files: [], tests: ['detached case'] });
+    expect(parseFailedTestNames('src/a.test.ts:\nother.txt:\n(fail) detached case [1ms]'))
+      .toEqual({ files: [], tests: ['detached case'] });
+    expect(parseFailedTestNames('src/a.test.ts:\n(fail) case with colon:'))
+      .toEqual({ files: ['src/a.test.ts'], tests: ['case with colon:'] });
+    expect(failedNamesFromStreams({ stdout: 'src/a.test.ts:\n1 fail\nRan 1 test across 1 file.\n', stderr: '(fail) stderr case [1ms]', exitCode: 1 }))
+      .toEqual({ files: [], tests: ['stderr case'] });
+  });
+
   test('reports interference and numeric difference when the combined run adds failures', async () => {
     const { runner } = fakeRunner({ A: result(3, 0), B: result(4, 0), 'A B': result(2, 5, 2) });
     const lines: string[] = [];

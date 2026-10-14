@@ -2396,18 +2396,20 @@ harnessCmd
   .description('하니스 disposable worktree + 브랜치 정리(기본 접두는 만드는 쪽 상수에서 온다). ⚠️ 열린 PR 은 항상 보존. 기본 dry-run(계획만·--yes 로 실제 제거).')
   .option('--abandoned', 'PR 이력 없는 것(escalated/방치) 제거 [기본]')
   .option('--merged', 'PR 머지된 것 제거')
+  .option('--include-unowned-merged-clean', '미소유 merged-clean worktree 회수 허용(merged 모드 전용)')
   .option('--all', '열린 PR 외 전부 제거')
   .option('--force', '열린 PR 브랜치도 제거(위험)')
   .option('--yes', '실제 제거(생략 시 dry-run)')
   .option('--prefix <p>', `브랜치 prefix(기본 ${WORKTREE_BRANCH_PREFIX_HELP})`)
   .option('--repo <repo>', 'gh repo(기본 origin 추론)')
   .option('--json', '구조화 출력')
-  .action(async (opts: { abandoned?: boolean; merged?: boolean; all?: boolean; force?: boolean; yes?: boolean; prefix?: string; repo?: string; json?: boolean }) => {
+  .action(async (opts: { abandoned?: boolean; merged?: boolean; all?: boolean; force?: boolean; includeUnownedMergedClean?: boolean; yes?: boolean; prefix?: string; repo?: string; json?: boolean }) => {
     const { execHarnessClean } = await import('./harness/harness-clean.js');
     const mode = opts.all ? 'all' : opts.merged ? 'merged' : 'abandoned';
     const res = execHarnessClean({
       mode, dryRun: !opts.yes,
       ...(opts.force ? { force: true } : {}),
+      ...(opts.includeUnownedMergedClean ? { includeUnownedMergedClean: true } : {}),
       ...(opts.prefix ? { branchPrefix: opts.prefix } : {}),
       ...(opts.repo ? { repo: opts.repo } : {}),
     });
@@ -3354,6 +3356,19 @@ coordCmd.command('events')
   });
 
 const selfCmd = program.command('self').description('Self-awareness memory — 외부 도구(Claude Code/Codex)가 구현/변경 이력을 elanous 기억에 주입·회상');
+selfCmd.command('repair-commit-export <pr> <base-head> <child-output> <repo> <outbox>')
+  .description('Pod commit-only repair artifact exporter (installed CLI)')
+  .action(async (pr: string, baseHead: string, outputPath: string, repo: string, outbox: string) => {
+    const { readFileSync } = await import('node:fs');
+    const { writePodRepairCommit } = await import('./task-orchestrator/surfaces/pod-repair-commit.js');
+    try {
+      const result = writePodRepairCommit({ pr: Number(pr), baseHead, runId: process.env.ELANOUS_PARENT_RUN_ID ?? '', output: readFileSync(outputPath, 'utf8'), repo, outbox });
+      console.log(`ELANOUS_POD_REPAIR_COMMIT ${result.pr} ${result.baseHead} ${result.commit}`);
+    } catch (error) {
+      console.error(`ELANOUS_POD_REPAIR_FAILED ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+  });
 { const { registerSelfUtterancesCommand } = await import('./cli/self-utterances-cli.js'); registerSelfUtterancesCommand(selfCmd); }
 
 // M12 Claude Code 의존도 계기판 — `elanous self dependence [--since] [--until] [--json]`(읽기만).
@@ -4380,6 +4395,7 @@ selfCmd
   .option('--base <branch>', 'PR base 브랜치(생략 시 provider 기본)')
   .option('--no-draft', 'non-draft PR (기본 draft)')
   .option('--open-pr', 'gate 통과 후 push + draft PR open (기본: PR 안 열고 worktree 보존·fail-closed). 이 플래그가 HITL 명시 승인.')
+  .addOption(new Option('--no-open-pr', '수리 실행: PR 개설 없이 worktree-only로 종료').default(undefined))
   .option('--auto-merge', '★ 내부 리뷰가 clean(실제 리뷰 완료·verdict≠fail)이면 자동 병합(squash). must-fix 있으면 무시(hold·rework). outward-facing(main 병합)이라 명시 opt-in. 미지정=리뷰 후 HITL/draft.')
   .option('--merge-by-host', 'Pod 자식: 병합 직전 merge-ready 로 끝내 호스트가 재게이트한 뒤 병합')
   .option('--child-llm-provider <id>', '구현 자식 LLM provider(--child-llm-model 과 함께 · Pod 의 grok 폴백이 쓴다)')
@@ -4564,6 +4580,13 @@ const selfOrchestrateCmd = selfCmd
       debug.log('harness.entrance', 'old-door-refused', { door: refused.door, caller: refused.caller });
       ui.error(refused.message);
       process.exit(refused.exitCode);
+    }
+    const repairRequested = (opts as { repairCommitOnly?: string }).repairCommitOnly;
+    if (repairRequested !== undefined && ((opts as { substrate?: string }).substrate !== 'pod'
+      || !/^pr:[1-9]\d*$/.test((opts as { podSource?: string }).podSource ?? '')
+      || !/^[0-9a-f]{40}$/.test(repairRequested) || opts.openPr || opts.autoMerge)) {
+      ui.error('--repair-commit-only: --substrate pod, --pod-source pr:N, 40-hex expected head, PR/자동 병합 없음이 필요합니다');
+      process.exit(2);
     }
     // 위치 인자는 종전처럼 분리하고 파일 입력은 파일당 한 골이다.
     let inputGoals: ReturnType<typeof readSelfOrchestrateGoals>;
@@ -5014,6 +5037,10 @@ const selfOrchestrateCmd = selfCmd
         }
         const passEnv = podProvider === 'grok' ? requestedPassEnv.filter((key) => !grokKeyNames.includes(key)) : podProvider === 'openrouter' ? [...new Set([...requestedPassEnv, 'OPENROUTER_API_KEY'])] : podProvider === 'anthropic' ? [...new Set([...requestedPassEnv, 'ANTHROPIC_API_KEY'])] : requestedPassEnv;
         const podSourceSpec = (opts as { podSource?: string }).podSource;
+        const repairBaseHead = (opts as { repairCommitOnly?: string }).repairCommitOnly;
+        if (repairBaseHead && (!/^pr:[1-9]\d*$/.test(podSourceSpec ?? '') || !/^[0-9a-f]{40}$/.test(repairBaseHead) || opts.autoMerge || opts.openPr || goalTexts.length !== 1)) {
+          ui.error('--repair-commit-only: --pod-source pr:N, 40-hex expected head, 골 1개, PR/자동 병합 없음이 필요합니다'); process.exit(2);
+        }
         let podSource: import('./task-orchestrator/surfaces/pod-source-receive.js').PodSource | undefined;
         if (podSourceSpec) {
           const { parsePodSourceSpec, resolvePodSource } = await import('./task-orchestrator/surfaces/pod-source-spec.js');
@@ -5036,7 +5063,7 @@ const selfOrchestrateCmd = selfCmd
         if (childFlags.childLlmProvider?.trim()) debug.log('self-implement.pod', 'child-provider-named', { provider: childFlags.childLlmProvider.trim(), model: childFlags.childLlmModel ?? null, podProvider });
         // BEDROCK-POD-PROVIDER-DROP — provider·account 는 한 곳(podLaunchProviderOptions)에서 — 손 나열이 bedrock 을 떨궈 codex(team)로 돌았다(10-11).
         const podProviderOptions = (await import('./task-orchestrator/surfaces/pod-child-providers.js')).podLaunchProviderOptions(podProvider, { explicitPodAccount, grokApiKeyOptIn });
-        const podBase = { hostSupervised: opts.supervise === true, ...podChildLlm, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), ...podProviderOptions, ...(accountBroker ? { accountBroker, rotationAccounts } : {}), passEnv, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}) };
+        const podBase = { hostSupervised: opts.supervise === true, ...podChildLlm, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), ...podProviderOptions, ...(accountBroker ? { accountBroker, rotationAccounts } : {}), passEnv, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}), ...(repairBaseHead && podSource?.kind === 'pr' ? { repairCommitOnly: { pr: podSource.number, baseHead: repairBaseHead } } : {}) };
         if (benchArms) {
           const { benchPodSpawn } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
           podSpawn = benchPodSpawn(benchArms, podBase);
@@ -5146,7 +5173,8 @@ selfOrchestrateCmd
   .addOption(new Option('--no-supervise', '⛔ 런 슈퍼바이저를 «끈다»(대표 2026-08-22 ***기본 ON***) — 켜져 있으면 런이 끝나면 실패를 «트리아지»해서 다시 걸 것이 있으면 «스스로» 재개한다(골루프처럼 끝까지). 정지 사유는 converged|needs-human|max-rounds|no-progress 로 각각 «다른 값»으로 말한다. 관측=elanous logs --category self-dev.supervisor').hideHelp())
   .addOption(new Option('--supervise-rounds <n>', '슈퍼바이저 재개 라운드 상한 (기본 3 · 끄려면 --no-supervise)').hideHelp())
   .addOption(new Option('--json', '구조화 출력 [{taskId, feature, status, stage?, prUrl?, merged?, error?}]').hideHelp())
-  .addOption(new Option('--pod-source <spec>', 'pod: 원천 — commit:<40자 sha> | pr:<정수> | worktree:<경로> | files:<경로>[,<경로>…] · 없으면 기본 clone').hideHelp());
+  .addOption(new Option('--pod-source <spec>', 'pod: 원천 — commit:<40자 sha> | pr:<정수> | worktree:<경로> | files:<경로>[,<경로>…] · 없으면 기본 clone').hideHelp())
+  .addOption(new Option('--repair-commit-only <expected-head>', 'pod: 기존 PR head에서 재작업하고 PR 생성 없이 커밋 bundle을 돌려준다').hideHelp());
 
 function formatRelativeAge(updatedAt: number, now = Date.now()): string {
   const seconds = Math.floor(Math.max(0, now - updatedAt) / 1000);
@@ -5649,7 +5677,8 @@ selfCmd
   .option('--context <path>', '리뷰어가 함께 판단할 레포 상대 파일 경로(반복 가능)', (value: string, previous: string[] = []) => [...previous, value])
   .option('--context-text <text>', '리뷰어가 함께 판단할 텍스트(반복 가능)', (value: string, previous: string[] = []) => [...previous, value])
   .option('--json', '구조화 출력 {pr, verdict, mustFix, shouldFix, reviewed}')
-  .action(async (prParts: string[], opts: { intent?: string; model?: string; acp?: boolean; acpModel?: string; acpBackend?: string; acpTimeout?: string; context?: string[]; contextText?: string[]; json?: boolean }) => {
+  .option('--save <name>', '리뷰 결과를 상태 디렉터리의 review-results/<name>-<PR>-<head12>.json에 저장')
+  .action(async (prParts: string[], opts: { intent?: string; model?: string; acp?: boolean; acpModel?: string; acpBackend?: string; acpTimeout?: string; context?: string[]; contextText?: string[]; json?: boolean; save?: string }) => {
     const prArgs = prParts.flatMap((p) => String(p).split(/[,\s]+/).filter(Boolean)); // 번호/#번호/URL·콤마목록.
     if (!prArgs.length) { ui.error('PR 필요: elanous self review <번호|URL> [..]'); process.exit(2); }
     // ⭐ 본문은 seam(`runSelfReviewCliCommand`)에 있다 — 이 액션은 **의존 배선만** 한다.
@@ -7723,7 +7752,7 @@ configCmd
   .action(async (path: string | undefined, opts: { reveal?: boolean }) => {
     const { resolveCurrentInstance } = await import('./instance/current.js');
     const instance = resolveCurrentInstance();
-    if (instance.kind === 'test' && instance.layer === 'tree-derived') {
+    if (instance.kind === 'test' && String(instance.layer) === 'tree-derived') {
       console.error('⚠️ test 우주의 config를 읽습니다 — 운영 값은 --config-dir ~/.elanous');
     }
     const cfg = getUserConfig() as unknown as Record<string, unknown>;

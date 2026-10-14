@@ -1,5 +1,7 @@
-import { test, expect, describe } from 'bun:test';
+import { test, expect, describe, beforeAll, afterAll, mock } from 'bun:test';
 import { buildEssentialMessage, synthesizeEssentialBrief, type EssentialSynthOpts } from './morning-essential.js';
+import * as morningEssentialNs from './morning-essential.js';
+import * as morningSynthesisNs from './morning-synthesis.js';
 import type { MorningSources } from './morning-synthesis.js';
 
 function fakeSources(over: Partial<MorningSources> = {}): MorningSources {
@@ -20,6 +22,29 @@ function fakeSources(over: Partial<MorningSources> = {}): MorningSources {
     ...over,
   };
 }
+
+// ── composeMorningReport 경유 model 전달 관측(SWAP-BENCH-CRON 둘째 조각) ─────────
+// 사슬 관측: composeMorningReport(narrate) → synthesizeEssentialBrief(md,{model})
+// → providerFor(cfg, model). collectMorningSources 만 가짜 소스로 갈라끊고,
+// synthesizeEssentialBrief 는 실물 위에 관측 providerFor 를 얹은 랩으로 대체한다.
+// R-TST23: afterAll 의 mock.module 원본 반환으로 레지스트리를 복구한다.
+type ComposeProviderFor = NonNullable<EssentialSynthOpts['providerFor']>;
+const realMorningEssential = { ...morningEssentialNs };
+const realMorningSynthesis = { ...morningSynthesisNs };
+const providerForCalls: unknown[][] = [];
+const narrFakeText = '[관전] composeMorningReport 가 명시 model 을 전달했다.';
+const narrProvider = {
+  name: 'fake',
+  async *streamChat() { yield { type: 'text' as const, delta: narrFakeText }; },
+} as unknown as ReturnType<ComposeProviderFor>;
+const recordingSynth = (detailMarkdown: string, opts: EssentialSynthOpts = {}) =>
+  realMorningEssential.synthesizeEssentialBrief(detailMarkdown, {
+    ...opts,
+    available: () => true,
+    providerFor: (...args) => { providerForCalls.push(args); return narrProvider; },
+  });
+afterAll(() => { mock.module('./morning-synthesis.js', () => realMorningSynthesis); });
+afterAll(() => { mock.module('./morning-essential.js', () => realMorningEssential); });
 
 describe('morning-essential — buildEssentialMessage', () => {
   test('국면·미국장·버즈·밤샘 + 링크', () => {
@@ -151,5 +176,47 @@ describe('synthesizeEssentialBrief model seam (SWAP-BENCH-CRON 첫 조각)', () 
     });
     expect(out).toBe('');
     expect(called).toBe(0);
+  });
+});
+
+describe('composeMorningReport model seam (SWAP-BENCH-CRON 둘째 조각)', () => {
+  let composeMorningReport: typeof import('./morning-report.js')['composeMorningReport'];
+
+  beforeAll(async () => {
+    mock.module('./morning-synthesis.js', () => ({
+      ...realMorningSynthesis,
+      collectMorningSources: async () => fakeSources(),
+    }));
+    mock.module('./morning-essential.js', () => ({
+      ...realMorningEssential,
+      synthesizeEssentialBrief: recordingSynth,
+    }));
+    ({ composeMorningReport } = await import('./morning-report.js'));
+  });
+
+  test('ⓓ narrate·model 지정 시 composeMorningReport 가 명시 model 을 providerFor 둘째 인자로 전달 + 기존 조립 회귀', async () => {
+    providerForCalls.length = 0;
+    const msg = await composeMorningReport(new Date('2026-07-10T00:00:00Z'), {
+      narrate: true, upload: false, model: 'z-ai/glm-5.3-flash',
+    });
+    expect(providerForCalls).toHaveLength(1);
+    expect(providerForCalls[0]![1]).toBe('z-ai/glm-5.3-flash');
+    // 조립 회귀: 결정론 에센셜 + 서사(하단) 순서 그대로.
+    expect(msg).toContain('🌅 *Conatus 아침 브리핑* — 7월 10일 (금)');
+    expect(msg).toContain('💬 *커뮤니티 버즈*');
+    expect(msg).toContain('하이닉스 급부상 x120');
+    expect(msg).toContain('🧭 *서사*');
+    expect(msg).toContain(narrFakeText);
+    expect(msg.indexOf('🧭 *서사*')).toBeGreaterThan(msg.indexOf('💬 *커뮤니티 버즈*'));
+    expect(msg).toContain('verify+HITL');
+  });
+
+  test('ⓔ model 미지정 시 providerFor 둘째 인자는 undefined(기존 기본 경로 보존)', async () => {
+    providerForCalls.length = 0;
+    const msg = await composeMorningReport(new Date('2026-07-10T00:00:00Z'), { narrate: true, upload: false });
+    expect(providerForCalls).toHaveLength(1);
+    expect(providerForCalls[0]![1]).toBeUndefined();
+    expect(msg).toContain('🧭 *서사*');
+    expect(msg).toContain(narrFakeText);
   });
 });

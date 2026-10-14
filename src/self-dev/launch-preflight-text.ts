@@ -17,7 +17,7 @@ export interface LiveRunOverlapPath {
 
 /** 검사 대상 한 건이 막힌 이유. `name` 은 사람이 바로 열어 볼 수 있는 식별자다. */
 export interface LaunchPreflightBlocker {
-  readonly kind: 'open-pr' | 'sibling-pr' | 'live-run' | 'no-target-paths' | 'recent-change' | 'ask-outside-path' | 'ask-marker';
+  readonly kind: 'open-pr' | 'sibling-pr' | 'live-run' | 'no-target-paths' | 'missing-traced-path' | 'goal-unreadable' | 'recent-change' | 'ask-outside-path' | 'ask-marker';
   /** `#8100` · `run-6ce5765b…` 처럼 «바로 조회 가능한» 이름. */
   readonly name: string;
   /** 왜 막혔는지 한 줄 — 경로와 수를 포함한다. */
@@ -490,6 +490,10 @@ export function renderLaunchPreflight(
   }
   lines.push(`[preflight] ⛔ 막는 것 ${result.blockers.length}건${forced ? '' : ' — 발사하지 않는다'}`);
   for (const blocker of result.blockers) lines.push(`[preflight]   · ${blocker.name} — ${blocker.detail}`);
+  if (result.blockers.some((blocker) => blocker.kind === 'missing-traced-path' || blocker.kind === 'goal-unreadable')) {
+    lines.push('[preflight] 골 판독 실패 또는 traced path 오류는 --force-preflight 로 우회할 수 없다 — 골 문서와 경로를 바로잡아야 한다');
+    return lines.join('\n');
+  }
   lines.push(forced
     ? '[preflight] ⚠️ --force-preflight — 위 막힘을 «뚫고» 발사한다 (이 우회는 관측에 남는다)'
     : '[preflight] 그래도 가려면 --force-preflight (그 우회는 관측에 남는다) — elanous dev');

@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { debug } from '../../debug/log.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
+import { PR_LABEL_NAMES } from '../../github/pr-labels.js';
+import { listRunLedgers } from '../../self-implement/run-ledger.js';
+import { queryRunningRuns } from '../../self-implement/running-runs.js';
 import {
   defaultGitMergeSeam, defaultLlmResolve, mergeMainWithLlmResolve,
   type LlmMergeOutcome, type MergeGitSeam,
@@ -16,6 +19,8 @@ interface ResyncShadowEntry {
   at: string;
   pr: number;
   head: string;
+  beforeHead?: string;
+  afterHead?: string;
   mode: ResyncShadowMode;
   pushed: boolean;
   labelRemoved: boolean;
@@ -27,7 +32,7 @@ interface ResyncShadowEntry {
 }
 export interface ResyncShadowSummary { candidates: number; tried: number; saved: number; savedRatio: number | null }
 
-type OpenPr = { number: number; headRefName: string; mergeable: string; isDraft: boolean; labels: { name: string }[] };
+type OpenPr = { number: number; headRefName: string; headRefOid?: string; mergeable: string; isDraft: boolean; labels: { name: string }[] };
 export interface ResyncShadowDeps {
   repoRoot?: string;
   instanceRoot?: string;
@@ -37,6 +42,63 @@ export interface ResyncShadowDeps {
   gitSeam?: MergeGitSeam;
   runTests?: (cwd: string, files: string[]) => { ok: boolean; failedTests?: string[]; noTests?: boolean };
   now?: () => Date;
+  /** Run ownership is checked before touching a branch; null means the observation failed. */
+  activePrNumbers?: (candidatePrs: readonly number[]) => ReadonlySet<number> | null;
+}
+
+function activePrNumbers(candidatePrs: readonly OpenPr[], repoRoot: string, instanceRoot: string): ReadonlySet<number> | null {
+  const owners = new Map<number, { runId: string; branch: string; headCommit: string; terminal: boolean }[]>();
+  const branchRuns = new Map<string, Set<string>>();
+  const incompleteOwnerPrs = new Set<number>();
+  const candidateSet = new Set(candidatePrs.map(pr => pr.number));
+  try {
+    for (const match of listRunLedgers().matches) {
+      const latestStatus = match.entries.filter(entry => entry.event === 'run-status').at(-1)?.data.runStatus;
+      const terminal = latestStatus === 'completed' || latestStatus === 'failed' || latestStatus === 'cancelled';
+      for (const entry of match.entries) {
+        // A competing run can own the branch even when its PR number or worktree event is missing.
+        if ((entry.event === 'worktree' || entry.event === 'pr-opened') && typeof entry.data.branch === 'string') {
+          const ids = branchRuns.get(entry.data.branch) ?? new Set<string>();
+          ids.add(match.runId);
+          branchRuns.set(entry.data.branch, ids);
+        }
+        const number = entry.event === 'pr-opened' ? entry.data.number : undefined;
+        if (typeof number !== 'number' || !candidateSet.has(number)) continue;
+        const matches = owners.get(number) ?? [];
+        if (typeof entry.data.branch !== 'string' || typeof entry.data.headCommit !== 'string')
+          incompleteOwnerPrs.add(number);
+        else matches.push({ runId: match.runId, branch: entry.data.branch, headCommit: entry.data.headCommit, terminal });
+        owners.set(number, matches);
+      }
+    }
+    const runIds = [...new Set([...owners.values()].flatMap(rows => rows.map(row => row.runId)))];
+    if (runIds.length === 0) return new Set(candidatePrs.map(pr => pr.number));
+    const observed = queryRunningRuns({ runIds, caller: 'smart-merge.resync' });
+    if (observed.completeness !== 'complete') return null;
+    const active = new Set(observed.entries.filter(row => row.status === 'running' || row.status === 'probable-running'
+      || row.status === 'unknown' || row.status === 'ended-unclosed').map(row => row.runId));
+    const priorPath = join(instanceRoot, 'orchestrator', 'resync-shadow.jsonl');
+    const prior = existsSync(priorPath) ? readFileSync(priorPath, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line) as ResyncShadowEntry) : [];
+    const excluded = new Set<number>();
+    for (const pr of candidatePrs) {
+      const matches = owners.get(pr.number) ?? [];
+      if (incompleteOwnerPrs.has(pr.number) || matches.length !== 1 || !/^[a-f0-9]{40}$/i.test(pr.headRefOid ?? '')) { excluded.add(pr.number); continue; }
+      const owner = matches[0]!;
+      if (owner.branch !== pr.headRefName || !owner.terminal || !/^[a-f0-9]{40}$/i.test(owner.headCommit)
+        || active.has(owner.runId) || [...(branchRuns.get(pr.headRefName) ?? [])].some(id => id !== owner.runId)) {
+        excluded.add(pr.number); continue;
+      }
+      const remote = command('git', ['ls-remote', 'origin', `refs/heads/${pr.headRefName}`], repoRoot).trim().split(/\s/)[0];
+      if (remote !== pr.headRefOid) { excluded.add(pr.number); continue; }
+      let proven = owner.headCommit;
+      for (const row of prior.filter(row => row.pr === pr.number && row.head === pr.headRefName && row.pushed)) {
+        if (row.beforeHead !== proven || !/^[a-f0-9]{40}$/i.test(row.afterHead ?? '')) { proven = ''; break; }
+        proven = row.afterHead!;
+      }
+      if (proven !== remote) excluded.add(pr.number);
+    }
+    return excluded;
+  } catch { return null; }
 }
 
 function command(file: string, args: string[], cwd: string, timeout = 60_000): string {
@@ -49,6 +111,15 @@ function changedTests(gh: (args: string[]) => string, number: number): string[] 
     || observed.files.some(file => !file || typeof file.path !== 'string')) throw new Error('invalid PR files observation');
   return [...new Set((observed.files as { path: string }[]).map(file => file.path).filter(path =>
     path.endsWith('.test.ts') && !isAbsolute(path) && path !== '' && !path.split('/').some(part => part === '..' || part === '.' || part === '')))];
+}
+
+function listOpenPrs(gh: (args: string[]) => string): OpenPr[] {
+  const observed: unknown = JSON.parse(gh(['pr', 'list', '--state', 'open', '--json', 'number,headRefName,headRefOid,mergeable,isDraft,labels', '--limit', '1000']));
+  if (!Array.isArray(observed) || observed.length >= 1000 || observed.some(pr => !pr || !Number.isSafeInteger(pr.number)
+    || typeof pr.headRefName !== 'string' || typeof pr.mergeable !== 'string' || typeof pr.isDraft !== 'boolean'
+    || !Array.isArray(pr.labels) || pr.labels.some((label: unknown) => !label || typeof label !== 'object' || typeof (label as { name?: unknown }).name !== 'string')))
+    throw new Error('incomplete or invalid PR observation');
+  return observed as OpenPr[];
 }
 
 // A PR test must not inherit credentials, reach the network or write outside its own worktree.
@@ -145,16 +216,16 @@ export async function runResyncShadow(max = 3, deps: ResyncShadowDeps = {}, mode
   if (mode !== 'shadow' && mode !== 'live') throw new Error('mode must be shadow or live');
   const repoRoot = deps.repoRoot ?? resolve(import.meta.dir, '../../..');
   const gh = deps.runGh ?? ((args: string[]) => command('gh', args, repoRoot));
-  const observed: unknown = JSON.parse(gh(['pr', 'list', '--state', 'open', '--json', 'number,headRefName,mergeable,isDraft,labels', '--limit', '1000']));
-  if (!Array.isArray(observed) || observed.length >= 1000 || observed.some(pr => !pr || !Number.isSafeInteger(pr.number)
-    || typeof pr.headRefName !== 'string' || typeof pr.mergeable !== 'string' || typeof pr.isDraft !== 'boolean'
-    || !Array.isArray(pr.labels) || pr.labels.some((label: unknown) => !label || typeof label !== 'object' || typeof (label as { name?: unknown }).name !== 'string')))
-    throw new Error('incomplete or invalid PR observation');
-  const candidates = (observed as OpenPr[]).filter(pr => pr.headRefName.startsWith('self-impl/')
-    && pr.mergeable === 'CONFLICTING'
-    && (mode === 'shadow' || pr.labels.some(label => label.name === 'elanous:needs-rebase'))
-    && !pr.labels.some(label => label.name === 'elanous:stalled' || label.name === 'elanous:superseded'))
-    .sort((a, b) => a.number - b.number).slice(0, max);
+  const eligible = listOpenPrs(gh).filter(pr => pr.headRefName.startsWith('self-impl/')
+    && (mode === 'shadow' ? pr.mergeable === 'CONFLICTING' : pr.mergeable === 'MERGEABLE')
+    && (mode === 'shadow' || pr.labels.some(label => label.name === PR_LABEL_NAMES.needsRebase))
+    && !pr.labels.some(label => label.name === PR_LABEL_NAMES.running)
+    && !pr.labels.some(label => label.name === PR_LABEL_NAMES.stalled || label.name === PR_LABEL_NAMES.superseded));
+  const observeActive = deps.activePrNumbers ?? ((numbers: readonly number[]) => activePrNumbers(
+    eligible.filter(pr => numbers.includes(pr.number)), repoRoot, deps.instanceRoot ?? effectiveInstanceRoot()));
+  const active = mode === 'live' && eligible.length ? observeActive(eligible.map(pr => pr.number)) : new Set<number>();
+  if (active === null) throw new Error('active run observation unavailable — resync stays read-only');
+  const candidates = eligible.filter(pr => !active.has(pr.number)).sort((a, b) => a.number - b.number).slice(0, max);
   const ledger = join(deps.instanceRoot ?? effectiveInstanceRoot(), 'orchestrator', 'resync-shadow.jsonl');
   let saved = 0;
   let tried = 0;
@@ -169,6 +240,9 @@ export async function runResyncShadow(max = 3, deps: ResyncShadowDeps = {}, mode
       // Explicit destination refspecs make origin/<head> and origin/main fresh even without remote.origin.fetch.
       command('git', ['fetch', 'origin', `+refs/heads/${pr.headRefName}:refs/remotes/origin/${pr.headRefName}`,
         '+refs/heads/main:refs/remotes/origin/main'], repoRoot);
+      entry.beforeHead = command('git', ['rev-parse', `origin/${pr.headRefName}`], repoRoot).trim();
+      if (mode === 'live' && !deps.activePrNumbers && entry.beforeHead !== pr.headRefOid)
+        throw new Error('PR head changed after owner proof — resync stays read-only');
       entry.testFiles = changedTests(gh, pr.number);
       tmp = realpathSync(mkdtempSync(join(tmpdir(), 'resync-shadow-')));
       command('git', ['worktree', 'add', '--detach', tmp, `origin/${pr.headRefName}`], repoRoot);
@@ -189,10 +263,24 @@ export async function runResyncShadow(max = 3, deps: ResyncShadowDeps = {}, mode
       } else entry.verdict = outcome.status === 'conflict-unresolved' || outcome.status === 'up-to-date' ? 'unresolved' : 'error';
       if (mode === 'live' && entry.verdict === 'saved') {
         try {
+          const lateActive = observeActive([pr.number]);
+          if (lateActive === null || lateActive.has(pr.number))
+            throw new Error('PR ownership changed before push — resync stays read-only');
+          const current = listOpenPrs(gh).filter(row => row.number === pr.number);
+          if (current.length !== 1 || current[0]!.headRefName !== pr.headRefName
+            || current[0]!.headRefOid !== pr.headRefOid || current[0]!.mergeable !== 'MERGEABLE'
+            || !current[0]!.labels.some(label => label.name === PR_LABEL_NAMES.needsRebase)
+            || current[0]!.labels.some(label => label.name === PR_LABEL_NAMES.running
+              || label.name === PR_LABEL_NAMES.stalled || label.name === PR_LABEL_NAMES.superseded))
+            throw new Error('PR state changed before push — resync stays read-only');
+          const immediateHead = command('git', ['ls-remote', 'origin', `refs/heads/${pr.headRefName}`], repoRoot).trim().split(/\s/)[0];
+          if (immediateHead !== entry.beforeHead)
+            throw new Error('remote head changed before push — resync stays read-only');
           (deps.runGit ?? (args => { command('git', args, tmp!); }))(
             ['push', 'origin', `HEAD:refs/heads/${pr.headRefName}`]);
           entry.pushed = true;
-          gh(['pr', 'edit', String(pr.number), '--remove-label', 'elanous:needs-rebase']);
+          entry.afterHead = command('git', ['rev-parse', 'HEAD'], tmp).trim();
+          gh(['pr', 'edit', String(pr.number), '--remove-label', PR_LABEL_NAMES.needsRebase]);
           entry.labelRemoved = true;
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);

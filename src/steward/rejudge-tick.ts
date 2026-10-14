@@ -19,6 +19,7 @@ import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { spawnElanous } from '../instance/spawn-elanous.js';
 import { getUserConfig } from '../user-config.js';
+import { resyncPendingPath } from './resync-tick.js';
 
 export const REJUDGE_TICK_EVENT = 'rejudge-tick';
 export const REJUDGE_DEFAULT_MAX_LOAD = 60;
@@ -49,6 +50,7 @@ export interface RejudgeTickDeps {
   config?: () => { rejudgeEveryMinutes?: number; rejudgeMaxLoad?: number } | undefined;
   load?: () => number;
   stampPath?: string;
+  pendingPath?: string;
   run?: () => Promise<RejudgeRun>;
   log?: (event: string, data: Record<string, unknown>) => void;
 }
@@ -110,7 +112,9 @@ export async function rejudgeTick(deps: RejudgeTickDeps = {}): Promise<RejudgeTi
     const now = (deps.now ?? (() => new Date()))();
     const stampPath = deps.stampPath ?? defaultStampPath();
     const lastStartedAt = readStamp(stampPath);
-    if (lastStartedAt && now.getTime() - Date.parse(lastStartedAt) < everyMinutes * 60_000 - REJUDGE_JITTER_MS) {
+    const pendingAt = readPending(deps.pendingPath ?? resyncPendingPath());
+    const savedSinceLastRun = pendingAt !== null && (!lastStartedAt || Date.parse(pendingAt) > Date.parse(lastStartedAt));
+    if (!savedSinceLastRun && lastStartedAt && now.getTime() - Date.parse(lastStartedAt) < everyMinutes * 60_000 - REJUDGE_JITTER_MS) {
       return emit({ decision: 'not-due', everyMinutes, lastStartedAt });
     }
     const maxLoad = positive(cfg?.rejudgeMaxLoad) ?? REJUDGE_DEFAULT_MAX_LOAD;
@@ -131,6 +135,13 @@ export async function rejudgeTick(deps: RejudgeTickDeps = {}): Promise<RejudgeTi
   } catch (error) {
     return emit({ decision: 'failed', everyMinutes: null, reason: (error instanceof Error ? error.message : String(error)).slice(-300) });
   }
+}
+
+function readPending(path: string): string | null {
+  try {
+    const value = (JSON.parse(readFileSync(path, 'utf8')) as { savedAt?: unknown }).savedAt;
+    return typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : null;
+  } catch { return null; }
 }
 
 if (import.meta.main) {

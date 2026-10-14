@@ -6,14 +6,16 @@ const HEAD = 'a'.repeat(40);
 const BASE_A = 'b'.repeat(40);
 const BASE_B = 'c'.repeat(40);
 const PR_VIEW = 'gh pr view 42 --json headRefOid,baseRefName,baseRefOid,state,isDraft';
-const BASE_FETCH = 'git fetch origin refs/heads/main';
-const HEAD_FETCH = 'git fetch origin refs/pull/42/head';
+const BASE_REF = 'refs/elanous/regate/<run>/base';
+const HEAD_REF = 'refs/elanous/regate/<run>/head';
+const BASE_FETCH = `git fetch --no-write-fetch-head origin +refs/heads/main:${BASE_REF}`;
+const HEAD_FETCH = `git fetch --no-write-fetch-head origin +refs/pull/42/head:${HEAD_REF}`;
+const normalized = (calls: string[]) => calls.map((call) => call.replace(/refs\/elanous\/regate\/[^/ ]+/g, 'refs/elanous/regate/<run>'));
 const input = { prNumber: 42, headCommit: HEAD, repoRoot: '/repo' };
 
 function fixture(views: string[], fetchedBase: string, fetchedHead = HEAD) {
   const calls: string[] = [];
   const events: string[] = [];
-  let lastFetch = '';
   let viewReads = 0;
   let measured = 0;
   const deps: HostRegateDeps = {
@@ -29,9 +31,10 @@ function fixture(views: string[], fetchedBase: string, fetchedHead = HEAD) {
         const baseRefOid = views[Math.min(viewReads++, views.length - 1)];
         return { status: 0, stdout: JSON.stringify({ headRefOid: HEAD, baseRefName: 'main', baseRefOid, state: 'OPEN', isDraft: false }), stderr: '' };
       }
-      if (call === BASE_FETCH || call === HEAD_FETCH) lastFetch = call;
+      const normalizedCall = normalized([call])[0]!;
       let stdout = '';
-      if (call === 'git rev-parse FETCH_HEAD') stdout = lastFetch === BASE_FETCH ? fetchedBase : fetchedHead;
+      if (normalizedCall === `git rev-parse ${BASE_REF}`) stdout = fetchedBase;
+      if (normalizedCall === `git rev-parse ${HEAD_REF}`) stdout = fetchedHead;
       if (call === 'git rev-parse HEAD') stdout = fetchedBase;
       if (call === 'git rev-parse HEAD^1') stdout = fetchedBase;
       if (call === 'git rev-parse HEAD^2') stdout = HEAD;
@@ -64,7 +67,9 @@ describe('host regate: PR base moves between view and fetch', () => {
       expect(Date.now() - before).toBeGreaterThanOrEqual(950);
       expect(result.failures).toEqual([{ step: 'test-interference', detail: 'stopped after base measurement' }]);
       expect(measured()).toBe(1);
-      expect(calls.slice(0, 8)).toEqual([PR_VIEW, BASE_FETCH, 'git rev-parse FETCH_HEAD', PR_VIEW, BASE_FETCH, 'git rev-parse FETCH_HEAD', HEAD_FETCH, 'git rev-parse FETCH_HEAD']);
+      expect(normalized(calls.slice(0, 8))).toEqual([PR_VIEW, BASE_FETCH, `git rev-parse ${BASE_REF}`, PR_VIEW, BASE_FETCH, `git rev-parse ${BASE_REF}`, HEAD_FETCH, `git rev-parse ${HEAD_REF}`]);
+      expect(normalized(calls)).toContain(`git update-ref -d ${BASE_REF}`);
+      expect(normalized(calls)).toContain(`git update-ref -d ${HEAD_REF}`);
       expect(calls).toContain(`git worktree add --detach /tmp/regate-base-race-fixture ${BASE_B}`);
       expect(calls).toContain(`git merge-base ${BASE_B} ${HEAD}`);
       expect(calls).not.toContain(`git worktree add --detach /tmp/regate-base-race-fixture ${BASE_A}`);
@@ -84,8 +89,10 @@ describe('host regate: PR base moves between view and fetch', () => {
       expect(result.failures.some((failure) => failure.detail.includes('fetched PR base differs'))).toBe(false);
       expect(events).not.toContain('unmeasured');
       expect(calls.filter((call) => call === PR_VIEW)).toHaveLength(3);
-      expect(calls.filter((call) => call === BASE_FETCH)).toHaveLength(3);
-      expect(calls).toContain(HEAD_FETCH);
+      expect(normalized(calls).filter((call) => call === BASE_FETCH)).toHaveLength(3);
+      expect(normalized(calls)).toContain(HEAD_FETCH);
+      expect(normalized(calls)).toContain(`git update-ref -d ${BASE_REF}`);
+      expect(normalized(calls)).toContain(`git update-ref -d ${HEAD_REF}`);
       expect(calls).toContain(`git worktree add --detach /tmp/regate-base-race-fixture ${BASE_B}`);
       expect(measured()).toBe(1);
       expect(retries(log.entries)).toEqual([1, 2, 3].map((attempt) => ({ category: 'harness.host-regate', event: 'base-moved-retry', data: { pr: 42, attempt, checked: BASE_A, fetched: BASE_B } })));
@@ -114,7 +121,7 @@ describe('host regate: PR base moves between view and fetch', () => {
       const result = await runHostRegate(input, deps);
       expect(result).toMatchObject({ passed: false, failures: [{ step: 'worktree', detail: 'Error: fetched PR head differs from checked SHA' }] });
       expect(events).toContain('unmeasured');
-      expect(calls.slice(0, 5)).toEqual([PR_VIEW, BASE_FETCH, 'git rev-parse FETCH_HEAD', HEAD_FETCH, 'git rev-parse FETCH_HEAD']);
+      expect(normalized(calls.slice(0, 5))).toEqual([PR_VIEW, BASE_FETCH, `git rev-parse ${BASE_REF}`, HEAD_FETCH, `git rev-parse ${HEAD_REF}`]);
       expect(calls.filter((call) => call === PR_VIEW)).toHaveLength(1);
       expect(calls.some((call) => call.startsWith('git worktree add'))).toBe(false);
       expect(measured()).toBe(0);
@@ -129,8 +136,10 @@ describe('host regate: PR base moves between view and fetch', () => {
       const result = await runHostRegate({ ...input, verifyOnly: true }, deps);
       expect(result).toMatchObject({ status: 'failed', baseCommit: BASE_B, failures: [{ step: 'test-interference' }] });
       expect(measured()).toBe(1);
-      expect(calls.slice(0, 5)).toEqual([PR_VIEW, BASE_FETCH, 'git rev-parse FETCH_HEAD', HEAD_FETCH, 'git rev-parse FETCH_HEAD']);
+      expect(normalized(calls.slice(0, 5))).toEqual([PR_VIEW, BASE_FETCH, `git rev-parse ${BASE_REF}`, HEAD_FETCH, `git rev-parse ${HEAD_REF}`]);
       expect(calls).toContain(`git worktree add --detach /tmp/regate-base-race-fixture ${BASE_B}`);
+      expect(normalized(calls)).toContain(`git update-ref -d ${BASE_REF}`);
+      expect(normalized(calls)).toContain(`git update-ref -d ${HEAD_REF}`);
       expect(retries(log.entries)).toEqual([]);
     } finally { log.restore(); }
   });

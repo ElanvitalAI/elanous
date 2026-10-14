@@ -1,13 +1,12 @@
 /**
  * ⭐ AUTHOR-NEW-FILE-PATHS — 저작 골 문서가 «새로 만들 파일»로 선언한 경로.
  *
- * 저작(TRACED PATHS 존재 검사)과 실행(orchestrator 범위 검사)이 **같은 줄**을 읽어야
- * 저작 통과·실행 보류가 다시 갈리지 않는다(TC 13:50). 줄 인식은 실행 쪽
- * src/self-implement/orchestrator.ts 의 DECLARED_NEW_FILES_LINE 와 같은 꼴을 쓴다.
+ * 저작(TRACED PATHS 존재 검사)과 실행(orchestrator 범위 검사)이 **같은 함수**로
+ * 신설 경로를 읽어야 저작 통과·실행 보류가 다시 갈리지 않는다(TC 13:50).
  */
 
 // SCOPE-NEW-FILES-LINE — 칸 문면은 새로 만들 파일을 «신설:» 줄로 따로 적는다(OP D칸 규칙).
-//    orchestrator.ts 의 DECLARED_NEW_FILES_LINE 와 같은 정규식이다(한쪽만 읽으면 저작과 실행이 갈린다).
+//    저작과 실행이 이 함수를 공유한다(한쪽만 읽으면 저작과 실행이 갈린다).
 export const DECLARED_NEW_FILES_LINE = /^\s*(?:신설|new\s*files?)\s*[:：]\s*(.*)$/i;
 
 /** 목록 기호 «- »·굵게 «**» 는 장식이다 — 그것만 벗기고 같은 정규식으로 문는다. */
@@ -32,7 +31,7 @@ export function declaredNewFilePaths(document: string): string[] {
     const match = DECLARED_NEW_FILES_LINE.exec(bareDeclarationLine(rawLine));
     if (!match) continue;
     for (const fragment of match[1]!.split(/[·,]/)) {
-      // 실행 쪽 범위 검사(parseDeclaredTargetPathsFromAsk)와 같은 정규화 — 등 코드, ./ 접두.
+      // 저작·실행 공통 정규화 — 등 코드, ./ 접두.
       const piece = fragment.trim().replace(/^`+|`+$/g, '').replace(/\\/g, '/').replace(/^\.\//, '');
       if (!isRepositoryFileCandidate(piece)) continue;
       paths.push(piece);

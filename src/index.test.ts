@@ -2910,6 +2910,13 @@ describe('self orchestrate CLI decomposer selection wiring', () => {
 describe('self orchestrate CLI help tiers', () => {
   const elanous = new URL('../bin/elanous.mjs', import.meta.url).pathname;
   const cwd = new URL('../', import.meta.url).pathname;
+  test('commit-only repair refuses the local execution path before any orchestrator launch', () => {
+    const run = Bun.spawnSync({ cmd: [process.execPath, elanous, '--test', 'self', 'orchestrate', 'fix',
+      '--repair-commit-only', 'a'.repeat(40), '--pod-source', 'pr:42'], cwd,
+      env: { ...process.env, ELANOUS_HARNESS_ENTRANCE: 'self-orchestrate' }, stdout: 'pipe', stderr: 'pipe' });
+    expect(run.exitCode).toBe(2);
+    expect(new TextDecoder().decode(run.stdout) + new TextDecoder().decode(run.stderr)).toContain('--repair-commit-only: --substrate pod');
+  });
   // ⭐⭐ 이 집합이 ***`self orchestrate` 옵션 계약의 canonical***이다.
   //   「옵션이 살아 있나」는 아래 `preserves the existing option set…` 이 «두 티어의 실제 산출»로 판정하고,
   //   `fails if a formerly accepted option is absent…` 가 그 판정이 «무는지»를 반증으로 확인한다.
@@ -2928,11 +2935,12 @@ describe('self orchestrate CLI help tiers', () => {
     '--goal-file',
     // 2026-10-05 PODPROVIDER — the harness child LLM choice reaches the Pod orchestrator (`--help-all` only).
     '--child-llm-provider', '--child-llm-model', '--child-llm-effort',
+    '--repair-commit-only',
   ]);
 
   test('option contract set itself does not silently shrink', () => {
     // ⛔ 위 집합을 줄이면 `toEqual` 이 여전히 통과하므로 계약이 «조용히» 좁아진다. 수를 못 박는다.
-    expect(existingOptionNames.size).toBe(27);
+    expect(existingOptionNames.size).toBe(28);
   });
 
   async function help(...args: string[]): Promise<string> {

@@ -50,6 +50,7 @@ export function liveMoveEffect(input: Pick<LiveMoveHistoryInput, 'executorResult
   const result = input.result;
   if (!result) return LIVE_MOVE_EFFECT_UNKNOWN;
   if (!result.executed) return 'none — not executed';
+  if (result.kind === 'decision-card') return result.ok ? 'decision card raised' : 'raise failed';
   if (result.kind === 'review' && result.ok) return result.resultPath ? LIVE_REVIEW_EFFECT_PENDING : LIVE_REVIEW_EFFECT_REQUESTED;
   if (result.kind === 'land' && result.ok) return 'land reported ok by the executor (merge state not re-checked here) · merge sha not reported';
   if (result.kind === 'propose-green' && result.ok) return `green proposed · checklist ${checklistId ?? '-'} (checklist untouched)`;

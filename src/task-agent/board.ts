@@ -12,7 +12,7 @@ import { releaseLedgerRoot } from '../instance/resolve.js';
 import { listChecklist, type ChecklistStatus } from '../release-loop/checklist.js';
 import { buildRunProgressRows, queryRunningRuns, type RunningRunsResult, type RunProgressRow } from '../self-implement/running-runs.js';
 import {
-  cardPrNumber, CLOSED_BY_HAND_EVENT, HAND_MOVE_HISTORY_EVENT, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, readTaskAgentState,
+  boundPrTerminal, cardPrNumber, CLOSED_BY_HAND_EVENT, HAND_MOVE_HISTORY_EVENT, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, readTaskAgentState,
   type CompletionKind, type TaskCard,
 } from './task-hand.js';
 
@@ -29,6 +29,10 @@ export interface BoardTaskLedger {
   lastEvent: { at: string; event: string; detail: string | null } | null;
   /** 카드가 failed · launch-failed 일 때 마지막 줄의 사유(예: `failed/needs-owner — exit 1 · pod-failure`). 그 밖에는 null. */
   exitReason: string | null;
+  /** Terminal PR observation, only when it still matches this card's binding. */
+  prTerminal?: NonNullable<TaskCard['prTerminal']>;
+  /** Checklist judgement after merge; partial means this slice ended while the cell remains open. */
+  postLand?: NonNullable<TaskCard['postLand']>;
 }
 
 /** `GET /api/task-agent/board` 응답 — progress 는 진전 관측(`queryRunningRuns`)을 싣는다; 관측을 못 얻으면 null(0을 «없다»로 쓰지 않는다). */
@@ -87,11 +91,14 @@ function aggregate(node: BoardNode): void {
 }
 
 function cardStatus(card: TaskCard): BoardStatus {
+  const terminal = boundPrTerminal(card);
+  if (terminal) return terminal.state === 'MERGED' ? 'done' : 'blocked';
   if (card.status === 'launch-failed' || card.status === 'failed') return 'blocked';
   return card.greenProposal ? 'done' : 'open';
 }
 
 function cardLedger(card: TaskCard): BoardTaskLedger {
+  const terminal = boundPrTerminal(card);
   const last = (card.history ?? [])
     .filter((item) => item.event !== LIVE_MOVE_HISTORY_EVENT && item.event !== LIVE_MOVE_RESULT_EVENT && item.event !== HAND_MOVE_HISTORY_EVENT)
     .at(-1);
@@ -105,6 +112,9 @@ function cardLedger(card: TaskCard): BoardTaskLedger {
     lastStatus: card.status,
     lastEvent: last ? { at: last.at, event: last.event, detail: last.detail ?? null } : null,
     exitReason: ended ? reason ?? null : null,
+    ...(terminal ? { prTerminal: terminal } : {}),
+    ...(terminal && terminal.state === 'MERGED' && card.postLand?.pr === terminal.pr && card.postLand.head === terminal.head
+      ? { postLand: card.postLand } : {}),
   };
 }
 

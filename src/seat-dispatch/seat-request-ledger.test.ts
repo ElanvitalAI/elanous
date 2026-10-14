@@ -39,6 +39,28 @@ test('list selects last row per key before seat and status filtering, retaining 
   } finally { f.close(); }
 });
 
+test('appendSeatRequestRows carries why and evidenceRef through latest-row-per-key parsing into listSeatRequests', () => {
+  const f = fixture();
+  try {
+    const path = join(f.root, 'seat-requests', 'requests.jsonl');
+    appendSeatRequestRows(path, [
+      { ...request('a'), why: 'superseded auto admission', evidenceRef: 'obs:T1#attempt-1' },
+      { ...request('a', 'TC', 'pending'), why: 'auto admission while pod warm', evidenceRef: 'obs:T1#pod-approve' },
+    ]);
+    appendSeatRequestRows(path, [{ ...request('b'), why: 'auto-queued for dispatch', evidenceRef: 'obs:T1#dispatch' }]);
+    const listed = listSeatRequests(f.root);
+    expect(listed.map(({ key }) => key)).toEqual(['a', 'b']);
+    expect(listed[0]).toMatchObject({ key: 'a', status: 'pending', why: 'auto admission while pod warm',
+      evidenceRef: 'obs:T1#pod-approve' });
+    expect(listed[1]).toMatchObject({ key: 'b', status: 'queued', why: 'auto-queued for dispatch',
+      evidenceRef: 'obs:T1#dispatch' });
+    const why: string | undefined = listed[0].why;
+    const evidenceRef: string | undefined = listed[0].evidenceRef;
+    expect(why).toBe('auto admission while pod warm');
+    expect(evidenceRef).toBe('obs:T1#pod-approve');
+  } finally { f.close(); }
+});
+
 test('close appends one reasoned terminal row per eligible key, and repeats cannot close again', () => {
   const f = fixture();
   try {
@@ -66,6 +88,31 @@ test('close appends one reasoned terminal row per eligible key, and repeats cann
     expect(listSeatRequests(f.root, { status: 'pending' }).map(({ key }) => key)).toEqual(['a']);
     expect(closeSeatRequests(f.root, ['a'], { reason: 'completed', status: 'done', now })).toMatchObject([{ key: 'a', status: 'done' }]);
     expect(listSeatRequests(f.root, { status: 'done' }).map(({ key }) => key)).toEqual(['a', 'done']);
+  } finally { f.close(); }
+});
+
+test('closing spreads why and evidenceRef into the terminal row and back through the journal', () => {
+  const f = fixture();
+  try {
+    const path = join(f.root, 'seat-requests', 'requests.jsonl');
+    appendSeatRequestRows(path, [
+      { ...request('a'), why: 'auto-queued pod admission', evidenceRef: 'obs:T1#pod-approve' },
+      { ...request('b', 'UX', 'pending'), why: 'auto-queued for UX handoff', evidenceRef: 'obs:T1#ux-handoff' },
+    ]);
+    const now = new Date('2026-10-05T00:00:00.000Z');
+    const closed = closeSeatRequests(f.root, ['a', 'b'], { reason: 'stale admission', status: 'rejected', now });
+    expect(closed.map(({ key }) => key)).toEqual(['a', 'b']);
+    expect(closed[0]).toMatchObject({ key: 'a', status: 'rejected', reason: 'stale admission', closedAt: now.toISOString(),
+      why: 'auto-queued pod admission', evidenceRef: 'obs:T1#pod-approve' });
+    expect(closed[1]).toMatchObject({ key: 'b', status: 'rejected', reason: 'stale admission', closedAt: now.toISOString(),
+      why: 'auto-queued for UX handoff', evidenceRef: 'obs:T1#ux-handoff' });
+    const rejected = listSeatRequests(f.root, { status: 'rejected' });
+    expect(rejected.map(({ key }) => key)).toEqual(['a', 'b']);
+    const why: string | undefined = rejected[0].why;
+    const evidenceRef: string | undefined = rejected[0].evidenceRef;
+    expect(why).toBe('auto-queued pod admission');
+    expect(evidenceRef).toBe('obs:T1#pod-approve');
+    expect(rejected[1]).toMatchObject({ why: 'auto-queued for UX handoff', evidenceRef: 'obs:T1#ux-handoff' });
   } finally { f.close(); }
 });
 

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { ClaimsLedger } from './claims-ledger.js';
 import { queueStaleRechecks, renderClaims, representativeNumber } from './claims-render.js';
 import { debug } from '../debug/log.js';
+import { PatentLedger } from '../patents/ledger.js';
 
 const root = () => realpathSync(mkdtempSync(join(tmpdir(), 'claims-render-test-')));
 
@@ -143,6 +144,37 @@ test('the latest evidence controls expiration and the recheck command', () => {
     expect(request.text).toBe('superseded 근거 낡음 — 재측: latest-command');
   } finally { rmSync(stateDir, { recursive: true, force: true }); rmSync(instanceRoot, { recursive: true, force: true }); }
 });
+
+test('public-allowed patent rows join the rendered claims output after measured claims, filtered by audience and deduped against stored ids', () => {
+  const stateDir = root();
+  const ledger = new ClaimsLedger({ stateDir, now: () => new Date('2026-10-04T00:00:00Z') });
+  try {
+    ledger.add({ id: 'stored', claim: '측정된 코드가 있습니다.', audience: 'personal', owner: 'MK' });
+    ledger.verify('stored', { value: '420만+ 줄', command: 'measure-stored', measuredAt: '2026-10-04T00:00:00Z', validUntil: '2026-10-07T00:00:00Z', by: 'TC' });
+    ledger.publish('stored', 'MK');
+    const patentLedger = new PatentLedger({ stateDir, now: () => new Date('2026-10-04T00:00:00Z') });
+    patentLedger.add({ id: 'PUBLIC-D', title: '공개 허용 후보 D.', track: '출원', status: '공개 허용' });
+    patentLedger.add({ id: 'PENDING', title: '출원 전 경로.', track: '출원', status: '출원' });
+    patentLedger.add({ id: 'stored', title: '저장 주장과 같은 식별자.', track: '출원', status: '공개 허용' });
+    const patents = { ledger: patentLedger, owner: 'MK', audience: 'team' };
+    const result = renderClaims(ledger, { surface: 'deck', patents });
+    expect(result.included).toEqual(['stored', 'PUBLIC-D']);
+    expect(result.markdown).toContain('공개 허용 후보 D.');
+    expect(result.markdown).toContain('<!-- claim:PUBLIC-D patent --> <!-- src:patents -->');
+    expect(result.markdown).not.toContain('출원 전 경로.');
+    expect(result.markdown).not.toContain('저장 주장과 같은 식별자.');
+    expect(result.excluded).toEqual([]);
+    const team = renderClaims(ledger, { surface: 'deck', audience: 'team', patents });
+    expect(team.included).toEqual(['PUBLIC-D']);
+    expect(team.markdown).toContain('공개 허용 후보 D.');
+    expect(team.markdown).not.toContain('측정된 코드가 있습니다.');
+    expect(team.markdown).not.toContain('출원 전 경로.');
+    patentLedger.setStatus('PUBLIC-D', '출원');
+    expect(renderClaims(ledger, { surface: 'deck', audience: 'team', patents }).included).toEqual([]);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+}, 120000);
 
 test('representativeNumber picks the one unit-bearing measured value and refuses dates or ambiguity (review round 3)', () => {
   expect(representativeNumber('측정일 2026-10-03, 결과 420만+ 줄')).toBe('420만+ 줄');

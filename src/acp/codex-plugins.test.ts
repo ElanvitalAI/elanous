@@ -8,6 +8,7 @@ import {
   readCodexPluginsObservation,
   readCodexPluginsFromAppServer,
   clearCodexPluginsCache,
+  readCodexPluginList,
 } from './codex-plugins.js';
 import type { CodexAppServerClient } from './codex-app-server-client.js';
 
@@ -29,6 +30,20 @@ const REAL_FIXTURE = {
     },
   ],
 };
+
+test('Codex package import reads the uncached inventory and closes its app-server', async () => {
+  const methods: string[] = [];
+  let closed = 0;
+  let killed = 0;
+  const client = {
+    request: async (method: string) => { methods.push(method); return method === 'plugin/list' ? REAL_FIXTURE : {}; },
+    close: async () => { closed++; },
+  } as unknown as CodexAppServerClient;
+  const spawn = (() => ({ client, child: { kill: () => { killed++; } } })) as unknown as Parameters<typeof readCodexPluginList>[0];
+  expect(await readCodexPluginList(spawn)).toBe(REAL_FIXTURE);
+  expect(methods).toEqual(['initialize', 'plugin/list']);
+  expect([closed, killed]).toEqual([1, 1]);
+});
 
 test('app-server probe initializes a live client and closes it, preserving unknown on failure', async () => {
   const methods: string[] = [];

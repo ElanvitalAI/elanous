@@ -419,6 +419,31 @@ nodes:
       tools: none
       outputs: []
 
+  # LAND-REFUSAL-EDGES: destinations only; recovery execution is a later slice.
+  - node_id: ready
+    group: land
+    journey_stage: land
+    kind: gate
+    recipe: none                      # 후보 선언만; LAND-REFUSAL-EXEC 전까지 실행 모듈 없음
+    max_visits: 1
+    terminal_stages: []
+    contract:
+      inputs: [pr-number]
+      tools: none
+      outputs: [ready-decision]
+
+  - node_id: pr-head-checkout
+    group: land
+    journey_stage: land
+    kind: gate
+    recipe: none                      # 후보 선언만; LAND-REFUSAL-EXEC 전까지 실행 모듈 없음
+    max_visits: 1
+    terminal_stages: []
+    contract:
+      inputs: [pr-number, head-sha]
+      tools: none
+      outputs: [checkout-decision]
+
 # ═══════════════════════════════════════════════════════════════════════
 # 엣지 — ⛔ 출처는 «코드 선언 ⊕ 원장 실측» 둘 다다. 어느 하나만 보면 틀린다.
 #   📏 2026-09-08 실측 (pipeline-traversal-shadow 182 걸음 · 판정 함수가 «실제로 본» 것):
@@ -448,7 +473,10 @@ edges:
       refuse: stopped
 
   - from: dispatch
-    to: author
+    on: source
+    map:
+      fresh: author
+      pr-source: pool-admit          # 같은 PR 수리: author·plan·decompose를 건너뛰고 Pod rework
 
   - from: author
     to: plan
@@ -567,6 +595,15 @@ edges:
 
   - from: hold
     to: freeze-check                   # 해제 뒤 재검사
+
+  - from: merge
+    on: refusal
+    map:
+      draft: ready
+      head-branch: pr-head-checkout
+      not-ancestor: main-sync
+      review-missing: review
+      other: next-move
 
   - from: merge
     to: cleanup

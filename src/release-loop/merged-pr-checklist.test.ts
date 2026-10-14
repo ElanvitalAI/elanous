@@ -3,6 +3,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { syncMergedPrChecklist, type MergedPrChecklistDeps } from './merged-pr-checklist.js';
+import { boundMergedTaskCells, candidateMergedTaskCells, closeMergedTaskCard } from '../task-agent/postland-card.js';
+import { judgeLandedCell } from './landed-to-green.js';
 import { addItem, listChecklist, type ChecklistItem } from './checklist.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 
@@ -21,7 +23,7 @@ function fixture(items: ChecklistItem[], title = 'unrelated', body = '칸: X', g
     versions: () => ['0.2.12'],
     checklist: (version) => ({ version, released: '', dev: version, items, history: [] }),
     addEvidence: (id, _version, ref) => { calls.push(`evidence ${id} ${ref}`); items.find((entry) => entry.id === id)!.evidence = ref; },
-    setStatus: (_version, id, patch) => { calls.push(`status ${id} ${patch.status}`); items.find((entry) => entry.id === id)!.status = patch.status!; return { version: '0.2.12', released: '', dev: '0.2.12', items, history: [] }; },
+    setStatus: (_version, id, patch) => { calls.push(`status ${id} ${patch.status}`); if (patch.status !== undefined) items.find((entry) => entry.id === id)!.status = patch.status; if (patch.evidence !== undefined) items.find((entry) => entry.id === id)!.evidence = patch.evidence; return { version: '0.2.12', released: '', dev: '0.2.12', items, history: [] }; },
     judgeLanded: () => undefined,
     log: (_category, event) => { events.push(event); },
   };
@@ -29,6 +31,112 @@ function fixture(items: ChecklistItem[], title = 'unrelated', body = '칸: X', g
 }
 
 describe('confirmed main merge checklist sync', () => {
+  test('unreadable TA binding prevents the legacy green judge path', () => {
+    const f = fixture([item('X')], 'unrelated', '칸: X');
+    try {
+      syncMergedPrChecklist(79, f.root, undefined, { ...f.deps,
+        candidateTaskCells: () => { throw new Error('card ledger unreadable'); },
+        judgeLanded: () => { f.calls.push('legacy judge'); return 'proposed'; },
+      });
+      expect(f.calls).not.toContain('legacy judge');
+      expect(f.items[0]!.status).toBe('yellow');
+      expect(f.events).toContain('postland-binding-unreadable');
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  test('same PR number with a mismatched card URL stays yellow instead of prose green', () => {
+    const f = fixture([item('X'), item('Y')], 'unrelated', '칸: X, Y', '칸: X\n칸: Y\n이 칸 완료\n');
+    const statePath = join(f.root, 'task-agent-actions.json');
+    writeFileSync(statePath, JSON.stringify({ tasks: { ta: { id: 'ta', text: 'x', createdAt: '2026-10-13T00:00:00Z', status: 'launched', history: [], checklistId: 'X',
+      pr: { number: 79, url: 'https://github.com/other/repo/pull/79' }, taLand: true } } }));
+    try {
+      syncMergedPrChecklist(79, f.root, f.path, { ...f.deps,
+        readPr: () => ({ state: 'MERGED', baseRefName: 'main', title: 'unrelated', body: '칸: X, Y', mergedAt: '2026-10-13T00:00:00Z', url: 'https://github.com/example/repo/pull/79', headRefOid: 'a'.repeat(40), files: [{ path: 'src/feature.ts' }] }),
+        candidateTaskCells: (number) => candidateMergedTaskCells(number, statePath),
+        boundTaskCells: (pr) => boundMergedTaskCells(pr, statePath),
+        closeTaskCard: (pr, cwd, options) => closeMergedTaskCard(pr, cwd, { ...options, statePath, checklist: f.deps.checklist, setStatus: f.deps.setStatus, judge: () => 'proposed', log: () => {} }),
+      });
+      expect(f.items.map((entry) => entry.status)).toEqual(['yellow', 'green']);
+      expect(JSON.parse(readFileSync(statePath, 'utf8')).tasks.ta.status).toBe('launched');
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  test('missing PR URL or head blocks prose-only green for candidate TA cells', () => {
+    const f = fixture([item('X'), item('Y')], 'unrelated', '칸: X, Y', '칸: X\n칸: Y\n이 칸 완료\n');
+    try {
+      syncMergedPrChecklist(79, f.root, f.path, { ...f.deps,
+        candidateTaskCells: () => ['X'],
+        readPr: () => ({ state: 'MERGED', baseRefName: 'main', title: 'unrelated', body: '칸: X, Y', mergedAt: '2026-10-13T00:00:00Z' }),
+      });
+      expect(f.items.map((entry) => entry.status)).toEqual(['yellow', 'green']);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  test('ambiguous TA cards on one PR cannot green either bound cell', () => {
+    const f = fixture([item('X'), item('Y')], 'unrelated', '칸: X, Y', '칸: X\n칸: Y\n이 칸 완료\n');
+    const statePath = join(f.root, 'task-agent-actions.json');
+    const card = (id: string, checklistId: string) => ({ id, text: id, createdAt: '2026-10-13T00:00:00Z', status: 'launched', history: [], checklistId,
+      pr: { number: 79, url: 'https://github.com/example/repo/pull/79' }, taLand: true, landAttempts: [{ pr: 79, head: 'a'.repeat(40), at: '2026-10-13T00:00:00Z' }] });
+    writeFileSync(statePath, JSON.stringify({ tasks: { taX: card('taX', 'X'), taY: card('taY', 'Y') } }));
+    try {
+      syncMergedPrChecklist(79, f.root, f.path, { ...f.deps,
+        readPr: () => ({ state: 'MERGED', baseRefName: 'main', title: 'unrelated', body: '칸: X, Y', mergedAt: '2026-10-13T00:00:00Z', url: 'https://github.com/example/repo/pull/79', headRefOid: 'a'.repeat(40), files: [{ path: 'src/feature.ts' }] }),
+        boundTaskCells: (pr) => boundMergedTaskCells(pr, statePath),
+        closeTaskCard: (pr, cwd, options) => closeMergedTaskCard(pr, cwd, { ...options, statePath, checklist: f.deps.checklist, setStatus: f.deps.setStatus, judge: () => 'proposed', log: () => {} }),
+      });
+      expect(f.items.map((entry) => entry.status)).toEqual(['yellow', 'yellow']);
+      expect(JSON.parse(readFileSync(statePath, 'utf8')).tasks.taX.postLand).toBeUndefined();
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  test('TA postland I/O failure cannot promote its bound cell by completion prose', () => {
+    const f = fixture([item('X'), item('Y')], 'unrelated', '칸: X, Y', '칸: X\n칸: Y\n이 칸 완료\n');
+    try {
+      syncMergedPrChecklist(79, f.root, f.path, { ...f.deps,
+        readPr: () => ({ state: 'MERGED', baseRefName: 'main', title: 'unrelated', body: '칸: X, Y', mergedAt: '2026-10-13T00:00:00Z', url: 'https://github.com/example/repo/pull/79', headRefOid: 'a'.repeat(40), files: [{ path: 'src/feature.ts' }] }),
+        boundTaskCells: () => ['X'],
+        closeTaskCard: () => { throw new Error('ledger unavailable'); },
+      });
+      expect(f.items[0]!.status).toBe('yellow');
+      expect(f.items[1]!.status).toBe('green');
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  test('TA completion declaration cannot override a failing measured criterion', () => {
+    const f = fixture([item('X'), item('Y')], 'unrelated', '칸: X, Y', '칸: X\n칸: Y\n이 칸 완료\n');
+    f.items[0]!.title = '판정 신호: 조건=focused; 관측=bun test feature.test.ts; 기대=0 fail';
+    const statePath = join(f.root, 'task-agent-actions.json');
+    writeFileSync(statePath, JSON.stringify({ tasks: { ta: { id: 'ta', text: 'x', createdAt: '2026-10-13T00:00:00Z', status: 'launched', history: [], checklistId: 'X', pr: { number: 79, url: 'https://github.com/example/repo/pull/79' }, taLand: true, landAttempts: [{ pr: 79, head: 'a'.repeat(40), at: '2026-10-13T00:00:00Z' }] } } }));
+    try {
+      const deps: MergedPrChecklistDeps = { ...f.deps,
+        readPr: () => ({ state: 'MERGED', baseRefName: 'main', title: 'unrelated', body: '칸: X, Y', mergedAt: '2026-10-13T00:00:00Z', url: 'https://github.com/example/repo/pull/79', headRefOid: 'a'.repeat(40), files: [{ path: 'src/feature.ts' }] }),
+        closeTaskCard: (pr, cwd, options) => closeMergedTaskCard(pr, cwd, { ...options, statePath, checklist: f.deps.checklist, setStatus: f.deps.setStatus,
+          judge: (cell, judgeOptions) => judgeLandedCell(cell, { ...judgeOptions, ledgerRoot: f.root, run: () => 1 }), log: () => {} }),
+      };
+      syncMergedPrChecklist(79, f.root, f.path, deps);
+      expect(f.items[0]!.status).toBe('yellow');
+      expect(f.items[1]!.status).toBe('green');
+      expect(f.items[0]!.evidence).toContain('TA postland #79/aaaaaaaaaaaa:');
+      expect(f.items[0]!.evidence).toContain('다음 조각 retitle 후보:');
+      expect(JSON.parse(readFileSync(statePath, 'utf8')).tasks.ta).toMatchObject({ status: 'done', postLand: { outcome: 'partial' } });
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  test('a merged TA PR with 칸: 없음 still reaches its bound-card postland closer', () => {
+    const f = fixture([item('CELL')], 'unrelated', '칸: 없음');
+    const statePath = join(f.root, 'task-agent-actions.json');
+    writeFileSync(statePath, JSON.stringify({ tasks: { ta: { id: 'ta', text: 'x', createdAt: '2026-10-13T00:00:00Z', status: 'launched', history: [], checklistId: 'CELL', pr: { number: 79, url: 'https://github.com/example/repo/pull/79' }, taLand: true, landAttempts: [{ pr: 79, head: 'a'.repeat(40), at: '2026-10-13T00:00:00Z' }] } } }));
+    try {
+      syncMergedPrChecklist(79, f.root, undefined, { ...f.deps,
+        readPr: () => ({ state: 'MERGED', baseRefName: 'main', title: 'unrelated', body: '칸: 없음', mergedAt: '2026-10-13T00:00:00Z', url: 'https://github.com/example/repo/pull/79', headRefOid: 'a'.repeat(40), files: [{ path: 'src/feature.ts' }] }),
+        closeTaskCard: (pr, cwd, options) => closeMergedTaskCard(pr, cwd, { ...options, statePath, checklist: f.deps.checklist, setStatus: f.deps.setStatus, judge: () => 'unmeasurable', log: () => {} }),
+      });
+      expect(f.items[0]!.status).toBe('yellow');
+      expect(f.items[0]!.evidence).toContain('TA postland #79/aaaaaaaaaaaa:');
+      expect(JSON.parse(readFileSync(statePath, 'utf8')).tasks.ta).toMatchObject({ status: 'done', postLand: { outcome: 'partial', pr: 79 } });
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
   test('invariant: any judgment verdict leaves evidence, completion green writes and merged-pr events identical to no judgment', () => {
     // Same PR, same goal (completion declared for X only), every verdict the judge can return — the merge path's
     // observable effects (addEvidence/setStatus calls, final statuses, release.checklist events) must not move.

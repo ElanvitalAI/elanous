@@ -17,8 +17,10 @@
 //      ⛔ 그래도 관측·산출에는 «그대로» 남긴다 — 「지나갔다」와 「없었다」는 다른 값이다.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { isAbsolute, resolve } from 'node:path';
+import { closeSync, existsSync, lstatSync, openSync, readSync, statSync } from 'node:fs';
+import { dirname, isAbsolute, resolve, sep } from 'node:path';
+import { linesOutsideFencedCode } from '../self-implement/goal-author.js';
+import { declaredNewFilePaths } from '../self-implement/goal-new-paths.js';
 import { resolveLogTargets } from '../cli/logs-cli.js';
 import { debug } from '../debug/log.js';
 import { siblingTestPath, normalizePreexistingFailureObservedAt, normalizePreexistingFailureRecords, emitAskMarkerObservation, emittedAskMarkerObservations, setAskMarkerObserver } from './launch-preflight-text.js';
@@ -734,8 +736,9 @@ export interface AskPreflightOptions {
   readonly openPrsLimit?: number;
   /** 중단 런 원장 조회의 최대 반환 행 수. 상한 도달은 결과의 `truncated` 상태로 남는다. */
   readonly interruptedRunsLimit?: number;
-  /** ⛔ 저작 «전» 예비 검사용 — 주면 골 문서를 읽지 않고 이 경로로 판정한다(ask 힌트).
-   *  ⚠️ 이것은 «추정»이다. 정본은 저작된 골의 TRACED PATHS 이고 발사 직전에 다시 판정한다. */
+  /** ⛔ 저작 «전» 예비 검사용 — 충돌 판정에는 이 ask 힌트 경로를 쓴다.
+   *  골 파일이 이미 있으면 문서의 TRACED PATHS 는 별도로 읽어 누락을 검사한다.
+   *  ⚠️ 힌트는 «추정»이다. 정본은 저작된 골의 TRACED PATHS 이고 발사 직전에 다시 판정한다. */
   readonly pathsOverride?: readonly string[];
   /** 원 ask 경로와 최종 대상의 차이를 ask-outside-path 경고에 보인다. */
   readonly askOutsidePathHints?: readonly string[];
@@ -768,6 +771,78 @@ export interface AskPreflightDecision {
    *   저장소 «전체» 검사로 승격해, 이 변경과 무관한 선행 오류 1,386건이 드러난다(2026-08-28 실측).
    */
   readonly plannedBranchResolution?: PlannedBranchResolution;
+}
+
+/** OP #980: fragments kept by cleanup remain inspectable traced targets, including bare names. */
+function isFileShapedTracedPath(path: string): boolean {
+  return path.trim().length > 0 && (!/\s/.test(path) || path.includes('/'));
+}
+
+// Keep lexical `..`/`.` segments: resolving them first hides ENOTDIR behind a file parent.
+function tracedFsPath(path: string, root: string): string {
+  return isAbsolute(path) ? path : `${root}${root.endsWith(sep) ? '' : sep}${path}`;
+}
+
+function tracedPathExists(path: string, root: string): boolean {
+  try {
+    const target = tracedFsPath(path, root);
+    if (!statSync(target).isFile()) return false;
+    const fd = openSync(target, 'r');
+    try { readSync(fd, Buffer.alloc(1), 0, 1, 0); }
+    finally { closeSync(fd); }
+    return true;
+  }
+  catch { return false; }
+}
+
+function tracedPathIsFile(path: string, root: string): boolean {
+  try { return statSync(tracedFsPath(path, root)).isFile(); }
+  catch { return false; }
+}
+
+function tracedPathOccupation(path: string, root: string): 'occupied' | 'missing' | 'inaccessible' {
+  const target = tracedFsPath(path, root);
+  try { lstatSync(target); return 'occupied'; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return 'inaccessible';
+    for (let parent = dirname(target); parent !== dirname(parent); parent = dirname(parent)) {
+      try {
+        if (lstatSync(parent).isSymbolicLink()) {
+          try { statSync(parent); } catch { return 'inaccessible'; }
+        }
+      } catch (parentError) {
+        if ((parentError as NodeJS.ErrnoException).code !== 'ENOENT') return 'inaccessible';
+      }
+    }
+    return 'missing';
+  }
+}
+
+/** Remove only malformed TRACED PATHS fragments before the child reads the goal file again. */
+export function discardNonFileTracedPathItems(document: string, _root: string): { document: string; dropped: string[] } {
+  const dropped: string[] = [];
+  let inTracedPaths = false;
+  const outsideStarts = new Set(linesOutsideFencedCode(document).map((line) => line.start));
+  let offset = 0;
+  const lines = document.split('\n').flatMap((line) => {
+    const lineStart = offset;
+    offset += line.length + 1;
+    if (!outsideStarts.has(lineStart)) return [line];
+    const body = line.replace(/\r$/, '');
+    if (/^\s*##\s+TRACED PATHS\s*$/.test(body)) { inTracedPaths = true; return [line]; }
+    if (inTracedPaths && /^\s*#{1,6}\s/.test(body)) inTracedPaths = false;
+    if (!inTracedPaths) return [line];
+    const item = /^(\s*(?:[-*+]|\d+[.)])\s+)(.*)$/.exec(body);
+    if (!item) return [line];
+    // OP #980: a fragment with whitespace and no slash is prose; all other forms stay verbatim.
+    const fragments = item[2]!.split(' · ');
+    const kept = fragments.filter((fragment) => !(/\s/.test(fragment.trim()) && !fragment.includes('/')));
+    if (kept.length === fragments.length) return [line];
+    if (kept.length === 0) { dropped.push(line); return []; }
+    dropped.push(line);
+    return [`${item[1]}${kept.join(' · ')}${line.endsWith('\r') ? '\r' : ''}`];
+  });
+  return { document: lines.join('\n'), dropped };
 }
 
 /** 인자 검증 — ⛔ 잘못된 값을 «조용히» 기본값으로 바꾸지 않는다(리뷰 should-fix). */
@@ -1001,20 +1076,48 @@ export function decideAskPreflight(
 ): AskPreflightDecision {
   const limit = opts.openPrsLimit ?? 200;
   const interruptedRunsLimit = resolveInterruptedRunsLimit(opts.interruptedRunsLimit);
-  // ⛔⭐ 「저작 전 예비 검사」 경로 — 골 파일이 «아직 없다». 그때는 ask 힌트를 대상 경로로 쓴다.
-  //   ⚠️ 골 문서를 읽지 «않는다» — 없는 파일을 읽으려 하면 여기서 던져 저작 자체가 막힌다.
+  // pathsOverride is an independent pre-authoring inspection, even if a stale goal file exists.
   let goalDocument: string | null = null;
   let goalRulersUnknownReason: string | undefined;
+  let goalReadFailed = false;
+  const resolvedGoalFile = opts.declaredPathsRoot?.trim() && !isAbsolute(opts.goalFile)
+    ? resolve(opts.declaredPathsRoot, opts.goalFile)
+    : opts.goalFile;
   if (!opts.pathsOverride) {
     try {
-      goalDocument = deps.readGoalDocument(opts.goalFile);
+      goalDocument = deps.readGoalDocument(resolvedGoalFile);
     } catch (error) {
+      goalReadFailed = true;
       goalRulersUnknownReason = `골 문서 판독 불가: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`;
     }
   } else {
     goalRulersUnknownReason = '저작 전 예비 검사에는 골 문서가 없다';
   }
-  const tracedPaths = opts.pathsOverride ?? (goalDocument === null ? [] : deps.tracedPaths(goalDocument));
+  // Resolve against the caller's root, but keep injected virtual goal documents out of
+  // filesystem checks when no authored file exists there.
+  const hasAuthoredGoal = !opts.pathsOverride && opts.goalFile !== '' && goalDocument !== null
+    && existsSync(resolvedGoalFile);
+  const authoredTracedPaths = goalDocument === null ? [] : deps.tracedPaths(goalDocument);
+  const tracedPathsRaw = opts.pathsOverride ?? authoredTracedPaths;
+  const inspectionRoot = goalDocument === null || !hasAuthoredGoal
+    ? undefined
+    : opts.declaredPathsRoot?.trim() || process.cwd();
+  const tracedPaths = inspectionRoot && !opts.pathsOverride
+    ? tracedPathsRaw.filter((path) => tracedPathExists(path, inspectionRoot) || isFileShapedTracedPath(path))
+    : tracedPathsRaw;
+  const declaredNewPaths = goalDocument === null ? new Set<string>() : new Set(declaredNewFilePaths(goalDocument));
+  const invalidTracedPaths: Array<{ path: string; reason: 'occupied-new' | 'not-file' | 'missing' | 'inaccessible' }> = inspectionRoot
+    ? authoredTracedPaths.flatMap<{ path: string; reason: 'occupied-new' | 'not-file' | 'missing' | 'inaccessible' }>((path) => {
+      const occupation = tracedPathOccupation(path, inspectionRoot);
+      if (!isFileShapedTracedPath(path) && occupation !== 'occupied') return [];
+      const isDeclaredNew = declaredNewPaths.has(path.replace(/^\.\//, ''));
+      if (isDeclaredNew) return occupation === 'missing' ? [] : [{ path, reason: occupation === 'occupied' ? 'occupied-new' as const : 'inaccessible' as const }];
+      if (tracedPathExists(path, inspectionRoot)) return [];
+      return [{ path, reason: occupation === 'occupied'
+        ? (tracedPathIsFile(path, inspectionRoot) ? 'inaccessible' as const : 'not-file' as const)
+        : occupation }];
+    })
+    : [];
   let premiseMockedBySignal: number | null = null;
   let invariantFunctionExits: number | null = null;
   if (goalDocument !== null) {
@@ -1197,11 +1300,41 @@ export function decideAskPreflight(
     ...(interruptedRunsUnknownReason ? { interruptedRunsUnknownReason } : {}),
     ...(recentChangesUnknownReason ? { recentChangesUnknownReason } : {}),
   });
-  const decisionResult = { ...result, warnings: [...result.warnings, ...askMarkerWarnings], runningRunsConfidenceAppendix: runningRunsConfidence.appendix };
+  const missingTracedPathBlockers: LaunchPreflightBlocker[] = [
+    ...(hasAuthoredGoal && authoredTracedPaths.length === 0 ? [{
+      kind: 'missing-traced-path' as const,
+      name: '최종 골의 TRACED PATHS 경로 0',
+      detail: '정리 후 보존된 traced 경로가 없다 — 실제 파일 또는 유효한 신설: 파일 경로를 골에 선언해야 발사할 수 있다',
+    }] : []),
+    ...invalidTracedPaths.map(({ path, reason }) => ({
+      kind: 'missing-traced-path' as const,
+      name: reason === 'occupied-new' ? `신설 traced path 가 이미 점유됨: ${path}`
+        : reason === 'not-file' ? `traced path 가 파일이 아님: ${path}`
+          : reason === 'inaccessible' ? `traced path 경로 접근 불가: ${path}` : `실재하지 않는 traced path: ${path}`,
+      detail: reason === 'occupied-new'
+        ? `골의 신설: 경로 ${path} 가 이미 파일·디렉터리·링크로 점유돼 있다 — 새 파일 경로를 바로잡아야 한다`
+        : reason === 'not-file'
+          ? `골의 TRACED PATHS 경로 ${path} 가 존재하지만 읽을 수 있는 파일이 아니다 — 파일 경로를 바로잡아야 한다`
+          : reason === 'inaccessible'
+            ? `골의 TRACED PATHS 경로 ${path} 를 검사할 수 없다 — 부모가 파일이거나 접근 권한이 없다. 경로를 바로잡아야 한다`
+            : `골의 TRACED PATHS 에 선언됐지만 ${inspectionRoot} 에 없고 유효한 신설: 목록에도 없다 — 발사 전에 골 경로를 바로잡아야 한다. 신설은 파일 경로로(확장자 포함) 선언한다`,
+    })),
+  ];
+  const goalReadBlockers: LaunchPreflightBlocker[] = goalReadFailed ? [{
+    kind: 'goal-unreadable',
+    name: `골 문서 판독 불가: ${opts.goalFile}`,
+    detail: `${goalRulersUnknownReason} — 최종 골의 traced path 를 확인할 수 없어 발사를 멈춘다`,
+  }] : [];
+  const decisionResult = {
+    ...result,
+    blockers: [...result.blockers, ...missingTracedPathBlockers, ...goalReadBlockers],
+    warnings: [...result.warnings, ...askMarkerWarnings],
+    runningRunsConfidenceAppendix: runningRunsConfidence.appendix,
+  };
   emittedAskMarkerObservations.add(decisionResult);
   return {
     result: decisionResult,
-    shouldLaunch: result.blockers.length === 0 || force,
+    shouldLaunch: missingTracedPathBlockers.length === 0 && goalReadBlockers.length === 0 && (result.blockers.length === 0 || force),
     plannedBranchResolution,
   };
 }

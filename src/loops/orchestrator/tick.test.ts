@@ -1,18 +1,19 @@
 import { describe, expect, test } from 'bun:test';
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 import { addItem, setItem, listChecklist } from '../../release-loop/checklist.js';
 import { splitCard } from '../../flow-loop/split.js';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { CardStore } from '../../task-cards/card-store.js';
 import { buildUserConfig, resetUserConfig } from '../../user-config.js';
-import { nextOrchestratorWindowAt, reconciliation, reportLine, runOrchestratorNode, type Node, type PlacementInput, type TickDeps } from './tick.js';
+import { nextOrchestratorWindowAt, readCompletionHeartbeat, reconciliation, reportLine, runOrchestratorNode, type Node, type PlacementInput, type TickDeps } from './tick.js';
 import { openMsgStore } from '../../msg/msg-store.js';
 import { checkLoopNeighbors, SEAT_NEIGHBORS } from '../neighbor-runtime.js';
 import { handleSeatRequests } from '../../nexus/api/seat-requests.js';
+import { CliUserError } from '../../cli/cli-user-error.js';
 
 const stages: Node[] = ['intake', 'split', 'place', 'delegate', 'launch', 'reconcile', 'report'];
 const fixture = async (run: (root: string, id: string, logged: Array<{ event: string; reason: string; targetLoopId?: string }>) => Promise<void>) => {
@@ -87,6 +88,176 @@ test('the orchestrator lease spans the scheduled gap: no false absence overnight
     expect(checkLoopNeighbors(root, 'mk-seat', orchestrator, new Date('2026-10-06T00:01:00Z')))
       .toMatchObject([{ neighbor: 'orchestrator', reason: 'end-expired', action: 'escalate', to: 'human' }]);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// COORD-HA ③ (RFC-loop-agent-map §A8b): the heartbeat measures «마지막 틱 완료 ⊕ 보드 마지막 쓰기 시각», not process liveness.
+describe('COORD-HA ③ progress heartbeat — tick completion and board write times', () => {
+  const recordPath = (root: string) => join(root, 'loop', 'orchestrator', 'heartbeat', 'completion.json');
+  const completeShadowRun = async (root: string, runId: string, now: Date) => {
+    for (const node of stages) await runOrchestratorNode(node, { root, runId, window: '08', mode: 'shadow', now,
+      split: () => [], loadAdapter: async () => undefined, print: () => {} });
+  };
+
+  test('only a completed report advances the run heartbeat', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'orch-progress-'));
+    try {
+      const morning = new Date('2026-10-05T00:00:00Z');
+      await runOrchestratorNode('intake', { root, runId: 'hb-a', window: '08', mode: 'shadow', now: morning });
+      expect(readCompletionHeartbeat(root)).toBeUndefined();
+      for (const node of stages.slice(1)) await runOrchestratorNode(node, { root, runId: 'hb-a', window: '08', mode: 'shadow', now: morning,
+        split: () => [], loadAdapter: async () => undefined, print: () => {} });
+      expect(readCompletionHeartbeat(root)).toEqual({ runId: 'hb-a', node: 'report', window: '08', mode: 'shadow',
+        boardWrittenAt: null, tickCompletedAt: morning.toISOString() });
+      // The record is durable on-disk state — a guardian in another process reads the same file.
+      expect(existsSync(recordPath(root))).toBe(true);
+      const noon = new Date('2026-10-05T03:00:00Z');
+      await runOrchestratorNode('intake', { root, runId: 'hb-b', window: '08', mode: 'shadow', now: noon });
+      expect(readCompletionHeartbeat(root)?.runId).toBe('hb-a');
+      for (const node of stages.slice(1)) await runOrchestratorNode(node, { root, runId: 'hb-b', window: '08', mode: 'shadow', now: noon,
+        split: () => [], loadAdapter: async () => undefined, print: () => {} });
+      expect(readCompletionHeartbeat(root)).toEqual({ runId: 'hb-b', node: 'report', window: '08', mode: 'shadow',
+        boardWrittenAt: null, tickCompletedAt: noon.toISOString() });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('a full shadow tick records the completion heartbeat of its last node through the standard path', async () => fixture(async (root, _id, logged) => {
+    const state = await invoke(root, 'hb-full', '08', { mode: 'shadow',
+      split: () => [{ id: 'C1', title: '칸', seat: 'MK' }], placeCell: () => null }, logged);
+    expect(state.nodes.report).toBe('ok');
+    expect(readCompletionHeartbeat(root)).toEqual({ runId: 'hb-full', node: 'report', window: '08', mode: 'shadow',
+      boardWrittenAt: null, tickCompletedAt: '2026-10-04T00:00:00.000Z' });
+  }));
+
+  test('a live placement write advances board time; later nodes and shadow ticks retain it', async () => fixture(async (root) => {
+    const at = new Date('2026-10-05T00:00:00Z');
+    const boardPath = join(root, 'release', 'features.sqlite');
+    const common: TickDeps = { root, runId: 'hb-live', window: '08', mode: 'live', now: at,
+      split: () => [{ id: 'C1', title: '칸', seat: 'MK' }] };
+    await runOrchestratorNode('intake', common);
+    await runOrchestratorNode('split', common);
+    expect(readCompletionHeartbeat(root)).toBeUndefined();
+    await runOrchestratorNode('place', { ...common, placeCell: () => {
+      mkdirSync(dirname(boardPath), { recursive: true });
+      writeFileSync(boardPath, 'placed');
+      return { version: '0.2.28' };
+    } });
+    expect(readFileSync(boardPath, 'utf8')).toBe('placed');
+    expect(readCompletionHeartbeat(root)).toMatchObject({ runId: 'hb-live', node: 'place',
+      boardWrittenAt: at.toISOString(), tickCompletedAt: null });
+    for (const node of stages.slice(3)) await runOrchestratorNode(node, { ...common,
+      seatTurn: async () => ({ status: 'skipped-empty' }), print: () => {} });
+    expect(readCompletionHeartbeat(root)).toMatchObject({ node: 'report', boardWrittenAt: at.toISOString() });
+    const later = new Date('2026-10-05T00:10:00Z');
+    await completeShadowRun(root, 'hb-shadow', later);
+    expect(readCompletionHeartbeat(root)).toMatchObject({ node: 'report', mode: 'shadow',
+      boardWrittenAt: at.toISOString(), tickCompletedAt: later.toISOString() });
+  }));
+
+  test('a real board write failure in place does not advance either completion time', async () => fixture(async (root) => {
+    const boardPath = join(root, 'release', 'features.sqlite');
+    const at = new Date('2026-10-05T00:00:00Z');
+    const common: TickDeps = { root, runId: 'hb-board-fail', window: '08', mode: 'live', now: at,
+      split: () => [{ id: 'C1', title: '칸', seat: 'MK' }] };
+    await completeShadowRun(root, 'hb-before-failure', at);
+    const completed = readCompletionHeartbeat(root);
+    await runOrchestratorNode('intake', common);
+    await runOrchestratorNode('split', common);
+    expect(readCompletionHeartbeat(root)).toEqual(completed);
+    mkdirSync(dirname(boardPath), { recursive: true });
+    symlinkSync(join(root, 'missing-dir', 'features.sqlite'), boardPath);
+    const failed = await runOrchestratorNode('place', { ...common, now: new Date('2026-10-05T00:10:00Z'),
+      placeCell: () => { writeFileSync(boardPath, 'placed'); return { version: '0.2.28' }; } });
+    expect(failed.placementFailed).toBe(true);
+    for (const node of stages.slice(3)) await runOrchestratorNode(node, { ...common, print: () => {},
+      seatTurn: async () => ({ status: 'skipped-empty' }) });
+    expect(readCompletionHeartbeat(root)).toEqual(completed);
+  }));
+
+  test('a live placer returning null or an invalid version cannot advance tick completion', async () => fixture(async (root, _id, logged) => {
+    const at = new Date('2026-10-05T00:00:00Z');
+    await completeShadowRun(root, 'hb-before-empty-place', at);
+    const completed = readCompletionHeartbeat(root);
+    const state = await invoke(root, 'hb-empty-place', '08', { mode: 'live', now: new Date('2026-10-05T00:10:00Z'),
+      split: () => [{ id: 'C1', title: 'null 칸', seat: 'MK' }, { id: 'C2', title: '무효 판 칸', seat: 'TC' }],
+      placeCell: cell => cell.id === 'C1' ? null : { version: ' ' },
+      seatTurn: async () => ({ status: 'skipped-empty' }), print: () => {} }, logged);
+    expect(state.unplaced).toBe(2);
+    expect(state.placementFailed).toBe(true);
+    expect(state.nodes.report).toBe('ok');
+    expect(readCompletionHeartbeat(root)).toEqual(completed);
+  }));
+
+  test('a partial board write advances only board time when a later cell fails as CliUserError', async () => fixture(async (root) => {
+    const at = new Date('2026-10-05T00:00:00Z');
+    await completeShadowRun(root, 'hb-before-cli-error', at);
+    const completed = readCompletionHeartbeat(root);
+    const later = new Date('2026-10-05T00:10:00Z');
+    const common: TickDeps = { root, runId: 'hb-cli-error', window: '08', mode: 'live', now: later,
+      split: () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }, { id: 'C2', title: '실패 칸', seat: 'TC' }] };
+    await runOrchestratorNode('intake', common);
+    await runOrchestratorNode('split', common);
+    const called: string[] = [];
+    const placed = await runOrchestratorNode('place', { ...common,
+      placeCell: cell => { called.push(cell.id); if (cell.id === 'C2') throw new CliUserError('board write rejected'); return { version: '0.2.28' }; } });
+    expect(called).toEqual(['C1', 'C2']);
+    expect(placed.placementFailed).toBe(true);
+    expect(readCompletionHeartbeat(root)).toMatchObject({ runId: completed?.runId, tickCompletedAt: completed?.tickCompletedAt,
+      boardWrittenAt: later.toISOString() });
+    for (const node of stages.slice(3)) await runOrchestratorNode(node, { ...common,
+      seatTurn: async () => ({ status: 'skipped-empty' }), print: () => {} });
+    expect(readCompletionHeartbeat(root)).toMatchObject({ runId: completed?.runId, tickCompletedAt: completed?.tickCompletedAt,
+      boardWrittenAt: later.toISOString() });
+  }));
+
+  test('a general error on one cell still allows the next cell to place', async () => fixture(async (root) => {
+    const common: TickDeps = { root, runId: 'hb-cell-recover', window: '08', mode: 'live', now: new Date('2026-10-05T00:00:00Z'),
+      split: () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }, { id: 'C2', title: '둘째 칸', seat: 'TC' }] };
+    await runOrchestratorNode('intake', common);
+    await runOrchestratorNode('split', common);
+    const called: string[] = [];
+    const placed = await runOrchestratorNode('place', { ...common, placeCell: cell => {
+      called.push(cell.id);
+      if (cell.id === 'C1') throw new Error('board unavailable');
+      return { version: '0.2.28' };
+    } });
+    expect(called).toEqual(['C1', 'C2']);
+    expect(placed.placed).toBe(1);
+    expect(placed.placementFailed).toBe(true);
+  }));
+
+  test('a completion heartbeat write failure rejects the node and retains the last completed record', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'orch-progress-record-fail-'));
+    try {
+      const at = new Date('2026-10-05T00:00:00Z');
+      await completeShadowRun(root, 'hb-ok', at);
+      const completed = readCompletionHeartbeat(root);
+      symlinkSync(join(root, 'missing-dir', 'record.json'), `${recordPath(root)}.${process.pid}.tmp`);
+      await expect(completeShadowRun(root, 'hb-no-record', new Date('2026-10-05T00:10:00Z'))).rejects.toThrow();
+      expect(readCompletionHeartbeat(root)).toEqual(completed);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('an off tick makes no progress — no completion heartbeat is recorded on a fresh root', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'orch-progress-off-'));
+    try {
+      expect(readCompletionHeartbeat(root)).toBeUndefined();
+      await runOrchestratorNode('intake', { root, runId: 'hb-off', window: '08', mode: 'off', now: new Date('2026-10-05T00:00:00Z') });
+      expect(readCompletionHeartbeat(root)).toBeUndefined();
+      expect(existsSync(recordPath(root))).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('an unreadable heartbeat record reads as no completion, never as a completed tick', () => {
+    const root = mkdtempSync(join(tmpdir(), 'orch-progress-corrupt-'));
+    try {
+      mkdirSync(dirname(recordPath(root)), { recursive: true });
+      writeFileSync(recordPath(root), '{torn');
+      expect(readCompletionHeartbeat(root)).toBeUndefined();
+      writeFileSync(recordPath(root), JSON.stringify({ runId: 'x', node: 'intake', window: '08', mode: 'shadow',
+        boardWrittenAt: 'not-a-time', tickCompletedAt: '2026-10-05T00:00:00.000Z' }));
+      expect(readCompletionHeartbeat(root)).toBeUndefined();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 });
 
 describe('orchestrator degradation and per-tick cap', () => {
@@ -1295,6 +1466,7 @@ test('COORD-HA: board down only during place (back by delegate) still carries th
   const delegated = await runOrchestratorNode('delegate', { ...base, degradation: () => ({ llm: true, board: true }) });
   expect(delegated.deferredCells?.map(cell => cell.id)).toEqual(['C1']);
   for (const node of ['launch', 'reconcile', 'report'] as const) await runOrchestratorNode(node, base);
+  expect(readCompletionHeartbeat(root)).toBeUndefined();
   const next = await invoke(root, 'placeOnly-next', '08', { mode: 'live', split, placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined }, logged);
   expect(next.delegated).toBe(1);
 }));

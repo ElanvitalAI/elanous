@@ -604,7 +604,7 @@ describe('elanous pr land', () => {
     expect(sink.errors).toEqual([
       '⚠ deletion-dominant-files: 삭제가 추가보다 많은 파일 1개 — src/self-implement/goal-author.ts (+3/-40).',
     ]);
-    expect(sink.logs.at(-1)).toBe('[dry-run] PR을 생성하고 ready 상태를 보장한 뒤 squash merge 합니다.');
+    expect(sink.logs.at(-1)).toBe('[dry-run] 머리 고정 없는 일반 착지: PR을 생성하고 ready 상태를 보장한 뒤 squash merge 합니다.');
     expect(sink.logs.join('\n')).not.toContain('local HEAD does not contain the landed result');
   });
 
@@ -686,7 +686,7 @@ describe('elanous pr land', () => {
     expect(line).toContain('#101');
     expect(line).toContain('#102');
     expect(line).toContain('이어 붙일지 이것을 살릴지 고르십시오');
-    expect(sink.logs.at(-1)).toBe('[dry-run] PR을 생성하고 ready 상태를 보장한 뒤 squash merge 합니다.');
+    expect(sink.logs.at(-1)).toBe('[dry-run] 머리 고정 없는 일반 착지: PR을 생성하고 ready 상태를 보장한 뒤 squash merge 합니다.');
   });
 
   it('continues landing without a sibling advisory when open-PR lookup fails', async () => {
@@ -1208,6 +1208,31 @@ describe('elanous pr land', () => {
       expect(sink.errors).toContain('✗ expected-head: overlap merge approval unavailable for the reviewed head');
       expect(sink.errors.join('\n')).not.toContain('overlap-evidence');
       expect(calls).not.toContain('merge');
+    });
+
+    it('marks an ancestor-auto-not-ancestor refusal for cross-host resync', async () => {
+      const { run, commands } = pinnedRun({ landingAncestors: [LANDINGS[0]!] });
+      const { manager, calls } = pinnedManager();
+      const sink = output();
+      const { dir } = evidenceFiles();
+      try {
+        expect(await runPrLand({ pr: '51', expectedHead: HEAD }, {
+          ...baseDeps, run, manager, out: sink.out, reviewResultsDir: join(dir, 'review-results'),
+        })).toBe(1);
+        expect(sink.errors.join('\n')).toContain('ancestor-auto-not-ancestor:');
+        expect(commands).toContainEqual({ cmd: 'gh', args: ['pr', 'edit', '51', '--add-label', 'elanous:needs-rebase'] });
+        expect(calls).not.toContain('merge');
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it('pinned dry-run checks identity without marking a PR for resync', async () => {
+      const { run, commands } = pinnedRun({ landingAncestors: [LANDINGS[0]!] });
+      const sink = output();
+      expect(await runPrLand({ pr: '51', expectedHead: HEAD, dryRun: true }, {
+        ...baseDeps, run, manager: pinnedManager().manager, out: sink.out,
+      })).toBe(0);
+      expect(sink.logs.join('\n')).toContain('✓ preflight');
+      expect(commands.some(({ cmd, args }) => cmd === 'gh' && args.includes('--add-label'))).toBe(false);
     });
 
     it('verified evidence (rebased · gated on that base · review pass must-fix 0) lands the pinned head', async () => {
@@ -2461,7 +2486,7 @@ describe('elanous pr land', () => {
 
     expect(sink.errors).toEqual([]);
     expect(sink.logs).toContain('✓ branch: feat/land');
-    expect(sink.logs.at(-1)).toBe('[dry-run] PR을 생성하고 ready 상태를 보장한 뒤 squash merge 합니다.');
+    expect(sink.logs.at(-1)).toBe('[dry-run] 머리 고정 없는 일반 착지: PR을 생성하고 ready 상태를 보장한 뒤 squash merge 합니다.');
     expect(calls).toEqual(['find']);
     expect(commands.some(({ cmd, args }) => cmd === 'gh' && args[0] === 'pr' && args[1] === 'view')).toBe(false);
   });
@@ -3128,6 +3153,111 @@ describe('public-export-leak at landing (LEAK1)', () => {
 });
 
 describe('pinned PR landing preview', () => {
+  it.each([
+    ['ready', false, 'a'.repeat(40), '', 0, '✓ preflight'],
+    ['draft', true, 'a'.repeat(40), '', 1, 'PR is draft'],
+    ['head mismatch', false, 'b'.repeat(40), '', 1, 'PR head differs'],
+    ['dirty worktree', false, 'a'.repeat(40), ' M src/x.ts\n', 1, 'local worktree is dirty'],
+  ] as const)('pinned dry-run %s shares the real identity guard and stays read-only', async (_case, isDraft, prHead, status, expectedCode, signal) => {
+    const head = 'a'.repeat(40);
+    const pr = '26563';
+    const calls: string[] = [];
+    const sink = output();
+    const { manager, calls: mutations } = fakeManager();
+    const run = (cmd: string, args: readonly string[]) => {
+      calls.push(`${cmd} ${args.join(' ')}`);
+      if (cmd === 'gh') return { ok: true, out: JSON.stringify({ headRefOid: prHead, headRefName: 'feat/land', state: 'OPEN', isDraft, url: `https://github.com/example/repo/pull/${pr}` }) };
+      if (args.join(' ') === 'rev-parse HEAD') return { ok: true, out: head };
+      if (args.join(' ') === 'status --porcelain') return { ok: true, out: status };
+      throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+    };
+    const code = await runPrLand({ pr, expectedHead: head, dryRun: true }, { ...baseDeps, manager, out: sink.out, run });
+    expect(code).toBe(expectedCode);
+    expect(sink.logs.join('\n')).toContain(signal);
+    if (isDraft) expect(sink.logs).toContain(`[dry-run] 선행: eln gh pr ready ${pr}`);
+    expect(mutations).toEqual([]);
+    expect(calls).toEqual([
+      `gh pr view ${pr} --json headRefOid,headRefName,state,isDraft,url`,
+      'git rev-parse HEAD',
+      'git status --porcelain',
+    ]);
+    if (expectedCode === 1) {
+      const actual = output();
+      const edges: { event: string; data?: unknown }[] = [];
+      const off = debug.registerSink({ name: 'pinned-refusal-route-test', emit: (row) => {
+        if (row.event === 'graph-edge-taken' && (row.data as { from?: string })?.from === 'merge') edges.push(row);
+      } });
+      let actualCode: number;
+      try { actualCode = await runPrLand({ pr, expectedHead: head }, { ...baseDeps, manager, out: actual.out, run }); }
+      finally { off(); }
+      expect(actualCode).toBe(1);
+      expect(actual.errors).toContain('✗ expected-head: PR OPEN non-draft, matching local HEAD and clean worktree required');
+      expect(edges).toHaveLength(1);
+      expect(edges[0]).toMatchObject({ data: { on: 'refusal', label: isDraft ? 'draft' : 'other',
+        to: isDraft ? 'ready' : 'next-move', reason: 'pr-land-refused; recovery-execution=none' } });
+    }
+  });
+
+  it('routes the paired --pr/--expected-head --dry-run through the CLI without a mutation', async () => {
+    const head = 'a'.repeat(40);
+    const pr = '26563';
+    const { manager, calls: mutations } = fakeManager();
+    const sink = output();
+    const commands: string[] = [];
+    const program = new Command();
+    program.exitOverride();
+    registerPrCommands(program, { ...baseDeps, manager, out: sink.out, run: (cmd, args) => {
+      commands.push(`${cmd} ${args.join(' ')}`);
+      if (cmd === 'gh') return { ok: true, out: JSON.stringify({ headRefOid: head, headRefName: 'feat/land', state: 'OPEN', isDraft: false, url: `https://github.com/example/repo/pull/${pr}` }) };
+      if (args.join(' ') === 'rev-parse HEAD') return { ok: true, out: head };
+      if (args.join(' ') === 'status --porcelain') return { ok: true, out: '' };
+      throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+    } });
+    await program.parseAsync(['pr', 'land', '--pr', pr, '--expected-head', head, '--dry-run'], { from: 'user' });
+    expect(sink.errors).toEqual([]);
+    expect(sink.logs.join('\n')).toContain('✓ preflight');
+    expect(mutations).toEqual([]);
+    expect(commands).toEqual([`gh pr view ${pr} --json headRefOid,headRefName,state,isDraft,url`, 'git rev-parse HEAD', 'git status --porcelain']);
+  });
+
+  it('fails closed when a pinned PR lookup returns a non-object', async () => {
+    const sink = output();
+    const code = await runPrLand({ pr: '26563', expectedHead: 'a'.repeat(40), dryRun: true }, {
+      ...baseDeps, out: sink.out, run: (cmd, args) => cmd === 'gh'
+        ? { ok: true, out: 'null' }
+        : args.join(' ') === 'rev-parse HEAD' ? { ok: true, out: 'a'.repeat(40) } : { ok: true, out: '' },
+    });
+    expect(code).toBe(1);
+    expect(sink.logs.join('\n')).toContain('PR is not OPEN');
+  });
+
+  it.each([
+    ['branch mismatch', 'other-branch', 'a'.repeat(40), 'OPEN', 'current branch differs', '✗ branch: PR head branch와 현재 브랜치가 다릅니다.'],
+    ['local HEAD mismatch', 'feat/land', 'b'.repeat(40), 'OPEN', 'local HEAD differs', '✗ expected-head: PR OPEN non-draft, matching local HEAD and clean worktree required'],
+    ['closed PR', 'feat/land', 'a'.repeat(40), 'CLOSED', 'PR is not OPEN', '✗ expected-head: PR OPEN non-draft, matching local HEAD and clean worktree required'],
+  ] as const)('pinned %s is rejected by preview and real guard', async (_case, prBranch, localHead, state, reason, realError) => {
+    const head = 'a'.repeat(40);
+    const { manager, calls: mutations } = fakeManager();
+    const run = (cmd: string, args: readonly string[]) => cmd === 'gh'
+      ? { ok: true, out: JSON.stringify({ headRefOid: head, headRefName: prBranch, state, isDraft: false, url: 'https://github.com/example/repo/pull/26563' }) }
+      : args.join(' ') === 'rev-parse HEAD' ? { ok: true, out: localHead } : { ok: true, out: '' };
+    const preview = output();
+    expect(await runPrLand({ pr: '26563', expectedHead: head, dryRun: true }, { ...baseDeps, manager, out: preview.out, run })).toBe(1);
+    expect(preview.logs.join('\n')).toContain(reason);
+    const actual = output();
+    expect(await runPrLand({ pr: '26563', expectedHead: head }, { ...baseDeps, manager, out: actual.out, run })).toBe(1);
+    expect(actual.errors).toContain(realError);
+    expect(mutations).toEqual([]);
+  });
+
+  it('rejects pinned --dry-run with --hold before any lookup', async () => {
+    const sink = output();
+    expect(await runPrLand({ pr: '26563', expectedHead: 'a'.repeat(40), dryRun: true, hold: true }, {
+      ...baseDeps, out: sink.out, run: () => { throw new Error('unexpected lookup'); },
+    })).toBe(1);
+    expect(sink.errors.join('\n')).toContain('--hold 는 머리 고정 읽기 전용 예행과 함께');
+  });
+
   it('prints the current PR head and read-only plan without running mutations', async () => {
     const calls: string[] = [];
     const log: string[] = [];

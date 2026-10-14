@@ -11,6 +11,9 @@ export interface TuiScreens {
 export interface TuiCheck { id: string; pass: boolean; detail: string }
 
 const ERROR_TEXT = /\b(TypeError|ReferenceError|SyntaxError|Unhandled|panic|Segmentation fault)\b|Error: /;
+// The startup band can say "Commands — /help lists every command" (#26954).
+// Only the modal's title proves that the help overlay itself remains on screen.
+const HELP_MODAL_TITLE = 'Dashboard help';
 
 export function tuiChecks(s: TuiScreens, readyLimitMs = 60_000): TuiCheck[] {
   const all = [s.first, s.help, s.afterEsc].join('\n');
@@ -18,8 +21,8 @@ export function tuiChecks(s: TuiScreens, readyLimitMs = 60_000): TuiCheck[] {
     { id: 'boot', pass: s.readyMs !== null && s.readyMs <= readyLimitMs, detail: s.readyMs === null ? 'never ready' : `ready in ${s.readyMs}ms` },
     { id: 'prompt', pass: s.first.includes('❯'), detail: 'input line (❯) on the first screen' },
     { id: 'status-bar', pass: /│.*ctx \d+/.test(s.first), detail: 'status bar with model and ctx' },
-    { id: 'help-opens', pass: s.help.includes('help') && s.help.includes('Commands') && s.help.includes('/help'), detail: '/help shows the help overlay' },
-    { id: 'help-closes', pass: !s.afterEsc.includes('Commands') && s.afterEsc.includes('❯'), detail: 'Esc closes the overlay' },
+    { id: 'help-opens', pass: s.help.includes(HELP_MODAL_TITLE) && s.help.includes('Commands') && s.help.includes('/help'), detail: '/help shows the help overlay' },
+    { id: 'help-closes', pass: !s.afterEsc.includes(HELP_MODAL_TITLE) && s.afterEsc.includes('❯'), detail: 'Esc closes the overlay' },
     { id: 'no-error-text', pass: !ERROR_TEXT.test(all), detail: 'no error text on any screen' },
   ];
 }

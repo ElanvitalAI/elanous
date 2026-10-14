@@ -54,6 +54,56 @@ describe('parseWorktreeSnapshot — prunable registrations', () => {
   });
 });
 
+describe('planHarnessClean — unowned merged-clean opt-in', () => {
+  const branch = 'dev/unowned-merged-clean';
+  const worktrees = [{ path: '/wt/dev/unowned-merged-clean', branch }];
+  const base = {
+    worktrees,
+    branches: [branch],
+    openPr: new Set<string>(),
+    mergedPr: new Set([branch]),
+    mode: 'merged' as const,
+    activeDirectories: [] as string[],
+    unmergedCommitCounts: new Map([[branch, 0]]),
+    uncommittedChanges: new Map([[branch, false]]),
+    changedFileCounts: new Map([[branch, 0]]),
+    branchContents: new Map([[branch, 'already-contained' as const]]),
+    assessWorktree: (input: Parameters<NonNullable<Parameters<typeof planHarnessClean>[0]['assessWorktree']>>[0]) => ({
+      ...input,
+      disposition: input.dirty ? 'do-not-touch' as const : 'reclaim-safe' as const,
+      reason: input.dirty ? 'dirty-worktree' : 'merged-clean',
+      hasOutput: false,
+    }),
+    readWorktreeProvenance: () => ({ owner: 'not-recorded', command: 'not-recorded', createdAt: 'not-recorded' }),
+  };
+
+  it('기본은 보존하고 opt-in 때만 merged·clean·열린 PR 없음·미사용 워크트리를 제거한다', () => {
+    const defaults = planHarnessClean(base);
+    expect(defaults.remove).toEqual([]);
+    expect(defaults.preserve).toHaveLength(1);
+    expect(defaults.preserve[0]?.reason).toContain('ownership=not-recorded:');
+
+    const allMode = planHarnessClean({ ...base, mode: 'all', includeUnownedMergedClean: true });
+    expect(allMode.remove).toEqual([]);
+    expect(allMode.preserve).toHaveLength(1);
+
+    const optedIn = planHarnessClean({ ...base, includeUnownedMergedClean: true });
+    expect(optedIn.remove).toEqual([expect.objectContaining({ branch, path: worktrees[0]!.path })]);
+    expect(optedIn.remove[0]?.reason).toContain('assessment=reclaim-safe:merged-clean');
+    expect(optedIn.remove[0]?.reason).toContain('ownership=not-recorded:');
+    expect(optedIn.preserve).toEqual([]);
+
+    const open = planHarnessClean({ ...base, includeUnownedMergedClean: true, openPr: new Set([branch]) });
+    expect(open.remove).toEqual([]);
+    expect(open.preserve[0]?.reason).toContain('ownership=not-recorded:');
+    const active = planHarnessClean({ ...base, includeUnownedMergedClean: true, activeDirectories: ['/wt/dev/unowned-merged-clean/src'] });
+    expect(active.remove).toEqual([]);
+    expect(active.preserve[0]?.reason).toBe('currently-in-use');
+    const dirty = planHarnessClean({ ...base, includeUnownedMergedClean: true, uncommittedChanges: new Map([[branch, true]]) });
+    expect(dirty.remove).toEqual([]);
+  });
+});
+
 describe('planHarnessClean — branch content assessment axis', () => {
   // ⛔⭐ 종전 이 시험은 `changedFileCounts` 에서 branchContent 를 «파생»하는 설계를 못 박고 있었다.
   //   그 파생은 `origin/main...HEAD`(merge-base) 기준이라 ***squash merge 를 못 본다*** —
@@ -920,6 +970,89 @@ describe('renderHarnessCleanReport — 사람 화면 규모 요약', () => {
     expect(summary).toContain('브랜치만 회수 2');
     expect(summary).toContain('워크트리 없이 안전 3');
     expect(res.plan).toEqual(before);
+  });
+});
+
+describe('execHarnessClean — unowned merged-clean opt-in wiring', () => {
+  const clean = 'self-impl/unowned-merged-clean';
+  const dirty = 'self-impl/unowned-merged-dirty';
+  const unowned = () => ({ owner: 'not-recorded', command: 'not-recorded', createdAt: 'not-recorded' });
+  const runWith = (removal: 'none' | 'success' | 'fail'): GitRunner => (args) => {
+    const command = args.join(' ');
+    if (command.includes('worktree list')) return { status: 0, stdout: [
+      `worktree /wt/${clean}`, `branch refs/heads/${clean}`, '',
+      `worktree /wt/${dirty}`, `branch refs/heads/${dirty}`, '',
+    ].join('\n'), stderr: '' };
+    if (command.includes('branch --list')) return { status: 0, stdout: `${clean}\n${dirty}\n`, stderr: '' };
+    if (args[0] === 'for-each-ref') return { status: 0, stdout: `${clean} 0 0\n${dirty} 0 0\n`, stderr: '' };
+    if (args.includes('rev-list')) return { status: 0, stdout: '0\n', stderr: '' };
+    if (args.includes('status') && args.includes('--porcelain')) return {
+      status: 0, stdout: args.includes(`/wt/${dirty}`) ? ' M dirty.txt\n' : '', stderr: '',
+    };
+    if (args.includes('diff')) return { status: 0, stdout: '', stderr: '' };
+    if (args[0] === 'worktree' && args[1] === 'remove') return {
+      status: removal === 'fail' ? 1 : 0, stdout: removal === 'fail' ? 'remove denied' : '', stderr: '',
+    };
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  const mergedPr = () => ({ status: 0, stdout: JSON.stringify({ data: { repository: {
+    b0: { nodes: [{ state: 'MERGED', mergedAt: '2026-09-13T00:00:00Z' }] },
+    b1: { nodes: [{ state: 'MERGED', mergedAt: '2026-09-13T00:00:00Z' }] },
+  } } }) });
+
+  it('실제 assessWorktree로 미소유 merged-clean만 계획하고 dirty는 보존한다', () => {
+    const result = execHarnessClean({
+      mode: 'merged', dryRun: true, includeUnownedMergedClean: true, branchPrefix: 'self-impl/',
+      run: runWith('none'), runGh: mergedPr, readWorktreeProvenance: unowned,
+      activeDirectoryProvider: () => ({ ok: true, value: [] }),
+    });
+    expect(result.plan.remove).toEqual([expect.objectContaining({ branch: clean, path: `/wt/${clean}`,
+      reason: expect.stringContaining('assessment=reclaim-safe:merged-clean') })]);
+    expect(result.plan.preserve).toEqual([expect.objectContaining({ branch: dirty,
+      reason: expect.stringContaining('assessment=needs-human:merged-but-dirty') })]);
+    expect(result.removed).toEqual([]);
+    const summary = renderHarnessCleanReport(result, 'merged').find((line) => line.startsWith('규모 '));
+    expect(summary).toContain('미소유 merged-clean 제거 예정 1');
+    expect(summary).not.toContain('미소유 merged-clean 회수');
+  });
+
+  it('실제 제거 성공만 회수 수로 세고 제거 실패는 0으로 남긴다', () => {
+    for (const removal of ['success', 'fail'] as const) {
+      const result = execHarnessClean({
+        mode: 'merged', dryRun: false, includeUnownedMergedClean: true, branchPrefix: 'self-impl/',
+        run: runWith(removal), runGh: mergedPr, readWorktreeProvenance: unowned,
+        activeDirectoryProvider: () => ({ ok: true, value: [] }),
+      });
+      expect(result.plan.remove.map((item) => item.branch)).toEqual([clean]);
+      expect(result.plan.preserve.map((item) => item.branch)).toEqual([dirty]);
+      expect(result.removed).toHaveLength(removal === 'success' ? 1 : 0);
+      expect(result.failed).toHaveLength(removal === 'fail' ? 1 : 0);
+      const summary = renderHarnessCleanReport(result, 'merged').find((line) => line.startsWith('규모 '));
+      if (removal === 'success') expect(summary).toContain('미소유 merged-clean 회수 1');
+      else expect(summary).toContain('미소유 merged-clean 회수 0');
+    }
+  });
+
+  it('옵트인 없음은 미소유 merged-clean을 기본 보존한다', () => {
+    const run: GitRunner = (args) => {
+      const command = args.join(' ');
+      if (command.includes('worktree list')) return { status: 0, stdout: `worktree /wt/${clean}\nbranch refs/heads/${clean}\n`, stderr: '' };
+      if (command.includes('branch --list')) return { status: 0, stdout: `${clean}\n`, stderr: '' };
+      if (args[0] === 'for-each-ref') return { status: 0, stdout: `${clean} 0 0\n`, stderr: '' };
+      if (command.includes('rev-list')) return { status: 0, stdout: '0\n', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const result = execHarnessClean({
+      mode: 'merged', dryRun: true, branchPrefix: 'self-impl/', run,
+      runGh: () => ({ status: 0, stdout: JSON.stringify({ data: { repository: { b0: { nodes: [{ state: 'MERGED', mergedAt: '2026-09-13T00:00:00Z' }] } } } }) }),
+      readWorktreeProvenance: unowned,
+      assessWorktree: (input) => ({ ...input, disposition: 'reclaim-safe', reason: 'merged-clean', hasOutput: false }),
+      activeDirectoryProvider: () => ({ ok: true, value: [] }),
+    });
+    expect(result.plan.remove).toEqual([]);
+    expect(result.plan.preserve.map((item) => item.branch)).toEqual([clean]);
+    const summary = renderHarnessCleanReport(result, 'merged').find((line) => line.startsWith('규모 '));
+    expect(summary).not.toContain('미소유 merged-clean');
   });
 });
 

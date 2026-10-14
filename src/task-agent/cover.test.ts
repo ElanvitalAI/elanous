@@ -1,5 +1,11 @@
 import { expect, test } from 'bun:test';
-import { formatLandingThroughput, formatSevenVerbLive, formatTaskAgentCover, measureLandingThroughput, measureSevenVerbLive, measureTaskAgentCover } from './cover.js';
+import { formatLandingThroughput, formatSevenVerbLive, formatTaskAgentCover,
+  measureLandingThroughput as rawLandingThroughput, measureSevenVerbLive as rawSevenVerbLive,
+  measureTaskAgentCover as rawTaskAgentCover, type TaskAgentCoverInput } from './cover.js';
+
+const measureLandingThroughput = (input: TaskAgentCoverInput) => rawLandingThroughput({ liveLandMoves: [], ...input });
+const measureSevenVerbLive = (input: TaskAgentCoverInput) => rawSevenVerbLive({ liveLandMoves: [], ...input });
+const measureTaskAgentCover = (input: TaskAgentCoverInput) => rawTaskAgentCover({ liveLandMoves: [], ...input });
 
 test('daily landing funnel reproduces the 10-08 launch, card PR, and TASK-AGENT landing formula', () => {
   const row = measureLandingThroughput({
@@ -44,7 +50,7 @@ test('failure distribution maps failed actions once and keeps unreadable sources
 test('four successful merges and one TASK-AGENT land yield a measured quarter', () => {
   const rows = measureTaskAgentCover({
     taskAgentActions: [
-      { kind: 'land', result: 'done' }, { kind: 'review', result: 'done' },
+      { kind: 'land', result: 'done', taskId: 'ta-land' }, { kind: 'review', result: 'done' },
       { kind: 'review', result: 'done' }, { kind: 'retry', result: 'shadow' },
     ],
     allLands: [
@@ -56,6 +62,31 @@ test('four successful merges and one TASK-AGENT land yield a measured quarter', 
   expect(rows[1]).toMatchObject({ verb: 'review', byTaskAgent: 2, total: null, observedActions: 2, ratio: null, state: 'no-denominator', liveActions: 2, shadowActions: 0, stewardTransition: 'unmeasured' });
   expect(rows[2]).toMatchObject({ verb: 'retry', byTaskAgent: 0, total: null, observedActions: 1, ratio: null, state: 'no-denominator', liveActions: 0, shadowActions: 1, stewardTransition: 'unmeasured' });
   expect(rows[3]).toMatchObject({ verb: 'green', byTaskAgent: 0, total: null, observedActions: 0, ratio: null, state: 'no-denominator', liveActions: 0, shadowActions: 0, stewardTransition: 'unmeasured' });
+});
+
+test('actual live land success is counted once with legacy action, while skipped and failed moves are excluded', () => {
+  const input = {
+    taskAgentActions: [{ kind: 'land' as const, result: 'done', taskId: 'ta-old' }],
+    liveLandMoves: [
+      { card: 'ta-old', executed: true, ok: true },
+      { card: 'ta-new', executed: true, ok: true },
+      { card: 'ta-new', executed: true, ok: true },
+      { card: 'ta-skip', executed: false, ok: true },
+      { card: 'ta-fail', executed: true, ok: false },
+    ],
+    allLands: Array.from({ length: 4 }, () => ({ step: 'merge', ok: true })),
+  };
+  expect(measureTaskAgentCover(input)[0]).toMatchObject({ byTaskAgent: 2, total: 4, ratio: 0.5 });
+  expect(measureLandingThroughput(input).taskAgentLandings).toBe(2);
+  expect(measureTaskAgentCover({ ...input, liveLandMoves: null })[0]).toMatchObject({ byTaskAgent: null, state: 'unreadable' });
+  const landUnreadable = measureSevenVerbLive({ ...input, liveLandMoves: null, goalAsks: [], goalRuns: [] });
+  expect(formatSevenVerbLive(landUnreadable)).toBe('7동사 live -/7 · 못 잼(착지 원장 null·절단) · 출처 없음 구현·정리');
+  expect(rawTaskAgentCover({ taskAgentActions: input.taskAgentActions, allLands: input.allLands })[0])
+    .toMatchObject({ byTaskAgent: null, state: 'unreadable' });
+  expect(measureTaskAgentCover({ ...input, taskAgentActions: [{ kind: 'land', result: 'done' }] })[0])
+    .toMatchObject({ byTaskAgent: null, state: 'unreadable' });
+  expect(measureTaskAgentCover({ ...input, truncated: { taskAgentActions: false, allLands: false, liveLandMoves: true } })[0])
+    .toMatchObject({ byTaskAgent: null, state: 'unreadable' });
 });
 
 test('empty observed sources have no denominator, not a zero ratio; unreadable differs from empty', () => {
@@ -79,7 +110,7 @@ test('empty observed sources have no denominator, not a zero ratio; unreadable d
 
 test('a bounded source never yields a measured land ratio or an invented total', () => {
   const input = {
-    taskAgentActions: [{ kind: 'land' as const, result: 'done' }, { kind: 'review' as const, result: 'done' }],
+    taskAgentActions: [{ kind: 'land' as const, result: 'done', taskId: 'ta-land' }, { kind: 'review' as const, result: 'done' }],
     allLands: [{ step: 'merge', ok: true }, { step: 'merge', ok: true }],
   };
   const limitedLands = measureTaskAgentCover({ ...input, truncated: { taskAgentActions: false, allLands: true } });
@@ -101,7 +132,7 @@ test('failed live actions and shadow proposals are distinct from successful subs
 
 test('one-line formatter preserves measured and unknown denominators', () => {
   const rows = measureTaskAgentCover({
-    taskAgentActions: [{ kind: 'land', result: 'done' }, { kind: 'review', result: 'shadow' }],
+    taskAgentActions: [{ kind: 'land', result: 'done', taskId: 'ta-land' }, { kind: 'review', result: 'shadow' }],
     allLands: [{ step: 'merge', ok: true }, { step: 'merge', ok: true }],
   });
   expect(formatTaskAgentCover(rows[0]!)).toBe('land: TA 1/2 (50.0%) · live 1 · shadow 0 · steward-transition observed');
@@ -115,7 +146,7 @@ test('one-line formatter preserves measured and unknown denominators', () => {
 test('review and land done are live, retry shadow is shadow-only, and liveVerbs counts only live verbs', () => {
   const measured = measureSevenVerbLive({
     taskAgentActions: [
-      { kind: 'review', result: 'done' }, { kind: 'land', result: 'done' }, { kind: 'retry', result: 'shadow' },
+      { kind: 'review', result: 'done' }, { kind: 'land', result: 'done', taskId: 'ta-land' }, { kind: 'retry', result: 'shadow' },
     ],
     allLands: [], goalAsks: [], goalRuns: [],
   });
@@ -135,7 +166,7 @@ test('review and land done are live, retry shadow is shadow-only, and liveVerbs 
 
 test('구현·정리 remain no-source even when the four action verbs are live', () => {
   const measured = measureSevenVerbLive({
-    taskAgentActions: [{ kind: 'review', result: 'done' }, { kind: 'land', result: 'done' }, { kind: 'retry', result: 'done' }, { kind: 'green', result: 'done' }],
+    taskAgentActions: [{ kind: 'review', result: 'done' }, { kind: 'land', result: 'done', taskId: 'ta-land' }, { kind: 'retry', result: 'done' }, { kind: 'green', result: 'done' }],
     allLands: [], goalAsks: [], goalRuns: [],
   });
   expect(measured.verbs.filter((row) => row.state === 'no-source').map((row) => row.verb)).toEqual(['구현', '정리']);
@@ -163,7 +194,7 @@ test('null or truncated taskAgentActions marks every verb unreadable and liveVer
 
 test('authored goal joins a completed goal by id, not a dangling assigned id or failed goal', () => {
   const input = {
-    taskAgentActions: [{ kind: 'review' as const, result: 'done' }, { kind: 'land' as const, result: 'done' }, { kind: 'retry' as const, result: 'done' }, { kind: 'green' as const, result: 'done' }],
+    taskAgentActions: [{ kind: 'review' as const, result: 'done' }, { kind: 'land' as const, result: 'done', taskId: 'ta-land' }, { kind: 'retry' as const, result: 'done' }, { kind: 'green' as const, result: 'done' }],
     allLands: [],
     goalAsks: [
       { authorRunId: 'author-ok', goalId: 'goal-ok' }, { authorRunId: 'author-ok', goalId: 'goal-ok' },
@@ -211,4 +242,76 @@ test('card denominator: no cards is no-denominator, unreadable ledger is unreada
     .toMatchObject({ verb: 'review', byTaskAgent: null, total: null, ratio: null, state: 'unreadable', stewardTransition: 'unmeasured' });
   expect(measureTaskAgentCover({ taskAgentActions: null, allLands: [], taskCards: [{ id: 'c1' }] })[1])
     .toMatchObject({ byTaskAgent: null, total: null, state: 'unreadable' });
+});
+
+test('구현 counts card-bound runs whose own ledger recorded a successful merge, once per card', () => {
+  const bindings = [
+    { cardId: 'c-merged', runId: 'run-merged' },
+    { cardId: 'c-child', runId: 'run-parent', runChildId: 'run-child' },
+    { cardId: 'c-failed', runId: 'run-failed' },
+    { cardId: 'c-launched', runId: 'run-launched' },
+    { cardId: 'c-unbound', runId: null, runChildId: null },
+    { cardId: 'c-merged', runId: 'run-merged' },
+  ];
+  const merges = new Map([
+    ['run-merged', { merged: true }],
+    ['run-child', { merged: true }],
+    ['run-failed', { merged: false }],
+    ['run-unrelated', { merged: true }],
+  ]);
+  const measured = measureSevenVerbLive({
+    taskAgentActions: [], allLands: [], goalAsks: [], goalRuns: [],
+    implementCardRuns: bindings, implementRunMerges: merges,
+  });
+  expect(measured.verbs[5]).toEqual({ verb: '구현', source: 'card-run+merged', liveDone: 2, shadow: 0, state: 'live' });
+  expect(measured.liveVerbs).toBe(1);
+  expect(measured.measuredVerbs).toBe(6);
+  expect(formatSevenVerbLive(measured)).toBe('7동사 live 1/7 · 출처 없음 정리');
+  // 결합이 하나도 완료로 이어지지 않으면 none(0) — 실패·발사만·무관·묶이지 않은 런은 완료로 세지 않는다.
+  const none = measureSevenVerbLive({
+    taskAgentActions: [], allLands: [], goalAsks: [], goalRuns: [],
+    implementCardRuns: bindings.filter((binding) => binding.cardId !== 'c-merged' && binding.cardId !== 'c-child'),
+    implementRunMerges: merges,
+  });
+  expect(none.verbs[5]).toEqual({ verb: '구현', source: 'card-run+merged', liveDone: 0, shadow: 0, state: 'none' });
+  expect(none.liveVerbs).toBe(0);
+  // 카드 없음([])은 측정된 0 이지 못 잼이 아니다.
+  const empty = measureSevenVerbLive({
+    taskAgentActions: [], allLands: [], goalAsks: [], goalRuns: [],
+    implementCardRuns: [], implementRunMerges: new Map(),
+  });
+  expect(empty.verbs[5]).toEqual({ verb: '구현', source: 'card-run+merged', liveDone: 0, shadow: 0, state: 'none' });
+});
+
+test('구현 stays no-source unwired, and unreadable card or merge ledgers never read as zero', () => {
+  // 배선 없음(기본) — 종전 계약 그대로 no-source.
+  const unwired = measureSevenVerbLive({ taskAgentActions: [], allLands: [], goalAsks: [], goalRuns: [] });
+  expect(unwired.verbs[5]).toEqual({ verb: '구현', source: null, liveDone: null, shadow: null, state: 'no-source' });
+  expect(unwired.measuredVerbs).toBe(5);
+  expect(formatSevenVerbLive(unwired)).toBe('7동사 live 0/7 · 출처 없음 구현·정리');
+  const merges = new Map([['run-merged', { merged: true }]]);
+  for (const patch of [
+    { implementCardRuns: null, implementRunMerges: merges },
+    { implementCardRuns: [{ cardId: 'c-merged', runId: 'run-merged' }], implementRunMerges: null },
+    { implementCardRuns: [{ cardId: 'c-merged', runId: 'run-merged' }], implementRunMerges: new Map(), truncated: { taskAgentActions: false, allLands: false, implementRunMerges: true } },
+  ]) {
+    const unknown = measureSevenVerbLive({ taskAgentActions: [], allLands: [], goalAsks: [], goalRuns: [], ...patch });
+    expect(unknown.verbs[5]).toEqual({ verb: '구현', source: 'card-run+merged', liveDone: null, shadow: null, state: 'unreadable' });
+    expect(unknown.liveVerbs).toBeNull();
+    expect(formatSevenVerbLive(unknown)).toBe('7동사 live -/7 · 못 잼(구현 카드·런 원장 null·절단) · 출처 없음 정리');
+  }
+  // 한 심만 주어지면 다른 심은 null — 전체는 unreadable.
+  const halfWired = measureSevenVerbLive({
+    taskAgentActions: [], allLands: [], goalAsks: [], goalRuns: [],
+    implementCardRuns: [{ cardId: 'c-merged', runId: 'run-merged' }],
+  });
+  expect(halfWired.verbs[5]).toMatchObject({ source: 'card-run+merged', liveDone: null, state: 'unreadable' });
+  expect(halfWired.liveVerbs).toBeNull();
+  const multipleFailures = measureSevenVerbLive({
+    taskAgentActions: null, allLands: null, goalAsks: null, goalRuns: null,
+    implementCardRuns: null, implementRunMerges: null,
+  });
+  expect(formatSevenVerbLive(multipleFailures)).toBe(
+    '7동사 live -/7 · 못 잼(행동·저작·골·구현 카드·런 원장 null·절단) · 출처 없음 정리',
+  );
 });

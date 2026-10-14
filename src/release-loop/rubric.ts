@@ -99,6 +99,76 @@ export function rubricPriority(text: string): ReturnType<typeof rubricGrade> {
   return rubric ? rubricGrade(rubricScore(rubric)) : 'P2';
 }
 
+// Rubric v2 — first slice: the formula only (line parsing and v1/v2 output are later slots).
+
+/** v2 value axes (L U F O R T M, each 0..3); Z divides the total, X subtracts from it. */
+export const RUBRIC_V2_VALUE_AXES = ['L', 'U', 'F', 'O', 'R', 'T', 'M'] as const;
+export const RUBRIC_V2_Z_CHOICES: readonly number[] = [1, 2, 4, 8];
+const V2_AXIS_KEYS = new Set<string>([...RUBRIC_V2_VALUE_AXES, 'Z', 'X']);
+
+/** Rubric v2 values: L U F O R T M each 0..3, Z ∈ {1,2,4,8}, X 0..3. */
+export interface RubricV2 {
+  L: number;
+  U: number;
+  F: number;
+  O: number;
+  R: number;
+  T: number;
+  M: number;
+  Z: number;
+  X: number;
+}
+
+/** The F weight is 2 through 2026-10-28 and 1 from 2026-10-29 on; asOf must retain its original date text. */
+export const RUBRIC_V2_F_CUTOVER_DAY = '2026-10-29';
+
+export function rubricV2FWeight(asOf: string): 2 | 1 {
+  const invalid = () => new Error(`루브릭 v2 기준 날짜가 잘못되었다: ${String(asOf)}`);
+  // A Date may already have normalized an impossible calendar day before this call.
+  if (typeof asOf !== 'string') throw invalid();
+  const parts = /^(\d{4}|[1-9]\d{4,5}|[+-]\d{6})-(\d{2})-(\d{2})(?:$|T)/.exec(asOf);
+  if (!parts) throw invalid();
+  const year = Number(parts[1]);
+  const month = Number(parts[2]);
+  const day = Number(parts[3]);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  if (!daysInMonth || day < 1 || day > daysInMonth) throw invalid();
+  const date = new Date(asOf);
+  if (Number.isNaN(date.getTime())) throw invalid();
+  return date.getTime() >= Date.parse(`${RUBRIC_V2_F_CUTOVER_DAY}T00:00:00.000Z`) ? 1 : 2;
+}
+
+/** V = 2L + 2U + wF + 1.5O + 1.5R + 1.5T + M (w = rubricV2FWeight), 점수 = V / Z − 0.5X. */
+export function rubricScoreV2(values: RubricV2, asOf: string): number {
+  if (values === null || typeof values !== 'object' || Array.isArray(values)) throw new Error('루브릭 v2 값이 축 객체가 아니다');
+  const given = values as unknown as Record<string, unknown>;
+  for (const key of Object.keys(given)) {
+    if (!V2_AXIS_KEYS.has(key)) throw new Error(`루브릭 v2 알 수 없는 축: ${key}`);
+  }
+  const readAxis = (axis: (typeof RUBRIC_V2_VALUE_AXES)[number]): number => {
+    const value = given[axis];
+    if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`루브릭 v2 축 ${axis} 값이 없다`);
+    if (value < 0 || value > 3) throw new Error(`루브릭 v2 축 ${axis} 값이 0~3 밖이다: ${value}`);
+    return value;
+  };
+  const L = readAxis('L');
+  const U = readAxis('U');
+  const F = readAxis('F');
+  const O = readAxis('O');
+  const R = readAxis('R');
+  const T = readAxis('T');
+  const M = readAxis('M');
+  const Z = given.Z;
+  if (typeof Z !== 'number' || !Number.isFinite(Z)) throw new Error('루브릭 v2 크기 Z 값이 없다');
+  if (!RUBRIC_V2_Z_CHOICES.includes(Z)) throw new Error(`루브릭 v2 크기 Z 값이 1·2·4·8 밖이다: ${Z}`);
+  const X = given.X;
+  if (typeof X !== 'number' || !Number.isFinite(X)) throw new Error('루브릭 v2 위험 X 값이 없다');
+  if (X < 0 || X > 3) throw new Error(`루브릭 v2 위험 X 값이 0~3 밖이다: ${X}`);
+  const w = rubricV2FWeight(asOf);
+  return (2 * L + 2 * U + w * F + 1.5 * O + 1.5 * R + 1.5 * T + M) / Z - 0.5 * X;
+}
+
 /** Inspect an existing checklist without initializing, importing, or migrating its ledger. */
 export function readRubricItems(version: string, ledgerRoot: string): Pick<ChecklistItem, 'id' | 'title' | 'evidence' | 'priority'>[] {
   const dbPath = join(ledgerRoot, 'release', 'features.sqlite');

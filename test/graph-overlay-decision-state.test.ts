@@ -104,5 +104,6 @@ it('⛔ 어휘 밖 상태 키는 «값은 안 싣되 이름은 남긴다» — �
   // ⛔ 목록 «안»의 키만 왔으면 그 필드가 아예 «없다» — 「빈 배열」과 「안 잼」을 섞지 않는다
   expect(overlayDecisionObservation({ state: { goal_id: 'g' } }).stateExtraKeys).toBeUndefined();
   // ⭐ 어휘 자체가 한 자리에 산다 — 실행기가 주는 키가 여기서 갈린다
-  expect([...OVERLAY_STATE_KEYS]).toEqual(['attempts', 'goal_id']);
+  //    (GRAPH-AUTHOR-GRADE: author_grade 가 어휘에 더해졌다 — 아직 실행기가 싣지 않는다)
+  expect([...OVERLAY_STATE_KEYS]).toEqual(['attempts', 'author_grade', 'goal_id']);
 });

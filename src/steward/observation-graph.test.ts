@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parse, stringify } from 'yaml';
@@ -14,7 +14,7 @@ const issues = [
 ];
 
 async function command(args: string[], cwd: string): Promise<{ code: number; stdout: string; stderr: string }> {
-  const child = Bun.spawn(args, { cwd, env: { ...process.env, NODE_ENV: 'development' }, stdout: 'pipe', stderr: 'pipe' });
+  const child = Bun.spawn(args, { cwd, env: { ...process.env, NODE_ENV: 'development', XDG_CONFIG_HOME: join(cwd, 'xdg'), PATH: `${cwd}:${process.env.PATH ?? ''}` }, stdout: 'pipe', stderr: 'pipe' });
   const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
   return { code, stdout, stderr };
 }
@@ -22,6 +22,8 @@ async function command(args: string[], cwd: string): Promise<{ code: number; std
 test('spawned steward graph and node scripts store decision rows in isolated logs.db for CLI lookup', async () => {
   const root = mkdtempSync(join(tmpdir(), 'steward-graph-logs-'));
   try {
+    writeFileSync(join(root, 'pgrep'), '#!/bin/sh\nexit 1\n');
+    chmodSync(join(root, 'pgrep'), 0o755);
     const dir = join(root, 'graphs', 'steward');
     mkdirSync(dir, { recursive: true });
     symlinkSync(join(repo, 'src'), join(root, 'src'));
@@ -46,46 +48,77 @@ globalThis.fetch = async (_url, init) => {
 const outbound = await import(${JSON.stringify(join(repo, 'src/domains/outbound-alert.ts'))});
 mock.module(${JSON.stringify(join(repo, 'src/domains/outbound-alert.ts'))}, () => ({ ...outbound, deliver: () => true }));
 `);
-    // TA-REJUDGE-PERIODIC — the rejudge node runs as installed (no config in the isolated universe → disabled, no rejudge).
-    expect(installed.nodes[0]?.node_id === 'rejudge' && recipes['steward-rejudge']?.command).toContain('src/steward/rejudge-tick.ts');
-    writeFileSync(join(dir, 'recipes.yaml'), stringify({ 'steward-rejudge': recipes['steward-rejudge'], ...Object.fromEntries(stages.map(name => [
+    // Run both installed tick entrypoints. Stub only the remote resync call and rejudge config in their child processes.
+    expect(installed.nodes[0]?.node_id === 'resync' && recipes['steward-resync']?.command).toContain('src/steward/resync-tick.ts');
+    expect(installed.nodes[1]?.node_id === 'rejudge' && recipes['steward-rejudge']?.command).toContain('src/steward/rejudge-tick.ts');
+    const resyncPreload = join(root, 'resync-preload.ts');
+    writeFileSync(resyncPreload, `import { mock } from 'bun:test';
+const hqSeats = await import(${JSON.stringify(join(repo, 'src/hq/seats.ts'))});
+mock.module(${JSON.stringify(join(repo, 'src/hq/seats.ts'))}, () => ({ ...hqSeats, resolveHqLaunchSeat: () => ${JSON.stringify(repo)} }));
+mock.module(${JSON.stringify(join(repo, 'src/release-loop/release-schedule.ts'))}, () => ({ listSchedules: () => [{ cutAt: new Date(Date.now() + 3_600_000).toISOString(), publishAt: new Date(Date.now() + 7_200_000).toISOString() }] }));
+mock.module(${JSON.stringify(join(repo, 'src/loops/orchestrator/resync-shadow.ts'))}, () => ({
+  runResyncShadow: async () => ({ candidates: 1, tried: 1, saved: 1, savedRatio: 1 }),
+}));
+`);
+    const rejudgePreload = join(root, 'rejudge-preload.ts');
+    writeFileSync(rejudgePreload, `import { mock } from 'bun:test';
+import { EventEmitter } from 'node:events';
+mock.module(${JSON.stringify(join(repo, 'src/instance/spawn-elanous.ts'))}, () => ({ spawnElanous: () => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = () => {};
+  queueMicrotask(() => { child.stdout.emit('data', '[]\\n'); child.emit('close', 0); });
+  return child;
+} }));
+`);
+    writeFileSync(join(dir, 'recipes.yaml'), stringify({
+      'steward-resync': { ...recipes['steward-resync'], command: `bun --preload ${JSON.stringify(resyncPreload)} ${recipes['steward-resync']!.command.slice(4)}` },
+      'steward-rejudge': { ...recipes['steward-rejudge'], command: `bun --preload ${JSON.stringify(rejudgePreload)} ${recipes['steward-rejudge']!.command.slice(4)}` }, ...Object.fromEntries(stages.map(name => [
       `steward-${name}`, { ...recipes[`steward-${name}`], command: `bun --preload ${JSON.stringify(preload)} ${recipes[`steward-${name}`]!.command.slice(4)}` },
     ])) }));
     const isolated = join(root, '.elanous-test');
+    mkdirSync(join(root, 'xdg', 'elanous'), { recursive: true });
+    writeFileSync(join(root, 'xdg', 'elanous', 'config.json'), JSON.stringify({ taskAgent: { rejudgeEveryMinutes: 30, rejudgeMaxLoad: 1000 } }));
     const stateDir = join(isolated, 'steward');
     mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, 'rejudge-tick.json'), JSON.stringify({ startedAt: new Date().toISOString() }));
     writeFileSync(join(stateDir, 'triage.json'), JSON.stringify([{ issue: issues[0]!.identifier, rung: 4, dependsOn: [], priority: 1,
       why: 'cached', inputHash: triageInputHash(issues[0]!, issues) }]));
+    const startedAt = new Date().toISOString();
     const run = await command(['bun', cli, `--test=${isolated}`, 'graph', 'run', join(dir, 'steward.yaml'), '--json'], root);
     expect(run.code, `${run.stderr}\n${run.stdout}`).toBe(0);
     const result = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { status: string; path: string[] };
     expect(result.status).toBe('done');
-    expect(result.path).toEqual(['rejudge', 'sync', 'triage', 'schedule', 'report', 'done']);
+    expect(result.path).toEqual(['resync', 'rejudge', 'sync', 'triage', 'schedule', 'report', 'done']);
     expect(existsSync(join(isolated, 'logs', 'logs.db')), run.stdout).toBe(true);
-    const tickLookup = await command(['bun', cli, `--test=${isolated}`, 'logs', '--category', 'loop.steward', '--event', 'decision', '--json', '--json-data', '--limit', '20'], root);
+    const resyncLookup = await command(['bun', cli, `--test=${isolated}`, 'logs', '--category', 'loop.steward', '--event', 'resync-tick', '--since', startedAt, '--json', '--json-data', '--limit', '20'], root);
+    expect(resyncLookup.code, `${resyncLookup.stderr}\n${resyncLookup.stdout}`).toBe(0);
+    expect(resyncLookup.stdout.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line) as { event?: string; data?: { decision?: string; summary?: { saved?: number } } })
+      .filter(row => row.event === 'resync-tick').map(row => [row.data?.decision, row.data?.summary?.saved])).toEqual([['ran', 1]]);
+    const tickLookup = await command(['bun', cli, `--test=${isolated}`, 'logs', '--category', 'loop.steward', '--event', 'decision', '--since', startedAt, '--json', '--json-data', '--limit', '20'], root);
     expect(tickLookup.code, `${tickLookup.stderr}\n${tickLookup.stdout}`).toBe(0);
     const tickRows = tickLookup.stdout.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line) as { category?: string; event?: string; data?: { verdict: string; reason: string; goalId?: string } });
-    expect(tickRows.filter(row => row.category === 'loop.steward' && row.event === 'decision').map(row => [row.data?.verdict, row.data?.reason, row.data?.goalId])).toEqual([
-      ['reported', 'daily digest sent', undefined],
-    ]);
-    const rejudgeLookup = await command(['bun', cli, `--test=${isolated}`, 'logs', '--category', 'loop.steward', '--event', 'rejudge-tick', '--json', '--json-data', '--limit', '20'], root);
+    expect(tickRows.filter(row => row.category === 'loop.steward' && row.event === 'decision').map(row => [row.data?.verdict, row.data?.reason, row.data?.goalId]))
+      .toContainEqual(['reported', 'daily digest sent', undefined]);
+    const rejudgeLookup = await command(['bun', cli, `--test=${isolated}`, 'logs', '--category', 'loop.steward', '--event', 'rejudge-tick', '--since', startedAt, '--json', '--json-data', '--limit', '20'], root);
     expect(rejudgeLookup.code, `${rejudgeLookup.stderr}\n${rejudgeLookup.stdout}`).toBe(0);
-    expect(rejudgeLookup.stdout.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line) as { event?: string; data?: { decision?: string } })
-      .filter(row => row.event === 'rejudge-tick').map(row => row.data?.decision)).toEqual(['disabled']);
-    const lookup = await command(['bun', cli, `--test=${isolated}`, 'logs', '--category', 'steward.', '--event', 'decision', '--json', '--json-data', '--limit', '20'], root);
+    const rejudgeDecisions = rejudgeLookup.stdout.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line) as { event?: string; data?: { decision?: string } })
+      .filter(row => row.event === 'rejudge-tick').map(row => row.data?.decision);
+    expect(rejudgeDecisions.length, rejudgeLookup.stdout + rejudgeLookup.stderr + run.stdout + run.stderr).toBeGreaterThan(0);
+    expect(rejudgeDecisions).toEqual(['ran']);
+    const lookup = await command(['bun', cli, `--test=${isolated}`, 'logs', '--category', 'steward.', '--event', 'decision', '--since', startedAt, '--json', '--json-data', '--limit', '20'], root);
     expect(lookup.code, `${lookup.stderr}\n${lookup.stdout}`).toBe(0);
     const records = lookup.stdout.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line) as { category?: string; event?: string; data?: { kind: string; target: string; wouldAct: boolean } });
-    const decisions = records.filter(row => row.event === 'decision');
+    const decisions = records.filter(row => row.event === 'decision' && ['ELA-81', 'ELA-82'].includes(row.data?.target ?? ''));
     expect(decisions.map(row => [row.category, row.data?.kind, row.data?.target, row.data?.wouldAct]).sort()).toEqual([
       ['steward.triage', '0', 'ELA-82', false],
       ['steward.schedule', 'now', 'ELA-81', false],
       ['steward.schedule', 'wait', 'ELA-82', false],
     ].sort());
-    const triageLookup = await command(['bun', cli, `--test=${isolated}`, 'logs', '--category', 'steward.triage', '--event', 'decision', '--json', '--json-data', '--limit', '20'], root);
+    const triageLookup = await command(['bun', cli, `--test=${isolated}`, 'logs', '--category', 'steward.triage', '--event', 'decision', '--since', startedAt, '--json', '--json-data', '--limit', '20'], root);
     expect(triageLookup.code, `${triageLookup.stderr}\n${triageLookup.stdout}`).toBe(0);
     const triageRows = triageLookup.stdout.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line) as { category?: string; event?: string });
     expect(triageRows.filter(row => row.category === 'steward.triage' && row.event === 'decision')).toHaveLength(1);
-    const distribution = await command(['bun', cli, `--test=${isolated}`, 'logs', 'fields', '--exact-category', 'steward.triage', '--event', 'decision', '--values', '10'], root);
+    const distribution = await command(['bun', cli, `--test=${isolated}`, 'logs', 'fields', '--exact-category', 'steward.triage', '--event', 'decision', '--since', startedAt, '--values', '10'], root);
     expect(distribution.code, `${distribution.stderr}\n${distribution.stdout}`).toBe(0);
     const fields = distribution.stdout.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line) as { category?: string; event?: string; field?: string; total?: number; values?: Array<{ value: string; n: number }> });
     expect(fields.find(row => row.category === 'steward.triage' && row.event === 'decision' && row.field === 'kind')).toMatchObject({ total: 1, values: [{ value: '0', n: 1 }] });

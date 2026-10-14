@@ -299,9 +299,20 @@ export function addItem(v: string, input: { id: string; title: string; refs?: st
 }
 
 export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; refs?: string[]; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; dispatchKind?: ChecklistDispatchKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean | null }, by: string): Checklist {
+  return setItemGuarded(v, id, patch, by);
+}
+
+/** Apply a measured verdict only while the release cell is still the snapshot that was judged. */
+export function setItemIfSnapshot(v: string, id: string, patch: Parameters<typeof setItem>[2], by: string, expected: Pick<ChecklistItem, 'title' | 'status' | 'evidence'>): Checklist {
+  return setItemGuarded(v, id, patch, by, expected);
+}
+
+function setItemGuarded(v: string, id: string, patch: Parameters<typeof setItem>[2], by: string, expected?: Pick<ChecklistItem, 'title' | 'status' | 'evidence'>): Checklist {
   return mutate(v, (data, otherItems) => {
     const item = data.items.find((i) => i.id === id);
     if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
+    if (expected && (item.title !== expected.title || item.status !== expected.status || item.evidence !== expected.evidence))
+      throw new CliUserError(`판정 중 칸 변경: ${id}`, '현재 칸으로 다시 측정한다');
     if (patch.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(patch.status)) throw new CliUserError(`잘못된 상태: ${patch.status}`);
     if (patch.disposition !== undefined && !['move', 'known-issue', 'block'].includes(patch.disposition)) throw new CliUserError(`잘못된 처분: ${patch.disposition}`);
     if (patch.kind !== undefined && !CHECKLIST_KINDS.includes(patch.kind)) throw new CliUserError(`잘못된 종류: ${patch.kind}`, 'screen|postpub');

@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runGate } from '../../scripts/ci-typecheck-changed.js';
+import { resolveTscScript, runGate } from '../../scripts/ci-typecheck-changed.js';
 import { runMockModuleRestoreGate } from '../../scripts/ci-mock-module-restore-gate.js';
 
 function git(cwd: string, args: string[]): void {
@@ -15,6 +15,9 @@ function git(cwd: string, args: string[]): void {
 /** A repo whose only change since the root commit is a markdown file — zero .ts. */
 function docsOnlyTree(): { dir: string; base: string; head: string } {
   const dir = mkdtempSync(join(tmpdir(), 'prland-cwd-'));
+  // A changed TypeScript file now requires declarations in the selected tree,
+  // even when this test injects the compiler result.
+  mkdirSync(join(dir, 'node_modules', 'bun-types'), { recursive: true });
   git(dir, ['init', '-q', '-b', 'main']);
   git(dir, ['config', 'user.email', 'prland-cwd@example.com']);
   git(dir, ['config', 'user.name', 'prland-cwd']);
@@ -61,6 +64,60 @@ test('tsc gate on --cwd docs-only tree reports base≠head, zero changed .ts, an
   expect(summary).toContain('변경 .ts 0개');
   expect(lines.some((line) => line.startsWith('[tsc-gate] PASS'))).toBe(true);
   expect(code).toBe(0);
+});
+
+test('tsc gate reads a changed TypeScript file from --cwd even when launched from another tree', () => {
+  const { dir } = docsOnlyTree();
+  mkdirSync(join(dir, 'src'), { recursive: true });
+  writeFileSync(join(dir, 'src/model.ts'), 'export const targetOnly = 1;\n');
+  git(dir, ['add', 'src/model.ts']);
+  git(dir, ['commit', '-q', '-m', 'target TypeScript']);
+  let tscRuns = 0;
+  const { lines, code } = capture((log, error, exit) => runGate({
+    cwd: dir, log, warn: error, error, exit,
+    runTscCmd: () => { tscRuns++; return { ran: true, out: '' }; },
+  }));
+  expect(code).toBe(0);
+  expect(tscRuns).toBeGreaterThan(0);
+  expect(lines.join('\n')).toContain('변경 .ts 1개 관측');
+  expect(lines.some((line) => line.startsWith('[tsc-gate] PASS'))).toBe(true);
+});
+
+test('literal reference scan stays inside --cwd and reports the target tree consumer', () => {
+  const { dir } = docsOnlyTree();
+  mkdirSync(join(dir, 'src'), { recursive: true });
+  writeFileSync(join(dir, 'src/producer.ts'), "export type Outcome = 'observed' | 'plan-staged';\n");
+  writeFileSync(join(dir, 'src/consumer.ts'), "const outcome = 'plan-staged';\n");
+  git(dir, ['add', 'src']);
+  git(dir, ['commit', '-q', '-m', 'baseline TypeScript']);
+  git(dir, ['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+  writeFileSync(join(dir, 'src/producer.ts'), "export type Outcome = 'observed';\n");
+  git(dir, ['add', 'src/producer.ts']);
+  git(dir, ['commit', '-q', '-m', 'remove literal']);
+  const { lines, code } = capture((log, error, exit) => runGate({
+    cwd: dir, log, warn: error, error, exit,
+    runTscCmd: () => ({ ran: true, out: '' }),
+  }));
+  expect(code).toBe(0);
+  expect(lines.join('\n')).toContain("src/consumer.ts:1: Outcome -= 'plan-staged'");
+});
+
+test('tsc gate fails explicitly when no target or installed compiler exists', () => {
+  const { dir } = docsOnlyTree();
+  mkdirSync(join(dir, 'src'), { recursive: true });
+  writeFileSync(join(dir, 'src/model.ts'), 'export const targetOnly = 1;\n');
+  git(dir, ['add', 'src/model.ts']);
+  git(dir, ['commit', '-q', '-m', 'target TypeScript']);
+  let tscRuns = 0;
+  const { lines, code } = capture((log, error, exit) => runGate({
+    cwd: dir, log, warn: error, error, exit,
+    resolveTscScript: (cwd) => resolveTscScript(cwd, join(dir, 'fake-cli/scripts')),
+    runTscCmd: () => { tscRuns++; return { ran: true, out: '' }; },
+  }));
+  expect(code).toBe(1);
+  expect(tscRuns).toBe(0);
+  expect(lines.join('\n')).toContain('bun install --frozen-lockfile');
+  expect(lines.at(-1)).toContain('FAIL');
 });
 
 test('dropping cwd makes the same docs-only tree fail as base==HEAD (could not count)', () => {

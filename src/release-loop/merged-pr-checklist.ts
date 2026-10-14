@@ -7,21 +7,25 @@ import { listChecklist, setItem } from './checklist.js';
 import { judgeLandedCell } from './landed-to-green.js';
 import { evidencePlan, landedButYellow, type MergedChecklistPr } from './landed-but-yellow.js';
 import { assignedVersions, evidenceAdd } from './feature-store.js';
+import { boundMergedTaskCells, candidateMergedTaskCells, closeMergedTaskCard } from '../task-agent/postland-card.js';
 
 export interface MergedPrChecklistDeps {
-  readPr?: (number: number, cwd: string) => { state: string; baseRefName: string; title: string; body: string | null; mergedAt: string };
+  readPr?: (number: number, cwd: string) => { state: string; baseRefName: string; title: string; body: string | null; mergedAt: string; url?: string; headRefOid?: string; files?: Array<{ path: string }> };
   versions?: () => string[];
   checklist?: typeof listChecklist;
   addEvidence?: typeof evidenceAdd;
   setStatus?: typeof setItem;
   judgeLanded?: typeof judgeLandedCell;
+  closeTaskCard?: typeof closeMergedTaskCard;
+  boundTaskCells?: typeof boundMergedTaskCells;
+  candidateTaskCells?: typeof candidateMergedTaskCells;
   log?: typeof debug.log;
 }
 
 /** A confirmed main merge is the only entry. The existing checklist matcher owns PR-to-cell decisions. */
 export function syncMergedPrChecklist(number: number, cwd: string, goalFile?: string, deps: MergedPrChecklistDeps = {}): void {
   const log = deps.log ?? debug.log.bind(debug);
-  const pr = (deps.readPr ?? ((n, dir) => JSON.parse(execFileSync('gh', ['pr', 'view', String(n), '--json', 'state,baseRefName,title,body,mergedAt'], { cwd: dir, encoding: 'utf8', timeout: 30_000 })) as ReturnType<NonNullable<MergedPrChecklistDeps['readPr']>>))(number, cwd);
+  const pr = (deps.readPr ?? ((n, dir) => JSON.parse(execFileSync('gh', ['pr', 'view', String(n), '--json', 'state,baseRefName,title,body,mergedAt,url,headRefOid,files'], { cwd: dir, encoding: 'utf8', timeout: 30_000 })) as ReturnType<NonNullable<MergedPrChecklistDeps['readPr']>>))(number, cwd);
   if (pr.state !== 'MERGED' || pr.baseRefName !== 'main') return;
   const merged: MergedChecklistPr = { number, title: pr.title, body: pr.body, mergedAt: pr.mergedAt };
   const versions = deps.versions?.() ?? (() => {
@@ -43,6 +47,21 @@ export function syncMergedPrChecklist(number: number, cwd: string, goalFile?: st
   const fromTitle = titleCells(pr.title);
   const fromGoal = goal ? goalFileCells(goal) : new Set<string>();
   const designated = [...new Set([...fromBody, ...fromTitle, ...fromGoal])];
+  // A TA card's bound checklist criterion owns its postland verdict. A prose completion
+  // declaration cannot turn that cell green before the measured TA judgment runs.
+  let taClosedId: string | null = null;
+  let taBoundIds = new Set<string>();
+  let taBindingUnreadable = false;
+  try {
+    taBoundIds = new Set((deps.candidateTaskCells ?? candidateMergedTaskCells)(number));
+    if (pr.url && pr.headRefOid) for (const id of (deps.boundTaskCells ?? boundMergedTaskCells)({ number, url: pr.url })) taBoundIds.add(id);
+  } catch (error) { taBindingUnreadable = true; log('release.checklist', 'postland-binding-unreadable', { pr: number, error: String(error) }); }
+  if (pr.url && pr.headRefOid && !taBindingUnreadable) {
+    try {
+      taClosedId = (deps.closeTaskCard ?? closeMergedTaskCard)({ ...pr, number, url: pr.url, headRefOid: pr.headRefOid }, cwd, { versions: [...new Set(versions)] });
+      if (taClosedId) taBoundIds.add(taClosedId);
+    } catch (error) { log('release.checklist', 'postland-card-error', { pr: number, ids: [...taBoundIds], error: String(error) }); }
+  }
   for (const id of designated) {
     log('release.checklist', 'merged-pr-cell-source', {
       pr: number,
@@ -67,19 +86,19 @@ export function syncMergedPrChecklist(number: number, cwd: string, goalFile?: st
   }
   for (const { version, snapshot, row } of matches) {
     if (counts.get(row.id) !== 1) continue;
-    for (const { id, ref } of evidencePlan([row])) {
+    for (const { id, ref } of taClosedId === row.id ? [] : evidencePlan([row])) {
       (deps.addEvidence ?? evidenceAdd)(id, version, ref, 'harness', snapshot.released, snapshot.dev);
       log('release.checklist', 'merged-pr-evidence-added', { version, id, pr: number, ref });
     }
     const cell = snapshot.items.find((item) => item.id === row.id)!;
-    if (cell.status !== 'green' && cell.status !== 'done') {
+    if (!taBindingUnreadable && !taBoundIds.has(row.id) && cell.status !== 'green' && cell.status !== 'done') {
       try {
         (deps.judgeLanded ?? judgeLandedCell)({ version, id: row.id, title: cell.title, pr: number }, { cwd });
       } catch (error) {
         try { log('release.checklist', 'landed-green-error', { version, id: row.id, pr: number, error: String(error) }); } catch { /* Judgment remains fail-soft. */ }
       }
     }
-    if (goal && declaresCompletion(goal)) {
+    if (!taBindingUnreadable && !taBoundIds.has(row.id) && goal && declaresCompletion(goal)) {
       if (!goalCells(goal).has(row.id)) {
         log('release.checklist', 'merged-pr-status-skipped', { version, id: row.id, pr: number, reason: 'goal-does-not-name-cell' });
         continue;

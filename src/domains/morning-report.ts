@@ -22,6 +22,8 @@ export interface MorningReportOpts {
   heatmapImageUrl?: string;
   /** S3 상세 리포트 업로드 여부(기본 true). 테스트는 false 로 부작용 차단. */
   upload?: boolean;
+  /** 시장서사 LLM model 명시(A/B). 미지정이면 지금과 같은 기본 provider 경로(providerFor(cfg)). */
+  model?: string;
 }
 
 /** 밤사이 소스를 종합한 아침 에센셜(텔레그램) 조립. 상세는 S3 링크로. */
@@ -38,7 +40,7 @@ export async function composeMorningReport(now: Date = new Date(), opts: Morning
     catch { uploaded = null; }
   }
 
-  const narrative = opts.narrate ? await synthesizeEssentialBrief(md) : '';
+  const narrative = opts.narrate ? await synthesizeEssentialBrief(md, { model: opts.model }) : '';
 
   // 결론-우선 상단 블록(매력도 Δ · 섹터순환 · 캡스톤) — PWA 대시보드 데이터 재사용. fail-soft.
   let heatmap = null, capstone = null;

@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -7,7 +8,7 @@ import { getUserConfig } from '../user-config.js';
 import { publicExposureFiles, runExposeGate } from './expose-gate.js';
 import { admitLandingMerge } from './frozen-merges.js';
 import { releaseGitDiffPaths, releasePathHold, releasePathHoldShouldPost, releasePathHoldComment, releasePathHoldCommentsArgs, RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
-import { detectTestInterference, parseFailureCount, runBunTest } from '../../scripts/detect-test-interference.js';
+import { detectTestInterference, failedNamesFromStreams, parseFailureCount, runBunTest, type MeasuredRun } from '../../scripts/detect-test-interference.js';
 import { MAX_INSPECTED_TEST_FILES, runTestInterferenceGate } from '../../scripts/ci-test-interference-gate.js';
 import { pwaGraph, pwaReach } from '../../scripts/ci-pwa-build-gate.js';
 import { classifyMergeFailure, clipRegateDetail, parseConflictFiles, type HostRegateFailure } from './regate-detail.js';
@@ -32,6 +33,12 @@ export function provideCheckoutDependencies(candidate: string, sourceRoot: strin
 
 export interface HostRegateInput { prNumber: number; headCommit: string; repoRoot: string; goalFile?: string; verifyOnly?: boolean; /** TA-LIVE-LAND-2: run the full landing gates (release-path hold · neighbours · PR re-read) but stop before the freeze admission and `gh pr merge` — the task agent lands it later via `pr land --expected-head`. */ noMerge?: true; /** Called by a resume sweep that already holds this PR's claim. */ resumed?: true }
 export interface HostRegateResult { passed: boolean; failures: HostRegateFailure[]; os: string; status?: 'passed' | 'failed' | 'unmeasured' | 'frozen'; /** verifyOnly: 실제로 얹어 잰 base 끝 */ baseCommit?: string }
+/** Only a missing host repository is recoverable by selecting the run's recorded root. Gate failures are final. */
+export function hostRepositoryUnavailable(result: HostRegateResult): boolean {
+  return !result.passed && result.status === 'unmeasured'
+    && result.failures[0]?.step === 'host-regate'
+    && result.failures[0].detail === 'host repository unavailable';
+}
 export type InterferenceVerdict = { passed: boolean; detail?: string; unmeasured?: boolean; /** neighbour tests left out so the selection fits the inspection cap */ neighborsTrimmed?: number; /** importer tests left out after changed tests and all selected neighbors take priority */ importerTrimmed?: number };
 export type HostRegateDeps = {
   command?: (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv) => { status: number | null; stdout: string; stderr: string };
@@ -56,6 +63,18 @@ const defaultCommand: NonNullable<HostRegateDeps['command']> = (bin, args, cwd, 
   const overflow = (r.error as NodeJS.ErrnoException | undefined)?.code === 'ENOBUFS';
   return { status: overflow ? null : r.status, stdout: r.stdout ?? '', stderr: (r.stderr ?? '') + (r.error ? `${r.error.message} (${overflow ? `output exceeded ${SPAWN_MAX_BUFFER} bytes` : 'command unavailable'})` : '') };
 };
+
+/** Keep the failure identity in both the returned detail and the host-regate ledger event. */
+function failureNames(runs: readonly MeasuredRun[], fileCap: number, testCap: number): string {
+  const failed = runs.filter((run) => run.fail !== null && run.fail > 0);
+  if (!failed.length) return 'none';
+  const files = [...new Set(failed.flatMap((run) => run.failedFiles ?? []))];
+  const tests = [...new Set(failed.flatMap((run) => run.failedTests ?? []))];
+  const bounded = (names: string[], cap: number): string => names.length
+    ? `${names.slice(0, cap).map((name) => name.slice(0, 120)).join(' | ')}${names.length > cap ? ` | +${names.length - cap} more` : ''}`
+    : 'unknown';
+  return `files=${bounded(files, fileCap)}; tests=${bounded(tests, testCap)}`;
+}
 
 /** The informational pr-land gate always returns zero; enforce its measured report and the combined test result instead. */
 export async function defaultInterference(files: readonly string[], cwd: string, opts: {
@@ -136,7 +155,9 @@ export async function defaultInterference(files: readonly string[], cwd: string,
     const run = await (opts.run ?? ((paths, dir) => runBunTest(paths, undefined, dir)))(selected, cwd);
     const fail = run.signal || run.exitCode === null ? null : parseFailureCount(`${run.stdout}${run.stderr}`);
     if (fail === null) return { passed: false, unmeasured: true, ...trimmed, detail: `single test run unmeasured: ${selected[0]}` };
-    return fail === 0 ? { passed: true, ...trimmed } : { passed: false, ...trimmed, detail: `${selected[0]} — ${fail} fail` };
+    if (fail === 0) return { passed: true, ...trimmed };
+    const names = failedNamesFromStreams(run);
+    return { passed: false, ...trimmed, detail: `single=${fail} fail; ${failureNames([{ files: selected, fail, status: 'measured', failedFiles: names.files, failedTests: names.tests }], 8, 20)}` };
   }
   // The informational pr-land gate always returns zero; its measured report is the verdict.
   let report: Awaited<ReturnType<typeof detectTestInterference>> | undefined;
@@ -146,7 +167,10 @@ export async function defaultInterference(files: readonly string[], cwd: string,
   });
   if (!report || report.status === 'unmeasurable' || selected.length > report.order.length) return { passed: false, unmeasured: true, ...trimmed, detail: `test interference measurement unavailable or truncated (selected ${selected.length}, changed tests ${tests.length}, cap ${MAX_INSPECTED_TEST_FILES})${trimNote}` };
   if (report.isolatedFailures !== 0 || report.combinedFailures !== 0 || report.status === 'interference') {
-    return { passed: false, ...trimmed, detail: `isolated=${report.isolatedFailures}, combined=${report.combinedFailures}, interference=${report.status}${trimNote}` };
+    const bothFailed = report.isolatedFailures! > 0 && report.combinedFailures! > 0;
+    const isolatedNames = failureNames(report.isolated, bothFailed ? 4 : 8, bothFailed ? 10 : 20);
+    const combinedNames = failureNames([report.combined], bothFailed ? 4 : 8, bothFailed ? 10 : 20);
+    return { passed: false, ...trimmed, detail: `isolated=${report.isolatedFailures}, combined=${report.combinedFailures}, interference=${report.status}; isolated ${isolatedNames}; combined ${combinedNames}${trimNote}` };
   }
   return { passed: true, ...trimmed, ...(trimNote ? { detail: trimNote.slice(3) } : {}) };
 }
@@ -237,6 +261,10 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
   let endLanding: ((merged?: boolean) => void) | undefined;
   let landed = false;
   let verifiedBase: string | undefined;
+  // Two host-regate slots may fetch in the same repository at once. FETCH_HEAD is shared;
+  // each measurement needs its own ref so another fetch cannot replace its evidence.
+  const fetchNamespace = `refs/elanous/regate/${process.pid}-${randomUUID()}`;
+  const fetchedRefs = new Set<string>();
   let interferenceNote: Record<string, unknown> = {};
   // HOST-REGATE-REASON-LOST: `facts` carries the expected/actual head, conflict files and merge failure kind of the
   //   pr-head · merge-conflict · merge steps; the detail keeps a bounded head ⊕ tail instead of the first 300 characters.
@@ -249,6 +277,12 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     const r = command(bin, args, cwd, env);
     if (r.status !== 0) throw new Error(clipRegateDetail((r.stderr || r.stdout || `${bin} exited ${r.status}`).trim()));
     return r.stdout.trim();
+  };
+  const fetchRef = (source: string, name: 'base' | 'head'): string => {
+    const ref = `${fetchNamespace}/${name}`;
+    fetchedRefs.add(ref);
+    run('git', ['fetch', '--no-write-fetch-head', 'origin', `+${source}:${ref}`], input.repoRoot);
+    return run('git', ['rev-parse', ref], input.repoRoot);
   };
   try {
     if (!Number.isSafeInteger(input.prNumber) || input.prNumber <= 0 || !/^[0-9a-f]{40}$/i.test(input.headCommit)) return result('unmeasured', 'input', 'invalid PR number or checked head SHA');
@@ -272,8 +306,7 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     const initialPrBase = baseCommit;
     let buildPwa = false;
     try {
-      run('git', ['fetch', 'origin', `refs/heads/${baseRefName}`], input.repoRoot);
-      let fetchedBase = run('git', ['rev-parse', 'FETCH_HEAD'], input.repoRoot);
+      let fetchedBase = fetchRef(`refs/heads/${baseRefName}`, 'base');
       if (input.verifyOnly) { baseCommit = fetchedBase; verifiedBase = fetchedBase; }
       else {
         for (let attempt = 1; fetchedBase !== baseCommit; attempt++) {
@@ -290,12 +323,10 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
             return prHeadFailure(view);
           }
           baseCommit = view.baseRefOid!;
-          run('git', ['fetch', 'origin', `refs/heads/${baseRefName}`], input.repoRoot);
-          fetchedBase = run('git', ['rev-parse', 'FETCH_HEAD'], input.repoRoot);
+          fetchedBase = fetchRef(`refs/heads/${baseRefName}`, 'base');
         }
       }
-      run('git', ['fetch', 'origin', `refs/pull/${input.prNumber}/head`], input.repoRoot);
-      if (run('git', ['rev-parse', 'FETCH_HEAD'], input.repoRoot) !== input.headCommit) throw new Error('fetched PR head differs from checked SHA');
+      if (fetchRef(`refs/pull/${input.prNumber}/head`, 'head') !== input.headCommit) throw new Error('fetched PR head differs from checked SHA');
       const slotWorktree = (release as (() => void) & { worktree?: string }).worktree;
       ephemeral = !!deps.makeTemp || !slotWorktree;
       worktree = deps.makeTemp?.() ?? slotWorktree ?? mkdtempSync(join(tmpdir(), 'host-regate-'));
@@ -463,6 +494,10 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     return result('unmeasured', 'host-regate', String(e));
   } finally {
     try { endLanding?.(landed); } catch (e) { log('unmeasured', { pr: input.prNumber, files, os: process.platform, failedStep: 'landing-release', detail: String(e) }); }
+    for (const ref of fetchedRefs) {
+      try { run('git', ['update-ref', '-d', ref], input.repoRoot); }
+      catch (e) { log('unmeasured', { pr: input.prNumber, files, os: process.platform, failedStep: 'fetch-ref-cleanup', detail: String(e) }); }
+    }
     try {
       if (attached && worktree) {
         if (slotCommonDir) verifySlot();

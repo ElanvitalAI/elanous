@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { dirname, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { userInfo } from 'node:os';
 import { DEFAULT_CONCURRENT_PODS, DEFAULT_DAILY_GOALS } from '../org/seat-budget.js';
+import { lintKnowhow } from './knowhow-lint.js';
 
 export interface SeatPackManifest {
   name: string;
@@ -31,13 +32,20 @@ function walk(directory: string, root: string): string[] {
     });
 }
 
+/** Static leak markers shared by the pack scan and the KNOWHOW lint. Account-name patterns stay in `scan` — they depend on the exporting host's user. */
+export function seatPackLeakPatterns(): Array<[string, RegExp]> {
+  return [
+    ['royal marker', /\u{1F451}/u],
+    ['track marker', /(?:🅞|🅣|🅢|🅕|\*\*\[(?:OP|TC|MK|UX|S|T|O|F)\]\*\*|\[(?:OP|TC|MK|UX|S|T|O|F)\])/u],
+    ['absolute user path', /\/Users\/[A-Za-z0-9._-]+/u],
+  ];
+}
+
 function scan(file: string, body: string): void {
   const usernames = new Set([userInfo().username, process.env.ELANOUS_LEAK_HOME_USER].filter((name): name is string => Boolean(name)));
   const accountPatterns = [...usernames].map((name) => new RegExp(`(?<![A-Za-z0-9._-])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9._-])`, 'iu'));
   const patterns: Array<[string, RegExp]> = [
-    ['royal marker', /\u{1F451}/u],
-    ['track marker', /(?:🅞|🅣|🅢|🅕|\*\*\[(?:OP|TC|MK|UX|S|T|O|F)\]\*\*|\[(?:OP|TC|MK|UX|S|T|O|F)\])/u],
-    ['absolute user path', /\/Users\/[A-Za-z0-9._-]+/u],
+    ...seatPackLeakPatterns(),
     ...accountPatterns.map((pattern): [string, RegExp] => ['account name', pattern]),
   ];
   for (const [index, line] of body.split(/\r?\n/u).entries()) {
@@ -61,6 +69,10 @@ export function exportSeatPack(seat: string, out: string, root = resolve(import.
   for (const file of roleFiles) {
     const body = readFileSync(join(repo, file));
     contents.set(file, body);
+    // Public leak markers take precedence over formatting errors: callers need
+    // the file:line and exit 2 before an export directory can be created.
+    scan(file, body.toString('utf8'));
+    if (basename(file) === 'KNOWHOW.md') lintKnowhow(body.toString('utf8'), file);
     for (const match of body.toString('utf8').matchAll(/graphs\/([A-Za-z0-9_./-]+(?:\.ya?ml|\/\*\*))/gu)) {
       const ref = `graphs/${match[1]!}`;
       if (ref.split('/').includes('..')) throw new Error(`invalid seat graph: ${ref}`);

@@ -24,7 +24,7 @@ const defaultGit: GitRun = (cwd, args) => {
 
 export interface LandWorktreeInput { card: string; pr: number; head: string; branch: string | undefined; repoCwd: string; statePath: string }
 export type LandWorktreeRemoval = { removed: boolean; reason?: string; /** 이 호출이 만든 가지를 지웠나 — 만든 가지가 없으면 null. */ branchRemoved?: boolean | null };
-export interface LandWorktree { cwd: string; cleanup: () => LandWorktreeRemoval }
+export interface LandWorktree { cwd: string; cleanup: () => LandWorktreeRemoval; /** false means an existing owner's tree is borrowed, never removed. */ created?: boolean }
 
 export interface LandWorktreeDeps {
   git?: GitRun;
@@ -43,6 +43,14 @@ export function localHead(cwd: string, git: GitRun = defaultGit): string | null 
     const r = git(cwd, ['rev-parse', 'HEAD']);
     const out = r.stdout.trim();
     return r.status === 0 && /^[0-9a-f]{40}$/i.test(out) ? out : null;
+  } catch { return null; }
+}
+
+/** cwd 의 현재 가지 — detached·조회 실패는 null. */
+export function localBranch(cwd: string, git: GitRun = defaultGit): string | null {
+  try {
+    const r = git(cwd, ['branch', '--show-current']);
+    return r.status === 0 && r.stdout.trim() ? r.stdout.trim() : null;
   } catch { return null; }
 }
 
@@ -69,6 +77,24 @@ function registered(git: GitRun, repoCwd: string, path: string): boolean | null 
   const real = (p: string): string => { try { return realpathSync(p); } catch { return resolve(p); } };
   const want = real(path);
   return list.stdout.split('\n').some((line) => line.startsWith('worktree ') && real(line.slice('worktree '.length).trim()) === want);
+}
+
+/** A registered checkout of the exact PR branch. An unreadable/malformed registry is never treated as vacant. */
+function branchOwner(git: GitRun, repoCwd: string, branch: string): { path: string | null; reason?: string } {
+  let list: ReturnType<GitRun>;
+  try { list = git(repoCwd, ['worktree', 'list', '--porcelain']); }
+  catch { return { path: null, reason: 'git worktree registry unreadable (owner unknown)' }; }
+  if (list.status !== 0 || !list.stdout.trim()) return { path: null, reason: 'git worktree registry unreadable (owner unknown)' };
+  const entries = list.stdout.trim().split(/\n\s*\n/);
+  const owners: string[] = [];
+  for (const entry of entries) {
+    const lines = entry.split('\n');
+    const pathLine = lines.find(line => line.startsWith('worktree '));
+    if (!pathLine?.slice(9).trim()) return { path: null, reason: 'git worktree registry malformed (owner unknown)' };
+    if (lines.some(line => line === `branch refs/heads/${branch}`)) owners.push(pathLine.slice(9).trim());
+  }
+  if (owners.length > 1) return { path: null, reason: `PR branch ${branch} has multiple registered owners (owner unknown)` };
+  return { path: owners[0] ?? null };
 }
 
 /** 이 저장소의 git 공통 디렉터리(실경로) — 못 읽으면 null. */
@@ -110,7 +136,7 @@ function removeWorktree(git: GitRun, repoCwd: string, path: string): { removed: 
 }
 
 /** `created` — 트리를 만들었었나(모르면 null) · `removed` — 만들었다면 걷었나(만든 적 없거나 모르면 null). */
-export type LandWorktreeFailure = { reason: string; created: boolean | null; removed: boolean | null };
+export type LandWorktreeFailure = { reason: string; created: boolean | null; removed: boolean | null; kind?: 'worktree-conflict'; ownerPath?: string };
 
 /** PR 머리 트리를 만든다 — 못 만들면 이유 ⊕ 만들었다 걷었는지(관측용). 던지지 않는다. */
 export async function createLandWorktree(input: LandWorktreeInput, deps: LandWorktreeDeps = {}): Promise<LandWorktree | LandWorktreeFailure> {
@@ -119,10 +145,15 @@ export async function createLandWorktree(input: LandWorktreeInput, deps: LandWor
   const head = input.head.toLowerCase();
   const branch = input.branch;
   const fail = (reason: string, created: boolean | null = false, removed: boolean | null = null): LandWorktreeFailure => ({ reason, created, removed });
+  const conflict = (reason: string, ownerPath?: string): LandWorktreeFailure => ({ reason: `worktree-conflict: ${reason}`, created: false, removed: null, kind: 'worktree-conflict', ...(ownerPath ? { ownerPath } : {}) });
   if (!branch) return fail('PR head branch name unknown');
   if (!/^[0-9a-f]{40}$/.test(head)) return fail('PR head is not a full sha');
   // 지난 시도가 남긴 같은 자리는 먼저 걷는다(같은 PR·머리 · 재사용하지 않는다 — 상태를 모르는 트리에서 착지하지 않게).
-  if (existsSync(path) || registered(git, input.repoCwd, path) !== false) {
+  let atLandPath: boolean | null;
+  try { atLandPath = registered(git, input.repoCwd, path); }
+  catch { atLandPath = null; }
+  if (atLandPath === null) return conflict('git worktree list unreadable (owner unknown)');
+  if (existsSync(path) || atLandPath) {
     const stale = removeWorktree(git, input.repoCwd, path);
     if (!stale.removed) return fail(`stale land worktree could not be removed: ${stale.reason}`);
   }
@@ -135,9 +166,25 @@ export async function createLandWorktree(input: LandWorktreeInput, deps: LandWor
     return r.status === 0 ? r.stdout.trim().toLowerCase() : null;
   };
   const existingHead = branchHead();
-  if (existingHead && existingHead !== head) return fail(`local branch ${branch} exists at ${existingHead.slice(0, 12)} (not the PR head) — not overwriting it`);
   const mine = commonDir(git, input.repoCwd);
   if (!mine) return fail('git common directory unreadable');
+  const owner = branchOwner(git, input.repoCwd, branch);
+  if (owner.reason) return conflict(owner.reason);
+  if (owner.path) {
+    const path = owner.path;
+    // The registry is only a lead: validate the checkout itself immediately before handing it to pr land.
+    try {
+      if (commonDir(git, path) !== mine) return conflict(`owner ${path} repository identity unreadable or different`, path);
+      const current = git(path, ['branch', '--show-current']);
+      if (current.status !== 0 || current.stdout.trim() !== branch) return conflict(`owner ${path} branch is ${current.stdout.trim() || 'unknown'} (expected ${branch})`, path);
+      const actualHead = localHead(path, git);
+      if (actualHead?.toLowerCase() !== head) return conflict(`owner ${path} HEAD ${actualHead?.slice(0, 12) ?? 'unknown'} ≠ reviewed ${head.slice(0, 12)}`, path);
+      const status = git(path, ['status', '--porcelain']);
+      if (status.status !== 0 || status.stdout.trim()) return conflict(`owner ${path} is ${status.status !== 0 ? 'status unreadable' : `dirty: ${status.stdout.trim().split('\n').slice(0, 3).join(' · ').slice(0, 160)}`}`, path);
+    } catch { return conflict(`owner ${path} verification failed`, path); }
+    return { cwd: path, created: false, cleanup: () => ({ removed: false, reason: `borrowed owner ${path} — left untouched` }) };
+  }
+  if (existingHead && existingHead !== head) return fail(`local branch ${branch} exists at ${existingHead.slice(0, 12)} (not the PR head) — not overwriting it`);
   try {
     mkdirSync(dirname(path), { recursive: true });
     // 표지를 먼저 — 등록 전에 죽어도 다음 시도가 «우리 잔여»임을 확인하고 걷을 수 있게.
@@ -192,7 +239,7 @@ export async function createLandWorktree(input: LandWorktreeInput, deps: LandWor
   } catch (error) {
     return abort(`land worktree check threw: ${(error instanceof Error ? error.message : String(error)).slice(-200)}`);
   }
-  return { cwd: path, cleanup };
+  return { cwd: path, cleanup, created: true };
 }
 
 export function observeLandWorktree(data: { card: string; pr: number; head: string; created: boolean | null; removed: boolean | null; branchRemoved?: boolean | null; reason: string },

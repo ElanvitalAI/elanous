@@ -6,7 +6,7 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import * as childProcess from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../../debug/log.js';
@@ -19,6 +19,7 @@ const TA_LAND_ENV = 'ELANOUS_TA_LAND';
 import { superviseRun, type SupervisorJobResult } from '../../self-dev/run-supervisor.js';
 import { orchestrateSelfDev } from '../../self-dev/orchestrate.js';
 import type { HostRegateResult } from '../../self-implement/host-regate.js';
+import { appendRunLedgerEntry, runLedgerDir } from '../../self-implement/run-ledger.js';
 
 const CREDS = () => ({ elanousAuth: '{"m":1}', codexAuth: '{"c":1}', ghToken: 'gho_x' });
 const HEAD = 'a'.repeat(40);
@@ -41,8 +42,10 @@ type RegateRequest = { prNumber: number; headCommit: string; repoRoot: string; g
 async function run(opts: { env?: NodeJS.ProcessEnv; moves?: readonly string[]; movesThrow?: boolean; regate?: (r: RegateRequest) => Promise<HostRegateResult> }) {
   const received: RegateRequest[] = [];
   const events: Array<[string, Record<string, unknown>]> = [];
+  const retryEvents: Array<[string, Record<string, unknown>]> = [];
   const spy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
     if (category === 'self-implement.pod') events.push([event, data ?? {}]);
+    if (category === 'harness.host-regate' && event === 'regate-retry') retryEvents.push([event, data ?? {}]);
   }) as typeof debug.log);
   try {
     const r = await podSelfImplementSpawn({
@@ -51,11 +54,61 @@ async function run(opts: { env?: NodeJS.ProcessEnv; moves?: readonly string[]; m
       taskAgentLiveMoves: () => { if (opts.movesThrow) throw new Error('config unreadable'); return new Set(opts.moves ?? []); },
       hostRegate: async (request) => { received.push(request); return (opts.regate ?? (async () => ({ passed: true, failures: [], os: process.platform })))(request); },
     })({ feature: 'ta land', spaceId: 'pod-ta-land', autoMerge: true }).done;
-    return { r, received, events };
+    return { r, received, events, retryEvents };
   } finally { spy.mockRestore(); }
 }
 
 describe('TA-LIVE-LAND-2 — Pod host leaves the merge to the task agent only on opt-in', () => {
+  const recordedRunId = 'run-12345678-1234-1234-1234-123456789abc';
+  async function fromNonGitCwd(regate: (request: RegateRequest) => Promise<HostRegateResult>) {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-regate-retry-'));
+    const originalCwd = process.cwd();
+    const recordedRoot = join(dir, 'recorded');
+    const nonGitCwd = join(dir, 'outside');
+    childProcess.execFileSync('git', ['init', '-q', recordedRoot]);
+    mkdirSync(nonGitCwd);
+    appendRunLedgerEntry({ runId: recordedRunId, event: 'start', data: { targetRoot: recordedRoot } }, runLedgerDir(dir));
+    try {
+      process.chdir(nonGitCwd);
+      return { ...(await run({ env: { [TA_LAND_ENV]: '1', ELANOUS_RUN_ID: recordedRunId, ELANOUS_STATE_DIR: dir }, moves: ['propose-land'], regate })), recordedRoot, nonGitCwd: realpathSync(nonGitCwd) };
+    } finally {
+      process.chdir(originalCwd);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test('non-git host cwd retries once from recorded repo root and leaves a passing PR for TA land', async () => {
+    const { r, received, retryEvents, recordedRoot, nonGitCwd } = await fromNonGitCwd(async (request) => {
+      const actualRoot = childProcess.execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: request.repoRoot, encoding: 'utf8' }).trim();
+      expect(realpathSync(actualRoot)).toBe(realpathSync(request.repoRoot));
+      return { passed: true, status: 'passed', failures: [], os: process.platform };
+    });
+    expect(received).toEqual([{ prNumber: 9, headCommit: HEAD, repoRoot: recordedRoot, noMerge: true }]);
+    expect(retryEvents).toEqual([['regate-retry', { pr: 9, from: nonGitCwd, to: recordedRoot, result: 'passed' }]]);
+    expect(r.disposition).toMatchObject({ stage: 'pr-opened', merged: false, ok: true, mergeReason: 'ta-land-owner' });
+  });
+
+  test('recorded-root retry remains unmeasured: one attempt and no TA land', async () => {
+    const { r, received, retryEvents } = await fromNonGitCwd(async () => ({ passed: false, status: 'unmeasured', failures: [{ step: 'host-regate', detail: 'host repository unavailable' }], os: process.platform }));
+    expect(received).toHaveLength(1);
+    expect(retryEvents).toHaveLength(1);
+    expect(retryEvents[0]?.[1]).toMatchObject({ result: 'unmeasured' });
+    expect(r.disposition).toMatchObject({ stage: 'host-regate-failed', merged: false, ok: false });
+  });
+
+  test('a measured gate failure never retries', async () => {
+    const { r, received, retryEvents } = await run({ env: { [TA_LAND_ENV]: '1' }, moves: ['propose-land'], regate: async () => ({ passed: false, status: 'failed', failures: [{ step: 'test-interference', detail: 'red' }], os: process.platform }) });
+    expect(received).toHaveLength(1);
+    expect(retryEvents).toHaveLength(0);
+    expect(r.disposition).toMatchObject({ stage: 'host-regate-failed', merged: false, ok: false });
+  });
+  test('non-TA host-regate exception keeps its prior status shape and never retries', async () => {
+    const { r, received, retryEvents } = await run({ regate: async () => { throw new Error('gate unavailable'); } });
+    expect(received).toHaveLength(1);
+    expect(retryEvents).toHaveLength(0);
+    expect('status' in (r.disposition?.hostRegate ?? {})).toBe(false);
+    expect(r.disposition).toMatchObject({ stage: 'host-regate-failed', merged: false, ok: false });
+  });
   test('marker ⊕ propose-land: host re-gates with noMerge and leaves the PR open (pr-opened · ta-land-owner)', async () => {
     const { r, received, events } = await run({ env: { [TA_LAND_ENV]: '1' }, moves: ['propose-land'] });
     expect(received).toEqual([{ prNumber: 9, headCommit: HEAD, repoRoot: expect.any(String), noMerge: true }]);
@@ -102,7 +155,7 @@ describe('TA-LIVE-LAND-2 — Pod host leaves the merge to the task agent only on
       command: (bin: string, args: readonly string[]) => {
         const call = `${bin} ${args.join(' ')}`; calls.push(call);
         if (call === 'gh pr view 9 --json headRefOid,baseRefName,baseRefOid,state,isDraft') return { status: 0, stdout: JSON.stringify({ headRefOid: HEAD, baseRefName: 'main', baseRefOid: base, state: 'OPEN', isDraft: false }), stderr: '' };
-        if (call === 'git rev-parse FETCH_HEAD') return { status: 0, stdout: calls.at(-2) === 'git fetch origin refs/heads/main' ? base : HEAD, stderr: '' };
+        if (call.startsWith('git rev-parse refs/elanous/regate/')) return { status: 0, stdout: call.endsWith('/base') ? base : HEAD, stderr: '' };
         if (call === 'git rev-parse HEAD' || call === 'git rev-parse HEAD^1') return { status: 0, stdout: base, stderr: '' };
         if (call === 'git rev-parse HEAD^2') return { status: 0, stdout: HEAD, stderr: '' };
         if (call.startsWith('git merge-base')) return { status: 0, stdout: 'b'.repeat(40), stderr: '' };

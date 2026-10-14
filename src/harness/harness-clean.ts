@@ -201,6 +201,8 @@ export function planHarnessClean(input: {
   readWorktreeProvenance?: WorktreeProvenanceReader;
   /** provenance reader가 쓰는 git runner. planner 단독 테스트에서는 반드시 명시한다. */
   run?: GitRunner;
+  /** Allow reclaiming unowned worktrees only for merged-clean branches; default remains preservation. */
+  includeUnownedMergedClean?: boolean;
   /** 조회별 소요 시간(밀리초). 키는 `queryStatus` 조회 칸과 같다. 못 잰 칸은 생략한다. */
   queryTimings?: HarnessCleanQueryTimings;
 }): HarnessCleanPlan {
@@ -353,7 +355,15 @@ export function planHarnessClean(input: {
       continue;
     }
     const ladderReason = `assessment=${assessment.disposition}:${assessment.reason}`;
-    if (assessment.disposition !== 'reclaim-safe' || !ownership.recorded) {
+    const includeUnownedMergedClean = input.includeUnownedMergedClean === true
+      && mode === 'merged'
+      && mergedPr.has(branch)
+      && !openPr.has(branch)
+      && assessment.disposition === 'reclaim-safe'
+      && assessment.reason === 'merged-clean'
+      && !ownership.recorded
+      && ownership.status.startsWith('not-recorded:');
+    if (assessment.disposition !== 'reclaim-safe' || (!ownership.recorded && !includeUnownedMergedClean)) {
       preserve.push({ ...base, reason: `${ladderReason}; ownership=${ownership.status}` });
       continue;
     }
@@ -992,6 +1002,7 @@ export function execHarnessClean(opts: {
   mode: HarnessCleanMode;
   dryRun?: boolean;
   force?: boolean;
+  includeUnownedMergedClean?: boolean;
   branchPrefix?: string;
   repo?: string;
   window?: { offset: number; size: number };
@@ -1087,6 +1098,7 @@ export function execHarnessClean(opts: {
     readWorktreeProvenance: opts.readWorktreeProvenance,
     run,
     mode: opts.mode,
+    ...(opts.includeUnownedMergedClean ? { includeUnownedMergedClean: true } : {}),
     queryStatus,
     queryTimings: {
       worktrees: worktreesTimed.ms,
@@ -1286,10 +1298,16 @@ export function renderHarnessCleanReport(
     item.reason.includes('reclaim-safe:merged-no-worktree'),
   ).length;
   const branchOnlyReclaimedCount = res.plan.remove.filter((item) => item.reason.includes('branch-only')).length;
+  const isUnownedMergedClean = (item: CleanPlanItem): boolean =>
+    item.reason.includes('assessment=reclaim-safe:merged-clean') && item.reason.includes('ownership=not-recorded:');
+  const plannedUnownedMergedCleanCount = res.plan.remove.filter(isUnownedMergedClean).length;
+  const unownedMergedCleanCount = (res.dryRun ? res.plan.remove : res.removed).filter(isUnownedMergedClean).length;
+  const unownedMergedCleanSummary = plannedUnownedMergedCleanCount > 0
+    ? ` · 미소유 merged-clean ${res.dryRun ? '제거 예정' : '회수'} ${unownedMergedCleanCount}` : '';
   L.push(
     omittedPreserve > 0
-      ? `규모 매칭 ${matchedTotal} · 제거 계획 ${res.plan.remove.length} · 보존 ${res.plan.preserve.length} · 화면 ${displayedCount} (보존 ${omittedPreserve}개는 생략) · 브랜치만 회수 ${branchOnlyReclaimedCount} · 워크트리 없이 안전 ${mergedNoWorktreeCount}`
-      : `규모 매칭 ${matchedTotal} · 제거 계획 ${res.plan.remove.length} · 보존 ${res.plan.preserve.length} · 화면 ${displayedCount} · 브랜치만 회수 ${branchOnlyReclaimedCount} · 워크트리 없이 안전 ${mergedNoWorktreeCount}`,
+      ? `규모 매칭 ${matchedTotal} · 제거 계획 ${res.plan.remove.length} · 보존 ${res.plan.preserve.length} · 화면 ${displayedCount} (보존 ${omittedPreserve}개는 생략) · 브랜치만 회수 ${branchOnlyReclaimedCount} · 워크트리 없이 안전 ${mergedNoWorktreeCount}${unownedMergedCleanSummary}`
+      : `규모 매칭 ${matchedTotal} · 제거 계획 ${res.plan.remove.length} · 보존 ${res.plan.preserve.length} · 화면 ${displayedCount} · 브랜치만 회수 ${branchOnlyReclaimedCount} · 워크트리 없이 안전 ${mergedNoWorktreeCount}${unownedMergedCleanSummary}`,
   );
   if (res.plan.remove.length === 0) L.push('정리 대상 없음.');
   else {

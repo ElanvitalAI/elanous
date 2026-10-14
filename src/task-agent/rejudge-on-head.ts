@@ -40,9 +40,12 @@ import type { DetachedSpawn } from '../cli/tasks-cli.js';
 import { remoteLedgerMirrorDir } from './parent-host.js';
 import { appendLandOrderRow, joinLandOrderRow } from './land-order-ledger.js';
 import { recordLiveMoveHistory } from './live-move-history.js';
+import { runRepairCycle, type RepairLaunchRequest } from './repair-cycle.js';
+import { repairMustFixFromReview, repairReviewDigest } from './repair-review.js';
+import type { RepairCasOutcome, RepairCasRequest } from './repair-branch-cas.js';
 import { defaultLandPrHead, defaultPrHead, defaultReviewRepoCandidates, executeLiveLand, executeLiveReview, landRetryPending, type LiveMoveDeps, type LiveMoveResult, type PrHeadView, type ReviewRepoCandidate, type TaskAgentLiveMove } from './live-moves.js';
-import { capturedLandReview, captureReviewResults, parseReviewResultOutput, pendingReviewResults, type ParsedReviewResult } from './review-result-capture.js';
-import { cardPrNumber, readTaskCard, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
+import { capturedLandReview, captureReviewResults, parseReviewResultOutput, pendingReviewResults, reviewResultPath, type ParsedReviewResult } from './review-result-capture.js';
+import { boundPrTerminal, cardPrNumber, LIVE_MOVE_RESULT_EVENT, readTaskCard, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
 
 export const REJUDGE_ON_HEAD_EVENT = 'rejudge-on-head';
 /** 카드·PR 당 재게이트하는 머리 수 상한(머리가 바뀔 때마다 하나) — 넘으면 멈추고 사람에게 넘긴다. */
@@ -52,7 +55,7 @@ export const CATCH_UP_CAP = 2;
 /** 떼어 띄운 재게이트 결과를 기다리는 상한 — 지나도 파일이 없으면 «결과 없음»으로 적는다(같은 머리는 다시 안 돌린다). */
 export const REGATE_RESULT_WAIT_MS = 90 * 60_000;
 
-export type RejudgeStep = 'regate' | 'review' | 'ready' | 'land' | 'target' | 'catch-up';
+export type RejudgeStep = 'regate' | 'review' | 'ready' | 'land' | 'target' | 'catch-up' | 'repair';
 export type CatchUpDecision = 'pushed' | 'conflict' | 'cap-reached' | 'failed';
 export interface RejudgeOutcome {
   card: string; pr: number | null; fromHead: string | null; toHead: string | null; step: RejudgeStep; decision: string; reason: string;
@@ -82,6 +85,10 @@ export interface RejudgeDeps {
   readyPr?: (pr: number, cwd: string) => Promise<{ ok: boolean; reason: string }>;
   /** 재게이트를 떼어 띄운다 — 시험은 주입한다. 기본은 `tasks regate-run` 자식(stdio ignore · 결과는 파일). */
   requestRegate?: (request: RegateRequest) => Promise<void>;
+  /** Source PR/head repair worker; absent uses the detached HQ local parent. */
+  requestRepair?: (request: RepairLaunchRequest) => Promise<void>;
+  applyRepair?: (request: RepairCasRequest) => RepairCasOutcome;
+  notifyRepair?: (seat: string, body: string) => void;
   /** TA-REJUDGE-REBASE-LOOP — origin/main 을 PR 가지에 3-way merge 하고 일반 push. 시험은 주입한다. */
   catchUpMain?: (request: CatchUpRequest) => Promise<CatchUpResult>;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
@@ -405,7 +412,9 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   if (!card || pr === undefined) return target('no-pr', 'card has no bound PR');
   const reviews = (card.reviewRequests ?? []).filter((entry) => entry.pr === pr);
   // 원격 부모는 node-b 의 liveMoves 가 꺼져 리뷰 이력이 0일 수 있다. HQ 거울의 종결 증거가 있을 때만 시작한다.
-  if (!reviews.length && (!card.parentHost || !(deps.remoteRunTerminal ?? remoteBoundRunTerminal)(card)))
+  const adopted = card.adoptedPr?.pr === pr && typeof card.pr === 'object'
+    && !!card.pr.url && sameUrl(card.adoptedPr.url, card.pr.url) && /^[a-f0-9]{40}$/i.test(card.adoptedPr.head);
+  if (!reviews.length && !adopted && (!card.parentHost || !(deps.remoteRunTerminal ?? remoteBoundRunTerminal)(card)))
     return target('not-started', 'no task-agent review on this PR yet (remote terminal unproven or run not stopped/judged)', pr);
   // 떼어 띄운 재게이트 결과를 «머리와 무관하게» 먼저 회수한다 — 결과가 나오기 전에 머리가 또 바뀌어도 그 머리의 결과는 카드에 남는다.
   for (const pending of (card.regates ?? []).filter((entry) => entry.pr === pr && entry.passed === undefined && entry.resultPath)) {
@@ -442,9 +451,98 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   if ('reason' in found) return target('pr-unreadable', found.reason, pr, fromHead);
   const { cwd, view } = found;
   const toHead = view.head;
+  if (view.state === 'MERGED' || view.state === 'CLOSED') {
+    const at = now().toISOString();
+    updateTaskCard(statePath, card.id, (current) => {
+      if (!current || cardPrNumber(current) !== pr || typeof current.pr !== 'object' || current.pr.url !== url) return undefined;
+      const previous = boundPrTerminal(current);
+      if (previous?.state === view.state && previous.head === toHead) return undefined;
+      return { ...current, prTerminal: { pr, url, head: toHead, state: view.state as 'MERGED' | 'CLOSED', at } };
+    });
+    return target('pr-not-open', `PR #${pr} is ${view.state}`, pr, fromHead, toHead);
+  }
   if (view.state !== 'OPEN') return target('pr-not-open', `PR #${pr} is ${view.state}`, pr, fromHead, toHead);
+  // An explicitly rejudged PR can be reopened. Clear the old marker before normal head judgement.
+  if (boundPrTerminal(card)) {
+    updateTaskCard(statePath, card.id, (current) => current && cardPrNumber(current) === pr && typeof current.pr === 'object' && current.pr.url === url
+      ? { ...current, prTerminal: undefined } : undefined);
+    card = readTaskCard(card.id, statePath) ?? card;
+  }
   const step = (s: RejudgeStep, decision: string, reason: string, record: boolean, extra: Partial<RejudgeOutcome> = {}) =>
     emit({ card: card!.id, pr, fromHead, toHead, step: s, decision, reason, ...extra }, record);
+
+  // Adoption is a first judgement for the current head, even when the implementation run
+  // already asked for a review. A captured failure needs repair; an accepted result must
+  // reach the host regate instead of stopping at the old same-head shortcut below.
+  const adoptedReview = adopted ? (card.history ?? []).filter((item) => item.event === LIVE_MOVE_RESULT_EVENT
+    && item.kind === 'review' && item.pr === pr && item.head && sameHead(item.head, toHead)
+    && item.reviewed === true && ['pass', 'warn', 'fail'].includes(item.verdict ?? '')).at(-1) : undefined;
+  if (adopted && !adoptedReview) {
+    if (reviews.some((entry) => sameHead(entry.head, toHead))) {
+      step('review', 'review-pending', `PR #${pr} head ${toHead.slice(0, 12)} already has a review request; await its result`, false);
+    } else if (!deps.liveMoves.has('review')) {
+      step('review', 'would-review', 'adopted PR first judgement · review not enabled in HQ taskAgent.liveMoves — shadow', false);
+    } else {
+      const before = { reviewRequests: card.reviewRequests, landAttempts: card.landAttempts };
+      const result = await executeLiveReview(card, pr, { runId: card.runId ?? null, stopReason: 'adopted-pr-first-judgement', cwd }, { ...live, ...(deps.log ? { log: deps.log } : {}) });
+      recordMove(statePath, card.id, card.runId, 'review', result, pr, before, now, deps.log);
+      step('review', result.executed ? 'review-requested' : 'review-request-failed', result.detail, true);
+    }
+    return outcomes;
+  }
+  const capturedForHead = (card.history ?? []).filter((item) => item.event === LIVE_MOVE_RESULT_EVENT
+    && item.kind === 'review' && item.pr === pr && item.head && sameHead(item.head, toHead)
+    && item.reviewed === true && ['pass', 'warn', 'fail'].includes(item.verdict ?? '')).at(-1);
+  if (capturedForHead && (capturedForHead.verdict === 'fail' || (capturedForHead.mustFix ?? 0) > 0)) {
+    const capturedPath = capturedForHead.resultPath;
+    const requestMatches = !!capturedPath && (card.reviewRequests ?? []).some((entry) => entry.pr === pr
+      && sameHead(entry.head, toHead) && entry.resultPath === capturedPath);
+    let mustFix: string[] | null = null;
+    try {
+      if (requestMatches && /^[0-9a-f]{64}$/.test(capturedForHead.reviewSha256 ?? '')) {
+        const text = read(capturedPath!);
+        if (repairReviewDigest(text) === capturedForHead.reviewSha256) mustFix = repairMustFixFromReview(text, pr, toHead);
+      }
+    } catch { /* fail closed below */ }
+    if (!mustFix && (deps.liveMoves.has('narrow-relaunch') || deps.liveMoves.has('salvage-relaunch') || deps.liveMoves.has('alternative'))
+      && !(card.repairs ?? []).some((entry) => entry.pr === pr && (entry.status === 'requested' || entry.status === 'unconfirmed'))) {
+      if (pendingReviewResults(card).some((entry) => entry.pr === pr && sameHead(entry.head, toHead))) {
+        step('review', 'review-pending', 'replacement exact-head review pending before repair', false);
+        return outcomes;
+      }
+      const originalPath = reviewResultPath(statePath, card.id, pr, toHead);
+      const retried = (card.reviewRequests ?? []).some((entry) => entry.pr === pr && sameHead(entry.head, toHead)
+        && entry.resultPath && entry.resultPath !== originalPath);
+      if (deps.liveMoves.has('review') && !retried) {
+        const before = { reviewRequests: card.reviewRequests, landAttempts: card.landAttempts };
+        const result = await executeLiveReview(card, pr, { runId: card.runId ?? null, stopReason: 'captured-review-identity-unavailable', cwd, forceNewReview: true },
+          { ...live, ...(deps.log ? { log: deps.log } : {}) });
+        recordMove(statePath, card.id, card.runId, 'review', result, pr, before, now, deps.log);
+        step('review', result.executed ? 'review-requested' : 'review-request-failed', result.detail, true);
+        return outcomes;
+      }
+      step('repair', 'repair-stopped', 'captured review result identity missing or changed; request a new review', true);
+      return outcomes;
+    }
+    if (mustFix?.length || (card.repairs ?? []).some((entry) => entry.pr === pr && (entry.status === 'requested' || entry.status === 'unconfirmed'))) {
+      if (!view.branch) {
+        step('repair', 'repair-stopped', 'PR branch name unavailable', true);
+        return outcomes;
+      }
+      const result = await runRepairCycle({ card, statePath, repo: cwd, pr, head: toHead, branch: view.branch,
+        mustFix: mustFix ?? [], liveMoves: deps.liveMoves, now: now(), readFile: read,
+        ...(deps.requestRepair ? { request: deps.requestRepair } : {}),
+        ...(deps.applyRepair ? { apply: deps.applyRepair } : {}),
+        ...(deps.notifyRepair ? { notify: deps.notifyRepair } : {}) });
+      step('repair', result.decision, result.reason, true);
+      return outcomes;
+    }
+  }
+  if (adopted && (adoptedReview?.verdict === 'fail' || !capturedLandReview(card, pr, toHead)
+    || capturedLandReview(card, pr, toHead)?.mustFixCount !== 0)) {
+    step('review', 'repair-needed', `PR #${pr} head ${toHead.slice(0, 12)} review ${adoptedReview?.verdict ?? 'unknown'} · must-fix ${adoptedReview?.mustFix ?? 'unknown'} — owner repair`, true);
+    return outcomes;
+  }
 
   // A remote --ta-land parent leaves its PR draft. Only a captured review for this exact
   // head may let HQ make it ready; the regate runner deliberately rejects draft PRs.
@@ -527,7 +625,7 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   };
 
   // 기존 live 경로의 같은 머리 조기 반환은 유지한다. 완료 훅의 그림자 판단만 통과 리뷰를 다시 본다.
-  if (!regates.length && judgedHead && sameHead(toHead, judgedHead) && !landRetryPending(card, pr, toHead)) {
+  if (!adopted && !regates.length && judgedHead && sameHead(toHead, judgedHead) && !landRetryPending(card, pr, toHead)) {
     const unchangedReview = capturedLandReview(card, pr, toHead);
     if (!deps.shadowSameHead || deps.liveMoves.size !== 0 || !unchangedReview || !['pass', 'warn'].includes(unchangedReview.verdict) || unchangedReview.mustFixCount !== 0) {
       return target('head-unchanged', `PR #${pr} head is still the judged head`, pr, fromHead, toHead);
@@ -687,7 +785,8 @@ function recordMove(statePath: string, cardId: string, runId: string | undefined
 export function rejudgeCandidates(tasks: Readonly<Record<string, TaskCard>>): string[] {
   return Object.values(tasks).filter((card) => {
     const pr = cardPrNumber(card);
-    return pr !== undefined && ((card.reviewRequests ?? []).some((entry) => entry.pr === pr)
-      || (card.status === 'launched' && card.taLand === true && !!card.parentHost && !!card.runId && !!card.runChildId));
+    return pr !== undefined && !boundPrTerminal(card) && ((card.reviewRequests ?? []).some((entry) => entry.pr === pr)
+      || (card.status === 'launched' && card.taLand === true && ((!!card.parentHost && !!card.runId && !!card.runChildId)
+        || (card.adoptedPr?.pr === pr && typeof card.pr === 'object' && !!card.pr.url && sameUrl(card.adoptedPr.url, card.pr.url)))));
   }).map((card) => card.id);
 }

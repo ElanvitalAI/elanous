@@ -1,6 +1,7 @@
 import type { Command } from 'commander';
 import { ClaimsInputError, ClaimsLedger, type ClaimsLedgerOptions, type ClaimRow, type ClaimDetail } from '../claims/claims-ledger.js';
 import { renderClaims, queueStaleRechecks, type ClaimSurface } from '../claims/claims-render.js';
+import { PatentLedger, PatentsInputError, type PatentStatus, type PatentTrack } from '../patents/ledger.js';
 
 function actor(explicit?: string): string {
   const by = explicit?.trim() || process.env.AI_AGENT?.trim();
@@ -19,7 +20,7 @@ function handle<Args extends unknown[]>(command: string, action: (...args: Args)
   return (...args) => {
     try { action(...args); }
     catch (error) {
-      if (!(error instanceof ClaimsInputError)) throw error;
+      if (!(error instanceof ClaimsInputError) && !(error instanceof PatentsInputError)) throw error;
       const message = error.message.replace(/\r/g, '\\r').replace(/\n/g, '\\n')
         .replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
       process.stderr.write(`claims ${command}: ${message}\n`);
@@ -41,7 +42,19 @@ function detail(row: ClaimDetail): string {
 export function registerClaimsCommands(program: Command, options: ClaimsLedgerOptions & { instanceRoot?: string } = {}, out: Pick<Console, 'log'> = console): void {
   const root = program.command('claims').description('소구점 · 실측 근거 원장');
   const ledger = () => new ClaimsLedger(options);
+  const patentLedger = () => new PatentLedger(options);
   const emit = (value: unknown, json: boolean | undefined, text: string) => out.log(json ? JSON.stringify(value) : text);
+  const patents = root.command('patents').description('비공개 특허 후보 원장');
+  patents.command('add <id>').requiredOption('--title <title>').requiredOption('--track <track>')
+    .option('--deadline <YYYY-MM-DD>').action(handle('patents add', (id: string, o: { title: string; track: PatentTrack; deadline?: string }) => {
+      const row = patentLedger().add({ id, title: o.title, track: o.track, ...(o.deadline ? { deadline: o.deadline } : {}) });
+      emit(row, false, `${row.id} · ${row.status}`);
+    }));
+  patents.command('status <id>').requiredOption('--status <status>')
+    .action(handle('patents status', (id: string, o: { status: PatentStatus }) => {
+      const row = patentLedger().setStatus(id, o.status);
+      emit(row, false, `${row.id} · ${row.status}`);
+    }));
   root.command('add <id>').requiredOption('--claim <text>').requiredOption('--audience <list>').requiredOption('--owner <seat>')
     .option('--contrast <text>').action(handle('add', (id: string, o: { claim: string; audience: string; owner: string; contrast?: string }) => {
       const row = ledger().add({ id, claim: o.claim, audience: o.audience, owner: o.owner, ...(o.contrast ? { contrast: o.contrast } : {}) });
@@ -79,9 +92,16 @@ export function registerClaimsCommands(program: Command, options: ClaimsLedgerOp
     emit(row, o.json, detail(row));
   }));
   root.command('render').requiredOption('--surface <surface>', 'deck | site | notice')
-    .option('--audience <audience>').option('--json')
-    .action(handle('render', (o: { surface: ClaimSurface; audience?: string; json?: boolean }) => {
-      const result = renderClaims(ledger(), { surface: o.surface, ...(o.audience ? { audience: o.audience } : {}) });
+    .option('--audience <audience>').option('--include-patents', '명시적으로 공개 허용 특허 후보를 포함')
+    .option('--patent-owner <owner>', '특허 후보의 확인된 담당').option('--json')
+    .action(handle('render', (o: { surface: ClaimSurface; audience?: string; includePatents?: boolean; patentOwner?: string; json?: boolean }) => {
+      if (o.includePatents && (!o.patentOwner?.trim() || !o.audience?.trim())) {
+        throw new ClaimsInputError('--include-patents requires --patent-owner and --audience');
+      }
+      if (!o.includePatents && o.patentOwner) throw new ClaimsInputError('--patent-owner requires --include-patents');
+      const patents = o.includePatents
+        ? { ledger: patentLedger(), owner: o.patentOwner!, audience: o.audience! } : undefined;
+      const result = renderClaims(ledger(), { surface: o.surface, ...(o.audience ? { audience: o.audience } : {}), ...(patents ? { patents } : {}) });
       // Review follow-up: rendering is where stale claims surface — queue their re-measurement in the same act.
       const rechecks = result.excluded.some(item => item.reason === 'stale')
         ? queueStaleRechecks(ledger(), { root: options.instanceRoot, now: options.now?.() }) : 0;

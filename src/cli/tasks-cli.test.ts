@@ -8,16 +8,216 @@ import { join, relative } from 'node:path';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { addItem, checklistDevVersion } from '../release-loop/checklist.js';
-import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
+import { appendRunLedgerEntry, loadRunLedger, type RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { GoalAskStore } from '../self-implement/goal-ask-store.js';
 import { GoalRunStore, goalRunDbPath } from '../self-implement/goal-run-store.js';
 import { runHostRegate } from '../self-implement/host-regate.js';
 import type { LogStoreRow } from '../mss/logging/log-store.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from '../task-agent/task-hand.js';
+import { rejudgeCandidates } from '../task-agent/rejudge-on-head.js';
+import { adoptExistingPr, adoptedRunTerminal } from '../task-agent/adopt-pr.js';
 import type { BoardNode } from '../task-agent/board.js';
 import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TasksCliDeps } from './tasks-cli.js';
 
 const token = 'secret-acp-token-sentinel';
+test('tasks adopt-pr binds an existing OPEN PR once without relaunch and queues head rejudge', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ta-adopt-pr-'));
+  try {
+    const path = join(dir, 'cards.json');
+    const card: TaskCard = { id: 'ta-20261013-adopt', text: 'existing', checklistId: 'EXPORT-CHECK-PWA-DEPS', status: 'launched', runId: 'run-stopped', createdAt: '2026-10-13T00:00:00Z', history: [] };
+    writeTaskCards(path, [card]);
+    let launched = 0;
+    const deps: TasksCliDeps = {
+      taskStatePath: path, registerSink: async () => {}, taskLauncher: async () => { launched++; },
+      releaseVersions: () => ['0.2.26'],
+      adoptRunTerminal: () => true,
+      adoptChecklist: (version) => ({ version, released: '', dev: '', items: version === '0.2.26' ? [{ id: card.checklistId!, title: 'work', status: 'yellow', updatedAt: '', updatedBy: '' }] : [], history: [] }),
+      adoptPrView: () => ({ number: 26619, url: 'https://github.com/ElanvitalAI/elanous/pull/26619', state: 'OPEN', baseRefName: 'main', headRefOid: 'a'.repeat(40) }),
+    };
+    const first = await run(['tasks', 'adopt-pr', '26619', '--card', card.id, '--json'], deps);
+    const second = await run(['tasks', 'adopt-pr', '26619', '--card', card.id, '--json'], deps);
+    expect(first.code ?? 0).toBe(0);
+    expect(JSON.parse(first.lines[0]!).changed).toBe(true);
+    expect(JSON.parse(second.lines[0]!).changed).toBe(false);
+    const bound = readTaskCard(card.id, path)!;
+    writeTaskCards(path, [{ ...bound, status: 'done' }]);
+    const afterClose = await run(['tasks', 'adopt-pr', '26619', '--card', card.id], deps);
+    expect(afterClose.code).toBe(1);
+    expect(afterClose.lines[0]).toContain('이미 닫힌 입양 카드');
+    writeTaskCards(path, [bound]);
+    expect(bound.pr).toEqual({ number: 26619, url: 'https://github.com/ElanvitalAI/elanous/pull/26619' });
+    expect(bound.checklistVersion).toBe('0.2.26');
+    expect(bound.history.filter((item) => item.event === 'pr-adopted')).toHaveLength(1);
+    expect(rejudgeCandidates({ [card.id]: bound })).toEqual([card.id]);
+    expect(launched).toBe(0);
+    const tick = await run(['tasks', 'rejudge', '--all'], { ...deps, rejudge: { liveMoves: new Set(),
+      live: { repoCandidates: () => [{ source: 'host', cwd: dir }], prHead: async () => ({ head: 'a'.repeat(40), state: 'OPEN', url: bound.pr && typeof bound.pr === 'object' ? bound.pr.url! : '', branch: 'feature' }) },
+    } });
+    expect(tick.lines.some((line) => line.includes(`${card.id}\tPR #26619`) && line.includes('would-review'))).toBe(true);
+    expect(launched).toBe(0);
+    const ambiguousDir = mkdtempSync(join(tmpdir(), 'ta-adopt-ambiguous-'));
+    try {
+      const ambiguousPath = join(ambiguousDir, 'cards.json');
+      writeTaskCards(ambiguousPath, [card]);
+      const ambiguous = await run(['tasks', 'adopt-pr', '26619', '--card', card.id], {
+        ...deps, taskStatePath: ambiguousPath,
+        adoptChecklist: (version) => ({ version, released: '', dev: '', items: [{ id: card.checklistId!, title: 'work', status: 'yellow', updatedAt: '', updatedBy: '' }], history: [] }),
+      });
+      expect(ambiguous.code).toBe(1);
+      expect(ambiguous.lines[0]).toContain('--version 지정');
+      expect(readTaskCard(card.id, ambiguousPath)?.pr).toBeUndefined();
+    } finally { rmSync(ambiguousDir, { recursive: true, force: true }); }
+    const completed = await run(['tasks', 'adopt-pr', '26619', '--card', card.id, '--version', '0.2.26'], {
+      ...deps, adoptChecklist: (version) => ({ version, released: '', dev: '', items: [{ id: card.checklistId!, title: 'work', status: 'green', updatedAt: '', updatedBy: '' }], history: [] }),
+    });
+    expect(completed.code).toBe(1);
+    expect(completed.lines[0]).toContain('이미 완료된 칸');
+    const pendingDir = mkdtempSync(join(tmpdir(), 'ta-adopt-pending-'));
+    try {
+      const pendingPath = join(pendingDir, 'cards.json');
+      writeTaskCards(pendingPath, [{ ...card, runId: undefined, launchId: 'tl-pending' }]);
+      const pending = await run(['tasks', 'adopt-pr', '26619', '--card', card.id, '--version', '0.2.26'],
+        { ...deps, taskStatePath: pendingPath, adoptRunTerminal: undefined });
+      expect(pending.code).toBe(1);
+      expect(pending.lines[0]).toContain('런 종결·PR 근거가 없다');
+      expect(readTaskCard(card.id, pendingPath)?.pr).toBeUndefined();
+    } finally { rmSync(pendingDir, { recursive: true, force: true }); }
+    const closed = await run(['tasks', 'adopt-pr', '26619', '--card', card.id], { ...deps, adoptPrView: () => ({ ...deps.adoptPrView!(26619, ''), state: 'CLOSED' }) });
+    expect(closed.code).toBe(1);
+    const wrongVersion = await run(['tasks', 'adopt-pr', '26619', '--card', card.id, '--version', '0.2.27'], {
+      ...deps, adoptChecklist: (version) => ({ version, released: '', dev: '', items: [{ id: card.checklistId!, title: 'work', status: 'yellow', updatedAt: '', updatedBy: '' }], history: [] }),
+    });
+    expect(wrongVersion.code).toBe(1);
+    expect(wrongVersion.lines[0]).toContain('판이 다르다');
+    const raced = await run(['tasks', 'adopt-pr', '26619', '--card', card.id], { ...deps,
+      adoptRunTerminal: () => {
+        const disk = JSON.parse(readFileSync(path, 'utf8'));
+        disk.tasks[card.id].runId = 'run-new';
+        writeFileSync(path, JSON.stringify(disk));
+        return true;
+      },
+    });
+    expect(raced.code).toBe(1);
+    expect(raced.lines[0]).toContain('런 식별자가 바뀌었다');
+    writeTaskCards(path, [bound]);
+    const movedCell = await run(['tasks', 'adopt-pr', '26619', '--card', card.id], { ...deps,
+      adoptRunTerminal: () => {
+        const disk = JSON.parse(readFileSync(path, 'utf8'));
+        disk.tasks[card.id].checklistId = 'OTHER-CELL';
+        writeFileSync(path, JSON.stringify(disk));
+        return true;
+      },
+    });
+    expect(movedCell.code).toBe(1);
+    expect(movedCell.lines[0]).toContain('카드 칸·판이 바뀌었다');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('new-card PR adoption pins the selected checklist version and rejects a second PR binding', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ta-adopt-version-'));
+  try {
+    const path = join(dir, 'cards.json');
+    const pr = { number: 80, url: 'https://github.com/ElanvitalAI/elanous/pull/80', state: 'OPEN', baseRefName: 'main', headRefOid: 'b'.repeat(40) };
+    const result = adoptExistingPr({ pr, repo: 'ElanvitalAI/elanous', statePath: path, checklist: { version: '0.2.26', id: 'CELL', title: 'work', status: 'yellow' } });
+    expect(result.card.checklistVersion).toBe('0.2.26');
+    expect(result.card.status).toBe('launched');
+    expect(() => adoptExistingPr({ pr, repo: 'ElanvitalAI/elanous', statePath: path, checklist: { version: '0.2.26', id: 'CELL', title: 'work', status: 'yellow' } })).toThrow('이미 카드');
+    expect(() => adoptExistingPr({ pr, repo: 'another/repo', statePath: path, checklist: { version: '0.2.26', id: 'CELL', title: 'work', status: 'yellow' } })).toThrow('OPEN/main');
+    const second: TaskCard = { id: 'ta-second', text: 'same cell', checklistId: 'CELL', createdAt: '2026-10-13T00:00:00Z', status: 'launched', history: [] };
+    writeTaskCards(path, [result.card, second]);
+    expect(() => adoptExistingPr({ pr: { ...pr, number: 81, url: pr.url.replace('/80', '/81') }, repo: 'ElanvitalAI/elanous', statePath: path,
+      cardId: second.id, version: '0.2.26', observedRun: {} })).toThrow('이미 TA 착지 후보');
+    writeFileSync(path, JSON.stringify({ tasks: { [second.id]: second } }));
+    expect(() => adoptExistingPr({ pr: { ...pr, number: 82, url: pr.url.replace('/80', '/82') }, repo: 'ElanvitalAI/elanous', statePath: path,
+      checklist: { version: '0.2.26', id: 'CELL', title: 'work', status: 'yellow' } })).toThrow('--card로 그 카드를 선택');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('tasks adopt-pr promotes a registry-bound PR only with terminal proof and the same URL', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ta-adopt-bound-'));
+  try {
+    const path = join(dir, 'cards.json');
+    const url = 'https://github.com/ElanvitalAI/elanous/pull/26619';
+    const card: TaskCard = { id: 'ta-registry-bound', text: 'existing', checklistId: 'CELL', status: 'launched',
+      runId: 'run-parent', createdAt: '2026-10-13T00:00:00Z', history: [], pr: { number: 26619, url } };
+    writeTaskCards(path, [card]);
+    const ledgerDir = join(dir, 'run-ledger');
+    appendRunLedgerEntry({ runId: 'run-parent', event: 'pod-child-run', data: { childRunId: 'run-child' } }, ledgerDir);
+    appendRunLedgerEntry({ runId: 'run-child', event: 'pr-opened', data: { number: 26619, url } }, ledgerDir);
+    const deps: TasksCliDeps = { taskStatePath: path, registerSink: async () => {},
+      releaseVersions: () => ['0.2.26'],
+      adoptRunTerminal: (card, pr, _load, allowUnlinked) => adoptedRunTerminal(card, pr,
+        (id) => loadRunLedger(id, ledgerDir), allowUnlinked),
+      adoptChecklist: (version) => ({ version, released: '', dev: '', items: version === '0.2.26'
+        ? [{ id: 'CELL', title: 'work', status: 'yellow', updatedAt: '', updatedBy: '' }] : [], history: [] }),
+      adoptPrView: () => ({ number: 26619, url, state: 'OPEN', baseRefName: 'main', headRefOid: 'a'.repeat(40) }),
+    };
+    const pending = await run(['tasks', 'adopt-pr', '26619', '--card', card.id], deps);
+    expect(pending.code).toBe(1);
+    expect(readTaskCard(card.id, path)?.taLand).toBeUndefined();
+    appendRunLedgerEntry({ runId: 'run-child', event: 'run-status', data: { runStatus: 'completed' } }, ledgerDir);
+    const promoted = await run(['tasks', 'adopt-pr', '26619', '--card', card.id, '--json'], deps);
+    expect(promoted.code ?? 0).toBe(0);
+    expect(JSON.parse(promoted.lines[0]!).changed).toBe(true);
+    const bound = readTaskCard(card.id, path)!;
+    expect(bound.taLand).toBe(true);
+    expect(bound.adoptedPr?.pr).toBe(26619);
+    expect(rejudgeCandidates({ [card.id]: bound })).toEqual([card.id]);
+    writeTaskCards(path, [{ ...card, pr: { number: 26619, url: `${url}/wrong` } }]);
+    const wrongUrl = await run(['tasks', 'adopt-pr', '26619', '--card', card.id], deps);
+    expect(wrongUrl.code).toBe(1);
+    expect(readTaskCard(card.id, path)?.taLand).toBeUndefined();
+    writeTaskCards(path, [card]);
+    const racedBinding = await run(['tasks', 'adopt-pr', '26619', '--card', card.id], { ...deps,
+      adoptRunTerminal: () => {
+        writeTaskCards(path, [{ ...card, pr: { number: 26620, url: url.replace('26619', '26620') } }]);
+        return true;
+      },
+    });
+    expect(racedBinding.code).toBe(1);
+    expect(readTaskCard(card.id, path)?.taLand).toBeUndefined();
+    writeTaskCards(path, [card]);
+    rmSync(ledgerDir, { recursive: true, force: true });
+    appendRunLedgerEntry({ runId: 'run-parent', event: 'pod-child-run', data: { childRunId: 'run-child' } }, ledgerDir);
+    appendRunLedgerEntry({ runId: 'run-child', event: 'run-status', data: { runStatus: 'completed' } }, ledgerDir);
+    const unlinked = await run(['tasks', 'adopt-pr', '26619', '--card', card.id, '--unlinked-terminal'], deps);
+    expect(unlinked.code).toBe(1);
+    expect(unlinked.lines[0]).toContain('--unlinked-terminal');
+    expect(readTaskCard(card.id, path)?.taLand).toBeUndefined();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('adoption of a launched run requires the exact child PR and terminal status', () => {
+  const pr = { number: 80, url: 'https://github.com/ElanvitalAI/elanous/pull/80', state: 'OPEN', baseRefName: 'main', headRefOid: 'b'.repeat(40) };
+  const card: TaskCard = { id: 'ta-running', text: 'work', checklistId: 'CELL', createdAt: '2026-10-13T00:00:00Z', status: 'launched', history: [], runId: 'run-parent' };
+  const parent: RunLedgerEntry[] = [{ runId: 'run-parent', timestamp: '', event: 'pod-child-run', data: { childRunId: 'run-child' } }];
+  const child: RunLedgerEntry[] = [{ runId: 'run-child', timestamp: '', event: 'pr-opened', data: { number: 80, url: pr.url } }];
+  const load = (id: string) => id === 'run-parent' ? parent : child;
+  expect(adoptedRunTerminal(card, pr, load as Parameters<typeof adoptedRunTerminal>[2])).toBe(false);
+  expect(adoptedRunTerminal({ ...card, runId: undefined, launchId: 'tl-pending' }, pr, load as Parameters<typeof adoptedRunTerminal>[2])).toBe(false);
+  child.push({ runId: 'run-child', timestamp: '', event: 'run-status', data: { runStatus: 'completed' } });
+  expect(adoptedRunTerminal(card, pr, load as Parameters<typeof adoptedRunTerminal>[2])).toBe(true);
+  expect(adoptedRunTerminal(card, { ...pr, number: 81, url: pr.url.replace('/80', '/81') }, load as Parameters<typeof adoptedRunTerminal>[2])).toBe(false);
+  child.push({ runId: 'run-child', timestamp: '', event: 'run-status', data: { runStatus: 'running' } });
+  expect(adoptedRunTerminal(card, pr, load as Parameters<typeof adoptedRunTerminal>[2])).toBe(false);
+  child.splice(0, child.length, { runId: 'run-child', timestamp: '', event: 'run-status', data: { runStatus: 'completed' } },
+    { runId: 'run-child', timestamp: '', event: 'pr-opened', data: { number: 80, url: pr.url } });
+  expect(adoptedRunTerminal(card, pr, load as Parameters<typeof adoptedRunTerminal>[2])).toBe(false);
+  child.splice(0, child.length, { runId: 'run-child', timestamp: '', event: 'run-status', data: { runStatus: 'completed' } });
+  expect(adoptedRunTerminal(card, pr, load as Parameters<typeof adoptedRunTerminal>[2])).toBe(false);
+  expect(adoptedRunTerminal(card, pr, load as Parameters<typeof adoptedRunTerminal>[2], true)).toBe(true);
+  child.push({ runId: 'run-child', timestamp: '', event: 'run-status', data: { runStatus: 'running' } });
+  expect(adoptedRunTerminal(card, pr, load as Parameters<typeof adoptedRunTerminal>[2], true)).toBe(false);
+  const siblingParent: RunLedgerEntry[] = [...parent, { runId: 'run-parent', timestamp: '', event: 'pod-child-run', data: { childRunId: 'run-sibling' } }];
+  const stoppedChild: RunLedgerEntry[] = [{ runId: 'run-child', timestamp: '', event: 'pr-opened', data: { number: 80, url: pr.url } },
+    { runId: 'run-child', timestamp: '', event: 'run-status', data: { runStatus: 'completed' } }];
+  const runningSibling: RunLedgerEntry[] = [{ runId: 'run-sibling', timestamp: '', event: 'pr-opened', data: { number: 80, url: pr.url } },
+    { runId: 'run-sibling', timestamp: '', event: 'run-status', data: { runStatus: 'running' } }];
+  const siblings = (id: string) => id === 'run-parent' ? siblingParent : id === 'run-child' ? stoppedChild : runningSibling;
+  expect(adoptedRunTerminal(card, pr, siblings as Parameters<typeof adoptedRunTerminal>[2])).toBe(false);
+  runningSibling[1] = { runId: 'run-sibling', timestamp: '', event: 'run-status', data: { runStatus: 'completed' } };
+  expect(adoptedRunTerminal(card, pr, siblings as Parameters<typeof adoptedRunTerminal>[2])).toBe(false);
+});
 const tasks = [
   { id: 'low', title: 'Low task', status: 'backlog', priority: 'low', createdAt: 1, approval: { state: 'pending' }, generatedBy: { kind: 'external', provider: 'linear', ref: 'L-1' } },
   { id: 'urgent', title: 'Urgent task', status: 'backlog', priority: 'urgent', createdAt: 4, approval: { state: 'pending' }, generatedBy: { kind: 'external', provider: 'linear', ref: 'L-4' } },
@@ -64,9 +264,9 @@ test('tasks cover --json reads two filtered log sources and measures land withou
   const result = await run(['tasks', 'cover', '--since', since, '--until', until, '--json'], {
     coverLogs: (query) => {
       queries.push(query);
-      const payloads = query.exactCategories?.[0] === 'task-agent'
-        ? [{ kind: 'land', result: 'done' }, { kind: 'review', result: 'done' }, { kind: 'review', result: 'done' }, { kind: 'land', result: 'failed' }]
-        : [...Array.from({ length: 4 }, () => ({ step: 'merge', ok: true })), { step: 'merge', ok: false }];
+      const payloads = query.events?.[0] === 'action'
+        ? [{ kind: 'land', result: 'done', taskId: 'ta-land' }, { kind: 'review', result: 'done' }, { kind: 'review', result: 'done' }, { kind: 'land', result: 'failed' }]
+        : query.events?.[0] === 'step' ? [...Array.from({ length: 4 }, () => ({ step: 'merge', ok: true })), { step: 'merge', ok: false }] : [];
       return payloads.map((data) => ({ category: query.exactCategories![0], event: query.events![0], data: JSON.stringify(data) }) as LogStoreRow);
     },
   });
@@ -74,29 +274,189 @@ test('tasks cover --json reads two filtered log sources and measures land withou
   expect(queries.map((query) => [query.exactCategories, query.events, query.sinceMs, query.untilMs])).toEqual([
     [['task-agent'], ['action'], Date.parse(since), Date.parse(until)],
     [['pr.land'], ['step'], Date.parse(since), Date.parse(until)],
+    [['task-agent'], ['live-move'], Date.parse(since), Date.parse(until)],
+    [['task-agent.land-order'], ['appended'], Date.parse(since), Date.parse(until)],
   ]);
   expect(JSON.parse(result.lines[0]!).rows).toContainEqual({ verb: 'land', byTaskAgent: 1, total: 4, observedActions: 2, ratio: 0.25, state: 'measured', liveActions: 2, shadowActions: 0, stewardTransition: 'observed' });
   expect(JSON.parse(result.lines[0]!).rows[1]).toEqual({ verb: 'review', byTaskAgent: 2, total: null, observedActions: 2, ratio: null, state: 'no-denominator', liveActions: 2, shadowActions: 0, stewardTransition: 'unmeasured' });
   expect(JSON.parse(result.lines[0]!).sevenVerbs.verbs[4]).toEqual({ verb: '저작', source: 'goal-ask+goal-run', liveDone: 0, shadow: 0, state: 'none' });
 });
 
+test('tasks cover reads prod by default and includes test stores only by explicit flag', async () => {
+  const scopes: boolean[] = [];
+  const coverLogs: NonNullable<TasksCliDeps['coverLogs']> = (query, includeTest) => {
+    scopes.push(includeTest === true);
+    const category = query.exactCategories![0]!;
+    const event = query.events![0]!;
+    const data = event === 'action' ? { kind: 'land', result: 'done', taskId: 'ta-land' } : { step: 'merge', ok: true };
+    const row = { category, event, data: JSON.stringify(data) } as LogStoreRow;
+    return event === 'action' || event === 'step' ? includeTest ? [row, row] : [row] : [];
+  };
+  const prod = await run(['tasks', 'cover', '--json'], { coverLogs });
+  const withTest = await run(['tasks', 'cover', '--include-test', '--json'], { coverLogs });
+  expect(scopes).toEqual([false, false, false, false, true, true, true, true]);
+  expect(JSON.parse(prod.lines[0]!).rows[0]).toMatchObject({ byTaskAgent: 1, total: 1, state: 'measured' });
+  expect(JSON.parse(withTest.lines[0]!).rows[0]).toMatchObject({ byTaskAgent: 1, total: 2, state: 'measured' });
+});
+
+test('tasks cover counts prod live-move and land-order attempts without treating skipped moves as landings', async () => {
+  const card = 'ta-20261012-44c03a';
+  const result = await run(['tasks', 'cover', '--json'], {
+    coverLogs: (query, includeTest) => {
+      expect(includeTest).toBe(false);
+      const category = query.exactCategories?.[0];
+      const event = query.events?.[0];
+      const data = category === 'task-agent' && event === 'live-move'
+        ? { kind: 'land', card, executed: false, ok: true, live: true }
+        : category === 'task-agent.land-order' && event === 'appended'
+          ? { pr: 26931, head: '8fac058df29caa79aa57d1319a93106ff059cf57' }
+          : null;
+      return data === null ? [] : [{ category, event, data: JSON.stringify(data) } as LogStoreRow];
+    },
+  });
+  const body = JSON.parse(result.lines[0]!);
+  expect(body.landSignals).toEqual({ liveMoveEvents: 1, executedLiveMoves: 0, landOrderEvents: 1 });
+  expect(body.rows[0]).toMatchObject({ byTaskAgent: 0, total: 0, state: 'no-denominator' });
+});
+
+test('tasks cover counts the successful land executor event in the measured numerator', async () => {
+  const result = await run(['tasks', 'cover', '--json'], {
+    coverLogs: (query) => {
+      const category = query.exactCategories?.[0];
+      const event = query.events?.[0];
+      const data = category === 'task-agent' && event === 'live-move'
+        ? { kind: 'land', card: 'ta-20261012-44c03a', executed: true, ok: true }
+        : category === 'pr.land' && event === 'step' ? { step: 'merge', ok: true } : null;
+      return data === null ? [] : [{ category, event, data: JSON.stringify(data) } as LogStoreRow];
+    },
+  });
+  const body = JSON.parse(result.lines[0]!);
+  expect(body.rows[0]).toMatchObject({ byTaskAgent: 1, total: 1, ratio: 1, state: 'measured', observedActions: 0, liveActions: 0 });
+  expect(body.sevenVerbs.verbs[1]).toMatchObject({ verb: '착지', liveDone: 1, state: 'live' });
+  expect(body.landSignals).toEqual({ liveMoveEvents: 1, executedLiveMoves: 1, landOrderEvents: 0 });
+});
+
+test('tasks cover does not assert a land ratio when live-move source is unreadable or bounded', async () => {
+  const row = (category: string, event: string, data: object) =>
+    ({ category, event, data: JSON.stringify(data) }) as LogStoreRow;
+  const read = (bounded: boolean) => run(['tasks', 'cover', '--json'], {
+    coverLogs: (query) => {
+      const category = query.exactCategories![0]!;
+      const event = query.events![0]!;
+      if (event === 'live-move') {
+        if (!bounded) throw new Error('store unreadable');
+        return { rows: [row(category, event, { kind: 'land', card: 'ta-land', executed: true, ok: true })],
+          limitReached: true, unreadableStores: 0, storesRead: 1 };
+      }
+      return event === 'step' ? [row(category, event, { step: 'merge', ok: true })] : [];
+    },
+  });
+  for (const bounded of [false, true]) {
+    const body = JSON.parse((await read(bounded)).lines[0]!);
+    expect(body.rows[0]).toMatchObject({ byTaskAgent: null, total: 1, ratio: null, state: 'unreadable' });
+    expect(body.sevenVerbs.verbs[1]).toMatchObject({ liveDone: null, state: 'unreadable' });
+    expect(body.limitReached).toBe(bounded);
+  }
+});
+
+test('tasks cover marks a successful live-move without card identity unreadable', async () => {
+  const result = await run(['tasks', 'cover', '--json'], {
+    coverLogs: (query) => {
+      const category = query.exactCategories![0]!;
+      const event = query.events![0]!;
+      const data = event === 'live-move' ? { kind: 'land', executed: true, ok: true }
+        : event === 'step' ? { step: 'merge', ok: true } : null;
+      return data === null ? [] : [{ category, event, data: JSON.stringify(data) } as LogStoreRow];
+    },
+  });
+  const body = JSON.parse(result.lines[0]!);
+  expect(body.rows[0]).toMatchObject({ byTaskAgent: null, total: 1, state: 'unreadable', ratio: null });
+  expect(body.sevenVerbs.verbs[1]).toMatchObject({ liveDone: null, state: 'unreadable' });
+});
+
+test('tasks cover treats missing or invalid live-move outcome as unreadable', async () => {
+  for (const move of [
+    { kind: 'land', card: 'ta-land', executed: true },
+    { kind: 'land', card: 'ta-land', executed: true, ok: 'unknown' },
+    { kind: 'land', card: 'ta-land', ok: true },
+    { kind: 'land', card: 'ta-land', executed: false },
+    { kind: 'land', executed: false, ok: true },
+    { kind: 'land', executed: true, ok: false },
+    { card: 'ta-land', executed: true, ok: true },
+  ]) {
+    const result = await run(['tasks', 'cover', '--json'], {
+      coverLogs: (query) => {
+        const category = query.exactCategories![0]!;
+        const event = query.events![0]!;
+        const data = event === 'live-move' ? move : event === 'step' ? { step: 'merge', ok: true } : null;
+        return data === null ? [] : [{ category, event, data: JSON.stringify(data) } as LogStoreRow];
+      },
+    });
+    const body = JSON.parse(result.lines[0]!);
+    expect(body.rows[0]).toMatchObject({ byTaskAgent: null, total: 1, state: 'unreadable', ratio: null });
+    expect(body.landSignals.liveMoveEvents).toBeNull();
+  }
+});
+
+test('tasks cover does not drop invalid JSON from its land-move source', async () => {
+  const result = await run(['tasks', 'cover', '--json'], {
+    coverLogs: (query) => {
+      const category = query.exactCategories![0]!;
+      const event = query.events![0]!;
+      return event === 'live-move' ? [{ category, event, data: '{broken' } as LogStoreRow]
+        : event === 'step' ? [{ category, event, data: JSON.stringify({ step: 'merge', ok: true }) } as LogStoreRow] : [];
+    },
+  });
+  expect(JSON.parse(result.lines[0]!).rows[0]).toMatchObject({ byTaskAgent: null, total: 1, state: 'unreadable' });
+});
+
+test('tasks cover marks incomplete or corrupt land-action records unreadable', async () => {
+  for (const data of [
+    JSON.stringify({ kind: 'land', taskId: 'ta-land' }),
+    JSON.stringify({ kind: 'land', result: 'done' }),
+    '{broken',
+  ]) {
+    const result = await run(['tasks', 'cover', '--json'], {
+      coverLogs: (query) => {
+        const category = query.exactCategories![0]!;
+        const event = query.events![0]!;
+        return event === 'action' ? [{ category, event, data } as LogStoreRow]
+          : event === 'step' ? [{ category, event, data: JSON.stringify({ step: 'merge', ok: true }) } as LogStoreRow] : [];
+      },
+    });
+    expect(JSON.parse(result.lines[0]!).rows[0]).toMatchObject({ byTaskAgent: null, total: 1, state: 'unreadable' });
+  }
+});
+
+test('tasks cover does not use a malformed merge-step denominator', async () => {
+  const result = await run(['tasks', 'cover', '--json'], {
+    coverLogs: (query) => {
+      const category = query.exactCategories![0]!;
+      const event = query.events![0]!;
+      return event === 'step' ? [{ category, event, data: '{broken' } as LogStoreRow] : [];
+    },
+  });
+  expect(JSON.parse(result.lines[0]!).rows[0]).toMatchObject({ byTaskAgent: 0, total: null, state: 'unreadable' });
+});
+
 test('tasks cover --lines uses the one-line formatter on the read-only observation path', async () => {
   const queries: string[] = [];
-  const result = await run(['tasks', 'cover', '--lines'], { coverLogs: (query) => {
+  const result = await run(['tasks', 'cover', '--lines'], { coverImplementCardRuns: () => [], coverImplementRunMerges: () => new Map(), coverLogs: (query) => {
     queries.push(query.exactCategories![0]!);
-    const data = query.exactCategories?.[0] === 'task-agent'
-      ? [{ kind: 'land', result: 'done' }, { kind: 'land', result: 'shadow' }, { kind: 'review', result: 'shadow' }]
-      : [{ step: 'merge', ok: true }, { step: 'merge', ok: true }];
+    const data = query.events?.[0] === 'action'
+      ? [{ kind: 'land', result: 'done', taskId: 'ta-land' }, { kind: 'land', result: 'shadow' }, { kind: 'review', result: 'shadow' }]
+      : query.events?.[0] === 'step' ? [{ step: 'merge', ok: true }, { step: 'merge', ok: true }] : [];
     return data.map((item) => ({ category: query.exactCategories![0], event: query.events![0], data: JSON.stringify(item) }) as LogStoreRow);
   } });
   expect(result.code ?? 0).toBe(0);
-  expect(queries).toEqual(['task-agent', 'pr.land']);
+  expect(queries).toEqual(['task-agent', 'pr.land', 'task-agent', 'task-agent.land-order']);
   expect(result.lines).toEqual([
     'land: TA 1/2 (50.0%) · live 1 · shadow 1 · steward-transition observed',
     'review: TA 0/- (-) · live 0 · shadow 1 · steward-transition unmeasured',
     'retry: TA 0/- (-) · live 0 · shadow 0 · steward-transition unmeasured',
     'green: TA 0/- (-) · live 0 · shadow 0 · steward-transition unmeasured',
-    '7동사 live 1/7 · 출처 없음 구현·정리',
+    '7동사 live 1/7 · 출처 없음 정리',
+    '착지 시도 관측: live-move 0 · 집행 0 · land-order 0 (병합 수와 별개)',
   ]);
 });
 
@@ -140,7 +500,7 @@ test('tasks cover --json keeps a single JSON result and declares when a source r
 });
 
 test('tasks cover marks land unknown when a bounded merge query has successful merges', async () => {
-  const action = { category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'land', result: 'done' }) } as LogStoreRow;
+  const action = { category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'land', result: 'done', taskId: 'ta-land' }) } as LogStoreRow;
   const merge = { category: 'pr.land', event: 'step', data: JSON.stringify({ step: 'merge', ok: true }) } as LogStoreRow;
   const result = await run(['tasks', 'cover', '--json'], {
     coverLogs: (query) => query.exactCategories?.[0] === 'task-agent' ? [action] : Array(100_000).fill(merge),
@@ -151,7 +511,7 @@ test('tasks cover marks land unknown when a bounded merge query has successful m
 });
 
 test('tasks cover --json takes a federated read and says how many stores it could not read', async () => {
-  const action = { category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'land', result: 'done' }) } as LogStoreRow;
+  const action = { category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'land', result: 'done', taskId: 'ta-land' }) } as LogStoreRow;
   const merge = { category: 'pr.land', event: 'step', data: JSON.stringify({ step: 'merge', ok: true }) } as LogStoreRow;
   const result = await run(['tasks', 'cover', '--json'], {
     coverLogs: (query) => ({
@@ -166,9 +526,10 @@ test('tasks cover --json takes a federated read and says how many stores it coul
 });
 
 test('tasks cover --json includes the seven-verb live measurement', async () => {
-  const action = (kind: string, result: string) => ({ category: 'task-agent', event: 'action', data: JSON.stringify({ kind, result }) }) as LogStoreRow;
+  const action = (kind: string, result: string) => ({ category: 'task-agent', event: 'action', data: JSON.stringify({ kind, result, ...(kind === 'land' ? { taskId: 'ta-land' } : {}) }) }) as LogStoreRow;
   const merge = { category: 'pr.land', event: 'step', data: JSON.stringify({ step: 'merge', ok: true }) } as LogStoreRow;
   const result = await run(['tasks', 'cover', '--json'], {
+    coverImplementCardRuns: () => [], coverImplementRunMerges: () => new Map(),
     coverLogs: (query) => query.exactCategories?.[0] === 'task-agent'
       ? [action('review', 'done'), action('land', 'done'), action('retry', 'shadow')]
       : [merge],
@@ -181,12 +542,120 @@ test('tasks cover --json includes the seven-verb live measurement', async () => 
       { verb: '수리', source: 'retry', liveDone: 0, shadow: 1, state: 'shadow-only' },
       { verb: '검증', source: 'green', liveDone: 0, shadow: 0, state: 'none' },
       { verb: '저작', source: 'goal-ask+goal-run', liveDone: 0, shadow: 0, state: 'none' },
-      { verb: '구현', source: null, liveDone: null, shadow: null, state: 'no-source' },
+      { verb: '구현', source: 'card-run+merged', liveDone: 0, shadow: 0, state: 'none' },
       { verb: '정리', source: null, liveDone: null, shadow: null, state: 'no-source' },
     ],
     liveVerbs: 2,
-    measuredVerbs: 5,
+    measuredVerbs: 6,
   });
+});
+
+test('tasks cover joins bound card runs to merged run-ledger events for the 구현 verb', async () => {
+  const action = (kind: string, result: string) => ({ category: 'task-agent', event: 'action', data: JSON.stringify({ kind, result, ...(kind === 'land' ? { taskId: 'ta-land' } : {}) }) }) as LogStoreRow;
+  const merge = { category: 'pr.land', event: 'step', data: JSON.stringify({ step: 'merge', ok: true }) } as LogStoreRow;
+  const coverLogs: NonNullable<TasksCliDeps['coverLogs']> = (query) => query.exactCategories?.[0] === 'task-agent'
+    ? [action('review', 'done')]
+    : [merge];
+  const deps: TasksCliDeps = {
+    coverLogs,
+    coverImplementCardRuns: () => [
+      { cardId: 'c-merged', runId: 'run-merged' },
+      { cardId: 'c-merged', runId: 'run-merged' },
+      { cardId: 'c-failed', runId: 'run-failed' },
+      { cardId: 'c-child', runId: 'run-parent', runChildId: 'run-child' },
+    ],
+    coverImplementRunMerges: () => new Map([
+      ['run-merged', { merged: true }],
+      ['run-child', { merged: true }],
+      ['run-failed', { merged: false }],
+      ['run-unrelated', { merged: true }],
+    ]),
+  };
+  const result = await run(['tasks', 'cover', '--json'], deps);
+  const body = JSON.parse(result.lines[0]!);
+  expect(body.sevenVerbs.verbs[5]).toEqual({ verb: '구현', source: 'card-run+merged', liveDone: 2, shadow: 0, state: 'live' });
+  expect(body.sevenVerbs.measuredVerbs).toBe(6);
+  expect(body.sevenVerbs.liveVerbs).toBe(2);
+  const lines = await run(['tasks', 'cover', '--lines'], deps);
+  expect(lines.lines).toContain('7동사 live 2/7 · 출처 없음 정리');
+  // 런 원장을 못 읽으면 구현만 unreadable — 전체 liveVerbs 는 null(0 으로 읽히지 않게).
+  const unreadable = await run(['tasks', 'cover', '--json'], { ...deps, coverImplementRunMerges: () => null });
+  expect(JSON.parse(unreadable.lines[0]!).sevenVerbs.verbs[5]).toEqual({ verb: '구현', source: 'card-run+merged', liveDone: null, shadow: null, state: 'unreadable' });
+  expect(JSON.parse(unreadable.lines[0]!).sevenVerbs.liveVerbs).toBeNull();
+  const unreadableLines = await run(['tasks', 'cover', '--lines'], { ...deps, coverImplementRunMerges: () => null });
+  expect(unreadableLines.lines).toContain('7동사 live -/7 · 못 잼(구현 카드·런 원장 null·절단) · 출처 없음 정리');
+  // 카드 원장을 못 읽어도 같은 unreadable — 심 하나만 주어진 반쪽 배선도 못 읽은 것이다.
+  const cardsUnreadable = await run(['tasks', 'cover', '--json'], { ...deps, coverImplementCardRuns: () => null });
+  expect(JSON.parse(cardsUnreadable.lines[0]!).sevenVerbs.verbs[5]).toMatchObject({ source: 'card-run+merged', liveDone: null, state: 'unreadable' });
+  // 심이 던지면 null 로 못 읽은 것이다(측정이 깨지지 않게).
+  const thrown = await run(['tasks', 'cover', '--json'], { ...deps, coverImplementRunMerges: () => { throw new Error('ledger unreadable'); } });
+  expect(JSON.parse(thrown.lines[0]!).sevenVerbs.verbs[5]).toMatchObject({ source: 'card-run+merged', liveDone: null, state: 'unreadable' });
+});
+
+test('tasks cover default 구현 readers join physical task-agent-actions.json and run ledgers in the merge window', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cover-implement-ledgers-'));
+  const statePath = join(root, 'task-agent-actions.json');
+  const ledgerDir = join(root, 'run-ledger');
+  const mirrorDir = join(root, 'remote-parents', 'pod-1', 'run-ledger');
+  mkdirSync(ledgerDir);
+  mkdirSync(mirrorDir, { recursive: true });
+  const runId = (suffix: string) => `run-00000000-0000-4000-8000-0000000000${suffix}`;
+  const merged = runId('01');
+  const failed = runId('02');
+  const child = runId('03');
+  const outside = runId('04');
+  const unrelated = runId('05');
+  const parent = runId('06');
+  const split = runId('07');
+  const card = (id: string, boundRun: string, boundChild?: string): TaskCard => ({
+    id, text: id, createdAt: '2026-10-01T00:00:00.000Z', status: 'launched', history: [],
+    runId: boundRun, ...(boundChild ? { runChildId: boundChild } : {}),
+  });
+  const writeLedger = (id: string, timestamp: string, succeeded: boolean, directory = ledgerDir) =>
+    writeFileSync(join(directory, `${id}.jsonl`), `${JSON.stringify({ timestamp, runId: id, event: 'merged', data: { merged: succeeded } })}\n`);
+  try {
+    writeTaskCards(statePath, [
+      card('ta-merged', merged), card('ta-failed', failed),
+      card('ta-child', parent, child), card('ta-outside', outside), card('ta-split', split),
+    ]);
+    writeLedger(merged, '2026-10-11T10:00:00.000Z', true);
+    writeLedger(failed, '2026-10-11T10:00:00.000Z', false);
+    writeFileSync(join(ledgerDir, `${parent}.jsonl`),
+      `${JSON.stringify({ timestamp: '2026-10-10T10:00:00.000Z', runId: parent, event: 'start', data: {} })}\n`);
+    writeLedger(child, '2026-10-11T11:00:00.000Z', true);
+    writeLedger(outside, '2026-10-13T10:00:00.000Z', true);
+    writeLedger(unrelated, '2026-10-11T10:00:00.000Z', true);
+    writeFileSync(join(ledgerDir, `${split}.jsonl`),
+      `${JSON.stringify({ timestamp: '2026-10-10T09:00:00.000Z', runId: split, event: 'start', data: {} })}\n`);
+    writeLedger(split, '2026-10-11T12:00:00.000Z', true, mirrorDir);
+    const deps: TasksCliDeps = {
+      taskStatePath: statePath,
+      coverLogs: () => [],
+    };
+    // No coverImplementCardRuns or coverImplementRunMerges seam is supplied.
+    const observed = await run(['tasks', 'cover', '--since', '2026-10-10T00:00:00Z', '--until', '2026-10-12T00:00:00Z', '--json'], deps);
+    expect(observed.code ?? 0).toBe(0);
+    const live = JSON.parse(observed.lines[0]!).sevenVerbs;
+    expect(live.verbs[5]).toEqual({ verb: '구현', source: 'card-run+merged', liveDone: 3, shadow: 0, state: 'live' });
+    expect(live.measuredVerbs).toBe(6);
+
+    writeFileSync(join(ledgerDir, `${child}.jsonl`), '{broken}\n');
+    const unreadable = await run(['tasks', 'cover', '--json'], deps);
+    expect(JSON.parse(unreadable.lines[0]!).sevenVerbs.verbs[5]).toMatchObject({
+      source: 'card-run+merged', liveDone: null, state: 'unreadable',
+    });
+    expect(JSON.parse(unreadable.lines[0]!).sevenVerbs.liveVerbs).toBeNull();
+    rmSync(join(ledgerDir, `${child}.jsonl`));
+    const missingRun = await run(['tasks', 'cover', '--json'], deps);
+    expect(JSON.parse(missingRun.lines[0]!).sevenVerbs.verbs[5]).toMatchObject({
+      source: 'card-run+merged', liveDone: null, state: 'unreadable',
+    });
+    rmSync(statePath);
+    const missingCards = await run(['tasks', 'cover', '--json'], deps);
+    expect(JSON.parse(missingCards.lines[0]!).sevenVerbs.verbs[5]).toMatchObject({
+      source: 'card-run+merged', liveDone: null, state: 'unreadable',
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('tasks cover joins authored goal provenance to merged goal records inside the window', async () => {
@@ -203,16 +672,17 @@ test('tasks cover joins authored goal provenance to merged goal records inside t
     { goalId: 'g3', stage: 'merged', outcome: 'completed', startedAt: since, completedAt: '2026-10-13T00:00:00Z' },
   ];
   const coverLogs: NonNullable<TasksCliDeps['coverLogs']> = (query) => query.exactCategories?.[0] === 'task-agent'
-    ? ['review', 'land', 'retry', 'green'].map((kind) => ({ category: 'task-agent', event: 'action', data: JSON.stringify({ kind, result: 'done' }) } as LogStoreRow))
+    ? ['review', 'land', 'retry', 'green'].map((kind) => ({ category: 'task-agent', event: 'action', data: JSON.stringify({ kind, result: 'done', taskId: 'ta-land' }) } as LogStoreRow))
     : [];
-  const deps = { coverLogs, coverGoalAsks: () => asks, coverGoalRuns: () => runs };
+  const deps = { coverLogs, coverGoalAsks: () => asks, coverGoalRuns: () => runs,
+    coverImplementCardRuns: () => [], coverImplementRunMerges: () => new Map() };
   const result = await run(['tasks', 'cover', '--json', '--since', since, '--until', until], deps);
   const body = JSON.parse(result.lines[0]!);
   expect(body.sevenVerbs.verbs[4]).toEqual({ verb: '저작', source: 'goal-ask+goal-run', liveDone: 1, shadow: 0, state: 'live' });
   expect(body.sevenVerbs.liveVerbs).toBe(5);
   expect(body.rows[1]).toMatchObject({ verb: 'review', byTaskAgent: 1 });
   const lines = await run(['tasks', 'cover', '--lines', '--since', since, '--until', until], deps);
-  expect(lines.lines.at(-1)).toBe('7동사 live 5/7 · 출처 없음 구현·정리');
+  expect(lines.lines.at(-2)).toBe('7동사 live 5/7 · 출처 없음 정리');
   const dangling = await run(['tasks', 'cover', '--json', '--since', since], { ...deps, coverGoalAsks: () => asks.filter((ask) => ask.goalId === 'g2') });
   expect(JSON.parse(dangling.lines[0]!).sevenVerbs.verbs[4]).toMatchObject({ liveDone: 0, state: 'none' });
   const missingRun = await run(['tasks', 'cover', '--json', '--since', since], { ...deps, coverGoalRuns: () => [] });
@@ -705,7 +1175,7 @@ test('index wires tasks instead of the retirement stub, and scheduler stays reti
   registerTasksCommands(program);
   const command = program.commands.find((entry) => entry.name() === 'tasks');
   expect(command?.aliases()).toContain('task');
-  expect(command?.commands.map((entry) => entry.name())).toEqual(['cover', 'list', 'hand', 'hand-move', 'live-verified', 'close', 'parents', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'approve']);
+  expect(command?.commands.map((entry) => entry.name())).toEqual(['green-sweep', 'cover', 'list', 'hand', 'hand-move', 'live-verified', 'close', 'parents', 'adopt-pr', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'repair-run', 'approve']);
 });
 
 test('tasks hand-move — 카드 history 에 손으로 쓴 한 줄을 남긴다 · 모르는 kind 는 원장을 건드리지 않는다', async () => {
@@ -962,7 +1432,7 @@ test('TA-LAND-AFTER-REVIEW phase ① — actual regate-run completion logs a sha
   }]);
   const shadow: Array<Record<string, unknown>> = [];
   const live: string[] = [];
-  let fetched = 'c'.repeat(40);
+  const regateCalls: string[] = [];
   const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
     if (event === 'rejudge-shadow' && data && typeof data === 'object') shadow.push(data as Record<string, unknown>);
   });
@@ -972,15 +1442,16 @@ test('TA-LAND-AFTER-REVIEW phase ① — actual regate-run completion logs a sha
       hostRegate: (input) => runHostRegate(input, {
         command: (bin, args, cwd) => {
           const call = `${bin} ${args.join(' ')}`;
-          if (call === 'git fetch origin refs/heads/main') { fetched = 'c'.repeat(40); return { status: 0, stdout: '', stderr: '' }; }
-          if (call === 'git fetch origin refs/pull/30/head') { fetched = head; return { status: 0, stdout: '', stderr: '' }; }
+          regateCalls.push(call);
+          if (/^git fetch --no-write-fetch-head origin \+refs\/heads\/main:refs\/elanous\/regate\/[^ ]+\/base$/.test(call)) return { status: 0, stdout: '', stderr: '' };
+          if (/^git fetch --no-write-fetch-head origin \+refs\/pull\/30\/head:refs\/elanous\/regate\/[^ ]+\/head$/.test(call)) return { status: 0, stdout: '', stderr: '' };
           if (call === 'gh pr view 30 --json headRefOid,baseRefName,baseRefOid,state,isDraft') return {
             status: 0, stdout: JSON.stringify({ headRefOid: head, baseRefName: 'main', baseRefOid: 'c'.repeat(40), state: 'OPEN', isDraft: false }), stderr: '',
           };
           if (call === 'git rev-parse --show-toplevel') return { status: 0, stdout: cwd, stderr: '' };
           if (call === 'git rev-parse HEAD' || call === 'git rev-parse HEAD^1') return { status: 0, stdout: 'c'.repeat(40), stderr: '' };
           if (call === 'git rev-parse HEAD^2') return { status: 0, stdout: head, stderr: '' };
-          if (call === 'git rev-parse FETCH_HEAD') return { status: 0, stdout: fetched, stderr: '' };
+          if (/^git rev-parse refs\/elanous\/regate\/[^ ]+\/(base|head)$/.test(call)) return { status: 0, stdout: call.endsWith('/base') ? 'c'.repeat(40) : head, stderr: '' };
           if (call === `git merge-base ${'c'.repeat(40)} ${head}`) return { status: 0, stdout: 'd'.repeat(40), stderr: '' };
           if (call === `git diff --name-only ${'d'.repeat(40)} ${head}`) return { status: 0, stdout: 'src/feature.test.ts\n', stderr: '' };
           if (call === `git diff --find-renames --name-status -z ${'d'.repeat(40)} ${head}`) return { status: 0, stdout: 'M\0src/feature.test.ts\0', stderr: '' };
@@ -998,6 +1469,8 @@ test('TA-LAND-AFTER-REVIEW phase ① — actual regate-run completion logs a sha
       }, requestRegate: async () => { live.push('regate'); } },
     });
     expect(result.code ?? 0).toBe(0);
+    expect(regateCalls.some((call) => /^git fetch --no-write-fetch-head origin \+refs\/heads\/main:refs\/elanous\/regate\/[^ ]+\/base$/.test(call))).toBe(true);
+    expect(regateCalls.some((call) => /^git fetch --no-write-fetch-head origin \+refs\/pull\/30\/head:refs\/elanous\/regate\/[^ ]+\/head$/.test(call))).toBe(true);
     expect(shadow).toMatchObject([{ card: 'ta-x', head12: head.slice(0, 12), decision: 'land' }]);
     expect(live).toEqual([]);
     expect(readTaskCard('ta-x', statePath)?.landAttempts).toBeUndefined();
@@ -1016,4 +1489,35 @@ test('TA-REJUDGE-ON-HEAD — tasks rejudge --all judges each candidate card and 
     live: { repoCandidates: () => [{ source: 'host', cwd: '/repo' }], prHead: async () => ({ head: a, state: 'OPEN', url: 'https://github.com/o/r/pull/30' }) },
   } });
   expect(result.lines).toEqual([`ta-rj\tPR #30\t${a.slice(0, 12)}→${a.slice(0, 12)}\ttarget\thead-unchanged\tPR #30 head is still the judged head`]);
+});
+
+test('tasks rejudge --all selects a formerly unbound remote parent after HQ mirror PR binding', async () => {
+  const { remoteLedgerMirrorDir } = await import('../task-agent/parent-host.js');
+  const root = mkdtempSync(join(tmpdir(), 'tasks-cli-remote-rejudge-'));
+  const taskStatePath = join(root, 'task-agent-actions.json');
+  const parent = 'run-11111111-1111-4111-8111-111111111111';
+  const child = 'run-22222222-2222-4222-8222-222222222222';
+  const url = 'https://github.com/o/r/pull/30';
+  const dir = remoteLedgerMirrorDir(root, 'node-b');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${parent}.jsonl`), JSON.stringify({ runId: parent, event: 'pod-child-run', data: { childRunId: child } }) + '\n');
+  const childPr = { runId: child, event: 'pr-opened', data: { number: 30, url } };
+  writeFileSync(join(dir, `${child}.jsonl`), JSON.stringify(childPr) + '\n');
+  writeFileSync(taskStatePath, JSON.stringify({ tasks: { 'ta-remote': {
+    id: 'ta-remote', text: 'repair', createdAt: '2026-10-12T00:00:00.000Z', status: 'launched', taLand: true,
+    runId: parent, parentHost: { host: 'node-b' }, history: [],
+  } } }));
+  const deps: TasksCliDeps = { taskStatePath, registerSink: async () => true,
+    remoteLedgerMirror: () => {}, rejudge: { liveMoves: new Set(), remoteRunTerminal: () => true,
+      live: { repoCandidates: () => [{ source: 'host', cwd: '/repo' }], prHead: async () => ({ head: 'a'.repeat(40), state: 'OPEN', url }) } } };
+  const incomplete = await run(['tasks', 'rejudge', '--all'], deps);
+  expect(incomplete.lines).toEqual([]);
+  expect((JSON.parse(readFileSync(taskStatePath, 'utf8')) as { tasks: Record<string, { pr?: unknown }> }).tasks['ta-remote']?.pr).toBeUndefined();
+  writeFileSync(join(dir, `${child}.jsonl`), [childPr,
+    { runId: child, event: 'run-status', data: { runStatus: 'completed' } },
+  ].map(row => JSON.stringify(row)).join('\n') + '\n');
+  const result = await run(['tasks', 'rejudge', '--all'], deps);
+  expect(result.lines.some(line => line.startsWith('ta-remote\tPR #30\t'))).toBe(true);
+  expect((JSON.parse(readFileSync(taskStatePath, 'utf8')) as { tasks: Record<string, { pr?: { number: number }; runChildId?: string }> }).tasks['ta-remote'])
+    .toMatchObject({ pr: { number: 30 }, runChildId: child });
 });

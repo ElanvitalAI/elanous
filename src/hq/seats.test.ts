@@ -3,7 +3,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { hqWork } from './seats.js';
+import { debug } from '../debug/log.js';
+import { hqSeat, hqWork } from './seats.js';
 
 let temp: string;
 let home: string;
@@ -14,13 +15,30 @@ function command(bin: string, args: string[], cwd = temp, env: NodeJS.ProcessEnv
   return spawnSync(bin, args, { cwd, env, encoding: 'utf8', timeout: 60_000 });
 }
 function git(args: string[], cwd = temp): string {
-  const r = command('git', args, cwd);
+  // The pod's global gitconfig points core.hooksPath at a git-guard whose pre-push hook refuses
+  // fixture pushes to refs/heads/main. Fixture git runs get their own isolated config, like the
+  // CLI child envs below; fixture identity lives in each repo's local config, not the global one.
+  const r = command('git', args, cwd, { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
   expect(r.status, `${args.join(' ')}: ${r.stderr}`).toBe(0);
   return r.stdout.trim();
 }
 function hq(...args: string[]) {
   return command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', ...args], temp, { ...process.env, HOME: home,
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+}
+// The CLI child writes observations to its own log file; in-process hqSeat calls are captured
+// through a registered sink instead. The diet guard is disabled for the window: one event must stay one event.
+function captureRefreshSkipped(): { events: () => { category: string; event: string; data?: unknown }[]; unregister: () => void } {
+  const seen: { category: string; event: string; data?: unknown }[] = [];
+  const previousGuard = debug.setLogDietGuard(null);
+  const unregisterSink = debug.registerSink({
+    name: 'hq-seat-refresh-skipped-test',
+    emit: rec => { seen.push({ category: rec.category, event: rec.event, data: rec.data }); },
+  });
+  return {
+    events: () => seen.filter(e => e.category === 'hq.seat' && e.event === 'refresh-skipped'),
+    unregister: () => { debug.setLogDietGuard(previousGuard); unregisterSink(); },
+  };
 }
 function fixture() {
   remote = join(temp, 'remote.git');
@@ -40,9 +58,17 @@ beforeEach(() => {
   temp = realpathSync(mkdtempSync(join(tmpdir(), 'hq-seats-')));
   home = join(temp, 'home');
   mkdirSync(home);
+  // In-process hqSeat/hqWork spawns inherit process.env: isolate them from the pod's global
+  // gitconfig too (its core.hooksPath override would silence fixture hooks, incl. post-checkout).
+  process.env.GIT_CONFIG_NOSYSTEM = '1';
+  process.env.GIT_CONFIG_GLOBAL = join(temp, 'empty-gitconfig');
   fixture();
 });
-afterEach(() => rmSync(temp, { recursive: true, force: true }), 120_000);
+afterEach(() => {
+  delete process.env.GIT_CONFIG_NOSYSTEM;
+  delete process.env.GIT_CONFIG_GLOBAL;
+  rmSync(temp, { recursive: true, force: true });
+}, 120_000);
 
 test('empty HOME: init → seat → work new → merge into bare remote → done, with premerge refusal', () => {
   const root = join(home, 'elanous-hq');
@@ -845,6 +871,60 @@ test('dirty seat --refresh preserves bytes and HEAD with rc 0 and one warning', 
   expect(result.stderr).toContain('dirty — refresh skipped');
   expect(readFileSync(join(seat, 'README'), 'utf8')).toBe('do not overwrite\n');
   expect(git(['rev-parse', 'HEAD'], seat)).toBe(head);
+  expect(existsSync(join(seat, 'next'))).toBe(false);
+}, 120_000);
+
+test('dirty seat refresh skip records one hq.seat refresh-skipped event with reason and behind count', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, '--test', 'hq', 'init'], seed, { ...process.env, HOME: home });
+  expect(init.status, init.stderr).toBe(0);
+  expect(hq('seat', 'TC').status).toBe(0);
+  const seat = join(root, 'seats', 'TC');
+  const head = git(['rev-parse', 'HEAD'], seat);
+  writeFileSync(join(seat, 'README'), 'do not overwrite\n');
+  for (const name of ['next1', 'next2']) {
+    writeFileSync(join(seed, name), `${name}\n`);
+    git(['add', name], seed);
+    git(['commit', '-m', name], seed);
+  }
+  git(['push', 'origin', 'main'], seed);
+  // The cron line fetches the mirror before each refresh; behind counts against that fetched origin/main.
+  git(['--git-dir', join(root, 'repo.git'), 'fetch', 'origin']);
+  const capture = captureRefreshSkipped();
+  try {
+    expect(hqSeat('TC', { root, refresh: true }).outcome).toBe('dirty');
+  } finally { capture.unregister(); }
+  const events = capture.events();
+  expect(events).toHaveLength(1);
+  expect(events[0]!.data).toMatchObject({ role: 'TC', path: seat, reason: 'dirty', head, behind: 2 });
+  expect(readFileSync(join(seat, 'README'), 'utf8')).toBe('do not overwrite\n');
+  expect(git(['rev-parse', 'HEAD'], seat)).toBe(head);
+  expect(existsSync(join(seat, 'next1'))).toBe(false);
+  expect(existsSync(join(seat, 'next2'))).toBe(false);
+}, 120_000);
+
+test('unlanded detached HEAD refresh skip records one refresh-skipped event and keeps the seat untouched', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, '--test', 'hq', 'init'], seed, { ...process.env, HOME: home });
+  expect(init.status, init.stderr).toBe(0);
+  expect(hq('seat', 'TC').status).toBe(0);
+  const seat = join(root, 'seats', 'TC');
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-m', 'on seat'], seat);
+  const local = git(['rev-parse', 'HEAD'], seat);
+  writeFileSync(join(seed, 'next'), 'remote advanced\n');
+  git(['add', 'next'], seed);
+  git(['commit', '-m', 'next'], seed);
+  git(['push', 'origin', 'main'], seed);
+  git(['--git-dir', join(root, 'repo.git'), 'fetch', 'origin']);
+  const capture = captureRefreshSkipped();
+  try {
+    expect(hqSeat('TC', { root, refresh: true }).outcome).toBe('dirty');
+  } finally { capture.unregister(); }
+  const events = capture.events();
+  expect(events).toHaveLength(1);
+  expect(events[0]!.data).toMatchObject({ role: 'TC', path: seat, reason: 'unlanded-head', head: local, behind: 1 });
+  expect(git(['rev-parse', 'HEAD'], seat)).toBe(local);
+  expect(git(['status', '--porcelain'], seat)).toBe('');
   expect(existsSync(join(seat, 'next'))).toBe(false);
 }, 120_000);
 

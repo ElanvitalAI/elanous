@@ -1008,7 +1008,7 @@ describe('podSelfImplementSpawn', () => {
       command: (bin: string, args: readonly string[]) => {
         const call = `${bin} ${args.join(' ')}`; ghCalls.push(call);
         if (call === 'gh pr view 9 --json headRefOid,baseRefName,baseRefOid,state,isDraft') return { status: 0, stdout: JSON.stringify({ headRefOid: head, baseRefName: 'main', baseRefOid: base, state: 'OPEN', isDraft: false }), stderr: '' };
-        if (call === 'git rev-parse FETCH_HEAD') return { status: 0, stdout: ghCalls.at(-2) === 'git fetch origin refs/heads/main' ? base : head, stderr: '' };
+        if (/^git rev-parse refs\/elanous\/regate\/[^ ]+\/(base|head)$/.test(call)) return { status: 0, stdout: call.endsWith('/base') ? base : head, stderr: '' };
         if (call === 'git rev-parse HEAD' || call === 'git rev-parse HEAD^1') return { status: 0, stdout: base, stderr: '' };
         if (call === 'git rev-parse HEAD^2') return { status: 0, stdout: head, stderr: '' };
         if (call.startsWith('git merge-base')) return { status: 0, stdout: 'b'.repeat(40), stderr: '' };
@@ -1022,6 +1022,8 @@ describe('podSelfImplementSpawn', () => {
     const { k } = fakeKubectl(['Complete'], `${json}\n`);
     const r = await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS, hostRegate: (request) => runHostRegate(request, deps) })({ feature: 'real regate', spaceId: 'pod-real-regate', autoMerge: true }).done;
     expect(ghCalls).toContain(`gh pr merge 9 --squash --match-head-commit ${head}`);
+    expect(ghCalls.some((call) => /^git fetch --no-write-fetch-head origin \+refs\/heads\/main:refs\/elanous\/regate\/[^ ]+\/base$/.test(call))).toBe(true);
+    expect(ghCalls.some((call) => /^git fetch --no-write-fetch-head origin \+refs\/pull\/9\/head:refs\/elanous\/regate\/[^ ]+\/head$/.test(call))).toBe(true);
     expect(r.disposition).toMatchObject({ stage: 'merged', merged: true, hostRegate: { passed: true } });
   });
 
@@ -1031,7 +1033,7 @@ describe('podSelfImplementSpawn', () => {
       command: (bin: string, args: readonly string[]) => {
         const call = `${bin} ${args.join(' ')}`; ghCalls.push(call);
         if (call === 'gh pr view 9 --json headRefOid,baseRefName,baseRefOid,state,isDraft') return { status: 0, stdout: JSON.stringify({ headRefOid: head, baseRefName: 'main', baseRefOid: base, state: 'OPEN', isDraft: false }), stderr: '' };
-        if (call === 'git rev-parse FETCH_HEAD') return { status: 0, stdout: ghCalls.at(-2) === 'git fetch origin refs/heads/main' ? base : head, stderr: '' };
+        if (/^git rev-parse refs\/elanous\/regate\/[^ ]+\/(base|head)$/.test(call)) return { status: 0, stdout: call.endsWith('/base') ? base : head, stderr: '' };
         if (call === 'git rev-parse HEAD' || call === 'git rev-parse HEAD^1') return { status: 0, stdout: base, stderr: '' };
         if (call === 'git rev-parse HEAD^2') return { status: 0, stdout: head, stderr: '' };
         if (call.startsWith('git merge-base')) return { status: 0, stdout: 'b'.repeat(40), stderr: '' };
@@ -1068,6 +1070,8 @@ describe('podSelfImplementSpawn', () => {
         const { r, ghCalls, events, script } = await runFrozen(when);
         expect(script).toContain("'--merge-by-host'");
         expect(ghCalls.some((c) => c.startsWith('gh pr merge'))).toBe(false);
+        expect(ghCalls.some((call) => /^git fetch --no-write-fetch-head origin \+refs\/heads\/main:refs\/elanous\/regate\/[^ ]+\/base$/.test(call))).toBe(true);
+        expect(ghCalls.some((call) => /^git fetch --no-write-fetch-head origin \+refs\/pull\/9\/head:refs\/elanous\/regate\/[^ ]+\/head$/.test(call))).toBe(true);
         expect(r.disposition).toMatchObject({ stage: 'pr-opened', merged: false, hostRegate: { status: 'frozen' } });
         expect(events.filter((e) => e.event === 'merge-blocked-by-freeze')).toEqual([{ event: 'merge-blocked-by-freeze', data: expect.objectContaining({ pr: 9, reason: 'landing-freeze' }) }]);
       });

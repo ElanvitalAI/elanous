@@ -8,6 +8,7 @@ export interface MessageEnvelope {
   to: string;
   body: string;
   kind?: string;
+  replyTo?: number;
 }
 
 export interface Message extends MessageEnvelope {
@@ -46,8 +47,16 @@ export function validateMessageEnvelope(input: unknown): MessageEnvelope {
   if (record.kind !== undefined && (typeof record.kind !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/.test(record.kind))) {
     throw new Error('invalid message kind');
   }
-  if (Object.keys(record).some(key => !['from', 'to', 'body', 'kind'].includes(key))) throw new Error('unknown message field');
-  return record.kind === undefined ? { from, to, body: record.body } : { from, to, body: record.body, kind: record.kind as string };
+  const replyTo = record.replyTo;
+  if (replyTo !== undefined && (typeof replyTo !== 'number' || !Number.isSafeInteger(replyTo) || replyTo < 1)) {
+    throw new Error('replyTo must be a positive integer message ID');
+  }
+  if (Object.keys(record).some(key => !['from', 'to', 'body', 'kind', 'replyTo'].includes(key))) throw new Error('unknown message field');
+  return {
+    from, to, body: record.body,
+    ...(record.kind === undefined ? {} : { kind: record.kind as string }),
+    ...(replyTo === undefined ? {} : { replyTo }),
+  };
 }
 
 function validCursor(cursor: number): number {
@@ -68,28 +77,45 @@ interface MessageRow {
   recipient: string;
   body: string;
   kind: string | null;
+  reply_to: number | null;
   created_at: string;
 }
 
 function fromRow(row: MessageRow): Message {
   return { id: row.id, from: row.sender, to: row.recipient, body: row.body,
-    ...(row.kind === null ? {} : { kind: row.kind }), createdAt: row.created_at };
+    ...(row.kind === null ? {} : { kind: row.kind }),
+    ...(row.reply_to == null ? {} : { replyTo: row.reply_to }),
+    createdAt: row.created_at };
 }
 
 /** SQLite owns both append order and per-recipient acknowledgement progress. */
 export class MsgStore {
   readonly db: Database;
 
-  constructor(path: string = defaultMsgStorePath()) {
-    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    this.db = new Database(path);
+  // A read-only SSE connection may outlive another process's in-place migration.
+  private get hasReplyTo(): boolean {
+    return (this.db.query(`SELECT COUNT(*) AS count FROM pragma_table_info('msg_messages') WHERE name = 'reply_to'`)
+      .get() as { count: number }).count > 0;
+  }
+
+  private readWithSchema<T>(read: (hasReplyTo: boolean) => T): T {
+    // The schema projection and rows must share one SQLite snapshot. Otherwise a writer can
+    // migrate between them and a reader could advance past a reply with its link erased.
+    return this.db.transaction(() => read(this.hasReplyTo)).deferred();
+  }
+
+  constructor(path: string = defaultMsgStorePath(), options: { readOnly?: boolean } = {}) {
+    if (options.readOnly && (path === ':memory:' || !existsSync(path))) throw new Error('message ledger unavailable for read-only SSE service');
+    if (!options.readOnly && path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    this.db = options.readOnly ? new Database(path, { readonly: true }) : new Database(path);
     this.db.exec('PRAGMA busy_timeout = 5000');
-    this.db.exec(`CREATE TABLE IF NOT EXISTS msg_messages (
+    if (!options.readOnly) this.db.exec(`CREATE TABLE IF NOT EXISTS msg_messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       sender TEXT NOT NULL,
       recipient TEXT NOT NULL,
       body TEXT NOT NULL,
       kind TEXT,
+      reply_to INTEGER,
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_msg_messages_recipient_id ON msg_messages(recipient, id);
@@ -101,21 +127,28 @@ export class MsgStore {
       provenance_key TEXT PRIMARY KEY,
       message_id INTEGER NOT NULL REFERENCES msg_messages(id)
     );`);
+    // Serialize the schema check and ALTER across processes opening an old ledger at once.
+    if (!options.readOnly) this.db.transaction(() => {
+      const replyToColumn = (this.db.query(`SELECT COUNT(*) AS count FROM pragma_table_info('msg_messages') WHERE name = 'reply_to'`)
+        .get() as { count: number }).count;
+      if (replyToColumn === 0) this.db.exec('ALTER TABLE msg_messages ADD COLUMN reply_to INTEGER');
+      this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_reply_to ON msg_messages(reply_to, id)');
+    }).immediate();
   }
 
   append(input: MessageEnvelope): Message {
     return this.insertMessage(input);
   }
 
-  /** Append once for a provenance key such as coord:<commentId>:<recipient>. */
+  /** Append once for a coordination comment or a task failure incident. */
   appendWithProvenance(input: MessageEnvelope, provenanceKey: string): Message {
-    if (typeof provenanceKey !== 'string' || !/^coord:[^:]+:[^:]+$/.test(provenanceKey)) {
+    if (typeof provenanceKey !== 'string' || !/^(?:coord|ta-failure):[^:]+:[^:]+$/.test(provenanceKey)) {
       throw new Error('invalid message provenance key');
     }
     const msg = validateMessageEnvelope(input);
     if (provenanceKey.split(':')[2] !== msg.to) throw new Error('provenance recipient does not match message recipient');
     return this.db.transaction(() => {
-      const existing = this.db.query(`SELECT m.id, m.sender, m.recipient, m.body, m.kind, m.created_at
+      const existing = this.db.query(`SELECT m.id, m.sender, m.recipient, m.body, m.kind, m.reply_to, m.created_at
         FROM msg_provenance p JOIN msg_messages m ON m.id = p.message_id WHERE p.provenance_key = ?`)
         .get(provenanceKey) as MessageRow | null;
       if (existing) return fromRow(existing);
@@ -128,9 +161,12 @@ export class MsgStore {
 
   private insertMessage(input: MessageEnvelope): Message {
     const msg = validateMessageEnvelope(input);
+    if (msg.replyTo !== undefined && this.db.query('SELECT 1 FROM msg_messages WHERE id = ?').get(msg.replyTo) === null) {
+      throw new Error(`reply target not found: #${msg.replyTo}`);
+    }
     const createdAt = new Date().toISOString();
-    const result = this.db.query(`INSERT INTO msg_messages(sender, recipient, body, kind, created_at)
-      VALUES (?, ?, ?, ?, ?)`).run(msg.from, msg.to, msg.body, msg.kind ?? null, createdAt);
+    const result = this.db.query(`INSERT INTO msg_messages(sender, recipient, body, kind, reply_to, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)`).run(msg.from, msg.to, msg.body, msg.kind ?? null, msg.replyTo ?? null, createdAt);
     return { id: Number(result.lastInsertRowid), ...msg, createdAt };
   }
 
@@ -142,13 +178,46 @@ export class MsgStore {
     if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
     validCursor(after);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
-    return (this.db.query(`SELECT id, sender, recipient, body, kind, created_at FROM msg_messages
+    return this.readWithSchema(hasReplyTo => (this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at FROM msg_messages
       WHERE id > ? AND (recipient = ? OR (recipient = 'ALL' AND sender <> ?))
-      ORDER BY id ASC LIMIT ?`).all(after, to, to, limit) as MessageRow[]).map(fromRow);
+      ORDER BY id ASC LIMIT ?`).all(after, to, to, limit) as MessageRow[]).map(fromRow));
+  }
+
+  /** One message by durable ID, or null when absent. */
+  getMessage(messageId: number): Message | null {
+    if (!Number.isSafeInteger(messageId) || messageId < 1) throw new Error('message ID must be a positive integer');
+    return this.readWithSchema(hasReplyTo => {
+      const row = this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at FROM msg_messages
+        WHERE id = ?`).get(messageId) as MessageRow | null;
+      return row === null ? null : fromRow(row);
+    });
+  }
+
+  /** Replies pointing at the supplied message, ordered by durable insertion ID. */
+  listReplies(messageId: number, limit: number = 100, afterId: number = 0): Message[] {
+    if (!Number.isSafeInteger(messageId) || messageId < 1) throw new Error('message ID must be a positive integer');
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
+    validCursor(afterId);
+    return this.readWithSchema(hasReplyTo => hasReplyTo
+      ? (this.db.query(`SELECT id, sender, recipient, body, kind, reply_to, created_at FROM msg_messages
+        WHERE reply_to = ? AND id > ? ORDER BY id ASC LIMIT ?`).all(messageId, afterId, limit) as MessageRow[]).map(fromRow)
+      : []);
   }
 
   list(recipient: string, after: number = 0, limit: number = 100): Message[] {
     return this.listByRecipient(recipient, after, limit);
+  }
+
+  /** One ordered scan for every SSE subscriber; recipient filtering happens in the server. */
+  listAfter(after: number, limit: number = 1000): Message[] {
+    validCursor(after);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
+    return this.readWithSchema(hasReplyTo => (this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at FROM msg_messages
+      WHERE id > ? ORDER BY id ASC LIMIT ?`).all(after, limit) as MessageRow[]).map(fromRow));
+  }
+
+  latestId(): number {
+    return (this.db.query('SELECT COALESCE(MAX(id), 0) AS id FROM msg_messages').get() as { id: number }).id;
   }
 
   getCursor(recipient: string): number {
@@ -199,6 +268,7 @@ export class MsgStore {
 
 export function defaultMsgStorePath(): string { return join(elanousStateRoot(), 'msg', 'messages.db'); }
 export function openMsgStore(path?: string): MsgStore { return new MsgStore(path); }
+export function openMsgStoreReadOnly(path?: string): MsgStore { return new MsgStore(path, { readOnly: true }); }
 
 /** Observe one recipient without creating a store or advancing its acknowledgement. */
 export function readUnreadCount(recipient: string, path: string = defaultMsgStorePath()): number | null {

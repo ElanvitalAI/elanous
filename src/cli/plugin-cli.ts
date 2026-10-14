@@ -6,7 +6,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { userConfigPath } from '../user-config.js';
 import { debug, redactSecretText } from '../debug/log.js';
-import { addMarket, ensureInternalMarketIndex, listMarkets, MarketFetchError, updateMarket } from '../plugins/install/market-fetch.js';
+import { addMarket, codexPluginPackagePath, ensureInternalMarketIndex, listMarkets, MarketFetchError, updateMarket } from '../plugins/install/market-fetch.js';
+import { readCodexPluginList } from '../acp/codex-plugins.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { OFFICIAL_INDEX_KEYS } from '../market/official-keys.js';
 import { installPlugin, listInstalledPlugins, PluginInstallError, removePlugin, type InstallEvent } from '../plugins/install/plugin-install.js';
@@ -118,15 +119,22 @@ export function registerPluginCommands(program: Command): void {
       }
     });
   plugin.command('add <spec>').description('Install a local path, pinned git plugin or signed market plugin')
+    .option('--from-codex', 'Import an installed Codex plugin by name@marketplace')
     .option('--yes', 'Accept requested capabilities')
     .option('--json', 'NDJSON progress events')
     .option('--allow-unsigned', 'Allow unsigned marketplace indices')
     .option('--refresh', 'Refresh the signed marketplace index before installing')
-    .action(async (spec: string, opts: { yes?: boolean; json?: boolean; allowUnsigned?: boolean; refresh?: boolean }) => {
+    .action(async (spec: string, opts: { yes?: boolean; json?: boolean; allowUnsigned?: boolean; refresh?: boolean; fromCodex?: boolean }) => {
       try {
         const root = elanousStateRoot();
         const nodeCount = { value: 0 };
-        await installPlugin(spec, {
+        let source = spec;
+        if (opts.fromCodex) {
+          const match = /^([a-z0-9][a-z0-9-]{1,39})@([a-z0-9][a-z0-9-]{1,39})$/.exec(spec);
+          if (!match) throw new PluginInstallError('io', 'Codex import requires name@marketplace');
+          source = codexPluginPackagePath(await readCodexPluginList(), match[1]!, match[2]!);
+        }
+        await installPlugin(source, {
           root, marketDir: join(root, 'plugins', 'markets'), trustedKeys: keys(),
           yes: opts.yes, allowUnsigned: opts.allowUnsigned, refresh: opts.refresh,
           onEvent: event => outputEvent(event, !!opts.json, nodeCount),

@@ -5,10 +5,12 @@ import { dirname, join } from 'node:path';
 import { landOrderLedgerPath } from './land-order-ledger.js';
 import { classifyLandFailure, liveLandArgs, type TaskAgentLiveMove } from './live-moves.js';
 import { CATCH_UP_CAP, defaultCatchUpMain, defaultRequestRegate, overlapEvidencePath, parseRegateResult, REJUDGE_HEAD_CAP, regateResultPath, regateRunArgs, rejudgeCandidates, rejudgeCardOnHead, rejudgeAsyncResultCard, rejudgeCompletedTaskRegate, rejudgeShadowCard, remoteBoundRunTerminal, type CatchUpGit, type CatchUpRequest, type CatchUpResult, type RegateRequest } from './rejudge-on-head.js';
-import { rejudgeCompletedTaskReview, reviewResultPath, TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_RESULT_ENV, TA_REVIEW_COMPLETION_STATE_ENV } from './review-result-capture.js';
+import { captureReviewResults, rejudgeCompletedTaskReview, reviewResultPath, TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_RESULT_ENV, TA_REVIEW_COMPLETION_STATE_ENV } from './review-result-capture.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
 import { setUserConfigOverlay } from '../user-config.js';
 import { debug } from '../debug/log.js';
+import { repairReviewDigest } from './repair-review.js';
+import type { RepairLaunchRequest } from './repair-cycle.js';
 
 const A = 'a'.repeat(40);
 const B = 'b'.repeat(40);
@@ -24,7 +26,7 @@ function fixture(opts: { regates?: TaskCard['regates']; landAttempts?: TaskCard[
   const pathA = reviewResultPath(statePath, 'ta-rj-1', 30, A);
   // 런 멈춤 때: 머리 A 리뷰 요청 ⊕ 회수(fail · must-fix 2) — #26030 실측 꼴.
   const seed: TaskCard = {
-    id: 'ta-rj-1', text: 'feature ask', checklistId: 'CELL-RJ', createdAt: '2026-10-11T00:00:00.000Z', status: 'launched', runId: 'run-rj',
+    id: 'ta-rj-1', text: 'feature ask', seat: 'TC', checklistId: 'CELL-RJ', createdAt: '2026-10-11T00:00:00.000Z', status: 'launched', runId: 'run-rj',
     pr: { number: 30, url: URL },
     reviewRequests: [{ pr: 30, head: A, at: '2026-10-11T00:10:00.000Z', resultPath: pathA }],
     history: [{ at: '2026-10-11T00:20:00.000Z', event: 'live-move-result', kind: 'review', pr: 30, head: A, verdict: 'fail', reviewed: true, mustFix: 2, reviewRoute: 'api', resultPath: pathA, effect: 'review result captured · verdict fail · reviewed true · must-fix 2' }],
@@ -87,6 +89,110 @@ function fixture(opts: { regates?: TaskCard['regates']; landAttempts?: TaskCard[
 }
 
 describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트·리뷰·land 를 다시 판단한다', () => {
+  test('adopted unchanged head gets its first review request, then only one pending request', async () => {
+    const f = fixture();
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
+      adoptedPr: { pr: 30, url: URL, head: A, at: '2026-10-11T00:30:00.000Z' },
+      reviewRequests: [], history: [] }]);
+    await rejudgeCardOnHead(f.card().id, f.deps());
+    expect(f.decisions()).toContain('review:review-requested');
+    expect(f.reviewRequests).toHaveLength(1);
+    await rejudgeCardOnHead(f.card().id, f.deps());
+    expect(f.decisions()).toContain('review:review-pending');
+    expect(f.reviewRequests).toHaveLength(1);
+    expect(f.regateRequests).toHaveLength(0);
+  });
+
+  test('adopted unchanged head routes captured failure to repair and captured pass to regate', async () => {
+    const failed = fixture();
+    writeTaskCards(failed.statePath, [{ ...failed.card(), taLand: true,
+      adoptedPr: { pr: 30, url: URL, head: A, at: '2026-10-11T00:30:00.000Z' } }]);
+    await rejudgeCardOnHead(failed.card().id, failed.deps());
+    expect(failed.decisions()).toEqual(['review:repair-needed']);
+    expect(failed.regateRequests).toHaveLength(0);
+    expect(failed.reviewRequests).toHaveLength(0);
+
+    const passed = fixture();
+    writeTaskCards(passed.statePath, [{ ...passed.card(), taLand: true,
+      adoptedPr: { pr: 30, url: URL, head: A, at: '2026-10-11T00:30:00.000Z' },
+      history: [{ at: '2026-10-11T00:20:00.000Z', event: 'live-move-result', kind: 'review', pr: 30,
+        head: A, verdict: 'pass', reviewed: true, mustFix: 0, effect: 'review result captured · verdict pass · reviewed true · must-fix 0' }] }]);
+    await rejudgeCardOnHead(passed.card().id, passed.deps());
+    expect(passed.decisions()).toContain('regate:regate-requested');
+    expect(passed.regateRequests).toHaveLength(1);
+    expect(passed.reviewRequests).toHaveLength(0);
+  });
+
+  test('captured exact-head must-fix enters next-move and launches one same-PR repair worker', async () => {
+    const f = fixture();
+    const resultPath = f.card().reviewRequests![0]!.resultPath!;
+    mkdirSync(dirname(resultPath), { recursive: true });
+    const text = reviewJson(A, { verdict: 'fail', mustFix: ['fix assertion one', 'fix assertion two'] });
+    writeFileSync(resultPath, text);
+    writeTaskCards(f.statePath, [{ ...f.card(), history: f.card().history.map((entry) => entry.resultPath === resultPath
+      ? { ...entry, reviewSha256: repairReviewDigest(text) } : entry) }]);
+    const launched: Array<{ pr: number; head: string; resultPath: string }> = [];
+    const deps = { ...f.deps(['review', 'propose-land', 'narrow-relaunch']),
+      requestRepair: async (request: { pr: number; head: string; resultPath: string }) => { launched.push(request); } };
+    await rejudgeCardOnHead(f.card().id, deps);
+    expect(f.decisions()).toContain('repair:repair-requested');
+    expect(launched).toHaveLength(1);
+    expect(launched[0]).toMatchObject({ pr: 30, head: A });
+    expect(f.card().repairs?.[0]).toMatchObject({ pr: 30, head: A, move: 'narrow-relaunch', status: 'requested' });
+    await rejudgeCardOnHead(f.card().id, deps);
+    expect(launched).toHaveLength(1);
+    expect(f.decisions()).toContain('repair:repair-pending');
+  });
+
+  test('repair reads the captured review file, rejects changed bytes, and ignores a later request for the same head', async () => {
+    const f = fixture();
+    const path = f.card().reviewRequests![0]!.resultPath!;
+    const text = reviewJson(A, { verdict: 'fail', mustFix: ['captured fix one', 'captured fix two'] });
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, text);
+    const laterPath = `${path}.later`;
+    // A later request exists, but its result has not been captured; it cannot substitute its path.
+    writeTaskCards(f.statePath, [{ ...f.card(),
+      reviewRequests: [...f.card().reviewRequests!, { pr: 30, head: A, at: '2026-10-11T00:30:00.000Z', resultPath: laterPath }],
+      history: f.card().history.map((entry) => entry.resultPath === path ? { ...entry, reviewSha256: repairReviewDigest(text) } : entry) }]);
+    const launched: RepairLaunchRequest[] = [];
+    const deps = { ...f.deps(['review', 'propose-land', 'narrow-relaunch']), requestRepair: async (request: RepairLaunchRequest) => { launched.push(request); } };
+    await rejudgeCardOnHead(f.card().id, deps);
+    expect(launched).toHaveLength(1);
+    expect(readFileSync(launched[0]!.goalFile, 'utf8')).toContain('captured fix one');
+    expect(readFileSync(launched[0]!.goalFile, 'utf8')).not.toContain('wrong fix');
+    const g = fixture();
+    const p = g.card().reviewRequests![0]!.resultPath!;
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, text);
+    writeTaskCards(g.statePath, [{ ...g.card(), history: g.card().history.map((entry) => entry.resultPath === p
+      ? { ...entry, reviewSha256: repairReviewDigest(text) } : entry) }]);
+    writeFileSync(p, reviewJson(A, { verdict: 'fail', mustFix: ['mutated'] }));
+    await rejudgeCardOnHead(g.card().id, { ...g.deps(['review', 'propose-land', 'narrow-relaunch']), requestRepair: async () => { throw new Error('must not launch'); } });
+    expect(g.decisions()).toContain('review:review-requested');
+    expect(g.reviewRequests).toHaveLength(1);
+  });
+
+  test('legacy captured review without a digest requests one replacement review before repair', async () => {
+    const f = fixture();
+    const oldPath = f.card().reviewRequests![0]!.resultPath!;
+    mkdirSync(dirname(oldPath), { recursive: true });
+    writeFileSync(oldPath, reviewJson(A, { verdict: 'fail', mustFix: ['old bytes cannot be trusted'] }));
+    f.onReview((path) => writeFileSync(path, reviewJson(A, { verdict: 'fail', mustFix: ['fresh exact-head fix'] })));
+    const launched: RepairLaunchRequest[] = [];
+    const deps = { ...f.deps(['review', 'narrow-relaunch']), requestRepair: async (request: RepairLaunchRequest) => { launched.push(request); } };
+    await rejudgeCardOnHead(f.card().id, deps);
+    expect(f.decisions()).toContain('review:review-requested');
+    expect(f.reviewRequests).toHaveLength(1);
+    expect(f.reviewRequests[0]!.resultPath).not.toBe(oldPath);
+    await rejudgeCardOnHead(f.card().id, deps);
+    expect(f.reviewRequests).toHaveLength(1);
+    captureReviewResults(f.statePath);
+    await rejudgeCardOnHead(f.card().id, deps);
+    expect(launched).toHaveLength(1);
+    expect(readFileSync(launched[0]!.goalFile, 'utf8')).toContain('fresh exact-head fix');
+  });
+
   test('taLand reviewed draft becomes ready before its first host regate', async () => {
     const f = fixture();
     let draft = true;
@@ -591,7 +697,7 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     await rejudgeCardOnHead('ta-rj-1', f.deps());
     expect(f.card().regates?.[0]).toMatchObject({ passed: true, baseCommit: BASE });
     expect(f.lands).toEqual([]);
-    expect(f.card().history.find((item) => item.event === 'rejudge-on-head' && item.kind === 'land')?.detail).toContain('must-fix 1');
+    expect(f.decisions()).toContain('repair:would-repair');
   });
 
   test('재게이트 pass ⊕ 지금 머리 pass ⊕ must-fix 0 → land 한 번 · --overlap-evidence 파일 내용이 맞다', async () => {
@@ -872,7 +978,7 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     f.setClock('2026-10-11T01:10:00.000Z');
     await rejudgeCardOnHead('ta-rj-1', f.deps());
     expect(f.lands).toHaveLength(lands);
-    if (lands === 0) expect(f.decisions().at(-1)).toBe('land:not-landing');
+    if (lands === 0) expect(f.decisions().at(-1)).toBe(digit === '6' ? 'repair:would-repair' : 'land:not-landing');
   });
 
   test('propose-land 가 허용 밖이면 재게이트·land 0(리뷰 재요청만)', async () => {
@@ -964,6 +1070,38 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     const f = fixture();
     const card = f.card();
     expect(rejudgeCandidates({ [card.id]: card, other: { ...card, id: 'other', reviewRequests: [] } })).toEqual(['ta-rj-1']);
+  });
+
+  test('MERGED/CLOSED bound PR is recorded once and excluded from future ticks', async () => {
+    for (const state of ['MERGED', 'CLOSED'] as const) {
+      const f = fixture();
+      const deps = { ...f.deps(), live: { ...f.deps().live, prHead: async () => ({ head: B, state, url: URL }) } };
+      expect((await rejudgeCardOnHead(f.card().id, deps)).at(-1)?.decision).toBe('pr-not-open');
+      const first = f.card().prTerminal;
+      expect(first).toMatchObject({ pr: 30, url: URL, head: B, state, at: '2026-10-11T01:00:00.000Z' });
+      expect(rejudgeCandidates({ [f.card().id]: f.card() })).toEqual([]);
+      f.setClock('2026-10-11T02:00:00.000Z');
+      await rejudgeCardOnHead(f.card().id, deps);
+      expect(f.card().prTerminal).toEqual(first);
+      expect(f.regateRequests).toHaveLength(0);
+      expect(f.reviewRequests).toHaveLength(0);
+      expect(f.lands).toHaveLength(0);
+    }
+  });
+
+  test('terminal marker applies only to its exact binding; explicit rejudge clears it after reopen', async () => {
+    const f = fixture();
+    const terminal = { pr: 30, url: URL, head: A, state: 'CLOSED' as const, at: '2026-10-11T00:30:00.000Z' };
+    writeTaskCards(f.statePath, [{ ...f.card(), prTerminal: terminal }]);
+    expect(rejudgeCandidates({ [f.card().id]: f.card() })).toEqual([]);
+    const reopened = { ...f.deps(), live: { ...f.deps().live, prHead: async () => ({ head: A, state: 'OPEN', url: URL }) } };
+    await rejudgeCardOnHead(f.card().id, reopened);
+    expect(f.card().prTerminal).toBeUndefined();
+    expect(rejudgeCandidates({ [f.card().id]: f.card() })).toEqual([f.card().id]);
+
+    writeTaskCards(f.statePath, [{ ...f.card(), pr: { number: 31, url: 'https://github.com/o/r/pull/31' }, prTerminal: terminal,
+      reviewRequests: [{ pr: 31, head: A, at: '2026-10-11T00:10:00.000Z' }] }]);
+    expect(rejudgeCandidates({ [f.card().id]: f.card() })).toEqual([f.card().id]);
   });
 
   test('liveLandArgs — 증거가 있으면 --overlap-evidence <file> · 없으면 종전 인자 그대로', () => {

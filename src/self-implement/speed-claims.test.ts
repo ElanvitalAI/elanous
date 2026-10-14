@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { LogStore } from '../mss/logging/log-store.js';
-import { measureParentSpeedClaims, measureSpeedClaims, renderSpeedClaims, type ParentSpeedClaimsEvent } from './speed-claims.js';
+import { measureParentSpeedClaims, measureSpeedClaims, renderSpeedClaims, type ParentSpeedClaimsEvent, type SpeedClaimsReleaseEvent } from './speed-claims.js';
 
 const id = (suffix: string) => `run-00000000-0000-4000-8000-00000000${suffix}`;
 const stamp = (minute: number) => new Date(Date.parse('2026-09-01T00:00:00.000Z') + minute * 60_000).toISOString();
@@ -23,7 +23,7 @@ function writeRun(dir: string, suffix: string, events: readonly { minute?: numbe
 
 function invoke(dir: string, json = false) {
   return spawnSync(process.execPath, [fileURLToPath(new URL('../../bin/elanous.mjs', import.meta.url)), `--test=${dir}`, 'self', 'speed-claims', ...(json ? ['--json'] : [])], {
-    encoding: 'utf8', timeout: 60_000, env: { ...process.env, ELANOUS_STATE_DIR: dir },
+    encoding: 'utf8', timeout: 60_000, env: { ...process.env, ELANOUS_STATE_DIR: dir, ELANOUS_CONFIG_DIR: dir },
   });
 }
 
@@ -309,6 +309,233 @@ describe('SPEED-CLAIMS launch-to-end census', () => {
       const cli = invoke(state);
       expect(cli.status, cli.stderr).toBe(0);
       expect(cli.stdout).toContain('status: cannot-measure');
+    } finally { rmSync(state, { recursive: true, force: true }); }
+  }, 70_000);
+});
+
+describe('SPEED-CLAIMS daily 30-day landed-PR and issued-release census', () => {
+  const now = Date.parse('2026-10-13T12:00:00.000Z');
+
+  const dailyMeasure = (dir: string, releases: readonly SpeedClaimsReleaseEvent[] = []) => measureSpeedClaims({
+    dir, now, readParentEvents: () => [], readParentQueue: () => [], readReleaseEvents: () => releases,
+  });
+
+  const writeMergedRuns = (dir: string, runs: readonly { suffix: string; pr?: number; timestamps: readonly string[] }[]): void => {
+    for (const { suffix, pr, timestamps } of runs) {
+      const runId = id(suffix);
+      writeFileSync(join(dir, `${runId}.jsonl`), timestamps.map((ts) => JSON.stringify({
+        runId, event: 'merged', timestamp: ts, data: pr === undefined ? { merged: true } : { number: pr, merged: true },
+      })).join('\n') + '\n');
+    }
+  };
+
+  it('returns exactly 30 consecutive UTC date rows ending on the measurement day', () => {
+    const state = mkdtempSync(join(tmpdir(), 'speed-claims-daily-rows-'));
+    try {
+      const dir = join(state, 'run-ledger');
+      mkdirSync(dir);
+      writeMergedRuns(dir, [{ suffix: '0051', pr: 23995, timestamps: ['2026-10-13T00:30:00.000Z'] }]);
+      const result = dailyMeasure(dir);
+      expect(result.daily).toMatchObject({
+        scope: 'last-30-days', windowStart: '2026-09-14', windowEnd: '2026-10-13',
+        landedPrs: { status: 'measured', undatedCount: 0 }, releases: { status: 'measured', undatedCount: 0 },
+      });
+      const expectedDates = Array.from({ length: 30 }, (_, index) => new Date(Date.parse('2026-09-14T00:00:00.000Z') + index * 86_400_000).toISOString().slice(0, 10));
+      expect(result.daily.rows.map((row) => row.date)).toEqual(expectedDates);
+      expect(result.daily.rows[0]).toEqual({ date: '2026-09-14', landedPrCount: 0, releasedCount: 0 });
+      expect(result.daily.rows[29]).toEqual({ date: '2026-10-13', landedPrCount: 1, releasedCount: 0 });
+    } finally { rmSync(state, { recursive: true, force: true }); }
+  });
+
+  it('de-duplicates repeated landed PRs by number across runs, days and retries', () => {
+    const state = mkdtempSync(join(tmpdir(), 'speed-claims-daily-dedup-'));
+    try {
+      const dir = join(state, 'run-ledger');
+      mkdirSync(dir);
+      writeMergedRuns(dir, [
+        { suffix: '0061', pr: 1001, timestamps: ['2026-10-10T01:00:00.000Z', '2026-10-10T05:00:00.000Z'] },
+        { suffix: '0062', pr: 1001, timestamps: ['2026-10-11T02:00:00.000Z'] },
+        { suffix: '0063', pr: 1002, timestamps: ['2026-10-10T03:00:00.000Z'] },
+        { suffix: '0064', pr: 1003, timestamps: ['2026-09-01T00:00:00.000Z'] },
+        { suffix: '0065', timestamps: ['2026-10-10T04:00:00.000Z', '2026-10-10T06:00:00.000Z'] },
+      ]);
+      const result = dailyMeasure(dir);
+      const byDate = new Map(result.daily.rows.map((row) => [row.date, row]));
+      expect(byDate.get('2026-10-10')).toEqual({ date: '2026-10-10', landedPrCount: 3, releasedCount: 0 });
+      expect(byDate.get('2026-10-11')!.landedPrCount).toBe(0);
+      expect(byDate.get('2026-10-13')!.landedPrCount).toBe(0);
+      expect(result.daily.rows.reduce((sum, row) => sum + (row.landedPrCount ?? 0), 0)).toBe(3);
+      expect(result.daily.landedPrs.undatedCount).toBe(0);
+    } finally { rmSync(state, { recursive: true, force: true }); }
+  });
+
+  it('joins an unnumbered merge to a later numbered merge in the same run', () => {
+    const state = mkdtempSync(join(tmpdir(), 'speed-claims-daily-alias-'));
+    try {
+      const dir = join(state, 'run-ledger');
+      mkdirSync(dir);
+      const runId = id('0067');
+      writeFileSync(join(dir, `${runId}.jsonl`), [
+        { runId, event: 'merged', timestamp: '2026-10-10T01:00:00.000Z', data: { merged: true } },
+        { runId, event: 'merged', timestamp: '2026-10-11T01:00:00.000Z', data: { merged: true, number: 1005 } },
+      ].map((event) => JSON.stringify(event)).join('\n') + '\n');
+      writeMergedRuns(dir, [{ suffix: '0068', pr: 1005, timestamps: ['2026-10-12T01:00:00.000Z'] }]);
+      const rows = dailyMeasure(dir).daily.rows;
+      expect(rows.find((row) => row.date === '2026-10-10')?.landedPrCount).toBe(1);
+      expect(rows.find((row) => row.date === '2026-10-11')?.landedPrCount).toBe(0);
+      expect(rows.find((row) => row.date === '2026-10-12')?.landedPrCount).toBe(0);
+    } finally { rmSync(state, { recursive: true, force: true }); }
+  });
+
+  it('de-duplicates repeated issued releases by version and attributes them to the earliest day', () => {
+    const state = mkdtempSync(join(tmpdir(), 'speed-claims-daily-releases-'));
+    try {
+      const dir = join(state, 'run-ledger');
+      mkdirSync(dir);
+      const result = dailyMeasure(dir, [
+        { version: '0.2.27', ts: '2026-10-12T09:00:00.000Z' },
+        { version: '0.2.27', ts: '2026-10-12T18:00:00.000Z' },
+        { version: 'v0.2.27', ts: '2026-10-13T01:00:00.000Z' },
+        { version: '0.2.26-dev.1', ts: '2026-10-12T10:00:00.000Z' },
+        { version: '0.2.25', ts: '2026-08-01T00:00:00.000Z' },
+      ]);
+      const byDate = new Map(result.daily.rows.map((row) => [row.date, row]));
+      expect(byDate.get('2026-10-12')).toEqual({ date: '2026-10-12', landedPrCount: 0, releasedCount: 2 });
+      expect(byDate.get('2026-10-13')!.releasedCount).toBe(0);
+      expect(result.daily.rows.reduce((sum, row) => sum + (row.releasedCount ?? 0), 0)).toBe(2);
+      expect(result.daily.releases.undatedCount).toBe(0);
+      expect(result.daily.landedPrs.status).toBe('measured');
+    } finally { rmSync(state, { recursive: true, force: true }); }
+  });
+
+  it('does not claim a measured zero when a landed PR or issued release has no valid date', () => {
+    const state = mkdtempSync(join(tmpdir(), 'speed-claims-daily-undated-'));
+    try {
+      const dir = join(state, 'run-ledger');
+      mkdirSync(dir);
+      writeMergedRuns(dir, [
+        { suffix: '0066', pr: 1004, timestamps: ['2026-02-30T00:00:00.000Z'] },
+        { suffix: '0067', pr: 1005, timestamps: ['2026-10-12T01:00:00.000Z'] },
+      ]);
+      const result = dailyMeasure(dir, [
+        { version: '0.2.26', ts: 'invalid' },
+        { version: '0.2.27', ts: '2026-10-12T09:00:00.000Z' },
+      ]);
+      expect(result.daily.landedPrs).toEqual({ status: 'unmeasured', undatedCount: 1 });
+      expect(result.daily.releases).toEqual({ status: 'unmeasured', undatedCount: 1 });
+      expect(result.daily.rows.every((row) => row.landedPrCount === null && row.releasedCount === null)).toBe(true);
+    } finally { rmSync(state, { recursive: true, force: true }); }
+  });
+
+  it('renders queried-zero days as 0 and unqueryable days as unmeasured, with JSON nulls', () => {
+    const state = mkdtempSync(join(tmpdir(), 'speed-claims-daily-unmeasured-'));
+    try {
+      const dir = join(state, 'run-ledger');
+      mkdirSync(dir);
+      const zero = dailyMeasure(dir);
+      expect(zero.daily.landedPrs.status).toBe('measured');
+      expect(zero.daily.rows[0]).toEqual({ date: '2026-09-14', landedPrCount: 0, releasedCount: 0 });
+      expect(renderSpeedClaims(zero)).toContain('date=2026-09-14 landed=0 released=0');
+      expect(renderSpeedClaims(zero)).toContain('landed PRs status: measured (undated: 0)');
+
+      const unreadableReleases = measureSpeedClaims({
+        dir, now, readParentEvents: () => [], readParentQueue: () => [], readReleaseEvents: () => { throw new Error('tags unreadable'); },
+      });
+      expect(unreadableReleases.daily.releases).toEqual({ status: 'unmeasured', undatedCount: 0 });
+      expect(unreadableReleases.daily.rows.every((row) => row.releasedCount === null && row.landedPrCount === 0)).toBe(true);
+      expect(renderSpeedClaims(unreadableReleases)).toContain('date=2026-09-14 landed=0 released=unmeasured');
+      expect(renderSpeedClaims(unreadableReleases)).toContain('issued releases status: unmeasured');
+
+      const unreadableLedger = dailyMeasure(join(state, 'absent'), [{ version: '0.2.27', ts: '2026-10-12T09:00:00.000Z' }]);
+      expect(unreadableLedger.daily.landedPrs).toEqual({ status: 'unmeasured', undatedCount: 0 });
+      expect(unreadableLedger.daily.rows.every((row) => row.landedPrCount === null)).toBe(true);
+      expect(renderSpeedClaims(unreadableLedger)).toContain('date=2026-10-12 landed=unmeasured released=1');
+    } finally { rmSync(state, { recursive: true, force: true }); }
+  });
+
+  it('renders the daily section through the self speed-claims CLI', () => {
+    const state = mkdtempSync(join(tmpdir(), 'speed-claims-daily-cli-'));
+    try {
+      mkdirSync(join(state, 'run-ledger'));
+      const text = invoke(state);
+      expect(text.status, text.stderr).toBe(0);
+      expect(text.stdout).toContain('daily landed PRs / issued releases (last 30 days, UTC):');
+      expect(text.stdout).toContain('daily window: ');
+      const rows = text.stdout.match(/^date=\d{4}-\d{2}-\d{2} landed=(?:\d+|unmeasured) released=(?:\d+|unmeasured)$/gm);
+      expect(rows?.length).toBe(30);
+      const json = invoke(state, true);
+      expect(json.status, json.stderr).toBe(0);
+      const parsed = JSON.parse(json.stdout);
+      expect(parsed.daily.rows).toHaveLength(30);
+      expect(parsed.daily.scope).toBe('last-30-days');
+      expect(parsed.daily.windowStart).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    } finally { rmSync(state, { recursive: true, force: true }); }
+  }, 70_000);
+
+  it('CLI counts a release by publishedAt even when its source commit predates the window; absent history is unmeasured', () => {
+    const state = mkdtempSync(join(tmpdir(), 'speed-claims-published-at-'));
+    try {
+      mkdirSync(join(state, 'run-ledger'));
+      const versionDir = join(state, 'release', '0.2.27');
+      mkdirSync(versionDir, { recursive: true });
+      const publishedAt = new Date().toISOString();
+      writeFileSync(join(versionDir, 'release.json'), JSON.stringify({
+        version: '0.2.27', tag: 'v0.2.27', sourceCommit: '0000000000000000000000000000000000000000',
+        publishedAt,
+      }));
+      const issued = invoke(state, true);
+      expect(issued.status, issued.stderr).toBe(0);
+      const daily = JSON.parse(issued.stdout).daily;
+      expect(daily.releases.status).toBe('measured');
+      expect(daily.rows.find((row: { date: string }) => row.date === publishedAt.slice(0, 10))?.releasedCount).toBe(1);
+
+      const brokenDir = join(state, 'release', '0.2.26');
+      mkdirSync(brokenDir);
+      writeFileSync(join(brokenDir, 'release.json'), '{broken');
+      const mixed = invoke(state, true);
+      expect(mixed.status, mixed.stderr).toBe(0);
+      const partialHistory = JSON.parse(mixed.stdout).daily;
+      expect(partialHistory.releases.status).toBe('unmeasured');
+      expect(partialHistory.rows.every((row: { releasedCount: number | null }) => row.releasedCount === null)).toBe(true);
+
+      for (const damagedTime of ['not-a-date', 0]) {
+        writeFileSync(join(brokenDir, 'release.json'), JSON.stringify({ version: '0.2.26', publishedAt: damagedTime }));
+        const damaged = invoke(state, true);
+        expect(damaged.status, damaged.stderr).toBe(0);
+        const damagedDaily = JSON.parse(damaged.stdout).daily;
+        expect(damagedDaily.releases.status).toBe('unmeasured');
+        expect(damagedDaily.rows.every((row: { releasedCount: number | null }) => row.releasedCount === null)).toBe(true);
+      }
+
+      rmSync(join(state, 'release'), { recursive: true, force: true });
+      const missing = invoke(state, true);
+      expect(missing.status, missing.stderr).toBe(0);
+      const noHistory = JSON.parse(missing.stdout).daily;
+      expect(noHistory.releases.status).toBe('unmeasured');
+      expect(noHistory.rows.every((row: { releasedCount: number | null }) => row.releasedCount === null)).toBe(true);
+
+      const preparedDir = join(state, 'release', '0.2.28');
+      mkdirSync(preparedDir, { recursive: true });
+      writeFileSync(join(preparedDir, 'release.json'), JSON.stringify({ version: '0.2.28' }));
+      const prepared = invoke(state, true);
+      expect(prepared.status, prepared.stderr).toBe(0);
+      const preparedDaily = JSON.parse(prepared.stdout).daily;
+      expect(preparedDaily.releases.status).toBe('measured');
+      expect(preparedDaily.rows.every((row: { releasedCount: number | null }) => row.releasedCount === 0)).toBe(true);
+
+      const missingManifestDir = join(state, 'release', '0.2.29');
+      mkdirSync(missingManifestDir);
+      const missingManifest = invoke(state, true);
+      expect(missingManifest.status, missingManifest.stderr).toBe(0);
+      expect(JSON.parse(missingManifest.stdout).daily.releases.status).toBe('unmeasured');
+      rmSync(missingManifestDir, { recursive: true, force: true });
+
+      writeFileSync(join(state, 'run-ledger', `${id('0099')}.jsonl`), '');
+      const emptyRun = invoke(state, true);
+      expect(emptyRun.status, emptyRun.stderr).toBe(0);
+      const emptyRunDaily = JSON.parse(emptyRun.stdout).daily;
+      expect(emptyRunDaily.landedPrs.status).toBe('unmeasured');
+      expect(emptyRunDaily.rows.every((row: { landedPrCount: number | null }) => row.landedPrCount === null)).toBe(true);
     } finally { rmSync(state, { recursive: true, force: true }); }
   }, 70_000);
 });

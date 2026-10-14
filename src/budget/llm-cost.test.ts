@@ -7,7 +7,7 @@ import { findGrokModel } from '../grok/models.js';
 import { debug } from '../debug/log.js';
 import { logAgentTurnUsage } from '../llm.js';
 import * as userConfig from '../user-config.js';
-import { bedrockPricingModelId, estimateLlmCost, llmUsageCostFields, readLlmConfigPricing, longContextPricing } from './llm-cost.js';
+import { bedrockPricingModelId, creditRouteFromQuotaSignal, estimateLlmCost, llmUsageCostFields, readLlmConfigPricing, longContextPricing } from './llm-cost.js';
 
 const MILLION = 1_000_000;
 const noOverlay = { configPricing: {} };
@@ -584,5 +584,67 @@ describe('stream-llm site — reportedCostUsd (G9)', () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+describe('Codex credit billing (METER-CODEX-CREDIT-ACTUAL)', () => {
+  it('selects credit only for an exhausted window with available credits', () => {
+    expect(creditRouteFromQuotaSignal({ usedPercent: 100, hasCredits: true })).toBe('credit');
+    expect(creditRouteFromQuotaSignal({ usedPercent: 99.9, rateLimitReached: true, hasCredits: true })).toBe('credit');
+    expect(creditRouteFromQuotaSignal({ usedPercent: 99.9, hasCredits: true })).toBeNull();
+    expect(creditRouteFromQuotaSignal({ usedPercent: 100, hasCredits: false })).toBeNull();
+  });
+
+  it('does not infer credit from absent or incomplete quota data', () => {
+    expect(creditRouteFromQuotaSignal(null)).toBeNull();
+    expect(creditRouteFromQuotaSignal({ hasCredits: true })).toBeNull();
+    expect(creditRouteFromQuotaSignal({ usedPercent: 100 })).toBeNull();
+    expect(creditRouteFromQuotaSignal({ usedPercent: Number.NaN, hasCredits: true })).toBeNull();
+  });
+
+  it('records credit separately from dollars while retaining a known API equivalent', () => {
+    const equivalent = findCodexModel('gpt-5.6-terra')!.pricingUsd!.inputPerM;
+    expect(llmUsageCostFields('gpt-5.6-terra', { inputTokens: MILLION, outputTokens: 0 }, noOverlay, 'credit'))
+      .toEqual({ cost: { kind: 'credit', model: 'gpt-5.6-terra', usd: null, apiEquivalentUsd: equivalent } });
+    expect(llmUsageCostFields('absent-model-for-test', { inputTokens: 3 }, noOverlay, 'credit'))
+      .toEqual({ cost: { kind: 'credit', model: 'absent-model-for-test', usd: null } });
+  });
+
+  it('keeps an explicit credit route when conflicting provider or BYOK amounts are present', () => {
+    const base = { inputTokens: MILLION, outputTokens: 0 };
+    const equivalent = findCodexModel('gpt-5.6-terra')!.pricingUsd!.inputPerM;
+    expect(llmUsageCostFields('gpt-5.6-terra', { ...base, reportedCostUsd: 1.23 } as never, noOverlay, 'credit'))
+      .toEqual({ cost: { kind: 'credit', model: 'gpt-5.6-terra', usd: null, apiEquivalentUsd: equivalent } });
+    expect(llmUsageCostFields('gpt-5.6-terra', { ...base, byok: true, reportedCostUsd: 1.23, upstreamCostUsd: 2.34 } as never, noOverlay, 'credit'))
+      .toEqual({ cost: { kind: 'credit', model: 'gpt-5.6-terra', usd: null, apiEquivalentUsd: equivalent } });
+  });
+
+  it('does not label a production usage row as credit without a verified payment route', () => {
+    const spy = spyOn(debug, 'log');
+    try {
+      logAgentTurnUsage('gpt-5.6-terra', {
+        provider: 'openai', inputTokens: MILLION, outputTokens: 0,
+      }, { providerName: 'openai-codex', site: 'codex-billing-test' });
+      const row = spy.mock.calls.find((call) =>
+        call[0] === 'llm.usage' && (call[2] as { site?: string })?.site === 'codex-billing-test');
+      expect(row).toBeDefined();
+      expect(row![2]).toMatchObject({ billingProvider: 'openai-codex', inputTokens: MILLION, outputTokens: 0 });
+      const recorded = row![2] as { billing: string; cost: unknown };
+      const equivalent = findCodexModel('gpt-5.6-terra')!.pricingUsd!.inputPerM;
+      expect(['subscription', 'unknown']).toContain(recorded.billing);
+      if (recorded.billing === 'subscription') {
+        expect(recorded.cost).toEqual({ kind: 'included', model: 'gpt-5.6-terra', usd: 0, billing: 'subscription', apiEquivalentUsd: equivalent });
+      } else {
+        expect(recorded.cost).toEqual({ kind: 'known', model: 'gpt-5.6-terra', usd: equivalent, source: 'catalog', cacheReadPricedAt: 'input-rate', cacheWritePricedAt: 'input-rate' });
+      }
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('preserves the existing subscription estimate as an API equivalent', () => {
+    const estimate = findCodexModel('gpt-5.6-terra')!.pricingUsd!.inputPerM;
+    expect(llmUsageCostFields('gpt-5.6-terra', { inputTokens: MILLION, outputTokens: 0 }, noOverlay, 'subscription'))
+      .toEqual({ cost: { kind: 'included', model: 'gpt-5.6-terra', usd: 0, billing: 'subscription', apiEquivalentUsd: estimate } });
   });
 });

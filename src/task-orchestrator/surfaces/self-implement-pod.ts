@@ -19,6 +19,7 @@ import { coalescedInstallationCredential } from '../../auth/github-app-token.js'
 import { POD_CREDENTIAL_TOKEN_ENV, POD_CREDENTIAL_URL_ENV } from '../../grok/credential.js';
 import { collectPodLedgers, createPodLedgerFollower } from './pod-ledger-collect.js';
 import { collectPodArtifacts, podNoResultDiagnostic } from './pod-artifact-return.js';
+import { readPodRepairArtifact } from './pod-repair-commit.js';
 import { isValidAccountName, resolveCodexAccount } from '../../oauth/codex-account.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { controlInboxEnv } from '../../harness/control-inbox.js';
@@ -27,7 +28,7 @@ import { mintRunId, normalizeRunId } from '../../harness/harness-space.js';
 import { TA_LAND_ENV } from '../../task-agent/task-hand.js';
 import { appendRunLedgerEntry, loadRunLedger, runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
 import type { GoalExecutionRecord } from '../../self-implement/orchestrator.js';
-import { runHostRegate, type HostRegateResult } from '../../self-implement/host-regate.js';
+import { hostRepositoryUnavailable, runHostRegate, type HostRegateResult } from '../../self-implement/host-regate.js';
 import { resolvePodHostAcpReview, runPodHostAcpReview, type PodHostAcpReviewOutcome } from './pod-host-acp-review.js';
 import { REVIEW_DEFERRED_TO_HOST_ENV, REVIEW_DEFERRED_TO_HOST_MERGE_REASON } from '../../self-implement/review-deferred-to-host.js';
 import { classifyPodTerminal, applyPodTerminal, podTerminalPrBody, type PrTerminalRecord, type DraftResidueContext } from '../../self-dev/draft-residue.js';
@@ -137,6 +138,8 @@ export interface PodSpawnOptions {
   authorConfig?: () => UserConfig;
   /** 원천 — 없으면 종전 `git clone --depth 50`. bundle 이면 apply 뒤 kubectl cp 로 싣는다. */
   source?: PodSource;
+  /** Existing PR repair: pin the source head and export a commit bundle instead of opening a PR. */
+  repairCommitOnly?: { pr: number; baseHead: string };
   /** 호스트 환경에서 읽어 Pod env 로 넣을 키 이름(예: OPENROUTER_API_KEY · ANTHROPIC_API_KEY) — 벤치마크 과금 경로. */
   passEnv?: readonly string[];
   /** 호스트가 재발사를 소유하면 Pod 자식의 자체 감독을 끈다. 독립 호출 기본 true; 실제 CLI 호스트는 자기 감독 상태를 명시한다. */
@@ -953,7 +956,10 @@ export function podSigtermTrapScript(seqFile: string = POD_USAGE_PARTIAL_SEQ_FIL
   return `trap '{ [ -n "$si_pid" ] && kill "$si_pid" 2>/dev/null || true; [ -n "\${usage_partial_pid:-}" ] && kill "$usage_partial_pid" 2>/dev/null || true; si_seq=$(cat ${seqFile} 2>/dev/null || true); case "$si_seq" in ""|*[!0-9]*) si_seq=0;; esac; si_seq=$((10#$si_seq + 1)); { [ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h --partial --seq "$si_seq"; } & si_rollup_pid=$!; for si_i in 1 2 3 4 5 6 7 8; do kill -0 "$si_rollup_pid" 2>/dev/null || break; sleep 1; done; kill "$si_rollup_pid" 2>/dev/null || true; wait "$si_rollup_pid" 2>/dev/null || true; exit 143; }' TERM`;
 }
 
-export function podJobManifest(o: { name: string; namespace: string; image: string; workIdentity?: PodWorkIdentity; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; memoryRequest?: string; goalDoc?: string; /** AUTHOR-POD2 — run `harness say` on /creds/feature inside the Pod (authoring happens off the host). */ authorSentence?: boolean; authorGrade?: 'full' | 'lite'; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number; /** Which goal execution and attempt this Job is — a resumed host verifies it before following the Job (POD9). */ execution?: { key: string; attempt: number }; hostLeaseAdmitted?: boolean; /** POD-ROLE-LLM — OpenRouter 자식 Pod 에 리뷰어용 codex 자격을 깐다. */ reviewerCodexAuth?: boolean; /** BEDROCK-PROVIDER ② — bedrock 자식만: 이름 있는 AWS Secret 의 키(secretKeyRef) ⊕ 리전 ⊕ 이그레스 라벨. */ bedrock?: BedrockPodSpec; /** ZAI-POD-CHILD — glm(ZAI) 자식만: 이름 있는 ZAI Secret 의 키(secretKeyRef) ⊕ 이그레스·동시 상한 라벨(Pod ⊕ Job). */ zai?: ZaiPodSpec }): Record<string, unknown> {
+export function podJobManifest(o: { name: string; namespace: string; image: string; workIdentity?: PodWorkIdentity; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; repairCommitOnly?: { pr: number; baseHead: string }; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; memoryRequest?: string; goalDoc?: string; /** AUTHOR-POD2 — run `harness say` on /creds/feature inside the Pod (authoring happens off the host). */ authorSentence?: boolean; authorGrade?: 'full' | 'lite'; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number; /** Which goal execution and attempt this Job is — a resumed host verifies it before following the Job (POD9). */ execution?: { key: string; attempt: number }; hostLeaseAdmitted?: boolean; /** POD-ROLE-LLM — OpenRouter 자식 Pod 에 리뷰어용 codex 자격을 깐다. */ reviewerCodexAuth?: boolean; /** BEDROCK-PROVIDER ② — bedrock 자식만: 이름 있는 AWS Secret 의 키(secretKeyRef) ⊕ 리전 ⊕ 이그레스 라벨. */ bedrock?: BedrockPodSpec; /** ZAI-POD-CHILD — glm(ZAI) 자식만: 이름 있는 ZAI Secret 의 키(secretKeyRef) ⊕ 이그레스·동시 상한 라벨(Pod ⊕ Job). */ zai?: ZaiPodSpec }): Record<string, unknown> {
+  if (o.repairCommitOnly && (o.source?.kind !== 'pr' || o.source.number !== o.repairCommitOnly.pr || !/^[0-9a-f]{40}$/.test(o.repairCommitOnly.baseHead) || o.args.includes('--open-pr') || o.args.includes('--merge-by-host') || o.args.includes('--auto-merge'))) {
+    throw new Error('repair commit-only requires matching PR source and no PR/merge flags');
+  }
   const quoted = o.args.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(' ');
   const childProviderIndex = o.args.indexOf('--child-llm-provider');
   const childModelIndex = o.args.indexOf('--child-llm-model');
@@ -962,7 +968,7 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
   // POD-ANTHROPIC-PROVIDER — anthropic 자식은 키(env · secretKeyRef)만 쓴다. codex·grok 자격 파일을 깔지 않는다.
   const anthropicChild = childProviderIndex >= 0 && o.args[childProviderIndex + 1] === 'anthropic';
   const goalPath = o.goalDoc ? `'${(o.goalDoc.startsWith('-') ? `./${o.goalDoc}` : o.goalDoc).replace(/'/g, `'\\''`)}'` : undefined;
-  const delegated = Boolean(o.goalDoc) || o.authorSentence === true;
+  const delegated = !o.repairCommitOnly && (Boolean(o.goalDoc) || o.authorSentence === true);
   const askBaseIndex = delegated ? o.args.indexOf('--base') : -1;
   const quotedAsk = (askBaseIndex >= 0 && o.args[askBaseIndex + 1]
     ? ` '--base' '${o.args[askBaseIndex + 1]!.replace(/'/g, `'\\''`)}'`
@@ -997,12 +1003,13 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
     podGitPushGuardScript(),
     'curl -s -m 3 -o /dev/null http://host.orb.internal:31415/health && { echo "[pod] ISOLATION FAIL"; exit 3; }',
     podSourceScript(o.source ?? { kind: 'default' }, o.repoUrl),
+    ...(o.repairCommitOnly ? [`[ "$(git rev-parse HEAD)" = '${o.repairCommitOnly.baseHead}' ] || { echo 'ELANOUS_POD_REPAIR_FAILED source-head-mismatch'; exit 8; }`] : []),
     ...(goalPath ? [
       `mkdir -p -- "$(dirname -- ${goalPath})" && cp -- /creds/goal-doc ${goalPath} || exit 6`,
     ] : []),
     // Only fixed command shapes leave the Pod; arbitrary argv (including shell -c text) is never emitted.
     `(while :; do { mem=$(if [ -r /sys/fs/cgroup/memory.current ]; then cat /sys/fs/cgroup/memory.current; elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then cat /sys/fs/cgroup/memory/memory.usage_in_bytes; else printf -- -; fi); top=$(ps -eo rss=,comm=,args= --sort=-rss | head -5 | awk 'function encode(s) { gsub(/%/, "%25", s); gsub(/:/, "%3A", s); gsub(/ /, "%20", s); gsub(/\\t/, "%09", s); return s } { rss=$1; name=$2; sub(/^[[:space:]]*[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]*/, ""); n=split($0, a, /[[:space:]]+/); cmd="<redacted>"; if (name=="sleep" && a[2]=="30") cmd="sleep 30" (n>2 ? " <redacted>" : ""); else if (name=="bun") { cmd="bun <redacted>"; if (a[2]=="test") cmd="bun test <redacted>"; else if (a[2]=="run") cmd="bun run <redacted>"; else if ((a[2]=="x" || a[2]=="exec") && a[3]=="tsc") cmd="bun x tsc <redacted>" } else if (name=="tsc") cmd="tsc <redacted>"; else if (name=="elanous") { cmd="elanous <redacted>"; if (a[2]=="self") cmd="elanous self <redacted>"; else if (a[2]=="harness") cmd="elanous harness <redacted>" } else if (name=="node") cmd="node <redacted>"; if (name=="sleep" && cmd=="<redacted>") cmd="sleep <redacted>"; else if (cmd=="<redacted>" && name!="bash" && name!="sh") name="other"; printf " %s:%s:%s", rss, encode(name), encode(substr(cmd,1,120)) }'); printf "ELANOUS_MEM %s %s%s\\n" "$(date +%s)" "$mem" "$top"; } || true; sleep 15 || break; done) & mem_sampler_pid=$!`,
-    ...(o.appCredential ? [podGithubWatchdogScript(o.githubStaleSeconds ?? POD_GH_STALE_SECONDS)] : []),
+    ...(o.appCredential && !o.repairCommitOnly ? [podGithubWatchdogScript(o.githubStaleSeconds ?? POD_GH_STALE_SECONDS)] : []),
     // METER-POD-ROLLUP-GAP — 부분 롤업 표본기: 최종 줄까지 못 사는 Pod 도 N 분마다(기본 5 · ELANOUS_USAGE_PARTIAL_MINUTES) PARTIAL 줄을 하나씩 남긴다.
     `(usage_partial_seq=0; while :; do { usage_partial_seq=$((usage_partial_seq+1)); printf '%s\\n' "$usage_partial_seq" > ${POD_USAGE_PARTIAL_SEQ_FILE} 2>/dev/null || true; [ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h --partial --seq "$usage_partial_seq" || true; } || true; usage_partial_sleep=$(( \${ELANOUS_USAGE_PARTIAL_MINUTES:-5} * 60 )); sleep "$usage_partial_sleep" || break; done) & usage_partial_pid=$!`,
     // ⭐ MF-d3b5a70f — si_pid 초기화 + trap: 메인 명령을 아래에서 `& si_pid=$!` 로 띄우고 `wait "$si_pid"` 로
@@ -1013,7 +1020,9 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
     // 마지막 줄 JSON 이 «맨 끝»이어야 한다(parseSelfImplementJson) — rollup 은 그 앞에.
     // ⛔ `--author-grade` 는 Pod 안 `elanous`(이미지에 깔린 판)가 모를 수 있어 넘기지 않는다 — 10-06 «unknown option» 즉사(#24445 되돌림).
     // AUTHOR-LITE2-POD — 등급은 환경변수 `ELANOUS_AUTHOR_GRADE` 로 싣는다(옛 Pod elanous 는 모르는 환경변수를 무시하고 full 로 돈다).
-    o.authorSentence
+    o.repairCommitOnly
+      ? `export ${OLD_DOOR_STAMP_ENV}=self-implement; elanous self implement "$(cat /creds/feature)" --json --no-open-pr ${quoted} > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; if [ "$rc" -eq 0 ]; then elanous self repair-commit-export '${o.repairCommitOnly.pr}' '${o.repairCommitOnly.baseHead}' /tmp/si.out "$PWD" "$HOME/outbox" || rc=8; fi`
+      : o.authorSentence
       ? `echo "ELANOUS_AUTHOR_ON_POD started host=$(hostname) at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; author_t0=$(date +%s); ${o.authorGrade === 'lite' || o.authorGrade === 'full' ? `ELANOUS_AUTHOR_GRADE=${o.authorGrade} ` : ''}elanous harness say --substrate local --json${quotedAsk}${quotedChildLlm} -- "$(cat /creds/feature)" > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; echo "ELANOUS_AUTHOR_ON_POD finished host=$(hostname) rc=$rc seconds=$(( $(date +%s) - author_t0 ))"; ${POD_RESULT_FLATTEN}`
       : goalPath
       ? `elanous harness ask ${goalPath} --json${quotedAsk}${quotedChildLlm} > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; ${POD_RESULT_FLATTEN}`
@@ -1074,12 +1083,12 @@ for ledger in "\${ELANOUS_STATE_DIR:-$HOME/.elanous}"/run-ledger/*.jsonl; do
 done
 if [ "$found" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi`,
     'kill "$mem_sampler_pid" 2>/dev/null || true',
-    ...(o.appCredential ? ['kill "$gh_watch_pid" 2>/dev/null || true'] : []),
+    ...(o.appCredential && !o.repairCommitOnly ? ['kill "$gh_watch_pid" 2>/dev/null || true'] : []),
     '[ -n "${usage_partial_pid:-}" ] && kill "$usage_partial_pid" 2>/dev/null || true',
     'wait "$mem_sampler_pid" 2>/dev/null || true',
     '[ -n "${usage_partial_pid:-}" ] && wait "$usage_partial_pid" 2>/dev/null || true',
     'tail -n 1 /tmp/si.out',
-    podSalvageScript(),
+    ...(o.repairCommitOnly ? [] : [podSalvageScript()]),
     'exit $rc',
   ].join('\n');
   return {
@@ -1149,6 +1158,9 @@ function defaultGhComment(prNumber: number, body: string): void {
 }
 
 export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplementJobSpawn {
+  if (options.repairCommitOnly && (options.source?.kind !== 'pr' || options.source.number !== options.repairCommitOnly.pr || !/^[0-9a-f]{40}$/.test(options.repairCommitOnly.baseHead))) {
+    throw new Error('repair commit-only requires a matching PR source and exact head');
+  }
   const baseKubectl = options.kubectl ?? defaultKubectl;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const namespace = options.namespace ?? 'elanous-test';
@@ -1160,6 +1172,9 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
   if (hostMirror && !isAbsolute(hostMirror)) throw new Error('pod.hostMirror must be an absolute directory path');
   const hostSupervised = options.hostSupervised ?? true;
   return (input) => {
+    if (options.repairCommitOnly && (input.autoMerge || input.openPr || input.base !== `pr-${options.repairCommitOnly.pr}`)) {
+      throw new Error('repair commit-only refuses auto merge, new PR, or a different base');
+    }
     const name = podJobName(input.spaceId);
     let parentGoal: string | undefined;
     let parentGoalUnreadable = false;
@@ -1212,6 +1227,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
     const childRunId = mintRunId();
     const executionKey = createHash('sha256').update(JSON.stringify({ spaceId: input.spaceId, feature: input.feature, base: input.base, autoMerge: input.autoMerge, autoReview: input.autoReview, openPr: input.openPr, draft: input.draft })).digest('hex');
     const parentRunId = env.ELANOUS_RUN_ID?.trim();
+    if (options.repairCommitOnly && !parentRunId) throw new Error('repair commit-only requires a parent run id');
     // Standalone callers journal retries without altering the existing Pod manifest.
     const ledgerRunId = parentRunId || `run-${executionKey.slice(0, 8)}-${executionKey.slice(8, 12)}-${executionKey.slice(12, 16)}-${executionKey.slice(16, 20)}-${executionKey.slice(20, 32)}`;
     const address = `self-impl:${input.spaceId}`;
@@ -1237,7 +1253,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
       ...(input.autoReview ? ['--auto-review'] : []),
       // ⭐ 계약이 미래 노드를 바꾼다(첫 규칙): Pod 는 끝나면 사라지므로 완료 하한 = PR. 작업 트리로만 끝나면 결과가 Pod 와 함께 없어진다.
       //   ⚠️ 임시 안전망(🅢 2026-09-26) — 🅣 의 «종결 하한 오버레이»(그래프 쪽)가 서면 이 줄을 지우고 그것으로 바꾼다(채널 합의).
-      ...(input.openPr || (!input.autoMerge && completionFloorFor({ substrate: 'pod' }) === 'pr') ? ['--open-pr'] : []),
+      ...(!options.repairCommitOnly && (input.openPr || (!input.autoMerge && completionFloorFor({ substrate: 'pod' }) === 'pr')) ? ['--open-pr'] : []),
       ...(input.draft === false ? ['--no-draft'] : []),
       ...(hostSupervised ? ['--no-supervise'] : []),
       ...(options.extraArgs ?? []),
@@ -1327,7 +1343,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
       if (unfitDone) return unfitDone;
       // HARNESS-FULL-GRAPH — Pod 입장(입장 관문 ⊕ 멤버 슬롯)은 그래프 노드 pool-admit 이다.
       // 2판: decompose →(substrate=pod) pool-admit 간선은 «여기»(Pod 입장 직전 · 실제 단계 경계)에서 남긴다.
-      routeJourneyEdge('decompose', 'pod', { substrate: 'pod' });
+      if (options.repairCommitOnly) routeJourneyEdge('dispatch', 'pr-source', { source: 'pr', substrate: 'pod' });
+      else routeJourneyEdge('decompose', 'pod', { substrate: 'pod' });
       enterJourneyNode('pool-admit', { provenance: 'self-implement-pod', data: { spaceId: input.spaceId } });
       // ⛔ 감싸는 함수(async 래퍼)를 쓰지 않는다 — 마이크로태스크가 늘면 Job apply 순서가 밀린다(시험이 잡았다). 같은 자리 try/catch 로.
       const podAdmitError = (error: unknown): void => {
@@ -1354,6 +1371,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
       try {
       if (!context) return { exitCode: 1, output: '', error: { code: 'pod-context', message: 'Pod Job context를 확인할 수 없다' } };
       const cleanupSecret = () => { kubectl(['-n', namespace, 'delete', 'secret', `${name}-creds`, '--ignore-not-found']); };
+      let repairResultAnnounced = false;
+      let repairArtifactReady = false;
       const collectFullLogs = (unavailableEvent: string, replace?: ReadonlySet<string>, onEvent?: (event: string, data: Record<string, unknown>) => void, childId?: string): { status: 'ok' | 'unavailable' | 'incomplete'; childLedgerIncomplete: boolean; samples: ReturnType<typeof parseMemSamples> } => {
         let full: ReturnType<Kubectl>;
         try {
@@ -1384,6 +1403,20 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           collectPodArtifacts(full.stdout, { dir: join(effectiveInstanceRoot(), 'pod-artifacts'), job: name, log: record });
         }
         catch (error) { record('self-implement.pod', 'artifact-collect-incomplete', { job: name, reason: error instanceof Error ? error.message : String(error) }); }
+        if (options.repairCommitOnly) {
+          const artifactDir = join(effectiveInstanceRoot(), 'pod-artifacts', name, 'repair');
+          try {
+            const result = readPodRepairArtifact(artifactDir, { ...options.repairCommitOnly, runId: parentRunId });
+            repairArtifactReady = true;
+            if (!repairResultAnnounced) {
+              console.log(`ELANOUS_POD_REPAIR_RESULT ${JSON.stringify({ job: name, artifactDir, pr: result.pr, baseHead: result.baseHead, runId: result.runId, commit: result.commit, bundleSha256: result.bundleSha256 })}`);
+              repairResultAnnounced = true;
+            }
+          } catch (error) {
+            repairArtifactReady = false;
+            record('self-implement.pod', 'repair-artifact-incomplete', { job: name, reason: error instanceof Error ? error.message : String(error) });
+          }
+        }
         return { status: ledgerIncomplete || artifactIncomplete ? 'incomplete' : 'ok', childLedgerIncomplete, samples: parseMemSamples(full.stdout) };
       };
       let retryAccount: string | undefined;
@@ -1839,7 +1872,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           slotId: env.ELANOUS_POD_SLOT_ID,
           work: !goalDoc && env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? 'authoring' : (oomRetried ? retryTier : memoryTier) === 'lite' ? 'lite' : 'harness',
         };
-        const job = podJobManifest({ name, namespace, image: jobImage, workIdentity, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), args: jobArgs, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? { authorSentence: true, ...(env.ELANOUS_POD_AUTHOR_GRADE === 'lite' || env.ELANOUS_POD_AUTHOR_GRADE === 'full' ? { authorGrade: env.ELANOUS_POD_AUTHOR_GRADE } : {}) } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, memoryRequest, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission, ...(reviewerCredential ? { reviewerCodexAuth: true } : {}), ...(bedrockSpec ? { bedrock: bedrockSpec } : {}), ...(zaiSpec ? { zai: zaiSpec } : {}) });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
+        const job = podJobManifest({ name, namespace, image: jobImage, workIdentity, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(options.repairCommitOnly ? { repairCommitOnly: options.repairCommitOnly } : {}), ...(hostMirror ? { hostMirror } : {}), args: jobArgs, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? { authorSentence: true, ...(env.ELANOUS_POD_AUTHOR_GRADE === 'lite' || env.ELANOUS_POD_AUTHOR_GRADE === 'full' ? { authorGrade: env.ELANOUS_POD_AUTHOR_GRADE } : {}) } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, memoryRequest, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission, ...(reviewerCredential ? { reviewerCodexAuth: true } : {}), ...(bedrockSpec ? { bedrock: bedrockSpec } : {}), ...(zaiSpec ? { zai: zaiSpec } : {}) });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
         const carriedBranch = goalDoc ? 'goal-doc' as const : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? 'author' as const : undefined;
         const carriedChildLlm = carriedBranch ? podDelegatedChildLlm(jobArgs) : undefined;
         const a = kubectl(['apply', '-f', '-'], JSON.stringify(job));
@@ -2047,6 +2080,9 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         }
         // Pod 안 경로는 호스트에서 쓸 수 없다.
         let disposition = parsed ? { ...parsed, worktreePath: undefined } : undefined;
+        if (options.repairCommitOnly && state === 'complete' && !repairArtifactReady) {
+          disposition = { ...disposition, worktreePath: undefined, ok: false, stage: 'repair-artifact-missing', detail: 'Pod repair result or bundle was not collected' };
+        }
         if (input.autoMerge && state === 'complete' && disposition?.stage === 'merge-ready') {
           const prNumber = disposition.prNumber;
           const headCommit = disposition.checkedHeadCommit;
@@ -2097,13 +2133,35 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             debug.log('harness.host-regate', 'unmeasured', { pr: prNumber ?? null, files: [], os: process.platform, failedStep: 'pod-result' });
             regate = { passed: false, failures: [{ step: 'pod-result', detail: 'missing PR number or checked head commit' }], os: process.platform };
           } else {
+            let hostRoot: string | undefined;
+            let hostCwd: string | undefined;
             try {
-              const hostRoot = findGitDir(process.cwd())?.root;
+              hostCwd = process.cwd();
+              hostRoot = findGitDir(hostCwd)?.root;
               if (!hostRoot) throw new Error('host repository unavailable');
               regate = await (options.hostRegate ?? runHostRegate)({ prNumber, headCommit, repoRoot: hostRoot, ...(goalFile ? { goalFile } : {}), ...(taLandOwner ? { noMerge: true as const } : {}) });
             } catch (error) {
               debug.log('harness.host-regate', 'unmeasured', { pr: prNumber, files: [], os: process.platform, failedStep: 'host-regate' });
-              regate = { passed: false, failures: [{ step: 'host-regate', detail: error instanceof Error ? error.message : String(error) }], os: process.platform };
+              regate = { passed: false, ...(taLandOwner ? { status: 'unmeasured' as const } : {}), failures: [{ step: 'host-regate', detail: error instanceof Error ? error.message : String(error) }], os: process.platform };
+            }
+            if (taLandOwner && !hostRoot && hostRepositoryUnavailable(regate)) {
+              let recordedRoot: string | undefined;
+              try {
+                const recorded = loadRunLedger(ledgerRunId, ledgerDir)?.find((entry) => entry.event === 'start')?.data.targetRoot;
+                if (typeof recorded === 'string' && isAbsolute(recorded)) {
+                  const foundRoot = findGitDir(recorded)?.root;
+                  // The recorded path must itself name the repository root, including symlink aliases.
+                  if (foundRoot && realpathSync(foundRoot) === realpathSync(recorded)) recordedRoot = foundRoot;
+                }
+              } catch { /* unreadable ledger or path leaves the original unmeasured result intact */ }
+              if (recordedRoot) {
+                try {
+                  regate = await (options.hostRegate ?? runHostRegate)({ prNumber, headCommit, repoRoot: recordedRoot, ...(goalFile ? { goalFile } : {}), noMerge: true });
+                } catch (error) {
+                  regate = { passed: false, status: 'unmeasured', failures: [{ step: 'host-regate', detail: error instanceof Error ? error.message : String(error) }], os: process.platform };
+                }
+                debug.log('harness.host-regate', 'regate-retry', { pr: prNumber, from: hostCwd, to: recordedRoot, result: regate.status ?? (regate.passed ? 'passed' : 'failed') });
+              }
             }
           }
           // runHostRegate comments on its own failures; these two paths never reached it.

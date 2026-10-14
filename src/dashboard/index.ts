@@ -643,6 +643,7 @@ import { activeCodexAccountView } from '../oauth/codex-account-store.js';
 import { buildDashboardStatusLines } from './dashboard-status-lines.js';
 import { readSlashContextNow, seatsNowLine } from '../context-bus/context-now-surfaces.js';
 import { buildFirstScreenBand, resolveTuiDaemonLink, type TuiDaemonLink } from './first-screen-band.js';
+import { detectLocale } from '../expression/locale.js';
 import { runNexusShow, type NexusShowResult } from '../cli/nexus-show.js';
 import {
   workingDirSegment, sessionCwdSegment, modelSegment, gitSegment,
@@ -1896,18 +1897,20 @@ export function renderDashboardFirstScreenBand(input: {
   readonly history: ReadonlyArray<{ role: string }>;
   readonly lines: string[];
   readonly width: number;
+  /** Renders the localized guidance rows; `undefined` keeps the historical mixed band. */
+  readonly locale?: 'ko' | 'en';
   readonly draw: () => void;
   readonly observe: (data: { daemon: boolean; hasPwa: boolean; hasTailnet: boolean }) => void;
   readonly show?: () => Promise<Pick<NexusShowResult, 'status' | 'urls'>>;
   readonly daemonLink?: () => Promise<TuiDaemonLink>;
 }): Promise<void> {
   if (input.history.some((message) => message.role !== 'system')) return Promise.resolve();
-  const band = buildFirstScreenBand({ width: input.width, daemon: false, link: { status: 'checking' } });
+  const band = buildFirstScreenBand({ width: input.width, daemon: false, link: { status: 'checking' }, locale: input.locale });
   input.lines.unshift(...band);
   const daemonLink = input.daemonLink ?? resolveTuiDaemonLink;
   const linkPending = Promise.resolve().then(() => daemonLink()).catch((): TuiDaemonLink => ({ status: 'error', stage: 'health' })).then((link) => {
     if (input.lines[0] !== band[0]) return;
-    input.lines[0] = buildFirstScreenBand({ width: input.width, daemon: false, link })[0]!;
+    input.lines[0] = buildFirstScreenBand({ width: input.width, daemon: false, link, locale: input.locale })[0]!;
     try { input.draw(); } catch { /* screen may have closed */ }
   });
   const show = input.show ?? (() => runNexusShow({ format: 'json', out: { log: () => {}, error: () => {} } }));
@@ -1921,7 +1924,7 @@ export function renderDashboardFirstScreenBand(input: {
     const hasTailnet = !!pwa?.tailnet;
     observe({ daemon, hasPwa, hasTailnet });
     if (input.lines[1] !== band[1]) return;
-    input.lines[1] = buildFirstScreenBand({ width: input.width, daemon, pwa })[1]!;
+    input.lines[1] = buildFirstScreenBand({ width: input.width, daemon, pwa, locale: input.locale })[1]!;
     try { input.draw(); } catch { /* screen may have closed */ }
   }).catch(() => {
     observe({ daemon: false, hasPwa: false, hasTailnet: false });
@@ -15703,6 +15706,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       history: chat.history,
       lines: chatLines,
       width: Math.max(0, termSize().cols - 4),
+      // The band ships ko/en only; any other detected locale keeps the English rows.
+      locale: detectLocale() === 'ko' ? 'ko' : 'en',
       draw: () => draw(),
       observe: (data) => { try { debug.log('dashboard.first-screen-band', 'resolved', data); } catch { /* observation is best-effort */ } },
     });

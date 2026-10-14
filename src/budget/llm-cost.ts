@@ -303,7 +303,19 @@ export function estimateLlmCost(
 
 /** Discriminated cost fields to spread onto an `llm.usage` observation. */
 /** 과금 경로(BACKLOG C6 · hermes `resolve_billing_route`). 구독(OAuth)·local 은 «토큰당 청구가 없다». */
-export type BillingRoute = 'subscription' | 'local' | 'api' | 'unknown';
+export type BillingRoute = 'subscription' | 'local' | 'credit' | 'api' | 'unknown';
+
+/** Credit is known only when the quota window is exhausted and credits are present. */
+export function creditRouteFromQuotaSignal(signal: {
+  usedPercent?: number | null;
+  rateLimitReached?: boolean | null;
+  hasCredits?: boolean | null;
+} | null): 'credit' | null {
+  if (!signal || signal.hasCredits !== true) return null;
+  const exhausted = signal.rateLimitReached === true
+    || (typeof signal.usedPercent === 'number' && Number.isFinite(signal.usedPercent) && signal.usedPercent >= 100);
+  return exhausted ? 'credit' : null;
+}
 
 /** 구독·local 호출의 비용 — 청구 0 이지만 «API 로 샀다면」 값은 따로 남긴다(환산가 · 모르면 칸이 없다). */
 /** provider 가 보고한 실제 청구액(OpenRouter `usage.cost`) — 카탈로그 추정과 다르면 이것이 맞다. */
@@ -323,14 +335,25 @@ export interface IncludedLlmCost {
   apiEquivalentUsd?: number;
 }
 
+export interface CreditLlmCost {
+  kind: 'credit';
+  model: string;
+  usd: null;
+  apiEquivalentUsd?: number;
+}
+
 export function llmUsageCostFields(
   model: string,
   usage: Omit<LlmCostUsage, 'model'>,
   opts?: EstimateLlmCostOptions,
   billing?: BillingRoute,
-): { cost: LlmCostEstimate | IncludedLlmCost | ActualLlmCost | ByokActualCost | ByokPartialCost } {
+): { cost: LlmCostEstimate | IncludedLlmCost | CreditLlmCost | ActualLlmCost | ByokActualCost | ByokPartialCost } {
   const resolved = opts ?? { configPricing: readLlmConfigPricing() };
   const estimate = estimateLlmCost({ model, ...usage }, resolved);
+  // An explicit credit route owns this cost row; API/BYOK amounts belong to other routes.
+  if (billing === 'credit') {
+    return { cost: { kind: 'credit', model, usd: null, ...(estimate.kind === 'known' || estimate.kind === 'partial' ? { apiEquivalentUsd: estimate.usd } : {}) } };
+  }
   // ⛔⭐ 구독을 API 단가로 «known» 이라 적지 않는다 — 09-25 벤치에서 codex 구독 팔이 `$7.81 known` 으로 보였다.
   // ⭐ BACKLOG C7 — provider 가 실어 보낸 «실제 청구액»이 있으면 그것이 비용이다(추정은 곁에 남긴다).
   // OR-BYOK-COST — BYOK 면 «OR 청구 + 상류 청구»가 비용이다(상류를 모르면 partial · 0 으로 가정하지 않는다).

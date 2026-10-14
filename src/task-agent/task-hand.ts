@@ -11,6 +11,10 @@ import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, readFileSync, statSync, writeFileSync, type Stats } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parse as parseYaml } from 'yaml';
+import { validateUnitCalls } from '../graph-runner/runner.js';
+import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
 import { resolveDaemonHarnessTarget } from '../intake-plane/harness-target.js';
 import { HARNESS_RUN_ID_ENV, mintRunId, normalizeRunId } from '../harness/harness-space.js';
 import { debug } from '../debug/log.js';
@@ -89,6 +93,66 @@ export function taskCardLabelContext(card: Pick<TaskCard, 'id'>): TaskCardLabelC
 export const COMPLETION_KINDS = ['code-pr', 'artifact', 'research-report', 'ops-action', 'content', 'watch-brief', 'decision-support', 'deliverable'] as const;
 export type CompletionKind = typeof COMPLETION_KINDS[number];
 
+export interface TaskComposition {
+  file: string;
+  /** null = 파일은 있으나 파싱 실패로 판을 확인하지 못했다. */
+  version: number | null;
+}
+
+export interface CompositionSelection {
+  composition?: TaskComposition;
+  unitsResolved: boolean;
+  missingUnits: string[];
+  launcher?: 'harness-say' | 'graph-run';
+  error?: string;
+}
+
+/** 1판은 조합을 고르고 단위 해석 결과를 기록한다. 단위 실행은 2판의 몫이다. */
+export function selectTaskComposition(completion: CompletionKind, root = join(dirname(fileURLToPath(import.meta.url)), '..', '..')): CompositionSelection {
+  const file = `graphs/work/${completion}.yaml`;
+  const path = join(root, file);
+  let source: string;
+  try { source = readFileSync(path, 'utf8'); } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return { unitsResolved: false, missingUnits: [] };
+    return { composition: { file, version: null }, unitsResolved: false, missingUnits: [],
+      error: `조합 읽기 오류: ${file}: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const parsed = parseGraphTemplateYaml(source, path);
+  if (!parsed.template || parsed.errors.length) {
+    let version: number | null = null;
+    try {
+      const raw: unknown = parseYaml(source);
+      if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        const candidate = (raw as Record<string, unknown>).version;
+        if (typeof candidate === 'number' && Number.isInteger(candidate)) version = candidate;
+      }
+    } catch { /* 파싱 실패 자체를 아래 원장에 적는다. */ }
+    return { composition: { file, version }, unitsResolved: false, missingUnits: [],
+      error: `조합 오류: ${file}: ${parsed.errors.map(e => e.message).join('; ')}` };
+  }
+  const raw: unknown = parseYaml(source);
+  const launcher = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>).launcher : undefined;
+  if (launcher !== undefined && launcher !== 'harness-say' && launcher !== 'graph-run') {
+    return { composition: { file, version: parsed.template.version }, unitsResolved: false, missingUnits: [],
+      error: `조합 오류: ${file}: 모르는 launcher` };
+  }
+  if (completion === 'code-pr' && launcher === undefined) {
+    return { composition: { file, version: parsed.template.version }, unitsResolved: false, missingUnits: [],
+      error: `조합 오류: ${file}: launcher 없음` };
+  }
+  const missingUnits: string[] = [];
+  let unitError: string | undefined;
+  try { validateUnitCalls(parsed.template, path, [], call => missingUnits.push(call)); }
+  catch (error) { unitError = error instanceof Error ? error.message : String(error); }
+  return {
+    composition: { file, version: parsed.template.version },
+    unitsResolved: missingUnits.length === 0 && !unitError,
+    missingUnits,
+    ...(launcher === 'harness-say' || launcher === 'graph-run' ? { launcher } : {}),
+    ...(unitError ? { error: `조합 단위 해석 오류: ${file}: ${unitError}` } : {}),
+  };
+}
+
 /**
  * `run-bound`·`goal-bound`·`pr-bound` 은 runId(⊕ pr)를 싣는다 — 옛 카드의 칸은 at·event·detail 뿐이다.
  * TA-LIVE-MOVE-CARD-HISTORY — `live-move` 줄만 kind·executed·ok·executorResult·head·effect 를 더 싣는다(`live-move-history.ts`).
@@ -104,6 +168,8 @@ export interface TaskCardEvent {
   resultPath?: string;
   /** TA-REVIEW-RESULT-CAPTURE — `live-move-result` 줄만: 회수한 `self review --json` 의 칸(못 읽은 칸은 null). */
   verdict?: string | null; reviewed?: boolean | null; mustFix?: number | null; reviewRoute?: string | null;
+  /** Exact bytes of the captured review stdout; repair must read the same resultPath and digest. */
+  reviewSha256?: string;
 }
 /** 카드 history 의 live-move 줄 이벤트 이름 — 상태 사유(«마지막 칸») 판정에서 뺀다. */
 export const LIVE_MOVE_HISTORY_EVENT = 'live-move';
@@ -117,8 +183,15 @@ export interface TaskCard {
   text: string;
   seat?: TaskSeat;
   checklistId?: string;
+  /** Explicit release version for an adopted PR; post-land still confirms the cell exists there. */
+  checklistVersion?: string;
   /** 종결 종류 — 비면 code-pr. */
   completion?: CompletionKind;
+  /** 선택된 일 조합 파일과 판(1판: 실행은 launcher 에 위임). */
+  composition?: TaskComposition;
+  graphSelectedBy?: 'completion';
+  unitsResolved?: boolean;
+  missingUnits?: string[];
   /** 과제 대상 프로젝트(§A4b②) — target 은 절대 경로(git 이 아닐 수 있다). id 는 `task hand --project` 가 싣는다(옛 카드엔 없을 수 있다). */
   project?: { id?: string; target: string };
   /** 보드(§A4b① `board.ts`) 소속 — 목표 id · 이정표 id(`task hand --goal/--milestone`). 조각 카드의 `goalId`(골 sha 16자)와 다른 칸이다. */
@@ -130,7 +203,7 @@ export interface TaskCard {
    * failed = 발사된 런이 PR·수확 가지 없이 죽었거나 끝내 안 떴다(TA-JUDGE-DEAD-RUN · `card-evidence.ts`) — 사유
    * (`failed/needs-owner|needs-relaunch — …`)는 history 마지막 칸 · 자동 재발사하지 않는다(사람/판단부 몫).
    */
-  status: 'handed' | 'launched' | 'launch-failed' | 'failed';
+  status: 'handed' | 'launched' | 'launch-failed' | 'failed' | 'done';
   history: TaskCardEvent[];
   /** 미션 카드만 — 조각 카드 id(순서대로) · 쪼갠 출처(`mission.ts` splitMission). */
   pieces?: string[];
@@ -145,6 +218,12 @@ export interface TaskCard {
    * 번호는 `cardPrNumber` 로 읽는다(옛 카드의 number 도 그대로 읽힌다).
    */
   pr?: number | TaskCardPr;
+  /** Host-verified existing OPEN PR adopted without launching a new implementation run. */
+  adoptedPr?: { pr: number; url: string; head: string; at: string };
+  /** Bound PR observed in a terminal GitHub state. Only applies while the card still binds the same PR and URL. */
+  prTerminal?: { pr: number; url: string; head: string; state: 'MERGED' | 'CLOSED'; at: string };
+  /** Post-land checklist judgement. A partial slice closes this card while leaving the checklist cell yellow. */
+  postLand?: { pr: number; head: string; at: string; outcome: 'complete' | 'partial'; evidence: string[]; remaining: string[] };
   goalId?: string;
   /** `manual` = pr/goalId 를 사람이 적었다(`recordPieceRef`) — 런 묶기가 건드리지 않는다. */
   refSource?: 'manual';
@@ -185,6 +264,10 @@ export interface TaskCard {
   taLand?: true;
   /** TASKS-HAND-CHILD-LLM — `tasks hand --child-llm <provider>/<model> [--child-llm-effort <level>]` → 발사 인자 `--child-llm-provider/-model/-effort`. */
   childLlm?: TaskChildLlm;
+  /** Same-PR repair launches; exact source head and worker result are retained for CAS and retry limits. */
+  repairs?: Array<{ pr: number; head: string; branch: string; at: string; move: string; runId: string;
+    resultPath: string; fromModel: string; toModel: string; status: 'requested' | 'unconfirmed' | 'failed' | 'applied';
+    detail?: string; commit?: string; bundleSha256?: string; bundlePath?: string }>;
 }
 
 /** 구현 자식 LLM 선택 — 하니스 `--child-llm-provider/--child-llm-model/--child-llm-effort` 로 그대로 넘긴다(검증 권위는 하니스). */
@@ -213,6 +296,12 @@ export interface TaskCardPr { number: number; url?: string }
 /** 카드의 PR 번호 — 수동(number)·묶음(`{number,url}`) 둘 다. */
 export function cardPrNumber(card: Pick<TaskCard, 'pr'>): number | undefined {
   return typeof card.pr === 'number' ? card.pr : card.pr?.number;
+}
+
+/** A stale terminal marker must never close a card after its PR binding changes. */
+export function boundPrTerminal(card: Pick<TaskCard, 'pr' | 'prTerminal'>): TaskCard['prTerminal'] | undefined {
+  const marker = card.prTerminal;
+  return marker && typeof card.pr === 'object' && card.pr.number === marker.pr && card.pr.url === marker.url ? marker : undefined;
 }
 
 /** A uniquely launched code-PR card may own a draft through its PR or its opening run. */
@@ -374,6 +463,8 @@ export interface HandTaskOptions {
   childLlm?: string;
   childLlmEffort?: string;
   statePath?: string;
+  /** 시험에서만 조합 저장소를 바꿔 해석·거부를 검증한다. */
+  compositionRoot?: string;
   /** `--live` 일 때만 불린다. */
   launcher?: TaskLauncher;
   now?: () => Date;
@@ -443,6 +534,11 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   }
   if (opts.childLlmEffort !== undefined && opts.childLlm === undefined) throw new Error('--child-llm-effort 는 --child-llm <provider>/<model> 과 함께 준다');
   const childLlm = opts.childLlm !== undefined ? parseChildLlm(opts.childLlm, opts.childLlmEffort) : undefined;
+  const completion = opts.completion ?? 'code-pr';
+  const selected = selectTaskComposition(completion, opts.compositionRoot);
+  const selectionFailure = !selected.composition ? `조합 없음: graphs/work/${completion}.yaml`
+    : selected.error ?? (completion !== 'code-pr' || selected.launcher !== 'harness-say'
+      ? `조합 실행기 없음: ${selected.composition.file} (1판은 code-pr harness-say만 발사)` : undefined);
   let project: TaskCard['project'];
   let targetIsGit: boolean | null = null;
   if (opts.project) {
@@ -467,19 +563,25 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(opts.seat ? { seat: opts.seat } : {}),
     ...(opts.checklistId ? { checklistId: opts.checklistId } : {}),
     ...(opts.completion ? { completion: opts.completion } : {}),
+    ...(selected.composition ? { composition: selected.composition, graphSelectedBy: 'completion' as const } : {}),
+    unitsResolved: selected.unitsResolved,
+    missingUnits: selected.missingUnits,
     ...(project ? { project } : {}),
     ...(opts.goal ? { goal: opts.goal } : {}),
     ...(opts.milestone ? { milestone: opts.milestone } : {}),
     ...(opts.taLand === true ? { taLand: true as const } : {}),
     ...(childLlm ? { childLlm } : {}),
     createdAt: now.toISOString(),
-    status: 'handed',
-    history: [],
+    status: selectionFailure ? 'failed' : 'handed',
+    history: selectionFailure ? [{ at: now.toISOString(), event: !selected.composition ? 'composition-missing'
+      : selected.error ? 'composition-invalid' : 'composition-launcher-unavailable', detail: selectionFailure }] : [],
     ...(opts.mission ? { mission: opts.mission, after: [...(opts.after ?? [])] } : {}),
-    ...(opts.cardFields ?? {}),
+    ...(opts.cardFields?.pr !== undefined ? { pr: opts.cardFields.pr } : {}),
+    ...(opts.cardFields?.goalId !== undefined ? { goalId: opts.cardFields.goalId } : {}),
+    ...(opts.cardFields?.handed !== undefined ? { handed: opts.cardFields.handed } : {}),
   };
-  const move = nextMoveFor(card, opts.landed);
-  if (move.kind !== 'launch') throw new Error(`발사할 수 없는 과제다 — ${move.reason}`);
+  const move = selectionFailure ? undefined : nextMoveFor(card, opts.landed);
+  if (move && move.kind !== 'launch') throw new Error(`발사할 수 없는 과제다 — ${move.reason}`);
   const guard = opts.writeGuard;
   const writeCard = (target: string, next: TaskCard): void => {
     if (!guard) { writeTaskCards(target, [next]); return; }
@@ -495,6 +597,13 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     if (!owned.ok) throw new TaskCardSupersededError(next.id);
   };
   writeCard(path, card);
+  try { debug.log('task-agent.graph-select', !selected.composition ? 'composition-missing' : selected.error ? 'composition-invalid' : 'composition-selected', {
+    completion, file: selected.composition?.file ?? `graphs/work/${completion}.yaml`,
+    unitsResolved: selected.unitsResolved, missingUnits: selected.missingUnits,
+    ...(selected.error ? { error: selected.error } : {}),
+  }); } catch { /* fail-soft */ }
+  if (selectionFailure) throw new Error(`${selectionFailure} (카드 ${id})`);
+  if (!move || move.kind !== 'launch') throw new Error('조합 선택 뒤 발사 수가 없다');
   try { debug.log('task-agent', 'handed', { taskId: id, seat: card.seat ?? null, checklistId: card.checklistId ?? null, mode, projectId: project?.id ?? null, targetIsGit, taLand: card.taLand === true }); } catch { /* fail-soft */ }
   if (childLlm) {
     try { debug.log('task-agent', 'child-llm', { taskId: id, input: opts.childLlm, provider: childLlm.provider, model: childLlm.model, effort: childLlm.effort ?? null, mode }); } catch { /* fail-soft */ }

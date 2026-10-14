@@ -37,6 +37,8 @@ export const JOURNEY_NODE_IDS = [
   'salvage',
   'heal',
   'next-move',
+  'ready',
+  'pr-head-checkout',
   'stopped',
 ] as const;
 export type JourneyNodeId = typeof JOURNEY_NODE_IDS[number];

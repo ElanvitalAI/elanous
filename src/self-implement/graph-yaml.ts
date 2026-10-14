@@ -33,6 +33,8 @@ export interface GraphNodeSpec {
   readonly fanOut?: string;
   readonly contract?: GraphNodeContract;
   readonly call?: string;
+  /** Entry selected by this call when a unit exposes more than one entry. */
+  readonly callEntry?: string;
   readonly budget?: { readonly innerSteps: number };
 }
 
@@ -60,7 +62,7 @@ export interface GraphTemplateSpec {
   readonly state?: readonly string[];
   /** ⭐ 런 계약(선택) — 이 그래프가 «기본으로» 요구하는 실행 칸 등. 발사 인자가 덮는다(graph-run-contract.ts). */
   readonly runContract?: GraphRunContractSpec;
-  readonly unit?: { readonly inputs: readonly string[]; readonly outputs: readonly string[]; readonly exits: readonly string[] };
+  readonly unit?: { readonly inputs: readonly string[]; readonly outputs: readonly string[]; readonly exits: readonly string[]; readonly entries?: readonly string[] };
   readonly nodes: readonly GraphNodeSpec[];
   readonly edges: readonly GraphEdgeSpec[];
 }
@@ -155,7 +157,7 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       : undefined;
     // A subgraph node becomes a unit call only when it names `call:`; without it the node keeps the
     // pre-unit meaning (catalog role / recipe node), so existing declarations stay valid.
-    if (kind === 'subgraph' && (n.call !== undefined || n.budget !== undefined)) {
+    if (kind === 'subgraph' && (n.call !== undefined || n.budget !== undefined || n.call_entry !== undefined)) {
       if (typeof n.call !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*@(?:\^?[1-9]\d*)$/.test(n.call))
         errors.push({ path: `${at}/call`, message: 'call 은 id@정수판 또는 id@^주판이어야 한다' });
       const budget = n.budget as Record<string, unknown> | undefined;
@@ -166,8 +168,10 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
           !Array.isArray(contractRaw.outputs) || !contractRaw.outputs.every(v => typeof v === 'string'))
         errors.push({ path: `${at}/contract`, message: 'subgraph 에는 inputs·outputs 계약이 필요하다' });
       if (recipe !== 'none') errors.push({ path: `${at}/recipe`, message: 'subgraph 는 recipe 를 실행하지 않는다' });
-    } else if (kind !== 'subgraph' && (n.call !== undefined || n.budget !== undefined)) {
-      errors.push({ path: at, message: 'call·budget 은 subgraph 전용이다' });
+      if (n.call_entry !== undefined && (typeof n.call_entry !== 'string' || !n.call_entry.trim()))
+        errors.push({ path: `${at}/call_entry`, message: 'call_entry 는 비어 있지 않은 노드 id 여야 한다' });
+    } else if (kind !== 'subgraph' && (n.call !== undefined || n.budget !== undefined || n.call_entry !== undefined)) {
+      errors.push({ path: at, message: 'call·call_entry·budget 은 subgraph 전용이다' });
     }
     // ⛔ 계약이 없으면 「이 노드가 무엇을 할 수 있나」를 답할 수 없다 — 경고로 남긴다(거절은 오버레이 쪽).
     if (contract === undefined) warnings.push({ path: `${at}/contract`, message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' });
@@ -182,6 +186,7 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       ...(typeof n.fan_out === 'string' ? { fanOut: n.fan_out } : {}),
       ...(contract ? { contract } : {}),
       ...(kind === 'subgraph' && typeof n.call === 'string' ? { call: n.call } : {}),
+      ...(kind === 'subgraph' && typeof n.call_entry === 'string' ? { callEntry: n.call_entry } : {}),
       ...(kind === 'subgraph' && n.budget && typeof n.budget === 'object' && !Array.isArray(n.budget) &&
         typeof (n.budget as Record<string, unknown>).inner_steps === 'number'
         ? { budget: { innerSteps: (n.budget as { inner_steps: number }).inner_steps } } : {}),
@@ -242,15 +247,18 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
   if (doc.unit !== undefined) {
     const rawUnit = doc.unit as Record<string, unknown>;
     if (!rawUnit || typeof rawUnit !== 'object' || Array.isArray(rawUnit) ||
-        Object.keys(rawUnit).some(key => !['inputs', 'outputs', 'exits'].includes(key)) ||
+        Object.keys(rawUnit).some(key => !['inputs', 'outputs', 'exits', 'entries'].includes(key)) ||
         !['inputs', 'outputs', 'exits'].every(key => Array.isArray(rawUnit[key]) &&
           (rawUnit[key] as unknown[]).every(v => typeof v === 'string' && v.length > 0) &&
           new Set(rawUnit[key] as string[]).size === (rawUnit[key] as string[]).length) ||
         !(rawUnit.exits as string[]).length ||
         (rawUnit.exits as string[]).some(exit => !terminalNodes.includes(exit)) ||
-        terminalNodes.some(exit => !(rawUnit.exits as string[]).includes(exit))) {
+        terminalNodes.some(exit => !(rawUnit.exits as string[]).includes(exit)) ||
+        (rawUnit.entries !== undefined && (!Array.isArray(rawUnit.entries) || !(rawUnit.entries as unknown[]).every(v => typeof v === 'string' && v.length > 0 && known.has(v)) ||
+          new Set(rawUnit.entries as string[]).size !== (rawUnit.entries as string[]).length || !(rawUnit.entries as string[]).includes(entryNode!)))) {
       errors.push({ path: `${label}/unit`, message: 'unit 의 inputs·outputs·exits 및 terminal_nodes 가 일치해야 한다' });
-    } else unit = { inputs: rawUnit.inputs as string[], outputs: rawUnit.outputs as string[], exits: rawUnit.exits as string[] };
+    } else unit = { inputs: rawUnit.inputs as string[], outputs: rawUnit.outputs as string[], exits: rawUnit.exits as string[],
+      ...(rawUnit.entries === undefined ? {} : { entries: rawUnit.entries as string[] }) };
   }
   const runContract = parseGraphRunContract(doc.run_contract);
   if (runContract.error) errors.push({ path: `${label}/run_contract`, message: runContract.error });

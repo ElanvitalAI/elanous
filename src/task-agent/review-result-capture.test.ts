@@ -11,6 +11,7 @@ import { regateResultPath } from './rejudge-on-head.js';
 import { capturedSelfReview, captureReviewResults, parseReviewResultOutput, rejudgeCompletedTaskReview, REVIEW_RESULT_MISSING_EFFECT, REVIEW_RESULT_UNREADABLE_EFFECT, reviewResultPath, TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_RESULT_ENV, TA_REVIEW_COMPLETION_STATE_ENV } from './review-result-capture.js';
 import { recordTaskAgentShadowMove } from './shadow.js';
 import { nextMoveFor, readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
+import { repairReviewDigest } from './repair-review.js';
 
 const HEAD = 'b'.repeat(40);
 const job = (over: Partial<SupervisorJobResult> = {}): SupervisorJobResult =>
@@ -329,6 +330,7 @@ describe('TA-REVIEW-RESULT-CAPTURE — 떼어 띄운 self review 결과를 파�
     expect(f.lines('live-move-result')).toEqual([{
       at: '2026-10-10T12:05:00.000Z', event: 'live-move-result', kind: 'review', pr: 21, head: HEAD,
       verdict: 'pass', reviewed: true, mustFix: 0, reviewRoute: 'api', resultPath: expectedPath,
+      reviewSha256: repairReviewDigest(readFileSync(expectedPath, 'utf8')),
       effect: 'review result captured · verdict pass · reviewed true · must-fix 0',
     }]);
     expect(f.logs.filter((entry) => entry.event === 'review-result-captured').map((entry) => entry.data)).toEqual([{

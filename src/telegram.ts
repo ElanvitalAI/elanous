@@ -79,6 +79,8 @@ import { handleTelegramFieldNote } from './field-note/telegram.js';
 import type { TranscriptionEngine, FieldAudio } from './field-note/transcribe.js';
 import { maybeHandleCardPhoto, type CardPhotoDeps } from './telegram-card-followup.js';
 import { attachTelegramProjectButtons } from './telegram-project-command.js';
+import { BriefItemsLedger } from './briefing/brief-items.js';
+import { recordBriefTelegramUpdate } from './cli/brief-cli.js';
 import { attachTelegramFabricPlan } from './telegram-fabric-plan.js';
 import { contextNow as readContextNow, type ContextNowDeps } from './context-bus/context-now.js';
 import { renderContextFirstOpening } from './context-bus/context-now-surfaces.js';
@@ -123,6 +125,7 @@ export interface TgIncoming {
   botId?: string;
   /** 답장 대상 메시지의 텍스트(force_reply 정정 가로채기용). parseUpdate 가 채운다. */
   replyToText?: string;
+  replyToMessageId?: number;
   /** 앨범(media group) id — `#현장` 캡션은 앨범의 첫 항목에만 붙으므로 나머지를 같은 행사로 묶는 데 쓴다. */
   mediaGroupId?: string;
   /** 영상 — `#현장` 저장 전용. `attachments` 에 넣지 않는다(LLM 경로의 동작을 안 바꾸려고). */
@@ -239,6 +242,8 @@ export interface TelegramBotOpts {
   /** 시험 seam — `/v1/context/now` 와 같은 `contextNow` 읽기. 던지면 «맥락 못 읽음». */
   readContextNow?: typeof readContextNow;
   contextNowDeps?: ContextNowDeps;
+  /** Optional test-isolated briefing ledger for inbound feedback. */
+  briefLedger?: BriefItemsLedger;
   /** Keeps last-utterance times across a daemon restart so a restart does not re-send the context-first opening. */
   contextFirstStore?: ContextFirstStore;
 }
@@ -301,6 +306,7 @@ export class TelegramBot {
   readonly botId: string;
   private readonly allowedUsers: Set<number>;
   private readonly onMessage: TelegramBotOpts['onMessage'];
+  private readonly briefLedger: BriefItemsLedger | undefined;
   private readonly fetchImpl: typeof fetch;
   private readonly errorBackoffMs: number;
   private readonly pollTimeoutSec: number;
@@ -381,6 +387,7 @@ export class TelegramBot {
     this.botId = opts.token.split(':')[0] || opts.token;
     this.allowedUsers = new Set(opts.allowedUsers);
     this.onMessage = opts.onMessage;
+    this.briefLedger = opts.briefLedger ?? (opts.nowImpl === undefined && opts.fetchImpl === undefined ? new BriefItemsLedger() : undefined);
     this.homeChannel = opts.homeChannel;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.errorBackoffMs = opts.errorBackoffMs ?? DEFAULT_ERROR_BACKOFF;
@@ -1229,7 +1236,7 @@ export class TelegramBot {
     while (this.running) {
       try {
         await deliverSeatAnswers(this.seatWorkDeps.askDeps!);
-        const wantCallbackQuery = this.callbackHandlers.size > 0;
+        const wantCallbackQuery = this.callbackHandlers.size > 0 || this.briefLedger !== undefined;
         const wantReaction = this.reactionHandlers.size > 0;
         // allowed_updates 는 명시한 것만 받으므로 등록된 핸들러 종류만 추가(비파괴 — 핸들러
         // 없으면 종전 ['message']/['message','callback_query'] 그대로).
@@ -1274,6 +1281,19 @@ export class TelegramBot {
               messageId: cq.message?.message_id,
               data: cq.data ?? '',
             };
+            if (this.briefLedger && payload.chatId !== undefined && payload.messageId !== undefined && /^brief-item:[1-9]\d*:(?:read|button|ignore)$/.test(payload.data)) {
+              try {
+                const recorded = recordBriefTelegramUpdate(this.briefLedger, {
+                  botId: this.botId, chatId: payload.chatId, messageId: payload.messageId,
+                  updateId: String(u.update_id), callbackData: payload.data,
+                });
+                await this.answerCallbackQuery(payload.id, { text: recorded ? '브리핑 반응 기록됨' : '브리핑 항목을 찾을 수 없습니다' });
+              } catch (err) {
+                this.log(`brief feedback failed: ${err instanceof Error ? err.message : String(err)}`);
+                try { await this.answerCallbackQuery(payload.id, { text: '브리핑 반응 기록 실패' }); } catch { /* polling continues */ }
+              }
+              continue;
+            }
             for (const h of this.callbackHandlers) {
               try { await h(payload); } catch (err) {
                 this.log(`callback handler error: ${err instanceof Error ? err.message : String(err)}`);
@@ -1314,6 +1334,14 @@ export class TelegramBot {
           if (!this.isOwnerAllowed(incoming.userId)) {
             await this.refuseMessage(incoming);
             continue;
+          }
+          if (this.briefLedger && incoming.replyToMessageId && incoming.text.trim() && !incoming.text.trim().startsWith('/')) {
+            try {
+              recordBriefTelegramUpdate(this.briefLedger, {
+                botId: this.botId, chatId: incoming.chatId, messageId: incoming.replyToMessageId,
+                updateId: String(incoming.updateId), text: incoming.text,
+              });
+            } catch (err) { this.log(`brief feedback failed: ${err instanceof Error ? err.message : String(err)}`); }
           }
           // HITL "Other" free-text: consume inline (before the turn
           // chain) so it isn't queued behind the turn awaiting it.
@@ -2494,6 +2522,7 @@ export function parseUpdate(u: RawUpdate): TgIncoming | null {
     isGroup: !isDm,
     attachments,
     ...(m.reply_to_message?.text ? { replyToText: m.reply_to_message.text } : {}),
+    ...(m.reply_to_message?.message_id ? { replyToMessageId: m.reply_to_message.message_id } : {}),
     ...(m.media_group_id ? { mediaGroupId: m.media_group_id } : {}),
     ...(video ? { video } : {}),
   };

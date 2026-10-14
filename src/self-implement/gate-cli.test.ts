@@ -18,6 +18,7 @@ import {
   parseDirtyWorktreePaths,
   runSelfGateCli, formatUnrunnableChangeKinds,
 } from './gate-cli.js';
+import { GATE_CALLER_TEST_LIMIT } from './gate-scope.js';
 import type { BaselineProcessResult } from './gate-baseline.js';
 import type { ShardRunResult } from '../self-dev/shard-run.js';
 import { aggregateGateTestShards } from '../self-dev/shard-aggregate.js';
@@ -351,6 +352,142 @@ describe('runSelfGateCli', () => {
     expect(result.documentsWithoutDerivedTests).toEqual(['AGENTS.md']);
     expect(result.lines).toContain('document paths: AGENTS.md');
     expect(result.lines).toContain('documents without derived tests: AGENTS.md');
+  });
+
+  test('scripts-only change runs its importer and reports an introduced failure through the baseline', () => {
+    const fixture = fixtureRepository({
+      'scripts/compute.ts': 'export const compute = () => 2;\n',
+      'test/compute-consumer.test.ts': "import { compute } from '../scripts/compute.js';\ntest('compute', () => { if (compute() !== 1) throw new Error('new red'); });\n",
+    });
+    try {
+      const ran: string[][] = [];
+      const result = runSelfGateCli(fixture.cwd, { includeImporterTests: true }, {
+        changedFiles: () => ({ files: ['scripts/compute.ts'], baseRef: 'base-sha' }),
+        runTests: (cwd, files) => {
+          ran.push([...files]);
+          const actual = spawnSync('bun', ['test', ...files], { cwd, encoding: 'utf8' });
+          expect(actual.status).toBe(1);
+          expect(actual.stderr).toContain('(fail) compute');
+          return { status: actual.status, stdout: actual.stdout, stderr: actual.stderr };
+        },
+        runBaseline: (_cwd, files, ref) => {
+          expect(files).toEqual(['test/compute-consumer.test.ts']);
+          expect(ref).toBe('base-sha');
+          return baseline('test/compute-consumer.test.ts:\n(pass) compute\n1 pass\n', 'pass');
+        },
+        runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+        runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+        runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      });
+      expect(ran).toEqual([['test/compute-consumer.test.ts']]);
+      expect(result.testFiles).toEqual(['test/compute-consumer.test.ts']);
+      expect(result.lines).toContain('unrun importer tests: 0; unresolved relative specifiers: 0');
+      expect(result.baseline).toEqual({ introduced: 1, preexisting: 0, unknown: 0, preconditionUnmet: 0 });
+      expect(result.lines.join('\n')).toContain('[gate-baseline] introduced=1');
+      expect(result.lines.join('\n')).toContain('- introduced: test/compute-consumer.test.ts > compute');
+      expect(result.exitCode).toBe(1);
+    } finally { fixture.dispose(); }
+  });
+
+  test('the light-rc opt-in still selects src/ importers alongside scripts/ importers', () => {
+    const fixture = fixtureRepository({
+      'src/service.ts': 'export const service = 1;\n',
+      'scripts/compute.ts': 'export const compute = 1;\n',
+      'test/service-consumer.test.ts': "import '../src/service.js';\n",
+      'test/compute-consumer.test.ts': "import '../scripts/compute.js';\n",
+    });
+    try {
+      const result = runSelfGateCli(fixture.cwd, { includeImporterTests: true }, {
+        changedFiles: () => ({ files: ['src/service.ts', 'scripts/compute.ts'], baseRef: 'HEAD' }),
+        runTests: () => ok(),
+        runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+        runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+        runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      });
+      expect(new Set(result.testFiles)).toEqual(new Set(['test/service-consumer.test.ts', 'test/compute-consumer.test.ts']));
+      expect(result.lines).toContain('unrun importer tests: 0; unresolved relative specifiers: 0');
+      expect(result.exitCode).toBe(0);
+    } finally { fixture.dispose(); }
+  });
+
+  test('the plain gate leaves scripts-only importer selection unchanged without the light-rc option', () => {
+    const fixture = fixtureRepository({
+      'scripts/compute.ts': 'export const compute = 1;\n',
+      'test/compute-consumer.test.ts': "import '../scripts/compute.js';\n",
+    });
+    try {
+      const result = runSelfGateCli(fixture.cwd, {}, {
+        changedFiles: () => ({ files: ['scripts/compute.ts'], baseRef: 'HEAD' }),
+        runTests: () => { throw new Error('plain gate must not run scripts importer'); },
+        runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+        runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+        runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      });
+      expect(result.testFiles).toEqual([]);
+      expect(result.lines).toContain('unrun importer tests: 0');
+      expect(result.lines.some((line) => line.startsWith('importer tests added:'))).toBe(false);
+      expect(result.exitCode).toBe(0);
+    } finally { fixture.dispose(); }
+  });
+
+  test('scripts-only importer lookup failure is reported as unmeasured rather than zero', () => {
+    const result = runSelfGateCli('/repo', { includeImporterTests: true }, {
+      changedFiles: () => ({ files: ['scripts/compute.ts'], baseRef: 'HEAD' }),
+      exists: () => false,
+      runCommand: () => ({ status: 2, stderr: 'grep unavailable' }),
+      runTests: () => { throw new Error('lookup failed; no tests can run'); },
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+      runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+      runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+    });
+    expect(result.testFiles).toEqual([]);
+    expect(result.lines).toContain('unrun importer tests: lookup failed (grep unavailable)');
+    expect(result.lines).toContain('importer tests added: lookup failed (grep unavailable)');
+    expect(result.lines).not.toContain('unrun importer tests: 0');
+  });
+
+  test('scripts-only importers beyond the caller cap join the opt-in test run', () => {
+    const paths = Array.from({ length: GATE_CALLER_TEST_LIMIT + 1 }, (_, n) => `test/scripts-consumer-${String(n).padStart(2, '0')}.test.ts`);
+    const fixture = fixtureRepository({
+      'scripts/compute.ts': 'export const compute = 1;\n',
+      ...Object.fromEntries(paths.map((path) => [path, "import '../scripts/compute.js';\n"])),
+    });
+    try {
+      const ran: string[][] = [];
+      const result = runSelfGateCli(fixture.cwd, { includeImporterTests: true }, {
+        changedFiles: () => ({ files: ['scripts/compute.ts'], baseRef: 'HEAD' }),
+        runTests: (_cwd, files) => { ran.push([...files]); return ok(); },
+        runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+        runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+        runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      });
+      expect(new Set(ran.flat())).toEqual(new Set(paths));
+      expect(result.importerTestsAdded).toEqual([paths[GATE_CALLER_TEST_LIMIT]]);
+      expect(result.lines).toContain(`importer tests added: 1 (reason=changed-source-importer · ${paths[GATE_CALLER_TEST_LIMIT]})`);
+      expect(result.lines).toContain('unrun importer tests: 0; unresolved relative specifiers: 0');
+      expect(result.exitCode).toBe(0);
+    } finally { fixture.dispose(); }
+  });
+
+  test('scripts importer that cannot be run remains an explicit partial observation', () => {
+    const fixture = fixtureRepository({
+      'scripts/compute.ts': 'export const compute = 1;\n',
+      'test/compute-importer.test.ts': "import '../scripts/compute.js';\n",
+    });
+    try {
+      const result = runSelfGateCli(fixture.cwd, { includeImporterTests: true }, {
+        changedFiles: () => ({ files: ['scripts/compute.ts'], baseRef: 'HEAD' }),
+        exists: () => false,
+        runTests: () => { throw new Error('unrunnable importer must not run'); },
+        runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+        runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+        runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      });
+      expect(result.testFiles).toEqual([]);
+      expect(result.lines).toContain('unrun importer tests: 1 (test/compute-importer.test.ts); unresolved relative specifiers: 0');
+      expect(result.lines).toContain('importer tests added: 0 (reason=changed-source-importer)');
+      expect(result.exitCode).toBe(0);
+    } finally { fixture.dispose(); }
   });
 
   test('runs reverse importer tests that exist beside conventional tests', () => {

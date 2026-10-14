@@ -274,11 +274,20 @@ test('GATE-NODES-PARALLEL: a staged prefetch is what the late tui and docs nodes
   const tui = (at: string) => { tuiRuns++; return tuiNodeOutput(at, [{ checks: tuiChecks({ readyMs: 9000, first, help, afterEsc: first }) }], { unmeasured: 'fixture' }); };
 
   const staged = stagePrefetch(context, env, root, run, { stateRoot: state, tui });
-  expect(staged).toMatchObject({ version: '9.9.9', commit, main, tree: join(contexts, 'docs-prefetch/tree') });
+  expect(staged).toMatchObject({ version: '9.9.9', commit, main });
+  expect(staged.tree.startsWith(join(contexts, 'docs-prefetch/tree-'))).toBe(true);
   expect(staged.docs.outcome).toBe('ok');
   expect(tuiRuns).toBe(1);
   const cacheFiles = () => readdirSync(join(contexts, 'docs-prefetch')).filter((name) => name.endsWith('.json'));
-  expect(cacheFiles()).toHaveLength(1);
+  // Two separately published cache files: the docs result and the finished TUI (should-fix ②).
+  expect(cacheFiles()).toHaveLength(2);
+  const cacheDir = join(contexts, 'docs-prefetch');
+  const docsCacheFile = cacheFiles().find((name) => !name.endsWith('.tui.json'))!;
+  const tuiCacheFile = cacheFiles().find((name) => name.endsWith('.tui.json'))!;
+  const docsCache = JSON.parse(readFileSync(join(cacheDir, docsCacheFile), 'utf8'));
+  const tuiCache = JSON.parse(readFileSync(join(cacheDir, tuiCacheFile), 'utf8'));
+  expect(docsCache).not.toHaveProperty('tui');
+  expect(tuiCache.tui).toMatchObject({ verdict: 'pass', commit });
   // Second stage of the same cut is a cache hit (no second worktree, no second TUI).
   stagePrefetch(context, env, root, run, { stateRoot: state, tui });
   expect(tuiRuns).toBe(1);
@@ -291,7 +300,10 @@ test('GATE-NODES-PARALLEL: a staged prefetch is what the late tui and docs nodes
   expect(calls.filter((call) => call.startsWith('git worktree add'))).toHaveLength(1);
   expect(calls).toContain(`git -C ${staged.tree} switch -c release-docs/9.9.9`);
   expect(calls.at(-1)).toBe('git push -u origin release-docs/9.9.9');
-  expect(cacheFiles()).toHaveLength(0);
+  // The DOCS cache is spent (a resumed docs node must not reuse a tree now on the branch);
+  // the tui cache file survives in its own file — the tui node's result is not docs' to throw away.
+  expect(cacheFiles()).toHaveLength(1);
+  expect(cacheFiles()[0]).toEndWith('.tui.json');
 
   // Spent cache: a resumed docs node (or a moved origin/main) takes the original fresh-worktree path.
   currentMain = 'c'.repeat(40);
@@ -532,4 +544,106 @@ test('GATE-NODES-PARALLEL: worker claimed first but its valid cache appears only
   expect(resumed.worktree).not.toBe(join(dir, 'tree'));
   expect(calls.some((call) => call.includes(' switch -c '))).toBe(false);
   expect(calls.filter((call) => call.startsWith('git worktree add -b'))).toHaveLength(2);
+});
+
+test('GATE-NODES-PARALLEL: failed worktree add removes only its own tree, preserving an earlier checkout for retry', async () => {
+  const { stagePrefetch, commandRunner } = await import('./docs-node.js');
+  const { tuiChecks } = await import('./tui-node-checks.js');
+  const { tuiNodeOutput } = await import('./tui-sim-node.js');
+  const root = mkdtempSync(join(tmpdir(), 'release-docs-prefetch-addfail-'));
+  scratch.push(root);
+  const state = join(root, 'state');
+  const commit = 'a'.repeat(40);
+  mkdirSync(join(state, 'release/9.9.9'), { recursive: true });
+  writeFileSync(join(state, 'release/9.9.9/manifest.json'), JSON.stringify({ version: '9.9.9', cutoff: { sha: commit }, in: [] }));
+  const contexts = join(root, 'run.json.contexts');
+  mkdirSync(contexts);
+  const contextPath = join(contexts, '1.json');
+  const context = { input: { version: '9.9.9', previousVersion: '9.9.8' }, outputs: { 'version-release': { outcome: 'ok', commit } } } as Parameters<typeof stagePrefetch>[0];
+  writeFileSync(contextPath, JSON.stringify(context));
+  const calls: string[] = [];
+  const earlierTree = join(contexts, 'docs-prefetch/tree');
+  mkdirSync(earlierTree, { recursive: true });
+  writeFileSync(join(earlierTree, 'marker'), 'earlier cut');
+  let tree = '';
+  const run = (command: string, args: string[]) => {
+    calls.push(`${command} ${args.join(' ')}`);
+    if (command === 'git' && args[0] === 'rev-parse') return 'b'.repeat(40);
+    // Real-world shape: `git worktree add` creates the tree directory and THEN fails (e.g. a checkout error).
+    if (command === 'git' && args[0] === 'worktree' && args[1] === 'add') {
+      tree = args[args.indexOf('--detach') + 1]!;
+      mkdirSync(tree, { recursive: true });
+      throw new Error('worktree add: checkout failed');
+    }
+    return '';
+  };
+  expect(() => stagePrefetch(context, { ELANOUS_GRAPH_CONTEXT: contextPath }, root, run, { stateRoot: state, tui: () => null }))
+    .toThrow('worktree add: checkout failed');
+  // The tree directory existed when add failed — the cleanup must run anyway and leave nothing behind (should-fix ①).
+  expect(existsSync(tree)).toBe(false);
+  expect(readFileSync(join(earlierTree, 'marker'), 'utf8')).toBe('earlier cut');
+  expect(calls).toContain(`git worktree remove --force ${tree}`);
+  expect(readdirSync(join(contexts, 'docs-prefetch')).filter((name) => name.endsWith('.json') || name === 'claim')).toHaveLength(0);
+  // The run can now be retried: the tree path is free again.
+  const first = '─┤ ChatLog ├──\n❯ /command, or type a question\n 📁 elan/monad-agent  │ ⌥ main │ some-model │ ctx 0 │ 🖥 mbp';
+  const help = `┌── Dashboard help ──\n│Commands\n│/help  Show help overlay\n${first}`;
+  const tui = () => tuiNodeOutput(commit, [{ checks: tuiChecks({ readyMs: 9000, first, help, afterEsc: first }) }], { unmeasured: 'fixture' });
+  const retry = (command: string, args: string[], cwd?: string, timeout?: number, childEnv?: NodeJS.ProcessEnv) => {
+    if (command === 'git' && args[0] === 'rev-parse') return 'b'.repeat(40);
+    if (command === 'git' && args[0] === 'worktree' && args[1] === 'add') {
+      const target = args.includes('--detach') ? args[args.indexOf('--detach') + 1]! : args[args.indexOf('-b') + 2]!;
+      mkdirSync(join(target, 'release/public/docs/releases'), { recursive: true });
+      mkdirSync(join(target, 'website'), { recursive: true });
+      writeFileSync(join(target, 'website/pages.json'), JSON.stringify({ pages: [] }));
+      return '';
+    }
+    if (command === process.execPath) return commandRunner(command, args, cwd, timeout, childEnv);
+    return '';
+  };
+  expect(stagePrefetch(context, { ELANOUS_GRAPH_CONTEXT: contextPath }, root, retry, { stateRoot: state, tui }).docs.outcome).toBe('ok');
+});
+
+test('GATE-NODES-PARALLEL: a failed docs stage does not discard the finished tui — joinTui reuses the separate tui cache, fallback must not run', async () => {
+  const { stagePrefetch, joinTui, commandRunner } = await import('./docs-node.js');
+  const { tuiChecks } = await import('./tui-node-checks.js');
+  const { tuiNodeOutput } = await import('./tui-sim-node.js');
+  const root = mkdtempSync(join(tmpdir(), 'release-docs-tui-split-'));
+  scratch.push(root);
+  const state = join(root, 'state');
+  const commit = 'a'.repeat(40);
+  mkdirSync(join(state, 'release/9.9.9'), { recursive: true });
+  writeFileSync(join(state, 'release/9.9.9/manifest.json'), JSON.stringify({ version: '9.9.9', cutoff: { sha: commit }, in: [] }));
+  const contexts = join(root, 'run.json.contexts');
+  mkdirSync(contexts);
+  const contextPath = join(contexts, '1.json');
+  const context = { input: { version: '9.9.9', previousVersion: '9.9.8' }, outputs: {
+    'version-release': { outcome: 'ok', commit }, upgrade: { outcome: 'ok' } } } as Parameters<typeof stagePrefetch>[0];
+  writeFileSync(contextPath, JSON.stringify(context));
+  const env = { ELANOUS_GRAPH_CONTEXT: contextPath };
+  const run = (command: string, args: string[], cwd?: string, timeout?: number, childEnv?: NodeJS.ProcessEnv) => {
+    if (command === 'git' && args[0] === 'rev-parse') return 'b'.repeat(40);
+    if (command === 'git' && args[0] === 'worktree' && args[1] === 'add') {
+      const target = args[args.indexOf('--detach') + 1]!;
+      mkdirSync(join(target, 'release/public/docs/releases'), { recursive: true });
+      mkdirSync(join(target, 'website'), { recursive: true });
+      writeFileSync(join(target, 'website/pages.json'), JSON.stringify({ pages: [] }));
+      return '';
+    }
+    // The docs stage fails for real (unknown version under its isolated tree state root).
+    if (command === process.execPath) return commandRunner(command, [args[0], '--version', '8.8.8', '--base', cwd ?? root, '--json'], cwd, timeout, childEnv);
+    return '';
+  };
+  const first = '─┤ ChatLog ├──\n❯ /command, or type a question\n 📁 elan/monad-agent  │ ⌥ main │ some-model │ ctx 0 │ 🖥 mbp';
+  const help = `┌── Dashboard help ──\n│Commands\n│/help  Show help overlay\n${first}`;
+  let tuiRuns = 0;
+  const tui = () => { tuiRuns++; return tuiNodeOutput(commit, [{ checks: tuiChecks({ readyMs: 9000, first, help, afterEsc: first }) }], { unmeasured: 'fixture' }); };
+  expect(() => stagePrefetch(context, env, root, run, { stateRoot: state, tui })).toThrow(/failed/);
+  expect(tuiRuns).toBe(1);
+  const dir = join(contexts, 'docs-prefetch');
+  // docs failed → NO docs cache file was published; the finished tui lives on in its own file (should-fix ②).
+  expect(readdirSync(dir).filter((name) => name.endsWith('.json') && !name.endsWith('.tui.json'))).toHaveLength(0);
+  expect(readdirSync(dir).filter((name) => name.endsWith('.tui.json'))).toHaveLength(1);
+  // The late tui node reads that separate file and never reruns the costly check.
+  const joined = joinTui(context, env, root, () => { throw new Error('fallback must not run: the finished tui survives the docs failure'); }, state);
+  expect(joined).toMatchObject({ outcome: 'ok', verdict: 'pass', commit });
 });

@@ -1190,6 +1190,8 @@ export interface SelfImplementToolConfig {
    *  Overload failover (OVERLOAD-FAILOVER) may move an unpinned codex child to
    *  grok. A pinned codex provider is never moved. */
   childLlm?: ChildLlmPreferenceConfig;
+  /** Explicit same-provider child escalation map. Absent preserves the existing model ladder. */
+  escalateChild?: Readonly<Record<string, string>>;
   /** SUBSCRIPTION-EXHAUST-REROUTE (0.2.24) — `--child-llm-*` 없이 뜬 Pod 구현 자식의 기본 모델.
    *  `{ provider, model? }` · `'off'`(종전 codex 기본). 없으면 `openrouter/z-ai/glm-5.3`. 원값 — `resolvePodChildDefault` 가 검사한다. */
   podChildDefault?: unknown;
@@ -2737,6 +2739,11 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
     ? selfImplRaw.autoheal as Record<string, unknown> : undefined;
   // ⛔ 모르는 값은 좁은 쪽(shadow) — 오타가 live 를 켜면 안 된다.
   const autoheal = autohealRaw ? { mode: autohealRaw.mode === 'live' ? 'live' as const : 'shadow' as const } : undefined;
+  const escalateChildRaw = selfImplRaw.escalateChild;
+  const escalateChild = escalateChildRaw && typeof escalateChildRaw === 'object' && !Array.isArray(escalateChildRaw)
+    ? Object.fromEntries(Object.entries(escalateChildRaw).filter(([from, to]) => from.trim() && typeof to === 'string' && to.trim())
+      .map(([from, to]) => [from.trim(), (to as string).trim()])) as Record<string, string>
+    : undefined;
   // ⭐ 관측(리뷰 should-fix) — 오타/비-boolean 은 기본값(ON)으로 수렴하는데, 그게 조용하면
   //   "껐다고 믿었는데 자동 개설되는" 운영 사고가 된다. 값이 **있는데 boolean 이 아닐 때만**
   //   경고한다(부재는 정상). 로거 대신 stderr — 이 파일의 기존 경고와 동형(부트 시점·의존 0).
@@ -2772,7 +2779,7 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
     runDevHarness,
     selfOrchestrate,
     nativeStructure,
-    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalRecordInDoc, goalAuthorPersistentGrounding, fabricDecompose, fabricDecomposeAutoPathThreshold, autoOpenPr, draftOnStop, salvageRetention, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation, ...(childLlm ? { childLlm } : {}), ...(selfImplRaw.podChildDefault !== undefined ? { podChildDefault: selfImplRaw.podChildDefault } : {}), ...(runTtlHours !== undefined ? { runTtlHours } : {}), ...(draftSweepCloseCap !== undefined ? { draftSweepCloseCap } : {}), ...(runTtl ? { runTtl } : {}), ...(autoheal ? { autoheal } : {}) },
+    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalRecordInDoc, goalAuthorPersistentGrounding, fabricDecompose, fabricDecomposeAutoPathThreshold, autoOpenPr, draftOnStop, salvageRetention, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation, ...(childLlm ? { childLlm } : {}), ...(escalateChild && Object.keys(escalateChild).length ? { escalateChild } : {}), ...(selfImplRaw.podChildDefault !== undefined ? { podChildDefault: selfImplRaw.podChildDefault } : {}), ...(runTtlHours !== undefined ? { runTtlHours } : {}), ...(draftSweepCloseCap !== undefined ? { draftSweepCloseCap } : {}), ...(runTtl ? { runTtl } : {}), ...(autoheal ? { autoheal } : {}) },
   };
 }
 

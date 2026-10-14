@@ -1,15 +1,31 @@
 import { execFileSync } from 'node:child_process';
 import { statSync } from 'node:fs';
-import { isAbsolute, relative, resolve } from 'node:path';
+import { basename, extname, isAbsolute, relative, resolve } from 'node:path';
 
 export interface AskPathCandidateOptions {
   readonly cwd: string;
   readonly run?: (command: string, args: readonly string[], options: { cwd: string; encoding: 'utf8' }) => string;
 }
 
-export type AskPathCandidates =
-  | { readonly tokens: string[]; readonly paths: string[]; readonly error?: undefined }
-  | { readonly tokens: string[]; readonly paths: string[]; readonly error: string };
+export interface AskPathCandidates {
+  readonly tokens: string[];
+  readonly paths: string[];
+  readonly evidence?: AskPathEvidence[];
+  readonly selection?: AskPathSelection;
+  readonly error?: string;
+}
+
+export interface AskPathEvidence {
+  readonly path: string;
+  readonly pathTokens: string[];
+  readonly strongestPathMatch: 'explicit-file' | 'filename' | 'directory' | null;
+  readonly contentTokens: string[];
+  readonly score: number;
+}
+
+export type AskPathSelection =
+  | { readonly path: string; readonly reason: 'unique-strongest-evidence' }
+  | { readonly path: null; readonly reason: 'tied-strongest-evidence' };
 
 const STOP_WORDS = new Set(['the', 'and', 'test', 'src', 'scripts', 'file', 'path', 'paths', 'code', 'with', 'from', 'this', 'that', 'into', 'for', 'then', 'when', 'have', 'does', 'should', 'will', 'please', 'target', 'change']);
 const WORD = /[-/]?[A-Za-z][A-Za-z0-9_.-]*(?:\/[A-Za-z0-9_.-]+)*/g;
@@ -63,7 +79,15 @@ function existingFile(fragment: string, cwd: string): string | null {
 
 /** Find existing code paths by lexical evidence from an unmodified ask. */
 export function findAskPathCandidates(askText: string, { cwd, run = execFileSync }: AskPathCandidateOptions): AskPathCandidates {
-  const scores = new Map<string, Set<string>>();
+  const scores = new Map<string, { explicit: Set<string>; filename: Set<string>; directory: Set<string>; content: Set<string> }>();
+  const hitsFor = (path: string) => {
+    let hits = scores.get(path);
+    if (!hits) {
+      hits = { explicit: new Set(), filename: new Set(), directory: new Set(), content: new Set() };
+      scores.set(path, hits);
+    }
+    return hits;
+  };
   const tokens: string[] = [];
   const seen = new Set<string>();
   const body = stripAskWrapper(askText);
@@ -73,16 +97,30 @@ export function findAskPathCandidates(askText: string, { cwd, run = execFileSync
       const raw = match[0];
       const token = raw.replace(/^\//, '');
       const file = existingFile(token, cwd);
-      if (file) {
-        const hits = scores.get(file) ?? new Set<string>();
-        hits.add(token);
-        scores.set(file, hits);
-      }
+      if (file) hitsFor(file).explicit.add(token);
       if (STOP_WORDS.has(token.toLowerCase()) || isGenericToken(token) || seen.has(token)) continue;
       if (!file && !token.includes('/') && !token.includes('.') && !token.includes('-') && !token.includes('_')
         && !/[a-z][A-Z]/.test(token) && token.length < 4) continue;
       seen.add(token);
       tokens.push(token);
+    }
+  }
+  if (tokens.length > 0) {
+    let files: string;
+    try {
+      files = run('rg', ['--files', '--glob', '!*.test.ts', 'src', 'scripts'], { cwd, encoding: 'utf8' });
+    } catch (error) {
+      if ((error as { status?: number }).status === 1) files = '';
+      else return { tokens, paths: [], error: error instanceof Error ? error.message : String(error) };
+    }
+    for (const path of files.split(/\r?\n/).filter(Boolean)) {
+      const fileStem = basename(path, extname(path)).toLowerCase();
+      const directories = path.toLowerCase().split('/').slice(0, -1);
+      for (const token of tokens) {
+        const lower = token.toLowerCase();
+        if (fileStem === lower || basename(path).toLowerCase() === lower) hitsFor(path).filename.add(token);
+        else if (directories.includes(lower)) hitsFor(path).directory.add(token);
+      }
     }
   }
   for (const token of tokens) {
@@ -94,13 +132,30 @@ export function findAskPathCandidates(askText: string, { cwd, run = execFileSync
       return { tokens, paths: [], error: error instanceof Error ? error.message : String(error) };
     }
     for (const path of matches.split(/\r?\n/).filter(Boolean)) {
-      const hits = scores.get(path) ?? new Set<string>();
-      hits.add(token);
-      scores.set(path, hits);
+      hitsFor(path).content.add(token);
     }
   }
+  const evidence = [...scores].map<AskPathEvidence>(([path, hits]) => {
+    const tier = hits.explicit.size > 0 ? 3 : hits.filename.size > 0 ? 2 : hits.directory.size > 0 ? 1 : 0;
+    return {
+      path,
+      pathTokens: [...new Set([...hits.explicit, ...hits.filename, ...hits.directory])],
+      strongestPathMatch: tier === 3 ? 'explicit-file' : tier === 2 ? 'filename' : tier === 1 ? 'directory' : null,
+      contentTokens: [...hits.content],
+      // Lexicographic tiers: even many directory hits cannot outrank one filename hit.
+      score: tier * 1000 + Math.min(hits.explicit.size + hits.filename.size + hits.directory.size, 9) * 100
+        + Math.min(hits.content.size, 99),
+    };
+  }).sort((a, b) => b.score - a.score || a.path.localeCompare(b.path, 'en'));
+  const top = evidence[0];
   return {
     tokens,
-    paths: [...scores].sort(([a, aHits], [b, bHits]) => bHits.size - aHits.size || a.localeCompare(b, 'en')).slice(0, 5).map(([path]) => path),
+    paths: evidence.slice(0, 5).map(({ path }) => path),
+    ...(top ? {
+      evidence: evidence.slice(0, 5),
+      selection: evidence[1]?.score === top.score
+        ? { path: null, reason: 'tied-strongest-evidence' as const }
+        : { path: top.path, reason: 'unique-strongest-evidence' as const },
+    } : {}),
   };
 }

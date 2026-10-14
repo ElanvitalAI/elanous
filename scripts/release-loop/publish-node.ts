@@ -48,6 +48,9 @@ export function waitForAssets(run: CommandRunner, repo: string, tag: string, nam
 export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: string,
   clock: { now: () => number; sleep: (ms: number) => void } = { now: Date.now, sleep: Bun.sleepSync }) {
   const context = readGraphContext();
+  // A resumed graph once invoked this irreversible node at npm-publish, docs-land, and failed.
+  // The runner's context is the authority: only the publish visit may publish.
+  if (context.nodeId !== 'publish') throw new Error(`publish node context mismatch: expected publish, got ${context.nodeId ?? 'missing'}`);
   const version = context.input.version;
   // A measured automatic decision or the existing human approval must authorize publication.
   const auto = context.outputs['auto-approve'];

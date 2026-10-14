@@ -97,6 +97,40 @@ describe('TA-LAND-RETRY-ON-INFRA — 인프라 실패는 같은 머리에 한 �
     expect(f.calls).toHaveLength(2);
   });
 
+  test('missing node, bun or tsc during typecheck is infra only with rc127/ENOENT and the exact gate refusal', () => {
+    const refusal = '✗ typecheck: scripts/ci-typecheck-changed.ts blocked pr land.';
+    for (const runtime of ['node', 'bun', 'tsc']) {
+      const output = `env: ${runtime}: No such file or directory\n[tsc-gate] FAIL — tsc 종료코드 127\n${refusal}`;
+      expect(classifyLandFailure({ status: 1, stdout: '', stderr: output })).toEqual({ class: 'infra', reason: 'tsc-runtime-missing' });
+      expect(classifyLandFailure({ status: 1, stdout: '', stderr: output.replace('127', '2') }).class).toBe('judgement');
+      expect(classifyLandFailure({ status: 1, stdout: '', stderr: `${output}\n✗ merge: conflict` }).class).toBe('judgement');
+    }
+    expect(classifyLandFailure({ status: 1, stdout: '', stderr: `env: node: No such file or directory\n[tsc-gate] tsc 실행 실패 (signal=undefined code=ENOENT status=undefined)\n${refusal}` }))
+      .toEqual({ class: 'infra', reason: 'tsc-runtime-missing' });
+  });
+
+  test('#26931 legacy judgement from missing node reopens once and records reclassification before retry', async () => {
+    const refusal = '✗ typecheck: scripts/ci-typecheck-changed.ts blocked pr land.';
+    const detail = `env: node: No such file or directory\n[tsc-gate] FAIL — tsc 종료코드 127\n${refusal}`;
+    const f = fixture({ landAttempts: [{ pr: 30, head: HEAD_A, at: '2026-10-11T04:00:00.000Z', ok: false, class: 'judgement', reason: refusal, detail }] });
+    expect(landRetryPending(f.card(), 30, HEAD_A)).toBe(true);
+    f.queue({ status: 0, stdout: 'merged' });
+    expect(await f.land()).toMatchObject({ executed: true, ok: true, landAttempt: { attempt: 2 } });
+    expect(f.calls).toHaveLength(1);
+    expect(f.retryEvents()).toEqual([expect.objectContaining({ decision: 'legacy-reclassified-retrying', reason: 'tsc-runtime-missing-legacy', attempt: 2 })]);
+    expect(landRetryPending(f.card(), 30, HEAD_A)).toBe(false);
+  });
+
+  test('a legacy judgement with another refused gate stays closed even when the old detail includes missing node', async () => {
+    const refusal = '✗ typecheck: scripts/ci-typecheck-changed.ts blocked pr land.';
+    const detail = `env: node: No such file or directory\n[tsc-gate] FAIL — tsc 종료코드 127\n${refusal}\n✗ merge: conflict`;
+    const f = fixture({ landAttempts: [{ pr: 30, head: HEAD_A, at: '2026-10-11T04:00:00.000Z', ok: false, class: 'judgement', reason: refusal, detail }] });
+    expect(landRetryPending(f.card(), 30, HEAD_A)).toBe(false);
+    expect((await f.land()).executed).toBe(false);
+    expect(f.calls).toHaveLength(0);
+    expect(f.retryEvents()).toHaveLength(0);
+  });
+
   test.each([
     ['겹침 관문 거부', { status: 1, stdout: '✓ branch: feature', stderr: OVERLAP_REFUSED }],
     ['머리 바뀜(병합 직전)', { status: 1, stdout: '', stderr: '✗ expected-head: PR head/state changed before merge' }],

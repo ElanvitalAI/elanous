@@ -1361,7 +1361,22 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
           return {};
         }
         const target = childLlm
-          ? resolveExplicitChildEscalateTarget(tier, process.env, { provider: childLlm.provider, model: childLlm.model, ...(childLlm.effort ? { effort: childLlm.effort } : {}) })
+          ? resolveExplicitChildEscalateTarget(tier, process.env,
+            { provider: childLlm.provider, model: childLlm.model, ...(childLlm.effort ? { effort: childLlm.effort } : {}) },
+            {
+              escalateChild: tier === 'none' ? undefined : (() => {
+                try { return getUserConfig().tools.selfImplement.escalateChild; }
+                catch (error) {
+                  try { debug.log('self-dev.rework', 'escalate-config-unavailable', { reason: errorMessage(error) }); }
+                  catch { /* Observability cannot block child launch. */ }
+                  return undefined;
+                }
+              })(),
+              observe: observation => {
+                try { debug.log(observation.category, observation.event, observation.data); }
+                catch { /* Observability cannot block child launch. */ }
+              },
+            })
           : resolveEscalateTarget(tier);
         if (!target) return {};
         return {

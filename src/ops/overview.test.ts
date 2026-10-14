@@ -120,7 +120,7 @@ describe('표기 — 못 잼은 0 이 아니다', () => {
   test('optional throughput adds one line and unmeasured throughput remains explicit', () => {
     const s = base();
     s.throughput = okCell(measureLandingThroughput({
-      taskAgentActions: [], allLands: [], launched: 327, cardPrs: 10, pendingLandingAgeSeconds: [],
+      taskAgentActions: [], liveLandMoves: [], allLands: [], launched: 327, cardPrs: 10, pendingLandingAgeSeconds: [],
     }), 'daily launch/PR/TASK-AGENT sources', AT);
     const rendered = renderOverview(s, computeVerdict(s), { elapsedMs: 12 });
     expect(rendered).toContain('처리량(1d) 발사 327 → 카드 PR 10 → TA 착지 0');

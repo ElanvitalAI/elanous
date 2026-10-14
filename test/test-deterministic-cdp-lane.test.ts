@@ -21,6 +21,9 @@ function captureCmd(argv: string[], patterns: string[]): Promise<string[]> {
   return runDeterministicTests({
     argv,
     deriveCdpPatterns: () => patterns,
+    // This fixture observes CDP forwarding. Mock-module child splitting has
+    // its own contract in scripts/test-deterministic.test.ts.
+    deriveMockModuleFiles: () => [],
     spawn,
     report: () => {},
     waitForSignal: () => new Promise<never>(() => {}),

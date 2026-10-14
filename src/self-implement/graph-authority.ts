@@ -280,11 +280,24 @@ export function graphAuthorityFields(authority: GraphAuthority, template: GraphT
  *    (`wrong-stage` · `does-not-apply` · `key-absent` · `unparseable` 이 서로 다른 처방이다).
  *  ⛔ **거절은 조용하지 않다** — 패치가 안 물면 `rejections` 로 나오고 «기준 선언»이 그대로 산다. */
 /** 오버레이 조건이 «읽을 수 있는» 상태 키. ⛔ 여기 없는 키는 원장에 값이 안 실린다.
- *  🔑 그래서 «떨어뜨리되 말은 한다» — 아래 `stateExtraKeys` 가 그 이름을 남긴다. */
-export const OVERLAY_STATE_KEYS = ['attempts', 'goal_id'] as const;
+ *  🔑 그래서 «떨어뜨리되 말은 한다» — 아래 `stateExtraKeys` 가 그 이름을 남긴다.
+ *  ⭐ `author_grade` — 적응형 저작(GRAPH-AUTHOR-GRADE) 첫 조각: 저작 등급을 오버레이 상태의 «이름»으로 싣는다. */
+export const OVERLAY_STATE_KEYS = ['attempts', 'author_grade', 'goal_id'] as const;
+
+/** 저작 등급의 오버레이 어휘 — `goal-author` 의 `GoalAuthorGrade`(`full|lite`) 를 오버레이 등급(`normal`) 로 옮긴다.
+ *  ⛔ 모르는 값(빈 값·오타)은 `undefined` — 등급을 «지어내지 않는다». */
+export function normalizeAuthorGrade(value: unknown): 'lite' | 'normal' | 'complex' | undefined {
+  if (value === 'lite') return 'lite';
+  if (value === 'full') return 'normal';
+  if (value === 'complex') return 'complex';
+  return undefined;
+}
 
 /** `graph-overlay-decision` 원장에 «판정에 실제로 쓴» 상태를 싣는다.
  *  ⛔ `hasOwn` 으로 복사한다 — 그래야 「없음」과 「false」와 「0」이 원장에서 «다른 값»이다.
+ *  ⭐ `author_grade` 만은 `normalizeAuthorGrade` 를 «거쳐» 실린다 — 저작 어휘(`full`)가 원장에
+ *     그대로 «사실»로 남으면 오버레이 어휘(`normal`)와 섞인다. 모르는 등급은 키는 남되 값이
+ *     `undefined` 다(등급을 지어내지 않는다 · «있었다»는 사실도 조용히 버리지 않는다).
  *  ⛔⭐ 목록 밖 키는 값을 «안» 싣지만 ***조용히 버리지 않는다*** — `stateExtraKeys` 로 이름을 남긴다.
  *     🩸 이 골이 생긴 이유가 「원장이 판정의 입력을 안 남겨서 손으로 재현하다 오판했다」이므로,
  *        여기서 «조용히» 떨어뜨리면 같은 병을 한 층 아래에서 다시 짓는 것이다. */
@@ -293,7 +306,8 @@ export function overlayDecisionObservation<T extends Readonly<Record<string, unk
 }): T & { readonly state: Readonly<Record<string, unknown>>; readonly stateExtraKeys?: readonly string[] } {
   const state: Record<string, unknown> = {};
   for (const key of OVERLAY_STATE_KEYS) {
-    if (Object.hasOwn(input.state, key)) state[key] = input.state[key];
+    if (!Object.hasOwn(input.state, key)) continue;
+    state[key] = key === 'author_grade' ? normalizeAuthorGrade(input.state[key]) : input.state[key];
   }
   const extra = Object.keys(input.state).filter((key) => !(OVERLAY_STATE_KEYS as readonly string[]).includes(key)).sort();
   return { ...input, state, ...(extra.length > 0 ? { stateExtraKeys: extra } : {}) };

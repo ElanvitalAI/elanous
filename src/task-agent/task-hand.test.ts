@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { Command } from 'commander';
 import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
@@ -7,7 +8,8 @@ import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { registerTasksCommands, spawnDetachedConfirmed, type DetachedSpawn } from '../cli/tasks-cli.js';
 import { debug } from '../debug/log.js';
-import { closeTaskCard, draftTaskOwner, handTask, launchArgs, nextMoveFor, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, TASK_CARD_LABEL, taskCardLabelContext, TaskAgentStateError, type TaskCard, type TaskLaunchContext } from './task-hand.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { closeTaskCard, draftTaskOwner, handTask, launchArgs, nextMoveFor, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, selectTaskComposition, TASK_CARD_LABEL, taskCardLabelContext, TaskAgentStateError, type TaskCard, type TaskLaunchContext } from './task-hand.js';
 
 test('only a unique launched code-PR card owns the PR or its opening run', () => {
   const base: TaskCard = { id: 'ta-one', text: 'draft', createdAt: '2026-10-10T00:00:00Z',
@@ -25,6 +27,164 @@ test('only a unique launched code-PR card owns the PR or its opening run', () =>
 function statePath(): string {
   return join(mkdtempSync(join(tmpdir(), 'task-hand-')), 'task-agent-actions.json');
 }
+
+function compositionFixture(kind: string): string {
+  const root = mkdtempSync(join(tmpdir(), 'task-composition-'));
+  const work = join(root, 'graphs', 'work');
+  mkdirSync(work, { recursive: true });
+  writeFileSync(join(work, `${kind}.yaml`), `graph_id: work-${kind}\nversion: 1\nlauncher: harness-say\nentry_node: done\nterminal_nodes: [done]\nnodes:\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\nedges: []\n`);
+  return root;
+}
+
+test('1판 조합: code-pr의 해석 결과를 기록하고 기존 harness say 인자로 발사한다', async () => {
+  const config = mkdtempSync(join(tmpdir(), 'task-graph-config-'));
+  setElanousConfigDir(config);
+  try {
+  const selected = selectTaskComposition('code-pr');
+  expect(selected).toMatchObject({ composition: { file: 'graphs/work/code-pr.yaml', version: 1 }, launcher: 'harness-say' });
+  const path = statePath();
+  const calls: string[][] = [];
+  const events: Array<{ category: string; event: string; data?: unknown }> = [];
+  const off = debug.registerSink({ name: 'graph-select-code-test', emit: (rec) => { if (rec.category === 'task-agent.graph-select') events.push(rec); } });
+  let result: Awaited<ReturnType<typeof handTask>>;
+  try {
+    result = await handTask({ text: 'ship code', seat: 'MK', statePath: path, live: true,
+      launcher: (args) => { calls.push(args); } });
+  } finally { off(); }
+  expect(calls).toEqual([['harness', 'say', '--seat', 'MK', '--substrate', 'pod', '--merge-by-host', 'ship code']]);
+  expect(readTaskCard(result.card.id, path)).toMatchObject({ composition: selected.composition,
+    graphSelectedBy: 'completion', unitsResolved: selected.unitsResolved, missingUnits: selected.missingUnits });
+  expect(events).toContainEqual(expect.objectContaining({ event: 'composition-selected', data: expect.objectContaining({
+    completion: 'code-pr', file: 'graphs/work/code-pr.yaml', unitsResolved: selected.unitsResolved, missingUnits: selected.missingUnits,
+  }) }));
+  } finally { resetElanousConfigDir(); }
+});
+
+test('단위 해석은 러너 resolveUnit 규칙으로 id·판을 확인하고 실제 단위가 생기면 true가 된다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'task-composition-units-'));
+  const work = join(root, 'graphs', 'work');
+  const units = join(work, 'units');
+  mkdirSync(units, { recursive: true });
+  const graph = `graph_id: work-artifact\nversion: 2\nentry_node: make\nterminal_nodes: [done, failed]\nnodes:\n  - { node_id: make, kind: subgraph, recipe: none, max_visits: 1, call: worker@2, budget: { inner_steps: 3 }, contract: { inputs: [ask], outputs: [result] } }\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\n  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }\nedges:\n  - { from: make, on: outcome, map: { done: done, failed: failed } }\n`;
+  writeFileSync(join(work, 'artifact.yaml'), graph);
+  writeFileSync(join(units, 'worker.yaml'), 'graph_id: worker\nversion: 1\nunit: { inputs: [ask], outputs: [result], exits: [done, failed] }\nentry_node: done\nterminal_nodes: [done, failed]\nnodes:\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\n  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }\nedges: []\n');
+  expect(selectTaskComposition('artifact', root)).toMatchObject({ composition: { file: 'graphs/work/artifact.yaml', version: 2 }, unitsResolved: false, missingUnits: ['worker@2'] });
+  writeFileSync(join(units, 'worker.yaml'), 'graph_id: worker\nversion: 2\nunit: { inputs: [ask], outputs: [result], exits: [done, failed] }\nentry_node: done\nterminal_nodes: [done, failed]\nnodes:\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\n  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }\nedges: []\n');
+  expect(selectTaskComposition('artifact', root)).toMatchObject({ unitsResolved: true, missingUnits: [] });
+  writeFileSync(join(units, 'worker.yaml'), 'graph_id: worker\nversion: 2\nunit: { inputs: [ask], outputs: [result], exits: [done, failed] }\nentry_node: nested\nterminal_nodes: [done, failed]\nnodes:\n  - { node_id: nested, kind: subgraph, recipe: none, max_visits: 1, call: nested@1, budget: { inner_steps: 3 }, contract: { inputs: [], outputs: [] } }\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\n  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }\nedges:\n  - { from: nested, on: outcome, map: { done: done, failed: failed } }\n');
+  expect(selectTaskComposition('artifact', root)).toMatchObject({ unitsResolved: false, missingUnits: ['nested@1'] });
+  writeFileSync(join(units, 'nested.yaml'), 'graph_id: nested\nversion: 1\nunit: { inputs: [], outputs: [], exits: [done, failed] }\nentry_node: done\nterminal_nodes: [done, failed]\nnodes:\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\n  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }\nedges: []\n');
+  expect(selectTaskComposition('artifact', root)).toMatchObject({ unitsResolved: true, missingUnits: [] });
+  writeFileSync(join(units, 'nested.yaml'), 'graph_id: nested\nversion: 1\nunit: { inputs: [extra], outputs: [], exits: [done, failed] }\nentry_node: done\nterminal_nodes: [done, failed]\nnodes:\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\n  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }\nedges: []\n');
+  expect(selectTaskComposition('artifact', root)).toMatchObject({ unitsResolved: false, missingUnits: [],
+    error: expect.stringContaining('unit contract mismatch') });
+  writeFileSync(join(units, 'worker.yaml'), 'graph_id: worker\nversion: 2\nunit: { inputs: [ask], outputs: [result], exits: [done, failed] }\nentry_node: absent\nterminal_nodes: [done, failed]\nnodes: []\nedges: []\n');
+  expect(selectTaskComposition('artifact', root)).toMatchObject({ unitsResolved: false, missingUnits: [],
+    error: expect.stringContaining('조합 단위 해석 오류') });
+});
+
+test('cardFields의 런타임 추가 필드는 선택된 조합과 종결 종류를 덮어쓰지 못한다', async () => {
+  const root = compositionFixture('code-pr');
+  const injectedFields = { goalId: 'goal-1', completion: 'artifact' as const,
+    composition: { file: 'graphs/work/artifact.yaml', version: 99 }, graphSelectedBy: 'completion' as const,
+    unitsResolved: false, missingUnits: ['fake@1'], status: 'failed' as const };
+  const result = await handTask({ text: 'ship code', compositionRoot: root, statePath: statePath(),
+    cardFields: injectedFields });
+  expect(result.card).toMatchObject({ goalId: 'goal-1', status: 'handed',
+    composition: { file: 'graphs/work/code-pr.yaml', version: 1 }, unitsResolved: true, missingUnits: [] });
+  expect(result.card.completion).toBeUndefined();
+});
+
+test('깨진 조합 YAML과 단위 해석 오류는 실패 카드·선택 관측에 남고 발사하지 않는다', async () => {
+  const root = compositionFixture('artifact');
+  const file = join(root, 'graphs', 'work', 'artifact.yaml');
+  const path = statePath();
+  writeFileSync(file, 'graph_id: [broken\n');
+  let launched = 0;
+  const events: Array<{ category: string; event: string; data?: unknown }> = [];
+  const off = debug.registerSink({ name: 'graph-select-invalid-test', emit: (rec) => { if (rec.category === 'task-agent.graph-select') events.push(rec); } });
+  try {
+    await expect(handTask({ id: 'ta-bad-composition', text: 'artifact', completion: 'artifact',
+      compositionRoot: root, statePath: path, live: true, launcher: () => { launched++; } })).rejects.toThrow('조합 오류');
+  } finally { off(); }
+  expect(launched).toBe(0);
+  expect(readTaskCard('ta-bad-composition', path)).toMatchObject({ status: 'failed',
+    composition: { file: 'graphs/work/artifact.yaml', version: null }, graphSelectedBy: 'completion',
+    unitsResolved: false, missingUnits: [], history: [{ event: 'composition-invalid', detail: expect.stringContaining('조합 오류') }] });
+  expect(events).toContainEqual(expect.objectContaining({ event: 'composition-invalid', data: expect.objectContaining({ error: expect.stringContaining('조합 오류') }) }));
+
+  writeFileSync(file, 'graph_id: work-artifact\nversion: 1\nlauncher: harness-say\nentry_node: invoke\nterminal_nodes: [done]\nnodes:\n  - { node_id: invoke, kind: subgraph, recipe: none, max_visits: 1, call: worker@1, budget: { inner_steps: 1 }, contract: { inputs: [], outputs: [] } }\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\nedges:\n  - { from: invoke, on: outcome, map: { done: done } }\n');
+  const units = join(root, 'graphs', 'work', 'units');
+  mkdirSync(units);
+  writeFileSync(join(units, 'worker.yaml'), 'graph_id: worker\nversion: 1\nentry_node: absent\nterminal_nodes: []\nnodes: []\nedges: []\nunit: { inputs: [], outputs: [], exits: [done] }\n');
+  await expect(handTask({ id: 'ta-bad-unit', text: 'artifact', completion: 'artifact',
+    compositionRoot: root, statePath: path, live: true, launcher: () => { launched++; } })).rejects.toThrow('조합 단위 해석 오류');
+  expect(launched).toBe(0);
+  expect(readTaskCard('ta-bad-unit', path)).toMatchObject({ status: 'failed',
+    composition: { file: 'graphs/work/artifact.yaml', version: 1 }, unitsResolved: false, missingUnits: [],
+    history: [{ event: 'composition-invalid', detail: expect.stringContaining('조합 단위 해석 오류') }] });
+});
+
+test('조합 읽기 오류와 code-pr launcher 누락도 실패 카드와 오류 관측에 남긴다', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'task-composition-read-error-'));
+  mkdirSync(join(root, 'graphs', 'work', 'artifact.yaml'), { recursive: true });
+  const path = statePath();
+  const events: string[] = [];
+  const off = debug.registerSink({ name: 'graph-select-read-error-test', emit: rec => {
+    if (rec.category === 'task-agent.graph-select') events.push(rec.event);
+  } });
+  try {
+    await expect(handTask({ id: 'ta-read-error', text: 'artifact', completion: 'artifact',
+      compositionRoot: root, statePath: path })).rejects.toThrow('조합 읽기 오류');
+    expect(readTaskCard('ta-read-error', path)).toMatchObject({ status: 'failed',
+      composition: { file: 'graphs/work/artifact.yaml', version: null },
+      history: [{ event: 'composition-invalid', detail: expect.stringContaining('조합 읽기 오류') }] });
+
+    const codeRoot = compositionFixture('code-pr');
+    const codeFile = join(codeRoot, 'graphs', 'work', 'code-pr.yaml');
+    writeFileSync(codeFile, readFileSync(codeFile, 'utf8').replace('launcher: harness-say\n', ''));
+    await expect(handTask({ id: 'ta-no-launcher', text: 'code', compositionRoot: codeRoot,
+      statePath: path })).rejects.toThrow('launcher 없음');
+    expect(readTaskCard('ta-no-launcher', path)).toMatchObject({ status: 'failed',
+      history: [{ event: 'composition-invalid', detail: expect.stringContaining('launcher 없음') }] });
+  } finally { off(); }
+  expect(events).toEqual(['composition-invalid', 'composition-invalid']);
+});
+
+test('없는 조합은 발사 전 거부하고 카드·관측에 이유를 남긴다', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'task-composition-missing-'));
+  const path = statePath();
+  let launched = 0;
+  const events: Array<{ category: string; event: string; data?: unknown }> = [];
+  const off = debug.registerSink({ name: 'graph-select-missing-test', emit: (rec) => { if (rec.category === 'task-agent.graph-select') events.push(rec); } });
+  try {
+    await expect(handTask({ id: 'ta-missing-composition', text: 'watch', completion: 'watch-brief',
+      statePath: path, compositionRoot: root, live: true, launcher: () => { launched++; } })).rejects.toThrow('조합 없음');
+  } finally { off(); }
+  expect(launched).toBe(0);
+  expect(readTaskCard('ta-missing-composition', path)).toMatchObject({ status: 'failed', completion: 'watch-brief',
+    history: [{ event: 'composition-missing', detail: '조합 없음: graphs/work/watch-brief.yaml' }] });
+  expect(events).toContainEqual(expect.objectContaining({ event: 'composition-missing', data: expect.objectContaining({
+    completion: 'watch-brief', file: 'graphs/work/watch-brief.yaml', unitsResolved: false, missingUnits: [],
+  }) }));
+  for (const kind of ['artifact', 'research-report', 'ops-action', 'content', 'decision-support', 'deliverable'] as const) {
+    await expect(handTask({ text: 'task', completion: kind, statePath: path, compositionRoot: root })).rejects.toThrow(`조합 없음: graphs/work/${kind}.yaml`);
+  }
+});
+
+test('2판 graph-run 조합은 1판에서 잘못 harness say로 발사하지 않고 선택 근거를 남긴다', async () => {
+  const root = compositionFixture('research-report');
+  const file = join(root, 'graphs', 'work', 'research-report.yaml');
+  writeFileSync(file, readFileSync(file, 'utf8').replace('launcher: harness-say', 'launcher: graph-run'));
+  const path = statePath();
+  let launched = 0;
+  await expect(handTask({ id: 'ta-graph-run-future', text: 'report', completion: 'research-report',
+    compositionRoot: root, statePath: path, live: true, launcher: () => { launched++; } })).rejects.toThrow('조합 실행기 없음');
+  expect(launched).toBe(0);
+  expect(readTaskCard('ta-graph-run-future', path)).toMatchObject({ status: 'failed',
+    composition: { file: 'graphs/work/research-report.yaml', version: 1 }, graphSelectedBy: 'completion',
+    unitsResolved: true, missingUnits: [], history: [{ event: 'composition-launcher-unavailable' }] });
+});
 
 async function cli(args: string[], deps: Parameters<typeof registerTasksCommands>[1]): Promise<{ lines: string[]; code: number | string | undefined }> {
   const lines: string[] = [];
@@ -119,9 +279,10 @@ test('Pod 카드 라벨 맥락은 원장 id 그대로이며 카드·원장·발�
 test('live handTask 는 카드 라벨 맥락을 기존 launcher 호출에 싣고 명령·cwd·런 연결을 보존한다', async () => {
   const path = statePath();
   const target = mkdtempSync(join(tmpdir(), 'task-hand-label-target-'));
+  execFileSync('git', ['init', '-q', target]);
   const calls: Array<{ args: string[]; cwd?: string; context?: TaskLaunchContext }> = [];
   const result = await handTask({
-    id: 'ta-20261009-label01', text: '  write report  ', completion: 'research-report',
+    id: 'ta-20261009-label01', text: '  write report  ', completion: 'code-pr',
     project: { id: 'p1', target }, seat: 'TC', checklistId: 'CELL-1', live: true, statePath: path,
     launcher: (args, cwd, context) => { calls.push({ args, cwd, context }); return { runId: context!.runId }; },
   });
@@ -200,25 +361,25 @@ test('task show <ta-id> 는 카드와 다음 수를 보이고 넥서스를 부�
   expect(missing.code).toBe(1);
 });
 
-test('비git 프로젝트 보고서 대상은 절대 경로로 저장하고 live launcher 에 cwd 를 전달한다', async () => {
+test('비git 보고서 대상은 절대 경로로 카드에 남지만 1판에서 발사하지 않는다', async () => {
   const target = mkdtempSync(join(tmpdir(), 'task-hand-project-'));
   const path = statePath();
+  const taskCompositionRoot = compositionFixture('research-report');
   const args = ['task', 'hand', '보고서', '--project', 'p1', '--target', target, '--completion', 'research-report', '--json'];
-  const shadow = await cli(args, { taskStatePath: path });
-  expect(shadow.code ?? 0).toBe(0);
-  const result = JSON.parse(shadow.lines[0]!);
-  expect(result.card.project).toEqual({ id: 'p1', target });
-  expect(result.card.completion).toBe('research-report');
-  expect(result.cwd).toBe(target);
-  expect(readTaskCard(result.card.id, path)?.project?.target).toBe(target);
+  const shadow = await cli(args, { taskStatePath: path, taskCompositionRoot });
+  expect(shadow.code).toBe(1);
+  expect(shadow.lines[0]).toContain('조합 실행기 없음');
+  const card = Object.values(readTaskAgentState<{ tasks: Record<string, TaskCard> }>(path).tasks)[0]!;
+  expect(card).toMatchObject({ completion: 'research-report', project: { id: 'p1', target },
+    composition: { file: 'graphs/work/research-report.yaml', version: 1 }, status: 'failed' });
   const calls: Array<{ args: string[]; cwd?: string }> = [];
-  const live = await cli([...args, '--live'], { taskStatePath: path, taskLauncher: (command, cwd) => { calls.push({ args: command, cwd }); } });
-  expect(live.code ?? 0).toBe(0);
-  expect(calls).toEqual([{ args: ['harness', 'say', '--substrate', 'pod', '--merge-by-host', '보고서'], cwd: target }]);
-  expect(JSON.parse(live.lines[0]!).cwd).toBe(target);
+  const live = await cli([...args, '--live'], { taskStatePath: path, taskCompositionRoot, taskLauncher: (command, cwd) => { calls.push({ args: command, cwd }); } });
+  expect(live.code).toBe(1);
+  expect(calls).toEqual([]);
   const relativeTarget = relative(process.cwd(), target);
-  const normalized = await cli(['task', 'hand', '보고서', '--project', 'p1', '--target', relativeTarget, '--completion', 'research-report', '--json'], { taskStatePath: path });
-  expect(JSON.parse(normalized.lines[0]!).card.project.target).toBe(target);
+  const normalized = await cli(['task', 'hand', '보고서', '--project', 'p1', '--target', relativeTarget, '--completion', 'research-report', '--json'], { taskStatePath: path, taskCompositionRoot });
+  expect(normalized.code).toBe(1);
+  expect(Object.values(readTaskAgentState<{ tasks: Record<string, TaskCard> }>(path).tasks).at(-1)?.project?.target).toBe(target);
 });
 
 test('비git code-pr 및 없는 디렉터리는 카드 기록 전에 거부한다', async () => {
@@ -239,11 +400,12 @@ test('비git code-pr 및 없는 디렉터리는 카드 기록 전에 거부한�
 
 test('프로젝트 handed 관측은 id 와 git 여부를 남긴다', async () => {
   const target = mkdtempSync(join(tmpdir(), 'task-hand-project-'));
+  execFileSync('git', ['init', '-q', target]);
   const events: Array<{ category: string; event: string; data?: unknown }> = [];
   const off = debug.registerSink({ name: 'task-project-capture', emit: (rec) => { if (rec.category === 'task-agent') events.push(rec); } });
   try {
-    await handTask({ text: '보고서', project: { id: 'p1', target }, completion: 'research-report', statePath: statePath() });
-    expect(events.find((entry) => entry.event === 'handed')?.data).toMatchObject({ projectId: 'p1', targetIsGit: false });
+    await handTask({ text: '보고서', project: { id: 'p1', target }, completion: 'code-pr', statePath: statePath() });
+    expect(events.find((entry) => entry.event === 'handed')?.data).toMatchObject({ projectId: 'p1', targetIsGit: true });
   } finally { off(); }
 });
 
@@ -335,9 +497,10 @@ test('TASK-AGENT 관측 — 싱크 등록이 실패해도 과제 넘기기는 �
 
 test('--completion <kind> 는 카드에 종결 종류를 싣고 모르는 값은 exit 1 · 안 주면 카드에 칸이 없다 (§A4b③)', async () => {
   const path = statePath();
-  const { lines, code } = await cli(['task', 'hand', 'x', '--completion', 'artifact', '--json'], { taskStatePath: path });
-  expect(code).toBeFalsy();
-  expect(JSON.parse(lines[0]!).card.completion).toBe('artifact');
+  const { lines, code } = await cli(['task', 'hand', 'x', '--completion', 'artifact', '--json'], { taskStatePath: path, taskCompositionRoot: compositionFixture('artifact') });
+  expect(code).toBe(1);
+  expect(lines[0]).toContain('조합 실행기 없음');
+  expect(Object.values(readTaskAgentState<{ tasks: Record<string, TaskCard> }>(path).tasks)[0]?.completion).toBe('artifact');
   const plain = await cli(['task', 'hand', 'y', '--json'], { taskStatePath: path });
   expect('completion' in JSON.parse(plain.lines[0]!).card).toBe(false);
   const previous = process.exitCode;
@@ -403,7 +566,7 @@ test('TASKS-HAND-CHILD-LLM: without --child-llm the command line and card are by
     .replaceAll(card.id, '<ID>').replaceAll(stored.runId!, '<RUN>').replaceAll(stored.launchId!, '<LAUNCH>')
     .replaceAll(stored.createdAt, '<T>').replaceAll(stored.history[0]!.at, '<T>');
   expect(normalized).toBe(JSON.stringify({
-    id: '<ID>', text: 'ship it', seat: 'UX', createdAt: '<T>', status: 'launched', history: [
+    id: '<ID>', text: 'ship it', seat: 'UX', composition: { file: 'graphs/work/code-pr.yaml', version: 1 }, graphSelectedBy: 'completion', unitsResolved: false, missingUnits: ['make-code@1'], createdAt: '<T>', status: 'launched', history: [
       { at: '<T>', event: 'launch', detail: 'harness say --seat UX --substrate pod --merge-by-host ship it' },
       { at: '<T>', event: 'run-bound', detail: '<RUN>', runId: '<RUN>' },
     ], runId: '<RUN>', launchId: '<LAUNCH>',

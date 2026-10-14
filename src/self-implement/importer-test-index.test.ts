@@ -16,6 +16,19 @@ function fixture(files: Record<string, string>): { cwd: string; dispose: () => v
 }
 
 describe('buildImporterTestIndex — ordered TypeScript extension resolution', () => {
+  test('a tracked scripts/ source is indexed from a relative test import without changing src/ resolution', () => {
+    const repo = fixture({
+      'scripts/compute.ts': 'export const compute = 1;\n',
+      'src/service.ts': 'export const service = 1;\n',
+      'test/compute.test.ts': "import '../scripts/compute.js';\nimport '../src/service.js';\n",
+    });
+    try {
+      const index = buildImporterTestIndex(repo.cwd, ['test/compute.test.ts'], ['scripts/compute.ts', 'src/service.ts']);
+      expect(index?.testsBySource.get('scripts/compute.ts')).toEqual(['test/compute.test.ts']);
+      expect(index?.testsBySource.get('src/service.ts')).toEqual(['test/compute.test.ts']);
+      expect(index?.unresolvedRelativeSpecifiers).toBe(0);
+    } finally { repo.dispose(); }
+  });
   test('a .js specifier registers only its first existing .ts candidate when .ts and .js coexist', () => {
     const repo = fixture({
       'src/x.ts': 'export const ts = true;\n',

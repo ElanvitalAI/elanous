@@ -21,6 +21,7 @@ function fixture() {
   const reviews: number[] = [];
   const lands: number[] = [];
   const deps = (moves: TaskAgentLiveMove[], over: Record<string, unknown> = {}) => ({
+    env: {},
     readCard: (id: string) => readTaskCard(id, statePath),
     log: (_c: string, event: string, data: Record<string, unknown>) => { logs.push({ event, data }); },
     liveMoves: new Set(moves),
@@ -173,6 +174,16 @@ describe('TA-LIVE-MOVE-CARD-HISTORY — live-move 마다 카드 history 한 줄'
       expect.objectContaining({ card: 'ta-hist-1', kind: 'review', reason: 'card ledger unknown (injected readCard without live.statePath)' }),
     ]);
     expect(f.liveLines()).toEqual([]);
+  });
+
+  test('decision-card 효과는 실행 여부와 성공 여부로 구분하고 review·land 분류를 보존한다', () => {
+    const decision = (executed: boolean, ok: boolean) => ({ kind: 'decision-card' as const, card: 'c', executed, ok, detail: 'decision result' });
+    expect(liveMoveEffect({ executorResult: 'live', result: decision(false, false) })).toBe('none — not executed');
+    expect(liveMoveEffect({ executorResult: 'live', result: decision(true, true) })).toBe('decision card raised');
+    expect(liveMoveEffect({ executorResult: 'live', result: decision(true, false) })).toBe('raise failed');
+
+    expect(liveMoveEffect({ executorResult: 'live', result: { kind: 'review', card: 'c', ok: true, executed: true, detail: '?' } })).toBe(LIVE_REVIEW_EFFECT_REQUESTED);
+    expect(liveMoveEffect({ executorResult: 'live', result: { kind: 'land', card: 'c', ok: true, executed: true, detail: 'merged' } })).toBe('land reported ok by the executor (merge state not re-checked here) · merge sha not reported');
   });
 
   test('효과 — 모르면 unknown(지어내지 않는다)', () => {

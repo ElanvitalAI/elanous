@@ -172,6 +172,19 @@ describe('buildFirstScreenBand', () => {
     expect(buildFirstScreenBand({ width: 80, daemon: false, pwa: {} })[1]).toBe('PWA: unavailable');
   });
 
+  test('keeps the historical hint when locale is omitted across link and width states', () => {
+    const hint = 'Type a message to begin | /help for commands';
+    for (const link of [undefined, { status: 'checking' } as const, { status: 'error', stage: 'health' } as const]) {
+      expect(buildFirstScreenBand({ width: 120, daemon: false, link })).toHaveLength(3);
+      expect(buildFirstScreenBand({ width: 120, daemon: false, link })[2]).toBe(hint);
+      expect(buildFirstScreenBand({ width: 24, daemon: false, link })[2]).toBe(hint.slice(0, 24));
+    }
+    expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en' })[5])
+      .toBe('Try typing: what can you do?');
+    expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'ko' })[5])
+      .toBe('바로 입력해 보세요: 무엇을 할 수 있어?');
+  });
+
   test('selects tailnet before lan before loopback, falling back when an address is absent', () => {
     const pwa = {
       tailnet: 'https://host.tailnet.ts.net:3460',
@@ -210,6 +223,87 @@ describe('buildFirstScreenBand', () => {
     expect(output).toContain('PWA: https://host.tailnet.ts.net:3460');
     for (const secret of ['user', 'secret', 'private-token', 'query-secret', 'fragment-secret']) {
       expect(output).not.toContain(secret);
+    }
+  });
+
+  test('renders three available-action lines and one immediately-typeable example per ko/en locale', () => {
+    const korean = buildFirstScreenBand({ width: 120, daemon: false, locale: 'ko' });
+    expect(korean).toEqual([
+      'elanous | 데몬: 꺼짐',
+      'PWA: 확인 안 함',
+      '· 대화 — 무엇이든 자연어로 물어보고 시켜보세요',
+      '· 명령 — /help 로 전체 명령을 보세요',
+      '· 스킬 — /run-skill <이름> 으로 설치된 스킬을 돌리세요',
+      '바로 입력해 보세요: 무엇을 할 수 있어?',
+    ]);
+    const english = buildFirstScreenBand({ width: 120, daemon: false, locale: 'en' });
+    expect(english).toEqual([
+      'elanous | daemon: offline',
+      'PWA: not checked',
+      '· Chat — ask for anything in plain language',
+      '· Commands — /help lists every command',
+      '· Skills — /run-skill <name> runs an installed skill',
+      'Try typing: what can you do?',
+    ]);
+    const localized = buildFirstScreenBand({ width: 120, daemon: true, pwa: { loopback: 'http://127.0.0.1:3460' }, locale: 'ko' });
+    expect(localized).toHaveLength(6);
+    expect(localized[0]).toBe('elanous | 데몬: 켜짐');
+    expect(localized[1]).toBe('PWA: http://127.0.0.1:3460');
+    expect(localized[2]).toBe('· 대화 — 무엇이든 자연어로 물어보고 시켜보세요');
+    expect(localized[3]).toBe('· 명령 — /help 로 전체 명령을 보세요');
+    expect(localized[4]).toBe('· 스킬 — /run-skill <이름> 으로 설치된 스킬을 돌리세요');
+    expect(localized[5]).toBe('바로 입력해 보세요: 무엇을 할 수 있어?');
+  });
+
+  test('localizes every daemon link state in the requested locale', () => {
+    expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en', link: { status: 'checking' } })[0])
+      .toBe('elanous | daemon: checking');
+    expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en', link: { status: 'connected', address: 'http://127.0.0.1:31415' } })[0])
+      .toBe('elanous | daemon: connected (http://127.0.0.1:31415)');
+    expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en', link: { status: 'absent', startCommand: 'elanous nexus run --hmr' } })[0])
+      .toBe('elanous | daemon: absent · start: elanous nexus run --hmr');
+    expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en', link: { status: 'unhealthy', startCommand: 'elanous nexus run --hmr' } })[0])
+      .toBe('elanous | daemon: unhealthy · start: elanous nexus run --hmr');
+    expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en', link: { status: 'error', stage: 'health' } })[0])
+      .toBe('elanous | daemon: health lookup error');
+    expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'ko', link: { status: 'absent', startCommand: 'elanous nexus run --hmr' } })[0])
+      .toBe('elanous | 데몬: 없음 · 시작: elanous nexus run --hmr');
+  });
+
+  test('keeps the same guidance readable on error and empty screens in both locales', () => {
+    for (const locale of ['ko', 'en'] as const) {
+      const example = locale === 'ko' ? '무엇을 할 수 있어?' : 'what can you do?';
+      const empty = buildFirstScreenBand({ width: 120, daemon: false, locale });
+      const errored = buildFirstScreenBand({
+        width: 120, daemon: false, locale, link: { status: 'error', stage: 'health' },
+      });
+      const checking = buildFirstScreenBand({
+        width: 120, daemon: false, locale, link: { status: 'checking' },
+      });
+      const unhealthy = buildFirstScreenBand({
+        width: 120, daemon: false, locale, link: { status: 'unhealthy', startCommand: 'elanous nexus run --hmr' },
+      });
+      for (const band of [empty, errored, checking, unhealthy]) {
+        expect(band).toHaveLength(6);
+        expect(band[2]!.length).toBeGreaterThan(0);
+        expect(band[3]!.length).toBeGreaterThan(0);
+        expect(band[4]!.length).toBeGreaterThan(0);
+        expect(band[5]).toContain(example);
+      }
+      expect(errored.slice(2)).toEqual(empty.slice(2));
+      expect(checking.slice(2)).toEqual(empty.slice(2));
+      expect(unhealthy.slice(2)).toEqual(empty.slice(2));
+      expect(errored[1]).toBe(empty[1]);
+    }
+  });
+
+  test('truncates localized guidance on Hangul boundaries without splitting a syllable', () => {
+    const full = buildFirstScreenBand({ width: 120, daemon: false, locale: 'ko' });
+    for (const width of [10, 15, 20, 30]) {
+      const lines = buildFirstScreenBand({ width, daemon: false, locale: 'ko' });
+      for (let index = 2; index <= 5; index++) {
+        expect(full[index]!.startsWith(lines[index]!)).toBe(true);
+      }
     }
   });
 });

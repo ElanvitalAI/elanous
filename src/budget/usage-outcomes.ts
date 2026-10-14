@@ -33,6 +33,14 @@ export interface UsageOutcomesReport {
   readonly unreadableLedgers: number;
 }
 
+export interface AutoLandRatioRow {
+  readonly selfLanded: number;
+  readonly handMerges: number | null;
+  readonly totalMerges: number | null;
+  readonly autoLandRatio: number | null;
+  readonly blockReasons: Readonly<Record<string, number>>;
+}
+
 export interface UsageOutcomesDeps {
   readonly dir?: string;
   readonly nowMs?: number;
@@ -137,6 +145,30 @@ export function aggregateUsageOutcomes(
     }))
     .sort((a, b) => a.provider.localeCompare(b.provider, 'en'));
   return { sinceDays, sinceMs, rows, unreadableLedgers };
+}
+
+/** Join the existing run-ledger aggregate with an externally measured hand-merge count. */
+export function measureAutoLandRatio(report: UsageOutcomesReport, handMerges: number | null): AutoLandRatioRow {
+  const selfLanded = report.rows.reduce((sum, row) => sum + row.landed, 0);
+  const hand = handMerges !== null && Number.isSafeInteger(handMerges) && handMerges >= 0 ? handMerges : null;
+  const sum = hand === null ? null : selfLanded + hand;
+  // An empty report also represents a missing ledger directory; do not turn that into 0%.
+  const totalMerges = report.rows.length === 0 || report.unreadableLedgers > 0 || sum === null || !Number.isSafeInteger(sum) ? null : sum;
+  const autoLandRatio = totalMerges === null || totalMerges === 0 ? null : selfLanded / totalMerges;
+  const reasons = new Map<string, number>();
+  for (const row of report.rows) {
+    for (const [reason, count] of Object.entries(row.blockReasons)) {
+      reasons.set(reason, (reasons.get(reason) ?? 0) + count);
+    }
+  }
+  const blockReasons = Object.fromEntries([...reasons].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))) as Record<string, number>;
+  return { selfLanded, handMerges: hand, totalMerges, autoLandRatio, blockReasons };
+}
+
+export function formatAutoLandRatio(row: AutoLandRatioRow): string {
+  const ratio = row.autoLandRatio === null ? '-' : `${Math.round(row.autoLandRatio * 1000) / 10}%`;
+  const reasons = Object.entries(row.blockReasons).map(([reason, count]) => `${reason}=${count}`).join(',') || '-';
+  return `자율 착지 ${row.selfLanded} / 전체 ${row.totalMerges ?? '-'} (${ratio}) · 손 착지 ${row.handMerges ?? '-'} · 멈춤 사유 ${reasons}`;
 }
 
 export function queryUsageOutcomes(sinceDays: number, deps: UsageOutcomesDeps = {}): UsageOutcomesReport {

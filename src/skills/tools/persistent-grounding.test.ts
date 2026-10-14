@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CoreTurnContext, GoalLoopResult } from '../../core-turn/index.js';
+import { runGoalLoop } from '../../core-turn/index.js';
 import { debug } from '../../debug/log.js';
 import { findNativeTool } from '../../native-tool-catalog.js';
 import {
@@ -421,8 +422,151 @@ describe('persistent grounding', () => {
       const result = await groundPersistently('unread evidence', root, {
         runGoalLoop: async (ctx) => complete(ctx, 'src/candidate.ts: asserted only'),
       });
-      expect(result).toEqual({ files: [], evidence: [], iterations: 1, stopReason: 'goal_complete' });
+      expect(result).toEqual({ files: [], evidence: [], iterations: 2, stopReason: 'goal_complete' });
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('읽지 않은 import 경로를 되먹인 뒤 한 번의 재시도에서 Read로 검증해 채택한다', async () => {
+    const root = worktreeWithRoots(['scripts', 'src/ux-sim']);
+    writeFileSync(join(root, 'scripts', 'ux-sim.ts'), "import '../src/ux-sim/fault-cred-expiry.js';\n");
+    writeFileSync(join(root, 'src', 'ux-sim', 'fault-cred-expiry.js'), 'export const fault = true;\n');
+    let attempts = 0;
+    try {
+      const result = await groundPersistently('inspect UX fault path', root, {
+        runGoalLoop: async (ctx, options) => {
+          attempts += 1;
+          const callCtx = { callId: `grounding-${attempts}`, sessionId: ctx.sessionId, signal: ctx.signal };
+          if (attempts === 1) {
+            await ctx.dispatchTool('Read', { file_path: 'scripts/ux-sim.ts' }, callCtx);
+            return complete(ctx, 'src/ux-sim/fault-cred-expiry.js: handles the credential fault');
+          }
+          expect(options?.maxIterations).toBe(2);
+          expect(ctx.messages.at(-1)?.content).toContain('src/ux-sim/fault-cred-expiry.js');
+          expect(ctx.messages.at(-1)?.content).toContain('scripts/ux-sim.ts');
+          await ctx.dispatchTool('Read', { file_path: 'src/ux-sim/fault-cred-expiry.js' }, callCtx);
+          return complete(ctx, 'src/ux-sim/fault-cred-expiry.js: handles the credential fault');
+        },
+      });
+      expect(attempts).toBe(2);
+      expect(result).toEqual({ files: ['src/ux-sim/fault-cred-expiry.js'],
+        evidence: ['src/ux-sim/fault-cred-expiry.js: handles the credential fault'], iterations: 2, stopReason: 'goal_complete' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('존재하지 않는 경로는 재시도에서 제거하고 실제 Read 경로만 채택한다', async () => {
+    const root = worktreeWithRoots(['scripts']);
+    let attempts = 0;
+    try {
+      const result = await groundPersistently('inspect available implementation', root, {
+        runGoalLoop: async (ctx) => {
+          attempts += 1;
+          const callCtx = { callId: `grounding-${attempts}`, sessionId: ctx.sessionId, signal: ctx.signal };
+          if (attempts === 1) {
+            await ctx.dispatchTool('Read', { file_path: 'scripts/candidate.ts' }, callCtx);
+            return complete(ctx, 'src/nonexistent.ts: guessed location');
+          }
+          expect(ctx.messages.at(-1)?.content).toContain('src/nonexistent.ts');
+          return complete(ctx, 'scripts/candidate.ts: actual implementation entry');
+        },
+      });
+      expect(result).toEqual({ files: ['scripts/candidate.ts'], evidence: ['scripts/candidate.ts: actual implementation entry'],
+        iterations: 2, stopReason: 'goal_complete' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('재시도와 그 실패 로그가 모두 throw해도 첫 Read 근거를 보존한다', async () => {
+    const root = worktree();
+    const original = debug.log.bind(debug) as typeof debug.log;
+    let attempts = 0;
+    (debug as { log: typeof debug.log }).log = ((category: string, event: string) => {
+      if (category === 'grounding.persistent' && event === 'evidence-retry-failed') throw new Error('log unavailable');
+    }) as typeof debug.log;
+    try {
+      const result = await groundPersistently('keep verified evidence', root, {
+        runGoalLoop: async (ctx) => {
+          attempts += 1;
+          if (attempts === 2) throw new Error('retry unavailable');
+          const callCtx = { callId: 'first', sessionId: ctx.sessionId, signal: ctx.signal };
+          await ctx.dispatchTool('Read', { file_path: 'src/candidate.ts' }, callCtx);
+          return complete(ctx, 'src/candidate.ts: verified implementation\nsrc/unread.ts: guessed detail');
+        },
+      });
+      expect(attempts).toBe(2);
+      expect(result).toEqual({ files: ['src/candidate.ts'], evidence: ['src/candidate.ts: verified implementation'],
+        iterations: 1, stopReason: 'goal_complete' });
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('재시도에 다른 유효 경로와 같은 미Read 경로가 섞여도 첫 유효 근거를 잃지 않는다', async () => {
+    const root = worktree();
+    writeFileSync(join(root, 'src', 'second.ts'), 'export const second = true;\n');
+    let attempts = 0;
+    try {
+      const result = await groundPersistently('preserve both verified paths', root, {
+        runGoalLoop: async (ctx) => {
+          attempts += 1;
+          const callCtx = { callId: `mixed-${attempts}`, sessionId: ctx.sessionId, signal: ctx.signal };
+          if (attempts === 1) {
+            await ctx.dispatchTool('Read', { file_path: 'src/candidate.ts' }, callCtx);
+            return complete(ctx, 'src/candidate.ts: first verified path\nsrc/unread.ts: still guessed');
+          }
+          await ctx.dispatchTool('Read', { file_path: 'src/second.ts' }, callCtx);
+          return complete(ctx, 'src/second.ts: second verified path\nsrc/unread.ts: still guessed');
+        },
+      });
+      expect(attempts).toBe(2);
+      expect(result).toEqual({ files: ['src/candidate.ts', 'src/second.ts'],
+        evidence: ['src/candidate.ts: first verified path', 'src/second.ts: second verified path'],
+        iterations: 2, stopReason: 'goal_complete' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('실제 goal loop는 재시도 Read 응답 뒤 다음 턴의 완료 증거를 채택한다', async () => {
+    const root = worktreeWithRoots(['scripts', 'src']);
+    let retryTurns = 0;
+    const original = debug.log.bind(debug) as typeof debug.log;
+    const finished: Record<string, unknown>[] = [];
+    (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: Record<string, unknown>) => {
+      if (category === 'grounding.persistent' && event === 'finished' && data) finished.push(data);
+    }) as typeof debug.log;
+    try {
+      const result = await groundPersistently('trace the real file', root, {
+        runGoalLoop: (ctx, options) => runGoalLoop(ctx, { ...options, changedFiles: () => [],
+          runTurn: async (turn) => {
+            const callCtx = { callId: 'read', sessionId: turn.sessionId, signal: turn.signal };
+            if (!turn.sessionId.endsWith('-evidence-retry')) {
+              await turn.dispatchTool('Read', { file_path: 'scripts/candidate.ts' }, callCtx);
+              const evidence = 'src/candidate.ts: guessed before Read';
+              turn.callbacks?.onToolCall?.({ id: 'first-goal', name: 'update_goal', args: { status: 'complete', evidence } });
+              turn.callbacks?.onTurnComplete?.([{ role: 'assistant', content: [{ type: 'tool_use', id: 'first-goal', name: 'update_goal', input: { status: 'complete', evidence } }] }]);
+              return { stopReason: 'end_turn', finalText: '' };
+            }
+            retryTurns += 1;
+            if (retryTurns === 1) {
+              const read = await turn.dispatchTool('Read', { file_path: 'src/candidate.ts' }, callCtx) as { output: string };
+              expect(read.output).toContain('candidate');
+              turn.callbacks?.onTurnComplete?.([{ role: 'assistant', content: [{ type: 'tool_use', id: 'retry-read', name: 'Read', input: { file_path: 'src/candidate.ts' } }] }]);
+              return { stopReason: 'end_turn', finalText: '' };
+            }
+            expect(turn.messages.at(-1)?.content).toContain('continue');
+            const evidence = 'src/candidate.ts: verified after the prior Read response';
+            turn.callbacks?.onToolCall?.({ id: 'retry-goal', name: 'update_goal', args: { status: 'complete', evidence } });
+            turn.callbacks?.onTurnComplete?.([{ role: 'assistant', content: [{ type: 'tool_use', id: 'retry-goal', name: 'update_goal', input: { status: 'complete', evidence } }] }]);
+            return { stopReason: 'end_turn', finalText: '' };
+          },
+        }),
+      });
+      expect(retryTurns).toBe(2);
+      expect(result?.files).toEqual(['src/candidate.ts']);
+      expect(result?.evidence).toEqual(['src/candidate.ts: verified after the prior Read response']);
+      expect(finished.at(-1)).toMatchObject({ feedbackRetry: true, candidateCount: 1, evidenceCount: 1, stopReason: 'goal_complete' });
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('명시적으로 유효한 ReadResult만 읽은 후보로 승인하고 비정상 반환 뒤에도 루프를 계속한다', async () => {
@@ -445,8 +589,8 @@ describe('persistent grounding', () => {
             return complete(ctx, 'src/candidate.ts: asserted after invalid Read');
           },
         });
-        expect(calls).toBe(2);
-        expect(result).toEqual({ files: [], evidence: [], iterations: 1, stopReason: 'goal_complete' });
+        expect(calls).toBe(4);
+        expect(result).toEqual({ files: [], evidence: [], iterations: 2, stopReason: 'goal_complete' });
       }
       const result = await groundPersistently('valid dispatcher result', root, {
         dispatchTool: async () => validReadResult,
@@ -598,7 +742,8 @@ describe('persistent grounding', () => {
       }));
       const finished = logs.find((log) => log.category === 'grounding.persistent' && log.event === 'finished');
       expect(Object.keys(finished?.data as object).sort()).toEqual([
-        'candidateCount', 'candidates', 'durationMs', 'evidenceCount', 'evidenceRejection', 'iterations', 'maxIterations', 'outcome', 'sessionId', 'stopReason', 'toolCalls',
+        'candidateCount', 'candidates', 'durationMs', 'evidenceCount', 'evidenceRejection', 'feedbackRetry', 'firstEvidenceRejection',
+        'iterations', 'maxIterations', 'outcome', 'sessionId', 'stopReason', 'toolCalls',
       ]);
       expect((finished?.data as { evidenceRejection?: unknown }).evidenceRejection).toEqual({
         noPath: 2,

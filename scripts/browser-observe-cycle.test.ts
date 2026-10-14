@@ -1,6 +1,6 @@
 import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../src/debug/log.js';
@@ -11,25 +11,33 @@ import {
 } from '../src/mss/logging/log-store.js';
 import { MCP_PROTOCOL_VERSION_LATEST } from '../src/mcp/server.js';
 import type { McpHttpFetch } from '../src/mcp/client.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../src/elanous-config-dir.js';
 import * as cycle from './browser-observe-cycle.js';
 import {
   ASIDE_REPL_TOOL,
   BROWSER_OBSERVE_LOG_CATEGORY,
   BROWSER_OBSERVE_OK,
+  BROWSER_OBSERVE_REASON_AUTH_MISSING,
+  BROWSER_OBSERVE_REASON_AUTH_REJECTED,
   BROWSER_OBSERVE_UNOBSERVED,
   BROWSER_OBSERVE_WRONG_SCREEN,
   MCP_SESSION_HEADER,
   ELANOUS_PWA_URL,
   _resetBrowserObserveLogSinkForTest,
+  browserObserveTokenPath,
   buildBrowserObserveReplCode,
   classifyBrowserObserve,
   ensureBrowserObserveLogSink,
   observeBrowserCycle,
+  readBrowserObserveToken,
   type BrowserObserveMcpRequest,
 } from './browser-observe-cycle.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
+
+// 주입 readToken 이 돌려주는 루프백 토큰값 — 파일 시스템 없이 결정성을 얻는다.
+const TEST_TOKEN = 'browser-observe-test-token';
 
 // 2026-08-24 실측 snapshot(page, {interactive:true}).tree — HTML 이 아닌 접근성 개요.
 const ACTUAL_ELANOUS_PWA_TREE = `# note: interactive (clickable / focusable) elements only.
@@ -94,6 +102,8 @@ function createMcpHttpFixture(opts: {
   toolError?: { code: number; message: string };
   failInitialize?: Error;
   failToolsCall?: Error;
+  /** 모든 요청에 401 로 답한다 — nexus default-deny 의 invalid_token 을 흉내 낸다. */
+  unauthorized?: boolean;
 } = {}): { fetch: McpHttpFetch; posts: JsonRpcPost[]; sessionId: string } {
   const posts: JsonRpcPost[] = [];
   const sessionId = opts.sessionId ?? MCP_SESSION_ID;
@@ -104,6 +114,18 @@ function createMcpHttpFixture(opts: {
       params?: Record<string, unknown>;
     };
     posts.push({ method: req.method, id: req.id, params: req.params, headers: init.headers });
+    if (opts.unauthorized) {
+      return {
+        status: 401,
+        headers: jsonHeaders({ 'www-authenticate': 'Bearer error="invalid_token"' }),
+        text: async () =>
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: req.id,
+            error: { code: -32001, message: 'authentication required' },
+          }),
+      };
+    }
     if (req.method === 'initialize') {
       if (opts.failInitialize) throw opts.failInitialize;
       return {
@@ -244,6 +266,7 @@ describe('observeBrowserCycle — MCP initialize + session HTTP path', () => {
     const fixture = createMcpHttpFixture();
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     expect(result.status).toBe(BROWSER_OBSERVE_OK);
@@ -262,6 +285,7 @@ describe('observeBrowserCycle — MCP initialize + session HTTP path', () => {
     const fixture = createMcpHttpFixture();
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     expect(result.status).toBe(BROWSER_OBSERVE_OK);
@@ -288,6 +312,7 @@ describe('observeBrowserCycle — MCP initialize + session HTTP path', () => {
     });
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     expect(result.status).toBe(BROWSER_OBSERVE_UNOBSERVED);
@@ -303,6 +328,7 @@ describe('observeBrowserCycle — MCP initialize + session HTTP path', () => {
     });
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     expect(result.status).toBe(BROWSER_OBSERVE_UNOBSERVED);
@@ -314,6 +340,7 @@ describe('observeBrowserCycle — MCP initialize + session HTTP path', () => {
     const fixture = createMcpHttpFixture({ tree: '   ', url: ELANOUS_PWA_URL });
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     expect(result.status).toBe(BROWSER_OBSERVE_UNOBSERVED);
@@ -325,6 +352,7 @@ describe('observeBrowserCycle — MCP initialize + session HTTP path', () => {
     const fixture = createMcpHttpFixture();
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     const request: BrowserObserveMcpRequest = result.request;
@@ -346,6 +374,7 @@ describe('observeBrowserCycle — MCP initialize + session HTTP path', () => {
     const fixture = createMcpHttpFixture();
     await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     const call = toolsCallPost(fixture.posts);
@@ -363,6 +392,7 @@ describe('observeBrowserCycle — MCP initialize + session HTTP path', () => {
     });
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     expect(result.status).toBe(BROWSER_OBSERVE_UNOBSERVED);
@@ -377,12 +407,132 @@ describe('observeBrowserCycle — MCP initialize + session HTTP path', () => {
     });
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     expect(result.status).toBe(BROWSER_OBSERVE_WRONG_SCREEN);
     expect(result.status).not.toBe(BROWSER_OBSERVE_OK);
   });
 });
+
+describe('observeBrowserCycle — loopback owner token on MCP calls', () => {
+  test('injected fetch receives Authorization: Bearer on every MCP POST', async () => {
+    const fixture = createMcpHttpFixture();
+    const result = await observeBrowserCycle({
+      fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
+      log: () => {},
+    });
+    expect(result.status).toBe(BROWSER_OBSERVE_OK);
+    expect(fixture.posts.length).toBeGreaterThan(0);
+    for (const post of fixture.posts) {
+      expect(post.headers.authorization).toBe(`Bearer ${TEST_TOKEN}`);
+    }
+    const call = toolsCallPost(fixture.posts);
+    expect(call.headers.authorization).toBe(`Bearer ${TEST_TOKEN}`);
+  });
+
+  test('missing token is unobserved with reason auth-missing and no MCP call at all', async () => {
+    const fixture = createMcpHttpFixture();
+    const result = await observeBrowserCycle({
+      fetch: fixture.fetch,
+      readToken: () => null,
+      log: () => {},
+    });
+    expect(result.status).toBe(BROWSER_OBSERVE_UNOBSERVED);
+    expect(result.reason).toBe(BROWSER_OBSERVE_REASON_AUTH_MISSING);
+    expect(result.observedUrl).toBeNull();
+    expect(fixture.posts).toEqual([]);
+  });
+
+  test('server 401 with a token is unobserved with reason auth-rejected, not the long mcp-call string', async () => {
+    const fixture = createMcpHttpFixture({ unauthorized: true });
+    const result = await observeBrowserCycle({
+      fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
+      log: () => {},
+    });
+    expect(result.status).toBe(BROWSER_OBSERVE_UNOBSERVED);
+    expect(result.reason).toBe(BROWSER_OBSERVE_REASON_AUTH_REJECTED);
+    expect(result.reason).not.toContain('mcp-call:');
+    expect(result.observedUrl).toBeNull();
+    // 401 은 첫 POST(initialize) 에서 돌아온다 — Bearer 를 붙였는지 그 요청이 증언한다.
+    expect(fixture.posts.length).toBe(1);
+    expect(fixture.posts[0]?.method).toBe('initialize');
+    expect(fixture.posts[0]?.headers.authorization).toBe(`Bearer ${TEST_TOKEN}`);
+  });
+
+  test('other transport failures keep the existing mcp-call reason shape', async () => {
+    const fixture = createMcpHttpFixture({ failInitialize: new Error('ECONNREFUSED') });
+    const result = await observeBrowserCycle({
+      fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
+      log: () => {},
+    });
+    expect(result.status).toBe(BROWSER_OBSERVE_UNOBSERVED);
+    expect(result.reason).toContain('mcp-call:');
+    expect(result.reason).not.toBe(BROWSER_OBSERVE_REASON_AUTH_MISSING);
+    expect(result.reason).not.toBe(BROWSER_OBSERVE_REASON_AUTH_REJECTED);
+  });
+
+  test('provided mcpCall bypasses the token gate without reading any token', async () => {
+    let readTokenCalls = 0;
+    const result = await observeBrowserCycle({
+      mcpCall: async () => toolCallEnvelope(ACTUAL_ELANOUS_PWA_TREE, ELANOUS_PWA_URL),
+      readToken: () => {
+        readTokenCalls += 1;
+        return null;
+      },
+      log: () => {},
+    });
+    expect(result.status).toBe(BROWSER_OBSERVE_OK);
+    expect(readTokenCalls).toBe(0);
+  });
+});
+
+describe('readBrowserObserveToken — read-only loopback acp-token', () => {
+  const temporaryRoots: string[] = [];
+  afterEach(() => {
+    resetElanousConfigDir();
+    temporaryRoots.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true }));
+  });
+
+  function withTempConfigDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'browser-observe-token-'));
+    temporaryRoots.push(dir);
+    setElanousConfigDir(dir);
+    return dir;
+  }
+
+  test('token path is acp-token inside the elanous config dir', () => {
+    const dir = withTempConfigDir();
+    expect(browserObserveTokenPath()).toBe(join(dir, 'acp-token'));
+  });
+
+  test('reads the stored token, trimmed', () => {
+    withTempConfigDir();
+    writeFileSync(browserObserveTokenPath(), '  owner-token-value\n', 'utf8');
+    expect(readBrowserObserveToken()).toBe('owner-token-value');
+  });
+
+  test('missing or blank token yields null without creating the file', () => {
+    withTempConfigDir();
+    expect(readBrowserObserveToken()).toBeNull();
+    expect(existsSync(browserObserveTokenPath())).toBe(false);
+    writeFileSync(browserObserveTokenPath(), '   \n', 'utf8');
+    expect(readBrowserObserveToken()).toBeNull();
+    // 읽기 전용 — 두 번 읽어도 파일 내용은 그대로다.
+    expect(readFileSyncSafe(browserObserveTokenPath())).toBe('   \n');
+  });
+});
+
+function readFileSyncSafe(path: string): string | null {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch {
+    return null;
+  }
+}
 
 describe('observeBrowserCycle — standalone sink reaches logs.db', () => {
   const temporaryRoots: string[] = [];
@@ -434,6 +584,7 @@ describe('observeBrowserCycle — standalone sink reaches logs.db', () => {
       const fixture = createMcpHttpFixture();
       const result = await observeBrowserCycle({
         fetch: fixture.fetch,
+        readToken: () => TEST_TOKEN,
       });
       expect(result.status).toBe(BROWSER_OBSERVE_OK);
       debug.flush();
@@ -459,6 +610,7 @@ describe('observeBrowserCycle — standalone sink reaches logs.db', () => {
       });
       const result = await observeBrowserCycle({
         fetch: fixture.fetch,
+        readToken: () => TEST_TOKEN,
       });
       expect(result.status).toBe(BROWSER_OBSERVE_UNOBSERVED);
       debug.flush();
@@ -667,6 +819,7 @@ describe('buildBrowserObserveReplCode — injected browser execution', () => {
     const fixture = createMcpHttpFixture({ result: envelope });
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     expect(result.status).toBe(BROWSER_OBSERVE_OK);
@@ -737,6 +890,7 @@ describe('buildBrowserObserveReplCode — injected browser execution', () => {
     const fixture = createMcpHttpFixture({ result: envelope });
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     expect(result.status).toBe(BROWSER_OBSERVE_OK);
@@ -790,6 +944,7 @@ describe('observeBrowserCycle — mixed human text plus JSON', () => {
     });
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     expect(result.status).toBe(BROWSER_OBSERVE_OK);
@@ -804,6 +959,7 @@ describe('observeBrowserCycle — mixed human text plus JSON', () => {
     });
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     expect(result.status).toBe(BROWSER_OBSERVE_UNOBSERVED);
@@ -821,6 +977,7 @@ describe('observeBrowserCycle — mixed human text plus JSON', () => {
     });
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     expect(result.status).toBe(BROWSER_OBSERVE_OK);
@@ -840,6 +997,7 @@ describe('observeBrowserCycle — mixed human text plus JSON', () => {
     });
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     expect(result.status).toBe(BROWSER_OBSERVE_OK);
@@ -859,6 +1017,7 @@ describe('observeBrowserCycle — mixed human text plus JSON', () => {
     });
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     expect(result.status).toBe(BROWSER_OBSERVE_OK);
@@ -883,6 +1042,7 @@ describe('observeBrowserCycle — mixed human text plus JSON', () => {
     });
     const result = await observeBrowserCycle({
       fetch: fixture.fetch,
+      readToken: () => TEST_TOKEN,
       log: () => {},
     });
     expect(result.status).toBe(BROWSER_OBSERVE_OK);

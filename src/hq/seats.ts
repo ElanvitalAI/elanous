@@ -278,6 +278,18 @@ export function hqInit(options: { root?: string; home?: string } = {}): { root: 
   return { root, created, cron };
 }
 
+// A skipped refresh leaves the seat looking idle to every other surface: one observation line carries the
+// reason and how far the kept HEAD trails the fetched origin/main. Observation never changes the verdict
+// (same rule as judgeLandedTip).
+function observeRefreshSkipped(path: string, role: HqSeatRole, reason: 'dirty' | 'unlanded-head', head?: string): void {
+  try {
+    const tip = head ?? git(path, 'rev-parse', 'HEAD');
+    const behind = runGitCommand(path, ['rev-list', '--count', 'HEAD..refs/remotes/origin/main'], { encoding: 'utf8' });
+    const count = behind.status === 0 && /^\d+$/.test(behind.stdout.trim()) ? Number(behind.stdout.trim()) : null;
+    debug.log('hq.seat', 'refresh-skipped', { role, path, reason, head: tip, behind: count });
+  } catch { /* observation must not change the verdict */ }
+}
+
 export function hqSeat(value: string, options: { root?: string; refresh?: boolean } = {}): { path: string; outcome: 'created' | 'unchanged' | 'refreshed' | 'dirty' } {
   const role = roleOf(value);
   const root = resolve(options.root ?? hqRoot());
@@ -301,16 +313,18 @@ export function hqSeat(value: string, options: { root?: string; refresh?: boolea
   const onBranch = runGitCommand(path, ['symbolic-ref', '--quiet', '--short', 'HEAD'], { encoding: 'utf8' });
   if (onBranch.status === 0) throw new Error(`not a seat: ${path} is on branch ${onBranch.stdout.trim()}; refusing to touch it`);
   // A dirty seat must be byte-for-byte untouched, including its detached HEAD.
-  if (options.refresh && !clean(path)) return { path, outcome: 'dirty' };
+  // The cron line fetches the mirror before refreshing, so `behind` counts against the fetched origin/main.
+  if (options.refresh && !clean(path)) { observeRefreshSkipped(path, role, 'dirty'); return { path, outcome: 'dirty' }; }
   if (!options.refresh) return { path, outcome: 'unchanged' };
   git(repo, 'fetch', 'origin');
   // Concurrent refreshes of one seat (cron and a person) serialize on the house lock; each re-checks first.
   return withLedgerLock(root, () => {
     assertRegisteredWorktree(repo, path);
     if (runGitCommand(path, ['symbolic-ref', '--quiet', 'HEAD'], { encoding: 'utf8' }).status === 0) throw new Error(`not a seat: ${path} is on a branch; refusing to touch it`);
-    if (!clean(path)) return { path, outcome: 'dirty' as const };
+    if (!clean(path)) { observeRefreshSkipped(path, role, 'dirty'); return { path, outcome: 'dirty' as const }; }
     // Commits made on the detached seat are not on origin/main; moving HEAD would orphan them. Treat as dirty.
-    if (!mergedIntoMain(repo, git(path, 'rev-parse', 'HEAD'))) return { path, outcome: 'dirty' as const };
+    const head = git(path, 'rev-parse', 'HEAD');
+    if (!mergedIntoMain(repo, head)) { observeRefreshSkipped(path, role, 'unlanded-head', head); return { path, outcome: 'dirty' as const }; }
     git(path, 'checkout', '--detach', 'refs/remotes/origin/main');
     return { path, outcome: 'refreshed' as const };
   });

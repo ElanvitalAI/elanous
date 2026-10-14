@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateIndexKeyPair, signIndex } from '../../market/signed-index.js';
 import { OFFICIAL_INDEX_KEYS } from '../../market/official-keys.js';
-import { addMarket, ELANOUS_MARKET_URL, ensureInternalMarketIndex, ensureMarketIndex, listMarkets, updateMarket } from './market-fetch.js';
+import { addMarket, codexPluginPackagePath, ELANOUS_MARKET_URL, ensureInternalMarketIndex, ensureMarketIndex, listMarkets, updateMarket } from './market-fetch.js';
 
 const dirs: string[] = [];
 function setup() {
@@ -27,6 +27,28 @@ function server(bytes: Uint8Array, signature: string) {
   }) as typeof fetch;
   return { fetcher, requests };
 }
+
+test('Codex inventory selects only an installed package directory, never an uninstalled row', () => {
+  const { root } = setup();
+  const pkg = join(root, 'mail');
+  mkdirSync(pkg);
+  writeFileSync(join(pkg, 'plugin.json'), JSON.stringify({ id: 'mail', version: '1.0.0' }));
+  const inventory = { marketplaces: [{ name: 'openai-curated', plugins: [
+    { name: 'mail', installed: true, availability: 'AVAILABLE', installPath: pkg },
+    { name: 'missing', installed: false, availability: 'AVAILABLE', installPath: pkg },
+  ] }] };
+  expect(codexPluginPackagePath(inventory, 'mail', 'openai-curated')).toBe(pkg);
+  expect(() => codexPluginPackagePath(inventory, 'missing', 'openai-curated')).toThrow('not installed');
+  writeFileSync(join(pkg, 'plugin.json'), JSON.stringify({ id: 'other', version: '1.0.0' }));
+  expect(() => codexPluginPackagePath(inventory, 'mail', 'openai-curated')).toThrow('name differs');
+  writeFileSync(join(pkg, 'plugin.json'), JSON.stringify({ id: 'mail', version: '1.0.0' }));
+  expect(() => codexPluginPackagePath({ marketplaces: [{ name: 'openai-curated', plugins: [
+    { name: 'mail', installed: true, availability: 'UNAVAILABLE', installPath: pkg },
+  ] }] }, 'mail', 'openai-curated')).toThrow('not installed');
+  expect(() => codexPluginPackagePath({ marketplaces: [{ name: 'openai-curated', plugins: [
+    { name: 'mail', installed: true, installPath: '../mail' },
+  ] }] }, 'mail', 'openai-curated')).toThrow('directory unavailable');
+});
 
 describe('signed market fetch', () => {
   test('built-in Pages URL, user markets and trust coexist without losing unrelated configuration', () => {

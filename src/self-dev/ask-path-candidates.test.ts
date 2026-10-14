@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { findAskPathCandidates, stripAskWrapper } from './ask-path-candidates.js';
 
 test('identifier and backtick words find ranked code candidates with literal rg arguments', () => {
@@ -26,6 +26,61 @@ test('candidate search retains five ranked paths for observation before the laun
     run: () => ['src/z.ts', 'src/e.ts', 'src/d.ts', 'src/c.ts', 'src/b.ts', 'src/a.ts'].join('\n'),
   });
   expect(result.paths).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts', 'src/e.ts']);
+});
+
+test('S1-02 original ux-sim request outranks unrelated SQLite busy content', () => {
+  const result = findAskPathCandidates('하니스로 개발: ux-sim 에 «SQLite busy» 결함 주입 심 하나 더', {
+    cwd: resolve(import.meta.dir, '../..'),
+  });
+  expect(result.error).toBeUndefined();
+  expect(result.paths[0]).toBe('scripts/ux-sim.ts');
+  expect(result.paths).not.toContain('scripts/hq/standby-snapshot.ts');
+  expect(result.evidence?.[0]).toMatchObject({ path: 'scripts/ux-sim.ts', pathTokens: ['ux-sim'], strongestPathMatch: 'filename' });
+  expect(result.selection).toEqual({ path: 'scripts/ux-sim.ts', reason: 'unique-strongest-evidence' });
+});
+
+test('equal content evidence leaves the target unselected', () => {
+  const result = findAskPathCandidates('prioritySignal', {
+    cwd: '/repo',
+    run: () => 'src/a.ts\nsrc/b.ts\n',
+  });
+  expect(result.paths).toEqual(['src/a.ts', 'src/b.ts']);
+  expect(result.selection).toEqual({ path: null, reason: 'tied-strongest-evidence' });
+});
+
+test('plain basename, extension, and directory names outrank unrelated content in an isolated tree', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ask-path-names-'));
+  try {
+    mkdirSync(join(root, 'src', 'engine'), { recursive: true });
+    mkdirSync(join(root, 'scripts', 'hq'), { recursive: true });
+    writeFileSync(join(root, 'src', 'engine', 'worker.ts'), 'export {};');
+    writeFileSync(join(root, 'scripts', 'orchestrate.ts'), 'export {};');
+    writeFileSync(join(root, 'scripts', 'ux-sim.ts'), 'export {};');
+    writeFileSync(join(root, 'scripts', 'hq', 'standby-snapshot.ts'), 'SQLite busy');
+    for (const [ask, path, match] of [
+      ['orchestrate SQLite busy', 'scripts/orchestrate.ts', 'filename'],
+      ['ux-sim.ts SQLite busy', 'scripts/ux-sim.ts', 'filename'],
+      ['engine SQLite busy', 'src/engine/worker.ts', 'directory'],
+    ] as const) {
+      const result = findAskPathCandidates(ask, { cwd: root });
+      expect(result.selection).toEqual({ path, reason: 'unique-strongest-evidence' });
+      expect(result.evidence?.[0]?.strongestPathMatch).toBe(match);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('many directory-name matches cannot outscore one filename match', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ask-path-tier-'));
+  const names = Array.from({ length: 11 }, (_, index) => `part${index}`);
+  try {
+    mkdirSync(join(root, 'src', ...names), { recursive: true });
+    mkdirSync(join(root, 'scripts'), { recursive: true });
+    writeFileSync(join(root, 'src', ...names, 'worker.ts'), 'export {};');
+    writeFileSync(join(root, 'scripts', 'ux-sim.ts'), 'export {};');
+    const result = findAskPathCandidates(`ux-sim ${names.join(' ')}`, { cwd: root });
+    expect(result.selection).toEqual({ path: 'scripts/ux-sim.ts', reason: 'unique-strongest-evidence' });
+    expect(result.evidence?.[0]?.score).toBeGreaterThan(result.evidence?.[1]?.score ?? 0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('common words yield zero candidates without searching', () => {

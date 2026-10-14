@@ -429,7 +429,8 @@ describe('post-merge goal copy cleanup', () => {
       expect(git('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'goal').status).toBe(0);
       expect(spawnSync('git', ['init', '--bare', '-q', origin]).status).toBe(0);
       expect(git('remote', 'add', 'origin', origin).status).toBe(0);
-      expect(git('push', '-q', 'origin', 'main').status).toBe(0);
+      expect(spawnSync('git', ['-C', origin, 'fetch', '-q', root, 'main:refs/heads/main']).status).toBe(0);
+      expect(git('fetch', '-q', 'origin', 'main:refs/remotes/origin/main').status).toBe(0);
       expect(removeMatchingGoalCopy(root, file, 'origin/main')).toMatchObject({ outcome: 'kept', reason: 'tracked' });
       expect(git('rm', '--cached', '-q', goal).status).toBe(0);
       writeFileSync(file, Buffer.from([0, 254, 10]));
@@ -16437,6 +16438,23 @@ describe('detectDeclaredScopeDiff — 선언한 대상 밖 변경', () => {
     });
     expect(scope.outsideNames).toEqual(['src/other.ts']);
     expect(scope.declaredCount).toBe(3);
+  });
+  test('decorated fullwidth new-file declarations in Original ask share the author parser and execution scope', () => {
+    const ask = [
+      'src/a.ts',
+      '- **신설：** `./src/new.ts`, `src/new.test.ts` · `src/extra.ts`',
+      '- **신설:** src/bold.ts',
+      'new files: src/other.ts',
+    ].join('\n');
+    const goalDocument = goalDocumentWithDeclaredTargets(ask);
+    const scope = detectDeclaredScopeDiff({
+      goalDocument: `${goalDocument}\n\n## NOTES\n신설: src/outside-ask.ts`,
+      changedFiles: ['src/a.ts', 'src/new.ts', 'src/new.test.ts', 'src/extra.ts', 'src/bold.ts', 'src/other.ts', 'src/outside-ask.ts'],
+    });
+    expect(scope).toMatchObject({
+      status: 'known', declaredCount: 6, outsideCount: 1, outsideNames: ['src/outside-ask.ts'],
+      unmadeCount: 0, unmadeNames: [],
+    });
   });
   test('a «신설:» line without a target-path first line stays unreadable', () => {
     const doc = goalDocumentWithDeclaredTargets('src/a.ts').replace('대상 경로: src/a.ts', '신설: src/new.ts');

@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { Database } from 'bun:sqlite';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { MsgStore, canonicalSeatId, defaultMsgStorePath, openMsgStore, validateMessageEnvelope } from './msg-store.js';
 
@@ -33,7 +34,10 @@ describe('message identity and envelope', () => {
       for (const invalid of [null, [], {}, { from: 'S', to: 'T', body: '' },
         { from: 'S', to: 'T', body: 4 }, { from: '../S', to: 'T', body: 'hi' },
         { from: 'S', to: 'T', body: 'hi', kind: 'BAD!' },
-        { from: 'S', to: 'T', body: 'hi', id: 9 }]) {
+        { from: 'S', to: 'T', body: 'hi', id: 9 },
+        { from: 'S', to: 'T', body: 'hi', replyTo: 0 },
+        { from: 'S', to: 'T', body: 'hi', replyTo: 1.5 },
+        { from: 'S', to: 'T', body: 'hi', replyTo: 'one' }]) {
         expect(() => store.append(invalid as never)).toThrow();
       }
       expect(store.unreadRecipients()).toEqual([]);
@@ -238,6 +242,110 @@ describe('durable message log and cursor', () => {
       expect(reopened.getCursor('T')).toBe(posted!);
       expect(reopened.unread()).toEqual([]);
     } finally { reopened.close(); }
+  });
+
+  test('replyTo threads replies to a question, listing them in insertion order and paging by exclusive reply ID', () => {
+    const store = new MsgStore(':memory:');
+    try {
+      const question = store.post({ from: 'OP', to: 'TC', body: 'the question' });
+      expect(question.replyTo).toBeUndefined();
+      store.post({ from: 'OP', to: 'MK', body: 'unrelated' });
+      const first = store.post({ from: 'TC', to: 'OP', body: 'first reply', replyTo: question.id });
+      const second = store.post({ from: 'TC', to: 'OP', body: 'second reply', replyTo: question.id });
+      expect(first).toMatchObject({ replyTo: question.id });
+      expect(second.replyTo).toBe(question.id);
+      expect(store.listReplies(question.id)).toEqual([first, second]);
+      expect(store.listReplies(first.id)).toEqual([]);
+      expect(store.listReplies(question.id, 1)).toEqual([first]);
+      expect(store.listReplies(question.id, 100, first.id)).toEqual([second]);
+      expect(store.listReplies(question.id, 100, second.id)).toEqual([]);
+      expect(store.getMessage(question.id)).toEqual(question);
+      expect(store.getMessage(999)).toBeNull();
+      expect(validateMessageEnvelope({ from: 'coo', to: 'cmo', body: 'hi', replyTo: 7 }))
+        .toEqual({ from: 'OP', to: 'MK', body: 'hi', replyTo: 7 });
+      for (const invalid of [0, -1, 1.5, 'one', null]) {
+        expect(() => store.append({ from: 'OP', to: 'MK', body: 'x', replyTo: invalid } as never))
+          .toThrow('replyTo must be a positive integer message ID');
+      }
+      for (const invalid of [0, -1, 1.5]) {
+        expect(() => store.listReplies(invalid as never)).toThrow('message ID must be a positive integer');
+        expect(() => store.getMessage(invalid as never)).toThrow('message ID must be a positive integer');
+      }
+      for (const limit of [0, -1, 1001, 1.5]) expect(() => store.listReplies(1, limit)).toThrow('limit must be between 1 and 1000');
+      for (const invalid of [-1, 1.5]) expect(() => store.listReplies(question.id, 100, invalid)).toThrow('cursor must be a nonnegative safe integer');
+    } finally { store.close(); }
+  });
+
+  test('a pre-threading ledger migrates in place; old messages stay valid and replies persist across reopen', () => {
+    const path = diskPath();
+    mkdirSync(dirname(path), { recursive: true });
+    const legacy = new Database(path);
+    try {
+      legacy.exec(`CREATE TABLE msg_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender TEXT NOT NULL,
+        recipient TEXT NOT NULL,
+        body TEXT NOT NULL,
+        kind TEXT,
+        created_at TEXT NOT NULL
+      );`);
+      legacy.query('INSERT INTO msg_messages(sender, recipient, body, kind, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run('OP', 'TC', 'old question', 'memo', '2026-10-01T00:00:00.000Z');
+      legacy.query('INSERT INTO msg_messages(sender, recipient, body, created_at) VALUES (?, ?, ?, ?)')
+        .run('TC', 'OP', 'old answer', '2026-10-01T00:01:00.000Z');
+    } finally { legacy.close(); }
+
+    const oldQuestion = { id: 1, from: 'OP', to: 'TC', body: 'old question', kind: 'memo', createdAt: '2026-10-01T00:00:00.000Z' };
+    const oldAnswer = { id: 2, from: 'TC', to: 'OP', body: 'old answer', createdAt: '2026-10-01T00:01:00.000Z' };
+    const readOnly = new MsgStore(path, { readOnly: true });
+    try {
+      expect(readOnly.getMessage(1)).toEqual(oldQuestion);
+      expect(readOnly.listByRecipient('OP')).toEqual([oldAnswer]);
+      expect(readOnly.listAfter(0)).toEqual([oldQuestion, oldAnswer]);
+      expect(readOnly.listReplies(1)).toEqual([]);
+    } finally { readOnly.close(); }
+    const store = new MsgStore(path);
+    try {
+      expect(store.listByRecipient('TC')).toEqual([oldQuestion]);
+      expect(store.getMessage(2)).toEqual(oldAnswer);
+      expect(store.listReplies(1)).toEqual([]);
+      const reply = store.post({ from: 'TC', to: 'OP', body: 'new reply', replyTo: 1 });
+      expect(reply).toMatchObject({ id: 3, replyTo: 1 });
+      expect(store.listReplies(1).map(message => [message.id, message.body, message.replyTo])).toEqual([[3, 'new reply', 1]]);
+    } finally { store.close(); }
+
+    const reopened = new MsgStore(path);
+    try {
+      expect(reopened.getMessage(1)).toEqual(oldQuestion);
+      expect(reopened.getMessage(2)).toEqual(oldAnswer);
+      expect(reopened.listReplies(1).map(message => [message.id, message.replyTo])).toEqual([[3, 1]]);
+    } finally { reopened.close(); }
+  });
+
+  test('two processes can open the same pre-threading ledger during migration', async () => {
+    const path = diskPath();
+    mkdirSync(dirname(path), { recursive: true });
+    const legacy = new Database(path);
+    try {
+      legacy.exec(`CREATE TABLE msg_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, recipient TEXT NOT NULL,
+        body TEXT NOT NULL, kind TEXT, created_at TEXT NOT NULL
+      )`);
+    } finally { legacy.close(); }
+    const script = `import { MsgStore } from './src/msg/msg-store.ts'; const store = new MsgStore(process.env.MSG_DB_PATH!); store.close();`;
+    const results = await Promise.all([0, 1].map(async () => {
+      const child = Bun.spawn(['bun', '-e', script], {
+        cwd: process.cwd(), env: { ...process.env, MSG_DB_PATH: path }, stdout: 'pipe', stderr: 'pipe',
+      });
+      const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+      return { code, stderr };
+    }));
+    for (const result of results) expect(result.code, result.stderr).toBe(0);
+    const store = new MsgStore(path);
+    try {
+      const columns = store.db.query(`SELECT name FROM pragma_table_info('msg_messages') WHERE name = 'reply_to'`).all();
+      expect(columns).toHaveLength(1);
+    } finally { store.close(); }
   });
 
   test('default database belongs to the resolved instance state root', () => {

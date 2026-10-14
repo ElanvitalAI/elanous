@@ -759,7 +759,7 @@ export function exportedLiteralUnionMembersInChanges(
   pathsResult: ChangedPathResult = changedPathPairs(base),
   readBase: GitFileReader = readGitFile,
   readHead = (file: string) => readFileSync(file, 'utf8'),
-  sources?: RepositorySources,
+  sources?: RepositorySources | (() => RepositorySources),
 ): LiteralUnionMemberCheck {
   if (pathsResult.failure) return { additions: [], failure: pathsResult.failure };
   const additions: LiteralUnionAddition[] = [];
@@ -780,7 +780,7 @@ export function exportedLiteralUnionMembersInChanges(
   }
   if (removals.length === 0) return { additions };
   try {
-    return { additions, removals: literalUnionReferencesInSource(removals, changed, sources ?? repositoryTypeScriptSources()) };
+    return { additions, removals: literalUnionReferencesInSource(removals, changed, typeof sources === 'function' ? sources() : sources ?? repositoryTypeScriptSources()) };
   } catch (error: unknown) {
     return { additions, failure: `저장소 리터럴 참조 탐색 실패: ${error instanceof Error ? error.message : String(error)}` };
   }
@@ -873,6 +873,7 @@ export type GateIo = {
   literalUnionMembers?: (changed: ReadonlySet<string>, base: string) => LiteralUnionMember[] | LiteralUnionMemberCheck;
   readBaselineDiagnostics?: (base: string, command: string) => BaselineDiagnostics;
   runTscCmd: (cmd: string) => TscRun;
+  resolveTscScript?: (cwd: string) => string | undefined;
   /** Landing tree. Git, existsSync, tsc, and the test baseline are measured here — not in process.cwd(). */
   cwd?: string;
   /** Explicit base revision. Same rule as TSC_BASE_REF, without reading the process environment. */
@@ -982,16 +983,30 @@ export function planRootCheck(input: {
   if (roots.length > TSC_GATE_ROOT_LIMIT) return { mode: 'full', fallbackReason: `루트 ${roots.length}개 > 상한 ${TSC_GATE_ROOT_LIMIT}`, roots: roots.length };
   return { mode: 'affected', roots, changedCount: gateChanged.size };
 }
-/**
- * K-OP-039 · 노하우를 «도구 출력»에 싣는 첫 조각(대표 2026-10-12 «어떤 에이전트가 와도 같은 수준»).
- * 승격된 전체 판정은 `apps/pwa/node_modules` 가 없으면 «가짜» PWA 타입 에러만 낸다 —
- * 10-12 하루 TC·UX 두 자리가 같은 가짜 TS2322(ChatMessage.tsx)로 코드를 고치려 했다.
- * 카드(내부 문서 `KNOWHOW` K-OP-039)의 처방 문면을 그대로 도구 출력에 싣는다.
- */
-const PWA_DEPS_MISSING_HINT = '환경: apps/pwa 의존성 없음 — (cd apps/pwa && bun install --frozen-lockfile) 뒤 재실행 · 코드 결함 아님(K-OP-039)';
+/** Target checkout first, then the installed CLI's top-level and nested dependencies. */
+export function resolveTscScript(cwd: string, scriptsDir = import.meta.dir, present: (path: string) => boolean = existsSync): string | undefined {
+  return [
+    join(cwd, 'node_modules/typescript/bin/tsc'),
+    join(scriptsDir, '../../typescript/bin/tsc'),
+    join(scriptsDir, '../node_modules/typescript/bin/tsc'),
+  ].find(present);
+}
+
+/** The installed compiler cannot resolve declarations from a checkout without its own dependencies. */
+export function missingCheckoutTypeDependencies(cwd: string, needsPwa = false, present: (path: string) => boolean = existsSync): string[] {
+  const missing: string[] = [];
+  if (!present(join(cwd, 'node_modules'))) missing.push('node_modules');
+  if (!present(join(cwd, 'node_modules/bun-types'))) missing.push('bun-types');
+  if (needsPwa && !present(join(cwd, 'apps/pwa/node_modules'))) missing.push('apps/pwa/node_modules');
+  return missing;
+}
 
 export function runGate(io: Partial<GateIo> = {}): void {
   const cwd = io.cwd ?? process.cwd();
+  const targetGit: GitRunner = (command, args, options) => execFileSync(command, args, { ...options, cwd, env: gitEnv() });
+  const targetPaths = (base: string) => changedPathPairs(base, targetGit);
+  const targetFile = (ref: string, path: string) => readGitFile(ref, path, targetGit);
+  const targetSource = (file: string) => readFileSync(join(cwd, file), 'utf8');
   const defaultChanged = () => changedTsFiles((cmd) => sh(cmd, cwd), process.env, cwd, io.baseRef);
   const defaultRunTsc = (cmd: string) => runTsc(cmd, ((command, options) => execSync(command, { ...options, cwd, env: tscExecEnv(options?.env) })) as typeof execSync);
   const { changedTsFiles: getChanged = defaultChanged, runTscCmd = defaultRunTsc, log = (message: string) => console.log(message), warn = (message: string) => console.warn(message), error = (message: string) => console.error(message), exit = ((code: number) => process.exit(code)) as GateIo['exit'] } = io;
@@ -999,10 +1014,10 @@ export function runGate(io: Partial<GateIo> = {}): void {
   // Set 주입은 기존 테스트 심이며 기준 revision이 없다. 실제 ChangedTsFiles 경로만 Git 관측을 요구한다.
   const requiredExportFields = io.requiredExportFields ?? ((changed: ReadonlySet<string>, base: string) => base === 'injected test seam'
     ? { fields: [], removedSymbols: [], parameterIncreases: [] }
-    : requiredExportFieldsInChanges(changed, base));
+    : requiredExportFieldsInChanges(changed, base, targetPaths(base), targetFile, targetSource));
   const literalUnionMembers = io.literalUnionMembers ?? ((changed: ReadonlySet<string>, base: string) => base === 'injected test seam'
     ? { additions: [] }
-    : exportedLiteralUnionMembersInChanges(changed, base));
+    : exportedLiteralUnionMembersInChanges(changed, base, targetPaths(base), targetFile, targetSource, () => repositoryTypeScriptSources(cwd)));
   const changedResult = getChanged();
   const { files: changed, base, baseSource, head, diffFiles, warnings = [], failures = [] } = changedResult instanceof Set
     ? { files: changedResult, base: 'injected test seam', baseSource: 'injected test seam', head: 'injected test seam', diffFiles: new Set<string>(), warnings: [], failures: [] }
@@ -1099,15 +1114,33 @@ export function runGate(io: Partial<GateIo> = {}): void {
   }, { level: 'info' });
   log(`[tsc-gate] root 설정 범위 ${rootScope.size}개 관측 (apps/pwa/** 제외).`);
   if (runsPwa) log(`[tsc-gate] PWA 설정 범위 ${pwaScope.size}개 관측.`);
-  // ⛔ K-OP-039: 승격된 전체 판정은 apps/pwa 의존성 없이는 «가짜» PWA 타입 에러만 낸다(환경 문제 · 코드 결함 아님).
-  //    그 오류를 내기 «전에» 이 한 줄로 멈춘다(환경 줄이 곧 마지막 줄 = 판정) — 의존성이 있으면 아래
-  //    판정 규칙·출력 형식은 기존 그대로다. «못 쟀다 ≠ 통과» — PWA 미측정을 통과로 접지 않는다.
-  if (wholeRepository && !existsSync(join(cwd, 'apps/pwa/node_modules'))) {
-    error(`[tsc-gate] ${PWA_DEPS_MISSING_HINT}`);
+  // K-OP-039: PWA checks without app dependencies produce fake type errors.
+  // The target checkout's declarations are required even when a compiler is
+  // supplied by the installed CLI or injected by another gate caller.
+  const missing = missingCheckoutTypeDependencies(cwd, runsPwa || wholeRepository);
+  if (missing.length > 0) {
+    const quotedCwd = `'${cwd.replaceAll("'", "'\\''")}'`;
+    const install = `cd ${quotedCwd} && bun install --frozen-lockfile${missing.includes('apps/pwa/node_modules') ? ' && (cd apps/pwa && bun install --frozen-lockfile)' : ''}`;
+    error(`[tsc-gate] ⛔ 대상 트리 타입 의존성 없음: ${missing.join(', ')} — ${install}`);
+    error('[tsc-gate] FAIL — 대상 의존성을 확인하지 못했다(설치본 tsc 존재 ≠ 대상 타입 검사 가능).');
     exit(1);
     return;
   }
-  const tscBin = existsSync(join(cwd, 'node_modules/.bin/tsc')) ? 'node_modules/.bin/tsc' : 'npx tsc';
+  // The .bin shim uses `#!/usr/bin/env node`. A LaunchAgent can have Bun but no
+  // node on PATH, so invoke the installed compiler with this process's absolute
+  // runtime instead. A missing dependency must fail the gate, never fetch via npx.
+  // Preserve the target checkout's compiler version when available. The
+  // installed CLI may resolve TypeScript from a sibling top-level node_modules
+  // or its own nested node_modules; verify each path before starting a child.
+  const tscScript = (io.resolveTscScript ?? resolveTscScript)(cwd);
+  if (!tscScript) {
+    error('[tsc-gate] ⛔ TypeScript 실행 파일 없음 — 대상 트리 또는 설치본에 bun install --frozen-lockfile 뒤 재실행하십시오.');
+    error('[tsc-gate] FAIL — tsc 를 실행하지 못했다(의존성 없음 ≠ 진단 0건).');
+    exit(1);
+    return;
+  }
+  const shellArg = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  const tscBin = `${shellArg(process.execPath)} ${shellArg(tscScript)}`;
   const baseline = readTestTypecheckBaseline(cwd);
   const rootCommand = `${tscBin} --noEmit -p ${TYPECHECK_GATE_CONFIG}`;
   const pwaCommand = `${tscBin} --noEmit -p apps/pwa/tsconfig.json`;

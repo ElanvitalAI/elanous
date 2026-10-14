@@ -4,6 +4,7 @@ import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFil
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { setUserConfigOverlay } from '../user-config.js';
 import { listCoordEvents } from '../context-bus/coord-events.js';
 import { openSurfaceEventsDb } from '../domains/surface-events.js';
 import { harnessScreenPath } from '../harness/harness-screen.js';
@@ -32,6 +33,7 @@ const previousHarnessSpaceId = process.env.ELANOUS_HARNESS_SPACE_ID;
 const stateDirs: string[] = [];
 
 afterEach(() => {
+  setUserConfigOverlay(null);
   if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
   else process.env.ELANOUS_STATE_DIR = previousStateDir;
   if (previousHarnessSpace === undefined) delete process.env.ELANOUS_HARNESS_SPACE;
@@ -570,6 +572,7 @@ describe('headless goal-loop child LLM selection', () => {
   const solModel = process.env.ELANOUS_SELFDEV_SOL_MODEL;
   const solProvider = process.env.ELANOUS_SELFDEV_SOL_PROVIDER;
   const solEffort = process.env.ELANOUS_SELFDEV_SOL_EFFORT;
+  const escalateChildEnv = process.env.ELANOUS_SELFDEV_ESCALATE_CHILD;
 
   afterEach(() => {
     if (parentProvider === undefined) delete process.env.ELANOUS_LLM_PROVIDER; else process.env.ELANOUS_LLM_PROVIDER = parentProvider;
@@ -578,6 +581,7 @@ describe('headless goal-loop child LLM selection', () => {
     if (solModel === undefined) delete process.env.ELANOUS_SELFDEV_SOL_MODEL; else process.env.ELANOUS_SELFDEV_SOL_MODEL = solModel;
     if (solProvider === undefined) delete process.env.ELANOUS_SELFDEV_SOL_PROVIDER; else process.env.ELANOUS_SELFDEV_SOL_PROVIDER = solProvider;
     if (solEffort === undefined) delete process.env.ELANOUS_SELFDEV_SOL_EFFORT; else process.env.ELANOUS_SELFDEV_SOL_EFFORT = solEffort;
+    if (escalateChildEnv === undefined) delete process.env.ELANOUS_SELFDEV_ESCALATE_CHILD; else process.env.ELANOUS_SELFDEV_ESCALATE_CHILD = escalateChildEnv;
   });
 
   test('미지정이면 기존 부모 선택 상속과 승격 env를 그대로 유지한다', async () => {
@@ -676,15 +680,67 @@ describe('headless goal-loop child LLM selection', () => {
     expect(kimi.ELANOUS_ESCALATE_MODEL).toBeUndefined();
   });
 
+  test('실제 자식 발사 경로가 config GLM 승급과 self-dev.rework 관측을 연결한다', async () => {
+    delete process.env.ELANOUS_SELFDEV_ESCALATE_CHILD;
+    setUserConfigOverlay(config => ({ ...config, tools: { ...config.tools, selfImplement: {
+      ...config.tools.selfImplement,
+      escalateChild: { 'openrouter/z-ai/glm-5.3': 'openrouter/anthropic/claude-sonnet-5.5' },
+    } } }));
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: Record<string, unknown>) => {
+      events.push({ category, event, data });
+    }) as never);
+    try {
+      const env = await captureChildEnv({ childLlm: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3', source: 'flag' }, escalateTier: 'sol' });
+      expect(env.ELANOUS_ESCALATE_MODEL).toBe('openrouter/anthropic/claude-sonnet-5.5');
+      expect(env.ELANOUS_ESCALATE_PROVIDER).toBe('openrouter');
+      expect(events.filter(e => e.category === 'self-dev.rework' && e.event === 'escalate-target').map(e => e.data))
+        .toEqual([{ source: 'config', from: 'openrouter/z-ai/glm-5.3', to: 'openrouter/anthropic/claude-sonnet-5.5', applied: true }]);
+    } finally { log.mockRestore(); }
+  });
+
+  test('실제 자식 발사에서 env 매핑이 config보다 우선하고 provider 밖 타깃은 다음 config 층으로 돌아간다', async () => {
+    const glm = 'openrouter/z-ai/glm-5.3';
+    const better = lookupLlmTierSpec('openrouter', 'better').model;
+    setUserConfigOverlay(config => ({ ...config, tools: { ...config.tools, selfImplement: {
+      ...config.tools.selfImplement, escalateChild: { [glm]: better },
+    } } }));
+    const events: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: Record<string, unknown>) => {
+      if (category === 'self-dev.rework' && event === 'escalate-target') events.push(data);
+    }) as never);
+    try {
+      process.env.ELANOUS_SELFDEV_ESCALATE_CHILD = `${glm}=openrouter/anthropic/claude-sonnet-5.5`;
+      const env = await captureChildEnv({ childLlm: { provider: 'openrouter', model: glm, source: 'flag' }, escalateTier: 'sol' });
+      expect(env.ELANOUS_ESCALATE_MODEL).toBe('openrouter/anthropic/claude-sonnet-5.5');
+      expect(events.at(-1)).toMatchObject({ source: 'env', from: glm, applied: true });
+      events.length = 0;
+      process.env.ELANOUS_SELFDEV_ESCALATE_CHILD = `${glm}=anthropic/claude-sonnet-5.5`;
+      const fallback = await captureChildEnv({ childLlm: { provider: 'openrouter', model: glm, source: 'flag' }, escalateTier: 'sol' });
+      expect(fallback.ELANOUS_ESCALATE_MODEL).toBe(better);
+      expect(events).toEqual([
+        { source: 'env', from: glm, to: 'anthropic/claude-sonnet-5.5', applied: false, reason: 'cross-provider' },
+        { source: 'config', from: glm, to: better, applied: true },
+      ]);
+    } finally { log.mockRestore(); }
+  });
+
   test('명시 childLlm 승격도 운영자의 SOL 환경 변수 덮어쓰기를 따른다', async () => {
     process.env.ELANOUS_SELFDEV_SOL_MODEL = 'configured-terra';
     process.env.ELANOUS_SELFDEV_SOL_PROVIDER = 'configured-codex';
     process.env.ELANOUS_SELFDEV_SOL_EFFORT = 'medium';
     // ⭐ 09-25 B9 뒤: 승급이 살아 있는 provider(grok)로 «덮어쓰기» 경로를 문다(anthropic 은 이제 승급 없음).
-    const env = await captureChildEnv({ childLlm: { provider: 'grok', model: 'grok-4.7', source: 'flag' }, escalateTier: 'opus' });
-    expect(env).toEqual(expect.objectContaining({
-      ELANOUS_ESCALATE_MODEL: 'configured-terra', ELANOUS_ESCALATE_PROVIDER: 'configured-codex', ELANOUS_ESCALATE_EFFORT: 'medium',
-    }));
+    const events: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: Record<string, unknown>) => {
+      if (category === 'self-dev.rework' && event === 'escalate-target') events.push(data);
+    }) as never);
+    try {
+      const env = await captureChildEnv({ childLlm: { provider: 'grok', model: 'grok-4.7', source: 'flag' }, escalateTier: 'opus' });
+      expect(env).toEqual(expect.objectContaining({
+        ELANOUS_ESCALATE_MODEL: 'configured-terra', ELANOUS_ESCALATE_PROVIDER: 'configured-codex', ELANOUS_ESCALATE_EFFORT: 'medium',
+      }));
+      expect(events).toEqual([{ source: 'env', from: 'grok-4.7', to: 'configured-terra', applied: true }]);
+    } finally { log.mockRestore(); }
   });
 
   test('미지정 childLlm의 기존 tier별 승격과 provider 키 릴레이는 보존된다 — codex·anthropic «밖»(grok 부모)', async () => {

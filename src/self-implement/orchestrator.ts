@@ -94,6 +94,7 @@ import { boundaryGlobs, boundaryViolations } from './goal-boundary.js';
 import { askAtExecution, type ExecutionClarificationResult } from './execution-clarification.js';
 import { classifyOutOfScope } from './scope-adjacency.js';
 import { targetScopedGoalText } from './goal-text-path-scope.js';
+import { declaredNewFilePaths } from './goal-new-paths.js';
 import { dropStaleReverts, type RevertGuardResult } from './revert-guard.js';
 import type { SelfDevGoalType } from '../self-dev/orchestrate.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE, gateGitResidue, observeGitResidue } from '../git-fs/worktree.js';
@@ -813,10 +814,8 @@ function parseDeclaredTargetPathsFromAsk(askText: string): { readable: boolean; 
   return { readable: true, paths: [...new Set(paths.filter(Boolean))] };
 }
 
-// SCOPE-NEW-FILES-LINE — 칸 문면은 새로 만들 파일을 «신설:» 줄로 따로 적는다(OP D칸 규칙). 그 줄도 선언 범위다.
+// SCOPE-NEW-FILES-LINE — 칸 문면의 신설 경로도 선언 범위다.
 //   10-11 FLEX-SIGNALS run-95799887: 칸이 적은 신설 파일 둘을 «범위 밖»으로 세어 구현을 보류했다.
-const DECLARED_NEW_FILES_LINE = /^\s*(?:신설|new\s*files?)\s*[:：]\s*(.*)$/i;
-
 function declaredPathsFromGoalDocumentText(document: string): { readable: boolean; paths: readonly string[] } {
   const originalAsk = extractVerbatimOriginalAsk(document)?.ask ?? null;
   if (originalAsk === null) return { readable: false, paths: [] };
@@ -824,13 +823,6 @@ function declaredPathsFromGoalDocumentText(document: string): { readable: boolea
   if (!declared.readable) return declared;
   const newFiles = declaredNewFilePaths(originalAsk);
   return newFiles.length > 0 ? { readable: true, paths: [...new Set([...declared.paths, ...newFiles])] } : declared;
-}
-
-function declaredNewFilePaths(askText: string): readonly string[] {
-  return askText.split(/\r?\n/).flatMap((line) => {
-    const match = DECLARED_NEW_FILES_LINE.exec(line);
-    return match ? parseDeclaredTargetPathsFromAsk(`대상 경로: ${match[1]}`).paths : [];
-  });
 }
 
 /** P3 전제의 경계 — ask 머리줄 «대상 경로:» ⊕ «신설:» 줄의 합집합. 못 읽으면 빈 목록(그때 P3 는 unknown). */
@@ -8263,6 +8255,7 @@ async function runSelfImplementInner(
     url: pr.url,
     number: pr.number,
     branch: wt.branch,
+    headCommit: runGitCommand(wt.path, ['rev-parse', '--verify', 'HEAD'], { encoding: 'utf8', timeout: 10_000 }).stdout.trim(),
     autoMerge: canAuto,
     autoReview: !!labels,
     ...(preparedPrBody.truncated ? { prBodyTruncated: true, prBodyOriginalChars: preparedPrBody.originalChars } : {}),

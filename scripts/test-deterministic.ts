@@ -30,10 +30,11 @@
 //     group. If group termination fails it falls back to the direct child and
 //     reports the failure.
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import * as ts from 'typescript';
 // The predicate lives in its own side-effect-free module so it can be tested:
 // importing THIS file used to spawn the suite at load time. The runner is now
 // behind `import.meta.main` / `runDeterministicTests()`, but the filter stays
@@ -79,9 +80,12 @@ const EXECUTION_ORIGIN_ENV_KEYS = [
 
 export type ShutdownSignal = 'SIGINT' | 'SIGTERM';
 
+export type NamePatternEvidence = { nameMissDiagnostic: boolean; passSummary: boolean; runSummary: boolean };
+
 export type DirectChild = {
   readonly pid?: number;
   readonly exited: Promise<number>;
+  readonly stderrEvidence?: Promise<NamePatternEvidence>;
   kill(signal?: number | NodeJS.Signals): boolean | void;
 };
 
@@ -93,6 +97,8 @@ export type SpawnDirectChild = (opts: {
   stdout: 'inherit';
   stderr: 'inherit';
   detached: true;
+  captureNoMatch?: boolean;
+  namePatterns?: string[];
 }) => DirectChild;
 
 export type KillProcessGroup = (pid: number, signal: NodeJS.Signals) => void;
@@ -113,6 +119,8 @@ export type DeterministicRunnerDeps = {
   argv?: string[];
   /** 시험이 파생을 갈아 끼울 자리 — 실물 rg 를 안 부르고 목록을 준다. */
   deriveCdpPatterns?: () => string[];
+  deriveMockModuleFiles?: () => string[];
+  deriveTestFiles?: () => string[];
   cwd?: string;
   tmpdir?: () => string;
   mkdtempSync?: (prefix: string) => string;
@@ -317,15 +325,68 @@ export function prepareIsolatedTestEnv(sourceEnv: NodeJS.ProcessEnv, testRoot: s
   return envLiteral(env);
 }
 
-const defaultSpawn: SpawnDirectChild = (opts) => Bun.spawn({
-  cmd: opts.cmd,
-  cwd: opts.cwd,
-  env: opts.env,
-  stdin: 'inherit',
-  stdout: 'inherit',
-  stderr: 'inherit',
-  detached: true,
-});
+/** Read every stderr line, retaining only Bun's verdict signals. A long test
+ * log must not become a second in-memory copy of the full output. */
+export async function scanNamePatternStderr(
+  stream: AsyncIterable<Uint8Array>, patterns: string[], forward: (chunk: Uint8Array) => void = () => {},
+): Promise<NamePatternEvidence> {
+    const evidence = { nameMissDiagnostic: false, passSummary: false, runSummary: false };
+    const decoder = new TextDecoder();
+    let pending = '';
+    let overflow = false;
+    const inspect = (line: string) => {
+      if (/^\s*[1-9]\d* pass$/.test(line)) evidence.passSummary = true;
+      if (/^Ran [1-9]\d* tests? across \d+ files?\. \[\d+(?:\.\d+)?ms\]$/.test(line)) evidence.runSummary = true;
+      for (const pattern of patterns) {
+        const prefix = `error: regex ${JSON.stringify(pattern)} matched 0 tests. Searched `;
+        if (line.startsWith(prefix)
+          && /^\d+ files? \(skipping \d+ tests?\) \[\d+(?:\.\d+)?ms\]$/.test(line.slice(prefix.length))) {
+          evidence.nameMissDiagnostic = true;
+        }
+      }
+    };
+    const feed = (text: string) => {
+      let start = 0;
+      while (start < text.length) {
+        const newline = text.indexOf('\n', start);
+        const part = text.slice(start, newline < 0 ? undefined : newline);
+        if (!overflow) {
+          if (pending.length + part.length > 4096) { pending = ''; overflow = true; }
+          else pending += part;
+        }
+        if (newline < 0) break;
+        if (!overflow) inspect(pending.endsWith('\r') ? pending.slice(0, -1) : pending);
+        pending = '';
+        overflow = false;
+        start = newline + 1;
+      }
+    };
+    for await (const chunk of stream) {
+      forward(chunk);
+      feed(decoder.decode(chunk, { stream: true }));
+    }
+    feed(decoder.decode());
+    if (!overflow) inspect(pending.endsWith('\r') ? pending.slice(0, -1) : pending);
+    return evidence;
+}
+
+const defaultSpawn: SpawnDirectChild = (opts) => {
+  const child = Bun.spawn({
+    cmd: opts.cmd,
+    cwd: opts.cwd,
+    env: opts.env,
+    stdin: 'inherit',
+    stdout: 'inherit',
+    stderr: opts.captureNoMatch ? 'pipe' : 'inherit',
+    detached: true,
+  });
+  if (!opts.captureNoMatch) return child;
+  const stderrEvidence = scanNamePatternStderr(
+    child.stderr as ReadableStream<Uint8Array>, opts.namePatterns ?? [],
+    (chunk) => process.stderr.write(chunk),
+  );
+  return { pid: child.pid, exited: child.exited, kill: (signal) => child.kill(signal), stderrEvidence };
+};
 
 export function installShutdownSignalGate(
   target: SignalTarget = process,
@@ -403,6 +464,357 @@ export function deriveCdpTestPatterns(deps: { spawnSync?: typeof Bun.spawnSync; 
     .sort();
 }
 
+// Keep both scans aligned with Bun's default test discovery (four name forms,
+// eight JavaScript/TypeScript extensions). A file absent from either list can
+// be silently skipped when a positional filter matches multiple test files.
+const BUN_TEST_EXTENSIONS = ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'mts', 'cts'];
+const BUN_TEST_GLOBS = BUN_TEST_EXTENSIONS.flatMap((ext) => [
+  `*.test.${ext}`, `*_test.${ext}`, `*.spec.${ext}`, `*_spec.${ext}`,
+]);
+const BUN_TEST_FILE_PATTERN = /(?:\.|_)(?:test|spec)\.(?:js|jsx|ts|tsx|mjs|cjs|mts|cts)$/;
+const BUN_EXPLICIT_TEST_FILE_PATTERN = /\.(?:js|jsx|ts|tsx|mjs|cjs|mts|cts)$/;
+
+const MOCK_SCAN_OPTIONS: ts.CompilerOptions = {
+  allowJs: true, noResolve: true, noLib: true, jsx: ts.JsxEmit.Preserve,
+};
+
+function bunTestScriptKind(file: string): ts.ScriptKind {
+  if (file.endsWith('.jsx')) return ts.ScriptKind.JSX;
+  if (file.endsWith('.tsx')) return ts.ScriptKind.TSX;
+  if (file.endsWith('.js') || file.endsWith('.mjs') || file.endsWith('.cjs')) return ts.ScriptKind.JS;
+  return ts.ScriptKind.TS; // .ts, .mts, .cts
+}
+
+function sourceHasModuleMockCall(tree: ts.SourceFile): boolean {
+  let found = false;
+  const unwrap = (expression: ts.Expression): ts.Expression => {
+    while (ts.isParenthesizedExpression(expression)) expression = expression.expression;
+    return expression;
+  };
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (ts.isCallExpression(node)) {
+      const callee = unwrap(node.expression);
+      if (ts.isPropertyAccessExpression(callee)) {
+        const receiver = unwrap(callee.expression);
+        if (ts.isIdentifier(receiver) && receiver.text === 'mock' && callee.name.text === 'module') {
+          found = true;
+          return;
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(tree);
+  return found;
+}
+
+/** Use public syntactic diagnostics; TypeScript's parseDiagnostics field is
+ * internal and absent from SourceFile's public type. */
+function scanMockCallBatch(files: string[]): boolean[] {
+  const roots = new Set(files.map((file) => resolve(file)));
+  const host = ts.createCompilerHost(MOCK_SCAN_OPTIONS);
+  host.getSourceFile = (file, languageVersion) => {
+    if (!roots.has(resolve(file))) return undefined;
+    try {
+      return ts.createSourceFile(file, readFileSync(file, 'utf8'), languageVersion, true, bunTestScriptKind(file));
+    } catch { return undefined; }
+  };
+  const program = ts.createProgram(files, MOCK_SCAN_OPTIONS, host);
+  return files.map((file) => {
+    const tree = program.getSourceFile(file);
+    return !tree || program.getSyntacticDiagnostics(tree).length > 0 || sourceHasModuleMockCall(tree);
+  });
+}
+
+function hasModuleMockCall(source: string, file: string): boolean {
+  const host = ts.createCompilerHost(MOCK_SCAN_OPTIONS);
+  host.getSourceFile = (name, languageVersion) => resolve(name) === resolve(file)
+    ? ts.createSourceFile(name, source, languageVersion, true, bunTestScriptKind(file)) : undefined;
+  const program = ts.createProgram([file], MOCK_SCAN_OPTIONS, host);
+  const tree = program.getSourceFile(file);
+  return !tree || program.getSyntacticDiagnostics(tree).length > 0 || sourceHasModuleMockCall(tree);
+}
+
+/** Parse every Bun-discovered test: text search misses valid calls with a
+ * comment between `mock` and `.module`. An extra solo file costs time, while a
+ * missed call can contaminate every later file in the Bun process. */
+export function deriveMockModuleTestFiles(deps: { spawnSync?: typeof Bun.spawnSync; cwd?: string } = {}): string[] {
+  const cwd = deps.cwd ?? process.cwd();
+  const files = deriveTestFiles({ spawnSync: deps.spawnSync, cwd });
+  const mocks: string[] = [];
+  // A bounded program keeps the public syntax check below 600 MB on the
+  // current repository, rather than retaining all 5,836 ASTs at once.
+  for (let index = 0; index < files.length; index += 100) {
+    const batch = files.slice(index, index + 100);
+    const matched = scanMockCallBatch(batch.map((file) => resolve(cwd, file)));
+    for (let offset = 0; offset < batch.length; offset++) if (matched[offset]) mocks.push(batch[offset]!);
+  }
+  return mocks.sort();
+}
+
+export function deriveTestFiles(deps: { spawnSync?: typeof Bun.spawnSync; cwd?: string } = {}): string[] {
+  const run = deps.spawnSync ?? Bun.spawnSync;
+  const result = run({
+    cmd: ['rg', '--files', ...BUN_TEST_GLOBS.flatMap((glob) => ['--glob', glob])],
+    cwd: deps.cwd ?? process.cwd(),
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  // rg --files exits 1 for a valid directory with no matching test files.
+  if (result.exitCode !== 0 && result.exitCode !== 1) {
+    throw new Error(`test file scan failed (exit ${result.exitCode}): ${decodeSpawnOutput(result.stderr).trim()}`);
+  }
+  return decodeSpawnOutput(result.stdout).split('\n').map((line) => line.trim()).filter((line) => BUN_TEST_FILE_PATTERN.test(line));
+}
+
+// Bun accepts both `--flag=value` and `--flag value`. The value of a test
+// option is never a file selector, even when it happens to match a file name.
+// Audited against `bun --help` and `bun test --help` in Bun 1.4.2. Bun accepts
+// these global value options after `test` too. Missing one makes its value look
+// like a path selector, which disables the default CDP exclusion.
+const BUN_TEST_VALUE_OPTIONS = new Set([
+  '--elide-lines', '-F', '--filter', '--shell', '--watch-kill-signal',
+  '--preload', '-r', '--require', '--import', '--inspect', '--inspect-wait', '--inspect-brk',
+  '--cpu-prof-name', '--cpu-prof-dir', '--cpu-prof-interval',
+  '--heap-prof-name', '--heap-prof-dir', '--heap-prof-interval',
+  '--install', '--eval', '-e', '--print', '-p', '--port', '--conditions',
+  '--fetch-preconnect', '--max-http-header-size', '--dns-result-order',
+  '--redirect-warnings', '--disable-warning', '--title', '--unhandled-rejections',
+  '--console-depth', '--user-agent', '--cron-title', '--cron-period', '--main-fields',
+  '--extension-order', '--tsconfig-override', '--define', '-d', '--drop', '--feature',
+  '--loader', '-l', '--jsx-factory', '--jsx-fragment', '--jsx-import-source',
+  '--jsx-runtime', '--env-file', '--cwd', '--config', '-c',
+  // `bun test --help` values:
+  '--timeout', '--rerun-each', '--retry', '--seed', '--coverage-reporter',
+  '--coverage-dir', '--test-name-pattern', '-t', '--reporter',
+  '--reporter-outfile', '--max-concurrency', '--path-ignore-patterns',
+  '--parallel-delay', '--shard',
+  // `bun test --timings file.test.ts` reads file.test.ts as timing JSON and
+  // errors if it contains test code; it does not treat the file as a selector.
+  '--timings',
+]);
+export function partitionBunTestArguments(argv: string[]): { selectors: string[]; soloArgs: string[] } {
+  const selectors: string[] = [];
+  const soloArgs: string[] = [];
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index]!;
+    if (arg === '--') {
+      soloArgs.push(arg);
+      selectors.push(...argv.slice(index + 1));
+      break;
+    }
+    if (!arg.startsWith('-')) {
+      selectors.push(arg);
+      continue;
+    }
+    soloArgs.push(arg);
+    if (arg.includes('=')) continue;
+    const next = argv[index + 1];
+    // Bun 1.4.2 reads `--bail 2`, `--parallel 2`, and `--changed HEAD` as
+    // positional filters. Their optional values require `--flag=value`.
+    if (next !== undefined && BUN_TEST_VALUE_OPTIONS.has(arg)) {
+      soloArgs.push(next);
+      index++;
+    }
+  }
+  return { selectors, soloArgs };
+}
+
+function bunTestOptionTokens(argv: string[]): string[] {
+  const options: string[] = [];
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index]!;
+    if (arg === '--') break;
+    if (!arg.startsWith('-')) continue;
+    options.push(arg);
+    if (!arg.includes('=') && BUN_TEST_VALUE_OPTIONS.has(arg) && argv[index + 1] !== undefined) index++;
+  }
+  return options;
+}
+
+function bunTestOptionValues(argv: string[], name: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index]!;
+    if (arg === '--') break;
+    if (arg === name && argv[index + 1] !== undefined) values.push(argv[index + 1]!);
+    else if (arg.startsWith(`${name}=`)) values.push(arg.slice(name.length + 1));
+    if (!arg.includes('=') && BUN_TEST_VALUE_OPTIONS.has(arg) && argv[index + 1] !== undefined) index++;
+  }
+  return values;
+}
+
+/** Bun applies the final --cwd against the process launch directory, not a
+ * previous --cwd. Use the same root for discovery as the child test runner. */
+export function effectiveTestCwd(argv: string[], launchCwd: string): string {
+  let testCwd = launchCwd;
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index]!;
+    if (arg === '--') break;
+    if (arg.startsWith('--cwd=')) {
+      testCwd = resolve(launchCwd, arg.slice('--cwd='.length));
+    } else if (arg === '--cwd' && argv[index + 1] !== undefined) {
+      testCwd = resolve(launchCwd, argv[++index]!);
+    } else if (BUN_TEST_VALUE_OPTIONS.has(arg)) {
+      index++;
+    }
+  }
+  return testCwd;
+}
+
+/** rg intentionally honors ignore rules, but Bun can execute an explicit
+ * ignored or outside-repository test file. Inspect those paths directly. */
+export function classifyExplicitTestFiles(argv: string[], cwd: string): { files: string[]; mockFiles: string[] } {
+  const files: string[] = [];
+  const mockFiles: string[] = [];
+  for (const selector of partitionBunTestArguments(argv).selectors) {
+    const absolute = resolve(cwd, selector);
+    // Bun treats an unsuffixed `test/custom.ts` as a name filter, while
+    // `./test/custom.ts` and absolute paths explicitly select that file.
+    const explicitFilePath = BUN_TEST_FILE_PATTERN.test(absolute)
+      || selector.startsWith('./') || selector.startsWith('../') || isAbsolute(selector);
+    let candidates: string[] = [];
+    let isDirectory = false;
+    try {
+      const stats = statSync(absolute);
+      isDirectory = stats.isDirectory();
+      if (stats.isFile() && explicitFilePath && BUN_EXPLICIT_TEST_FILE_PATTERN.test(absolute)) candidates = [absolute];
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      // A file Bun may open but our classifier cannot read must run alone.
+      candidates = explicitFilePath && BUN_EXPLICIT_TEST_FILE_PATTERN.test(absolute) ? [absolute] : [];
+    }
+    // A failed directory scan must stop planning; it cannot certify that a
+    // selected directory contains no ordinary tests.
+    if (isDirectory) candidates = deriveTestFiles({ cwd: absolute }).map((file) => resolve(absolute, file));
+    for (const candidate of candidates) {
+      const rel = relative(cwd, candidate);
+      // Bun discovers a custom.ts passed by absolute path, but treats bare
+      // `test/custom.ts` as a name filter rather than an explicit file path.
+      const file = rel.startsWith('..') || isAbsolute(rel) || !BUN_TEST_FILE_PATTERN.test(candidate)
+        ? candidate : rel;
+      files.push(file);
+      try {
+        if (hasModuleMockCall(readFileSync(candidate, 'utf8'), candidate)) mockFiles.push(file);
+      } catch {
+        mockFiles.push(file);
+      }
+    }
+  }
+  return { files: [...new Set(files)], mockFiles: [...new Set(mockFiles)] };
+}
+
+function replaceBulkSelectors(argv: string[], replacement: (selector: string) => string[]): string[] {
+  const result: string[] = [];
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index]!;
+    if (arg === '--') {
+      result.push(arg, ...argv.slice(index + 1).flatMap(replacement));
+      break;
+    }
+    if (arg.startsWith('-')) {
+      result.push(arg);
+      if (BUN_TEST_VALUE_OPTIONS.has(arg) && argv[index + 1] !== undefined) result.push(argv[++index]!);
+    } else {
+      result.push(...replacement(arg));
+    }
+  }
+  return result;
+}
+
+/** Return one bulk command and one command per selected global module mock. */
+export function planDeterministicTestCommands(
+  argv: string[], cdpPatterns: string[], mockFiles: string[], allTestFiles: string[] = [], testCwd = process.cwd(),
+): string[][] {
+  const { selectors: pathArgs, soloArgs } = partitionBunTestArguments(argv);
+  const explicitPaths = pathArgs.length > 0;
+  const directory = (selector: string): string | undefined => {
+    const path = resolve(testCwd, selector);
+    try { return statSync(path).isDirectory() ? path : undefined; } catch { return undefined; }
+  };
+  const insideDirectory = (file: string, path: string): boolean => {
+    const absolute = resolve(testCwd, file);
+    return absolute.startsWith(path + sep);
+  };
+  const discoveredPaths = new Set(allTestFiles.map((file) => resolve(testCwd, file)));
+  const isExact = (selector: string): boolean => discoveredPaths.has(resolve(testCwd, selector));
+  const matchesSelector = (file: string, selector: string): boolean => {
+    const dir = directory(selector);
+    if (dir) return insideDirectory(file, dir);
+    return isExact(selector)
+      ? resolve(testCwd, file) === resolve(testCwd, selector)
+      : file.includes(selector.replace(/^\.\//, ''));
+  };
+  const callerIgnoreGlobs = bunTestOptionValues(argv, '--path-ignore-patterns').map((pattern) => new Bun.Glob(pattern));
+  const selectedMocks = mockFiles.filter((file) => !cdpPatterns.includes(file)
+    && !callerIgnoreGlobs.some((glob) => glob.match(file) || glob.match(resolve(testCwd, file)))
+    && (!explicitPaths || pathArgs.some((selector) => matchesSelector(file, selector))));
+  if (selectedMocks.length === 0) {
+    return [['bun', 'test', ...cdpPatterns.flatMap((pattern) => ['--path-ignore-patterns', pattern]), ...argv]];
+  }
+  const globalBail = !explicitPaths && bunTestOptionTokens(argv).some((arg) =>
+    arg === '--bail' || arg === '--bail=1');
+  if ((explicitPaths && pathArgs.every((selector) =>
+    allTestFiles.some((file) => matchesSelector(file, selector))))
+    || (globalBail && allTestFiles.length > 0)) {
+    // Bun runs selected files in path order, regardless of selector order.
+    // Keep the ordinary files in contiguous bulk runs around solo mock files;
+    // this also preserves which file a global --bail stops on.
+    const files = allTestFiles.filter((file) => (explicitPaths
+      ? pathArgs.some((selector) => matchesSelector(file, selector))
+      : !cdpPatterns.includes(file))
+      && !callerIgnoreGlobs.some((glob) => glob.match(file) || glob.match(resolve(testCwd, file))))
+      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+    const commands: string[][] = [];
+    let ordinary: string[] = [];
+    const flushOrdinary = () => {
+      if (ordinary.length > 0) commands.push(['bun', 'test', ...soloArgs, ...ordinary]);
+      ordinary = [];
+    };
+    for (const file of files) {
+      if (selectedMocks.includes(file)) {
+        flushOrdinary();
+        commands.push(['bun', 'test', ...soloArgs, file]);
+      } else ordinary.push(file);
+    }
+    flushOrdinary();
+    return commands;
+  }
+  const exactMockSelector = (selector: string): boolean => isExact(selector)
+    && allTestFiles.some((file) => resolve(testCwd, file) === resolve(testCwd, selector))
+    && selectedMocks.some((file) => resolve(testCwd, file) === resolve(testCwd, selector));
+  // Remove selected exact mock arguments from bulk so each runs in its own
+  // process. Caller ignore globs are applied above before this selection.
+  const replacement = (selector: string): string[] => {
+    const dir = directory(selector);
+    if (dir) {
+      const matched = allTestFiles.filter((file) => insideDirectory(file, dir));
+      return matched.length === 0 ? [selector] : matched.filter((file) => !selectedMocks.includes(file));
+    }
+    if (exactMockSelector(selector)) return [];
+    const matched = allTestFiles.filter((file) => matchesSelector(file, selector));
+    // A partial path selector can select only mock files. In that case Bun's
+    // bulk child has no tests after exclusion, so leave the selector to solo.
+    // Unknown selectors stay in bulk to preserve Bun's no-tests failure.
+    return matched.length > 0 && matched.every((file) => selectedMocks.includes(file)) ? [] : [selector];
+  };
+  const bulkSelectors = pathArgs.flatMap(replacement);
+  const skipBulk = explicitPaths && bulkSelectors.length === 0;
+  const bulkArgv = replaceBulkSelectors(argv, replacement);
+  const bulk = skipBulk ? [] : [[
+    'bun', 'test',
+    ...[...new Set([...cdpPatterns, ...selectedMocks])].flatMap((pattern) => ['--path-ignore-patterns', pattern]),
+    // With only a name pattern, ordinary tests may match zero names while a
+    // solo mock child still matches. There is no path selector to validate.
+    ...(!explicitPaths && selectedMocks.length > 0 && !bunTestOptionTokens(argv).some((arg) =>
+      arg === '--test-name-pattern' || arg.startsWith('--test-name-pattern=') || arg === '-t' || arg.startsWith('-t='))
+      ? ['--pass-with-no-tests'] : []),
+    ...bulkArgv,
+  ]];
+  return [...bulk, ...selectedMocks.map((file) => ['bun', 'test', ...soloArgs, file])];
+}
+
 export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}): Promise<number> {
   const makeTemp = deps.mkdtempSync ?? mkdtempSync;
   const tempBase = deps.tmpdir ?? tmpdir;
@@ -454,11 +866,63 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
     }
   };
   // ⛔ 사람이 «경로»를 직접 준 창에서는 아무것도 빼지 않는다 — 그 창은 「이것만 돌려라」다.
-  const explicitPaths = argv.some((arg) => !arg.startsWith('-'));
-  const cdpPatterns = explicitPaths ? [] : (deps.deriveCdpPatterns ?? deriveCdpTestPatterns)();
-  const ignoreArgs = cdpPatterns.flatMap((pattern) => ['--path-ignore-patterns', pattern]);
+  const explicitPaths = partitionBunTestArguments(argv).selectors.length > 0;
+  const fullBail = !explicitPaths && bunTestOptionTokens(argv).some((arg) =>
+    arg === '--bail' || arg === '--bail=1');
+  const testCwd = effectiveTestCwd(argv, cwd);
+  const cdpPatterns = explicitPaths ? [] : (deps.deriveCdpPatterns ?? (() => deriveCdpTestPatterns({ cwd: testCwd })))();
+  const explicitFiles = classifyExplicitTestFiles(argv, testCwd);
+  const mockFiles = [...new Set([...(deps.deriveMockModuleFiles ?? (() => deriveMockModuleTestFiles({ cwd: testCwd })))(), ...explicitFiles.mockFiles])];
+  const allTestFiles = (explicitPaths || fullBail) && mockFiles.length > 0
+    ? [...new Set([...(deps.deriveTestFiles ?? (() => deriveTestFiles({ cwd: testCwd })))(), ...explicitFiles.files])]
+    : [];
+  let commands = planDeterministicTestCommands(argv, cdpPatterns, mockFiles, allTestFiles, testCwd);
+  const optionTokens = bunTestOptionTokens(argv);
+  // Bun writes these outputs to one caller-selected file. Separate children
+  // would overwrite each other, so preserve the caller's single-process run.
+  const sharedOutput = optionTokens.some((arg) => arg === '--reporter-outfile' || arg.startsWith('--reporter-outfile='))
+    || bunTestOptionValues(argv, '--coverage-reporter').some((value) => value.split(',').includes('lcov'))
+    || (optionTokens.includes('--update-timings') && bunTestOptionValues(argv, '--timings').length > 0);
+  const sharedOutputFallback = commands.length > 1 && sharedOutput;
+  if (sharedOutputFallback) {
+    report('[test-deterministic] 공유 파일 출력 옵션: mock.module 분리를 끄고 단일 Bun 시험 프로세스로 실행한다.');
+    commands = [['bun', 'test', ...cdpPatterns.flatMap((pattern) => ['--path-ignore-patterns', pattern]), ...argv]];
+  }
+  const namePatterns = [
+    ...bunTestOptionValues(argv, '--test-name-pattern'),
+    ...bunTestOptionValues(argv, '-t'),
+  ];
+  const captureNoMatch = commands.length > 1 && namePatterns.length > 0;
+  if (captureNoMatch && explicitPaths && !optionTokens.includes('--pass-with-no-tests')) {
+    // Internal --pass-with-no-tests may only neutralize a valid file whose
+    // test name missed. It must not turn a nonexistent file filter into pass.
+    const unmatched = partitionBunTestArguments(argv).selectors.find((selector) => {
+      const path = resolve(testCwd, selector);
+      let isDirectory = false;
+      try { isDirectory = statSync(path).isDirectory(); } catch { /* a Bun substring filter may still match */ }
+      return !allTestFiles.some((file) => {
+        const absolute = resolve(testCwd, file);
+        return isDirectory ? absolute.startsWith(path + sep)
+          : absolute === path || file.includes(selector.replace(/^\.\//, ''));
+      });
+    });
+    if (unmatched !== undefined) {
+      report(`[test-deterministic] test selector matched no files: ${unmatched}`);
+      return 1;
+    }
+  }
+  const hasShard = optionTokens.some((arg) => arg === '--shard' || arg.startsWith('--shard='));
+  const bailArgs = optionTokens.filter((arg) => arg === '--bail' || arg.startsWith('--bail='));
+  const stopOnFirstFailure = bailArgs.length > 0 && bailArgs.every((arg) => arg === '--bail' || arg === '--bail=1');
+  if (commands.length > 1 && (hasShard || (bailArgs.length > 0 && !stopOnFirstFailure))) {
+    report('[test-deterministic] --shard 또는 --bail=1 이외의 실패 한도는 여러 시험 프로세스에서 전역 의미를 보존할 수 없다.');
+    return 1;
+  }
   if (cdpPatterns.length > 0) {
     report(`[test-deterministic] CDP 시험 ${cdpPatterns.length}개 파일을 뺐다 — bun run test:cdp 로 돈다 (파생: requireCdpBase 직접 import ⊕ 포트 9333 직접 사용).`);
+  }
+  if (!sharedOutputFallback && commands.some((cmd) => mockFiles.includes(cmd.at(-1) ?? ''))) {
+    report('[test-deterministic] mock.module 시험 파일을 각자 단독 프로세스로 실행한다.');
   }
 
   let testRoot: string | undefined;
@@ -480,30 +944,47 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
       : installShutdownSignalGate(deps.signalTarget ?? process, deps.onAbsorbSignal);
     const signalPromise = deps.waitForSignal ? deps.waitForSignal() : gate!.received;
 
-    child = spawn({
-      cmd: ['bun', 'test', ...ignoreArgs, ...argv],
-      cwd: deps.cwd ?? process.cwd(),
-      env,
-      stdin: 'inherit',
-      stdout: 'inherit',
-      stderr: 'inherit',
-      detached: true,
-    });
+    let exitCode = 0;
+    let sawNameMatch = false;
+    let sawNameMiss = false;
+    for (const cmd of commands) {
+      // With a name filter, Bun gives an unmatched child exit 0 only with this
+      // flag. A real failed test still exits nonzero; aggregate matches below.
+      const childCmd = captureNoMatch && !cmd.includes('--pass-with-no-tests')
+        ? [cmd[0]!, cmd[1]!, '--pass-with-no-tests', ...cmd.slice(2)] : cmd;
+      child = spawn({
+        cmd: childCmd,
+        cwd,
+        env,
+        stdin: 'inherit',
+        stdout: 'inherit',
+        stderr: 'inherit',
+        detached: true,
+        captureNoMatch,
+        namePatterns,
+      });
 
-    const childExit = child.exited.then(
-      (code) => ({ kind: 'exit' as const, code }),
-      (error) => ({ kind: 'error' as const, error }),
-    );
-    const outcome = await Promise.race([
-      childExit,
-      signalPromise.then((signal) => ({ kind: 'signal' as const, signal })),
-    ]);
+      const childExit = child.exited.then(
+        (code) => ({ kind: 'exit' as const, code }),
+        (error) => ({ kind: 'error' as const, error }),
+      );
+      const outcome = await Promise.race([
+        childExit,
+        signalPromise.then((signal) => ({ kind: 'signal' as const, signal })),
+      ]);
 
-    if (outcome.kind === 'error') {
-      throw outcome.error;
-    }
+      if (outcome.kind === 'error') throw outcome.error;
+      if (outcome.kind === 'exit') {
+        const evidence = await child.stderrEvidence;
+        const passedTests = evidence?.passSummary && evidence.runSummary;
+        if (captureNoMatch && evidence?.nameMissDiagnostic && !passedTests && outcome.code === 0) sawNameMiss = true;
+        else if (outcome.code === 0) sawNameMatch = true;
+        else exitCode = outcome.code ?? 1;
+        child = undefined;
+        if (exitCode !== 0 && stopOnFirstFailure) break;
+        continue;
+      }
 
-    if (outcome.kind === 'signal') {
       await terminateDirectChild(child, outcome.signal, {
         graceMs: deps.childGraceMs,
         report,
@@ -525,10 +1006,12 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
       }
       return 1;
     }
+    if (sawNameMiss && !sawNameMatch && exitCode === 0
+      && !optionTokens.includes('--pass-with-no-tests')) exitCode = 1;
 
     cleanupRoot();
     checkConfig();
-    return configChanged ? 1 : (outcome.code ?? 1);
+    return configChanged ? 1 : exitCode;
   } catch (error) {
     if (child) {
       try {

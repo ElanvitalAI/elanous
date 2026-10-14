@@ -1,0 +1,23 @@
+# 1판: tasks hand 가 이 조합을 고르되 러너로 실행하지 않는다.
+# make-code 단위가 준비되고 실물 code-pr 완주·재개 시험이 끝날 때까지 harness say 가 실행 주인이다.
+graph_id: work-code-pr
+version: 1
+launcher: harness-say
+entry_node: make-code
+terminal_nodes: [done, needs-human, failed]
+nodes:
+  - node_id: make-code
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: make-code@1
+    covers: [research, decide, make, verify, execute]
+    budget: { inner_steps: 20 }
+    contract: { inputs: [ask, context, prior], tools: harness-say, outputs: [result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: needs-human, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - from: make-code
+    on: outcome
+    map: { done: done, rework: needs-human, needs-human: needs-human, failed: needs-human }

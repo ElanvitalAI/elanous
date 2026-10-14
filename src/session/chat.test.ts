@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type { LLMMessage, LLMOpts, LLMProvider, LLMToolSpec, StreamWithToolsHandlers } from '../llm.js';
 import type { CoreTurnDispatchTool } from '../core-turn/index.js';
 import { PTY_BUDGET_GRANT, TERMINAL_MISSION_DISCIPLINE } from '../agent/terminal-surface.js';
+import * as actualMemory from '../memory.js';
 
 const streamCalls: Array<{
   messages: LLMMessage[];
@@ -16,6 +17,7 @@ const OMIT_DISPATCH_CTX = Symbol('omit-dispatch-ctx');
 let nextDispatchCtx: unknown = OMIT_DISPATCH_CTX;
 
 mock.module('../memory.js', () => ({
+  ...actualMemory,
   buildMemoryInjection: () => ({ block: '', injectedIds: [] }),
   buildMemoryInjectionLLM: async () => ({ block: '', injectedIds: [] }),
 }));

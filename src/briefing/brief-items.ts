@@ -49,6 +49,15 @@ export interface AddBriefItem {
   dedupeWithinMs?: number;
 }
 
+export interface BriefTelegramFeedback {
+  botId: string;
+  chatId: number;
+  messageId: number;
+  updateId: string;
+  reaction: BriefReaction;
+  itemId?: number;
+}
+
 export interface BriefItemsOptions {
   stateDir?: string;
   now?: () => Date;
@@ -112,7 +121,11 @@ export function composeBriefMarkdown(items: readonly BriefItem[], slot: BriefSlo
 }
 
 /** The ids are exactly the rows represented by the composed page, after deduplication. */
-export function composeBriefPage(items: readonly BriefItem[], slot: BriefSendSlot, now: Date): { markdown: string; ids: number[] } {
+export function composeBriefPage(
+  items: readonly BriefItem[], slot: BriefSendSlot, now: Date,
+  actions?: BriefWeeklyActions,
+  observedKinds?: ReadonlySet<BriefDomain>,
+): { markdown: string; ids: number[] } {
   const today = dateKey(now, { timeZone: KST });
   // A duplicate left out of a delivered page stays unsent in the ledger, but must not reappear on a later page.
   // A new undeliverable observation after a sent page is a new occurrence, not an old duplicate.
@@ -138,11 +151,22 @@ export function composeBriefPage(items: readonly BriefItem[], slot: BriefSendSlo
     for (const item of decisions) lines.push(itemLine(item));
     lines.push('');
   }
-  for (const domain of BRIEF_DOMAINS) {
+  const domains = [...BRIEF_DOMAINS];
+  // Measured action leads. An unobserved kind keeps its normal position; a sent-but-unobserved
+  // item is not evidence of being ignored. Keep every domain heading in this first slice.
+  if (actions && Object.values(actions.byKind).some(count => count.acted > 0)) {
+    domains.sort((a, b) => {
+      const x = actions.byKind[a], y = actions.byKind[b];
+      const xRate = observedKinds?.has(a) ? x.rate : 0;
+      const yRate = observedKinds?.has(b) ? y.rate : 0;
+      return yRate - xRate || BRIEF_DOMAINS.indexOf(a) - BRIEF_DOMAINS.indexOf(b);
+    });
+  }
+  for (const domain of domains) {
     const group = unique.filter(item => item.domain === domain && !decisionIds.has(item.id));
     if (group.length === 0) continue;
     lines.push(`## ${domain}`, '');
-    for (const item of group.sort((a, b) => a.id - b.id)) lines.push(itemLine(item));
+    for (const item of group) lines.push(itemLine(item));
     lines.push('');
   }
   return { markdown: `${lines.join('\n').trimEnd()}\n`, ids: unique.map(item => item.id) };
@@ -203,12 +227,12 @@ export class BriefItemsLedger {
     this.requirementFunnel = options.requirementFunnel ?? ((now) => readRequirementFunnel({ stateDir: options.stateDir, now }));
   }
 
-  private using<T>(work: (db: Database) => T): T {
+  private using<T>(work: (db: Database) => T, busyTimeoutMs = 10000): T {
     mkdirSync(dirname(this.path), { recursive: true });
     const db = new Database(this.path, { create: true, strict: true });
     try {
       chmodSync(this.path, 0o600);
-      db.exec('PRAGMA busy_timeout = 10000');
+      db.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
       migrateLegacyItems(db, this.log);
       db.exec(`CREATE TABLE IF NOT EXISTS items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -237,7 +261,20 @@ export class BriefItemsLedger {
         reacted_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS reactions_item_time ON reactions(item_id, reacted_at);
-      CREATE INDEX IF NOT EXISTS sends_time ON sends(sent_at);`);
+      CREATE INDEX IF NOT EXISTS sends_time ON sends(sent_at);
+      CREATE TABLE IF NOT EXISTS telegram_sends (
+        bot_id TEXT NOT NULL,
+        chat_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL,
+        item_id INTEGER NOT NULL REFERENCES items(id),
+        PRIMARY KEY (bot_id, chat_id, message_id, item_id)
+      );
+      CREATE TABLE IF NOT EXISTS telegram_feedback_events (
+        bot_id TEXT NOT NULL,
+        chat_id INTEGER NOT NULL,
+        update_id TEXT NOT NULL,
+        PRIMARY KEY (bot_id, chat_id, update_id)
+      );`);
       if (!(db.query("SELECT name FROM pragma_table_info('items')").all() as { name: string }[]).some(column => column.name === 'dedupe_key')) {
         db.exec('ALTER TABLE items ADD COLUMN dedupe_key TEXT');
       }
@@ -318,34 +355,72 @@ export class BriefItemsLedger {
     this.log('briefing.items', 'reaction-recorded', { itemId, reaction });
   }
 
+  /** Attribute one update to an item in its delivered Telegram message, without rewriting send history. */
+  recordTelegramFeedback(event: BriefTelegramFeedback): boolean {
+    if (!event.botId || !Number.isSafeInteger(event.chatId) || !Number.isSafeInteger(event.messageId)
+      || event.messageId < 1 || !event.updateId || !(BRIEF_REACTIONS as readonly string[]).includes(event.reaction)) {
+      throw new BriefItemsInputError('invalid telegram feedback');
+    }
+    if (event.itemId !== undefined && (!Number.isSafeInteger(event.itemId) || event.itemId < 1)) {
+      throw new BriefItemsInputError('invalid item id');
+    }
+    const recorded = this.using(db => {
+      // Wait for an in-flight brief send before looking up its coordinates. A deferred read
+      // could see the pre-send snapshot and discard an early callback as unmatched.
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const linked = db.query('SELECT item_id FROM telegram_sends WHERE bot_id = ? AND chat_id = ? AND message_id = ? ORDER BY item_id')
+          .all(event.botId, event.chatId, event.messageId) as Array<{ item_id: number }>;
+        const targets = event.itemId === undefined ? (linked.length === 1 ? linked : []) : linked.filter(row => row.item_id === event.itemId);
+        if (targets.length !== 1) { db.exec('COMMIT'); return false; }
+        if (!db.query('INSERT OR IGNORE INTO telegram_feedback_events (bot_id, chat_id, update_id) VALUES (?, ?, ?) RETURNING update_id')
+          .get(event.botId, event.chatId, event.updateId)) { db.exec('COMMIT'); return false; }
+        db.query('INSERT INTO reactions (item_id, reaction, reacted_at) VALUES (?, ?, ?)')
+          .run(targets[0]!.item_id, event.reaction, this.now().toISOString());
+        db.exec('COMMIT');
+        return targets[0]!.item_id;
+      } catch (cause) {
+        try { db.exec('ROLLBACK'); } catch { /* connection closes next */ }
+        throw cause;
+      }
+    }, 120000);
+    if (recorded) this.log('briefing.items', 'reaction-recorded', { itemId: recorded, reaction: event.reaction, source: 'telegram' });
+    return recorded !== false;
+  }
+
   /** KST Monday through now: distinct sent items acted on (button/reply/correction), grouped by domain. */
   weeklyActions(): BriefWeeklyActions {
-    const now = this.now();
+    return this.using(db => this.weeklyActionsFromDb(db, this.now()));
+  }
+
+  private weekStart(now: Date): string {
     const today = dateKey(now, { timeZone: KST });
     const day = new Date(`${today}T00:00:00Z`);
     day.setUTCDate(day.getUTCDate() - ((day.getUTCDay() + 6) % 7));
-    const since = new Date(`${day.toISOString().slice(0, 10)}T00:00:00+09:00`).toISOString();
+    return new Date(`${day.toISOString().slice(0, 10)}T00:00:00+09:00`).toISOString();
+  }
+
+  private weeklyActionsFromDb(db: Database, now: Date): BriefWeeklyActions {
+    const since = this.weekStart(now);
     const until = now.toISOString();
-    return this.using(db => {
-      const rows = db.query(`SELECT items.domain AS kind,
-        COUNT(*) AS total,
-        SUM(CASE WHEN EXISTS (
-          SELECT 1 FROM reactions r WHERE r.item_id = items.id
-            AND r.reaction IN ('버튼', '답장', '정정') AND r.reacted_at >= ? AND r.reacted_at <= ?
-        ) THEN 1 ELSE 0 END) AS acted
-        FROM items WHERE EXISTS (
-          SELECT 1 FROM sends s WHERE s.item_id = items.id AND s.sent_at >= ? AND s.sent_at <= ?
-        ) GROUP BY items.domain`).all(since, until, since, until) as Array<{ kind: BriefDomain; total: number; acted: number }>;
-      const byKind = Object.fromEntries(BRIEF_DOMAINS.map(kind => [kind, { acted: 0, total: 0, rate: 0 }])) as Record<BriefDomain, BriefActionCount>;
-      let acted = 0;
-      let total = 0;
-      for (const row of rows) {
-        byKind[row.kind] = { acted: row.acted, total: row.total, rate: row.acted / row.total };
-        acted += row.acted;
-        total += row.total;
-      }
-      return { acted, total, rate: total === 0 ? 0 : acted / total, byKind };
-    });
+    const rows = db.query(`SELECT items.domain AS kind,
+      COUNT(*) AS total,
+      SUM(CASE WHEN EXISTS (
+        SELECT 1 FROM reactions r WHERE r.item_id = items.id
+          AND r.reaction IN ('버튼', '답장', '정정') AND r.reacted_at >= ? AND r.reacted_at <= ?
+      ) THEN 1 ELSE 0 END) AS acted
+      FROM items WHERE EXISTS (
+        SELECT 1 FROM sends s WHERE s.item_id = items.id AND s.sent_at >= ? AND s.sent_at <= ?
+      ) GROUP BY items.domain`).all(since, until, since, until) as Array<{ kind: BriefDomain; total: number; acted: number }>;
+    const byKind = Object.fromEntries(BRIEF_DOMAINS.map(kind => [kind, { acted: 0, total: 0, rate: 0 }])) as Record<BriefDomain, BriefActionCount>;
+    let acted = 0;
+    let total = 0;
+    for (const row of rows) {
+      byKind[row.kind] = { acted: row.acted, total: row.total, rate: row.acted / row.total };
+      acted += row.acted;
+      total += row.total;
+    }
+    return { acted, total, rate: total === 0 ? 0 : acted / total, byKind };
   }
 
   /** Insertion order. Optional domain filter. Item text is the stored original. */
@@ -388,7 +463,14 @@ export class BriefItemsLedger {
         this.log('briefing.items', 'requirement-funnel-failed', { slot, error: error instanceof Error ? error.message : String(error) });
       }
     }
-    const composed = composeBriefPage([...items, ...funnelItems], slot, now);
+    const since = this.weekStart(now);
+    const until = now.toISOString();
+    const observedKinds = new Set((db.query(`SELECT DISTINCT i.domain FROM items i
+      JOIN reactions r ON r.item_id = i.id
+      WHERE r.reacted_at >= ? AND r.reacted_at <= ? AND EXISTS (
+        SELECT 1 FROM sends s WHERE s.item_id = i.id AND s.sent_at >= ? AND s.sent_at <= ?
+      )`).all(since, until, since, until) as Array<{ domain: BriefDomain }>).map(row => row.domain));
+    const composed = composeBriefPage([...items, ...funnelItems], slot, now, this.weeklyActionsFromDb(db, now), observedKinds);
     // Ephemeral funnel lines appear on the page but have no ledger row to mark sent.
     const page = { markdown: composed.markdown, ids: composed.ids.filter(id => id > 0) };
     const candidates = (slot === 'realtime' ? pendingRealtime(items, now) : items.filter(item => item.sent_at === null && beforeSlot(item.created_at, slot, now))).length;
@@ -403,24 +485,58 @@ export class BriefItemsLedger {
   }
 
   /** Hold the ledger's SQLite writer lock from selecting unsent rows through delivery and marking.
-   * A failed delivery rolls back and releases the lock; the next sender can retry.
+   * A delivery that fails before anything was sent rolls back and releases the lock; the next
+   * sender can retry. A delivery that fails after some messages already went out commits what
+   * the 대표 actually received (sends + telegram_sends) so a retry never re-sends them.
    */
-  withSendLock<T>(slot: string, work: (page: { markdown: string; ids: number[] }, markSent: (ids: readonly number[], slot: BriefSendSlot) => number) => T): T {
+  withSendLock<T>(slot: string, work: (page: { markdown: string; ids: number[]; itemLines: ReadonlyMap<string, readonly number[]> }, markSent: (ids: readonly number[], slot: BriefSendSlot, telegram?: { botId: string; chatId: number; messageId: number } | ReadonlyArray<{ botId: string; chatId: number; messageId: number; itemId: number }>) => number) => T): T {
     if (slot !== 'realtime' && !(BRIEF_SLOTS as readonly string[]).includes(slot)) throw new BriefItemsInputError('invalid slot');
     return this.using(db => {
       db.exec('BEGIN IMMEDIATE');
+      let marked = false;
       try {
         const page = this.pageFromDb(db, slot as BriefSendSlot);
-        const result = work(page, (ids, sentSlot) => {
-          if (sentSlot !== slot || ids.length !== page.ids.length || ids.some((id, index) => id !== page.ids[index])) {
+        const itemIds = new Set(page.ids);
+        const itemLines = new Map<string, number[]>();
+        for (const item of this.itemsFromDb(db).filter(item => itemIds.has(item.id))) {
+          const line = itemLine(item);
+          itemLines.set(line, [...(itemLines.get(line) ?? []), item.id]);
+        }
+        const result = work({ ...page, itemLines }, (ids, sentSlot, telegram) => {
+          const pageIdSet = new Set(page.ids);
+          if (sentSlot !== slot || ids.length === 0 || new Set(ids).size !== ids.length
+            || ids.some(id => !pageIdSet.has(id))) {
             throw new BriefItemsInputError('marked ids must match composed page');
           }
-          return this.markSentInDb(db, ids, sentSlot);
+          const coordinates = telegram === undefined ? [] : Array.isArray(telegram)
+            ? telegram : ids.map(itemId => ({ ...telegram, itemId }));
+          if (telegram && (coordinates.some(row => !row.botId || !Number.isSafeInteger(row.chatId)
+            || !Number.isSafeInteger(row.messageId) || row.messageId < 1 || !ids.includes(row.itemId))
+            || new Set(coordinates.map(row => row.itemId)).size !== ids.length)) {
+            throw new BriefItemsInputError('invalid telegram send');
+          }
+          db.exec('SAVEPOINT brief_mark');
+          try {
+            const count = this.markSentInDb(db, ids, sentSlot);
+            if (telegram) {
+              const insert = db.query('INSERT OR IGNORE INTO telegram_sends (bot_id, chat_id, message_id, item_id) VALUES (?, ?, ?, ?)');
+              for (const row of coordinates) insert.run(row.botId, row.chatId, row.messageId, row.itemId);
+            }
+            db.exec('RELEASE brief_mark');
+            marked = true;
+            return count;
+          } catch (cause) {
+            db.exec('ROLLBACK TO brief_mark');
+            db.exec('RELEASE brief_mark');
+            throw cause;
+          }
         });
         db.exec('COMMIT');
         return result;
       } catch (cause) {
-        db.exec('ROLLBACK');
+        // The only writes inside this lock are the marks; committing on failure preserves what
+        // the 대표 already received, so a retry sends only the unsent remainder.
+        try { db.exec(marked ? 'COMMIT' : 'ROLLBACK'); } catch { /* the connection closes next */ }
         throw cause;
       }
     });

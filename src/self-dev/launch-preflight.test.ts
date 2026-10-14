@@ -1,6 +1,6 @@
 import { setDefaultTimeout, describe, expect, it, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { LogStore } from '../mss/logging/log-store.js';
 import { debug } from '../debug/log.js';
 import { tmpdir } from 'node:os';
@@ -9,6 +9,7 @@ import {
   DEFAULT_RECENT_CHANGE_WINDOW_DAYS,
   combineWorktreePathTouchAxes,
   decideAskPreflight as decideAskPreflightWithDefault,
+  discardNonFileTracedPathItems,
   evaluateLaunchPreflight,
   interruptedRunObservationFailureCount,
   listPreexistingFailureTestFiles,
@@ -88,6 +89,218 @@ const notCountedPtyEntry = (runId: string, ptyUpdatedAt: number | null): Running
 });
 
 const noRunningRuns = (): RunningRunsResult => confidenceRunningRuns(0, 0);
+
+test('discard malformed traced prose without changing the rest of the goal', () => {
+  const root = mkdtempSync(join(tmpdir(), 'traced-prose-'));
+  try {
+    mkdirSync(join(root, 'src'));
+    writeFileSync(join(root, 'src', 'one.ts'), 'export {};');
+    const document = '# Goal\n## TRACED PATHS\n- src/one.ts\n- Read-verified 경로 2개(이번 run에서 전체 내용 Read 성공)\n- src/../missing.ts\n- src/new.ts\n  ### OTHER\n- Read-verified 하위 절 원문\n## BOUNDARY\n원문 보존\n';
+    expect(discardNonFileTracedPathItems(document, root)).toEqual({
+      document: '# Goal\n## TRACED PATHS\n- src/one.ts\n- src/../missing.ts\n- src/new.ts\n  ### OTHER\n- Read-verified 하위 절 원문\n## BOUNDARY\n원문 보존\n',
+      dropped: ['- Read-verified 경로 2개(이번 run에서 전체 내용 Read 성공)'],
+    });
+    expect(discardNonFileTracedPathItems('## TRACED PATHS\n- Read-verified 경로 2개: 설명 전체\n## END\n', root)).toEqual({
+      document: '## TRACED PATHS\n## END\n',
+      dropped: ['- Read-verified 경로 2개: 설명 전체'],
+    });
+    expect(discardNonFileTracedPathItems('## TRACED PATHS\n- src/one.ts · Read-verified 경로 2개(내용)\n- src/runner\n신설: src/runner\n', root)).toEqual({
+      document: '## TRACED PATHS\n- src/one.ts\n- src/runner\n신설: src/runner\n',
+      dropped: ['- src/one.ts · Read-verified 경로 2개(내용)'],
+    });
+    expect(discardNonFileTracedPathItems('## TRACED PATHS\n- 경로: src/one.ts\n', root)).toEqual({
+      document: '## TRACED PATHS\n- 경로: src/one.ts\n', dropped: [],
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('traced cleanup only removes obvious prose and leaves other path spellings unchanged', () => {
+  const root = mkdtempSync(join(tmpdir(), 'traced-prose-boundary-'));
+  try {
+    const unchanged = ['README', './runner', '../runner', 'src/runner', 'src/./missing.ts', 'src//missing.ts', 'src/My File.ts', 'dir/a b.ts'];
+    const document = `## TRACED PATHS\n${unchanged.map((path) => `- ${path}`).join('\n')}\n- Read-verified 경로 2개(설명)\n- Note: this is prose\n## NEXT\n`;
+    expect(discardNonFileTracedPathItems(document, root)).toEqual({
+      document: `## TRACED PATHS\n${unchanged.map((path) => `- ${path}`).join('\n')}\n## NEXT\n`,
+      dropped: ['- Read-verified 경로 2개(설명)', '- Note: this is prose'],
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('missing traced file blocks before launch unless the goal declares it new', () => {
+  const root = mkdtempSync(join(tmpdir(), 'traced-missing-'));
+  try {
+    mkdirSync(join(root, 'src'));
+    writeFileSync(join(root, 'src', 'one.ts'), 'export {};');
+    const goalFile = join(root, 'goal.md');
+    const document = '## TRACED PATHS\n- src/one.ts\n- src/new.ts\n- src/missing.ts\n신설: src/new.ts\n';
+    writeFileSync(goalFile, document);
+    const decision = decideAskPreflight({
+      goalFile, declaredPathsRoot: root, liveRunWindowMinutes: 30, recentChangeWindowDays: 7,
+    }, {
+      readGoalDocument: () => document,
+      tracedPaths: () => ['src/one.ts', 'src/new.ts', 'src/missing.ts'],
+      listOpenPrs: () => [], listUnfinishedRuns: () => [], countRecentChanges: () => ({}),
+    }, false);
+    expect(decision.shouldLaunch).toBe(false);
+    expect(decision.result.blockers.filter((blocker) => blocker.kind === 'missing-traced-path'))
+      .toEqual([expect.objectContaining({ name: '실재하지 않는 traced path: src/missing.ts' })]);
+    expect(decision.result.paths).toEqual(['src/one.ts', 'src/new.ts', 'src/missing.ts']);
+    const forced = decideAskPreflight({
+      goalFile, declaredPathsRoot: root, liveRunWindowMinutes: 30, recentChangeWindowDays: 7,
+      pathsOverride: ['src/one.ts', 'src/future-dir'],
+    }, {
+      readGoalDocument: () => document,
+      tracedPaths: () => ['src/one.ts', 'src/missing.ts'],
+      listOpenPrs: () => [], listUnfinishedRuns: () => [], countRecentChanges: () => ({}),
+    }, true);
+    expect(forced.shouldLaunch).toBe(true);
+    expect(forced.result.paths).toEqual(['src/one.ts', 'src/future-dir']);
+    expect(forced.result.blockers.filter((blocker) => blocker.kind === 'missing-traced-path')).toEqual([]);
+    const noExplicitRoot = decideAskPreflight({
+      goalFile, liveRunWindowMinutes: 30, recentChangeWindowDays: 7,
+    }, {
+      readGoalDocument: () => document, tracedPaths: () => [join(root, 'never-created.ts')],
+      listOpenPrs: () => [], listUnfinishedRuns: () => [], countRecentChanges: () => ({}),
+    }, false);
+    expect(noExplicitRoot.result.blockers.some((blocker) => blocker.kind === 'missing-traced-path')).toBe(true);
+    const parentSegment = decideAskPreflight({
+      goalFile, declaredPathsRoot: root, liveRunWindowMinutes: 30, recentChangeWindowDays: 7,
+    }, {
+      readGoalDocument: () => '## TRACED PATHS\n- src/../missing.ts\n',
+      tracedPaths: () => ['src/../missing.ts'],
+      listOpenPrs: () => [], listUnfinishedRuns: () => [], countRecentChanges: () => ({}),
+    }, false);
+    expect(parentSegment.result.blockers).toContainEqual(expect.objectContaining({
+      kind: 'missing-traced-path', name: '실재하지 않는 traced path: src/../missing.ts',
+    }));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('extensionless traced directory and inaccessible new child are blocked for their actual reasons', () => {
+  const root = mkdtempSync(join(tmpdir(), 'traced-kind-'));
+  try {
+    mkdirSync(join(root, 'runner'));
+    mkdirSync(join(root, 'dir'));
+    writeFileSync(join(root, 'parent.ts'), 'export {};');
+    symlinkSync(join(root, 'never-created'), join(root, 'broken-parent'));
+    const goalFile = join(root, 'goal.md');
+    writeFileSync(goalFile, '## TRACED PATHS\n- runner\n- parent.ts/new.ts\n- parent.ts/../new.ts\n- broken-parent/new.ts\n- src/My File.ts\n- dir/new file\n- README\n신설: parent.ts/new.ts\n신설: parent.ts/../new.ts\n신설: broken-parent/new.ts\n');
+    const result = decideAskPreflight({
+      goalFile, declaredPathsRoot: root, liveRunWindowMinutes: 30, recentChangeWindowDays: 7,
+    }, {
+      readGoalDocument: () => '## TRACED PATHS\n- runner\n- parent.ts/new.ts\n- parent.ts/../new.ts\n- broken-parent/new.ts\n- src/My File.ts\n- dir/new file\n- README\n신설: parent.ts/new.ts\n신설: parent.ts/../new.ts\n신설: broken-parent/new.ts\n',
+      tracedPaths: () => ['runner', 'parent.ts/new.ts', 'parent.ts/../new.ts', 'broken-parent/new.ts', 'src/My File.ts', 'dir/new file', 'README'],
+      listOpenPrs: () => [], listUnfinishedRuns: () => [], countRecentChanges: () => ({}),
+    }, true);
+    expect(result.shouldLaunch).toBe(false);
+    expect(result.result.blockers.filter((blocker) => blocker.kind === 'missing-traced-path').map((blocker) => blocker.name)).toEqual([
+      'traced path 가 파일이 아님: runner',
+      'traced path 경로 접근 불가: parent.ts/new.ts',
+      'traced path 경로 접근 불가: parent.ts/../new.ts',
+      'traced path 경로 접근 불가: broken-parent/new.ts',
+      '실재하지 않는 traced path: src/My File.ts',
+      '실재하지 않는 traced path: dir/new file',
+      '실재하지 않는 traced path: README',
+    ]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('unreadable final goal cannot be forced and parentless declared new files keep their authoring contract', () => {
+  const root = mkdtempSync(join(tmpdir(), 'traced-goal-read-'));
+  try {
+    const goalFile = join(root, 'goal.md');
+    const deps = {
+      tracedPaths: (document: string) => document.includes('noext') ? ['src/absent/noext'] : ['src/absent/new.ts'],
+      listOpenPrs: () => [], listUnfinishedRuns: () => [], countRecentChanges: () => ({}),
+    };
+    writeFileSync(goalFile, '## TRACED PATHS\n- src/absent/new.ts\n신설: src/absent/new.ts\n');
+    const options = { goalFile, declaredPathsRoot: root, liveRunWindowMinutes: 30, recentChangeWindowDays: 7 };
+    const unreadable = decideAskPreflight(options, {
+      ...deps, readGoalDocument: () => { throw new Error('read denied'); },
+    }, true);
+    expect(unreadable.shouldLaunch).toBe(false);
+    expect(unreadable.result.blockers).toContainEqual(expect.objectContaining({ kind: 'goal-unreadable' }));
+    expect(renderLaunchPreflight(unreadable.result, false)).toContain('--force-preflight 로 우회할 수 없다');
+
+    const allowedDocument = '## TRACED PATHS\n- src/absent/new.ts\n신설: src/absent/new.ts\n';
+    const allowed = decideAskPreflight(options, { ...deps, readGoalDocument: () => allowedDocument }, false);
+    expect(allowed.result.blockers.filter((blocker) => blocker.kind === 'missing-traced-path')).toEqual([]);
+    const extensionlessDocument = '## TRACED PATHS\n- src/absent/noext\n신설: src/absent/noext\n';
+    const extensionless = decideAskPreflight(options, { ...deps, readGoalDocument: () => extensionlessDocument }, true);
+    expect(extensionless.shouldLaunch).toBe(false);
+    expect(extensionless.result.blockers).toContainEqual(expect.objectContaining({
+      kind: 'missing-traced-path', name: '실재하지 않는 traced path: src/absent/noext',
+    }));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a relative authored goal read from declaredPathsRoot still checks its missing traced target', () => {
+  const root = mkdtempSync(join(tmpdir(), 'traced-relative-goal-'));
+  try {
+    const document = '## TRACED PATHS\n- missing.ts\n';
+    writeFileSync(join(root, 'goal.md'), document);
+    const decision = decideAskPreflight({
+      goalFile: 'goal.md', declaredPathsRoot: root,
+      liveRunWindowMinutes: 30, recentChangeWindowDays: 7,
+    }, {
+      readGoalDocument: (path) => readFileSync(path, 'utf8'),
+      tracedPaths: () => ['missing.ts'],
+      listOpenPrs: () => [], listUnfinishedRuns: () => [], countRecentChanges: () => ({}),
+    }, true);
+    expect(decision.shouldLaunch).toBe(false);
+    expect(decision.result.blockers).toContainEqual(expect.objectContaining({
+      kind: 'missing-traced-path', name: '실재하지 않는 traced path: missing.ts',
+    }));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('an authored goal with no preserved traced path cannot force launch', () => {
+  const root = mkdtempSync(join(tmpdir(), 'traced-empty-goal-'));
+  try {
+    const goalFile = join(root, 'goal.md');
+    writeFileSync(goalFile, '## TRACED PATHS\n');
+    const decision = decideAskPreflight({
+      goalFile, declaredPathsRoot: root, liveRunWindowMinutes: 30, recentChangeWindowDays: 7,
+    }, {
+      readGoalDocument: (path) => readFileSync(path, 'utf8'),
+      tracedPaths: () => [], askTargetPaths: () => ['src/one.ts'],
+      listOpenPrs: () => [], listUnfinishedRuns: () => [], countRecentChanges: () => ({}),
+    }, true);
+    expect(decision.shouldLaunch).toBe(false);
+    expect(decision.result.blockers).toContainEqual(expect.objectContaining({
+      kind: 'missing-traced-path', name: '최종 골의 TRACED PATHS 경로 0',
+    }));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('an existing traced file must be openable for reading', () => {
+  const root = mkdtempSync(join(tmpdir(), 'traced-unreadable-'));
+  const target = join(root, 'src', 'locked.ts');
+  try {
+    mkdirSync(join(root, 'src'));
+    writeFileSync(target, 'export {};');
+    chmodSync(target, 0o000);
+    let denied = false;
+    try { readFileSync(target); } catch { denied = true; }
+    if (!denied) return; // Privileged test runners may bypass file mode bits.
+    const goalFile = join(root, 'goal.md');
+    writeFileSync(goalFile, '## TRACED PATHS\n- src/locked.ts\n');
+    const decision = decideAskPreflight({
+      goalFile, declaredPathsRoot: root, liveRunWindowMinutes: 30, recentChangeWindowDays: 7,
+    }, {
+      readGoalDocument: (path) => readFileSync(path, 'utf8'),
+      tracedPaths: () => ['src/locked.ts'],
+      listOpenPrs: () => [], listUnfinishedRuns: () => [], countRecentChanges: () => ({}),
+    }, true);
+    expect(decision.shouldLaunch).toBe(false);
+    expect(decision.result.blockers).toContainEqual(expect.objectContaining({
+      kind: 'missing-traced-path', name: 'traced path 경로 접근 불가: src/locked.ts',
+    }));
+  } finally {
+    chmodSync(target, 0o600);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 const decideAskPreflight = (
   options: Parameters<typeof decideAskPreflightWithDefault>[0],
@@ -2043,10 +2256,13 @@ describe('decideAskPreflight — CLI 배선', () => {
       mkdirSync(join(presentRoot, 'src'));
       mkdirSync(join(absentRoot, 'src'));
       writeFileSync(join(presentRoot, 'src/new-value.ts'), 'export {};');
+      writeFileSync(join(presentRoot, 'src/a.ts'), 'export {};');
+      writeFileSync(join(absentRoot, 'src/a.ts'), 'export {};');
       const options = { goalFile: 'g.md', askText, liveRunWindowMinutes: 30, recentChangeWindowDays: 7 };
-      const present = decideAskPreflight({ ...options, declaredPathsRoot: presentRoot }, deps(), false);
-      const absent = decideAskPreflight({ ...options, declaredPathsRoot: absentRoot }, deps(), false);
-      const fallback = decideAskPreflight(options, deps(), false);
+      const markerDeps = deps();
+      const present = decideAskPreflight({ ...options, declaredPathsRoot: presentRoot }, markerDeps, false);
+      const absent = decideAskPreflight({ ...options, declaredPathsRoot: absentRoot }, markerDeps, false);
+      const fallback = decideAskPreflight(options, markerDeps, false);
 
       expect(present.result.askMarkerObservation).toMatchObject({ inspectionRoot: presentRoot });
       expect(absent.result.askMarkerObservation).toMatchObject({ inspectionRoot: absentRoot });
@@ -2077,8 +2293,9 @@ describe('decideAskPreflight — CLI 배선', () => {
       '판정 신호: 조건 = 기판; 관측 = 그 기판으로 자식을 하나 돌려 main-tree-reject 0 을 보여라; 기대 = 0',
     ].join('\n');
     const options = { goalFile: 'g.md', askText, liveRunWindowMinutes: 30, recentChangeWindowDays: 7 };
-    const withoutRoot = decideAskPreflight(options, deps(), false);
-    const withRoot = decideAskPreflight({ ...options, declaredPathsRoot: process.cwd() }, deps(), false);
+    const markerDeps = { ...deps(), tracedPaths: () => ['src/self-dev/launch-preflight.ts'] };
+    const withoutRoot = decideAskPreflight(options, markerDeps, false);
+    const withRoot = decideAskPreflight({ ...options, declaredPathsRoot: process.cwd() }, markerDeps, false);
 
     for (const decision of [withoutRoot, withRoot]) {
       const unpressed = decision.result.askMarkerObservation!.warnings.filter((warning) => warning.includes('안 눌릴 신호'));

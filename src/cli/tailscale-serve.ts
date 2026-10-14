@@ -1,17 +1,14 @@
 // Unified Tailscale Serve helper — single source of truth for the
 // two transport modes monad-agent uses on macOS:
 //
-//   - `https-443` — share the daemon on the host's standard HTTPS:443
-//                   (one Serve per host · used by `pwa share enable`
-//                   and the legacy `bringShareUp` auto-share path in
-//                   `pwa-start`). HTTP/2 forwarder · NOT WebSocket-
-//                   friendly (Upgrade returns 502).
+//   - `https-443` — explicit legacy mode on the host's standard HTTPS:443.
+//                   HTTP/2 forwarding does not preserve WebSocket Upgrade
+//                   (the daily PWA sharing path no longer selects it).
 //
 //   - `tls-tcp`   — per-port TLS terminator forwarding plaintext TCP
 //                   (HTTP/1.1) to a backend on `localhost:<port>`.
-//                   Used by `pwa test --https` for project-local
-//                   isolated dogfood. WebSocket Upgrade returns 101
-//                   (the iPad-side multi-LLM dispatch needs this).
+//                   Used by `pwa share enable`, `pwa-start` auto-share and
+//                   `pwa test --https`. WebSocket Upgrade returns 101.
 //
 // Why unify? Before this lift, `defaultServe` (https-443) and
 // `mountTailscaleTestServe` (tls-tcp) duplicated:

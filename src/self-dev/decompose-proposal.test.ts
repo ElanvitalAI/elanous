@@ -278,6 +278,85 @@ describe('applyDecomposeProposals — 「쪼개서 다시」의 «집행» (단�
     const r = applyDecomposeProposals([G('big')], [R('big', [{ id: 'p1', feature: 'only', dependsOn: [] }])]);
     expect(r.decomposed).toEqual([]);
   });
+
+  // ⭐ DECOMPOSE-PIECE-TARGET-LINE (10-11 부검 run-76941fca) — 조각이 골을 통째로 갈아 끼워
+  //   첫 줄 «대상 경로:» 선언이 사라지면 Pod 예비 검사가 대상 경로 0 → 재저작 NOT-GROUNDED 로 exit 1 한다.
+  //   ⇒ 조각은 머리줄 선언을 «좁혀서» 물려받는다(원 선언 경로 중 조각 문장에 나오는 것만 · 없으면 전부).
+  describe('조각의 «대상 경로:» 머리줄 상속 (DECOMPOSE-PIECE-TARGET-LINE)', () => {
+    test('pieces inherit a target-path first line narrowed to the paths they mention', () => {
+      const parent = G('대상 경로: src/a.ts · src/b.ts\n보존 계약: 원장 형식은 그대로');
+      const r = applyDecomposeProposals(
+        [parent],
+        [R('대상 경로: src/a.ts · src/b.ts\n보존 계약: 원장 형식은 그대로', [
+          { id: 'p1', feature: 'In src/a.ts, add the parser guard', dependsOn: [] },
+          { id: 'p2', feature: 'Wire the freeze hook into src/b.ts and src/a.ts', dependsOn: ['p1'] },
+        ])],
+      );
+      expect(r.goals[0]!.feature).toBe('대상 경로: src/a.ts\nIn src/a.ts, add the parser guard');
+      expect(r.goals[1]!.feature).toBe('대상 경로: src/a.ts · src/b.ts\nWire the freeze hook into src/b.ts and src/a.ts');
+      expect(r.goals[0]!.feature.split('\n')[0]).toBe('대상 경로: src/a.ts');
+      expect(r.goals[1]!.feature.split('\n')[0]).toBe('대상 경로: src/a.ts · src/b.ts');
+    });
+
+    test('a path prefix is not a mention of the declared file (target and new paths)', () => {
+      const feature = '대상 경로: src/a.ts · src/a.tsx\n신설: src/new.ts · src/new.tsx';
+      const r = applyDecomposeProposals(
+        [G(feature)],
+        [R(feature, [
+          { id: 'p1', feature: 'Change src/a.tsx and add src/new.tsx', dependsOn: [] },
+          { id: 'p2', feature: 'Change src/a.ts and add src/new.ts', dependsOn: [] },
+          { id: 'p3', feature: 'Change nested/src/a.ts and add src/new.tsx', dependsOn: [] },
+        ])],
+      );
+      expect(r.goals[0]!.feature).toBe('대상 경로: src/a.tsx\n신설: src/new.tsx\nChange src/a.tsx and add src/new.tsx');
+      expect(r.goals[1]!.feature).toBe('대상 경로: src/a.ts\n신설: src/new.ts\nChange src/a.ts and add src/new.ts');
+      expect(r.goals[2]!.feature).toBe('대상 경로: src/a.ts · src/a.tsx\n신설: src/new.tsx\nChange nested/src/a.ts and add src/new.tsx');
+      expect(r.goals.map((g) => g.feature.split('\n')[0])).toEqual([
+        '대상 경로: src/a.tsx',
+        '대상 경로: src/a.ts',
+        '대상 경로: src/a.ts · src/a.tsx',
+      ]);
+    });
+
+    test('a piece that names no declared path inherits all declared paths', () => {
+      const parent = G('대상 경로: src/one.ts · src/two.ts\n현재 계약: bun test → 0 fail');
+      const r = applyDecomposeProposals(
+        [parent],
+        [R('대상 경로: src/one.ts · src/two.ts\n현재 계약: bun test → 0 fail', [
+          { id: 'p1', feature: 'Refactor the shared types', dependsOn: [] },
+          { id: 'p2', feature: 'Split the orchestration seam', dependsOn: [] },
+        ])],
+      );
+      expect(r.goals[0]!.feature.split('\n')[0]).toBe('대상 경로: src/one.ts · src/two.ts');
+      expect(r.goals[1]!.feature.split('\n')[0]).toBe('대상 경로: src/one.ts · src/two.ts');
+    });
+
+    test('a parent without a target-path line leaves pieces unchanged', () => {
+      const r = applyDecomposeProposals(
+        [G('그냥 골 문장\n신설: src/new.ts')],
+        [R('그냥 골 문장\n신설: src/new.ts', [
+          { id: 'p1', feature: 'part 1', dependsOn: [] },
+          { id: 'p2', feature: 'part 2', dependsOn: [] },
+        ])],
+      );
+      expect(r.goals.map((g) => g.feature)).toEqual(['part 1', 'part 2']);
+      expect(r.goals.map((g) => g.feature.split('\n')[0])).toEqual(['part 1', 'part 2']);
+    });
+
+    test('«신설:» 줄도 같은 규칙으로 물려준다 — 조각이 언급한 새 파일만', () => {
+      const parent = G('대상 경로: src/handler.ts\n신설: src/handler.test.ts · src/new-module.ts');
+      const r = applyDecomposeProposals(
+        [parent],
+        [R('대상 경로: src/handler.ts\n신설: src/handler.test.ts · src/new-module.ts', [
+          { id: 'p1', feature: 'Add the route in src/handler.ts', dependsOn: [] },
+          { id: 'p2', feature: 'Cover it with src/handler.test.ts cases', dependsOn: ['p1'] },
+        ])],
+      );
+      // p1 은 신설 경로를 «하나도» 언급 안 한다 → 규칙대로 원 신설 선언 «전부»를 물려받는다.
+      expect(r.goals[0]!.feature).toBe('대상 경로: src/handler.ts\n신설: src/handler.test.ts · src/new-module.ts\nAdd the route in src/handler.ts');
+      expect(r.goals[1]!.feature).toBe('대상 경로: src/handler.ts\n신설: src/handler.test.ts\nCover it with src/handler.test.ts cases');
+    });
+  });
 });
 
 describe('orderPiecesTopologically — 「의존 0」이 아니라 「DAG 인가」 (RUN-T82 · 2026-09-06)', () => {

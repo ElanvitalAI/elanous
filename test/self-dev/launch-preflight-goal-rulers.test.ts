@@ -52,7 +52,7 @@ describe('launch preflight goal rulers', () => {
       readGoalDocument: () => { throw new Error('EACCES'); },
     }, false);
 
-    expect(decision.result.blockers).toMatchObject([{ kind: 'no-target-paths' }]);
+    expect(decision.result.blockers.map((blocker) => blocker.kind)).toEqual(['no-target-paths', 'goal-unreadable']);
     expect(decision.shouldLaunch).toBe(false);
     expect(decision.result.premiseMockedBySignal).toMatchObject({ state: 'unknown', reason: '골 문서 판독 불가: EACCES' });
     expect(decision.result.invariantFunctionExits).toMatchObject({ state: 'unknown', reason: '골 문서 판독 불가: EACCES' });

@@ -1,13 +1,18 @@
 import type { Command } from 'commander';
-import { canonicalSeatId, openMsgStore, type Message, type MsgStore } from '../msg/msg-store.js';
+import { ensureAuthToken } from '../auth/acp-token.js';
+import { canonicalSeatId, openMsgStore, openMsgStoreReadOnly, type Message, type MsgStore } from '../msg/msg-store.js';
+import { startMsgSseServer } from '../msg/msg-sse-server.js';
 
 export interface MsgCliDeps {
   openStore?: () => MsgStore;
+  openReadStore?: () => MsgStore;
   out?: Pick<Console, 'log' | 'error'>;
   readStdin?: () => Promise<string>;
   sleep?: (ms: number) => Promise<void>;
   setExitCode?: (code: number) => void;
   signal?: AbortSignal;
+  fetch?: typeof fetch;
+  authToken?: () => string;
 }
 
 type CommonOptions = { json?: boolean };
@@ -33,6 +38,7 @@ function formatMessage(message: Message): string {
 /** Register the durable, recipient-addressed CLI. Reading never advances the acknowledgement cursor. */
 export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): void {
   const open = deps.openStore ?? (() => openMsgStore());
+  const openRead = deps.openReadStore ?? (() => openMsgStoreReadOnly());
   const out = deps.out ?? console;
   const readStdin = deps.readStdin ?? (() => Bun.stdin.text());
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
@@ -58,13 +64,16 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
 
   msg.command('post [body]').description('Post a message; use - or omit body to read stdin')
     .option('--from <seat>').option('--to <seat>').option('--kind <kind>').option('--body <text>')
+    .option('--reply-to <id>', 'point this reply at a question message ID')
     .option('--origin-key <key>', 'deduplicate a channel mirror by coord:<commentId>:<recipient>').option('--json')
-    .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; originKey?: string }) => run(async () => {
+    .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; replyTo?: string; originKey?: string }) => run(async () => {
       const from = seat(opts.from, '--from');
       const to = seat(opts.to, '--to');
       if (body !== undefined && body !== '-' && opts.body !== undefined) throw new Error('provide body once (argument or --body)');
       const text = opts.body ?? (body !== undefined && body !== '-' ? body : await readStdin());
-      const envelope = { from, to, body: text, ...(opts.kind === undefined ? {} : { kind: opts.kind }) };
+      const envelope = { from, to, body: text,
+        ...(opts.kind === undefined ? {} : { kind: opts.kind }),
+        ...(opts.replyTo === undefined ? {} : { replyTo: integer(opts.replyTo, '--reply-to', 0, 1, Number.MAX_SAFE_INTEGER) }) };
       const posted = withStore(store => opts.originKey === undefined
         ? store.post(envelope)
         : store.appendWithProvenance(envelope, opts.originKey));
@@ -110,12 +119,13 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       });
     })());
 
-  msg.command('watch').description('Poll for new messages without acknowledging them (Ctrl-C to stop)')
+  msg.command('watch').description('Watch durable messages; SSE accelerates delivery and polling covers outages')
     .option('--to <seat>').option('--after <id>', 'exclusive message ID (default: acknowledged cursor)')
     .option('--since-ack', 'start from the recipient seat’s acknowledged cursor')
     .option('--interval <ms>', 'poll interval in milliseconds', '1000')
+    .option('--sse <url>', 'post office base URL (fall back to ledger polling on disconnect)')
     .option('--once', 'poll once and exit').option('--json')
-    .action((opts: RecipientOptions & { interval?: string; once?: boolean; sinceAck?: boolean }) => run(async () => {
+    .action((opts: RecipientOptions & { interval?: string; once?: boolean; sinceAck?: boolean; sse?: string }) => run(async () => {
       if (opts.sinceAck && opts.after !== undefined) throw new Error('--since-ack cannot be used with --after');
       const to = seat(opts.to, '--to');
       const interval = integer(opts.interval, '--interval', 1000, 1, 60000);
@@ -123,7 +133,7 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       const store = open();
       try {
         let cursor = after ?? store.getCursor(to);
-        do {
+        const poll = () => {
           let messages: Message[];
           do {
             messages = store.list(to, cursor, 1000);
@@ -132,10 +142,156 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
               cursor = message.id;
             }
           } while (messages.length === 1000 && !deps.signal?.aborted);
-          if (opts.once || deps.signal?.aborted) break;
-          await sleep(interval);
-        } while (!deps.signal?.aborted);
+        };
+        if (!opts.sse || opts.once) {
+          do {
+            poll();
+            if (opts.once || deps.signal?.aborted) break;
+            await sleep(interval);
+          } while (!deps.signal?.aborted);
+        } else {
+          const url = new URL('/stream', opts.sse);
+          if (!['http:', 'https:'].includes(url.protocol)) throw new Error('--sse requires an HTTP URL');
+          if (url.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))
+            throw new Error('--sse requires HTTPS outside localhost');
+          url.searchParams.set('to', to);
+          const token = (deps.authToken ?? (() => ensureAuthToken().token))();
+          let outage = false;
+          while (!deps.signal?.aborted) {
+            poll();
+            url.searchParams.set('since', String(cursor));
+            const controller = new AbortController();
+            const onAbort = () => controller.abort();
+            deps.signal?.addEventListener('abort', onAbort, { once: true });
+            try {
+              let connectTimer: ReturnType<typeof setTimeout> | undefined;
+              const response = await Promise.race([
+                (deps.fetch ?? fetch)(url, { headers: {
+                  Authorization: `Bearer ${token}`, 'Last-Event-ID': String(cursor),
+                }, signal: controller.signal }),
+                new Promise<never>((_, reject) => { connectTimer = setTimeout(() => {
+                  controller.abort();
+                  reject(new Error('SSE connect timeout'));
+                }, Math.max(1000, Math.min(5000, interval * 2))); }),
+              ]).finally(() => clearTimeout(connectTimer));
+              if (response.status === 401) throw new Error('SSE unauthorized (401)');
+              if (!response.ok || !response.body) throw new Error(`SSE unavailable (${response.status})`);
+              outage = false;
+              const reader = response.body.getReader();
+              const decoder = new TextDecoder();
+              let pending = '';
+              while (!deps.signal?.aborted) {
+                let idleTimer: ReturnType<typeof setTimeout> | undefined;
+                const chunk = await Promise.race([
+                  reader.read(),
+                  new Promise<never>((_, reject) => { idleTimer = setTimeout(() => {
+                    controller.abort();
+                    reject(new Error('SSE idle timeout'));
+                  }, Math.max(1000, Math.min(5000, interval * 2))); }),
+                ]).finally(() => clearTimeout(idleTimer));
+                if (chunk.done) break;
+                pending += decoder.decode(chunk.value, { stream: true });
+                pending = pending.replace(/\r\n/g, '\n');
+                if (pending.length > 1_000_000) throw new Error('SSE event exceeds limit');
+                let boundary: number;
+                while ((boundary = pending.indexOf('\n\n')) >= 0) {
+                  const event = pending.slice(0, boundary);
+                  pending = pending.slice(boundary + 2);
+                  if (event.split('\n').some((line) => line.startsWith('id: '))) poll();
+                }
+              }
+            } catch (error) {
+              if (error instanceof Error && error.message === 'SSE unauthorized (401)') throw error;
+              if (!outage && !deps.signal?.aborted) out.error(`msg: SSE disconnected; polling ledger (${error instanceof Error ? error.message : String(error)})`);
+              outage = true;
+            } finally { deps.signal?.removeEventListener('abort', onAbort); controller.abort(); }
+            if (deps.signal?.aborted) break;
+            poll();
+            await sleep(interval);
+          }
+        }
       } finally { store.close(); }
+    })());
+
+  msg.command('ask <recipient> <question>').description('Post a question and wait for its first reply')
+    .option('--from <seat>', 'asking seat (required)').option('--wait <seconds>', 'seconds to wait for a reply (default 60)', '60')
+    .option('--json')
+    .action((recipient: string, question: string, opts: CommonOptions & { from?: string; wait?: string }) => run(async () => {
+      const from = seat(opts.from, '--from');
+      const to = canonicalSeatId(recipient);
+      const waitSeconds = integer(opts.wait, '--wait', 60, 0, 86400);
+      const interrupt = deps.signal === undefined ? new AbortController() : undefined;
+      const signal = deps.signal ?? interrupt!.signal;
+      const onInterrupt = () => interrupt?.abort();
+      if (interrupt) {
+        process.once('SIGINT', onInterrupt);
+        process.once('SIGTERM', onInterrupt);
+      }
+      let store: MsgStore | undefined;
+      try {
+        const asked = withStore(ledger => ledger.post({ from, to, body: question }));
+        const deadline = Date.now() + waitSeconds * 1000;
+        let reply: Message | undefined;
+        store = open();
+        do {
+          reply = store.listReplies(asked.id, 1)[0];
+          if (reply !== undefined || signal.aborted || Date.now() >= deadline) break;
+          await sleep(1000);
+        } while (true);
+        if (reply === undefined && signal.aborted) throw new Error(`ask interrupted after posting #${asked.id}`);
+        if (reply === undefined) throw new Error(`no reply to #${asked.id} within ${waitSeconds}s`);
+        emit(reply, opts.json, () => out.log(formatMessage(reply)));
+      } finally {
+        store?.close();
+        if (interrupt) {
+          process.removeListener('SIGINT', onInterrupt);
+          process.removeListener('SIGTERM', onInterrupt);
+        }
+      }
+    })());
+
+  msg.command('thread <id>').description('Show one question and its replies in time order')
+    .option('--json')
+    .action((id: string, opts: CommonOptions) => run(() => {
+      const target = integer(id, 'message ID', 0, 1, Number.MAX_SAFE_INTEGER);
+      const thread = withStore(store => {
+        const question = store.getMessage(target);
+        if (question === null) throw new Error(`message not found: #${target}`);
+        // Keep paging until a short page so a thread longer than one store page is never truncated.
+        const replies: Message[] = [];
+        let after = 0;
+        let page: Message[];
+        do {
+          page = store.listReplies(target, 100, after);
+          replies.push(...page);
+          after = page.at(-1)?.id ?? after;
+        } while (page.length === 100);
+        return { question, replies };
+      });
+      emit(thread, opts.json, () => {
+        out.log(formatMessage(thread.question));
+        for (const reply of thread.replies) out.log(formatMessage(reply));
+      });
+    })());
+
+  msg.command('serve').description('Run the independent, read-only post office SSE service')
+    .option('--sse', 'serve GET /stream')
+    .option('--port <port>', 'port (or ELANOUS_MSG_SSE_PORT)')
+    .option('--host <host>', 'bind address', '127.0.0.1')
+    .action((opts: { sse?: boolean; port?: string; host?: string }) => run(() => {
+      if (!opts.sse) throw new Error('serve requires --sse');
+      const rawPort = opts.port ?? process.env.ELANOUS_MSG_SSE_PORT;
+      if (rawPort === undefined) throw new Error('--port or ELANOUS_MSG_SSE_PORT is required');
+      const port = integer(rawPort, '--port', 0, 0, 65535);
+      const store = openRead();
+      try {
+        const service = startMsgSseServer({ store, token: (deps.authToken ?? (() => ensureAuthToken().token))(),
+          port, hostname: opts.host });
+        out.log(`msg SSE listening on ${opts.host}:${service.port}`);
+        const stop = () => { service.stop(); store.close(); };
+        process.once('SIGINT', stop);
+        process.once('SIGTERM', stop);
+      } catch (error) { store.close(); throw error; }
     })());
 
   // Commander reports option/argument errors before action handlers run. Scope their exit code

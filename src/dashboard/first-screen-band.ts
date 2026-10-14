@@ -106,6 +106,8 @@ export interface FirstScreenBandInput {
   readonly width: number;
   readonly daemon: boolean;
   readonly link?: TuiDaemonLink;
+  /** Renders the three available-action rows and the example row in this locale; `undefined` keeps the historical band. */
+  readonly locale?: 'ko' | 'en';
   readonly pwa?: {
     readonly tailnet?: string | null;
     readonly lan?: string | null;
@@ -138,10 +140,37 @@ function fitCells(text: string, limit: number): string {
   return result;
 }
 
+// First-run guidance: three rows of available actions plus one immediately-typeable
+// example row, per locale. Every row names something the empty TUI can really do.
+const GUIDANCE: Record<'ko' | 'en', {
+  readonly actions: readonly [string, string, string];
+  readonly example: string;
+}> = {
+  ko: {
+    actions: [
+      '· 대화 — 무엇이든 자연어로 물어보고 시켜보세요',
+      '· 명령 — /help 로 전체 명령을 보세요',
+      '· 스킬 — /run-skill <이름> 으로 설치된 스킬을 돌리세요',
+    ],
+    example: '바로 입력해 보세요: 무엇을 할 수 있어?',
+  },
+  en: {
+    actions: [
+      '· Chat — ask for anything in plain language',
+      '· Commands — /help lists every command',
+      '· Skills — /run-skill <name> runs an installed skill',
+    ],
+    example: 'Try typing: what can you do?',
+  },
+};
+
 /** A startup transcript band; never includes credentials or a partial address. */
 export function buildFirstScreenBand(input: FirstScreenBandInput): string[] {
   const width = Number.isFinite(input.width) ? Math.max(0, Math.floor(input.width)) : 0;
-  const fit = (text: string): string => text.slice(0, width);
+  // The historical band is mixed: the link row speaks Korean, the remaining lines English.
+  // An explicit locale unifies them; `undefined` must keep every pinned line byte-identical.
+  const linkKorean = input.locale !== 'en';
+  const plainKorean = input.locale === 'ko';
   const address = [input.pwa?.tailnet, input.pwa?.lan, input.pwa?.loopback]
     .map((candidate) => {
       if (!candidate) return null;
@@ -154,32 +183,53 @@ export function buildFirstScreenBand(input: FirstScreenBandInput): string[] {
       }
     })
     .find((candidate) => candidate !== null);
-  const fallback = input.pwa === undefined ? 'PWA: not checked' : 'PWA: unavailable';
+  const fallback = input.pwa === undefined
+    ? (plainKorean ? 'PWA: 확인 안 함' : 'PWA: not checked')
+    : (plainKorean ? 'PWA: 사용할 수 없음' : 'PWA: unavailable');
   const addressLine = address ? `PWA: ${address}` : fallback;
 
   const daemonLine = (() => {
     const link = input.link;
-    if (!link) return `elanous | daemon: ${input.daemon ? 'online' : 'offline'}`;
-    if (link.status === 'checking') return 'elanous | 데몬: 확인 중';
+    if (!link) return plainKorean
+      ? `elanous | 데몬: ${input.daemon ? '켜짐' : '꺼짐'}`
+      : `elanous | daemon: ${input.daemon ? 'online' : 'offline'}`;
+    if (link.status === 'checking') return linkKorean ? 'elanous | 데몬: 확인 중' : 'elanous | daemon: checking';
     if (link.status === 'connected') {
       let address: string;
       try {
         const url = new URL(link.address);
         address = ['http:', 'https:'].includes(url.protocol) && url.hostname ? url.origin : '';
       } catch { address = ''; }
-      const line = `elanous | 데몬: 연결됨${address ? ` (${address})` : ''}`;
-      return cellWidth(line) <= width ? line : 'elanous | 데몬: 연결됨';
+      const bare = linkKorean ? 'elanous | 데몬: 연결됨' : 'elanous | daemon: connected';
+      const line = `${bare}${address ? ` (${address})` : ''}`;
+      return cellWidth(line) <= width ? line : bare;
     }
-    if (link.status === 'error') return `elanous | 데몬: ${link.stage} 조회 오류`;
-    const bare = `elanous | 데몬: ${link.status === 'absent' ? '없음' : '응답 없음'}`;
+    if (link.status === 'error') {
+      return linkKorean ? `elanous | 데몬: ${link.stage} 조회 오류` : `elanous | daemon: ${link.stage} lookup error`;
+    }
+    const bare = linkKorean
+      ? `elanous | 데몬: ${link.status === 'absent' ? '없음' : '응답 없음'}`
+      : `elanous | daemon: ${link.status === 'absent' ? 'absent' : 'unhealthy'}`;
     if (!link.startCommand || CONTROL_CHARS.test(link.startCommand)) return bare;
-    const line = `${bare} · 시작: ${link.startCommand}`;
+    const line = `${bare} · ${linkKorean ? '시작' : 'start'}: ${link.startCommand}`;
     return cellWidth(line) <= width ? line : bare;
   })();
 
-  return [
-    input.link ? fitCells(daemonLine, width) : fit(daemonLine),
-    addressLine.length <= width ? addressLine : fit(address ? 'PWA: address available' : fallback),
-    fit('Type a message to begin | /help for commands'),
+  const hintLine = 'Type a message to begin | /help for commands';
+
+  const statusRows = [
+    fitCells(daemonLine, width),
+    cellWidth(addressLine) <= width
+      ? addressLine
+      : fitCells(address ? (plainKorean ? 'PWA: 주소 확인됨' : 'PWA: address available') : fallback, width),
   ];
+  // The historical band folds its guidance into one mixed-language hint row.
+  // An explicit locale renders the same guidance as three available-action rows
+  // plus one immediately-typeable example row, in that locale — on every screen
+  // state (empty, checking, absent, unhealthy, error) because none of these
+  // rows depends on the daemon link or the PWA lookup.
+  const guidanceRows = input.locale
+    ? [...GUIDANCE[input.locale].actions, GUIDANCE[input.locale].example].map((row) => fitCells(row, width))
+    : [fitCells(hintLine, width)];
+  return [...statusRows, ...guidanceRows];
 }

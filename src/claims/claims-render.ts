@@ -6,6 +6,7 @@ import { BRAND_RULES_UNMEASURED, checkBrand } from '../../scripts/brand/check.js
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import type { ClaimsLedger, ClaimEvidence } from './claims-ledger.js';
+import type { PatentLedger } from '../patents/ledger.js';
 
 export type ClaimSurface = 'deck' | 'site' | 'notice';
 export interface RenderedClaims {
@@ -49,12 +50,14 @@ export function representativeNumber(value: string): string | undefined {
   return matches[0];
 }
 
-export function renderClaims(ledger: ClaimsLedger, options: { surface: ClaimSurface; audience?: string; rulesPath?: string }): RenderedClaims {
+export function renderClaims(ledger: ClaimsLedger, options: { surface: ClaimSurface; audience?: string; rulesPath?: string; patents?: { ledger: PatentLedger; owner: string; audience: string } }): RenderedClaims {
   const { surface, audience } = options;
   if (!(surface in headings)) throw new Error(`invalid claims surface: ${surface}`);
   const excluded: RenderedClaims['excluded'] = [];
   const candidates: Array<{ id: string; line: string }> = [];
-  for (const row of ledger.list()) {
+  const rows = ledger.list();
+  const known = new Set(rows.map(row => row.id));
+  for (const row of rows) {
     if (audience && !row.audience.split(',').includes(audience)) continue;
     if (row.status !== 'public') {
       excluded.push({ id: row.id, reason: row.status === 'stale' ? 'stale' : row.status === 'retracted' ? 'retracted' : 'not-public' });
@@ -81,6 +84,23 @@ export function renderClaims(ledger: ClaimsLedger, options: { surface: ClaimSurf
       continue;
     }
     candidates.push({ id: row.id, line: `- ${claim} — ${number} <!-- claim:${row.id} measured:${evidence.measured_at} cmd:${commentValue(evidence.command)}${evidence.source ? ` source:${commentValue(evidence.source)}` : ''} --> <!-- src:${commentValue(evidence.source ?? evidence.command)} -->` });
+  }
+
+  // 공개 허용 상태는 렌더 시점에 특허 원장에서 읽는다. 임의의 ClaimRow 배열은 받지 않는다.
+  // 저장된 주장과 같은 식별자를 가진 유도 행은 원장 행이 이긴다.
+  for (const row of options.patents ? ledger.patentClaims(options.patents.ledger, options.patents) : []) {
+    if (known.has(row.id)) continue;
+    if (audience && !row.audience.split(',').includes(audience)) continue;
+    if (row.status !== 'public') {
+      excluded.push({ id: row.id, reason: 'not-public' });
+      continue;
+    }
+    const patentClaim = firstSentence(row.claim);
+    if (!patentClaim) {
+      excluded.push({ id: row.id, reason: 'brand' });
+      continue;
+    }
+    candidates.push({ id: row.id, line: `- ${patentClaim} <!-- claim:${row.id} patent --> <!-- src:patents -->` });
   }
 
   const rulesMissing = checkBrand(scopes[surface], [], options.rulesPath).missing;

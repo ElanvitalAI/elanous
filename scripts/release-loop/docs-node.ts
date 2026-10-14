@@ -130,7 +130,11 @@ export function runDocs(
 const SHA = /^[0-9a-f]{40}$/i;
 const PREFETCH_DEADLINE_MS = 15 * 60_000;
 type Cut = { version: string; commit: string; manifestHash: string };
-type PrefetchCache = Cut & { main: string; tree: string; docs: DocsResult; tui: Record<string, unknown> | null };
+// Two separately published cache files: a finished TUI must survive a docs failure or delay,
+// so it never lives inside the same file as the docs result (should-fix ②).
+type TuiCache = Cut & { tui: Record<string, unknown> };
+type DocsCache = Cut & { main: string; tree: string; docs: DocsResult };
+type PrefetchCache = DocsCache & { tui: Record<string, unknown> | null };
 type Runner = (command: string, args: string[], cwd?: string, timeout?: number, env?: NodeJS.ProcessEnv) => string;
 export const commandRunner: Runner = (command, args, cwd, timeout, env) => {
   const output = spawnSync(command, args, { cwd, env: env ?? process.env, timeout: timeout ?? 15 * 60_000, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
@@ -162,11 +166,27 @@ function claimPrefetch(dir: string, owner: 'worker' | 'docs'): boolean {
 function cacheFile(dir: string, cut: Cut): string {
   return join(dir, `${cut.commit}-${cut.manifestHash}.json`);
 }
-function loadCache(dir: string, cut: Cut): PrefetchCache | null {
+function tuiCacheFile(dir: string, cut: Cut): string {
+  return join(dir, `${cut.commit}-${cut.manifestHash}.tui.json`);
+}
+function loadTuiCache(dir: string, cut: Cut): TuiCache | null {
   try {
-    const value = JSON.parse(readFileSync(cacheFile(dir, cut), 'utf8')) as PrefetchCache;
+    const value = JSON.parse(readFileSync(tuiCacheFile(dir, cut), 'utf8')) as TuiCache;
+    if (value.version !== cut.version || value.commit !== cut.commit || value.manifestHash !== cut.manifestHash) return null;
+    return value;
+  } catch { return null; }
+}
+/** Publish `data` to `path` atomically (temp + rename), so a reader never sees a partial file. */
+function publish(path: string, data: unknown): void {
+  const staged = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(staged, JSON.stringify(data) + '\n');
+  try { renameSync(staged, path); } catch (error) { rmSync(staged, { force: true }); throw error; }
+}
+function loadCache(dir: string, cut: Cut): DocsCache | null {
+  try {
+    const value = JSON.parse(readFileSync(cacheFile(dir, cut), 'utf8')) as DocsCache;
     if (value.version !== cut.version || value.commit !== cut.commit || value.manifestHash !== cut.manifestHash
-      || !SHA.test(value.main) || value.tree !== join(dir, 'tree') || !existsSync(value.tree)
+      || !SHA.test(value.main) || dirname(value.tree) !== dir || !/^tree-[0-9a-f-]{36}$/.test(basename(value.tree)) || !existsSync(value.tree)
       || value.docs?.outcome !== 'ok' || value.docs.version !== cut.version
       || value.docs.notes !== join(value.tree, 'release/public/docs/releases', `${cut.version}.md`)
       || value.docs.pages !== join(value.tree, 'website/pages.json')
@@ -191,21 +211,34 @@ export function stagePrefetch(context: GraphContext, env: NodeJS.ProcessEnv = pr
   const cut = cutFor(context, stateRoot);
   mkdirSync(dir, { recursive: true });
   const already = loadCache(dir, cut);
-  if (already) return already;
-  const tree = join(dir, 'tree');
+  if (already) return { ...already, tui: loadTuiCache(dir, cut)?.tui ?? null };
+  // An attempt gets its own path. A failed add can only remove a tree belonging to this attempt,
+  // even when an earlier cut or a concurrent worker has a checkout in the same run directory.
+  const tree = join(dir, `tree-${randomUUID()}`);
   let added = false;
+  // `git worktree add` can fail AFTER creating the tree directory (e.g. a failed checkout): clean up
+  // whenever the add succeeded OR the tree is on disk, so a retry of this run is never blocked (should-fix ①).
+  const removeTree = () => {
+    if (!(added || existsSync(tree))) return;
+    try { runner('git', ['worktree', 'remove', '--force', tree], repo, 60_000); } catch { /* preserve original failure */ }
+    // A remove that failed (or could not unregister the tree) must still leave no blocking directory behind.
+    if (existsSync(tree)) rmSync(tree, { recursive: true, force: true });
+  };
   try {
     const main = run('git', ['rev-parse', '--verify', 'origin/main^{commit}'], repo);
     if (!SHA.test(main)) throw new Error('invalid origin/main commit');
-    // TUI runs against the cut, on its own isolated worktree, before touching the docs checkout.
+    const cachedTui = loadTuiCache(dir, cut);
+    // TUI runs against the cut, on its own isolated session, before touching the docs checkout.
     // tui-sim-node.ts prints the RAW result (no `outcome`); judge it the way node-verdict.ts tui would before reuse.
-    const tuiData = deps.tui ? deps.tui(cut.commit) : (() => {
+    // Publish the reusable TUI in its OWN file the moment it is confirmed — a later docs failure or
+    // delay must not throw away a finished TUI (should-fix ②).
+    const tui = cachedTui ? cachedTui.tui : reusableTui(withTuiOutcome(0, deps.tui ? deps.tui(cut.commit) : (() => {
       const tuiRun = spawnSync('bun', ['scripts/release-loop/tui-sim-node.ts', '--commit', cut.commit, '--json'], {
         cwd: repo, timeout: Math.min(6 * 60_000, left()), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
       });
       return tuiRun.status === 0 ? lastResult({ status: tuiRun.status, stdout: tuiRun.stdout ?? '', stderr: tuiRun.stderr ?? '' }) ?? null : null;
-    })();
-    const tui = reusableTui(withTuiOutcome(0, tuiData), cut.commit);
+    })()), cut.commit);
+    if (tui && !cachedTui) publish(tuiCacheFile(dir, cut), { ...cut, tui });
     run('git', ['worktree', 'add', '--detach', tree, main], repo);
     added = true;
     run('bun', ['install', '--frozen-lockfile'], tree);
@@ -220,19 +253,14 @@ export function stagePrefetch(context: GraphContext, env: NodeJS.ProcessEnv = pr
     const finalCut = cutFor(context, stateRoot);
     if (finalCut.manifestHash !== cut.manifestHash) throw new Error('manifest changed during prefetch');
     const result: PrefetchCache = { ...cut, main, tree, docs, tui };
-    const final = cacheFile(dir, cut);
-    const staged = `${final}.${process.pid}.${randomUUID()}.tmp`;
-    writeFileSync(staged, JSON.stringify(result) + '\n');
+    const docsCache: DocsCache = { ...cut, main, tree, docs };
     // Publication handshake: whoever creates `claim` first (O_EXCL) wins. The docs node claims before it reads,
     // so a worker that loses can never publish a cache that a docs attempt would consume.
-    if (!claimPrefetch(dir, 'worker')) {
-      rmSync(staged, { force: true });
-      throw new Error('docs node already ran; late prefetch is discarded');
-    }
-    renameSync(staged, final);
+    if (!claimPrefetch(dir, 'worker')) throw new Error('docs node already ran; late prefetch is discarded');
+    publish(cacheFile(dir, cut), docsCache);
     return result;
   } catch (error) {
-    if (added) { try { runner('git', ['worktree', 'remove', '--force', tree], repo, 60_000); } catch { /* preserve original failure */ } }
+    removeTree();
     throw error;
   }
 }
@@ -247,9 +275,10 @@ export function joinTui(context: GraphContext, env: NodeJS.ProcessEnv, repo: str
   }, stateRoot = effectiveInstanceRoot()): Record<string, unknown> {
   if (context.outputs.upgrade?.outcome !== 'ok') throw new Error('upgrade did not pass');
   // Any failure to key the cache (no manifest, cutoff mismatch, no run dir) is a cache miss → original TUI path.
+  // The TUI cache file is independent of docs (should-fix ②): a docs failure or delay never blocks this read.
   let cut: Cut | null = null;
-  let cached: PrefetchCache | null = null;
-  try { cut = cutFor(context, stateRoot); cached = loadCache(runCacheDir(env), cut); } catch { /* cache miss */ }
+  let cached: TuiCache | null = null;
+  try { cut = cutFor(context, stateRoot); cached = loadTuiCache(runCacheDir(env), cut); } catch { /* cache miss */ }
   const reused = cut && cached?.tui && reusableTui(cached.tui, cut.commit);
   if (reused) return { ...reused, outcome: 'ok', summary: `tui ${reused.verdict}` };
   // Preserve node-verdict.ts's exit convention and last-JSON output on a cache miss.
@@ -287,7 +316,7 @@ export function graphDocs(context: GraphContext, env: NodeJS.ProcessEnv, repo: s
   try {
     // No fetch (nor any write to remote) until every gate is verified.
     for (const node of ['gate', 'prepare', 'upgrade', 'tui']) if (context.outputs[node]?.outcome !== 'ok') throw new Error(`${node} did not pass`);
-    let cached: PrefetchCache | null = null;
+    let cached: DocsCache | null = null;
     // A cache key that cannot be computed is a miss — the original fresh-worktree path runs.
     if (mayConsume && cacheDir) { try { const cut = cutFor(context, stateRoot); cached = loadCache(cacheDir, cut); } catch { cached = null; } }
     const branch = `release-docs/${version}`;

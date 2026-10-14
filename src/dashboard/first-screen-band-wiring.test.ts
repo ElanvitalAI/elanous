@@ -100,6 +100,30 @@ test('lookup rejection does not block first screen or log secrets', async () => 
   expect(observations).toEqual([{ daemon: false, hasPwa: false, hasTailnet: false }]);
 });
 
+test('a resolved locale threads the localized guidance rows through the production renderer', async () => {
+  const lines: string[] = [];
+  const history = [{ role: 'system' }];
+  const observations: object[] = [];
+  await renderDashboardFirstScreenBand({
+    history, lines, width: 120, locale: 'ko',
+    daemonLink: async () => ({ status: 'absent', startCommand: 'elanous nexus run --hmr' }),
+    show: async () => ({ status: 'absent' }),
+    draw: () => {}, observe: (value) => observations.push(value),
+  });
+  expect(lines).toEqual(buildFirstScreenBand({
+    width: 120, daemon: false, locale: 'ko', link: { status: 'absent', startCommand: 'elanous nexus run --hmr' },
+  }));
+  // Rows 2..5 are the three available-action rows plus the immediately-typeable
+  // example row; they survive the daemon-link and PWA lookups resolving in place.
+  expect(lines.slice(2)).toEqual([
+    '· 대화 — 무엇이든 자연어로 물어보고 시켜보세요',
+    '· 명령 — /help 로 전체 명령을 보세요',
+    '· 스킬 — /run-skill <이름> 으로 설치된 스킬을 돌리세요',
+    '바로 입력해 보세요: 무엇을 할 수 있어?',
+  ]);
+  expect(observations).toEqual([{ daemon: false, hasPwa: false, hasTailnet: false }]);
+});
+
 // ⚠️ 맥(BSD `script`)은 표준 입력이 진짜 터미널이어야 PTY 를 세운다 — 이 시험처럼 파이프로 띄우면
 //  «tcgetattr/ioctl: Operation not supported on socket» 로 시작도 못 한다(0.2.9 게이트 10-02 실측).
 //  리눅스(util-linux `script` · 하니스 파드)에서는 그대로 돈다. 맥에서도 돌게 하는 것은 0.2.10 칸(드라이버 `scripts/drive-tui.ts` 로 옮기기).
@@ -113,7 +137,9 @@ test.skipIf(process.platform === 'darwin')('showDashboard renders the startup ba
   const scriptArgs = process.platform === 'darwin' ? ['-q', '/dev/null', ...command] : ['-qfec', command.join(' '), '/dev/null'];
   const child = spawn('script', scriptArgs, {
     cwd: resolve(import.meta.dir, '../..'),
-    env: { ...process.env, NODE_ENV: 'test', TERM: 'xterm-256color', NO_COLOR: '1', COLUMNS: '120', LINES: '48' },
+    // The production call site resolves the band locale from the environment
+    // (ELANOUS_LANG → LC_ALL/LANG → en); pin it so the pinned rows below are deterministic.
+    env: { ...process.env, NODE_ENV: 'test', ELANOUS_LANG: 'ko', TERM: 'xterm-256color', NO_COLOR: '1', COLUMNS: '120', LINES: '48' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   const terminal = new Terminal({ cols: 120, rows: 48, scrollback: 200, allowProposedApi: true });
@@ -150,7 +176,7 @@ test.skipIf(process.platform === 'darwin')('showDashboard renders the startup ba
       const footer = frame.findIndex((line, index) => index > header && /^─{8}/.test(line));
       return header >= 0 && footer > header ? frame.slice(header + 1, footer) : [];
     };
-    const before = await waitFor((frame) => historyArea(frame).some((line) => line.includes('Type a message to begin'))
+    const before = await waitFor((frame) => historyArea(frame).some((line) => line.includes('무엇을 할 수 있어?'))
       && historyArea(frame).some((line) => line.includes('데몬: 없음')), 'resolved daemon link in real TUI');
     // `--test=<root>` is an explicit root, so the start command names it (or is dropped when it does not fit).
     expect(historyArea(before).join('\n')).toContain('데몬: 없음');
@@ -161,13 +187,13 @@ test.skipIf(process.platform === 'darwin')('showDashboard renders the startup ba
     const after = await waitFor((frame) => {
       const history = historyArea(frame);
       return history.some((line) => line.includes('❯ band-retention-probe'))
-        && history.some((line) => line.includes('Type a message to begin'))
+        && history.some((line) => line.includes('무엇을 할 수 있어?'))
         && history.some((line) => line.includes('PWA:'))
         && frame.some((line) => line.trim() === '❯');
     }, 'submitted input in transcript');
     expect(historyArea(after)).toEqual(expect.arrayContaining([
       expect.stringContaining('❯ band-retention-probe'),
-      expect.stringContaining('Type a message to begin'),
+      expect.stringContaining('무엇을 할 수 있어?'),
       expect.stringContaining('PWA:'),
     ]));
   } finally {
@@ -189,7 +215,7 @@ test.skipIf(process.platform === 'darwin')('real TUI shows a healthy write daemo
   const command = ['bun', '--preload', preload, 'bin/elanous.mjs', `--test=${testRoot}`, '--chat-only'];
   const child = spawn('script', ['-qfec', command.join(' '), '/dev/null'], {
     cwd: resolve(import.meta.dir, '../..'),
-    env: { ...process.env, NODE_ENV: 'test', TERM: 'xterm-256color', NO_COLOR: '1', COLUMNS: '120', LINES: '48' },
+    env: { ...process.env, NODE_ENV: 'test', ELANOUS_LANG: 'ko', TERM: 'xterm-256color', NO_COLOR: '1', COLUMNS: '120', LINES: '48' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   const terminal = new Terminal({ cols: 120, rows: 48, scrollback: 200, allowProposedApi: true });

@@ -43,6 +43,23 @@ export interface FetchCodexPluginsOpts {
   noCache?: boolean;
 }
 
+/** Read the full inventory for an explicit package import. Unlike the chip projector, this keeps
+ *  the package location and never substitutes a stale cached inventory after an RPC failure. */
+export async function readCodexPluginList(
+  spawn: typeof spawnCodexAppServer = spawnCodexAppServer,
+): Promise<unknown> {
+  const server = spawn({ requestTimeoutMs: 5000 });
+  try {
+    await server.client.request('initialize', {
+      clientInfo: { name: 'elanous', version: '0.x' }, capabilities: { experimentalApi: true },
+    });
+    return await server.client.request<Record<string, never>, unknown>('plugin/list', {});
+  } finally {
+    try { await server.client.close(); }
+    finally { server.child.kill(); }
+  }
+}
+
 /** Uncached inventory probe: distinguish no session / RPC failure from an empty installed list. */
 export async function readCodexPluginsObservation(client: CodexAppServerClient | null | undefined): Promise<
   { status: 'ok'; plugins: ReadonlyArray<CodexPlugin> } | { status: 'unknown'; plugins: readonly [] }

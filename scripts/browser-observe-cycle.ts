@@ -4,7 +4,15 @@
 // 기본 MCP 전송은 기존 McpClient 의 initialize + Mcp-Session-Id 수명주기를 탄다.
 // 스케줄러 진입점 배선은 다음 조각의 몫이다. 이 파일은 호출 가능한 함수만 내보낸다.
 
-import { McpClient, McpServerError, type McpHttpFetch } from '../src/mcp/client.js';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import {
+  McpClient,
+  McpConnectionError,
+  McpServerError,
+  type McpHttpFetch,
+} from '../src/mcp/client.js';
+import { getElanousConfigDir } from '../src/elanous-config-dir.js';
 import { debug } from '../src/debug/log.js';
 
 export const ELANOUS_PWA_URL = 'http://127.0.0.1:31415/app';
@@ -21,6 +29,10 @@ export const BROWSER_OBSERVE_OK = 'ok';
 export const BROWSER_OBSERVE_WRONG_SCREEN = 'wrong-screen';
 /** 관측하지 못했다 */
 export const BROWSER_OBSERVE_UNOBSERVED = 'unobserved';
+/** `unobserved` 사유 — 루프백 owner 토큰을 못 읽어 Authorization 헤더를 못 붙였다 */
+export const BROWSER_OBSERVE_REASON_AUTH_MISSING = 'auth-missing';
+/** `unobserved` 사유 — 루프백 owner 토큰을 붙였는데 서버가 401 로 거부했다 */
+export const BROWSER_OBSERVE_REASON_AUTH_REJECTED = 'auth-rejected';
 
 export type BrowserObserveStatus =
   | typeof BROWSER_OBSERVE_OK
@@ -50,6 +62,39 @@ export interface BrowserObserveResult extends BrowserObserveClassification {
   request: BrowserObserveMcpRequest;
 }
 
+/** 루프백 owner 토큰을 어디서 읽는지 — `src/cli/mcp-reload.ts` 의 기존 꼴과 같은 자리다. */
+export function browserObserveTokenPath(): string {
+  return join(getElanousConfigDir(), 'acp-token');
+}
+
+/**
+ * 루프백 ACP 토큰을 **읽기 전용**으로 얻는다(실패는 null).
+ * ⛔ `ensureAuthToken`(src/auth/acp-token.ts) 을 쓰지 않는다 — 그것은 «없으면 만든다».
+ * 이 조각은 새 토큰 생성 0: 파일이 없거나 비면 그대로 auth-missing 이다.
+ */
+export function readBrowserObserveToken(): string | null {
+  const tokenPath = browserObserveTokenPath();
+  try {
+    if (!existsSync(tokenPath)) return null;
+    const token = readFileSync(tokenPath, 'utf8').trim();
+    return token.length > 0 ? token : null;
+  } catch {
+    return null;
+  }
+}
+
+/** MCP POST 전부에 `Authorization: Bearer <token>` 을 얹는 전송 래퍼. */
+export function withBrowserObserveAuthorization(
+  fetchImpl: BrowserObserveHttpFetch,
+  token: string,
+): BrowserObserveHttpFetch {
+  return (url, init) =>
+    fetchImpl(url, {
+      ...init,
+      headers: { ...init.headers, authorization: `Bearer ${token}` },
+    });
+}
+
 export type BrowserObserveMcpCall = (request: BrowserObserveMcpRequest) => Promise<unknown>;
 export type BrowserObserveLog = (category: string, event: string, data?: unknown) => void;
 export type BrowserObserveHttpFetch = McpHttpFetch;
@@ -58,6 +103,8 @@ export interface BrowserObserveDeps {
   mcpCall?: BrowserObserveMcpCall;
   fetch?: BrowserObserveHttpFetch;
   log?: BrowserObserveLog;
+  /** 토큰 획득 주입 자리 — 시험이 파일 시스템 없이 결정성을 얻는다. 생략하면 `readBrowserObserveToken` */
+  readToken?: () => string | null;
 }
 
 /**
@@ -328,6 +375,15 @@ function emit(
 }
 
 function unobservedFromCaught(caught: unknown): BrowserObserveClassification {
+  // 루프백 토큰을 붙였는데 서버가 401 로 거부한 경우 — McpClient 가
+  // McpConnectionError('auth-required') 로 던진다. 긴 오류 문자열 대신 이유 한 칸으로 가른다.
+  if (caught instanceof McpConnectionError && caught.reason === 'auth-required') {
+    return {
+      status: BROWSER_OBSERVE_UNOBSERVED,
+      observedUrl: null,
+      reason: BROWSER_OBSERVE_REASON_AUTH_REJECTED,
+    };
+  }
   if (caught instanceof McpServerError) {
     return {
       status: BROWSER_OBSERVE_UNOBSERVED,
@@ -342,14 +398,32 @@ function unobservedFromCaught(caught: unknown): BrowserObserveClassification {
   };
 }
 
+/** 기본 전송(McpClient) 에 루프백 토큰을 얹는다. 토큰이 없으면 null — 401 이 보장된 호출은 아예 안 한다. */
+function defaultAuthorizedMcpCall(deps: BrowserObserveDeps): BrowserObserveMcpCall | null {
+  const token = deps.readToken ? deps.readToken() : readBrowserObserveToken();
+  if (token === null) return null;
+  const base: BrowserObserveHttpFetch = deps.fetch ?? ((url, init) => fetch(url, init));
+  const authorized = withBrowserObserveAuthorization(base, token);
+  return (request) => callAsideReplViaMcpClient(request, authorized);
+}
+
 /** MCP 로 브라우저에서 값을 가져와 공개 분류 함수에 넘긴다. 의존성 주입으로 실 데몬 없이 검증한다. */
 export async function observeBrowserCycle(
   deps: BrowserObserveDeps = {},
 ): Promise<BrowserObserveResult> {
   if (!deps.log) await ensureBrowserObserveLogSink();
   const log = deps.log ?? defaultLog;
-  const mcpCall = deps.mcpCall ?? ((request) => callAsideReplViaMcpClient(request, deps.fetch));
   const request = buildBrowserObserveMcpRequest();
+  const mcpCall = deps.mcpCall ?? defaultAuthorizedMcpCall(deps);
+  if (mcpCall === null) {
+    const classified: BrowserObserveClassification = {
+      status: BROWSER_OBSERVE_UNOBSERVED,
+      observedUrl: null,
+      reason: BROWSER_OBSERVE_REASON_AUTH_MISSING,
+    };
+    emit(log, classified);
+    return { ...classified, request };
+  }
   try {
     const response = await mcpCall(request);
     const rpcError = jsonRpcErrorMessage(response);

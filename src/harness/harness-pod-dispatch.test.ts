@@ -2,7 +2,7 @@ import { describe, expect, spyOn, test } from 'bun:test';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
 import { dispatchHarnessOnPod, podOrchestrateArgs } from './harness-pod-dispatch.js';
 import { podMemoryLimitFor } from '../task-orchestrator/surfaces/self-implement-pod.js';
@@ -150,6 +150,42 @@ describe('harness say/ask --substrate pod', () => {
       const refused = dispatchHarnessOnPod({ entrance: 'cli-harness-ask', input: 'docs/goals/ASK-x.md', source: 'bogus' }, { cwd: root, run });
       expect(refused).toBe(2);
       expect(seen).toHaveLength(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('repair dispatch pins the PR source, skips author and PR flags, and refuses unsafe inputs', () => {
+    const head = 'a'.repeat(40);
+    const args = podOrchestrateArgs({ entrance: 'cli-harness-say', input: 'fix', source: 'pr:42', repairCommitOnly: head }, 'goal.txt');
+    expect(args).toContain('--repair-commit-only');
+    expect(args[args.indexOf('--repair-commit-only') + 1]).toBe(head);
+    expect(args[args.indexOf('--base') + 1]).toBe('pr-42');
+    expect(args).not.toContain('--open-pr');
+    expect(args).not.toContain('--auto-merge');
+    const seen: Array<{ args: readonly string[]; env: NodeJS.ProcessEnv }> = [];
+    const run = (_cmd: string, childArgs: readonly string[], env: NodeJS.ProcessEnv) => {
+      seen.push({ args: childArgs, env }); return 0;
+    };
+    expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'fix', source: 'pr:42', repairCommitOnly: head, authorOnPod: true }, { run })).toBe(0);
+    expect(seen[0]?.env.ELANOUS_POD_AUTHOR_ON_POD).toBeUndefined();
+    expect(seen[0]?.env.ELANOUS_POD_GOAL_DOC).toBeUndefined();
+    expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'fix', source: 'commit:' + head, repairCommitOnly: head }, { run })).toBe(2);
+    expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'fix', source: 'pr:42', repairCommitOnly: head, autoMerge: true }, { run })).toBe(2);
+    expect(seen).toHaveLength(1);
+  });
+
+  test('repair flag at the public say entrance requires a PR source before any local run', () => {
+    const entry = new URL('../../bin/elanous.mjs', import.meta.url).pathname;
+    const root = mkdtempSync(join(tmpdir(), 'pod-repair-cli-'));
+    const env = { ...process.env, ELANOUS_STATE_DIR: join(root, 'state'), ELANOUS_CONFIG_DIR: join(root, 'config'), ELANOUS_POD_POOL: 'test-pool' };
+    try {
+      const result = spawnSync(process.execPath, [entry, '--test', 'harness', 'say', '--repair-commit-only', 'a'.repeat(40), '--dry-run', 'fix'],
+        { encoding: 'utf8', timeout: 60_000, env });
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain('--repair-commit-only requires --substrate pod --source pr:N');
+      const valid = spawnSync(process.execPath, [entry, '--test', 'harness', 'say', '--substrate', 'pod', '--source', 'pr:42',
+        '--repair-commit-only', 'a'.repeat(40), '--no-auto-merge', '--dry-run', 'fix'], { encoding: 'utf8', timeout: 60_000, env });
+      expect(valid.status).toBe(0);
+      expect(valid.stdout).toContain(`[dry-run] repair forwarding: --pod-source pr:42 --repair-commit-only ${'a'.repeat(40)} --no-auto-merge`);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 

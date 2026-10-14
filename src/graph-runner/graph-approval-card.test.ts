@@ -120,7 +120,7 @@ test('card approval resumes through the actual graph approval node toward publis
   const dir = join(root, 'graphs');
   mkdirSync(dir);
   const graph = join(dir, 'release-loop.yaml');
-  writeFileSync(graph, `graph_id: release-loop\nversion: 1\nentry_node: approve-publish\nterminal_nodes: [done, failed]\nnodes:\n  - { node_id: approve-publish, kind: hitl, recipe: 'approval:publish', max_visits: 1 }\n  - { node_id: publish, kind: git, recipe: 'cmd:command', max_visits: 1 }\n  - { node_id: done, kind: gate, max_visits: 1 }\n  - { node_id: failed, kind: gate, max_visits: 1 }\nedges:\n  - { from: approve-publish, on: outcome, map: { ok: publish, fail: failed } }\n  - { from: publish, on: outcome, map: { ok: done, fail: failed } }\n`);
+  writeFileSync(graph, `graph_id: approval-release-probe\nversion: 1\nentry_node: approve-publish\nterminal_nodes: [done, failed]\nnodes:\n  - { node_id: approve-publish, kind: hitl, recipe: 'approval:publish', max_visits: 1 }\n  - { node_id: publish, kind: git, recipe: 'cmd:command', max_visits: 1 }\n  - { node_id: done, kind: gate, max_visits: 1 }\n  - { node_id: failed, kind: gate, max_visits: 1 }\nedges:\n  - { from: approve-publish, on: outcome, map: { ok: publish, fail: failed } }\n  - { from: publish, on: outcome, map: { ok: done, fail: failed } }\n`);
   writeFileSync(join(dir, 'recipes.yaml'), `publish: { approval: 'Publish?' }\ncommand: { command: 'echo published' }\n`);
   const run = await runGraph(graph, { runId: 'actual', deps: { root, processStartMs: () => null } });
   expect(run.status).toBe('awaiting-approval');

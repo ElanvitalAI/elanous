@@ -3,6 +3,12 @@ export const IDEA_APPROVAL_LIMIT = 10;
 export const IDEA_STALE_DAYS = 7;
 export const STALLED_DRAFT_HOURS = 24;
 export const CLAIM_IDLE_HOURS = 6;
+export const PR_LABEL_NAMES = {
+  running: 'elanous:running',
+  stalled: 'elanous:stalled',
+  superseded: 'elanous:superseded',
+  needsRebase: 'elanous:needs-rebase',
+} as const;
 
 export type PrLabelAxis = 'state' | 'addon' | 'origin' | 'risk';
 export type PrLabelApplier = 'harness' | 'launcher' | 'sweeper' | 'session' | 'human';
@@ -24,14 +30,14 @@ export interface PrLabelDefinition {
 }
 
 export const PR_LABELS = [
-  { name: 'elanous:running', axis: 'state', color: '1D76DB', description: 'Harness run or session is actively handling a draft PR', appliedBy: ['harness', 'session'], sweep: { action: 'mark-stalled', when: 'run-ended' } },
-  { name: 'elanous:stalled', axis: 'state', color: 'D93F0B', description: 'Incomplete draft requiring human attention', appliedBy: ['harness', 'sweeper'], sweep: { action: 'close', afterHours: STALLED_DRAFT_HOURS } },
+  { name: PR_LABEL_NAMES.running, axis: 'state', color: '1D76DB', description: 'Harness run or session is actively handling a draft PR', appliedBy: ['harness', 'session'], sweep: { action: 'mark-stalled', when: 'run-ended' } },
+  { name: PR_LABEL_NAMES.stalled, axis: 'state', color: 'D93F0B', description: 'Incomplete draft requiring human attention', appliedBy: ['harness', 'sweeper'], sweep: { action: 'close', afterHours: STALLED_DRAFT_HOURS } },
   { name: 'elanous:idea-approval', axis: 'state', color: '0E8A16', description: 'Completed, ready PR awaiting human approval', appliedBy: ['launcher'], sweep: { action: 'none' } },
-  { name: 'elanous:superseded', axis: 'state', color: '6A737D', description: 'Another PR has already merged the same work', appliedBy: ['sweeper', 'session'], sweep: { action: 'close' } },
+  { name: PR_LABEL_NAMES.superseded, axis: 'state', color: '6A737D', description: 'Another PR has already merged the same work', appliedBy: ['sweeper', 'session'], sweep: { action: 'close' } },
   { name: 'elanous:keep', axis: 'addon', color: 'BFDADC', description: 'Human requested that the PR be kept open', appliedBy: ['human'], sweep: { action: 'exclude' } },
   { name: 'elanous:release-hold', axis: 'addon', color: 'D4C5F9', description: 'Exclude from release notes until verified in production', appliedBy: ['launcher', 'session', 'human'], sweep: { action: 'none' } },
   { name: 'elanous:idea-stale', axis: 'addon', color: 'FBCA04', description: 'Approval pending beyond the notification threshold', appliedBy: ['sweeper'], sweep: { action: 'notify', afterDays: IDEA_STALE_DAYS } },
-  { name: 'elanous:needs-rebase', axis: 'addon', color: 'E99695', description: 'Approval blocked by conflicts or failing checks', appliedBy: ['sweeper'], sweep: { action: 'block-approval' } },
+  { name: PR_LABEL_NAMES.needsRebase, axis: 'addon', color: 'E99695', description: 'Approval blocked by conflicts or failing checks', appliedBy: ['sweeper', 'session'], sweep: { action: 'block-approval' } },
   { name: 'elanous:bench', axis: 'addon', color: 'C5DEF5', description: 'Bench arm output: never landed or swept; the owner harvests the winner onto main', appliedBy: ['harness'], sweep: { action: 'none' } },
   { name: 'elanous:harvestable', axis: 'addon', color: 'FBCA04', description: 'Pod terminal marked this PR for harvest', appliedBy: ['harness'], sweep: { action: 'close', afterHours: STALLED_DRAFT_HOURS } },
   { name: 'elanous:from-harness', axis: 'origin', color: 'C5DEF5', description: 'Launched from a harness goal', appliedBy: ['harness'], sweep: { action: 'none' } },

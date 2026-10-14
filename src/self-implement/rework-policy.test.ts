@@ -3,7 +3,7 @@ import { describe, it, expect } from 'bun:test';
 import {
   resolveAdaptiveMaxRework, resolveAdaptiveMaxReworkDecision, measureReviewFindingRepeat, shouldEscalateModel, resolveEscalateTier, resolveEscalateTarget, resolveExplicitChildEscalateTarget,
   buildReworkFeature, failIndicator, parseContractConflictRelaxation, parseReworkBudgetDecision, appendReworkHistory, applyReworkBudgetDecision, resolveContractConflictDisposition, resolveReworkBudgetCarry, stripReworkBudgetHeaders, countConsecutiveMustFixIds, assessConvergence, isSubstantiveReviewFindingRepeat, resolveConvergenceDisposition, mergeReworkNotes, resolveReworkKind,
-  type ReworkStopReason,
+  type ReworkStopReason, type EscalateTargetObservation,
 } from './rework-policy.js';
 import { MUST_FIX_REFUTATION_ACKNOWLEDGEMENT, parseMustFixRefutations } from './reflect-mustfix.js';
 import { reviewFindingKey } from '../agent-substrate/review-finding-key.js';
@@ -451,6 +451,106 @@ describe('resolveEscalateTarget — 단일 중간 모델/provider/effort', () =>
     expect(resolveExplicitChildEscalateTarget('sol', {
       ELANOUS_SELFDEV_SOL_MODEL: 'configured-terra', ELANOUS_SELFDEV_SOL_PROVIDER: 'configured-codex', ELANOUS_SELFDEV_SOL_EFFORT: 'medium',
     }, { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' })).toEqual({ model: 'configured-terra', provider: 'configured-codex', effort: 'medium' });
+  });
+  it('escalateChild maps glm-5.3 to the configured same-provider target', () => {
+    const observations: EscalateTargetObservation[] = [];
+    const target = resolveExplicitChildEscalateTarget('sol', {}, {
+      provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3',
+    }, {
+      // 골 문면의 예시 구문 그대로 — OpenRouter 경로 Sonnet 은 같은 provider(openrouter) 안이다.
+      escalateChild: { 'openrouter/z-ai/glm-5.3': 'openrouter/anthropic/claude-sonnet-5.5' },
+      observe: (observation) => observations.push(observation),
+    });
+    // 매핑 타깃이 같은 provider(openrouter) 안 → 사다리(better 칸 qwen3.8-max)보다 먼저 적용된다.
+    expect(target).toEqual({ model: 'openrouter/anthropic/claude-sonnet-5.5', provider: 'openrouter', effort: '' });
+    expect(observations).toEqual([{
+      category: 'self-dev.rework',
+      event: 'escalate-target',
+      data: { source: 'config', from: 'openrouter/z-ai/glm-5.3', to: 'openrouter/anthropic/claude-sonnet-5.5', applied: true },
+    }]);
+    // 같은 provider 매핑이 사다리보다 먼저다 — 사다리 칸(qwen3.8-max)으로 가지 않는다.
+    expect(target!.model).not.toBe(lookupLlmTierSpec('openrouter', 'better').model);
+  });
+  it('escalateChild env beats config (Pod 자식은 env 로만 받는다)', () => {
+    const observations: EscalateTargetObservation[] = [];
+    const target = resolveExplicitChildEscalateTarget('sol', {
+      ELANOUS_SELFDEV_ESCALATE_CHILD: 'openrouter/z-ai/glm-5.3=openrouter/moonshotai/kimi-k3',
+    }, {
+      provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3',
+    }, {
+      escalateChild: { 'openrouter/z-ai/glm-5.3': 'openrouter/qwen/qwen3.8-max-0902' },
+      observe: (observation) => observations.push(observation),
+    });
+    expect(target).toEqual({ model: 'openrouter/moonshotai/kimi-k3', provider: 'openrouter', effort: '' });
+    expect(observations).toEqual([{
+      category: 'self-dev.rework',
+      event: 'escalate-target',
+      data: { source: 'env', from: 'openrouter/z-ai/glm-5.3', to: 'openrouter/moonshotai/kimi-k3', applied: true },
+    }]);
+  });
+  it('a cross-provider escalateChild target is ignored', () => {
+    const observations: EscalateTargetObservation[] = [];
+    // 매핑 타깃이 자식 provider(openrouter) 밖(anthropic Sonnet) → 무시 ⊕ 관측하고 사다리 한 칸 위로.
+    const target = resolveExplicitChildEscalateTarget('sol', {}, {
+      provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3',
+    }, {
+      escalateChild: { 'openrouter/z-ai/glm-5.3': 'anthropic/claude-sonnet-5.5' },
+      observe: (observation) => observations.push(observation),
+    });
+    expect(target).toEqual({ model: lookupLlmTierSpec('openrouter', 'better').model, provider: 'openrouter', effort: '' });
+    expect(observations).toEqual([{
+      category: 'self-dev.rework',
+      event: 'escalate-target',
+      data: { source: 'config', from: 'openrouter/z-ai/glm-5.3', to: 'anthropic/claude-sonnet-5.5', applied: false, reason: 'cross-provider' },
+    }, {
+      category: 'self-dev.rework',
+      event: 'escalate-target',
+      data: { source: 'ladder', from: 'openrouter/z-ai/glm-5.3', to: lookupLlmTierSpec('openrouter', 'better').model, applied: true },
+    }]);
+  });
+  it('an incomplete escalateChild target is observed and falls back to the ladder', () => {
+    const observations: EscalateTargetObservation[] = [];
+    const child = { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' };
+    const target = resolveExplicitChildEscalateTarget('sol', {}, child, {
+      escalateChild: { [child.model]: 'openrouter/' },
+      observe: (observation) => observations.push(observation),
+    });
+    expect(target).toEqual({ model: lookupLlmTierSpec('openrouter', 'better').model, provider: 'openrouter', effort: '' });
+    expect(observations).toEqual([{
+      category: 'self-dev.rework', event: 'escalate-target',
+      data: { source: 'config', from: child.model, to: 'openrouter/', applied: false, reason: 'invalid-target' },
+    }, {
+      category: 'self-dev.rework', event: 'escalate-target',
+      data: { source: 'ladder', from: child.model, to: lookupLlmTierSpec('openrouter', 'better').model, applied: true },
+    }]);
+  });
+  it('a model named like an inherited map property uses the ladder when no own mapping exists', () => {
+    const observations: EscalateTargetObservation[] = [];
+    const child = { provider: 'openrouter', model: 'toString' };
+    const target = resolveExplicitChildEscalateTarget('sol', {}, child, {
+      escalateChild: { 'openrouter/z-ai/glm-5.3': 'openrouter/moonshotai/kimi-k3' },
+      observe: (observation) => observations.push(observation),
+    });
+    expect(target).toEqual({ model: lookupLlmTierSpec('openrouter', 'best').model, provider: 'openrouter', effort: '' });
+    expect(observations).toEqual([{
+      category: 'self-dev.rework', event: 'escalate-target',
+      data: { source: 'ladder', from: 'toString', to: lookupLlmTierSpec('openrouter', 'best').model, applied: true },
+    }]);
+  });
+  it('without escalateChild the ladder step is unchanged', () => {
+    const observations: EscalateTargetObservation[] = [];
+    const glm = lookupLlmTierSpec('openrouter', 'balanced').model;
+    const target = resolveExplicitChildEscalateTarget('sol', {}, {
+      provider: 'openrouter', model: glm,
+    }, { observe: (observation) => observations.push(observation) });
+    // 매핑이 없으면 종전 그대로(바이트 불변) — 같은 provider 사다리 한 칸 위(better 칸).
+    expect(target).toEqual(resolveExplicitChildEscalateTarget('sol', {}, { provider: 'openrouter', model: glm }));
+    expect(target).toEqual({ model: lookupLlmTierSpec('openrouter', 'better').model, provider: 'openrouter', effort: '' });
+    expect(observations).toEqual([{
+      category: 'self-dev.rework',
+      event: 'escalate-target',
+      data: { source: 'ladder', from: glm, to: lookupLlmTierSpec('openrouter', 'better').model, applied: true },
+    }]);
   });
   it('none 은 null(미주입=종전 base)이고 SOL 환경 변수는 중간 승급만 바꾼다', () => {
     expect(resolveEscalateTarget('none', {})).toBeNull();

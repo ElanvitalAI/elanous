@@ -315,3 +315,64 @@ test('failed ledger commit rolls back both the plugin and its declared knowledge
   expect(existsSync(join(opts.root, 'knowledge-packs', 'test-market', 'facts-pack', '2.0.0'))).toBe(false);
   expect(existsSync(join(opts.root, 'plugins', 'test-market', 'sample-plugin', '1.2.3'))).toBe(false);
 });
+
+/** CARD1 business-card sales plugin + sales knowledge pack served from a signed market. */
+function salesFixture(mode: 'ok' | 'no-pack' | 'wrong-signature') {
+  const root = mkdtempSync(join(tmpdir(), 'plugin-card1-'));
+  dirs.push(root);
+  const source = join(root, 'source');
+  mkdirSync(source);
+  writeFileSync(join(source, 'plugin.json'), JSON.stringify({ id: 'card1', version: '1.0.0', main: './plugin.ts', requires: { knowledgePacks: ['sales-playbook'] } }));
+  writeFileSync(join(source, 'plugin.ts'), 'export default {}');
+  const pack = join(root, 'pack');
+  mkdirSync(pack);
+  writeFileSync(join(pack, 'playbook.txt'), 'sales playbook facts');
+  const pluginArchive = join(root, 'plugin.tgz');
+  const packArchive = join(root, 'pack.tgz');
+  execFileSync('tar', ['-czf', pluginArchive, '-C', source, '.']);
+  execFileSync('tar', ['-czf', packArchive, '-C', pack, '.']);
+  const pluginBytes = readFileSync(pluginArchive);
+  const packBytes = readFileSync(packArchive);
+  const artifact = (key: string, bytes: Buffer) => ({ key, sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length });
+  const index = { name: 'test-market', interface: { displayName: 'Test' }, sequence: 1,
+    plugins: [{ name: 'card1', version: '1.0.0', source: { source: 'local' }, artifact: artifact('plugin.tgz', pluginBytes),
+      'ai.elanous': { capabilities: [], connectors: [], pricing: { model: 'free' } } }],
+    knowledgePacks: mode === 'no-pack' ? [] : [{ name: 'sales-playbook', version: '1.0.0', visibility: 'public', artifact: artifact('pack.tgz', packBytes) }] };
+  const indexBytes = Buffer.from(JSON.stringify(index));
+  const keys = generateIndexKeyPair();
+  const signer = mode === 'wrong-signature' ? generateIndexKeyPair() : keys;
+  const signature = signIndex(indexBytes, signer.privateKeyPem, keys.keyId);
+  const configPath = join(root, 'config.json');
+  addMarket('test-market', 'https://example.org/market/', { configPath });
+  const fetcher = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.endsWith('/marketplace.json')) return new Response(indexBytes);
+    if (url.endsWith('/index.sig')) return new Response(signature);
+    if (url.endsWith('/plugin.tgz')) return new Response(pluginBytes);
+    if (url.endsWith('/pack.tgz')) return new Response(packBytes);
+    throw new Error(`unexpected URL: ${url}`);
+  }) as typeof fetch;
+  const opts = { root: join(root, 'installed'), configPath, fetcher, trustedKeys: [{ keyId: keys.keyId, publicKey: keys.publicKey }], yes: true };
+  return { root, opts };
+}
+
+test('CARD1 sales plugin and its sales knowledge pack land together or not at all', async () => {
+  const ok = salesFixture('ok');
+  const installed = await installPlugin('card1@test-market', ok.opts);
+  expect(installed).toMatchObject({ name: 'card1', version: '1.0.0', market: 'test-market' });
+  expect(existsSync(join(installed.path, 'plugin.ts'))).toBe(true);
+  expect(readFileSync(join(ok.opts.root, 'knowledge-packs', 'test-market', 'sales-playbook', '1.0.0', 'playbook.txt'), 'utf8')).toBe('sales playbook facts');
+  expect(listInstalledPlugins(ok.opts.root)).toEqual([installed]);
+
+  const missing = salesFixture('no-pack');
+  await expect(installPlugin('card1@test-market', missing.opts)).rejects.toMatchObject({ reason: 'io' });
+  expect(listInstalledPlugins(missing.opts.root)).toEqual([]);
+  expect(existsSync(join(missing.opts.root, 'plugins', 'test-market', 'card1', '1.0.0'))).toBe(false);
+  expect(existsSync(join(missing.opts.root, 'knowledge-packs'))).toBe(false);
+
+  const badSignature = salesFixture('wrong-signature');
+  await expect(installPlugin('card1@test-market', badSignature.opts)).rejects.toMatchObject({ reason: 'signature' });
+  expect(listInstalledPlugins(badSignature.opts.root)).toEqual([]);
+  expect(existsSync(join(badSignature.opts.root, 'plugins', 'test-market', 'card1', '1.0.0'))).toBe(false);
+  expect(existsSync(join(badSignature.opts.root, 'knowledge-packs'))).toBe(false);
+});

@@ -306,6 +306,20 @@ describe('public skill structural check', () => {
     expect(row.violations.join('\n')).toContain('skills/example/settings.cfg');
   }));
 
+  test('an API URL path /users/ is not a personal path and stays portable OK', () => withFixture((root) => {
+    writeFileSync(join(root, 'skills', 'example', 'scripts', 'api.ts'), 'const url = "https://api.example.com/v2/users/me";');
+    const row = checkPublicSkills(root, boundary).skills[0]!;
+    expect(row.checks.portable).toBe(true);
+    expect(row.violations.join('\n')).not.toContain('skills/example/scripts/api.ts');
+  }));
+
+  test('a personal path /Users/alice/x still fails the portable check', () => withFixture((root) => {
+    writeFileSync(join(root, 'skills', 'example', 'scripts', 'local.ts'), 'const dir = "/Users/alice/x";');
+    const row = checkPublicSkills(root, boundary).skills[0]!;
+    expect(row.checks.portable).toBe(false);
+    expect(row.violations.join('\n')).toContain('skills/example/scripts/local.ts');
+  }));
+
   test('boundary errors block a passing inventory and are visible in the table', () => withFixture((root) => {
     const report = checkPublicSkills(root, { ...boundary, errors: ['uncertain: cannot classify'] });
     expect(report.ok).toBe(false);

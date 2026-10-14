@@ -348,7 +348,31 @@ export interface DecomposeApplication {
  *   ⓐ 같은 goal 을 «두 번» 쪼개지 않는다(alreadyDecomposed)
  *   ⓑ 조각이 둘 미만인 제안은 애초에 안 온다(pickDecomposeProposals 가 거른다)
  *   ⓒ 상한을 넘기면 «쪼개지 않는다» — 조각이 무한히 불어나는 것을 막는다
+ *
+ * ⭐ **조각은 원 골의 «대상 경로:» 머리줄을 물려받는다** (DECOMPOSE-PIECE-TARGET-LINE · 10-11 부검 run-76941fca):
+ *   조각 feature 가 골을 «통째로» 갈아 끼우면 첫 줄 선언이 사라져 Pod 예비 검사가 «대상 경로 0» →
+ *   재저작 NOT-GROUNDED 로 조각 전부가 exit 1 했다. 좁히는 규칙 = 원 선언 경로 중 조각 문장에
+ *   나오는 것만(없으면 원 선언 전부) · «신설:» 줄도 같은 규칙 · 첫 줄이 라벨이 아니면 지금 그대로.
  */
+
+// ── 머리줄 선언을 읽고 좁히는 순수 조각 (위 규칙의 실물) ──────────────────────────
+const TARGET_PATHS_LINE = /^대상 경로:[ \t]*(.*)$/;
+const NEW_PATHS_LINE = /^신설:[ \t]*(.*)$/;
+
+/** 선언 줄의 경로를 나눈다 — « · »·쉼표(`goal-new-paths` 와 같은 분리 규칙). 유효성은 걸러내지 않는다: 선언 그대로다. */
+function splitDeclaredPaths(payload: string): string[] {
+  return payload.split(/[·,]/).map((token) => token.trim()).filter((token) => token.length > 0);
+}
+
+/** 조각 문장에 «나오는» 선언 경로만 남긴다. 하나도 안 나오면 원 선언 전부 — 선언 밖 경로는 지어내지 않는다. */
+function narrowDeclaredPaths(declared: readonly string[], pieceFeature: string): string[] {
+  const mentioned = declared.filter((path) => {
+    const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(^|[^\\w./-])${escaped}(?=$|[^\\w./-]|\\.(?:\\s|$))`).test(pieceFeature);
+  });
+  return mentioned.length ? mentioned : [...declared];
+}
+
 export function applyDecomposeProposals(
   goals: readonly SelfDevGoal[],
   results: readonly SelfDevJobResult[],
@@ -374,11 +398,29 @@ export function applyDecomposeProposals(
     // ⛔ 상한을 넘기면 «쪼개지 않는다» — 조용히 자르지 않고 원본을 그대로 둔다.
     if (out.length + pieces.length + (goals.length - out.length - 1) > maxGoals) { out.push(goal); continue; }
     decomposed.push(goal.feature);
+    // 원 골의 머리줄 선언 — 첫 줄이 «대상 경로:» 가 아니면 조각은 지금 그대로(바이트 불변)다.
+    const goalLines = goal.feature.split('\n');
+    const targetLine = TARGET_PATHS_LINE.exec(goalLines[0] ?? '');
+    // «신설:» 상속은 머리줄 선언이 «있을 때만» — 첫 줄이 라벨이 아니면 조각은 바이트 불변이어야 한다.
+    const newLine = targetLine ? goalLines.map((line) => NEW_PATHS_LINE.exec(line)).find((m) => m !== null) : null;
     for (const piece of pieces) {
+      const inherited: string[] = [];
+      let paths: string[] = [];
+      if (targetLine) {
+        const declared = splitDeclaredPaths(targetLine[1]!);
+        paths = declared.length ? narrowDeclaredPaths(declared, piece.feature) : declared;
+        // 선언이 비어 있으면 원 줄을 그대로 실는다 — 라벨만이라도 예비 검사가 읽게 한다.
+        inherited.push(declared.length ? `대상 경로: ${paths.join(' · ')}` : goalLines[0]!);
+      }
+      if (newLine) {
+        const declaredNew = splitDeclaredPaths(newLine[1]!);
+        const narrowedNew = declaredNew.length ? narrowDeclaredPaths(declaredNew, piece.feature) : declaredNew;
+        inherited.push(declaredNew.length ? `신설: ${narrowedNew.join(' · ')}` : newLine[0]!);
+      }
       out.push({
         ...goal,                       // 승격 플래그(openPr·autoReview·autoMerge·base)를 물려받는다
         id: piece.id,
-        feature: piece.feature,
+        feature: inherited.length ? [...inherited, piece.feature].join('\n') : piece.feature,
         ...(piece.dependsOn.length ? { dependsOn: [...piece.dependsOn] } : {}),
         // ⛔⭐ `...goal` 이 «부모의» hotPaths 를 그대로 흘린다 — 그러면 조각 전부가 서로 겹쳐
         //   `orchestrate.ts` 가 전부를 직렬화한다(위상이 아니라 «한 줄»이 된다).

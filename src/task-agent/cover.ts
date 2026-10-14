@@ -8,7 +8,7 @@ export interface CoverRow {
   byTaskAgent: number | null;
   /** Total work by all seats; null when no independent denominator is available. */
   total: number | null;
-  /** TASK-AGENT events observed for this verb, including non-done outcomes; null if unreadable. */
+  /** TASK-AGENT action events observed for this verb; null if unreadable. */
   observedActions: number | null;
   ratio: number | null;
   state: 'measured' | 'no-denominator' | 'unreadable';
@@ -23,6 +23,8 @@ export interface CoverRow {
 /** null means the source could not be read; [] means it was read and had no matching events. */
 export interface TaskAgentCoverInput {
   taskAgentActions: readonly { kind: NextActionKind; result: string; reason?: string; taskId?: string }[] | null;
+  /** Actual land executor outcomes; omitted or null means the source was not read. */
+  liveLandMoves?: readonly { card: string; executed: boolean; ok: boolean }[] | null;
   allLands: readonly { step: string; ok: boolean }[] | null;
   /** Card-ledger denominator for review·retry·green. undefined = not requested; null = ledger unreadable; [] = no cards. */
   taskCards?: readonly { id: string }[] | null;
@@ -32,10 +34,26 @@ export interface TaskAgentCoverInput {
   /** null means the pending-landing age source could not be read; [] means no pending landings. */
   pendingLandingAgeSeconds?: readonly number[] | null;
   /** A source reached the query safety limit; its aggregate is not known to be complete. */
-  truncated?: { taskAgentActions: boolean; allLands: boolean; goalAsks?: boolean; goalRuns?: boolean };
+  truncated?: { taskAgentActions: boolean; allLands: boolean; liveLandMoves?: boolean; goalAsks?: boolean; goalRuns?: boolean; implementCardRuns?: boolean; implementRunMerges?: boolean };
   /** Completed authoring provenance and terminal goal records. undefined = not wired; null = unreadable. */
   goalAsks?: readonly { authorRunId: string; goalId: string }[] | null;
   goalRuns?: readonly { goalId: string; outcome: string; stage?: string }[] | null;
+  /** 구현 출처 — TA 카드의 런 결합. undefined = 이 동사의 출처 배선이 없다(no-source); null = 카드 원장을 못 읽었다; [] = 읽고 카드 없음. */
+  implementCardRuns?: readonly ImplementCardRunBinding[] | null;
+  /** 구현 출처 — 런 원장의 merged 사건. undefined = 배선 없음; null = 런 원장을 못 읽음. */
+  implementRunMerges?: ReadonlyMap<string, ImplementRunMergeEvent> | null;
+}
+
+/** 구현 동사의 카드 결합 — runId·runChildId 는 그 카드가 발사한 런이다. */
+export interface ImplementCardRunBinding {
+  cardId: string;
+  runId?: string | null;
+  runChildId?: string | null;
+}
+
+/** 구현 동사의 원장 merged 사건 — merged=true 만 완료 구현으로 센다. */
+export interface ImplementRunMergeEvent {
+  merged: boolean;
 }
 
 export type LandingFailureReason = 'load' | 'oom' | 'time-limit' | 'conflict' | 'review' | 'other';
@@ -52,6 +70,24 @@ export interface LandingThroughput {
 
 const FAILURE_REASONS: readonly LandingFailureReason[] = ['load', 'oom', 'time-limit', 'conflict', 'review', 'other'];
 
+function successfulLandCount(input: TaskAgentCoverInput): number | null {
+  if (input.taskAgentActions === null || input.truncated?.taskAgentActions
+    || input.liveLandMoves == null || input.truncated?.liveLandMoves) return null;
+  const cards = new Set<string>();
+  for (const action of input.taskAgentActions) {
+    if (action.kind !== 'land' || action.result !== 'done') continue;
+    // Without a card identity an action may duplicate a live-move; its count is unknown.
+    if (!action.taskId) return null;
+    cards.add(action.taskId);
+  }
+  for (const move of input.liveLandMoves) {
+    if (!move.executed || !move.ok) continue;
+    if (!move.card) return null;
+    cards.add(move.card);
+  }
+  return cards.size;
+}
+
 function landingFailureReason(action: { kind: NextActionKind; reason?: string }): LandingFailureReason {
   const reason = action.reason ?? '';
   if (/\boom\b|out[- ]of[- ]memory|oomkilled|메모리.{0,12}(초과|부족|킬)/i.test(reason)) return 'oom';
@@ -65,9 +101,7 @@ function landingFailureReason(action: { kind: NextActionKind; reason?: string })
 /** Daily funnel, failure-reason distribution, and oldest pending-landing age. */
 export function measureLandingThroughput(input: TaskAgentCoverInput): LandingThroughput {
   const actionsReadable = input.taskAgentActions !== null && input.truncated?.taskAgentActions !== true;
-  const taskAgentLandings = actionsReadable
-    ? input.taskAgentActions!.filter((action) => action.kind === 'land' && action.result === 'done').length
-    : null;
+  const taskAgentLandings = actionsReadable ? successfulLandCount(input) : null;
   const failureReasons = actionsReadable
     ? Object.fromEntries(FAILURE_REASONS.map((reason) => [reason, 0])) as Record<LandingFailureReason, number>
     : null;
@@ -112,7 +146,8 @@ export function measureTaskAgentCover(input: TaskAgentCoverInput): CoverRow[] {
   const rows = verbs.map((verb): CoverRow => {
     const actions = input.taskAgentActions?.filter((action) => action.kind === verb);
     const actionsUnreadable = actions === undefined || input.truncated?.taskAgentActions === true;
-    const byTaskAgent = actionsUnreadable ? null : actions.filter((action) => action.result === 'done').length;
+    const byTaskAgent = verb === 'land' ? successfulLandCount(input)
+      : actionsUnreadable ? null : actions.filter((action) => action.result === 'done').length;
     const observedActions = actionsUnreadable ? null : actions.length;
     const liveActions = actionsUnreadable ? null : actions.filter((action) => action.result !== 'shadow').length;
     const shadowActions = actionsUnreadable ? null : actions.filter((action) => action.result === 'shadow').length;
@@ -137,7 +172,7 @@ export function measureTaskAgentCover(input: TaskAgentCoverInput): CoverRow[] {
     };
     const total = input.allLands === null || input.truncated?.allLands
       ? null : input.allLands.filter((land) => land.step === 'merge' && land.ok === true).length;
-    const state = actionsUnreadable || total === null ? 'unreadable'
+    const state = byTaskAgent === null || total === null ? 'unreadable'
       : total === 0 ? 'no-denominator' : 'measured';
     const ratio = state === 'measured' && byTaskAgent !== null && total !== null ? byTaskAgent / total : null;
     return { verb, byTaskAgent, total, observedActions, ratio, state, ...counts,
@@ -167,20 +202,20 @@ export type SevenVerbName = '리뷰' | '착지' | '수리' | '검증' | '저작'
 /** no-source 는 출처 배선이 없는 동사 · unreadable 은 해당 동사의 원천을 완전히 못 읽은 것이다. */
 export type SevenVerbState = 'live' | 'shadow-only' | 'none' | 'no-source' | 'unreadable';
 
-/** 7동사 출처 표의 한 칸 — source 는 그 동사를 관측하는 TASK-AGENT action kind, null 이면 출처가 아직 없다. */
+/** 7동사 출처 표의 한 칸 — source 는 그 동사를 관측하는 원천, null 이면 출처가 아직 없다. */
 export interface SevenVerbSource {
   verb: SevenVerbName;
-  source: Exclude<NextActionKind, 'decision' | 'deliver'> | 'goal-ask+goal-run' | null;
+  source: Exclude<NextActionKind, 'decision' | 'deliver'> | 'goal-ask+goal-run' | 'card-run+merged' | null;
 }
 
-/** TA-THEME-VERBS-LIVE — 저작은 완료 골 조인; 구현·정리는 아직 출처가 없다. */
+/** TA-THEME-VERBS-LIVE — 저작은 완료 골 조인; 구현은 카드 런 결합 ⊕ 원장 merged 조인; 정리는 아직 출처가 없다. */
 export const SEVEN_VERB_SOURCES: readonly SevenVerbSource[] = [
   { verb: '리뷰', source: 'review' },
   { verb: '착지', source: 'land' },
   { verb: '수리', source: 'retry' },
   { verb: '검증', source: 'green' },
   { verb: '저작', source: 'goal-ask+goal-run' },
-  { verb: '구현', source: null },
+  { verb: '구현', source: 'card-run+merged' },
   { verb: '정리', source: null },
 ];
 
@@ -200,12 +235,37 @@ export interface SevenVerbLive {
   measuredVerbs: number;
 }
 
-/** 행동 동사는 창 안의 done, 저작은 완료한 저작 원장과 착지 골의 조인. 각 출처의 null·절단은 해당 동사만 unreadable. */
+/** 행동 동사는 창 안의 done, 저작은 완료한 저작 원장과 착지 골의 조인, 구현은 카드 런 결합과 원장 merged 사건의 조인. 각 출처의 null·절단은 해당 동사만 unreadable. */
 export function measureSevenVerbLive(input: TaskAgentCoverInput): SevenVerbLive {
   const unreadable = input.taskAgentActions === null || input.truncated?.taskAgentActions === true;
   const verbs = SEVEN_VERB_SOURCES.map(({ verb, source }): SevenVerbLiveRow => {
+    if (source === 'card-run+merged') {
+      // ⛔ 배선이 없으면 출처가 «있는» 동사로 거짓 측정을 하지 않는다 — no-source 로 그대로 둔다.
+      if (input.implementCardRuns === undefined && input.implementRunMerges === undefined) {
+        return { verb, source: null, liveDone: null, shadow: null, state: 'no-source' };
+      }
+      if (input.implementCardRuns == null || input.implementRunMerges == null
+        || input.truncated?.implementCardRuns === true || input.truncated?.implementRunMerges === true) {
+        return { verb, source, liveDone: null, shadow: null, state: 'unreadable' };
+      }
+      const merges = input.implementRunMerges;
+      const cards = new Set<string>();
+      for (const binding of input.implementCardRuns) {
+        // 카드 신원 없이는 중복 없는 분자를 낼 수 없다 — 그 원장은 못 읽은 것으로 한다.
+        if (!binding.cardId) return { verb, source, liveDone: null, shadow: null, state: 'unreadable' };
+        const bound = [binding.runId, binding.runChildId];
+        if (bound.some((runId) => typeof runId === 'string' && runId && merges.get(runId)?.merged === true)) {
+          cards.add(binding.cardId);
+        }
+      }
+      const liveDone = cards.size;
+      return { verb, source, liveDone, shadow: 0, state: liveDone >= 1 ? 'live' : 'none' };
+    }
     if (source === null) return { verb, source: null, liveDone: null, shadow: null, state: 'no-source' };
-    if (source !== 'goal-ask+goal-run' && unreadable) return { verb, source, liveDone: null, shadow: null, state: 'unreadable' };
+    if (source !== 'goal-ask+goal-run' && (unreadable || (source === 'land'
+      && (input.liveLandMoves == null || input.truncated?.liveLandMoves)))) {
+      return { verb, source, liveDone: null, shadow: null, state: 'unreadable' };
+    }
     if (source === 'goal-ask+goal-run') {
       if (input.goalAsks == null || input.goalRuns == null || input.truncated?.goalAsks || input.truncated?.goalRuns) {
         return { verb, source, liveDone: null, shadow: null, state: 'unreadable' };
@@ -216,14 +276,15 @@ export function measureSevenVerbLive(input: TaskAgentCoverInput): SevenVerbLive 
       return { verb, source, liveDone, shadow: 0, state: liveDone > 0 ? 'live' : 'none' };
     }
     const actions = input.taskAgentActions!.filter((action) => action.kind === source);
-    const liveDone = actions.filter((action) => action.result === 'done').length;
+    const liveDone = source === 'land' ? successfulLandCount(input) : actions.filter((action) => action.result === 'done').length;
+    if (liveDone === null) return { verb, source, liveDone: null, shadow: null, state: 'unreadable' };
     const shadow = actions.filter((action) => action.result === 'shadow').length;
     return { verb, source, liveDone, shadow, state: liveDone >= 1 ? 'live' : shadow >= 1 ? 'shadow-only' : 'none' };
   });
   return {
     verbs,
     liveVerbs: verbs.some((row) => row.state === 'unreadable' && row.source !== null) ? null : verbs.filter((row) => row.state === 'live').length,
-    measuredVerbs: SEVEN_VERB_SOURCES.filter((row) => row.source !== null).length,
+    measuredVerbs: verbs.filter((row) => row.source !== null).length,
   };
 }
 
@@ -232,9 +293,15 @@ export function formatSevenVerbLive(measurement: SevenVerbLive): string {
   const total = SEVEN_VERB_SOURCES.length;
   if (measurement.liveVerbs === null) {
     const actionUnreadable = measurement.verbs.some((row) => row.source === 'review' && row.state === 'unreadable');
+    const landUnreadable = measurement.verbs.some((row) => row.source === 'land' && row.state === 'unreadable');
     const authorUnreadable = measurement.verbs.some((row) => row.source === 'goal-ask+goal-run' && row.state === 'unreadable');
-    const reason = actionUnreadable && authorUnreadable ? '행동·저작·골 원장 null·절단'
-      : actionUnreadable ? '행동 원장 null·절단' : '저작·골 원장 null·절단';
+    const implementUnreadable = measurement.verbs.some((row) => row.source === 'card-run+merged' && row.state === 'unreadable');
+    const failures = [
+      actionUnreadable ? '행동' : landUnreadable ? '착지' : null,
+      authorUnreadable ? '저작·골' : null,
+      implementUnreadable ? '구현 카드·런' : null,
+    ].filter((part): part is string => part !== null);
+    const reason = `${failures.join('·') || '저작·골'} 원장 null·절단`;
     const noSource = measurement.verbs.filter((row) => row.state === 'no-source').map((row) => row.verb).join('·');
     return `${total}동사 live -/${total} · 못 잼(${reason})${noSource ? ` · 출처 없음 ${noSource}` : ''}`;
   }

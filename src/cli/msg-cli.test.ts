@@ -1,11 +1,12 @@
 import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { Command } from 'commander';
 import { MsgStore } from '../msg/msg-store.js';
-import { registerMsgCommands } from './msg-cli.js';
+import { startMsgSseServer } from '../msg/msg-sse-server.js';
+import { registerMsgCommands, type MsgCliDeps } from './msg-cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -13,7 +14,7 @@ setDefaultTimeout(60_000);
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
-function fixture(stdin = '') {
+function fixture(stdin = '', overrides: (context: { path: string }) => Partial<MsgCliDeps> = () => ({})) {
   const dir = mkdtempSync(join(tmpdir(), 'msg-cli-'));
   dirs.push(dir);
   const path = join(dir, 'messages.db');
@@ -29,10 +30,11 @@ function fixture(stdin = '') {
     readStdin: async () => stdin,
     sleep: async () => { sleeps++; signal.abort(); }, signal: signal.signal,
     setExitCode: code => exits.push(code),
+    ...overrides({ path }),
   });
   return {
     run: async (...args: string[]) => { await program.parseAsync(['msg', ...args], { from: 'user' }); },
-    store: () => new MsgStore(path), stdout, stderr, exits, signal,
+    store: () => new MsgStore(path), stdout, stderr, exits, signal, path,
     get sleeps() { return sleeps; },
   };
 }
@@ -152,6 +154,286 @@ test('watch prints only unacknowledged messages for the seat and never acks by i
   expect(f.stdout).toHaveLength(1);
 });
 
+test('post --reply-to links a reply to its question through the durable store', async () => {
+  const f = fixture();
+  await f.run('post', 'what about the budget?', '--from', 'op', '--to', 'tc', '--json');
+  const question = JSON.parse(f.stdout.at(-1)!);
+  await f.run('post', 'settled yesterday', '--from', 'tc', '--to', 'op', '--reply-to', String(question.id), '--json');
+  const reply = JSON.parse(f.stdout.at(-1)!);
+  expect(reply.replyTo).toBe(question.id);
+  const store = f.store();
+  try {
+    expect(store.listReplies(question.id).map(message => message.body)).toEqual(['settled yesterday']);
+    expect(store.getMessage(reply.id)).toMatchObject({ replyTo: question.id });
+  } finally { store.close(); }
+  await f.run('post', 'bad target', '--from', 'OP', '--to', 'MK', '--reply-to', '1.5');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(f.stderr.at(-1)).toMatch(/^msg: --reply-to must be an integer/);
+  await f.run('post', 'zero target', '--from', 'OP', '--to', 'MK', '--reply-to', '0');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(f.stderr.at(-1)).toMatch(/^msg: --reply-to must be an integer/);
+  await f.run('post', 'missing target', '--from', 'OP', '--to', 'MK', '--reply-to', '999');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(f.stderr.at(-1)).toBe('msg: reply target not found: #999');
+  const unchanged = f.store();
+  try { expect(unchanged.list('MK')).toEqual([]); } finally { unchanged.close(); }
+});
+
+test('ask waits for the first reply pointing at its question and exits 0', async () => {
+  let postedDuringWait = false;
+  const f = fixture('', ({ path }) => ({
+    sleep: async () => {
+      postedDuringWait = true;
+      const store = new MsgStore(path);
+      try { store.post({ from: 'TC', to: 'OP', body: '42 ships on friday', replyTo: 1 }); }
+      finally { store.close(); }
+    },
+  }));
+  await f.run('ask', 'tc', 'what ships on friday?', '--from', 'op', '--wait', '5', '--json');
+  expect(f.stderr).toEqual([]);
+  expect(f.exits).toEqual([]);
+  expect(postedDuringWait).toBe(true);
+  expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ id: 2, from: 'TC', to: 'OP', body: '42 ships on friday', replyTo: 1 });
+  const store = f.store();
+  try {
+    expect(store.getMessage(1)).toMatchObject({ from: 'OP', to: 'TC', body: 'what ships on friday?' });
+    expect(store.listReplies(1).map(message => message.id)).toEqual([2]);
+  } finally { store.close(); }
+});
+
+test('ask requires an explicit sender and does not post on behalf of OP', async () => {
+  const f = fixture();
+  await f.run('ask', 'tc', 'what ships on friday?', '--wait', '0');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(f.stderr.at(-1)).toMatch(/--from/);
+  const store = f.store();
+  try { expect(store.list('TC')).toEqual([]); }
+  finally { store.close(); }
+});
+
+test('ask without a reply prints the question id and exits 2', async () => {
+  const f = fixture();
+  await f.run('ask', 'tc', 'anyone alive?', '--from', 'op', '--wait', '0');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(f.stderr.at(-1)).toBe('msg: no reply to #1 within 0s');
+  expect(f.stdout).toEqual([]);
+  const store = f.store();
+  try { expect(store.list('TC')).toHaveLength(1); expect(store.listReplies(1)).toEqual([]); }
+  finally { store.close(); }
+  await f.run('ask', '../bad', 'question', '--from', 'op');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(f.stderr.at(-1)).toBe('msg: invalid seat ID');
+});
+
+test('ask reports interruption separately from reply timeout', async () => {
+  const f = fixture();
+  await f.run('ask', 'TC', 'question', '--from', 'OP', '--wait', '60');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(f.stderr.at(-1)).toBe('msg: ask interrupted after posting #1');
+});
+
+test('real ask reports the durable question ID when SIGINT interrupts waiting', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-cli-interrupt-'));
+  dirs.push(dir);
+  const path = join(dir, 'msg', 'messages.db');
+  const script = `import { Command } from 'commander'; import { registerMsgCommands } from './src/cli/msg-cli.ts'; const cli = new Command(); registerMsgCommands(cli); await cli.parseAsync(process.argv.slice(1), { from: 'user' });`;
+  const child = Bun.spawn(['bun', '-e', script, 'msg', 'ask', 'TC', 'question', '--from', 'OP', '--wait', '60'], {
+    cwd: process.cwd(), env: { ...process.env, ELANOUS_STATE_DIR: dir }, stdout: 'pipe', stderr: 'pipe',
+  });
+  try {
+    let posted = false;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (existsSync(path)) {
+        try {
+          const store = new MsgStore(path, { readOnly: true });
+          try { posted = store.getMessage(1) !== null; } finally { store.close(); }
+        } catch { /* Writer may still be initializing its schema. */ }
+      }
+      if (posted) break;
+      await Bun.sleep(20);
+    }
+    expect(posted).toBe(true);
+    child.kill('SIGINT');
+    const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+    expect(code, stderr).toBe(2);
+    expect(stderr).toContain('msg: ask interrupted after posting #1');
+  } finally { if (child.exitCode === null) child.kill(); }
+});
+
+test('ask catches SIGINT immediately after the question is stored', async () => {
+  const f = fixture('', ({ path }) => ({
+    signal: undefined,
+    openStore: () => {
+      const store = new MsgStore(path);
+      const post = store.post.bind(store);
+      store.post = (input) => {
+        const message = post(input);
+        process.emit('SIGINT');
+        return message;
+      };
+      return store;
+    },
+  }));
+  await f.run('ask', 'TC', 'question', '--from', 'OP', '--wait', '60');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(f.stderr.at(-1)).toBe('msg: ask interrupted after posting #1');
+  const store = f.store();
+  try { expect(store.getMessage(1)).toMatchObject({ body: 'question', from: 'OP', to: 'TC' }); }
+  finally { store.close(); }
+});
+
+test('thread prints the question and its replies in time order', async () => {
+  const f = fixture();
+  const store = f.store();
+  let questionId = 0;
+  try {
+    const question = store.post({ from: 'OP', to: 'TC', body: 'the question' });
+    questionId = question.id;
+    store.post({ from: 'MK', to: 'UX', body: 'unrelated' });
+    store.post({ from: 'TC', to: 'OP', body: 'first reply', replyTo: questionId });
+    store.post({ from: 'TC', to: 'OP', body: 'second reply', replyTo: questionId });
+  } finally { store.close(); }
+  await f.run('thread', String(questionId), '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({
+    question: { id: questionId, body: 'the question' },
+    replies: [
+      { id: 3, body: 'first reply', replyTo: questionId },
+      { id: 4, body: 'second reply', replyTo: questionId },
+    ],
+  });
+  await f.run('thread', String(questionId));
+  const lines = f.stdout.splice(-3);
+  expect(lines[0]).toContain('the question');
+  expect(lines[1]).toContain('first reply');
+  expect(lines[2]).toContain('second reply');
+  await f.run('thread', '999');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(f.stderr.at(-1)).toBe('msg: message not found: #999');
+  await f.run('thread', '1.5');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(f.stderr.at(-1)).toMatch(/^msg: message ID must be an integer/);
+  const untouched = f.store();
+  try { expect(untouched.getCursor('TC')).toBe(0); } finally { untouched.close(); }
+});
+
+test('thread pages past a full reply page instead of silently truncating the thread', async () => {
+  const f = fixture();
+  const store = f.store();
+  try {
+    const question = store.post({ from: 'OP', to: 'TC', body: 'the question' });
+    for (let index = 1; index <= 101; index++) store.post({ from: 'TC', to: 'OP', body: `reply ${index}`, replyTo: question.id });
+  } finally { store.close(); }
+  await f.run('thread', '1', '--json');
+  const thread = JSON.parse(f.stdout.at(-1)!) as { question: { id: number }; replies: Array<{ id: number; body: string }> };
+  expect(thread.question.id).toBe(1);
+  expect(thread.replies).toHaveLength(101);
+  expect(thread.replies.map(reply => reply.id)).toEqual(Array.from({ length: 101 }, (_, index) => index + 2));
+  expect(thread.replies[99]).toMatchObject({ body: 'reply 100' });
+  expect(thread.replies[100]).toMatchObject({ body: 'reply 101' });
+  await f.run('thread', '1');
+  expect(f.stdout.at(-1)).toContain('reply 101');
+}, 120000);
+test('watch --sse falls back to the durable ledger during a disconnected service', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-cli-sse-'));
+  dirs.push(dir);
+  const path = join(dir, 'messages.db');
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const signal = new AbortController();
+  const program = new Command();
+  let polls = 0;
+  registerMsgCommands(program, {
+    openStore: () => new MsgStore(path),
+    out: { log: line => stdout.push(line), error: line => stderr.push(line) },
+    authToken: () => 'same-nexus-token',
+    fetch: (async () => { throw new Error('service stopped'); }) as unknown as typeof fetch,
+    signal: signal.signal,
+    sleep: async () => {
+      polls++;
+      if (polls === 1) {
+        const writer = new MsgStore(path);
+        try { writer.post({ from: 'OP', to: 'TC', body: 'posted during outage' }); }
+        finally { writer.close(); }
+      } else signal.abort();
+    },
+  });
+  await program.parseAsync(['msg', 'watch', '--to', 'TC', '--sse', 'http://127.0.0.1:1', '--json'], { from: 'user' });
+  expect(stdout.map((line) => JSON.parse(line).body)).toEqual(['posted during outage']);
+  expect(stderr).toHaveLength(1);
+  const store = new MsgStore(path);
+  try { expect(store.getCursor('TC')).toBe(0); } finally { store.close(); }
+});
+
+test('watch --sse receives a live event and prints the matching durable message once', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-cli-sse-live-'));
+  dirs.push(dir);
+  const path = join(dir, 'messages.db');
+  const store = new MsgStore(path);
+  const service = startMsgSseServer({ store, token: 'same-nexus-token', port: 0, pollMs: 100 });
+  const signal = new AbortController();
+  const stdout: string[] = [];
+  const program = new Command();
+  registerMsgCommands(program, {
+    openStore: () => new MsgStore(path),
+    out: { log: line => { stdout.push(line); signal.abort(); }, error: () => {} },
+    authToken: () => 'same-nexus-token',
+    signal: signal.signal,
+  });
+  try {
+    const watching = program.parseAsync(['msg', 'watch', '--to', 'TC', '--sse', `http://127.0.0.1:${service.port}`, '--json'], { from: 'user' });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    store.post({ from: 'OP', to: 'TC', body: 'live' });
+    await watching;
+    expect(stdout.map((line) => JSON.parse(line).body)).toEqual(['live']);
+  } finally { service.stop(); store.close(); }
+});
+
+test('watch --sse leaves a silent half-open stream and recovers from the ledger', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-cli-sse-idle-'));
+  dirs.push(dir);
+  const path = join(dir, 'messages.db');
+  const signal = new AbortController();
+  const stdout: string[] = [];
+  const program = new Command();
+  registerMsgCommands(program, {
+    openStore: () => new MsgStore(path),
+    out: { log: line => { stdout.push(line); signal.abort(); }, error: () => {} },
+    authToken: () => 'same-nexus-token',
+    fetch: (async () => new Response(new ReadableStream({ start(controller) {
+      controller.enqueue(new TextEncoder().encode(': connected\n\n'));
+    } }), { status: 200 })) as unknown as typeof fetch,
+    signal: signal.signal,
+  });
+  const writer = new MsgStore(path);
+  const post = setTimeout(() => writer.post({ from: 'OP', to: 'TC', body: 'while silent' }), 100);
+  try {
+    await program.parseAsync(['msg', 'watch', '--to', 'TC', '--sse', 'http://127.0.0.1:1', '--interval', '1', '--json'], { from: 'user' });
+    expect(stdout.map((line) => JSON.parse(line).body)).toEqual(['while silent']);
+  } finally { clearTimeout(post); writer.close(); }
+});
+
+test('watch --sse returns to ledger polling when fetch never sends response headers', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-cli-sse-connect-'));
+  dirs.push(dir);
+  const path = join(dir, 'messages.db');
+  const signal = new AbortController();
+  const stdout: string[] = [];
+  const program = new Command();
+  registerMsgCommands(program, {
+    openStore: () => new MsgStore(path),
+    out: { log: line => { stdout.push(line); signal.abort(); }, error: () => {} },
+    authToken: () => 'same-nexus-token',
+    fetch: (() => new Promise<Response>(() => {})) as unknown as typeof fetch,
+    signal: signal.signal,
+  });
+  const writer = new MsgStore(path);
+  const post = setTimeout(() => writer.post({ from: 'OP', to: 'TC', body: 'before response' }), 100);
+  try {
+    await program.parseAsync(['msg', 'watch', '--to', 'TC', '--sse', 'http://127.0.0.1:1', '--interval', '1', '--json'], { from: 'user' });
+    expect(stdout.map((line) => JSON.parse(line).body)).toEqual(['before response']);
+  } finally { clearTimeout(post); writer.close(); }
+});
+
 test('real stdin piping and validation failure use process exit 2 without a stack', () => {
   const dir = mkdtempSync(join(tmpdir(), 'msg-cli-child-'));
   dirs.push(dir);
@@ -183,6 +465,20 @@ test('real stdin piping and validation failure use process exit 2 without a stac
   expect(help.status, help.stderr).toBe(0);
   expect(help.stdout).toContain('--to <seat>');
   expect(help.stderr).toBe('');
+  const reply = spawnSync('bun', ['-e', script, 'msg', 'post', 'settled yesterday', '--from', 'MK', '--to', 'OP', '--reply-to', '1', '--json'],
+    { cwd: process.cwd(), env, encoding: 'utf8' });
+  expect(reply.status, reply.stderr).toBe(0);
+  expect(JSON.parse(reply.stdout)).toMatchObject({ id: 2, replyTo: 1 });
+  const thread = spawnSync('bun', ['-e', script, 'msg', 'thread', '1'],
+    { cwd: process.cwd(), env, encoding: 'utf8' });
+  expect(thread.status, thread.stderr).toBe(0);
+  expect(thread.stdout).toContain('actual piped stdin');
+  expect(thread.stdout).toContain('settled yesterday');
+  const askTimeout = spawnSync('bun', ['-e', script, 'msg', 'ask', 'MK', 'anyone alive?', '--from', 'OP', '--wait', '1'],
+    { cwd: process.cwd(), env, encoding: 'utf8' });
+  expect(askTimeout.status, askTimeout.stderr).toBe(2);
+  expect(askTimeout.stderr.trim()).toBe('msg: no reply to #3 within 1s');
+  expect(askTimeout.stderr).not.toContain('    at ');
 });
 
 test('bad seats, body, kind, cursor, limit and future ack exit 2 with one-line error, no stack or mutation', async () => {

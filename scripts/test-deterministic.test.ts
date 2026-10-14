@@ -6,19 +6,32 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   cleanupTemporaryRoot,
+  classifyExplicitTestFiles,
+  deriveMockModuleTestFiles,
+  deriveTestFiles,
+  effectiveTestCwd,
   getProcessGroupId,
   installShutdownSignalGate,
   isLivePid,
   isLiveProcessGroup,
   killProcessGroup,
+  partitionBunTestArguments,
+  planDeterministicTestCommands,
   prepareIsolatedTestEnv,
-  runDeterministicTests,
+  runDeterministicTests as runDeterministicTestsOriginal,
+  scanNamePatternStderr,
   TEMP_ROOT_PREFIX,
   terminateDirectChild,
   type DirectChild,
+  type DeterministicRunnerDeps,
   type ShutdownSignal,
   type SignalTarget,
 } from './test-deterministic.js';
+
+// Existing lifecycle fixtures exercise one direct child. They explicitly opt
+// out of source discovery; the partition tests below opt in to mock files.
+const runDeterministicTests = (deps: DeterministicRunnerDeps = {}) =>
+  runDeterministicTestsOriginal({ deriveMockModuleFiles: () => [], ...deps });
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -122,10 +135,18 @@ async function spawnHangWithGrandchild(pidPath: string): Promise<{ child: Direct
 }
 
 async function spawnExitedLeaderWithTermIgnoringGrandchild(pidPath: string): Promise<{ child: DirectChild; grandchildPid: number }> {
-  const grandchildBody = 'process.on("SIGTERM", () => {}); process.on("SIGHUP", () => {}); process.on("SIGINT", () => {}); await Bun.sleep(60_000);';
+  // The readiness file comes from the grandchild *after* its signal handlers
+  // are installed. Otherwise this test can SIGTERM it before it starts.
+  const grandchildBody = `
+    import { writeFileSync } from 'node:fs';
+    process.on("SIGTERM", () => {});
+    process.on("SIGHUP", () => {});
+    process.on("SIGINT", () => {});
+    writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));
+    await Bun.sleep(60_000);
+  `;
   const child = Bun.spawn({
     cmd: [process.execPath, '-e', `
-      import { writeFileSync } from 'node:fs';
       const g = Bun.spawn({
         cmd: ${JSON.stringify([process.execPath, '-e', grandchildBody])},
         stdin: 'ignore',
@@ -133,7 +154,6 @@ async function spawnExitedLeaderWithTermIgnoringGrandchild(pidPath: string): Pro
         stderr: 'ignore',
       });
       g.unref();
-      writeFileSync(${JSON.stringify(pidPath)}, String(g.pid));
     `],
     stdin: 'ignore',
     stdout: 'ignore',
@@ -311,17 +331,18 @@ describe('scripts/test-deterministic.ts preservation', () => {
     expect(source).toContain('detached: true');
     // ⛔ 이 칸이 지키는 «뜻»은 「사람이 준 argv 가 bun test 까지 그대로 간다」다.
     //   2026-09-24: CDP 레인 분리로 그 앞에 ...ignoreArgs 가 붙었다 — argv 통과는 그대로다.
-    expect(source).toContain("cmd: ['bun', 'test', ...ignoreArgs, ...argv]");
+    expect(source).toContain('let commands = planDeterministicTestCommands(argv, cdpPatterns, mockFiles, allTestFiles, testCwd)');
+    expect(source).toContain('for (const cmd of commands)');
     expect(source).toContain("join(tempBase(), TEMP_ROOT_PREFIX)");
     expect(source).toContain("export const TEMP_ROOT_PREFIX = 'elanous-deterministic-test-';");
     expect(source).toContain('if (import.meta.main)');
     expect(source).toContain('await runDeterministicTests()');
-    expect(source).toContain('const defaultSpawn: SpawnDirectChild = (opts) => Bun.spawn({');
+    expect(source).toContain('const child = Bun.spawn({');
     expect(source).not.toContain("Bun.spawnSync({\n  cmd: ['bun', 'test'");
   });
 
   test('signal path terminates the process group before cleanup and retries once with SIGKILL', () => {
-    const signalBlock = source.slice(source.indexOf("if (outcome.kind === 'signal')"));
+    const signalBlock = source.slice(source.indexOf('await terminateDirectChild(child, outcome.signal'));
     expect(signalBlock).toContain('await terminateDirectChild(child, outcome.signal');
     expect(signalBlock).toContain('cleanupTemporaryRoot(testRoot');
     expect(signalBlock.indexOf('await terminateDirectChild')).toBeLessThan(signalBlock.indexOf('cleanupTemporaryRoot'));
@@ -736,7 +757,8 @@ describe('runDeterministicTests core.bare guard', () => {
     let values = 'false';
     const messages: string[] = [];
     const code = await runDeterministicTests({
-      argv: ['scripts/test-deterministic.test.ts'],
+      argv: ['--dots'],
+      deriveCdpPatterns: () => [],
       mkdtempSync: () => makeRoot(),
       waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
       report: (message) => messages.push(message),
@@ -777,7 +799,8 @@ describe('runDeterministicTests core.bare guard', () => {
   test('does not raise an alert when core.bare remains unchanged', async () => {
     const messages: string[] = [];
     const code = await runDeterministicTests({
-      argv: ['scripts/test-deterministic.test.ts'],
+      argv: ['--dots'],
+      deriveCdpPatterns: () => [],
       mkdtempSync: () => makeRoot(),
       waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
       report: (message) => messages.push(message),
@@ -785,6 +808,641 @@ describe('runDeterministicTests core.bare guard', () => {
     });
     expect(code).toBe(0);
     expect(messages).toEqual([]);
+  });
+});
+
+describe('mock.module process isolation', () => {
+  test('discovers module mocks across Bun test name forms and extensions', () => {
+    const root = makeRoot();
+    for (const dir of ['src', 'test', 'plugins']) mkdirSync(join(root, dir));
+    const mocked = ['src/mocked.test.ts', 'plugins/widget.test.tsx'];
+    for (const ext of ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'mts', 'cts']) {
+      for (const name of [`value.test.${ext}`, `value.spec.${ext}`, `value_test.${ext}`, `value_spec.${ext}`]) {
+        mocked.push(`src/${name}`);
+      }
+    }
+    for (const file of mocked) writeFileSync(join(root, file), 'mock .\nmodule ("x", () => ({}));');
+    writeFileSync(join(root, 'test', 'plain.test.ts'), 'test("plain", () => {});');
+    expect(deriveMockModuleTestFiles({ cwd: root })).toEqual(mocked.sort());
+    expect(deriveTestFiles({ cwd: root }).sort()).toEqual([...mocked, 'test/plain.test.ts'].sort());
+  });
+
+  test('keeps comment-only tests together and separates inline-comment and parenthesized module mocks', () => {
+    const root = makeRoot();
+    mkdirSync(join(root, 'test'));
+    mkdirSync(join(root, 'scripts'));
+    writeFileSync(join(root, 'test', 'comment.test.ts'),
+      "import { test } from 'bun:test'; // mock.module('unused', () => ({}))\ntest('comment', () => {});\n");
+    writeFileSync(join(root, 'test', 'actual.test.ts'),
+      "import { mock, test } from 'bun:test'; mock/* inline */.module('virtual-test-module', () => ({})); test('actual', () => {});\n");
+    writeFileSync(join(root, 'test', 'parenthesized.test.ts'),
+      "import { mock, test } from 'bun:test'; (mock).module('virtual-parenthesized', () => ({})); test('parenthesized', () => {});\n");
+    writeFileSync(join(root, 'test', 'callee-parenthesized.test.ts'),
+      "import { mock, test } from 'bun:test'; (mock.module)('virtual-callee', () => ({})); test('callee-parenthesized', () => {});\n");
+    writeFileSync(join(root, 'test', 'plain.test.ts'),
+      "import { test } from 'bun:test'; test('plain', () => {});\n");
+    expect(deriveMockModuleTestFiles({ cwd: root })).toEqual([
+      'test/actual.test.ts', 'test/callee-parenthesized.test.ts', 'test/parenthesized.test.ts',
+    ]);
+    const run = (...selectors: string[]) => spawnSync('bun', ['run', script, '--cwd', root, ...selectors], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+    });
+    const comment = run('test/comment.test.ts', 'test/plain.test.ts');
+    expect(comment.status).toBe(0);
+    expect(`${comment.stdout}\n${comment.stderr}`).toContain('Ran 2 tests across 2 files');
+    const actual = run('test/actual.test.ts', 'test/plain.test.ts');
+    expect(actual.status).toBe(0);
+    expect((`${actual.stdout}\n${actual.stderr}`).match(/Ran 1 test across 1 file/g) ?? []).toHaveLength(2);
+    for (const selector of ['test/parenthesized.test.ts', 'test/callee-parenthesized.test.ts']) {
+      const result = run(selector, 'test/plain.test.ts');
+      expect(result.status).toBe(0);
+      expect((`${result.stdout}\n${result.stderr}`).match(/Ran 1 test across 1 file/g) ?? []).toHaveLength(2);
+    }
+  });
+
+  test('keeps syntax errors and unreadable discovered files isolated', () => {
+    const root = makeRoot();
+    writeFileSync(join(root, 'broken.test.ts'), 'function (\n');
+    const found = deriveMockModuleTestFiles({
+      cwd: root,
+      spawnSync: (() => ({
+        exitCode: 0, stdout: Buffer.from('broken.test.ts\nmissing.test.ts\n'), stderr: Buffer.from(''),
+      })) as unknown as typeof Bun.spawnSync,
+    });
+    expect(found).toEqual(['broken.test.ts', 'missing.test.ts']);
+  });
+
+  test('keeps a mixed selection in Bun path order and gives the mock its own process', () => {
+    const commands = planDeterministicTestCommands(
+      ['--dots', 'dashboard-handlers', 'pty-drive-action'], [],
+      ['src/dashboard/slash-runtime/dashboard-handlers.test.ts'],
+      ['src/dashboard/slash-runtime/dashboard-handlers.test.ts', 'test/pty-drive-action.test.ts'],
+    );
+    expect(commands).toEqual([
+      ['bun', 'test', '--dots', 'src/dashboard/slash-runtime/dashboard-handlers.test.ts'],
+      ['bun', 'test', '--dots', 'test/pty-drive-action.test.ts'],
+    ]);
+  });
+
+  test('skips an empty bulk run when only a mock file was requested', () => {
+    expect(planDeterministicTestCommands(
+      ['--dots', 'dashboard-handlers'], [],
+      ['src/dashboard/slash-runtime/dashboard-handlers.test.ts'],
+      ['src/dashboard/slash-runtime/dashboard-handlers.test.ts'],
+    )).toEqual([
+      ['bun', 'test', '--dots', 'src/dashboard/slash-runtime/dashboard-handlers.test.ts'],
+    ]);
+    expect(planDeterministicTestCommands(
+      ['./src/dashboard/slash-runtime/dashboard-handlers.test.ts'], [],
+      ['src/dashboard/slash-runtime/dashboard-handlers.test.ts'],
+      ['src/dashboard/slash-runtime/dashboard-handlers.test.ts'],
+    )).toEqual([['bun', 'test', 'src/dashboard/slash-runtime/dashboard-handlers.test.ts']]);
+  });
+
+  test('full selection isolates every mock except CDP files', () => {
+    expect(planDeterministicTestCommands(
+      ['--dots'], ['test/browser.test.ts'],
+      ['test/browser.test.ts', 'test/a.test.ts', 'test/b.test.ts'],
+    )).toEqual([
+      ['bun', 'test', '--path-ignore-patterns', 'test/browser.test.ts', '--path-ignore-patterns', 'test/a.test.ts', '--path-ignore-patterns', 'test/b.test.ts', '--pass-with-no-tests', '--dots'],
+      ['bun', 'test', '--dots', 'test/a.test.ts'],
+      ['bun', 'test', '--dots', 'test/b.test.ts'],
+    ]);
+  });
+
+  test('keeps spaced Bun option values out of path selectors and on solo commands', () => {
+    const mock = 'src/dashboard/slash-runtime/dashboard-handlers.test.ts';
+    const plain = 'test/pty-drive-action.test.ts';
+    expect(partitionBunTestArguments(['--test-name-pattern', 'dashboard-handlers', plain])).toEqual({
+      selectors: [plain], soloArgs: ['--test-name-pattern', 'dashboard-handlers'],
+    });
+    expect(planDeterministicTestCommands(
+      ['--test-name-pattern', 'dashboard-handlers', plain], [], [mock], [mock, plain],
+    )).toEqual([['bun', 'test', '--test-name-pattern', 'dashboard-handlers', plain]]);
+    expect(planDeterministicTestCommands(
+      ['-t', 'dashboard-handlers', mock], [], [mock], [mock, plain],
+    )).toEqual([['bun', 'test', '-t', 'dashboard-handlers', mock]]);
+    expect(planDeterministicTestCommands(
+      ['--test-name-pattern=dashboard-handlers', mock], [], [mock], [mock, plain],
+    )).toEqual([['bun', 'test', '--test-name-pattern=dashboard-handlers', mock]]);
+    expect(planDeterministicTestCommands(
+      ['--test-name-pattern', 'dashboard-handlers'], [], [mock], [mock, plain],
+    )).toEqual([
+      ['bun', 'test', '--path-ignore-patterns', mock, '--test-name-pattern', 'dashboard-handlers'],
+      ['bun', 'test', '--test-name-pattern', 'dashboard-handlers', mock],
+    ]);
+  });
+
+  test('treats tokens after optional Bun flags as file selectors', () => {
+    const mock = 'src/mock.test.ts';
+    for (const flag of ['--bail', '--parallel', '--changed']) {
+      expect(partitionBunTestArguments([flag, mock])).toEqual({
+        selectors: [mock], soloArgs: [flag],
+      });
+      expect(planDeterministicTestCommands([flag, mock], [], [mock], [mock])).toEqual([
+        ['bun', 'test', flag, mock],
+      ]);
+      expect(partitionBunTestArguments([`${flag}=2`, mock])).toEqual({
+        selectors: [mock], soloArgs: [`${flag}=2`],
+      });
+    }
+  });
+
+  test('uses Bun final --cwd for mock and CDP discovery in another tree', async () => {
+    const root = makeRoot();
+    const earlier = join(root, 'earlier');
+    const target = join(root, 'target');
+    mkdirSync(earlier);
+    mkdirSync(target);
+    mkdirSync(join(target, 'test'));
+    mkdirSync(join(target, 'scripts'));
+    writeFileSync(join(target, 'test', 'mock.test.ts'), 'mock.module("x", () => ({}));');
+    writeFileSync(join(target, 'test', 'browser.test.ts'), 'requireCdpBase();');
+    writeFileSync(join(target, 'test', 'plain.test.ts'), 'test("plain", () => {});');
+    expect(deriveMockModuleTestFiles({ cwd: target })).toEqual(['test/mock.test.ts']);
+    expect(effectiveTestCwd(['--cwd', 'earlier', '--cwd=target'], root)).toBe(target);
+    expect(effectiveTestCwd(['--', '--cwd=other'], root)).toBe(root);
+    const argv = ['--cwd', earlier, `--cwd=${target}`];
+    expect(effectiveTestCwd(argv, process.cwd())).toBe(target);
+    const commands: string[][] = [];
+    const code = await runDeterministicTestsOriginal({
+      argv,
+      spawn: (opts) => {
+        commands.push(opts.cmd);
+        return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+      },
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+    });
+    expect(code).toBe(0);
+    expect(commands).toEqual([
+      ['bun', 'test', '--path-ignore-patterns', 'test/browser.test.ts', '--path-ignore-patterns', 'test/mock.test.ts', '--pass-with-no-tests', ...argv],
+      ['bun', 'test', ...argv, 'test/mock.test.ts'],
+    ]);
+  });
+
+  test('treats the spaced --timings argument as timing JSON, not a test selector', () => {
+    expect(partitionBunTestArguments(['--timings', 'sample.test.ts'])).toEqual({
+      selectors: [], soloArgs: ['--timings', 'sample.test.ts'],
+    });
+    expect(partitionBunTestArguments(['--timings'])).toEqual({ selectors: [], soloArgs: ['--timings'] });
+    expect(partitionBunTestArguments(['--timings=times.json', 'sample.test.ts'])).toEqual({
+      selectors: ['sample.test.ts'], soloArgs: ['--timings=times.json'],
+    });
+  });
+
+  test('does not skip bulk when a selected Bun spec or JavaScript test remains', () => {
+    const mock = 'src/shared.test.ts';
+    const remaining = ['src/shared.spec.ts', 'src/shared.test.js'];
+    expect(planDeterministicTestCommands(['shared'], [], [mock], [mock, ...remaining])).toEqual([
+      ['bun', 'test', ...remaining],
+      ['bun', 'test', mock],
+    ]);
+  });
+
+  test('runs an ignored outside absolute mock alone while keeping its ordinary neighbor', () => {
+    const root = makeRoot();
+    const mock = join(root, 'mock.test.ts');
+    const plain = join(root, 'plain.test.ts');
+    expect(spawnSync('git', ['init', '-q'], { cwd: root }).status).toBe(0);
+    writeFileSync(join(root, '.gitignore'), 'mock.test.ts\n');
+    writeFileSync(mock, "import { mock, test } from 'bun:test'; mock.module('virtual-test-module', () => ({}));\ntest('mock', () => {});\n");
+    writeFileSync(plain, "import { test } from 'bun:test'; test('plain', () => {});\n");
+    expect(classifyExplicitTestFiles([mock, plain], process.cwd())).toEqual({
+      files: [mock, plain], mockFiles: [mock],
+    });
+    const child = spawnSync('bun', ['run', script, mock, plain], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+    });
+    expect(child.status).toBe(0);
+    expect(`${child.stdout}\n${child.stderr}`).toContain('mock.module 시험 파일을 각자 단독 프로세스로 실행한다');
+    expect((`${child.stdout}\n${child.stderr}`).match(/Ran 1 test across 1 file/g) ?? []).toHaveLength(2);
+    const missing = spawnSync('bun', ['run', script, mock, join(root, 'missing.test.ts')], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+    });
+    expect(missing.status).not.toBe(0);
+    const noNameMatch = spawnSync('bun', ['run', script, '--test-name-pattern', '__no_such_test__', mock], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+    });
+    expect(noNameMatch.status).not.toBe(0);
+  });
+
+  test('preserves Bun verdict for mock-only partial and name selectors and an invalid neighbor', () => {
+    const root = makeRoot();
+    mkdirSync(join(root, 'test'));
+    mkdirSync(join(root, 'scripts'));
+    writeFileSync(join(root, 'test', 'mock.test.ts'),
+      "import { mock, test } from 'bun:test'; mock.module('virtual-test-module', () => ({}));\ntest('mock-only', () => {});\n");
+    writeFileSync(join(root, 'test', 'plain.test.ts'),
+      "import { test } from 'bun:test'; test('plain-only', () => {});\n");
+    const run = (...args: string[]) => spawnSync('bun', ['run', script, '--cwd', root, ...args], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+    });
+    const partial = run('mock');
+    expect(partial.status).toBe(0);
+    expect(`${partial.stdout}\n${partial.stderr}`).toContain('1 pass');
+    const name = run('--test-name-pattern', 'mock-only');
+    expect(name.status).toBe(0);
+    expect(`${name.stdout}\n${name.stderr}`).toContain('1 pass');
+    const invalid = run('mock', 'missing-ordinary');
+    expect(invalid.status).not.toBe(0);
+  });
+
+  test('keeps shared output options in one Bun child while preserving ordinary split options', async () => {
+    const mock = 'src/mock.test.ts';
+    const plain = 'src/plain.test.ts';
+    for (const option of [
+      ['--reporter-outfile', 'report.xml'], ['--reporter-outfile=report.xml'],
+      ['--coverage', '--coverage-reporter=lcov'], ['--coverage', '--coverage-reporter', 'lcov'],
+      ['--timings=timings.json', '--update-timings'],
+    ]) {
+      const messages: string[] = [];
+      const commands: string[][] = [];
+      const code = await runDeterministicTestsOriginal({
+        argv: [...option, plain, mock],
+        deriveMockModuleFiles: () => [mock],
+        deriveTestFiles: () => [mock, plain],
+        report: (message) => messages.push(message),
+        spawn: (opts) => {
+          commands.push(opts.cmd);
+          return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+        },
+        waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+      });
+      expect(code).toBe(0);
+      expect(commands).toEqual([['bun', 'test', ...option, plain, mock]]);
+      expect(messages.join('\n')).toContain('공유 파일 출력 옵션');
+      expect(messages.join('\n')).not.toContain('각자 단독 프로세스');
+    }
+    const splitCommands: string[][] = [];
+    expect(await runDeterministicTestsOriginal({
+      argv: ['--coverage', '--coverage-reporter=text', mock, plain],
+      deriveMockModuleFiles: () => [mock], deriveTestFiles: () => [mock, plain],
+      spawn: (opts) => {
+        splitCommands.push(opts.cmd);
+        return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+      },
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+    })).toBe(0);
+    expect(splitCommands.length).toBe(2);
+    const commands: string[][] = [];
+    const code = await runDeterministicTestsOriginal({
+      argv: ['--reporter-outfile', 'report.xml', mock],
+      deriveMockModuleFiles: () => [mock],
+      deriveTestFiles: () => [mock],
+      spawn: (opts) => {
+        commands.push(opts.cmd);
+        return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+      },
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+    });
+    expect(code).toBe(0);
+    expect(commands).toEqual([['bun', 'test', '--reporter-outfile', 'report.xml', mock]]);
+  });
+
+  test('rejects global shard and multi-failure bail across children; first-failure bail stops', async () => {
+    const mock = 'src/mock.test.ts';
+    const plain = 'src/plain.test.ts';
+    for (const option of ['--shard=1/2', '--bail=2']) {
+      let spawned = 0;
+      const messages: string[] = [];
+      const code = await runDeterministicTestsOriginal({
+        argv: [option, mock, plain],
+        deriveMockModuleFiles: () => [mock], deriveTestFiles: () => [mock, plain],
+        report: (message) => messages.push(message),
+        spawn: () => { spawned++; return { pid: process.pid, exited: Promise.resolve(0), kill: () => true }; },
+      });
+      expect(code).toBe(1);
+      expect(spawned).toBe(0);
+      expect(messages.join('\n')).toContain(option.startsWith('--shard') ? '--shard' : '--bail');
+    }
+    for (const bail of ['--bail', '--bail=1']) {
+      let spawned = 0;
+      const code = await runDeterministicTestsOriginal({
+        argv: [bail, mock, plain],
+        deriveMockModuleFiles: () => [mock], deriveTestFiles: () => [mock, plain],
+        spawn: () => { spawned++; return { pid: process.pid, exited: Promise.resolve(3), kill: () => true }; },
+        waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+      });
+      expect(code).toBe(3);
+      expect(spawned).toBe(1);
+    }
+  });
+
+  test('does not treat another option value as a multi-child control flag', async () => {
+    const mock = 'src/mock.test.ts';
+    const plain = 'src/plain.test.ts';
+    for (const value of ['--shard=1/2', '--bail=2', '--reporter-outfile=report.xml']) {
+      const commands: string[][] = [];
+      const code = await runDeterministicTestsOriginal({
+        argv: ['--test-name-pattern', value, mock, plain],
+        deriveMockModuleFiles: () => [mock], deriveTestFiles: () => [mock, plain],
+        spawn: (opts) => {
+          commands.push(opts.cmd);
+          return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+        },
+        waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+      });
+      expect(code).toBe(0);
+      expect(commands).toHaveLength(2);
+    }
+  });
+
+  test('honors caller path-ignore-patterns when selecting solo mocks', () => {
+    const root = makeRoot();
+    mkdirSync(join(root, 'test'));
+    mkdirSync(join(root, 'scripts'));
+    writeFileSync(join(root, 'test', 'mock.test.ts'),
+      "import { mock, test } from 'bun:test'; mock.module('virtual-test-module', () => ({}));\ntest('mock', () => {});\n");
+    writeFileSync(join(root, 'test', 'plain.test.ts'),
+      "import { test } from 'bun:test'; test('plain', () => {});\n");
+    for (const ignoreArg of [['--path-ignore-patterns', '**/mock.test.ts'], ['--path-ignore-patterns=**/mock.test.ts']]) {
+      const child = spawnSync('bun', ['run', script, '--cwd', root, ...ignoreArg], {
+        cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+      });
+      expect(child.status).toBe(0);
+      const output = `${child.stdout}\n${child.stderr}`;
+      expect(output).toContain('1 pass');
+      expect(output).toContain('Ran 1 test across 1 file');
+      expect(output).not.toContain('(pass) mock');
+    }
+    const selected = ['--cwd', root, '--path-ignore-patterns', '**/mock.test.ts', 'test/mock.test.ts', 'test/plain.test.ts'];
+    const raw = spawnSync('bun', ['test', ...selected], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+    });
+    const runner = spawnSync('bun', ['run', script, ...selected], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+    });
+    expect(raw.status).toBe(0);
+    expect(runner.status).toBe(raw.status);
+    expect(`${runner.stdout}\n${runner.stderr}`).toContain('Ran 1 test across 1 file');
+    expect(`${runner.stdout}\n${runner.stderr}`).not.toContain('(pass) mock');
+  });
+
+  test('isolates an explicitly selected mock in a JavaScript or TypeScript file without test suffix', () => {
+    const root = makeRoot();
+    mkdirSync(join(root, 'test'));
+    mkdirSync(join(root, 'scripts'));
+    writeFileSync(join(root, 'test', 'custom.ts'),
+      "import { mock, test } from 'bun:test'; mock.module('virtual-test-module', () => ({}));\ntest('custom-mock', () => {});\n");
+    writeFileSync(join(root, 'test', 'plain.test.ts'),
+      "import { test } from 'bun:test'; test('plain', () => {});\n");
+    const run = (args: string[]) => spawnSync('bun', ['run', script, '--cwd', root, ...args], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+    });
+    const bare = run(['test/custom.ts']);
+    const rawBare = spawnSync('bun', ['test', 'test/custom.ts'], { cwd: root, encoding: 'utf8' });
+    expect(bare.status).toBe(rawBare.status);
+    expect(bare.status).not.toBe(0);
+    const mixed = run(['test/custom.ts', 'test/plain.test.ts']);
+    const rawMixed = spawnSync('bun', ['test', 'test/custom.ts', 'test/plain.test.ts'], { cwd: root, encoding: 'utf8' });
+    expect(mixed.status).toBe(rawMixed.status);
+    expect(`${mixed.stdout}\n${mixed.stderr}`).toContain('Ran 1 test across 1 file');
+    expect(`${mixed.stdout}\n${mixed.stderr}`).not.toContain('custom-mock');
+    for (const selector of ['./test/custom.ts', join(root, 'test', 'custom.ts')]) {
+      const child = run([selector, 'test/plain.test.ts']);
+      expect(child.status).toBe(0);
+      expect((`${child.stdout}\n${child.stderr}`).match(/Ran 1 test across 1 file/g) ?? []).toHaveLength(2);
+    }
+  });
+
+  test('allows an empty explicit directory with Bun pass-with-no-tests and still reports scan errors', () => {
+    const root = makeRoot();
+    mkdirSync(join(root, 'empty'));
+    mkdirSync(join(root, 'test'));
+    mkdirSync(join(root, 'scripts'));
+    writeFileSync(join(root, 'test', 'mock.test.ts'),
+      "import { mock, test } from 'bun:test'; mock.module('virtual-test-module', () => ({}));\ntest('mock', () => {});\n");
+    expect(deriveTestFiles({ cwd: join(root, 'empty') })).toEqual([]);
+    const child = spawnSync('bun', ['run', script, '--cwd', root, '--pass-with-no-tests', 'empty'], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+    });
+    expect(child.status).toBe(0);
+    expect(`${child.stdout}\n${child.stderr}`).not.toContain('(pass) mock');
+    expect(() => deriveTestFiles({ spawnSync: (() => ({
+      exitCode: 2, stdout: Buffer.from(''), stderr: Buffer.from('read error'),
+    })) as unknown as typeof Bun.spawnSync })).toThrow('test file scan failed (exit 2): read error');
+  });
+
+  test('preserves global name-pattern verdict across bulk and solo children', () => {
+    const root = makeRoot();
+    mkdirSync(join(root, 'test'));
+    mkdirSync(join(root, 'scripts'));
+    writeFileSync(join(root, 'test', 'mock.test.ts'),
+      "import { mock, test } from 'bun:test'; mock.module('virtual-test-module', () => ({}));\ntest('mock-only', () => {}); test('fake', () => {});\n");
+    writeFileSync(join(root, 'test', 'plain.test.ts'),
+      "import { test } from 'bun:test'; test('plain-only', () => {}); test('plain-fail', () => { throw new Error('intentional'); }); test('fake-error', () => { console.error('error: regex \"fake\" matched 0 tests. Searched 1 file (skipping 1 test) [1.00ms]'); throw new Error('intentional fake'); });\n");
+    const run = (name: string, ...rest: string[]) => spawnSync('bun',
+      ['run', script, '--cwd', root, '--test-name-pattern', name, ...rest],
+      { cwd: process.cwd(), encoding: 'utf8', timeout: 30_000 });
+    expect(run('plain-only').status).toBe(0);
+    expect(run('mock-only').status).toBe(0);
+    expect(run('mock-only', 'test').status).toBe(0);
+    const invalidNeighbor = run('mock-only', 'test/mock.test.ts', 'test/missing.test.ts');
+    expect(invalidNeighbor.status).not.toBe(0);
+    expect(`${invalidNeighbor.stdout}\n${invalidNeighbor.stderr}`).toContain('test selector matched no files: test/missing.test.ts');
+    expect(run('mock-only', 'test/mock.test.ts', 'test/missing.test.ts', '--pass-with-no-tests').status).toBe(0);
+    expect(run('missing').status).not.toBe(0);
+    expect(run('missing', '--pass-with-no-tests').status).toBe(0);
+    const failed = run('plain-fail');
+    expect(failed.status).not.toBe(0);
+    expect(`${failed.stdout}\n${failed.stderr}`).toContain('intentional');
+    const faked = run('fake');
+    expect(faked.status).not.toBe(0);
+    expect(`${faked.stdout}\n${faked.stderr}`).toContain('intentional fake');
+  });
+
+  test('finds exact no-match diagnostics before trailing stderr without mistaking a passing summary for no-match', async () => {
+    const root = makeRoot();
+    expect(spawnSync('git', ['init', '-q'], { cwd: root }).status).toBe(0);
+    const diagnostic = 'error: regex "missing" matched 0 tests. Searched 1 file (skipping 1 test) [1.00ms]';
+    const evidenceFor = (stderr: string) => scanNamePatternStderr((async function* () {
+      const bytes = new TextEncoder().encode(stderr);
+      yield bytes.slice(0, 25);
+      yield bytes.slice(25);
+    })(), ['missing']);
+    const run = async (stderr: string) => runDeterministicTestsOriginal({
+      argv: ['--test-name-pattern', 'missing'],
+      cwd: root,
+      deriveCdpPatterns: () => [],
+      deriveMockModuleFiles: () => ['a.test.ts', 'b.test.ts'],
+      spawn: () => ({
+        pid: process.pid,
+        exited: Promise.resolve(0),
+        kill: () => true,
+        stderrEvidence: evidenceFor(stderr),
+      }),
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+    });
+    expect(await run(`${diagnostic}\npreload wrote after Bun's diagnostic\n`)).toBe(1);
+    expect(await run(`${diagnostic}\n 1 pass\n 0 fail\nRan 1 test across 1 file. [2.00ms]\n`)).toBe(0);
+  });
+
+  test('runs exact mock and ordinary selectors in Bun path order without dropping options', async () => {
+    const root = makeRoot();
+    mkdirSync(join(root, 'src'));
+    expect(spawnSync('git', ['init', '-q'], { cwd: root }).status).toBe(0);
+    writeFileSync(join(root, '.gitignore'), 'src/mock.test.ts\n');
+    writeFileSync(join(root, 'src', 'mock.test.ts'), 'mock.module("virtual-test-module", () => ({}));\n');
+    writeFileSync(join(root, 'src', 'plain.test.ts'), 'test("plain", () => {});\n');
+    const argv = ['--cwd', root, 'src/mock.test.ts', '--dots', 'src/plain.test.ts'];
+    const commands: string[][] = [];
+    const code = await runDeterministicTestsOriginal({
+      argv,
+      spawn: (opts) => {
+        commands.push(opts.cmd);
+        return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+      },
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+    });
+    expect(code).toBe(0);
+    expect(commands).toEqual([
+      ['bun', 'test', '--cwd', root, '--dots', 'src/mock.test.ts'],
+      ['bun', 'test', '--cwd', root, '--dots', 'src/plain.test.ts'],
+    ]);
+  });
+
+  test('matches Bun exact-file order across ordinary and mock children with --bail', () => {
+    const root = makeRoot();
+    writeFileSync(join(root, 'a.test.ts'), "import { mock, test } from 'bun:test'; mock.module('virtual-a', () => ({})); test('A fail', () => { throw new Error('intentional order'); });\n");
+    writeFileSync(join(root, 'b.test.ts'), "import { mock, test } from 'bun:test'; mock.module('virtual-b', () => ({})); test('B later', () => {});\n");
+    writeFileSync(join(root, 'plain.test.ts'), "import { test } from 'bun:test'; test('plain later', () => {});\n");
+    const args = ['b.test.ts', 'plain.test.ts', 'a.test.ts', '--bail'];
+    const raw = spawnSync('bun', ['test', ...args], { cwd: root, encoding: 'utf8', timeout: 30_000 });
+    const isolated = spawnSync('bun', ['run', script, '--cwd', root, ...args], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+    });
+    for (const result of [raw, isolated]) {
+      const output = `${result.stdout}\n${result.stderr}`;
+      expect(result.status).toBe(1);
+      expect(output).toContain('intentional order');
+      expect(output).not.toContain('B later');
+      expect(output).not.toContain('plain later');
+    }
+  });
+
+  test('matches Bun default discovery order before stopping on --bail', () => {
+    const root = makeRoot();
+    writeFileSync(join(root, 'a.test.ts'), "import { mock, test } from 'bun:test'; mock.module('virtual-a', () => ({})); test('A fail', () => { throw new Error('intentional default order'); });\n");
+    writeFileSync(join(root, 'b.test.ts'), "import { test } from 'bun:test'; test('B later', () => {});\n");
+    writeFileSync(join(root, 'c.test.ts'), "import { mock, test } from 'bun:test'; mock.module('virtual-c', () => ({})); test('C later', () => {});\n");
+    const raw = spawnSync('bun', ['test', '--bail'], { cwd: root, encoding: 'utf8', timeout: 30_000 });
+    const isolated = spawnSync('bun', ['run', script, '--cwd', root, '--bail'], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+    });
+    for (const result of [raw, isolated]) {
+      const output = `${result.stdout}\n${result.stderr}`;
+      expect(result.status).toBe(1);
+      expect(output).toContain('intentional default order');
+      expect(output).not.toContain('B later');
+      expect(output).not.toContain('C later');
+    }
+  });
+
+  test('keeps ordinary runs on both sides of an exact mock in Bun path order', () => {
+    expect(planDeterministicTestCommands(
+      ['c.test.ts', 'b.test.ts', 'a.test.ts'], [], ['b.test.ts'],
+      ['a.test.ts', 'b.test.ts', 'c.test.ts'],
+    )).toEqual([
+      ['bun', 'test', 'a.test.ts'],
+      ['bun', 'test', 'b.test.ts'],
+      ['bun', 'test', 'c.test.ts'],
+    ]);
+  });
+
+  test('runs mock and ordinary files separately for relative and absolute directory selectors', () => {
+    const root = makeRoot();
+    const subdir = join(root, 'subdir');
+    mkdirSync(subdir);
+    writeFileSync(join(subdir, 'mock.test.ts'), "import { mock, test } from 'bun:test'; mock.module('virtual-test-module', () => ({}));\ntest('mock', () => {});\n");
+    writeFileSync(join(subdir, 'plain.test.ts'), "import { test } from 'bun:test'; test('plain', () => {});\n");
+    for (const selector of ['./subdir', subdir]) {
+      const child = spawnSync('bun', ['run', script, '--cwd', root, selector], {
+        cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+      });
+      expect(child.status).toBe(0);
+      expect((`${child.stdout}\n${child.stderr}`).match(/Ran 1 test across 1 file/g) ?? []).toHaveLength(2);
+    }
+  });
+
+  test('keeps Bun preload values while excluding CDP and isolating mock files', async () => {
+    const cdp = 'test/browser.test.ts';
+    const mock = 'src/dashboard/slash-runtime/dashboard-handlers.test.ts';
+    for (const flag of ['--preload', '-r', '--require', '--import']) {
+      const argv = [flag, './setup.ts'];
+      expect(partitionBunTestArguments(argv)).toEqual({ selectors: [], soloArgs: argv });
+      expect(planDeterministicTestCommands(argv, [cdp], [cdp, mock])).toEqual([
+        ['bun', 'test', '--path-ignore-patterns', cdp, '--path-ignore-patterns', mock, '--pass-with-no-tests', ...argv],
+        ['bun', 'test', ...argv, mock],
+      ]);
+    }
+    const commands: string[][] = [];
+    const code = await runDeterministicTests({
+      argv: ['--preload', './setup.ts'],
+      deriveCdpPatterns: () => [cdp],
+      deriveMockModuleFiles: () => [cdp, mock],
+      spawn: (opts) => {
+        commands.push(opts.cmd);
+        return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+      },
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+    });
+    expect(code).toBe(0);
+    expect(commands).toEqual([
+      ['bun', 'test', '--path-ignore-patterns', cdp, '--path-ignore-patterns', mock, '--pass-with-no-tests', '--preload', './setup.ts'],
+      ['bun', 'test', '--preload', './setup.ts', mock],
+    ]);
+  });
+
+  test('keeps Bun global value options from becoming test selectors', () => {
+    const help = spawnSync('bun', ['--help'], { encoding: 'utf8' });
+    expect(help.status).toBe(0);
+    const options = (help.stdout ?? '').split('\n').flatMap((line) => {
+      const long = line.match(/(--[a-z0-9-]+)=<val>/)?.[1];
+      return long ? [long, ...(line.match(/^\s*(-[A-Za-z]),/)?.slice(1) ?? [])] : [];
+    });
+    expect(options).toContain('--env-file');
+    for (const option of options) {
+      expect(partitionBunTestArguments([option, 'value.test.ts']).selectors).toEqual([]);
+    }
+  });
+
+  test('keeps --env-file value while excluding CDP and isolating mock files', async () => {
+    const cdp = 'test/browser.test.ts';
+    const mock = 'src/dashboard/slash-runtime/dashboard-handlers.test.ts';
+    const commands: string[][] = [];
+    const code = await runDeterministicTests({
+      argv: ['--env-file', '.env.test'],
+      deriveCdpPatterns: () => [cdp],
+      deriveMockModuleFiles: () => [cdp, mock],
+      spawn: (opts) => {
+        commands.push(opts.cmd);
+        return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+      },
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+    });
+    expect(code).toBe(0);
+    expect(commands).toEqual([
+      ['bun', 'test', '--path-ignore-patterns', cdp, '--path-ignore-patterns', mock, '--pass-with-no-tests', '--env-file', '.env.test'],
+      ['bun', 'test', '--env-file', '.env.test', mock],
+    ]);
+  });
+
+  test('runs each selected mock in a separate child and combines nonzero results', async () => {
+    const commands: string[][] = [];
+    const code = await runDeterministicTests({
+      argv: ['--dots', 'dashboard-handlers', 'pty-drive-action'],
+      deriveMockModuleFiles: () => ['src/dashboard/slash-runtime/dashboard-handlers.test.ts'],
+      deriveTestFiles: () => ['src/dashboard/slash-runtime/dashboard-handlers.test.ts', 'test/pty-drive-action.test.ts'],
+      spawn: (opts) => {
+        commands.push(opts.cmd);
+        return { pid: process.pid, exited: Promise.resolve(commands.length === 1 ? 4 : 0), kill: () => true };
+      },
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+    });
+    expect(code).toBe(4);
+    expect(commands).toHaveLength(2);
+    expect(commands[0]).toEqual(['bun', 'test', '--dots', 'src/dashboard/slash-runtime/dashboard-handlers.test.ts']);
+    expect(commands[1]).toEqual(['bun', 'test', '--dots', 'test/pty-drive-action.test.ts']);
   });
 });
 

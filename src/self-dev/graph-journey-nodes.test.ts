@@ -95,6 +95,6 @@ describe('HARNESS-FULL-GRAPH 여정 노드', () => {
     expect(route('intake', 'direct')).toBe('launch-gate');
     expect(route('intake', 'queued')).toBe('queue');
     expect(spec.entryNode).toBe('intake');
-    expect(edgeMapOf(spec).merge).toEqual(['cleanup']);
+    expect(edgeMapOf(spec).merge).toEqual(['ready', 'pr-head-checkout', 'main-sync', 'review', 'next-move', 'cleanup']);
   });
 });

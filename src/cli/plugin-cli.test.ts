@@ -2,7 +2,7 @@ import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { generateIndexKeyPair, signIndex } from '../market/signed-index.js';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -33,6 +33,53 @@ async function cli(root: string, args: string[], preload?: string, input?: strin
   return { code, output, stderr };
 }
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+test('plugin add --from-codex imports one installed marketplace package with skill metadata, skipping uninstalled entries', async () => {
+  const root = temp();
+  const codexHome = temp();
+  const packageDir = join(codexHome, 'plugins', 'mail-kit');
+  mkdirSync(join(packageDir, '.codex-plugin'), { recursive: true });
+  mkdirSync(join(packageDir, 'skills', 'read-mail'), { recursive: true });
+  writeFileSync(join(packageDir, '.codex-plugin', 'plugin.json'), JSON.stringify({ name: 'mail-kit', version: '1.0.0', skills: './skills/' }));
+  writeFileSync(join(packageDir, 'skills', 'read-mail', 'SKILL.md'), '---\nname: read-mail\ndescription: Read mail\n---\nRead the inbox.\n');
+  const bin = join(temp(), 'codex');
+  writeFileSync(bin, `#!/usr/bin/env bun
+if (process.argv.includes('--version')) { console.log('codex-cli 999.0.0'); process.exit(0); }
+if (!process.argv.includes('app-server')) process.exit(2);
+let buffer = '';
+for await (const chunk of process.stdin) {
+  buffer += chunk.toString();
+  while (buffer.includes('\\n')) {
+    const end = buffer.indexOf('\\n');
+    const line = buffer.slice(0, end);
+    buffer = buffer.slice(end + 1);
+    if (!line) continue;
+    const request = JSON.parse(line);
+    const result = request.method === 'plugin/list' ? { marketplaces: [{ name: 'openai-curated', plugins: [
+      { name: 'mail-kit', installed: true, availability: 'AVAILABLE', installPath: ${JSON.stringify(packageDir)} },
+      { name: 'not-installed', installed: false, availability: 'AVAILABLE', installPath: ${JSON.stringify(packageDir)} }
+    ] }] } : {};
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\\n');
+  }
+}
+`);
+  chmodSync(bin, 0o755);
+  const preload = join(root, 'codex-path.js');
+  writeFileSync(preload, `process.env.PATH = ${JSON.stringify(join(bin, '..'))} + ':' + process.env.PATH;`);
+  const imported = await cli(root, ['add', 'mail-kit@openai-curated', '--from-codex', '--json'], preload);
+  expect(imported).toMatchObject({ code: 0 });
+  expect(imported.output.trim().split('\n').map(line => JSON.parse(line)).find(event => event.event === 'registered'))
+    .toMatchObject({ skills: ['read-mail'] });
+  const installed = JSON.parse((await cli(root, ['list', '--json'])).output);
+  expect(installed.map((entry: { name: string }) => entry.name)).toEqual(['mail-kit']);
+  expect(readFileSync(join(installed[0].path, 'skills', 'read-mail', 'SKILL.md'), 'utf8')).toContain('description: Read mail');
+  const ledger = JSON.parse(readFileSync(join(root, 'plugins', 'installed.json'), 'utf8'));
+  expect(Object.keys(ledger[0]).sort()).toEqual(['installedAt', 'market', 'name', 'sha256', 'version']);
+  const skipped = await cli(root, ['add', 'not-installed@openai-curated', '--from-codex', '--json'], preload);
+  expect(skipped.code).toBe(1);
+  expect(JSON.parse(skipped.output.trim().split('\n').at(-1)!)).toMatchObject({ event: 'failed', reason: 'io' });
+  expect(JSON.parse((await cli(root, ['list', '--json'])).output).map((entry: { name: string }) => entry.name)).toEqual(['mail-kit']);
+}, 60_000);
 
 test('CLI add NDJSON order, list, remove and secret-free connector names', async () => {
   const root = temp();

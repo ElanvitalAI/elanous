@@ -7,6 +7,7 @@ import { rejudgeTick, REJUDGE_TICK_EVENT, type RejudgeRun } from './rejudge-tick
 function harness(config: { rejudgeEveryMinutes?: number; rejudgeMaxLoad?: number } | undefined, opts: { load?: number; run?: RejudgeRun; now?: string; stamp?: string } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'rejudge-tick-'));
   const stampPath = join(dir, 'steward', 'rejudge-tick.json');
+  const pendingPath = join(dir, 'steward', 'resync-pending.json');
   if (opts.stamp) { mkdirSync(join(dir, 'steward'), { recursive: true }); writeFileSync(stampPath, JSON.stringify({ startedAt: opts.stamp })); }
   const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
   let runs = 0;
@@ -15,10 +16,11 @@ function harness(config: { rejudgeEveryMinutes?: number; rejudgeMaxLoad?: number
     config: () => config,
     load: () => opts.load ?? 1,
     stampPath,
+    pendingPath,
     run: async () => { runs++; return opts.run ?? { code: 0, stdout: '[{"card":"a","decision":"pr-not-open"},{"card":"b","decision":"pr-not-open"},{"card":"b","decision":"regate-requested"}]\n', stderr: '', timedOut: false }; },
     log: (event: string, data: Record<string, unknown>) => { logs.push({ event, data }); },
   };
-  return { dir, stampPath, logs, deps, runs: () => runs, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { dir, stampPath, pendingPath, logs, deps, runs: () => runs, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 test('off by default: no interval configured → disabled, nothing runs, one observation line', async () => {
@@ -57,6 +59,29 @@ test('not due inside the interval; due again at interval minus jitter (a 15-minu
     expect((await rejudgeTick(late.deps)).decision).toBe('ran');
     expect(late.runs()).toBe(1);
   } finally { early.cleanup(); late.cleanup(); }
+});
+
+test('a newly saved resync head forces rejudge inside its interval, while disabled and load guards still apply', async () => {
+  const h = harness({ rejudgeEveryMinutes: 30 }, { stamp: '2026-10-12T01:45:00Z' });
+  try {
+    writeFileSync(h.pendingPath, JSON.stringify({ savedAt: '2026-10-12T01:46:00Z' }));
+    expect((await rejudgeTick(h.deps)).decision).toBe('ran');
+    expect(h.runs()).toBe(1);
+    expect((await rejudgeTick(h.deps)).decision).toBe('not-due');
+    expect(h.runs()).toBe(1);
+  } finally { h.cleanup(); }
+  const busy = harness({ rejudgeEveryMinutes: 30 }, { stamp: '2026-10-12T01:45:00Z', load: 61 });
+  try {
+    writeFileSync(busy.pendingPath, JSON.stringify({ savedAt: '2026-10-12T01:46:00Z' }));
+    expect((await rejudgeTick(busy.deps)).decision).toBe('load-skip');
+    expect(busy.runs()).toBe(0);
+  } finally { busy.cleanup(); }
+  const off = harness(undefined, { stamp: '2026-10-12T01:45:00Z' });
+  try {
+    writeFileSync(off.pendingPath, JSON.stringify({ savedAt: '2026-10-12T01:46:00Z' }));
+    expect((await rejudgeTick(off.deps)).decision).toBe('disabled');
+    expect(off.runs()).toBe(0);
+  } finally { off.cleanup(); }
 });
 
 test('load guard: above the max load it skips without stamping, so the next tick retries', async () => {

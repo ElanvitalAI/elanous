@@ -60,14 +60,14 @@ describe('TASK-AGENT-SHADOW — 멈춤 확정 → 판단부 → 실행부(shadow
     expect(selectDeliveryCandidates(worktree, 'research-report')).toEqual(['report.md', join('reports', 'extra.md')]);
     let commands = 0;
     const out = await recordTaskAgentShadowMove({ runId: 'run-delivery', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
-      readCard: () => card, log: () => {}, command: async () => { commands++; throw new Error('command called'); },
+      readCard: () => card, log: () => {}, env: {}, command: async () => { commands++; throw new Error('command called'); },
     });
     expect(out).toMatchObject({ move: 'wait', executorKind: 'deliver', executorResult: 'shadow', pr: null });
     expect(out.wouldDo).toContain(join(target, 'elanous-out', 't'));
     expect(commands).toBe(0);
     expect(existsSync(target)).toBe(false);
     const code = await recordTaskAgentShadowMove({ runId: 'run-delivery', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
-      readCard: () => ({ ...card, completion: 'code-pr' }), log: () => {},
+      readCard: () => ({ ...card, completion: 'code-pr' }), log: () => {}, env: {},
     });
     expect(code.move).toBe('wait');
     expect(code.executorResult).toBeNull();
@@ -87,7 +87,7 @@ describe('TASK-AGENT-SHADOW — 멈춤 확정 → 판단부 → 실행부(shadow
     const statePath = join(mkdtempSync(join(tmpdir(), 'shadow-state-')), 'task-agent-actions.json');
     const unique = `research-${Date.now()}-${Math.random()}`;
     writeFileSync(statePath, JSON.stringify({ tasks: { 'ta-real': { ...card, id: 'ta-real', text: unique } } }));
-    const out = await recordTaskAgentShadowMove({ runId: 'run-shadow', stopReason: 'converged', results: [job({ taskId: 'self-dev-other', feature: unique, ok: true, worktreePath: worktree })] }, { log: () => {}, statePath });
+    const out = await recordTaskAgentShadowMove({ runId: 'run-shadow', stopReason: 'converged', results: [job({ taskId: 'self-dev-other', feature: unique, ok: true, worktreePath: worktree })] }, { log: () => {}, statePath, env: {} });
     expect(out.executorKind).toBe('deliver');
     expect(out.wouldDo).toContain(join(target, 'elanous-out', 'ta-real'));
     expect(existsSync(target)).toBe(false);
@@ -185,6 +185,25 @@ describe('TASK-AGENT-SHADOW — 멈춤 확정 → 판단부 → 실행부(shadow
     expect(JSON.parse(await Bun.file(statePath).text()).tasks['ta-real-card'].history).toEqual([]);
   });
 
+  test('원격 Pod 의 카드 id·부모 runId 가 현지 카드와 일치하면 결선해 카드 history 에 그림자 수를 기록한다', async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), 'remote-card-match-')), 'task-agent-actions.json');
+    writeTaskCards(statePath, [{ id: 'ta-bind-card', runId: 'run-parent-bind', text: 'a different card goal', createdAt: '', status: 'launched', history: [] }]);
+    const queued: RunLedgerEntry[] = [];
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const out = await recordTaskAgentShadowMove({ runId: 'run-child-bind', stopReason: 'needs-human', results: [job({ taskId: 'unknown-task', feature: 'unrelated child goal', prNumber: 26761 })] }, {
+      statePath, env: { ELANOUS_POD_NAME: 'pod-a', ELANOUS_PARENT_RUN_ID: 'run-parent-bind', ELANOUS_TASK_CARD_ID: 'ta-bind-card' },
+      liveMoves: new Set(['review']), queueMove: (entry) => queued.push(entry),
+      log: (_c, event, data) => events.push({ event, data }),
+    });
+    expect(out.move).toBe('review');
+    expect(out.cardBinding).not.toBe('pending');
+    expect(queued).toHaveLength(0);
+    expect(events.find((entry) => entry.event === 'shadow-move')?.data).toMatchObject({ card: 'ta-bind-card' });
+    const history = JSON.parse(await Bun.file(statePath).text()).tasks['ta-bind-card'].history;
+    expect(history).toHaveLength(1);
+    expect(history[0]).toMatchObject({ event: 'live-move', kind: 'review', pr: 26761, runId: 'run-child-bind' });
+  });
+
   test('원격 카드 미결 수의 원장 기록 실패를 호출자에게 돌려준다', async () => {
     const statePath = join(mkdtempSync(join(tmpdir(), 'remote-card-queue-failed-')), 'task-agent-actions.json');
     const events: Array<{ event: string; data: Record<string, unknown> }> = [];
@@ -222,6 +241,25 @@ describe('TASK-AGENT-SHADOW — 멈춤 확정 → 판단부 → 실행부(shadow
     expect(local.liveMove).toMatchObject({ kind: 'review', executed: false, card: null, ok: false });
   });
 
+  test('카드 ID 없는 원격 이동은 HQ 에서 부모 runId 로 역조회해 대상 카드 history 에 기록한다', async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), 'remote-card-parent-replay-')), 'task-agent-actions.json');
+    const cardId = 'ta-parent-fallback';
+    const parentRunId = 'run-parent-fallback';
+    const childRunId = 'run-child-fallback';
+    writeTaskCards(statePath, [{ id: cardId, runId: parentRunId, parentHost: { host: 'wsl' },
+      text: 'different parent goal', createdAt: '', status: 'launched', history: [] }]);
+    const parent: RunLedgerEntry[] = [{ runId: parentRunId, event: 'pod-child-run', data: { childRunId } }];
+    const child: RunLedgerEntry[] = [{ timestamp: '2026-10-12T12:03:00.000Z', runId: childRunId, event: REMOTE_CARD_MOVE_PENDING,
+      data: { id: '00000000-0000-4000-8000-000000000004', card: null, parentRunId,
+        kind: 'review', pr: 26761, detail: 'child goal differs from card text' } }];
+    const evidence = { loadLedger: (id: string) => id === parentRunId ? parent : id === childRunId ? child : null,
+      podFinishes: () => [] };
+    expect(await replayRemoteCardMoves(cardId, statePath, evidence)).toBe(1);
+    const history = JSON.parse(await Bun.file(statePath).text()).tasks[cardId].history;
+    expect(history).toHaveLength(1);
+    expect(history[0]).toMatchObject({ event: 'live-move', kind: 'review', pr: 26761, runId: childRunId });
+  });
+
   test('HQ 는 원격 자식 미결 수를 부모 runId 간선으로 회수하며 중복 조회·다른 카드 id 를 거부한다', async () => {
     const statePath = join(mkdtempSync(join(tmpdir(), 'remote-card-hq-')), 'task-agent-actions.json');
     const card: TaskCard = { id: 'ta-hq-card', runId: 'run-parent-1', parentHost: { host: 'wsl' },
@@ -252,7 +290,7 @@ describe('TASK-AGENT-SHADOW — 멈춤 확정 → 판단부 → 실행부(shadow
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
       const out = await recordTaskAgentShadowMove({ runId: 'run-live', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
-        mode: 'live', readCard: () => card, log: () => {}, command: async () => { throw new Error('commands forbidden'); },
+        mode: 'live', readCard: () => card, log: () => {}, env: {}, command: async () => { throw new Error('commands forbidden'); },
       });
       const report = join(target, 'elanous-out', 't', 'report.md');
       expect(existsSync(report)).toBe(true);
@@ -268,7 +306,7 @@ describe('TASK-AGENT-SHADOW — 멈춤 확정 → 판단부 → 실행부(shadow
     const { worktree, card, target } = deliveryFixture();
     execFileSync('git', ['-C', worktree, 'add', 'report.md']);
     const out = await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
-      readCard: () => card, log: () => {}, mode: 'live',
+      readCard: () => card, log: () => {}, mode: 'live', env: {},
     });
     expect(out.move).toBe('wait');
     expect(out.reason).toBe('전달 후보 없음');
@@ -310,6 +348,46 @@ describe('TASK-AGENT-SHADOW — 멈춤 확정 → 판단부 → 실행부(shadow
     expect(events.map((e) => e.stopReason)).toEqual(SAMPLES.map(([s]) => s));
     expect(events.every((e) => typeof e.runId === 'string' && typeof e.reason === 'string')).toBe(true);
     expect(commands).toBe(0);
+  });
+
+  test('허용된 narrow-relaunch 는 주입된 부하 관문 아래 live 로 명령을 한 번 실행한다', async () => {
+    const commands: string[][] = [];
+    let loadChecks = 0;
+    const out = await recordTaskAgentShadowMove({ runId: 'run-retry', stopReason: 'no-progress', results: [job()] }, {
+      env: {}, readCard: () => undefined, log: () => {}, liveMoves: new Set(['narrow-relaunch']),
+      loadGate: { loadMax: 2, load1: () => { loadChecks++; return 0.5; } },
+      command: async (args) => { commands.push(args); return { status: 0, stdout: '' }; },
+    });
+    expect(out).toMatchObject({ move: 'narrow-relaunch', executorKind: 'retry', variant: 'narrow', executorResult: 'done' });
+    expect(commands).toHaveLength(1);
+    expect(commands[0]!.slice(0, 2)).toEqual(['harness', 'say']);
+    expect(commands[0]![2]).toStartWith('feature ask');
+    expect(loadChecks).toBe(1);
+  });
+
+  test('loadGate 미주입은 narrow-relaunch 허용과 command 주입에도 shadow 로 둔다', async () => {
+    const commands: string[][] = [];
+    const out = await recordTaskAgentShadowMove({ runId: 'run-retry', stopReason: 'no-progress', results: [job()] }, {
+      env: {}, readCard: () => undefined, log: () => {}, liveMoves: new Set(['narrow-relaunch']),
+      command: async (args) => { commands.push(args); return { status: 0, stdout: '' }; },
+    });
+    expect(out).toMatchObject({ move: 'narrow-relaunch', executorResult: 'shadow' });
+    expect(out.wouldDo).toStartWith('would retry:narrow');
+    expect(commands).toHaveLength(0);
+  });
+
+  test('liveMoves 에 없는 narrow-relaunch 는 관문과 command 가 있어도 shadow 로 둔다', async () => {
+    const commands: string[][] = [];
+    let loadChecks = 0;
+    const out = await recordTaskAgentShadowMove({ runId: 'run-retry', stopReason: 'no-progress', results: [job()] }, {
+      env: {}, readCard: () => undefined, log: () => {}, liveMoves: new Set(['wait-retry']),
+      loadGate: { loadMax: 2, load1: () => { loadChecks++; return 0.5; } },
+      command: async (args) => { commands.push(args); return { status: 0, stdout: '' }; },
+    });
+    expect(out).toMatchObject({ move: 'narrow-relaunch', executorResult: 'shadow' });
+    expect(out.wouldDo).toStartWith('would retry:narrow');
+    expect(commands).toHaveLength(0);
+    expect(loadChecks).toBe(0);
   });
 
   test('PR 상태는 결과에 실린 값만 쓴다 — 병합이 아니면 OPEN · PR 없으면 비운다', () => {
@@ -388,14 +466,14 @@ describe('종결 종류를 판단부 입력·shadow-move 관측에 싣는다 (RF
     const logged: Array<Record<string, unknown>> = [];
     const log = (_c: string, _e: string, data: Record<string, unknown>) => { logged.push(data); };
     const ops = await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
-      readCard: () => ({ ...card, completion: 'ops-action' }), log,
+      readCard: () => ({ ...card, completion: 'ops-action' }), log, env: {},
     });
     expect(ops.move).toBe('wait');
     expect(ops.reason).toBe('확인 증거 대기 — ops-action');
     expect(ops.executorKind).toBeNull();
     expect(logged.at(-1)).toMatchObject({ completion: 'ops-action' });
     const pr = await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
-      readCard: () => ({ ...card, completion: 'code-pr' }), log,
+      readCard: () => ({ ...card, completion: 'code-pr' }), log, env: {},
     });
     expect(pr.reason).toBe('완주했으나 PR 병합 근거 대기');
     expect(logged.at(-1)).toMatchObject({ completion: 'code-pr' });
@@ -404,7 +482,7 @@ describe('종결 종류를 판단부 입력·shadow-move 관측에 싣는다 (RF
     await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'no-progress', results: [job()] }, { log, env: {}, statePath: emptyState });
     expect(logged.at(-1)).toMatchObject({ completion: null });
     const legacy = await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
-      readCard: () => ({ ...card, completion: undefined }), log,
+      readCard: () => ({ ...card, completion: undefined }), log, env: {},
     });
     expect(legacy.reason).toBe('완주했으나 PR 병합 근거 대기');
     expect(logged.at(-1)).toMatchObject({ completion: 'code-pr' });
@@ -430,7 +508,7 @@ describe('종결 종류를 판단부 입력·shadow-move 관측에 싣는다 (RF
     const out = await recordTaskAgentShadowMove({ runId: 'run-decision', stopReason: 'max-rounds', results: [job({
       status: 'failed', error: { code: 'implement-abort', message: 'child stopped after budget' }, reviewMustFix: ['missing contract'],
     })] }, {
-      statePath: path, liveMoves: new Set(['decision-card']),
+      statePath: path, liveMoves: new Set(['decision-card']), env: {},
       live: { statePath: path, raiseDecision: async (args) => { raised.push(args); return { status: 0, stdout: '' }; } },
       log: (_category, event, data) => { events.push({ event, data }); },
     });
@@ -448,7 +526,7 @@ describe('종결 종류를 판단부 입력·shadow-move 관측에 싣는다 (RF
     const raised: string[][] = [];
     const events: Array<{ event: string; data: Record<string, unknown> }> = [];
     const input = { runId: 'run-empty', stopReason: 'max-rounds' as const, results: [job()] };
-    const deps = { statePath: path, live: { statePath: path, raiseDecision: async (args: string[]) => { raised.push(args); return { status: 0, stdout: '' }; } },
+    const deps = { statePath: path, env: {}, live: { statePath: path, raiseDecision: async (args: string[]) => { raised.push(args); return { status: 0, stdout: '' }; } },
       log: (_category: string, event: string, data: Record<string, unknown>) => { events.push({ event, data }); } };
     const noEvidence = await recordTaskAgentShadowMove(input, { ...deps, liveMoves: new Set(['decision-card']) });
     expect(noEvidence.liveMove).toMatchObject({ kind: 'decision-card', executed: false, ok: false });

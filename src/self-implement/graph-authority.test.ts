@@ -5,7 +5,7 @@ import { join, relative } from 'node:path';
 import { buildDocumentGuardianIndex } from './document-guardian-index.js';
 import {
   activeImplementTemplate, activeTemplate, auditTestConsumedDocumentCoverage, discardedNodeFieldsSummary, frontObservationTemplate, graphAuthorityFields,
-  graphTemplateIssuesObservation, nodeNameForStage, repositoryTestSources, resolveGraphAuthority, resolveGraphAuthorityForUserConfig, routeGate, templateHasNode,
+  graphTemplateIssuesObservation, nodeNameForStage, normalizeAuthorGrade, overlayDecisionObservation, repositoryTestSources, resolveGraphAuthority, resolveGraphAuthorityForUserConfig, routeGate, templateHasNode,
 } from './graph-authority.js';
 import { GRAPH_SPECS, GRAPH_TEMPLATES, compileGraphTemplate, type GraphTemplate } from './graph-templates.js';
 import { buildUserConfig } from '../user-config.js';
@@ -351,5 +351,39 @@ describe('⭐ 게이트 라우터 — 값은 «코드»가 낸다 (RFC §4.3 ⑵
     expect(withoutGate.reason).not.toBe(documentsOnly.reason);
     expect(unknown.runsGate).toBe(true);
     expect(documentsOnly.reason).not.toBe(unknown.reason);
+  });
+});
+
+describe('author_grade overlay state — 적응형 저작(GRAPH-AUTHOR-GRADE) 첫 조각', () => {
+  test('ⓐ overlayDecisionObservation은 state.author_grade를 «값»으로 싣는다 — stateExtraKeys로 남지 않는다', () => {
+    const observation = overlayDecisionObservation({ state: { author_grade: 'lite' }, stage: 'launch' });
+    expect(observation.state.author_grade).toBe('lite');
+    expect(observation.stateExtraKeys).toBeUndefined();
+    // ⛔ 반증: OVERLAY_STATE_KEYS 에서 author_grade 를 빼면 값이 안 실리고 이름이 stateExtraKeys 로 간다.
+    const demoted = overlayDecisionObservation({ state: { attempts: 0, author_grade: 'lite', goal_id: 'g' }, stage: 'launch' });
+    expect(demoted.state.author_grade).toBe('lite');
+    expect(demoted.state).toEqual({ attempts: 0, author_grade: 'lite', goal_id: 'g' });
+    expect(demoted.stateExtraKeys).toBeUndefined();
+  });
+
+  test('ⓑ normalizeAuthorGrade — full→normal · lite→lite · complex→complex · 그 밖은 지어내지 않는다', () => {
+    expect(normalizeAuthorGrade('full')).toBe('normal');
+    expect(normalizeAuthorGrade('lite')).toBe('lite');
+    expect(normalizeAuthorGrade('complex')).toBe('complex');
+    expect(normalizeAuthorGrade('x')).toBeUndefined();
+    expect(normalizeAuthorGrade(undefined)).toBeUndefined();
+    expect(normalizeAuthorGrade('')).toBeUndefined();
+  });
+
+  test('ⓐ′ 원장 복사는 normalizer를 «거친다» — 저작 어휘 full이 사실로 남지 않는다', () => {
+    // ⛔ 반증: 복사 루프에서 normalizeAuthorGrade 를 빼면 author_grade 가 원값 그대로 남아 이 시험이 빨강이다.
+    const authored = overlayDecisionObservation({ state: { author_grade: 'full' }, stage: 'launch' });
+    expect(authored.state.author_grade).toBe('normal');
+    expect(authored.stateExtraKeys).toBeUndefined();
+    // 모르는 등급은 키는 남되 값을 지어내지 않는다 — stateExtraKeys 로도 흘러가지 않는다.
+    const unknown = overlayDecisionObservation({ state: { author_grade: 'x' }, stage: 'launch' });
+    expect(unknown.state.author_grade).toBeUndefined();
+    expect('author_grade' in unknown.state).toBe(true);
+    expect(unknown.stateExtraKeys).toBeUndefined();
   });
 });

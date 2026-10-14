@@ -1,14 +1,16 @@
 import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { baseVersion, isReleaseVersion, nextPrereleaseVersion, prereleaseKind } from './release-version.js';
 import { cutReleaseBranchForRun, main as versionNode, nextDevVersion } from './version-node.js';
 import { cutReleaseBranch } from './cut-branch.js';
 import { refreshReleaseBranchTip, resumeReleaseRun } from './resume-release.js';
 import { labelPrerelease } from './publish-node.js';
 import { parseOptions as gateOptions } from './gate-node.js';
+import { debug } from '../../src/debug/log.js';
 
 // RELEASE-BRANCH ⊕ RELEASE-REHEARSAL-RC (10-06): real git against a temporary bare origin; install is injected and
 // nothing is published.
@@ -211,24 +213,22 @@ test('RELEASE-BRANCH: a freeze that is on stops a new branch cut (the emergency 
   } finally { f.done(); }
 });
 
-test('RELEASE-BRANCH: a real graph run resumed after cut-branch --append runs its later node on the repaired tip', async () => {
+test('RELEASE-BRANCH: a real child records the branch-cut command fingerprint and PID', async () => {
   const f = fixture();
   try {
     const cut = cutReleaseBranchForRun(f.repo, '0.2.18', { install: () => {}, freeze: () => null });
     const probe = join(f.root, 'probe');
     const state = join(f.root, 'state');
     mkdirSync(probe);
-    const fixed = join(probe, 'fixed');
     writeFileSync(join(probe, 'vr.json'), `${JSON.stringify({ outcome: 'ok', kind: 'release', version: '0.2.18', commit: cut.commit, pr: null, branch: 'release/0.2.18' })}\n`);
     writeFileSync(join(probe, 'gate.js'), [
       "const fs = require('node:fs');",
       'const loc = process.env.ELANOUS_GRAPH_CONTEXT;',
       "const ctx = JSON.parse(loc.trim().startsWith('{') ? loc : fs.readFileSync(loc, 'utf8'));",
-      "const commit = ctx.outputs['version-release'].commit;",
-      `if (!fs.existsSync(${JSON.stringify(fixed)})) { console.log(JSON.stringify({ outcome: 'fail', commit })); process.exit(1); }`,
-      "console.log(JSON.stringify({ outcome: 'ok', commit }));",
+      "console.log(JSON.stringify({ outcome: 'fail', commit: ctx.outputs['version-release'].commit }));",
+      'process.exit(1);',
     ].join('\n'));
-    writeFileSync(join(probe, 'release-loop.yaml'), ['graph_id: release-loop', 'version: 1', 'entry_node: version-release', 'terminal_nodes: [done, failed]', 'nodes:',
+    writeFileSync(join(probe, 'release-loop.yaml'), ['graph_id: release-branch-probe', 'version: 1', 'entry_node: version-release', 'terminal_nodes: [done, failed]', 'nodes:',
       "  - { node_id: version-release, kind: git, recipe: 'cmd:vr', max_visits: 1 }", "  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1 }",
       '  - { node_id: done, kind: gate, max_visits: 1 }', '  - { node_id: failed, kind: gate, max_visits: 1 }', 'edges:',
       '  - { from: version-release, on: outcome, map: { ok: gate, fail: failed, error: failed } }',
@@ -238,16 +238,19 @@ test('RELEASE-BRANCH: a real graph run resumed after cut-branch --append runs it
     const first = await runGraph(join(probe, 'release-loop.yaml'), { input: { version: '0.2.18', previousVersion: '0.2.17', branchCut: true }, deps: { root: state } });
     expect(first.status).toBe('failed');
     expect(JSON.stringify(first.nodes.find((node) => node.nodeId === 'gate')!.output)).toContain(cut.commit!);
-    // Repair: one main fix appended to release/0.2.18, then resume at the gate.
-    const fix = f.land('fix.ts', 'export const fix = true;\n');
-    cutReleaseBranch({ version: '0.2.18', base: cut.base!, pick: [fix], append: true, repoRoot: f.repo, log: () => {} });
-    const tip = git(f.origin, 'rev-parse', 'release/0.2.18');
-    writeFileSync(fixed, '');
-    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'gate' }, { root: state, repo: f.repo, graphPath: join(probe, 'release-loop.yaml') });
-    expect(resumed.tip).toMatchObject({ changed: true, from: cut.commit, to: tip });
-    expect(resumed.state.status).toBe('done');
-    const gate = resumed.state.nodes.find((node) => node.nodeId === 'gate')!;
-    expect(JSON.parse(String(gate.output).trim().split('\n').at(-1)!)).toEqual({ outcome: 'ok', commit: tip });
+    const expectedArgvSha256 = createHash('sha256').update(JSON.stringify(['/bin/bash', '-c', `cat ${join(probe, 'vr.json')}`])).digest('hex');
+    const realDispatch = debug.events(500).find((entry) => entry.category === 'graph.run' && entry.event === 'command-dispatch' &&
+      (entry.data as { runId?: string; nodeId?: string }).runId === first.runId &&
+      (entry.data as { nodeId?: string }).nodeId === 'version-release');
+    const realSpawn = debug.events(500).find((entry) => entry.category === 'graph.run' && entry.event === 'command-spawn' &&
+      (entry.data as { runId?: string; nodeId?: string }).runId === first.runId &&
+      (entry.data as { nodeId?: string }).nodeId === 'version-release');
+    const spawnedPid = (realSpawn?.data as { pid?: number } | undefined)?.pid;
+    expect(typeof spawnedPid).toBe('number');
+    expect(Number(spawnedPid) > 0).toBe(true);
+    expect(realDispatch?.data).toMatchObject({ nodeId: 'version-release', recipe: 'cmd:vr', argvSha256: expectedArgvSha256, pid: null });
+    expect(realSpawn?.data).toMatchObject({ nodeId: 'version-release', recipe: 'cmd:vr', argvSha256: expectedArgvSha256,
+      pid: expect.any(Number) });
   } finally { f.done(); }
 });
 
@@ -255,11 +258,11 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
   const f = fixture();
   try {
     const state = join(f.root, 'state');
-    const seen: Array<{ nodeId: string; commit: unknown; context: string }> = [];
+    const seen: Array<{ nodeId: string; commit: unknown; context: string; command: string }> = [];
     let gateFails = true;
     // Node commands are not executed: version-release runs the real branch cut; every other node records the context
     // the runner handed it (gate fails once). Nothing is published.
-    const runBash = async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
+    const runBash = async (body: string, opts: { env?: NodeJS.ProcessEnv }) => {
       const contextPath = opts.env!.ELANOUS_GRAPH_CONTEXT!;
       const raw = readFileSync(contextPath, 'utf8');
       const context = JSON.parse(raw) as { nodeId: string; outputs: Record<string, { commit?: unknown } | null> };
@@ -268,7 +271,7 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
       }
       const copy = join(f.root, `ctx-${seen.length}.json`);
       writeFileSync(copy, raw);
-      seen.push({ nodeId: context.nodeId, commit: context.outputs['version-release']?.commit, context: copy });
+      seen.push({ nodeId: context.nodeId, commit: context.outputs['version-release']?.commit, context: copy, command: body });
       if (context.nodeId === 'gate' && gateFails) return { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}\n' };
       return { exitCode: 0, stderr: '', stdout: '{"outcome":"ok","verdict":"pass"}\n' };
     };
@@ -290,6 +293,22 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     expect(resumed.state.status).toBe('done');
     expect(seen.map((item) => item.nodeId)).toEqual(['gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues',
       'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump']);
+    // Shadow publication on the real resume path: the three post-approval visits must dispatch three
+    // distinct commands. The injected runner never publishes anything outside this temporary test universe.
+    expect(seen.filter((item) => ['publish', 'npm-publish', 'docs-land'].includes(item.nodeId)).map((item) => [item.nodeId, item.command]))
+      .toEqual([['publish', 'bun scripts/release-loop/publish-node.ts'],
+        ['npm-publish', 'bun scripts/release-loop/npm-publish-node.ts'],
+        ['docs-land', 'bun scripts/release-loop/docs-land-node.ts']]);
+    const dispatches = debug.events(500).filter((entry) => entry.category === 'graph.run' && entry.event === 'command-dispatch' &&
+      (entry.data as { runId?: string }).runId === first.runId);
+    expect(dispatches.filter((entry) => ['publish', 'npm-publish', 'docs-land'].includes(String((entry.data as { nodeId?: string }).nodeId)))
+      .map((entry) => {
+        const data = entry.data as { nodeId: string; recipe: string; argvSha256: string; pid: number | null };
+        return [data.nodeId, data.recipe, data.argvSha256.length, data.pid];
+      }))
+      .toEqual([['publish', 'cmd:publish-command', 64, null], ['npm-publish', 'cmd:npm-publish', 64, null],
+        ['docs-land', 'cmd:docs-land', 64, null]]);
+    expect(dispatches.some((entry) => (entry.data as { nodeId?: string }).nodeId === 'failed')).toBe(false);
     expect(new Set(seen.map((item) => item.commit))).toEqual(new Set([tip]));
     // The real gate node reads that context and measures the repaired tip.
     const gate = gateOptions(['--json'], { ELANOUS_GRAPH_CONTEXT: seen[0]!.context });
@@ -297,6 +316,53 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     expect(git(f.origin, 'rev-parse', 'main')).toBe(fix);
     expect(f.versionOn('main')).toBe('0.2.18-dev.3');
   } finally { f.done(); }
+});
+
+test('RELEASE-POSTPUB: a wrongly saved post-gate binding is rejected before any resumed child starts', async () => {
+  const probe = mkdtempSync(join(tmpdir(), 'release-postpub-binding-'));
+  try {
+    const releaseDir = join(probe, 'graphs', 'release');
+    mkdirSync(releaseDir, { recursive: true });
+    const graphPath = join(releaseDir, 'release-loop.yaml');
+    const recipePath = join(releaseDir, 'recipes.yaml');
+    const graph = readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8');
+    const recipes = readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8');
+    writeFileSync(graphPath, graph);
+    writeFileSync(recipePath, recipes);
+    let childCalls = 0;
+    const runBash = async () => { childCalls++; return { exitCode: 1, stdout: '{"outcome":"fail"}\n', stderr: '' }; };
+    const { runGraph } = await import('../../src/graph-runner/runner.js');
+    // The CLI can hand the runner a relative graph path; this must use the same binding guard.
+    const relativeGraphPath = relative(process.cwd(), graphPath);
+    const first = await runGraph(relativeGraphPath, { input: { version: '0.2.28' }, deps: { root: join(probe, 'state'), runBash } });
+    expect(first.status).toBe('failed');
+    expect(childCalls).toBe(1);
+    const resume = () => runGraph(relativeGraphPath, { resumeRunId: first.runId, fromNodeId: 'version-release', useCurrentGraph: true,
+      deps: { root: join(probe, 'state'), runBash } });
+    writeFileSync(recipePath, recipes.replace('bun scripts/release-loop/npm-publish-node.ts', 'bun scripts/release-loop/publish-node.ts'));
+    await expect(resume()).rejects.toThrow('release node dispatch mismatch before execution: npm-publish');
+    expect(childCalls).toBe(1);
+    writeFileSync(recipePath, recipes);
+    // Both bindings are individually valid recipes, but each belongs to a different node.
+    writeFileSync(graphPath, graph.replace("node_id: verify, kind: gate, recipe: 'cmd:verify'",
+      "node_id: verify, kind: gate, recipe: 'cmd:npm-publish'").replace("node_id: npm-publish, kind: git, recipe: 'cmd:npm-publish'",
+      "node_id: npm-publish, kind: git, recipe: 'cmd:verify'"));
+    await expect(resume()).rejects.toThrow('release node dispatch mismatch before execution: npm-publish');
+    expect(childCalls).toBe(1);
+    // A saved snapshot can carry a coherent checksum and still bind the wrong node command.
+    // The independent node table must reject the default resume path too.
+    writeFileSync(graphPath, graph);
+    const badSnapshot = graph.replace("node_id: verify, kind: gate, recipe: 'cmd:verify'",
+      "node_id: verify, kind: gate, recipe: 'cmd:npm-publish'");
+    writeFileSync(`${first.statePath}.graph/graph.yaml`, badSnapshot);
+    const saved = JSON.parse(readFileSync(first.statePath, 'utf8')) as { graphSnapshot: { graphSha: string }; sourceHash: string };
+    saved.graphSnapshot.graphSha = createHash('sha256').update(badSnapshot).digest('hex');
+    saved.sourceHash = createHash('sha256').update(badSnapshot).update('\0').update(recipes).digest('hex');
+    writeFileSync(first.statePath, JSON.stringify(saved));
+    await expect(runGraph(relativeGraphPath, { resumeRunId: first.runId, fromNodeId: 'version-release',
+      deps: { root: join(probe, 'state'), runBash } })).rejects.toThrow('release node dispatch mismatch before execution: verify');
+    expect(childCalls).toBe(1);
+  } finally { rmSync(probe, { recursive: true, force: true }); }
 });
 
 test('RELEASE-REHEARSAL-RC: docs-land and ops-upgrade skip a prerelease; its public notes open with a pre-release label', () => {

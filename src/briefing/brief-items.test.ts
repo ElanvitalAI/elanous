@@ -1,10 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BRIEF_SLOTS, BriefItemsInputError, BriefItemsLedger, composeBriefMarkdown, normalizeClaim, pendingRealtime, type BriefItem } from './brief-items.js';
+import { BRIEF_SLOTS, BriefItemsInputError, BriefItemsLedger, composeBriefMarkdown, composeBriefPage, normalizeClaim, pendingRealtime, type BriefItem } from './brief-items.js';
 import { runRequirementFunnel } from '../intake-plane/requirement-funnel.js';
+import { briefFeedbackButtons, recordBriefTelegramUpdate, registerBriefCommands } from '../cli/brief-cli.js';
+import { Command } from 'commander';
+import { TelegramBot } from '../telegram.js';
 import type { DirectiveRow } from '../intake-plane/requirement-funnel.js';
 
 const NOW = new Date('2026-10-05T00:00:00Z'); // 09:00 KST — after 08:30, before 22:00
@@ -160,6 +163,676 @@ test('reactions append per sent item without rewriting items; weekly action rate
     expect(() => store.recordReaction(999, '버튼')).toThrow('item was not sent');
     expect(() => store.recordReaction(first.id, 'unknown' as '버튼')).toThrow('invalid reaction');
     expect(reopened.weeklyActions().total).toBe(3);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('no feedback preserves id order inside a domain even when input is reversed', () => {
+  const { root, store } = fixture();
+  try {
+    const first = store.add({ text: '먼저', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const second = store.add({ text: '나중', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const page = composeBriefPage(store.list().reverse(), '08:30', NOW);
+    expect(page.ids).toEqual([first.id, second.id]);
+    expect(page.markdown.indexOf('먼저')).toBeLessThan(page.markdown.indexOf('나중'));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Telegram feedback buttons and attributed updates keep item and send rows unchanged', () => {
+  const { root, store } = fixture();
+  try {
+    const first = store.add({ text: '첫째', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const second = store.add({ text: '둘째', domain: '판', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    expect(briefFeedbackButtons([first.id])[0]).toEqual([
+      { text: `👀 ${first.id} 읽음`, data: `brief-item:${first.id}:read` },
+      { text: `✅ ${first.id} 움직임`, data: `brief-item:${first.id}:button` },
+      { text: `➖ ${first.id} 넘김`, data: `brief-item:${first.id}:ignore` },
+    ]);
+    store.withSendLock('08:30', (page, mark) => {
+      expect(page.ids).toEqual([first.id, second.id]);
+      mark(page.ids, '08:30', { botId: 'bot', chatId: 42, messageId: 77 });
+    });
+    const db = new Database(store.path);
+    try {
+      const sends = db.query('SELECT * FROM sends ORDER BY item_id').all();
+      const items = store.list();
+      const base = { botId: 'bot', chatId: 42, messageId: 77 };
+      expect(recordBriefTelegramUpdate(store, { ...base, botId: 'other', updateId: 'u1', text: '#1 답장' })).toBe(false);
+      expect(recordBriefTelegramUpdate(store, { ...base, chatId: 43, updateId: 'u1', text: '#1 답장' })).toBe(false);
+      expect(recordBriefTelegramUpdate(store, { ...base, messageId: 78, updateId: 'u1', text: '#1 답장' })).toBe(false);
+      expect(recordBriefTelegramUpdate(store, { ...base, updateId: 'u2', text: '그게 아니라' })).toBe(false);
+      expect(recordBriefTelegramUpdate(store, { ...base, updateId: 'u2a', callbackData: 'brief-item:999:button' })).toBe(false);
+      expect(recordBriefTelegramUpdate(store, { ...base, updateId: 'u3', callbackData: `brief-item:${first.id}:button` })).toBe(true);
+      expect(recordBriefTelegramUpdate(store, { ...base, updateId: 'u3', callbackData: `brief-item:${second.id}:button` })).toBe(false);
+      expect(recordBriefTelegramUpdate(store, { ...base, updateId: 'u4', text: `#${second.id}: 그게 아니라 내일` })).toBe(true);
+    expect(recordBriefTelegramUpdate(store, { ...base, updateId: 'u5', text: `#${first.id} 정정: 마감은 내일` })).toBe(true);
+      expect(db.query('SELECT item_id, reaction FROM reactions ORDER BY id').all()).toEqual([
+        { item_id: first.id, reaction: '버튼' }, { item_id: second.id, reaction: '정정' }, { item_id: first.id, reaction: '정정' },
+      ]);
+      expect(store.weeklyActions()).toMatchObject({ acted: 2, total: 2 });
+      expect(db.query('SELECT * FROM sends ORDER BY item_id').all()).toEqual(sends);
+      expect(store.list()).toEqual(items);
+    } finally { db.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('brief send failure leaves sends and Telegram coordinates empty', async () => {
+  const { root, store } = fixture();
+  const priorExit = process.exitCode;
+  try {
+    store.add({ text: '재시도', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const program = new Command();
+    const errors: string[] = [];
+    registerBriefCommands(program, { ledger: store, send: () => null,
+      telegramTarget: { botToken: '123:secret', chatId: 42 }, error: text => errors.push(text) });
+    await program.parseAsync(['brief', 'send', '--slot', '08:30'], { from: 'user' });
+    expect(errors[0]).toContain('발송 실패');
+    const db = new Database(store.path);
+    try {
+      expect(db.query('SELECT COUNT(*) AS count FROM sends').get()).toEqual({ count: 0 });
+      expect(db.query('SELECT COUNT(*) AS count FROM telegram_sends').get()).toEqual({ count: 0 });
+    } finally { db.close(); }
+  } finally { process.exitCode = priorExit ?? 0; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a Telegram coordinate write failure rolls back the sent mark with it', () => {
+  const { root, store } = fixture();
+  try {
+    const item = store.add({ text: '좌표 실패 재시도', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    let db = new Database(store.path);
+    try {
+      db.exec("CREATE TRIGGER reject_telegram_send BEFORE INSERT ON telegram_sends BEGIN SELECT RAISE(ABORT, 'coordinate failed'); END");
+    } finally { db.close(); }
+    expect(() => store.withSendLock('08:30', (page, mark) => {
+      mark(page.ids, '08:30', { botId: 'bot', chatId: 42, messageId: 77 });
+    })).toThrow('coordinate failed');
+    db = new Database(store.path);
+    try {
+      expect(db.query('SELECT COUNT(*) AS count FROM sends').get()).toEqual({ count: 0 });
+      expect(db.query('SELECT COUNT(*) AS count FROM telegram_sends').get()).toEqual({ count: 0 });
+      db.exec('DROP TRIGGER reject_telegram_send');
+    } finally { db.close(); }
+    store.withSendLock('08:30', (page, mark) => { mark(page.ids, '08:30', { botId: 'bot', chatId: 42, messageId: 78 }); });
+    db = new Database(store.path);
+    try {
+      expect(db.query('SELECT item_id FROM sends').all()).toEqual([{ item_id: item.id }]);
+      expect(db.query('SELECT message_id, item_id FROM telegram_sends').all()).toEqual([{ message_id: 78, item_id: item.id }]);
+    } finally { db.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('31-item Telegram brief gives every split message item buttons and attributes early read and reply', async () => {
+  const { root, store } = fixture();
+  try {
+    const items = Array.from({ length: 31 }, (_, index) => store.add({
+      text: `요청 ${index} ` + '가'.repeat(100), domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z',
+    }));
+    const delivered: Array<{ text: string; buttons: ReturnType<typeof briefFeedbackButtons>; messageId: number }> = [];
+    const program = new Command();
+    const outputs: string[] = [];
+    registerBriefCommands(program, { ledger: store, telegramTarget: { botToken: '123:secret', chatId: 42 },
+      sendWithButtons: (text, buttons) => {
+        const messageId = 77 + delivered.length;
+        delivered.push({ text, buttons, messageId });
+        return messageId;
+      }, output: text => outputs.push(text) });
+    await program.parseAsync(['brief', 'send', '--slot', '08:30'], { from: 'user' });
+    expect(delivered).toHaveLength(31);
+    expect(delivered.every(part => part.text.length <= 3900)).toBe(true);
+    expect(delivered[0]!.text).toContain(items[0]!.text);
+    expect(delivered[0]!.buttons).toEqual(briefFeedbackButtons([items[0]!.id]));
+    expect(outputs).toEqual(['sent 107 (31 items)']);
+    const early = { botId: '123', chatId: 42, messageId: delivered[0]!.messageId };
+    const updates = [
+      { update_id: 1, callback_query: { id: 'read-first', from: { id: 42 }, message: { message_id: early.messageId, chat: { id: 42 } }, data: delivered[0]!.buttons[0]![0]!.data } },
+      { update_id: 2, message: { message_id: 88, from: { id: 42 }, chat: { id: 42, type: 'private' }, text: '움직이겠습니다', reply_to_message: { message_id: early.messageId } } },
+    ];
+    let polls = 0;
+    let bot: TelegramBot;
+    const seen: string[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/getUpdates')) {
+        if (++polls === 1) return Response.json({ ok: true, result: updates });
+        bot.stop();
+        return Response.json({ ok: true, result: [] });
+      }
+      return Response.json({ ok: true, result: { message_id: 99 } });
+    }) as typeof fetch;
+    bot = new TelegramBot({ token: '123:secret', allowedUsers: [42], fetchImpl, nowImpl: () => NOW.getTime(),
+      perChatGapMs: 0, briefLedger: store, onMessage: async ctx => { seen.push(ctx.text); } });
+    await bot.start();
+    expect(seen).toEqual(['움직이겠습니다']);
+    expect(recordBriefTelegramUpdate(store, { ...early, updateId: 'wrong-item', callbackData: `brief-item:${items[30]!.id}:button` })).toBe(false);
+    const db = new Database(store.path);
+    try {
+      expect(db.query('SELECT item_id, slot FROM sends ORDER BY item_id').all()).toEqual(items.map(item => ({ item_id: item.id, slot: '08:30' })));
+      expect(db.query('SELECT message_id, item_id FROM telegram_sends ORDER BY message_id').all()).toEqual(
+        items.map((item, index) => ({ message_id: 77 + index, item_id: item.id })),
+      );
+      expect(db.query('SELECT item_id, reaction FROM reactions ORDER BY id').all()).toEqual([
+        { item_id: items[0]!.id, reaction: '열람' }, { item_id: items[0]!.id, reaction: '답장' },
+      ]);
+      expect(store.weeklyActions()).toMatchObject({ acted: 1, total: 31 });
+    } finally { db.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a separate Telegram poller records feedback arriving while later fragments are delayed', async () => {
+  const { root, store } = fixture();
+  let workerProcess: ReturnType<typeof Bun.spawn> | undefined;
+  try {
+    const items = Array.from({ length: 31 }, (_, index) => store.add({
+      text: `조기 반응 ${index} ` + '가'.repeat(100), domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z',
+    }));
+    const marker = join(root, 'first-fragment-sent');
+    const worker = join(root, 'send-worker.ts');
+    writeFileSync(worker, `
+import { writeFileSync } from 'node:fs';
+import { BriefItemsLedger } from ${JSON.stringify(join(import.meta.dir, 'brief-items.ts'))};
+import { registerBriefCommands } from ${JSON.stringify(join(import.meta.dir, '../cli/brief-cli.ts'))};
+class Command {
+  children = [];
+  constructor(name) { this.name = name; }
+  description() { return this; }
+  requiredOption() { return this; }
+  option() { return this; }
+  action(fn) { this.handler = fn; return this; }
+  command(name) { const child = new Command(name); this.children.push(child); return child; }
+}
+const [root, marker] = process.argv.slice(2);
+const command = new Command('root');
+let sends = 0;
+registerBriefCommands(command, {
+  ledger: new BriefItemsLedger({ stateDir: root, now: () => new Date('2026-10-05T00:00:00Z'), log: () => {} }),
+  telegramTarget: { botToken: '123:secret', chatId: 42 },
+  sendWithButtons: () => {
+    sends += 1;
+    if (sends === 1) writeFileSync(marker, 'ready');
+    if (sends === 2) Bun.sleepSync(1000);
+    return 76 + sends;
+  }, output: () => {}, error: message => { throw new Error(message); },
+});
+command.children[0].children.find(child => child.name === 'send').handler({ slot: '08:30' });
+`);
+    workerProcess = Bun.spawn(['bun', 'run', worker, root, marker], { stdout: 'pipe', stderr: 'pipe' });
+    for (let i = 0; i < 200 && !existsSync(marker); i += 1) await Bun.sleep(10);
+    expect(existsSync(marker)).toBe(true);
+    let polls = 0;
+    let bot: TelegramBot;
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/getUpdates')) {
+        if (++polls === 1) return Response.json({ ok: true, result: [{ update_id: 1, callback_query: {
+          id: 'early-read', from: { id: 42 }, message: { message_id: 77, chat: { id: 42 } },
+          data: `brief-item:${items[0]!.id}:read`,
+        } }] });
+        bot.stop();
+        return Response.json({ ok: true, result: [] });
+      }
+      return Response.json({ ok: true, result: true });
+    }) as typeof fetch;
+    bot = new TelegramBot({ token: '123:secret', allowedUsers: [42], fetchImpl, nowImpl: () => NOW.getTime(),
+      perChatGapMs: 0, briefLedger: store, onMessage: async () => undefined });
+    await bot.start();
+    expect(await workerProcess.exited).toBe(0);
+    const db = new Database(store.path);
+    try { expect(db.query('SELECT item_id, reaction FROM reactions').all()).toEqual([{ item_id: items[0]!.id, reaction: '열람' }]); }
+    finally { db.close(); }
+  } finally { workerProcess?.kill(); rmSync(root, { recursive: true, force: true }); }
+}, 15000);
+
+test('item-number prefixes are counted before choosing a single Telegram message', async () => {
+  const { root, store } = fixture();
+  try {
+    for (let index = 0; index < 30; index += 1) {
+      store.add({ text: `요청 ${index} ` + '가'.repeat(100), domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    }
+    const page = store.composeWithIds('08:30');
+    expect(page.ids).toHaveLength(30);
+    expect(page.markdown.length + page.markdown.split('\n').length).toBeLessThanOrEqual(3900);
+    const delivered: string[] = [];
+    const program = new Command();
+    registerBriefCommands(program, { ledger: store, telegramTarget: { botToken: '123:secret', chatId: 42 },
+      sendWithButtons: text => { delivered.push(text); return 100 + delivered.length; }, output: () => {} });
+    await program.parseAsync(['brief', 'send', '--slot', '08:30'], { from: 'user' });
+    expect(delivered).toHaveLength(30);
+    expect(delivered.every(text => text.length + text.split('\n').length <= 3900)).toBe(true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('identical item lines in different domains retain distinct Telegram coordinates', async () => {
+  const { root, store } = fixture();
+  try {
+    const first = store.add({ text: '동일 주장', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const second = store.add({ text: '동일 주장', domain: '판', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const delivered: ReturnType<typeof briefFeedbackButtons>[] = [];
+    const program = new Command();
+    registerBriefCommands(program, { ledger: store, telegramTarget: { botToken: '123:secret', chatId: 42 },
+      sendWithButtons: (_text, buttons) => { delivered.push(buttons); return 77 + delivered.length; }, output: () => {} });
+    await program.parseAsync(['brief', 'send', '--slot', '08:30'], { from: 'user' });
+    expect(delivered).toEqual([briefFeedbackButtons([first.id])]);
+    const db = new Database(store.path);
+    try {
+      expect(db.query('SELECT item_id FROM sends').all()).toEqual([{ item_id: first.id }]);
+      expect(db.query('SELECT item_id FROM telegram_sends').all()).toEqual([{ item_id: first.id }]);
+      expect(store.list().find(item => item.id === second.id)?.sent_at).toBeNull();
+    } finally { db.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('oversized single item splits with its own buttons on both fragments', async () => {
+  const { root, store } = fixture();
+  try {
+    const item = store.add({ text: '긴 브리핑 ' + '가'.repeat(3900), domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const delivered: Array<{ text: string; buttons: ReturnType<typeof briefFeedbackButtons> }> = [];
+    const program = new Command();
+    registerBriefCommands(program, { ledger: store, telegramTarget: { botToken: '123:secret', chatId: 42 },
+      sendWithButtons: (text, buttons) => { delivered.push({ text, buttons }); return 76 + delivered.length; }, output: () => {} });
+    await program.parseAsync(['brief', 'send', '--slot', '08:30'], { from: 'user' });
+    expect(delivered.length).toBeGreaterThan(1);
+    expect(delivered.every(part => part.text.length <= 3900 && JSON.stringify(part.buttons) === JSON.stringify(briefFeedbackButtons([item.id])))).toBe(true);
+    expect(recordBriefTelegramUpdate(store, { botId: '123', chatId: 42, messageId: 77, updateId: 'early', text: '그게 아니라 수정' })).toBe(true);
+    const db = new Database(store.path);
+    try {
+      expect(db.query('SELECT item_id, slot FROM sends').all()).toEqual([{ item_id: item.id, slot: '08:30' }]);
+      expect(db.query('SELECT message_id, item_id FROM telegram_sends ORDER BY message_id').all()).toEqual(
+        delivered.map((_, index) => ({ message_id: 77 + index, item_id: item.id })),
+      );
+      expect(db.query('SELECT item_id, reaction FROM reactions').all()).toEqual([{ item_id: item.id, reaction: '정정' }]);
+    } finally { db.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a failed second fragment leaves the long item unsent and retries every fragment', async () => {
+  const { root, store } = fixture();
+  const priorExit = process.exitCode;
+  try {
+    const item = store.add({ text: '긴 재시도 ' + '가'.repeat(3900), domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const firstAttempt: string[] = [];
+    const errors: string[] = [];
+    const first = new Command();
+    registerBriefCommands(first, { ledger: store, telegramTarget: { botToken: '123:secret', chatId: 42 },
+      sendWithButtons: text => { firstAttempt.push(text); return firstAttempt.length === 1 ? 77 : null; },
+      output: () => {}, error: text => errors.push(text) });
+    await first.parseAsync(['brief', 'send', '--slot', '08:30'], { from: 'user' });
+    expect(firstAttempt).toHaveLength(2);
+    expect(errors[0]).toContain('발송 실패');
+    let db = new Database(store.path);
+    try {
+      expect(db.query('SELECT COUNT(*) AS count FROM sends').get()).toEqual({ count: 0 });
+      expect(db.query('SELECT COUNT(*) AS count FROM telegram_sends').get()).toEqual({ count: 0 });
+    } finally { db.close(); }
+    const retried: string[] = [];
+    const retry = new Command();
+    registerBriefCommands(retry, { ledger: store, telegramTarget: { botToken: '123:secret', chatId: 42 },
+      sendWithButtons: text => { retried.push(text); return 100 + retried.length; },
+      output: () => {}, error: () => {} });
+    await retry.parseAsync(['brief', 'send', '--slot', '08:30'], { from: 'user' });
+    expect(retried.length).toBeGreaterThan(1);
+    expect(retried[0]).toBe(firstAttempt[0]);
+    db = new Database(store.path);
+    try {
+      expect(db.query('SELECT item_id, slot FROM sends').all()).toEqual([{ item_id: item.id, slot: '08:30' }]);
+      expect(db.query('SELECT message_id, item_id FROM telegram_sends ORDER BY message_id').all()).toEqual(
+        retried.map((_, index) => ({ message_id: 101 + index, item_id: item.id })),
+      );
+    } finally { db.close(); }
+  } finally { process.exitCode = priorExit ?? 0; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('brief send records Telegram coordinates without changing the sends ledger or output', async () => {
+  const { root, store } = fixture();
+  try {
+    const item = store.add({ text: '응답 요청', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const program = new Command();
+    const outputs: string[] = [];
+    registerBriefCommands(program, { ledger: store, send: () => 77,
+      telegramTarget: { botToken: '123:secret', chatId: 42 }, output: text => outputs.push(text) });
+    await program.parseAsync(['brief', 'send', '--slot', '08:30'], { from: 'user' });
+    expect(outputs).toEqual(['sent 77 (1 items)']);
+    const db = new Database(store.path);
+    try {
+      expect(db.query('SELECT item_id, slot FROM sends').all()).toEqual([{ item_id: item.id, slot: '08:30' }]);
+      expect(db.query('SELECT bot_id, chat_id, message_id, item_id FROM telegram_sends').all()).toEqual([
+        { bot_id: '123', chat_id: 42, message_id: 77, item_id: item.id },
+      ]);
+    } finally { db.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('mid-flight Telegram split failure keeps the delivered front items and a retry sends only the remainder', async () => {
+  const { root, store } = fixture();
+  const priorExit = process.exitCode;
+  try {
+    const items = Array.from({ length: 31 }, (_, index) => store.add({
+      text: `요청 ${index} ` + '가'.repeat(100), domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z',
+    }));
+    const errors: string[] = [];
+    const firstRun: Array<{ text: string; buttons: ReturnType<typeof briefFeedbackButtons> }> = [];
+    let sends = 0;
+    const program = new Command();
+    registerBriefCommands(program, { ledger: store, telegramTarget: { botToken: '123:secret', chatId: 42 },
+      sendWithButtons: (text, buttons) => {
+        sends += 1;
+        if (sends > 2) return null;
+        firstRun.push({ text, buttons });
+        return 76 + sends;
+      }, output: () => {}, error: text => errors.push(text) });
+    await program.parseAsync(['brief', 'send', '--slot', '08:30'], { from: 'user' });
+    expect(errors[0]).toContain('발송 실패');
+    // the two messages the 대표 already received stay recorded; the unsent 29 stay unsent
+    expect(firstRun[0]!.text).toContain(`#${items[0]!.id} `);
+    let db = new Database(store.path);
+    try {
+      expect(db.query('SELECT item_id, slot FROM sends ORDER BY item_id').all()).toEqual([
+        { item_id: items[0]!.id, slot: '08:30' }, { item_id: items[1]!.id, slot: '08:30' },
+      ]);
+      expect(db.query('SELECT message_id, item_id FROM telegram_sends ORDER BY message_id').all()).toEqual([
+        { message_id: 77, item_id: items[0]!.id }, { message_id: 78, item_id: items[1]!.id },
+      ]);
+    } finally { db.close(); }
+    expect(store.list().filter(item => item.sent_at)).toHaveLength(2);
+    // retry: only the unsent remainder goes out — nothing already delivered is re-sent
+    const retry: Array<{ text: string; buttons: ReturnType<typeof briefFeedbackButtons> }> = [];
+    const outputs: string[] = [];
+    const programRetry = new Command();
+    registerBriefCommands(programRetry, { ledger: store, telegramTarget: { botToken: '123:secret', chatId: 42 },
+      sendWithButtons: (text, buttons) => { retry.push({ text, buttons }); return 100 + retry.length; },
+      output: text => outputs.push(text), error: () => {} });
+    await programRetry.parseAsync(['brief', 'send', '--slot', '08:30'], { from: 'user' });
+    expect(retry).toHaveLength(1);
+    expect(retry[0]!.text).toContain(`#${items[2]!.id} `);
+    expect(retry[0]!.text).not.toContain(`#${items[0]!.id} `);
+    expect(retry[0]!.text).not.toContain(`#${items[1]!.id} `);
+    expect(retry[0]!.buttons).toEqual(briefFeedbackButtons(items.slice(2).map(item => item.id)));
+    expect(outputs).toEqual(['sent 101 (29 items)']);
+    db = new Database(store.path);
+    try {
+      expect(db.query('SELECT COUNT(*) AS count FROM sends').get()).toEqual({ count: 31 });
+      expect(db.query('SELECT COUNT(*) AS count FROM telegram_sends').get()).toEqual({ count: 31 });
+    } finally { db.close(); }
+  } finally { process.exitCode = priorExit ?? 0; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a thrown split send preserves completed front items and retries only the remainder', async () => {
+  const { root, store } = fixture();
+  const priorExit = process.exitCode;
+  try {
+    const items = Array.from({ length: 31 }, (_, index) => store.add({
+      text: `요청 ${index} ` + '가'.repeat(100), domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z',
+    }));
+    let attempts = 0;
+    const errors: string[] = [];
+    const first = new Command();
+    registerBriefCommands(first, { ledger: store, telegramTarget: { botToken: '123:secret', chatId: 42 },
+      sendWithButtons: () => { if (++attempts === 2) throw new Error('network failed'); return 77; },
+      output: () => {}, error: text => errors.push(text) });
+    await first.parseAsync(['brief', 'send', '--slot', '08:30'], { from: 'user' });
+    expect(errors[0]).toContain('network failed');
+    let db = new Database(store.path);
+    try {
+      expect(db.query('SELECT item_id FROM sends').all()).toEqual([{ item_id: items[0]!.id }]);
+      expect(db.query('SELECT message_id, item_id FROM telegram_sends').all()).toEqual([{ message_id: 77, item_id: items[0]!.id }]);
+    } finally { db.close(); }
+    const retryTexts: string[] = [];
+    const retry = new Command();
+    registerBriefCommands(retry, { ledger: store, telegramTarget: { botToken: '123:secret', chatId: 42 },
+      sendWithButtons: text => { retryTexts.push(text); return 100 + retryTexts.length; },
+      output: () => {}, error: () => {} });
+    await retry.parseAsync(['brief', 'send', '--slot', '08:30'], { from: 'user' });
+    expect(retryTexts.join('\n')).toContain(`#${items[1]!.id} `);
+    expect(retryTexts.join('\n')).not.toContain(`#${items[0]!.id} `);
+    db = new Database(store.path);
+    try {
+      expect(db.query('SELECT COUNT(*) AS count FROM sends').get()).toEqual({ count: 31 });
+    } finally { db.close(); }
+  } finally { process.exitCode = priorExit ?? 0; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('multi-item single-message brief carries item numbers so a reply can name its target item', async () => {
+  const { root, store } = fixture();
+  try {
+    const first = store.add({ text: '첫 항목', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const second = store.add({ text: '둘 항목', domain: '판', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const sent: string[] = [];
+    const program = new Command();
+    registerBriefCommands(program, { ledger: store, send: text => { sent.push(text); return 77; },
+      telegramTarget: { botToken: '123:secret', chatId: 42 }, output: () => {} });
+    await program.parseAsync(['brief', 'send', '--slot', '08:30'], { from: 'user' });
+    // the delivered text numbers every item line so a plain reply can name its target
+    expect(sent[0]).toContain(`#${first.id} - [P1] 첫 항목`);
+    expect(sent[0]).toContain(`#${second.id} - [P1] 둘 항목`);
+    const base = { botId: '123', chatId: 42, messageId: 77 };
+    // an unnumbered reply to a multi-item message stays unattributed (signal dropped)
+    expect(recordBriefTelegramUpdate(store, { ...base, updateId: 'u1', text: '그게 아니라 내일' })).toBe(false);
+    // a reply naming the item lands on exactly that item
+    expect(recordBriefTelegramUpdate(store, { ...base, updateId: 'u2', text: `#${second.id} 그게 아니라 내일` })).toBe(true);
+    expect(recordBriefTelegramUpdate(store, { ...base, updateId: 'u3', text: `#${first.id} 움직이겠습니다` })).toBe(true);
+    const db = new Database(store.path);
+    try {
+      expect(db.query('SELECT item_id, reaction FROM reactions ORDER BY id').all()).toEqual([
+        { item_id: second.id, reaction: '정정' }, { item_id: first.id, reaction: '답장' },
+      ]);
+    } finally { db.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Telegram poller automatically collects owner button and reply feedback without swallowing normal turns', async () => {
+  const { root, store } = fixture();
+  try {
+    const item = store.add({ text: '응답 요청', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    store.withSendLock('08:30', (page, mark) => { mark(page.ids, '08:30', { botId: '123', chatId: 42, messageId: 77 }); });
+    const updates = [
+      { update_id: 1, callback_query: { id: 'blocked', from: { id: 999 }, message: { message_id: 77, chat: { id: 42 } }, data: `brief-item:${item.id}:button` } },
+      { update_id: 2, callback_query: { id: 'owner', from: { id: 42 }, message: { message_id: 77, chat: { id: 42 } }, data: `brief-item:${item.id}:button` } },
+      { update_id: 3, message: { message_id: 88, from: { id: 42 }, chat: { id: 42, type: 'private' }, text: '그게 아니라 내일', reply_to_message: { message_id: 77 } } },
+      { update_id: 4, callback_query: { id: 'other', from: { id: 42 }, message: { message_id: 77, chat: { id: 42 } }, data: 'other:action' } },
+    ];
+    const seen: string[] = [];
+    const otherCallbacks: string[] = [];
+    const acknowledgements: string[] = [];
+    const allowedUpdates: string[] = [];
+    let polls = 0;
+    let bot: TelegramBot;
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith('/answerCallbackQuery')) acknowledgements.push(String(init?.body));
+      if (String(input).endsWith('/getUpdates')) {
+        allowedUpdates.push(String(init?.body));
+        if (++polls === 1) return Response.json({ ok: true, result: updates });
+        bot.stop();
+        return Response.json({ ok: true, result: [] });
+      }
+      return Response.json({ ok: true, result: { message_id: 99 } });
+    }) as typeof fetch;
+    bot = new TelegramBot({ token: '123:secret', allowedUsers: [42], fetchImpl, nowImpl: () => NOW.getTime(),
+      perChatGapMs: 0, briefLedger: store, onMessage: async ctx => { seen.push(ctx.text); } });
+    bot.onCallbackQuery(query => { otherCallbacks.push(query.data); });
+    await bot.start();
+    const db = new Database(store.path);
+    try {
+      expect(db.query('SELECT item_id, reaction FROM reactions ORDER BY id').all()).toEqual([
+        { item_id: item.id, reaction: '버튼' }, { item_id: item.id, reaction: '정정' },
+      ]);
+      expect(store.weeklyActions()).toMatchObject({ acted: 1, total: 1 });
+      expect(seen).toEqual(['그게 아니라 내일']);
+      expect(otherCallbacks).toEqual(['other:action']);
+      expect(acknowledgements).toHaveLength(2);
+      expect(allowedUpdates[0]).toContain('callback_query');
+    } finally { db.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('one-item Telegram page records read and ignore without inflating the weekly action rate', () => {
+  const { root, store } = fixture();
+  try {
+    const item = store.add({ text: '읽을 항목', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    store.withSendLock('08:30', (page, mark) => { mark(page.ids, '08:30', { botId: 'bot', chatId: 42, messageId: 77 }); });
+    const base = { botId: 'bot', chatId: 42, messageId: 77 };
+    expect(recordBriefTelegramUpdate(store, { ...base, updateId: 'r', callbackData: `brief-item:${item.id}:read` })).toBe(true);
+    expect(recordBriefTelegramUpdate(store, { ...base, updateId: 'i', callbackData: `brief-item:${item.id}:ignore` })).toBe(true);
+    expect(store.weeklyActions()).toMatchObject({ acted: 0, total: 1 });
+    expect(recordBriefTelegramUpdate(store, { ...base, updateId: 'a', text: '그게 아니라 수정' })).toBe(true);
+    expect(store.weeklyActions()).toMatchObject({ acted: 1, total: 1 });
+    const output: string[] = [];
+    const program = new Command();
+    registerBriefCommands(program, { ledger: store, output: line => output.push(line) });
+    program.parse(['brief'], { from: 'user' });
+    expect(output).toEqual(['이번 주 브리핑 중 대표가 움직인 것 1/1']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('one observed low-yield kind keeps its heading and item in the first slice', () => {
+  const { root, store } = fixture();
+  try {
+    const old = store.add({ text: '시장 이전', domain: '시장', priority: 'P1', source: 'test' });
+    store.markSent([old.id], '08:30');
+    store.recordReaction(old.id, '무시');
+    const item = store.add({ text: '시장 현재', domain: '시장', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const page = store.composeWithIds('08:30');
+    expect(page.ids).toEqual([item.id]);
+    expect(page.markdown).toContain('## 시장\n');
+    expect(page.markdown).not.toContain('## 그 밖의 동향');
+    expect(page.markdown).toContain(item.text);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('feedback changes domain priority without changing id order inside the domain', () => {
+  const { root, store } = fixture();
+  try {
+    const history = store.add({ text: '시장 발송', domain: '시장', priority: 'P1', source: 'test' });
+    store.markSent([history.id], '08:30');
+    store.recordReaction(history.id, '버튼');
+    const first = store.add({ text: '시장 첫째', domain: '시장', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const second = store.add({ text: '시장 둘째', domain: '시장', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    store.add({ text: '운영 항목', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const page = store.compose('08:30');
+    expect(page.indexOf('## 시장')).toBeLessThan(page.indexOf('## 운영'));
+    expect(page.indexOf(first.text)).toBeLessThan(page.indexOf(second.text));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('feedback moves acted kinds forward while retaining headings, items and decisions', () => {
+  const { root, store } = fixture();
+  try {
+    const history = [
+      store.add({ text: '운영 이전', domain: '운영', priority: 'P1', source: 'test' }),
+      store.add({ text: '판 이전', domain: '판', priority: 'P1', source: 'test' }),
+      store.add({ text: '시장 이전', domain: '시장', priority: 'P1', source: 'test' }),
+    ];
+    store.markSent(history.map(item => item.id), '08:30');
+    store.recordReaction(history[0]!.id, '무시');
+    store.recordReaction(history[1]!.id, '버튼');
+    store.recordReaction(history[2]!.id, '열람');
+    const first = store.add({ text: '운영 새 항목', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const next = store.add({ text: '판 새 항목', domain: '판', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const last = store.add({ text: '시장 새 항목', domain: '시장', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const decision = store.add({ text: '즉시 결정', domain: '운영', priority: 'P0', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const before = store.list();
+    const page = store.composeWithIds('08:30');
+    expect(page.ids).toEqual([first.id, next.id, last.id, decision.id]);
+    expect(page.markdown.indexOf('## 결정이 필요한 것')).toBeLessThan(page.markdown.indexOf('## 판'));
+    expect(page.markdown.indexOf('## 판')).toBeLessThan(page.markdown.indexOf('## 운영'));
+    expect(page.markdown).toContain('## 운영\n');
+    expect(page.markdown).toContain('## 시장\n');
+    expect(page.markdown).toContain('운영 새 항목');
+    expect(page.markdown).toContain('시장 새 항목');
+    expect(page.markdown).not.toContain('## 그 밖의 동향');
+    expect(store.list()).toEqual(before);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('an unmeasured page retains the default domain order and a read without action never moves a kind ahead', () => {
+  const { root, store } = fixture();
+  try {
+    const oldOperation = store.add({ text: '운영 발송', domain: '운영', priority: 'P1', source: 'test' });
+    const oldMarket = store.add({ text: '시장 발송', domain: '시장', priority: 'P1', source: 'test' });
+    store.add({ text: '운영 새 항목', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    store.add({ text: '시장 새 항목', domain: '시장', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const unmeasured = store.compose('08:30');
+    expect(unmeasured.indexOf('## 운영')).toBeLessThan(unmeasured.indexOf('## 시장'));
+    expect(unmeasured).not.toContain('## 그 밖의 동향');
+    store.markSent([oldOperation.id, oldMarket.id], '08:30');
+    store.recordReaction(oldOperation.id, '무시');
+    store.recordReaction(oldMarket.id, '열람');
+    const readOnly = store.compose('08:30');
+    expect(readOnly).toContain('## 운영\n');
+    expect(readOnly).toContain('## 시장\n');
+    expect(readOnly).not.toContain('## 그 밖의 동향');
+    expect(store.weeklyActions().acted).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('sent kinds with no observed reaction are not called ignored or merged', () => {
+  const { root, store } = fixture();
+  try {
+    const oldOperation = store.add({ text: '운영 발송', domain: '운영', priority: 'P1', source: 'test' });
+    const oldMarket = store.add({ text: '시장 발송', domain: '시장', priority: 'P1', source: 'test' });
+    store.markSent([oldOperation.id, oldMarket.id], '08:30');
+    store.add({ text: '운영 새 항목', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    store.add({ text: '시장 새 항목', domain: '시장', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const page = store.compose('08:30');
+    expect(store.weeklyActions()).toMatchObject({ acted: 0, total: 2 });
+    expect(page).toContain('## 운영\n');
+    expect(page).toContain('## 시장\n');
+    expect(page).not.toContain('## 그 밖의 동향');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('measured high-action kinds lead regardless of fixed domain order; zero-sample kinds keep their own heading', () => {
+  const { root, store } = fixture();
+  try {
+    const oldOperation = store.add({ text: '운영 옛 항목', domain: '운영', priority: 'P1', source: 'test' });
+    const oldMarket = store.add({ text: '시장 옛 항목', domain: '시장', priority: 'P1', source: 'test' });
+    store.markSent([oldOperation.id, oldMarket.id], '08:30');
+    store.recordReaction(oldMarket.id, '답장');
+    store.add({ text: '운영 새 항목', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    store.add({ text: '시장 새 항목', domain: '시장', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    store.add({ text: '판 미측정', domain: '판', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const page = store.compose('08:30');
+    expect(page).toContain('## 시장\n');
+    expect(page).toContain('## 운영\n');
+    expect(page.indexOf('## 시장')).toBeLessThan(page.indexOf('## 운영'));
+    expect(page).toContain('## 판\n');
+    expect(page).not.toContain('## 그 밖의 동향');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('ordering follows distinct per-kind action rate, not raw number of button and reply events', () => {
+  const { root, store } = fixture();
+  try {
+    const operations = [
+      store.add({ text: '운영 기록 1', domain: '운영', priority: 'P1', source: 'test' }),
+      store.add({ text: '운영 기록 2', domain: '운영', priority: 'P1', source: 'test' }),
+    ];
+    const market = store.add({ text: '시장 기록', domain: '시장', priority: 'P1', source: 'test' });
+    store.markSent([...operations.map(item => item.id), market.id], '08:30');
+    store.recordReaction(operations[0]!.id, '버튼');
+    store.recordReaction(operations[0]!.id, '답장');
+    store.recordReaction(market.id, '정정');
+    store.add({ text: '운영 새 항목', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    store.add({ text: '시장 새 항목', domain: '시장', priority: 'P1', source: 'test', createdAt: '2026-10-04T23:00:00Z' });
+    const page = store.compose('08:30');
+    expect(store.weeklyActions().byKind.운영).toEqual({ acted: 1, total: 2, rate: 0.5 });
+    expect(store.weeklyActions().byKind.시장).toEqual({ acted: 1, total: 1, rate: 1 });
+    expect(page.indexOf('## 시장\n')).toBeLessThan(page.indexOf('## 운영\n'));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('feedback ordering follows this KST week and reverts when the measured week expires', () => {
+  const root = mkdtempSync(join(tmpdir(), 'brief-feedback-week-'));
+  let current = new Date('2026-10-05T00:00:00Z');
+  const store = new BriefItemsLedger({ stateDir: root, now: () => current, log: () => {} });
+  try {
+    const history = store.add({ text: '시장 지난주', domain: '시장', priority: 'P1', source: 'test' });
+    store.markSent([history.id], '08:30');
+    store.recordReaction(history.id, '정정');
+    store.add({ text: '운영 다음주', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-11T23:00:00Z' });
+    store.add({ text: '시장 다음주', domain: '시장', priority: 'P1', source: 'test', createdAt: '2026-10-11T23:00:00Z' });
+    current = new Date('2026-10-12T00:00:00Z');
+    const page = store.compose('08:30');
+    expect(store.weeklyActions()).toMatchObject({ acted: 0, total: 0 });
+    expect(page).toContain('## 운영\n');
+    expect(page).toContain('## 시장\n');
+    expect(page.indexOf('## 운영')).toBeLessThan(page.indexOf('## 시장'));
+    expect(page).not.toContain('## 그 밖의 동향');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -15,7 +15,7 @@
  * - 관측: 실행한 수마다 `debug.log('task-agent', 'live-move', {kind, card, ok, detail, live:true})`.
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -25,9 +25,9 @@ import type { DetachedSpawn } from '../cli/tasks-cli.js';
 import { LIVE_MOVE_HISTORY_EVENT, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
 import { LIVE_RETRY_MOVES } from './judge.js';
 import { decisionCardGrounds, decisionRaiseArgs, type DecisionCardEvidence, type NextAction } from './actions.js';
-import { reviewResultPath, TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_RESULT_ENV, TA_REVIEW_COMPLETION_STATE_ENV } from './review-result-capture.js';
+import { pendingReviewResults, reviewResultPath, TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_RESULT_ENV, TA_REVIEW_COMPLETION_STATE_ENV } from './review-result-capture.js';
 import { buildPriorFixContext, PRIOR_FIX_SCOPE_LINE, priorFixBlock, priorFixObservation, type PriorDiffReader, type PriorFixContext } from './review-prior-fix.js';
-import { createLandWorktree, localHead, observeLandWorktree, type LandWorktree, type LandWorktreeFailure, type LandWorktreeInput, type LandWorktreeRemoval } from './land-worktree.js';
+import { createLandWorktree, localBranch, localHead, observeLandWorktree, type LandWorktree, type LandWorktreeFailure, type LandWorktreeInput, type LandWorktreeRemoval } from './land-worktree.js';
 
 export const TASK_AGENT_LIVE_MOVES = ['review', 'propose-green', 'propose-land', 'decision-card', ...LIVE_RETRY_MOVES] as const;
 export type TaskAgentLiveMove = typeof TASK_AGENT_LIVE_MOVES[number];
@@ -89,7 +89,7 @@ export interface LiveMoveDeps {
   raiseDecision?: (args: string[]) => Promise<{ status: number; stdout: string; stderr?: string }>;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
   /** TA-LAND-WORKTREE — cwd HEAD 읽기 · PR 머리 임시 워크트리 만들기(시험 주입 · 기본 = git). */
-  landWorktree?: { localHead?: (cwd: string) => string | null; create?: (input: LandWorktreeInput) => Promise<LandWorktree | LandWorktreeFailure> };
+  landWorktree?: { localHead?: (cwd: string) => string | null; localBranch?: (cwd: string) => string | null; create?: (input: LandWorktreeInput) => Promise<LandWorktree | LandWorktreeFailure> };
 }
 
 /** `executed` = 부작용을 실제로 냈다(리뷰를 띄웠다 · 제안을 적었다). ok 이지만 이미 한 수(같은 머리·이미 제안)면 false. */
@@ -317,7 +317,7 @@ function observe(deps: LiveMoveDeps, result: LiveMoveResult): LiveMoveResult {
 /** `review` — PR 머리마다 한 번. 카드에 먼저 적고(잠금 안) 그다음 띄운다 · 띄우기 실패는 카드에 오류로 남기고 같은 머리는 다시 안 띄운다. */
 export async function executeLiveReview(
   card: TaskCard | undefined, pr: number | undefined,
-  ctx: { runId: string | null; stopReason: string; cwd?: string; produced?: { headCommit?: string; branch?: string; prUrl?: string } },
+  ctx: { runId: string | null; stopReason: string; cwd?: string; forceNewReview?: boolean; produced?: { headCommit?: string; branch?: string; prUrl?: string } },
   deps: LiveMoveDeps = {},
 ): Promise<LiveMoveResult> {
   const kind = 'review' as const;
@@ -345,12 +345,16 @@ export async function executeLiveReview(
   const path = deps.statePath ?? taskAgentStatePath();
   const at = (deps.now ?? (() => new Date()))().toISOString();
   // TA-REVIEW-RESULT-CAPTURE — 머리마다 한 번이라 경로도 머리마다 하나다. 요청 칸에 먼저 적는다(회수가 이 칸을 본다).
-  const resultPath = reviewResultPath(path, card.id, pr, head.head);
+  const resultPath = ctx.forceNewReview
+    ? reviewResultPath(path, card.id, pr, head.head).replace(/\.json$/, `-${randomUUID()}.json`)
+    : reviewResultPath(path, card.id, pr, head.head);
   const claim: { claimed: boolean; missing: boolean; before?: TaskCard } = { claimed: false, missing: false };
   updateTaskCard(path, card.id, (current) => {
     if (!current) { claim.missing = true; return undefined; }
     // 머리 «이력»으로 본다 — A→B→A 로 돌아와도 A 는 다시 요청하지 않는다.
-    if ((current.reviewRequests ?? []).some((entry) => entry.pr === pr && entry.head === head!.head)) return undefined;
+    if (ctx.forceNewReview) {
+      if (pendingReviewResults(current).some((entry) => entry.pr === pr && entry.head === head!.head)) return undefined;
+    } else if ((current.reviewRequests ?? []).some((entry) => entry.pr === pr && entry.head === head!.head)) return undefined;
     claim.claimed = true;
     claim.before = current;
     return { ...current, reviewRequests: [...(current.reviewRequests ?? []), { pr, head: head!.head, at, resultPath }] };
@@ -416,6 +420,12 @@ const LAND_BASE_STALE_LINE = /^✗ overlap-evidence: (base-stale-overlap: .*)$/;
 const LAND_BASE_STALE_CONSEQUENCE_LINES: readonly RegExp[] = [/^✗ expected-head: overlap merge approval unavailable for the reviewed head$/];
 /** 실패가 아닌 ✗ 줄 — `pr land` 가 «계속합니다»로 넘어간다(판정에 쓰지 않는다). */
 const LAND_NON_FATAL_LINES: readonly RegExp[] = [/^✗ active-run-files: .*계속합니다\.?$/];
+const TSC_RUNTIME_MISSING = /(?:^|\n)(?:sh: )?(?:env: )?(?:[^\s]*\/)?(?:node|bun|tsc): (?:No such file or directory|command not found)/m;
+const TSC_NOT_RUN = /(?:tsc 종료코드 127|tsc 실행 실패 \([^\n]*code=ENOENT)/;
+const TSC_GATE_REFUSED = '✗ typecheck: scripts/ci-typecheck-changed.ts blocked pr land.';
+function missingTscRuntime(text: string): boolean {
+  return TSC_NOT_RUN.test(text) && TSC_RUNTIME_MISSING.test(text);
+}
 /** executeLiveLand 쪽 인프라 사유(출력 줄이 아니라 실행 사실). */
 export const LAND_INFRA_EXECUTOR_REASONS = ['land-process-error', 'land-no-result-line'] as const;
 const [LAND_PROCESS_ERROR, LAND_NO_RESULT_LINE] = LAND_INFRA_EXECUTOR_REASONS;
@@ -435,6 +445,12 @@ export function classifyLandFailure(outcome: { status: number; stdout?: string; 
   // 결과 줄이 «하나도» 없이 0 아닌 코드로 끝났다 — 관문까지 못 간 채 죽었다(크래시 · 신호).
   if (!marked.length) return outcome.status !== 0 ? { class: 'infra', reason: LAND_NO_RESULT_LINE } : { class: 'judgement', reason: 'no-failure-line' };
   const failures = marked.map((line) => line.replace(/^\[dry-run\] /, '')).filter((line) => line.startsWith('✗') && !LAND_NON_FATAL_LINES.some((re) => re.test(line)));
+  // The gate did not measure TypeScript when its interpreter was absent. The
+  // exact typecheck refusal alone remains judgement; require rc127/ENOENT and
+  // the missing runtime line, with no second failing gate.
+  if (failures.length === 1 && failures[0] === TSC_GATE_REFUSED && missingTscRuntime(lines.join('\n'))) {
+    return { class: 'infra', reason: 'tsc-runtime-missing' };
+  }
   const infra = new Set<string>();
   const unlisted: string[] = [];
   for (const line of failures) {
@@ -497,7 +513,15 @@ function observeLandWorktreeCreateCapped(deps: LiveMoveDeps, data: { card: strin
 
 /** 같은 머리에 한 번 더 시도해도 되나 — 앞 시도가 «전부» 끝났고(ok:false) «전부» infra 이고 상한 밑일 때만. */
 function landRetryAllowed(prior: readonly LandAttempt[]): boolean {
-  return prior.length > 0 && prior.length < LAND_ATTEMPTS_PER_HEAD_ON_INFRA && prior.every((entry) => entry.ok === false && entry.class === 'infra');
+  return prior.length > 0 && prior.length < LAND_ATTEMPTS_PER_HEAD_ON_INFRA
+    && prior.every((entry) => entry.ok === false && (entry.class === 'infra' || legacyMissingTscRuntime(entry)));
+}
+
+/** A previous release classified a missing node interpreter as judgement; only that exact recorded shape may be reopened. */
+function legacyMissingTscRuntime(entry: LandAttempt): boolean {
+  return entry.ok === false && entry.class === 'judgement' && entry.reason === TSC_GATE_REFUSED
+    && typeof entry.detail === 'string'
+    && classifyLandFailure({ status: 1, stderr: entry.detail }).reason === 'tsc-runtime-missing';
 }
 
 /**
@@ -566,7 +590,8 @@ export async function executeLiveLand(
   const at = (deps.now ?? (() => new Date()))().toISOString();
   const local = (deps.landWorktree?.localHead ?? localHead)(cwd);
   const landKey = `land:${card.id}:${view.head.slice(0, 12)}`;
-  const needsLandWorktree = !!local && local.toLowerCase() !== view.head.toLowerCase();
+  const branch = local?.toLowerCase() === view.head.toLowerCase() ? (deps.landWorktree?.localBranch ?? localBranch)(cwd) : null;
+  const needsLandWorktree = !!local && (local.toLowerCase() !== view.head.toLowerCase() || branch !== view.branch);
   const createCap = landWorktreeCreateCap();
   let claimed = false;
   let missing = false;
@@ -603,7 +628,8 @@ export async function executeLiveLand(
   const attempt = prior.length + 1;
   if (attempt > 1) {
     const last = prior.at(-1)!;
-    try { (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', LAND_RETRY_ON_INFRA_EVENT, { card: card.id, pr, head: view.head, attempt, reason: last.reason ?? 'unknown', class: 'infra', decision: 'retrying' }); } catch { /* fail-soft */ }
+    const legacy = legacyMissingTscRuntime(last);
+    try { (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', LAND_RETRY_ON_INFRA_EVENT, { card: card.id, pr, head: view.head, attempt, reason: legacy ? 'tsc-runtime-missing-legacy' : last.reason ?? 'unknown', class: 'infra', decision: legacy ? 'legacy-reclassified-retrying' : 'retrying' }); } catch { /* fail-soft */ }
   }
   if (cycle) landedCycles.add(cycle);
   // TA-LAND-WORKTREE — `pr land --expected-head` 는 «로컬 HEAD = 고정 머리»를 요구한다. cwd 가 다른 머리면(Pod 런 PR · 호스트 checkout)
@@ -618,6 +644,11 @@ export async function executeLiveLand(
     if ('reason' in made) {
       const reason = made.reason;
       observeLandWorktree({ card: card.id, pr, head: view.head, created: made.created, removed: made.removed, reason }, deps.log);
+      if (made.kind === 'worktree-conflict') {
+        try { (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', 'worktree-conflict', {
+          card: card.id, pr, head: view.head, branch: view.branch ?? null, ownerPath: made.ownerPath ?? 'unknown', reason,
+        }); } catch { /* fail-soft */ }
+      }
       let failures: LandWorktreeCreateFailure[] = [];
       let recordFailureError: unknown;
       try {
@@ -655,7 +686,7 @@ export async function executeLiveLand(
     } catch (error) {
       try { (deps.log ?? ((c, e, d) => debug.log(c, e, d, { level: 'warn' })))('task-agent', 'land-worktree-create-failures-clear-failed', { card: card.id, pr, head: view.head, error: String(error).slice(-200) }); } catch { /* fail-soft */ }
     }
-    observeLandWorktree({ card: card.id, pr, head: view.head, created: true, removed: false, reason: `cwd HEAD ${local.slice(0, 12)} ≠ PR head ${view.head.slice(0, 12)}` }, deps.log);
+    observeLandWorktree({ card: card.id, pr, head: view.head, created: made.created ?? null, removed: false, reason: `cwd HEAD ${local.slice(0, 12)} · branch ${branch ?? 'unknown'} differs from PR ${view.head.slice(0, 12)} · ${view.branch ?? 'unknown'}` }, deps.log);
   }
   // 증거 경로는 «원래» cwd 기준으로 고정한다 — 임시 트리로 cwd 를 바꿔도 상대경로가 다른 파일을 가리키지 않게(같은 cwd 면 그대로).
   const overlapEvidence = ctx.overlapEvidence && worktree ? resolve(cwd, ctx.overlapEvidence) : ctx.overlapEvidence;
@@ -681,7 +712,7 @@ export async function executeLiveLand(
     // 성공이든 실패든 걷는다.
     let removal: LandWorktreeRemoval;
     try { removal = worktree.cleanup(); } catch (error) { removal = { removed: false, reason: String(error).slice(-200) }; }
-    observeLandWorktree({ card: card.id, pr, head: view.head, created: true, removed: removal.removed, ...(removal.branchRemoved !== undefined ? { branchRemoved: removal.branchRemoved } : {}),
+    observeLandWorktree({ card: card.id, pr, head: view.head, created: worktree.created ?? null, removed: removal.removed, ...(removal.branchRemoved !== undefined ? { branchRemoved: removal.branchRemoved } : {}),
       reason: removal.reason ?? `land ${ok ? 'ok' : 'failed'} — removed` }, deps.log);
   }
   const landAttempt: LiveMoveResult['landAttempt'] = failure

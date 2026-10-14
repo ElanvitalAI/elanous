@@ -2,7 +2,8 @@ import type { PtyHandle } from '../pty-shell/registry.js';
 import { classifierFrameLines } from '../capture/frame-state-detect.js';
 import { emitDecision, type DecisionEvent } from '../live/detail-switch.js';
 import { debug } from '../debug/log.js';
-import { streamLLM, type LLMMessage } from '../llm.js';
+import * as llm from '../llm.js';
+import { resolveRoleLlm } from '../user-config.js';
 
 export interface PluginRequest { agent: 'codex' | 'claude'; plugin: string; marketplace: string }
 export type PluginResult = { outcome: 'installed' } | { outcome: 'escalate'; reason: 'plugins-disabled' | 'unknown-menu' | 'timeout' | 'wrong-target' | 'credentials' };
@@ -103,11 +104,15 @@ export async function installPluginInsideAgent(request: PluginRequest, pty: Pick
       ? ['[credential screen]']
       : lines(screen).slice(-10).map(line => line.slice(0, 160));
   const brain = deps.brain ?? (async (screen: string, target: string) => {
-    const messages: LLMMessage[] = [
+    const messages: llm.LLMMessage[] = [
       { role: 'system', content: 'You navigate a plugin menu using only up/down/tab/enter/wait/unknown. Return exactly one of those words. Do not choose enter unless the requested plugin@marketplace is visibly selected. Never enter credentials.' },
       { role: 'user', content: `Target: ${target}\nScreen:\n${screen.slice(-3500)}` },
     ];
-    const answer = (await streamLLM(messages, () => {}, { maxTokens: 20 })).trim().toLowerCase();
+    const resolved = resolveRoleLlm('classify');
+    const provider = llm.PROVIDERS[resolved.provider];
+    if (!provider) throw new Error(`Unknown classify provider: ${resolved.provider}`);
+    debug.log('llm.role-pin', 'resolved', { site: 'in-agent-plugin', role: 'classify', model: resolved.model, provider: resolved.provider, source: resolved.source });
+    const answer = (await llm.streamLLM(messages, () => {}, { model: resolved.model, provider, usageRole: 'classify', maxTokens: 20 })).trim().toLowerCase();
     return /^(up|down|tab|enter|wait)$/.test(answer) ? answer as 'up' | 'down' | 'tab' | 'enter' | 'wait' : 'unknown';
   });
   const target = `${request.plugin}@${request.marketplace}`;

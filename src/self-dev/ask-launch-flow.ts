@@ -11,6 +11,8 @@
 // ⛔ 종료(`process.exit`)는 여기가 «안» 한다 — 호출자가 자기 표면에 맞게 끝낸다.
 //   그래서 결과를 «세 값»으로 낸다: 발사 / 저작 전 중단 / 전제 검사 중단.
 import { linesOutsideFencedCode } from '../self-implement/goal-author.js';
+import { existsSync } from 'node:fs';
+import { debug } from '../debug/log.js';
 import { recordAuthoredGoal } from './authored-goal-trace.js';
 import { findAskPathCandidates, type AskPathCandidateOptions } from './ask-path-candidates.js';
 import { retiredEntranceNotice, type EntranceDeclaration } from './entrance-registry.js';
@@ -18,6 +20,7 @@ import {
   classifyConcurrentAuthoring,
   countRepeatedBlocks,
   decideAskPreflight,
+  discardNonFileTracedPathItems,
   parseAskTargetPathHintsResult,
   parseBlockedChoice,
   planBlockedPrompt,
@@ -797,10 +800,10 @@ async function intakeClarifications(
     selfResolveClarifications: selfResolveClarifications.value,
   });
   const parentDocument = document;
-  effectiveGoalFile = reauthored.path;
+  effectiveGoalFile = isAbsolutePath(reauthored.path) ? reauthored.path : resolvePath(deps.cwd(), reauthored.path);
   deps.print(`[ask] ⑴b 재저작됨: ${reauthored.path}`);
   // ⛔ 「재저작이 «났다»」와 「재저작이 «옳았다»」는 다른 물음이다(JDG-T35 3단 ⑶).
-  const childDocument = reauthored.authored?.document ?? deps.readFile(reauthored.path);
+  const childDocument = reauthored.authored?.document ?? deps.readFile(effectiveGoalFile);
   const askFidelity = classifyReauthoredAsk(parentDocument, childDocument);
   if (askFidelity !== 'preserved') {
     deps.print(`[ask] ⑴b ⚠️ 재저작 ask 판정: ${askFidelity} — ⛔ 「preserved」가 아니면 사람의 ask 가 살아남았는지 «확인하라»`);
@@ -939,7 +942,31 @@ export async function runAskLaunchFlow(
     }, markerCounts !== null && markerCounts.missingMarkers > 0 ? 'warn' : 'info');
 
     // ⛔ 되묻기에 답하면 «새 골»이 나온다 — 아래 전제 검사·발사는 그 «최종» 골을 써야 한다.
-    const goalFile = await intakeClarifications(authored, input, deps, selfResolveClarifications);
+    const goalFile = await intakeClarifications({
+      ...authored,
+      path: isAbsolutePath(authored.path) ? authored.path : resolvePath(deps.cwd(), authored.path),
+    }, input, deps, selfResolveClarifications);
+    // The child reads this file again. Filtering only preflight.paths would leave the same bogus
+    // TRACED PATHS prose in the child and repeat its missing-file failure.
+    let sanitizeFailed = false;
+    let sanitizeFailure: unknown;
+    if (existsSync(goalFile)) {
+      try {
+        const original = deps.readFile(goalFile);
+        const sanitized = discardNonFileTracedPathItems(original, deps.cwd());
+        if (sanitized.dropped.length > 0) {
+          // The child reads this same file, so a failed rewrite must stop launch.
+          (deps.writeGoalDocument ?? deps.writeFile)(goalFile, sanitized.document);
+          for (const dropped of sanitized.dropped) {
+            try { debug.log('harness.preflight', 'traced-path-discarded', { goalFile, dropped }); }
+            catch { /* observation must not change launch */ }
+          }
+        }
+      } catch (error) {
+        sanitizeFailed = true;
+        sanitizeFailure = error;
+      }
+    }
     const preflightDeps = await deps.buildPreflightDeps();
     observeLaunchingTree(deps, preflightDeps);
     const askOutsidePathHints = parseAskTargetPathHintsResult(input.askText).paths;
@@ -954,11 +981,11 @@ export async function runAskLaunchFlow(
         ...(machineSuggestedTargetPaths.length > 0 ? { machineSuggestedTargetPaths } : {}),
         declaredPathsRoot: deps.cwd(),
       },
-      preflightDeps,
+      sanitizeFailed ? { ...preflightDeps, readGoalDocument: () => { throw sanitizeFailure; } } : preflightDeps,
       input.forceRequested,
     );
     const preflight = decision.result;
-    deps.print(renderLaunchPreflight(preflight, input.forceRequested && preflight.blockers.length > 0, 'before-launch'));
+    deps.print(renderLaunchPreflight(preflight, input.forceRequested && decision.shouldLaunch && preflight.blockers.length > 0, 'before-launch'));
     observeLaunchPreflight(deps, 'before-launch', decision);
     // ⛔ 자식 격리 worktree를 만들기 전, 이 흐름을 호출한 작업 트리에서만 센다.
     //    이 관측은 발사 판정의 입력이 아니다 — 의도적으로 옛 판에서 쏘는 경우도 있다.
@@ -1001,7 +1028,7 @@ export async function runAskLaunchFlow(
       liveRunWindowMs: preflight.liveRunWindowMs,
       // ⛔ 「플래그를 줬다」와 「실제로 뚫었다」는 다른 값이다(리뷰 should-fix).
       forceRequested: input.forceRequested,
-      bypassed: input.forceRequested && preflight.blockers.length > 0,
+      bypassed: input.forceRequested && decision.shouldLaunch && preflight.blockers.length > 0,
     }, preflight.blockers.length > 0 ? 'warn' : 'info');
     return { goalFile, decision };
   };
@@ -1023,14 +1050,27 @@ export async function runAskLaunchFlow(
       } catch (error) {
         candidates = { tokens: [], paths: [], error: error instanceof Error ? error.message : String(error) };
       }
+      const selectedPath = candidates.selection?.path
+        ?? (!candidates.selection && candidates.paths.length === 1 ? candidates.paths[0] : undefined);
+      const selectionReason = candidates.selection?.reason
+        ?? (candidates.error ? 'search-error' : selectedPath ? 'only-candidate'
+          : candidates.paths.length > 0 ? 'ambiguous-without-evidence' : 'no-candidates');
       deps.log('ask-auto-target-candidates', {
         tokens: candidates.tokens, paths: candidates.paths,
+        evidence: candidates.evidence ?? [],
+        selection: { path: selectedPath ?? null, reason: selectionReason },
         ...(candidates.error === undefined ? {} : { error: candidates.error }),
-      }, candidates.error === undefined ? 'info' : 'warn');
+      }, candidates.error === undefined && selectedPath ? 'info' : 'warn');
     }
-    const selectedPaths = candidates.paths.slice(0, 1);
+    const selectedPaths = candidates.selection?.path
+      ? [candidates.selection.path]
+      : !candidates.selection && candidates.paths.length === 1 ? [candidates.paths[0]!] : [];
     if (selectedPaths.length > 0) {
       deps.print(`[ask] ⑴ 코드에서 후보 경로 ${selectedPaths.length}개를 찾아 넣고 다시 저작한다: ${selectedPaths.join(' · ')}`);
+    } else if (candidates.paths.length > 0) {
+      deps.print(`[ask] ⑴ ⚠️ 후보 경로를 하나로 판정할 근거가 없다. 대상 경로를 확인해야 한다: ${candidates.paths.join(' · ')}`);
+    } else {
+      deps.print('[ask] ⑴ ⚠️ 자동 재저작에 넣을 대상 경로 후보가 없다. 대상 경로를 확인해야 한다');
     }
     authored = await authorAndPreflight(selectedPaths.length > 0
       ? `대상 경로: ${selectedPaths.join(' · ')}\n${input.askText}`

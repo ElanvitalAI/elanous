@@ -31,6 +31,43 @@ function repoFixture() {
 }
 
 describe('TA-LAND-WORKTREE — PR 머리 임시 워크트리(실물 git)', () => {
+  test('PR branch already checked out at the reviewed head in another clean worktree → borrow without removing it', async () => {
+    const f = repoFixture();
+    const owner = join(f.root, 'owner');
+    git(f.host, 'branch', 'feature/pod', f.head);
+    git(f.host, 'worktree', 'add', '-q', owner, 'feature/pod');
+    const made = await createLandWorktree({ card: 'ta-c', pr: 7, head: f.head, branch: 'feature/pod', repoCwd: f.host, statePath: f.statePath }, { provideDeps: () => { throw new Error('must not install into owner'); } });
+    if ('reason' in made) throw new Error(made.reason);
+    expect(realpathSync(made.cwd)).toBe(realpathSync(owner));
+    expect(made.created).toBe(false);
+    expect(made.cleanup()).toMatchObject({ removed: false, reason: expect.stringContaining('left untouched') });
+    expect(existsSync(owner)).toBe(true);
+    expect(git(owner, 'branch', '--show-current')).toBe('feature/pod');
+    expect(existsSync(landWorktreePath(f.statePath, 'ta-c', 7, f.head))).toBe(false);
+  });
+
+  test('occupied PR branch with dirty worktree → worktree-conflict names owner; owner stays untouched', async () => {
+    const f = repoFixture();
+    const owner = join(f.root, 'owner');
+    git(f.host, 'branch', 'feature/pod', f.head);
+    git(f.host, 'worktree', 'add', '-q', owner, 'feature/pod');
+    writeFileSync(join(owner, 'a.txt'), 'dirty\n');
+    const made = await createLandWorktree({ card: 'ta-c', pr: 7, head: f.head, branch: 'feature/pod', repoCwd: f.host, statePath: f.statePath }, { provideDeps: () => {} });
+    expect(made).toMatchObject({ kind: 'worktree-conflict', ownerPath: realpathSync(owner), reason: expect.stringContaining('dirty'), created: false });
+    expect(git(owner, 'status', '--porcelain')).toContain('a.txt');
+  });
+
+  test('occupied PR branch on a different SHA → worktree-conflict names owner; no branch rewrite', async () => {
+    const f = repoFixture();
+    const owner = join(f.root, 'owner');
+    git(f.host, 'branch', 'feature/pod');
+    const other = git(f.host, 'rev-parse', 'feature/pod');
+    git(f.host, 'worktree', 'add', '-q', owner, 'feature/pod');
+    const made = await createLandWorktree({ card: 'ta-c', pr: 7, head: f.head, branch: 'feature/pod', repoCwd: f.host, statePath: f.statePath }, { provideDeps: () => {} });
+    expect(made).toMatchObject({ kind: 'worktree-conflict', ownerPath: realpathSync(owner), reason: expect.stringContaining('HEAD'), created: false });
+    expect(git(owner, 'rev-parse', 'HEAD')).toBe(other);
+  });
+
   test('host checkout on another head → worktree on the PR head with the PR branch checked out, clean · cleanup removes it and the branch', async () => {
     const f = repoFixture();
     expect(localHead(f.host)).not.toBe(f.head);

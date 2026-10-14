@@ -159,7 +159,7 @@ export function remoteLaunchScript(target: ParentHostConfig, args: readonly stri
   const elanous = target.elanous ?? DEFAULT_REMOTE_ELANOUS;
   const configDir = target.configDir ?? DEFAULT_REMOTE_CONFIG_DIR;
   const log = remoteParentLogPath(target, env.ELANOUS_RUN_ID ?? 'unknown');
-  const envPart = Object.entries(env).filter(([key]) => /^[A-Z_][A-Z0-9_]*$/.test(key)).map(([key, value]) => `${key}=${shellQuote(value)}`).join(' ');
+  const envPart = [...Object.entries(env).filter(([key]) => key !== 'ELANOUS_STATE_DIR' && /^[A-Z_][A-Z0-9_]*$/.test(key)).map(([key, value]) => `${key}=${shellQuote(value)}`), `ELANOUS_STATE_DIR=${remotePath(configDir)}`].join(' ');
   const argv = [remotePath(elanous), '--config-dir', remotePath(configDir), ...remoteParentArgs(args, target.podPool).map(shellQuote)].join(' ');
   // 준비가 실패하면 «확실히 안 띄웠다»(not-launched=…)를 찍고 끝낸다 — 그때만 호출부가 로컬로 돌아간다.
   // 띄운 뒤에는 짧게 살아 있는지 보고 pid 를 찍는다(조기 종료면 early-exit — 역시 «안 돈다»가 확실).

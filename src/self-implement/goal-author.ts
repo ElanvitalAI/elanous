@@ -1701,7 +1701,8 @@ export function lintGoalFile(document: string, branch: string, deps: GoalFileLin
   }
   if (deps.readReferencedFile) {
     // AUTHOR-NEW-FILE-PATHS — 문서가 «새로 만들 파일»로 선언한 경로. 실행 쪽 범위 검사와 같은 줄을 읽는다.
-    const declaredNew = new Set(declaredNewFilePaths(document));
+    // 저작과 실행은 같은 Original ask 범위만 선언으로 인정한다. 문서의 다른 절은 근거일 뿐이다.
+    const declaredNew = new Set(declaredNewFilePaths(extractVerbatimOriginalAsk(document)?.ask ?? ''));
     for (const reference of tracedPathReferences(document)) {
       const result = deps.readReferencedFile(reference.path);
       const normalized = typeof result === 'string' ? { kind: 'ok' as const, contents: result }

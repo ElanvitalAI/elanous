@@ -52,6 +52,7 @@ test('publish accepts real auto-approve output with warning-only rows but reject
     for (let n = 0; n < 5; n++) writeFileSync(join(out, 'dist', `file-${n}`), 'fixture');
     const commit = 'a'.repeat(40);
     const context: GraphContext = {
+      nodeId: 'publish',
       input: { version, previousVersion: '0.2.3' },
       outputs: {
         gate: { outcome: 'ok', introduced: [] },
@@ -101,6 +102,23 @@ test('publish accepts real auto-approve output with warning-only rows but reject
   }
 });
 
+test('publish refuses a graph context for any other node before invoking a command', () => {
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  let calls = 0;
+  const run = () => { calls++; throw new Error('publish command must not run'); };
+  try {
+    for (const nodeId of ['npm-publish', 'docs-land', 'failed', undefined]) {
+      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId,
+        input: { version: '0.2.27', previousVersion: '0.2.26' }, outputs: {} });
+      expect(() => runPublish(run)).toThrow(`publish node context mismatch: expected publish, got ${nodeId ?? 'missing'}`);
+    }
+    expect(calls).toBe(0);
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
+
 test('publish rechecks freeze immediately before irreversible publication; only force-freeze bypasses', async () => {
   const root = mkdtempSync(join(tmpdir(), 'publish-freeze-'));
   const previous = { state: process.env.ELANOUS_STATE_DIR, graph: process.env.ELANOUS_GRAPH_CONTEXT };
@@ -114,13 +132,13 @@ test('publish rechecks freeze immediately before irreversible publication; only 
   try {
     process.env.ELANOUS_STATE_DIR = root;
     enableLandingFreeze({ reason: 'drill', by: 'MK' }, root);
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
     expect(runPublish(run, root)).toMatchObject({ outcome: 'fail', summary: expect.stringContaining('동결 중 · drill') });
     expect(publishCalls).toBe(0);
     // A frozen publication leaves no in-flight marker behind (so `freeze on` does not wait on it).
     const { inFlightLandingMerges } = await import('../../src/release-loop/landing-freeze.js');
     expect(inFlightLandingMerges(root)).toBe(0);
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3', forceFreeze: true }, outputs });
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3', forceFreeze: true }, outputs });
     expect(runPublish(run, root)).toMatchObject({ outcome: 'ok' });
     expect(publishCalls).toBe(1);
   } finally {
@@ -153,7 +171,7 @@ test('publish-at waits after measured auto-approval and prerequisites; omission 
   };
   const clock = { now: () => now, sleep: (ms: number) => { sleeps.push(ms); now += ms; } };
   const publish = (publishAt?: string, authorized = true) => {
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version, previousVersion: '0.2.3', ...(publishAt ? { publishAt } : {}) },
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version, previousVersion: '0.2.3', ...(publishAt ? { publishAt } : {}) },
       outputs: authorized ? outputs : { ...outputs, 'auto-approve': { outcome: 'fail' } } });
     calls.length = 0;
     sleeps.length = 0;

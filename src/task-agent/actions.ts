@@ -166,6 +166,7 @@ export async function executeNextAction(action: NextAction, deps: ActionDeps): P
     catch { return card('PR labels unavailable'); }
     if (!Array.isArray(labels) || !labels.every(label => label && typeof label === 'object' && typeof label.name === 'string')) return card('PR labels unavailable');
     if (labels.some(label => label.name === 'elanous:release-path')) return card('release-path');
+    if (labels.some(label => label.name === 'elanous:keep')) return card('elanous:keep');
     const day = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Seoul' });
     if (deps.landingDay && deps.landingDay !== day) deps.landingsToday = 0;
     deps.landingDay = day;

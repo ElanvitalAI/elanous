@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { Command } from 'commander';
 import { registerUsageCommand } from './usage-cli.js';
-import { outcomeTableHasCodexGrokUnknown, type UsageOutcomesReport } from '../budget/usage-outcomes.js';
+import { formatAutoLandRatio, measureAutoLandRatio, outcomeTableHasCodexGrokUnknown, queryUsageOutcomes, type UsageOutcomesReport } from '../budget/usage-outcomes.js';
 import type { collectUnifiedUsage } from '../budget/unified-usage.js';
 import { LogStore, type LogStoreRow } from '../mss/logging/log-store.js';
 import type { LogRecord } from '../mss/logging/record.js';
@@ -92,6 +92,20 @@ describe('usage runs', () => {
       { account: 'acct-e', calls: 1 },
       { account: 'acct-f', calls: 1 },
     ]);
+  });
+
+  it('usage runs --by model ranks subscription rows by apiEquivalentUsd (shadow cost)', async () => {
+    const read = () => [
+      row({ runId: 'r-api', model: 'api-model', billingProvider: 'gateway', billing: 'api', cost: { kind: 'known', usd: 0.5 } }),
+      row({ runId: 'r-api', model: 'api-model', billingProvider: 'gateway', billing: 'api', cost: { kind: 'known', usd: 0.5 } }),
+      row({ runId: 'r-api', model: 'api-model', billingProvider: 'gateway', billing: 'api', cost: { kind: 'known', usd: 0.5 } }),
+      row({ runId: 'r-codex', model: 'gpt-6-sol', billingProvider: 'codex', billing: 'subscription', cost: { kind: 'included', usd: 0, apiEquivalentUsd: 5 } }),
+    ];
+    const byModel = JSON.parse((await run(['runs', '--by', 'model', '--json'], read))[0]!);
+    expect(byModel).toHaveLength(2);
+    expect(byModel[0]).toMatchObject({ model: 'gpt-6-sol', calls: 1, usdKnown: 0, apiEquivalentUsd: 5, rankUsd: 5 });
+    expect(byModel[1]).toMatchObject({ model: 'api-model', calls: 3, usdKnown: 1.5, apiEquivalentUsd: 0, rankUsd: 1.5 });
+    expect((await run(['runs', '--by', 'model'], read))[0]).toContain('rankUsd=5');
   });
 
   it('rejects invalid --by values before reading logs', async () => {
@@ -200,6 +214,60 @@ describe('usage outcomes', () => {
     expect(table).toContain('grok');
     expect(table).toContain('불명');
     expect(table).toContain('no-progress=1');
+  });
+});
+
+describe('measureAutoLandRatio — 원장 집계와 손 착지 수의 순수 결합', () => {
+  const report = (unreadableLedgers = 0): UsageOutcomesReport => ({
+    sinceDays: 2, sinceMs: 0, unreadableLedgers,
+    rows: [
+      { provider: 'codex', runs: 3, landed: 2, draft: 0, failed: 1, open: 0, unattendedLandRate: 2 / 3, rounds: 1, blockReasons: { timeout: 1, stalled: 2 } },
+      { provider: 'grok', runs: 1, landed: 0, draft: 0, failed: 1, open: 0, unattendedLandRate: 0, rounds: 1, blockReasons: { timeout: 2 } },
+    ],
+  });
+
+  it('자율 2 · 손 1은 2/3이고 제공자 둘의 멈춤 사유를 합쳐 많은 순으로 낸다', () => {
+    const measured = measureAutoLandRatio(report(), 1);
+    expect(measured).toMatchObject({ selfLanded: 2, handMerges: 1, totalMerges: 3, autoLandRatio: 2 / 3 });
+    expect(Object.entries(measured.blockReasons)).toEqual([['timeout', 3], ['stalled', 2]]);
+    expect(formatAutoLandRatio(measured)).toBe('자율 착지 2 / 전체 3 (66.7%) · 손 착지 1 · 멈춤 사유 timeout=3,stalled=2');
+  });
+
+  it('손 착지 수가 없으면 비율과 전체를 못 잰 값으로 낸다', () => {
+    const measured = measureAutoLandRatio(report(), null);
+    expect(measured.autoLandRatio).toBeNull();
+    expect(measured.totalMerges).toBeNull();
+    expect(formatAutoLandRatio(measured)).toContain('전체 - (-) · 손 착지 -');
+  });
+
+  it('읽지 못한 런 원장이 있으면 손 수가 있어도 비율을 못 잰다', () => {
+    const measured = measureAutoLandRatio(report(1), 1);
+    expect(measured.autoLandRatio).toBeNull();
+    expect(measured.totalMerges).toBeNull();
+  });
+
+  it('분모가 0이면 0%라고 지어내지 않는다', () => {
+    const measured = measureAutoLandRatio({ ...report(), rows: [] }, 0);
+    expect(measured.autoLandRatio).toBeNull();
+    expect(formatAutoLandRatio(measured)).toContain('전체 - (-)');
+  });
+
+  it('원장 디렉터리가 없어서 빈 보고서가 나오면 손 착지 1건도 0%로 지어내지 않는다', () => {
+    const missing = queryUsageOutcomes(2, {
+      dir: '/missing-run-ledgers',
+      list: () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); },
+    });
+    expect(missing.rows).toHaveLength(0);
+    const measured = measureAutoLandRatio(missing, 1);
+    expect(measured.autoLandRatio).toBeNull();
+    expect(formatAutoLandRatio(measured)).toContain('전체 - (-) · 손 착지 1');
+  });
+
+  it('전체 착지 수가 안전 정수를 넘으면 부정확한 비율을 내지 않는다', () => {
+    const huge = { ...report(), rows: [{ ...report().rows[0]!, landed: Number.MAX_SAFE_INTEGER }] };
+    const measured = measureAutoLandRatio(huge, 1);
+    expect(measured.totalMerges).toBeNull();
+    expect(measured.autoLandRatio).toBeNull();
   });
 });
 

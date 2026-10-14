@@ -305,6 +305,7 @@ function registerHarnessAskSayOptions(command: Command): Command {
     .addOption(new Option('--pod-memory <tier>', 'pod: 메모리 등급 — lite(2Gi · 문서·조사·네트워크 스킬 골 · OOM 이면 high 로 한 번 재시도) | standard(16Gi) | high(32Gi) · 없으면 골 문면 `Pod 메모리: <등급>` 한 줄 · 그것도 없으면 골이 apps/pwa/ 를 담을 때 high').choices(['lite', 'standard', 'high']))
     .option('--after <goal-or-pr>', 'pod: 선행 — 이 골 ID(16자) 또는 PR(#N) 이 병합될 때까지 Pod 발사가 큐에서 이유와 함께 기다린다(병합 없이 닫히면 blocked) · 골 문면 `선행: #N` 한 줄과 같다 · 대상 파일만 겹치면 선행이 아니다(경고만)')
     .option('--source <spec>', 'pod: 원천 — commit:<40자 sha> | pr:<정수> | worktree:<경로> | files:<경로>[,<경로>…] · `--substrate pod` 와 함께')
+    .option('--repair-commit-only <expected-head>', 'pod: 기존 PR head에서 수리한 커밋을 bundle로 반환(PR 생성 없음)')
     .option('--bench <id[:sha]>', '벤치 팔 — base 를 bench/<id>/base 로 고정(없으면 sha·생략 시 origin/main 으로 만든다 · 있으면 sha 일치 확인 · 불일치 거부) · 팔 가지 bench/<id>/<arm> · PR 라벨 elanous:bench · PR 직전 main 동기화 생략 · 원장 elanous bench ls <id>');
 }
 
@@ -397,7 +398,7 @@ function assertHarnessChildLlmModel(opts: HarnessAskSayChildLlmOptions): void {
 }
 
 /** Shared post-parse gate: validate child model before any ask/say early return (including `--dry-run`). */
-type HarnessSubstrateOpts = { substrate?: 'local' | 'pod'; podPool?: string; podMemory?: 'lite' | 'standard' | 'high'; after?: string; autoMerge?: boolean; base?: string; json?: boolean; target?: string; source?: string; seat?: QueueSeat };
+type HarnessSubstrateOpts = { substrate?: 'local' | 'pod'; podPool?: string; podMemory?: 'lite' | 'standard' | 'high'; after?: string; autoMerge?: boolean; base?: string; json?: boolean; target?: string; source?: string; repairCommitOnly?: string; seat?: QueueSeat };
 function resolveLaunchSubstrate(opts: HarnessSubstrateOpts): ResolvedHarnessSubstrate {
   const resolved = resolveHarnessSubstrate({ flag: opts, config: getUserConfig(), env: process.env });
   debug.log('harness.substrate', 'resolved', resolved);
@@ -693,7 +694,7 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
   const status = await dispatchHarnessOnPod({ entrance, input, podPool: pool, ...(authorOnPod && entrance === 'cli-harness-say' ? { authorOnPod: true } : {}),
     ...(child.childLlmProvider?.trim() ? { childLlmProvider: child.childLlmProvider.trim() } : {}),
     ...(child.childLlmModel?.trim() ? { childLlmModel: child.childLlmModel.trim() } : {}),
-    ...(child.childLlmEffort?.trim() ? { childLlmEffort: child.childLlmEffort.trim() } : {}), ...(authorOnPod && podAuthorGrade ? { authorGrade: podAuthorGrade.grade, authorGradeSource: podAuthorGrade.source } : {}), ...(dispatchRecorded ? { dispatchRecorded: true } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...((opts as HarnessAskSayChildLlmOptions).goalType ? { goalType: (opts as HarnessAskSayChildLlmOptions).goalType } : {}), ...(o.after ? { after: o.after } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}), ...(o.seat ? { seat: o.seat } : {}) },
+    ...(child.childLlmEffort?.trim() ? { childLlmEffort: child.childLlmEffort.trim() } : {}), ...(authorOnPod && podAuthorGrade ? { authorGrade: podAuthorGrade.grade, authorGradeSource: podAuthorGrade.source } : {}), ...(dispatchRecorded ? { dispatchRecorded: true } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...((opts as HarnessAskSayChildLlmOptions).goalType ? { goalType: (opts as HarnessAskSayChildLlmOptions).goalType } : {}), ...(o.after ? { after: o.after } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}), ...(o.repairCommitOnly ? { repairCommitOnly: o.repairCommitOnly } : {}), ...(o.seat ? { seat: o.seat } : {}) },
     { onOutput: (text) => {
       runId ??= harnessPodRunId(output + text);
       output = (output + text).slice(-16_000);
@@ -894,6 +895,8 @@ async function dispatchHarnessAskSay(
     if (isHarnessDryRun(opts)) {
       resolveLaunchSubstrate(opts);
       printHarnessLaunchDryRun(dryRunPreview);
+      const repair = opts as HarnessSubstrateOpts;
+      if (repair.repairCommitOnly) console.log(`[dry-run] repair forwarding: --pod-source ${repair.source} --repair-commit-only ${repair.repairCommitOnly} --no-auto-merge`);
       return;
     }
     ensureJourneyKey();
@@ -939,7 +942,7 @@ async function dispatchHarnessAskSay(
         ['--goal-type', opts.goalType], ...(dryRunPreview.entrance === 'cli-harness-say' ? [['--author-grade', opts.authorGradeSource === 'flag' ? opts.authorGrade : undefined] as [string, string | undefined]] : []), ['--child-llm-provider', opts.childLlmProvider],
         ['--child-llm-model', opts.childLlmModel], ['--child-llm-effort', opts.childLlmEffort],
         ['--pod-pool', (opts as HarnessSubstrateOpts).podPool], ['--pod-memory', (opts as HarnessSubstrateOpts).podMemory],
-        ['--after', (opts as HarnessSubstrateOpts).after], ['--source', (opts as HarnessSubstrateOpts).source],
+        ['--after', (opts as HarnessSubstrateOpts).after], ['--source', (opts as HarnessSubstrateOpts).source], ['--repair-commit-only', (opts as HarnessSubstrateOpts).repairCommitOnly],
       ];
       for (const [flag, value] of values) if (value !== undefined) flags.push(flag, value);
       if ((opts as HarnessSubstrateOpts).source !== undefined && resolved.substrate !== 'pod') {
@@ -1013,8 +1016,9 @@ async function dispatchHarnessAskSay(
       const previous = process.env.ELANOUS_HARNESS_SEAT;
       if (stampedSeat) process.env.ELANOUS_HARNESS_SEAT = stampedSeat;
       else delete process.env.ELANOUS_HARNESS_SEAT;
-      // 배치 노드 — 실행 칸(local | pod)이 그 출구 라벨이고, YAML 의 decompose 간선(on: substrate)이 그 값으로 갈린다.
-      passJourneyNode('dispatch', { ...journey, outcome: resolved.substrate });
+      // The source label selects the declared author or same-PR rework edge; substrate remains data for decompose.
+      passJourneyNode('dispatch', { ...journey, outcome: (stampedOpts as HarnessSubstrateOpts).repairCommitOnly ? 'pr-source' : 'fresh',
+        data: { substrate: resolved.substrate } });
       const benchRow = bench ? recordBenchLaunch(bench, stampedOpts, resolved.substrate, dryRunPreview.entrance, benchDeps) : undefined;
       try { await dispatch(resolved, stampedOpts); }
       finally {
@@ -3342,6 +3346,11 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
   if (ask) {
     registerHarnessAskSayOptions(harnessCmd.command('ask <goal-path>').description('골 문서 경로를 받아 구동한다'))
       .action(async (goalPath: string, opts: HarnessAskSayChildLlmOptions & HarnessDryRunOpts) => {
+        if ((opts as HarnessSubstrateOpts).repairCommitOnly !== undefined) {
+          console.error('--repair-commit-only is supported only by harness say');
+          process.exitCode = 2;
+          return;
+        }
         await dispatchHarnessAskSay(
           opts,
           {
@@ -3370,6 +3379,13 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
     registerHarnessAskSayOptions(harnessCmd.command('say <sentence...>').description('문장을 받아 구동한다'))
       .addOption(new Option('--author-grade <grade>', 'say 저작 등급 (full|lite)').choices(['full', 'lite']))
       .action(async (sentence: string[], opts: HarnessAskSayChildLlmOptions & HarnessDryRunOpts) => {
+        const repair = opts as HarnessSubstrateOpts;
+        if (repair.repairCommitOnly !== undefined && (repair.substrate !== 'pod' || !/^pr:[1-9]\d*$/.test(repair.source ?? '')
+          || !/^[0-9a-f]{40}$/.test(repair.repairCommitOnly) || repair.autoMerge !== false || repair.target !== undefined)) {
+          console.error('--repair-commit-only requires --substrate pod --source pr:N --no-auto-merge and a 40-hex expected head');
+          process.exitCode = 2;
+          return;
+        }
         const grade = resolveGoalAuthorGrade(opts.authorGrade, getUserConfig().harness?.authorGrade);
         const podSource = process.env.ELANOUS_POD_AUTHOR_ON_POD === '1' && process.env.ELANOUS_POD_AUTHOR_GRADE === grade.grade
           ? process.env.ELANOUS_POD_AUTHOR_GRADE_SOURCE : undefined;
@@ -3390,7 +3406,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
               return Promise.resolve();
             }
             return resolved.substrate === 'pod'
-              ? onPod(stampedOpts, 'cli-harness-say', sentence.join(' '), resolved.pool!, deps.podDispatchTask, harnessAuthorOnPod())
+              ? onPod(stampedOpts, 'cli-harness-say', sentence.join(' '), resolved.pool!, deps.podDispatchTask, !(opts as HarnessSubstrateOpts).repairCommitOnly && harnessAuthorOnPod())
               : (announceLocalChildProvider(stampedOpts), say(sentence, normalizeHarnessAskSayOptions(stampedOpts)));
           },
           deps.launchGate, queueDeps, immediateLaunch, queueDeps.launch ? undefined : immediateExit, deps.bench,

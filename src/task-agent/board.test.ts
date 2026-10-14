@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -164,7 +165,8 @@ describe('보드 일반형 — 프로젝트 › 목표 › 이정표 › 과제 
   test('task hand --goal/--milestone 은 카드에 싣고 보드로 읽힌다 · 안 주면 카드에 칸이 없다', async () => {
     const path = join(tempDir('task-board-hand-'), 'task-agent-actions.json');
     const target = tempDir('task-board-target-');
-    const { lines, code } = await cli(['task', 'hand', 'first', '--project', 'p1', '--target', target, '--completion', 'artifact', '--goal', 'g1', '--milestone', 'm1', '--json'], { taskStatePath: path });
+    execFileSync('git', ['init', '-q', target]);
+    const { lines, code } = await cli(['task', 'hand', 'first', '--project', 'p1', '--target', target, '--completion', 'code-pr', '--goal', 'g1', '--milestone', 'm1', '--json'], { taskStatePath: path });
     expect(code ?? 0).toBe(0);
     const id = JSON.parse(lines[0]!).card.id as string;
     expect(readTaskCard(id, path)).toMatchObject({ project: { id: 'p1', target }, goal: 'g1', milestone: 'm1' });
@@ -224,6 +226,26 @@ describe('보드 일반형 — 프로젝트 › 목표 › 이정표 › 과제 
       lastEvent: { at: 't3', event: 'failed', detail: 'failed/needs-owner — exit 1 · pod-failure' }, exitReason: 'failed/needs-owner — exit 1 · pod-failure' });
     expect(tasks['ta-closed']).toMatchObject({ runId: null, pr: null, exitReason: '중복 카드' });
     expect(tasks['ta-new']).toEqual({ runId: null, pr: null, lastStatus: 'handed', lastEvent: null, exitReason: null });
+  });
+
+  test('bound terminal PR distinguishes merged and closed; stale marker does not close a rebound card', () => {
+    const path = join(tempDir('task-board-terminal-'), 'task-agent-actions.json');
+    const url = 'https://github.com/o/r/pull/30';
+    const merged = { pr: 30, url, head: 'a'.repeat(40), state: 'MERGED' as const, at: '2026-10-13T01:00:00.000Z' };
+    const partial = { pr: 30, head: merged.head, at: merged.at, outcome: 'partial' as const, evidence: ['slice landed'], remaining: ['live check'] };
+    writeFileSync(path, JSON.stringify({ tasks: {
+      merged: card('merged', { status: 'launched', pr: { number: 30, url }, prTerminal: merged, postLand: partial }),
+      closed: card('closed', { status: 'launched', pr: { number: 31, url: 'https://github.com/o/r/pull/31' },
+        prTerminal: { ...merged, pr: 31, url: 'https://github.com/o/r/pull/31', state: 'CLOSED' } }),
+      rebound: card('rebound', { status: 'launched', pr: { number: 32, url: 'https://github.com/o/r/pull/32' }, prTerminal: merged }),
+      crossRepo: card('crossRepo', { status: 'launched', pr: { number: 30, url: 'https://github.com/other/repo/pull/30' },
+        prTerminal: merged, postLand: partial }),
+    } }));
+    const tasks = cardsBoard(path, { ledger: true })[0]!.children!;
+    expect(tasks.map((item) => [item.id, item.status])).toEqual([['merged', 'done'], ['closed', 'blocked'], ['rebound', 'open'], ['crossRepo', 'open']]);
+    expect(tasks[0]?.ledger).toMatchObject({ prTerminal: merged, postLand: partial });
+    expect(tasks[2]?.ledger?.prTerminal).toBeUndefined();
+    expect(tasks[3]?.ledger?.postLand).toBeUndefined();
   });
 
   test('progress — 부분 관측(count `{ count: null, lowerBound }` 꼴 · unreadable)이면 partial=true·lowerBound=최소 수 · 완전 관측이면 partial=false·lowerBound=null', () => {

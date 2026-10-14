@@ -1,4 +1,5 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
+import { debug } from '../debug/log.js';
 import { PodLeaseAdmission } from './admission.js';
 import type { PoolLeaseRecommendation } from '../task-orchestrator/surfaces/pod-lease.js';
 
@@ -114,6 +115,20 @@ describe('pod lease FIFO admission', () => {
     releaseFirst(); releaseSecond();
   });
 
+  test('a merged predecessor keeps its place ahead of a follower when one slot opens', async () => {
+    const admission = new PodLeaseAdmission({ status: () => status(1), dependencyMerged: async () => true, pollMs: 60_000 });
+    const order: string[] = [];
+    const first = admission.acquire(undefined, 'earlier').then((release) => { order.push('first'); return release; });
+    const second = admission.acquire().then((release) => { order.push('second'); return release; });
+    const releaseFirst = await first;
+    expect(order).toEqual(['first']);
+    expect(admission.snapshot()).toMatchObject({ active: 1, queued: 1 });
+    releaseFirst();
+    const releaseSecond = await second;
+    expect(order).toEqual(['first', 'second']);
+    releaseSecond();
+  });
+
   test('a predecessor closed without merging rejects as blocked and frees the queue', async () => {
     const admission = new PodLeaseAdmission({ status: () => status(1), dependencyMerged: () => 'blocked', pollMs: 1_000 });
     const blocked = admission.acquire(undefined, 123).catch((error: Error) => error.message);
@@ -122,6 +137,21 @@ describe('pod lease FIFO admission', () => {
     const release = await next;
     expect(admission.snapshot()).toMatchObject({ active: 1, queued: 0, waiting: [] });
     release();
+  });
+
+  test('late blocked predecessor clears the poll timer after the last waiter leaves', async () => {
+    let finishCheck!: (state: 'blocked') => void;
+    const dependency = new Promise<'blocked'>((resolve) => { finishCheck = resolve; });
+    const admission = new PodLeaseAdmission({ status: () => status(1), dependencyMerged: () => dependency, pollMs: 60_000 });
+    const blocked = admission.acquire(undefined, 'earlier').catch((error: Error) => error.message);
+    const handles = admission as unknown as { timer?: ReturnType<typeof setTimeout>; expiryTimer?: ReturnType<typeof setTimeout> };
+    for (let attempt = 0; attempt < 100 && handles.timer === undefined; attempt++) await Bun.sleep(5);
+    expect(admission.snapshot().queued).toBe(1);
+    expect(handles.timer).toBeDefined();
+    finishCheck('blocked');
+    expect(await blocked).toBe('pod lease predecessor blocked: earlier was closed without merging');
+    expect(admission.snapshot().queued).toBe(0);
+    expect(Number(handles.timer !== undefined) + Number(handles.expiryTimer !== undefined)).toBe(0);
   });
 
   test('a queued item with no predecessor reports no-free-slot as its waiting reason', async () => {
@@ -206,6 +236,211 @@ describe('pod lease FIFO admission', () => {
     await tick();
     expect(admission.snapshot()).toMatchObject({ active: 1, queued: 0 });
     release();
+  });
+
+  test('rejects an overdue no-free-slot waiter, removes it, and logs starvation without disturbing the next waiter', async () => {
+    let now = 0;
+    const clock = spyOn(Date, 'now').mockImplementation(() => now);
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      let recommended = 0;
+      const admission = new PodLeaseAdmission({ status: () => status(recommended), pollMs: 60_000, maxWaitMs: 60_000 });
+      const expired = admission.acquire().catch((error: Error) => error.message);
+      await admission.refresh();
+      now = 59_000;
+      const follower = admission.acquire();
+      await admission.refresh();
+      now = 60_001;
+      await tick();
+      await admission.refresh();
+      expect(await expired).toBe('pod lease admit-starved: waited 1m · reason no-free-slot');
+      expect(log).toHaveBeenCalledWith('pod-lease', 'admit-starved',
+        { waitedMs: 60_001, reason: 'no-free-slot', after: undefined });
+      expect(admission.snapshot()).toMatchObject({ active: 0, queued: 1, waiting: [{ reason: 'no-free-slot' }] });
+      recommended = 1;
+      await admission.refresh();
+      expect(admission.snapshot()).toMatchObject({ active: 1, queued: 0 });
+      const release = await follower;
+      release();
+    } finally {
+      clock.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  test('automatically rejects and dequeues a starved slot waiter before the next poll', async () => {
+    const admission = new PodLeaseAdmission({ status: () => status(0), pollMs: 200, maxWaitMs: 10 });
+    const waiting = admission.acquire().catch((error: Error) => error.message);
+    await Bun.sleep(50);
+    expect(await Promise.race([
+      waiting,
+      Bun.sleep(50).then(() => 'still waiting'),
+    ])).toMatch(/^pod lease admit-starved: waited 0m · reason no-free-slot$/);
+    expect(admission.snapshot().queued).toBe(0);
+  });
+
+  test('admits a follower from a free slot while the predecessor check never responds', async () => {
+    let checkStarted!: () => void;
+    const started = new Promise<void>((resolve) => { checkStarted = resolve; });
+    const admission = new PodLeaseAdmission({
+      status: () => status(1),
+      dependencyMerged: () => { checkStarted(); return new Promise<boolean>(() => {}); },
+      pollMs: 200,
+      maxWaitMs: 10,
+    });
+    const controller = new AbortController();
+    const predecessor = admission.acquire(controller.signal, 'earlier').catch((error: Error) => error.message);
+    await started;
+    const follower = admission.acquire();
+    const release = await Promise.race([
+      follower,
+      Bun.sleep(100).then(() => { throw new Error('follower blocked by unresolved predecessor'); }),
+    ]);
+    expect(admission.snapshot()).toMatchObject({ active: 1, queued: 1, recommended: 1,
+      waiting: [{ after: 'earlier', reason: 'predecessor-unmerged:earlier' }] });
+    await Bun.sleep(30);
+    expect(admission.snapshot()).toMatchObject({ active: 1, queued: 1,
+      waiting: [{ after: 'earlier', reason: 'predecessor-unmerged:earlier' }] });
+    release();
+    controller.abort();
+    expect(await predecessor).toBe('pod lease admission aborted');
+  });
+
+  test('expires a follower while a predecessor check is still unresolved', async () => {
+    let checkStarted!: () => void;
+    const started = new Promise<void>((resolve) => { checkStarted = resolve; });
+    let finishCheck!: (merged: boolean) => void;
+    const check = new Promise<boolean>((resolve) => { finishCheck = resolve; });
+    const admission = new PodLeaseAdmission({
+      status: () => status(0),
+      dependencyMerged: () => { checkStarted(); return check; },
+      pollMs: 200,
+      maxWaitMs: 10,
+    });
+    const controller = new AbortController();
+    const predecessor = admission.acquire(controller.signal, 'earlier').catch((error: Error) => error.message);
+    await started;
+    const follower = admission.acquire().catch((error: Error) => error.message);
+    expect(await Promise.race([
+      follower,
+      Bun.sleep(100).then(() => 'still waiting'),
+    ])).toBe('pod lease admit-starved: waited 0m · reason no-free-slot');
+    expect(admission.snapshot()).toMatchObject({ active: 0, queued: 1,
+      waiting: [{ after: 'earlier' }] });
+    finishCheck(false);
+    await admission.refresh();
+    expect(admission.snapshot().waiting).toEqual([{ after: 'earlier', reason: 'predecessor-unmerged:earlier' }]);
+    controller.abort();
+    expect(await predecessor).toBe('pod lease admission aborted');
+  });
+
+  test('an already overdue slot waiter cannot jump the queue when a slot opens', async () => {
+    let now = 0;
+    const clock = spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      let recommended = 0;
+      const admission = new PodLeaseAdmission({ status: () => status(recommended), pollMs: 60_000, maxWaitMs: 1_000 });
+      const expired = admission.acquire().catch((error: Error) => error.message);
+      await admission.refresh();
+      now = 1_001;
+      recommended = 1;
+      const next = admission.acquire();
+      await admission.refresh();
+      expect(await expired).toBe('pod lease admit-starved: waited 0m · reason no-free-slot');
+      const release = await next;
+      expect(admission.snapshot()).toMatchObject({ active: 1, queued: 0 });
+      release();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test('defaults to a 30-minute slot-wait cap', async () => {
+    let now = 0;
+    const clock = spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const admission = new PodLeaseAdmission({ status: () => status(0), pollMs: 60_000 });
+      const waiting = admission.acquire().catch((error: Error) => error.message);
+      await admission.refresh();
+      now = 30 * 60_000;
+      await admission.refresh();
+      expect(admission.snapshot().queued).toBe(1);
+      now++;
+      await admission.refresh();
+      expect(await waiting).toBe('pod lease admit-starved: waited 30m · reason no-free-slot');
+      expect(admission.snapshot().queued).toBe(0);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test('an unmerged predecessor is exempt from the slot wait cap and still lets a follower through', async () => {
+    let now = 0;
+    const clock = spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      let merged = false;
+      const admission = new PodLeaseAdmission({ status: () => status(1), dependencyMerged: () => merged,
+        pollMs: 60_000, maxWaitMs: 1_000 });
+      const first = admission.acquire(undefined, 'earlier');
+      await admission.refresh();
+      now = 120_000;
+      await admission.refresh();
+      expect(admission.snapshot().waiting).toEqual([{ after: 'earlier', reason: 'predecessor-unmerged:earlier' }]);
+      const second = admission.acquire();
+      const releaseSecond = await second;
+      expect(admission.snapshot()).toMatchObject({ active: 1, queued: 1 });
+      releaseSecond();
+      merged = true;
+      await admission.refresh();
+      const releaseFirst = await first;
+      expect(admission.snapshot()).toMatchObject({ active: 1, queued: 0 });
+      releaseFirst();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test('a predecessor whose slot never opens starts its wait clock only after merging', async () => {
+    let now = 0;
+    const clock = spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      let merged = false;
+      const admission = new PodLeaseAdmission({ status: () => status(0), dependencyMerged: () => merged,
+        pollMs: 60_000, maxWaitMs: 1_000 });
+      const waiting = admission.acquire(undefined, 'earlier').catch((error: Error) => error.message);
+      await admission.refresh();
+      now = 120_000;
+      await admission.refresh();
+      expect(admission.snapshot().waiting).toEqual([{ after: 'earlier', reason: 'predecessor-unmerged:earlier' }]);
+      merged = true;
+      await admission.refresh();
+      expect(admission.snapshot().waiting).toEqual([{ after: 'earlier', reason: 'no-free-slot' }]);
+      now = 121_001;
+      await admission.refresh();
+      expect(await waiting).toBe('pod lease admit-starved: waited 0m · reason no-free-slot');
+      expect(admission.snapshot().queued).toBe(0);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test('admits within maxWaitMs even after a previous no-free-slot check', async () => {
+    let now = 0;
+    const clock = spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      let recommended = 0;
+      const admission = new PodLeaseAdmission({ status: () => status(recommended), pollMs: 60_000, maxWaitMs: 1_000 });
+      const waiting = admission.acquire();
+      await admission.refresh();
+      now = 999;
+      recommended = 1;
+      await admission.refresh();
+      const release = await waiting;
+      expect(admission.snapshot()).toMatchObject({ active: 1, queued: 0 });
+      release();
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   test('queued cancellation removes only the cancelled launch without blocking followers', async () => {

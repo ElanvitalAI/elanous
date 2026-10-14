@@ -2,6 +2,7 @@ import { describe, expect, test, spyOn } from 'bun:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { act, create } from 'react-test-renderer';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
+import TasksPage from '@/app/tasks/page';
 import { DaemonClient } from '@/lib/daemon-client';
 import { boardColumn, cardTitle, foldCard, type TaskCardEntry } from '@/lib/task-card-model';
 import type { TaskCardWire } from '@/nexus/client';
@@ -12,6 +13,17 @@ const entries: TaskCardEntry[] = [
   { taskId: 'task-1', section: 'gates', key: 'g1', owner: 'gatekeeper', ts: 1700000001000, runId: '12345678-90ab', data: { budget: 'proceed', location: 'pod' } },
   { taskId: 'task-1', section: 'incidents', key: 'x1', owner: 'operator', ts: 1700000002000, data: { reason: 'quota' } },
 ];
+
+describe('/tasks landing', () => {
+  test('shows the agent ledger first and preserves the TOX manager inside a closed disclosure', () => {
+    const config = { baseUrl: 'http://board.test', token: '', provider: '' };
+    const markup = renderToStaticMarkup(<DaemonContext.Provider value={{ config, client: new DaemonClient(config), sessionId: '', setConfig: () => {}, setSessionId: () => {} }}><TasksPage /></DaemonContext.Provider>);
+    expect(markup).toContain('aria-label="Task agent ledger"');
+    expect(markup).toContain('옛 작업(TOX)');
+    expect(markup).not.toContain('Task Manager');
+    expect(markup.indexOf('Task agent ledger')).toBeLessThan(markup.indexOf('옛 작업(TOX)'));
+  });
+});
 
 describe('TaskBoardView detail wiring', () => {
   test('selection renders the production TaskCardDetail; closing removes it', () => {

@@ -273,6 +273,12 @@ describe('RFC §5 1단계 — YAML 이 «코드 상수»와 같은가', () => {
 
   test('⭐ 엣지가 PIPELINE_EDGES_BY_NODE 를 «전부» 덮는다 (map ⊕ fallback 합쳐서)', () => {
     const declared = PIPELINE_EDGES_BY_NODE as unknown as Record<string, readonly string[]>;
+    const refusalEdges = implement.edges.filter((edge) => edge.from === 'merge' && edge.on === 'refusal');
+    expect(refusalEdges).toHaveLength(1);
+    expect(refusalEdges[0]?.map).toEqual({
+      draft: 'ready', 'head-branch': 'pr-head-checkout', 'not-ancestor': 'main-sync',
+      'review-missing': 'review', other: 'next-move',
+    });
     const yamlTargets = new Map<string, Set<string>>();
     for (const edge of implement.edges) {
       const set = yamlTargets.get(edge.from) ?? new Set<string>();
@@ -298,9 +304,13 @@ describe('RFC §5 1단계 — YAML 이 «코드 상수»와 같은가', () => {
     };
     for (const [from, targets] of Object.entries(declared)) {
       expect({ from, uncovered: targets.filter((to) => !reachesThroughJourney(from, to)) }).toEqual({ from, uncovered: [] });
-      // ⛔ 역방향: YAML 이 파이프라인 노드 사이에 «코드에 없는» 간선을 더하면 빨강이다(여정 노드로 가는 간선만 더할 수 있다).
+      // ⛔ 역방향: 코드에 없는 파이프라인 간선은 빨강. merge 거부 복구 후보 다섯은
+      // 실행 간선이 아닌 on: refusal 판독이므로 이 한 묶음만 예외로 둔다.
       const pipelineTargets = [...(yamlTargets.get(from) ?? new Set())].filter((to) => !journey.has(to));
-      expect({ from, undeclaredInCode: pipelineTargets.filter((to) => !(targets as readonly string[]).includes(to)).sort() }).toEqual({ from, undeclaredInCode: [] });
+      const refusal = from === 'merge' ? implement.edges.find((edge) => edge.from === 'merge' && edge.on === 'refusal') : undefined;
+      const refusalTargets = new Set(Object.values(refusal?.map ?? {}));
+      expect({ from, undeclaredInCode: pipelineTargets.filter((to) => !(targets as readonly string[]).includes(to) && !refusalTargets.has(to)).sort() })
+        .toEqual({ from, undeclaredInCode: [] });
     }
   });
 });
@@ -365,5 +375,14 @@ describe('ARG-UNIT-CALL — subgraph unit call parsing', () => {
     const node = '{ node_id: a, kind: agent, recipe: test, max_visits: 1 }';
     expect(parseGraphTemplateYaml(doc(node, 'unit: { inputs: [i], outputs: [o], exits: [done] }\n')).template?.unit).toEqual({ inputs: ['i'], outputs: ['o'], exits: ['done'] });
     expect(parseGraphTemplateYaml(doc(node, 'unit: { inputs: [i], outputs: [o], exits: [other] }\n')).errors.some(e => e.path === '<inline>/unit')).toBe(true);
+  });
+  test('multi-entry headers declare every selectable entry and calls name a nonempty selector', () => {
+    const source = `graph_id: multi\nversion: 1\nunit: { inputs: [], outputs: [], exits: [done], entries: [a, b] }\nentry_node: a\nterminal_nodes: [done]\nnodes:\n  - { node_id: a, kind: gate, recipe: none, max_visits: 1 }\n  - { node_id: b, kind: gate, recipe: none, max_visits: 1 }\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\nedges:\n  - { from: a, to: done }\n  - { from: b, to: done }\n`;
+    expect(parseGraphTemplateYaml(source).template?.unit?.entries).toEqual(['a', 'b']);
+    expect(parseGraphTemplateYaml(source.replace('entries: [a, b]', 'entries: [b]')).errors.some(e => e.path === '<inline>/unit')).toBe(true);
+    expect(parseGraphTemplateYaml(source.replace('entries: [a, b]', 'entries: [a, missing]')).errors.some(e => e.path === '<inline>/unit')).toBe(true);
+    const call = doc('{ node_id: a, kind: subgraph, recipe: none, max_visits: 1, call: multi@1, call_entry: b, budget: { inner_steps: 5 }, contract: { inputs: [], outputs: [] } }');
+    expect(parseGraphTemplateYaml(call).template?.nodes[0]?.callEntry).toBe('b');
+    expect(parseGraphTemplateYaml(call.replace('call_entry: b', 'call_entry: ""')).errors.some(e => e.path === '<inline>/nodes/0/call_entry')).toBe(true);
   });
 });

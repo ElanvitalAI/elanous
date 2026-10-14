@@ -1,14 +1,15 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { loadRunLedger as loadRunLedgerSync } from '../self-implement/run-ledger.js';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { loadRunLedger as loadRunLedgerSync, loadRunLedgerWithMetadata, runLedgerDir, resolveFederatedRunLedgerDirectories } from '../self-implement/run-ledger.js';
 import { goalRunDbPath, loadGoalRunQuery } from '../self-implement/goal-run-store.js';
 import { loadGoalAskRecords } from '../self-implement/goal-ask-store.js';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { InvalidArgumentError, Option, type Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { readNexusRuntime } from '../nexus/runtime.js';
-import { checklistDevVersion } from '../release-loop/checklist.js';
+import { checklistDevVersion, listChecklist } from '../release-loop/checklist.js';
 import { assignedVersions, releasedVersion, validateVersion } from '../release-loop/feature-store.js';
 import { compareVersions } from '../directives/version-at.js';
 import { cardsBoard, countBoardTasks, INTERNAL_PACK_PROJECT, mergeBoards, releasePackBoard, type BoardNode } from '../task-agent/board.js';
@@ -17,9 +18,11 @@ import { cardPrNumber, CLOSED_BY_HAND_EVENT, closeTaskCard, COMPLETION_KINDS, ha
 import { readCardSalvageBranch, recordWiringLiveVerified, refreshCardRunBinding, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
 import { captureReviewResults } from '../task-agent/review-result-capture.js';
 import { replayRemoteCardMoves } from '../task-agent/shadow.js';
+import { remoteLedgerMirrorDirs } from '../task-agent/parent-host.js';
+import { ambiguousGreenSweepPrs, decideGreenSweep, greenSweepCandidates, observeGreenSweep, type GreenSweepPr } from '../task-agent/green-sweep.js';
 import { HAND_MOVE_KINDS, recordHandMove } from '../task-agent/live-move-history.js';
 import { advanceMission, handMission, MissionAdvanceError, openMissionIds, recordPieceRef, type AdvanceMissionResult, type MissionDecompose, type PieceEvidenceReader } from '../task-agent/mission.js';
-import { formatSevenVerbLive, formatTaskAgentCover, measureSevenVerbLive, measureTaskAgentCover, type CoverRow, type SevenVerbLive, type TaskAgentCoverInput } from '../task-agent/cover.js';
+import { formatSevenVerbLive, formatTaskAgentCover, measureSevenVerbLive, measureTaskAgentCover, type CoverRow, type ImplementCardRunBinding, type ImplementRunMergeEvent, type SevenVerbLive, type TaskAgentCoverInput } from '../task-agent/cover.js';
 import { LogStore, STORE_SAFETY_MAX, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
 import { resolveLogTargets } from './logs-cli.js';
 
@@ -36,6 +39,8 @@ export interface TasksCliDeps {
   reviewResultNow?: () => Date;
   /** 과제 카드 상태 파일(시험 주입). 기본 = `effectiveInstanceRoot()/task-agent-actions.json`. */
   taskStatePath?: string;
+  /** 조합 선택 시험에서만 그래프 저장소 루트를 바꾼다. */
+  taskCompositionRoot?: string;
   /** logs.db 싱크 등록(시험 주입). 기본 = `registerStandaloneLogSink`. `hand`·`show` 가 부른다. */
   registerSink?: (surface: string) => Promise<unknown>;
   /** `task hand --mission` 의 분해기(시험 주입). 기본 = 나열형은 결정론 · 아니면 `decomposeSelfDevGoal`. */
@@ -46,6 +51,12 @@ export interface TasksCliDeps {
   releaseBoard?: (version?: string) => BoardNode[];
   /** `tasks hand --checklist` 판 목록(시험 주입). 기본은 발행 전 체크리스트가 있는 판 전부. */
   releaseVersions?: () => string[];
+  /** Isolated checklist read for PR adoption. */
+  adoptChecklist?: typeof listChecklist;
+  /** `tasks adopt-pr` live PR read seam; default is gh in this repository. */
+  adoptPrView?: (number: number, cwd: string) => import('../task-agent/adopt-pr.js').AdoptPrView;
+  /** Isolated ledger proof for a launched card being adopted. */
+  adoptRunTerminal?: typeof import('../task-agent/adopt-pr.js').adoptedRunTerminal;
   /** `tasks show`·`advance` 의 런 근거 읽기(시험 주입) — 기본 = 런 원장(이 우주 ⊕ 연합) ⊕ 호스트 logs 의 Pod job-finished. */
   cardRunEvidence?: CardRunEvidenceDeps;
   /** `tasks live-verified` 가 적는 런 원장 디렉터리(시험 주입). 기본 = `runLedgerDir()`. */
@@ -56,15 +67,20 @@ export interface TasksCliDeps {
   staleParents?: import('../task-agent/parent-host.js').StaleParentDeps;
   /** `tasks adopt-runs` 의 백필 의존(시험 주입 · 등록부·상태 파일). */
   adoptRuns?: import('../task-agent/run-adopt.js').RunAdoptDeps;
-  /** `tasks cover` logs 조회 seam. 기본은 등록된 모든 우주(운영 ⊕ test)의 logs.db 를 read-only 로 연다 —
-   *  pr land 는 작업 트리마다 파생 test 우주에 기록되므로 현재 우주만 읽으면 분모가 늘 0 이다. */
-  coverLogs?: (query: LogQuery) => LogStoreRow[] | CoverLogRead;
+  /** `tasks cover` logs 조회 seam. 기본은 운영 우주만, --include-test 때 시험 우주도 읽는다. */
+  coverLogs?: (query: LogQuery, includeTest?: boolean) => LogStoreRow[] | CoverLogRead;
   /** `tasks cover --by-card` 카드 원장 읽기 seam(읽기 전용). 플래그가 있을 때만 부른다. 기본 = TA 카드 원장(task-agent-actions.json). null = 못 읽음. */
   coverCards?: () => CoverCardRow[] | null | Promise<CoverCardRow[] | null>;
   /** Read-only authored goal provenance; null means the authoring ledger could not be read. */
   coverGoalAsks?: () => { authorRunId: string; goalId: string; createdAt: string }[] | null;
   /** Read-only terminal goal records; null means the goal ledger could not be read. */
   coverGoalRuns?: () => { goalId: string; outcome: string; stage?: string; startedAt: string; completedAt?: string }[] | null;
+  /** 구현 출처 시험 seam. 생략하면 task-agent-actions.json을 읽고, null이면 카드 원장을 못 읽은 것이다. */
+  coverImplementCardRuns?: () => readonly ImplementCardRunBinding[] | null;
+  /** 구현 출처 시험 seam. 생략하면 로컬·연합·원격 거울 run-ledger를 읽고, null이면 못 읽은 것이다. */
+  coverImplementRunMerges?: () => ReadonlyMap<string, ImplementRunMergeEvent> | null;
+  /** Read test-universe ledgers only when --include-test was requested. */
+  coverIncludeTest?: boolean;
   /** TA-REJUDGE-ON-HEAD — `tasks rejudge` 의 판단 의존(시험 주입 · 기본 = 설정 liveMoves ⊕ 실물 gh·리뷰·재게이트·land). */
   rejudge?: Partial<import('../task-agent/rejudge-on-head.js').RejudgeDeps>;
   /** TA-REJUDGE-ON-HEAD — `tasks regate-run` 의 재게이트(시험 주입 · 기본 `runHostRegate`). */
@@ -324,8 +340,8 @@ async function mirrorRemoteCardLedger(cardId: string, deps: TasksCliDeps): Promi
   try {
     if (deps.remoteLedgerMirror) { deps.remoteLedgerMirror(card); return; }
     const { mirrorRemoteRunLedgers } = await import('../task-agent/parent-host.js');
-    const { prodInstanceRoot } = await import('../instance/resolve.js');
-    mirrorRemoteRunLedgers(card.parentHost, card.runId, prodInstanceRoot());
+    const { effectiveInstanceRoot } = await import('../instance/resolve.js');
+    mirrorRemoteRunLedgers(card.parentHost, card.runId, effectiveInstanceRoot(), deps.cardRunEvidence?.ssh);
   } catch (error) {
     try { debug.log('task-agent', 'remote-ledger-mirror-failed', { card: cardId, host: card.parentHost.host, runId: card.runId, error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
   }
@@ -456,8 +472,20 @@ const COVER_QUERY_LIMIT = STORE_SAFETY_MAX;
 /** Federated read: rows from every store, whether any single store hit the bound, and how many stores could not be read. */
 export interface CoverLogRead { rows: LogStoreRow[]; limitReached: boolean; unreadableStores: number; storesRead: number }
 
-function queryCoverLogs(query: LogQuery): CoverLogRead {
-  const { targets, error } = resolveLogTargets({ all: true, includeTest: true });
+/** Land attempts are observed separately from completed land actions; an appended order or skipped move is not a merge. */
+export interface CoverLandSignals {
+  liveMoveEvents: number | null;
+  executedLiveMoves: number | null;
+  landOrderEvents: number | null;
+}
+
+export function formatCoverLandSignals(signals: CoverLandSignals): string {
+  const count = (value: number | null) => value === null ? '-' : String(value);
+  return `착지 시도 관측: live-move ${count(signals.liveMoveEvents)} · 집행 ${count(signals.executedLiveMoves)} · land-order ${count(signals.landOrderEvents)} (병합 수와 별개)`;
+}
+
+function queryCoverLogs(query: LogQuery, includeTest = false): CoverLogRead {
+  const { targets, error } = resolveLogTargets({ all: true, includeTest });
   if (error) throw new Error(error);
   const read: CoverLogRead = { rows: [], limitReached: false, unreadableStores: 0, storesRead: 0 };
   for (const target of targets) {
@@ -490,6 +518,61 @@ function coverEvents<T>(rows: readonly LogStoreRow[], category: string, event: s
   return events;
 }
 
+/** A malformed land record makes the numerator unknown; dropping it would assert a false zero. */
+function coverLandMoves(rows: readonly LogStoreRow[]): { card: string; executed: boolean; ok: boolean }[] | null {
+  const moves: { card: string; executed: boolean; ok: boolean }[] = [];
+  for (const row of rows) {
+    if (row.category !== 'task-agent' || row.event !== 'live-move') continue;
+    if (typeof row.data !== 'string') return null;
+    let data: unknown;
+    try { data = JSON.parse(row.data); } catch { return null; }
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) return null;
+    const move = data as Record<string, unknown>;
+    if (typeof move.kind !== 'string') return null;
+    if (move.kind !== 'land') continue;
+    if (typeof move.card !== 'string' || !move.card || typeof move.executed !== 'boolean'
+      || typeof move.ok !== 'boolean') return null;
+    moves.push({ card: move.card, executed: move.executed, ok: move.ok });
+  }
+  return moves;
+}
+
+/** An incomplete action source cannot provide a certain land numerator. */
+function coverTaskActions(rows: readonly LogStoreRow[]): NonNullable<TaskAgentCoverInput['taskAgentActions']> | null {
+  const actions: NonNullable<TaskAgentCoverInput['taskAgentActions']>[number][] = [];
+  for (const row of rows) {
+    if (row.category !== 'task-agent' || row.event !== 'action') continue;
+    if (typeof row.data !== 'string') return null;
+    let data: unknown;
+    try { data = JSON.parse(row.data); } catch { return null; }
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) return null;
+    const action = data as Record<string, unknown>;
+    if (typeof action.kind !== 'string' || typeof action.result !== 'string') return null;
+    if (action.kind === 'land' && action.result === 'done'
+      && (typeof action.taskId !== 'string' || !action.taskId)) return null;
+    actions.push({ kind: action.kind as NonNullable<TaskAgentCoverInput['taskAgentActions']>[number]['kind'],
+      result: action.result,
+      ...(typeof action.taskId === 'string' ? { taskId: action.taskId } : {}),
+      ...(typeof action.reason === 'string' ? { reason: action.reason } : {}) });
+  }
+  return actions;
+}
+
+function coverLandSteps(rows: readonly LogStoreRow[]): NonNullable<TaskAgentCoverInput['allLands']> | null {
+  const steps: NonNullable<TaskAgentCoverInput['allLands']>[number][] = [];
+  for (const row of rows) {
+    if (row.category !== 'pr.land' || row.event !== 'step') continue;
+    if (typeof row.data !== 'string') return null;
+    let data: unknown;
+    try { data = JSON.parse(row.data); } catch { return null; }
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) return null;
+    const step = data as Record<string, unknown>;
+    if (typeof step.step !== 'string' || typeof step.ok !== 'boolean') return null;
+    steps.push({ step: step.step, ok: step.ok });
+  }
+  return steps;
+}
+
 export interface CoverCardRow { id: string; createdAt: string }
 
 /**
@@ -511,14 +594,89 @@ export function coverCardsInWindow(cards: readonly CoverCardRow[] | null, window
   }).map(({ id }) => ({ id }));
 }
 
+/** Read the card ledger itself. A missing file or malformed row makes the aggregate unknown. */
+function readImplementCardBindings(statePath: string): ImplementCardRunBinding[] {
+  if (!existsSync(statePath)) throw new Error('TASK-AGENT card ledger is missing');
+  const state = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath);
+  if (state.tasks !== undefined && (!state.tasks || typeof state.tasks !== 'object' || Array.isArray(state.tasks))) {
+    throw new Error('TASK-AGENT card ledger is malformed');
+  }
+  const cards = Object.entries(state.tasks ?? {});
+  if (cards.length >= COVER_QUERY_LIMIT) throw new Error('TASK-AGENT card ledger reached query bound');
+  return cards.map(([key, card]) => {
+    if (!card || typeof card !== 'object' || Array.isArray(card) || typeof card.id !== 'string' || !card.id
+      || card.id !== key || (card.runId != null && typeof card.runId !== 'string')
+      || (card.runChildId != null && typeof card.runChildId !== 'string')) {
+      throw new Error('TASK-AGENT card binding is malformed');
+    }
+    return { cardId: card.id, runId: card.runId, runChildId: card.runChildId };
+  });
+}
+
+function implementLedgerDirectories(statePath: string, includeTest: boolean): string[] {
+  const root = dirname(statePath);
+  return [...new Set([
+    runLedgerDir(root),
+    runLedgerDir(),
+    ...resolveFederatedRunLedgerDirectories({ includeTest }),
+    ...remoteLedgerMirrorDirs(root),
+  ])];
+}
+
+/** Read only runs bound to cards. Merge time, rather than card launch time, owns the cover window. */
+function readImplementRunMerges(
+  bindings: readonly ImplementCardRunBinding[],
+  directories: readonly string[],
+  window: { sinceMs?: number; untilMs?: number },
+): ReadonlyMap<string, ImplementRunMergeEvent> {
+  const runIds = new Set(bindings.flatMap(({ runId, runChildId }) => [runId, runChildId])
+    .filter((id): id is string => typeof id === 'string' && id.length > 0));
+  if (runIds.size >= COVER_QUERY_LIMIT) throw new Error('bound run ledger query reached bound');
+  const merges = new Map<string, ImplementRunMergeEvent>();
+  let eventsRead = 0;
+  for (const runId of runIds) {
+    let found = false;
+    let merged = false;
+    let failure: unknown;
+    for (const directory of directories) {
+      try {
+        const loaded = loadRunLedgerWithMetadata(runId, directory);
+        if (loaded === null) continue;
+        found = true;
+        if (loaded.skippedTrailingBytes) throw new Error(`run ledger is incomplete: ${runId}`);
+        eventsRead += loaded.entries.length;
+        if (eventsRead >= COVER_QUERY_LIMIT) throw new Error('run ledger query reached bound');
+        for (const entry of loaded.entries) {
+          if (entry.event !== 'merged') continue;
+          if (typeof entry.data.merged !== 'boolean') throw new Error(`merged event is malformed: ${runId}`);
+          if (!entry.data.merged) continue;
+          if (window.sinceMs !== undefined || window.untilMs !== undefined) {
+            const at = Date.parse(entry.timestamp ?? '');
+            if (!Number.isFinite(at)) throw new Error(`merged event timestamp is missing: ${runId}`);
+            if ((window.sinceMs !== undefined && at < window.sinceMs)
+              || (window.untilMs !== undefined && at > window.untilMs)) continue;
+          }
+          merged = true;
+        }
+      } catch (error) { failure ??= error; }
+    }
+    // A local parent may contain only launch events while a federated or mirrored copy has the merge.
+    // Read every physical copy. Any unreadable copy leaves the aggregate unknown.
+    if (failure !== undefined) throw failure;
+    if (!found) throw new Error(`bound run ledger is missing: ${runId}`);
+    merges.set(runId, { merged });
+  }
+  return merges;
+}
+
 export function readTaskAgentCover(
   window: { sinceMs?: number; untilMs?: number } = {},
   query: NonNullable<TasksCliDeps['coverLogs']> = queryCoverLogs,
   taskCards?: readonly { id: string }[] | null,
-  goalReaders: Pick<TasksCliDeps, 'coverGoalAsks' | 'coverGoalRuns'> = {},
-): { rows: CoverRow[]; sevenVerbs: SevenVerbLive; limitReached: boolean; unreadableStores: number } {
+  goalReaders: Pick<TasksCliDeps, 'coverGoalAsks' | 'coverGoalRuns' | 'coverImplementCardRuns' | 'coverImplementRunMerges' | 'taskStatePath' | 'coverIncludeTest'> = {},
+): { rows: CoverRow[]; sevenVerbs: SevenVerbLive; landSignals: CoverLandSignals; limitReached: boolean; unreadableStores: number } {
   let unreadableStores = 0;
-  const read = (category: 'task-agent' | 'pr.land', event: 'action' | 'step'): { rows: LogStoreRow[]; limitReached: boolean } | null => {
+  const read = (category: 'task-agent' | 'pr.land' | 'task-agent.land-order', event: 'action' | 'step' | 'live-move' | 'appended'): { rows: LogStoreRow[]; limitReached: boolean } | null => {
     try {
       const result = query({ ...window, limit: COVER_QUERY_LIMIT, exactCategories: [category], events: [event] });
       if (Array.isArray(result)) return { rows: result, limitReached: result.length >= COVER_QUERY_LIMIT };
@@ -528,9 +686,13 @@ export function readTaskAgentCover(
   };
   const actionRead = read('task-agent', 'action');
   const landRead = read('pr.land', 'step');
+  const moveRead = read('task-agent', 'live-move');
+  const orderRead = read('task-agent.land-order', 'appended');
   const actions = actionRead?.rows ?? null;
   const lands = landRead?.rows ?? null;
-  const truncated = { taskAgentActions: actionRead?.limitReached === true, allLands: landRead?.limitReached === true };
+  const truncated = { taskAgentActions: actionRead?.limitReached === true, allLands: landRead?.limitReached === true,
+    liveLandMoves: moveRead?.limitReached === true };
+  const moves = moveRead && !moveRead.limitReached ? coverLandMoves(moveRead.rows) : null;
   const inWindow = (value: string): boolean => {
     const time = Date.parse(value);
     return Number.isFinite(time) && (window.sinceMs === undefined || time >= window.sinceMs) && (window.untilMs === undefined || time <= window.untilMs);
@@ -550,7 +712,9 @@ export function readTaskAgentCover(
   try {
     if (goalReaders.coverGoalRuns) goalRuns = goalReaders.coverGoalRuns();
     else {
-      const runs = loadGoalRunQuery({ limit: COVER_QUERY_LIMIT }, goalRunDbPath());
+      // Cover consumes only goal identity and terminal outcome. Child-brain enrichment would query every
+      // runId against every registered test logs.db, even though this measurement never reads childBrain.
+      const runs = loadGoalRunQuery({ limit: COVER_QUERY_LIMIT }, goalRunDbPath(), { targets: [] });
       goalRunsTruncated = runs?.truncated ?? false;
       goalRuns = runs?.records.map(({ goalId, record }) => ({
         goalId, outcome: record.outcome, stage: record.stage, startedAt: record.startedAt ?? '', completedAt: record.completedAt,
@@ -559,11 +723,9 @@ export function readTaskAgentCover(
   } catch { goalRuns = null; }
   const authoredGoalIds = new Set(goalAsks?.map((ask) => ask.goalId) ?? []);
   const input: TaskAgentCoverInput = {
-    taskAgentActions: actions === null ? null : coverEvents(actions, 'task-agent', 'action', (data) =>
-      typeof data.kind === 'string' && typeof data.result === 'string'
-        ? { kind: data.kind as NonNullable<TaskAgentCoverInput['taskAgentActions']>[number]['kind'], result: data.result, ...(typeof data.taskId === 'string' ? { taskId: data.taskId } : {}) } : null),
-    allLands: lands === null ? null : coverEvents(lands, 'pr.land', 'step', (data) =>
-      typeof data.step === 'string' && typeof data.ok === 'boolean' ? { step: data.step, ok: data.ok } : null),
+    taskAgentActions: actions === null ? null : coverTaskActions(actions),
+    liveLandMoves: moves,
+    allLands: lands === null ? null : coverLandSteps(lands),
     truncated: { ...truncated, goalAsks: goalAsksTruncated, goalRuns: goalRunsTruncated },
     // Authoring may start before this window; completion is the event being counted.
     goalAsks,
@@ -575,7 +737,32 @@ export function readTaskAgentCover(
       : goalRuns,
     ...(taskCards === undefined ? {} : { taskCards }),
   };
-  return { rows: measureTaskAgentCover(input), sevenVerbs: measureSevenVerbLive(input), limitReached: truncated.taskAgentActions || truncated.allLands || goalAsksTruncated || goalRunsTruncated, unreadableStores };
+  // A supplied reader overrides only its own source. The ordinary CLI always reads both physical ledgers.
+  try {
+    input.implementCardRuns = goalReaders.coverImplementCardRuns
+      ? goalReaders.coverImplementCardRuns()
+      : readImplementCardBindings(goalReaders.taskStatePath ?? taskStatePathDefault());
+  } catch { input.implementCardRuns = null; }
+  try {
+    input.implementRunMerges = goalReaders.coverImplementRunMerges
+      ? goalReaders.coverImplementRunMerges()
+      : input.implementCardRuns === null
+        ? null
+        : readImplementRunMerges(
+          input.implementCardRuns,
+          implementLedgerDirectories(goalReaders.taskStatePath ?? taskStatePathDefault(), goalReaders.coverIncludeTest === true),
+          window,
+        );
+  } catch { input.implementRunMerges = null; }
+  const orders = orderRead && !orderRead.limitReached ? coverEvents(orderRead.rows, 'task-agent.land-order', 'appended', (data) =>
+    Number.isSafeInteger(data.pr) ? { pr: data.pr as number } : null) : null;
+  const landSignals: CoverLandSignals = {
+    liveMoveEvents: moves?.length ?? null,
+    executedLiveMoves: moves?.filter((move) => move.executed).length ?? null,
+    landOrderEvents: orders?.length ?? null,
+  };
+  return { rows: measureTaskAgentCover(input), sevenVerbs: measureSevenVerbLive(input), landSignals,
+    limitReached: truncated.taskAgentActions || truncated.allLands || moveRead?.limitReached === true || orderRead?.limitReached === true || goalAsksTruncated || goalRunsTruncated, unreadableStores };
 }
 
 export function registerTasksCommands(program: Command, deps: TasksCliDeps = {}): void {
@@ -590,6 +777,83 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
   };
   const tasks = program.command('tasks').alias('task').description('TOX 태스크 조회 및 승인 · TASK-AGENT 과제 넘기기(hand)');
 
+  tasks.command('green-sweep')
+    .description('병합된 과제 PR 과 칸 근거를 대조해 green/기록만/건너뜀을 미리 본다 (항상 dry-run)')
+    .requiredOption('--version <version>', '조회할 체크리스트 판')
+    .option('--cell <id>', '한 칸만 조회')
+    .option('--traffic <path>', '실물 green 판정에는 traffic.json 필수 — 빠지거나 못 읽으면 hold 불명으로 보수 판정')
+    .option('--json', 'JSON 출력')
+    .action((opts: { version: string; cell?: string; traffic?: string; json?: boolean }) => {
+      try {
+        validateVersion(opts.version);
+        const snapshot = listChecklist(opts.version);
+        const cards = Object.values(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(deps.taskStatePath ?? taskStatePathDefault()).tasks ?? {});
+        let holds: Set<string> | null = null;
+        if (opts.traffic) {
+          try {
+            const traffic: unknown = JSON.parse(readFileSync(opts.traffic, 'utf8'));
+            if (traffic && typeof traffic === 'object' && !Array.isArray(traffic)
+              && Array.isArray((traffic as { hold?: unknown }).hold)
+              && (traffic as { hold: unknown[] }).hold.every((id) => typeof id === 'string'))
+              holds = new Set((traffic as { hold: string[] }).hold);
+          } catch { /* unknown is not an empty hold set */ }
+        }
+        const prCache = new Map<number, GreenSweepPr | null>();
+        const ambiguousPrs = ambiguousGreenSweepPrs(snapshot.items, opts.version, cards);
+        const origin = spawnSync('git', ['remote', 'get-url', 'origin'],
+          { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000 });
+        const originRepo = origin.status === 0
+          ? /github\.com[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?$/i.exec(origin.stdout.trim())?.[1]?.toLowerCase() : undefined;
+        const localMain = spawnSync('git', ['rev-parse', 'origin/main'],
+          { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000 });
+        const remoteMain = spawnSync('git', ['ls-remote', 'origin', 'refs/heads/main'],
+          { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000 });
+        const localMainSha = localMain.status === 0 ? localMain.stdout.trim() : '';
+        const remoteMainSha = remoteMain.status === 0 ? remoteMain.stdout.trim().split(/\s+/)[0] : '';
+        const mainFresh = /^[a-f0-9]{40}$/i.test(localMainSha) && localMainSha === remoteMainSha;
+        if (opts.cell && !snapshot.items.some((item) => item.id === opts.cell)) throw new Error(`없는 칸: ${opts.cell}`);
+        const decisions = snapshot.items.filter((item) => !opts.cell || item.id === opts.cell).flatMap((item) => {
+          const candidates = greenSweepCandidates(item, opts.version, cards);
+          return candidates.map((candidate) => {
+            let pr = prCache.get(candidate.pr);
+            if (pr === undefined) {
+              const view = spawnSync('gh', ['pr', 'view', String(candidate.pr), '--json', 'number,state,mergeCommit,url'],
+                { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000 });
+              try {
+                if (view.status !== 0) throw new Error('gh failed');
+                const parsed = JSON.parse(view.stdout) as { number?: number; state?: string; mergeCommit?: { oid?: string }; url?: string };
+                pr = parsed.number === candidate.pr && typeof parsed.state === 'string'
+                  ? { number: candidate.pr, state: parsed.state, mergeSha: parsed.mergeCommit?.oid, url: parsed.url } : null;
+              } catch { pr = null; }
+              prCache.set(candidate.pr, pr);
+            }
+            const sha = pr?.mergeSha;
+            const prRepo = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/\d+(?:\/|$)/i.exec(pr?.url ?? '')?.[1]?.toLowerCase();
+            const repositoryMatches = originRepo && prRepo ? originRepo === prRepo : null;
+            const ancestor = !mainFresh || !sha || !/^[a-f0-9]{40}$/i.test(sha) ? null : (() => {
+              const check = spawnSync('git', ['merge-base', '--is-ancestor', sha, 'origin/main'],
+                { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000 });
+              return check.status === 0 ? true : check.status === 1 ? false : null;
+            })();
+            const decision = decideGreenSweep({ item, candidate, candidateCount: candidates.length,
+              pr: pr ?? null, ancestor, hold: holds === null ? null : holds.has(item.id), repositoryMatches,
+              ambiguousAcrossCells: ambiguousPrs.has(candidate.pr) });
+            observeGreenSweep(decision);
+            return decision;
+          });
+        });
+        const counts = { candidate: decisions.length, green: decisions.filter((d) => d.verdict === 'green').length,
+          recordOnly: decisions.filter((d) => d.verdict === 'record-only').length,
+          skipped: decisions.filter((d) => d.verdict === 'skip').length };
+        if (opts.json) out(JSON.stringify({ dryRun: true, version: opts.version, counts, decisions }));
+        else {
+          out(`dry-run · ${opts.version} · 후보 ${counts.candidate} · green ${counts.green} · 기록만 ${counts.recordOnly} · 건너뜀 ${counts.skipped}`);
+          for (const d of decisions) out(`${d.verdict}\t${d.cell}\t#${d.pr}\t${d.mergeSha ?? '-'}\t${d.reason}\t${d.evidence}\tbefore=${JSON.stringify(d.existingEvidence)}\tafter=${JSON.stringify(d.plannedEvidence)}`);
+          if (holds === null) out('⚠ hold 원장을 읽지 못해 green 없이 기록만 판정');
+        }
+      } catch (error) { out(`green-sweep 조회 실패: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+    });
+
   tasks.command('cover')
     .description('TASK-AGENT 가 대신한 착지 비율과 리뷰·재발사·green 의 아직 없는 분모를 조회(읽기 전용)')
     .option('--since <iso>', '시작 시각 (ISO)')
@@ -597,7 +861,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .option('--json', 'JSON 출력')
     .option('--lines', '동사별 한 줄 요약 출력 (읽기 전용)')
     .option('--by-card', 'review·retry·green 분모를 카드 원장(창 안 createdAt 카드 수)으로 센다 (읽기 전용)')
-    .action(async (opts: { since?: string; until?: string; json?: boolean; lines?: boolean; byCard?: boolean }) => {
+    .option('--include-test', '시험 우주 logs.db 도 운영 우주와 합산(기본은 운영만)')
+    .action(async (opts: { since?: string; until?: string; json?: boolean; lines?: boolean; byCard?: boolean; includeTest?: boolean }) => {
       const parseIso = (value: string | undefined, flag: string): number | undefined => {
         if (value === undefined) return undefined;
         const time = Date.parse(value);
@@ -617,18 +882,23 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           }
           taskCards = coverCardsInWindow(cards, { sinceMs, untilMs });
         }
-        const { rows, sevenVerbs, limitReached, unreadableStores } = readTaskAgentCover({ sinceMs, untilMs }, deps.coverLogs, taskCards, deps);
+        const scopedCoverLogs = (query: LogQuery) => (deps.coverLogs ?? queryCoverLogs)(query, opts.includeTest === true);
+        const { rows, sevenVerbs, landSignals, limitReached, unreadableStores } = readTaskAgentCover(
+          { sinceMs, untilMs }, scopedCoverLogs, taskCards, { ...deps, coverIncludeTest: opts.includeTest === true },
+        );
         const limitWarning = limitReached ? `조회 상한 ${COVER_QUERY_LIMIT} 도달 — 더 오래된 사건이 있을 수 있다(절단된 수를 전체로 읽지 말 것)` : null;
         const storeWarning = unreadableStores > 0 ? `logs.db ${unreadableStores}개를 못 읽었다 — 그 우주의 사건은 수에 없다(«없다»로 읽지 말 것)` : null;
-        if (opts.json) out(JSON.stringify({ rows, sevenVerbs, limitReached, unreadableStores, ...(limitWarning ? { warning: limitWarning } : {}), ...(storeWarning ? { storeWarning } : {}) }));
+        if (opts.json) out(JSON.stringify({ rows, sevenVerbs, landSignals, limitReached, unreadableStores, ...(limitWarning ? { warning: limitWarning } : {}), ...(storeWarning ? { storeWarning } : {}) }));
         else {
           if (opts.lines) {
             for (const row of rows) out(formatTaskAgentCover(row));
             out(formatSevenVerbLive(sevenVerbs));
+            out(formatCoverLandSignals(landSignals));
           }
           else {
             out('동사\t대신\t전체\t비율\t상태\t관측 사건');
             for (const row of rows) out(`${row.verb}\t${row.byTaskAgent ?? '-'}\t${row.total ?? '-'}\t${row.ratio ?? '-'}\t${row.state}\t${row.observedActions ?? '-'}`);
+            out(formatCoverLandSignals(landSignals));
           }
           if (limitWarning) out(`⚠ ${limitWarning}`);
           if (storeWarning) out(`⚠ ${storeWarning}`);
@@ -820,6 +1090,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           ...(opts.childLlm !== undefined ? { childLlm: opts.childLlm } : {}),
           ...(opts.childLlmEffort !== undefined ? { childLlmEffort: opts.childLlmEffort } : {}),
           ...(deps.taskStatePath ? { statePath: deps.taskStatePath } : {}),
+          ...(deps.taskCompositionRoot ? { compositionRoot: deps.taskCompositionRoot } : {}),
           launcher: deps.taskLauncher ?? defaultTaskLauncher,
         });
         if (opts.json) out(JSON.stringify(result));
@@ -933,6 +1204,74 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
       out(`하니스 부모 ${report.scanned} · 나이 ≥ ${hours}h 중 낡음 후보 ${report.rows.length}${report.podRunsMeasured ? '' : ' · ⚠ Pod 목록 못 잼(원장 근거만)'} — 읽기 전용(죽이지 않는다)`);
       out('pid\t나이h\t자리\t판\t런\t사유');
       for (const row of report.rows) out([row.pid, row.ageHours, row.seat ?? '-', row.version ?? '-', row.runId ?? '-', row.reasons.join(',')].join('\t'));
+    });
+
+  tasks.command('adopt-pr <number>')
+    .description('기존 OPEN/main PR을 TA 카드에 묶고 다음 tasks rejudge 대상에 넣는다(구현 발사 0)')
+    .option('--card <id>', '기존 launched 카드(미바인딩 또는 같은 PR이 등록부에서 바인딩됨)')
+    .option('--checklist <id>', '새 카드에 붙일 체크리스트 칸')
+    .option('--version <version>', '체크리스트 판(기존 카드에도 고정 가능)')
+    .option('--unlinked-terminal', '기존 카드의 모든 구현 자식이 종결되고 PR 사건이 전혀 없을 때만 별도로 열린 PR을 명시적으로 입양')
+    .option('--json', 'JSON 출력')
+    .action(async (value: string, opts: { card?: string; checklist?: string; version?: string; unlinkedTerminal?: boolean; json?: boolean }) => {
+      await registerTaskAgentSink(deps.registerSink);
+      try {
+        if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error(`PR 번호가 아니다: ${value}`);
+        if ((opts.card === undefined) === (opts.checklist === undefined))
+          throw new Error('--card 또는 --checklist [--version] 중 하나만 준다');
+        if (opts.unlinkedTerminal && !opts.card) throw new Error('--unlinked-terminal은 --card와 함께 준다');
+        if (opts.version) validateVersion(opts.version);
+        let cardVersion = opts.version;
+        let observedChecklist: { id: string; version: string; status: string; cardVersion?: string } | undefined;
+        if (opts.card) {
+          const current = readTaskCard(opts.card, deps.taskStatePath ?? taskStatePathDefault());
+          if (!current?.checklistId) throw new Error(`카드 ${opts.card}의 칸이 없다`);
+          const versions = opts.version ? [opts.version] : [...new Set([checklistDevVersion(), ...(deps.releaseVersions?.() ?? assignedVersions())])];
+          const matches = versions.filter((version) => {
+            try { return (deps.adoptChecklist ?? listChecklist)(version).items.some((item) => item.id === current.checklistId); }
+            catch (error) { if (opts.version) throw error; return false; }
+          });
+          if (matches.length !== 1) throw new Error(matches.length ? `칸 ${current.checklistId}가 여러 판에 있다 — --version 지정: ${matches.join(', ')}` : `체크리스트 칸 없음: ${current.checklistId}`);
+          cardVersion = matches[0]!;
+          const item = (deps.adoptChecklist ?? listChecklist)(cardVersion).items.find((candidate) => candidate.id === current.checklistId)!;
+          if (item.status === 'green' || item.status === 'done') throw new Error(`이미 완료된 칸은 새 PR 입양 대상이 아니다: ${cardVersion}/${item.id}`);
+          observedChecklist = { id: item.id, version: cardVersion, status: item.status, cardVersion: current.checklistVersion };
+        }
+        let checklist: { version: string; id: string; title: string; status: string } | undefined;
+        if (opts.checklist) {
+          const versions = opts.version ? [opts.version] : [...new Set([checklistDevVersion(), ...(deps.releaseVersions?.() ?? assignedVersions())])];
+          const matches = versions.flatMap((version) => {
+            try { return (deps.adoptChecklist ?? listChecklist)(version).items.filter((item) => item.id === opts.checklist).map((item) => ({ version, id: item.id, title: item.title, status: item.status })); }
+            catch (error) { if (opts.version) throw error; return []; }
+          });
+          if (matches.length !== 1) throw new Error(matches.length ? `칸 ${opts.checklist}가 여러 판에 있다 — --version 지정: ${matches.map((item) => item.version).join(', ')}` : `체크리스트 칸 없음: ${opts.checklist}`);
+          checklist = matches[0];
+        }
+        const number = Number(value);
+        const origin = execFileSync('git', ['remote', 'get-url', 'origin'], { cwd: process.cwd(), encoding: 'utf8' }).trim().replace(/\.git\/?$/, '');
+        const repo = origin.match(/^(?:git@github\.com:|https:\/\/github\.com\/|ssh:\/\/git@github\.com\/)([^/\s]+\/[^/\s]+)\/?$/)?.[1];
+        if (!repo) throw new Error(`현재 worktree origin이 GitHub 저장소가 아니다: ${origin}`);
+        const view = (deps.adoptPrView ?? ((pr: number, cwd: string) => JSON.parse(execFileSync('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'number,url,state,baseRefName,headRefOid'], { cwd, encoding: 'utf8' }))))(number, process.cwd());
+        if (view.number !== number) throw new Error(`조회 PR 번호가 다르다: 요청 #${number} · 응답 #${view.number}`);
+        const { adoptExistingPr, adoptedRunTerminal } = await import('../task-agent/adopt-pr.js');
+        const targetCard = opts.card ? readTaskCard(opts.card, deps.taskStatePath ?? taskStatePathDefault()) : undefined;
+        const checkRun = deps.adoptRunTerminal ?? adoptedRunTerminal;
+        const linkedEvidence = targetCard ? checkRun(targetCard, view) : undefined;
+        const terminalRunEvidence = linkedEvidence || (opts.unlinkedTerminal && targetCard ? checkRun(targetCard, view, undefined, true) : false);
+        const unlinkedTerminalUsed = opts.unlinkedTerminal === true && linkedEvidence !== true;
+        const chosen = observedChecklist ?? checklist;
+        const result = adoptExistingPr({ pr: view, repo, statePath: deps.taskStatePath ?? taskStatePathDefault(),
+          ...(opts.card ? { cardId: opts.card, version: cardVersion, terminalRunEvidence, unlinkedTerminal: unlinkedTerminalUsed, observedChecklist,
+            observedRun: { runId: targetCard?.runId, runChildId: targetCard?.runChildId, parentHost: targetCard?.parentHost?.host, launchId: targetCard?.launchId } } : {}),
+          ...(chosen ? { checklistAtWrite: () => (deps.adoptChecklist ?? listChecklist)(chosen.version).items.find((item) => item.id === chosen.id) } : {}),
+          ...(checklist ? { checklist } : {}) });
+        try { debug.log('task-agent', 'pr-adopted', { card: result.card.id, pr: number, head: view.headRefOid, created: result.created, changed: result.changed, launched: false }); } catch { /* fail-soft */ }
+        if (opts.json) out(JSON.stringify({ card: result.card.id, pr: number, head: view.headRefOid, created: result.created, changed: result.changed, next: `tasks rejudge ${result.card.id}` }));
+        else out(`${result.card.id}\tPR #${number}\t${result.changed ? 'adopted' : 'already-adopted'}\t구현 발사 0 · 다음: tasks rejudge ${result.card.id}`);
+      } catch (error) {
+        out(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      }
     });
 
   tasks.command('adopt-runs')
@@ -1151,7 +1490,15 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
       const { rejudgeCandidates, rejudgeCardOnHead } = await import('../task-agent/rejudge-on-head.js');
       const statePath = deps.taskStatePath ?? taskStatePathDefault();
       let ids: string[];
-      try { ids = id ? [id] : rejudgeCandidates(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {}); } catch (error) {
+      try {
+        if (!id) {
+          const { bindMirroredRemoteRejudgeCards } = await import('../task-agent/remote-rejudge-bind.js');
+          const cards = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {};
+          const binding = await bindMirroredRemoteRejudgeCards(cards, statePath);
+          try { debug.log('task-agent', 'remote-rejudge-bind', binding); } catch { /* fail-soft */ }
+        }
+        ids = id ? [id] : rejudgeCandidates(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {});
+      } catch (error) {
         out(error instanceof Error ? error.message : '과제 카드 읽기 실패'); process.exitCode = 1; return;
       }
       const { configuredTaskAgentLiveMoves } = await import('../task-agent/live-moves.js');
@@ -1204,6 +1551,26 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         }
       }
       if (!result.passed) process.exitCode = 1;
+    });
+
+  tasks.command('repair-run', { hidden: true })
+    .description('TA-REPAIR-SAME-BRANCH 내부 — source PR 머리에서 commit-only Pod 수리를 실행하고 결과를 파일로 남긴다')
+    .requiredOption('--card <id>').requiredOption('--pr <n>').requiredOption('--head <sha>')
+    .requiredOption('--repo <root>').requiredOption('--out <path>').requiredOption('--goal-file <path>')
+    .requiredOption('--run-id <id>').requiredOption('--model-provider <provider>').requiredOption('--model-id <id>')
+    .option('--seat <seat>')
+    .action(async (opts: { card: string; pr: string; head: string; repo: string; out: string; goalFile: string;
+      runId: string; modelProvider: string; modelId: string; seat?: string }) => {
+      const { readFileSync } = await import('node:fs');
+      const { getElanousConfigDirOverride } = await import('../elanous-config-dir.js');
+      const { effectiveInstanceRoot } = await import('../instance/resolve.js');
+      const { runRepairWorker } = await import('../task-agent/repair-worker.js');
+      const result = await runRepairWorker({ card: opts.card, pr: Number(opts.pr), head: opts.head,
+        repo: opts.repo, resultPath: opts.out, entry: ELANOUS_CLI_ENTRY,
+        configDir: getElanousConfigDirOverride() ?? effectiveInstanceRoot(), runId: opts.runId,
+        model: { provider: opts.modelProvider, model: opts.modelId }, seat: opts.seat,
+        goal: readFileSync(opts.goalFile, 'utf8') });
+      if (!result.ok) process.exitCode = 1;
     });
 
   tasks.command('approve <id...>')

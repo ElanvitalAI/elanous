@@ -1,7 +1,10 @@
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, spyOn } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import * as llm from '../llm.js';
+import { debug } from '../debug/log.js';
+import { setUserConfigOverlay } from '../user-config.js';
 import { runAgentMission, codexBackend } from './driver.js';
 import { installPluginInsideAgent, parsePluginRef, type PluginDeps } from './in-agent-plugin.js';
 import { runAgentMissionCliCommand } from './mission-cli.js';
@@ -192,6 +195,26 @@ describe('agent UI plugin installation', () => {
     f.deps.brain = async () => 'enter';
     expect(await installPluginInsideAgent(req, f.pty, f.deps)).toEqual({ outcome: 'escalate', reason: 'wrong-target' });
     expect(f.keys).toEqual(['/plugins\r']);
+  });
+
+  test('default brain resolves classify role llm and pins usageRole on streamLLM', async () => {
+    const stream = spyOn(llm, 'streamLLM').mockResolvedValue('unknown');
+    const rolePinEvents: unknown[] = [];
+    const stopCapture = debug.registerSink({
+      name: 'in-agent-plugin-role-pin-test',
+      emit: record => {
+        if (record.category === 'llm.role-pin' && record.event === 'resolved') rolePinEvents.push(record.data);
+      },
+    });
+    try {
+      setUserConfigOverlay(config => ({ ...config, roleLlm: { ...config.roleLlm, classify: { provider: 'gemini', model: 'plugin-brain-fixture' } } }));
+      const f = fixture([ready, 'Browse plugins\n> other@elanous-test']);
+      delete f.deps.brain;
+      expect(await installPluginInsideAgent(req, f.pty, f.deps)).toEqual({ outcome: 'escalate', reason: 'unknown-menu' });
+      expect(stream.mock.calls[0]?.[2]).toMatchObject({ model: 'plugin-brain-fixture', provider: llm.PROVIDERS.gemini, usageRole: 'classify', maxTokens: 20 });
+      expect(rolePinEvents[0])
+        .toMatchObject({ site: 'in-agent-plugin', role: 'classify', model: 'plugin-brain-fixture', provider: 'gemini', source: 'config-role' });
+    } finally { stopCapture(); stream.mockRestore(); setUserConfigOverlay(null); }
   });
 
   test('rechecks a changed confirmation screen: another selected plugin marked Not installed never gets Enter', async () => {

@@ -116,11 +116,28 @@ test('release-path and landing cap raise cards without landing', async () => {
   const release = fake(undefined, ['elanous:release-path']);
   await executeNextAction({ ...action, kind: 'land' }, release.deps);
   expect(release.calls.map(c => c.slice(0, 2))).toEqual([['gh', 'pr'], ['decisions', 'raise']]);
+  const both = fake(undefined, ['elanous:keep', 'elanous:release-path']);
+  expect(await executeNextAction({ ...action, kind: 'land' }, both.deps)).toBe('decision');
+  expect(both.calls.map(c => c.slice(0, 2))).toEqual([['gh', 'pr'], ['decisions', 'raise']]);
+  expect(both.events.at(-1)).toMatchObject({ kind: 'land', result: 'decision', reason: 'release-path' });
   const cap = fake();
   cap.deps.landingsToday = 5;
   cap.deps.landingDay = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Seoul' });
   await executeNextAction({ ...action, kind: 'land' }, cap.deps);
   expect(cap.calls.map(c => c.slice(0, 2))).toEqual([['gh', 'pr'], ['decisions', 'raise']]);
+});
+test('keep-only PR raises a grounded decision before any land or landing-slot reservation', async () => {
+  const f = fake(undefined, ['elanous:keep']);
+  let reserved = 0;
+  f.deps.reserveLanding = () => { reserved++; return true; };
+  expect(await executeNextAction({ ...action, kind: 'land' }, f.deps)).toBe('decision');
+  expect(f.calls.map(c => c.slice(0, 2))).toEqual([['gh', 'pr'], ['decisions', 'raise']]);
+  expect(f.calls.some(c => c[0] === 'pr' && c[1] === 'land')).toBe(false);
+  expect(reserved).toBe(0);
+  const raise = f.calls[1]!;
+  expect(raise[raise.indexOf('--c') + 1]).toBe('elanous:keep');
+  expect(JSON.parse(raise[raise.indexOf('--ref') + 1]!)).toMatchObject({ pr: 42, selected: 'land', reason: 'elanous:keep' });
+  expect(f.events.at(-1)).toMatchObject({ kind: 'land', result: 'decision', reason: 'elanous:keep' });
 });
 test('repeated successful landings count toward daily cap', async () => {
   const f = fake();

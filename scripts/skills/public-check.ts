@@ -17,7 +17,9 @@ export interface PublicCheckReport {
   readonly ok: boolean;
 }
 
-const PERSONAL_OR_INTERNAL = /\/Users\/|~\/source(?:\/|\b)|\b(?:INTERNAL_ONLY|ELANOUS_INTERNAL|PRIVATE_INTERNAL|internal-only)\b|@internal\b|내부\s*전용/iu;
+// 개인 경로(`/Users/`·`~/source`)는 대소문자를 가리고, 내부 표지는 기존처럼 `iu`.
+const PERSONAL_PATH = /\/Users\/|~\/source(?:\/|\b)/u;
+const INTERNAL_MARKER = /\b(?:INTERNAL_ONLY|ELANOUS_INTERNAL|PRIVATE_INTERNAL|internal-only)\b|@internal\b|내부\s*전용/iu;
 const EXECUTABLE = /\.(?:ts|tsx|js|mjs|cjs|py|sh|bash)$/iu;
 const ENTRY_DIR = /^(?:scripts|src|bin)\//u;
 const NON_ENTRY = /(?:\.d\.ts|\.(?:test|spec)\.[^.]+)$/iu;
@@ -165,7 +167,8 @@ export function checkPublicSkills(root: string, boundary: SkillBoundaryReport = 
       const bytes = readFileSync(file);
       if (bytes.includes(0)) continue;
       try {
-        if (PERSONAL_OR_INTERNAL.test(new TextDecoder('utf-8', { fatal: true }).decode(bytes))) matches.push(relative(root, file));
+        const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        if (PERSONAL_PATH.test(decoded) || INTERNAL_MARKER.test(decoded)) matches.push(relative(root, file));
       } catch {
         // Binary assets are not text; extensionless and dotfiles are checked when decodable.
       }

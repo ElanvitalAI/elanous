@@ -15,8 +15,8 @@ import { extname, join, relative, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
 import { readTaskAgentState, readTaskCard, taskAgentStatePath, TASK_CARD_PREFIX, type CompletionKind, type TaskCard } from './task-hand.js';
 import type { SupervisorJobResult, SupervisorStopReason } from '../self-dev/run-supervisor.js';
-import { executeNextAction, type DeliveryKind, type NextAction } from './actions.js';
-import { judgeNextMove, type TaskJudgeInput, type TaskJudgement } from './judge.js';
+import { executeNextAction, type ActionDeps, type DeliveryKind, type NextAction } from './actions.js';
+import { judgeNextMove, LIVE_RETRY_MOVES, type TaskJudgeInput, type TaskJudgement } from './judge.js';
 import { HARNESS_RUN_ID_ENV } from '../harness/harness-space.js';
 import { appendRunLedgerEntry, loadRunLedger } from '../self-implement/run-ledger.js';
 import { collectWiringEvidence, readCardRunSnapshot, type WiringEvidenceDeps, type CardRunEvidenceDeps } from './card-evidence.js';
@@ -57,8 +57,10 @@ export interface TaskAgentShadowMove {
 
 export interface TaskAgentShadowDeps {
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
-  /** 시험용 — shadow 실행부가 명령을 부르면 여기로 온다(정상이면 0회). */
-  command?: (args: string[]) => Promise<{ status: number; stdout: string; stderr?: string }>;
+  /** 재발사 live 실행부 명령(주입되지 않으면 shadow). */
+  command?: ActionDeps['command'];
+  /** 재발사 live 부하 관문(주입되지 않으면 shadow). */
+  loadGate?: ActionDeps['loadGate'];
   readCard?: (taskId: string) => TaskCard | undefined;
   /** Explicit live invocation only; supervisor's default hook always uses shadow. */
   mode?: 'shadow' | 'live';
@@ -265,6 +267,9 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
       : { move: 'wait', stage: 'waiting', reason: '전달 후보 없음' }
     : judgeNextMove(judgeInput);
   if (cardLookupFailed) judgement.reason = `${judgement.reason} · 종결 종류 미확인(카드 조회 실패)`;
+  // 판단마다 해석한다 — 허용되지 않은 수를 판단할 때도 모르는 항목 경고가 남게.
+  const liveMoves = deps.liveMoves ?? await configuredTaskAgentLiveMoves();
+  const retryLaunches = { count: 0 };
   let executorResult: string | null = null;
   let wouldDo: string | null = null;
   if (judgement.executorKind) {
@@ -279,10 +284,13 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
       checklistId: delivery ? card?.checklistId ?? '' : '',
       ...(delivery ? { delivery } : {}),
     };
+    const liveRetry = !delivery && deps.command !== undefined && deps.loadGate !== undefined
+      && (LIVE_RETRY_MOVES as readonly string[]).includes(judgement.move) && liveMoves.has(judgement.move as TaskAgentLiveMove);
     executorResult = await executeNextAction(action, {
-      mode: delivery ? (deps.mode ?? 'shadow') : 'shadow',
+      mode: delivery ? (deps.mode ?? 'shadow') : liveRetry ? 'live' : 'shadow',
       command: deps.command ?? (async () => { throw new Error('task-agent shadow path must not run commands'); }),
       observe: (_event, data) => { wouldDo = data.reason; },
+      ...(liveRetry ? { liveMoves, retryLaunches, loadGate: deps.loadGate } : {}),
     });
   }
   const move: TaskAgentShadowMove = {
@@ -305,8 +313,6 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
     move.wouldDo = null;
   }
   const liveKind: TaskAgentLiveMove | null = move.move === 'review' || move.move === 'propose-green' || move.move === 'propose-land' || move.move === 'decision-card' ? move.move : null;
-  // 판단마다 해석한다 — 허용되지 않은 수를 판단할 때도 모르는 항목 경고가 남게.
-  const liveMoves = deps.liveMoves ?? await configuredTaskAgentLiveMoves();
   // 카드 id 는 모든 판단 관측에 싣는다(그림자 일치율을 카드로 잇는다) — 읽기 전용 조회.
   // live 수는 «근거 결과»에 묶는다 — PR 수는 그 PR 을 낸 결과의 카드·작업 트리, 전달은 전달한 카드(다중 결과에서 남의 카드에 쓰지 않게).
   const prResult = typeof judgeInput.pr === 'number' ? input.results.find((result) => result.prNumber === judgeInput.pr) : undefined;

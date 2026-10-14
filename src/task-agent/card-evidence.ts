@@ -17,6 +17,7 @@ import { appendRunLedgerEntry, type RunLedgerEntry } from '../self-implement/run
 import { cardPrNumber, taskAgentStatePath, updateTaskCard, readTaskCard, type TaskCard } from './task-hand.js';
 import { judgeNextMove, type TaskJudgeInput } from './judge.js';
 import { remoteParentAlive, type SshRunner } from './parent-host.js';
+import { notifyRemoteFailure, remoteFailureReason } from './failure-notify.js';
 
 const GOAL_ID = /^[a-f0-9]{16}$/;
 const PR_URL = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)$/;
@@ -134,6 +135,8 @@ export interface CardRunEvidenceDeps {
   dispatchPod?: (runId: string, sinceIso: string) => boolean;
   runExit?: (runId: string) => RunExit | undefined;
   ssh?: SshRunner;
+  /** Isolated tests can put incident messages in their own mailbox; production uses the resolved default store. */
+  incidentStorePath?: string;
 }
 
 async function defaultLoadLedger(): Promise<(runId: string) => RunLedgerEntry[] | null> {
@@ -145,8 +148,7 @@ async function defaultLoadLedger(): Promise<(runId: string) => RunLedgerEntry[] 
   // HARNESS-PARENT-ON-MSB1: 원격 부모 런의 원장 거울(`tasks show` 가 ssh 로 당긴다) — 이 우주 ⊕ 연합 «뒤»에만 붙는다.
   try {
     const { remoteLedgerMirrorDirs } = await import('./parent-host.js');
-    const { prodInstanceRoot } = await import('../instance/resolve.js');
-    dirs = [...new Set([...dirs, ...remoteLedgerMirrorDirs(prodInstanceRoot())])];
+    dirs = [...new Set([...dirs, ...remoteLedgerMirrorDirs(effectiveInstanceRoot())])];
   } catch { /* 거울이 없으면 종전 그대로 */ }
   return ledgerLoader(dirs, (runId, dir) => loadRunLedger(runId, dir), federationFailure);
 }
@@ -216,16 +218,46 @@ export async function readCardRunSnapshot(card: Pick<TaskCard, 'runId' | 'create
  */
 export async function refreshCardRunBinding(cardId: string, statePath = taskAgentStatePath(), deps: CardRunEvidenceDeps = {}): Promise<{ card: TaskCard | undefined; evidence?: CardRunEvidence }> {
   let card = readTaskCard(cardId, statePath);
-  // 수동 근거(refSource manual)는 덮지 않는다 · 둘 다 차 있으면 다시 읽지 않는다(한 번만) —
-  // 단 «10분 발사 근거 없음»으로 failed 된 카드는 PR·골이 먼저 묶였어도 되살림 판정을 계속 받는다.
+  // 수동 근거(refSource manual)는 아래 바인딩에서 덮지 않는다. 원격 부모의 확정 실패는
+  // 수동 근거가 있어도 읽어야 하므로 여기서 반환하지 않는다.
+  // 둘 다 차 있으면 다시 읽지 않는다(한 번만) — 단 «10분 발사 근거 없음»으로 failed 된 카드는
+  // PR·골이 먼저 묶였어도 되살림 판정을 계속 받는다.
   const awaitingRevival = card?.status === 'failed' && [...card.history].reverse().find((item) => item.event === 'failed')?.detail === LATE_LAUNCH_FAILURE;
-  if (!card?.runId || card.refSource === 'manual' || (card.pr !== undefined && card.goalId !== undefined && !awaitingRevival)) return { card };
+  if (!card?.runId || (card.pr !== undefined && card.goalId !== undefined && !awaitingRevival)) return { card };
   const runId = card.runId;
+  // A stale HQ mirror cannot prove a terminal remote failure. Refresh it here as well as in `tasks show`,
+  // since mission advance and direct callers also reach this function.
+  if (card.parentHost && !deps.loadLedger) {
+    try {
+      const { mirrorRemoteRunLedgers } = await import('./parent-host.js');
+      mirrorRemoteRunLedgers(card.parentHost, runId, effectiveInstanceRoot(), deps.ssh);
+    } catch (error) {
+      try { debug.log('task-agent', 'card-bind-failed', { card: cardId, runId, reason: `remote ledger refresh failed: ${error instanceof Error ? error.message : String(error)}` }); } catch { /* fail-soft */ }
+      return { card };
+    }
+  }
   const snapshot = await readCardRunSnapshot(card, deps);
   if (snapshot.readErrors?.length) {
     try { debug.log('task-agent', 'card-bind-failed', { card: cardId, runId: card.runId, errors: snapshot.readErrors }); } catch { /* fail-soft */ }
   }
   const evidence = bindCardEvidence(card, snapshot);
+  const remoteReason = remoteFailureReason(card, snapshot, evidence, deps.ssh);
+  if (remoteReason && (card.status === 'launched' || card.status === 'failed')) {
+    if (card.status === 'launched') {
+      const at = (deps.now ?? (() => new Date()))().toISOString();
+      card = updateTaskCard(statePath, cardId, (current) => current?.status === 'launched' && current.runId === runId && !current.pr
+        ? { ...current, status: 'failed', history: [...current.history, { at, event: 'failed', detail: `failed/needs-owner — ${remoteReason}`, runId }] }
+        : undefined) ?? card;
+    }
+    // An older generic Pod/no-launch failure may have closed this same run before its supervisor tail arrived.
+    // The terminal evidence still warrants an incident; message provenance keeps retries at one row.
+    const lastFailure = [...card.history].reverse().find((row) => row.event === 'failed');
+    if (card.status === 'failed' && lastFailure?.runId === runId && !card.history.some((row) => row.event === 'closed-by-hand')) {
+      try { notifyRemoteFailure(card, remoteReason, deps.incidentStorePath); }
+      catch (error) { try { debug.log('task-agent', 'failure-notify-failed', { card: cardId, runId, reason: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ } }
+      return { card, evidence };
+    }
+  }
   let revived = false;
   const lastFailure = [...card.history].reverse().find((item) => item.event === 'failed');
   if (card.status === 'failed' && lastFailure?.event === 'failed' && lastFailure.detail === LATE_LAUNCH_FAILURE

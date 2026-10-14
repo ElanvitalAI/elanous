@@ -33,6 +33,12 @@ describe('release-loop TUI node checks', () => {
     expect(checks.find((c) => c.id === 'help-closes')!.pass).toBe(false);
   });
 
+  test('startup Commands guidance remains after Esc without counting as an open overlay', () => {
+    const guidance = '· Commands — /help lists every command';
+    const checks = tuiChecks({ readyMs: 9000, first: `${first}\n${guidance}`, help, afterEsc: `${first}\n${guidance}` });
+    expect(checks.find((c) => c.id === 'help-closes')!.pass).toBe(true);
+  });
+
   test('error text anywhere fails the session', () => {
     const checks = tuiChecks({ readyMs: 9000, first, help: `${help}\nTypeError: x is undefined`, afterEsc: first });
     expect(checks.find((c) => c.id === 'no-error-text')!.pass).toBe(false);

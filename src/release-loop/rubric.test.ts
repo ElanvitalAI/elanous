@@ -8,7 +8,8 @@ import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-di
 import { debug } from '../debug/log.js';
 import { buildUserConfig, resetUserConfig, setUserConfigOverlay } from '../user-config.js';
 import { addItem, listChecklist, setItem } from './checklist.js';
-import { DEFAULT_PROJECT_AXES, parseRubric, readRubricItems, resolveRubricAxes, rubricGrade, rubricPriority, rubricScore, rubricScoreWith } from './rubric.js';
+import { DEFAULT_PROJECT_AXES, parseRubric, readRubricItems, resolveRubricAxes, rubricGrade, rubricPriority, rubricScore, rubricScoreV2, rubricScoreWith, rubricV2FWeight } from './rubric.js';
+import type { RubricV2 } from './rubric.js';
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -20,6 +21,9 @@ afterEach(() => {
 
 const first = '루브릭: A1 E2 R1 D3 M3 B2 S1 X1 (17)';
 const second = '루브릭: A3 E3 R2 D2 M2 B1 S2 X1';
+
+const v2 = (values: Partial<RubricV2> = {}): RubricV2 =>
+  ({ L: 0, U: 0, F: 0, O: 0, R: 0, T: 0, M: 0, Z: 1, X: 0, ...values });
 
 test('제목·근거의 축 순서와 옛 괄호 점수를 구분하고 식 그대로 채점한다', () => {
   const r = parseRubric(first);
@@ -113,6 +117,91 @@ test('등급 경계는 포함 여부까지 정확하다', () => {
   for (const [score, grade] of [[11, 'P1'], [10.5, 'P2'], [8, 'P2'], [7.5, 'P3'], [5, 'P3'], [4.5, 'P4']] as const) {
     expect(rubricGrade(score)).toBe(grade);
   }
+});
+
+test('루브릭 v2 가중은 L·U 2, F w, O·R·T 1.5, M 1 을 식 그대로 더한다', () => {
+  const day = '2026-10-28';
+  expect(rubricScoreV2(v2(), day)).toBe(0);
+  expect(rubricScoreV2(v2({ L: 3 }), day)).toBe(6);
+  expect(rubricScoreV2(v2({ U: 3 }), day)).toBe(6);
+  expect(rubricScoreV2(v2({ F: 3 }), day)).toBe(6);
+  expect(rubricScoreV2(v2({ O: 3 }), day)).toBe(4.5);
+  expect(rubricScoreV2(v2({ R: 3 }), day)).toBe(4.5);
+  expect(rubricScoreV2(v2({ T: 3 }), day)).toBe(4.5);
+  expect(rubricScoreV2(v2({ M: 3 }), day)).toBe(3);
+  expect(rubricScoreV2(v2({ L: 2, U: 1 }), day)).toBe(6);
+  expect(rubricScoreV2(v2({ O: 2, T: 1 }), day)).toBe(4.5);
+  expect(rubricScoreV2(v2({ L: 1.5 }), day)).toBe(3);
+  expect(rubricScoreV2(v2({ L: 3, U: 3, F: 3, O: 3, R: 3, T: 3, M: 3 }), day)).toBe(34.5);
+});
+
+test('Z 나눗셈은 같은 V 를 크기 1·2·4·8 로 나눈다', () => {
+  const values = { L: 2, U: 1, F: 3, O: 2, R: 0, T: 1, M: 3 }; // w=2 치의 V = 19.5
+  expect(rubricScoreV2(v2({ ...values, Z: 1 }), '2026-10-28')).toBe(19.5);
+  expect(rubricScoreV2(v2({ ...values, Z: 2 }), '2026-10-28')).toBe(9.75);
+  expect(rubricScoreV2(v2({ ...values, Z: 4 }), '2026-10-28')).toBe(4.875);
+  expect(rubricScoreV2(v2({ ...values, Z: 8 }), '2026-10-28')).toBe(2.4375);
+});
+
+test('X 차감은 위험 하나에 0.5 씩 뺀다', () => {
+  const values = { L: 2, U: 1, F: 3, O: 2, R: 0, T: 1, M: 3, Z: 2 }; // X 를 빼기 전 9.75
+  expect(rubricScoreV2(v2({ ...values, X: 0 }), '2026-10-28')).toBe(9.75);
+  expect(rubricScoreV2(v2({ ...values, X: 1 }), '2026-10-28')).toBe(9.25);
+  expect(rubricScoreV2(v2({ ...values, X: 2 }), '2026-10-28')).toBe(8.75);
+  expect(rubricScoreV2(v2({ ...values, X: 3 }), '2026-10-28')).toBe(8.25);
+});
+
+test('F 가중은 2026-10-28 당일까지 2, 2026-10-29 부터 1 로 바뀐다', () => {
+  expect(rubricV2FWeight('2026-10-27')).toBe(2);
+  expect(rubricV2FWeight('2026-10-28')).toBe(2);
+  expect(rubricV2FWeight('2026-10-28T23:59:59.999Z')).toBe(2);
+  expect(rubricV2FWeight('2026-10-29T00:00:00.000Z')).toBe(1);
+  expect(rubricV2FWeight('2026-10-29')).toBe(1);
+  expect(rubricV2FWeight('2026-10-30')).toBe(1);
+  expect(rubricV2FWeight('2025-12-31')).toBe(2);
+  expect(rubricV2FWeight('2027-01-01')).toBe(1);
+  expect(rubricV2FWeight('+010000-01-01T00:00:00.000Z')).toBe(1);
+  expect(rubricV2FWeight('+010000-01-01')).toBe(1);
+  expect(rubricV2FWeight('10000-01-01')).toBe(1);
+  expect(rubricScoreV2(v2({ F: 3 }), '10000-01-01')).toBe(3);
+  expect(rubricV2FWeight('2024-02-29')).toBe(2);
+  expect(rubricScoreV2(v2({ F: 3 }), '2026-10-28')).toBe(6);
+  expect(rubricScoreV2(v2({ F: 3 }), '2026-10-29')).toBe(3);
+});
+
+test('잘못된 축·크기·위험·날짜는 명시적으로 거부한다', () => {
+  const day = '2026-10-28';
+  expect(() => rubricScoreV2(null as unknown as RubricV2, day)).toThrow('루브릭 v2 값이 축 객체가 아니다');
+  expect(() => rubricScoreV2([v2()] as unknown as RubricV2, day)).toThrow('루브릭 v2 값이 축 객체가 아니다');
+  expect(() => rubricScoreV2({ ...v2({ F: 3 }), A: 2 } as RubricV2, day)).toThrow('루브릭 v2 알 수 없는 축: A');
+  expect(() => rubricScoreV2({ U: 0, F: 0, O: 0, R: 0, T: 0, M: 0, Z: 1, X: 0 } as RubricV2, day)).toThrow('루브릭 v2 축 L 값이 없다');
+  expect(() => rubricScoreV2(v2({ L: Number.NaN }), day)).toThrow('루브릭 v2 축 L 값이 없다');
+  expect(() => rubricScoreV2(v2({ L: '2' as unknown as number }), day)).toThrow('루브릭 v2 축 L 값이 없다');
+  expect(() => rubricScoreV2(v2({ L: 4 }), day)).toThrow('루브릭 v2 축 L 값이 0~3 밖이다: 4');
+  expect(() => rubricScoreV2(v2({ L: -1 }), day)).toThrow('루브릭 v2 축 L 값이 0~3 밖이다: -1');
+  expect(() => rubricScoreV2(v2({ O: 3.5 }), day)).toThrow('루브릭 v2 축 O 값이 0~3 밖이다: 3.5');
+  expect(() => rubricScoreV2(v2({ Z: 3 }), day)).toThrow('루브릭 v2 크기 Z 값이 1·2·4·8 밖이다: 3');
+  expect(() => rubricScoreV2(v2({ Z: 0 }), day)).toThrow('루브릭 v2 크기 Z 값이 1·2·4·8 밖이다: 0');
+  expect(() => rubricScoreV2(v2({ X: 4 }), day)).toThrow('루브릭 v2 위험 X 값이 0~3 밖이다: 4');
+  expect(() => rubricScoreV2(v2({ X: -0.5 }), day)).toThrow('루브릭 v2 위험 X 값이 0~3 밖이다: -0.5');
+  expect(() => rubricScoreV2(v2({ L: 3 }), 'not-a-date')).toThrow('루브릭 v2 기준 날짜가 잘못되었다: not-a-date');
+  for (const bad of ['2026-02-30', '2026-04-31', '2025-02-29', '2026-00-01', '2026-01-00', '2026-02-30T00:00:00Z']) {
+    expect(() => rubricV2FWeight(bad)).toThrow(`루브릭 v2 기준 날짜가 잘못되었다: ${bad}`);
+  }
+  expect(() => rubricScoreV2(v2({ F: 3 }), '2026-02-30')).toThrow('루브릭 v2 기준 날짜가 잘못되었다: 2026-02-30');
+  expect(() => rubricV2FWeight(new Date('2026-02-30') as unknown as string)).toThrow('루브릭 v2 기준 날짜가 잘못되었다:');
+  expect(() => rubricScoreV2(v2({ F: 3 }), new Date('2026-02-30') as unknown as string)).toThrow('루브릭 v2 기준 날짜가 잘못되었다:');
+  expect(() => rubricScoreV2(v2({ L: 3 }), new Date(Number.NaN) as unknown as string)).toThrow('루브릭 v2 기준 날짜가 잘못되었다: Invalid Date');
+});
+
+test('v1 표면은 v2 추가에 그대로 — v2 줄은 v1 루브릭으로 해석하지 않는다', () => {
+  const v2line = '루브릭v2: L3 U3 F3 O3 R3 T3 M3 Z2 X1';
+  expect(parseRubric(v2line)).toBeNull();
+  expect(parseRubric(`제목 루브릭: A1 E2 R1 D3 M3 B2 S1 X1\n${v2line}`)).toEqual({ A: 1, E: 2, R: 1, D: 3, M: 3, B: 2, S: 1, X: 1 });
+  expect(rubricScore({ A: 3, E: 2, R: 2, D: 3, M: 3, B: 2, S: 3, X: 1 })).toBe(21.5);
+  expect(rubricGrade(12)).toBe('P1');
+  expect(rubricPriority(v2line)).toBe('P2');
+  expect(rubricPriority('본문에는 점수가 없다')).toBe('P2');
 });
 
 test('rubric 명령은 정렬된 표와 JSON을 출력하고 기존 원장 행을 쓰지 않는다', async () => {

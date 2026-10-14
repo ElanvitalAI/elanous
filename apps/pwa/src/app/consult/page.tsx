@@ -48,6 +48,11 @@ export default function ConsultPage() {
     setSending(true);
     setMessage('');
     try {
+      // The PWA form posts to POST /v1/consult-requests — the owner intake
+      // (receipt + JSONL ledger, wired in apps/pwa/src/lib/daemon-client.ts).
+      // The separate public-site POST /v1/consult (src/hooks/consult-intake.ts,
+      // #23437 off by default) queues an { id } instead: a different receiver,
+      // not this form's path.
       const result = await client.submitConsultRequest(request);
       if ('receiptId' in result) {
         setError(false);
@@ -58,7 +63,7 @@ export default function ConsultPage() {
       }
     } catch {
       setError(true);
-      setMessage('접수하지 못했습니다. 연결 상태를 확인하고 다시 보내 주세요.');
+      setMessage('접수하지 못했습니다. 서버 또는 연결 상태를 확인하고 다시 보내 주세요.');
     } finally {
       setSending(false);
     }

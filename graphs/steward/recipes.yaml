@@ -1,3 +1,6 @@
+steward-resync:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/resync-tick.ts"'
+  timeout_ms: 660000
 steward-rejudge:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/rejudge-tick.ts"'
   # The node kills its own `tasks rejudge` child at 600 s; this leaves room for the log line.
@@ -15,3 +18,6 @@ steward-schedule:
 steward-report:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/triage.ts" report'
   timeout_ms: 120000
+steward-release-day:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/release-day.ts"'
+  timeout_ms: 30000

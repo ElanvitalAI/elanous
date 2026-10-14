@@ -1,5 +1,5 @@
 import { withFileLockSync } from '../../storage/file-lock.js';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { CardStore, taskCardsDir, type TaskCard } from '../../task-cards/card-store.js';
 import { Database } from 'bun:sqlite';
@@ -16,6 +16,7 @@ import { placeOnGrid, type GridHost } from './grid-place.js';
 import { checkPodPool, parsePodPool, resolvePodPoolSpec } from '../../task-orchestrator/surfaces/pod-pool.js';
 import { leaseKubectl } from '../../task-orchestrator/surfaces/pod-lease.js';
 import { readTaskAgentState, TASK_SEATS, type HandTaskOptions, type TaskCard as TaskAgentCard, type HandTaskResult, type TaskLauncher, type TaskSeat } from '../../task-agent/task-hand.js';
+import { runCoordinatorInbox } from './inbox.js';
 
 export type Window = '08' | '12' | '18';
 export type Node = 'intake' | 'split' | 'place' | 'delegate' | 'launch' | 'reconcile' | 'report';
@@ -31,6 +32,10 @@ export interface TickState {
   /** The highest degradation actually applied in this run — the report keeps it even if the signal recovers before report. */
   degradationPeak?: { level: 1 | 2; reason: string };
   deferredCells?: Cell[];
+  /** A placement adapter rejected at least one cell; this run cannot claim full completion. */
+  placementFailed?: boolean;
+  /** Last confirmed live placement write in this run, carried across node processes. */
+  boardWrittenAt?: string;
   /** place ran at L2 (skipped) in this run — its unplaced cells are carried even if the board is back by delegate. */
   placeDegraded?: boolean;
   delegatedKeys?: string[];
@@ -67,6 +72,8 @@ export interface TickDeps {
   handToTaskAgentCell?: string;
   handTask?: (opts: HandTaskOptions) => Promise<HandTaskResult>;
   taskLauncher?: TaskLauncher;
+  /** Coordinator inbox seam; the real intake reads and replies on the durable message bus. */
+  coordinatorInbox?: () => { replied: number; acknowledged: number };
 }
 
 /** ORCH-TA-HAND ledger — one row per handed `orch:<card>:<cell>` key so a cell is handed once across ticks and processes. */
@@ -329,6 +336,41 @@ function stateFile(root: string, runId: string): string {
   if (!/^[a-zA-Z0-9._-]+$/.test(runId) || runId === '.' || runId === '..') throw new Error('Invalid orchestrator runId');
   return join(root, 'loop', 'orchestrator', `${runId}.json`);
 }
+/** COORD-HA ③ 진행 하트비트 — the last tick that finished its work and the last confirmed placement write. The guardian watches this
+ * (RFC-loop-agent-map §A8b: «마지막 틱 완료 ⊕ 보드 마지막 쓰기 시각»), not process liveness — a held node keeps pulsing
+ * healthy while this record goes stale, which is exactly the stall it exists to expose. */
+export interface CompletionHeartbeat {
+  runId: string;
+  node: Node;
+  window: Window;
+  mode: Mode;
+  /** last confirmed live placement write; null before the first such write */
+  boardWrittenAt: string | null;
+  /** last fully completed run, or null while only board writes have succeeded */
+  tickCompletedAt: string | null;
+}
+/** Its own subdirectory, so the run-state scanners (`restorePrevious` · `previousDelegations` · `syncQueuedPoolHints`) never parse it as a TickState. */
+function completionHeartbeatPath(root: string): string { return join(root, 'loop', 'orchestrator', 'heartbeat', 'completion.json'); }
+/** COORD-HA ③ — last completed run and board write, independently. Undefined means neither has been recorded. */
+export function readCompletionHeartbeat(root: string): CompletionHeartbeat | undefined {
+  const path = completionHeartbeatPath(root);
+  if (!existsSync(path)) return undefined;
+  try {
+    const { runId, node, window, mode, boardWrittenAt, tickCompletedAt } = JSON.parse(readFileSync(path, 'utf8')) as Partial<CompletionHeartbeat>;
+    if (typeof runId !== 'string' || typeof node !== 'string' || typeof window !== 'string' || typeof mode !== 'string'
+      || (boardWrittenAt !== null && (typeof boardWrittenAt !== 'string' || !Number.isFinite(Date.parse(boardWrittenAt))))
+      || (tickCompletedAt !== null && (typeof tickCompletedAt !== 'string' || !Number.isFinite(Date.parse(tickCompletedAt))))) return undefined;
+    return { runId, node: node as Node, window: window as Window, mode: mode as Mode, boardWrittenAt, tickCompletedAt };
+  } catch { return undefined; }
+}
+/** Temp + rename, so a guardian in another process never reads a torn record. */
+function recordCompletionHeartbeat(root: string, completion: CompletionHeartbeat): void {
+  const path = completionHeartbeatPath(root);
+  mkdirSync(dirname(path), { recursive: true });
+  const temp = `${path}.${process.pid}.tmp`;
+  writeFileSync(temp, JSON.stringify(completion));
+  renameSync(temp, path);
+}
 function restorePrevious(root: string, day: string, mode: Mode): Pick<TickState, 'cards' | 'cells' | 'launched'> | null {
   const dir = join(root, 'loop', 'orchestrator');
   if (!existsSync(dir)) return null;
@@ -430,6 +472,15 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
     try { (deps.observe ?? ((name, payload) => debug.log('loop.orchestrator', name, payload)))(event, data); }
     catch { /* observation must not change the run */ }
   };
+  // A graph node may be replayed with the same runId, and 12/18 skip intake.
+  // Drain the bus on every tick command; the message transaction prevents duplicate answers.
+  if (mode !== 'off') {
+    const inbox = (deps.coordinatorInbox ?? (() => runCoordinatorInbox(undefined, 100, join(root, 'msg', 'messages.db'))))();
+    if (inbox.replied || inbox.acknowledged) {
+      observe('exchange', 'coordinator-inbox-replied', inbox.replied);
+      observe('exchange', 'coordinator-inbox-acknowledged', inbox.acknowledged);
+    }
+  }
   if (mode !== 'off' && activeNode(node, window) && state.nodes[node] !== 'ok') {
     if (node === 'intake') {
       if (mode === 'live' && deps.cards) { state.cards = wishCards(deps.cards()); state.skippedCards = []; }
@@ -495,11 +546,19 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
             if (validVersion(placed?.version)) {
               cell.version = placed.version;
               state.placed++;
+              // The live placer has returned from its board write. A shadow dry run or null result is not a write.
+              if (mode === 'live') state.boardWrittenAt = currentTime().toISOString();
               observe('exchange', mode === 'shadow' ? `would-place:${cell.id}:${cell.version}` : `placed:${cell.id}:${cell.version}`, 1);
-            } else { state.unplaced = (state.unplaced ?? 0) + 1; observe('exchange', 'unplaced-no-release', 1); }
+            } else {
+              state.unplaced = (state.unplaced ?? 0) + 1;
+              if (mode === 'live') state.placementFailed = true;
+              observe('exchange', 'unplaced-no-release', 1);
+            }
           } catch (error) {
             state.unplaced = (state.unplaced ?? 0) + 1;
+            state.placementFailed = true;
             observe('exchange', `unplaced:${cell.id}:${String(error).slice(0, 160)}`, 1);
+            // Preserve the cell-by-cell recovery contract; the run completion record is withheld at report.
           }
         }
       }
@@ -762,8 +821,20 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
     state.nodes[node] = 'skipped';
   }
   observe('tick', state.nodes[node], state.cells.length);
+  if (mode === 'live' && node === 'place' && state.boardWrittenAt) {
+    // A board write can succeed even when a later cell fails. Advance its clock without claiming run completion.
+    const previous = readCompletionHeartbeat(root);
+    recordCompletionHeartbeat(root, previous
+      ? { ...previous, boardWrittenAt: state.boardWrittenAt }
+      : { runId, node, window, mode, boardWrittenAt: state.boardWrittenAt, tickCompletedAt: null });
+  }
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(state));
+  if (mode !== 'off' && node === 'report' && !state.placementFailed && !state.placeDegraded) {
+    // Only the last node can attest that the whole run completed. Carry the most recent confirmed board write.
+    const boardWrittenAt = state.boardWrittenAt ?? readCompletionHeartbeat(root)?.boardWrittenAt ?? null;
+    recordCompletionHeartbeat(root, { runId, node, window, mode, boardWrittenAt, tickCompletedAt: currentTime().toISOString() });
+  }
   return state;
   } catch (error) {
     nodeError = error;
