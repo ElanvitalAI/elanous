@@ -107,6 +107,7 @@ export interface ChatPickerModalBindings {
   maxVisible: number;
   getInputZoneHeight: () => number;
   width: number;
+  getWidth?: () => number;
   onKey?: PickerOnKey;
   onRowClick?: PickerOnRowClick;
 }
@@ -122,6 +123,7 @@ type FramedPickerSpec<T> = {
   maxVisible: number;
   getInputZoneHeight: () => number;
   width: number;
+  getWidth?: () => number;
   onKey?: PickerOnKey;
   onRowClick?: PickerOnRowClick;
 };
@@ -140,7 +142,7 @@ function createFramedPickerModal<T>(spec: FramedPickerSpec<T>): ModalSurface {
     if (visibleCount <= 0) return null;
     const height = visibleCount + 3;
     const row = bottomRow - height + 1;
-    return { row, col: spec.bounds.col, width: spec.width, height, startIdx, visibleCount };
+    return { row, col: spec.bounds.col, width: spec.getWidth?.() ?? spec.width, height, startIdx, visibleCount };
   };
 
   /** Phase 4.5a (substrate Occam · §4-pre.7 · 2026-05-03) — update

@@ -9,11 +9,33 @@ import { dirname, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { CardStore } from '../../task-cards/card-store.js';
 import { buildUserConfig, resetUserConfig } from '../../user-config.js';
-import { nextOrchestratorWindowAt, readCompletionHeartbeat, reconciliation, reportLine, runOrchestratorNode, type Node, type PlacementInput, type TickDeps } from './tick.js';
+import { isLaunchEligible, nextOrchestratorWindowAt, readCompletionHeartbeat, reconciliation, reportLine, runOrchestratorNode, type Node, type PlacementInput, type TickDeps } from './tick.js';
 import { openMsgStore } from '../../msg/msg-store.js';
 import { checkLoopNeighbors, SEAT_NEIGHBORS } from '../neighbor-runtime.js';
 import { handleSeatRequests } from '../../nexus/api/seat-requests.js';
 import { CliUserError } from '../../cli/cli-user-error.js';
+
+describe('isLaunchEligible (dispatch-c decision seam)', () => {
+  const supply = { id: 'C1', title: '칸', owner: 'MK', status: 'yellow' as const };
+  const ready = { nextCell: supply, running: 1, launchCap: 2 };
+
+  test('requires supply, even when capacity is available', () => {
+    expect(isLaunchEligible(ready)).toBe(true);
+    expect(isLaunchEligible({ ...ready, nextCell: null })).toBe(false);
+  });
+
+  test('requires remaining launch capacity at the boundary', () => {
+    expect(isLaunchEligible({ ...ready, running: 2 })).toBe(false);
+    expect(isLaunchEligible({ ...ready, launchCap: 0, running: 0 })).toBe(false);
+    expect(isLaunchEligible({ ...ready, launchCap: 2, running: 1 })).toBe(true);
+  });
+
+  test('skips only blocking reasons, not an earlier empty turn after supply recovers', () => {
+    expect(isLaunchEligible(ready, 'degraded-skip')).toBe(false);
+    expect(isLaunchEligible(ready, 'cap-deferred')).toBe(false);
+    expect(isLaunchEligible(ready, 'skipped-empty')).toBe(true);
+  });
+});
 
 const stages: Node[] = ['intake', 'split', 'place', 'delegate', 'launch', 'reconcile', 'report'];
 const fixture = async (run: (root: string, id: string, logged: Array<{ event: string; reason: string; targetLoopId?: string }>) => Promise<void>) => {

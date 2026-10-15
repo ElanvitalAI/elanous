@@ -45,7 +45,8 @@ export async function groundGoalInCodebase(goalText: string, deps: GroundGoalDep
     );
     const persistentElapsedMs = performance.now() - persistentStartedAt;
     if (!persistent?.files.length) {
-      safeObserve('empty', { cwd: deps.cwd, reason: persistent ? 'no-candidates' : 'failed-or-no-candidates', candidates: 0 });
+      safeObserve('empty', { cwd: deps.cwd, reason: persistent ? 'no-candidates' : 'failed-or-no-candidates',
+        persistentStopReason: persistent?.stopReason ?? null, candidates: 0 });
       return '';
     }
     const renderingStartedAt = performance.now();

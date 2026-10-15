@@ -8,6 +8,27 @@ import { dedupePodRollupRows, parseRollupArgs, renderRollupLine, rollup } from '
 const MODEL = tierModel('balanced', 'openai');
 
 describe('usage-rollup --partial', () => {
+  test('same model keeps distinct observed roles and does not invent an account', () => {
+    const source = (role: string, inputTokens: number) => JSON.stringify({ event: 'llm-usage', data: {
+      site: 'agent-turn', provider: 'openai-codex', model: MODEL, role, inputTokens,
+    } });
+    const rows = rollup([source('implement', 10), source('review', 4)]).rows;
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => [row.role, row.inputTokens])).toEqual([['implement', 10], ['review', 4]]);
+    expect(rows.every((row) => !('account' in row))).toBe(true);
+  });
+
+  test('null or blank tags share the unobserved bucket and are omitted', () => {
+    const data = (tags: Record<string, unknown>) => JSON.stringify({ event: 'llm-usage', data: {
+      site: 'agent-turn', provider: 'openai-codex', model: MODEL, inputTokens: 1, ...tags,
+    } });
+    const rows = rollup([data({ account: null, role: '', stage: ' ' }), data({})]).rows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.calls).toBe(2);
+    expect(rows[0]!.inputTokens).toBe(2);
+    expect(['role', 'stage', 'account'].every((key) => !(key in rows[0]!))).toBe(true);
+  });
+
   test('인자 없으면 전체판 기본 그대로 — since 6h · partial:false · seq 1', () => {
     expect(parseRollupArgs([])).toEqual({ since: '6h', partial: false, seq: 1 });
   });

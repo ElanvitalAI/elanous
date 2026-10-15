@@ -309,11 +309,30 @@ describe('bridgeCoreTurnToAcp — forwarding', () => {
       getMessages: defaultAcpMessagesSeed,
       getTools: () => [],
       dispatchTool: async () => null,
+      resolveModel: () => 'routed-model-x',
     });
     const { ctx, usages } = makeTurnCtx();
     await runTurn(ctx);
     await new Promise((r) => setTimeout(r, 1));
-    expect(usages).toEqual([{ provider: 'anthropic', inputTokens: 10, outputTokens: 4 }]);
+    // 턴 모델(라우팅 결과)을 실어 보낸다 — 대시보드 턴 지표가 설정 모델로 ctx·단가를 잡지 않게.
+    expect(usages).toEqual([{ provider: 'anthropic', model: 'routed-model-x', inputTokens: 10, outputTokens: 4 }]);
+  });
+
+  test('onUsage — 내보내는 쪽이 준 모델이 라우팅 모델보다 이긴다', async () => {
+    runCoreTurnImpl = async (ctx) => {
+      ctx.callbacks?.onUsage?.({ provider: 'openai', model: 'emitter-model', inputTokens: 1 });
+      return { stopReason: 'end_turn', finalText: '' };
+    };
+    const runTurn = bridgeCoreTurnToAcp({
+      getMessages: defaultAcpMessagesSeed,
+      getTools: () => [],
+      dispatchTool: async () => null,
+      resolveModel: () => 'routed-model-x',
+    });
+    const { ctx, usages } = makeTurnCtx();
+    await runTurn(ctx);
+    await new Promise((r) => setTimeout(r, 1));
+    expect(usages).toEqual([{ provider: 'openai', model: 'emitter-model', inputTokens: 1 }]);
   });
 
   test('onTurnComplete forwards to deps hook with sessionId', async () => {
@@ -510,7 +529,8 @@ describe('TUI ACP durable persistence', () => {
       expect(stored?.meta).toMatchObject({ id: session.id, source: 'tui' });
       expect(stored?.messages.map((message) => [message.role, message.content])).toEqual([
         ['user', 'TUI integration prompt'],
-        ['assistant', 'server answer'],
+        // A plain read prompt routes to 읽기·분석, and its route line is part of the turn as on every non-goal route.
+        ['assistant', '라우팅: 읽기·분석\nserver answer'],
       ]);
     } finally {
       await session.close();

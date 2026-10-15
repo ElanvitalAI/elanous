@@ -1,5 +1,5 @@
 import { describe, it, expect, spyOn } from 'bun:test';
-import { enhancePrompt, parseEnhanceJson, extractChecklistFallback, selectEnhanceLlm } from './enhance.js';
+import { enhancePrompt, parseEnhanceJson, extractChecklistFallback, selectEnhanceLlm, selectPlanningLlm } from './enhance.js';
 import { defaultGoalAuthorDeps } from '../self-implement/goal-author.js';
 import { getUserConfig } from '../user-config.js';
 import { tierModel } from '../llm/model-defaults.js';
@@ -37,6 +37,24 @@ describe('enhance — authoring model and effort selection', () => {
     expect(selectEnhanceLlm({ config: configFor({ effort: 'low' }) }, env)).toEqual({ model: 'legacy-review', effort: 'low', modelSource: 'default', effortSource: 'config-role' });
     expect(selectEnhanceLlm({ config: configFor({ model: 'gpt-6-sol', effort: 'medium' }), reasoningEffort: 'low' }, env)).toEqual({ model: 'gpt-6-sol', effort: 'low', modelSource: 'config-role', effortSource: 'opts' });
     expect(selectEnhanceLlm({ config }, { ...env, ELANOUS_PROMPT_ENHANCE_EFFORT: 'invalid' })).toEqual({ model: 'gpt-6-sol', effort: 'medium', modelSource: 'config-role', effortSource: 'config-role' });
+  });
+
+  it('planning selection preserves the host config source across the Pod model relay', () => {
+    const config = configFor({ model: 'gpt-6-sol', effort: 'medium' });
+    expect(selectPlanningLlm({}, config)).toEqual({ model: 'gpt-6-sol', effort: 'medium', modelSource: 'config-role' });
+    expect(selectPlanningLlm({ ELANOUS_PROMPT_ENHANCE_MODEL: 'gpt-6-sol', ELANOUS_PROMPT_ENHANCE_MODEL_RELAY: 'pod', ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE: 'config-role' }, configFor({})))
+      .toEqual({ model: 'gpt-6-sol', effort: 'high', modelSource: 'config-role' });
+    const defaultRelay = { ELANOUS_PROMPT_ENHANCE_MODEL: 'gpt-6-sol', ELANOUS_PROMPT_ENHANCE_MODEL_RELAY: 'pod', ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE: 'default' };
+    expect(selectEnhanceLlm({ config: configFor({}) }, defaultRelay).modelSource).toBe('default');
+    expect(selectPlanningLlm(defaultRelay, configFor({}))).toEqual({ model: 'gpt-6-sol', effort: 'high', modelSource: 'default' });
+    expect(selectPlanningLlm({ ELANOUS_PROMPT_ENHANCE_MODEL: 'gpt-6-sol', ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE: 'config-role' }, configFor({})).modelSource).toBe('env');
+  });
+
+  it('Pod child fallback keeps the provider choice and reason in authoring and grounding selections', () => {
+    const config = configFor({ model: 'gpt-6-sol' });
+    const podEnv = { ELANOUS_PROMPT_ENHANCE_MODEL: 'openrouter/z-ai/glm-5.3', ELANOUS_PROMPT_ENHANCE_MODEL_RELAY: 'pod', ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE: 'fallback-child', ELANOUS_PROMPT_ENHANCE_MODEL_FALLBACK_REASON: 'quota-exhausted', ELANOUS_PROMPT_ENHANCE_REQUESTED_MODEL: 'gpt-6-sol', ELANOUS_PROMPT_ENHANCE_REQUESTED_SOURCE: 'config-role' };
+    expect(selectEnhanceLlm({ config }, podEnv).modelSource).toBe('fallback-child');
+    expect(selectPlanningLlm(podEnv, config)).toEqual({ model: 'openrouter/z-ai/glm-5.3', effort: 'high', modelSource: 'fallback-child', fallbackReason: 'quota-exhausted', requestedModel: 'gpt-6-sol', requestedSource: 'config-role' });
   });
 
   it('the disabled path calls no LLM and records no model selection', async () => {

@@ -4,7 +4,7 @@ import type { ChatMainInputSession } from './chat-main-session.js';
 
 export type ChatMainTextInputBaseOpts = Omit<
   Parameters<typeof textInput>[0],
-  'row' | 'getRow' | 'col' | 'width' | 'prompt' | 'maxLines' | 'initialText' | 'history' | 'onPaintChrome' | 'shouldPaint' | 'placeholder' | 'preferHistoryArrowKeys'
+  'row' | 'getRow' | 'col' | 'width' | 'getWidth' | 'prompt' | 'maxLines' | 'initialText' | 'history' | 'onPaintChrome' | 'shouldPaint' | 'placeholder' | 'preferHistoryArrowKeys'
 >;
 
 export interface RunChatMainInputTurnDeps {
@@ -24,6 +24,7 @@ export function buildChatMainTextInputRequest(
     getRow: deps.session.getInputRow,
     col: 1,
     width: deps.session.inputWidth,
+    getWidth: deps.session.getInputWidth,
     prompt: '\u276f ',
     maxLines: 8,
     onPaintChrome: deps.session.paintChrome,

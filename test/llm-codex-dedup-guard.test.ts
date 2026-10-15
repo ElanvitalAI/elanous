@@ -7,6 +7,9 @@
 // codex did not. Guard activates only for modelFamily === 'codex'.
 
 import { afterEach, describe, expect, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   familyMaxTurnsKey,
   streamLLMWithTools,
@@ -17,12 +20,14 @@ import type { LLMProvider, LLMStreamEvent } from '../src/llm';
 import { __resetSnapshotStore, __resetTurnState } from '../src/undo-turn/index.js';
 import { resetPlanModeState } from '../src/plan-mode/index.js';
 import { setUserConfigOverlay } from '../src/user-config.js';
+import { loadProjectAnchorWithMeta, setGlobalAnchorPathForTest } from '../src/prompt-library/universal-preamble.js';
 
 afterEach(() => {
   __resetSnapshotStore();
   __resetTurnState();
   resetPlanModeState();
   setUserConfigOverlay(null);
+  setGlobalAnchorPathForTest(undefined);
 });
 
 function installFamilyCapsForLoopTest(): void {
@@ -914,14 +919,17 @@ describe('streamLLMWithTools — W4-A: post-Read broad search blocked for codex'
 // system prompt; on-disk Read is pure waste.
 // ─────────────────────────────────────────────────────────────────────────
 describe('streamLLMWithTools — W5-D: Read on AGENTS.md/CLAUDE.md blocked for codex', () => {
-  test('codex Read on AGENTS.md returns ANCHOR READ BLOCKED stub', async () => {
+  test('codex Read on a fenced root AGENTS.md returns ANCHOR READ BLOCKED stub', async () => {
     let toolResultText: unknown = null;
     const provider = scriptedProvider([
       [{ type: 'tool_call', id: 'a', name: 'Read', args: { file_path: 'AGENTS.md', offset: 1, limit: 2600 } }],
       [],
     ]);
     await streamLLMWithTools(
-      [{ role: 'user', content: 'q' }],
+      [
+        { role: 'system', content: '=== Root guide (AGENTS.md) ===\ncomplete\n=== end AGENTS.md ===' },
+        { role: 'user', content: 'q' },
+      ],
       {
         onText: () => {},
         onToolResult: (r) => { toolResultText = r.result; },
@@ -964,7 +972,7 @@ describe('streamLLMWithTools — W5-D: Read on AGENTS.md/CLAUDE.md blocked for c
     expect(String(toolResultText)).toContain('`Root guide` anchor');
   });
 
-  test('codex Read reports an absent anchor without claiming it is already present', async () => {
+  test('codex Read on a CLAUDE.md omitted from the prompt dispatches', async () => {
     let toolResultText: unknown = null;
     const provider = scriptedProvider([
       [{ type: 'tool_call', id: 'a', name: 'Read', args: { file_path: 'CLAUDE.md' } }],
@@ -983,10 +991,7 @@ describe('streamLLMWithTools — W5-D: Read on AGENTS.md/CLAUDE.md blocked for c
         tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }],
       },
     );
-    expect(String(toolResultText)).toContain('ANCHOR READ BLOCKED');
-    expect(String(toolResultText)).toContain('CLAUDE.md');
-    expect(String(toolResultText)).toContain('is not present in the system prompt');
-    expect(String(toolResultText)).not.toContain('ALREADY rendered verbatim');
+    expect(String(toolResultText)).toBe('X');
   });
 
   test('codex Read reports a truncated anchor prefix and unavailable remainder', async () => {
@@ -1016,14 +1021,17 @@ describe('streamLLMWithTools — W5-D: Read on AGENTS.md/CLAUDE.md blocked for c
     expect(String(toolResultText)).toContain('`Root guide` anchor');
   });
 
-  test('codex Read on subdir/AGENTS.md (basename match) also blocked', async () => {
+  test('codex Read on an unfenced subdir/AGENTS.md dispatches despite the root fence', async () => {
     let toolResultText: unknown = null;
     const provider = scriptedProvider([
       [{ type: 'tool_call', id: 'a', name: 'Read', args: { file_path: 'subproject/AGENTS.md' } }],
       [],
     ]);
     await streamLLMWithTools(
-      [{ role: 'user', content: 'q' }],
+      [
+        { role: 'system', content: '=== Root guide (AGENTS.md) ===\ncomplete\n=== end AGENTS.md ===' },
+        { role: 'user', content: 'q' },
+      ],
       {
         onText: () => {},
         onToolResult: (r) => { toolResultText = r.result; },
@@ -1035,7 +1043,243 @@ describe('streamLLMWithTools — W5-D: Read on AGENTS.md/CLAUDE.md blocked for c
         tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }],
       },
     );
+    expect(String(toolResultText)).toBe('X');
+  });
+
+  test('codex Read on ./AGENTS.md resolves to the same fenced root path', async () => {
+    let toolResultText: unknown = null;
+    const provider = scriptedProvider([
+      [{ type: 'tool_call', id: 'a', name: 'Read', args: { file_path: './AGENTS.md' } }],
+      [],
+    ]);
+    await streamLLMWithTools(
+      [
+        { role: 'system', content: '=== Root guide (AGENTS.md) ===\ncomplete\n=== end AGENTS.md ===' },
+        { role: 'user', content: 'q' },
+      ],
+      {
+        onText: () => {},
+        onToolResult: (r) => { toolResultText = r.result; },
+        dispatchTool: async () => 'ACTUAL',
+      },
+      {
+        provider,
+        model: 'gpt-5.4',
+        tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }],
+      },
+    );
     expect(String(toolResultText)).toContain('ANCHOR READ BLOCKED');
+    expect(String(toolResultText)).toContain('full text of `./AGENTS.md` is present');
+    expect(String(toolResultText)).not.toContain('`./AGENTS.md` is not present');
+  });
+
+  test('codex Read on a fenced subdir/AGENTS.md names that path in its stub', async () => {
+    let toolResultText: unknown = null;
+    const provider = scriptedProvider([
+      [{ type: 'tool_call', id: 'a', name: 'Read', args: { file_path: 'release/public/AGENTS.md' } }],
+      [],
+    ]);
+    await streamLLMWithTools(
+      [
+        { role: 'system', content: '=== Subdirectory guide (release/public/AGENTS.md) ===\nsubguide\n=== end release/public/AGENTS.md ===' },
+        { role: 'user', content: 'q' },
+      ],
+      {
+        onText: () => {},
+        onToolResult: (r) => { toolResultText = r.result; },
+        dispatchTool: async () => 'ACTUAL',
+      },
+      {
+        provider,
+        model: 'gpt-5.4',
+        tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }],
+      },
+    );
+    expect(String(toolResultText)).toContain('ANCHOR READ BLOCKED');
+    expect(String(toolResultText)).toContain('full text of `release/public/AGENTS.md` is present');
+    expect(String(toolResultText)).toContain('`Subdirectory guide` anchor');
+  });
+
+  test('same-named root and scoped fences match the requested path, not the first basename', async () => {
+    let toolResultText: unknown = null;
+    const provider = scriptedProvider([
+      [{ type: 'tool_call', id: 'a', name: 'Read', args: { file_path: 'subproject/AGENTS.md' } }],
+      [],
+    ]);
+    await streamLLMWithTools(
+      [
+        { role: 'system', content: '=== Root guide (AGENTS.md) ===\nroot\n=== end AGENTS.md ===\n=== Scoped guide (AGENTS.md @ subproject) ===\nsubguide\n=== end AGENTS.md @ subproject ===' },
+        { role: 'user', content: 'q' },
+      ],
+      {
+        onText: () => {},
+        onToolResult: (r) => { toolResultText = r.result; },
+        dispatchTool: async () => 'ACTUAL',
+      },
+      {
+        provider,
+        model: 'gpt-5.4',
+        tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }],
+      },
+    );
+    expect(String(toolResultText)).toContain('ANCHOR READ BLOCKED');
+    expect(String(toolResultText)).toContain('full text of `subproject/AGENTS.md`');
+    expect(String(toolResultText)).toContain('`Scoped guide` anchor');
+    expect(String(toolResultText)).not.toContain('`Root guide` anchor');
+  });
+
+  test('a truncated scoped fence is reported instead of the complete same-named root fence', async () => {
+    let toolResultText: unknown = null;
+    const provider = scriptedProvider([
+      [{ type: 'tool_call', id: 'a', name: 'Read', args: { file_path: 'subproject/AGENTS.md' } }],
+      [],
+    ]);
+    await streamLLMWithTools(
+      [
+        { role: 'system', content: '=== Root guide (AGENTS.md) ===\ncomplete\n=== end AGENTS.md ===\n=== Scoped guide (AGENTS.md @ subproject) ===\nprefix\n…[truncated to fit anchor budget]\n=== end AGENTS.md @ subproject ===' },
+        { role: 'user', content: 'q' },
+      ],
+      {
+        onText: () => {},
+        onToolResult: (r) => { toolResultText = r.result; },
+        dispatchTool: async () => 'ACTUAL',
+      },
+      {
+        provider,
+        model: 'gpt-5.4',
+        tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }],
+      },
+    );
+    expect(String(toolResultText)).toContain('Only a prefix of `subproject/AGENTS.md` is present');
+    expect(String(toolResultText)).toContain('`Scoped guide` anchor');
+    expect(String(toolResultText)).not.toContain('`Root guide` anchor');
+  });
+
+  test('a scoped opening fence with a legacy scopeless closing fence is still recognized', async () => {
+    let toolResultText: unknown = null;
+    const provider = scriptedProvider([
+      [{ type: 'tool_call', id: 'a', name: 'Read', args: { file_path: 'subproject/AGENTS.md' } }],
+      [],
+    ]);
+    await streamLLMWithTools(
+      [
+        { role: 'system', content: '=== Scoped guide (AGENTS.md @ subproject) ===\nlegacy\n=== end AGENTS.md ===' },
+        { role: 'user', content: 'q' },
+      ],
+      {
+        onText: () => {},
+        onToolResult: (r) => { toolResultText = r.result; },
+        dispatchTool: async () => 'ACTUAL',
+      },
+      {
+        provider,
+        model: 'gpt-5.4',
+        tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }],
+      },
+    );
+    expect(String(toolResultText)).toContain('ANCHOR READ BLOCKED');
+    expect(String(toolResultText)).toContain('full text of `subproject/AGENTS.md`');
+  });
+
+  test('an absolute root path matches the same fence as a relative root path', async () => {
+    let toolResultText: unknown = null;
+    const provider = scriptedProvider([
+      [{ type: 'tool_call', id: 'a', name: 'Read', args: { file_path: `${process.cwd()}/AGENTS.md` } }],
+      [],
+    ]);
+    await streamLLMWithTools(
+      [
+        { role: 'system', content: '=== Root guide (AGENTS.md) ===\nroot\n=== end AGENTS.md ===' },
+        { role: 'user', content: 'q' },
+      ],
+      {
+        onText: () => {},
+        onToolResult: (r) => { toolResultText = r.result; },
+        dispatchTool: async () => 'ACTUAL',
+      },
+      {
+        provider,
+        model: 'gpt-5.4',
+        tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }],
+      },
+    );
+    expect(String(toolResultText)).toContain('ANCHOR READ BLOCKED');
+    expect(String(toolResultText)).toContain(`full text of \`${process.cwd()}/AGENTS.md\``);
+  });
+
+  test('a global anchor fence only blocks the actual universe-root file', async () => {
+    const globalPath = `${process.cwd()}/global/AGENTS.md`;
+    setGlobalAnchorPathForTest(globalPath);
+    let result: unknown = null;
+    const provider = scriptedProvider([
+      [{ type: 'tool_call', id: 'a', name: 'Read', args: { file_path: globalPath } }],
+      [{ type: 'tool_call', id: 'b', name: 'Read', args: { file_path: 'AGENTS.md' } }],
+      [],
+    ]);
+    const results: string[] = [];
+    await streamLLMWithTools(
+      [
+        { role: 'system', content: '=== User-global instructions (AGENTS.md @ instance root) ===\nglobal\n=== end AGENTS.md @ instance root ===' },
+        { role: 'user', content: 'q' },
+      ],
+      {
+        onText: () => {},
+        onToolResult: (r) => { result = r.result; results.push(String(result)); },
+        dispatchTool: async () => 'ACTUAL',
+      },
+      {
+        provider,
+        model: 'gpt-5.4',
+        tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }],
+      },
+    );
+    expect(results[0]).toContain('ANCHOR READ BLOCKED');
+    expect(results[0]).toContain(`full text of \`${globalPath}\``);
+    expect(results[1]).toBe('ACTUAL');
+  });
+
+  test('the real anchor builder fence blocks its scoped path but not a same-named sibling', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-anchor-read-'));
+    const priorCwd = process.cwd();
+    try {
+      mkdirSync(join(root, '.git'));
+      const scoped = join(root, 'subproject');
+      mkdirSync(scoped);
+      writeFileSync(join(root, 'AGENTS.md'), 'root guide');
+      writeFileSync(join(scoped, 'AGENTS.md'), 'scoped guide');
+      setGlobalAnchorPathForTest(null);
+      process.chdir(scoped);
+      const built = loadProjectAnchorWithMeta(scoped);
+      expect(built.content).toContain('AGENTS.md @ ..');
+      expect(built.content).toContain('=== end AGENTS.md ===');
+      const results: string[] = [];
+      const provider = scriptedProvider([
+        [{ type: 'tool_call', id: 'a', name: 'Read', args: { file_path: join(root, 'AGENTS.md') } }],
+        [{ type: 'tool_call', id: 'b', name: 'Read', args: { file_path: join(scoped, 'AGENTS.md') } }],
+        [{ type: 'tool_call', id: 'c', name: 'Read', args: { file_path: join(root, 'other', 'AGENTS.md') } }],
+        [],
+      ]);
+      await streamLLMWithTools(
+        [{ role: 'system', content: built.content! }, { role: 'user', content: 'q' }],
+        {
+          onText: () => {},
+          onToolResult: (r) => { results.push(String(r.result)); },
+          dispatchTool: async () => 'ACTUAL',
+        },
+        {
+          provider,
+          model: 'gpt-5.4',
+          tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }],
+        },
+      );
+      expect(results[0]).toContain('ANCHOR READ BLOCKED');
+      expect(results[1]).toContain('ANCHOR READ BLOCKED');
+      expect(results[1]).toContain(`full text of \`${join(scoped, 'AGENTS.md')}\` is present`);
+      expect(results[2]).toBe('ACTUAL');
+    } finally {
+      process.chdir(priorCwd);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('codex Read on AGENTS-helper.md (NOT exact basename) is NOT blocked', async () => {

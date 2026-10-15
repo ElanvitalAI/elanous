@@ -79,9 +79,14 @@ export type CoreTurnDispatchTool = (
 /** Events the hosting surface (dashboard chat pane, ACP push pipe,
  *  future web/iphone client) cares about. All optional. */
 export interface CoreTurnCallbacks {
+  /** Actual provider and model selected for this turn, including fallback attempts. */
+  onResolvedProvider?(provider: string, model: string): void;
   /** Streaming text delta — `full` is the accumulated text across the
    *  entire turn (not just the current round). */
   onText?(delta: string, full: string): void;
+  /** The final answer came back enriched with a runtime verification
+   *  supplement — forwarded from `StreamWithToolsHandlers.onFinalAnswerSupplement`. */
+  onFinalAnswerSupplement?(info: { answer: string; supplement: string; finalText: string }): void;
   /** Fires just before a tool call is dispatched. */
   onToolCall?(call: CoreToolCall): void;
   /** Fires once the tool call resolves. */
@@ -157,4 +162,6 @@ export interface CoreTurnContext {
 export interface CoreTurnResult {
   stopReason: CoreTurnStopReason;
   finalText: string;
+  /** `auth_rejected` 일 때만 — 공급자 오류 원문(비밀값 가림). 호스트가 처방 줄에 원문을 붙인다. */
+  errorMessage?: string;
 }

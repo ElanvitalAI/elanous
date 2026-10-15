@@ -444,7 +444,12 @@ const INDEX_MAX_LINES = 200;
  */
 export function rebuildIndex(root: string = memoryRoot()): void {
   ensureRoot(root);
-  const entries = listMemories({}, root);
+  writeFileDurable(memoryIndexPath(root), renderMemoryIndex(listMemories({}, root)));
+}
+
+/** The MEMORY.md text for a set of entries — rebuildIndex writes it for the whole store,
+ *  a scoped injection renders it for the entries its filter keeps. */
+export function renderMemoryIndex(entries: readonly MemoryEntry[]): string {
   const byType: Record<MemoryType, MemoryEntry[]> = {
     user: [], feedback: [], project: [], reference: [],
   };
@@ -468,7 +473,7 @@ export function rebuildIndex(root: string = memoryRoot()): void {
     }
     lines.push('');
   }
-  writeFileDurable(memoryIndexPath(root), lines.join('\n'));
+  return lines.join('\n');
 }
 
 /** Read the MEMORY.md index verbatim. Returns '' when missing (e.g.
@@ -512,6 +517,11 @@ export interface InjectOpts {
   minScore?: number;
   /** Always include the MEMORY.md index even if no keyword hits. */
   alwaysIncludeIndex?: boolean;
+  /** Scope filter. When set, only kept entries are injected and the index is rendered from
+   *  them instead of read from MEMORY.md (which lists every entry, other seats' cards included). */
+  filter?: (entry: MemoryEntry) => boolean;
+  /** Inject these bodies like pinned ones (e.g. the current seat's context cards). */
+  alwaysInject?: (entry: MemoryEntry) => boolean;
 }
 
 /** Build the memory-injection block for a user turn. Always prepends
@@ -531,7 +541,9 @@ export function buildMemoryInjection(
   const minScore = opts.minScore ?? 2;
   const alwaysIdx = opts.alwaysIncludeIndex !== false;
 
-  const index = readIndex(root);
+  const filter = opts.filter;
+  const scoped = filter ? listMemories({}, root).filter(m => m.contextCard?.status !== 'retired' && filter(m)) : null;
+  const index = scoped ? (scoped.length > 0 ? renderMemoryIndex(scoped) : '') : readIndex(root);
   if (!index) return { block: '', tokens: 0, injectedIds: [] };
 
   const parts: string[] = [];
@@ -548,7 +560,10 @@ export function buildMemoryInjection(
 
   // 📌 pinned 기억 — 키워드 무관 항상 주입(relevance gate bypass · Letta pinned block /
   //    claude-code MEMORY.md tier 동형). priority 높은 순. core/safety/ref-location 사실용.
-  const pinnedMems = listMemories({}, root).filter(m => m.pinned && m.contextCard?.status !== 'retired').sort((a, b) => b.priority - a.priority);
+  const alwaysInject = opts.alwaysInject;
+  const pinnedMems = (scoped ?? listMemories({}, root))
+    .filter(m => (m.pinned || alwaysInject?.(m) === true) && m.contextCard?.status !== 'retired')
+    .sort((a, b) => b.priority - a.priority);
   const pinnedParts: string[] = [];
   for (const e of pinnedMems) {
     const chunk = pinnedChunk(e);
@@ -566,7 +581,7 @@ export function buildMemoryInjection(
   const hits = lowContext
     ? []
     : searchMemories(userText, { limit: maxHits + pinnedParts.length }, root)
-        .filter(h => h.score >= minScore && !injected.includes(h.entry.id))
+        .filter(h => h.score >= minScore && !injected.includes(h.entry.id) && (!filter || filter(h.entry)))
         .slice(0, maxHits);
   const bodyParts: string[] = [];
   for (const hit of hits) {

@@ -130,16 +130,38 @@ test('a resolved locale threads the localized guidance rows through the producti
 test.skipIf(process.platform === 'darwin')('showDashboard renders the startup band before and after the real first chat input', async () => {
   mkdirSync(resolve(import.meta.dir, '../../.elanous-test'), { recursive: true });
   const testRoot = mkdtempSync(resolve(import.meta.dir, '../../.elanous-test/first-screen-'));
-  writeFileSync(resolve(testRoot, 'config.json'), JSON.stringify({ onboarding: { completed: true } }));
+  // 첫 입력이 «보내져야» 기록에 남는다 — 공급자가 없으면 noProviderReply 가 입력칸에 되돌려 놓는다(0.2.29 gate Pod 실측).
+  //  실제 공급자 대신 loopback OpenAI 호환 가짜(이웃 scripts/lib/tui-streaming-e2e.test.ts 와 같은 장치)로 결정적으로.
+  const chatRequests: string[] = [];
+  const llm = Bun.serve({
+    hostname: '127.0.0.1', port: 0,
+    fetch: (request) => {
+      const { pathname } = new URL(request.url);
+      if (pathname.endsWith('/models')) return Response.json({ object: 'list', data: [{ id: 'test-model', object: 'model' }] });
+      chatRequests.push(pathname);
+      return new Response('data: {"choices":[{"delta":{"content":"band-probe-ok"}}]}\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+    },
+  });
+  const llmUrl = `http://127.0.0.1:${llm.port}/v1`;
+  writeFileSync(resolve(testRoot, 'config.json'), JSON.stringify({
+    onboarding: { completed: true }, dashboard: { bootBanner: 'full' }, // the historical band (#28 minimal is boot-banner.test.ts)
+    llm: { provider: 'local', model: 'test-model', baseUrl: llmUrl },
+    skillRouter: { llmFallback: false }, mcp: { enabled: false },
+  }));
   // `script` 는 판마다 문법이 다르다 — util-linux(리눅스 파드) `-qfec "<명령>" <파일>` · BSD(맥 게이트) `-q <파일> <명령…>`.
   //  리눅스 문법만 쓰면 맥에서 «illegal option -- f» 로 시작도 못 한다(0.2.9 게이트 10-02 실측).
   const command = ['bun', 'bin/elanous.mjs', `--test=${testRoot}`, '--chat-only'];
   const scriptArgs = process.platform === 'darwin' ? ['-q', '/dev/null', ...command] : ['-qfec', command.join(' '), '/dev/null'];
+  // 이 시험은 루프백 가짜 공급자를 스스로 주입한다 — 공용 가짜 공급자 env 를 넘기지 않는다.
+  const { ELANOUS_TEST_FAKE_LLM: _sharedFakeLlm, ...parentEnv } = process.env;
   const child = spawn('script', scriptArgs, {
     cwd: resolve(import.meta.dir, '../..'),
     // The production call site resolves the band locale from the environment
     // (ELANOUS_LANG → LC_ALL/LANG → en); pin it so the pinned rows below are deterministic.
-    env: { ...process.env, NODE_ENV: 'test', ELANOUS_LANG: 'ko', TERM: 'xterm-256color', NO_COLOR: '1', COLUMNS: '120', LINES: '48' },
+    env: {
+      ...parentEnv, NODE_ENV: 'test', ELANOUS_LANG: 'ko', TERM: 'xterm-256color', NO_COLOR: '1', COLUMNS: '120', LINES: '48',
+      LOCAL_LLM_URL: llmUrl, LOCAL_LLM_MODEL: 'test-model', ELANOUS_LLM_PROVIDER: 'local', ELANOUS_LLM_MODEL: 'test-model', ELANOUS_LLM_BASE_URL: llmUrl,
+    },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   const terminal = new Terminal({ cols: 120, rows: 48, scrollback: 200, allowProposedApi: true });
@@ -189,17 +211,23 @@ test.skipIf(process.platform === 'darwin')('showDashboard renders the startup ba
       return history.some((line) => line.includes('❯ band-retention-probe'))
         && history.some((line) => line.includes('무엇을 할 수 있어?'))
         && history.some((line) => line.includes('PWA:'))
+        && history.some((line) => line.includes('band-probe-ok'))
         && frame.some((line) => line.trim() === '❯');
-    }, 'submitted input in transcript');
+    }, 'submitted input and fake reply in transcript');
     expect(historyArea(after)).toEqual(expect.arrayContaining([
       expect.stringContaining('❯ band-retention-probe'),
       expect.stringContaining('무엇을 할 수 있어?'),
       expect.stringContaining('PWA:'),
+      expect.stringContaining('band-probe-ok'),
     ]));
+    // 턴이 끝까지 돈 뒤에도 띠가 남는다 — 응답은 실제 공급자가 아니라 loopback 가짜가 냈다(공급자 없음 경로로 새지 않았다).
+    expect(historyArea(after).join('\n')).not.toContain('No LLM provider available');
+    expect(chatRequests).toContain('/v1/chat/completions');
   } finally {
     child.kill();
     await exited;
     terminal.dispose();
+    llm.stop(true);
     rmSync(testRoot, { recursive: true, force: true });
   }
 }, 30_000);
@@ -207,7 +235,7 @@ test.skipIf(process.platform === 'darwin')('showDashboard renders the startup ba
 test.skipIf(process.platform === 'darwin')('real TUI shows a healthy write daemon in row zero', async () => {
   mkdirSync(resolve(import.meta.dir, '../../.elanous-test'), { recursive: true });
   const testRoot = mkdtempSync(resolve(import.meta.dir, '../../.elanous-test/first-screen-connected-'));
-  writeFileSync(resolve(testRoot, 'config.json'), JSON.stringify({ onboarding: { completed: true } }));
+  writeFileSync(resolve(testRoot, 'config.json'), JSON.stringify({ onboarding: { completed: true }, dashboard: { bootBanner: 'full' } }));
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json({ ok: true, testUniverse: true }) });
   const address = `http://127.0.0.1:${server.port}`;
   const preload = resolve(testRoot, 'write-endpoint.ts');

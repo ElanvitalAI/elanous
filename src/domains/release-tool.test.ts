@@ -117,16 +117,10 @@ test('schedule, blocked and landed actions return Korean summaries from injected
   expect(observedNow).toBe(now);
 });
 
-test('topic takes precedence over a simultaneous action with one deterministic notice', () => {
-  const result = dispatchReleaseStatus({ topic: 'features', action: 'landed' }, {
-    devVersion: () => '0.2.10',
-    checklist: version => ({ version, released: '', dev: version, history: [], items: [
-      { id: 'KEEP', title: '보이는 칸', status: 'yellow', owner: 'UX', updatedAt: '', updatedBy: '' },
-    ] }),
-  });
-  expect(result.text.split('\n')[0]).toBe('action=landed 은 무시됨 — topic 과 같이 못 쓴다');
-  expect(result.text.match(/action=landed 은 무시됨 — topic 과 같이 못 쓴다/g)).toHaveLength(1);
-  expect((result.structured.items as Array<{ id: string }>).map(item => item.id)).toEqual(['KEEP']);
+test('a simultaneous topic and action is rejected with one error naming both before any ledger read', () => {
+  expect(() => dispatchReleaseStatus({ topic: 'features', action: 'landed' }, {
+    checklist: () => { throw new Error('원장을 읽으면 안 됩니다'); },
+  })).toThrow('topic 과 action 을 동시에 쓸 수 없습니다 — 둘 중 하나만: topic=features 는 피처 목록 · action 은 짧은 요약');
 });
 
 test('features applies owner and status filters and counts matching ledger entries beyond display limit', () => {
@@ -146,11 +140,15 @@ test('features applies owner and status filters and counts matching ledger entri
   expect(result.text).toContain('앞 60칸만 표시(전체 65칸)');
 });
 
-test('existing core dispatch reaches release_status topic precedence without another tool registration', async () => {
+test('existing core dispatch surfaces the simultaneous rejection; topic-only still reads features through the same registration', async () => {
   fixture();
-  const result = await buildCoreTools().dispatch('release_status', { topic: 'features', action: 'landed' }) as { text: string };
-  expect(result.text.split('\n')[0]).toBe('action=landed 은 무시됨 — topic 과 같이 못 쓴다');
-  expect(result.text).toContain('판 피처');
+  const tools = buildCoreTools();
+  let rejected: unknown;
+  try { await tools.dispatch('release_status', { topic: 'features', action: 'landed' }); } catch (error) { rejected = error; }
+  expect(rejected).toBeInstanceOf(Error);
+  expect((rejected as Error).message).toBe('topic 과 action 을 동시에 쓸 수 없습니다 — 둘 중 하나만: topic=features 는 피처 목록 · action 은 짧은 요약');
+  const topicOnly = await tools.dispatch('release_status', { topic: 'features' }) as { text: string };
+  expect(topicOnly.text).toContain('판 피처');
 });
 
 test('existing core dispatch preserves the standalone release_status action contract', async () => {

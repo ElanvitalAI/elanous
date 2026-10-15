@@ -14,6 +14,7 @@ export interface RunDashboardChatMainEntryDeps {
   promptFrame: PromptFrame;
   getPromptFrame?: () => PromptFrame;
   inputCols: number;
+  getInputCols?: () => number;
   surfaceRegistry: SurfaceRegistry;
   invalidateRenderCacheRow: (row0: number) => void;
   buildPromptFrameDividerRows: (promptFrame: PromptFrame, divider: string) => Array<{ row: number; text: string }>;
@@ -61,6 +62,7 @@ export async function runDashboardChatMainEntry(
     promptFrame: deps.promptFrame,
     getPromptFrame,
     inputCols: deps.inputCols,
+    getInputCols: deps.getInputCols,
     surfaceRegistry: deps.surfaceRegistry,
     invalidateRenderCacheRow: deps.invalidateRenderCacheRow,
     buildPromptFrameDividerRows: deps.buildPromptFrameDividerRows,

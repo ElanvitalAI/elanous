@@ -79,4 +79,16 @@ describe('lintGoalFile traced paths', () => {
     expect(findings.tracedPathExclusionCount).toBe(0);
     expect(findings).not.toContainEqual(expect.objectContaining({ tag: 'traced-path' }));
   });
+
+  test('keeps an unresolved filename visible without passing it to repository path checks', () => {
+    const document = goalWithTracedPaths('- src/self-implement/goal-author.ts\n- 미해석: plugin-trust.json — bare filename');
+    const inspected: string[] = [];
+    const findings = lintGoalFile(document, 'main', {
+      readReferencedFile: (path) => { inspected.push(path); return 'export {};\n'; },
+    });
+
+    expect(tracedPathReferences(document).map(({ path }) => path)).toEqual(['src/self-implement/goal-author.ts']);
+    expect(inspected).toEqual(['src/self-implement/goal-author.ts']);
+    expect(findings).toContainEqual({ level: 'WARN', tag: 'traced-path', message: '미해석: plugin-trust.json — bare filename' });
+  });
 });

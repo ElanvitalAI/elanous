@@ -47,6 +47,15 @@ test('next future cut picks earliest cut, then version; exact boundaries and alr
   expect(planRehearsal([], at(420), {}).status).toBe('no-schedule');
 });
 
+test('rehearsal tick stamps a failed TUI screen result as an error, not a successful RC', async () => {
+  const root = newRoot();
+  const h = harness(at(420), rc({ ok: false, rehearsalTui: { outcome: 'fail', detail: 'help-closes failed' } }));
+  const tick = await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
+  expect(tick.status).toBe('due');
+  expect(h.calls).toEqual([schedule.version]);
+  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'error', result: { ok: false, rehearsalTui: { outcome: 'fail', detail: 'help-closes failed' } } });
+});
+
 test('two identical -7h ticks claim the stage once; outcome and SHA stay in the stamp', async () => {
   const root = newRoot(), h = harness(at(420));
   const opts = { ledgerRoot: root, checkout: '/fake/checkout', apply: true };

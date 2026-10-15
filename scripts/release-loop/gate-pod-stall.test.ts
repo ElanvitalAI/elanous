@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  createGateRunner, gateBeatScript, gateShardShell, readShardLiveLog, runGateNode, watchShardStall,
+  createGateRunner, gateBeatScript, gateEnvBaselineLine, gateShardShell, readShardLiveLog, runGateNode, watchShardStall,
   POD_SHARD_FILE_CAP, type GateOptions, type GateRunner,
 } from './gate-node';
 import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
@@ -25,7 +25,7 @@ function stallRig(files: string[], stalls: (call: number) => boolean, partRc: (p
   const root = temp('gate-stall-');
   const repo = join(root, 'repo');
   mkdirSync(repo);
-  const calls: Array<{ name: string; files: string[] }> = [];
+  const calls: Array<{ name: string; files: string[]; shell: string }> = [];
   const live = new Map<string, { text: string; stop?: () => void }>();
   const stopped: string[] = [];
   const command: GateRunner['command'] = async (cmd, args) => {
@@ -36,7 +36,7 @@ function stallRig(files: string[], stalls: (call: number) => boolean, partRc: (p
   };
   const pod = async (o: RunPodCommandOptions) => {
     const parts = [...o.command[2]!.matchAll(/run_part \d+ ([^&]*)/g)].map((m) => [...m[1]!.matchAll(/'\.\/([^']+)'/g)].map((f) => f[1]!));
-    calls.push({ name: o.name!, files: parts.flat() });
+    calls.push({ name: o.name!, files: parts.flat(), shell: o.command[2]! });
     const dir = join(root, o.name!);
     mkdirSync(dir);
     if (stalls(calls.length)) {
@@ -91,6 +91,8 @@ test('a shard that prints only its checkout is stopped within the stall window, 
   ]);
   // First attempt ⊕ the one fresh retry — no -c<n> / -<n> split Pods.
   expect(calls.map((call) => call.files)).toEqual([files, files]);
+  // GATE-ENV-BASELINE: the fresh retry Pod goes through the same shell assembly — it carries the env baseline too.
+  for (const call of calls) expect(call.shell.split('\n')).toContain(gateEnvBaselineLine());
   expect(stopped).toEqual(calls.map((call) => call.name));
   expect(elapsed).toBeLessThan(10_000);
   const stalls = events.filter((item) => item.event === 'pod-shard-stall');
@@ -150,7 +152,7 @@ test('a shard that prints test output is unaffected: no stop, no retry, same res
   try { without = await plain.runner.sweep(plain.repo, join(plain.root, 'logs'), { pool: 'pool-test', shards: 1, stallSeconds: 0 }); }
   finally { off.restore(); }
   expect(withWatch).toEqual(without);
-  const strip = (meta: Record<string, unknown>) => { const { durationMs: _d, attemptId: _a, ...rest } = meta; return rest; };
+  const strip = (meta: Record<string, unknown>) => { const { durationMs: _d, attemptId: _a, phaseTimes: _t, ...rest } = meta; return rest; };
   const metaWith = JSON.parse(readFileSync(join(watched.root, 'logs', 'pod-0.json'), 'utf8'));
   const metaWithout = JSON.parse(readFileSync(join(plain.root, 'logs', 'pod-0.json'), 'utf8'));
   // runKey hashes the shell without the beat: a watched run reuses (and leaves) the same records as before.

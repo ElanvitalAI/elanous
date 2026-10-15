@@ -1493,8 +1493,11 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
       try {
         if (!id) {
           const { bindMirroredRemoteRejudgeCards } = await import('../task-agent/remote-rejudge-bind.js');
+          const { mirrorRemoteRunLedgers } = await import('../task-agent/parent-host.js');
           const cards = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {};
-          const binding = await bindMirroredRemoteRejudgeCards(cards, statePath);
+          const binding = await bindMirroredRemoteRejudgeCards(cards, statePath, deps.cardRunEvidence?.ssh
+            ? { mirror: (target, runId, root) => mirrorRemoteRunLedgers(target, runId, root, deps.cardRunEvidence!.ssh) }
+            : {});
           try { debug.log('task-agent', 'remote-rejudge-bind', binding); } catch { /* fail-soft */ }
         }
         ids = id ? [id] : rejudgeCandidates(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {});
@@ -1503,6 +1506,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
       }
       const { configuredTaskAgentLiveMoves } = await import('../task-agent/live-moves.js');
       const liveMoves = deps.rejudge?.liveMoves ?? await configuredTaskAgentLiveMoves();
+      const repairBudget = opts.all ? { max: (await import('../user-config.js')).getUserConfig().taskAgent?.repairMaxPerTick ?? 3,
+        requested: 0, capped: 0 } : undefined;
       const all = [];
       for (const cardId of ids) {
         await mirrorRemoteCardLedger(cardId, deps);
@@ -1510,7 +1515,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           try { debug.log('task-agent', 'card-binding-replay-failed', { card: cardId, reason: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
         }
         let outcomes: Awaited<ReturnType<typeof rejudgeCardOnHead>>;
-        try { outcomes = await rejudgeCardOnHead(cardId, { ...deps.rejudge, liveMoves, live: { ...deps.rejudge?.live, statePath } }); } catch (error) {
+        try { outcomes = await rejudgeCardOnHead(cardId, { ...deps.rejudge, liveMoves,
+          ...(repairBudget ? { repairBudget } : {}), live: { ...deps.rejudge?.live, statePath } }); } catch (error) {
           // 카드 하나의 예외가 --all 의 나머지 카드 판단을 멈추지 않게 — 사유를 남기고 다음 카드로.
           const reason = (error instanceof Error ? error.message : String(error)).slice(-300);
           try { debug.log('task-agent', 'rejudge-on-head', { card: cardId, pr: null, fromHead: null, toHead: null, step: 'target', decision: 'rejudge-threw', reason }, { level: 'warn' }); } catch { /* fail-soft */ }

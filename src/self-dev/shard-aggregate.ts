@@ -16,6 +16,8 @@ export interface GateShardAttempt {
   baselineExitCode: number | null;
   currentSignal?: string | null;
   baselineSignal?: string | null;
+  currentDiagnostic?: string;
+  baselineDiagnostic?: string;
   /** LIGHT-RC-MEASURE — the shard files that exist in the baseline tree, i.e. what the baseline side actually ran.
    *  Absent = every shard file (the old shape). Empty = the baseline side was not run and contributes zero cases. */
   baselineFiles?: readonly string[];

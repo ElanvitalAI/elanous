@@ -8,6 +8,12 @@ import type { DashboardTurnBlockAttachLike } from '../turn-message-runtime.js';
 import type { DashboardAssistantRenderState } from '../turn-tail-runtime.js';
 import type { SearchPlannerState } from '../../session-runtime/index.js';
 import { runDashboardPlainTurnStream } from './dashboard-plain-turn-stream.js';
+import {
+  formatFailureNotice, matchFailureText, recordFailureSignatureMatch,
+} from '../../self-health/signatures.js';
+import { isUnknownCodex400, repairCodexToolPairs, restoreRepairedHistory } from './compact-prepass-recovery.js';
+import type { LLMMessage } from '../../llm.js';
+import { isTuiRouteLine } from '../../core-turn/short-question.js';
 
 export interface DashboardChatMainPlainTurnRuntimeDeps {
   userText: string;
@@ -75,7 +81,10 @@ export interface DashboardChatMainPlainTurnRuntimeDeps {
     preamble: unknown[];
     chatHistory: unknown[];
     userMsg: unknown;
+    onPrePassApplied: () => void;
   }) => Promise<void>;
+  /** Null means the server-side dispatch boundary cannot be observed. */
+  readToolDispatchCount?: () => number | null;
 
   attachChatStreamingKeys: (abortCtrl: AbortController) => () => void;
   /** ⭐ 관측 심 — 형제 `chat-main-entry-runtime` 과 «같은 형태»다(재발명 0 · `OBS-T124`). */
@@ -141,6 +150,8 @@ export interface DashboardChatMainPlainTurnRuntimeDeps {
   runActionEffects: (outcome: unknown) => Promise<void>;
   warningLine: (message: string) => string;
   pushErrorLine: (message: string) => void;
+  /** 실패 지문이 맞은 오류: 화면엔 한국어 처방 한 줄, 원문은 여기(`/detail`)로. 없으면 원문을 그대로 낸다. */
+  pushFailureNotice?: (notice: string, raw: string) => void;
   finalizeTurn: (status: 'completed' | 'interrupted' | 'failed', error?: string) => void;
 }
 
@@ -172,6 +183,7 @@ export async function runDashboardChatMainPlainTurn(
   const userText = deps.intent?.text ?? deps.userText;
 
   let cleanupEsc = () => {};
+  let stage = 'streaming-keys-attached';
 
   try {
     const abortCtrl = new AbortController();
@@ -202,7 +214,6 @@ export async function runDashboardChatMainPlainTurn(
         turnStartedAtIso,
       });
     } catch { /* fail-soft — 관측이 턴을 막지 않는다 */ }
-    let stage = 'streaming-keys-attached';
     const finishIfAborted = (): boolean => {
       if (!abortCtrl.signal.aborted) return false;
       finalStatus = 'interrupted';
@@ -237,6 +248,9 @@ export async function runDashboardChatMainPlainTurn(
       pushChatLine: deps.pushChatLine,
     });
     deps.chat.history.push(userMsg);
+    // Detect whether the pre-pass actually replaced history before considering
+    // a bounded pair repair. The copy is never replayed to the provider.
+    const beforeCompact = deps.chat.history.slice();
 
     await deps.beginCodeEditTurn(
       typeof userMsg.content === 'string' ? userMsg.content : '',
@@ -251,11 +265,15 @@ export async function runDashboardChatMainPlainTurn(
       userConfig,
     });
 
+    let prePassApplied = false;
     await deps.runAutoCompact({
       preamble,
       chatHistory: deps.chat.history,
       userMsg,
+      onPrePassApplied: () => { prePassApplied = true; },
     });
+    const compactChanged = prePassApplied && (deps.chat.history.length !== beforeCompact.length
+      || deps.chat.history.some((message, index) => message !== beforeCompact[index]));
     stage = 'runAutoCompact';
     if (finishIfAborted()) return;
 
@@ -316,10 +334,139 @@ export async function runDashboardChatMainPlainTurn(
         });
       } catch { /* fail-soft — 관측이 턴을 막지 않는다 */ }
     };
+    const recoverySend: typeof deps.acpSession = {
+      send: async (opts) => {
+        let lastError: unknown;
+        let pairReport: ReturnType<typeof repairCodexToolPairs> | null = null;
+        let inspectedHistory: string | null = null;
+        let initialAttemptEmitted = false;
+        let warned = false;
+        const manualRecovery = (reason: string): void => {
+          if (warned) return;
+          warned = true;
+          deps.debugLog?.('chat.compact-400-recovery', 'manual-recovery-required', {
+            reason, historyMessages: deps.chat.history.length,
+          });
+          deps.pushChatLine(deps.warningLine(
+            'Codex 400으로 자동 복구를 멈췄습니다. 대화 이력을 확인한 뒤 /session new 로 새 세션을 시작하세요.',
+          ));
+        };
+        const dispatchCountBeforeSend = deps.readToolDispatchCount?.() ?? null;
+        const attempt = async (stage: string): Promise<boolean> => {
+          let emitted = false;
+          try {
+            await deps.acpSession.send({
+              ...opts,
+              // 라우팅 줄은 브리지가 모델 호출 «전»에 보낸다 — 모델 출력이 아니므로 재시도를 막지 않는다.
+              onText: (chunk) => {
+                if (!isTuiRouteLine(chunk)) { emitted = true; if (stage === 'initial') initialAttemptEmitted = true; }
+                opts.onText(chunk);
+              },
+              onToolCall: (call) => { emitted = true; if (stage === 'initial') initialAttemptEmitted = true; opts.onToolCall(call); },
+              onToolResult: (call) => { emitted = true; if (stage === 'initial') initialAttemptEmitted = true; opts.onToolResult(call); },
+            });
+            deps.debugLog?.('chat.compact-400-recovery', 'recovered', { stage });
+            return true;
+          } catch (err) {
+            const dispatchCountNow = deps.readToolDispatchCount?.() ?? null;
+            const dispatchUnknown = dispatchCountBeforeSend === null || dispatchCountNow === null;
+            const toolDispatched = dispatchCountNow !== dispatchCountBeforeSend;
+            const unknown400 = isUnknownCodex400(selectDashboardChatErrorDetail(err), err);
+            if (unknown400 && compactChanged) {
+              if (!pairReport) {
+                pairReport = repairCodexToolPairs(deps.chat.history as LLMMessage[]);
+                try { inspectedHistory = JSON.stringify(deps.chat.history); } catch { /* unsafe to retry */ }
+                deps.debugLog?.('chat.compact-400-recovery', 'pair-check', {
+                  removedCalls: pairReport.removedCalls,
+                  removedResults: pairReport.removedResults,
+                  ambiguousCount: pairReport.ambiguousIds.length,
+                  readOnly: true,
+                });
+              }
+              deps.debugLog?.('chat.compact-400-recovery', 'codex-400-unknown', {
+                stage, historyMessages: deps.chat.history.length,
+                emitted, dispatchUnknown, toolDispatched,
+              });
+            }
+            if (emitted || dispatchUnknown || toolDispatched || abortCtrl.signal.aborted || !compactChanged
+              || !unknown400) {
+              if (stage === 'pair-repair') manualRecovery('pair-repair-failed');
+              else if (unknown400 && compactChanged) manualRecovery('unsafe-retry');
+              throw err;
+            }
+            lastError = err;
+            return false;
+          }
+        };
+        if (await attempt('initial')) return;
+
+        const repaired = pairReport!;
+        let historyUnchanged = false;
+        try {
+          historyUnchanged = inspectedHistory !== null
+            && JSON.stringify(deps.chat.history) === inspectedHistory;
+        } catch { /* unsafe to retry */ }
+        if (!historyUnchanged) {
+          deps.debugLog?.('chat.compact-400-recovery', 'history-changed-after-pair-check', {
+            historyMessages: deps.chat.history.length,
+          });
+          manualRecovery('history-changed-after-pair-check');
+          throw lastError;
+        }
+        if (repaired.ambiguousIds.length === 0 && repaired.removedCalls + repaired.removedResults > 0) {
+          let beforeRepairValues: typeof deps.chat.history;
+          let expectedRepairedValues: typeof repaired.messages;
+          try {
+            beforeRepairValues = structuredClone(deps.chat.history);
+            expectedRepairedValues = structuredClone(repaired.messages);
+          } catch {
+            manualRecovery('history-snapshot-unavailable');
+            throw lastError;
+          }
+          const dispatchCountBeforeRepair = deps.readToolDispatchCount?.() ?? null;
+          let historyStillInspected = false;
+          try {
+            historyStillInspected = inspectedHistory !== null
+              && JSON.stringify(deps.chat.history) === inspectedHistory;
+          } catch { /* unsafe to retry */ }
+          if (dispatchCountBeforeSend === null || dispatchCountBeforeRepair === null
+            || dispatchCountBeforeRepair !== dispatchCountBeforeSend
+            || initialAttemptEmitted || abortCtrl.signal.aborted || !historyStillInspected) {
+            deps.debugLog?.('chat.compact-400-recovery', 'retry-gate-changed', {
+              dispatchUnknown: dispatchCountBeforeSend === null || dispatchCountBeforeRepair === null,
+              toolDispatched: dispatchCountBeforeRepair !== dispatchCountBeforeSend,
+              emitted: initialAttemptEmitted,
+              aborted: abortCtrl.signal.aborted,
+              historyChanged: !historyStillInspected,
+            });
+            manualRecovery('retry-gate-changed');
+            throw lastError;
+          }
+          deps.chat.history.splice(0, deps.chat.history.length, ...repaired.messages);
+          let recovered = false;
+          try {
+            recovered = await attempt('pair-repair');
+            if (recovered) return;
+          } finally {
+            if (!recovered) {
+              const restoration = restoreRepairedHistory(
+                deps.chat.history, beforeRepairValues, repaired.messages, expectedRepairedValues,
+              );
+              deps.debugLog?.('chat.compact-400-recovery', restoration.restored
+                ? 'history-restored' : 'history-restore-skipped', restoration);
+            }
+          }
+        }
+
+        manualRecovery(repaired.ambiguousIds.length > 0 ? 'ambiguous-tool-pairing'
+          : repaired.removedCalls + repaired.removedResults > 0 ? 'pair-repair-failed' : 'no-orphan-pairs');
+        throw lastError;
+      },
+    };
     const streamResult = await runDashboardPlainTurnStream({
       userText,
       abortCtrl,
-      acpSession: deps.acpSession,
+      acpSession: recoverySend,
       onText: (chunk, accumulated) => {
         logFirstToken(chunk);
         turnStreamRuntime.onText(chunk, accumulated);
@@ -398,11 +545,33 @@ export async function runDashboardChatMainPlainTurn(
   } catch (err: any) {
     finalStatus = 'failed';
     const detail = selectDashboardChatErrorDetail(err);
+    const stackHead = typeof err?.stack === 'string'
+      ? err.stack.split('\n').slice(0, 4).join('\n')
+      : undefined;
+    deps.debugLog?.('chat-main.plain-turn', 'turn-failed', {
+      stage,
+      message: redactSecretText(detail),
+      stackHead: stackHead === undefined ? undefined : redactSecretText(stackHead),
+    });
     const firstLine = detail.split(/\r?\n/, 1)[0]?.trim() ?? '';
     finalError = detail === ''
       ? err?.message || String(err)
       : firstLine.length > 80 ? `${firstLine.slice(0, 80)}…` : firstLine;
-    deps.pushErrorLine(detail);
+    const failure = deps.pushFailureNotice ? matchFailureText(detail) : null;
+    if (failure && deps.pushFailureNotice) {
+      recordFailureSignatureMatch(failure, 'turn-error');
+      finalError = failure.cause;
+      deps.pushFailureNotice(formatFailureNotice(failure, { rawHint: '/detail open' }), detail);
+    } else {
+      deps.pushErrorLine(detail);
+    }
+    // ⛔ #27452 400 복구 판정은 «원문» detail 로 — 지문 번역(finalError)으로 판정하면 복구가 안 걸린다.
+    if (isUnknownCodex400(detail)) {
+      // The normal finalizer also stops it, but freezing here closes the
+      // failure path even if an outer render callback throws afterward.
+      deps.thinking.stop({ status: 'failed', errorText: finalError });
+      deps.debugLog?.('chat.compact-400-recovery', 'thinking-stopped', { status: 'failed' });
+    }
   } finally {
     try {
       cleanupEsc();

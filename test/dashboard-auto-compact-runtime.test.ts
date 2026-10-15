@@ -1,8 +1,65 @@
 import { describe, expect, test } from 'bun:test';
 
 import { runDashboardAutoCompact } from '../src/dashboard/auto-compact-runtime.js';
+import { runCompactPipeline } from '../src/compact/pipeline.js';
+import { messagesToResponsesInput, type LLMMessage } from '../src/llm.js';
 
 describe('runDashboardAutoCompact', () => {
+  test('real pre-pass keeps long interleaved Codex tool call and output pairs on the wire', async () => {
+    const history: LLMMessage[] = [{ role: 'system', content: 'system' }];
+    for (let i = 0; i < 65; i++) {
+      const id = `call_${i}`;
+      history.push({ role: 'user', content: `request ${i}` });
+      history.push({ role: 'assistant', content: [{ type: 'tool_use', id, name: 'Read', input: { path: `file-${i}` } }] });
+      history.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: `result ${i}\n${'x'.repeat(4000)}` }] });
+    }
+    const userMsg: LLMMessage = { role: 'user', content: 'continue' };
+    history.push(userMsg);
+    const snapshot = history.slice();
+    const snapshotJson = JSON.stringify(snapshot);
+    const before = messagesToResponsesInput(history).input;
+    let cleared = 0;
+    let trimmed = 0;
+    let prePassApplied = 0;
+    await runDashboardAutoCompact({
+      preamble: [], chatHistory: history as any, userMsg: userMsg as any,
+      model: 'gpt-6-sol', autoCompactConfig: {} as any,
+      shouldAutoCompact: () => ({ fire: false, partial: false, preserveLastN: 4,
+        reason: 'under-threshold', ratio: 0.1, usedTokens: 100, maxTokens: 1000 }),
+      compactConversation: async () => ({ summary: '' }),
+      compactConversationPartial: async () => ({ summary: '' }),
+      renderCompactBoundary: () => '', pushChatLine: () => {}, pushDebugLine: () => {},
+      muted: (t) => t, debugLog: (_event, action, data) => {
+        if (action === 'applied') {
+          cleared = (data as { layer2Cleared: number }).layer2Cleared;
+          trimmed = (data as { layer1Trimmed: number }).layer1Trimmed;
+        }
+      },
+      onPrePassApplied: () => { prePassApplied++; },
+      runCompactPipeline: (messages, opts) => runCompactPipeline(messages, {
+        sessionId: opts.sessionId,
+        policy: { archiveEnabled: false, toolOutputCharBudget: 1000, microcompactAgeThreshold: 5, preserveLastN: 4 },
+      }),
+    });
+    const after = messagesToResponsesInput(history).input;
+    const pairs = (items: typeof after) => items.flatMap((item, index) =>
+      'type' in item && item.type === 'function_call'
+        ? [{ id: item.call_id, callIndex: index,
+          resultIndex: items.findIndex(candidate => 'type' in candidate
+            && candidate.type === 'function_call_output' && candidate.call_id === item.call_id) }]
+        : []);
+    expect(cleared).toBeGreaterThan(0);
+    expect(trimmed).toBeGreaterThan(0);
+    expect(prePassApplied).toBe(1);
+    // The real pre-pass replaces message objects; it does not mutate the
+    // saved objects. The runtime can therefore restore this slice verbatim.
+    expect(JSON.stringify(snapshot)).toBe(snapshotJson);
+    expect(history.some((message, index) => message !== snapshot[index])).toBe(true);
+    expect(after.length).toBe(before.length);
+    expect(pairs(after).length).toBe(65);
+    expect(pairs(after).map(pair => pair.id)).toEqual(pairs(before).map(pair => pair.id));
+    expect(pairs(after).every(pair => pair.resultIndex > pair.callIndex)).toBe(true);
+  });
   test('rewrites history with summary and boundary when auto-compact fires', async () => {
     const history = [
       { role: 'system', content: 'sys' },

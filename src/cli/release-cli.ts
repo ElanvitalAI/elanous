@@ -53,6 +53,7 @@ import { autoStartScheduledRelease, type AutoStartDeferral } from '../release-lo
 import { runRehearsalTick, type RehearsalDeps } from '../release-loop/rehearsal.js';
 import { landingFreezeMessage, LandingFrozenError, readLandingFreeze } from '../release-loop/landing-freeze.js';
 import { formatLightRc, runLightRc, type LightRcDeps } from '../release-loop/light-rc.js';
+import { applyWatchList, formatGateHistory, gateHistory, ghMergedPrs } from '../../scripts/release-loop/gate-history.js';
 import { registerRfcCommands } from './rfc-cli.js';
 
 export const DEFAULT_PUBLIC_REPO = 'ElanvitalAI/elanous';
@@ -1140,14 +1141,15 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--remote <host>', '게이트 호스트(기본 config gateRemote.host)')
     .option('--local', '원격 대신 이 기계에서 돌린다(원격 자식이 이것으로 다시 불린다)')
     .option('--shards <n>', '시험 분할 수', '4')
+    .option('--rehearsal-tui', '리허설 전용 TUI 화면 점검(원격 자식 전달)')
     .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
-    .action(async (o: { version: string; base?: string; head?: string; remote?: string; local?: boolean; shards: string; json?: boolean }) => {
+    .action(async (o: { version: string; base?: string; head?: string; remote?: string; local?: boolean; shards: string; rehearsalTui?: boolean; json?: boolean }) => {
       // The root strips `--local` from argv (remote-bookmark attach) before Commander sees it — same read as `self gate`.
       const local = !!o.local || process.argv.slice(2).includes('--local');
       await jsonAction(o.json, async (log) => {
         if (o.remote !== undefined && local) throw new Error('release light-rc: --remote and --local cannot be combined');
         const shards = Number(o.shards);
-        const result = await runLightRc(o.version, { base: o.base, head: o.head, remote: o.remote, local, shards, ledgerRoot: releaseRunDeps.ledgerRoot, log: (l) => console.error(l) }, lightRcDeps);
+        const result = await runLightRc(o.version, { base: o.base, head: o.head, remote: o.remote, local, shards, rehearsalTui: o.rehearsalTui, ledgerRoot: releaseRunDeps.ledgerRoot, log: (l) => console.error(l) }, lightRcDeps);
         for (const line of formatLightRc(result)) log(line);
         return result;
       }, (r) => r.ok);
@@ -1190,6 +1192,46 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         return { tip: result.tip, partial: result.partial, status: result.state.status, runId: result.state.runId,
           ...(o.gateExecutor !== undefined && result.state.inputOverrides?.length ? { gateExecutor: result.state.inputOverrides.at(-1) } : {}) };
       }, (r) => r.status === 'done' || r.status === 'awaiting-approval');
+    });
+  release.command('gate-history')
+    .description('GATE-FAIL-HISTORY (0.2.29) — 판을 넘는 게이트 실패 표 — 모든 release-loop·light-rc 런 원장 ⊕ gate-verdict 에서 시험 파일별 introduced·preexisting·env·flaky 횟수 · 마지막 실패 판 · 원인 PR(수리 PR 본문 «원인 #N»)')
+    .option('--since <판|일>', '이 판(x.y.z)부터 · 또는 그 날(YYYY-MM-DD) 이후 시작된 런부터')
+    .option('--top <n>', '가장 자주 깨지는 순 상위 n 줄', '20')
+    .option('--apply-watchlist', '감시 목록(최근 3판 중 2판 이상 새 실패·흔들림)을 release/light-rc-always.txt 에 자동 추가(없는 줄만)')
+    .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
+    .action(async (o: { since?: string; top: string; applyWatchlist?: boolean; json?: boolean }) => {
+      const log = o.json ? console.error : console.log;
+      try {
+        const top = Number(o.top);
+        if (!/^\d+$/.test(o.top) || !Number.isSafeInteger(top)) throw new CliUserError(`--top 은 0 이상의 정수다: ${o.top}`);
+        const instanceRoots = [effectiveInstanceRoot()];
+        const ledgerRoots = getElanousConfigDirOverride() ? [effectiveInstanceRoot()] : [releaseRunDeps.ledgerRoot ?? releaseLedgerRoot()];
+        const report = gateHistory({ instanceRoots, ledgerRoots, since: o.since }, { mergedPrs: ghMergedPrs });
+        let applied = { added: [] as string[], file: 'release/light-rc-always.txt' };
+        if (o.applyWatchlist && report.watchList.length) {
+          const file = applied.file;
+          const text = existsSync(file) ? readFileSync(file, 'utf8') : '# LIGHT-RC (0.2.19) — tests `release light-rc` always runs, whatever changed since the previous cut.\n# One repository-relative path per line · `#` starts a comment.\n';
+          const next = applyWatchList(text, report.watchList);
+          if (next.added.length) {
+            writeFileSync(file, next.text, { mode: 0o644 });
+            debug.log('release.gate-history', 'watchlist-applied', { added: next.added, file });
+          }
+          applied = { added: next.added, file };
+        }
+        if (o.json) await writeStdoutJson(`${JSON.stringify({ ...report, rows: report.rows.slice(0, top), top, ...(o.applyWatchlist ? { applied } : {}) })}\n`);
+        else {
+          for (const line of formatGateHistory(report, top)) log(line);
+          if (o.applyWatchlist) {
+            if (!report.watchList.length) log('감시 목록에 추가할 파일이 없다');
+            else if (!applied.added.length) log(`감시 목록은 이미 있다: ${report.watchList.join(' · ')}`);
+            else log(`✅ 감시 목록 ${applied.added.length}줄 추가: ${applied.added.join(' · ')} → ${applied.file}`);
+          }
+        }
+      } catch (e) {
+        if (o.json) await writeStdoutJson(`${JSON.stringify({ ok: false, error: (e as Error).message })}\n`);
+        else console.error(`⛔ ${(e as Error).message}`);
+        process.exitCode = 1;
+      }
     });
   release.command('rehearsal').description('판 일정에서 컷 전 가벼운 RC 두 단계').command('tick')
     .description('15분 틱: 다음 판 컷 −7h · −150m RC 계획(기본 보기만)')

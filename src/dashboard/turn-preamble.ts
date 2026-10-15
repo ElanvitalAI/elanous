@@ -18,6 +18,7 @@ import type { ModelFamily } from '../models/prompts.js';
 import { debug } from '../debug/log.js';
 import type { NativeToolCatalogEntry } from '../native-tool-catalog.js';
 import { buildUniversalPreamble } from '../prompt-library/universal-preamble.js';
+import { buildSeatBootSystemMessages, type SeatBootDeps } from './seat-boot-preamble.js';
 import { buildPlanModeSystemMessages } from '../plan-mode/system-prompt.js';
 import { buildImplDisciplineSystemMessages } from '../impl-discipline/index.js';
 import { buildConcisenessSystemMessages } from '../prompt-library/chat-conciseness.js';
@@ -29,7 +30,8 @@ import {
 import { buildExecutionAskSystemMessages } from '../ask-user-question/index.js';
 import { buildApprovalPolicySystemMessages } from '../code-edit/index.js';
 import { buildSandboxEscalationSystemMessages } from '../shell-primitive/index.js';
-import { elanousSelfAccessPrompt, elanousSelfAmbientParts } from '../agent/self-ambient.js';
+import { elanousSelfAccessPrompt, investigationRecallAmbient } from '../agent/self-ambient.js';
+import { sessionMemoryLayer, sessionSelfAmbientParts } from './turn-session-layers.js';
 import { localRefGroundingAmbient } from '../agent/ref-grounding.js';
 import {
   globalTaskNotificationQueue,
@@ -66,9 +68,14 @@ export interface DashboardTurnPreambleContext {
    *  one-liner directives (e.g. AskUserQuestion → use for tool-deny
    *  clarification). Pass `tools.map(t => t.name)` from the caller. */
   enabledTools?: readonly string[];
+  /** 🪪 L1 자리 부트 카드를 싣나(`seat-boot-preamble.ts`). 대화형 TUI 호출부만 켠다 — 기본 꺼짐이라
+   *  다른 호출부·시험은 셸의 `COORD_ID` 에 따라 출력이 갈리지 않는다. */
+  seatBoot?: boolean | SeatBootDeps;
   /** Explicit controller provenance for tests and embedded callers. When
    *  omitted, the controller environment is used. */
   controlEnv?: { controller?: string; channels?: string };
+  /** File-memory layer seam: a store root and env for scope resolution (tests), or false to omit it. */
+  memory?: { root?: string; env?: NodeJS.ProcessEnv } | false;
 }
 
 export function buildControllerSystemMessage(controller: string, channels?: string): LLMMessage {
@@ -91,10 +98,22 @@ export function buildDashboardTurnPreamble(
     ...(ctx.modelFamily !== undefined ? { modelFamily: ctx.modelFamily } : {}),
     ...(ctx.enabledTools !== undefined ? { enabledTools: ctx.enabledTools } : {}),
   });
+  // 🪪 L1 — 자리 부트 카드(세션마다 한 번 만든 스냅샷). 정체성(앵커) 바로 뒤. 자리가 아니면 [].
+  const seatBootSystemMsgs = ctx.seatBoot
+    ? buildSeatBootSystemMessages(
+      { cwd: ctx.cwd, ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}) },
+      ctx.seatBoot === true ? {} : ctx.seatBoot,
+    )
+    : [];
   const planModeSystemMsgs = buildPlanModeSystemMessages();
   const askSystemMsgs = buildExecutionAskSystemMessages() as LLMMessage[];
   const approvalSystemMsgs = buildApprovalPolicySystemMessages() as LLMMessage[];
   const sandboxSystemMsgs = buildSandboxEscalationSystemMessages() as LLMMessage[];
+  // Session-scoped (built once, rebuilt on change) — see turn-session-layers.ts.
+  const sessionKey = ctx.sessionId ?? 'tui';
+  const memorySystemMsgs = ctx.memory === false
+    ? []
+    : sessionMemoryLayer({ sessionKey, cwd: ctx.cwd, ...(ctx.memory ?? {}) });
   const gitSnapshotSystemMsgs = buildSessionRuntimeSystemMessages({
     cwd: ctx.cwd,
   });
@@ -137,7 +156,12 @@ export function buildDashboardTurnPreamble(
   //   성립한다. fail-soft: ambient 조회 실패가 턴을 막지 않는다.
   let selfOpsSystemMsgs: LLMMessage[] = [];
   try {
-    selfOpsSystemMsgs = [elanousSelfAccessPrompt(ctx.sessionId), ...elanousSelfAmbientParts(ctx.userText), localRefGroundingAmbient(ctx.userText)]
+    selfOpsSystemMsgs = [
+      elanousSelfAccessPrompt(ctx.sessionId),
+      ...sessionSelfAmbientParts(sessionKey),
+      investigationRecallAmbient(ctx.userText),
+      localRefGroundingAmbient(ctx.userText),
+    ]
       .filter(Boolean)
       .map((content): LLMMessage => ({ role: 'system', content }));
   } catch { /* fail-soft */ }
@@ -150,10 +174,12 @@ export function buildDashboardTurnPreamble(
     : [];
   const preamble = [
     ...universalPreamble,
+    ...seatBootSystemMsgs,
     ...planModeSystemMsgs,
     ...askSystemMsgs,
     ...approvalSystemMsgs,
     ...sandboxSystemMsgs,
+    ...memorySystemMsgs,
     ...gitSnapshotSystemMsgs,
     ...surfaceSystemMsgs,
     ...selfOpsSystemMsgs,
@@ -190,10 +216,12 @@ export function buildDashboardTurnPreamble(
       rich: ctx.rich === true,
       builderCounts: {
         universal: universalPreamble.length,
+        seatBoot: seatBootSystemMsgs.length,
         planMode: planModeSystemMsgs.length,
         ask: askSystemMsgs.length,
         approval: approvalSystemMsgs.length,
         sandbox: sandboxSystemMsgs.length,
+        memory: memorySystemMsgs.length,
         gitSnapshot: gitSnapshotSystemMsgs.length,
         surface: surfaceSystemMsgs.length,
         selfOps: selfOpsSystemMsgs.length,

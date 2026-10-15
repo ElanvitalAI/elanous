@@ -12,6 +12,8 @@ export function dashboardLogHelpLines(): string[] {
     '  /log freeze                 Show scroll-freeze status + queued-line count.',
     '  /log turn <off|rule|time|both|now>  Insert/toggle between-turn separator (rule + optional clock).',
     '  /log fold <line|task-unit|kind-unit>  Set fold mode: line (budget), task-unit (tool headers), kind-unit (same-kind ops).',
+    '  /log unfold [all]           Expand every folded block now (same as /log fold off).',
+    '  /log fold all               Collapse every folded block back.',
     '  /log filter <query>         Filter visible log rows by substring.',
     '  /log filter clear           Clear the active visible-row filter.',
     '  /log search [query]         Open search modal (no query) or jump to first match.',
@@ -30,6 +32,8 @@ export function dashboardLogHelpLines(): string[] {
     '  s        Open in-pane search modal',
     '  n / Shift+N  Next / previous match (after a search)',
     '  Esc      Clear active search highlight',
+    '  f / F    Toggle the latest folded block / every folded block',
+    '  Ctrl+X f (anywhere, incl. input) toggles every folded block.',
     '  Ctrl+L   Clear log',
     '  Ctrl+\u2191/\u2193 (anywhere) also resizes; Ctrl+0 resets.',
   ];

@@ -2,6 +2,7 @@
 import { spawn } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
+import { debug } from '../debug/log.js';
 import { mintRunId } from '../harness/harness-space.js';
 import { spawnElanousSync } from '../instance/spawn-elanous.js';
 import { passJourneyNode } from '../self-dev/graph-journey-nodes.js';
@@ -29,7 +30,11 @@ export interface RepairCycleInput {
   notify?: (seat: string, body: string) => void;
   observeLaunch?: (move: string, runId: string) => void;
   resolveOwner?: (card: TaskCard) => RepairOwner;
+  /** Shared only by one `tasks rejudge --all` invocation; a single-card rejudge has no cap. */
+  repairBudget?: RepairTickBudget;
 }
+
+export interface RepairTickBudget { max: number; requested: number; capped: number }
 
 export type RepairCycleOutcome = { decision: 'would-repair' | 'repair-requested' | 'repair-pending' | 'repair-applied' | 'repair-failed' | 'repair-stopped'; reason: string };
 export type RepairOwner = { seat?: TaskSeat; source: string; reason?: string };
@@ -230,6 +235,13 @@ export async function runRepairCycle(input: RepairCycleInput): Promise<RepairCyc
       ? { ...current, status: 'failed', history: [...(current.history ?? []), { at: now.toISOString(), event: 'repair-owner-missing', pr, head, detail: reason }] } : undefined);
     return { decision: 'repair-stopped', reason };
   }
+  if (input.repairBudget && input.repairBudget.requested >= input.repairBudget.max) {
+    input.repairBudget.capped++;
+    const reason = `repairMaxPerTick 상한 ${input.repairBudget.max} · 다음 틱에 재판정`;
+    try { debug.log('task-agent', 'repair-tick-cap', { card: card.id, pr, head, max: input.repairBudget.max,
+      requested: input.repairBudget.requested, capped: input.repairBudget.capped, move: judged.judgement.move }); } catch { /* fail-soft */ }
+    return { decision: 'would-repair', reason };
+  }
   const next = attempts.length + 1;
   const runId = mintRunId();
   const { from, to } = alternateRepairModel(card);
@@ -251,6 +263,7 @@ export async function runRepairCycle(input: RepairCycleInput): Promise<RepairCyc
   try {
     await (input.request ?? defaultRequestRepair)({ card: card.id, pr, head, repo, resultPath, goalFile,
       runId, model: to, seat: owner.seat });
+    if (input.repairBudget) input.repairBudget.requested++;
   } catch (error) {
     const reason = `repair launch failed: ${error instanceof Error ? error.message : String(error)}`;
     updateTaskCard(statePath, card.id, (current) => current?.repairs?.some((entry) => entry.runId === runId && entry.status === 'requested')

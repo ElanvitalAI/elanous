@@ -19,12 +19,13 @@ function handle(action: () => Promise<void> | void): Promise<void> {
 }
 
 function allLoopTable(entries: AllLoopEntry[]): void {
-  console.log('id\t층\t주인 자리\t모드\t기대 주기\t호스트\t울타리 역할\t관측 카테고리\t마지막 실행');
+  console.log('id\t층\t주인 자리\t모드\t기대 주기\t호스트\t울타리 역할\t관측 카테고리\t마지막 실행\t메시지 주소\t답글 몸\t깨움\t깨움 출처\t안 읽은 글');
   for (const entry of entries) {
     const interval = entry.expectEveryMinutes === undefined ? '모름'
       : entry.cronIrregular ? `불규칙 · 최대 ${entry.expectEveryMinutes}분` : `${entry.expectEveryMinutes}분`;
     console.log([entry.id, entry.kind, entry.owner ?? '모름', entry.mode ?? '모름', interval,
-      entry.host ?? '모름', entry.fenceRole ?? '모름', entry.observationCategory ?? '모름', entry.lastRunAt ?? '모름'].join('\t'));
+      entry.host ?? '모름', entry.fenceRole ?? '모름', entry.observationCategory ?? '모름', entry.lastRunAt ?? '모름',
+      entry.msgAddress ?? '—', entry.replyBody ?? 'none', entry.wake ?? 'none', entry.wakeSource === 'unresolved' ? '모름' : entry.wakeSource ?? '—', entry.unreadCount ?? '모름'].join('\t'));
   }
 }
 

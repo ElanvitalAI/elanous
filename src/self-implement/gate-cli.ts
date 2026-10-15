@@ -14,7 +14,7 @@ import { buildGateBaselineReport, calculateGateTestCountChange, formatGateBaseli
 import { resolveGateScope } from './gate-scope.js';
 import { publicExposureFiles, runExposeGate } from './expose-gate.js';
 import { getUserConfig } from '../user-config.js';
-import { debug } from '../debug/log.js';
+import { debug, redactSecretText } from '../debug/log.js';
 import { buildDocumentGuardianIndex, formatDocumentGuardians } from './document-guardian-index.js';
 import { buildImporterTestIndex, importerTestsNotInRunSet, isTestPath, type ImporterTestIndex } from './importer-test-index.js';
 import { buildRouteConsumerTestIndex } from './route-consumer-test-index.js';
@@ -695,7 +695,16 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
     lines.push(`shards: ${sharded.shards.length} (${sharded.shards.map((shard) => `${shard.id}=${shard.files.join(',')}`).join('; ')})${sharded.measurementFailures ? ` · 측정 실패 ${sharded.measurementFailures}` : ''}`);
     // 조각이 «못 쟀다»일 때 이유가 줄에 없으면 자리·시간 초과·죽음을 가를 수 없다(OP 10-09 light RC) — 종료 코드·신호를 같이 싣는다.
     const side = (code: number | null, signal: string | null | undefined, junit: string | undefined) => signal ? `signal ${signal}` : code === null ? 'exit ?' : `exit ${code}${junit === undefined ? ' · junit 없음' : ''}`;
-    for (const attempt of sharded.attempts) lines.push(`shard attempt: ${attempt.shardId} #${attempt.attempt} · 지금 ${side(attempt.currentExitCode, attempt.currentSignal, attempt.currentJUnit)} · 기준 ${side(attempt.baselineExitCode, attempt.baselineSignal, attempt.baselineJUnit)}`);
+    for (const attempt of sharded.attempts) {
+      const plannedFiles = sharded.shards.find((shard) => shard.id === attempt.shardId)?.files;
+      const baselineFiles = attempt.baselineFiles;
+      const baselineDifference = baselineFiles && plannedFiles && (baselineFiles.length !== plannedFiles.length || baselineFiles.some((file, index) => file !== plannedFiles[index]))
+        ? ` · 기준 파일 ${baselineFiles.join(',') || '(none)'}` : '';
+      lines.push(`shard attempt: ${attempt.shardId} #${attempt.attempt} · 지금 ${side(attempt.currentExitCode, attempt.currentSignal, attempt.currentJUnit)} · 기준 ${side(attempt.baselineExitCode, attempt.baselineSignal, attempt.baselineJUnit)} · 파일 ${plannedFiles?.join(',') ?? '(unknown)'}${baselineDifference}`);
+      const renderDiagnostic = (value: string): string => redactSecretText(value).replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ').slice(0, 500);
+      if (attempt.currentJUnit === undefined && attempt.currentDiagnostic) lines.push(`shard diagnostic: ${attempt.shardId} #${attempt.attempt} 지금 · ${renderDiagnostic(attempt.currentDiagnostic)}`);
+      if (attempt.baselineJUnit === undefined && attempt.baselineDiagnostic) lines.push(`shard diagnostic: ${attempt.shardId} #${attempt.attempt} 기준 · ${renderDiagnostic(attempt.baselineDiagnostic)}`);
+    }
     const { aggregate } = sharded;
     let shardBaseline: SelfGateCliResult['baseline'];
     let unmeasuredReason: string | undefined;

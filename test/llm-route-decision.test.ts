@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { tierModel } from '../src/llm/model-defaults';
-import { currentRouteDecision, formatRouteDecisionSummary, recordCurrentRouteDecision, resolveRouteDecision } from '../src/llm/route-decision.js';
+import { currentRouteDecision, formatRouteDecisionSummary, recordCurrentRouteDecision, resolveRouteDecision, sessionModelPin, setSessionModelPin } from '../src/llm/route-decision.js';
 
 describe('RouteDecision R0 read-model', () => {
   test('explicit pin always wins over Codex policy', () => {
@@ -55,5 +55,29 @@ describe('RouteDecision R0 read-model', () => {
     expect(summary).toContain('codex-tier-policy');
     // 렌더가 «모델만» 내고 강도를 잃지 않는지 — 두 레인이 모델을 공유할 수 있으므로 중요하다.
     if (decision.effort) expect(summary).toContain(decision.effort);
+  });
+});
+
+describe('TUI-MODEL-SESSION-SCOPE — session model pin', () => {
+  test('a pin sent as explicitModel beats the codex tier policy (the 10-14 OPT failure)', () => {
+    const luna = tierModel('budget', 'openai-codex');
+    // 전제: 핀 없이는 configuredModel=luna 여도 정책이 무시한다.
+    const unpinned = resolveRouteDecision({ provider: 'openai-codex', configuredModel: luna, text: '이 설계를 계획해줘' });
+    expect(unpinned.source).toBe('legacy-default');
+    expect(unpinned.model).not.toBe(luna);
+
+    setSessionModelPin('test-pin', { provider: 'openai-codex', model: luna });
+    const pin = sessionModelPin('test-pin', 'openai-codex');
+    const pinned = resolveRouteDecision({ provider: 'openai-codex', configuredModel: luna, text: '이 설계를 계획해줘', ...(pin ? { explicitModel: pin.model } : {}) });
+    expect(pinned).toMatchObject({ model: luna, source: 'explicit-pin' });
+    setSessionModelPin('test-pin', null);
+    expect(sessionModelPin('test-pin')).toBeNull();
+  });
+
+  test('a pin chosen under another provider is not applied', () => {
+    setSessionModelPin('test-pin-2', { provider: 'openai-codex', model: 'gpt-6-luna' });
+    expect(sessionModelPin('test-pin-2', 'anthropic')).toBeNull();
+    expect(sessionModelPin('test-pin-2', 'openai-codex')).toEqual({ provider: 'openai-codex', model: 'gpt-6-luna' });
+    setSessionModelPin('test-pin-2', null);
   });
 });

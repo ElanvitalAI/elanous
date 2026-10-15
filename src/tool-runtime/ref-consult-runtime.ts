@@ -23,7 +23,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { LLMToolSpec } from '../llm.js';
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
-import { DEFAULT_REFERENCE_ROOTS } from '../agent/ref-grounding.js';   // ★ F3 — 로컬 canonical ref 루트
+import { DEFAULT_REFERENCE_ROOTS, denyNonPublicReference } from '../agent/ref-grounding.js';   // ★ F3 — 로컬 canonical ref 루트
 import { debug } from '../debug/log.js';
 
 const CACHE_ROOT_DEFAULT = join(homedir(), '.cache', 'elanous-refs');
@@ -123,6 +123,17 @@ export function dispatchRefConsult(
 ): RefConsultResult {
   const host = args.host ?? 'github.com';
   const cacheRoot = args.cacheRoot ?? CACHE_ROOT_DEFAULT;
+  // 대표 2026-10-14 — 비공개 소스(Claude Code 사본)는 캐시·로컬 ref 어느 쪽이든 조회하지 않는다.
+  //   owner·repo 는 단일 경로 성분이어야 한다 — `<사본 이름>/.` 같은 값이 join() 정규화로 이름 판정을 우회하지 못하게.
+  for (const [field, value] of [['owner', args.owner], ['repo', args.repo]] as const) {
+    if (!/^[A-Za-z0-9._-]+$/.test(value) || value === '.' || value === '..') {
+      throw new Error(`RefConsult: ${field} must be a single path segment (got ${JSON.stringify(value)})`);
+    }
+  }
+  //   판정은 `repo` 칸만 — 공개 저장소 owner 이름이 우연히 같아도 막지 않는다(로컬 중첩 경로는 아래에서 따로 거른다).
+  if (denyNonPublicReference(args.repo)) {
+    throw new Error(`RefConsult: ${args.owner}/${args.repo} is a non-public source and is not consulted. Use public documentation instead.`);
+  }
   // ★ F3(2026-07-22) — repo 경로 해석을 fallback 체인으로: ①에이전트 scratch 캐시(SyncRepo 산출·있으면 우선)
   //   → ②로컬 canonical ref(~/source/ref/<repo>·flat bare-name·재클론 없이 90 repo 즉시 grep) → ③둘 다 없으면
   //   throw. 종전엔 캐시만 봐서 캐시 미존재 시 canonical ref 가 놀아도 "SyncRepo 먼저" 로 죽던 단절을 연결.
@@ -133,7 +144,11 @@ export function dispatchRefConsult(
   if (!existsSync(join(cachePath, '.git'))) {
     const roots = args.referenceRoots ?? DEFAULT_REFERENCE_ROOTS;
     const localHit = roots
-      .flatMap((root) => [join(root, args.repo), join(root, args.owner, args.repo)])
+      .flatMap((root) => [
+        join(root, args.repo),
+        // 로컬 ref 의 <owner>/<repo> 중첩은 owner 디렉터리가 비공개 사본이면 그 아래로 내려가지 않는다.
+        ...(denyNonPublicReference(args.owner) ? [] : [join(root, args.owner, args.repo)]),
+      ])
       .find((p) => existsSync(join(p, '.git')));
     if (localHit) { repoPath = localHit; source = 'local-ref'; }
     else {

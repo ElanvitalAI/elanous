@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { debug } from '../debug/log.js';
+import { debug, redactSecretText } from '../debug/log.js';
 import { prepareDeterministicChildEnvironment } from '../../scripts/lib/deterministic-env.js';
 import { withBaselineWorktree } from '../self-implement/gate-baseline.js';
 import { aggregateGateTestShards, type GateShardAttempt, type GateShardAggregate } from './shard-aggregate.js';
@@ -21,7 +21,24 @@ export type ShardProcess = (cwd: string, files: readonly string[]) => {
   junit?: string;
   rssMb?: number;
   seconds?: number;
+  /** Bounded, redacted process output for an abnormal exit before JUnit exists. */
+  diagnostic?: string;
 };
+
+const DIAGNOSTIC_STREAM_LIMIT = 240;
+
+function boundedDiagnostic(stdout: Uint8Array, stderr: Uint8Array): string | undefined {
+  const oneStream = (bytes: Uint8Array): string => {
+    const safe = redactSecretText(Buffer.from(bytes).toString('utf8')).replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ').trim();
+    if (safe.length <= DIAGNOSTIC_STREAM_LIMIT) return safe;
+    // Bun can print the cause after a long preamble; keep both ends within the same bound.
+    const head = Math.floor((DIAGNOSTIC_STREAM_LIMIT - 1) / 2);
+    return `${safe.slice(0, head)}…${safe.slice(-(DIAGNOSTIC_STREAM_LIMIT - 1 - head))}`;
+  };
+  const out = oneStream(stdout);
+  const err = oneStream(stderr);
+  return [out && `stdout: ${out}`, err && `stderr: ${err}`].filter(Boolean).join(' · ') || undefined;
+}
 
 /** Absent only when the path provably is not a file there (missing, or not a regular file); any other stat error
  *  (permissions …) is not evidence of absence, so the file stays in the baseline run (fail-closed: unmeasured). */
@@ -102,6 +119,7 @@ export function runShardedGateTests(
           currentJUnit: current.junit, baselineJUnit: base.junit,
           currentExitCode: current.exitCode, baselineExitCode: base.exitCode,
           currentSignal: current.signal, baselineSignal: base.signal,
+          currentDiagnostic: current.diagnostic, baselineDiagnostic: base.diagnostic,
           baselineFiles,
         });
       }
@@ -125,10 +143,13 @@ export function runBunShard(cwd: string, files: readonly string[]): ReturnType<S
     const result = Bun.spawnSync(['bun', ...args], {
       cwd, env: isolated.env, stdout: 'pipe', stderr: 'pipe', timeout: 300_000,
     });
+    const junit = existsSync(report) ? readFileSync(report, 'utf8') : undefined;
     return {
       exitCode: result.exitCode,
       signal: result.signalCode ? String(result.signalCode) : undefined,
-      junit: existsSync(report) ? readFileSync(report, 'utf8') : undefined,
+      junit,
+      ...(junit === undefined && (result.exitCode !== 0 || result.signalCode)
+        ? { diagnostic: boundedDiagnostic(result.stdout, result.stderr) } : {}),
       rssMb: measured ? result.resourceUsage.maxRSS / (1024 * 1024) : undefined,
       seconds: measured ? (performance.now() - started) / 1000 : undefined,
     };

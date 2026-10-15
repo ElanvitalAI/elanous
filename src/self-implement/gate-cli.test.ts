@@ -141,7 +141,7 @@ describe('runSelfGateCli', () => {
     expect(result.lines.join('\n')).toContain('[gate-baseline] introduced=1, preexisting=1, unknown=0');
     expect(result.lines.join('\n')).toContain('shard attempt: shard-1 #1');
     expect(result.lines.join('\n')).toContain('shard attempt: shard-2 #1');
-    expect(result.lines.join('\n')).toContain('shard attempt: shard-1 #1 · 지금 exit 1 · 기준 exit 1');
+    expect(result.lines.join('\n')).toContain('shard attempt: shard-1 #1 · 지금 exit 1 · 기준 exit 1 · 파일 src/a.test.ts');
   });
 
   test('--shards names why an attempt was unmeasured — signal, exit and missing JUnit per side (OP 10-09 light RC)', () => {
@@ -157,9 +157,41 @@ describe('runSelfGateCli', () => {
       runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
     });
     const text = result.lines.join('\n');
-    expect(text).toContain('shard attempt: shard-1 #1 · 지금 signal SIGTERM · 기준 exit 0');
-    expect(text).toContain('shard attempt: shard-1 #2 · 지금 exit 1 · junit 없음 · 기준 exit ?');
+    expect(text).toContain('shard attempt: shard-1 #1 · 지금 signal SIGTERM · 기준 exit 0 · 파일 src/a.test.ts');
+    expect(text).toContain('shard attempt: shard-1 #2 · 지금 exit 1 · junit 없음 · 기준 exit ? · 파일 src/a.test.ts');
     expect(text).toContain('shards: unmeasured (shard-1)');
+  });
+
+  test('--shards reports both sides and selected files for a no-JUnit exit 2 without leaking secrets', () => {
+    const files = ['src/a.test.ts', 'src/b.test.ts'];
+    const shards = [{ id: 'shard-2', files, plannedRssMb: 10, plannedSeconds: 1 }];
+    const attempts = [{ shardId: 'shard-2', attempt: 1, currentExitCode: 2, baselineExitCode: 2,
+      currentDiagnostic: 'stderr: API_KEY=supersecretvalue12345 current bootstrap error',
+      baselineDiagnostic: 'stderr: API_KEY=*** baseline bootstrap error' }];
+    const result = runSelfGateCli('/repo', { shards: 1 }, {
+      changedFiles: () => ({ files, baseRef: 'HEAD' }), exists: () => true,
+      runShards: () => ({ shards, attempts, aggregate: { status: 'unmeasured', retryShardIds: ['shard-2'] } }),
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+    });
+    const output = result.lines.join('\n');
+    expect(result.exitCode).toBe(1);
+    expect(output).toContain('shard attempt: shard-2 #1 · 지금 exit 2 · junit 없음 · 기준 exit 2 · junit 없음 · 파일 src/a.test.ts,src/b.test.ts');
+    expect(output).toContain('shard diagnostic: shard-2 #1 지금 · stderr: API_KEY=*** current bootstrap error');
+    expect(output).toContain('shard diagnostic: shard-2 #1 기준 · stderr: API_KEY=*** baseline bootstrap error');
+    expect(output).not.toContain('supersecretvalue12345');
+  });
+
+  test('--shards distinguishes the baseline files actually run when a new test exists only at head', () => {
+    const files = ['src/old.test.ts', 'src/new.test.ts'];
+    const shards = [{ id: 'shard-1', files, plannedRssMb: 10, plannedSeconds: 1 }];
+    const attempts = [{ shardId: 'shard-1', attempt: 1, currentExitCode: 2, baselineExitCode: 2,
+      baselineFiles: ['src/old.test.ts'], currentDiagnostic: 'stderr: current', baselineDiagnostic: 'stderr: baseline' }];
+    const result = runSelfGateCli('/repo', { shards: 1 }, {
+      changedFiles: () => ({ files, baseRef: 'HEAD' }), exists: () => true,
+      runShards: () => ({ shards, attempts, aggregate: { status: 'unmeasured', retryShardIds: ['shard-1'] } }),
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+    });
+    expect(result.lines.join('\n')).toContain('파일 src/old.test.ts,src/new.test.ts · 기준 파일 src/old.test.ts');
   });
 
   test('default bun test command uses an isolated deterministic environment and cleans it', () => {

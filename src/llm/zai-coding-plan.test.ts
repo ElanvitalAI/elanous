@@ -170,6 +170,23 @@ describe('오류 판별 — 1113/1308/1310/1316~1321', () => {
     expect(extractZaiPlanLimitSignal(500, 'not json', 'stop')).toBeNull();
   });
 
+  test('1308 신호 경계 — 리셋 문면 없으면 resetAt null(신호는 산다) · overage 세 값 그대로 · 1308 외 코드는 null', () => {
+    // 슈퍼바이저의 판단 축: resetAt 이 있어야 «리셋까지 짧다/길다» 를 잴 수 있다. 없어도 null 로 신호는 살린다.
+    const noReset = extractZaiPlanLimitSignal(429, JSON.stringify({ error: { code: '1308', message: 'Usage limit reached for the past 5 hours.' } }), 'balance');
+    expect(noReset).toEqual({ provider: 'glm', kind: 'plan-limit', resetAt: null, overage: 'balance' });
+    for (const overage of ['stop', 'balance', 'openrouter'] as const) {
+      const sig = extractZaiPlanLimitSignal(429, JSON.stringify({ error: {
+        code: '1308', message: 'Usage limit reached for 5 hours. Resets at 2026-10-11 09:12:33.',
+      } }), overage)!;
+      expect(sig.overage).toBe(overage);
+      expect(sig.resetAt).toBe(Date.parse('2026-10-11T09:12:33+08:00'));
+    }
+    // 첫 조각의 판정선은 1308 뿐 — 주 창 plan-limit(1310)·rate(1302)·other(1214) 는 null
+    expect(extractZaiPlanLimitSignal(429, JSON.stringify({ error: { code: '1310', message: 'Usage limit reached for this week. Resets at 2026-10-11 09:12:33.' } }), 'stop')).toBeNull();
+    expect(extractZaiPlanLimitSignal(429, JSON.stringify({ error: { code: '1302', message: 'rate' } }), 'stop')).toBeNull();
+    expect(extractZaiPlanLimitSignal(429, JSON.stringify({ error: { code: '1214', message: 'bad param' } }), 'stop')).toBeNull();
+  });
+
   test('next_flush_time — 문면의 시각(시간대 없으면 UTC+8) · 숫자 칸', () => {
     const msg = 'Usage limit reached for the past 5 hours. Insufficient balance for extra usage. Resets at 2026-10-11 09:12:33.';
     const r = classifyZaiError(429, JSON.stringify({ error: { code: '1316', message: msg } }))!;
@@ -258,6 +275,21 @@ describe('공급자 흐름 — 적산·폴백·멈춤', () => {
     });
     await expect(drain(provider.streamChat!([{ role: 'user', content: 'hi' }], {}))).rejects.toMatchObject({
       planLimitSignal: { provider: 'glm', kind: 'plan-limit', resetAt, overage: 'stop' },
+    });
+  });
+
+  test('출력이 나간 뒤의 1308 — 폴백 대신 멈추되 «한참 작업한 런»의 신호(resetAt·overage)를 그대로 실어 슈퍼바이저에 넘긴다', async () => {
+    // 대표 10-12 «공급자 한도로 한참 작업한 런을 죽이는 건 아깝다» — 첫 조각은 이 지점에서 판단 재료를 보존하는 것.
+    const resetAt = Date.parse('2026-10-11T09:12:33+08:00');
+    const { provider, orCalls } = setup('openrouter', async function* () {
+      yield { type: 'text', delta: 'long work already streamed' };
+      throw apiError(429, 1308, 'Usage limit reached for 5 hours. Resets at 2026-10-11 09:12:33.');
+    });
+    const err = await drain(provider.streamChat!([{ role: 'user', content: 'hi' }], {})).catch((e) => e);
+    expect(err).toBeInstanceOf(ZaiCodingPlanLimitError);
+    expect(orCalls).toEqual([]);                       // 이미 나간 출력 위에 다른 모델을 잇지 않는다(종전 규칙 그대로)
+    expect((err as ZaiCodingPlanLimitError).planLimitSignal).toEqual({
+      provider: 'glm', kind: 'plan-limit', resetAt, overage: 'openrouter',
     });
   });
 

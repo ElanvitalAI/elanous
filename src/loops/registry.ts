@@ -14,6 +14,9 @@ import { getUserConfig, type UserConfig } from '../user-config.js';
 import { runGraph, type GraphRunState } from '../graph-runner/runner.js';
 import { FENCE_ROLES } from '../hq/hq.js';
 import { dueBefore, type CheckEntry } from './checker.js';
+import { readUnreadCount } from '../msg/msg-store.js';
+import { loopMessageRoute, SEAT_MESSAGE_ROUTES, type LoopReplyBody, type MessageWake } from './msg-address.js';
+import { resolveWake, type WakeDeps, type WakeResolution } from './msg-wake.js';
 
 export interface LoopRun {
   at: string;
@@ -25,6 +28,12 @@ export interface LoopRun {
 }
 export interface LoopEntry {
   id: string;
+  msgAddress?: string | null;
+  replyBody?: LoopReplyBody;
+  wake?: MessageWake;
+  /** Where `wake` came from — `unresolved` is «모름», not a measured absence. */
+  wakeSource?: WakeResolution['source'];
+  unreadCount?: number | null;
   title: string;
   description: string | null;
   owner?: string | null;
@@ -48,6 +57,20 @@ export interface LoopRegistryOptions {
   scheduleAction?: (action: 'create' | 'enable' | 'disable', args: Record<string, unknown>) => Promise<unknown>;
   /** Home used to expand `~`/`$HOME` in cron redirects; tests inject a temp dir instead of writing the real HOME. */
   home?: string;
+  /** Seat wake resolution (pty manifest ⊕ seat folders); tests inject fixed rows. */
+  wakeDeps?: WakeDeps;
+}
+
+function messageFields(id: string, stateRoot: string): { msgAddress: string | null; replyBody: LoopReplyBody; wake: MessageWake; wakeSource?: WakeResolution['source']; unreadCount: number | null } {
+  const route = loopMessageRoute(id);
+  return { ...route, ...(route.msgAddress ? { wakeSource: 'loop-table' as const } : {}), unreadCount: route.msgAddress ? readUnreadCount(route.msgAddress, join(stateRoot, 'msg', 'messages.db')) : null };
+}
+
+/** A seat row is addressed by its seat; its wake path is resolved on this host (pty name → herdr pane → 모름). */
+function seatMessageFields(seat: string, stateRoot: string, wakeDeps?: WakeDeps): { msgAddress: string; replyBody: LoopReplyBody; wake: MessageWake; wakeSource: WakeResolution['source']; unreadCount: number | null } {
+  const wake = resolveWake(seat, wakeDeps);
+  return { msgAddress: seat, replyBody: 'agent', wake: wake.wake, wakeSource: wake.source,
+    unreadCount: readUnreadCount(seat, join(stateRoot, 'msg', 'messages.db')) };
 }
 
 function graphFiles(dir: string): string[] {
@@ -216,7 +239,7 @@ export function listLoops(opts: LoopRegistryOptions = {}): LoopEntry[] {
     const active = matched.filter(row => !!row.enabled && !!row.cron);
     const next = active.map(row => nextLoopFire(row.cron!, opts.now ?? new Date())).filter((v): v is string => v !== null).sort()[0] ?? null;
     const title = typeof header?.title === 'string' ? header.title : doc.graph_id;
-    const entry: LoopEntry = { id: doc.graph_id, title,
+    const entry: LoopEntry = { id: doc.graph_id, title, ...messageFields(doc.graph_id, stateRoot),
       description: typeof header?.description === 'string' ? header.description : null,
       ...resolveOwner(doc.graph_id, title, config, header?.owner),
       mode: typeof header?.mode === 'string' ? header.mode : null, file: relative(root, file),
@@ -229,6 +252,12 @@ export function listLoops(opts: LoopRegistryOptions = {}): LoopEntry[] {
 }
 
 export interface AllLoopEntry extends CheckEntry {
+  msgAddress?: string | null;
+  replyBody?: LoopReplyBody;
+  wake?: MessageWake;
+  /** Where `wake` came from — `unresolved` is «모름», not a measured absence. */
+  wakeSource?: WakeResolution['source'];
+  unreadCount?: number | null;
   kind: 'graph' | 'seat' | 'cron-shell' | 'orchestrator' | 'unregistered';
   title: string;
   cron?: string;
@@ -589,6 +618,7 @@ export function listAllLoops(opts: LoopRegistryOptions = {}): AllLoopEntry[] {
     const declaredHost = typeof header.host === 'string' && header.host ? header.host : undefined;
     const declaredCategory = typeof header.observationCategory === 'string' && header.observationCategory ? header.observationCategory : undefined;
     return { kind: 'graph', id: loop.id, title: loop.title, owner: loop.owner ?? undefined, ownerSource: loop.ownerSource,
+      msgAddress: loop.msgAddress, replyBody: loop.replyBody, wake: loop.wake, ...(loop.wakeSource ? { wakeSource: loop.wakeSource } : {}), unreadCount: loop.unreadCount,
       ...(declaredHost || installed.length ? { host: declaredHost ?? hostname() } : {}),
       observationCategory: declaredCategory ?? 'graph.runner',
       ...(fenceRole ? { fenceRole } : {}),
@@ -599,6 +629,7 @@ export function listAllLoops(opts: LoopRegistryOptions = {}): AllLoopEntry[] {
       recentStatuses: runs.map(run => run.status) };
   });
   const namedIds = namedCronIds(rows, claimed);
+  const seatOf = new Map<AllLoopEntry, string>();
   for (const row of rows) {
     if (claimed.has(row.id)) continue;
     const command = row.command ?? '';
@@ -622,7 +653,7 @@ export function listAllLoops(opts: LoopRegistryOptions = {}): AllLoopEntry[] {
     const picked = logMtime && (!recorded || Date.parse(logMtime) >= Date.parse(recorded)) ? 'log-mtime'
       : recorded ? 'registry' : 'none';
     debug.log('loops.registry', 'cron-last-run', { id, targets, picked });
-    all.push({ kind, id, title,
+    const pushed: AllLoopEntry = { kind, id, title,
       ...resolveOwner(id, title, config, undefined, seatArg ?? seat, seatArg ? 'seat-arg' : 'seat'), ...(fenceRole ? { fenceRole } : {}),
       host: hostname(), observationCategory: row.category,
       enabled: !!row.enabled, registered: true,
@@ -632,7 +663,11 @@ export function listAllLoops(opts: LoopRegistryOptions = {}): AllLoopEntry[] {
       ...(picked === 'log-mtime' ? { lastRunAt: logMtime, evidence: picked }
         : picked === 'registry' ? { lastRunAt: recorded, evidence: picked } : {}),
       ...(row.last_status ? { lastStatus: row.last_status } : {}),
-      recentStatuses: row.last_status ? [row.last_status] : [] });
+      recentStatuses: row.last_status ? [row.last_status] : [] };
+    all.push(pushed);
+    const seatName = (seatArg ?? seat)?.toUpperCase();
+    // 선언된 자리 줄만 자리 주소로 공개한다 — 모르는 `--seat FOO` 는 종전처럼 주소 없음.
+    if (kind === 'seat' && seatName && Object.hasOwn(SEAT_MESSAGE_ROUTES, seatName)) seatOf.set(pushed, seatName);
   }
   const warnings = unregisteredCronLoops(all, graphOpts);
   for (const row of warnings) {
@@ -647,7 +682,10 @@ export function listAllLoops(opts: LoopRegistryOptions = {}): AllLoopEntry[] {
   for (const loop of all) bySource[loop.ownerSource!]++;
   debug.log('loop.check', 'ownership', { total: all.length, bySource });
   debug.log('loops.registry', 'list-all', { count: all.length });
-  return all;
+  const stateRoot = opts.stateRoot ?? effectiveInstanceRoot();
+  return all.map(entry => entry.kind === 'graph' ? entry
+    : seatOf.has(entry) ? { ...entry, ...seatMessageFields(seatOf.get(entry)!, stateRoot, opts.wakeDeps) }
+      : { ...entry, ...messageFields(entry.id, stateRoot) });
 }
 
 /** An unclaimed cron line with any elanous marker must surface as an unregistered warning. */

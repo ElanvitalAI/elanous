@@ -2,7 +2,19 @@ import { describe, expect, it } from 'bun:test';
 import { Command } from 'commander';
 import { registerUsageCommand } from '../cli/usage-cli.js';
 import type { LogStoreRow } from '../mss/logging/log-store.js';
-import { rollupRunUsage, type RunUsageInput } from './run-usage-rollup.js';
+import { excludeCoveredPodRawRows, rollupRunUsage, type RunUsageInput } from './run-usage-rollup.js';
+
+describe('returned Pod raw usage coverage', () => {
+  it('drops raw rows only for Jobs with a measured rollup, independent of input order', () => {
+    const covered = { origin: 'pod', podJob: 'job-a', site: 'agent-turn', inputTokens: 10 };
+    const uncovered = { origin: 'pod', podJob: 'job-b', site: 'agent-turn', inputTokens: 20 };
+    const missing = { job: 'job-b', site: 'pod-rollup:missing', measured: false };
+    const rollup = { job: 'job-a', site: 'pod-rollup:agent-turn', inputTokens: 10 };
+    const local = { site: 'agent-turn', inputTokens: 3 };
+    expect(excludeCoveredPodRawRows([covered, uncovered, missing, rollup, local])).toEqual([uncovered, missing, rollup, local]);
+    expect(excludeCoveredPodRawRows([rollup, covered])).toEqual([rollup]);
+  });
+});
 
 const usageInputs: RunUsageInput[] = [
   { runId: 'A', site: 'stream-llm', role: 'classify', model: 'm', billingProvider: 'p', billing: 'api', hostId: 'h1', inputTokens: 10, outputTokens: 2, cost: { kind: 'known', usd: 1 } },

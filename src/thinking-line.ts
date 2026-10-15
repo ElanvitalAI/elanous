@@ -295,10 +295,19 @@ export function startPinnedThinking(opts: StartPinnedThinkingOpts): ThinkingHand
   const interval = opts.intervalMs ?? INTERVAL_MS;
   const timer = interval > 0 ? setInterval(tick, interval) : null;
 
+  // ⛔ stop() 뒤엔 칠하지 않는다 — 멈춘 손잡이에 늦게 온 update/updateMetrics(다음 반복이 같은 손잡이를
+  //   재사용하거나 턴 마감 뒤 도착한 이벤트)가 «✢ Thinking…» 프레임을 footer 에 다시 써서, 타이머 없는
+  //   멈춘 표시로 남았다(TUI 결함 #5 · 10-14 13:43 오류 뒤 «Thinking…» 정지).
+  const repaint = (): void => {
+    if (stopped) return;
+    paint();
+    opts.onFrame();
+  };
+
   return {
-    update: (m) => { message = m; messageFactory = null; paint(); opts.onFrame(); },
-    updateAnimated: (fn) => { messageFactory = fn; paint(); opts.onFrame(); },
-    updateMetrics: (m) => { metrics = { ...metrics, ...m }; paint(); opts.onFrame(); },
+    update: (m) => { message = m; messageFactory = null; repaint(); },
+    updateAnimated: (fn) => { messageFactory = fn; repaint(); },
+    updateMetrics: (m) => { metrics = { ...metrics, ...m }; repaint(); },
     reflow: () => { if (!stopped) paint(); opts.onFrame(); },
     stop: (stopOpts) => {
       if (stopped) return;

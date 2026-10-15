@@ -7,15 +7,20 @@ const RESOURCE_SEATS: readonly OrchestratorSeat[] = ['OP', 'TC', 'MK', 'UX'];
 type WorkCell = Pick<ChecklistItem, 'owner' | 'status'>;
 
 /** Allocate whole base slots by remaining work; this calculation does not decide launches. */
-export function calculateSeatBaseShares({ totalSlots, currentRound, nextRound, seatCaps }: {
+export function calculateSeatBaseShares({ totalSlots, currentRound, nextRound, seatCaps, minShare = 0 }: {
   totalSlots: number;
   currentRound: readonly WorkCell[];
   nextRound: readonly WorkCell[];
   seatCaps: Readonly<Record<OrchestratorSeat, number>>;
+  /** CAP-DYN seat minimum: seats holding yellow work receive min(minShare, cap) before the weighted split. Default 0 keeps the weighted-only split. */
+  minShare?: number;
 }): Record<OrchestratorSeat, number> {
   if (!Number.isSafeInteger(totalSlots) || totalSlots < 0 ||
     RESOURCE_SEATS.some(seat => !Number.isSafeInteger(seatCaps[seat]) || seatCaps[seat] < 0)) {
     throw new RangeError('totalSlots and seatCaps must be nonnegative safe integers');
+  }
+  if (!Number.isSafeInteger(minShare) || minShare < 0) {
+    throw new RangeError('minShare must be a nonnegative safe integer');
   }
   const shares: Record<OrchestratorSeat, number> = { OP: 0, TC: 0, MK: 0, UX: 0 };
   const weights: Record<OrchestratorSeat, number> = { OP: 0, TC: 0, MK: 0, UX: 0 };
@@ -28,23 +33,48 @@ export function calculateSeatBaseShares({ totalSlots, currentRound, nextRound, s
   }
 
   let available = Math.min(totalSlots, RESOURCE_SEATS.reduce((sum, seat) => sum + seatCaps[seat], 0));
-  let eligible = RESOURCE_SEATS.filter(seat => weights[seat] > 0 && seatCaps[seat] > 0);
+  if (minShare > 0) {
+    // Seat minimum: only seats with at least one yellow cell qualify, capped by their own cap.
+    const floors = RESOURCE_SEATS
+      .filter(seat => weights[seat] > 0)
+      .map(seat => ({ seat, floor: Math.min(minShare, seatCaps[seat]) }))
+      .filter(entry => entry.floor > 0);
+    const floorTotal = floors.reduce((sum, entry) => sum + entry.floor, 0);
+    if (floorTotal > available) {
+      // The minimums alone exceed the pool: largest-weight seats keep theirs, the rest get zero.
+      floors.sort((a, b) => weights[b.seat] - weights[a.seat]);
+      for (const { seat, floor } of floors) {
+        const grant = Math.min(floor, available);
+        shares[seat] = grant;
+        available -= grant;
+        if (available === 0) break;
+      }
+      return shares;
+    }
+    for (const { seat, floor } of floors) {
+      shares[seat] = floor;
+      available -= floor;
+    }
+  }
+  const room = (seat: OrchestratorSeat): number => seatCaps[seat] - shares[seat];
+  let eligible = RESOURCE_SEATS.filter(seat => weights[seat] > 0 && room(seat) > 0);
   while (available > 0 && eligible.length > 0) {
     const totalWeight = eligible.reduce((sum, seat) => sum + weights[seat], 0);
     const ideal = (seat: OrchestratorSeat) => available * weights[seat] / totalWeight;
-    const capped = eligible.filter(seat => ideal(seat) >= seatCaps[seat]);
+    const capped = eligible.filter(seat => ideal(seat) >= room(seat));
     if (capped.length > 0) {
       for (const seat of capped) {
-        shares[seat] = seatCaps[seat];
-        available -= seatCaps[seat];
+        const fill = room(seat);
+        shares[seat] += fill;
+        available -= fill;
       }
       eligible = eligible.filter(seat => !capped.includes(seat));
       continue;
     }
     const remainders = eligible.map(seat => ({ seat, exact: ideal(seat) }));
     for (const { seat, exact } of remainders) {
-      shares[seat] = Math.floor(exact);
-      available -= shares[seat];
+      shares[seat] += Math.floor(exact);
+      available -= Math.floor(exact);
     }
     remainders.sort((a, b) => (b.exact - Math.floor(b.exact)) - (a.exact - Math.floor(a.exact)));
     for (const { seat } of remainders) {

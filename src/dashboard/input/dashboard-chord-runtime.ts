@@ -31,6 +31,7 @@ export interface DashboardChordRuntimeDeps<Pane> {
   focusPreviewAfterTerminalExpand: () => void;
   onPreviewTerminalExpandChanged: (expanded: boolean) => void;
   onMissingPreviewTerminal: () => void;
+  toggleAllFolds?: () => void;
 }
 
 export function createDashboardChordRuntime<Pane>(
@@ -80,6 +81,7 @@ export function createDashboardChordRuntime<Pane>(
     },
     toggleLogZoom: deps.toggleLogZoom,
     openPreviewTerminal: deps.openPreviewTerminal,
+    toggleAllFolds: deps.toggleAllFolds,
     togglePreviewTerminalExpand: () => {
       const term = deps.getPreviewTerminal();
       if (term !== null && term.isAlive) {

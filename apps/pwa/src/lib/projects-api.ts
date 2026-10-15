@@ -7,6 +7,33 @@ export interface Project {
   createdAt: string;
 }
 
+export interface ProjectAutopsyFailure {
+  runId: string;
+  nodeId: string;
+  summary: string;
+  kind: string;
+  status: string;
+  startedAt?: string;
+  endedAt?: string;
+  verdict?: string;
+}
+
+export interface ProjectAutopsyCause {
+  kind: string;
+  count: number;
+  runs: string[];
+}
+
+export interface ProjectAutopsy {
+  project: { id: string; name: string; primaryFolder?: string };
+  attribution: { status: 'measured' | 'partial' | 'unavailable'; reason?: 'ledger-project-id-missing' };
+  coverage: { failuresTruncated: boolean; proposalsTruncated: boolean; causeCounts: 'returned-failures' };
+  failures: ProjectAutopsyFailure[];
+  causes: ProjectAutopsyCause[];
+  proposals: Array<{ runId: string; message: string; requestedAt: number }>;
+  pendingApprovals: number;
+}
+
 export class ProjectsApi {
   constructor(private readonly client: DaemonClient) {}
 
@@ -32,5 +59,9 @@ export class ProjectsApi {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ projectId }),
     });
+  }
+
+  fetchProjectAutopsy(projectId: string): Promise<ProjectAutopsy> {
+    return this.client.fetchJson(`/v1/projects/${encodeURIComponent(projectId)}/autopsy`);
   }
 }

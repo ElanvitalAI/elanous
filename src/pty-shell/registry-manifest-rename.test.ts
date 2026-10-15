@@ -110,6 +110,37 @@ function runOutputTotalOnExit(stateDir: string, failedExitFlushes = 0): unknown 
 }
 
 describe('registry rename manifest synchronization', () => {
+  test('renamePty also renames a live non-child control target (bare TUI row tui:<pid>) in the manifest', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'elanous-tui-rename-'));
+    try {
+      const script = `
+        import { registerPtyControlTarget, renamePty } from './src/pty-shell/registry.ts';
+        import { upsertPtyManifest, getPtyManifest } from './src/pty-shell/pty-manifest.ts';
+        const id = 'tui:' + process.pid;
+        let alive = true;
+        upsertPtyManifest({ id, kind: 'tui', nickname: 'launch-name', cmd: 'elanous', startedAt: 1, now: 1 });
+        const unregister = registerPtyControlTarget({ id, accessMode: 'write', transitionPolicy: 'open', setAccessMode: () => true, isAlive: () => alive, canWrite: () => true, write() {}, resize() {} });
+        const renamed = renamePty(id, '  op  ');
+        const after = getPtyManifest(id)?.nickname;
+        alive = false;
+        const deadRenamed = renamePty(id, 'other');
+        unregister();
+        const missing = renamePty(id, 'other');
+        console.log(JSON.stringify({ renamed, after, deadRenamed, missing, final: getPtyManifest(id)?.nickname }));
+        process.exit(0);
+      `;
+      const result = Bun.spawnSync([process.execPath, '-e', script], {
+        cwd: repo,
+        env: { ...process.env, NODE_ENV: 'production', ELANOUS_STATE_DIR: stateDir },
+        stdout: 'pipe', stderr: 'pipe',
+      });
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(new TextDecoder().decode(result.stdout).trim())).toEqual({ renamed: true, after: 'op', deadRenamed: false, missing: false, final: 'op' });
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
   test('later rename updates the manifest nickname used by remote refs', () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'pty-rename-manifest-'));
     try {

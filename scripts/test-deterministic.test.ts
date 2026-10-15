@@ -20,6 +20,7 @@ import {
   prepareIsolatedTestEnv,
   runDeterministicTests as runDeterministicTestsOriginal,
   scanNamePatternStderr,
+  selectedTestFiles,
   TEMP_ROOT_PREFIX,
   terminateDirectChild,
   type DirectChild,
@@ -857,6 +858,47 @@ describe('mock.module process isolation', () => {
       const result = run(selector, 'test/plain.test.ts');
       expect(result.status).toBe(0);
       expect((`${result.stdout}\n${result.stderr}`).match(/Ran 1 test across 1 file/g) ?? []).toHaveLength(2);
+    }
+  });
+
+  test('path-selected runs parse only reachable tests and plan the same commands as a full scan', async () => {
+    const root = makeRoot();
+    for (const dir of ['test/a', 'test/b']) mkdirSync(join(root, dir), { recursive: true });
+    const mock = "import { mock, test } from 'bun:test'; mock.module('x', () => ({})); test('m', () => {});\n";
+    const plain = "import { test } from 'bun:test'; test('p', () => {});\n";
+    writeFileSync(join(root, 'test/a/mock.test.ts'), mock);
+    writeFileSync(join(root, 'test/a/plain.test.ts'), plain);
+    writeFileSync(join(root, 'test/b/other-mock.test.ts'), mock);
+    writeFileSync(join(root, 'test/b/plain.test.ts'), plain);
+    const all = deriveTestFiles({ cwd: root });
+    expect(deriveMockModuleTestFiles({ cwd: root, files: selectedTestFiles(['test/a'], all, root) }))
+      .toEqual(['test/a/mock.test.ts']);
+    expect(selectedTestFiles(['--dots', 'b/plain', './test/a/mock.test.ts'], all, root).sort())
+      .toEqual(['test/a/mock.test.ts', 'test/b/plain.test.ts']);
+    const fullMocks = deriveMockModuleTestFiles({ cwd: root });
+    expect(fullMocks).toEqual(['test/a/mock.test.ts', 'test/b/other-mock.test.ts']);
+    for (const argv of [
+      ['test/a'], ['test/a/plain.test.ts'], ['test/a/plain.test.ts', 'test/a/mock.test.ts'],
+      ['--dots', 'plain', 'other-mock'], ['mock'], ['./test/b/other-mock.test.ts', 'test/a'],
+    ]) {
+      const commands: string[][] = [];
+      const code = await runDeterministicTestsOriginal({
+        cwd: root,
+        argv,
+        mkdtempSync: () => makeRoot(),
+        waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+        report: () => {},
+        gitConfig: (_cwd, args) => args[0] === 'rev-parse' ? root : '',
+        spawn: (opts) => {
+          commands.push(opts.cmd);
+          return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+        },
+      });
+      expect(code).toBe(0);
+      const explicit = classifyExplicitTestFiles(argv, root);
+      expect(commands).toEqual(planDeterministicTestCommands(
+        argv, [], [...new Set([...fullMocks, ...explicit.mockFiles])], [...new Set([...all, ...explicit.files])], root,
+      ));
     }
   });
 

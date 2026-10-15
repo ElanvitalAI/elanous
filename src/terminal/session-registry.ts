@@ -158,6 +158,12 @@ export class TerminalSessionRegistry {
         shellArgs: spec.shellArgs,
         env: spec.env,
         termName: spec.termName,
+        useRegistry: spec.useRegistry,
+        registryKind: spec.registryKind,
+        registryNickname: spec.registryNickname,
+        registryOrigin: spec.registryOrigin,
+        registryPurpose: spec.registryPurpose,
+        registrySeat: spec.registrySeat,
         bounds: spec.bounds,
         sizePreset: spec.sizePreset,
         onExit: (code) => {

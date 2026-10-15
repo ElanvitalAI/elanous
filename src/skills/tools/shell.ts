@@ -178,6 +178,116 @@ function rejectedCdResult(): RunShellDispatchResult {
   };
 }
 
+// ── ops-ledger CLI steering (RunShell-0 convergence) ────────────────────────
+// The durable mailbox and release-checklist ledgers have in-process native
+// tools (MsgList/MsgPost/MsgAck · ChecklistList/Add/Set/Move —
+// src/skills/tools/ops-ledger.ts, registered for the same skill+tui hosts as
+// RunShell). Shelling out to the `elanous` CLI for exactly those covered ops
+// pays 1.3–2s of process startup for work the host process does in <300ms,
+// and the CLI's human-oriented stdout amplifies TUI screen defects — so the
+// call is steered to the native tool with a structured refusal naming it.
+//
+// Deliberately NOT a blanket elanous-CLI ban: only the seven covered ops are
+// refused, and argv that explicitly scopes another universe (--test /
+// --config-dir / --state-dir) is allowed through because the native tools
+// always serve THIS process's instance.
+const LEDGER_CLI_BIN = /(?:^|[/\\])(?:elanous|elanous\.mjs|elanous\.cjs|eln)$/;
+const LEDGER_ENV_BIN = /(?:^|[/\\])env$/;
+const LEDGER_CLI_NATIVE_TOOL: Readonly<Record<string, string>> = {
+  'msg list': 'MsgList',
+  'msg post': 'MsgPost',
+  'msg ack': 'MsgAck',
+  'release checklist list': 'ChecklistList',
+  'release checklist add': 'ChecklistAdd',
+  'release checklist set': 'ChecklistSet',
+  'release checklist move': 'ChecklistMove',
+};
+
+/** The covered ops-ledger CLI op in this argv and its exposed native tool,
+ *  or null when the command should run normally. */
+export function matchLedgerCli(
+  command: readonly string[], availableToolNames: readonly string[] = [],
+): { covered: string; tool: string } | null {
+  let binIndex = 0;
+  // RunShell receives argv, so recognize only argv-preserving env wrappers.
+  // An alternate instance must still run its own CLI, never this process's native tool;
+  // so must a changed or unset ELANOUS_TRACK — the native tools record THIS process's
+  // seat as the actor and route ChecklistMove permissions by it.
+  if (LEDGER_ENV_BIN.test(command[0] ?? '')) {
+    binIndex = 1;
+    while (binIndex < command.length) {
+      const arg = command[binIndex]!;
+      if (arg === '-i' || arg === '--ignore-environment') return null;
+      if (arg === '--') { binIndex += 1; continue; }
+      if (arg === '-u' || arg === '--unset') {
+        const name = command[binIndex + 1];
+        if (!name || /^ELANOUS_(?:STATE_DIR|CONFIG_DIR|TEST_STATE_DIR|TRACK)$/.test(name)) return null;
+        binIndex += 2;
+        continue;
+      }
+      if (arg.startsWith('--unset=')) {
+        if (/^--unset=ELANOUS_(?:STATE_DIR|CONFIG_DIR|TEST_STATE_DIR|TRACK)$/.test(arg)) return null;
+        binIndex += 1;
+        continue;
+      }
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)) {
+        if (/^ELANOUS_(?:STATE_DIR|CONFIG_DIR|TEST_STATE_DIR|TRACK)=/.test(arg)) return null;
+        binIndex += 1;
+        continue;
+      }
+      break;
+    }
+  }
+  if (command[binIndex] === 'bun' || command[binIndex] === 'bunx' || command[binIndex] === 'node' || command[binIndex] === 'npx') {
+    binIndex += 1;
+    if (command[binIndex] === '--bun') binIndex += 1;
+  }
+  if (!LEDGER_CLI_BIN.test(command[binIndex] ?? '')) return null;
+  const args = command.slice(binIndex + 1);
+  if (args.some((arg) => arg === '--test' || arg === '--config-dir' || arg.startsWith('--config-dir=')
+    || arg === '--state-dir' || arg.startsWith('--state-dir=')
+    || arg === '--test-state-dir' || arg.startsWith('--test-state-dir='))) return null;
+  let i = 0;
+  while (i < args.length && args[i]!.startsWith('-')) i += 1;
+  const sub = args[i];
+  const covered = sub === 'msg'
+    ? `msg ${args[i + 1]}`
+    : sub === 'release' && args[i + 1] === 'checklist'
+      ? `release checklist ${args[i + 2]}`
+      : '';
+  const tool = covered ? LEDGER_CLI_NATIVE_TOOL[covered] : undefined;
+  if (!tool || !availableToolNames.includes(tool)) return null;
+  return { covered, tool };
+}
+
+function ledgerCliSteerOutput(shellTool: string, covered: string, tool: string): string {
+  const metadata = covered === 'release checklist set' ? ' — for owner/priority/disposition/kind/… use ChecklistEdit, one field per call' : '';
+  return `${shellTool} rejected \`${covered}\`: call the native ${tool} tool instead (same ledger, same permissions and audit, no CLI startup)${metadata}.`;
+}
+
+/** Structured refusal steering a covered ops-ledger CLI argv to its native
+ *  tool, or null when the command should run normally. Exported so tests
+ *  can exercise the matcher without spawning anything. */
+export function rejectedLedgerCliResult(
+  command: readonly string[], availableToolNames: readonly string[] = [],
+): RunShellDispatchResult | null {
+  const match = matchLedgerCli(command, availableToolNames);
+  if (!match) return null;
+  const { covered, tool } = match;
+  return {
+    output: ledgerCliSteerOutput('RunShell', covered, tool),
+    exitCode: null,
+    outcome: 'spawn-error',
+    elapsedMs: 0,
+    stdout: '',
+    stderr: `use the native ${tool} tool instead of the ${covered} CLI`,
+    truncated: false,
+    approvalKey: 'rejected:ops-ledger-cli',
+    sandboxed: false,
+    sandboxTool: 'none',
+  };
+}
+
 function logShellDispatch(event: string, data: Record<string, unknown>): void {
   debug.log('shell.dispatch', event, data);
 }
@@ -240,7 +350,7 @@ export function enqueueShellCompletionNotice(
 
 export async function dispatchRunShell(
   rawArgs: Record<string, unknown>,
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; availableToolNames?: readonly string[] } = {},
 ): Promise<RunShellDispatchResult> {
   const command = asCommand(rawArgs.command);
   const cwd = typeof rawArgs.cwd === 'string' ? rawArgs.cwd : undefined;
@@ -254,6 +364,12 @@ export async function dispatchRunShell(
   if (command[0] === 'cd') {
     logShellDispatch('cd.rejected', { reason: 'argv-state-does-not-persist' });
     return rejectedCdResult();
+  }
+  const ledgerCliMatch = matchLedgerCli(command, opts.availableToolNames);
+  if (ledgerCliMatch) {
+    // covered op ⊕ tool only — the argv can carry a message body.
+    logShellDispatch('ledger-cli.steered', { shell: 'run-shell', ...ledgerCliMatch });
+    return rejectedLedgerCliResult(command, opts.availableToolNames)!;
   }
   const effectiveCwd = cwd ?? getSessionCwd();
   const cwdSource = cwd === undefined ? 'session' : 'argument';

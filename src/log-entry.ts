@@ -26,7 +26,7 @@
 // data model. Fold/expand (Phase F4) will need a typed pane later; for
 // now the strings carry ANSI styling only.
 
-import { FIGURES } from './render.js';
+import { FIGURES, singleLineToolHeaderText } from './render.js';
 import { C } from './tui.js';
 import { agentColor } from './agent/color-map.js';
 import { debug } from './debug/log.js';
@@ -357,7 +357,7 @@ export function summarizeToolCall(
         : '';
       const cwd = args.cwd ? ` cwd=${args.cwd}` : '';
       const mode = args.mode ? ` mode=${args.mode}` : '';
-      return `${command || '(empty command)'}${cwd}${mode}`;
+      return singleLineToolHeaderText(`${command || '(empty command)'}${cwd}${mode}`);
     }
     case 'GetDashboardState': {
       return 'current dashboard snapshot';
@@ -391,7 +391,7 @@ export function renderLogEntry(
       return [(entry.color ?? C.peach)(entry.label)];
 
     case 'tool-header': {
-      const head = `${C.peach(G.CIRCLE)} ${C.bold(entry.toolName)}(${C.subtext(truncate(entry.summary, width - entry.toolName.length - 4))})`;
+      const head = `${C.peach(G.CIRCLE)} ${C.bold(entry.toolName)}(${C.subtext(truncate(singleLineToolHeaderText(entry.summary), width - entry.toolName.length - 4))})`;
       return [head];
     }
 

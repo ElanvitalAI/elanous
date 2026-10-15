@@ -35,7 +35,8 @@
 // Core really can run headless.
 
 import type { LLMMessage, LLMToolSpec, ContentBlock } from '../llm.js';
-import { debug } from '../debug/log.js';
+import { debug, redactSecretText } from '../debug/log.js';
+import { CoreTurnAuthRejectedError } from '../core-turn/auth-rejected-notice.js';
 import {
   runCoreTurn,
   runGoalLoop,
@@ -49,20 +50,25 @@ import type { AcpServerOptions, AcpTurnContext } from './server.js';
 import { acpToolDenialResult } from './tool-approval.js';
 import { readOriginSessionMeta } from './origin-session-meta.js';
 import { isFactQuestion } from './fact-question.js';
-import { classifyTuiChatIntent, type TuiChatRoute } from '../core-turn/short-question.js';
+import { classifyTuiChatIntent, formatTuiRouteLine, type TuiChatRoute } from '../core-turn/short-question.js';
 import { HARNESS_ROLE_ENV } from '../harness/harness-space.js';
 
 const FACT_QUESTION_INSTRUCTION = '사실·최신 정보 질문이다. WebSearch 를 1~2회 쓰고 검색 결과(제목·스니펫·URL)로 답하라. 출처 링크를 붙여라. 셸·브라우저·파일 도구는 검색 결과로 부족할 때만. 도구 예산에 닿으면 지금까지 근거로 답하고 끝에 «더 찾아볼까요?»를 붙여라.';
 
+// 읽기·분석 keeps every tool (it reads files and state) and only leaves the goal loop.
+type QuickTuiRoute = Exclude<TuiChatRoute, '코딩·구현' | '읽기·분석'>;
+
 // An allowlist, not a denylist: a new repository writer cannot slip into a quick turn.
-const QUICK_TOOLS: Record<Exclude<TuiChatRoute, '코딩·구현'>, readonly string[]> = {
+// memory_recall is read-only and on every quick route: the self-access discipline (agent/self-ambient.ts) tells
+// every turn to recall before judging, so a route without it asked for a tool it could not call (TUI-SEAT-MEMORY-SCOPE).
+const QUICK_TOOLS: Record<QuickTuiRoute, readonly string[]> = {
   '조회': ['decisions_pending', 'ops_seats', 'ops_status', 'release_status', 'logs_query', 'context_now', 'memory_recall', 'Read'],
-  '설정 변경': ['DashboardConfigGet', 'DashboardConfigSet', 'LlmListAvailableModels', 'prompt_getRuntimeConfig', 'prompt_setRuntimeConfig', 'view_getConfig', 'view_applyRuntimeConfig', 'view_saveConfig'],
-  '조사': ['WebSearch', 'OmniSearch', 'Grep', 'Glob', 'Read', 'fact_check'],
-  '상시 일': ['schedule_manage', 'schedule_list', 'schedule_create', 'schedule_update', 'session_manage', 'ops_status'],
+  '설정 변경': ['DashboardConfigGet', 'DashboardConfigSet', 'LlmListAvailableModels', 'prompt_getRuntimeConfig', 'prompt_setRuntimeConfig', 'view_getConfig', 'view_applyRuntimeConfig', 'view_saveConfig', 'memory_recall'],
+  '조사': ['WebSearch', 'OmniSearch', 'Grep', 'Glob', 'Read', 'fact_check', 'memory_recall'],
+  '상시 일': ['schedule_manage', 'schedule_list', 'schedule_create', 'schedule_update', 'session_manage', 'ops_status', 'memory_recall'],
 };
 
-export function toolsForTuiRoute(tools: readonly LLMToolSpec[], route: Exclude<TuiChatRoute, '코딩·구현'>): LLMToolSpec[] {
+export function toolsForTuiRoute(tools: readonly LLMToolSpec[], route: QuickTuiRoute): LLMToolSpec[] {
   const preferred = QUICK_TOOLS[route];
   return preferred.flatMap((name) => tools.filter((tool) => tool.name === name));
 }
@@ -155,6 +161,10 @@ export function acpApprovalGatedDispatch(
   };
 }
 
+/** 사용자 답에서 뺀 검증 보충을 로그에 남길 때 한 조각의 글자 수 — 로그 저장의 문자열 상한
+ *  (`compactForLog` stringMax 256)보다 작아야 조각이 저장 중에 안 잘린다(리뷰 r4). */
+const FINAL_SUPPLEMENT_LOG_CHUNK = 240;
+
 /** Extract the trailing assistant message text from runCoreTurn's
  *  `newMessages` array. emitTurnComplete (src/llm.ts:3835) appends
  *  `{role:'assistant', content:[{type:'text', text:finalAssistantText}]}`
@@ -223,7 +233,7 @@ export function bridgeCoreTurnToAcp(
             hasAttachments: turnCtx.promptBlocks?.some((block) => block.type !== 'text') ?? false,
           })
         : { route: '코딩·구현' as const, reason: harness ? 'harness' : 'legacy', goalLoop: true };
-      const tools = !route.goalLoop && route.route !== '코딩·구현'
+      const tools = !route.goalLoop && route.route !== '코딩·구현' && route.route !== '읽기·분석'
         ? toolsForTuiRoute(availableTools, route.route)
         : availableTools;
       if (deps.tuiRouting) {
@@ -231,12 +241,27 @@ export function bridgeCoreTurnToAcp(
         // Only a quick route is announced: a coding turn's transcript stays exactly as before (preservation).
         // Awaited so the route line precedes the answer; a failed write is observed, not fatal to the turn.
         if (!route.goalLoop) {
-          try { await turnCtx.push(`라우팅: ${route.route}\n`); }
+          try { await turnCtx.push(formatTuiRouteLine(route.route)); }
           catch (error) { debug.log('chat.route', 'push-failed', { route: route.route, error: String(error) }); }
         }
       }
       const modelOverride = deps.resolveModel?.({ sessionId: turnCtx.sessionId, userText: turnCtx.userText });
-      const factQuestion = isFactQuestion(turnCtx.userText);
+      // Tier 2 arming(config-gated·2026-07-19 goal-exec → 아크4 전-family) — llm.goalLoop.enabled
+      // 면 across-turn goal loop(runGoalLoop)로 감싸 목표 완료(update_goal 증거게이트)까지 지속·
+      // continuation 재주입. **family 무관**(runGoalLoop 프롬프트·update_goal 툴 전부 provider-generic·
+      // 백스톱=max-iter·spin·blocked-3strike·context-pressure). 그 외엔 단일 turn(runCoreTurn).
+      // 하드코딩 기본 ON 아님 — config 로 아밍(안전).
+      const goalLoopCfg = getUserConfig().llm.goalLoop;
+      const armGoalLoop = goalLoopCfg?.enabled === true && route.goalLoop;
+      // 사실 질문 예산은 «단일 턴» 전용이다 — goal loop 와 겹치면 예산을 다 쓴 뒤에도 루프가 계속 재촉해
+      // 매 continuation 이 «Tool budget reached» 로 거부되고, 모델은 그것을 도구 장애로 읽어 blocked 를 남긴다
+      // (10-14 13:48 운영 TUI OP: route short-question·goalLoop ⊕ factQuestion → 소진 뒤 헛호출 7회).
+      const factShaped = isFactQuestion(turnCtx.userText);
+      const factQuestion = factShaped && !armGoalLoop;
+      if (factShaped && armGoalLoop) {
+        try { debug.log('chat.turn', 'fact-budget-skipped', { reason: 'goal-loop-armed', route: route.route }); }
+        catch { /* observation cannot interrupt a turn */ }
+      }
       const explicitMaxToolTurns = deps.resolveMaxToolTurns?.({ sessionId: turnCtx.sessionId });
       const maxToolTurns = explicitMaxToolTurns ?? (factQuestion ? getUserConfig().chat.factQuestion.maxToolTurns : undefined);
       const turnMessages: LLMMessage[] = factQuestion
@@ -262,15 +287,12 @@ export function bridgeCoreTurnToAcp(
       // `delta=''` (synthesizedText lost to ACP). The dashboard never
       // saw the substantive answer — only the streamed narration.
       let streamedTextSum = '';
-      // Tier 2 arming(config-gated·2026-07-19 goal-exec → 아크4 전-family) — llm.goalLoop.enabled
-      // 면 across-turn goal loop(runGoalLoop)로 감싸 목표 완료(update_goal 증거게이트)까지 지속·
-      // continuation 재주입. **family 무관**(runGoalLoop 프롬프트·update_goal 툴 전부 provider-generic·
-      // 백스톱=max-iter·spin·blocked-3strike·context-pressure). 그 외엔 단일 turn(runCoreTurn).
-      // 하드코딩 기본 ON 아님 — config 로 아밍(안전). turnFamily 는 관측용으로만 유지.
-      const goalLoopCfg = getUserConfig().llm.goalLoop;
+      // 런타임이 최종 답 꼬리에 붙인 검증 보충(변경 파일·검증 최신성·루프 마감 상태 — goal loop 내부 판정).
+      // 사용자 답에서는 빼고 로그로 보낸다(TUI 결함 #25). 코어 턴이 끝날 때마다(goal loop 반복 경계) 비운다.
+      let finalSupplement: { answer: string; supplement: string; finalText: string } | null = null;
+      // turnFamily 는 관측용으로만 유지(goal loop 아밍 판정은 위 사실 질문 판정 앞에서 한다).
       const turnModel = modelOverride ?? getUserConfig().llm.model;
       const turnFamily = getModelFamily(turnModel);
-      const armGoalLoop = goalLoopCfg?.enabled === true && route.goalLoop;
       if (armGoalLoop) {
         // 관측 — 어느 family/모델에서 across-turn goal-loop 가 아밍됐나(전-family 개방 검증).
         debug.log('goal.loop', 'arm', { family: turnFamily, model: turnModel });
@@ -326,7 +348,7 @@ export function bridgeCoreTurnToAcp(
             return approvedDispatch(name, args, dispatchCtx);
           }
         : approvedDispatch;
-      await runTurnDispatch({
+      const dispatchResult = await runTurnDispatch({
         sessionId: turnCtx.sessionId,
         ...(originSessionId ? { originSessionId } : {}),
         ...(turnCtx.userText ? { userText: turnCtx.userText } : {}),
@@ -338,7 +360,11 @@ export function bridgeCoreTurnToAcp(
         ...(maxToolTurns !== undefined ? { maxToolTurns } : {}),
         ...((!factQuestion || explicitMaxToolTurns !== undefined) && deps.budgetGrant !== undefined ? { budgetGrant: deps.budgetGrant } : {}),
         callbacks: {
-          onText: (delta) => {
+          onText: (delta, full) => {
+            // ⛔ 검증 보충이 붙은 최종 답의 재방출(`onText('', 답+보충)`)은 흘리지 않는다 — 빈 청크를 TUI 는
+            //   «확정(commit)»으로 읽어 이미 그린 답을 굳히고, 아래 onTurnComplete 재표면화가 같은 답을
+            //   «한 번 더» 그렸다(TUI 결함 #25 · 10-14 18:36 OPT). 답 표시는 onTurnComplete 가 정한다.
+            if (delta === '' && finalSupplement !== null && full === finalSupplement.finalText) return;
             // Fire-and-forget: ACP `push` is async but the core-turn
             // contract is synchronous onText. Chunks are delivered in
             // order because `sessionUpdate` is serialized per-
@@ -353,6 +379,7 @@ export function bridgeCoreTurnToAcp(
           // callers see today. Fire-and-forget for the same reason
           // onText is: callbacks are synchronous, `turnCtx.push*` is
           // async, ordering is preserved by the SDK.
+          onFinalAnswerSupplement: (info) => { finalSupplement = info; },
           onToolCall: (call) => {
             if (!factQuestion || maxToolTurns === undefined || maxToolTurns <= 0) {
               toolCallCount += 1;
@@ -362,7 +389,8 @@ export function bridgeCoreTurnToAcp(
             void turnCtx.pushToolCall(call);
           },
           onToolResult: (call) => { void turnCtx.pushToolResult(call); },
-          onUsage: (usage) => { void turnCtx.pushUsage(usage); },
+          // 턴 모델(라우팅 결과)을 실어 보낸다 — 대시보드 턴 지표가 설정 모델로 ctx·단가를 잡지 않게.
+          onUsage: (usage) => { void turnCtx.pushUsage({ ...usage, model: usage.model ?? turnModel }); },
           // Codex Responses API reasoning summary stream. Currently
           // surfaced via forensic only (debug.log) — acts as the
           // "did the model actually emit reasoning?" verification
@@ -438,8 +466,15 @@ export function bridgeCoreTurnToAcp(
               visibleFinalText !== null
               && visibleFinalText.length > 0
               && streamedTextSum.endsWith(visibleFinalText);
+            // ⭐ 최종 답 = 모델 답 ⊕ 런타임 검증 보충이면 사용자에겐 «모델 답»만 보인다 — 보충은 로그로(#25).
+            //   대화 이력(completedMessages)엔 그대로 남아 다음 턴 맥락은 바뀌지 않는다.
+            const supplement = finalSupplement !== null && finalAssistantText === finalSupplement.finalText
+              ? finalSupplement
+              : null;
+            finalSupplement = null;
             const needsReSurface =
-              visibleFinalText !== null
+              supplement === null
+              && visibleFinalText !== null
               && visibleFinalText !== streamedTextSum
               && !synthesisAlreadyStreamed
               && !originalFinalStreamed;
@@ -452,9 +487,34 @@ export function bridgeCoreTurnToAcp(
                   && visibleFinalText.startsWith(streamedTextSum),
                 endsWithStreamedTail: synthesisAlreadyStreamed,
                 needsReSurface,
+                supplementChars: supplement?.supplement.length ?? 0,
               });
             }
-            if (originalFinalStreamed) {
+            if (supplement !== null) {
+              const answerStreamed = supplement.answer.length > 0 && streamedTextSum.trimEnd().endsWith(supplement.answer);
+              try {
+                // 보충 «전체»를 남긴다 — 한 행이 저장 전에 잘리지 않게 조각(part/parts)으로 나눈다(리뷰 r3·r4).
+                const redacted = redactSecretText(supplement.supplement);
+                const parts = Math.max(1, Math.ceil(redacted.length / FINAL_SUPPLEMENT_LOG_CHUNK));
+                for (let part = 0; part < parts; part += 1) {
+                  debug.log('acp.turn', 'final-supplement-withheld', {
+                    sessionId: turnCtx.sessionId,
+                    answerChars: supplement.answer.length,
+                    answerStreamed,
+                    supplementChars: supplement.supplement.length,
+                    part: part + 1,
+                    parts,
+                    supplement: redacted.slice(part * FINAL_SUPPLEMENT_LOG_CHUNK, (part + 1) * FINAL_SUPPLEMENT_LOG_CHUNK),
+                  });
+                }
+              } catch { /* observation cannot interrupt a turn */ }
+              if (!answerStreamed && supplement.answer.length > 0) {
+                void turnCtx.push('');
+                void turnCtx.push(needsFollowup ? `${supplement.answer}${followupSuffix}` : supplement.answer);
+              } else if (needsFollowup) {
+                void turnCtx.push(followupSuffix);
+              }
+            } else if (originalFinalStreamed) {
               void turnCtx.push(followupSuffix);
             } else if (needsReSurface) {
               // Emit a clear-then-replace pair so clients that follow
@@ -476,6 +536,22 @@ export function bridgeCoreTurnToAcp(
           },
         },
       });
+      // ⭐ 인증 거절은 코어 턴이 «던지지 않고» 돌려준다 — 여기서 안 읽으면 서버는 end_turn 을 내고
+      //   TUI 엔 «✔ 완료»만 남는다(TUI 결함 #22). 던져서 실패 경로(prompt-failed · 오류 줄)로 보낸다.
+      const stopReason = (dispatchResult as { stopReason?: unknown } | null | undefined)?.stopReason;
+      if (stopReason === 'auth_rejected') {
+        const rawError = (dispatchResult as { errorMessage?: unknown }).errorMessage;
+        const error = new CoreTurnAuthRejectedError(typeof rawError === 'string' ? rawError : undefined);
+        try {
+          debug.log('acp.turn', 'auth-rejected', {
+            sessionId: turnCtx.sessionId,
+            model: turnModel,
+            goalLoop: armGoalLoop,
+            error: error.rawMessage.slice(0, 300),
+          }, { level: 'warn' });
+        } catch { /* observation cannot interrupt a turn */ }
+        throw error;
+      }
     } finally {
       clearInterval(poll);
     }

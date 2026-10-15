@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseRoleLlmFlags, formatRoleLlmSpec } from './role-llm-cli.js';
-import { resolveRoleLlm, resolveRoleModel, MODEL_ROLES, getUserConfig } from '../user-config.js';
+import { resolveConfiguredAgentRoleLlm, resolveRoleLlm, resolveRoleModel, MODEL_ROLES, getUserConfig } from '../user-config.js';
 
 // Classification: unlike dev-pipeline's default-seam leak, these tests call role
 // resolution directly. Supply an explicit non-credentialed local config so they test
@@ -41,6 +41,17 @@ describe('role-llm 입력 파서 — ⛔ 조용히 삼키지 않는다', () => {
     if (r.ok) expect(Object.keys(r.overrides).sort()).toEqual(['implement', 'review']);
   });
 
+  test('조율자·수호자 역할은 CLI 에서 명시적으로 선택할 수 있다', () => {
+    const parsed = parseRoleLlmFlags(['coordinator=grok/balanced', 'guardian=/balanced']);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.overrides.coordinator).toEqual({ provider: 'grok', tier: 'balanced' });
+      expect(parsed.overrides.guardian).toEqual({ tier: 'balanced' });
+    }
+    expect(parseRoleLlmFlags(['coordinator=']).ok).toBe(false);
+    expect(parseRoleLlmFlags(['guardian=unknown-provider']).ok).toBe(false);
+  });
+
   // ⭐ 이 네 개가 110차 F42(--acp-backend 가 조용히 무시됨)의 «직접» 처방이다.
   test('모르는 역할은 거부하고 이름을 댄다', () => {
     const r = parseRoleLlmFlags(['nope=grok']);
@@ -75,6 +86,52 @@ describe('role-llm 입력 파서 — ⛔ 조용히 삼키지 않는다', () => {
     expect(formatRoleLlmSpec('implement', undefined)).toContain('없음');
     expect(formatRoleLlmSpec('implement', { provider: 'grok', tier: 'best' })).toContain('provider=grok');
   });
+});
+
+test('조율자·수호자는 명시 설정이 없거나 빈 값이면 기본 모델로 기동하지 않는다', () => {
+  const config = resolverTestConfig();
+  expect(resolveConfiguredAgentRoleLlm('coordinator', { config, env: {} })).toBeUndefined();
+  expect(resolveConfiguredAgentRoleLlm('guardian', { config, env: {} })).toBeUndefined();
+  expect(resolveConfiguredAgentRoleLlm('coordinator', {
+    config, env: {}, overrides: { coordinator: {} },
+  })).toBeUndefined();
+  expect(resolveConfiguredAgentRoleLlm('coordinator', {
+    config: { ...config, roleLlm: { coordinator: { effort: 'high' } } }, env: {},
+  })).toBeUndefined();
+  const fromConfig = resolveConfiguredAgentRoleLlm('coordinator', {
+    config: { ...config, roleLlm: { coordinator: { provider: 'grok', tier: 'balanced' } } }, env: {},
+  });
+  expect(fromConfig).toMatchObject({ provider: 'grok', tier: 'balanced', source: 'config-role' });
+  const fromFlag = resolveConfiguredAgentRoleLlm('guardian', {
+    config, env: {}, overrides: { guardian: { provider: 'grok' } },
+  });
+  expect(fromFlag).toMatchObject({ provider: 'grok', tier: 'balanced', source: 'flag' });
+  const fromEnv = resolveConfiguredAgentRoleLlm('guardian', {
+    config, env: { ELANOUS_ROLE_LLM_GUARDIAN: '{"provider":"grok","tier":"balanced"}' },
+  });
+  expect(fromEnv).toMatchObject({ provider: 'grok', tier: 'balanced', source: 'environment' });
+  expect(resolveConfiguredAgentRoleLlm('guardian', {
+    config, env: { ELANOUS_ROLE_LLM_GUARDIAN: '{}' },
+  })).toBeUndefined();
+});
+
+test('config roleLlm.coordinator/guardian 의 빈 값·잘못된 값은 저장되지 않는다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-role-config-'));
+  try {
+    const path = join(root, 'config.json');
+    writeFileSync(path, JSON.stringify({ roleLlm: {
+      coordinator: { provider: 'grok', tier: 'balanced' }, guardian: { model: '  ' },
+    } }));
+    expect(getUserConfig(path).roleLlm).toEqual({ coordinator: { provider: 'grok', tier: 'balanced' } });
+    writeFileSync(path, JSON.stringify({ roleLlm: {
+      coordinator: {}, guardian: { effort: 'low' },
+    } }));
+    expect(getUserConfig(path).roleLlm).toBeUndefined();
+    writeFileSync(path, JSON.stringify({ roleLlm: {
+      coordinator: { provider: 'unknown-provider' }, guardian: { tier: 'balanced' },
+    } }));
+    expect(getUserConfig(path).roleLlm).toEqual({ guardian: { tier: 'balanced' } });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('config roleLlm.planning invalid effort only drops effort and preserves the model', () => {

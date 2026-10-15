@@ -1,5 +1,6 @@
 import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { isMainThread, parentPort, workerData, Worker } from 'node:worker_threads';
 import { queryRunningRuns, type QueriedRunningRunsResult } from '../self-implement/running-runs.js';
 import { loadRunLedger } from '../self-implement/run-ledger.js';
 import { localLoopRows } from '../dashboard/slash-runtime/loops-table.js';
@@ -8,6 +9,7 @@ import { debug, redactSecretText } from '../debug/log.js';
 import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
 import { listChecklist, devVersion, type Checklist } from '../release-loop/checklist.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { setElanousConfigDir } from '../elanous-config-dir.js';
 import { seatDay, seatLedgerPath, type SeatEntry } from '../seat-loop/seat-loop.js';
 import { listCoordEvents, type CoordEvent } from './coord-events.js';
 import { filterPublicDemoContext } from './context-now-public.js';
@@ -48,6 +50,18 @@ function todaySeatEntries(now: Date): Array<{ entry: SeatEntry; source: string }
       source: `elanous://seat-loop/${seat}/${day}#${index + 1}`,
     }] : []);
   });
+}
+
+function seatFact({ entry, source }: { entry: SeatEntry; source: string }): Extract<ContextFact, { kind: 'seat' }> {
+  return { kind: 'seat', seat: entry.seat, at: entry.at, status: entry.status,
+    id: entry.item?.id ?? null, title: entry.item?.source === 'checklist'
+      ? redactSecretText(entry.item.title.split(/\r?\n/, 1)[0] ?? '').slice(0, 120) : null, source };
+}
+
+/** The TUI status line needs seat facts only; it must not scan release or run ledgers. */
+export function seatStatusNow(now = new Date()): ContextNowAnswer {
+  return { at: `${now.toISOString().slice(0, 16)}:00.000Z`, topic: null,
+    facts: todaySeatEntries(now).map(seatFact), events: [], guide: [] };
 }
 
 const runSource = 'elanous://self-implement/running-runs';
@@ -143,11 +157,7 @@ export function contextNow(options: { topic?: string; limit?: number; audience?:
     facts.push({ kind: 'decision', id: item.id, title: redactSecretText(item.title.split(/\r?\n/, 1)[0] ?? '').slice(0, 120),
       status: item.status, dueAt: item.dueAt ?? null, source: `elanous://decisions/${encodeURIComponent(item.id)}` });
   }
-  for (const { entry, source } of (deps.seatEntries ?? todaySeatEntries)(now)) {
-    facts.push({ kind: 'seat', seat: entry.seat, at: entry.at, status: entry.status,
-      id: entry.item?.id ?? null, title: entry.item?.source === 'checklist'
-        ? redactSecretText(entry.item.title.split(/\r?\n/, 1)[0] ?? '').slice(0, 120) : null, source });
-  }
+  facts.push(...(deps.seatEntries ?? todaySeatEntries)(now).map(seatFact));
   const rawEvents = (deps.events ?? (since => listCoordEvents({ since })))(new Date(now.getTime() - 7 * 86_400_000).toISOString());
   const chronologicalEvents = rawEvents.slice().sort((a, b) => a.at.localeCompare(b.at));
   const matches = (text: string) => !topic || text.toLocaleLowerCase().includes(topic.toLocaleLowerCase());
@@ -198,4 +208,71 @@ export function contextNow(options: { topic?: string; limit?: number; audience?:
   const answer = { at, topic, facts: boundedFacts, events: selectedEvents, guide };
   debug.log('context.now', 'answer', { topic, facts: answer.facts, events: answer.events });
   return options.audience === 'public-demo' ? filterPublicDemoContext(answer, deps.brandCheck) : answer;
+}
+
+const workerAnswers = new Map<string, { promise: Promise<ContextNowAnswer>; expiresAt: number }>();
+const WORKER_ANSWER_TTL_MS = 5_000;
+const WORKER_SCAN_TIMEOUT_MS = 60_000;
+let workerScanTail: Promise<void> = Promise.resolve();
+
+/** Keep the ledger scan off the TUI event loop. Repeated identical reads share one scan. */
+export function contextNowInWorker(options: Parameters<typeof contextNow>[0] = {}): Promise<ContextNowAnswer> {
+  const stateRoot = process.env.ELANOUS_STATE_DIR;
+  const selectedRoot = effectiveInstanceRoot();
+  const key = JSON.stringify([selectedRoot, stateRoot ?? null, options.topic ?? null, options.limit ?? null, options.audience ?? null]);
+  const now = Date.now();
+  for (const [cachedKey, cached] of workerAnswers) {
+    if (cached.expiresAt < now) workerAnswers.delete(cachedKey);
+  }
+  const cached = workerAnswers.get(key);
+  if (cached) return cached.promise;
+  // Distinct topics queue behind the active scan instead of multiplying the same costly ledger walk.
+  const promise = workerScanTail.then(() => scanContextNowInWorker(options, stateRoot, selectedRoot));
+  workerScanTail = promise.then(() => undefined, () => undefined);
+  const entry = { promise, expiresAt: Infinity };
+  workerAnswers.set(key, entry);
+  void promise.then(() => { entry.expiresAt = Date.now() + WORKER_ANSWER_TTL_MS; }, () => { workerAnswers.delete(key); });
+  return promise;
+}
+
+export function scanContextNowInWorker(options: Parameters<typeof contextNow>[0], stateRoot: string | undefined, selectedRoot: string,
+  createWorker: () => Worker = () => new Worker(new URL(import.meta.url), { workerData: { kind: 'context-now' } }),
+  timeoutMs = WORKER_SCAN_TIMEOUT_MS): Promise<ContextNowAnswer> {
+  const worker = createWorker();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      debug.log('context.now', 'worker-timeout', { timeoutMs, topic: options?.topic ?? null, selectedRoot });
+      finish(new Error(`context_now worker timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    const finish = (error?: Error, answer?: ContextNowAnswer): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      void worker.terminate();
+      if (error) reject(error);
+      else resolve(answer!);
+    };
+    worker.on('message', (message: { answer?: ContextNowAnswer; error?: string }) => {
+      if (message.error) finish(new Error(message.error));
+      else if (message.answer) finish(undefined, message.answer);
+    });
+    worker.on('error', error => finish(error instanceof Error ? error : new Error(String(error))));
+    worker.on('exit', code => { if (!settled) finish(new Error(`context_now worker exited before answering: ${code}`)); });
+    // Preserve both caller roots: a programmatic config override is not inherited by workers.
+    worker.postMessage({ options, stateRoot, selectedRoot });
+  });
+}
+
+const contextWorkerPort = parentPort;
+if (!isMainThread && contextWorkerPort && workerData?.kind === 'context-now') {
+  contextWorkerPort.on('message', ({ options, stateRoot, selectedRoot }: { options: Parameters<typeof contextNow>[0]; stateRoot?: string; selectedRoot: string }) => {
+    try {
+      if (stateRoot === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = stateRoot;
+      setElanousConfigDir(selectedRoot);
+      contextWorkerPort.postMessage({ answer: contextNow(options) });
+    }
+    catch (error) { contextWorkerPort.postMessage({ error: error instanceof Error ? error.message : String(error) }); }
+  });
 }

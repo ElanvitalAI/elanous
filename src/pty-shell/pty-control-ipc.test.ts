@@ -709,6 +709,22 @@ describe('pty-control-ipc round-trip', () => {
     unregister();
   });
 
+  test('IPC rename reaches a live TUI control target (no PtyHandle) instead of unknown-pty; a dead one stays unknown', async () => {
+    const id = freshId();
+    register(id);
+    const target = createTuiControlTarget(id, { injectKey: () => true });
+    const unregister = registerPtyControlTarget(target);
+    const owner = () => processPtyControlRequests(getPtyControlTarget, () => false);
+    const named = requestRemotePtyControl(id, 'rename', { nickname: 'op' }, 2000);
+    await Bun.sleep(60); await owner();
+    await expect(named).resolves.toEqual({ status: 'success' });
+    target.deactivate();
+    const dead = requestRemotePtyControl(id, 'rename', { nickname: 'op2' }, 2000);
+    await Bun.sleep(60); await owner();
+    await expect(dead).resolves.toEqual({ status: 'unknown-pty' });
+    unregister();
+  });
+
   test('TUI raw-mode refusal settles as write-failed and never reports success', async () => {
     const id = freshId();
     register(id);

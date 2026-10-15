@@ -1,3 +1,11 @@
+import { seatStatusNow } from '../context-bus/context-now.js';
+import { seatsNowLine } from '../context-bus/context-now-surfaces.js';
+
+/** Shared by the live /status path and its rendering test. */
+export function readDashboardSeatsNow(now = Date.now()): string | null {
+  return seatsNowLine(seatStatusNow(new Date(now)), now);
+}
+
 export interface DashboardStatusLinesInput {
   readonly provider?: string | null;
   readonly model?: string | null;
@@ -6,6 +14,8 @@ export interface DashboardStatusLinesInput {
   readonly daemonConnected: boolean;
   readonly accountName?: string | null;
   readonly seatsNow?: string | null;
+  /** Boot rows the minimal first screen held back (PWA address · hitl port shift). */
+  readonly bootHeld?: readonly string[];
   readonly sessionSurfaceLines: readonly string[];
   readonly view: string;
   readonly focus: string;
@@ -53,6 +63,7 @@ export function buildDashboardStatusLines(input: DashboardStatusLinesInput): str
     connectionLine(address, input.daemonConnected),
     `계정: ${input.accountName?.trim() === 'default' ? '기본' : known(input.accountName)}`,
     ...(input.seatsNow ? [input.seatsNow] : []),
+    ...(input.bootHeld ?? []),
     '',
     DASHBOARD_STATUS_DETAIL_HEADING,
     ...input.sessionSurfaceLines.map(line => `  ${line}`),

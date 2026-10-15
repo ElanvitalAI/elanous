@@ -211,6 +211,8 @@ export interface TextInputHost {
      *  exactly as if the user had typed Enter. Reset to undefined on
      *  textInput return. */
     submit?: (request?: string | TextInputExternalSubmitRequest) => void;
+    /** Live buffer text while textInput is mounted; undefined after it returns. */
+    getBufferText?: () => string;
   };
   onLinesChange?: (visibleLines: number) => void;
   /** Preferred host seam for input-global shortcuts. textInput emits a
@@ -230,6 +232,7 @@ export interface ResolvedTextInputHost {
     repaint: () => void;
     insertAtCursor?: (text: string) => void;
     submit?: (request?: string | TextInputExternalSubmitRequest) => void;
+    getBufferText?: () => string;
   };
   onLinesChange?: (visibleLines: number) => void;
   dispatchGlobalAction?: (action: TextInputGlobalAction) => void | Promise<void>;
@@ -473,7 +476,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'sync',  aliases: ['s'],         description: 'Enter sync mode' },
   { name: 'plugin', aliases: ['plugins'], description: 'Manage plugins', subcommands: ['list', 'activate', 'deactivate', 'reload'] },
   { name: 'widget', aliases: ['widgets'], description: 'Manage widgets', subcommands: ['list', 'reload', 'instances'] },
-  { name: 'log',   aliases: [],             description: 'Chat Log controls — size / clear / filter / search / freeze / solo / turn / fold / help', subcommands: ['size', 'clear', 'filter', 'search', 'freeze', 'solo', 'turn', 'fold', 'help'] },
+  { name: 'log',   aliases: [],             description: 'Chat Log controls — size / clear / filter / search / freeze / solo / turn / fold / unfold / help', subcommands: ['size', 'clear', 'filter', 'search', 'freeze', 'solo', 'turn', 'fold', 'unfold', 'help'] },
   { name: 'loops', aliases: [], description: '루프와 크론 상태 표 — /loops [owner]' },
   { name: 'board', aliases: [], description: '판 체크리스트 — /board [판]' },
   { name: 'memory', aliases: ['mem'], description: 'Memory ops — list / show / search / add / delete (see `elanous memory --help`)', subcommands: ['list', 'show', 'search', 'add', 'delete', 'index'] },
@@ -496,7 +499,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'telegram',  aliases: ['tg'],    description: 'Telegram bot — status / pair / send / pause / stop / attach / detach / sessions', subcommands: ['status', 'pair', 'setup', 'send', 'pause', 'stop', 'attach', 'detach', 'sessions'] },
   { name: 'tablet',    aliases: [],        description: 'Tablet mode — collapse layout to log + input', subcommands: ['on', 'off', 'toggle', 'auto', 'status', 'browser-preview', 'bp'] },
   { name: 'surface',   aliases: [], description: 'Surface control — open a pane/catalog launcher (/surface catalog · browser · preview · log · scratch · obsidian · skill) OR set a preferred LLM surface (/surface coding-agent · research-agent · control-agent · ops-agent · … · clear · status)', subcommands: ['catalog', 'browser', 'preview', 'browser-preview', 'log', 'scratch', 'obsidian', 'skill', 'skill-file', 'agents', 'coding-agent', 'coding-chat', 'research-agent', 'research-chat', 'control-agent', 'ops-ui-agent', 'ops-fleet-agent', 'ops-agent', 'clear', 'status'] },
-  { name: 'term',  aliases: ['terminal'], description: 'Interactive terminal modal — spawn / list / attach / detach / switch / kill / snapshot / resume', subcommands: ['spawn', 'list', 'attach', 'detach', 'switch', 'kill', 'snapshot', 'resume'] },
+  { name: 'term',  aliases: ['terminal'], description: 'Interactive terminal modal — new / list / attach / detach / switch / kill / snapshot / resume', subcommands: ['new', 'list', 'attach', 'detach', 'switch', 'kill', 'snapshot', 'resume'] },
   { name: 'claude', aliases: [], description: 'Spawn claude-code CLI in a terminal modal' },
   { name: 'codex',  aliases: [], description: 'Spawn codex CLI in a terminal modal' },
   { name: 'gemini', aliases: [], description: 'Spawn gemini CLI in a terminal modal' },
@@ -693,6 +696,7 @@ export async function textInput(opts: {
   getRow?: () => number;
   col: number;
   width: number;
+  getWidth?: () => number;
   maxLines?: number;
   prompt?: string;
   placeholder?: string;
@@ -893,6 +897,7 @@ export async function textInput(opts: {
   host?: TextInputHost;
 }): Promise<InputResult> {
   const { row: initialRow, col, width, maxLines = 5, prompt = '\u276f ', placeholder = '' } = opts;
+  const getWidth = (): number => opts.getWidth?.() ?? width;
   const getRow = (): number => opts.getRow?.() ?? initialRow;
   const row = getRow();
   // P2.1: report the input's top row so writeTerminal scopes its
@@ -985,7 +990,7 @@ export async function textInput(opts: {
     picker,
     getBufferView: bufView,
     writeTerminal,
-    getBounds: () => ({ row: getRow(), col, width, height: 1 }),
+    getBounds: () => ({ row: getRow(), col, width: getWidth(), height: 1 }),
     getInputZoneHeight: () => Math.min(lines.length, maxLines),
     onDispatchResult: async (dispatched) => processPickerDispatch(dispatched),
   });
@@ -1129,7 +1134,7 @@ export async function textInput(opts: {
     setInputPromptStartRow(row);
     const promptStr = C.accent(prompt);
     const promptW = visibleWidth(prompt);
-    const textW = width - promptW - 1;
+    const textW = Math.max(0, getWidth() - promptW - 1);
     const numLines = lines.length;
     // Visible window: at most `maxLines` rows on screen, but the buffer
     // (`lines`) may exceed that. `firstVisibleIdx` keeps the cursor's
@@ -1194,7 +1199,7 @@ export async function textInput(opts: {
     prevDrawnLines = visibleLines;
 
     if (ctrlCHint) {
-      writeTerminal(ansi.moveTo(row + 2, col) + '\x1b[2K' + C.muted(truncate(ctrlCHint, width)));
+      writeTerminal(ansi.moveTo(row + 2, col) + '\x1b[2K' + C.muted(truncate(ctrlCHint, getWidth())));
       ctrlCHintPainted = true;
     } else if (ctrlCHintPainted) {
       writeTerminal(ansi.moveTo(row + 2, col) + '\x1b[2K');
@@ -1248,7 +1253,7 @@ export async function textInput(opts: {
   };
 
   const pickerModalFamily = pickerModalRuntime.createFamily({
-    bounds: { row: getRow(), col, width, height: 1 },
+    bounds: { row: getRow(), col, width: getWidth(), height: 1 },
     sources: createChatPickerFamilySources({
       // 명시 K — createChatPickerFamilySource<K> 의 K 를 pin. getItems 반환이
       // conditional 타입 ChatPickerItems<K> 라 역추론이 K 를 union(ChatPickerKind)
@@ -1282,7 +1287,7 @@ export async function textInput(opts: {
     pickerModalRuntime.syncFamily({
       activeKind: activePickerKind(),
       clearRows: MAX_PICKER + 3,
-      debugLayout: { row, col, width },
+      debugLayout: { row: getRow(), col, width: getWidth() },
       family: pickerModalFamily,
     });
   };
@@ -1295,7 +1300,7 @@ export async function textInput(opts: {
     const searchRow = row;
     const promptStr = C.accent(prompt);
     const promptW = visibleWidth(prompt);
-    const textW = width - promptW - 1;
+    const textW = Math.max(0, getWidth() - promptW - 1);
     const match = currentReverseSearchResult();
     const status = match ? 'reverse-i-search' : 'failed reverse-i-search';
     const prefixRaw = `(${status})\`${reverseSearch.query}': `;
@@ -1375,6 +1380,8 @@ export async function textInput(opts: {
   const drawAll = renderActions.repaintUserMutation;
   let pendingExternalSubmitSource: InputSourceRef | undefined;
   const finalizeInput = (result: InputResult): InputResult => {
+    // 외부 주입 라우터가 «composer 가 안 떠 있다»를 알 수 있게 내린다.
+    if (hostControl) hostControl.getBufferText = undefined;
     clearPicker();
     writeTerminal(endTextInputCursor(opts.cursorSink));
     return result;
@@ -1420,17 +1427,30 @@ export async function textInput(opts: {
     // Enter into the readKey queue so the main loop returns the
     // submit outcome exactly like a typed Enter. Reset to
     // undefined on textInput return.
+    hostControl.getBufferText = () => lines.join('\n');
     hostControl.submit = (request?: string | TextInputExternalSubmitRequest) => {
       const nextText = typeof request === 'string' ? request : request?.text;
+      // 합성 Enter 가 못 들어가면 버퍼·커서·출처를 «통째로» 되돌린다 — 외부 글이 composer 에 남아
+      // 사용자 입력과 섞이거나 대기열이 다시 보내 중복되지 않게(원자적 제출).
+      const before = { lines: [...lines], lineIdx, colIdx, source: pendingExternalSubmitSource };
       pendingExternalSubmitSource = typeof request === 'string' ? undefined : request?.source;
       if (nextText !== undefined) {
         const next = nextText.split('\n');
         lines = next.length > 0 ? next : [''];
         lineIdx = lines.length - 1;
         colIdx = lines[lineIdx]!.length;
-        drawAll();
       }
-      injectKey({ name: 'enter', ctrl: false, shift: false });
+      // 반환값 = 합성 Enter 가 키 큐에 들어갔나(raw 모드가 아니면 false) — 외부 입력 대기열이 유실을 막는 데 쓴다.
+      const accepted = injectKey({ name: 'enter', ctrl: false, shift: false });
+      if (!accepted) {
+        lines = before.lines; lineIdx = before.lineIdx; colIdx = before.colIdx;
+        pendingExternalSubmitSource = before.source;
+      }
+      // 렌더 실패가 수락 결과를 뒤집으면 이미 큐에 든 Enter 와 대기열이 같은 글을 두 번 보낸다 — 삼킨다.
+      if (nextText !== undefined) {
+        try { drawAll(); } catch (error) { debug.log('chat.input', 'external-submit-draw-failed', { accepted, error: String(error) }); }
+      }
+      return accepted;
     };
   }
 
@@ -1650,6 +1670,7 @@ export async function textInput(opts: {
         // Host owns the focus swap; we return gotoPane:true so the
         // input loop exits cleanly and the dashboard's pane dispatcher
         // picks up the keys.
+        if (hostControl) hostControl.getBufferText = undefined;
         return { text: '', submitted: false, gotoPane: true };
       }
       drawAll();

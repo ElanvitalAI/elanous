@@ -8,6 +8,7 @@ export type DashboardChatMainLogCommand =
   | { kind: 'solo' }
   | { kind: 'turn'; arg: string }
   | { kind: 'fold'; mode: string }
+  | { kind: 'fold-all'; expanded: boolean }
   | { kind: 'copy-all' }
   | { kind: 'return-to-input' }
   | { kind: 'unknown'; subcommand: string };
@@ -24,7 +25,17 @@ export function resolveDashboardChatMainLogCommand(
   if (sub === 'freeze') return { kind: 'freeze' };
   if (sub === 'solo' || sub === 'maximize' || sub === 'zoom') return { kind: 'solo' };
   if (sub === 'turn') return { kind: 'turn', arg: (args[1] ?? '').toLowerCase().trim() };
-  if (sub === 'fold') return { kind: 'fold', mode: (args[1] ?? '').toLowerCase().trim() };
+  if (sub === 'fold') {
+    const mode = (args[1] ?? '').toLowerCase().trim();
+    // #19 — bulk state, not a fold mode: `fold all` collapses every static fold, `fold off` opens them.
+    if (mode === 'all') return { kind: 'fold-all', expanded: false };
+    if (mode === 'off') return { kind: 'fold-all', expanded: true };
+    return { kind: 'fold', mode };
+  }
+  if (sub === 'unfold') {
+    const target = (args[1] ?? 'all').toLowerCase().trim();
+    return target === 'all' ? { kind: 'fold-all', expanded: true } : { kind: 'unknown', subcommand: `unfold ${target}` };
+  }
   if (sub === 'copy' || sub === 'all') return { kind: 'copy-all' };
   if (sub === 'input' || sub === 'return') return { kind: 'return-to-input' };
   return { kind: 'unknown', subcommand: sub };

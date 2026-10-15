@@ -226,6 +226,7 @@ describe('drainTurnTypeaheadOnce — index.ts inner-loop 가 반복마다 부르
       state: createTurnTypeaheadState(),
       nextInitial: 'xyz\nsecond\ndraft',
       injectEnter: false,
+      releasedPendingIds: [],
     });
     expect(drainTurnTypeaheadOnce(state, 'carried', { interrupted: true }).nextInitial)
       .toBe('carried\nxyz\nsecond\ndraft');
@@ -234,6 +235,7 @@ describe('drainTurnTypeaheadOnce — index.ts inner-loop 가 반복마다 부르
         state: createTurnTypeaheadState(),
         nextInitial: 'draft',
         injectEnter: false,
+        releasedPendingIds: [],
       });
   });
 });

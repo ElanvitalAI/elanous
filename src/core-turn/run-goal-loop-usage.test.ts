@@ -33,6 +33,19 @@ async function collectObservations(
 }
 
 describe('runGoalLoop iteration usage observation', () => {
+  test('forwards the resolved provider from a real goal-loop turn', async () => {
+    const resolved: string[] = [];
+    const ctx = baseCtx();
+    ctx.callbacks = { onResolvedProvider: (provider, model) => resolved.push(`${provider}/${model}`) };
+
+    await runGoalLoop(ctx, { maxIterations: 1, runTurn: async (turnCtx) => {
+      turnCtx.callbacks?.onResolvedProvider?.('openrouter', 'openrouter/z-ai/glm-5.3');
+      return { stopReason: 'end_turn', finalText: 'done' };
+    } });
+
+    expect(resolved).toEqual(['openrouter/openrouter/z-ai/glm-5.3']);
+  });
+
   test('accumulates usage per iteration while preserving input occupancy and existing fields', async () => {
     const observations = await collectObservations(async (ctx) => {
       ctx.callbacks?.onUsage?.({ inputTokens: 100, outputTokens: 10, cacheReadInputTokens: 1 });

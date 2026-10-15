@@ -104,12 +104,12 @@ describe('ch5730-watch delivery — 배달 목적지를 «다른 값»으로 낸
   });
 
   test('⚠️ lsof 가 «없으면» 「정상」이라 말하지 않는다', () => {
-    // PATH 를 최소로 깎아 lsof 만 없앤다(스크립트가 delivery 경로에서 쓰는 것은 tr·sed·head).
+    // PATH 를 최소로 깎아 lsof 만 없앤다(스크립트가 delivery 경로에서 쓰는 것은 tr·sed·head · #27709 뒤 dirname·awk).
     const bin = mkdtempSync(join(tmpdir(), 'ch5730-nolsof-'));
     dirs.push(bin);
     // ⚠️ `bash` 를 빼면 스크립트가 «뜨지도» 못하고 산출이 빈다 — 그러면 이 테스트는
     //    「lsof 없음을 옳게 말한다」가 아니라 「아무 말도 못 한다」를 통과시킨다(첫 판에 그랬다).
-    for (const tool of ['bash', 'tr', 'sed', 'head', 'cat']) {
+    for (const tool of ['bash', 'tr', 'sed', 'head', 'cat', 'dirname', 'awk']) {
       const real = spawnSync('bash', ['-lc', `command -v ${tool}`], { encoding: 'utf8' }).stdout.trim();
       if (real) symlinkSync(real, join(bin, tool));
     }

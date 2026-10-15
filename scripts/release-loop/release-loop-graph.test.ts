@@ -265,7 +265,7 @@ test('ops-upgrade runs after verify and a failed host does not undo publication 
   const graph = yaml(readFileSync(graphPath, 'utf8')) as { nodes: Array<{ node_id: string; kind: string; recipe?: string; max_visits: number }>; edges: Array<{ from: string; map: Record<string, string> }> };
   const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command?: string; timeout_ms?: number }>;
   expect(graph.nodes.find((node) => node.node_id === 'ops-upgrade')).toMatchObject({ kind: 'agent', recipe: 'cmd:ops-upgrade', max_visits: 1 });
-  expect(graph.edges.find((edge) => edge.from === 'verify')?.map).toEqual({ ok: 'vault-note', fail: 'failed', error: 'failed' });
+  expect(graph.edges.find((edge) => edge.from === 'verify')?.map).toEqual({ ok: 'vault-note', fail: 'version-dev-bump-after-failure', error: 'version-dev-bump-after-failure' });
   expect(graph.edges.find((edge) => edge.from === 'ops-upgrade')?.map).toEqual({ ok: 'version-dev-bump', fail: 'version-dev-bump', error: 'version-dev-bump' });
   expect(recipes['ops-upgrade']).toEqual({ command: 'bun scripts/release-loop/ops-upgrade-node.ts', timeout_ms: 1_200_000 });
   const root = mkdtempSync(join(tmpdir(), 'release-ops-failed-'));
@@ -280,6 +280,30 @@ test('ops-upgrade runs after verify and a failed host does not undo publication 
     expect(state.path.slice(-9)).toEqual(['publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
     expect(JSON.parse(String(state.nodes.find((node) => node.nodeId === 'ops-upgrade')?.output))).toMatchObject({ outcome: 'fail', hosts: [{ host: 'node-b', ok: false }] });
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('RELEASE-DEVBUMP-ALWAYS: after a successful publish, docs-land and verify failures route through version-dev-bump', async () => {
+  const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  const graph = yaml(readFileSync(graphPath, 'utf8')) as { edges: Array<{ from: string; map: Record<string, string> }> };
+  expect(graph.edges.find((edge) => edge.from === 'docs-land')?.map).toEqual({ ok: 'verify', fail: 'version-dev-bump-after-failure', error: 'version-dev-bump-after-failure' });
+  expect(graph.edges.find((edge) => edge.from === 'verify')?.map).toEqual({ ok: 'vault-note', fail: 'version-dev-bump-after-failure', error: 'version-dev-bump-after-failure' });
+  for (const [failing, nodeId] of [['docs-land-node.ts', 'docs-land'], ['verify-node.ts', 'verify']] as const) {
+    const root = mkdtempSync(join(tmpdir(), 'release-devbump-always-'));
+    try {
+      const state = await runGraph(graphPath, {
+        input: { version: '9.9.9', previousVersion: '0.2.3' },
+        deps: { root, runBash: async (body) => ({
+          exitCode: body.includes(failing) ? 1 : 0,
+          stdout: JSON.stringify(body.includes(failing) ? { outcome: 'fail', verdict: 'fail', summary: '이미 있는 릴리스' } : { outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '',
+        }) },
+      });
+      expect(state.status).toBe('failed');
+      // A failed post-publish step still bumps main, but the graph reports the original failure.
+      expect(state.path.slice(-3)).toEqual([nodeId, 'version-dev-bump-after-failure', 'failed']);
+      // the failure stays reported as-is in the failing node's own output
+      expect(JSON.parse(String(state.nodes.find((node) => node.nodeId === nodeId)?.output))).toMatchObject({ outcome: 'fail', summary: '이미 있는 릴리스' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
 });
 
 test('release story follows vault note and every outcome continues to ops upgrade', async () => {

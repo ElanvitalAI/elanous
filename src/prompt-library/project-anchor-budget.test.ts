@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { debug } from '../debug/log.js';
-import { loadProjectAnchorWithMeta, PROJECT_ANCHOR_MAX_CHARS, resetUniversalPreambleCache } from './universal-preamble.js';
+import { loadProjectAnchorWithMeta, PROJECT_ANCHOR_MAX_CHARS, resetUniversalPreambleCache, setGlobalAnchorPathForTest } from './universal-preamble.js';
 
 const REPO_ROOT = new URL('../..', import.meta.url).pathname.replace(/\/$/, '');
 
@@ -14,6 +14,9 @@ const REPO_ROOT = new URL('../..', import.meta.url).pathname.replace(/\/$/, '');
  * 🩹 그래서 이 파일이 그 «읽는 자»다. ⛔ 수를 여기 박지 않는다 — 상한은 코드가 canonical 이다.
  */
 describe('프로젝트 앵커 예산 — 이 저장소가 상한 «안»에 있나', () => {
+  // 저장소 앵커만 잰다 — 사용자 전역 ~/.elanous/AGENTS.md 는 이 저장소의 예산이 아니다.
+  beforeAll(() => setGlobalAnchorPathForTest(null));
+  afterAll(() => setGlobalAnchorPathForTest(undefined));
   it('앵커 파일이 하나도 «잘리지» 않는다', () => {
     resetUniversalPreambleCache();
     const result = loadProjectAnchorWithMeta(REPO_ROOT);

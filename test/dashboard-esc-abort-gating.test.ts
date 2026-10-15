@@ -77,7 +77,8 @@ describe('dashboard ESC abort gating', () => {
     expect(source).toContain('settleEscAbortPendingLines(chatLines, chatLinesStartIndex);');
     expect(source).toContain('escGate.dispose();');
     const plainTurnIndicators = source.match(/startPinnedThinking\(\{[\s\S]*?message: '(?:Routing|Thinking)',[\s\S]*?metrics: \{ startedAt: [^}]+, hint: 'esc 중단' \},/g) ?? [];
-    expect(plainTurnIndicators).toHaveLength(3);
+    // 첫 표시 ⊕ 자동 라우팅 취소 재무장 둘 ⊕ /goal 반복마다 재무장(#5) — 모두 esc 중단 안내를 단다.
+    expect(plainTurnIndicators).toHaveLength(4);
   });
 
   test('rejects finalizeTurn sources that omit the clear call or contain it only outside the callback', () => {
@@ -120,6 +121,33 @@ describe('dashboard ESC abort gating', () => {
 
     expect(priorTurnLines).toEqual(['  ⏳ 중단 요청됨 — Bash 종료를 기다리는 중입니다.', 'next turn']);
     expect(noPendingLines).toEqual(['a', '  ✘ interrupted']);
+  });
+
+  test('does not throw when chatLines has holes', () => {
+    const lines: string[] = ['a', '  ⏳ 중단 요청됨 — Bash 종료를 기다리는 중입니다.'];
+    lines.length = 4;
+    expect(() => settleEscAbortPendingLines(lines, 0)).not.toThrow();
+    expect(lines[1]).toBe('  ⏹ 중단됨');
+  });
+
+  test('cleanup still clears turn activity when settle throws', () => {
+    const source = readFileSync(new URL('../src/dashboard/index.ts', import.meta.url), 'utf8');
+    const start = source.indexOf('const attachChatStreamingKeys =');
+    const end = source.indexOf('// ── Working-directory workspace widgets', start);
+    const body = source.slice(start, end);
+    const cleanupStart = body.lastIndexOf('return () => {');
+    const cleanup = body.slice(cleanupStart);
+    const settleAt = cleanup.indexOf('settleEscAbortPendingLines(chatLines, chatLinesStartIndex);');
+    const idleAt = cleanup.indexOf("reportTuiTurn('idle');");
+    const inFlightAt = cleanup.indexOf('streamingInFlight = false;');
+    const finallyAt = cleanup.indexOf('} finally {');
+    const catchAt = cleanup.indexOf("debug.log('dashboard.turn', 'settle-failed'");
+    expect(settleAt).toBeGreaterThan(-1);
+    expect(catchAt).toBeGreaterThan(settleAt);
+    expect(finallyAt).toBeGreaterThan(settleAt);
+    expect(inFlightAt).toBeGreaterThan(finallyAt);
+    expect(idleAt).toBeGreaterThan(finallyAt);
+    expect(cleanup.indexOf('userScrolledDuringStream = false;')).toBeGreaterThan(finallyAt);
   });
 
   test('stream runtime creation clears tracked tool state before the next ESC decision', () => {

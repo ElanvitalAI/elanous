@@ -16,10 +16,11 @@ import { collectPodArtifacts } from './pod-artifact-return.js';
 import { getDefaultLogStore, type LogStore } from '../../mss/logging/log-store.js';
 import { podBunCacheVolume } from './pod-bun-cache.js';
 import { POD_JOB_TTL_AFTER_FINISHED_SECONDS } from './pod-lease.js';
-import { podHostDirsInit, podInstallSlotsVolume } from './pod-install-slots.js';
+import { podHostDirsScript, podInstallSlotsVolume } from './pod-install-slots.js';
 import { type PodPoolMember, PodPoolScheduler, resolvePodPoolSpec, parsePodPool, checkPodPool, syncPoolImages, type PoolKubectl } from './pod-pool.js';
 import { podSkillsDigest, readSkillEnvFiles, resolvePodSkills } from './pod-skills.js';
 import { podSourceScript, type PodSource } from './pod-source-receive.js';
+import { seedMirrorOnce, type MirrorSeedResult } from './pod-mirror-seed.js';
 import {
   POD_CHILD_REQUESTS,
   POD_JOB_DEADLINE_SECONDS,
@@ -132,13 +133,18 @@ export function tailBytes(text: string, maxBytes: number): string {
   return `…[앞 ${bytes.length - maxBytes}바이트 생략]\n${cut.subarray(start).toString('utf8')}`;
 }
 
-const GATE = `ok=0
+/** The isolation probe: wait until the NetworkPolicy blocks the host/prod daemons, then run `onPass` (default `exit 0`). */
+function isolationGateScript(onPass = 'exit 0'): string {
+  return `ok=0
 for i in $(seq 1 60); do
   if curl -s -m 1 -o /dev/null http://host.orb.internal:31415/health || curl -s -m 1 -o /dev/null http://core.elanous-prod:8080/; then ok=0; else ok=$((ok+1)); fi
-  [ "$ok" -ge 3 ] && { echo "[gate] isolation enforced after \${i} probes"; exit 0; }
+  [ "$ok" -ge 3 ] && { echo "[gate] isolation enforced after \${i} probes"; ${onPass}; }
   sleep 0.5
 done
 echo "[gate] ISOLATION NOT ENFORCED within 30s"; exit 1`;
+}
+
+const GATE = isolationGateScript();
 
 /** Export the command's log store into the existing outbox return channel without changing the command exit status. */
 const COMMAND_LOG_EXPORT = `if mkdir -p "$HOME/outbox/pod-logs" && elanous --test="$HOME/.elanous-test" logs --instance prod --since 12h --limit 20000 --json --json-data > "$HOME/outbox/pod-logs/logs.jsonl"; then
@@ -244,6 +250,10 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
     // A command may not end in LF; keep artifact markers on their own line for the existing parser.
     ...(o.returnLogs ? ["printf '\\n'", COMMAND_LOG_EXPORT] : []),
     ARTIFACT_EMIT,
+    // GATE-POD-RESULT-MARKER: the last line says «the child is done» so the host need not wait for the Job condition
+    // (k3d on node-b flips it 90~550s late). Leading LF keeps it on its own line; the host strips exactly this tail.
+    // The token is this launch's random id — a command that prints the bare marker word cannot end the wait early.
+    `printf '\\n${podResultMarker(o.launch ?? o.name)} rc=%s\\n' "$rc"`,
     'exit $rc',
   ].join('\n');
   const secretKeys = grok || skillNames.length || o.clone === true;
@@ -261,8 +271,12 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
           restartPolicy: 'Never',
           securityContext: { runAsUser: 1000, fsGroup: 1000 },
           initContainers: [
-            { name: 'isolation-gate', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never', command: ['bash', '-c'], args: [GATE] },
-            ...(hostDirMounts.length ? [podHostDirsInit(o.image, o.imagePullPolicy ?? 'Never', hostDirMounts)] : []),
+            // GATE-WARM-BOOT (10-15): ONE init container. Each extra container cost minutes on a loaded k3d node (the measured
+            // gap between a finished init script and the next container start), so the root host-dir hand-over runs inside
+            // the isolation init after the probe passes instead of as a second `host-dirs` container.
+            hostDirMounts.length
+              ? { name: 'isolation-gate', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never', securityContext: { runAsUser: 0 }, command: ['bash', '-c'], args: [isolationGateScript(podHostDirsScript(hostDirMounts))], volumeMounts: hostDirMounts.map((mount) => ({ ...mount })) }
+              : { name: 'isolation-gate', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never', command: ['bash', '-c'], args: [GATE] },
           ],
           containers: [{
             name: 'child', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never',
@@ -380,6 +394,10 @@ export interface RunPodCommandOptions {
   kubectl?: Kubectl;
   /** A caller-owned scheduler is self-capped: acquires count only its own Jobs, never cluster occupancy (POOLGLOBAL-REG). */
   poolScheduler?: PodPoolScheduler;
+  /** GATE-WARM-BOOT — seeds a commit-pinned clone's commit into the pool host mirror (test seam · default {@link seedMirrorOnce}). */
+  seedMirror?: (o: { host: string; commit: string; cwd: string }) => Promise<MirrorSeedResult | undefined>;
+  /** GATE-WARM-BOOT — the git tree the seed pushes from (default: the process cwd — the gate runs in the repo tree). */
+  mirrorSeedCwd?: string;
   checkPool?: typeof checkPodPool;
   syncImages?: typeof syncPoolImages;
   imageCommit?: string | null;
@@ -394,6 +412,19 @@ export interface RunPodCommandOptions {
   configHostMirror?: () => string | undefined;
   /** 자식 로그 전문 상한(바이트). 생략 시 config `pod.childLogMaxBytes`, 없으면 1MiB. 넘으면 끝부분 우선. */
   childLogMaxBytes?: number;
+}
+
+/** GATE-POD-RESULT-MARKER — the child script's final line (`\n<marker> <token> rc=<n>\n`), printed after the artifact emit. */
+export const POD_RESULT_MARKER = '__ELANOUS_POD_DONE__';
+/** The marker bound to one launch (`token` = the launch's random id · the Job name when the manifest has no launch). */
+export function podResultMarker(token: string): string { return `${POD_RESULT_MARKER} ${token}`; }
+
+/** Split the child's logs into the command output (marker tail removed, bytes otherwise unchanged) and the marker rc (null = no marker for this token). */
+export function splitPodResultMarker(logs: string, token: string): { logs: string; rc: number | null } {
+  const escaped = podResultMarker(token).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = new RegExp(`\\n${escaped} rc=(\\d+)\\n?$`).exec(logs);
+  if (!match) return { logs, rc: null };
+  return { logs: logs.slice(0, match.index), rc: Number(match[1]) };
 }
 
 function jobFinished(types: string): 'complete' | 'failed' | null {
@@ -522,6 +553,16 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     }
     const imageRef = member?.imageRef;
     if (!imageRef) log('pod.command-job', 'image-fallback-local', { reason: !member ? 'no-pool-member' : !imageCommit ? 'image-commit-unavailable' : 'registry-tag-unavailable' });
+    // GATE-WARM-BOOT (10-15): a commit-pinned clone on a pool host — put that commit into the host's mirror first (once per
+    // host·commit in this process), so the Pod's podSourceScript finds it (`cat-file -e`) instead of fetching from GitHub.
+    // Best effort: a failed seed only logs; the Pod keeps the old path. Never with an injected kubectl (tests) unless seeded.
+    const seedMirror = options.seedMirror ?? (options.kubectl ? undefined : seedMirrorOnce);
+    if (seedMirror && options.clone && options.source?.kind === 'commit' && hostMirror && member?.sshHost) {
+      // Worst case added to a cold start: the push limit (GATE_MIRROR_SEED_LIMIT_MS), once per host·commit.
+      const seed = await seedMirror({ host: member.sshHost, commit: options.source.sha, cwd: options.mirrorSeedCwd ?? process.cwd() })
+        .catch((error: unknown) => ({ host: member!.sshHost!, ok: false, ms: 0, detail: String(error).slice(0, 300) }));
+      log('pod.command-job', 'mirror-seed', { host: member.sshHost, commit: options.source.sha, ok: seed?.ok ?? false, ms: seed?.ms ?? 0, ...(seed?.detail ? { detail: seed.detail } : {}) });
+    }
     const ghToken = options.clone ? (options.ghToken ?? defaultGhToken)() : undefined;
     const secret = commandJobSecret({ name, namespace, launch, skills, skillEnvText, ...(grokAuth !== undefined ? { grokAuth } : {}), ...(ghToken !== undefined ? { ghToken } : {}) });
     if (secret) {
@@ -543,10 +584,24 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     }
     let state: 'complete' | 'failed' = 'failed';
     let unreadableSince: number | null = null;
+    let markerRc: number | null = null;
+    const appliedAt = Date.now();
     for (;;) {
       const got = kubectl(['-n', namespace, 'get', 'job', name, '-o', 'jsonpath={.status.conditions[*].type}']);
       const finished = jobFinished(got.stdout);
       if (finished) { state = finished; break; }
+      // GATE-POD-RESULT-MARKER: the condition is not there yet — the child may already be done (k3d condition lag).
+      // A tail read that fails (Pod still pending · init container) or lacks the marker changes nothing.
+      const tail = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child', '--tail=2']);
+      if (tail.status === 0) {
+        const seen = splitPodResultMarker(tail.stdout.startsWith('\n') ? tail.stdout : `\n${tail.stdout}`, launch).rc;
+        if (seen !== null) {
+          markerRc = seen;
+          state = seen === 0 ? 'complete' : 'failed';
+          log('pod.command-job', 'result-marker-early', { job: name, waitedMs: Date.now() - appliedAt, rc: seen });
+          break;
+        }
+      }
       if (got.status !== 0 && options.statusUnreadableMs !== undefined) {
         unreadableSince ??= Date.now();
         if (Date.now() - unreadableSince >= options.statusUnreadableMs) {
@@ -558,7 +613,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     }
     const logsResult = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child']);
     const logsFailed = logsResult.status !== 0;
-    const logs = logsFailed ? '' : logsResult.stdout;
+    const logs = logsFailed ? '' : splitPodResultMarker(logsResult.stdout, launch).logs;
     const artifactDir = artifactRoot;
     let artifacts: PodArtifactCollection;
     if (logsFailed) {
@@ -591,7 +646,8 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     const maxBytes = options.childLogMaxBytes ?? podChildLogMaxBytes();
     const childLog = logsFailed ? `산출 회수 못 함: ${artifacts.error}` : tailBytes(logs, maxBytes);
     writeFileSync(resolve(artifactsDir, 'child.log'), childLog);
-    const exitCode = exitCodeFromPod(kubectl, namespace, name, state);
+    // Marker path: the rc the child printed (the Pod's terminated state may lag like the condition). Condition path: unchanged.
+    const exitCode = markerRc ?? exitCodeFromPod(kubectl, namespace, name, state);
     cleanupSecret();
     log('pod.command', 'job-finished', {
       job: name,

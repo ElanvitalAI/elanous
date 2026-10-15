@@ -166,3 +166,12 @@ acp-token
 .env*
 .elanous-test/
 !.env.example
+
+# 🪪 자리 로컬 지시(L0 정체성 · 2026-10-14) — 디렉터리마다 비공유 역할 지시. 앵커 로더가 읽는다(universal-preamble.ts).
+AGENTS.local.md
+CLAUDE.local.md
+# TUI 가 소유하는 «지난 세션»(자리 루트 · 대화 끝마다 갈아 씀)
+.AGENTS.local.last-session.md
+*.local.last-session.md.tmp-*
+# 자기 편집 직전 판 백업(L0 로더가 한 벌 덮어쓴다)
+*.local.md.prev

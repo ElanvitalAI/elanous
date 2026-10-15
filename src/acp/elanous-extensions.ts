@@ -79,6 +79,8 @@ export interface ElanousUiUsagePayload {
   /** Opaque correlation id. Dashboard uses `turn:<epoch>` per turn. */
   id: string;
   provider?: 'anthropic' | 'openai';
+  /** 그 턴이 실제로 요청한 모델(라우팅 결과 — 설정 모델과 다를 수 있다). */
+  model?: string;
   inputTokens?: number;
   outputTokens?: number;
   cacheReadInputTokens?: number;

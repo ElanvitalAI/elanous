@@ -11,7 +11,7 @@ const MAX_MEMORY_ITEMS = 5;
 const MAX_EXTERNAL_SOURCES = 3;
 const LOCAL_REFERENCE_CANDIDATES = [
   'openclaw', 'codex', 'hermess', 'hermes', 'hermes-agent',
-  'claude', 'claude-code-fork', 'grok', 'grok-cli', 'grok-build',
+  'claude', 'grok', 'grok-cli', 'grok-build',
 ] as const;
 
 export interface GoalAuthoringExternalSource {

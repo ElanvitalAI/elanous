@@ -47,6 +47,8 @@ describe('startEventLoopStallMonitor', () => {
     expect(logs).toEqual([
       ['tui.event-loop', 'monitor-started', { intervalMs: 100, thresholdMs: 250 }],
       ['tui.event-loop', 'stall', { lagMs: 2_500, streamingInFlight: true, thinkingMessage: 'Thinking… (5s)' }],
+      // 2초 넘는 정지는 실패 지문(결함 #1·#14)으로도 센다.
+      ['tui.failure-signature', 'matched', { id: 'event-loop-stall', surface: 'event-loop' }],
     ]);
     dispose();
   });

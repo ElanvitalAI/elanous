@@ -20,6 +20,41 @@ export function nextDevVersion(version: string): string {
   return `${match[1]}.${match[2]}.${BigInt(match[3]!) + 1n}-dev.0`;
 }
 
+/** Is main carrying the published release immediately before this cut (patch, minor, or major boundary)? */
+function previousPublishedLine(version: string, current: string): string | null {
+  const target = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(baseVersion(version));
+  const carried = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-dev\.(0|[1-9]\d*))?$/.exec(current);
+  if (!target || !carried) return null;
+  const [major, minor, patch] = [BigInt(target[1]!), BigInt(target[2]!), BigInt(target[3]!)];
+  const [priorMajor, priorMinor, priorPatch] = [BigInt(carried[1]!), BigInt(carried[2]!), BigInt(carried[3]!)];
+  const nextPatch = priorMajor === major && priorMinor === minor && priorPatch + 1n === patch;
+  const nextMinor = priorMajor === major && priorMinor + 1n === minor && patch === 0n;
+  const nextMajor = priorMajor + 1n === major && minor === 0n && patch === 0n;
+  return nextPatch || nextMinor || nextMajor ? `${priorMajor}.${priorMinor}.${priorPatch}` : null;
+}
+
+function compareVersionParts(left: readonly bigint[], right: readonly bigint[]): number {
+  for (let index = 0; index < 3; index++) {
+    if (left[index] !== right[index]) return left[index]! < right[index]! ? -1 : 1;
+  }
+  return 0;
+}
+
+/** At a minor/major boundary, the carried line must be the latest published stable tag before the cut. */
+function latestPublishedStableBefore(repo: string, version: string): string | null {
+  const target = baseVersion(version).split('.').map(BigInt);
+  let latest: { version: string; parts: bigint[] } | null = null;
+  const tags = git(repo, 'ls-remote', '--tags', '--refs', 'origin', 'refs/tags/v*');
+  for (const line of tags.split('\n')) {
+    const match = /\brefs\/tags\/v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))$/.exec(line);
+    if (!match) continue;
+    const parts = match[1]!.split('.').map(BigInt);
+    if (compareVersionParts(parts, target) >= 0) continue;
+    if (!latest || compareVersionParts(parts, latest.parts) > 0) latest = { version: match[1]!, parts };
+  }
+  return latest?.version ?? null;
+}
+
 function run(command: string, args: string[], cwd: string): string {
   const result = spawnSync(command, args, { cwd, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
   if (result.status !== 0 || result.error) {
@@ -121,12 +156,31 @@ function currentFreeze(): LandingFreeze | null {
 }
 
 /**
+ * RELEASE-DEVBUMP-ALWAYS (대표 10-14 07:0x): main still carries the previous line (<previous> or <previous>-dev.N)
+ * while that release is already published (tag v<previous> advertised) — its post-publish dev bump was
+ * stranded by an earlier failed run. Land the stranded dev bump (to <version>-dev.0) so this release cuts
+ * from its own -dev line. Returns false without touching anything when the carried version is not the
+ * immediately previous line or that line is not published yet.
+ */
+function strandedDevBumpHealed(repo: string, version: string, current: string, deps: BranchCutDeps): boolean {
+  const previous = previousPublishedLine(version, current);
+  if (previous === null) return false;
+  const tag = git(repo, 'ls-remote', '--tags', 'origin', `refs/tags/v${previous}`);
+  if (!tag.trim()) return false;
+  const devBump = `${baseVersion(version)}-dev.0`;
+  if (devBump !== nextDevVersion(previous) && latestPublishedStableBefore(repo, version) !== previous) return false;
+  landing(repo, 'dev-bump', previous, undefined, undefined, deps.forceFreeze === true, true, devBump);
+  debug.log('release-loop.version-dev-bump', 'self-healed', { version, mainVersion: current, devBump, published: previous });
+  return true;
+}
+
+/**
  * RELEASE-BRANCH (대표 10-06 20:0x «0.2.18부터 브랜치 방식»): the release commit lives on `release/<v>`, never on main.
  * An existing branch is reused as is (a resumed run, or a branch a repair appended to) — its tip is the release commit.
  * Otherwise the branch is cut from origin/main and the version bump is committed on it; main keeps its -dev.N version
  * until the post-publish dev bump.
  */
-export function cutReleaseBranchForRun(repo: string, version: string, deps: BranchCutDeps = {}): Output {
+export function cutReleaseBranchForRun(repo: string, version: string, deps: BranchCutDeps = {}, selfHealed = false): Output {
   if (!isReleaseVersion(version)) throw new Error(`invalid release version: ${version}`);
   // The run does not need a freeze, but one that is on is the emergency stop: neither a new nor a reused cut passes it.
   const frozen = (deps.freeze ?? currentFreeze)();
@@ -160,7 +214,11 @@ export function cutReleaseBranchForRun(repo: string, version: string, deps: Bran
   const current = versionAt(repo, base);
   const stable = baseVersion(version);
   const devOfStable = new RegExp(`^${stable.replaceAll('.', '\\.')}-dev\\.(0|[1-9][0-9]*)$`);
-  if (current !== version && !devOfStable.test(current)) throw new Error(`origin/main version ${current} is not ${stable}-dev.N (release ${version})`);
+  if (current !== version && !devOfStable.test(current)) {
+    // RELEASE-DEVBUMP-ALWAYS: self-heal once — a stranded previous dev bump never strands this release's cut too.
+    if (!selfHealed && strandedDevBumpHealed(repo, version, current, deps)) return cutReleaseBranchForRun(repo, version, deps, true);
+    throw new Error(`origin/main version ${current} is not ${stable}-dev.N (release ${version})`);
+  }
   const temp = mkdtempSync(join(tmpdir(), 'release-branch-cut-'));
   const worktree = join(temp, 'tree');
   let added = false;
@@ -189,14 +247,14 @@ export function cutReleaseBranchForRun(repo: string, version: string, deps: Bran
   }
 }
 
-function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string, cutCommit?: string, forceFreeze = false, branchCut = false): Output {
+function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string, cutCommit?: string, forceFreeze = false, branchCut = false, devTarget?: string): Output {
   if (kind === 'release' && branchCut && cutCommit === undefined) return cutReleaseBranchForRun(repo, releaseVersion, { forceFreeze });
   if (kind === 'dev-bump' && prereleaseKind(releaseVersion) !== null) {
     // A prerelease (rehearsal) never moves main: the next stable release still owns this -dev line.
     debug.log('release-loop.version-dev-bump', 'skipped', { version: releaseVersion, reason: 'prerelease' });
     return { outcome: 'ok', kind, version: releaseVersion, commit: null, pr: null, skipped: 'prerelease' };
   }
-  const target = kind === 'release' ? releaseVersion : nextDevVersion(releaseVersion);
+  const target = kind === 'release' ? releaseVersion : devTarget ?? nextDevVersion(releaseVersion);
   // With the release on its branch, main still carries <v>-dev.N when the dev bump runs.
   const source = kind === 'release' ? `${releaseVersion}-dev.N` : branchCut ? `${releaseVersion}-dev.N` : releaseVersion;
   fetchMain(repo);

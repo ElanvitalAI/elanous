@@ -72,6 +72,7 @@ import { registerPodCommands } from './cli/pod-cli.js';
 import { registerBrowserAnnotateCommand } from './cli/browser-annotate-cli.js';
 import { registerPendingQuestionsCommand } from './cli/pending-questions-cli.js';
 import { registerUsageCommand } from './cli/usage-cli.js';
+import { registerUsageDailyCommand } from './cli/usage-daily-cli.js';
 import { registerLiveCommands } from './cli/live-cli.js';
 import { registerResearchCommand } from './cli/research-cli.js';
 import { registerReleaseCommands } from './cli/release-cli.js';
@@ -915,6 +916,7 @@ registerPodCommands(program);
 registerBrowserAnnotateCommand(program);
 registerPendingQuestionsCommand(program);
 registerUsageCommand(program);
+registerUsageDailyCommand(program);
 // main() → program.parseAsync() → live detail action; --test was applied before dispatch.
 registerLiveCommands(program);
 registerResearchCommand(program);
@@ -1473,6 +1475,8 @@ program
     '--test',
     '격리 테스트 인스턴스로 실행 — cwd 의 git 트리(worktree 포함)에서 `<트리>/.elanous-test` 를 루트로 잡고 state·config 두 축을 함께 격리한다. config 사본이 없으면 자동 물질화. `--test=<dir>` 로 루트 직접 지정 가능(값 문법은 `=` 형태 하나 — 모호함 없음). ELANOUS_STATE_DIR/--config-dir 을 손으로 줄 필요가 없다.',
   )
+  // Documentation-only — `readDashboardNameFlag` 가 Commander «전»에 argv 에서 걷어낸다.
+  .option('--name <name>', '대시보드 TUI 의 PTY 행(tui:<pid>)에 별명을 달고 뜬다 — `elanous pty list` 에 보이고 `pty snapshot <name>` 으로 부른다. 뜬 뒤 바꾸려면 `elanous pty rename <ref> <name>`.')
   .option('--help-all', '시스템 명령을 제외한 모든 최상위 명령 표시');
 program.addHelpText('after', acpServerHelpText());
 
@@ -11608,6 +11612,15 @@ async function main(): Promise<void> {
   //    ⇒ 이제 규칙이 «문법»뿐이라(북마크 스토어를 안 본다) 인자도 없다.
   rawArgs = stripRemoteFlags(rawArgs);
 
+  // `elanous --name <name>` — 대시보드 TUI 의 자기 PTY 행(`tui:<pid>`) 별명. 루트 실행 플래그라
+  //   Commander «전»에 걷어낸다(하위 명령이 앞이면 손대지 않는다 — dashboard-name-flag.ts 머리말).
+  const dashboardName = (await import('./cli/dashboard-name-flag.js')).readDashboardNameFlag(rawArgs);
+  if (dashboardName.error) {
+    console.error(dashboardName.error);
+    process.exit(1);
+  }
+  rawArgs = dashboardName.args;
+
   // M2.4 — remote-daemon path. `ELANOUS_REMOTE=mbp.tailnet:31415` (or
   // a full ws:// URL) makes the dashboard attach to a remote daemon
   // instead of booting an in-process ACP pair. Token + no-auth
@@ -11784,7 +11797,7 @@ async function main(): Promise<void> {
   // dashboard the user is actually looking at. Off unless this boots
   // (no producer in headless/daemon paths). fail-soft·비블로킹.
   bootTimer.begin();
-  try { (await import('./capture/tui-self-report.js')).startTuiSelfReport(); } catch { /* fail-soft */ }
+  try { (await import('./capture/tui-self-report.js')).startTuiSelfReport(dashboardName.name ? { nickname: dashboardName.name } : {}); } catch { /* fail-soft */ }
   bootTimer.phase('self-report');
 
   // Dashboard handles sync inline — only returns on quit

@@ -164,6 +164,11 @@ export function buildUpdateGoalToolSpec(): LLMToolSpec {
   };
 }
 
+/** 반려·재요청은 모델에게만 가는 내부 지시다 — 사용자 답에 그 사정(«완료 주장이 거부됐다»·«죄송합니다»)이 새지 않게 한다
+ *  (10-14 OPT 점검: evidence·rejected 판정 14회가 사용자 답의 사과 문장으로 나왔다). */
+export const GOAL_INTERNAL_NOTICE_RULE =
+  '이 반려·재요청은 내부 지시다. 사용자에게 보이는 답에 «완료 주장이 거부됐다/어긋났다»·«죄송합니다» 같은 내부 사정을 쓰지 말고, 고친 결과와 사실만 말하라.';
+
 /** 목표 실행 계약 — 첫 turn 앞에 leading system 메시지로 주입. codex 자체 prompt.md /
  *  ext-goal continuation.md 의 지속·anti-shrink·증거완료 언어 이식. ASCII + 한국어. */
 export const GOAL_SYSTEM_PREAMBLE = [
@@ -173,6 +178,7 @@ export const GOAL_SYSTEM_PREAMBLE = [
   '- 완료는 증거로 판정한다. 모든 요구사항/산출물/검증에 대해 실제 현재 상태에서 증거를 확인하라. 불확실하거나 간접적인 증거는 미달성으로 보고 계속하라.',
   `- 목표가 실제로 완전히 끝났고 증거로 확인됐을 때만 ${UPDATE_GOAL_TOOL_NAME} 도구를 status="complete" 로 호출하고 evidence 에 그 증거를 적어 종료하라. 완료 신호는 이 도구 호출뿐이다(텍스트 문장이 아니다).`,
   '- 아직 할 일이 남았으면 멈추거나 허락을 구하지 말고 다음 최고가치 스텝을 바로 실행하라.',
+  `- [continue]·[finalize]·[evidence required]·[evidence mismatch]·[tool call rejected] 같은 반려·재요청은 내부 지시다. 사용자에게 보이는 답에 «완료 주장이 거부됐다/어긋났다»·«죄송합니다» 같은 내부 사정을 쓰지 말고, ${UPDATE_GOAL_TOOL_NAME} 호출도 답에서 설명하지 마라.`,
 ].join('\n');
 
 /** 미완 판정 시 재주입하는 continuation 프롬프트(user turn). */
@@ -186,6 +192,7 @@ export const GOAL_CONTINUATION_PROMPT = [
   '예산이 곧 소진된다거나 그만두고 싶다는 이유로 완료를 선언하지 마라.',
   `진짜로 진행이 막혔고(같은 장애가 반복) 대안도 없을 때만 ${UPDATE_GOAL_TOOL_NAME} 도구를 status="blocked" 로 호출하고 무엇이 왜 막혔는지 evidence 에 적어라. 단지 어렵거나 느리거나 불확실하다는 이유로는 쓰지 마라.`,
   `모든 요구사항이 증거로 충족됐다면, ${UPDATE_GOAL_TOOL_NAME} 도구를 status="complete" + evidence 로 호출해 종료하라.`,
+  GOAL_INTERNAL_NOTICE_RULE,
 ].join('\n');
 
 /** 감독 메모 블록의 머리말 — 자식이 「이것은 부모가 보낸 것」임을 «구별»하게 한다. */
@@ -198,6 +205,7 @@ export const GOAL_READBACK_PROMPT = [
   `완료를 텍스트로만 말했다. 텍스트 문장은 완료 신호가 아니다 — 완료가 사실이면 ${UPDATE_GOAL_TOOL_NAME} 도구를 status="complete" 로 호출하고 evidence 에 현재 상태에서 실제로 확인한 증거(파일·명령출력·테스트·PR)를 적어라.`,
   '아직 미충족 항목이 있으면 완료를 주장하지 말고 다음 스텝을 지금 실행하라.',
   '이미 사용자에게 한 답을 다시 쓰지 마라 — 새 사실이 없으면 텍스트 없이 update_goal 만 호출하라.',
+  GOAL_INTERNAL_NOTICE_RULE,
 ].join('\n');
 
 /** GOAL-LOOP-INTENT-STALL (0.2.24 · OP or-audit-1010) — 구현 자식이 «도구를 한 번도 안 부르고 말만 한 턴»에
@@ -222,6 +230,7 @@ export const GOAL_EVIDENCE_REQUIRED_PROMPT = [
   '[evidence required]',
   `${UPDATE_GOAL_TOOL_NAME}(status="complete") 를 호출했지만 evidence 가 비어 있어 완료로 인정하지 않는다.`,
   '현재 상태(파일·명령출력·테스트결과·PR)에서 실제로 확인한 증거를 evidence 에 채워 다시 호출하거나, 미충족 항목을 마저 실행하라.',
+  GOAL_INTERNAL_NOTICE_RULE,
 ].join('\n');
 
 /** evidence-mismatch 반려 재주입 (OH8 후속 PR-2) — update_goal(complete) 를 호출했으나 그 턴까지의
@@ -236,6 +245,7 @@ export function buildEvidenceMismatchPrompt(fail: number, unmatchedFilters: read
       `(fail=${fail}, unmatched=${unmatched}). 완료 증거와 실제 테스트 결과가 어긋난다 — 완료로 인정하지 않는다.`,
     '테스트를 실제로 통과시키거나(fail=0 · 모든 필터 매칭), 완료 주장을 철회하고 남은 작업을 마저 실행하라.',
     '통과한 run_tests 없이 complete 를 다시 주장하지 마라.',
+    GOAL_INTERNAL_NOTICE_RULE,
   ].join('\n');
 }
 
@@ -245,6 +255,7 @@ export function buildRejectedToolCompletionPrompt(rejectedTools: readonly string
     '[tool call rejected]',
     `${UPDATE_GOAL_TOOL_NAME}(status="complete") 를 호출했지만 이 turn 에 ${rejectedTools.join(', ')} 도구 호출이 거부되어 실행되지 않았다. 완료 증거와 실제 도구 결과가 어긋난다 — 완료로 인정하지 않는다.`,
     '거부된 작업을 실제로 다시 실행하거나 완료 주장을 철회하고 남은 작업을 마저 실행하라.',
+    GOAL_INTERNAL_NOTICE_RULE,
   ].join('\n');
 }
 
@@ -301,6 +312,8 @@ export interface GoalLoopResult {
   stopReason: GoalLoopStopReason;
   /** 목표가 증거 기준 완료로 선언됐는지(update_goal(complete)+evidence 감지). */
   goalComplete: boolean;
+  /** `auth_rejected` 로 끝났을 때 — 마지막 코어 턴의 공급자 오류 원문(비밀값 가림). */
+  errorMessage?: string;
 }
 
 /** 완료 마커 감지(deprecated fallback) — 마커가 산문 안에 우연히 포함(예: "상수 값은
@@ -856,7 +869,10 @@ export async function runGoalLoop(
         sessionId: ctx.sessionId, ...runAttribution, iterations, stopReason: lastResult.stopReason,
         finalChars: lastResult.finalText.length,
       }, { level: 'error' });
-      return finish({ finalText: lastResult.finalText, iterations, stopReason: lastResult.stopReason, goalComplete: false });
+      return finish({
+        finalText: lastResult.finalText, iterations, stopReason: lastResult.stopReason, goalComplete: false,
+        ...(lastResult.errorMessage !== undefined ? { errorMessage: lastResult.errorMessage } : {}),
+      });
     }
 
     // Evidence-less completion is not authoritative; only retry after stop and terminal outcomes

@@ -6341,6 +6341,39 @@ ${report}`);
       .not.toContainEqual(expect.objectContaining({ tag: 'grounding-evidence' }));
   });
 
+  test('PROJECT-RELATIONS salvage: a Read-verified sentence renders six file paths, not one prose path', async () => {
+    const evidence = 'All six candidate paths were Read directly (not just discovered) and match the PROJECT-RELATIONS first-slice request: src/project/project-store.ts — schema; src/project/project-store.test.ts — tests; src/project/session-context.ts, src/project/session-context.test.ts, src/project/project-suggestion.ts, src/project/project-suggestion.test.ts — adjacent consumers.';
+    const authored = await authorGoal('Keep project relations grounded.', {
+      ...deps,
+      ground: async () => ({ ...facts, persistentEvidence: [evidence] }),
+    });
+    expect(tracedPathReferences(authored.document).map(({ path }) => path)).toEqual([
+      'src/project/project-store.ts', 'src/project/project-store.test.ts',
+      'src/project/session-context.ts', 'src/project/session-context.test.ts',
+      'src/project/project-suggestion.ts', 'src/project/project-suggestion.test.ts',
+    ]);
+    expect(authored.document.split(evidence)).toHaveLength(2);
+  });
+
+  test('a differently worded Read evidence sentence still renders its path as a path', async () => {
+    for (const evidence of [
+      'Both target paths were Read directly in src/project/project-store.ts and src/project/session-context.ts.',
+      'All six candidate paths were inspected in src/project/project-store.ts and src/project/session-context.ts.',
+      'src/project/project-store.ts and src/project/session-context.ts — Read evidence.',
+    ]) {
+      const authored = await authorGoal('Keep target paths grounded.', {
+        ...deps,
+        ground: async () => ({ ...facts, persistentEvidence: [evidence] }),
+      });
+      expect(tracedPathReferences(authored.document).map(({ path }) => path)).toEqual([
+        'src/project/project-store.ts', 'src/project/session-context.ts',
+      ]);
+      expect(authored.document.split(evidence)).toHaveLength(2);
+      expect(lintGoalFile(authored.document, 'main', { readReferencedFile: () => 'export const value = 1;\n' })
+        .filter((finding) => finding.tag === 'traced-path')).toEqual([]);
+    }
+  });
+
   test('retains verbatim persistent evidence in PROBLEM for research goals without TRACED PATHS', async () => {
     const evidence = [
       'src/example.ts:42 — Read-verified persistent evidence.',
@@ -9255,6 +9288,33 @@ describe('lintGoalFile · TRACED PATHS 의 인라인 코드 표기', () => {
 
   test('맨 경로(저작기 산출 표기)는 그대로 통과한다 — 회귀 방지', () => {
     expect(tracedFindings('1. src/present.ts — 설명')).toEqual([]);
+  });
+
+  test('legacy prose stays visible as a preflight error, and a spaced missing path is still checked', () => {
+    expect(tracedFindings('1. All six candidate paths were inspected in src/present.ts\n2. src/present.ts\n3. Read Me/missing.ts')
+      .map((finding) => finding.message)).toEqual([
+        'traced path does not exist: All six candidate paths were inspected in src/present.ts',
+        'traced path does not exist: Read Me/missing.ts',
+      ]);
+  });
+
+  test('Read 도구 주석은 경로에서 걷고 정규화한 수를 관측한다', () => {
+    const original = debug.log.bind(debug) as typeof debug.log;
+    const observations: Record<string, unknown>[] = [];
+    (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: Record<string, unknown>) => {
+      if (category === 'goal-author' && event === 'traced-path-annotation-normalized' && data) observations.push(data);
+    }) as typeof debug.log;
+    try {
+      const references = tracedPathReferences(canonical('1. src/present.ts (Read, 5 lines)\n2. `src/present.ts`:2 (Read, 2 lines)'));
+      expect(references).toEqual([
+        { path: 'src/present.ts', line: null, endLine: null },
+        { path: 'src/present.ts', line: 2, endLine: null },
+      ]);
+      expect(observations).toEqual([{ count: 2 }]);
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+    expect(tracedFindings('1. src/present.ts (Read, 5 lines)')).toEqual([]);
   });
 
   test('목록 기호가 두 겹이어도(저작기 산출 꼴 · 10-11 no-result-line 18건) 경로만 읽는다', () => {

@@ -4,7 +4,7 @@
 // not visual correctness.
 
 import { describe, test, expect } from 'bun:test';
-import { buildLogPaneViewport, renderLogPane, findBlock, renderBodyLine } from '../src/panes/log-pane.js';
+import { buildLogPaneViewport, renderLogPane, findBlock, renderBodyLine, physicalLogRowCount, logPaneContentHeight, maxLogPaneScroll } from '../src/panes/log-pane.js';
 import { stripAnsi } from '../src/tui.js';
 import { renderSkillsRows, type SkillRow } from '../src/panes/skills-pane.js';
 import { renderFilesRows } from '../src/panes/files-pane.js';
@@ -15,6 +15,67 @@ import { canPreview } from '../src/panes/preview-pane.js';
 import type { FileTreeEntry } from '../src/types.js';
 
 describe('log pane', () => {
+  test('multiline log content consumes physical rows without covering the streaming footer', () => {
+    const viewport = buildLogPaneViewport(
+      { lines: ['command\nfirst\nlast'], scrollOffset: -1, footerLine: 'streaming' },
+      { width: 40, height: 6, focused: false },
+    );
+    expect(viewport.bodyLines).toHaveLength(5);
+    expect(viewport.bodyLines.map(stripAnsi)).toEqual([
+      '  command', '  first', '  last', '', '  streaming',
+    ]);
+    expect(viewport.visibleLineIndices).toEqual([0, 0, 0, -1, -1]);
+    expect(viewport.bodyLines.every(line => !/[\r\n]/.test(line))).toBe(true);
+  });
+
+  test('filter matches only the physical line containing the query', () => {
+    const viewport = buildLogPaneViewport(
+      { lines: ['before\nneedle\nafter'], scrollOffset: -1, filterQuery: 'needle' },
+      { width: 40, height: 4, focused: false },
+    );
+    expect(viewport.title).toContain('⌕ needle · 1');
+    expect(viewport.bodyLines.join('\n')).toContain('needle');
+    expect(viewport.bodyLines.join('\n')).not.toContain('before');
+    expect(viewport.visibleLineIndices.filter(index => index >= 0)).toEqual([0]);
+  });
+
+  test('manual scroll reaches each physical row of a multiline entry', () => {
+    const lines = ['first\nsecond\nthird', 'fourth', 'fifth', 'sixth'];
+    const height = 4;
+    const maxScroll = physicalLogRowCount(lines) - (height - 1);
+    expect(physicalLogRowCount(lines, 1)).toBe(3);
+    expect(maxScroll).toBe(3);
+    const atTop = buildLogPaneViewport({ lines, scrollOffset: 0 }, { width: 30, height, focused: false });
+    const oneRowDown = buildLogPaneViewport({ lines, scrollOffset: 1 }, { width: 30, height, focused: false });
+    const atTail = buildLogPaneViewport({ lines, scrollOffset: maxScroll }, { width: 30, height, focused: false });
+    expect(atTop.bodyLines.slice(0, 3).map(stripAnsi)).toEqual(['  first', '  second', '  third']);
+    expect(oneRowDown.bodyLines.slice(0, 3).map(stripAnsi)).toEqual(['  second', '  third', '  fourth']);
+    expect(atTail.bodyLines.slice(0, 3).map(stripAnsi)).toEqual(['  fourth', '  fifth', '  sixth']);
+  });
+
+  test('filtered scroll bounds count only painted physical rows and reserve footer rows', () => {
+    const lines = ['before\r\nneedle\rafter', 'other'];
+    expect(physicalLogRowCount(lines)).toBe(4);
+    expect(physicalLogRowCount(lines, lines.length, 'needle')).toBe(1);
+    expect(logPaneContentHeight(6, true, false)).toBe(3);
+    expect(logPaneContentHeight(6, true, true)).toBe(2);
+    const maxScroll = Math.max(0, physicalLogRowCount(lines, lines.length, 'needle') - logPaneContentHeight(6, true, false));
+    expect(maxScroll).toBe(0);
+    const viewport = buildLogPaneViewport(
+      { lines, scrollOffset: maxScroll, filterQuery: 'needle', footerLine: 'Streaming…' },
+      { width: 40, height: 6, focused: false },
+    );
+    expect(viewport.bodyLines.map(stripAnsi)).toEqual(['  needle', '', '', '', '  Streaming…']);
+  });
+
+  test('keyboard and wheel scroll bound respects filter, freeze, and queued footer height', () => {
+    const lines = ['old\nneedle one\nold', 'needle two\nneedle three', 'needle four'];
+    expect(maxLogPaneScroll(lines, 4)).toBe(3);
+    expect(maxLogPaneScroll(lines, 4, { filterQuery: 'needle' })).toBe(1);
+    expect(maxLogPaneScroll(lines, 4, { filterQuery: 'needle', frozenTailIndex: 1 })).toBe(0);
+    expect(maxLogPaneScroll(lines, 6, { filterQuery: 'needle', hasFooter: true, hasQueueRow: true })).toBe(2);
+  });
+
   test('renders title + body lines = height', () => {
     const out = renderLogPane(
       { lines: ['a', 'b', 'c'], scrollOffset: 0 },

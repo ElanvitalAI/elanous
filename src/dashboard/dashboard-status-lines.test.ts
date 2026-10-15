@@ -1,7 +1,14 @@
-import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { describe, expect, spyOn, test } from 'bun:test';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { buildDashboardStatusLines, dashboardStatusSummaryLines, type DashboardStatusLinesInput } from './dashboard-status-lines.js';
+import { renderDashboardStatusLines } from './index.js';
 import { executeImmediateDashboardSlash } from './input/slash-executor.js';
+import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { seatLedgerPath } from '../seat-loop/seat-loop.js';
+import * as runningRuns from '../self-implement/running-runs.js';
+import { bunSpawnPty } from '../pty-shell/bun-native-pty.js';
 
 const input: DashboardStatusLinesInput = {
   provider: 'openai-codex',
@@ -20,18 +27,48 @@ const input: DashboardStatusLinesInput = {
   acp: 'idle',
 };
 
-test('dashboard /status reads current seats and fails closed when the read throws', () => {
-  const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
-  const start = source.indexOf('const getDashboardStatusLines = () => {');
-  const end = source.indexOf('bootDashboardSlashExecutor({', start);
-  expect(start).toBeGreaterThan(-1);
-  expect(end).toBeGreaterThan(start);
-  const status = source.slice(start, end);
-  expect(status).toContain('let seatsNow: string | null = null;');
-  expect(status).toContain('seatsNowLine(readSlashContextNow([]), Date.now())');
-  expect(status).toMatch(/try\s*\{[\s\S]*readSlashContextNow\(\[\]\)[\s\S]*\}\s*catch\s*\(error\)\s*\{[\s\S]*debug\.log\('dashboard\.status', 'seats-unreadable'/);
-  expect(status).toContain('return buildDashboardStatusLines({\n      seatsNow,');
+test('dashboard /status renders a seat without scanning run ledgers', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-seats-'));
+  const previousOverride = getElanousConfigDirOverride();
+  const now = new Date();
+  const query = spyOn(runningRuns, 'queryRunningRuns');
+  setElanousConfigDir(root);
+  try {
+    mkdirSync(join(root, 'seat-loop', 'TC'), { recursive: true });
+    writeFileSync(seatLedgerPath('TC', root, now), JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'working',
+      item: { source: 'checklist', id: 'TUI-STATUS', title: 'Seat ledger visible' } }) + '\n');
+    const result = executeImmediateDashboardSlash({ name: 'status', args: [] }, {
+      getStatusLines: () => renderDashboardStatusLines(input, now.getTime()),
+    });
+    expect(result?.logLines).toContain('지금 자리들: CTO Seat ledger visible · 방금');
+    expect(query).not.toHaveBeenCalled();
+  } finally {
+    query.mockRestore();
+    if (previousOverride) setElanousConfigDir(previousOverride);
+    else resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
+
+test('booted dashboard dispatches its registered /status without a run scan', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-status-boot-'));
+  try {
+    const child = bunSpawnPty(process.execPath, [join(import.meta.dir, '../../test/fixtures/dashboard-status-boot.fixture.ts')], {
+      env: { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_SESSION_ROOT: join(root, 'sessions'), DASHBOARD_STATUS_TEST_ROOT: root } as Record<string, string>,
+      cols: 80,
+      rows: 24,
+    });
+    let output = '';
+    const code = await new Promise<number | null>((resolve) => {
+      child.onData(chunk => { output += chunk; });
+      child.onExit(event => resolve(event.exitCode));
+    });
+    if (code !== 0) throw new Error(`booted /status exited ${code}: ${output}`);
+    expect(output).toContain('DASHBOARD_STATUS_PROBE={"seatVisible":true,"queryCalls":0}');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 25_000);
 
 describe('buildDashboardStatusLines', () => {
   test('puts model, daemon attachment and account first, preserving all detailed lines', () => {

@@ -383,6 +383,28 @@ describe('llm.reviewFallbackModels persistence', () => {
   });
 });
 
+describe('llm.routePolicy persistence', () => {
+  test('survives parse, save, and reload (config set → get round trip)', () => {
+    writeConfig({ llm: { provider: 'openai-codex', routePolicy: { mode: 'active-provider', opusEscalation: 'evidence-hitl' } } });
+    const config = buildUserConfig(configPath);
+    expect(config.llm.routePolicy).toEqual({ mode: 'active-provider', opusEscalation: 'evidence-hitl' });
+
+    const savedPath = join(root, 'saved-config.json');
+    saveUserConfig(config, savedPath);
+    expect(JSON.parse(readFileSync(savedPath, 'utf-8')).llm.routePolicy).toEqual({ mode: 'active-provider', opusEscalation: 'evidence-hitl' });
+    expect(buildUserConfig(savedPath).llm.routePolicy).toEqual({ mode: 'active-provider', opusEscalation: 'evidence-hitl' });
+  });
+
+  test('a config set on the typed value is written back', () => {
+    writeConfig({ llm: { provider: 'openai-codex' } });
+    const config = buildUserConfig(configPath);
+    expect(config.llm.routePolicy).toBeUndefined();
+    const savedPath = join(root, 'saved-config.json');
+    saveUserConfig({ ...config, llm: { ...config.llm, routePolicy: { mode: 'active-provider' } } }, savedPath);
+    expect(buildUserConfig(savedPath).llm.routePolicy).toEqual({ mode: 'active-provider' });
+  });
+});
+
 describe('tools.nativeStructure provider list', () => {
   function captureStderr(run: () => void): string {
     const chunks: string[] = [];
@@ -642,6 +664,22 @@ describe('retired dashboard mode config', () => {
     const saved = JSON.parse(readFileSync(configPath, 'utf8'));
     expect(saved.dashboard).not.toHaveProperty('uiMode');
     expect(saved.dashboard).not.toHaveProperty('defaultMode');
+  });
+});
+
+describe('dashboard bootBanner', () => {
+  test('is absent by default (minimal at the use site) and drops invalid values', () => {
+    writeConfig({});
+    expect(buildUserConfig(configPath).dashboard.bootBanner).toBeUndefined();
+    writeConfig({ dashboard: { bootBanner: 'loud' } });
+    expect(buildUserConfig(configPath).dashboard.bootBanner).toBeUndefined();
+  });
+
+  test('round-trips an explicit full through saveUserConfig', () => {
+    writeConfig({ dashboard: { bootBanner: 'full' } });
+    const cfg = buildUserConfig(configPath);
+    saveUserConfig(cfg, configPath);
+    expect(buildUserConfig(configPath).dashboard.bootBanner).toBe('full');
   });
 });
 

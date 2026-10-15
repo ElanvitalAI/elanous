@@ -145,6 +145,7 @@ export function createChatPickerModalRuntime(deps: ChatPickerModalRuntimeDeps): 
     maxVisible: spec.maxVisible,
     getInputZoneHeight: deps.getInputZoneHeight,
     width: deps.getBounds().width,
+    getWidth: () => deps.getBounds().width,
     onKey: makePickerOnKey(kind),
     onRowClick: makePickerOnRowClick(kind),
   });

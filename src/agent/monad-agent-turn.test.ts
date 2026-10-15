@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
+import { Database } from 'bun:sqlite';
 import { listChecklist } from '../release-loop/checklist.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
 import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
@@ -18,6 +19,17 @@ afterEach(() => {
   delete process.env.ELANOUS_STATE_DIR;
   resetElanousConfigDir();
 });
+
+function productionSurfaceEventCount(): number | null {
+  const path = join(homedir(), '.elanous', 'memory', 'surface_events.db');
+  if (!existsSync(path)) return null;
+  const db = new Database(path, { readonly: true });
+  try {
+    return Number((db.query('SELECT COUNT(*) AS count FROM events').get() as { count: number }).count);
+  } finally {
+    db.close();
+  }
+}
 
 const config = {
   llm: { provider: 'fake', model: 'fake-model' },
@@ -38,6 +50,44 @@ function fakeTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
 }
 
 describe('shared messenger agent final answer', () => {
+  test('a test-runner turn without an explicit state directory leaves production rows unchanged', async () => {
+    const priorStateDir = process.env.ELANOUS_STATE_DIR;
+    const priorNodeEnv = process.env.NODE_ENV;
+    const priorBunTest = process.env.BUN_TEST;
+    delete process.env.ELANOUS_STATE_DIR;
+    process.env.NODE_ENV = 'test';
+    delete process.env.BUN_TEST;
+    const productionCountBefore = productionSurfaceEventCount();
+    try {
+      await makeElanousAgentRunTurn(config, 'telegram', fakeTurn)({
+        userConfig: config, sessionId: 'isolated-fake-session', userText: 'isolated test question',
+      });
+      expect(productionSurfaceEventCount()).toBe(productionCountBefore);
+    } finally {
+      if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = priorStateDir;
+      if (priorNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = priorNodeEnv;
+      if (priorBunTest === undefined) delete process.env.BUN_TEST;
+      else process.env.BUN_TEST = priorBunTest;
+    }
+  });
+
+  test('a test-runner turn writes to the injected isolated state directory', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'monad-turn-memory-'));
+    tempDirs.push(root);
+    process.env.ELANOUS_STATE_DIR = root;
+    await makeElanousAgentRunTurn(config, 'telegram', fakeTurn)({
+      userConfig: config, sessionId: 'isolated-fake-session', userText: 'isolated test question',
+    });
+    const isolatedDb = new Database(join(root, 'surface_events.db'), { readonly: true });
+    try {
+      expect(isolatedDb.query('SELECT COUNT(*) AS count FROM events').get()).toEqual({ count: 1 });
+    } finally {
+      isolatedDb.close();
+    }
+  });
+
   for (const surface of ['telegram', 'discord'] as const) {
     test(`${surface} displays the last assistant message after a fake tool call`, async () => {
       const deltas: string[] = [];

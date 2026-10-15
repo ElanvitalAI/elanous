@@ -195,7 +195,11 @@ export const SELF_COGNITION_RUNTIMES: readonly ToolRuntime[] = SELF_COGNITION_TO
     return coreSpec(name);
   },
   run: async (args, ctx) => name === 'context_now'
-    ? (await import('../context-bus/context-now.js')).contextNow({ ...(typeof args.topic === 'string' ? { topic: args.topic } : {}) })
+    ? (() => {
+      const options = { ...(typeof args.topic === 'string' ? { topic: args.topic } : {}) };
+      return import('../context-bus/context-now.js').then(now => ctx.surface === 'tui'
+        ? now.contextNowInWorker(options) : now.contextNow(options));
+    })()
     : name === 'memory_recall' || name === 'self_recall'
       ? runRecall(name, args, ctx)
       : toToolRunResult(await coreTools().buildCoreTools().dispatch(name, args)),

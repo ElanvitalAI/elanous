@@ -34,12 +34,12 @@ test.skipIf(!ptyAvailable())('isolated real TUI first turn attributes input.subm
     env: { ...process.env, NODE_ENV: 'development', XDG_STATE_HOME: xdg, ELANOUS_STATE_DIR: state, TERM: 'xterm-256color' },
   });
   try {
-    // The real chat composer paints this exact prompt (src/dashboard/index.ts;
-    // #22370 changed it from English). first-screen-band has a separate hint.
-    const firstTurnPrompt = '말 한 줄로 시작 — 질문하거나 «하니스로 구현 …» · /command · /path/to.pdf 첨부';
+    // TUI-INPUT-PLACEHOLDER-OFF — the composer no longer paints a guide line,
+    // so an input row holding only «❯» means the first turn is ready.
+    const emptyComposer = (screen: string) => screen.split('\n').some((line) => line.trim() === '❯');
     const deadline = Date.now() + 60_000;
-    while (!(await handle.renderScreen()).includes(firstTurnPrompt) && Date.now() < deadline) await Bun.sleep(100);
-    expect(await handle.renderScreen()).toContain(firstTurnPrompt);
+    while (!emptyComposer(await handle.renderScreen()) && Date.now() < deadline) await Bun.sleep(100);
+    expect(emptyComposer(await handle.renderScreen())).toBe(true);
     handle.write('안녕\r');
 
     const dbPath = join(root, 'logs', 'logs.db');

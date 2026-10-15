@@ -89,6 +89,8 @@ export interface RejudgeDeps {
   requestRepair?: (request: RepairLaunchRequest) => Promise<void>;
   applyRepair?: (request: RepairCasRequest) => RepairCasOutcome;
   notifyRepair?: (seat: string, body: string) => void;
+  /** Shared new-launch budget for this `tasks rejudge --all` call. */
+  repairBudget?: import('./repair-cycle.js').RepairTickBudget;
   /** TA-REJUDGE-REBASE-LOOP — origin/main 을 PR 가지에 3-way merge 하고 일반 push. 시험은 주입한다. */
   catchUpMain?: (request: CatchUpRequest) => Promise<CatchUpResult>;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
@@ -533,7 +535,8 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
         mustFix: mustFix ?? [], liveMoves: deps.liveMoves, now: now(), readFile: read,
         ...(deps.requestRepair ? { request: deps.requestRepair } : {}),
         ...(deps.applyRepair ? { apply: deps.applyRepair } : {}),
-        ...(deps.notifyRepair ? { notify: deps.notifyRepair } : {}) });
+        ...(deps.notifyRepair ? { notify: deps.notifyRepair } : {}),
+        ...(deps.repairBudget ? { repairBudget: deps.repairBudget } : {}) });
       step('repair', result.decision, result.reason, true);
       return outcomes;
     }

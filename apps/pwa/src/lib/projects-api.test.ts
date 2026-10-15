@@ -45,3 +45,19 @@ test('projects API creates a project using a folder selected on the remote host'
     body: '{"name":"새 일","primaryFolder":"/srv/work/a"}',
   } });
 });
+
+test('projects API encodes the requested autopsy ID in the client URL', async () => {
+  const calls: string[] = [];
+  const client = { fetchJson: async (path: string) => {
+    calls.push(path);
+    return { project: { id: 'id/a', name: 'Example' },
+      attribution: { status: 'unavailable', reason: 'ledger-project-id-missing' },
+      coverage: { failuresTruncated: false, proposalsTruncated: false, causeCounts: 'returned-failures' },
+      failures: [], causes: [], proposals: [], pendingApprovals: 0 };
+  } };
+  const api = new ProjectsApi(client as never);
+  expect(await api.fetchProjectAutopsy('id/a')).toMatchObject({
+    project: { id: 'id/a' }, attribution: { status: 'unavailable', reason: 'ledger-project-id-missing' },
+  });
+  expect(calls).toEqual(['/v1/projects/id%2Fa/autopsy']);
+});

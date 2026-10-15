@@ -281,6 +281,19 @@ describe('runPtyList — worktree provenance output', () => {
     ? { known: true, goalId: 'goal-1', goalFile: 'goals/goal-1.md', goalTitle: 'Purpose' }
     : { known: false, provenanceReason: workdir ? 'config-not-recorded' : 'workdir-not-recorded' };
 
+  test('explicit shell purpose fills absent goal while a recorded git goal keeps precedence', () => {
+    const refs = () => [
+      { id: 'shell_new', kind: 'shell', source: 'remote' as const, alive: true, workdir: '/repo/no-goal', purpose: 'tui-shell' },
+      { id: 'shell_goal', kind: 'shell', source: 'remote' as const, alive: true, workdir: '/repo/known', purpose: 'tui-shell' },
+    ];
+    const result = runPtyList({ ...listOnlyDeps(refs), resolveWorktreeProvenance: provenance });
+    const [shell, goal, count] = result.message!.split('\n');
+    expect(shell).toContain('purpose=tui-shell');
+    expect(goal).toContain('goalId=goal-1');
+    expect(goal).not.toContain('purpose=tui-shell');
+    expect(count).toBe('purpose-known rows: 2/2');
+  });
+
   test('JSON current and federated paths project values or exactly one named absence reason', () => {
     const base: Omit<PtyManifestRow, 'id' | 'workdir'> = { kind: 'pty', cmd: 'bun', ownerPid: 1, ptyPid: 1, instance: 'test', startedAt: 0, alive: true, exitCode: null, snapshot: '', snapshotAt: 0, updatedAt: 0, frame: '', frameAt: 0, outputBytesTotal: 0, runId: '', runIdSource: '', spaceId: '', sessionId: '', parentPtyId: '', parentKind: '', parentPid: 0, closedAt: 0, codeSha: '' };
     const deps: PtyTakeoverCommandDeps = {

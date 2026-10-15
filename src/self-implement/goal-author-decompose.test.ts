@@ -63,7 +63,8 @@ mock.module('../llm.js', () => ({
   },
 }));
 
-const { createGoalAuthorDecomposeSteps, readRecentStepCountsFailOpen } = await import('./goal-author-decompose.js');
+const { classifyShadowFirstSplit, createGoalAuthorDecomposeSteps, readRecentStepCountsFailOpen, SHADOW_FIRST_SPLIT_MARKER } = await import('./goal-author-decompose.js');
+const { authorGoal } = await import('./goal-author.js');
 const { runGoalAuthorCli } = await import('./goal-author-cli.js');
 const {
   _setCreateGoalAuthorDecomposeStepsForTesting,
@@ -690,4 +691,166 @@ afterAll(() => {
   mock.module('../harness/llm-decompose.js', () => llmDecomposeOriginal);
   mock.module('../harness/adversarial-plan.js', () => adversarialPlanOriginal);
   mock.module('../llm.js', () => llmOriginal);
+});
+
+// ⭐ AUTHOR-SHADOW-FIRST-SPLIT ① — #27040 이 «분류기를 부르는 시험 0» 으로 수렴 실패했다.
+//    발동은 명시 표지 «분할: 그림자 먼저» 한 줄뿐이다(OP 결정 10-15 — 자연어 감지 발동은 후속 개선).
+//    여기 시험은 분류기 단독이 아니라 «실제 호출 경로»(runGoalAuthorCli → 기본 분해 seam → authorGoal 의 ## STEPS)를
+//    통과해, 분기를 지우면 실패한다(표지 골에서 LLM 분해 mock 의 originalSteps 가 대신 나온다).
+const MARKED_ASK = '대상 경로: src/task-agent/live-moves.ts\nTA 가 리뷰 통과 뒤 스스로 착지한다.\n분할: 그림자 먼저\n판정: 운영 원장에 TA 자가 착지가 실제로 1건 이상 일어난다.';
+// 리뷰 r1~r6 의 자연어 반례 전부 — 표지가 없으므로 어느 것도 쪼개지지 않는다.
+const UNMARKED_ASKS = [
+  'TA 가 리뷰 통과 뒤 스스로 착지한다.\n판정: 운영 원장에 TA 자가 착지가 실제로 1건 이상 일어난다.',
+  'TA 자가 착지 · 판정: 운영 원장에 실제로 1건',
+  '자동 테스트 보강 · 죽은 코드 삭제 · 판정: 운영에서 실제로 장애 0건',
+  'TA가 스스로 착지하도록 배선한다.\n설명: 운영에서 실제로 장애가 발생했다.\n판정: bun test src/task-agent/live-moves.test.ts → 0 fail',
+  'TA가 스스로 착지하지 않게 막는다. 판정: 운영에서 실제로 자가 착지 0건',
+  '대상: src/acceptance.test.ts\nTA가 스스로 착지한다.\n판정: 운영에서 실제로 1건',
+  'TA 자가 착지 방지 · 판정: 운영에서 실제로 착지 0건',
+  'live move 비활성화 · 판정: 운영에서 실제로 착지 0건',
+  'TA가 스스로 착지한다. 판정: in production은 아직 확인하지 못함',
+  'TA 자가 착지하지 말라.\n판정: 운영에서 실제로 착지 시도 1건 이상 차단',
+  '죽은 코드 삭제 · 판정: bun test src/example.test.ts → 0 fail.',
+];
+// 표지와 «비슷하지만 정확한 꼴이 아닌» 문면 — 발동하지 않는다.
+const NEAR_MISS_MARKER_ASKS = [
+  'TA 착지 · 분할: 그림자 먼저',
+  '분할: 그림자 먼저 하지 않는다',
+  '설명에 «분할: 그림자 먼저» 표지를 언급한다',
+  '분할 : 그림자먼저',
+  '분할:그림자 먼저',
+  '분할:   그림자 먼저',
+  '  분할: 그림자 먼저',
+  '분할: 그림자 먼저  ',
+];
+
+function shadowFirstSplitLogs(log: { mock: { calls: unknown[][] } }): unknown[][] {
+  return log.mock.calls.filter(([category, event]) => category === 'goal-author' && event === 'shadow-first-split');
+}
+
+describe('AUTHOR-SHADOW-FIRST-SPLIT ① explicit-marker classifier', () => {
+  test('the marker line splits into shadow → live with one predecessor edge', () => {
+    const verdict = classifyShadowFirstSplit(MARKED_ASK);
+    if (verdict.kind !== 'shadow-first-split') throw new Error(`expected split, got ${verdict.kind}`);
+    expect(verdict.pieces.map((piece) => piece.id)).toEqual(['shadow', 'live']);
+    expect(verdict.pieces[0].dependsOn).toEqual([]);
+    expect(verdict.pieces[1].dependsOn).toEqual(['shadow']);
+    expect(verdict.pieces.reduce((edges, piece) => edges + piece.dependsOn.length, 0)).toBe(1);
+    expect(verdict.pieces[0].step).toContain('«기록만»');
+    expect(verdict.pieces[1].step).toContain('선행 = ①');
+  });
+
+  test('the marker must be a whole line exactly (no leading/trailing whitespace); only a CRLF line ending is tolerated', () => {
+    expect(classifyShadowFirstSplit(`골 문면\r\n${SHADOW_FIRST_SPLIT_MARKER}\r\n판정: x`).kind).toBe('shadow-first-split');
+    expect(classifyShadowFirstSplit(SHADOW_FIRST_SPLIT_MARKER).kind).toBe('shadow-first-split');
+  });
+
+  test('a lone CR not followed by LF is not a line ending — the marker does not trigger (r8 regression)', () => {
+    expect(classifyShadowFirstSplit(`${SHADOW_FIRST_SPLIT_MARKER}\r`)).toEqual({ kind: 'single-piece' });
+    expect(classifyShadowFirstSplit(`골 문면\n${SHADOW_FIRST_SPLIT_MARKER}\r판정: x`)).toEqual({ kind: 'single-piece' });
+  });
+
+  test.each(UNMARKED_ASKS)('no marker → single-piece for any wording (r1~r6 counterexamples): %s', (ask) => {
+    expect(classifyShadowFirstSplit(ask)).toEqual({ kind: 'single-piece' });
+  });
+
+  test.each(NEAR_MISS_MARKER_ASKS)('a near-miss of the exact marker form does not trigger: %s', (ask) => {
+    expect(classifyShadowFirstSplit(ask)).toEqual({ kind: 'single-piece' });
+  });
+});
+
+describe('AUTHOR-SHADOW-FIRST-SPLIT ① decomposition seam', () => {
+  test('a marked goal returns the two pieces without calling the LLM decomposition or the critic', async () => {
+    captureStreamLlm = true;
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      const steps = await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: true })(MARKED_ASK, { runId: 'run-shadow' });
+      expect(steps).toHaveLength(2);
+      expect(steps[0]).toStartWith('① 그림자');
+      expect(steps[1]).toStartWith('② live 스위치');
+      expect(decompositionOptions).toBeUndefined();
+      expect(critiqueCalls).toBe(0);
+      expect(streamLlmCalls).toHaveLength(0);
+      expect(shadowFirstSplitLogs(log)).toEqual([[
+        'goal-author', 'shadow-first-split', expect.objectContaining({ verdict: 'shadow-first-split', trigger: 'explicit-marker', pieces: ['shadow', 'live'], edges: 1, runId: 'run-shadow' }),
+      ]]);
+    } finally { log.mockRestore(); }
+  });
+
+  test.each(UNMARKED_ASKS)('an unmarked goal keeps the LLM decomposition with no shadow-first-split observation: %s', async (ask) => {
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      expect(await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: false })(ask)).toEqual(originalSteps);
+      expect(decompositionOptions).toBeDefined();
+      expect(shadowFirstSplitLogs(log)).toEqual([]);
+    } finally { log.mockRestore(); }
+  });
+
+  test('a marker only in grounding context does not split', async () => {
+    expect(await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: false })(UNMARKED_ASKS[0]!, {
+      context: SHADOW_FIRST_SPLIT_MARKER,
+    })).toEqual(originalSteps);
+  });
+});
+
+// ⚠️ 범위: CLI 기본 seam → authorGoal 의 저작 문서(## STEPS)까지다. 파일 쓰기(write)는 stub — 디스크 출력은 이 시험이 증명하지 않는다.
+describe('AUTHOR-SHADOW-FIRST-SPLIT ① production call path (runGoalAuthorCli → default seam → authorGoal ## STEPS · write stubbed)', () => {
+  const authorFacts = {
+    grounded: true, context: '', files: ['src/example.ts'],
+    persistentEvidence: ['src/example.ts:42 — authorGoal receives this Read-verified call path.'],
+    codeFacts: ['[code:src/example.ts] exampleExport'], skillFacts: [], memoryFacts: [],
+    documentFacts: ['docs/example.md'], refFacts: [], ptyFacts: [],
+  };
+  const authorThroughGoalAuthor = (documents: string[]): NonNullable<Parameters<typeof runGoalAuthorCli>[2]>['write'] => async (ask, _cwd, deps) => {
+    const authored = await authorGoal(ask, {
+      ...deps,
+      ground: async () => authorFacts,
+      enhance: async (raw) => ({ original: raw, checklist: ['embed the exact ask in the authored document'], verbatimPreserved: true }),
+      slugFn: async () => 'shadow-first-split',
+    });
+    documents.push(authored.document);
+    return { path: 'docs/goals/GOAL-shadow.md', authored };
+  };
+  const stepsSection = (document: string): string[] => {
+    const lines = document.split('\n');
+    const start = lines.indexOf('## STEPS');
+    if (start < 0) return [];
+    const out: string[] = [];
+    for (const line of lines.slice(start + 1)) {
+      if (!line.startsWith('- ')) break;
+      out.push(line.slice(2));
+    }
+    return out;
+  };
+
+  test('a marked ask is authored with shadow then live steps and no LLM decomposition call', async () => {
+    const documents: string[] = [];
+    await runGoalAuthorCli([MARKED_ASK], { cwd: process.cwd(), disableAdversarialReview: true }, {
+      recentStepCountReader: () => [], write: authorThroughGoalAuthor(documents),
+    });
+    expect(documents).toHaveLength(1);
+    const steps = stepsSection(documents[0]!);
+    expect(steps).toHaveLength(2);
+    expect(steps[0]).toStartWith('① 그림자');
+    expect(steps[1]).toStartWith('② live 스위치 — 선행 = ①');
+    expect(decompositionOptions).toBeUndefined();
+  });
+
+  test.each(UNMARKED_ASKS)('an unmarked ask is authored with the unchanged LLM decomposition (one piece stays one piece): %s', async (ask) => {
+    decomposition = ['한 조각'];
+    const documents: string[] = [];
+    await runGoalAuthorCli([ask], { cwd: process.cwd(), disableAdversarialReview: true }, {
+      recentStepCountReader: () => [], write: authorThroughGoalAuthor(documents),
+    });
+    expect(stepsSection(documents[0]!)).toEqual(['한 조각']);
+    expect(decompositionOptions).toBeDefined();
+  });
+
+  test('an unmarked ask keeps a multi-piece LLM decomposition unchanged', async () => {
+    const documents: string[] = [];
+    await runGoalAuthorCli([UNMARKED_ASKS[0]!], { cwd: process.cwd(), disableAdversarialReview: true }, {
+      recentStepCountReader: () => [], write: authorThroughGoalAuthor(documents),
+    });
+    expect(stepsSection(documents[0]!)).toEqual(originalSteps);
+  });
 });

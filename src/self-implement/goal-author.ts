@@ -1,7 +1,7 @@
 import { classifyObservation } from '../design/behaviour-signal.js';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync, type Dirent } from 'node:fs';
 import { spawn } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 import { isRepositoryImplementationCandidate, type CodebaseGrounding } from '../autopilot/codebase-grounding.js';
 import { extractSlugSource, generateMissionSlug, slugify } from '../autopilot/mission-registry.js';
@@ -41,7 +41,9 @@ import { resolveGoalAuthorClarification, parseGoalDocumentClarifications, serial
 import { acquireLockSync } from '../storage/file-lock.js';
 import { createRepositoryReferencedFileReader, type ReferencedFileReadResult } from './goal-file-reader.js';
 import { extractGoalDocSections, type GoalDocSourceLine } from './goal-doc/section.js';
-import { isGoalAuthorFileName } from './goal-document.js';
+import { buildGoalFileName, goalFileName, type GoalFileNameSource } from './goal-file-name.js';
+export { goalFileName } from './goal-file-name.js';
+export type { GoalFileNameSource } from './goal-file-name.js';
 import { resolveGoalDocumentsDir } from './goal-documents-dir.js';
 import { REQUIRED_EVIDENCE_COMMAND_SEPARATOR } from './off-diff-evidence.js';
 import { renderLaunchPreflight, siblingTestPath, type LaunchPreflightResult } from '../self-dev/launch-preflight-text.js';
@@ -792,10 +794,14 @@ export type ArtifactLaunchDeclarationClassification = 'declared' | 'absent-witho
 const SERVER_ENTRY_PATH = /(?:^|\/)server[^/]*\.(?:[cm]?[jt]sx?)$/i;
 const LOOPBACK_ADDRESS_WITH_PORT = /(?<![\p{L}\p{N}.-])(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)(?![\p{L}\p{N}_])/iu;
 
+function targetPathsInLabelPiece(piece: string): string[] {
+  return askPathTokens(piece).filter((path) => path.includes('/'));
+}
+
 function declaredTargetPaths(document: string): string[] {
   return linesOutsideFencedCode(document).flatMap(({ text }) => {
     const match = TARGET_PATH_LABEL.exec(text.trim());
-    return match ? askPathTokens(match[1]) : [];
+    return match ? match[1].split(/\s+[·,]\s*|[·,]\s+/).flatMap(targetPathsInLabelPiece) : [];
   });
 }
 
@@ -1303,6 +1309,8 @@ function isTracedPathsEvidenceUnavailable(entry: string): boolean {
 const TRACED_PATH_LINE = /^(.*?)(?::(\d+)(?:-(\d+))?)?$/;
 const INLINE_CODE_WRAPPED = /^(`+)([^`]*)\1$/;
 const TRACED_PATH_DESCRIPTION_DELIMITER = /\s+(?:—|-)\s+|:\s+/;
+/** Read tool output annotations are prose, never part of a repository path. */
+const TRACED_PATH_READ_ANNOTATION = /\s+\(Read,\s*\d+\s+lines?\)\s*$/i;
 /** 저작기가 「관련 있어 보이지만 여기가 아니다」를 말하려고 적은 항목 — 추적 경로가 아니다.
  *  ⚠️ 지금은 영어 문면만 문다(저작기 산출이 영어다). 한국어 배제 문장은 아직 안 잡는다. */
 const TRACED_PATH_EXCLUSION_DESCRIPTION = /\b(?:related|relevant)\b.*\b(?:but|however)\b.*\b(?:not here|elsewhere|another (?:location|place|path))\b|\b(?:not here|elsewhere|another (?:location|place|path))\b.*\b(?:related|relevant)\b/i;
@@ -1347,10 +1355,11 @@ export function tracedPathReferences(document: string): TracedPathReference[] {
   const section = markdownSection(document, 'TRACED PATHS');
   if (!section) return [];
   const references: TracedPathReference[] = [];
+  let normalizedAnnotationCount = 0;
   for (const line of section.split(/\r?\n/)) {
     const evidence = tracedPathListItem(line);
     if (!evidence) continue;
-    if (isTracedPathsEvidenceUnavailable(evidence) || isTracedPathExclusionDescription(evidence)) continue;
+    if (isTracedPathsEvidenceUnavailable(evidence) || evidence.startsWith('미해석:') || isTracedPathExclusionDescription(evidence)) continue;
     // 설명 구분자는 **공백으로 둘러싼** em dash 또는 hyphen 뿐이다 — 파일명 안의 dash 를 설명 구분자로 오인하지 않는다.
     // 경로 칸 안의 복수 경로는 **공백으로 둘러싼** 가운뎃점만 본다 — 파일명 안의 `·` 를 가르지 않는다.
     // ⭐ 인라인 코드 표기(`path`)를 벗긴다 — 저작기는 맨 경로를 쓰지만 사람이 쓴 골과 이 레포의 다른 문서는
@@ -1361,13 +1370,19 @@ export function tracedPathReferences(document: string): TracedPathReference[] {
       if (!trimmed) continue;
       // 10-11 재발 — 저작기가 «`- src/…`» 처럼 목록 기호를 백틱 «안»에 쓰면 바깥 기호만 벗긴 뒤 백틱을 벗겨
       //   «- src/…» 가 경로로 남았다(AUTHOR-DECOMPOSE-KNOB · MODEL-BENCH-SCORES 부검). 백틱을 벗긴 뒤 한 번 더 벗긴다.
-      const unwrapped = stripInlineCode(trimmed).replace(TRACED_PATH_LEADING_LIST_MARKERS, '');
+      const withoutAnnotation = trimmed.replace(TRACED_PATH_READ_ANNOTATION, '').trim();
+      if (withoutAnnotation !== trimmed) normalizedAnnotationCount += 1;
+      const unwrapped = stripInlineCode(withoutAnnotation).replace(TRACED_PATH_LEADING_LIST_MARKERS, '');
       const match = TRACED_PATH_LINE.exec(unwrapped);
       // 두 번 벗긴다 — 줄번호가 백틱 **안**(`p:42`)일 수도 **밖**(`p`:42)일 수도 있다.
       const path = match ? stripInlineCode(match[1].trim()).replace(TRACED_PATH_LEADING_LIST_MARKERS, '') : undefined;
       if (!path) continue;
       references.push({ path, line: match?.[2] ? Number(match[2]) : null, endLine: match?.[3] ? Number(match[3]) : null });
     }
+  }
+  if (normalizedAnnotationCount > 0) {
+    try { debug.log('goal-author', 'traced-path-annotation-normalized', { count: normalizedAnnotationCount }); }
+    catch { /* observation must not prevent path validation */ }
   }
   return references;
 }
@@ -1698,6 +1713,12 @@ export function lintGoalFile(document: string, branch: string, deps: GoalFileLin
         ? unavailableTracedPathEvidence
         : `${unavailableTracedPathEvidence} GoalType ${goalType} does not require ## TRACED PATHS.`,
     });
+  }
+  const unresolvedTracedPathEvidence = markdownSection(document, 'TRACED PATHS')?.split(/\r?\n/)
+    .map((line) => tracedPathListItem(line))
+    .filter((item): item is string => item !== undefined && item.startsWith('미해석:')) ?? [];
+  for (const item of unresolvedTracedPathEvidence) {
+    findings.push({ level: 'WARN', tag: 'traced-path', message: item });
   }
   if (deps.readReferencedFile) {
     // AUTHOR-NEW-FILE-PATHS — 문서가 «새로 만들 파일»로 선언한 경로. 실행 쪽 범위 검사와 같은 줄을 읽는다.
@@ -2277,11 +2298,94 @@ function observePersistentEvidenceSourceKinds(facts: CodebaseGrounding | null, a
   observeGoalAuthor('goal-author', 'persistent-grounding-evidence-source-count', { authorRunId, counts });
 }
 
-function tracedPathsSection(facts: CodebaseGrounding | null, unavailableEvidence: string): string[] {
+function tracedPathsSection(facts: CodebaseGrounding | null, ask: string, repositoryRoot: string | undefined, unavailableEvidence: string): string[] {
   const evidence = persistentEvidenceItems(facts);
-  return evidence.length
-    ? evidence.map(({ text, source }, index) => `${index + 1}. ${renderPersistentEvidence({ text, source })}`)
-    : [`- ${unavailableEvidence}`];
+  // Without a repository root we cannot verify paths. Keep the established
+  // rendering contract for callers that do not supply one.
+  if (repositoryRoot === undefined) {
+    const legacyPaths: string[] = [];
+    for (const item of evidence) {
+      const referenced = [...new Set(Array.from(item.text.matchAll(SOURCE_PATH), (match) => match[0]))]
+        .filter(isRepositoryImplementationCandidate);
+      if (referenced.length === 0 || (referenced.length === 1 && item.text.trim().startsWith(referenced[0]!))) {
+        legacyPaths.push(`${legacyPaths.length + 1}. ${renderPersistentEvidence(item)}`);
+        continue;
+      }
+      referenced.forEach((path, index) => legacyPaths.push(`${legacyPaths.length + 1}. ${path}${index === 0 ? ` — ${renderPersistentEvidence(item)}` : ''}`));
+    }
+    return legacyPaths.length ? legacyPaths : [`- ${unavailableEvidence}`];
+  }
+  const paths: string[] = [];
+  const declaredNew = new Set(declaredNewFilePaths(ask));
+  const targetLabels = linesOutsideFencedCode(ask)
+    .map(({ text }) => /^대상 경로:\s*(.*)$/.exec(text.trim())?.[1])
+    .filter((value): value is string => value !== undefined);
+  const unresolvedTargetPieces = targetLabels.flatMap((label) => label.split(/\s+[·,]\s*|[·,]\s+/))
+    .flatMap((piece) => {
+      const tokens = piece.trim().split(/\s+/).filter(Boolean);
+      return tokens.length === 0 ? ['(빈 대상 경로)'] : tokens.filter((token) => targetPathsInLabelPiece(token).length === 0);
+    });
+  const labeledTargets = declaredTargetPaths(ask);
+  const scopedAskPaths = [...new Set(askPathTokens(targetScopedGoalText(ask)).filter((path) => path.includes('/')))];
+  // A single repository path in an ask without a target label is still an explicit target.
+  // Multiple mentions are ambiguous; do not turn background references into targets.
+  const requestedTargets = targetLabels.length ? labeledTargets : scopedAskPaths.length === 1 ? scopedAskPaths : [];
+  const known = [...new Set([
+    ...requestedTargets, ...scopedAskPaths, ...(facts?.files ?? []),
+    ...evidence.flatMap((item) => Array.from(item.text.matchAll(SOURCE_PATH), (match) => match[0]).filter((path) => path.includes('/'))),
+  ])];
+  let root: string | null;
+  try { root = repositoryRoot === undefined ? null : realpathSync(resolve(repositoryRoot)); }
+  catch { root = null; }
+  const valid = (path: string, allowDeclaredNew: boolean): boolean => {
+    if (!path.includes('/') || isAbsolute(path) || path.split('/').some((part) => part === '..' || part === '.')) return false;
+    if (root === null) return false;
+    if (allowDeclaredNew && declaredNew.has(path) && isSafeNewTargetPath(path, root)) return true;
+    try {
+      const real = realpathSync(resolve(root, path));
+      return isSameOrNestedPath(real, root) && lstatSync(real).isFile();
+    } catch { return false; }
+  };
+  const resolvePath = (path: string, declaredTarget = false): string | null => {
+    if (declaredTarget) return valid(path, true) ? path : null;
+    if (path.includes('/') && valid(path, true)) return path;
+    if (path.includes('/')) return null;
+    const matches = known.filter((candidate) => candidate.endsWith(`/${path}`) && valid(candidate, false));
+    return matches.length === 1 ? matches[0]! : null;
+  };
+  const added = new Map<string, number>();
+  const addPath = (path: string, description?: string): void => {
+    const existing = added.get(path);
+    if (existing !== undefined) {
+      if (description !== undefined) paths[existing] += ` — ${description}`;
+      return;
+    }
+    added.set(path, paths.length);
+    paths.push(`${paths.length + 1}. ${path}${description === undefined ? '' : ` — ${description}`}`);
+  };
+  for (const path of requestedTargets) {
+    const resolved = resolvePath(path, true);
+    if (resolved) addPath(resolved);
+    else paths.push(`${paths.length + 1}. 미해석: ${path} — 요청에 선언된 대상 경로를 저장소 파일 또는 명시적 신설 파일로 확인하지 못함`);
+  }
+  for (const piece of unresolvedTargetPieces) {
+    paths.push(`${paths.length + 1}. 미해석: ${piece} — 요청에 선언된 대상 경로를 파싱하지 못함`);
+  }
+  for (const item of evidence) {
+    const referenced = [...new Set(Array.from(item.text.matchAll(SOURCE_PATH), (match) => match[0]))]
+      .filter(isRepositoryImplementationCandidate);
+    if (referenced.length === 0) {
+      paths.push(`${paths.length + 1}. 미해석: ${renderPersistentEvidence(item)} — 경로가 없는 접지 근거`);
+      continue;
+    }
+    referenced.forEach((path, index) => {
+      const resolved = resolvePath(path);
+      if (resolved) addPath(resolved, index === 0 ? renderPersistentEvidence(item) : undefined);
+      else paths.push(`${paths.length + 1}. 미해석: ${path} — ${renderPersistentEvidence(item)}`);
+    });
+  }
+  if (evidence.length === 0) paths.push(`- ${unavailableEvidence}`);
+  return paths;
 }
 
 const IDENTITY_PREFIX = /^(agent|session|submitted|authored-by|track|roadmap):/i;
@@ -5537,7 +5641,7 @@ async function authorGoalWithSupersededRootIntent(
     '## REQUIRED EVIDENCE',
     ...requiredEvidence(criteria, facts ? implementationCandidates(facts) : [], authorRunId),
     '',
-    ...(goalType === 'implement' ? ['## TRACED PATHS', ...tracedPathsSection(facts, narrative.tracedPathsUnavailableEvidence), ''] : []),
+    ...(goalType === 'implement' ? ['## TRACED PATHS', ...tracedPathsSection(facts, ask, deps.repositoryRoot, narrative.tracedPathsUnavailableEvidence), ''] : []),
     '## SCOPE BOUNDARY',
     ...scopeBoundarySection,
     '',
@@ -5723,22 +5827,7 @@ export function defaultGoalAuthorDeps(cwd: string): GoalAuthorDeps {
   };
 }
 
-const MAX_FILENAME_BYTES = 255;
-// Goal files are listed and reviewed in ASCII-only terminals, so keep the meaningful
-// prefix portable and short even when the request title is Korean.
-const MAX_GOAL_SLUG_BYTES = 64;
-const GOAL_FINGERPRINT_LENGTH = 8;
 const IDENTITY_LINE = /^(agent|track|session|submitted):\s*(.*?)\s*$/i;
-
-function localDate(now: Date): string {
-  return [now.getFullYear(), String(now.getMonth() + 1).padStart(2, '0'), String(now.getDate()).padStart(2, '0')].join('-');
-}
-
-function asciiGoalSlug(title: string): string {
-  return title.normalize('NFKC').toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
 
 function missionSlugFallback(goal: string): string {
   return slugify(extractSlugSource(goal));
@@ -5752,32 +5841,6 @@ async function goalSlug(goal: string, slugFn: (goal: string) => Promise<string>)
   }
 }
 
-function slugWithinUtf8Budget(normalizedSlug: string, byteBudget: number): string {
-  let slug = '';
-  let bytes = 0;
-  const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(normalizedSlug);
-  for (const { segment } of graphemes) {
-    const segmentBytes = Buffer.byteLength(segment, 'utf8');
-    if (bytes + segmentBytes > byteBudget) break;
-    slug += segment;
-    bytes += segmentBytes;
-  }
-  return slug.replace(/-+$/g, '');
-}
-
-function goalFingerprint(source: string): string {
-  return createHash('sha256').update(source, 'utf8').digest('hex').slice(0, GOAL_FINGERPRINT_LENGTH);
-}
-
-export interface GoalFileNameSource {
-  /** Human-readable generated goal title used for the ASCII slug. */
-  title: string;
-  /** Complete generated artifact used to distinguish semantically different results from one ask. */
-  document: string;
-  /** Repository identifiers from the original ask, retained before a generated title slug. */
-  repositoryIdentifiers?: readonly string[];
-}
-
 function repositoryIdentifiers(ask: string): string[] {
   const lines = ask.split(/\r?\n/);
   const metadata = leadingIdentityMetadata(ask);
@@ -5788,27 +5851,6 @@ function repositoryIdentifiers(ask: string): string[] {
     .filter((line) => !line.startsWith('Checkable requested criterion:'))
     .join('\n')
     .match(/[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*/g) ?? [];
-}
-
-function buildGoalFileName(source: GoalFileNameSource, now: Date, collisionSuffix = ''): string {
-  const date = localDate(now);
-  const fingerprint = goalFingerprint(source.document);
-  const fixed = `GOAL--${fingerprint}${collisionSuffix}-${date}.md`;
-  const byteBudget = Math.min(
-    MAX_GOAL_SLUG_BYTES,
-    MAX_FILENAME_BYTES - Buffer.byteLength(fixed, 'utf8'),
-  );
-  const identifierPrefix = source.repositoryIdentifiers?.map(asciiGoalSlug).filter(Boolean).join('-');
-  const titleSlug = asciiGoalSlug(source.title);
-  const slug = slugWithinUtf8Budget([identifierPrefix, titleSlug].filter(Boolean).join('-'), byteBudget) || 'goal';
-  return `GOAL-${slug}-${fingerprint}${collisionSuffix}-${date}.md`;
-}
-
-/** Single filename contract shared by helper callers and the filesystem writer. */
-export function goalFileName(source: GoalFileNameSource, now: Date): string {
-  const fileName = buildGoalFileName(source, now);
-  if (!isGoalAuthorFileName(fileName)) throw new Error(`goal filename violates document contract: ${fileName}`);
-  return fileName;
 }
 
 function leadingIdentityMetadata(ask: string): Map<string, string> {

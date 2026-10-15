@@ -213,6 +213,9 @@ export interface GitSegmentState {
   ahead?: number;
   /** Commits behind upstream. Non-zero → peach tone with "-N". */
   behind?: number;
+  /** Optional axis label after the glyph (e.g. `트리`) — set when a
+   *  running-build pill sits next to it so the two SHAs are not confused. */
+  label?: string;
 }
 
 /** Git state — flat colored text. No pill background.
@@ -241,7 +244,7 @@ export function gitSegment(
   const head = state.branch
     ? truncateGitHead(state.branch, 20)
     : `HEAD@${(state.detachedSha ?? '').slice(0, 7)}`;
-  const parts: string[] = [`⌥ ${head}`];
+  const parts: string[] = [state.label ? `⌥ ${state.label} ${head}` : `⌥ ${head}`];
   const dirty = Math.max(0, state.dirtyTotal ?? 0);
   if (dirty > 0) parts.push(`*${dirty}`);
   if ((state.ahead ?? 0) > 0) parts.push(`+${state.ahead}`);
@@ -258,6 +261,33 @@ export function gitSegment(
   return tone === 'overlay'
     ? text(parts.join(' '), tone, opts)
     : strongText(parts.join(' '), tone, opts);
+}
+
+/** The code this TUI process loaded at boot (not the session tree HEAD). */
+export interface RunningBuildState {
+  /** Boot commit (full or short); '' = unknown (rendered as `?`). */
+  sha: string;
+  /** True when the installed/checkout code moved after boot — a relaunch runs the new build.
+   *  null = could not compare (not the same as «not stale»). */
+  stale: boolean | null;
+  /** The commit a relaunch would run, when known. */
+  currentSha?: string;
+}
+
+/** Running-build pill.
+ *
+ *     ▶ 실행 5c0f98f                         — boot build matches current code (overlay)
+ *     ▶ 실행 5c0f98f ⟳ 재기동 필요 → 1a2b3c4  — code moved after boot (yellow, bold)
+ *     ▶ 실행 5c0f98f ?                        — could not compare (overlay)
+ *     ▶ 실행 ?                                — boot build unknown (overlay) */
+export function runningBuildSegment(state: RunningBuildState | null | undefined, opts: StatusBarRenderOptions = {}): string {
+  if (!state) return '';
+  if (!state.sha) return text('▶ 실행 ?', 'overlay', opts);
+  const label = `▶ 실행 ${state.sha.slice(0, 7)}`;
+  if (state.stale === null) return text(`${label} ?`, 'overlay', opts);
+  if (!state.stale) return text(label, 'overlay', opts);
+  const target = state.currentSha ? ` → ${state.currentSha.slice(0, 7)}` : '';
+  return strongText(`${label} ⟳ 재기동 필요${target}`, 'yellow', opts);
 }
 
 /** Truncate a model id at the first parameter-size marker (e.g.
@@ -289,7 +319,7 @@ function truncateAtParamSize(model: string): string {
  *   - `local:qwen3.6-35b-a3b-ud-mlx` → `local:qwen3.6-35b`
  *   - `node-b:qwen2.5-72b-instruct`    → `node-b:qwen2.5-72b`
  *   - `claude-opus-4-6`              → unchanged (no `\d+b` marker) */
-export function modelSegment(info: ActiveProviderInfo, opts: StatusBarRenderOptions = {}): string {
+export function modelSegment(info: Pick<ActiveProviderInfo, 'provider' | 'model'>, opts: StatusBarRenderOptions = {}): string {
   if (!info.model || info.model === '(none)') {
     return strongText(info.provider, 'pink', opts);
   }

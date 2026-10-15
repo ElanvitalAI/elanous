@@ -13,7 +13,7 @@ import { spawnSync } from 'node:child_process';
 import { findGitDir, type LocatedGit } from './locate.js';
 import { readGitHead } from './read-head.js';
 import { GitFileWatcher } from './watcher.js';
-import { probeDirty, probeAheadBehind } from './dirty.js';
+import { probeDirty, probeAheadBehind, probeDirtyAsync, probeAheadBehindAsync } from './dirty.js';
 import { debug } from '../debug/log.js';
 import type {
   GitHeadInfo,
@@ -170,6 +170,47 @@ export function refreshDirty(
   };
 }
 
+const dirtyInFlight = new Map<CacheEntry, Promise<GitStatusView>>();
+
+function viewOf(entry: CacheEntry): GitStatusView {
+  return { head: entry.head, dirty: entry.dirty, aheadBehind: entry.aheadBehind, lastDirtyProbeAt: entry.lastDirtyProbeAt };
+}
+
+/** Non-blocking twin of `refreshDirty` for the TUI: the probes run as
+ *  async subprocesses so a slow `git status` (large worktree, loaded
+ *  host) never stalls key input. Same throttle; concurrent calls share
+ *  one probe, except that `force` (a known write just happened) never
+ *  reuses a probe that started before it. */
+export function refreshDirtyAsync(
+  cwd: string,
+  opts: { minIntervalMs?: number; force?: boolean } = {},
+): Promise<GitStatusView> {
+  let entry: CacheEntry | null;
+  try { entry = ensureEntry(cwd); } catch (error) { return Promise.reject(error); }
+  if (!entry) return Promise.resolve({ head: null, dirty: null, aheadBehind: null, lastDirtyProbeAt: 0 });
+  // An in-flight probe (possibly a forced, post-write one) is newer than the last stored view.
+  const running = dirtyInFlight.get(entry);
+  if (running && !opts.force) return running;
+  const min = opts.minIntervalMs ?? 2_000;
+  if (!opts.force && entry.lastDirtyProbeAt > 0 && Date.now() - entry.lastDirtyProbeAt < min) {
+    return Promise.resolve(viewOf(entry));
+  }
+  const target = entry;
+  const root = target.located.root;
+  const start = (): Promise<GitStatusView> => Promise.all([probeDirtyAsync(root), probeAheadBehindAsync(root)])
+    .then(([dirty, aheadBehind]) => {
+      target.dirty = dirty;
+      target.aheadBehind = aheadBehind;
+      target.lastDirtyProbeAt = Date.now();
+      return viewOf(target);
+    });
+  // A forced probe queues behind the running one so it reads the post-write tree.
+  const probe = (running ? running.then(start, start) : start())
+    .finally(() => { if (dirtyInFlight.get(target) === probe) dirtyInFlight.delete(target); });
+  dirtyInFlight.set(target, probe);
+  return probe;
+}
+
 /** Claude Code-style git snapshot for LLM system context.
  *  This is intentionally a point-in-time summary: good enough for
  *  baseline repo awareness, but callers should still use tools for
@@ -256,4 +297,5 @@ export function __resetGitFsCache(): void {
   for (const [, entry] of cache) entry.watcher.dispose();
   cache.clear();
   clearGitSnapshotCache();
+  dirtyInFlight.clear();
 }

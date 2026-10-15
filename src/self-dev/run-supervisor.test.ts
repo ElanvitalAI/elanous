@@ -1599,3 +1599,182 @@ describe('AUT-NO-PROGRESS-RETRY-LOOP — PR 없이 2라운드 연속 실패면 �
     expect(noPrStreakKey(undefined)).toBe('');
   });
 });
+
+describe('REVIEW-MUSTFIX-CLASSIFY — 슈퍼바이저는 추이 대신 회차 분류를 먼저 본다', () => {
+  // 진동 재수리 후보가 되는 실패 조각 — 리뷰 must-fix 관측을 실은다.
+  const oscillatingFailed = (id: string, mustFix: string[]) => ({
+    taskId: id, feature: id, status: 'failed' as const, stage: 'error',
+    error: { code: 'SELF_IMPL_FAILED', message: "error: cannot lock ref 'refs/remotes/origin/main': is at abc123" },
+    prNumber: 4242,
+    rework: { trend: 'oscillating' as const, signature: `sig-${id}`, rounds: 2 },
+    ...(mustFix.length > 0 ? { reviewMustFix: mustFix } : {}),
+  }) as never;
+
+  test('appendRound — 회차 원장에 must-fix 관측을 실어 다음 회차 짝으로 쓴다(관측 없으면 칸도 없다)', () => {
+    const h = appendRound([], [oscillatingFailed('a', ['지적 하나'])]);
+    expect(h[0]!.mustFix).toEqual({ items: [{ text: '지적 하나', taskId: 'a' }] });
+    // 옛 원장 형식 보존 — 관측이 없으면 필드가 안 생긴다.
+    expect(appendRound([], [lockRace('b')])[0]!.mustFix).toBeUndefined();
+  });
+
+  test('① new-defect — 새 지적은 그대로 수렴 간다(진동 수리 유지, 분류가 결정에 실린다)', () => {
+    const history: SupervisorRound[] = [{ round: 0, landed: 0, actionable: 1, mustFix: { items: [{ text: '옛 지적' }] } }];
+    const d = decideNextRun({
+      results: [oscillatingFailed('osc', ['새 지적'])],
+      history,
+      repairGoalExecution: true,
+    });
+    expect(d.mustFix).toMatchObject({ class: 'new-defect' });
+    expect(d.action).toBe('add-repair-task');
+  });
+
+  test('② post-land-evidence — 같은 런 재수리 0 · «그림자 착지 → 관측 → live» 쪼개기 결정 1', () => {
+    const history: SupervisorRound[] = [{ round: 0, landed: 0, actionable: 1, mustFix: { items: [{ text: '다른 지적' }] } }];
+    // 대조 — 텍스트에서 착지 뒤 증거가 유도되지 않으면 ① new-defect 로 지금처럼 진동 수리를 붙인다.
+    const withoutEvidence = decideNextRun({
+      results: [oscillatingFailed('osc', ['live 가 아니라 그림자 호출만 봤다'])],
+      history, repairGoalExecution: true,
+    });
+    expect(withoutEvidence.action).toBe('add-repair-task');
+    expect(withoutEvidence.mustFix).toMatchObject({ class: 'new-defect' });
+    // ② 분류가 추이보다 먼저 — 실 reviewMustFix 텍스트('live 호출자' 유도)에서
+    // 같은 런 재수리 0(add-repair-task 아님), 쪼개기 결정 1.
+    const d = decideNextRun({
+      results: [oscillatingFailed('osc', ['live 호출자를 못 봤다'])],
+      history, repairGoalExecution: true,
+    });
+    expect(d.action).toBe('stop');
+    expect(d.stopReason).toBe('review-oscillating');
+    expect(d.oscillation?.repairGoals ?? {}).toEqual({});
+    expect(d.mustFix).toMatchObject({ class: 'post-land-evidence', split: 'shadow-land → observe → live' });
+    expect(d.why).toContain('착지');
+  });
+
+  test('③ recurring — 이 조각에선 관측만: 결정에 교차 리뷰 제안이 실리고 동작은 기존 규칙 그대로(수리한 조각은 사람 결정)', () => {
+    // 앞 회차에 이 조각의 진동 수리가 붙었고(«수리 뒤»), 그 회차 지적이 원장에 조각 단위로 실렸다.
+    const history: SupervisorRound[] = [{ round: 0, landed: 0, actionable: 1, oscillationRepairTaskIds: ['osc'],
+      mustFix: { items: [{ text: '게이트을 고쳐라', taskId: 'osc' }] } }];
+    // cur 관측은 결과의 reviewMustFix 에서 유도된다 — 공백·대소문자만 달라도 같은 지적이다.
+    const d = decideNextRun({
+      results: [oscillatingFailed('osc', ['  게이트을   고쳐라 '])],
+      history,
+      repairGoalExecution: true,
+    });
+    expect(d.mustFix).toMatchObject({ class: 'recurring', crossReview: true });
+    expect(d.action).toBe('stop');
+    expect(d.stopReason).toBe('review-oscillating');
+    // ③ 은 보류 사유를 안 낸다 — 정지는 «이미 수리한 조각» 기존 규칙이다(③ 동작은 후속 칸).
+    expect(d.why).not.toContain('교차 리뷰');
+  });
+
+  test('수리 없이 같은 지적만 반복되면 ③ 이 아니다 — «수리 뒤»가 아니면 짝이 없다(첫 진동 수리 유지)', () => {
+    const history: SupervisorRound[] = [{ round: 0, landed: 0, actionable: 1, mustFix: { items: [{ text: '게이트을 고쳐라', taskId: 'osc' }] } }];
+    const d = decideNextRun({ results: [oscillatingFailed('osc', ['게이트을 고쳐라'])], history, repairGoalExecution: true });
+    expect(d.mustFix).toMatchObject({ class: 'new-defect' });
+    expect(d.action).toBe('add-repair-task');
+  });
+
+  test('분류는 조각마다 — 한 조각의 ③ recurring 이 다른 조각의 첫 진동 수리를 끊지 않는다', () => {
+    const history: SupervisorRound[] = [{ round: 0, landed: 0, actionable: 2, oscillationRepairTaskIds: ['osc'],
+      mustFix: { items: [{ text: '게이트을 고쳐라', taskId: 'osc' }] } }];
+    const d = decideNextRun({
+      results: [oscillatingFailed('osc', ['게이트을 고쳐라']), oscillatingFailed('other', ['게이트을 고쳐라'])],
+      history, repairGoalExecution: true,
+    });
+    expect(d.action).toBe('add-repair-task');
+    expect(d.oscillation).toMatchObject({ taskIds: ['other'], heldTaskIds: ['osc'] });
+    expect(d.mustFix).toMatchObject({ class: 'recurring', crossReview: true });
+  });
+
+  test('② 로 보류한 조각은 ① 조각의 수리 회차에 다시 타지 않는다 — 재실행 목록에서 빠지고 사람 결정으로 간다', () => {
+    const d = decideNextRun({
+      results: [oscillatingFailed('evid', ['live 호출자를 못 봤다']), oscillatingFailed('real', ['null 검사를 고쳐라'])],
+      history: [{ round: 0, landed: 0, actionable: 2 }], repairGoalExecution: true,
+    });
+    expect(d.action).toBe('add-repair-task');
+    expect(d.oscillation).toMatchObject({ taskIds: ['real'], heldTaskIds: ['evid'] });
+    expect(Object.keys(d.oscillation?.repairGoals ?? {})).toEqual(['real']);
+    for (const list of [d.rerunnable, d.reworkable, d.decomposable, d.repairable]) expect(list).not.toContain('evid');
+    expect(d.needsHuman).toContain('evid');
+    expect(d.mustFixByTask?.evid).toMatchObject({ class: 'post-land-evidence', split: 'shadow-land → observe → live' });
+    expect(d.mustFixByTask?.real).toMatchObject({ class: 'new-defect' });
+    expect(d.why).toContain('착지');
+  });
+
+  test('구현 부재 지적(«live 호출자가 없다. 추가하라»)은 ② 가 아니다 — 같은 런 첫 수리를 그대로 붙인다', () => {
+    const d = decideNextRun({
+      results: [oscillatingFailed('osc', ['live 호출자가 없다. 호출 경로를 추가하라'])],
+      history: [{ round: 0, landed: 0, actionable: 1 }], repairGoalExecution: true,
+    });
+    expect(d.mustFix).toMatchObject({ class: 'new-defect' });
+    expect(d.action).toBe('add-repair-task');
+    expect(Object.keys(d.oscillation?.repairGoals ?? {})).toEqual(['osc']);
+  });
+
+  test('superviseRun — ② 로 보류한 조각은 실제 rerun 인자에 안 실리고 ① 조각만 수리 골과 함께 간다', async () => {
+    const received: string[][] = [];
+    const goals: string[][] = [];
+    await superviseRun({
+      initial: [oscillatingFailed('evid', ['live 호출자를 못 봤다']), oscillatingFailed('real', ['null 검사를 고쳐라'])],
+      repairGoalExecution: true, taskAgentShadow: false, sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+      limits: { stallRounds: 4 },
+      rerun: async (previous, invocation) => {
+        received.push(previous.map((job) => job.taskId));
+        goals.push(Object.keys(invocation.repairGoals ?? {}));
+        return [];
+      },
+    });
+    expect(received[0]).toEqual(['real']);
+    expect(goals[0]).toEqual(['real']);
+  });
+
+  test('혼합 회차(② ⊕ ③)는 조각별 분류를 둘 다 남긴다 — ② 쪼개기 결정 ⊕ ③ 교차 리뷰 제안(관측)', () => {
+    const history: SupervisorRound[] = [{ round: 0, landed: 0, actionable: 2, oscillationRepairTaskIds: ['rec'],
+      mustFix: { items: [{ text: '게이트을 고쳐라', taskId: 'rec' }] } }];
+    const d = decideNextRun({
+      results: [oscillatingFailed('rec', ['게이트을 고쳐라']), oscillatingFailed('evid', ['live 호출자를 못 봤다'])],
+      history, repairGoalExecution: true,
+    });
+    expect(d.action).toBe('stop');
+    expect(d.mustFixByTask?.rec).toMatchObject({ class: 'recurring', crossReview: true });
+    expect(d.mustFixByTask?.evid).toMatchObject({ class: 'post-land-evidence', split: 'shadow-land → observe → live' });
+    expect(d.mustFix).toMatchObject({ class: 'post-land-evidence' });
+    expect(d.why).toContain('착지');
+  });
+
+  test('③ 수리 계보 — 수리 조각(oscillationRepairOf)에서 원조각 지적이 재발하면 짝이 맞고, 무관한 조각과는 안 맞는다', () => {
+    const history: SupervisorRound[] = [{ round: 0, landed: 0, actionable: 1, oscillationRepairTaskIds: ['a'],
+      mustFix: { items: [{ text: '게이트을 고쳐라', taskId: 'a' }] } }];
+    const piece = { ...(oscillatingFailed('b', ['게이트을 고쳐라']) as object), oscillationRepairOf: 'a' } as never;
+    const lineage = decideNextRun({ results: [piece], history, repairGoalExecution: true });
+    expect(lineage.mustFixByTask?.b).toMatchObject({ class: 'recurring', crossReview: true });
+    // 계보 없는 무관한 조각 — 같은 문면이어도 첫 지적(①)이다.
+    const unrelated = decideNextRun({ results: [oscillatingFailed('c', ['게이트을 고쳐라'])], history, repairGoalExecution: true });
+    expect(unrelated.mustFixByTask?.c).toMatchObject({ class: 'new-defect' });
+    expect(unrelated.action).toBe('add-repair-task');
+  });
+
+  test('③ «수리 뒤»는 직전 관측 이후의 수리만 — 예전에 수리됐어도 직전 회차에 수리가 없으면 남은 지적은 ③ 이 아니다', () => {
+    const history: SupervisorRound[] = [
+      // 조각 수가 줄고 있다(제자리 정지에 안 걸린다) — 진동 분기의 분류만 본다.
+      { round: 0, landed: 0, actionable: 3, oscillationRepairTaskIds: ['osc'], mustFix: { items: [{ text: '옛 지적 A', taskId: 'osc' }] } },
+      { round: 1, landed: 0, actionable: 2, mustFix: { items: [{ text: '새 지적 B', taskId: 'osc' }] } },
+    ];
+    const d = decideNextRun({ results: [oscillatingFailed('osc', ['새 지적 B'])], history, repairGoalExecution: true });
+    expect(d.mustFixByTask?.osc).toMatchObject({ class: 'new-defect' });
+    // 예전 수리 이력이 있으니 진동 수리는 지금처럼 사람 결정으로 보류된다(분류가 아니라 기존 규칙).
+    expect(d.action).toBe('stop');
+    expect(d.stopReason).toBe('review-oscillating');
+  });
+
+  test('분류 불가(unmeasured)면 결정에 분류가 안 실리고 지금 동작 그대로다', () => {
+    const d = decideNextRun({
+      results: [oscillatingFailed('osc', [])],
+      history: [{ round: 0, landed: 0, actionable: 1 }],
+    });
+    expect(d.mustFix).toBeUndefined();
+    // 순수 판정(repairGoalExecution 미선언)에서의 지금 동작 — 진동 수리 결정 칸만 낸다.
+    expect(d.action).toBe('add-repair-task');
+    expect(d.stopReason).toBeUndefined();
+  });
+});

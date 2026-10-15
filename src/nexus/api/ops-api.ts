@@ -131,6 +131,8 @@ export function releaseNodeFacts(output: unknown): ReleaseNodeFacts {
 }
 export interface ReleaseRunView {
   runId: string; status: string; startedAt: string; version: string | null; path: string[]; nodes: ReleaseRunNodeView[];
+  /** Explicit project ownership. The release ledger does not currently populate this field. */
+  projectId?: string;
   /** GATE-LIVE-OBS — 지금 gate 노드에 있는 런에만 싣는다(발행 원장 `gate-logs/cut/shards.json`). 파일이 없으면 생략. */
   gateShards?: GateShardsFile & { summary: GateShardsSummary };
 }

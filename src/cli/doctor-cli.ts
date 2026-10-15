@@ -40,6 +40,16 @@ import type { LlmInventory } from '../llm/local-manager/types.js';
 import { buildDoctorBundle } from './doctor-bundle.js';
 import { uploadDoctorBundle } from './doctor-bundle-upload.js';
 import { checkNodeModules, formatNodeModulesCheck, nodeModulesTrees } from './doctor-node-modules.js';
+import {
+  DOCTOR_SYMPTOMS,
+  DOCTOR_VISIT_SOURCES,
+  doctorVisitRunExists,
+  isDoctorSymptom,
+  isDoctorVisitSource,
+  readDoctorVisits,
+  recordDoctorVisit,
+  type DoctorSymptom,
+} from '../self-implement/doctor-visit.js';
 import { formatHostDoctorLines, runHostDoctor, type HostDoctorExpected, type HostDoctorOptions, type HostDoctorRemote } from '../fleet/host-doctor.js';
 import { listMachineResources } from './control-cli.js';
 import type { ResourceView } from '../control-plane/ledger.js';
@@ -210,6 +220,8 @@ export interface DoctorCliDeps extends DoctorOptions, Pick<DoctorFixDeps, 'home'
   hostDoctorMembership?: () => Promise<NonNullable<HostDoctorOptions['membership']>>;
   /** Nexus machine query seam; tests can exercise the default assembly without contacting a live service. */
   hostDoctorMachineResources?: () => Promise<ResourceView[]>;
+  /** `doctor visit`/`doctor status` 원장 디렉터리(시험 seam) — 기본 = `runLedgerDir()`. */
+  doctorVisitLedgerDir?: string;
 }
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -1335,6 +1347,74 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
       const report = runHostDoctor({ host, role: opts.role, remote: deps.hostDoctorRemote, expected: deps.hostDoctorExpected, membership });
       out.log(json ? JSON.stringify(report, null, 2) : formatHostDoctorLines(report).join('\n'));
       if (!report.ok) setExitCode(1);
+    });
+  doctor.command('visit')
+    .description('Record a doctor visit (triage symptom) in the run ledger of that run')
+    .argument('<runId>', 'run id whose ledger receives the visit')
+    .requiredOption('--symptom <symptom>', `closed symptom list: ${DOCTOR_SYMPTOMS.join(', ')}`)
+    .requiredOption('--from <who>', `closed sender list: ${DOCTOR_VISIT_SOURCES.join(', ')}`)
+    .option('--evidence <text>', 'free-text evidence recorded with the visit')
+    .option('--json', 'structured output')
+    .action((runId: string, opts: { symptom: string; from: string; evidence?: string; json?: boolean }, command: Command) => {
+      const json = opts.json === true || command.parent?.opts().json === true;
+      if (!isDoctorSymptom(opts.symptom)) {
+        const reason = `unknown symptom: ${opts.symptom} — closed list: ${DOCTOR_SYMPTOMS.join(', ')}`;
+        if (json) out.log(JSON.stringify({ status: 'rejected', reason }));
+        else err.error(reason);
+        setExitCode(1);
+        return;
+      }
+      if (!isDoctorVisitSource(opts.from)) {
+        const reason = `unknown from: ${opts.from} — closed list: ${DOCTOR_VISIT_SOURCES.join(', ')}`;
+        if (json) out.log(JSON.stringify({ status: 'rejected', reason }));
+        else err.error(reason);
+        setExitCode(1);
+        return;
+      }
+      try {
+        const visit = recordDoctorVisit({
+          runId,
+          from: opts.from,
+          symptom: opts.symptom,
+          ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}),
+          ...(deps.doctorVisitLedgerDir !== undefined ? { dir: deps.doctorVisitLedgerDir } : {}),
+        });
+        out.log(json ? JSON.stringify(visit) : `doctor visit recorded: runId=${runId} from=${opts.from} symptom=${opts.symptom}${visit.evidence !== undefined ? ` evidence=${visit.evidence}` : ''}`);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (json) out.log(JSON.stringify({ status: 'rejected', reason }));
+        else err.error(reason);
+        setExitCode(1);
+      }
+    });
+  doctor.command('status')
+    .description('Summarize recorded doctor visits by symptom with recent visit lines')
+    .option('--run <runId>', 'limit the summary to one run ledger')
+    .option('--json', 'structured output')
+    .action((opts: { run?: string; json?: boolean }, command: Command) => {
+      const json = opts.json === true || command.parent?.opts().json === true;
+      const ledgerScope = deps.doctorVisitLedgerDir !== undefined ? { dir: deps.doctorVisitLedgerDir } : {};
+      if (opts.run !== undefined && !doctorVisitRunExists(opts.run, ledgerScope)) {
+        const reason = `없음: 런 원장이 없습니다 (runId=${opts.run})`;
+        if (json) out.log(JSON.stringify({ status: 'rejected', reason }));
+        else err.error(reason);
+        setExitCode(1);
+        return;
+      }
+      const visits = readDoctorVisits(opts.run, ledgerScope);
+      const counts = Object.fromEntries(DOCTOR_SYMPTOMS.map((symptom: DoctorSymptom) => [symptom, 0])) as Record<DoctorSymptom, number>;
+      for (const visit of visits) counts[visit.symptom] += 1;
+      if (json) {
+        out.log(JSON.stringify({ total: visits.length, counts, visits }, null, 2));
+        return;
+      }
+      out.log([
+        `Doctor visits: ${visits.length}`,
+        ...DOCTOR_SYMPTOMS.map((symptom: DoctorSymptom) => `  ${symptom}: ${counts[symptom]}`),
+        'Recent visits:',
+        ...visits.map((visit) => `  ${visit.timestamp ?? 'unknown-time'} runId=${visit.runId} from=${visit.from} symptom=${visit.symptom}${visit.evidence !== undefined ? ` evidence=${visit.evidence}` : ''}`),
+        ...(visits.length === 0 ? ['  none'] : []),
+      ].join('\n'));
     });
   doctor
     .option('--credentials', 'show per-credential details in human-readable output')

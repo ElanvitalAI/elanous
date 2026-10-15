@@ -176,6 +176,7 @@ import { dispatchPersonaRoute } from './personas.js';
 import { handleMe, operatorSignal } from './operator.js';
 import { handleGraphRunRoute } from '../../graph-runner/graph-run-api.js';
 import { handleOpsApi } from './ops-api.js';
+import { handleProjectAutopsy } from './project-autopsy.js';
 import { handleRoleJudge } from './role-judge.js';
 import { handleAudioStt } from './audio-stt.js';
 import { handleLlmModels } from './llm-models.js';
@@ -1498,6 +1499,10 @@ export async function routeRequest(
   if (pathname === '/v1/projects' && (method === 'GET' || method === 'POST')) {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
     return method === 'GET' ? handleProjectsGet() : handleProjectsPost(req);
+  }
+  if (pathname.startsWith('/v1/projects/') && pathname.endsWith('/autopsy') && method === 'GET') {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleProjectAutopsy(req, pathname.slice('/v1/projects/'.length, pathname.length - '/autopsy'.length));
   }
 
   // Polling must remain outside the non-GET dispatch below.

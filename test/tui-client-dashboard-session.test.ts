@@ -104,6 +104,7 @@ describe('DashboardSession — send interceptor (P2-bridge-ext)', () => {
       payload: {
         id: 'turn:1',
         provider: 'anthropic',
+        model: 'routed-model-x',
         inputTokens: 4,
         outputTokens: 2,
       },
@@ -112,7 +113,8 @@ describe('DashboardSession — send interceptor (P2-bridge-ext)', () => {
       sessionUpdate: 'agent_thought_chunk',
       content: { type: 'text', text: envText },
     }));
-    expect(seen).toEqual([{ provider: 'anthropic', inputTokens: 4, outputTokens: 2 }]);
+    // 턴 모델도 그대로 건넌다 — 대시보드 턴 지표가 이것으로 ctx 최대치·단가를 잡는다.
+    expect(seen).toEqual([{ provider: 'anthropic', model: 'routed-model-x', inputTokens: 4, outputTokens: 2 }]);
   });
 
   test('ignores unrelated agent_thought_chunk text (plain thought)', () => {

@@ -6,7 +6,7 @@ import type { LogStore, LogStoreRow } from '../mss/logging/log-store.js';
 import { SELF_IMPLEMENT_PROGRESS_STAGES } from './orchestrator.js';
 import { debug } from '../debug/log.js';
 import { assessLingeringLaunchParents, assessRunningRuns, buildRunProgressRows, collectObservedRunPhases, isPartialRunningRuns, queryRunningRuns, renderRunProgressTable, renderRunningRuns } from './running-runs.js';
-import { queryFederatedUnfinishedRunLedgers, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery } from './run-ledger.js';
+import { appendRunLedgerEntry, queryFederatedUnfinishedRunLedgers, recordNonBlockingRunPending, recordNonBlockingRunResult, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery } from './run-ledger.js';
 
 const ledger = (
   runId: string,
@@ -1015,4 +1015,124 @@ test('renderRunProgressTable marks a run whose phase store was unreadable as uno
   const line = renderRunProgressTable(result, 0).split('\n')[1];
 
   expect(line).toContain('단계 미관측 (단계 저장소 읽기 실패)');
+});
+
+test('재시작 뒤에도 발사 전 실패 requestId의 원본 reason·next를 eln self runs 조회가 반환한다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'running-runs-nb-restart-failure-'));
+  const ledgerDirectory = join(root, 'state', 'run-ledger');
+  const requestId = 'run-00000000-0000-4000-8000-0000000000b1';
+  const now = Date.now();
+  recordNonBlockingRunPending(requestId, { timestamp: new Date(now - 60_000).toISOString(), dir: ledgerDirectory });
+  recordNonBlockingRunResult(
+    requestId,
+    {
+      kind: 'failed',
+      reason: 'runner unavailable',
+      ok: false,
+    },
+    { timestamp: new Date(now - 30_000).toISOString(), dir: ledgerDirectory },
+  );
+  try {
+    // 프로세스 재시작 시뮬레이션 — in-memory 상태 없이 on-disk 원장만으로 새 조회
+    const result = queryRunningRuns({ runIds: [requestId] }, {
+      queryLedgers: (options) => queryFederatedUnfinishedRunLedgers({ ...options, goalsDir: root, ledgerDirectories: [ledgerDirectory], noCache: true }),
+      ptyTargets: () => [],
+      listPtyRefs: () => ({ refs: [], unreadable: [] }),
+    });
+    const entry = result.entries.find((candidate) => candidate.runId === requestId);
+    expect(entry?.nonBlocking).toMatchObject({
+      requestId,
+      kind: 'failed',
+      reason: 'runner unavailable',
+    });
+    // 발사 전 실패엔 런이 산출한 next가 없다 — 재조회도 생략된 채 원본을 반환(지어낸 기본 문구 금지).
+    expect(entry?.nonBlocking).not.toHaveProperty('next');
+    expect(renderRunningRuns(result)).toContain('nonBlocking=kind:failed reason:runner unavailable next:none');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('재시작 뒤에도 완료 requestId의 원본 reason·next를 eln self runs 조회가 반환한다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'running-runs-nb-restart-completed-'));
+  const ledgerDirectory = join(root, 'state', 'run-ledger');
+  const requestId = 'run-00000000-0000-4000-8000-0000000000b2';
+  const now = Date.now();
+  recordNonBlockingRunPending(requestId, { timestamp: new Date(now - 60_000).toISOString(), dir: ledgerDirectory });
+  recordNonBlockingRunResult(
+    requestId,
+    {
+      kind: 'launched',
+      next: `eln self run ${requestId}`,
+      ok: true,
+      runId: requestId,
+    },
+    { timestamp: new Date(now - 30_000).toISOString(), dir: ledgerDirectory },
+  );
+  try {
+    const result = queryRunningRuns({ runIds: [requestId] }, {
+      queryLedgers: (options) => queryFederatedUnfinishedRunLedgers({ ...options, goalsDir: root, ledgerDirectories: [ledgerDirectory], noCache: true }),
+      ptyTargets: () => [],
+      listPtyRefs: () => ({ refs: [], unreadable: [] }),
+    });
+    const entry = result.entries.find((candidate) => candidate.runId === requestId);
+    expect(entry?.nonBlocking).toMatchObject({ requestId, kind: 'launched', next: `eln self run ${requestId}` });
+    expect(renderRunningRuns(result)).toContain(`nonBlocking=kind:launched reason:none next:eln self run ${requestId}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('종결 run-status와 함께 남은 완료 기록도 requestId 조회에서 빠지지 않는다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'running-runs-nb-terminal-'));
+  const ledgerDirectory = join(root, 'state', 'run-ledger');
+  const requestId = 'run-00000000-0000-4000-8000-0000000000b3';
+  const now = Date.now();
+  appendRunLedgerEntry({ timestamp: new Date(now - 90_000).toISOString(), runId: requestId, event: 'start', data: {} }, ledgerDirectory);
+  appendRunLedgerEntry({ timestamp: new Date(now - 60_000).toISOString(), runId: requestId, event: 'run-status', data: { runStatus: 'failed' } }, ledgerDirectory);
+  recordNonBlockingRunResult(
+    requestId,
+    {
+      kind: 'launched',
+      next: `eln self run ${requestId}`,
+      ok: true,
+      runId: requestId,
+    },
+    { timestamp: new Date(now - 30_000).toISOString(), dir: ledgerDirectory },
+  );
+  try {
+    const result = queryRunningRuns({ runIds: [requestId] }, {
+      queryLedgers: (options) => queryFederatedUnfinishedRunLedgers({ ...options, goalsDir: root, ledgerDirectories: [ledgerDirectory], noCache: true }),
+      ptyTargets: () => [],
+      listPtyRefs: () => ({ refs: [], unreadable: [] }),
+    });
+    const entry = result.entries.find((candidate) => candidate.runId === requestId);
+    expect(entry).toEqual(expect.objectContaining({
+      runId: requestId,
+      status: 'ended-unclosed',
+      nonBlocking: expect.objectContaining({ kind: 'launched', next: `eln self run ${requestId}` }),
+    }));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('원장에 non-blocking 기록이 없는 런의 조회 출력은 그대로다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'running-runs-nb-absent-'));
+  const ledgerDirectory = join(root, 'state', 'run-ledger');
+  const runId = 'run-00000000-0000-4000-8000-0000000000b4';
+  const now = Date.now();
+  appendRunLedgerEntry({ timestamp: new Date(now - 60_000).toISOString(), runId, event: 'start', data: {} }, ledgerDirectory);
+  try {
+    const result = queryRunningRuns({ runIds: [runId] }, {
+      queryLedgers: (options) => queryFederatedUnfinishedRunLedgers({ ...options, goalsDir: root, ledgerDirectories: [ledgerDirectory], noCache: true }),
+      ptyTargets: () => [],
+      listPtyRefs: () => ({ refs: [], unreadable: [] }),
+    });
+    const entry = result.entries.find((candidate) => candidate.runId === runId);
+    expect(entry?.nonBlocking).toBeUndefined();
+    expect(renderRunningRuns(result)).not.toContain('nonBlocking=');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

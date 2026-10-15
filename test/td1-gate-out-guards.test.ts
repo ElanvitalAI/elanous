@@ -86,7 +86,9 @@ test('guarded gate-out candidates remain assigned to the Pod gate, except existi
       writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
       return { exitCode: 0, artifactsDir, job: 'fake' };
     }, new PodPoolScheduler([{ context: 'td1-test', capacity: 1, k3dCluster: 'test' }]));
-    expect((await runner.sweep(root, undefined, { pool: 'td1-test', shards: 1 })).rc).toBe(0);
+    // The gate now reserves a separate shard for real process tests. This
+    // fixture contains both kinds, so one shard is an invalid gate plan.
+    expect((await runner.sweep(root, undefined, { pool: 'td1-test', shards: 2 })).rc).toBe(0);
     expect(assigned.sort()).toEqual([...expected, 'src/sentinel.test.ts'].sort());
   } finally {
     rmSync(root, { recursive: true, force: true });

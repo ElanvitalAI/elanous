@@ -172,6 +172,24 @@ test('regeneration leaves user-owned README intact after generation', () => {
   expect(readFileSync(path, 'utf8')).toBe('Custom documentation\n');
 });
 
+test('regeneration does not mistake an edited README retaining the wizard notice for generated text', () => {
+  const parent = temp();
+  const slug = 'weather-research';
+  saveWizardDraft(parent, slug, draft);
+  const dir = join(parent, slug);
+  const readmePath = join(dir, 'README.md');
+  const graphPath = join(dir, 'graphs', `${slug}.yaml`);
+  const original = readFileSync(readmePath, 'utf8');
+  const edited = original.replace('# weather-research', '# My weather research notes');
+  writeFileSync(readmePath, edited);
+  writeFileSync(graphPath, 'custom graph\n');
+  const files = saveWizardDraft(parent, slug, { ...draft, description: 'Tomorrow weather' }, true);
+  expect(files).toEqual(['plugin.json', `skills/${slug}/SKILL.md`]);
+  expect(readFileSync(readmePath, 'utf8')).toBe(edited);
+  expect(readFileSync(graphPath, 'utf8')).toBe('custom graph\n');
+  expect(listWizardDrafts(parent)[0]?.description).toBe('Tomorrow weather');
+});
+
 test('wizard draft inventory survives reload and regeneration without touching the install ledger', () => {
   const parent = temp();
   expect(listWizardDrafts(parent)).toEqual([]);
@@ -197,11 +215,12 @@ test('adds research files to an existing maker scaffold without replacing its gr
   const dir = temp();
   mkdirSync(join(dir, 'graphs'));
   writeFileSync(join(dir, 'graphs/weather-research.yaml'), 'original graph\n');
-  writeFileSync(join(dir, 'plugin.json'), JSON.stringify({ name: 'weather-research', version: '0.1.0',
+  writeFileSync(join(dir, 'plugin.json'), JSON.stringify({ name: 'weather-research', version: '0.1.0', description: 'Scaffold description',
     extensions: { 'ai.elanous': { graphs: ['./graphs/weather-research.yaml'], capabilities: ['fs:workdir', 'proc:bun', 'proc:elanous'] } } }));
   expect(generateWizardFiles(dir, 'weather-research', draft)).toEqual(['plugin.json', 'skills/weather-research/SKILL.md']);
   expect(readFileSync(join(dir, 'graphs/weather-research.yaml'), 'utf8')).toBe('original graph\n');
   const manifest = JSON.parse(readFileSync(join(dir, 'plugin.json'), 'utf8'));
+  expect(manifest.description).toBe(draft.description);
   expect(manifest.extensions['ai.elanous'].connectors)
     .toEqual([{ id: 'weather', fields: [{ name: 'WEATHER_API_KEY', secret: true }] }]);
   expect(manifest.extensions['ai.elanous'].researchDraft).toBe(true);

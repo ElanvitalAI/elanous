@@ -85,6 +85,13 @@ export interface PreviewTerminalOpts {
    *  로 받아 같은 에뮬레이터/탭에 먹인다(정체성·크로스서피스 goto 획득). bun onData-死는 registry bun-native
    *  openpty 가 해결. ⚠️ 라이브 렌더(yazi DA2·마우스·커서·alt-screen) 검증은 기기 세션 필요(대표) → 기본 off. */
   useRegistry?: boolean;
+  /** Shared PTY identity for registry-backed popups. Defaults to preview. */
+  registryKind?: string;
+  /** Human-readable purpose shown by PTY inventory. */
+  registryNickname?: string;
+  registryOrigin?: { originRoot: string; controller?: string };
+  registryPurpose?: string;
+  registrySeat?: string;
   /** P13 — OSC 9/99/777 notification hook. Fires when the child
    *  emits one of:
    *    ESC ] 9 ; <title> BEL                  (iTerm2 growl)
@@ -337,7 +344,13 @@ export class PreviewTerminal {
       this.registryHandle = this.registryDeps.startPty({
         // 합성자 = registry(resolveSpawnShape) — 여기서는 overlay 만 넘긴다.
         cmd: shell, args, workdir: this.opts.cwd, env: childEnv,
-        cols: this.term.cols, rows: this.term.rows, kind: 'preview', accessMode: 'write',
+        cols: this.term.cols, rows: this.term.rows,
+        kind: this.opts.registryKind ?? 'preview',
+        nickname: this.opts.registryNickname,
+        origin: this.opts.registryOrigin,
+        purpose: this.opts.registryPurpose,
+        seat: this.opts.registrySeat,
+        accessMode: 'write',
       });
       this.alive = true;
     } else {

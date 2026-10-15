@@ -21,7 +21,7 @@ export const RELEASE_STATUS_SPEC: LLMToolSpec = {
     + 'topic=cell: id 칸 하나의 상태·근거와 살핀 판.\n'
     + 'topic=schedule: 발행 이후 판의 컷·착지·발행·동결 일정.\n'
     + 'topic=ops: 도는 런·발행·늦은 스케줄·자리·열린 결정의 출처 있는 개관.\n'
-    + 'topic 과 action 을 동시에 쓰면 topic 을 우선하고 action 은 무시한다. topic 은 읽을 대상, action 은 단독 조회의 짧은 요약.\n'
+    + 'topic 과 action 을 동시에 쓰면 오류를 돌려받는다 — 둘 중 하나만 보낸다. topic 은 읽을 대상, action 은 단독 조회의 짧은 요약.\n'
     + 'topic=features 에서는 owner·status 로 칸을 필터링할 수 있다.\n'
     + '발행·버전·피처·체크리스트·칸·컷·일정·운영 상태 질문은 Grep·ListDir·파일 검색보다 이 도구를 먼저 부른다 — 그 답은 파일이 아니라 원장에 있다.',
   parameters: { type: 'object', properties: {
@@ -125,10 +125,9 @@ function cellView(item: ChecklistItem) {
 export function dispatchReleaseStatus(args: Record<string, unknown>, deps: ReleaseToolDeps = {}): { text: string; structured: Record<string, unknown> } {
   const topic = args.topic === undefined ? 'status' : args.topic;
   if (typeof topic !== 'string' || !['status', 'features', 'cell', 'schedule', 'ops'].includes(topic)) throw new Error('topic 은 status, features, cell, schedule, ops 중 하나');
-  const ignoredAction = args.topic !== undefined && args.action !== undefined ? args.action : undefined;
-  const withIgnoredAction = (result: { text: string; structured: Record<string, unknown> }) => ignoredAction === undefined
-    ? result
-    : { ...result, text: `action=${String(ignoredAction)} 은 무시됨 — topic 과 같이 못 쓴다\n${result.text}` };
+  if (args.topic !== undefined && args.action !== undefined) {
+    throw new Error('topic 과 action 을 동시에 쓸 수 없습니다 — 둘 중 하나만: topic=features 는 피처 목록 · action 은 짧은 요약');
+  }
   const requested = args.version;
   if (topic === 'features') {
     for (const key of ['owner', 'status'] as const) {
@@ -149,10 +148,10 @@ export function dispatchReleaseStatus(args: Record<string, unknown>, deps: Relea
     const kinds: ContextFact['kind'][] = ['run', 'release', 'schedule-late', 'seat', 'decision'];
     const facts = answer.facts.filter(fact => kinds.includes(fact.kind));
     debug.log('release.tool', 'status', { action: 'status', topic, version: requested ?? null });
-    return withIgnoredAction({ text: facts.length ? facts.map(fact => JSON.stringify(fact)).join('\n') : '운영 개관: 관측된 사실 없음', structured: { facts } });
+    return { text: facts.length ? facts.map(fact => JSON.stringify(fact)).join('\n') : '운영 개관: 관측된 사실 없음', structured: { facts } };
   }
   const dev = checklistDevVersion(deps.devVersion?.() ?? devVersion());
-  if (ignoredAction === undefined && args.action !== undefined) {
+  if (args.action !== undefined) {
     const action = args.action;
     if (typeof action !== 'string' || !['schedule', 'blocked', 'landed'].includes(action)) {
       throw new Error('action 은 schedule, blocked, landed 중 하나여야 합니다');
@@ -225,7 +224,7 @@ export function dispatchReleaseStatus(args: Record<string, unknown>, deps: Relea
           publishAt: row.publishAt ?? null, freezeFrom: row.freezeFrom ?? null, freezeUntil: row.freezeUntil ?? null })) } };
     }
     debug.log('release.tool', 'status', { action: 'status', topic, version: requested ?? dev });
-    return withIgnoredAction(result);
+    return result;
   }
   const version = requested ? null : dev;
   const versions = requested ? [requested as string] : [version!, nextVersion(version!)];
@@ -270,7 +269,7 @@ export function dispatchReleaseStatus(args: Record<string, unknown>, deps: Relea
     : published.state === 'unreadable' ? `발행 판 ${published.version} · 발행 기록 못 읽음` : '발행 판 모름';
   const structured = { releases: entries, latestRun: latest, published };
   debug.log('release.tool', 'status', { action: 'status', topic, version: versions.join(',') });
-  return withIgnoredAction({ text: `${lines.join('\n\n')}\n${cards.map(formatElanousCard).join('\n')}\n${publishedLine}`, structured });
+  return { text: `${lines.join('\n\n')}\n${cards.map(formatElanousCard).join('\n')}\n${publishedLine}`, structured };
 }
 
 function requiredString(args: Record<string, unknown>, key: string): string {

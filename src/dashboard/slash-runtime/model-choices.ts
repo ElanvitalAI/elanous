@@ -123,3 +123,38 @@ export function modelChangeLine(
   const providerNote = resolution.target.provider === before.provider ? '' : `  · provider ${resolution.target.provider}`;
   return `모델: ${currentLabel(before.provider, before.model, before.reasoning)} → ${after} (${resolution.target.model}${reasoningNote})${providerNote}`;
 }
+
+/** `/model` arguments: the choice word plus the `--global` flag (TUI-MODEL-SESSION-SCOPE · 10-14). */
+export function parseModelSlashArgs(args: readonly string[]): { arg: string; global: boolean } {
+  const global = args.some((a) => a.trim().toLowerCase() === '--global');
+  const arg = args.find((a) => !a.trim().startsWith('--'))?.trim().toLowerCase() ?? '';
+  return { arg, global };
+}
+
+/**
+ * Where a `/model` choice lands. The default is this TUI session only (a pin that the next turn sends as an
+ * explicit model, so it beats the Codex tier policy); `--global` writes config. A choice on another provider
+ * can't be a session pin — the turn carries a model, not a provider — so it needs `--global`.
+ */
+export function modelSwitchScope(
+  targetProvider: LLMProviderName,
+  currentProvider: LLMProviderName,
+  global: boolean,
+): 'session' | 'global' | 'needs-global' {
+  if (global) return 'global';
+  return targetProvider === currentProvider ? 'session' : 'needs-global';
+}
+
+/** The muted line under a switch: what scope it took and when it applies — no promise the code doesn't keep. */
+export function modelScopeLine(
+  scope: 'session' | 'global',
+  reasoning?: { tier: ReasoningLevel; current: ReasoningLevel },
+): string {
+  const where = scope === 'session'
+    ? '  └─ 이 세션만 · 다음 턴부터 · 설정 파일은 그대로 (전역은 /model <이름> --global · 해제 /model reset)'
+    : '  └─ 설정 파일(전역)에 저장 · 이 세션은 다음 턴부터 · 다른 세션은 그 세션의 routePolicy 를 따른다 (codex 기본 정책이면 단계 모델이 이긴다)';
+  const think = reasoning && reasoning.tier !== reasoning.current
+    ? ` · 생각 깊이는 그대로 ${reasoning.current} (이 단계는 ${reasoning.tier} — /reasoning ${reasoning.tier})`
+    : '';
+  return where + think;
+}

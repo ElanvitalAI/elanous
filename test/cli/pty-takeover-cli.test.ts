@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Command } from 'commander';
-import { federatedPtyRefs, findPtyManifestRows, listPtyRefs, runPtyFind, runPtyKey, runPtyList, runPtyRelease, runPtyResize, runPtyRetire, runPtySnapshot, runPtyState, runPtyTakeover, runPtyText, runPtyWait, registerPtyTakeoverCommands, type PtyTakeoverCommandDeps } from '../../src/cli/pty-takeover-cli.js';
+import { federatedPtyRefs, findPtyManifestRows, listPtyRefs, runPtyFind, runPtyKey, runPtyList, runPtyRelease, runPtyRename, runPtyResize, runPtyRetire, runPtySnapshot, runPtyState, runPtyTakeover, runPtyText, runPtyTextWhenIdle, runPtyWait, registerPtyTakeoverCommands, type PtyTakeoverCommandDeps } from '../../src/cli/pty-takeover-cli.js';
 import { getPtyManifest, setPtyManifestDbPathForTesting, upsertPtyManifest, type PtyManifestRow } from '../../src/pty-shell/pty-manifest.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -70,6 +70,40 @@ describe('pty takeover CLI commands', () => {
     for (const ref of refs) expect(resolvePtyRef(ref.id, deps.listRefs!()).match?.id).toBe(ref.id);
     await Promise.all(refs.map((ref) => expect(runPtyText(ref.id, 'x', false, deps)).resolves.toMatchObject({ exitCode: 0 })));
     expect(remote).toEqual(refs.map((ref) => ref.id));
+  });
+
+  test('list appends a run column (boot build, stale) only for rows that record a build', () => {
+    const row = (id: string, kind: string, extra: Record<string, unknown> = {}) => ({
+      id, kind, cmd: 'elanous', ownerPid: 1, ptyPid: 0, instance: 'prod', startedAt: 100, alive: true, exitCode: null,
+      snapshot: '', snapshotAt: 0, outputBytesTotal: 0, updatedAt: 200, frame: '', frameAt: 0, runId: '', runIdSource: '' as const, spaceId: '', sessionId: '',
+      parentPtyId: '', parentPid: 0, parentKind: '', closedAt: 0, codeSha: '', ...extra,
+    });
+    const deps: PtyTakeoverCommandDeps = {
+      getPty: () => undefined, requestPtyTakeover: () => false, requestRemote: async () => ({ status: 'unknown-pty' as const }), log() {},
+      listRefs: () => [
+        { id: 'tui:1', kind: 'tui', source: 'remote', alive: true },
+        { id: 'tui:2', kind: 'tui', source: 'remote', alive: true },
+        { id: 'tui:3', kind: 'tui', source: 'remote', alive: true },
+        { id: 'pty_sh', kind: 'shell', source: 'remote', alive: true },
+      ],
+      listManifestRows: () => [
+        row('tui:1', 'tui', { build: { version: 'v', sha: 'a'.repeat(40), source: 'installed' } }),
+        row('tui:2', 'tui', { build: { version: 'v', sha: 'b'.repeat(40), source: 'installed' } }),
+        // 판 기록 없는 옛 TUI 행 — 설치본이 그 행보다 늦게 깔렸다 ⇒ 추정 stale.
+        row('tui:3', 'tui'),
+        row('pty_sh', 'shell'),
+      ],
+      readInstalledBuild: () => ({ sha: 'b'.repeat(40), installedAt: 150 }),
+      resolveWorktreeProvenance: () => ({ known: false, provenanceReason: 'workdir-not-recorded' }),
+    };
+    const lines = runPtyList(deps).message.split('\n');
+    expect(lines[0]).toEndWith('\trun=aaaaaaa,stale');
+    expect(lines[1]).toEndWith('\trun=bbbbbbb');
+    expect(lines[2]).toEndWith('\trun=?,stale');
+    expect(lines[3]).not.toContain('run=');
+    // 설치본 판독기가 없는 구성은 칸을 안 낸다(기계마다 다른 값이 새지 않게).
+    const { readInstalledBuild: _omit, ...withoutReader } = deps;
+    expect(runPtyList(withoutReader).message).not.toContain('run=');
   });
 
   test('list distinguishes no PTYs from unavailable reference listing', () => {
@@ -554,8 +588,31 @@ describe('pty takeover CLI commands', () => {
       requestRemote: async () => ({ status: 'success', screen: '❯ /command, or type a question' }),
       listRefs: () => [{ id: 'pty_x', kind: 'tui', source: 'remote', alive: true }], now: () => 1234, log() {},
     };
-    await expect(runPtyState('pty_x', deps, true)).resolves.toEqual({ exitCode: 0, message: JSON.stringify({ id: 'pty_x', state: 'idle', label: 'bare-prompt', at: 1234 }) });
-    await expect(runPtyState('pty_x', deps)).resolves.toEqual({ exitCode: 0, message: 'pty state: pty_x state=idle label=bare-prompt' });
+    await expect(runPtyState('pty_x', deps, true)).resolves.toEqual({ exitCode: 0, message: JSON.stringify({ id: 'pty_x', state: 'idle', label: 'bare-prompt', at: 1234, turn: 'unknown', build: null, installed: null, stale: null, staleReason: 'unknown' }) });
+    await expect(runPtyState('pty_x', deps)).resolves.toEqual({ exitCode: 0, message: 'pty state: pty_x state=idle label=bare-prompt turn=unknown build=unknown installed=- stale=unknown' });
+  });
+
+  test('state reports the TUI-recorded turn and a stale running build (not the screen guess)', async () => {
+    const boot = 'a'.repeat(40); const current = 'b'.repeat(40);
+    const logs: Array<[string, unknown]> = [];
+    const deps: PtyTakeoverCommandDeps = {
+      getPty: () => undefined, requestPtyTakeover: () => false,
+      // 화면은 idle 로 보이지만 TUI 가 적은 턴은 busy 다 — 둘은 다른 칸으로 나간다.
+      requestRemote: async () => ({ status: 'success', screen: '❯ /command, or type a question' }),
+      listRefs: () => [{ id: 'tui:42', kind: 'tui', source: 'remote', alive: true }], now: () => 1234,
+      readManifestRow: (id) => id === 'tui:42' ? {
+        id, kind: 'tui', cmd: 'elanous', ownerPid: 42, ptyPid: 0, instance: 'prod', startedAt: 100, alive: true, exitCode: null,
+        snapshot: '', snapshotAt: 0, outputBytesTotal: 0, updatedAt: 200, frame: '', frameAt: 0, runId: '', runIdSource: '', spaceId: '', sessionId: '',
+        parentPtyId: '', parentPid: 0, parentKind: '', closedAt: 0, codeSha: '',
+        turnState: 'busy', turnAt: 150, build: { version: '0.2.29-dev.0', sha: boot, source: 'installed' },
+      } : null,
+      readInstalledBuild: () => ({ sha: current, installedAt: 300 }),
+      log: (event, data) => logs.push([event, data]),
+    };
+    const json = JSON.parse((await runPtyState('tui:42', deps, true)).message);
+    expect(json).toMatchObject({ state: 'idle', turn: 'busy', turnAt: 150, build: { version: '0.2.29-dev.0', sha: boot, source: 'installed' }, installed: current, stale: true, staleReason: 'installed-moved' });
+    await expect(runPtyState('tui:42', deps)).resolves.toEqual({ exitCode: 0, message: 'pty state: tui:42 state=idle label=bare-prompt turn=busy build=0.2.29-dev.0@aaaaaaa(installed) installed=bbbbbbb stale=true (installed-moved)' });
+    expect(logs.filter(([event]) => event === 'state-run-unknown')).toEqual([]);
   });
 
   test('wait polls until idle and reports the third acquired screen', async () => {
@@ -569,6 +626,35 @@ describe('pty takeover CLI commands', () => {
     const result = await runPtyWait('pty_x', 'idle', { timeoutMs: 10_000, pollMs: 1 }, deps);
     expect(result).toMatchObject({ exitCode: 0, message: expect.stringContaining('reached idle') });
     expect(requests).toBe(3);
+  });
+
+  test('text --when-idle waits for idle, then injects once', async () => {
+    const screens = ['✽ Thinking…  (4s · esc 중단)', '❯ /command, or type a question'];
+    const actions: string[] = []; let snaps = 0; let clock = 0;
+    const deps: PtyTakeoverCommandDeps = {
+      getPty: () => undefined, requestPtyTakeover: () => false,
+      requestRemote: async (_id, action) => {
+        actions.push(action);
+        return action === 'snapshot' ? { status: 'success', screen: screens[snaps++]! } : { status: 'success' };
+      },
+      listRefs: () => [{ id: 'pty_x', kind: 'tui', source: 'remote', alive: true }], now: () => clock, sleep: async (ms) => { clock += ms; }, log() {},
+    };
+    const result = await runPtyTextWhenIdle('pty_x', 'wake', true, { timeoutMs: 10_000, pollMs: 1 }, deps);
+    expect(result.exitCode).toBe(0);
+    expect(result.message).toContain('reached idle');
+    expect(actions).toEqual(['snapshot', 'snapshot', 'input-text']);
+  });
+
+  test('text --when-idle times out without injecting (rc=1)', async () => {
+    const actions: string[] = []; let clock = 0;
+    const deps: PtyTakeoverCommandDeps = {
+      getPty: () => undefined, requestPtyTakeover: () => false,
+      requestRemote: async (_id, action) => { actions.push(action); return { status: 'success', screen: '✽ Thinking…  (4s · esc 중단)' }; },
+      listRefs: () => [{ id: 'pty_x', kind: 'tui', source: 'remote', alive: true }], now: () => clock, sleep: async (ms) => { clock += ms; }, log() {},
+    };
+    const result = await runPtyTextWhenIdle('pty_x', 'wake', true, { timeoutMs: 20, pollMs: 10 }, deps);
+    expect(result).toMatchObject({ exitCode: 1, message: expect.stringContaining('pty text --when-idle: not delivered') });
+    expect(actions.includes('input-text')).toBe(false);
   });
 
   test('wait times out with the last working state', async () => {
@@ -590,6 +676,42 @@ describe('pty takeover CLI commands', () => {
     };
     await expect(runPtyWait('pty_x', 'sleeping', {}, deps)).resolves.toMatchObject({ exitCode: 2, message: expect.stringContaining('idle, working, blocked, waiting, done') });
     expect(requests).toBe(0);
+  });
+
+  test('state degrades a throwing checkout-HEAD read to stale=unknown instead of failing', async () => {
+    const deps: PtyTakeoverCommandDeps = {
+      getPty: () => undefined, requestPtyTakeover: () => false,
+      requestRemote: async () => ({ status: 'success', screen: '❯ /command, or type a question' }),
+      listRefs: () => [{ id: 'tui:43', kind: 'tui', source: 'remote', alive: true }], now: () => 1,
+      readManifestRow: () => ({
+        id: 'tui:43', kind: 'tui', cmd: 'elanous', ownerPid: 43, ptyPid: 0, instance: 'prod', startedAt: 100, alive: true, exitCode: null,
+        snapshot: '', snapshotAt: 0, outputBytesTotal: 0, updatedAt: 200, frame: '', frameAt: 0, runId: '', runIdSource: '', spaceId: '', sessionId: '',
+        parentPtyId: '', parentPid: 0, parentKind: '', closedAt: 0, codeSha: '',
+        turnState: 'idle', turnAt: 150, build: { version: 'v', sha: 'a'.repeat(40), source: 'checkout', codeRoot: '/r' },
+      }),
+      readInstalledBuild: () => ({}),
+      readCheckoutHead: () => { throw new Error('git exploded'); },
+      log() {},
+    };
+    await expect(runPtyState('tui:43', deps)).resolves.toEqual({ exitCode: 0, message: 'pty state: tui:43 state=idle label=bare-prompt turn=idle build=v@aaaaaaa(checkout) installed=- stale=unknown' });
+  });
+
+  test('state still reports the recorded turn and build when the screen cannot be read', async () => {
+    const deps: PtyTakeoverCommandDeps = {
+      getPty: () => undefined, requestPtyTakeover: () => false,
+      requestRemote: async () => ({ status: 'failed', reason: 'screen-unavailable' }), readManifestFrame: () => null,
+      listRefs: () => [{ id: 'tui:42', kind: 'tui', source: 'remote', alive: true }], now: () => 9,
+      readManifestRow: () => ({
+        id: 'tui:42', kind: 'tui', cmd: 'elanous', ownerPid: 42, ptyPid: 0, instance: 'prod', startedAt: 100, alive: true, exitCode: null,
+        snapshot: '', snapshotAt: 0, outputBytesTotal: 0, updatedAt: 200, frame: '', frameAt: 0, runId: '', runIdSource: '', spaceId: '', sessionId: '',
+        parentPtyId: '', parentPid: 0, parentKind: '', closedAt: 0, codeSha: '',
+        turnState: 'busy', turnAt: 150, build: { version: 'v', sha: 'a'.repeat(40), source: 'installed' },
+      }),
+      readInstalledBuild: () => ({ sha: 'a'.repeat(40) }),
+      log() {},
+    };
+    expect(JSON.parse((await runPtyState('tui:42', deps, true)).message)).toMatchObject({ state: 'unknown', screenUnavailable: 'screen-unavailable', turn: 'busy', stale: false });
+    await expect(runPtyState('tui:42', deps)).resolves.toEqual({ exitCode: 0, message: 'pty state: tui:42 state=unknown label=- screen=unavailable(screen-unavailable) turn=busy build=v@aaaaaaa(installed) installed=aaaaaaa stale=false (same-as-installed)' });
   });
 
   test('state preserves snapshot-equivalent screen acquisition failures', async () => {
@@ -997,6 +1119,73 @@ describe('pty CLI --actor 배선(Commander → IPC)', () => {
         ['input-key', { actor: 'agent' }],   // 대소문자 정규화도 이 경로를 탄다
         ['resize', { actor: 'agent' }],
         ['input-text', { actor: 'human' }],
+      ]);
+      expect(process.exitCode).toBe(0);
+    } finally {
+      process.stdout.write = originalOut;
+    }
+  });
+});
+
+describe('pty rename CLI', () => {
+  test('remote rename resolves the TUI row by id, sends the nickname over IPC, and later resolves by the new name', async () => {
+    const remote: Array<[string, string, unknown, unknown]> = [];
+    const logs: Array<[string, Record<string, unknown>]> = [];
+    const refs = [{ id: 'tui:4242', kind: 'tui', source: 'remote' as const, alive: true } as { id: string; kind: string; source: 'remote'; alive: boolean; nickname?: string }];
+    const deps: PtyTakeoverCommandDeps = {
+      getPty: () => undefined, requestPtyTakeover: () => false,
+      requestRemote: async (id, action, payload, options) => {
+        remote.push([id, action, payload, options]);
+        if (action === 'rename') refs[0] = { ...refs[0]!, nickname: (payload as { nickname: string }).nickname };
+        return { status: 'success' };
+      },
+      listRefs: () => refs,
+      log: (event, data) => { logs.push([event, data]); },
+    };
+    await expect(runPtyRename('tui:4242', '  op  ', deps)).resolves.toEqual({ exitCode: 0, message: 'pty rename: tui:4242 is now named op' });
+    expect(remote).toEqual([['tui:4242', 'rename', { nickname: 'op' }, { actor: 'human' }]]);
+    expect(logs[0]).toEqual(['rename', expect.objectContaining({ ptyId: 'tui:4242', nickname: 'op', actor: 'human' })]);
+    await expect(runPtySnapshot('op', deps)).resolves.toMatchObject({ exitCode: 0 });
+    expect(remote[1]?.[0]).toBe('tui:4242');
+  });
+
+  test('rename rejects an empty name and surfaces owner failures', async () => {
+    const deps: PtyTakeoverCommandDeps = {
+      getPty: () => undefined, requestPtyTakeover: () => false,
+      requestRemote: async () => ({ status: 'unknown-pty' }),
+      listRefs: () => [{ id: 'tui:1', kind: 'tui', source: 'remote', alive: true }],
+      log() {},
+    };
+    await expect(runPtyRename('tui:1', '   ', deps)).resolves.toEqual({ exitCode: 1, message: 'pty rename: name must not be empty' });
+    await expect(runPtyRename('tui:1', 'op', deps)).resolves.toEqual({ exitCode: 1, message: 'pty rename: tui:1 was not found' });
+  });
+
+  test('local rename uses the in-process registry handle', async () => {
+    setPtyAdapterForTesting(() => adapter());
+    const handle = tracked({ cmd: 'x', detach: true });
+    const events: string[] = [];
+    await expect(runPtyRename(handle.id, 'local-op', depsFor(handle, events))).resolves.toMatchObject({ exitCode: 0 });
+    expect(handle.nickname).toBe('local-op');
+    expect(events).toEqual(['rename']);
+  });
+
+  test('Commander wires pty rename <ref> <name> with --actor', async () => {
+    const program = new Command();
+    const captured: Array<[string, unknown, unknown]> = [];
+    const originalOut = process.stdout.write;
+    process.stdout.write = (() => true) as typeof process.stdout.write;
+    try {
+      registerPtyTakeoverCommands(program, {
+        getPty: () => undefined, requestPtyTakeover: () => false,
+        requestRemote: async (_id, action, payload, options) => { captured.push([action, payload, options]); return { status: 'success' }; },
+        listRefs: () => [{ id: 'tui:7', kind: 'tui', source: 'remote', alive: true }],
+        log() {},
+      });
+      await program.parseAsync(['node', 'elanous', 'pty', 'rename', 'tui:7', 'op']);
+      await program.parseAsync(['node', 'elanous', 'pty', 'rename', 'tui:7', 'op2', '--actor', 'agent']);
+      expect(captured).toEqual([
+        ['rename', { nickname: 'op' }, { actor: 'human' }],
+        ['rename', { nickname: 'op2' }, { actor: 'agent' }],
       ]);
       expect(process.exitCode).toBe(0);
     } finally {

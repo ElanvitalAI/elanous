@@ -272,7 +272,8 @@
 // `../index.ts`) instead of importing the type — keeps this module free
 // of circular dependency on dashboard/index.ts.
 
-import { tuiNowSlash } from '../../context-bus/context-now-surfaces.js';
+import { renderTuiNow, tuiNowSlash } from '../../context-bus/context-now-surfaces.js';
+import { contextNowInWorker } from '../../context-bus/context-now.js';
 import { handleTuiChatPersona, type TuiChatPersonaSelection } from './chat-persona.js';
 import { createWishCard } from '../../intake-plane/wish-card.js';
 import { CardStore } from '../../task-cards/card-store.js';
@@ -284,6 +285,8 @@ import { resolveRepositoryDesignCheck } from '../../cli/repo-cli.js';
 import { renderDesignCheckLines, type DesignCheckTone } from '../../design/design-check-render.js';
 import { handleDesignPick } from './design-pick.js';
 import { createDecideSlashHandler } from './decide-slash.js';
+import { startSeatBootConversation } from '../seat-boot-preamble.js';
+import { markSeatConversationStarted, recordSeatSessionEnd } from '../seat-local-instructions.js';
 import type { DecisionLedger } from '../../decisions/decision-ledger.js';
 import { listDesignDirections, parseDeclaredDirection } from '../../design/design-directions.js';
 import {
@@ -343,7 +346,7 @@ import { terminalModalRouter } from '../input/terminal-modal-router.js';
 import { termSize, stripAnsi } from '../../tui.js';
 import { SLASH_COMMANDS } from '../../chat/index.js';
 import { buildEssentialHelpLines } from './help-from-registry.js';
-import { HUMAN_MODEL_WORDS, MODEL_CODE_NAMES, humanWordForModel, modelChangeLine, modelOverviewLines, resolveModelChoice } from './model-choices.js';
+import { HUMAN_MODEL_WORDS, MODEL_CODE_NAMES, humanWordForModel, modelChangeLine, modelOverviewLines, modelScopeLine, modelSwitchScope, parseModelSlashArgs, resolveModelChoice } from './model-choices.js';
 import type { FoldMode } from '../../log-entry.js';
 import { resolveDashboardChatMainLogCommand } from '../input/chat-main-log-command.js';
 import {
@@ -358,7 +361,7 @@ import { debug } from '../../debug/log.js';
 import { resolveDebugCompanionTargets } from '../../window/debug-window-consumers.js';
 import { getPromptBankStore, buildPromptInjection } from '../../prompt-bank/index.js';
 import { inspectActiveProvider } from '../../provider-summary.js';
-import { currentRouteDecision, formatRouteDecisionSummary, resolveRouteDecision, type RouteDecision } from '../../llm/route-decision.js';
+import { currentRouteDecision, formatRouteDecisionSummary, resolveRouteDecision, sessionModelPin, setSessionModelPin, type RouteDecision } from '../../llm/route-decision.js';
 import {
   listSessions as sessionListSessions,
   resolveSessionId as sessionResolveId,
@@ -954,6 +957,8 @@ export interface DashboardSlashContext {
     // Fold mode
     getLogFoldMode(): FoldMode;
     setLogFoldMode(mode: FoldMode): void;
+    /** #19 — put every static fold in one state; returns how many changed. */
+    setAllFolds?(expanded: boolean): number;
     // Solo (chat-only) toggle — flips chatOnlyMode + manages HUD mode segment.
     /** Returns the new chatOnlyMode value after toggle. */
     toggleSolo(): boolean;
@@ -1071,6 +1076,7 @@ export interface DashboardSlashContext {
   termSlash: {
     /** Line formatters (existing factory output type re-used). */
     slashRuntime: DashboardTermSlashRuntime;
+    openNewTerminal(command?: string): void;
 
     /** Terminal session registry (the modal-pty side). */
     sessionRegistry: {
@@ -1413,8 +1419,10 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     ctx.setChatScrollOffset(-1);
   });
 
-  registry.register(['now'], (args, ctx) => {
-    for (const line of tuiNowSlash(args, nowDeps)) ctx.pushChatLine(line);
+  registry.register(['now'], async (args, ctx) => {
+    const lines = nowDeps ? tuiNowSlash(args, nowDeps)
+      : renderTuiNow(await contextNowInWorker({ topic: args.join(' ').trim() }));
+    for (const line of lines) ctx.pushChatLine(line);
   });
 
   registry.register('loops', async (args, ctx) => {
@@ -2977,6 +2985,10 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
       ctx.setChatScrollOffset(-1);
       return;
     }
+    if (sub === 'new') {
+      ctx.termSlash.openNewTerminal(args.slice(1).join(' ').trim() || undefined);
+      return;
+    }
     if (sub === 'list') {
       const alive = sessionRegistry.list();
       if (alive.length === 0) {
@@ -4019,6 +4031,10 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     }
 
     if (seSub === 'new' || seSub === 'clear') {
+      // 🪪 L2-lite — 비우기 «전»에 이 대화의 «지난 세션»을 자리 로컬 지시에 남긴다(실패해도 진행).
+      try {
+        recordSeatSessionEnd(seSub === 'new' ? 'session-new' : 'session-clear');
+      } catch { /* 기록이 새 대화를 막지 않는다 */ }
       if (seSub === 'new') {
         try {
           const { suggestProjectForFolder } = await import('../../project/project-store.js');
@@ -4044,6 +4060,12 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
       ctx.chatLines.push(ctx.success(prev
         ? `  ✓ cleared history + detached ${prev.slice(0, 8)}`
         : `  ✓ cleared history`));
+      // 🪪 L1 — 새 대화 = 새 자리 부트 카드.
+      //   ⛔ 정적 import · 동기 호출 — history 를 비운 «같은 틱»에 카드 캐시를 비운다(비동기 대기 틈에 새 턴이 옛 카드를 읽지 않게).
+      try {
+        startSeatBootConversation({ reason: seSub === 'new' ? 'session-new' : 'session-clear' });
+        markSeatConversationStarted();
+      } catch { /* 부트 카드가 새 대화를 막지 않는다 */ }
       ctx.setChatScrollOffset(-1);
       return;
     }
@@ -4471,6 +4493,22 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
           newChatOnlyMode: next,
         });
       }
+      ctx.setChatScrollOffset(-1);
+      return;
+    }
+    if (logCommand.kind === 'fold-all') {
+      if (!ctx.logSlash.setAllFolds) {
+        // A host without a fold controller cannot know whether anything is folded — say so, not «nothing».
+        debug.log('log.fold', 'slash-set-all', { expanded: logCommand.expanded, changed: null, reason: 'no-fold-controller' });
+        emitReplyToChat(ctx, ctx.warning('  fold controls are not available in this view'));
+        ctx.setChatScrollOffset(-1);
+        return;
+      }
+      const changed = ctx.logSlash.setAllFolds(logCommand.expanded);
+      debug.log('log.fold', 'slash-set-all', { expanded: logCommand.expanded, changed });
+      emitReplyToChat(ctx, ctx.muted(changed > 0
+        ? `  ${logCommand.expanded ? 'unfolded' : 'folded'} ${changed} block${changed === 1 ? '' : 's'}`
+        : `  (nothing to ${logCommand.expanded ? 'unfold' : 'fold'})`));
       ctx.setChatScrollOffset(-1);
       return;
     }
@@ -5302,9 +5340,10 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     // previews an unpinned request without changing provider/model state.
     if (sub === 'route') {
       const cfg = getUserConfig();
+      const previewPin = sessionModelPin('dashboard', cfg.llm.provider);
       const text = args.slice(1).join(' ').trim();
       const decision = text
-        ? resolveRouteDecision({ provider: cfg.llm.provider, configuredModel: inspectActiveProvider().model, text, routePolicy: cfg.llm.routePolicy })
+        ? resolveRouteDecision({ provider: cfg.llm.provider, configuredModel: inspectActiveProvider().model, text, routePolicy: cfg.llm.routePolicy, ...(previewPin ? { explicitModel: previewPin.model } : {}) })
         : currentRouteDecision('dashboard');
       ctx.chatLines.push(ctx.accent(`❯ /provider route${text ? '' : ' (current)'}`));
       if (!decision) ctx.chatLines.push(ctx.muted('  아직 이 세션에서 실행된 route가 없습니다. `/provider route <요청>`으로 미리보기 합니다.'));
@@ -6062,24 +6101,35 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     // /model            — 지금 모델(사람 낱말) + 고르기
     // /model 빠름|보통|깊음 — 지금 provider 의 budget·better·best 티어 (model-choices.ts)
     // /model <코드명>    — codex·terra·sol·luna·opus·sonnet·grok (그대로 동작)
+    // /model <x> --global — 설정 파일(전역)에 저장 · /model reset — 세션 핀 해제
+    // ⭐ 기본은 «이 세션» 핀이다(TUI-MODEL-SESSION-SCOPE · 10-14): config 의 llm.model 만 바꾸면 codex 티어 정책이
+    //   그것을 무시해 실제 턴은 그대로 sol 이었다(OPT 21:33). 핀은 다음 턴 explicitModel 로 들어가 정책을 이긴다.
     // effort(low/med/high)는 /reasoning. NL 미지원(대표 OK·slash-only).
-    const arg = (args[0] ?? '').toLowerCase().trim();
+    const { arg, global } = parseModelSlashArgs(args);
     const curCfg = getUserConfig();
     const curProvider = curCfg.llm.provider;
-    const curModel = curCfg.llm.model;
+    const pin = sessionModelPin('dashboard', curProvider);
+    const curModel = pin?.model ?? curCfg.llm.model;
     const curReasoning = effectiveReasoningLevel(curCfg.llm, curProvider, curModel);
     if (!arg) {
       const [, codes] = modelOverviewLines(curProvider, curModel, curReasoning);
       // A model outside the 빠름/보통/깊음 map (codename or custom) says so explicitly instead of dropping the tier slot.
       const tierName = humanWordForModel(curProvider, curModel, curReasoning) ?? '단계 밖';
-      ctx.chatLines.push(`지금: ${curModel?.trim() || '기본 모델'} (${tierName} · 생각 ${curReasoning}) · 고르기: /model ${HUMAN_MODEL_WORDS.join(' | ')}`);
+      ctx.chatLines.push(`지금: ${curModel?.trim() || '기본 모델'} (${tierName} · 생각 ${curReasoning}${pin ? ' · 이 세션 핀' : ''}) · 고르기: /model ${HUMAN_MODEL_WORDS.join(' | ')}`);
       ctx.chatLines.push(ctx.muted(codes));
+      ctx.setChatScrollOffset(-1);
+      return;
+    }
+    if (arg === 'reset') {
+      setSessionModelPin('dashboard', null);
+      debug.log('llm.model-choice', 'session-pin-cleared', { hadPin: pin !== null, configModel: curCfg.llm.model ?? null }, { level: 'info' });
+      ctx.chatLines.push(ctx.muted(`/model reset: 세션 핀 ${pin ? `해제 (${pin.model})` : '없음'} — 다음 턴은 설정·정책대로`));
       ctx.setChatScrollOffset(-1);
       return;
     }
     const resolution = resolveModelChoice(arg, curProvider);
     if (resolution.kind === 'needs-provider') {
-      debug.log('dashboard.model', 'human-word-needs-provider', { word: resolution.word, provider: curProvider });
+      debug.log('llm.model-choice', 'human-word-needs-provider', { word: resolution.word, provider: curProvider });
       ctx.chatLines.push(ctx.muted(`/model ${resolution.word}: provider 가 auto 라 고를 사다리가 없다 — /provider 로 먼저 하나를 고르거나 코드명(${MODEL_CODE_NAMES.join('/')})을 쓴다.`));
       ctx.setChatScrollOffset(-1);
       return;
@@ -6090,29 +6140,51 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
       return;
     }
     const { target } = resolution;
+    const scope = modelSwitchScope(target.provider, curProvider, global);
+    if (scope === 'needs-global') {
+      ctx.chatLines.push(ctx.muted(`/model ${arg}: provider 가 ${curProvider} → ${target.provider} 로 바뀌는 선택은 세션 핀이 안 된다 — /model ${arg} --global 로 설정에 저장한다.`));
+      ctx.setChatScrollOffset(-1);
+      return;
+    }
     // A human word picks a whole tier (model ⊕ reasoning, like /reasoning it clears the codex override);
-    // a code name changes the model only.
+    // a code name changes the model only. Reasoning has no per-turn override, so only --global sets it.
     const tierReasoning = resolution.kind === 'human' ? resolution.reasoningLevel : undefined;
-    saveUserConfig({
-      ...curCfg,
-      llm: {
-        ...curCfg.llm,
-        provider: target.provider,
-        model: target.model,
-        ...(tierReasoning ? { reasoningLevel: tierReasoning, codexReasoning: undefined } : {}),
-      },
-    });
-    reloadUserConfig();
-    if (tierReasoning) ctx.refreshReasoningHudSegment();
-    debug.log('dashboard.model', 'switch', {
+    if (scope === 'global') {
+      saveUserConfig({
+        ...curCfg,
+        llm: {
+          ...curCfg.llm,
+          provider: target.provider,
+          model: target.model,
+          ...(tierReasoning ? { reasoningLevel: tierReasoning, codexReasoning: undefined } : {}),
+        },
+      });
+      reloadUserConfig();
+      if (tierReasoning) ctx.refreshReasoningHudSegment();
+    }
+    // --global 도 이 세션은 핀으로 «즉시» 반영한다 — config 만 쓰면 codex 티어 정책이 configuredModel 을
+    //   무시해 다음 턴에 안 먹는다(1R 리뷰 mf). 다른 세션은 그 세션의 routePolicy 를 따른다.
+    setSessionModelPin('dashboard', { provider: target.provider, model: target.model });
+    // 감사 한 줄 — 종전 범주 `dashboard.model` 은 렌더 접두(`dashboard`)라 기본 음소거돼 로그 스토어에 0회였다
+    //   (src/mss/logging/render-categories.ts). 판정 이벤트는 렌더 밖 범주에 둔다.
+    debug.log('llm.model-choice', 'switch', {
+      scope,
       via: resolution.kind,
       choice: resolution.kind === 'human' ? resolution.tier : resolution.name,
-      from: { provider: curProvider, model: curModel ?? null },
+      from: { provider: curProvider, model: curModel ?? null, pinned: pin !== null },
       to: target,
-      reasoning: tierReasoning ?? null,
-    });
-    ctx.chatLines.push(modelChangeLine({ provider: curProvider, model: curModel, reasoning: curReasoning }, resolution));
-    ctx.chatLines.push(ctx.muted('  └─ 다음 턴부터 반영 · 실행 뱃지(#4442)로 확인'));
+      reasoning: scope === 'global' ? (tierReasoning ?? null) : null,
+      configWritten: scope === 'global',
+    }, { level: 'info' });
+    // 세션 범위는 생각 깊이를 안 바꾼다 — 모델 줄에 티어의 깊이를 «바뀐 값»처럼 쓰지 않고, 남는 깊이를 말한다
+    //   (2R 리뷰 — 한 응답 안의 «생각 medium» 과 «생각 깊이는 그대로 high» 모순).
+    if (scope === 'session' && resolution.kind === 'human') {
+      const { reasoningLevel: _tierReasoning, ...modelOnly } = resolution;
+      ctx.chatLines.push(`${modelChangeLine({ provider: curProvider, model: curModel, reasoning: curReasoning }, modelOnly)} · 생각 ${curReasoning} 그대로`);
+    } else {
+      ctx.chatLines.push(modelChangeLine({ provider: curProvider, model: curModel, reasoning: curReasoning }, resolution));
+    }
+    ctx.chatLines.push(ctx.muted(modelScopeLine(scope, scope === 'session' && tierReasoning ? { tier: tierReasoning, current: curReasoning } : undefined)));
     ctx.setChatScrollOffset(-1);
   });
 

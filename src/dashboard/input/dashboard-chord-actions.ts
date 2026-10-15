@@ -12,7 +12,8 @@ export type DashboardChordAction =
   | { kind: 'open-pane-modal' }
   | { kind: 'toggle-log-zoom' }
   | { kind: 'open-preview-terminal' }
-  | { kind: 'toggle-preview-terminal-expand' };
+  | { kind: 'toggle-preview-terminal-expand' }
+  | { kind: 'toggle-all-folds' };
 
 export function matchDashboardChordAction(key: Key): DashboardChordAction | null {
   if (key.ctrl && (key.name === 'w' || key.name === 'ㅈ')) {
@@ -54,6 +55,10 @@ export function matchDashboardChordAction(key: Key): DashboardChordAction | null
   if (key.name === 'e' || key.name === 'ㄷ') {
     return { kind: 'toggle-preview-terminal-expand' };
   }
+  // #19 — the log-pane `F` bulk fold toggle, reachable from the input (plain `F` types a letter there).
+  if (!key.ctrl && (key.name === 'f' || key.name === 'ㄹ')) {
+    return { kind: 'toggle-all-folds' };
+  }
   return null;
 }
 
@@ -70,6 +75,7 @@ export interface DashboardChordActionRunnerDeps<Pane> {
   toggleLogZoom: () => void | Promise<void>;
   openPreviewTerminal: () => void;
   togglePreviewTerminalExpand: () => void;
+  toggleAllFolds?: () => void;
 }
 
 export function createDashboardChordActionRunner<Pane>(
@@ -112,6 +118,9 @@ export function createDashboardChordActionRunner<Pane>(
         return;
       case 'toggle-preview-terminal-expand':
         deps.togglePreviewTerminalExpand();
+        return;
+      case 'toggle-all-folds':
+        deps.toggleAllFolds?.();
         return;
     }
   };

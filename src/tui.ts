@@ -965,6 +965,11 @@ export function injectKey(key: Key): boolean {
   return true;
 }
 
+/** 아직 readKey 가 소비하지 않은 키 수 — 외부 입력 대기열이 «사용자 키보다 앞서» 끼어들지 않게 본다. */
+export function pendingKeyCount(): number {
+  return _keyQueue.length;
+}
+
 export function termSize(): { rows: number; cols: number } {
   return { rows: process.stdout.rows || 24, cols: process.stdout.columns || 80 };
 }

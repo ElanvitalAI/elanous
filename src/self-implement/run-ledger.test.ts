@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from 'bun:test';
-import { appendRunLedgerEntry, cleanupUnfinishedRunLedgers, classifyFederatedLedgerDirectoryReadFailure, describeFederatedMissingRunLedger, dispositionUnfinishedRunLedger, isTerminatedUnfinishedLifecycle, loadFederatedRunLedger, classifyUnfinishedLifecycle, loadRunLedger, loadRunLedgerWithMetadata, lookupPrGoalAcceptance, parseRunShardIdentity, queryCompletedRunLedgers, queryFederatedCompletedRunLedgers, queryFederatedInterruptedRunLedgers, queryFederatedUnfinishedRunLedgers, queryInterruptedRunLedgers, queryRunChain, queryRunLedgerTimeline, queryRunScreenKey, queryUnfinishedRunLedgers, recordHumanStoppedRun, renderRunLedger, renderUnfinishedRunLedgers, runLedgerDir, summarizeRunLedgerRounds, TERMINATED_UNFINISHED_LIFECYCLES, type RunChainLogStore, type RunLedgerEntry, type RunLedgerReader, type UnfinishedRunLedgerEntry } from './run-ledger.js';
+import { appendRunLedgerEntry, cleanupUnfinishedRunLedgers, classifyFederatedLedgerDirectoryReadFailure, describeFederatedMissingRunLedger, dispositionUnfinishedRunLedger, hasTerminalRunStatus, isTerminatedUnfinishedLifecycle, loadFederatedRunLedger, classifyUnfinishedLifecycle, loadRunLedger, loadRunLedgerWithMetadata, lookupPrGoalAcceptance, parseRunShardIdentity, queryCompletedRunLedgers, queryFederatedCompletedRunLedgers, queryFederatedInterruptedRunLedgers, queryFederatedUnfinishedRunLedgers, queryInterruptedRunLedgers, queryRunChain, queryRunLedgerTimeline, queryRunScreenKey, queryUnfinishedRunLedgers, readNonBlockingRunRecord, recordHumanStoppedRun, recordNonBlockingRunPending, recordNonBlockingRunResult, renderRunLedger, renderUnfinishedRunLedgers, runLedgerDir, summarizeRunLedgerRounds, TERMINATED_UNFINISHED_LIFECYCLES, type RunChainLogStore, type RunLedgerEntry, type RunLedgerReader, type UnfinishedRunLedgerEntry } from './run-ledger.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1243,6 +1243,110 @@ describe('human-stopped run ledger records', () => {
       { timestamp: '2026-08-14T00:01:00.000Z', runId, event: 'human-stop', data: { stoppedBy: 'operator', stoppedAt: '2026-08-14T00:01:00.000Z' } },
     ]);
     expect(queryUnfinishedRunLedgers({ dir: directory, goalsDir: directory }).entries).toEqual([]);
+  });
+
+  afterAll(() => {
+    for (const directory of directories) rmSync(directory, { recursive: true, force: true });
+  });
+});
+
+describe('non-blocking run ledger records — recordHumanStoppedRun 선례를 따른다', () => {
+  const directories: string[] = [];
+
+  it('append 한 pending 과 완료 결과를 같은 requestId 로 재독기한다', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'run-ledger-non-blocking-'));
+    directories.push(directory);
+    const requestId = 'run-00000000-0000-4000-8000-000000000201';
+    recordNonBlockingRunPending(requestId, { timestamp: '2026-10-14T00:00:00.000Z', dir: directory });
+    recordNonBlockingRunResult(
+      requestId,
+      {
+        kind: 'failed',
+        reason: 'runner unavailable',
+        next: '요청과 실패 이유를 확인한 뒤 다시 요청',
+        ok: false,
+      },
+      { timestamp: '2026-10-14T00:00:01.000Z', dir: directory },
+    );
+
+    const ledger = loadRunLedger(requestId, directory);
+    expect(ledger).not.toBeNull();
+    expect(ledger!.map((entry) => entry.event)).toEqual(['non-blocking-pending', 'non-blocking-result']);
+    expect(readNonBlockingRunRecord(ledger!)).toMatchObject({
+      requestId,
+      kind: 'failed',
+      reason: 'runner unavailable',
+      next: '요청과 실패 이유를 확인한 뒤 다시 요청',
+    });
+  });
+
+  it('dir 옵션은 원장 entry 페이로드에 남지 않고 next 미제공 시 그 키도 생략된다', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'run-ledger-non-blocking-payload-'));
+    directories.push(directory);
+    const requestId = 'run-00000000-0000-4000-8000-000000000204';
+    recordNonBlockingRunResult(
+      requestId,
+      { kind: 'failed', ok: false },
+      { timestamp: '2026-10-14T00:00:00.000Z', dir: directory },
+    );
+
+    const ledger = loadRunLedger(requestId, directory);
+    expect(ledger).not.toBeNull();
+    const resultEntry = ledger!.find((entry) => entry.event === 'non-blocking-result');
+    expect(resultEntry).toBeDefined();
+    expect(resultEntry!.data).not.toHaveProperty('dir');
+    expect(resultEntry!.data).not.toHaveProperty('next');
+    expect(resultEntry!.data).not.toHaveProperty('timestamp');
+    expect(readNonBlockingRunRecord(ledger!)).toEqual({ requestId, kind: 'failed' });
+  });
+
+  it('pending 만 있으면 pending 상태로 재독기된다', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'run-ledger-non-blocking-pending-'));
+    directories.push(directory);
+    const requestId = 'run-00000000-0000-4000-8000-000000000202';
+    recordNonBlockingRunPending(requestId, { timestamp: '2026-10-14T00:00:00.000Z', dir: directory });
+
+    const ledger = loadRunLedger(requestId, directory);
+    expect(ledger).not.toBeNull();
+    expect(readNonBlockingRunRecord(ledger!)).toEqual({ requestId, kind: 'pending', next: null });
+  });
+
+  it('완료 결과는 종결 run-status 뒤에 남아도 런을 다시 미완로 열지 않는다', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'run-ledger-non-blocking-terminal-'));
+    directories.push(directory);
+    const requestId = 'run-00000000-0000-4000-8000-000000000203';
+    appendRunLedgerEntry({ timestamp: '2026-10-14T00:00:00.000Z', runId: requestId, event: 'start', data: {} }, directory);
+    appendRunLedgerEntry({ timestamp: '2026-10-14T00:00:01.000Z', runId: requestId, event: 'run-status', data: { runStatus: 'failed' } }, directory);
+    recordNonBlockingRunResult(
+      requestId,
+      {
+        kind: 'launched',
+        next: `eln self run ${requestId}`,
+        ok: true,
+        runId: requestId,
+      },
+      { timestamp: '2026-10-14T00:00:02.000Z', dir: directory },
+    );
+
+    const ledger = loadRunLedger(requestId, directory)!;
+    expect(hasTerminalRunStatus(ledger)).toBe(true);
+    // 종결된 런이어도 requestId 기록은 조회 계층에 남는다(칸 판정선).
+    const unfinished = queryUnfinishedRunLedgers({ dir: directory, goalsDir: directory });
+    expect(unfinished.entries).toEqual([expect.objectContaining({ runId: requestId, nonBlocking: expect.objectContaining({ kind: 'launched', next: `eln self run ${requestId}` }) })]);
+  });
+
+  it('RunLedgerEntry 스키마·검증은 그대로다 — 새 이벤트도 기존 파서를 통과한다', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'run-ledger-non-blocking-schema-'));
+    directories.push(directory);
+    const requestId = 'run-00000000-0000-4000-8000-000000000204';
+    recordNonBlockingRunPending(requestId, { timestamp: '2026-10-14T00:00:00.000Z', dir: directory });
+    const ledger = loadRunLedger(requestId, directory)!;
+    expect(ledger[0]).toEqual({
+      timestamp: '2026-10-14T00:00:00.000Z',
+      runId: requestId,
+      event: 'non-blocking-pending',
+      data: { requestId, kind: 'pending', recordedAt: '2026-10-14T00:00:00.000Z' },
+    });
   });
 
   afterAll(() => {

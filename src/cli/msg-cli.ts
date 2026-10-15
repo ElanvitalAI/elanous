@@ -2,6 +2,8 @@ import type { Command } from 'commander';
 import { ensureAuthToken } from '../auth/acp-token.js';
 import { canonicalSeatId, openMsgStore, openMsgStoreReadOnly, type Message, type MsgStore } from '../msg/msg-store.js';
 import { startMsgSseServer } from '../msg/msg-sse-server.js';
+import { messageRouteFor, noReplyBodyNotice, unsupportedLoopAddressNotice } from '../loops/msg-address.js';
+import { resolveWake, wakeRecipient, type WakeDeps, type WakeOutcome } from '../loops/msg-wake.js';
 
 export interface MsgCliDeps {
   openStore?: () => MsgStore;
@@ -13,6 +15,12 @@ export interface MsgCliDeps {
   signal?: AbortSignal;
   fetch?: typeof fetch;
   authToken?: () => string;
+  /** Wake-path resolution for `msg route` (tests inject; default reads pty manifest ⊕ seat folders). */
+  wakeDeps?: WakeDeps;
+  /** Attach the logs.db sink so `msg.wake` reaches `elanous logs` (a short CLI otherwise writes only the file trail). */
+  registerLogSink?: () => Promise<unknown>;
+  /** Wake the recipient after a durable post; never changes the post outcome. */
+  wake?: (address: string, msgId: number, message: { from: string; kind?: string }, deps: WakeDeps) => Promise<WakeOutcome>;
 }
 
 type CommonOptions = { json?: boolean };
@@ -31,8 +39,14 @@ function integer(raw: string | undefined, flag: string, fallback: number, min: n
   return value;
 }
 
-function formatMessage(message: Message): string {
-  return `#${message.id} ${message.createdAt} ${message.from} → ${message.to}${message.kind ? ` [${message.kind}]` : ''}: ${message.body}`;
+/** Emoji prefix per known kind; the `[kind]` text itself stays because operating scripts grep for it. */
+const KIND_EMOJI: Readonly<Record<string, string>> = {
+  coord: '🤝', report: '📋', info: 'ℹ️', question: '❓', alert: '🚨', progress: '⏳', incident: '🔥', coach: '🎓',
+};
+
+export function formatMessage(message: Message): string {
+  const kind = message.kind ? ` ${Object.hasOwn(KIND_EMOJI, message.kind) ? KIND_EMOJI[message.kind] : ''}[${message.kind}]` : '';
+  return `#${message.id} ${message.createdAt} ${message.from} → ${message.to}${kind}: ${message.body}`;
 }
 
 /** Register the durable, recipient-addressed CLI. Reading never advances the acknowledgement cursor. */
@@ -68,6 +82,8 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     .option('--origin-key <key>', 'deduplicate a channel mirror by coord:<commentId>:<recipient>').option('--json')
     .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; replyTo?: string; originKey?: string }) => run(async () => {
       const from = seat(opts.from, '--from');
+      const unsupported = opts.to === undefined ? null : unsupportedLoopAddressNotice(opts.to);
+      if (unsupported) out.error(unsupported);
       const to = seat(opts.to, '--to');
       if (body !== undefined && body !== '-' && opts.body !== undefined) throw new Error('provide body once (argument or --body)');
       const text = opts.body ?? (body !== undefined && body !== '-' ? body : await readStdin());
@@ -78,6 +94,33 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
         ? store.post(envelope)
         : store.appendWithProvenance(envelope, opts.originKey));
       emit(posted, opts.json, () => out.log(formatMessage(posted)));
+      const noBody = noReplyBodyNotice(to);
+      if (noBody) out.error(noBody);
+      // 저장 «뒤» 한 번 — 읽는 몸이 없다는 안내가 이미 나갔으면 깨움 경고는 겹쳐 내지 않는다.
+      // 깨움은 post 의 성패를 바꾸지 않는다 — 동기 예외까지 여기서 막는다.
+      // 로그 싱크 등록이 멈춰도 깨움·post 완료를 붙잡지 않는다(1초 상한).
+      try {
+        let sinkTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          (deps.registerLogSink ?? (async () => (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('cli')))(),
+          new Promise<void>(resolve => { sinkTimer = setTimeout(resolve, 1000); }),
+        ]).finally(() => clearTimeout(sinkTimer));
+      } catch { /* observability is fail-open */ }
+      try {
+        await (deps.wake ?? wakeRecipient)(to, posted.id, { from, ...(opts.kind === undefined ? {} : { kind: opts.kind }) },
+          { ...deps.wakeDeps, warn: noBody ? () => {} : line => out.error(line) });
+      } catch { /* the wake outcome is logged by wakeRecipient; the post is already durable */ }
+    })());
+
+  msg.command('route <address>').description('Show how a post to this address is read (replyBody) and woken (wake)')
+    .option('--json')
+    .action((address: string, opts: CommonOptions) => run(() => {
+      const to = canonicalSeatId(address);
+      const wake = resolveWake(to, deps.wakeDeps);
+      const row = { msgAddress: to, replyBody: messageRouteFor(to)?.replyBody ?? null, ...wake };
+      emit(row, opts.json, () => out.log(`${to}\treplyBody=${row.replyBody ?? '모름'}\twake=${wake.wake}`
+        + `${wake.target ? `\ttarget=${wake.target}` : ''}${wake.optIn === undefined ? '' : `\toptIn=${wake.optIn ? 'yes' : 'no(주입 0)'}`}`
+        + `\t(${wake.source}${wake.reason ? `: ${wake.reason}` : ''})`));
     })());
 
   msg.command('list').description('List messages for one recipient without acknowledging them')

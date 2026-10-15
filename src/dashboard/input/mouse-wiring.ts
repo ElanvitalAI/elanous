@@ -77,6 +77,7 @@ import {
   modeSegment,
   ptyShellCountSegment,
   runningAgentsSegment,
+  runningBuildSegment,
   controllerSegment,
   shellRollupSegment,
   sshSegment,
@@ -85,11 +86,12 @@ import {
   vwSegment,
   voiceSegment,
   type GitSegmentState,
+  type RunningBuildState,
   type ShellRollupSummary,
   type StatusBarRenderOptions,
   type VwSummary,
 } from '../../status/bar.js';
-import type { ActiveProviderInfo } from '../../provider-summary.js';
+import type { StatusProviderInfo } from '../../status/status-provider-info.js';
 import { modelDisplayForRotationEntry, type RotationEntry } from '../../user-config.js';
 import {
   createWdPickerRecipe,
@@ -137,6 +139,12 @@ export type DashboardPaneHitTarget = Extract<
   HitTarget,
   { kind: 'pane-body' | 'pane-title' | 'pane-nav-tab' }
 >;
+/** Tag the git pill with an axis label (`트리`) without touching the caller's state. */
+function labelGitState(state: GitSegmentState | string | null | undefined, label: string | undefined): GitSegmentState | string | undefined {
+  if (!label || state === null || state === undefined) return state ?? undefined;
+  return typeof state === 'string' ? { branch: state, label } : { ...state, label };
+}
+
 export type DashboardMousePreflightInputClassifier = (
   row: number,
   col: number,
@@ -153,7 +161,7 @@ export type DashboardMousePreflightPaneClassifier = (
 export interface DashboardStatusInput {
   swd: string;
   gitState?: GitSegmentState | string | null;
-  providerInfo: ActiveProviderInfo;
+  providerInfo: StatusProviderInfo;
   contextUsedTokens?: number;
   tmuxLabel?: string | null;
   sshLabel?: string | null;
@@ -179,6 +187,9 @@ export interface DashboardStatusInput {
    *  passes the latest label through here; null/empty means the voice
    *  segment is hidden (idle). */
   voiceLabel?: string | null;
+  /** The code this TUI process booted with. Present → a `▶ 실행` pill
+   *  follows the git pill, which is then labelled `트리`. Omit to hide. */
+  runningBuild?: RunningBuildState | null;
   theme?: ThemeTokens;
 }
 
@@ -870,9 +881,11 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
     const opts: StatusBarRenderOptions = { theme: input.theme, compact: cols < 100 };
     const segments: Array<{ name: PillName | null; render: string }> = [
       { name: 'workingDir', render: sessionCwdSegment(input.swd, opts) },
-      { name: null,         render: gitSegment(input.swd, input.gitState ?? undefined, opts) },
-      { name: 'model',      render: modelSegment(input.providerInfo, opts) },
+      { name: null,         render: gitSegment(input.swd, labelGitState(input.gitState, input.runningBuild ? '트리' : undefined), opts) },
     ];
+    const runningBuildRender = runningBuildSegment(input.runningBuild, opts);
+    if (runningBuildRender) segments.push({ name: null, render: runningBuildRender });
+    segments.push({ name: 'model', render: modelSegment(input.providerInfo, opts) });
     const runningAgentsRender = runningAgentsSegment(input.runningAgents ?? 0, opts);
     if (runningAgentsRender) segments.push({ name: null, render: runningAgentsRender });
     const controllerRender = controllerSegment(input.controller, opts);

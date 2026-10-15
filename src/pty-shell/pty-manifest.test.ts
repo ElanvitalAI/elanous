@@ -102,6 +102,28 @@ describe('pty-manifest store (크로스-프로세스 관측)', () => {
     expect(listPtyManifestAt(corrupt)).toEqual([]);
   });
 
+  test('purpose 컬럼 없는 기존 DB의 행을 읽고 스키마를 이행한다', () => {
+    const path = join(stateDir, 'pre-purpose-manifest.db');
+    const d = new Database(path);
+    d.run(`CREATE TABLE pty_manifest (id TEXT PRIMARY KEY, kind TEXT NOT NULL, cmd TEXT NOT NULL, workdir TEXT, owner_pid INTEGER NOT NULL, instance TEXT NOT NULL, started_at INTEGER NOT NULL, alive INTEGER NOT NULL, exit_code INTEGER, snapshot TEXT NOT NULL DEFAULT '', snapshot_at INTEGER NOT NULL DEFAULT 0, frame TEXT NOT NULL DEFAULT '', frame_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)`);
+    d.run(`INSERT INTO pty_manifest VALUES ('old-shell','shell','/bin/zsh','/tmp',1,'old',1,1,NULL,'',0,'frame',1,1)`);
+    expect(listPtyManifestRowsAt(path).find((row) => row.id === 'old-shell')?.purpose).toBeUndefined();
+    expect(listPtyManifestRowsAt(path).find((row) => row.id === 'old-shell')?.seat).toBeUndefined();
+    migratePtyManifestSchema(d);
+    expect(d.query(`PRAGMA table_info(pty_manifest)`).all().some((column) => (column as { name: string }).name === 'purpose')).toBe(true);
+    expect(d.query(`PRAGMA table_info(pty_manifest)`).all().some((column) => (column as { name: string }).name === 'seat')).toBe(true);
+    expect(listPtyManifestRowsAt(path).find((row) => row.id === 'old-shell')).toMatchObject({ id: 'old-shell', kind: 'shell' });
+    expect(listPtyManifestRowsAt(path).find((row) => row.id === 'old-shell')?.purpose).toBeUndefined();
+    expect(listPtyManifestRowsAt(path).find((row) => row.id === 'old-shell')?.seat).toBeUndefined();
+    d.close();
+  });
+
+  test('seat, purpose, and workdir remain separate on new shell rows', () => {
+    upsertPtyManifest({ id: 'shell-seat', kind: 'shell', cmd: '/bin/zsh', seat: 'UX', purpose: 'tui-shell:UX', workdir: '/hq/seats/UX', startedAt: 1, now: 1 });
+    expect(getPtyManifest('shell-seat')).toMatchObject({ seat: 'UX', purpose: 'tui-shell:UX', workdir: '/hq/seats/UX' });
+    expect(listPtyManifestRowsAt(manifestDbPath).find((row) => row.id === 'shell-seat')).toMatchObject({ seat: 'UX', purpose: 'tui-shell:UX', workdir: '/hq/seats/UX' });
+  });
+
   test('fresh WAL registration is visible to a separate readonly process before checkpoint', () => {
     upsertPtyManifest({ id: 'fresh-wal', kind: 'tui', cmd: 'elanous', startedAt: 1, now: 1 });
     expect(listPtyManifestRowsAt(manifestDbPath).map((row) => row.id)).toContain('fresh-wal');
@@ -127,6 +149,20 @@ describe('pty-manifest store (크로스-프로세스 관측)', () => {
     expect(getPtyManifest('pty-pid-mapped')?.ptyPid).toBe(process.pid);
     expect(listPtyManifestRows().find((row) => row.id === 'pty-pid-mapped')?.ptyPid).toBe(process.pid);
     expect(listPtyManifest().find((row) => row.id === 'pty-pid-mapped')?.ptyPid).toBe(process.pid);
+  });
+
+  test('TUI shell purpose and explicit origin survive the manifest boundary; legacy rows remain readable', () => {
+    upsertPtyManifest({
+      id: 'shell-purpose', kind: 'shell', cmd: '/bin/zsh', workdir: '/tmp',
+      purpose: 'tui-shell', origin: { originRoot: 'elanous-internal', controller: 'tui-shell' },
+      startedAt: 1, now: 1,
+    });
+    expect(getPtyManifest('shell-purpose')).toMatchObject({
+      kind: 'shell', purpose: 'tui-shell', originRoot: 'elanous-internal',
+      controller: 'tui-shell', terminalOriginCategory: 'elanous',
+    });
+    upsertPtyManifest({ id: 'legacy-purpose', kind: 'shell', cmd: '/bin/zsh', startedAt: 2, now: 2 });
+    expect(getPtyManifest('legacy-purpose')?.purpose).toBeUndefined();
   });
 
   test('lastControlAt is absent until control is marked, then records only the control axis', () => {

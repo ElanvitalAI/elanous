@@ -26,7 +26,7 @@ describe('groundGoalAuthoringContext', () => {
     expect(text).toContain('/refs/openclaw');
     expect(text).toContain('supplemental pattern only');
     expect(result).toMatchObject({ memoryCount: 1, localSourceCount: 1, externalCount: 1, externalStatus: 'used' });
-    expect(result.localReferenceAttempts).toHaveLength(10);
+    expect(result.localReferenceAttempts).toHaveLength(9);
   });
 
   test('records local ref candidates and fails soft for candidate names that are absent', async () => {
@@ -40,8 +40,12 @@ describe('groundGoalAuthoringContext', () => {
         referenceRoots: [root],
       });
       expect(result.localReferenceAttempts.filter((attempt) => attempt.present).map((attempt) => attempt.candidate))
-        .toEqual(['openclaw', 'codex', 'hermes-agent', 'claude-code-fork', 'grok-cli']);
+        .toEqual(['openclaw', 'codex', 'hermes-agent', 'grok-cli']);
       expect(result.localReferenceAttempts.find((attempt) => attempt.candidate === 'hermess')).toEqual({ candidate: 'hermess', present: false });
+      // 대표 10-14 — 비공개 소스 사본은 디렉터리가 있어도 후보·그라운딩 어느 쪽에도 안 나온다.
+      expect(result.localReferenceAttempts.map((attempt) => attempt.candidate)).not.toContain('claude-code-fork');
+      expect(result.documentLines.join('\n')).not.toContain(join(root, 'claude-code-fork'));
+      expect(result.documentLines.join('\n')).toContain(join(root, 'openclaw'));
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -305,7 +309,7 @@ describe('groundGoalAuthoringContext', () => {
         localSourceCount: 1,
         repositorySourceCount: 0,
         genericSearchScope: false,
-        localReferenceAttempted: 10,
+        localReferenceAttempted: 9,
         localReferencePresent: [],
         selectedSources: ['surface-events/self-awareness', 'repo/local-canonical', 'omni'],
         externalCount: 1,

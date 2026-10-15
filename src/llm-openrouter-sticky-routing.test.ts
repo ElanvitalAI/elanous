@@ -96,6 +96,7 @@ test('invariant: no key → OpenRouter body/headers unchanged; other providers n
 
 test('tool loop: streamLLMWithTools carries the same sessionId into every OpenRouter turn', async () => {
   const bodies: Record<string, any>[] = [];
+  const resolved: string[] = [];
   let call = 0;
   const mock = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
     bodies.push(JSON.parse(String(init?.body)));
@@ -107,10 +108,14 @@ test('tool loop: streamLLMWithTools carries the same sessionId into every OpenRo
   }) as typeof fetch);
   try {
     const provider = getProviderForConfig({ llm: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3', apiKey: 'k' } } as UserConfig);
-    await streamLLMWithTools([{ role: 'user', content: 'go' }], { onText() {}, dispatchTool: async () => 'ok' }, { provider, tools, maxTurns: 3, sessionId: 'sess-loop' });
+    await streamLLMWithTools([{ role: 'user', content: 'go' }], { onText() {}, dispatchTool: async () => 'ok' }, {
+      provider, tools, maxTurns: 3, sessionId: 'sess-loop',
+      onResolvedProvider: (actualProvider, actualModel) => resolved.push(`${actualProvider}/${actualModel}`),
+    });
   } finally {
     mock.mockRestore();
   }
   expect(bodies.length).toBeGreaterThanOrEqual(2);
   for (const b of bodies) expect(b.session_id).toBe('sess-loop');
+  expect(resolved).toContain('openrouter/openrouter/z-ai/glm-5.3');
 });

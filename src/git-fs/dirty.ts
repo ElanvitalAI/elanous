@@ -5,10 +5,11 @@
 // kernel has to stat every tracked file vs its index entry.
 //
 // Throttle is enforced by the caller (the index.ts cache). This
-// module just does one probe, synchronously (spawnSync), and is
-// intentionally side-effect free.
+// module just does one probe and is intentionally side-effect free.
+// The sync probes serve one-shot callers; the TUI's periodic refresh
+// uses the async twins so `git status` never blocks its event loop.
 
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import type { DirtyCount, AheadBehind } from './types.js';
 import { CLEAN_DIRTY } from './types.js';
 
@@ -24,6 +25,23 @@ export function probeDirty(cwd: string, timeoutMs = 5_000): DirtyCount {
   });
   if (res.status !== 0 || res.error) return CLEAN_DIRTY;
   return parsePorcelain(res.stdout);
+}
+
+/** Run git without blocking the caller's event loop; null on failure. */
+function execGit(cwd: string, args: string[], timeoutMs: number, maxBuffer: number): Promise<string | null> {
+  return new Promise((resolveOut) => {
+    try {
+      execFile('git', args, { cwd, encoding: 'utf8', timeout: timeoutMs, maxBuffer }, (error, stdout) => {
+        resolveOut(error ? null : String(stdout ?? ''));
+      });
+    } catch { resolveOut(null); }
+  });
+}
+
+/** Async twin of `probeDirty`. */
+export async function probeDirtyAsync(cwd: string, timeoutMs = 5_000): Promise<DirtyCount> {
+  const out = await execGit(cwd, ['status', '--porcelain'], timeoutMs, 2 * 1024 * 1024);
+  return out === null ? CLEAN_DIRTY : parsePorcelain(out);
 }
 
 /** Parse porcelain v1 output. Format per line:
@@ -66,7 +84,17 @@ export function probeAheadBehind(cwd: string, timeoutMs = 5_000): AheadBehind | 
     { cwd, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 64 * 1024 },
   );
   if (res.status !== 0 || res.error) return null;
-  const parts = res.stdout.trim().split(/\s+/);
+  return parseAheadBehind(res.stdout);
+}
+
+/** Async twin of `probeAheadBehind`. */
+export async function probeAheadBehindAsync(cwd: string, timeoutMs = 5_000): Promise<AheadBehind | null> {
+  const out = await execGit(cwd, ['rev-list', '--left-right', '--count', '@{u}...HEAD'], timeoutMs, 64 * 1024);
+  return out === null ? null : parseAheadBehind(out);
+}
+
+function parseAheadBehind(out: string): AheadBehind | null {
+  const parts = out.trim().split(/\s+/);
   if (parts.length < 2) return null;
   const behind = Number.parseInt(parts[0]!, 10);
   const ahead = Number.parseInt(parts[1]!, 10);

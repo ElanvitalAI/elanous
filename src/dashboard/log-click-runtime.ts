@@ -39,7 +39,8 @@ export interface DashboardLogClickRuntimeDeps {
   pillRowGetter?: () => number | null;
   onPillClick?: () => void;
   /** When present, a click on a fold range toggles it (collapse only on
-   *  the expanded first line; otherwise `toggleAtLine` decides). Hosts
+   *  the expanded first/last line or the row that expanded it; otherwise
+   *  `toggleAtLine` decides). Hosts
    *  that omit it keep the legacy attachment/pill-only behavior. */
   foldStack?: FoldStack;
 }
@@ -96,11 +97,12 @@ export function createDashboardLogClickDeps(
       ? {
           tryFoldToggle: (absIdx: number): boolean => {
             const fold = deps.foldStack!;
-            // Collapse only from the first line of an expanded range.
+            // Collapse from the first/last line of an expanded range or
+            // the row whose click expanded it (#16 — same spot again folds).
             // Other lines of that range are rejected first so a body
             // click cannot fold the block under a reader. Folded
             // containment is left to toggleAtLine (false when none).
-            if (!fold.isExpandedFirstLine(absIdx)) {
+            if (!fold.isExpandedCollapseLine(absIdx)) {
               const targets = fold.snapshot();
               for (let i = targets.length - 1; i >= 0; i--) {
                 const t = targets[i]!;

@@ -522,9 +522,12 @@ describe('handleTerminalsList', () => {
     await new Promise((resolve) => setTimeout(resolve, 5));
     registerPreviewTerminalForWebTap(first, 'web-session-a', 'preview-renamed', previewTapHandle);
     registerPreviewTerminalForWebTap(second, 'web-session-b', 'preview-renamed', previewTapHandle);
+    // 둘째 등록 시각을 «재서» 그 뒤로 둔다 — 고정 +20ms 는 부하 중 setTimeout(5)·등록이
+    // 15ms 를 넘기면 둘째가 newer 위로 올라가 순서 단언이 깨졌다(0.2.29 gate pod-21 · 거의 매판).
+    const secondRegisteredAt = Math.max(...listAllPreviewTerminals().map((entry) => entry.firstRegisteredAt));
     const newerPty = spawnWith('newer', { cmd: 'newer-pty' });
     const olderPty = spawnWith('older', { cmd: 'older-pty' });
-    Object.assign(newerPty, { startedAt: firstRegisteredAt + 20 });
+    Object.assign(newerPty, { startedAt: secondRegisteredAt + 20 });
     Object.assign(olderPty, { startedAt: firstRegisteredAt - 20 });
     const deps = {
       ptyManifestTargets: () => [],

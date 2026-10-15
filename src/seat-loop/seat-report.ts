@@ -8,6 +8,7 @@ import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getUserConfig, type SeatLoopConfig } from '../user-config.js';
 import { collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type DraftMetrics, type OverlapMetrics } from '../self-dev/draft-sweep.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
+import { loadRunLedger } from '../self-implement/run-ledger.js';
 import { readTaskAgentCover } from '../cli/tasks-cli.js';
 import { formatTaskAgentCover } from '../task-agent/cover.js';
 import type { TasksCliDeps } from '../cli/tasks-cli.js';
@@ -27,6 +28,10 @@ export type SeatReportDeps = {
   /** DRAFT-NOT-ARCHIVE salvage branches since the KST day start; null = unreadable. */
   salvagedToday?: (dayStart: Date, now: Date) => Promise<number | null>;
   runningRuns?: (runIds: readonly string[]) => { running: number; unknown: number } | null;
+  /** Launched-run 착지 집계; null 이나 예외는 «착지 못 잼»으로 나온다. */
+  landedRuns?: (runIds: readonly string[]) => { landed: number; unread: number } | null;
+  /** 기본 집계의 runId별 읽기 경로를 시험할 때만 교체한다. */
+  loadLedger?: typeof loadRunLedger;
 };
 export type SeatReportResult = { seat: string; date: string; body: string; posted: boolean };
 const repoRoot = resolve(import.meta.dir, '../..');
@@ -173,10 +178,45 @@ export async function seatReport(seat: string, deps: SeatReportDeps = {}): Promi
         : ` · 도는 런 ${counts.running}(불확실 ${counts.unknown})`;
     } catch { runningDetail = ' · 도는 런 못 잼'; }
   }
-  const body = `**[${seat}]** {{TS}} → 보고 ${date}: ${detail.join(' · ') || (classified.length ? 'OP 그림자 판단' : '원장 기록 없음')}${opDetail}${draftDetail}${runningDetail}`;
+  // ⭐ 사다리 ① (#25210 «도는 런» 옆): 발사된 runId 각각의 run 원장을 읽어 착지 수를 센다.
+  //   'merged' 사건이 있으면 착지 · 원장이 null(로컬에 없음 — Pod 런 등)이면 «원장 없음»으로 따로 센다.
+  let landedDetail = '';
+  let landed: number | null = 0;
+  let landedUnread: number | null = 0;
+  if (runIds.length) {
+    try {
+      const counts = (deps.landedRuns ?? ((ids: readonly string[]) => {
+        let landedCount = 0;
+        let unreadCount = 0;
+        let unreadable = false;
+        for (const runId of ids) {
+          try {
+            const ledger = (deps.loadLedger ?? loadRunLedger)(runId);
+            if (ledger === null) unreadCount += 1;
+            else if (ledger.some((entry) => entry.event === 'merged')) landedCount += 1;
+          } catch { unreadable = true; }
+        }
+        return unreadable ? null : { landed: landedCount, unread: unreadCount };
+      }))(runIds);
+      if (counts === null) {
+        landed = null;
+        landedUnread = null;
+        landedDetail = ' · 착지 못 잼';
+      } else {
+        landed = counts.landed;
+        landedUnread = counts.unread;
+        landedDetail = ` · 착지 ${counts.landed}(원장 없음 ${counts.unread})`;
+      }
+    } catch {
+      landed = null;
+      landedUnread = null;
+      landedDetail = ' · 착지 못 잼';
+    }
+  }
+  const body = `**[${seat}]** {{TS}} → 보고 ${date}: ${detail.join(' · ') || (classified.length ? 'OP 그림자 판단' : '원장 기록 없음')}${opDetail}${draftDetail}${runningDetail}${landedDetail}`;
   const pr = (deps.config ?? getUserConfig().loops?.seat)?.reportPr;
   const posted = deps.post === true && pr !== undefined;
   if (posted) await (deps.send ?? ((text, id, number) => defaultSend(text, id, number, deps.repo ?? repoRoot)))(body, seat, pr);
-  try { debug.log('seat.loop', 'reported', { seat, date, entries: entries.length, posted }); } catch { /* observation is fail-soft */ }
+  try { debug.log('seat.loop', 'reported', { seat, date, entries: entries.length, posted, landed, landedUnread }); } catch { /* observation is fail-soft */ }
   return { seat, date, body, posted };
 }

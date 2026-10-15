@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'bun:test';
+import { bootDashboardAcpSession } from '../src/dashboard/acp-boot.js';
+import { runDashboardAutoCompact } from '../src/dashboard/auto-compact-runtime.js';
+import { runCompactPipeline } from '../src/compact/pipeline.js';
 import {
   runDashboardChatMainPlainTurn,
   type DashboardChatMainPlainTurnRuntimeDeps,
@@ -8,6 +11,11 @@ import type { ThinkingHandle } from '../src/thinking-line.js';
 import { promptForPhase } from '../src/impl-discipline/index.js';
 import { buildDashboardTurnPreamble } from '../src/dashboard/turn-preamble.js';
 import { getUserConfig } from '../src/user-config.js';
+import { setUserConfigOverlay } from '../src/user-config.js';
+import { saveTokens } from '../src/oauth/store.js';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 function makeThinking(): ThinkingHandle {
   return {
@@ -75,6 +83,7 @@ function buildDeps(overrides: Partial<DashboardChatMainPlainTurnRuntimeDeps> = {
       return ['preamble'];
     },
     runAutoCompact: async () => { calls.push('run-auto-compact'); },
+    readToolDispatchCount: () => 0,
     attachChatStreamingKeys: (_abortCtrl) => {
       calls.push('attach-streaming-keys');
       return () => { calls.push('cleanup-streaming-keys'); };
@@ -389,6 +398,10 @@ describe('runDashboardChatMainPlainTurn', () => {
     expect(ctx.errorLines).toEqual(['stream exploded']);
     expect(ctx.finalizeCalls).toEqual([{ status: 'failed', error: 'stream exploded' }]);
     expect(ctx.calls).toContain('finalize-turn:failed');
+    const failed = ctx.debugEvents.find((event) => event.event === 'turn-failed');
+    expect(failed?.category).toBe('chat-main.plain-turn');
+    expect(failed?.payload).toMatchObject({ stage: expect.any(String), message: 'stream exploded' });
+    expect(typeof failed?.payload.stackHead === 'string' || failed?.payload.stackHead === undefined).toBe(true);
   });
 
   it('uses JSON-RPC internal-error details for the failed-turn summary and error line', async () => {
@@ -404,6 +417,31 @@ describe('runDashboardChatMainPlainTurn', () => {
 
     expect(ctx.errorLines).toEqual([detail]);
     expect(ctx.finalizeCalls).toEqual([{ status: 'failed', error: detail }]);
+  });
+
+  it('replaces a matched failure signature with a Korean notice and stages the raw error for /detail', async () => {
+    const detail = 'Codex API 400: {"detail":"Bad Request"}';
+    const notices: Array<{ notice: string; raw: string }> = [];
+    const ctx = buildDeps({
+      acpSession: { send: async () => { throw new Error(detail); } },
+      pushFailureNotice: (notice, raw) => { notices.push({ notice, raw }); },
+    });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+
+    expect(ctx.errorLines).toEqual([]);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.raw).toBe(detail);
+    expect(notices[0]!.notice).toMatch(/^⚠ .+ → \/session new .+ · 원문 \/detail open$/);
+    expect(notices[0]!.notice).not.toMatch(/[A-Za-z]+(?:\s+[A-Za-z]+){3,}/);
+    expect(ctx.finalizeCalls[0]!.error).not.toContain('Codex API');
+  });
+
+  it('keeps the raw error line when no failure-notice sink is wired', async () => {
+    const detail = 'Codex API 400: {"detail":"Bad Request"}';
+    const ctx = buildDeps({ acpSession: { send: async () => { throw new Error(detail); } } });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+
+    expect(ctx.errorLines).toEqual([detail]);
   });
 
   it('truncates the first line of a selected error detail in the failed-turn summary', async () => {
@@ -648,5 +686,443 @@ describe('runDashboardChatMainPlainTurn', () => {
     expect(attached).toBeDefined();
     expect(attached!.payload.userTextBytes).toBe(11);
     expect(attached!.payload.turnStartedAtIso).toBeUndefined();
+  });
+
+  it('repairs an orphan result once after pre-pass and generic Codex 400', async () => {
+    let sends = 0;
+    const ctx = buildDeps({
+      buildTurnMessage: () => ({ userMsg: { role: 'user', content: 'hello world' } }),
+      runAutoCompact: async ({ chatHistory, onPrePassApplied }) => {
+        chatHistory[0] = { ...(chatHistory[0] as object) };
+        onPrePassApplied();
+      },
+      acpSession: { send: async () => {
+        sends++;
+        if (sends === 1) throw new Error('Codex API 400: {"detail":"Bad Request"}');
+      } },
+    });
+    ctx.chatHistory.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'orphan', content: 'old' }] });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(sends).toBe(2);
+    expect(ctx.chatHistory.some(message => JSON.stringify(message).includes('orphan'))).toBe(false);
+    expect(ctx.debugEvents.some(event => event.event === 'pair-check' && event.payload.removedResults === 1)).toBe(true);
+    expect(ctx.finalizeCalls[0]?.status).toBe('completed');
+  });
+
+  it('does not replace a message appended after pair inspection and before repair', async () => {
+    let sends = 0;
+    const lateMessage = { role: 'user', content: 'arrived after pair check' };
+    const ctx = buildDeps({
+      debugLog: (_category, event) => {
+        if (event === 'pair-check') queueMicrotask(() => ctx.chatHistory.push(lateMessage));
+      },
+      runAutoCompact: async ({ chatHistory, onPrePassApplied }) => {
+        chatHistory[0] = { ...(chatHistory[0] as object) };
+        onPrePassApplied();
+      },
+      acpSession: { send: async () => {
+        sends++;
+        throw new Error('Codex API 400: {"detail":"Bad Request"}');
+      } },
+    });
+    ctx.chatHistory.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'orphan', content: 'old' }] });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(sends).toBe(1);
+    expect(ctx.chatHistory.some(message => JSON.stringify(message).includes('orphan'))).toBe(true);
+    expect(ctx.chatHistory).toContain(lateMessage);
+    expect(ctx.chatLines.some(line => line.includes('/session new'))).toBe(true);
+  });
+
+  it('checks pairs and gives recovery guidance for a generic 400 body variant', async () => {
+    let sends = 0;
+    const ctx = buildDeps({
+      runAutoCompact: async ({ chatHistory, onPrePassApplied }) => {
+        chatHistory[0] = { ...(chatHistory[0] as object) };
+        onPrePassApplied();
+      },
+      acpSession: { send: async () => {
+        sends++;
+        throw new Error('Codex API 400: { "detail": "Bad Request" }');
+      } },
+    });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(sends).toBe(1);
+    expect(ctx.debugEvents.some(event => event.event === 'pair-check')).toBe(true);
+    expect(ctx.chatLines.some(line => line.includes('/session new'))).toBe(true);
+  });
+
+  it('caps retry at two sends and stops Thinking when repaired history still returns 400', async () => {
+    let sends = 0;
+    const stopped: string[] = [];
+    const ctx = buildDeps({
+      thinking: { ...makeThinking(), stop: opts => { stopped.push(opts?.status ?? 'completed'); } },
+      buildTurnMessage: () => ({ userMsg: { role: 'user', content: 'continue' } }),
+      runAutoCompact: async ({ chatHistory, onPrePassApplied }) => {
+        chatHistory[0] = { ...(chatHistory[0] as object) };
+        onPrePassApplied();
+      },
+      acpSession: { send: async () => {
+        sends++;
+        if (sends === 2) ctx.chatHistory.push({ role: 'user', content: 'followup during retry' });
+        throw new Error('Codex API 400: {"detail":"Bad Request"}');
+      } },
+    });
+    ctx.chatHistory.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'orphan', content: 'old' }] });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(sends).toBe(2);
+    expect(stopped).toEqual(['failed']);
+    expect(ctx.finalizeCalls[0]?.status).toBe('failed');
+    expect(ctx.chatLines.some(line => line.includes('/session new'))).toBe(true);
+    expect(ctx.chatHistory.some(message => JSON.stringify(message).includes('orphan'))).toBe(true);
+    expect(ctx.chatHistory.at(-1)).toEqual({ role: 'user', content: 'followup during retry' });
+    expect(ctx.debugEvents.some(event => event.event === 'history-restored'
+      && event.payload.preservedTail === 1)).toBe(true);
+  });
+
+  it('shows manual recovery if pair repair retry fails with a different error', async () => {
+    let sends = 0;
+    const ctx = buildDeps({
+      buildTurnMessage: () => ({ userMsg: { role: 'user', content: 'continue' } }),
+      runAutoCompact: async ({ chatHistory, onPrePassApplied }) => {
+        chatHistory[0] = { ...(chatHistory[0] as object) };
+        onPrePassApplied();
+      },
+      acpSession: { send: async () => {
+        sends++;
+        throw new Error(sends === 1
+          ? 'Codex API 400: {"detail":"Bad Request"}' : 'transport disconnected');
+      } },
+    });
+    ctx.chatHistory.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'orphan', content: 'old' }] });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(sends).toBe(2);
+    expect(ctx.chatLines.some(line => line.includes('/session new'))).toBe(true);
+    expect(ctx.chatHistory.some(message => JSON.stringify(message).includes('orphan'))).toBe(true);
+    expect(ctx.debugEvents.some(event => event.event === 'history-restored')).toBe(true);
+  });
+
+  it('does not overwrite a repaired prefix changed in place during the retry', async () => {
+    let sends = 0;
+    const ctx = buildDeps({
+      runAutoCompact: async ({ chatHistory, onPrePassApplied }) => {
+        chatHistory[0] = { ...(chatHistory[0] as object) };
+        onPrePassApplied();
+      },
+      acpSession: { send: async () => {
+        sends++;
+        if (sends === 2) {
+          (ctx.chatHistory[0] as { content: unknown }).content = 'changed during retry';
+          throw new Error('transport disconnected');
+        }
+        throw new Error('Codex API 400: {"detail":"Bad Request"}');
+      } },
+    });
+    ctx.chatHistory.push(
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'paired', name: 'Read', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'paired', content: 'kept' }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'orphan', content: 'old' }] },
+    );
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(sends).toBe(2);
+    expect((ctx.chatHistory[0] as { content: unknown }).content).toBe('changed during retry');
+    expect(ctx.debugEvents.some(event => event.event === 'history-restore-skipped')).toBe(true);
+    expect(ctx.chatLines.some(line => line.includes('/session new'))).toBe(true);
+  });
+
+  it('does not retry after even an empty ACP text event', async () => {
+    let sends = 0;
+    const ctx = buildDeps({
+      runAutoCompact: async ({ chatHistory, onPrePassApplied }) => {
+        chatHistory[0] = { ...(chatHistory[0] as object) };
+        onPrePassApplied();
+      },
+      acpSession: { send: async ({ onText }) => {
+        sends++;
+        onText('');
+        throw new Error('Codex API 400: {"detail":"Bad Request"}');
+      } },
+    });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(sends).toBe(1);
+  });
+
+  it('sends repaired pairs through the real local ACP path on the second Codex request', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'compact-prepass-wire-'));
+    const envKeys = ['HOME', 'XDG_CONFIG_HOME', 'CODEX_HOME', 'ELANOUS_STATE_DIR',
+      'ELANOUS_CODEX_ACCOUNT', 'ELANOUS_CODEX_ACCOUNT_HOME'] as const;
+    const savedEnv = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
+    const originalFetch = globalThis.fetch;
+    const bodies: Array<{ input: Array<Record<string, unknown>> }> = [];
+    let boot: Awaited<ReturnType<typeof bootDashboardAcpSession>> | undefined;
+    try {
+    for (const key of envKeys) delete process.env[key];
+    process.env.HOME = root;
+    process.env.XDG_CONFIG_HOME = root;
+    process.env.CODEX_HOME = join(root, 'codex-home');
+    process.env.ELANOUS_STATE_DIR = root;
+    mkdirSync(process.env.CODEX_HOME, { recursive: true });
+    saveTokens('openai-codex', {
+      accessToken: 'isolated-test-token', refreshToken: 'isolated-test-refresh',
+      expiresAt: Date.now() + 3_600_000,
+    }, { authMode: 'chatgpt', mirrorCodex: false });
+    setUserConfigOverlay(config => ({ ...config,
+      llm: { ...config.llm, provider: 'openai-codex', model: 'gpt-6-sol',
+        baseUrl: 'https://test.invalid/backend-api/codex', codexStore: false },
+    }));
+    globalThis.fetch = (async (_url, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as { input: Array<Record<string, unknown>> });
+      if (bodies.length <= 2) return new Response('{"detail":"Bad Request"}', {
+        status: 400, headers: { 'Content-Type': 'application/json' },
+      });
+      return new Response('data: {"type":"response.output_text.delta","delta":"recovered"}\n\ndata: [DONE]\n\n', {
+        status: 200, headers: { 'Content-Type': 'text/event-stream' },
+      });
+    }) as typeof fetch;
+    let prePassApplied = 0;
+    const ctx = buildDeps({
+      buildTurnMessage: () => ({ userMsg: { role: 'user', content: 'continue' } }),
+      runAutoCompact: async ({ preamble, chatHistory, userMsg, onPrePassApplied }) =>
+        runDashboardAutoCompact({
+          preamble: preamble as any, chatHistory: chatHistory as any, userMsg: userMsg as any,
+          model: 'gpt-6-sol', autoCompactConfig: {} as any,
+          shouldAutoCompact: () => ({ fire: false, partial: false, preserveLastN: 4,
+            reason: 'under-threshold', ratio: 0.1, usedTokens: 100, maxTokens: 1000 }),
+          compactConversation: async () => ({ summary: '' }),
+          compactConversationPartial: async () => ({ summary: '' }),
+          renderCompactBoundary: () => '', pushChatLine: () => {}, pushDebugLine: () => {},
+          muted: text => text, debugLog: () => {},
+          onPrePassApplied: () => { prePassApplied++; onPrePassApplied(); },
+          runCompactPipeline: (messages, opts) => runCompactPipeline(messages, {
+            sessionId: opts.sessionId,
+            policy: { archiveEnabled: false, toolOutputCharBudget: 1000,
+              microcompactAgeThreshold: 5, preserveLastN: 4 },
+          }),
+        }),
+    });
+    for (let i = 0; i < 65; i++) {
+      const id = `call_${i}`;
+      ctx.chatHistory.push(
+        { role: 'user', content: `request ${i}` },
+        { role: 'assistant', content: [{ type: 'tool_use', id, name: 'Read', input: { path: `file-${i}` } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: id,
+          content: `result ${i}\n${'x'.repeat(4000)}` }] },
+      );
+    }
+    ctx.chatHistory.push(
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'paired', name: 'Read', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'paired', content: 'kept' }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'orphan', content: 'drop' }] },
+    );
+    boot = await bootDashboardAcpSession({
+      getCwd: () => '/tmp', getChatHistory: () => ctx.chatHistory as any,
+      getPreamble: () => [],
+      getTools: () => [{ name: 'echo', description: 'test', parameters: { type: 'object', properties: {} } }],
+      getActiveModel: () => 'gpt-6-sol', dispatchTool: async () => null,
+      pushTurnToolHistory: () => {},
+    });
+      ctx.deps.acpSession = boot.session as any;
+      ctx.deps.readToolDispatchCount = () => 0;
+      await runDashboardChatMainPlainTurn(ctx.deps);
+      expect(prePassApplied).toBe(1);
+      expect(bodies).toHaveLength(3);
+      const first = bodies[0]!.input;
+      expect(bodies[1]!.input).toEqual(first); // provider's own HTTP retry precedes the TUI repair
+      const second = bodies[2]!.input;
+      expect(JSON.stringify(first)).toContain('orphan');
+      expect(JSON.stringify(second)).not.toContain('orphan');
+      const callIndex = second.findIndex(item => 'type' in item
+        && item.type === 'function_call' && item.call_id === 'paired');
+      const resultIndex = second.findIndex(item => 'type' in item
+        && item.type === 'function_call_output' && item.call_id === 'paired');
+      expect(callIndex).toBeGreaterThanOrEqual(0);
+      expect(resultIndex).toBeGreaterThan(callIndex);
+      expect(ctx.finalizeCalls[0]?.status).toBe('completed');
+    } finally {
+      try { await boot?.session.close(); } catch { /* preserve global test isolation */ }
+      globalThis.fetch = originalFetch;
+      setUserConfigOverlay(null);
+      for (const key of envKeys) {
+        const value = savedEnv[key];
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not retry ambiguous duplicate call IDs after pre-pass 400', async () => {
+    let sends = 0;
+    const stopped: string[] = [];
+    const ctx = buildDeps({
+      thinking: { ...makeThinking(), stop: opts => { stopped.push(opts?.status ?? 'completed'); } },
+      runAutoCompact: async ({ chatHistory, onPrePassApplied }) => {
+        chatHistory[0] = { ...(chatHistory[0] as object) };
+        onPrePassApplied();
+      },
+      acpSession: { send: async () => {
+        sends++;
+        throw new Error('Codex API 400: {"detail":"Bad Request"}');
+      } },
+    });
+    ctx.chatHistory.push(
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'same', name: 'Read', input: {} }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'same', name: 'Write', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'same', content: 'result' }] },
+    );
+    const before = JSON.stringify(ctx.chatHistory);
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(sends).toBe(1);
+    expect(JSON.stringify(ctx.chatHistory)).toContain(before.slice(1, -1));
+    expect(ctx.debugEvents.some(event => event.event === 'pair-check'
+      && event.payload.ambiguousCount === 1)).toBe(true);
+    expect(ctx.debugEvents.some(event => event.event === 'manual-recovery-required'
+      && event.payload.reason === 'ambiguous-tool-pairing')).toBe(true);
+    expect(stopped).toEqual(['failed']);
+    expect(ctx.chatLines.some(line => line.includes('/session new'))).toBe(true);
+  });
+
+  it('shows manual recovery and stops Thinking when no safe pair repair exists', async () => {
+    const stopped: string[] = [];
+    let sends = 0;
+    const ctx = buildDeps({
+      thinking: { ...makeThinking(), stop: opts => { stopped.push(opts?.status ?? 'completed'); } },
+      runAutoCompact: async ({ chatHistory, onPrePassApplied }) => {
+        chatHistory[0] = { ...(chatHistory[0] as object) };
+        onPrePassApplied();
+      },
+      acpSession: { send: async () => {
+        sends++;
+        throw new Error('Codex API 400: {"detail":"Bad Request"}');
+      } },
+    });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(sends).toBe(1);
+    expect(stopped).toEqual(['failed']);
+    expect(ctx.chatLines.some(line => line.includes('/session new'))).toBe(true);
+    expect(ctx.debugEvents.some(event => event.event === 'manual-recovery-required')).toBe(true);
+  });
+
+  it('does not retry when the server dispatched a tool before the ACP event reached the client', async () => {
+    let dispatchCount = 0;
+    let sends = 0;
+    const ctx = buildDeps({
+      buildTurnMessage: () => ({ userMsg: { role: 'user', content: 'continue' } }),
+      runAutoCompact: async ({ chatHistory, onPrePassApplied }) => {
+        chatHistory[0] = { ...(chatHistory[0] as object) };
+        onPrePassApplied();
+      },
+      readToolDispatchCount: () => dispatchCount,
+      acpSession: { send: async () => {
+        sends++;
+        dispatchCount++;
+        throw new Error('Codex API 400: {"detail":"Bad Request"}');
+      } },
+    });
+    ctx.chatHistory.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'orphan', content: 'old' }] });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(sends).toBe(1);
+    expect(ctx.chatLines.some(line => line.includes('/session new'))).toBe(true);
+    expect(ctx.debugEvents.some(event => event.event === 'pair-check'
+      && event.payload.removedResults === 1 && event.payload.readOnly === true)).toBe(true);
+    expect(ctx.chatHistory.some(message => JSON.stringify(message).includes('orphan'))).toBe(true);
+  });
+
+  it('rechecks server dispatch after pair inspection before changing history', async () => {
+    let dispatchCount = 0;
+    let sends = 0;
+    const ctx = buildDeps({
+      debugLog: (_category, event) => {
+        if (event === 'pair-check') queueMicrotask(() => { dispatchCount++; });
+      },
+      runAutoCompact: async ({ chatHistory, onPrePassApplied }) => {
+        chatHistory[0] = { ...(chatHistory[0] as object) };
+        onPrePassApplied();
+      },
+      readToolDispatchCount: () => dispatchCount,
+      acpSession: { send: async () => {
+        sends++;
+        throw new Error('Codex API 400: {"detail":"Bad Request"}');
+      } },
+    });
+    ctx.chatHistory.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'orphan', content: 'old' }] });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(sends).toBe(1);
+    expect(ctx.chatHistory.some(message => JSON.stringify(message).includes('orphan'))).toBe(true);
+    expect(ctx.chatLines.some(line => line.includes('/session new'))).toBe(true);
+  });
+
+  it('rechecks dispatch observability immediately before repair resend', async () => {
+    let reads = 0;
+    let sends = 0;
+    const ctx = buildDeps({
+      runAutoCompact: async ({ chatHistory, onPrePassApplied }) => {
+        chatHistory[0] = { ...(chatHistory[0] as object) };
+        onPrePassApplied();
+      },
+      readToolDispatchCount: () => ++reads >= 3 ? null : 0,
+      acpSession: { send: async () => {
+        sends++;
+        throw new Error('Codex API 400: {"detail":"Bad Request"}');
+      } },
+    });
+    ctx.chatHistory.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'orphan', content: 'old' }] });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(sends).toBe(1);
+    expect(reads).toBe(3);
+    expect(ctx.chatHistory.some(message => JSON.stringify(message).includes('orphan'))).toBe(true);
+  });
+
+  it('does not retry when a delayed ACP stream event arrives after the first 400', async () => {
+    let sends = 0;
+    let delayedText: ((chunk: string) => void) | undefined;
+    const ctx = buildDeps({
+      debugLog: (_category, event) => {
+        if (event === 'pair-check') queueMicrotask(() => delayedText?.(''));
+      },
+      runAutoCompact: async ({ chatHistory, onPrePassApplied }) => {
+        chatHistory[0] = { ...(chatHistory[0] as object) };
+        onPrePassApplied();
+      },
+      acpSession: { send: async ({ onText }) => {
+        sends++;
+        delayedText = onText;
+        throw new Error('Codex API 400: {"detail":"Bad Request"}');
+      } },
+    });
+    ctx.chatHistory.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'orphan', content: 'old' }] });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(sends).toBe(1);
+    expect(ctx.chatHistory.some(message => JSON.stringify(message).includes('orphan'))).toBe(true);
+    expect(ctx.chatLines.some(line => line.includes('/session new'))).toBe(true);
+  });
+
+  it('does not retry when server dispatch count is unavailable', async () => {
+    let sends = 0;
+    const ctx = buildDeps({
+      runAutoCompact: async ({ chatHistory, onPrePassApplied }) => {
+        chatHistory[0] = { ...(chatHistory[0] as object) };
+        onPrePassApplied();
+      },
+      readToolDispatchCount: () => null,
+      acpSession: { send: async () => {
+        sends++;
+        throw new Error('Codex API 400: {"detail":"Bad Request"}');
+      } },
+    });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(sends).toBe(1);
+  });
+
+  it('does not enter pre-pass recovery after ordinary auto-compact alone', async () => {
+    let sends = 0;
+    const ctx = buildDeps({
+      runAutoCompact: async ({ chatHistory }) => { chatHistory[0] = { role: 'assistant', content: 'normal summary' }; },
+      acpSession: { send: async () => {
+        sends++;
+        throw new Error('Codex API 400: {"detail":"Bad Request"}');
+      } },
+    });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(sends).toBe(1);
+    expect(ctx.chatLines.some(line => line.includes('/session new'))).toBe(false);
   });
 });

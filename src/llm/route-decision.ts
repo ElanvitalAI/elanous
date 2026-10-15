@@ -46,6 +46,31 @@ export function currentRouteDecision(surface: string): RouteDecision | null {
   return lastBySurface.get(surface) ?? null;
 }
 
+/** A `/model` choice scoped to this process's surface (TUI-MODEL-SESSION-SCOPE · 10-14).
+ * It reaches the turn as `explicitModel`, so it wins over the Codex tier policy —
+ * a config-only `llm.model` change is ignored by that policy (10-14 OPT: `/model luna`
+ * wrote config, every turn still ran sol). Not persisted; `/model … --global` writes config. */
+export interface SessionModelPin {
+  provider: LLMProviderName;
+  model: string;
+}
+
+const pinBySurface = new Map<string, SessionModelPin>();
+
+export function setSessionModelPin(surface: string, pin: SessionModelPin | null): void {
+  if (pin) pinBySurface.set(surface, pin);
+  else pinBySurface.delete(surface);
+}
+
+/** The surface's pinned model, or null when none — or when the active provider
+ * has since changed (a pin only makes sense on the provider it was chosen for). */
+export function sessionModelPin(surface: string, activeProvider?: LLMProviderName): SessionModelPin | null {
+  const pin = pinBySurface.get(surface);
+  if (!pin) return null;
+  if (activeProvider !== undefined && pin.provider !== activeProvider) return null;
+  return pin;
+}
+
 export interface ResolveRouteDecisionInput {
   provider: LLMProviderName;
   configuredModel?: string;

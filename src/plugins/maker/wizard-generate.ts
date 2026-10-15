@@ -63,8 +63,9 @@ export function generateWizardFiles(dir: string, slug: string, draft: WizardRese
   }
   const skillPath = join(dir, `skills/${slug}/SKILL.md`);
   const readmePath = join(dir, 'README.md');
-  const wizardReadme = options.regenerate && existsSync(readmePath) &&
-    readFileSync(readmePath, 'utf8').includes('Research draft only. Connector declarations contain credential names, not values.');
+  const readmeNotice = 'Research draft only. Connector declarations contain credential names, not values. The graph cannot perform the requested processing yet: implement and validate its steps, then remove extensions["ai.elanous"].researchDraft from plugin.json before installing or running it. No messages are sent.';
+  const wizardReadme = options.regenerate && existing && existsSync(readmePath) &&
+    readFileSync(readmePath, 'utf8') === `# ${slug}\n\n${existing.description}\n\n${readmeNotice}\n`;
   if (options.regenerate) {
     if (!existing || existing.extensions['ai.elanous'].researchDraft !== true || !existsSync(skillPath)) {
       throw new Error('wizard regeneration requires an existing research draft');
@@ -80,7 +81,8 @@ export function generateWizardFiles(dir: string, slug: string, draft: WizardRese
     requires: undefined as { knowledgePacks?: string[]; [key: string]: unknown } | undefined,
     extensions: { 'ai.elanous': { graphs: [`./graphs/${slug}.yaml`],
       capabilities: ['fs:workdir', 'proc:bun', 'proc:elanous'], connectors: [] as unknown[], researchDraft: true } } };
-  if (options.regenerate) manifest.description = draft.description;
+  // A maker scaffold may have no description or an earlier description; the research draft owns this field.
+  manifest.description = draft.description;
   if (draft.requires?.knowledgePacks !== undefined) {
     manifest.requires = { ...manifest.requires, knowledgePacks: [...new Set(draft.requires.knowledgePacks)] };
   }
@@ -108,7 +110,7 @@ console.log(JSON.stringify({ outcome: 'fail', error: step === 'prepare' || step 
 process.exitCode = 1;
 `],
     ['examples/input.json', '{}\n'],
-    ['README.md', `# ${slug}\n\n${draft.description}\n\nResearch draft only. Connector declarations contain credential names, not values. The graph cannot perform the requested processing yet: implement and validate its steps, then remove extensions["ai.elanous"].researchDraft from plugin.json before installing or running it. No messages are sent.\n`],
+    ['README.md', `# ${slug}\n\n${draft.description}\n\n${readmeNotice}\n`],
     [`skills/${slug}/SKILL.md`, `---\n${stringifyYaml({ name: slug, description: draft.skill?.description ?? draft.description, requires: [...new Set(requires)] })}---\n\n${draft.skill?.instructions ?? draft.description}\n`],
   ];
   const generated = existing ? files.filter(([path]) => path === 'plugin.json' || path.startsWith('skills/') ||

@@ -12,6 +12,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { AutopilotAutonomyLog } from './AutopilotAutonomyLog';
 import { AutopilotMissions } from './AutopilotMissions';
+import { AutopilotDecisionQueue } from './AutopilotDecisionQueue';
 import { FabricStageHeader } from '@/components/shell/FabricStageHeader';
 import { AutopilotApi, type ArmingStatus } from '@/lib/autopilot-api';
 
@@ -63,6 +64,7 @@ export function AutopilotPanel() {
         <p className="text-sm text-muted-foreground">미션(사람 + 자율)의 계보·상태·자율행동. 아래 &ldquo;골 던지기&rdquo; 또는 텔레그램 &ldquo;미션:&rdquo; 마커로 소망을 던지면 미션이 됩니다.</p>
         <ArmingBanner arming={arming} />
       </div>
+      <AutopilotDecisionQueue client={client} />
       <div className="flex gap-1 border-b border-border">
         {TABS.map((t) => (
           <button

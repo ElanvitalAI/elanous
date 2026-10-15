@@ -115,33 +115,42 @@ describe('PreviewTerminal', () => {
 
   // 위 시험은 «에뮬레이터» 격자만 본다 — 그래서 Bun 에서 node-pty `resize` 가 EBADF 로 삼켜져 커널 PTY 가
   // 80×24 에 머무는 것을 못 잡았다(2026-09-28 · 웹 터미널 셸이 80칸에서 접혔다). 여기선 «셸이 보는» 크기를 잰다.
+  // 실물 PTY «계약 시험»이라 가짜 spawn 으로 바꾸지 않는다 — 대신 시각이 아니라 «조건»으로 기다린다(0.2.29 gate:
+  // 부하 걸린 Pod 에서 `-l -i` 로그인 셸이 3초 안에 안 떠 «echo READY» 의 tty 메아리만 보고 넘어갔다 → 셸이 아직
+  // 안 읽은 줄에 SZ 가 영영 안 찍혔다). ⓐ 프로필을 안 읽는 셸 ⓑ 메아리가 아니라 «셸의 출력»을 기다린다
+  // (`RE""ADY` 는 메아리엔 따옴표째 보이고 출력에만 `READY` 로 붙는다) ⓒ 고정 sleep 0 · 상한은 넉넉히.
   test('resize reaches the kernel PTY — the shell sees the new size (stty size)', async () => {
     const session = new PreviewTerminal({
       cols: 80,
       rows: 10,
       cwd: process.cwd(),
       shell: '/bin/bash',
+      shellArgs: ['--noprofile', '--norc', '-i'],
       env: { ...process.env, PS1: '$ ', BASH_ENV: '', ENV: '' } as Record<string, string>,
     });
-    session.start();
-    // node-pty 의 fd 는 «뜬 직후»엔 아직 살아 있다 — 셸이 한 줄 낸 뒤(실사용과 같은 때)에 바꾼다.
-    session.write('echo READY\r');
-    for (const until = Date.now() + 2000; Date.now() < until && !session.render().includes('READY'); ) {
-      await new Promise(r => setTimeout(r, 50));
+    const waitForRender = async (pred: (s: string) => boolean, ms: number): Promise<string> => {
+      const until = Date.now() + ms;
+      let s = session.render();
+      while (!pred(s) && Date.now() < until) {
+        await new Promise(r => setTimeout(r, 50));
+        s = session.render();
+      }
+      return s;
+    };
+    try {
+      session.start();
+      // node-pty 의 fd 는 «뜬 직후»엔 아직 살아 있다 — 셸이 한 줄을 «실행한» 뒤(실사용과 같은 때)에 바꾼다.
+      session.write('echo RE""ADY\r');
+      const ready = await waitForRender(s => /^READY\s*$/m.test(s), 60_000);
+      expect(ready).toMatch(/^READY\s*$/m);
+      session.resize(117, 21);
+      session.write('echo SZ=$(stty size)\r');
+      const snapshot = await waitForRender(s => /SZ=\d+ \d+/.test(s), 60_000);
+      expect(snapshot).toContain('SZ=21 117');
+    } finally {
+      session.stop();
     }
-    await new Promise(r => setTimeout(r, 300));
-    session.resize(117, 21);
-    session.write('echo SZ=$(stty size)\r');
-    const deadline = Date.now() + 3000;
-    let snapshot = '';
-    while (Date.now() < deadline) {
-      snapshot = session.render();
-      if (/SZ=\d+ \d+/.test(snapshot)) break;
-      await new Promise(r => setTimeout(r, 50));
-    }
-    session.stop();
-    expect(snapshot).toContain('SZ=21 117');
-  }, 6000);
+  }, 130_000);
 
   test('stop is idempotent', () => {
     const session = new PreviewTerminal({
@@ -582,7 +591,7 @@ describe('PreviewTerminal', () => {
       if (ev.kind === 'resize') sizes.push({ cols: ev.cols, rows: ev.rows });
     });
     session.resize(40, 10);
-    await new Promise(r => setTimeout(r, 40));
+    await flushPreview(session);
     expect(sizes).toContainEqual({ cols: 40, rows: 10 });
     session.stop();
   });

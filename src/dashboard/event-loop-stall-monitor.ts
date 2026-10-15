@@ -1,4 +1,5 @@
 import { stripAnsi } from '../tui.js';
+import { matchFailureEvent, recordFailureSignatureMatch } from '../self-health/signatures.js';
 
 export interface EventLoopStallContext {
   streamingInFlight: boolean;
@@ -40,6 +41,9 @@ export function startEventLoopStallMonitor({
     previousTickAt = tickAt;
     if (lagMs >= thresholdMs) {
       log('tui.event-loop', 'stall', { lagMs, ...getContext() });
+      // 긴 정지(결함 #1·#14)는 실패 지문으로도 센다 — L3 자기 건강이 `tui.failure-signature` 로 읽는다.
+      const signature = matchFailureEvent({ category: 'tui.event-loop', event: 'stall', data: { lagMs } });
+      if (signature) recordFailureSignatureMatch(signature, 'event-loop', log);
     }
   }, intervalMs);
   timer.unref?.();

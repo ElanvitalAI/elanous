@@ -16,6 +16,15 @@ export interface RunUsageInput {
   cost?: { kind?: string; usd?: number; apiEquivalentUsd?: number } | null;
 }
 
+/** A returned Pod raw usage row is covered only by a measured rollup from the same Job. */
+export function excludeCoveredPodRawRows<T extends { origin?: unknown; podJob?: unknown; job?: unknown; site?: unknown; measured?: unknown }>(rows: readonly T[]): T[] {
+  const rolledUpJobs = new Set(rows.flatMap((row) =>
+    typeof row.job === 'string' && row.job.length > 0
+      && typeof row.site === 'string' && row.site.startsWith('pod-rollup:')
+      && row.site !== 'pod-rollup:missing' && row.measured !== false ? [row.job] : []));
+  return rows.filter((row) => row.origin !== 'pod' || typeof row.podJob !== 'string' || !rolledUpJobs.has(row.podJob));
+}
+
 export interface RunUsageRow {
   runId: string;
   role?: string;

@@ -5,7 +5,7 @@ import { CardStore, taskCardsDir, type TaskCard } from '../../task-cards/card-st
 import { Database } from 'bun:sqlite';
 import { type ChecklistItem } from '../../release-loop/checklist.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
-import { getUserConfig, type OrchestratorLoopConfig } from '../../user-config.js';
+import { getUserConfig, resolveConfiguredAgentRoleLlm, type OrchestratorLoopConfig } from '../../user-config.js';
 import { rubricPriority } from '../../release-loop/rubric.js';
 import { debug } from '../../debug/log.js';
 import { emitLoopHeartbeat } from '../neighbor-runtime.js';
@@ -15,14 +15,23 @@ import { addHarnessQueue, harnessQueueOutcome, setQueuedPoolHint } from '../../h
 import { placeOnGrid, type GridHost } from './grid-place.js';
 import { checkPodPool, parsePodPool, resolvePodPoolSpec } from '../../task-orchestrator/surfaces/pod-pool.js';
 import { leaseKubectl } from '../../task-orchestrator/surfaces/pod-lease.js';
+import type { TrafficSeatRow } from './traffic.js';
 import { readTaskAgentState, TASK_SEATS, type HandTaskOptions, type TaskCard as TaskAgentCard, type HandTaskResult, type TaskLauncher, type TaskSeat } from '../../task-agent/task-hand.js';
-import { runCoordinatorInbox } from './inbox.js';
+import { runCoordinatorAgentInbox, runCoordinatorInbox, type CoordinatorInboxResult } from './inbox.js';
+import { loadAgentRolePack, type AgentReplyInput } from '../agent-reply.js';
+import type { LLMProvider } from '../../llm.js';
 
 export type Window = '08' | '12' | '18';
 export type Node = 'intake' | 'split' | 'place' | 'delegate' | 'launch' | 'reconcile' | 'report';
 export type Mode = 'off' | 'shadow' | 'live';
 const SEAT_LOOP_IDS: Readonly<Record<string, string>> = { OP: 'op-seat', MK: 'cmo-seat', TC: 'tc-seat', UX: 'ux-seat' };
 export interface Cell { id: string; title: string; kind?: string; seat?: string; host?: string; gridHost?: boolean; version?: string; cardId: string; origin: 'candidate' | 'flow1a'; priority?: 'P0' | 'P1' | 'P2' | 'P3' | 'P4'; predecessors?: string[] }
+/** Pure launch decision over observed traffic; dispatch-c will wire it into the periodic launch path. */
+export function isLaunchEligible(row: Pick<TrafficSeatRow, 'nextCell' | 'running' | 'launchCap'>,
+  skipReason?: string): boolean {
+  return row.nextCell !== null && row.running < row.launchCap &&
+    skipReason !== 'degraded-skip' && skipReason !== 'cap-deferred';
+}
 export interface TickState {
   runId: string; window: Window; mode: Mode; day: string;
   cards: TaskCard[]; skippedCards: Array<{ id: string; reason: string }>; cells: Cell[]; placed: number; unplaced?: number; delegated: number; wouldDelegate: number; rebalanced?: number; rebalanceBlocked?: Array<{ id: string; reason: string }>;
@@ -73,7 +82,10 @@ export interface TickDeps {
   handTask?: (opts: HandTaskOptions) => Promise<HandTaskResult>;
   taskLauncher?: TaskLauncher;
   /** Coordinator inbox seam; the real intake reads and replies on the durable message bus. */
-  coordinatorInbox?: () => { replied: number; acknowledged: number };
+  coordinatorInbox?: () => CoordinatorInboxResult | Promise<CoordinatorInboxResult>;
+  /** Production still uses the restricted turn; tests can supply a deterministic turn. */
+  coordinatorAgentRun?: AgentReplyInput['runAgent'];
+  coordinatorAgentProvider?: LLMProvider;
 }
 
 /** ORCH-TA-HAND ledger — one row per handed `orch:<card>:<cell>` key so a cell is handed once across ticks and processes. */
@@ -475,7 +487,15 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
   // A graph node may be replayed with the same runId, and 12/18 skip intake.
   // Drain the bus on every tick command; the message transaction prevents duplicate answers.
   if (mode !== 'off') {
-    const inbox = (deps.coordinatorInbox ?? (() => runCoordinatorInbox(undefined, 100, join(root, 'msg', 'messages.db'))))();
+    const inboxPath = join(root, 'msg', 'messages.db');
+    const inbox = await (deps.coordinatorInbox ?? (() => {
+      const role = resolveConfiguredAgentRoleLlm('coordinator');
+      return role
+        ? runCoordinatorAgentInbox({ role, pack: loadAgentRolePack('coordinator'), path: inboxPath, root,
+            ...(deps.coordinatorAgentRun ? { runAgent: deps.coordinatorAgentRun } : {}),
+            ...(deps.coordinatorAgentProvider ? { provider: deps.coordinatorAgentProvider } : {}) })
+        : runCoordinatorInbox(undefined, 100, inboxPath);
+    }))();
     if (inbox.replied || inbox.acknowledged) {
       observe('exchange', 'coordinator-inbox-replied', inbox.replied);
       observe('exchange', 'coordinator-inbox-acknowledged', inbox.acknowledged);

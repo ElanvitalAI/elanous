@@ -6,6 +6,7 @@ export interface ChatMainInputSession {
   inputRow: number;
   getInputRow: () => number;
   inputWidth: number;
+  getInputWidth: () => number;
   paintChrome: () => void;
   shouldPaint: () => boolean;
   register: () => void;
@@ -16,6 +17,7 @@ export interface CreateChatMainInputSessionDeps {
   promptFrame: PromptFrame;
   getPromptFrame?: () => PromptFrame;
   inputCols: number;
+  getInputCols?: () => number;
   surfaceRegistry: SurfaceRegistry;
   invalidateRenderCacheRow: (row0: number) => void;
   buildPromptFrameDividerRows: (promptFrame: PromptFrame, divider: string) => Array<{ row: number; text: string }>;
@@ -36,9 +38,10 @@ export function createChatMainInputSession(
   // of the full-width divider, which reads like the border width
   // flickered when slash/search pickers appear.
   const inputWidth = deps.inputCols;
+  const getInputWidth = (): number => deps.getInputCols?.() ?? inputWidth;
 
   const paintChrome = () => {
-    const divider = hLine(deps.inputCols);
+    const divider = hLine(getInputWidth());
     for (const row of deps.buildPromptFrameDividerRows(getPromptFrame(), divider)) {
       deps.invalidateRenderCacheRow(row.row - 1);
       process.stdout.write(ansi.moveTo(row.row, 1) + '\x1b[2K' + row.text);
@@ -57,7 +60,7 @@ export function createChatMainInputSession(
     deps.debugLog?.('input.surface.register', 'chat-main', {
       inputId: 'chat-main',
       row: getInputRow(),
-      width: inputWidth,
+      width: getInputWidth(),
     });
   };
 
@@ -70,6 +73,7 @@ export function createChatMainInputSession(
     inputRow,
     getInputRow,
     inputWidth,
+    getInputWidth,
     paintChrome,
     shouldPaint,
     register,

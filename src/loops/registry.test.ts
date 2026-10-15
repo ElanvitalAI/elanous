@@ -10,6 +10,8 @@ import { checkLoops } from './checker.js';
 import { inventoryCrontab, listSchedules, openSchedulesDb } from '../domains/schedule-registry.js';
 import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
 import { listAllLoops, listLoops, loopRecentRuns, loopStatus, runLoop, setLoopEnabled, type LoopRegistryOptions } from './registry.js';
+import { LOOP_MESSAGE_ROUTES } from './msg-address.js';
+import { MsgStore } from '../msg/msg-store.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -33,6 +35,30 @@ function fixture() {
   const opts: LoopRegistryOptions = { root, stateRoot, now: new Date('2026-09-28T06:30:00.000Z'), schedules: rows };
   return { root, stateRoot, cronFile, line, opts };
 }
+
+test('loop registry uses the inbox address export and reads unread counts from its own state root', () => {
+  const f = fixture();
+  writeFileSync(join(f.root, 'graphs', 'orchestrator.yaml'), "graph_id: orchestrator\nloop:\n  trigger:\n    events: [manual]\n");
+  writeFileSync(join(f.root, 'graphs', 'guardian.yaml'), "graph_id: guardian\nloop:\n  trigger:\n    events: [manual]\n");
+  const messageDir = join(f.stateRoot, 'msg');
+  mkdirSync(messageDir, { recursive: true });
+  const store = new MsgStore(join(messageDir, 'messages.db'));
+  try {
+    store.post({ from: 'UX', to: LOOP_MESSAGE_ROUTES.orchestrator.msgAddress, body: 'question' });
+    store.post({ from: 'UX', to: LOOP_MESSAGE_ROUTES.guardian.msgAddress, body: 'question' });
+  } finally { store.close(); }
+  const entries = listLoops(f.opts);
+  expect(entries.find(entry => entry.id === 'orchestrator')).toMatchObject({
+    msgAddress: LOOP_MESSAGE_ROUTES.orchestrator.msgAddress, replyBody: 'rules', wake: 'cron', wakeSource: 'loop-table', unreadCount: 1,
+  });
+  expect(entries.find(entry => entry.id === 'guardian')).toMatchObject({
+    msgAddress: 'GUARDIAN', replyBody: 'none', wake: 'none', unreadCount: 1,
+  });
+  expect(entries.find(entry => entry.id === 'daily')).toMatchObject({ msgAddress: null, replyBody: 'none', wake: 'none', unreadCount: null });
+  expect(listAllLoops(f.opts).find(entry => entry.id === 'orchestrator')).toMatchObject({
+    msgAddress: LOOP_MESSAGE_ROUTES.orchestrator.msgAddress, replyBody: 'rules', unreadCount: 1,
+  });
+});
 
 test('cron shell chooses the newest redirect from outer and inner fence commands, or the newer DB record', () => {
   const f = fixture();

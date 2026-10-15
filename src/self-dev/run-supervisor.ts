@@ -11,6 +11,7 @@ import { sweepFrozenMerges } from '../self-implement/frozen-merges.js';
 import { routeSupervisorVerdict } from './supervisor-verdict-edges.js';
 import { recordTaskAgentShadowMove, runCardFor, type TaskAgentShadowInput } from '../task-agent/shadow.js';
 import { cardPrNumber, taskAgentStatePath } from '../task-agent/task-hand.js';
+import { classifyMustFixRound, inferMustFixEvidence, type MustFixRoundClassification, type MustFixRoundObservation } from '../self-implement/review-mustfix-class.js';
 
 export interface SupervisorRound {
   round: number;
@@ -46,6 +47,8 @@ export interface SupervisorRound {
    * streak pairs rounds by this key. Omitted on older history — the guard then pairs by taskId as before.
    */
   noPrFeatureKeys?: string[];
+  /** REVIEW-MUSTFIX-CLASSIFY — that round's observed must-fix items; pairs the next round's classification. */
+  mustFix?: MustFixRoundObservation;
 }
 
 /** Failed without a PR — a result that carries either a PR number or a PR URL has one (fixtures and older producers set only one). */
@@ -116,6 +119,10 @@ export interface SupervisorDecision {
   deliverableUnmeasured: boolean;
   deliverableMergeCompleteness: 'unmeasured' | 'complete' | 'incomplete';
   reviewMustFixTrend: ReviewRework['trend'];
+  /** REVIEW-MUSTFIX-CLASSIFY — this round's leading must-fix class (② › ③ observed › ①); omitted when unmeasured (지금 동작 그대로). */
+  mustFix?: MustFixRoundClassification;
+  /** REVIEW-MUSTFIX-CLASSIFY — every oscillating task's measured class, so a mixed round keeps each task's decision. */
+  mustFixByTask?: Record<string, MustFixRoundClassification>;
   oscillation?: { taskIds: string[]; helper: 'review-oscillation'; signature: string; repairGoals?: Record<string, string>; heldTaskIds?: string[] };
   pendingDecision?: 'attempt-care-escalation';
 }
@@ -233,6 +240,41 @@ export function aggregateReviewTrend(results: readonly SelfDevJobResult[]): Revi
   const severity: readonly ReviewRework['trend'][] = ['unmeasured', 'improving', 'stable', 'worsening', 'oscillating'];
   return severity[Math.max(...trends.map((trend) => severity.indexOf(trend)))];
 }
+
+/**
+ * REVIEW-MUSTFIX-CLASSIFY — this round's must-fix observation from the results' verbatim `reviewMustFix`.
+ * Each item carries its `taskId` so the next round pairs per task (one task's recurrence never holds another).
+ */
+function mustFixFromResults(results: readonly SupervisorJobResult[]): MustFixRoundObservation {
+  const items = results.flatMap((result) => (result.reviewMustFix ?? []).map((text) => {
+    const evidence = inferMustFixEvidence(text);
+    return { text, taskId: result.taskId, ...(evidence === undefined ? {} : { evidence }) };
+  }));
+  return items.length > 0 ? { items } : {};
+}
+
+/**
+ * REVIEW-MUSTFIX-CLASSIFY — per-task class. `prev` is the preceding round's items of the same task or its repair
+ * lineage (`oscillationRepairOf`), and only when that preceding round authored a repair for it — «수리 뒤 같은 지적»
+ * means a repair ran between the last observation and this one, not «repaired at any time». Lineage items are
+ * re-scoped to this task so the pure pairing accepts them; unrelated tasks never pair.
+ */
+function classifyTaskMustFix(result: SupervisorJobResult, preceding: SupervisorRound | undefined): MustFixRoundClassification {
+  const pairIds = new Set([result.taskId, ...(result.oscillationRepairOf ? [result.oscillationRepairOf] : [])]);
+  const repairedSincePrev = (preceding?.oscillationRepairTaskIds ?? []).some((id) => pairIds.has(id));
+  const prevItems = repairedSincePrev
+    ? (preceding?.mustFix?.items ?? []).filter((item) => item.taskId !== undefined && pairIds.has(item.taskId))
+      .map((item) => ({ ...item, taskId: result.taskId }))
+    : [];
+  return classifyMustFixRound(prevItems.length > 0 ? { items: prevItems } : undefined, mustFixFromResults([result]));
+}
+
+/**
+ * Classes that hold a task out of this round's same-run repair. Only ② acts in this slice; ③ recurring is
+ * observed (decision `mustFix`/`mustFixByTask` · crossReview suggestion) but behaves as ① — acting on it is a
+ * follow-up cell (REVIEW-MUSTFIX-CLASSIFY partial landing).
+ */
+const MUST_FIX_HELD = new Set<MustFixRoundClassification['class']>(['post-land-evidence']);
 
 export function decideNextRun(input: {
   results: readonly SupervisorJobResult[];
@@ -520,8 +562,27 @@ export function decideNextRun(input: {
         || (entry.oscillationRepairFeatures?.[index] !== undefined && entry.oscillationRepairFeatures[index] === result.feature
           && Object.values(entry.oscillationRepairGoals ?? {}).includes(result.feature))));
     // Per task: a task that already got its one oscillation repair is held for a human; a fresh one may get it.
-    const fresh = oscillating.filter((result) => !isRepaired(result));
-    const held = [...new Set(oscillating.filter(isRepaired).map((result) => result.taskId))];
+    // REVIEW-MUSTFIX-CLASSIFY — 슈퍼바이저는 추이 대신 회차 분류를 먼저 본다(대표 10-12 «노하우가 아니라 로직으로» · 임의 임계 없음).
+    //   ① new-defect — 그대로 수렴(진동 수리 유지).
+    //   ② post-land-evidence — 증거는 착지 뒤에만 난다 ⇒ 같은 런 재수리 0, «그림자 착지 → 관측 → live» 쪼개기 결정.
+    //   ③ recurring — 수리 뒤 같은 지적 ⇒ 이 조각에선 관측만(교차 리뷰 제안을 결정에 싣고 동작은 ① 그대로 · 후속 칸).
+    //   unmeasured — 분류 불가 ⇒ 지금 동작 그대로. 분류는 조각마다 — 한 조각의 분류가 다른 조각의 수리를 끊지 않는다.
+    const taskClasses = new Map(oscillating.map((result) => [result.taskId, classifyTaskMustFix(result, preceding)]));
+    const fresh = oscillating.filter((result) => !isRepaired(result) && !MUST_FIX_HELD.has(taskClasses.get(result.taskId)!.class));
+    const classes = [...taskClasses.values()];
+    // Decision-level class: ② (the only acting class) first, then observed ③, else ①.
+    const mustFixClass = classes.find((c) => c.class === 'post-land-evidence') ?? classes.find((c) => c.class === 'recurring')
+      ?? classes.find((c) => c.class === 'new-defect');
+    // Held = already repaired once, or classified ② — either way it never rides this round's rerun.
+    const classHeld = [...new Set(oscillating.filter((result) => !isRepaired(result)
+      && MUST_FIX_HELD.has(taskClasses.get(result.taskId)!.class)).map((result) => result.taskId))];
+    const held = [...new Set([...oscillating.filter(isRepaired).map((result) => result.taskId), ...classHeld])];
+    const repairedHeld = held.filter((id) => !classHeld.includes(id));
+    // Every task's measured class survives in the decision — a mixed round keeps ② split and the observed ③ cross-review suggestion both.
+    const mustFixByTask: Record<string, MustFixRoundClassification> = Object.fromEntries(
+      [...taskClasses].filter(([, c]) => c.class !== 'unmeasured'));
+    const heldReasons = [...new Set(classes.filter((c) => MUST_FIX_HELD.has(c.class)).map((c) => c.reason))];
+    const heldReasonSuffix = heldReasons.length ? ` · ${heldReasons.join(' · ')}` : '';
     const repairGoals: Record<string, string> = Object.fromEntries(fresh.flatMap((result) => {
       const goal = result.prNumber && result.reviewMustFix?.length
         ? authorRepairGoal({ pr: result.prNumber, category: 'review-oscillation', originalRequest: result.feature,
@@ -551,14 +612,16 @@ export function decideNextRun(input: {
       } : {}),
       action,
       ...(action === 'stop' ? { stopReason: 'review-oscillating' as const } : {}),
+      ...(mustFixClass ? { mustFix: mustFixClass } : {}),
+      ...(Object.keys(mustFixByTask).length ? { mustFixByTask } : {}),
       oscillation: { taskIds, helper: 'review-oscillation', signature, ...(Object.keys(repairGoals).length ? { repairGoals } : {}),
         ...(action === 'add-repair-task' && held.length ? { heldTaskIds: held } : {}) },
       pendingDecision: 'attempt-care-escalation',
       why: fresh.length === 0
-        ? `리뷰 진동 반복 — ${signatureOf(oscillating)} · 사람 결정 필요(같은 전략 재발사 금지)`
+        ? `리뷰 진동 반복 — ${signatureOf(oscillating)} · 사람 결정 필요(같은 전략 재발사 금지)${heldReasonSuffix}`
         : cannotRepair
-          ? `리뷰 진동 — ${signatureOf(oscillating)} · ${input.repairGoalExecution === false ? '이 감독 경로가 수리 골 실행을 선언하지 않았다(미선언 또는 불가)' : '수리 원문/PR 관측 불가'} · 사람 결정 필요(같은 전략 재발사 금지)`
-          : `리뷰 진동 — ${signatureOf(fresh)} · review-oscillation 수리 조각을 한 번 붙인다${input.repairGoalExecution === true ? '' : '(실행 배선 미선언 — 결정 칸만)'}${held.length ? ` · 이미 수리한 조각 ${held.join(', ')} 은 사람 결정 대기` : ''}`,
+          ? `리뷰 진동 — ${signatureOf(oscillating)} · ${input.repairGoalExecution === false ? '이 감독 경로가 수리 골 실행을 선언하지 않았다(미선언 또는 불가)' : '수리 원문/PR 관측 불가'} · 사람 결정 필요(같은 전략 재발사 금지)${heldReasonSuffix}`
+          : `리뷰 진동 — ${signatureOf(fresh)} · review-oscillation 수리 조각을 한 번 붙인다${input.repairGoalExecution === true ? '' : '(실행 배선 미선언 — 결정 칸만)'}${repairedHeld.length ? ` · 이미 수리한 조각 ${repairedHeld.join(', ')} 은 사람 결정 대기` : ''}${classHeld.length ? ` · 분류로 보류한 조각 ${classHeld.join(', ')}` : ''}${heldReasonSuffix}`,
     };
   }
 
@@ -588,6 +651,8 @@ export function appendRound(
   const t = triageRun(results.filter((result) => result.salvage !== 'launched'), undefined, false, undefined, mainSyncRelaunchSpent(history));
   const baseCompleted = countBaseCompleted(results);
   const base = roundBase(results);
+  // REVIEW-MUSTFIX-CLASSIFY — 회차 원장에 관측을 실어 다음 회차 짝으로 쓴다(관측 없는 옛 원장은 그대로).
+  const mustFix = mustFixFromResults(results.filter((result) => result.salvage !== 'launched'));
   const noPrResults = results.filter(failedWithoutPr);
   const noPrTaskIds = noPrResults.map((result) => result.taskId);
   const noPrFeatureKeys = noPrResults.map((result) => noPrStreakKey(result.feature));
@@ -597,6 +662,7 @@ export function appendRound(
     ...(baseCompleted > 0 || base !== undefined ? { baseCompleted, ...(base === undefined ? {} : { base }) } : {}),
     actionable: countActionable(t),
     ...(reviewMustFixTrend === undefined ? {} : { reviewMustFixTrend }),
+    ...((mustFix.items ?? []).length > 0 ? { mustFix } : {}),
     ...(results.some((result) => result.rework?.signature)
       ? { signatures: Object.fromEntries(results.filter((result) => result.rework?.signature).map((result) => [result.taskId, result.rework!.signature])) } : {}),
     ...(decision && decision.action !== 'stop' && decision.relaunchOnMain.length > 0 ? {

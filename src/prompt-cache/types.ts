@@ -15,6 +15,8 @@
 export interface LLMUsage {
   /** Origin provider — lets the metrics module tag accumulated tokens. */
   provider?: 'anthropic' | 'openai';
+  /** 이 사용량을 낸 턴의 모델(내보내는 쪽이 알 때만). 턴 지표가 설정 모델 대신 이것으로 ctx 최대치·단가를 잡는다. */
+  model?: string;
   inputTokens?: number;
   outputTokens?: number;
   cacheReadInputTokens?: number;

@@ -539,9 +539,12 @@ function hasModuleMockCall(source: string, file: string): boolean {
 /** Parse every Bun-discovered test: text search misses valid calls with a
  * comment between `mock` and `.module`. An extra solo file costs time, while a
  * missed call can contaminate every later file in the Bun process. */
-export function deriveMockModuleTestFiles(deps: { spawnSync?: typeof Bun.spawnSync; cwd?: string } = {}): string[] {
+export function deriveMockModuleTestFiles(
+  deps: { spawnSync?: typeof Bun.spawnSync; cwd?: string; files?: string[] } = {},
+): string[] {
   const cwd = deps.cwd ?? process.cwd();
-  const files = deriveTestFiles({ spawnSync: deps.spawnSync, cwd });
+  // `files` narrows the parse to a caller-selected subset of discovered tests.
+  const files = deps.files ?? deriveTestFiles({ spawnSync: deps.spawnSync, cwd });
   const mocks: string[] = [];
   // A bounded program keeps the public syntax check below 600 MB on the
   // current repository, rather than retaining all 5,836 ASTs at once.
@@ -723,12 +726,10 @@ function replaceBulkSelectors(argv: string[], replacement: (selector: string) =>
   return result;
 }
 
-/** Return one bulk command and one command per selected global module mock. */
-export function planDeterministicTestCommands(
-  argv: string[], cdpPatterns: string[], mockFiles: string[], allTestFiles: string[] = [], testCwd = process.cwd(),
-): string[][] {
-  const { selectors: pathArgs, soloArgs } = partitionBunTestArguments(argv);
-  const explicitPaths = pathArgs.length > 0;
+/** How a positional selector picks discovered test files: a directory selects
+ * the files under it, an exact discovered path selects itself, and anything
+ * else is Bun's substring filter. */
+function testSelectorMatcher(allTestFiles: string[], testCwd: string) {
   const directory = (selector: string): string | undefined => {
     const path = resolve(testCwd, selector);
     try { return statSync(path).isDirectory() ? path : undefined; } catch { return undefined; }
@@ -746,6 +747,25 @@ export function planDeterministicTestCommands(
       ? resolve(testCwd, file) === resolve(testCwd, selector)
       : file.includes(selector.replace(/^\.\//, ''));
   };
+  return { directory, insideDirectory, isExact, matchesSelector };
+}
+
+/** Discovered test files that a path-selected run can reach. With explicit
+ * paths the planner only isolates mock files inside this set, so parsing the
+ * rest of the repository (≈20 s per gate shard under load) cannot change it. */
+export function selectedTestFiles(argv: string[], allTestFiles: string[], testCwd: string): string[] {
+  const { selectors } = partitionBunTestArguments(argv);
+  const { matchesSelector } = testSelectorMatcher(allTestFiles, testCwd);
+  return allTestFiles.filter((file) => selectors.some((selector) => matchesSelector(file, selector)));
+}
+
+/** Return one bulk command and one command per selected global module mock. */
+export function planDeterministicTestCommands(
+  argv: string[], cdpPatterns: string[], mockFiles: string[], allTestFiles: string[] = [], testCwd = process.cwd(),
+): string[][] {
+  const { selectors: pathArgs, soloArgs } = partitionBunTestArguments(argv);
+  const explicitPaths = pathArgs.length > 0;
+  const { directory, insideDirectory, isExact, matchesSelector } = testSelectorMatcher(allTestFiles, testCwd);
   const callerIgnoreGlobs = bunTestOptionValues(argv, '--path-ignore-patterns').map((pattern) => new Bun.Glob(pattern));
   const selectedMocks = mockFiles.filter((file) => !cdpPatterns.includes(file)
     && !callerIgnoreGlobs.some((glob) => glob.match(file) || glob.match(resolve(testCwd, file)))
@@ -872,10 +892,19 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
   const testCwd = effectiveTestCwd(argv, cwd);
   const cdpPatterns = explicitPaths ? [] : (deps.deriveCdpPatterns ?? (() => deriveCdpTestPatterns({ cwd: testCwd })))();
   const explicitFiles = classifyExplicitTestFiles(argv, testCwd);
-  const mockFiles = [...new Set([...(deps.deriveMockModuleFiles ?? (() => deriveMockModuleTestFiles({ cwd: testCwd })))(), ...explicitFiles.mockFiles])];
-  const allTestFiles = (explicitPaths || fullBail) && mockFiles.length > 0
-    ? [...new Set([...(deps.deriveTestFiles ?? (() => deriveTestFiles({ cwd: testCwd })))(), ...explicitFiles.files])]
-    : [];
+  let discovered: string[] | undefined;
+  const discoverTestFiles = (): string[] => discovered ??=
+    [...new Set([...(deps.deriveTestFiles ?? (() => deriveTestFiles({ cwd: testCwd })))(), ...explicitFiles.files])];
+  // With explicit paths, parse only the files the selectors reach; files that
+  // classifyExplicitTestFiles already parsed are not parsed twice.
+  const scanMocks = (): string[] => {
+    if (!explicitPaths) return deriveMockModuleTestFiles({ cwd: testCwd });
+    const classified = new Set(explicitFiles.files);
+    const files = selectedTestFiles(argv, discoverTestFiles(), testCwd).filter((file) => !classified.has(file));
+    return files.length === 0 ? [] : deriveMockModuleTestFiles({ cwd: testCwd, files });
+  };
+  const mockFiles = [...new Set([...(deps.deriveMockModuleFiles ?? scanMocks)(), ...explicitFiles.mockFiles])];
+  const allTestFiles = (explicitPaths || fullBail) && mockFiles.length > 0 ? discoverTestFiles() : [];
   let commands = planDeterministicTestCommands(argv, cdpPatterns, mockFiles, allTestFiles, testCwd);
   const optionTokens = bunTestOptionTokens(argv);
   // Bun writes these outputs to one caller-selected file. Separate children

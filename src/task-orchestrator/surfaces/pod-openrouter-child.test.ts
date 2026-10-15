@@ -1,9 +1,10 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../../debug/log.js';
 import { podNamedChildProvider, podChildLlmArgs, podSelfImplementSpawn, POD_OPENROUTER_REVIEWER_PINS, resolvePodOpenRouterReviewer, type Kubectl } from './self-implement-pod.js';
-import { resolveRoleLlm, type UserConfig } from '../../user-config.js';
+import { getUserConfig, resolveRoleLlm, type UserConfig } from '../../user-config.js';
 import { resolveImplementationChildModel } from '../../self-dev/dev-cli.js';
 import { stablePodManifestText } from './pod-manifest-test-normalize.js';
+import { inspectCodexRotation } from '../../oauth/codex-account-store.js';
 
 const model = 'openrouter/z-ai/glm-5.3-flash';
 const key = 'test-openrouter-secret-not-in-job';
@@ -139,7 +140,7 @@ describe('explicit OpenRouter Pod child', () => {
       const run = capture();
       const events: Array<{ event: string; data: any }> = [];
       const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
-        if (category === 'self-implement.pod' && event.startsWith('role-llm')) events.push({ event, data });
+        if (category === 'self-implement.pod' && (event.startsWith('role-llm') || event === 'planning-model-fallback')) events.push({ event, data });
       }) as typeof debug.log);
       let result;
       try {
@@ -211,6 +212,74 @@ describe('explicit OpenRouter Pod child', () => {
       const off = await spawnOr({ openrouterReviewer: 'off' }, 'or-review-off');
       expect(JSON.stringify(off.job)).not.toContain('ELANOUS_ROLE_LLM_');
       expect(off.events.map((e) => e.event)).toEqual(['role-llm-skipped']);
+    });
+
+    test('planning sol on an OpenRouter author Pod reuses the reviewer Codex Secret path', async () => {
+      const config = { ...podConfig, roleLlm: { planning: { model: 'gpt-6-sol' } } } as UserConfig;
+      const armed = await spawnOr({ env: { ELANOUS_POD_AUTHOR_ON_POD: '1' }, authorConfig: () => config, credentials: codexCreds, planningCodexQuota: () => ({ usable: true }) }, 'or-author-sol');
+      expect(armed.result.exitCode).toBe(0);
+      expect(armed.secret.stringData['elanous-auth.json']).toBe(codexCreds().elanousAuth);
+      expect(armed.secret.stringData['codex-auth.json']).toBe(codexCreds().codexAuth);
+      expect(containerEnv(armed.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_MODEL', value: 'gpt-6-sol' });
+      expect(containerEnv(armed.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_MODEL_RELAY', value: 'pod' });
+      expect(containerEnv(armed.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE', value: 'config-role' });
+      expect(armed.job.spec.template.spec.containers[0].args[0]).toContain('cp /creds/elanous-auth.json ~/.elanous/auth.json');
+      expect(armed.events).toContainEqual({ event: 'role-llm-armed', data: expect.objectContaining({ role: 'planning', source: 'config-role', model: 'gpt-6-sol' }) });
+      expect(JSON.stringify(armed.job) + JSON.stringify(armed.events)).not.toContain('accessToken');
+      expect(JSON.stringify(armed.job) + JSON.stringify(armed.events)).not.toContain('access_token');
+    });
+
+    test('planning sol falls back to the GLM child when quota or credential is unavailable', async () => {
+      const baseConfig = getUserConfig();
+      const config = { ...baseConfig, llm: { ...baseConfig.llm, provider: 'openrouter' }, roleLlm: { planning: { model: 'gpt-6-sol' } } } as UserConfig;
+      const exhausted = { config, inspectCodex: (() => ({ candidates: [{ name: 'team', storeKey: 'openai-codex:team', home: '/tmp/team', reached: false, usedPercent: 98 }], policy: undefined })) as unknown as typeof inspectCodexRotation };
+      for (const [label, extra, reason] of [
+        ['quota', { credentials: codexCreds, budgetInputDeps: exhausted }, 'quota-exhausted'],
+        ['quota-unmeasured', { credentials: codexCreds, planningCodexQuota: () => ({ usable: false, reason: 'quota-unmeasured' }) }, 'quota-unmeasured'],
+        ['credential', { planningCodexQuota: () => ({ usable: true }) }, 'no-credential-source'],
+        ['untrusted-reason', { planningCodexQuota: () => ({ usable: false, reason: 'secret-value-should-not-leak' }) }, 'unavailable'],
+      ] as const) {
+        const fallback = await spawnOr({ env: { ELANOUS_POD_AUTHOR_ON_POD: '1' }, authorConfig: () => config, ...extra }, `or-author-sol-${label}`);
+        expect(fallback.result.exitCode).toBe(0);
+        expect(containerEnv(fallback.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_MODEL', value: model });
+        expect(containerEnv(fallback.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_MODEL_RELAY', value: 'pod' });
+        expect(containerEnv(fallback.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE', value: 'fallback-child' });
+        expect(containerEnv(fallback.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_MODEL_FALLBACK_REASON', value: reason });
+        expect(containerEnv(fallback.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_REQUESTED_MODEL', value: 'gpt-6-sol' });
+        expect(containerEnv(fallback.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_REQUESTED_SOURCE', value: 'config-role' });
+        expect(fallback.events).toContainEqual({ event: 'planning-model-fallback', data: expect.objectContaining({ provider: 'openrouter', model, reason }) });
+        expect(fallback.secret.stringData['elanous-auth.json']).toBeUndefined();
+        expect(JSON.stringify(fallback.job) + JSON.stringify(fallback.events)).not.toContain('secret-value-should-not-leak');
+      }
+    });
+
+    test('default Codex author model still checks quota; both unavailable refuse before apply', async () => {
+      const available = await spawnOr({
+        env: { ELANOUS_POD_AUTHOR_ON_POD: '1', ELANOUS_PR_REVIEW_MODEL: 'gpt-6-sol' },
+        credentials: codexCreds,
+        planningCodexQuota: () => ({ usable: true }),
+      }, 'or-author-default-codex-available');
+      expect(available.result.exitCode).toBe(0);
+      expect(containerEnv(available.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_MODEL', value: 'gpt-6-sol' });
+      expect(containerEnv(available.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE', value: 'default' });
+      expect(available.secret.stringData['elanous-auth.json']).toBe(codexCreds().elanousAuth);
+
+      const defaultChoice = await spawnOr({
+        env: { ELANOUS_POD_AUTHOR_ON_POD: '1', ELANOUS_PR_REVIEW_MODEL: 'gpt-6-sol' },
+        planningCodexQuota: () => ({ usable: false, reason: 'quota-unmeasured' }),
+      }, 'or-author-default-codex');
+      expect(defaultChoice.result.exitCode).toBe(0);
+      expect(containerEnv(defaultChoice.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE', value: 'fallback-child' });
+      expect(containerEnv(defaultChoice.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_REQUESTED_SOURCE', value: 'default' });
+
+      const noChild = capture();
+      expect(() => podSelfImplementSpawn({
+        provider: 'openrouter', env: { ELANOUS_POD_AUTHOR_ON_POD: '1', ELANOUS_PR_REVIEW_MODEL: 'gpt-6-sol' },
+        readKeyCache: () => key, openrouterGhToken: () => 'gh-test',
+        planningCodexQuota: () => ({ usable: false, reason: 'quota-unmeasured' }),
+        kubectl: noChild.kubectl, sleep: async () => {},
+      })({ feature: 'implement', spaceId: 'or-author-both-unavailable' })).toThrow('openrouter 자식 모델 없음');
+      expect(noChild.applied).toEqual([]);
     });
 
     test('invariant: codex and grok Pod manifests are byte-identical with or without the OR reviewer knob', async () => {

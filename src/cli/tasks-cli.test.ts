@@ -15,11 +15,54 @@ import { runHostRegate } from '../self-implement/host-regate.js';
 import type { LogStoreRow } from '../mss/logging/log-store.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from '../task-agent/task-hand.js';
 import { rejudgeCandidates } from '../task-agent/rejudge-on-head.js';
+import { reviewResultPath } from '../task-agent/review-result-capture.js';
+import { repairReviewDigest } from '../task-agent/repair-review.js';
 import { adoptExistingPr, adoptedRunTerminal } from '../task-agent/adopt-pr.js';
 import type { BoardNode } from '../task-agent/board.js';
 import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TasksCliDeps } from './tasks-cli.js';
 
 const token = 'secret-acp-token-sentinel';
+test('tasks rejudge --all launches at most three new repairs and leaves two for the next tick', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ta-repair-tick-cap-'));
+  setElanousConfigDir(dir);
+  try {
+    const statePath = join(dir, 'cards.json');
+    const head = 'a'.repeat(40);
+    const cards: TaskCard[] = [];
+    for (let n = 1; n <= 5; n++) {
+      const id = `ta-cap-${n}`;
+      const pr = 300 + n;
+      const resultPath = reviewResultPath(statePath, id, pr, head);
+      const review = JSON.stringify({ pr: String(pr), verdict: 'fail', mustFix: ['fix the assertion'], shouldFix: [],
+        reviewed: true, reviewRoute: 'api', headCommit: head });
+      mkdirSync(join(dir, 'review-results'), { recursive: true });
+      mkdirSync(join(resultPath, '..'), { recursive: true });
+      writeFileSync(resultPath, review);
+      cards.push({ id, text: 'fix', seat: 'TC', status: 'launched', runId: `run-cap-${n}`,
+        createdAt: '2026-10-15T00:00:00Z', pr: { number: pr, url: `https://github.com/o/r/pull/${pr}` },
+        reviewRequests: [{ pr, head, at: '2026-10-15T00:01:00Z', resultPath }],
+        history: [{ at: '2026-10-15T00:02:00Z', event: 'live-move-result', kind: 'review', pr, head,
+          verdict: 'fail', reviewed: true, mustFix: 1, reviewRoute: 'api', resultPath,
+          reviewSha256: repairReviewDigest(review), effect: 'review result captured' }] });
+    }
+    writeTaskCards(statePath, cards);
+    const launched: number[] = [];
+    const result = await run(['tasks', 'rejudge', '--all', '--json'], {
+      taskStatePath: statePath, registerSink: async () => {},
+      rejudge: { liveMoves: new Set(['narrow-relaunch']), requestRepair: async (request) => { launched.push(request.pr); },
+        live: { repoCandidates: () => [{ source: 'host', cwd: dir }],
+          prHead: async (pr) => ({ head, state: 'OPEN', url: `https://github.com/o/r/pull/${pr}`, branch: 'feature' }) } },
+    });
+    expect(result.code ?? 0).toBe(0);
+    const repair = JSON.parse(result.lines[0]!) as Array<{ step: string; decision: string; reason: string }>;
+    expect(repair.filter((row) => row.step === 'repair' && row.decision === 'repair-requested')).toHaveLength(3);
+    const capped = repair.filter((row) => row.step === 'repair' && row.decision === 'would-repair');
+    expect(capped).toHaveLength(2);
+    expect(capped.every((row) => row.reason.includes('상한 3') && row.reason.includes('다음 틱'))).toBe(true);
+    expect(launched).toHaveLength(3);
+    expect(cards.filter((card) => readTaskCard(card.id, statePath)?.repairs?.[0]?.status === 'requested')).toHaveLength(3);
+  } finally { resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+});
 test('tasks adopt-pr binds an existing OPEN PR once without relaunch and queues head rejudge', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ta-adopt-pr-'));
   try {
@@ -1418,6 +1461,7 @@ test('TA-REJUDGE-ON-HEAD — tasks regate-run runs the host regate without merge
 
 test('TA-LAND-AFTER-REVIEW phase ① — actual regate-run completion logs a shadow decision and executes zero live moves', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-regate-shadow-'));
+  mkdirSync(join(dir, 'apps/pwa/node_modules'), { recursive: true });
   const statePath = join(dir, 'task-agent-actions.json');
   const head = 'b'.repeat(40);
   const outPath = join(dir, 'regate-results', 'ta-x-30-bbbbbbbbbbbb.json');
@@ -1499,25 +1543,35 @@ test('tasks rejudge --all selects a formerly unbound remote parent after HQ mirr
   const child = 'run-22222222-2222-4222-8222-222222222222';
   const url = 'https://github.com/o/r/pull/30';
   const dir = remoteLedgerMirrorDir(root, 'node-b');
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, `${parent}.jsonl`), JSON.stringify({ runId: parent, event: 'pod-child-run', data: { childRunId: child } }) + '\n');
+  const parentRow = { runId: parent, event: 'pod-child-run', data: { childRunId: child } };
   const childPr = { runId: child, event: 'pr-opened', data: { number: 30, url } };
-  writeFileSync(join(dir, `${child}.jsonl`), JSON.stringify(childPr) + '\n');
+  const remote = new Map([[parent, JSON.stringify(parentRow) + '\n'], [child, JSON.stringify(childPr) + '\n']]);
+  const pulled: string[] = [];
+  const ssh = (_host: string, script: string, _timeoutMs: number) => {
+    const id = [parent, child].find((runId) => script.includes(`${runId}.jsonl`));
+    if (id) pulled.push(id);
+    return { status: id ? 0 : 1, stdout: id ? remote.get(id)! : '', stderr: id ? '' : 'unknown run' };
+  };
   writeFileSync(taskStatePath, JSON.stringify({ tasks: { 'ta-remote': {
-    id: 'ta-remote', text: 'repair', createdAt: '2026-10-12T00:00:00.000Z', status: 'launched', taLand: true,
+    id: 'ta-remote', text: 'repair', createdAt: new Date().toISOString(), status: 'launched', taLand: true,
     runId: parent, parentHost: { host: 'node-b' }, history: [],
   } } }));
   const deps: TasksCliDeps = { taskStatePath, registerSink: async () => true,
-    remoteLedgerMirror: () => {}, rejudge: { liveMoves: new Set(), remoteRunTerminal: () => true,
-      live: { repoCandidates: () => [{ source: 'host', cwd: '/repo' }], prHead: async () => ({ head: 'a'.repeat(40), state: 'OPEN', url }) } } };
+    cardRunEvidence: { ssh }, remoteLedgerMirror: () => {}, rejudge: { liveMoves: new Set(['review']), remoteRunTerminal: () => true,
+      live: { repoCandidates: () => [{ source: 'host', cwd: '/repo' }], prHead: async () => ({ head: 'a'.repeat(40), state: 'OPEN', url }),
+        requestReview: async () => {} } } };
   const incomplete = await run(['tasks', 'rejudge', '--all'], deps);
   expect(incomplete.lines).toEqual([]);
   expect((JSON.parse(readFileSync(taskStatePath, 'utf8')) as { tasks: Record<string, { pr?: unknown }> }).tasks['ta-remote']?.pr).toBeUndefined();
-  writeFileSync(join(dir, `${child}.jsonl`), [childPr,
+  expect(pulled).toEqual([parent, child]);
+  expect(existsSync(join(dir, `${parent}.jsonl`))).toBe(true);
+  expect(existsSync(join(dir, `${child}.jsonl`))).toBe(true);
+  remote.set(child, [childPr,
     { runId: child, event: 'run-status', data: { runStatus: 'completed' } },
   ].map(row => JSON.stringify(row)).join('\n') + '\n');
   const result = await run(['tasks', 'rejudge', '--all'], deps);
-  expect(result.lines.some(line => line.startsWith('ta-remote\tPR #30\t'))).toBe(true);
+  expect(result.lines.some(line => line.startsWith('ta-remote\tPR #30\t') && line.includes('\treview-requested\t'))).toBe(true);
+  expect(readFileSync(join(dir, `${child}.jsonl`), 'utf8')).toContain('"runStatus":"completed"');
   expect((JSON.parse(readFileSync(taskStatePath, 'utf8')) as { tasks: Record<string, { pr?: { number: number }; runChildId?: string }> }).tasks['ta-remote'])
     .toMatchObject({ pr: { number: 30 }, runChildId: child });
 });

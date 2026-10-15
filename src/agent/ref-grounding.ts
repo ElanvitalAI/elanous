@@ -18,6 +18,23 @@ import { debug } from '../debug/log.js';
 /** 로컬 참조 루트(기본 ~/source/ref). 다른 환경엔 없으면 무동작(graceful). */
 export const DEFAULT_REFERENCE_ROOTS = [join(homedir(), 'source', 'ref')];
 
+// 대표 2026-10-14 — 비공개 소스(Claude Code 사본) 통로 차단. Claude Code 는 공개 계약(code.claude.com)만 본다.
+// ref 루트 아래 디렉터리가 실존해도 이 이름이면 그라운딩·조회 대상에서 뺀다(대소문자·`_`/`-` 변형 포함).
+const NON_PUBLIC_REFERENCE_PATTERN = /^claude[-_]?code[-_]?(?:fork|src|source|leak|leaked)$/i;
+
+/** 공개 계약이 아닌 참조 사본 이름인가. `owner/repo` 꼴이면 마지막 칸으로 본다. */
+export function isNonPublicReferenceName(name: string): boolean {
+  const last = name.trim().replace(/\/+$/, '').split('/').pop() ?? '';
+  return NON_PUBLIC_REFERENCE_PATTERN.test(last);
+}
+
+/** 거부 판정 ⊕ 관측 한 줄. 거부면 true. */
+export function denyNonPublicReference(name: string): boolean {
+  if (!isNonPublicReferenceName(name)) return false;
+  try { debug.log('ref.grounding', 'denied', { name, reason: 'non-public-source' }); } catch { /* fail-soft */ }
+  return true;
+}
+
 function expandTilde(p: string): string {
   return p.startsWith('~') ? join(homedir(), p.slice(1)) : p;
 }
@@ -91,6 +108,7 @@ export function localRefGroundingDigest(taskText: string, roots: string[] = DEFA
     if (!existsSync(root)) continue;
     for (const token of tokens) {
       if (seen.has(token)) continue;
+      if (denyNonPublicReference(token)) { seen.add(token); continue; }
       try {
         const path = join(root, token);
         if (statSync(path).isDirectory()) { found.push({ path, root, token }); seen.add(token); }

@@ -166,6 +166,12 @@ export interface TurnStreamFormatter {
 export function createTurnStreamFormatter(
   deps: TurnStreamFormatterDeps,
 ): TurnStreamFormatter {
+  const groupingKind = (name: string, args: Record<string, unknown>): string | undefined => {
+    const kind = toolOperationKind(name, args);
+    return deps.foldMode === 'kind-unit' || (deps.foldMode === 'task-unit' && kind === 'RunShell')
+      ? kind
+      : undefined;
+  };
   // Per-tool-round 누적기. cross-turn 에서 이전 round 의 텍스트를
   // 가져오지 않음. clear-and-commit (onText('', '')) 또는 tool call
   // 발생 시 reset.
@@ -278,8 +284,8 @@ export function createTurnStreamFormatter(
           callId: call.id,
           lines: rendered,
           args: call.args,
-          ...(deps.foldMode === 'kind-unit'
-            ? { operationKind: toolOperationKind(call.name, call.args) }
+          ...(groupingKind(call.name, call.args)
+            ? { operationKind: groupingKind(call.name, call.args) }
             : {}),
         });
         closeRound();
@@ -293,8 +299,8 @@ export function createTurnStreamFormatter(
         callId: call.id,
         lines: [deps.muted(`${deps.brainIcon} tool: ${call.name} — running`)],
         args: call.args,
-        ...(deps.foldMode === 'kind-unit'
-          ? { operationKind: toolOperationKind(call.name, call.args) }
+        ...(groupingKind(call.name, call.args)
+          ? { operationKind: groupingKind(call.name, call.args) }
           : {}),
       });
       debug.log('dashboard.chat.generic-tool', 'formatter.genericCall', { toolName: call.name });
@@ -331,8 +337,10 @@ export function createTurnStreamFormatter(
         callId: call.id,
         collapsedLines: variants.collapsed,
         expandedLines: variants.expanded,
-        ...(deps.foldMode === 'kind-unit'
-          ? { operationKind: ('operationKind' in variants ? variants.operationKind : undefined) ?? toolOperationKind(call.name, args) }
+        ...(groupingKind(call.name, args)
+          ? { operationKind: deps.foldMode === 'task-unit'
+            ? 'RunShell'
+            : ('operationKind' in variants ? variants.operationKind : undefined) ?? toolOperationKind(call.name, args) }
           : {}),
       });
       toolArgsByCallId.delete(call.id);

@@ -17,6 +17,7 @@ import {
 import { authStorePath, defaultCodexHome, isUnderTestRunner, listProviders, loadTokens, saveTokens } from './store.js';
 import { readFreshAvailabilityState, quotaSignalDir, readQuotaSignal, readQuotaSignalCredits, readQuotaSignalUsedPercent, readQuotaSignalObservedAt, readQuotaSignalObservedAtRaw } from '../budget/codex-reset-credit-state.js';
 import { creditPaceStatus } from '../budget/codex-credit-pace.js';
+import { noteCodexBillingDecision, type CodexCreditSpendReason } from './codex-billing-route.js';
 import { loadLlmPolicy } from '../policy/llm-policy.js';
 import { getUserConfig } from '../user-config.js';
 import {
@@ -204,6 +205,8 @@ interface RunPin {
   readonly resolution: CodexAccountResolution;
   /** ⛔ 핀이 «갇혔는지»를 싸게 재려면 그 계정의 홈이 필요하다. 모르면 재지 못하므로 그대로 둔다. */
   readonly home: string | undefined;
+  /** 핀을 박은 판정이 크레딧 소진이었나 — 핀으로 돌려줄 때도 과금 경로를 같이 남긴다. */
+  readonly creditReason?: CodexCreditSpendReason;
 }
 const pinnedByRun = new Map<string, RunPin>();
 /** ⛔ 상한 — 장수 프로세스에서 runId 수만큼 «영구히» 자라면 안 된다(리뷰 should-fix).
@@ -213,6 +216,8 @@ const PIN_MAX = 256;
 /** ⛔ 테스트 심 — 고정을 푼다. 프로덕션에서는 부르지 않는다. */
 export function _resetCodexRotationPinForTesting(): void {
   pinnedByRun.clear();
+  // 판정이 남긴 과금 경로도 같이 푼다 — 안 풀면 다음 시험 파일의 codex usage 가 credit 으로 읽힌다.
+  noteCodexBillingDecision(undefined);
 }
 
 /** ⛔⭐⭐ 후보 조립은 «한 자»여야 한다 — 실행 경로와 조회(dry-run)가 다른 자를 쓰면
@@ -728,7 +733,7 @@ export function resolveCodexAccountForRun(
   const explicit = Boolean(env.ELANOUS_CODEX_ACCOUNT?.trim());
   // ⛔⭐ 사람이 «명시»했으면 고정보다 «먼저» 이긴다(결정 ③) — 고정을 읽지도 쓰지도 않는다.
   //   고정이 앞서면, 앞선 호출이 만든 회전 결과가 「명시한 계정」을 덮는다.
-  if (explicit) { observeRotation({ reason: 'explicit' }, current.name); return current; }
+  if (explicit) { observeRotation({ reason: 'explicit' }, current.name); noteCodexBillingDecision(undefined); return current; }
   // ⛔⭐⭐⭐ 설정 판정이 «핀보다 먼저»다(리뷰 must-fix).
   //   핀을 먼저 보면, 같은 런에서 이미 회전·핀된 뒤 설정이 false 로 바뀌어도
   //   ***계속 회전 계정을 돌려준다*** — 「config false 로만 꺼진다」가 핀 경유로 깨진다.
@@ -736,6 +741,7 @@ export function resolveCodexAccountForRun(
   const enabled = rotationConfig.enabled;
   if (!enabled) {
     observeRotation({ reason: 'disabled', disabledProvenance: rotationConfig.state }, current.name);
+    noteCodexBillingDecision(undefined);
     return current;
   }
   // ⛔⭐⭐⭐ 고정은 «런 신원이 있을 때만» 한다.
@@ -763,7 +769,7 @@ export function resolveCodexAccountForRun(
       //   🔑 전환은 «소진당 한 번»으로 갇히고, 그 뒤 다시 핀이 박힌다.
       const pinnedHome = pinned.home;
       const exhausted = pinnedHome !== undefined && pinnedAccountExhausted(pinnedHome, pinned.resolution.name);
-      if (!exhausted) return pinned.resolution;
+      if (!exhausted) { noteCodexBillingDecision(pinned.creditReason); return pinned.resolution; }
       pinnedByRun.delete(runKey);
       debug.log('oauth.codex-account', 'pin-released',
         { account: pinned.resolution.name, why: 'threshold-reached' }, { level: 'warn' });
@@ -806,6 +812,8 @@ export function resolveCodexAccountForRun(
   // CREDIT-SPEND-ORDER(10-12) — «다른 계정의 선불 크레딧으로 옮김»(`rotated` ⊕ creditEntry)도 크레딧 진입이다.
   const creditSpendReason = decision.reason === 'credits-allowed' || decision.reason === 'credit-pace' ? decision.reason
     : decision.reason === 'rotated' && decision.creditEntry ? 'credits-rotated' as const : undefined;
+  // CREDIT-BILLING-LABEL(10-14) — 이 판정으로 나가는 호출의 `llm.usage` 가 `billing='credit'` 이 되게 남긴다.
+  noteCodexBillingDecision(creditSpendReason);
   if (creditSpendReason && !deps.counterPath && isUnderTestRunner(process.env)) {
     // 시험 러너 가드(autoConsume 의 test-runtime-guard 와 같은 관용구) — 카운터를 주입 안 한 시험이 실제 카운터·송신기에 닿지 않는다.
     debug.log('oauth.codex-account', 'credit-spend-alert-skipped', { account: decision.to?.name ?? current.name, reason: 'test-runtime-guard' });
@@ -833,7 +841,11 @@ export function resolveCodexAccountForRun(
       const oldest = pinnedByRun.keys().next().value;
       if (oldest !== undefined) pinnedByRun.delete(oldest);
     }
-    pinnedByRun.set(runKey, { resolution: resolved, home: effectiveCodexHome(resolved, loadTokens(resolved.storeKey, path), env).home });
+    pinnedByRun.set(runKey, {
+      resolution: resolved,
+      home: effectiveCodexHome(resolved, loadTokens(resolved.storeKey, path), env).home,
+      ...(creditSpendReason ? { creditReason: creditSpendReason } : {}),
+    });
   }
   return resolved;
 }

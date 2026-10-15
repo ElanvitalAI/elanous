@@ -9,7 +9,7 @@ import { isPidAlive } from '../git-fs/worktree.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { loadSelfDevRun, selfDevRunsDir, type SelfDevRunState } from '../self-dev/run-store.js';
 import { listPtyManifestRowsAt } from '../pty-shell/pty-manifest.js';
-import { classifyFederatedLedgerDirectoryReadFailure, isTerminatedUnfinishedLifecycle, queryFederatedUnfinishedRunLedgers, resolveFederatedRunLedgerDirectories, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery, type UnfinishedRunLifecycle } from './run-ledger.js';
+import { classifyFederatedLedgerDirectoryReadFailure, isTerminatedUnfinishedLifecycle, queryFederatedUnfinishedRunLedgers, resolveFederatedRunLedgerDirectories, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery, type NonBlockingRunLedgerRecord, type UnfinishedRunLifecycle } from './run-ledger.js';
 import { SELF_IMPLEMENT_PROGRESS_STAGES } from './orchestrator.js';
 
 export type RunningRunStatus = 'running' | 'probable-running' | 'ended-unclosed' | 'unknown';
@@ -55,6 +55,8 @@ export interface RunningRunAssessment {
   readonly ptyUpdatedAt: number | null;
   readonly ledgerDirectories: readonly string[];
   readonly ptyRefs: readonly Pick<FederatedPtyRef, 'instance' | 'id' | 'kind'>[];
+  /** Non-blocking request record (kind·reason·next) carried by this runId's ledger; absent for runs without one. */
+  readonly nonBlocking?: NonBlockingRunLedgerRecord;
 }
 
 export interface RunningRunsObservation {
@@ -376,14 +378,16 @@ export function assessRunningRuns(
     const ledgerDirectories = [...new Set(matchingLedgers.map((entry) => entry.ledgerDirectory))].sort();
     const phase = { phaseObservation: phaseObservation === 'not-observed' && latestPhase ? 'observed' as const : phaseObservation, lastPhase: latestPhase?.phase ?? null, lastPhaseObservedAt: latestPhase?.observedAt ?? null };
     const ptyRefs = refs.map(({ instance, id, kind }) => ({ instance, id, kind }));
+    const nonBlocking = matchingLedgers.find((entry) => entry.nonBlocking)?.nonBlocking;
+    const nonBlockingField = nonBlocking === undefined ? {} : { nonBlocking };
     if (matchingLedgers.some((entry) => isTerminatedUnfinishedLifecycle(entry.lifecycle))) {
-      return { runId, status: 'ended-unclosed' as const, presence: refs.length > 0 ? 'ledger-and-pty-observed' as const : 'ledger-without-pty-observed' as const, reason: 'ledger-positive-termination-evidence', lifecycle, lastActivityTimestamp, ...phase, ptyUpdatedAt, ledgerDirectories, ptyRefs };
+      return { runId, status: 'ended-unclosed' as const, presence: refs.length > 0 ? 'ledger-and-pty-observed' as const : 'ledger-without-pty-observed' as const, reason: 'ledger-positive-termination-evidence', lifecycle, lastActivityTimestamp, ...phase, ptyUpdatedAt, ledgerDirectories, ptyRefs, ...nonBlockingField };
     }
     if (refs.length > 0 && lifecycle === 'live') {
-      return { runId, status: 'running' as const, presence: 'ledger-live-and-pty-observed' as const, reason: 'ledger-live-and-pty-alive', lifecycle, lastActivityTimestamp, ...phase, ptyUpdatedAt, ledgerDirectories, ptyRefs };
+      return { runId, status: 'running' as const, presence: 'ledger-live-and-pty-observed' as const, reason: 'ledger-live-and-pty-alive', lifecycle, lastActivityTimestamp, ...phase, ptyUpdatedAt, ledgerDirectories, ptyRefs, ...nonBlockingField };
     }
     if (matchingLedgers.length > 0 && lifecycle === 'live' && pty.unreadable.length === 0 && refs.length === 0) {
-      return { runId, status: 'probable-running' as const, presence: 'ledger-live-pty-not-observed' as const, reason: 'ledger-without-live-pty', lifecycle, lastActivityTimestamp, ...phase, ptyUpdatedAt, ledgerDirectories, ptyRefs };
+      return { runId, status: 'probable-running' as const, presence: 'ledger-live-pty-not-observed' as const, reason: 'ledger-without-live-pty', lifecycle, lastActivityTimestamp, ...phase, ptyUpdatedAt, ledgerDirectories, ptyRefs, ...nonBlockingField };
     }
     const ledgerUnreadable = hasUnreadableLedgerObservation(ledgerObservation);
     const reason = matchingLedgers.length === 0
@@ -395,7 +399,7 @@ export function assessRunningRuns(
       : matchingLedgers.length === 0 ? 'pty-without-ledger-observed'
       : refs.length === 0 ? 'ledger-without-pty-observed'
       : 'ledger-and-pty-observed';
-    return { runId, status: 'unknown' as const, presence, reason, lifecycle, lastActivityTimestamp, ...phase, ptyUpdatedAt, ledgerDirectories, ptyRefs };
+    return { runId, status: 'unknown' as const, presence, reason, lifecycle, lastActivityTimestamp, ...phase, ptyUpdatedAt, ledgerDirectories, ptyRefs, ...nonBlockingField };
   });
   const counts: Record<RunningRunStatus, number> = { running: 0, 'probable-running': 0, 'ended-unclosed': 0, unknown: 0 };
   for (const entry of entries) counts[entry.status] += 1;
@@ -657,7 +661,7 @@ export function renderRunningRuns(result: RunningRunsResult): string {
     `observed live ptys: ${result.pty.observedRefCount} without runId: ${result.pty.withoutRunIdCount} not counted as running: ${result.pty.notCountedRefCount}`,
     `unreadable pty roots: ${result.pty.unreadable.join(',') || 'none'}`,
     `phase stores: ${result.phases?.targetCount ?? 0} readable: ${result.phases?.readableTargetCount ?? 0} unreadable: ${result.phases?.unreadableTargetCount ?? 0} unreadable targets: ${result.phases?.unreadableTargets.join(',') || 'none'} non-stage events discarded: ${result.phases?.discardedNonStageEventCount ?? 0}`,
-    ...result.entries.map((entry) => `runId=${entry.runId} status=${entry.status} presence=${entry.presence} reason=${entry.reason} lifecycle=${entry.lifecycle ?? 'none'} lastActivity=${entry.lastActivityTimestamp ?? 'null'} phaseObservation=${entry.phaseObservation ?? 'not-observed'} lastPhase=${entry.lastPhase ?? 'none'} lastPhaseObservedAt=${entry.lastPhaseObservedAt ?? 'none'} ledgerDirectories=${entry.ledgerDirectories.join(',') || 'none'} ptyRefs=${entry.ptyRefs.map((ref) => `${ref.instance}:${ref.id}`).join(',') || 'none'}`),
+    ...result.entries.map((entry) => `runId=${entry.runId} status=${entry.status} presence=${entry.presence} reason=${entry.reason} lifecycle=${entry.lifecycle ?? 'none'} lastActivity=${entry.lastActivityTimestamp ?? 'null'} phaseObservation=${entry.phaseObservation ?? 'not-observed'} lastPhase=${entry.lastPhase ?? 'none'} lastPhaseObservedAt=${entry.lastPhaseObservedAt ?? 'none'} ledgerDirectories=${entry.ledgerDirectories.join(',') || 'none'} ptyRefs=${entry.ptyRefs.map((ref) => `${ref.instance}:${ref.id}`).join(',') || 'none'}${entry.nonBlocking ? ` nonBlocking=kind:${entry.nonBlocking.kind} reason:${entry.nonBlocking.reason ?? 'none'} next:${entry.nonBlocking.next ?? 'none'}` : ''}`),
     partial
       ? `quantity scope: running=unknown lowerBound=${lowerBound} population=${result.quantities.running.population}; total=unknown entries=unknown population=${result.quantities.total.population}; ${observationScopeText(result.observation)}`
       : `quantity scope: running=${result.quantities.running.value} population=${result.quantities.running.population}; total=${result.quantities.total.value} entries=${result.quantities.entries.value} population=${result.quantities.total.population}; ${observationScopeText(result.observation)}`,

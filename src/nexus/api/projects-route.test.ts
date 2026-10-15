@@ -82,6 +82,29 @@ test('GET and POST /v1/projects require owner authentication and stay off the pu
   expect(listProjects()).toEqual([]);
 });
 
+test('GET /v1/projects/:id/autopsy requires owner authentication', async () => {
+  const created = await request('POST', { name: 'Example' });
+  const body = await created.json() as { project: { id: string } };
+  const path = `/v1/projects/${body.project.id}/autopsy`;
+  expect(isPublicRoute('GET', path, { setupMode: false })).toBe(false);
+  expect((await request('GET', undefined, '', path)).status).toBe(401);
+  expect((await request('GET', undefined, 'wrong-owner', path)).status).toBe(401);
+  const response = await request('GET', undefined, token, path);
+  expect(response.status).toBe(200);
+  const autopsy = await response.json() as { project: { id: string }; attribution: { status: string; reason?: string } };
+  expect(autopsy.project.id).toBe(body.project.id);
+  expect(autopsy.attribution).toEqual({ status: 'unavailable', reason: 'ledger-project-id-missing' });
+  const missing = await request('GET', undefined, token, '/v1/projects/11111111-1111-4111-8111-111111111111/autopsy');
+  expect(missing.status).toBe(404);
+  expect(await missing.json()).toEqual({ error: 'not-found' });
+  for (const invalid of ['/v1/projects//autopsy', '/v1/projects/no-id/autopsy',
+    `/v1/projects/${body.project.id}/extra/autopsy`, '/v1/projects/%25/autopsy']) {
+    const bad = await request('GET', undefined, token, invalid);
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toEqual({ error: 'bad_request', reason: 'invalid project id' });
+  }
+});
+
 test('authenticated POST persists a project and GET lists it from the project store', async () => {
   const folder = join(root, 'source');
   const created = await request('POST', { name: 'A', primaryFolder: folder });

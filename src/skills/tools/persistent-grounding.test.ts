@@ -1,10 +1,11 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CoreTurnContext, GoalLoopResult } from '../../core-turn/index.js';
 import { runGoalLoop } from '../../core-turn/index.js';
 import { debug } from '../../debug/log.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
 import { findNativeTool } from '../../native-tool-catalog.js';
 import {
   allowedEvidenceRoots,
@@ -422,7 +423,102 @@ describe('persistent grounding', () => {
       const result = await groundPersistently('unread evidence', root, {
         runGoalLoop: async (ctx) => complete(ctx, 'src/candidate.ts: asserted only'),
       });
-      expect(result).toEqual({ files: [], evidence: [], iterations: 2, stopReason: 'goal_complete' });
+      expect(result).toEqual({ files: [], evidence: [], iterations: 2, stopReason: 'evidence_retry_rejected' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('근거 없이 완료한 재시도가 실패하면 실패 사유를 완료와 구분한다', async () => {
+    const root = worktree();
+    let attempts = 0;
+    try {
+      const result = await groundPersistently('unread evidence', root, {
+        runGoalLoop: async (ctx) => {
+          attempts += 1;
+          if (attempts === 1) return complete(ctx, 'src/candidate.ts: guessed from Glob');
+          throw new Error('retry unavailable');
+        },
+      });
+      expect(attempts).toBe(2);
+      expect(result).toEqual({ files: [], evidence: [], iterations: 1, stopReason: 'evidence_retry_failed' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  for (const [retryStopReason, retryOutcome] of [
+    ['auth_rejected', 'auth-rejected'], ['aborted', 'aborted'], ['error', 'failed'], ['soft_stop', 'aborted'],
+  ] as const) {
+    test(`반환형 ${retryStopReason} 재시도는 미완료로 바꾸지 않고 원래 종료 사유를 보존한다`, async () => {
+      const root = worktree();
+      const original = debug.log.bind(debug) as typeof debug.log;
+      const finished: Record<string, unknown>[] = [];
+      let attempts = 0;
+      (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: Record<string, unknown>) => {
+        if (category === 'grounding.persistent' && event === 'finished' && data) finished.push(data);
+      }) as typeof debug.log;
+      try {
+        const result = await groundPersistently('unread evidence', root, {
+          runGoalLoop: async (ctx) => {
+            attempts += 1;
+            if (attempts === 1) return complete(ctx, 'src/candidate.ts: guessed from Glob');
+            return { finalText: '', iterations: 1, stopReason: retryStopReason, goalComplete: false };
+          },
+        });
+        expect(attempts).toBe(2);
+        expect(result?.stopReason).toBe(retryStopReason);
+        expect(finished.at(-1)).toMatchObject({ retryOutcome, retryStopReason, stopReason: retryStopReason, evidenceCount: 0 });
+      } finally {
+        (debug as { log: typeof debug.log }).log = original;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test('미Read 경로 재시도는 정확한 Read 호출을 지시하고 완료 없이 끝난 상태와 실제 모델을 기록한다', async () => {
+    const root = worktree();
+    const original = debug.log.bind(debug) as typeof debug.log;
+    const finished: Record<string, unknown>[] = [];
+    let attempts = 0;
+    (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: Record<string, unknown>) => {
+      if (category === 'grounding.persistent' && event === 'finished' && data) finished.push(data);
+    }) as typeof debug.log;
+    try {
+      const result = await groundPersistently('inspect real candidate', root, {
+        runGoalLoop: async (ctx) => {
+          attempts += 1;
+          ctx.callbacks?.onResolvedProvider?.('openrouter', attempts === 1 ? 'glm-first' : 'glm-retry');
+          if (attempts === 1) return complete(ctx, 'src/candidate.ts: asserted from Glob only');
+          const feedback = String(ctx.messages.at(-1)?.content);
+          expect(feedback).toContain('Read({"file_path":"src/candidate.ts"})');
+          expect(feedback).toContain('Glob, Grep, and ListDir');
+          expect(feedback).toContain('Finish by calling update_goal');
+          return { stopReason: 'end_turn', finalText: 'done', iterations: 1, goalComplete: false };
+        },
+      });
+      expect(attempts).toBe(2);
+      expect(result?.evidence).toEqual([]);
+      expect(result?.stopReason).toBe('evidence_retry_incomplete');
+      expect(finished.at(-1)).toMatchObject({ feedbackRetry: true, retryOutcome: 'incomplete',
+        provider: 'openrouter', model: 'glm-retry', evidenceCount: 0, stopReason: 'evidence_retry_incomplete' });
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('거부된 경로가 여러 개여도 재시도 피드백에 각각의 Read 호출을 적는다', async () => {
+    const root = worktree();
+    const paths = ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts', 'src/e.ts', 'src/f.ts', 'src/g.ts', 'src/h.ts', 'src/i.ts'];
+    let attempts = 0;
+    try {
+      await groundPersistently('inspect candidates', root, {
+        runGoalLoop: async (ctx) => {
+          attempts += 1;
+          if (attempts === 1) return complete(ctx, paths.map((path) => `${path}: discovered by Glob`).join('\n'));
+          const feedback = String(ctx.messages.at(-1)?.content);
+          for (const path of paths) expect(feedback).toContain(`Read({"file_path":"${path}"})`);
+          return { stopReason: 'end_turn', finalText: 'done', iterations: 1, goalComplete: false };
+        },
+      });
+      expect(attempts).toBe(2);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -493,12 +589,34 @@ describe('persistent grounding', () => {
       });
       expect(attempts).toBe(2);
       expect(result).toEqual({ files: ['src/candidate.ts'], evidence: ['src/candidate.ts: verified implementation'],
-        iterations: 1, stopReason: 'goal_complete' });
+        iterations: 1, stopReason: 'evidence_retry_failed' });
     } finally {
       (debug as { log: typeof debug.log }).log = original;
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  for (const [retryStopReason, expected] of [
+    ['auth_rejected', 'auth_rejected'], ['aborted', 'aborted'], ['error', 'error'], ['soft_stop', 'soft_stop'],
+  ] as const) {
+    test(`혼합 첫 증거 뒤 재시도 ${retryStopReason}가 와도 완료로 위장하지 않는다`, async () => {
+      const root = worktree();
+      let attempts = 0;
+      try {
+        const result = await groundPersistently('mixed evidence', root, {
+          runGoalLoop: async (ctx) => {
+            attempts++;
+            if (attempts > 1) return { finalText: '', iterations: 1, stopReason: retryStopReason, goalComplete: false };
+            await ctx.dispatchTool('Read', { file_path: 'src/candidate.ts' },
+              { callId: 'first', sessionId: ctx.sessionId, signal: ctx.signal });
+            return complete(ctx, 'src/candidate.ts: verified implementation\nsrc/unread.ts: guessed path');
+          },
+        });
+        expect(result).toEqual({ files: ['src/candidate.ts'],
+          evidence: ['src/candidate.ts: verified implementation'], iterations: 2, stopReason: expected });
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+  }
 
   test('재시도에 다른 유효 경로와 같은 미Read 경로가 섞여도 첫 유효 근거를 잃지 않는다', async () => {
     const root = worktree();
@@ -522,6 +640,97 @@ describe('persistent grounding', () => {
         evidence: ['src/candidate.ts: first verified path', 'src/second.ts: second verified path'],
         iterations: 2, stopReason: 'goal_complete' });
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('실제 grounding 스트림의 요청 모델이 finished 관측 모델과 일치한다', async () => {
+    const root = worktree();
+    const configRoot = mkdtempSync(join(tmpdir(), 'elanous-grounding-config-'));
+    writeFileSync(join(configRoot, 'config.json'), JSON.stringify({ llm: {
+      provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3', apiKey: 'test-key',
+    } }));
+    const originalLog = debug.log;
+    const originalKey = process.env.OPENROUTER_API_KEY;
+    const originalXdg = process.env.XDG_CONFIG_HOME;
+    const requests: Record<string, unknown>[] = [];
+    const finished: Record<string, unknown>[] = [];
+    const fetchMock = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
+      requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response('data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    }) as typeof fetch);
+    try {
+      delete process.env.XDG_CONFIG_HOME;
+      process.env.OPENROUTER_API_KEY = 'test-key';
+      setElanousConfigDir(configRoot);
+      debug.log = ((category: string, event: string, data: Record<string, unknown>) => {
+        if (category === 'grounding.persistent' && event === 'finished') finished.push(data);
+      }) as typeof debug.log;
+      await groundPersistently('inspect src/candidate.ts', root, { maxIterations: 1, hasAstGrep: () => false });
+      expect(requests.length).toBeGreaterThan(0);
+      expect(finished).toHaveLength(1);
+      expect(requests[0]?.model).toBe('z-ai/glm-5.3');
+      expect(finished[0]).toMatchObject({ provider: 'openrouter', model: `openrouter/${requests[0]?.model}` });
+    } finally {
+      fetchMock.mockRestore();
+      debug.log = originalLog;
+      resetElanousConfigDir();
+      if (originalKey === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = originalKey;
+      if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = originalXdg;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(configRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('근거 루프는 자식 기본 모델 대신 planning 역할 모델을 모든 턴에 전달한다', async () => {
+    const root = worktree();
+    const models: Array<string | undefined> = [];
+    let calls = 0;
+    const original = debug.log;
+    const finished: Record<string, unknown>[] = [];
+    debug.log = ((category: string, event: string, data: Record<string, unknown>) => {
+      if (category === 'grounding.persistent' && event === 'finished') finished.push(data);
+    }) as typeof debug.log;
+    try {
+      await groundPersistently('inspect src/candidate.ts', root, {
+        planningLlm: () => ({ model: 'gpt-6-sol', modelSource: 'config-role' }),
+        runGoalLoop: async (ctx) => {
+          models.push(ctx.modelOverride);
+          calls++;
+          if (calls === 1) return complete(ctx, 'src/candidate.ts: evidence before Read');
+          const callCtx = { callId: 'planning-read', sessionId: ctx.sessionId, signal: ctx.signal };
+          await ctx.dispatchTool('Read', { file_path: 'src/candidate.ts' }, callCtx);
+          return complete(ctx, 'src/candidate.ts: verified implementation candidate');
+        },
+      });
+      expect(models).toEqual(['gpt-6-sol', 'gpt-6-sol']);
+      expect(finished[0]).toMatchObject({ planningModel: 'gpt-6-sol', planningModelSource: 'config-role', evidenceCount: 1 });
+    } finally {
+      debug.log = original;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('자식 모델 폴백은 grounding 완료 관측에 모델 출처와 사유를 남긴다', async () => {
+    const root = worktree();
+    const logs: Record<string, unknown>[] = [];
+    const original = debug.log;
+    debug.log = ((category: string, event: string, data: Record<string, unknown>) => {
+      if (category === 'grounding.persistent' && event === 'finished') logs.push(data);
+    }) as typeof debug.log;
+    try {
+      await groundPersistently('inspect src/candidate.ts', root, {
+        planningLlm: () => ({ model: 'openrouter/z-ai/glm-5.3', modelSource: 'fallback-child', fallbackReason: 'quota-exhausted', requestedModel: 'gpt-6-sol', requestedSource: 'config-role' }),
+        runGoalLoop: async (ctx) => {
+          expect(ctx.modelOverride).toBe('openrouter/z-ai/glm-5.3');
+          await ctx.dispatchTool('Read', { file_path: 'src/candidate.ts' }, { callId: 'fallback-read', sessionId: ctx.sessionId, signal: ctx.signal });
+          return complete(ctx, 'src/candidate.ts: verified implementation candidate');
+        },
+      });
+      expect(logs[0]).toMatchObject({ planningModel: 'openrouter/z-ai/glm-5.3', planningModelSource: 'fallback-child', planningFallbackReason: 'quota-exhausted', planningRequestedModel: 'gpt-6-sol', planningRequestedSource: 'config-role' });
+    } finally {
+      debug.log = original;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('실제 goal loop는 재시도 Read 응답 뒤 다음 턴의 완료 증거를 채택한다', async () => {
@@ -590,7 +799,7 @@ describe('persistent grounding', () => {
           },
         });
         expect(calls).toBe(4);
-        expect(result).toEqual({ files: [], evidence: [], iterations: 2, stopReason: 'goal_complete' });
+        expect(result).toEqual({ files: [], evidence: [], iterations: 2, stopReason: 'evidence_retry_rejected' });
       }
       const result = await groundPersistently('valid dispatcher result', root, {
         dispatchTool: async () => validReadResult,
@@ -743,7 +952,7 @@ describe('persistent grounding', () => {
       const finished = logs.find((log) => log.category === 'grounding.persistent' && log.event === 'finished');
       expect(Object.keys(finished?.data as object).sort()).toEqual([
         'candidateCount', 'candidates', 'durationMs', 'evidenceCount', 'evidenceRejection', 'feedbackRetry', 'firstEvidenceRejection',
-        'iterations', 'maxIterations', 'outcome', 'sessionId', 'stopReason', 'toolCalls',
+        'iterations', 'maxIterations', 'model', 'outcome', 'planningFallbackReason', 'planningModel', 'planningModelSource', 'planningRequestedModel', 'planningRequestedSource', 'provider', 'retryOutcome', 'retryStopReason', 'sessionId', 'stopReason', 'toolCalls',
       ]);
       expect((finished?.data as { evidenceRejection?: unknown }).evidenceRejection).toEqual({
         noPath: 2,

@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { nativeToolCatalog } from '../src/native-tool-catalog.js';
 import { SELF_COGNITION_MCP_CATALOG_ENTRIES } from '../src/tool-runtime/self-cognition-runtimes.js';
 import { buildDashboardSlashRegistry } from '../src/dashboard/slash-runtime/index.js';
-import retiredCatalogIds from '../docs/measurements/NTC1-retired-native-tool-ids.json';
+import retiredCatalogIds from './fixtures/NTC1-retired-native-tool-ids.json';
 
 describe('HT3 — native-tool wiring lint', () => {
   test('script exists + imports cleanly', async () => {
@@ -54,13 +54,13 @@ describe('HT3 — native-tool wiring lint', () => {
   test('self-implement P2 — implementation catalog ID inventory', () => {
     const implementationCatalogEntries = nativeToolCatalog.slice(SELF_COGNITION_MCP_CATALOG_ENTRIES.length);
     const ids = implementationCatalogEntries.map(entry => entry.id);
-    expect(ids).toHaveLength(178);
+    expect(ids).toHaveLength(186);
     expect(new Set(ids).size).toBe(ids.length);
     expect(Object.keys(retiredCatalogIds).sort()).toEqual(['baselineIds', 'retiredIds']);
     expect(retiredCatalogIds.retiredIds).toHaveLength(18);
     expect(new Set(retiredCatalogIds.retiredIds).size).toBe(retiredCatalogIds.retiredIds.length);
     expect(ids.filter(id => retiredCatalogIds.retiredIds.includes(id))).toEqual([]);
-    expect(retiredCatalogIds.baselineIds).toHaveLength(196);
+    expect(retiredCatalogIds.baselineIds).toHaveLength(204);
     expect(new Set(retiredCatalogIds.baselineIds).size).toBe(retiredCatalogIds.baselineIds.length);
     expect([...ids, ...retiredCatalogIds.retiredIds].sort()).toEqual([...retiredCatalogIds.baselineIds].sort());
     expect(ids).toContain('self_implement');

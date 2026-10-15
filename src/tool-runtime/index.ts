@@ -32,6 +32,7 @@ import { agentReplyRuntime } from './agent-reply-runtime.js';
 import { agentStopRuntime } from './agent-stop-runtime.js';
 import { ALL_TEAM_TOOL_RUNTIMES } from './team-tool-runtimes.js';
 import { ALL_OPS_FLEET_RUNTIMES } from './ops-fleet-runtimes.js';
+import { ALL_OPS_LEDGER_RUNTIMES } from './ops-ledger-runtimes.js';
 import { ALL_AUTO_RESEARCH_RUNTIMES } from './auto-research-runtimes.js';
 import { ALL_INTELLIGENCE_MAP_RUNTIMES } from './intelligence-map-runtimes.js';
 import { ALL_CFT_ANDON_RUNTIMES } from './cft-andon-runtimes.js';
@@ -115,6 +116,9 @@ export function registerAllDefaultToolRuntimes(): void {
   registerToolRuntime(agentStopRuntime);
   for (const rt of ALL_TEAM_TOOL_RUNTIMES) registerToolRuntime(rt);
   for (const rt of ALL_OPS_FLEET_RUNTIMES) registerToolRuntime(rt);
+  // Ops-ledger (우편 msg · 판 release checklist) — in-process ledger tools so
+  // TUI OP turns stop paying 1.3–2s of `eln` CLI startup per msg/checklist op.
+  for (const rt of ALL_OPS_LEDGER_RUNTIMES) registerToolRuntime(rt);
   for (const rt of ALL_AUTO_RESEARCH_RUNTIMES) registerToolRuntime(rt);
   for (const rt of ALL_INTELLIGENCE_MAP_RUNTIMES) registerToolRuntime(rt);
   for (const rt of ALL_CFT_ANDON_RUNTIMES) registerToolRuntime(rt);

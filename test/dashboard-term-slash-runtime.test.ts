@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 
-import { createDashboardTermSlashRuntime } from '../src/dashboard/term-slash-runtime.js';
+import { createDashboardTermSlashRuntime, resolveTuiShellSeat } from '../src/dashboard/term-slash-runtime.js';
+
+test('TUI shell seat comes from the workdir, then COORD_ID, then unknown', () => {
+  expect(resolveTuiShellSeat('/tmp/hq/seats/OP', 'UX')).toBe('OP');
+  expect(resolveTuiShellSeat('/tmp/worktree', 'UX')).toBe('UX');
+  expect(resolveTuiShellSeat('/tmp/worktree')).toBe('unknown');
+});
 
 describe('createDashboardTermSlashRuntime', () => {
   test('builds matrix and resume feedback lines', () => {

@@ -4,7 +4,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CmdRunner } from '../../src/autopilot/pr-manager.js';
@@ -64,6 +64,8 @@ function scenario(advance: readonly string[], opts: { mergeTip?: boolean } = {})
 }
 const verify = (evidencePath: string, head: string, cwd = work) => verifyOverlapEvidence({
   evidencePath, pr: 51, expectedHead: head, remote: 'origin', branch: 'main', cwd, run, readFile: (p) => readFileSync(p, 'utf8'),
+  reviewResultsDir: join(root, 'review-results'), listDir: readdirSync,
+  reviewMtime: (p) => statSync(p).mtimeMs, reviewRealPath: realpathSync,
 });
 
 describe('OVERLAP-EVIDENCE-BASE-WINDOW — real git', () => {
@@ -171,9 +173,14 @@ describe('already-ancestor-auto — 증거 파일 없이', () => {
     expect(auto(head, reviewResultsDir, [landed])).toEqual({ ok: false, reason: 'review-must-fix-1' });
   });
 
-  it('PR-LAND-MUSTFIX-NONE — must-fix 칸이 «(없음 — 수용기준 충족 …)» 표지 한 줄뿐이면 0 으로 보고 통과', () => {
-    const { landed, head, reviewResultsDir } = ancestorScenario({ verdict: 'pass', mustFix: ['(없음 — 수용기준 충족: 관문이 리뷰 출력과 같은 판정을 쓴다)'] });
+  it('PR-LAND-MUSTFIX-NONE — 검증된 무소견 표지만 있으면 0 으로 보고 통과', () => {
+    const { landed, head, reviewResultsDir } = ancestorScenario({ verdict: 'pass', mustFix: ['(없음 — 수용기준 충족)'] });
     expect(auto(head, reviewResultsDir, [landed])).toMatchObject({ ok: true, mode: 'already-ancestor-auto' });
+  });
+
+  it('PR-LAND-MUSTFIX-NONE — 미확인 설명은 must-fix 로 남겨 착지를 거부', () => {
+    const { landed, head, reviewResultsDir } = ancestorScenario({ verdict: 'pass', mustFix: ['(없음 — 수용기준 충족: 관문이 리뷰 출력과 같은 판정을 쓴다)'] });
+    expect(auto(head, reviewResultsDir, [landed])).toEqual({ ok: false, reason: 'review-must-fix-1' });
   });
 
   it('같은 머리의 리뷰 중 하나라도 must-fix 가 남으면 거부(처음 통과한 하나로 승인하지 않는다)', () => {

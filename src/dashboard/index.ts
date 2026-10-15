@@ -6,10 +6,12 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { fileURLToPath } from 'node:url';
+import { createRunningBuildStatus } from './running-build-status.js';
+import { reportTuiTurn } from '../pty-shell/tui-run-state.js';
 import { createStaleInstallCheck, formatStaleInstallNotice, readCurrentInstalledCommit, readDashboardBootCommit, STALE_INSTALL_CHECK_INTERVAL_MS, versionedDashboardInstallDir } from './stale-install-check.js';
 import { spawn, spawnSync } from 'node:child_process';
 import { $ } from 'bun';
-import { LOCAL_SKILLS_DIR, SERVICE_NAMES, DATA_DIR, OBSIDIAN_VAULT } from '../config.js';
+import { LOCAL_SKILLS_DIR, DATA_DIR, OBSIDIAN_VAULT } from '../config.js';
 import { dispatchDashboardSessionRuntimeTool } from './session-runtime-dispatch.js';
 import { nextChatScrollOffset } from '../chat/log-scroll-key.js';
 import { suggestProjectForFolder } from '../project/project-store.js';
@@ -160,8 +162,8 @@ function loadLastSelection(): LastSelection | null {
 }
 import { getLocalSkills, executeSync } from '../sync.js';
 import { computeDiff } from '../smart.js';
-import { analyzeDiff, summarizeDiff, isAnalyzerAvailable } from '../grok.js';
-import { C, ICONS, ansi, initTui, closeTui, setExitNotice, readKey, setKeyTracer, render, resetRenderCache, termSize, pad, stripAnsi, timeSince, hLine, showHelp, invalidateRenderCacheRow, wrapAnsiByWidth, injectKey } from '../tui.js';
+import { summarizeDiff, isAnalyzerAvailable } from '../grok.js';
+import { C, ICONS, ansi, initTui, closeTui, setExitNotice, readKey, setKeyTracer, render, termSize, pad, stripAnsi, hLine, showHelp, invalidateRenderCacheRow, wrapAnsiByWidth, injectKey } from '../tui.js';
 import { paintCursor, type CursorState } from '../display/cursor-state.js';
 import type { CursorDecision } from '../display/cursor-owner.js';
 import type { Key, RenderOptions } from '../tui.js';
@@ -169,7 +171,6 @@ import {
   createTurnTypeaheadState,
   applyTurnTypeaheadKey,
   renderTurnTypeaheadQueueRow,
-  drainTurnTypeaheadOnce,
   renderTurnTypeaheadEcho,
 } from '../chat/turn-typeahead.js';
 import { dispatchStreamingTurnTypeaheadSubmission } from './input/streaming-turn-typeahead.js';
@@ -180,13 +181,11 @@ import type { CoreTurnDispatchTool } from '../core-turn/index.js';
 // ACP pair (see `bootDashboardAcpSession`), which internally routes
 // to streamLLMWithTools via runCoreTurn.
 import {
-  startSpinner,
   createChatState,
   buildContext,
   formatResponse,
   onEscAbort,
   attachStreamingKeys,
-  SLASH_COMMANDS,
   type InputResult,
   type TextInputExternalSubmitRequest,
 } from '../chat/index.js';
@@ -198,6 +197,7 @@ import {
 } from '../chat/hud-segments-wire.js';
 import { PreviewTerminal } from '../preview/terminal.js';
 import { startThinking, startPinnedThinking, type ThinkingHandle } from '../thinking-line.js';
+import { goalLoopIterationThinking } from './goal-loop-thinking.js';
 import { debug, getAmbientSessionId } from '../debug/log.js';
 import { startEventLoopStallMonitor, thinkingVerbFromFooter } from './event-loop-stall-monitor.js';
 import { getPushcutClient } from '../pushcut/client.js';
@@ -220,11 +220,6 @@ import {
   registerAction as inputCoreRegisterAction,
   addDefaultBinding as inputCoreAddDefaultBinding,
   initUserBindings as initInputCoreUserBindings,
-  readAuditTail,
-  isInputAuditEntry,
-  formatAuditEntry,
-  parseDuration as parseAuditDuration,
-  runRebindCommand,
   type DispatchContext as InputCoreDispatchContext,
   type MouseInputEvent as InputCoreMouseInputEvent,
   type RouteCallbacks as InputCoreRouteCallbacks,
@@ -255,7 +250,6 @@ import { wireInputModeContextBridge } from '../input-core/mode-context-bridge.js
 import { getDashboardContextKeyService } from './context/keys.js';
 import {
   getDashboardContextMenuRegistry,
-  handleForPill,
 } from './context-menu/registry.js';
 import { createTransientOverlayHost } from '../display/transient-overlay-host.js';
 import { configureThemeIconsGetter } from '../theme/icons.js';
@@ -267,7 +261,6 @@ import {
 } from '../log-pane/buffer-policy.js';
 import { publishFocusContextKeysFromService } from './context/focus-bridge.js';
 import {
-  modalBlocksBackground,
   modalParticipatesInViewMode,
   renderModalStack,
   topBlockingForegroundModalSurface,
@@ -285,7 +278,6 @@ import {
   debugWorkbenchIndexForTarget,
   getDebugCompanionSpec,
   listDebugCompanionKeys,
-  resolveDebugCompanionTargets,
   type DebugWorkbenchPane,
 } from '../window/debug-window-consumers.js';
 import {
@@ -295,7 +287,6 @@ import {
 } from '../window/tablet-workspace-policy.js';
 import {
   type PromptFrame,
-  bottomFixedRowsForPromptFrame,
   resolvePromptFrame,
 } from '../display/prompt-frame.js';
 import { resolveBottomSlotBounds } from '../display/bottom-slot.js';
@@ -341,27 +332,8 @@ import { attachDashboardQuickPassConsumers } from './input/control-signal-consum
 import { resolveDashboardChatMainSlashCommand } from './input/chat-main-slash-command.js';
 import { TuiChatPersonaSelection, tuiChatPersonaMessages } from './slash-runtime/chat-persona.js';
 import { awaitGlobalPersonaLoad } from '../persona/global-registry.js';
-import { resolveDashboardChatMainCacheCommand } from './input/chat-main-cache-command.js';
-import {
-  dashboardDeltaHelpLines,
-  resolveDashboardChatMainDeltaCommand,
-} from './input/chat-main-delta-command.js';
-import {
-  DASHBOARD_SETUP_STEPS,
-  dashboardSetupHelpLines,
-  resolveDashboardChatMainSetupCommand,
-} from './input/chat-main-setup-command.js';
 import { createDashboardInlineSetupFlow } from './setup-inline.js';
-import { resolveDashboardChatMainThemeCommand } from './input/chat-main-theme-command.js';
-import { resolveDashboardChatMainLogCommand } from './input/chat-main-log-command.js';
 import { noProviderReply } from './input/no-provider-reply.js';
-import {
-  dashboardLogHelpLines,
-  resolveDashboardLogFilterAction,
-  resolveDashboardLogSearchAction,
-  resolveDashboardLogSizeAction,
-  resolveDashboardLogTurnAction,
-} from './input/chat-main-log-actions.js';
 import type { LogTurnSeparatorMode } from './log-turn-separator-mode.js';
 import { createDashboardChatMainInteractionOpts } from './input/chat-main-interaction-opts.js';
 import { createDashboardChatMainCompletionOpts } from './input/chat-main-completion-opts.js';
@@ -379,6 +351,7 @@ import {
   matchDashboardChordAction,
 } from './input/dashboard-chord-actions.js';
 import { createDashboardChordRuntime } from './input/dashboard-chord-runtime.js';
+import { registerLogFoldInputBinding } from './input/log-fold-binding.js';
 import { handleDashboardDisplayKeyRoute } from './input/dashboard-display-key-route.js';
 import { routeDashboardPriorityKey } from './input/dashboard-priority-key-route.js';
 import { shouldPassthroughDashboardHostOwnedInputCoreAction } from './input/input-core-host-action.js';
@@ -425,7 +398,6 @@ import {
 } from './voice-host-boot.js';
 import {
   bootDashboardAutoTts,
-  handleAutoTtsSlash,
 } from './auto-tts/auto-tts-host-boot.js';
 import {
   bootDashboardVoiceChat,
@@ -443,7 +415,6 @@ import {
 import {
   resolveLegacyForegroundModalFocusPlan,
   resolveLegacyForegroundModalDemotionTransition,
-  resolveLegacyForegroundModalFallbackPane,
 } from './input/foreground-modal-focus.js';
 import {
   resolveDashboardInitialWorkingFocus,
@@ -460,18 +431,10 @@ import { addHint, listHints, removeHint, resetScope } from '../tool-hints/regist
 import { resetGateCache } from '../tool-hints/gate.js';
 import { collectSignals, signalsSummary } from '../tool-hints/signals.js';
 import { resetProbes } from '../tool-hints/probe.js';
-import {
-  addAllowed,
-  hostOf,
-  listAllowed,
-  rateLimitStatus,
-  removeAllowed,
-} from '../tool-hints/api-allowlist.js';
 import type { HintScope } from '../tool-hints/types.js';
-import { listSkillNames, describeSkill } from '../skills/runner.js';
 import { globalAgentRegistry, type AgentToolCallEvent } from '../agent/registry.js';
 import { SELF_IMPLEMENT_TOOL_NAMES } from '../boot/daemon-tools/self-implement-names.js';
-import { FOLD_LIMITS, type FoldMode } from '../log-entry.js';
+import { type FoldMode } from '../log-entry.js';
 import { renderToolCallEvent, renderToolResultVariants } from '../chat/tool-render/index.js';
 import { FoldStack } from '../fold-stack.js';
 import { getSkillIndex, reloadSkillIndex, applySkillFilter, skillIndexProblems } from '../skills/index.js';
@@ -546,7 +509,11 @@ export function formatEscAbortWaitingTargets(targets: readonly string[]): string
 export function settleEscAbortPendingLines(lines: string[], fromIndex: number): void {
   let settled = false;
   for (let index = fromIndex; index < lines.length;) {
-    const line = lines[index]!;
+    const line = lines[index];
+    if (typeof line !== 'string') {
+      index += 1;
+      continue;
+    }
     const isAbortPending = line.startsWith('  ⏳ 중단 요청됨 — ');
     const isAbortRepeat = /^  ⏳ ESC 재시도 \d+회 — /.test(line);
     if (!isAbortPending && !isAbortRepeat) {
@@ -625,38 +592,33 @@ export function getEscAbortRunningCount(
     return Math.max(1, registeredRunning);
   }
 }
-import { resetOnboardingMarker } from '../onboarding.js';
+import { needsOnboarding, resetOnboardingMarker } from '../onboarding.js';
 import {
   getUserConfig, reloadUserConfig, saveUserConfig,
   rotateNextProvider, jumpToRotationEntry, rotationEntryLabel, applyRotationEntry,
-  currentRotationIndex, resolveAcpHopCapFromConfig,
+  resolveAcpHopCapFromConfig,
   VOICE_HARDCODED_DEFAULTS,
 } from '../user-config.js';
-import { listProviders, streamLLM, anyProviderAvailable, getProviderForConfig, REASONING_CYCLE, nextReasoningLevel, reasoningLevelLabel, effectiveReasoningLevel, modelSupportsReasoning, type LLMMessage, type LLMToolSpec } from '../llm.js';
-import { resolveRouteDecision, recordCurrentRouteDecision, currentRouteDecision, formatRouteDecisionSummary } from '../llm/route-decision.js';
-import type { ReasoningLevel } from '../user-config.js';
+import { streamLLM, anyProviderAvailable, getProviderForConfig, nextReasoningLevel, reasoningLevelLabel, effectiveReasoningLevel, modelSupportsReasoning, type LLMMessage, type LLMToolSpec } from '../llm.js';
+import { currentRouteDecision, formatRouteDecisionSummary } from '../llm/route-decision.js';
+import { resolveDashboardActiveModel } from './acp-active-model.js';
 import { getModelFamily, getModelTier } from '../models/prompts.js';
 import { buildPromptInjection, getPromptBankStore } from '../prompt-bank/index.js';
-import { getInputHistoryStore, inputHistoryDbPath, inputHistoryJsonPath } from '../input-history.js';
+import { getInputHistoryStore } from '../input-history.js';
 import { inspectActiveProvider } from '../provider-summary.js';
+import { createStatusProviderInfoReader } from '../status/status-provider-info.js';
 import { activeCodexAccountView } from '../oauth/codex-account-store.js';
-import { buildDashboardStatusLines } from './dashboard-status-lines.js';
-import { readSlashContextNow, seatsNowLine } from '../context-bus/context-now-surfaces.js';
+import { buildDashboardStatusLines, readDashboardSeatsNow, type DashboardStatusLinesInput } from './dashboard-status-lines.js';
 import { buildFirstScreenBand, resolveTuiDaemonLink, type TuiDaemonLink } from './first-screen-band.js';
 import { detectLocale } from '../expression/locale.js';
 import { runNexusShow, type NexusShowResult } from '../cli/nexus-show.js';
 import {
-  workingDirSegment, sessionCwdSegment, modelSegment, gitSegment,
-  ctxBarSegment, costSegment, speedSegment, elapsedSegment, cacheSegment,
-  ptyShellCountSegment,
-  voiceCostSegment,
   type GitSegmentState,
 } from '../status/bar.js';
 // PR-S1V.5 — voice month-to-date USD pill on the secondary status row.
 // The tracker is process-wide so the same singleton is read here and
 // updated by `voice-input-bridge.transcribe` (TUI path) + daemon REST
 // handler (PWA path).
-import { globalVoiceCostTracker } from '../voice/cost-tracker.js';
 import { createDashboardMouseWiring } from './input/mouse-wiring.js';
 import { createMouseConversationPopupRuntime } from './input/mouse-conversation-popup-runtime.js';
 import { createMouseModalHitRuntime } from './input/mouse-modal-hit-runtime.js';
@@ -740,7 +702,7 @@ import { createDashboardContextMenuFeedbackRuntime } from './context-menu-feedba
 import { createDashboardStatusFeedbackRuntime } from './status-feedback-runtime.js';
 import { createDashboardTransferFeedbackRuntime } from './transfer-feedback-runtime.js';
 import { createDashboardFinderFeedbackRuntime } from './finder-feedback-runtime.js';
-import { createDashboardTermSlashRuntime } from './term-slash-runtime.js';
+import { createDashboardTermSlashRuntime, resolveTuiShellSeat } from './term-slash-runtime.js';
 import { createDashboardShellSlashRuntime } from './shell-slash-runtime.js';
 import { createDashboardRunSkillSlashRuntime } from './run-skill-slash-runtime.js';
 import { createDashboardSkillTriggersSlashRuntime } from './skill-triggers-slash-runtime.js';
@@ -790,7 +752,6 @@ import { createPfcScreenshotAttacher, type PfcScreenshotAttacher } from '../cond
 import { createStatusShellPostureRuntime } from './status-shell-posture-runtime.js';
 import { createTerminalHostFacade } from '../shell-runner/terminal-host-facade.js';
 import {
-  buildTerminalMouseIntentEvent,
   interpretTerminalSurfaceIntent,
 } from './terminal-surface-intent.js';
 import {
@@ -821,15 +782,12 @@ import { bootDashboardApproverRuntimes } from './approver-runtime-boot.js';
 import { bootDashboardCaptureSourceProviders } from './capture-source-provider-boot.js';
 import { bootDashboardContextMenuProviders } from './context-menu-provider-boot.js';
 import { bootDashboardContextMenuRegistry } from './context-menu-registry-boot.js';
-import { buildPillMenu } from '../ui/context-menu-registry.js';
-import { createActionPickerRecipe } from '../mouse-action-recipes.js';
-import type { PopupPlacement } from '../ui/chrome/picker-popup-placement.js';
-import { deriveSubmenuPopupRoleTheme } from '../ui/submenu-popup-theme.js';
 import { bootDashboardContextRuntime } from './context-runtime-boot.js';
 import { bootDashboardContextWindowRuntime } from './context-window-runtime-boot.js';
 import { bootDashboardEagerTools } from './eager-tool-boot.js';
 import { bootDashboardEmbodiedTools } from './embodied-tools-boot.js';
 import { bootDashboardHitl } from './hitl-boot.js';
+import { bootBannerStatusLines, normalizeBootBannerMode, renderMinimalBootBand, type BootBannerHeld } from './boot-banner.js';
 import { attachDashboardFilePathToken } from './file-path-attachment.js';
 import { bootDashboardSlashExecutor } from './slash-executor-boot.js';
 import { buildDashboardSlashRegistry, type DashboardSlashContext } from './slash-runtime/index.js';
@@ -880,14 +838,14 @@ import {
 } from '../dashboard-pane-context-menu.js';
 // writeClipboard imported below with other clipboard helpers (line ~185).
 import {
-  renderPaneNav, paneAtColumn, paneNavLabel,
+  paneAtColumn, paneNavLabel,
   type PaneNavHitArea,
 } from './panes/nav.js';
 import { getSessionCwd, setSessionCwd, subscribeSessionCwd, pickSwdTargetFromBrowser } from '../session/working-dir.js';
 import {
   getGitStatusView,
   subscribeGitChanges,
-  refreshDirty as refreshGitDirty,
+  refreshDirtyAsync as refreshGitDirtyAsync,
 } from '../git-fs/index.js';
 import { getPty, listPty, requestPtyTakeover } from '../pty-shell/registry.js';
 import { listPtyManifestRowsAt } from '../pty-shell/pty-manifest.js';
@@ -899,16 +857,13 @@ import { formatPtyCallLine, formatPtyResultLine } from '../pty-activity-log.js';
 import { getSessionMetrics } from '../status/metrics.js';
 import {
   createContextRegistry, tokenizeInput, pruneUnreferenced,
-  addAttachment as ctxAdd,
   addAttachmentEx as ctxAddEx,
-  clearAll as ctxClearAll, clearLarge as ctxClearLarge,
   dropAttachment as ctxDrop, listAttachments as ctxList,
   totalContextBytes as ctxTotalBytes,
-  DEFAULT_LARGE_THRESHOLD_BYTES,
   type Attachment,
 } from '../context.js';
 import { loadAllAttachments } from '../extractors.js';
-import { grabClipboardImage, pruneOldPastes, isClipboardSupported, writeClipboard, writeClipboardDetailed, hasClipboardImage } from '../clipboard/index.js';
+import { grabClipboardImage, pruneOldPastes, isClipboardSupported, writeClipboard, writeClipboardDetailed } from '../clipboard/index.js';
 import { startClipboardHistory, type ClipboardHistory } from '../clipboard/history.js';
 import { renderImagePreview } from '../image/preview.js';
 import { isKgpTerminal } from '../kgp/capabilities.js';
@@ -917,23 +872,19 @@ import { _internal as previewRouterInternal } from '../preview/router.js';
 import { showPreviewModal } from './modals/preview.js';
 import { terminalModalRouter } from './input/terminal-modal-router.js';
 import {
-  computeDashboardViewMode,
   syncDashboardViewModeToContextKeys,
   type DashboardViewModeSignals,
 } from './runtime/view-mode.js';
 import { IDLE_VIEW_MODE, type ViewMode } from '../input-core/view-mode.js';
-import { createInteractiveTerminalModal } from '../interactive-terminal-modal.js';
 import { showToast } from './render/toast.js';
 import {
   browserWidgetInstanceIdForView,
-  shortcutFor,
 } from './modals/pane.js';
 import { showTransientTerminalModal, currentTransientTerminalModal } from './modals/transient.js';
-import { showPaneMultiModal, showLivePaneMultiModal, currentPaneMultiModal, type PaneMultiModalHandle } from './modals/pane-multi.js';
+import { showLivePaneMultiModal, type PaneMultiModalHandle } from './modals/pane-multi.js';
 import {
   resolveCompanionPopupChrome,
   resolveCompanionPopupTitleControls,
-  resolveWindowScopedCompanionPopupChrome,
 } from './modals/companion-popup-chrome.js';
 import {
   resolveDebugPaneMultiChrome,
@@ -951,30 +902,22 @@ import {
   BroadcastBus,
   PreviewSlotAdapter,
   getChannelBus,
-  type TerminalPlacement,
 } from '../terminal-matrix/index.js';
-import { resolveTerminalMoveDestination } from '../terminal-matrix/mobility.js';
 import { initElementObservability } from '../element-registry/index.js';
 import {
-  armSessionQuickControl,
   createSearchPlannerState,
   buildSessionRuntimeToolSpecs,
   buildSessionDashboardStatusLines,
-  buildSessionSurfaceStatusLines,
   consumeSessionQuickControl,
   createSessionPostureState,
   enterSessionControlMode,
   exitSessionControlMode,
   isSessionControlActive,
   routeDevHarnessSubmitIntent,
-  parseSessionControlSlash,
-  parseSessionSurfaceSlash,
   resolveSessionInputModeFromChatMode,
   resolveSessionModeSnapshot,
   resolveSessionSurfaceStatus,
-  setSessionPreferredSurface,
   toggleSessionControlMode,
-  type SearchPlannerState,
 } from '../session-runtime/index.js';
 import {
   initDashboardApprovers,
@@ -987,12 +930,13 @@ import {
   bootDashboardAcpSession,
   deriveDaemonHttpBase,
   fetchDaemonSessionHistory,
-  fetchDaemonSessionList,
 } from './acp-boot.js';
 import { renderReplayPreviewLines } from './replay-preview.js';
 import {
   buildDashboardTurnPreamble,
 } from './turn-preamble.js';
+import { describeSeatBoot, startSeatBootConversation } from './seat-boot-preamble.js';
+import { ensureSeatLocalInstructions, installSeatSessionRecorder } from './seat-local-instructions.js';
 import type { DashboardSession } from '../tui-client/dashboard-session.js';
 import type { SessionTurnProfile } from '../session-runtime/index.js';
 import { createCompanionSurfaceHostRegistry } from './companion-surface-host-registry.js';
@@ -1021,7 +965,6 @@ import {
 } from '../display/workspace-affinity.js';
 import { initDashboardHitl, stopDashboardHitl } from './runtime/hitl.js';
 import { openDashboardShellRollupPopup } from './shell-rollup-popup.js';
-import { expandPromptReferences } from '../prompt/references.js';
 import { spawnCodingAgent, CodingAgentBinaryMissing } from '../terminal/coding-agent.js';
 import type { TerminalSession } from '../terminal/session-registry.js';
 import { createSessionPickerModal } from '../session/picker-modal.js';
@@ -1031,15 +974,13 @@ import { listSessions as listChatSessionsForResume, adoptSession as adoptChatSes
 // 영속은 세션 스토어(forkSessionFromHistory)가 담당한다.
 import { userMessagePositions, truncateBeforeNthUser } from '../acp/session-fork.js';
 import { resolveEscEscRewind } from '../chat/esc-esc-rewind.js';
-import { wirePersistence, loadPersistedSessions } from '../terminal/session-persistence.js';
+import { wirePersistence } from '../terminal/session-persistence.js';
 import { renderMarkdown as renderMarkdownGlow } from '../markdown-preview.js';
 import { basename, dirname } from 'path';
 import { statSync } from 'fs';
 import {
-  FIGURES, applyColor, toolHeader, toolResult, toolBlock,
-  renderTable, renderMarkdown, successLine, errorLine, warningLine,
-  sectionHeader, progressIndicator, renderTaskStatus,
-  type StatusColor, type TaskStatus,
+  FIGURES, toolHeader, toolResult,
+  renderMarkdown, successLine, errorLine, warningLine,
 } from '../render.js';
 import type { SyncMode } from '../types.js';
 import type { ChatMessage } from '../chat/index.js';
@@ -1047,12 +988,12 @@ import type { PlainTurnSubmit } from '../input/turn-submit.js';
 // U-4.2 · `renderLogPane` no longer called from dashboard directly —
 // wd-log widget owns log rendering via renderLogViaWidget. Only
 // `findBlock` still used here (chat-input block navigation).
-import { findBlock } from '../panes/log-pane.js';
+import { findBlock, logPaneContentHeight, maxLogPaneScroll, visibleSearchRowOffset } from '../panes/log-pane.js';
 import { createQuitConfirmationState, gracefulQuit, type QuitConfirmationState } from './graceful-quit.js';
-import { enqueuePendingUserInput } from '../session/pending-input.js';
+import { handoffTurnTypeaheadAtTurnEnd, releaseTurnTypeaheadPending, steerLastTurnTypeaheadSubmission } from './input/turn-steer-bridge.js';
 import { createAttachmentRowMap } from '../log-pane/attachment-row-map.js';
 import { createAttachmentPopup, type AttachmentPopupAction } from '../log-pane/attachment-popup.js';
-import { findLogMatches, type LogSearchResult } from '../log-pane/search.js';
+import { findLogMatches, findVisibleLogMatches, type LogSearchResult } from '../log-pane/search.js';
 import { createLogSearchModal, type LogSearchModalOpts } from '../log-pane/search-modal.js';
 // U-4.3 · direct imports of tryAttachmentHitAtBodyRow /
 // tryHandleLogAreaClick are gone · wd-log.onMouse owns the hit-test.
@@ -1111,7 +1052,6 @@ import {
 } from '../skills/tools/dashboard-config.js';
 import {
   initDashboardWidgetTools,
-  type WidgetInfo,
 } from '../skills/tools/dashboard-widget.js';
 import { initWidgetInspectorTools } from '../skills/tools/widget-inspector.js';
 import {
@@ -1124,7 +1064,6 @@ import {
 } from '../agent/spawn-embodied-agent-in-vw.js';
 import { findSessionObserver } from '../agent/observer-registry.js';
 import {
-  conversationHoverHudLabel,
   conversationModalTitle,
   conversationModalWidgetId,
   findConversationSessionEntry,
@@ -1170,10 +1109,10 @@ import {
 import { computeWorkingFocusSync } from '../display/working-focus-sync.js';
 import { dispatchPaneClick } from '../display/pane-click-dispatch.js';
 import { installResizeListener } from '../display/resize-listener.js';
-import { isPtyForwardMouseEventType, type KeyEvent as DisplayKeyEvent } from '../display/types.js';
+import { isPtyForwardMouseEventType } from '../display/types.js';
 import { createDisplayEventBus } from '../display/events.js';
 import { agentBatchScratchTitle, renderAgentBatchScratch } from '../display/agent-batch.js';
-import { createExecutionSurface, type ExecutionSurfaceHandle } from '../display/index.js';
+import { type ExecutionSurfaceHandle } from '../display/index.js';
 import { AgentSurfaceStore, renderAgentDetail, renderAgentRoster, type AgentSurfaceState } from '../display/agent-surface.js';
 import { globalAgentFlash } from '../display/agent-flash.js';
 import { renderDebugEventDetail, renderDebugEventRows, renderDebugStack, renderPromptInjectionDebug } from '../display/debug-surface.js';
@@ -1196,9 +1135,9 @@ export function registerDashboardCoreHostTools(host: Pick<PluginHost, 'registerH
   }
 }
 import { registerDashboardPaneHostTools } from './panes/host-tools.js';
-import { DEFAULT_THEME_TOKENS, mergeThemeTokens, resolveThemeTokens, type ThemeTokenInput, type ThemeTokens } from '../theme/tokens.js';
-import { resolveActiveTheme, setActivePresetInConfig } from './render/theme-resolver.js';
-import { getTheme, listThemes } from '../themes/index.js';
+import { type ThemeTokens } from '../theme/tokens.js';
+import { resolveActiveTheme } from './render/theme-resolver.js';
+import { getTheme } from '../themes/index.js';
 import type { PaneFocus, PreviewSource, WorkingDirView } from '../workspace-types.js';
 import type { DisplayMouseEvent } from '../display/types.js';
 import type { Key as TuiKey } from '../tui.js';
@@ -1215,7 +1154,6 @@ import {
   readDirEntries,
   sortEntries,
   splitAtPrefix,
-  dirname as wdDirname,
   type WorkingDirState,
   type FsEntry,
 } from '../working-dir/index.js';
@@ -1225,8 +1163,6 @@ import {
   resolveBrowserActionContextFromHit,
 } from '../browser-pane/actions.js';
 import { resolveBrowserTransferCapability } from '../browser-pane/capabilities.js';
-import { openBrowserPaneModal } from '../browser-pane/mount.js';
-import { openPreviewPaneModal } from '../preview-pane/mount.js';
 import {
   cyclePreviewSourceForView,
   formatPreviewSourceLabel,
@@ -1239,7 +1175,7 @@ import {
 } from '../preview-pane/model.js';
 import { PreviewPaneRegistry } from '../preview-pane/registry.js';
 import { FileIndexCache, absolutize } from '../file-index.js';
-import { firstPaneOfView, paneSetForView } from '../working-dir/focus.js';
+import { firstPaneOfView } from '../working-dir/focus.js';
 import { applyVisibleFocusRepair } from './focus-repair.js';
 import {
   nextVisiblePaneFocus,
@@ -1250,11 +1186,7 @@ import {
 } from '../views/pane-policy.js';
 import {
   autoTabletModeForViewport,
-  orderDashboardViewsForCompactMode,
   effectiveChatOnlyModeForViewport,
-  orderSurfaceCatalogForCompactMode,
-  pruneDashboardViewsForCompactMode,
-  pruneSurfaceCatalogForCompactMode,
   productCompactModeForViewport,
 } from '../views/product-compact-mode.js';
 import { readScopedRenderLogs, resolveRenderSuppressed, readScopedDebugLevel, resolveStartupDebugLevel, hotPathGateOpen } from '../mss/logging/scoped-level.js';
@@ -1265,7 +1197,6 @@ import {
   compileDashboardViewLayout,
   describeDashboardViewsForPrompt,
   findDashboardView,
-  nextDashboardView,
   panesForDashboardView,
   serializeDashboardViewsConfig,
   validateDashboardViewsConfig,
@@ -1345,6 +1276,8 @@ import {
   type SpaceLongPressDetector,
 } from './input/space-longpress-detector.js';
 import { isAllowlistedDictationSurface } from './input/dictation-surface-allowlist.js';
+import { createDashboardExternalInputHost } from './input/external-input-host.js';
+import { registerExternalInputHost } from '../input/external-input-queue.js';
 // H3 #6 follow-up #3 — background sessions render as a distinct sidebar
 // kind with live state badge + tap-to-Join. Dashboard pulls BG records
 // through backgroundToStub + maps state via bgStateToSessionStatus,
@@ -1930,6 +1863,17 @@ export function renderDashboardFirstScreenBand(input: {
     observe({ daemon: false, hasPwa: false, hasTailnet: false });
   });
   return Promise.all([linkPending, pwaPending]).then(() => {});
+}
+
+/** The /status reader used by the live dashboard slash callback. */
+export function renderDashboardStatusLines(input: Omit<DashboardStatusLinesInput, 'seatsNow'>, now = Date.now()): string[] {
+  let seatsNow: string | null = null;
+  try {
+    seatsNow = readDashboardSeatsNow(now);
+  } catch (error) {
+    debug.log('dashboard.status', 'seats-unreadable', { error: String(error) });
+  }
+  return buildDashboardStatusLines({ ...input, seatsNow });
 }
 
 export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<DashboardAction> {
@@ -2594,9 +2538,17 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   };
   const clearLogFilter = (): void => {
     logFilterQuery = '';
+    if (logSearchQuery) {
+      logSearchResults = findLogMatches(chatLines, logSearchQuery);
+      logSearchCursor = Math.min(logSearchCursor, Math.max(0, logSearchResults.length - 1));
+    }
   };
   const applyLogFilter = (query: string): void => {
     logFilterQuery = query.trim();
+    if (logSearchQuery) {
+      logSearchResults = findVisibleLogMatches(chatLines, logSearchQuery, logFilterQuery);
+      logSearchCursor = Math.min(logSearchCursor, Math.max(0, logSearchResults.length - 1));
+    }
     if (debug.enabled) {
       debug.log('log-pane.filter.apply', `q="${logFilterQuery}"`, {
         active: logFilterQuery.length > 0,
@@ -2606,7 +2558,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const applyLogSearch = (query: string): void => {
     logSearchQuery = query.trim();
     logSearchResults = logSearchQuery
-      ? findLogMatches(chatLines, logSearchQuery)
+      ? findVisibleLogMatches(chatLines, logSearchQuery, logFilterQuery)
       : [];
     logSearchCursor = 0;
     if (debug.enabled) {
@@ -2618,13 +2570,18 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   /** Center the viewport on a search-result line. Sets chatScrollOffset
    *  so the match row lands mid-pane when possible; clamps at bounds. */
   const scrollToSearchResult = (result: LogSearchResult): void => {
+    // An explicit search may jump to output that arrived while the pane
+    // was frozen. Release that snapshot before computing the row bound.
+    if (logFrozenTailIndex !== null && result.lineIdx >= logFrozenTailIndex) {
+      logFrozenTailIndex = null;
+    }
     const { rows: tr } = termSize();
     const sH = computeLogH(tr);
-    const bodyH = Math.max(0, sH - 1);
     const hasFooter = chatFooterLine.current != null && chatFooterLine.current !== '';
-    const contentH = Math.max(0, bodyH - (hasFooter ? 2 : 0));
-    const target = Math.max(0, result.lineIdx - Math.floor(contentH / 2));
-    const maxScroll = Math.max(0, chatLines.length - contentH);
+    const hasQueueRow = hasFooter && !!renderTurnTypeaheadQueueRow(turnTypeaheadRef.state, Math.max(20, termSize().cols - 6));
+    const contentH = logPaneContentHeight(sH, hasFooter, hasQueueRow);
+    const target = Math.max(0, visibleSearchRowOffset(chatLines, result, logFilterQuery) - Math.floor(contentH / 2));
+    const maxScroll = logScrollMax(sH);
     chatScrollOffset = target >= maxScroll ? -1 : target;
     // Entering a scrolled state may set the freeze — the
     // handleLogPaneKey transition only fires for user keystrokes, so
@@ -3416,6 +3373,16 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // indicator below the scrolling log body. Mutated by startPinnedThinking
   // via this ref. `null` = no footer, body uses full log height.
   const chatFooterLine: { current: string | null } = { current: null };
+  const logScrollMax = (height: number): number => {
+    const hasFooter = chatFooterLine.current != null && chatFooterLine.current !== '';
+    const hasQueueRow = hasFooter && !!renderTurnTypeaheadQueueRow(turnTypeaheadRef.state, Math.max(20, termSize().cols - 6));
+    return maxLogPaneScroll(chatLines, height, {
+      filterQuery: logFilterQuery,
+      frozenTailIndex: logFrozenTailIndex,
+      hasFooter,
+      hasQueueRow,
+    });
+  };
   const disposeEventLoopStallMonitor = startEventLoopStallMonitor({
     getContext: () => ({
       streamingInFlight,
@@ -3538,20 +3505,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
    * actual view model instead of drifting toward an old 60/40 guess.
    */
   const dashboardState = new DashboardStateStore();
-  const getFallbackPromptFrame = (termRows: number) =>
-    dashboardState.getFallbackPromptFrame(termRows);
   const getLayoutPromptFrame = (termRows: number): PromptFrame =>
     dashboardState.getLayoutPromptFrame(termRows);
   const currentPromptFrame = (termRows = termSize().rows): PromptFrame =>
     dashboardState.getCurrentPromptFrame(termRows);
-
-  /** Rows taken up by everything BELOW the log zone (hud excluded — it
-   *  sits between grid and log, and is reserved separately when the
-   *  grid is present). Used to compute paneH below and to size the
-   *  embedded grid when logEmbedded=true. Must match the number of
-   *  rows pushed by zones 'input-divider-upper' through 'dock'. */
-  const bottomFixedRows = (inputHeight: number) =>
-    bottomFixedRowsForPromptFrame(inputHeight);
 
   /** Compute paneH (height reserved for the top pane/grid in
    *  non-chat-only, non-embedded modes) given termRows. Factored out
@@ -3687,6 +3644,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // The ACP bridge is created later during dashboard boot. Keep status renders
   // safe before then, and bind this reader once the bridge exists.
   let activeAcpRuntimeModel = (): string | undefined => undefined;
+  // 상태줄은 provider·model 만 쓴다 — 렌더마다 inspectActiveProvider(자격·authDetail 동기 읽기)를 안 부른다.
+  const readStatusProviderInfo = createStatusProviderInfoReader();
+  const runningBuildStatus = createRunningBuildStatus();
   /** Primary pill row — wd · git · provider/model · elapsed.
    *  MX11b — delegates to mouseWiring.buildStatusLine so pill column
    *  bounds are captured as a side effect; the return string is
@@ -3714,7 +3674,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       return mouseWiring.buildStatusLine({
         swd,
         gitState,
-        providerInfo: inspectActiveProvider(undefined, activeAcpRuntimeModel()),
+        providerInfo: readStatusProviderInfo(activeAcpRuntimeModel()),
         contextUsedTokens: metrics.lastContextUsed,
         tmuxLabel: tmuxStatusLabel,
         sshLabel: sshStatusLabel,
@@ -3736,41 +3696,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         // dashboardVoiceChat.onPhaseChange). The status-bar pill is
         // intentionally null so we don't render the same state twice.
         voiceLabel: null,
+        runningBuild: runningBuildStatus(),
         theme,
       });
-    } catch { return ''; }
-  };
-
-  /** Secondary metrics row — CTX bar · total cost · t/s · cache hit %.
-   *  Reads from the session-metrics singleton populated by runTurn +
-   *  dashboard streaming paths, plus the prompt-cache metrics
-   *  singleton populated by onUsage. Renders an all-zero row when no
-   *  turns have completed yet (matches Claude Code's "0k/N.Nk"
-   *  placeholder). */
-  const buildSecondaryStatusLine = (): string => {
-    try {
-      const m = getSessionMetrics();
-      const theme = currentThemeTokens();
-      // Prompt-cache summary is ambient — import synchronously from a
-      // side-effect-free module; no fetch, no state beyond the session
-      // singleton that was already populated by onUsage events.
-      const { getSessionSummary } = require('../prompt-cache/metrics.js') as
-        typeof import('../prompt-cache/metrics.js');
-      const cachePct = getSessionSummary().hitRatePct;
-      // PR-S1V.5 — voice cost month-to-date pill. Reads the
-      // process-wide tracker that voice-input-bridge.transcribe and
-      // the daemon's /v1/voice/transcribe REST handler both write to,
-      // so the pill is the canonical view across surfaces. Empty
-      // string when nothing was spent this month.
-      const voiceMonthly = globalVoiceCostTracker().getMonthSummary().totalUsd;
-      const parts = [
-        ctxBarSegment(m.lastContextUsed, m.lastContextMax, 24),
-        costSegment(m.totalCostUsd, { theme }, m.unpricedTurns),
-        voiceCostSegment(voiceMonthly, { theme }),
-        speedSegment(m.lastTokensPerSec, { theme }),
-        cacheSegment(cachePct, { theme }),
-      ];
-      return parts.filter(Boolean).join('  ');
     } catch { return ''; }
   };
 
@@ -3930,9 +3858,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   if (debug.enabled) {
     debug.log('status.shell-posture.boot', 'ready', statusShellPostureRuntime.current());
   }
-  const blankRows = (height: number, width: number): string[] => (
-    Array.from({ length: Math.max(0, height) }, () => ' '.repeat(Math.max(0, width)))
-  );
   // IUL Phase M (Bundle 1) → Phase S·a (Bundle 2) → Bundle 3 wiring.
   // Wraps the existing afterRender hook with composeIdentityHooks so
   // every modal-kind surface mount/dispose gets a stable ModalIdentity
@@ -4064,9 +3989,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       // The 5s poll would eventually catch the change; forcing here
       // makes the "*N" suffix tick up within the same frame so the
       // user sees feedback for their own action immediately.
-      try {
-        refreshGitDirty(getSessionCwd(), { force: true });
-      } catch { /* noop */ }
+      // TUI-TYPING-LAG — async probe: `git status` must not block key input.
+      void refreshGitDirtyAsync(getSessionCwd(), { force: true })
+        .then(() => { try { draw(); } catch { /* TUI torn down */ } }, () => { /* noop */ });
     });
   }
   // WD2 — session working directory subscription. Status bar pills
@@ -4098,10 +4023,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // Kick off the first dirty probe in the background so the
     // "*N" suffix appears on the first meaningful redraw. Throttle
     // handles repeated calls; we just fire-and-forget.
-    try {
-      refreshGitDirty(swd, { force: true });
-      try { draw(); } catch { /* noop */ }
-    } catch { /* noop */ }
+    void refreshGitDirtyAsync(swd, { force: true })
+      .then(() => { try { draw(); } catch { /* noop */ } }, () => { /* noop */ });
   };
   wireGitForSwd();
 
@@ -4130,14 +4053,15 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const gitDirtyTimer: ReturnType<typeof setInterval> = setInterval(() => {
     try {
       const before = getGitStatusView(getSessionCwd());
-      refreshGitDirty(getSessionCwd(), { minIntervalMs: 4_000 });
-      const after = getGitStatusView(getSessionCwd());
-      if (
-        (before.dirty?.total ?? -1) !== (after.dirty?.total ?? -1) ||
-        (before.aheadBehind?.ahead ?? -1) !== (after.aheadBehind?.ahead ?? -1)
-      ) {
-        try { draw(); } catch { /* noop */ }
-      }
+      // TUI-TYPING-LAG — the 5s probe ran `git status` synchronously (130ms+, hundreds under load).
+      void refreshGitDirtyAsync(getSessionCwd(), { minIntervalMs: 4_000 }).then((after) => {
+        if (
+          (before.dirty?.total ?? -1) !== (after.dirty?.total ?? -1) ||
+          (before.aheadBehind?.ahead ?? -1) !== (after.aheadBehind?.ahead ?? -1)
+        ) {
+          try { draw(); } catch { /* noop */ }
+        }
+      }, () => { /* noop */ });
     } catch { /* noop */ }
   }, 5_000);
   (gitDirtyTimer as unknown as { unref?: () => void }).unref?.();
@@ -4398,6 +4322,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // requestConfirmation() / HitlConfirm tool reaches the iPhone.
   // Fire-and-forget: a listener start failure warns but doesn't
   // block dashboard init (HITL degrades to terminal-only / no-op).
+  // #28 — the minimal boot banner holds healthy-boot rows for /status instead of the transcript.
+  const bootBannerMode = normalizeBootBannerMode(getUserConfig().dashboard.bootBanner);
+  const bootBannerHeld: BootBannerHeld = {};
   bootDashboardHitl({
     enabled: process.env['ELANOUS_HITL_DISABLE'] !== '1',
     initDashboardHitl,
@@ -4407,6 +4334,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       try { return getPushcutClient().configured; } catch { return false; }
     },
     pushWarningLine: (message) => { chatLines.push(C.warning(message)); },
+    holdWarningLine: bootBannerMode === 'minimal' ? (message) => { bootBannerHeld.hitl = message; } : undefined,
     draw: () => { draw(); },
     registerBeforeExit: (cb) => { process.once('beforeExit', cb); },
     warnConsole: (message) => { console.warn(message); },
@@ -4900,6 +4828,15 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   inputCoreAddDefaultBinding({ matcher: 'ctrl+x s', actionId: 'mode.enter.sync' });
   inputCoreAddDefaultBinding({ matcher: 'ctrl+x c', actionId: 'mode.enter.control' });
   inputCoreAddDefaultBinding({ matcher: 'ctrl+x g', actionId: 'mode.enter.general' });
+  // #19 — the log-pane `F` bulk fold toggle, shared by the input (`ctrl+x f`) and pane chords.
+  const toggleAllLogFolds = (): void => {
+    const changed = foldStack.toggleAll();
+    debug.log('log.fold', 'toggle-all', { via: 'ctrl+x f', changed });
+    if (changed === 0) pushDebugLine(C.muted('(nothing to fold/unfold)'));
+    chatScrollOffset = -1;
+    draw();
+  };
+  registerLogFoldInputBinding(toggleAllLogFolds);
 
   initTui(true);
 
@@ -6246,14 +6183,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     const active = inspectActiveProvider(cfg);
     const reasoningProvider = (['openai-codex', 'openai', 'anthropic', 'gemini', 'grok', 'local', 'openrouter'] as const)
       .find(provider => active.provider === provider || active.provider === `auto:${provider}`);
-    let seatsNow: string | null = null;
-    try {
-      seatsNow = seatsNowLine(readSlashContextNow([]), Date.now());
-    } catch (error) {
-      debug.log('dashboard.status', 'seats-unreadable', { error: String(error) });
-    }
-    return buildDashboardStatusLines({
-      seatsNow,
+    return renderDashboardStatusLines({
       provider: active.provider,
       model: active.model,
       reasoning: reasoningProvider
@@ -6263,6 +6193,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         : undefined,
       daemonAddress: opts.remote?.url,
       daemonConnected: daemonAttached,
+      bootHeld: bootBannerStatusLines(bootBannerHeld),
       accountName: active.provider === 'openai-codex' || active.provider === 'auto:openai-codex'
         ? activeCodexAccountView().name : undefined,
       sessionSurfaceLines: buildSessionDashboardStatusLines(resolveSessionSurfaceStatus({ chatModeState })),
@@ -6337,7 +6268,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     const { rows: tr } = termSize();
     const sH = computeLogH(tr);
     const halfSH = Math.max(1, Math.floor(sH / 2));
-    const maxScr = Math.max(0, chatLines.length - sH);
+    const maxScr = logScrollMax(sH);
     // Scroll keys → Scrollable behavior on wd-log. Sync pre/post.
     const SCROLL_KEYS = new Set([
       'j', 'k', 'down', 'up',
@@ -6528,6 +6459,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     const chatLinesStartIndex = chatLines.length;
     userScrolledDuringStream = false;
     streamingInFlight = true;
+    reportTuiTurn('busy');
     const SCROLL_KEYS = new Set(['j', 'k', 'down', 'up', 'pageup', 'pagedown', 'home', 'end', 'g', 'G']);
     // T3-B2: ESC abort gate. When the user hits Esc AND sub-agent
     // work is running, pop a confirmation modal before tearing down
@@ -6597,7 +6529,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     const scrollLogBy = (delta: number): void => {
       const { rows: tr } = termSize();
       const sH = computeLogH(tr);
-      const maxScr = Math.max(0, chatLines.length - sH);
+      const maxScr = logScrollMax(sH);
       const cur = chatScrollOffset < 0 ? maxScr : chatScrollOffset;
       let next = Math.max(0, Math.min(cur + delta, maxScr));
       if (delta > 0 && next >= maxScr) next = -1; // re-pin tail
@@ -6842,22 +6774,22 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                     },
                   });
                   if (queuedHistoryEntry) refreshInputHistory();
-                  enqueuePendingUserInput(sid, queuedText, (drained) => {
-                    // 배수된 만큼을 앞에서부터 떨어낸다(FIFO · 순서 보존).
-                    const remaining = turnTypeaheadRef.state.queuedSubmissions.slice(drained.length);
-                    turnTypeaheadRef.state = { ...turnTypeaheadRef.state, queuedSubmissions: remaining };
-                    for (const text of drained) {
+                  // ⭐ 레지스트리 id 로 짝짓는다 — 배수·되꺼내기·턴 종료 승격이 같은 항목을 «한 번만» 보낸다.
+                  //   ⛔ 슬래시는 안 넣는다(턴 종료 FIFO 로만 실행).
+                  steerLastTurnTypeaheadSubmission(turnTypeaheadRef, sid, ({ texts, remaining }) => {
+                    for (const text of texts) {
                       echoSubmittedUserText(text, { live: true });
                       debug.log('dashboard.turn-typeahead', 'echoed', { path: 'live', length: text.length });
                     }
-                    if (drained.length > 0) draw();
+                    if (texts.length > 0) draw();
                     debug.log('dashboard.turn-typeahead', 'drained-into-live-turn', {
-                      drained: drained.length, remaining: remaining.length,
+                      drained: texts.length, remaining,
                     });
                   });
                 }
               }
             }
+            if (r.releasedPendingIds) releaseTurnTypeaheadPending(r.releasedPendingIds, 'recalled');
             if (r.immediateSubmission) {
               turnTypeaheadRef.state = await dispatchStreamingTurnTypeaheadSubmission(
                 turnTypeaheadRef.state,
@@ -7086,9 +7018,17 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     return () => {
       cleanup();
       escGate.dispose();
-      if (!stoppedHarnessSpace) settleEscAbortPendingLines(chatLines, chatLinesStartIndex);
-      userScrolledDuringStream = false;
-      streamingInFlight = false;
+      try {
+        if (!stoppedHarnessSpace) settleEscAbortPendingLines(chatLines, chatLinesStartIndex);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const stackHead = err instanceof Error ? err.stack?.split('\n')[1]?.trim() : undefined;
+        debug.log('dashboard.turn', 'settle-failed', { message, stackHead });
+      } finally {
+        userScrolledDuringStream = false;
+        streamingInFlight = false;
+        reportTuiTurn('idle');
+      }
     };
   };
 
@@ -7331,9 +7271,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       ?? viewRegistry.views.find(v => v.baseView === baseView)
       ?? viewRegistry.views[0]!;
     setActiveDashboardView(def);
-  };
-  const reloadDashboardViews = (): void => {
-    applyDashboardViewsRuntime(getUserConfig().dashboard.views as any);
   };
   const userClosedPanes = new Set<PaneFocus>();
   const closedPaneSet = (): ReadonlySet<PaneFocus> => {
@@ -8298,7 +8235,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       }
       return;
     }
-    const maxScr = Math.max(0, chatLines.length - logViewport.height);
+    const maxScr = logScrollMax(logViewport.height);
     const delta = m.type === 'scroll-up' ? -3 : 3;
     const before = chatScrollOffset;
     chatScrollOffset = Math.max(0, Math.min(
@@ -9367,24 +9304,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       limit,
     });
   };
-  const describePaneStateForPrompt = (): string => {
-    const state = paneStateSnapshot();
-    const rows = state.panes.map(p => {
-      const bits = [
-        p.visible ? 'visible' : 'hidden',
-        p.closed ? 'closed' : '',
-        p.closeable ? 'closeable' : 'primary',
-        p.omittedReason ? `omitted=${p.omittedReason}` : '',
-      ].filter(Boolean).join(', ');
-      return `- ${p.pane}: ${bits}`;
-    });
-    return [
-      '## Dashboard Pane State',
-      '',
-      `Active view: ${state.activeViewId} "${state.viewLabel}" (baseView=${state.baseView}, compact=${state.compactLevel}, focus=${state.focused})`,
-      ...rows,
-    ].join('\n');
-  };
   // Surface-unification v2.2 V2.2-5 Part 2 (2026-05-11) — schedulerView
   // state · openSchedulerForm · activeSchedulerFormValue /
   // setActiveSchedulerFormValue · submitSchedulerForm 모두 폐기.
@@ -9445,11 +9364,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       surfaceIdForWorkingFocus,
     );
   };
-
-  // Plain row label used as the list widget's identity (selection
-  // matching, cursor display string). Kept ANSI-free so visibleWidth
-  // and the selected-set string lookup work correctly.
-  const fmtEntry = (e: FsEntry): string => e.isDir ? `${e.name}/` : e.name;
 
   // Colored variant for the list widget's `items` array — yazi-style
   // accent for folders, per-extension fileColor for files. The list
@@ -9885,92 +9799,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       C.warning,
       C.muted,
     );
-  };
-
-  // ── Workspace context builder ──
-  // Emitted once per chat turn (prepended to the user message) so the
-  // LLM knows what widgets are currently on screen and how to write
-  // to them via layout_setWidgetState / layout_addWidget without
-  // having to probe layout_getState first. Kept compact — iteration
-  // order matches visual layout (top-to-bottom, left-to-right).
-  //
-  // Writable surfaces:
-  //   wd-scratch  — primary canvas for notes / reports. Persists
-  //                 until the user clears or switches to memo mode.
-  //   wd-preview  — secondary canvas. Persists until the user
-  //                 navigates to a different file in the browser
-  //                 (file nav overwrites, which is by design).
-  //
-  // Reserved (LLM writes rejected with a helpful error):
-  //   wd-browser, wd-log — dashboard re-renders these every frame
-  //                        from its own buffers (file list, chat
-  //                        transcript). Use layout_addWidget to
-  //                        spawn a fresh widget the dashboard will
-  //                        NOT touch.
-  const buildWorkspaceContext = (): string => {
-    try {
-      const pluginLayout = pluginHost.activeLayout();
-      let layoutForCtx: Layout;
-      if (pluginLayout) {
-        layoutForCtx = pluginLayout;
-      } else {
-        const { cols, rows: tr } = termSize();
-        const promptFrame = getLayoutPromptFrame(tr);
-        const topHeight = computePromptFrameGridHeight(tr, promptFrame);
-        layoutForCtx = workingDirLayoutForView(cols - 1, topHeight);
-      }
-      const visibleWidgets: Array<{ id: string; type: string; title?: string }> = [];
-      for (const row of layoutForCtx.rows) {
-        for (const cell of row.cells) {
-          if (!cell.widgetInstanceId) continue;
-          const inst = widgetHost.get(cell.widgetInstanceId);
-          if (!inst) continue;
-          visibleWidgets.push({
-            id: inst.id,
-            type: inst.type,
-            title: inst.character || undefined,
-          });
-        }
-      }
-      if (visibleWidgets.length === 0) return '';
-      const rows = visibleWidgets.map(w => {
-        const tag =
-            w.id === 'wd-scratch'  ? '  ← writable canvas; persistent'
-          : w.id === 'wd-preview'  ? '  ← writable canvas; overwritten on file-nav'
-          : w.id === 'wd-browser'  ? '  ← READ-ONLY (dashboard-managed file list)'
-          : w.id === 'wd-log'      ? '  ← READ-ONLY (chat transcript)'
-          : w.id.startsWith('wd-debug-') ? '  ← READ-ONLY (debug event surface; use debug_* tools)'
-          :                          '  ← persistent (spawned by LLM)';
-        const label = w.title ? ` "${w.title}"` : '';
-        return `- ${w.id} (${w.type})${label}${tag}`;
-      }).join('\n');
-      return [
-        '## Current dashboard workspace',
-        '',
-        'The following widgets are visible right now. You have three host-level tools to mutate the layout:',
-        '- `layout_getState` — refresh view of the grid.',
-        '- `layout_setWidgetState({id, patch})` — merge a patch into a widget\'s state. For markdown widgets patch `{text: "..."}`.',
-        '- `layout_addWidget({type, row, col, character, config})` — spawn a new widget; dashboard will NOT re-render its state.',
-        '',
-        rows,
-        '',
-        'Writing rules:',
-        '- To SHOW the user multi-line output (notes, analyses, lists, reports), write to `wd-scratch` via `layout_setWidgetState({id:"wd-scratch", patch:{text:"<content>"}})`. The dashboard auto-reopens that pane if the user had it closed.',
-        '- For a secondary canvas (e.g. side-by-side comparison), write to `wd-preview` the same way.',
-        '- DO NOT write to `wd-browser` or `wd-log` — the dashboard rejects those patches with an error.',
-        '- DO NOT write to `wd-debug-*`; use `debug_getState`, `debug_getCallStack`, `debug_setLevel`, `debug_openView`, and `debug_selectEvent`.',
-        '- For your own persistent widget (won\'t be overwritten by anything), spawn with `layout_addWidget` and pick your own id.',
-        '',
-        describeDashboardViewsForPrompt(viewRegistry),
-        '',
-        describePaneStateForPrompt(),
-      ].join('\n');
-    } catch {
-      // Workspace snapshot is best-effort — a failure here must not
-      // break the chat turn. Return empty so the user message flows
-      // through unchanged.
-      return '';
-    }
   };
 
   // ── LLM layout tools (W5) ──
@@ -12811,43 +12639,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       onContextMenuMouse: (ev) => ctxMenuWire.onMouse(ev),
     });
   };
-  const openBrowserOnlyModal = (): void => {
-    const { cols: tc, rows: tr } = termSize();
-    const liveMode = resolveBrowserPreviewModalLiveMode(process.env.ELANOUS_PANE_MODAL_LIVE);
-    void openBrowserPaneModal({
-      browserWidgetInstanceId: browserWidgetInstanceIdForView(workingDir.view),
-      liveMode,
-      browserPaneRegistry,
-      widgetHost,
-      coordinator: display,
-      termCols: tc,
-      termRows: tr,
-      captureSnapshot: () => captureDeferredPane('browser'),
-      theme: currentThemeTokens(),
-      fmtEntryColored,
-      iconForEntry,
-      onSubmit: dispatchSidebarSubmit,
-      onDispose: () => { draw(); },
-      onCancel: () => { draw(); },
-    });
-  };
-  const openPreviewOnlyModal = (): void => {
-    const { cols: tc, rows: tr } = termSize();
-    const liveMode = (process.env.ELANOUS_PANE_MODAL_LIVE ?? 'on').toLowerCase() !== 'off';
-    void openPreviewPaneModal({
-      preview: dockedPreview,
-      previewWidgetInstanceId: 'wd-preview',
-      liveMode,
-      widgetHost,
-      coordinator: display,
-      termCols: tc,
-      termRows: tr,
-      captureSnapshot: () => captureDeferredPane('preview'),
-      theme: currentThemeTokens(),
-      onDispose: () => { draw(); },
-      onCancel: () => { draw(); },
-    });
-  };
   registerDashboardGlobalKeys({
     enableSupplementalGlobalKeys: getUserConfig().dashboard.enableSupplementalGlobalKeys,
     register: (binding) => { display.registerKeyBinding(binding); },
@@ -13071,6 +12862,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     repaint: () => void;
     insertAtCursor?: (text: string) => void;
     submit?: (request?: string | TextInputExternalSubmitRequest) => void;
+    getBufferText?: () => string;
   } = { repaint: () => {} };
   repaintPromptAfterRender = () => {
     if (shouldSuppressDashboardBottomArea()) {
@@ -13094,6 +12886,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // safe. Dispose on process exit to keep the listener set clean.
   const disposeResizeListener = installResizeListener({ draw: (opts) => draw(opts), promptCtl });
   process.on('exit', disposeResizeListener);
+  // 외부 주입(`pty text`)을 사용자 타이핑과 섞지 않고 별도 대기열로 — 결함 #6(10-14).
+  const disposeExternalInputHost = registerExternalInputHost(createDashboardExternalInputHost({
+    isTurnActive: () => streamingInFlight,
+    promptCtl,
+    pushNotice: (line) => { chatLines.push(C.muted(`  ${line}`)); chatScrollOffset = -1; draw(); },
+  }));
+  process.on('exit', disposeExternalInputHost);
 
   const publishScratchSurface = (
     source: string,
@@ -13112,6 +12911,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const detailViewerRuntime = createDashboardDetailViewerRuntime({
     setOpen: (open) => { setCompanionPopupOpen('detail', open); },
     requestRender: () => { requestDashboardRender('detail'); },
+    // 채팅 단독 화면에선 그리드 투영이 안 돌아 팝업이 «(no preview content)» 였다 — 그리기 전에 싣는다.
+    project: (snapshot) => {
+      const detailWidget = widgetHost.get('wd-detail') as WidgetInstance<Record<string, unknown>> | null;
+      if (detailWidget?.state && typeof detailWidget.state === 'object') {
+        companionWidgetRuntime.projectDetailWidget(detailWidget, snapshot);
+      }
+    },
   });
   const companionWidgetRuntime = createDashboardCompanionWidgetRuntime();
   const clipboardHistoryRuntime = createDashboardClipboardHistoryRuntime();
@@ -13801,6 +13607,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       let session: TerminalSession;
       try {
         if (req.kind === 'shell') {
+          const shellSeat = resolveTuiShellSeat(req.cwd, process.env.COORD_ID);
           session = sessionRegistry.spawn(
             {
               title: 'terminal',
@@ -13808,6 +13615,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               command: req.command,
               env: req.env,
               kind: 'shell',
+              useRegistry: true,
+              registryKind: 'shell',
+              registryNickname: `tui-shell:${req.cwd}`,
+              registryOrigin: { originRoot: 'elanous-internal', controller: 'tui-shell' },
+              registryPurpose: `tui-shell:${shellSeat}`,
+              registrySeat: shellSeat,
               onExit: handleExit,
               onTitleAction: handleTitleAction,
             },
@@ -13899,8 +13712,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       openInteractiveTerminalPopup,
     });
     const TerminalPopup = terminalPopupRuntime;
-    const spawnGlobalTerminalModal = (): void => {
-      terminalPopupRuntime.spawnGlobalTerminalModal(workingDir.cwd);
+    const spawnGlobalTerminalModal = (command?: string): void => {
+      openInteractiveTerminalPopup({ kind: 'shell', cwd: workingDir.cwd, command });
     };
 
     // E3 (2026-05-17) — copyLastAssistantTurnToClipboard /
@@ -14022,7 +13835,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       },
       toggleLogZoom: () => { toggleChatOnlyLayout(); },
       copyLastBlock: copyLastAssistantTurnToClipboard,
-      spawnTerminalModal: spawnGlobalTerminalModal,
+      spawnTerminalModal: () => spawnGlobalTerminalModal(),
       copyLogPane: copyLogPaneToClipboard,
       // Ctrl+L — 터미널 클리어 후 전체 강제 리페인트(resize 리스너와 동일 레시피).
       // 외부 출력/아티팩트로 더러워진 화면 복구용 · 대화(chatLines)는 보존.
@@ -14091,6 +13904,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       },
       onPreviewTerminalExpandChanged: chordFeedbackRuntime.onPreviewTerminalExpandChanged,
       onMissingPreviewTerminal: chordFeedbackRuntime.onMissingPreviewTerminal,
+      // #19 — Ctrl+X f from a pane; the input path is the `ctrl+x f` input-core binding.
+      toggleAllFolds: toggleAllLogFolds,
     });
 
     // ══════════════════════════════════════════════════════════════
@@ -15369,6 +15184,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     //     adds turn concurrency must key this by turn (or session+turn) first.
     let acpTurnToolSpecs: LLMToolSpec[] = [];
     let acpDispatchToolSelf: CoreTurnDispatchTool | null = null;
+    let acpToolDispatchCount = 0;
     const trMod = await import('../tool-runtime/index.js');
     trMod.registerAllDefaultToolRuntimes();
     acpToolRuntime = trMod;
@@ -15423,6 +15239,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               modelFamily: getModelFamily(inspectActiveProvider().model),
               rich: false,
               enabledTools: tools.map(t => t.name),
+              seatBoot: true,
             }),
           ];
         },
@@ -15452,35 +15269,16 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         // Codex-first decision as every other surface. The core bridge now
         // supplies userText to resolveModel, preserving explicit pins and
         // making this the actual model override rather than a display hint.
-        getActiveModel: ({ userText }) => {
-          const cfg = getUserConfig();
-          const decision = resolveRouteDecision({
-            provider: cfg.llm.provider,
-            configuredModel: inspectActiveProvider().model,
-            text: userText,
-            routePolicy: cfg.llm.routePolicy,
-          });
-          // Badge truthfulness(2026-07-19 goal-exec) — resolveRouteDecision 의 codex
-          // tier-policy 브랜치는 curated effort(예: balanced=low)를 찍지만, codex provider 는
-          // 그 값을 wire 로 보내지 않는다: 실제 effort 는 effectiveReasoningLevel(cfg)(config
-          // 주도, reasoningLevel 미설정 시 model-default high). 그대로 두면 완료 뱃지가
-          // "terra(low)" 로 떠 사용자가 모델이 약하게 돈다고 오해한다(실제 high). 실제 wire
-          // effort 로 덮어써 뱃지를 진실하게. decision.effort 는 표시 전용이라 라우팅 무영향.
-          const trueEffort = effectiveReasoningLevel(cfg.llm, decision.provider, decision.model);
-          const badgedDecision = trueEffort && trueEffort !== 'off'
-            ? { ...decision, effort: trueEffort }
-            : decision;
-          recordCurrentRouteDecision('dashboard', badgedDecision);
-          if (debug.enabled) debug.log('llm.route-decision', 'dashboard-acp', {
-            provider: decision.provider, model: decision.model, mission: decision.mission, source: decision.source,
-          });
-          return decision.model || null;
-        },
+        // 본체 = acp-active-model.ts(실물 경로를 시험이 그대로 부르도록 뺐다 · TUI-MODEL-SESSION-SCOPE).
+        getActiveModel: ({ userText }) => resolveDashboardActiveModel(userText),
         // ⭐ The assignment is deliberate, not a typo: it captures a reference to
         //  this very dispatcher so `agentDispatchTool` below can route a
         //  sub-agent's tool calls back through it. A plain named const would need
         //  the closure hoisted out of this literal; this keeps the diff local.
         dispatchTool: acpDispatchToolSelf = async (name, args, ctx) => {
+          // Count at the server-side boundary, before any tool effect and
+          // before the ACP notification can reach the TUI client.
+          acpToolDispatchCount++;
           const runtime = acpToolRuntime;
           const persist = acpPersistToolOutputPreview;
           if (!runtime || !persist) {
@@ -15702,16 +15500,36 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     }
     subscribeSessionCwd((state) => { pushProjectSuggestion(state.cwd); });
     chatScrollOffset = -1;
-    void renderDashboardFirstScreenBand({
+    const firstScreenBandInput = {
       history: chat.history,
       lines: chatLines,
       width: Math.max(0, termSize().cols - 4),
       // The band ships ko/en only; any other detected locale keeps the English rows.
-      locale: detectLocale() === 'ko' ? 'ko' : 'en',
+      locale: detectLocale() === 'ko' ? 'ko' as const : 'en' as const,
       draw: () => draw(),
-      observe: (data) => { try { debug.log('dashboard.first-screen-band', 'resolved', data); } catch { /* observation is best-effort */ } },
-    });
+      observe: (data: { daemon: boolean; hasPwa: boolean; hasTailnet: boolean }) => { try { debug.log('dashboard.first-screen-band', 'resolved', data); } catch { /* observation is best-effort */ } },
+    };
+    void (bootBannerMode === 'full'
+      ? renderDashboardFirstScreenBand(firstScreenBandInput)
+      : renderMinimalBootBand({
+        ...firstScreenBandInput,
+        guidance: needsOnboarding(getUserConfig()),
+        held: bootBannerHeld,
+        show: () => runNexusShow({ format: 'json', out: { log: () => {}, error: () => {} } }),
+        daemonLink: resolveTuiDaemonLink,
+        styleFailure: (line) => C.warning(line),
+        observeHeld: (data) => { try { debug.log('dashboard.first-screen-band', 'held', data); } catch { /* observation is best-effort */ } },
+      }));
 
+    // 🪪 L1 — 자리 부트(seat-boot-preamble.ts): 자리면 첫 화면에 한 줄.
+    // 🪪 L2-lite(seat-local-instructions.ts): 자리 로컬 지시가 없으면 템플릿 생성(덮어쓰기 0) ⊕ 대화 끝 «지난 세션» 기록.
+    const seatLocal = ensureSeatLocalInstructions(getSessionCwd());
+    if (seatLocal.status === 'created') chatLines.push(C.muted(`  📝 자리 로컬 지시를 만들었다 — ${seatLocal.path} (사람이 고쳐도 된다)`));
+    else if (seatLocal.status === 'exists' && seatLocal.missingPrinciple) chatLines.push(C.muted(`  💡 ${seatLocal.path} 에 제1원칙 절이 없다 — 넣을지 사람이 정한다(덮어쓰지 않음)`));
+    installSeatSessionRecorder({ getCwd: () => getSessionCwd(), getHistory: () => chat.history });
+    const seatBoot = describeSeatBoot(getSessionCwd());
+    if (seatBoot) chatLines.push(C.muted(`  🪪 ${seatBoot.seat} 자리 · 안 읽은 우편 ${seatBoot.unread ?? '미관측'} — 부트 카드를 턴마다 싣는다`));
+    if (dashboardAcpBootResult.mode !== 'resumed' && !opts.resumeSessionId) startSeatBootConversation({ reason: 'boot' });
     tuiSeatAskTimer = setInterval(pollTuiSeatAnswers, 10_000);
     tuiSeatAskTimer.unref();
     pollTuiSeatAnswers();
@@ -16696,7 +16514,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               sync.cursors[sync.focus] = Math.max(0, Math.min(sync.cursors[sync.focus]! + delta, sync.lists[sync.focus]!.length - 1));
             } else if (mr > logViewport.startRow && mr <= logViewport.endRow) {
               // Scroll the log pane
-              const maxScr = Math.max(0, chatLines.length - logViewport.height);
+              const maxScr = logScrollMax(logViewport.height);
               chatScrollOffset = Math.max(0, Math.min((chatScrollOffset < 0 ? maxScr : chatScrollOffset) + delta, maxScr));
               if (delta > 0 && chatScrollOffset >= maxScr) chatScrollOffset = -1;
             }
@@ -16771,17 +16589,19 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           //    테스트가 그 순서를 다시 베껴야 하고, 베낀 테스트는 배선 회귀를 못 잡는다.
           const interrupted = lastTurnFinalStatus === 'interrupted';
           const queuedBeforeDrain = turnTypeaheadRef.state.queuedSubmissions.length;
-          const drained = drainTurnTypeaheadOnce(turnTypeaheadRef.state, nextInitial, { interrupted });
+          // ⭐ 드레인 → 레지스트리 해제 → Enter 주입은 다리 모듈이 한 함수로 한다(시험이 같은 함수를 문다).
+          const drained = handoffTurnTypeaheadAtTurnEnd(turnTypeaheadRef, nextInitial, { interrupted }, () => {
+            injectKey({ name: 'enter', ctrl: false, shift: false });
+          });
           lastTurnFinalStatus = undefined;
-          turnTypeaheadRef.state = drained.state;
           nextInitial = drained.nextInitial;
           const queuedTurnEndText = drained.injectEnter ? drained.nextInitial : undefined;
           if (interrupted && queuedBeforeDrain > 0) {
             debug.log('dashboard.turn-typeahead', 'restored-after-interrupt', { count: queuedBeforeDrain });
           }
-          if (drained.injectEnter) injectKey({ name: 'enter', ctrl: false, shift: false });
           draw();
-          const { cols: inputCols } = termSize();
+          const getInputCols = () => termSize().cols;
+          const inputCols = getInputCols();
           // Row is published by draw() via the `input-prompt` zone's
           // resolved geometry — no `termRows - N` math here anymore.
           // The composer is the single source of truth; if the layout
@@ -16792,6 +16612,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             promptFrame: currentPromptFrame(termSize().rows),
             getPromptFrame: () => currentPromptFrame(termSize().rows),
             inputCols,
+            getInputCols,
             surfaceRegistry: getSurfaceRegistry(),
             invalidateRenderCacheRow,
             buildPromptFrameDividerRows,
@@ -16805,8 +16626,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             paintFrameNow: () => drawNow(),
             preferHistoryArrowKeys: slashQuickMode,
             history: inputHistory,
+            // TUI-INPUT-PLACEHOLDER-OFF — provider 가 있으면 빈 입력창은 비워 둔다(대표 «불필요한 가이드 없애라»).
             placeholder: anyProviderAvailable()
-              ? '말 한 줄로 시작 — 질문하거나 «하니스로 구현 …» · /command · /path/to.pdf 첨부'
+              ? ''
               : '/quit /clear (run `elanous setup` — no LLM provider available)',
             debugLog: debug.enabled ? (event, label, payload) => debug.log(event, label, payload) : undefined,
             textInputOpts: {
@@ -17662,7 +17484,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 openDetailViewer: (title, lines) => { setDetailViewer(title, lines); },
               },
               undo: {
-                refreshGitDirty: () => { refreshGitDirty(getSessionCwd(), { force: true }); },
+                refreshGitDirty: () => { void refreshGitDirtyAsync(getSessionCwd(), { force: true }).then(() => { try { draw(); } catch { /* noop */ } }, () => { /* noop */ }); },
                 bold: C.bold,
               },
               delta: {
@@ -18048,6 +17870,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 pushTurnSeparator: () => { pushTurnSeparator(); },
                 getLogFoldMode: () => logFoldMode,
                 setLogFoldMode: (mode) => { logFoldMode = mode; },
+                setAllFolds: (expanded) => foldStack.setAll(expanded),
                 copyEntireLog: async () => { await copyLogBlock(-1, 'all'); },
                 returnFocusToInput: () => {
                   const sourceFocus = workingDir.focus;
@@ -18145,6 +17968,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               },
               termSlash: {
                 slashRuntime: termSlashRuntime,
+                openNewTerminal: spawnGlobalTerminalModal,
                 sessionRegistry: sessionRegistry as unknown as DashboardSlashContext['termSlash']['sessionRegistry'],
                 terminalMatrix: terminalMatrix as unknown as DashboardSlashContext['termSlash']['terminalMatrix'],
                 vwRegistry: {
@@ -18950,10 +18774,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   userConfig: args.userConfig,
                   rich: false,
                   enabledTools: tools.map(t => t.name),
+                  seatBoot: true,
                 }),
               ];
             },
-            runAutoCompact: async ({ preamble, chatHistory, userMsg }) => {
+            runAutoCompact: async ({ preamble, chatHistory, userMsg, onPrePassApplied }) => {
               const compactMod = await import('../compact/index.js');
               const { shouldAutoCompact, compactConversationPartial, compactConversation, runCompactPipeline, setVerifyProbeEnabled } = compactMod;
               const { renderCompactBoundary } = await import('../chat/compact-boundary.js');
@@ -18992,8 +18817,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 getCompactProvider: () => getDefaultCompactProvider(),
                 setVerifyProbeEnabled,
                 sessionId: attachedSessionId ?? undefined,
+                onPrePassApplied,
               });
             },
+            readToolDispatchCount: () => opts.remote ? null : acpToolDispatchCount,
             attachChatStreamingKeys,
             createOptionalSpecs: async () => {
               const uc = (await import('../user-config.js')).getUserConfig();
@@ -19117,7 +18944,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             recordTurnMetrics: async (fullResponse) => {
               await recordDashboardTurnMetrics({
                 chatHistory: chat.history as ChatMessage[],
-                model: inspectActiveProvider().model,
+                // 실제 턴 모델로 기록한다 — 설정 모델이면 ctx 최대치·단가가 다른 모델 것이 된다.
+                //   ACP 서버가 사용량에 실어 보낸 턴 모델 → 없으면 백엔드가 확인한 runtime 모델 → 설정.
+                model: latestTurnUsage?.model ?? inspectActiveProvider(undefined, activeAcpRuntimeModel()).model,
                 fullResponse,
                 turnStartedAt,
                 usage: latestTurnUsage,
@@ -19180,6 +19009,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             },
             warningLine: (message) => C.warning(`${ICONS.warning} ${message}`),
             pushErrorLine: (message) => { chatLines.push(C.error(`Error: ${message}`)); },
+            pushFailureNotice: (notice, raw) => {
+              chatLines.push(C.warning(notice));
+              detailViewerRuntime.stage('turn error', raw.split(/\r?\n/));
+            },
             finalizeTurn: (finalStatus, finalError) => {
               lastTurnFinalStatus = finalStatus;
               clearEscAbortToolState(escAbortToolState);
@@ -19224,7 +19057,15 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           }
           let goalLoopBudget = 100; // hard safety cap independent of /goal budget
           let lastTurnAborted = false;
+          let goalLoopIteration = 0;
           do {
+            // 앞 반복의 finalizeTurn 이 손잡이를 멈췄다 — 반복이 «실제로 시작될 때만» 새 표시를 단다(#5).
+            thinking = goalLoopIterationThinking(goalLoopIteration++, thinking, () => startPinnedThinking({
+              target: chatFooterLine,
+              onFrame: () => { pinChatTail(); draw(); },
+              message: 'Thinking',
+              metrics: { startedAt: Date.now(), hint: 'esc 중단' },
+            }));
             const turnText = goalLoopUserText ?? tok.text;
             await runDashboardChatMainSubmitIntent({
               submit: createDashboardChatMainTurnSubmit({

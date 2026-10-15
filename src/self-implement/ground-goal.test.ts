@@ -60,6 +60,33 @@ describe('groundGoalInCodebase', () => {
     })).toBe('');
   });
 
+  test('재시도 미완료는 상위 grounding empty 관측에도 별도 사유로 남는다', async () => {
+    const original = debug.log.bind(debug) as typeof debug.log;
+    const logs: { category: string; event: string; data: unknown }[] = [];
+    (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
+      logs.push({ category, event, data });
+    }) as typeof debug.log;
+    let attempts = 0;
+    try {
+      expect(await groundGoalInCodebase('unread candidate', {
+        cwd: process.cwd(),
+        persistent: { runGoalLoop: async (ctx) => {
+          attempts += 1;
+          if (attempts === 1) {
+            ctx.callbacks?.onToolCall?.({ id: 'done', name: 'update_goal', args: {
+              status: 'complete', evidence: 'src/self-implement/ground-goal.ts: found by Glob',
+            } });
+            return { finalText: '', iterations: 1, stopReason: 'goal_complete', goalComplete: true };
+          }
+          return { finalText: 'done', iterations: 1, stopReason: 'end_turn', goalComplete: false };
+        } },
+      })).toBe('');
+      expect(attempts).toBe(2);
+      expect(logs).toContainEqual(expect.objectContaining({ category: 'grounding.persistent', event: 'empty',
+        data: expect.objectContaining({ reason: 'no-candidates', persistentStopReason: 'evidence_retry_incomplete' }) }));
+    } finally { (debug as { log: typeof debug.log }).log = original; }
+  });
+
   test('심볼 추출 예외도 fail-soft로 빈 grounding을 반환한다', async () => {
     expect(await groundGoalInCodebase('broken symbols', {
       cwd: '/wt',

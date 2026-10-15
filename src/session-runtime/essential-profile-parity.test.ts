@@ -41,7 +41,15 @@ function withDefaultModelSurface<T>(callback: () => T): T {
 // ⛔ 2026-08-19 — SelfOrchestrate 는 «은퇴»했다(대표 "self implement 만 남겨주세요. 그게 통합 방향입니다").
 //   능력은 self_implement 에 «이미» 흡수돼 있다(goals·decompose·concurrency… 스펙 선언 ⊕ :467 배선).
 //   🔄 되돌리기 = native-tool-catalog.ts 의 defaultEnabled 한 줄.
-const EXPECTED_ESSENTIAL_ONLY = ['SelfImplement', 'PersistentGrounding'];
+// The eight in-process ops-ledger runtimes are deliberately in the fixed
+// essential TUI catalog: an OP turn must be able to replace the corresponding
+// RunShell CLI calls even when rich coding profiles omit that family.
+const EXPECTED_ESSENTIAL_ONLY = [
+  'SelfImplement',
+  'MsgList', 'MsgPost', 'MsgAck',
+  'ChecklistList', 'ChecklistAdd', 'ChecklistSet', 'ChecklistEdit', 'ChecklistMove',
+  'PersistentGrounding',
+];
 const PARITY_GUARD = 'The essential fixed catalog and coding profile defaults diverged; if intentional, update this test with the reason. This guard makes divergence visible rather than forbidding it.';
 
 function toolNames(
@@ -164,7 +172,7 @@ describe('essential fixed catalog and coding profile parity', () => {
   });
 
   // PersistentGrounding remains essential-only at the default cost gate; explicit nativeStructure opt-in adds it to coding.
-  it('exposes SelfImplement, deferred SelfOrchestrate, and PersistentGrounding beyond either default rich coding profile', () => {
+  it('keeps SelfImplement, eight ops-ledger tools, and PersistentGrounding beyond either default rich coding profile', () => {
     for (const surfaceId of CODING_SURFACES) {
       const richNames = toolNames(true, surfaceId);
       const essentialOnly = difference(essentialNames, richNames);

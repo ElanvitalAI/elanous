@@ -58,6 +58,13 @@ export interface InteractiveTerminalModalSpec {
   /** Ghostty-compatible terminfo name. Defaults via PreviewTerminal
    *  to xterm-256color. */
   termName?: string;
+  /** Register this popup in the shared PTY inventory. */
+  useRegistry?: boolean;
+  registryKind?: string;
+  registryNickname?: string;
+  registryOrigin?: { originRoot: string; controller?: string };
+  registryPurpose?: string;
+  registrySeat?: string;
   /** Override bounds. Default: 85% of termCols/termRows, centered. */
   bounds?: ModalBounds;
   /** MT1 — named size preset (mutually exclusive with `bounds`; when
@@ -206,6 +213,12 @@ export function createInteractiveTerminalModal(
     shellArgs: spec.shellArgs,
     env: spec.env,
     termName: spec.termName,
+    useRegistry: spec.useRegistry,
+    registryKind: spec.registryKind,
+    registryNickname: spec.registryNickname,
+    registryOrigin: spec.registryOrigin,
+    registryPurpose: spec.registryPurpose,
+    registrySeat: spec.registrySeat,
     onUpdate: () => {
       // First output → leave the placeholder state. Stops the
       // spinner timer + flushes a render so the real PTY frame

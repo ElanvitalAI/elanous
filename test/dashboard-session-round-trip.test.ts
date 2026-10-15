@@ -26,6 +26,7 @@ import type {
   StreamWithToolsHandlers,
 } from '../src/llm.js';
 import * as llmModule from '../src/llm.js';
+import { isTuiRouteLine } from '../src/core-turn/short-question.js';
 
 type StreamCall = {
   messages: LLMMessage[];
@@ -36,6 +37,10 @@ const streamCalls: StreamCall[] = [];
 let streamImpl: (args: StreamCall) => Promise<string> = async () => '';
 
 const { DashboardSession } = await import('../src/tui-client/dashboard-session.js');
+
+// DashboardSession 은 tuiRouting 이 켜져 있어 goal loop 밖 턴은 답 앞에 «라우팅 줄»을 먼저 보낸다(#27555).
+// 그 줄은 브리지의 안내이지 모델 스트림이 아니다 — 왕복 단언은 모델이 낸 청크만 본다.
+const modelText = (texts: readonly string[]): string[] => texts.filter((t) => !isTuiRouteLine(t));
 
 const tool: LLMToolSpec = {
   name: 'echo',
@@ -101,7 +106,7 @@ describe('DashboardSession — full ACP round-trip (Phase 4)', () => {
     });
 
     expect(stopReason).toBe('end_turn');
-    expect(texts.join('')).toBe('hello');
+    expect(modelText(texts).join('')).toBe('hello');
     expect(toolCalls).toEqual([{ id: 'c1', name: 'echo' }]);
     expect(toolResults).toEqual([{ id: 'c1', name: 'echo', result: { ok: true } }]);
     expect(usages).toHaveLength(1);
@@ -132,7 +137,7 @@ describe('DashboardSession — full ACP round-trip (Phase 4)', () => {
       // intentionally no onToolCall / onToolResult / onUsage — must not throw
     });
     expect(stopReason).toBe('end_turn');
-    expect(texts).toEqual(['ok']);
+    expect(modelText(texts)).toEqual(['ok']);
 
     await session.close();
   });

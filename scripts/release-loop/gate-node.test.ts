@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { createGateRunner, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, parseOptions, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, admitGateShard, poolGateAdmission, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, type GateAdmission, type GateRunner } from './gate-node';
+import { createGateRunner, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, GATE_HOST_RECHECK_FILE_LIMIT, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, parseOptions, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, admitGateShard, poolGateAdmission, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, type GateAdmission, type GateRunner } from './gate-node';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { releaseLedgerRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
 import { debug } from '../../src/debug/log.js';
@@ -83,6 +83,29 @@ function fake(cut = [A, B, C], baseline = [A, D], cached = true) {
   return { root, instanceRoot, ledgerRoot, runner, calls };
 }
 const options = (instanceRoot: string) => ({ commit: CUT, version: '1.0.1', baselineVersion: '1.0.0', instanceRoot, ledgerRoot: join(dirname(instanceRoot), 'machine-ledger') });
+
+test('rehearsal gate invokes executable TUI screen node and refuses a failed screen; regular gate does not invoke it', async () => {
+  const f = fake([A], [A]);
+  let tuiRuns = 0;
+  f.runner.localCommand = async (_cmd, args) => {
+    tuiRuns++;
+    expect(args.slice(0, 3)).toEqual(['scripts/release-loop/tui-sim-node.ts', '--commit', CUT]);
+    return { rc: 1, output: JSON.stringify({ commit: CUT, verdict: 'fail', attempts: 2, checks: [
+      { id: 'boot', pass: true, detail: 'booted' }, { id: 'prompt', pass: true, detail: 'prompt' }, { id: 'status-bar', pass: true, detail: 'status' },
+      { id: 'help-opens', pass: true, detail: 'help' }, { id: 'help-closes', pass: false, detail: 'stuck' }, { id: 'no-error-text', pass: true, detail: 'clean' },
+    ] }) };
+  };
+  expect(await judgeGate(options(f.instanceRoot), f.runner)).toMatchObject({ outcome: 'ok' });
+  expect(tuiRuns).toBe(0);
+  expect(await judgeGate({ ...options(f.instanceRoot), rehearsalTui: true }, f.runner)).toMatchObject({
+    outcome: 'error', rehearsalTui: { outcome: 'fail', detail: expect.stringContaining('help-closes') },
+  });
+  expect(tuiRuns).toBe(1);
+  f.runner.localCommand = async () => ({ rc: 0, output: 'Usage: --help Dashboard help Commands ❯ ctx 0' });
+  expect(await judgeGate({ ...options(f.instanceRoot), rehearsalTui: true }, f.runner)).toMatchObject({
+    outcome: 'error', rehearsalTui: { outcome: 'unmeasured' },
+  });
+});
 
 test('pod counts only listed failing ids separately while still reporting a new unlisted failure', async () => {
   const repo = resolve(import.meta.dir, '../..');
@@ -231,6 +254,59 @@ test('judged identities persist in the machine ledger and a re-gate replaces the
     });
     expect(events.at(-1)).toEqual(expect.objectContaining({ commit: nextCommit, introduced: 0, preexisting: 1, introducedIds: [], preexistingIds: [A] }));
   } finally { observation.mockRestore(); }
+});
+
+test('second verdict-root write failure records the current error verdict and identities in the first root', async () => {
+  const { root, instanceRoot, ledgerRoot, runner } = fake([A, B], [A]);
+  const instanceVerdict = join(instanceRoot, 'release/1.0.1/gate-verdict.json');
+  const ledgerVerdict = join(ledgerRoot, 'release/1.0.1/gate-verdict.json');
+  mkdirSync(dirname(instanceVerdict), { recursive: true });
+  mkdirSync(dirname(ledgerVerdict), { recursive: true });
+  writeFileSync(instanceVerdict, JSON.stringify({ version: '1.0.1', commit: 'c'.repeat(40), outcome: 'ok', introduced: [], knownEnv: [], preexisting: [], loadFlaky: [] }));
+  writeFileSync(ledgerVerdict, JSON.stringify({ version: '1.0.1', commit: 'c'.repeat(40), outcome: 'ok', introduced: [], knownEnv: [], preexisting: [], loadFlaky: [] }));
+  const fs = await import('node:fs');
+  const realRename = fs.renameSync;
+  const judgedEvents: unknown[] = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'release-loop.gate' && event === 'judged') judgedEvents.push(data);
+  });
+  const rename = spyOn(fs, 'renameSync').mockImplementation((oldPath, newPath) => {
+    if (String(newPath) === instanceVerdict) throw new Error('second root write failed');
+    return realRename(oldPath, newPath);
+  });
+  try {
+    const result = await judgeGate(options(instanceRoot), runner);
+    expect(result).toMatchObject({ outcome: 'error', error: expect.stringContaining('second root write failed') });
+    expect(JSON.parse(readFileSync(ledgerVerdict, 'utf8'))).toEqual({
+      version: '1.0.1', commit: CUT, outcome: 'error', introduced: [B], knownEnv: [], preexisting: [A], loadFlaky: [],
+    });
+    expect(judgedEvents).toContainEqual(expect.objectContaining({
+      commit: CUT, outcome: 'error', introducedIds: [B], preexistingIds: [A],
+    }));
+  } finally { rename.mockRestore(); log.mockRestore(); }
+});
+
+test('unreadable existing verdict returns an error GateResult', async () => {
+  const { instanceRoot, ledgerRoot, runner } = fake([A, B], [A]);
+  const path = join(ledgerRoot, 'release/1.0.1/gate-verdict.json');
+  const events: unknown[] = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'release-loop.gate' && event === 'judged') events.push(data);
+  });
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, 'not readable by permissions');
+  const fs = await import('node:fs');
+  const realRead = fs.readFileSync;
+  const read = spyOn(fs, 'readFileSync').mockImplementation(((file: unknown, ...args: unknown[]) => {
+    if (String(file) === path) throw new Error('verdict read failed');
+    return (realRead as (...parameters: unknown[]) => unknown)(file, ...args);
+  }) as typeof fs.readFileSync);
+  try {
+    expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({
+      outcome: 'error', error: expect.stringContaining('verdict read failed'),
+    });
+    expect(events).toContainEqual(expect.objectContaining({ outcome: 'error', introducedIds: [B], preexistingIds: [A] }));
+  } finally { read.mockRestore(); log.mockRestore(); }
 });
 
 test('machine ledger baseline is reused across empty worktree universes; stale commit is swept', async () => {
@@ -579,7 +655,7 @@ test('remote preparation uses a bare mirror without the caller checkout on the r
   const origin = join(root, 'origin');
   const caller = join(root, 'caller');
   mkdirSync(origin);
-  const git = (cwd: string, ...args: string[]) => spawnSync('git', args, { cwd, encoding: 'utf8' });
+  const git = (cwd: string, ...args: string[]) => spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: join(root, 'gitconfig') } });
   expect(git(origin, 'init', '-q').status).toBe(0);
   writeFileSync(join(origin, 'tracked.txt'), 'baseline');
   expect(git(origin, 'add', 'tracked.txt').status).toBe(0);
@@ -590,6 +666,7 @@ test('remote preparation uses a bare mirror without the caller checkout on the r
   expect(git(origin, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'cut').status).toBe(0);
   const cut = git(origin, 'rev-parse', 'HEAD').stdout.trim();
   expect(git(root, 'clone', '-q', '--no-checkout', origin, caller).status).toBe(0);
+  expect(git(caller, 'config', '--local', 'core.hooksPath', '/dev/null').status).toBe(0);
   expect(git(caller, 'remote', 'set-url', 'origin', 'https://example.invalid/unavailable.git').status).toBe(0);
   // The remote is always a Linux host whose work dir is `/tmp/release-gate-*` (the code refuses anything else) — mirror
   // that literally; `tmpdir()` is `/var/folders/…` on macOS and made this test red on mbp only.
@@ -614,7 +691,7 @@ test('remote preparation uses a bare mirror without the caller checkout on the r
   });
   runner.localCommand = async (cmd, args, cwd) => {
     calls.push(`${cmd} ${args.join(' ')} @${cwd}`);
-    const run = spawnSync(cmd, ['push', mirror, ...args.slice(2)], { cwd, encoding: 'utf8' });
+    const run = spawnSync(cmd, ['-c', 'core.hooksPath=/dev/null', 'push', mirror, ...args.slice(2)], { cwd, encoding: 'utf8' });
     return { rc: run.status ?? 2, output: `${run.stdout ?? ''}\n${run.stderr ?? ''}` };
   };
   runner.sweep = async (tree) => {
@@ -672,14 +749,26 @@ test('real SSH transport pushes to a bare mirror without the caller path or GitH
   expect(git(source, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'cut').status).toBe(0);
   const cut = git(source, 'rev-parse', 'HEAD').stdout.trim();
   expect(git(root, 'clone', '-q', '--no-checkout', source, caller).status).toBe(0);
+  expect(git(caller, 'config', '--local', 'core.hooksPath', '/dev/null').status).toBe(0);
   expect(git(caller, 'remote', 'set-url', 'origin', 'https://example.invalid/unavailable.git').status).toBe(0);
+  const previousGitConfig = process.env.GIT_CONFIG_GLOBAL;
+  const previousGitNoSystem = process.env.GIT_CONFIG_NOSYSTEM;
+  const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL;
+  const previousGitTemplateDir = process.env.GIT_TEMPLATE_DIR;
   const sshCalls = join(root, 'ssh-calls');
   const shim = join(bin, 'ssh');
   writeFileSync(shim, `#!/usr/bin/env bun\nimport { appendFileSync } from 'node:fs';\nimport { spawnSync } from 'node:child_process';\nconst command = process.argv.slice(3).join(' ');\nappendFileSync(${JSON.stringify(sshCalls)}, command + '\\n');\nif (command.includes(${JSON.stringify(caller)})) process.exit(91);\nconst run = spawnSync('sh', ['-c', command], { stdio: 'inherit' });\nprocess.exit(run.status ?? 2);\n`);
   chmodSync(shim, 0o700);
+  expect(git(caller, 'config', '--local', 'core.hooksPath', '/dev/null').status).toBe(0);
   const oldPath = process.env.PATH;
   process.env.PATH = `${bin}:${oldPath ?? ''}`;
   try {
+    process.env.GIT_CONFIG_GLOBAL = join(root, 'gitconfig');
+    process.env.GIT_CONFIG_NOSYSTEM = '1';
+    process.env.GIT_ALLOW_PROTOCOL = 'file:ssh';
+    process.env.GIT_TEMPLATE_DIR = join(root, 'empty-template');
+    mkdirSync(process.env.GIT_TEMPLATE_DIR);
+    writeFileSync(process.env.GIT_CONFIG_GLOBAL, '');
     const runner = createGateRunner(caller, 'test-host');
     const command = runner.command;
     let remoteWork = '';
@@ -704,7 +793,17 @@ test('real SSH transport pushes to a bare mirror without the caller path or GitH
   } finally {
     if (oldPath === undefined) delete process.env.PATH;
     else process.env.PATH = oldPath;
+    if (previousGitConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = previousGitConfig;
+    if (previousGitNoSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+    else process.env.GIT_CONFIG_NOSYSTEM = previousGitNoSystem;
+    if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL;
+    else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol;
+    if (previousGitTemplateDir === undefined) delete process.env.GIT_TEMPLATE_DIR;
+    else process.env.GIT_TEMPLATE_DIR = previousGitTemplateDir;
   }
+  expect(process.env.GIT_ALLOW_PROTOCOL).toBe(previousGitAllowProtocol);
+  expect(process.env.GIT_TEMPLATE_DIR).toBe(previousGitTemplateDir);
 });
 
 test('an unsafe remote mirror path fails before any remote commands', async () => {
@@ -1155,7 +1254,9 @@ test('Pod sweep opts into the Bun cache and records the first install timing', a
     expect(invoked).toHaveLength(2);
     expect(invoked[1]!.bunCache).toBe('/srv/bun-cache');
     const cachePrefix = 'if [ -d /bun-cache ] && [ -w /bun-cache ]; then export BUN_INSTALL_CACHE_DIR=/bun-cache; fi;\n';
-    expect(invoked[1]!.command[2]).toContain(`O="$HOME/outbox"\n${cachePrefix}`);
+    expect(invoked[1]!.command[2]).toContain(`O="$HOME/outbox"`);
+    expect(invoked[1]!.command[2]).toContain(cachePrefix);
+    expect(invoked[1]!.command[2]!.indexOf(`O="$HOME/outbox"`)).toBeLessThan(invoked[1]!.command[2]!.indexOf(cachePrefix));
     expect(invoked[1]!.command[2]!.replace(cachePrefix, '')).toBe(invoked[0]!.command[2]);
     expect(observed).toEqual([
       { event: 'pod-bun-cache', data: { source: 'none' } },
@@ -1210,7 +1311,11 @@ test('graph pod cache wins over env, and blank graph cache falls back to env', a
     expect((await sweepGraph(undefined)).rc).toBe(0);
     const prefix = 'if [ -d /bun-cache ] && [ -w /bun-cache ]; then export BUN_INSTALL_CACHE_DIR=/bun-cache; fi;\n';
     expect(invoked.map((o) => o.bunCache)).toEqual(['/var/cache/elanous-bun', '/var/cache/elanous-bun', '/srv/env-cache', undefined]);
-    for (const o of invoked.slice(0, 3)) expect(o.command[2]).toContain(`O="$HOME/outbox"\n${prefix}`);
+    for (const o of invoked.slice(0, 3)) {
+      expect(o.command[2]).toContain(`O="$HOME/outbox"`);
+      expect(o.command[2]).toContain(prefix);
+      expect(o.command[2]!.indexOf(`O="$HOME/outbox"`)).toBeLessThan(o.command[2]!.indexOf(prefix));
+    }
     expect(invoked[3]!.command[2]).not.toContain('BUN_INSTALL_CACHE_DIR');
     expect(sources).toEqual([{ source: 'config' }, { source: 'config' }, { source: 'env' }, { source: 'none' }]);
   } finally {
@@ -1856,7 +1961,10 @@ test('GT1: a 60-file root shard that OOMs retries as 27/27/6 chunks at once, nev
   const repo = join(root, 'repo');
   mkdirSync(repo);
   const files = Array.from({ length: 60 }, (_, i) => `src/f${String(i).padStart(2, '0')}.test.ts`);
+  mkdirSync(join(repo, 'release'));
+  writeFileSync(join(repo, 'release/gate-batch-safe.json'), JSON.stringify({ env: 'linux-pod', tests: files.map((file) => ({ file, evidence: 'synthetic cap fixture' })) }));
   const sizes: number[] = [];
+  const shells: string[] = [];
   const events: Array<[string, unknown]> = [];
   const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
     if (category === 'release-loop.gate' && (event === 'pod-shard-split' || event === 'pod-shard-cap-split')) events.push([event, data]);
@@ -1870,20 +1978,39 @@ test('GT1: a 60-file root shard that OOMs retries as 27/27/6 chunks at once, nev
     }, async (o) => {
       const paths = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
       sizes.push(paths.length);
+      shells.push(o.command[2]!);
       const artifactsDir = join(root, `cap-shard-${o.name}`);
+      rmSync(artifactsDir, { recursive: true, force: true });
       mkdirSync(artifactsDir);
       if (paths.length > POD_SHARD_FILE_CAP) return { exitCode: 137, artifactsDir, job: 'fake' };
-      writeFileSync(join(artifactsDir, 'shard.log'), `${paths.length} pass\n0 fail\nRan ${paths.length} tests across ${paths.length} files.\n`);
-      writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+      if (!o.command[2]!.includes('gate-isolate.')) {
+        writeFileSync(join(artifactsDir, 'shard.log'), `${paths.length} pass\n0 fail\nRan ${paths.length} tests across ${paths.length} files.\n`);
+        writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+        return { exitCode: 0, artifactsDir, job: 'fake' };
+      }
+      // A cap chunk is now one Job with file-isolated parts; provide the same artifact contract as that Job.
+      writeFileSync(join(artifactsDir, 'install.rc'), '0\n');
+      paths.forEach((file, index) => {
+        writeFileSync(join(artifactsDir, `part-${index}.log`), `${file}:\n(pass) case [1.00ms]\n1 pass\n0 fail\nRan 1 test across 1 file.\n`);
+        writeFileSync(join(artifactsDir, `part-${index}.rc`), '0\n');
+        writeFileSync(join(artifactsDir, `part-${index}.junit.xml`), `<testsuites><testsuite file="${file}" tests="1"><testcase name="case"/></testsuite></testsuites>`);
+      });
       return { exitCode: 0, artifactsDir, job: 'fake' };
     }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]));
     const result = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 });
     expect(sizes[0]).toBe(60);
     expect(sizes.slice(1).sort((a, b) => b - a)).toEqual([27, 27, 6]);
+    expect(shells.slice(1).every((shell) => shell.includes('pids+=('))).toBe(true);
     expect(result.rc).toBe(0);
     expect(result.output).toContain('Ran 60 tests across 60 files.');
     expect(events.map(([event]) => event)).toEqual(['pod-shard-cap-split']);
     expect(events[0]![1]).toMatchObject({ shard: 0, files: 60, chunks: 3, cap: 27 });
+    writeFileSync(join(repo, 'release/gate-batch-safe.json'), JSON.stringify({ env: 'linux-pod', tests: [] }));
+    sizes.length = 0; shells.length = 0;
+    const defaultResult = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 });
+    expect(sizes).toEqual([60, 27, 27, 6]);
+    expect(shells.slice(1).every((shell) => !shell.includes('gate-isolate.'))).toBe(true);
+    expect(defaultResult.rc).toBe(0);
   } finally { log.mockRestore(); }
 });
 
@@ -2815,6 +2942,34 @@ test('GATE-INTRO-RECHECK: an assertion failure is introduced as before, with no 
   expect(calls.some((call) => call.includes('--timeout'))).toBe(false);
 });
 
+test('GATE-HOST-RECHECK-CAP: excess new-failure files are named unmeasured and gate exits through the human error path', async () => {
+  const ids = Array.from({ length: 33 }, (_, i) => `src/intro-${i}.test.ts > fails`).reverse();
+  const orderedFiles = ids.map((id) => id.split(' > ')[0]!).sort();
+  const omitted = orderedFiles[32]!;
+  const measured = orderedFiles.slice(0, 32);
+  const { root, instanceRoot, runner, calls } = fake(ids, []);
+  const original = runner.command;
+  runner.command = async (cmd, args, cwd, limitMs) => {
+    if (cmd === 'bun' && args[0] === 'run' && args[1] === 'test:deterministic') {
+      calls.push(`${cmd} ${args.join(' ')} @${cwd}`);
+      const file = args[2]!.replace(/^\.\//, '');
+      return cwd.endsWith('/cut')
+        ? { rc: 1, output: runOutput([`${file} > fails`]) }
+        : { rc: 0, output: '1 pass\n0 fail\nRan 1 tests across 1 files.\n' };
+    }
+    return original(cmd, args, cwd, limitMs);
+  };
+  const result = await judgeGate(options(instanceRoot), runner);
+  expect(result).toMatchObject({ outcome: 'error', introduced: measured.map((file) => `${file} > fails`), knownEnv: 0,
+    stalledEnv: [], unmeasuredRecheckFiles: [omitted] });
+  expect(result.error).toContain('isolated recheck unmeasured: 1 files exceed limit 32');
+  expect(graphGateResult(result, true).verdict).toBe('fail');
+  expect(JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8')))
+    .toMatchObject({ outcome: 'error', unmeasuredRecheckFiles: [omitted] });
+  expect(calls.filter((call) => call.startsWith('bun run test:deterministic') && call.includes('/cut'))
+    .map((call) => /\.\/src\/intro-\d+\.test\.ts/.exec(call)?.[0])).toEqual(measured.map((file) => `./${file}`));
+});
+
 // GATE-SHARD-RESUME (0.2.19) — 0.2.18 gate 2 stopped after 33 minutes on a tool error and gate 3 re-ran every finished shard.
 test('GATE-SHARD-RESUME: a re-run on the same commit reads finished shards from the log directory instead of starting Pods', async () => {
   const { root, runner: fixtureRunner } = fake([], []);
@@ -3058,7 +3213,7 @@ test('GATE-SHARD-RESUME: a big shard that went cap-split and then file isolation
     return { exitCode: 0, artifactsDir, job: 'fake' };
   }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]));
   const first = await runner.sweep(repo, logDir, { pool: 'pool-test', shards: 1 });
-  // root 1 · cap chunks 2 · isolated files 29
+  // root 1 · cap chunks 2 (each a file-isolated batch) · both batches OOM · per-file fallback 29.
   expect(podCalls).toBe(1 + 2 + files.length);
   expect(existsSync(join(logDir, 'pod-0-c0-file-0.json'))).toBe(true);
   const resumed = await runner.sweep(repo, logDir, { pool: 'pool-test', shards: 1 });

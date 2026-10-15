@@ -37,6 +37,25 @@ export interface WizardForm {
 
 export interface WizardMessage { role: 'user' | 'assistant'; text: string }
 
+export function wizardConversationFromResponse(text: string, previous: WizardForm): { form: WizardForm; reply: string } {
+  const trimmed = text.trim();
+  const json = trimmed.startsWith('```json') && trimmed.endsWith('```')
+    ? trimmed.slice(7, -3).trim() : trimmed;
+  if (!json.startsWith('{') || !json.endsWith('}')) throw new Error('마법사 응답에 폼이 없습니다. 다시 요청하세요.');
+  let result: unknown;
+  try { result = JSON.parse(json); }
+  catch { throw new Error('마법사 응답을 읽지 못했습니다. 다시 요청하세요.'); }
+  if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('마법사 응답에 폼이 없습니다. 다시 요청하세요.');
+  const form = result as Record<string, unknown>;
+  if (typeof form.description !== 'string' || !form.description.trim() ||
+    typeof form.instructions !== 'string' || !form.instructions.trim() ||
+    typeof form.reply !== 'string' || !form.reply.trim()) {
+    throw new Error('마법사 응답에 설명과 지시문과 답변이 필요합니다. 다시 요청하세요.');
+  }
+  // LLM content never overwrites the user-controlled plugin identity, connector or credential fields.
+  return { form: { ...previous, description: form.description.trim(), instructions: form.instructions.trim() }, reply: form.reply.trim() };
+}
+
 export function wizardFormFromRequest(request: string, previous: WizardForm): WizardForm {
   const description = request.trim();
   if (!description) throw new Error('플러그인 설명을 입력하세요.');

@@ -74,6 +74,7 @@ export interface TerminalSummary {
   cmd: string;
   workdir?: string;
   nickname?: string;
+  purpose?: string;
   treeName: string;
   worktreeName: string;
   parentPtyId: string;
@@ -278,6 +279,7 @@ function summarize(
     cmd: handle.cmd,
     ...(handle.workdir ? { workdir: handle.workdir } : {}),
     ...(manifest?.nickname ? { nickname: manifest.nickname } : {}),
+    ...(manifest?.purpose ? { purpose: manifest.purpose } : {}),
     ...names,
     parentPtyId: manifest?.parentPtyId ?? '',
     parentPid: manifest?.parentPid ?? 0,
@@ -322,6 +324,7 @@ function summarizeManifest(
     id: row.id, cmd: row.cmd,
     ...(row.workdir ? { workdir: row.workdir } : {}),
     ...(row.nickname ? { nickname: row.nickname } : {}),
+    ...(row.purpose ? { purpose: row.purpose } : {}),
     ...terminalTreeNames(row.workdir),
     parentPtyId: row.parentPtyId, parentPid: row.parentPid, parentKind: row.parentKind, runId: row.runId,
     ...(row.chainOrigin === undefined ? {} : { chainOrigin: row.chainOrigin }),

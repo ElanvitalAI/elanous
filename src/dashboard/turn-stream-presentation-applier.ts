@@ -99,6 +99,13 @@ export function createTurnStreamPresentationApplier(
       switch (event.type) {
         case 'assistant.replaceBlock': {
           const beforeLen = deps.chatLines.length;
+          if (assistantStart > deps.chatLines.length) {
+            debug.log('dashboard.chat.stream', 'presentation.assistant-start-clamped', {
+              assistantStart,
+              chatLinesLen: deps.chatLines.length,
+            });
+            assistantStart = deps.chatLines.length;
+          }
           deps.chatLines.length = assistantStart;
           deps.chatLines.push(...event.lines);
           logEvent('assistant.replaceBlock', {
@@ -158,6 +165,7 @@ export function createTurnStreamPresentationApplier(
             event.expandedLines,
             event.operationKind ? { operationKind: event.operationKind } : undefined,
           );
+          assistantStart = Math.min(assistantStart, deps.chatLines.length);
           deps.renderedToolRuntime.deleteArgs(event.callId);
           logEvent('tool.replaceBlock', {
             callId: event.callId,

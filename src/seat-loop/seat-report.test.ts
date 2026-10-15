@@ -360,10 +360,10 @@ test('report counts distinct launched runIds for every seat and appends the runn
       const prefix = `**[${seat}]** {{TS}} → 보고 2026-10-03: 발사 K1 K1 (r1) · 발사 K2 K2 (r2) · 발사 K3 K3 (r3) · 발사 K4 K4 (r1) · 결정 상정 K5 K5 · 발사 K6 K6 (runId 없음)`;
       expect(body.startsWith(prefix)).toBe(true);
       if (seat === 'OP') {
-        expect(body).toContain(' · 수확 가지 오늘 0 · TASK-AGENT cover land: TA 0/0 (-) · live 0 · shadow 0 · steward-transition unmeasured · 도는 런 2(불확실 1)');
+        expect(body).toContain(' · 수확 가지 오늘 0 · TASK-AGENT cover land: TA 0/0 (-) · live 0 · shadow 0 · steward-transition unmeasured · 도는 런 2(불확실 1) · 착지 0(원장 없음 3)');
       }
-      else expect(body).toBe(`${prefix} · 도는 런 2(불확실 1)`);
-      expect(body).toEndWith(' · 도는 런 2(불확실 1)');
+      else expect(body).toBe(`${prefix} · 도는 런 2(불확실 1) · 착지 0(원장 없음 3)`);
+      expect(body).toEndWith(' · 도는 런 2(불확실 1) · 착지 0(원장 없음 3)');
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -405,9 +405,9 @@ test('report default lookup follows isolated run-ledger start and termination re
     });
     expect(child.status, child.stderr).toBe(0);
     const { before, terminatedWithPty, after } = JSON.parse(child.stdout.trim().split('\n').at(-1)!) as { before: string; terminatedWithPty: string; after: string };
-    expect(before).toEndWith(' · 도는 런 1(불확실 0)');
-    expect(terminatedWithPty).toEndWith(' · 도는 런 0(불확실 1)');
-    expect(after).toEndWith(' · 도는 런 0(불확실 0)');
+    expect(before).toEndWith(' · 도는 런 1(불확실 0) · 착지 0(원장 없음 0)');
+    expect(terminatedWithPty).toEndWith(' · 도는 런 0(불확실 1) · 착지 0(원장 없음 0)');
+    expect(after).toEndWith(' · 도는 런 0(불확실 0) · 착지 0(원장 없음 0)');
     expect(before.slice(0, before.lastIndexOf(' · 도는 런'))).toBe(after.slice(0, after.lastIndexOf(' · 도는 런')));
   } finally { rmSync(home, { recursive: true, force: true }); }
 }, 150_000);
@@ -421,10 +421,10 @@ test('report distinguishes failed or null running lookup from no launched runs w
       item: { source: 'checklist', id: 'K1', title: 'build', text: 'build' }, runId: 'r1' }) + '\n');
     const base = { root, now: () => now };
     const failed = (await seatReport('TC', { ...base, runningRuns: () => { throw Error('ledger unavailable'); } })).body;
-    expect(failed).toBe('**[TC]** {{TS}} → 보고 2026-10-03: 발사 K1 build (r1) · 도는 런 못 잼');
-    expect((await seatReport('TC', { ...base, runningRuns: () => null })).body).toEndWith(' · 도는 런 못 잼');
+    expect(failed).toBe('**[TC]** {{TS}} → 보고 2026-10-03: 발사 K1 build (r1) · 도는 런 못 잼 · 착지 0(원장 없음 1)');
+    expect((await seatReport('TC', { ...base, runningRuns: () => null })).body).toEndWith(' · 도는 런 못 잼 · 착지 0(원장 없음 1)');
     expect((await seatReport('TC', { ...base, runningRuns: () => ({ running: 0, unknown: 0 }) })).body)
-      .toEndWith(' · 도는 런 0(불확실 0)');
+      .toEndWith(' · 도는 런 0(불확실 0) · 착지 0(원장 없음 1)');
     writeFileSync(path, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'hitl',
       item: { source: 'checklist', id: 'K1', title: 'build', text: 'build' }, runId: 'r1' }) + '\n');
     let lookups = 0;
@@ -437,5 +437,138 @@ test('report distinguishes failed or null running lookup from no launched runs w
     const missingId = (await seatReport('TC', { ...base, runningRuns: () => { lookups += 1; return null; } })).body;
     expect(lookups).toBe(0);
     expect(missingId).toBe('**[TC]** {{TS}} → 보고 2026-10-03: 발사 K2 unidentified (runId 없음) · 도는 런 0');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('report counts a merged run ledger as 착지 next to the running field and leaves unmerged runs out', () => {
+  const home = mkdtempSync(join(tmpdir(), 'seat-report-landed-'));
+  try {
+    const state = join(home, '.elanous');
+    const ids = [randomUUID(), randomUUID(), randomUUID()].map((uuid) => `run-${uuid}`);
+    const script = `
+      import { mkdirSync, appendFileSync, writeFileSync } from 'node:fs';
+      import { dirname, join } from 'node:path';
+      import { seatReport } from ${JSON.stringify(join(import.meta.dir, 'seat-report.ts'))};
+      import { seatLedgerPath } from ${JSON.stringify(join(import.meta.dir, 'seat-loop.ts'))};
+      import { runLedgerDir } from ${JSON.stringify(join(import.meta.dir, '../self-implement/run-ledger.ts'))};
+      const state = ${JSON.stringify(state)};
+      const ids = ${JSON.stringify(ids)};
+      const now = new Date(${JSON.stringify(now.toISOString())});
+      const seatPath = seatLedgerPath('TC', state, now);
+      mkdirSync(dirname(seatPath), { recursive: true });
+      writeFileSync(seatPath, ids.map((id) => JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'launched',
+        item: { source: 'checklist', id: 'K1', title: 'build', text: 'build' }, runId: id })).join('\\n') + '\\n');
+      const ledgerDir = runLedgerDir();
+      mkdirSync(ledgerDir, { recursive: true });
+      const record = (id, event, data) => appendFileSync(join(ledgerDir, id + '.jsonl'),
+        JSON.stringify({ timestamp: now.toISOString(), runId: id, event, data }) + '\\n');
+      for (const id of ids) record(id, 'start', {});
+      record(ids[0], 'merged', { number: 101, merged: true });
+      record(ids[1], 'merged', { number: 102, merged: true });
+      const report = await seatReport('TC', { root: state, now: () => now, runningRuns: () => ({ running: 0, unknown: 0 }) });
+      console.log(JSON.stringify({ body: report.body }));
+    `;
+    const child = spawnSync('bun', ['-e', script], {
+      cwd: join(import.meta.dir, '../..'), encoding: 'utf8', timeout: 120_000,
+      env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: state, ELANOUS_CONFIG_DIR: state },
+    });
+    expect(child.status, child.stderr).toBe(0);
+    const { body } = JSON.parse(child.stdout.trim().split('\n').at(-1)!) as { body: string };
+    expect(body).toEndWith(' · 도는 런 0(불확실 0) · 착지 2(원장 없음 0)');
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}, 150_000);
+
+test('report counts a launched runId without a local run ledger as 원장 없음, distinct from 0', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'seat-report-'));
+  try {
+    const path = seatLedgerPath('TC', root, now);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'launched',
+      item: { source: 'checklist', id: 'K1', title: 'build', text: 'build' }, runId: `run-${randomUUID()}` }) + '\n');
+    const body = (await seatReport('TC', { root, now: () => now, runningRuns: () => ({ running: 0, unknown: 0 }) })).body;
+    expect(body).toContain(' · 착지 0(원장 없음 1)');
+    expect(body).toEndWith(' · 도는 런 0(불확실 0) · 착지 0(원장 없음 1)');
+    expect(body).not.toContain('원장 없음 0');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('report attempts every runId even when the first ledger read throws', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'seat-report-'));
+  try {
+    const path = seatLedgerPath('TC', root, now);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, ['first', 'second'].map((runId) => JSON.stringify({ seat: 'TC', at: now.toISOString(),
+      status: 'launched', item: { source: 'checklist', id: runId, title: runId, text: runId }, runId })).join('\n') + '\n');
+    const visited: string[] = [];
+    const body = (await seatReport('TC', { root, now: () => now,
+      runningRuns: () => ({ running: 0, unknown: 0 }),
+      loadLedger: (runId) => {
+        visited.push(runId);
+        if (runId === 'first') throw Error('unreadable ledger');
+        return [{ runId, event: 'merged', data: {} }];
+      },
+    })).body;
+    expect(visited).toEqual(['first', 'second']);
+    expect(body).toEndWith(' · 도는 런 0(불확실 0) · 착지 못 잼');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('report checks later runIds after a real unreadable ledger and reports 착지 못 잼', () => {
+  const home = mkdtempSync(join(tmpdir(), 'seat-report-unreadable-ledger-'));
+  try {
+    const state = join(home, '.elanous');
+    const ids = [randomUUID(), randomUUID()].map((uuid) => `run-${uuid}`);
+    const script = `
+      import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+      import { dirname, join } from 'node:path';
+      import { seatReport } from ${JSON.stringify(join(import.meta.dir, 'seat-report.ts'))};
+      import { seatLedgerPath } from ${JSON.stringify(join(import.meta.dir, 'seat-loop.ts'))};
+      import { runLedgerDir } from ${JSON.stringify(join(import.meta.dir, '../self-implement/run-ledger.ts'))};
+      const state = ${JSON.stringify(state)};
+      const ids = ${JSON.stringify(ids)};
+      const now = new Date(${JSON.stringify(now.toISOString())});
+      const seatPath = seatLedgerPath('TC', state, now);
+      mkdirSync(dirname(seatPath), { recursive: true });
+      writeFileSync(seatPath, ids.map((id) => JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'launched',
+        item: { source: 'checklist', id: 'K1', title: 'build', text: 'build' }, runId: id })).join('\\n') + '\\n');
+      const dir = runLedgerDir();
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, ids[0] + '.jsonl'), '{bad json}\\n');
+      writeFileSync(join(dir, ids[1] + '.jsonl'), JSON.stringify({ timestamp: now.toISOString(), runId: ids[1], event: 'merged', data: {} }) + '\\n');
+      const body = (await seatReport('TC', { root: state, now: () => now, runningRuns: () => ({ running: 0, unknown: 0 }) })).body;
+      // 실패 원장을 제거하면 남은 실제 merged 원장은 정상적으로 집계된다.
+      rmSync(join(dir, ids[0] + '.jsonl'));
+      const recovered = (await seatReport('TC', { root: state, now: () => now, runningRuns: () => ({ running: 0, unknown: 0 }) })).body;
+      console.log(JSON.stringify({ body, recovered }));
+    `;
+    const child = spawnSync('bun', ['-e', script], {
+      cwd: join(import.meta.dir, '../..'), encoding: 'utf8', timeout: 120_000,
+      env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: state, ELANOUS_CONFIG_DIR: state },
+    });
+    expect(child.status, child.stderr).toBe(0);
+    const { body, recovered } = JSON.parse(child.stdout.trim().split('\n').at(-1)!) as { body: string; recovered: string };
+    expect(body).toEndWith(' · 도는 런 0(불확실 0) · 착지 못 잼');
+    expect(recovered).toEndWith(' · 도는 런 0(불확실 0) · 착지 1(원장 없음 1)');
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}, 150_000);
+
+test('report renders 착지 못 잼 when the landed-run lookup fails and shows an all-zero 착지', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'seat-report-'));
+  try {
+    const path = seatLedgerPath('TC', root, now);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'launched',
+      item: { source: 'checklist', id: 'K1', title: 'build', text: 'build' }, runId: 'r1' }) + '\n');
+    const base = { root, now: () => now, runningRuns: () => ({ running: 0, unknown: 0 }) };
+    const received: string[][] = [];
+    const failed = (await seatReport('TC', { ...base, landedRuns: (ids) => {
+      received.push([...ids]);
+      throw Error('run ledger unreadable');
+    } })).body;
+    expect(received).toEqual([['r1']]);
+    expect(failed).toEndWith(' · 도는 런 0(불확실 0) · 착지 못 잼');
+    expect((await seatReport('TC', { ...base, landedRuns: () => null })).body).toEndWith(' · 착지 못 잼');
+    expect((await seatReport('TC', { ...base, landedRuns: () => ({ landed: 0, unread: 0 }) })).body)
+      .toEndWith(' · 도는 런 0(불확실 0) · 착지 0(원장 없음 0)');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

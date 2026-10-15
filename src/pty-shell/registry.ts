@@ -371,6 +371,12 @@ export interface StartOpts {
   kind?: string;
   /** 휴먼 리더블 닉네임 — 고유 id 와 함께 같은 PTY 를 부르는 다른 이름(나중에 goto 로 기억·접근). */
   nickname?: string;
+  /** Explicit origin for a host-owned PTY when the host process has no origin marker. */
+  origin?: { originRoot: string; controller?: string };
+  /** Explicit purpose for a host-owned PTY with no worktree goal. */
+  purpose?: string;
+  /** Seat that owns this PTY; absent for callers without a seat. */
+  seat?: string;
   /** 접근 모드 초기값(관찰 read/인터랙션 write/자율 auto). 기본 'write'(미션 등 헤드리스 자율은 'auto' 지정). */
   accessMode?: PtyAccessMode;
   /** 전환 정책 초기값(전환불가 locked/전환허용 open). 기본 'open'. */
@@ -766,6 +772,9 @@ export function startPty(opts: StartOpts): PtyHandle {
       id, kind: handle.kind, cmd: handle.cmd, ptyPid: adapter.pid,
       ...(handle.nickname ? { nickname: handle.nickname } : {}),
       ...(handle.workdir ? { workdir: handle.workdir } : {}),
+      ...(opts.origin ? { origin: opts.origin } : {}),
+      ...(opts.purpose ? { purpose: opts.purpose } : {}),
+      ...(opts.seat ? { seat: opts.seat } : {}),
       startedAt: handle.startedAt, now: Date.now(),
       identity: {
         ...(childSpaceId === undefined ? {} : { spaceId: childSpaceId }),
@@ -887,8 +896,16 @@ export function listPty(): PtyHandle[] {
 /** 닉네임 부여/변경 — 나중에 goto 로 기억·접근 쉽게. 없는 id 면 false. */
 export function renamePty(id: string, nickname: string): boolean {
   const h = getPty(id);
-  if (!h) return false;
-  h.setNickname(nickname);
+  if (h) {
+    h.setNickname(nickname);
+    return true;
+  }
+  // ⭐ 자식이 아닌 제어 대상(맨 `elanous` TUI 의 `tui:<pid>` 행 등)은 PtyHandle 이 없다 —
+  //    별명은 manifest 행에만 산다. 여기서 받지 않으면 IPC rename 이 그 행에 `unknown-pty` 로 진다.
+  const target = controlTargets.get(id);
+  if (!target || !target.isAlive()) return false;
+  if (PTY_MANIFEST_ENABLED) updatePtyManifestNickname(id, nickname.trim() || undefined, Date.now());
+  debug.log('pty.rename', 'control-target-renamed', { ptyId: id, nickname: nickname.trim() });
   return true;
 }
 

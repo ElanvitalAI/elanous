@@ -741,6 +741,12 @@ const SESSION_RUNTIME_TOOL_FAMILY_RULES: SessionRuntimeToolFamilyRule[] = [
     match: () => false,
   },
   {
+    id: 'ops-ledger',
+    description: 'In-process seat messages and release checklist operations.',
+    names: ['msg_list', 'msg_post', 'msg_ack', 'checklist_list', 'checklist_add', 'checklist_set', 'checklist_edit', 'checklist_move'],
+    match: () => false,
+  },
+  {
     // OH8 follow-up (PR-1) — multi-filter run_tests. A coding agent that
     // passes multiple test filters needs to know each one actually ran;
     // `bun test` substring filters silently absorb typos (exit 0). names =
@@ -1735,7 +1741,7 @@ const ESSENTIAL_NATIVE_RULE_IDS = [
 const ESSENTIAL_HOST_FAMILY_IDS = ['self-ops', 'release-read'] as const;
 // Keep this TUI essential addition out of the shared control/agent self-ops family.
 const ESSENTIAL_HOST_EXTRA_NAMES = ['logs_query'] as const;
-const ESSENTIAL_RUNTIME_FAMILY_IDS = ['bash', 'run-shell', 'pty-shell', 'run-tests', 'elanous_skills_list', 'skill_exec', 'code-grounding'] as const;
+const ESSENTIAL_RUNTIME_FAMILY_IDS = ['bash', 'run-shell', 'ops-ledger', 'pty-shell', 'run-tests', 'elanous_skills_list', 'skill_exec', 'code-grounding'] as const;
 const ESSENTIAL_OPTIONAL_TOOL_NAMES = [
   'GetDashboardState',
   'TerminalModalList', 'TerminalModalObserve', 'TerminalModalFocus', 'TerminalModalDetach', 'TerminalModalKill',

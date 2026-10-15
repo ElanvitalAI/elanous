@@ -16,6 +16,51 @@ import { fileLeaseStore, serializeLease } from '../hq/lease.js';
 import type { HqDeps } from '../hq/hq.js';
 import { isPrerelease, isReleaseVersion, planPublish, publishRelease, registerReleaseCommands, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
 
+test('gate-history CLI --json --apply-watchlist reports the files actually written in an isolated checkout', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-gate-history-cli-'));
+  const cwd = process.cwd();
+  const exitCode = process.exitCode;
+  const repo = join(root, 'repo');
+  const instance = join(root, 'instance');
+  mkdirSync(join(repo, 'release'), { recursive: true });
+  mkdirSync(join(instance, 'graph-runs', 'release-loop'), { recursive: true });
+  writeFileSync(join(repo, 'release', 'light-rc-always.txt'), '# kept\n');
+  for (const [version, index] of [['0.2.30', 0], ['0.2.31', 1]] as const) {
+    writeFileSync(join(instance, 'graph-runs', 'release-loop', `${index}.json`), JSON.stringify({
+      input: { version }, startedAt: `2026-10-0${index + 1}T00:00:00Z`,
+      nodes: [{ nodeId: 'gate', output: { commit: 'a'.repeat(40), introduced: ['src/new.test.ts > fails'], outcome: 'regression' } }],
+    }));
+  }
+  const lines: string[] = [];
+  const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+    lines.push(String(chunk).trim()); callback?.(); return true;
+  }) as typeof process.stdout.write);
+  try {
+    process.chdir(repo);
+    setElanousConfigDir(instance);
+    const cmd = new Command(); registerReleaseCommands(cmd);
+    await cmd.parseAsync(['release', 'gate-history', '--json', '--apply-watchlist'], { from: 'user' });
+    const data = JSON.parse(lines[0]!) as { watchList: string[]; applied: { added: string[] } };
+    expect(data.watchList).toEqual(['src/new.test.ts']);
+    expect(data.applied.added).toEqual(['src/new.test.ts']);
+    const watchFile = join(repo, 'release', 'light-rc-always.txt');
+    const written = readFileSync(watchFile, 'utf8');
+    expect(written).toContain('src/new.test.ts\n');
+    lines.length = 0;
+    await cmd.parseAsync(['release', 'gate-history', '--json', '--apply-watchlist'], { from: 'user' });
+    expect(JSON.parse(lines[0]!).applied.added).toEqual([]);
+    expect(readFileSync(watchFile, 'utf8')).toBe(written);
+    lines.length = 0;
+    await cmd.parseAsync(['release', 'gate-history', '--json', '--top', '0'], { from: 'user' });
+    expect(JSON.parse(lines[0]!)).toMatchObject({ top: 0, rows: [], watchList: ['src/new.test.ts'] });
+    rmSync(join(repo, 'release'), { recursive: true, force: true });
+    lines.length = 0;
+    await cmd.parseAsync(['release', 'gate-history', '--json', '--apply-watchlist'], { from: 'user' });
+    expect(JSON.parse(lines[0]!)).toMatchObject({ ok: false, error: expect.stringContaining('ENOENT') });
+    expect(existsSync(join(repo, 'release', 'light-rc-always.txt'))).toBe(false);
+  } finally { output.mockRestore(); resetElanousConfigDir(); process.exitCode = exitCode ?? 0; process.chdir(cwd); rmSync(root, { recursive: true, force: true }); }
+});
+
 function fixture() {
   const out = mkdtempSync(join(tmpdir(), 'release-cli-'));
   const dist = join(out, 'dist');
@@ -131,7 +176,7 @@ describe('release checklist CLI', () => {
       expect(listChecklist('9.9.9').items).toHaveLength(0);
       const cmd = new Command(); registerReleaseCommands(cmd);
       const release = cmd.commands.find((c) => c.name() === 'release')!;
-      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'place', 'rebalance', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'rehearsal', 'auto-start']);
+      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'place', 'rebalance', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'gate-history', 'rehearsal', 'auto-start']);
       expect(release.commands.find((c) => c.name() === 'prepare')!.helpInformation()).toContain('네트워크 쓰기 없음');
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');

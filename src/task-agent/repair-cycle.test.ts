@@ -26,6 +26,26 @@ function fixture() {
   return { dir, statePath, card, input };
 }
 
+test('repair tick cap zero defers eligible launches but preserves missing-owner stop', async () => {
+  const eligible = fixture();
+  const budget = { max: 0, requested: 0, capped: 0 };
+  let launches = 0;
+  const deferred = await runRepairCycle(eligible.input({ repairBudget: budget, request: async () => { launches++; } }));
+  expect(deferred.decision).toBe('would-repair');
+  expect(deferred.reason).toContain('상한 0');
+  expect(budget).toEqual({ max: 0, requested: 0, capped: 1 });
+  expect(launches).toBe(0);
+  expect(readTaskCard(eligible.card.id, eligible.statePath)?.repairs).toBeUndefined();
+
+  const unowned = fixture();
+  const stopped = await runRepairCycle(unowned.input({ repairBudget: budget,
+    resolveOwner: () => ({ source: 'none', reason: 'seat absent' }), request: async () => { launches++; } }));
+  expect(stopped.decision).toBe('repair-stopped');
+  expect(stopped.reason).toContain('seat absent');
+  expect(budget.capped).toBe(1);
+  expect(launches).toBe(0);
+});
+
 test('exact review must-fix launches one graph-routed commit-only worker, records model change, and deduplicates the next tick', async () => {
   const f = fixture();
   const launches: RepairLaunchRequest[] = [];

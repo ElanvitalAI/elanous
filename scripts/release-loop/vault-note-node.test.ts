@@ -219,7 +219,8 @@ test('write failure is fail yet the vault-note graph edge leads through release-
   expect(result.reason).toBeTruthy();
   const graph = parse(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as { edges: Array<{ from: string; map: Record<string, string> }> };
   expect(graph.edges.find((edge) => edge.from === 'vault-note')?.map).toEqual({ ok: 'release-story', fail: 'release-story', error: 'release-story' });
-  expect(graph.edges.find((edge) => edge.from === 'verify')?.map).toEqual({ ok: 'vault-note', fail: 'failed', error: 'failed' });
+  expect(graph.edges.find((edge) => edge.from === 'verify')?.map).toEqual({ ok: 'vault-note', fail: 'version-dev-bump-after-failure', error: 'version-dev-bump-after-failure' });
+  expect(graph.edges.find((edge) => edge.from === 'version-dev-bump-after-failure')?.map).toEqual({ ok: 'failed', fail: 'failed', error: 'failed' });
   const recipes = parse(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command: string; timeout_ms: number }>;
   expect(recipes['vault-note']).toEqual({ command: 'bun scripts/release-loop/vault-note-node.ts', timeout_ms: 60000 });
   expect(readFileSync(join(root, 'release', version, 'release.json'), 'utf8')).toContain('8cd885efe701bf47c1df020c32ccd17e31cd4a25');

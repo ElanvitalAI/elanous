@@ -7,6 +7,9 @@ import {
   createTurnStreamPresentationApplier,
   type TurnStreamRenderedToolRuntime,
 } from '../src/dashboard/turn-stream-presentation-applier.js';
+import { createDashboardRenderedToolRuntime } from '../src/dashboard/rendered-tool-runtime.js';
+import { FoldStack } from '../src/fold-stack.js';
+import { foldKindHint } from '../src/log-entry.js';
 
 interface ApplierFixture {
   chatLines: string[];
@@ -133,6 +136,47 @@ describe('createTurnStreamPresentationApplier — tool.replaceBlock', () => {
     });
     expect(fx.toolCalls.map(c => c[0])).toEqual(['replaceBlock', 'registerFold', 'deleteArgs']);
     expect(fx.chatLines).toEqual(['head', '● tool ✓']);
+  });
+
+  test('kind-unit coalesce shrinks chatLines then assistant.replaceBlock leaves zero undefined slots', () => {
+    // Real rendered-tool-runtime: three adjacent RunShell results go through
+    // registerFold's kind-unit coalesce, which splices chatLines shorter.
+    const chatLines: string[] = ['head'];
+    const renderedToolRuntime = createDashboardRenderedToolRuntime({
+      chatLines,
+      foldStack: new FoldStack({ chatLines }),
+      pinChatTail: () => {},
+      draw: () => {},
+    });
+    const applier = createTurnStreamPresentationApplier({
+      chatLines,
+      renderedToolRuntime,
+      initialAssistantStart: 1,
+      draw: () => {},
+      pinChatTail: () => {},
+    });
+    for (let i = 0; i < 3; i++) {
+      applier.apply({ type: 'assistant.commit' });
+      applier.apply({
+        type: 'tool.appendBlock',
+        callId: `c${i}`,
+        lines: ['● RunShell', '  running'],
+        args: { command: `echo ${i}` },
+        operationKind: 'RunShell',
+      });
+      applier.apply({
+        type: 'tool.replaceBlock',
+        callId: `c${i}`,
+        collapsedLines: ['● RunShell ✓', `  out ${i}`],
+        expandedLines: null,
+        operationKind: 'RunShell',
+      });
+    }
+    expect(chatLines).toEqual(['head', foldKindHint('RunShell', 3)]);
+    applier.apply({ type: 'assistant.replaceBlock', lines: ['after fold'] });
+    expect(Array.from(chatLines).every((line) => typeof line === 'string')).toBe(true);
+    expect(chatLines).toHaveLength(3);
+    expect(Array.from(chatLines)).toEqual(['head', foldKindHint('RunShell', 3), 'after fold']);
   });
 });
 

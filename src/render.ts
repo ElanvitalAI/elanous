@@ -572,6 +572,10 @@ function parseAndRenderTable(lines: string[]): string {
  * Render a tool call header like Claude Code:
  * ⏺ ToolName(description)
  */
+export function singleLineToolHeaderText(text: string): string {
+  return text.replace(/[ \t]*(?:\r\n|\r|\n|\u2028|\u2029)[ \t]*/g, ' ↵ ');
+}
+
 export function toolHeader(
   toolName: string,
   description: string,
@@ -585,7 +589,7 @@ export function toolHeader(
     case 'error':   icon = applyColor(circle, 'error'); break;
   }
   const name = chalk.bold(toolName);
-  const desc = description ? chalk.dim(`(${description})`) : '';
+  const desc = description ? chalk.dim(`(${singleLineToolHeaderText(description)})`) : '';
   return `${icon} ${name}${desc}`;
 }
 

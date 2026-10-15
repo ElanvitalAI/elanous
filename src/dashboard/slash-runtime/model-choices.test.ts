@@ -9,6 +9,9 @@ import {
   modelChangeLine,
   modelOverviewLines,
   resolveModelChoice,
+  modelScopeLine,
+  modelSwitchScope,
+  parseModelSlashArgs,
 } from './model-choices.js';
 
 describe('TUI-SLASH-DECIDE-NOW C — /model human words', () => {
@@ -103,5 +106,28 @@ describe('TUI-SLASH-DECIDE-NOW C — /model lines', () => {
     const entry = SLASH_COMMANDS.find(({ name }) => name === 'model')!;
     expect(entry.description).toBe('모델 바꾸기 — /model 빠름|보통|깊음 (코드명도 됨)');
     expect(entry.subcommands).toEqual([...HUMAN_MODEL_WORDS, ...MODEL_CODE_NAMES]);
+  });
+});
+
+describe('TUI-MODEL-SESSION-SCOPE — /model scope', () => {
+  test('--global is a flag, not the choice', () => {
+    expect(parseModelSlashArgs(['luna'])).toEqual({ arg: 'luna', global: false });
+    expect(parseModelSlashArgs(['--global', 'Luna'])).toEqual({ arg: 'luna', global: true });
+    expect(parseModelSlashArgs([])).toEqual({ arg: '', global: false });
+  });
+
+  test('session by default · cross-provider needs --global · --global always global', () => {
+    expect(modelSwitchScope('openai-codex', 'openai-codex', false)).toBe('session');
+    expect(modelSwitchScope('anthropic', 'openai-codex', false)).toBe('needs-global');
+    expect(modelSwitchScope('anthropic', 'openai-codex', true)).toBe('global');
+    expect(modelSwitchScope('openai-codex', 'openai-codex', true)).toBe('global');
+  });
+
+  test('the scope line says where it landed and does not promise a reasoning change it did not make', () => {
+    expect(modelScopeLine('session')).toContain('이 세션만');
+    expect(modelScopeLine('session')).toContain('--global');
+    expect(modelScopeLine('global')).toContain('전역');
+    expect(modelScopeLine('session', { tier: 'medium', current: 'high' })).toContain('생각 깊이는 그대로 high');
+    expect(modelScopeLine('session', { tier: 'high', current: 'high' })).not.toContain('생각 깊이');
   });
 });

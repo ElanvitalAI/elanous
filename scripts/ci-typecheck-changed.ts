@@ -950,7 +950,7 @@ function inspectTscResult(tsc: TscRun, changed: ReadonlySet<string>, baseline: R
   return false;
 }
 
-/** Above this many roots a narrowed program stops being much smaller than the whole one. */
+/** Observation threshold only: a large affected program is still narrower than the whole repository. */
 export const TSC_GATE_ROOT_LIMIT = 400;
 /** Files tsconfig.gate.json compiles as roots (its `include`); other changed .ts files are never part of that program. */
 const GATE_ROOT_SOURCE = /^(?:src|scripts|test)\/.*\.ts$/;
@@ -980,7 +980,6 @@ export function planRootCheck(input: {
     return { mode: 'full', fallbackReason: '루트 계산 실패: 변경 파일 누락' };
   }
   const roots = [...computed.roots].filter((file) => GATE_ROOT_SOURCE.test(file)).sort();
-  if (roots.length > TSC_GATE_ROOT_LIMIT) return { mode: 'full', fallbackReason: `루트 ${roots.length}개 > 상한 ${TSC_GATE_ROOT_LIMIT}`, roots: roots.length };
   return { mode: 'affected', roots, changedCount: gateChanged.size };
 }
 /** Target checkout first, then the installed CLI's top-level and nested dependencies. */
@@ -1164,8 +1163,10 @@ export function runGate(io: Partial<GateIo> = {}): void {
       rootPlan = { mode: 'full', fallbackReason: `임시 tsconfig 쓰기 실패: ${cause instanceof Error ? cause.message : String(cause)}`, roots: rootPlan.roots.length };
     }
   }
+  log(`[tsc-gate] root-plan ${JSON.stringify({ mode: rootPlan.mode, roots: rootPlan.mode === 'affected' ? rootPlan.roots.length : rootPlan.roots ?? null, promoted: rootPlan.mode === 'full', reason: rootPlan.mode === 'full' ? rootPlan.fallbackReason : rootPlan.roots.length > TSC_GATE_ROOT_LIMIT ? 'large-affected-kept' : null })}`);
   if (rootPlan.mode === 'affected') {
     log(`[tsc-gate] 영향 루트 ${rootPlan.roots.length}개 (변경 ${rootPlan.changedCount} + importer·전역 선언 ${rootPlan.roots.length - rootPlan.changedCount}) — 임시 tsconfig 로 root 검사.`);
+    if (rootPlan.roots.length > TSC_GATE_ROOT_LIMIT) warn(`[tsc-gate] ⚠ 영향 루트 ${rootPlan.roots.length}개 > 관측선 ${TSC_GATE_ROOT_LIMIT} — 전체 승격 사유가 없어 영향 루트 검사를 유지한다.`);
     debug.log('typecheck.gate', 'roots', { mode: 'affected', roots: rootPlan.roots.length, fallbackReason: null }, { level: 'info' });
   } else {
     log(`[tsc-gate] 영향 루트 ${rootPlan.roots ?? '?'}개(전체로 폴백: ${rootPlan.fallbackReason})`);

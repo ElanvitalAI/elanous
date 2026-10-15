@@ -104,9 +104,9 @@ async function fixture(args: string[], extraCrons: string[] = []): Promise<{ lin
 
 test('list --all renders every layer and unknown last run, then warns only missing elanous cron', async () => {
   const { lines, entries } = await fixture(['--all']);
-  expect(lines[0]).toBe('id\t층\t주인 자리\t모드\t기대 주기\t호스트\t울타리 역할\t관측 카테고리\t마지막 실행');
+  expect(lines[0]).toBe('id\t층\t주인 자리\t모드\t기대 주기\t호스트\t울타리 역할\t관측 카테고리\t마지막 실행\t메시지 주소\t답글 몸\t깨움\t깨움 출처\t안 읽은 글');
   expect(lines).toHaveLength(entries.length + 2);
-  expect(lines[1]).toBe(`daily\tgraph\tOP\twatch\t불규칙 · 최대 960분\t${hostname()}\t모름\tgraph.runner\t모름`);
+  expect(lines[1]).toBe(`daily\tgraph\tOP\twatch\t불규칙 · 최대 960분\t${hostname()}\t모름\tgraph.runner\t모름\t—\tnone\tnone\t—\t모름`);
   expect(lines.some(line => line.includes(`\tseat\tTC\t모름\t15분\t${hostname()}\t모름\tmonitor\t모름`))).toBe(true);
   expect(lines.some(line => line.includes('\tcron-shell\t'))).toBe(true);
   expect(lines.some(line => line.includes('\torchestrator\t'))).toBe(true);

@@ -58,6 +58,7 @@ export interface DashboardAutoCompactRuntimeDeps {
   ) => Promise<CompactPipelineResult>;
   getCompactProvider?: () => CompactProvider;
   setVerifyProbeEnabled?: (enabled: boolean) => void;
+  onPrePassApplied?: () => void;
   sessionId?: string;
 }
 
@@ -88,6 +89,7 @@ export async function runDashboardAutoCompact(
         }
         for (const m of newHistory) deps.chatHistory.push(m);
         if (userMsg) deps.chatHistory.push(userMsg);
+        deps.onPrePassApplied?.();
         deps.debugLog(
           'chat.presentation.auto-compact.pre-pass',
           'applied',

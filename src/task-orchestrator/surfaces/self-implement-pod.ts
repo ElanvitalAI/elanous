@@ -79,17 +79,20 @@ import { envLiteral } from '../../platform/env-literal.js';
 import { LLM_TIER_MAP_BY_PROVIDER, lookupLlmTierSpec, type LlmTierProvider } from '../../model-tier/llm-tier-map.js';
 import { parseSelfImplementJson, type SelfImplementJobDone, type SelfImplementJobSpawn } from './self-implement.js';
 import { codexQuotaPolicyFromConfig } from '../../oauth/codex-account-store.js';
+import { normalizeFallbackChain, type FallbackStep } from '../../oauth/fallback-chain.js';
 import { goalTypeOf, type GoalType } from '../../../scripts/measure-pod-memory-by-goal.js';
 import { declaredGoalType, type GoalType as DeclaredGoalType } from '../../self-implement/goal-author.js';
 import { readPodMemoryAdvice, type PodMemoryAdvice } from '../../cli/pod-memory-advice.js';
-import { getUserConfig, roleLlmEnvName, type UserConfig } from '../../user-config.js';
+import { DEFAULT_BUDGET_GATE_MAX_USED_PERCENT, getUserConfig, roleLlmEnvName, type UserConfig } from '../../user-config.js';
 import { podChildProviderOf, podChildProviderRefusal, type PodChildProvider } from './pod-child-providers.js';
 import { BEDROCK_POD_EGRESS_LABEL, bedrockPodEnv, checkBedrockPodSecret, type BedrockPodSpec } from './pod-bedrock-child.js';
 import { resolveBedrockRegion, validBedrockRegion } from '../../llm/bedrock.js';
 import { ZAI_POD_EGRESS_LABEL, checkZaiPodSecret, countActiveZaiJobs, decideZaiPodSlot, zaiOverflowChildArgs, zaiPodEnv, type ZaiPodSpec } from './pod-zai-child.js';
 import { ZAI_CODING_DEFAULT_MODEL, ZAI_OPENROUTER_FALLBACK_MODEL, zaiSettingsFromConfig, type ZaiCodingPlanSettings } from '../../llm/zai-coding-plan.js';
-import { selectEnhanceLlm } from '../../prompt-enhance/enhance.js';
+import { normalizePlanningFallbackReason, selectEnhanceLlm } from '../../prompt-enhance/enhance.js';
+import { inferProviderFromModel } from '../../llm.js';
 import { classifyPodExit, extractPodFailureReason, podTerminalRow, type PodExitClass } from './pod-failure-reason.js';
+import { kubectlTransientReason, retryKubectlTransient } from './kubectl-transient-retry.js';
 import { OLD_DOOR_STAMP_ENV } from '../../self-dev/old-door.js';
 
 export type Kubectl = (args: readonly string[], input?: string) => { status: number | null; stdout: string; stderr: string };
@@ -119,6 +122,8 @@ export interface PodSpawnOptions {
   budgetSnapshot?: (childLlm: PodBudgetChildLlm) => Promise<BudgetSnapshot | undefined> | BudgetSnapshot | undefined;
   /** Input reader seam; the host still runs its normal budget decision and Job propagation. */
   budgetInputDeps?: ReadBudgetInputsDeps & { readLiveGrok?: () => Promise<number | undefined> };
+  /** Test seam for the planning Codex quota check; production reads the existing budget-gate candidates. */
+  planningCodexQuota?: (account: string) => { usable: boolean; reason?: string };
   /** Child model/effort chosen at launch (`--child-llm-model/--child-llm-effort`) — carried into the Pod child. */
   childModel?: string;
   childEffort?: string;
@@ -136,6 +141,8 @@ export interface PodSpawnOptions {
   configHostMirror?: () => string | undefined;
   /** AUTHOR-POD2 host config seam; Pod itself has no host config. */
   authorConfig?: () => UserConfig;
+  /** Host fallback chain seam; a Pod has no access to the host config. */
+  fallbackConfig?: () => UserConfig;
   /** 원천 — 없으면 종전 `git clone --depth 50`. bundle 이면 apply 뒤 kubectl cp 로 싣는다. */
   source?: PodSource;
   /** Existing PR repair: pin the source head and export a commit bundle instead of opening a PR. */
@@ -282,6 +289,20 @@ async function measureHostBudgetSnapshot(childLlm: PodBudgetChildLlm, env: NodeJ
     ...(childLlm.provider ? { requested: childLlm.provider } : {}),
     decision: { action: decision.action, ...(decision.provider ? { provider: decision.provider } : {}), ...(decision.model ? { model: decision.model } : {}) },
   };
+}
+
+/** Planning uses a subscription account inside an OpenRouter Pod. Credits are not a silent fallback for this role. */
+async function hostPlanningCodexQuota(account: string, deps?: ReadBudgetInputsDeps): Promise<{ usable: boolean; reason?: string }> {
+  try {
+    const { readBudgetInputs } = await import('../../self-implement/budget-gate.js');
+    const inputs = readBudgetInputs(deps);
+    const candidate = inputs.codexCandidates.find((item) => item.name === account);
+    const configuredCap = inputs.maxUsedPercent['openai-codex'];
+    const cap = typeof configuredCap === 'number' && Number.isFinite(configuredCap) ? configuredCap : DEFAULT_BUDGET_GATE_MAX_USED_PERCENT['openai-codex']!;
+    if (!candidate || typeof candidate.usedPercent !== 'number' || !Number.isFinite(candidate.usedPercent)) return { usable: false, reason: 'quota-unmeasured' };
+    if (candidate.reached === true || candidate.usedPercent >= cap) return { usable: false, reason: 'quota-exhausted' };
+    return { usable: true };
+  } catch { return { usable: false, reason: 'quota-unavailable' }; }
 }
 
 /** «3시간 안 만료» — 선갱신 대상이라는 표지(다른 자격 오류와 구분한다). */
@@ -956,7 +977,7 @@ export function podSigtermTrapScript(seqFile: string = POD_USAGE_PARTIAL_SEQ_FIL
   return `trap '{ [ -n "$si_pid" ] && kill "$si_pid" 2>/dev/null || true; [ -n "\${usage_partial_pid:-}" ] && kill "$usage_partial_pid" 2>/dev/null || true; si_seq=$(cat ${seqFile} 2>/dev/null || true); case "$si_seq" in ""|*[!0-9]*) si_seq=0;; esac; si_seq=$((10#$si_seq + 1)); { [ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h --partial --seq "$si_seq"; } & si_rollup_pid=$!; for si_i in 1 2 3 4 5 6 7 8; do kill -0 "$si_rollup_pid" 2>/dev/null || break; sleep 1; done; kill "$si_rollup_pid" 2>/dev/null || true; wait "$si_rollup_pid" 2>/dev/null || true; exit 143; }' TERM`;
 }
 
-export function podJobManifest(o: { name: string; namespace: string; image: string; workIdentity?: PodWorkIdentity; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; repairCommitOnly?: { pr: number; baseHead: string }; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; memoryRequest?: string; goalDoc?: string; /** AUTHOR-POD2 — run `harness say` on /creds/feature inside the Pod (authoring happens off the host). */ authorSentence?: boolean; authorGrade?: 'full' | 'lite'; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number; /** Which goal execution and attempt this Job is — a resumed host verifies it before following the Job (POD9). */ execution?: { key: string; attempt: number }; hostLeaseAdmitted?: boolean; /** POD-ROLE-LLM — OpenRouter 자식 Pod 에 리뷰어용 codex 자격을 깐다. */ reviewerCodexAuth?: boolean; /** BEDROCK-PROVIDER ② — bedrock 자식만: 이름 있는 AWS Secret 의 키(secretKeyRef) ⊕ 리전 ⊕ 이그레스 라벨. */ bedrock?: BedrockPodSpec; /** ZAI-POD-CHILD — glm(ZAI) 자식만: 이름 있는 ZAI Secret 의 키(secretKeyRef) ⊕ 이그레스·동시 상한 라벨(Pod ⊕ Job). */ zai?: ZaiPodSpec }): Record<string, unknown> {
+export function podJobManifest(o: { name: string; namespace: string; image: string; workIdentity?: PodWorkIdentity; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; repairCommitOnly?: { pr: number; baseHead: string }; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; memoryRequest?: string; goalDoc?: string; /** AUTHOR-POD2 — run `harness say` on /creds/feature inside the Pod (authoring happens off the host). */ authorSentence?: boolean; authorGrade?: 'full' | 'lite'; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number; /** Which goal execution and attempt this Job is — a resumed host verifies it before following the Job (POD9). */ execution?: { key: string; attempt: number }; hostLeaseAdmitted?: boolean; /** POD-ROLE-LLM — OpenRouter 자식 Pod 에 리뷰어용 codex 자격을 깐다. */ reviewerCodexAuth?: boolean; /** BEDROCK-PROVIDER ② — bedrock 자식만: 이름 있는 AWS Secret 의 키(secretKeyRef) ⊕ 리전 ⊕ 이그레스 라벨. */ bedrock?: BedrockPodSpec; /** ZAI-POD-CHILD — glm(ZAI) 자식만: 이름 있는 ZAI Secret 의 키(secretKeyRef) ⊕ 이그레스·동시 상한 라벨(Pod ⊕ Job). */ zai?: ZaiPodSpec; fallbackChain?: { steps: readonly FallbackStep[]; source: 'host' | 'default' } }): Record<string, unknown> {
   if (o.repairCommitOnly && (o.source?.kind !== 'pr' || o.source.number !== o.repairCommitOnly.pr || !/^[0-9a-f]{40}$/.test(o.repairCommitOnly.baseHead) || o.args.includes('--open-pr') || o.args.includes('--merge-by-host') || o.args.includes('--auto-merge'))) {
     throw new Error('repair commit-only requires matching PR source and no PR/merge flags');
   }
@@ -981,6 +1002,10 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
     : '';
   const script = [
     'set -u',
+    ...(o.fallbackChain ? [
+      'mkdir -p "$HOME/.elanous" && install -m 600 /creds/llm-fallback-config.json "$HOME/.elanous/config.json" || exit 6',
+      `echo "ELANOUS_POD_FALLBACK_CHAIN source=${o.fallbackChain.source} steps=${o.fallbackChain.steps.join(',')}"`,
+    ] : []),
     openrouterModel
       ? o.reviewerCodexAuth
         ? 'mkdir -p ~/.elanous ~/.codex && cp /creds/elanous-auth.json ~/.elanous/auth.json && cp /creds/codex-auth.json ~/.codex/auth.json && chmod 600 ~/.elanous/auth.json ~/.codex/auth.json && export ELANOUS_LLM_PROVIDER=openrouter'
@@ -1533,8 +1558,23 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           ? (options.grokCredentials ?? (() => hostGrokCredentials({ env, apiKeyOptIn: options.grokApiKeyOptIn })))()
           : apiKeyChild ? { ghToken: (options.openrouterGhToken ?? defaultGhToken)() }
           : codexCredentials?.[0] ?? usable[0]!.credential;
-        // POD-ROLE-LLM — OpenRouter 자식만 리뷰어를 고정한다. 기본 glm(새 자격 0) · codex-sol 은 선택이고 자격 한 벌이 필요하다 — 못 얻으면 고정을 건너뛴다(종전 kimi 리뷰어 그대로).
+        // POD-ROLE-LLM — OpenRouter 자식의 Codex 역할(리뷰·저작 grounding)은 별도 access 자격을 검증해 싣는다.
         //   ⛔ kubectl 주입(=시험)이면 호스트 자격 스토어를 읽지 않는다 — 시험은 credentials 를 명시한다.
+        const roleCodexAccount = options.account ?? 'team';
+        const loadRoleCodexCredential = async (): Promise<{ credential?: { elanousAuth: string; codexAuth: string }; skipped?: string }> => {
+          const credentialSource = options.credentials ?? (options.kubectl ? undefined : (account: string) => hostCredentials(account, authStorePath(), () => ''));
+          if (!credentialSource) return { skipped: 'no-credential-source' };
+          try {
+            const got = await podCodexCredentialWithPrerefresh(roleCodexAccount, { ...prerefreshDeps, credentials: credentialSource });
+            if (!got) return { skipped: 'expiring' };
+            const elanous = JSON.parse(got.elanousAuth) as { providers?: Record<string, { tokens?: { accessToken?: unknown; refreshToken?: unknown } }> };
+            const codex = JSON.parse(got.codexAuth) as { tokens?: { access_token?: unknown; refresh_token?: unknown } };
+            const elanousTokens = elanous.providers?.['openai-codex']?.tokens;
+            const nonEmpty = (v: unknown): boolean => typeof v === 'string' && v.trim().length > 0;
+            if (!elanousTokens || !nonEmpty(elanousTokens.accessToken) || elanousTokens.refreshToken || !codex.tokens || !nonEmpty(codex.tokens.access_token) || codex.tokens.refresh_token) return { skipped: 'credential-shape' };
+            return { credential: { elanousAuth: got.elanousAuth, codexAuth: got.codexAuth } };
+          } catch { return { skipped: 'credential-error' }; }   // 자격 오류 원문에는 토큰이 섞일 수 있다.
+        };
         let reviewerCredential: { elanousAuth: string; codexAuth: string } | undefined;
         let reviewerPin: string | undefined;
         const reviewerPick = openrouter ? resolvePodOpenRouterReviewer(options.openrouterReviewer, env) : undefined;
@@ -1544,29 +1584,12 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         } else if (reviewerPick?.choice === 'off') {
           debug.log('self-implement.pod', 'role-llm-skipped', { job: name, role: 'review', choice: 'off', source: reviewerPick.source, reason: 'off' });
         } else if (reviewerPick?.choice === 'codex-sol') {
-          const reviewerAccount = options.account ?? 'team';
-          const reviewerCredentials = options.credentials ?? (options.kubectl ? undefined : (account: string) => hostCredentials(account, authStorePath(), () => ''));
-          let skipped: string | undefined;
-          if (!reviewerCredentials) skipped = 'no-credential-source';
-          else {
-            try {
-              const got = await podCodexCredentialWithPrerefresh(reviewerAccount, { ...prerefreshDeps, credentials: reviewerCredentials });
-              if (!got) skipped = 'expiring';
-              else {
-                const elanous = JSON.parse(got.elanousAuth) as { providers?: Record<string, { tokens?: { accessToken?: unknown; refreshToken?: unknown } }> };
-                const codex = JSON.parse(got.codexAuth) as { tokens?: { access_token?: unknown; refresh_token?: unknown } };
-                const elanousTokens = elanous.providers?.['openai-codex']?.tokens;
-                const nonEmpty = (v: unknown): boolean => typeof v === 'string' && v.trim().length > 0;
-                // 불완전한 자격(access 비었음·refresh 있음)이면 고정을 켜지 않는다 — 켜면 Pod 리뷰가 인증 실패로 no-real-review 가 된다.
-                if (!elanousTokens || !nonEmpty(elanousTokens.accessToken) || elanousTokens.refreshToken || !codex.tokens || !nonEmpty(codex.tokens.access_token) || codex.tokens.refresh_token) skipped = 'credential-shape';
-                else reviewerCredential = { elanousAuth: got.elanousAuth, codexAuth: got.codexAuth };
-              }
-            } catch { skipped = 'credential-error'; }   // ⛔ 원문 메시지는 싣지 않는다 — 자격 오류 문면에 토큰이 섞일 수 있다(비밀 0)
-          }
+          const { credential, skipped } = await loadRoleCodexCredential();
+          reviewerCredential = credential;
           if (reviewerCredential) {
             reviewerPin = POD_OPENROUTER_REVIEWER_PINS['codex-sol'];
-            debug.log('self-implement.pod', 'role-llm-armed', { job: name, role: 'review', env: roleLlmEnvName('review'), value: reviewerPin, choice: 'codex-sol', source: reviewerPick.source, account: reviewerAccount });
-          } else debug.log('self-implement.pod', 'role-llm-skipped', { job: name, role: 'review', choice: 'codex-sol', source: reviewerPick.source, account: reviewerAccount, reason: skipped });
+            debug.log('self-implement.pod', 'role-llm-armed', { job: name, role: 'review', env: roleLlmEnvName('review'), value: reviewerPin, choice: 'codex-sol', source: reviewerPick.source, account: roleCodexAccount });
+          } else debug.log('self-implement.pod', 'role-llm-skipped', { job: name, role: 'review', choice: 'codex-sol', source: reviewerPick.source, account: roleCodexAccount, reason: skipped });
         }
         if (grok && !('grokAuth' in creds && creds.grokAuth) && !('grokApiKey' in creds && creds.grokApiKey && options.grokApiKeyOptIn === true)) {
           throw new Error('grok: 구독 자격 없음 · API 키 opt-in 꺼짐 또는 키 없음');
@@ -1697,13 +1720,48 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         debug.log('self-implement.pod', 'goal-doc-mode', { spaceId: input.spaceId, mode, reason: shard ? 'shard-identity' : requestedPath ? 'goal-doc-env' : 'no-goal-doc' });
         const goalDoc = shard ? undefined : requestedPath;
         const goalDocument = goalDoc ? originalGoal : undefined;
+        const authorOnPod = env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !goalDoc && !shard;
+        // Relay provenance is set by this host after selection; caller env cannot assert it.
+        const hostAuthorEnv = { ...env };
+        for (const key of Object.keys(hostAuthorEnv)) {
+          if (key.startsWith('ELANOUS_PROMPT_ENHANCE_') && key !== 'ELANOUS_PROMPT_ENHANCE_MODEL' && key !== 'ELANOUS_PROMPT_ENHANCE_EFFORT') delete hostAuthorEnv[key];
+        }
+        let authorChoice = authorOnPod ? selectEnhanceLlm({ config: (options.authorConfig ?? getUserConfig)() }, hostAuthorEnv) : undefined;
+        let authorFallbackReason: string | undefined;
+        let authorRequestedModel: string | undefined;
+        let authorRequestedSource: string | undefined;
+        let roleCodexCredential = reviewerCredential;
+        if (openrouter && authorChoice && inferProviderFromModel(authorChoice.model) === 'openai-codex') {
+          const quota = options.planningCodexQuota?.(roleCodexAccount) ?? await hostPlanningCodexQuota(roleCodexAccount, options.budgetInputDeps);
+          if (!quota.usable) authorFallbackReason = normalizePlanningFallbackReason(quota.reason ?? 'quota-unavailable');
+          else if (!roleCodexCredential) {
+            const { credential, skipped } = await loadRoleCodexCredential();
+            if (credential) roleCodexCredential = credential;
+            else authorFallbackReason = normalizePlanningFallbackReason(skipped ?? 'credential-unavailable');
+          }
+          if (authorFallbackReason) {
+            const childModel = podDelegatedChildLlm(jobArgs)?.model;
+            if (!childModel || inferProviderFromModel(childModel) !== 'openrouter') throw new Error(`pod: planning sol·자식 모델 모두 불가 (${authorFallbackReason})`);
+            authorRequestedModel = authorChoice.model;
+            authorRequestedSource = authorChoice.modelSource;
+            debug.log('self-implement.pod', 'planning-model-fallback', { job: name, provider: 'openrouter', model: childModel, reason: authorFallbackReason, requestedModel: authorChoice.model, account: roleCodexAccount });
+            authorChoice = { ...authorChoice, model: childModel, modelSource: 'fallback-child' };
+          } else debug.log('self-implement.pod', 'role-llm-armed', { job: name, role: 'planning', model: authorChoice.model, source: authorChoice.modelSource, account: roleCodexAccount });
+        }
         const hostKey = (k: string): string | undefined => k === 'OPENROUTER_API_KEY' && openrouter ? openrouterKey : k === 'ANTHROPIC_API_KEY' && anthropic ? anthropicKey : env[k] ?? (options.readKeyCache ?? defaultReadKeyCache)(k);
+        const hostFallbackNames = (options.fallbackConfig ?? getUserConfig)().llm.fallbackChain;
+        const normalizedFallback = normalizeFallbackChain(hostFallbackNames);
+        const fallbackChain = { steps: normalizedFallback.chain, source: normalizedFallback.usedDefault ? 'default' as const : 'host' as const };
+        debug.log('self-implement.pod', 'fallback-chain-carried', {
+          job: name, source: fallbackChain.source, steps: fallbackChain.steps,
+          ...(normalizedFallback.dropped.length ? { droppedCount: normalizedFallback.dropped.length } : {}),
+        });
         const secret = {
           apiVersion: 'v1', kind: 'Secret', type: 'Opaque',
           metadata: { name: `${name}-creds`, namespace, labels: { 'elanous.job': name } },
           stringData: {
             ...(anthropic || bedrockChild || zaiChild ? {}
-              : openrouter ? (reviewerCredential ? { 'elanous-auth.json': reviewerCredential.elanousAuth, 'codex-auth.json': reviewerCredential.codexAuth } : {})
+              : openrouter ? (roleCodexCredential ? { 'elanous-auth.json': roleCodexCredential.elanousAuth, 'codex-auth.json': roleCodexCredential.codexAuth } : {})
               : grok
               ? ('grokAuth' in creds && creds.grokAuth
                 ? { 'grok-auth.json': creds.grokAuth }
@@ -1712,6 +1770,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
                 ? Object.fromEntries(codexCredentials.map((candidate, i) => [`codex-${i}.json`, JSON.stringify({ elanousAuth: candidate.elanousAuth, codexAuth: candidate.codexAuth })]))
                 : { 'elanous-auth.json': (creds as ReturnType<typeof hostCredentials>).elanousAuth, 'codex-auth.json': (creds as ReturnType<typeof hostCredentials>).codexAuth }),
             'gh-token': podGhToken, feature: input.feature,
+            'llm-fallback-config.json': JSON.stringify({ llm: { fallbackChain: fallbackChain.steps } }),
             ...(goalDocument !== undefined ? { 'goal-doc': goalDocument } : {}),
             ...Object.fromEntries(Object.entries(skillEnvs).map(([n, text]) => [`skillenv-${n}`, text])),
             ...(grounding ? { [`env-${GROUNDING_TOKEN_ENV}`]: grounding.token } : {}),
@@ -1808,7 +1867,10 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           const removed = kubectl(['-n', namespace, 'delete', 'job', name, '--ignore-not-found', '--wait=true']);
           if (removed.status !== 0) return { exitCode: 1, output: removed.stderr, error: { code: 'pod-delete', message: removed.stderr.trim() } };
         }
-        const s = kubectl(['apply', '-f', '-'], JSON.stringify(secret));
+        const applySecret = () => kubectl(['apply', '-f', '-'], JSON.stringify(secret));
+        let s = applySecret();
+        // K3S-SECRET-DB-LOCK-RETRY — k3s sqlite «database is locked» 는 백오프 재시도 · 소진 시에만 아래 pod-secret 실패.
+        if (kubectlTransientReason(s)) s = await retryKubectlTransient(applySecret, s, { sleep, category: 'pod.secret', data: { job: name, namespace, context } });
         if (s.status !== 0) return { exitCode: 1, output: s.stderr, error: { code: 'pod-secret', message: s.stderr.trim() } };
         const jobPassEnv = [
           ...passEnv,
@@ -1819,12 +1881,16 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const detail = selectLiveDetail(options.liveDetailFile ? { path: options.liveDetailFile } : {}).state;
         const detailUntil = detail && (detail.scope === 'all' || detail.scope === parentRunId || detail.scope === launchRunId) && detail.until > Date.now()
           ? String(detail.until) : undefined;
-        const armEnv = Object.fromEntries(Object.entries(options.armEnv ?? {}).filter(([key]) => key !== 'ELANOUS_LIVE_DETAIL_UNTIL' && key !== 'ELANOUS_PROMPT_ENHANCE_MODEL' && key !== 'ELANOUS_PROMPT_ENHANCE_EFFORT' && key !== POD_GITHUB_CREDENTIAL_TOKEN_ENV && key !== POD_GITHUB_CREDENTIAL_URL_ENV && (!hostRefresh || !['GH_TOKEN', 'GITHUB_TOKEN', 'GH_CONFIG_DIR'].includes(key))));
+        const armEnv = Object.fromEntries(Object.entries(options.armEnv ?? {}).filter(([key]) => key !== 'ELANOUS_LIVE_DETAIL_UNTIL' && !key.startsWith('ELANOUS_PROMPT_ENHANCE_') && key !== POD_GITHUB_CREDENTIAL_TOKEN_ENV && key !== POD_GITHUB_CREDENTIAL_URL_ENV && (!hostRefresh || !['GH_TOKEN', 'GITHUB_TOKEN', 'GH_CONFIG_DIR'].includes(key))));
         const seat = env.ELANOUS_HARNESS_SEAT;
-        const authorOnPod = env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !goalDoc && !shard;
-        const authorChoice = authorOnPod ? selectEnhanceLlm({ config: (options.authorConfig ?? getUserConfig)() }, env) : undefined;
         const authorEnv = authorChoice ? {
-          ...(authorChoice.modelSource !== 'default' ? { ELANOUS_PROMPT_ENHANCE_MODEL: authorChoice.model } : {}),
+          ...(authorChoice.modelSource !== 'default' || inferProviderFromModel(authorChoice.model) === 'openai-codex' ? {
+            ELANOUS_PROMPT_ENHANCE_MODEL: authorChoice.model,
+            ELANOUS_PROMPT_ENHANCE_MODEL_RELAY: 'pod',
+            ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE: authorChoice.modelSource,
+            ...(authorFallbackReason ? { ELANOUS_PROMPT_ENHANCE_MODEL_FALLBACK_REASON: authorFallbackReason } : {}),
+            ...(authorRequestedModel ? { ELANOUS_PROMPT_ENHANCE_REQUESTED_MODEL: authorRequestedModel, ELANOUS_PROMPT_ENHANCE_REQUESTED_SOURCE: authorRequestedSource! } : {}),
+          } : {}),
           ...(authorChoice.effortSource !== 'default' ? { ELANOUS_PROMPT_ENHANCE_EFFORT: authorChoice.effort } : {}),
         } : {};
         const budgetRead = hostBudgetSnapshot(podDelegatedChildLlm(jobArgs) ?? {}, options, env, name);
@@ -1872,7 +1938,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           slotId: env.ELANOUS_POD_SLOT_ID,
           work: !goalDoc && env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? 'authoring' : (oomRetried ? retryTier : memoryTier) === 'lite' ? 'lite' : 'harness',
         };
-        const job = podJobManifest({ name, namespace, image: jobImage, workIdentity, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(options.repairCommitOnly ? { repairCommitOnly: options.repairCommitOnly } : {}), ...(hostMirror ? { hostMirror } : {}), args: jobArgs, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? { authorSentence: true, ...(env.ELANOUS_POD_AUTHOR_GRADE === 'lite' || env.ELANOUS_POD_AUTHOR_GRADE === 'full' ? { authorGrade: env.ELANOUS_POD_AUTHOR_GRADE } : {}) } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, memoryRequest, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission, ...(reviewerCredential ? { reviewerCodexAuth: true } : {}), ...(bedrockSpec ? { bedrock: bedrockSpec } : {}), ...(zaiSpec ? { zai: zaiSpec } : {}) });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
+        const job = podJobManifest({ name, namespace, fallbackChain, image: jobImage, workIdentity, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(options.repairCommitOnly ? { repairCommitOnly: options.repairCommitOnly } : {}), ...(hostMirror ? { hostMirror } : {}), args: jobArgs, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? { authorSentence: true, ...(env.ELANOUS_POD_AUTHOR_GRADE === 'lite' || env.ELANOUS_POD_AUTHOR_GRADE === 'full' ? { authorGrade: env.ELANOUS_POD_AUTHOR_GRADE } : {}) } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, memoryRequest, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission, ...(roleCodexCredential ? { reviewerCodexAuth: true } : {}), ...(bedrockSpec ? { bedrock: bedrockSpec } : {}), ...(zaiSpec ? { zai: zaiSpec } : {}) });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
         const carriedBranch = goalDoc ? 'goal-doc' as const : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? 'author' as const : undefined;
         const carriedChildLlm = carriedBranch ? podDelegatedChildLlm(jobArgs) : undefined;
         const a = kubectl(['apply', '-f', '-'], JSON.stringify(job));
@@ -2468,8 +2534,16 @@ export function reemitPodUsage(logs: string, job: string, log: (category: string
   const rows = parsed.rows ?? [];
   for (const r of rows) {
     const cost = podRowCost(r, reprice);
+    const role = typeof r.role === 'string' && r.role.trim() ? r.role : undefined;
+    const stage = typeof r.stage === 'string' && r.stage.trim() ? r.stage : undefined;
+    const account = typeof r.account === 'string' && r.account.trim() ? r.account : undefined;
     log('llm.usage', 'llm-usage', {
       site: `pod-rollup:${String(r.site)}`, provider: r.provider, model: r.model, calls: r.calls,
+      // Preserve only source-observed dimensions. A Pod bucket can contain the
+      // same model under several roles, so these also distinguish dedup keys.
+      ...(role !== undefined ? { role } : {}),
+      ...(stage !== undefined ? { stage } : {}),
+      ...(account !== undefined ? { account } : {}),
       inputTokens: r.inputTokens, outputTokens: r.outputTokens, cacheReadInputTokens: r.cacheReadInputTokens,
       // ⭐ 캐시 쓰기 — 옛 Pod 이미지 rollup 엔 칸이 없다 ⇒ 없으면 «잰 0» 으로 꾸미지 않고 뺀다.
       ...(r.cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens: r.cacheCreationInputTokens } : {}),
@@ -2482,7 +2556,7 @@ export function reemitPodUsage(logs: string, job: string, log: (category: string
       //   부분(seq 달라도)·최종·abort⊕resume 재방출이 몇 번 만나도 집계(rollup)에서 한 번만 센다. 키 없는 기존 행은 종전대로.
       //   ⭐ METER-POD-ROLLUP-GAP-2 — podName 을 키에 넣는다: gh-login·usage-limit 재시도는 «같은 job 이름·runId» 로 새 Pod 를 띄우므로
       //   (podJobName 은 spaceId 결정적) 그것 없이는 서로 다른 시도의 사용량이 한 번으로 접혀 앞 시도분이 사라진다.
-      podRollupKey: `${job}|${parsed.podName ?? ''}|${parsed.runId ?? ''}|pod-rollup:${String(r.site)}|${String(r.provider)}|${String(r.model)}`,
+      podRollupKey: `${job}|${parsed.podName ?? ''}|${parsed.runId ?? ''}|pod-rollup:${String(r.site)}|${String(r.provider)}|${String(r.model)}${role !== undefined || stage !== undefined || account !== undefined ? `|${JSON.stringify([role ?? null, stage ?? null, account ?? null])}` : ''}`,
       ...(parsed.podName ? { podName: parsed.podName } : {}), ...(parsed.nodeName ? { nodeName: parsed.nodeName } : {}), ...(parsed.hostId ? { podHostId: parsed.hostId } : {}),
       // ⭐ PARTIAL 폴백 재방출 꼬리표 — 최종 줄 행은 그대로(부분이 아님을 꾸미지 않는다).
       ...(partialLine ? { partial: true, ...(parsed.seq !== undefined ? { partialSeq: parsed.seq } : {}), ...(parsed.at !== undefined ? { partialAt: parsed.at } : {}), ...(livePartial ? { partialSource: 'live-capture' } : {}) } : {}),

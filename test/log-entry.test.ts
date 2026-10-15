@@ -17,11 +17,34 @@ import {
   renderAgentChildBlock, TOOL_BODY_MAX_LINES, formatAgentBatchStatus, agentBatchScanner,
   countFoldedItems, FOLD_LIMITS,
 } from '../src/log-entry';
+import { toolHeader } from '../src/render';
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = (s: string): string => s.replace(ANSI_RE, '');
 
 describe('summarizeToolCall', () => {
+  test('RunShell heredoc renders one visible header row with newline markers', () => {
+    const summary = summarizeToolCall('RunShell', {
+      command: ['cat <<\'EOF\'\nfirst\r\nsecond\rEOF'], cwd: '/tmp',
+    });
+    expect(summary).toBe("cat <<'EOF' ↵ first ↵ second ↵ EOF cwd=/tmp");
+    expect(summary).not.toMatch(/[\r\n]/);
+  });
+
+  test('toolHeader keeps a multiline description on one physical row', () => {
+    const header = strip(toolHeader('RunShell', 'cat <<EOF\nline 1\nEOF'));
+    expect(header).toContain('cat <<EOF ↵ line 1 ↵ EOF');
+    expect(header).not.toMatch(/[\r\n]/);
+  });
+
+  test('structured tool-header also marks embedded command newlines', () => {
+    const header = strip(renderLogEntryAsString({
+      kind: 'tool-header', toolName: 'RunShell', summary: 'cat <<EOF\nline 1\nEOF',
+    }));
+    expect(header).toContain('cat <<EOF ↵ line 1 ↵ EOF');
+    expect(header).not.toMatch(/[\r\n]/);
+  });
+
   test('Bash: command, trims whitespace, handles empty', () => {
     expect(summarizeToolCall('Bash', { command: '  ls -la  ' })).toBe('ls -la');
     expect(summarizeToolCall('Bash', { command: '' })).toBe('(empty command)');

@@ -652,6 +652,9 @@ export function buildReviewPrompt(
  *  `none of the tests …`. 표지 낱말로 시작하는 실제 블로커를 지우면 PASS/WARN 리뷰에서 블로커가 사라진다. */
 const NONE_WORD = String.raw`(?:없음|해당\s*없음|n\/a|none|nothing)`;
 const BARE_SENTINEL = new RegExp(String.raw`^${NONE_WORD}\s*[.。]?$`, 'i');
+const DASH_ONLY_SENTINEL = /^[([（【]\s*[-—–]\s*[)\]）】]$/;
+// 목록 항목의 바깥 `- `와 별개로, 리뷰어가 괄호 안에도 장식 대시를 둘 수 있다: `- (- 없음 -)`.
+const DASH_WRAPPED_BRACKETED_SENTINEL = new RegExp(String.raw`^[([（【]\s*(?:[-—–]+\s*)?${NONE_WORD}\s*(?:[-—–]+\s*)?[)\]）】]$`, 'i');
 const BRACKETED_SENTINEL = new RegExp(String.raw`^[([（【]\s*${NONE_WORD}(?:\s*[—–\-:.,;·]\s*([^)\]）】]*))?\s*[)\]）】]$`, 'i');
 // ⭐ 설명 «전체»가 「지적 없음」 한 문장일 때만 — 일부만 맞아도 접으면 `(none: no blockers are checked because …)` 같은 지적이 사라진다.
 const NO_FINDING_REMARK = new RegExp([
@@ -662,41 +665,38 @@ const NO_FINDING_REMARK = new RegExp([
   String.raw`^수용\s*기준(?:을|이)?\s*(?:(?:모두|전부)\s*)?충족(?:함|됨|했다|합니다)?[.。]?$`,
   String.raw`^(?:all\s+)?acceptance\s+criteria\s+(?:are\s+)?(?:all\s+)?met\.?$`,
 ].join('|'), 'i');
-// REVIEW-MUSTFIX-NONE-SENTINEL 후속 — GLM 이 괄호 안에 «무소견 머리 + 긴 근거»를 쓴다(10-11 TC `pr land` 가 `review-must-fix-1` 로 거부):
-//   `(없음 — 수용기준 충족: 머리말에 … 반영됨 …)` · `(없음 — 수용기준 3항 모두 충족: … (\`'failed'\` 반환) · …)`(근거 안에 괄호가 또 있다).
-//   ⭐ 길이 무관 0 은 «머리»가 무소견 서술이고 바로 구분자가 올 때만 — 머리가 결함 서술이면(`(없음 — 하지만 X 가 깨진다)`) 지적으로 남긴다.
-//   ⛔ 근거에 역접·미충족(`하지만`·`다만`·`미충족`·`but`·`except`·`not met` …)이 있으면 보수적으로 지적으로 남긴다.
-const LONG_BRACKETED_SENTINEL = new RegExp(String.raw`^[([（【]\s*${NONE_WORD}\s*[—–\-:·]\s*([\s\S]+?)\s*[)\]）】]$`, 'i');
-const NO_FINDING_HEAD = new RegExp('^(?:' + [
-  String.raw`수용\s*기준(?:\s*\d+\s*(?:항|개|건)(?:목)?)?(?:을|이)?\s*(?:(?:모두|전부)\s*)?충족(?:함|됨|했다|합니다)?`,
-  String.raw`(?:all\s+)?acceptance\s+criteria\s+(?:are\s+)?(?:all\s+)?met`,
-  String.raw`must-?fix\s*(?:항목)?(?:은|는|이|가)?\s*(?:없(?:음|다|습니다)|0\s*건)`,
-  String.raw`(?:no|zero)\s+(?:blocking\s+)?(?:blockers?|must-?fix(?:es)?)(?:\s+found)?`,
-  String.raw`(?:(?:블로커|차단)\s*)?(?:수준의?\s*)?(?:결함|블로커)(?:은|는|이|가)?\s*(?:발견되지\s*않(?:음|았(?:다|습니다)?)|없(?:음|다|습니다))`,
-].join('|') + String.raw`)\s*(?:[:：—–\-·,;.。(]|$)`, 'i');
-const LONG_REMARK_DISSENT = /하지만|그러나|다만|(?<![가-힣])단(?:,|\s)|미\s*충족|불\s*충족|충족하지|충족되지|\bbut\b|\bhowever\b|\bexcept\b|\balthough\b|\bnot\s+(?:yet\s+)?met\b|\bunmet\b/i;
-/** 괄호 안이 «없음 + 구분자 + 무소견 머리 …» 인가 — 길이 무관(근거 안 괄호도 허용). `isNoneSentinelFinding` 의 갈래. */
+// OP #3173 — 설명은 의미 추정하지 않는다. 실측으로 무소견임을 확인한 문장만 등록한다.
+// 문법 밖 `없음 — 설명`은 실제 결함일 수 있으므로 mustFix에 남긴다.
+const LONG_BRACKETED_SENTINEL = new RegExp(String.raw`^[([（【]\s*(?:[-—–]+\s*)?${NONE_WORD}\s*[—–\-:·]\s*([\s\S]+?)\s*[)\]）】]$`, 'i');
+const KNOWN_NO_FINDING_REMARKS = new Set([
+  // #27349 저장 JSON의 실제 무소견 문구.
+  '문서 전용 변경이고 의도된 산출물이 실제로 존재하며 배선 누락·죽은 코드·Goodhart 해당 없음',
+]);
+/** 괄호 안 `없음` 뒤 설명이 닫힌 무소견 문법에 정확히 들어가는가. */
 function isLongNoFindingBracket(text: string): boolean {
   const m = LONG_BRACKETED_SENTINEL.exec(text.trim());
   if (!m) return false;
   const remark = m[1]!.trim();
-  return NO_FINDING_HEAD.test(remark) && !LONG_REMARK_DISSENT.test(remark);
+  const bareRemark = remark.replace(/\s*[-—–]+\s*$/, '').trim();
+  return NO_FINDING_REMARK.test(bareRemark) || KNOWN_NO_FINDING_REMARKS.has(bareRemark);
 }
 /** must-fix 항목이 «지적 없음» 표지인가 — must-fix 를 세는 자리는 전부 `parseReviewResult` 를 거친다
  *  (`self review --json` 의 `mustFix` → TA `parseReviewResultOutput` → `pr land --overlap-evidence` 의 `review-must-fix-N`).
  *  ⭐ export — `parseReviewResultOutput` 가 «같은» 판정으로 저장된 결과의 표지 줄을 다시 접는다(PR-LAND-MUSTFIX-NONE · 복제 금지). */
 export function isNoneSentinelFinding(finding: string): boolean {
   const text = finding.trim();
-  if (BARE_SENTINEL.test(text)) return true;
-  const bracketed = BRACKETED_SENTINEL.exec(text);
+  if (/^[-—–]+$/.test(text)) return true;
+  const markerText = text.replace(/^[—–-]+\s*|\s*[—–-]+$/g, '').trim();
+  if (markerText && (BARE_SENTINEL.test(markerText) || DASH_ONLY_SENTINEL.test(markerText) || DASH_WRAPPED_BRACKETED_SENTINEL.test(markerText))) return true;
+  const bracketed = BRACKETED_SENTINEL.exec(markerText);
   if (bracketed) {
     const remark = bracketed[1]?.trim();
     if (!remark || NO_FINDING_REMARK.test(remark)) return true;
   }
-  return isLongNoFindingBracket(text);
+  return isLongNoFindingBracket(markerText);
 }
 
-/** critic 응답 파싱 → ReviewResult. 순수함수. VERDICT + MUST-FIX/SHOULD-FIX/REQUIREMENTS 섹션 분해.
+/** critic 응답 파싱 → ReviewResult. VERDICT + MUST-FIX/SHOULD-FIX/REQUIREMENTS 섹션 분해.
  *  verdict=FAIL 인데 must-fix 미기재면 첫 finding 을 must 로 승격(블로커 근거 보존). */
 /** ⭐ `VERDICT: PASS|WARN|FAIL` 판정 줄 — `parseReviewResult` 와 `reviewedResultFromRaw` 가 «같은» 정규식을 쓴다(존재 판정이 갈리면 안 된다). */
 const VERDICT_LINE = /VERDICT:\s*(PASS|WARN|FAIL)/i;
@@ -709,6 +709,7 @@ export function parseReviewResult(text: string): ReviewResult {
   const shouldFix: string[] = [];
   const requirements: string[] = [];
   let fallbackFinding: string | undefined;
+  let droppedNonePlaceholders = 0;
   let section: 'must' | 'should' | 'requirements' | null = null;
   for (const l of lines) {
     if (/^MUST-?FIX/i.test(l)) { section = 'must'; continue; }
@@ -718,11 +719,18 @@ export function parseReviewResult(text: string): ReviewResult {
     if (l.startsWith('- ')) {
       const f = l.slice(2).trim();
       if (!f) continue;
-      if (section === 'must') { if (!isNoneSentinelFinding(f)) mustFix.push(f); }
-      else if (section === 'should') shouldFix.push(f);
+      if (section === 'must') {
+        if (isNoneSentinelFinding(f)) droppedNonePlaceholders++;
+        else mustFix.push(f);
+      } else if (section === 'should') shouldFix.push(f);
       else if (section === 'requirements') requirements.push(f);
       else fallbackFinding ??= f;
     }
+  }
+  if (droppedNonePlaceholders > 0) {
+    try {
+      debug.log('review.parse', 'none-placeholder-dropped', { count: droppedNonePlaceholders });
+    } catch { /* observation must not change parsed review data */ }
   }
   if (verdict === 'fail' && mustFix.length === 0) {
     const first = shouldFix.shift() ?? fallbackFinding;

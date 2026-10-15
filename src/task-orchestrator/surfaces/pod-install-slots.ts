@@ -22,7 +22,7 @@ export const POD_INSTALL_SLOTS_DEFAULT = 4;
 export const POD_INSTALL_SLOTS_MOUNT = '/gate-install-slots';
 
 /** hostPath volume ⊕ mount for the tokens. `DirectoryOrCreate` makes a root-owned 0755 directory, so the Pod also needs
- *  {@link podHostDirsInit} (the child runs as uid 1000). */
+ *  {@link podHostDirsScript} (the child runs as uid 1000). */
 export function podInstallSlotsVolume(hostPath: string = POD_INSTALL_SLOTS_HOST_PATH) {
   return {
     volume: { name: 'install-slots', hostPath: { path: hostPath, type: 'DirectoryOrCreate' } },
@@ -31,19 +31,14 @@ export function podInstallSlotsVolume(hostPath: string = POD_INSTALL_SLOTS_HOST_
 }
 
 /**
- * A root init container that hands the mounted hostPath directories to the child's uid. Without it a `DirectoryOrCreate`
+ * The root shell that hands the mounted hostPath directories to the child's uid. Without it a `DirectoryOrCreate`
  * hostPath stays root:root 0755 and the child's `[ -w … ]` guard silently skips it (the Bun cache option was a no-op).
+ * Never fails the Pod: an unchanged directory only means the child falls back (no cache · no throttle).
+ * GATE-WARM-BOOT — it runs inside the Pod's single init container (after the isolation probe), not as a second one.
  */
-export function podHostDirsInit(image: string, imagePullPolicy: string, mounts: ReadonlyArray<{ name: string; mountPath: string; readOnly: boolean }>) {
+export function podHostDirsScript(mounts: ReadonlyArray<{ mountPath: string }>): string {
   const paths = mounts.map((mount) => `'${mount.mountPath.replace(/'/g, `'\\''`)}'`).join(' ');
-  return {
-    name: 'host-dirs', image, imagePullPolicy,
-    securityContext: { runAsUser: 0 },
-    command: ['sh', '-c'],
-    // Never fails the Pod: an unchanged directory only means the child falls back (no cache · no throttle).
-    args: [`for d in ${paths}; do mkdir -p "$d" && chown 1000:1000 "$d" && chmod 0775 "$d" || echo "[host-dirs] could not prepare $d"; done; exit 0`],
-    volumeMounts: mounts.map((mount) => ({ ...mount })),
-  };
+  return `for d in ${paths}; do mkdir -p "$d" && chown 1000:1000 "$d" && chmod 0775 "$d" || echo "[host-dirs] could not prepare $d"; done; exit 0`;
 }
 
 const int = (value: number, label: string) => {

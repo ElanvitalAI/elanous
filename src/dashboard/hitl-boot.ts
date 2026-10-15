@@ -12,6 +12,8 @@ export interface DashboardHitlBootDeps {
   debugLog: (scope: string, message: string) => void;
   isPushcutConfigured: () => boolean;
   pushWarningLine: (message: string) => void;
+  /** Minimal boot banner: hold the port-shift notice for `/status` instead of the transcript. */
+  holdWarningLine?: (message: string) => void;
   draw: () => void;
   registerBeforeExit: (cb: () => void) => void;
   warnConsole: (message: string) => void;
@@ -25,10 +27,13 @@ export function bootDashboardHitl(
     onPortShift: (info) => {
       deps.debugLog('hitl.port.shift', `${info.wanted} → ${info.actual}`);
       if (!deps.isPushcutConfigured()) return;
-      deps.pushWarningLine(
-        `[hitl] callback port ${info.wanted} was busy — bound ${info.actual} instead. `
-        + `Update your Pushcut Shortcut URL: http://127.0.0.1:${info.actual}`,
-      );
+      const message = `[hitl] callback port ${info.wanted} was busy — bound ${info.actual} instead. `
+        + `Update your Pushcut Shortcut URL: http://127.0.0.1:${info.actual}`;
+      if (deps.holdWarningLine) {
+        deps.holdWarningLine(message);
+        return;
+      }
+      deps.pushWarningLine(message);
       try { deps.draw(); } catch { /* ignore */ }
     },
   }).catch((err) => {

@@ -278,12 +278,15 @@ describe('TA-REVIEW-RESULT-CAPTURE — 떼어 띄운 self review 결과를 파�
     expect(parseReviewResultOutput(JSON.stringify({ pr: 21, verdict: 'pass', reviewed: true, mustFix: 'x', headCommit: 'abc', error: 'odd' }))).toMatchObject({ mustFix: null, head: null });
   });
 
-  test('PR-LAND-MUSTFIX-NONE — 저장된 mustFix 의 «(없음 — …)» 표지 줄은 리뷰 출력과 같은 판정으로 0 · 진짜 지적은 1 · 빈 배열 0', () => {
-    const none = '(없음 — 수용기준 충족: 관문 파서가 리뷰 출력과 같은 판정을 쓴다)';
+  test('PR-LAND-MUSTFIX-NONE — 검증된 무소견 표지는 0 · 설명과 진짜 지적은 보존 · 빈 배열은 0', () => {
+    const none = '(없음 — 수용기준 충족)';
+    const unverified = '(없음 — 수용기준 충족: 관문 파서가 리뷰 출력과 같은 판정을 쓴다)';
     expect(parseReviewResultOutput(reviewJson({ mustFix: [none] }))?.mustFix).toBe(0);
     expect(parseReviewResultOutput(reviewJson({ mustFix: ['none'] }))?.mustFix).toBe(0);
+    expect(parseReviewResultOutput(reviewJson({ mustFix: [unverified] }))?.mustFix).toBe(1);
     expect(parseReviewResultOutput(reviewJson({ mustFix: ['src/x.ts: 새 export 가 호출부에서 안 불린다'] }))?.mustFix).toBe(1);
     expect(parseReviewResultOutput(reviewJson({ mustFix: [none, 'src/x.ts: 실제 블로커'] }))?.mustFix).toBe(1);
+    expect(parseReviewResultOutput(reviewJson({ mustFix: [unverified, 'src/x.ts: 실제 블로커'] }))?.mustFix).toBe(2);
     // 머리가 결함 서술이면 표지가 아니다 — 지적으로 남긴다.
     expect(parseReviewResultOutput(reviewJson({ mustFix: ['(없음 — 하지만 X 가 깨진다)'] }))?.mustFix).toBe(1);
     expect(parseReviewResultOutput(reviewJson({ mustFix: [] }))?.mustFix).toBe(0);

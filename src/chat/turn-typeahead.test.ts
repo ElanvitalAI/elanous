@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import {
   applyTurnTypeaheadKey,
+  attachTurnTypeaheadPendingId,
   renderTurnTypeaheadQueueRow,
   renderTurnTypeaheadEcho,
   createTurnTypeaheadState,
@@ -175,13 +176,17 @@ describe('drainedIntoTurn — 라이브 턴 배수 문장', () => {
 });
 
 describe('queued speech is delivered only once', () => {
-  test('dashboard live drain removes its FIFO prefix before the turn-end handoff', () => {
+  test('dashboard live drain pairs registry ids and releases handed-off items', () => {
     const dashboard = readFileSync(new URL('../dashboard/index.ts', import.meta.url), 'utf8');
-    const callback = dashboard.slice(dashboard.indexOf('enqueuePendingUserInput(sid, queuedText, (drained) => {'));
-    const body = callback.slice(0, callback.indexOf("debug.log('dashboard.turn-typeahead', 'drained-into-live-turn'"));
-    expect(body).toContain('queuedSubmissions.slice(drained.length)');
-    expect(body.indexOf('queuedSubmissions.slice(drained.length)')).toBeLessThan(body.indexOf('echoSubmittedUserText(text, { live: true })'));
-    expect(dashboard).toContain('drainTurnTypeaheadOnce(turnTypeaheadRef.state, nextInitial, { interrupted })');
+    expect(dashboard).toContain('steerLastTurnTypeaheadSubmission(turnTypeaheadRef, sid,');
+    expect(dashboard).toContain("if (r.releasedPendingIds) releaseTurnTypeaheadPending(r.releasedPendingIds, 'recalled');");
+    // 턴 종료 핸드오프(드레인 → 해제 → Enter)는 다리 모듈 한 함수다 — 순서·Enter 는 turn-steer-bridge.test.ts 가 행동으로 문다.
+    expect(dashboard).toContain('handoffTurnTypeaheadAtTurnEnd(turnTypeaheadRef, nextInitial, { interrupted }, () => {');
+    const turnEnd = dashboard.slice(dashboard.indexOf('handoffTurnTypeaheadAtTurnEnd(turnTypeaheadRef, nextInitial, { interrupted }, () => {'));
+    // ⛔ 그 콜백이 «진짜» Enter 를 주입해야 한다 — 빈 콜백이면 승격 발화가 composer 에 갇힌다.
+    expect(turnEnd.slice(0, 200)).toContain("injectKey({ name: 'enter', ctrl: false, shift: false });");
+    expect(dashboard).not.toContain('drainTurnTypeaheadOnce(turnTypeaheadRef.state');
+    expect(dashboard).not.toContain('queuedSubmissions.slice(drained.length)');
   });
 
   test('live-drained items cannot be handed off again at turn end; remaining items retain FIFO order', () => {
@@ -215,11 +220,13 @@ describe('drainTurnTypeaheadQueue / drainTurnTypeaheadOnce — 기존 계약 보
       state: { buffer: '', queuedSubmissions: ['second'] },
       nextInitial: 'first',
       injectEnter: true,
+      releasedPendingIds: [],
     });
     expect(drainTurnTypeaheadOnce(createTurnTypeaheadState(), 'carried')).toEqual({
       state: createTurnTypeaheadState(),
       nextInitial: 'carried',
       injectEnter: false,
+      releasedPendingIds: [],
     });
   });
 
@@ -229,11 +236,13 @@ describe('drainTurnTypeaheadQueue / drainTurnTypeaheadOnce — 기존 계약 보
       state: createTurnTypeaheadState(),
       nextInitial: 'carried\nxyz\nsecond\ndraft',
       injectEnter: false,
+      releasedPendingIds: [],
     });
     expect(drainTurnTypeaheadOnce(state, undefined)).toEqual({
       state: { buffer: 'draft', queuedSubmissions: ['second'] },
       nextInitial: 'xyz',
       injectEnter: true,
+      releasedPendingIds: [],
     });
   });
 });
@@ -252,5 +261,16 @@ describe('renderTurnTypeaheadEcho — 컴포저에서 큐 접미를 뗐다 (B1)'
     for (const ch of 'abc') st = applyTurnTypeaheadKey(st, key(ch)).state;
     st = applyTurnTypeaheadKey(st, key('enter'), () => true).state;
     expect(renderTurnTypeaheadEcho(st, 80, { includeQueueSuffix: true })).toContain('1건 대기');
+  });
+});
+
+describe('queuedPendingIds 칸 모양', () => {
+  test('짝이 다 빠지면 칸 자체가 없다(undefined 키도 없다)', () => {
+    let state = attachTurnTypeaheadPendingId({ buffer: '', queuedSubmissions: ['a'] }, 0, 'pending-x');
+    expect(state.queuedPendingIds).toEqual(['pending-x']);
+    state = dequeueTurnTypeaheadHandoff(state).state;
+    expect('queuedPendingIds' in state).toBe(false);
+    const drained = drainTurnTypeaheadQueue(attachTurnTypeaheadPendingId({ buffer: '', queuedSubmissions: ['b'] }, 0, 'pending-y'));
+    expect('queuedPendingIds' in drained.state).toBe(false);
   });
 });

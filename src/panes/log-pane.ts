@@ -7,7 +7,7 @@
 import { C, stripAnsi, truncate, visibleWidth } from '../tui.js';
 import type { FoldMode } from '../log-entry.js';
 import { paneTitle } from './pane-title.js';
-import { highlightLineSegments } from '../log-pane/search.js';
+import { highlightLineSegments, type LogSearchResult } from '../log-pane/search.js';
 import type { PaneSpec, RenderCtx } from '../plugins/core/types.js';
 
 export interface LogPaneState {
@@ -60,6 +60,64 @@ export interface LogPaneViewport {
   visibleLineIndices: number[];
 }
 
+/** Dashboard scroll offsets count painted rows, while freeze/copy indices
+ *  still address original entries. Match the pane's filter before scrolling.
+ *  The common no-filter path counts delimiters without allocating rows. */
+export function physicalLogRowCount(
+  lines: readonly string[],
+  beforeIndex = lines.length,
+  filterQuery = '',
+): number {
+  let count = 0;
+  const query = filterQuery.trim().toLowerCase();
+  for (let i = 0; i < Math.min(beforeIndex, lines.length); i++) {
+    const entry = lines[i] ?? '';
+    if (query) {
+      count += entry.split(/\r\n|\r|\n/).filter(line => stripAnsi(line).toLowerCase().includes(query)).length;
+      continue;
+    }
+    count++;
+    for (let j = 0; j < entry.length; j++) {
+      if (entry[j] === '\n') count++;
+      else if (entry[j] === '\r') {
+        count++;
+        if (entry[j + 1] === '\n') j++;
+      }
+    }
+  }
+  return count;
+}
+
+export function visibleSearchRowOffset(
+  lines: readonly string[],
+  result: LogSearchResult,
+  filterQuery = '',
+): number {
+  const precedingRows = physicalLogRowCount(lines, result.lineIdx, filterQuery);
+  const entryRowsBeforeMatch = (lines[result.lineIdx] ?? '')
+    .split(/\r\n|\r|\n/)
+    .slice(0, result.physicalRowInEntry ?? 0);
+  const filter = filterQuery.trim().toLowerCase();
+  const withinEntry = filter
+    ? entryRowsBeforeMatch.filter(line => stripAnsi(line).toLowerCase().includes(filter)).length
+    : entryRowsBeforeMatch.length;
+  return precedingRows + withinEntry;
+}
+
+export function logPaneContentHeight(height: number, hasFooter: boolean, hasQueueRow: boolean): number {
+  return Math.max(0, height - 1 - (hasFooter ? (hasQueueRow ? 3 : 2) : 0));
+}
+
+export function maxLogPaneScroll(
+  lines: readonly string[],
+  height: number,
+  opts: { filterQuery?: string; frozenTailIndex?: number | null; hasFooter?: boolean; hasQueueRow?: boolean } = {},
+): number {
+  const sourceCount = opts.frozenTailIndex ?? lines.length;
+  const visibleRows = physicalLogRowCount(lines, sourceCount, opts.filterQuery);
+  return Math.max(0, visibleRows - logPaneContentHeight(height, !!opts.hasFooter, !!opts.hasQueueRow));
+}
+
 function buildScrollStatusLine(opts: {
   start: number;
   visibleCount: number;
@@ -96,11 +154,13 @@ export function buildLogPaneViewport(state: LogPaneState, ctx: RenderCtx): LogPa
   const frozenLines = frozen != null ? state.lines.slice(0, frozen) : state.lines;
   const hiddenBehindFreeze = frozen != null ? Math.max(0, state.lines.length - frozen) : 0;
   const filterQuery = state.filterQuery?.trim() ?? '';
-  const filtered = frozenLines.flatMap((line, index) => {
-    if (!filterQuery) return [{ line, index }];
-    return stripAnsi(line).toLowerCase().includes(filterQuery.toLowerCase())
-      ? [{ line, index }]
-      : [];
+  // Each source entry can contain embedded newlines. Expand it before
+  // viewport math so one array item never paints over the footer/input rows.
+  const physicalLines = frozenLines.flatMap((entry, index) =>
+    entry.split(/\r\n|\r|\n/).map(line => ({ line, index })));
+  const filtered = physicalLines.filter(({ line }) => {
+    if (!filterQuery) return true;
+    return stripAnsi(line).toLowerCase().includes(filterQuery.toLowerCase());
   });
   const visibleLines = filtered.map(item => item.line);
   const visibleLineIndices = filtered.map(item => item.index);
@@ -130,8 +190,7 @@ export function buildLogPaneViewport(state: LogPaneState, ctx: RenderCtx): LogPa
   // breathing gap above + 1-row footer) so the streamed text doesn't
   // feel crammed against the indicator.
   const hasQueueRow = hasFooter && state.queueRow != null && state.queueRow !== '';
-  const footerReserve = hasFooter ? (hasQueueRow ? 3 : 2) : 0;
-  const contentH = Math.max(0, bodyH - footerReserve);
+  const contentH = logPaneContentHeight(ctx.height, hasFooter, hasQueueRow);
   const maxScroll = Math.max(0, visibleLines.length - contentH);
   const start = state.scrollOffset < 0
     ? maxScroll

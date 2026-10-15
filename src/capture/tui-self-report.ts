@@ -42,7 +42,9 @@ import {
   upsertPtyManifest, updatePtyManifestFrame, touchLivePtyManifest, markPtyManifestClosed, removePtyManifest,
 } from '../pty-shell/pty-manifest.js';
 import { writeHarnessScreen } from '../harness/harness-screen.js';
+import { startTuiRunStateRecorder } from '../pty-shell/tui-run-state.js';
 import { debug } from '../debug/log.js';
+import { routeExternalInput, type ExternalInputRoute } from '../input/external-input-queue.js';
 
 export interface TuiFrameObserverCfg {
   surfaceId: string;
@@ -99,6 +101,8 @@ export interface TuiControlTargetDeps {
   splitKeys?: (input: string) => Key[];
   /** The foreground terminal's real size; `undefined` when it cannot be known (stdout is not a TTY). */
   dims?: () => { readonly cols: number; readonly rows: number } | undefined;
+  /** 외부 주입 라우터 — 글 한 줄을 사용자 버퍼에 섞지 않고 별도 대기열로 돌린다(`input/external-input-queue`). */
+  routeExternal?: (chars: string) => ExternalInputRoute;
 }
 
 function stdoutDims(): { cols: number; rows: number } | undefined {
@@ -116,6 +120,7 @@ export function createTuiControlTarget(surfaceId: string, deps: TuiControlTarget
   const inject = deps.injectKey ?? injectKey;
   const parse = deps.splitKeys ?? splitKeys;
   const dims = deps.dims ?? stdoutDims;
+  const routeExternal = deps.routeExternal ?? routeExternalInput;
   let alive = true;
   let accessMode: PtyAccessMode = 'write';
   let transitionPolicy: PtyTransitionPolicy = 'open';
@@ -135,6 +140,8 @@ export function createTuiControlTarget(surfaceId: string, deps: TuiControlTarget
     isAlive: () => alive,
     canWrite: (actor: PtyWriteActor = 'human') => resolveWriteDecision(accessMode, actor).allow,
     write(chars: string): void {
+      // ⭐ 이 write 는 «바깥»(제어 IPC)에서만 온다 — 키보드와 섞이기 전에 라우터가 먼저 가른다.
+      if (routeExternal(chars) !== 'passthrough') return;
       const keys = parse(chars);
       if (!keys.length || !keys.every(inject)) throw new Error('tui-input-undelivered');
     },
@@ -145,11 +152,13 @@ export function createTuiControlTarget(surfaceId: string, deps: TuiControlTarget
 
 export interface TuiSelfReportDeps {
   surfaceId?: string;
+  /** `elanous --name <name>` — 자기 manifest 행 별명. `pty list`·`pty snapshot <name>` 이 이것으로 부른다. */
+  nickname?: string;
   throttleMs?: number;
   now?: () => number;
   register?: (fn: ((lines: readonly string[], dims: { rows: number; cols: number }) => void) | null) => void;
   publishFrame?: (frame: SelfReportFrame) => void;
-  registerRow?: (surfaceId: string, now: number) => void;
+  registerRow?: (surfaceId: string, now: number, nickname?: string) => void;
   writeFrame?: (surfaceId: string, text: string, now: number) => void;
   /** B(harness-screens 파일) sink — `elanous self screen` 이 읽는 substrate.
    *  자식 harness 발행과 대칭(tmux 없이 L2 대시보드 자기 화면 관측). */
@@ -174,6 +183,8 @@ export interface TuiSelfReportDeps {
   startControlPoller?: () => (() => void);
   reportControlInitFailure?: (stage: TuiControlInitStage, error: unknown) => void;
   reportControlCleanupFailure?: (stage: TuiControlCleanupStage, error: unknown) => void;
+  /** 행 등록 직후 실행 판 ⊕ 턴(idle) 기록을 연다 — `elanous pty state` 가 읽는다. 반환 = 정리. */
+  startRunState?: (surfaceId: string) => (() => void);
 }
 
 export type TuiControlInitStage = 'create-target' | 'register-target' | 'start-poller' | 'publish-manifest';
@@ -235,7 +246,9 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
     initDisposers.push({ stage: 'stop-poller', dispose: stopControlPoller });
     controlInitStage = 'publish-manifest';
     initDisposers.push({ stage: 'rollback-manifest', dispose: () => rollbackRow(surfaceId) });
-    registerRow(surfaceId, now());
+    const nickname = deps.nickname?.trim() || undefined;
+    registerRow(surfaceId, now(), nickname);
+    if (nickname) debug.log('pty.rename', 'tui-launch-name', { ptyId: surfaceId, nickname });
   } catch (error) {
     for (let disposer = initDisposers.pop(); disposer; disposer = initDisposers.pop()) {
       try { disposer.dispose(); } catch (cleanupError) {
@@ -246,6 +259,10 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
     return () => {};
   }
   const activeControlTarget = controlTarget;
+  let stopRunState: () => void = () => {};
+  // 행 등록을 갈아 끼운 호출자(시험)는 실 manifest 를 안 건드린다 — 기본 녹음기는 기본 행 등록과 짝일 때만.
+  const startRunState = deps.startRunState ?? (deps.registerRow ? () => () => {} : startTuiRunStateRecorder);
+  try { stopRunState = startRunState(surfaceId); } catch { /* fail-soft — recorder logs its own write failures */ }
   const driveTicks = deps.driveTicks ?? ((tick, ms) => {
     const t = setInterval(tick, ms);
     (t as { unref?: () => void }).unref?.();
@@ -320,6 +337,7 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
     try { stopSource(); } catch { /* fail-soft — unregisters observer / clears tick timer */ }
     try { mirror?.stop(); } catch { /* fail-soft — restores stdout.write */ }
     clearInterval(hb);
+    try { stopRunState(); } catch { /* fail-soft */ }
     try { markClosed(surfaceId, now()); } catch { /* fail-soft */ }
     try { activeControlTarget?.deactivate(); } catch { /* fail-soft */ }
     try { stopControlPoller(); } catch { /* fail-soft */ }
@@ -357,8 +375,8 @@ function defaultPublishFrame(frame: SelfReportFrame): void {
   publishSelfReportFrame(getChannelBus(), frame);
 }
 
-function defaultRegisterRow(surfaceId: string, now: number): void {
-  upsertPtyManifest({ id: surfaceId, kind: 'tui', cmd: 'elanous', startedAt: now, now });
+function defaultRegisterRow(surfaceId: string, now: number, nickname?: string): void {
+  upsertPtyManifest({ id: surfaceId, kind: 'tui', ...(nickname ? { nickname } : {}), cmd: 'elanous', startedAt: now, now });
 }
 
 function defaultWriteFrame(surfaceId: string, text: string, now: number): void {

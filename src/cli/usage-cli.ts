@@ -9,13 +9,16 @@ import { join } from 'node:path';
 import type { Command } from 'commander';
 import { collectUnifiedUsage, formatUnifiedUsage } from '../budget/unified-usage.js';
 import { consumeCodexResetCredits, listCodexResetCredits } from '../budget/codex-reset-credits.js';
-import { rollupRunUsage, type RunUsageInput } from '../budget/run-usage-rollup.js';
+import { excludeCoveredPodRawRows, rollupRunUsage, type RunUsageInput } from '../budget/run-usage-rollup.js';
 import { dedupePodRollupRows } from '../../scripts/usage-rollup.js';
 import { formatUsageOutcomes, outcomeTableHasCodexGrokUnknown, queryUsageOutcomes, type UsageOutcomesDeps, type UsageOutcomesReport } from '../budget/usage-outcomes.js';
 import { LogStore, logsDbPath, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
 import { LOGS_SINCE_OPTION, parseSince } from './logs-cli.js';
 import { formatCodexCreditPlan, type CodexCreditPlan } from '../budget/codex-credit-plan.js';
 import { codexCreditPlanFromDisk } from './codex-credit-plan-view.js';
+import { getUserConfig } from '../user-config.js';
+import { defaultSshRunner, type SshRunner } from '../task-agent/parent-host.js';
+import { shellQuote } from '../task-agent/task-hand.js';
 
 export interface UsageCliDeps {
   readonly collect?: typeof collectUnifiedUsage;
@@ -24,6 +27,9 @@ export interface UsageCliDeps {
   readonly out?: { log: (s: string) => void };
   /** Read-only LogStore query seam; returns stored llm-usage rows, newest first. */
   readonly readRunLogs?: (query: LogQuery) => LogStoreRow[];
+  /** Federation seams: the configured TA parent hosts plus this HQ host, and bounded SSH. */
+  readonly usageHosts?: () => { local: string; remote: string[] };
+  readonly ssh?: SshRunner;
   /** 시험 심 — 실물 네트워크를 안 탄다. */
   readonly list?: typeof listCodexResetCredits;
   readonly consume?: typeof consumeCodexResetCredits;
@@ -61,8 +67,16 @@ function readRunLogs(query: LogQuery): LogStoreRow[] {
   }
 }
 
+function configuredUsageHosts(): { local: string; remote: string[] } {
+  const config = getUserConfig();
+  const local = config.hq?.hostName?.trim() || '';
+  const parents = config.taskAgent?.parentHost;
+  const entries = Array.isArray(parents) ? parents : parents ? [parents] : [];
+  return { local, remote: [...new Set(entries.map((entry) => entry.host?.trim()).filter((host): host is string => !!host && host !== local))] };
+}
+
 type UsageAxis = 'stage' | 'model' | 'account';
-type ExtendedRunUsageInput = RunUsageInput & { stage?: string | null; account?: string | null };
+type ExtendedRunUsageInput = RunUsageInput & { stage?: string | null; account?: string | null; origin?: string; podJob?: string; job?: string; measured?: boolean };
 type AxisUsageRow = {
   stage?: string;
   model?: string;
@@ -82,15 +96,78 @@ type AxisUsageRow = {
   rankUsd: number;
 };
 
+type FederatedUsageRow = {
+  runId?: string; role?: string; site?: string; stage?: string; model?: string; account?: string;
+  billingProvider?: string; billing?: string; hostIds: string[]; rankUsd?: number;
+  calls: number; inputTokens: number; outputTokens: number; cacheReadInputTokens: number;
+  cacheCreationInputTokens: number; reasoningOutputTokens: number; usdKnown: number;
+  unknownCostCalls: number; includedCalls: number; apiEquivalentUsd: number;
+};
+type HostMeasurement = { host: string; status: 'ok' | 'unmeasured'; reason?: string };
+const SUM_FIELDS = ['calls', 'inputTokens', 'outputTokens', 'cacheReadInputTokens', 'cacheCreationInputTokens', 'reasoningOutputTokens', 'usdKnown', 'unknownCostCalls', 'includedCalls', 'apiEquivalentUsd'] as const;
+const SSH_HOST = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/;
+
+function validUsageRows(value: unknown, axis: 'run' | 'role' | UsageAxis): value is FederatedUsageRow[] {
+  if (!Array.isArray(value)) return false;
+  const key = axis === 'run' ? 'runId' : axis;
+  return value.every((candidate) => {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return false;
+    const row = candidate as Record<string, unknown>;
+    return typeof row[key] === 'string' && Array.isArray(row.hostIds)
+      && row.hostIds.every((host: unknown) => typeof host === 'string')
+      && (axis !== 'run' && axis !== 'role'
+        || ['model', 'billingProvider', 'billing', ...(axis === 'role' ? ['site'] : [])]
+          .every((field) => typeof row[field] === 'string'))
+      && SUM_FIELDS.every((field) => {
+        const number = row[field];
+        return typeof number === 'number' && Number.isFinite(number) && number >= 0;
+      })
+      && (axis !== 'stage' && axis !== 'model' && axis !== 'account'
+        || typeof row.rankUsd === 'number' && Number.isFinite(row.rankUsd));
+  });
+}
+
+function mergeUsageRows(groups: readonly FederatedUsageRow[][], axis: 'run' | 'role' | UsageAxis): FederatedUsageRow[] {
+  const merged = new Map<string, FederatedUsageRow>();
+  for (const rows of groups) for (const row of rows) {
+    const key = axis === 'run' ? JSON.stringify([row.runId, row.model, row.billingProvider, row.billing])
+      : axis === 'role' ? JSON.stringify([row.role, row.site, row.model, row.billingProvider, row.billing])
+        : JSON.stringify(row[axis]);
+    const previous = merged.get(key);
+    if (!previous) { merged.set(key, { ...row, hostIds: [...row.hostIds] }); continue; }
+    for (const field of SUM_FIELDS) previous[field] += row[field];
+    previous.hostIds = [...new Set([...previous.hostIds, ...row.hostIds])];
+    if (axis === 'stage' || axis === 'model' || axis === 'account') previous.rankUsd = previous.usdKnown + previous.apiEquivalentUsd;
+  }
+  return [...merged.values()];
+}
+
+function readRemoteUsage(host: string, axis: 'run' | 'role' | UsageAxis, opts: { run?: string; sinceMs?: number }, ssh: SshRunner): { rows?: FederatedUsageRow[]; reason?: string } {
+  if (!SSH_HOST.test(host)) return { reason: '호스트 이름 오류' };
+  const args = ['eln', '--config-dir', '"$HOME"/.elanous', 'usage', 'runs', '--by', shellQuote(axis), '--json'];
+  if (opts.run !== undefined) args.push('--run', shellQuote(opts.run));
+  if (opts.sinceMs !== undefined) args.push('--since', shellQuote(new Date(opts.sinceMs).toISOString()));
+  try {
+    // The local usage command returns [] when its store is absent. Check the
+    // same configured store first so federation cannot count absence as zero.
+    const result = ssh(host, 'test -f "$HOME"/.elanous/logs/logs.db || { echo usage-store-missing >&2; exit 68; }; ' + args.join(' '), 20_000);
+    if (result.status === 68 || result.stderr.includes('usage-store-missing')) return { reason: '원격 logs.db 없음' };
+    if (result.status !== 0) return { reason: result.status === null ? '시간 초과 또는 SSH 실패' : `SSH/원격 명령 rc=${result.status}` };
+    const parsed: unknown = JSON.parse(result.stdout);
+    return validUsageRows(parsed, axis) ? { rows: parsed } : { reason: '원격 JSON 형식 오류' };
+  } catch { return { reason: '원격 JSON 또는 SSH 실행 오류' }; }
+}
+
 function usageData(row: LogStoreRow, unwrapPod = false): ExtendedRunUsageInput | null {
   if (row.category !== 'llm.usage' || row.event !== 'llm-usage' || !row.data) return null;
   try {
     let value: unknown = JSON.parse(row.data);
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-    const wrapper = value as { origin?: unknown; originalData?: unknown };
-    if (unwrapPod && wrapper.origin === 'pod') {
-      value = typeof wrapper.originalData === 'string' ? JSON.parse(wrapper.originalData) : wrapper.originalData;
-      if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const wrapper = value as { origin?: unknown; podJob?: unknown; originalData?: unknown };
+    if (unwrapPod && wrapper.origin === 'pod' && wrapper.originalData !== undefined) {
+      const original = typeof wrapper.originalData === 'string' ? JSON.parse(wrapper.originalData) : wrapper.originalData;
+      if (!original || typeof original !== 'object' || Array.isArray(original)) return null;
+      value = { ...original, origin: 'pod', podJob: wrapper.podJob };
     }
     return value as ExtendedRunUsageInput;
   } catch { return null; }
@@ -176,8 +253,9 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
     .option('--run <runId>', '런 ID 정확 일치')
     .option('--by <axis>', '집계 축 (run | role | stage | model | account)', 'run')
     .option(...LOGS_SINCE_OPTION)
+    .option('--hosts <scope>', '호스트 연합 (all: 이 호스트 + 설정된 taskAgent.parentHost)')
     .option('--json', '집계 행 JSON 출력')
-    .action((opts: { run?: string; by: string; since?: string; json?: boolean }, command: Command) => {
+    .action((opts: { run?: string; by: string; since?: string; hosts?: string; json?: boolean }, command: Command) => {
       const json = opts.json || command.optsWithGlobals<{ json?: boolean }>().json;
       if (!isUsageAxis(opts.by)) {
         out.log('⛔ --by 는 run | role | stage | model | account');
@@ -190,16 +268,71 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
         exit(2);
         return;
       }
-      const rows = (deps.readRunLogs ?? readRunLogs)({
-        exactCategories: ['llm.usage'], events: ['llm-usage'],
-        ...(sinceMs !== undefined ? { sinceMs } : {}),
-      });
+      if (opts.hosts !== undefined && opts.hosts !== 'all') {
+        out.log(`⛔ --hosts 는 all 만 지원: '${opts.hosts}'`);
+        exit(2);
+        return;
+      }
+      const localUnavailable = opts.hosts === 'all' && !deps.readRunLogs && !existsSync(logsDbPath())
+        ? '로컬 logs.db 없음' : undefined;
+      const emitFederated = (localRows: FederatedUsageRow[], localFailure?: string): void => {
+        const roster = (deps.usageHosts ?? configuredUsageHosts)();
+        if (!roster.local) {
+          const reason = 'hq.hostName 설정 없음 — 로컬 호스트와 원격 중복 여부를 확인할 수 없음';
+          const hosts = [...new Set(roster.remote)].map((host) => ({ host, status: 'unmeasured' as const, reason: '로컬 식별 불가로 조회 중지' }));
+          if (json) out.log(JSON.stringify({ rows: [], hosts, complete: false, reason }, null, 2));
+          else out.log(`호스트 연합: 못 잼 (${reason})`);
+          return;
+        }
+        const hosts: HostMeasurement[] = [localFailure
+          ? { host: roster.local, status: 'unmeasured', reason: localFailure }
+          : { host: roster.local, status: 'ok' }];
+        const parts: FederatedUsageRow[][] = localFailure ? [] : [localRows];
+        const rosterReason = roster.remote.length === 0 ? 'taskAgent.parentHost 설정 없음' : undefined;
+        for (const host of [...new Set(roster.remote.filter((name) => name !== roster.local))]) {
+          const remote = readRemoteUsage(host, opts.by as 'run' | 'role' | UsageAxis,
+            { run: opts.run, sinceMs }, deps.ssh ?? defaultSshRunner);
+          if (remote.rows) { hosts.push({ host, status: 'ok' }); parts.push(remote.rows); }
+          else hosts.push({ host, status: 'unmeasured', reason: remote.reason ?? '원인 미상' });
+        }
+        const complete = !rosterReason && hosts.every((host) => host.status === 'ok');
+        const rows = mergeUsageRows(parts, opts.by as 'run' | 'role' | UsageAxis);
+        if (opts.by === 'role') rows.sort((a, b) => b.calls - a.calls);
+        if (opts.by === 'stage' || opts.by === 'model' || opts.by === 'account') rows.sort((a, b) => (b.rankUsd ?? 0) - (a.rankUsd ?? 0) || b.calls - a.calls);
+        if (json) { out.log(JSON.stringify({ rows, hosts, complete, ...(rosterReason ? { reason: rosterReason } : {}) }, null, 2)); return; }
+        out.log(`호스트 ${hosts.filter((host) => host.status === 'ok').length}/${hosts.length} 측정 · ${complete ? '완결' : '부분 합계'}`);
+        if (rosterReason) out.log(`호스트 목록: 못 잼 (${rosterReason})`);
+        for (const host of hosts) if (host.status === 'unmeasured') out.log(`${host.host}: 못 잼 (${host.reason})`);
+        if (rows.length === 0) { out.log('(일치하는 런 사용량 없음)'); return; }
+        for (const row of rows) {
+          if (opts.by === 'stage' || opts.by === 'model' || opts.by === 'account') out.log(formatAxisUsage(row as AxisUsageRow, opts.by));
+          else if (opts.by === 'role') out.log(`${row.role}  ${row.site}  ${row.model}  ${row.billingProvider}/${row.billing}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}`);
+          else out.log(`${row.runId}  ${row.model}  ${row.billingProvider}/${row.billing}  hosts=${row.hostIds.join(',') || '(none)'}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  cacheRead=${row.cacheReadInputTokens}  cacheCreation=${row.cacheCreationInputTokens}  reasoning=${row.reasoningOutputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}`);
+        }
+      };
+      let rows: LogStoreRow[] = [];
+      let localFailure = localUnavailable;
+      if (!localFailure) {
+        try {
+          rows = (deps.readRunLogs ?? readRunLogs)({
+            exactCategories: ['llm.usage'], events: ['llm-usage'],
+            ...(sinceMs !== undefined ? { sinceMs } : {}),
+          });
+        } catch (error) {
+          if (opts.hosts !== 'all') throw error;
+          localFailure = '로컬 logs.db 조회 실패';
+        }
+      }
       const unwrapPod = opts.by === 'stage' || opts.by === 'model' || opts.by === 'account';
       // ⭐ METER-POD-ROLLUP-GAP-2 — Pod 사용량 재방출 행(podRollupKey)은 «더 완전한 한 행»만 센다(키 없는 행은 그대로).
-      const inputs = dedupePodRollupRows(rows.map((row) => usageData(row, unwrapPod)).filter((data): data is ExtendedRunUsageInput => data !== null))
+      const selected = rows.map((row) => usageData(row, unwrapPod))
+        .filter((data): data is ExtendedRunUsageInput => data !== null)
         .filter((data) => opts.run === undefined || data.runId === opts.run);
+      // A returned Pod raw row and its host rollup describe the same usage. Keep raw rows when no measured rollup exists.
+      const inputs = dedupePodRollupRows(unwrapPod ? excludeCoveredPodRawRows(selected) : selected);
       if (opts.by === 'stage' || opts.by === 'model' || opts.by === 'account') {
         const report = rollupByAxis(inputs, opts.by);
+        if (opts.hosts === 'all') { emitFederated(report, localFailure); return; }
         if (json) {
           out.log(JSON.stringify(report, null, 2));
           return;
@@ -209,6 +342,7 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
         return;
       }
       const report = rollupRunUsage(inputs, { by: opts.by });
+      if (opts.hosts === 'all') { emitFederated(report, localFailure); return; }
       if (opts.by === 'role') report.sort((a, b) => b.calls - a.calls);
       if (json) {
         out.log(JSON.stringify(report, null, 2));

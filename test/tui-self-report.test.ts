@@ -74,6 +74,21 @@ describe('createTuiControlTarget · foreground terminal adapter', () => {
     ]);
   });
 
+  test('외부 주입 라우터가 대기열로 가져가면 키를 넣지 않는다(사용자 버퍼에 안 섞인다)', () => {
+    const injected: string[] = [];
+    const routed: string[] = [];
+    const target = createTuiControlTarget('tui:route', {
+      splitKeys: (s) => [...s].map((ch) => ({ name: ch, ctrl: false, shift: false })),
+      injectKey: (key) => { injected.push(key.name); return true; },
+      routeExternal: (chars) => { routed.push(chars); return chars.endsWith('\r') ? 'queued' : 'passthrough'; },
+    });
+    target.write('외부\r', 'human');
+    expect(routed).toEqual(['외부\r']);
+    expect(injected).toEqual([]);
+    target.write('ab', 'human');
+    expect(injected).toEqual(['a', 'b']);
+  });
+
   test('raw-mode delivery failure throws, so IPC settles it as failure rather than success', () => {
     const target = createTuiControlTarget('tui:raw-off', {
       splitKeys: () => [{ name: 'x', ctrl: false, shift: false }],
@@ -198,6 +213,20 @@ describe('startTuiSelfReport · wiring (injected deps)', () => {
     stop(); // idempotent
     expect(calls.registered).toBeNull();          // observer removed
     expect(calls.closed).toEqual([{ id: 'tui:42', now: 5_000 }]);
+  });
+
+  test('--name nickname is registered on the TUI manifest row (trimmed; absent stays absent)', () => {
+    const rows: Array<{ id: string; nickname?: string }> = [];
+    const base = {
+      createMirror: () => null, heartbeatMs: 1_000_000,
+      register: () => {}, publishFrame: () => {}, writeFrame: () => {}, writeScreen: () => {},
+      heartbeat: () => {}, markClosed: () => {}, onExit: () => {},
+      registerControlTarget: () => () => {}, startControlPoller: () => () => {},
+      registerRow: (id: string, _now: number, nickname?: string) => { rows.push({ id, ...(nickname ? { nickname } : {}) }); },
+    };
+    startTuiSelfReport({ ...base, surfaceId: 'tui:named', nickname: '  op ' })();
+    startTuiSelfReport({ ...base, surfaceId: 'tui:plain' })();
+    expect(rows).toEqual([{ id: 'tui:named', nickname: 'op' }, { id: 'tui:plain' }]);
   });
 
   test('starts the shared control poller and stops it with the TUI', () => {

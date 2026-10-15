@@ -16,6 +16,8 @@ import { debug } from '../debug/log.js';
 import { detectTestInterference, type RunnerResult } from '../../scripts/detect-test-interference.js';
 
 const testFreezeRoot = mkdtempSync(join(tmpdir(), 'host-regate-freeze-'));
+const mockWorktree = join(testFreezeRoot, 'mock-worktree');
+let mockWorktreeUsers = 0;
 afterAll(() => rmSync(testFreezeRoot, { recursive: true, force: true }));
 
 const HEAD = 'a'.repeat(40);
@@ -32,6 +34,10 @@ function mock(overrides: Partial<HostRegateDeps> = {}) {
     command: (bin, args, cwd) => {
       const call = `${bin} ${args.join(' ')}`;
       calls.push(call);
+      if (call.startsWith(`git worktree add --detach ${mockWorktree} `)) {
+        mkdirSync(join(mockWorktree, 'apps/pwa/node_modules/next'), { recursive: true });
+        writeFileSync(join(mockWorktree, 'apps/pwa/node_modules/next/package.json'), '{}');
+      }
       if (call === 'gh pr view 42 --json headRefOid,baseRefName,baseRefOid,state,isDraft') return { status: 0, stdout: view, stderr: '' };
       if (call === 'git rev-parse --show-toplevel') return { status: 0, stdout: cwd, stderr: '' };
       if (call === 'git rev-parse HEAD') return { status: 0, stdout: BASE, stderr: '' };
@@ -46,7 +52,14 @@ function mock(overrides: Partial<HostRegateDeps> = {}) {
       if (call === `git rev-parse ${SQUASH}^1`) return { status: 0, stdout: BASE, stderr: '' };
       return { status: 0, stdout: '', stderr: '' };
     },
-    acquire: async () => Object.assign(() => { events.push('release'); }, { worktree: '/temp/regate' }),
+    acquire: async () => {
+      mockWorktreeUsers += 1;
+      return Object.assign(() => {
+        events.push('release');
+        mockWorktreeUsers -= 1;
+        if (mockWorktreeUsers === 0) rmSync(mockWorktree, { recursive: true, force: true });
+      }, { worktree: mockWorktree });
+    },
     interference: async () => ({ passed: true }),
     log: (event) => events.push(event),
     ...overrides,
@@ -227,7 +240,7 @@ describe('host regate: never merge without a measured host pass', () => {
     expect(events).not.toContain('base-raced');
     expect(calls.filter((call) => call === 'gh pr view 42 --json headRefOid,baseRefName,baseRefOid,state,isDraft')).toHaveLength(2);
     expect(calls).toContain(`git merge-base ${BASE} ${HEAD}`);
-    expect(calls).toContain(`git worktree add --detach /temp/regate ${BASE}`);
+    expect(calls).toContain(`git worktree add --detach ${mockWorktree} ${BASE}`);
     expect(calls).toContain(`git merge --no-ff --no-commit ${HEAD}`);
     expect(calls.indexOf(`git merge --no-ff --no-commit ${HEAD}`)).toBeLessThan(calls.indexOf('bun scripts/ci-typecheck-changed.ts'));
     expect(calls).toContain('bun scripts/ci-typecheck-changed.ts');
@@ -438,7 +451,7 @@ describe('host regate: never merge without a measured host pass', () => {
     } });
     const verified = await runHostRegate({ ...input, verifyOnly: true }, deps);
     expect(verified).toMatchObject({ passed: true, status: 'passed', baseCommit: BASE });
-    expect(calls).toContain(`git worktree add --detach /temp/regate ${BASE}`);
+    expect(calls).toContain(`git worktree add --detach ${mockWorktree} ${BASE}`);
     expect(envs.at(-1)?.TSC_BASE_REF).toBe(BASE);
     expect(calls.filter((call) => call.startsWith('gh pr merge'))).toHaveLength(0);
 
@@ -450,8 +463,8 @@ describe('host regate: never merge without a measured host pass', () => {
         ? { status: 0, stdout: staleView, stderr: '' } : base(bin, args, cwd, env);
     } }).deps);
     expect(landing.failures.some((failure) => failure.detail.includes('fetched PR base differs from checked SHA'))).toBe(false);
-    expect(landingCalls).toContain(`git worktree add --detach /temp/regate ${BASE}`);
-    expect(landingCalls.some((call) => call.startsWith(`git worktree add --detach /temp/regate ${OLD}`))).toBe(false);
+    expect(landingCalls).toContain(`git worktree add --detach ${mockWorktree} ${BASE}`);
+    expect(landingCalls.some((call) => call.startsWith(`git worktree add --detach ${mockWorktree} ${OLD}`))).toBe(false);
   });
 
   test('verifyOnly keeps unmeasured distinct from a failed gate and cannot merge', async () => {
@@ -569,6 +582,132 @@ describe('host regate: never merge without a measured host pass', () => {
     }
   });
 
+  test('restores PWA dependencies lost after interference before typecheck', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'host-regate-pwa-lost-'));
+    const workspace = join(root, 'repo');
+    const tree = join(root, 'candidate');
+    mkdirSync(join(workspace, 'apps/pwa/node_modules/next'), { recursive: true });
+    writeFileSync(join(workspace, 'apps/pwa/node_modules/next/package.json'), '{}');
+    mkdirSync(join(tree, 'apps/pwa'), { recursive: true });
+    const { deps, calls } = mock();
+    const command = deps.command!;
+    deps.acquire = async () => Object.assign(() => {}, { worktree: tree });
+    deps.interference = async () => {
+      expect(existsSync(join(tree, 'apps/pwa/node_modules'))).toBe(true);
+      rmSync(join(tree, 'apps/pwa/node_modules'));
+      return { passed: true };
+    };
+    deps.command = (bin, args, cwd, env) => {
+      if (bin === 'git' && args[0] === 'diff' && args[1] === '--name-only') {
+        calls.push(`${bin} ${args.join(' ')}`);
+        return { status: 0, stdout: 'apps/pwa/src/page.tsx\n', stderr: '' };
+      }
+      if (bin === 'bun' && args[0] === 'scripts/ci-typecheck-changed.ts') {
+        expect(existsSync(join(tree, 'apps/pwa/node_modules'))).toBe(true);
+      }
+      return command(bin, args, cwd, env);
+    };
+    try {
+      expect(await runHostRegate({ ...input, repoRoot: workspace }, deps)).toMatchObject({ passed: true });
+      expect(calls).toContain('bun scripts/ci-typecheck-changed.ts');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('missing PWA directory is named before typecheck, with a recovery observation', async () => {
+    const tree = mkdtempSync(join(tmpdir(), 'host-regate-no-pwa-'));
+    const { deps } = mock();
+    const command = deps.command!;
+    deps.acquire = async () => Object.assign(() => {}, { worktree: tree });
+    deps.command = (bin, args, cwd, env) => {
+      if (bin === 'git' && args[0] === 'diff' && args[1] === '--name-only') return { status: 0, stdout: 'apps/pwa/src/page.tsx\n', stderr: '' };
+      return command(bin, args, cwd, env);
+    };
+    const logged = spyOn(debug, 'log');
+    try {
+      const verdict = await runHostRegate(input, deps);
+      expect(verdict).toMatchObject({ passed: false, failures: [{ step: 'dependencies', detail: 'apps/pwa absent before typecheck' }] });
+      expect(logged).toHaveBeenCalledWith('harness.host-regate', 'pwa-dependencies-before-typecheck', { pr: 42, restored: false, failure: 'apps/pwa absent before typecheck' });
+    } finally { logged.mockRestore(); rmSync(tree, { recursive: true, force: true }); }
+  });
+
+  test('a shared-file PWA candidate fails closed when interference removes the app directory', async () => {
+    const tree = mkdtempSync(join(tmpdir(), 'host-regate-shared-pwa-lost-'));
+    mkdirSync(join(tree, 'apps/pwa/node_modules/next'), { recursive: true });
+    writeFileSync(join(tree, 'apps/pwa/node_modules/next/package.json'), '{}');
+    const { deps, calls } = mock();
+    deps.acquire = async () => Object.assign(() => {}, { worktree: tree });
+    deps.interference = async () => {
+      rmSync(join(tree, 'apps/pwa'), { recursive: true });
+      return { passed: true };
+    };
+    const logged = spyOn(debug, 'log');
+    try {
+      const verdict = await runHostRegate(input, deps);
+      expect(verdict).toMatchObject({ passed: false, failures: [{ step: 'dependencies', detail: 'apps/pwa absent before typecheck' }] });
+      expect(calls).not.toContain('bun scripts/ci-typecheck-changed.ts');
+      expect(logged).toHaveBeenCalledWith('harness.host-regate', 'pwa-dependencies-before-typecheck', { pr: 42, restored: false, failure: 'apps/pwa absent before typecheck' });
+    } finally { logged.mockRestore(); rmSync(tree, { recursive: true, force: true }); }
+  });
+
+  test('failed PWA dependency recovery records the attempted failure', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'host-regate-pwa-recovery-fail-'));
+    const workspace = join(root, 'repo');
+    const tree = join(root, 'candidate');
+    mkdirSync(join(workspace, 'apps/pwa/node_modules/next'), { recursive: true });
+    writeFileSync(join(workspace, 'apps/pwa/node_modules/next/package.json'), '{}');
+    mkdirSync(join(tree, 'apps/pwa'), { recursive: true });
+    const { deps } = mock();
+    const command = deps.command!;
+    deps.acquire = async () => Object.assign(() => {}, { worktree: tree });
+    deps.interference = async () => {
+      rmSync(join(tree, 'apps/pwa/node_modules'));
+      rmSync(join(workspace, 'apps/pwa/node_modules'), { recursive: true });
+      return { passed: true };
+    };
+    deps.command = (bin, args, cwd, env) => {
+      if (bin === 'git' && args[0] === 'diff' && args[1] === '--name-only') return { status: 0, stdout: 'apps/pwa/src/page.tsx\n', stderr: '' };
+      if (bin === 'bun' && args.join(' ') === 'install --frozen-lockfile' && cwd === join(tree, 'apps/pwa')) return { status: 1, stdout: '', stderr: 'install failed' };
+      return command(bin, args, cwd, env);
+    };
+    const logged = spyOn(debug, 'log');
+    try {
+      const verdict = await runHostRegate({ ...input, repoRoot: workspace }, deps);
+      expect(verdict).toMatchObject({ passed: false, failures: [{ step: 'dependencies' }] });
+      expect(logged.mock.calls.some(([category, event, data]) => category === 'harness.host-regate'
+        && event === 'pwa-dependencies-before-typecheck'
+        && (data as { restored?: boolean } | undefined)?.restored === false
+        && String((data as { failure?: unknown } | undefined)?.failure).includes('install failed'))).toBe(true);
+    } finally { logged.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('successful install exit without PWA dependencies records the missing result', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'host-regate-pwa-install-empty-'));
+    const workspace = join(root, 'repo');
+    const tree = join(root, 'candidate');
+    mkdirSync(join(workspace, 'apps/pwa/node_modules/next'), { recursive: true });
+    writeFileSync(join(workspace, 'apps/pwa/node_modules/next/package.json'), '{}');
+    mkdirSync(join(tree, 'apps/pwa'), { recursive: true });
+    const { deps } = mock();
+    const command = deps.command!;
+    deps.acquire = async () => Object.assign(() => {}, { worktree: tree });
+    deps.interference = async () => {
+      rmSync(join(tree, 'apps/pwa/node_modules'));
+      rmSync(join(workspace, 'apps/pwa/node_modules'), { recursive: true });
+      return { passed: true };
+    };
+    deps.command = (bin, args, cwd, env) => {
+      if (bin === 'git' && args[0] === 'diff' && args[1] === '--name-only') return { status: 0, stdout: 'apps/pwa/src/page.tsx\n', stderr: '' };
+      if (bin === 'bun' && args.join(' ') === 'install --frozen-lockfile' && cwd === join(tree, 'apps/pwa')) return { status: 0, stdout: '', stderr: '' };
+      return command(bin, args, cwd, env);
+    };
+    const logged = spyOn(debug, 'log');
+    try {
+      const failure = 'apps/pwa/node_modules absent after provision before typecheck';
+      expect(await runHostRegate({ ...input, repoRoot: workspace }, deps)).toMatchObject({ passed: false, failures: [{ step: 'dependencies', detail: failure }] });
+      expect(logged).toHaveBeenCalledWith('harness.host-regate', 'pwa-dependencies-before-typecheck', { pr: 42, restored: false, failure });
+    } finally { logged.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('an install source without installed dependencies gets a fresh install in the candidate, not an empty link', async () => {
     const root = mkdtempSync(join(tmpdir(), 'host-regate-empty-'));
     const workspace = join(root, 'repo');
@@ -585,13 +724,16 @@ describe('host regate: never merge without a measured host pass', () => {
         calls.push(`${bin} ${args.join(' ')}`);
         return { status: 0, stdout: 'apps/pwa/src/page.test.ts\n', stderr: '' };
       }
-      if (bin === 'bun' && args.join(' ') === 'install --frozen-lockfile') installs.push(cwd);
+      if (bin === 'bun' && args.join(' ') === 'install --frozen-lockfile') {
+        installs.push(cwd);
+        mkdirSync(join(cwd, 'node_modules'), { recursive: true });
+      }
       return command(bin, args, cwd, env);
     };
     try {
       expect(await runHostRegate({ ...input, repoRoot: workspace }, deps)).toMatchObject({ passed: true });
       expect(installs).toEqual([tree, join(tree, 'apps/pwa')]);
-      expect(existsSync(join(tree, 'node_modules'))).toBe(false);
+      expect(existsSync(join(tree, 'node_modules'))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -667,7 +809,7 @@ describe('host regate: never merge without a measured host pass', () => {
   test('interference failure: no merge, a single-line failure comment', async () => {
     const { deps, calls, events } = mock({ interference: async (files, cwd) => {
       expect(files).toEqual(['src/feature.test.ts']);
-      expect(cwd).toBe('/temp/regate');
+      expect(cwd).toBe(mockWorktree);
       expect(calls).toContain(`git merge --no-ff --no-commit ${HEAD}`);
       expect(calls).toContain('git rev-parse HEAD^2');
       return { passed: false, detail: 'combined 2 fail' };
@@ -1110,6 +1252,7 @@ describe('needsPwaBuild — pr-land PWA reachability', () => {
     deps.command = (bin, args, cwd, env) => {
       const call = `${bin} ${args.join(' ')}`;
       if (call === `git diff --name-only ${MERGE_BASE} ${HEAD}`) return { status: 0, stdout: `${changed}\n`, stderr: '' };
+      if (call === 'bun install --frozen-lockfile') mkdirSync(join(cwd, 'node_modules'), { recursive: true });
       return command(bin, args, cwd, env);
     };
     try {

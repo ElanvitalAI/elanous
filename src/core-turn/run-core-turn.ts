@@ -23,7 +23,7 @@
 import { isAuthRejectionError, streamLLMWithTools } from '../llm.js';
 import { drainPendingUserInput } from '../session/pending-input.js';
 import type { StreamWithToolsHandlers } from '../llm.js';
-import { debug, withAmbientSessionScope } from '../debug/log.js';
+import { debug, redactSecretText, withAmbientSessionScope } from '../debug/log.js';
 import { applyDeferredTools } from '../session-runtime/tier-flip.js';
 import { resolveSessionSurfaceProfile } from '../session-runtime/index.js';
 import type {
@@ -133,6 +133,9 @@ export async function runCoreTurn(
       accumulatedText = full;
       ctx.callbacks?.onText?.(delta, full);
     },
+    ...(ctx.callbacks?.onFinalAnswerSupplement
+      ? { onFinalAnswerSupplement: (info: { answer: string; supplement: string; finalText: string }) => ctx.callbacks?.onFinalAnswerSupplement?.(info) }
+      : {}),
     // This async boundary deliberately returns the dispatcher's fulfilled value
     // or rejection, not its Promise object identity, so completion is recorded.
     dispatchTool: async (name, args, c) => {
@@ -283,6 +286,7 @@ export async function runCoreTurn(
         ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}),
         ...(ctx.maxToolTurns !== undefined ? { maxTurns: ctx.maxToolTurns } : {}),
         ...(ctx.modelOverride !== undefined ? { model: ctx.modelOverride } : {}),
+        ...(ctx.callbacks?.onResolvedProvider !== undefined ? { onResolvedProvider: ctx.callbacks.onResolvedProvider } : {}),
         ...(ctx.budgetGrant !== undefined ? { budgetGrant: ctx.budgetGrant } : {}),
         // ⭐⭐⭐ `B3`(2026-08-19 · 대표 지시 ②) — 도는 턴 «안»으로 들어오는 사용자 발화의 배수구.
         //   ⛔ 종전엔 스트리밍 중 친 발화가 ***턴이 끝난 뒤***에야 나갔다.
@@ -307,8 +311,15 @@ export async function runCoreTurn(
     };
     } catch (err) {
       const stopReason = classifyStopReason(err, ctx.signal);
-      if (stopReason === 'aborted' || stopReason === 'auth_rejected') {
+      if (stopReason === 'aborted') {
         return { stopReason, finalText: accumulatedText };
+      }
+      if (stopReason === 'auth_rejected') {
+        return {
+          stopReason,
+          finalText: accumulatedText,
+          errorMessage: redactSecretText(err instanceof Error ? err.message : String(err)),
+        };
       }
       throw err;
     }

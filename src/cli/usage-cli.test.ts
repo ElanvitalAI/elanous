@@ -20,6 +20,27 @@ async function run(args: string[], readRunLogs: NonNullable<Parameters<typeof re
 }
 
 describe('usage runs', () => {
+  it('counts a Pod Job rollup once on model, stage, and account axes while retaining raw-only Jobs', async () => {
+    const read = () => [
+      row({ origin: 'pod', podJob: 'job-a', originalData: JSON.stringify({ runId: 'child-a', model: 'raw-model', role: 'implement', account: 'raw-account', inputTokens: 12, cost: { kind: 'known', usd: 2 } }) }),
+      row({ site: 'pod-rollup:agent-turn', job: 'job-a', model: 'rollup-model', stage: 'implement', account: 'rollup-account', inputTokens: 12, cost: { kind: 'known', usd: 2 }, podRollupKey: 'job-a|agent-turn' }),
+      row({ origin: 'pod', podJob: 'job-b', runId: 'child-b', model: 'raw-only', role: 'review', account: 'raw-only-account', inputTokens: 5, cost: { kind: 'known', usd: 1 } }),
+      row({ site: 'pod-rollup:missing', job: 'job-b', measured: false, podRollupKey: 'job-b|missing' }),
+      row({ runId: 'local', model: 'local-model', role: 'review', account: 'local-account', inputTokens: 3 }),
+    ];
+    const byModel = JSON.parse((await run(['runs', '--by', 'model', '--json'], read))[0]!);
+    expect(byModel.find((entry: { model: string }) => entry.model === 'raw-model')).toBeUndefined();
+    expect(byModel.find((entry: { model: string }) => entry.model === 'rollup-model')).toMatchObject({ calls: 1, inputTokens: 12, usdKnown: 2 });
+    expect(byModel.find((entry: { model: string }) => entry.model === 'raw-only')).toMatchObject({ calls: 1, inputTokens: 5, usdKnown: 1 });
+    const byStage = JSON.parse((await run(['runs', '--by', 'stage', '--json'], read))[0]!);
+    expect(byStage.find((entry: { stage: string }) => entry.stage === 'implement')).toMatchObject({ calls: 1, inputTokens: 12 });
+    expect(byStage.find((entry: { stage: string }) => entry.stage === 'review')).toMatchObject({ calls: 2, inputTokens: 8 });
+    const byAccount = JSON.parse((await run(['runs', '--by', 'account', '--json'], read))[0]!);
+    expect(byAccount.find((entry: { account: string }) => entry.account === 'raw-account')).toBeUndefined();
+    expect(byAccount.find((entry: { account: string }) => entry.account === 'rollup-account')).toMatchObject({ calls: 1, inputTokens: 12 });
+    expect(byAccount.find((entry: { account: string }) => entry.account === 'raw-only-account')).toMatchObject({ calls: 1, inputTokens: 5 });
+  });
+
   it('passes the exact category/event and shared --since grammar to the injected reader, filters run IDs exactly, and rolls up billing/cost axes', async () => {
     let query: unknown;
     const read = (q: Parameters<LogStore['query']>[0]) => {
@@ -281,5 +302,167 @@ describe('usage runs — pod rollup re-emit dedup', () => {
     ];
     const [first] = JSON.parse((await run(['runs', '--run', 'run-p', '--json'], read))[0]!);
     expect(first).toMatchObject({ calls: 2, inputTokens: 10, usdKnown: 4.5 });
+  });
+});
+
+describe('usage runs --hosts all', () => {
+  const remoteModel = {
+    model: 'm', hostIds: ['pod-node-b'], calls: 2, inputTokens: 20, outputTokens: 3,
+    cacheReadInputTokens: 4, cacheCreationInputTokens: 0, reasoningOutputTokens: 1,
+    usdKnown: 1.5, unknownCostCalls: 0, includedCalls: 0, apiEquivalentUsd: 0, rankUsd: 1.5,
+  };
+
+  it('accepts the installed local JSON contract on every grouping axis', async () => {
+    const read = () => [row({ runId: 'r', site: 'agent-turn', role: 'review', stage: 'review',
+      model: 'm', account: 'acct', hostId: 'pod-mbp', inputTokens: 5, cost: { kind: 'known', usd: 1 } })];
+    for (const axis of ['run', 'role', 'stage', 'model', 'account'] as const) {
+      const remoteJson = (await run(['runs', '--by', axis, '--json'], read))[0]!;
+      const lines: string[] = [];
+      const cli = new Command();
+      registerUsageCommand(cli, {
+        readRunLogs: read,
+        usageHosts: () => ({ local: 'mbp', remote: ['node-b'] }),
+        ssh: () => ({ status: 0, stdout: remoteJson, stderr: '' }),
+        out: { log: (line) => lines.push(line) },
+      });
+      await cli.parseAsync(['usage', 'runs', '--hosts', 'all', '--by', axis, '--json'], { from: 'user' });
+      const report = JSON.parse(lines[0]!);
+      expect(report.hosts).toEqual([{ host: 'mbp', status: 'ok' }, { host: 'node-b', status: 'ok' }]);
+      expect(report.complete).toBe(true);
+      expect(report.rows[0].inputTokens).toBe(10);
+    }
+  });
+
+  it('reports an empty remote roster without inventing a host', async () => {
+    const lines: string[] = [];
+    const cli = new Command();
+    registerUsageCommand(cli, {
+      readRunLogs: () => [row({ runId: 'r', model: 'm', inputTokens: 5 })],
+      usageHosts: () => ({ local: 'mbp', remote: [] }),
+      ssh: () => { throw new Error('unexpected SSH'); },
+      out: { log: (line) => lines.push(line) },
+    });
+    await cli.parseAsync(['usage', 'runs', '--hosts', 'all', '--by', 'model', '--json'], { from: 'user' });
+    const report = JSON.parse(lines[0]!);
+    expect(report.hosts).toEqual([{ host: 'mbp', status: 'ok' }]);
+    expect(report).toMatchObject({ complete: false, reason: 'taskAgent.parentHost 설정 없음' });
+    expect(report.rows[0].inputTokens).toBe(5);
+  });
+
+  it('does not count local usage twice when the local host identity is missing', async () => {
+    const lines: string[] = [];
+    const cli = new Command();
+    registerUsageCommand(cli, {
+      readRunLogs: () => [row({ runId: 'r', model: 'm', inputTokens: 5 })],
+      usageHosts: () => ({ local: '', remote: ['mbp'] }),
+      ssh: () => { throw new Error('unexpected SSH'); },
+      out: { log: (line) => lines.push(line) },
+    });
+    await cli.parseAsync(['usage', 'runs', '--hosts', 'all', '--by', 'model', '--json'], { from: 'user' });
+    expect(JSON.parse(lines[0]!)).toMatchObject({ rows: [], hosts: [
+      { host: 'mbp', status: 'unmeasured', reason: '로컬 식별 불가로 조회 중지' },
+    ], complete: false });
+    expect(JSON.parse(lines[0]!).reason).toContain('hq.hostName');
+  });
+
+  it('does not treat a remote missing logs.db as zero measured usage', async () => {
+    const lines: string[] = [];
+    const cli = new Command();
+    registerUsageCommand(cli, {
+      readRunLogs: () => [],
+      usageHosts: () => ({ local: 'mbp', remote: ['node-b'] }),
+      ssh: (_host, script) => {
+        expect(script).toContain('test -f "$HOME"/.elanous/logs/logs.db');
+        return { status: 68, stdout: '', stderr: 'usage-store-missing' };
+      },
+      out: { log: (line) => lines.push(line) },
+    });
+    await cli.parseAsync(['usage', 'runs', '--hosts', 'all', '--by', 'model', '--json'], { from: 'user' });
+    expect(JSON.parse(lines[0]!)).toMatchObject({ complete: false, hosts: [
+      { host: 'mbp', status: 'ok' }, { host: 'node-b', status: 'unmeasured', reason: '원격 logs.db 없음' },
+    ] });
+  });
+
+  it('combines the local store with configured remote hosts and marks an SSH failure as an incomplete partial sum', async () => {
+    const lines: string[] = [];
+    const calls: Array<{ host: string; script: string; timeoutMs: number }> = [];
+    const cli = new Command();
+    registerUsageCommand(cli, {
+      readRunLogs: () => [row({ runId: 'r', model: 'm', hostId: 'pod-mbp', inputTokens: 5, cost: { kind: 'known', usd: 0.5 } })],
+      usageHosts: () => ({ local: 'mbp', remote: ['node-b', 'node-c'] }),
+      ssh: (host, script, timeoutMs) => {
+        calls.push({ host, script, timeoutMs });
+        return host === 'node-b'
+          ? { status: 0, stdout: JSON.stringify([remoteModel]), stderr: '' }
+          : { status: 255, stdout: '', stderr: 'connection refused' };
+      },
+      out: { log: (line) => lines.push(line) },
+    });
+    await cli.parseAsync(['usage', 'runs', '--hosts', 'all', '--by', 'model', '--since', '2026-10-14T00:00:00Z', '--json'], { from: 'user' });
+    const report = JSON.parse(lines[0]!);
+    expect(report.complete).toBe(false);
+    expect(report.hosts).toEqual([
+      { host: 'mbp', status: 'ok' }, { host: 'node-b', status: 'ok' },
+      { host: 'node-c', status: 'unmeasured', reason: 'SSH/원격 명령 rc=255' },
+    ]);
+    expect(report.rows).toHaveLength(1);
+    expect(report.rows[0]).toMatchObject({ model: 'm', calls: 3, inputTokens: 25, usdKnown: 2, hostIds: ['pod-mbp', 'pod-node-b'] });
+    expect(calls.map((call) => call.host)).toEqual(['node-b', 'node-c']);
+    expect(calls.every((call) => call.timeoutMs === 20_000 && call.script.includes('usage runs --by model --json --since 2026-10-14T00:00:00.000Z'))).toBe(true);
+    expect(calls.every((call) => !call.script.includes('--hosts'))).toBe(true);
+  });
+
+  it('reports invalid JSON and timeout as unmeasured, including in text, while local JSON stays an array', async () => {
+    const lines: string[] = [];
+    const deps = {
+      readRunLogs: () => [row({ runId: 'r', model: 'm', inputTokens: 5 })],
+      usageHosts: () => ({ local: 'mbp', remote: ['node-b', 'node-c'] }),
+      ssh: (host: string) => host === 'node-b'
+        ? { status: 0, stdout: '{broken', stderr: '' }
+        : { status: null, stdout: '', stderr: 'timeout' },
+      out: { log: (line: string) => lines.push(line) },
+    };
+    const local = new Command();
+    registerUsageCommand(local, deps);
+    await local.parseAsync(['usage', 'runs', '--json'], { from: 'user' });
+    expect(Array.isArray(JSON.parse(lines[0]!))).toBe(true);
+    lines.length = 0;
+    const federated = new Command();
+    registerUsageCommand(federated, deps);
+    await federated.parseAsync(['usage', 'runs', '--hosts', 'all'], { from: 'user' });
+    expect(lines.join('\n')).toContain('부분 합계');
+    expect(lines.join('\n')).toContain('node-b: 못 잼');
+    expect(lines.join('\n')).toContain('node-c: 못 잼');
+  });
+
+  it('does not present an unreadable local store as zero usage', async () => {
+    const lines: string[] = [];
+    const cli = new Command();
+    registerUsageCommand(cli, {
+      readRunLogs: () => { throw new Error('database is locked'); },
+      usageHosts: () => ({ local: 'mbp', remote: ['node-b'] }),
+      ssh: () => ({ status: 0, stdout: JSON.stringify([remoteModel]), stderr: '' }),
+      out: { log: (line) => lines.push(line) },
+    });
+    await cli.parseAsync(['usage', 'runs', '--hosts', 'all', '--by', 'model', '--json'], { from: 'user' });
+    const report = JSON.parse(lines[0]!);
+    expect(report.complete).toBe(false);
+    expect(report.hosts[0]).toEqual({ host: 'mbp', status: 'unmeasured', reason: '로컬 logs.db 조회 실패' });
+    expect(report.rows[0]).toMatchObject({ model: 'm', calls: 2, inputTokens: 20 });
+  });
+
+  it('rejects a syntactically valid but incomplete remote summary', async () => {
+    const lines: string[] = [];
+    const cli = new Command();
+    registerUsageCommand(cli, {
+      readRunLogs: () => [],
+      usageHosts: () => ({ local: 'mbp', remote: ['node-b'] }),
+      ssh: () => ({ status: 0, stdout: JSON.stringify([{ model: 'm', calls: 9 }]), stderr: '' }),
+      out: { log: (line) => lines.push(line) },
+    });
+    await cli.parseAsync(['usage', 'runs', '--hosts', 'all', '--by', 'model', '--json'], { from: 'user' });
+    expect(JSON.parse(lines[0]!)).toMatchObject({ complete: false, rows: [], hosts: [
+      { host: 'mbp', status: 'ok' }, { host: 'node-b', status: 'unmeasured', reason: '원격 JSON 형식 오류' },
+    ] });
   });
 });

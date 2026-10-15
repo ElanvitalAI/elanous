@@ -304,11 +304,37 @@ export function runHarnessGcTick(opts: HarnessGcOptions = {}, deps: HarnessGcDep
   } finally { release(); }
 }
 
-function cliArgs(args: string[]): HarnessGcOptions {
-  const opts: HarnessGcOptions = {};
+interface HarnessGcCliOptions extends HarnessGcOptions {
+  human: boolean;
+  json: boolean;
+}
+
+export function formatHarnessGcReport(result: HarnessGcResult): string {
+  const value = (count: number | undefined): string => count === undefined ? 'unknown' : String(count);
+  const lines = [
+    `Harness GC · ${result.outcome}${result.reason ? ` (${result.reason})` : ''}`,
+    `repos=${result.repos} removed=${result.removed} preserved=${result.preserved} deferred=${result.deferred} failed=${result.failed}`,
+    `unseenOutsideWindow=${value(result.unseenOutsideWindow)} unseenOutsidePrefix=${value(result.unseenOutsidePrefix)}`,
+    `orphanScanUnavailable=${result.orphanScanUnavailable} budgetMs=${result.budgetMs} elapsedMs=${result.elapsedMs} budgetExhausted=${result.budgetExhausted ?? false}`,
+  ];
+  if (result.repositories.length === 0) lines.push('orphanScan=not-requested (no repository result)');
+  for (const repo of result.repositories) {
+    lines.push(`repo=${repo.gitDir} orphanScan=${repo.orphanScan} removed=${repo.removed} preserved=${repo.preserved} deferred=${repo.deferred} failed=${repo.failed}`);
+  }
+  for (const failure of result.repoFailures ?? []) lines.push(`repoFailure=${failure.gitDir}: ${failure.error}`);
+  return lines.join('\n');
+}
+
+export function formatHarnessGcOutput(result: HarnessGcResult, format: Pick<HarnessGcCliOptions, 'human' | 'json'>): string {
+  return format.human && !format.json ? formatHarnessGcReport(result) : JSON.stringify(result);
+}
+
+function cliArgs(args: string[]): HarnessGcCliOptions {
+  const opts: HarnessGcCliOptions = { human: false, json: false };
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (arg === '--json') continue;
+    if (arg === '--json') { opts.json = true; continue; }
+    if (arg === '--human') { opts.human = true; continue; }
     if (arg === '--dry-run') { opts.dryRun = true; continue; }
     if (arg === '--repo') { (opts.repos ??= []).push(args[++i] ?? ''); continue; }
     const key = arg === '--window' ? 'window' : arg === '--max-remove' ? 'maxRemove' : arg === '--budget-ms' ? 'budgetMs' : null;
@@ -321,8 +347,9 @@ function cliArgs(args: string[]): HarnessGcOptions {
 
 if (import.meta.main) {
   try {
-    const result = runHarnessGcTick(cliArgs(process.argv.slice(2)));
-    console.log(JSON.stringify(result));
+    const opts = cliArgs(process.argv.slice(2));
+    const result = runHarnessGcTick(opts);
+    console.log(formatHarnessGcOutput(result, opts));
     if (result.outcome === 'fail') process.exitCode = 1;
   } catch (error) {
     console.log(JSON.stringify({ outcome: 'fail', reason: String(error) }));

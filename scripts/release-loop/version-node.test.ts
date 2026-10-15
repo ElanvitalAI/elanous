@@ -24,12 +24,18 @@ const args = process.argv.slice(2);
 fs.appendFileSync(path.join(root, 'calls'), 'git ' + args.join(' ') + '\\n');
 if (args[0] === 'show' && args[1] === 'origin/main:package.json') console.log(JSON.stringify({name:'fixture',version:state.version}));
 else if (args[0] === 'show' && args[1] === (state.chosen || 'chosen-sha') + ':package.json') console.log(JSON.stringify({name:'fixture',version:state.chosenVersion || state.version}));
+else if (args[0] === 'show' && String(args[1]).endsWith(':package.json')) console.log(JSON.stringify({name:'fixture',version:state.version}));
 else if (args[0] === 'fetch' && args[2] === 'refs/heads/release/0.2.4') { state.branchFetched = true; fs.writeFileSync(stateFile, JSON.stringify(state)); }
 else if (args[0] === 'rev-parse' && args[1] === '--verify') {
   if (state.chosenMissing && !state.branchFetched) { console.error('unknown revision'); process.exit(128); }
   console.log(state.chosen || 'chosen-sha');
 }
 else if (args[0] === 'merge-base') process.exit(state.onMain === false ? 1 : 0);
+else if (args[0] === 'ls-remote' && args[1] === '--tags') {
+  const published = state.publishedVersions || (state.publishedTag ? [state.publishedVersion || '0.2.27'] : []);
+  const requested = args.at(-1);
+  for (const version of published) if (requested === 'refs/tags/v*' || requested === 'refs/tags/v' + version) console.log((state.publishedTag || 'b'.repeat(40)) + '\\trefs/tags/v' + version);
+}
 else if (args[0] === 'ls-remote') console.log(state.branchTip ? state.branchTip + '\\trefs/heads/release/0.2.4' : '');
 else if (args[0] === 'rev-parse' && args[1] === 'origin/main') console.log(state.sha);
 else if (args[0] === 'show' && args[1] === (state.cutSha || 'cut-sha') + ':release/next.md') {
@@ -37,7 +43,7 @@ else if (args[0] === 'show' && args[1] === (state.cutSha || 'cut-sha') + ':relea
   process.stdout.write(state.cutNextMd);
 }
 else if (args[0] === 'worktree' && args[1] === 'add') {
-  const tree = args[4];
+  const tree = args[2] === '--detach' ? args[3] : args[4];
   fs.mkdirSync(tree, {recursive:true});
   fs.writeFileSync(path.join(tree, 'package.json'), JSON.stringify({name:'fixture',version:state.version}, null, 2) + '\\n');
   fs.writeFileSync(path.join(tree, 'bun.lock'), JSON.stringify({workspaces:{'':{name:'fixture',version:state.version,dependencies:{}}}}));
@@ -61,6 +67,10 @@ else if (args[0] === 'worktree' && args[1] === 'add') {
     process.exit(1);
   }
 } else if (args[0] === 'remote' && args[1] === 'get-url' && args[2] === 'origin') console.log(state.remoteUrl || 'git@example.com:repo.git');
+else if (args[0] === 'add') { /* staged in the caller's worktree */ }
+else if (args[0] === 'commit') console.log('[cut ' + (state.cutHead || 'cut-head-sha') + ']');
+else if (args[0] === 'rev-parse' && args[1] === 'HEAD') console.log(state.cutHead || 'cut-head-sha');
+else if (args[0] === 'push') console.log('*\\t' + args[4] + '\\t[new branch]');
 else { console.error('unexpected fake git ' + args.join(' ')); process.exit(2); }
 `;
 const fakeBun = `#!/usr/bin/env node
@@ -608,4 +618,121 @@ test('dev-bump with a cut whose next.md cannot be read removes nothing and warns
   expect(result.status).toBe(0);
   expect(result.stderr).toContain('next.md 비우기 건너뜀(cut-next-md-unreadable)');
   expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).landedNextMd).toBe(nextMd);
+});
+
+test('RELEASE-DEVBUMP-ALWAYS: main on the published previous line self-heals the stranded dev bump, then cuts', () => {
+  for (const current of ['0.2.27-dev.0', '0.2.27']) {
+    const { root, run } = fixture(current);
+    const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+    writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, publishedTag: 'b'.repeat(40), publishedVersion: '0.2.27' }));
+    const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.28', branchCut: true } });
+    try {
+      const result = run('release', '--json');
+      expect(result.status).toBe(0);
+      expect(result.output).toMatchObject({ outcome: 'ok', kind: 'release', version: '0.2.28', commit: 'cut-head-sha', pr: null, branch: 'release/0.2.28' });
+      // the stranded 0.2.27 dev bump landed first (main → 0.2.28-dev.0), then the release branch was cut from it
+      expect(result.calls).toContain('git ls-remote --tags origin refs/tags/v0.2.27');
+      expect(result.calls).toContain('pr land --commit-message version: 0.2.28-dev.0');
+      expect(result.calls).toContain('git commit -m release: 0.2.28 -m Cut from main merged-sha.');
+      expect(result.calls).toContain('git push --porcelain --force-with-lease=refs/heads/release/0.2.28: origin cut-head-sha:refs/heads/release/0.2.28');
+      expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'))).toMatchObject({ version: '0.2.28-dev.0', sha: 'merged-sha' });
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+      else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+    }
+  }
+});
+
+test('RELEASE-DEVBUMP-ALWAYS: a published previous minor self-heals into the new minor dev line', () => {
+  for (const current of ['0.2.29-dev.2', '0.2.29']) {
+    const { root, run } = fixture(current);
+    const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+    writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, publishedTag: 'b'.repeat(40), publishedVersion: '0.2.29' }));
+    const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.3.0', branchCut: true } });
+    try {
+      const result = run('release', '--json');
+      expect(result.status).toBe(0);
+      expect(result.output).toMatchObject({ outcome: 'ok', kind: 'release', version: '0.3.0', branch: 'release/0.3.0' });
+      expect(result.calls).toContain('git ls-remote --tags origin refs/tags/v0.2.29');
+      expect(result.calls).toContain('pr land --commit-message version: 0.3.0-dev.0');
+      expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'))).toMatchObject({ version: '0.3.0-dev.0', sha: 'merged-sha' });
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+      else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+    }
+  }
+});
+
+test('RELEASE-DEVBUMP-ALWAYS: RC cuts heal to the stable dev line, not an rc dev version', () => {
+  const { root, run } = fixture('0.2.27-dev.0');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, publishedTag: 'b'.repeat(40), publishedVersion: '0.2.27' }));
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.28-rc.1', branchCut: true } });
+  try {
+    const result = run('release', '--json');
+    expect(result.status).toBe(0);
+    expect(result.output).toMatchObject({ outcome: 'ok', kind: 'release', version: '0.2.28-rc.1', branch: 'release/0.2.28-rc.1' });
+    expect(result.calls).toContain('pr land --commit-message version: 0.2.28-dev.0');
+    expect(result.calls).not.toContain('0.2.28-rc.1-dev.0');
+    expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).version).toBe('0.2.28-dev.0');
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
+
+test('RELEASE-DEVBUMP-ALWAYS: an intervening published tag blocks cross-minor healing', () => {
+  const { root, run } = fixture('0.2.27-dev.0');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, publishedVersions: ['0.2.27', '0.2.29'] }));
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.3.0', branchCut: true } });
+  try {
+    const result = run('release', '--json');
+    expect(result.status).toBe(1);
+    expect(result.output.error).toContain('origin/main version 0.2.27-dev.0 is not 0.3.0-dev.N');
+    expect(result.calls).toContain('git ls-remote --tags --refs origin refs/tags/v*');
+    expect(result.calls).not.toContain('pr land');
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
+
+test('RELEASE-DEVBUMP-ALWAYS: an unpublished previous line does not self-heal and the cut still fails', () => {
+  const { root, run } = fixture('0.2.27-dev.0');
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.28', branchCut: true } });
+  try {
+    const result = run('release', '--json');
+    expect(result.status).toBe(1);
+    expect(result.output).toMatchObject({ outcome: 'error', kind: 'release', version: '0.2.28' });
+    expect(result.output.error).toContain('origin/main version 0.2.27-dev.0 is not 0.2.28-dev.N');
+    expect(result.calls).not.toContain('pr land');
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
+
+test('RELEASE-DEVBUMP-ALWAYS: a published tag alone does not heal a non-adjacent main version', () => {
+  for (const current of ['0.2.26-dev.0', '0.2.29-dev.0']) {
+    const { root, run } = fixture(current);
+    const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+    writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, publishedTag: 'b'.repeat(40), publishedVersion: '0.2.27' }));
+    const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.28', branchCut: true } });
+    try {
+      const result = run('release', '--json');
+      expect(result.status).toBe(1);
+      expect(result.output.error).toContain(`origin/main version ${current} is not 0.2.28-dev.N`);
+      expect(result.calls).not.toContain('pr land');
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+      else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+    }
+  }
 });

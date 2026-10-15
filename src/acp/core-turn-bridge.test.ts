@@ -218,6 +218,43 @@ test.each(['src/acp/server.ts 의 승인 정책 고쳐줘', '현재 파일을 �
   },
 );
 
+test('a fact-shaped status question on an armed goal loop gets no fact budget, no search instruction and logs the skip', async () => {
+  // 10-14 운영 TUI OP: «지금 … 상황은?» 이 goal loop ⊕ 사실 질문 예산 6 을 동시에 받아 소진 뒤 헛호출 7회.
+  const base = config.getUserConfig();
+  spyOn(config, 'getUserConfig').mockReturnValue({
+    ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: true } },
+    chat: { ...base.chat, factQuestion: { maxToolTurns: 2 } },
+  });
+  const coreCalls: CoreTurnContext[] = [];
+  spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
+    coreCalls.push(ctx);
+    return { stopReason: 'end_turn', finalText: '' };
+  });
+  const log = spyOn(debug, 'log');
+  const text = '지금 0.2.29 판 상황은?';
+  const turn = bridgeCoreTurnToAcp({
+    getMessages: () => [{ role: 'user', content: text }],
+    getTools: () => [search],
+    dispatchTool: async () => ({ ok: true }),
+  });
+  await turn({
+    sessionId: 'goal-fact', cwd: '/tmp', userText: text,
+    promptBlocks: [{ type: 'text', text }], isAborted: () => false,
+    push: async () => {}, pushWithMeta: async () => {}, pushSessionUpdate: async () => {},
+    pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
+  } as unknown as AcpTurnContext);
+  const ctx = coreCalls[0]!;
+  expect(ctx.maxToolTurns).toBeUndefined();
+  // The goal loop prepends its own execution contract; only the fact instruction must be absent.
+  expect(ctx.messages.some((m) => typeof m.content === 'string' && m.content.includes('사실·최신 정보 질문이다'))).toBe(false);
+  // The budget gate is not wrapped around dispatch: calls past the configured 2 still reach the host.
+  for (let i = 0; i < 3; i += 1) {
+    expect(await ctx.dispatchTool('WebSearch', {}, {} as never)).not.toEqual({ error: 'Tool budget reached. Answer using the evidence already collected.' });
+  }
+  expect(log).toHaveBeenCalledWith('chat.turn', 'fact-budget-skipped', { reason: 'goal-loop-armed', route: '코딩·구현' });
+  expect(log).toHaveBeenCalledWith('chat.turn', 'tool-budget', expect.objectContaining({ factQuestion: false, maxToolTurns: null }));
+});
+
 test('TUI route selects one core turn, matching tools and visible/logged decision; daemon remains unfiltered', async () => {
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
@@ -282,6 +319,43 @@ test('TUI route selects one core turn, matching tools and visible/logged decisio
   expect(daemonPushes.some((delta) => delta.startsWith('라우팅:'))).toBe(false);
 });
 
+test('TUI read question runs one full-tool turn outside the goal loop; a write request keeps it (10-14 report: UpdateGoal on reads)', async () => {
+  const base = config.getUserConfig();
+  spyOn(config, 'getUserConfig').mockReturnValue({
+    ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: true } },
+  });
+  const coreCalls: CoreTurnContext[] = [];
+  spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
+    coreCalls.push(ctx);
+    return { stopReason: 'end_turn', finalText: '' };
+  });
+  const specs = ['Edit', 'Write', 'Bash', 'Read', 'decisions_pending'].map((name) => ({
+    name, description: '', parameters: { type: 'object' as const },
+  }));
+  const run = async (text: string) => {
+    const pushes: string[] = [];
+    await bridgeCoreTurnToAcp({
+      tuiRouting: true,
+      getMessages: () => [{ role: 'user', content: text }], getTools: () => specs,
+      dispatchTool: async () => ({}),
+    })({
+      sessionId: 'read-route', cwd: '/tmp', userText: text,
+      promptBlocks: [{ type: 'text', text }], isAborted: () => false,
+      push: async (delta: string) => { pushes.push(delta); },
+      pushWithMeta: async () => {}, pushSessionUpdate: async () => {},
+      pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
+    } as unknown as AcpTurnContext);
+    return { tools: coreCalls.at(-1)!.tools.map((tool) => tool.name), pushes, calls: coreCalls.length };
+  };
+  const read = await run('OP 앞 글 읽고 제안 표로');
+  expect(read.tools).toEqual(specs.map((spec) => spec.name));
+  expect(read.pushes[0]).toBe('라우팅: 읽기·분석\n');
+  expect(read.calls).toBe(1);
+  const write = await run('지시 문서에 절 추가');
+  expect(write.tools).toEqual([...specs.map((spec) => spec.name), 'update_goal']);
+  expect(write.pushes.some((delta) => delta.startsWith('라우팅:'))).toBe(false);
+});
+
 test('TUI routing skips only an explicit executor harness child; a human TUI in a harness space is routed', async () => {
   const coreCalls: CoreTurnContext[] = [];
   const coreSpy = spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
@@ -319,5 +393,16 @@ test('TUI routing skips only an explicit executor harness child; a human TUI in 
     coreSpy.mockRestore();
     if (saved.space === undefined) delete process.env.ELANOUS_HARNESS_SPACE; else process.env.ELANOUS_HARNESS_SPACE = saved.space;
     if (saved.role === undefined) delete process.env.ELANOUS_HARNESS_ROLE; else process.env.ELANOUS_HARNESS_ROLE = saved.role;
+  }
+});
+
+test('memory_recall is on every quick route (the self-access discipline asks every turn to recall)', () => {
+  const specs = ['memory_recall', 'Edit', 'WebSearch'].map((name) => ({
+    name, description: '', parameters: { type: 'object' as const },
+  }));
+  for (const route of ['조회', '설정 변경', '조사', '상시 일'] as const) {
+    const names = toolsForTuiRoute(specs, route).map((tool) => tool.name);
+    expect(names).toContain('memory_recall');
+    expect(names).not.toContain('Edit');
   }
 });

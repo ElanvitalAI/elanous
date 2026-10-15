@@ -13,6 +13,55 @@ export interface TurnTypeaheadState {
   buffer: string;
   /** Enter 한 입력들. 턴 종료 뒤 입력 순서대로 자동 제출한다. */
   queuedSubmissions: string[];
+  /**
+   * `queuedSubmissions` 와 같은 순서의 짝 — 턴 «안» 주입 레지스트리(`session/pending-input`) 항목 id.
+   * `null`(또는 칸이 모자람) = 레지스트리에 안 넣은 항목. ⭐ 이 id 로 배수·되꺼내기·턴 종료 승격을
+   * «짝지어» 떨어낸다 — 위치·문자열로 짝지으면 같은 발화가 두 번 들어간다(10-14 중복 수리).
+   */
+  queuedPendingIds?: (string | null)[];
+}
+
+/** 큐 길이에 맞춘 id 짝(모자라면 null 로 채운다). 순수. */
+export function turnTypeaheadPendingIds(state: TurnTypeaheadState): (string | null)[] {
+  const ids = state.queuedPendingIds ?? [];
+  return state.queuedSubmissions.map((_, i) => ids[i] ?? null);
+}
+
+function presentIds(ids: readonly (string | null)[]): string[] {
+  return ids.filter((id): id is string => typeof id === 'string');
+}
+
+/** 짝이 하나도 없으면 칸을 아예 안 둔다(`undefined` 키도 없이) — 레지스트리를 안 쓰는 경로의 상태 모양을 옛 그대로 둔다. */
+function idsField(ids: readonly (string | null)[]): { queuedPendingIds?: (string | null)[] } {
+  return ids.some(id => id !== null) ? { queuedPendingIds: [...ids] } : {};
+}
+
+/** 상태에서 id 짝 칸을 뗀다 — `idsField` 와 함께 써서 옛 짝이 스프레드로 살아남지 않게 한다. */
+function withoutIds(state: TurnTypeaheadState): TurnTypeaheadState {
+  if (!('queuedPendingIds' in state)) return state;
+  const { queuedPendingIds: _ids, ...rest } = state;
+  return rest;
+}
+
+/** 큐 index 번째 항목에 레지스트리 id 를 단다. 순수. 범위 밖이면 그대로. */
+export function attachTurnTypeaheadPendingId(
+  state: TurnTypeaheadState,
+  index: number,
+  id: string,
+): TurnTypeaheadState {
+  if (index < 0 || index >= state.queuedSubmissions.length) return state;
+  const ids = turnTypeaheadPendingIds(state);
+  ids[index] = id;
+  return { ...withoutIds(state), ...idsField(ids) };
+}
+
+/**
+ * 턴 «안» 주입(steer) 대상인가. ⛔ 슬래시는 뺀다 — 명령은 턴이 끝난 뒤 FIFO 로만 실행한다
+ * (모델에 `/…` 문면이 발화로 들어가면 명령이 아니라 잡음이다 · Claude Code 도 같은 경계에서 뺀다).
+ */
+export function isTurnTypeaheadSteerable(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.length > 0 && !trimmed.startsWith('/');
 }
 
 export function createTurnTypeaheadState(): TurnTypeaheadState {
@@ -38,6 +87,8 @@ export type TurnTypeaheadKeyResult = {
   immediateSubmission?: string;
   /** 비어 있지 않은 Enter 입력의 제출 경로 분류. */
   submissionDisposition?: 'immediate' | 'fifo';
+  /** 큐에서 «다른 길»로 빠진 항목의 레지스트리 id — 호출측이 레지스트리에서도 떨어낸다(되꺼내기). */
+  releasedPendingIds?: string[];
 };
 
 /** 등록소 소유의 관측용 표시 조회. 이름·문법·실행 정책은 이 순수 판정기에 두지 않는다. */
@@ -82,7 +133,11 @@ export function applyTurnTypeaheadKey(
       // A registry lookup failure must preserve the typed input on the existing FIFO path.
     }
     return {
-      state: { buffer: '', queuedSubmissions: [...state.queuedSubmissions, state.buffer] },
+      state: {
+        buffer: '',
+        queuedSubmissions: [...state.queuedSubmissions, state.buffer],
+        ...idsField([...turnTypeaheadPendingIds(state), null]),
+      },
       consumed: true,
       changed: true,
       submissionDisposition: 'fifo',
@@ -94,10 +149,16 @@ export function applyTurnTypeaheadKey(
   if (key.name === 'up' && key.ctrl && !key.alt && !key.shift && !key.meta) {
     const recalled = state.queuedSubmissions.at(-1);
     if (recalled === undefined) return { state, consumed: false, changed: false };
+    const ids = turnTypeaheadPendingIds(state);
     return {
-      state: { buffer: state.buffer + recalled, queuedSubmissions: state.queuedSubmissions.slice(0, -1) },
+      state: {
+        buffer: state.buffer + recalled,
+        queuedSubmissions: state.queuedSubmissions.slice(0, -1),
+        ...idsField(ids.slice(0, -1)),
+      },
       consumed: true,
       changed: true,
+      ...(ids.at(-1) ? { releasedPendingIds: presentIds(ids.slice(-1)) } : {}),
     };
   }
 
@@ -114,13 +175,17 @@ export function restoreTurnTypeaheadSubmission(
   state: TurnTypeaheadState,
   text: string,
 ): TurnTypeaheadState {
-  return { ...state, queuedSubmissions: [...state.queuedSubmissions, text] };
+  return {
+    ...withoutIds(state),
+    queuedSubmissions: [...state.queuedSubmissions, text],
+    ...idsField([...turnTypeaheadPendingIds(state), null]),
+  };
 }
 
 export type TurnTypeaheadHandoff =
   | { kind: 'none' }
   | { kind: 'prefill'; text: string }
-  | { kind: 'submit'; text: string };
+  | { kind: 'submit'; text: string; pendingId?: string };
 
 /** 턴 종료 때 FIFO의 다음 항목 하나를 꺼낸다. 큐가 비면 미제출 buffer는 prefill한다. */
 export function dequeueTurnTypeaheadHandoff(
@@ -128,7 +193,11 @@ export function dequeueTurnTypeaheadHandoff(
 ): { handoff: TurnTypeaheadHandoff; state: TurnTypeaheadState } {
   const [next, ...queuedSubmissions] = state.queuedSubmissions;
   if (next !== undefined) {
-    return { handoff: { kind: 'submit', text: next }, state: { ...state, queuedSubmissions } };
+    const [pendingId, ...queuedPendingIds] = turnTypeaheadPendingIds(state);
+    return {
+      handoff: pendingId ? { kind: 'submit', text: next, pendingId } : { kind: 'submit', text: next },
+      state: { ...withoutIds(state), queuedSubmissions, ...idsField(queuedPendingIds) },
+    };
   }
   if (!state.buffer) return { handoff: { kind: 'none' }, state };
   return { handoff: { kind: 'prefill', text: state.buffer }, state: createTurnTypeaheadState() };
@@ -143,21 +212,35 @@ export function drainTurnTypeaheadOnce(
   state: TurnTypeaheadState,
   carriedInitial: string | null | undefined,
   opts?: { interrupted?: boolean },
-): { state: TurnTypeaheadState; nextInitial: string | undefined; injectEnter: boolean } {
+): {
+  state: TurnTypeaheadState;
+  nextInitial: string | undefined;
+  injectEnter: boolean;
+  /**
+   * ⭐ 이번 걸음에 큐를 «떠난» 항목의 레지스트리 id — 호출측이 레지스트리에서도 떨어낸다.
+   *   안 떨어내면 승격된 발화(새 프롬프트)가 다음 턴 둘째 바퀴에 «또» 들어가고(턴 종료),
+   *   composer 로 돌아간 글이 고치기 전 문면으로 모델에 들어간다(중단 복원).
+   */
+  releasedPendingIds: string[];
+} {
   if (opts?.interrupted && state.queuedSubmissions.length > 0) {
     const restored = [...state.queuedSubmissions, ...(state.buffer ? [state.buffer] : [])].join('\n');
     return {
       state: createTurnTypeaheadState(),
       nextInitial: carriedInitial ? `${carriedInitial}\n${restored}` : restored,
       injectEnter: false,
+      releasedPendingIds: presentIds(turnTypeaheadPendingIds(state)),
     };
   }
   const { handoff, state: remaining } = dequeueTurnTypeaheadHandoff(state);
-  if (handoff.kind === 'none') return { state: remaining, nextInitial: carriedInitial ?? undefined, injectEnter: false };
+  if (handoff.kind === 'none') {
+    return { state: remaining, nextInitial: carriedInitial ?? undefined, injectEnter: false, releasedPendingIds: [] };
+  }
   return {
     state: remaining,
     nextInitial: carriedInitial ? `${carriedInitial}${handoff.text}` : handoff.text,
     injectEnter: handoff.kind === 'submit',
+    releasedPendingIds: handoff.kind === 'submit' && handoff.pendingId ? [handoff.pendingId] : [],
   };
 }
 
@@ -177,7 +260,7 @@ export function drainTurnTypeaheadQueue(
 ): { state: TurnTypeaheadState; drained: string[] } {
   if (state.queuedSubmissions.length === 0) return { state, drained: [] };
   return {
-    state: { ...state, queuedSubmissions: [] },
+    state: { ...withoutIds(state), queuedSubmissions: [] },
     drained: [...state.queuedSubmissions],
   };
 }
@@ -185,8 +268,10 @@ export function drainTurnTypeaheadQueue(
 /**
  * ★ 라이브 턴 안으로 배수된 발화의 상태 전이 + 챗로그 문장. 순수.
  *
- * 대시보드 `enqueuePendingUserInput` onDrained 가 앞에서부터
- * `slice(drained.length)` 로 떨어내는 FIFO 와 같다.
+ * `items`(레지스트리 항목 · id 포함)를 주면 ***id 가 짝지어지는 항목만*** 떨어내고 문장도 그것만 적는다.
+ *   ⛔ 앞에서부터 `slice(drained.length)` 하면 같은 버킷의 남의 항목(goal-loop 제어 메모)이나
+ *   이미 되꺼낸 항목 때문에 엉뚱한 대기 발화가 떨어진다(10-14 중복 수리).
+ * `items` 가 없으면 옛 계약(앞에서부터 떨어내기)을 지킨다.
  * 버퍼는 건드리지 않는다. 배수된 것이 없으면 문장도 없다.
  *
  * 문면은 `renderTurnTypeaheadQueueRow` 와 나란히 읽힌다:
@@ -199,15 +284,37 @@ export function drainTurnTypeaheadQueue(
 export function drainedIntoTurn(
   state: TurnTypeaheadState,
   drained: readonly string[],
-): { state: TurnTypeaheadState; sentence: string | null } {
-  if (drained.length === 0) return { state, sentence: null };
-  const remaining = state.queuedSubmissions.slice(drained.length);
-  const count = drained.length;
+  items?: readonly { id: string; text: string }[],
+): { state: TurnTypeaheadState; sentence: string | null; matched: string[] } {
+  if (drained.length === 0) return { state, sentence: null, matched: [] };
+  let next: TurnTypeaheadState;
+  let matched: string[];
+  if (items) {
+    const drainedIds = new Set(items.map(item => item.id));
+    const ids = turnTypeaheadPendingIds(state);
+    const keep = ids.map(id => id === null || !drainedIds.has(id));
+    matched = state.queuedSubmissions.filter((_, i) => !keep[i]);
+    next = {
+      ...withoutIds(state),
+      queuedSubmissions: state.queuedSubmissions.filter((_, i) => keep[i]),
+      ...idsField(ids.filter((_, i) => keep[i])),
+    };
+  } else {
+    matched = [...drained];
+    next = {
+      ...withoutIds(state),
+      queuedSubmissions: state.queuedSubmissions.slice(drained.length),
+      ...idsField(turnTypeaheadPendingIds(state).slice(drained.length)),
+    };
+  }
+  if (matched.length === 0) return { state: next, sentence: null, matched };
+  const count = matched.length;
   const label = count === 1 ? '⏳ 턴 안 1건' : `⏳ 턴 안 ${count}건`;
-  const quoted = drained.map(text => `"${text}"`).join(' · ');
+  const quoted = matched.map(text => `"${text}"`).join(' · ');
   return {
-    state: { ...state, queuedSubmissions: remaining },
+    state: next,
     sentence: `${label} · ${quoted} · 라이브 턴으로 전송`,
+    matched,
   };
 }
 

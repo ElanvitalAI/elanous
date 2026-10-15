@@ -168,18 +168,45 @@ describe('parseReviewResult — VERDICT + MUST-FIX/SHOULD-FIX 파싱', () => {
       expect(parseReviewResult(`VERDICT: PASS\nMUST-FIX:\n- ${sentinel}`).mustFix).toEqual([]);
     }
   });
+  it('REVIEW-MUSTFIX-NONE-PLACEHOLDER — 닫힌 표지만 지우고 문법 밖 설명·실제 지적은 남긴다(OP #3173)', () => {
+    for (const sentinel of ['(- 없음 -)', '(— none —)', '[– N/A –]', '(- 없음)', '(- none)', '(없음 -)', '(none —)']) {
+      expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${sentinel}`).mustFix).toEqual([]);
+    }
+    const real = '(none — docs-only: broken links need fixing)';
+    expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- (- 없음 -)\n- ${real}`).mustFix).toEqual([real]);
+    const describedSentinel = '(- 없음 — 문서 전용 변경이고 설명 문구만 달라짐 -)';
+    expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${describedSentinel}\n- ${real}`).mustFix).toEqual([describedSentinel, real]);
+    const alternateDescription = '(없음 — 문서 전용 변경이고 본문 표현만 수정됨)';
+    expect(parseReviewResult(`VERDICT: PASS\nMUST-FIX:\n- ${alternateDescription}`).mustFix).toEqual([alternateDescription]);
+    const noCodeChange = '(없음 — 문서 전용 변경이고 코드 변경 없음)';
+    expect(parseReviewResult(`VERDICT: PASS\nMUST-FIX:\n- ${noCodeChange}`).mustFix).toEqual([noCodeChange]);
+    const linkOnly = '(없음 — 문서 전용 변경이고 링크만 수정)';
+    expect(parseReviewResult(`VERDICT: PASS\nMUST-FIX:\n- ${linkOnly}`).mustFix).toEqual([linkOnly]);
+    const incident = '(없음 — 문서 전용 변경이고 의도된 산출물이 실제로 존재하며 배선 누락·죽은 코드·Goodhart 해당 없음)';
+    expect(parseReviewResult(`VERDICT: PASS\nMUST-FIX:\n- ${incident}`).mustFix).toEqual([]);
+    const brokenLink = '(없음 — 문서 전용 변경이고 설명 문구만 달라짐: README 링크가 깨짐)';
+    expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${brokenLink}`).mustFix).toEqual([brokenLink]);
+    const decoratedBrokenLink = '(- 없음 — 문서 전용 변경이고 설명 문구만 달라짐: README 링크가 깨짐 -)';
+    expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${decoratedBrokenLink}`).mustFix).toEqual([decoratedBrokenLink]);
+    const missingLink = '(없음 — 문서 전용 변경이고 README 링크 누락, 코드 변경 없음)';
+    expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${missingLink}`).mustFix).toEqual([missingLink]);
+    const unopenedLink = '(없음 — 문서 전용 변경이고 README 링크가 열리지 않음 코드 변경 없음)';
+    expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${unopenedLink}`).mustFix).toEqual([unopenedLink]);
+    const decoratedReal = '(- none — docs-only: broken links need fixing -)';
+    expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${decoratedReal}`).mustFix).toEqual([decoratedReal]);
+  });
   it('REVIEW-MUSTFIX-NONE-SENTINEL ② — 괄호 없는 «없음 — 수용기준 미충족» 과 괄호 안 미충족 설명은 지적으로 남긴다', () => {
     for (const finding of ['없음 — 수용기준 미충족: 시험 0', '없음 — 수용기준 충족', '(없음 — 수용기준 미충족: 시험 0)', '(없음 · 리뷰 테스트가 배선되지 않음)']) {
       expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${finding}`).mustFix).toEqual([finding]);
     }
   });
-  it('REVIEW-MUSTFIX-NONE-SENTINEL ④ — 괄호 안 «없음 — 무소견 머리 + 긴 근거»는 길이 무관 0건(10-11 TC pr land review-must-fix-1)', () => {
-    for (const sentinel of [
+  it('REVIEW-MUSTFIX-NONE-SENTINEL ④ — 출처를 확인하지 못한 장문 설명은 지적으로 보존한다(OP #3173)', () => {
+    for (const finding of [
       '(없음 — 수용기준 충족: 머리말에 KNOWHOW 링크가 반영됨, 표의 각 항목이 읽기 전용 확인 명령을 달고 있으며 기존 문서 줄 인용 시험도 그대로 통과한다는 실측이 PR 본문에 있다)',
       "(없음 — 수용기준 3항 모두 충족: 신규 테스트 파일 존재 · 원장 쓰기 실패 경로가 config set 을 실패시키지 않음(`'failed'` 반환 + warn, 테스트로 검증) · 기존 명령 무변경)",
       '(none — acceptance criteria met: the new branch is wired into parseReviewResult, both positive and negative cases are covered by tests, and no unrelated files change)',
     ]) {
-      expect(parseReviewResult(`VERDICT: PASS\nMUST-FIX:\n- ${sentinel}`).mustFix).toEqual([]);
+      expect(parseReviewResult(`VERDICT: PASS\nMUST-FIX:\n- ${finding}`).mustFix).toEqual([finding]);
     }
   });
   it('REVIEW-MUSTFIX-NONE-SENTINEL ⑤ — «없음 —» 뒤가 결함 서술이거나 근거에 역접이 있으면 지적으로 남긴다', () => {
@@ -233,6 +260,30 @@ describe('parseReviewResult — VERDICT + MUST-FIX/SHOULD-FIX 파싱', () => {
     const result = parseReviewResult('VERDICT: PASS\nREQUIREMENTS:\n보아야 할 항목');
     expect(result).toMatchObject({ verdict: 'pass', mustFix: [], shouldFix: [] });
     expect(result.requirements).toBeUndefined();
+  });
+  it('REVIEW-MUSTFIX-NONE-PLACEHOLDER — 문서 전용 빈 표지는 제거하고 실제 지적과 문장 안의 없음은 보존한다', () => {
+    const incident = 'VERDICT: PASS\nMUST-FIX:\n- (없음 — 문서 전용 변경이고 의도된 산출물이 실제로 존재하며 배선 누락·죽은 코드·Goodhart 해당 없음)';
+    expect(parseReviewResult(incident)).toEqual({ verdict: 'pass', mustFix: [], shouldFix: [] });
+
+    const mixed = 'VERDICT: WARN\nMUST-FIX:\n- 검증이 없음\n- (없음 — 문서 전용 변경이고 의도된 산출물이 실제로 존재하며 배선 누락·죽은 코드·Goodhart 해당 없음)';
+    expect(parseReviewResult(mixed)).toEqual({ verdict: 'warn', mustFix: ['검증이 없음'], shouldFix: [] });
+
+    for (const marker of ['없음', '(없음)', '- 없음 -', 'none', '(none)', 'N/A', '(N/A)', '- N/A -', '-', '(—)', '- none -', '(-)']) {
+      expect(parseReviewResult(`VERDICT: PASS\nMUST-FIX:\n- ${marker}`).mustFix).toEqual([]);
+    }
+  });
+  it('REVIEW-MUSTFIX-NONE-PLACEHOLDER — 제거된 표지 수를 debug 로그로 남긴다', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      parseReviewResult('VERDICT: PASS\nMUST-FIX:\n- (없음 — 문서 전용 변경이고 의도된 산출물이 실제로 존재하며 배선 누락·죽은 코드·Goodhart 해당 없음)\n- -');
+      expect(log).toHaveBeenCalledWith('review.parse', 'none-placeholder-dropped', { count: 2 });
+      log.mockClear();
+      const mixed = parseReviewResult('VERDICT: WARN\nMUST-FIX:\n- 검증이 없음\n- (없음 — 문서 전용 변경이고 의도된 산출물이 실제로 존재하며 배선 누락·죽은 코드·Goodhart 해당 없음)');
+      expect(mixed.mustFix).toEqual(['검증이 없음']);
+      expect(log).toHaveBeenCalledWith('review.parse', 'none-placeholder-dropped', { count: 1 });
+    } finally {
+      log.mockRestore();
+    }
   });
 });
 

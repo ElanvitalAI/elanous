@@ -19,8 +19,8 @@
 // sandbox, conciseness, impl-discipline) move here as they're verified
 // surface-agnostic.
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { join, basename, dirname, relative } from 'node:path';
+import { closeSync, existsSync, lstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { join, basename, dirname, relative, resolve as resolvePath } from 'node:path';
 import type { LLMMessage } from '../llm.js';
 import type { ModelFamily } from '../models/prompts.js';
 import { debug } from '../debug/log.js';
@@ -31,6 +31,7 @@ import { buildAnthropicFamilyAddendum } from './anthropic-family-addendum.js';
 import { buildGrokFamilyAddendum } from './grok-family-addendum.js';
 import { buildSessionGuidanceAddendum } from './session-guidance.js';
 import { getHarnessSpace } from '../harness/harness-space.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 
 export const PROJECT_ANCHOR_MAX_CHARS = 36 * 1024; // 10-10 증액(32K→36K) — 줄이기는 AGENTS-CLAUDE-DIET(0.2.24)
 /** «lean» 예산(BACKLOG L2 · 2026-09-25) — 로컬 모델 구현 자식은 매 턴 이것을 prefill 한다.
@@ -51,6 +52,21 @@ export const PROJECT_ANCHOR_CANDIDATES = [
 // AGENTS.md is the repository's canonical collaboration guide. CLAUDE.md
 // is intentionally excluded from project anchors by owner policy.
 export const PROJECT_ANCHOR_NON_CANDIDATE_FILENAMES = ['CLAUDE.md'] as const;
+
+/** 🪪 자리 로컬 지시(L0 정체성 · 2026-10-14 · 대표 «TUI 가 자기를 인식 못하면 쓸 수 없다»).
+ *  git 에 안 올라가는 «이 디렉터리만의» 지시 — 같은 저장소의 여러 자리(`seats/OP` 등)가 역할을 갈라 갖는 자리다.
+ *  한 디렉터리에서 «하나만» 읽는다: `AGENTS.local.md`(엘라누스 정본 이름)가 있으면 그것, 없으면 호환 `CLAUDE.local.md`.
+ *  ⚠️ 위 정책 제외는 «공용» `CLAUDE.md` 만이다 — 로컬 파일은 자리 주인이 쓴 비공유 지시라 별개 축이다.
+ *  선례: codex `AGENTS.override.md`(`core/src/agents_md.rs:45`) · grok-build `CLAUDE.local.md`(`compat.rs:309-316`). */
+export const PROJECT_ANCHOR_LOCAL_CANDIDATES = [
+  { filename: 'AGENTS.local.md', label: 'Directory-local instructions (overrides the shared guide)' },
+  { filename: 'CLAUDE.local.md', label: 'Directory-local instructions (compat · overrides the shared guide)' },
+] as const;
+/** 로컬 지시는 공용 앵커와 «따로» 예산을 쓴다 — 공용 `AGENTS.md` 가 상한 가까이라 같은 예산이면 자리 지시가
+ *  통째로 빠진다(10-14 실측: 공용 33,050자 / 36K). 그 반대로 로컬이 공용을 밀어내지도 않는다. */
+export const PROJECT_ANCHOR_LOCAL_MAX_CHARS = 8 * 1024;
+export const PROJECT_ANCHOR_LOCAL_LEAN_MAX_CHARS = 2 * 1024;
+export function projectAnchorLocalMaxChars(): number { return promptBudgetLean() ? PROJECT_ANCHOR_LOCAL_LEAN_MAX_CHARS : PROJECT_ANCHOR_LOCAL_MAX_CHARS; }
 
 // W4-B (2026-05-03) — codex-rs `realtime_context.rs` 패턴 차용:
 // per-dir DIR_ENTRY_LIMIT=20 으로 1차 통제, character cap 은 최종 안전망.
@@ -81,10 +97,10 @@ Give one line explaining how to enable tools: \`elanous agent "<your question>"\
 const CODING_AGENT_LIFECYCLE = `# Coding Agent Pipelines — Tool-Batch Discipline
 
 For coding-style tasks (analysis, implementation, debugging), follow ONE
-of these three pipelines. State the pipeline you chose ONCE in your
-opening sentence (not every turn). On subsequent turns, just execute the
-next stage — your tool calls are the audit trail; re-narrating the
-pipeline every turn signals you are stuck.
+of these three pipelines. Do not tell the user which pipeline you chose
+(no "I'll use the analysis pipeline" / "○○ 파이프라인으로 하겠습니다") —
+the user sees your tool calls, and the pipeline name adds nothing. Just
+execute the next stage; your tool calls are the audit trail.
 
 ## Analysis (분석) — find → read → organize
 When a user's analysis question identifies a concrete, user-fixable code or
@@ -119,9 +135,9 @@ not claim a change was made before it is implemented and verified.
    you've established a clear blocker for the user.
 
 ## Pipeline Discipline
-- Pick ONE pipeline at the START of the task. State it ONCE in your
-  opening sentence — do NOT re-state on every subsequent turn. On
-  follow-up turns just call the next stage's tools directly.
+- Pick ONE pipeline at the START of the task, silently — never name it
+  in your answer. On follow-up turns just call the next stage's tools
+  directly.
 - Each stage = ONE turn (or one parallel batch within a turn). Don't
   spread \`find\` across 4 sequential turns — batch the tools.
 - **find → read transition is MANDATORY** after the first \`find\` batch
@@ -131,8 +147,7 @@ not claim a change was made before it is implemented and verified.
 - For Analysis: stop at \`organize\`. Don't drift into edit/exec.
 - For Implementation/Debugging: \`verify\` is mandatory. "I made the
   change" without verification is incomplete output.
-- Do not announce your pipeline choice and then call zero tools — pick a
-  pipeline ONLY when you actually need to use it. Pure conversational
+- Pick a pipeline ONLY when you actually need to use it. Pure conversational
   questions don't need a pipeline.`;
 
 /** Build the family-agnostic coding-agent lifecycle addendum. Returns
@@ -192,9 +207,22 @@ export interface ProjectAnchorMeta {
    *  Mirrors ref/codex's path-aware AGENTS.md ordering — the model
    *  needs to know which scope a given fragment came from. */
   relDir: string;
+  /** 자리 로컬 지시(`AGENTS.local.md`·`CLAUDE.local.md`)에서 왔나 — 공용 앵커와 예산·순서가 다르다. */
+  local?: true;
+  /** 층(L0 v2): global = 우주 뿌리(`effectiveInstanceRoot`)의 `AGENTS.md` · root = 저장소 루트 · dir = 루트→cwd 사이·cwd 의 디렉터리 · local = `*.local.md`. */
+  layer?: ProjectAnchorLayer;
+  /** 읽은 파일의 절대 경로(관측용). */
+  path?: string;
 }
 
-export type ProjectAnchorSkipReason = 'budget-exhausted' | 'absent' | 'read-failed' | 'policy-excluded';
+export type ProjectAnchorLayer = 'global' | 'root' | 'dir' | 'local' | 'last-session';
+
+/** 🪪 TUI 가 통째로 소유하는 «지난 세션» 파일(`dashboard/seat-local-instructions.ts` 가 대화 끝마다 쓴다).
+ *  층 ④ 뒤에 싣는다. 작아야 정상이라 상한을 넘으면 자른다(사람 지시가 아니다). */
+export const PROJECT_ANCHOR_LAST_SESSION_FILE = '.AGENTS.local.last-session.md';
+export const PROJECT_ANCHOR_LAST_SESSION_MAX_CHARS = 2 * 1024;
+
+export type ProjectAnchorSkipReason = 'budget-exhausted' | 'absent' | 'read-failed' | 'policy-excluded' | 'shadowed';
 
 export interface ProjectAnchorSkippedFile {
   filename: string;
@@ -510,77 +538,216 @@ function ancestorChain(root: string, cwd: string): string[] {
  *  walk from project root (`.git` marker) down to cwd, reading the
  *  configured anchor candidates at every level. Root-most fragments land
  *  first so general project guidance precedes sub-package specifics. Same
- *  character budget — ancestor fragments consume budget before cwd's, but
- *  in practice the chain is shallow (≤ 5 dirs) and individual AGENTS
- *  files are small. */
+ *  character budget — allocate from cwd toward root and global so the
+ *  most specific instructions remain intact; render outer-first. */
 export function loadProjectAnchorWithMeta(cwd: string): ProjectAnchorResult {
-  const parts: string[] = [];
+  // L0 v2(대표 10-14) — 층 넷: ① 전역(우주 뿌리 `AGENTS.md`) ② 저장소 루트 AGENTS.md·DESIGN.md
+  //   ③ 루트→cwd 사이 각 디렉터리(codex 식) ④ 로컬 `AGENTS.local.md`(호환 `CLAUDE.local.md`).
+  //   «예산»은 ④ 먼저(자르지 않는다 · 로컬 상한을 넘으면 경고 관측) → ③(cwd→부모) → ② → ① 순으로 받고,
+  //   «싣는» 순서는 ① → ② → ③(루트→cwd) → ④ — 안쪽이 바깥을 덮는다(codex·Claude Code 와 같은 규칙).
+  //   ⇒ 예산이 모자라면 잘리는 순서는 ① → ② → ③(얕은 것부터), ④ 는 안 잘린다.
   const files: ProjectAnchorMeta[] = [];
   const skipped: ProjectAnchorSkippedFile[] = [];
-  let charsUsed = 0;
   const TRUNCATION_MARKER = '\n…[truncated to fit anchor budget]';
   const root = findProjectRoot(cwd);
   const chain = ancestorChain(root, cwd);
-  const readWithBudget = (dir: string, filename: string, label: string): void => {
-    const relDir = relative(cwd, dir);
-    const skip = (reason: ProjectAnchorSkipReason): void => {
-      skipped.push({ filename, relDir, reason });
-    };
-    if (charsUsed >= projectAnchorMaxChars()) {
-      skip('budget-exhausted');
-      return;
-    }
-    const path = join(dir, filename);
-    if (!existsSync(path)) {
-      skip('absent');
-      return;
-    }
-    let raw: string;
+  interface Slot { order: number; text?: string; meta?: ProjectAnchorMeta; skip?: ProjectAnchorSkippedFile }
+  const slots: Slot[] = [];
+  const fence = (label: string, filename: string, scope: string, content: string): string =>
+    `=== ${label} (${filename}${scope}) ===\n${content}\n=== end ${filename}${scope} ===`;
+  const readRaw = (path: string): string | null => {
     try {
-      raw = readFileSync(path, 'utf8');
+      const raw = readFileSync(path, 'utf8');
       projectAnchorReadObserverForTest?.(path);
+      return raw;
     } catch {
-      skip('read-failed');
+      return null;
+    }
+  };
+
+  const localRaw = new Map<string, string>();
+  // ④ 로컬 — 먼저 읽고 자르지 않는다. 디렉터리마다 하나(AGENTS.local.md 가 이기고 CLAUDE.local.md 는 shadowed).
+  const LOCAL_ORDER_BASE = 1_000_000;
+  let localUsed = 0;
+  chain.forEach((dir, index) => {
+    const relDir = relative(cwd, dir);
+    const present = PROJECT_ANCHOR_LOCAL_CANDIDATES.filter(({ filename }) => existsSync(join(dir, filename)));
+    const chosen = present[0];
+    if (!chosen) return;
+    for (const other of present.slice(1)) slots.push({ order: LOCAL_ORDER_BASE + index * 10 + 1, skip: { filename: other.filename, relDir, reason: 'shadowed' } });
+    const path = join(dir, chosen.filename);
+    const raw = readRaw(path);
+    if (raw === null) {
+      slots.push({ order: LOCAL_ORDER_BASE + index * 10, skip: { filename: chosen.filename, relDir, reason: 'read-failed' } });
       return;
     }
-    const remaining = projectAnchorMaxChars() - charsUsed;
-    const truncated = raw.length > remaining;
-    const sliceLen = truncated ? Math.max(0, remaining - TRUNCATION_MARKER.length) : raw.length;
-    const content = truncated ? `${raw.slice(0, sliceLen)}${TRUNCATION_MARKER}` : raw;
-    // Disambiguate fragments from different scopes in the inline
-    // header so the model can tell "this is the root project guide"
-    // from "this is the sub-package override". Empty relDir = cwd
-    // itself, render plain filename for backwards-compat with the
-    // single-fragment case.
-    const scopeSuffix = relDir === '' ? '' : ` @ ${relDir}`;
-    parts.push(`=== ${label} (${filename}${scopeSuffix}) ===\n${content}\n=== end ${filename}${scopeSuffix} ===`);
-    charsUsed += content.length;
-    files.push({ filename, chars: content.length, truncated, relDir });
-  };
-  for (const dir of chain) {
-    for (const candidate of PROJECT_ANCHOR_CANDIDATES) {
-      readWithBudget(dir, candidate.filename, candidate.label);
-    }
-    for (const filename of PROJECT_ANCHOR_NON_CANDIDATE_FILENAMES) {
-      if (existsSync(join(dir, filename))) {
-        skipped.push({ filename, relDir: relative(cwd, dir), reason: 'policy-excluded' });
+    localUsed += raw.length;
+    localRaw.set(path, raw);
+    const scope = relDir === '' ? '' : ` @ ${relDir}`;
+    slots.push({
+      order: LOCAL_ORDER_BASE + index * 10,
+      text: fence(chosen.label, chosen.filename, scope, raw),
+      meta: { filename: chosen.filename, chars: raw.length, truncated: false, relDir, local: true, layer: 'local', path },
+    });
+  });
+  // ⑤ 지난 세션 — TUI 소유 파일. 로컬 지시 «뒤»(가장 안쪽 · 가장 최근 맥락). «cwd 의 자리 루트»(/seats/<자리>) 하나만 읽는다 —
+  //   자리 밖 TUI 나 상위 디렉터리의 같은 이름 파일을 «지난 세션»으로 싣지 않게. 사람 파일이 아니므로 상한에서 자르고 읽기도 상한만큼만.
+  const lastSessionPath = seatLastSessionPath(cwd);
+  if (lastSessionPath) {
+    const relDir = relative(cwd, dirname(lastSessionPath));
+    let regular: boolean | null = null;
+    try { regular = lstatSync(lastSessionPath).isFile(); } catch { regular = null; /* 없음 */ }
+    if (regular === false) {
+      // ⛔ 링크·비정규 파일은 읽지 않는다(바깥 파일 주입 차단 · 기록기도 링크를 거부한다).
+      slots.push({ order: 2_000_000, skip: { filename: PROJECT_ANCHOR_LAST_SESSION_FILE, relDir, reason: 'read-failed' } });
+    } else if (regular === true) {
+      const raw = readHeadChars(lastSessionPath, PROJECT_ANCHOR_LAST_SESSION_MAX_CHARS + 1);
+      if (raw === null) {
+        slots.push({ order: 2_000_000, skip: { filename: PROJECT_ANCHOR_LAST_SESSION_FILE, relDir, reason: 'read-failed' } });
+      } else {
+        const truncated = raw.length > PROJECT_ANCHOR_LAST_SESSION_MAX_CHARS;
+        const content = truncated ? `${raw.slice(0, PROJECT_ANCHOR_LAST_SESSION_MAX_CHARS - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}` : raw;
+        localUsed += content.length;
+        const scope = relDir === '' ? '' : ` @ ${relDir}`;
+        slots.push({
+          order: 2_000_000,
+          text: fence('Previous TUI session in this seat (TUI-owned)', PROJECT_ANCHOR_LAST_SESSION_FILE, scope, content),
+          meta: { filename: PROJECT_ANCHOR_LAST_SESSION_FILE, chars: content.length, truncated, relDir, layer: 'last-session', path: lastSessionPath },
+        });
       }
     }
   }
-  return {
+  const localCap = projectAnchorLocalMaxChars();
+  if (localUsed > localCap) {
+    // ⛔ 자르지 않는다(대표 «먼저 읽게») — 대신 넘친 만큼 공용 예산이 준다. 그 사실을 «읽을 때마다» 게이트 없이 남긴다
+    //   (캐시 적중 턴은 같은 결과를 다시 쓰는 것이라 새로 남기지 않는다 — 파일이 바뀌면 다시 읽혀 다시 남는다).
+    debug.log('chat.project-anchor', 'local-over-cap', { cwd, localChars: localUsed, localCapChars: localCap });
+  }
+  // 공용 예산 = 공용 상한. 로컬이 자기 상한을 넘으면 넘친 만큼 공용에서 뺀다(합계 상한 = 공용 + 로컬).
+  const sharedCap = Math.max(0, Math.min(projectAnchorMaxChars(), projectAnchorMaxChars() + localCap - localUsed));
+  let sharedUsed = 0;
+
+  // ①②③ 를 «예산 우선순위»로 줄 세운다: cwd → 부모 디렉터리 → 루트 → 전역. order 는 «싣는» 순서다.
+  interface Want { order: number; path: string; filename: string; label: string; relDir: string; scope: string; layer: ProjectAnchorLayer; recordAbsent: boolean }
+  const wants: Want[] = [];
+  const globalPath = globalAnchorPath();
+  // 우주 뿌리가 저장소 트리 안이면(예: `--test=<트리>`) 전역 파일이 곧 ②·③ 의 AGENTS.md 다 — 두 번 싣지 않는다.
+  const chainAgents = new Set(chain.map((dir) => safeRealpath(join(dir, 'AGENTS.md'))));
+  const dirWants = (index: number): Want[] => {
+    const dir = chain[index]!;
+    const relDir = relative(cwd, dir);
+    return PROJECT_ANCHOR_CANDIDATES.map(({ filename, label }, k) => ({
+      order: 100 + index * 10 + k,
+      path: join(dir, filename),
+      filename,
+      label,
+      relDir,
+      scope: relDir === '' ? '' : ` @ ${relDir}`,
+      layer: (index === 0 ? 'root' : 'dir') as ProjectAnchorLayer,
+      recordAbsent: true,
+    }));
+  };
+  for (let index = chain.length - 1; index >= 0; index--) wants.push(...dirWants(index));
+  if (globalPath && existsSync(globalPath) && !chainAgents.has(safeRealpath(globalPath))) {
+    wants.push({ order: 0, path: globalPath, filename: basename(globalPath), label: 'User-global instructions', relDir: relative(cwd, dirname(globalPath)), scope: ' @ instance root', layer: 'global', recordAbsent: false });
+  }
+  for (const want of wants) {
+    const skip = (reason: ProjectAnchorSkipReason): void => {
+      slots.push({ order: want.order, skip: { filename: want.filename, relDir: want.relDir, reason } });
+    };
+    // 남은 예산이 절단 마커보다 «작으면» «잘라 싣기»가 상한을 넘긴다 — 그때는 통째로 뺀다(같으면 마커만 싣는다).
+    if (sharedCap - sharedUsed < TRUNCATION_MARKER.length) { if (want.recordAbsent || existsSync(want.path)) skip('budget-exhausted'); continue; }
+    if (!existsSync(want.path)) { if (want.recordAbsent) skip('absent'); continue; }
+    const raw = readRaw(want.path);
+    if (raw === null) { skip('read-failed'); continue; }
+    const remaining = sharedCap - sharedUsed;
+    const truncated = raw.length > remaining;
+    const sliceLen = truncated ? Math.max(0, remaining - TRUNCATION_MARKER.length) : raw.length;
+    const content = truncated ? `${raw.slice(0, sliceLen)}${TRUNCATION_MARKER}` : raw;
+    sharedUsed += content.length;
+    slots.push({
+      order: want.order,
+      text: fence(want.label, want.filename, want.scope, content),
+      meta: { filename: want.filename, chars: content.length, truncated, relDir: want.relDir, layer: want.layer, path: want.path },
+    });
+  }
+  chain.forEach((dir, index) => {
+    for (const filename of PROJECT_ANCHOR_NON_CANDIDATE_FILENAMES) {
+      if (existsSync(join(dir, filename))) {
+        slots.push({ order: 100 + index * 10 + 9, skip: { filename, relDir: relative(cwd, dir), reason: 'policy-excluded' } });
+      }
+    }
+  });
+
+  slots.sort((a, b) => a.order - b.order);
+  const parts: string[] = [];
+  for (const slot of slots) {
+    if (slot.text !== undefined && slot.meta) { parts.push(slot.text); files.push(slot.meta); }
+    if (slot.skip) skipped.push(slot.skip);
+  }
+  const result: ProjectAnchorResult = {
     content: parts.length > 0 ? parts.join('\n\n') : null,
     files,
     skipped,
-    totalChars: charsUsed,
+    totalChars: sharedUsed + localUsed,
   };
+  // 읽은 로컬 원문 — 자기 편집 비교·백업용(관측 로그에 안 실리게 결과 객체 밖에 둔다).
+  localRawByResult.set(result, localRaw);
+  return result;
+}
+
+function safeRealpath(path: string): string {
+  try { return realpathSync(path); } catch { return resolvePath(path); }
+}
+
+const SEAT_ROOT_IN_PATH = /^(.*?\/seats\/[A-Za-z][A-Za-z0-9_-]{0,63})(?:\/|$)/;
+/** cwd 가 `/seats/<자리>` 아래면 그 자리 루트의 «지난 세션» 파일 경로. 자리 밖이면 null. */
+export function seatLastSessionPath(cwd: string): string | null {
+  const m = SEAT_ROOT_IN_PATH.exec(cwd);
+  return m ? join(m[1]!, PROJECT_ANCHOR_LAST_SESSION_FILE) : null;
+}
+
+/** 파일 앞부분만 읽는다(문자 상한의 4배 바이트까지 — UTF-8 최대 폭). */
+function readHeadChars(path: string, maxChars: number): string | null {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, 'r');
+    const buf = Buffer.alloc(maxChars * 4);
+    const n = readSync(fd, buf, 0, buf.length, 0);
+    projectAnchorReadObserverForTest?.(path);
+    return buf.subarray(0, n).toString('utf8').slice(0, maxChars);
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) { try { closeSync(fd); } catch { /* ignore */ } }
+  }
+}
+
+let globalAnchorPathOverride: string | null | undefined;
+/** 시험 심 — 전역 앵커 경로를 바꾼다(null = 전역 층 끄기 · undefined = 기본 · 우주 뿌리의 `AGENTS.md`). */
+export function setGlobalAnchorPathForTest(path: string | null | undefined): void {
+  globalAnchorPathOverride = path;
+}
+/** ① 전역 층 — 사용자 공통 지시. «이 프로세스의 우주» 뿌리(`effectiveInstanceRoot` — 운영이면 `~/.elanous`,
+ *  `--test`·`--config-dir`·`ELANOUS_STATE_DIR` 면 그 우주)의 `AGENTS.md` 다. ⛔ 홈 경로를 박지 않는다 — 격리 우주가
+ *  운영 파일을 읽으면 안 된다(isolation-gate). 뿌리를 못 정하면 전역 층을 끈다. */
+export function globalAnchorPath(): string | null {
+  if (globalAnchorPathOverride !== undefined) return globalAnchorPathOverride;
+  try {
+    return join(effectiveInstanceRoot(), 'AGENTS.md');
+  } catch {
+    return null;
+  }
 }
 
 function projectAnchorCandidates(cwd: string): string[] {
   const root = findProjectRoot(cwd);
-  return ancestorChain(root, cwd).flatMap(dir => [
+  const globalPath = globalAnchorPath();
+  return [...(globalPath ? [globalPath] : []), ...ancestorChain(root, cwd).flatMap(dir => [
     ...PROJECT_ANCHOR_CANDIDATES.map(({ filename }) => join(dir, filename)),
     ...PROJECT_ANCHOR_NON_CANDIDATE_FILENAMES.map(filename => join(dir, filename)),
-  ]);
+    ...PROJECT_ANCHOR_LOCAL_CANDIDATES.map(({ filename }) => join(dir, filename)),
+  ]), ...(seatLastSessionPath(cwd) ? [seatLastSessionPath(cwd)!] : [])];
 }
 
 function projectAnchorMtimes(candidates: string[]): ProjectAnchorCandidate[] {
@@ -629,8 +796,48 @@ function observeProjectAnchorLoss(cwd: string, result: ProjectAnchorResult): voi
     totalChars: result.totalChars,
     capChars: projectAnchorMaxChars(),
     // ⛔ 「얼마나 모자랐나」를 같이 낸다 — 「잘렸다」만으론 «얼마나» 키워야 할지 모른다
-    overflowChars: Math.max(0, result.totalChars - projectAnchorMaxChars()),
+    // 로컬 지시는 따로 예산이라 공용 상한과 비교할 때는 뺀다.
+    overflowChars: Math.max(0, result.files.filter((file) => !file.local).reduce((sum, file) => sum + file.chars, 0) - projectAnchorMaxChars()),
   });
+}
+
+/** 🪪 자리 로컬 지시가 «바뀌었다»를 남긴다 — TUI 에이전트가 자기 지시 파일을 고치면(Edit 등) 다음 조회에서
+ *  mtime 이 바뀌어 다시 읽히고, 그때 «문면»이 달라졌으면(mtime 만 바뀐 touch 는 아니다) 관측 한 줄 ⊕ 직전 판 백업 한 벌.
+ *  ⛔ 이 파일은 git 제외라 모델이 잘못 고치면 되돌릴 이력이 없다 ⇒ 직전 내용을 같은 폴더 `.<파일>.prev` 로 덮어쓴다.
+ *  드물고 결과가 크니 항상 남긴다(게이트 없음). 백업 실패는 관측만 하고 앵커를 막지 않는다. */
+const localRawByResult = new WeakMap<ProjectAnchorResult, Map<string, string>>();
+
+function observeLocalInstructionEdits(cwd: string, previous: ProjectAnchorResult | undefined, next: ProjectAnchorResult): void {
+  if (!previous) return;
+  for (const file of next.files) {
+    if (!file.local) continue;
+    const before = previous.files.find((f) => f.local && f.filename === file.filename && f.relDir === file.relDir);
+    if (!before) continue;
+    // ⛔ 펜스 문면을 역파싱하지 않는다(본문에 `=== end …` 줄이 있으면 잘린다) — 읽은 원문 그대로 비교·백업.
+    const prevBody = before.path ? localRawByResult.get(previous)?.get(before.path) ?? null : null;
+    const nextBody = file.path ? localRawByResult.get(next)?.get(file.path) ?? null : null;
+    if (prevBody === nextBody) continue;
+    let prevPath: string | null = null;
+    let backupError: string | undefined;
+    if (prevBody !== null && file.path) {
+      prevPath = join(dirname(file.path), `.${file.filename}.prev`);
+      try {
+        writeFileSync(prevPath, prevBody);
+      } catch (err) {
+        backupError = err instanceof Error ? err.message : String(err);
+        prevPath = null;
+      }
+    }
+    debug.log('tui.local-instructions', 'edited', {
+      cwd,
+      file: file.relDir ? `${file.relDir}/${file.filename}` : file.filename,
+      charsBefore: before.chars,
+      charsAfter: file.chars,
+      truncated: file.truncated,
+      prevPath,
+      ...(backupError ? { backupError } : {}),
+    });
+  }
 }
 
 export function loadProjectAnchor(cwd: string): ProjectAnchorResult {
@@ -649,6 +856,7 @@ export function loadProjectAnchor(cwd: string): ProjectAnchorResult {
     const after = projectAnchorMtimes(candidates);
     if (projectAnchorSnapshotsMatch(before, after)) {
       _projectAnchorCache.set(cwd, { result, candidates: after });
+      observeLocalInstructionEdits(cwd, cached?.result, result);
       observeProjectAnchorLoss(cwd, result);
       if (debug.enabled) {
         debug.log('chat.project-anchor', result.content ? 'loaded' : 'empty', {
@@ -709,10 +917,16 @@ export function buildUniversalPreamble(ctx: UniversalPreambleContext): LLMMessag
     // list reflects what was read), so a project with only CLAUDE.md
     // doesn't see a misleading AGENTS.md reference.
     const fileList = result.files.map(f => `\`${f.filename}\``).join(' and ');
+    const hasLocal = result.files.some(f => f.local);
     const header = result.files.length > 0
       ? (
         `## Project Anchor — full text of ${fileList} inline below.\n` +
-        `(Already in context — refer to this text instead of re-reading the file.)\n\n`
+        `(Already in context — refer to this text instead of re-reading the file.)\n` +
+        (hasLocal
+          ? `Directory-local instructions (\`*.local.md\`) come last and are specific to this working directory — they define your role here and take precedence over the shared guide where they differ.\n` +
+            `That local file is YOUR OWN instruction file: when you learn a lesson or your role changes, edit it yourself with your file-edit tools (keep sections short; never edit the TUI-owned \`.AGENTS.local.last-session.md\`). Your edits load on the next turn.\n`
+          : '') +
+        `\n`
       )
       : '';
     out.push({ role: 'system', content: `${header}${result.content}` });
@@ -793,6 +1007,9 @@ export function buildUniversalPreamble(ctx: UniversalPreambleContext): LLMMessag
       hasProjectAnchor: result.content !== null,
       anchorChars: result.totalChars,
       anchorFiles: result.files.map(f => f.filename),
+      // L0 v2 — 층·경로·잘림을 한 줄씩(어느 층이 실렸고 어디서 잘렸나).
+      anchorLayers: result.files.map(f => ({ layer: f.layer ?? null, path: f.path ?? null, chars: f.chars, truncated: f.truncated })),
+      anchorLocalFiles: result.files.filter(f => f.local).map(f => (f.relDir ? `${f.relDir}/${f.filename}` : f.filename)),
       anchorSkipped: result.skipped,
       hasProjectTree: tree.content !== null,
       treeChars: tree.totalChars,

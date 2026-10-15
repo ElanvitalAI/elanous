@@ -8,6 +8,7 @@ import {
   applyManualGoalEvidenceRequirement,
   runDevPipeline,
 } from '../src/self-dev/dev-pipeline.js';
+import { TEST_FAKE_LLM_ENV } from '../src/ux-sim/fake-llm.js';
 
 describe('hand-authored --file goal evidence contract', () => {
   test('uses the author-owned shared requirement for a hand-authored goal without rewriting its source', () => {
@@ -37,6 +38,10 @@ describe('hand-authored --file goal evidence contract', () => {
   //   파일 입구가 full goal-file lint도 타므로, 이 fixture는 canonical nine sections도 만족해야
   //   원래 검증하려던 "증거 위치 계약이 child까지 전달된다"를 계속 고립해서 잰다.
   test('passes the attached requirement to the self-implement boundary for --file input', async () => {
+    // The goal boundary is the subject here; a keyless gate Pod still needs a
+    // deterministic provider while the pipeline resolves its LLM before dispatch.
+    const previousFake = process.env[TEST_FAKE_LLM_ENV];
+    process.env[TEST_FAKE_LLM_ENV] = '1';
     const sectionContents: Record<(typeof REQUIRED_BLOCKS)[number], string> = {
       '## PROBLEM': 'manual goal evidence contract',
       '## WHAT TO BUILD': 'Build the requested behavior.',
@@ -51,24 +56,28 @@ describe('hand-authored --file goal evidence contract', () => {
     const source = REQUIRED_BLOCKS.map((heading) => `${heading}\n${sectionContents[heading]}`).join('\n\n');
     let feature = '';
 
-    await runDevPipeline(
-      {
-        input: { file: 'docs/goals/manual.txt' },
-        executor: { kind: 'self' },
-        completion: 'worktree-only',
-      },
-      {
-        readFile: (path) => {
-          expect(path).toBe('docs/goals/manual.txt');
-          return source;
+    try {
+      await runDevPipeline(
+        {
+          input: { file: 'docs/goals/manual.txt' },
+          executor: { kind: 'self' },
+          completion: 'worktree-only',
         },
-        runSelfImplement: async (options) => {
-          feature = options.feature;
-          return { ok: true } as never;
+        {
+          readFile: (path) => {
+            expect(path).toBe('docs/goals/manual.txt');
+            return source;
+          },
+          runSelfImplement: async (options) => {
+            feature = options.feature;
+            return { ok: true } as never;
+          },
         },
-      },
-    );
-
+      );
+    } finally {
+      if (previousFake === undefined) delete process.env[TEST_FAKE_LLM_ENV];
+      else process.env[TEST_FAKE_LLM_ENV] = previousFake;
+    }
     expect(feature).toBe(`${source}\n\n${EVIDENCE_LOCATION_REQUIREMENT}`);
   });
 

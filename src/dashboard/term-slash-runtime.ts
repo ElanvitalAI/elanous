@@ -1,3 +1,17 @@
+import { resolve } from 'node:path';
+
+/** The workdir is the source of truth for a seat shell; env is only a fallback. */
+export function resolveTuiShellSeat(cwd: string, coordId?: string): string {
+  const parts = resolve(cwd).split(/[\\/]/);
+  const seatIndex = parts.lastIndexOf('seats');
+  const fromPath = seatIndex >= 0 ? parts[seatIndex + 1] : undefined;
+  const valid = (value: string | undefined): value is string =>
+    value !== undefined && /^[A-Za-z0-9_-]{1,64}$/.test(value);
+  if (valid(fromPath)) return fromPath;
+  const fromEnv = coordId?.trim();
+  return valid(fromEnv) ? fromEnv : 'unknown';
+}
+
 export interface DashboardPersistedSessionEntry {
   id: string;
   title: string;
@@ -109,6 +123,7 @@ export function createDashboardTermSlashRuntime(
       '',
       deps.accent('\u276f /term'),
       deps.muted('Usage:'),
+      deps.muted('  /term new [command]       Open a shell PTY (Ctrl+Shift+T or Alt+T).'),
       deps.muted('  /term list                List all alive sessions (fg / bg / exited).'),
       deps.muted('  /term attach <id>         Bring a backgrounded session to foreground.'),
       deps.muted('  /term detach              Send foreground session to background (PTY survives).'),

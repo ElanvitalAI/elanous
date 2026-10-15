@@ -15,6 +15,7 @@ import {
   getGitStatusView,
   subscribeGitChanges,
   refreshDirty,
+  refreshDirtyAsync,
   __resetGitFsCache,
 } from '../src/git-fs/index.js';
 
@@ -386,5 +387,67 @@ describe('git-fs: buildGitSnapshot', () => {
     } finally {
       rmSync(outside, { recursive: true, force: true });
     }
+  });
+});
+
+// TUI-TYPING-LAG — the TUI probes git dirty state without blocking its event loop.
+describe('git-fs: refreshDirtyAsync', () => {
+  let repo: string;
+
+  beforeEach(() => {
+    repo = mkdtempSync(join(tmpdir(), 'gitfs-async-'));
+    runGit(repo, ['init', '-q', '-b', 'main']);
+    writeFileSync(join(repo, 'a.txt'), 'hello');
+    runGit(repo, ['add', '.']);
+    runGit(repo, ['commit', '-q', '-m', 'init']);
+    __resetGitFsCache();
+  });
+
+  afterEach(() => {
+    __resetGitFsCache();
+    try { rmSync(repo, { recursive: true, force: true }); } catch {}
+  });
+
+  test('matches the sync probe and shares one in-flight probe', async () => {
+    writeFileSync(join(repo, 'new.md'), 'x');
+    const first = refreshDirtyAsync(repo, { minIntervalMs: 0 });
+    const second = refreshDirtyAsync(repo, { minIntervalMs: 0 });
+    expect(second).toBe(first);
+    const view = await first;
+    expect(view.dirty).toEqual(refreshDirty(repo, { force: true }).dirty);
+    expect(view.dirty!.untracked).toBe(1);
+  });
+
+  test('throttles like the sync probe', async () => {
+    await refreshDirtyAsync(repo, { force: true });
+    const first = getGitStatusView(repo).lastDirtyProbeAt;
+    await refreshDirtyAsync(repo);
+    expect(getGitStatusView(repo).lastDirtyProbeAt).toBe(first);
+  });
+
+  test('outside a repo resolves an empty view', async () => {
+    const outside = mkdtempSync(join(tmpdir(), 'gitfs-async-outside-'));
+    try {
+      expect((await refreshDirtyAsync(outside)).head).toBeNull();
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test('a throttled call during a forced probe joins it instead of returning the pre-write view', async () => {
+    await refreshDirtyAsync(repo, { force: true });
+    writeFileSync(join(repo, 'joined.txt'), 'dirty');
+    const forced = refreshDirtyAsync(repo, { force: true });
+    const throttled = refreshDirtyAsync(repo);
+    expect(throttled).toBe(forced);
+    expect((await throttled).dirty!.untracked).toBe(1);
+  });
+
+  test('a forced probe after a write does not reuse a probe that started before the write', async () => {
+    const before = refreshDirtyAsync(repo, { minIntervalMs: 0 });
+    writeFileSync(join(repo, 'raced.txt'), 'dirty');
+    const forced = refreshDirtyAsync(repo, { force: true });
+    expect(forced).not.toBe(before);
+    expect((await forced).dirty!.untracked).toBe(1);
   });
 });

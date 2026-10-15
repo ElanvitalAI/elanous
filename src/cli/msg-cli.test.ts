@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { Command } from 'commander';
-import { MsgStore } from '../msg/msg-store.js';
+import { MsgStore, type Message } from '../msg/msg-store.js';
 import { startMsgSseServer } from '../msg/msg-sse-server.js';
-import { registerMsgCommands, type MsgCliDeps } from './msg-cli.js';
+import { formatMessage, registerMsgCommands, type MsgCliDeps } from './msg-cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -30,6 +30,9 @@ function fixture(stdin = '', overrides: (context: { path: string }) => Partial<M
     readStdin: async () => stdin,
     sleep: async () => { sleeps++; signal.abort(); }, signal: signal.signal,
     setExitCode: code => exits.push(code),
+    // Real wake reads the pty manifest and seat folders; focused tests opt in through overrides.
+    registerLogSink: async () => undefined,
+    wake: async (address, msgId) => ({ wake: 'none', source: 'unresolved', address, msgId, result: 'skipped-test-universe' }),
     ...overrides({ path }),
   });
   return {
@@ -53,6 +56,84 @@ test('post reads piped stdin, accepts literal body and kind; human and JSON outp
   f.stdout.length = 0;
   await f.run('post', '--body', 'from flag', '--from', 'OP', '--to', 'MK', '--json');
   expect(JSON.parse(f.stdout[0]!).body).toBe('from flag');
+});
+
+test('post warns for recipients without a reply body and leaves loop aliases invalid', async () => {
+  const f = fixture();
+  for (const recipient of ['GUARDIAN', 'ORCHESTRATOR', 'STEWARD']) {
+    await f.run('post', 'request', '--from', 'UX', '--to', recipient, '--json');
+    expect(JSON.parse(f.stdout.at(-1)!).to).toBe(recipient);
+    expect(f.stderr.at(-1)).toContain('이 주소는 읽는 몸이 없다 — 지금은 OP');
+  }
+  const posted = f.stdout.length;
+  await f.run('post', 'request', '--from', 'UX', '--to', 'loop:orchestrator');
+  expect(f.stdout).toHaveLength(posted);
+  expect(f.stderr.at(-2)).toContain('지금 읽는 주소는 COORDINATOR');
+  expect(f.stderr.at(-1)).toContain('invalid seat ID');
+  expect(f.exits.at(-1)).toBe(2);
+  await f.run('post', 'request', '--from', 'UX', '--to', 'loop:ORCHESTRATOR');
+  expect(f.stderr.at(-2)).toContain('지금 읽는 주소는 COORDINATOR');
+  expect(f.stderr.at(-1)).toContain('invalid seat ID');
+  await f.run('post', 'request', '--from', 'UX', '--to', 'loop:guardian');
+  expect(f.stderr.at(-2)).toContain('GUARDIAN은 읽는 몸이 없다 — 지금은 OP');
+  expect(f.stderr.at(-1)).toContain('invalid seat ID');
+});
+
+test('post wakes the recipient after the durable save; a reply is passed through and a failed wake keeps rc 0', async () => {
+  const calls: Array<{ address: string; msgId: number; message: { from: string; kind?: string }; stored: number }> = [];
+  const f = fixture('', ({ path }) => ({
+    wake: async (address, msgId, message) => {
+      const ledger = new MsgStore(path);
+      try { calls.push({ address, msgId, message, stored: ledger.list(address, 0, 10).length }); }
+      finally { ledger.close(); }
+      throw new Error('wake exploded');
+    },
+  }));
+  const sync = fixture('', () => ({ wake: (() => { throw new Error('sync wake'); }) as unknown as MsgCliDeps['wake'],
+    registerLogSink: (() => { throw new Error('sync sink'); }) as unknown as MsgCliDeps['registerLogSink'] }));
+  await sync.run('post', 'still saved', '--from', 'OP', '--to', 'OPT', '--json');
+  expect(sync.exits).toEqual([]);
+  expect(JSON.parse(sync.stdout[0]!).id).toBe(1);
+  let woke = 0;
+  const hungSink = fixture('', () => ({ registerLogSink: () => new Promise(() => {}), wake: async (address, msgId) => {
+    woke++; return { wake: 'none', source: 'unresolved', address, msgId, result: 'no-wake' };
+  } }));
+  const started = Date.now();
+  await hungSink.run('post', 'sink hangs', '--from', 'OP', '--to', 'OPT');
+  expect(woke).toBe(1);
+  expect(Date.now() - started).toBeLessThan(5000);
+  await f.run('post', 'hello', '--from', 'OP', '--to', 'opt', '--json');
+  await f.run('post', 'answer', '--from', 'OPT', '--to', 'OP', '--kind', 'reply', '--json');
+  expect(calls).toEqual([
+    { address: 'OPT', msgId: 1, message: { from: 'OP' }, stored: 1 },
+    { address: 'OP', msgId: 2, message: { from: 'OPT', kind: 'reply' }, stored: 1 },
+  ]);
+  expect(f.exits).toEqual([]);
+  expect(f.stdout.map(line => JSON.parse(line).id)).toEqual([1, 2]);
+});
+
+test('post with the real wake warns once for an unresolved seat and stays quiet when no reply body was announced', async () => {
+  const f = fixture('', () => ({ wake: undefined, wakeDeps: { listPtys: () => [], readPane: () => null, live: false } }));
+  await f.run('post', 'hello', '--from', 'OP', '--to', 'UX');
+  expect(f.exits).toEqual([]);
+  expect(f.stderr).toEqual(['이 주소는 깨울 길이 없다 — 받는 몸이 스스로 읽을 때까지 쌓인다 (wake=none · 모름: no-pty-name-no-herdr-pane)']);
+  await f.run('post', 'hello', '--from', 'OP', '--to', 'GUARDIAN');
+  expect(f.stderr.at(-1)).toBe('이 주소는 읽는 몸이 없다 — 지금은 OP');
+  expect(f.stderr).toHaveLength(2);
+});
+
+test('route shows reply body and resolved wake for loop and seat addresses', async () => {
+  const f = fixture('', () => ({ wakeDeps: { listPtys: () => [{ id: 'tui:9', nickname: 'opt', alive: true }], readPane: () => null, hasOptIn: () => false } }));
+  await f.run('route', 'coordinator', '--json');
+  await f.run('route', 'opt', '--json');
+  await f.run('route', 'ux', '--json');
+  expect(f.stdout.map(line => JSON.parse(line))).toEqual([
+    { msgAddress: 'COORDINATOR', replyBody: 'rules', wake: 'cron', source: 'loop-table' },
+    { msgAddress: 'OPT', replyBody: 'agent', wake: 'pty-inject', target: 'tui:9', source: 'pty-name', optIn: false },
+    { msgAddress: 'UX', replyBody: 'agent', wake: 'none', source: 'unresolved', reason: 'no-pty-name-no-herdr-pane' },
+  ]);
+  await f.run('route', 'opt');
+  expect(f.stdout.at(-1)).toBe('OPT\treplyBody=agent\twake=pty-inject\ttarget=tui:9\toptIn=no(주입 0)\t(pty-name)');
 });
 
 test('post --origin-key deduplicates a channel mirror, accepts a loop address, and rejects a mismatched key', async () => {
@@ -510,4 +591,12 @@ test('bad seats, body, kind, cursor, limit and future ack exit 2 with one-line e
   const store = f.store();
   try { expect(store.unread()).toEqual([]); expect(store.getCursor('MK')).toBe(0); }
   finally { store.close(); }
+});
+
+test('human line puts a kind emoji right before the unchanged [kind] text; unknown or missing kind stays as before', () => {
+  const base: Message = { id: 7, createdAt: '2026-10-15T00:00:00.000Z', from: 'OP', to: 'MK', body: 'hi' };
+  expect(formatMessage({ ...base, kind: 'coord' })).toBe('#7 2026-10-15T00:00:00.000Z OP → MK 🤝[coord]: hi');
+  expect(formatMessage({ ...base, kind: 'memo' })).toBe('#7 2026-10-15T00:00:00.000Z OP → MK [memo]: hi');
+  expect(formatMessage({ ...base, kind: 'toString' })).toBe('#7 2026-10-15T00:00:00.000Z OP → MK [toString]: hi');
+  expect(formatMessage(base)).toBe('#7 2026-10-15T00:00:00.000Z OP → MK: hi');
 });

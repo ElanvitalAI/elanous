@@ -123,3 +123,25 @@ test('real Bun JUnit runner records process RSS, duration, and selected files on
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+test('a Bun exit 2 before JUnit preserves only bounded, redacted output', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'elanous-shard-exit-test-'));
+  try {
+    mkdirSync(join(cwd, 'test'));
+    writeFileSync(join(cwd, 'test/early.test.ts'), [
+      "console.log('phase=bootstrap ' + 'x'.repeat(800));",
+      "console.error('stderr preamble ' + 'y'.repeat(400) + ' API_KEY=supersecretvalue12345 crash before test');",
+      'process.exit(2);',
+    ].join('\n'));
+    const result = runBunShard(cwd, ['test/early.test.ts']);
+    expect(result.exitCode).toBe(2);
+    expect(result.junit).toBeUndefined();
+    expect(result.diagnostic).toContain('phase=bootstrap');
+    expect(result.diagnostic).toContain('API_KEY=***');
+    expect(result.diagnostic).toContain('crash before test');
+    expect(result.diagnostic).not.toContain('supersecretvalue12345');
+    expect(result.diagnostic!.length).toBeLessThan(510);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});

@@ -16,6 +16,7 @@ import {
   _setSelfImplementFabricDecomposeConfigReaderForTesting,
   _setSelfImplementSeamsFactoryForTesting,
   _setSelfImplementCliCommandForTesting,
+  _setSelfImplementNonBlockingLedgerDirForTesting,
   _setSelfImplementOrchestrateCliCommandForTesting,
   _setSelfImplementOrchestrateForTesting,
   buildSelfImplementSpec,
@@ -30,6 +31,7 @@ import type { DefaultSeamsOptions } from './seams.js';
 import { runSelfImplementCliCommand, type SelfImplementCliOpts, type SingleRunSuperviseOptions } from './self-implement-cli.js';
 import { runSelfImplement as runProductionSelfImplement } from './orchestrator.js';
 import { buildSelfImplementDevSpec, planDevPipeline } from '../self-dev/dev-pipeline.js';
+import { loadRunLedger, readNonBlockingRunRecord } from './run-ledger.js';
 import { buildSelfImplementDaemonSpec, dispatchSelfImplement } from '../boot/daemon-tools/self-implement.js';
 import { getUserConfig } from '../user-config.js';
 import type { ToolRuntimeContext } from '../tool-runtime/types.js';
@@ -1977,5 +1979,67 @@ describe('selfImplementRuntime — opt-in non-blocking return', () => {
       await waitUntil(writer.completed, 5000).catch(() => undefined);
       writer.restore();
     }
+  });
+
+  test('비블로킹 발사 전 실패는 원장에 pending 과 failed 결과를 같은 requestId 로 남긴다', async () => {
+    const ledgerDirectory = mkdtempSync(join(tmpdir(), 'runtime-nonblocking-failure-ledger-'));
+    _setSelfImplementNonBlockingLedgerDirForTesting(ledgerDirectory);
+    _setSelfImplementCliCommandForTesting(async () => { throw new Error('runner unavailable'); });
+    try {
+      const pending = await selfImplementRuntime.run({ feature: '원장 발사 전 실패', non_blocking: true }, ctx);
+      const requestId = pending.requestId;
+      if (requestId === undefined) throw new Error('expected a pending requestId');
+      await waitUntil(() => {
+        const ledger = loadRunLedger(requestId, ledgerDirectory);
+        return ledger !== null && ledger.some((entry) => entry.event === 'non-blocking-result');
+      });
+      const ledger = loadRunLedger(requestId, ledgerDirectory)!;
+      expect(ledger.map((entry) => entry.event)).toEqual(['non-blocking-pending', 'non-blocking-result']);
+      const failureRecord = readNonBlockingRunRecord(ledger);
+      expect(failureRecord).toMatchObject({
+        requestId,
+        kind: 'failed',
+        reason: 'runner unavailable',
+      });
+      // reject 경로엔 런이 산출한 next가 없다 — 원장에는 생략해 unknown 보존(지어낸 기본 문구 금지).
+      expect(failureRecord).not.toHaveProperty('next');
+    } finally {
+      _setSelfImplementNonBlockingLedgerDirForTesting(null);
+      rmSync(ledgerDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test('비블로킹 완료도 원장에 결과를 남기고 같은 requestId 로 재조회된다', async () => {
+    const ledgerDirectory = mkdtempSync(join(tmpdir(), 'runtime-nonblocking-completed-ledger-'));
+    _setSelfImplementNonBlockingLedgerDirForTesting(ledgerDirectory);
+    _setSelfImplementCliCommandForTesting(async (_feature, opts) => ({
+      ok: true, kind: 'self', exitCode: 0,
+      result: { ok: true, stage: 'pr-opened', runId: opts.runId, node: 'open-pr' },
+    } as never));
+    try {
+      const pending = await selfImplementRuntime.run({ feature: '원장 완료 기록', non_blocking: true }, ctx);
+      const requestId = pending.requestId;
+      if (requestId === undefined) throw new Error('expected a pending requestId');
+      await waitUntil(() => {
+        const ledger = loadRunLedger(requestId, ledgerDirectory);
+        return ledger !== null && ledger.some((entry) => entry.event === 'non-blocking-result');
+      });
+      const ledger = loadRunLedger(requestId, ledgerDirectory)!;
+      expect(ledger.map((entry) => entry.event)).toEqual(['non-blocking-pending', 'non-blocking-result']);
+      expect(readNonBlockingRunRecord(ledger)).toMatchObject({
+        requestId,
+        kind: 'launched',
+        next: `eln self run ${pending.requestId}`,
+      });
+    } finally {
+      _setSelfImplementNonBlockingLedgerDirForTesting(null);
+      rmSync(ledgerDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test('이 골이 더한 원장 기록 배선을 지우면 위 검사가 그 결손을 잡는다', () => {
+    const source = readFileSync(new URL('./self-implement-runtime.ts', import.meta.url), 'utf8');
+    expect(source).toContain('recordNonBlockingRunPending(requestId, ledgerDirOptions)');
+    expect(source).toContain('recordNonBlockingRunResult(requestId, {');
   });
 });

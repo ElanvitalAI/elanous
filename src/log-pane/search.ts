@@ -10,6 +10,8 @@ import { stripAnsi } from '../tui.js';
 export interface LogSearchResult {
   /** Absolute chatLines index where the match was found. */
   readonly lineIdx: number;
+  /** Physical row inside that entry where its first match begins. */
+  readonly physicalRowInEntry?: number;
   /** Stripped-ANSI context window around the match (~80 cols). Leading
    *  `…` when we trimmed the start; trailing `…` when we trimmed the
    *  end, so users see exactly what section of the line matched. */
@@ -26,25 +28,48 @@ export interface LogSearchResult {
  *  same line are folded into the first occurrence (power users can
  *  refine the query if they need multi-per-line hits). */
 export function findLogMatches(lines: readonly string[], query: string): LogSearchResult[] {
+  return scanLogMatches(lines, query, '');
+}
+
+export function findVisibleLogMatches(lines: readonly string[], query: string, filterQuery: string): LogSearchResult[] {
+  return scanLogMatches(lines, query, filterQuery);
+}
+
+function scanLogMatches(lines: readonly string[], query: string, filterQuery: string): LogSearchResult[] {
   const q = query.trim();
   if (!q) return [];
   const qLower = q.toLowerCase();
+  const filter = filterQuery.trim().toLowerCase();
   const results: LogSearchResult[] = [];
   for (let i = 0; i < lines.length; i++) {
     const stripped = stripAnsi(lines[i] ?? '');
-    const idx = stripped.toLowerCase().indexOf(qLower);
+    let source = '';
+    let idx = -1;
+    let physicalRowInEntry = 0;
+    const rows = stripped.split(/\r\n|\r|\n/);
+    for (let row = 0; row < rows.length; row++) {
+      const candidate = rows[row]!;
+      if (filter && !candidate.toLowerCase().includes(filter)) continue;
+      const match = candidate.toLowerCase().indexOf(qLower);
+      if (match < 0) continue;
+      source = candidate;
+      idx = match;
+      physicalRowInEntry = row;
+      break;
+    }
     if (idx < 0) continue;
     const ctxLead = 20;  // chars before the match in the preview
     const ctxTail = 60;  // chars after the match end in the preview
     const srcStart = Math.max(0, idx - ctxLead);
-    const srcEnd = Math.min(stripped.length, idx + q.length + ctxTail);
+    const srcEnd = Math.min(source.length, idx + q.length + ctxTail);
     const trimmedLeft = srcStart > 0;
-    const trimmedRight = srcEnd < stripped.length;
-    const slice = stripped.slice(srcStart, srcEnd);
+    const trimmedRight = srcEnd < source.length;
+    const slice = source.slice(srcStart, srcEnd);
     const preview = (trimmedLeft ? '…' : '') + slice + (trimmedRight ? '…' : '');
     const offsetInPreview = (trimmedLeft ? 1 : 0) + (idx - srcStart);
     results.push({
       lineIdx: i,
+      physicalRowInEntry,
       preview,
       matchStart: offsetInPreview,
       matchEnd: offsetInPreview + q.length,

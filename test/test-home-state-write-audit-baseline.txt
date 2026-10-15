@@ -7,6 +7,7 @@ src/acp/grok-auth-probe.test.ts
 src/agent-mission/control-frame.test.ts
 src/agent-substrate/execution/memory-context.test.ts
 src/agent-substrate/self-review-cli.test.ts
+src/agent/monad-agent-turn.test.ts
 src/agent/path-policy.test.ts
 src/agent/shared-app-tools.test.ts
 src/autopilot/build/config-isolation.test.ts

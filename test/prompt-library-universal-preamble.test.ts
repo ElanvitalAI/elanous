@@ -20,6 +20,7 @@ import {
   loadProjectTreeWithMeta,
   resetUniversalPreambleCache,
   setProjectAnchorReadObserverForTest,
+  setGlobalAnchorPathForTest,
 } from '../src/prompt-library/universal-preamble.js';
 import { mkdirSync } from 'node:fs';
 
@@ -55,6 +56,7 @@ function assertProjectAnchorCandidatesFitBudget(root: string): void {
 }
 
 beforeEach(() => {
+  setGlobalAnchorPathForTest(null); // 실제 ~/.elanous/AGENTS.md 가 있는 기계에서도 파일 목록 단언이 서게
   delete process.env.ELANOUS_HARNESS_SPACE;
   delete process.env.ELANOUS_HARNESS_SPACE_ID;
   delete process.env.ELANOUS_RUN_ID;
@@ -63,6 +65,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setGlobalAnchorPathForTest(undefined);
   rmSync(tmp, { recursive: true, force: true });
   resetUniversalPreambleCache();
   if (harnessEnv.space === undefined) delete process.env.ELANOUS_HARNESS_SPACE;
@@ -152,7 +155,9 @@ describe('buildUniversalPreamble + loadProjectAnchor', () => {
     const result = loadProjectAnchor(root);
     const agents = result.files.find(({ filename, relDir }) => filename === 'AGENTS.md' && relDir === '');
     expect(agents).toEqual(expect.objectContaining({ truncated: false, chars: raw.length }));
-    expect(result.totalChars).toBe(
+    // 자리 트리(seats/*)엔 git 제외 로컬 지시가 있을 수 있다 — 따로 예산이라 공용 합만 잰다.
+    const localChars = result.files.filter(f => f.local).reduce((sum, f) => sum + f.chars, 0);
+    expect(result.totalChars - localChars).toBe(
       PROJECT_ANCHOR_CANDIDATES.reduce((total, { filename }) =>
         total + readFileSync(join(root, filename), 'utf8').length, 0),
     );
@@ -165,11 +170,12 @@ describe('buildUniversalPreamble + loadProjectAnchor', () => {
 
     const result = loadProjectAnchor(root);
 
-    expect(result.files).toEqual([
+    expect(result.files.filter(f => !f.local)).toEqual([
       expect.objectContaining({ filename: 'AGENTS.md', relDir: '', truncated: false, chars: agentsRaw.length }),
       expect.objectContaining({ filename: 'DESIGN.md', relDir: '', truncated: false, chars: designRaw.length }),
     ]);
-    expect(result.totalChars).toBe(agentsRaw.length + designRaw.length);
+    const localChars = result.files.filter(f => f.local).reduce((sum, f) => sum + f.chars, 0);
+    expect(result.totalChars - localChars).toBe(agentsRaw.length + designRaw.length);
     expect(result.content).toContain(
       `=== Project design craft rulebooks (DESIGN.md) ===\n${designRaw}\n=== end DESIGN.md ===`,
     );
@@ -469,6 +475,15 @@ describe('buildUniversalPreamble — codex-family addendum (fix L-1) + lifecycle
     expect(lifecycle).toContain('edit');
     expect(lifecycle).toContain('verify');
     expect(lifecycle).toContain('exec');
+  });
+
+  test('lifecycle no longer asks the model to announce its pipeline (10-14 report: «○○ 파이프라인으로 하겠습니다»)', () => {
+    const lifecycle = buildUniversalPreamble({ cwd: tmp })[1]!.content as string;
+    expect(lifecycle).not.toContain('opening sentence');
+    expect(lifecycle).not.toContain('State the pipeline');
+    expect(lifecycle).not.toContain('State it ONCE');
+    expect(lifecycle).toContain('Do not tell the user which pipeline you chose');
+    expect(lifecycle).toContain('never name it');
   });
 });
 

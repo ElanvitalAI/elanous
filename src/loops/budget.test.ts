@@ -83,6 +83,48 @@ test('observation retains a pending MK cell with zero running even when launch a
   expect(observed).toMatchObject({ running: 0, idle: false, nextCell: input.openCells[0] });
 });
 
+describe('calculateSeatBaseShares minShare (CAP-DYN seat minimum)', () => {
+  const yellow = (owner: string) => ({ id: owner, title: owner, owner, status: 'yellow' as const });
+
+  test('minShare 2 with weights TC 20 / MK 1 over 10 slots gives MK at least 2 and sums to 10', () => {
+    const currentRound = Array.from({ length: 10 }, () => yellow('TC'));
+    const result = calculateSeatBaseShares({ totalSlots: 10, currentRound, nextRound: [yellow('MK')],
+      seatCaps: { OP: 4, TC: 10, MK: 6, UX: 6 }, minShare: 2 });
+    expect(result.MK).toBeGreaterThanOrEqual(2);
+    expect(result.OP + result.TC + result.MK + result.UX).toBe(10);
+    expect(result).toEqual({ OP: 0, TC: 8, MK: 2, UX: 0 });
+  });
+
+  test('omitting minShare keeps the weighted-only result unchanged', () => {
+    const args = { totalSlots: 8, currentRound: [yellow('MK'), yellow('TC')], nextRound: [yellow('OP')],
+      seatCaps: { OP: 2, TC: 4, MK: 6, UX: 2 } };
+    expect(calculateSeatBaseShares(args)).toEqual({ OP: 2, TC: 3, MK: 3, UX: 0 });
+    expect(calculateSeatBaseShares({ ...args, minShare: 0 })).toEqual(calculateSeatBaseShares(args));
+  });
+
+  test('minimums exceeding totalSlots fill largest-weight seats first and never exceed the pool', () => {
+    const result = calculateSeatBaseShares({ totalSlots: 4,
+      currentRound: [yellow('TC'), yellow('TC'), yellow('MK'), yellow('OP')], nextRound: [yellow('MK')],
+      seatCaps: { OP: 4, TC: 8, MK: 6, UX: 4 }, minShare: 2 });
+    expect(result).toEqual({ OP: 0, TC: 2, MK: 2, UX: 0 });
+    expect(result.OP + result.TC + result.MK + result.UX).toBe(4);
+  });
+
+  test('a seat without yellow cells never receives a minimum', () => {
+    const result = calculateSeatBaseShares({ totalSlots: 10, currentRound: [yellow('TC')], nextRound: [],
+      seatCaps: { OP: 4, TC: 10, MK: 6, UX: 6 }, minShare: 2 });
+    expect(result).toEqual({ OP: 0, TC: 10, MK: 0, UX: 0 });
+  });
+
+  test('a floor is clipped by the seat cap and invalid minShare fails closed', () => {
+    const args = { totalSlots: 12, currentRound: [yellow('TC'), yellow('TC'), yellow('MK')], nextRound: [],
+      seatCaps: { OP: 4, TC: 10, MK: 2, UX: 4 } };
+    expect(calculateSeatBaseShares({ ...args, minShare: 5 })).toEqual({ OP: 0, TC: 10, MK: 2, UX: 0 });
+    expect(() => calculateSeatBaseShares({ ...args, minShare: -1 })).toThrow(RangeError);
+    expect(() => calculateSeatBaseShares({ ...args, minShare: 1.5 })).toThrow(RangeError);
+  });
+});
+
 describe('seatCapExclusion (SEAT-CAP-STALE)', () => {
   const now = Date.parse('2026-10-06T22:00:00Z');
   const min = 60_000;

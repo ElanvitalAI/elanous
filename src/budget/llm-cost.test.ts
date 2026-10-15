@@ -478,6 +478,7 @@ describe('Bedrock non-Anthropic classification (BEDROCK-COST-LEDGER 0.2.26)', ()
 
 // BACKLOG C7 — provider 보고 청구액이 있으면 그것이 비용(추정은 곁에).
 import { llmUsageCostFields as fieldsC7 } from './llm-cost.js';
+import { _resetCodexBillingDecisionForTesting } from '../oauth/codex-billing-route.js';
 describe('actual cost (BACKLOG C7)', () => {
   it('reported cost wins over the catalog estimate for api billing; subscription stays included', () => {
     const api = fieldsC7('gpt-6-sol', { inputTokens: 1_000_000, outputTokens: 0, reportedCostUsd: 1.23 } as never, { configPricing: {} }, 'api');
@@ -620,6 +621,8 @@ describe('Codex credit billing (METER-CODEX-CREDIT-ACTUAL)', () => {
   });
 
   it('does not label a production usage row as credit without a verified payment route', () => {
+    // CREDIT-BILLING-LABEL — 회전 판정이 남긴 크레딧 경로(다른 시험 파일의 잔여)가 없을 때의 기본값을 잰다.
+    _resetCodexBillingDecisionForTesting();
     const spy = spyOn(debug, 'log');
     try {
       logAgentTurnUsage('gpt-5.6-terra', {

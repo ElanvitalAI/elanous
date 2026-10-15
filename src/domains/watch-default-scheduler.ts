@@ -50,8 +50,13 @@ export function startWatchDefaultScheduler(opts: WatchDefaultSchedulerOpts = {})
     running = true;
     try {
       const active = enabled() && listSources({ seat: 'user' }, root).length > 0;
-      const registryDay = now().toISOString().slice(0, 10);
-      const inventoryKey = `${registryDay}:${active}`;
+      const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+      }).formatToParts(now());
+      const part = (type: string) => parts.find((entry) => entry.type === type)?.value ?? '';
+      const day = `${part('year')}-${part('month')}-${part('day')}`;
+      const clock = `${part('hour')}:${part('minute')}`;
+      const inventoryKey = `${day}:${active}`;
       if (lastInventory !== inventoryKey) {
         // The registry row is a view; a registry failure must not skip the real collect/brief of this minute.
         try {
@@ -62,14 +67,8 @@ export function startWatchDefaultScheduler(opts: WatchDefaultSchedulerOpts = {})
       }
       lastFailure = undefined;
       if (!active) return;
-      const parts = new Intl.DateTimeFormat('en-CA', {
-        timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-      }).formatToParts(now());
-      const part = (type: string) => parts.find((entry) => entry.type === type)?.value ?? '';
-      const day = `${part('year')}-${part('month')}-${part('day')}`;
-      const clock = `${part('hour')}:${part('minute')}`;
       for (const [job, at, fire] of [['watch-collect', '07:00', collect], ['watch-brief', '08:30', brief]] as const) {
-        if (clock !== at || lastRun.get(job) === day) continue;
+        if (clock < at || lastRun.get(job) === day) continue;
         try {
           const outcome = await fire();
           if (job === 'watch-brief' && (!outcome || (outcome as { sent?: boolean }).sent !== true)) continue;

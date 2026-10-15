@@ -44,6 +44,23 @@ describe('PreviewTerminal useRegistry (P0b-2 · 공유 버스 흡수)', () => {
     pt.stop();
   });
 
+  test('TUI shell identity, purpose, and origin reach the shared PTY spawn', () => {
+    const s = stub();
+    const pt = new PreviewTerminal({
+      cols: 80, rows: 24, cwd: '/repo/seat', env: {}, useRegistry: true,
+      registryKind: 'shell', registryNickname: 'tui-shell:seat',
+      registryPurpose: 'tui-shell:UX', registrySeat: 'UX',
+      registryOrigin: { originRoot: 'elanous-internal', controller: 'tui-shell' },
+    }, undefined, s.deps);
+    pt.start();
+    expect(s.getStartOpts()).toMatchObject({
+      kind: 'shell', nickname: 'tui-shell:seat', purpose: 'tui-shell:UX', seat: 'UX',
+      origin: { originRoot: 'elanous-internal', controller: 'tui-shell' },
+      workdir: '/repo/seat', accessMode: 'write',
+    });
+    pt.stop();
+  });
+
   test('onPtyEvent output → 매칭 id 만 에뮬레이터/raw 탭에 도달', () => {
     const s = stub();
     const raw: string[] = [];

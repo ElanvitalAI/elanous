@@ -331,6 +331,43 @@ describe('overview cache — 10 s snapshot and 60 s background Pod measurement',
 });
 
 describe('collectOverview — 주입 원천으로 끝까지', () => {
+  test('collectOverview fills throughput from task-agent ledger cards', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ovw-root-'));
+    const seat = mkdtempSync(join(tmpdir(), 'ovw-seat-'));
+    const now = Date.parse(AT);
+    const cards = [
+      { id: 'launched-pr', text: '', status: 'launched', createdAt: AT, pr: 42, landAttempts: [
+        { pr: 42, head: 'a', at: AT, ok: true, detail: 'merged' },
+      ] },
+      { id: 'launched-no-pr', text: '', status: 'launched', createdAt: AT, landAttempts: [
+        { pr: 43, head: 'b', at: AT, ok: false, reason: 'conflict' },
+      ] },
+      { id: 'old-launch', text: '', status: 'launched', createdAt: '2026-10-07T14:59:59.999Z', pr: 44 },
+      { id: 'not-launched', text: '', status: 'failed', createdAt: AT, pr: 45 },
+    ] as TaskCard[];
+    const deps = {
+      listSchedules: () => [{ version: '0.2.21', cutAt: '2026-10-08T09:00:00Z', landBy: null, updatedAt: AT, updatedBy: 't' }],
+      listChecklist: () => ({ version: '0.2.21', released: '', dev: '', history: [], items: [] }),
+      readRuns: () => [], readCards: () => cards, ledger: () => [], poolSpec: () => null, ps: () => '',
+      gitLog: () => ({ lines: [], observedAt: AT }),
+    };
+    const snapshot = await collectOverview({ sinceMs: 3_600_000, sinceLabel: '최근 1h', now, root, seatEraDir: seat }, deps);
+    expect(snapshot.throughput).toMatchObject({
+      status: 'ok', source: 'task-agent ledger(오늘 KST · landAttempts)', observedAt: AT,
+      value: {
+        launched: 2, cardPrs: 1, taskAgentLandings: null,
+        failureReasons: { conflict: 1 }, pendingLandings: null, oldestPendingAgeSeconds: null,
+      },
+    });
+
+    const failed = await collectOverview({ sinceMs: 3_600_000, sinceLabel: '최근 1h', now, root, seatEraDir: seat }, {
+      ...deps, readCards: () => { throw new Error('cards unavailable'); },
+    });
+    expect(failed.throughput).toMatchObject({
+      status: 'unmeasured', value: null, source: 'task-agent ledger', reason: 'cards unavailable',
+    });
+  });
+
   test('원천이 비거나 실패하면 그 칸만 못 잼', async () => {
     const root = mkdtempSync(join(tmpdir(), 'ovw-root-'));
     const seat = mkdtempSync(join(tmpdir(), 'ovw-seat-'));

@@ -422,6 +422,8 @@ describe('tool-loop followup phase rejection', () => {
         args: { file_path: 'AGENTS.md' },
         expectedDispatches: 0,
         stub: 'ANCHOR READ BLOCKED',
+        // #27630: only an anchor actually loaded (fenced) in the prompt blocks Read.
+        system: '=== Root guide (AGENTS.md) ===\ncomplete\n=== end AGENTS.md ===',
       },
     ] as const;
 
@@ -438,7 +440,10 @@ describe('tool-loop followup phase rejection', () => {
       let dispatched = 0;
 
       const result = await streamLLMWithTools(
-        [{ role: 'user', content: 'exercise blocked-stub repeat tracking' }],
+        [
+          ...('system' in scenario ? [{ role: 'system' as const, content: scenario.system }] : []),
+          { role: 'user', content: 'exercise blocked-stub repeat tracking' },
+        ],
         {
           onText() {},
           dispatchTool: async () => {

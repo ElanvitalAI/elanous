@@ -4,7 +4,7 @@ import { debug } from '../debug/log.js';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execHarnessClean, listDirectoryEntries, planHarnessClean, type GitRunner, type GhRunner } from './harness-clean.js';
-import { discoverHarnessGcRepos, runHarnessGcTick } from './harness-gc.js';
+import { discoverHarnessGcRepos, formatHarnessGcOutput, runHarnessGcTick } from './harness-gc.js';
 import { listLoops, setLoopEnabled } from '../loops/registry.js';
 import { getUserConfig } from '../user-config.js';
 
@@ -42,6 +42,31 @@ function fixture(count: number, onDelete?: () => void, commonDir = '/x/repo.git'
 }
 
 function temp() { return mkdtempSync(join(tmpdir(), 'harness-gc-')); }
+
+it('human GC report shows orphan scan and HQ recovery counts while JSON remains unchanged', () => {
+  const result = {
+    outcome: 'ok' as const, repos: 3, removed: 2, preserved: 3, deferred: 4, failed: 5,
+    unseenOutsideWindow: 6, unseenOutsidePrefix: 7, undiscoverable: 0, orphanScanUnavailable: 1,
+    budgetMs: 240_000, elapsedMs: 12, budgetExhausted: true,
+    repositories: [
+      { gitDir: '/repo.git', offset: 0, window: 10, total: 20, removed: 2, preserved: 3,
+        deferred: 4, failed: 5, preservedByReason: {}, orphanScan: 'unavailable' as const },
+      { gitDir: '/scanned.git', offset: 0, window: 10, total: 0, removed: 0, preserved: 0,
+        deferred: 0, failed: 0, preservedByReason: {}, orphanScan: 'scanned' as const },
+      { gitDir: '/not-requested.git', offset: 0, window: 10, total: 0, removed: 0, preserved: 0,
+        deferred: 0, failed: 0, preservedByReason: {}, orphanScan: 'not-requested' as const },
+    ],
+  };
+  const human = formatHarnessGcOutput(result, { human: true, json: false });
+  expect(human).toContain('orphanScan=unavailable');
+  expect(human).toContain('orphanScan=scanned');
+  expect(human).toContain('orphanScan=not-requested');
+  expect(human).toContain('removed=2 preserved=3 deferred=4 failed=5');
+  expect(human).toContain('unseenOutsideWindow=6 unseenOutsidePrefix=7');
+  expect(human).toContain('budgetMs=240000 elapsedMs=12 budgetExhausted=true');
+  expect(formatHarnessGcOutput(result, { human: false, json: false })).toBe(JSON.stringify(result));
+  expect(formatHarnessGcOutput(result, { human: true, json: true })).toBe(JSON.stringify(result));
+});
 
 it('bare common git dir isolates unavailable orphan scan without blocking a merged branch', () => {
   const f = fixture(1);

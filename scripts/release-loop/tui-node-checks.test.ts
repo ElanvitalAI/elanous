@@ -1,12 +1,30 @@
 import { describe, expect, test } from 'bun:test';
 import type { spawnSync } from 'node:child_process';
 import { measureTuiRegress, tuiNodeOutput } from './tui-sim-node';
-import { parseTuiRegress, regressWarning, reusableTui, tuiChecks, tuiVerdict } from './tui-node-checks';
+import { executeTuiNodeCheck, parseTuiRegress, regressWarning, reusableTui, tuiChecks, tuiVerdict } from './tui-node-checks';
 
 const first = `─┤ ChatLog ├──\n❯ /command, or type a question\n 📁 elan/monad-agent  │ ⌥ main │ some-model │ ctx 0 │ 🖥 mbp`;
 const help = `┌── Dashboard help ──\n│Commands\n│/help  Show help overlay\n${first}`;
 
 describe('release-loop TUI node checks', () => {
+  test('executable check invokes screen node and rejects help text without captured screens', async () => {
+    const commit = 'a'.repeat(40);
+    const calls: string[][] = [];
+    const command = async (_cmd: string, args: string[], _cwd: string) => {
+      calls.push(args);
+      return { rc: 0, output: 'Usage: --help Dashboard help Commands ❯ ctx 0' };
+    };
+    expect(await executeTuiNodeCheck(commit, '/repo', command)).toMatchObject({ outcome: 'unmeasured' });
+    expect(calls).toEqual([['scripts/release-loop/tui-sim-node.ts', '--commit', commit, '--json']]);
+    const checks = tuiChecks({ readyMs: 9000, first, help, afterEsc: first });
+    expect(await executeTuiNodeCheck(commit, '/repo', async () => ({ rc: 0, output: JSON.stringify({ commit, verdict: 'pass', attempts: 1, checks, regress: { unmeasured: 'no regress' } }) }))).toMatchObject({ outcome: 'ok' });
+    expect(await executeTuiNodeCheck(commit, '/repo', async () => ({ rc: 0, output: JSON.stringify({ commit, verdict: 'pass', attempts: 1, checks: checks.map((check) => ({ id: check.id, pass: true })) }) }))).toMatchObject({ outcome: 'unmeasured' });
+    const broken = tuiChecks({ readyMs: 9000, first, help, afterEsc: help });
+    expect(await executeTuiNodeCheck(commit, '/repo', async () => ({ rc: 1, output: JSON.stringify({ commit, verdict: 'fail', attempts: 2, checks: broken }) }))).toMatchObject({ outcome: 'fail', detail: expect.stringContaining('help-closes') });
+    expect(await executeTuiNodeCheck(commit, '/repo', async () => ({ rc: 1, output: '{}' }))).toMatchObject({ outcome: 'unmeasured' });
+    expect(await executeTuiNodeCheck(commit, '/repo', async () => ({ rc: 1, output: JSON.stringify({ commit: 'other', verdict: 'fail', attempts: 2, checks: broken }) }))).toMatchObject({ outcome: 'unmeasured' });
+    expect(await executeTuiNodeCheck(commit, '/repo', async () => ({ rc: 1, output: JSON.stringify({ commit, verdict: 'fail', attempts: 2, checks: broken.slice(1) }) }))).toMatchObject({ outcome: 'unmeasured' });
+  });
   test('a healthy session passes every check', () => {
     const checks = tuiChecks({ readyMs: 9000, first, help, afterEsc: first });
     expect(checks.filter((c) => !c.pass)).toEqual([]);

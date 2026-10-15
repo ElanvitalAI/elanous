@@ -10,7 +10,8 @@ import { effectiveInstanceRoot } from '../instance/resolve.js';
 import type { Checklist, ChecklistItem } from '../release-loop/checklist.js';
 import type { ReleaseSchedule } from '../release-loop/release-schedule.js';
 import type { ResourceView } from '../control-plane/ledger.js';
-import type { TaskCard } from '../task-agent/task-hand.js';
+import { cardPrNumber, type TaskCard } from '../task-agent/task-hand.js';
+import { measureLandingThroughput, type LandingThroughput } from '../task-agent/cover.js';
 import {
   okCell, unmeasured, type Cell, type CapacityInfo, type ChecklistCounts, type LaunchableInfo, type LoopRow, type MachineRow,
   type OverviewSnapshot, type OwnerTaskRow, type ParentsInfo, type PodMemberRow, type ReleaseRunInfo, type ScheduleInfo,
@@ -269,6 +270,22 @@ export async function collectOverview(opts: CollectOptions, injected: CollectDep
   const byOwner: Cell<Record<string, OwnerTaskRow>> = cards instanceof Error
     ? unmeasured('task-agent ledger', errText(cards))
     : okCell(ownerRows(cards, kstMidnight, opts.owner), `task-agent ledger(오늘 KST · owner=seat 키)`, iso(now));
+  const launchedCards = cards instanceof Error ? [] : cards.filter((card) => card.createdAt >= kstMidnight && card.status === 'launched');
+  const throughput = cards instanceof Error
+    ? unmeasured<LandingThroughput>('task-agent ledger', errText(cards))
+    : okCell(measureLandingThroughput({
+      launched: launchedCards.length,
+      cardPrs: launchedCards.filter((card) => cardPrNumber(card) !== undefined).length,
+      taskAgentActions: launchedCards.flatMap((card) => (card.landAttempts ?? [])
+        .filter((attempt) => attempt.at >= kstMidnight)
+        .map((attempt) => ({
+          kind: 'land' as const,
+          result: attempt.ok === true ? 'done' : attempt.ok === false ? 'failed' : 'pending',
+          reason: attempt.reason ?? attempt.detail,
+        }))),
+      allLands: null,
+      pendingLandingAgeSeconds: null,
+    }), 'task-agent ledger(오늘 KST · landAttempts)', iso(now));
   const done = unmeasured<number>('task-agent ledger', '착지 판정은 PR 조회가 필요 — owner 모델(OVW-OWNER)·card-evidence 연결 전');
 
   // 발사 가능 — 열린 판(앞으로의 컷) 전부.
@@ -334,7 +351,7 @@ export async function collectOverview(opts: CollectOptions, injected: CollectDep
       beat: okCell({ lastAt: b.lastAt, ageSeconds: b.ageSeconds, alive: b.alive }, `${SEAT_ERA_SOURCE} dispatcher-${b.seat}.pid`, b.lastAt) });
   }
 
-  return { generatedAt: iso(now), instanceRoot: root, since: opts.sinceLabel, release, tasks, machines, landings, loops };
+  return { generatedAt: iso(now), instanceRoot: root, since: opts.sinceLabel, release, tasks, machines, landings, throughput, loops };
 }
 
 export function parseSince(raw: string | undefined): { ms: number; label: string } {

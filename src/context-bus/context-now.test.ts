@@ -2,7 +2,8 @@ import { expect, test, setDefaultTimeout, setSystemTime } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { contextNow, type ContextNowDeps } from './context-now.js';
+import { Worker } from 'node:worker_threads';
+import { contextNow, contextNowInWorker, scanContextNowInWorker, seatStatusNow, type ContextNowDeps } from './context-now.js';
 import { renderTuiNow, renderVoiceNow } from './context-now-surfaces.js';
 import type { QueriedRunningRunsResult } from '../self-implement/running-runs.js';
 import { recordExternalEvent } from './external-events.js';
@@ -14,7 +15,7 @@ import { routeRequest } from '../nexus/api/http-server.js';
 import { createDevProxyRuntimeRef } from '../nexus/api/admin-dev-proxy.js';
 import { SELF_COGNITION_RUNTIMES } from '../tool-runtime/self-cognition-runtimes.js';
 import { buildCoreTools } from '../domains/core-tools.js';
-import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
+import { getElanousConfigDirOverride, setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
 import { openSchedulesDb } from '../domains/schedule-registry.js';
 import { localLoopRows } from '../dashboard/slash-runtime/loops-table.js';
 
@@ -24,6 +25,109 @@ setDefaultTimeout(30_000);
 
 const at = '2026-10-03T04:00:00.000Z';
 const noOperations: ContextNowDeps = { runningRuns: () => [], releaseRun: () => null, lateSchedules: () => null };
+
+test('TUI status reads seat facts without release or run sources', () => {
+  const root = mkdtempSync(join(tmpdir(), 'context-now-seat-status-'));
+  const now = new Date(at);
+  const previousOverride = getElanousConfigDirOverride();
+  setElanousConfigDir(root);
+  try {
+    const path = seatLedgerPath('TC', root, now);
+    mkdirSync(join(root, 'seat-loop', 'TC'), { recursive: true });
+    writeFileSync(path, JSON.stringify({ seat: 'TC', at, status: 'working', item: { source: 'checklist', id: 'P0', title: 'event loop' } }) + '\n');
+    expect(seatStatusNow(now)).toMatchObject({ facts: [{ kind: 'seat', seat: 'TC', id: 'P0' }], events: [], guide: [] });
+  } finally {
+    if (previousOverride) setElanousConfigDir(previousOverride);
+    else resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('context_now worker returns a source-labelled answer without blocking the caller loop', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'context-now-worker-'));
+  const previous = process.env.ELANOUS_STATE_DIR;
+  const previousOverride = getElanousConfigDirOverride();
+  process.env.ELANOUS_STATE_DIR = root;
+  setElanousConfigDir(root);
+  let heartbeat = 0;
+  const timer = setInterval(() => { heartbeat += 1; }, 5);
+  try {
+    const first = contextNowInWorker({ audience: 'public-demo', topic: 'worker-probe' });
+    expect(contextNowInWorker({ audience: 'public-demo', topic: 'worker-probe' })).toBe(first);
+    const answer = await first;
+    expect(heartbeat).toBeGreaterThan(0);
+    expect(answer).toMatchObject({ topic: 'worker-probe', facts: expect.any(Array), events: expect.any(Array) });
+  } finally {
+    clearInterval(timer);
+    if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previous;
+    if (previousOverride) setElanousConfigDir(previousOverride);
+    else resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('context_now worker preserves a config override distinct from the state stamp', async () => {
+  const stateRoot = mkdtempSync(join(tmpdir(), 'context-now-state-'));
+  const configRoot = mkdtempSync(join(tmpdir(), 'context-now-config-'));
+  const nextRoot = mkdtempSync(join(tmpdir(), 'context-now-next-'));
+  const previousState = process.env.ELANOUS_STATE_DIR;
+  const previousOverride = getElanousConfigDirOverride();
+  process.env.ELANOUS_STATE_DIR = stateRoot;
+  setElanousConfigDir(configRoot);
+  try {
+    const now = new Date();
+    const configPath = seatLedgerPath('TC', configRoot, now);
+    const statePath = seatLedgerPath('TC', stateRoot, now);
+    const nextPath = seatLedgerPath('TC', nextRoot, now);
+    mkdirSync(join(configRoot, 'seat-loop', 'TC'), { recursive: true });
+    mkdirSync(join(stateRoot, 'seat-loop', 'TC'), { recursive: true });
+    mkdirSync(join(nextRoot, 'seat-loop', 'TC'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'working',
+      item: { source: 'checklist', id: 'CONFIG-ROOT', title: 'config root' } }) + '\n');
+    writeFileSync(statePath, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'working',
+      item: { source: 'checklist', id: 'STATE-ROOT', title: 'state root' } }) + '\n');
+    writeFileSync(nextPath, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'working',
+      item: { source: 'checklist', id: 'NEXT-ROOT', title: 'next root' } }) + '\n');
+    const pending = contextNowInWorker({ topic: 'CONFIG-ROOT', audience: 'operator' });
+    setElanousConfigDir(nextRoot);
+    const answer = await pending;
+    expect(answer.facts).toContainEqual(expect.objectContaining({ kind: 'seat', id: 'CONFIG-ROOT' }));
+    expect(answer.facts).not.toContainEqual(expect.objectContaining({ kind: 'seat', id: 'STATE-ROOT' }));
+  } finally {
+    if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousState;
+    if (previousOverride) setElanousConfigDir(previousOverride);
+    else resetElanousConfigDir();
+    rmSync(stateRoot, { recursive: true, force: true });
+    rmSync(configRoot, { recursive: true, force: true });
+    rmSync(nextRoot, { recursive: true, force: true });
+  }
+});
+
+test('context_now worker rejects a successful exit without an answer', async () => {
+  await expect(scanContextNowInWorker({}, undefined, '/tmp/context-now-exit-probe',
+    () => new Worker('process.exit(0)', { eval: true })))
+    .rejects.toThrow('context_now worker exited before answering: 0');
+});
+
+test('context_now worker times out and releases a stalled scan', async () => {
+  await expect(scanContextNowInWorker({}, undefined, '/tmp/context-now-timeout-probe',
+    () => new Worker('setInterval(() => {}, 1000)', { eval: true }), 25))
+    .rejects.toThrow('context_now worker timed out after 25ms');
+});
+
+test('unrelated workers importing context-now do not register its message handler', async () => {
+  const worker = new Worker(new URL('./context-now.ts', import.meta.url));
+  let answered = false;
+  worker.on('message', () => { answered = true; });
+  worker.postMessage({ options: {}, selectedRoot: '/tmp/not-a-context-worker' });
+  await new Promise<void>((resolve, reject) => {
+    worker.once('error', reject);
+    worker.once('exit', () => resolve());
+  });
+  expect(answered).toBe(false);
+});
 
 function ledgerRunAnswer(start: Record<string, unknown> | null) {
   const root = mkdtempSync(join(tmpdir(), 'context-run-ledger-'));

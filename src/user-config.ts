@@ -1659,6 +1659,10 @@ export interface DashboardConfig {
    *  Defaults off so optional pane/window controls do not occupy keys
    *  required by essential input, reading, and escape controls. */
   enableSupplementalGlobalKeys: boolean;
+  /** First-screen boot banner. Absent = `minimal`: only failures and first-run
+   *  guidance reach the transcript; healthy daemon/PWA/hitl-port rows move to
+   *  `/status`. `full` restores the historical band. */
+  bootBanner?: 'minimal' | 'full';
 }
 
 export interface DashboardPromptBankConfig {
@@ -3337,7 +3341,8 @@ export interface AutoReviewConfig {
   };
 }
 
-export type ModelRole = 'implement' | 'review' | 'research' | 'planning' | 'audit' | 'classify' | 'graph-grow';
+export type ModelRole = 'implement' | 'review' | 'research' | 'planning' | 'audit' | 'classify' | 'graph-grow' | 'coordinator' | 'guardian';
+export type AgentModelRole = 'coordinator' | 'guardian';
 
 export interface RoleModelConfig {
   implement?: string;
@@ -3347,6 +3352,8 @@ export interface RoleModelConfig {
   audit?: string;
   classify?: string;
   'graph-grow'?: string;
+  coordinator?: string;
+  guardian?: string;
 }
 
 /** Sparse provider-agnostic model tier preferences by execution role. */
@@ -3429,6 +3436,10 @@ export const ROLE_MODEL_DEFAULTS: Record<ModelRole, { environment: string; tier:
   audit: { environment: 'ELANOUS_MEMORY_JUDGE_MODEL', tier: 'better' },
   classify: { environment: 'ELANOUS_ACTION_CLASSIFIER_MODEL', tier: 'budget' },
   'graph-grow': { environment: 'ELANOUS_GRAPH_GROW_MODEL', tier: 'better' },
+  // 이 티어는 provider 만 명시했을 때 쓰인다. 에이전트 기동은
+  // resolveConfiguredAgentRoleLlm 이 명시 설정을 먼저 요구한다.
+  coordinator: { environment: 'ELANOUS_COORDINATOR_MODEL', tier: 'balanced' },
+  guardian: { environment: 'ELANOUS_GUARDIAN_MODEL', tier: 'balanced' },
 };
 
 /** Resolve `auto` through the same runtime provider selector that dispatches LLM calls.
@@ -3581,6 +3592,24 @@ export function resolveRoleLlm(role: ModelRole, opts: RoleLlmResolveOptions = {}
   const baseline = resolveRoleLlmBaseline(role, config, globalProvider());
   if (opts.overrides || launchRoleLlmOverrides || envSpec || config.roleLlm?.[role]) observeRoleLlm(role, baseline, flagSpec);
   return baseline;
+}
+
+/** 조율자·수호자는 사용자 선택이 없으면 기동하지 않는다.
+ *  일반 역할의 기본 모델 사다리와 구분해, 발사 인자·env pin·roleLlm 설정 중
+ *  실제 모델 선택(provider/tier/model)이 있을 때만 해석한다. effort 단독은 선택이 아니다. */
+export function resolveConfiguredAgentRoleLlm(
+  role: AgentModelRole,
+  opts: RoleLlmResolveOptions = {},
+): RoleLlmResolution | undefined {
+  const config = opts.config ?? getUserConfig();
+  const hasSelection = (spec: RoleLlmSpec | undefined): boolean =>
+    Boolean(spec?.provider || spec?.tier || spec?.model?.trim());
+  const configured = [
+    (opts.overrides ?? launchRoleLlmOverrides)?.[role],
+    roleLlmEnvPin(role, opts.env ?? process.env),
+    config.roleLlm?.[role],
+  ].some(hasSelection);
+  return configured ? resolveRoleLlm(role, { ...opts, config }) : undefined;
 }
 
 /** POD-ROLE-LLM — 역할 고정을 «프로세스 env» 로 받는 칸. `ELANOUS_ROLE_LLM_<ROLE>` = RoleLlmSpec JSON
@@ -3840,9 +3869,9 @@ export interface UserConfig {
   /** GUARD-ONE-a: omitted means shadow. `live` is parsed for the later cutover, but `elanous guardian tick`
    *  refuses it until a human-confirmed operational change (GUARD-ONE-a ships shadow only). */
   guardian?: { mode?: 'shadow' | 'live'; /** Orphan CLI GC on the guardian tick: off = no ps collection, shadow (default) = evidence only, on = evidence then SIGTERM. */ orphanGc?: 'off' | 'shadow' | 'on' };
-  /** TA-JUDGE-LIVE-SAFE: task-agent judge moves executed for real. Only `review` · `propose-green` are honoured
-   *  (`src/task-agent/live-moves.ts` drops anything else with a warning). Absent = env ELANOUS_TASK_AGENT_LIVE_MOVES, else none (pure shadow). */
-  taskAgent?: { liveMoves?: string[]; /** TA-REJUDGE-PERIODIC — steward tick runs `tasks rejudge --all` every N minutes (absent/0 = off). */ rejudgeEveryMinutes?: number; /** 1-minute load average above which that tick is skipped (default 60). */ rejudgeMaxLoad?: number; parentHost?: { host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number } | Array<{ host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number }> };
+  /** Task-agent live move allow-list (`src/task-agent/live-moves.ts` validates its vocabulary).
+   *  Absent = env ELANOUS_TASK_AGENT_LIVE_MOVES, else none (pure shadow). */
+  taskAgent?: { liveMoves?: string[]; /** TA-REJUDGE-PERIODIC — steward tick runs `tasks rejudge --all` every N minutes (absent/0 = off). */ rejudgeEveryMinutes?: number; /** 1-minute load average above which that tick is skipped (default 60). */ rejudgeMaxLoad?: number; /** TA-REPAIR-TICK-CAP — new repair launches per `tasks rejudge --all` (default 3, 0 = none). */ repairMaxPerTick?: number; parentHost?: { host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number } | Array<{ host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number }> };
   events?: EventsConfig;
   /** GATE-REMOTE — see GateRemoteConfig. Absent = defaults (auto on · node-b · load 20 · cap 2). */
   gateRemote?: GateRemoteConfig;
@@ -4046,7 +4075,7 @@ export function parseRoleLlmEntry(raw: unknown): { ok: true; spec: RoleLlmSpec }
   return { ok: true, spec };
 }
 
-export const MODEL_ROLES: readonly ModelRole[] = ['implement', 'review', 'research', 'planning', 'audit', 'classify', 'graph-grow'];
+export const MODEL_ROLES: readonly ModelRole[] = ['implement', 'review', 'research', 'planning', 'audit', 'classify', 'graph-grow', 'coordinator', 'guardian'];
 
 export function isModelRole(v: unknown): v is ModelRole {
   return typeof v === 'string' && (MODEL_ROLES as readonly string[]).includes(v);
@@ -4154,12 +4183,17 @@ function parseTaskAgentConfig(raw: unknown): UserConfig['taskAgent'] {
   }
   const parentHost = parseTaskAgentParentHost((raw as Record<string, unknown>).parentHost);
   // TA-REJUDGE-PERIODIC — 음이 아닌 유한수만 산다(0 = 끔). 그 밖은 경고하고 버린다(= 끔 · 기본 부하 상한).
-  const rejudge: { rejudgeEveryMinutes?: number; rejudgeMaxLoad?: number } = {};
+  const rejudge: { rejudgeEveryMinutes?: number; rejudgeMaxLoad?: number; repairMaxPerTick?: number } = {};
   for (const key of ['rejudgeEveryMinutes', 'rejudgeMaxLoad'] as const) {
     const value = (raw as Record<string, unknown>)[key];
     if (value === undefined) continue;
     if (typeof value === 'number' && Number.isFinite(value) && value >= 0) rejudge[key] = value;
     else warnUserConfigDrop(`taskAgent.${key}`, `음이 아닌 수가 아니다(${JSON.stringify(value)}) — 버림`);
+  }
+  const repairMaxPerTick = (raw as Record<string, unknown>).repairMaxPerTick;
+  if (repairMaxPerTick !== undefined) {
+    if (Number.isSafeInteger(repairMaxPerTick) && (repairMaxPerTick as number) >= 0) rejudge.repairMaxPerTick = repairMaxPerTick as number;
+    else warnUserConfigDrop('taskAgent.repairMaxPerTick', `음이 아닌 정수가 아니다(${JSON.stringify(repairMaxPerTick)}) — 기본 3`);
   }
   const extras = { ...rejudge, ...(parentHost ? { parentHost } : {}) };
   const liveMoves = (raw as Record<string, unknown>).liveMoves;
@@ -4261,6 +4295,10 @@ function parseRoleLlmConfig(raw: unknown): RoleLlmConfig | undefined {
         if (effort === 'low' || effort === 'medium' || effort === 'high') spec.effort = effort;
         else warnUserConfigDrop(`roleLlm.${role}.effort`, `low|medium|high 가 아니다(${JSON.stringify(effort)}) — 버림`);
       }
+      if ((role === 'coordinator' || role === 'guardian') && !spec.provider && !spec.tier && !spec.model) {
+        dropped.push({ role, reason: 'provider·tier·model 중 하나는 있어야 한다 (effort 단독은 기동 설정이 아니다)' });
+        continue;
+      }
       if (Object.keys(spec).length > 0) parsed[role] = spec;
     } else {
       const entry = parseRoleLlmEntry(rawEntry);
@@ -4275,6 +4313,11 @@ function parseRoleLlmConfig(raw: unknown): RoleLlmConfig | undefined {
   //   사용자는 「왜 내 설정이 안 먹지」를 영영 못 푼다(CLI 는 이름을 대며 거부하는데 여기만 조용했다).
   //   ⇒ 버린 것을 «이름과 이유»로 남긴다. 로딩 자체는 계속한다.
   if (dropped.length > 0) {
+    for (const { role, reason } of dropped) {
+      if (role === 'coordinator' || role === 'guardian') {
+        warnUserConfigDrop(`roleLlm.${role}`, `${reason} — 버림; 명시 모델 없이는 에이전트 기동 거부`);
+      }
+    }
     try {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const { debug } = require('./debug/log.js') as typeof import('./debug/log.js');
@@ -5722,6 +5765,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
         ? dash.foldMode
         : 'task-unit',
       benchmark: dash.benchmark === true ? true : undefined,
+      bootBanner: dash.bootBanner === 'minimal' || dash.bootBanner === 'full' ? dash.bootBanner : undefined,
       enableVirtualWindowSwitchKeys: dash.enableVirtualWindowSwitchKeys === true,
       enableSupplementalGlobalKeys: dash.enableSupplementalGlobalKeys === true,
       promptBank: {
@@ -6535,6 +6579,9 @@ export function saveUserConfig(
       answerPriority: cfg.llm.answerPriority,
       maxTurns: cfg.llm.maxTurns,
       missionRouting: cfg.llm.missionRouting,
+      // ⛔ 로드(parseLlmRoutePolicy)만 있고 저장이 없으면 `config set llm.routePolicy` 가 «조용히» 떨어진다
+      //   (10-14 OP 실측 — set 뒤 get 이 undefined · TUI-MODEL-SESSION-SCOPE ①).
+      routePolicy: cfg.llm.routePolicy,
     }),
     skills: stripUndef({
       activeSet: cfg.skills.activeSet,
@@ -6698,6 +6745,7 @@ export function saveUserConfig(
       promptBank: cfg.dashboard.promptBank,
       foldMode: cfg.dashboard.foldMode,
       benchmark: cfg.dashboard.benchmark,
+      bootBanner: cfg.dashboard.bootBanner,
       enableVirtualWindowSwitchKeys: cfg.dashboard.enableVirtualWindowSwitchKeys,
       enableSupplementalGlobalKeys: cfg.dashboard.enableSupplementalGlobalKeys,
     }),

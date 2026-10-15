@@ -2,13 +2,14 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { parse as parseYaml } from 'yaml';
 import { defaultProbeHostEnvironment, defaultReadInstallPrefix, formatDoctorReport as renderDoctorReport, humanBreaks, registerDoctorCommand, runDoctor, setFetchHealthSpawnForTest, summarizeDoctorCapabilities } from './doctor-cli.js';
 import { checkReadiness } from './doctor-readiness.js';
 import { debug } from '../debug/log.js';
 import { applySudoFixes } from './doctor-fix.js';
+import { DOCTOR_SYMPTOMS } from '../self-implement/doctor-visit.js';
 import type { UserConfig } from '../user-config.js';
 
 const example = [
@@ -31,6 +32,9 @@ function options(overrides: Parameters<typeof runDoctor>[0] = {}) {
     exists: () => false,
     env: {},
     userConfig: userConfig(),
+    // CLI assertions must not probe this host's Ollama/LM Studio/MLX/Docker.
+    // A live inventory can take seconds and change between consecutive parses.
+    localLlmInventory: async () => ({ nodes: [], models: [], at: 0, cached: false, warnings: [] }),
     // Existing cases assert the credential report. Readiness is injected so they
     // never touch gh, HTTP, PATH, or ~/.elanous. The readiness section is covered below.
     readiness: {
@@ -68,6 +72,19 @@ function credentialBlock(formatted: string, name: string, nextName?: string): st
 }
 
 describe('doctor CLI', () => {
+  test('shared CLI options use an isolated local LLM inventory', async () => {
+    const outputs: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, { ...options(), out: { log: (line) => outputs.push(line) }, setExitCode: () => {} });
+    await program.parseAsync(['doctor', '--json'], { from: 'user' });
+    await program.parseAsync(['doctor', '--json'], { from: 'user' });
+    const reports = outputs.map((line) => JSON.parse(line) as { localLlm: unknown });
+    expect(reports.map((report) => report.localLlm)).toEqual([
+      { nodes: [], timedOut: false },
+      { nodes: [], timedOut: false },
+    ]);
+  });
+
   test('doctor --json reports three modes and human output adds only the mode section', async () => {
     const outputs: string[] = [];
     const program = new Command();
@@ -2472,5 +2489,153 @@ describe('defaultProbeHostEnvironment (L0 · injected probes, no real docker/kub
     } finally {
       setFetchHealthSpawnForTest(null);
     }
+  });
+});
+
+describe('doctor visit (DOCTOR-VISIT)', () => {
+  const canonicalRunId = 'run-1a2b3c4d-0000-4000-8000-000000000001';
+  const anotherRunId = 'run-1a2b3c4d-0000-4000-8000-000000000002';
+
+  const seededRoots: string[] = [];
+  afterEach(() => {
+    for (const root of seededRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+  });
+
+  function seedDoctorVisitLedger(): string {
+    const root = mkdtempSync(join(tmpdir(), 'doctor-visit-'));
+    seededRoots.push(root);
+    const dir = join(root, 'run-ledger');
+    mkdirSync(dir, { recursive: true });
+    for (const runId of [canonicalRunId, anotherRunId]) {
+      writeFileSync(join(dir, `${runId}.jsonl`), `${JSON.stringify({ timestamp: '2026-10-10T00:00:00.000Z', runId, event: 'start', data: {} })}\n`);
+    }
+    return dir;
+  }
+
+  function visitCli(dir: string) {
+    const outputs: string[] = [];
+    const errors: string[] = [];
+    const exitCodes: number[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options(),
+      doctorVisitLedgerDir: dir,
+      out: { log: (line: string) => outputs.push(line) },
+      err: { error: (line: string) => errors.push(line) },
+      setExitCode: (code: number) => exitCodes.push(code),
+    });
+    return { program, outputs, errors, exitCodes };
+  }
+
+  const ledgerEntries = (dir: string, runId: string) =>
+    readFileSync(join(dir, `${runId}.jsonl`), 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { event: string; data: Record<string, unknown> });
+
+  test('visit records one doctor-visit line per closed-list symptom and status shows all 13 symptoms', async () => {
+    const dir = seedDoctorVisitLedger();
+    const cli = visitCli(dir);
+    for (const symptom of DOCTOR_SYMPTOMS) {
+      await cli.program.parseAsync(['doctor', 'visit', canonicalRunId, '--symptom', symptom, '--from', 'supervisor', '--evidence', `evidence:${symptom}`], { from: 'user' });
+    }
+    expect(cli.exitCodes).toEqual([]);
+    const visits = ledgerEntries(dir, canonicalRunId).filter((entry) => entry.event === 'doctor-visit');
+    expect(visits).toHaveLength(13);
+    expect(new Set(visits.map((entry) => entry.data.symptom))).toEqual(new Set([...DOCTOR_SYMPTOMS]));
+    for (const entry of visits) {
+      expect(entry.data.from).toBe('supervisor');
+      expect(entry.data.evidence).toBe(`evidence:${entry.data.symptom}`);
+    }
+    await cli.program.parseAsync(['doctor', 'status'], { from: 'user' });
+    const status = cli.outputs.at(-1)!;
+    expect(status).toContain('Doctor visits: 13');
+    for (const symptom of DOCTOR_SYMPTOMS) {
+      expect(status).toContain(`  ${symptom}: 1`);
+      expect(status).toContain(`symptom=${symptom}`);
+    }
+  });
+
+  test('each recorded visit emits one debug.log run-doctor/visit event', async () => {
+    const dir = seedDoctorVisitLedger();
+    const cli = visitCli(dir);
+    const events: Array<{ category: string; event: string; data: unknown }> = [];
+    const observation = spyOn(debug, 'log').mockImplementation((category, event, data) => { events.push({ category, event, data }); });
+    try {
+      await cli.program.parseAsync(['doctor', 'visit', canonicalRunId, '--symptom', 'oom', '--from', 'child'], { from: 'user' });
+      await cli.program.parseAsync(['doctor', 'visit', canonicalRunId, '--symptom', 'made-up-symptom', '--from', 'child'], { from: 'user' });
+    } finally {
+      observation.mockRestore();
+    }
+    const visitEvents = events.filter((entry) => entry.category === 'run-doctor' && entry.event === 'visit');
+    expect(visitEvents).toEqual([{ category: 'run-doctor', event: 'visit', data: { runId: canonicalRunId, from: 'child', symptom: 'oom' } }]);
+  });
+
+  test('status --run refuses a runId with no ledger instead of reporting zero visits (rc!=0)', async () => {
+    const dir = seedDoctorVisitLedger();
+    const cli = visitCli(dir);
+    const missingRunId = 'run-1a2b3c4d-0000-4000-8000-eeeeeeeeeeee';
+    await cli.program.parseAsync(['doctor', 'status', '--run', missingRunId], { from: 'user' });
+    expect(cli.exitCodes).toEqual([1]);
+    expect(cli.errors.at(-1)).toContain('없음');
+    expect(cli.outputs.some((line) => line.includes('Doctor visits:'))).toBe(false);
+    await cli.program.parseAsync(['doctor', 'status', '--run', missingRunId, '--json'], { from: 'user' });
+    expect(cli.exitCodes).toEqual([1, 1]);
+    expect(JSON.parse(cli.outputs.at(-1)!).status).toBe('rejected');
+    expect(existsSync(join(dir, `${missingRunId}.jsonl`))).toBe(false);
+  });
+
+  test('visit rejects out-of-list symptom and sender with rc!=0 without writing a ledger line', async () => {
+    const dir = seedDoctorVisitLedger();
+    const cli = visitCli(dir);
+    await cli.program.parseAsync(['doctor', 'visit', canonicalRunId, '--symptom', 'made-up-symptom', '--from', 'supervisor'], { from: 'user' });
+    expect(cli.exitCodes).toEqual([1]);
+    await cli.program.parseAsync(['doctor', 'visit', canonicalRunId, '--symptom', 'oom', '--from', 'intruder'], { from: 'user' });
+    expect(cli.exitCodes).toEqual([1, 1]);
+    expect(cli.errors).toHaveLength(2);
+    expect(cli.errors[0]).toContain('unknown symptom: made-up-symptom');
+    expect(cli.errors[1]).toContain('unknown from: intruder');
+    expect(ledgerEntries(dir, canonicalRunId).filter((entry) => entry.event === 'doctor-visit')).toHaveLength(0);
+  });
+
+  test('visit refuses a runId with no ledger instead of silently creating one (rc!=0)', async () => {
+    const dir = seedDoctorVisitLedger();
+    const missingRunId = 'run-1a2b3c4d-0000-4000-8000-ffffffffffff';
+    const cli = visitCli(dir);
+    await cli.program.parseAsync(['doctor', 'visit', missingRunId, '--symptom', 'oom', '--from', 'child', '--json'], { from: 'user' });
+    expect(cli.exitCodes).toEqual([1]);
+    expect(JSON.parse(cli.outputs[0]!).status).toBe('rejected');
+    expect(JSON.parse(cli.outputs[0]!).reason).toContain('없음');
+    expect(existsSync(join(dir, `${missingRunId}.jsonl`))).toBe(false);
+  });
+
+  test('visit --json echoes the recorded visit and status --run limits the summary to that run', async () => {
+    const dir = seedDoctorVisitLedger();
+    const cli = visitCli(dir);
+    await cli.program.parseAsync(['doctor', 'visit', canonicalRunId, '--symptom', 'oom', '--from', 'child', '--evidence', 'child OOM-killed at 16Gi', '--json'], { from: 'user' });
+    const echoed = JSON.parse(cli.outputs[0]!);
+    expect(echoed).toMatchObject({ runId: canonicalRunId, from: 'child', symptom: 'oom', evidence: 'child OOM-killed at 16Gi' });
+    expect(typeof echoed.timestamp).toBe('string');
+    await cli.program.parseAsync(['doctor', 'visit', anotherRunId, '--symptom', 'no-progress', '--from', 'judge', '--json'], { from: 'user' });
+    await cli.program.parseAsync(['doctor', 'status', '--json'], { from: 'user' });
+    const status = JSON.parse(cli.outputs.at(-1)!);
+    expect(status.total).toBe(2);
+    expect(status.counts.oom).toBe(1);
+    expect(status.counts['no-progress']).toBe(1);
+    expect(status.counts['admit-starved']).toBe(0);
+    expect(status.visits.map((visit: { runId: string }) => visit.runId)).toEqual([canonicalRunId, anotherRunId]);
+    await cli.program.parseAsync(['doctor', 'status', '--run', anotherRunId], { from: 'user' });
+    const scoped = cli.outputs.at(-1)!;
+    expect(scoped).toContain('Doctor visits: 1');
+    expect(scoped).toContain('symptom=no-progress');
+    expect(scoped).not.toContain('symptom=oom');
+  });
+
+  test('bare doctor output and exit code are unchanged by the visit/status subcommands', async () => {
+    const dir = seedDoctorVisitLedger();
+    const cli = visitCli(dir);
+    await cli.program.parseAsync(['doctor'], { from: 'user' });
+    const text = cli.outputs[0]!;
+    expect(text).toStartWith('Readiness:');
+    expect(text).toContain('Credentials: ');
+    expect(text).not.toContain('Doctor visits:');
+    expect(cli.exitCodes).toEqual([]);
   });
 });

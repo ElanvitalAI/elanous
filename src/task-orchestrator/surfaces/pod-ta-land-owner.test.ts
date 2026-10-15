@@ -162,7 +162,11 @@ describe('TA-LIVE-LAND-2 — Pod host leaves the merge to the task agent only on
         if (call.startsWith('git diff --name-only')) return { status: 0, stdout: 'src/x.ts\n', stderr: '' };
         return { status: 0, stdout: '', stderr: '' };
       },
-      makeTemp: () => mkdtempSync(join(tmpdir(), 'pod-ta-land-regate-')), removeTemp: (path: string) => rmSync(path, { recursive: true, force: true }),
+      makeTemp: () => {
+        const path = mkdtempSync(join(tmpdir(), 'pod-ta-land-regate-'));
+        mkdirSync(join(path, 'apps/pwa/node_modules'), { recursive: true });
+        return path;
+      }, removeTemp: (path: string) => rmSync(path, { recursive: true, force: true }),
       acquire: async () => () => {}, interference: async () => ({ passed: true }), log: () => {},
     };
     const { r } = await run({ env: { [TA_LAND_ENV]: '1' }, moves: ['propose-land'], regate: (request) => runHostRegate(request, deps) });

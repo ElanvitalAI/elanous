@@ -54,7 +54,9 @@ function writeGrokSubscriptionCredential(): void {
 }
 
 beforeEach(() => {
-  for (const k of ['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENROUTER_API_KEY', 'LOCAL_LLM_URL']) {
+  // These cases exercise the real provider decision, including its failure
+  // branch, even when the gate Pod enables the separate fake-provider lane.
+  for (const k of ['ELANOUS_TEST_FAKE_LLM', 'XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENROUTER_API_KEY', 'LOCAL_LLM_URL']) {
     savedEnv[k] = process.env[k];
     delete process.env[k];
   }

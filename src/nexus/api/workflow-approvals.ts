@@ -21,6 +21,8 @@ export interface PendingApprovalSummary {
   runId: string;
   message: string;
   requestedAt: number;
+  /** Explicit project ownership. The approval registry does not currently populate this field. */
+  projectId?: string;
 }
 
 interface PendingApprovalEntry extends PendingApprovalSummary {

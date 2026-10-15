@@ -837,6 +837,7 @@ export interface AcpTurnContext {
    *  didn't advertise `elanous.ui.usage` in its ClientCapabilities. */
   pushUsage: (usage: {
     provider?: 'anthropic' | 'openai';
+    model?: string;
     inputTokens?: number;
     outputTokens?: number;
     cacheReadInputTokens?: number;
@@ -1837,6 +1838,7 @@ function wireAcpConnection(
         const payload: ElanousUiUsagePayload = {
           id: `turn:${Date.now()}`,
           ...(usage.provider !== undefined ? { provider: usage.provider } : {}),
+          ...(usage.model !== undefined ? { model: usage.model } : {}),
           ...(usage.inputTokens !== undefined ? { inputTokens: usage.inputTokens } : {}),
           ...(usage.outputTokens !== undefined ? { outputTokens: usage.outputTokens } : {}),
           ...(usage.cacheReadInputTokens !== undefined

@@ -12,6 +12,10 @@ export interface PtyUsageReemitOpts {
   readonly workdir: string;
   /** Codex session UUID observed from this child PTY; empty when unavailable (emit nothing). */
   readonly sessionId: string;
+  /** Caller-observed metadata only. Never infer a Codex account from CODEX_HOME. */
+  readonly role?: string;
+  readonly stage?: string;
+  readonly account?: string;
   /** Child start time: do not attribute older sessions in a shared CODEX_HOME to this child. */
   readonly sinceMs?: number;
   /** Override the dedup ledger location in isolated tests. */
@@ -40,6 +44,9 @@ export function reemitPtyUsage(opts: PtyUsageReemitOpts): number {
       if (Number(insert.run(home, turn.turnId).changes) === 0) continue;
       debug.log('llm.usage', 'llm-usage', {
         runId: opts.runId,
+        ...(opts.role !== undefined ? { role: opts.role } : {}),
+        ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
+        ...(opts.account !== undefined ? { account: opts.account } : {}),
         substrate: 'pty',
         site: 'pty-rollup:codex',
         turnId: turn.turnId,

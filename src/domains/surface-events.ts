@@ -146,7 +146,10 @@ export function recordInboundTurn(
 ): string | null {
   const q = (opts.userText ?? '').trim();
   if (!q) return null;
-  const db = opts.db ?? openSurfaceEventsDb();
+  // Test runners must never fall through to the user's production memory DB.
+  const testRunner = process.env.NODE_ENV === 'test' || process.env.BUN_TEST !== undefined;
+  const isolatedTestPath = process.env.ELANOUS_STATE_DIR?.trim() ? surfaceEventsDbPath() : ':memory:';
+  const db = opts.db ?? openSurfaceEventsDb(testRunner ? isolatedTestPath : surfaceEventsDbPath());
   const ownDb = !opts.db;
   try {
     const a = (opts.responseText ?? '').trim();

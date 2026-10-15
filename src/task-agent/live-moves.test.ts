@@ -247,6 +247,19 @@ describe('taskAgent.liveMoves 해석 — config > env > 없음 · 모르는 항�
     expect(reloadUserConfig(path).taskAgent).toBeUndefined();
   });
 
+  test('taskAgent.repairMaxPerTick 은 0 포함 안전한 정수만 보존한다', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ta-repair-cap-config-'));
+    const path = join(dir, 'config.json');
+    writeFileSync(path, JSON.stringify({ taskAgent: { repairMaxPerTick: 0 } }));
+    expect(reloadUserConfig(path).taskAgent?.repairMaxPerTick).toBe(0);
+    writeFileSync(path, JSON.stringify({ taskAgent: { repairMaxPerTick: 5 } }));
+    expect(reloadUserConfig(path).taskAgent?.repairMaxPerTick).toBe(5);
+    writeFileSync(path, JSON.stringify({ taskAgent: { repairMaxPerTick: -1 } }));
+    expect(reloadUserConfig(path).taskAgent?.repairMaxPerTick).toBeUndefined();
+    writeFileSync(path, JSON.stringify({ taskAgent: { repairMaxPerTick: 1.5 } }));
+    expect(reloadUserConfig(path).taskAgent?.repairMaxPerTick).toBeUndefined();
+  });
+
   test('실제 설정 로더 → 해석: 숫자 섞인 목록은 review 를 살리고 숫자만 경고 · 설정이 있으면 env 는 안 먹는다', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ta-live-config-'));
     const path = join(dir, 'config.json');

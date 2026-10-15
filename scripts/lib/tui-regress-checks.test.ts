@@ -4,7 +4,7 @@ import {
   judgeHintAppearsThenClears, judgePalette, judgeQueuedEcho, paletteHas,
 } from './tui-regress-checks';
 
-const INPUT = '❯ 말 한 줄로 시작';
+const INPUT = '❯';
 
 describe('V1 TUI regression verdicts (screen text only)', () => {
   test('seven checks R1–R7 in order', () => {

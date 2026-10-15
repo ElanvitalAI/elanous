@@ -70,6 +70,9 @@ export interface StaticFoldTarget {
   groupKey?: string;
   /** Fold mode shared with fold-applied. FoldStack does not invent this. */
   mode?: string;
+  /** Offset (from lineStart) of the click that expanded this target —
+   *  clicking the same row again collapses it (#16 two-way click). */
+  expandedAtOffset?: number;
 }
 
 export type FoldTarget = LiveFoldTarget | StaticFoldTarget;
@@ -178,6 +181,7 @@ export class FoldStack {
 
     this.opts.chatLines.splice(t.lineStart, oldLen, ...newLines);
     t.expanded = nextExpanded;
+    t.expandedAtOffset = undefined;
     t.lineEnd  = t.lineStart + newLines.length;
 
     // Any OTHER static target whose lineStart is ≥ the toggled
@@ -224,6 +228,7 @@ export class FoldStack {
     const lineStart = t.lineStart;
     const lineEnd = t.lineEnd;
     const toggled = this.toggleTarget(t);
+    if (toggled) t.expandedAtOffset = t.expanded ? lineIndex - lineStart : undefined;
     if (toggled) {
       debug.log('log.fold', t.expanded ? 'fold-expanded' : 'fold-recollapsed', {
         mode: t.mode ?? null,
@@ -259,6 +264,16 @@ export class FoldStack {
     return t != null && t.expanded && t.lineStart === lineIndex;
   }
 
+  /** Fact for callers: may a click on `lineIndex` collapse its expanded
+   *  target? True on the first line, the last line, and the row whose
+   *  click expanded it — the rest of the body stays a reading area. */
+  isExpandedCollapseLine(lineIndex: number): boolean {
+    const t = this.findLatestStaticContaining(lineIndex);
+    if (t == null || !t.expanded) return false;
+    const offset = lineIndex - t.lineStart;
+    return offset === 0 || lineIndex === t.lineEnd - 1 || offset === t.expandedAtOffset;
+  }
+
   /** Toggle every static target on the stack in the same direction.
    *  If ≥ half are already expanded we collapse all; otherwise we
    *  expand all. Returns the number of targets that actually changed
@@ -273,7 +288,14 @@ export class FoldStack {
     const statics = this.targets.filter((t): t is StaticFoldTarget => t.kind === 'static');
     if (statics.length === 0) return 0;
     const expandedCount = statics.filter(t => t.expanded).length;
-    const targetExpanded = expandedCount * 2 < statics.length; // <50% → expand all
+    return this.setAll(expandedCount * 2 < statics.length); // <50% → expand all
+  }
+
+  /** Put every static target in one explicit state (`/log unfold all` ·
+   *  `/log fold all`). Returns how many targets changed; live targets are
+   *  skipped exactly as in toggleAll. */
+  setAll(targetExpanded: boolean): number {
+    const statics = this.targets.filter((t): t is StaticFoldTarget => t.kind === 'static');
     // Sort by lineStart ascending; toggling from the top of chatLines
     // down means later targets shift consistently as we go. Skip
     // targets already in the desired state.
@@ -287,6 +309,7 @@ export class FoldStack {
       const delta = newLines.length - oldLen;
       this.opts.chatLines.splice(t.lineStart, oldLen, ...newLines);
       t.expanded = targetExpanded;
+      t.expandedAtOffset = undefined;
       t.lineEnd = t.lineStart + newLines.length;
       if (delta !== 0) {
         for (const other of this.targets) {

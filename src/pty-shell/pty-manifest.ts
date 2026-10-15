@@ -64,6 +64,8 @@ export interface PtyManifestRow {
   nickname?: string;
   cmd: string;
   workdir?: string;
+  purpose?: string;
+  seat?: string;
   ownerPid: number;
   ptyPid: number;
   livenessSource?: 'pty-pid' | 'owner-pid';
@@ -96,6 +98,22 @@ export interface PtyManifestRow {
   externalToolName?: string;
   closedAt: number;
   codeSha: string;
+  /** TUI 턴 상태 — TUI 가 턴 시작·끝에 스스로 적는다(화면 글자 추정 아님). 없으면 기록 안 하는 행/옛 판. */
+  turnState?: PtyTurnState;
+  turnAt?: number;
+  /** 행 소유 프로세스가 «기동 때» 실은 코드 판 — 트리 HEAD(`codeSha`)와 다른 축이다. */
+  build?: PtyBuildIdentity;
+}
+
+export type PtyTurnState = 'busy' | 'idle';
+export type PtyBuildSource = 'installed' | 'checkout' | 'unknown';
+export interface PtyBuildIdentity {
+  readonly version: string;
+  /** 40자 커밋 — 모르면 ''. */
+  readonly sha: string;
+  readonly source: PtyBuildSource;
+  /** 기동한 코드의 뿌리 — checkout 이면 지금 HEAD 와 비교하는 자리. */
+  readonly codeRoot?: string;
 }
 
 const SNAPSHOT_TAIL_BYTES = 16 * 1024;
@@ -152,6 +170,8 @@ function db(): Database | null {
 
 export function migratePtyManifestSchema(d: Database): void {
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN nickname TEXT'); } catch { /* already exists */ }
+  try { d.run('ALTER TABLE pty_manifest ADD COLUMN purpose TEXT'); } catch { /* already exists */ }
+  try { d.run('ALTER TABLE pty_manifest ADD COLUMN seat TEXT'); } catch { /* already exists */ }
   try { d.run(`ALTER TABLE pty_manifest ADD COLUMN frame TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN frame_at INTEGER NOT NULL DEFAULT 0'); } catch { /* already exists */ }
   try { d.run(`ALTER TABLE pty_manifest ADD COLUMN run_id TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
@@ -176,6 +196,12 @@ export function migratePtyManifestSchema(d: Database): void {
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN external_tool_name TEXT'); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN output_bytes_total INTEGER NOT NULL DEFAULT 0'); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN last_control_at INTEGER'); } catch { /* already exists */ }
+  try { d.run('ALTER TABLE pty_manifest ADD COLUMN turn_state TEXT'); } catch { /* already exists */ }
+  try { d.run('ALTER TABLE pty_manifest ADD COLUMN turn_at INTEGER'); } catch { /* already exists */ }
+  try { d.run('ALTER TABLE pty_manifest ADD COLUMN build_version TEXT'); } catch { /* already exists */ }
+  try { d.run('ALTER TABLE pty_manifest ADD COLUMN build_sha TEXT'); } catch { /* already exists */ }
+  try { d.run('ALTER TABLE pty_manifest ADD COLUMN build_source TEXT'); } catch { /* already exists */ }
+  try { d.run('ALTER TABLE pty_manifest ADD COLUMN build_code_root TEXT'); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest DROP COLUMN chain_depth'); } catch { /* legacy schema has no duplicate column */ }
   try { d.run('UPDATE pty_manifest SET closed_at=updated_at WHERE alive=0 AND closed_at=0'); } catch { /* fail-soft */ }
 }
@@ -236,9 +262,12 @@ export function upsertPtyManifest(row: {
   nickname?: string;
   cmd: string;
   workdir?: string;
+  purpose?: string;
+  seat?: string;
   startedAt: number;
   now: number;
   ptyPid?: number;
+  origin?: { originRoot: string; controller?: string };
   identity?: {
     spaceId?: string;
     parentPtyId?: string;
@@ -258,7 +287,10 @@ export function upsertPtyManifest(row: {
     const chainOrigin = getPtyChainOrigin();
     const registrarNestDepth = process.env.ELANOUS_NEST_DEPTH === undefined ? undefined : getNestDepth();
     const nestDepth = row.identity?.nestDepth ?? registrarNestDepth;
-    const { originRoot, originAgent, originSession, controller } = originObservationFields();
+    const observedOrigin = originObservationFields();
+    const { originRoot, originAgent, originSession, controller } = row.origin
+      ? { originRoot: row.origin.originRoot, originAgent: undefined, originSession: undefined, controller: row.origin.controller }
+      : observedOrigin;
     const terminalOrigin = classifyTerminalOrigin({ originRoot, originAgent, originSession, controller });
     const codeSha = codeShaForWorkdir(row.workdir);
     d.run('BEGIN IMMEDIATE');
@@ -281,15 +313,15 @@ export function upsertPtyManifest(row: {
           : 'process';
       const shouldRecordSpawned = previous === null || previous.alive === 0;
       const values = [
-        row.id, row.kind, row.nickname ?? null, row.cmd, row.workdir ?? null, process.pid, row.ptyPid ?? 0, resolveInstanceName(),
+        row.id, row.kind, row.nickname ?? null, row.cmd, row.workdir ?? null, row.purpose ?? null, row.seat ?? null, process.pid, row.ptyPid ?? 0, resolveInstanceName(),
         runId, runIdSource, spaceId, sessionId, codeSha, parentPtyId, parentPid, parentKind, chainOrigin ?? null, nestDepth ?? null,
         originRoot ?? null, originAgent ?? null, originSession ?? null, manifestController ?? null, terminalOrigin.category, terminalOrigin.reason,
         terminalOrigin.externalToolName ?? null, row.startedAt, 1, null, '', 0, row.now,
       ];
       d.run(
-        `INSERT INTO pty_manifest (id, kind, nickname, cmd, workdir, owner_pid, pty_pid, instance, run_id, run_id_source, space_id, session_id, code_sha, parent_pty_id, parent_pid, parent_kind, chain_origin, nest_depth, origin_root, origin_agent, origin_session, controller, terminal_origin_category, terminal_origin_reason, external_tool_name, started_at, alive, exit_code, snapshot, snapshot_at, updated_at)
+        `INSERT INTO pty_manifest (id, kind, nickname, cmd, workdir, purpose, seat, owner_pid, pty_pid, instance, run_id, run_id_source, space_id, session_id, code_sha, parent_pty_id, parent_pid, parent_kind, chain_origin, nest_depth, origin_root, origin_agent, origin_session, controller, terminal_origin_category, terminal_origin_reason, external_tool_name, started_at, alive, exit_code, snapshot, snapshot_at, updated_at)
          VALUES (${values.map(() => '?').join(', ')})
-         ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, nickname=excluded.nickname, cmd=excluded.cmd, workdir=excluded.workdir,
+         ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, nickname=excluded.nickname, cmd=excluded.cmd, workdir=excluded.workdir, purpose=excluded.purpose, seat=excluded.seat,
            owner_pid=excluded.owner_pid, pty_pid=excluded.pty_pid, instance=excluded.instance,
            run_id=excluded.run_id, run_id_source=excluded.run_id_source, space_id=excluded.space_id, session_id=excluded.session_id, code_sha=excluded.code_sha,
            parent_pty_id=excluded.parent_pty_id, parent_pid=excluded.parent_pid, parent_kind=excluded.parent_kind,
@@ -297,13 +329,16 @@ export function upsertPtyManifest(row: {
            origin_session=excluded.origin_session, controller=excluded.controller, terminal_origin_category=excluded.terminal_origin_category,
            terminal_origin_reason=excluded.terminal_origin_reason, external_tool_name=excluded.external_tool_name,
            started_at=excluded.started_at, alive=1, exit_code=NULL,
-           snapshot='', snapshot_at=0, frame='', frame_at=0, closed_at=0, updated_at=excluded.updated_at`,
+           snapshot='', snapshot_at=0, frame='', frame_at=0, closed_at=0, updated_at=excluded.updated_at,
+           turn_state=NULL, turn_at=NULL, build_version=NULL, build_sha=NULL, build_source=NULL, build_code_root=NULL`,
         values,
       );
       d.run('COMMIT');
       if (shouldRecordSpawned) {
         recordPtyLifecycle('spawned', {
           id: row.id, kind: row.kind, ...(row.nickname ? { nickname: row.nickname } : {}), cmd: row.cmd,
+          ...(row.purpose ? { purpose: row.purpose } : {}),
+          ...(row.seat ? { seat: row.seat } : {}),
           ...(row.workdir ? { workdir: row.workdir } : {}), ownerPid: process.pid, ptyPid: row.ptyPid ?? 0, instance: resolveInstanceName(),
           startedAt: row.startedAt, alive: true, exitCode: null, snapshot: '', snapshotAt: 0, outputBytesTotal: 0, updatedAt: row.now,
           frame: '', frameAt: 0, runId, runIdSource, spaceId, sessionId, parentPtyId, parentPid, parentKind,
@@ -373,6 +408,29 @@ export function updatePtyManifestNickname(id: string, nickname: string | undefin
     const d = db(); if (!d) return;
     d.run('UPDATE pty_manifest SET nickname=?, updated_at=? WHERE id=?', [nickname ?? null, now, id]);
   } catch { /* fail-soft */ }
+}
+
+/** 턴 상태 기록 — 행이 없거나 db 를 못 열면 false(호출자가 관측을 남긴다). */
+export function updatePtyManifestTurn(id: string, turn: PtyTurnState, at: number): boolean {
+  try {
+    const d = db(); if (!d) return false;
+    return d.run('UPDATE pty_manifest SET turn_state=?, turn_at=? WHERE id=?', [turn, at, id]).changes > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** 기동 판 기록 — 행 등록 직후 한 번. */
+export function updatePtyManifestBuild(id: string, build: PtyBuildIdentity): boolean {
+  try {
+    const d = db(); if (!d) return false;
+    return d.run(
+      'UPDATE pty_manifest SET build_version=?, build_sha=?, build_source=?, build_code_root=? WHERE id=?',
+      [build.version, build.sha, build.source, build.codeRoot ?? null, id],
+    ).changes > 0;
+  } catch {
+    return false;
+  }
 }
 
 export function markPtyControlled(id: string, at: number): void {
@@ -781,6 +839,8 @@ function mapRow(r: Record<string, unknown>): PtyManifestRow {
     ...(r.nickname ? { nickname: String(r.nickname) } : {}),
     cmd: String(r.cmd),
     ...(r.workdir ? { workdir: String(r.workdir) } : {}),
+    ...(r.purpose ? { purpose: String(r.purpose) } : {}),
+    ...(r.seat ? { seat: String(r.seat) } : {}),
     ownerPid: Number(r.owner_pid),
     ptyPid: Number(r.pty_pid ?? 0),
     ...(r.liveness_source === 'pty-pid' || r.liveness_source === 'owner-pid' ? { livenessSource: r.liveness_source } : {}),
@@ -812,6 +872,18 @@ function mapRow(r: Record<string, unknown>): PtyManifestRow {
     ...(terminalOrigin.externalToolName === undefined ? {} : { externalToolName: terminalOrigin.externalToolName }),
     closedAt: Number(r.closed_at ?? 0),
     codeSha: String(r.code_sha ?? ''),
+    ...(r.turn_state === 'busy' || r.turn_state === 'idle' ? { turnState: r.turn_state, turnAt: Number(r.turn_at ?? 0) } : {}),
+    ...(typeof r.build_sha === 'string' ? { build: mapBuild(r) } : {}),
     updatedAt: Number(r.updated_at),
+  };
+}
+
+function mapBuild(r: Record<string, unknown>): PtyBuildIdentity {
+  const source = r.build_source === 'installed' || r.build_source === 'checkout' ? r.build_source : 'unknown';
+  return {
+    version: String(r.build_version ?? ''),
+    sha: String(r.build_sha ?? ''),
+    source,
+    ...(typeof r.build_code_root === 'string' && r.build_code_root ? { codeRoot: r.build_code_root } : {}),
   };
 }

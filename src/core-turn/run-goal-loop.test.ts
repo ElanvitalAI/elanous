@@ -9,7 +9,12 @@ import {
   CHILD_LIVENESS_HEARTBEAT_ENV,
   GOAL_LOOP_FINAL_TEXT_EXCERPT_MAX_CHARS,
   GOAL_CONTINUATION_PROMPT,
+  GOAL_EVIDENCE_REQUIRED_PROMPT,
+  GOAL_INTERNAL_NOTICE_RULE,
   GOAL_READBACK_PROMPT,
+  GOAL_SYSTEM_PREAMBLE,
+  buildEvidenceMismatchPrompt,
+  buildRejectedToolCompletionPrompt,
   mergeChildLivenessHeartbeat,
   startChildLivenessHeartbeat,
   runGoalLoop,
@@ -140,6 +145,15 @@ describe('runGoalLoop completion answer deduplication', () => {
       expect(prompt).toContain('다시 쓰지 마라');
       expect(prompt).toContain('텍스트 없이 update_goal 만 호출하라');
     }
+  });
+
+  test('every rejection or re-request keeps its reason out of the user-facing answer (10-14 OPT apology lines)', () => {
+    const prompts = [GOAL_CONTINUATION_PROMPT, GOAL_READBACK_PROMPT, GOAL_EVIDENCE_REQUIRED_PROMPT,
+      buildEvidenceMismatchPrompt(1, []), buildRejectedToolCompletionPrompt(['Write'])];
+    for (const prompt of prompts) expect(prompt).toContain(GOAL_INTERNAL_NOTICE_RULE);
+    expect(GOAL_INTERNAL_NOTICE_RULE).toContain('죄송합니다');
+    expect(GOAL_SYSTEM_PREAMBLE).toContain('내부 지시다');
+    expect(GOAL_SYSTEM_PREAMBLE).toContain('[tool call rejected]');
   });
 
   async function completeAfterAnswer(completionText: string) {

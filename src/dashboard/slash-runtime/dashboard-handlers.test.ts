@@ -7,6 +7,7 @@ import { CardStore } from '../../task-cards/card-store.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 import { getUserConfig, reloadUserConfig, saveUserConfig } from '../../user-config.js';
 import { lookupLlmTierSpec } from '../../model-tier/index.js';
+import { setSessionModelPin } from '../../llm/route-decision.js';
 import type { FoldMode } from '../../log-entry.js';
 import { resolveSurfaceUx } from '../../agent/surface-ux/build.js';
 import { debug } from '../../debug/log.js';
@@ -407,20 +408,24 @@ test('/model without arguments shows the current model, tier name, and effective
 
     for (const [word, tier] of [['빠름', 'budget'], ['보통', 'better'], ['깊음', 'best']] as const) {
       const selected = lookupLlmTierSpec('openai-codex', tier);
-      await buildDashboardSlashRegistry().dispatch('model', [word], ctx);
+      // 설정 파일에 쓰는 것은 --global 뿐이다(TUI-MODEL-SESSION-SCOPE — 기본은 이 세션 핀).
+      await buildDashboardSlashRegistry().dispatch('model', [word, '--global'], ctx);
       expect(getUserConfig().llm).toMatchObject({ provider: 'openai-codex', model: selected.model, reasoningLevel: selected.reasoningLevel });
     }
-    await buildDashboardSlashRegistry().dispatch('model', ['opus'], ctx);
+    await buildDashboardSlashRegistry().dispatch('model', ['opus', '--global'], ctx);
     expect(getUserConfig().llm).toMatchObject({ provider: 'anthropic', model: 'claude-opus-4-8', reasoningLevel: lookupLlmTierSpec('openai-codex', 'best').reasoningLevel });
 
     // Outside the tier map: the tier slot is explicit, not silently dropped.
     const custom = getUserConfig();
     saveUserConfig({ ...custom, llm: { ...custom.llm, provider: 'anthropic', model: 'some-custom-model', reasoningLevel: 'medium' } });
     reloadUserConfig();
+    // --global 도 이 세션 핀을 건다 — 손으로 고친 config 를 보려면 핀을 푼다.
+    await buildDashboardSlashRegistry().dispatch('model', ['reset'], ctx);
     lines.length = 0;
     await buildDashboardSlashRegistry().dispatch('model', [], ctx);
     expect(lines[0]).toBe('지금: some-custom-model (단계 밖 · 생각 medium) · 고르기: /model 빠름 | 보통 | 깊음');
   } finally {
+    setSessionModelPin('dashboard', null);
     resetElanousConfigDir();
     rmSync(root, { recursive: true, force: true });
   }
@@ -954,6 +959,25 @@ test('/log fold dispatch resolves mode, stores it, reports feedback, and resets 
     '  /log fold line | task-unit | kind-unit',
   ]);
   expect(scrollResetCount).toBe(3);
+});
+
+test('/log unfold all · fold all report the changed count; a host without a fold controller says so', async () => {
+  const registry = buildDashboardSlashRegistry();
+  const lines: string[] = [];
+  const calls: boolean[] = [];
+  const context = createContext(lines);
+  context.logSlash.setAllFolds = (expanded) => { calls.push(expanded); return expanded ? 2 : 0; };
+  await registry.dispatch('log', ['unfold', 'all'], context);
+  expect(lines.at(-1)).toBe('  unfolded 2 blocks');
+  await registry.dispatch('log', ['fold', 'all'], context);
+  expect(lines.at(-1)).toBe('  (nothing to fold)');
+  expect(calls).toEqual([true, false]);
+
+  const bare: string[] = [];
+  const bareContext = createContext(bare);
+  delete bareContext.logSlash.setAllFolds;
+  await registry.dispatch('log', ['unfold'], bareContext);
+  expect(bare.at(-1)).toBe('  fold controls are not available in this view');
 });
 
 test('dashboard catalog exposes /log fold in description and subcommands', () => {

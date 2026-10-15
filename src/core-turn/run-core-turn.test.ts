@@ -63,6 +63,23 @@ async function run(messages: LLMMessage[], userText?: string): Promise<void> {
 }
 
 describe('runCoreTurn surface input isolation', () => {
+  test('reports the model attempted by the tool stream to the hosting callback', async () => {
+    const resolved: string[] = [];
+    spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, _handlers, opts) => {
+      opts?.onResolvedProvider?.('openrouter', 'openrouter/z-ai/glm-5.3');
+      return 'done';
+    });
+    await runCoreTurn({
+      sessionId: 'grounding-model-observation',
+      messages: [{ role: 'user', content: 'inspect repository' }],
+      tools: [tool],
+      dispatchTool: async () => null,
+      signal,
+      callbacks: { onResolvedProvider: (provider, model) => resolved.push(`${provider}/${model}`) },
+    });
+    expect(resolved).toEqual(['openrouter/openrouter/z-ai/glm-5.3']);
+  });
+
   test('[skips-machine-turns] uses the original human prompt for surface selection after a goal-loop prompt', async () => {
     await run([
       { role: 'user', content: 'please inspect the browser page' },

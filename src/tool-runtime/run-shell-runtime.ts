@@ -31,6 +31,9 @@ export const runShellRuntime: ToolRuntime<Record<string, unknown>, RunShellDispa
       ctx.surface === 'dashboard' && req.sandbox === undefined
         ? { ...req, sandbox: 'auto' }
         : req;
-    return dispatchRunShell(effectiveReq, { signal: ctx.signal });
+    return dispatchRunShell(effectiveReq, {
+      signal: ctx.signal,
+      availableToolNames: ctx.agentHostTools?.map(tool => tool.name),
+    });
   },
 };

@@ -11,6 +11,7 @@ import { isPtyAccessMode } from './pty-ref.js';
 import { debug } from '../debug/log.js';
 import { encodeSgrMouse, mouseModeOffReason, type PtyMouseInput } from './pty-mouse.js';
 import { startPtyRecording, stopPtyRecording } from './pty-recording.js';
+import { withExternalKeyCommand } from '../input/external-input-queue.js';
 
 const OWNER_PTY_CONTROL_ACTIONS = ['takeover', 'release', 'input-text', 'input-key', 'input-mouse', 'resize', 'snapshot', 'rename', 'terminate', 'capabilities', 'record-start', 'record-stop'] as const;
 export type PtyControlAction = typeof OWNER_PTY_CONTROL_ACTIONS[number];
@@ -412,7 +413,9 @@ async function processPtyControlRequestsOnce(getHandle: (id: string) => PtyContr
         } else if ((row.action === 'input-text' || row.action === 'input-key') && 'chars' in payload) {
           // ⛔⭐ 여기서 세지 «않는다» — 계기는 `registry.write`(진짜 초크포인트)에 있다.
           //   여기서도 세면 크로스-프로세스 쓰기가 **두 번** 세어진다(`[S]` 리뷰 후 이동).
-          const outcome = writePtyWithOutcome(handle, payload.chars, authorized.actor);
+          //   `input-key` 는 TUI 외부 입력 대기열(`input/external-input-queue`)을 타지 않는다 — 글이 아니라 키다.
+          const write = (): ReturnType<typeof writePtyWithOutcome> => writePtyWithOutcome(handle, payload.chars, authorized.actor);
+          const outcome = row.action === 'input-key' ? withExternalKeyCommand(write) : write();
           result = outcome === 'success'
             ? { status: 'success' }
             : outcome === 'denied'

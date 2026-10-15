@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
-import type { FoldMode } from '../log-entry.js';
+import { foldKindHint, type FoldMode } from '../log-entry.js';
 import { FoldStack } from '../fold-stack.js';
 import { createDashboardRenderedToolRuntime } from './rendered-tool-runtime.js';
 import {
@@ -250,7 +250,7 @@ describe('createTurnStreamFormatter foldMode forwarding', () => {
     expect(replacement.expandedLines?.join('\n')).toContain('22 more lines folded');
   });
 
-  test('kind-unit append/replace events carry operationKind; line and task-unit omit it', () => {
+  test('kind-unit and task-unit RunShell carry grouping kind; other task-unit tools do not', () => {
     const kindUnit = makeFormatter('generic', { foldMode: 'kind-unit' });
     kindUnit.formatter.onToolCall(call('r1', 'Read'));
     kindUnit.formatter.onToolResult({ ...call('r1', 'Read'), result: 'ok' });
@@ -270,6 +270,47 @@ describe('createTurnStreamFormatter foldMode forwarding', () => {
     task.formatter.onToolResult({ ...call('r3', 'Read'), result: 'ok' });
     expect(task.events.find((event) => event.type === 'tool.appendBlock')).not.toHaveProperty('operationKind');
     expect(task.events.find((event) => event.type === 'tool.replaceBlock')).not.toHaveProperty('operationKind');
+
+    task.formatter.onToolCall(call('s1', 'RunShell'));
+    task.formatter.onToolResult({ ...call('s1', 'RunShell'), result: 'ok' });
+    expect(task.events.find((event) => event.type === 'tool.appendBlock' && event.callId === 's1')).toMatchObject({ operationKind: 'RunShell' });
+    expect(task.events.find((event) => event.type === 'tool.replaceBlock' && event.callId === 's1')).toMatchObject({ operationKind: 'RunShell' });
+  });
+
+  test('task-unit combines adjacent RunShell results and expands both details', () => {
+    const chatLines: string[] = [];
+    const foldStack = new FoldStack({ chatLines });
+    const renderedToolRuntime = createDashboardRenderedToolRuntime({
+      chatLines, foldStack, draw: () => {}, pinChatTail: () => {},
+    });
+    const runtime = createDashboardTurnStreamRuntime({
+      initialAssistantStart: 0,
+      chatLines,
+      thinking: { update: () => {}, updateMetrics: () => {} },
+      draw: () => {}, pinChatTail: () => {}, termCols: () => 80, wrapOpts: {},
+      formatResponse: (full) => full.split('\n'), text: (line) => line, muted: (line) => line,
+      ptyCallLine: () => null, ptyResultLine: () => null,
+      renderToolCallEvent: (item) => [`running ${item.id}`],
+      renderToolResultVariants: (item) => ({
+        collapsed: [`${item.name} ${item.id}`],
+        expanded: [`${item.name} ${item.id}`, `detail ${item.id}`],
+      }),
+      toolRendering: {}, foldMode: 'task-unit', renderedToolRuntime, brainIcon: '[B]',
+    });
+    for (const id of ['s1', 's2']) {
+      runtime.onToolCall(call(id, 'RunShell'));
+      runtime.onToolResult({ ...call(id, 'RunShell'), result: 'ok' });
+    }
+    expect(chatLines).toEqual([foldKindHint('RunShell', 2)]);
+    expect(foldStack.toggleAtLine(0)).toBe(true);
+    expect(chatLines.join('\n')).toContain('detail s1');
+    expect(chatLines.join('\n')).toContain('detail s2');
+    expect(foldStack.toggleAtLine(0)).toBe(true);
+    runtime.onToolCall(call('r1', 'Read'));
+    runtime.onToolResult({ ...call('r1', 'Read'), result: 'ok' });
+    runtime.onToolCall(call('s3', 'RunShell'));
+    runtime.onToolResult({ ...call('s3', 'RunShell'), result: 'ok' });
+    expect(chatLines).toEqual([foldKindHint('RunShell', 2), 'Read r1', 'RunShell s3']);
   });
 });
 

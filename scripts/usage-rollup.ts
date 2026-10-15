@@ -10,10 +10,14 @@
 import { spawnSync } from 'node:child_process';
 
 export interface UsageRow { site: string; provider: string; model: string; calls: number; inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number; cacheCreationUnmeasuredCalls: number; usdKnown: number; unknownCostCalls: number; includedCalls: number; apiEquivalentUsd: number;
+  /** Preserve only metadata observed on the source usage row. */
+  role?: string; stage?: string; account?: string;
   /** OR-BYOK-COST — BYOK 호출 수 ⊕ 그중 상류 청구액 합(알려진 것만) ⊕ 상류를 모르는 호출 수. BYOK 를 본 행에만 있다(종전 행 바이트 불변). */
   byokCalls?: number; byokUpstreamUsd?: number; byokUpstreamUnknownCalls?: number }
 
-type UsageData = { site?: string; provider?: string; billingProvider?: string; model?: string; inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; cost?: { kind?: string; usd?: number }; podRollupKey?: string; partial?: boolean; partialSeq?: number; partialAt?: string };
+type UsageData = { site?: string; provider?: string; billingProvider?: string; model?: string; role?: unknown; stage?: unknown; account?: unknown; inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; cost?: { kind?: string; usd?: number }; podRollupKey?: string; partial?: boolean; partialSeq?: number; partialAt?: string };
+
+const observedTag = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value : undefined;
 
 /** 재방출 행 dedup 에 필요한 칸만 — 호스트 소비처(bench-report · `elanous usage`)도 같은 규칙을 쓴다. */
 export type PodRollupKeyed = { podRollupKey?: unknown; partial?: unknown; partialSeq?: unknown; partialAt?: unknown };
@@ -68,8 +72,12 @@ export function rollup(lines: readonly string[]): { rows: UsageRow[]; truncated:
   const entries = dedupePodRollupRows(parsed);
   for (const d of entries) {
     const provider = d.billingProvider ?? d.provider ?? '?';   // ⭐ 과금 주체 우선(B10)
-    const key = `${d.site ?? '?'}|${provider}|${d.model ?? '?'}`;
-    const row = by.get(key) ?? { site: d.site ?? '?', provider, model: d.model ?? '?', calls: 0, inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, cacheCreationUnmeasuredCalls: 0, usdKnown: 0, unknownCostCalls: 0, includedCalls: 0, apiEquivalentUsd: 0 };
+    const role = observedTag(d.role), stage = observedTag(d.stage), account = observedTag(d.account);
+    // A site/model bucket can contain different roles or accounts. Keeping those
+    // dimensions separate is required before the host can report who used a model.
+    const key = JSON.stringify([d.site ?? '?', provider, d.model ?? '?', role ?? null, stage ?? null, account ?? null]);
+    const row = by.get(key) ?? { site: d.site ?? '?', provider, model: d.model ?? '?', calls: 0, inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, cacheCreationUnmeasuredCalls: 0, usdKnown: 0, unknownCostCalls: 0, includedCalls: 0, apiEquivalentUsd: 0,
+      ...(role !== undefined ? { role } : {}), ...(stage !== undefined ? { stage } : {}), ...(account !== undefined ? { account } : {}) };
     row.calls++;
     row.inputTokens += Number(d.inputTokens ?? 0);
     row.outputTokens += Number(d.outputTokens ?? 0);

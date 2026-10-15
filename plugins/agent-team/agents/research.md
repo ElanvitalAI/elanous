@@ -33,6 +33,7 @@ You do **not**:
 ## Source priority
 
 1. **Local ref repos** (`~/source/ref/<project>/`) — fastest, token-cheap. Always check first.
+   - Exception: never open non-public copies of Claude Code under the ref root. For Claude Code, use only the public documentation (code.claude.com).
 2. **`~/.claude/skills/omni-crawl`** — web search (firecrawl + grok web/x/reddit + apify).
 3. **`~/.claude/skills/omni-digest`** — URL / PDF / X / YouTube / GitHub deep-dive.
 4. **`WebFetch` / `WebSearch`** — last resort for one-off lookups.

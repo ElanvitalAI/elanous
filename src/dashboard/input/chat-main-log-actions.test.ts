@@ -10,8 +10,10 @@ import {
 
 describe('dashboardLogHelpLines', () => {
   test('exposes /log fold with line, task-unit, and kind-unit', () => {
-    const foldLines = dashboardLogHelpLines().filter((line) => /^\s*\/log fold\b/.test(line));
+    // `/log fold all` (#19 bulk collapse) is a separate row; the mode row stays one.
+    const foldLines = dashboardLogHelpLines().filter((line) => /^\s*\/log fold </.test(line));
     expect(foldLines).toHaveLength(1);
+    expect(dashboardLogHelpLines().filter((line) => /^\s*\/log (unfold|fold all)\b/.test(line))).toHaveLength(2);
     expect(foldLines[0]).toContain('line');
     expect(foldLines[0]).toContain('task-unit');
     expect(foldLines[0]).toContain('kind-unit');

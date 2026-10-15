@@ -3,6 +3,10 @@
 // Auto-routes based on model name prefix, or picks the first available provider.
 
 import { createHash } from 'node:crypto';
+import { testFakeLlmEnabled, testFakeLlmProvider } from './ux-sim/fake-llm.js';
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { globalAnchorPath } from './prompt-library/universal-preamble.js';
 import type { LLMUsage } from './prompt-cache/types.js';
 import { applyOpenRouterCacheControl, openRouterPromptCacheFamily } from './prompt-cache/openrouter.js';
 import { detectLocale, type Locale } from './expression/locale.js';
@@ -27,8 +31,11 @@ import {
   dispatchWithParallelSafety,
   isSafeForParallel,
 } from './session-runtime/parallel-dispatch.js';
+import { createRetryDisplayGate, type RetryDisplayStep } from './llm-stream-retry-display.js';
 import {
   DoomLoopTracker,
+  backoffMs,
+  classifyError,
   decideRetry,
   fingerprintError,
   decideProviderFallback,
@@ -336,6 +343,8 @@ export type ToolChoice = 'auto' | 'required' | 'none' | { name: string };
 
 export interface LLMOpts {
   model?: string;
+  /** Reports the provider and model actually attempted, including fallbacks. */
+  onResolvedProvider?(provider: string, model: string): void;
   temperature?: number;
   maxTokens?: number;
   signal?: AbortSignal;
@@ -4228,17 +4237,11 @@ function permitsAutomaticProviderFallback(opts: LLMOpts & { provider?: LLMProvid
   }
 }
 
-function configuredFallbackProviders(): LLMProvider[] {
+function configuredFallbackChainSteps(): readonly string[] {
   try {
     const { getUserConfig } = require('./user-config.js') as typeof import('./user-config.js');
     const { normalizeFallbackChain } = require('./oauth/fallback-chain.js') as typeof import('./oauth/fallback-chain.js');
-    const { chain } = normalizeFallbackChain(getUserConfig().llm.fallbackChain);
-    const out: LLMProvider[] = [];
-    for (const name of providerNamesFromFallbackChain(chain)) {
-      const provider = PROVIDERS[name];
-      if (provider) out.push(provider);
-    }
-    return out;
+    return normalizeFallbackChain(getUserConfig().llm.fallbackChain).chain;
   } catch (err) {
     // ⛔ 조용히 삼키면 「설정을 못 읽었다」가 「폴백 후보가 없다」로 «둔갑»한다 —
     //   호출자는 그것을 `fallback candidates exhausted` 로 보고 사람에게 그렇게 말한다.
@@ -4250,40 +4253,129 @@ function configuredFallbackProviders(): LLMProvider[] {
   }
 }
 
-function remainingFallbackProviderNames(
+/** 체인 칸 하나가 후보에서 «왜» 빠졌나. ⭐ `exhausted` 를 설명 가능하게 하려고 남긴다(TUI-STREAM-RETRY).
+ *  `folded-into-earlier-step` = `codex-credits` 처럼 앞 칸과 같은 provider 로 접힌 칸 — 접는 동작 자체는
+ *  `providerNamesFromFallbackChain` 소유이고 여기선 «기록만» 한다. */
+export type FallbackCandidateSkipReason =
+  | 'already-attempted'
+  | 'not-available'
+  | 'folded-into-earlier-step'
+  | 'unknown-step';
+
+export interface FallbackCandidateSkip {
+  step: string;
+  provider?: string;
+  reason: FallbackCandidateSkipReason;
+}
+
+function explainFallbackCandidates(
   attemptedProviders: ReadonlySet<string>,
   opts: LLMOpts & { provider?: LLMProvider },
-): string[] {
+  chain: readonly string[] = configuredFallbackChainSteps(),
+): { candidates: string[]; skipped: FallbackCandidateSkip[] } {
   // Priority:
   //   1. per-call opts.provider → no fallback (caller pinned the route)
   //   2. llm.provider === 'auto' → ⭐ 2026-09-24 결정: `llm.fallbackChain` 을 «먼저»(codex-rotate→openai-codex · grok),
   //      그다음 체인이 «다루지 않는» 자동 후보(anthropic·gemini·local). 체인이 grok 을 뺐으면 grok 으로 새지 않는다.
   //      종전엔 auto 가 체인을 통째로 무시하고 AUTOMATIC_PROVIDER_ORDER 만 걸었다.
   //   3. otherwise → configured llm.fallbackChain (read from config; never baked here)
-  if (opts.provider) return [];
+  const candidates: string[] = [];
+  const skipped: FallbackCandidateSkip[] = [];
+  if (opts.provider) return { candidates, skipped };
+  const seen = new Set<string>();
+  const consider = (step: string, provider: LLMProvider) => {
+    if (attemptedProviders.has(provider.name)) skipped.push({ step, provider: provider.name, reason: 'already-attempted' });
+    else if (!provider.available()) skipped.push({ step, provider: provider.name, reason: 'not-available' });
+    else candidates.push(provider.name);
+  };
+  for (const step of chain) {
+    const name = providerNamesFromFallbackChain([step])[0];
+    const provider = name ? PROVIDERS[name] : undefined;
+    if (!name || !provider) {
+      skipped.push({ step, ...(name ? { provider: name } : {}), reason: 'unknown-step' });
+      continue;
+    }
+    if (seen.has(name)) {
+      skipped.push({ step, provider: name, reason: 'folded-into-earlier-step' });
+      continue;
+    }
+    seen.add(name);
+    consider(step, provider);
+  }
   if (permitsAutomaticProviderFallback(opts)) {
     const chainGoverned = new Set(providerNamesFromFallbackChain(['codex-rotate', 'grok']));
-    const ordered: LLMProvider[] = [
-      ...configuredFallbackProviders(),
-      ...automaticProviderCandidates().filter((candidate) => !chainGoverned.has(candidate.name)),
-    ];
-    const seen = new Set<string>();
-    return ordered
-      .filter((candidate) => {
-        if (seen.has(candidate.name)) return false;
-        seen.add(candidate.name);
-        return !attemptedProviders.has(candidate.name) && candidate.available();
-      })
-      .map((candidate) => candidate.name);
+    for (const candidate of automaticProviderCandidates()) {
+      if (chainGoverned.has(candidate.name) || seen.has(candidate.name)) continue;
+      seen.add(candidate.name);
+      consider(`auto:${candidate.name}`, candidate);
+    }
   }
-  return configuredFallbackProviders()
-    .filter((candidate) => !attemptedProviders.has(candidate.name) && candidate.available())
-    .map((candidate) => candidate.name);
+  return { candidates, skipped };
+}
+
+function remainingFallbackProviderNames(
+  attemptedProviders: ReadonlySet<string>,
+  opts: LLMOpts & { provider?: LLMProvider },
+): string[] {
+  return explainFallbackCandidates(attemptedProviders, opts).candidates;
+}
+
+/** 폴백 후보를 고르는 «그 순간»에 빠진 칸과 이유를 남긴다 — `provider-fallback-exhausted` 가
+ *  「무엇을 봤고 왜 아무도 안 남았나」를 혼자 말하지 못하던 결손(2026-10-14 TUI 실측) 수리. */
+function explainAndLogFallbackCandidates(
+  attemptedProviders: ReadonlySet<string>,
+  opts: LLMOpts & { provider?: LLMProvider },
+  context: { failedProvider: string; turn?: number },
+  chain?: readonly string[],
+): string[] {
+  const { candidates, skipped } = explainFallbackCandidates(attemptedProviders, opts, chain);
+  debug.log('llm.router', 'fallback-candidates', {
+    ...(context.turn !== undefined ? { turn: context.turn } : {}),
+    failedProvider: context.failedProvider,
+    candidates,
+    skipped,
+  });
+  return candidates;
+}
+
+/** 스트림 중 끊김 재시도 상한 — codex `DEFAULT_STREAM_MAX_RETRIES`(5) 와 같은 값. */
+const STREAM_DISCONNECT_MAX_RETRIES = 5;
+let streamDisconnectRetryDelayMs: (attempt: number) => number = backoffMs;
+
+/** @internal 시험 seam — 재시도 대기(기본 `backoffMs`)를 바꾼다. `undefined` 면 원복. */
+export function _setStreamDisconnectRetryDelayForTest(fn: ((attempt: number) => number) | undefined): void {
+  streamDisconnectRetryDelayMs = fn ?? backoffMs;
+}
+
+/** 흐르던 스트림의 끊김을 같은 공급자로 다시 걸어도 되나.
+ *  ⛔ 이 스트림에서 tool_call 을 받았거나 image 를 이미 내보냈으면 아니다 — 그 조각을 다시 보내면
+ *  부작용·화면이 두 번 생길 수 있다(실행 전이라도 «추측해서» 버리지 않는다). */
+function isStreamDisconnectRetryable(err: unknown, pendingCallCount: number, emittedImage: boolean): boolean {
+  if (pendingCallCount > 0 || emittedImage) return false;
+  if (err instanceof OverloadFailoverError) return false;
+  return classifyError(err) === 'network-transient';
+}
+
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const onAbort = () => { clearTimeout(timer); resolve(); };
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 /** @internal 시험 seam — auto 폴백 순서(체인 먼저 · 체인이 안 다루는 자동 후보 뒤)를 결정적으로 누른다. */
 export function _remainingFallbackProviderNamesForTest(attempted: readonly string[]): string[] {
   return remainingFallbackProviderNames(new Set(attempted), {});
+}
+
+/** @internal 시험 seam — 체인 칸별 skip 이유 ⊕ `llm.router fallback-candidates` 관측. */
+export function _explainAndLogFallbackCandidatesForTest(
+  attempted: readonly string[],
+  chain: readonly string[],
+): string[] {
+  return explainAndLogFallbackCandidates(new Set(attempted), {}, { failedProvider: attempted[0] ?? 'none' }, chain);
 }
 
 function terminalFallbackVerdict(
@@ -4388,6 +4480,9 @@ export function getProvider(model?: string): LLMProvider {
   }
   if (PROVIDERS.openrouter!.available()) return PROVIDERS.openrouter!;
 
+  // Gate Pod may intentionally have no credentials. The explicit test env
+  // supplies a deterministic answer only after every real auto candidate failed.
+  if (testFakeLlmEnabled()) return testFakeLlmProvider;
   throw new NoLlmProviderAvailableError();
 }
 
@@ -4725,7 +4820,7 @@ export async function streamLLM(
       debug.log('llm', 'outcome', { provider: activeProvider.name, status: 'error', kind: 'streamLLM', durationMs: Date.now() - started });
       throw err;
     }
-    const remaining = remainingFallbackProviderNames(attemptedProviders, opts);
+    const remaining = explainAndLogFallbackCandidates(attemptedProviders, opts, { failedProvider: activeProvider.name });
     const verdict = decideProviderFallback({
       err,
       failedProvider: activeProvider.name,
@@ -4889,6 +4984,11 @@ export interface StreamWithToolsHandlers {
       turnIndex?: number;
     },
   ): Promise<unknown>;
+  /** Optional: the final answer was enriched with a runtime verification
+   *  supplement (변경 파일·검증 명령·검증 최신성·루프 마감 상태). Fires just
+   *  before the `onText('', enriched)` re-emit so presentation hosts can
+   *  keep the user answer to `answer` and send `supplement` to logs. */
+  onFinalAnswerSupplement?(info: { answer: string; supplement: string; finalText: string }): void;
   /** Optional: notify when a tool_call is about to fire (for log line,
    *  HUD segment, etc). */
   onToolCall?(call: { id: string; name: string; args: Record<string, unknown> }): void;
@@ -8048,6 +8148,8 @@ export function billingRouteForProvider(provider: string | undefined, model: str
   if (name === 'local') return 'local';
   try {
     const auth = authKindForProvider(name, model);
+    // CREDIT-BILLING-LABEL(10-14) — codex 회전이 크레딧 소진을 정한 호출은 구독이 아니라 크레딧이다.
+    if (auth === 'oauth' && name === 'openai-codex' && codexCreditSpendReason()) return 'credit';
     return auth === 'oauth' ? 'subscription' : auth === 'local' ? 'local' : auth === 'apikey' ? 'api' : 'unknown';
   } catch {
     return 'unknown';
@@ -8087,6 +8189,7 @@ export async function streamLLMWithTools(
   const initial = finalizeStreamingProviderModel(provider, opts.model ?? provider.defaultModel);
   let activeProvider = initial.provider;
   let activeModel = initial.model;
+  opts.onResolvedProvider?.(activeProvider.name, activeModel);
   const attemptedProviders = new Set<string>([activeProvider.name]);
   let blockedProviders: ProviderFallbackAttempt[] = [];
   const effectiveModel = activeModel;
@@ -8588,6 +8691,32 @@ export async function streamLLMWithTools(
     });
     let evCount = 0;
     let lastEvType = 'none';
+    // ⭐ TUI-STREAM-RETRY(2026-10-14 실측) — 200 OK 로 흐르던 스트림이 소켓 끊김으로 죽으면 같은 공급자로
+    //   다시 건다(codex `stream_max_retries` 동형). 이 턴에서 받은 tool_call·image 가 있으면 재시도하지 않는다.
+    let streamDisconnectRetries = 0;
+    let streamEmittedImage = false;
+    // 끊긴 조각을 이력(turnText·fullText)에서 «조용히» 되감는다 — 화면엔 지우라고 알리지 않는다
+    //   (TUI 의 빈 델타는 «커밋»이다). 이미 보인 글과 겹치는 재시도 본문은 `retryDisplay` 가 막는다.
+    const retryDisplay = createRetryDisplayGate();
+    const emitRetryDisplayStep = (step: RetryDisplayStep) => {
+      if (step.kind === 'emit') {
+        if (step.delta) handlers.onText(step.delta, fullText);
+      } else if (step.kind === 'diverged') {
+        debug.log('llm.retry', 'stream-retry-display-diverged', { provider: activeProvider.name, turn, textChars: step.text.length }, { level: 'warn' });
+        handlers.onText('', '');
+        if (step.text) handlers.onText(step.text, fullText);
+      }
+    };
+    const rewindDisconnectedStream = () => {
+      if (turnText.length > 0) {
+        fullText = fullText.slice(0, fullText.length - turnText.length);
+        turnText = '';
+      }
+      retryDisplay.arm();
+      turnReasoningDetails = undefined;
+      evCount = 0;
+      lastEvType = 'none';
+    };
     // ⚠️ idle watchdog(2026-07-17) — codex SSE 가 완료 신호 없이 hang 하는 간헐 케이스 방어. 각
     // 이벤트 대기를 idle timeout 과 race — STREAM_IDLE_TIMEOUT_MS 무이벤트면 스트림 정리·탈출(받은
     // 텍스트로 진행). 35분 무한 hang → 자동 복구. 원인 규명은 consume-end 부재/idle-timeout 로그가.
@@ -8600,6 +8729,7 @@ export async function streamLLMWithTools(
           const finalized = finalizeStreamingProviderModel(activeProvider, activeModel);
           activeProvider = finalized.provider;
           activeModel = finalized.model;
+          opts.onResolvedProvider?.(activeProvider.name, activeModel);
           turnOpts = { ...turnOpts, model: activeModel };
           streamIter = activeProvider.streamChat!(history, turnOpts)[Symbol.asyncIterator]();
         }
@@ -8624,16 +8754,49 @@ export async function streamLLMWithTools(
             activeProvider = finalized.provider;
             activeModel = finalized.model;
             attemptedProviders.add(activeProvider.name);
+            streamDisconnectRetries = 0;
             turnOpts = buildTurnOpts();
             streamIter = undefined;
             continue;
           }
         }
+        if (evCount > 0 && isStreamDisconnectRetryable(err, pendingCalls.length, streamEmittedImage) && !opts.signal?.aborted) {
+          const retryData = {
+            provider: activeProvider.name,
+            model: activeModel,
+            turn,
+            scope: 'stream-disconnect',
+            category: 'network-transient',
+            reason: sanitizeProviderFailureReason(err instanceof Error ? err.message : String(err)),
+            evCount,
+            lastEvType,
+            rewoundTextChars: turnText.length,
+            maxRetries: STREAM_DISCONNECT_MAX_RETRIES,
+          };
+          if (streamDisconnectRetries < STREAM_DISCONNECT_MAX_RETRIES) {
+            const delayMs = streamDisconnectRetryDelayMs(streamDisconnectRetries);
+            streamDisconnectRetries++;
+            debug.log('llm.retry', 'retry', { ...retryData, attempt: streamDisconnectRetries, delayMs }, { level: 'warn' });
+            rewindDisconnectedStream();
+            await sleepUnlessAborted(delayMs, opts.signal);
+            if (opts.signal?.aborted) throw err;
+            streamIter = undefined;
+            continue;
+          }
+          debug.log('llm.retry', 'max-attempts-exhausted', { ...retryData, attempt: streamDisconnectRetries }, { level: 'warn' });
+          // 되감았으니 이 턴은 «출력 전» 상태다 — 아래 폴백이 다음 공급자로 깨끗이 넘어갈 수 있다.
+          rewindDisconnectedStream();
+        }
         // 명시 provider 선택만 폴백 대상이 아니다 — `streamLLM` 과 같은 계약으로
         // «원본 오류»를 그대로 올린다. 모델만 전달된 호출은 다음 provider의 기본 모델로 재시도한다.
         if (opts.provider) throw err;
+        if (evCount > 0) {
+          debug.log('llm.router', 'fallback-candidates', {
+            turn, failedProvider: activeProvider.name, candidates: [], skipped: [], outputEmitted: true, evCount, pendingCalls: pendingCalls.length,
+          });
+        }
         const remaining = evCount === 0
-          ? remainingFallbackProviderNames(attemptedProviders, opts)
+          ? explainAndLogFallbackCandidates(attemptedProviders, opts, { failedProvider: activeProvider.name, turn })
           : [];
         const verdict = decideProviderFallback({
           err,
@@ -8670,6 +8833,8 @@ export async function streamLLMWithTools(
         activeProvider = finalized.provider;
         activeModel = finalized.model;
         attemptedProviders.add(activeProvider.name);
+        // 재시도 상한은 «공급자마다» — 넘어간 공급자도 스트림 도중 끊김이면 다시 5회까지 건다.
+        streamDisconnectRetries = 0;
         turnOpts = buildTurnOpts();
         streamIter = undefined;
         continue;
@@ -8687,7 +8852,7 @@ export async function streamLLMWithTools(
       if (ev.type === 'text') {
         turnText += ev.delta;
         fullText += ev.delta;
-        handlers.onText(ev.delta, fullText);
+        emitRetryDisplayStep(retryDisplay.onText(ev.delta, turnText));
       } else if (ev.type === 'reasoning_details') {
         turnReasoningDetails = ev.details;
       } else if (ev.type === 'tool_call') {
@@ -8724,6 +8889,7 @@ export async function streamLLMWithTools(
           });
         }
       } else if (ev.type === 'image') {
+        streamEmittedImage = true;
         // Y2·1 (2026-05-17) — forward Codex server-tool image result.
         // Only fires when caller opted into opts.serverTools.imageGeneration
         // and the model invoked the built-in tool. No-op when handler
@@ -8780,6 +8946,7 @@ export async function streamLLMWithTools(
     }
 
     // hang 진단 — for-await(SSE 스트림) 정상 종료 확정. 이 로그가 없으면 codex SSE 스트림 hang.
+    emitRetryDisplayStep(retryDisplay.settle(turnText));
     debug.log('llm.stream', 'consume-end', { turn, evCount, lastEvType, textChars: turnText.length, pendingCalls: pendingCalls.length });
     const turnInfo = {
       turn,
@@ -8826,6 +8993,10 @@ export async function streamLLMWithTools(
         verificationLoopState,
         finalization,
       );
+      if (finalText !== visibleText) {
+        const answer = visibleText.trim();
+        handlers.onFinalAnswerSupplement?.({ answer, supplement: finalText.slice(answer.length).trim(), finalText });
+      }
       if (finalText !== fullText) handlers.onText('', finalText);
       emitTurnComplete(finalText);
       return finalText;
@@ -9488,32 +9659,55 @@ export async function streamLLMWithTools(
         | { kind: 'absent' }
         | { kind: 'complete'; label: string }
         | { kind: 'truncated'; label: string };
-      const anchorFileState = (systemMessages: LLMMessage[], filename: string): AnchorFileState => {
-        const escapedFilename = filename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const opening = new RegExp(`^=== (.+) \\(${escapedFilename}(?: @ [^)]+)?\\) ===$`, 'm');
-        const closing = new RegExp(`^=== end ${escapedFilename}(?: @ .+)? ===$`, 'm');
+      const anchorFileState = (systemMessages: LLMMessage[], filename: string, filePath?: string): AnchorFileState => {
+        const opening = /^=== (.+) \(([^()]+?)(?: @ ([^)]+))?\) ===$/gm;
         for (const message of systemMessages) {
           if (message.role !== 'system' || typeof message.content !== 'string') continue;
-          const openingMatch = opening.exec(message.content);
-          if (openingMatch === null || !closing.test(message.content.slice(openingMatch.index))) continue;
-          const contentStart = openingMatch.index + openingMatch[0].length;
-          const closingMatch = closing.exec(message.content.slice(contentStart));
-          const content = message.content.slice(contentStart, contentStart + (closingMatch?.index ?? 0));
-          return content.includes('…[truncated to fit anchor budget]')
-            ? { kind: 'truncated', label: openingMatch[1] }
-            : { kind: 'complete', label: openingMatch[1] };
+          for (const openingMatch of message.content.matchAll(opening)) {
+            const fencedPath = openingMatch[2]!;
+            const scope = openingMatch[3];
+            if (fencedPath.split('/').pop() !== filename) continue;
+            // The actual project-anchor fence names a filename + its
+            // directory relative to this turn's cwd. Keep the full path
+            // when one is supplied explicitly, never just its basename.
+            const anchorPath = scope === 'instance root'
+              ? globalAnchorPath()
+              : resolve(scope ?? '.', fencedPath);
+            if (filePath !== undefined) {
+              // macOS may spell the same /var path as /private/var in cwd;
+              // Read accepts either. Canonicalize both real files so a
+              // symlink spelling cannot turn a loaded anchor into a miss.
+              const samePath = (path: string): string => {
+                try { return realpathSync(path); } catch { return resolve(path); }
+              };
+              if (!anchorPath || samePath(anchorPath) !== samePath(filePath)) continue;
+            }
+            const contentStart = openingMatch.index + openingMatch[0].length;
+            const escapedPath = fencedPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const escapedScope = scope?.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            // Current fences close with their scope. Accept a legacy
+            // scopeless closing fence as well, but never another scope.
+            const closing = new RegExp(`^=== end ${escapedPath}${escapedScope ? `(?: @ ${escapedScope})?` : ''} ===$`, 'm');
+            const closingMatch = closing.exec(message.content.slice(contentStart));
+            if (closingMatch === null) continue;
+            const content = message.content.slice(contentStart, contentStart + closingMatch.index);
+            return content.includes('…[truncated to fit anchor budget]')
+              ? { kind: 'truncated', label: openingMatch[1] }
+              : { kind: 'complete', label: openingMatch[1] };
+          }
         }
         return { kind: 'absent' };
       };
-      const anchorStubContext = (filename: string): string => {
-        const state = anchorFileState(messages, filename);
+      const anchorStubContext = (filename: string, filePath?: string): string => {
+        const state = anchorFileState(messages, filename, filePath);
+        const namedPath = filePath ?? filename;
         if (state.kind === 'absent') {
-          return `\`${filename}\` is not present in the system prompt.`;
+          return `\`${namedPath}\` is not present in the system prompt.`;
         }
         if (state.kind === 'truncated') {
-          return `Only a prefix of \`${filename}\` is present in the system prompt under the \`${state.label}\` anchor; the remainder is unavailable.`;
+          return `Only a prefix of \`${namedPath}\` is present in the system prompt under the \`${state.label}\` anchor; the remainder is unavailable.`;
         }
-        return `The full text of \`${filename}\` is present in the system prompt under the \`${state.label}\` anchor.`;
+        return `The full text of \`${namedPath}\` is present in the system prompt under the \`${state.label}\` anchor.`;
       };
       // W4-anchor (2026-05-03 PM) — Scope: codex family only. Glob anchor detection is permissive:
       // contains 'AGENTS' or 'CLAUDE' AND contains '.md'. This catches
@@ -9575,11 +9769,10 @@ export async function streamLLMWithTools(
       // instead. A guardian test keeps the repo's own candidates under
       // the cap — see test/prompt-library-universal-preamble.test.ts.
       //
-      // Match: file_path's basename equals AGENTS.md or CLAUDE.md
-      // (case-sensitive). Catches `AGENTS.md`, `./AGENTS.md`,
-      // `/abs/path/AGENTS.md`, `subdir/CLAUDE.md`, etc. Other
-      // AGENTS-prefixed files (`AGENTS-helper.md`) are NOT blocked
-      // since basename match is strict.
+      // Match only a file whose resolved path corresponds to a complete or
+      // truncated fence in this turn's system prompt. A same-named file in
+      // another directory (or a policy-excluded CLAUDE.md) must remain
+      // readable; a filename alone is not evidence that it was loaded.
       const isAnchorRead = (
         call: { name: string; args: Record<string, unknown> },
       ): { filePath: string } | null => {
@@ -9587,7 +9780,8 @@ export async function streamLLMWithTools(
         const filePath = typeof call.args.file_path === 'string' ? call.args.file_path : '';
         if (filePath.length === 0) return null;
         const basename = filePath.split('/').pop() ?? '';
-        if (basename === 'AGENTS.md' || basename === 'CLAUDE.md') {
+        if ((basename === 'AGENTS.md' || basename === 'CLAUDE.md')
+          && anchorFileState(messages, basename, filePath).kind !== 'absent') {
           return { filePath };
         }
         return null;
@@ -9916,7 +10110,7 @@ export async function streamLLMWithTools(
             const filename = anchorRead.filePath.split('/').pop() ?? anchorRead.filePath;
             const stub =
               `ANCHOR READ BLOCKED — \`${anchorRead.filePath}\` matches an anchor-file read. ` +
-              `${anchorStubContext(filename)} Move to a source file (e.g. \`src/...\`) for on-disk investigation.`;
+              `${anchorStubContext(filename, anchorRead.filePath)} Move to a source file (e.g. \`src/...\`) for on-disk investigation.`;
             return { result: stub, isError: false, phaseRejected: false };
           }
           // W5-A — Literal-path Glob redirect. Codex uses Glob({pattern:
@@ -10897,6 +11091,7 @@ export async function streamLLMWithTools(
 import type { LLMConfig as UCLLMConfig, UserConfig } from './user-config.js';
 import { loadTokens, readCodexMirrorTokens } from './oauth/store.js';
 import { resolveCodexAccount, effectiveCodexHome } from './oauth/codex-account.js';
+import { codexCreditSpendReason } from './oauth/codex-billing-route.js';
 import { join } from 'node:path';
 import {
   CODEX_API_BASE_URL, getCodexUserAgent, loadFreshCodexAuthState,
@@ -11620,7 +11815,10 @@ export function getProviderForConfig(
     ? decision.provider.slice('auto:'.length)
     : decision.provider;
   if (provider === 'auto') {
-    if (resolvedProviderName === 'auto') throw new NoLlmProviderAvailableError();
+    if (resolvedProviderName === 'auto') {
+      if (testFakeLlmEnabled()) return testFakeLlmProvider;
+      throw new NoLlmProviderAvailableError();
+    }
     if (!isKnownProviderName(resolvedProviderName)) {
       throw new Error(`unknown provider: ${resolvedProviderName}`);
     }

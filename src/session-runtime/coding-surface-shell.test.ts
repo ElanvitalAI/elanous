@@ -18,6 +18,30 @@ import { runShellRuntime } from '../tool-runtime/run-shell-runtime.js';
 import { registerAllDefaultToolRuntimes } from '../tool-runtime/index.js';
 import { listToolRuntimes } from '../tool-runtime/registry.js';
 import { globalAgentRegistry } from '../agent/registry.js';
+import type { LLMProvider } from '../llm.js';
+
+/** 중단 신호가 올 때까지 매달리는 공급자. 키 없는 우주(게이트 Pod·빈 HOME)에선
+ *  배경 자식이 공급자 해석 실패로 «즉시» error 로 끝나 registry.abort 가 no-op 이
+ *  된다 — 그러면 «부모 신호 → 자식 controller» 사슬을 잴 수 없다(0.2.29 gate pod-20).
+ *  test/agent-runner.test.ts 의 hangingProvider 와 같은 꼴. */
+function hangingProvider(): LLMProvider {
+  async function hang(opts: { signal?: AbortSignal } | undefined): Promise<never> {
+    return new Promise<never>((_resolve, reject) => {
+      const sig = opts?.signal;
+      const err = () => Object.assign(new Error('aborted'), { name: 'AbortError' });
+      if (!sig) return;
+      if (sig.aborted) { reject(err()); return; }
+      sig.addEventListener('abort', () => reject(err()), { once: true });
+    });
+  }
+  return {
+    name: 'hang',
+    defaultModel: 'hang',
+    available: () => true,
+    async *streamChat(_msgs, opts) { await hang(opts); },
+    async *chat(_msgs, opts) { await hang(opts); },
+  };
+}
 
 function exposed(surfaceId: SessionSurfaceId): string[] {
   return buildSessionRuntimeToolSpecs({
@@ -225,7 +249,9 @@ describe('coding surface — shell 실행 tool 노출', () => {
         workingDirectory: cwd,
       }),
     }, 'buildChildToolCatalog');
-    const spawn = spyOn(globalAgentRegistry, 'spawn');
+    // 실제 spawn 을 그대로 부르되 공급자만 매달리는 가짜로 — 자식이 abort 전에 끝나지 않게.
+    const realSpawn = globalAgentRegistry.spawn.bind(globalAgentRegistry);
+    const spawn = spyOn(globalAgentRegistry, 'spawn').mockImplementation(spawnOpts => realSpawn({ ...spawnOpts, provider: spawnOpts.provider ?? hangingProvider() }));
 
     try {
       const result = await dispatchSessionRuntimeTool('Agent', { description: 'inherit tools', prompt: 'inspect', run_in_background: true, isolation: 'cwd' }, runtimeDispatchDeps({
@@ -254,6 +280,10 @@ describe('coding surface — shell 실행 tool 노출', () => {
       expect(spawn.mock.calls[1]?.[0]?.tools).toEqual(hostTools);
       expect(spawn.mock.calls[1]?.[0]?.dispatchTool).toBe(dispatchTool);
     } finally {
+      for (const r of spawn.mock.results) {
+        const id = (r.value as { task?: { id?: string } } | undefined)?.task?.id;
+        if (id) globalAgentRegistry.abort(id);
+      }
       spawn.mockRestore();
     }
   });

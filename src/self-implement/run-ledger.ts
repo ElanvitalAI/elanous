@@ -260,6 +260,8 @@ export interface FederatedRunLedgerLookupOptions {
 
 export interface RunLedgerLookupOptions extends FederatedRunLedgerLookupOptions {
   all?: boolean;
+  /** Single-directory scope for the non-federated lookup; default = `runLedgerDir()`. */
+  dir?: string;
   list?: (path: string) => string[];
 }
 
@@ -306,7 +308,7 @@ export function loadFederatedRunLedger(runId: string, options: FederatedRunLedge
 }
 
 function lookupRunLedgerTargets(options: RunLedgerLookupOptions): RunLedgerLookupTarget[] {
-  return options.all ? resolveFederatedRunLedgerTargets(options) : [{ ledgerDirectory: runLedgerDir(), targetName: null }];
+  return options.all ? resolveFederatedRunLedgerTargets(options) : [{ ledgerDirectory: options.dir ?? runLedgerDir(), targetName: null }];
 }
 
 /** Find exact canonical IDs first; otherwise scan canonical ledger filenames for a normalized unique prefix. */
@@ -431,6 +433,95 @@ export function recordHumanStoppedRun(runId: string, options: HumanStopRunLedger
     event: 'human-stop',
     data: { stoppedBy: options.stoppedBy, stoppedAt },
   }, options.dir);
+}
+
+/** Ledger-recording options shared by the non-blocking observers — never part of the recorded entry payload. */
+export interface NonBlockingRunLedgerOptions {
+  /** 관측 시각 — 생략하면 now */
+  timestamp?: string;
+  /** 원장 디렉터리 — 생략하면 정본 run ledger dir */
+  dir?: string;
+}
+
+/** The settled-result payload a non-blocking request records under its requestId. */
+export interface NonBlockingRunResultLedgerEntry {
+  kind: string;
+  reason?: string;
+  /** 런이 실제로 산출한 next만 담는다 — 값이 없으면 키를 생략한다(unknown 보존). */
+  next?: string;
+  ok?: boolean;
+  runId?: string;
+}
+
+/**
+ * Record a non-blocking request's immediate pending state under its minted requestId.
+ * Event-kind naming follows the `recordHumanStoppedRun` observer-event precedent; never changes a run itself.
+ */
+export function recordNonBlockingRunPending(requestId: string, options: NonBlockingRunLedgerOptions = {}): void {
+  const recordedAt = options.timestamp ?? new Date().toISOString();
+  appendRunLedgerEntry({
+    timestamp: recordedAt,
+    runId: requestId,
+    event: 'non-blocking-pending',
+    data: { requestId, kind: 'pending', recordedAt },
+  }, options.dir);
+}
+
+/**
+ * Record a non-blocking request's settled result (kind·reason·next) under the same requestId.
+ * The payload is the second argument; ledger placement options (timestamp·dir) stay a separate third argument
+ * so no option ever leaks into the recorded entry (RunLedgerEntry format stays unchanged).
+ * Event-kind naming follows the `recordHumanStoppedRun` observer-event precedent; never changes a run itself.
+ */
+export function recordNonBlockingRunResult(
+  requestId: string,
+  entry: NonBlockingRunResultLedgerEntry,
+  options: NonBlockingRunLedgerOptions = {},
+): void {
+  const recordedAt = options.timestamp ?? new Date().toISOString();
+  appendRunLedgerEntry({
+    timestamp: recordedAt,
+    runId: requestId,
+    event: 'non-blocking-result',
+    data: {
+      requestId,
+      kind: entry.kind,
+      ...(entry.reason === undefined ? {} : { reason: entry.reason }),
+      ...(entry.next === undefined ? {} : { next: entry.next }),
+      ...(entry.ok === undefined ? {} : { ok: entry.ok }),
+      ...(entry.runId === undefined ? {} : { runId: entry.runId }),
+      recordedAt,
+    },
+  }, options.dir);
+}
+
+/** The non-blocking request record a ledger carries for its runId; latest result wins over the pending entry. */
+export interface NonBlockingRunLedgerRecord {
+  requestId: string;
+  kind: string;
+  reason?: string;
+  /** next는 런이 실제로 산출한 값만 담는다 — 원장에 적힌 값이 없으면 이 키도 없다(unknown 보존). */
+  next?: string | null;
+}
+
+/** Read the non-blocking request record from an already-loaded ledger; null when the ledger carries none. */
+export function readNonBlockingRunRecord(ledger: readonly RunLedgerEntry[]): NonBlockingRunLedgerRecord | null {
+  let record: NonBlockingRunLedgerRecord | null = null;
+  for (const entry of ledger) {
+    if (entry.event === 'non-blocking-pending' && record === null) {
+      record = { requestId: entry.runId, kind: 'pending', next: null };
+      continue;
+    }
+    if (entry.event !== 'non-blocking-result' || typeof entry.data.kind !== 'string') continue;
+    const reason = typeof entry.data.reason === 'string' ? entry.data.reason : undefined;
+    record = {
+      requestId: entry.runId,
+      kind: entry.data.kind,
+      ...(reason === undefined ? {} : { reason }),
+      ...(typeof entry.data.next === 'string' ? { next: entry.data.next } : {}),
+    };
+  }
+  return record;
 }
 
 function parseRunLedgerEntry(line: string, lineNumber: number, expectedRunId: string): RunLedgerEntry {
@@ -1210,6 +1301,8 @@ export interface UnfinishedRunLedgerEntry {
   lastActivityStatus: LastActivityStatus;
   /** ⭐ 「남은 것」을 «가려» 보여 주는 등급 — 종전엔 이 조회가 한 값뿐이라 회고에서 못 갈랐다. */
   lifecycle: UnfinishedRunLifecycle;
+  /** Non-blocking request record (kind·reason·next) carried by this runId's ledger; absent for runs without one. */
+  nonBlocking?: NonBlockingRunLedgerRecord;
 }
 
 export interface UnfinishedRunLedgerQuery {
@@ -1294,7 +1387,10 @@ function hasCanonicalRunStatus(ledger: readonly RunLedgerEntry[]): boolean {
 }
 
 /** Events that may follow a terminal run-status without reopening the run. Anything else stays unfinished. */
-export const TRAILING_BOOKKEEPING_EVENTS = ['pipeline-traversal-shadow', 'run-rollup', 'progress-delivery', 'progress-delivery-outcome'] as const;
+// `non-blocking-pending`/`non-blocking-result` are observer records of the non-blocking request
+// surface (#26634 칸 NONBLOCKING-RESULT-LEDGER). They carry the requestId result, never a run
+// lifecycle, so appending them after a terminal run-status must not reopen the run.
+export const TRAILING_BOOKKEEPING_EVENTS = ['pipeline-traversal-shadow', 'run-rollup', 'progress-delivery', 'progress-delivery-outcome', 'non-blocking-pending', 'non-blocking-result'] as const;
 
 const TRAILING_BOOKKEEPING_EVENT_SET = new Set<string>(TRAILING_BOOKKEEPING_EVENTS);
 
@@ -1559,6 +1655,7 @@ interface UnfinishedLedgerFacts {
   targetRoot: string | null;
   goalFile: string | null;
   fixedLifecycle: UnfinishedRunLifecycle;
+  nonBlocking: NonBlockingRunLedgerRecord | null;
 }
 
 // A full federated scan can exceed 5,000 files; keep the previous scan resident for mtime-checked reuse.
@@ -1589,6 +1686,7 @@ function unfinishedLedgerFacts(ledger: readonly RunLedgerEntry[]): UnfinishedLed
     targetRoot: ledgerTargetRoot(ledger),
     goalFile: ledgerGoalDocument(ledger),
     fixedLifecycle: classifyUnfinishedLifecycle(ledger, null, 0),
+    nonBlocking: readNonBlockingRunRecord(ledger),
   };
 }
 
@@ -1698,7 +1796,9 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
     if (facts.terminal) {
       terminal += 1;
       if (facts.terminalByTrailingRunStatus) terminalByTrailingRunStatus += 1;
-      continue;
+      // A run carrying a non-blocking request record stays queryable by requestId even after its
+      // terminal run-status; runs without one keep the exact previous skip behavior.
+      if (!facts.nonBlocking) continue;
     }
 
     const branch = facts.branch;
@@ -1726,7 +1826,7 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
           : goalDocument.status === 'directory-unreadable'
             ? 'goal-directory-unreadable'
             : 'goal-document-not-found';
-      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: [], plannedPathStatus, ...unknownDeclaredPaths(), pathMatchReasons: {}, goalDocumentPath: null, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle });
+      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: [], plannedPathStatus, ...unknownDeclaredPaths(), pathMatchReasons: {}, goalDocumentPath: null, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle, ...(facts.nonBlocking ? { nonBlocking: facts.nonBlocking } : {}) });
       continue;
     }
     try {
@@ -1734,9 +1834,9 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
       const text = typeof document === 'string' ? document : document.toString('utf8');
       const paths = [...new Set(tracedPathReferences(text).map((reference) => reference.path))];
       const declared = declaredPathsFromGoalDocument(text);
-      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: paths, plannedPathStatus: paths.length > 0 ? goalDocument.source === 'ledger' ? 'found-ledger-goal-file' : 'found-branch-fallback' : 'no-traced-paths', ...declared, pathMatchReasons: pathMatchReasons(declared.declaredPaths, paths), goalDocumentPath: goalDocument.path, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle });
+      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: paths, plannedPathStatus: paths.length > 0 ? goalDocument.source === 'ledger' ? 'found-ledger-goal-file' : 'found-branch-fallback' : 'no-traced-paths', ...declared, pathMatchReasons: pathMatchReasons(declared.declaredPaths, paths), goalDocumentPath: goalDocument.path, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle, ...(facts.nonBlocking ? { nonBlocking: facts.nonBlocking } : {}) });
     } catch {
-      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: [], plannedPathStatus: 'goal-document-unreadable', declaredPaths: [], declaredPathStatus: 'goal-document-unreadable', pathMatchReasons: {}, goalDocumentPath: goalDocument.path, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle });
+      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: [], plannedPathStatus: 'goal-document-unreadable', declaredPaths: [], declaredPathStatus: 'goal-document-unreadable', pathMatchReasons: {}, goalDocumentPath: goalDocument.path, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle, ...(facts.nonBlocking ? { nonBlocking: facts.nonBlocking } : {}) });
     }
   }
   entries.sort((left, right) => left.runId.localeCompare(right.runId));
@@ -1885,7 +1985,11 @@ export function queryFederatedUnfinishedRunLedgers(options: FederatedUnfinishedR
   //   📏 실측(2026-08-11): 미완 57 중 ***7*** 이 다른 원장에 종결을 갖고 있었다.
   // ⛔ 판정 술어는 스캐너와 «같은 것»을 쓴다(`run-status` 또는 `terminal`) — 어휘를 새로 만들지 않는다.
   const terminatedElsewhere = new Set<string>();
-  const unfinishedRunIds = requestedRunIds === undefined ? new Set(entries.map((entry) => entry.runId)) : new Set([...requestedRunIds].filter((runId) => entries.some((entry) => entry.runId === runId)));
+  // Runs carrying a non-blocking request record never drop out of the union: their requestId
+  // reason·next must survive restarts and cross-directory reconciliation alike.
+  const unfinishedRunIds = requestedRunIds === undefined
+    ? new Set(entries.filter((entry) => !entry.nonBlocking).map((entry) => entry.runId))
+    : new Set([...requestedRunIds].filter((runId) => entries.some((entry) => entry.runId === runId && !entry.nonBlocking)));
   for (const runId of unfinishedRunIds) {
     for (const ledgerDirectory of ledgerDirectories) {
       try {

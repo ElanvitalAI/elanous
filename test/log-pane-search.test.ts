@@ -1,7 +1,8 @@
 // In-pane search — findLogMatches + highlightLineSegments pure fns.
 
 import { describe, expect, test } from 'bun:test';
-import { findLogMatches, highlightLineSegments } from '../src/log-pane/search.js';
+import { findLogMatches, findVisibleLogMatches, highlightLineSegments } from '../src/log-pane/search.js';
+import { visibleSearchRowOffset } from '../src/panes/log-pane.js';
 import { stripAnsi } from '../src/tui.js';
 
 describe('findLogMatches', () => {
@@ -59,6 +60,25 @@ describe('findLogMatches', () => {
     // Preview is stripped so the escapes don't bleed into the UI.
     expect(results[0]!.preview).not.toContain('\x1b');
     expect(results[0]!.preview).toContain('ERROR');
+  });
+
+  test('late match in a multiline entry points to its painted row', () => {
+    const lines = ['earlier', Array.from({ length: 30 }, (_, i) => i === 25 ? 'needle' : `row ${i}`).join('\n'), 'later'];
+    const result = findLogMatches(lines, 'needle')[0]!;
+    expect(result.lineIdx).toBe(1);
+    expect(result.physicalRowInEntry).toBe(25);
+    expect(result.preview).toBe('needle');
+    expect(visibleSearchRowOffset(lines, result)).toBe(26);
+    expect(visibleSearchRowOffset(lines, result, 'needle')).toBe(0);
+  });
+
+  test('search excludes hidden physical rows and can choose a later visible match', () => {
+    const lines = ['foo\nbar\nfoo bar'];
+    expect(findVisibleLogMatches(lines, 'bar', 'foo')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ lineIdx: 0, physicalRowInEntry: 2 }),
+    ]));
+    expect(findVisibleLogMatches(['foo\nbar'], 'bar', 'foo')).toEqual([]);
+    expect(findVisibleLogMatches(['foo\nbar'], 'bar', 'bar')[0]?.physicalRowInEntry).toBe(1);
   });
 });
 

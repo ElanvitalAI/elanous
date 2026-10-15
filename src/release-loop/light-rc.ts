@@ -11,6 +11,7 @@ import { runSelfGateCli, type SelfGateCliOptions, type SelfGateCliResult } from 
 import { dispatchHeavyCheck, isValidGateHost, type DispatchDeps, type DispatchOptions } from '../self-implement/gate-remote.js';
 import { latestPublishedPreviousVersion } from '../../scripts/release-loop/unattended-release.js';
 import { baseVersion, isReleaseVersion } from '../../scripts/release-loop/release-version.js';
+import { executeTuiNodeCheck, type ExecutedTuiCheck } from '../../scripts/release-loop/tui-node-checks.js';
 
 export const LIGHT_RC_ALWAYS_FILE = 'release/light-rc-always.txt';
 export const LIGHT_RC_DEFAULT_SHARDS = 4;
@@ -31,6 +32,8 @@ export interface LightRcOptions {
   /** Release ledger root for the previous-version lookup (release run's deps.ledgerRoot). */
   ledgerRoot?: string;
   log?: (line: string) => void;
+  /** Rehearsal-only TUI screen check; other light-rc callers keep their current defaults. */
+  rehearsalTui?: boolean;
 }
 
 export interface LightRcResult {
@@ -57,6 +60,7 @@ export interface LightRcResult {
   /** LIGHT-RC-MEASURE ③ — why the gate produced no measurement (e.g. `shard-2`); null = it measured. Carried in the
    *  JSON so the reason reaches the caller even when the remote child's human lines (stderr) do not. */
   unmeasured: string | null;
+  rehearsalTui?: ExecutedTuiCheck;
 }
 
 export interface LightRcDeps {
@@ -68,6 +72,7 @@ export interface LightRcDeps {
   dispatch?: (opts: DispatchOptions, deps?: DispatchDeps) => Promise<number>;
   /** Extra dispatch deps (runner · settings) — tests drive the real dispatch with a fake host. */
   dispatchDeps?: Omit<DispatchDeps, 'write'>;
+  tuiCheck?: typeof executeTuiNodeCheck;
   /** Detached checkout of `sha` for a local run whose tree is not at the measured commit (default: git worktree add
    *  --detach in a temp dir ⊕ bun install); `cleanup` removes it. */
   checkout?: (sha: string, repo: string, log: (line: string) => void) => { dir: string; cleanup: () => void };
@@ -180,13 +185,21 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
   let alwaysInclude = readList(cwd);
 
   let local: SelfGateCliResult | undefined;
-  const runLocal = () => {
+  let localTui: ExecutedTuiCheck | undefined;
+  const runLocal = async () => {
     // ① The gate scopes by its tree's HEAD — so a tree that is not at the measured commit runs in a detached checkout of it.
     const checkout = worktreeHead === measuredCommit ? undefined : (deps.checkout ?? defaultCheckout)(measuredCommit, cwd, log);
     try {
       const dir = checkout?.dir ?? cwd;
       if (checkout) alwaysInclude = readList(dir);
       local = (deps.runGate ?? runSelfGateCli)(dir, { base, shards, alwaysInclude, includeImporterTests: true });
+      if (opts.rehearsalTui) {
+        const command = async (cmd: string, args: string[], tree: string, limitMs?: number) => {
+          const run = spawnSync(cmd, args, { cwd: tree, encoding: 'utf8', timeout: limitMs });
+          return { rc: run.status ?? 2, output: `${run.stdout ?? ''}\n${run.stderr ?? ''}` };
+        };
+        localTui = await (deps.tuiCheck ?? executeTuiNodeCheck)(measuredCommit, dir, command);
+      }
     } finally { checkout?.cleanup(); }
     for (const line of local.lines) log(line);
     return local.exitCode;
@@ -195,7 +208,7 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
   const rc = await (deps.dispatch ?? dispatchHeavyCheck)({
     tool: 'self-gate', repo: cwd, installPwa: true, refs: [base], json: true, commit: measuredCommit,
     // The host re-runs this command with --local (and ELANOUS_GATE_REMOTE_CHILD=1), so it never recurses.
-    remoteArgv: (sha) => ['bun', 'bin/elanous.mjs', 'release', 'light-rc', '--version', version, '--base', sha(base), '--head', measuredCommit, '--shards', String(shards), '--local', '--json'],
+    remoteArgv: (sha) => ['bun', 'bin/elanous.mjs', 'release', 'light-rc', '--version', version, '--base', sha(base), '--head', measuredCommit, '--shards', String(shards), '--local', '--json', ...(opts.rehearsalTui ? ['--rehearsal-tui'] : [])],
     flags: { remote: opts.local ? undefined : opts.remote ?? true, local: !!opts.local },
     runLocal,
   }, {
@@ -236,11 +249,22 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
       unmeasured: typeof remote.unmeasured === 'string' && remote.unmeasured
         ? remote.unmeasured
         : typeof remote.introduced === 'number' ? null : LIGHT_RC_REASON_NOT_REPORTED,
+      ...(remote.rehearsalTui ? { rehearsalTui: remote.rehearsalTui } : {}),
     };
   }
   // Unmeasured (null) or unclassified failures are never green; policy-gate findings in the gate output are reported
   // (gate rc), not a regression.
-  result.ok = result.introduced === 0 && result.unclassified === 0;
+  if (opts.rehearsalTui) {
+    if (local) {
+      result.rehearsalTui = localTui ?? { outcome: 'unmeasured', detail: 'local TUI screen result missing' };
+    } else {
+      const tui = result.rehearsalTui;
+      result.rehearsalTui = tui && ['ok', 'fail', 'unmeasured'].includes(tui.outcome) && typeof tui.detail === 'string' && tui.detail.length > 0
+        ? tui : { outcome: 'unmeasured', detail: 'remote TUI screen result missing' };
+    }
+  }
+  result.ok = result.introduced === 0 && result.unclassified === 0 && result.unmeasured === null
+    && (!opts.rehearsalTui || result.rehearsalTui?.outcome === 'ok');
   debug.log('release.light-rc', 'done', { version, base, measuredCommit, worktreeHead, importerTests: result.importerTests, introduced: result.introduced, preexisting: result.preexisting, unclassified: result.unclassified, shards, remote: result.remote, unmeasured: result.unmeasured });
   return result;
 }
@@ -250,5 +274,6 @@ export function formatLightRc(result: LightRcResult): string[] {
     `${result.ok ? '✅' : '⛔'} light-rc ${result.version} · base ${result.base.slice(0, 12)} · measured ${result.measuredCommit.slice(0, 12)} · ${result.remote ? `host ${result.remote}` : 'local'} · shards ${result.shards}`,
     `  introduced ${result.introduced ?? '못 쟀다'} · preexisting ${result.preexisting ?? '못 쟀다'} · unclassified ${result.unclassified ?? '못 쟀다'} · importer tests ${result.importerTests ?? '못 쟀다'} · always-include ${result.alwaysInclude}${result.alwaysIncludeMissing.length ? ` (missing: ${result.alwaysIncludeMissing.join(', ')})` : ''} · gate rc ${result.gateExitCode}`,
     ...(result.unmeasured !== null ? [`  shards: unmeasured (${result.unmeasured})`] : []),
+    ...(result.rehearsalTui ? [`  TUI screens: ${result.rehearsalTui.outcome} (${result.rehearsalTui.detail})`] : []),
   ];
 }

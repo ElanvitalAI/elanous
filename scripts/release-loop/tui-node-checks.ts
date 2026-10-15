@@ -27,6 +27,29 @@ export function tuiChecks(s: TuiScreens, readyLimitMs = 60_000): TuiCheck[] {
   ];
 }
 
+export interface ExecutedTuiCheck { outcome: 'ok' | 'fail' | 'unmeasured'; detail: string }
+
+/** Run the screen-based TUI node, not `--help`: the subprocess boots a PTY, captures first/help/Esc screens and judges them. */
+export async function executeTuiNodeCheck(commit: string, repo: string,
+  command: (cmd: string, args: string[], cwd: string, limitMs?: number) => Promise<{ rc: number; output: string }>): Promise<ExecutedTuiCheck> {
+  const run = await command('bun', ['scripts/release-loop/tui-sim-node.ts', '--commit', commit, '--json'], repo, 300_000);
+  const line = run.output.split(/\r?\n/).find((text) => text.trim().startsWith('{'));
+  let value: Record<string, unknown>;
+  try { value = JSON.parse(line ?? '') as Record<string, unknown>; }
+  catch { return { outcome: 'unmeasured', detail: `TUI screen result missing (rc=${run.rc})` }; }
+  if (run.rc === 0 && reusableTui(withTuiOutcome(run.rc, value), commit))
+    return { outcome: 'ok', detail: `TUI screens: ${value.verdict} · 6 checks` };
+  const ids = ['boot', 'prompt', 'status-bar', 'help-opens', 'help-closes', 'no-error-text'];
+  const measuredFailure = run.rc === 1 && value.commit === commit && value.verdict === 'fail' && value.attempts === 2
+    && Array.isArray(value.checks) && value.checks.length === ids.length
+    && value.checks.every((check: unknown, i: number) => !!check && typeof check === 'object'
+      && (check as TuiCheck).id === ids[i] && typeof (check as TuiCheck).pass === 'boolean'
+      && typeof (check as TuiCheck).detail === 'string')
+    && value.checks.some((check: TuiCheck) => !check.pass);
+  const failed = measuredFailure ? (value.checks as TuiCheck[]).filter((check) => !check.pass).map((check) => check.id) : [];
+  return { outcome: measuredFailure ? 'fail' : 'unmeasured', detail: `TUI screens: ${failed.join(', ') || String(value.verdict)} (rc=${run.rc})` };
+}
+
 export function tuiVerdict(checks: readonly TuiCheck[]): 'pass' | 'fail' {
   return checks.every((c) => c.pass) ? 'pass' : 'fail';
 }

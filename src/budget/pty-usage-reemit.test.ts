@@ -21,14 +21,16 @@ test('three Codex turns emit run-scoped PTY usage once across repeated scans and
       })),
     ];
     writeFileSync(join(sessions, 'fixture.jsonl'), lines.map((line) => JSON.stringify(line)).join('\n'));
-    const opts = { codexHome: join(dir, 'codex'), runId: 'run-fixture', workdir: join(dir, 'worktree'), sessionId: 'fixture-session', ledgerPath: join(dir, 'ledger.sqlite') };
+    const opts = { codexHome: join(dir, 'codex'), runId: 'run-fixture', workdir: join(dir, 'worktree'), sessionId: 'fixture-session', ledgerPath: join(dir, 'ledger.sqlite'),
+      role: 'implement', stage: 'implement', account: 'verified-fixture-account' };
     expect(reemitPtyUsage(opts)).toBe(3);
     expect(reemitPtyUsage(opts)).toBe(0);
     expect(reemitPtyUsage({ ...opts, runId: 'another-run' })).toBe(0);
     const rows = log.mock.calls.filter(([category, event]) => category === 'llm.usage' && event === 'llm-usage');
     expect(rows).toHaveLength(3);
     expect(rows.map(([, , data]) => data)).toEqual([0, 1, 2].map((i) => ({
-      runId: 'run-fixture', substrate: 'pty', site: 'pty-rollup:codex', turnId: `codex:turn-${i}`,
+      runId: 'run-fixture', role: 'implement', stage: 'implement', account: 'verified-fixture-account',
+      substrate: 'pty', site: 'pty-rollup:codex', turnId: `codex:turn-${i}`,
       model: 'gpt-fixture', provider: 'codex', billingProvider: 'codex', billing: 'subscription',
       inputTokens: [11, 17, 23][i], outputTokens: [3, 5, 7][i], cacheReadInputTokens: [2, 4, 6][i],
       cost: { kind: 'unknown', model: 'gpt-fixture' },

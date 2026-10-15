@@ -320,9 +320,11 @@ describe('createDashboardTurnStreamRuntime', () => {
   test('uses rendered tool runtime for structured tool events', () => {
     const setArgsCalls: Array<Record<string, unknown>> = [];
     const deleted: string[] = [];
+    // The fake block writer appends like the real one — the applier now clamps assistantStart to chatLines.length (#27721).
+    const chatLines: string[] = [];
     const runtime = createDashboardTurnStreamRuntime({
       initialAssistantStart: 0,
-      chatLines: [],
+      chatLines,
       thinking: { update: () => {}, updateMetrics: () => {} },
       draw: () => {},
       pinChatTail: () => {},
@@ -340,7 +342,7 @@ describe('createDashboardTurnStreamRuntime', () => {
         setArgs: (_id, args) => { setArgsCalls.push(args); },
         getArgs: () => ({ q: 1 }),
         deleteArgs: (id) => { deleted.push(id); },
-        replaceBlock: (_id, _lines, assistantStart) => assistantStart + 1,
+        replaceBlock: (_id, lines, assistantStart) => { chatLines.push(...lines.slice(0, 1)); return assistantStart + 1; },
         registerFold: () => {},
       },
       brainIcon: '[brain]',

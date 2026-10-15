@@ -134,7 +134,11 @@ function askMarkerCount(ask: string): number {
   return (ask.match(/(?:^|\s)(?:불변식|경계|판정\s*신호|invariant|boundary|decision\s+signal)\s*:/gi) ?? []).length;
 }
 
-type EnhanceSelectionSource = 'opts' | 'env' | 'config-role' | 'default';
+type EnhanceSelectionSource = 'opts' | 'env' | 'config-role' | 'fallback-child' | 'default';
+const PLANNING_FALLBACK_REASONS = new Set(['quota-exhausted', 'quota-unmeasured', 'quota-unavailable', 'no-credential-source', 'expiring', 'credential-shape', 'credential-error', 'credential-unavailable', 'unavailable']);
+export function normalizePlanningFallbackReason(value: unknown): string {
+  return typeof value === 'string' && PLANNING_FALLBACK_REASONS.has(value) ? value : 'unavailable';
+}
 
 /** Select the authoring knobs independently; a planning effort alone cannot change the model. */
 export function selectEnhanceLlm(
@@ -146,8 +150,10 @@ export function selectEnhanceLlm(
   const configuredModel = opts.model === undefined && !env.ELANOUS_PROMPT_ENHANCE_MODEL
     && planning && (planning.model || planning.tier || planning.provider)
     ? resolveRoleLlm('planning', { config, overrides: {} }).model : undefined;
+  const forwardedModelSource = env.ELANOUS_PROMPT_ENHANCE_MODEL_RELAY === 'pod' ? env.ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE : undefined;
   const modelSource: EnhanceSelectionSource = opts.model !== undefined ? 'opts'
-    : env.ELANOUS_PROMPT_ENHANCE_MODEL ? 'env'
+    : env.ELANOUS_PROMPT_ENHANCE_MODEL
+      ? forwardedModelSource === 'config-role' || forwardedModelSource === 'fallback-child' || forwardedModelSource === 'default' ? forwardedModelSource : 'env'
     : configuredModel !== undefined ? 'config-role' : 'default';
   const model = opts.model ?? (env.ELANOUS_PROMPT_ENHANCE_MODEL || configuredModel || env.ELANOUS_PR_REVIEW_MODEL || tierModel('better'));
   const envEffort = env.ELANOUS_PROMPT_ENHANCE_EFFORT;
@@ -170,15 +176,25 @@ export function selectEnhanceLlm(
 export function selectPlanningLlm(
   env: NodeJS.ProcessEnv = process.env,
   config: UserConfig = getUserConfig(),
-): { model: string | undefined; effort: 'low' | 'medium' | 'high' } {
+): { model: string | undefined; effort: 'low' | 'medium' | 'high'; modelSource: 'env' | 'config-role' | 'fallback-child' | 'default'; fallbackReason?: string; requestedModel?: string; requestedSource?: string } {
   const planning = config.roleLlm?.planning;
-  const model = env.ELANOUS_PROMPT_ENHANCE_MODEL
-    || (planning && (planning.model || planning.tier || planning.provider)
-      ? resolveRoleLlm('planning', { config, overrides: {} }).model
-      : undefined);
+  const envModel = env.ELANOUS_PROMPT_ENHANCE_MODEL;
+  const roleModel = !envModel && planning && (planning.model || planning.tier || planning.provider)
+    ? resolveRoleLlm('planning', { config, overrides: {} }).model : undefined;
+  const model = envModel || roleModel || undefined;
+  // Pod authoring receives the host's selection through env. Preserve its origin for the grounding log.
+  const relayed = env.ELANOUS_PROMPT_ENHANCE_MODEL_RELAY === 'pod';
+  const forwardedSource = relayed ? env.ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE : undefined;
+  const modelSource = envModel
+    ? forwardedSource === 'config-role' || forwardedSource === 'fallback-child' || forwardedSource === 'default' ? forwardedSource : 'env'
+    : roleModel ? 'config-role' : 'default';
   const envEffort = env.ELANOUS_PROMPT_ENHANCE_EFFORT;
   const validEnvEffort = envEffort === 'low' || envEffort === 'medium' || envEffort === 'high' ? envEffort : undefined;
-  return { model, effort: validEnvEffort ?? planning?.effort ?? 'high' };
+  const fallbackReason = modelSource === 'fallback-child' ? normalizePlanningFallbackReason(env.ELANOUS_PROMPT_ENHANCE_MODEL_FALLBACK_REASON) : undefined;
+  const requestedModel = fallbackReason ? env.ELANOUS_PROMPT_ENHANCE_REQUESTED_MODEL : undefined;
+  const requestedSource = fallbackReason ? env.ELANOUS_PROMPT_ENHANCE_REQUESTED_SOURCE : undefined;
+  return { model, effort: validEnvEffort ?? planning?.effort ?? 'high', modelSource,
+    ...(fallbackReason ? { fallbackReason } : {}), ...(requestedModel ? { requestedModel } : {}), ...(requestedSource ? { requestedSource } : {}) };
 }
 
 /** 스캐폴드 생성 LLM 시스템 프롬프트 — 가산·원문불가침 규율. */

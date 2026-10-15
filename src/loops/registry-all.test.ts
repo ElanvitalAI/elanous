@@ -28,7 +28,9 @@ test('all inventory joins graph cron once and adds seat, shell and orchestrator 
       '*/10 * * * * bun scripts/loop-orchestrator.ts',
     ].join('\n') + '\n' });
     db.run("UPDATE schedule_registry SET category = 'monitor' WHERE command LIKE '%--seat TC'");
-    const opts = { root, stateRoot: root, now: new Date('2026-10-04T12:00:00Z'), schedules: listSchedules(db) };
+    const opts = { root, stateRoot: root, now: new Date('2026-10-04T12:00:00Z'), schedules: listSchedules(db),
+      wakeDeps: { listPtys: () => [{ id: 'tui:7', nickname: 'tc', alive: true }],
+        readPane: (path: string) => path.endsWith(join('MK', 'herdr.pane')) ? 'wJ:p3' : null } };
     const before = listLoops(opts);
     const all = listAllLoops(opts);
     expect(listLoops(opts)).toEqual(before);
@@ -40,6 +42,11 @@ test('all inventory joins graph cron once and adds seat, shell and orchestrator 
         kind: 'seat', owner: seat, enabled: true, registered: true, expectEveryMinutes: minutes,
       });
     }
+    // Seat rows are addressed by their seat and show the wake path resolved on this host — or «모름».
+    const seatRow = (seat: string) => all.find(loop => loop.kind === 'seat' && loop.owner === seat);
+    expect(seatRow('TC')).toMatchObject({ msgAddress: 'TC', replyBody: 'agent', wake: 'pty-inject', wakeSource: 'pty-name' });
+    expect(seatRow('MK')).toMatchObject({ msgAddress: 'MK', replyBody: 'agent', wake: 'herdr', wakeSource: 'herdr.pane' });
+    expect(seatRow('OP')).toMatchObject({ msgAddress: 'OP', replyBody: 'agent', wake: 'none', wakeSource: 'unresolved' });
     expect(all.find(loop => loop.kind === 'graph')).toMatchObject({ host: hostname(), observationCategory: 'graph.runner' });
     expect(all.find(loop => loop.kind === 'seat' && loop.owner === 'TC')).toMatchObject({ host: hostname(), observationCategory: 'monitor' });
     expect(all.find(loop => loop.kind === 'cron-shell')).toMatchObject({ expectEveryMinutes: 5, registered: true, host: hostname(), observationCategory: 'maintenance' });
@@ -86,6 +93,20 @@ test('four fenced seat loop CLI crons are owned by their seat and accounted once
     writeFileSync(configPath, JSON.stringify({ loops: { owners: { 'elanous:seat-loop:MK': 'UX' } } }));
     expect(listAllLoops({ ...opts, config: buildUserConfig(configPath) }).find(entry => entry.id === 'elanous:seat-loop:MK'))
       .toMatchObject({ owner: 'UX', ownerSource: 'config' });
+  } finally { db.close(); }
+});
+
+test('only declared seats get a seat message address; an undeclared seat row stays unaddressed', () => {
+  const root = mkdtempSync(join(tmpdir(), 'registry-seat-undeclared-'));
+  roots.push(root);
+  const db = openSchedulesDb(join(root, 'schedules.db'));
+  try {
+    inventoryCrontab(db, { crontab: '*/15 * * * * bun scripts/seat-loop.ts --seat QQ\n*/15 * * * * bun scripts/seat-loop.ts --seat OP\n' });
+    const all = listAllLoops({ root, stateRoot: root, now: new Date('2026-10-04T12:00:00Z'), schedules: listSchedules(db),
+      wakeDeps: { listPtys: () => [], readPane: () => null } });
+    const seats = all.filter(entry => entry.kind === 'seat');
+    expect(seats.find(entry => entry.owner === 'OP')).toMatchObject({ msgAddress: 'OP', replyBody: 'agent', wake: 'none', wakeSource: 'unresolved' });
+    for (const entry of seats.filter(row => row.owner !== 'OP')) expect(entry).toMatchObject({ msgAddress: null, replyBody: 'none', wake: 'none' });
   } finally { db.close(); }
 });
 

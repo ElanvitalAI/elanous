@@ -1,6 +1,7 @@
 import type { WizardIO } from '../../onboarding.js';
 import type { SetupCheckResult } from '../setup-status.js';
 import type { TailscaleProbe } from './tailscale-probe.js';
+import { createManagementStarterContract } from '../../persona/presets.js';
 
 export interface FirstBootWizardDeps {
   io: WizardIO;
@@ -18,13 +19,31 @@ export interface FirstBootWizardDeps {
   pwaBuilt?: boolean;
   /** Tailscale probe 결과 (alive 시 magicDNS / IP 도 banner 에 노출). */
   tailscale?: TailscaleProbe;
+  /** 0.2.29 PERSONA-STARTER — «경영» 스타터 계약을 쓸 persona 저장소 경로.
+   *  생략하면 기본 상태 저장소(resolveStatePersonaDir) — 운영 첫 실행 경로. */
+  starterContractDir?: string;
 }
 
 export type FirstBootStep = 'llm' | 'tailscale';
 
+/** 0.2.29 PERSONA-STARTER — 직업 질문에서 «경영»을 골랐을 때 만들어진 스타터 계약 한 장. */
+export interface StarterContractSummary {
+  personaId: string;
+  displayName: string;
+  path: string;
+}
+
 export type FirstBootResult =
-  | { action: 'completed'; stepsRun: FirstBootStep[] }
+  | { action: 'completed'; stepsRun: FirstBootStep[]; starterContract?: StarterContractSummary }
   | { action: 'skipped'; reason: 'no-tty' | 'all-set-up' };
+
+/** 직업 질문 답의 정규화 — «1»·«경영»·«management» 는 경영,
+ *  나머지(빈 답 포함)는 일반(현재 첫 실행 동작 유지). */
+export function normalizeOccupationChoice(input: string): 'management' | 'general' {
+  const v = input.trim().toLowerCase();
+  if (v === '1' || v === '경영' || v === 'management') return 'management';
+  return 'general';
+}
 
 function isTty(force?: boolean): boolean {
   if (force === true) return true;
@@ -89,6 +108,39 @@ function printPwaSetupBanner(deps: FirstBootWizardDeps): void {
   deps.io.print('');
 }
 
+/** 0.2.29 PERSONA-STARTER — 직업 질문. «경영»이면 경영 스타터 계약 한 장을
+ *  만들고, 일반이면 계약 없이 현재 흐름 그대로. 계약 생성이 실패해도
+ *  wizard 결과는 completed 로 유지한다(fail-soft). */
+async function askOccupationAndCreateStarter(
+  deps: FirstBootWizardDeps,
+  out: { log: (s: string) => void; error: (s: string) => void },
+): Promise<StarterContractSummary | undefined> {
+  const io = deps.io;
+  if (io.nonInteractive) return undefined;
+  io.print('');
+  io.print('  어떤 일을 하세요? 고르면 스타터 계약 한 장을 만듭니다.');
+  io.print('    1) 경영 — 방향·판단·운영을 함께 세우는 경영 스타터');
+  io.print('    2) 일반 — 지금처럼 계속 (스타터 계약 없이)');
+  let answer: string;
+  try {
+    answer = await io.ask('  선택 (1/2 · Enter=일반): ');
+  } catch (err) {
+    out.error(`first-boot wizard: occupation question failed: ${(err as Error).message}`);
+    return undefined;
+  }
+  if (normalizeOccupationChoice(answer) !== 'management') return undefined;
+  try {
+    const written = createManagementStarterContract(
+      deps.starterContractDir ? { dir: deps.starterContractDir } : {},
+    );
+    io.print(`  ✓ 경영 스타터 계약이 만들어졌습니다: ${written.path}`);
+    return { personaId: written.personaId, displayName: written.displayName, path: written.path };
+  } catch (err) {
+    out.error(`first-boot wizard: starter contract failed: ${(err as Error).message}`);
+    return undefined;
+  }
+}
+
 export async function runFirstBootWizard(
   deps: FirstBootWizardDeps,
 ): Promise<FirstBootResult> {
@@ -127,5 +179,7 @@ export async function runFirstBootWizard(
     }
   }
 
-  return { action: 'completed', stepsRun };
+  const starterContract = await askOccupationAndCreateStarter(deps, out);
+
+  return { action: 'completed', stepsRun, ...(starterContract ? { starterContract } : {}) };
 }

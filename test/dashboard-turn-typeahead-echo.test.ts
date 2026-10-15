@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const dashboard = readFileSync(new URL('../src/dashboard/index.ts', import.meta.url), 'utf8');
+// TUI-INPUT-PLACEHOLDER-OFF — 빈 입력창에 안내 문구가 없으므로 «❯» 만 남은 줄로 입력 대기를 잰다.
+const emptyComposer = (screen: string) => screen.split('\n').some(line => line.trim() === '❯');
 
 
 describe('dashboard real user echo wiring', () => {
@@ -40,7 +42,7 @@ describe('dashboard real user echo wiring', () => {
         cols: 160, rows: 50, kind: 'shell', detach: false,
       });
       await sleep(9000);
-      expect(await handle.renderScreen()).toContain('말 한 줄로 시작');
+      expect(emptyComposer(await handle.renderScreen())).toBe(true);
       handle.write('1부터 30까지 천천히 한 줄에 하나씩 써 줘. 도구는 쓰지 마.\r');
       // A FIFO classification exists only while the first turn owns the keyboard.
       // Do not accept a normal submission after the first turn has ended.
@@ -66,7 +68,7 @@ describe('dashboard real user echo wiring', () => {
         const q3Answer = screen.indexOf('Q3MARK\n', q3Echo + '❯ Q3MARK 라고만 답해'.length);
         fifoInputReady = q3Echo >= 0 && q3Answer > q3Echo
           && screen.indexOf('✔ 완료', q3Answer) > q3Answer
-          && screen.includes('❯ 말 한 줄로 시작');
+          && emptyComposer(screen);
         if (fifoInputReady) break;
       }
       expect(fifoInputReady).toBe(true);
@@ -97,7 +99,7 @@ describe('dashboard real user echo wiring', () => {
         cols: 160, rows: 50, kind: 'shell', detach: false,
       });
       await sleep(9000);
-      expect(await handle.renderScreen()).toContain('말 한 줄로 시작');
+      expect(emptyComposer(await handle.renderScreen())).toBe(true);
       const beforeLive = new Map(await Promise.all((await debugFiles()).map(async path => [path, (await stat(path)).size] as const)));
       handle.write('Bash 도구를 사용해서 현재 디렉터리의 파일 이름을 확인하고 설명해 줘.\r');
       await sleep(800);
@@ -126,7 +128,7 @@ describe('dashboard real user echo wiring', () => {
         events = await observed(beforeLive);
         nextInputReady = screen.includes('LIVEQMARK\n')
           && screen.includes('✔ 완료')
-          && screen.includes('말 한 줄로 시작')
+          && emptyComposer(screen)
           && !screen.includes('⏳ 대기');
         if (nextInputReady) break;
       }
@@ -152,10 +154,10 @@ describe('dashboard real user echo wiring', () => {
 
   test('normal submission and each delivered live item share the same chat-log renderer', () => {
     expect(dashboard).toContain('echoSubmittedUserText(tok.text);');
-    const callback = dashboard.slice(dashboard.indexOf('enqueuePendingUserInput(sid, queuedText, (drained) => {'));
+    const callback = dashboard.slice(dashboard.indexOf('steerLastTurnTypeaheadSubmission(turnTypeaheadRef, sid, ({ texts, remaining }) => {'));
     const body = callback.slice(0, callback.indexOf("debug.log('dashboard.turn-typeahead', 'drained-into-live-turn'"));
-    expect(body).toContain('turnTypeaheadRef.state.queuedSubmissions.slice(drained.length)');
-    expect(body).toContain('for (const text of drained) {\n                      echoSubmittedUserText(text, { live: true });');
+    // 큐 떨어내기는 다리 모듈이 id 로 한다(10-14) — 여기서는 «떨어낸 것만» 에코한다.
+    expect(body).toContain('for (const text of texts) {\n                      echoSubmittedUserText(text, { live: true });');
     expect(dashboard).toContain('turnStreamRuntime.onText(chunk, accumulated);\n                  restoreLiveTypeaheadEchoes();');
     expect(dashboard).toContain("if (opts?.live) chatLines.push(C.muted('  ↳ 이어서'));");
     expect(dashboard).toContain('wrapAnsiByWidth(`❯ ${text}`, echoWrapCols)');
@@ -163,7 +165,7 @@ describe('dashboard real user echo wiring', () => {
 
   test('turn-end injected Enter reaches the regular echo without an extra pre-echo', () => {
     expect(dashboard).toContain("const queuedTurnEndText = drained.injectEnter ? drained.nextInitial : undefined;");
-    expect(dashboard).toContain("if (drained.injectEnter) injectKey({ name: 'enter', ctrl: false, shift: false });");
+    expect(dashboard).toContain("handoffTurnTypeaheadAtTurnEnd(turnTypeaheadRef, nextInitial, { interrupted }, () => {\n            injectKey({ name: 'enter', ctrl: false, shift: false });");
     expect(dashboard).toContain('initialText: nextInitial,');
     expect(dashboard).toContain('echoSubmittedUserText(tok.text);');
     expect(dashboard).not.toContain('wireDashboardTurnTypeaheadEcho(drained)');

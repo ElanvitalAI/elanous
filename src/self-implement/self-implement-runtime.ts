@@ -29,6 +29,7 @@ import { normalizeTargetPaths, observeDecomposerSelection, selectFabricDecompose
 import { parseAskProseTitle } from '../self-dev/launch-preflight.js';
 import { getUserConfig } from '../user-config.js';
 import { mintRunId } from '../harness/harness-space.js';
+import { recordNonBlockingRunPending, recordNonBlockingRunResult } from './run-ledger.js';
 
 type SelfImplementApprover = NonNullable<SelfImplementSeams['approvePr']>;
 type SelfImplementGoalAuthor = (ask: string, cwd: string, deps?: { goalTitle?: string }) => Promise<{ path: string }>;
@@ -65,6 +66,16 @@ export function setSelfImplementSoftStopSpaceObserver(observer: typeof softStopS
 /** 자식 헤드리스 elanous 의 config/state 격리 + 구현 대기 상한을 주입. */
 export function setSelfImplementRuntimeDeps(d: SelfImplementRuntimeDeps | null): void {
   runtimeDeps = d ?? {};
+}
+
+// ── non-blocking 원장 기록 dir (테스트 seam · 기본 = 정본 run ledger dir) ──
+// #26634 칸 NONBLOCKING-RESULT-LEDGER: pending requestId 와 완료 kind·reason·next 를
+// appendRunLedgerEntry 로 정본 run ledger 에 보존한다. 테스트 격리에서만 이 dir 을 바꾼다.
+let nonBlockingLedgerDir: string | undefined;
+
+/** 테스트 헬퍼 — non-blocking 원장 기록 dir 주입. null = un-set(정본 run ledger dir). */
+export function _setSelfImplementNonBlockingLedgerDirForTesting(dir: string | null): void {
+  nonBlockingLedgerDir = dir ?? undefined;
 }
 
 // ── seam factory (테스트 seam) ──
@@ -859,6 +870,9 @@ export const selfImplementRuntime: ToolRuntime<SelfImplementRuntimeRequest, Self
       const runId = allocatedRunId ?? mintRunId();
       const requestId = runId;
       const lookup = `eln logs --category self-implement --event runtime.non-blocking-completed,runtime.non-blocking-failed --grep ${requestId} --since 3h --all --include-test`;
+      const ledgerDirOptions = nonBlockingLedgerDir === undefined ? {} : { dir: nonBlockingLedgerDir };
+      // 즉시 pending 관측 기록 — appendRunLedgerEntry 는 fail-soft 계약이라 호출자가 지킨다.
+      try { recordNonBlockingRunPending(requestId, ledgerDirOptions); } catch { /* observer record cannot break the run */ }
       void drive(runId).then(
         (result) => {
           debug.log('self-implement', result.kind === 'failed' ? 'runtime.non-blocking-failed' : 'runtime.non-blocking-completed', {
@@ -870,6 +884,16 @@ export const selfImplementRuntime: ToolRuntime<SelfImplementRuntimeRequest, Self
             ok: result.ok,
             ...(result.stage === undefined ? {} : { stage: result.stage }),
           }, result.kind === 'failed' ? { level: 'warn' } : undefined);
+          try {
+            recordNonBlockingRunResult(requestId, {
+              kind: result.kind,
+              ...(result.reason === undefined ? {} : { reason: result.reason }),
+              // next는 런이 실제로 산출한 값만 원장에 남긴다(unknown 보존 — 기본 문구 지어내기 없음).
+              ...(result.next === undefined ? {} : { next: result.next }),
+              ok: result.ok,
+              ...(result.runId ? { runId: result.runId } : {}),
+            }, ledgerDirOptions);
+          } catch { /* observer record cannot break the run */ }
         },
         (error) => {
           const reason = error instanceof Error ? error.message : String(error);
@@ -879,6 +903,14 @@ export const selfImplementRuntime: ToolRuntime<SelfImplementRuntimeRequest, Self
             reason,
             next: '요청과 실패 이유를 확인한 뒤 다시 요청',
           }, { level: 'warn' });
+          try {
+            // reject 경로엔 런이 산출한 next가 없다 — 원장에는 생략해 unknown 보존(기본 문구는 debug.log 임시 경로에만 남긴다).
+            recordNonBlockingRunResult(requestId, {
+              kind: 'failed',
+              reason,
+              ok: false,
+            }, ledgerDirOptions);
+          } catch { /* observer record cannot break the run */ }
         },
       );
       return {

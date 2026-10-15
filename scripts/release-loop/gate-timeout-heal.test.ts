@@ -6,7 +6,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  createGateRunner, gateShardShell, POD_SHARD_FILE_CAP, POD_SHARD_TIMEOUT_CAP_SECONDS, readShardArtifacts, shardDeadlineSeconds, shardParts,
+  createGateRunner, gateBatchTestWallSeconds, gateShardShell, POD_SHARD_FILE_CAP, POD_SHARD_TIMEOUT_CAP_SECONDS, readGatePodLifecycle, readShardArtifacts, shardDeadlineSeconds, shardParts,
   softDeadlineSeconds, type GateRunner,
 } from './gate-node';
 import { installSlotScript } from '../../src/task-orchestrator/surfaces/pod-install-slots.js';
@@ -49,6 +49,24 @@ test('② parts follow the plan and the file cap, in order', () => {
   expect(shardParts(['a', 'b', 'c', 'd'], (file) => file === 'b' ? 200 : 10).map((part) => part.length)).toEqual([2, 2]);
 });
 
+test('batch test wall counts overlapping test intervals once and leaves setup gaps as overhead', () => {
+  expect(gateBatchTestWallSeconds({ 'part-0-test-start': 10, 'part-0-test-end': 14,
+    'part-1-test-start': 12, 'part-1-test-end': 16, 'part-2-test-start': 20, 'part-2-test-end': 22 }, 3)).toBe(8);
+  expect(gateBatchTestWallSeconds({ 'part-0-test-start': 10 }, 1)).toBeUndefined();
+});
+
+test('Pod lifecycle reader keeps schedule, init and child timestamps without trusting malformed status', () => {
+  const time = '2026-10-15T00:00:00Z';
+  const pod = { items: [{ metadata: { creationTimestamp: time }, status: {
+    conditions: [{ type: 'PodScheduled', lastTransitionTime: time }],
+    initContainerStatuses: [{ name: 'isolation-gate', state: { terminated: { startedAt: time, finishedAt: time } } }],
+    containerStatuses: [{ name: 'child', state: { terminated: { startedAt: time, finishedAt: time } } }],
+  } }] };
+  expect(readGatePodLifecycle(JSON.stringify(pod))).toEqual({ podCreated: time, podScheduled: time,
+    'init-isolation-gate-start': time, 'init-isolation-gate-end': time, childStart: time, childEnd: time });
+  expect(readGatePodLifecycle('{bad')).toEqual({});
+});
+
 /** A fake `bun` (install · test:deterministic) and `timeout` for running the real Pod shell on this machine. */
 function fakeTools(bin: string) {
   mkdirSync(bin, { recursive: true });
@@ -58,6 +76,20 @@ shift 2 # run test:deterministic
 files=(); out=
 for a in "$@"; do case "$a" in --reporter-outfile=*) out="\${a#--reporter-outfile=}";; --*) ;; *) files+=("\${a#./}");; esac; done
 for f in "\${files[@]}"; do case "$f" in *slow*) sleep 30;; esac; done
+[ -n "$FAKE_TEST_SLEEP" ] && sleep "$FAKE_TEST_SLEEP"
+echo "TEST_HOME=$HOME"
+echo "TEST_CWD=$PWD"
+echo "TEST_STATE=$ELANOUS_STATE_DIR"
+echo "TEST_TMP=$TMPDIR"
+echo "TEST_XDG_CONFIG=$XDG_CONFIG_HOME"
+echo "TEST_XDG_CACHE=$XDG_CACHE_HOME"
+echo "TEST_XDG_DATA=$XDG_DATA_HOME"
+echo "TEST_XDG_STATE=$XDG_STATE_HOME"
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git config --local gate.batch-part "\${files[0]}"
+  echo "TEST_GIT_LOCAL=$(git config --local gate.batch-part)"
+fi
+if [ -d "$ELANOUS_STATE_DIR" ] && [ -d "$TMPDIR" ] && [ -d "$XDG_CONFIG_HOME" ] && [ -d "$XDG_CACHE_HOME" ] && [ -d "$XDG_DATA_HOME" ] && [ -d "$XDG_STATE_HOME" ]; then echo 'TEST_DIRS_READY=yes'; else echo 'TEST_DIRS_READY=no'; fi
 { echo '<testsuites>'; for f in "\${files[@]}"; do echo "<testsuite name=\\"$f\\" file=\\"$f\\"><testcase name=\\"works\\" file=\\"$f\\"></testcase></testsuite>"; done; echo '</testsuites>'; } > "$out"
 echo "\${#files[@]} pass"; echo "0 fail"; echo "Ran \${#files[@]} tests across \${#files[@]} files."
 `);
@@ -107,6 +139,106 @@ test('reproduction: the real Pod shell cut by its soft deadline leaves the finis
   expect(read.output).toContain('Ran 2 tests across 2 files.');
 }, 30_000);
 
+test('spawn lane uses a per-test 120s limit and marks a capped child as unmeasured before the shard deadline', () => {
+  const base = { cdpPatterns: [], softSeconds: 10, cachePrefix: '', installSlots: 0 };
+  const regular = gateShardShell({ ...base, parts: [['src/ordinary.test.ts']] });
+  expect(regular).not.toContain('--timeout=120000');
+  expect(regular).not.toContain('spawn_part');
+  expect(() => gateShardShell({ ...base, parts: [['src/ordinary.test.ts', 'test/preview-terminal.test.ts']] }))
+    .toThrow('gate spawn lane part mixed with regular tests');
+  const parts = [['test/preview-terminal.test.ts']];
+  const production = gateShardShell({ ...base, parts });
+  expect(production).toContain("'--timeout=120000'");
+  expect(production).toContain('if [ "$spawn_part" -eq 1 ] && [ "$left" -gt 120 ]; then left=120; fi');
+
+  const root = temp('gate-spawn-cap-');
+  const home = join(root, 'home');
+  const repo = join(root, 'work', 'repo');
+  mkdirSync(join(repo, 'apps/pwa'), { recursive: true });
+  mkdirSync(home);
+  fakeTools(join(root, 'bin'));
+  // Exercise the production shell path at a two-second test scale, while its shard deadline stays ten seconds.
+  const shell = production.replace(/^pod_age=\$\(awk.*$/m, 'pod_age=0')
+    .replace('if [ "$spawn_part" -eq 1 ] && [ "$left" -gt 120 ]; then left=120; fi',
+      'if [ "$spawn_part" -eq 1 ] && [ "$left" -gt 2 ]; then left=2; fi');
+  const run = spawnSync('bash', ['-c', shell], { cwd: repo, encoding: 'utf8', timeout: 15_000,
+    env: { PATH: `${join(root, 'bin')}:/usr/bin:/bin`, HOME: home, TMPDIR_FIRED: root, FAKE_TEST_SLEEP: '30' } });
+  expect(run.status).toBe(0);
+  const outbox = join(home, 'outbox');
+  expect(readFileSync(join(outbox, 'shard.timeout'), 'utf8').trim()).toBe('0');
+  expect(existsSync(join(outbox, 'part-0.rc'))).toBe(false);
+  expect(readShardArtifacts(outbox, parts)).toMatchObject({ timedOut: true, finished: [] });
+}, 20_000);
+
+test('spawn child killed before its cap remains a measured failure', () => {
+  const root = temp('gate-spawn-early-kill-');
+  const home = join(root, 'home');
+  const repo = join(root, 'work', 'repo');
+  mkdirSync(join(repo, 'apps/pwa'), { recursive: true });
+  mkdirSync(home);
+  fakeTools(join(root, 'bin'));
+  writeFileSync(join(root, 'bin', 'bun'), '#!/bin/bash\nif [ "$1" = install ]; then exit 0; fi\nexit 137\n');
+  const shell = gateShardShell({ parts: [['test/preview-terminal.test.ts']], cdpPatterns: [],
+    softSeconds: 10, cachePrefix: '', installSlots: 0 }).replace(/^pod_age=\$\(awk.*$/m, 'pod_age=0');
+  const run = spawnSync('bash', ['-c', shell], { cwd: repo, encoding: 'utf8', timeout: 15_000,
+    env: { PATH: `${join(root, 'bin')}:/usr/bin:/bin`, HOME: home, TMPDIR_FIRED: root } });
+  expect(run.status).toBe(0);
+  const outbox = join(home, 'outbox');
+  expect(existsSync(join(outbox, 'shard.timeout'))).toBe(false);
+  expect(readFileSync(join(outbox, 'part-0.rc'), 'utf8').trim()).toBe('137');
+});
+
+test('isolation batch runs four files in one shell with separate HOME and complete per-file artifacts', () => {
+  const root = temp('gate-batch-');
+  const home = join(root, 'home');
+  const repo = join(root, 'work', 'repo');
+  mkdirSync(join(repo, 'apps/pwa'), { recursive: true });
+  mkdirSync(home);
+  fakeTools(join(root, 'bin'));
+  mkdirSync(join(repo, 'src'));
+  writeFileSync(join(repo, 'src/fixture.txt'), 'source');
+  expect(spawnSync('git', ['-C', repo, 'init', '-q']).status).toBe(0);
+  expect(spawnSync('git', ['-C', repo, 'add', 'src/fixture.txt']).status).toBe(0);
+  expect(spawnSync('git', ['-C', repo, '-c', 'user.name=TC', '-c', 'user.email=tc@example.invalid', 'commit', '-qm', 'fixture']).status).toBe(0);
+  const parts = ['a', 'b', 'c', 'd'].map((name) => [`src/${name}.test.ts`]);
+  const shell = gateShardShell({ parts, cdpPatterns: [], softSeconds: 15, cachePrefix: '', installSlots: 0, parallelParts: 4 })
+    .replace(/^pod_age=\$\(awk.*$/m, 'pod_age=0');
+  const started = Date.now();
+  const run = spawnSync('bash', ['-c', shell], { cwd: repo, encoding: 'utf8', timeout: 20_000,
+    env: { PATH: `${join(root, 'bin')}:/usr/bin:/bin`, HOME: home, TMPDIR_FIRED: root, FAKE_TEST_SLEEP: '1' } });
+  expect(run.status).toBe(0);
+  expect(Date.now() - started).toBeLessThan(12_000);
+  const outbox = join(home, 'outbox');
+  const result = readShardArtifacts(outbox, parts);
+  expect(result).toMatchObject({ rc: 0, timedOut: false, finished: parts.flat() });
+  const stages = readFileSync(join(outbox, 'stages.tsv'), 'utf8');
+  const testStarts = [...stages.matchAll(/^(\d+)\tpart-\d+-test-start$/gm)].map((match) => Number(match[1]));
+  expect(testStarts).toHaveLength(4);
+  expect(Math.max(...testStarts) - Math.min(...testStarts)).toBeLessThanOrEqual(3);
+  for (let index = 0; index < parts.length; index++) {
+    for (const phase of ['setup-start', 'setup-end', 'test-start', 'test-end', 'cleanup-start', 'cleanup-end'])
+      expect(stages).toContain(`part-${index}-${phase}`);
+  }
+  const homes = parts.map((_, index) => readFileSync(join(outbox, `part-${index}.log`), 'utf8').match(/TEST_HOME=(.*)/)?.[1]);
+  const worktrees = parts.map((_, index) => readFileSync(join(outbox, `part-${index}.log`), 'utf8').match(/TEST_CWD=(.*)/)?.[1]);
+  expect(new Set(homes).size).toBe(4);
+  expect(new Set(worktrees).size).toBe(4);
+  expect(worktrees.every((value) => value?.includes('/tmp/gate-isolate.'))).toBe(true);
+  expect(homes.every((value) => value?.startsWith('/tmp/gate-isolate.'))).toBe(true);
+  for (const label of ['STATE', 'TMP', 'XDG_CONFIG', 'XDG_CACHE', 'XDG_DATA', 'XDG_STATE']) {
+    const values = parts.map((_, index) => readFileSync(join(outbox, `part-${index}.log`), 'utf8').match(new RegExp(`TEST_${label}=(.*)`))?.[1]);
+    expect(new Set(values).size).toBe(4);
+    expect(values.every((value) => value?.startsWith('/tmp/gate-isolate.'))).toBe(true);
+  }
+  expect(parts.every((_, index) => readFileSync(join(outbox, `part-${index}.log`), 'utf8').includes('TEST_DIRS_READY=yes'))).toBe(true);
+  for (let index = 0; index < parts.length; index++) {
+    expect(readFileSync(join(outbox, `part-${index}.log`), 'utf8')).toContain(`TEST_GIT_LOCAL=${parts[index]![0]}`);
+  }
+  expect(spawnSync('git', ['-C', repo, 'config', '--local', '--get', 'gate.batch-part']).status).toBe(1);
+  expect(gateShardShell({ parts, cdpPatterns: [], softSeconds: 15, cachePrefix: '', installSlots: 0, parallelParts: 1 }))
+    .toContain('ELANOUS_STATE_DIR="$isolated/state"');
+});
+
 test('readShardArtifacts: every part done → one summary and rc; a crashed part → its exit; the old single-run layout still reads', () => {
   const dir = temp('gate-art-');
   const parts = [['src/a.test.ts'], ['src/b.test.ts', 'src/c.test.ts']];
@@ -130,10 +262,12 @@ test('readShardArtifacts: every part done → one summary and rc; a crashed part
   expect(readShardArtifacts(legacy, parts)).toMatchObject({ rc: 0, timedOut: false, output: summary(['src/a.test.ts']) });
 });
 
-function sweepRunner(files: string[], pod: (o: RunPodCommandOptions, parts: string[][]) => Promise<{ exitCode: number; artifactsDir: string; job: string }>) {
+function sweepRunner(files: string[], pod: (o: RunPodCommandOptions, parts: string[][]) => Promise<{ exitCode: number; artifactsDir: string; job: string }>, safeFiles: readonly string[] = files) {
   const root = temp('gate-sweep-');
   const repo = join(root, 'repo');
   mkdirSync(repo);
+  mkdirSync(join(repo, 'release'));
+  writeFileSync(join(repo, 'release/gate-batch-safe.json'), JSON.stringify({ env: 'linux-pod', tests: safeFiles.map((file) => ({ file, evidence: 'synthetic test fixture' })) }));
   const command: GateRunner['command'] = async (cmd, args) => {
     if (cmd === 'rg') return { rc: 1, output: '' };
     if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
@@ -146,6 +280,62 @@ function sweepRunner(files: string[], pod: (o: RunPodCommandOptions, parts: stri
   }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]), () => '');
   return { root, repo, runner };
 }
+
+test('unreadable optional stage timings do not change a completed shard verdict', async () => {
+  const file = 'src/a.test.ts';
+  const { root, repo, runner } = sweepRunner([file], async (o) => {
+    const dir = join(root, o.name!);
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'shard.log'), summary([file]));
+    writeFileSync(join(dir, 'shard.rc'), '0\n');
+    mkdirSync(join(dir, 'stages.tsv')); // readFileSync throws EISDIR on this optional measurement.
+    return { exitCode: 0, artifactsDir: dir, job: 'fake' };
+  }, []);
+  const result = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1, stallSeconds: 0 });
+  expect(result.rc).toBe(0);
+  expect(result.output).toContain('1 pass');
+});
+
+test('sweep generated batch Job shell overlaps safe file tests in the real shell', async () => {
+  const files = Array.from({ length: 8 }, (_, i) => `src/f-${i}.test.ts`);
+  const shells: string[] = [];
+  const intervals: Array<Array<[number, number]>> = [];
+  const { root, repo, runner } = sweepRunner(files, async (o, parts) => {
+    const shell = o.command[2]!;
+    const dir = join(root, o.name!);
+    mkdirSync(dir);
+    if (!shell.includes('gate-isolate.')) return { exitCode: 137, artifactsDir: dir, job: 'fake' };
+    shells.push(shell);
+    const home = join(root, `home-${shells.length}`);
+    mkdirSync(home);
+    const run = spawnSync('bash', ['-c', shell.replace(/^pod_age=\$\(awk.*$/m, 'pod_age=0')], {
+      cwd: repo, encoding: 'utf8', timeout: 25_000,
+      env: { PATH: `${join(root, 'bin')}:/usr/bin:/bin`, HOME: home, FAKE_TEST_SLEEP: '1' },
+    });
+    expect(run.status).toBe(0);
+    const outbox = join(home, 'outbox');
+    const stage = readFileSync(join(outbox, 'stages.tsv'), 'utf8');
+    intervals.push(parts.map((_, i) => {
+      const start = Number(new RegExp(`^(\\d+)\\tpart-${i}-test-start$`, 'm').exec(stage)?.[1]);
+      const end = Number(new RegExp(`^(\\d+)\\tpart-${i}-test-end$`, 'm').exec(stage)?.[1]);
+      expect(Number.isFinite(start) && Number.isFinite(end)).toBe(true);
+      return [start, end];
+    }));
+    return { exitCode: 0, artifactsDir: outbox, job: 'fake' };
+  });
+  mkdirSync(join(repo, 'apps/pwa'), { recursive: true });
+  mkdirSync(join(repo, 'src'), { recursive: true });
+  writeFileSync(join(repo, 'src/fixture.txt'), 'source');
+  fakeTools(join(root, 'bin'));
+  expect(spawnSync('git', ['-C', repo, 'init', '-q']).status).toBe(0);
+  expect(spawnSync('git', ['-C', repo, 'add', 'src/fixture.txt']).status).toBe(0);
+  expect(spawnSync('git', ['-C', repo, '-c', 'user.name=TC', '-c', 'user.email=tc@example.invalid', 'commit', '-qm', 'fixture']).status).toBe(0);
+  const result = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1, stallSeconds: 0 });
+  expect(result.rc).toBe(0);
+  expect(shells.length).toBeGreaterThan(0);
+  expect(shells.every((shell) => shell.includes('pids+=('))).toBe(true);
+  expect(intervals.some((group) => group.length > 1 && group[0]![0] < group[1]![1] && group[1]![0] < group[0]![1])).toBe(true);
+}, 30_000);
 
 test('reproduction through the sweep: a cut shard is reason=timeout, keeps its finished files, re-runs only the rest, and shards.json says so', async () => {
   const files = Array.from({ length: 30 }, (_, i) => `src/f-${String(i).padStart(2, '0')}.test.ts`);
@@ -201,6 +391,7 @@ test('pod shard records outer JUnit file seconds, total test seconds, nonnegativ
     writeFileSync(join(dir, 'part-0.log'), summary(parts[0]!));
     writeFileSync(join(dir, 'part-0.rc'), '0\n');
     writeFileSync(join(dir, 'part-0.junit.xml'), '<testsuites><testsuite file="src/a.test.ts" time="2"><testsuite file="src/nested.test.ts" time="90"/></testsuite><testsuite file="src/b.test.ts" time="3"/></testsuites>');
+    writeFileSync(join(dir, 'stages.tsv'), '100\tshell-start\n101\tdeps-start\n102\tdeps-end\n103\ttest-start\n105\ttest-end\n106\tshell-end\n');
     return { exitCode: 0, artifactsDir: dir, job: 'fake' };
   });
   try {
@@ -210,7 +401,11 @@ test('pod shard records outer JUnit file seconds, total test seconds, nonnegativ
   const meta = JSON.parse(readFileSync(join(root, 'logs', 'pod-0.json'), 'utf8'));
   expect(meta.fileSeconds).toEqual({ 'src/a.test.ts': 2, 'src/b.test.ts': 3 });
   expect(meta.testSeconds).toBe(5);
-  expect(meta.podOverheadSeconds).toBe(Math.max(0, meta.durationMs / 1000 - 5));
+  expect(meta.testWallSeconds).toBe(2);
+  expect(meta.podOverheadSeconds).toBe(Math.max(0, meta.durationMs / 1000 - 2));
+  expect(meta.podStages).toMatchObject({ 'deps-start': 101, 'deps-end': 102, 'test-start': 103, 'test-end': 105 });
+  expect(meta.phaseTimes).toHaveProperty('admissionStart');
+  expect(meta.phaseTimes).toHaveProperty('jobReturned');
   expect(events.find(({ event }) => event === 'pod-shard')?.data.testSeconds).toBe(5);
   expect([...readFileDurations(join(root, 'logs'))]).toEqual([['src/a.test.ts', 2], ['src/b.test.ts', 3]]);
 });
@@ -239,6 +434,63 @@ test('a cut shard whose finished files have a failure keeps that failure for the
   expect(result.rc).toBe(1);
   expect(result.output).toContain(`${files[3]}:\n(fail) works`);
   expect(result.output).toContain('29 pass\n1 fail\n0 errors\nRan 30 tests across 30 files.');
+});
+
+test('depth-two isolation keeps unlisted files in their own Pod and batches opt-in files', async () => {
+  const files = Array.from({ length: 8 }, (_, i) => `src/f-${i}.test.ts`);
+  files[1] = 'src/unlisted.test.ts';
+  const jobs: Array<{ files: string[]; batch: boolean }> = [];
+  const { root, repo, runner } = sweepRunner(files, async (o, parts) => {
+    const batch = o.command[2]!.includes('gate-isolate.');
+    jobs.push({ files: parts.flat(), batch });
+    const dir = join(root, o.name!);
+    mkdirSync(dir);
+    if (batch || parts.flat().length === 1) {
+      writeFileSync(join(dir, 'install.rc'), '0\n');
+      parts.forEach((part, index) => {
+        writeFileSync(join(dir, `part-${index}.log`), summary(part));
+        writeFileSync(join(dir, `part-${index}.rc`), '0\n');
+        writeFileSync(join(dir, `part-${index}.junit.xml`), junitFor(part));
+      });
+    }
+    return { exitCode: 0, artifactsDir: dir, job: 'fake' };
+  }, files.filter((file) => file !== files[1]));
+  const result = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1, stallSeconds: 0 });
+  expect(result.rc).toBe(0);
+  expect(result.output).toContain('Ran 8 tests across 8 files.');
+  expect(jobs.some((job) => job.batch && job.files.length >= 2 && job.files.every((file) => file !== files[1]))).toBe(true);
+  expect(jobs.filter((job) => job.batch).every((job) => !job.files.includes(files[1]!))).toBe(true);
+  expect(jobs.some((job) => !job.batch && job.files.length === 1 && job.files[0] === files[1])).toBe(true);
+  expect(jobs.filter((job) => job.batch || job.files.length === 1).flatMap((job) => job.files).sort()).toEqual([...files].sort());
+});
+
+test('a batch missing one JUnit reruns only that file and preserves a completed failure', async () => {
+  const files = Array.from({ length: 8 }, (_, i) => `src/f-${i}.test.ts`);
+  const failing = new Set([files[1]!]);
+  const jobs: Array<{ files: string[]; batch: boolean }> = [];
+  let missingBatch = false;
+  const { root, repo, runner } = sweepRunner(files, async (o, parts) => {
+    const batch = o.command[2]!.includes('gate-isolate.');
+    jobs.push({ files: parts.flat(), batch });
+    const dir = join(root, o.name!);
+    mkdirSync(dir);
+    if (batch || parts.flat().length === 1) {
+      writeFileSync(join(dir, 'install.rc'), '0\n');
+      parts.forEach((part, index) => {
+        writeFileSync(join(dir, `part-${index}.log`), summary(part, failing));
+        writeFileSync(join(dir, `part-${index}.rc`), `${part.some((file) => failing.has(file)) ? 1 : 0}\n`);
+        if (!(batch && !missingBatch && index === 0)) writeFileSync(join(dir, `part-${index}.junit.xml`), junitFor(part, failing));
+      });
+      if (batch && !missingBatch) missingBatch = true;
+    }
+    return { exitCode: 0, artifactsDir: dir, job: 'fake' };
+  });
+  const result = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1, stallSeconds: 0 });
+  expect(result.rc).toBe(1);
+  expect(result.output).toContain('Ran 8 tests across 8 files.');
+  expect(result.output).toContain(`${files[1]}:\n(fail) works`);
+  // retryFiles keeps the complete part's JUnit verdict and narrows to only the part missing its JUnit.
+  expect(jobs.filter((job) => !job.batch && job.files.length === 1)).toEqual([{ files: [files[0]!], batch: false }]);
 });
 
 test('④ an isolated Pod that dies before its tests (exit 5 · no outbox) gets one more run instead of stalling the sweep', async () => {

@@ -21,7 +21,7 @@
  *   하나라도 못 재거나 어긋나면 거부 — 호출부는 종전 거부를 그대로 낸다(fail-closed).
  * - 관측: `pr.land` · `overlap-evidence` (decision · reason · 잰 값).
  */
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
 import type { CmdRunner } from '../autopilot/pr-manager.js';
 import { parseReviewResultOutput } from '../task-agent/review-result-capture.js';
@@ -35,6 +35,10 @@ interface OverlapEvidenceFile {
   gate?: { head: string; baseCommit: string; passed: boolean };
   /** `self review --json` stdout 을 받은 파일(TA: `<state>/review-results/<card>-<pr>-<head접두 10~40>.json`); 내용의 전체 head도 확인한다. */
   reviewResult: string;
+  /** Explicitly replaced failed reviews. Each reason is the verifier's original refusal reason. */
+  supersedes?: { reviewResult: string; reason: string }[];
+  /** OPEN follow-up PR that owns the findings intentionally split from this landing. */
+  followupPr?: number;
 }
 
 export type OverlapEvidenceVerdict =
@@ -52,8 +56,97 @@ export interface VerifyOverlapEvidenceInput {
   cwd: string;
   run: CmdRunner;
   readFile: (path: string) => string;
+  /** Canonical state directory; evidence cannot choose the review search root. */
+  reviewResultsDir?: string;
+  /** Standard review-results directory listing. Failure to measure always rejects. */
+  listDir?: (dir: string) => readonly string[];
+  /** Review file modification time in milliseconds, used to prove the selected result followed failed attempts. */
+  reviewMtime?: (path: string) => number;
+  /** Resolve the physical review path so a symlink cannot select a file outside the state directory. */
+  reviewRealPath?: (path: string) => string;
   /** 겹침 관문이 찾은 «겹친» 최근 착지 커밋들 — 전부 머리의 조상이면 already-ancestor. */
   overlappingLandings?: readonly string[];
+}
+
+function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Partial<OverlapEvidenceFile>, head: string): { ok: true } | { ok: false; reason: string } {
+  const selected = e.reviewResult!;
+  if (!input.reviewResultsDir || !input.listDir || !input.reviewMtime || !input.reviewRealPath) return { ok: false, reason: 'review-attempts-unmeasured' };
+  const dir = input.reviewResultsDir;
+  if (resolve(dirname(selected)) !== resolve(dir)) return { ok: false, reason: 'review-selected-outside-standard-dir' };
+  let names: readonly string[];
+  try { names = input.listDir(dir); } catch { return { ok: false, reason: 'review-attempts-unmeasured' }; }
+  const filename = new RegExp(`^[A-Za-z0-9][A-Za-z0-9._-]*-${input.pr}-([a-f0-9]{10,40})\\.json$`, 'i');
+  const candidates = [...names].filter((name) => {
+    const match = filename.exec(name);
+    return Boolean(match && head.startsWith(match[1]!.toLowerCase()));
+  }).map((name) => join(dir, name));
+  if (!candidates.includes(selected)) return { ok: false, reason: 'review-selected-missing' };
+  let physicalDir: string;
+  let physicalParent: string;
+  try {
+    physicalDir = input.reviewRealPath(dir);
+    physicalParent = input.reviewRealPath(dirname(dir));
+  } catch { return { ok: false, reason: 'review-attempts-unmeasured' }; }
+  if (resolve(physicalDir) !== resolve(join(physicalParent, basename(dir)))) {
+    return { ok: false, reason: 'review-standard-dir-symlink' };
+  }
+  for (const path of candidates) {
+    let physicalPath: string;
+    try { physicalPath = input.reviewRealPath(path); } catch { return { ok: false, reason: 'review-attempts-unmeasured' }; }
+    if (resolve(dirname(physicalPath)) !== resolve(physicalDir)) return { ok: false, reason: 'review-file-outside-standard-dir' };
+  }
+  const entries = e.supersedes;
+  if (entries !== undefined && (!Array.isArray(entries) || entries.length === 0)) return { ok: false, reason: 'review-supersedes-invalid' };
+  const superseded = new Map<string, string>();
+  let selectedTime: number | undefined;
+  if (entries?.length) {
+    try { selectedTime = input.reviewMtime(selected); } catch { return { ok: false, reason: 'review-attempt-time-unmeasured' }; }
+    if (!Number.isFinite(selectedTime)) return { ok: false, reason: 'review-attempt-time-unmeasured' };
+  }
+  for (const entry of entries ?? []) {
+    if (!entry || typeof entry.reviewResult !== 'string' || typeof entry.reason !== 'string' || !entry.reason.trim()
+      || !candidates.includes(entry.reviewResult) || entry.reviewResult === selected || superseded.has(entry.reviewResult)) {
+      return { ok: false, reason: 'review-supersedes-invalid' };
+    }
+    superseded.set(entry.reviewResult, entry.reason);
+    let failedTime: number;
+    try { failedTime = input.reviewMtime(entry.reviewResult); } catch { return { ok: false, reason: 'review-attempt-time-unmeasured' }; }
+    if (!Number.isFinite(failedTime) || selectedTime === undefined || failedTime >= selectedTime) {
+      return { ok: false, reason: 'review-selected-not-later-than-failure' };
+    }
+  }
+  for (const path of candidates) {
+    if (path === selected) continue;
+    const review = checkReview(input, { reviewResult: path }, head);
+    if (review.ok) {
+      if (superseded.has(path)) return { ok: false, reason: 'review-supersedes-passing' };
+      continue;
+    }
+    if (superseded.get(path) !== review.reason) return { ok: false, reason: `review-attempt-not-superseded: ${basename(path)} (${review.reason})` };
+    if (!/^review-(verdict-fail|must-fix-[1-9][0-9]*)$/.test(review.reason)) {
+      return { ok: false, reason: `review-supersedes-not-failed: ${basename(path)} (${review.reason})` };
+    }
+  }
+  if (entries?.length) {
+    if (!Number.isSafeInteger(e.followupPr) || (e.followupPr as number) <= 0 || e.followupPr === input.pr) {
+      return { ok: false, reason: 'review-followup-pr-invalid' };
+    }
+    const response = input.run('gh', ['pr', 'view', String(e.followupPr), '--json', 'state'], { cwd: input.cwd });
+    if (!response.ok) return { ok: false, reason: 'review-followup-pr-unmeasured' };
+    let state: unknown;
+    try { state = JSON.parse(response.out); } catch { return { ok: false, reason: 'review-followup-pr-unmeasured' }; }
+    if ((state as { state?: unknown })?.state !== 'OPEN') return { ok: false, reason: 'review-followup-pr-not-open' };
+  } else if (e.followupPr !== undefined) {
+    return { ok: false, reason: 'review-followup-pr-without-supersedes' };
+  }
+  debug.log('pr.land', 'review-attempt-selection', {
+    pr: input.pr,
+    head,
+    selected,
+    superseded: [...superseded.entries()].map(([reviewResult, reason]) => ({ reviewResult, reason })),
+    followupPr: e.followupPr ?? null,
+  });
+  return { ok: true };
 }
 
 type Checked = { ok: false; reason: string; baseTip?: string; gateBase?: string; windowCommits?: number }
@@ -160,7 +253,9 @@ function check(input: VerifyOverlapEvidenceInput): Checked {
   if (landings.length > 0 && landings.every((sha) => /^[0-9a-f]{7,40}$/i.test(sha)
     && input.run('git', ['merge-base', '--is-ancestor', sha, head], { cwd: input.cwd }).ok)) {
     const review = checkReview(input, e, head);
-    return review.ok ? { ok: true, mode: 'already-ancestor', reviewResult: review.reviewResult } : review;
+    if (!review.ok) return review;
+    const attempts = checkSelectedReviewAttempts(input, e, head);
+    return attempts.ok ? { ok: true, mode: 'already-ancestor', reviewResult: review.reviewResult } : attempts;
   }
 
   // ① 재기반 — 원격의 «지금» 끝을 읽기 전용으로 받는다(로컬 ref 를 안 바꾼다).
@@ -178,9 +273,11 @@ function check(input: VerifyOverlapEvidenceInput): Checked {
     const window = checkBaseWindow(input, head, baseTip, gateBase!, staleReason);
     if (!window.ok) return { ok: false, reason: window.reason, baseTip, gateBase, windowCommits: window.windowCommits };
     const review = checkReview(input, e, head, baseTip);
-    return review.ok
+    if (!review.ok) return { ...review, gateBase, windowCommits: window.windowCommits };
+    const attempts = checkSelectedReviewAttempts(input, e, head);
+    return attempts.ok
       ? { ok: true, mode: 'base-advanced-disjoint', baseTip, gateBase: gateBase!, windowCommits: window.windowCommits, reviewResult: review.reviewResult }
-      : { ...review, gateBase, windowCommits: window.windowCommits };
+      : { ...attempts, gateBase, windowCommits: window.windowCommits };
   };
   if (!ancestor.ok) {
     const notRebased = `not-rebased: ${input.remote}/${input.branch} ${baseTip.slice(0, 12)} is not an ancestor of ${head.slice(0, 12)}`;
@@ -198,7 +295,9 @@ function check(input: VerifyOverlapEvidenceInput): Checked {
 
   // ③ 리뷰 — 그 PR · 그 머리의 pass ⊕ must-fix 0.
   const review = checkReview(input, e, head, baseTip);
-  return review.ok ? { ok: true, mode: 'rebased', baseTip, reviewResult: review.reviewResult } : review;
+  if (!review.ok) return review;
+  const attempts = checkSelectedReviewAttempts(input, e, head);
+  return attempts.ok ? { ok: true, mode: 'rebased', baseTip, reviewResult: review.reviewResult } : attempts;
 }
 
 export type AncestorAutoVerdict =

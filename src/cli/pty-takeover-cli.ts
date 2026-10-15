@@ -4,7 +4,8 @@ import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { runGitCommand } from '../git-fs/runner.js';
 import { debug } from '../debug/log.js';
-import { getPty, listPty, requestPtyTakeover } from '../pty-shell/registry.js';
+import { getPty, listPty, renamePty, requestPtyTakeover } from '../pty-shell/registry.js';
+import { describePtyRunState, readCheckoutHead, readCurrentInstallRecord, shortSha, type InstalledRecord, type PtyRunStateView } from '../pty-shell/tui-run-state.js';
 import { getPtyManifest, isProcessAlive, listPtyManifest, listPtyManifestRows, listPtyManifestRowsAt, ptyManifestDbPath, readPtyManifestFrame, reapDeadPtyManifest, reapDeadPtyManifestAt, reapStalePtyManifest, removePtyManifest, PTY_MANIFEST_CLOSED_TTL_MS, PTY_MANIFEST_STALE_MS, type PtyManifestExternalReapResult, type PtyManifestRow } from '../pty-shell/pty-manifest.js';
 import { readPtyEventsAfter, readPtyEventsAfterAt, type PtyEventLogReadResult, type PtyEventRow } from '../pty-shell/pty-event-log.js';
 import { resolvePtyRef, type PtyRefItem } from '../pty-shell/pty-ref.js';
@@ -36,7 +37,7 @@ interface PtyTakeoverCommandResult { readonly exitCode: 0 | 1 | 2; readonly mess
  *  보냈다. 둘 다 원인이 같다: `pty list` 가 **id·kind·alive 만** 줘서 *"내가 방금 띄웠으니 이게 내 것"*
  *  이라는 **추론**이 유일한 소유 근거였다. workdir 은 registry handle 과 manifest 양쪽에 이미
  *  있었고 **목록이 안 보여줬을 뿐**이다. ⇒ 보여 주면 소유가 추론이 아니라 조회가 된다. */
-type PtyListItem = PtyRefItem & { readonly source: 'local' | 'remote'; readonly alive: boolean; readonly mode?: PtyHandle['accessMode']; readonly workdir?: string; readonly runId?: string; readonly terminalOriginCategory?: PtyManifestRow['terminalOriginCategory']; readonly terminalOriginReason?: string; readonly externalToolName?: string };
+type PtyListItem = PtyRefItem & { readonly source: 'local' | 'remote'; readonly alive: boolean; readonly mode?: PtyHandle['accessMode']; readonly workdir?: string; readonly purpose?: string; readonly runId?: string; readonly terminalOriginCategory?: PtyManifestRow['terminalOriginCategory']; readonly terminalOriginReason?: string; readonly externalToolName?: string };
 /** ⚠️ 내부 타입 — 파일 밖 production 소비자 없음(dead export 금지·review). `readLivePtyAddressBook`
  *  가 이 형태를 돌려주지만 호출부(테스트 포함)는 값만 쓰고 타입명을 import 하지 않는다. */
 interface DeadPtyRef extends PtyRefItem {
@@ -59,6 +60,7 @@ export interface FederatedPtyRef {
   readonly nickname?: string;
   readonly runId?: string;
   readonly workdir?: string;
+  readonly purpose?: string;
   readonly terminalOriginCategory?: PtyManifestRow['terminalOriginCategory'];
   readonly terminalOriginReason?: string;
   readonly externalToolName?: string;
@@ -82,14 +84,14 @@ export interface FederatedPtyListing {
  *  ⛔ 살아있는 것만 싣는다 — 죽은 owner 까지 섞으면 *"밖에서 몰 수 있는 것"* 목록이 아니게 된다. */
 export function federatedPtyRefs(
   targets: readonly { name: string; dbPath: string }[],
-  readRows: (dbPath: string) => readonly { id: string; kind: string; nickname?: string; runId?: string; workdir?: string; terminalOriginCategory?: PtyManifestRow['terminalOriginCategory']; terminalOriginReason?: string; externalToolName?: string; alive: boolean; ownerPid?: number; ptyPid?: number; instance?: string; updatedAt?: number }[],
+  readRows: (dbPath: string) => readonly { id: string; kind: string; nickname?: string; runId?: string; workdir?: string; purpose?: string; terminalOriginCategory?: PtyManifestRow['terminalOriginCategory']; terminalOriginReason?: string; externalToolName?: string; alive: boolean; ownerPid?: number; ptyPid?: number; instance?: string; updatedAt?: number }[],
   alive: (pid: number) => boolean = isProcessAlive,
 ): FederatedPtyListing {
   const seen = new Set<string>();
   const out: FederatedPtyRef[] = [];
   const unreadable: string[] = [];
   for (const target of targets) {
-    let rows: readonly { id: string; kind: string; nickname?: string; runId?: string; workdir?: string; terminalOriginCategory?: PtyManifestRow['terminalOriginCategory']; terminalOriginReason?: string; externalToolName?: string; alive: boolean; ownerPid?: number; ptyPid?: number; instance?: string; updatedAt?: number }[];
+    let rows: readonly { id: string; kind: string; nickname?: string; runId?: string; workdir?: string; purpose?: string; terminalOriginCategory?: PtyManifestRow['terminalOriginCategory']; terminalOriginReason?: string; externalToolName?: string; alive: boolean; ownerPid?: number; ptyPid?: number; instance?: string; updatedAt?: number }[];
     try {
       rows = readRows(target.dbPath);
     } catch {
@@ -105,7 +107,7 @@ export function federatedPtyRefs(
       // ⚠️ 같은 물리 뿌리가 두 이름으로 등록될 수 있다 ⇒ id 로 dedup(먼저 만난 이름을 남긴다).
       if (seen.has(row.id)) continue;
       seen.add(row.id);
-      out.push({ instance: row.instance || target.name, id: row.id, kind: row.kind, alive: true, sourceRoot: target.dbPath, ownerProcessAlive, ...(row.nickname ? { nickname: row.nickname } : {}), ...(row.runId ? { runId: row.runId } : {}), ...(row.workdir ? { workdir: row.workdir } : {}), ...(row.terminalOriginCategory ? { terminalOriginCategory: row.terminalOriginCategory } : {}), ...(row.terminalOriginReason ? { terminalOriginReason: row.terminalOriginReason } : {}), ...(row.externalToolName ? { externalToolName: row.externalToolName } : {}), ...(row.updatedAt === undefined ? {} : { updatedAt: row.updatedAt }) });
+      out.push({ instance: row.instance || target.name, id: row.id, kind: row.kind, alive: true, sourceRoot: target.dbPath, ownerProcessAlive, ...(row.nickname ? { nickname: row.nickname } : {}), ...(row.runId ? { runId: row.runId } : {}), ...(row.workdir ? { workdir: row.workdir } : {}), ...(row.purpose ? { purpose: row.purpose } : {}), ...(row.terminalOriginCategory ? { terminalOriginCategory: row.terminalOriginCategory } : {}), ...(row.terminalOriginReason ? { terminalOriginReason: row.terminalOriginReason } : {}), ...(row.externalToolName ? { externalToolName: row.externalToolName } : {}), ...(row.updatedAt === undefined ? {} : { updatedAt: row.updatedAt }) });
     }
   }
   return { refs: out, unreadable };
@@ -380,7 +382,14 @@ export interface PtyTakeoverCommandDeps {
   getPty(id: string): PtyControlTarget | undefined;
   requestPtyTakeover(id: string, actor: 'human'): boolean;
   requestRemote(id: string, action: PtyControlAction, payload?: PtyControlPayload, options?: PtyControlRequestOptions): Promise<PtyControlResult>;
+  /** Local (same-process) rename; default = registry renamePty. */
+  renameLocal?(id: string, nickname: string): boolean;
   readManifestFrame?(id: string): { readonly frame: string; readonly frameAt: number } | null;
+  /** 한 행 판독 — `pty state` 의 턴·판 칸. 기본 = 이 인스턴스 manifest(getPtyManifest). */
+  readManifestRow?(id: string): PtyManifestRow | null;
+  /** 지금 설치본(commit ⊕ installedAt) · 체크아웃 HEAD — stale 판정의 비교 대상. 주입 = 시험. */
+  readInstalledBuild?(): InstalledRecord;
+  readCheckoutHead?(codeRoot: string): string | undefined;
   listManifestRows?(): readonly PtyManifestRow[];
   listManifestRowsAt?(dbPath: string): readonly PtyManifestRow[];
   currentManifestDbPath?(): string;
@@ -445,6 +454,7 @@ interface RemoteTerminalListItem {
   readonly instance?: string;
   readonly alive?: boolean;
   readonly workdir?: string;
+  readonly purpose?: string;
   readonly terminalOriginCategory?: PtyManifestRow['terminalOriginCategory'];
   readonly terminalOriginReason?: string;
   readonly externalToolName?: string;
@@ -457,7 +467,7 @@ interface RemoteTerminalListItem {
 
 export function listPtyRefs(
   localHandles: readonly Pick<PtyHandle, 'id' | 'kind' | 'nickname' | 'isAlive' | 'accessMode' | 'workdir'>[],
-  manifestRows: readonly { id: string; kind: string; nickname?: string; runId?: string; alive: boolean; workdir?: string; terminalOriginCategory?: PtyManifestRow['terminalOriginCategory']; terminalOriginReason?: string; externalToolName?: string }[],
+  manifestRows: readonly { id: string; kind: string; nickname?: string; runId?: string; alive: boolean; workdir?: string; purpose?: string; terminalOriginCategory?: PtyManifestRow['terminalOriginCategory']; terminalOriginReason?: string; externalToolName?: string }[],
 ): PtyListItem[] {
   // ⭐ 로컬 우선 — 같은 id 가 양쪽에 있으면 **로컬 handle 이 진실**이다(같은 프로세스의 실시간 상태).
   //    manifest 의 `alive` 는 하트비트 기반이라 stale 할 수 있어(프로세스가 죽어도 한동안 alive=1),
@@ -469,13 +479,14 @@ export function listPtyRefs(
     return {
       id: handle.id, kind: handle.kind, source: 'local' as const, alive: handle.isAlive(), mode: handle.accessMode,
       ...(handle.nickname ? { nickname: handle.nickname } : {}), ...(handle.workdir ? { workdir: handle.workdir } : {}),
+      ...(manifest?.purpose ? { purpose: manifest.purpose } : {}),
       ...(manifest?.terminalOriginCategory ? { terminalOriginCategory: manifest.terminalOriginCategory } : {}),
       ...(manifest?.terminalOriginReason ? { terminalOriginReason: manifest.terminalOriginReason } : {}),
       ...(manifest?.externalToolName ? { externalToolName: manifest.externalToolName } : {}),
     };
   });
   const ids = new Set(local.map((item) => item.id));
-  return [...local, ...manifestRows.filter((row) => !ids.has(row.id)).map((row) => ({ id: row.id, kind: row.kind, source: 'remote' as const, alive: row.alive, ...(row.nickname ? { nickname: row.nickname } : {}), ...(row.workdir ? { workdir: row.workdir } : {}), ...(row.runId ? { runId: row.runId } : {}), ...(row.terminalOriginCategory ? { terminalOriginCategory: row.terminalOriginCategory } : {}), ...(row.terminalOriginReason ? { terminalOriginReason: row.terminalOriginReason } : {}), ...(row.externalToolName ? { externalToolName: row.externalToolName } : {}) }))];
+  return [...local, ...manifestRows.filter((row) => !ids.has(row.id)).map((row) => ({ id: row.id, kind: row.kind, source: 'remote' as const, alive: row.alive, ...(row.nickname ? { nickname: row.nickname } : {}), ...(row.workdir ? { workdir: row.workdir } : {}), ...(row.purpose ? { purpose: row.purpose } : {}), ...(row.runId ? { runId: row.runId } : {}), ...(row.terminalOriginCategory ? { terminalOriginCategory: row.terminalOriginCategory } : {}), ...(row.terminalOriginReason ? { terminalOriginReason: row.terminalOriginReason } : {}), ...(row.externalToolName ? { externalToolName: row.externalToolName } : {}) }))];
 }
 
 export function readLivePtyAddressBook(): PtyAddressBook {
@@ -505,6 +516,9 @@ export function readLivePtyAddressBook(): PtyAddressBook {
 
 const liveDeps: PtyTakeoverCommandDeps = {
   getPty, requestPtyTakeover, requestRemote: requestRemotePtyControl, readManifestFrame: readPtyManifestFrame,
+  readManifestRow: getPtyManifest,
+  readInstalledBuild: () => readCurrentInstallRecord(),
+  readCheckoutHead,
   // `find`/`retire` must prove before removal: this reader never invokes any reaper.
   listManifestRows: listPtyManifestRows,
   listManifestRowsAt: listPtyManifestRowsAt,
@@ -662,6 +676,7 @@ function mapResult(action: string, ptyId: string, control: PtyControlResult, dep
     deps.log(action, { ptyId, action, ...safe, from: control.from, to: control.to });
     if (action === 'takeover') return { exitCode: 0, message: `pty takeover: ${ptyId} is now human write-owned` };
     if (action === 'release') return { exitCode: 0, message: `pty release: ${ptyId} returned to ${control.to ?? 'its prior'} mode` };
+    if (action === 'rename') return { exitCode: 0, message: `pty rename: ${ptyId} is now named ${String(safe.nickname ?? '')}` };
     return { exitCode: 0, message: `pty ${action}: delivered to ${ptyId}` };
   }
   const reason = control.reason ?? control.status;
@@ -1341,6 +1356,17 @@ function formatPtyWorktreeProvenance(raw: PtyWorktreeProvenance): string {
   ].join(' ');
 }
 
+function formatPtyPurpose(raw: PtyWorktreeProvenance, explicit?: string): string {
+  const provenance = normalizePtyWorktreeProvenance(raw);
+  return provenance.known || !explicit?.trim()
+    ? formatPtyWorktreeProvenance(provenance)
+    : `purpose=${singleLinePtyCell(explicit)}`;
+}
+
+function ptyPurposeKnown(raw: PtyWorktreeProvenance, explicit?: string): boolean {
+  return normalizePtyWorktreeProvenance(raw).known || Boolean(explicit?.trim());
+}
+
 function terminalOriginFields(row: Pick<PtyManifestRow, 'terminalOriginCategory' | 'terminalOriginReason' | 'externalToolName'>): { readonly terminalOriginCategory: NonNullable<PtyManifestRow['terminalOriginCategory']>; readonly terminalOriginReason: string; readonly externalToolName?: string } {
   const category = row.terminalOriginCategory;
   const reason = row.terminalOriginReason;
@@ -1383,6 +1409,7 @@ interface PtyListJsonRow extends PtyWebAddress {
   readonly id: string;
   readonly kind: string;
   readonly nickname?: string;
+  readonly purpose?: string;
   readonly runId?: string;
   readonly instance: string | 'unknown';
   readonly sourceRoot: PtyManifestSourceRoot | 'unknown';
@@ -1448,6 +1475,7 @@ function ptyListJsonRow(row: PtyManifestRow, instance: string, sourceRoot: PtyMa
     id: row.id,
     kind: row.kind,
     ...(row.nickname ? { nickname: row.nickname } : {}),
+    ...(row.purpose ? { purpose: row.purpose } : {}),
     ...(row.runId ? { runId: row.runId } : {}),
     instance,
     sourceRoot,
@@ -1561,6 +1589,7 @@ function parseRemoteTerminalItem(value: unknown): RemoteTerminalListItem | null 
     id,
     ...(stringOrUndefined(row.kind) ? { kind: stringOrUndefined(row.kind) } : {}),
     ...(stringOrUndefined(row.nickname) ? { nickname: stringOrUndefined(row.nickname) } : {}),
+    ...(stringOrUndefined(row.purpose) ? { purpose: stringOrUndefined(row.purpose) } : {}),
     ...(stringOrUndefined(row.runId) ? { runId: stringOrUndefined(row.runId) } : {}),
     ...(stringOrUndefined(row.instance) ? { instance: stringOrUndefined(row.instance) } : {}),
     ...(typeof row.alive === 'boolean' ? { alive: row.alive } : {}),
@@ -1723,6 +1752,7 @@ function remotePtyListJsonRow(row: RemoteTerminalListItem): PtyListJsonRow {
     id: row.id,
     kind: row.kind ?? 'unknown',
     ...(row.nickname ? { nickname: row.nickname } : {}),
+    ...(row.purpose ? { purpose: row.purpose } : {}),
     ...(row.runId ? { runId: row.runId } : {}),
     instance: row.instance ?? 'unknown',
     sourceRoot: row.sourceRoot ?? 'unknown',
@@ -1755,7 +1785,7 @@ function formatRemotePtyListRow(row: RemoteTerminalListItem): string {
   //      ***사실 주장***인데 우리는 그 기계에서 git 을 «돌린 적이 없다». 우리가 아는 것은
   //      「그 응답이 그 칸을 안 실었다」뿐이고, 그것은 «저쪽에 기록이 없다»와 다른 값이다.
   const provenance: PtyWorktreeProvenance = { known: false, provenanceReason: 'unknown' };
-  return `${row.id}\t${row.kind ?? 'unknown'}\t${row.nickname ?? '-'}\tremote\t${alive}\t?\t${row.workdir ?? '-'}\t${row.runId ?? '-'}\tunknown\t${origin}\t${formatPtyWorktreeProvenance(provenance)}`;
+  return `${row.id}\t${row.kind ?? 'unknown'}\t${row.nickname ?? '-'}\tremote\t${alive}\t?\t${row.workdir ?? '-'}\t${row.runId ?? '-'}\tunknown\t${origin}\t${formatPtyPurpose(provenance, row.purpose)}`;
 }
 
 async function runPtyListRemote(
@@ -1816,7 +1846,7 @@ async function runPtyListRemote(
   const rendered = fetched.terminals.map((row) => formatRemotePtyListRow(row));
   return {
     exitCode: 0,
-    message: [...rendered, `purpose-known rows: 0/${rendered.length}`].join('\n'),
+    message: [...rendered, `purpose-known rows: ${fetched.terminals.filter((row) => Boolean(row.purpose?.trim())).length}/${rendered.length}`].join('\n'),
   };
 }
 
@@ -1913,7 +1943,7 @@ export function runPtyList(
       const ownerRunUsage = classifyPtyOwnerRunUsage(ref.ownerProcessAlive, runTerminated);
       const provenance = (deps.resolveWorktreeProvenance ?? resolvePtyWorktreeProvenance)(ref.workdir);
       if (ownerRunUsage === 'terminated-live-owner') deps.log('owner-run-terminated', { ptyId: ref.id, runId: ref.runId ?? '' });
-      return { known: normalizePtyWorktreeProvenance(provenance).known, line: `${formatFederatedRef(ref, ownerRunUsage)}\t${formatTerminalOrigin(ref)}\t${formatPtyWorktreeProvenance(provenance)}${pwa ? `\t${formatPtyWebAddress(ptyWebAddress(ref.id, pwa))}` : ''}` };
+      return { known: ptyPurposeKnown(provenance, ref.purpose), line: `${formatFederatedRef(ref, ownerRunUsage)}\t${formatTerminalOrigin(ref)}\t${formatPtyPurpose(provenance, ref.purpose)}${pwa ? `\t${formatPtyWebAddress(ptyWebAddress(ref.id, pwa))}` : ''}` };
     });
     return { exitCode: 0, message: [...rendered.map(({ line }) => line), `purpose-known rows: ${rendered.filter(({ known }) => known).length}/${rendered.length}`, ...partial].join('\n') };
   }
@@ -1934,9 +1964,14 @@ export function runPtyList(
   deps.log('list', { count: refs.length });
   if (refs.length === 0) return { exitCode: 0, message: `${ptyListEmptyNotice(opts)}\npurpose-known rows: 0/0` };
   const pwa = deps.resolveNexusPwa?.();
+  // 판 칸(맨 끝) — 설치본 기록은 목록 한 번에 한 번만 읽는다.
+  //    설치본 판독기가 없는 구성(시험 deps)은 이 칸을 안 낸다 — 기계마다 다른 값이 목록에 새지 않게.
+  const manifestRowById = new Map((deps.readInstalledBuild ? deps.listManifestRows?.() ?? [] : []).map((row) => [row.id, row] as const));
+  let installedOnce: InstalledRecord | undefined;
+  const installed = (): InstalledRecord => (installedOnce ??= deps.readInstalledBuild?.() ?? {});
   const rendered = refs.map((ref) => {
     const provenance = (deps.resolveWorktreeProvenance ?? resolvePtyWorktreeProvenance)(ref.workdir);
-    return { known: normalizePtyWorktreeProvenance(provenance).known, line: `${ref.id}\t${ref.kind}\t${ref.nickname ?? '-'}\t${ref.source}\t${ref.alive ? 'alive' : 'dead'}\t${ref.mode ?? '?'}\t${ref.workdir ?? '-'}\t${ref.runId ?? '-'}${ownerRunUsageById.has(ref.id) ? `\t${ownerRunUsageById.get(ref.id)}` : ''}\t${formatTerminalOrigin(ref)}\t${formatPtyWorktreeProvenance(provenance)}${pwa ? `\t${formatPtyWebAddress(ptyWebAddress(ref.id, pwa))}` : ''}` };
+    return { known: ptyPurposeKnown(provenance, ref.purpose), line: `${ref.id}\t${ref.kind}\t${ref.nickname ?? '-'}\t${ref.source}\t${ref.alive ? 'alive' : 'dead'}\t${ref.mode ?? '?'}\t${ref.workdir ?? '-'}\t${ref.runId ?? '-'}${ownerRunUsageById.has(ref.id) ? `\t${ownerRunUsageById.get(ref.id)}` : ''}\t${formatTerminalOrigin(ref)}\t${formatPtyPurpose(provenance, ref.purpose)}${pwa ? `\t${formatPtyWebAddress(ptyWebAddress(ref.id, pwa))}` : ''}${formatListRunColumn(manifestRowById.get(ref.id), deps, installed)}` };
   });
   return {
     exitCode: 0,
@@ -2025,12 +2060,56 @@ const WAITABLE_FRAME_STATES: readonly Exclude<FrameState, 'unknown'>[] = ['idle'
 export async function runPtyState(ref: string, deps: PtyTakeoverCommandDeps = liveDeps, json = false): Promise<PtyTakeoverCommandResult> {
   const acquired = await acquirePtyScreen(ref, deps);
   if ('exitCode' in acquired) return acquired;
-  if (acquired.control.status !== 'success') return { exitCode: 1, message: formatSnapshotResult(acquired.id, acquired.control) };
+  // ⭐ `state` 는 화면 분류(추정)고 `turn` 은 TUI 가 스스로 적은 값이다 — 둘을 섞지 않는다.
+  const run = ptyRunStateFor(acquired.id, deps);
+  if (acquired.control.status !== 'success') {
+    // 화면을 못 읽어도 기록된 턴·판은 낸다(state=unknown + 화면 실패 사유). 기록이 하나도 없으면 종전 실패 그대로.
+    if (run.turn === 'unknown' && run.build === null) return { exitCode: 1, message: formatSnapshotResult(acquired.id, acquired.control) };
+    const screenUnavailable = acquired.control.reason ?? acquired.control.status;
+    deps.log('state-screen-unavailable', { ptyId: acquired.id, reason: screenUnavailable, turn: run.turn });
+    return formatPtyStateResult(acquired.id, { state: 'unknown', label: null }, run, deps.now?.() ?? Date.now(), json, screenUnavailable);
+  }
   const verdict = classifyFrameState(acquired.control.screen ?? '');
   const at = deps.now?.() ?? Date.now();
+  if (run.turn === 'unknown' || run.stale === null) deps.log('state-run-unknown', { ptyId: acquired.id, turn: run.turn, staleReason: run.staleReason, hasBuild: run.build !== null });
+  return formatPtyStateResult(acquired.id, { state: verdict.state, label: verdict.matchedLabel }, run, at, json);
+}
+
+function formatPtyStateResult(id: string, screen: { state: string; label?: string | null }, run: PtyRunStateView, at: number, json: boolean, screenUnavailable?: string): PtyTakeoverCommandResult {
   return { exitCode: 0, message: json
-    ? JSON.stringify({ id: acquired.id, state: verdict.state, label: verdict.matchedLabel, at })
-    : `pty state: ${acquired.id} state=${verdict.state} label=${verdict.matchedLabel ?? '-'}` };
+    ? JSON.stringify({
+      id, state: screen.state, label: screen.label, at,
+      ...(screenUnavailable ? { screenUnavailable } : {}),
+      turn: run.turn, ...(run.turnAt !== undefined ? { turnAt: run.turnAt } : {}),
+      build: run.build ? { version: run.build.version, sha: run.build.sha, source: run.build.source } : null,
+      installed: run.installed, stale: run.stale, staleReason: run.staleReason,
+    })
+    : `pty state: ${id} state=${screen.state} label=${screen.label ?? '-'}${screenUnavailable ? ` screen=unavailable(${screenUnavailable})` : ''} turn=${run.turn} build=${formatRunBuild(run)} installed=${shortSha(run.installed)} stale=${run.stale ?? 'unknown'}${run.stale === null ? '' : ` (${run.staleReason})`}` };
+}
+
+function ptyRunStateFor(id: string, deps: PtyTakeoverCommandDeps): PtyRunStateView {
+  let row: PtyManifestRow | null = null;
+  try { row = deps.readManifestRow?.(id) ?? null; } catch { row = null; }
+  // 판독기 미주입이면 «모른다»로 — 기본 판독(실 설치본·git)은 liveDeps 가 싣는다.
+  return describePtyRunState(row, {
+    readInstalled: deps.readInstalledBuild ?? (() => ({})),
+    readCheckoutHead: deps.readCheckoutHead ?? (() => undefined),
+  });
+}
+
+function formatRunBuild(run: PtyRunStateView): string {
+  return run.build ? `${run.build.version}@${shortSha(run.build.sha)}(${run.build.source})` : 'unknown';
+}
+
+/** `pty list` 한 칸 — 판을 적는 행(TUI)만. `run=<sha>` · 낡았으면 `,stale` · 옛 행 추정은 `run=?,stale`. */
+function formatListRunColumn(row: PtyManifestRow | undefined, deps: PtyTakeoverCommandDeps, installed: () => InstalledRecord): string {
+  if (!row || (!row.build && row.kind !== 'tui')) return '';
+  const run = describePtyRunState(row, {
+    readInstalled: installed,
+    ...(deps.readCheckoutHead ? { readCheckoutHead: deps.readCheckoutHead } : {}),
+  });
+  if (!run.build && run.stale !== true) return '';
+  return `\trun=${run.build?.sha ? shortSha(run.build.sha) : '?'}${run.stale === true ? ',stale' : ''}`;
 }
 
 export async function runPtyWait(ref: string, until: string, options: { readonly timeoutMs?: number; readonly pollMs?: number } = {}, deps: PtyTakeoverCommandDeps = liveDeps): Promise<PtyTakeoverCommandResult> {
@@ -2054,6 +2133,15 @@ export async function runPtyWait(ref: string, until: string, options: { readonly
 }
 
 export function runPtyText(ref: string, text: string, appendEnter = false, deps: PtyTakeoverCommandDeps = liveDeps, actor: PtyWriteActor = 'human'): Promise<PtyTakeoverCommandResult> { return inject(ref, 'input-text', text + (appendEnter ? '\r' : ''), { length: text.length + (appendEnter ? 1 : 0) }, deps, actor); }
+/** `pty text --when-idle` — 화면이 idle 로 분류될 때까지 기다린 뒤 넣는다. 못 기다렸으면 «안 넣고» rc=1.
+ *  ⭐ 맨 `elanous` TUI 는 기다리지 않아도 턴 중·입력 중 글을 별도 대기열로 돌린다(`input/external-input-queue`) —
+ *  이 플래그는 그 밖의 대상(외부 CLI 자식 등)에서 «언제 들어갔나»를 rc 로 받고 싶을 때 쓴다. */
+export async function runPtyTextWhenIdle(ref: string, text: string, appendEnter: boolean, options: { readonly timeoutMs?: number; readonly pollMs?: number }, deps: PtyTakeoverCommandDeps = liveDeps, actor: PtyWriteActor = 'human'): Promise<PtyTakeoverCommandResult> {
+  const waited = await runPtyWait(ref, 'idle', options, deps);
+  if (waited.exitCode !== 0) return { exitCode: 1, message: `pty text --when-idle: not delivered · ${waited.message}` };
+  const typed = await runPtyText(ref, text, appendEnter, deps, actor);
+  return { ...typed, message: `${waited.message}\n${typed.message}` };
+}
 export function runPtyKey(ref: string, key: string, repeat = 1, deps: PtyTakeoverCommandDeps = liveDeps, actor: PtyWriteActor = 'human'): Promise<PtyTakeoverCommandResult> {
   if (!Number.isInteger(repeat) || repeat < 1) return Promise.resolve({ exitCode: 1, message: 'pty key: repeat must be a positive integer' });
   try { const normalized = key.trim().toLowerCase(); return inject(ref, 'input-key', resolvePtySpecialKey(normalized).repeat(repeat), { key: normalized, repeat }, deps, actor); } catch (error) { return Promise.resolve({ exitCode: 1, message: `pty key: ${(error as Error).message}` }); }
@@ -2090,6 +2178,20 @@ export async function runPtyResize(ref: string, cols: number, rows: number, deps
     : outcome === 'denied'
       ? { status: 'denied', reason: 'write-arbiter' }
       : { status: 'failed', reason: 'resize-error' }, deps, observed);
+}
+/** `pty rename <ref> <name>` — 별명만 바꾼다(소유권 아님 · resize 와 같은 길: 로컬이면 바로, 아니면 소유자 IPC).
+ *  ⭐ 맨 `elanous` TUI 행(`tui:<pid>`)도 받는다 — 소유자 쪽 renamePty 가 제어 대상의 manifest 행을 고친다.
+ *  별명 충돌은 기존 rename 규칙 그대로다(거부하지 않는다 · 같은 별명 둘이면 ref 해석이 ambiguous 로 거부). */
+export async function runPtyRename(ref: string, name: string, deps: PtyTakeoverCommandDeps = liveDeps, actor: PtyWriteActor = 'human'): Promise<PtyTakeoverCommandResult> {
+  const nickname = name.trim();
+  if (!nickname) return { exitCode: 1, message: 'pty rename: name must not be empty' };
+  const refResult = resolveId(ref, 'rename', deps); if (typeof refResult !== 'string') return refResult;
+  const id = refResult;
+  const observed = { nickname, actor };
+  const handle = deps.getPty(id);
+  if (!handle) return mapResult('rename', id, await deps.requestRemote(id, 'rename', { nickname }, { actor }), deps, observed);
+  const renamed = (deps.renameLocal ?? renamePty)(id, nickname);
+  return mapResult('rename', id, renamed ? { status: 'success' } : { status: 'unknown-pty' }, deps, observed);
 }
 export function registerPtyTakeoverCommands(program: Command, deps: PtyTakeoverCommandDeps = liveDeps, toolInstallDeps: ToolInstallDeps = {}): void {
   const pty = program.command('pty').description(
@@ -2181,10 +2283,15 @@ export function registerPtyTakeoverCommands(program: Command, deps: PtyTakeoverC
     return actor ? next(actor) : Promise.resolve({ exitCode: 1, message: `pty: --actor must be 'human' or 'agent' (got ${opts.actor})` });
   };
   pty.command('text <ref> <text>').option('--enter', 'append Enter (CR) after the text').option('-r', 'inject text on the default remote bookmark (does not take a value)').option('--remote <name>', 'inject text on a named remote bookmark').option(...ACTOR_FLAG)
-    .description('Inject literal text — no newline unless --enter').action((id: string, text: string, opts: { enter?: boolean; actor?: string; r?: boolean; remote?: string }) => run(() => {
+    .option('--when-idle', 'wait until the screen classifies as idle before injecting; rc=1 and nothing injected on timeout (the bare elanous TUI already queues text sent mid-turn or over a typed draft as a separate message)')
+    .option('--idle-timeout <ms>', 'max wait for --when-idle in milliseconds', '600000')
+    .description('Inject literal text — no newline unless --enter').action((id: string, text: string, opts: { enter?: boolean; actor?: string; r?: boolean; remote?: string; whenIdle?: boolean; idleTimeout: string }) => run(() => {
       const remote = opts.remote ?? (opts.r === true ? true : undefined);
+      if (opts.whenIdle === true && remote !== undefined) return Promise.resolve({ exitCode: 1 as const, message: 'pty text: --when-idle is local-only (remote bookmarks are not supported)' });
       return withActor(opts, (actor) => remote === undefined
-        ? runPtyText(id, text, Boolean(opts.enter), deps, actor)
+        ? (opts.whenIdle === true
+          ? runPtyTextWhenIdle(id, text, Boolean(opts.enter), { timeoutMs: Number(opts.idleTimeout) }, deps, actor)
+          : runPtyText(id, text, Boolean(opts.enter), deps, actor))
         : runPtyRemoteControl('text', id, remote, { action: 'input-text', chars: text + (opts.enter === true ? '\r' : '') }, deps));
     }));
   pty.command('key <ref> <key>').option('-n, --repeat <count>', 'repetitions', '1').option('-r', 'inject a key on the default remote bookmark (does not take a value)').option('--remote <name>', 'inject a key on a named remote bookmark').option(...ACTOR_FLAG)
@@ -2208,6 +2315,8 @@ export function registerPtyTakeoverCommands(program: Command, deps: PtyTakeoverC
       if (remote !== undefined && actor === 'agent') return { exitCode: 1, message: 'pty mouse: remote HTTP cannot verify same-run agent ownership; use the owner IPC instead' };
       return remote === undefined ? runPtyMouse(id, input, deps, actor) : runPtyRemoteControl('mouse', id, remote, { action: 'input-mouse', ...input }, deps);
     })));
+  pty.command('rename <ref> <name>').option(...ACTOR_FLAG)
+    .description("Rename a live PTY's nickname (incl. the bare elanous TUI row tui:<pid>) — later refs can use the new name").action((id: string, name: string, opts: { actor?: string }) => run(() => withActor(opts, (actor) => runPtyRename(id, name, deps, actor))));
   pty.command('resize <ref> <cols> <rows>').option(...ACTOR_FLAG)
     .description('Resize the PTY (gated by the same access matrix as input)').action((id: string, cols: string, rows: string, opts: { actor?: string }) => run(() => withActor(opts, (actor) => runPtyResize(id, Number(cols), Number(rows), deps, actor))));
 }

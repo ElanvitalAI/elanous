@@ -7,7 +7,7 @@ import { runSelfGateCli, type SelfGateCliOptions, type SelfGateCliResult } from 
 import { GATE_CALLER_TEST_LIMIT } from '../self-implement/gate-scope.js';
 import { GATE_REMOTE_DEFAULTS, type DispatchDeps, type DispatchOptions, type GateRemoteRunner } from '../self-implement/gate-remote.js';
 import { registerReleaseCommands } from '../cli/release-cli.js';
-import { LIGHT_RC_ALWAYS_FILE, LIGHT_RC_UNKNOWN_HOST, parseAlwaysIncludeList, resolveMeasuredCommit, runLightRc, type LightRcDeps } from './light-rc.js';
+import { LIGHT_RC_ALWAYS_FILE, LIGHT_RC_UNKNOWN_HOST, formatLightRc, parseAlwaysIncludeList, resolveMeasuredCommit, runLightRc, type LightRcDeps } from './light-rc.js';
 
 const REPO = resolve(import.meta.dir, '../..');
 const dirs: string[] = [];
@@ -118,6 +118,65 @@ function localDeps(over: Partial<LightRcDeps> = {}, gate: SelfGateCliResult = ga
 }
 
 describe('runLightRc (LIGHT-RC ⑶)', () => {
+  test('rehearsal opt-in invokes screen check on measured commit and blocks failed or unmeasured screens', async () => {
+    const seen: string[] = [];
+    const { deps } = localDeps({ tuiCheck: async (commit) => { seen.push(commit); return { outcome: 'fail', detail: 'help-closes failed' }; } });
+    const normal = await runLightRc('0.2.19', { base: 'abc123', head: MAIN_SHA, log: () => {} }, deps);
+    expect(normal.ok).toBe(true);
+    expect(seen).toEqual([]);
+    const rehearsal = await runLightRc('0.2.19', { base: 'abc123', head: MAIN_SHA, rehearsalTui: true, log: () => {} }, deps);
+    expect(seen).toEqual([MAIN_SHA]);
+    expect(rehearsal).toMatchObject({ ok: false, rehearsalTui: { outcome: 'fail' }, unmeasured: null });
+    expect(formatLightRc(rehearsal)).toContain('  TUI screens: fail (help-closes failed)');
+  });
+
+  test('rehearsal TUI runs in the measured checkout before cleanup', async () => {
+    const seen: string[] = [];
+    const { deps } = localDeps({
+      git: (args) => ({ rc: 0, stdout: args.includes('HEAD') ? 'b'.repeat(40) + '\n' : MAIN_SHA + '\n' }),
+      checkout: () => ({ dir: '/measured/tree', cleanup: () => { seen.push('cleanup'); } }),
+      readFile: () => 'src/cli/a.test.ts\n',
+      tuiCheck: async (_commit, tree) => {
+        seen.push(tree);
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        seen.push('checked');
+        return { outcome: 'ok', detail: '6 screens' };
+      },
+    });
+    const result = await runLightRc('0.2.25', { base: 'abc123', head: MAIN_SHA, rehearsalTui: true, local: true, log: () => {} }, deps);
+    expect(seen).toEqual(['/measured/tree', 'checked', 'cleanup']);
+    expect(result.rehearsalTui?.outcome).toBe('ok');
+  });
+
+  test('remote rehearsal carries opt-in to child and refuses a missing screen result', async () => {
+    let remoteArgv: string[] = [];
+    const { deps } = localDeps({ dispatch: async (opts, channels) => {
+      remoteArgv = typeof opts.remoteArgv === 'function' ? opts.remoteArgv((sha: string) => sha) : opts.remoteArgv;
+      channels?.write?.out(Buffer.from(JSON.stringify({ introduced: 0, unclassified: 0, gateExitCode: 0 }) + '\n'));
+      return 0;
+    } });
+    const result = await runLightRc('0.2.19', { base: 'abc123', head: MAIN_SHA, rehearsalTui: true, log: () => {} }, deps);
+    expect(remoteArgv).toContain('--rehearsal-tui');
+    expect(result).toMatchObject({ ok: false, rehearsalTui: { outcome: 'unmeasured' } });
+    const { deps: invalidDeps } = localDeps({ dispatch: async (_opts, channels) => {
+      channels?.write?.out(Buffer.from(JSON.stringify({ introduced: 0, unclassified: 0, gateExitCode: 0, rehearsalTui: { outcome: 'ok' } }) + '\n'));
+      return 0;
+    } });
+    expect(await runLightRc('0.2.19', { base: 'abc123', head: MAIN_SHA, rehearsalTui: true, log: () => {} }, invalidDeps)).toMatchObject({
+      ok: false, rehearsalTui: { outcome: 'unmeasured', detail: 'remote TUI screen result missing' },
+    });
+  });
+  test('remote rehearsal never turns an unmeasured shard green when screens pass', async () => {
+    const { deps } = localDeps({ dispatch: async (_opts, channels) => {
+      channels?.write?.out(Buffer.from(JSON.stringify({
+        introduced: 0, unclassified: 0, unmeasured: 'shard-2', gateExitCode: 1,
+        rehearsalTui: { outcome: 'ok', detail: '6 screens' },
+      }) + '\n'));
+      return 1;
+    } });
+    const result = await runLightRc('0.2.19', { base: 'abc123', head: MAIN_SHA, rehearsalTui: true, log: () => {} }, deps);
+    expect(result).toMatchObject({ ok: false, unmeasured: 'shard-2', rehearsalTui: { outcome: 'ok' } });
+  });
   test('③ no --base: merge-base of the previous cut is the base · shards 4 · the six always-include paths · one gate call', async () => {
     const gitCalls: string[][] = [];
     const { calls, dispatched, deps } = localDeps({ git: (args) => { gitCalls.push(args); return fakeGit(args); } });

@@ -23,7 +23,31 @@ const TASK = /(?:작업|파일|폴더|디렉터리|레포|저장소|커밋|브�
 const PATH_OR_CODE = /(?:https?:\/\/|www\.|[\w.-]+\/[\w./-]+|\.(?:ts|tsx|js|py|md|json|yaml|swift|kt)\b|[`{};=<>])/i;
 const LIVE = /(?:오늘\s*(?:날짜|며칠|무슨\s*요일)|지금\s*몇\s*시|최신|뉴스|속보|주가|시세|환율|날씨|today'?s|latest|news|stock|weather|right now)/i;
 
-export type TuiChatRoute = '조회' | '설정 변경' | '조사' | '상시 일' | '코딩·구현';
+export type TuiChatRoute = '조회' | '설정 변경' | '조사' | '상시 일' | '읽기·분석' | '코딩·구현';
+const TUI_CHAT_ROUTES: readonly TuiChatRoute[] = ['조회', '설정 변경', '조사', '상시 일', '읽기·분석', '코딩·구현'];
+
+// goal loop 밖 턴이 답 앞에 먼저 보내는 «라우팅 줄»(core-turn-bridge) — 형식의 정본은 여기 하나다.
+export function formatTuiRouteLine(route: TuiChatRoute): string {
+  return `라우팅: ${route}\n`;
+}
+// 그 줄 «그대로»인 청크만 참이다 — 모델 출력의 시작으로 세지 않을 때 쓴다(compact-400 재시도 판정 · 0.2.29).
+export function isTuiRouteLine(chunk: string): boolean {
+  return TUI_CHAT_ROUTES.some((route) => chunk === formatTuiRouteLine(route));
+}
+
+// 읽기·분석(goal loop 밖 단일 턴 · 도구 전체) 자리에서도 goal 을 지키는 셋 — «해줘» 없는 쓰기 꼴 · 디버깅 · 목표 명시.
+// 쓰기 낱말은 «동사로 쓰일 때»만 문다(«추가 정보» · «갱신된 칸» · «기록된 결정» 은 읽기다).
+const WRITE_INTENT = /(?:(?:추가|작성|기록|반영|갱신|업데이트|개선|수정|변경|교체|생성|적용|도입|설계|연결|정정)(?=\s*(?:해|하|할|합|좀|$|[.!]))|적어|붙여|넣어|만들|고치|바꾸|올려|채워|\b(?:add|write|append|insert|implement)\b)/i;
+const DEBUG_INTENT = /(?:디버그|디버깅|에러|오류|크래시|깨져|깨짐|안\s*(?:돼|됨|되네|된다)|\b(?:debug|error|crash|broken|fails?|failing)\b)/i;
+const EXPLICIT_GOAL = /(?:^\/goal\b|목표\s*[:：]|\bgoal\s*:)/i;
+const REPO_NOUN = /(?:코드|스크립트|소스|브랜치|서버|파일|레포|저장소|\bPR\b|\b(?:code|script|branch|server|file|repo)\b)/i;
+
+function writeDebugOrGoal(q: string): 'write-intent' | 'debug' | 'explicit-goal' | null {
+  if (WRITE_INTENT.test(q)) return 'write-intent';
+  if (DEBUG_INTENT.test(q)) return 'debug';
+  if (EXPLICIT_GOAL.test(q)) return 'explicit-goal';
+  return null;
+}
 
 export interface TuiChatVerdict {
   route: TuiChatRoute;
@@ -31,8 +55,8 @@ export interface TuiChatVerdict {
   goalLoop: boolean;
 }
 
-/** Request verbs a quick lookup/settings/research/scheduling turn can carry out without the repository. */
-const QUICK_REQUEST_VERBS = /^(?:보여|알려|확인해|찾아|찾아봐|조사해|검색해|정리해|요약해|바꿔|변경해|전환해|설정해|맞춰|수정해|고쳐|만들어|등록해|예약해|추가해|보내)$/;
+/** Request verbs a quick or read-only turn can carry out without writing to the repository. */
+const QUICK_REQUEST_VERBS = /^(?:보여|알려|확인해|찾아|찾아봐|조사해|검색해|정리해|요약해|바꿔|변경해|전환해|설정해|맞춰|수정해|고쳐|만들어|등록해|예약해|추가해|보내|설명해|읽어|읽어봐|살펴|살펴봐|훑어봐|비교해|분석해|검토해|평가해|제안해)$/;
 
 /** True when the verb never appears, or each occurrence directly follows an allowed object. */
 function everyVerbTakes(text: string, verb: RegExp, object: RegExp): boolean {
@@ -42,16 +66,14 @@ function everyVerbTakes(text: string, verb: RegExp, object: RegExp): boolean {
   return true;
 }
 
-/** Uncertain or mixed requests retain the full coding goal-loop and tool surface. */
+/** Write, debug, goal, mixed or attached requests retain the coding goal loop; a plain read question is one full-tool turn. */
 export function classifyTuiChatIntent(text: string, ctx: ShortQuestionContext = {}): TuiChatVerdict {
   const q = text.trim();
   const coding = (reason: string): TuiChatVerdict => ({ route: '코딩·구현', reason, goalLoop: true });
   if (!q || ctx.hasAttachments) return coding(ctx.hasAttachments ? 'attachment' : 'empty');
-  if (/(?:하니스|구현|코딩|코드|스크립트|버그|소스|리팩터|커밋|패치|테스트|시험\s*돌|빌드|배포|브랜치|서버|파일|레포|저장소|\bPR\b|\b(?:implement|coding|code|script|refactor|commit|patch|tests?|build|deploy|branch|server|file|repo)\b)/i.test(q)) return coding('coding');
+  if (/(?:하니스|구현|코딩|버그|리팩터|커밋|패치|테스트|시험\s*돌|빌드|배포|\b(?:implement|coding|refactor|commit|patch|tests?|build|deploy)\b)/i.test(q)) return coding('coding');
   // Destructive or executing verbs in any form (not only «…줘») are never a quick turn.
-  if (/(?:지워|지우|삭제|제거|옮겨|옮기|돌려|실행|설치|되돌려|롤백|재시작|죽여|\b(?:delete|remove|rm|rename|move|run|install|revert|rollback|drop|kill|restart)\b)/i.test(q)) return coding('write-verb');
-  // A file path or code shape means the request touches the repository, whatever else it asks.
-  if (PATH_OR_CODE.test(q)) return coding('path-or-code');
+  if (/(?:지워|지우|삭제|제거|옮겨|옮기|돌려|실행(?!\s*중(?:인)?(?:\s|[?!.~]|$))|설치|되돌려|롤백|재시작|죽여|\b(?:delete|remove|rm|rename|move|run|install|revert|rollback|drop|kill|restart)\b)/i.test(q)) return coding('write-verb');
   // Allowlist, not denylist: every «…줘» request verb must be one a quick turn can do; anything else
   // (지워줘 · 돌려줘 · 옮겨줘 …) keeps the coding goal loop.
   for (const match of q.matchAll(/([가-힣]+?)\s*(?:줘|주세요|줄래|주라)/g)) {
@@ -61,9 +83,17 @@ export function classifyTuiChatIntent(text: string, ctx: ShortQuestionContext = 
   // («모델 설정 수정해줘» · «알림 만들어줘» stay quick; «… 그리고 화면 고쳐줘» does not).
   if (!everyVerbTakes(q, /(?:수정|고쳐|바꿔|변경|전환|교체|\b(?:edit|fix|modify|change|switch|replace)\b)/gi, /(?:모델|설정|config|provider|예약|일정|알림|리마인더|스케줄|reminder|schedule)\s*(?:을|를|로|으로)?\s*$/i)) return coding('edit');
   if (!everyVerbTakes(q, /(?:만들어|작성|추가해|생성|등록해|\b(?:create|write|make|add)\b)/gi, /(?:알림|일정|예약|리마인더|스케줄|reminder|schedule)\s*(?:을|를)?\s*$/i)) return coding('create');
+  // Debugging or a stated goal keeps the goal loop even on a quick-route word («오류 로그 요약» · «목표: 상태 요약»).
+  if (DEBUG_INTENT.test(q)) return coding('debug');
+  if (EXPLICIT_GOAL.test(q)) return coding('explicit-goal');
+  // A repository noun, file path or code shape is no quick route; with no write, debug or goal intent it is a read.
+  if (REPO_NOUN.test(q) || PATH_OR_CODE.test(q)) {
+    const intent = writeDebugOrGoal(q);
+    return intent ? coding(intent) : { route: '읽기·분석', reason: 'read-repo', goalLoop: false };
+  }
 
   const routes: Array<{ route: Exclude<TuiChatRoute, '코딩·구현'>; reason: string; pattern: RegExp }> = [
-    { route: '조회', reason: 'lookup', pattern: /(?:결정\s*카드|결정\s*대기|상태|현황|로그|알림\s*(?:왔|있|보여)|\b(?:status|logs?|pending decisions?)\b)/i },
+    { route: '조회', reason: 'lookup', pattern: /(?:결정\s*카드|결정\s*대기|상태|현황|로그|알림\s*(?:왔|있|보여)|돌고\s*있는|진행\s*중|실행\s*중|뭐\s*하고\s*있어|\b(?:status|logs?|pending decisions?|(?<![\w-])running(?![\w-])|in progress)\b)/i },
     { route: '설정 변경', reason: 'settings', pattern: /(?:(?:모델|설정|config|provider).*(?:바꿔|변경|전환|설정해|맞춰|수정|고쳐|써\s*줘|set|change|switch|edit|fix|modify)|(?:바꿔|변경|전환).*(?:모델|설정|config|provider)|답변.*빠른\s*모델)/i },
     { route: '조사', reason: 'research', pattern: /(?:조사|검색|찾아\s*봐|뉴스|업계\s*소식|\b(?:research|search|news)\b)/i },
     { route: '상시 일', reason: 'recurring', pattern: /(?:매일|매주|매달|매\s*아침|[가-힣]+마다|정기적|반복\s*일정|예약|리마인더|\b(?:daily|weekly|every|schedule|remind)\b)/i },
@@ -74,10 +104,13 @@ export function classifyTuiChatIntent(text: string, ctx: ShortQuestionContext = 
     && matches.every(({ route }) => route === '상시 일' || route === '조사' || route === '조회')) {
     return { route: '상시 일', reason: matches.length > 1 ? 'recurring-research' : 'recurring', goalLoop: false };
   }
-  if (matches.length !== 1) {
-    if (matches.length) return coding('mixed');
+  if (matches.length > 1) return coding('mixed');
+  if (!matches.length) {
+    // 쓰기·디버깅·목표 의도가 없는 물음은 파일·상태를 읽고 답하는 한 턴이다 — 증거 게이트(update_goal)를 걸지 않는다.
+    const intent = writeDebugOrGoal(q);
+    if (intent) return coding(intent);
     const shortQuestion = classifyShortQuestion(q, ctx);
-    return coding(shortQuestion.fast ? `short-${shortQuestion.reason}` : 'ambiguous');
+    return { route: '읽기·분석', reason: shortQuestion.fast ? `short-${shortQuestion.reason}` : 'read', goalLoop: false };
   }
   const { route, reason } = matches[0]!;
   return { route, reason, goalLoop: false };

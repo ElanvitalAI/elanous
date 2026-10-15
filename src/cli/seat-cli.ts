@@ -78,10 +78,33 @@ function contextFacts(snapshot: unknown): string[] {
   return facts.slice(0, MAX_ROWS);
 }
 
-export function renderSeatBootCard(seat: SeatRole, sections: ReadonlyArray<{ title: string; source: string; updated: string; rows: readonly string[]; reason?: string }>, facts: readonly string[], contextUpdated = '미상'): string {
-  const out = [`# ${seat} 자리 부팅 카드`, '', '## 현재 구조화 관측', '출처: elanous://context-now', `갱신: ${clean(contextUpdated)}`, ...(facts.length ? facts.map(row => `- ${clean(row)}`) : ['- 미관측: contextNow 구조화 facts/events 없음'])];
+export type SeatBootSection = { title: string; source: string; updated: string; rows: readonly string[]; reason?: string };
+
+/** `facts === null` 이면 contextNow 절을 «생략»한다(TUI 부트 카드 — 턴 경로에서 버스를 안 읽는다). */
+export function renderSeatBootCard(seat: string, sections: ReadonlyArray<SeatBootSection>, facts: readonly string[] | null, contextUpdated = '미상'): string {
+  const out = facts === null
+    ? [`# ${seat} 자리 부팅 카드`]
+    : [`# ${seat} 자리 부팅 카드`, '', '## 현재 구조화 관측', '출처: elanous://context-now', `갱신: ${clean(contextUpdated)}`, ...(facts.length ? facts.map(row => `- ${clean(row)}`) : ['- 미관측: contextNow 구조화 facts/events 없음'])];
   for (const section of sections) out.push('', `## ${section.title}`, `출처: ${clean(section.source)}`, `갱신: ${clean(section.updated)}`, ...(section.rows.length ? section.rows.map(row => `- ${clean(row)}`) : [`- ${clean(section.reason ?? '미관측')}`]));
   return out.join('\n');
+}
+
+/** 자리 카드의 파일·우편 절(동기) — `eln seat boot` 와 TUI 세션 부트(`dashboard/seat-boot-preamble.ts`)가 같이 쓴다. */
+export function collectSeatBootSections(seat: string, options: { home: string; msgPath: string }): { sections: SeatBootSection[]; unread: number | null } {
+  const root = join(options.home, 'elanous-hq', 'seat-state');
+  const seatDir = join(root, seat);
+  let unread: number | null = null;
+  try { unread = readUnreadCount(seat, options.msgPath); }
+  catch { /* unavailable is not a measured zero */ }
+  const sections: SeatBootSection[] = [
+    { title: 'msg 원장', source: options.msgPath, updated: unread === null ? '미상' : new Date().toISOString(), rows: [`안 읽은 msg ${unread ?? '미관측'} (${seat})`] },
+    { title: 'HANDOFF', ...metadata(options.home, root, join(seatDir, 'HANDOFF.md'), 'markdown') },
+    { title: 'inbox', ...metadata(options.home, root, join(seatDir, 'inbox.md'), 'markdown') },
+    { title: '수확 주장', ...metadata(options.home, root, join(seatDir, 'harvest-claims.tsv'), 'tsv') },
+    { title: '예약', ...metadata(options.home, root, join(seatDir, 'scheduled.tsv'), 'tsv') },
+    { title: '공통 메모리 색인', ...metadata(options.home, root, join(root, 'memory', 'MEMORY.md'), 'memory') },
+  ];
+  return { sections, unread };
 }
 
 export function registerSeatBootCommands(command: Command, options: { home?: () => string; contextNow?: () => unknown; msgPath?: () => string } = {}): void {
@@ -90,7 +113,6 @@ export function registerSeatBootCommands(command: Command, options: { home?: () 
       const seat = rawSeat.toUpperCase();
       if (!(SEAT_ROLES as readonly string[]).includes(seat)) { console.error(`seat boot: unknown seat ${rawSeat} (OP|TC|MK|UX)`); process.exitCode = 2; return; }
       const home = options.home?.() ?? homedir();
-      const root = join(home, 'elanous-hq', 'seat-state');
       let facts: string[] = [];
       let contextUpdated = '미상';
       try {
@@ -102,19 +124,7 @@ export function registerSeatBootCommands(command: Command, options: { home?: () 
         contextUpdated = typeof context.at === 'string' ? clean(context.at) : '시각 미관측';
         facts = contextFacts(snapshot);
       } catch { facts = []; contextUpdated = '미관측: contextNow 조회 실패'; }
-      const seatDir = join(root, seat);
-      const msgPath = options.msgPath?.() ?? defaultMsgStorePath();
-      let unread: number | null = null;
-      try { unread = readUnreadCount(seat, msgPath); }
-      catch { /* unavailable is not a measured zero */ }
-      const sections = [
-        { title: 'msg 원장', source: msgPath, updated: unread === null ? '미상' : new Date().toISOString(), rows: [`안 읽은 msg ${unread ?? '미관측'} (${seat})`] },
-        { title: 'HANDOFF', ...metadata(home, root, join(seatDir, 'HANDOFF.md'), 'markdown') },
-        { title: 'inbox', ...metadata(home, root, join(seatDir, 'inbox.md'), 'markdown') },
-        { title: '수확 주장', ...metadata(home, root, join(seatDir, 'harvest-claims.tsv'), 'tsv') },
-        { title: '예약', ...metadata(home, root, join(seatDir, 'scheduled.tsv'), 'tsv') },
-        { title: '공통 메모리 색인', ...metadata(home, root, join(root, 'memory', 'MEMORY.md'), 'memory') },
-      ];
+      const sections = collectSeatBootSections(seat, { home, msgPath: options.msgPath?.() ?? defaultMsgStorePath() }).sections;
       console.log(renderSeatBootCard(seat as SeatRole, sections, facts, contextUpdated));
     });
 }

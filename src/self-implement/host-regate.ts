@@ -425,6 +425,20 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
         (bin, args, dir) => command(bin, args, dir));
       if (!exposure.passed) return result('failed', 'expose', exposure.log);
     }
+    // The checked checkout is shared with interference/exposure gates. Verify dependencies at the
+    // typecheck boundary as well: a missing PWA link here made #27414 fail as an unmeasured host regate.
+    if (buildPwa && !existsSync(join(worktree, 'apps/pwa/node_modules'))) {
+      let failure: string | null = null;
+      try {
+        if (existsSync(join(worktree, 'apps/pwa'))) {
+          provideCheckoutDependencies(worktree, input.repoRoot, 'apps/pwa', 'next', (cwd) => { run('bun', ['install', '--frozen-lockfile'], cwd); });
+        } else failure = 'apps/pwa absent before typecheck';
+      } catch (e) { failure = String(e); }
+      const ready = existsSync(join(worktree, 'apps/pwa/node_modules'));
+      if (!ready && !failure) failure = 'apps/pwa/node_modules absent after provision before typecheck';
+      try { debug.log('harness.host-regate', 'pwa-dependencies-before-typecheck', { pr: input.prNumber, restored: ready, failure }); } catch { /* observation must not block regate */ }
+      if (!ready) return result('unmeasured', 'dependencies', failure!);
+    }
     // verifyOnly: 통합 후보는 «지금 main 끝»(baseCommit)에 얹은 것이다 — 옛 merge-base 로 비교하면 그사이 main 착지분
     //   수백 파일이 «이 PR 의 변경»으로 잡혀 저장소 전체 검사로 승격된다(2026-09-28 #21239 실측: 456파일 · PWA 636건).
     try { run('bun', ['scripts/ci-typecheck-changed.ts'], worktree, { ...process.env, TSC_BASE_REF: input.verifyOnly ? baseCommit : base }); }

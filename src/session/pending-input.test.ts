@@ -1,7 +1,9 @@
 // 세션별 턴-중 대기 발화 — ⛔ 「비우면서 낸다」와 「원본 큐도 같이 비운다」가 계약이다.
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, spyOn } from 'bun:test';
+import { debug } from '../debug/log.js';
 import {
   enqueuePendingUserInput, drainPendingUserInput, pendingUserInputCount, clearPendingUserInput,
+  removePendingUserInput,
 } from './pending-input.js';
 
 describe('pending-input — 턴 «안»으로 들어갈 발화', () => {
@@ -86,5 +88,60 @@ describe('pending-input — 턴 «안»으로 들어갈 발화', () => {
     expect(pendingUserInputCount('s1')).toBe(1);
     expect(drainPendingUserInput('s1')).toEqual(['남을 발화']);
     expect(seen).toEqual([['남을 발화']]);
+  });
+});
+
+describe('pending-input — id 짝짓기(10-14 중복 수리)', () => {
+  beforeEach(() => { clearPendingUserInput('s1'); clearPendingUserInput('s2'); });
+
+  test('enqueue 는 유일한 id 를 내고, 안 쌓으면 null 이다', () => {
+    const a = enqueuePendingUserInput('s1', 'a');
+    const b = enqueuePendingUserInput('s1', 'a');
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+    expect(a).not.toBe(b);
+    expect(enqueuePendingUserInput('s1', '  ')).toBeNull();
+  });
+
+  test('removePendingUserInput 는 그 id 만 빼고 onDrained 를 부르지 않는다', () => {
+    const seen: string[][] = [];
+    const a = enqueuePendingUserInput('s1', '같은 글', (d) => seen.push([...d]))!;
+    enqueuePendingUserInput('s1', '같은 글');
+    enqueuePendingUserInput('s2', '남의 세션');
+    expect(removePendingUserInput([a])).toBe(1);
+    expect(seen).toEqual([]);
+    expect(pendingUserInputCount('s1')).toBe(1);
+    expect(pendingUserInputCount('s2')).toBe(1);
+    expect(removePendingUserInput([a])).toBe(0);
+  });
+
+  test('onDrained 둘째 인자로 id 가 붙은 항목을 받는다', () => {
+    const items: { id: string; text: string }[][] = [];
+    const id = enqueuePendingUserInput('s1', 'x', (_d, it) => items.push([...it]));
+    drainPendingUserInput('s1');
+    expect(items).toEqual([[{ id: id!, text: 'x' }]]);
+  });
+});
+
+describe('pending-input — 계측(RFC v2 P1 ⓑ)', () => {
+  beforeEach(() => { clearPendingUserInput('s1'); });
+
+  test('removed 는 실제로 뺀 id 만 · 세션 버리기는 discarded 로 남는다', () => {
+    const spy = spyOn(debug, 'log');
+    try {
+      const a = enqueuePendingUserInput('s1', 'a')!;
+      const b = enqueuePendingUserInput('s1', 'b')!;
+      removePendingUserInput([a], 'recalled');
+      removePendingUserInput([a], 'recalled');
+      clearPendingUserInput('s1');
+      const events = spy.mock.calls.filter(([c]) => c === 'llm.interjection').map(([, e, d]) => [e, d]);
+      expect(events).toContainEqual(['removed', { ids: [a], requested: 1, removed: 1, reason: 'recalled' }]);
+      expect(events).toContainEqual(['removed', { ids: [], requested: 1, removed: 0, reason: 'recalled' }]);
+      expect(events).toContainEqual(['discarded', { sessionId: 's1', ids: [b] }]);
+      expect(a.startsWith('pending-')).toBe(true);
+      expect(a.split('-')[1]).toHaveLength(8);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
