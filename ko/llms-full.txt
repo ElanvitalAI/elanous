@@ -5121,6 +5121,23 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.2.29
+
+Source: https://docs.elanous.ai/releases/0-2-29/
+
+## Behavior changes
+
+- Keep multiline tool commands within one TUI log row so streaming input and status remain visible.
+- Do not apply the fact-question tool budget on goal-loop turns, so status questions in the TUI no longer stall with «Tool budget reached».
+- Fold consecutive RunShell results into one expandable TUI row in task-unit mode.
+- Open an inspectable shell or Codex session from the TUI with `/term new [command]` or the terminal shortcut.
+- Restore the in-memory TUI history prefix after a failed Codex 400 repair retry when it has not changed, while retaining later messages.
+- Text injected from outside with `pty text` no longer merges into the line you are typing or the mid-turn typeahead; it waits as a separate queued message (marked in the TUI) and is sent after the turn once the input is empty, and `pty text --when-idle` waits for an idle screen first.
+
+Plus 123 internal changes.
+
+---
+
 # 0.2.28
 
 Source: https://docs.elanous.ai/releases/0-2-28/
