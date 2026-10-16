@@ -861,29 +861,53 @@ function isWithinRoot(path: string, root: string): boolean {
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 
+/** realpath-resolved folder-root allow-list; a missing root grants nothing. */
+function resolveFolderRoots(roots: string[]): string[] {
+  const allowed: string[] = [];
+  for (const root of roots) {
+    try { allowed.push(realpathSync(root)); } catch { /* a missing root grants nothing */ }
+  }
+  return allowed;
+}
+
+/** Outcome of the folder-root allow-list check shared by the picker and project creation. */
+type FolderRootResolution =
+  | { ok: true; path: string }
+  | { ok: false; error: 'folder_unavailable' | 'outside_allowed_roots'; status: 404 | 403 };
+
+/**
+ * Resolves a folder path against the allow-listed roots with realpath first,
+ * so `..` segments and symlinks cannot escape the roots. A path that cannot
+ * be resolved is unavailable (404); a resolved path outside every root is
+ * refused (403).
+ */
+function resolveWithinFolderRoots(requested: string, allowed: string[]): FolderRootResolution {
+  let path: string;
+  try { path = realpathSync(requested); }
+  catch { return { ok: false, error: 'folder_unavailable', status: 404 }; }
+  if (!allowed.some(root => isWithinRoot(path, root))) {
+    return { ok: false, error: 'outside_allowed_roots', status: 403 };
+  }
+  return { ok: true, path };
+}
+
 /**
  * Remote folder picker: lists sub-folders under an allow-listed root only.
  * Every path is resolved with realpath first, so `..` segments and symlinks cannot escape the roots;
  * dot-folders are hidden and symlinked entries that point outside the roots are not listed.
  */
 export function handleProjectFoldersGet(req: Request, roots: string[] = [homedir()]): Response {
-  const allowed: string[] = [];
-  for (const root of roots) {
-    try { allowed.push(realpathSync(root)); } catch { /* a missing root grants nothing */ }
-  }
+  const allowed = resolveFolderRoots(roots);
   if (allowed.length === 0) return jsonResponse({ error: 'folder_unavailable' }, 404);
   const requested = new URL(req.url).searchParams.get('path') ?? allowed[0]!;
   if (!isAbsolute(requested) || requested.includes('\0')) return jsonResponse({ error: 'invalid_folder' }, 400);
-  let path: string;
-  try { path = realpathSync(requested); }
-  catch {
-    debug.log('nexus.projects', 'folders-unavailable', { reason: 'missing' });
-    return jsonResponse({ error: 'folder_unavailable' }, 404);
+  const resolved = resolveWithinFolderRoots(requested, allowed);
+  if (!resolved.ok) {
+    if (resolved.status === 403) debug.log('nexus.projects', 'folders-refused', { reason: 'outside-roots' });
+    else debug.log('nexus.projects', 'folders-unavailable', { reason: 'missing' });
+    return jsonResponse({ error: resolved.error }, resolved.status);
   }
-  if (!allowed.some(root => isWithinRoot(path, root))) {
-    debug.log('nexus.projects', 'folders-refused', { reason: 'outside-roots' });
-    return jsonResponse({ error: 'outside_allowed_roots' }, 403);
-  }
+  const path = resolved.path;
   try {
     if (!statSync(path).isDirectory()) return jsonResponse({ error: 'not_directory' }, 400);
     const folders = readdirSync(path, { withFileTypes: true })
@@ -905,7 +929,12 @@ export function handleProjectFoldersGet(req: Request, roots: string[] = [homedir
   }
 }
 
-export async function handleProjectsPost(req: Request): Promise<Response> {
+/**
+ * Project creation. A `primaryFolder`, when given, must pass the same
+ * projectFolderRoots allow-list as the remote folder picker: realpath first,
+ * so `..` segments and symlinks cannot persist a folder outside the roots.
+ */
+export async function handleProjectsPost(req: Request, roots: string[] = [homedir()]): Promise<Response> {
   let body: unknown;
   try { body = await req.json(); }
   catch { return jsonResponse({ error: 'invalid_json' }, 400); }
@@ -918,6 +947,16 @@ export async function handleProjectsPost(req: Request): Promise<Response> {
   }
   if (primaryFolder !== undefined && (typeof primaryFolder !== 'string' || !isAbsolute(primaryFolder))) {
     return jsonResponse({ error: 'invalid_primary_folder' }, 400);
+  }
+  if (typeof primaryFolder === 'string') {
+    const allowed = resolveFolderRoots(roots);
+    if (allowed.length === 0) return jsonResponse({ error: 'folder_unavailable' }, 404);
+    const resolved = resolveWithinFolderRoots(primaryFolder, allowed);
+    if (!resolved.ok) {
+      if (resolved.status === 403) debug.log('nexus.projects', 'post-primary-folder-refused', { reason: 'outside-roots' });
+      else debug.log('nexus.projects', 'post-primary-folder-unavailable', { reason: 'missing' });
+      return jsonResponse({ error: resolved.error }, resolved.status);
+    }
   }
   return jsonResponse({ project: createProject({ name, ...(primaryFolder !== undefined ? { primaryFolder } : {}) }) }, 201);
 }
@@ -1498,7 +1537,7 @@ export async function routeRequest(
   }
   if (pathname === '/v1/projects' && (method === 'GET' || method === 'POST')) {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    return method === 'GET' ? handleProjectsGet() : handleProjectsPost(req);
+    return method === 'GET' ? handleProjectsGet() : handleProjectsPost(req, opts.projectFolderRoots);
   }
   if (pathname.startsWith('/v1/projects/') && pathname.endsWith('/autopsy') && method === 'GET') {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);

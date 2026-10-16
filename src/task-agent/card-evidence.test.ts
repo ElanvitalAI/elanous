@@ -370,6 +370,22 @@ test('no-launch after ten minutes needs relaunch, but a Pod child run prevents t
   expect(readTaskCard(card.id, path)?.history.at(-1)?.detail).toContain('failed/needs-relaunch');
 });
 
+test('TA-BIND-PR-TERMINAL bindCardEvidence: parent pr-terminal of a pod child is PR evidence; pr-opened still wins; mismatches do not bind', () => {
+  const CHILD = 'run-0a04e0d6-4341-4b3e-8836-ac1ed93f947b';
+  const URL = 'https://github.com/o/r/pull/28037';
+  const edge = entry(RUN, 'pod-child-run', { childRunId: CHILD });
+  const terminal = (data: Record<string, unknown>) => entry(RUN, 'pr-terminal', { childRunId: CHILD, prNumber: 28037, prUrl: URL, ...data });
+  expect(bindCardEvidence({ runId: RUN }, { host: [edge, terminal({})], children: { [CHILD]: [entry(CHILD, 'rework-blocked-draft-pr', { stage: 'gate-failed' })] } }))
+    .toMatchObject({ ledgerFound: true, pr: { number: 28037, url: URL }, childRunId: CHILD });
+  expect(bindCardEvidence({ runId: RUN }, { host: [edge, terminal({})], children: { [CHILD]: [entry(CHILD, 'pr-opened', { number: 77, url: URL_77 })] } }).pr)
+    .toEqual({ number: 77, url: URL_77 });
+  for (const bad of [{ childRunId: 'run-99999999-9999-4999-8999-999999999999' }, { prNumber: 28038 }, { prUrl: 'https://github.com/o/r/pull/1' }, { prUrl: undefined }]) {
+    expect(bindCardEvidence({ runId: RUN }, { host: [edge, terminal(bad)], children: { [CHILD]: [] } }).pr).toBeUndefined();
+  }
+  // 부모의 pod-child-run 자식이 아니면 받지 않는다.
+  expect(bindCardEvidence({ runId: RUN }, { host: [terminal({})], children: {} }).pr).toBeUndefined();
+});
+
 test('bindCardEvidence: 호스트 원장 pr-opened · 골 id', () => {
   const evidence = bindCardEvidence({ runId: RUN }, { host: [entry(RUN, 'start', { feature: 'x' }, GOAL), entry(RUN, 'pr-opened', { number: 77, url: URL_77 })], children: {} });
   expect(evidence).toEqual({ ledgerFound: true, goalId: GOAL, pr: { number: 77, url: URL_77 } });
@@ -754,8 +770,9 @@ test('TA-WIRING-CHECK ④ shadow: 병합 PR 판단 뒤 wiring-shadow 를 관측�
   const input = { runId: readTaskCard(card.id, path)!.runId!, stopReason: 'converged' as const, results: [{ taskId: card.id, feature: 'ship it', status: 'done', prNumber: 77, merged: true } as never] };
   const events: Array<{ event: string; data: Record<string, unknown> }> = [];
   const log = (_category: string, event: string, data: Record<string, unknown>) => events.push({ event, data });
-  const base = await recordTaskAgentShadowMove(input, { log, statePath: path, liveMoves: new Set(), wiring: { prDiff: () => diffOf('src/task-agent/dispatcher.ts', 'handlers.deploy = deploy;'), loadLedger: () => null } });
-  const broken = await recordTaskAgentShadowMove(input, { log: () => {}, statePath: path, liveMoves: new Set(), wiring: { prDiff: () => { throw new Error('gh down'); } } });
+  // HQ(비-Pod) 판단을 단언한다 — 게이트 Pod 의 ELANOUS_POD_NAME 이 새어 «원격 자식»으로 읽히지 않게 env 를 못 박는다.
+  const base = await recordTaskAgentShadowMove(input, { log, statePath: path, liveMoves: new Set(), env: {}, wiring: { prDiff: () => diffOf('src/task-agent/dispatcher.ts', 'handlers.deploy = deploy;'), loadLedger: () => null } });
+  const broken = await recordTaskAgentShadowMove(input, { log: () => {}, statePath: path, liveMoves: new Set(), env: {}, wiring: { prDiff: () => { throw new Error('gh down'); } } });
   expect(events.find((row) => row.event === 'wiring-shadow')?.data).toEqual({ card: card.id, pr: 77, required: true, liveRunRecorded: false, unknown: false });
   expect(broken.move).toBe(base.move);
   expect(base.move).toBe('propose-green');

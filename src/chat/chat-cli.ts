@@ -17,6 +17,10 @@ import type { DevChatOpts } from '../self-dev/dev-pipeline.js';
 export interface ChatCliOpts {
   session?: string;
   new?: boolean;
+  /** `--continue` — 활성 세션 이어하기(명시). 대표 #73: 기본은 새 세션. */
+  continue?: boolean;
+  /** `--resume [id]` — id 면 그 세션, 값 없이(true) 면 활성 세션. */
+  resume?: string | boolean;
   json?: boolean;
   tools?: boolean;
   goalLoop?: boolean;
@@ -29,13 +33,17 @@ export interface ChatCliDeps {
   runDevPipeline?: typeof runDevPipeline;
 }
 
-/** CLI 옵션 → DevChatOpts(--new→forceNew·나머지 boolean 정규화). reuseActive 는 dispatch 클로저에서 !forceNew 파생.
+/** CLI 옵션 → DevChatOpts(--new→forceNew·--continue/--resume→continueActive·나머지 boolean 정규화).
+ *  대표 #73 — reuseActive 는 dispatch 클로저에서 continueActive 로만 켠다(인자 없음 = 새 세션).
  *  session 은 `!== undefined` 로 통과(원 액션 explicitSessionId:opts.session 과 정확 등가 — 빈 문자열도 그대로,
  *  runChatTurnCli 가 falsy 처리해 결과는 동일하나 중간값까지 무손실 유지). */
 export function toDevChatOpts(opts: ChatCliOpts): DevChatOpts {
   return {
-    ...(opts.session !== undefined ? { session: opts.session } : {}),
+    ...(opts.session !== undefined
+      ? { session: opts.session }
+      : typeof opts.resume === 'string' ? { session: opts.resume } : {}),
     forceNew: opts.new === true,
+    continueActive: opts.continue === true || opts.resume === true,
     json: opts.json === true,
     enableTools: opts.tools === true,
     goalLoop: opts.goalLoop === true,

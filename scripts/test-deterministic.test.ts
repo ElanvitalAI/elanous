@@ -38,6 +38,7 @@ const runDeterministicTests = (deps: DeterministicRunnerDeps = {}) =>
 setDefaultTimeout(60_000);
 
 const source = readFileSync('scripts/test-deterministic.ts', 'utf8');
+const envSource = readFileSync('scripts/lib/deterministic-env.ts', 'utf8');
 const script = join(import.meta.dir, 'test-deterministic.ts');
 const cleanups: Array<() => void> = [];
 
@@ -314,17 +315,20 @@ async function collect(child: ChildProcess): Promise<{ code: number | null; sign
 
 describe('scripts/test-deterministic.ts preservation', () => {
   test('keeps the human deterministic entrypoint wired to the credential filter and redirected roots', () => {
-    expect(source).toContain("import { isCredentialKey } from './lib/deterministic-env.js';");
-    expect(source).toContain("'ELANOUS_HARNESS_SPACE'");
-    expect(source).toContain('!isCredentialKey(key)');
-    expect(source).toContain('!HARNESS_TEST_ENV_KEYS.includes');
-    expect(source).toContain('!EXECUTION_ORIGIN_ENV_KEYS.includes');
-    expect(source).toContain('env.HOME = testRoot;');
-    expect(source).toContain('delete env.XDG_CONFIG_HOME;');
-    expect(source).toContain('env.ELANOUS_TEST_HOME = testRoot;');
-    expect(source).toContain("env.ELANOUS_STATE_DIR = join(testRoot, 'state');");
-    expect(source).toContain('delete env.ELANOUS_CONFIG_DIR;');
+    // R7(10-16): the isolated env builder moved to the side-effect-free lib (shared with the regate runner).
+    expect(source).toContain("import { GIT_LOCATION_ENV_KEYS, prepareIsolatedTestEnv } from './lib/deterministic-env.js';");
+    expect(source).toContain('const env = prepareIsolatedTestEnv(deps.env ?? process.env, testRoot);');
+    expect(envSource).toContain("'ELANOUS_HARNESS_SPACE'");
+    expect(envSource).toContain('!isCredentialKey(key)');
+    expect(envSource).toContain('!HARNESS_TEST_ENV_KEYS.includes');
+    expect(envSource).toContain('!EXECUTION_ORIGIN_ENV_KEYS.includes');
+    expect(envSource).toContain('env.HOME = testRoot;');
+    expect(envSource).toContain('delete env.XDG_CONFIG_HOME;');
+    expect(envSource).toContain('env.ELANOUS_TEST_HOME = testRoot;');
+    expect(envSource).toContain("env.ELANOUS_STATE_DIR = join(testRoot, 'state');");
+    expect(envSource).toContain('delete env.ELANOUS_CONFIG_DIR;');
     expect(source).not.toMatch(/env\.ELANOUS_CONFIG_DIR\s*=/);
+    expect(envSource).not.toMatch(/env\.ELANOUS_CONFIG_DIR\s*=\s*join\(testRoot/);
     expect(source).toContain('env,');
     expect(source).toContain("stdin: 'inherit'");
     expect(source).toContain("stdout: 'inherit'");

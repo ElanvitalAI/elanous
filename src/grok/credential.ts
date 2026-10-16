@@ -478,6 +478,32 @@ export function isGrokSubscriptionExpiring(
   return (opts.now ?? Date.now)() + (opts.bufferMs ?? GROK_REFRESH_BUFFER_MS) >= ms;
 }
 
+/** 구독 만료 상태 — 칸 CRED-EXPIRY-REFRESH 기준 창. 이 안에 만료가 오면 갱신 후보다. */
+export const GROK_EXPIRY_SOON_WINDOW_MS = 2 * 60 * 60 * 1000;
+
+/** 만료 상태 셋 — ⛔ boolean 으로 접으면 「모름」과 «여유»가 «같은 값»이 된다. */
+export type GrokSubscriptionExpiryState = 'healthy' | 'expiring' | 'unknown';
+
+/** 실제로 쓸 구독(key 를 가진 scope 중 가장 늦게 만료되는 것)의 expires_at 만으로 상태를 가른다.
+ *
+ * ⭐ 칸 CRED-EXPIRY-REFRESH 첫 조각 — «토큰 없이» 읽는다:
+ *   · 선택 규칙은 `readSubscriptionToken` 과 «같다»(key 없는 항목의 만료에 속지 않는다).
+ *   · 반환은 상태 «하나»뿐 — 토큰 값은 어떤 형태로도 나가지 않는다.
+ *   · 기존 `isGrokSubscriptionExpiring`(boolean)은 모름을 false 로 접는다 — 이 함수는
+ *     모름을 'unknown' 으로 «별도의 값»으로 낸다. 갱신 유도·호스트 발사는 후속 조각.
+ * · 순수 판정 — 부수효과가 없고, 파일이 못 읽히면 죽이지 않고 'unknown' 을 낸다. */
+export function grokSubscriptionExpiryState(
+  opts: { home?: string; bufferMs?: number; now?: () => number } = {},
+): GrokSubscriptionExpiryState {
+  const raw = readSubscriptionToken(grokAuthFilePath(opts.home))?.expiresAt ?? null;
+  if (raw === null) return 'unknown';
+  const ms = Date.parse(raw);
+  if (!Number.isFinite(ms)) return 'unknown';
+  return (opts.now ?? Date.now)() + (opts.bufferMs ?? GROK_EXPIRY_SOON_WINDOW_MS) >= ms
+    ? 'expiring'
+    : 'healthy';
+}
+
 /** 갱신 경로의 관측 — ⛔ 토큰은 «절대» 싣지 않는다(판정·결과·출처만). */
 function observeGrokAuth(event: string, data: Record<string, unknown>): void {
   try {

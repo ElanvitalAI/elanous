@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
 function read(rel: string): string {
   return readFileSync(resolve(import.meta.dir, '..', rel), 'utf8');
@@ -14,7 +15,7 @@ describe('ui foundation · R6 interaction bridge source truth', () => {
       expect(ctxMenuBoot).toContain(`${provider}(providers, {`);
     }
 
-    const dashboard = read('src/dashboard/index.ts');
+    const dashboard = tuiSourceText();
     expect(dashboard).toContain('const ctxMenuProviders = bootDashboardContextMenuProviders({');
   });
 });

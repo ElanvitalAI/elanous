@@ -6,7 +6,15 @@ export const STOP_CLASS_NO_LAUNCH = 'no-launch' as const;
 const CHILD_RESULT_KINDS = new Set(['self', 'external']);
 
 /** The dev child's terminal line nests the stage: {ok, kind, result:{stage, ok, node, outcome, …}}. Other JSON rows are not results. */
-export function nestedPodResult(row: Record<string, unknown>): { stage: string; ok: boolean; error?: string } | null {
+export function nestedPodResult(row: Record<string, unknown>): {
+  stage: string;
+  ok: boolean;
+  error?: string;
+  reasonCode?: string;
+  checkName?: string;
+  targetPath?: string;
+  preflightChecks?: PreflightCheck[];
+} | null {
   if (typeof row.kind !== 'string' || !CHILD_RESULT_KINDS.has(row.kind) || typeof row.ok !== 'boolean') return null;
   if (!row.result || typeof row.result !== 'object' || Array.isArray(row.result)) return null;
   const result = row.result as Record<string, unknown>;
@@ -18,28 +26,72 @@ export function nestedPodResult(row: Record<string, unknown>): { stage: string; 
       ? (classification as Record<string, unknown>).classification : undefined;
   const reason = [result.node, result.outcome].filter((part): part is string => typeof part === 'string' && part.length > 0).join(' ');
   const error = [reason || (typeof result.error === 'string' ? result.error : ''), typeof detail === 'string' && detail ? detail : ''].filter(Boolean).join(' · ');
-  return { stage: result.stage, ok: false, ...(error ? { error } : {}) };
+  // PREFLIGHT-RESULT-LINE: a nested preflight rejection carries its blockers under result.blockers — the same ledger fields as the flat row.
+  const blockers = result.stage === 'preflight-blocked' ? preflightBlockerText(result.blockers)
+    : { error: '', preflightChecks: [] as PreflightCheck[] };
+  return {
+    stage: result.stage,
+    ok: false,
+    ...(error || blockers.error ? { error: error || blockers.error } : {}),
+    ...(blockers.preflightChecks.length === 1 ? blockers.preflightChecks[0] : {}),
+    ...(blockers.preflightChecks.length > 1 ? { preflightChecks: blockers.preflightChecks } : {}),
+  };
 }
 
-/** One line naming each preflight blocker (`(대상 경로 0) — …`), or '' when the row carries none. */
-function preflightBlockerText(blockers: unknown): string {
-  if (!Array.isArray(blockers)) return '';
-  return blockers.flatMap((blocker) => {
-    if (!blocker || typeof blocker !== 'object' || Array.isArray(blocker)) return [];
-    const { name, detail } = blocker as Record<string, unknown>;
-    const parts = [name, detail].filter((part): part is string => typeof part === 'string' && part.trim().length > 0).map((part) => part.trim().replace(/\s+/gu, ' '));
-    return parts.length ? [parts.join(' — ')] : [];
-  }).join(' · ');
+function ledgerString(value: unknown): string {
+  return typeof value === 'string' && value.trim().length > 0 ? value : '';
+}
+
+type PreflightCheck = { reasonCode: string; checkName: string; targetPath?: string };
+
+/** Keep each structured check paired with its own path; legacy blockers retain their name/detail diagnostic. */
+function preflightBlockerText(blockers: unknown): { error: string; preflightChecks: PreflightCheck[] } {
+  if (!Array.isArray(blockers)) return { error: '', preflightChecks: [] };
+  const errors: string[] = [];
+  const preflightChecks: PreflightCheck[] = [];
+  for (const blocker of blockers) {
+    if (!blocker || typeof blocker !== 'object' || Array.isArray(blocker)) continue;
+    const record = blocker as Record<string, unknown>;
+    const reasonCode = ledgerString(record.reasonCode);
+    const checkName = ledgerString(record.checkName);
+    if (reasonCode && checkName) {
+      const targetPath = ledgerString(record.targetPath);
+      preflightChecks.push({ reasonCode, checkName, ...(targetPath ? { targetPath } : {}) });
+      errors.push(`${reasonCode} · ${checkName}`);
+      continue;
+    }
+    const parts = [record.name, record.detail]
+      .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+      .map((part) => part.trim().replace(/\s+/gu, ' '));
+    if (parts.length) errors.push(parts.join(' — '));
+  }
+  return { error: errors.join(' · '), preflightChecks };
 }
 
 /** A child terminal row: the legacy flat form {stage, ok, error?} (no kind, or a child kind) or the nested dev result. Any other kind is not a result. */
-export function podTerminalRow(row: Record<string, unknown>): { stage: string; ok: boolean; error?: string } | null {
+export function podTerminalRow(row: Record<string, unknown>): {
+  stage: string;
+  ok: boolean;
+  error?: string;
+  reasonCode?: string;
+  checkName?: string;
+  targetPath?: string;
+  preflightChecks?: PreflightCheck[];
+} | null {
   if (typeof row.kind === 'string' && !CHILD_RESULT_KINDS.has(row.kind)) return null;
   if (typeof row.stage === 'string' && typeof row.ok === 'boolean') {
-    if (typeof row.error === 'string') return { stage: row.stage, ok: row.ok, error: row.error };
-    // PREFLIGHT-RESULT-LINE: `{kind:'self', ok:false, stage:'preflight-blocked', blockers}` carries its reason in the blockers, not in `error`.
-    const blockers = row.ok === false && row.stage === 'preflight-blocked' ? preflightBlockerText(row.blockers) : '';
-    return { stage: row.stage, ok: row.ok, ...(blockers ? { error: blockers } : {}) };
+    // PREFLIGHT-RESULT-LINE: preserve structured blockers even when an explicit error supplies the human-readable reason.
+    if (row.ok === false && row.stage === 'preflight-blocked') {
+      const blockers = preflightBlockerText(row.blockers);
+      return {
+        stage: row.stage,
+        ok: row.ok,
+        ...(typeof row.error === 'string' ? { error: row.error } : blockers.error ? { error: blockers.error } : {}),
+        ...(blockers.preflightChecks.length === 1 ? blockers.preflightChecks[0] : {}),
+        ...(blockers.preflightChecks.length > 1 ? { preflightChecks: blockers.preflightChecks } : {}),
+      };
+    }
+    return { stage: row.stage, ok: row.ok, ...(typeof row.error === 'string' ? { error: row.error } : {}) };
   }
   return nestedPodResult(row);
 }
@@ -64,9 +116,21 @@ export function classifyPodExit(input: {
   jobReason?: string | null;
   logs: string;
   result?: Record<string, unknown> | null;
-}): { class: PodExitClass; errorCode: string | null; containerReason: string | null; exitCode: number | null; jobReason: string | null; tail: string[] } {
+}): {
+  class: PodExitClass;
+  errorCode: string | null;
+  containerReason: string | null;
+  exitCode: number | null;
+  jobReason: string | null;
+  tail: string[];
+  reasonCode?: string;
+  checkName?: string;
+  targetPath?: string;
+  preflightChecks?: PreflightCheck[];
+  noResultLine?: true;
+} {
   const logLines = input.logs.split(/\r\n|\n|\r/u).map((line) => line.trim()).filter(Boolean);
-  let terminalResult: { stage: string; ok: boolean; error?: string } | null = null;
+  let terminalResult: ReturnType<typeof podTerminalRow> = null;
   for (const line of logLines) {
     if (!line.startsWith('{')) continue;
     let parsed: unknown;
@@ -74,8 +138,8 @@ export function classifyPodExit(input: {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
     terminalResult = podTerminalRow(parsed as Record<string, unknown>) ?? terminalResult;
   }
-  if (!terminalResult && input.result) terminalResult = podTerminalRow(input.result);
   const hasResultLine = terminalResult !== null;
+  if (!terminalResult && input.result) terminalResult = podTerminalRow(input.result);
   const askReprompt = logLines.some((line) =>
     /^\[ask\](?!\s+\d+\)\s).*(?:implementation[_ -]?target|reprompt|re-prompt|되묻)/iu.test(line));
   // 파싱되는 JSON 줄(진행·결과 행)은 오류 «줄»로 세지 않는다 — tail 과 같은 기준.
@@ -116,6 +180,11 @@ export function classifyPodExit(input: {
     exitCode: input.containerExitCode ?? null,
     jobReason: input.jobReason ?? null,
     tail,
+    ...(terminalResult?.reasonCode ? { reasonCode: terminalResult.reasonCode } : {}),
+    ...(terminalResult?.checkName ? { checkName: terminalResult.checkName } : {}),
+    ...(terminalResult?.targetPath ? { targetPath: terminalResult.targetPath } : {}),
+    ...(terminalResult?.preflightChecks ? { preflightChecks: terminalResult.preflightChecks } : {}),
+    ...(!hasResultLine ? { noResultLine: true as const } : {}),
   };
 }
 

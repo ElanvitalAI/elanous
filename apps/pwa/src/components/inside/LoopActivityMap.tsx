@@ -9,6 +9,7 @@ import { activityEdgeKey, activityNodes, activityTraceTarget, cardPathEdges, EDG
 import { toPublicText } from './public-text';
 import { PacketEdge, PACKET_MS, type PacketData } from './PacketEdge';
 import { NODE_STATE } from '@/components/ops/ReleaseFlow';
+import { ResourceFlowPanel } from '@/components/resources/ResourceFlowPanel';
 
 const TONE: Record<LoopRow['verdict'], string> = {
   '살아 있음': 'bg-emerald-500/15 text-emerald-300 ring-emerald-500/30',
@@ -204,6 +205,7 @@ export function LoopActivityMap({ rows, edges, seenAt, now, state, seatIds, deta
         <Background color="#355470" /><Controls showInteractive={false} />
       </ReactFlow>
     </div>
+    {state === 'ready' && <ResourceFlowPanel edges={edges} seatIds={seatIds} />}
     <div aria-label="지도 목록" className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
       {groups.map(group => <section key={group.owner} className="min-w-0 rounded-xl border border-slate-600 p-3">
         <h3 className="mb-2 font-semibold">{SEAT_NAMES[group.owner] ?? toPublicText(group.owner)}</h3>

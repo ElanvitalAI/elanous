@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { registerLoopCommands } from './loop-cli.js';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
@@ -23,7 +23,7 @@ function fixture() {
   mkdirSync(join(root, 'graphs', 'daily'), { recursive: true });
   const body = (id: string, header = '') => `graph_id: ${id}\nversion: 1\n${header}entry_node: step\nterminal_nodes: [done]\nnodes:\n  - { node_id: step, kind: agent, recipe: 'cmd:step', max_visits: 1 }\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\nedges:\n  - { from: step, to: done }\n`;
   const cronFile = join(root, 'graphs', 'daily', 'cron.yaml');
-  writeFileSync(cronFile, body('daily', "loop:\n  title: Daily\n  trigger:\n    cron: '0 7 * * *'\n"));
+  writeFileSync(cronFile, body('daily', "loop:\n  title: Daily\n  root: 조율자\n  trigger:\n    cron: '0 7 * * *'\n"));
   writeFileSync(join(root, 'graphs', 'event.yaml'), body('event', 'loop:\n  trigger:\n    events: [manual]\n'));
   writeFileSync(join(root, 'graphs', 'plain.yaml'), body('plain'));
   writeFileSync(join(root, 'graphs', 'daily', 'recipes.yaml'), 'step:\n  command: "printf ok"\n');
@@ -268,7 +268,8 @@ test('cron_entry only matches the executed script, not a similarly named script 
   const f = fixture();
   mkdirSync(join(f.root, 'graphs', 'intake'));
   writeFileSync(join(f.root, 'graphs', 'intake', 'intake-daily.yaml'),
-    readFileSync(join(import.meta.dir, '..', '..', 'graphs', 'intake', 'intake-daily.yaml')));
+    readFileSync(join(import.meta.dir, '..', '..', 'graphs', 'intake', 'intake-daily.yaml'), 'utf8')
+      .replace('loop:\n', 'loop:\n  root: 수호자\n'));
   const db = openSchedulesDb(join(f.root, 'entry-decoys.db'));
   try {
     inventoryCrontab(db, { crontab: [
@@ -285,6 +286,74 @@ test('cron_entry only matches the executed script, not a similarly named script 
     });
     expect(listLoops(opts).find(l => l.id === 'daily')?.jobs).toHaveLength(0);
   } finally { db.close(); }
+});
+
+test('legacy loop without root stays readable without CLI stderr but cannot create a new cron', async () => {
+  const f = fixture();
+  const warnings: string[] = [];
+  const warn = spyOn(console, 'warn').mockImplementation(message => { warnings.push(String(message)); });
+  let called = 0;
+  try {
+    const opts: LoopRegistryOptions = { ...f.opts, schedules: [], scheduleAction: async () => { called++; } };
+    const entry = listLoops(opts).find(loop => loop.id === 'daily');
+    expect(entry).toMatchObject({ id: 'daily', enabled: false, root: '조율자' });
+    const legacy = listLoops(opts).find(loop => loop.id === 'event');
+    expect(legacy).toMatchObject({ id: 'event', enabled: false });
+    expect(legacy?.root).toBeUndefined();
+    expect(warnings).toEqual([]);
+    writeFileSync(join(f.root, 'graphs', 'null-root.yaml'), "graph_id: null-root\nloop:\n  root: null\n  trigger:\n    events: [manual]\n");
+    expect(listLoops(opts).find(loop => loop.id === 'null-root')?.root).toBeUndefined();
+    expect(warnings).toEqual([]);
+    writeFileSync(join(f.root, 'graphs', 'legacy-cron.yaml'), "graph_id: legacy-cron\nloop:\n  trigger:\n    cron: '0 8 * * *'\n");
+    expect(listLoops(opts).find(loop => loop.id === 'legacy-cron')).toBeDefined();
+    await expect(setLoopEnabled('legacy-cron', true, false, opts)).rejects.toThrow('requires root');
+    await expect(setLoopEnabled('legacy-cron', true, true, opts)).rejects.toThrow('requires root');
+    expect(called).toBe(0);
+  } finally { warn.mockRestore(); }
+});
+
+test('legacy rootless loop with an existing cron can still stop and restart', async () => {
+  const f = fixture();
+  writeFileSync(join(f.root, 'graphs', 'legacy-cron.yaml'),
+    "graph_id: legacy-cron\nloop:\n  trigger:\n    cron: '0 8 * * *'\n");
+  const db = openSchedulesDb(join(f.root, 'legacy-existing.db'));
+  const line = `0 8 * * * cd ${f.root} && bun bin/elanous.mjs graph run graphs/legacy-cron.yaml`;
+  const actions: string[] = [];
+  const opts: LoopRegistryOptions = { ...f.opts, scheduleAction: async action => {
+    actions.push(action); return { changed: true };
+  } };
+  const warn = spyOn(console, 'warn').mockImplementation(() => {});
+  try {
+    inventoryCrontab(db, { crontab: `${line}\n` });
+    opts.schedules = listSchedules(db);
+    expect(await setLoopEnabled('legacy-cron', false, true, opts)).toMatchObject({ changed: true });
+    inventoryCrontab(db, { crontab: `# ${line}\n` });
+    opts.schedules = listSchedules(db);
+    expect(await setLoopEnabled('legacy-cron', true, true, opts)).toMatchObject({ changed: true });
+    expect(actions).toEqual(['disable', 'enable']);
+  } finally { warn.mockRestore(); db.close(); }
+});
+
+test('registry projects metadata from YAML through list, all, and status; new root-backed loop registers', async () => {
+  const f = fixture();
+  writeFileSync(join(f.root, 'graphs', 'child.yaml'), "graph_id: child\nloop:\n  title: Child\n  root: 수호자\n  parent: daily\n  owner: TC\n  purpose: 검증\n  stage: shadow\n  trigger:\n    cron: '0 8 * * *'\n");
+  const actions: string[] = [];
+  const opts: LoopRegistryOptions = { ...f.opts, schedules: [], scheduleAction: async action => { actions.push(action); return { changed: true }; } };
+  const metadata = { root: '수호자', parent: 'daily', owner: 'TC', ownerSource: 'header', purpose: '검증', stage: 'shadow' };
+  expect(listLoops(opts).find(loop => loop.id === 'child')).toMatchObject(metadata);
+  expect(loopStatus('child', opts)).toMatchObject(metadata);
+  expect(listAllLoops(opts).find(loop => loop.id === 'child')).toMatchObject(metadata);
+  expect(await setLoopEnabled('child', true, false, opts)).toMatchObject({ dryRun: true, changes: [{ action: 'create' }] });
+  expect(await setLoopEnabled('child', true, true, opts)).toMatchObject({ changed: true });
+  expect(actions).toEqual(['create']);
+});
+
+test('registry rejects invalid root and stage rather than silently assigning a tree position', () => {
+  const f = fixture();
+  writeFileSync(join(f.root, 'graphs', 'bad.yaml'), "graph_id: bad\nloop:\n  root: 기타\n  trigger:\n    events: [manual]\n");
+  expect(() => listLoops(f.opts)).toThrow('invalid loop root for bad');
+  writeFileSync(join(f.root, 'graphs', 'bad.yaml'), "graph_id: bad\nloop:\n  root: 조율자\n  stage: obsolete\n  trigger:\n    events: [manual]\n");
+  expect(() => listLoops(f.opts)).toThrow('invalid loop stage for bad');
 });
 
 test('start plans absent cron, --yes registers; stop disables and start restores without deletion', async () => {

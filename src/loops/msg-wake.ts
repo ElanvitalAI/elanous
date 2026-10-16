@@ -14,6 +14,11 @@
 //    ⚠️ wake-inject 는 «사람이 치지 않는 pane»(무인 에이전트 전용)에만 둔다 — 사람이 치는 pane 에는 켜지 말 것.
 // ⛔ 깨움은 post 의 성패를 바꾸지 않는다 — 실패·시간 초과는 결과 값으로만 돌아온다.
 // ⛔ 시험 우주에서는 실제 pty/herdr 호출 0 — `ELANOUS_MSG_WAKE_LIVE=1` 로만 연다(격리 실물 시험용).
+// ⭐ 버리지 않고 미룬다(TUI-H4 · 10-16 OPT 우편 36 중 18 깨움 0): pty-inject 대상이 턴 중(busy)이거나 5분 창(debounced)이라
+//    못 두드린 글은 `pending_wakes` 에 «주소당 한 줄»로 접어 두고, 그 TUI 안의 폴러(`startPendingWakePoller`)가
+//    턴이 idle 로 «기록»된 뒤 한 번 다시 두드린다. 5분 창은 다시 두드림에도 걸린다 — 창 안이면 버림이 아니라 다음 틱으로 미룸.
+//    상한(시도 3 · 2시간) → `gave-up`. 관측 = `loops.msg-wake` deferred | redelivered | gave-up.
+//    재두드림 «전»에 그 주소 미읽음을 잰다 — 0 이면 두드리지 않고 줄을 지운다(`dropped-read` · H4-FOLLOW ③).
 
 import { spawn } from 'node:child_process';
 import { Database } from 'bun:sqlite';
@@ -24,11 +29,17 @@ import { dirname, join } from 'node:path';
 
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
+import { readUnreadCount } from '../msg/msg-store.js';
 import { listPtyManifestRows } from '../pty-shell/pty-manifest.js';
 import { messageRouteFor, type MessageWake } from './msg-address.js';
 
 export const WAKE_DEBOUNCE_MS = 5 * 60_000;
 export const WAKE_TIMEOUT_MS = 3_000;
+/** A deferred wake is retried at most this many times (an attempt = idle ∧ window free ∧ injection tried). */
+export const MAX_REDELIVER_ATTEMPTS = 3;
+/** A deferred wake older than this is given up even if the TUI never went idle. */
+export const PENDING_WAKE_TTL_MS = 2 * 60 * 60_000;
+export const PENDING_WAKE_POLL_MS = 15_000;
 /** Seat-folder file that opts a human pane in to wake injection (presence is the switch). */
 const WAKE_OPT_IN_FILE = 'wake-inject';
 
@@ -67,6 +78,8 @@ export interface WakeDeps {
   herdrStatus?: (paneId: string, signal: AbortSignal) => Promise<string>;
   herdrInject?: (paneId: string, line: string, signal: AbortSignal) => Promise<void>;
   warn?: (line: string) => void;
+  /** Unread count for an address before a deferred re-knock (H4-FOLLOW ③). null = «모름» (never drops). Default: the msg ledger. */
+  readUnread?: (address: string) => number | null;
 }
 
 function isLive(deps: WakeDeps): boolean {
@@ -127,18 +140,28 @@ function claimDbPath(deps: WakeDeps): string {
 
 interface WakeClaim { db: string; address: string; token: string }
 
+function openWakeDb(db: string): Database {
+  mkdirSync(dirname(db), { recursive: true });
+  const conn = new Database(db);
+  try {
+    conn.exec('PRAGMA busy_timeout = 2000');
+    conn.exec('CREATE TABLE IF NOT EXISTS wake_claims (address TEXT PRIMARY KEY, at INTEGER NOT NULL, token TEXT NOT NULL)');
+    conn.exec(`CREATE TABLE IF NOT EXISTS pending_wakes (address TEXT PRIMARY KEY, first_msg_id INTEGER NOT NULL,
+      last_msg_id INTEGER NOT NULL, last_from TEXT NOT NULL, count INTEGER NOT NULL, since INTEGER NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL)`);
+    return conn;
+  } catch (error) { conn.close(); throw error; }
+}
+
 /**
  * Atomically claim the 5-minute wake window for one address. One SQLite upsert decides it under the
  * write lock — the row is replaced only when the held claim is older than the window — so two
  * concurrent `msg post` processes cannot both win, including when both saw an expired claim.
  */
 export function claimWake(db: string, address: string, now: number): WakeClaim | null {
-  mkdirSync(dirname(db), { recursive: true });
   const token = `${now} ${process.pid} ${randomUUID()}`;
-  const conn = new Database(db);
+  const conn = openWakeDb(db);
   try {
-    conn.exec('PRAGMA busy_timeout = 2000');
-    conn.exec('CREATE TABLE IF NOT EXISTS wake_claims (address TEXT PRIMARY KEY, at INTEGER NOT NULL, token TEXT NOT NULL)');
     const changed = conn.query(`INSERT INTO wake_claims (address, at, token) VALUES (?1, ?2, ?3)
       ON CONFLICT(address) DO UPDATE SET at = excluded.at, token = excluded.token WHERE wake_claims.at <= ?2 - ?4`)
       .run(address, now, token, WAKE_DEBOUNCE_MS).changes;
@@ -278,5 +301,184 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
     debug.log('msg.wake', outcome.result === 'skipped' ? 'skipped' : outcome.wake, { address, msgId, wake: outcome.wake, result: outcome.result, reason: outcome.reason ?? outcome.source,
       ...(outcome.target ? { target: outcome.target } : {}) });
   } catch { /* reporting never turns a wake outcome into a throw */ }
+  try { settlePending(outcome, message.from, deps); } catch { /* the deferral ledger never turns a post into a throw */ }
   return outcome;
+}
+
+// ── 미룬 깨움(pending) ─────────────────────────────────────────────────────────
+
+interface PendingWakeRow { address: string; first_msg_id: number; last_msg_id: number; last_from: string; count: number; since: number; attempts: number; reason: string }
+
+export type PendingWakeEvent = 'deferred' | 'redelivered' | 'gave-up' | 'dropped-read';
+
+function logPending(event: PendingWakeEvent, data: Record<string, unknown>): void {
+  try { debug.log('loops.msg-wake', event, data); } catch { /* observability is fail-open */ }
+}
+
+/**
+ * After a fresh wake: a pty-inject TUI that was busy or inside the 5-minute window is remembered (not dropped);
+ * an injected wake absorbs whatever was pending for that address (the line tells the reader to list everything).
+ */
+function settlePending(outcome: WakeOutcome, from: string, deps: WakeDeps): void {
+  if (!isLive(deps)) return;
+  // TTL 은 폴러 «밖»에서도 닫는다 — TUI 가 죽은 채 안 돌아오면 그 폴러는 없다. 어느 주소든 post 가 오면 낡은 줄을 거둔다.
+  try { prunePendingWakes(deps); } catch { /* fail-soft */ }
+  if (outcome.wake !== 'pty-inject') return;
+  const address = outcome.address.trim().toUpperCase();
+  if (outcome.result === 'injected') {
+    // 이 줄은 «그때까지 저장된 글 전부를 읽어라»라 msgId 이하만 덮는다 — 주입 «뒤»에 저장·미뤄진 글(더 큰 id)이 섞인 줄은 남긴다.
+    const conn = openWakeDb(claimDbPath(deps));
+    try { conn.query('DELETE FROM pending_wakes WHERE address = ?1 AND last_msg_id <= ?2').run(address, outcome.msgId); } finally { conn.close(); }
+    return;
+  }
+  if (outcome.result !== 'busy' && outcome.result !== 'debounced') return;
+  const reason = outcome.result === 'debounced' ? 'debounced' : outcome.reason ?? 'busy';
+  const conn = openWakeDb(claimDbPath(deps));
+  let count = 1;
+  try {
+    // 주소당 한 줄 — 묶음이 늘어도 다시 두드림은 한 번. 범위는 id 순서로(동시 post 가 역순으로 와도 min·max),
+    // 보낸 이는 끝 id 의 것. 끝 id 가 바뀌면(새 글) 시도 수는 0 — 새 글은 자기 몫의 시도를 받는다. 시작 시각(TTL)은 첫 미룸 기준.
+    conn.query(`INSERT INTO pending_wakes (address, first_msg_id, last_msg_id, last_from, count, since, attempts, reason)
+      VALUES (?1, ?2, ?2, ?3, 1, ?4, 0, ?5)
+      ON CONFLICT(address) DO UPDATE SET first_msg_id = min(first_msg_id, excluded.first_msg_id),
+        last_msg_id = max(last_msg_id, excluded.last_msg_id),
+        last_from = CASE WHEN excluded.last_msg_id > last_msg_id THEN excluded.last_from ELSE last_from END,
+        attempts = CASE WHEN excluded.last_msg_id > last_msg_id THEN 0 ELSE attempts END,
+        count = count + 1, reason = excluded.reason`)
+      .run(address, outcome.msgId, from, (deps.now ?? Date.now)(), reason);
+    count = (conn.query('SELECT count FROM pending_wakes WHERE address = ?1').get(address) as { count: number } | null)?.count ?? 1;
+  } finally { conn.close(); }
+  logPending('deferred', { seat: address, count, reason, msgId: outcome.msgId });
+}
+
+function logGaveUp(row: PendingWakeRow, reason: string, attempts = row.attempts): void {
+  logPending('gave-up', { seat: row.address, count: row.count, reason, attempts, firstMsgId: row.first_msg_id, lastMsgId: row.last_msg_id });
+}
+
+/** Give up deferrals older than the TTL (a TUI that died and never came back has no poller to do it). */
+export function prunePendingWakes(deps: WakeDeps = {}): number {
+  const db = claimDbPath(deps);
+  if (!existsSync(db)) return 0;
+  const cutoff = (deps.now ?? Date.now)() - PENDING_WAKE_TTL_MS;
+  const conn = openWakeDb(db);
+  try {
+    const stale = conn.query('SELECT * FROM pending_wakes WHERE since < ?1').all(cutoff) as PendingWakeRow[];
+    for (const row of stale) {
+      if (conn.query('DELETE FROM pending_wakes WHERE address = ?1 AND last_msg_id = ?2').run(row.address, row.last_msg_id).changes === 1) logGaveUp(row, 'ttl');
+    }
+    return stale.length;
+  } finally { conn.close(); }
+}
+
+export interface RedeliverOutcome { seat: string; result: 'redelivered' | 'gave-up' | 'dropped-read' | 'waiting' | 'failed'; count: number; reason?: string }
+
+/** Unread count for a deferred address — injected reader first, else the msg ledger beside the claims db. Never throws. */
+function readUnreadFor(address: string, deps: WakeDeps): number | null {
+  try {
+    if (deps.readUnread) return deps.readUnread(address);
+    return readUnreadCount(address, join(deps.stateRoot ?? effectiveInstanceRoot(), 'msg', 'messages.db'));
+  } catch { return null; }
+}
+
+export function redeliverLine(row: Pick<PendingWakeRow, 'address' | 'last_from' | 'first_msg_id' | 'last_msg_id' | 'count'>): string {
+  const ids = row.first_msg_id === row.last_msg_id ? `#${row.last_msg_id}` : `#${row.first_msg_id}..#${row.last_msg_id}`;
+  return `[우편 깨움 · 미룬 ${row.count}통] ${row.last_from} → ${row.address} ${ids} — eln msg list --to ${row.address} 로 읽고 처리`;
+}
+
+/**
+ * Re-knock deferred wakes whose TUI is now recorded idle. `target` limits the sweep to one pty (the TUI's own poller).
+ * Never throws per row; a row stays pending while the TUI is busy or the 5-minute window is held.
+ */
+export async function redeliverPendingWakes(deps: WakeDeps = {}, opts: { target?: string } = {}): Promise<RedeliverOutcome[]> {
+  if (!isLive(deps)) return [];
+  const db = claimDbPath(deps);
+  if (!existsSync(db)) return [];
+  const conn = openWakeDb(db);
+  let rows: PendingWakeRow[];
+  try { rows = conn.query('SELECT * FROM pending_wakes ORDER BY since').all() as PendingWakeRow[]; } finally { conn.close(); }
+  const results: RedeliverOutcome[] = [];
+  const now = () => (deps.now ?? Date.now)();
+  // 지울 때는 «읽은 그 묶음»만 — 그 사이 새로 미룬 글이 오면 줄이 남아 한 번 더 두드린다.
+  const drop = (row: PendingWakeRow): boolean => {
+    const c = openWakeDb(db);
+    try { return c.query('DELETE FROM pending_wakes WHERE address = ?1 AND last_msg_id = ?2').run(row.address, row.last_msg_id).changes === 1; }
+    finally { c.close(); }
+  };
+  // 포기는 «실제로 지운» 묶음만 — 그 사이 새 글이 합쳐졌으면(끝 id 바뀜) 줄은 새 묶음으로 남고 시도 수는 0 으로 돌아가 있다.
+  const giveUp = (row: PendingWakeRow, reason: string) => {
+    if (drop(row)) {
+      logGaveUp(row, reason);
+      results.push({ seat: row.address, result: 'gave-up', count: row.count, reason });
+    } else results.push({ seat: row.address, result: 'waiting', count: row.count, reason: 'batch-changed' });
+  };
+  for (const row of rows) {
+    try {
+      if (row.attempts >= MAX_REDELIVER_ATTEMPTS) { giveUp(row, `attempts>=${MAX_REDELIVER_ATTEMPTS}`); continue; }
+      if (now() - row.since > PENDING_WAKE_TTL_MS) { giveUp(row, 'ttl'); continue; }
+      // H4-FOLLOW ③ — 그 사이 이미 읽었으면(미읽음 0) 재두드림하지 않고 줄을 지운다(10-16 OPT 가 ack 한 #9250 재두드림).
+      //   «모름»(원장 없음·못 읽음)은 지우지 않는다 — 0 으로 읽지 않는다.
+      const unread = readUnreadFor(row.address, deps);
+      if (unread === 0) {
+        if (drop(row)) {
+          logPending('dropped-read', { seat: row.address, count: row.count, attempts: row.attempts, firstMsgId: row.first_msg_id, lastMsgId: row.last_msg_id });
+          results.push({ seat: row.address, result: 'dropped-read', count: row.count });
+        } else results.push({ seat: row.address, result: 'waiting', count: row.count, reason: 'batch-changed' });
+        continue;
+      }
+      const resolution = resolveWake(row.address, deps);
+      if (resolution.optIn === false) { giveUp(row, 'human-pane-no-opt-in'); continue; }
+      // TUI 가 없거나(재기동 중) 다른 pty 의 몫이면 이번 틱은 건너뛴다 — 수명은 TTL 이 닫는다.
+      if (resolution.wake !== 'pty-inject' || !resolution.target) continue;
+      if (opts.target !== undefined && resolution.target !== opts.target) continue;
+      const tui = (deps.listPtys ?? listPtyManifestRows)().find(item => item.id === resolution.target);
+      if (!tui?.alive || tui.turnState !== 'idle') { results.push({ seat: row.address, result: 'waiting', count: row.count, reason: `turn=${tui?.turnState ?? 'unknown'}` }); continue; }
+      const claim = claimWake(db, row.address, now());
+      // 5분 창 안 — 버림이 아니라 미룸: 줄은 그대로, 다음 틱.
+      if (!claim) { results.push({ seat: row.address, result: 'waiting', count: row.count, reason: 'debounced' }); continue; }
+      const c = openWakeDb(db);
+      try { c.query('UPDATE pending_wakes SET attempts = attempts + 1 WHERE address = ?1 AND last_msg_id = ?2').run(row.address, row.last_msg_id); } finally { c.close(); }
+      let injected = false;
+      try {
+        const inject = await (deps.ptyInjector ?? defaultPtyInjector)();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([inject(resolution.target, redeliverLine(row)), new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('timeout')), deps.timeoutMs ?? WAKE_TIMEOUT_MS);
+        })]).finally(() => clearTimeout(timer));
+        injected = true;
+      } catch (error) {
+        releaseClaim(claim);
+        const reason = error instanceof Error ? error.message : String(error);
+        // 상한에 닿은 실패는 그 자리에서 닫는다 — 다음 틱을 기다리지 않는다.
+        if (row.attempts + 1 >= MAX_REDELIVER_ATTEMPTS) giveUp({ ...row, attempts: row.attempts + 1 }, `attempts>=${MAX_REDELIVER_ATTEMPTS}:${reason}`);
+        else {
+          logPending('deferred', { seat: row.address, count: row.count, reason: `inject-failed:${reason}`, attempts: row.attempts + 1 });
+          results.push({ seat: row.address, result: 'failed', count: row.count, reason });
+        }
+      }
+      if (injected) {
+        drop(row);
+        logPending('redelivered', { seat: row.address, count: row.count, reason: row.reason, attempts: row.attempts + 1, target: resolution.target, firstMsgId: row.first_msg_id, lastMsgId: row.last_msg_id });
+        results.push({ seat: row.address, result: 'redelivered', count: row.count });
+      }
+    } catch (error) {
+      results.push({ seat: row.address, result: 'failed', count: row.count, reason: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return results;
+}
+
+/**
+ * The TUI's own poller: every tick, re-knock wakes deferred for this pty once its turn is recorded idle.
+ * Reuses the manifest `turn_state` the TUI already writes (#27485) — no new IPC. Unref'd; never throws.
+ */
+export function startPendingWakePoller(surfaceId: string, deps: WakeDeps = {}, intervalMs = PENDING_WAKE_POLL_MS): () => void {
+  let inFlight = false;
+  const tick = () => {
+    if (inFlight) return;
+    inFlight = true;
+    void redeliverPendingWakes(deps, { target: surfaceId }).catch(() => []).finally(() => { inFlight = false; });
+  };
+  const timer = setInterval(tick, intervalMs);
+  (timer as { unref?: () => void }).unref?.();
+  return () => clearInterval(timer);
 }

@@ -99,7 +99,11 @@ test('pod throw only warns and keeps local verdict', async () => {
     warn: h.warn,
   });
   expect(h.calls).toHaveLength(1);
-  expect(h.logs).toHaveLength(0);
+  expect(h.logs).toHaveLength(1);
+  expect(h.logs[0]![1]).toBe('heavy-on-pod-shadow');
+  expect((h.logs[0]![2] as { pod: { measured: boolean; ok: boolean; reason: string }; agree: boolean }).pod)
+    .toEqual({ measured: false, ok: false, reason: 'pod-exception:Error' });
+  expect((h.logs[0]![2] as { agree: boolean }).agree).toBe(false);
   expect(h.warns).toEqual(['pod-down']);
   expect(result).toBe(local);
 });

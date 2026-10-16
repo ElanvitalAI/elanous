@@ -8,3 +8,11 @@ test('hold settlement and owner-child-watch observations are allowlisted', () =>
     'hold-owner-watch-timeout',
   ])));
 });
+
+test('POD-LIFECYCLE-STAGES: the pod.lifecycle «stages» line is allowlisted', () => {
+  expect(KNOWN_LOG_EVENT_NAMES.has('stages')).toBe(true);
+});
+
+test('SI-SEED-DEFAULT: the mirror seed skip line is allowlisted', () => {
+  expect(KNOWN_LOG_EVENT_NAMES.has('mirror-seed-skipped')).toBe(true);
+});

@@ -9,6 +9,7 @@ import { getSchedule } from '../../src/release-loop/release-schedule.js';
 import { isLandingFreezeRefusal, readLandingFreeze, LandingFrozenError } from '../../src/release-loop/landing-freeze.js';
 import { debug } from '../../src/debug/log.js';
 import { runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
+import { withOpSeatFlock } from '../../src/steward/resync-tick.js';
 import { releaseRunUniverse } from './release-universe.js';
 import { baseVersion, isStableVersion, nextPrereleaseVersion, type PrereleaseKind } from './release-version.js';
 import { publishAtError } from './publish-at.js';
@@ -27,6 +28,10 @@ export interface ReleaseLoopConfig {
   gatePodInstallSlots?: number;
   /** GATE-MEM-ADMIT — seconds a gate shard waits for pool admission (memory headroom) before launching anyway with `admission-timeout` (default 300 · 0 = off). */
   gatePodAdmissionWaitSeconds?: number;
+  /** Maximum simultaneous file-level isolation retries across all gate shards (default 4). */
+  gatePodIsolationConcurrency?: number;
+  /** Final isolated recheck files per window; overflow continues in later windows (default 32). */
+  gateRecheckFileLimit?: number;
   /** GATE-SPEED A3①: gate shard Pod CPU — `2` (request = limit) or `{ request, limit }`. Omitted = request 1 / limit 4. */
   gatePodCpu?: number | string | { request?: number | string; limit?: number | string };
   gateRemote?: string;
@@ -135,6 +140,17 @@ export function buildReleaseRunInput(version: string, deps: UnattendedReleaseDep
 export async function runUnattendedRelease(
   opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string },
   deps: UnattendedReleaseDeps = {},
+): Promise<{ input: ReleaseRunInput; dryRun: boolean; state?: GraphRunState }> {
+  // A dry run only builds the input and mutates nothing, so it neither creates nor waits on the OP-seat lock.
+  if (opts.dryRun) return runUnattendedReleaseLocked(opts, deps);
+  // The lock root is the OP seat's (opSeatLockRoot), never the injected ledger root: a different `deps.ledgerRoot` must
+  // not move this run onto a separate lock inode from the steward resync and a manual resume.
+  return withOpSeatFlock(() => runUnattendedReleaseLocked(opts, deps));
+}
+
+async function runUnattendedReleaseLocked(
+  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string },
+  deps: UnattendedReleaseDeps,
 ): Promise<{ input: ReleaseRunInput; dryRun: boolean; state?: GraphRunState }> {
   // RELEASE-BRANCH (10-06): the default cut is a release branch, so main keeps landing and the run no longer needs a
   // landing freeze. A freeze stays the emergency switch: when one is on, it still stops the run (`--force-freeze` overrides).

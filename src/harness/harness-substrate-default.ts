@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { loadavg, cpus, freemem } from 'node:os';
 import { effectiveInstanceRoot, prodInstanceRoot, treeDerivedRootFor } from '../instance/resolve.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { buildUserConfig, getUserConfig, type UserConfig } from '../user-config.js';
@@ -99,6 +100,60 @@ export interface AutoSubstrateDecision {
   reason: string;
 }
 
+export interface AutoSubstrateReadDeps {
+  loadavg?: typeof loadavg;
+  cpus?: typeof cpus;
+  freemem?: typeof freemem;
+  podAdmission?: () => AutoSubstrateSignals['podAdmission'];
+  localLaneOpen?: () => boolean;
+  /** Resolved by the launch decision, using its flag → env → config → context precedence. */
+  pool?: string | null;
+  config?: Pick<UserConfig, 'harness' | 'pod'>;
+  measurePoolLease?: typeof import('../task-orchestrator/surfaces/pod-lease.js').measurePoolLease;
+}
+
+/** Read Pod admission using the same pool, usage and account inputs as dispatch backpressure. */
+function readAutoPodAdmission(deps: AutoSubstrateReadDeps): AutoSubstrateSignals['podAdmission'] {
+  // Keep Pod lease dependencies lazy for local-only launches.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { leaseKubectl, measurePoolLease, recommendConcurrency } = require('../task-orchestrator/surfaces/pod-lease.js') as typeof import('../task-orchestrator/surfaces/pod-lease.js');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { parsePodPool, resolvePodPoolSpec } = require('../task-orchestrator/surfaces/pod-pool.js') as typeof import('../task-orchestrator/surfaces/pod-pool.js');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { listCodexAccountsInStore } = require('../oauth/codex-account-store.js') as typeof import('../oauth/codex-account-store.js');
+  // A direct collector call can resolve its own pool. The launch resolver passes a string or null
+  // explicitly so it never substitutes another universe's pool when the launch pool is unreadable.
+  const fallback = deps.pool === undefined ? (deps.config ?? getUserConfig()) : null;
+  const spec = fallback ? resolvePodPoolSpec(undefined, process.env, () => fallback.harness?.podPool ?? fallback.pod?.pool) : null;
+  const current = fallback && !spec ? leaseKubectl(['config', 'current-context']) : null;
+  const pool = deps.pool === undefined ? (spec ?? (current?.status === 0 ? current.stdout.trim() : null)) : deps.pool;
+  if (!pool) return null;
+  const members = parsePodPool(pool);
+  const measure = (deps.measurePoolLease ?? measurePoolLease)(members, { measureUsage: true, skipDnsProbe: true });
+  let accounts = -1;
+  try { accounts = listCodexAccountsInStore().length; } catch { /* Accounts are only observed, not a limit. */ }
+  const { recommended, limitedBy } = recommendConcurrency(measure, {
+    capacity: members.reduce((sum, member) => sum + member.capacity, 0),
+    accounts, perAccount: (deps.config ?? getUserConfig()).pod?.lease?.perAccount ?? 4,
+  });
+  return recommended === null || limitedBy === null ? null : { recommended, limitedBy };
+}
+
+/** Collect observations on the launch host; an unreadable Pod recommendation is not a refusal. */
+export function readAutoSubstrateSignals(deps: AutoSubstrateReadDeps = {}): AutoSubstrateSignals {
+  let podAdmission: AutoSubstrateSignals['podAdmission'];
+  try { podAdmission = (deps.podAdmission ?? (() => readAutoPodAdmission(deps)))() ?? null; }
+  catch { podAdmission = null; }
+  if (podAdmission?.recommended === null || podAdmission?.limitedBy === null) podAdmission = null;
+  return {
+    load1: (deps.loadavg ?? loadavg)()[0],
+    cores: (deps.cpus ?? cpus)().length,
+    availableMemoryBytes: (deps.freemem ?? freemem)(),
+    podAdmission,
+    localLaneOpen: deps.localLaneOpen?.() ?? false,
+  };
+}
+
 export interface NextLocalLaneCapInput {
   current: number;
   wanted: number;
@@ -194,28 +249,44 @@ export function checkHarnessPodPool(pool: string, run?: PoolKubectl): HarnessPoo
 export function resolveHarnessSubstrate({ flag, config, env, currentContext = () => {
   const result = spawnSync('kubectl', ['config', 'current-context'], { encoding: 'utf8', timeout: 5000 });
   return result.status === 0 ? result.stdout?.trim() : undefined;
-}, autoSignals, poolCheck = checkHarnessPodPool }: {
+  }, autoSignals, readAutoSignals, autoReadDeps, poolCheck = checkHarnessPodPool }: {
   flag?: { substrate?: HarnessSubstrate | 'auto'; podPool?: string };
   config?: Pick<UserConfig, 'harness' | 'pod'>;
   env?: NodeJS.ProcessEnv;
   currentContext?: () => string | undefined;
   /** Signals must come from the launch host and Pod admission, not a worktree's cached config. */
   autoSignals?: AutoSubstrateSignals;
+  /** Inject the collector at the decision boundary; explicit requests never invoke it. */
+  readAutoSignals?: () => AutoSubstrateSignals;
+  /** Inject measurement dependencies without bypassing the default collector or pool selection. */
+  autoReadDeps?: Omit<AutoSubstrateReadDeps, 'pool' | 'config' | 'podAdmission'>;
   /** POD-POOL-UNCAPPED-SPEC — pre-launch check of the implicit kube context; tests inject it instead of shelling out. */
   poolCheck?: (pool: string) => HarnessPoolCheck;
 }): ResolvedHarnessSubstrate {
   const requested = flag?.substrate ?? config?.harness?.substrate ?? 'local';
   if (requested !== 'local' && requested !== 'pod' && requested !== 'auto') throw new Error('harness.substrate: local, pod 또는 auto 만 허용한다');
   const source = flag?.substrate ? 'flag' : config?.harness?.substrate ? 'config' : 'default';
-  // Missing signals mean admission was not observed, not that the Pod has room.
-  const decision = requested === 'auto' ? routeAutoSubstrate(autoSignals ?? {
-    podAdmission: null, load1: null, cores: null, availableMemoryBytes: null, localLaneOpen: false,
-  }) : null;
+  const explicit = flag?.podPool?.trim() || env?.ELANOUS_POD_POOL?.trim() || config?.harness?.podPool?.trim() || config?.pod?.pool?.trim();
+  // Reuse the same pool choice for admission and launch; do not fall back to a different universe's pool.
+  let implicit: string | undefined;
+  let contextRead = false;
+  const selectedPool = () => {
+    if (explicit) return explicit;
+    if (!contextRead) { implicit = currentContext()?.trim(); contextRead = true; }
+    return implicit;
+  };
+  const signals = requested === 'auto'
+    ? (autoSignals ?? (readAutoSignals ?? (() => readAutoSubstrateSignals({ ...autoReadDeps, pool: selectedPool() ?? null, config })))())
+    : null;
+  if (signals && autoSignals === undefined) debug.log('harness.substrate', 'auto-signals', {
+    load1: signals.load1, cores: signals.cores, availableMemoryBytes: signals.availableMemoryBytes,
+    podAdmission: signals.podAdmission, localLaneOpen: signals.localLaneOpen,
+  });
+  const decision = signals ? routeAutoSubstrate(signals) : null;
   const substrate: HarnessSubstrate = requested === 'auto' ? decision!.substrate : requested;
   if (decision) debug.log('harness.substrate', 'route', { substrate, reason: decision.reason, source });
   if (substrate === 'local') return { substrate, pool: null, source };
-  const explicit = flag?.podPool?.trim() || env?.ELANOUS_POD_POOL?.trim() || config?.harness?.podPool?.trim() || config?.pod?.pool?.trim();
-  const pool = explicit || currentContext()?.trim();
+  const pool = selectedPool();
   if (!pool) throw new Error(`harness.substrate=${decision ? `auto→pod(${decision.reason})` : 'pod'}: Pod 풀 또는 현재 컨텍스트에 닿지 못했다 — 풀을 설정하거나 \`--substrate local\` 로 명시하라`);
   // POD-POOL-UNCAPPED-SPEC — an explicit pool is the operator's own statement and gets `checkPodPool` at the launch
   //   site (`src/index.ts` self orchestrate · `src/loops/orchestrator/tick.ts` · `pod-command-job.ts`). The implicit

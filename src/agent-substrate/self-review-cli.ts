@@ -1125,6 +1125,24 @@ function roleAcpErrorReason(error: unknown): 'acp-handshake-timeout' | 'acp-erro
 
 type AcpFallbackSkip = { backend: string; reason: string };
 
+function validateReviewDenyBackends(value: unknown, now: number): string[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return null;
+  const denied: string[] = [];
+  for (const entry of value) {
+    if (typeof entry === 'string' && entry.trim()) { denied.push(entry); continue; }
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+    const item = entry as Record<string, unknown>;
+    if (Object.keys(item).some((key) => key !== 'backend' && key !== 'expiresAt')
+      || typeof item.backend !== 'string' || !item.backend.trim()
+      || typeof item.expiresAt !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(item.expiresAt)
+      || !Number.isFinite(Date.parse(item.expiresAt)) || new Date(item.expiresAt).toISOString().slice(0, 19) !== item.expiresAt.slice(0, 19)
+      || Date.parse(item.expiresAt) <= now) return null;
+    denied.push(item.backend);
+  }
+  return denied;
+}
+
 function orderedAcpReviewFallbackBackends(configuredBackend: string | undefined, denyBackends: readonly string[] = []): {
   backends: string[];
   skipped: AcpFallbackSkip[];
@@ -1294,10 +1312,17 @@ async function runSelfReviewCliCommandPinned(
   const acpBackend = acpBackendResolution.backend;
   const requestedModel = opts.model?.trim() || undefined;
   const rawReviewDenyBackends = (getUserConfig().raw?.acp as { reviewDenyBackends?: unknown } | undefined)?.reviewDenyBackends;
-  const configuredReviewDenyBackends = Array.isArray(rawReviewDenyBackends)
-    ? rawReviewDenyBackends.filter((backend): backend is string => typeof backend === 'string')
-    : [];
-  const automaticFallbacks = orderedAcpReviewFallbackBackends(opts.configuredAcpBackend, opts.reviewDenyBackends ?? configuredReviewDenyBackends);
+  const denyCheckedAt = Date.now();
+  const configuredReviewDenyBackends = validateReviewDenyBackends(rawReviewDenyBackends, denyCheckedAt);
+  const reviewDenyBackends = validateReviewDenyBackends(opts.reviewDenyBackends, denyCheckedAt);
+  if (configuredReviewDenyBackends === null || reviewDenyBackends === null) {
+    const message = 'acp.reviewDenyBackends 설정이 유효하지 않거나 만료됐습니다 — 리뷰를 실행하지 않습니다.';
+    deps.log('review-deny-invalid', { reason: 'invalid-or-expired-review-deny-backends' }, { level: 'warn' });
+    deps.error(message);
+    return { results: opts.json ? [{ error: message }] : [], failed: 1 };
+  }
+  const automaticFallbacks = orderedAcpReviewFallbackBackends(opts.configuredAcpBackend,
+    opts.reviewDenyBackends === undefined ? configuredReviewDenyBackends : reviewDenyBackends);
   const fallbackAcpBackends = opts.acpBackend
     ? [canonicalizeBackendId(opts.acpBackend)]
     : automaticFallbacks.backends;
@@ -1632,6 +1657,7 @@ async function runSelfReviewCliCommandPinned(
     const reviewProvenance = {
       reviewRoute,
       fallbackAttempted,
+      ...(requestedModel ? { requestedModel } : {}),
       ...(fallbackBackend ? { fallbackBackend } : {}),
       ...(fallbackBackend ? { requestedModel: primaryModel, actualBackend: `acp:${fallbackBackend}` } : {}),
       ...(fallbackNotAttemptedReason ? { fallbackNotAttemptedReason } : {}),

@@ -84,7 +84,7 @@ import { recordBriefTelegramUpdate } from './cli/brief-cli.js';
 import { attachTelegramFabricPlan } from './telegram-fabric-plan.js';
 import { contextNow as readContextNow, type ContextNowDeps } from './context-bus/context-now.js';
 import { renderContextFirstOpening } from './context-bus/context-now-surfaces.js';
-import { createContextFirstFileStore, createContextFirstGate, isOperationalQuery, renderContextFirst, type ContextFirstStore } from './context-bus/context-first.js';
+import { createContextFirstFileStore, createContextFirstGate, renderContextFirst, takeContextFirstOpening, type ContextFirstStore } from './context-bus/context-first.js';
 
 export type TgAttachmentKind = 'photo' | 'voice' | 'audio' | 'document';
 
@@ -446,10 +446,8 @@ export class TelegramBot {
   /** 처음이거나 6시간 이상 쉰 대화의 첫 일반 답 앞에 context-now 요약 한 메시지를 보낸다. 실패해도 본 답은 막지 않는다. */
   private async maybeSendContextFirst(ctx: TgIncoming): Promise<void> {
     const key = `${ctx.chatId}:${ctx.threadId ?? ''}`;
-    if (!this.contextFirstGate.take(key)) return;
     const cfg = this.slashContext?.userConfig.telegram;
-    if (cfg?.contextFirst === false) return;
-    if (isOperationalQuery(ctx.text)) return;
+    if (!takeContextFirstOpening({ gate: this.contextFirstGate, key, text: ctx.text, enabled: cfg?.contextFirst !== false })) return;
     try {
       const opening = renderContextFirst(this.readContextNow, this.contextNowDeps, renderContextFirstOpening);
       if (!opening) return;

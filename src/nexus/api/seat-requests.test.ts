@@ -12,7 +12,10 @@ import { handleSeatRequests } from './seat-requests.js';
 import { subscribeInsideEvent } from './inside-events.js';
 import type { submitIntakeWork } from '../../intake-plane/submit-intake-work.js';
 import type { CeoCommandDeps } from '../../seat-dispatch/ceo-commands.js';
-import type { MessageEnvelope } from '../../msg/msg-store.js';
+import { MsgStore, type MessageEnvelope } from '../../msg/msg-store.js';
+import { handleTelegramSeatWork } from '../../intake-plane/telegram-seat-work.js';
+import { answerSeatAsk, DEFAULT_ASK_TIMEOUT_MS, deliverSeatAnswers, listSeatAskRoundTrips, type AskOrigin } from '../../seat-dispatch/seat-ask.js';
+import type { UserConfig } from '../../user-config.js';
 import { resolveAttachmentPath, saveAttachmentBlob } from '../../boot/attachment-store.js';
 
 const roots: string[] = [];
@@ -491,6 +494,48 @@ test('PWA gh failure still returns 202 and a channelError with the seat message 
   expect(stored[0]!.body).toMatch(/^점검\n요청: pwa:\S+$/);
   expect(await (await post()).json()).toEqual(receipt);
   expect(stored).toHaveLength(1);
+});
+
+test('Telegram question → CTO session answer → Telegram reply: 10분 안 판정과 기한·미답 표시', async () => {
+  const store = new MsgStore(':memory:');
+  store.close = () => {};
+  const sent: Array<{ origin: AskOrigin; text: string }> = [];
+  const config = { raw: { decisions: { telegramOwnerId: 111 } } } as unknown as UserConfig;
+  const commandDeps: CeoCommandDeps = { ownerId: '111', replyTarget: 'acme/repo#42',
+    runGh: async () => 0, append: (message) => { store.append(message); } };
+  try {
+    let time = 1_700_000_000_000;
+    const ask = { open: () => store, now: () => time,
+      send: async (origin: AskOrigin, text: string) => { sent.push({ origin, text }); } };
+    // 텔레그램 질문 — 기존 호출자 handleTelegramSeatWork → askSeat(origin {channel:'telegram',…}).
+    const asked = await handleTelegramSeatWork('CTO에게 물어봐 배포 상태?',
+      { chatId: 111, userId: 111, messageId: 456, threadId: 7 },
+      { config, commandDeps, askDeps: ask });
+    expect(asked).toContain(`최대 ${Math.ceil(DEFAULT_ASK_TIMEOUT_MS / 60_000)}분`);
+    const id = /요청: ask:([\w-]+)/.exec(store.list('TC')[0]!.body)![1]!;
+    // CTO 세션 답 — 기한 안.
+    time += 3 * 60_000;
+    answerSeatAsk(id, '배포 완료', ask);
+    time += 2 * 60_000;
+    await deliverSeatAnswers(ask);
+    expect(sent).toEqual([{ origin: { channel: 'telegram', chatId: 111, messageId: 456, threadId: 7 },
+      text: `CTO 답변 (${id}): 배포 완료` }]);
+    expect(listSeatAskRoundTrips({ since: 1_699_999_000_000, now: time, open: () => store })).toEqual([{
+      id, surface: 'telegram', askedAt: 1_700_000_000_000, answeredAt: 1_700_000_180_000,
+      deliveredAt: 1_700_000_300_000, roundTripMs: 300_000, verdict: '10분 안' }]);
+    // 기한·미답 표시 — 두 번째 텔레그램 질문이 1분 기한을 넘기면 미답으로 표시된다.
+    const short = { ...ask, timeoutMs: 60_000 };
+    await handleTelegramSeatWork('CTO에게 물어봐 다음 배포?', { chatId: 111, userId: 111, messageId: 457 },
+      { config, commandDeps, askDeps: short });
+    const unansweredId = /요청: ask:([\w-]+)/.exec(store.list('TC').at(-1)!.body)![1]!;
+    expect(unansweredId).not.toBe(id);
+    time += 60_000;
+    expect(() => answerSeatAsk(unansweredId, '늦은 답', short)).toThrow('deadline passed');
+    await deliverSeatAnswers(short);
+    expect(sent.at(-1)?.text).toBe(`CTO 미답 (${unansweredId}): 아직 답 없음 (1분 경과).`);
+    expect(listSeatAskRoundTrips({ since: 1_699_999_000_000, now: time, open: () => store })[0])
+      .toMatchObject({ id: unansweredId, surface: 'telegram', verdict: '미답', roundTripMs: null, answeredAt: null, deliveredAt: 1_700_000_360_000 });
+  } finally { store.close(); }
 });
 
 test('HTTP router serializes simultaneous submissions sharing a key and rejects a conflicting payload', async () => {

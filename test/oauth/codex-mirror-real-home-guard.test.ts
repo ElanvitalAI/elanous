@@ -16,7 +16,7 @@ import { mkdtempSync, readFileSync, rmSync, symlinkSync, mkdirSync } from 'node:
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  saveTokens, assertMirrorTargetIsSafeUnderTest, isUnderTestRunner,
+  saveTokens, assertMirrorTargetIsSafeUnderTest, isUnderTestRunner, resolveMirrorGuardPath,
 } from '../../src/oauth/store';
 
 let root: string;
@@ -65,6 +65,13 @@ describe('① 가드 — 실홈이 대상이면 «던진다» (쓰기는 일어�
     const link = join(root, 'link');
     symlinkSync(join(homedir(), '.codex'), link);
     expect(() => assertMirrorTargetIsSafeUnderTest(join(link, 'auth.json'))).toThrow(/실제 ~\/\.codex/);
+  });
+
+  test.skipIf(!CAN_SYMLINK)('⛔ 없는 대상 디렉터리로 향한 링크도 문자열 대상까지 풀어 비교한다', () => {
+    const future = join(root, 'future-codex-home');
+    const link = join(root, 'dangling');
+    symlinkSync(future, link);
+    expect(resolveMirrorGuardPath(join(link, 'auth.json'))).toBe(resolveMirrorGuardPath(join(future, 'auth.json')));
   });
 
   test('✅ 임시 경로는 통과한다 — 가드가 정당한 테스트를 막지 않는다', () => {

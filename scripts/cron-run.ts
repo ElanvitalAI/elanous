@@ -16,7 +16,7 @@ import { ensureCronNodePath } from '../src/domains/cron-path.js';
 ensureCronNodePath();
 
 async function main(): Promise<void> {
-  const argv = process.argv.slice(2);
+  const { argv, maxRuntimeMs } = extractMaxRuntimeArgs(process.argv.slice(2)); // 래퍼 옵션은 대상 앞에서만 소비한다.
   const hasScheduleId = argv[0] === '--schedule-id';
   const scheduleId = hasScheduleId ? argv.splice(0, 2)[1] : undefined;
   if (hasScheduleId && (!scheduleId?.trim() || scheduleId === '--shell')) {
@@ -90,6 +90,9 @@ async function main(): Promise<void> {
   const child = spawn(interpreter, [target, ...targetArgs], {
     stdio: ['ignore', 'inherit', 'pipe'],
     env: { ...process.env },
+    // ⓐ detached — 자식이 프로세스 그룹 리더가 된다. 상한 초과 kill 은 그룹 전체
+    // (자식의 자식까지)를 죽린다: process.kill(-pid).
+    detached: true,
   });
   let errTail = '';
   child.stderr?.on('data', (chunk: Buffer) => {
@@ -97,14 +100,53 @@ async function main(): Promise<void> {
     errTail = (errTail + chunk.toString()).slice(-2000); // 바운디드
   });
 
+  // ⓐ 상한 타이머 — 넘으면 자식 프로세스 그룹 전체를 SIGKILL 하고 관측 플래그를 올린다.
+  // 진단(stderr 한 줄)은 여기서, 관측 기록은 기존 finish() 경로가 그대로 맡는다(fail-open 불변).
+  // ⚠ 리더가 이미 종료했다고 조기 반환하지 않는다(리뷰 must-fix): 리더만 죽고 손자가 stderr
+  //   파이프를 쥔 채 남으면 close 가 영영 안 와 관측도 반환도 없다. 이 경로에서도 그룹(트리)
+  //   종료를 시도하고, close 가 오지 않으면 finish 를 직접 불러 관측·반환을 마무리한다.
+  let overrun = false;
+  let finished = false;
+  let forwardedExit: number | null = null;
+  let signalKillTimer: ReturnType<typeof setTimeout> | null = null;
+  const timer: ReturnType<typeof setTimeout> | null = maxRuntimeMs > 0
+    ? setTimeout(() => {
+        if (child.pid === undefined || finished) return;
+        overrun = true;
+        const leaderGone = child.exitCode !== null || child.signalCode !== null;
+        try { process.stderr.write(`cron-run overrun: ${maxRuntimeMs}ms 상한 초과 — 자식 트리(pid ${child.pid}) 종료${leaderGone ? ' — 리더 이미 종료, 파이프를 쥔 손자 정리' : ''}\n`); } catch { /* */ }
+        try { process.kill(-child.pid, 'SIGKILL'); }
+        catch { try { child.kill('SIGKILL'); } catch { /* 이미 종료 */ } }
+        // 그룹 밖(setsid) 잔존자가 파이프를 계속 쥐면 close 가 오지 않는다 — 관측까지 여기서
+        // 마무리한다. close 가 정상적으로 오면 finish 의 멱등 가드가 이 호출을 흡수한다.
+        setTimeout(() => finish(child.exitCode), OVERRUN_CLOSE_GRACE_MS);
+      }, maxRuntimeMs)
+    : null;
+
   const finish = (code: number | null): void => {
-    const exit = code ?? 0;
+    if (finished) return; // 멱등 — close·error·상한 유예 경로가 겹쳐도 관측·반환은 1회
+    finished = true;
+    // 신호를 받은 뒤 리더가 먼저 닫혀도, SIGTERM을 무시하고 stdio를 닫은 손자가
+    // 그룹에 남을 수 있다. close가 온 시점에도 그룹 전체를 마지막으로 거둔다.
+    if (forwardedExit !== null && child.pid !== undefined) {
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { /* 그룹 이미 종료 */ }
+    }
+    if (timer !== null) clearTimeout(timer);
+    if (signalKillTimer !== null) clearTimeout(signalKillTimer);
+    process.removeListener('SIGINT', onSigInt);
+    process.removeListener('SIGTERM', onSigTerm);
+    const exit = overrun ? 124 : forwardedExit ?? code ?? 0;
     try {
       const durationMs = Date.now() - start;
       const status: 'ok' | 'error' = exit === 0 ? 'ok' : 'error';
+      const overrunNote = overrun
+        ? `cron-run overrun: killed ${target} (pid ${child.pid ?? '?'}) after ${durationMs}ms — cap ${maxRuntimeMs}ms`
+        : null;
       const record = {
         status, exit, durationMs, via: 'crontab' as const,
-        error: exit === 0 ? null : errTail.trim().split('\n').slice(-3).join('\n') || `exit ${exit}`,
+        error: overrunNote
+          ? [overrunNote, ...errTail.trim().split('\n').slice(-3).filter(Boolean)].join('\n')
+          : exit === 0 ? null : errTail.trim().split('\n').slice(-3).join('\n') || `exit ${exit}`,
       };
       const options = { ...(db ? { db } : {}), ...(id ? { id } : {}), prevStatus };
       const diagnostic = (kind: 'prerequisite' | 'registry record skipped' | 'registry selection ambiguous' | 'import' | 'record', error: unknown): Promise<void> => {
@@ -144,8 +186,59 @@ async function main(): Promise<void> {
       process.exit(exit);
     }
   };
+  const forwardSignal = (signal: 'SIGINT' | 'SIGTERM'): void => {
+    if (finished || forwardedExit !== null) return;
+    forwardedExit = signal === 'SIGINT' ? 130 : 143;
+    if (child.pid === undefined) { finish(forwardedExit); return; }
+    try { process.kill(-child.pid, signal); }
+    catch { try { child.kill(signal); } catch { /* 이미 종료 */ } }
+    signalKillTimer = setTimeout(() => {
+      try { process.kill(-child.pid!, 'SIGKILL'); }
+      catch { try { child.kill('SIGKILL'); } catch { /* 이미 종료 */ } }
+      finish(forwardedExit);
+    }, OVERRUN_CLOSE_GRACE_MS);
+  };
+  const onSigInt = (): void => forwardSignal('SIGINT');
+  const onSigTerm = (): void => forwardSignal('SIGTERM');
+  process.on('SIGINT', onSigInt);
+  process.on('SIGTERM', onSigTerm);
   child.on('close', finish);
   child.on('error', (e) => { process.stderr.write(`cron-run spawn error: ${e.message}\n`); finish(1); });
 }
 
+const MAX_TIMER_MS = 2_147_483_647;
 void main().catch(() => process.exit(0));
+
+// ⓐ LOGS-RETENTION-46MIN: 실행 시간 상한 — 상한 없이 살아남은 옛 판 크론이 6시간마다
+// «오래된 행 50%» 삭제를 겹쳐 돌려 보존 창을 무너뜨린 사고(10-12)의 재발 방지.
+// 우선순위: --max-runtime-ms > CRON_RUN_MAX_RUNTIME_MS > 기본 30분. 0 이하는 상한 끔.
+//
+// 래퍼 플래그는 대상 앞에서만 읽는다. 대상 뒤의 같은 이름은 자식 인자다.
+// ⚠ main() 안쪽이 아니라 여기(helper)에 두는 이유: main() 머리에 줄을 늘리면 위쪽
+//   registerLogStoreSink 호출의 줄번호가 움직여 log-store-retention-callers.test.ts
+//   가 git 색인과 대비하는 검사를 깬다(부메랑).
+function extractMaxRuntimeArgs(argv: string[]): { argv: string[]; maxRuntimeMs: number } {
+  const args = [...argv];
+  if (args[0] === '--schedule-id') args.splice(0, 2);
+  if (args[0] === '--max-runtime-ms') {
+    const raw = args[1];
+    const parsed = Number(raw);
+    if (!raw || !Number.isSafeInteger(parsed) || parsed < 0 || parsed > MAX_TIMER_MS) {
+      process.stderr.write(`cron-run: --max-runtime-ms 인자는 0~${MAX_TIMER_MS} 사이의 정수여야 합니다\n`);
+      process.exit(2);
+    }
+    const flagIndex = argv.indexOf('--max-runtime-ms');
+    return { argv: argv.filter((_, index) => index !== flagIndex && index !== flagIndex + 1), maxRuntimeMs: parsed };
+  }
+  const rawEnv = process.env.CRON_RUN_MAX_RUNTIME_MS;
+  const fromEnv = Number(rawEnv);
+  if (rawEnv?.trim() && fromEnv > MAX_TIMER_MS) {
+    process.stderr.write(`cron-run: CRON_RUN_MAX_RUNTIME_MS 인자는 0~${MAX_TIMER_MS} 사이의 정수여야 합니다\n`);
+    process.exit(2);
+  }
+  return { argv, maxRuntimeMs: rawEnv?.trim() && Number.isSafeInteger(fromEnv) && fromEnv >= 0 && fromEnv <= MAX_TIMER_MS ? fromEnv : 30 * 60_000 };
+}
+
+// ⓐ 상한 시점의 그룹 종료 뒤에도 close 가 오지 않는 경로(파이프를 쥔 그룹 밖 손자)에서
+// 관측(finish)을 마무리할 때까지 기다리는 유예.
+const OVERRUN_CLOSE_GRACE_MS = 2_000;

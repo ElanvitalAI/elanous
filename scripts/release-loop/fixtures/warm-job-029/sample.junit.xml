@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="3" assertions="7" failures="0" skipped="0" time="0.29736114">
+  <testsuite name="src/chat/tool-render/dispatch.test.ts" file="src/chat/tool-render/dispatch.test.ts" tests="3" assertions="7" failures="0" skipped="0" time="0.295442442" hostname="gate-4a935594-9ba4-4f22-8081-dff669314775-nt44m">
+    <testsuite name="renderToolResultVariants kind-unit grouping" file="src/chat/tool-render/dispatch.test.ts" line="18" tests="3" assertions="7" failures="0" skipped="0" time="0.001" hostname="gate-4a935594-9ba4-4f22-8081-dff669314775-nt44m">
+      <testcase name="kind-unit attaches the classified operation kind" classname="renderToolResultVariants kind-unit grouping" time="0.001902" file="src/chat/tool-render/dispatch.test.ts" line="19" assertions="1" />
+      <testcase name="unknown tools fall back to the tool name only in kind-unit" classname="renderToolResultVariants kind-unit grouping" time="0.000023" file="src/chat/tool-render/dispatch.test.ts" line="24" assertions="1" />
+      <testcase name="line and task-unit omit operationKind and keep identical collapsed text" classname="renderToolResultVariants kind-unit grouping" time="0.00021" file="src/chat/tool-render/dispatch.test.ts" line="34" assertions="5" />
+    </testsuite>
+  </testsuite>
+</testsuites>

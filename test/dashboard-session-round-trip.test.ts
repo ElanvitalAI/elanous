@@ -27,6 +27,7 @@ import type {
 } from '../src/llm.js';
 import * as llmModule from '../src/llm.js';
 import { isTuiRouteLine } from '../src/core-turn/short-question.js';
+import { debug } from '../src/debug/log.js';
 
 type StreamCall = {
   messages: LLMMessage[];
@@ -112,6 +113,27 @@ describe('DashboardSession — full ACP round-trip (Phase 4)', () => {
     expect(usages).toHaveLength(1);
     expect(usages[0]).toMatchObject({ provider: 'anthropic', inputTokens: 7, outputTokens: 2 });
 
+    await session.close();
+  });
+
+  // TUI-H1-SEAT-GOALLOOP — DashboardSession carries the seat resolver into the bridge's routing decision (review r4).
+  test('resolveSeat reaches the bridge: a seat operational directive is routed to the goal loop', async () => {
+    streamImpl = async ({ handlers }) => { handlers.onText('ok', 'ok'); return 'ok'; };
+    const log = spyOn(debug, 'log');
+    const text = 'OP 13:14: 계속 — draft 다음 행.';
+    const session = await DashboardSession.create({
+      cwd: '/tmp',
+      resolveSeat: () => 'OPT',
+      getMessages: () => [{ role: 'user', content: text }],
+      getTools: () => [tool],
+      dispatchTool: async () => null,
+    });
+    const texts: string[] = [];
+    await session.send({ userText: text, onText: (t) => texts.push(t) });
+    expect(log).toHaveBeenCalledWith('chat.route', 'decided', expect.objectContaining({
+      reason: 'seat-read', goalLoop: true, seat: 'OPT', seatKnown: true,
+    }));
+    expect(texts.some((t) => isTuiRouteLine(t))).toBe(false);
     await session.close();
   });
 

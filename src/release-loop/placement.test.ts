@@ -1,15 +1,16 @@
 import { afterEach, expect, spyOn, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { Command } from 'commander';
 import { registerReleaseCommands } from '../cli/release-cli.js';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { addItem, checklistHistory, listChecklist, setItem } from './checklist.js';
-import { mergedPrsLast24h, placeCell, rebalance, seatMove } from './placement.js';
+import { mergedPrsLast24h, placeCell, planPullForward, rebalance, seatMove } from './placement.js';
 import { move } from './feature-store.js';
 import { CliUserError } from '../cli/cli-user-error.js';
-import { setSchedule } from './release-schedule.js';
+import { listSchedules, setSchedule } from './release-schedule.js';
 
 let dir = '';
 const now = new Date('2026-10-04T00:00:00.000Z');
@@ -561,4 +562,155 @@ test('ORCH-LIVE-1008: rebalance and seat moves of an open cell are not blocked b
   addItem('0.2.10', { id: 'mkdup', title: 'old mk', owner: 'MK' }, { allowDuplicateId: true });
   addItem('0.2.14', { id: 'mkdup', title: 'MK cell', owner: 'MK' }, { allowDuplicateId: true });
   expect(() => seatMove('mkdup', '0.2.14', '0.2.15', 'MK', 'capacity', { ...deps(), merged24h: 10, released: '0.2.13', dryRun: true })).not.toThrow();
+}, 60_000);
+
+const pullCell = (id: string, priority: 'P0' | 'P1' | 'P2' = 'P1') =>
+  ({ ...cell(id, priority), title: `대상 경로: src/release-loop/placement.ts\n${id}` });
+const pullDeps = () => {
+  const schedules = listSchedules();
+  return { ...deps(), schedules, checklists: new Map(schedules.map(({ version }) => [version, listChecklist(version).items] as const)),
+    released: '0.2.13', seatCap: { TC: 2, MK: 2 }, ceoDailyCap: 30, ceoCalendar: {},
+    signal: { order: [] as string[], hold: [] as string[] }, targetPathExists: (path: string) => path === 'src/release-loop/placement.ts' };
+};
+
+test('planPullForward selects next-release signal order then P0/P1, caps at five, and excludes unsafe cells', () => {
+  setup();
+  for (const id of ['a', 'b']) addItem('0.2.14', { ...cell(id, 'P0'), owner: 'MK' });
+  addItem('0.2.14', { ...cell('finished', 'P0'), owner: 'MK' });
+  setItem('0.2.14', 'finished', { status: 'green' }, 'OP');
+  for (const id of ['p1a', 'p1b', 'p1c', 'p1d', 'p0a', 'p0b', 'p0c']) addItem('0.2.15', pullCell(id, id.startsWith('p0') ? 'P0' : 'P1'));
+  addItem('0.2.15', pullCell('p2', 'P2'));
+  addItem('0.2.15', pullCell('held', 'P0'));
+  addItem('0.2.15', { ...pullCell('human'), title: '대상 경로: src/release-loop/placement.ts\n실기기 확인' });
+  addItem('0.2.15', { ...pullCell('approval'), title: '대상 경로: src/release-loop/placement.ts\n\u{1F451} 승인' });
+  addItem('0.2.15', { ...pullCell('manual-approval'), title: '대상 경로: src/release-loop/placement.ts\n수동 승인' });
+  for (const [id, label] of [['manual-en', 'manual approval'], ['human-en', 'human review'], ['hand-work', '손 구현 착수']] as const)
+    addItem('0.2.15', { ...pullCell(id), title: `대상 경로: src/release-loop/placement.ts\n${label}` });
+  addItem('0.2.15', { ...pullCell('no-path'), title: '설명만 있는 칸' });
+  addItem('0.2.15', { ...pullCell('fake-path'), title: '대상 경로: 없음\n설명' });
+  addItem('0.2.15', { ...pullCell('no-file'), title: '대상 경로: src/not-real-pull-forward.ts\n설명' });
+  addItem('0.2.15', { ...pullCell('later-path'), title: '설명\n대상 경로: src/release-loop/placement.ts' });
+  addItem('0.2.14', { ...cell('unresolved'), owner: 'MK' });
+  addItem('0.2.15', { ...pullCell('dependent'), predecessors: ['unresolved'] });
+  const plan = planPullForward({ ...pullDeps(), merged24h: 100, seatCap: { TC: 20, MK: 20 },
+    signal: { order: ['p1d', 'p0c', 'p1d'], hold: ['held'] } });
+  expect(plan.decisions.map((row) => row.id)).toEqual(['p1d', 'p0c', 'p0a', 'p0b', 'p1a']);
+  expect(plan.decisions.every((row) => row.from === '0.2.15' && row.version === '0.2.14')).toBe(true);
+  expect(listChecklist('0.2.15').items).toHaveLength(20);
+  expect(checklistHistory('p1d').filter((row) => row.field === 'move')).toHaveLength(0);
+}, 60_000);
+
+test('a completed historical copy cannot hide an incomplete predecessor with the same id', () => {
+  setup();
+  setSchedule('0.2.10', { cutAt: '2026-10-01T00:00Z', landBy: '2026-10-01T00:00Z' }, 'OP');
+  addItem('0.2.10', { ...cell('predecessor'), owner: 'MK' });
+  setItem('0.2.10', 'predecessor', { status: 'green' }, 'OP');
+  addItem('0.2.14', { ...cell('predecessor'), owner: 'MK' }, { allowDuplicateId: true });
+  addItem('0.2.15', { ...pullCell('dependent'), predecessors: ['predecessor'] });
+  const plan = planPullForward({ ...pullDeps(), merged24h: 100 });
+  expect(plan).toEqual({ decisions: [], blocked: [] });
+}, 60_000);
+
+test('missing traffic order uses P0 before P1 while preserving ledger order within a priority', () => {
+  setup();
+  addItem('0.2.15', pullCell('p1-first', 'P1'));
+  addItem('0.2.15', pullCell('p0', 'P0'));
+  addItem('0.2.15', pullCell('p1-second', 'P1'));
+  const plan = planPullForward({ ...pullDeps(), merged24h: 100, seatCap: { TC: 20 }, signal: { hold: [] } });
+  expect(plan.decisions.map((row) => row.id)).toEqual(['p0', 'p1-first', 'p1-second']);
+}, 60_000);
+
+test('target declaration is on the first line; an explicitly new file remains eligible', () => {
+  setup();
+  addItem('0.2.15', { ...pullCell('later-only'), title: '설명만 있음\n대상 경로: src/release-loop/placement.ts' });
+  addItem('0.2.15', { ...pullCell('human-review'), title: '대상 경로: src/release-loop/placement.ts\n\u{1F451} 검토' });
+  addItem('0.2.15', { ...pullCell('new-file'), title: '대상 경로: src/new-pull-forward.ts\n신설: 신규 모듈' });
+  expect(planPullForward({ ...pullDeps(), merged24h: 100 }).decisions.map((row) => row.id)).toEqual(['new-file']);
+}, 60_000);
+
+test('planPullForward applies P0 ≤3 and the inclusive four-hour landing deadline boundary', () => {
+  setup();
+  addItem('0.2.15', pullCell('ready', 'P0'));
+  addItem('0.2.15', { ...pullCell('missing'), title: '대상 경로: src/not-real-pull-forward.ts\nmissing' });
+  for (const index of [0, 1, 2, 3]) addItem('0.2.14', { ...cell(`p0-${index}`, 'P0'), owner: 'MK' });
+  const base = () => ({ ...pullDeps(), merged24h: 100, seatCap: { TC: 20, MK: 20 } });
+  expect(planPullForward(base()).decisions).toEqual([]);
+  expect(planPullForward(base()).blocked[0]?.reason).toContain('남은 P0 4 > 3');
+  setItem('0.2.14', 'p0-3', { status: 'green' }, 'OP');
+  expect(planPullForward(base()).decisions.map((row) => row.id)).toEqual(['ready']);
+  const land = Date.parse('2026-10-05T02:00:00Z');
+  expect(planPullForward({ ...base(), now: new Date(land - 4 * 60 * 60 * 1000) }).decisions.map((row) => row.id)).toEqual(['ready']);
+  const tooLate = planPullForward({ ...base(), now: new Date(land - 4 * 60 * 60 * 1000 + 1) });
+  expect(tooLate.decisions).toEqual([]);
+  expect(tooLate.blocked).toEqual([expect.objectContaining({ id: 'ready', reason: expect.stringContaining('4시간 미만') })]);
+  const distinct = listSchedules().map((row) => row.version === '0.2.14'
+    ? { ...row, cutAt: new Date(land + 60 * 60 * 1000).toISOString() } : row);
+  const boundary = new Date(land - 3.5 * 60 * 60 * 1000);
+  expect(planPullForward({ ...base(), schedules: distinct, now: boundary }).decisions).toEqual([]);
+  const noLandBy = distinct.map((row) => row.version === '0.2.14' ? { ...row, landBy: undefined } : row);
+  expect(planPullForward({ ...base(), schedules: noLandBy, now: boundary })
+    .decisions.map((row) => row.id)).toEqual(['ready']);
+}, 60_000);
+
+test('pull-forward uses only the supplied checkout path probe', () => {
+  setup();
+  addItem('0.2.15', pullCell('ready', 'P1'));
+  const base = { ...pullDeps(), merged24h: 100, seatCap: { TC: 20 } };
+  expect(planPullForward({ ...base, targetPathExists: () => false }).decisions).toEqual([]);
+  expect(planPullForward({ ...base, targetPathExists: (path) => path === 'src/release-loop/placement.ts' })
+    .decisions.map((row) => row.id)).toEqual(['ready']);
+  expect(() => planPullForward({ ...base, targetPathExists: undefined as unknown as (path: string) => boolean })).toThrow('경로 판정기');
+}, 60_000);
+
+test('pull-forward CLI exposes a read-only production caller and requires readable traffic', async () => {
+  setup();
+  const land = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  const nextLand = new Date(Date.now() + 8 * 24 * 60 * 60 * 1000).toISOString();
+  setSchedule('0.2.14', { cutAt: land, landBy: land }, 'OP');
+  setSchedule('0.2.15', { cutAt: nextLand, landBy: nextLand }, 'OP');
+  addItem('0.2.15', pullCell('ready', 'P0'));
+  addItem('0.2.15', pullCell('signal-first', 'P1'));
+  const traffic = join(dir, 'traffic.json');
+  writeFileSync(traffic, JSON.stringify({ global: 'green', order: ['signal-first', 'ready'], hold: [] }));
+  const bin = join(dir, 'bin');
+  mkdirSync(bin);
+  const gh = join(bin, 'gh');
+  const mergedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  writeFileSync(gh, `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify(Array.from({ length: 10 }, (_, index) => ({ number: index + 1, mergedAt })))}'\n`);
+  chmodSync(gh, 0o700);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${bin}:${originalPath ?? ''}`;
+  const checkout = join(import.meta.dir, '..', '..');
+  const targetFile = join(checkout, 'src/release-loop/placement.ts');
+  const targetBefore = readFileSync(targetFile);
+  const cmd = new Command();
+  registerReleaseCommands(cmd);
+  const lines: string[] = [];
+  const output = spyOn(console, 'log').mockImplementation((value: string) => { lines.push(String(value)); });
+  try {
+    await cmd.parseAsync(['release', 'pull-forward', '--dry-run', '--traffic', traffic, '--checkout', checkout], { from: 'user' });
+    const selected = lines.filter((line) => line.startsWith('· 드라이런 '));
+    expect(selected[0]).toContain('signal-first 0.2.15 → 0.2.14');
+    expect(selected[1]).toContain('ready 0.2.15 → 0.2.14');
+    expect(lines.some((line) => line.includes('missing'))).toBe(false);
+    expect(checklistHistory('ready').filter((row) => row.field === 'move')).toHaveLength(0);
+    expect(readFileSync(targetFile).equals(targetBefore)).toBe(true);
+    const linkedCheckout = join(dir, 'linked-checkout');
+    mkdirSync(join(linkedCheckout, 'src', 'release-loop'), { recursive: true });
+    expect(spawnSync('git', ['init', linkedCheckout], { encoding: 'utf8' }).status).toBe(0);
+    symlinkSync(targetFile, join(linkedCheckout, 'src', 'release-loop', 'placement.ts'));
+    lines.length = 0;
+    await cmd.parseAsync(['release', 'pull-forward', '--dry-run', '--traffic', traffic, '--checkout', linkedCheckout], { from: 'user' });
+    expect(lines.some((line) => line.startsWith('· 드라이런 '))).toBe(false);
+    await expect(cmd.parseAsync(['release', 'pull-forward', '--dry-run', '--traffic', traffic, '--checkout', dir], { from: 'user' }))
+      .rejects.toThrow('Git 체크아웃 루트');
+    await expect(cmd.parseAsync(['release', 'pull-forward', '--traffic', traffic, '--checkout', checkout], { from: 'user' }))
+      .rejects.toThrow('--dry-run');
+    await expect(cmd.parseAsync(['release', 'pull-forward', '--dry-run', '--traffic', join(dir, 'missing.json'), '--checkout', checkout], { from: 'user' }))
+      .rejects.toThrow('traffic.json');
+  } finally {
+    output.mockRestore();
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+  }
 }, 60_000);

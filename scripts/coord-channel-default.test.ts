@@ -4,10 +4,10 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 
-test('coordination watcher selects #27708 only from the unique current heading and fails closed', () => {
+test('coordination watcher selects #27708 only from the unique last-channel heading and fails closed', () => {
   const manualPath = resolve(import.meta.dir, '../docs/manual/MANUAL-multi-agent-coordination-channel-2026-07-28.md');
   const manual = readFileSync(manualPath, 'utf8');
-  expect(manual).toMatch(/^> ## .*현재 채널 = \[PR #27708\]\(https:\/\/github\.com\/ElanvitalAI\/elanous-agent\/pull\/27708\)/m);
+  expect(manual).toMatch(/^> ## .*마지막 채널 = \[PR #27708\]\(https:\/\/github\.com\/ElanvitalAI\/elanous-agent\/pull\/27708\)/m);
   const fixture = mkdtempSync(resolve(tmpdir(), 'coord-channel-watch-'));
   const scriptDir = resolve(fixture, 'scripts');
   const fixtureManual = resolve(fixture, 'docs/manual/MANUAL-multi-agent-coordination-channel-2026-07-28.md');
@@ -27,7 +27,7 @@ test('coordination watcher selects #27708 only from the unique current heading a
     expect(defaultRun.status).toBe(0);
     expect(defaultRun.stderr).toContain('PR_NUM=27708');
 
-    writeFileSync(fixtureManual, manual.replace('현재 채널 = [PR #27708]', '현재 채널 = [PR #BROKEN]'));
+    writeFileSync(fixtureManual, manual.replace('마지막 채널 = [PR #27708]', '마지막 채널 = [PR #BROKEN]'));
     const brokenRun = run();
     expect(brokenRun.status).toBe(3);
     expect(brokenRun.stderr).toContain('채널 번호를 못 읽었다');
@@ -36,7 +36,7 @@ test('coordination watcher selects #27708 only from the unique current heading a
     const mismatchedRun = run();
     expect(mismatchedRun.status).toBe(3);
 
-    const extraHeading = '\n> ## 현재 채널 = [PR #26146](https://github.com/ElanvitalAI/elanous/pull/26146)\n';
+    const extraHeading = '\n> ## 마지막 채널 = [PR #26146](https://github.com/ElanvitalAI/elanous/pull/26146)\n';
     writeFileSync(fixtureManual, manual.replace('# MANUAL — 멀티 에이전트 조율 채널 감시', `# MANUAL — 멀티 에이전트 조율 채널 감시${extraHeading}`));
     const ambiguousRun = run();
     expect(ambiguousRun.status).toBe(3);

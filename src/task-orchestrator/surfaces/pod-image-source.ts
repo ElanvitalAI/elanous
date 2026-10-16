@@ -14,6 +14,7 @@
  *   이미지는 표준판(elanous-harness)만 — 이 발사 경로는 lite 를 쓰지 않는다.
  */
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../util/spawn-sync-output.js';
 import { debug } from '../../debug/log.js';
 import { memberHasRegistry, registryImageRef, type RemoteRun } from './pod-pool.js';
 
@@ -71,7 +72,7 @@ export function memberPinRegistry(member: PodImageMember, source: Extract<PodIma
 
 /** 실제 조회 — 원격은 pod-pool 의 SSH 판정, 로컬은 이 기계의 docker/curl 로 조회한다. */
 export function podPoolImageLookup(run?: RemoteRun, localRun: (cmd: string, args: readonly string[]) => { status: number | null; stdout: string } = (cmd, args) => {
-  const r = spawnSync(cmd, [...args], { encoding: 'utf8', timeout: 10_000 });
+  const r = spawnSync(cmd, [...args], { encoding: 'utf8', timeout: 10_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   return { status: r.status, stdout: r.stdout ?? '' };
 }): {
   hasRegistry: (member: PodImageMember & { context: string }, registry: string) => boolean;

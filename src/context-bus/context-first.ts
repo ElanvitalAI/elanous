@@ -69,6 +69,19 @@ export function isOperationalQuery(text: string | undefined): boolean {
   return !!text && OPERATIONAL_QUERY.test(text);
 }
 
+/** 칸 3 a59c1c24c — «맥락 먼저 판단»의 공통 게이트 결정: 개시 대기 소진 → 표면 스위치 → 운영 질문 스킵.
+ *  Telegram(maybeSendContextFirst)과 Discord(maybeSendContextFirst)가 같은 한 지점에서 판단한다. */
+export function takeContextFirstOpening(opts: {
+  gate: ReturnType<typeof createContextFirstGate>;
+  key: string;
+  text?: string;
+  enabled?: boolean;
+}): boolean {
+  if (!opts.gate.take(opts.key)) return false;
+  if (opts.enabled === false) return false;
+  return !isOperationalQuery(opts.text);
+}
+
 export function renderContextFirst(
   read: (options: {}, deps?: ContextNowDeps) => ContextNowAnswer,
   deps: ContextNowDeps | undefined,

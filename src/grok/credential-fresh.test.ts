@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import {
   resolveFreshGrokCredential,
   isGrokSubscriptionExpiring,
+  grokSubscriptionExpiryState,
+  GROK_EXPIRY_SOON_WINDOW_MS,
   _resetGrokRefreshCooldownForTesting,
 } from './credential.js';
 
@@ -21,6 +23,7 @@ function writeAuth(expiresAt: string): string {
 
 const FUTURE = new Date(Date.now() + 3_600_000).toISOString();
 const SOON = new Date(Date.now() + 10_000).toISOString();   // 버퍼(120s) 안 — 만료 임박
+const FAR = new Date(Date.now() + 3 * 3_600_000).toISOString();  // 2시간 창 «밖» — 여유
 
 describe('만료 판정 — ⛔ 모르면 「만료」로 단정하지 않는다', () => {
   beforeEach(() => _resetGrokRefreshCooldownForTesting());
@@ -141,5 +144,69 @@ describe('접힌 해석 — 호출자가 «기억할 것»이 없다', () => {
     });
     expect(cred).toBeNull();
     expect(called).toBe(0);
+  });
+});
+
+// ⭐ 칸 CRED-EXPIRY-REFRESH 첫 조각 — 실제 선택된 구독의 expires_at 을 «토큰 없이» 읽어
+//   healthy·expiring(2시간 이내)·unknown 셋을 가리는 순수 판정.
+//   ⛔ 기존 boolean(isGrokSubscriptionExpiring)은 모름을 false 로 접는다 — 여기서 그 둘을 가른다.
+describe('만료 상태 판정 grokSubscriptionExpiryState — 셋 값이 «모름»을 «여유»와 가른다', () => {
+  test('2시간 창 밖이면 healthy', () => {
+    expect(grokSubscriptionExpiryState({ home: writeAuth(FAR) })).toBe('healthy');
+  });
+
+  test('2시간 이내면 expiring', () => {
+    expect(grokSubscriptionExpiryState({ home: writeAuth(SOON) })).toBe('expiring');
+  });
+
+  test('경계 — 정확히 2시간이면 expiring(«이내»는 닫힌 구간)', () => {
+    const fixed = Date.now();
+    const atEdge = new Date(fixed + GROK_EXPIRY_SOON_WINDOW_MS).toISOString();
+    expect(grokSubscriptionExpiryState({ home: writeAuth(atEdge), now: () => fixed })).toBe('expiring');
+  });
+
+  test('경계 — 2시간 + 1초 밖이면 healthy', () => {
+    const fixed = Date.now();
+    const pastEdge = new Date(fixed + GROK_EXPIRY_SOON_WINDOW_MS + 1_000).toISOString();
+    expect(grokSubscriptionExpiryState({ home: writeAuth(pastEdge), now: () => fixed })).toBe('healthy');
+  });
+
+  test('파일이 없으면 unknown — 같은 조건에서 기존 boolean 은 false 다', () => {
+    const home = mkdtempSync(join(tmpdir(), 'grok-none-'));
+    expect(grokSubscriptionExpiryState({ home })).toBe('unknown');
+    expect(isGrokSubscriptionExpiring({ home })).toBe(false);
+  });
+
+  test('expires_at 이 못 읽는 값이면 unknown — 기존 boolean 의 false 와 «구별»된다', () => {
+    const home = writeAuth('not-a-date');
+    expect(grokSubscriptionExpiryState({ home })).toBe('unknown');
+    expect(isGrokSubscriptionExpiring({ home })).toBe(false);
+  });
+
+  test('쓸 수 있는 scope 의 expires_at 이 없으면 unknown — 만료를 지어내지 않는다', () => {
+    const home = mkdtempSync(join(tmpdir(), 'grok-noexp-'));
+    const dir = join(home, '.grok');
+    require('node:fs').mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'auth.json'), JSON.stringify({
+      'https://auth.x.ai::no-exp': { key: 'eyJ-no-expiry', user_id: 'u1' },
+    }));
+    expect(grokSubscriptionExpiryState({ home })).toBe('unknown');
+  });
+
+  // ⭐ boolean 판의 취약점(key 없는 항목에 속음)을 «같은 규칙»으로 예방 — 선택은 readSubscriptionToken.
+  test('key 없는 항목의 «먼» 만료에 속하지 않는다 — 실제 항목 임박이면 expiring', () => {
+    const home = mkdtempSync(join(tmpdir(), 'grok-mixed-state-'));
+    const dir = join(home, '.grok');
+    require('node:fs').mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'auth.json'), JSON.stringify({
+      'https://auth.x.ai::stale-no-key': { expires_at: new Date(Date.now() + 86_400_000).toISOString() },
+      'https://auth.x.ai::real': { key: 'eyJ-real', expires_at: new Date(Date.now() + 10_000).toISOString(), user_id: 'u1' },
+    }));
+    expect(grokSubscriptionExpiryState({ home })).toBe('expiring');
+  });
+
+  test('토큰 없이 — 결과값에 자격 토큰이 «실리지 않는다»', () => {
+    const state = grokSubscriptionExpiryState({ home: writeAuth(FAR) });
+    expect(JSON.stringify(state)).not.toContain('eyJ-fake-jwt');
   });
 });

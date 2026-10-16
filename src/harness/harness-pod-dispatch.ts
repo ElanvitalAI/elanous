@@ -13,17 +13,20 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { selfDevRunsDir } from '../self-dev/run-store.js';
 import { findGitDir } from '../git-fs/locate.js';
+import { runGitCommand } from '../git-fs/runner.js';
 import { logsDbPath } from '../mss/logging/log-store.js';
 import { POD_REEMIT_LOGS_DB_ENV } from '../task-orchestrator/surfaces/pod-ledger-prod-sink.js';
 import { debug } from '../debug/log.js';
 import { ELANOUS_ENTRY_SCRIPT } from '../self-implement/seams.js';
 import { parsePodSourceSpec } from '../task-orchestrator/surfaces/pod-source-spec.js';
-import { declaredGoalType, type GoalType } from '../self-implement/goal-author.js';
+import { declaredGoalType, extractVerbatimOriginalAsk, tracedPathReferences, type GoalType } from '../self-implement/goal-author.js';
+import { declaredNewFilePaths } from '../self-implement/goal-new-paths.js';
 import { appendRunLedgerEntry } from '../self-implement/run-ledger.js';
 import { HARNESS_RUN_ID_ENV } from './harness-space.js';
 import { podMemoryLimitFor, type PodMemoryTier } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { oldDoorInternalEnv } from '../self-dev/old-door.js';
 import { selectPodMemoryTier } from './pod-memory-policy.js';
+import { preflightGoalDoneBoundary } from '../self-dev/dev-pipeline.js';
 
 export interface HarnessPodDispatchInput {
   readonly entrance: 'cli-harness-ask' | 'cli-harness-say';
@@ -73,7 +76,24 @@ export function podOrchestrateArgs(input: HarnessPodDispatchInput, goalFile: str
   ];
 }
 
-type PodDispatchDeps = { run?: (cmd: string, args: readonly string[], env: NodeJS.ProcessEnv) => number | null; readFile?: (path: string) => string; cwd?: string; spawnChild?: typeof spawn; onOutput?: (text: string) => void };
+type PodDispatchDeps = { run?: (cmd: string, args: readonly string[], env: NodeJS.ProcessEnv) => number | null; readFile?: (path: string) => string; cwd?: string; spawnChild?: typeof spawn; onOutput?: (text: string) => void; recordRunLedgerEntry?: typeof appendRunLedgerEntry; nowMs?: number };
+
+/** Default Pod source clones origin HEAD. Never infer its file occupation from an unrelated worktree. */
+function defaultPodSourceHeadAt(root: string): string | undefined {
+  const localResult = runGitCommand(root, ['rev-parse', 'HEAD'], { encoding: 'utf8', timeout: 5_000 });
+  if (localResult.status !== 0 || localResult.signal) return undefined;
+  const local = localResult.stdout.trim();
+  const remoteResult = runGitCommand(root, ['ls-remote', 'origin', 'HEAD'], { encoding: 'utf8', timeout: 5_000 });
+  if (remoteResult.status !== 0 || remoteResult.signal) return undefined;
+  const remote = remoteResult.stdout.trim().split(/\s+/, 1)[0];
+  return /^[0-9a-f]{40}$/.test(remote ?? '') && remote === local ? local : undefined;
+}
+
+function occupiedInTree(root: string, head: string, path: string): boolean | undefined {
+  const result = runGitCommand(root, ['ls-tree', head, '--', path], { encoding: 'utf8', timeout: 5_000 });
+  if (result.status !== 0 || result.signal) return undefined;
+  return result.stdout.trim() !== '';
+}
 
 export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDispatchDeps & { run: NonNullable<PodDispatchDeps['run']> }): number;
 export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps?: PodDispatchDeps): number | Promise<number>;
@@ -111,13 +131,6 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
     tempDir = mkdtempSync(join(runsDir, 'pod-author-'));
     goalFile = join(tempDir, 'sentence.txt');
     writeFileSync(goalFile, input.input, { mode: 0o600 });
-    const runId = env[HARNESS_RUN_ID_ENV]?.trim() || `run-${randomUUID()}`;
-    env[HARNESS_RUN_ID_ENV] = runId;
-    const receipt = { entrance: input.entrance, host: hostname(), runId, authorOnPod: true,
-      sentenceChars: input.input.length, sentenceSha256: createHash('sha256').update(input.input).digest('hex') };
-    debug.log('harness.substrate', 'author-on-pod-receipt', receipt);
-    try { appendRunLedgerEntry({ runId, event: 'author-on-pod-receipt', data: receipt }); }
-    catch (error) { debug.log('harness.substrate', 'author-on-pod-receipt-unwritten', { reason: error instanceof Error ? error.message : String(error) }); }
   } else {
     const goal = input.input;
     goalText = goal;
@@ -127,8 +140,72 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
     goalFile = join(tempDir, 'goal.txt');
     writeFileSync(goalFile, goal, { mode: 0o600 });
   }
+  let pinnedDefaultSource: string | undefined;
+  // AUTHOR-NEW-FILE-PATHS: when the Pod will use this very repository tree, reject a
+  // deterministically occupied new path before creating a Job. A different --source or
+  // --base can have different files; the Pod remains responsible for those cases.
+  if (!input.source && !input.base && input.entrance === 'cli-harness-ask') {
+    const declaration = extractVerbatimOriginalAsk(goalText)?.ask ?? '';
+    const newPaths = declaredNewFilePaths(declaration);
+    const traced = new Set(tracedPathReferences(goalText).map(({ path }) => path.replace(/^\.\//, '')));
+    const candidates = newPaths.filter((path) => traced.has(path));
+    const repositoryRoot = candidates.length > 0 ? findGitDir(cwd)?.root : undefined;
+    const defaultSourceHead = repositoryRoot ? defaultPodSourceHeadAt(repositoryRoot) : undefined;
+    if (candidates.length > 0 && !defaultSourceHead) {
+      debug.log('harness.substrate', 'new-path-preflight-unmeasured', {
+        entrance: input.entrance, reason: 'default-source-head-unverified', candidateCount: candidates.length,
+      });
+    }
+    // The preflight checks this exact tree, so pin the Pod job to the same commit.
+    // Otherwise origin/HEAD could move between this check and the Job's clone.
+    if (candidates.length > 0 && defaultSourceHead) pinnedDefaultSource = `commit:${defaultSourceHead}`;
+    for (const path of candidates) {
+      if (!repositoryRoot || !defaultSourceHead) break; // Unmeasured source parity is never a refusal.
+      const occupied = occupiedInTree(repositoryRoot, defaultSourceHead, path);
+      if (occupied === undefined) {
+        debug.log('harness.substrate', 'new-path-preflight-unmeasured', {
+          entrance: input.entrance, reason: 'default-source-tree-query-failed', candidate: path,
+        });
+        continue;
+      }
+      if (!occupied) continue;
+      const runId = env[HARNESS_RUN_ID_ENV]?.trim() || `run-${randomUUID()}`;
+      const attemptId = randomUUID();
+      const line = `[self-dev] run ${runId} [preflight:new-path-occupied:${attemptId}] 신설 traced path 가 이미 점유됨: ${path} — 골의 신설: 경로를 바로잡아야 한다\n`;
+      try {
+        (deps.recordRunLedgerEntry ?? appendRunLedgerEntry)({ runId, event: 'preflight-refused', data: { kind: 'occupied-new-traced-path', path, entrance: input.entrance, sourceHead: defaultSourceHead, attemptId } });
+      } catch (error) {
+        debug.log('harness.substrate', 'preflight-receipt-unwritten', { reason: String(error) });
+        break; // Without the host receipt, let Pod-side validation decide instead of claiming a host refusal.
+      }
+      deps.onOutput?.(line);
+      if (!deps.onOutput) process.stderr.write(line);
+      if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+      return 2;
+    }
+  }
+  if (input.authorOnPod && input.entrance === 'cli-harness-say') {
+    const runId = env[HARNESS_RUN_ID_ENV]?.trim() || `run-${randomUUID()}`;
+    env[HARNESS_RUN_ID_ENV] = runId;
+    const receipt = { entrance: input.entrance, host: hostname(), runId, authorOnPod: true,
+      sentenceChars: input.input.length, sentenceSha256: createHash('sha256').update(input.input).digest('hex') };
+    debug.log('harness.substrate', 'author-on-pod-receipt', receipt);
+    try { (deps.recordRunLedgerEntry ?? appendRunLedgerEntry)({ runId, event: 'author-on-pod-receipt', data: receipt }); }
+    catch (error) { debug.log('harness.substrate', 'author-on-pod-receipt-unwritten', { reason: error instanceof Error ? error.message : String(error) }); }
+  }
+  // This is the common host-side Pod launch boundary for harness ask/say and
+  // dev ask. A say sentence is the source request; an ask file is the GOAL.
+  // Check before the orchestrator child can place or create a Pod Job.
+  try {
+    preflightGoalDoneBoundary({ file: goalFile }, goalText, env.ELANOUS_TASK_CARD_ID, input.entrance,
+      input.entrance === 'cli-harness-say' ? 'request' : 'goal', deps.nowMs ?? Date.now());
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+    return 2;
+  }
   const goalChars = goalText.length;
-  const args = podOrchestrateArgs(input, goalFile);
+  const args = podOrchestrateArgs(pinnedDefaultSource ? { ...input, source: pinnedDefaultSource } : input, goalFile);
   debug.log('harness.substrate', 'goal-file', { entrance: input.entrance, mode: tempDir ? 'temp' : 'path' });
   const goalType = input.goalType ?? declaredGoalType(goalText);
   // A process-level memory tier is already an explicit selection; do not replace it with a goal-type default.

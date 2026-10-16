@@ -489,7 +489,17 @@ async function executeHarnessSelfRun(
   runId: string,
   startDraftTriage: typeof import('./self-dev/dev-cli.js')['startDraftTriage'],
   startDraftTriageOptions?: RunDevAskStartDraftTriageOptions,
+  entranceId?: EntranceId,
 ): Promise<Awaited<ReturnType<RunDevAskRunDevPipeline>>> {
+  // TA harness say/ask may be decomposed into parallel text goals before
+  // runDevPipeline reads the authored file. Check the original GOAL here,
+  // before any orchestrator or Pod child can be dispatched.
+  const isGoalFile = existsSync(input);
+  if (process.env.ELANOUS_TASK_CARD_ID?.trim() || isGoalFile) {
+    const { preflightGoalDoneBoundary } = await import('./self-dev/dev-pipeline.js');
+    preflightGoalDoneBoundary({ file: isGoalFile ? input : '<harness request>' }, isGoalFile ? readFileSync(input, 'utf8') : input,
+      process.env.ELANOUS_TASK_CARD_ID, entranceId, isGoalFile ? 'goal' : 'request');
+  }
   startDraftTriage(runId, startDraftTriageOptions);
   // 정지 요청의 «신선도» 기준 — 첫 런 «전»에 잰다(첫 런 도중의 정지도 이 호출의 것이다).
   const invocationStartedAtMs = Date.now();
@@ -651,6 +661,11 @@ async function runDevAskFromAskFile(askPath: string, opts: HarnessAskSayChildLlm
     },
   );
   if (flowResult.kind !== 'launch') {
+    // ⭐ 프리플라이트 거절은 «자식 결과» 봉투로 마지막 JSON 행을 남긴다 — Pod 원장(pod-failure-reason.nestedPodResult)이
+    //   {ok, kind, result:{stage, blockers}} 중첩 행에서 사유 코드·검사 이름·경로를 읽는다. 나머지 중단은 기존대로 조용히 exit(1).
+    if (opts.json && flowResult.kind === 'stopped-by-preflight') {
+      await writeStdoutJson(`${JSON.stringify({ ok: false, kind: 'self', result: { stage: 'preflight-blocked', ok: false, blockers: flowResult.blockers } })}\n`);
+    }
     runDevAskFromGoalFileDeps.setExitCode(1);
     return;
   }
@@ -677,6 +692,7 @@ async function runDevAskFromAskFile(askPath: string, opts: HarnessAskSayChildLlm
     identity.runId,
     startDraftTriage,
     startDraftTriageOptions,
+    CLI_HARNESS_ASK_ENTRANCE.id,
   );
   const ok = devResultOk(result);
   if (opts.json) {
@@ -782,6 +798,7 @@ async function runDevAskFromGoalFile(goalPath: string, opts: HarnessAskSayChildL
     identity.runId,
     startDraftTriage,
     startDraftTriageOptions,
+    CLI_HARNESS_ASK_ENTRANCE.id,
   );
   const ok = devResultOk(result);
   if (opts.json) {
@@ -886,6 +903,7 @@ async function runDevSayFromWords(
     identity.runId,
     startDraftTriage,
     startDraftTriageOptions,
+    entrance,
   );
   const ok = devResultOk(result);
   if (opts.json) {
@@ -4319,10 +4337,15 @@ selfCmd
   .option('--base <ref>', '커밋됐지만 PR 없는 변경의 비교 기준(ref...HEAD)')
   .option('--pr <number>', '열린 PR 번호에서 gh pr view files로 변경 파일을 읽는다')
   .option('--shards [number]', '메모리 예산에 맞춰 시험을 별도 프로세스로 분할한다 (기본 2)')
+  .option('--fixed-shard-distribution', '--shards N 과 함께만: RSS 사전 측정 없이 정렬된 파일을 N 조각에 라운드로빈 고정 배정한다(opt-in · 메모리 보증 아님 · 조각 타임아웃/OOM = unmeasured)')
+  .option('--include-importers', '변경 모듈을 가져오는 importer 시험도 실행한다 (기본 caller 한도 밖까지)')
   .option('--remote [host]', 'GATE-REMOTE — 같은 커밋을 원격 호스트(기본 config gateRemote.host=node-b)에서 돌리고 결과만 가져온다(깨끗한 트리 · --pr 은 로컬)')
   .option('--local', '원격 자동 분배(로컬 1분 부하 > gateRemote.loadThreshold=20)를 끄고 로컬에서 돌린다')
-  .action(async (opts: { changed?: boolean; base?: string; pr?: string; shards?: string | boolean; remote?: string | boolean; local?: boolean }) => {
+  .option('--artifact-dir <dir>', '조각별 지금/기준 JUnit ⊕ summary.json 을 이 디렉토리에 남긴다(판정 불변 · JUnit 은 --shards 경로만 · 원격 실행이면 그 호스트에서 가져온다)')
+  .action(async (opts: { changed?: boolean; base?: string; pr?: string; shards?: string | boolean; fixedShardDistribution?: boolean; includeImporters?: boolean; remote?: string | boolean; local?: boolean; artifactDir?: string }) => {
     if (!opts.changed && opts.shards === undefined) { ui.error('self gate requires --changed or --shards'); process.exitCode = 2; return; }
+    if (opts.fixedShardDistribution && opts.shards === undefined) { ui.error('self gate: --fixed-shard-distribution requires --shards <n>'); process.exitCode = 2; return; }
+    if (opts.artifactDir !== undefined && !opts.artifactDir.trim()) { ui.error('self gate: --artifact-dir needs a non-empty directory'); process.exitCode = 2; return; }
     // The root strips `--local` from argv anywhere (remote-bookmark attach · src/cli/remote-resolve.ts) before Commander
     // sees it, so this subcommand reads it from the untouched process.argv.
     opts.local = !!opts.local || process.argv.slice(2).includes('--local');
@@ -4332,10 +4355,13 @@ selfCmd
       if (!isValidGateHost(opts.remote)) { ui.error(`self gate: invalid --remote host: ${opts.remote}`); process.exitCode = 2; return; }
     }
     const shards = opts.shards === undefined ? undefined : opts.shards === true ? 2 : Number(opts.shards);
+    let ranLocal = false;
+    let remoteArtifacts: { dir: string; fetch?: { ok: true; summaryPath: string; junitFiles: string[]; remoteDirKept: boolean } | { ok: false; reason: string } } | { unsupported: true } | undefined;
     const runLocal = () => {
+      ranLocal = true;
       try {
         const { runSelfGateCli } = require('./self-implement/gate-cli.js') as typeof import('./self-implement/gate-cli.js');
-        const result = runSelfGateCli(process.cwd(), { base: opts.base, pr: opts.pr, shards });
+        const result = runSelfGateCli(process.cwd(), { base: opts.base, pr: opts.pr, shards, ...(opts.fixedShardDistribution ? { fixedShardDistribution: true } : {}), includeImporterTests: !!opts.includeImporters, ...(opts.artifactDir !== undefined ? { artifactDir: opts.artifactDir } : {}) });
         console.log(result.lines.join('\n'));
         return result.exitCode;
       } catch (error) {
@@ -4350,23 +4376,74 @@ selfCmd
       if (topLevel.status !== 0) throw new Error(`git rev-parse --show-toplevel failed: ${topLevel.stderr.trim() || `rc=${topLevel.status}`}`);
       const repo = topLevel.stdout.trim();
       // Only a committed --base range is reproducible on another host: the default mode measures uncommitted files, --pr
-      // reads files through gh on this host, and the remote checkout runs from the repository root — those stay local.
+      // reads files through gh on this host, and the remote checkout runs from the repository root — automatic placement
+      // falls back locally; an explicit --remote reports that this check was not measured.
       const { realpathSync } = await import('node:fs');
       const localOnlyReason = opts.pr ? 'self gate --pr reads PR files through gh on this host'
         : !opts.base ? 'self gate without --base measures uncommitted files on this host'
         : realpathSync(repo) !== realpathSync(process.cwd()) ? 'self gate run from a sub-directory' : undefined;
+      // SIDE-VERIFY-GATE-SHARDS ② — the host writes its artifacts outside its scratch tree (which its trap removes) and we
+      // fetch them back after the run. Only when the measured commit knows --artifact-dir: an unknown option would kill the
+      // remote CLI and change the verdict itself.
+      if (opts.artifactDir !== undefined) {
+        const { remoteCommitSupportsArtifactDir, newRemoteArtifactDir } = await import('./self-implement/gate-artifacts.js');
+        remoteArtifacts = remoteCommitSupportsArtifactDir(repo) ? { dir: newRemoteArtifactDir() } : { unsupported: true };
+      }
+      const remoteArtifactArgs = remoteArtifacts && 'dir' in remoteArtifacts ? ['--artifact-dir', remoteArtifacts.dir] : [];
       // origin/main is pinned to this machine's origin/main on the host; any other base is passed as its resolved sha.
       const remoteArgv = (sha: (ref: string) => string) => ['bun', 'bin/elanous.mjs', 'self', 'gate', '--local', ...(opts.changed ? ['--changed'] : []),
-        ...(opts.base ? ['--base', opts.base === 'origin/main' ? opts.base : sha(opts.base)] : []), ...(shards !== undefined ? ['--shards', String(shards)] : [])];
+        ...(opts.base ? ['--base', opts.base === 'origin/main' ? opts.base : sha(opts.base)] : []), ...(shards !== undefined ? ['--shards', String(shards)] : []),
+        // A measured commit without this option rejects it (exit ≠ 0) — read as not passed, never as a silent measured run.
+        ...(opts.fixedShardDistribution ? ['--fixed-shard-distribution'] : []),
+        ...(opts.includeImporters ? ['--include-importers'] : []), ...remoteArtifactArgs];
+      const { gateHostReservationRoot } = await import('./release-loop/gate-host-reservation.js');
       process.exitCode = await dispatchHeavyCheck({
-        tool: 'self-gate', repo, installPwa: true, remoteArgv, refs: opts.base ? [opts.base] : [],
+        tool: 'self-gate', repo, installPwa: true, remoteArgv, refs: opts.base ? [opts.base] : [], reservationRoot: gateHostReservationRoot(),
         localOnlyReason,
+        explicitRemoteOnly: opts.remote !== undefined, reportRemoteHost: true,
         flags: { remote: typeof opts.remote === 'string' ? opts.remote : opts.remote ? true : undefined, local: !!opts.local },
         runLocal,
+        ...(remoteArtifacts && 'dir' in remoteArtifacts && opts.artifactDir !== undefined ? {
+          onRemoteOutcome: ((outcome, host, runner) => {
+            const { fetchRemoteGateArtifacts, remoteArtifactCleanupScript, resolveArtifactDir } = require('./self-implement/gate-artifacts.js') as typeof import('./self-implement/gate-artifacts.js');
+            const target = remoteArtifacts as { dir: string; fetch?: { ok: true; summaryPath: string; junitFiles: string[]; remoteDirKept: boolean } | { ok: false; reason: string } };
+            if (outcome.kind === 'ran') {
+              target.fetch = fetchRemoteGateArtifacts({ host, remoteDir: target.dir, localDir: resolveArtifactDir(opts.artifactDir!, process.cwd()), ssh: runner.ssh });
+            } else if (outcome.kind === 'infra') {
+              // The run may have started before it broke — remove the host-side dir; automatic placement's local fallback writes its own.
+              try { runner.ssh(host, remoteArtifactCleanupScript(target.dir), 30_000); } catch { /* best effort */ }
+            }
+          }) satisfies NonNullable<import('./self-implement/gate-remote.js').DispatchOptions['onRemoteOutcome']>,
+        } : {}),
       });
     } catch (error) {
-      ui.error(`self gate dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
-      process.exitCode = runLocal();
+      const reason = error instanceof Error ? error.message : String(error);
+      if (opts.remote !== undefined) {
+        ui.error(`self gate remote unmeasured — ${reason.replace(/\s+/g, ' ').trim()}`);
+        process.exitCode = 1;
+      } else {
+        ui.error(`self gate dispatch failed: ${reason}`);
+        process.exitCode = runLocal();
+      }
+    }
+    // 원격에서 돌았으면 그 호스트의 산출을 가져와 같은 꼴로 썼다 — 못 가져왔으면 «조용히» 비우지 않고 summary 에 이유를 적는다(판정 불변).
+    if (opts.artifactDir !== undefined && !ranLocal) {
+      const fetched = remoteArtifacts && 'dir' in remoteArtifacts ? remoteArtifacts.fetch : undefined;
+      try {
+        if (fetched?.ok) {
+          console.log(`artifacts: ${fetched.summaryPath} (junit ${fetched.junitFiles.length} · fetched from remote)`);
+          if (fetched.remoteDirKept) console.log(`⚠ artifacts: 원격 산출 디렉토리를 못 지웠다 — ${(remoteArtifacts as { dir: string }).dir} (판정은 그대로다)`);
+        }
+        else {
+          const reason = remoteArtifacts && 'unsupported' in remoteArtifacts ? 'remote-unsupported' as const : 'remote-fetch-failed' as const;
+          if (reason === 'remote-fetch-failed') console.log(`⚠ artifacts: 원격 산출을 못 가져왔다 — ${fetched && !fetched.ok ? fetched.reason : 'no remote fetch ran'} (판정은 그대로다)`);
+          const { writeRemoteUnavailableGateArtifacts } = await import('./self-implement/gate-artifacts.js');
+          const written = writeRemoteUnavailableGateArtifacts(opts.artifactDir, process.cwd(), opts.base, Number(process.exitCode ?? 0), reason);
+          console.log(`artifacts: ${written.summaryPath} (junit 0 · unavailable=${reason})`);
+        }
+      } catch (error) {
+        console.log(`⚠ artifacts: ${opts.artifactDir} 에 못 썼다 — ${error instanceof Error ? error.message : String(error)} (판정은 그대로다)`);
+      }
     }
   });
 
@@ -7505,7 +7582,7 @@ const selfDevCmd = program
             cfg: reloadUserConfig(),
             userText: text,
             explicitSessionId: chat.session,
-            reuseActive: !chat.forceNew,
+            reuseActive: chat.continueActive === true,
             forceNew: chat.forceNew === true,
             json: chat.json === true,
             enableTools: chat.enableTools,
@@ -7790,7 +7867,7 @@ configCmd
   .command('set <path> <value>')
   .description('Set a dotted config path. Value is parsed as JSON when possible.')
   .option('--no-backup', "Don't write config.json.bak before saving")
-  .action((path: string, value: string, opts: { backup?: boolean }) => {
+  .action(async (path: string, value: string, opts: { backup?: boolean }) => {
     const parsed = parseConfigValue(value);
     const cfg = getUserConfig() as unknown as Record<string, unknown>;
     const previousProvider = getConfigPath(cfg, 'llm.provider');
@@ -7809,6 +7886,7 @@ configCmd
       : undefined;
 
     if (opts.backup !== false) backupUserConfig(userConfigPath());
+    const prev = getConfigPath(cfg, path); // CFG-STORE2 감사 이력 — 변경 «전» 값
     setConfigPath(cfg, path, parsed);
     if (credential?.apiKey && (credential.source === 'rotation' || credential.source === 'env')) {
       setConfigPath(cfg, 'llm.apiKey', credential.apiKey);
@@ -7822,6 +7900,8 @@ configCmd
       console.error(`⚠️ set ${path} — 저장 후 값 미반영(직렬화 드롭). 읽힌값=${JSON.stringify(after)}`);
       process.exit(1);
     }
+    // CFG-STORE2 — 저장 «성공» 뒤 감사 이력 한 줄 · fail-open(기록 실패가 set 을 막지 않는다).
+    try { (await import('./cli/config-audit.js')).recordConfigChange({ key: path, prev, next: parsed, why: 'config set' }); } catch (err) { ui.warn(`config 감사 이력 기록 실패(무시): ${err instanceof Error ? err.message : String(err)}`); }
     if (credential?.apiKey && (credential.source === 'rotation' || credential.source === 'env')) {
       ui.info(`provider credential updated: ${parsed} via ${credential.source} (${credential.apiKey.length} chars)`);
     } else if (credential?.source === 'none' && !isKeylessProvider(nextProvider)) {
@@ -7836,9 +7916,10 @@ configCmd
   .command('unset <path>')
   .description('Remove a dotted config path (set 의 역 · 배열 인덱스 지원). 이미 없으면 no-op.')
   .option('--no-backup', "Don't write config.json.bak before saving")
-  .action((path: string, opts: { backup?: boolean }) => {
+  .action(async (path: string, opts: { backup?: boolean }) => {
     const cfg = getUserConfig() as unknown as Record<string, unknown>;
-    if (getConfigPath(cfg, path) === undefined) {
+    const prev = getConfigPath(cfg, path); // CFG-STORE2 감사 이력 — 삭제 «전» 값
+    if (prev === undefined) {
       ui.info(`unset ${path} — 이미 없음 (no-op)`);
       return;
     }
@@ -7852,6 +7933,8 @@ configCmd
       console.error(`⚠️ unset ${path} — 삭제 후에도 값 잔존. 남은값=${JSON.stringify(after)}`);
       process.exit(1);
     }
+    // CFG-STORE2 — 삭제 저장 «성공» 뒤 감사 이력 한 줄 · fail-open(기록 실패가 unset 을 막지 않는다).
+    try { (await import('./cli/config-audit.js')).recordConfigChange({ key: path, prev, why: 'config unset' }); } catch (err) { ui.warn(`config 감사 이력 기록 실패(무시): ${err instanceof Error ? err.message : String(err)}`); }
     ui.info(`unset ${path}`);
   });
 
@@ -8050,6 +8133,7 @@ program
       reuseActive: opts.reuse === true,
       forceNew: false,
       json: opts.json === true,
+      surface: 'ask',
     });
   });
 
@@ -8900,15 +8984,26 @@ function announceChatToolsCompatibility(): void {
 
 // ── chat (single-turn helper, non-TUI) ──
 program
-  .command('chat <text...>')
-  .description('Send one message in the active session (or a new one) and print the reply')
-  .option('--new', 'Force a new session instead of using the active one')
-  .option('--session <id>', 'Continue an explicit session (id or unique prefix). Overrides --new and active session.')
+  .command('chat [text...]')
+  .description('Send one message in a new session (or a continued one with --continue/--resume/--session) and print the reply')
+  .option('--new', 'Start a new session (the default since 0.2.31 — kept for compatibility)')
+  .option('--continue', 'Continue the active session instead of starting a new one')
+  .option('--resume [id]', 'Continue a session: the given id (or unique prefix), or the active session when no id is given. A word after --resume that is not session-id shaped (hex uuid) is read as the prompt, not the id.')
+  .option('--session <id>', 'Continue an explicit session (id or unique prefix). Overrides --new, --continue and --resume.')
   .option('--json', 'Emit a single JSON line {sessionId, provider, model, reply, logPath, budget} instead of streaming text + ui.info trailer. Stable shape for LLM self-spawn.')
   .option('--tools', 'Enable the tool-loop path (Read/Grep/Glob/ListDir/Edit/Write + Bash). Default off — chat is text-only by default for backward compatibility. `elanous agent` is a thin wrapper that flips this on.')
   .option('--goal-loop', 'Arm the across-turn goal loop (runGoalLoop): wrap the tool-loop so the model keeps iterating until the goal is complete (GOAL-COMPLETE evidence gate) or maxIterations. Requires --tools. Same engine as ACP/dashboard (재발명 없음). Config `llm.goalLoop.enabled` also arms it.')
   .option('--implement', 'Bypass the harness goal-loop guard for the legacy implementation child entrypoint')
-  .action(async (parts: string[], opts: { new?: boolean; session?: string; json?: boolean; tools?: boolean; goalLoop?: boolean; implement?: boolean }) => {
+  .action(async (rawParts: string[], opts: { new?: boolean; continue?: boolean; resume?: string | boolean; session?: string; json?: boolean; tools?: boolean; goalLoop?: boolean; implement?: boolean }) => {
+    // TUI-H8-FOLLOW ② — `chat --resume "질문"` 에서 Commander 가 질문 첫 낱말을 세션 id 로 먹지 않게.
+    const { splitResumeArgument } = await import('./session/session-start.js');
+    const split = splitResumeArgument(opts.resume, rawParts ?? [], 'chat', process.argv.slice(2));
+    opts.resume = split.resume;
+    const parts = split.parts;
+    if (parts.length === 0) {
+      console.error("error: missing required argument 'text'");
+      process.exit(1);
+    }
     if (getHarnessSpace() && opts.tools && opts.goalLoop && !opts.implement) {
       process.stderr.write('Harness chat goal-loop requires `dev --implement`; use that implementation entrypoint instead.\n');
       process.exitCode = 1;
@@ -8951,7 +9046,7 @@ program
         cfg: refreshed,
         userText: text,
         explicitSessionId: chat.session,
-        reuseActive: !chat.forceNew,
+        reuseActive: chat.continueActive === true,
         forceNew: chat.forceNew === true,
         json: chat.json === true,
         enableTools: chat.enableTools,
@@ -8963,8 +9058,10 @@ program
 // ── repl (sticky multi-turn REPL) ──
 program
   .command('repl')
-  .description('Sticky multi-turn REPL — same session across turns, no per-turn process boot. Drives chat / agent / scenario from one shell. Uses --new for a fresh session, --session <id> to resume, --scenario <yaml> for a scripted run, JSONL on stdin for piped automation.')
-  .option('--new', 'Force a new session at boot instead of resuming the active one')
+  .description('Sticky multi-turn REPL — same session across turns, no per-turn process boot. Drives chat / agent / scenario from one shell. Boots a new session by default; --continue/--resume continue the active one, --session <id> resumes an explicit one, --scenario <yaml> for a scripted run, JSONL on stdin for piped automation.')
+  .option('--new', 'Start a new session at boot (the default since 0.2.31 — kept for compatibility)')
+  .option('--continue', 'Continue the active session at boot instead of starting a new one')
+  .option('--resume [id]', 'Continue a session at boot: the given id (or unique prefix), or the active session when no id is given')
   .option('--session <id>', 'Resume an explicit session (id or unique prefix)')
   .option('--scenario <path>', 'Run a YAML multi-turn scenario before handing back to interactive (or exit)')
   .option('--replay <session-id>', 'Re-execute the user prompts from a previous session in a fresh REPL run. User prompts are extracted in order and fed through the same dispatcher as --scenario; assistant/tool messages and attachments are dropped. Mutually exclusive with --scenario.')
@@ -8975,6 +9072,8 @@ program
   .option('--stdin-jsonl', 'Force JSONL-on-stdin mode even when stdin is a TTY (useful for testing automation paths)')
   .action(async (opts: {
     new?: boolean;
+    continue?: boolean;
+    resume?: string | boolean;
     session?: string;
     scenario?: string;
     replay?: string;
@@ -8999,8 +9098,9 @@ program
     const exitAfterScenario = opts.exitAfterScenario === undefined ? exitDefault : opts.exitAfterScenario;
     const code = await runRepl({
       cfg: refreshed,
-      initialSessionId: opts.session,
+      initialSessionId: opts.session ?? (typeof opts.resume === 'string' ? opts.resume : undefined),
       forceNew: opts.new === true,
+      continueActive: opts.continue === true || opts.resume === true,
       enableTools: opts.tools !== false,
       scenarioPath: opts.scenario,
       replaySessionId: opts.replay,
@@ -11432,7 +11532,14 @@ voiceCmd
   });
 
 // ── Default: Dashboard (no subcommand) ──
-const DASHBOARD_FLAGS = new Set(['--debug', '--chat-only', '--chat', '--yolo', '--benchmark']);
+const DASHBOARD_FLAGS = new Set(['--debug', '--chat-only', '--chat', '--yolo', '--benchmark', '--continue']);
+
+/** 대표 #73 — `--resume` 뒤 토큰이 세션 id 인가(없거나 다른 플래그면 «id 없는 이어하기» = 최신 세션). */
+export function rootResumeIdAt(rawArgs: readonly string[], resumeFlagIdx: number): string | undefined {
+  if (resumeFlagIdx < 0) return undefined;
+  const next = rawArgs[resumeFlagIdx + 1];
+  return next !== undefined && !next.startsWith('-') ? next : undefined;
+}
 
 export function filterDashboardArgs(rawArgs: readonly string[], resumeFlagIdx?: number): string[] {
   const rootResumeFlagIdx = resumeFlagIdx ?? rawArgs.findIndex((arg, index) =>
@@ -11447,7 +11554,8 @@ export function filterDashboardArgs(rawArgs: readonly string[], resumeFlagIdx?: 
   return rawArgs.filter((a, i) => {
     if (!leadsWithSubcommand && (DASHBOARD_FLAGS.has(a) || a === '--rich')) return false;
     if (!leadsWithSubcommand && i === rootResumeFlagIdx) return false;
-    if (!leadsWithSubcommand && rootResumeFlagIdx >= 0 && i === rootResumeFlagIdx + 1) return false;
+    if (!leadsWithSubcommand && rootResumeFlagIdx >= 0 && i === rootResumeFlagIdx + 1
+      && rootResumeIdAt(rawArgs, rootResumeFlagIdx) !== undefined) return false;
     return true;
   });
 }
@@ -11645,13 +11753,32 @@ async function main(): Promise<void> {
     //    🩹 옛 손버릇은 `readRemoteFlag` 쪽 오류 문면이 «갈 곳을 말해» 받는다.
     arg === '--resume' && rawArgs.slice(0, index).every((prior) => prior.startsWith('-')),
   );
-  const resumeFromFlag = resumeFlagIdx >= 0 ? rawArgs[resumeFlagIdx + 1] : undefined;
+  const resumeFromFlag = rootResumeIdAt(rawArgs, resumeFlagIdx);
   // Step 5 PR γ — env read routes through readDeprecatedEnv so the
   // user gets a one-shot deprecation warning when the env override
   // drives the resume path. CLI flag wins outright (no warning).
   const { readDeprecatedEnv: readDeprecatedEnvForResume } = await import('./control-client/env-resolver.js');
-  const resumeFromEnv = readDeprecatedEnvForResume('ELANOUS_RESUME_SESSION').value;
-  const resumeSessionId = (resumeFromFlag ?? resumeFromEnv ?? '').trim() || undefined;
+  // 대표 #73 — 인자 없는 `elanous` 는 새 세션. 이어하기는 `--resume <id>` · id 없는 `--resume` · `--continue`(= 최신 세션)일 때만.
+  const leadsWithSubcommandForResume = rawArgs.length > 0 && !rawArgs[0]!.startsWith('-');
+  const continueLatest = !leadsWithSubcommandForResume
+    && (rawArgs.includes('--continue') || (resumeFlagIdx >= 0 && resumeFromFlag === undefined));
+  // 우선순위: `--resume <id>` > `--continue`·id 없는 `--resume`(최신) > (폐기 예정) ELANOUS_RESUME_SESSION.
+  //   ⛔ 명시 인자가 있으면 환경변수가 이기지 않는다(TUI-H8 r1 must-fix).
+  const { resolveLatestSessionId, resolveRootResumeSessionId } = await import('./session/session-start.js');
+  const rootResume = resolveRootResumeSessionId({
+    ...(resumeFromFlag !== undefined ? { flagId: resumeFromFlag } : {}),
+    continueLatest,
+    // 명시 인자가 있으면 env 를 «읽지도» 않는다(폐기 경고가 명시 이어하기에 섞이지 않게).
+    readEnvId: () => readDeprecatedEnvForResume('ELANOUS_RESUME_SESSION').value ?? null,
+    latest: () => resolveLatestSessionId({
+      activeSessionId: () => getActiveSessionId(),
+      latestSessionId: () => listSessions({ limit: 1 })[0]?.id ?? null,
+      // TUI-H8-FOLLOW ① — 활성 표지가 사라진 세션이면 최신 세션으로(#28509 리뷰 should-fix).
+      sessionExists: (id) => loadSession(id) !== null,
+    }),
+  });
+  if (rootResume.source === 'continue-none') console.log('[elanous] --continue: 이어갈 세션이 없다 — 새 세션으로 시작한다');
+  const resumeSessionId = rootResume.sessionId;
 
   // user-config can opt into benchmark mode persistently
   // (`dashboard.benchmark: true`) so callers don't have to retype the

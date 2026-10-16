@@ -5,7 +5,8 @@ import { handleOnboardingRefusal, needsOnboarding, runOnboarding } from '../onbo
 import { runTurn, ensureCliSession, sessionBudget } from '../session/chat.js';
 import { suggestProjectForFolder } from '../project/project-store.js';
 import { NoLlmProviderAvailableError, noProviderAvailableMessage } from '../llm.js';
-import { resolveSessionId, getActiveSessionId, setActiveSessionId } from '../session/index.js';
+import { resolveSessionId, getActiveSessionId, setActiveSessionId, loadSession, listSessions } from '../session/index.js';
+import { decideSessionStart, observeSessionStart, splitResumeArgument } from '../session/session-start.js';
 import { getHarnessSpace } from '../harness/harness-space.js';
 import { encodeDetachedProgressFrame } from '../harness/dispatch-detached.js';
 import type { FeedbackEnvelope } from '../feedback/envelope.js';
@@ -65,12 +66,18 @@ export function registerAgentCommands(program: Command): void {
   .command('agent')
   .argument('[text...]', 'Prompt text for the single-turn agent.')
   .description('Single-turn agent — same as `chat` but with the tool loop on by default (Read/Grep/Glob/ListDir/Edit/Write + Bash). Use this when the LLM needs to inspect files / run commands / debug itself.')
-  .option('--new', 'Force a new session instead of using the active one')
-  .option('--session <id>', 'Continue an explicit session (id or unique prefix). Overrides --new and active session.')
+  .option('--new', 'Start a new session (the default since 0.2.31 — kept for compatibility)')
+  .option('--continue', 'Continue the active session instead of starting a new one')
+  .option('--resume [id]', 'Continue a session: the given id (or unique prefix), or the active session when no id is given. A word after --resume that is not session-id shaped (hex uuid) is read as the prompt, not the id.')
+  .option('--session <id>', 'Continue an explicit session (id or unique prefix). Overrides --new, --continue and --resume.')
   .option('--json', 'Emit a single JSON line {sessionId, provider, model, reply, logPath, budget} instead of streaming text + ui.info trailer. Stable shape for LLM self-spawn.')
   .option('--no-tools', 'Disable the tool loop and fall back to text-only chat (for benchmarking / parity with `chat`).')
-  .action(async (parts: string[], opts: { new?: boolean; session?: string; json?: boolean; tools?: boolean }) => {
-    if (!parts || parts.length === 0) {
+  .action(async (rawParts: string[], opts: { new?: boolean; continue?: boolean; resume?: string | boolean; session?: string; json?: boolean; tools?: boolean }) => {
+    // TUI-H8-FOLLOW ② — `agent --resume "질문"` 에서 Commander 가 질문 첫 낱말을 세션 id 로 먹지 않게.
+    const split = splitResumeArgument(opts.resume, rawParts ?? [], 'agent', process.argv.slice(2));
+    opts.resume = split.resume;
+    const parts = split.parts;
+    if (parts.length === 0) {
       console.error("error: missing required argument 'text'");
       process.exit(1);
     }
@@ -105,10 +112,12 @@ export function registerAgentCommands(program: Command): void {
     await runChatTurnCli({
       cfg: refreshed,
       userText: parts.join(' '),
-      explicitSessionId: opts.session,
-      reuseActive: opts.new !== true,
+      explicitSessionId: opts.session ?? (typeof opts.resume === 'string' ? opts.resume : undefined),
+      // 대표 #73 — 인자 없음 = 새 세션. 이어하기는 `--continue`/`--resume` 명시일 때만.
+      reuseActive: opts.continue === true || opts.resume === true,
       forceNew: opts.new === true,
       json: opts.json === true,
+      surface: 'agent',
       // commander stores --no-tools as `tools: false`, plain absence as undefined → default true here.
       enableTools: opts.tools !== false,
     });
@@ -385,11 +394,13 @@ tierCmd
 
 /** Single-turn CLI driver shared by `elanous ask` and `elanous chat`.
  *
- *  Resolution order for sessionId:
- *    1. opts.explicitSessionId (`--session`)  — wins, validates against
+ *  Resolution order for sessionId (`decideSessionStart` · 대표 #73 기본 = 새 세션):
+ *    1. opts.explicitSessionId (`--session`/`--resume <id>`) — wins, validates against
  *       resolveSessionId so a 6-char prefix works
- *    2. active session                         — when reuseActive
- *    3. fresh session                          — otherwise
+ *    2. fresh session                          — when forceNew
+ *    3. active session                         — only when reuseActive (`--continue`/`--resume`)
+ *    4. fresh session                          — otherwise (the default)
+ *  Every decision emits `session`/`start` {surface, origin, reason}.
  *
  *  When `json` is true, the function suppresses the streaming text +
  *  ui.info trailer and instead emits exactly ONE JSON line on stdout
@@ -402,9 +413,12 @@ export async function runChatTurnCli(opts: {
   cfg: ReturnType<typeof reloadUserConfig>;
   userText: string;
   explicitSessionId: string | undefined;
+  /** 활성 세션 이어하기를 «명시로» 요청했나(`--continue`/`--resume`). 기본 false = 새 세션. */
   reuseActive: boolean;
   forceNew: boolean;
   json: boolean;
+  /** 관측용 표면 이름(`session`/`start`). 기본 'chat'. */
+  surface?: 'chat' | 'agent' | 'ask';
   /** When true, build a CORE-native + Bash tool catalog and route
    *  through streamLLMWithTools so the LLM can drive multi-turn
    *  exploration (file reads, grep, shell). Default false — CLI
@@ -429,11 +443,25 @@ export async function runChatTurnCli(opts: {
       process.exit(1);
     }
     resolvedSessionIdHint = id;
-  } else if (opts.reuseActive && !opts.forceNew) {
-    resolvedSessionIdHint = getActiveSessionId() ?? undefined;
   }
+  const startDecision = decideSessionStart({
+    ...(resolvedSessionIdHint ? { explicitSessionId: resolvedSessionIdHint } : {}),
+    continueActive: opts.reuseActive,
+    forceNew: opts.forceNew,
+    activeSessionId: () => getActiveSessionId(),
+    // TUI-H8-FOLLOW ① — 활성 표지가 사라진 세션이면 최신 세션으로.
+    sessionExists: (id) => loadSession(id) !== null,
+    latestSessionId: () => listSessions({ limit: 1 })[0]?.id ?? null,
+  });
+  resolvedSessionIdHint = startDecision.sessionIdHint;
   const session = ensureCliSession(opts.cfg, resolvedSessionIdHint);
   setActiveSessionId(session.id);
+  observeSessionStart({
+    surface: opts.surface ?? 'chat',
+    origin: resolvedSessionIdHint && session.id === resolvedSessionIdHint ? startDecision.origin : 'new',
+    reason: resolvedSessionIdHint && session.id !== resolvedSessionIdHint ? 'resume-target-missing' : startDecision.reason,
+    sessionId: session.id,
+  });
   if (!opts.json && (!resolvedSessionIdHint || session.id !== resolvedSessionIdHint)) {
     try {
       const project = suggestProjectForFolder(process.cwd());

@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { MsgStore, canonicalSeatId, defaultMsgStorePath, openMsgStore, validateMessageEnvelope } from './msg-store.js';
+import { MsgStore, canonicalSeatId, defaultMsgStorePath, openMsgStore, readUnreadSummary, validateMessageEnvelope } from './msg-store.js';
 
 const dirs: string[] = [];
 function diskPath(): string {
@@ -48,6 +48,37 @@ describe('message identity and envelope', () => {
 });
 
 describe('durable message log and cursor', () => {
+  test('TA delivery claim serializes two senders and rejects a stale failure after success', () => {
+    const path = diskPath();
+    const first = new MsgStore(path);
+    const second = new MsgStore(path);
+    try {
+      const request = first.post({ from: 'OP', to: 'TA', body: 'memo ta-card one' });
+      first.post({ from: 'TA', to: 'OP', body: 'pending', replyTo: request.id });
+      first.setTaDeliveryStatus(request.id, 'pending');
+      const owner = first.claimTaDelivery(request.id)!;
+      expect(owner).toBeTruthy();
+      expect(second.claimTaDelivery(request.id)).toBeNull();
+      expect(first.settleTaDelivery(request.id, owner, 'delivered once', true)).toBe(true);
+      expect(second.claimTaDelivery(request.id)).toBeNull();
+      expect(first.settleTaDelivery(request.id, owner, 'stale failure', false)).toBe(false);
+      expect(second.listReplies(request.id)[0]!.body).toBe('delivered once');
+    } finally { first.close(); second.close(); }
+  });
+
+  test('TA delivery claim stays held without a process-liveness guess', () => {
+    const store = new MsgStore(diskPath());
+    try {
+      const request = store.post({ from: 'OP', to: 'TA', body: 'memo ta-card retry' });
+      store.post({ from: 'TA', to: 'OP', body: 'pending', replyTo: request.id });
+      store.setTaDeliveryStatus(request.id, 'pending');
+      store.claimTaDelivery(request.id);
+      expect(store.taDeliveryClaimState(request.id)).toBe('held');
+      expect(store.claimTaDelivery(request.id)).toBeNull();
+      expect(store.settleTaDelivery(request.id, 'not-the-owner', 'stale failure', false)).toBe(false);
+      expect(store.listReplies(request.id)[0]!.body).toBe('pending');
+    } finally { store.close(); }
+  });
   test('ALL is one topic row, delivered through each recipient cursor except the sender', () => {
     const store = new MsgStore(':memory:');
     try {
@@ -350,5 +381,26 @@ describe('durable message log and cursor', () => {
 
   test('default database belongs to the resolved instance state root', () => {
     expect(defaultMsgStorePath()).toBe(join(elanousStateRoot(), 'msg', 'messages.db'));
+  });
+});
+
+describe('readUnreadSummary (TUI-H3 턴 끝 자동 재개의 «같은 오더» 지문)', () => {
+  test('unread count ⊕ newest unread ID · ack moves both · ALL topic from others counts · absent ledger = null', () => {
+    const path = diskPath();
+    expect(readUnreadSummary('OPT', path)).toBeNull();
+    const store = new MsgStore(path);
+    try {
+      expect(readUnreadSummary('OPT', path)).toEqual({ count: 0, maxId: null });
+      const a = store.post({ from: 'OP', to: 'OPT', body: 'a' });
+      store.post({ from: 'OP', to: 'MK', body: 'not mine' });
+      const c = store.post({ from: 'MK', to: 'ALL', body: 'topic' });
+      store.post({ from: 'OPT', to: 'ALL', body: 'own topic' });
+      expect(readUnreadSummary('opt', path)).toEqual({ count: 2, maxId: c.id });
+      store.ack('OPT', a.id);
+      expect(readUnreadSummary('OPT', path)).toEqual({ count: 1, maxId: c.id });
+      store.ack('OPT', store.latestId());
+      expect(readUnreadSummary('OPT', path)).toEqual({ count: 0, maxId: null });
+      expect(() => readUnreadSummary('ALL', path)).toThrow('ALL is a topic');
+    } finally { store.close(); }
   });
 });

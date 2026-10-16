@@ -19,6 +19,7 @@ test('self utterance CLI records explicit human and defaults unmarked Claude Cod
     }
     const codex = Bun.spawnSync(['bun', 'bin/elanous.mjs', '--test', 'self', 'utterance', '--source', 'codex', '--text', 'codex human prompt', '--ts', '2026-10-12T12:00:00Z', '--origin', 'human'], { cwd: import.meta.dir + '/../..', env, stdout: 'pipe', stderr: 'pipe' });
     expect(codex.exitCode).toBe(0);
+    // The record command validates --origin in src/index.ts; the read command's validator is not a substitute.
     const invalid = Bun.spawnSync(['bun', 'bin/elanous.mjs', '--test', 'self', 'utterance', '--source', 'claude-code', '--text', 'invalid prompt', '--origin', 'robot'], { cwd: import.meta.dir + '/../..', env, stdout: 'pipe', stderr: 'pipe' });
     expect(invalid.exitCode).not.toBe(0);
     expect(new TextDecoder().decode(invalid.stdout) + new TextDecoder().decode(invalid.stderr)).toContain('--origin must be human or agent');
@@ -30,6 +31,8 @@ test('self utterance CLI records explicit human and defaults unmarked Claude Cod
       expect(codexHuman.utterances.map((row) => [row.text, row.source])).toEqual([['codex human prompt', 'codex']]);
       expect(human.utterances.map((row) => [row.text, row.source])).toEqual([['human prompt', 'claude-code']]);
       expect(agent.utterances.map((row) => row.text).sort()).toEqual(['explicit agent', 'unmarked prompt']);
+      // The domain query covers the agent filter/output; the real human CLI query below covers entry and persistence.
+      expect(agent.utterances.map((row) => [row.text, row.origin, row.source]).sort()).toEqual([['explicit agent', 'agent', 'claude-code'], ['unmarked prompt', 'agent', 'claude-code']]);
       const rows = db.query('SELECT text, surface, refs FROM events ORDER BY text').all() as Array<{ text: string; surface: string; refs: string }>;
       expect(rows.map((row) => [row.text, row.surface, JSON.parse(row.refs)])).toEqual([
         ['codex human prompt', 'ext:codex', { origin: 'codex', utteranceOrigin: 'human' }],
@@ -41,9 +44,6 @@ test('self utterance CLI records explicit human and defaults unmarked Claude Cod
     const read = Bun.spawnSync(['bun', 'bin/elanous.mjs', '--test', 'self', 'utterances', '--from', interval.from, '--to', interval.to, '--surface', 'ext:claude-code', '--origin', 'human', '--json'], { cwd: import.meta.dir + '/../..', env, stdout: 'pipe', stderr: 'pipe' });
     expect(read.exitCode).toBe(0);
     expect(JSON.parse(new TextDecoder().decode(read.stdout)).utterances.map((row: { text: string; origin: string }) => [row.text, row.origin])).toEqual([['human prompt', 'human']]);
-    const readAgent = Bun.spawnSync(['bun', 'bin/elanous.mjs', '--test', 'self', 'utterances', '--from', interval.from, '--to', interval.to, '--surface', 'ext:claude-code', '--origin', 'agent', '--json'], { cwd: import.meta.dir + '/../..', env, stdout: 'pipe', stderr: 'pipe' });
-    expect(readAgent.exitCode).toBe(0);
-    expect(JSON.parse(new TextDecoder().decode(readAgent.stdout)).utterances.map((row: { text: string; origin: string; source: string }) => [row.text, row.origin, row.source]).sort()).toEqual([['explicit agent', 'agent', 'claude-code'], ['unmarked prompt', 'agent', 'claude-code']]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }, 30_000);
 

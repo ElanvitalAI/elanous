@@ -19,6 +19,7 @@ describe('dashboard chat-main entry runtime', () => {
       const pending = runDashboardChatMainEntry({
         promptFrame: { promptBottomRow: 12 } as PromptFrame,
         inputCols: 40,
+        getInputCols: () => 40,
         surfaceRegistry: { register() {}, unregister() {} } as any,
         invalidateRenderCacheRow: () => {},
         buildPromptFrameDividerRows: () => [],
@@ -60,6 +61,7 @@ describe('dashboard chat-main entry runtime', () => {
       const pending = runDashboardChatMainEntry({
         promptFrame: { promptBottomRow: 12 } as PromptFrame,
         inputCols: 40,
+        getInputCols: () => 40,
         surfaceRegistry: { register() {}, unregister() {} } as any,
         invalidateRenderCacheRow: () => {},
         buildPromptFrameDividerRows: () => [],
@@ -92,6 +94,7 @@ describe('dashboard chat-main entry runtime', () => {
       const pending = runDashboardChatMainEntry({
         promptFrame: { promptBottomRow: 12 } as PromptFrame,
         inputCols: 40,
+        getInputCols: () => 40,
         surfaceRegistry: { register() {}, unregister() {} } as any,
         invalidateRenderCacheRow: () => {},
         buildPromptFrameDividerRows: () => [],
@@ -135,6 +138,7 @@ describe('dashboard chat-main entry runtime', () => {
       const pending = runDashboardChatMainEntry({
         promptFrame: { promptBottomRow: 12 } as PromptFrame,
         inputCols: 40,
+        getInputCols: () => 40,
         surfaceRegistry: {
           register(entry: any) { registered.push(entry.title); },
           unregister(addr: any) { unregistered.push(addr.inputId); },
@@ -176,6 +180,7 @@ describe('dashboard chat-main entry runtime', () => {
         // promptTopRow=10, promptBottomRow=12 → 3 input rows (0-based 9,10,11).
         promptFrame: { promptTopRow: 10, promptBottomRow: 12, inputHeight: 3 } as PromptFrame,
         inputCols: 40,
+        getInputCols: () => 40,
         surfaceRegistry: {
           register() {},
           unregister() {},

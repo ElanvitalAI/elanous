@@ -43,3 +43,21 @@ describe('renderToolResultVariants kind-unit grouping', () => {
     expect(line?.collapsed.join('\n')).not.toEqual(task?.collapsed.join('\n'));
   });
 });
+
+describe('phase rejection label (#67)', () => {
+  const render = (output: string) => renderToolResultVariants(
+    { id: 'b', name: 'Bash', args: { command: 'x' }, result: { output } },
+    baseConfig,
+  )?.collapsed?.join('\n') ?? '';
+
+  test('a phase guard reads as «tool call rejected — <reason>», not a budget', () => {
+    const text = render('TOOL CALL REJECTED — Bash did NOT run. Nothing they would have changed has changed.  VERIFY ACTION REQUIRED — edits already happened. Stop …');
+    expect(text).toContain('tool call rejected — verify action required');
+    expect(text).not.toContain('budget');
+  });
+
+  test('the real turn-budget stub keeps the budget label', () => {
+    const text = render('TOOL CALL REJECTED — tool-loop budget exhausted at 30/30 turns. Your next assistant turn must be plain text final synthesis');
+    expect(text).toContain('tool budget exhausted — final answer required');
+  });
+});

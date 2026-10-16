@@ -1,4 +1,5 @@
 import { test, expect, describe } from 'bun:test';
+import { pickDecomposeProposals } from '../src/self-dev/decompose-proposal.js';
 import { judgeSample } from './measure-promotion-gate.js';
 
 const P = (id: string, dependsOn: string[] = [], hotPaths?: string[]) => ({
@@ -34,9 +35,16 @@ describe('judgeSample — 두 관문을 «같은 표본»에 나란히 누른다
     expect(v.dagPromotable).toBe(false);
   });
 
-  test('hotPaths 겹침은 간선으로 세어지고 통과를 «막지 않는다»', () => {
-    const v = judgeSample([P('a', [], ['src/x.ts']), P('b', [], ['src/x.ts'])]);
+  test('hotPaths 겹침은 순서 간선 없이 제안의 형제 겹침으로 관측된다', () => {
+    const pieces = [P('a', [], ['src/x.ts']), P('b', [], ['src/x.ts'])];
+    const v = judgeSample(pieces);
     expect(v.dagPromotable).toBe(true);
-    expect(v.hotPathEdges).toBe(1);
+    expect(v.hotPathEdges).toBe(0);
+    const proposals = pickDecomposeProposals([{
+      event: 'decomposition-shadow-goals', shardId: 'run-overlap', data: { pieces },
+    }]);
+    expect(proposals.get('run-overlap')?.hotPathOverlaps).toEqual([
+      { a: 'a', b: 'b', paths: ['src/x.ts'] },
+    ]);
   });
 });

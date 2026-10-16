@@ -138,7 +138,7 @@ describe('chat --tools compatibility notice', () => {
 
     expect(match).toContain("debug.log('chat.tools-compatibility', 'invoked', { toolLoopEnabled: true })");
     expect(match).not.toMatch(/(?:const|let|var)\s+\w+\s*=\s*announceChatToolsCompatibility\(/);
-    const chatAction = source.match(/\.command\('chat <text\.\.\.>'\)[\s\S]*?const cfg = getUserConfig\(\);/)?.[0];
+    const chatAction = source.match(/\.command\('chat [<[]text\.\.\.[>\]]'\)[\s\S]*?const cfg = getUserConfig\(\);/)?.[0];
     expect(chatAction).toContain('if (getHarnessSpace() && opts.tools && opts.goalLoop && !opts.implement)');
     expect(chatAction).toContain('if (opts.tools) announceChatToolsCompatibility();');
     expect(chatAction!.indexOf('if (getHarnessSpace()')).toBeLessThan(chatAction!.indexOf('if (opts.tools) announceChatToolsCompatibility();'));

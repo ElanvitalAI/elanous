@@ -111,13 +111,18 @@ describe('TTS provider availability and free fallback', () => {
   });
 
   test('linux without free binaries returns original choice and logs all tried ids', () => {
-    const before = debug.events().length;
-    expect(resolveDaemonTtsProviderIdWithDepsForTesting(fakeDeps('linux', ['sox']))).toBe('openai-tts');
-    expect(debug.events().slice(before)).toContainEqual(expect.objectContaining({
-      category: 'voice.tts',
-      event: 'no-usable-provider',
-      data: expect.objectContaining({ tried: ['openai-tts', 'edge-tts', 'macos-say'] }),
-    }));
+    const observations: Array<{ category: string; event: string; data?: unknown }> = [];
+    const off = debug.registerSink({ name: 'voice-tts-fallback-test', emit: (record) => { observations.push(record); } });
+    try {
+      expect(resolveDaemonTtsProviderIdWithDepsForTesting(fakeDeps('linux', ['sox']))).toBe('openai-tts');
+      expect(observations).toContainEqual(expect.objectContaining({
+        category: 'voice.tts',
+        event: 'no-usable-provider',
+        data: expect.objectContaining({ tried: ['openai-tts', 'edge-tts', 'macos-say'] }),
+      }));
+    } finally {
+      off();
+    }
   });
 
   test('explicit env and config provider selections remain unchanged even if unavailable', () => {

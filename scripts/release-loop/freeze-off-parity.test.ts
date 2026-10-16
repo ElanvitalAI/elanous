@@ -22,7 +22,7 @@ const NODES = ['scripts/release-loop/gate-node.ts', 'scripts/release-loop/publis
 const REPO = resolve(import.meta.dir, '../..');
 type Mods = { judgeGate: typeof gateNode.judgeGate; runPublish: typeof publishNode.runPublish; runUnattendedRelease: typeof unattendedNode.runUnattendedRelease };
 
-async function capture(mods: Mods): Promise<string> {
+async function capture(mods: Mods, assertCurrentDiagnostics = false): Promise<string> {
   const env = { state: process.env.ELANOUS_STATE_DIR, graph: process.env.ELANOUS_GRAPH_CONTEXT };
   const roots: string[] = [];
   try {
@@ -50,12 +50,19 @@ async function capture(mods: Mods): Promise<string> {
   };
   const gate = await mods.judgeGate({ commit: CUT, version: '1.0.1', baselineVersion: '1.0.0', instanceRoot: inst, ledgerRoot: join(root, 'machine-ledger') }, runner);
   delete (gate as { durationMs?: number }).durationMs;
+  // These diagnostics postdate FREEZE1. Assert them explicitly before comparing the original output contract.
+  if (assertCurrentDiagnostics) {
+    expect(gate.rcNonzeroNoFailures).toEqual([]);
+    expect(gate.baselineCache).toEqual({ hits: 0, misses: 1 });
+  }
+  delete (gate as { rcNonzeroNoFailures?: unknown }).rcNonzeroNoFailures;
+  delete (gate as { baselineCache?: unknown }).baselineCache;
   // publish
   const proot = realpathSync(mkdtempSync(join(tmpdir(), 'cap-pub-'))); roots.push(proot);
   process.env.ELANOUS_STATE_DIR = proot;
   const outputs: Record<string, unknown> = Object.fromEntries(['gate', 'pwa', 'upgrade', 'tui', 'prepare', 'docs'].map((n) => [n, { outcome: 'ok' }]));
   Object.assign(outputs, { 'approve-publish': { outcome: 'approved' }, prepare: { outcome: 'ok', commit: 'a', out: 'dist' }, 'version-release': { commit: 'a' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' } });
-  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
   const pcalls: string[][] = [];
   const pub = mods.runPublish((cmd: string, args: string[]) => { pcalls.push([cmd, ...args.map((a) => a.replace(/\/[^ ]*notes\.md$/, '<notes>'))]); return { status: 0, stdout: args.some((a) => a.endsWith('website/pages.json')) ? JSON.stringify({ pages: [] }) : args.includes('publish') ? JSON.stringify({ ok: true, published: true, tag: 'v0.2.4' }) : '# 0.2.4\nHello', stderr: '' }; });
   // unattended
@@ -114,12 +121,12 @@ function treeAt(rev: string, expectFreeze: boolean): { dir: string; base: string
 
 test('freeze switch off: gate, publish and unattended release are byte-identical to pre-freeze behavior', async () => {
   if (!historyAvailable()) {
-    const current = await capture({ judgeGate: gateNode.judgeGate, runPublish: publishNode.runPublish, runUnattendedRelease: unattendedNode.runUnattendedRelease });
+    const current = await capture({ judgeGate: gateNode.judgeGate, runPublish: publishNode.runPublish, runUnattendedRelease: unattendedNode.runUnattendedRelease }, true);
     console.warn('freeze-off-parity: no git history (not a work tree or shallow clone) — compared with the recorded pre-FREEZE1 GOLDEN only');
     expect(current).toBe(JSON.stringify(GOLDEN));
     return;
   }
-  const current = await capture({ judgeGate: gateNode.judgeGate, runPublish: publishNode.runPublish, runUnattendedRelease: unattendedNode.runUnattendedRelease });
+  const current = await capture({ judgeGate: gateNode.judgeGate, runPublish: publishNode.runPublish, runUnattendedRelease: unattendedNode.runUnattendedRelease }, true);
   // Pre-freeze base: the parent of the first commit that brought the freeze in — or HEAD while it is uncommitted.
   const commit = freezeCommit();
   const before = treeAt(commit ? `${commit}^` : 'HEAD', false);
@@ -130,7 +137,8 @@ test('freeze switch off: gate, publish and unattended release are byte-identical
       runUnattendedRelease: (await import(join(before.dir, NODES[2]!))).runUnattendedRelease,
     });
     expect(old).not.toContain('forceFreeze');
+    expect(old).toBe(JSON.stringify(GOLDEN));
     expect(current).toBe(old);
     expect(current).toBe(JSON.stringify(GOLDEN));
   } finally { rmSync(before.dir, { recursive: true, force: true }); }
-});
+}, 120_000);

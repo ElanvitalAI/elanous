@@ -217,6 +217,20 @@ describe('Claude ACP subscription authentication', () => {
     }
   });
 
+  test('Claude implementation options are forwarded only on the requested ACP session', async () => {
+    const { agent, events } = await startPeer(false);
+    const meta = { claudeCode: { options: { tools: ['Read', 'Edit', 'Bash'], strictMcpConfig: true } } };
+    try {
+      await agent.newSession(meta);
+      const frame = events.find(e => e.category === 'acp.client' && e.event === 'frame'
+        && (e.data as { direction?: string; method?: string }).direction === 'outgoing'
+        && (e.data as { method?: string }).method === 'session/new');
+      expect(JSON.parse((frame?.data as { body: string }).body).params).toMatchObject({
+        mcpServers: [], _meta: meta,
+      });
+    } finally { await agent.stop(); }
+  });
+
   test('Claude model selection uses configOptions and session/set_config_option', async () => {
     const { agent, logs, events } = await startPeer(false);
     try {

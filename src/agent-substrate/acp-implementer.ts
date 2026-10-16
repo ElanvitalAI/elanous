@@ -85,6 +85,18 @@ export interface AcpImplementerResult {
 
 const OBS = 'agent-substrate.acp-implementer';
 
+/** Claude ACP's default preset imports user/project plugins and MCP servers into every
+ * prompt snapshot. The implementation child only needs the built-in coding tools. */
+export const CLAUDE_IMPLEMENTER_META = {
+  claudeCode: { options: {
+    tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
+    settingSources: [],
+    plugins: [],
+    mcpServers: {},
+    strictMcpConfig: true,
+  } },
+} as const;
+
 export function makeAcpImplementer(opts: AcpImplementerOpts): (prompt: string) => Promise<AcpImplementerResult> {
   return async (prompt) => {
     const spawn = subscriptionReviewerSpawn(opts.spec ?? { provider: 'claude-acp' }, opts.env ?? process.env, opts.proxyBaseUrl);
@@ -119,10 +131,10 @@ export function makeAcpImplementer(opts: AcpImplementerOpts): (prompt: string) =
       await withinHandshake(agent.start());
       let sid: string;
       if (opts.resumeSessionId) {
-        await withinHandshake(agent.loadSession({ sessionId: opts.resumeSessionId, cwd: opts.worktree }));
+        await withinHandshake(agent.loadSession({ sessionId: opts.resumeSessionId, cwd: opts.worktree, _meta: CLAUDE_IMPLEMENTER_META }));
         sid = opts.resumeSessionId;
       } else {
-        sid = await withinHandshake(agent.newSession());
+        sid = await withinHandshake(agent.newSession(CLAUDE_IMPLEMENTER_META));
       }
       if (opts.model) await withinHandshake(agent.selectSessionModel(sid, opts.model));
       debug.log(OBS, 'start', { cwd: opts.worktree, model: opts.model ?? '(default)', resumed: Boolean(opts.resumeSessionId) });

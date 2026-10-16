@@ -26,6 +26,15 @@ import { mkdirSync, rmSync } from 'node:fs';
 import { GIT_LOCATION_ENV_KEYS } from '../scripts/test-deterministic.js';
 import { debug } from '../src/debug/log.js';
 
+// ⛔ ENV-PREFIX-SCRUB (R4 · 10-16) — the runner's Pod identity, the cluster's service env and the harness markers are
+// ambient «who/where am I» signals, not test inputs. A name list leaked whenever a new name appeared (gate Pod:
+// ELANOUS_POD_NAME → shadow.ts remote-child branch · #28317), so the rule is a prefix. Tests that need one of these set
+// it themselves after this preload; nothing in the suite expects them from the parent shell.
+const SCRUBBED_ENV_PREFIXES = ['ELANOUS_POD_', 'KUBERNETES_', 'ELANOUS_HARNESS_'] as const;
+const scrubbedKeys = Object.keys(process.env).filter((key) => SCRUBBED_ENV_PREFIXES.some((prefix) => key.startsWith(prefix)));
+for (const key of scrubbedKeys) delete process.env[key];
+if (scrubbedKeys.length > 0) debug.log('test.preload', 'env-scrubbed', { keys: scrubbedKeys.sort(), prefixes: SCRUBBED_ENV_PREFIXES });
+
 const clearedGitKeys = GIT_LOCATION_ENV_KEYS.filter((key) => Object.hasOwn(process.env, key));
 for (const key of clearedGitKeys) delete process.env[key];
 if (clearedGitKeys.length > 0) debug.log('test.preload', 'git-location-env-cleared', { keys: clearedGitKeys });
@@ -76,8 +85,7 @@ if (inheritedHarnessRun || !process.env.ELANOUS_STATE_DIR?.trim()) {
   if (inheritedHarnessRun) {
     delete process.env.ELANOUS_STATE_DIR_SOURCE;
     delete process.env.ELANOUS_RUN_ID;
-    delete process.env.ELANOUS_HARNESS_SPACE;
-    delete process.env.ELANOUS_HARNESS_SPACE_ID;
+    // ELANOUS_HARNESS_* is already gone (prefix scrub above).
     delete process.env.ELANOUS_CONTROL_INBOX_DIR;
   }
   // 우리가 생성한 경우에만 프로세스 종료 시 정리 — CI 장기 러너 누적 방지(전역 preload라

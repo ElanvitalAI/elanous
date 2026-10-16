@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { refuseProductionLedgerWriteInTest } from '../harness/ledger-write-guard.js';
 import { tracedPathReferences, verbatimOriginalAsk } from './goal-author.js';
@@ -20,6 +20,7 @@ export interface RunLedgerEntry {
   event: string;
   data: Record<string, unknown>;
   goalId?: string;
+  devProject?: string;
   orchestrationId?: string;
   shardId?: string;
   siblingShardIds?: string[];
@@ -412,8 +413,12 @@ export function appendRunLedgerEntry(entry: RunLedgerEntry, dir = runLedgerDir()
   if (refuseProductionLedgerWriteInTest(dir, 'run-ledger')) return;
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const live = runLedgerPath(entry.runId, dir);
+  const devProject = process.env.ELANOUS_DEV_PROJECT;
+  const row = entry.devProject === undefined && typeof devProject === 'string' && devProject.startsWith('prj-')
+    ? { ...entry, devProject }
+    : entry;
   withRunLedgerLock(dir, entry.runId, () => {
-    const line = `${JSON.stringify(entry)}\n`;
+    const line = `${JSON.stringify(row)}\n`;
     if (!restoreArchivedRunLedger(dir, entry.runId, line)) appendFileSync(live, line, 'utf8');
   });
 }
@@ -1315,6 +1320,10 @@ export interface UnfinishedRunLedgerQuery {
   terminalByTrailingRunStatus?: number;
   cacheHits?: number;
   cacheMisses?: number;
+  /** Hits served by the persisted cross-process scan index (subset of cacheHits). */
+  indexHits?: number;
+  /** Whether that index was loaded from disk, started fresh, or was bypassed. */
+  indexOrigin?: RunLedgerScanIndexOrigin;
   pathFilter?: string;
   matchingPathCount?: number;
   unknownPathCount?: number;
@@ -1674,6 +1683,96 @@ function unfinishedLedgerCacheKey(path: string, read?: RunLedgerReader): string 
   return `${path}\u0000reader:${id}`;
 }
 
+// ⭐ 프로세스 간 유효 스캔 색인(칸 CONTEXT-NOW-RUN-SCAN-INDEX).
+//   `/now`(contextNowInWorker)는 요청마다 «새 워커 프로세스»를 띄우므로 위 프로세스 캐시는 매번 빈 채로 시작한다
+//   (실측 2026-10-14: scanned=7893, cacheHits=0, 조회 6.3~8.9초). 색인은 파싱된 파일별 facts 를
+//   원장 옆에 (size, mtimeMs) 스탬프로 저장하고, 스탬프가 같으면 재사용한다. 원장에 무엇이 «붙으면»
+//   스탬프가 바뀌므로 무효화는 자동이다. 읽기 실패는 전부 fail-soft: 색인이 없으면 그냥 새로 읽는다.
+const RUN_LEDGER_SCAN_INDEX_FILE = '.unfinished-scan-index.json';
+const RUN_LEDGER_SCAN_INDEX_VERSION = 1;
+const RUN_LEDGER_SCAN_INDEX_LIMIT = 32_768;
+
+/** Where the persisted scan index lives: beside its ledgers, never mistaken for one (readdir filters canonical names). */
+export function runLedgerScanIndexPath(dir: string): string {
+  return join(dir, RUN_LEDGER_SCAN_INDEX_FILE);
+}
+
+export interface RunLedgerScanIndexRecord {
+  size: number;
+  mtimeMs: number;
+  facts: UnfinishedLedgerFacts;
+}
+
+/** Whether the persisted index was loaded, started fresh, or was bypassed (noCache or an injected reader). */
+export type RunLedgerScanIndexOrigin = 'loaded' | 'fresh' | 'bypassed';
+
+const UNFINISHED_LIFECYCLE_WORDS = new Set<string>([
+  'live', 'orphaned', 'human-stopped', 'terminal-other-vocabulary', 'terminal-run-status-superseded', 'unjudgeable',
+]);
+
+function isScanIndexFacts(value: unknown): value is UnfinishedLedgerFacts {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const facts = value as Record<string, unknown>;
+  return typeof facts.terminal === 'boolean'
+    && typeof facts.terminalByTrailingRunStatus === 'boolean'
+    && (facts.branch === null || typeof facts.branch === 'string')
+    && (facts.lastActivityTimestamp === null || typeof facts.lastActivityTimestamp === 'string')
+    && typeof facts.lastActivityStatus === 'string'
+    && (facts.targetRoot === null || typeof facts.targetRoot === 'string')
+    && (facts.goalFile === null || typeof facts.goalFile === 'string')
+    && typeof facts.fixedLifecycle === 'string' && UNFINISHED_LIFECYCLE_WORDS.has(facts.fixedLifecycle);
+}
+
+function isScanIndexRecord(value: unknown): value is RunLedgerScanIndexRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return Number.isFinite(record.size) && Number.isFinite(record.mtimeMs) && isScanIndexFacts(record.facts);
+}
+
+const scanIndexCache = new Map<string, { stamp: string; entries: Map<string, RunLedgerScanIndexRecord> }>();
+
+function scanIndexFileStamp(path: string): string {
+  try { const stat = statSync(path); return `${stat.size}:${stat.mtimeMs}`; } catch { return 'missing'; }
+}
+
+/** Load (memoized by index-file stamp) the persisted per-directory scan index; malformed or absent behaves as fresh. */
+export function loadRunLedgerScanIndex(dir: string): Map<string, RunLedgerScanIndexRecord> {
+  const path = runLedgerScanIndexPath(dir);
+  const stamp = scanIndexFileStamp(path);
+  const cached = scanIndexCache.get(dir);
+  if (cached && cached.stamp === stamp) return cached.entries;
+  const entries = new Map<string, RunLedgerScanIndexRecord>();
+  if (stamp !== 'missing') {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+      const raw = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        && (parsed as Record<string, unknown>).version === RUN_LEDGER_SCAN_INDEX_VERSION
+        && typeof (parsed as Record<string, unknown>).entries === 'object'
+        && (parsed as Record<string, unknown>).entries !== null && !Array.isArray((parsed as Record<string, unknown>).entries)
+        ? (parsed as { entries: Record<string, unknown> }).entries : null;
+      if (raw) for (const [runId, record] of Object.entries(raw)) {
+        if (isScanIndexRecord(record)) entries.set(runId, record);
+      }
+    } catch { /* a malformed index behaves as absent */ }
+  }
+  scanIndexCache.set(dir, { stamp, entries });
+  return entries;
+}
+
+/** Persist the index beside its ledgers, best-effort: any failure just leaves the next scan reading fresh. */
+function persistRunLedgerScanIndex(dir: string, entries: ReadonlyMap<string, RunLedgerScanIndexRecord>): boolean {
+  if (refuseProductionLedgerWriteInTest(dir, 'run-ledger-scan-index')) return false;
+  const bounded = entries.size > RUN_LEDGER_SCAN_INDEX_LIMIT
+    ? new Map([...entries].slice(entries.size - RUN_LEDGER_SCAN_INDEX_LIMIT))
+    : entries;
+  try {
+    writeFileSync(runLedgerScanIndexPath(dir), JSON.stringify({ version: RUN_LEDGER_SCAN_INDEX_VERSION, entries: Object.fromEntries(bounded) }), 'utf8');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function unfinishedLedgerFacts(ledger: readonly RunLedgerEntry[]): UnfinishedLedgerFacts {
   const last = ledger.at(-1)?.timestamp;
   const lastActivityTimestamp = last !== undefined && Number.isFinite(Date.parse(last)) ? last : null;
@@ -1690,7 +1789,13 @@ function unfinishedLedgerFacts(ledger: readonly RunLedgerEntry[]): UnfinishedLed
   };
 }
 
-function readUnfinishedLedgerFacts(runId: string, dir: string, read?: RunLedgerReader, noCache?: boolean): { facts: UnfinishedLedgerFacts; hit: boolean } {
+function readUnfinishedLedgerFacts(
+  runId: string,
+  dir: string,
+  read?: RunLedgerReader,
+  noCache?: boolean,
+  index?: Map<string, RunLedgerScanIndexRecord>,
+): { facts: UnfinishedLedgerFacts; hit: boolean; source: 'process' | 'index' | 'read' } {
   const path = runLedgerPath(runId, dir);
   const key = noCache ? null : unfinishedLedgerCacheKey(path, read);
   const stamp = noCache ? null : statSync(path);
@@ -1698,9 +1803,18 @@ function readUnfinishedLedgerFacts(runId: string, dir: string, read?: RunLedgerR
   if (cached && stamp && key !== null && cached.size === stamp.size && cached.mtimeMs === stamp.mtimeMs) {
     unfinishedLedgerCache.delete(key);
     unfinishedLedgerCache.set(key, cached);
-    return { facts: cached.facts, hit: true };
+    return { facts: cached.facts, hit: true, source: 'process' };
   }
   if (key !== null) unfinishedLedgerCache.delete(key);
+  // ⭐ 프로세스 캐시가 비었어도(새 워커) 디스크 색인의 스탬프가 같으면 재사용한다.
+  //   주입된 reader 는 실제 파일 내용과 무관한 대역이라 색인에 넣지 «도», 색인에서 읽지 «도» 않는다.
+  if (index !== undefined && stamp && read === undefined) {
+    const record = index.get(runId);
+    if (record && record.size === stamp.size && record.mtimeMs === stamp.mtimeMs) {
+      if (key !== null) unfinishedLedgerCache.set(key, { size: stamp.size, mtimeMs: stamp.mtimeMs, facts: record.facts });
+      return { facts: record.facts, hit: true, source: 'index' };
+    }
+  }
   try {
     const ledger = loadRunLedger(runId, dir, read);
     if (ledger === null && stamp !== null) throw new Error(`run ledger disappeared after stat: ${path}`);
@@ -1712,9 +1826,14 @@ function readUnfinishedLedgerFacts(runId: string, dir: string, read?: RunLedgerR
         if (unfinishedLedgerCache.size > UNFINISHED_LEDGER_CACHE_LIMIT) unfinishedLedgerCache.delete(unfinishedLedgerCache.keys().next().value!);
       }
     }
-    return { facts, hit: false };
+    if (index !== undefined && stamp !== null && read === undefined) {
+      index.set(runId, { size: stamp.size, mtimeMs: stamp.mtimeMs, facts });
+    }
+    return { facts, hit: false, source: 'read' };
   } catch (error) {
     if (key !== null) unfinishedLedgerCache.delete(key);
+    // 원장이 사라졌거나 바뀐 사이에 읽었다 — 색인의 스탬프는 이미 무효이므로 치운다(무효화).
+    index?.delete(runId);
     throw error;
   }
 }
@@ -1734,6 +1853,11 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
   const goalsDir = resolve(options.goalsDir ?? resolveGoalDocumentsDir(process.cwd()).directory);
   const list = options.list ?? readdirSync;
   const liveWindowMs = options.liveWindowMs ?? DEFAULT_UNFINISHED_LIVE_WINDOW_MS;
+  // ⭐ 색인은 noCache 나 주입된 reader 가 아니어야만 켠다 — 그 둘은 «정직한 재읽기» 계약을 지켜야 한다.
+  const scanIndex = !options.noCache && options.read === undefined ? loadRunLedgerScanIndex(dir) : undefined;
+  const indexOrigin: RunLedgerScanIndexOrigin = scanIndex === undefined ? 'bypassed' : scanIndex.size > 0 ? 'loaded' : 'fresh';
+  let indexHits = 0;
+  let indexChanged = false;
   let fileNames: string[];
   try {
     fileNames = list(dir);
@@ -1748,6 +1872,8 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
         terminalByTrailingRunStatus: 0,
         cacheHits: 0,
         cacheMisses: 0,
+        indexHits: 0,
+        indexOrigin,
         ...(options.path === undefined ? {} : { pathFilter: options.path, matchingPathCount: 0, unknownPathCount: 0 }),
         scope: 'self-implement-run-ledger',
         note: UNFINISHED_RUN_LEDGER_NOTE,
@@ -1760,6 +1886,8 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
         terminalByTrailingRunStatus: 0,
         cacheHits: 0,
         cacheMisses: 0,
+        indexOrigin,
+        indexHits: 0,
         ms: Date.now() - startedAt,
       });
       return missing;
@@ -1782,12 +1910,18 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
     scanned += 1;
     let facts: UnfinishedLedgerFacts;
     try {
-      const observed = readUnfinishedLedgerFacts(runId, dir, options.read, options.noCache);
+      const observed = readUnfinishedLedgerFacts(runId, dir, options.read, options.noCache, scanIndex);
       facts = observed.facts;
-      if (observed.hit) cacheHits += 1;
-      else cacheMisses += 1;
+      if (observed.hit) {
+        cacheHits += 1;
+        if (observed.source === 'index') indexHits += 1;
+      } else {
+        cacheMisses += 1;
+        if (scanIndex !== undefined) indexChanged = true;
+      }
     } catch {
       cacheMisses += 1;
+      if (scanIndex?.delete(runId)) indexChanged = true;
       unreadableLedgerCount += 1;
       entries.push({ runId, branch: null, status: 'ledger-unreadable', plannedPaths: [], plannedPathStatus: 'unknown', ...unknownDeclaredPaths(), pathMatchReasons: {}, goalDocumentPath: null, goalLookupBasis: 'caller-cwd', goalDocumentSearchDirectory: null, lastActivityTimestamp: null, lastActivityAgeMs: null, lastActivityStatus: 'ledger-unreadable', lifecycle: 'unjudgeable' });
       callerCwdCount += 1;
@@ -1840,6 +1974,7 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
     }
   }
   entries.sort((left, right) => left.runId.localeCompare(right.runId));
+  if (scanIndex !== undefined && indexChanged) persistRunLedgerScanIndex(dir, scanIndex);
   debug.log('self-implement.run-ledger', 'goal-lookup-basis', { ledgerTarget: ledgerTargetCount, callerCwd: callerCwdCount });
   debug.log('self-implement.run-ledger', 'unfinished-query', {
     scanned,
@@ -1848,10 +1983,12 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
     terminalByTrailingRunStatus,
     cacheHits,
     cacheMisses,
+    indexOrigin,
+    indexHits,
     ms: Date.now() - startedAt,
   });
   if (options.path === undefined) {
-    return { entries, ledgerDirectory: dir, goalsDirectory: goalsDir, unreadableLedgerCount, ledgerDirectoryMissing: false, terminalByTrailingRunStatus, cacheHits, cacheMisses, scope: 'self-implement-run-ledger', note: UNFINISHED_RUN_LEDGER_NOTE };
+    return { entries, ledgerDirectory: dir, goalsDirectory: goalsDir, unreadableLedgerCount, ledgerDirectoryMissing: false, terminalByTrailingRunStatus, cacheHits, cacheMisses, indexHits, indexOrigin, scope: 'self-implement-run-ledger', note: UNFINISHED_RUN_LEDGER_NOTE };
   }
   const pathFilter = options.path;
   const unknownPathStatus = (entry: UnfinishedRunLedgerEntry): boolean => entry.plannedPathStatus !== 'found-ledger-goal-file'
@@ -1871,6 +2008,8 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
     terminalByTrailingRunStatus,
     cacheHits,
     cacheMisses,
+    indexHits,
+    indexOrigin,
     pathFilter,
     matchingPathCount: matchingEntries.length,
     unknownPathCount: unknownEntries.length,
@@ -1908,6 +2047,8 @@ export interface FederatedUnfinishedRunLedgerQuery {
   reconciledTerminatedElsewhereCount: number;
   cacheHits?: number;
   cacheMisses?: number;
+  /** Hits served by the persisted cross-process scan index (subset of cacheHits). */
+  indexHits?: number;
   pathFilter?: string;
   matchingPathCount?: number;
   unknownPathCount?: number;
@@ -1947,6 +2088,7 @@ export function queryFederatedUnfinishedRunLedgers(options: FederatedUnfinishedR
   let unknownPathCount = 0;
   let cacheHits = 0;
   let cacheMisses = 0;
+  let indexHits = 0;
   const recordDirectoryFailure = (kind: FederatedLedgerDirectoryFailureKind): void => {
     if (kind === 'missing') missingLedgerDirectoryCount += 1;
     else if (kind === 'unreadable') unreadableLedgerDirectoryAccessCount += 1;
@@ -1972,6 +2114,7 @@ export function queryFederatedUnfinishedRunLedgers(options: FederatedUnfinishedR
       unknownPathCount += result.unknownPathCount ?? 0;
       cacheHits += result.cacheHits ?? 0;
       cacheMisses += result.cacheMisses ?? 0;
+      indexHits += result.indexHits ?? 0;
       entries.push(...result.entries.map((entry) => ({ ...entry, ledgerDirectory })));
     } catch (error) {
       recordDirectoryFailure(classifyFederatedLedgerDirectoryReadFailure(error));
@@ -1993,7 +2136,8 @@ export function queryFederatedUnfinishedRunLedgers(options: FederatedUnfinishedR
   for (const runId of unfinishedRunIds) {
     for (const ledgerDirectory of ledgerDirectories) {
       try {
-        if (readUnfinishedLedgerFacts(runId, ledgerDirectory, undefined, options.noCache).facts.terminal) { terminatedElsewhere.add(runId); break; }
+        const reconciliationIndex = options.noCache ? undefined : loadRunLedgerScanIndex(ledgerDirectory);
+        if (readUnfinishedLedgerFacts(runId, ledgerDirectory, undefined, options.noCache, reconciliationIndex).facts.terminal) { terminatedElsewhere.add(runId); break; }
       } catch { /* An absent or unreadable sibling cannot establish termination. */ }
     }
   }
@@ -2014,6 +2158,7 @@ export function queryFederatedUnfinishedRunLedgers(options: FederatedUnfinishedR
     reconciledTerminatedElsewhereCount,
     cacheHits,
     cacheMisses,
+    indexHits,
     ...(options.path === undefined ? {} : { pathFilter: options.path, matchingPathCount, unknownPathCount }),
     scope: 'self-implement-run-ledger-federated',
     note: FEDERATED_UNFINISHED_RUN_LEDGER_NOTE,

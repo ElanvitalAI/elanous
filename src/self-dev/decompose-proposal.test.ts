@@ -40,6 +40,20 @@ describe('pickDecomposeProposals — 하니스가 낸 「이렇게 쪼개라」�
     expect(m.size).toBe(0);
   });
 
+  test('겹침이 없어도 hotPathOverlaps 는 [] 이다 — 키를 생략하지 않는다', () => {
+    const m = pickDecomposeProposals([
+      ev('task:a', [
+        { ...P('1'), hotPaths: ['src/x.ts'] },
+        { ...P('2'), hotPaths: ['src/y.ts'] },
+      ]),
+      ev('task:b', [P('1'), P('2')]),
+    ]);
+    expect(m.get('task:a')!.hotPathOverlaps).toEqual([]);
+    expect(m.get('task:b')!.hotPathOverlaps).toEqual([]);
+    expect(Object.prototype.hasOwnProperty.call(m.get('task:a')!, 'hotPathOverlaps')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(m.get('task:b')!, 'hotPathOverlaps')).toBe(true);
+  });
+
   test('hotPaths 를 보존하고, 없으면 키를 생략하며, 비문자열 원소는 버린다', () => {
     const m = pickDecomposeProposals([
       ev('task:a', [
@@ -373,10 +387,16 @@ describe('orderPiecesTopologically — 「의존 0」이 아니라 「DAG 인가
     expect(r.cycle).toBeUndefined();
   });
 
-  test('hotPaths 가 겹치면 «앞선 조각 먼저»로 간선이 생긴다 (연합 경로의 기존 결정과 같은 규칙)', () => {
-    const r = orderPiecesTopologically([Q('a', [], ['src/x.ts']), Q('b', [], ['src/x.ts'])]);
-    expect(r.ordered?.map((p) => p.id)).toEqual(['a', 'b']);
-    expect(r.hotPathEdges).toBe(1);
+  test('hotPaths 가 겹쳐도 «간선이 없다» — 겹침은 형제 겹침(hotPathOverlaps)으로 따로 센다 (2026-10-16 새 계약)', () => {
+    // 옛 계약은 hotPathEdges===1 (앞선 것 먼저 강제 간선) 을 기대했다 — 겹침 간선 제거(대표 10-11 «겹침이라 미루는 현상 제거»)로 고쳤다.
+    const m = pickDecomposeProposals([ev('task:a', [
+      { ...P('1'), hotPaths: ['src/x.ts'] },
+      { ...P('2'), hotPaths: ['src/x.ts'] },
+    ])]);
+    expect(m.get('task:a')!.hotPathOverlaps).toEqual([{ a: '1', b: '2', paths: ['src/x.ts'] }]);
+    const r = orderPiecesTopologically(m.get('task:a')!.pieces);
+    expect(r.ordered?.map((p) => p.id)).toEqual(['1', '2']);
+    expect(r.hotPathEdges).toBe(0);
     expect(r.dependsOnEdges).toBe(0);
   });
 
@@ -386,15 +406,28 @@ describe('orderPiecesTopologically — 「의존 0」이 아니라 「DAG 인가
     expect(r.ordered?.map((p) => p.id)).toEqual(['a', 'b']);
   });
 
-  // ⛔⭐ 이것이 이 함수의 «가장 미끄러운» 자리다: 두 축이 방향을 다른 근거로 정한다.
-  //   dependsOn 은 「b 가 a 뒤」, hotPaths 는 「배열 앞(b) 이 먼저」 ⇒ 순진하게 걸면 b→a ⊕ a→b = 가짜 순환.
-  //   가드가 없으면 이 시험은 cycle 을 받아 «승격 전체가 막힌다»(= 옛 관문으로의 조용한 회귀).
+  // ⛔⭐ 이것이 이 함수의 «가장 미끄러운» 자리였다: 두 축이 방향을 다른 근거로 정했기에
+  //   dependsOn(b 가 a 뒤) ⊕ hotPaths(앞선 것 먼저) 가 b→a ⊕ a→b 가짜 순환을 만들었다.
+  //   겹침 간선 제거(2026-10-16)로 그 원천이 사라졌다 — 이 시험은 그 부재를 못 보고 지나가지 «않는다».
   test('⭐⭐ dependsOn 과 hotPaths 가 «반대 방향»을 가리켜도 가짜 순환을 만들지 않는다', () => {
     const r = orderPiecesTopologically([Q('b', ['a'], ['src/x.ts']), Q('a', [], ['src/x.ts'])]);
     expect(r.cycle).toBeUndefined();
     expect(r.ordered?.map((p) => p.id)).toEqual(['a', 'b']);
     expect(r.dependsOnEdges).toBe(1);
-    expect(r.hotPathEdges).toBe(0);   // 반대 방향으로 이미 길이 있어 «건너뛴» 것이지 못 본 것이 아니다
+    expect(r.hotPathEdges).toBe(0);   // 겹침은 이제 간선을 «아예» 만들지 않는다 — 가짜 순환의 원천이 사라졌다
+  });
+
+  test('«hot path overlap no edge» — 겹쳐도 간선 0 · hotPathOverlaps 1쌍 · dependsOn 간선은 그대로', () => {
+    const m = pickDecomposeProposals([ev('task:a', [
+      { ...P('1'), hotPaths: ['src/x.ts'] },
+      { ...P('2', 'feat 2', ['1']), hotPaths: ['src/x.ts'] },
+    ])]);
+    const proposal = m.get('task:a')!;
+    expect(proposal.hotPathOverlaps).toEqual([{ a: '1', b: '2', paths: ['src/x.ts'] }]);
+    const r = orderPiecesTopologically(proposal.pieces);
+    expect(r.hotPathEdges).toBe(0);
+    expect(r.dependsOnEdges).toBe(1);          // dependsOn 이 있으면 그 간선은 그대로다
+    expect(r.ordered?.map((p) => p.id)).toEqual(['1', '2']);
   });
 
   test('진짜 순환은 «이름으로» 낸다 — ordered 는 undefined 이지 빈 배열이 아니다', () => {

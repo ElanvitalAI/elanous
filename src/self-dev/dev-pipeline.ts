@@ -21,7 +21,7 @@ import { readFileSync } from 'node:fs';
 import { dispatchTask, type DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
 import { getNestDepth } from '../agent/nest-depth.js';
 import { appendRunLedgerEntry } from '../self-implement/run-ledger.js';
-import { appendEvidenceLocationRequirement, extractVerbatimOriginalAsk, formatGoalFileLintFinding, inspectAskDecisionSignalMarker, leadingGoalMetadata, lintGoalFile, parseGoalId, parseGoalType, tracedPathReferences, SUPERSEDED_BY_LINE, type GoalFileLintFinding, type GoalFileLintResult } from '../self-implement/goal-author.js';
+import { appendEvidenceLocationRequirement, extractVerbatimOriginalAsk, formatGoalFileLintFinding, inspectAskDecisionSignalMarker, inspectGoalDoneBoundary, leadingGoalMetadata, lintGoalFile, markdownSection, parseGoalId, parseGoalType, tracedPathReferences, SUPERSEDED_BY_LINE, type GoalFileLintFinding, type GoalFileLintResult } from '../self-implement/goal-author.js';
 import { createRepositoryReferencedFileReader, type ReferencedFileReader } from '../self-implement/goal-file-reader.js';
 import { parseGoalDocumentClarifications } from '../self-implement/goal-author-clarification.js';
 import { requiredEvidenceFromGoal } from '../self-implement/off-diff-evidence.js';
@@ -164,8 +164,10 @@ export interface DevHarnessOpts {
 export interface DevChatOpts {
   /** 이어갈 세션 id/prefix(explicitSessionId). */
   session?: string;
-  /** 새 세션 강제(reuseActive=!forceNew 로 파생). */
+  /** 새 세션 강제(`--new` · 0.2.31 부터 기본과 같다 — 호환). */
   forceNew?: boolean;
+  /** 활성 세션 이어하기(`--continue`/`--resume` 명시 · 대표 #73). 없으면 새 세션. */
+  continueActive?: boolean;
   /** 단일 JSON 라인 출력. */
   json?: boolean;
   /** tool-loop(Read/Grep/…/Bash) 활성(elanous agent 가 켬). */
@@ -1364,6 +1366,32 @@ export function preflightGoalFileEvidence(input: DevInput, text: string, allowNo
   );
 }
 
+/** TA 발사만 강제한다. 사람의 dev ask/say는 일주일 관측용 경고와 이벤트를 남긴다. */
+export const GOAL_DONE_BOUNDARY_HUMAN_OBSERVATION_START_MS = Date.parse('2026-10-16T00:00:00+09:00');
+export const GOAL_DONE_BOUNDARY_HUMAN_OBSERVATION_END_MS = Date.parse('2026-10-23T00:00:00+09:00');
+
+export function preflightGoalDoneBoundary(input: DevInput, text: string, taskCardId = process.env.ELANOUS_TASK_CARD_ID, entrance?: EntranceId, source: 'goal' | 'request' = 'goal', nowMs = Date.now()): void {
+  if ('text' in input) return;
+  // One-week human observation is scoped to the authored ask/say doors; unrelated
+  // manual-file consumers keep their existing output contract.
+  if (!taskCardId?.trim() && entrance !== 'cli-dev-ask' && entrance !== 'cli-harness-ask' && entrance !== 'cli-harness-say') return;
+  if (!taskCardId?.trim() && (nowMs < GOAL_DONE_BOUNDARY_HUMAN_OBSERVATION_START_MS || nowMs >= GOAL_DONE_BOUNDARY_HUMAN_OBSERVATION_END_MS)) return;
+  const { missing } = inspectGoalDoneBoundary(source === 'request' ? text : markdownSection(text, 'ACCEPTANCE CRITERIA') ?? '');
+  if (missing.length === 0) {
+    debug.log('dev-pipeline', 'goal-done-boundary-ready', { file: input.file, taskCardId: taskCardId?.trim() || null, source });
+    return;
+  }
+  const card = taskCardId?.trim() || null;
+  const location = source === 'request' ? '원 요청' : '## ACCEPTANCE CRITERIA';
+  const reason = `골 완료 경계 누락: ${missing.join(' · ')} (${location} 안에 '- <이름>: <구체적 완료 조건>' 세 행을 적으세요)`;
+  if (card) {
+    debug.log('dev-pipeline', 'goal-done-boundary-rejected', { file: input.file, taskCardId: card, missing, reason, source });
+    throw new DevPipelineError(`${reason} · TA 카드 ${card}`);
+  }
+  debug.log('dev-pipeline', 'goal-done-boundary-warned', { file: input.file, taskCardId: null, missing, reason, source, observationWindow: '2026-10-16/2026-10-23' });
+  process.stderr.write(`[dev] ${reason} — 사람 요청 관측 기간에는 발사를 계속합니다\n`);
+}
+
 /** `--file` 골의 연속된 머리말 메타데이터에서 폐기 backlink를 찾아 발사 직전에 막는다. */
 export function preflightSupersededGoalFile(input: DevInput, text: string, allowSupersededGoal = false): void {
   if ('text' in input) return;
@@ -1967,6 +1995,7 @@ async function runDevPipelineDispatch(
 
   const readFile = deps.readFile ?? ((p: string) => readFileSync(p, 'utf8'));
   const inputText = resolveDevInputText(plan.input, readFile);
+  preflightGoalDoneBoundary(plan.input, inputText, process.env.ELANOUS_TASK_CARD_ID, plan.entrance);
   preflightGoalFileEvidence(plan.input, inputText, spec.allowNoEvidence === true);
   preflightSupersededGoalFile(plan.input, inputText, spec.allowSupersededGoal === true);
   preflightGoalFileLint(plan.input, inputText, plan.dispatch, deps.cwd ?? process.cwd(), spec.allowGoalLintErrors === true, deps);

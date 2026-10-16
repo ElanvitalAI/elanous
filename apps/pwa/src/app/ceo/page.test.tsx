@@ -5,6 +5,7 @@ import { DaemonClient } from '@/lib/daemon-client';
 import { routeMaturity } from '@/lib/route-maturity';
 import { SIDEBAR_NAV_ITEMS } from '@/components/shell/sidebar-nav-items';
 import CeoPage from './page';
+import { OVERVIEW_STALE_MS, OVERVIEW_VERDICT_LABEL, parseOverviewStrip } from './overview-strip';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const originalFetch = globalThis.fetch;
@@ -23,6 +24,11 @@ const seat = (id: string, green = 0, yellow = 0) => ({
 const seats = { date: '2026-10-05', seats: [seat('OP', 1), seat('TC', 1, 1), seat('MK'), seat('UX')] };
 const draftMetrics = { inventory: 168, oldestAgeHours: 119.2, needsOwner: 12, converted48h: 330, cohort48h: 701, conversion48h: 330 / 701 };
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
+const overviewBody = {
+  verdict: 'supply-empty',
+  reasons: ['빈 자리 2 · 발사 가능 칸 0'],
+  cacheAgeMs: 0,
+};
 const gridData = {
   hq: { record: { holder: '본부-OP', generation: 4, acquiredAt: 900, renewedAt: 990, ttlSeconds: 1500 }, ageSeconds: 125, expired: false, reason: null },
   members: [
@@ -60,6 +66,7 @@ test('all six cards show loading rather than unreadable before the first respons
   globalThis.fetch = (async (url: string) => {
     calls.push(url);
     await pending;
+    if (url.includes('/v1/ops/overview')) return json(overviewBody);
     if (url.includes('/v1/ops/seats')) return json(seats);
     if (url.includes('/v1/schedules')) return json({ schedules: [] });
     if (url.includes('/v1/dashboard/loops')) return json({ loops: { loops: [] } });
@@ -71,7 +78,9 @@ test('all six cards show loading rather than unreadable before the first respons
   }) as typeof fetch;
   const root = await mount();
   const labels = ['릴리스 판 진행', '루프 판정', '결정 대기 카드', '오늘 병합 PR', '위험·막힘 톱 5', '그리드', 'draft 재고'];
-  expect(calls).toHaveLength(8);
+  expect(calls).toHaveLength(9);
+  expect(card(root, '흐름 판정')).toContain('불러오는 중…');
+  expect(card(root, '흐름 판정')).not.toContain('못 잼');
   expect(root.findAllByType('section').map((section) => section.props['aria-label'])).toEqual(labels);
   for (const label of labels) {
     expect(card(root, label)).toContain('불러오는 중…');
@@ -81,6 +90,7 @@ test('all six cards show loading rather than unreadable before the first respons
   await act(async () => { release(); });
   expect(card(root, '결정 대기 카드')).toBe('결정 대기 카드0');
   expect(card(root, '그리드')).toContain('칸 사용 3/8');
+  expect(card(root, '흐름 판정')).toBe('공급 부족 · 빈 자리 2 · 발사 가능 칸 0');
 });
 
 test('failed and unanswered reads show 못 읽음 only after the request ends', async () => {
@@ -100,14 +110,15 @@ test('failed and unanswered reads show 못 읽음 only after the request ends', 
     expect(root.findAllByType('section').map((section) => section.props['aria-label'])).toEqual([
       '릴리스 판 진행', '루프 판정', '결정 대기 카드', '오늘 병합 PR', '위험·막힘 톱 5', '그리드', 'draft 재고',
     ]);
-    expect(deadlines).toHaveLength(8);
+    expect(deadlines).toHaveLength(9);
     expect(card(root, 'draft 재고')).toBe('draft 재고못 읽음');
+    expect(card(root, '흐름 판정')).toBe('못 잼');
     for (const label of ['릴리스 판 진행', '루프 판정', '결정 대기 카드', '오늘 병합 PR', '위험·막힘 톱 5']) {
       expect(card(root, label)).toContain('못 읽음');
     }
     expect(card(root, '그리드')).toContain('불러오는 중…');
     expect(card(root, '그리드')).not.toContain('못 읽음');
-    await act(async () => { deadlines[6]!(); });
+    await act(async () => { deadlines[7]!(); });
     expect(card(root, '릴리스 판 진행')).toBe('릴리스 판 진행못 읽음발행 현황 보기 →');
     expect(card(root, '루프 판정')).toBe('루프 판정못 읽음루프 상호작용 보기 →');
     expect(card(root, '결정 대기 카드')).toBe('결정 대기 카드못 읽음');
@@ -128,6 +139,7 @@ test('CEO loop card distinguishes a pending schedule, an empty schedule, and a f
   let scheduleResponse: () => Response | Promise<Response> = () => pendingSchedule;
   globalThis.fetch = (async (url: string) => {
     if (url.includes('/v1/schedules')) return scheduleResponse();
+    if (url.includes('/v1/ops/overview')) return json(overviewBody);
     if (url.includes('/v1/ops/seats')) return json(seats);
     if (url.includes('/v1/dashboard/loops')) return json({ loops: { loops: [] } });
     if (url.includes('/v1/decisions')) return json({ decisions: [] });
@@ -158,6 +170,7 @@ test('completed cards resolve independently while another request remains unansw
   const pendingGrid = new Promise<Response>((resolve) => { releaseGrid = resolve; });
   globalThis.fetch = (async (url: string) => {
     if (url.includes('/v1/grid')) return pendingGrid;
+    if (url.includes('/v1/ops/overview')) return json(overviewBody);
     if (url.includes('/v1/ops/seats')) return json(seats);
     if (url.includes('/v1/schedules')) return json({ schedules: [] });
     if (url.includes('/v1/dashboard/loops')) return json({ loops: { loops: [] } });
@@ -182,6 +195,7 @@ test('owner overview preserves four summary cards and adds two compact cards usi
   globalThis.fetch = (async (url: string, init?: RequestInit) => {
     calls.push({ url, init });
     if (url.includes('/v1/grid')) return json(gridData);
+    if (url.includes('/v1/ops/overview')) return json(overviewBody);
     if (url.includes('/v1/ops/seats')) return json(seats);
     if (url.includes('/v1/schedules')) return json({ schedules: [
       schedule('late', 'stale', 'ok', '2026-10-04T09:00:00Z'),
@@ -213,6 +227,7 @@ test('owner overview preserves four summary cards and adds two compact cards usi
   expect(card(root, '위험·막힘 톱 5')).toContain('못 읽음');
   expect(card(root, '그리드')).toContain('칸 사용 3/8');
   expect(calls.map((call) => call.url)).toEqual([
+    'https://nexus.example/v1/ops/overview',
     'https://nexus.example/v1/ops/seats',
     'https://nexus.example/v1/schedules?includeOff=1',
     'https://nexus.example/v1/dashboard/loops',
@@ -229,6 +244,7 @@ test('owner overview preserves four summary cards and adds two compact cards usi
 function gridFetch(grid: unknown, status = 200) {
   globalThis.fetch = (async (url: string) => {
     if (url.includes('/v1/grid')) return json(grid, status);
+    if (url.includes('/v1/ops/overview')) return json(overviewBody);
     if (url.includes('/v1/ops/seats')) return json(seats);
     if (url.includes('/v1/schedules')) return json({ schedules: [] });
     if (url.includes('/v1/dashboard/loops')) return json({ loops: { loops: [] } });
@@ -286,6 +302,7 @@ test('failed grid read is 못 읽음 while all five existing cards remain readab
 test('an empty schedule says 등록된 일정 0 while unreadable sources say 못 읽음 rather than zero', async () => {
   Date.now = () => at;
   globalThis.fetch = (async (url: string) => {
+    if (url.includes('/v1/ops/overview')) return json(overviewBody);
     if (url.includes('/v1/ops/seats')) return json({ error: 'forbidden' }, 403);
     if (url.includes('/v1/schedules')) return json({ schedules: [] });
     if (url.includes('/v1/dashboard/loops')) return json({ loops: { loops: [] } });
@@ -308,6 +325,7 @@ test('an empty schedule says 등록된 일정 0 while unreadable sources say 못
 test('a partial checklist, malformed schedules and truncated PR list are not measured counts', async () => {
   Date.now = () => at;
   globalThis.fetch = (async (url: string) => {
+    if (url.includes('/v1/ops/overview')) return json(overviewBody);
     if (url.includes('/v1/ops/seats')) return json({ ...seats, seats: seats.seats.map((row, index) => ({ ...row, checklist: index === 0 ? null : { green: 0, yellow: 0, red: 0, done: 0 } })) });
     if (url.includes('/v1/schedules')) return json({ schedules: [{ id: 'broken' }] });
     if (url.includes('/v1/dashboard/loops')) return json({ loops: { loops: [] } });
@@ -324,6 +342,7 @@ test('a partial checklist, malformed schedules and truncated PR list are not mea
 test('a failed loop registry never turns a readable schedule count into a false clean risk list', async () => {
   Date.now = () => at;
   globalThis.fetch = (async (url: string) => {
+    if (url.includes('/v1/ops/overview')) return json(overviewBody);
     if (url.includes('/v1/ops/seats')) return json(seats);
     if (url.includes('/v1/schedules')) return json({ schedules: [] });
     if (url.includes('/v1/dashboard/loops')) return json({ error: 'unavailable' }, 503);
@@ -340,6 +359,7 @@ test('a failed loop registry never turns a readable schedule count into a false 
 test('failed risk-run observation remains unreadable without discarding the independent merged count', async () => {
   Date.now = () => at;
   globalThis.fetch = (async (url: string) => {
+    if (url.includes('/v1/ops/overview')) return json(overviewBody);
     if (url.includes('/v1/ops/seats')) return json(seats);
     if (url.includes('/v1/schedules')) return json({ schedules: [] });
     if (url.includes('/v1/dashboard/loops')) return json({ loops: { loops: [] } });
@@ -359,6 +379,7 @@ test('failed risk-run observation remains unreadable without discarding the inde
 test('risk card sorts stopped runs, failed loops and overdue decisions newest first and caps at five on phone width', async () => {
   Date.now = () => at;
   globalThis.fetch = (async (url: string) => {
+    if (url.includes('/v1/ops/overview')) return json(overviewBody);
     if (url.includes('/v1/ops/seats')) return json(seats);
     if (url.includes('/v1/schedules')) return json({ schedules: [
       schedule('old-failure', 'live', 'error', '2026-10-05T01:00:00Z'),
@@ -402,6 +423,7 @@ test('risk card sorts stopped runs, failed loops and overdue decisions newest fi
 test('duplicate failed loop in schedule and registry occupies only one risk slot', async () => {
   Date.now = () => at;
   globalThis.fetch = (async (url: string) => {
+    if (url.includes('/v1/ops/overview')) return json(overviewBody);
     if (url.includes('/v1/ops/seats')) return json(seats);
     if (url.includes('/v1/schedules')) return json({ schedules: [schedule('duplicate', 'live', 'error', '2026-10-05T07:00:00Z')] });
     if (url.includes('/v1/dashboard/loops')) return json({ loops: { loops: [
@@ -432,6 +454,7 @@ function draftFetch(drafts: () => Response | Promise<Response>, calls: string[] 
     calls.push(url);
     if (url.includes('/v1/drafts/metrics')) return drafts();
     if (url.includes('/v1/grid')) return json(gridData);
+    if (url.includes('/v1/ops/overview')) return json(overviewBody);
     if (url.includes('/v1/ops/seats')) return json(seats);
     if (url.includes('/v1/schedules')) return json({ schedules: [] });
     if (url.includes('/v1/dashboard/loops')) return json({ loops: { loops: [] } });
@@ -547,4 +570,101 @@ test('DRAFT-METRIC card re-asks the daemon while it is measuring and stops after
     expect(calls.filter((url) => url.includes('/v1/drafts/metrics'))).toHaveLength(2);
     expect(polls).toHaveLength(1);
   } finally { timer.mockRestore(); }
+});
+
+function overviewFetch(body: unknown | (() => Response | Promise<Response>), status = 200) {
+  globalThis.fetch = (async (url: string) => {
+    if (url.includes('/v1/ops/overview')) return typeof body === 'function' ? body() : json(body, status);
+    if (url.includes('/v1/grid')) return json(gridData);
+    if (url.includes('/v1/ops/seats')) return json(seats);
+    if (url.includes('/v1/schedules')) return json({ schedules: [] });
+    if (url.includes('/v1/dashboard/loops')) return json({ loops: { loops: [] } });
+    if (url.includes('/v1/decisions')) return json({ decisions: [] });
+    if (url.includes('/v1/harness/runs')) return json({ completeness: 'complete', landed: [], finished: [], entries: [], finishedObservation: { skippedFiles: 0 } });
+    if (url.includes('/v1/drafts/metrics')) return json({ state: 'ready', metrics: draftMetrics, measuredAt: '2026-10-08T00:30:00Z', refreshing: false, reason: null });
+    throw Error(`Unexpected GET: ${url}`);
+  }) as typeof fetch;
+}
+
+test('OVW-CEO-STRIP shows verdict ⊕ first reason from GET /v1/ops/overview and marks 못 잼 · 낡음', async () => {
+  overviewFetch(overviewBody);
+  let root = await mount();
+  expect(card(root, '흐름 판정')).toBe('공급 부족 · 빈 자리 2 · 발사 가능 칸 0');
+  expect(root.findByProps({ 'aria-label': '흐름 판정' }).findByType('a').props.href).toBe('/ops/resources');
+  await act(async () => { tree!.unmount(); });
+  tree = undefined;
+
+  overviewFetch({ verdict: 'blocked', reasons: ['발행 런 승인 대기 14분'], cacheAgeMs: 0 });
+  root = await mount();
+  expect(card(root, '흐름 판정')).toBe('막힘 · 발행 런 승인 대기 14분');
+  expect(root.findByProps({ 'aria-label': '흐름 판정' }).findByType('a').props.href).toBe('/loops?view=map');
+  await act(async () => { tree!.unmount(); });
+  tree = undefined;
+
+  overviewFetch({ verdict: 'flowing', reasons: [], cacheAgeMs: OVERVIEW_STALE_MS });
+  root = await mount();
+  expect(card(root, '흐름 판정')).toBe('흐름 정상 · 사유 없음 · 낡음');
+  await act(async () => { tree!.unmount(); });
+  tree = undefined;
+
+  overviewFetch({ error: 'forbidden' }, 403);
+  root = await mount();
+  expect(card(root, '흐름 판정')).toBe('못 잼');
+  expect(card(root, '릴리스 판 진행')).toContain('green 2');
+});
+
+test('parseOverviewStrip uses Object.hasOwn for own-key verdict and rejects inherited or unknown verdicts', () => {
+  expect(parseOverviewStrip(overviewBody)).toEqual({
+    verdict: 'supply-empty', label: OVERVIEW_VERDICT_LABEL['supply-empty'],
+    reason: '빈 자리 2 · 발사 가능 칸 0', stale: false,
+  });
+  expect(parseOverviewStrip({ verdict: 'not-a-verdict', reasons: ['x'] })).toBeNull();
+  expect(parseOverviewStrip({ verdict: 'constructor', reasons: ['x'] })).toBeNull();
+  expect(parseOverviewStrip({ verdict: 'toString', reasons: ['x'] })).toBeNull();
+  expect(parseOverviewStrip({ reasons: ['x'] })).toBeNull();
+  expect(parseOverviewStrip({ verdict: 'flowing' })).toBeNull();
+  const inherited = Object.create({ verdict: 'flowing', reasons: ['inherited'] });
+  expect(Object.hasOwn(inherited, 'verdict')).toBe(false);
+  expect('verdict' in inherited).toBe(true);
+  expect(parseOverviewStrip(inherited)).toBeNull();
+  expect(parseOverviewStrip({ verdict: 'unobservable', reasons: ['판 못 잼'], cacheAgeMs: OVERVIEW_STALE_MS - 1 })?.stale).toBe(false);
+  expect(parseOverviewStrip({ verdict: 'unobservable', reasons: ['판 못 잼'], cacheAgeMs: OVERVIEW_STALE_MS })?.stale).toBe(true);
+});
+
+test('parseOverviewStrip treats malformed reasons or cacheAgeMs as 못 잼 instead of a fresh verdict', () => {
+  for (const reasons of ['x', [1], [null], { 0: 'x' }]) {
+    expect(parseOverviewStrip({ verdict: 'flowing', reasons, cacheAgeMs: 0 })).toBeNull();
+  }
+  for (const cacheAgeMs of [undefined, '0', '5000', -1, Number.NaN, Number.POSITIVE_INFINITY, null]) {
+    const body: Record<string, unknown> = { verdict: 'flowing', reasons: ['ok'] };
+    if (cacheAgeMs !== undefined) body.cacheAgeMs = cacheAgeMs;
+    expect(parseOverviewStrip(body)).toBeNull();
+  }
+  expect(parseOverviewStrip({ verdict: 'flowing', reasons: ['ok'], cacheAgeMs: 0 })).toEqual({
+    verdict: 'flowing', label: OVERVIEW_VERDICT_LABEL.flowing, reason: 'ok', stale: false,
+  });
+});
+
+test('overview request times out independently at 15s without waiting for other cards', async () => {
+  const deadlines: Array<() => void> = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, delay: number) => {
+    if (delay !== 15_000) return originalSetTimeout(callback, delay);
+    deadlines.push(callback);
+    return deadlines.length as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout);
+  try {
+    overviewFetch(() => new Promise<Response>(() => {}));
+    const root = await mount();
+    expect(deadlines).toHaveLength(9);
+    expect(card(root, '흐름 판정')).toBe('불러오는 중…');
+    expect(card(root, '릴리스 판 진행')).toContain('green 2');
+    expect(card(root, '루프 판정')).toContain('등록된 일정 0');
+    expect(card(root, '그리드')).toContain('칸 사용 3/8');
+    await act(async () => { deadlines[0]!(); });
+    expect(card(root, '흐름 판정')).toBe('못 잼');
+    expect(card(root, '릴리스 판 진행')).toContain('green 2');
+  } finally {
+    timer.mockRestore();
+  }
 });

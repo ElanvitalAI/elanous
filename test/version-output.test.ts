@@ -9,8 +9,8 @@ setDefaultTimeout(240_000);
 const repo = join(import.meta.dir, '..');
 const cli = join(repo, 'bin/elanous.mjs');
 
-function version(cwd: string): string {
-  const result = spawnSync('bun', [cli, '--version'], {
+function version(cwd: string, flag = '--version'): string {
+  const result = spawnSync('bun', [cli, flag], {
     cwd,
     encoding: 'utf8',
     timeout: 120_000,
@@ -33,4 +33,8 @@ test('version reports the package version and current checkout revision', () => 
   const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' });
   expect(head.status, head.stderr).toBe(0);
   expect(output).toBe(`${packageVersion} ${head.stdout.trim()}`);
+});
+
+test('standalone -V uses the same package version and checkout revision', () => {
+  expect(version(repo, '-V')).toBe(version(repo));
 });

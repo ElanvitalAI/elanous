@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parsePodPool, type PoolKubectl } from './pod-pool.js';
-import { harnessCpuSlotsBesideGate, measurePoolLease, probePoolDns, recommendConcurrency, POD_HOST_LEASE_ANNOTATION, type PoolLeaseMeasure } from './pod-lease.js';
+import { harnessCpuSlotsBesideGate, measurePoolLease, probePoolDns, recommendConcurrency, resolveSiTaskMemoryPolicy, POD_HOST_LEASE_ANNOTATION, type PoolLeaseMeasure } from './pod-lease.js';
 import { podJobManifest } from './self-implement-pod.js';
 import { podCommandJobManifest } from './pod-command-job.js';
 import { debug } from '../../debug/log.js';
@@ -847,6 +847,27 @@ else if (args.includes('logs')) console.log('Name: kubernetes.default.svc.cluste
 
 describe('POD-ADMIT-BY-USAGE — admission by observed Pod usage', () => {
   const mi = 1024 ** 2;
+  test('one env value restores the previous request and uncapped p95 admission; invalid values fail conservative', () => {
+    expect(resolveSiTaskMemoryPolicy(undefined)).toEqual({ requestMemory: '3Gi', admissionCapBytes: 3 * gi, source: 'default' });
+    expect(resolveSiTaskMemoryPolicy('6Gi')).toEqual({ requestMemory: '6Gi', admissionCapBytes: null, source: 'override' });
+    expect(resolveSiTaskMemoryPolicy('1Gi')).toEqual({ requestMemory: '6Gi', admissionCapBytes: null, source: 'invalid-override-fallback' });
+    expect(resolveSiTaskMemoryPolicy('32Gi')).toEqual({ requestMemory: '6Gi', admissionCapBytes: null, source: 'invalid-override-fallback' });
+  });
+  test('a fresh CLI process applies the rollback env to the Job manifest and admission cap', () => {
+    const source = `import { POD_SI_ADMISSION_CAP_BYTES, recommendConcurrency } from './src/task-orchestrator/surfaces/pod-lease.ts';
+      import { podJobManifest } from './src/task-orchestrator/surfaces/self-implement-pod.ts';
+      const gi = 1024 ** 3;
+      const job = podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60 });
+      const member = { context: 'm', capacity: 4, running: 1, pending: 0, unleasedRunning: 0, memoryLimitBytes: 16 * gi,
+        allocatableMemoryBytes: 128 * gi, allocatableCpuMillicores: 8000, availableMemoryByNodeBytes: [112 * gi], reason: null,
+        harnessUsageBytes: [10 * gi], memoryReservedBytes: 15 * gi, allocatableMemoryByNodeBytes: [128 * gi], usedMemoryByNodeBytes: [20 * gi] };
+      const admission = recommendConcurrency({ members: [member] }, { capacity: 4, accounts: 0, perAccount: 0 }).admission;
+      console.log(JSON.stringify({ request: job.spec.template.spec.containers[0].resources.requests.memory,
+        cap: POD_SI_ADMISSION_CAP_BYTES, admitBytes: admission?.admitBytes }));`;
+    const run = spawnSync('bun', ['-e', source], { cwd: process.cwd(), env: { ...process.env, ELANOUS_POD_SI_REQUEST_MEMORY: '6Gi' }, encoding: 'utf8', timeout: 20_000 });
+    expect(run.status).toBe(0);
+    expect(JSON.parse(run.stdout.trim())).toEqual({ request: '6Gi', cap: null, admitBytes: 15 * gi });
+  });
   // OP 10-07 14:4x node-b: 18 Running harness Pods (request 6Gi · limit 16Gi) using 0.3–2.6GiB, one 10GiB.
   const usageMi = [300, 290, 640, 600, 1050, 310, 2650, 290, 290, 590, 580, 580, 810, 570, 2880, 560, 500, 10240];
   const harnessPod = (name: string, phase = 'Running') => ({
@@ -873,6 +894,15 @@ describe('POD-ADMIT-BY-USAGE — admission by observed Pod usage', () => {
   const measure = (kubectl: PoolKubectl, measureUsage = true) => measurePoolLease(parsePodPool('node-b:25'), { kubectl, dns: () => 'ready', measureUsage });
   const decide = (m: PoolLeaseMeasure) => recommendConcurrency(m, { capacity: 25, accounts: 0, perAccount: 0 });
 
+  test('command Pod usage stays outside si-task p95 while its request still occupies node memory', () => {
+    const command = { metadata: { namespace: 'elanous-test', name: 'command-1', labels: { 'elanous.substrate': 'pod', 'elanous.kind': 'command', 'elanous.job': 'command-1' } },
+      status: { phase: 'Running' }, spec: { nodeName: 'node-1', containers: [{ resources: { requests: { memory: '6Gi' }, limits: { memory: '16Gi' } } }] } };
+    const m = measure(cluster({ status: 0, stdout: 'si-task-0 12m 300Mi\ncommand-1 12m 10240Mi', stderr: '' }, [harnessPod('si-task-0'), command]).kubectl);
+    expect(m.members[0]!.harnessUsageBytes).toEqual([300 * mi]);
+    expect(m.members[0]!.availableMemoryByNodeBytes).toEqual([480 * gi - 6 * gi - 6 * gi]);
+    expect(decide(m).admission).toEqual({ samples: 1, p95Bytes: 300 * mi, admitBytes: 3 * gi, fallback: null });
+  });
+
   test('18 Running Pods using 0.3–2.6GiB (one 10GiB) leave room that limit reservations call 0', () => {
     const today = decide(measure(cluster(null).kubectl, false));
     expect(today.recommended).toBe(0);
@@ -887,20 +917,20 @@ describe('POD-ADMIT-BY-USAGE — admission by observed Pod usage', () => {
       expect(m.members[0]!.memoryReservedBytes).toBe(17 * 6 * gi + 15 * gi);
       expect(m.members[0]!.memoryLimitBytes).toBe(18 * 16 * gi);
       const now = decide(m);
-      expect(now.admission).toEqual({ samples: 18, p95Bytes: 10 * gi, admitBytes: 15 * gi, fallback: null });
+      expect(now.admission).toEqual({ samples: 18, p95Bytes: 10 * gi, admitBytes: 3 * gi, fallback: null });
       expect(now.recommended).toBeGreaterThan(0);
       expect(now.recommended).toBe(7); // capacity 25 − 18 Running
       expect(now.limitedBy).toBe('capacity');
-      // node: 480 − 117 − 180 = 183Gi free, keeps 48Gi (10%) → 9 goals at 15Gi
+      // node: 480 − 117 − 180 = 183Gi free, keeps 48Gi (10%) → enough 3Gi goals to fill seven pool slots.
       expect(now.placeableSlots).toBe(7);
       expect(log.mock.calls.filter((c) => c[0] === 'pod-lease' && c[1] === 'admit-by-usage')).toHaveLength(1);
     } finally { log.mockRestore(); }
   });
 
   test('the node real-usage floor keeps 10% of allocatable free', () => {
-    // top nodes says the node already uses 400Gi: 480 − 400 − 48 = 32Gi → 2 goals at 15Gi, whatever the bookkeeping says.
-    const now = decide(measure(cluster({ status: 0, stdout: topPods(), stderr: '' }, pods, 'node-1 1m 1% 409600Mi 85%').kubectl));
-    expect(now.recommended).toBe(2);
+    // top nodes says the node already uses 427Gi: 480 − 427 − 48 = 5Gi → only one 3Gi goal.
+    const now = decide(measure(cluster({ status: 0, stdout: topPods(), stderr: '' }, pods, 'node-1 1m 1% 437248Mi 89%').kubectl));
+    expect(now.recommended).toBe(1);
     expect(now.limitedBy).toBe('memory');
   });
 

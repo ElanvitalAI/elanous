@@ -26,6 +26,7 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { androidToolchainMissing } from './lib/android-toolchain.js';
 
 const ROOT = join(import.meta.dir, '..');
 
@@ -225,6 +226,8 @@ export type AndroidGateIo = {
   readonly cwd?: string;
   readonly log?: (line: string) => void;
   readonly error?: (line: string) => void;
+  /** 툴체인 판정 심 — 기본은 bun 시험의 skip 관문과 «같은» `androidToolchainMissing()`. 다 있으면 null. */
+  readonly toolchainMissing?: () => string | null;
   /** 시험 실행 심 — 시험에서 주입한다. */
   readonly runGradle?: (androidDir: string) => { readonly status: number | null; readonly output: string };
   /** 결과 XML 읽기 심. */
@@ -381,6 +384,19 @@ export function runAndroidUnitTestGate(io: AndroidGateIo = {}): number {
       // ⭐ 「해당 없음」을 «말한다» — 조용한 통과는 오늘 우리가 당한 그것이다.
       log(`[android-gate] 해당 없음 — 변경 ${changed.length}개 중 ${ANDROID_PREFIX} 아래 파일 0개.`);
       return 0;
+    }
+    // ⭐ R5a(0.2.31 · OP #8961): 바뀐 안드로이드 파일이 «전부» bun 시험(.test.ts)이고 이 호스트에 툴체인이 없으면
+    //    Gradle 축은 «측정 대상 아님»이다 — 그 파일들은 Kotlin 컴파일러가 안 읽어 Gradle 결과를 못 바꾸고,
+    //    그 자체는 bun 러너가 잰다(툴체인이 없으면 시험이 «전제 없음» 이유를 찍고 skip).
+    //    ⛔ 「Gradle 통과」로 말하지 않는다. Kotlin·Gradle 설정이 하나라도 바뀌었으면 아래 기존 판정(0 = 실패) 그대로다.
+    //    면제는 «Kotlin 소스셋 안»의 bun 시험만이다(`androidKotlinSourcesetTestTsFiles` · r2 리뷰) — 그 밖의 .test.ts 는 기존 판정.
+    if (androidKotlinSourcesetTestTsFiles(hits).length === hits.length) {
+      const missing = (io.toolchainMissing ?? androidToolchainMissing)();
+      if (missing) {
+        log(`[android-gate] 측정 대상 아님 — 이 호스트에 안드로이드 툴체인이 없다: ${missing}`);
+        log(`   바뀐 안드로이드 파일 ${hits.length}개가 전부 bun 시험(.test.ts)이라 Gradle 결과를 바꾸지 못한다 — 그 시험은 bun 러너가 잰다. ⛔ 「Gradle 통과」가 아니라 「Gradle 안 잼」이다.`);
+        return 0;
+      }
     }
     log(`[android-gate] 대상 ${hits.length}개 (변경 ${changed.length}개 중) — 시험을 돌린다.`);
   }

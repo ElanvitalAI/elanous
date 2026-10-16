@@ -9,6 +9,18 @@ import {
 const SIMPLE = 'flowchart LR\n    A[Start] --> B[End]';
 const MULTI = 'flowchart LR\n    A[Root] --> B[Top]\n    A --> C[Bot]\n    B --> D[Done]\n    C --> D';
 
+async function withTerm<T>(term: string | undefined, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.TERM;
+  if (term === undefined) delete process.env.TERM;
+  else process.env.TERM = term;
+  try {
+    return await run();
+  } finally {
+    if (previous === undefined) delete process.env.TERM;
+    else process.env.TERM = previous;
+  }
+}
+
 describe('buildMermaidRenderTool', () => {
   test('schema declares source required + format enum', () => {
     const spec = buildMermaidRenderTool();
@@ -27,7 +39,9 @@ describe('mermaidRendererAvailable', () => {
 
 describe('dispatchMermaidRender — happy path', () => {
   test('renders a simple flowchart to Unicode boxes', async () => {
-    const r = await dispatchMermaidRender({ source: SIMPLE });
+    // Unspecified format resolves from $TERM (unset/dumb → ascii). A gate Pod runs with no TERM,
+    // so pin a capable terminal here; the TERM-less branch is asserted separately below.
+    const r = await withTerm('xterm-256color', () => dispatchMermaidRender({ source: SIMPLE }));
     expect(r.metadata.renderer).toBe('mermaidtui');
     expect(r.metadata.format).toBe('unicode');
     // Contains at least one Unicode box-drawing char.
@@ -35,6 +49,12 @@ describe('dispatchMermaidRender — happy path', () => {
     // Contains node labels.
     expect(r.output).toContain('Start');
     expect(r.output).toContain('End');
+  });
+
+  test.each([[undefined], ['dumb']])('unspecified format with TERM=%p falls back to ASCII', async (term) => {
+    const r = await withTerm(term, () => dispatchMermaidRender({ source: SIMPLE }));
+    expect(r.metadata.format).toBe('ascii');
+    expect(r.output).not.toMatch(/[┌┐└┘]/);
   });
 
   test('format:"ascii" uses ASCII corners', async () => {

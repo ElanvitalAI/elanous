@@ -1,9 +1,9 @@
 import { expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { registerSeatBootCommands } from './seat-cli.js';
+import { assembleSeatQuickPath, assembleSeatTacitKnowledge, collectSeatLadderSections, registerSeatBootCommands, renderSeatBootCard, SEAT_QUICKSTART_MANUAL, SEAT_TRUST_LADDER } from './seat-cli.js';
 import { MsgStore } from '../msg/msg-store.js';
 
 function fixture() {
@@ -132,7 +132,7 @@ test('CLI entry writes the local boot card to stdout only', () => {
     expect(stdout).toContain('Local handoff heading');
     expect(stderr).toBe('');
   } finally { rmSync(home, { recursive: true, force: true }); }
-});
+}, 120_000);
 
 test('seat boot marks absent sources as unobserved and rejects non-seat values', async () => {
   const home = mkdtempSync(join(tmpdir(), 'seat-boot-empty-'));
@@ -151,4 +151,203 @@ test('seat boot marks absent sources as unobserved and rejects non-seat values',
     expect(errors.at(-1)).toContain('unknown seat');
     expect(process.exitCode).toBe(2);
   } finally { process.exitCode = prior ?? 0; log.mockRestore(); error.mockRestore(); rmSync(home, { recursive: true, force: true }); }
+});
+
+const MANUAL = [
+  '# MANUAL',
+  '## 0. 세 줄 원칙',
+  '| 하려는 것 | 명령 | ⛔ 하지 말 것 |',
+  '## 1. 무엇을 하려면 → 명령',
+  '| 하려는 것 | 명령 | ⛔ 하지 말 것 |',
+  '|---|---|---|',
+  '| 받은 메시지 보기 | `eln msg list --to <자리>` · ⚠️ codex·elanous 세션은 **스스로 안 깨어난다** — `tmux.target` 등록 | Claude Monitor 를 가정 |',
+  '| 시뮬 기록 | `sim-log.sh <S1|S2> <pass|fail>` | 원장에 안 적기 |',
+  '| 착지 | `eln pr land --pr <N>` · `… --dry-run` | `gh pr merge` 직접 |',
+  '## 2. 막히면',
+  '| 묻기 | `eln msg post` | 손으로 |',
+].join('\n');
+
+test('L1 assembles the «무엇→명령» quick path and keeps agent notes only for the named agents', () => {
+  const codex = assembleSeatQuickPath(MANUAL, 'codex');
+  expect(codex).toEqual([
+    '받은 메시지 보기 → eln msg list --to <자리> · ⚠️ codex·elanous 세션은 스스로 안 깨어난다 — tmux.target 등록 ⛔ Claude Monitor 를 가정',
+    '시뮬 기록 → sim-log.sh <S1|S2> <pass|fail> ⛔ 원장에 안 적기',
+    '착지 → eln pr land --pr <N> · … --dry-run ⛔ `gh pr merge` 직접',
+  ]);
+  expect(assembleSeatQuickPath(MANUAL, 'elanous')[0]).toContain('스스로 안 깨어난다');
+  expect(assembleSeatQuickPath(MANUAL, 'claude')[0]).toBe('받은 메시지 보기 → eln msg list --to <자리> ⛔ Claude Monitor 를 가정');
+  expect(assembleSeatQuickPath('# 표 없음\n| a | `b` | c |', 'codex')).toEqual([]);
+});
+
+const card = (n: number, verified: string, status = 'active') => `## K-MK-${String(n).padStart(2, '0')} 항목 ${n}${n === 3 ? ' codex 함정' : ''}\n- 상태: ${status}\n- 검증: ${verified}\n`;
+
+test('L3 orders visible seat KNOWHOW before top-N memories (지시>코드>문서>기억), each ranked by recency then hits', () => {
+  const knowhow = ['# MK KNOWHOW', card(1, '2026-10-01 참'), card(2, '2026-10-10 참'), card(3, '2026-10-10 참'), card(4, '2026-10-12 참', 'superseded-by K-MK-05'), card(5, '2026-10-02 못잼', 'unproven')].join('\n');
+  const rows = assembleSeatTacitKnowledge({
+    seat: 'MK', agent: 'codex', knowhow, now: new Date('2026-10-15T00:00:00Z'), limit: 3,
+    memories: [
+      { title: '옛 기억', hook: '오래됨', updated: '2026-09-01T00:00:00Z' },
+      { title: '오늘 일반', hook: '무관', updated: '2026-10-14T01:00:00Z' },
+      { title: '오늘 codex', hook: 'MK 자리 함정', updated: '2026-10-14T00:00:00Z' },
+      { title: '어제', hook: '', updated: '2026-10-13T00:00:00Z' },
+    ],
+  });
+  expect(rows).toEqual([
+    SEAT_TRUST_LADDER,
+    '[문서] K-MK-03 항목 3 codex 함정',
+    '[문서] K-MK-02 항목 2',
+    '[문서·검증 안 됨] K-MK-05 항목 5',
+    '[문서] K-MK-01 항목 1',
+    '[기억] 오늘 codex — MK 자리 함정 (갱신 2026-10-14)',
+    '[기억] 오늘 일반 — 무관 (갱신 2026-10-14)',
+    '[기억] 어제 (갱신 2026-10-13)',
+  ]);
+  expect(SEAT_TRUST_LADDER).toContain('지시 > 코드 > 문서 > 기억');
+  expect(assembleSeatTacitKnowledge({ seat: 'MK', agent: 'claude', knowhow: '', memories: [], now: new Date() })).toEqual([SEAT_TRUST_LADDER]);
+});
+
+test('L3 includes KNOWHOW advice and keeps top memories visible when KNOWHOW exceeds the card budget', async () => {
+  const now = new Date('2026-10-15T00:00:00Z');
+  const make = (advice: string) => ['# MK KNOWHOW', ...Array.from({ length: 20 }, (_, i) =>
+    `${card(i + 1, '2026-10-10 참')}- 처방(힐링): 먼저 로그를 본다\n- 재는 명령: ${i === 0 ? advice : `조치 ${i + 1}`}\n`)].join('\n');
+  const memories = Array.from({ length: 5 }, (_, i) => ({ title: `기억 ${i + 1}`, hook: `명령 ${i + 1}`, updated: '2026-10-11T00:00:00Z' }));
+  const rows = assembleSeatTacitKnowledge({ seat: 'MK', agent: 'codex', knowhow: make('원격 게이트부터 재측정'), memories, now });
+  const changed = assembleSeatTacitKnowledge({ seat: 'MK', agent: 'codex', knowhow: make('로컬 게이트부터 재측정'), memories, now });
+  expect(rows.filter(row => /^\[문서(?:·검증 안 됨)?\] K-MK-/.test(row))).toHaveLength(5);
+  expect(rows).toContain('[문서] 나머지 15항목은 원문 KNOWHOW 참고');
+  expect(rows.filter(row => row.startsWith('[기억]'))).toHaveLength(5);
+  expect(rows.some(row => row.includes('먼저 로그를 본다'))).toBe(true);
+  expect(rows.some(row => row.includes('원격 게이트부터 재측정'))).toBe(true);
+  expect(changed.some(row => row.includes('로컬 게이트부터 재측정'))).toBe(true);
+  const rendered = renderSeatBootCard('MK', [{ title: 'L3 암묵지', source: 'fixture', updated: '2026-10-15', rows }], null);
+  expect(rendered).toContain('원격 게이트부터 재측정');
+  expect(rendered).toContain('[기억] 기억 5');
+
+  // The actual Commander boot path renders every L3 row; MAX_ROWS limits L0 metadata collection only.
+  const home = mkdtempSync(join(tmpdir(), 'seat-ladder-many-home-'));
+  const repo = mkdtempSync(join(tmpdir(), 'seat-ladder-many-repo-'));
+  const output: string[] = [];
+  const log = spyOn(console, 'log').mockImplementation((line: string) => output.push(line));
+  try {
+    mkdirSync(join(repo, 'docs', 'roles', 'MK'), { recursive: true });
+    writeFileSync(join(repo, 'docs', 'roles', 'MK', 'KNOWHOW.md'), make('원격 게이트부터 재측정'));
+    const memoryDir = join(home, 'elanous-hq', 'seat-state', 'memory');
+    mkdirSync(memoryDir, { recursive: true });
+    writeFileSync(join(memoryDir, 'MEMORY.md'), memories.map((entry, i) => `- [${entry.title}](memory-${i}.md) — ${entry.hook}`).join('\n'));
+    for (let i = 0; i < memories.length; i++) {
+      const path = join(memoryDir, `memory-${i}.md`);
+      writeFileSync(path, 'memory detail\n');
+      utimesSync(path, new Date(memories[i]!.updated), new Date(memories[i]!.updated));
+    }
+    const cli = new Command();
+    registerSeatBootCommands(cli.command('seat'), { home: () => home, repoRoot: () => repo, contextNow: () => ({}), now: () => now });
+    await cli.parseAsync(['seat', 'boot', 'MK', '--agent', 'codex'], { from: 'user' });
+    const cardText = output.at(-1)!;
+    expect(cardText).toContain('원격 게이트부터 재측정');
+    expect(cardText).toContain('나머지 15항목은 원문 KNOWHOW 참고');
+    expect(cardText.match(/^- \[기억\] 기억 /gm)).toHaveLength(5);
+    expect(cardText.indexOf('[문서] K-MK-01')).toBeLessThan(cardText.indexOf('[기억] 기억 1'));
+  } finally { log.mockRestore(); rmSync(home, { recursive: true, force: true }); rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('L1 and L3 assemble rows from the repository manual and TC KNOWHOW', () => {
+  const home = mkdtempSync(join(tmpdir(), 'seat-ladder-real-'));
+  try {
+    const repoRoot = join(import.meta.dir, '..', '..');
+    const sections = collectSeatLadderSections('TC', 'codex', { home, repoRoot, now: new Date('2026-10-16T00:00:00Z') });
+    expect(sections[0]!.rows.some(row => row.includes('→'))).toBe(true);
+    expect(sections[1]!.rows.some(row => row.startsWith('[문서] K-TC-'))).toBe(true);
+    expect(sections[1]!.rows.some(row => row.includes('↳') && row.includes('처방'))).toBe(true);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('seat boot --agent appends L1 and L3 after the L0 card; without --agent the card stays L0 only', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'seat-boot-ladder-'));
+  const repo = mkdtempSync(join(tmpdir(), 'seat-boot-repo-'));
+  mkdirSync(join(repo, 'docs', 'manual'), { recursive: true });
+  mkdirSync(join(repo, 'docs', 'roles', 'MK'), { recursive: true });
+  writeFileSync(join(repo, SEAT_QUICKSTART_MANUAL), MANUAL);
+  writeFileSync(join(repo, 'docs', 'roles', 'MK', 'KNOWHOW.md'), card(2, '2026-10-10 참'));
+  const memory = join(home, 'elanous-hq', 'seat-state', 'memory');
+  mkdirSync(memory, { recursive: true });
+  writeFileSync(join(memory, 'MEMORY.md'), '# Memory index\n- [사라진 기억](gone.md) — 깨진 링크\n- [착지 슬롯](land-slots.md) — 전 자리 합 2\n');
+  writeFileSync(join(memory, 'land-slots.md'), 'body stays private\n');
+  utimesSync(join(memory, 'land-slots.md'), new Date('2026-10-09T00:00:00Z'), new Date('2026-10-09T00:00:00Z'));
+  const output: string[] = [];
+  const errors: string[] = [];
+  const log = spyOn(console, 'log').mockImplementation((line: string) => output.push(line));
+  const error = spyOn(console, 'error').mockImplementation((line: string) => errors.push(line));
+  const prior = process.exitCode;
+  const cli = new Command();
+  registerSeatBootCommands(cli.command('seat'), { home: () => home, contextNow: () => ({}), repoRoot: () => repo, now: () => new Date('2026-10-15T00:00:00Z') });
+  try {
+    await cli.parseAsync(['seat', 'boot', 'MK'], { from: 'user' });
+    expect(output.at(-1)).toContain('## HANDOFF');
+    expect(output.at(-1)).not.toContain('## L1');
+    await cli.parseAsync(['seat', 'boot', 'MK', '--agent', 'claude'], { from: 'user' });
+    const text = output.at(-1)!;
+    expect(text.indexOf('## 공통 메모리 색인')).toBeLessThan(text.indexOf('## L1 빠른 길 (claude)'));
+    expect(text.indexOf('## L1 빠른 길 (claude)')).toBeLessThan(text.indexOf('## L3 암묵지 (claude)'));
+    expect(text).toContain('- 착지 → eln pr land --pr <N>');
+    expect(text).not.toContain('스스로 안 깨어난다');
+    expect(text).toContain(`- ${SEAT_TRUST_LADDER}`);
+    expect(text).toContain('- [문서] K-MK-02 항목 2');
+    expect(text).toContain('- [기억] 착지 슬롯 — 전 자리 합 2 (갱신 2026-10-09)');
+    expect(text).not.toContain('사라진 기억');
+    expect(text).not.toContain('body stays private');
+    await cli.parseAsync(['seat', 'boot', 'MK', '--agent', 'codex'], { from: 'user' });
+    expect(output.at(-1)).toContain('스스로 안 깨어난다');
+    process.exitCode = 0;
+    await cli.parseAsync(['seat', 'boot', 'MK', '--agent', 'gemini'], { from: 'user' });
+    expect(errors.at(-1)).toContain('unknown agent');
+    expect(process.exitCode).toBe(2);
+  } finally { process.exitCode = prior ?? 0; log.mockRestore(); error.mockRestore(); rmSync(home, { recursive: true, force: true }); rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('L3 marks a missing KNOWHOW and a missing memory index as 미관측 instead of showing only the trust ladder', () => {
+  const home = mkdtempSync(join(tmpdir(), 'seat-ladder-absent-'));
+  const repo = mkdtempSync(join(tmpdir(), 'seat-ladder-repo-'));
+  const l3 = () => collectSeatLadderSections('MK', 'codex', { home, repoRoot: repo, now: new Date('2026-10-15T00:00:00Z') }).find(section => section.title.startsWith('L3'))!.rows;
+  try {
+    expect(l3()).toEqual([SEAT_TRUST_LADDER, '미관측: KNOWHOW 파일 없음', '미관측: 기억 색인 파일 없음']);
+    mkdirSync(join(repo, 'docs', 'roles', 'MK'), { recursive: true });
+    writeFileSync(join(repo, 'docs', 'roles', 'MK', 'KNOWHOW.md'), card(2, '2026-10-10 참'));
+    expect(l3()).toEqual([SEAT_TRUST_LADDER, '[문서] K-MK-02 항목 2', '미관측: 기억 색인 파일 없음']);
+    const memory = join(home, 'elanous-hq', 'seat-state', 'memory');
+    mkdirSync(memory, { recursive: true });
+    writeFileSync(join(memory, 'MEMORY.md'), '# Memory index\n- [사라진 기억](gone.md) — 깨진 링크\n');
+    expect(l3()).toEqual([SEAT_TRUST_LADDER, '[문서] K-MK-02 항목 2', '미관측: 기억 색인에 읽을 항목 없음']);
+    writeFileSync(join(memory, 'MEMORY.md'), '- [착지 슬롯](land-slots.md) — 전 자리 합 2\n');
+    writeFileSync(join(memory, 'land-slots.md'), 'body\n');
+    utimesSync(join(memory, 'land-slots.md'), new Date('2026-10-09T00:00:00Z'), new Date('2026-10-09T00:00:00Z'));
+    writeFileSync(join(repo, 'docs', 'roles', 'MK', 'KNOWHOW.md'), '# MK KNOWHOW\n');
+    expect(l3()).toEqual([SEAT_TRUST_LADDER, '미관측: KNOWHOW 에 읽을 항목 없음', '[기억] 착지 슬롯 — 전 자리 합 2 (갱신 2026-10-09)']);
+  } finally { rmSync(home, { recursive: true, force: true }); rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('L1·L3 read the manual and KNOWHOW inside the repo but not through a link that leaves the repo', () => {
+  const home = mkdtempSync(join(tmpdir(), 'seat-ladder-link-'));
+  const repo = mkdtempSync(join(tmpdir(), 'seat-ladder-repo-'));
+  const outside = mkdtempSync(join(tmpdir(), 'seat-ladder-outside-'));
+  const sections = () => collectSeatLadderSections('MK', 'claude', { home, repoRoot: repo, now: new Date('2026-10-15T00:00:00Z') });
+  try {
+    mkdirSync(join(repo, 'docs', 'manual'), { recursive: true });
+    mkdirSync(join(repo, 'docs', 'roles', 'MK'), { recursive: true });
+    writeFileSync(join(outside, 'manual.md'), MANUAL.replace('착지', '바깥 착지'));
+    writeFileSync(join(outside, 'KNOWHOW.md'), card(1, '2026-10-10 바깥'));
+    symlinkSync(join(outside, 'manual.md'), join(repo, SEAT_QUICKSTART_MANUAL));
+    symlinkSync(join(outside, 'KNOWHOW.md'), join(repo, 'docs', 'roles', 'MK', 'KNOWHOW.md'));
+    const [linkedL1, linkedL3] = sections();
+    expect(linkedL1!.rows).toEqual([]);
+    expect(linkedL1!.reason).toBe('미관측: 파일 없음');
+    expect(linkedL3!.rows).toContain('미관측: KNOWHOW 파일 없음');
+    expect(JSON.stringify([linkedL1, linkedL3])).not.toContain('바깥');
+    rmSync(join(repo, SEAT_QUICKSTART_MANUAL));
+    rmSync(join(repo, 'docs', 'roles', 'MK', 'KNOWHOW.md'));
+    writeFileSync(join(repo, SEAT_QUICKSTART_MANUAL), MANUAL);
+    writeFileSync(join(repo, 'docs', 'roles', 'MK', 'KNOWHOW.md'), card(2, '2026-10-10 참'));
+    const [l1, l3] = sections();
+    expect(l1!.rows).toContain('착지 → eln pr land --pr <N> · … --dry-run ⛔ `gh pr merge` 직접');
+    expect(l3!.rows).toContain('[문서] K-MK-02 항목 2');
+  } finally { for (const dir of [home, repo, outside]) rmSync(dir, { recursive: true, force: true }); }
 });

@@ -8,7 +8,55 @@ import {
   writeRunGraphYaml,
 } from '@/lib/run-graph-yaml-edit';
 import { layeredPositions } from '@/lib/graph-edge-route';
+import { collapseGroups, GROUP_NODE_PREFIX, groupNames, groupOf, isGroupNodeId, type GroupedRunGraph } from './graph-groups';
 import type { RunStep } from '../../../../../src/self-implement/run-step-projection';
+
+/** Read-only projection for the editor. The YAML source and its node positions never change when a unit is folded. */
+export function canvasGroupGraph(graph: CanvasGraph): GroupedRunGraph {
+  return {
+    id: graph.graphId, source: 'mine', editable: true,
+    entry_node: graph.entry ?? '', terminal_nodes: graph.terminals,
+    nodes: graph.nodes.map((node) => ({
+      node_id: node.id, kind: node.kind, recipe: node.recipe, max_visits: node.maxVisits,
+      ...(typeof node.extra?.group === 'string' ? { group: node.extra.group } : {}),
+    })),
+    edges: graph.edges.map((edge) => edge.outcome
+      ? { from: edge.from, on: 'outcome', map: { [edge.outcome]: edge.to } }
+      : { from: edge.from, to: edge.to }),
+  };
+}
+
+export function projectCanvasGroups(graph: CanvasGraph, collapsed: ReadonlySet<string>, inside: string | null = null): CanvasGraph {
+  const source = canvasGroupGraph(graph);
+  const names = groupNames(source);
+  if (names.length === 0 || (!inside && !names.some((name) => collapsed.has(name)))) return graph;
+  const groups = groupOf(source);
+  const view = inside && names.includes(inside)
+    ? { ...source, nodes: source.nodes.filter((node) => groups.get(node.node_id) === inside),
+        edges: source.edges.flatMap((edge) => {
+          if (groups.get(edge.from) !== inside) return [];
+          if (edge.to) return groups.get(edge.to) === inside ? [edge] : [];
+          const map = Object.fromEntries(Object.entries(edge.map ?? {}).filter(([, to]) => groups.get(to) === inside));
+          return Object.keys(map).length ? [{ from: edge.from, on: edge.on, map }] : [];
+        }),
+      }
+    : collapseGroups(source, collapsed).graph;
+  const originals = new Map(graph.nodes.map((node) => [node.id, node]));
+  const nodes: CanvasNode[] = view.nodes.map((node) => {
+    const original = originals.get(node.node_id);
+    if (original) return original;
+    const first = graph.nodes.find((candidate) => groups.get(candidate.id) === node.group)!;
+    return { id: node.node_id, kind: node.kind, recipe: node.recipe, maxVisits: node.max_visits, x: first.x, y: first.y };
+  });
+  const edges: CanvasEdge[] = view.edges.flatMap((edge) => edge.to
+    ? [{ from: edge.from, to: edge.to, outcome: '' }]
+    : Object.entries(edge.map ?? {}).map(([outcome, to]) => ({ from: edge.from, to, outcome })));
+  const known = new Set(nodes.map((node) => node.id));
+  const resolve = inside ? (id: string) => id : collapseGroups(source, collapsed).resolve;
+  const resolvedEntry = resolve(graph.entry ?? '');
+  const entry = known.has(resolvedEntry) ? resolvedEntry : (nodes[0]?.id ?? null);
+  return { ...graph, nodes, edges, entry, terminals: [...new Set(graph.terminals.map(resolve))].filter((id) => known.has(id)) };
+}
 
 /** Pure model behind the custom graph canvas (CGE-EDIT). No DOM — every edit returns a new graph.
  *  YAML goes through the existing run-graph-yaml-edit helpers; the server loader stays the authority
@@ -425,4 +473,80 @@ export function autoLayout(graph: CanvasGraph, flow: CanvasFlow = 'horizontal'):
 function extrasOf(source: Record<string, unknown>, known: readonly string[]): { extra?: Record<string, unknown> } {
   const extra = Object.fromEntries(Object.entries(source).filter(([key]) => !known.includes(key)));
   return Object.keys(extra).length > 0 ? { extra } : {};
+}
+
+/** CGE-UNITS — 유닛 두 보기의 모델 부분. 유닛은 노드의 `group:` 꼬리표에서 온다(라이브 런 페이지가 읽는 것과
+ *  같은 꼬리표) — 접고 펼치는 판단은 graph-groups 의 collapseGroups 에 위임한다(같은 부품, 다시 만들지 않는다). */
+
+/** Unit names in first-declared order — a graph without `group:` tags has none. */
+export function canvasUnitNames(graph: CanvasGraph): string[] {
+  return groupNames(canvasToGrouped(graph));
+}
+
+/** node id → unit name, only for nodes carrying a non-empty `group:` tag. */
+export function canvasUnitOf(graph: CanvasGraph): Map<string, string> {
+  return groupOf(canvasToGrouped(graph));
+}
+
+/** The graph with every unit in `collapsed` folded into one node — a VIEW: the source graph is left as it is, and with
+ *  nothing folded it is the very same object (the integrated view edits the real graph). */
+export function collapseCanvasUnits(graph: CanvasGraph, collapsed: ReadonlySet<string>): CanvasGraph {
+  if (collapsed.size === 0) return graph;
+  return groupedToCanvas(collapseGroups(canvasToGrouped(graph), collapsed).graph, graph);
+}
+
+/** Canvas shape → the shared run-graph shape graph-groups reads (per-outcome edges of one source merge back into one
+ *  `on: outcome` map edge). */
+function canvasToGrouped(graph: CanvasGraph): GroupedRunGraph {
+  const edges: GroupedRunGraph['edges'] = [];
+  const maps = new Map<string, Record<string, string>>();
+  for (const edge of graph.edges) {
+    if (!edge.outcome) { edges.push({ from: edge.from, to: edge.to }); continue; }
+    const map = maps.get(edge.from);
+    if (map) map[edge.outcome] = edge.to;
+    else {
+      const fresh = { [edge.outcome]: edge.to };
+      maps.set(edge.from, fresh);
+      edges.push({ from: edge.from, on: OUTCOME_ON, map: fresh });
+    }
+  }
+  return {
+    id: graph.graphId || 'canvas',
+    source: 'mine',
+    editable: true,
+    entry_node: graph.entry ?? '',
+    terminal_nodes: graph.terminals,
+    nodes: graph.nodes.map((node) => {
+      const tag = unitTagOf(node);
+      return { node_id: node.id, kind: node.kind, recipe: node.recipe, max_visits: node.maxVisits, ...(tag !== null ? { group: tag } : {}) };
+    }),
+    edges,
+  };
+}
+
+/** The `group:` tag trimmed the way groupOf reads it — `group: ''` counts as no unit. */
+function unitTagOf(node: CanvasNode): string | null {
+  const tag = typeof node.extra?.group === 'string' ? node.extra.group.trim() : '';
+  return tag ? tag : null;
+}
+
+/** Shared run-graph shape (already collapsed) → canvas shape, carrying the source positions over — a folded unit starts
+ *  at its members' centroid until the canvas re-lays the view out. */
+function groupedToCanvas(view: GroupedRunGraph, source: CanvasGraph): CanvasGraph {
+  const membersByUnit = new Map<string, CanvasNode[]>();
+  for (const node of source.nodes) {
+    const tag = unitTagOf(node);
+    if (tag !== null) membersByUnit.set(tag, [...(membersByUnit.get(tag) ?? []), node]);
+  }
+  const at = new Map(source.nodes.map((node) => [node.id, node]));
+  const nodes: CanvasNode[] = view.nodes.map((node) => {
+    const members = isGroupNodeId(node.node_id) ? membersByUnit.get(node.node_id.slice(GROUP_NODE_PREFIX.length)) ?? [] : [];
+    const x = members.length > 0 ? members.reduce((sum, member) => sum + member.x, 0) / members.length : (at.get(node.node_id)?.x ?? 0);
+    const y = members.length > 0 ? members.reduce((sum, member) => sum + member.y, 0) / members.length : (at.get(node.node_id)?.y ?? 0);
+    return { id: node.node_id, kind: node.kind, recipe: node.recipe, maxVisits: node.max_visits, x, y };
+  });
+  const edges: CanvasEdge[] = view.edges.flatMap((edge) => 'map' in edge && edge.map
+    ? Object.entries(edge.map).map(([outcome, to]) => ({ from: edge.from, to, outcome }))
+    : [{ from: edge.from, to: edge.to ?? '', outcome: '' }]);
+  return { graphId: source.graphId, entry: view.entry_node || null, terminals: view.terminal_nodes, nodes, edges };
 }

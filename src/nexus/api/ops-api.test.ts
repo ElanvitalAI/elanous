@@ -363,3 +363,67 @@ test('GATE-LIVE-OBS: a run sitting on gate carries the shard table of its own ve
     expect(runs.find((run) => run.runId === 'publishing')?.gateShards).toBeUndefined();
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('resources: bearerless 401, stale cache answered immediately, and the injected collector/ssh path is never called', async () => {
+  const { send } = fixture(true);
+  // No credential offered at all → 401, before the cache is even built.
+  expect((await send('/v1/ops/resources'))?.status).toBe(401);
+  let clock = Date.now();
+  let collects = 0;
+  let podCalls = 0;
+  let tick = () => {};
+  const collect = async (): Promise<OverviewSnapshot> => {
+    collects++;
+    return {
+      generatedAt: new Date(clock).toISOString(), instanceRoot: '/test', since: '최근 1h',
+      release: { version: okCell('0.2.28', 'test ledger', new Date(clock).toISOString()), run: okCell('none' as const, 'test ledger', new Date(clock).toISOString()), schedule: okCell('none' as const, 'test ledger', new Date(clock).toISOString()), checklist: okCell({ green: 1, yellow: 0, red: 0, done: 0, p0Yellow: 0 }, 'test ledger', new Date(clock).toISOString()) },
+      tasks: { byOwner: okCell({}, 'test ledger', new Date(clock).toISOString()), done: okCell(0, 'test ledger', new Date(clock).toISOString()),
+        launchable: okCell({ count: 0, ids: [], skipped: { noTargetPath: 0, predecessorOpen: 0, alreadyHanded: 0 }, interim: true }, 'test ledger', new Date(clock).toISOString()),
+        capacity: okCell({ podUsed: 1, podTarget: 2, localUsed: 0, localMax: 0, free: 1 }, 'test ledger', new Date(clock).toISOString()) },
+      machines: {
+        hosts: [{ name: 'grid-1', load: okCell({ load1: 1.5, load5: 2.5, load15: 3.5, cpuCount: 8, freeGb: 4.5, totalGb: 16, ageSeconds: 30 }, 'machine heartbeat', new Date(clock).toISOString()) }],
+        pods: [{ context: 'pool-a', capacity: 2, occupied: unmeasured('pod pool', 'pending') }],
+        parents: okCell({ count: 0, staleOver6h: 0, oldestHours: null }, 'test ledger', new Date(clock).toISOString()),
+      },
+      landings: okCell({ count: 0, recent: [] }, 'test ledger', new Date(clock).toISOString()), loops: [],
+    };
+  };
+  const headers = { 'x-elanous-operator': SECRET };
+  // A cache with nothing in it yet: answered at once with { stale: true }, no collection started.
+  setOverviewCacheForTest(createOverviewCache({ now: () => clock, collect, measurePods: async () => {
+    podCalls++;
+    return [{ context: 'pool-a', occupied: 1, reason: null, observedAt: clock }];
+  }, schedule: (fn) => ({ unref() { tick = fn; } }) as ReturnType<typeof setInterval> }));
+  try {
+    const start = performance.now();
+    const empty = await send('/v1/ops/resources', headers);
+    expect(performance.now() - start).toBeLessThan(2_000);
+    expect(empty?.status).toBe(200);
+    expect(await empty?.json()).toEqual({ stale: true });
+    expect(collects).toBe(0);
+    expect(podCalls).toBe(0);
+    // The overview read fills the memo; the map endpoint then folds it — collector not called again.
+    await send('/v1/ops/overview', headers);
+    expect(collects).toBe(1);
+    const map = await (await send('/v1/ops/resources', headers))?.json() as {
+      generatedAt: string; readAt: string; missing: string[];
+      hosts: Array<{ name: string; load5: { value: number | null; observedAt: string | null; missing: string | null } }>;
+      pods: Array<{ context: string; capacity: number; occupied: { value: number | null; observedAt: string | null; missing: string | null } }>;
+    };
+    expect(collects).toBe(1);
+    expect(podCalls).toBe(0);
+    expect(map.hosts[0]?.name).toBe('grid-1');
+    expect(map.hosts[0]?.load5.value).toBe(2.5);
+    expect(map.pods[0]).toEqual({ context: 'pool-a', capacity: 2, occupied: { value: null, observedAt: null, missing: '측정 대기' } });
+    // After the background Pod tick the overlay lands without any new collection.
+    tick();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const overlaid = await (await send('/v1/ops/resources', headers))?.json() as typeof map;
+    expect(collects).toBe(1);
+    expect(podCalls).toBe(1);
+    expect(overlaid.pods[0]?.occupied.value).toBe(1);
+    expect(overlaid.pods[0]?.occupied.missing).toBeNull();
+  } finally {
+    setOverviewCacheForTest(null);
+  }
+});

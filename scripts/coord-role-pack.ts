@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { KnowhowLintError, lintKnowhow } from '../src/seat-loop/knowhow-lint.js';
 
 export type RolePackRole = 'coordinator' | 'guardian';
 
@@ -10,11 +11,82 @@ export interface RolePack {
   version: string;
   sha256: string;
   body: string;
+  /** Built-in C/G rule identifiers; verified KNOWHOW identifiers appear in the body. */
   includedCardIds: string[];
   excludedCardIds: string[];
   sources: Array<{ path: string; sha256: string }>;
   /** Source docs absent from this root, e.g. the published package ships no internal docs. */
   missingSources: string[];
+}
+
+const KNOWHOW_PATH = 'docs/roles/OP/KNOWHOW.md';
+
+/**
+ * KNOWHOW.md 를 `##` 제목 단위 카드로 자른다(코드 울타리 안은 본문으로 본다).
+ * 유효한 `## K-<role>-<number>` 제목을 가진 카드만 반환한다.
+ */
+export function splitKnowhowCards(body: string): Array<{ id: string; title: string; text: string }> {
+  const segments: Array<{ heading: string | null; lines: string[] }> = [{ heading: null, lines: [] }];
+  let fence: { marker: string; length: number } | null = null;
+  for (const line of body.split(/\r?\n/u)) {
+    const fenceLine = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/u);
+    if (fence) {
+      if (fenceLine && fenceLine[1]![0] === fence.marker && fenceLine[1]!.length >= fence.length && /^[ \t]*$/u.test(fenceLine[2]!)) fence = null;
+      segments.at(-1)!.lines.push(line);
+      continue;
+    }
+    if (fenceLine) {
+      fence = { marker: fenceLine[1]![0]!, length: fenceLine[1]!.length };
+      segments.at(-1)!.lines.push(line);
+      continue;
+    }
+    if (/^##\s/u.test(line)) {
+      segments.push({ heading: line, lines: [] });
+      continue;
+    }
+    segments.at(-1)!.lines.push(line);
+  }
+  const cards: Array<{ id: string; title: string; text: string }> = [];
+  for (const segment of segments) {
+    if (!segment.heading) continue;
+    const heading = segment.heading.match(/^##\s+(K-[A-Za-z]+-\d+)\s*(.*)$/u);
+    if (!heading) continue;
+    cards.push({ id: heading[1]!, title: heading[2]!.trim(), text: [segment.heading, ...segment.lines].join('\n') });
+  }
+  return cards;
+}
+
+/**
+ * KNOWHOW 카드 중 src/seat-loop/knowhow-lint.ts 의 린트를 통과한 항목만 검증된 출처로 싣는다.
+ * 실패 항목(비밀값 포함)은 제외하고 그 아이디만 남긴다. 파일이 없으면 아무것도 싣지 않는다.
+ */
+export function collectVerifiedKnowhow(repo: string): {
+  included: Array<{ id: string; title: string; text: string }>;
+  excluded: string[];
+  fileBody: string | null;
+} {
+  let body: string;
+  try {
+    body = readFileSync(resolve(repo, KNOWHOW_PATH), 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { included: [], excluded: [], fileBody: null };
+    throw error;
+  }
+  const included: Array<{ id: string; title: string; text: string }> = [];
+  const excluded: string[] = [];
+  for (const card of splitKnowhowCards(body)) {
+    try {
+      lintKnowhow(card.text, KNOWHOW_PATH);
+      included.push({ id: card.id, title: card.title, text: card.text });
+    } catch (error) {
+      if (error instanceof KnowhowLintError) {
+        excluded.push(card.id);
+        continue;
+      }
+      throw error;
+    }
+  }
+  return { included, excluded, fileBody: body };
 }
 
 const SOURCE_PATHS = [
@@ -70,6 +142,8 @@ export function buildCoordRolePackManifest(role: RolePackRole, root = resolve(im
   const present = SOURCE_PATHS.filter((path) => existsSync(resolve(repo, path)));
   const missingSources = SOURCE_PATHS.filter((path) => !present.includes(path));
   const sources = present.map((path) => ({ path, sha256: sha256(readFileSync(resolve(repo, path), 'utf8')) }));
+  const knowhow = collectVerifiedKnowhow(repo);
+  if (knowhow.fileBody !== null) sources.push({ path: KNOWHOW_PATH, sha256: sha256(knowhow.fileBody) });
   const packageJson = resolve(repo, 'package.json');
   const version = existsSync(packageJson)
     ? (JSON.parse(readFileSync(packageJson, 'utf8')) as { version: string }).version : 'unknown';
@@ -109,20 +183,25 @@ export function buildCoordRolePackManifest(role: RolePackRole, root = resolve(im
     '재는 명령: `eln release checklist status --version <판> --json`(칸·선행·판) · `eln config get harness.podPool`(Pod 풀) · `uptime`(부하 추세) · `eln self gate --help`(호스트·게이트 옵션). 명령이 못 재는 슬롯·런 상태는 담당 원장의 현행 명령을 확인한다.',
     ...cards.map(([id, rule]) => `- ${id} · ${rule} → 팩 ${role === 'coordinator' ? '조율자' : '수호자'} v1`),
     '',
+    '## KNOWHOW — 검증된 출처',
+    `docs/roles/OP/KNOWHOW.md 항목 중 src/seat-loop/knowhow-lint.ts 의 린트를 통과한 항목만 싣는다. 실패 항목·비밀값은 제외한다.`,
+    ...knowhow.included.map((card) => `- ${card.id} · ${card.title}`),
+    ...knowhow.included.flatMap((card) => ['', card.text]),
+    '',
     '## 판단 순서',
     '1. 원 요청과 지금의 우편 스레드·확인표 칸을 대조한다.',
     '2. 코드·설정·실행 결과를 읽고, 문서와 충돌하면 현재 실행 결과를 따른다.',
     '3. 관측·판단 근거·다음 행동을 분리해 답한다. 쓰기는 현재 확인 단계가 허용한 명령으로만 한다.',
     '4. 근거가 없거나 안전 난간과 충돌하면 보류하고 담당 자리 또는 사람에게 올린다.',
     '',
-    '위에 명시한 검증된 C/G 카드 외의 노하우 카드는 포함하지 않는다. 현재 관측과 담당 자리의 검증된 원장을 직접 확인한다.',
+    '위에 명시한 검증된 C/G 카드와 KNOWHOW 린트 통과 항목 외의 노하우는 포함하지 않는다. 현재 관측과 담당 자리의 검증된 원장을 직접 확인한다.',
     '## 출처 해시',
     ...sources.map((source) => `- ${source.path}: ${source.sha256}`),
     ...missingSources.map((path) => `- ${path}: 없음(이 설치본에 미포함)`),
     '',
   ];
   const body = lines.join('\n');
-  return { role, version, sha256: sha256(body), body, includedCardIds: cards.map(([id]) => id), excludedCardIds: [], sources, missingSources };
+  return { role, version, sha256: sha256(body), body, includedCardIds: cards.map(([id]) => id), excludedCardIds: knowhow.excluded, sources, missingSources };
 }
 
 /** Prompt body consumed by coordinator and guardian agents. */

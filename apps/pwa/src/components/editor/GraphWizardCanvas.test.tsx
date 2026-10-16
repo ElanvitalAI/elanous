@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { act, create, type ReactTestInstance } from 'react-test-renderer';
+import { ReactFlow } from '@xyflow/react';
 import { createNexusClient, type GraphKindEntry, type NexusClient } from '@/nexus/client';
 import { GraphCanvasEditor, type GraphCanvasContext } from './GraphCanvasEditor';
+import { addNode, emptyGraph } from './graph-canvas-model';
 import { GraphWizardChat } from './GraphWizardChat';
 import { useWizardCanvas } from './use-wizard-canvas';
 import type { WizardClient } from './graph-wizard';
@@ -104,13 +106,46 @@ describe('GRAPH-WIZARD chat ↔ real canvas', () => {
     if (!hadRaf) g.requestAnimationFrame = (fn: () => void) => setTimeout(fn, 0);
     hadResize = 'ResizeObserver' in g;
     if (!hadResize) g.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
-    if (!hadWindow) g.window = { requestAnimationFrame: (fn: () => void) => setTimeout(fn, 0), cancelAnimationFrame: (id: number) => clearTimeout(id), addEventListener: noop, removeEventListener: noop, devicePixelRatio: 1, matchMedia: () => ({ matches: false, addEventListener: noop, removeEventListener: noop }) };
+    if (!hadWindow) g.window = { setTimeout, clearTimeout, requestAnimationFrame: (fn: () => void) => setTimeout(fn, 0), cancelAnimationFrame: (id: number) => clearTimeout(id), addEventListener: noop, removeEventListener: noop, devicePixelRatio: 1, matchMedia: () => ({ matches: false, addEventListener: noop, removeEventListener: noop }) };
   });
   afterEach(() => {
     delete g.IS_REACT_ACT_ENVIRONMENT;
     if (!hadWindow) delete g.window;
     if (!hadResize) delete g.ResizeObserver;
     if (!hadRaf) delete g.requestAnimationFrame;
+  });
+
+  test('unit card click opens its breadcrumb and group box while the folded view rejects edits', async () => {
+    let graph = emptyGraph('unit-demo');
+    graph = addNode(graph, { kind: 'agent', id: 'plan' }).graph;
+    graph = addNode(graph, { kind: 'agent', id: 'build' }).graph;
+    graph = addNode(graph, { kind: 'agent', id: 'ship' }).graph;
+    graph = { ...graph, nodes: graph.nodes.map((node) => ({ ...node, extra: { group: node.id === 'ship' ? 'delivery' : 'work' } })) };
+    let current: GraphCanvasContext | null = null;
+    let root!: ReturnType<typeof create>;
+    act(() => { root = create(<GraphCanvasEditor palette={palette} initialGraph={graph} onChange={(value) => { current = value; }} />, { createNodeMock }); });
+    const toggle = root.root.findByProps({ 'data-testid': 'toggle-units' });
+    act(() => { toggle.props.onClick(); });
+    const flow = root.root.findByType(ReactFlow);
+    expect(flow.props.nodes.some((node: { id: string }) => node.id === 'group:work')).toBe(true);
+    expect(root.root.findByProps({ 'aria-label': '그래프 id' }).props.disabled).toBe(true);
+    const paletteButton = root.root.findByProps({ 'aria-label': 'agent 노드 추가' });
+    expect(paletteButton.props.disabled).toBe(true);
+    act(() => { paletteButton.props.onClick(); });
+    expect(current!.graph.nodes).toHaveLength(3);
+
+    act(() => { flow.props.onNodeClick({}, { id: 'group:work', type: 'canvas' }); });
+    expect(text(root.root.findByProps({ 'data-testid': 'unit-breadcrumb' }))).toContain('work');
+    expect(root.root.findByType(ReactFlow).props.nodes.some((node: { type: string; data: { group?: string } }) =>
+      node.type === 'groupBox' && node.data.group === 'work')).toBe(true);
+    expect(root.root.findByType(ReactFlow).props.nodes.some((node: { id: string }) => node.id === 'group:delivery')).toBe(true);
+    act(() => { root.root.findByProps({ 'aria-label': '그래프 캔버스' }).props.onDrop({
+      dataTransfer: { getData: () => 'agent' }, preventDefault: noop, clientX: 20, clientY: 20,
+    }); });
+    act(() => { root.root.findByType(ReactFlow).props.onNodeClick({}, { id: 'plan', type: 'canvas' }); });
+    expect(current!.graph.nodes).toHaveLength(3);
+    expect(root.root.findAll((node) => node.type === 'aside' && node.props['aria-label'] === '속성')).toHaveLength(0);
+    act(() => { root.unmount(); });
   });
 
   test('create → edit lands on the canvas (its YAML goes back as currentYaml) → undo restores it', async () => {

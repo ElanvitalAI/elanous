@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -16,12 +16,13 @@ import {
   observePrFileOverlap,
   observePrWorktreeDirtiness,
   parseDirtyWorktreePaths,
-  runSelfGateCli, formatUnrunnableChangeKinds,
+  runSelfGateCli, selectGateTestFiles, formatUnrunnableChangeKinds,
 } from './gate-cli.js';
 import { GATE_CALLER_TEST_LIMIT } from './gate-scope.js';
 import type { BaselineProcessResult } from './gate-baseline.js';
 import type { ShardRunResult } from '../self-dev/shard-run.js';
 import { aggregateGateTestShards } from '../self-dev/shard-aggregate.js';
+import { GATE_SPAWN_LANE_FILES } from '../self-dev/spawn-lane-files.js';
 
 const baseline = (output: string, status: BaselineProcessResult['status'] = 'test-fail'): BaselineProcessResult => ({ status, output, log: 'baseline' });
 const fail = (name: string) => ({ status: 1, stdout: `test/a.test.ts:\n(fail) ${name}\n1 fail\n`, stderr: '' });
@@ -89,7 +90,130 @@ function scriptedCommand(entries: Array<[string, string[], CommandResult]>): (co
   };
 }
 
+test('read-only gate preflight selects files without running exposure, tests, baseline or policy gates', () => {
+  const called: string[] = [];
+  const forbidden = (name: string) => () => { called.push(name); throw new Error(`${name} must not run`); };
+  const deps = {
+    changedFiles: () => ({ files: ['release/public/docs/new.md'], baseRef: 'HEAD' }),
+    exists: () => false,
+    runCommand: forbidden('exposure command'),
+    runTests: forbidden('tests'), runBaseline: forbidden('baseline'),
+    runIsolationGate: forbidden('policy'), runPwaGate: forbidden('policy'),
+  };
+  const picked = selectGateTestFiles('/repo', {}, deps);
+  expect(picked.changedFiles).toEqual(['release/public/docs/new.md']);
+  expect(picked.testFiles).toEqual([]);
+  expect(picked.skipTestStep).toBe(true);
+  expect(called).toEqual([]);
+});
+
 describe('runSelfGateCli', () => {
+  test('scenario adds an importer test to the programmatic self gate and rejects a stale head', () => {
+    const baseSha = 'a'.repeat(40);
+    const headSha = 'b'.repeat(40);
+    const scenario = { version: 1, baseSha, headSha, changedFiles: ['src/a.ts'], selectedTests: [{ path: 'test/importer.test.ts', reasons: ['import'] }], coverage: { status: 'measured', unmeasured: [], reach: [{ path: 'src/a.ts', changed: [], import: ['test/importer.test.ts'], spawn: [], unmeasured: [] }] } };
+    const observed: string[][] = [];
+    const deps = {
+      changedFiles: () => ({ files: ['src/a.ts'], baseRef: baseSha }),
+      exists: (path: string) => path === 'test/importer.test.ts',
+      isRegularFile: () => true,
+      runCommand: (command: string, args: string[]) => command === 'git' && args[0] === 'rev-parse'
+        ? ok(args[1] === 'HEAD' ? headSha : baseSha) : ok(),
+      runTests: (_cwd: string, files: readonly string[]) => { observed.push([...files]); return ok(); },
+      runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+      runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+    };
+    const result = runSelfGateCli('/repo', { scenario }, deps);
+    expect(result.exitCode).toBe(0);
+    expect(observed).toEqual([['test/importer.test.ts']]);
+    expect(result.lines).toContain('scenario tests: 1 (test/importer.test.ts)');
+    const dir = mkdtempSync(join(tmpdir(), 'self-scenario-'));
+    try {
+      const scenarioFile = join(dir, 'scenario.json');
+      writeFileSync(scenarioFile, JSON.stringify(scenario));
+      expect(runSelfGateCli('/repo', { scenarioFile }, deps).testFiles).toContain('test/importer.test.ts');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+    expect(() => runSelfGateCli('/repo', { scenario: { ...scenario, headSha: 'c'.repeat(40) } }, deps)).toThrow('stale head/base');
+    expect(() => runSelfGateCli('/repo', { scenario: { ...scenario, coverage: { ...scenario.coverage, reach: [] } } }, deps)).toThrow('reach incomplete');
+    const symlinkRepo = mkdtempSync(join(tmpdir(), 'self-scenario-link-'));
+    const outsideDir = mkdtempSync(join(tmpdir(), 'self-scenario-outside-'));
+    try {
+      mkdirSync(join(symlinkRepo, 'test'));
+      const outside = join(outsideDir, 'importer.test.ts');
+      writeFileSync(outside, 'test("outside", () => {})');
+      symlinkSync(outside, join(symlinkRepo, 'test/importer.test.ts'));
+      const { isRegularFile: _injected, ...realFileDeps } = deps;
+      expect(() => runSelfGateCli(symlinkRepo, { scenario }, realFileDeps)).toThrow('selected test is not a regular file');
+      rmSync(join(symlinkRepo, 'test'), { recursive: true, force: true });
+      symlinkSync(outsideDir, join(symlinkRepo, 'test'), 'dir');
+      expect(() => runSelfGateCli(symlinkRepo, { scenario }, realFileDeps)).toThrow('selected test is not a regular file');
+    } finally {
+      rmSync(symlinkRepo, { recursive: true, force: true });
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+  test('default gate routes a real child test through separated shards', () => {
+    const spawnFile = 'test/preview-terminal.test.ts';
+    const files = [spawnFile, 'test/ordinary.test.ts'];
+    let dispatched: [string, readonly string[], string, number] | undefined;
+    const result = runSelfGateCli('/repo', {}, {
+      changedFiles: () => ({ files, baseRef: 'HEAD' }), exists: () => true,
+      runTests: () => { throw new Error('direct Bun runner must not run'); },
+      runShards: (cwd, selected, ref, count) => {
+        dispatched = [cwd, selected, ref, count ?? 2];
+        return { shards: [], attempts: [], aggregate: { status: 'passed', retryShardIds: [] } };
+      },
+      runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+      runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+    });
+    expect(dispatched).toEqual(['/repo', files, 'HEAD', 2]);
+    expect(result.exitCode).toBe(0);
+  });
+
+  test('--fixed-shard-distribution is opt-in: only then the runner gets the fixed mode; plain --shards is called as before', () => {
+    const files = ['test/b.test.ts', 'test/a.test.ts', 'test/c.test.ts'];
+    const calls: unknown[][] = [];
+    const deps = {
+      changedFiles: () => ({ files, baseRef: 'HEAD' }), exists: () => true,
+      runTests: () => { throw new Error('direct Bun runner must not run'); },
+      runShards: ((...args: unknown[]) => {
+        calls.push(args);
+        return { shards: [{ id: 'shard-1', files: ['test/a.test.ts'], plannedRssMb: 0, plannedSeconds: 0 }], attempts: [], aggregate: { status: 'passed', retryShardIds: [] } };
+      }) as never,
+      runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+      runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+    };
+    const plain = runSelfGateCli('/repo', { shards: 4 }, deps);
+    expect(calls[0]).toEqual(['/repo', files, 'HEAD', 4]);
+    expect(plain.lines.find((line) => line.startsWith('shards: '))).not.toContain('고정 분배');
+    const fixed = runSelfGateCli('/repo', { shards: 4, fixedShardDistribution: true }, deps);
+    expect(calls[1]).toEqual(['/repo', files, 'HEAD', 4, undefined, undefined, undefined, { fixedDistribution: true }]);
+    expect(fixed.lines.find((line) => line.startsWith('shards: '))).toContain('고정 분배');
+    expect(fixed.exitCode).toBe(0);
+    expect(() => runSelfGateCli('/repo', { fixedShardDistribution: true }, deps)).toThrow('requires --shards');
+    expect(calls).toHaveLength(2);
+  });
+
+  test('default gate gives all ten real child tests three spawn shards beside regular tests', () => {
+    const files = [...GATE_SPAWN_LANE_FILES, 'test/ordinary.test.ts'];
+    let shardCount: number | undefined;
+    runSelfGateCli('/repo', {}, {
+      changedFiles: () => ({ files, baseRef: 'HEAD' }), exists: () => true,
+      runTests: () => { throw new Error('direct Bun runner must not run'); },
+      runShards: (_cwd, _selected, _ref, count) => {
+        shardCount = count;
+        return { shards: [], attempts: [], aggregate: { status: 'passed', retryShardIds: [] } };
+      },
+      runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+      runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+    });
+    expect(shardCount).toBe(4);
+  });
+
   test('--shards dispatches selected tests and preserves the single gate verdict and policy gates', () => {
     const files = Array.from({ length: 6 }, (_, i) => `src/f${i}.test.ts`);
     const observed: string[][] = [];
@@ -142,6 +266,28 @@ describe('runSelfGateCli', () => {
     expect(result.lines.join('\n')).toContain('shard attempt: shard-1 #1');
     expect(result.lines.join('\n')).toContain('shard attempt: shard-2 #1');
     expect(result.lines.join('\n')).toContain('shard attempt: shard-1 #1 · 지금 exit 1 · 기준 exit 1 · 파일 src/a.test.ts');
+  });
+
+  test('--shards writes failure.json under --artifact-dir for a failed shard and names the path (OP FU · MK #8178)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-gate-failure-evidence-'));
+    try {
+      const files = ['src/a.test.ts'];
+      const shards = [{ id: 'shard-9', files, plannedRssMb: 10, plannedSeconds: 1 }];
+      const attempts = [{ shardId: 'shard-9', attempt: 1, currentExitCode: 2, baselineExitCode: 0, baselineJUnit: '<testsuite/>' }];
+      const failureEvidence = [{ shardId: 'shard-9', side: 'current' as const, attempt: 1, files, exitCode: 2, signal: null,
+        durationMs: 12, stdoutTail: 'out tail', stderrTail: 'err tail' }];
+      const result = runSelfGateCli('/repo', { shards: 1, artifactDir: dir }, {
+        changedFiles: () => ({ files, baseRef: 'HEAD' }), exists: () => true,
+        runShards: () => ({ shards, attempts, failureEvidence, aggregate: { status: 'unmeasured', retryShardIds: ['shard-9'] } }),
+        runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+        resolveRev: () => null, envKey: () => 'test-env',
+      });
+      const path = join(dir, 'shard-9.failure.json');
+      expect(result.lines).toContain(`shard failure evidence: ${path}`);
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ shardId: 'shard-9', files, exitCode: 2, stdoutTail: 'out tail', stderrTail: 'err tail' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('--shards names why an attempt was unmeasured — signal, exit and missing JUnit per side (OP 10-09 light RC)', () => {
@@ -429,14 +575,23 @@ describe('runSelfGateCli', () => {
       'test/compute-consumer.test.ts': "import '../scripts/compute.js';\n",
     });
     try {
-      const result = runSelfGateCli(fixture.cwd, { includeImporterTests: true }, {
+      let testCalls = 0;
+      const options = { includeImporterTests: true };
+      const deps = {
         changedFiles: () => ({ files: ['src/service.ts', 'scripts/compute.ts'], baseRef: 'HEAD' }),
-        runTests: () => ok(),
+        runTests: () => { testCalls++; return ok(); },
         runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
         runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
         runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
-      });
+      };
+      const preflight = selectGateTestFiles(fixture.cwd, options, deps);
+      expect(testCalls).toBe(0);
+      const result = runSelfGateCli(fixture.cwd, options, deps);
+      expect(testCalls).toBe(1);
       expect(new Set(result.testFiles)).toEqual(new Set(['test/service-consumer.test.ts', 'test/compute-consumer.test.ts']));
+      expect([...preflight.testFiles]).toEqual([...(result.testFiles ?? [])]);
+      expect([...preflight.importerTestsAdded]).toEqual([...(result.importerTestsAdded ?? [])]);
+      expect(preflight.unrunImporterTotal).toBe(0);
       expect(result.lines).toContain('unrun importer tests: 0; unresolved relative specifiers: 0');
       expect(result.exitCode).toBe(0);
     } finally { fixture.dispose(); }
@@ -448,14 +603,18 @@ describe('runSelfGateCli', () => {
       'test/compute-consumer.test.ts': "import '../scripts/compute.js';\n",
     });
     try {
-      const result = runSelfGateCli(fixture.cwd, {}, {
+      const deps = {
         changedFiles: () => ({ files: ['scripts/compute.ts'], baseRef: 'HEAD' }),
         runTests: () => { throw new Error('plain gate must not run scripts importer'); },
         runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
         runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
         runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
-      });
+      };
+      const preflight = selectGateTestFiles(fixture.cwd, {}, deps);
+      const result = runSelfGateCli(fixture.cwd, {}, deps);
       expect(result.testFiles).toEqual([]);
+      expect(preflight.testFiles).toEqual(result.testFiles);
+      expect(preflight.skipTestStep).toBe(true);
       expect(result.lines).toContain('unrun importer tests: 0');
       expect(result.lines.some((line) => line.startsWith('importer tests added:'))).toBe(false);
       expect(result.exitCode).toBe(0);
@@ -463,7 +622,7 @@ describe('runSelfGateCli', () => {
   });
 
   test('scripts-only importer lookup failure is reported as unmeasured rather than zero', () => {
-    const result = runSelfGateCli('/repo', { includeImporterTests: true }, {
+    const deps = {
       changedFiles: () => ({ files: ['scripts/compute.ts'], baseRef: 'HEAD' }),
       exists: () => false,
       runCommand: () => ({ status: 2, stderr: 'grep unavailable' }),
@@ -471,8 +630,13 @@ describe('runSelfGateCli', () => {
       runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
       runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
       runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
-    });
+    };
+    const preflight = selectGateTestFiles('/repo', { includeImporterTests: true }, deps);
+    const result = runSelfGateCli('/repo', { includeImporterTests: true }, deps);
     expect(result.testFiles).toEqual([]);
+    expect(preflight.testFiles).toEqual(result.testFiles);
+    expect(preflight.lookupFailed).toBe('grep unavailable');
+    expect(preflight.unrunImporterTotal).toBeNull();
     expect(result.lines).toContain('unrun importer tests: lookup failed (grep unavailable)');
     expect(result.lines).toContain('importer tests added: lookup failed (grep unavailable)');
     expect(result.lines).not.toContain('unrun importer tests: 0');
@@ -1662,7 +1826,9 @@ describe('runSelfGateCli', () => {
       expect(overlap.status === 'overlap' ? overlap.files : []).not.toContain('src/before.ts');
       const none = observePrFileOverlap(cwd, ['src/before.ts'], baseOid, 'trunk', undefined);
       expect(none).toEqual({ status: 'none' });
-      const logged = spawnSync('git', landingHistoryLogArgs('0', `${baseOid}..trunk`), { cwd, encoding: 'utf8' });
+      // Git interprets --since=0 relative to now, so a slow CI shard can exclude
+      // the commits this test just created. Use a fixed origin for all history.
+      const logged = spawnSync('git', landingHistoryLogArgs('1970-01-01T00:00:00Z', `${baseOid}..trunk`), { cwd, encoding: 'utf8' });
       expect(logged.status).toBe(0);
       expect(logged.stdout).toContain(afterOid);
       expect(logged.stdout).toContain('src/after.ts');

@@ -41,6 +41,10 @@ const WRITE_INTENT = /(?:(?:추가|작성|기록|반영|갱신|업데이트|개�
 const DEBUG_INTENT = /(?:디버그|디버깅|에러|오류|크래시|깨져|깨짐|안\s*(?:돼|됨|되네|된다)|\b(?:debug|error|crash|broken|fails?|failing)\b)/i;
 const EXPLICIT_GOAL = /(?:^\/goal\b|목표\s*[:：]|\bgoal\s*:)/i;
 const REPO_NOUN = /(?:코드|스크립트|소스|브랜치|서버|파일|레포|저장소|\bPR\b|\b(?:code|script|branch|server|file|repo)\b)/i;
+// A named CLI command («(eln msg list --to OPT)» · «`git log`») or the seat mailbox is work the research
+// allowlist cannot do (no RunShell · no MsgList) — it is a full-tool read, not the «조사» quick route
+// (TUI-QUICK-ROUTE-EXPLICIT-CMD · 10-16 OPT: «우편 확인(eln msg list …) … 조사» answered «셸 도구가 없다»).
+const EXPLICIT_COMMAND = /(?:(?<![\w-])(?:eln|elanous|git|gh)\s+[a-z][\w-]*|우편)/i;
 
 function writeDebugOrGoal(q: string): 'write-intent' | 'debug' | 'explicit-goal' | null {
   if (WRITE_INTENT.test(q)) return 'write-intent';
@@ -55,8 +59,23 @@ export interface TuiChatVerdict {
   goalLoop: boolean;
 }
 
-/** Request verbs a quick or read-only turn can carry out without writing to the repository. */
-const QUICK_REQUEST_VERBS = /^(?:보여|알려|확인해|찾아|찾아봐|조사해|검색해|정리해|요약해|바꿔|변경해|전환해|설정해|맞춰|수정해|고쳐|만들어|등록해|예약해|추가해|보내|설명해|읽어|읽어봐|살펴|살펴봐|훑어봐|비교해|분석해|검토해|평가해|제안해)$/;
+/** 자리(무인) TUI 인가 — 호출부가 `detectSeatTui` 로 정한다. 없으면 사람 대화 TUI(종전 판정 그대로). */
+export interface TuiChatContext extends ShortQuestionContext {
+  seat?: boolean;
+}
+
+// TUI-H1-SEAT-GOALLOOP — 자리 앞으로 온 «운영 지시» 꼴: 우편·오더 · 이름 있는 CLI 명령 · «OP 13:14:» 머리 · «계속 —» · «다음 행».
+// (10-16 OPT 13:14 «OP 13:14: 계속 — draft 다음 행.» 이 읽기·분석 단일 턴으로 가 «다음 점검 13:20» 만 남기고 멈췄다.)
+const SEAT_OPS_DIRECTIVE = /(?:우편|오더|(?<![\w-])(?:eln|elanous|git|gh)\s+[a-z][\w-]*|^\[?OP\s*\d{1,2}:\d{2}|(?:^|[\s:：])계속(?:\s*[—–-]|\s*(?:해|하|진행)|[.!]?\s*$)|다음\s*행(?![가-힣]))/i;
+
+/** 자리 운영 지시 꼴인가(인지 · 관측용으로도 내보낸다). */
+export function isSeatOpsDirective(text: string): boolean {
+  return SEAT_OPS_DIRECTIVE.test(text.trim());
+}
+
+/** Request verbs a quick or read-only turn can carry out without writing to the repository.
+ *  «봐줘·봐 줘·들여다봐줘» are reads (TUI-INITIATIVE-S ④ — «로그 좀 봐줘» used to fall to coding as request-verb). */
+const QUICK_REQUEST_VERBS = /^(?:보여|알려|확인해|찾아|찾아봐|조사해|검색해|정리해|요약해|바꿔|변경해|전환해|설정해|맞춰|수정해|고쳐|만들어|등록해|예약해|추가해|보내|설명해|읽어|읽어봐|봐|봐봐|들여다봐|살펴|살펴봐|훑어봐|비교해|분석해|검토해|평가해|제안해)$/;
 
 /** True when the verb never appears, or each occurrence directly follows an allowed object. */
 function everyVerbTakes(text: string, verb: RegExp, object: RegExp): boolean {
@@ -66,8 +85,21 @@ function everyVerbTakes(text: string, verb: RegExp, object: RegExp): boolean {
   return true;
 }
 
-/** Write, debug, goal, mixed or attached requests retain the coding goal loop; a plain read question is one full-tool turn. */
-export function classifyTuiChatIntent(text: string, ctx: ShortQuestionContext = {}): TuiChatVerdict {
+/** Write, debug, goal, mixed or attached requests retain the coding goal loop; a plain read question is one full-tool turn.
+ *  A seat (unattended) TUI reverts #27531 for its work: a read/analysis turn (except a fast short question) and any
+ *  operational directive (mail · order · named CLI command · «계속 —») ride the goal loop to completion evidence. */
+export function classifyTuiChatIntent(text: string, ctx: TuiChatContext = {}): TuiChatVerdict {
+  const verdict = classifyTuiChatIntentBase(text, ctx);
+  // A fast short question («다음 행이 뭐야?») stays one turn even in a seat — only work rides the goal loop.
+  if (!ctx.seat || verdict.goalLoop || verdict.reason.startsWith('short-')) return verdict;
+  if (verdict.route === '읽기·분석') {
+    return { route: verdict.route, reason: `seat-${verdict.reason}`, goalLoop: true };
+  }
+  if (isSeatOpsDirective(text)) return { route: verdict.route, reason: `seat-ops-${verdict.reason}`, goalLoop: true };
+  return verdict;
+}
+
+function classifyTuiChatIntentBase(text: string, ctx: ShortQuestionContext): TuiChatVerdict {
   const q = text.trim();
   const coding = (reason: string): TuiChatVerdict => ({ route: '코딩·구현', reason, goalLoop: true });
   if (!q || ctx.hasAttachments) return coding(ctx.hasAttachments ? 'attachment' : 'empty');
@@ -86,8 +118,8 @@ export function classifyTuiChatIntent(text: string, ctx: ShortQuestionContext = 
   // Debugging or a stated goal keeps the goal loop even on a quick-route word («오류 로그 요약» · «목표: 상태 요약»).
   if (DEBUG_INTENT.test(q)) return coding('debug');
   if (EXPLICIT_GOAL.test(q)) return coding('explicit-goal');
-  // A repository noun, file path or code shape is no quick route; with no write, debug or goal intent it is a read.
-  if (REPO_NOUN.test(q) || PATH_OR_CODE.test(q)) {
+  // A repository noun, file path, code shape or named command is no quick route; with no write, debug or goal intent it is a read.
+  if (REPO_NOUN.test(q) || PATH_OR_CODE.test(q) || EXPLICIT_COMMAND.test(q)) {
     const intent = writeDebugOrGoal(q);
     return intent ? coding(intent) : { route: '읽기·분석', reason: 'read-repo', goalLoop: false };
   }

@@ -96,6 +96,8 @@ export function buildRunDevHarnessTool(): LLMToolSpec {
 
 /** dev-harness 실행 seam 세트(테스트/대체 주입). */
 export interface DevHarnessDeps {
+  /** 시험 전용 target HOME. 생략하면 resolveHarnessTarget 의 실제 homedir 기본값을 쓴다. */
+  targetHome?: string;
   /** 하니스 구동(기본 runStagedHarnessOnSurface). */
   runHarness?: (opts: RunHarnessOnSurfaceOptions) => Promise<HarnessResult>;
   /** In-process 실행 직전의 관측 전용 디스패치 seam. */
@@ -319,7 +321,7 @@ export async function dispatchRunDevHarness(
   let targetResolution: HarnessTargetResolution | undefined;
   if (!targetOptions && target) {
     const elanousBinRoot = resolveMainRepoRoot(process.cwd()) ?? process.cwd();
-    const resolution = resolveHarnessTarget(target);
+    const resolution = resolveHarnessTarget(target, { home: deps?.targetHome });
     targetResolution = resolution;
     debug.log('harness.frontdoor', 'target.resolved', {
       target, kind: resolution.status, elanousBinRoot,
@@ -343,7 +345,7 @@ export async function dispatchRunDevHarness(
         debug.log('harness.frontdoor', 'refused', { target, reason: 'outside-home-declined', interactive: ux.interactive });
         return { output: `RunDevHarness ⚠️ 거부: 홈 밖 시스템경로 '${target}' — 진입 ${ux.interactive ? '취소됨(HITL 미승인).' : '승인 채널 없음(fail-closed).'}` };
       }
-      const authorized = revalidateHarnessTarget(resolution);
+      const authorized = revalidateHarnessTarget(resolution, { home: deps?.targetHome });
       if (authorized.status === 'normalization-failed' || authorized.status === 'missing') {
         debug.log('harness.frontdoor', 'refused', { target, reason: 'outside-home-revalidation-failed', detail: authorized.reason });
         return { output: `RunDevHarness ⚠️ 거부: target '${target}' — 승인 중 경로 재검증에 실패했습니다.` };
@@ -369,7 +371,7 @@ export async function dispatchRunDevHarness(
   // Recheck immediately before handing paths to seams; a symlink retarget after
   // classification must not reach staging or apply through stale options.
   if (targetResolution) {
-    const revalidated = revalidateHarnessTarget(targetResolution);
+    const revalidated = revalidateHarnessTarget(targetResolution, { home: deps?.targetHome });
     if (revalidated.status === 'normalization-failed') {
       debug.log('harness.frontdoor', 'refused', { target, reason: 'target-revalidation-failed', detail: revalidated.reason });
       return { output: `RunDevHarness ⚠️ 거부: target '${target}' — 스테이징 전 경로 재검증에 실패했습니다.` };
@@ -421,7 +423,7 @@ export async function dispatchRunDevHarness(
   });
   if (targetResolution) {
     const assertStableTarget = (): void => {
-      const current = revalidateHarnessTarget(targetResolution!);
+      const current = revalidateHarnessTarget(targetResolution!, { home: deps?.targetHome });
       if (current.status === 'normalization-failed' || current.status === 'missing') {
         debug.log('harness.frontdoor', 'refused', { target, reason: 'target-revalidation-failed', detail: current.reason });
         throw new Error(`harness target revalidation failed: ${current.reason ?? current.status}`);

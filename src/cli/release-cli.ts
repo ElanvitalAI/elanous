@@ -8,7 +8,7 @@
 //   elanous release run     --version <x.y.z> [--prerelease rc] [--main-cut | --cut-commit <sha>] [--publish-at <iso>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--dry-run] [--json] [--if-ready]
 //   elanous release resume  --run <runId> --from <node> [--waive <node> --reason <text>] [--accepted-regressions <json>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--json]
 //   elanous release auto-start [--window-minutes <n>] [--apply] [--json]
-//   elanous release rehearsal tick [--apply] [--checkout <dir>] [--json]
+//   elanous release rehearsal tick [--apply] [--checkout <dir>] [--shards <n>] [--remote <host>] [--json]
 //   elanous release preflight --version <x.y.z> [--publish-at <iso>] [--json]   (컷 30분 전 사전 점검 · 읽기 전용 · ⛔ 있으면 exit 1)
 //   elanous release cut-branch --version <x.y.z> --base <sha> --pick <sha>... [--dry-run]
 //
@@ -21,7 +21,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
@@ -32,7 +32,8 @@ import { addItem, cellsReferencingDoc, claimItem, decodeClaimHistoryEntry, devVe
 import * as features from '../release-loop/feature-store.js';
 import { evidencePlan, landedButYellow, type MergedChecklistPr } from '../release-loop/landed-but-yellow.js';
 import { formatSchedule, getSchedule, listSchedules, setSchedule } from '../release-loop/release-schedule.js';
-import { placeCell, rebalance, seatMove, type PlacementPriority } from '../release-loop/placement.js';
+import { mergedPrsLast24h, placeCell, planPullForward, pullForwardPlacementConfig, rebalance, seatMove, type PlacementPriority } from '../release-loop/placement.js';
+import { readTrafficSignal } from '../seat-loop/traffic-signal.js';
 import { parseRubric, readRubricItems, rubricGrade, rubricScore } from '../release-loop/rubric.js';
 import { writeStdoutJson } from './stdout-json.js';
 import { CliUserError } from './cli-user-error.js';
@@ -700,6 +701,63 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       for (const row of blocked) console.log(`⛔ ${row.id} ${row.from} → ${row.to} 이월 거부 · ${row.reason}`);
       if (!decisions.length && !blocked.length) console.log('이월할 미시작 칸 없음');
     });
+  release.command('budget').description('판의 P0/P1 루브릭 S(0~3) 분포·합계·미기입 칸 조회(읽기 전용)')
+    .requiredOption('--version <v>', '조회할 판 또는 별칭')
+    .option('--json', '결과 JSON')
+    .action(async (opts: { version: string; json?: boolean }) => {
+      const version = checklistVersion(opts.version, checklistCodenames());
+      const byPriority = {
+        P0: { s: { 0: 0, 1: 0, 2: 0, 3: 0 }, total: 0, missing: 0 },
+        P1: { s: { 0: 0, 1: 0, 2: 0, 3: 0 }, total: 0, missing: 0 },
+      };
+      for (const item of readRubricItems(version, releaseLedgerRoot())) {
+        if (item.priority !== 'P0' && item.priority !== 'P1') continue;
+        const group = byPriority[item.priority];
+        const rubric = parseRubric(`${item.title}\n${item.evidence ?? ''}`);
+        if (rubric === null) group.missing++;
+        else { group.s[rubric.S as 0 | 1 | 2 | 3]++; group.total += rubric.S; }
+      }
+      const result = { version, byPriority, total: byPriority.P0.total + byPriority.P1.total, missing: byPriority.P0.missing + byPriority.P1.missing };
+      if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
+      else {
+        for (const [priority, group] of Object.entries(byPriority)) console.log(`${priority} · S 0:${group.s[0]} 1:${group.s[1]} 2:${group.s[2]} 3:${group.s[3]} · 합계 ${group.total} · S 미기입 ${group.missing}`);
+        console.log(`합계 ${result.total} · S 미기입 ${result.missing}`);
+      }
+    });
+  release.command('pull-forward').description('다음 판 P0/P1 칸을 지금 판으로 당길 계획만 조회')
+    .option('--dry-run', '원장 이동 없이 계획만 보기').option('--traffic <path>', 'OP traffic.json 경로')
+    .option('--checkout <dir>', '대상 저장소 체크아웃(기본 harness.defaultRepo 또는 현재 디렉터리)')
+    .option('--json', '구조화 계획 출력')
+    .action((opts: { dryRun?: boolean; traffic?: string; checkout?: string; json?: boolean }) => {
+      if (!opts.dryRun) throw new CliUserError('pull-forward는 --dry-run 계획만 지원한다');
+      const signal = readTrafficSignal(opts.traffic);
+      if (!signal || 'unreadable' in signal) throw new CliUserError('traffic.json을 읽지 못해 hold·신호 순서를 확인할 수 없다');
+      const checkout = resolve(opts.checkout ?? getUserConfig().harness?.defaultRepo ?? process.cwd());
+      if (!existsSync(checkout) || !statSync(checkout).isDirectory()) throw new CliUserError(`대상 저장소 체크아웃이 없다: ${checkout}`);
+      const root = spawnSync('git', ['-C', checkout, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: 5_000 });
+      if (root.status !== 0 || !root.stdout?.trim() || realpathSync(root.stdout.trim()) !== realpathSync(checkout))
+        throw new CliUserError(`대상 저장소의 Git 체크아웃 루트가 아니다: ${checkout}`);
+      const checkoutReal = realpathSync(checkout);
+      const now = new Date();
+      const schedules = listSchedules(scheduleLedgerRoot());
+      const versions = [...new Set([...schedules.map((row) => row.version), ...features.assignedVersions()])];
+      const checklists = new Map(versions.map((version) => [version, listChecklist(version).items] as const));
+      const placement = pullForwardPlacementConfig();
+      const result = planPullForward({ now, schedules, checklists, released: features.releasedVersion(),
+        merged24h: mergedPrsLast24h(now), ...placement, signal,
+        targetPathExists: (path) => {
+          try {
+            const targetReal = realpathSync(join(checkout, path));
+            const inside = relative(checkoutReal, targetReal);
+            return inside !== '..' && !inside.startsWith(`..${sep}`)
+              && !isAbsolute(inside) && statSync(targetReal).isFile();
+          } catch { return false; }
+        } });
+      if (opts.json) return writeStdoutJson(`${JSON.stringify(result)}\n`);
+      for (const row of result.decisions) console.log(`· 드라이런 ${row.id} ${row.from} → ${row.version} · ${row.reason}`);
+      for (const row of result.blocked) console.log(`⛔ ${row.id} ${row.from} → ${row.to} 당김 보류 · ${row.reason}`);
+      if (!result.decisions.length && !result.blocked.length) console.log('당겨올 칸 없음');
+    });
   const ceoMinutes = (value: string): number => {
     if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) throw new CliUserError('대표 손 분량은 0 이상의 정수 분이어야 한다');
     return Number(value);
@@ -783,13 +841,16 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         if (opts.open && (local.version !== undefined || inherited?.version !== undefined)) throw new CliUserError('--open 과 --version 을 함께 쓸 수 없다');
         const json = local.json ?? inherited?.json;
         if (opts.owner !== undefined) parseOwner(opts.owner);
-        const released = opts.open ? (landedDeps.released ?? features.releasedVersion)() : '';
-        const openSnapshots = opts.open
-          ? (landedDeps.schedules ?? features.readSchedules)()
-            .filter(({ version }) => isReleaseVersion(version) && (!released || compareReleaseVersions(version, released) > 0))
-            .sort((a, b) => compareReleaseVersions(a.version, b.version))
-            .map(({ version }) => (landedDeps.checklist ?? listChecklist)(version)).filter((snapshot) => snapshot.items.length > 0)
+        const includeOpenHistory = opts.open || local.version !== undefined || inherited?.version !== undefined;
+        const released = includeOpenHistory ? (landedDeps.released ?? features.releasedVersion)() : '';
+        // readSchedules() initializes SQLite when the ledger does not exist. This query is read-only.
+        const schedules = includeOpenHistory
+          ? landedDeps.schedules?.() ?? (existsSync(join(releaseLedgerRoot(), 'release', 'features.sqlite')) ? features.readSchedules() : [])
           : [];
+        const openSnapshots = schedules
+          .filter(({ version }) => isReleaseVersion(version) && (!released || compareReleaseVersions(version, released) > 0))
+          .sort((a, b) => compareReleaseVersions(a.version, b.version))
+          .map(({ version }) => (landedDeps.checklist ?? listChecklist)(version)).filter((snapshot) => snapshot.items.length > 0);
         if (opts.open && !openSnapshots.length) {
           if (json) await writeStdoutJson('[]\n'); else console.log('열린 판 없음');
           return;
@@ -797,7 +858,9 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         if (opts.applyEvidence && !opts.dryRun && !mayWrite(cmd)) return;
         const snapshots = opts.open ? openSnapshots : [(landedDeps.checklist ?? listChecklist)(context(cmd).version)];
         const now = (landedDeps.now ?? (() => new Date()))();
-        const updated = snapshots.flatMap(({ items }) => items
+        // --version 도 --open 과 같은 판 전체 최좌 수정일로 병합 PR 을 찾는다 — 선택 판 칸의 updatedAt 에 묶이면 그보다 오래 전에 병합된 PR 을 놓친다(LBY-VERSION-OPEN-MISMATCH · OPT #4059).
+        const sinceSnapshots = opts.open ? snapshots : [...openSnapshots, ...snapshots];
+        const updated = sinceSnapshots.flatMap(({ items }) => items
           .filter((item) => (item.status === 'yellow' || item.status === 'red') && (opts.owner === undefined || ownerMatches(item.owner, opts.owner)))
           .map((item) => Date.parse(item.updatedAt)).filter((at) => Number.isFinite(at)));
         const since = updated.length ? new Date(updated.reduce((earliest, at) => Math.min(earliest, at))).toISOString().slice(0, 10)
@@ -1141,15 +1204,16 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--remote <host>', '게이트 호스트(기본 config gateRemote.host)')
     .option('--local', '원격 대신 이 기계에서 돌린다(원격 자식이 이것으로 다시 불린다)')
     .option('--shards <n>', '시험 분할 수', '4')
+    .option('--fixed-shard-distribution', 'self gate 에 그대로 전달 — RSS 사전 측정 없이 --shards N 조각에 정렬 라운드로빈 고정 배정(opt-in · 원격 자식 전달)')
     .option('--rehearsal-tui', '리허설 전용 TUI 화면 점검(원격 자식 전달)')
     .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
-    .action(async (o: { version: string; base?: string; head?: string; remote?: string; local?: boolean; shards: string; rehearsalTui?: boolean; json?: boolean }) => {
+    .action(async (o: { version: string; base?: string; head?: string; remote?: string; local?: boolean; shards: string; fixedShardDistribution?: boolean; rehearsalTui?: boolean; json?: boolean }) => {
       // The root strips `--local` from argv (remote-bookmark attach) before Commander sees it — same read as `self gate`.
       const local = !!o.local || process.argv.slice(2).includes('--local');
       await jsonAction(o.json, async (log) => {
         if (o.remote !== undefined && local) throw new Error('release light-rc: --remote and --local cannot be combined');
         const shards = Number(o.shards);
-        const result = await runLightRc(o.version, { base: o.base, head: o.head, remote: o.remote, local, shards, rehearsalTui: o.rehearsalTui, ledgerRoot: releaseRunDeps.ledgerRoot, log: (l) => console.error(l) }, lightRcDeps);
+        const result = await runLightRc(o.version, { base: o.base, head: o.head, remote: o.remote, local, shards, ...(o.fixedShardDistribution ? { fixedShardDistribution: true } : {}), rehearsalTui: o.rehearsalTui, ledgerRoot: releaseRunDeps.ledgerRoot, log: (l) => console.error(l) }, lightRcDeps);
         for (const line of formatLightRc(result)) log(line);
         return result;
       }, (r) => r.ok);
@@ -1237,12 +1301,14 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .description('15분 틱: 다음 판 컷 −7h · −150m RC 계획(기본 보기만)')
     .option('--apply', '도장 선점 후 해당 단계 실행')
     .option('--checkout <dir>', '깨끗한 git 체크아웃(기본 ELANOUS_REHEARSAL_GIT_CWD)')
+    .option('--shards <n>', '시험 분할 수')
+    .option('--remote <host>', '게이트 호스트')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { apply?: boolean; checkout?: string; json?: boolean }) => {
+    .action(async (o: { apply?: boolean; checkout?: string; shards?: string; remote?: string; json?: boolean }) => {
       await jsonAction(o.json, async (log) => {
         const ledgerRoot = scheduleLedgerRoot();
         if (o.apply && !mayWriteLedger('release rehearsal tick', false, ledgerRoot)) throw new Error('release rehearsal tick: ledger write denied');
-        const result = await runRehearsalTick({ apply: o.apply, checkout: o.checkout, ledgerRoot }, rehearsalDeps);
+        const result = await runRehearsalTick({ apply: o.apply, checkout: o.checkout, shards: o.shards === undefined ? undefined : Number(o.shards), remote: o.remote, ledgerRoot }, rehearsalDeps);
         log(`· 리허설 ${result.status}${'version' in result ? ` ${result.version}` : ''}${result.status === 'due' ? ` · 실행 ${result.run ?? '-'} · 건너뜀 ${result.supersede.join(', ') || '-'}` : ''}`);
         return result;
       }, (result) => !result.notificationFailures && !result.stamps?.some((stamp) => !['ok', 'superseded'].includes(stamp.outcome)));

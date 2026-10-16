@@ -15,6 +15,7 @@ import { EdgeTTSProvider } from '../src/voice/tts/tts-providers/edge-tts.js';
 import {
   isTtsProviderUsableNow,
   resolveDaemonTtsProviderIdForTesting,
+  resolveDaemonTtsProviderIdWithDepsForTesting,
 } from '../src/voice/voice-tts-singleton.js';
 
 const ORIGINAL_ENV = { ...process.env };
@@ -265,20 +266,44 @@ describe('TTS provider availability and unpaid default', () => {
     expect(isTtsProviderUsableNow('elevenlabs-tts')).toBe(true);
   });
 
-  it('reports edge-tts and macos-say usable without credentials', () => {
+  it('reports free providers usable only when their local requirements are available', () => {
     delete process.env.OPENAI_API_KEY;
     delete process.env.ELEVENLABS_API_KEY;
-    expect(isTtsProviderUsableNow('edge-tts')).toBe(true);
-    expect(isTtsProviderUsableNow('macos-say')).toBe(true);
+    const unavailable = {
+      which: (_name: string) => null,
+      exists: (_path: string) => false,
+      executable: (_path: string) => false,
+      platform: 'linux' as NodeJS.Platform,
+    };
+    expect(isTtsProviderUsableNow('edge-tts', unavailable)).toBe(false);
+    expect(isTtsProviderUsableNow('macos-say', unavailable)).toBe(false);
+
+    const available = {
+      ...unavailable,
+      which: (name: string) => name === 'edge-tts' || name === 'sox' || name === 'say' ? `/fake/${name}` : null,
+      platform: 'darwin' as NodeJS.Platform,
+    };
+    expect(isTtsProviderUsableNow('edge-tts', available)).toBe(true);
+    expect(isTtsProviderUsableNow('macos-say', available)).toBe(true);
   });
 
-  it('falls back to edge-tts, not openai-tts, when nobody chose and no credential resolves', () => {
+  it('selects the first available free provider when nobody chose and no credential resolves', () => {
     delete process.env.OPENAI_API_KEY;
     delete process.env.ELEVENLABS_API_KEY;
     delete process.env.TTS_PROVIDER;
     isolateConfig();
-    expect(resolveDaemonTtsProviderIdForTesting()).toBe('edge-tts');
-    expect(resolveDaemonTtsProviderIdForTesting()).not.toBe('openai-tts');
+    const unavailable = {
+      which: (_name: string) => null,
+      exists: (_path: string) => false,
+      executable: (_path: string) => false,
+      platform: 'linux' as NodeJS.Platform,
+    };
+    const edgeAvailable = {
+      ...unavailable,
+      which: (name: string) => name === 'edge-tts' || name === 'sox' ? `/fake/${name}` : null,
+    };
+    expect(resolveDaemonTtsProviderIdWithDepsForTesting(unavailable)).toBe('openai-tts');
+    expect(resolveDaemonTtsProviderIdWithDepsForTesting(edgeAvailable)).toBe('edge-tts');
   });
 
   it('keeps openai-tts when an OPENAI credential resolves and nobody chose', () => {

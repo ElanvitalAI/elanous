@@ -480,6 +480,69 @@ export function linesOutsideFencedCode(document: string): GoalDocSourceLine[] {
   return outside;
 }
 
+/** TA 완료 경계는 기존 정식 절 안의 세 독립 행이다. 원문에 없는 값을 저작기가 만들지 않는다. */
+export const GOAL_DONE_BOUNDARY_LABELS = ['완료 경계 코드', '완료 경계 실물', '완료 경계 증거 명령'] as const;
+export type GoalDoneBoundaryLabel = typeof GOAL_DONE_BOUNDARY_LABELS[number];
+// This is a declaration check, not a judgement of whether the proposed work
+// is good. Remove only presentation marks before comparing known placeholders.
+const GOAL_DONE_EMPTY_VALUES = new Set(['', 'na', 'ok', 'yes', 'pass', 'done', '완료', '확인']);
+const GOAL_DONE_UNRESOLVED_PREFIXES = ['tbd', 'todo', 'unknown', 'notdeclared', 'notavailable', '미정', '추후', '없음'];
+
+function isGoalDonePlaceholder(value: string): boolean {
+  const normalized = value.normalize('NFKC').toLowerCase().replace(/[\p{P}\p{S}\s]+/gu, '');
+  return GOAL_DONE_EMPTY_VALUES.has(normalized)
+    || GOAL_DONE_UNRESOLVED_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+}
+// Evidence must be an executable command line, not another prose acceptance
+// criterion. Keep this lexical: the preflight cannot safely run the command.
+// An explicit executable is required so prose such as "Check that tests pass"
+// does not become a false completion boundary.
+const GOAL_DONE_EVIDENCE_COMMAND = /^(?:[A-Za-z_][\w-]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)*(eln|bun|git|gh|rg|test|npm|pnpm|yarn|node|python|python3|pytest|bash|sh|make|cargo|go|curl|jq|sqlite3|grep|sed|awk|cat|find|ssh|docker|kubectl|(?:\.\/|\/|~\/)[^\s]+)(?:\s+(.*))?$/;
+// The goal boundary parser never invokes commands, so compound shell lines are
+// outside its supported evidence grammar and must not be accepted as proof.
+const GOAL_DONE_UNSUPPORTED_SHELL_OPERATOR = /&&|\|\||[;|><`]|\$\(/;
+// Only the narrow, concrete file predicates are accepted for `test`; the
+// predicate also needs its operand, so `test -f` cannot claim proof.
+const GOAL_DONE_SHELL_TEST_ARGS = /^-(?:f|e)\s+\S+(?:\s|$)/;
+
+function isGoalDoneEvidenceCommand(value: string): boolean {
+  if (GOAL_DONE_UNSUPPORTED_SHELL_OPERATOR.test(value)) return false;
+  const match = GOAL_DONE_EVIDENCE_COMMAND.exec(value);
+  const args = match?.[2]?.trim() ?? '';
+  return !!match && args.length > 0 && (match[1] !== 'test' || GOAL_DONE_SHELL_TEST_ARGS.test(args));
+}
+
+function unwrapGoalDoneValue(value: string): string {
+  let result = value.trim();
+  const wrappers: Array<readonly [string, string]> = [['`', '`'], ['"', '"'], ["'", "'"], ['“', '”'], ['‘', '’']];
+  // Each pass removes two characters. Repeated wrappers cannot hide a marker.
+  while (result.length >= 2) {
+    const pair = wrappers.find(([open, close]) => result.startsWith(open) && result.endsWith(close));
+    if (!pair) break;
+    result = result.slice(pair[0].length, -pair[1].length).trim();
+  }
+  return result;
+}
+
+export function inspectGoalDoneBoundary(document: string): { values: Partial<Record<GoalDoneBoundaryLabel, string>>; missing: GoalDoneBoundaryLabel[] } {
+  const values: Partial<Record<GoalDoneBoundaryLabel, string>> = {};
+  for (const line of linesOutsideFencedCode(document)) {
+    const match = /^\s*(?:[-*]\s*)?(완료 경계 코드|완료 경계 실물|완료 경계 증거 명령)\s*:\s*(.*?)\s*$/.exec(line.text);
+    if (!match) continue;
+    const label = match[1] as GoalDoneBoundaryLabel;
+    const value = match[2]?.trim() ?? '';
+    const inspected = unwrapGoalDoneValue(value);
+    if (!isGoalDonePlaceholder(value)
+      && (label !== '완료 경계 증거 명령' || isGoalDoneEvidenceCommand(inspected))) values[label] = value;
+  }
+  return { values, missing: GOAL_DONE_BOUNDARY_LABELS.filter((label) => !values[label]) };
+}
+
+export function explicitGoalDoneBoundaryLines(ask: string): string[] {
+  const { values } = inspectGoalDoneBoundary(ask);
+  return GOAL_DONE_BOUNDARY_LABELS.flatMap((label) => values[label] ? [`- ${label}: ${values[label]}`] : []);
+}
+
 // CommonMark 펜스는 **한 종류의 문자**가 3개 이상 이어진 런이다 — `[`~]{3,}` 는 혼합(백틱+틸드)까지
 // 펜스로 인정해 진짜 진양성을 펜스 안으로 숨긴다(리뷰 must-fix). 열기/닫기 모두 이 하나를 쓴다.
 const FENCE_RUN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
@@ -795,7 +858,7 @@ const SERVER_ENTRY_PATH = /(?:^|\/)server[^/]*\.(?:[cm]?[jt]sx?)$/i;
 const LOOPBACK_ADDRESS_WITH_PORT = /(?<![\p{L}\p{N}.-])(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)(?![\p{L}\p{N}_])/iu;
 
 function targetPathsInLabelPiece(piece: string): string[] {
-  return askPathTokens(piece).filter((path) => path.includes('/'));
+  return askPathTokens(piece).filter((path) => classifyTracedPathToken(path).kind === 'path');
 }
 
 function declaredTargetPaths(document: string): string[] {
@@ -1204,6 +1267,73 @@ interface TracedPathReference {
   endLine: number | null;
 }
 
+/** Every TRACED PATHS declaration token is one of these kinds. Nested repository paths are `path`. */
+export type TracedPathTokenKind = 'path' | 'bare' | 'residual' | 'repository-root' | 'empty-cover';
+
+export interface TracedPathTokenClassification {
+  readonly token: string;
+  readonly kind: TracedPathTokenKind;
+  /** Inspectable path when the token names one; null for an empty cover. */
+  readonly path: string | null;
+  /** Attached residual characters when `kind` is `residual` (for example `???` in `src/a.ts???`). */
+  readonly residual: string | null;
+}
+
+const EMPTY_COVER_TOKEN = '(빈 대상 경로)';
+/** Leftover punctuation after a complete file token (`src/a.ts???`). Must not steal extension letters. */
+const TRACED_PATH_RESIDUAL_TOKEN = /^((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]+)([^A-Za-z0-9./\\:\s,;]+)$/;
+
+function isEmptyCoverToken(token: string): boolean {
+  const trimmed = token.trim();
+  return trimmed === '' || trimmed === EMPTY_COVER_TOKEN;
+}
+
+function repositoryRootFileExists(path: string, repositoryRoot: string): boolean {
+  if (path.includes('/') || path.includes('\\') || isAbsolute(path)) return false;
+  try {
+    const realRoot = realpathSync(resolve(repositoryRoot));
+    const absolutePath = resolve(realRoot, path);
+    if (dirname(absolutePath) !== realRoot || !isSameOrNestedPath(absolutePath, realRoot)) return false;
+    return lstatSync(absolutePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Classify one TRACED PATHS / 대상 경로 declaration token.
+ * Residual characters stay attached until this plate splits them; locators (`file.ts:line`) stay locators.
+ */
+export function classifyTracedPathToken(token: string, repositoryRoot?: string): TracedPathTokenClassification {
+  const trimmed = token.trim();
+  if (isEmptyCoverToken(trimmed)) {
+    return { token: trimmed, kind: 'empty-cover', path: null, residual: null };
+  }
+  const unwrapped = stripInlineCode(trimmed).replace(TRACED_PATH_LEADING_LIST_MARKERS, '').trim();
+  if (isEmptyCoverToken(unwrapped)) {
+    return { token: trimmed, kind: 'empty-cover', path: null, residual: null };
+  }
+  const residualMatch = TRACED_PATH_RESIDUAL_TOKEN.exec(unwrapped);
+  if (residualMatch?.[1] && residualMatch[2]) {
+    return { token: trimmed, kind: 'residual', path: residualMatch[1], residual: residualMatch[2] };
+  }
+  const normalized = unwrapped.replaceAll('\\', '/');
+  if (!normalized.includes('/')) {
+    if (repositoryRoot && repositoryRootFileExists(normalized, repositoryRoot)) {
+      return { token: trimmed, kind: 'repository-root', path: normalized, residual: null };
+    }
+    return { token: trimmed, kind: 'bare', path: normalized, residual: null };
+  }
+  return { token: trimmed, kind: 'path', path: normalized, residual: null };
+}
+
+/** Inspectable traced path: nested or repository-root files only. Residual, bare-only, and empty covers are not injected. */
+export function canonicalTracedPathToken(token: string, repositoryRoot?: string): string | null {
+  const classification = classifyTracedPathToken(token, repositoryRoot);
+  if (classification.kind === 'path' || classification.kind === 'repository-root') return classification.path;
+  return null;
+}
+
 /**
  * Count lines an editor would address. A file's terminating newline closes the last line rather
  * than opening a new one, so `"one\n"` is one addressable line — counting the split remainder
@@ -1377,6 +1507,8 @@ export function tracedPathReferences(document: string): TracedPathReference[] {
       // 두 번 벗긴다 — 줄번호가 백틱 **안**(`p:42`)일 수도 **밖**(`p`:42)일 수도 있다.
       const path = match ? stripInlineCode(match[1].trim()).replace(TRACED_PATH_LEADING_LIST_MARKERS, '') : undefined;
       if (!path) continue;
+      const classification = classifyTracedPathToken(path);
+      if (classification.kind === 'residual' || classification.kind === 'empty-cover') continue;
       references.push({ path, line: match?.[2] ? Number(match[2]) : null, endLine: match?.[3] ? Number(match[3]) : null });
     }
   }
@@ -2323,13 +2455,24 @@ function tracedPathsSection(facts: CodebaseGrounding | null, ask: string, reposi
   const unresolvedTargetPieces = targetLabels.flatMap((label) => label.split(/\s+[·,]\s*|[·,]\s+/))
     .flatMap((piece) => {
       const tokens = piece.trim().split(/\s+/).filter(Boolean);
-      return tokens.length === 0 ? ['(빈 대상 경로)'] : tokens.filter((token) => targetPathsInLabelPiece(token).length === 0);
+      return tokens.length === 0
+        ? ['(빈 대상 경로)']
+        : tokens.filter((token) => targetPathsInLabelPiece(token).length === 0
+          && classifyTracedPathToken(token, repositoryRoot).kind !== 'repository-root');
     });
   const labeledTargets = declaredTargetPaths(ask);
+  const labeledRootFiles = targetLabels.flatMap((label) => label.split(/\s+[·,]\s*|[·,]\s+/))
+    .flatMap((piece) => piece.trim().split(/\s+/).filter(Boolean))
+    .flatMap((token) => {
+      const classification = classifyTracedPathToken(token, repositoryRoot);
+      return classification.kind === 'repository-root' && classification.path ? [classification.path] : [];
+    });
   const scopedAskPaths = [...new Set(askPathTokens(targetScopedGoalText(ask)).filter((path) => path.includes('/')))];
   // A single repository path in an ask without a target label is still an explicit target.
   // Multiple mentions are ambiguous; do not turn background references into targets.
-  const requestedTargets = targetLabels.length ? labeledTargets : scopedAskPaths.length === 1 ? scopedAskPaths : [];
+  const requestedTargets = targetLabels.length
+    ? [...new Set([...labeledTargets, ...labeledRootFiles])]
+    : scopedAskPaths.length === 1 ? scopedAskPaths : [];
   const known = [...new Set([
     ...requestedTargets, ...scopedAskPaths, ...(facts?.files ?? []),
     ...evidence.flatMap((item) => Array.from(item.text.matchAll(SOURCE_PATH), (match) => match[0]).filter((path) => path.includes('/'))),
@@ -2338,8 +2481,9 @@ function tracedPathsSection(facts: CodebaseGrounding | null, ask: string, reposi
   try { root = repositoryRoot === undefined ? null : realpathSync(resolve(repositoryRoot)); }
   catch { root = null; }
   const valid = (path: string, allowDeclaredNew: boolean): boolean => {
-    if (!path.includes('/') || isAbsolute(path) || path.split('/').some((part) => part === '..' || part === '.')) return false;
+    if (isAbsolute(path) || path.split('/').some((part) => part === '..' || part === '.')) return false;
     if (root === null) return false;
+    if (!path.includes('/')) return classifyTracedPathToken(path, root).kind === 'repository-root';
     if (allowDeclaredNew && declaredNew.has(path) && isSafeNewTargetPath(path, root)) return true;
     try {
       const real = realpathSync(resolve(root, path));
@@ -2877,9 +3021,13 @@ interface AbsentFirstImplementationPath {
 }
 
 function askPathTokens(ask: string): string[] {
-  return ask.split(/\s+/)
-    .map((token) => token.replace(/^[`\p{P}]+|[`\p{P}]+$/gu, ''))
-    .filter((token) => token.includes('/') && /\.[^./]+$/.test(token));
+  return ask.split(/\s+/).flatMap((raw) => {
+    const withoutWrap = raw.replace(/^[`([{]+|[`)\]}]+$/g, '');
+    if (classifyTracedPathToken(raw).kind === 'residual' || classifyTracedPathToken(withoutWrap).kind === 'residual') return [];
+    const token = raw.replace(/^[`\p{P}]+|[`\p{P}]+$/gu, '');
+    if (classifyTracedPathToken(token).kind === 'residual') return [];
+    return token.includes('/') && /\.[^./]+$/.test(token) ? [token] : [];
+  });
 }
 
 const ASK_QUANTITY_WORDS = new Set(['모든', '무조건', '전부', '아래의']);
@@ -2958,7 +3106,9 @@ interface NewTargetFile {
 export function isAskPathLocatorToken(path: string): boolean {
   // Evidence (`file.ts:line`) and prefixed (`ref:path`) tokens are not file paths.
   // This plate discards them; it does not strip the colon and retry the remainder.
-  return path.split(/[\\/]/).some((component) => component.includes(':'));
+  if (path.split(/[\\/]/).some((component) => component.includes(':'))) return true;
+  const kind = classifyTracedPathToken(path).kind;
+  return kind === 'residual' || kind === 'empty-cover';
 }
 
 export function classifyAbsentFirstPathPresence(path: string, repositoryRoot?: string): AbsentFirstPathPresence {
@@ -5184,6 +5334,7 @@ async function authorGoalWithSupersededRootIntent(
       '',
       '## ACCEPTANCE CRITERIA',
       ...enhancement.checklist.map(requestedCriterionLine),
+      ...explicitGoalDoneBoundaryLines(ask),
       '',
       '## REQUIRED EVIDENCE',
       '- [requested] Verify the decision signal and the verbatim ask.',
@@ -5634,6 +5785,7 @@ async function authorGoalWithSupersededRootIntent(
       : ['## STEPS', ...(resolvedSteps.length ? resolvedSteps.map((step) => `- ${step}`) : ['- No externally injected steps.']), '']),
     '## ACCEPTANCE CRITERIA',
     ...acceptanceSection,
+    ...explicitGoalDoneBoundaryLines(ask),
     ...preservationAmbiguityCriteria(ambiguities, clarificationAnswers),
     ...preservationAmbiguityNotice(ambiguities),
     ...preservationAmbiguityClarification(clarificationQuestions, clarificationResponses),

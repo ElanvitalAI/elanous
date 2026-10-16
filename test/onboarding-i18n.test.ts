@@ -20,6 +20,7 @@ import { messagesEn } from '../src/expression/i18n/messages.en';
 import { messagesKo } from '../src/expression/i18n/messages.ko';
 import { messagesJa } from '../src/expression/i18n/messages.ja';
 import { messagesZh } from '../src/expression/i18n/messages.zh';
+import { withTestEnv } from './helpers/with-test-home';
 
 let root: string;
 let cfgPath: string;
@@ -111,20 +112,25 @@ describe('i18n bundles · setup wizard keys', () => {
     expect(m.setupBanner).toBe('elanous — 셋업 마법사');
   });
 
-  test('getMessages() falls back to en when no locale env set', () => {
-    delete process.env.ELANOUS_LANG;
-    delete process.env.LANG;
-    delete process.env.LC_ALL;
-    delete process.env.LC_MESSAGES;
-    const m = getMessages();
+  test('getMessages() falls back to en when no locale env set', async () => {
+    const m = await withTestEnv({ ELANOUS_LANG: undefined, LANG: undefined, LC_ALL: undefined, LC_MESSAGES: undefined },
+      () => getMessages());
     expect(m.setupBanner).toBe('elanous — setup wizard');
   });
 
-  test('LANG=ko_KR.UTF-8 routes to ko bundle', () => {
-    delete process.env.ELANOUS_LANG;
-    process.env.LANG = 'ko_KR.UTF-8';
-    const m = getMessages();
+  // POSIX order is LC_ALL > LC_MESSAGES > LANG (src/expression/locale.ts) and the gate baseline exports
+  // LC_ALL=C.UTF-8 (scripts/lib/gate-test-env.ts). The product honours that order, so the test clears the two keys
+  // that outrank LANG instead of asserting LANG against whatever the runner exported (R4 · gate 0.2.30 pod-8).
+  test('LANG=ko_KR.UTF-8 routes to ko bundle', async () => {
+    const m = await withTestEnv({ ELANOUS_LANG: undefined, LC_ALL: undefined, LC_MESSAGES: undefined, LANG: 'ko_KR.UTF-8' },
+      () => getMessages());
     expect(m.setupBanner).toBe('elanous — 셋업 마법사');
+  });
+
+  test('LC_ALL outranks LANG (POSIX) — the gate baseline LC_ALL=C.UTF-8 keeps a ko LANG on the en bundle', async () => {
+    const m = await withTestEnv({ ELANOUS_LANG: undefined, LC_ALL: 'C.UTF-8', LC_MESSAGES: undefined, LANG: 'ko_KR.UTF-8' },
+      () => getMessages());
+    expect(m.setupBanner).toBe('elanous — setup wizard');
   });
 });
 

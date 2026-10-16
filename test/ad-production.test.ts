@@ -523,6 +523,8 @@ test('renders planned captions after assembly while preserving the uncaptained m
       onGrounding: () => {},
       production: {
         captionFontPath: options.fontPath,
+        // The burned-in caption check plans text OCR only on macOS; pin it so a Linux gate Pod runs the same path.
+        qcPlatform: 'darwin',
         voiceover: { lines: options.emptyVoiceLines ? [] : [{ beatIndex: 0, text: 'fresh flavors shine brightly', voiceId: 'voice-1' }], runner },
         soundtrack: runner,
         musicBedPath: '/assets/bed.wav',

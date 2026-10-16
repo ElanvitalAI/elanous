@@ -10,6 +10,7 @@
 // 배선은 P4(현재 비-git 은 front door 에서 refuse 유지 → 이 적용 경로는 프로덕션 미도달).
 
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { cpSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -49,7 +50,7 @@ export function stageNonGitDir(opts: { target: string; branch: string }): StageN
   const slug = basename(target).replace(/[^a-zA-Z0-9._-]/g, '-');
   const shadowPath = join(tmpdir(), `elanous-shadow-${slug}-${process.pid}`);
   // 이전 세대 잔여 정리(고아 방지·createWorktree resetExisting 정합).
-  try { spawnSync('rm', ['-rf', shadowPath], { timeout: GIT_TIMEOUT_MS }); } catch { /* fail-soft */ }
+  try { spawnSync('rm', ['-rf', shadowPath], { timeout: GIT_TIMEOUT_MS, maxBuffer: SPAWN_SYNC_MAX_BUFFER }); } catch { /* fail-soft */ }
 
   // ② 대상 → 그림자 복사(내용 전체·심볼릭 보존 X: cpSync 기본).
   cpSync(target, shadowPath, { recursive: true });
@@ -69,7 +70,7 @@ export function stageNonGitDir(opts: { target: string; branch: string }): StageN
     path: shadowPath,
     branch,
     base,
-    cleanup: () => { try { spawnSync('rm', ['-rf', shadowPath], { timeout: GIT_TIMEOUT_MS }); } catch { /* fail-soft */ } },
+    cleanup: () => { try { spawnSync('rm', ['-rf', shadowPath], { timeout: GIT_TIMEOUT_MS, maxBuffer: SPAWN_SYNC_MAX_BUFFER }); } catch { /* fail-soft */ } },
   };
 }
 
@@ -94,9 +95,9 @@ export function stageFile(opts: { target: string; branch: string }): StageFileRe
   const fileName = basename(target);
   const slug = fileName.replace(/[^a-zA-Z0-9._-]/g, '-');
   const shadowPath = join(tmpdir(), `elanous-shadow-file-${slug}-${process.pid}`);
-  try { spawnSync('rm', ['-rf', shadowPath], { timeout: GIT_TIMEOUT_MS }); } catch { /* fail-soft */ }
+  try { spawnSync('rm', ['-rf', shadowPath], { timeout: GIT_TIMEOUT_MS, maxBuffer: SPAWN_SYNC_MAX_BUFFER }); } catch { /* fail-soft */ }
 
-  spawnSync('mkdir', ['-p', shadowPath], { timeout: GIT_TIMEOUT_MS });
+  spawnSync('mkdir', ['-p', shadowPath], { timeout: GIT_TIMEOUT_MS, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   cpSync(target, join(shadowPath, fileName));
 
   git(shadowPath, ['init', '-b', 'shadow-base']);
@@ -113,7 +114,7 @@ export function stageFile(opts: { target: string; branch: string }): StageFileRe
     fileName,
     branch,
     base,
-    cleanup: () => { try { spawnSync('rm', ['-rf', shadowPath], { timeout: GIT_TIMEOUT_MS }); } catch { /* fail-soft */ } },
+    cleanup: () => { try { spawnSync('rm', ['-rf', shadowPath], { timeout: GIT_TIMEOUT_MS, maxBuffer: SPAWN_SYNC_MAX_BUFFER }); } catch { /* fail-soft */ } },
   };
 }
 
@@ -166,7 +167,7 @@ export function applyShadowToTarget(opts: { shadowPath: string; target: string; 
   debug.log('harness.target', 'apply.backup', { target: target.slice(-48), backup: backup.slice(-48) });
 
   // ② rsync 미러링(--delete·그림자 git 메타 제외). rsync 부재 = fail-closed(백업만 남기고 미적용).
-  const probe = spawnSync('rsync', ['--version'], { encoding: 'utf8', timeout: 5_000 });
+  const probe = spawnSync('rsync', ['--version'], { encoding: 'utf8', timeout: 5_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   if (probe.status !== 0) {
     debug.log('harness.target', 'apply.no-rsync', { target: target.slice(-48) });
     return { backup, applied: false, log: 'rsync 미설치 → 적용 안 함(백업만 생성·fail-closed). 수동 적용 필요.' };

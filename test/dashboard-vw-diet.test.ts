@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { matchTextInputGlobalAction } from '../src/chat/global-actions.js';
 import type { Key } from '../src/tui.js';
 import { buildDashboardSlashRegistry } from '../src/dashboard/slash-runtime/dashboard-handlers.js';
+import { dashboardSourceText, readTuiSources, tuiSourceText } from './helpers/dashboard-source.js';
 
 const root = resolve(import.meta.dir, '..');
 const source = (name: string): string => readFileSync(resolve(root, name), 'utf8');
@@ -40,13 +41,12 @@ test('retired virtual-window implementation and picker are absent', () => {
 });
 
 test('retired dashboard VW surface files and their index imports are absent', () => {
-  const index = source('src/dashboard/index.ts');
+  const index = tuiSourceText();
   for (const module of retired) {
     expect(existsSync(resolve(root, `src/dashboard/${module}.ts`))).toBe(false);
     expect(index).not.toContain(`./${module}.js`);
   }
-  for (const file of ['src/dashboard/browser-help-runtime.ts', 'src/dashboard/index.ts']) {
-    const text = source(file);
+  for (const text of [source('src/dashboard/browser-help-runtime.ts'), index]) {
     for (const module of retired) {
       expect(text).not.toContain(`${module}.js`);
     }
@@ -57,13 +57,24 @@ test('retired dashboard VW surface files and their index imports are absent', ()
 });
 
 test('dashboard boot and input do not import or read virtual windows', () => {
-  const index = source('src/dashboard/index.ts');
+  const index = tuiSourceText();
   const layout = source('src/dashboard/layout-display-runtime-registration.ts');
-  const handlers = source('src/dashboard/slash-runtime/dashboard-handlers.ts');
-  for (const text of [index, layout, handlers]) {
+  // 슬래시 구현 = 옛 dashboard-handlers.ts ⊕ 이사 간 src/tui/slash/**(D4b · TUI-SLASH-SPLIT-MISSION ⊕ -TERM).
+  // ⛔ 옛 파일 하나만 읽으면 옮겨 간 명령(/mission …)에 금지 VW 참조가 다시 들어와도 놓친다.
+  const slashImpl = readTuiSources().filter(({ path }) =>
+    path === 'src/dashboard/slash-runtime/dashboard-handlers.ts' || path.startsWith('src/tui/slash/'));
+  for (const moved of ['src/tui/slash/mission.ts', 'src/tui/slash/term.ts']) {
+    expect(slashImpl.map(({ path }) => path)).toContain(moved);
+  }
+  const handlers = dashboardSourceText(slashImpl);
+  // 묶음 검사에서 둘을 뺀다 — terminal-exposure.ts 는 머리 주석에 옛 호스트 목록(virtual-windows)을 적어 둔 것뿐이고,
+  // 옛 슬래시 구현(dashboard-handlers.ts)은 위 `handlers`(⊕ src/tui/slash/**)로 따로 문다(주석에 옛 레지스트리 이름이 남아 있다).
+  const exempt = new Set(['src/dashboard/terminal-exposure.ts', 'src/dashboard/slash-runtime/dashboard-handlers.ts']);
+  const boot = dashboardSourceText(readTuiSources().filter(({ path }) => !exempt.has(path)));
+  for (const text of [boot, layout, handlers]) {
     expect(text).not.toMatch(/virtual-windows|windowing\/virtual-windows|window-picker-modal|resident-vw|benchmark-preset/);
   }
-  expect(index).not.toMatch(/initDashboardVirtualWindows|virtualWindows\.registry|registerPaneContentKind\('vw-browser'/);
+  expect(boot).not.toMatch(/initDashboardVirtualWindows|virtualWindows\.registry|registerPaneContentKind\('vw-browser'/);
   expect(layout).not.toMatch(/registerLayoutRuntimes|windowRegistry/);
   expect(handlers).not.toMatch(/registry\.register\('bench'/);
   expect(index).toContain('vw: null,');
@@ -96,7 +107,7 @@ test('VW spawn slashes and /bench are unregistered while /help remains available
 });
 
 test('VW prefix and modal chords are not registered, without removing the input route', () => {
-  const index = source('src/dashboard/index.ts');
+  const index = tuiSourceText();
   expect(index).not.toContain('dashboard:vw-chord:');
   expect(index).not.toContain('dashboard:pane-modal-chord:');
   expect(index).not.toContain('routePopupCloseChord:');

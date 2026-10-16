@@ -99,6 +99,25 @@ export function removePendingUserInput(
   return removedIds.length;
 }
 
+/**
+ * id 로 고른 항목을 버킷 «맨 앞»으로 옮긴다(주어진 순서대로) — «지금 밀어 넣기»가 끊을 수 없는 도구 때문에
+ * 다음 경계로 떨어질 때, 같은 버킷의 다른 항목(goal-loop 메모 등)보다 먼저 들어가게 한다. 옮긴 수를 낸다.
+ */
+export function prioritizePendingUserInput(ids: readonly string[]): number {
+  if (ids.length === 0) return 0;
+  const order = new Map(ids.map((id, index) => [id, index]));
+  let moved = 0;
+  for (const bucket of buckets.values()) {
+    const front = bucket.items.filter(item => order.has(item.id))
+      .sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+    if (front.length === 0) continue;
+    bucket.items = [...front, ...bucket.items.filter(item => !order.has(item.id))];
+    moved += front.length;
+  }
+  if (moved > 0) debug.log('llm.interjection', 'prioritized', { requested: ids.length, moved });
+  return moved;
+}
+
 /** 지금 이 세션에 대기 중인 수(관측·표시용). 비우지 «않는다». */
 export function pendingUserInputCount(sessionId: string): number {
   return buckets.get(sessionId)?.items.length ?? 0;

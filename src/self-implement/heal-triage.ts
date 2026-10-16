@@ -1,5 +1,8 @@
 /** 결정론 트리아지 — 실패 서명과 이미 거친 역할만으로 다음 갈래를 고른다. */
 
+import { defaultOverlaysDir, loadGraphOverlays, selectOverlays, type GraphOverlaySpec } from './graph-overlay-yaml.js';
+import { GRAPH_SPECS } from './graph-templates.js';
+
 export type HealTriageOutcome =
   | 'environment-claimed'
   | 'untestable'
@@ -270,4 +273,80 @@ export function triageFailure(signature: HealFailureSignature, history?: HealTri
     outcome: 'exhausted',
     evidence: ['observe-deeper 와 ground-external 을 둘 다 거쳤다', '더 올릴 해상도가 없다'],
   };
+}
+
+/** ═══ 슈퍼바이저 고르기(0.2.32 칸 GRAPH-SUPERVISOR-PICK) — «선언된» 오버레이 중에서 고른다 ═══
+ *
+ * 능력표 ③b: 고르기만 한다. ⛔ 새 그래프 노드를 «짓지 않는다» — 후보를 읽고 선언된 조건을
+ * 판정해 overlayId 하나를 고를 뿐, 템플릿을 만들거나 노드를 더하지 않는다.
+ *
+ * 후보의 실체: `graphs/overlays/`(loadGraphOverlays) 선언 중 `stage: heal` 인 것만.
+ * 조건의 값은 코드가 낸다 — 선언의 appliesWhen 을 selectOverlays(선언 조건 판정 기계)로 판정한다.
+ * 결정론: 같은 입력·같은 선언이면 언제나 같은 답 — 조건이 맞는 후보 중 «선언 순서가 가장 앞»인 것.
+ */
+
+/** 선언된 heal 오버레이 후보를 읽는 자리 — 시험이 갈아 끼운다. */
+export type DeclaredHealOverlayLoader = () => readonly GraphOverlaySpec[];
+
+export type SupervisorOverlayPickOutcome =
+  | 'picked'
+  | 'no-declared-candidate'
+  | 'no-applicable-candidate';
+
+export interface SupervisorOverlayPickInput {
+  /** 선언 조건(appliesWhen) 판정에 쓸 상태 — 예: `{ stop_class: 'pod-died' }`. */
+  readonly state: Readonly<Record<string, unknown>>;
+  /** 후보를 좁힐 그래프 id — 기본은 활성 self-implement 그래프. */
+  readonly graphId?: string;
+}
+
+/** 고르기 결과 — outcome+evidence 계약(triageFailure·classifyReworkCapExhaustion 과 같은 양식). */
+export interface SupervisorOverlayPick {
+  readonly outcome: SupervisorOverlayPickOutcome;
+  /** outcome='picked' 일 때 고른 선언 오버레이. */
+  readonly overlayId?: string;
+  readonly evidence: readonly string[];
+}
+
+/** `graphs/overlays/` 선언에서 `stage: heal` 인 것만 읽는다 — 고르기 후보의 실체. */
+export function loadDeclaredHealOverlays(): readonly GraphOverlaySpec[] {
+  return loadGraphOverlays(defaultOverlaysDir()).overlays.filter((spec) => spec.stage === 'heal');
+}
+
+/**
+ * 선언된 heal 오버레이 후보 중 하나를 고른다. 조건이 맞는 후보가 여럿이면 선언 순서가
+ * 가장 앞인 것을 고른다(결정론). 던지지 않는다 — 못 고르는 이유는 evidence 가 말한다.
+ */
+export function pickSupervisorHealOverlay(
+  input: SupervisorOverlayPickInput,
+  load: DeclaredHealOverlayLoader = loadDeclaredHealOverlays,
+): SupervisorOverlayPick {
+  let declared: readonly GraphOverlaySpec[];
+  try {
+    declared = load();
+  } catch (error) {
+    const why = error instanceof Error ? error.message : String(error);
+    return { outcome: 'no-declared-candidate', evidence: [`선언을 읽지 못했다: ${why}`] };
+  }
+  const healOnly = declared.filter((spec) => spec.stage === 'heal');
+  if (healOnly.length === 0) {
+    return { outcome: 'no-declared-candidate', evidence: ['선언된 heal 오버레이 후보가 없다'] };
+  }
+  const graphId = input.graphId ?? GRAPH_SPECS['self-implement']?.graphId;
+  if (!graphId) {
+    return { outcome: 'no-declared-candidate', evidence: ['활성 self-implement 그래프 선언이 없다'] };
+  }
+  let applied: readonly GraphOverlaySpec[];
+  try {
+    applied = selectOverlays(healOnly, { graphId, stage: 'heal', state: { ...input.state } }).applied;
+  } catch (error) {
+    const why = error instanceof Error ? error.message : String(error);
+    return { outcome: 'no-applicable-candidate', evidence: [`선언 조건 판정이 실패했다: ${why}`] };
+  }
+  const applicable = new Set(applied.map((spec) => spec.overlayId));
+  const first = healOnly.find((spec) => applicable.has(spec.overlayId));
+  if (!first) {
+    return { outcome: 'no-applicable-candidate', evidence: [`선언된 heal 후보 ${healOnly.length}개 중 조건이 맞는 것이 없다`] };
+  }
+  return { outcome: 'picked', overlayId: first.overlayId, evidence: [`선언된 heal 후보 ${healOnly.length}개 중 조건이 맞는 첫 선언: ${first.overlayId}`] };
 }

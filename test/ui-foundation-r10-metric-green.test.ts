@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
 const ROOT = join(import.meta.dir, '..');
 
@@ -26,7 +27,7 @@ function widgetFiles(): string[] {
 
 describe('ui foundation · R10 metric green source truth', () => {
   test('mouse dispatch converges on unified input-core choke points', () => {
-    const dashboard = read('src/dashboard/index.ts');
+    const dashboard = tuiSourceText();
     const dispatcher = read('src/input-core/dispatcher.ts');
 
     expect(dispatcher.match(/export function routeInputEvent\(/g)?.length ?? 0).toBe(1);
@@ -41,7 +42,7 @@ describe('ui foundation · R10 metric green source truth', () => {
   });
 
   test('wd-log owns log click hit resolution and dashboard no longer calls legacy helpers directly', () => {
-    const dashboard = read('src/dashboard/index.ts');
+    const dashboard = tuiSourceText();
     const logWidget = read('widgets/log/widget.ts');
 
     expect(dashboard).toContain('direct imports of tryAttachmentHitAtBodyRow /');

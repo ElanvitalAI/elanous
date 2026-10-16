@@ -25,6 +25,7 @@ import {
   type BaselineCacheOptions,
 } from './tsc-baseline-cache.js';
 import { TSC_OOM_RETRY_HEAP_MB, TSC_HEAP_MB, tscEnv } from '../src/typecheck-ratchet.js';
+import { runIncrementalCachedTsc } from './tsc-incremental-cache.js';
 
 /** Inherited GIT_DIR / GIT_WORK_TREE would make `--cwd <other tree>` still read the launcher's repo. */
 function gitEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
@@ -49,7 +50,7 @@ function sh(cmd: string, cwd = process.cwd()): string {
   return execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], cwd, env: gitEnv() });
 }
 
-export type TscRun = { out: string; ran: boolean; why?: string };
+export type TscRun = { out: string; ran: boolean; why?: string; exitCode?: number };
 
 export { TSC_HEAP_MB, TSC_OOM_RETRY_HEAP_MB, tscEnv } from '../src/typecheck-ratchet.js';
 /** V8 힙 부족의 얼굴 — 「타입 에러」와 «다른 값»이다. */
@@ -70,7 +71,7 @@ export function runTsc(cmd: string, exec = execSync): TscRun {
   const result = (attempt: Attempt, env: NodeJS.ProcessEnv): TscRun => {
     const { out, error: e } = attempt;
     if (OOM.test(out)) return { out, ran: false, why: `tsc 가 V8 힙 부족(OOM)으로 죽었다 — 타입 에러가 아니다 (NODE_OPTIONS=${env.NODE_OPTIONS})` };
-    if (!e) return { out, ran: true };
+    if (!e) return { out, ran: true, exitCode: 0 };
     if (e.signal || e.code === 'ENOENT' || e.status === null || e.status === undefined) {
       return { out, ran: false, why: `tsc 실행 실패 (signal=${String(e.signal)} code=${String(e.code)} status=${String(e.status)})` };
     }
@@ -81,7 +82,7 @@ export function runTsc(cmd: string, exec = execSync): TscRun {
     if (!/error TS\d+/.test(out)) {
       return { out, ran: false, why: `tsc 가 종료코드 ${e.status} 로 끝났는데 TS 진단이 한 건도 없다(래퍼 실패로 본다)` };
     }
-    return { out, ran: true };
+    return { out, ran: true, exitCode: e.status };
   };
 
   const initialEnv = tscEnv();
@@ -140,6 +141,10 @@ export function changedTsFiles(run: (cmd: string) => string = sh, env: NodeJS.Pr
   const quietRevision = (command: string): string => { try { return run(command).trim(); } catch { return ''; } };
   const head = quietRevision('git rev-parse HEAD') || undefined;
   const warnings: string[] = [];
+  // base==HEAD ⊕ HEAD 가 origin/main 의 조상(merge-base 가 HEAD 자신) — 아래 수집이 git diff --name-only HEAD
+  // (커밋 안 된 변경) ⊕ git ls-files --others(untracked) 를 계속 모으므로 «변경을 셀 수 없다» 판정은
+  // 그 수집 결과에 따라 갈린다. 결정만 여기서 미뤄 수집 뒤에 넣는다.
+  let uncountableBase: { command: string; why: string } | undefined;
   if (head && quietRevision(`git rev-parse ${base}`) === head) {
     const main = quietRevision('git rev-parse origin/main');
     const merged = main && main !== head ? quietRevision('git merge-base HEAD origin/main') : '';
@@ -148,14 +153,18 @@ export function changedTsFiles(run: (cmd: string) => string = sh, env: NodeJS.Pr
       base = merged;
       baseSource = 'recomputed merge-base(origin/main)';
     } else if (main && main !== head) {
-      failures.push({ command: `git rev-parse ${base}`, why: `base 가 HEAD(${head}) 와 같아 변경을 셀 수 없다 — TSC_BASE_REF 로 base 를 주라 (못 셌음 ≠ 0)` });
+      uncountableBase = { command: `git rev-parse ${base}`, why: `base 가 HEAD(${head}) 와 같아 변경을 셀 수 없다 — TSC_BASE_REF 로 base 를 주라 (못 셌음 ≠ 0)` };
     }
   }
 
   const files = new Set<string>();
   const diffFiles = new Set<string>();
+  // 커밋 안 된 변경 ⊕ untracked 를 내는 명령 — uncountableBase 판정의 분모다.
+  const dirtyCommands = new Set(['git diff --name-only HEAD', 'git ls-files --others --exclude-standard']);
+  let dirtyCount = 0;
   const commands = [`git diff --name-only ${base}...HEAD`, 'git diff --name-only HEAD', 'git ls-files --others --exclude-standard'];
   for (const command of commands) {
+    const countsDirty = uncountableBase !== undefined && dirtyCommands.has(command);
     try {
       for (const line of run(command).split('\n')) {
         const file = line.trim().replace(/^\.\//, '');
@@ -164,12 +173,21 @@ export function changedTsFiles(run: (cmd: string) => string = sh, env: NodeJS.Pr
         // A deleted .ts is not a compile candidate, so it must not count as «should have been collected».
         // existsSync is bound to the landing tree — process.cwd() would count the launcher's files.
         const present = existsSync(join(cwd, file));
-        if (!ts || present) diffFiles.add(file);
+        if ((!ts || present) && !diffFiles.has(file)) {
+          diffFiles.add(file);
+          if (countsDirty) dirtyCount += 1;
+        }
         if (ts && present) files.add(file);
       }
     } catch (cause) {
       failures.push({ command, why: cause instanceof Error ? cause.message : String(cause) });
     }
+  }
+  if (uncountableBase) {
+    // 커밋 안 된 변경·untracked 를 1개라도 셌으면 그 수(N)와 baseSource 를 경고에 실어 판정을 지속한다 —
+    // «못 셌음 ≠ 0» 실패는 둘 다 0일 때만 그대로 남긴다.
+    if (dirtyCount > 0) warnings.push(`base=HEAD — 커밋 안 된 변경 ${dirtyCount} 개만 센다 (baseSource=${baseSource})`);
+    else failures.push(uncountableBase);
   }
   return { files, base, baseSource, head, diffFiles, warnings, failures };
 }
@@ -1144,13 +1162,22 @@ export function runGate(io: Partial<GateIo> = {}): void {
   const rootCommand = `${tscBin} --noEmit -p ${TYPECHECK_GATE_CONFIG}`;
   const pwaCommand = `${tscBin} --noEmit -p apps/pwa/tsconfig.json`;
   const pwaEnvCommand = `${tscBin} --noEmit -p tsconfig.pwa-env.json`;
+  const cacheDir = (io.env ?? process.env).ELANOUS_TSC_CACHE_DIR;
+  const cacheEnabled = !!cacheDir && !io.runTscCmd && base !== 'injected test seam';
+  const checkedTsc = (command: string, config: string, scope: ReadonlySet<string>, excluded: readonly string[], included: readonly string[], promotionBaseline?: BaselineDiagnostics, excludeTests = false): TscRun => {
+    if (!cacheEnabled) return runTscCmd(command);
+    return runIncrementalCachedTsc({
+      cwd, base, head, changed, config, command, cacheDir: cacheDir!, run: runTscCmd, log,
+      decision: (result) => result.ran && inspectTscResult(result, scope, baseline, () => {}, () => {}, wholeRepository, excluded, included, promotionBaseline, excludeTests),
+    });
+  };
   const rootPromotionBaseline = wholeRepository ? readBaselineDiagnostics(base, rootCommand) : undefined;
   const pwaPromotionBaseline = wholeRepository && runsPwa ? readBaselineDiagnostics(base, pwaCommand) : undefined;
   const pwaEnvPromotionBaseline = wholeRepository && runsPwaEnv ? readBaselineDiagnostics(base, pwaEnvCommand) : undefined;
   let rootPlan = planRootCheck({ wholeRepository, rootChanged, env: io.env ?? process.env, cwd, affectedRoots: io.affectedRoots ?? reverseImportAffectedRoots });
   let rootsConfig: string | undefined;
   if (rootPlan.mode === 'affected') {
-    rootsConfig = `tsconfig.gate-roots.${process.pid}.${Date.now()}.json`;
+    rootsConfig = cacheEnabled ? 'tsconfig.gate-roots.incremental.json' : `tsconfig.gate-roots.${process.pid}.${Date.now()}.json`;
     try {
       // `include` is replaced (not merged) so only the listed roots plus ambient declarations enter the program.
       writeFileSync(join(cwd, rootsConfig), JSON.stringify({ extends: `./${TYPECHECK_GATE_CONFIG}`, include: ['src/**/*.d.ts', 'scripts/**/*.d.ts', 'test/**/*.d.ts'], files: rootPlan.roots }, null, 2), { flag: 'wx' });
@@ -1173,19 +1200,20 @@ export function runGate(io: Partial<GateIo> = {}): void {
     debug.log('typecheck.gate', 'roots', { mode: 'full', roots: rootPlan.roots ?? null, fallbackReason: rootPlan.fallbackReason }, { level: 'info' });
   }
   let rootTsc: TscRun;
-  try { rootTsc = runTscCmd(rootsConfig ? `${tscBin} --noEmit -p ${rootsConfig}` : rootCommand); }
+  try { rootTsc = checkedTsc(rootsConfig ? `${tscBin} --noEmit -p ${rootsConfig}` : rootCommand,
+    rootsConfig ?? TYPECHECK_GATE_CONFIG, rootScope, ['apps/pwa/'], [], rootPromotionBaseline); }
   finally { if (rootsConfig) rmSync(join(cwd, rootsConfig), { force: true }); }
   let unmeasured = !rootTsc.ran;
   let passed = inspectTscResult(rootTsc, rootScope, baseline, error, warn, wholeRepository, ['apps/pwa/'], [], rootPromotionBaseline);
   if (runsPwa) {
     log(`[tsc-gate] PWA 변경 ${pwaChanged.size}개 관측 — apps/pwa/tsconfig.json 검사.`);
-    const pwaTsc = runTscCmd(pwaCommand);
+    const pwaTsc = checkedTsc(pwaCommand, 'apps/pwa/tsconfig.json', pwaScope, [], ['apps/pwa/'], pwaPromotionBaseline);
     unmeasured = unmeasured || !pwaTsc.ran;
     passed = inspectTscResult(pwaTsc, pwaScope, baseline, error, warn, wholeRepository, [], ['apps/pwa/'], pwaPromotionBaseline) && passed;
   }
   if (runsPwaEnv) {
     log(`[tsc-gate] PWA env 패스 — 루트 비시험 ${nonTestRootChanged.size}개 (Next ProcessEnv 선언 포함).`);
-    const pwaEnvTsc = runTscCmd(pwaEnvCommand);
+    const pwaEnvTsc = checkedTsc(pwaEnvCommand, 'tsconfig.pwa-env.json', pwaEnvScope, ['apps/pwa/'], [], pwaEnvPromotionBaseline, true);
     unmeasured = unmeasured || !pwaEnvTsc.ran;
     passed = inspectTscResult(pwaEnvTsc, pwaEnvScope, baseline, error, warn, wholeRepository, ['apps/pwa/'], [], pwaEnvPromotionBaseline, true) && passed;
   }

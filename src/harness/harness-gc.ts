@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -104,7 +105,7 @@ export function discoverHarnessGcRepos(root: string, expired: () => boolean = ()
 }
 
 function defaultRun(args: string[]) {
-  const result = spawnSync('git', args, { encoding: 'utf8', timeout: 20_000 });
+  const result = spawnSync('git', args, { encoding: 'utf8', timeout: 20_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
 }
 

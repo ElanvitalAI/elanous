@@ -12,6 +12,7 @@ import {
   AppApiRateLimitError,
   isAppApiRateLimitFailure,
   readPrFilesWithRateLimitFallback,
+  runGhApp,
   setAppApiExecFileForTest,
   waitForAppApiRateLimitReset,
 } from './app-api-budget.js';
@@ -84,6 +85,62 @@ function ghCalls(cwd: string): string[][] {
 }
 
 describe('GitHub App API rate-limit budget', () => {
+  test('gh command completes through GithubRemoteCall without logging body arguments', async () => {
+    const events: Array<{ category: string; data: unknown }> = [];
+    const original = debug.log.bind(debug);
+    setAppApiExecFileForTest(async () => ({ stdout: 'ok', stderr: '' }));
+    debug.log = ((category: string, _event: string, data?: unknown) => {
+      events.push({ category, data });
+    }) as typeof debug.log;
+    try {
+      const result = await runGhApp('post-pr-comment', ['pr', 'comment', '8', '--body', 'ghs_secret_token'], {
+        cwd: '/tmp', encoding: 'utf8', timeout: 1000, env: {},
+      });
+      expect(result.stdout).toBe('ok');
+      expect(events.filter((item) => item.category === 'github.transport')).toHaveLength(1);
+      expect(events.find((item) => item.category === 'github.transport')?.data).toMatchObject({
+        caller: 'postPrComment', route: 'pr/:number/comment', method: 'unmeasured', status: 'unmeasured', ok: true,
+      });
+      expect(JSON.stringify(events)).not.toContain('ghs_secret_token');
+    } finally {
+      debug.log = original;
+    }
+  });
+
+  test('a failed legacy logger cannot replace gh success or its original failure', async () => {
+    const originalLog = debug.log.bind(debug);
+    const originalError = new Error('original gh failure');
+    debug.log = ((category: string) => {
+      if (category === 'github.app-api') throw new Error('legacy logger failed');
+    }) as typeof debug.log;
+    const opts = { cwd: '/tmp', encoding: 'utf8' as const, timeout: 1000, env: {} };
+    try {
+      setAppApiExecFileForTest(async () => ({ stdout: 'ok', stderr: '' }));
+      expect((await runGhApp('read-pr-files', ['api', 'repos/{owner}/{repo}/pulls/8/files'], opts)).stdout).toBe('ok');
+      setAppApiExecFileForTest(async () => { throw originalError; });
+      await expect(runGhApp('read-pr-files', ['api', 'repos/{owner}/{repo}/pulls/8/files'], opts)).rejects.toBe(originalError);
+    } finally {
+      debug.log = originalLog;
+    }
+  });
+
+  test('does not mistake GH_HOST for the actual gh request host', async () => {
+    const originalLog = debug.log.bind(debug);
+    const hosts: string[] = [];
+    setAppApiExecFileForTest(async () => ({ stdout: '[]', stderr: '' }));
+    debug.log = ((category: string, _event: string, data?: unknown) => {
+      if (category === 'github.transport') hosts.push((data as { host: string }).host);
+    }) as typeof debug.log;
+    try {
+      await runGhApp('read-pr-files', ['api', '--method', 'GET', 'repos/{owner}/{repo}/pulls/8/files'], {
+        cwd: '/tmp', encoding: 'utf8', timeout: 1000, env: { GH_HOST: 'ghe.example' },
+      });
+      expect(hosts).toEqual(['unmeasured']);
+    } finally {
+      debug.log = originalLog;
+    }
+  });
+
   test('classifies 403/429 rate-limit text and a zero remaining header, not other failures', () => {
     expect(isAppApiRateLimitFailure(403, 'API rate limit exceeded for installation ID 9')).toBe(true);
     expect(isAppApiRateLimitFailure(429, 'secondary rate limit')).toBe(true);
@@ -108,9 +165,11 @@ describe('GitHub App API rate-limit budget', () => {
       stderr: 'HTTP: 403\nX-RateLimit-Remaining: 0\nX-RateLimit-Reset: 9999999999\nAPI rate limit exceeded for installation ID 42',
     });
     const calls: Array<Record<string, unknown>> = [];
+    const transport: Array<Record<string, unknown>> = [];
     const original = debug.log.bind(debug);
     debug.log = ((category: string, event: string, data?: unknown) => {
       if (category === 'github.app-api') calls.push({ ...(data as object), event });
+      if (category === 'github.transport') transport.push({ ...(data as object), event });
       return original(category, event, data);
     }) as typeof debug.log;
     try {
@@ -120,6 +179,9 @@ describe('GitHub App API rate-limit budget', () => {
       expect(ghCalls(tree.cwd)).toHaveLength(1);
       expect(JSON.stringify(calls)).not.toContain('ghs_secret_token');
       expect(calls[0]).toMatchObject({ caller: 'readPrFiles', status: 403, remaining: '0' });
+      expect(transport).toHaveLength(1);
+      expect(transport[0]).toMatchObject({ caller: 'readPrFiles', route: 'repos/{owner}/{repo}/pulls/:number/files', method: 'GET', status: 403, ok: false, retry: 0 });
+      expect(JSON.stringify(transport)).not.toContain('ghs_secret_token');
     } finally {
       debug.log = original;
     }

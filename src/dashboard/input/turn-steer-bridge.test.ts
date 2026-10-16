@@ -111,27 +111,31 @@ describe('turn-steer-bridge — 같은 발화는 모델에 «정확히 한 번»
     expect(backend.count('MID-MARK')).toBe(1);
   });
 
-  test('Ctrl+↑ 되꺼낸 발화는 고치기 전 문면으로 모델에 가지 않는다 · 남은 발화는 한 번', () => {
+  test('Ctrl+↑ 로 되꺼낸 발화(전부)는 고치기 전 문면으로 모델에 가지 않는다 · 남의 항목은 남는다', () => {
     const ref: TurnTypeaheadRef = { state: createTurnTypeaheadState() };
     const backend = new BackendDouble();
     const events: SteerDrainedEvent[] = [];
+    enqueuePendingUserInput(SID, 'CONTROL-MEMO');
     typeAndEnter(ref, 'FIRST-MARK', events);
     typeAndEnter(ref, 'OOPS-MARK', events);
-    expect(pendingUserInputCount(SID)).toBe(2);
+    expect(pendingUserInputCount(SID)).toBe(3);
 
     const recalled = applyTurnTypeaheadKey(ref.state, { name: 'up', ctrl: true });
     expect(recalled.consumed).toBe(true);
-    expect(recalled.releasedPendingIds).toHaveLength(1);
+    expect(recalled.releasedPendingIds).toHaveLength(2);
     ref.state = recalled.state;
     releaseTurnTypeaheadPending(recalled.releasedPendingIds, 'recalled');
-    expect(ref.state.buffer).toBe('OOPS-MARK');
+    // 입력 순서대로 전부 꺼낸다(Claude Code 동형).
+    expect(ref.state.buffer).toBe('FIRST-MARK\nOOPS-MARK');
+    expect(pendingUserInputCount(SID)).toBe(1);
 
     backend.boundary();
     expect(turnEnd(ref, backend).entersInjected).toBe(0);
     backend.boundary();
-    expect(backend.count('FIRST-MARK')).toBe(1);
+    expect(backend.count('FIRST-MARK')).toBe(0);
     expect(backend.count('OOPS-MARK')).toBe(0);
-    expect(events).toEqual([{ texts: ['FIRST-MARK'], remaining: 0 }]);
+    expect(backend.count('CONTROL-MEMO')).toBe(1);
+    expect(events).toEqual([{ texts: [], remaining: 0 }]);
   });
 
   test('Ctrl+↑ 로 하나뿐인 항목을 되꺼내면 대기 수가 0이다', () => {

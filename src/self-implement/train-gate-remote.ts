@@ -3,9 +3,10 @@
  *  Unlike `dispatchHeavyCheck` it never falls back to a local run: a busy host or an infra failure is «unmeasured».
  *  The only local commands are git (cat-file · rev-parse · push · diff). */
 import { debug } from '../debug/log.js';
+import { parseGateScenario, readGateScenarioFile } from './gate-scenario.js';
 import { getDefaultLogStore } from '../mss/logging/log-store.js';
 import {
-  realGateRemoteRunner, resolveGateRemoteSettings, runOnRemote,
+  gateRemoteHostCap, realGateRemoteRunner, resolveGateRemoteSettings, runOnRemote,
   type GateRemoteRunner, type GateRemoteSettings, type RemoteRunOutcome,
 } from './gate-remote.js';
 
@@ -21,6 +22,9 @@ export interface TrainGateInput {
   changedFiles: readonly string[];
   /** Paths deleted by the integration commit — kept in `changedFiles` for tsc/PWA reach, never run as tests. */
   deletedFiles?: readonly string[];
+  /** Optional v0 JSON scenario. Selected tests are additive; invalid input is unmeasured. */
+  scenario?: unknown;
+  scenarioFile?: string;
   settings?: GateRemoteSettings;
 }
 
@@ -42,9 +46,10 @@ const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 const TEST_FILE = /\.test\.[cm]?[jt]sx?$/;
 
 /** The host-side shell body: each step runs only if the one before it passed. Exported for tests. */
-export function trainGateScript(baseSha: string, changedFiles: readonly string[], deleted: ReadonlySet<string> = new Set()): string {
+export function trainGateScript(baseSha: string, changedFiles: readonly string[], deleted: ReadonlySet<string> = new Set(), scenarioTests: readonly string[] = []): string {
   // A deleted test file is a changed path (tsc/PWA reach) but not something to run.
-  const tests = changedFiles.filter((file) => TEST_FILE.test(file) && !deleted.has(file));
+  const changedTests = changedFiles.filter((file) => TEST_FILE.test(file) && !deleted.has(file));
+  const tests = scenarioTests.length ? [...new Set([...changedTests, ...scenarioTests])] : changedTests;
   const steps = [
     `TSC_BASE_REF=${quote(baseSha)} bun scripts/ci-typecheck-changed.ts --local`,
     ...(tests.length ? [`bun run test:deterministic ${tests.map(quote).join(' ')}`] : []),
@@ -72,6 +77,30 @@ export const TRAIN_GATE_HOST = 'node-b';
 export async function runTrainGateOnHost(input: TrainGateInput, runner: GateRemoteRunner = realGateRemoteRunner, deps: TrainGateDeps = {}): Promise<TrainGateResult> {
   const settings = input.settings ?? await loadSettings();
   const host = settings.host;
+  const hostCap = gateRemoteHostCap(settings, host);
+  let scenarioTests: string[] = [];
+  if (input.scenario !== undefined || input.scenarioFile !== undefined) {
+    try {
+      if (input.scenario !== undefined && input.scenarioFile !== undefined) throw new Error('choose scenario or scenarioFile');
+      const scenario = parseGateScenario(input.scenarioFile === undefined ? input.scenario : readGateScenarioFile(input.scenarioFile), { baseSha: input.baseSha, headSha: input.commit, changedFiles: input.changedFiles });
+      if (scenario.selectedTests.some(({ path }) => input.deletedFiles?.includes(path))) throw new Error('selected test deleted');
+      scenarioTests = scenario.selectedTests.map(({ path }) => path);
+      // The remote checks out this exact commit. Verify every path against its tree locally before spending a host slot.
+      for (const path of scenarioTests) {
+        const file = runner.local('git', ['cat-file', '-e', `${input.commit}:${path}`], input.repo);
+        if (file.rc !== 0 || file.error) throw new Error(`selected test missing at head: ${path}`);
+        const tree = runner.local('git', ['ls-tree', '-z', input.commit, '--', path], input.repo);
+        if (tree.rc !== 0 || tree.error || !/^100(?:644|755) blob [0-9a-f]{40}\t/.test(tree.stdout)
+          || !tree.stdout.endsWith(`\t${path}\0`)) throw new Error(`selected test is not a regular file at head: ${path}`);
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const entry: TrainGateObservation = { host, commit: input.commit, baseSha: input.baseSha, outcome: 'unmeasured', reason, changedFiles: input.changedFiles.length };
+      debug.log('merge-queue', 'train-gate', entry);
+      try { (deps.observe ?? defaultObserve)(entry); } catch { /* observation only */ }
+      return { outcome: 'unmeasured', host, reason };
+    }
+  }
   if (host !== TRAIN_GATE_HOST) {
     const entry: TrainGateObservation = { host, commit: input.commit, baseSha: input.baseSha, outcome: 'unmeasured', reason: `host-not-gate-host (${host} ≠ ${TRAIN_GATE_HOST})`, changedFiles: input.changedFiles.length };
     debug.log('merge-queue', 'train-gate', entry);
@@ -81,13 +110,13 @@ export async function runTrainGateOnHost(input: TrainGateInput, runner: GateRemo
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = deps.now ?? Date.now;
   const deadline = now() + settings.slotWaitSeconds * 1000;
-  const script = trainGateScript(input.baseSha, input.changedFiles, new Set(input.deletedFiles ?? []));
+  const script = trainGateScript(input.baseSha, input.changedFiles, new Set(input.deletedFiles ?? []), scenarioTests);
   let outcome: RemoteRunOutcome;
   for (;;) {
     try {
       outcome = runOnRemote({
         repo: input.repo, host, mirror: settings.mirror, commit: input.commit, refs: [input.baseSha],
-        argv: ['sh', '-c', script], installPwa: true, hostCap: settings.hostCap,
+        argv: ['sh', '-c', script], installPwa: true, hostCap,
       }, runner);
     } catch (error) {
       outcome = { kind: 'infra', reason: `exception: ${error instanceof Error ? error.message : String(error)}` };
@@ -100,7 +129,7 @@ export async function runTrainGateOnHost(input: TrainGateInput, runner: GateRemo
   }
   const result: TrainGateResult = outcome.kind === 'ran'
     ? { outcome: outcome.rc === 0 ? 'pass' : 'fail', host, ms: outcome.ms, rc: outcome.rc }
-    : { outcome: 'unmeasured', host, reason: outcome.kind === 'busy' ? `host-busy (cap ${settings.hostCap} held for ${settings.slotWaitSeconds}s)` : outcome.reason };
+    : { outcome: 'unmeasured', host, reason: outcome.kind === 'busy' ? `host-busy (occupied ${outcome.occupied ?? 'unknown'}/${hostCap}, held for ${settings.slotWaitSeconds}s)` : outcome.reason };
   const entry: TrainGateObservation = {
     host, commit: input.commit, baseSha: input.baseSha, outcome: result.outcome,
     rc: result.rc, ms: result.ms, reason: result.reason, changedFiles: input.changedFiles.length,
@@ -116,7 +145,7 @@ export async function runTrainGateOnHost(input: TrainGateInput, runner: GateRemo
  *  integration commit's diff against `baseSha` (local git only); a diff failure is «unmeasured», never a local run. */
 export type TrainGate = (commitSha: string, prNumbers: readonly number[]) => Promise<TrainGateOutcome>;
 
-export function trainGateOnHost(opts: { repo: string; baseSha: string; settings?: GateRemoteSettings }, runner: GateRemoteRunner = realGateRemoteRunner, deps: TrainGateDeps = {}): TrainGate {
+export function trainGateOnHost(opts: { repo: string; baseSha: string; settings?: GateRemoteSettings; scenario?: unknown; scenarioFile?: string }, runner: GateRemoteRunner = realGateRemoteRunner, deps: TrainGateDeps = {}): TrainGate {
   const unmeasured = (commitSha: string, reason: string): 'unmeasured' => {
     const entry: TrainGateObservation = { host: opts.settings?.host ?? TRAIN_GATE_HOST, commit: commitSha, baseSha: opts.baseSha, outcome: 'unmeasured', reason, changedFiles: 0 };
     debug.log('merge-queue', 'train-gate', entry);
@@ -128,7 +157,7 @@ export function trainGateOnHost(opts: { repo: string; baseSha: string; settings?
       const diff = runner.local('git', ['diff', '--name-status', '-z', opts.baseSha, commitSha], opts.repo);
       if (diff.rc !== 0 || diff.error) return unmeasured(commitSha, 'changed-files-unavailable');
       const { changedFiles, deletedFiles } = parseNameStatus(diff.stdout);
-      return (await runTrainGateOnHost({ repo: opts.repo, commit: commitSha, baseSha: opts.baseSha, changedFiles, deletedFiles, settings: opts.settings }, runner, deps)).outcome;
+      return (await runTrainGateOnHost({ repo: opts.repo, commit: commitSha, baseSha: opts.baseSha, changedFiles, deletedFiles, settings: opts.settings, scenario: opts.scenario, scenarioFile: opts.scenarioFile }, runner, deps)).outcome;
     } catch (error) {
       // Any preparation failure (local git spawn, parse, settings) is «unmeasured» — never a rejected promise, never a local run.
       return unmeasured(commitSha, `prepare-failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 200));

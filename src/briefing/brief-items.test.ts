@@ -3,8 +3,8 @@ import { Database } from 'bun:sqlite';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BRIEF_SLOTS, BriefItemsInputError, BriefItemsLedger, composeBriefMarkdown, composeBriefPage, normalizeClaim, pendingRealtime, type BriefItem } from './brief-items.js';
-import { runRequirementFunnel } from '../intake-plane/requirement-funnel.js';
+import { BRIEF_DOMAINS, BRIEF_SLOTS, BriefItemsInputError, BriefItemsLedger, composeBriefMarkdown, composeBriefPage, normalizeClaim, orderBriefDomains, pendingRealtime, type BriefItem, type BriefWeeklyActions } from './brief-items.js';
+import { runRequirementFunnel, type RequirementFunnelResult } from '../intake-plane/requirement-funnel.js';
 import { briefFeedbackButtons, recordBriefTelegramUpdate, registerBriefCommands } from '../cli/brief-cli.js';
 import { Command } from 'commander';
 import { TelegramBot } from '../telegram.js';
@@ -12,15 +12,89 @@ import type { DirectiveRow } from '../intake-plane/requirement-funnel.js';
 
 const NOW = new Date('2026-10-05T00:00:00Z'); // 09:00 KST — after 08:30, before 22:00
 
+/** Keep 08:30 compose off the host funnel so split-send counts stay the ledger items under test. */
+function emptyFunnel(): RequirementFunnelResult {
+  return {
+    counts: { directive: 0, intake: 0, grounding: 0, coordination: 0, linear: 0 },
+    candidates: 0, decisions: [], unlinkedDirectives: [], briefItems: [],
+  };
+}
+
+function weeklyActions(overrides: Partial<Record<keyof BriefWeeklyActions['byKind'], { acted: number; total: number }>> = {}): BriefWeeklyActions {
+  const byKind = Object.fromEntries(BRIEF_DOMAINS.map(kind => {
+    const count = overrides[kind] ?? { acted: 0, total: 0 };
+    return [kind, { ...count, rate: count.total === 0 ? 0 : count.acted / count.total }];
+  })) as BriefWeeklyActions['byKind'];
+  const acted = BRIEF_DOMAINS.reduce((sum, kind) => sum + byKind[kind].acted, 0);
+  const total = BRIEF_DOMAINS.reduce((sum, kind) => sum + byKind[kind].total, 0);
+  return { acted, total, rate: total === 0 ? 0 : acted / total, byKind };
+}
+
+function pageItem(partial: Pick<BriefItem, 'id' | 'text' | 'domain'> & Partial<BriefItem>): BriefItem {
+  return {
+    priority: 'P1', deadline: null, evidence: null, source: 'test',
+    created_at: '2026-10-04T23:00:00Z', sent_at: null, ...partial,
+  };
+}
+
 function fixture(events: Array<{ event: string; data?: unknown }> = []) {
   const root = mkdtempSync(join(tmpdir(), 'brief-items-'));
   const store = new BriefItemsLedger({
     stateDir: root,
     now: () => NOW,
     log: (_category, event, data) => { events.push({ event, data }); },
+    requirementFunnel: emptyFunnel,
   });
   return { root, store, events };
 }
+
+test('orderBriefDomains returns BRIEF_DOMAINS unchanged when rate data is missing or every total is 0', () => {
+  expect(orderBriefDomains()).toEqual([...BRIEF_DOMAINS]);
+  expect(orderBriefDomains(null)).toEqual([...BRIEF_DOMAINS]);
+  expect(orderBriefDomains(weeklyActions())).toEqual([...BRIEF_DOMAINS]);
+});
+
+test('orderBriefDomains sorts sampled domains by action rate, not raw event count, and keeps zero-sample relative order', () => {
+  // 시장 1/1 beats 운영 1/2 even though 운영 recorded more events; 판·흡수 stay 운영 뒤 고정 상대 순서.
+  expect(orderBriefDomains(weeklyActions({
+    운영: { acted: 1, total: 2 },
+    시장: { acted: 1, total: 1 },
+  }))).toEqual(['시장', '운영', '판', '흡수', '행정', '코나투스']);
+});
+
+test('composeBriefPage keeps P0 and KST-today first, then high-rate domains, then zero-sample in fixed order', () => {
+  const items: BriefItem[] = [
+    pageItem({ id: 1, text: '운영 항목', domain: '운영' }),
+    pageItem({ id: 2, text: '판 항목', domain: '판' }),
+    pageItem({ id: 3, text: '시장 항목', domain: '시장' }),
+    pageItem({ id: 4, text: '오늘 결정', domain: '행정', priority: 'P2', deadline: '2026-10-05' }),
+    pageItem({ id: 5, text: '즉시 결정', domain: '운영', priority: 'P0' }),
+  ];
+  const actions = weeklyActions({ 시장: { acted: 1, total: 1 }, 운영: { acted: 1, total: 2 } });
+  const page = composeBriefPage(items, '08:30', NOW, actions);
+  expect(page.markdown.indexOf('## 결정이 필요한 것')).toBeLessThan(page.markdown.indexOf('- [P0] 즉시 결정'));
+  expect(page.markdown.indexOf('- [P0] 즉시 결정')).toBeLessThan(page.markdown.indexOf('- [P2] 오늘 결정'));
+  expect(page.markdown.indexOf('- [P2] 오늘 결정')).toBeLessThan(page.markdown.indexOf('## 시장'));
+  expect(page.markdown.indexOf('## 시장')).toBeLessThan(page.markdown.indexOf('## 운영'));
+  expect(page.markdown.indexOf('## 운영')).toBeLessThan(page.markdown.indexOf('## 판'));
+});
+
+test('composeBriefPage suppresses duplicate claims, copies text verbatim, and matches the no-rate page when rates are missing', () => {
+  const original = '  흡수   대기 ';
+  const items: BriefItem[] = [
+    pageItem({ id: 1, text: original, domain: '흡수' }),
+    pageItem({ id: 2, text: '흡수 대기', domain: '운영' }),
+    pageItem({ id: 3, text: '판 컷 확인', domain: '판' }),
+  ];
+  const withRates = composeBriefPage(items, '08:30', NOW, weeklyActions({ 판: { acted: 1, total: 1 } }));
+  const withoutRates = composeBriefPage(items, '08:30', NOW);
+  expect(withRates.markdown.split('흡수   대기').length - 1).toBe(1);
+  expect(withRates.markdown).toContain(original);
+  expect(withRates.markdown).not.toContain('- [P1] 흡수 대기');
+  expect(withoutRates.markdown).toBe(composeBriefPage(items, '08:30', NOW, weeklyActions()).markdown);
+  expect(withoutRates.markdown.indexOf('## 판')).toBeLessThan(withoutRates.markdown.indexOf('## 흡수'));
+  expect(withRates.markdown.indexOf('## 판')).toBeLessThan(withRates.markdown.indexOf('## 흡수'));
+});
 
 test('undeliverable same kind and route within an hour is one ledger item, then a fresh hour adds one', () => {
   const root = mkdtempSync(join(tmpdir(), 'brief-undeliverable-'));
@@ -314,7 +388,7 @@ test('31-item Telegram brief gives every split message item buttons and attribut
       expect(store.weeklyActions()).toMatchObject({ acted: 1, total: 31 });
     } finally { db.close(); }
   } finally { rmSync(root, { recursive: true, force: true }); }
-});
+}, 15000);
 
 test('a separate Telegram poller records feedback arriving while later fragments are delayed', async () => {
   const { root, store } = fixture();
@@ -342,7 +416,7 @@ const [root, marker] = process.argv.slice(2);
 const command = new Command('root');
 let sends = 0;
 registerBriefCommands(command, {
-  ledger: new BriefItemsLedger({ stateDir: root, now: () => new Date('2026-10-05T00:00:00Z'), log: () => {} }),
+  ledger: new BriefItemsLedger({ stateDir: root, now: () => new Date('2026-10-05T00:00:00Z'), log: () => {}, requirementFunnel: () => ({ counts: { directive: 0, intake: 0, grounding: 0, coordination: 0, linear: 0 }, candidates: 0, decisions: [], unlinkedDirectives: [], briefItems: [] }) }),
   telegramTarget: { botToken: '123:secret', chatId: 42 },
   sendWithButtons: () => {
     sends += 1;
@@ -354,7 +428,7 @@ registerBriefCommands(command, {
 command.children[0].children.find(child => child.name === 'send').handler({ slot: '08:30' });
 `);
     workerProcess = Bun.spawn(['bun', 'run', worker, root, marker], { stdout: 'pipe', stderr: 'pipe' });
-    for (let i = 0; i < 200 && !existsSync(marker); i += 1) await Bun.sleep(10);
+    for (let i = 0; i < 1500 && !existsSync(marker); i += 1) await Bun.sleep(10);
     expect(existsSync(marker)).toBe(true);
     let polls = 0;
     let bot: TelegramBot;
@@ -377,7 +451,7 @@ command.children[0].children.find(child => child.name === 'send').handler({ slot
     try { expect(db.query('SELECT item_id, reaction FROM reactions').all()).toEqual([{ item_id: items[0]!.id, reaction: '열람' }]); }
     finally { db.close(); }
   } finally { workerProcess?.kill(); rmSync(root, { recursive: true, force: true }); }
-}, 15000);
+}, 30000);
 
 test('item-number prefixes are counted before choosing a single Telegram message', async () => {
   const { root, store } = fixture();
@@ -396,7 +470,7 @@ test('item-number prefixes are counted before choosing a single Telegram message
     expect(delivered).toHaveLength(30);
     expect(delivered.every(text => text.length + text.split('\n').length <= 3900)).toBe(true);
   } finally { rmSync(root, { recursive: true, force: true }); }
-});
+}, 15000);
 
 test('identical item lines in different domains retain distinct Telegram coordinates', async () => {
   const { root, store } = fixture();
@@ -550,7 +624,7 @@ test('mid-flight Telegram split failure keeps the delivered front items and a re
       expect(db.query('SELECT COUNT(*) AS count FROM telegram_sends').get()).toEqual({ count: 31 });
     } finally { db.close(); }
   } finally { process.exitCode = priorExit ?? 0; rmSync(root, { recursive: true, force: true }); }
-});
+}, 15000);
 
 test('a thrown split send preserves completed front items and retries only the remainder', async () => {
   const { root, store } = fixture();
@@ -585,7 +659,7 @@ test('a thrown split send preserves completed front items and retries only the r
       expect(db.query('SELECT COUNT(*) AS count FROM sends').get()).toEqual({ count: 31 });
     } finally { db.close(); }
   } finally { process.exitCode = priorExit ?? 0; rmSync(root, { recursive: true, force: true }); }
-});
+}, 15000);
 
 test('multi-item single-message brief carries item numbers so a reply can name its target item', async () => {
   const { root, store } = fixture();

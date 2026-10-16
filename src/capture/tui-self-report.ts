@@ -185,6 +185,8 @@ export interface TuiSelfReportDeps {
   reportControlCleanupFailure?: (stage: TuiControlCleanupStage, error: unknown) => void;
   /** 행 등록 직후 실행 판 ⊕ 턴(idle) 기록을 연다 — `elanous pty state` 가 읽는다. 반환 = 정리. */
   startRunState?: (surfaceId: string) => (() => void);
+  /** 미룬 우편 깨움 폴러(TUI-H4)를 연다 — 반환 = 정리. 기본은 실 행 등록과 짝일 때만 늦게 불러온 `startPendingWakePoller`. */
+  startWakePoller?: (surfaceId: string) => (() => void);
 }
 
 export type TuiControlInitStage = 'create-target' | 'register-target' | 'start-poller' | 'publish-manifest';
@@ -263,6 +265,17 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
   // 행 등록을 갈아 끼운 호출자(시험)는 실 manifest 를 안 건드린다 — 기본 녹음기는 기본 행 등록과 짝일 때만.
   const startRunState = deps.startRunState ?? (deps.registerRow ? () => () => {} : startTuiRunStateRecorder);
   try { stopRunState = startRunState(surfaceId); } catch { /* fail-soft — recorder logs its own write failures */ }
+  // 미룬 우편 깨움(TUI-H4) — 이 TUI 가 턴 중·5분 창이라 못 받은 깨움을 idle 로 «기록»된 뒤 한 번 다시 두드린다.
+  // 실 행 등록과 짝일 때만(시험이 행 등록을 갈아 끼우면 0) · 무거운 모듈은 늦게 불러온다.
+  let stopWakePoller: () => void = () => {};
+  let wakePollerStopped = false;
+  if (deps.startWakePoller) {
+    try { stopWakePoller = deps.startWakePoller(surfaceId); } catch { /* fail-soft */ }
+  } else if (!deps.registerRow) {
+    void import('../loops/msg-wake.js').then(mod => {
+      if (!wakePollerStopped) stopWakePoller = mod.startPendingWakePoller(surfaceId);
+    }).catch(() => { /* fail-soft — the post-time wake still runs */ });
+  }
   const driveTicks = deps.driveTicks ?? ((tick, ms) => {
     const t = setInterval(tick, ms);
     (t as { unref?: () => void }).unref?.();
@@ -338,6 +351,8 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
     try { mirror?.stop(); } catch { /* fail-soft — restores stdout.write */ }
     clearInterval(hb);
     try { stopRunState(); } catch { /* fail-soft */ }
+    wakePollerStopped = true;
+    try { stopWakePoller(); } catch { /* fail-soft */ }
     try { markClosed(surfaceId, now()); } catch { /* fail-soft */ }
     try { activeControlTarget?.deactivate(); } catch { /* fail-soft */ }
     try { stopControlPoller(); } catch { /* fail-soft */ }

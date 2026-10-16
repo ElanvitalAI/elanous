@@ -27,13 +27,38 @@ export function orderProviderChoices(detected: readonly LLMProviderName[] = []):
   return [...detected, ...CHOICE_BASE.filter((name) => !detected.includes(name))];
 }
 
-async function chooseProvider(detected: readonly LLMProviderName[] = []): Promise<LLMProviderName | null> {
+export type MenuAnswer =
+  | { kind: 'chosen'; provider: LLMProviderName }
+  | { kind: 'cancel' }
+  | { kind: 'miss' };
+
+// FIRST10-FIX: 첫 화면의 오타 한 번이 first-run 전체를 취소하던 마찰 — 빈 입력(취소 의사)과 달리
+// 선택지를 가리키지 못하는 입력(오타·범위 밖·전각 숫자)은 취소가 아니라 다시 묻는다.
+export function parseMenuAnswer(answer: string, choices: readonly LLMProviderName[]): MenuAnswer {
+  const trimmed = answer.trim();
+  if (trimmed === '') return { kind: 'cancel' };
+  const index = Number(trimmed) - 1;
+  const provider = Number.isInteger(index) && index >= 0 ? choices[index] : undefined;
+  return provider !== undefined ? { kind: 'chosen', provider } : { kind: 'miss' };
+}
+
+export async function promptProviderMenu(
+  ask: (prompt: string) => Promise<string>,
+  detected: readonly LLMProviderName[] = [],
+): Promise<LLMProviderName | null> {
   const choices = orderProviderChoices(detected);
   const menu = choices.map((name, i) => `${i + 1} ${CHOICE_LABEL[name] ?? name}`).join(', ');
+  for (;;) {
+    const parsed = parseMenuAnswer(await ask(`Choose LLM (${menu}; Enter to cancel): `), choices);
+    if (parsed.kind === 'chosen') return parsed.provider;
+    if (parsed.kind === 'cancel') return null;
+  }
+}
+
+async function chooseProvider(detected: readonly LLMProviderName[] = []): Promise<LLMProviderName | null> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const answer = (await rl.question(`Choose LLM (${menu}; Enter to cancel): `)).trim();
-    return choices[Number(answer) - 1] ?? null;
+    return await promptProviderMenu((prompt) => rl.question(prompt), detected);
   } finally {
     rl.close();
   }

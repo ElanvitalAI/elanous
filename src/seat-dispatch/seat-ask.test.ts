@@ -1,5 +1,5 @@
 import { expect, test, spyOn } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { MsgStore } from '../msg/msg-store.js';
@@ -12,6 +12,7 @@ import { handleSeatRequests } from '../nexus/api/seat-requests.js';
 import { resolveDashboardChatMainSubmitIntent } from '../dashboard/input/chat-main-submit-route.js';
 import type { UserConfig } from '../user-config.js';
 import { acknowledgeSeatAnswers, answerSeatAsk, askSeat, askSeatAs, deliverSeatAnswers, getTuiSeatAskClientId, listSeatAskRoundTrips, parseSeatAsk, type AskOrigin, type SeatAskDeps } from './seat-ask.js';
+import { tuiSourceText } from '../../test/helpers/dashboard-source.js';
 
 const config = { raw: { decisions: { telegramOwnerId: 111 } } } as unknown as UserConfig;
 const command = (store: MsgStore, lines: string[]) => ({ ownerId: '111', replyTarget: 'acme/repo#42',
@@ -611,7 +612,7 @@ test('TUI ask reaches TC and its reply or expired notice returns only to the ori
 });
 
 test('dashboard uses the durable TUI address for both submission and reconnect polling', () => {
-  const source = readFileSync(join(import.meta.dir, '../dashboard/index.ts'), 'utf8');
+  const source = tuiSourceText();
   expect(source.includes('const tuiSeatAskClientId = getTuiSeatAskClientId();')).toBe(true);
   expect(source.includes("askSeat(submitIntent.text, { channel: 'tui', clientId: tuiSeatAskClientId }")).toBe(true);
   expect(source.includes("channel: 'tui' as const, clientId: tuiSeatAskClientId,")).toBe(true);

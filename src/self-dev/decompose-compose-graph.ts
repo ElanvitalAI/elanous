@@ -5,7 +5,8 @@ import { orderPiecesTopologically, type DecomposePiece } from './decompose-propo
 /** ⭐ RFC §5 «5단계» — `compose` 부모 그래프.
  *
  *  RFC §4.4 는 ***"compose 그래프가 «부모»가 되고, 조각마다 자식 그래프 인스턴스를 연다"*** 라고 적었다.
- *  겹침→간선 파생은 `orderPiecesTopologically` 가 «이미» 한다(`#15782`). 여기서 더하는 것은 둘이다:
+ *  ⛔ 겹침→간선 파생은 «없다»(2026-10-16 제거 · 대표 10-11 «겹침이라 미루는 현상 제거») — 순서 간선은 dependsOn 만 만든다.
+ *  여기서 더하는 것은 둘이다:
  *
  *  ⓐ 그 순서를 ***`GraphTemplate` 로 세워*** 2단계 위상 검사를 «그대로» 걸 수 있게 한다.
  *  ⓑ RFC 가 요구한 두 분모를 ***정적으로*** 잰다(원장 타임스탬프 대신 그래프 «경로»로).
@@ -42,22 +43,8 @@ export function composeGraphFromPieces(pieces: readonly DecomposePiece[], graphI
       if (!edges[dep]!.includes(piece.id)) { edges[dep]!.push(piece.id); hasIncoming.add(piece.id); }
     }
   }
-  // hotPaths 겹침 — 파생기와 «같은 규칙»(배열 앞선 것 먼저 · 이미 길이 있으면 건너뛴다)을 쓴다.
-  const reaches = (from: string, to: string): boolean => {
-    const seen = new Set([from]); const stack = [from];
-    while (stack.length) { const at = stack.pop()!; if (at === to) return true;
-      for (const next of edges[at] ?? []) if (!seen.has(next)) { seen.add(next); stack.push(next); } }
-    return false;
-  };
-  pieces.forEach((piece, index) => {
-    if (!piece.hotPaths?.length) return;
-    for (let earlier = 0; earlier < index; earlier++) {
-      const other = pieces[earlier]!;
-      if (!other.hotPaths?.some((path) => piece.hotPaths!.includes(path))) continue;
-      if (reaches(piece.id, other.id)) continue;
-      if (!edges[other.id]!.includes(piece.id)) { edges[other.id]!.push(piece.id); hasIncoming.add(piece.id); }
-    }
-  });
+  // ⛔ hotPaths 겹침 간선은 만들지 않는다(2026-10-16 제거 · 대표 10-11 «겹침이라 미루는 현상 제거»).
+  //    순서는 «의미 의존 dependsOn» 만 만든다 — 겹침은 pickDecomposeProposals 가 형제 겹침으로 따로 센다.
 
   for (const piece of pieces) {
     if (!hasIncoming.has(piece.id)) edges[COMPOSE_START]!.push(piece.id);
@@ -80,10 +67,11 @@ export function composeGraphFromPieces(pieces: readonly DecomposePiece[], graphI
 }
 
 /** RFC §5 5단계의 두 분모 — ⛔ 타임스탬프가 아니라 그래프 «경로»로 잰다.
- *  A = 겹치는 조각쌍(전부 직렬이어야 한다) · B = 겹치지 않는 쌍(하나 이상이 «나란히 갈 수» 있어야 한다).
+ *  A = 겹치는 조각쌍(선언된 의존 «외» 에는 직렬이어야 «하지 않는다») · B = 겹치지 않는 쌍(하나 이상이 «나란히 갈 수» 있어야 한다).
  *  ⛔ A=0 이거나 B=0 이면 «통과가 아니라» `unmeasured` 다. */
 export interface ComposeConcurrencyReport {
   readonly overlappingPairs: number;
+  /** 겹치는 쌍 중 «선언된 의존 외» 이유로 그래프에서 직렬로 남은 것 — 간선이 dependsOn 뿐이므로 구조적으로 0 이다(방어 관측). */
   readonly overlappingSerialized: number;
   readonly nonOverlappingPairs: number;
   readonly nonOverlappingConcurrent: number;
@@ -102,9 +90,9 @@ export function analyzeComposeConcurrency(pieces: readonly DecomposePiece[]): Co
     return false;
   };
 
-  // ⛔⭐ 「선언된 의존」과 「겹침에서 파생된 순서」를 «갈라» 본다.
-  //   분해기가 dependsOn 으로 «의미로» 정한 순서는 결함이 아니다 — 그것을 「불필요한 직렬화」로 세면
-  //   분모 B 가 거짓으로 0 이 되고, 통과할 판이 fail 로 뒤집힌다(이 갈림을 안 두었더니 실제로 그랬다).
+  // ⛔⭐ 「선언된 의존」으로 직렬된 쌍은 결함이 «아니다» — 분해기가 dependsOn 으로 «의미로» 정한 순서다.
+  //   겹침 간선이 사라진(2026-10-16) 그래프에서 남는 직렬은 전부 선언에서 오므로,
+  //   overlappingSerialized 는 «선언 외 직렬»만 센다 — 0 이 아니면 새 간선 원천이 생겼다는 방어 관측이다.
   const ids = new Set(pieces.map((p) => p.id));
   const declared: Record<string, string[]> = Object.fromEntries(pieces.map((p) => [p.id, [] as string[]]));
   for (const piece of pieces) {
@@ -120,16 +108,29 @@ export function analyzeComposeConcurrency(pieces: readonly DecomposePiece[]): Co
       const a = pieces[i]!, b = pieces[j]!;
       const overlaps = Boolean(a.hotPaths?.some((p) => b.hotPaths?.includes(p)));
       const serial = reachIn(edges, a.id, b.id) || reachIn(edges, b.id, a.id);
-      if (overlaps) { overlappingPairs++; if (serial) overlappingSerialized++; continue; }
+      if (overlaps) {
+        overlappingPairs++;
+        // ⛔ 선언된 의존으로 직렬된 겹침은 결함이 아니다 — «선언 외» 직렬만 센다.
+        if (!(reachIn(declared, a.id, b.id) || reachIn(declared, b.id, a.id)) && serial) overlappingSerialized++;
+        continue;
+      }
       // 선언된 의존으로 이미 순서가 있는 쌍은 분모 B 에서 «뺀다» — 나란히 갈 이유가 없는 쌍이다.
       if (reachIn(declared, a.id, b.id) || reachIn(declared, b.id, a.id)) continue;
       nonOverlappingPairs++;
       if (!serial) nonOverlappingConcurrent++;
     }
   }
-  const verdict: ComposeConcurrencyReport['verdict'] =
-    overlappingPairs === 0 || nonOverlappingPairs === 0 ? 'unmeasured'
-      : overlappingSerialized === overlappingPairs && nonOverlappingConcurrent >= 1 ? 'pass'
-        : 'fail';
-  return { overlappingPairs, overlappingSerialized, nonOverlappingPairs, nonOverlappingConcurrent, verdict };
+  return {
+    overlappingPairs, overlappingSerialized, nonOverlappingPairs, nonOverlappingConcurrent,
+    verdict: composeConcurrencyVerdict({ overlappingPairs, overlappingSerialized, nonOverlappingPairs, nonOverlappingConcurrent }),
+  };
+}
+
+/** RFC §5 5단계 판정식 — 파생 그래프에서 fail 이 구조적으로 안 나와도 식 자체는 살아 있다. */
+export function composeConcurrencyVerdict(
+  counts: Pick<ComposeConcurrencyReport, 'overlappingPairs' | 'overlappingSerialized' | 'nonOverlappingPairs' | 'nonOverlappingConcurrent'>,
+): ComposeConcurrencyReport['verdict'] {
+  return counts.overlappingPairs === 0 || counts.nonOverlappingPairs === 0 ? 'unmeasured'
+    : counts.overlappingSerialized === 0 && counts.nonOverlappingConcurrent >= 1 ? 'pass'
+      : 'fail';
 }

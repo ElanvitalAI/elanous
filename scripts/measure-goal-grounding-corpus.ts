@@ -14,6 +14,7 @@ import { debug } from '../src/debug/log.js';
 import { groundMissionInCodebase, type CodebaseGrounding, type SearchTermFn } from '../src/autopilot/mission-codebase-gate.js';
 import { groundForGoalAuthor, type GoalAuthorGroundingPath } from '../src/self-implement/goal-author.js';
 import { groundGoalInCodebase, GROUNDING_HEADER } from '../src/self-implement/ground-goal.js';
+import { TUI_ENTRY_PATH } from '../test/helpers/dashboard-source.js';
 
 type CorpusItem = { id: string; kind: string; ask: string; answers: readonly string[]; pr: number | null; searchTerms: readonly string[]; note?: string };
 
@@ -21,7 +22,7 @@ const CORPUS = [
   { id: 'B1', kind: 'B', ask: 'elanous logs 조회가 0건일 때 그 0이 무엇을 뜻하는지 함께 알려주도록 고쳐줘', answers: ['src/cli/logs-cli.ts'], pr: 5806, searchTerms: ['elanous', 'logs', '조회'] },
   { id: 'B2', kind: 'B', ask: '격리된 테스트 인스턴스가 살아있는 체크아웃을 조용히 편집하지 못하게 막아줘', answers: ['src/boot/tool-cwd.ts', 'src/boot/daemon-runtime.ts', 'src/nexus/index.ts'], pr: 5814, searchTerms: ['격리', '테스트', '체크아웃', '편집'] },
   { id: 'B3', kind: 'B', ask: '동시에 도는 턴들이 서로의 세션 식별자를 덮어쓰지 않게 해줘', answers: ['src/core-turn/run-core-turn.ts', 'src/debug/log.ts'], pr: 5809, searchTerms: ['동시에', '턴', '세션', '식별자'] },
-  { id: 'B4', kind: 'B', ask: '인자 없이 부르면 격리 판정이 항상 운영으로 나오는 문제를 고쳐줘', answers: ['src/instance/current.ts', 'src/boot/tool-cwd.ts', 'src/cli/where-cli.ts', 'src/dashboard/index.ts', 'src/nexus/index.ts'], pr: 5820, searchTerms: ['인자', '격리', '판정', '운영'] },
+  { id: 'B4', kind: 'B', ask: '인자 없이 부르면 격리 판정이 항상 운영으로 나오는 문제를 고쳐줘', answers: ['src/instance/current.ts', 'src/boot/tool-cwd.ts', 'src/cli/where-cli.ts', TUI_ENTRY_PATH, 'src/nexus/index.ts'], pr: 5820, searchTerms: ['인자', '격리', '판정', '운영'] },
   { id: 'B5', kind: 'B', ask: '팬아웃이 배달 0 을 냈을 때 그것이 어떤 종류의 0 인지 갈라서 알려줘', answers: ['src/session/session-fanout.ts'], pr: 5805, searchTerms: ['팬아웃', '배달', '종류'] },
   { id: 'A1', kind: 'A', ask: 'src/self-implement/goal-author.ts 가 근거를 모을 때 집계기를 쓰도록 바꿔줘', answers: ['src/self-implement/goal-author.ts'], pr: null, searchTerms: ['goal-author', '근거', '집계기'] },
   { id: 'A2', kind: 'A', ask: 'src/boot/tool-cwd.ts 의 죽은 타입을 살려서 경로 누출을 컴파일 에러로 만들어줘', answers: ['src/boot/tool-cwd.ts'], pr: 5815, searchTerms: ['tool-cwd', '타입', '경로'] },

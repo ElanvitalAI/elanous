@@ -479,6 +479,22 @@ describe('extractAppliedReviewItems review-context carryover', () => {
 
     expect(result).toEqual({ basePrLocated: true, items: [], headlineComments: 1 });
   });
+
+  test('repair worktree base looks up the bound PR by number', () => {
+    const calls: string[][] = [];
+    const runGh = (args: string[]) => {
+      calls.push(args);
+      return JSON.stringify(source({ comments: [{ createdAt: '2026-08-08T01:00:00Z',
+        body: `${reinforcementHeadline}\n- carried repair finding`, author: { login: 'ElanvitalAI' } }] }));
+    };
+    expect(fetchAppliedReviewItemsForBranch('pr-27780', runGh)).toEqual({ basePrLocated: true,
+      items: ['carried repair finding'], headlineComments: 1 });
+    expect(fetchAppliedReviewItemsForBranch('pr:27780', runGh).basePrLocated).toBe(true);
+    expect(calls).toEqual([
+      ['pr', 'view', '27780', '--json', 'comments'],
+      ['pr', 'view', '27780', '--json', 'comments'],
+    ]);
+  });
 });
 
 describe('fetchLatestReview 자동 상태 댓글 필터', () => {

@@ -10,6 +10,7 @@ import { operatorSignal } from './operator.js';
 import { createSeatsCache, todayKst } from './ops-seats.js';
 import { liveSeatsSources } from './ops-seats-sources.js';
 import { createOverviewCache } from '../../ops/overview-cache.js';
+import { resourcesFromOverview } from '../../ops/resources.js';
 import { parseSince } from '../../ops/overview-collect.js';
 import type { MetaApiOpts } from './meta-api.js';
 
@@ -192,6 +193,8 @@ export function handleOpsApi(req: Request, metaApi: MetaApiOpts | undefined): Re
   const signal = metaApi ? operatorSignal(req, metaApi) : { operator: false, operatorSource: null };
   if (!signal.operator) {
     debug.log('ops.api', 'refused', { path: pathname, source: signal.operatorSource });
+    // RES-FLOOR-API: no credential was offered at all — this endpoint names it 401; every other path keeps 403.
+    if (pathname === '/v1/ops/resources') return jsonResponse({ error: 'unauthorized' }, 401);
     return jsonResponse({ error: 'forbidden' }, 403);
   }
   const served = (response: Response): Response => {
@@ -209,6 +212,14 @@ export function handleOpsApi(req: Request, metaApi: MetaApiOpts | undefined): Re
     return overviewCache.get({ sinceMs: since.ms, sinceLabel: since.label,
       ...(version ? { version } : {}), ...(url.searchParams.has('owner') ? { owner: url.searchParams.get('owner')! } : {}) })
       .then((overview) => served(jsonResponse(overview)), () => jsonResponse({ error: 'overview-unavailable' }, 500));
+  }
+  if (pathname === '/v1/ops/resources') {
+    // RES-FLOOR-API — shares the overview cache; no new collection, no kubectl/ssh call, never waits.
+    overviewCache ??= createOverviewCache();
+    const peeked = overviewCache.peek();
+    return Promise.resolve(peeked
+      ? served(jsonResponse(resourcesFromOverview(peeked.snapshot, peeked.pods, peeked.at)))
+      : served(jsonResponse({ stale: true })));
   }
   if (pathname === '/v1/ops/seats') {
     const date = url.searchParams.get('date') ?? todayKst();

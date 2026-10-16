@@ -2,10 +2,11 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 
 import { registerDashboardLayoutDisplayRuntimes } from '../src/dashboard/layout-display-runtime-registration.js';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
 describe('registerDashboardLayoutDisplayRuntimes', () => {
   test('dashboard boot reaches the display-only registration without retired VW boot imports or calls', () => {
-    const boot = readFileSync(new URL('../src/dashboard/index.ts', import.meta.url), 'utf8');
+    const boot = tuiSourceText();
     const registration = readFileSync(new URL('../src/dashboard/layout-display-runtime-registration.ts', import.meta.url), 'utf8');
     expect(boot).toContain("import { registerDashboardLayoutDisplayRuntimes } from './layout-display-runtime-registration.js'");
     expect(boot).toContain('registerDashboardLayoutDisplayRuntimes({');

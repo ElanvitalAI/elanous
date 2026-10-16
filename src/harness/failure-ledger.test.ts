@@ -58,4 +58,17 @@ describe('renderLedger — handoff 번들 요약', () => {
     expect(s).toContain('h1');   // 앞쪽 조사도 유지(종전엔 최근 3건만 → 누락)
     expect(s).toContain('h4');
   });
+
+  test('보존 스냅샷 — renderLedger 출력 형식은 지금과 같다(전문 고정)', () => {
+    const ledger = [
+      inv({ stage: 'execute', attempt: 2, hypothesis: '원인 A', probe: '게이트 통과?', observed: '통과', verdict: 'supported', capsule: cap }),
+      inv({ hypothesis: '원인 B', verdict: 'refuted' }),
+    ];
+    expect(renderLedger(ledger)).toBe([
+      '[실패 조사 원장 (2건) — 무슨 가설을 무슨 probe 가 어떻게 판정했나]',
+      '- [execute r2·supported] 원인 A (probe: 게이트 통과? → 통과)',
+      '- [review r1·refuted] 원인 B (probe: p → o)',
+      '미충족 성공기준: A 완주 · B 검증',
+    ].join('\n'));
+  });
 });

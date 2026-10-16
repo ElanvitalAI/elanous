@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { mkdirSync, existsSync as fsExists } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { setGitCommandRunnerForTesting } from '../../git-fs/runner.js';
+import { createTempGitRemote } from '../../ux-sim/temp-git-remote.js';
 import {
   isolatedPort, planIsolatedInstance, assertIsolationSafe, buildTestConfig,
   createIsolatedInstance, ensureWorktreeDeps, PRODUCTION_PORT, ISOLATED_PORT_BASE,
@@ -205,27 +206,21 @@ describe('createIsolatedInstance — 주입 worktree', () => {
   });
 
   test('★ defaultMergeMainIntoWorktree — fetch 실패 → error / up-to-date / merged (실 git)', () => {
-    const tmp = mkdtempSync(join(tmpdir(), 'se-merge-'));
-    // origin(bare) + worktree(clone). base 커밋 push → origin/main.
-    const origin = join(tmp, 'origin.git');
-    spawnSync('git', ['init', '--bare', '-q', origin], { encoding: 'utf8' });
-    const wt = join(tmp, 'wt');
-    spawnSync('git', ['clone', '-q', origin, wt], { encoding: 'utf8' });
-    const g = (...a: string[]) => spawnSync('git', ['-C', wt, '-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { encoding: 'utf8' });
-    g('commit', '--allow-empty', '-q', '-m', 'base');
-    g('branch', '-M', 'main');
-    g('push', '-q', 'origin', 'main');
-    // origin/main = wt HEAD → up-to-date
-    expect(defaultMergeMainIntoWorktree(wt)).toBe('up-to-date');
-    // origin/main 에 새 커밋(별도 clone push) → merged
-    const wt2 = join(tmp, 'wt2');
-    spawnSync('git', ['clone', '-q', origin, wt2], { encoding: 'utf8' });
-    spawnSync('git', ['-C', wt2, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-q', '-m', 'ahead'], { encoding: 'utf8' });
-    spawnSync('git', ['-C', wt2, 'push', '-q', 'origin', 'main'], { encoding: 'utf8' });
-    expect(defaultMergeMainIntoWorktree(wt)).toBe('merged');
-    // origin remote 제거 → fetch 실패 → error(stale merge 방지)
-    spawnSync('git', ['-C', wt, 'remote', 'remove', 'origin'], { encoding: 'utf8' });
-    expect(defaultMergeMainIntoWorktree(wt)).toBe('error');
-    rmSync(tmp, { recursive: true, force: true });
+    const fixture = createTempGitRemote();
+    // 함수의 실제 Git 명령을 실행하되 환경은 이 runner 한 곳에만 준다(프로세스 env 불변).
+    setGitCommandRunnerForTesting((cwd, args, options) => {
+      const result = spawnSync('git', args, { ...options, cwd, env: { ...process.env, ...fixture.gitEnv } });
+      return { status: result.status, stdout: result.stdout?.toString() ?? '', stderr: result.stderr?.toString() ?? '' };
+    });
+    try {
+      expect(defaultMergeMainIntoWorktree(fixture.checkout)).toBe('up-to-date');
+      fixture.advanceMain(1);
+      expect(defaultMergeMainIntoWorktree(fixture.checkout)).toBe('merged');
+      fixture.removeOrigin();
+      expect(defaultMergeMainIntoWorktree(fixture.checkout)).toBe('error');
+    } finally {
+      setGitCommandRunnerForTesting(undefined);
+      fixture.cleanup();
+    }
   });
 });

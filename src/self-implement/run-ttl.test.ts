@@ -164,4 +164,77 @@ describe('RUN-TTL sweep step', () => {
     const out = await runRunTtlSweep({ adapters: { ...f.adapters, listOpenPrs: async () => { throw new Error('gh down'); } }, now: () => NOW, log: quiet().log });
     expect(out.reason).toBe('inventory-failed');
   });
+
+  test('shadow does not call requestRegate and records exactly one would-regate', async () => {
+    const f = fake([
+      { number: 20, createdHoursAgo: 72, commitHoursAgo: 48 },
+      { number: 21, createdHoursAgo: 80, commitHoursAgo: 60 },
+    ]);
+    const requested: number[] = [];
+    const { log, events } = quiet();
+    const out = await runRunTtlSweep({
+      adapters: f.adapters, now: () => NOW, log,
+      requestRegate: (pr) => { requested.push(pr.number); },
+    });
+    expect(out.mode).toBe('shadow');
+    expect(requested).toEqual([]);
+    expect(out.regate).toHaveLength(1);
+    expect([...out.label].sort()).toEqual([20, 21]);
+    expect(f.labels).toEqual([]);
+    expect(events.filter((event) => event.event === 'would-regate')).toHaveLength(1);
+    expect(events.some((event) => event.event === 'regate-requested')).toBe(false);
+  });
+
+  test('a follow-up sweep still skips already-marked PRs before fetch, even with a re-gate adapter', async () => {
+    // First live sweep: both stale, dead-run PRs get the label; only the stalest is re-gated.
+    const first = fake([
+      { number: 40, createdHoursAgo: 72, commitHoursAgo: 48 },
+      { number: 41, createdHoursAgo: 80, commitHoursAgo: 60 },
+    ]);
+    const requestedFirst: number[] = [];
+    await runRunTtlSweep({
+      adapters: first.adapters, mode: 'live', now: () => NOW, log: quiet().log,
+      requestRegate: (pr) => { requestedFirst.push(pr.number); },
+    });
+    expect(first.labels.map(([n]) => n).sort()).toEqual([40, 41]);
+    expect(requestedFirst).toHaveLength(1);
+    // Follow-up sweep: both PRs now carry the marker and still have no live run — the marker's
+    // «once» holds regardless of the adapter: skipped before any fetch (no maxFetch spend), never
+    // re-gated, never re-labelled. A per-PR re-gate history is a separate piece, not this one.
+    const second = fake([
+      { number: 40, createdHoursAgo: 72, commitHoursAgo: 48, labels: [RUN_TTL_MARKER_LABEL] },
+      { number: 41, createdHoursAgo: 80, commitHoursAgo: 60, labels: [RUN_TTL_MARKER_LABEL] },
+    ]);
+    const requestedSecond: number[] = [];
+    const out = await runRunTtlSweep({
+      adapters: second.adapters, mode: 'live', now: () => NOW, log: quiet().log,
+      requestRegate: (pr) => { requestedSecond.push(pr.number); },
+    });
+    expect(requestedSecond).toEqual([]);
+    expect(out.regate).toEqual([]);
+    expect(out.label).toEqual([]);
+    expect(second.labels).toEqual([]);
+    expect(second.commitCalls).toEqual([]);
+    expect(out.alreadyMarked).toEqual([40, 41]);
+  });
+
+  test('live calls requestRegate on exactly one of two stale PRs', async () => {
+    const f = fake([
+      { number: 30, createdHoursAgo: 72, commitHoursAgo: 48 },
+      { number: 31, createdHoursAgo: 80, commitHoursAgo: 60 },
+    ]);
+    const requested: number[] = [];
+    const { log, events } = quiet();
+    const out = await runRunTtlSweep({
+      adapters: f.adapters, mode: 'live', now: () => NOW, log,
+      requestRegate: (pr) => { requested.push(pr.number); },
+    });
+    expect(requested).toHaveLength(1);
+    expect(out.regate).toEqual(requested);
+    expect([...out.stale].sort()).toEqual([30, 31]);
+    expect([...out.label].sort()).toEqual([30, 31]);
+    expect(f.labels).toHaveLength(2);
+    expect(events.filter((event) => event.event === 'regate-requested')).toHaveLength(1);
+    expect(events.some((event) => event.event === 'would-regate')).toBe(false);
+  });
 });

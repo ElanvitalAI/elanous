@@ -7,6 +7,39 @@ export function isUnknownCodex400(detail: string, error?: unknown): boolean {
   return /\bCodex\s+API\s+400\b/i.test(detail.replace(/\s+/g, ' '));
 }
 
+/** The three recovery axes — persistent active session ID, ACP session ID, and in-memory history. */
+export interface PrepassRecoverySnapshotInput {
+  persistentActiveId: string;
+  acpId: string;
+  messages: readonly LLMMessage[];
+}
+
+export interface PrepassRecoverySnapshot {
+  persistentActiveId: string;
+  acpId: string;
+  messages: LLMMessage[];
+}
+
+/** Capture all three recovery axes into one immutable-by-convention deep snapshot. */
+export function capturePrepassRecoverySnapshot(input: PrepassRecoverySnapshotInput): PrepassRecoverySnapshot {
+  return {
+    persistentActiveId: input.persistentActiveId,
+    acpId: input.acpId,
+    messages: structuredClone([...input.messages]),
+  };
+}
+
+/** Restore a fresh, independently-mutable copy of all three axes; repeatable without aliasing. */
+export function restorePrepassRecoverySnapshot(
+  snapshot: PrepassRecoverySnapshot,
+): PrepassRecoverySnapshot {
+  return {
+    persistentActiveId: snapshot.persistentActiveId,
+    acpId: snapshot.acpId,
+    messages: structuredClone([...snapshot.messages]),
+  };
+}
+
 /** Restore only the repaired prefix, retaining messages appended during the retry. */
 export function restoreRepairedHistory<T>(
   history: T[], originalValues: readonly T[], repaired: readonly T[], expectedRepairedValues: readonly T[],

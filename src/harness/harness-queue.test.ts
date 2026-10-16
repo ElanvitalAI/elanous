@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { Command } from 'commander';
 import { installHarnessCliCommand } from './harness-cli-command.js';
 import { getUserConfig } from '../user-config.js';
-import { addHarnessQueue, harnessQueueCountingLimits, queueLaunchTime, HarnessQueueDuplicateError, queueCellId, harnessQueueIdForKey, harnessQueueOutcome, harnessQueuePath, harnessQueueReceiptPath, listHarnessQueue, queueLaunchArgs, queueSeatForCwd, queuePodRunsFromJobs, queueRunLabelValue, readHarnessQueuePodRuns, readHarnessQueueProcesses, queueCellRubricPriority, QUEUE_CEO_PRIORITY_BONUS, reconcileHarnessQueue, removeHarnessQueue, requestIdleSeats, setHarnessQueuePriority, tickHarnessQueue, type HarnessQueueDeps, type QueueItem } from './harness-queue.js';
+import { addHarnessQueue, harnessQueueCountingLimits, queueLaunchTime, HarnessQueueDuplicateError, queueCellId, harnessQueueIdForKey, harnessQueueOutcome, harnessQueuePath, harnessQueueReceiptPath, listHarnessQueue, queueLaunchArgs, queueSeatForCwd, queuePodRunsFromJobs, queueRunLabelValue, readHarnessQueuePodRuns, readHarnessQueueProcesses, queueCellRubricPriority, queueHeadBefore, QUEUE_CEO_PRIORITY_BONUS, reconcileHarnessQueue, removeHarnessQueue, requestIdleSeats, setHarnessQueuePriority, tickHarnessQueue, type HarnessQueueDeps, type QueueItem } from './harness-queue.js';
 import { checkpointDependenciesForRun, loadSelfDevRun, processBirthId, saveSelfDevRun, selfDevRunsDir } from '../self-dev/run-store.js';
 import { bindOrchestrateRunLedger } from '../self-dev/self-orchestrate-runtime.js';
 import { debug } from '../debug/log.js';
@@ -18,6 +18,7 @@ import { collectAuthorDepth, runAuthorDepthShadow } from '../loops/orchestrator/
 import { AuthorLedger } from '../loops/orchestrator/author-ledger.js';
 import { setSchedule } from '../release-loop/release-schedule.js';
 import { disableLandingFreeze, enableLandingFreeze, landingFreezePath } from '../release-loop/landing-freeze.js';
+import { collectDraftMetrics, type SweepDraft } from '../self-dev/draft-sweep.js';
 
 const roots: string[] = [];
 const root = () => { const path = mkdtempSync(join(tmpdir(), 'harness-queue-')); roots.push(path); return path; };
@@ -29,6 +30,86 @@ function fixture(dir: string, launches: string[][], pool = { running: 0, pending
   return { root: dir, pool: () => pool, cap: () => 2, alive: () => true, processes: () => [], burstMax: 1, launchStaggerMs: 0,
     authorShadow: () => {}, idleRequest: () => {}, launch: async (_item, args) => { launches.push(args); return nextPid++; }, log: () => {} };
 }
+
+test('queue dispatcher holds TC at 16 needs-owner drafts but launches TC at 15; other seat unaffected', async () => {
+  const dir = root(), launches: string[][] = [];
+  const clock = new Date('2026-10-05T00:00:00Z');
+  let tcCount = 16;
+  const deps: HarnessQueueDeps = { ...fixture(dir, launches), now: () => clock, needsOwnerGate: true,
+    draftMetrics: (at) => {
+      const drafts: SweepDraft[] = Array.from({ length: tcCount }, (_, i) => ({
+        number: i + 1, title: `draft ${i}`, branch: `self-impl/seat-${i}`,
+        labels: ['elanous:seat-TC'], createdAt: at.toISOString(), updatedAt: at.toISOString(),
+      }));
+      return collectDraftMetrics('owner/repo', {
+        listDrafts: async (page) => page === 1 ? drafts : [],
+        listRecentClosed: async () => [], getActiveClaimOwner: async () => undefined,
+      }, at);
+    },
+  };
+  const tc = await addHarnessQueue({ seat: 'TC', say: 'tc goal' }, deps);
+  const mk = await addHarnessQueue({ seat: 'MK', say: 'mk goal' }, deps);
+  expect(await tickHarnessQueue(deps, tc.id)).toMatchObject({ outcome: 'waiting', reason: expect.stringContaining('needs-owner TC: 16 > 15') });
+  expect(launches).toEqual([]);
+  expect((await tickHarnessQueue(deps)).item?.id).toBe(mk.id);
+  expect(launches).toHaveLength(1);
+  tcCount = 15;
+  expect(await tickHarnessQueue(deps, tc.id)).toMatchObject({ outcome: 'launched', item: { id: tc.id } });
+  expect(launches).toHaveLength(2);
+});
+
+test('needs-owner census runs once per tick and is shared across candidate seats (gh rate budget)', async () => {
+  const dir = root(), launches: string[][] = [];
+  const clock = new Date('2026-10-05T00:00:00Z');
+  let censusCalls = 0;
+  const deps: HarnessQueueDeps = { ...fixture(dir, launches), now: () => clock, needsOwnerGate: true,
+    draftMetrics: async (at) => { censusCalls += 1;
+      const drafts: SweepDraft[] = Array.from({ length: 16 }, (_, i) => ({
+        number: i + 1, title: `draft ${i}`, branch: `self-impl/seat-${i}`,
+        labels: ['elanous:seat-TC'], createdAt: at.toISOString(), updatedAt: at.toISOString(),
+      }));
+      return collectDraftMetrics('owner/repo', {
+        listDrafts: async (page) => page === 1 ? drafts : [],
+        listRecentClosed: async () => [], getActiveClaimOwner: async () => undefined,
+      }, at); } };
+  await addHarnessQueue({ seat: 'TC', say: 'tc goal' }, deps);
+  const mk = await addHarnessQueue({ seat: 'MK', say: 'mk goal' }, deps);
+  await addHarnessQueue({ seat: 'OP', say: 'op goal' }, deps);
+  // One tick walks TC (held, 16 > 15) then MK (launched): both read the SAME census.
+  expect((await tickHarnessQueue(deps)).item?.id).toBe(mk.id);
+  expect(censusCalls).toBe(1);
+  // The memo is per tick, not global: the next tick re-collects once.
+  await tickHarnessQueue(deps);
+  expect(censusCalls).toBe(2);
+});
+
+test('an unreadable needs-owner census stays unobserved and never holds any seat (NEEDS-OWNER-POLICY)', async () => {
+  const dir = root(), launches: string[][] = [];
+  const deps: HarnessQueueDeps = { ...fixture(dir, launches), now: () => new Date('2026-10-05T00:00:00Z'), needsOwnerGate: true,
+    draftMetrics: async () => { throw new Error('gh: rate limit exceeded'); } };
+  const tc = await addHarnessQueue({ seat: 'TC', say: 'tc goal' }, deps);
+  expect(await tickHarnessQueue(deps, tc.id)).toMatchObject({ outcome: 'launched', item: { id: tc.id } });
+  expect(launches).toHaveLength(1);
+});
+
+test('needs-owner boundary is the explicit option, not seam injection — ungated direct-launch shape still launches', async () => {
+  const dir = root(), launches: string[][] = [];
+  let censusCalls = 0;
+  const deps: HarnessQueueDeps = { ...fixture(dir, launches), now: () => new Date('2026-10-05T00:00:00Z'),
+    draftMetrics: async (at) => { censusCalls += 1;
+      const drafts: SweepDraft[] = Array.from({ length: 16 }, (_, i) => ({
+        number: i + 1, title: `draft ${i}`, branch: `self-impl/seat-${i}`,
+        labels: ['elanous:seat-TC'], createdAt: at.toISOString(), updatedAt: at.toISOString(),
+      }));
+      return collectDraftMetrics('owner/repo', {
+        listDrafts: async (page) => page === 1 ? drafts : [],
+        listRecentClosed: async () => [], getActiveClaimOwner: async () => undefined,
+      }, at); } };
+  const tc = await addHarnessQueue({ seat: 'TC', say: 'tc goal' }, deps);
+  // Direct say/ask tick shape (launch seam present, no explicit gate): injection alone no longer gates.
+  expect(await tickHarnessQueue(deps, tc.id)).toMatchObject({ outcome: 'launched', item: { id: tc.id } });
+  expect(censusCalls).toBe(0);
+});
 
 test('queue freeze holds launches only when requested, then releases queued rows when off or expired', async () => {
   const dir = root(), launches: string[][] = [], events: Array<{ event: string; data: Record<string, unknown> }> = [];
@@ -193,13 +274,37 @@ test('QUEUE-BURST: a failing follow-up launch ends the burst and keeps the launc
   expect(listHarnessQueue(deps).map((row) => row.status)).toEqual(['launched', 'launching']);
 });
 
+test('NEEDS-OWNER-BOUNDARY: the cron CLI tick holds TC at 16 needs-owner drafts while needsOwnerGate=false (the direct say/ask knob) launches', async () => {
+  const dir = root(), launches: string[][] = [];
+  const census = async () => ({ inventory: 16, oldestAgeHours: 48, needsOwner: 16, needsOwnerBySeat: { TC: 16 }, converted48h: 0, cohort48h: 0, conversion48h: null });
+  const deps = { ...fixture(dir, launches), draftMetrics: census };
+  const held = await addHarnessQueue({ seat: 'TC', say: 'cron held' }, deps);
+  const program = new Command().exitOverride();
+  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'cli', queue: deps });
+  const original = console.log, lines: string[] = [];
+  console.log = (line: string) => { lines.push(line); };
+  try { await program.parseAsync(['node', 'elanous', 'harness', 'queue', 'tick']); }
+  finally { console.log = original; }
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toContain(`waiting ${held.id}`);
+  expect(launches).toEqual([]);
+  // The direct say/ask path passes exactly this knob (needsOwnerGate: queueDeps.needsOwnerGate ?? false),
+  // so a person-initiated command answers itself instead of inheriting the cron hold.
+  const direct = await tickHarnessQueue({ ...deps, needsOwnerGate: false }, held.id);
+  expect(direct.outcome).toBe('launched');
+  expect(launches).toEqual([queueLaunchArgs(listHarnessQueue(deps)[0]!)]);
+});
+
 test('QUEUE-BURST CLI tick prints the first launch as before and one line per further launch', async () => {
   const dir = root(), launches: string[][] = [];
   const { deps } = burstFixture(dir, launches, { running: 0, pending: 0, reserved: 0, limit: 8 });
   const first = await addHarnessQueue({ seat: 'TC', say: 'first' }, deps);
   const second = await addHarnessQueue({ seat: 'MK', say: 'second' }, deps);
   const program = new Command().exitOverride();
-  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'cli', queue: deps });
+  // NEEDS-OWNER-BOUNDARY: the cron CLI tick defaults the needs-owner gate ON, so a routing test injects a
+  // zero census — a real gh census inside a test process would block on network instead of answering.
+  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'cli',
+    queue: { ...deps, draftMetrics: async () => ({ inventory: 0, oldestAgeHours: null, needsOwner: 0, needsOwnerBySeat: {}, converted48h: 0, cohort48h: 0, conversion48h: null }) } });
   const original = console.log, lines: string[] = [];
   console.log = (line: string) => { lines.push(line); };
   try { await program.parseAsync(['node', 'elanous', 'harness', 'queue', 'tick']); }
@@ -679,7 +784,10 @@ test('default queue launcher runs the stored launch args in the stored cwd under
   const stub = join(dir, 'stub.ts');
   writeFileSync(stub, "console.log('STUB ' + JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2) })); process.exitCode = 7;\n");
   const deps: HarnessQueueDeps = { root: dir, pool: () => ({ running: 0, pending: 0, reserved: 0, limit: 2 }), cap: () => 2,
-    alive: () => true, processes: () => [], authorShadow: () => {}, idleRequest: () => {}, log: () => {}, launchCommand: stub };
+    alive: () => true, processes: () => [], authorShadow: () => {}, idleRequest: () => {}, log: () => {}, launchCommand: stub,
+    draftMetrics: (at) => collectDraftMetrics('owner/repo', {
+      listDrafts: async () => [], listRecentClosed: async () => [], getActiveClaimOwner: async () => undefined,
+    }, at) };
   mkdirSync(join(dir, 'harness'), { recursive: true });
   const args = ['harness', 'say', 'exact words', '--seat', 'TC', '--substrate', 'local'];
   const item = await addHarnessQueue({ seat: 'TC', say: 'exact words', launchArgs: args, launchCwd: owner }, deps);
@@ -1310,7 +1418,10 @@ test('CLI add/list/remove/tick routes through the persisted queue and injected l
   const dir = root(), launches: string[][] = [];
   const deps = fixture(dir, launches);
   const program = new Command().exitOverride();
-  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'cli', queue: deps });
+  // NEEDS-OWNER-BOUNDARY: same zero-census stub — the queue tick CLI path is gated by default; this routing
+  // test stays fast because the census is injected instead of falling back to real gh calls.
+  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'cli',
+    queue: { ...deps, draftMetrics: async () => ({ inventory: 0, oldestAgeHours: null, needsOwner: 0, needsOwnerBySeat: {}, converted48h: 0, cohort48h: 0, conversion48h: null }) } });
   const old = console.log, lines: string[] = [];
   console.log = (...args) => { lines.push(args.join(' ')); };
   try {
@@ -2001,6 +2112,25 @@ test('TASK-QUEUE: the default enqueue priority is the cell rubric score plus the
   // A broken lookup leaves the row unprioritized instead of refusing the enqueue.
   const plain = await addHarnessQueue({ seat: 'OP', say: '칸: TQ-X other' }, { ...deps, cellPriority: () => { throw new Error('ledger down'); } });
   expect(plain.priority).toBeUndefined();
+});
+
+test('RUN-IDENTITY: 주입한 runPriority 가 칸 러브릭보다 위고 줄 머리를 잡는다(신분→우선순위 증명은 task-hand.test.ts «run identity 통합» 시험)', async () => {
+  const dir = root();
+  setSchedule('9.9.2', { cutAt: '2099-10-06T18:00+09:00' }, 'fixture', dir);
+  mkdirSync(join(dir, 'release', '9.9.2'), { recursive: true });
+  writeFileSync(join(dir, 'release', '9.9.2', 'checklist.json'), JSON.stringify({ version: '9.9.2', items: [
+    { id: 'TQ-R2', title: '루브릭 칸', status: 'yellow', evidence: '루브릭: A3 E2 R1 D2 M1 B0 S1 X0' },
+  ] }));
+  const now = new Date('2026-10-06T00:00:00Z');
+  const deps: HarnessQueueDeps = { ...fixture(dir, []), now: () => now };
+  const rubric = await addHarnessQueue({ seat: 'OP', say: '칸: TQ-R2 루브릭 칸 구현' }, deps);
+  expect(rubric.priority).toBe(15.5); // 칸 러브릭 — 종전 그대로
+  const idleRow = await addHarnessQueue({ seat: 'OP', say: '보통 손' }, deps);
+  expect(idleRow.priority).toBeUndefined(); // 칸 없는 보통 줄 — 값 없음(종전 그대로)
+  const gate = await addHarnessQueue({ seat: 'OP', say: '게이트 칸 손', runPriority: 200 }, deps);
+  expect(gate.priority).toBe(200); // 주입한 runPriority → 줄 우선순위 — 칸 러브릭·CEO 보너스보다 위
+  expect(queueHeadBefore(gate, rubric)).toBe(true); // 선점 — runPriority 줄이 칸 러브릭 줄보다 앞선다
+  expect(queueHeadBefore(gate, idleRow)).toBe(true); // 도착이 늦어도 runPriority 줄이 줄 머리를 잡는다
 });
 
 test('TASK-QUEUE: harness queue prio CLI re-ranks a queued row and refuses a non-number', async () => {

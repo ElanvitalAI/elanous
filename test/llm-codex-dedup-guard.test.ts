@@ -1617,3 +1617,69 @@ describe('streamLLMWithTools — W3-A-glob: Glob broad-spot dedup (threshold 2)'
     expect(dispatchedCalls.length).toBe(3);
   });
 });
+
+// TUI-INITIATIVE-S ② (10-15 · seat-state/OPC/initiative-probe/DIAGNOSIS-1.md) — 운영 TUI 가
+// gpt-6-sol(gpt 계열 · openai-codex 공급자)로 release_status 를 같은 인자·같은 오류({error})로 26회 돌렸다.
+// L-2 차단이 codex 계열·탐색 도구만 봤고, {error} 결과는 doom 추적기의 isError 를 세우지 않았다.
+describe('streamLLMWithTools — 같은 호출 · 같은 오류 반복 차단(gpt 계열 · 비탐색 도구)', () => {
+  const ERR = 'topic 과 action 을 동시에 쓸 수 없습니다 — 둘 중 하나만';
+  function namedProvider(name: string, turns: LLMStreamEvent[][]): LLMProvider {
+    return { ...scriptedProvider(turns), name };
+  }
+  const sameCall = (id: string): LLMStreamEvent[] => [
+    { type: 'tool_call', id, name: 'release_status', args: { topic: 'features', action: 'landed' } },
+  ];
+  async function runRepeat(model: string, providerName: string, calls: number, dispatchResult: (n: number) => unknown) {
+    const dispatched: string[] = [];
+    const results: string[] = [];
+    const turns: LLMStreamEvent[][] = [];
+    for (let i = 0; i < calls; i += 1) turns.push(sameCall(`c${i}`));
+    turns.push([{ type: 'text', delta: 'final' }]);
+    await streamLLMWithTools(
+      [{ role: 'user', content: '오늘 착지 현황 정리해줘' }],
+      {
+        onText: () => {},
+        onToolResult: (r) => { results.push(typeof r.result === 'string' ? r.result : JSON.stringify(r.result)); },
+        dispatchTool: async (name) => { dispatched.push(name); return dispatchResult(dispatched.length); },
+      },
+      {
+        provider: namedProvider(providerName, turns),
+        model,
+        tools: [{ name: 'release_status', description: 'd', parameters: { type: 'object' } }],
+        maxTurns: calls + 2,
+      },
+    );
+    return { dispatched, results };
+  }
+
+  test('gpt-6-sol on openai-codex: the 4th identical failing call is blocked with the RE-CALL stub', async () => {
+    const { dispatched, results } = await runRepeat('gpt-6-sol', 'openai-codex', 6, () => ({ error: ERR }));
+    expect(dispatched.length).toBe(3);
+    const stubs = results.filter((s) => s.includes('RE-CALL BLOCKED'));
+    expect(stubs.length).toBe(3);
+    expect(stubs[0]!).toContain('release_status(');
+    expect(stubs[0]!).toContain(ERR);
+  });
+
+  test('gpt family is blocked by family even on another provider name', async () => {
+    const { dispatched } = await runRepeat('gpt-6-sol', 'scripted', 5, () => ({ error: ERR }));
+    expect(dispatched.length).toBe(3);
+  });
+
+  test('a success in between resets the count — identical call that recovers is not blocked', async () => {
+    const { dispatched, results } = await runRepeat('gpt-6-sol', 'openai-codex', 5, (n) => (n === 3 ? 'ok' : { error: ERR }));
+    expect(dispatched.length).toBe(5);
+    expect(results.some((s) => s.includes('RE-CALL BLOCKED'))).toBe(false);
+  });
+
+  test('a different error each time is not «the same error» — not blocked', async () => {
+    const { dispatched } = await runRepeat('gpt-6-sol', 'openai-codex', 5, (n) => ({ error: `${ERR} #${n}` }));
+    expect(dispatched.length).toBe(5);
+  });
+
+  test('claude family is unchanged — repeated failing calls keep dispatching', async () => {
+    const { dispatched, results } = await runRepeat('claude-opus-4-6', 'scripted', 5, () => ({ error: ERR }));
+    expect(dispatched.length).toBe(5);
+    expect(results.some((s) => s.includes('RE-CALL BLOCKED'))).toBe(false);
+  });
+});

@@ -10,6 +10,7 @@ import { askSeat } from '../seat-dispatch/seat-questions.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
 import { buildUserConfig } from '../user-config.js';
 import { runSeatLoopOnce, seatLedgerPath, type SeatDeps, type SeatEntry } from './seat-loop.js';
+import { collectDraftMetrics, type SweepDraft } from '../self-dev/draft-sweep.js';
 
 const now = new Date('2026-10-04T03:00:00Z');
 const fixture = (title: string) => {
@@ -67,6 +68,72 @@ test('live-safe enqueues an allowed goal through AUTOQ, with durable receipt and
     expect(calls.map((args) => args.slice(0, 2))).toEqual([['harness', 'budget']]);
     expect(spy.mock.calls.some(([category, event]) => category === 'seat.loop' && event === 'queued')).toBe(true);
   } finally { spy.mockRestore(); f.close(); }
+});
+
+test('seat dispatcher holds 16 needs-owner drafts but enqueues at 15 (observed at launch call)', async () => {
+  for (const count of [16, 15]) {
+    const f = fixture('구현');
+    const launches: string[] = [];
+    try {
+      const drafts: SweepDraft[] = Array.from({ length: count }, (_, i) => ({
+        number: i + 1, title: `draft ${i}`, branch: `self-impl/seat-${i}`,
+        labels: ['elanous:seat-TC'], createdAt: now.toISOString(), updatedAt: now.toISOString(),
+      }));
+      const result = await runSeatLoopOnce('TC', { ...f.deps, needsOwnerGate: true, config: { mode: 'live-safe', seats: ['TC'] },
+        run: async (args) => { expect(args.slice(0, 2)).toEqual(['harness', 'budget']); return '{"outcome":"proceed"}'; },
+        draftMetrics: (clock) => collectDraftMetrics('owner/repo', {
+          listDrafts: async (page) => page === 1 ? drafts : [],
+          listRecentClosed: async () => [], getActiveClaimOwner: async () => undefined,
+        }, clock),
+        enqueue: async (seat) => { launches.push(seat); return { id: 'hq-00000000-0000-4000-8000-000000000001' }; },
+      });
+      expect(result.status).toBe(count === 16 ? 'wait' : 'queued');
+      expect(launches).toEqual(count === 16 ? [] : ['TC']);
+    } finally { f.close(); }
+  }
+});
+
+test('direct seat dispatcher does not call harness say for 16 needs-owner drafts, but does for 15', async () => {
+  for (const count of [16, 15]) {
+    const f = fixture('구현');
+    const launches: string[][] = [];
+    try {
+      const drafts: SweepDraft[] = Array.from({ length: count }, (_, i) => ({
+        number: i + 1, title: `draft ${i}`, branch: `self-impl/seat-${i}`,
+        labels: ['elanous:seat-TC'], createdAt: now.toISOString(), updatedAt: now.toISOString(),
+      }));
+      const result = await runSeatLoopOnce('TC', { ...f.deps, needsOwnerGate: true, config: { mode: 'on', seats: ['TC'] },
+        run: async (args) => {
+          if (args[1] === 'budget') return '{"outcome":"proceed"}';
+          launches.push(args);
+          return JSON.stringify([{ status: 'done', runId: 'run-00000000-0000-4000-8000-000000000001' }]);
+        },
+        draftMetrics: (clock) => collectDraftMetrics('owner/repo', {
+          listDrafts: async (page) => page === 1 ? drafts : [],
+          listRecentClosed: async () => [], getActiveClaimOwner: async () => undefined,
+        }, clock),
+      });
+      expect(result.status).toBe(count === 16 ? 'wait' : 'launched');
+      expect(launches.map((args) => args.slice(0, 2))).toEqual(count === 16 ? [] : [['harness', 'say']]);
+    } finally { f.close(); }
+  }
+});
+
+test('an unreadable needs-owner census stays unobserved in the dispatcher: the seat still launches (NEEDS-OWNER-POLICY)', async () => {
+  const f = fixture('구현');
+  const launches: string[][] = [];
+  try {
+    const result = await runSeatLoopOnce('TC', { ...f.deps, needsOwnerGate: true, config: { mode: 'on', seats: ['TC'] },
+      run: async (args) => {
+        if (args[1] === 'budget') return '{"outcome":"proceed"}';
+        launches.push(args);
+        return JSON.stringify([{ status: 'done', runId: 'run-00000000-0000-4000-8000-000000000002' }]);
+      },
+      draftMetrics: async () => { throw new Error('gh: rate limit exceeded'); },
+    });
+    expect(result.status).toBe('launched');
+    expect(launches.map((args) => args.slice(0, 2))).toEqual([['harness', 'say']]);
+  } finally { f.close(); }
 });
 
 test('a failed child is retryable, while a successful child and a person-removed item remain handled (SEAT-REQUEUE-HANDLED)', async () => {

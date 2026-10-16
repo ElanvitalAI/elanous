@@ -28,6 +28,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { nativeToolCatalog } from '../src/native-tool-catalog.js';
+import { TUI_SOURCE_DIRS, tuiSourceText } from '../test/helpers/dashboard-source.js';
 
 const verbose = process.argv.includes('--verbose');
 const strict  = process.argv.includes('--strict');
@@ -68,7 +69,7 @@ const SKIP_TOOLS: ReadonlySet<string> = new Set([
 //      ⇒ 그러므로 이 스크립트가 내는 issue 수는 «결함 수가 아니라 이 자로 잰 수»다. 분류는 후속.
 const root = resolve(import.meta.dir, '..');
 const skillDispatchSrc = readFileSync(resolve(root, 'src/tool-runtime/registry.ts'), 'utf8');
-const tuiSrc   = readFileSync(resolve(root, 'src/dashboard/index.ts'), 'utf8');
+const tuiSrc   = tuiSourceText(root); // TUI 소스 묶음(src/dashboard/** ⊕ src/tui/**) — 경로 무관
 
 interface Issue { tool: string; surface: string; kind: 'missing' | 'extra'; detail: string; }
 
@@ -103,7 +104,7 @@ for (const entry of nativeToolCatalog) {
         tool: entry.id,
         surface: 'tui',
         kind: 'missing',
-        detail: `dashboard/index.ts does not mention alias "${pascal}" (catalog lists host:'tui')`,
+        detail: `TUI source bundle (${TUI_SOURCE_DIRS.join(' + ')}) does not mention alias "${pascal}" (catalog lists host:'tui')`,
       });
     }
   }

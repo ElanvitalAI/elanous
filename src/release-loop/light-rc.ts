@@ -29,6 +29,9 @@ export interface LightRcOptions {
   /** Run on this machine (the remote child is re-invoked with it). */
   local?: boolean;
   shards?: number;
+  /** OP FU — pass `--fixed-shard-distribution` to self gate (sorted round-robin into `shards`, no RSS pre-measurement).
+   *  Opt-in; absent = the measured planner, unchanged. Also carried to the remote child. */
+  fixedShardDistribution?: boolean;
   /** Release ledger root for the previous-version lookup (release run's deps.ledgerRoot). */
   ledgerRoot?: string;
   log?: (line: string) => void;
@@ -192,7 +195,7 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
     try {
       const dir = checkout?.dir ?? cwd;
       if (checkout) alwaysInclude = readList(dir);
-      local = (deps.runGate ?? runSelfGateCli)(dir, { base, shards, alwaysInclude, includeImporterTests: true });
+      local = (deps.runGate ?? runSelfGateCli)(dir, { base, shards, ...(opts.fixedShardDistribution ? { fixedShardDistribution: true } : {}), alwaysInclude, includeImporterTests: true });
       if (opts.rehearsalTui) {
         const command = async (cmd: string, args: string[], tree: string, limitMs?: number) => {
           const run = spawnSync(cmd, args, { cwd: tree, encoding: 'utf8', timeout: limitMs });
@@ -208,7 +211,7 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
   const rc = await (deps.dispatch ?? dispatchHeavyCheck)({
     tool: 'self-gate', repo: cwd, installPwa: true, refs: [base], json: true, commit: measuredCommit,
     // The host re-runs this command with --local (and ELANOUS_GATE_REMOTE_CHILD=1), so it never recurses.
-    remoteArgv: (sha) => ['bun', 'bin/elanous.mjs', 'release', 'light-rc', '--version', version, '--base', sha(base), '--head', measuredCommit, '--shards', String(shards), '--local', '--json', ...(opts.rehearsalTui ? ['--rehearsal-tui'] : [])],
+    remoteArgv: (sha) => ['bun', 'bin/elanous.mjs', 'release', 'light-rc', '--version', version, '--base', sha(base), '--head', measuredCommit, '--shards', String(shards), ...(opts.fixedShardDistribution ? ['--fixed-shard-distribution'] : []), '--local', '--json', ...(opts.rehearsalTui ? ['--rehearsal-tui'] : [])],
     flags: { remote: opts.local ? undefined : opts.remote ?? true, local: !!opts.local },
     runLocal,
   }, {

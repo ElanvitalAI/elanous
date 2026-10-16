@@ -1066,6 +1066,10 @@ describe('자립 문면 — 0 일 때 «거짓말하지 않는다»', () => {
 // 원장에 ***0행***이었고 S3 보관 루프도 못 봤다. 파일은 로컬에만 있었다.
 // ⛔ 그런데 그 PR 본문엔 *"비공개 버킷 쪽으로 간다"*고 적혀 있었다 — 거짓이었다.
 // ⇒ 시험이 «호출 순서»를 물지 않으면 이 자리는 조용히 되돌아온다.
+const wgetAvailable = Bun.which('wget') !== null;
+const wgetIntegration = wgetAvailable ? test : test.skip;
+const wgetIntegrationName = (name: string) => wgetAvailable ? name : `${name} (skipped: wget unavailable)`;
+
 describe('브라우저 재현 가능한 미러 계약', () => {
   test.each([
     ['www 요청 호스트', 'https://www.example.co.uk/page', ['www.example.co.uk', 'example.co.uk']],
@@ -1086,7 +1090,10 @@ describe('브라우저 재현 가능한 미러 계약', () => {
     expect(filter.test('https://example.net/assets/app.js')).toBe(false);
   });
 
-  test('실제 wget은 POSIX ERE를 컴파일해 www 형제 자산만 받고 외부 호스트는 받지 않는다', async () => {
+  // 실 wget 계약(POSIX ERE 컴파일·형제 호스트만 받기)은 실물 wget 만 답한다 — 가짜 실행기로 바꾸면 이 시험의 뜻이 사라진다.
+  // 게이트 Pod 이미지(docker/harness)엔 wget 이 없다(0.2.30 게이트: originFiles 0). 그때는 «이유를 이름에 단» skip 이고,
+  // wget 인자 계약은 바로 아래 주입 실행기 시험(형제 제한·깊이·정규화 인자)이 Pod 에서도 문다.
+  wgetIntegration(wgetIntegrationName('실제 wget은 POSIX ERE를 컴파일해 www 형제 자산만 받고 외부 호스트는 받지 않는다'), async () => {
     const root = mkdtempSync(join(tmpdir(), 'webclone-archive-live-siblings-'));
     const dbPath = join(root, 'webclone.db');
     const serverScript = `

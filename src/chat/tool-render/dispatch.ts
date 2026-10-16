@@ -361,7 +361,11 @@ function extractSyntheticGuardSummary(result: unknown): string | null {
     return 'inspect budget exhausted — summarize inspected files';
   }
   if (text.includes('TOOL CALL REJECTED')) {
-    return 'tool budget exhausted — final answer required';
+    // Only the turn-budget stub is a budget; phase guards (VERIFY/REPAIR/INSPECT ACTION
+    // REQUIRED …) reject a tool for the current phase and must not read as «budget» (#67).
+    if (text.includes('tool-loop budget exhausted')) return 'tool budget exhausted — final answer required';
+    const reason = /\b([A-Z][A-Z]+(?: [A-Z]+)* (?:REQUIRED|EXHAUSTED))\b/.exec(text)?.[1];
+    return reason ? `tool call rejected — ${reason.toLowerCase()}` : 'tool call rejected';
   }
   if (text.includes('RUNTIME BLOCKED')) {
     return 'reuse current candidates';

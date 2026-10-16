@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
 const ROOT = process.cwd();
 
@@ -10,7 +11,7 @@ function read(rel: string): string {
 
 describe('R1 overlay audit', () => {
   test('dashboard flushes non-modal transient overlays via the shared host', () => {
-    const dashboard = read('src/dashboard/index.ts');
+    const dashboard = tuiSourceText();
     expect(dashboard).toContain("const overlay = transientOverlayHost.paint();");
     expect(dashboard).not.toContain('renderLlmContextDropBanner(');
   });

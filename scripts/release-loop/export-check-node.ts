@@ -21,7 +21,6 @@ function failed(step: ExportCheckResult['step'], message: string, result?: Comma
 export function runExportCheck(run: CommandRunner = runCommand, repoRoot = process.cwd()): ExportCheckResult {
   const context = readGraphContext();
   const commit = nodeOutput(context, 'version-release', 'commit');
-  if (context.outputs.gate?.outcome !== 'ok') return failed('export', 'gate did not pass');
   const root = resolve(repoRoot);
   const out = mkdtempSync(join(tmpdir(), 'elanous-export-check-'));
   const sourceDir = join(out, 'source');

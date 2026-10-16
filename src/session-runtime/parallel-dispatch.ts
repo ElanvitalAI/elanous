@@ -93,31 +93,48 @@ export function partitionByParallelSafety<T extends { name: string }>(
  *
  *   When `safe.length < 2`, the helper degenerates into pure sequential
  *   dispatch in original order — no parallelism benefit for 0-1 safe
- *   calls so we keep behaviour identical to pre-P2. */
+ *   calls so we keep behaviour identical to pre-P2.
+ *
+ *   ⭐ `signal` (TUI-ESC-ABORT-TOOLS · 2026-10-15) — 턴 중단(Esc)이 걸리면 묶음 안
+ *   «남은» 호출을 새로 시작하지 않는다. 순차 갈래·unsafe 갈래에서 호출마다
+ *   `signal.aborted` 를 보고, 참이면 그 호출과 뒤의 호출을 부르지 않는다.
+ *   ⛔ 이미 시작한 호출은 끊지 않는다(진행 중 도구의 중단은 도구가 받는 신호의 몫).
+ *   ⛔ 병렬(safe) 묶음은 한꺼번에 시작되므로 시작 «전»에만 본다.
+ *   부르지 않은 호출의 결과 칸은 비어 있다 — 호출자가 «중단됨» 결과로 채워
+ *   공급자 이력의 tool_call/tool_result 짝을 지킨다(`skippedIndices`). */
 export async function dispatchWithParallelSafety<T extends { name: string }>(
   calls: readonly T[],
   dispatchOne: (call: T, index: number) => Promise<void>,
-): Promise<{ safeCount: number; unsafeCount: number; parallelActivated: boolean }> {
+  signal?: AbortSignal,
+): Promise<{ safeCount: number; unsafeCount: number; parallelActivated: boolean; skippedIndices: number[] }> {
   const { safe, unsafe } = partitionByParallelSafety(calls);
   const parallelActivated = safe.length >= 2;
+  const skippedIndices: number[] = [];
   if (!parallelActivated) {
     // Fall back to pure sequential in original order. Keeps pre-P2
     // behaviour bit-exact when only one read tool is in the batch
     // (common case — no benefit to firing Promise.all for a single
     // call).
     for (let i = 0; i < calls.length; i += 1) {
+      if (signal?.aborted) { skippedIndices.push(i); continue; }
       await dispatchOne(calls[i]!, i);
     }
-    return { safeCount: safe.length, unsafeCount: unsafe.length, parallelActivated };
+    return { safeCount: safe.length, unsafeCount: unsafe.length, parallelActivated, skippedIndices };
   }
   // Parallel kickoff for the safe group. Promise.all is safe here
   // because `dispatchOne` is expected to catch its own errors and
   // write an error result into the caller's storage — we never want
   // one failing Read to cancel two sibling Reads.
-  await Promise.all(safe.map(({ call, index }) => dispatchOne(call, index)));
+  if (signal?.aborted) {
+    for (const { index } of safe) skippedIndices.push(index);
+  } else {
+    await Promise.all(safe.map(({ call, index }) => dispatchOne(call, index)));
+  }
   // Unsafe group: sequential, in original order.
   for (const { call, index } of unsafe) {
+    if (signal?.aborted) { skippedIndices.push(index); continue; }
     await dispatchOne(call, index);
   }
-  return { safeCount: safe.length, unsafeCount: unsafe.length, parallelActivated };
+  skippedIndices.sort((a, b) => a - b);
+  return { safeCount: safe.length, unsafeCount: unsafe.length, parallelActivated, skippedIndices };
 }

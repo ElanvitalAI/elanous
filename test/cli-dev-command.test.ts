@@ -1,4 +1,4 @@
-// U4 — `elanous dev` 실험 엔트리 실행수준 통합(subprocess). Commander 등록·옵션 검증·종료코드 회귀.
+// U4 — `elanous dev` 실험 엔트리 실행수준 통합. 파서 검사는 프로세스 안, 프로세스 계약은 subprocess.
 //   self dispatch는 실제 worktree spawn을 피하고, shell-drive 성공 경로는 짧은 실제 자식으로 검증한다.
 
 import { setDefaultTimeout, afterAll, beforeAll, describe, expect, it } from 'bun:test';
@@ -7,6 +7,8 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSy
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { snapshotWorktreeRoot, sweepNewEmptyWorktreeRoots } from './helpers/worktree-root-leak.js';
+import { simInProcessCli } from '../src/ux-sim/in-process-cli.js';
+import { createTempGitRemote, type TempGitRemote } from '../src/ux-sim/temp-git-remote.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -51,6 +53,14 @@ function run(args: string[]): { code: number; out: string } {
   return { code: r.status ?? 1, out };
 }
 
+/** Parser/help assertions use the real registered Commander tree in-process. */
+async function runRegistered(args: string[]): Promise<{ code: number; out: string }> {
+  const result = await simInProcessCli(args, { allowPaths: [['dev'], ['drive']] });
+  const out = result.stdout + result.stderr;
+  assertNoProductionConfigMaterialization(out);
+  return { code: result.exitCode, out };
+}
+
 function runIsolatedCli(args: string[], cwd?: string): { code: number; out: string } {
   const r = spawnSync('bun', [CLI, `--test=${childState}`, ...args], { cwd, encoding: 'utf-8', env: childEnv({ NODE_ENV: 'test' }) });
   const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
@@ -58,56 +68,32 @@ function runIsolatedCli(args: string[], cwd?: string): { code: number; out: stri
   return { code: r.status ?? 1, out };
 }
 
-function git(cwd: string, args: string[]): void {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
-  if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`);
-}
-
-function createGitFixture(behind: number | 'no-origin'): { invoked: string; cleanup: () => void } {
-  const root = mkdtempSync(join(tmpdir(), 'elanous-dev-behind-'));
-  const remote = join(root, 'remote.git');
-  const seed = join(root, 'seed');
-  const invoked = join(root, 'invoked');
-  // ⛔ 이식성(무인 리뷰 should-fix) — bare 의 기본 브랜치는 `init.defaultBranch` 를 따른다.
-  //   그 값이 `master` 인 환경에서는 bare 의 HEAD 가 `refs/heads/master` 를 가리키는데 우리가 미는 것은
-  //   `main` 이라, clone 이 **체크아웃 없는 트리**를 만들고 fixture 가 이 저장소 밖에서만 깨진다.
-  //   ⇒ bare 쪽 기본 브랜치를 명시해 환경 설정과 무관하게 만든다(`-b` 는 bare 에도 먹는다).
-  git(root, ['init', '--bare', '-b', 'main', remote]);
-  git(root, ['init', '-b', 'main', seed]);
-  git(seed, ['config', 'user.email', 'test@example.com']);
-  git(seed, ['config', 'user.name', 'Test User']);
-  writeFileSync(join(seed, 'README.md'), 'base\n');
-  git(seed, ['add', 'README.md']);
-  git(seed, ['commit', '-m', 'base']);
-  git(seed, ['remote', 'add', 'origin', remote]);
-  git(seed, ['push', '-u', 'origin', 'main']);
-  git(root, ['clone', remote, invoked]);
-  if (behind === 'no-origin') {
-    git(invoked, ['remote', 'remove', 'origin']);
-  } else {
-    for (let index = 0; index < behind; index += 1) {
-      writeFileSync(join(seed, 'README.md'), `commit ${index}\n`);
-      git(seed, ['add', 'README.md']);
-      git(seed, ['commit', '-m', `ahead ${index}`]);
-    }
-    if (behind > 0) git(seed, ['push', 'origin', 'main']);
-    git(invoked, ['fetch', 'origin']);
+function createGitFixture(behind: number | 'no-origin'): TempGitRemote & { invoked: string } {
+  const fixture = createTempGitRemote();
+  try {
+    if (behind === 'no-origin') fixture.removeOrigin();
+    else fixture.advanceMain(behind);
+    return { ...fixture, invoked: fixture.checkout };
+  } catch (error) {
+    fixture.cleanup();
+    throw error;
   }
-  return { invoked, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
-function runDevFixture(cwd: string, runId: string): {
+function runDevFixture(cwd: string, runId: string, gitEnv: Omit<NodeJS.ProcessEnv, 'NODE_ENV'>): {
   output: string;
   logs: Array<{ event: string; data: string }>;
 } {
-  const env = childEnv({ ELANOUS_RUN_ID: runId });
+  const env = childEnv({ ...gitEnv, ELANOUS_RUN_ID: runId });
   const result = spawnSync('bun', [CLI, `--test=${childState}`, 'dev', 'runtime git fixture', '--backend', 'codex', '--transport', 'acp'], {
-    cwd, env, encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL',
+    // The real CLI/ACP subprocess needs a cold-start window on gate Pods.
+    // 15 s hit ETIMEDOUT in all three worktree cases on node-b (2026-10-15).
+    cwd, env, encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL',
   });
   // 프로세스 종료와 pipeline 진입을 별개로 확인한다. 관측 `plan` 이 없으면
   // 경고를 출력했어도 실행 경로에 닿지 못한 것이다.
   if (result.error || result.signal) {
-    throw new Error(`dev spawn 실패: ${result.error?.message ?? result.signal}`);
+    throw new Error(`dev spawn 실패: ${result.error?.message ?? result.signal}\nstdout: ${(result.stdout ?? '').slice(-4000)}\nstderr: ${(result.stderr ?? '').slice(-4000)}`);
   }
   const logResult = spawnSync('bun', [CLI, `--test=${childState}`, 'logs', '--exact-category', 'dev-pipeline', '--since', '10m', '--json', '--limit', '10'], {
     cwd, env, encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL',
@@ -127,20 +113,21 @@ function runDevFixture(cwd: string, runId: string): {
   return { output, logs };
 }
 
+// Keep this suite name stable: gate-baseline compares the full test name with main.
 describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
   // `--help` matches `dev`, but drive runtime accepts only --goal, --max-steps,
   // --poll-ms, --model, and --cwd; every other dev option is explicitly rejected.
-  it('drive explicitly rejects dev-only --elanous at runtime', () => {
-    const r = run(['drive', 'printf done', '--goal', 'finish', '--elanous']);
+  it('drive explicitly rejects dev-only --elanous at runtime', async () => {
+    const r = await runRegistered(['drive', 'printf done', '--goal', 'finish', '--elanous']);
     expect(r.code).not.toBe(0);
     expect(r.out).toContain('drive: 지원하지 않는 옵션: --elanous');
   });
-  it('--help 는 실험 엔트리로 resolve', () => {
-    const r = run(['dev', '--help']);
+  it('--help 는 실험 엔트리로 resolve', async () => {
+    const r = await runRegistered(['dev', '--help']);
     expect(r.code).toBe(0);
     expect(r.out).toContain('실험');
     expect(r.out).toContain('--backend');
-    const all = run(['dev', '--help-all']);
+    const all = await runRegistered(['dev', '--help-all']);
     expect(all.code).toBe(0);
     expect(all.out).toContain('--context');
     expect(all.out).toContain('--context-text');
@@ -150,27 +137,27 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
   });
 
   // dev 에서 은퇴한 상한 옵션은 값과 --no-supervise 조합에 관계없이 파서가 거부한다.
-  it('--supervise-rounds fails with --no-supervise and with invalid limits, before self execution', () => {
+  it('--supervise-rounds fails with --no-supervise and with invalid limits, before self execution', async () => {
     for (const args of [
       ['dev', 'do not launch', '--no-supervise', '--supervise-rounds', '2'],
       ['dev', 'do not launch', '--supervise-rounds', '0'],
       ['dev', 'do not launch', '--supervise-rounds', '-1'],
     ]) {
-      const r = run(args);
+      const r = await runRegistered(args);
       expect(r.code).not.toBe(0);
       expect(r.out).toContain('--supervise-rounds');
     }
   });
 
-  it('기본 감독을 끄는 --no-supervise 는 help-all 에 계속 노출한다', () => {
-    const all = run(['dev', '--help-all']);
+  it('기본 감독을 끄는 --no-supervise 는 help-all 에 계속 노출한다', async () => {
+    const all = await runRegistered(['dev', '--help-all']);
     expect(all.code).toBe(0);
     expect(all.out).toContain('--no-supervise');
   });
 
-  it('drive rejects the dev-only reviewer context options', () => {
+  it('drive rejects the dev-only reviewer context options', async () => {
     for (const option of [['--context', 'README.md'], ['--context-text', 'review premise']] as const) {
-      const r = run(['drive', 'exit 0', '--goal', 'finish', ...option]);
+      const r = await runRegistered(['drive', 'exit 0', '--goal', 'finish', ...option]);
       expect(r.code).not.toBe(0);
       expect(r.out).toContain(`drive: 지원하지 않는 옵션: ${option[0]}`);
     }
@@ -236,7 +223,7 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
     const fixture = createGitFixture(2);
     try {
       const runId = `behind-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      const result = runDevFixture(fixture.invoked, runId);
+      const result = runDevFixture(fixture.invoked, runId, fixture.gitEnv);
       expect(result.output).toContain('origin/main보다 2개 커밋 뒤처져 있습니다');
       const behindEvents = result.logs.filter(({ event }) => event === 'worktree-behind-main');
       expect(behindEvents).toHaveLength(1);
@@ -245,31 +232,31 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
     } finally {
       fixture.cleanup();
     }
-  }, 35_000);
+  }, 90_000);
 
   it('origin/main과 동기화된 invoked worktree는 무경고로 pipeline 발사를 계속한다', () => {
     const fixture = createGitFixture(0);
     try {
-      const result = runDevFixture(fixture.invoked, `current-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+      const result = runDevFixture(fixture.invoked, `current-${Date.now()}-${Math.random().toString(16).slice(2)}`, fixture.gitEnv);
       expect(result.output).not.toContain('작업 트리는 origin/main보다');
       expect(result.logs.some(({ event }) => event === 'worktree-behind-main')).toBe(false);
       expect(result.logs.some(({ event }) => event === 'plan')).toBe(true);
     } finally {
       fixture.cleanup();
     }
-  }, 35_000);
+  }, 90_000);
 
   it('origin을 측정할 수 없는 invoked worktree는 무경고로 pipeline 발사를 계속한다', () => {
     const fixture = createGitFixture('no-origin');
     try {
-      const result = runDevFixture(fixture.invoked, `unknown-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+      const result = runDevFixture(fixture.invoked, `unknown-${Date.now()}-${Math.random().toString(16).slice(2)}`, fixture.gitEnv);
       expect(result.output).not.toContain('작업 트리는 origin/main보다');
       expect(result.logs.some(({ event }) => event === 'worktree-behind-main')).toBe(false);
       expect(result.logs.some(({ event }) => event === 'plan')).toBe(true);
     } finally {
       fixture.cleanup();
     }
-  }, 35_000);
+  }, 90_000);
 
   it('dev --json --worktree preserves created provenance when the real child initialization throws', () => {
     const fixture = createGitFixture(0);
@@ -282,7 +269,7 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
         cwd: fixture.invoked,
         encoding: 'utf8',
         timeout: 15_000, killSignal: 'SIGKILL',
-        env: childEnv({ ELANOUS_RUN_ID: runId, NODE_ENV: 'test' }),
+        env: childEnv({ ...fixture.gitEnv, ELANOUS_RUN_ID: runId, NODE_ENV: 'test' }),
       });
       expect(result.error).toBeUndefined();
       assertNoProductionConfigMaterialization(`${result.stdout ?? ''}${result.stderr ?? ''}`);
@@ -304,12 +291,10 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
       expect(output.autoWorktree.environment.branch).toBe('main');
       expect(output.autoWorktree.worktree).toMatchObject({ branch: `dev/${runId}`, owner: `dev:${runId}`, command: 'dev' });
       expect(worktreePath!.startsWith(`${realpathSync(fixture.invoked)}/`)).toBe(false);
-      const resolvedDevWorktree = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd: output.autoWorktree.worktree.path, encoding: 'utf8' });
-      expect(resolvedDevWorktree.status).toBe(0);
-      expect(resolvedDevWorktree.stdout.trim()).toBe(worktreePath!);
+      expect(fixture.git(output.autoWorktree.worktree.path, ['rev-parse', '--show-toplevel'])).toBe(worktreePath!);
       expect(output.autoWorktree.worktree.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-      expect(spawnSync('git', ['config', '--worktree', '--get', 'elanous.harness.command'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim()).toBe('dev');
-      expect(spawnSync('git', ['config', '--worktree', '--get', 'elanous.harness.owner'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim()).toBe(`dev:${runId}`);
+      expect(fixture.git(worktreePath!, ['config', '--worktree', '--get', 'elanous.harness.command'])).toBe('dev');
+      expect(fixture.git(worktreePath!, ['config', '--worktree', '--get', 'elanous.harness.owner'])).toBe(`dev:${runId}`);
       expect(readFileSync(invalidIsolationRoot, 'utf8')).toBe('blocks directory creation\n');
       testFailed = false;
     } finally {
@@ -413,7 +398,7 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
         //   ⇒ 그러니 이 값을 다시 올리기 전에 «워크트리 수»를 먼저 재라 —
         //     창을 올리는 것은 증상 완화이고, 수가 늘면 또 넘는다.
         timeout: 60_000, killSignal: 'SIGKILL',
-        env: childEnv({ ELANOUS_RUN_ID: runId, NODE_ENV: 'test' }),
+        env: childEnv({ ...fixture.gitEnv, ELANOUS_RUN_ID: runId, NODE_ENV: 'test' }),
       });
       expect(result.error).toBeUndefined();
       assertNoProductionConfigMaterialization(`${result.stdout ?? ''}${result.stderr ?? ''}`);
@@ -425,9 +410,7 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
       expect(worktreePath).toBeDefined();
       const reportedPath = result.stdout.match(/^worktree\.path: (.+)$/m)?.[1];
       expect(reportedPath).toBeDefined();
-      const resolvedDriveWorktree = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd: reportedPath!, encoding: 'utf8' });
-      expect(resolvedDriveWorktree.status).toBe(0);
-      expect(resolvedDriveWorktree.stdout.trim()).toBe(worktreePath!);
+      expect(fixture.git(reportedPath!, ['rev-parse', '--show-toplevel'])).toBe(worktreePath!);
       expect(result.stdout).toContain(`worktree.branch: dev/${runId}`);
       expect(result.stdout).toContain(`worktree.command: drive`);
       expect(worktreePath!.startsWith(`${realpathSync(fixture.invoked)}/`)).toBe(false);
@@ -459,19 +442,19 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
     expect(r.out).not.toContain('무효한 옵션: context');
   }, 30_000);
 
-  it('--file 과 <text> 동시 → 상호배타 거부(exit≠0·조용한 무시 없음)', () => {
+  it('--file 과 <text> 동시 → 상호배타 거부(exit≠0·조용한 무시 없음)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'devcli-'));
     try {
       const f = join(dir, 'm.md');
       writeFileSync(f, '미션');
-      const r = run(['dev', '텍스트', '--file', f]);
+      const r = await runRegistered(['dev', '텍스트', '--file', f]);
       expect(r.code).not.toBe(0);
       expect(r.out).toContain('동시 사용 불가');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('--backend 잘못된 값 → commander choices 거부(exit≠0)', () => {
-    const r = run(['dev', '기능', '--backend', 'bogus']);
+  it('--backend 잘못된 값 → commander choices 거부(exit≠0)', async () => {
+    const r = await runRegistered(['dev', '기능', '--backend', 'bogus']);
     expect(r.code).not.toBe(0);
     expect(r.out.toLowerCase()).toContain('choices');
   });
@@ -505,9 +488,9 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
     expect(r.out).toContain('--max-steps 는 양의 정수여야');
   });
 
-  it('drive는 legacy 비지원 dev 옵션을 수락 후 무시하지 않는다', () => {
+  it('drive는 legacy 비지원 dev 옵션을 수락 후 무시하지 않는다', async () => {
     for (const option of [['--backend', 'codex'], ['--transport', 'acp']]) {
-      const r = run(['drive', 'exit 0', '--goal', 'finish', ...option]);
+      const r = await runRegistered(['drive', 'exit 0', '--goal', 'finish', ...option]);
       expect(r.code).not.toBe(0);
       expect(r.out).toContain('drive: 지원하지 않는 옵션');
     }
@@ -524,9 +507,9 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
     expect(r.code).toBe(0);
   }, 30_000);
 
-  it('drive 는 무인 완결을 끄는 --no-* 를 받지 않고 기존처럼 거부한다', () => {
+  it('drive 는 무인 완결을 끄는 --no-* 를 받지 않고 기존처럼 거부한다', async () => {
     for (const option of ['--no-open-pr', '--no-auto-review', '--no-auto-merge'] as const) {
-      const r = run(['drive', 'exit 0', '--goal', 'finish', option]);
+      const r = await runRegistered(['drive', 'exit 0', '--goal', 'finish', option]);
       expect(r.code).not.toBe(0);
       expect(r.out).toContain('drive: 지원하지 않는 옵션');
     }
@@ -538,8 +521,8 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
     expect(r.out).toContain('transport 는 external backend 전용');
   });
 
-  it('U6 — --transport 잘못된 값 → commander choices 거부', () => {
-    const r = run(['dev', '기능', '--backend', 'codex', '--transport', 'bad']);
+  it('U6 — --transport 잘못된 값 → commander choices 거부', async () => {
+    const r = await runRegistered(['dev', '기능', '--backend', 'codex', '--transport', 'bad']);
     expect(r.code).not.toBe(0);
     expect(r.out.toLowerCase()).toContain('choices');
   });

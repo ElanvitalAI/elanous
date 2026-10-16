@@ -100,8 +100,8 @@ describe('QC measurement adapter', () => {
   });
 
   test('uses distinct OCR artifacts for repeated and parallel video measurement plans', () => {
-    const first = buildQcMeasurementPlan(scene([0, 10]), '/tmp/first.mp4');
-    const second = buildQcMeasurementPlan(scene([0, 10]), '/tmp/second.mp4');
+    const first = buildQcMeasurementPlan(scene([0, 10]), '/tmp/first.mp4', 'darwin');
+    const second = buildQcMeasurementPlan(scene([0, 10]), '/tmp/second.mp4', 'darwin');
     const firstOcr = first.commands.filter((command) => command.step === 'text-compile' || command.step === 'text-frame' || command.step === 'text-regions');
     const secondOcr = second.commands.filter((command) => command.step === 'text-compile' || command.step === 'text-frame' || command.step === 'text-regions');
 
@@ -110,6 +110,8 @@ describe('QC measurement adapter', () => {
     expect(secondOcr.flatMap((command) => command.argv)).not.toContain(first.textTempDirectory);
     expect(first.commands.find((command) => command.step === 'text-frame')?.argv).toContain('/tmp/first.mp4');
     expect(second.commands.find((command) => command.step === 'text-frame')?.argv).toContain('/tmp/second.mp4');
+    expect(parseQcMeasurements(first, outputs({ 'text-regions': { stdout: 'regions=2' } })).detectedTextRegions).toBe(2);
+    expect(parseQcMeasurements(second, outputs({ 'text-regions': { stdout: 'regions=5' } })).detectedTextRegions).toBe(5);
   });
 
   test('plans exactly one interior RGB pair per sufficiently long beat in a five-beat scene', () => {

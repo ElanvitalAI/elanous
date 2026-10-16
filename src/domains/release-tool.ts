@@ -122,7 +122,24 @@ function cellView(item: ChecklistItem) {
     owner: item.owner ?? null, priority: item.priority ?? null, evidence: item.evidence ? firstLine(item.evidence) : null };
 }
 
-export function dispatchReleaseStatus(args: Record<string, unknown>, deps: ReleaseToolDeps = {}): { text: string; structured: Record<string, unknown> } {
+export function dispatchReleaseStatus(rawArgs: Record<string, unknown>, deps: ReleaseToolDeps = {}): { text: string; structured: Record<string, unknown> } {
+  // A blank topic/action ("" · spaces) means «not sent» — models fill unused enum slots with "" and then hit the
+  // simultaneous-topic-and-action rejection over and over (TUI defect #70 · 10-15: 10+ identical retries, then gave up).
+  const args = { ...rawArgs };
+  for (const key of Object.keys(args)) if (typeof args[key] === 'string' && !(args[key] as string).trim()) delete args[key];
+  // topic=status is the default read — beside an action it adds nothing, so the action wins (#70 · 10-15 실측:
+  // models send {topic:"status", action:"landed"} and looped on the simultaneous-topic-and-action rejection).
+  if (args.topic === 'status' && args.action !== undefined) delete args.topic;
+  // Any other non-features topic beside an action: the action wins too, with one warning line in front (#70b · 10-15
+  // 실측: {topic:"ops", action:"schedule"} rejected over and over). topic=features ⊕ action stays rejected below —
+  // a feature list and a short summary are different answers.
+  if (args.action !== undefined && typeof args.topic === 'string'
+    && ['cell', 'schedule', 'ops'].includes(args.topic)) {
+    const { topic: ignoredTopic, ...rest } = args;
+    debug.log('release.tool', 'topic-ignored-for-action', { topic: ignoredTopic, action: args.action });
+    const result = dispatchReleaseStatus(rest, deps);
+    return { text: `topic(${ignoredTopic}) 은 무시하고 action 으로 답함\n${result.text}`, structured: { ...result.structured, ignoredTopic } };
+  }
   const topic = args.topic === undefined ? 'status' : args.topic;
   if (typeof topic !== 'string' || !['status', 'features', 'cell', 'schedule', 'ops'].includes(topic)) throw new Error('topic 은 status, features, cell, schedule, ops 중 하나');
   if (args.topic !== undefined && args.action !== undefined) {

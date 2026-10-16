@@ -15,7 +15,7 @@ import { appendRunLedgerEntry, type RunLedgerEntry, type RunLedgerWriter, type R
 /** 닫힌 목록 — 못 고르면 `unclassified`. */
 export const RUN_STOP_CLASSES = [
   'env-unrelated', 'main-sync', 'pod-died', 'review-repeat',
-  'review-out-of-scope', 'evidence-uncovered', 'fabric', 'launch-failed', 'unclassified',
+  'review-out-of-scope', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed', 'unclassified',
 ] as const;
 export type RunStopClass = typeof RUN_STOP_CLASSES[number];
 
@@ -68,8 +68,9 @@ export function classifyMergeHoldStop(mergeReason: string | undefined): RunStopC
   return 'unclassified';
 }
 
-/** Pod exit 분류 사유 → 닫힌 목록. */
-export function classifyPodExitStop(reason: string | undefined): RunStopClass {
+/** Pod exit 분류 사유 → 닫힌 목록. `stage` 가 호스트 재게이트 실패(`host-regate-failed`)면 `gate-failed`, 인자가 없으면 지금과 똑같이. */
+export function classifyPodExitStop(reason: string | undefined, stage?: string): RunStopClass {
+  if (stage === 'host-regate-failed') return 'gate-failed';
   switch (reason) {
     case 'pod-failure': case 'pod-error': case 'OOMKilled': case 'ENOBUFS': case 'signal': return 'pod-died';
     case 'no-launch': return 'launch-failed';

@@ -7,7 +7,7 @@
 // 🎯 이 파일이 답하는 물음은 «다른 것»이다:
 //    ***"그 코드가 진입점의 실행 경로에 «있는가»"***
 //
-// 📏 왜 여기서만 답할 수 있나 — `src/dashboard/index.ts` 의 그 호출은 TUI 부팅 함수 «안»의
+// 📏 왜 여기서만 답할 수 있나 — TUI 진입(대시보드 index) 의 그 호출은 TUI 부팅 함수 «안»의
 //    ACP 콜백이라 in-process import 로는 실행할 수 없다. 그래서 행동 테스트는 helper 를
 //    «직접» 부를 수밖에 없고, ***그러면 index 의 한 줄을 지워도 통과한다***(무인 리뷰 R2 지적 · 정확했다).
 //    ⇒ 이 저장소의 정본 처방은 «실물 spawn» 또는 «source-level wire pin» 이다
@@ -25,12 +25,13 @@
 import { describe, test, expect } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { dashboardSourceText, readTuiSources, tuiSourceText } from './helpers/dashboard-source.js';
 
 const REPO = resolve(import.meta.dir, '..');
 const read = (rel: string): string => readFileSync(resolve(REPO, rel), 'utf8');
 
 describe('dashboard → session-runtime 진행 엔벨로프 배선 (wire pin)', () => {
-  const dashboard = read('src/dashboard/index.ts');
+  const dashboard = tuiSourceText();
   const dispatchModule = read('src/dashboard/session-runtime-dispatch.ts');
   const sessionRuntime = read('src/session-runtime/index.ts');
   const orchestrator = read('src/self-implement/orchestrator.ts');
@@ -57,9 +58,13 @@ describe('dashboard → session-runtime 진행 엔벨로프 배선 (wire pin)', 
 
   // ⛔ 우회 가드 — 진입점이 하위 러너를 «직접» 부르면 emitFeedback 이 붙지 않아
   //    ux.progress 가 조용히 no-op 이 된다. 그것이 이 PR 이 고친 결함 그 자체다.
+  //    TUI 소스 묶음 중 하위 러너를 부를 자격이 있는 자리는 dashboard 전용 디스패처 «하나»뿐이다.
   test('진입점이 하위 dispatchSessionRuntimeTool 을 «직접» 쓰지 않는다', () => {
-    expect(dashboard).not.toContain('await dispatchSessionRuntimeTool(');
-    expect(dashboard).not.toContain('dispatchSessionRuntimeTool(name, args');
+    const outsideDispatcher = dashboardSourceText(
+      readTuiSources().filter(({ path }) => path !== 'src/dashboard/session-runtime-dispatch.ts'),
+    );
+    expect(outsideDispatcher).not.toContain('await dispatchSessionRuntimeTool(');
+    expect(outsideDispatcher).not.toContain('dispatchSessionRuntimeTool(name, args');
   });
 
   test('dashboard 디스패처가 emitFeedback 을 «렌더러로» 채운다', () => {

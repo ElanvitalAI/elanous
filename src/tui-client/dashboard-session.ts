@@ -201,6 +201,7 @@ export class DashboardSession {
       dispatchTool: opts.dispatchTool,
       ...(opts.onTurnComplete ? { onTurnComplete: opts.onTurnComplete } : {}),
       ...(opts.resolveModel ? { resolveModel: opts.resolveModel } : {}),
+      ...(opts.resolveSeat ? { resolveSeat: opts.resolveSeat } : {}),
       ...(opts.resolveMaxToolTurns
         ? { resolveMaxToolTurns: opts.resolveMaxToolTurns }
         : {}),
@@ -465,6 +466,14 @@ export class DashboardSession {
       mcpServers: [],
     });
     this.sessionId = newSessionId;
+  }
+
+  /** TUI-H8 ② — `/session new` 이 백엔드(ACP) 세션까지 새로 받는다. 같은 연결에서 `session/new` 를 다시 불러
+   *  새 id 로 갈아탄다(종전엔 TUI 기록만 비우고 ACP sessionId 가 그대로였다 · #69). 새 id 를 돌려준다. */
+  async renew(cwd: string): Promise<string> {
+    const { sessionId } = await this.client.newSession({ cwd, mcpServers: [] });
+    this.sessionId = sessionId;
+    return sessionId;
   }
 
   /** Send a single user prompt and await the turn's stopReason.

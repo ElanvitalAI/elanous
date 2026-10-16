@@ -189,10 +189,19 @@ export function wrapLines(text: string, max: number, maxLines: number): string[]
 }
 
 /** 한 프레임의 알파 평균(0=투명 · 255=불투명). ⛔ 못 재면 null. */
-export function alphaMean(path: string, at = 0): number | null {
-  const r = run('ffmpeg', ['-hide_banner', '-nostats', '-ss', at.toFixed(2), '-i', path, '-frames:v', '1', '-vf', 'alphaextract,signalstats,metadata=print:key=lavfi.signalstats.YAVG', '-f', 'null', '-']);
+function measureAlphaWith(bin: string, path: string, at: number): number | null {
+  const r = run(bin, ['-hide_banner', '-nostats', '-ss', at.toFixed(2), '-i', path, '-frames:v', '1', '-vf', 'alphaextract,signalstats,metadata=print:key=lavfi.signalstats.YAVG', '-f', 'null', '-']);
   const m = /YAVG=([\d.]+)/.exec(r.err);
   return m ? Number(m[1]) : null;
+}
+
+export function alphaMean(path: string, at = 0): number | null {
+  return measureAlphaWith('ffmpeg', path, at);
+}
+
+/** 실물 렌더 도구를 바꿔 잴 때도 alphaMean과 같은 판정기를 쓴다. */
+export function alphaMeanFor(bin: string): (path: string, at?: number) => number | null {
+  return (path, at = 0) => measureAlphaWith(bin, path, at);
 }
 
 // ── ⑥ layers · build-layers ──────────────────────────────────────────────
@@ -207,13 +216,19 @@ export const buildLayers: Recipe = async (ctx) => {
   const dir = join(ctx.workdir, 'layers');
   mkdirSync(dir, { recursive: true });
   const W = s.width, H = s.height, F = s.fps;
+  const render = typeof ctx.state.ffmpeg === 'function'
+    ? ctx.state.ffmpeg as typeof ffmpeg
+    : ffmpeg;
   const grain = join(dir, 'grain_loop.mp4');
-  const g = ffmpeg(['-f', 'lavfi', '-i', `color=c=gray:s=${W}x${H}:r=${F}:d=4`, '-vf', 'noise=c0s=18:c0f=t+u,format=yuv420p', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24', grain], 300_000);
+  const g = render(['-f', 'lavfi', '-i', `color=c=gray:s=${W}x${H}:r=${F}:d=4`, '-vf', 'noise=c0s=18:c0f=t+u,format=yuv420p', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24', grain], 300_000);
   const scrim = join(dir, 'scrim.mov');
-  const sc = ffmpeg(['-f', 'lavfi', '-i', `color=c=black:s=${W}x${H}:r=${F}:d=2`, '-vf',
+  const sc = render(['-f', 'lavfi', '-i', `color=c=black:s=${W}x${H}:r=${F}:d=2`, '-vf',
     `format=argb,geq=r=0:g=0:b=0:a='if(gt(Y,H*0.55),150*(Y-H*0.55)/(H*0.45),0)'`, '-c:v', 'qtrle', scrim], 300_000);
   // 자막 — 장의 text 를 그 장의 시간에만 띄운다. ⛔ 폰트는 «있는 것»만 쓴다.
-  const font = ['/System/Library/Fonts/AppleSDGothicNeo.ttc', '/System/Library/Fonts/Supplemental/AppleGothic.ttf'].find(existsSync);
+  const requestedFont = ctx.state.font_file as string | undefined;
+  const font = requestedFont && existsSync(requestedFont)
+    ? requestedFont
+    : ['/System/Library/Fonts/AppleSDGothicNeo.ttc', '/System/Library/Fonts/Supplemental/AppleGothic.ttf'].find(existsSync);
   let t = 0;
   const draws: string[] = [];
   for (const ch of s.chapters) {
@@ -232,15 +247,18 @@ export const buildLayers: Recipe = async (ctx) => {
     text = join(dir, 'text.mov');
     // 🩸 2026-09-23 실물: `color=c=black@0.0` → `format=argb` 는 알파가 «255»였다(색 소스는 알파 없는 yuv 로 나와 @0.0 이 사라진다).
     //   그 불투명 검정판이 리졸브에서 «영상 전체»를 덮었다(QC: 0~47s 검정). ⇒ 스크림처럼 geq 로 알파를 «직접» 0 으로 쓴다.
-    const tx = ffmpeg(['-f', 'lavfi', '-i', `color=c=black:s=${W}x${H}:r=${F}:d=${s.target_dur.toFixed(3)}`, '-vf', `format=argb,geq=r=0:g=0:b=0:a=0,${draws.join(',')}`, '-c:v', 'qtrle', text], 600_000);
+    const tx = render(['-f', 'lavfi', '-i', `color=c=black:s=${W}x${H}:r=${F}:d=${s.target_dur.toFixed(3)}`, '-vf', `format=argb,geq=r=0:g=0:b=0:a=0,${draws.join(',')}`, '-c:v', 'qtrle', text], 600_000);
     if (!tx.ok) return { outcome: 'error', note: `자막 층 실패: ${tx.err.slice(-200)}` };
   }
   if (!g.ok || !sc.ok) return { outcome: 'error', note: `층 실패: ${(g.err || sc.err).slice(-200)}` };
   // ⛔⭐ 덮는 층(스크림·자막)은 «투명해야» 한다 — 만든 직후 알파를 «잰다». 불투명이면 영상 전체를 덮는다.
   //   🩸 이 자가 없어서 결함이 «리졸브 렌더 뒤 QC»에서야 잡혔다(되돌아갈 곳도 cut 으로 잘못 가리켰다).
+  const measureAlpha = typeof ctx.state.alpha_mean === 'function'
+    ? ctx.state.alpha_mean as (path: string, at: number) => number | null
+    : alphaMean;
   for (const [label, p] of [['스크림', scrim], ['자막', text]] as const) {
     if (!p) continue;
-    const a = alphaMean(p, 1.0);
+    const a = measureAlpha(p, 1.0);
     if (a === null) return { outcome: 'error', note: `${label} 층 알파를 못 쟀다` };
     if (a > 200) return { outcome: 'error', note: `${label} 층이 «불투명»하다(알파 평균 ${a.toFixed(0)}/255) — 영상 전체를 덮는다` };
   }

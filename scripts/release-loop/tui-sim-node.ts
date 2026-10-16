@@ -12,6 +12,7 @@
  * Exit: 0 = pass or flaky · 1 = fail · 2 = could not run (not macOS, worktree).
  */
 import { spawn, spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { copyFileSync, existsSync, mkdtempSync, openSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
@@ -101,7 +102,7 @@ async function main(): Promise<number> {
   let regress: TuiRegress = { unmeasured: 'worktree를 만들지 못했다' };
   let worktreeReady = false;
   try {
-    const add = spawnSync('git', ['worktree', 'add', '--detach', worktree, commit], { cwd: repo, encoding: 'utf8' });
+    const add = spawnSync('git', ['worktree', 'add', '--detach', worktree, commit], { cwd: repo, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
     if (add.status !== 0) throw new Error(`worktree add failed: ${(add.stderr ?? '').trim()}`);
     worktreeReady = true;
     symlinkSync(join(repo, 'node_modules'), join(worktree, 'node_modules'));
@@ -119,7 +120,7 @@ async function main(): Promise<number> {
     attempts = [];
   } finally {
     if (worktreeReady) regress = measureTuiRegress(worktree);
-    spawnSync('git', ['worktree', 'remove', '--force', worktree], { cwd: repo });
+    spawnSync('git', ['worktree', 'remove', '--force', worktree], { cwd: repo, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   }
 
   const out = tuiNodeOutput(commit, attempts, regress, failure);

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CoreTurnContext, GoalLoopResult } from '../src/core-turn/index.js';
 import { debug } from '../src/debug/log.js';
+import { withSimClock } from '../src/ux-sim/fake-clock.js';
 import type { PersistentGroundingDeps } from '../src/skills/tools/persistent-grounding.js';
 import {
   _resetToolRuntimeRegistryForTest,
@@ -41,8 +42,10 @@ describe('PersistentGrounding ToolRuntime', () => {
     const root = worktree();
     const sessionId = 'persistent-grounding-runtime-test';
     _resetToolRuntimeRegistryForTest();
+    const wasMirrorEnabled = debug.isMirrorEnabled();
     debug.enable();
-    const eventCount = debug.events().length;
+    const observations: Array<{ category: string; event: string; session_id?: string; data?: unknown }> = [];
+    const off = debug.registerSink({ name: 'persistent-grounding-test', emit: (record) => { observations.push(record); } });
     try {
       setPersistentGroundingRuntimeDeps({ grounding: { runGoalLoop: completingLoop(), hasAstGrep: () => false } });
       registerAllDefaultToolRuntimes();
@@ -59,7 +62,7 @@ describe('PersistentGrounding ToolRuntime', () => {
       });
       expect(result.output).toContain('src/candidate.ts');
 
-      const observation = debug.events().slice(eventCount).find((event) =>
+      const observation = observations.find((event) =>
         event.category === 'grounding.persistent'
         && event.event === 'finished'
         && event.session_id === sessionId,
@@ -69,6 +72,8 @@ describe('PersistentGrounding ToolRuntime', () => {
         toolCalls: { Grep: 1, Read: 1, update_goal: 1 },
       }));
     } finally {
+      off();
+      debug.setMirror(wasMirrorEnabled);
       setPersistentGroundingRuntimeDeps();
       _resetToolRuntimeRegistryForTest();
       rmSync(root, { recursive: true, force: true });
@@ -76,10 +81,14 @@ describe('PersistentGrounding ToolRuntime', () => {
   });
 
   test('generates one session ID for ambient observations and grounding when no session ID is supplied', async () => {
+    const fixedNow = Date.parse('2026-10-15T00:00:00.000Z');
+    const expectedSessionId = `persistent-grounding-${fixedNow}`;
     let receivedDeps: PersistentGroundingDeps | undefined;
     _resetToolRuntimeRegistryForTest();
+    const wasMirrorEnabled = debug.isMirrorEnabled();
     debug.enable();
-    const eventCount = debug.events().length;
+    const observations: Array<{ category: string; event: string; session_id?: string; data?: unknown }> = [];
+    const off = debug.registerSink({ name: 'persistent-grounding-session-test', emit: (record) => { observations.push(record); } });
     try {
       setPersistentGroundingRuntimeDeps({
         groundPersistently: async (_goal, _cwd, deps = {}) => {
@@ -89,15 +98,17 @@ describe('PersistentGrounding ToolRuntime', () => {
         },
       });
       registerAllDefaultToolRuntimes();
-      await dispatchToolByName('PersistentGrounding', { goal: 'find candidate' }, { surface: 'skill' });
+      await withSimClock(fixedNow, () => dispatchToolByName('PersistentGrounding', { goal: 'find candidate' }, { surface: 'skill' }));
 
-      expect(receivedDeps?.sessionId).toEqual(expect.any(String));
-      const observation = debug.events().slice(eventCount).find((event) =>
+      expect(receivedDeps?.sessionId).toBe(expectedSessionId);
+      const observation = observations.find((event) =>
         event.category === 'grounding.runtime' && event.event === 'received-session',
       );
       expect(observation?.session_id).toBe(receivedDeps?.sessionId);
       expect((observation?.data as { sessionId?: string } | undefined)?.sessionId).toBe(receivedDeps?.sessionId);
     } finally {
+      off();
+      debug.setMirror(wasMirrorEnabled);
       setPersistentGroundingRuntimeDeps();
       _resetToolRuntimeRegistryForTest();
     }

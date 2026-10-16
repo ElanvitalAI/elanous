@@ -8,6 +8,7 @@ export type NodeOutcome = 'ok' | 'fail' | 'error';
 export type NodeVerdict = 'pass' | 'flaky' | 'fail';
 export interface GraphContext {
   nodeId?: string;
+  runId?: string;
   input: { version: string; previousVersion: string; [key: string]: unknown };
   outputs: Record<string, Record<string, unknown>>;
 }
@@ -22,6 +23,7 @@ export function readGraphContext(env: NodeJS.ProcessEnv = process.env): GraphCon
   if (!input || typeof input.version !== 'string' || !isReleaseVersion(input.version)
     || typeof input.previousVersion !== 'string' || !/^\d+\.\d+\.\d+$/.test(input.previousVersion)) throw new Error('version and previousVersion required');
   return { ...(typeof context.nodeId === 'string' ? { nodeId: context.nodeId } : {}),
+    ...(typeof context.runId === 'string' ? { runId: context.runId } : {}),
     input: input as GraphContext['input'], outputs: context.outputs && typeof context.outputs === 'object' ? context.outputs as GraphContext['outputs'] : {} };
 }
 

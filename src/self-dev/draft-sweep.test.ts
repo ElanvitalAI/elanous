@@ -1,6 +1,6 @@
 import { describe, expect, it, spyOn } from 'bun:test';
 import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
-import { DRAFT_NEEDS_OWNER_SEAT_CAP, isSeatDraftNeedsOwnerOverCap, DRAFT_SWEEP_CLOSE_CAP, resolveDraftSweepCloseCap, collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type OverlapMetricAdapters, type OverlapPreflightRow, draftSweepDaily, newerLineageDraft, runDraftSweep, supersedeDraftsOnMerge, sweptReasonLabel, sweepFailureReason, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from './draft-sweep.js';
+import { DRAFT_NEEDS_OWNER_SEAT_CAP, isSeatDraftNeedsOwnerOverCap, shouldHoldSeatNewLaunch, DRAFT_SWEEP_CLOSE_CAP, resolveDraftSweepCloseCap, collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type OverlapMetricAdapters, type OverlapPreflightRow, draftSweepDaily, newerLineageDraft, runDraftSweep, supersedeDraftsOnMerge, sweptReasonLabel, sweepFailureReason, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from './draft-sweep.js';
 import { branchLineageKey } from '../harness/worktree-branch-prefix.js';
 import { RELEASE_PATH_LABEL } from './release-path-guard.js';
 import { debug } from '../debug/log.js';
@@ -255,6 +255,15 @@ describe('seat needsOwner cap', () => {
     expect(isSeatDraftNeedsOwnerOverCap('TC', counts, 16)).toBe(false);
     expect(isSeatDraftNeedsOwnerOverCap('constructor', counts)).toBe(false);
   });
+
+  it('holds a new launch only for the seat over the default cap (15 does not hold, 16 holds, missing/0 do not)', () => {
+    const counts = { OP: 15, TC: 16, MK: 0 };
+    expect(shouldHoldSeatNewLaunch('OP', counts)).toBe(false);
+    expect(shouldHoldSeatNewLaunch('TC', counts)).toBe(true);
+    expect(shouldHoldSeatNewLaunch('MK', counts)).toBe(false);
+    expect(shouldHoldSeatNewLaunch('UX', counts)).toBe(false);
+    expect(shouldHoldSeatNewLaunch('constructor', counts)).toBe(false);
+  });
 });
 
 describe('draft metrics', () => {
@@ -269,7 +278,7 @@ describe('draft metrics', () => {
       { number: 11, title: 'late', branch: 'self-impl/late', draft: true, labels: [], createdAt: '2026-09-27T23:00:00Z', mergedAt: '2026-09-30T00:00:00Z' },
     ];
     expect(await collectDraftMetrics('owner/repo', fixture.adapters, now)).toEqual({
-      inventory: 2, oldestAgeHours: 96, needsOwner: 1, claimUnobserved: 0,
+      inventory: 2, oldestAgeHours: 96, needsOwner: 1, needsOwnerBySeat: {}, claimUnobserved: 0,
       converted48h: 1, cohort48h: 3, conversion48h: 1 / 3,
     });
     expect(draftSweepDaily(rows, [], now, new Map())).toEqual({ date: '2026-09-30', over24h: 2, closable: 0, harvestable: 0, blocked: 0 });
@@ -291,7 +300,7 @@ describe('draft metrics', () => {
     fixture.adapters.listRecentClosed = async () => [];
     fixture.adapters.getActiveClaimOwner = async () => undefined;
     expect(await collectDraftMetrics('owner/repo', fixture.adapters, now)).toEqual({
-      inventory: 0, oldestAgeHours: null, needsOwner: 0, claimUnobserved: 0,
+      inventory: 0, oldestAgeHours: null, needsOwner: 0, needsOwnerBySeat: {}, claimUnobserved: 0,
       converted48h: 0, cohort48h: 0, conversion48h: null,
     });
     fixture.adapters.listRecentClosed = undefined;
@@ -304,6 +313,30 @@ describe('draft metrics', () => {
     fixture.adapters.listRecentClosed = async () => [{ number: 5, title: 'duplicate', branch: 'self-impl/duplicate', draft: true,
       labels: [], createdAt: '2026-09-28T00:00:00Z' }];
     expect(collectDraftMetrics('owner/repo', fixture.adapters, now)).rejects.toThrow('Overlapping draft metric inventory');
+  });
+
+  it('aggregates needsOwnerBySeat (own-key, finite counts) and holds only that seat over the default cap', async () => {
+    const tc = Array.from({ length: 16 }, (_, i) => draft(100 + i, { labels: ['elanous:seat-TC'], updatedAt: now.toISOString() }));
+    const op = Array.from({ length: 15 }, (_, i) => draft(200 + i, { labels: ['elanous:seat-OP'], updatedAt: now.toISOString() }));
+    const mk = [draft(300, { labels: ['elanous:seat-MK'], updatedAt: now.toISOString() })];
+    const unattributed = [draft(400, { labels: [], updatedAt: now.toISOString() })];
+    const claimed = [draft(500, { labels: [running, 'elanous:seat-UX'], updatedAt: now.toISOString() })];
+    const fixture = make([...tc, ...op, ...mk, ...unattributed, ...claimed]);
+    fixture.adapters.listRecentClosed = async () => [];
+    fixture.adapters.getActiveClaimOwner = async (_repo, number) => number === 500 ? 'UX' : undefined;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const metrics = await collectDraftMetrics('owner/repo', fixture.adapters, now);
+      expect(metrics.needsOwner).toBe(33);
+      expect(metrics.needsOwnerBySeat).toEqual({ TC: 16, OP: 15, MK: 1 });
+      expect(Object.hasOwn(metrics.needsOwnerBySeat ?? {}, 'UX')).toBe(false);
+      expect(shouldHoldSeatNewLaunch('TC', metrics.needsOwnerBySeat ?? {})).toBe(true);
+      expect(shouldHoldSeatNewLaunch('OP', metrics.needsOwnerBySeat ?? {})).toBe(false);
+      expect(shouldHoldSeatNewLaunch('MK', metrics.needsOwnerBySeat ?? {})).toBe(false);
+      expect(shouldHoldSeatNewLaunch('UX', metrics.needsOwnerBySeat ?? {})).toBe(false);
+      const hold = log.mock.calls.find((call) => call[0] === 'self-dev.draft-metrics' && call[1] === 'seat-launch-hold');
+      expect(hold?.[2]).toMatchObject({ heldSeats: ['TC'] });
+    } finally { log.mockRestore(); }
   });
 });
 

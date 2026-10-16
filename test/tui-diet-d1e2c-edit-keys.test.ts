@@ -53,7 +53,7 @@ describe('D1e-2c TUI edit-key wiring', () => {
   test('Ctrl+Up reaches the streaming recall key path', () => {
     expect(applyTurnTypeaheadKey(
       { buffer: 'draft ', queuedSubmissions: ['queued'] }, parsed('\x1b[1;5A'),
-    )).toMatchObject({ consumed: true, changed: true, state: { buffer: 'draft queued', queuedSubmissions: [] } });
+    )).toMatchObject({ consumed: true, changed: true, state: { buffer: 'queued\ndraft ', queuedSubmissions: [] } });
   });
 
   test('textInput routes Ctrl+Left to the word boundary before inserting', async () => {

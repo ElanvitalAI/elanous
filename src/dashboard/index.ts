@@ -8,6 +8,7 @@ import { join } from 'path';
 import { fileURLToPath } from 'node:url';
 import { createRunningBuildStatus } from './running-build-status.js';
 import { reportTuiTurn } from '../pty-shell/tui-run-state.js';
+import { logTurnThrew, runTurnTeardownStep } from './turn-busy-teardown.js';
 import { createStaleInstallCheck, formatStaleInstallNotice, readCurrentInstalledCommit, readDashboardBootCommit, STALE_INSTALL_CHECK_INTERVAL_MS, versionedDashboardInstallDir } from './stale-install-check.js';
 import { spawn, spawnSync } from 'node:child_process';
 import { $ } from 'bun';
@@ -557,21 +558,50 @@ export function resumeInProcessDashboardSession(
     setAttachedSessionId: (sessionId: string) => void;
     setActiveSessionId: (sessionId: string) => void;
   },
-): { resumed: true; sessionId: string; turns: number } | { resumed: false; reason: string } {
+):
+  | { resumed: true; sessionId: string; turns: number; repaired?: { removedCalls: number; removedResults: number } }
+  | { resumed: false; reason: string } {
   const resolvedId = deps.resolveSessionId(resumeSessionId);
   const loaded = resolvedId ? deps.historyFromSession(resolvedId) : null;
   if (!resolvedId || !loaded) return { resumed: false, reason: resumeSessionId };
 
+  // ④ 깨진 기록 방어(TUI-H8 · #69) — 도구 호출 도중 죽은 프로세스의 기록은 호출·결과 짝이 깨진 꼬리를 남겨
+  //   이어받은 첫 턴이 Codex 400 으로 죽는다. 고아 호출·결과만 잘라(`repairCodexToolPairs` · 짝이 맞는 것은 그대로)
+  //   이어받고, 같은 id 가 겹쳐 짝을 못 가리면 이어받지 않는다(새 세션 권고).
+  const pairs = repairCodexToolPairs(loaded.history as unknown as LLMMessage[]);
+  if (pairs.ambiguousIds.length > 0) {
+    try {
+      debug.log('session', 'resume-refused', {
+        surface: 'tui', sessionId: resolvedId, reason: 'ambiguous-tool-pairs', ambiguousIds: pairs.ambiguousIds.length,
+      });
+    } catch { /* observation is best-effort */ }
+    return { resumed: false, reason: `${resumeSessionId} — 도구 호출·결과 짝이 모호한 기록이다 · 새 세션으로 시작한다(권고)` };
+  }
+  const repairedCount = pairs.removedCalls + pairs.removedResults;
+  const history = repairedCount > 0 ? pairs.messages as unknown as ChatMessage[] : loaded.history;
+  if (repairedCount > 0) {
+    try {
+      debug.log('session', 'resume-history-repaired', {
+        surface: 'tui', sessionId: resolvedId, removedCalls: pairs.removedCalls, removedResults: pairs.removedResults,
+      });
+    } catch { /* observation is best-effort */ }
+  }
+
   const sysFromDash = deps.chatHistory.find((message) => message.role === 'system');
   deps.chatHistory.length = 0;
   if (sysFromDash) deps.chatHistory.push(sysFromDash);
-  for (const message of loaded.history) {
+  for (const message of history) {
     if (message.role === 'system' && sysFromDash && message.content === sysFromDash.content) continue;
     deps.chatHistory.push(message);
   }
   deps.setAttachedSessionId(resolvedId);
   try { deps.setActiveSessionId(resolvedId); } catch { /* best-effort */ }
-  return { resumed: true, sessionId: resolvedId, turns: loaded.history.length };
+  return {
+    resumed: true,
+    sessionId: resolvedId,
+    turns: history.length,
+    ...(repairedCount > 0 ? { repaired: { removedCalls: pairs.removedCalls, removedResults: pairs.removedResults } } : {}),
+  };
 }
 
 /**
@@ -791,6 +821,7 @@ import { bootBannerStatusLines, normalizeBootBannerMode, renderMinimalBootBand, 
 import { attachDashboardFilePathToken } from './file-path-attachment.js';
 import { bootDashboardSlashExecutor } from './slash-executor-boot.js';
 import { buildDashboardSlashRegistry, type DashboardSlashContext } from './slash-runtime/index.js';
+import type { LoopScheduler } from './loop-scheduler.js';
 import { unknownSlashReply } from './slash-runtime/unknown-slash-reply.js';
 import { resolveSurfaceUx } from '../agent/surface-ux/build.js';
 import type { SurfaceUx } from '../agent/surface-ux/types.js';
@@ -984,13 +1015,18 @@ import {
 } from '../render.js';
 import type { SyncMode } from '../types.js';
 import type { ChatMessage } from '../chat/index.js';
+import { repairCodexToolPairs } from './input/compact-prepass-recovery.js';
+import { observeSessionStart } from '../session/session-start.js';
 import type { PlainTurnSubmit } from '../input/turn-submit.js';
 // U-4.2 · `renderLogPane` no longer called from dashboard directly —
 // wd-log widget owns log rendering via renderLogViaWidget. Only
 // `findBlock` still used here (chat-input block navigation).
 import { findBlock, logPaneContentHeight, maxLogPaneScroll, visibleSearchRowOffset } from '../panes/log-pane.js';
 import { createQuitConfirmationState, gracefulQuit, type QuitConfirmationState } from './graceful-quit.js';
-import { handoffTurnTypeaheadAtTurnEnd, releaseTurnTypeaheadPending, steerLastTurnTypeaheadSubmission } from './input/turn-steer-bridge.js';
+import { consumeTurnEndInterrupted, handoffTurnTypeaheadAtTurnEnd, releaseTurnTypeaheadPending, runTurnTypeaheadPushNow, steerLastTurnTypeaheadSubmission } from './input/turn-steer-bridge.js';
+import { abortTurnOnly } from '../turn-abort-scope.js';
+import { consumeInternalTurnYield, createInternalTurnGate, formatInternalTurnBanner, resolveInternalTurnSubmitIntent, type InternalTurnRequest } from './input/internal-turn.js';
+import { createSeatAutowake } from './input/seat-autowake.js';
 import { createAttachmentRowMap } from '../log-pane/attachment-row-map.js';
 import { createAttachmentPopup, type AttachmentPopupAction } from '../log-pane/attachment-popup.js';
 import { findLogMatches, findVisibleLogMatches, type LogSearchResult } from '../log-pane/search.js';
@@ -1022,7 +1058,6 @@ import { enqueueSoftStop, readSoftStopRequestStatus } from '../harness/control-i
 import { setSelfImplementSoftStopSpaceObserver } from '../self-implement/self-implement-runtime.js';
 import { createViEditor, type ViEditorHandle } from '../vi-editor.js';
 import { launchEditor, canLaunchEditor } from '../editor-launcher.js';
-import { createSshPickerModal } from '../ssh/ssh-picker-modal.js';
 import {
   refreshRemoteWorkingDir,
   refreshRemoteWorkingDirPreview,
@@ -1032,12 +1067,10 @@ import {
   remoteBadge,
 } from '../ssh/remote-browser.js';
 import { editRemoteFile } from '../ssh/remote-edit.js';
-import { scanFinder, relativizeResults } from '../finder/finder-scan.js';
-import { scanRemoteFinder, relativizeRemoteResults } from '../finder/finder-scan-remote.js';
-import { createFinderModal, createFolderPickerModal, type FinderItem } from '../finder/finder-modal.js';
-import { homedir, hostname } from 'node:os';
-import { listTransferTargets, type TransferTarget } from '../transfer/transfer-targets.js';
-import { createTransferPickerModal } from '../transfer/transfer-picker-modal.js';
+import { createFolderPickerModal } from '../finder/finder-modal.js';
+import { hostname } from 'node:os';
+import { type TransferTarget } from '../transfer/transfer-targets.js';
+import { createInputPickers } from '../tui/input/pickers.js';
 import { sshTransfer, type SshTransferProgress } from '../transfer/ssh-transfer.js';
 import { iphoneTransfer } from '../transfer/iphone-transfer.js';
 import { DashboardAcpChat, displayBackendName, parseAcpSlash, type AcpBackendId } from './chat/acp-chat.js';
@@ -1081,7 +1114,6 @@ import {
 } from '../agent/channel-router.js';
 import { initTtySnapshotTools } from '../skills/tools/tty-snapshot.js';
 import { initAgentHandoffTool } from '../skills/tools/agent-handoff.js';
-import { touchSshHost } from '../ssh/ssh-hosts.js';
 import { DisplayCoordinator } from '../display/coordinator.js';
 import {
   createLivePlaygroundHarness,
@@ -1162,7 +1194,6 @@ import {
   encodeBrowserScopedSubmitText,
   resolveBrowserActionContextFromHit,
 } from '../browser-pane/actions.js';
-import { resolveBrowserTransferCapability } from '../browser-pane/capabilities.js';
 import {
   cyclePreviewSourceForView,
   formatPreviewSourceLabel,
@@ -1276,7 +1307,7 @@ import {
   type SpaceLongPressDetector,
 } from './input/space-longpress-detector.js';
 import { isAllowlistedDictationSurface } from './input/dictation-surface-allowlist.js';
-import { createDashboardExternalInputHost } from './input/external-input-host.js';
+import { createDashboardExternalInputHost, stopTurnViaEscGate } from './input/external-input-host.js';
 import { registerExternalInputHost } from '../input/external-input-queue.js';
 // H3 #6 follow-up #3 — background sessions render as a distinct sidebar
 // kind with live state badge + tap-to-Join. Dashboard pulls BG records
@@ -2793,6 +2824,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // execute slashes, etc.
   const chatModeState = createSessionPostureState();
 
+  // TUI-LOOP-COMMAND — 실행 중 스케줄러를 쥐는 ref. showDashboard 인스턴스당
+  // 하나로, 입력 루프 «밖»에서 한 번만 선언한다. slashCtx 는 명령마다 다시
+  // 만들어지므로 리터럴 옆에 선언하면 /loop start 로 만든 스케줄러 ref 가
+  // 다음 명령에서 사라진다 — /loop stop · /session new|clear 세션 끝 정지가
+  // 같은 ref 를 써야 «stop 0»(판정)가 성립한다.
+  const dashboardLoopSchedulerRef: { current: LoopScheduler | null } = { current: null };
+
   // T3-C2 — vi-editor mounted in the preview pane. Set by the
   // browser pane's `e` key on a file; cleared on :q / :q!. When
   // non-null it overrides the preview pane's normal render path.
@@ -2865,6 +2903,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // current value so log analysis can filter "what keys fired while
   // a turn was in flight".
   let streamingInFlight = false;
+  /** 지금 턴의 escGate 중단 — 외부 `/stop`(TUI-STOP-INPUT-BYPASS)이 대기열을 건너뛰어 부른다. 턴 밖이면 null. */
+  let currentTurnExternalStop: (() => void) | null = null;
   const resolveTmuxStatusLabel = (): string | null => {
     if (!process.env['TMUX']) return null;
     const fallback = process.env['TMUX_PANE'] ?? 'tmux';
@@ -3333,6 +3373,26 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // 즉시 에코 · 턴 종료 시 loop-head 핸드오프가 prefill/자동제출로 넘긴다.
   // (외곽 스코프 선언 — 스트리밍 디스패처와 메인 키 루프 양쪽에서 참조.)
   const turnTypeaheadRef = { state: createTurnTypeaheadState() };
+  // «지금 밀어 넣기»로 끊은 턴 — 턴 종료가 큐를 composer 로 «복원»하지 않고 곧바로 «제출»하게 한다.
+  const steerInterruptRef = { pending: false };
+  // ⭐ H2 내부 턴 문(TUI-H2-INTERNAL-TURN) — 자율 재개(H3·H4·H5)가 지나갈 «문 하나». 판정은 모듈,
+  //   여기선 상태를 읽어 넘기기만 한다(⚠️ promptCtl·가시성 함수는 아래에서 선언 — 호출 시점엔 있다).
+  const internalTurnGate = createInternalTurnGate({
+    isTurnRunning: () => streamingInFlight,
+    isInputForeground: () =>
+      chatMainInputVisibilityState().inputOwnership?.owner === 'chat-main' && !topBlockingForegroundModal(),
+    getBufferText: () => promptCtl.getBufferText?.(),
+    getTypeaheadCount: () =>
+      turnTypeaheadRef.state.queuedSubmissions.length + (turnTypeaheadRef.state.buffer ? 1 : 0),
+  });
+  // ⭐ H3 턴 끝 자동 재개(OPT-QUEUE-AUTOWAKE) — 자리 TUI ∧ autowake 파일일 때만. 턴 끝에 «남은 일»(안 읽은
+  //   우편 · queue.md «## 대기»)을 재고 H2 문으로 다음 턴을 청한다. 판정·상한은 모듈, 여기선 배선만.
+  const seatAutowake = createSeatAutowake({
+    startTurnIfIdle: (text, opts) => internalTurnGate.startTurnIfIdle(text, opts),
+    getCwd: () => workingDir.cwd,
+    notify: (line) => { chatLines.push(C.muted(line)); draw(); },
+  });
+  const internalTurnYieldPort = seatAutowake.wrapPort(internalTurnGate.port);
   // ⭐ `B3` — 큐를 «도는 턴»에 넣으려면 그 턴이 도는 ***ACP 세션 id*** 가 필요하다.
   //   ⛔ `attachedSessionId`(대화 세션)와 «다른 축»이다 — 루프는 ACP 세션으로 스코프를 연다.
   //   ⚠️ 세션은 이 함수 «뒤»에서 만들어지므로 참조로 둔다(호출 시점엔 채워져 있다).
@@ -6458,8 +6518,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const attachChatStreamingKeys = (abortCtrl: AbortController): () => void => {
     const chatLinesStartIndex = chatLines.length;
     userScrolledDuringStream = false;
-    streamingInFlight = true;
-    reportTuiTurn('busy');
     const SCROLL_KEYS = new Set(['j', 'k', 'down', 'up', 'pageup', 'pagedown', 'home', 'end', 'g', 'G']);
     // T3-B2: ESC abort gate. When the user hits Esc AND sub-agent
     // work is running, pop a confirmation modal before tearing down
@@ -6759,7 +6817,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               //   ⛔ 중복 전송 방지가 계약이다: 레지스트리가 배수되면 `onDrained` 가
               //     ***여기 큐도 같이 비운다*** — 안 그러면 같은 발화가 턴 끝에 «또» 나간다.
               //   ⚠️ `immediate`(슬래시 등)는 지금 실행되므로 «넣지 않는다».
-              if (r.submissionDisposition === 'fifo' && !r.immediateSubmission) {
+              // ⛔ H2 — 내부 턴 중의 사람 입력은 그 턴에 끼워 넣지 않는다(턴 끝 FIFO 로 기다린다).
+              if (r.submissionDisposition === 'fifo' && !r.immediateSubmission && !internalTurnGate.isInternalTurnActive()) {
                 const queuedText = turnTypeaheadRef.state.queuedSubmissions.at(-1);
                 const sid = activeSessionIdForTypeahead();
                 if (queuedText && sid) {
@@ -6790,6 +6849,22 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               }
             }
             if (r.releasedPendingIds) releaseTurnTypeaheadPending(r.releasedPendingIds, 'recalled');
+            if (r.pushNowRequested) {
+              const decision = runTurnTypeaheadPushNow(turnTypeaheadRef, {
+                runningToolNames: () => getEscAbortWaitingToolNames(escAbortToolState),
+                interruptTurn: () => {
+                  steerInterruptRef.pending = true;
+                  try { globalAgentRegistry.markBackgroundAllRunning(); } catch { /* 승격 실패가 끊기를 막지 않는다 */ }
+                  abortTurnOnly(abortCtrl);
+                },
+                pushNotice: (line) => pushChatLine(C.muted(line)),
+              });
+              debug.log('dashboard.turn-typeahead', 'push-now', {
+                kind: decision.kind,
+                tools: decision.kind === 'interrupt' ? decision.runningTools : decision.kind === 'nothing' ? [] : decision.blockingTools,
+              });
+              draw();
+            }
             if (r.immediateSubmission) {
               turnTypeaheadRef.state = await dispatchStreamingTurnTypeaheadSubmission(
                 turnTypeaheadRef.state,
@@ -7015,19 +7090,29 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       // `runStreamingKeyUnifiedDispatch` above for the route body.
       await runStreamingKeyUnifiedDispatch(key);
     });
+    // ⛔ TUI-STALE-BUSY-MARKER — busy 는 «끄는 closure 를 돌려주기 직전»에 켠다. 위 준비(ESC 게이트·키 리스너)가
+    //    던지면 호출자는 cleanup 을 못 받으므로, 먼저 켜 두면 아무도 못 끄는 busy 가 남는다(#37).
+    streamingInFlight = true;
+    reportTuiTurn('busy');
+    const externalStop = (): void => { stopTurnViaEscGate(escGate); };
+    currentTurnExternalStop = externalStop;
     return () => {
-      cleanup();
-      escGate.dispose();
+      if (currentTurnExternalStop === externalStop) currentTurnExternalStop = null;
+      // 단계마다 격리 — 앞 단계가 던져도 settle·idle 전이에 닿는다(키 층 유휴 ∧ 턴 층 busy 이원 판정 #55 차단).
+      runTurnTeardownStep('stream-keys-detach', cleanup);
+      runTurnTeardownStep('esc-gate-dispose', () => { escGate.dispose(); });
       try {
         if (!stoppedHarnessSpace) settleEscAbortPendingLines(chatLines, chatLinesStartIndex);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         const stackHead = err instanceof Error ? err.stack?.split('\n')[1]?.trim() : undefined;
         debug.log('dashboard.turn', 'settle-failed', { message, stackHead });
+        logTurnThrew('settle-esc-lines', err);
       } finally {
         userScrolledDuringStream = false;
         streamingInFlight = false;
         reportTuiTurn('idle');
+        seatAutowake.noteTurnEnded();
       }
     };
   };
@@ -11561,136 +11646,57 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   let agentSearchModal: SearchModalHandle | null = null;
   let agentSearchHandle: { dispose: () => void } | null = null;
 
-  /** Open the agent-roster search modal. Reads the current roster
-   *  from agentSurfaceStore + globalAgentRegistry. Items: each
-   *  entry's name + last 8 chars of id. Enter sets cursor; Esc
-   *  dismisses. */
-  function openAgentRosterSearch(): void {
-    if (agentSearchModal) return;
-    const roster = agentSurfaceStore.syncTasks(globalAgentRegistry.list());
-    const cols = termSize().cols;
-    const modalWidth = Math.min(60, cols - 4);
-    const modalRow = 3;       // top-anchored over the roster pane
-    const modalCol = Math.max(2, Math.floor((cols - modalWidth) / 2));
-    const filterable = roster.length > 3;
-    const handle = createSearchModal({
-      id: `agent-roster-search:${Date.now().toString(36)}`,
-      bounds: { row: modalRow, col: modalCol, width: modalWidth, height: 12 },
-      title: 'Search agents',
-      width: modalWidth,
-      maxVisible: 8,
-      primaryActionLabel: 'jump',
-      cancelActionLabel: 'cancel',
-      filterable,
-      actionButtons: true,
-      chromeSpec: {
-        titleAlign: 'center',
-      },
-      onQuery: (q) => {
-        const roster = agentSurfaceStore.syncTasks(globalAgentRegistry.list());
-        const needle = q.trim().toLowerCase();
-        const match = (t: typeof roster[number]) => {
-          if (!needle) return true;
-          return t.name.toLowerCase().includes(needle)
-              || t.definitionName.toLowerCase().includes(needle)
-              || (t.summary ?? '').toLowerCase().includes(needle)
-              || t.id.toLowerCase().includes(needle);
-        };
-        return roster.filter(match).map((t): SearchItem => ({
-          label: `${t.name}  ${t.definitionName}  ${t.id.slice(0, 8)}`,
-          payload: t.id,
-        }));
-      },
-      onAccept: (item) => {
-        const roster = agentSurfaceStore.syncTasks(globalAgentRegistry.list());
-        const idx = roster.findIndex(t => t.id === item.payload);
-        if (idx >= 0) {
-          agentRosterCursor = idx;
-          agentCursorLockedId = roster[idx]!.id;
-          agentCursorManual = true;
-        }
-        closeAgentRosterSearch();
-      },
-      onCancel: () => closeAgentRosterSearch(),
-      theme: currentThemeTokens(),
-    });
-    attachSurfaceToWorkspace(handle.surface, currentWorkspaceOwnerId());
-    agentSearchModal = handle;
-    agentSearchHandle = display.pushModal(handle.surface);
-  }
+  // TUI-DIET-SEAM-PICKERS — the five input pickers (agent-roster search,
+  // transfer, Ctrl+T file finder, Alt+C directory finder, Ctrl+K SSH)
+  // live in src/tui/input/pickers.ts. Mutable dashboard state crosses
+  // the seam as live get/set accessors (never a value copy); `draw` is
+  // re-read at call time because it is reassigned after mount.
+  const {
+    openAgentRosterSearch,
+    openTransferPicker,
+    openFinderPicker,
+    openDirectoryPicker,
+    openSshPicker,
+  } = createInputPickers({
+    state: {
+      get agentSearchModal() { return agentSearchModal; },
+      set agentSearchModal(v: SearchModalHandle | null) { agentSearchModal = v; },
+      get agentSearchHandle() { return agentSearchHandle; },
+      set agentSearchHandle(v: { dispose: () => void } | null) { agentSearchHandle = v; },
+      get agentRosterCursor() { return agentRosterCursor; },
+      set agentRosterCursor(v: number) { agentRosterCursor = v; },
+      get agentCursorLockedId() { return agentCursorLockedId; },
+      set agentCursorLockedId(v: string) { agentCursorLockedId = v; },
+      get agentCursorManual() { return agentCursorManual; },
+      set agentCursorManual(v: boolean) { agentCursorManual = v; },
+      get chatScrollOffset() { return chatScrollOffset; },
+      set chatScrollOffset(v: number) { chatScrollOffset = v; },
+      get chatLines() { return chatLines; },
+    },
+    display,
+    agentSurfaceStore,
+    workingDir,
+    dockedPreview,
+    transferFeedbackRuntime,
+    finderFeedbackRuntime,
+    currentThemeTokens,
+    currentWorkspaceOwnerId,
+    activeBrowserWidgetId,
+    resolveBrowserStateById,
+    fmtBytes,
+    runTransfer,
+    closeAgentRosterSearch,
+    pushDebugLine,
+    refreshRemotePreviewBridge,
+    refreshWorkingDirPreview,
+    setWorkingFocus,
+    startRemoteModeBridge,
+    draw: () => draw(),
+  });
 
   function closeAgentRosterSearch(): void {
     if (agentSearchHandle) { agentSearchHandle.dispose(); agentSearchHandle = null; }
     agentSearchModal = null;
-    draw();
-  }
-
-  /** T5-J5 — open the transfer picker. Files arg = local paths to
-   *  ship; destination comes from the picker. Handles both ssh and
-   *  iphone target kinds. Remote-mode browser isn't supported here
-   *  yet — the user is transferring LOCAL files (focused entry +
-   *  selected set) to a remote destination. Transferring REMOTE→X
-   *  is a separate flow (not this phase). */
-  function openTransferPicker(
-    files: Array<{ localPath: string; size?: number }>,
-    browserId: string = activeBrowserWidgetId(),
-  ): void {
-    const targetBrowser = resolveBrowserStateById(browserId) ?? (workingDir as BrowserPaneModel);
-    if (files.length === 0) {
-      transferFeedbackRuntime.onNoFilesToTransfer();
-      return;
-    }
-    const capability = resolveBrowserTransferCapability(
-      targetBrowser,
-      listTransferTargets(),
-    );
-    if (!capability.enabled) {
-      transferFeedbackRuntime.onTransferDisabled(capability.reason);
-      return;
-    }
-    const targets = capability.targets;
-    if (targets.length === 0) {
-      transferFeedbackRuntime.onNoTransferTargets();
-      return;
-    }
-    const totalBytes = files.reduce((a, f) => a + (f.size ?? 0), 0);
-    const summary = `${files.length} file${files.length === 1 ? '' : 's'}${
-      totalBytes > 0 ? ` (${fmtBytes(totalBytes)})` : ''
-    }`;
-
-    const { cols, rows } = termSize();
-    const width = Math.min(74, Math.max(46, cols - 6));
-    const visibleRows = Math.min(10, targets.length);
-    const height = visibleRows + 3;
-    const bounds = {
-      row: Math.max(1, Math.floor((rows - height) / 2)),
-      col: Math.max(1, Math.floor((cols - width) / 2)),
-      width,
-      height,
-    };
-    let handle: ReturnType<typeof display.pushModal> | null = null;
-    const picker = createTransferPickerModal({
-      targets,
-      bounds,
-      width,
-      maxVisible: visibleRows,
-      summary,
-      theme: currentThemeTokens(),
-      onAccept: (target) => {
-        agentSearchModal = null;
-        handle?.dispose();
-        void runTransfer(target, files);
-        draw();
-      },
-      onCancel: () => {
-        agentSearchModal = null;
-        handle?.dispose();
-        draw();
-      },
-    });
-    attachSurfaceToWorkspace(picker.surface, currentWorkspaceOwnerId());
-    handle = display.pushModal(picker.surface);
-    agentSearchModal = picker;
     draw();
   }
 
@@ -11718,465 +11724,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     } catch (err) {
       transferFeedbackRuntime.onTransferCrashed(err);
     }
-  }
-
-  /** T4-F2 / T4-F3 — open the Ctrl+T finder modal. Scans the
-   *  current working dir (local only at MVP; remote scan is a
-   *  follow-up). On accept, cd's the browser pane to the file's
-   *  parent dir, focuses the file in the listing, and switches
-   *  pane focus to browser so the user can e/enter next. */
-  async function openFinderPicker(): Promise<void> {
-    const targetBrowserId = activeBrowserWidgetId();
-    const targetBrowser = resolveBrowserStateById(targetBrowserId) ?? (workingDir as BrowserPaneModel);
-    // T5-I2 — branch on remote vs local. Both paths produce the
-    // same {absPath, relPath} finder items so the modal + onAccept
-    // handler stay unified.
-    let finderItems: FinderItem[] = [];
-    let backend = 'fd';
-    let truncated = false;
-    let scanDurationMs = 0;
-
-    if (workingDir.remote) {
-      const host = workingDir.remote.host;
-      const remoteRoot = workingDir.remote.cwd;
-      finderFeedbackRuntime.onFinderScanStarted(`${host.name}:${remoteRoot}`);
-      draw();
-      const scan = await scanRemoteFinder({ host, root: remoteRoot });
-      const rels = relativizeRemoteResults(scan.paths, remoteRoot);
-      finderItems = scan.paths.map((absPath, i) => ({
-        absPath, relPath: rels[i] ?? absPath,
-      }));
-      backend = `${scan.backend}@${scan.host}`;
-      truncated = scan.truncated;
-      scanDurationMs = scan.durationMs;
-    } else {
-      // 2026-05-03 — scan from the Session Working Directory (the
-      // "project root"), NOT the browser pane's current navigation
-      // cursor. SWD is mutable only via Ctrl+W / /wd / SetWorkingDir
-      // tool — exactly the user's intent for "project root". Browser
-      // pane's cwd is purely UI navigation and should not narrow
-      // Ctrl+T's search scope (matches working-dir.ts:5-8 contract).
-      const scanRoot = getSessionCwd();
-      finderFeedbackRuntime.onFinderScanStarted(scanRoot);
-      draw();
-      const scan = await scanFinder({ root: scanRoot });
-      const rels = relativizeResults(scan.paths, scanRoot);
-      finderItems = scan.paths.map((absPath, i) => ({
-        absPath, relPath: rels[i] ?? absPath,
-      }));
-      backend = scan.backend;
-      truncated = scan.truncated;
-      scanDurationMs = scan.durationMs;
-    }
-    if (finderItems.length === 0) {
-      finderFeedbackRuntime.onFinderScanEmpty();
-      draw();
-      return;
-    }
-    finderFeedbackRuntime.onFinderScanCompleted({
-      count: finderItems.length,
-      backend,
-      truncated,
-      durationMs: scanDurationMs,
-    });
-
-    const { cols, rows } = termSize();
-    const width = Math.min(90, Math.max(50, cols - 6));
-    const visibleRows = Math.min(15, Math.max(6, rows - 8));
-    const height = visibleRows + 3;
-    const bounds = {
-      row: Math.max(1, Math.floor((rows - height) / 2)),
-      col: Math.max(1, Math.floor((cols - width) / 2)),
-      width,
-      height,
-    };
-    let handle: ReturnType<typeof display.pushModal> | null = null;
-    // Title reflects the actual scan root — SWD for local (project
-     // root), remote cwd for remote mode. Browser pane's nav cursor
-     // is intentionally NOT shown because the scan ignores it.
-    const titleRoot = workingDir.remote
-      ? `${workingDir.remote.host.name}:${workingDir.remote.cwd}`
-      : getSessionCwd().replace(homedir(), '~');
-    // 2026-05-03 — preview modes (yazi/fzf-style, on-demand).
-    //
-    // Default mode is OFF — the picker opens cleanly with NO preview
-    // so it's never annoying on tablet / narrow terminals. The user
-    // toggles preview behaviour with `Ctrl+/` (matches zshrc
-    // `--bind 'ctrl-/:toggle-preview'`):
-    //
-    //   off    →  hover  →  2pane  →  off  (cycle)
-    //
-    //   • off   — no preview, ever. The cursor moves freely.
-    //   • hover — popup appears after the cursor stays still for
-    //             1 second (HOVER_DELAY_MS). Popup auto-dismisses
-    //             after 4s. Centered, the same width as legacy
-    //             behaviour but on-demand.
-    //   • 2pane — browser-preview style: persistent preview popup
-    //             docked to the right of the picker. Updates
-    //             instantly as the cursor moves. Falls back to
-    //             hover if the terminal is too narrow (<140 cols).
-    //
-    // showPreviewModal supports remote-skip by itself (preview
-    // handlers read local fs), so we simply guard with workingDir
-    // .remote before scheduling.
-    type PreviewMode = 'off' | 'hover' | '2pane';
-    const HOVER_DELAY_MS = 1000;
-    const TWO_PANE_MIN_COLS = 140;
-    const TWO_PANE_GROUP = 'finder-2pane-preview';
-
-    let previewMode: PreviewMode = 'off';
-    let lastSelected: FinderItem | null = null;
-    let hoverTimer: ReturnType<typeof setTimeout> | null = null;
-    let lastPreviewHandle: { dispose(): void } | null = null;
-
-    const clearHoverTimer = () => {
-      if (hoverTimer !== null) { clearTimeout(hoverTimer); hoverTimer = null; }
-    };
-    const disposeActivePreview = () => {
-      if (lastPreviewHandle) {
-        try { lastPreviewHandle.dispose(); } catch { /* ignore */ }
-        lastPreviewHandle = null;
-      }
-    };
-
-    /** Compute the docked-preview bounds for 2-pane mode. Picker
-     *  centred at width≈90; preview takes the right gutter. Returns
-     *  null when there isn't enough room (caller falls back to
-     *  hover). */
-    const computeDockedPreviewBounds = (): {
-      row: number; col: number; width: number; height: number;
-    } | null => {
-      const { cols: tc, rows: tr } = termSize();
-      if (tc < TWO_PANE_MIN_COLS) return null;
-      const pickerWidth = Math.min(90, Math.max(50, tc - 6));
-      const pickerCol = Math.max(1, Math.floor((tc - pickerWidth) / 2));
-      const previewCol = pickerCol + pickerWidth + 2;
-      const previewWidth = Math.max(40, tc - previewCol - 2);
-      if (previewWidth < 40) return null;
-      const previewHeight = Math.max(8, Math.min(tr - 6, 28));
-      const previewRow = Math.max(1, Math.floor((tr - previewHeight) / 2));
-      return { row: previewRow, col: previewCol, width: previewWidth, height: previewHeight };
-    };
-
-    const paintPreviewFor = (item: FinderItem) => {
-      if (workingDir.remote) return;   // remote previews unsupported
-      const { rows: tr, cols: tc } = termSize();
-      const docked = previewMode === '2pane' ? computeDockedPreviewBounds() : null;
-      void showPreviewModal(item.absPath, {
-        coordinator: display,
-        termCols: tc,
-        termRows: tr,
-        title: item.relPath,
-        ttlMs: previewMode === '2pane' ? 0 : 4000,
-        bounds: docked ?? undefined,
-        group: previewMode === '2pane' ? TWO_PANE_GROUP : 'image-preview',
-      }).then((r) => {
-        lastPreviewHandle = r?.handle ?? null;
-      }).catch(() => { /* preview failure is non-fatal */ });
-    };
-
-    const scheduleHoverPreview = (item: FinderItem | null) => {
-      lastSelected = item;
-      clearHoverTimer();
-      if (previewMode === 'off') return;
-      if (!item || workingDir.remote) {
-        // Off-screen / remote — kill any straggling popup so the
-        // user doesn't see a preview that no longer matches the
-        // selection.
-        disposeActivePreview();
-        return;
-      }
-      if (previewMode === '2pane') {
-        // Instant update — no debounce. Persistent popup replaces
-        // itself via group dedup.
-        paintPreviewFor(item);
-        return;
-      }
-      // HOVER mode. Selection just changed → the popup currently on
-      // screen (if any) is stale. Drop it immediately so the user
-      // doesn't keep seeing the previous file's preview while their
-      // cursor is on a new file. The next paint waits HOVER_DELAY_MS
-      // of stillness before re-appearing.
-      disposeActivePreview();
-      hoverTimer = setTimeout(() => {
-        hoverTimer = null;
-        paintPreviewFor(item);
-      }, HOVER_DELAY_MS);
-    };
-
-    /** Cycle off → hover → 2pane → off. Surfaces a status line so
-     *  the user knows which mode they're in (Ctrl+/ has no chrome
-     *  feedback otherwise). 2pane on a narrow terminal degrades
-     *  to hover with a warning. */
-    const cyclePreviewMode = (): void => {
-      const next: PreviewMode = previewMode === 'off' ? 'hover'
-                              : previewMode === 'hover' ? '2pane'
-                              : 'off';
-      previewMode = next;
-      clearHoverTimer();
-      // Drop the active popup whenever the mode changes. The new
-      // mode (if any) re-paints below.
-      disposeActivePreview();
-
-      if (next === 'off') {
-        chatLines.push(C.muted('  finder preview: OFF (Ctrl+/ to cycle modes)'));
-      } else if (next === 'hover') {
-        chatLines.push(C.muted('  finder preview: HOVER (popup after 1 s · Ctrl+/ next)'));
-      } else {
-        // 2pane — refuse if the terminal is too narrow; degrade to
-        // hover so the user gets *some* preview without overlap.
-        const docked = computeDockedPreviewBounds();
-        if (!docked) {
-          previewMode = 'hover';
-          chatLines.push(C.warning(`  finder preview: 2-pane needs ≥${TWO_PANE_MIN_COLS} cols — falling back to HOVER`));
-        } else {
-          chatLines.push(C.muted('  finder preview: 2-PANE (docked right · Ctrl+/ to disable)'));
-          if (lastSelected) paintPreviewFor(lastSelected);
-        }
-      }
-      chatScrollOffset = -1;
-      draw();
-    };
-
-    // Declared up here so `onAccept`/`onCancel` closures below can
-    // reference both; assigned right after the picker mounts.
-    let previewToggleDisposable: { dispose(): void } | null = null;
-    let previewDismissDisposable: { dispose(): void } | null = null;
-    const picker = createFinderModal({
-      items: finderItems,
-      bounds, width, maxVisible: visibleRows,
-      truncated,
-      title: `Find file in ${titleRoot}`,
-      theme: currentThemeTokens(),
-      onHover: scheduleHoverPreview,
-      onAccept: (item) => {
-        clearHoverTimer();
-        disposeActivePreview();
-        previewToggleDisposable?.dispose();
-        previewDismissDisposable?.dispose();
-        agentSearchModal = null;
-        handle?.dispose();
-        const parentDir = item.absPath.slice(0, item.absPath.lastIndexOf('/')) || '/';
-        const basename = item.absPath.slice(item.absPath.lastIndexOf('/') + 1);
-        if (workingDir.remote) {
-          // T5-I2 — remote cd + focus-by-basename.
-          enterRemoteDirectory(workingDir, parentDir);
-          (async () => {
-            await refreshRemoteWorkingDir(workingDir, {}, dockedPreview);
-            const idx = workingDir.entries.findIndex(e => e.name === basename);
-            if (idx >= 0) {
-              workingDir.cursor = idx;
-              workingDir.offset = Math.max(0, idx - 3);
-            }
-            await refreshRemotePreviewBridge();
-            pushDebugLine(C.muted(`  ${workingDir.remote?.host.name}:${item.relPath}`));
-            chatScrollOffset = -1;
-            draw();
-          })().catch(() => {});
-        } else {
-          enterDirectory(targetBrowser as WorkingDirState, parentDir);
-          refreshWorkingDir(targetBrowser as WorkingDirState);
-          const idx = targetBrowser.entries.findIndex(e => e.name === basename);
-          if (idx >= 0) {
-            targetBrowser.cursor = idx;
-            targetBrowser.offset = Math.max(0, idx - 3);
-          }
-          refreshWorkingDirPreview();
-          pushDebugLine(C.muted(`  ${item.relPath}`));
-          chatScrollOffset = -1;
-        }
-        setWorkingFocus('browser', 'agent-roster-search-pick');
-        draw();
-      },
-      onCancel: () => {
-        clearHoverTimer();
-        disposeActivePreview();
-        previewToggleDisposable?.dispose();
-        previewDismissDisposable?.dispose();
-        agentSearchModal = null;
-        handle?.dispose();
-        draw();
-      },
-    });
-    // Ctrl+/ (and Ctrl+_ which some terminals send for the same
-    // physical chord) cycles preview modes. Active for the lifetime
-    // of THIS picker only — disposed in both onAccept and onCancel
-    // above. Q4 (substrate Occam): no per-binding pipe alias, register
-    // each variant separately. (Korean IME aliases unnecessary — Ctrl+/
-    // has no jamo mapping on the 2-set layout.)
-    const togglePreviewMode = (): void => { cyclePreviewMode(); };
-    const previewSlash = display.registerKeyBinding({
-      id: `dashboard:finder-picker-preview-toggle-slash:${Date.now().toString(36)}`,
-      key: 'C-/',
-      scope: 'global',
-      when: () => agentSearchModal === picker,
-      handler: togglePreviewMode,
-    });
-    const previewUnder = display.registerKeyBinding({
-      id: `dashboard:finder-picker-preview-toggle-under:${Date.now().toString(36)}`,
-      key: 'C-_',
-      scope: 'global',
-      when: () => agentSearchModal === picker,
-      handler: togglePreviewMode,
-    });
-    previewToggleDisposable = {
-      dispose: () => { previewSlash.dispose(); previewUnder.dispose(); },
-    };
-    // Ctrl+] — instantly dismiss the active preview popup WITHOUT
-    // closing the picker or changing the mode. Esc would be more
-    // intuitive but the picker captures Esc internally to cancel
-    // itself. Ctrl+\ is unsafe because it raises SIGQUIT in many
-    // terminal drivers. Ctrl+] (historically "telnet escape" =
-    // "exit this context") is universally safe + semantically right.
-    // Active only while a preview is currently visible — otherwise
-    // the binding silently no-ops (no flicker, no log spam).
-    // Mode stays as set; if user is in HOVER mode, the next
-    // cursor stillness re-triggers the popup. To stop the popup
-    // from re-appearing entirely, cycle Ctrl+/ back to OFF.
-    previewDismissDisposable = display.registerKeyBinding({
-      id: `dashboard:finder-picker-preview-dismiss:${Date.now().toString(36)}`,
-      key: 'C-]',
-      scope: 'global',
-      when: () => agentSearchModal === picker && lastPreviewHandle !== null,
-      handler: () => {
-        clearHoverTimer();
-        disposeActivePreview();
-        draw();
-      },
-    });
-    attachSurfaceToWorkspace(picker.surface, currentWorkspaceOwnerId());
-    handle = display.pushModal(picker.surface);
-    agentSearchModal = picker;
-    draw();
-  }
-
-  /** Yazi-style Alt+C — directory finder. Symmetric with openFinder
-   *  Picker but enumerates directories only (`scanFinder kind:'dir'`)
-   *  and on accept cd's the browser pane to the chosen directory.
-   *  Remote-mode is currently unsupported (surfaces a warning) — the
-   *  remote finder would need a parallel kind-aware backend. */
-  async function openDirectoryPicker(): Promise<void> {
-    if (workingDir.remote) {
-      chatLines.push(C.warning('  Alt+C: directory finder is local-only — Esc remote first.'));
-      chatScrollOffset = -1;
-      draw();
-      return;
-    }
-    const targetBrowserId = activeBrowserWidgetId();
-    const targetBrowser = resolveBrowserStateById(targetBrowserId) ?? (workingDir as BrowserPaneModel);
-    // Symmetric with openFinderPicker — scan from SWD (project root),
-    // not the browser pane's nav cursor. The accept handler still
-    // mutates targetBrowser to navigate into the chosen dir.
-    const scanRoot = getSessionCwd();
-    finderFeedbackRuntime.onFinderScanStarted(`${scanRoot} (dirs)`);
-    draw();
-    const scan = await scanFinder({ root: scanRoot, kind: 'dir' });
-    const rels = relativizeResults(scan.paths, scanRoot);
-    const dirItems: FinderItem[] = scan.paths.map((absPath, i) => ({
-      absPath, relPath: rels[i] ?? absPath,
-    }));
-    if (dirItems.length === 0) {
-      finderFeedbackRuntime.onFinderScanEmpty();
-      draw();
-      return;
-    }
-    finderFeedbackRuntime.onFinderScanCompleted({
-      count: dirItems.length,
-      backend: scan.backend,
-      truncated: scan.truncated,
-      durationMs: scan.durationMs,
-    });
-
-    const { cols, rows } = termSize();
-    const width = Math.min(90, Math.max(50, cols - 6));
-    const visibleRows = Math.min(15, Math.max(6, rows - 8));
-    const height = visibleRows + 3;
-    const bounds = {
-      row: Math.max(1, Math.floor((rows - height) / 2)),
-      col: Math.max(1, Math.floor((cols - width) / 2)),
-      width,
-      height,
-    };
-    let handle: ReturnType<typeof display.pushModal> | null = null;
-    const titleRoot = scanRoot.replace(homedir(), '~');
-    const picker = createFinderModal({
-      items: dirItems,
-      bounds, width, maxVisible: visibleRows,
-      truncated: scan.truncated,
-      title: `Find directory in ${titleRoot}`,
-      theme: currentThemeTokens(),
-      onAccept: (item) => {
-        agentSearchModal = null;
-        handle?.dispose();
-        enterDirectory(targetBrowser as WorkingDirState, item.absPath);
-        refreshWorkingDir(targetBrowser as WorkingDirState);
-        refreshWorkingDirPreview();
-        pushDebugLine(C.muted(`  cd ${item.relPath}`));
-        chatScrollOffset = -1;
-        setWorkingFocus('browser', 'alt-c-dir-pick');
-        draw();
-      },
-      onCancel: () => {
-        agentSearchModal = null;
-        handle?.dispose();
-        draw();
-      },
-    });
-    attachSurfaceToWorkspace(picker.surface, currentWorkspaceOwnerId());
-    handle = display.pushModal(picker.surface);
-    agentSearchModal = picker;
-    draw();
-  }
-
-  /** T4-E4 — open the SSH host picker (Ctrl+K). Accept connects
-   *  the browser pane to the remote host; Esc cancels silently.
-   *  Routes keys through agentSearchModal (shared pattern with
-   *  window + session pickers). */
-  function openSshPicker(): void {
-    const { cols, rows } = termSize();
-    const width = Math.min(72, Math.max(44, cols - 6));
-    const visibleRows = 8;
-    const height = visibleRows + 3;
-    const bounds = {
-      row: Math.max(1, Math.floor((rows - height) / 2)),
-      col: Math.max(1, Math.floor((cols - width) / 2)),
-      width,
-      height,
-    };
-    let handle: ReturnType<typeof display.pushModal> | null = null;
-    const picker = createSshPickerModal({
-      bounds, width, maxVisible: visibleRows,
-      activeHostName: workingDir.remote?.host.name ?? null,
-      theme: currentThemeTokens(),
-      onAccept: async (host) => {
-        agentSearchModal = null;
-        handle?.dispose();
-        touchSshHost(host.name);
-        startRemoteModeBridge(host, '.');
-        finderFeedbackRuntime.onSshConnectStarted({ name: host.name, host: host.host });
-        draw();
-        try {
-          await refreshRemoteWorkingDir(workingDir, {}, dockedPreview);
-          await refreshRemotePreviewBridge();
-          finderFeedbackRuntime.onSshConnectSucceeded(host.name);
-        } catch (err) {
-          finderFeedbackRuntime.onSshConnectFailed(
-            host.name,
-            err instanceof Error ? err.message : String(err),
-          );
-        }
-        draw();
-      },
-      onCancel: () => {
-        agentSearchModal = null;
-        handle?.dispose();
-        draw();
-      },
-    });
-    attachSurfaceToWorkspace(picker.surface, currentWorkspaceOwnerId());
-    handle = display.pushModal(picker.surface);
-    agentSearchModal = picker;
-    draw();
   }
 
   // FU-1 — register ssh-picker / finder-picker openers as display
@@ -12889,6 +12436,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // 외부 주입(`pty text`)을 사용자 타이핑과 섞지 않고 별도 대기열로 — 결함 #6(10-14).
   const disposeExternalInputHost = registerExternalInputHost(createDashboardExternalInputHost({
     isTurnActive: () => streamingInFlight,
+    getTurnStop: () => currentTurnExternalStop,
     promptCtl,
     pushNotice: (line) => { chatLines.push(C.muted(`  ${line}`)); chatScrollOffset = -1; draw(); },
   }));
@@ -15422,8 +14970,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     //     — the boot fell back to a fresh session. Surface the reason
     //     so the user knows they're on a different session than asked.
     //   - new (no resume requested): nothing extra to render.
+    // 대표 #73 — 인자 없는 기동 = 새 세션. 이어받았는지는 이 값 하나로 판정한다(관측 ⊕ 자리 부트 카드).
+    let tuiBootSessionStart: { origin: 'new' | 'resume'; reason: string; restoredSessionId?: string } = opts.resumeSessionId
+      ? { origin: 'new', reason: 'resume-failed' }
+      : { origin: 'new', reason: 'default-new' };
     if (dashboardAcpBootResult.mode === 'resumed' && dashboardAcpBootResult.sessionId) {
       const sid = dashboardAcpBootResult.sessionId;
+      tuiBootSessionStart = { origin: 'resume', reason: 'resume-daemon', restoredSessionId: sid };
       chatLines.push(C.success(`  ✓ resumed daemon session: ${sid}`));
       // Best-effort REST history replay over the remote HTTP/WS endpoint.
       if (opts.remote) {
@@ -15485,10 +15038,27 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       if (!resume.resumed) {
         chatLines.push(C.warning(`  ⚠ resume failed (${resume.reason}); started new session`));
       } else {
+        tuiBootSessionStart = {
+          origin: 'resume',
+          reason: resume.repaired ? 'resume-local-repaired' : 'resume-local',
+          restoredSessionId: resume.sessionId,
+        };
         chatLines.push(C.success(`  ✓ resumed local session: ${resume.sessionId}`));
+        if (resume.repaired) {
+          chatLines.push(C.muted(`    깨진 도구 호출·결과 짝을 잘라 이어받았다(호출 ${resume.repaired.removedCalls} · 결과 ${resume.repaired.removedResults})`));
+        }
         chatLines.push(C.muted(`    ${resume.turns} turns restored. Next turn continues this conversation.`));
       }
     }
+    observeSessionStart({
+      surface: 'tui',
+      origin: tuiBootSessionStart.origin,
+      reason: tuiBootSessionStart.reason,
+      // sessionId = 이 대화가 이어받은(또는 새로 연) 대화 기록의 id · acpSessionId = 백엔드 ACP 세션 id(둘이 다를 수 있다).
+      sessionId: tuiBootSessionStart.restoredSessionId ?? dashboardAcpSession.currentSessionId ?? null,
+      acpSessionId: dashboardAcpSession.currentSessionId ?? null,
+      resumeRequested: opts.resumeSessionId !== undefined,
+    });
     // 제안은 세션 작업 폴더 기준 — 시작 폴더 한 번이 아니라 폴더가 바뀔 때마다 다시 계산한다(IA1 리뷰 must-fix).
     const nextProjectSuggestion = createProjectSuggester(suggestProjectForFolder);
     const pushProjectSuggestion = (folder: string): void => {
@@ -15529,7 +15099,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     installSeatSessionRecorder({ getCwd: () => getSessionCwd(), getHistory: () => chat.history });
     const seatBoot = describeSeatBoot(getSessionCwd());
     if (seatBoot) chatLines.push(C.muted(`  🪪 ${seatBoot.seat} 자리 · 안 읽은 우편 ${seatBoot.unread ?? '미관측'} — 부트 카드를 턴마다 싣는다`));
-    if (dashboardAcpBootResult.mode !== 'resumed' && !opts.resumeSessionId) startSeatBootConversation({ reason: 'boot' });
+    // 새 세션(이어받기 실패 포함)이면 자리 부트 카드로 시작한다 — 자리 맥락은 세션이 아니라 자리 문서가 싣는다.
+    if (tuiBootSessionStart.origin === 'new') startSeatBootConversation({ reason: 'boot' });
     tuiSeatAskTimer = setInterval(pollTuiSeatAnswers, 10_000);
     tuiSeatAskTimer.unref();
     pollTuiSeatAnswers();
@@ -16587,7 +16158,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           // 다음 inner-loop 반복이 남은 항목도 같은 순서로 제출한다.
           // ⭐ 드레인 순서 자체는 `chat/turn-typeahead.ts` 가 소유한다 — 여기서 베끼면
           //    테스트가 그 순서를 다시 베껴야 하고, 베낀 테스트는 배선 회귀를 못 잡는다.
-          const interrupted = lastTurnFinalStatus === 'interrupted';
+          internalTurnGate.noteTurnSettled();
+          // «지금 밀어 넣기»로 끊은 턴은 «중단»이 아니다 — 복원하지 않고 큐 머리를 곧바로 제출한다.
+          const interrupted = consumeTurnEndInterrupted(lastTurnFinalStatus, steerInterruptRef);
           const queuedBeforeDrain = turnTypeaheadRef.state.queuedSubmissions.length;
           // ⭐ 드레인 → 레지스트리 해제 → Enter 주입은 다리 모듈이 한 함수로 한다(시험이 같은 함수를 문다).
           const drained = handoffTurnTypeaheadAtTurnEnd(turnTypeaheadRef, nextInitial, { interrupted }, () => {
@@ -16632,6 +16205,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               : '/quit /clear (run `elanous setup` — no LLM provider available)',
             debugLog: debug.enabled ? (event, label, payload) => debug.log(event, label, payload) : undefined,
             textInputOpts: {
+              internalTurnYield: internalTurnYieldPort,
               onScrollKey: (name) => {
                 const { rows } = termSize();
                 const viewport = computePromptFrameLogViewportBounds(
@@ -17073,6 +16647,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               }),
             },
           });
+          // ⭐ H2 — 입력칸이 내부 턴 문에 «비켜 줬다». 꺼낸 요청을 같은 턴 실행 경로로 보낸다
+          //   (슬래시 해석·히스토리·사람 발화 에코 없음). 꺼낼 게 없으면 입력으로 되돌아간다.
+          const consumed = consumeInternalTurnYield(internalTurnGate, input);
+          if (consumed.kind === 'reenter') continue;
+          const internalTurn: InternalTurnRequest | null = consumed.kind === 'internal' ? consumed.request : null;
+          input = consumed.input;
 
           const postTurn = resolveDashboardChatMainPostTurn(input, {
             inputLines: dashboardState.getInputLines(),
@@ -17124,7 +16704,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
 
           // Save to durable input history. Up/down reads the in-memory
           // tail, while slash/LLM tools can search the full store.
-          if (postTurn.historyRecord) {
+          if (!internalTurn) internalTurnGate.noteHumanTurn();
+          if (postTurn.historyRecord && !internalTurn) {
             inputHistoryStore.record(postTurn.historyRecord);
             refreshInputHistory();
           }
@@ -17282,14 +16863,16 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           // resource_link blocks so dropped screenshots and PDFs flow
           // naturally to the agent. debug.log gates the snapshot so
           // off-state stays zero-cost.
-          const submitIntent = resolveDashboardHarnessSubmitIntent(input.text, {
-            stickyBackend: dashboardAcpChat.getSticky(),
-            source: input.externalSubmitSource,
-          });
+          const submitIntent = internalTurn
+            ? resolveInternalTurnSubmitIntent(internalTurn, dashboardAcpSession.currentSessionId)
+            : resolveDashboardHarnessSubmitIntent(input.text, {
+              stickyBackend: dashboardAcpChat.getSticky(),
+              source: input.externalSubmitSource,
+            });
           const cmdText = submitIntent.kind === 'control-turn'
             ? (submitIntent.commandText ?? '')
             : submitIntent.text;
-          if (submitIntent.kind === 'submit-turn' && parseSeatAsk(submitIntent.text)) {
+          if (submitIntent.kind === 'submit-turn' && !internalTurn && parseSeatAsk(submitIntent.text)) {
             try {
               const receipt = await askSeat(submitIntent.text, { channel: 'tui', clientId: tuiSeatAskClientId },
                 ceoTaskDeps(getUserConfig(), null), tuiSeatAskDeps);
@@ -17959,6 +17542,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   ? { url: opts.remote.url, token: opts.remote.token }
                   : null,
                 acpSwapTo: (sessionId, cwd) => dashboardAcpSession.swapTo(sessionId, cwd),
+                acpRenew: async (cwd) => {
+                  const renewed = await dashboardAcpSession.renew(cwd);
+                  acpSessionIdRef.current = renewed;
+                  return renewed;
+                },
               },
               shellSlash: {
                 slashRuntime: shellSlashRuntime,
@@ -18020,6 +17608,21 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 },
                 setWorkingFocusPreview: () => { setWorkingFocus('preview', 'slash-term-move-preview'); },
                 nextTerminalVwSlotId: (terminalId) => `term-slot:${terminalId}`,
+              },
+              // TUI-LOOP-COMMAND — /loop <간격> <프롬프트> · 쉬는 동안만 발사
+              // (src/dashboard/loop-scheduler.ts · 판정: idle 발사 1 · busy 미룸 · stop 0).
+              // idle/busy 신호는 대시보드 루프가 이미 쓰는 것을 그대로 쓴다 —
+              // 스트리밍 턴(streamingInFlight · reportTuiTurn busy/idle) +
+              // ACP 세션 바쁨(dashboardAcpChat.isBusy()). 프롬프트 제출은
+              // 플러그인 submitDashboardText 와 같은 기존 제출 틈
+              // (dispatchDashboardSubmitText)으로 낸다 — 새 제출 경로를 만들지 않는다.
+              loopCommand: {
+                isIdle: () => !streamingInFlight && !dashboardAcpChat.isBusy(),
+                submitPrompt: (prompt: string) => {
+                  if (dispatchDashboardSubmitText) dispatchDashboardSubmitText(prompt);
+                  else chatLines.push(C.muted('  /loop: 입력 루프가 아직 제출을 받지 않는다 — 다음 틱을 기다린다'));
+                },
+                schedulerRef: dashboardLoopSchedulerRef,
               },
             };
             const slashOutcome = await dashboardSlashRegistry.dispatch(cmdLower, args, slashCtx);
@@ -18468,7 +18071,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           // pattern. Without this draw(), the echo sits in the chatLines
           // array but doesn't paint until after the skill router's
           // classifier LLM call returns (~1-2s of visual silence).
-          echoSubmittedUserText(tok.text);
+          if (internalTurn) {
+            chatLines.push(C.muted(`  ${formatInternalTurnBanner(internalTurn)}`));
+            chatScrollOffset = -1;
+          } else {
+            echoSubmittedUserText(tok.text);
+          }
           if (queuedTurnEndText !== undefined && input.text === queuedTurnEndText) {
             debug.log('dashboard.turn-typeahead', 'echoed', { path: 'turn-end', length: queuedTurnEndText.length });
           }
@@ -18686,7 +18294,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           let latestTurnUsage: import('../prompt-cache/types.js').LLMUsage | undefined;
           const runPlainSubmitTurn = (submit: PlainTurnSubmit) => runDashboardChatMainPlainTurn({
             // ⛔⭐ 관측 심을 «실제로» 넘긴다 — 타입만 선택적으로 넓히면 조용히 안 온다(`F12`).
-            debugLog: (category, event, payload) => { try { debug.log(category, event, payload); } catch { /* fail-soft */ } },
+            debugLog: (category, event, payload, opts) => { try { debug.log(category, event, payload, opts); } catch { /* fail-soft */ } },
             userText: tok.text,
             intent: submit.intent,
             contextText: ctx,
@@ -19046,7 +18654,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           const { resumeGoalFromUserFollowUp } = await import('../goals/chat-loop-bridge.js');
           const { hydrateGoalFromSnapshot } = await import('../goals/registry.js');
           hydrateGoalFromSnapshot();
-          const followUpAction = tok.text.startsWith('/goal')
+          // ⛔ H2 — 내부 턴은 사람의 «정정·재개» 발화가 아니다: 멈춘 /goal 을 되살리지 않는다.
+          const followUpAction = tok.text.startsWith('/goal') || internalTurn
             ? { kind: 'no-loop' as const }
             : resumeGoalFromUserFollowUp(tok.text);
           let goalLoopUserText: string | null = followUpAction.kind === 'continue'

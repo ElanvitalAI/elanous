@@ -7,6 +7,63 @@ import { debug } from '../debug/log.js';
 import { LogStore } from '../mss/logging/log-store.js';
 
 
+describe('run-ledger dev project annotation', () => {
+  it('adds only a valid environment project to newly appended entries and preserves explicit and legacy entries', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'run-ledger-dev-project-'));
+    const originalDevProject = process.env.ELANOUS_DEV_PROJECT;
+    const validRunId = 'run-00000000-0000-4000-8000-000000000901';
+    const missingRunId = 'run-00000000-0000-4000-8000-000000000902';
+    const malformedRunId = 'run-00000000-0000-4000-8000-000000000903';
+    const explicitRunId = 'run-00000000-0000-4000-8000-000000000904';
+    try {
+      process.env.ELANOUS_DEV_PROJECT = 'prj-x';
+      appendRunLedgerEntry({ runId: validRunId, event: 'start', data: {} }, directory);
+      expect(loadRunLedger(validRunId, directory)).toEqual([
+        { runId: validRunId, event: 'start', data: {}, devProject: 'prj-x' },
+      ]);
+
+      delete process.env.ELANOUS_DEV_PROJECT;
+      appendRunLedgerEntry({ runId: missingRunId, event: 'start', data: {} }, directory);
+      expect(loadRunLedger(missingRunId, directory)).toEqual([
+        { runId: missingRunId, event: 'start', data: {} },
+      ]);
+
+      process.env.ELANOUS_DEV_PROJECT = 'project-x';
+      appendRunLedgerEntry({ runId: malformedRunId, event: 'start', data: {} }, directory);
+      expect(loadRunLedger(malformedRunId, directory)).toEqual([
+        { runId: malformedRunId, event: 'start', data: {} },
+      ]);
+
+      appendRunLedgerEntry({ runId: explicitRunId, event: 'start', data: {}, devProject: 'prj-explicit' }, directory);
+      expect(loadRunLedger(explicitRunId, directory)).toEqual([
+        { runId: explicitRunId, event: 'start', data: {}, devProject: 'prj-explicit' },
+      ]);
+    } finally {
+      if (originalDevProject === undefined) delete process.env.ELANOUS_DEV_PROJECT;
+      else process.env.ELANOUS_DEV_PROJECT = originalDevProject;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('annotates an entry written through the existing recordHumanStoppedRun caller', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'run-ledger-dev-project-caller-'));
+    const originalDevProject = process.env.ELANOUS_DEV_PROJECT;
+    const runId = 'run-00000000-0000-4000-8000-000000000905';
+    try {
+      process.env.ELANOUS_DEV_PROJECT = 'prj-x';
+      recordHumanStoppedRun(runId, { stoppedBy: 'operator', dir: directory });
+
+      expect(loadRunLedger(runId, directory)).toEqual([
+        expect.objectContaining({ runId, event: 'human-stop', devProject: 'prj-x' }),
+      ]);
+    } finally {
+      if (originalDevProject === undefined) delete process.env.ELANOUS_DEV_PROJECT;
+      else process.env.ELANOUS_DEV_PROJECT = originalDevProject;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
 // ⛔⭐⭐⭐ 미완 «판별» — 종전엔 이 조회가 낸 것이 한 값(`terminal-status-missing`)뿐이었다.
 //   📏 2026-08-11 실측: 그 한 값에 「실제로 도는 것 2 · 5.2일 된 잔해 51 · 종료를 «다른 이름»으로
 //     적은 것 5」가 섞여 있었다 ⇒ 회고에서 「무엇이 내 찌꺼기인가」를 못 갈랐다.
@@ -1685,7 +1742,9 @@ describe('unfinished run ledger cleanup disposition', () => {
     }
   });
 
-  it('executes the cleanup CLI as plan-only by default, removes only on request, and blocks incomplete queries', () => {
+  // Keep one real CLI entrance here. src/index.test.ts covers --remove, incomplete
+  // queries, and each malformed --age value through the same CLI entry point.
+  it('executes the cleanup CLI as plan-only by default', () => {
     const stateDir = temporaryLedgerDir();
     const ledgerDir = join(stateDir, 'run-ledger');
     const oldId = runId('0020');
@@ -1693,39 +1752,18 @@ describe('unfinished run ledger cleanup disposition', () => {
     const oldPath = writeLedger(ledgerDir, oldId, new Date(Date.now() - 60 * 60_000).toISOString());
     const livePath = writeLedger(ledgerDir, liveId, new Date(Date.now() - 1_000).toISOString());
     const elanous = join(process.cwd(), 'bin', 'elanous.mjs');
-    const invoke = (...args: string[]) => Bun.spawnSync({
-      cmd: [process.execPath, elanous, `--test=${stateDir}`, 'self', 'unfinished-runs-cleanup', '--json', ...args],
+    const planned = Bun.spawnSync({
+      cmd: [process.execPath, elanous, `--test=${stateDir}`, 'self', 'unfinished-runs-cleanup', '--json'],
       cwd: process.cwd(),
       env: { ...process.env, ELANOUS_STATE_DIR: stateDir },
       stdout: 'pipe', stderr: 'pipe',
     });
-    const parse = (result: ReturnType<typeof invoke>) => JSON.parse(new TextDecoder().decode(result.stdout));
-
-    const planned = invoke();
     expect(planned.exitCode, new TextDecoder().decode(planned.stderr)).toBe(0);
-    expect(parse(planned)).toMatchObject({ plannedRemoval: [oldPath], removed: [], preserved: expect.arrayContaining([oldPath, livePath]) });
+    expect(JSON.parse(new TextDecoder().decode(planned.stdout))).toMatchObject({
+      plannedRemoval: [oldPath], removed: [], preserved: expect.arrayContaining([oldPath, livePath]),
+    });
     expect([oldPath, livePath].every(existsSync)).toBe(true);
-
-    const removed = invoke('--remove');
-    expect(removed.exitCode, new TextDecoder().decode(removed.stderr)).toBe(0);
-    expect(parse(removed)).toMatchObject({ removed: [oldPath], preserved: expect.arrayContaining([livePath]) });
-    expect(existsSync(oldPath)).toBe(false);
-    expect(existsSync(livePath)).toBe(true);
-
-    const blockedPath = writeLedger(ledgerDir, runId('0022'), new Date(Date.now() - 60 * 60_000).toISOString());
-    writeFileSync(join(ledgerDir, `${runId('0023')}.jsonl`), '{not json}\n', 'utf8');
-    const incomplete = invoke('--remove');
-    expect(incomplete.exitCode, new TextDecoder().decode(incomplete.stderr)).toBe(0);
-    expect(parse(incomplete)).toMatchObject({ unavailable: true, removed: [], counts: { queryUnavailable: 1 } });
-    expect(existsSync(blockedPath)).toBe(true);
-
-    for (const age of ['60s', '1,000', '1oops']) {
-      const invalid = invoke('--remove', '--age', age);
-      expect(invalid.exitCode).not.toBe(0);
-      expect(new TextDecoder().decode(invalid.stderr)).toContain('--age must be a non-negative number of minutes');
-      expect(existsSync(blockedPath)).toBe(true);
-    }
-  }, 15_000);
+  }, 60_000);
 
   afterAll(() => {
     for (const directory of directories) rmSync(directory, { recursive: true, force: true });

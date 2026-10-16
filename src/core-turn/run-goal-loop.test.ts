@@ -277,6 +277,68 @@ describe('runGoalLoop completion answer deduplication', () => {
       debug.log = originalLog;
     }
   });
+
+  // TUI-H1-SEAT-GOALLOOP · #29 처방 — 자리 운영 턴은 빈 evidence 완료를 반려(재주입)하지 않고 그 답으로 끝낸다.
+  test('lenientCompletionEvidence accepts an evidence-less completion once, with the answer as evidence (#29)', async () => {
+    let turns = 0;
+    const events: string[] = [];
+    const prompts: string[] = [];
+    const originalLog = debug.log;
+    debug.log = ((category: string, event: string) => {
+      if (category === 'goal.loop') events.push(event);
+    }) as typeof debug.log;
+    try {
+      const result = await runGoalLoop(baseCtx(), {
+        maxIterations: 3,
+        lenientCompletionEvidence: true,
+        changedFiles: () => [],
+        runTurn: async (ctx) => {
+          turns += 1;
+          const last = ctx.messages.at(-1);
+          if (last?.role === 'user' && typeof last.content === 'string') prompts.push(last.content);
+          ctx.callbacks?.onTurnComplete?.([{
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'goal', name: 'update_goal', input: { status: 'complete', evidence: '' } }],
+          }]);
+          return { stopReason: 'end_turn', finalText: '우편 3통 처리 · 남은 일 0' } satisfies CoreTurnResult;
+        },
+      });
+      expect(result).toMatchObject({ finalText: '우편 3통 처리 · 남은 일 0', stopReason: 'goal_complete', goalComplete: true, iterations: 1 });
+      expect(turns).toBe(1);
+      expect(events).toContain('complete-evidence-lenient');
+      expect(events).not.toContain('complete-rejected-no-evidence');
+      expect(prompts.some((p) => p.startsWith('[evidence required]'))).toBe(false);
+    } finally {
+      debug.log = originalLog;
+    }
+  });
+
+  test('lenientCompletionEvidence still rejects an evidence-less completion when the answer is empty too', async () => {
+    const events: string[] = [];
+    const originalLog = debug.log;
+    debug.log = ((category: string, event: string) => {
+      if (category === 'goal.loop') events.push(event);
+    }) as typeof debug.log;
+    try {
+      const result = await runGoalLoop(baseCtx(), {
+        maxIterations: 2,
+        lenientCompletionEvidence: true,
+        changedFiles: () => [],
+        runTurn: async (ctx) => {
+          ctx.callbacks?.onTurnComplete?.([{
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'goal', name: 'update_goal', input: { status: 'complete', evidence: '' } }],
+          }]);
+          return { stopReason: 'end_turn', finalText: '   ' } satisfies CoreTurnResult;
+        },
+      });
+      expect(result).toMatchObject({ stopReason: 'max_iterations', goalComplete: false });
+      expect(events).toContain('complete-rejected-no-evidence');
+      expect(events).not.toContain('complete-evidence-lenient');
+    } finally {
+      debug.log = originalLog;
+    }
+  });
 });
 
 describe('runGoalLoop wires file-heartbeat emission before waiting', () => {

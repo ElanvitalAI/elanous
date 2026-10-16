@@ -1,5 +1,7 @@
 import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from 'node:crypto';
 
+import { scanPackInternalRefs } from './pack-internal-refs';
+
 export interface MarketplaceArtifact {
   sha256: string;
   bytes: number;
@@ -96,6 +98,18 @@ function invalidIndex(value: unknown): string | null {
       if (!Number.isSafeInteger(entry.artifact.bytes) || (entry.artifact.bytes as number) < 0) return field('artifact.bytes: expected non-negative integer');
       if (!string(entry.artifact.key) || !entry.artifact.key.trim()) return field('artifact.key: expected non-empty string');
       if (collection === 'loopBundles' && entry.graphs !== undefined && !stringArray(entry.graphs)) return field('graphs: expected string array');
+      if (entry.visibility === 'public') {
+        const texts: Array<[string, string | undefined]> = [
+          ['name', string(entry.name) ? entry.name : undefined],
+          ['version', string(entry.version) ? entry.version : undefined],
+          ['description', string(entry.description) ? entry.description : undefined],
+          ['artifact.key', string(entry.artifact.key) ? entry.artifact.key : undefined],
+        ];
+        const graphs = collection === 'loopBundles' && stringArray(entry.graphs) ? entry.graphs : undefined;
+        if (graphs !== undefined) texts.push(['graphs', graphs.join('\n')]);
+        const hit = scanPackInternalRefs(texts.filter((pair): pair is [string, string] => pair[1] !== undefined).map(([path, text]) => ({ path, text })))[0];
+        if (hit) return field(`${hit.file}: expected no internal reference (${hit.marker})`);
+      }
     }
   }
 

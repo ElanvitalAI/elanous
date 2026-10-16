@@ -497,9 +497,20 @@ export async function resolveIntakeSlash(
       reason: target.ok ? undefined : target.reason,
     });
     if (!target.ok) return { output: target.reason, action: 'noop', session };
-    const runPipeline = deps.runPipeline ?? runIntakePipelinePhases;
-    const pipelineCallables = deps.pipelineCallables ?? buildRealIntakeCallables();
-    const pipeline = await runPipeline({ rawText: session.raw.rawText, intakeId }, pipelineCallables);
+    // Injected runPipeline ignores callables; skip eager
+    // buildRealIntakeCallables() so a keyless HOME does not throw
+    // NoLlmProviderAvailableError before the injected pipeline runs.
+    // When runPipeline is absent, keep resolving callables the same way
+    // so a real keyless user setup error still comes from the builder.
+    const pipeline = deps.runPipeline
+      ? await deps.runPipeline(
+          { rawText: session.raw.rawText, intakeId },
+          deps.pipelineCallables ?? {},
+        )
+      : await runIntakePipelinePhases(
+          { rawText: session.raw.rawText, intakeId },
+          deps.pipelineCallables ?? buildRealIntakeCallables(),
+        );
     const tasks = pipeline.enriched.missions.flatMap((mission) => mission.tasks);
     if (tasks.length === 0) {
       return {

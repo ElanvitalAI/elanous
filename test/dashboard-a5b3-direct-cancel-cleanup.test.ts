@@ -16,12 +16,12 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
-const DASHBOARD_TS = join(import.meta.dir, '..', 'src', 'dashboard', 'index.ts');
 
 describe('A-5b.3 · textInput opts.onEscape removed', () => {
   test('dashboard textInput call site no longer wires drag-aware opts.onEscape', () => {
-    const src = readFileSync(DASHBOARD_TS, 'utf8');
+    const src = tuiSourceText();
     // Before A-5b.3 there was exactly one `onEscape: () => {` in
     // dashboard.ts (inside the textInput opts literal). A-5b.3
     // removed it · A-5b.2's `opts.onKey` handles the drag path via
@@ -36,7 +36,7 @@ describe('A-5b.3 · textInput opts.onEscape removed', () => {
     // whose `onKey: async (key) =>` delegates to `deps.routeInputKey`.
     // The dispatcher route body (routeInputEventAsync + dragManager)
     // now lives at the `routeInputKey: async (key) =>` wire in
-    // dashboard/index.ts. Same invariant, asserted across both halves
+    // the TUI source bundle (dashboard entry). Same invariant, asserted across both halves
     // of the seam so neither side can silently drop the drag guard.
     const optsSrc = readFileSync(
       join(import.meta.dir, '..', 'src', 'dashboard', 'input', 'chat-main-interaction-opts.ts'),
@@ -47,7 +47,7 @@ describe('A-5b.3 · textInput opts.onEscape removed', () => {
     const onKeyWindow = optsSrc.slice(onKeyIdx, Math.min(optsSrc.length, onKeyIdx + 700));
     expect(onKeyWindow).toContain('deps.routeInputKey(key)');
 
-    const src = readFileSync(DASHBOARD_TS, 'utf8');
+    const src = tuiSourceText();
     const routeKeyIdx = src.indexOf('routeInputKey: async (key) =>');
     expect(routeKeyIdx).toBeGreaterThan(-1);
     // Window widened 700 → 1500: the route body carries a long
@@ -60,7 +60,7 @@ describe('A-5b.3 · textInput opts.onEscape removed', () => {
 
 describe('A-5b.3 · all three ESC call sites now dispatcher-first', () => {
   test('no `dm.cancelAll(\\\'escape\\\')` literal remains in dashboard.ts', () => {
-    const src = readFileSync(DASHBOARD_TS, 'utf8');
+    const src = tuiSourceText();
     // The A-8 guard in `src/input-core/dispatcher.ts` owns the one
     // `cancelAll('escape')` call in the codebase now. Dashboard sites
     // delegate via routeInputEventAsync · no direct literal remains.
@@ -73,7 +73,7 @@ describe('A-5b.3 · all three ESC call sites now dispatcher-first', () => {
     //   2. streaming ESC handler (A-5b.3)
     //   3. pane-ESC handler (A-5b.3 · Finding C replacement)
     //   4. textInput opts.onKey (A-5b.2)
-    const src = readFileSync(DASHBOARD_TS, 'utf8');
+    const src = tuiSourceText();
     const hits = src.match(/inputCoreRouteInputEventAsync/g) ?? [];
     expect(hits.length).toBeGreaterThanOrEqual(4);
   });

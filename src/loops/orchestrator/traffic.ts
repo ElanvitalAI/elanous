@@ -17,6 +17,51 @@ export type TrafficProcess = Pick<HarnessProcessRecord, 'command' | 'elapsedSeco
 export type TrafficSeatRow = { seat: OrchestratorSeat; running: number; cap: number; baseShare: number | null; borrowed: number; lent: number; launchCap: number; idleFor: number | null; idle: boolean; nextCell: TrafficCell | null };
 export type TrafficResult = { seats: TrafficSeatRow[]; unassigned: number; now: Date; idleMinutes: number; finish?: { metrics: FinishMetrics; advice: FinishAdvice } };
 
+/** A reason from a previous turn never blocks recovered supply; only active holds do. */
+export function isLaunchEligible(row: Pick<TrafficSeatRow, 'nextCell' | 'running' | 'launchCap'>,
+  skipReason?: string): boolean {
+  return row.nextCell !== null && row.running < row.launchCap &&
+    skipReason !== 'degraded-skip' && skipReason !== 'cap-deferred';
+}
+
+export type DispatchCycle = {
+  at: string; source: 'traffic' | 'tick'; mode: 'shadow' | 'live'; runId: string;
+  supply: number; capacity: number; eligible: number; skipped: Record<string, number>;
+  dispatch: OrchestratorLoopConfig['dispatch'];
+};
+
+/** Separate journal: never extend or reinterpret seat-requests or per-run state rows. */
+export function recordDispatchCycle(root: string, cycle: DispatchCycle,
+  log: (category: string, event: string, data: Record<string, unknown>) => void = debug.log.bind(debug)): void {
+  const path = join(root, 'orchestrator', 'dispatch-ledger.jsonl');
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    const appended = withFileLockSync(`${path}.lock`, () => {
+      const previous = existsSync(path) ? readFileSync(path, 'utf8') : '';
+      if (previous.split('\n').some(line => {
+        if (!line) return false;
+        let row: Partial<DispatchCycle>;
+        try { row = JSON.parse(line) as Partial<DispatchCycle>; }
+        catch {
+          // A torn append must not permanently stop later cycles. Keep the line for forensic inspection.
+          try { log('loop.orchestrator', 'dispatch-cycle-malformed', { path }); }
+          catch { /* Observation must not stop a valid append. */ }
+          return false;
+        }
+        return row && row.source === cycle.source && row.runId === cycle.runId && row.mode === cycle.mode;
+      })) return false;
+      // A torn final line has no newline; separate it from the next valid JSONL row.
+      appendFileSync(path, `${previous && !previous.endsWith('\n') ? '\n' : ''}${JSON.stringify(cycle)}\n`);
+      return true;
+    });
+    if (appended) try { log('loop.orchestrator', 'dispatch-cycle', cycle); }
+    catch { /* Observation cannot change a recorded decision. */ }
+  } catch (error) {
+    try { debug.log('loop.orchestrator', 'dispatch-cycle-failed', { error: String(error).slice(0, 200) }, { level: 'warn' }); }
+    catch { /* Observation cannot change a recorded decision. */ }
+  }
+}
+
 /** Same bounded walk as the CTX1 hook: a marker at the git root is checked before stopping. */
 export function seatOfTree(cwd: string | undefined, cfg: Pick<OrchestratorLoopConfig, 'seatTrees'>): OrchestratorSeat | null {
   if (!cwd || !isAbsolute(cwd)) return null;
@@ -144,7 +189,24 @@ export function runTrafficTick({ processes, now, caps, openCells, nextRound, tot
   const advice = finishAdvice(metrics, TRAFFIC_SEATS.reduce((sum, seat) => sum + caps[seat], 0));
   const result = { ...trafficTick({ processes, now, caps, openCells, nextRound, totalSlots: totalSlots ?? advice.launchSlots }),
     finish: { metrics, advice } };
-  const queued = applyTraffic(result, { ...applyDeps, mode });
+  const root = applyDeps?.root ?? effectiveInstanceRoot();
+  const queued = applyTraffic(result, { ...applyDeps, root, mode });
+  {
+    const skipped: Record<string, number> = {};
+    const suppliedSeats = new Set(openCells.filter(cell => cell.status !== 'done').map(cell => cell.owner?.split('/')[0]));
+    for (const row of result.seats) {
+      const reason = !suppliedSeats.has(row.seat) ? 'no-supply' : row.running >= row.launchCap ? 'capacity'
+        : !row.idle ? 'not-idle' : undefined;
+      if (reason) skipped[reason] = (skipped[reason] ?? 0) + 1;
+    }
+    recordDispatchCycle(root, {
+      at: now.toISOString(), source: 'traffic', mode, runId: now.toISOString(),
+      supply: result.seats.filter(row => suppliedSeats.has(row.seat)).length,
+      capacity: result.seats.reduce((sum, row) => sum + Math.max(0, row.launchCap - row.running), 0),
+      eligible: result.seats.filter(row => row.idle && isLaunchEligible(row)).length,
+      skipped, dispatch: getUserConfig().loops?.orchestrator?.dispatch ?? ORCHESTRATOR_DEFAULTS.dispatch,
+    });
+  }
   let authorShadow: AuthorShadow | null = null;
   let shadowFailure: Record<string, unknown> | null = null;
   try {
@@ -187,6 +249,7 @@ if (import.meta.main) {
     const { result, queued, authorShadow } = runTrafficTick({
       processes, now, caps: cfg.seatCaps, openCells: listChecklist(version).items,
       ...(nextVersion ? { nextRound: listChecklist(nextVersion).items } : {}), mode: cfg.trafficMode,
+      applyDeps: { root: effectiveInstanceRoot() },
     });
     if (args.includes('--json')) console.log(JSON.stringify({ ...result, mode: cfg.trafficMode, queued, version, authorShadow }));
     else console.log(trafficLine(result, cfg.trafficMode));

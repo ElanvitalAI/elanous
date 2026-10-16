@@ -27,6 +27,12 @@ const stoppedGate = (): GraphRunState => run(['start', 'prepare', 'gate'], [...h
   { nodeId: 'gate', ok: false, executed: false, exit: null, error: STOPPED_NODE_ERROR, endedAt: '2026-10-12T00:10:00.000Z', startedAt: '2026-10-12T00:00:00.000Z', seconds: 600 }]);
 const gateThenFailed = (gate: Omit<SavedNode, 'nodeId'>): GraphRunState => run(['start', 'prepare', 'gate', 'failed'], [...head,
   { nodeId: 'gate', ok: false, executed: true, ...gate }, { nodeId: 'failed', ok: true, executed: false, exit: null }]);
+const gateThenTriaged = (gate: Omit<SavedNode, 'nodeId'>): GraphRunState => {
+  const state = gateThenFailed(gate);
+  state.path.splice(-1, 0, 'gate-triage');
+  state.nodes.splice(-1, 0, { nodeId: 'gate-triage', ok: true, executed: true, exit: 0 } as NodeRecord);
+  return state;
+};
 const gateOutput = (result: Record<string, unknown>) => `[gate] sweeping\n${JSON.stringify({ commit: 'a'.repeat(40), introduced: [], preexisting: 0, ...result })}\n`;
 const sweepIncomplete = () => gateThenFailed({ exit: 2, output: gateOutput({ outcome: 'error', verdict: 'fail',
   error: 'pod sweep incomplete: stalled shards 3, 7 (unmeasured: no test output within 600s of checkout — shards 3, 7)',
@@ -55,6 +61,20 @@ describe('resume --waive gate: only an unmeasured gate', () => {
     expect(waived?.unmeasured).toEndWith('· stalled shards 2 (no-output×1, exit-code×1) · finished shards measured pass 900 fail 4 errors 0 ran 904');
     expect(releaseResumeWaiver(gateThenFailed({ exit: 2, output: gateOutput({ outcome: 'error', error: 'sweep incomplete: no tests ran' }) }),
       { from: 'gate', waive: 'gate', reason: REASON })?.unmeasured).toBe('sweep incomplete: sweep incomplete: no tests ran');
+  });
+
+  test('a recorded release gate-triage shadow preserves unmeasured waiver and measured-gate refusal', () => {
+    const unmeasured = gateThenTriaged({ exit: null, output: '[gate] sweeping shard 4/12\n', error: 'SIGTERM' });
+    expect(releaseResumeWaiver(unmeasured, { from: 'gate', waive: 'gate', reason: REASON })?.unmeasured)
+      .toBe('no-verdict: gate process ended with exit null and no result line — SIGTERM');
+    const measured = gateThenTriaged({ exit: 1, output: gateOutput({ outcome: 'fail', introduced: ['src/a.test.ts > breaks'] }) });
+    expect(() => releaseResumeWaiver(measured, { from: 'gate', waive: 'gate', reason: REASON })).toThrow('cannot waive a safety');
+    // An arbitrary or unexecuted node between gate and failed is not the triage shadow.
+    unmeasured.path[3] = 'mac-smoke';
+    expect(gateUnmeasuredDetail(unmeasured, 2)).toBeUndefined();
+    unmeasured.path[3] = 'gate-triage';
+    unmeasured.nodes[3]!.executed = false;
+    expect(gateUnmeasuredDetail(unmeasured, 2)).toBeUndefined();
   });
 
   test('a measured gate failure (outcome fail · introduced > 0) is refused', () => {

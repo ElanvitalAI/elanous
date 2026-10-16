@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { loadSeatPack } from './seat-knowhow.js';
 import { Database } from 'bun:sqlite';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
@@ -28,6 +29,7 @@ import { recordSeatAskShadow } from '../seat-dispatch/seat-ask.js';
 import { appendSeatRequestRows, listSeatRequests, withSeatRequestLedgerLock } from '../seat-dispatch/seat-request-ledger.js';
 import { answerCrossCheck, answerSeat, askCrossCheck, askSeat, crossCheckAnswer, deliveredSeatQuestion, hasSeatAnswer, isSeatId, seatCrossChecks, seatQuestions, type CrossCheckJudgment, type SeatId } from '../seat-dispatch/seat-questions.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
+import { collectDraftMetrics, DRAFT_NEEDS_OWNER_SEAT_CAP, shouldHoldSeatNewLaunch, type DraftMetrics } from '../self-dev/draft-sweep.js';
 import { checklistHistory, listChecklist, type Checklist } from '../release-loop/checklist.js';
 import { readSchedules, releasedVersion } from '../release-loop/feature-store.js';
 import { runOpDecide, type OpDecideCandidate } from './op-decide.js';
@@ -74,6 +76,12 @@ export type SeatDeps = {
   now?: () => Date;
   read?: (path: string) => string;
   run?: (args: string[]) => Promise<string>;
+  /** Current open draft inventory for the launch seat; injected tests avoid live GitHub. */
+  draftMetrics?: (now: Date) => Promise<DraftMetrics>;
+  /** Explicit needs-owner hold gate — the hold is an autonomous-launch guard. The orchestrator launch
+   *  (loops/orchestrator/tick.ts) and the hook wake (hooks/dispatch.ts) pass true; tests assert this
+   *  option instead of inferring the boundary from which seams are injected. */
+  needsOwnerGate?: boolean;
   /** Seat-folder resolver for every process this loop starts; production reads the registry-validated `seats/<role>` view, tests inject an isolated folder. */
   launchSeat?: (seat: string) => string;
   enqueue?: (seat: string, text: string, root: string, idempotencyKey: string, item: SeatItem) => Promise<{ id: string }>;
@@ -614,7 +622,10 @@ export async function gatherSeatInputs(seat: string, deps: SeatDeps = {}, ledger
   for (const request of pending) {
     if (request.source === 'seat-question' && ownedEvidence) request.evidence = ownedEvidence;
   }
-  return { requests: pending, checklist, role: read(join(deps.repo ?? repoRoot, 'docs', 'roles', `${seat}.md`)).slice(0, 4_000) };
+  // SEAT-PACK-LOADER (RFC seat-knowhow §A3): full charter (4,000-char cut abolished) ⊕ knowhow 사실/참고 blocks, top-k on this turn's judgment items.
+  const pack = loadSeatPack(seat, [...pending, ...checklist].map((item) => `${item.title}\n${item.text ?? ''}`).join('\n'),
+    { repo: deps.repo ?? repoRoot, read, now: deps.now ?? (() => new Date()) });
+  return { requests: pending, checklist, role: pack.text };
 }
 
 /** OP-LOOP-DECIDE: filter open decision cards each OP turn. Shadow records; live decides/routes. A failure never blocks the turn. */
@@ -1500,7 +1511,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
       ? ledger.find((row) => row.status === 'awaiting-resolution' && row.item && itemKey(row.item) === itemKey(item))?.inquiry ?? null
       : unfinished?.inquiry ?? await (deps.inquire ?? (async (asking: SeatId, work: SeatItem) => { try {
       const output = JSON.parse((await run(['agent', '--json', '--no-tools',
-        `[${asking} 자리 · 역할 docs/roles/${asking}.md] 이 항목을 판단할 근거가 부족한 경우에만 다른 자리 또는 사람에게 질문한다. 근거가 충분하면 null. JSON 객체 하나만 반환: null 또는 {"to":"OP|TC|MK|UX|CEO","question":"필요한 근거를 묻는 질문"}. 항목: ${work.id} ${work.title}\n내용: ${work.text}\n역할: ${(deps.read ?? defaultRead)(join(deps.repo ?? repoRoot, 'docs', 'roles', `${asking}.md`)).slice(0, 4_000)}`])).trim()) as { reply?: unknown };
+        `[${asking} 자리 · 역할 docs/roles/${asking}.md] 이 항목을 판단할 근거가 부족한 경우에만 다른 자리 또는 사람에게 질문한다. 근거가 충분하면 null. JSON 객체 하나만 반환: null 또는 {"to":"OP|TC|MK|UX|CEO","question":"필요한 근거를 묻는 질문"}. 항목: ${work.id} ${work.title}\n내용: ${work.text}\n역할: ${loadSeatPack(asking, `${work.title}\n${work.text}`, { repo: deps.repo ?? repoRoot, read: deps.read ?? defaultRead, now: () => now }).text}`])).trim()) as { reply?: unknown };
       const value: unknown = typeof output?.reply === 'string' ? JSON.parse(output.reply) : output;
       if (value === null) return null;
       if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid seat inquiry');
@@ -1696,6 +1707,34 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
   }
   const action = planned!;
   if (action.kind === 'harness') {
+    // A count is observation until the dispatch boundary uses it. Do not enqueue or call harness say for an over-cap seat.
+    // NEEDS-OWNER-BOUNDARY: the hold is an autonomous-launch guard — the orchestrator launch
+    // (loops/orchestrator/tick.ts) and the hook wake (hooks/dispatch.ts) opt in via deps.needsOwnerGate;
+    // tests assert the option instead of inferring the boundary from which seams are injected.
+    if (deps.needsOwnerGate ?? false) {
+      let metrics: DraftMetrics | undefined;
+      try {
+        metrics = await (deps.draftMetrics ?? (async (clock: Date) => {
+          const [{ resolveRepositoryName }, { githubDraftSweepAdapters }] = await Promise.all([
+            import('../harness/repository-name.js'), import('../harness/harness-cli-command.js'),
+          ]);
+          return collectDraftMetrics(resolveRepositoryName({}), githubDraftSweepAdapters(), clock);
+        }))(now);
+        if (!metrics.needsOwnerBySeat) throw new Error('per-seat draft inventory missing');
+      } catch (error) {
+        // NEEDS-OWNER-POLICY: an unreadable census — gh unavailable, rate-limited, or one unreadable
+        // claim comment — is unobserved, not failed-closed. Unobserved input never holds the seat's
+        // dispatch; only an observed count over the cap does. The next loop pass re-collects.
+        observe('launch-needs-owner-unobserved', { seat, item: item.id, reason: String(error).slice(0, 140) });
+      }
+      if (metrics && shouldHoldSeatNewLaunch(seat, metrics.needsOwnerBySeat ?? {})) {
+        entry.status = 'wait';
+        entry.reason = `needs-owner ${seat}: ${metrics.needsOwnerBySeat?.[seat]} > ${DRAFT_NEEDS_OWNER_SEAT_CAP}`;
+        append(path, entry);
+        observe('launch-held-needs-owner', { seat, item: item.id, count: metrics.needsOwnerBySeat?.[seat] });
+        return entry;
+      }
+    }
     const launchedRunIds = new Set(ledger.flatMap((row) => row.seat === seat && row.status === 'launched' && row.runId ? [row.runId] : []));
     let running: readonly RunningSeatPod[] = [];
     let observationUnavailable = false;

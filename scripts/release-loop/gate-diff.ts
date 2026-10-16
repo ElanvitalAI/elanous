@@ -12,7 +12,7 @@ export function parseFailures(output: string): string[] {
     const line = raw.trim();
     const header = /^(?:\.\/)?((?:[\w.-]+\/)+[\w.-]+\.test\.tsx?):(?:\s|$)/.exec(line);
     if (header) { file = header[1]; continue; }
-    const failed = /\(fail\)\s+(.+?)(?:\s+\[[\d.]+(?:ms|s)\])?$/.exec(line);
+    const failed = /^\(fail\)[ \t]+(.+?)(?:[ \t]+\[[\d.]+(?:ms|s)\])?$/.exec(line);
     if (failed && file) failures.add(`${file} > ${failed[1]!.trim()}`);
   }
   return [...failures].sort();

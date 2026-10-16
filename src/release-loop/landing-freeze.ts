@@ -36,6 +36,11 @@ export function readLandingFreeze(root = effectiveInstanceRoot(), now = new Date
   return { ...freeze, holdLaunches: freeze.holdLaunches ?? false } as LandingFreeze;
 }
 
+/** Interpret a validated, expiry-aware read without reading the freeze file twice. */
+export function landingFreezeState(freeze: LandingFreeze | null): 'on' | 'off' {
+  return freeze === null ? 'off' : 'on';
+}
+
 export function enableLandingFreeze(opts: { reason?: string; until?: string; by?: string; holdLaunches?: boolean }, root = effectiveInstanceRoot(), now = new Date()): LandingFreeze {
   const until = opts.until === undefined ? null : opts.until;
   if (until !== null && (!/^\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:\.\d+)?)?(?:Z|[+-]\d\d:\d\d)$/.test(until) || !Number.isFinite(Date.parse(until)) || Date.parse(until) <= now.getTime())) {

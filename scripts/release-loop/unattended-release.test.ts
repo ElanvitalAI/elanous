@@ -1,10 +1,24 @@
-import { expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, beforeEach, expect, test } from 'bun:test';
+import { closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { dlopen, FFIType } from 'bun:ffi';
 import { buildReleaseRunInput, latestPublishedPreviousVersion, runUnattendedRelease } from './unattended-release.js';
 import { parseOptions } from './gate-node.js';
 import { enableLandingFreeze, disableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
+import { opSeatFlockPath } from '../../src/steward/resync-tick.js';
+
+const instanceRoots: string[] = [];
+beforeEach(() => {
+  const root = mkdtempSync(join(tmpdir(), 'unattended-instance-'));
+  instanceRoots.push(root);
+  setElanousConfigDir(root);
+});
+afterEach(() => {
+  resetElanousConfigDir();
+  for (const dir of instanceRoots.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 
 function fixture(body: (root: string) => void) {
   const root = mkdtempSync(join(tmpdir(), 'unattended-release-'));
@@ -142,18 +156,20 @@ test('RELEASE-REHEARSAL-RC: --prerelease rc numbers the next free rc, skips the 
 
 test('GATE-MEM-ADMIT: release.loop.gatePodAdmissionWaitSeconds becomes graph input, and the gate reads it as the shard admission bound', () => fixture((root) => {
   record(root, '0.2.98', { version: '0.2.98', publishedAt: 'now' });
-  const input = buildReleaseRunInput('0.2.99', { ledgerRoot: root, config: { gatePodPool: 'pool-x@h:1', gatePodAdmissionWaitSeconds: 45 } });
-  expect(input).toMatchObject({ gatePodPool: 'pool-x@h:1', gatePodAdmissionWaitSeconds: 45 });
+  const input = buildReleaseRunInput('0.2.99', { ledgerRoot: root, config: { gatePodPool: 'pool-x@h:1', gatePodAdmissionWaitSeconds: 45, gatePodIsolationConcurrency: 2, gateRecheckFileLimit: 128 } });
+  expect(input).toMatchObject({ gatePodPool: 'pool-x@h:1', gatePodAdmissionWaitSeconds: 45, gatePodIsolationConcurrency: 2, gateRecheckFileLimit: 128 });
   const context = join(root, 'graph-context.json');
   writeFileSync(context, JSON.stringify({ input, outputs: {} }));
   const opts = parseOptions(['--json'], { ELANOUS_GRAPH_CONTEXT: context });
   if (opts === 'help') throw new Error('unexpected help');
-  expect(opts.pod).toMatchObject({ pool: 'pool-x@h:1', admissionWaitSeconds: 45 });
+  expect(opts.pod).toMatchObject({ pool: 'pool-x@h:1', admissionWaitSeconds: 45, isolationConcurrency: 2 });
+  expect(opts.recheckFileLimit).toBe(128);
   // Omitted config: no bound reaches the gate, which then uses GATE_ADMISSION_WAIT_SECONDS_DEFAULT.
   writeFileSync(context, JSON.stringify({ input: buildReleaseRunInput('0.2.99', { ledgerRoot: root, config: { gatePodPool: 'pool-x@h:1' } }), outputs: {} }));
   const plain = parseOptions(['--json'], { ELANOUS_GRAPH_CONTEXT: context });
   if (plain === 'help') throw new Error('unexpected help');
   expect(plain.pod?.admissionWaitSeconds).toBeUndefined();
+  expect(plain.recheckFileLimit).toBeUndefined();
 }));
 
 test('GATE-SPEED A3①: release.loop.gatePodCpu becomes graph input gatePodCpu, and the gate reads it as shard cpu request/limit', () => fixture((root) => {
@@ -171,3 +187,95 @@ test('GATE-SPEED A3①: release.loop.gatePodCpu becomes graph input gatePodCpu, 
   if (plain === 'help') throw new Error('unexpected help');
   expect(plain.pod?.cpu).toBeUndefined();
 }));
+
+function tryNonBlockingFlock(path: string): (() => void) | null {
+  const libc = process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6';
+  const lib = dlopen(libc, { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } });
+  const flock = lib.symbols.flock as (fd: number, op: number) => number;
+  const fd = openSync(path, constants.O_RDWR | constants.O_NOFOLLOW);
+  if (flock(fd, 2 | 4) !== 0) { closeSync(fd); return null; }
+  return () => { try { flock(fd, 8); } finally { closeSync(fd); } };
+}
+
+test('runUnattendedRelease acquires the shared OP-seat flock for HEAD, index, and workfile mutation and releases it on every exit', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'unattended-flock-'));
+  setElanousConfigDir(root);
+  try {
+    record(root, '0.2.3', { version: '0.2.3', publishedAt: 'now' });
+    let heldDuringGraph = false;
+    const deps = { ledgerRoot: root, config: { gatePodPool: 'pool' },
+      checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+      graph: async () => {
+        heldDuringGraph = tryNonBlockingFlock(opSeatFlockPath(root)) === null;
+        return { status: 'done' } as never;
+      } };
+    const run = await runUnattendedRelease({ version: '0.2.4' }, deps);
+    expect(run).toMatchObject({ dryRun: false, state: { status: 'done' } });
+    expect(heldDuringGraph).toBe(true);
+    const after = tryNonBlockingFlock(opSeatFlockPath(root));
+    expect(after).not.toBeNull();
+    after!();
+    let heldDuringReject = false;
+    await expect(runUnattendedRelease({ version: '0.2.4' }, { ...deps, checklist: () => {
+      heldDuringReject = tryNonBlockingFlock(opSeatFlockPath(root)) === null;
+      return { ok: false, red: ['K13'], undecided: [], blocked: [], moved: [], knownIssues: [] };
+    } })).rejects.toThrow('K13');
+    expect(heldDuringReject).toBe(true);
+    const afterReject = tryNonBlockingFlock(opSeatFlockPath(root));
+    expect(afterReject).not.toBeNull();
+    afterReject!();
+  } finally {
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a dry run neither creates nor needs the OP-seat lock: an unusable lock path does not fail the preview', async () => {
+  const seatRoot = mkdtempSync(join(tmpdir(), 'unattended-dry-seat-'));
+  const ledger = mkdtempSync(join(tmpdir(), 'unattended-dry-ledger-'));
+  setElanousConfigDir(seatRoot);
+  try {
+    record(ledger, '0.2.3', { version: '0.2.3', publishedAt: 'now' });
+    // A directory where the lock file belongs: any acquisition attempt would fail.
+    mkdirSync(opSeatFlockPath(), { recursive: true });
+    let graphCalls = 0;
+    const preview = await runUnattendedRelease({ version: '0.2.4', dryRun: true }, { ledgerRoot: ledger, config: { gatePodPool: 'pool' },
+      graph: async () => { graphCalls++; return { status: 'done' } as never; } });
+    expect(preview).toMatchObject({ dryRun: true, input: { version: '0.2.4', previousVersion: '0.2.3' } });
+    expect(graphCalls).toBe(0);
+    expect(existsSync(join(ledger, 'steward'))).toBe(false);
+    // The same unusable lock refuses a real run before any graph mutation.
+    await expect(runUnattendedRelease({ version: '0.2.4' }, { ledgerRoot: ledger, config: { gatePodPool: 'pool' },
+      checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+      graph: async () => { graphCalls++; return { status: 'done' } as never; } })).rejects.toThrow();
+    expect(graphCalls).toBe(0);
+  } finally {
+    resetElanousConfigDir();
+    rmSync(seatRoot, { recursive: true, force: true });
+    rmSync(ledger, { recursive: true, force: true });
+  }
+});
+
+test('an injected ledger root different from the OP-seat root still locks the one shared OP-seat lock file', async () => {
+  const seatRoot = mkdtempSync(join(tmpdir(), 'unattended-seat-'));
+  const ledger = mkdtempSync(join(tmpdir(), 'unattended-ledger-'));
+  setElanousConfigDir(seatRoot);
+  try {
+    record(ledger, '0.2.3', { version: '0.2.3', publishedAt: 'now' });
+    let sharedHeld = false;
+    const run = await runUnattendedRelease({ version: '0.2.4' }, { ledgerRoot: ledger, config: { gatePodPool: 'pool' },
+      checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+      graph: async () => {
+        sharedHeld = tryNonBlockingFlock(opSeatFlockPath()) === null;
+        return { status: 'done' } as never;
+      } });
+    expect(run).toMatchObject({ dryRun: false, state: { status: 'done' } });
+    expect(sharedHeld).toBe(true);
+    expect(opSeatFlockPath()).toBe(join(seatRoot, 'steward', 'op-seat.flock'));
+    expect(existsSync(join(ledger, 'steward', 'op-seat.flock'))).toBe(false);
+  } finally {
+    resetElanousConfigDir();
+    rmSync(seatRoot, { recursive: true, force: true });
+    rmSync(ledger, { recursive: true, force: true });
+  }
+});

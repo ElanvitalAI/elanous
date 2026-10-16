@@ -6,6 +6,7 @@ import { POD_GITHUB_CREDENTIAL_TOKEN_ENV, POD_GITHUB_CREDENTIAL_URL_ENV } from '
 import { ghAutomationEnv, defaultCmdRunner, makePrManager, extractPrNumber, resolveDeliverableBase, prBaseFromComparison, collectLandedCommitsOnBase, landingHistoryGitLogArgs, type CmdRunner, type CmdResult } from './pr-manager.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE } from '../git-fs/worktree.js';
 import { debug } from '../debug/log.js';
+import { guardNewPr } from '../pr-tool/census.js';
 
 /** 호출 기록 + 프로그램된 응답을 주는 스텁 러너. */
 function stubRunner(responses: Record<string, CmdResult> = {}): { run: CmdRunner; calls: string[][] } {
@@ -187,6 +188,70 @@ describe('makePrManager.upsertPr — 기존 PR 재활용(대표 2026-07-12)', ()
     commitMessage: 'm', excludePaths: ['node_modules', 'apps/pwa/out'], reuseComment: '🔄 재구현',
   };
 
+  it('하니스 신규 PR 생성 직전 공유 open-guard 거부를 적용하고 gh pr create 를 부르지 않는다', () => {
+    const { run, calls } = stubRunner({ 'pr list': { ok: true, out: '' } });
+    let checked = 0;
+    const result = makePrManager(run, () => {
+      checked += 1;
+      return guardNewPr({ files: ['docs/goals/GOAL-only.md'] }, { status: 'checked', prs: [] });
+    }).upsertPr(input);
+    expect(checked).toBe(1);
+    expect(result).toMatchObject({ ok: false, reason: 'guard', detail: expect.stringContaining('goal-only') });
+    expect(calls.some(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toBe(false);
+  });
+
+  it('하니스 호출자 seat 를 신규 PR 라벨에 남긴다', () => {
+    const { run, calls } = stubRunner({ 'pr list': { ok: true, out: '' }, 'pr create': { ok: true, out: 'https://github.com/o/r/pull/91' } });
+    const result = makePrManager(run, () => ({ status: 'allow', reasons: [], warnings: [] })).upsertPr({ ...input, seat: 'UX' });
+    expect(result).toMatchObject({ ok: true, reused: false });
+    expect(calls.find(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toContain('seat:UX');
+  });
+
+  it('열린 PR 조회 불가 세 번은 unmeasured 라벨로 진행하고 네 번째는 새 PR을 차단한다', () => {
+    const { run, calls } = stubRunner({ 'pr list': { ok: true, out: '' }, 'pr create': { ok: true, out: 'https://github.com/o/r/pull/91' } });
+    let count = 0;
+    const guard = () => guardNewPr({ files: ['src/new.ts'], seat: 'UX' }, { status: 'unknown', reason: 'network' });
+    const manager = makePrManager(run, guard, () => ({ count: ++count, blocked: count > 3 }));
+    for (let attempt = 0; attempt < 3; attempt++) {
+      expect(manager.upsertPr({ ...input, seat: 'UX' })).toMatchObject({ ok: true });
+    }
+    const create = calls.find(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create');
+    expect(create).toContain('pr-guard:unmeasured');
+    expect(manager.upsertPr({ ...input, seat: 'UX' })).toMatchObject({ ok: false, reason: 'guard', detail: expect.stringContaining('차단') });
+    expect(calls.filter(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toHaveLength(3);
+    expect(calls.some(call => call[0] === 'eln' && call[1] === 'msg' && call[2] === 'post')).toBe(true);
+  });
+
+  it('seat 미상인 네 번째 조회 실패도 HARNESS 신원으로 OP에 알린다', () => {
+    const { run, calls } = stubRunner({ 'pr list': { ok: true, out: '' } });
+    const guard = () => guardNewPr({ files: ['src/new.ts'] }, { status: 'unknown', reason: 'network' });
+    const result = makePrManager(run, guard, () => ({ count: 4, blocked: true })).upsertPr(input);
+    expect(result).toMatchObject({ ok: false, reason: 'guard' });
+    const alert = calls.find(call => call[0] === 'eln' && call[1] === 'msg' && call[2] === 'post');
+    expect(alert).toContain('HARNESS');
+  });
+
+  it('Pod의 로컬 원장·우편에는 미측정을 쓰지 않고 경고 라벨과 이벤트로 진행한다', () => {
+    const before = process.env.ELANOUS_POD_NAME;
+    process.env.ELANOUS_POD_NAME = 'test-pod';
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const { run, calls } = stubRunner({ 'pr list': { ok: true, out: '' }, 'pr create': { ok: true, out: 'https://github.com/o/r/pull/91' } });
+      let recorded = 0;
+      const guard = () => guardNewPr({ files: ['src/new.ts'] }, { status: 'unknown', reason: 'network' });
+      const result = makePrManager(run, guard, () => { recorded += 1; return { count: 4, blocked: true }; }).upsertPr({ ...input, seat: 'UX' });
+      expect(result).toMatchObject({ ok: true, reused: false });
+      expect(recorded).toBe(0);
+      expect(calls.find(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toContain('pr-guard:unmeasured');
+      expect(calls.some(call => call[0] === 'eln' && call[1] === 'msg')).toBe(false);
+      expect(log).toHaveBeenCalledWith('pr-tool.open-guard', 'pod-unmeasured', expect.objectContaining({ seat: 'UX' }));
+    } finally {
+      log.mockRestore();
+      if (before === undefined) delete process.env.ELANOUS_POD_NAME;
+      else process.env.ELANOUS_POD_NAME = before;
+    }
+  });
+
   it('기존 PR 있으면 재사용(reused=true)·force-push·코멘트, 새로 안 만듦', () => {
     const { run, calls } = stubRunner({ 'pr list': { ok: true, out: 'https://github.com/o/r/pull/9' } });
     const r = makePrManager(run).upsertPr(input);
@@ -199,6 +264,14 @@ describe('makePrManager.upsertPr — 기존 PR 재활용(대표 2026-07-12)', ()
     expect(editCall).toEqual(['gh', 'pr', 'edit', 'https://github.com/o/r/pull/9', '--title', '[SE] x', '--body', 'b', '--base', 'main']);
     expect(flat.some((c) => c.includes('pr create'))).toBe(false); // 새로 안 만듦
     expect(flat.some((c) => c.includes('pr comment') && c.includes('재구현'))).toBe(true); // 재사용 코멘트
+  });
+
+  it('기존 PR 재사용은 호출자 seat 라벨로 소유를 바꾸지 않는다', () => {
+    const { run, calls } = stubRunner({ 'pr list': { ok: true, out: 'https://github.com/o/r/pull/9' } });
+    expect(makePrManager(run).upsertPr({ ...input, seat: 'UX' })).toMatchObject({ ok: true, reused: true });
+    const edit = calls.find(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'edit');
+    expect(edit).not.toContain('seat:UX');
+    expect(calls.filter(call => call[0] === 'gh' && call[1] === 'label' && call[2] === 'create')).toHaveLength(0);
   });
 
   it('재사용 시 base·labels 반영 + draft=false 이고 현재 draft 면 ready 로 승격', () => {

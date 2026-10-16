@@ -70,6 +70,34 @@ export function getModelFamily(modelId: string | undefined): ModelFamily {
   return 'other';
 }
 
+/** gpt-6 세대 모델인가 — 직결 id(`gpt-6-sol` · `gpt-6-luna` · `gpt-6-astra` …)와 OpenRouter 게이트웨이 id
+ *  (`openrouter/openai/gpt-6-*`) 둘 다. 판정은 «모델 이름»만 본다(구동기 무관): 아래 가드는 모델의 도구 호출
+ *  «행동»에 묶인 것이라 같은 모델이면 어느 경로로 오든 같아야 한다. 맨 `openai/...` id 는 getModelFamily 와 같은
+ *  이유(LM Studio 이름 꼴)로 건드리지 않는다. */
+export function isGpt6GenerationModel(modelId: string | undefined): boolean {
+  if (!modelId) return false;
+  let m = modelId.toLowerCase();
+  if (m.startsWith(OPENROUTER_OPENAI_PREFIX)) m = m.slice(OPENROUTER_OPENAI_PREFIX.length);
+  return m.startsWith('gpt-6');
+}
+
+/** TUI-GPT6-GUARD-PARITY (2026-10-16) — codex 계열 «모델 행동» 도구 루프 가드를 켤 모델인가. 단일 원천.
+ *
+ *  🩸 계기(tui-op-issues #61): getModelFamily 는 `gpt-5*`·이름에 `codex` 만 'codex' 로 보내서 운영 기본
+ *  `gpt-6-sol`(·luna)이 'gpt' 로 떨어졌고, llm.ts 의 `modelFamily === 'codex'` 가드가 전부 꺼져 있었다.
+ *  ⛔ getModelFamily 자체를 바꾸지 않는다 — gpt-6 은 'gpt' 칸으로 전용 프롬프트(gpt6-family-addendum ·
+ *  GPT_CHAT_VARIANT · tool-hint 상한)를 받고 있고, 'codex' 로 옮기면 그것을 잃고 codex 프롬프트·도구 모양·
+ *  예산 칸까지 딸려 간다. 그래서 «가드만» 이 술어로 넓힌다.
+ *
+ *  이 술어로 가는 자리(모델 행동 · 넓힘): llm.ts 탐색 리다이렉트 묶음(W4-anchor · W6-A · W4-A · W5-D · W5-A)
+ *  ⊕ 그 Read 계수 ⊕ hard-stop 강제 종합(W5-E) ⊕ 예산 소진 강제 종합(W5-F).
+ *  일부러 안 넓힌 자리(`modelFamily === 'codex'` 유지 · 근거 없음/정책/구동기 축)는 PR 본문 표 참조:
+ *  즉시 hard-stop 셋 · auto-narrow/inspect 예산 · narrowing 문턱 · W5-G 조기 종합 · 최대 턴 예산 칸 ·
+ *  탐색 면제 · 유휴 감시(구동기 축이 이미 덮음) · codex 도구 모양(eval) · 프롬프트 변형. */
+export function usesCodexBehaviorGuards(modelId: string | undefined): boolean {
+  return getModelFamily(modelId) === 'codex' || isGpt6GenerationModel(modelId);
+}
+
 // ── Model tier (session 21) ─────────────────────────────────────────
 //
 // Coarse 3-tier classification used by the skill router to decide if

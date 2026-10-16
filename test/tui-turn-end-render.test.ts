@@ -2,7 +2,6 @@
 // 실제 `startPinnedThinking` ⊕ `finalizeDashboardTurn` 을 실제 plain-turn 런타임에 물려 갈래마다
 // footer 가 비워지고 «Thinking…» 프레임이 다시 칠해지지 않는지 잰다.
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { goalLoopIterationThinking } from '../src/dashboard/goal-loop-thinking.js';
 import { startPinnedThinking, type ThinkingHandle } from '../src/thinking-line.js';
 import { finalizeDashboardTurn } from '../src/dashboard/turn-finalize-runtime.js';
@@ -11,6 +10,7 @@ import {
   type DashboardChatMainPlainTurnRuntimeDeps,
 } from '../src/dashboard/input/chat-main-plain-turn-runtime.js';
 import { CoreTurnAuthRejectedError, AUTH_REJECTED_NOTICE } from '../src/core-turn/auth-rejected-notice.js';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
 const strip = (s: string | null): string => (s ?? '').replace(/\x1b\[[0-9;]*m/g, '');
 
@@ -150,7 +150,7 @@ describe('/goal 반복 진행 표시 (#5 · 리뷰 r1 지적: 루프가 끝난 �
   }
 
   test('대시보드 소스 — 손잡이 선택은 do 머리(제출 전)에만 있고, 루프 꼬리(상한·판정 뒤)에는 새 표시가 없다', () => {
-    const source = readFileSync(new URL('../src/dashboard/index.ts', import.meta.url), 'utf8');
+    const source = tuiSourceText();
     const loopStart = source.indexOf('let goalLoopIteration = 0;');
     const loopEnd = source.indexOf('} while (goalLoopUserText !== null);', loopStart);
     expect(loopStart).toBeGreaterThan(0);

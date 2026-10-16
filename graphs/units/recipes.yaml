@@ -1,0 +1,3 @@
+plan:
+  command: 'bun scripts/release-loop/gate-recheck-plan-node.ts'
+  timeout_ms: 60000

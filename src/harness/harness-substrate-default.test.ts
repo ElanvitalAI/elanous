@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { Command } from 'commander';
 import { buildUserConfig, getUserConfig, saveUserConfig, setUserConfigOverlay, type UserConfig } from '../user-config.js';
 import * as podDispatch from './harness-pod-dispatch.js';
-import { AUTO_LOCAL_MIN_AVAILABLE_MEMORY_BYTES, checkHarnessPodPool, harnessLaunchPolicyConfig, nextLocalLaneCap, resolveHarnessSubstrate, routeAutoSubstrate } from './harness-substrate-default.js';
+import { AUTO_LOCAL_MIN_AVAILABLE_MEMORY_BYTES, checkHarnessPodPool, harnessLaunchPolicyConfig, nextLocalLaneCap, readAutoSubstrateSignals, resolveHarnessSubstrate, routeAutoSubstrate } from './harness-substrate-default.js';
 import { debug } from '../debug/log.js';
 import { devAskPodDispatchInput } from './harness-substrate-default.js';
 import { installHarnessCliCommand } from './harness-cli-command.js';
@@ -415,6 +415,94 @@ describe('next local lane cap', () => {
 });
 
 describe('auto substrate routing', () => {
+  test('collector reads injected launch-host measurements, Pod admission and local lane', () => {
+    const calls: string[] = [];
+    const signals = readAutoSubstrateSignals({
+      loadavg: () => { calls.push('loadavg'); return [3, 4, 5]; },
+      cpus: () => { calls.push('cpus'); return Array(8).fill({}) as ReturnType<typeof import('node:os').cpus>; },
+      freemem: () => { calls.push('freemem'); return AUTO_LOCAL_MIN_AVAILABLE_MEMORY_BYTES; },
+      podAdmission: () => { calls.push('podAdmission'); return { recommended: 0, limitedBy: 'memory' }; },
+      localLaneOpen: () => { calls.push('localLaneOpen'); return true; },
+    });
+    expect(signals).toEqual(spareHost);
+    expect(calls).toEqual(['podAdmission', 'loadavg', 'cpus', 'freemem', 'localLaneOpen']);
+    expect(routeAutoSubstrate(signals)).toEqual({ substrate: 'local', reason: 'pod-memory-blocked-local-spare' });
+  });
+
+  test('unavailable or throwing Pod admission remains unobserved, and local lane defaults closed', () => {
+    const host = {
+      loadavg: () => [3, 4, 5],
+      cpus: () => Array(8).fill({}) as ReturnType<typeof import('node:os').cpus>,
+      freemem: () => AUTO_LOCAL_MIN_AVAILABLE_MEMORY_BYTES,
+    };
+    for (const podAdmission of [() => null, () => { throw new Error('unreachable'); },
+      () => ({ recommended: null, limitedBy: null })] as const) {
+      const signals = readAutoSubstrateSignals({ ...host, podAdmission });
+      expect(signals).toEqual({ ...spareHost, podAdmission: null, localLaneOpen: false });
+      expect(routeAutoSubstrate(signals)).toEqual({ substrate: 'pod', reason: 'pod-admission-unobserved' });
+    }
+  });
+
+  test('resolve collects once only for auto without supplied signals and logs the collected payload', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    let calls = 0;
+    const readAutoSignals = () => { calls++; return spareHost; };
+    const args = { config: config('pod', 'cfg'), env: {}, currentContext: context, readAutoSignals };
+    try {
+      expect(resolveHarnessSubstrate({ ...args, flag: { substrate: 'auto' } }))
+        .toEqual({ substrate: 'local', pool: null, source: 'flag' });
+      expect(calls).toBe(1);
+      expect(log).toHaveBeenCalledWith('harness.substrate', 'auto-signals', spareHost);
+      expect(resolveHarnessSubstrate({ ...args, flag: { substrate: 'auto' }, autoSignals: { ...spareHost, localLaneOpen: false } }))
+        .toEqual({ substrate: 'pod', pool: 'cfg', source: 'flag' });
+      expect(calls).toBe(1);
+      expect(resolveHarnessSubstrate({ ...args, flag: { substrate: 'pod' } })).toEqual({ substrate: 'pod', pool: 'cfg', source: 'flag' });
+      expect(resolveHarnessSubstrate({ ...args, flag: { substrate: 'local' } })).toEqual({ substrate: 'local', pool: null, source: 'flag' });
+      expect(calls).toBe(1);
+      expect(log.mock.calls.filter(([category, event]) => category === 'harness.substrate' && event === 'auto-signals')).toHaveLength(1);
+    } finally { log.mockRestore(); }
+  });
+
+  test('default collector measures the selected flag pool, not the configured pool, and logs its admission', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const measured: string[][] = [];
+    const gi = 1024 ** 3;
+    const measurePoolLease = ((members: Parameters<typeof import('../task-orchestrator/surfaces/pod-lease.js').measurePoolLease>[0], options: { measureUsage?: boolean; skipDnsProbe?: boolean }) => {
+      measured.push(members.map((m) => m.context));
+      expect(options).toEqual({ measureUsage: true, skipDnsProbe: true });
+      return { members: members.map((m) => ({
+        context: m.context, capacity: m.capacity, running: 0, pending: 0, unleasedRunning: 0,
+        memoryLimitBytes: 0, allocatableMemoryBytes: m.context === 'flag-pool' ? 8 * gi : 32 * gi,
+        allocatableCpuMillicores: 8_000,
+        availableMemoryByNodeBytes: [m.context === 'flag-pool' ? 8 * gi : 32 * gi], reason: null,
+      })) };
+    }) as typeof import('../task-orchestrator/surfaces/pod-lease.js').measurePoolLease;
+    const deps = {
+      loadavg: () => [3, 4, 5],
+      cpus: () => Array(8).fill({}) as ReturnType<typeof import('node:os').cpus>,
+      freemem: () => AUTO_LOCAL_MIN_AVAILABLE_MEMORY_BYTES,
+      measurePoolLease,
+    };
+    try {
+      const args = { config: { harness: { substrate: 'auto' as const, podPool: 'default-pool:8' } }, env: {},
+        currentContext: () => { throw new Error('explicit pool should not read context'); }, autoReadDeps: deps };
+      expect(resolveHarnessSubstrate({ ...args, flag: { substrate: 'auto', podPool: 'flag-pool:8' } }))
+        .toEqual({ substrate: 'pod', pool: 'flag-pool:8', source: 'flag' });
+      expect(measured).toEqual([['flag-pool']]);
+      expect(log).toHaveBeenCalledWith('harness.substrate', 'auto-signals', {
+        load1: 3, cores: 8, availableMemoryBytes: AUTO_LOCAL_MIN_AVAILABLE_MEMORY_BYTES,
+        podAdmission: { recommended: 0, limitedBy: 'memory' }, localLaneOpen: false,
+      });
+      log.mockClear();
+      expect(resolveHarnessSubstrate(args)).toEqual({ substrate: 'pod', pool: 'default-pool:8', source: 'config' });
+      expect(measured).toEqual([['flag-pool'], ['default-pool']]);
+      expect(log).toHaveBeenCalledWith('harness.substrate', 'auto-signals', {
+        load1: 3, cores: 8, availableMemoryBytes: AUTO_LOCAL_MIN_AVAILABLE_MEMORY_BYTES,
+        podAdmission: { recommended: 2, limitedBy: 'memory' }, localLaneOpen: false,
+      });
+    } finally { log.mockRestore(); }
+  });
+
   test('real lease recommendation limited by memory feeds auto routing', () => {
     const gi = 1024 ** 3;
     const measure: PoolLeaseMeasure = { members: [{

@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { readFileSync } from 'node:fs';
 import { resolveMainRepoRoot, type HarnessWorktreeCommand } from '../git-fs/worktree.js';
 import { goalTitleFromDocument } from '../self-implement/seams.js';
@@ -25,7 +26,7 @@ interface DevWorktreeGoal {
 }
 
 function git(cwd: string, args: string[]): string {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   if (result.status !== 0) {
     const message = (result.stderr || result.stdout || '').trim() || `git exited ${result.status}`;
     throw new Error(`dev auto-worktree inspection failed — ${message}`);

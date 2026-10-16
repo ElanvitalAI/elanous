@@ -2,6 +2,7 @@ import { debug } from '../debug/log.js';
 import { listChecklist, setItemIfSnapshot, type Checklist } from '../release-loop/checklist.js';
 import { judgeLandedCell, parseJudgeSignals, type GreenVerdict } from '../release-loop/landed-to-green.js';
 import { cardPrNumber, readTaskAgentState, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
+import { isGoalOnlyPr } from './judge.js';
 
 export interface LandedTaskPr { number: number; url: string; headRefOid: string; state: string; baseRefName: string; mergedAt: string; files?: Array<{ path: string }> }
 export interface PostlandDeps {
@@ -32,6 +33,10 @@ export function candidateMergedTaskCells(number: number, statePath = taskAgentSt
 export function closeMergedTaskCard(pr: LandedTaskPr, cwd: string, deps: PostlandDeps): string | null {
   const log = deps.log ?? debug.log.bind(debug);
   if (pr.state !== 'MERGED' || pr.baseRefName !== 'main' || !/^[a-f0-9]{40}$/i.test(pr.headRefOid) || !pr.url) return null;
+  if (isGoalOnlyPr(pr.files?.map((file) => file.path))) {
+    log('task-agent', 'postland-card-skipped', { pr: pr.number, reason: 'goal-only-pr', targetDiff: 0 });
+    return null;
+  }
   const path = deps.statePath ?? taskAgentStatePath();
   const tasks = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(path).tasks ?? {};
   const cards = Object.values(tasks).filter((card) => card.taLand && card.checklistId && cardPrNumber(card) === pr.number

@@ -32,6 +32,7 @@ import { resolveDashboardChatMainSlashCommand } from '../input/chat-main-slash-c
 import { createDashboardLogWidgetRuntime } from '../log-widget-runtime.js';
 import type { LogSurfaceStateContract } from '../../widgets/contracts/log-surface.js';
 import { checkSlashCatalogBaseline } from './registry.js';
+import type { LoopScheduler } from '../loop-scheduler.js';
 import type { dashboardLoops } from '../../domains/dashboard-data.js';
 
 type AskLaunchInput = {
@@ -1255,4 +1256,166 @@ test('restoring a removed listed-only name fails the catalog baseline by that na
     DASHBOARD_SLASH_CATALOG_BASELINE,
   );
   expect(restored.violations).toContain('listed-only: keys');
+});
+
+test('/loop <간격> <프롬프트> drives the idle-gated scheduler; /loop stop halts it', async () => {
+  const registry = buildDashboardSlashRegistry();
+  const lines: string[] = [];
+  const submitted: string[] = [];
+  let idle = true;
+  const schedulerRef: { current: LoopScheduler | null } = { current: null };
+  const ctx = createContext(lines);
+  ctx.loopCommand = {
+    isIdle: () => idle,
+    submitPrompt: (prompt) => { submitted.push(prompt); },
+    schedulerRef,
+  };
+
+  // 빈 인자는 usage 로 답하고 아무것도 쏘지 않는다.
+  await registry.dispatch('loop', [], ctx);
+  expect(lines.join('\n')).toContain('usage: /loop <간격> <프롬프트>');
+  expect(submitted).toEqual([]);
+  expect(schedulerRef.current).toBeNull();
+
+  // start on /loop — 시작 자체는 발사가 아니고, 스케줄러가 돈다.
+  await registry.dispatch('loop', ['2', '가', '볼까'], ctx);
+  const scheduler = schedulerRef.current;
+  expect(scheduler?.isRunning()).toBe(true);
+  expect(submitted).toEqual([]);
+  expect(lines.join('\n')).toContain('🔁 /loop 시작 — 2분 간격 · 쉬는 동안만 "가 볼까"');
+
+  // 판정선 via the wired handler — busy 미룸 → idle 발사 1.
+  idle = false;
+  scheduler!.tick();
+  expect(submitted).toEqual([]);
+  idle = true;
+  scheduler!.tick();
+  expect(submitted).toEqual(['가 볼까']);
+
+  // stop 0 — /loop stop 이후에는 아무것도 발사하지 않는다.
+  await registry.dispatch('loop', ['stop'], ctx);
+  expect(schedulerRef.current).toBeNull();
+  expect(scheduler!.isRunning()).toBe(false);
+  scheduler!.tick();
+  expect(submitted).toEqual(['가 볼까']);
+});
+
+test('/loop replaces a previous loop and rejects an unparsable interval', async () => {
+  const registry = buildDashboardSlashRegistry();
+  const lines: string[] = [];
+  const schedulerRef: { current: LoopScheduler | null } = { current: null };
+  const ctx = createContext(lines);
+  ctx.loopCommand = {
+    isIdle: () => true,
+    submitPrompt: () => {},
+    schedulerRef,
+  };
+  await registry.dispatch('loop', ['30s', '빨리'], ctx);
+  expect(schedulerRef.current?.isRunning()).toBe(true);
+  expect(lines.join('\n')).toContain('30초 간격');
+  const first = schedulerRef.current;
+  await registry.dispatch('loop', ['1h', '천천히'], ctx);
+  expect(first?.isRunning()).toBe(false);
+  expect(schedulerRef.current).not.toBe(first);
+  expect(schedulerRef.current?.isRunning()).toBe(true);
+  lines.length = 0;
+  await registry.dispatch('loop', ['빠르게', '문장'], ctx);
+  expect(lines.join('\n')).toContain('usage: /loop');
+  expect(schedulerRef.current?.isRunning()).toBe(true);
+  await registry.dispatch('loop', ['stop'], ctx);
+  expect(schedulerRef.current).toBeNull();
+});
+
+test('/loop without the ctx bundle replies not-wired instead of throwing', async () => {
+  const registry = buildDashboardSlashRegistry();
+  const lines: string[] = [];
+  await registry.dispatch('loop', ['5', '문장'], createContext(lines));
+  expect(lines.join('\n')).toContain('/loop: 이 화면에는 루프 스케줄러 배선이 없다');
+});
+
+test('/loop wiring keeps one scheduler across per-command contexts: two real dispatches (start→stop) stop the same loop', async () => {
+  // index.ts 배선 모양: 스케줄러 ref 는 명령 컨텍스트 밖(화면 스코프)에서 한 번 만들어지고,
+  // 명령마다 새 slashCtx 를 구성해도 같은 ref 를 건넨다. 두 실 dispatch 가 같은 루프를 멈춰야 한다.
+  const registry = buildDashboardSlashRegistry();
+  const submitted: string[] = [];
+  let idle = true;
+  const schedulerRef: { current: LoopScheduler | null } = { current: null };
+  const loopCommand = {
+    isIdle: () => idle,
+    submitPrompt: (prompt: string) => { submitted.push(prompt); },
+    schedulerRef,
+  };
+
+  const firstLines: string[] = [];
+  const first = createContext(firstLines);
+  first.loopCommand = loopCommand;
+  await registry.dispatch('loop', ['1', '보고서'], first);
+  const scheduler = schedulerRef.current;
+  expect(scheduler?.isRunning()).toBe(true);
+  expect(firstLines.join('\n')).toContain('🔁 /loop 시작');
+
+  const secondLines: string[] = [];
+  const second = createContext(secondLines);
+  second.loopCommand = loopCommand;
+  await registry.dispatch('loop', ['stop'], second);
+  expect(secondLines.join('\n')).toContain('정지');
+  expect(schedulerRef.current).toBeNull();
+  expect(scheduler!.isRunning()).toBe(false);
+  scheduler!.tick();
+  expect(submitted).toEqual([]);
+
+  // 판별력: 명령마다 ref 를 새로 만들면(영속성 결함 모양) 정지 명령이 실행 중 루프를 놓친다.
+  const leakRef: { current: LoopScheduler | null } = { current: null };
+  const leakCtx = createContext([]);
+  leakCtx.loopCommand = {
+    isIdle: () => true,
+    submitPrompt: (prompt: string) => { submitted.push(prompt); },
+    schedulerRef: leakRef,
+  };
+  await registry.dispatch('loop', ['1', '새는 루프'], leakCtx);
+  expect(leakRef.current?.isRunning()).toBe(true);
+  const missLines: string[] = [];
+  const missCtx = createContext(missLines);
+  missCtx.loopCommand = {
+    isIdle: () => true,
+    submitPrompt: () => {},
+    schedulerRef: { current: null },
+  };
+  await registry.dispatch('loop', ['stop'], missCtx);
+  expect(missLines.join('\n')).toContain('실행 중인 루프가 없다');
+  expect(leakRef.current?.isRunning()).toBe(true);
+  leakRef.current!.tick();
+  expect(submitted).toEqual(['새는 루프']);
+  leakRef.current!.stop();
+  expect(leakRef.current!.isRunning()).toBe(false);
+});
+
+test('/loop stops when the session ends (/session clear)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-tui-loop-session-end-'));
+  setElanousConfigDir(root);
+  try {
+    const lines: string[] = [];
+    const schedulerRef: { current: LoopScheduler | null } = { current: null };
+    const ctx = createContext(lines);
+    ctx.loopCommand = {
+      isIdle: () => true,
+      submitPrompt: () => {},
+      schedulerRef,
+    };
+    let attached: string | null = null;
+    ctx.getAttachedSessionId = () => attached;
+    ctx.setAttachedSessionId = (id) => { attached = id; };
+    ctx.setAttachedChatId = () => {};
+    await buildDashboardSlashRegistry().dispatch('loop', ['5', '문장'], ctx);
+    const scheduler = schedulerRef.current;
+    expect(scheduler?.isRunning()).toBe(true);
+    ctx.compactSlash = { chatHistory: [{ role: 'system', content: 'prompt' }] } as DashboardSlashContext['compactSlash'];
+    ctx.sessionSlash = { remoteDaemon: () => null } as DashboardSlashContext['sessionSlash'];
+    await buildDashboardSlashRegistry().dispatch('session', ['clear'], ctx);
+    expect(scheduler?.isRunning()).toBe(false);
+    expect(schedulerRef.current).toBeNull();
+  } finally {
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

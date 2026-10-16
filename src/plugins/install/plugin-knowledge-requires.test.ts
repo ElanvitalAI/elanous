@@ -251,7 +251,7 @@ test('missing or tampered required packs abort without installing either package
   expect(existsSync(join(bad.opts.root, 'knowledge-packs'))).toBe(false);
 });
 
-test('internal knowledge packs require enterprise authorization, and local standalone plugins remain installable', async () => {
+test('node-b internal market lets authorized mbp fetch and install the signed pack, while other tenants and keys fail', async () => {
   const internal = setup(['facts-pack'], 'internal');
   await expect(installPlugin('sample-plugin@test-market', internal.opts)).rejects.toMatchObject({ reason: 'io' });
   expect(listInstalledPlugins(internal.opts.root)).toEqual([]);
@@ -260,9 +260,21 @@ test('internal knowledge packs require enterprise authorization, and local stand
   const permitted = await installPlugin('sample-plugin@test-market', { ...allowed.opts, enterpriseId: 'tenant-a' });
   expect(listInstalledPlugins(allowed.opts.root)).toEqual([permitted]);
   expect(readFileSync(join(allowed.opts.root, 'knowledge-packs', 'test-market', 'facts-pack', '2.0.0', 'facts.txt'), 'utf8')).toBe('verified facts');
+  expect(allowed.requests).toContain('https://example.org/market/marketplace.json');
+  expect(allowed.requests).toContain('https://example.org/market/index.sig');
+  expect(allowed.requests).toContain('https://example.org/market/pack.tgz');
   const denied = setup(['facts-pack'], 'internal');
   await expect(installPlugin('sample-plugin@test-market', { ...denied.opts, enterpriseId: 'tenant-b' })).rejects.toMatchObject({ reason: 'io' });
   expect(listInstalledPlugins(denied.opts.root)).toEqual([]);
+  expect(denied.requests).not.toContain('https://example.org/market/pack.tgz');
+  const wrongKey = setup(['facts-pack'], 'internal');
+  const unrelated = generateIndexKeyPair();
+  const wrongKeyConfig = JSON.parse(readFileSync(wrongKey.opts.configPath, 'utf8'));
+  wrongKeyConfig.market.internalMarkets[0].trustedKeys = [{ keyId: unrelated.keyId, publicKey: unrelated.publicKey }];
+  writeFileSync(wrongKey.opts.configPath, JSON.stringify(wrongKeyConfig));
+  await expect(installPlugin('sample-plugin@test-market', { ...wrongKey.opts, enterpriseId: 'tenant-a' })).rejects.toMatchObject({ reason: 'signature' });
+  expect(wrongKey.requests).not.toContain('https://example.org/market/pack.tgz');
+  expect(listInstalledPlugins(wrongKey.opts.root)).toEqual([]);
   const local = setup([]);
   const installed = await installPlugin(local.source, { root: local.opts.root });
   expect(installed.market).toBe('local');

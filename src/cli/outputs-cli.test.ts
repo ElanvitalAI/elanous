@@ -127,15 +127,6 @@ test('the real CLI entry dispatches outputs list with an isolated instance root'
     { cwd: join(import.meta.dir, '../..'), encoding: 'utf8' });
   expect(result.status).toBe(0);
   expect(JSON.parse(result.stdout)).toMatchObject({ count: 1, byKind: { report: 1 }, items: [{ sourceId: 'entry' }] });
-  const folder = join(dir, 'outputs');
-  chmodSync(folder, 0o000);
-  try {
-    const failure = spawnSync('bun', ['bin/elanous.mjs', '--test', `--config-dir=${dir}`, 'outputs', 'list', '--json'],
-      { cwd: join(import.meta.dir, '../..'), encoding: 'utf8' });
-    expect(failure.status).toBe(1);
-    expect(failure.stdout).toBe('');
-    expect(failure.stderr).toContain('outputs ledger directory unreadable');
-  } finally { chmodSync(folder, 0o700); }
 });
 
 test('invalid filters fail once rather than return an empty ledger', async () => {

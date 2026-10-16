@@ -468,6 +468,12 @@ describe('buildUniversalPreamble — codex-family addendum (fix L-1) + lifecycle
     expect(lifecycle).toContain('구현');
     expect(lifecycle).toContain('디버깅');
     expect(lifecycle).toContain('수정할까요?');
+    // TUI-INITIATIVE 0단: a small in-scope fix is made and verified, not only offered.
+    expect(lifecycle).toContain('make it — switch to the Implementation pipeline, verify it');
+    expect(lifecycle).toContain('1-3 concrete\nnext actions');
+    // TUI-INITIATIVE 0b: the discipline line no longer forbids the small in-scope fix the Analysis section allows.
+    expect(lifecycle).not.toContain("Don't drift into edit/exec");
+    expect(lifecycle).toContain('switch to Implementation (edit → verify)');
     // Pipeline shapes — must literally name find / read / edit / verify
     // so a reviewer can audit the agent's chosen path.
     expect(lifecycle).toContain('find');

@@ -15,7 +15,7 @@ import {
   AgentRegistry, collectAgentText,
 } from '../src/agent/registry';
 import {
-  buildAgentMessages, filterAgentTools,
+  buildAgentMessages, filterAgentTools, resolveAgentModel,
 } from '../src/agent/runner';
 import type {
   AgentDefinition, AgentEvent,
@@ -421,5 +421,136 @@ describe('AgentRegistry', () => {
     expect(task.state).toBe('pending');
     expect(task.startedAt).toBeUndefined();
     expect(registry.get(task.id)).toBe(task);
+  });
+});
+
+// ═══════════════════════════════════════════
+// 7. resolveAgentModel — definition model resolution (TUI-AGENT-MODEL-FALLBACK · 결함 #34)
+// ═══════════════════════════════════════════
+
+describe('resolveAgentModel — definition model resolution', () => {
+  test("definition 'haiku' under current provider 'openai-codex' → parent fallback (incompatible-provider)", () => {
+    // 결함 #34: codex 부모에서 Claude 별칭 모델이 그대로 요청되어 죽었다.
+    // 폴백은 «못 부를 때만» — model 이 undefined 로 돌아가면 streamLLMWithTools 가
+    // 부모와 같은 설정 결정 경로(resolveDefaultProvider)를 탄다.
+    expect(resolveAgentModel('haiku', { currentProviderName: () => 'openai-codex' }))
+      .toEqual({ model: undefined, reason: 'incompatible-provider' });
+  });
+
+  test("definition 'haiku' under current provider 'anthropic' → canonical id kept (definition)", () => {
+    expect(resolveAgentModel('haiku', { currentProviderName: () => 'anthropic' }))
+      .toEqual({ model: 'claude-haiku-4-5', reason: 'definition' });
+  });
+
+  test("'inherit' — trimmed, case-insensitive — is an inheritance marker, never a model name", () => {
+    expect(resolveAgentModel('inherit')).toEqual({ model: undefined, reason: 'declared-inherit' });
+    expect(resolveAgentModel(' Inherit ')).toEqual({ model: undefined, reason: 'declared-inherit' });
+  });
+
+  test('no definition model → no-definition-model (parent inherit)', () => {
+    expect(resolveAgentModel(undefined)).toEqual({ model: undefined, reason: 'no-definition-model' });
+  });
+
+  test('provider lookup failure → inherit the parent as provider-unknown, never judged against a fake name nor sent unjudged', () => {
+    // 조회 실패를 'auto' 같은 가짜 이름으로 숨기지 않는다(호환 판정 0회) · 정의 모델을
+    // 판정 없이 넘기지도 않는다(모델 이름으로 공급자가 다시 골라질 수 있다) → 부모 모델 상속.
+    let compatAsked = false;
+    expect(resolveAgentModel('sonnet', {
+      currentProviderName: () => { throw new Error('no provider configured'); },
+      isCompatible: () => { compatAsked = true; return true; },
+    })).toEqual({ model: undefined, reason: 'provider-unknown' });
+    expect(compatAsked).toBe(false);
+  });
+
+  test("model id whose inferProvider is null → sent verbatim as unknown-model, never dropped to inherit", () => {
+    // isModelCompatible 은 추론 null 을 true 로 내므로 추론을 «먼저» 본다 —
+    // 이 케이스가 'definition' 이 아니라 'unknown-model' 로 나오는 것이 그 순서의 증명이다.
+    // local 자유 이름을 상속으로 떨구면 회귀다.
+    expect(resolveAgentModel('my-local-model', {
+      currentProviderName: () => 'local',
+      inferProvider: () => null,
+    })).toEqual({ model: 'my-local-model', reason: 'unknown-model' });
+  });
+});
+
+// ═══════════════════════════════════════════
+// 8. runAgent — definition model fallback, fake-provider end-to-end
+// ═══════════════════════════════════════════
+
+describe('runAgent — definition model fallback', () => {
+  /** fakeProvider variant with a pinned provider name that records the
+   *  model each streamChat call actually received. */
+  function recordingProvider(
+    name: string,
+    seen: (string | undefined)[],
+    turns: LLMStreamEvent[][],
+  ): LLMProvider {
+    let call = 0;
+    const p: LLMProvider = {
+      name,
+      defaultModel: `${name}-default-model`,
+      available: () => true,
+      async *streamChat(_messages: unknown, opts?: unknown) {
+        seen.push((opts as { model?: string } | undefined)?.model);
+        const events = turns[call++] ?? [];
+        for (const ev of events) yield ev;
+      },
+      async *chat(messages, opts) {
+        for await (const ev of p.streamChat!(messages, opts)) {
+          if (ev.type === 'text') yield ev.delta;
+        }
+      },
+    };
+    return p;
+  }
+
+  test("codex provider + definition model 'haiku' → run finishes on the provider default, never requests a Claude id", async () => {
+    // 결함 #34 의 판정 신호: 'haiku' 정의가 openai-codex 공급자에서 404 로 죽지 않고
+    // 부모(공급자 기본) 모델로 돈다 — opts.model 은 'haiku' 도 'claude-haiku-4-5' 도 아니다.
+    const registry = new AgentRegistry();
+    const seen: (string | undefined)[] = [];
+    const provider = recordingProvider('openai-codex', seen, [
+      [{ type: 'text', delta: 'fallback ok' }],
+    ]);
+
+    const { task, events } = registry.spawn({
+      definition: simpleDefinition({ model: 'haiku' }),
+      prompt: 'greet',
+      provider,
+    });
+
+    await collectEvents(events);
+
+    expect(task.state).toBe('done');
+    expect(task.result).toBe('fallback ok');
+    expect(seen.length).toBeGreaterThan(0);
+    for (const m of seen) {
+      expect(m).not.toBe('haiku');
+      expect(m).not.toBe('claude-haiku-4-5');
+      // 부정만으로는 'inherit' 같은 잘못된 값도 통과한다 — 실제로 실린 값이
+      // 부모(이 공급자)의 기본 모델임을 양(+)으로 단언한다.
+      expect(m).toBe(provider.defaultModel);
+    }
+  });
+
+  test("anthropic provider + definition model 'sonnet' → keeps the resolved canonical id 'claude-sonnet-5'", async () => {
+    // 맞는 공급자에서는 정의 모델을 지킨다 — sonnet 정의가 Claude 부모에서
+    // inherit 로 떨어지면 회귀다.
+    const registry = new AgentRegistry();
+    const seen: (string | undefined)[] = [];
+    const provider = recordingProvider('anthropic', seen, [
+      [{ type: 'text', delta: 'kept' }],
+    ]);
+
+    const { task, events } = registry.spawn({
+      definition: simpleDefinition({ model: 'sonnet' }),
+      prompt: 'greet',
+      provider,
+    });
+
+    await collectEvents(events);
+
+    expect(task.state).toBe('done');
+    expect(seen).toContain('claude-sonnet-5');
   });
 });

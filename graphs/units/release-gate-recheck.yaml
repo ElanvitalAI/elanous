@@ -1,0 +1,15 @@
+# Shadow G1 unit: plan only. TC connects gate-node's existing sweep to kind: recheck after #27800.
+graph_id: release-gate-recheck
+version: 1
+unit:
+  inputs: [version, commit, measuredCommit, failures, errors, ledgerRoot]
+  outputs: [planPath, files]
+  exits: [done, failed]
+entry_node: plan
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: plan, kind: agent, recipe: 'cmd:plan', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: plan, on: outcome, map: { ok: done, fail: failed } }

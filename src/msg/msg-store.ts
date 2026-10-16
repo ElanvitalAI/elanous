@@ -1,4 +1,5 @@
 import { Database } from 'bun:sqlite';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
@@ -64,6 +65,15 @@ function validCursor(cursor: number): number {
   return cursor;
 }
 
+/** Unread count ⊕ newest unread ID for one recipient (same predicate as `unreadCountOn`). */
+function unreadSummaryOn(db: Database, to: string): { count: number; maxId: number | null } {
+  const row = db.query(`SELECT COUNT(*) AS count, MAX(m.id) AS max_id FROM msg_messages m
+    WHERE m.id > COALESCE((SELECT last_id FROM msg_cursors WHERE recipient = ?), 0)
+      AND (m.recipient = ? OR (m.recipient = 'ALL' AND m.sender <> ?))`)
+    .get(to, to, to) as { count: number; max_id: number | null };
+  return { count: row.count, maxId: row.max_id ?? null };
+}
+
 function unreadCountOn(db: Database, to: string): number {
   return (db.query(`SELECT COUNT(*) AS count FROM msg_messages m
     WHERE m.id > COALESCE((SELECT last_id FROM msg_cursors WHERE recipient = ?), 0)
@@ -126,6 +136,14 @@ export class MsgStore {
     CREATE TABLE IF NOT EXISTS msg_provenance (
       provenance_key TEXT PRIMARY KEY,
       message_id INTEGER NOT NULL REFERENCES msg_messages(id)
+    );
+    CREATE TABLE IF NOT EXISTS msg_ta_delivery (
+      request_id INTEGER PRIMARY KEY REFERENCES msg_messages(id),
+      status TEXT NOT NULL CHECK(status IN ('pending', 'delivered'))
+    );
+    CREATE TABLE IF NOT EXISTS msg_ta_claim (
+      request_id INTEGER PRIMARY KEY REFERENCES msg_messages(id),
+      token TEXT NOT NULL
     );`);
     // Serialize the schema check and ALTER across processes opening an old ledger at once.
     if (!options.readOnly) this.db.transaction(() => {
@@ -140,9 +158,9 @@ export class MsgStore {
     return this.insertMessage(input);
   }
 
-  /** Append once for a coordination comment or a task failure incident. */
+  /** Append once for a coordination comment, task failure, or decided notification. */
   appendWithProvenance(input: MessageEnvelope, provenanceKey: string): Message {
-    if (typeof provenanceKey !== 'string' || !/^(?:coord|ta-failure):[^:]+:[^:]+$/.test(provenanceKey)) {
+    if (typeof provenanceKey !== 'string' || !/^(?:coord|ta-failure|decision):[^:]+:[^:]+$/.test(provenanceKey)) {
       throw new Error('invalid message provenance key');
     }
     const msg = validateMessageEnvelope(input);
@@ -171,6 +189,62 @@ export class MsgStore {
   }
 
   post(input: MessageEnvelope): Message { return this.append(input); }
+
+  /** Delivery state is separate from the single linked reply; an uncertain send keeps its claim. */
+  taDeliveryStatus(requestId: number): 'pending' | 'delivered' | null {
+    return (this.db.query('SELECT status FROM msg_ta_delivery WHERE request_id = ?').get(requestId) as { status: 'pending' | 'delivered' } | null)?.status ?? null;
+  }
+
+  setTaDeliveryStatus(requestId: number, status: 'pending' | 'delivered'): void {
+    this.db.query(`INSERT INTO msg_ta_delivery(request_id, status) VALUES (?, ?)
+      ON CONFLICT(request_id) DO UPDATE SET status = excluded.status`).run(requestId, status);
+  }
+
+  /** A short DB transaction grants one sender the external delivery. An abandoned claim stays ambiguous. */
+  claimTaDelivery(requestId: number): string | null {
+    return this.db.transaction(() => {
+      if (this.taDeliveryStatus(requestId) !== 'pending') return null;
+      const previous = this.db.query('SELECT 1 FROM msg_ta_claim WHERE request_id = ?').get(requestId);
+      if (previous) return null;
+      const token = randomUUID();
+      this.db.query('INSERT INTO msg_ta_claim(request_id, token) VALUES (?, ?)').run(requestId, token);
+      return token;
+    }).immediate();
+  }
+
+  taDeliveryClaimState(requestId: number): 'none' | 'held' {
+    return this.db.query('SELECT 1 FROM msg_ta_claim WHERE request_id = ?').get(requestId) ? 'held' : 'none';
+  }
+
+  /** Only the active sender may settle or report its own attempt; stale failures cannot overwrite success. */
+  settleTaDelivery(requestId: number, token: string, replyBody: string, delivered: boolean): boolean {
+    return this.db.transaction(() => {
+      const owner = this.db.query('SELECT token FROM msg_ta_claim WHERE request_id = ?').get(requestId) as { token: string } | null;
+      if (owner?.token !== token || this.taDeliveryStatus(requestId) === 'delivered') return false;
+      if (delivered) this.setTaDeliveryStatus(requestId, 'delivered');
+      this.updateTaReply(requestId, replyBody);
+      this.db.query('DELETE FROM msg_ta_claim WHERE request_id = ? AND token = ?').run(requestId, token);
+      return true;
+    }).immediate();
+  }
+
+  /** Keep the claim after any transport/settlement exception: publication may already have happened. */
+  markTaDeliveryUnknown(requestId: number, token: string, replyBody: string): boolean {
+    return this.db.transaction(() => {
+      const owner = this.db.query('SELECT token FROM msg_ta_claim WHERE request_id = ?').get(requestId) as { token: string } | null;
+      if (owner?.token !== token || this.taDeliveryStatus(requestId) === 'delivered') return false;
+      this.updateTaReply(requestId, replyBody);
+      return true;
+    }).immediate();
+  }
+
+  /** Settle only the TA reply reserved for this request; never create a second reply. */
+  updateTaReply(requestId: number, body: string): void {
+    const changed = this.db.query(`UPDATE msg_messages SET body = ? WHERE id = (
+      SELECT id FROM msg_messages WHERE reply_to = ? AND sender = 'TA' ORDER BY id ASC LIMIT 1
+    ) AND sender = 'TA'`).run(body, requestId);
+    if (changed.changes !== 1) throw new Error(`TA reply missing: #${requestId}`);
+  }
 
   /** Messages strictly after the supplied cursor, ordered by durable insertion ID. */
   listByRecipient(recipient: string, after: number = 0, limit: number = 100): Message[] {
@@ -277,5 +351,15 @@ export function readUnreadCount(recipient: string, path: string = defaultMsgStor
   if (!existsSync(path)) return null;
   const db = new Database(path, { readonly: true });
   try { return unreadCountOn(db, to); }
+  finally { db.close(); }
+}
+
+/** Observe one recipient's unread count ⊕ newest unread ID (read-only · no cursor change). null = ledger absent («모름»). */
+export function readUnreadSummary(recipient: string, path: string = defaultMsgStorePath()): { count: number; maxId: number | null } | null {
+  const to = canonicalSeatId(recipient);
+  if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
+  if (!existsSync(path)) return null;
+  const db = new Database(path, { readonly: true });
+  try { return unreadSummaryOn(db, to); }
   finally { db.close(); }
 }

@@ -652,6 +652,17 @@ export function buildReviewPrompt(
  *  `none of the tests …`. 표지 낱말로 시작하는 실제 블로커를 지우면 PASS/WARN 리뷰에서 블로커가 사라진다. */
 const NONE_WORD = String.raw`(?:없음|해당\s*없음|n\/a|none|nothing)`;
 const BARE_SENTINEL = new RegExp(String.raw`^${NONE_WORD}\s*[.。]?$`, 'i');
+// GLM 은 비어 있는 mustFix 항목이나 괄호 안의 한 문장으로 무소견을 적는다.
+// 괄호 전체만 검사한다. 중간에 "no blockers" 가 있어도 뒤에 지적이 이어지면 버리지 않는다.
+const BRACKETED_PLACEHOLDER = /^[（(]\s*([\s\S]*?)\s*[）)]$/;
+const PLACEHOLDER_ONLY = /^(?:없음|해당\s*없음|none|n\/a|no\s+blockers?)$/i;
+const PLACEHOLDER_END = /(?:블로커|차단)\s*없음$|no\s+blockers?$/i;
+function isBracketedPlaceholder(text: string): boolean {
+  const bracketed = BRACKETED_PLACEHOLDER.exec(text);
+  if (!bracketed) return false;
+  const inside = bracketed[1]!.trim().replace(/(?:\s*(?:…|\.{2,}|[.。]))+\s*$/, '').trim();
+  return PLACEHOLDER_ONLY.test(inside) || PLACEHOLDER_END.test(inside);
+}
 const DASH_ONLY_SENTINEL = /^[([（【]\s*[-—–]\s*[)\]）】]$/;
 // 목록 항목의 바깥 `- `와 별개로, 리뷰어가 괄호 안에도 장식 대시를 둘 수 있다: `- (- 없음 -)`.
 const DASH_WRAPPED_BRACKETED_SENTINEL = new RegExp(String.raw`^[([（【]\s*(?:[-—–]+\s*)?${NONE_WORD}\s*(?:[-—–]+\s*)?[)\]）】]$`, 'i');
@@ -685,6 +696,7 @@ function isLongNoFindingBracket(text: string): boolean {
  *  ⭐ export — `parseReviewResultOutput` 가 «같은» 판정으로 저장된 결과의 표지 줄을 다시 접는다(PR-LAND-MUSTFIX-NONE · 복제 금지). */
 export function isNoneSentinelFinding(finding: string): boolean {
   const text = finding.trim();
+  if (!text || isBracketedPlaceholder(text)) return true;
   if (/^[-—–]+$/.test(text)) return true;
   const markerText = text.replace(/^[—–-]+\s*|\s*[—–-]+$/g, '').trim();
   if (markerText && (BARE_SENTINEL.test(markerText) || DASH_ONLY_SENTINEL.test(markerText) || DASH_WRAPPED_BRACKETED_SENTINEL.test(markerText))) return true;

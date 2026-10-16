@@ -1,8 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ResourceLedger } from './ledger.js';
+import { acquireLockSync } from '../storage/file-lock.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -38,4 +39,127 @@ test('a zero-TTL record expires at registration time without being deleted', () 
   ledger.register({ id: 'zero', kind: 'machine', machine: 'host', name: 'host', owner: 'untrusted', attrs: {}, observedAt: 100, ttlMs: 0 }, 'member-a');
   expect(ledger.list({}, 100)[0]).toMatchObject({ ageMs: 0, expired: true });
   expect(ledger.list({}, 100)).toHaveLength(1);
+});
+
+test('warm worker lease is fenced across release, sanitize, and a later attempt', () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-worker-lease-'));
+  roots.push(root);
+  const ledger = new ResourceLedger(root);
+  const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock-a', architecture: 'arm64' };
+  ledger.registerPodWorker({ workerId: 'worker-1', machine: 'node-c', key, owner: 'host', ttlMs: 1000 }, 100);
+  const first = ledger.acquirePodWorker({ machine: 'node-c', key, owner: 'gate', runId: 'r1', attemptId: 'a1', ttlMs: 100 }, 101);
+  const generation = first.attrs.generation as number;
+  const leaseId = first.attrs.leaseId as string;
+  expect(generation).toBe(1);
+  expect(() => ledger.register({ ...first, attrs: { ...first.attrs, state: 'idle' } }, 'host')).toThrow('pod-worker-requires-allocator');
+  expect(() => ledger.heartbeat(first.id, 'host', { state: 'idle' }, 102)).toThrow('pod-worker-requires-allocator');
+  expect(() => ledger.delete(first.id, 'host')).toThrow('pod-worker-requires-allocator');
+  expect(ledger.list({ kind: 'pod-worker-lease' })[0]?.attrs.state).toBe('leased');
+  expect(() => ledger.acquirePodWorker({ key, owner: 'other', runId: 'r2', attemptId: 'a2', ttlMs: 100 }, 102)).toThrow('no-warm-worker');
+  expect(() => ledger.transitionPodWorker(first.id, { owner: 'gate', leaseId: 'stale', generation, action: 'release' }, 103)).toThrow('stale-worker-lease');
+  expect(ledger.transitionPodWorker(first.id, { owner: 'gate', leaseId, generation, action: 'release' }, 103).attrs.state).toBe('sanitizing');
+  expect(() => ledger.acquirePodWorker({ key, owner: 'other', runId: 'r2', attemptId: 'a2', ttlMs: 100 }, 104)).toThrow('no-warm-worker');
+  expect(() => ledger.transitionPodWorker(first.id, { owner: 'gate', leaseId, generation, action: 'sanitize' }, 105)).toThrow('not-owner');
+  const clean = ledger.transitionPodWorker(first.id, { owner: 'host', leaseId, generation, action: 'sanitize' }, 105);
+  expect(clean.attrs.state).toBe('idle');
+  expect(clean.ttlMs).toBe(1000);
+  const second = ledger.acquirePodWorker({ key, owner: 'other', runId: 'r2', attemptId: 'a2', ttlMs: 100 }, 106);
+  expect(second.attrs.generation).toBe(2);
+  expect(() => ledger.transitionPodWorker(first.id, { owner: 'gate', leaseId, generation, action: 'renew' }, 107)).toThrow('stale-worker-lease');
+  expect(() => ledger.registerPodWorker({ workerId: 'worker-1', machine: 'node-c', key, owner: 'host', ttlMs: 1000 }, 107)).toThrow('worker-id-used');
+});
+
+test('expired worker lease is not reused without fresh host registration', () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-worker-expiry-'));
+  roots.push(root);
+  const ledger = new ResourceLedger(root);
+  const key = { context: 'node-b', imageDigest: 'sha256:image', lockHash: 'lock-a', architecture: 'amd64' };
+  ledger.registerPodWorker({ workerId: 'worker-2', machine: 'node-b', key, owner: 'host', ttlMs: 100 }, 100);
+  const first = ledger.acquirePodWorker({ key, owner: 'gate', runId: 'r1', attemptId: 'a1', ttlMs: 10 }, 101);
+  expect(() => ledger.transitionPodWorker(first.id, { owner: 'gate', leaseId: first.attrs.leaseId as string,
+    generation: first.attrs.generation as number, action: 'renew' }, 111)).toThrow('lease-expired');
+  expect(() => ledger.acquirePodWorker({ key, owner: 'next', runId: 'r2', attemptId: 'a2', ttlMs: 10 }, 111)).toThrow('no-warm-worker');
+  expect(() => ledger.registerPodWorker({ workerId: 'worker-2', machine: 'node-b', key, owner: 'other', ttlMs: 100 }, 112)).toThrow('not-owner');
+  expect(() => ledger.registerPodWorker({ workerId: 'worker-2', machine: 'node-b', key, owner: 'host', ttlMs: 100 }, 112)).toThrow('worker-id-used');
+  expect(ledger.registerPodWorker({ workerId: 'new-pod-uid', machine: 'node-b', key, owner: 'host', ttlMs: 100 }, 112).attrs.generation).toBe(0);
+});
+
+test('a mismatched shadow reply can quarantine its leased worker without making the Job result non-authoritative', () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-worker-quarantine-'));
+  roots.push(root);
+  const ledger = new ResourceLedger(root);
+  const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock-a', architecture: 'arm64' };
+  ledger.registerPodWorker({ workerId: 'worker-3', machine: 'node-c', key, owner: 'host', ttlMs: 1000 }, 100);
+  const lease = ledger.acquirePodWorker({ key, owner: 'gate', runId: 'run', attemptId: 'attempt', ttlMs: 100 }, 101);
+  const quarantined = ledger.transitionPodWorker(lease.id, { owner: 'gate', leaseId: lease.attrs.leaseId as string,
+    generation: lease.attrs.generation as number, action: 'quarantine', reason: 'shadow-result-mismatch' }, 102);
+  expect(quarantined.attrs).toMatchObject({ state: 'quarantined', reason: 'shadow-result-mismatch' });
+  expect(() => ledger.acquirePodWorker({ key, owner: 'next', runId: 'next', attemptId: 'next', ttlMs: 100 }, 103)).toThrow('no-warm-worker');
+  expect(() => ledger.registerPodWorker({ workerId: 'worker-3', machine: 'node-c', key, owner: 'host', ttlMs: 1000 }, 2000)).toThrow('worker-id-used');
+});
+
+test('separate processes cannot claim the same idle worker while the ledger lock is contested', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-worker-processes-'));
+  roots.push(root);
+  const ledger = new ResourceLedger(root);
+  const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock-a', architecture: 'arm64' };
+  ledger.registerPodWorker({ workerId: 'worker-4', machine: 'node-c', key, owner: 'host', ttlMs: 30_000 });
+  const script = join(root, 'claim.ts');
+  writeFileSync(script, `import { ResourceLedger } from ${JSON.stringify(new URL('./ledger.ts', import.meta.url).pathname)};
+const store = new ResourceLedger(process.argv[2]);
+try { const row = store.acquirePodWorker({ key: ${JSON.stringify(key)}, owner: process.argv[3], runId: process.argv[3], attemptId: 'attempt', ttlMs: 1000 });
+  console.log(JSON.stringify({ ok: true, leaseId: row.attrs.leaseId })); }
+catch (error) { console.log(JSON.stringify({ ok: false, reason: error.message })); }`);
+  const release = acquireLockSync(`${ledger.path}.lock`);
+  const children = ['gate-a', 'gate-b'].map(owner => Bun.spawn(['bun', script, root, owner], { stdout: 'pipe', stderr: 'pipe' }));
+  try {
+    await Bun.sleep(100);
+    expect(children.every(child => child.exitCode === null)).toBe(true);
+  } finally { release(); }
+  const results = await Promise.all(children.map(async child => {
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+    expect(await child.exited).toBe(0);
+    expect(stderr).toBe('');
+    return JSON.parse(stdout) as { ok: boolean; leaseId?: string; reason?: string };
+  }));
+  expect(results.filter(result => result.ok)).toHaveLength(1);
+  expect(results.filter(result => result.reason === 'no-warm-worker')).toHaveLength(1);
+});
+
+test('a lock wait beyond TTL cannot acquire or renew using the pre-lock clock', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-worker-lock-clock-'));
+  roots.push(root);
+  const ledger = new ResourceLedger(root);
+  const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock-a', architecture: 'arm64' };
+  const script = join(root, 'locked-operation.ts');
+  writeFileSync(script, `import { writeFileSync } from 'node:fs';
+import { ResourceLedger } from ${JSON.stringify(new URL('./ledger.ts', import.meta.url).pathname)};
+const store = new ResourceLedger(process.argv[2]);
+writeFileSync(process.argv[2] + '/ready-' + process.argv[3], 'attempting');
+try {
+  if (process.argv[3] === 'acquire') store.acquirePodWorker({ key: ${JSON.stringify(key)}, owner: 'gate', runId: 'run', attemptId: 'attempt', ttlMs: 500 });
+  else store.transitionPodWorker(process.argv[4], { owner: 'gate', leaseId: process.argv[5], generation: Number(process.argv[6]), action: 'renew', ttlMs: 500 });
+  console.log('unexpected-success');
+} catch (error) { console.log(error.message); }`);
+  const afterWait = async (args: string[]): Promise<string> => {
+    const release = acquireLockSync(`${ledger.path}.lock`);
+    const child = Bun.spawn(['bun', script, root, ...args], { stdout: 'pipe', stderr: 'pipe' });
+    try {
+      for (let i = 0; i < 100 && !existsSync(join(root, `ready-${args[0]}`)); i++) await Bun.sleep(10);
+      expect(existsSync(join(root, `ready-${args[0]}`))).toBe(true);
+      await Bun.sleep(700);
+      expect(child.exitCode).toBeNull();
+    } finally { release(); }
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+    expect(await child.exited).toBe(0);
+    expect(stderr).toBe('');
+    return stdout.trim();
+  };
+  ledger.registerPodWorker({ workerId: 'worker-acquire', machine: 'node-c', key, owner: 'host', ttlMs: 500 });
+  expect(await afterWait(['acquire'])).toBe('no-warm-worker');
+  ledger.registerPodWorker({ workerId: 'worker-renew', machine: 'node-c', key, owner: 'host', ttlMs: 500 });
+  const lease = ledger.acquirePodWorker({ key, owner: 'gate', runId: 'run', attemptId: 'attempt', ttlMs: 500 });
+  expect(await afterWait(['renew', lease.id, String(lease.attrs.leaseId), String(lease.attrs.generation)])).toBe('lease-expired');
 });

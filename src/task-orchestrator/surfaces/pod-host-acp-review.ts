@@ -11,6 +11,7 @@
 //    ⛔ 기본 꺼짐(opt-in): 옵션 → env `ELANOUS_POD_HOST_ACP_REVIEW` → config `llm.podHostAcpReview` 순.
 //    📌 남은 조각(②-b): 이 문이 켜진 런에서 Pod 안 api 리뷰를 «끄는» 것은 Pod 이미지 쪽 변경이라 따로 간다.
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../util/spawn-sync-output.js';
 import { debug } from '../../debug/log.js';
 import type { ReviewResult } from '../../agent-substrate/pr-reviewer.js';
 import type { SubscriptionReviewerSpec } from '../../user-config.js';
@@ -57,7 +58,7 @@ export interface PodHostAcpReviewDeps {
 }
 
 function defaultReadPr(prNumber: number, repoRoot: string): { headRefOid: string; title: string; body: string; diff: string } | undefined {
-  const view = spawnSync('gh', ['pr', 'view', String(prNumber), '--json', 'headRefOid,title,body'], { cwd: repoRoot, encoding: 'utf8', timeout: 60_000 });
+  const view = spawnSync('gh', ['pr', 'view', String(prNumber), '--json', 'headRefOid,title,body'], { cwd: repoRoot, encoding: 'utf8', timeout: 60_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   if (view.status !== 0) return undefined;
   const diff = spawnSync('gh', ['pr', 'diff', String(prNumber)], { cwd: repoRoot, encoding: 'utf8', timeout: 120_000, maxBuffer: 64 * 1024 * 1024 });
   if (diff.status !== 0) return undefined;

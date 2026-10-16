@@ -11,7 +11,7 @@ import { ClaimsLedger } from '../../src/claims/claims-ledger.js';
 import { addItem, setItem } from '../../src/release-loop/checklist.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { makePrManager, type CmdRunner } from '../../src/autopilot/pr-manager.js';
-import { publicNotes, runPublish } from './publish-node.js';
+import { publicNotes, runPublish as realRunPublish } from './publish-node.js';
 import { runPrepare } from './prepare-node.js';
 import { runUpgrade } from './upgrade-node.js';
 import { runDocsLand } from './docs-land-node.js';
@@ -23,8 +23,8 @@ import { afterEach as freezeIsolationAfterEach, beforeEach as freezeIsolationBef
 import { rmSync as freezeIsolationRm } from 'node:fs';
 import { resetEffectiveInstanceRoot as freezeIsolationReset } from '../../src/instance/resolve.js';
 
-// Both freeze authorities are isolated for every runPrLand here: the operational root (injected) and the
-// local universe (ELANOUS_STATE_DIR) — these tests must never read or write the real ~/.elanous (FREEZE-HOSTMERGE).
+// Both freeze authorities are isolated for merge and publish fixtures: the operational root (injected or
+// subprocess HOME) and the local universe (ELANOUS_STATE_DIR). Never read or write the real ~/.elanous.
 let isolatedFreezeRoot = '';
 let isolatedStateDirForFreeze = '';
 let savedStateDirForFreeze: string | undefined;
@@ -42,6 +42,7 @@ freezeIsolationAfterEach(() => {
   freezeIsolationRm(isolatedStateDirForFreeze, { recursive: true, force: true });
 });
 const runPrLand: typeof realRunPrLand = (opts = {}, deps = {}) => realRunPrLand(opts, { prodFreezeRoot: isolatedFreezeRoot, ...deps });
+const runPublish: typeof realRunPublish = (run, prodFreezeRoot, clock) => realRunPublish(run, prodFreezeRoot ?? isolatedFreezeRoot, clock);
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -55,7 +56,7 @@ test('release graph CLI dry-run previews automatic route without executing comma
     expect(run.status).toBe(0);
     const output = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { status: string; path: string[]; executed: number; pending?: { nodeId: string; message: string } };
     expect(output.status).toBe('done');
-    expect(output.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(output.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate', 'mac-smoke', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
     expect(output.pending).toBeUndefined();
     expect(output.executed).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -68,7 +69,7 @@ test('graph dry-run previews automatic path without executing commands', async (
       input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async () => { throw new Error('dry-run executed command'); } }, dryRun: true,
     });
     expect(state.status).toBe('done');
-    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate', 'mac-smoke', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
     expect(state.pending).toBeUndefined();
     expect(state.executed).toBe(0);
     expect(state.nodes.every((node) => !node.executed)).toBe(true);
@@ -110,10 +111,10 @@ test('serial release baseline: RFC #24935 recorded figures (not a live measureme
   expect(graph.nodes.find((node) => node.node_id === 'tui')?.recipe).toBe('cmd:docs');
   expect(graph.nodes.find((node) => node.node_id === 'docs')?.recipe).toBe('cmd:docs');
   const next = (from: string) => graph.edges.find((edge) => edge.from === from)?.map.ok;
-  expect(['gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve']
-    .map(next)).toEqual(['mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish']);
+  expect(['gate', 'mac-smoke', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve']
+    .map(next)).toEqual(['mac-smoke', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish']);
   expect(graph.edges.find((edge) => edge.from === 'prefetch')?.map).toEqual({ ok: 'gate', fail: 'gate', error: 'gate' });
-  expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'mac-smoke', fail: 'failed', error: 'failed' });
+  expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'mac-smoke', fail: 'gate-triage', error: 'gate-triage' });
   expect(graph.edges.find((edge) => edge.from === 'tui')?.map).toEqual({ ok: 'docs', fail: 'failed', error: 'failed' });
   expect(graph.edges.find((edge) => edge.from === 'docs')?.map).toEqual({ ok: 'known-issues', fail: 'failed', error: 'failed' });
   expect(graph.edges.find((edge) => edge.from === 'auto-approve')?.map).toEqual({ ok: 'publish', fail: 'approve-publish', error: 'approve-publish' });
@@ -129,11 +130,11 @@ test('cutoff routes through checklist-gate before the costly gate', () => {
   const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command?: string; timeout_ms?: number }>;
   expect(graph.nodes.find((node) => node.node_id === 'checklist-gate')).toMatchObject({ kind: 'gate', recipe: 'cmd:checklist-gate', max_visits: 1 });
   expect(graph.edges.find((edge) => edge.from === 'cutoff')?.map).toEqual({ ok: 'checklist-gate', fail: 'failed', error: 'failed' });
-  expect(graph.edges.find((edge) => edge.from === 'checklist-gate')?.map).toEqual({ ok: 'prefetch', fail: 'failed', error: 'failed' });
+  expect(graph.edges.find((edge) => edge.from === 'checklist-gate')?.map).toEqual({ ok: 'export-check', fail: 'failed', error: 'failed' });
   expect(recipes['checklist-gate']).toEqual({ command: 'bun scripts/release-loop/checklist-gate-node.ts', timeout_ms: 600000 });
 });
 
-test('public export check routes gate ok before pwa and failure to failed', async () => {
+test('public export check fails before prefetch and gate', async () => {
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
   const graph = yaml(readFileSync(graphPath, 'utf8')) as {
     nodes: Array<{ node_id: string; kind: string; recipe?: string; max_visits: number }>;
@@ -142,10 +143,11 @@ test('public export check routes gate ok before pwa and failure to failed', asyn
   const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command?: string; timeout_ms?: number }>;
   expect(graph.nodes.find((node) => node.node_id === 'export-check')).toMatchObject({ kind: 'gate', recipe: 'cmd:export-check', max_visits: 1 });
   expect(graph.nodes.find((node) => node.node_id === 'mac-smoke')).toMatchObject({ kind: 'gate', recipe: 'cmd:mac-smoke', max_visits: 1 });
-  expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'mac-smoke', fail: 'failed', error: 'failed' });
-  expect(graph.edges.find((edge) => edge.from === 'mac-smoke')?.map).toEqual({ ok: 'export-check', fail: 'export-check', error: 'export-check' });
+  expect(graph.edges.find((edge) => edge.from === 'checklist-gate')?.map).toEqual({ ok: 'export-check', fail: 'failed', error: 'failed' });
+  expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'mac-smoke', fail: 'gate-triage', error: 'gate-triage' });
+  expect(graph.edges.find((edge) => edge.from === 'mac-smoke')?.map).toEqual({ ok: 'pwa', fail: 'pwa', error: 'pwa' });
   expect(recipes['mac-smoke']).toEqual({ command: 'bun scripts/release-loop/mac-smoke-node.ts', timeout_ms: 1_800_000 });
-  expect(graph.edges.find((edge) => edge.from === 'export-check')?.map).toEqual({ ok: 'pwa', fail: 'failed', error: 'failed' });
+  expect(graph.edges.find((edge) => edge.from === 'export-check')?.map).toEqual({ ok: 'prefetch', fail: 'failed', error: 'failed' });
   expect(recipes['export-check']).toEqual({ command: 'bun scripts/release-loop/export-check-node.ts', timeout_ms: 1_800_000 });
   const root = mkdtempSync(join(tmpdir(), 'release-export-failed-'));
   try {
@@ -154,11 +156,12 @@ test('public export check routes gate ok before pwa and failure to failed', asyn
       stdout: JSON.stringify(body.includes('export-check-node.ts') ? { outcome: 'fail', verdict: 'fail', summary: 'leak', step: 'export', tail: 'leak' } : { outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '',
     }) } });
     expect(state.status).toBe('failed');
-    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate', 'mac-smoke', 'export-check', 'failed']);
+    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'export-check', 'failed']);
+    expect(state.path).not.toContain('gate');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('mac-smoke fail and error are warning-only: the graph continues to export-check and publishing', async () => {
+test('mac-smoke fail and error are warning-only: the graph continues to pwa and publishing', async () => {
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
   for (const outcome of ['fail', 'error'] as const) {
     const root = mkdtempSync(join(tmpdir(), 'release-mac-smoke-failed-'));
@@ -168,7 +171,7 @@ test('mac-smoke fail and error are warning-only: the graph continues to export-c
         stdout: JSON.stringify(body.includes('mac-smoke-node.ts') ? { outcome, verdict: 'fail', summary: '측정 불가' } : { outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '',
       }) } });
       expect(state.status).toBe('done');
-      expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
+      expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate', 'mac-smoke', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
     } finally { rmSync(root, { recursive: true, force: true }); }
   }
 });
@@ -183,7 +186,7 @@ test('GATE-NODES-PARALLEL: a crashed or failed prefetch node never stops the rel
         return prefetch ? { exitCode: outcome === 'fail' ? 1 : 2, stdout: '', stderr: 'worker spawn error' }
           : { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '' };
       } } });
-      expect(state.path.slice(0, 5)).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate']);
+      expect(state.path.slice(0, 6)).toEqual(['version-release', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate']);
       expect(state.status).toBe('done');
     } finally { rmSync(root, { recursive: true, force: true }); }
   }
@@ -489,7 +492,7 @@ test('real graph commands stop at approval before publish', async () => {
       input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async (body) => ({ exitCode: body.includes('auto-approve-node.ts') ? 1 : 0, stdout: body.includes('auto-approve-node.ts') ? '{"outcome":"fail","verdict":"fail","summary":"unmeasured"}\n' : '{"outcome":"ok","verdict":"pass","summary":"fake"}\n', stderr: '' }) },
     });
     expect(state.status).toBe('awaiting-approval');
-    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'approve-publish']);
+    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate', 'mac-smoke', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'approve-publish']);
     expect(state.pending?.nodeId).toBe('approve-publish');
     expect(state.executed).toBe(15);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -538,9 +541,27 @@ test('gate regression routes to failed before preparing or publishing', async ()
       } },
     });
     expect(state.status).toBe('failed');
-    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate', 'failed']);
-    expect(commands).toHaveLength(5);
+    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate', 'gate-triage', 'failed']);
+    expect(commands).toHaveLength(7);
+    expect(commands.some((command) => command.includes('gate-triage-node.ts'))).toBe(true);
     expect(commands.some((command) => command.includes('publish-node.ts'))).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('shadow triage error cannot turn a failed gate into a passing release', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-triage-error-'));
+  try {
+    const state = await runGraph(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), {
+      input: { version: '9.9.9', previousVersion: '0.2.3' },
+      deps: { root, runBash: async (body) => body.includes('/gate-triage-node.ts')
+        ? { exitCode: 2, stdout: '{"outcome":"error","verdict":"fail","summary":"triage unavailable"}\n', stderr: '' }
+        : body.includes('/gate-node.ts')
+          ? { exitCode: 1, stdout: '{"outcome":"fail","verdict":"fail","summary":"regression"}\n', stderr: '' }
+          : { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass","summary":"fake"}\n', stderr: '' } },
+    });
+    expect(state.status).toBe('failed');
+    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate', 'gate-triage', 'failed']);
+    expect(state.path).not.toContain('publish');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -701,7 +722,7 @@ if (tool === 'git') {
       chmodSync(join(bin, tool), 0o755);
     }
     process.env.ELANOUS_STATE_DIR = root;
-    const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, RELEASE_WIRING_ROOT: root, ELANOUS_STATE_DIR: root };
+    const env = { ...process.env, HOME: root, PATH: `${bin}:${process.env.PATH}`, RELEASE_WIRING_ROOT: root, ELANOUS_STATE_DIR: root };
     const real = async (body: string, opts: { env?: NodeJS.ProcessEnv }) => {
       const nodeId = body.includes('docs-node.ts') ? JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')).nodeId : undefined;
       if (nodeId === 'prefetch') {

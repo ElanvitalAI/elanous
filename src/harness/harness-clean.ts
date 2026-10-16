@@ -5,6 +5,7 @@
 // planHarnessClean = 순수 분류(테스트). execHarnessClean = git/gh IO + 실제 제거.
 
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { listPtyManifest, type PtyManifestRow } from '../pty-shell/pty-manifest.js';
@@ -466,7 +467,7 @@ export type { GitRunner, GitRunResult } from '../git-fs/retry.js';
 
 const defaultGitRunner: GitRunner = (args) => {
   // git-spawn-allow: This is the injected low-level runner consumed by direct runGitWithRetry callers; routing it through runGitCommand would recurse through the retry seam.
-  const r = spawnSync('git', args, { encoding: 'utf8', timeout: 20_000 });
+  const r = spawnSync('git', args, { encoding: 'utf8', timeout: 20_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
 };
 

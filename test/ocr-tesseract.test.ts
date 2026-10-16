@@ -27,6 +27,13 @@ import {
 } from '../src/ocr/index.js';
 import { __resetTesseractCacheForTests } from '../src/ocr/tesseract.js';
 
+/** LLM Vision whose availability is fixed to true — the registry scoring under test, not the host's LLM config. */
+class AvailableLLMVisionProvider extends LLMVisionProvider {
+  override isAvailable(): boolean {
+    return true;
+  }
+}
+
 const samplePngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);  // PNG magic
 
 afterEach(() => {
@@ -219,8 +226,10 @@ describe('OcrRegistry · Tesseract picker behaviour', () => {
   });
 
   test('strengths:["context-aware"] still picks LLM Vision (Tesseract loses)', async () => {
+    // Scoring contract, not host capability: without an image-capable default LLM (a gate Pod
+    // has none) LLM Vision drops out at the availability filter and Tesseract wins by default.
     const reg = new OcrRegistry();
-    reg.register(new LLMVisionProvider());
+    reg.register(new AvailableLLMVisionProvider());
     reg.register(new TesseractProvider({
       recognize: async () => ({ text: 'should not win' }),
     }));

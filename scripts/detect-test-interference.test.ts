@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'bun:test';
+import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import {
   detectTestInterference,
   EXIT_INTERFERENCE,
@@ -135,6 +137,25 @@ describe('detect test interference', () => {
     const lines: string[] = [];
     expect(await main([], async () => result(0, 0), (line) => lines.push(line))).toBe(EXIT_INVALID_INPUT);
     expect(lines).toEqual(['Usage: bun scripts/detect-test-interference.ts <test-file> [test-file...]']);
+  });
+
+  test('R7: bun test runs in an isolated env — temp HOME/state, no credentials, remote parent off, PATH kept, root removed', async () => {
+    let seen: NodeJS.ProcessEnv | undefined;
+    const spawn: BunSpawn = ((options) => {
+      seen = options.env;
+      return { stdout: new Blob(['1 pass\n0 fail\nRan 1 test across 1 file.\n']).stream(), stderr: new Blob([]).stream(), exited: Promise.resolve(0), signalCode: null };
+    }) as BunSpawn;
+    const source = { HOME: '/Users/operator', PATH: '/opt/homebrew/bin:/usr/bin', OPENAI_API_KEY: 'sk-x', ELANOUS_STATE_DIR: '/Users/operator/.elanous', ELANOUS_STATE_DIR_SOURCE: 'derived', ELANOUS_RUN_ID: 'run-parent', ELANOUS_TA_PARENT_HOST: 'node-b' };
+    await runBunTest(['a.test.ts'], spawn, '/repo', source);
+    expect(seen!.HOME).not.toBe('/Users/operator');
+    expect(seen!.HOME!.startsWith(tmpdir())).toBe(true);
+    expect(seen!.ELANOUS_STATE_DIR!.startsWith(seen!.HOME!)).toBe(true);
+    expect(seen!.ELANOUS_TA_PARENT_HOST).toBe('off');
+    expect(seen!.PATH).toBe('/opt/homebrew/bin:/usr/bin');
+    expect(seen!.OPENAI_API_KEY).toBeUndefined();
+    expect(seen!.ELANOUS_STATE_DIR_SOURCE).toBeUndefined();
+    expect(seen!.ELANOUS_RUN_ID).toBeUndefined();
+    expect(existsSync(seen!.HOME!)).toBe(false);
   });
 
   test('forwards supplied path spellings and selected cwd to Bun', async () => {

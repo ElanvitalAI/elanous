@@ -2,6 +2,7 @@
  *  sha·PR·커밋은 형식 검사 전에 스크립트에 넣지 않는다(셸 주입 차단). */
 
 import { execFileSync } from 'node:child_process';
+import { siTaskPodStageShell } from './pod-lifecycle-stages.js';
 
 export type PodSource =
   | { kind: 'default'; base?: string }
@@ -52,17 +53,30 @@ function assertRemoteBase(repoUrl: string, base: string): void {
   }
 }
 
-/** Job 스크립트의 원천 단계. 성공 갈래는 `ELANOUS_POD_SOURCE <kind> <HEAD>` 로 끝난다. */
-export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath = '/host-mirror'): string {
+/** Job 스크립트의 원천 단계. 성공 갈래는 `ELANOUS_POD_SOURCE <kind> <HEAD>` 로 끝난다.
+ *  `stageMarkers` — si-task Job 만: 호스트 미러 `clone --shared` 시도의 시작·성공을 `ELANOUS_POD_STAGE mirror start|end` 로 찍는다
+ *  (건너뛰거나 실패하면 끝 표지가 없다 → 호스트가 missing 으로 읽는다). 기본은 꺼짐 — gate·pod-command Job 의 바이트는 그대로다. */
+export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath = '/host-mirror', options: { stageMarkers?: boolean } = {}): string {
+  const mark = (edge: 'start' | 'end'): string[] => options.stageMarkers ? [siTaskPodStageShell('mirror', edge)] : [];
   const quotedUrl = `'${repoUrl.replace(/'/g, `'\\''`)}'`;
   const quotedMirror = `'${mirrorPath.replace(/'/g, `'\\''`)}'`;
   const clone = `git clone -q --depth 50 ${quotedUrl} repo`;
   const start = [
     'if [ -e repo ]; then exit 5; fi',
-    `if [ -d ${quotedMirror} ] && git -C ${quotedMirror} rev-parse --verify HEAD >/dev/null 2>&1 && git clone -q --shared -- ${quotedMirror} repo && git -C repo rev-parse --verify HEAD >/dev/null 2>&1; then`,
+    // TA-POD-WARMBOOT-PARITY (10-16): the mirror fallback used to be silent — 157 HARD gate Pods all said
+    // `VIA github` and nothing said why (the Job had no /host-mirror mount). Each failed step now names itself.
+    'mirror_skip=',
+    ...mark('start'),
+    `if ! [ -d ${quotedMirror} ]; then mirror_skip=no-mount`,
+    `elif ! git -C ${quotedMirror} rev-parse --verify HEAD >/dev/null 2>&1; then mirror_skip=rev-parse-failed`,
+    `elif ! git clone -q --shared -- ${quotedMirror} repo || ! git -C repo rev-parse --verify HEAD >/dev/null 2>&1; then mirror_skip=clone-failed`,
+    'fi',
+    'if [ -z "$mirror_skip" ]; then',
+    ...mark('end').map((line) => `  ${line}`),
     `  git -C repo remote set-url origin ${quotedUrl} || exit 5`,
     '  source_via=mirror',
     'else',
+    "  printf 'ELANOUS_POD_SOURCE_MIRROR_SKIP %s\\n' \"$mirror_skip\"",
     '  if [ -e repo ]; then rm -r -- repo || exit 5; fi',
     `  ${clone} || exit 5`,
     '  source_via=github',
@@ -143,7 +157,9 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
     '  exit 3',
     'fi',
     'if [ -e repo ]; then exit 5; fi',
+    ...mark('start'),
     `if [ -d ${quotedMirror} ] && git -C ${quotedMirror} rev-parse --verify HEAD >/dev/null 2>&1 && git clone -q --shared -- ${quotedMirror} repo && git -C repo rev-parse --verify HEAD >/dev/null 2>&1; then`,
+    ...mark('end').map((line) => `  ${line}`),
     `  git -C repo remote set-url origin ${quotedUrl} || exit 5`,
     '  if git -C repo bundle verify /tmp/source.bundle >/dev/null 2>&1; then',
     '    git -C repo fetch /tmp/source.bundle "refs/elanous/pod-source/*:refs/remotes/bundle/*" || exit 5',

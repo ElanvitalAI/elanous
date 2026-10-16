@@ -17,6 +17,7 @@ import { DEFAULT_BRANCH_WORKTREE_BASE } from '../git-fs/worktree.js';
 import { isElanousRuntimeArtifactPath } from '../self-implement/gate-scope.js';
 import { isTransientExecutionFailure } from '../self-dev/execution-transient.js';
 import { withGhRestFallback } from './gh-rest-fallback.js';
+import { cellIdFromBody, guardNewPr, parseDiffHunks, readOpenPrs, recordGuardUnmeasured, type GuardVerdict, type Seat } from '../pr-tool/census.js';
 
 /** ★ stderr 캡처(대표 2026-07-21·관측 갭) — 종전엔 stdout 만 담아 git/gh 실패 사유가 소실됐다
  *  (705308: makePr 실패가 bare null 로 뭉뚱그려져 triage 가 "인증·네트워크"로 환각 오라우팅).
@@ -99,6 +100,8 @@ export interface UpsertPrInput {
   draft?: boolean;
   /** PR 라벨 — 신규 생성 시 `--label`, 재사용 시 `--add-label` 로 부착(무인 리뷰 진입 라벨이 재실행에도 유지). */
   labels?: readonly string[];
+  /** Harness caller's seat; stamped on newly created PRs for later census. */
+  seat?: Seat;
   /** 기존 PR 재사용 시 남길 코멘트(재구현 반영 안내·비평 해소). */
   reuseComment?: string;
   /**
@@ -115,7 +118,7 @@ export interface UpsertPrResult { url: string; reused: boolean }
  *  나머지 reason(add/commit/push/gh)은 진짜 실패로 detail(stderr)과 함께 관측·pr-failed. */
 export type UpsertPrOutcome =
   | { ok: true; url: string; reused: boolean; labelsApplied?: boolean; labelsOmitted?: boolean }
-  | { ok: false; reason: 'add' | 'commit' | 'base' | 'noop' | 'push' | 'gh'; detail: string };
+  | { ok: false; reason: 'add' | 'commit' | 'base' | 'noop' | 'push' | 'gh' | 'guard'; detail: string };
 
 /** 관측된 문면 두 가지:
  *    could not add label: 'auto-review' not found
@@ -312,9 +315,29 @@ function isTransientPushFailure(detail: string): boolean {
   return isTransientExecutionFailure(pushFailureMessageForTransientCheck(detail));
 }
 
+function seatFromEnvironment(): Seat | null {
+  // Production launchers stamp this in harness-pod-dispatch.ts and harness-cli-command.ts.
+  const value = process.env.ELANOUS_HARNESS_SEAT;
+  return value === 'OP' || value === 'TC' || value === 'MK' || value === 'UX' ? value : null;
+}
+
+function defaultPrCreateGuard(input: { cwd: string; base: string | undefined; seat: Seat | null; body: string }, run: CmdRunner): GuardVerdict {
+  if (!input.base) return guardNewPr({ files: null, seat: input.seat }, { status: 'unknown', reason: '비교 base 없음' });
+  const diff = run('git', ['-C', input.cwd, 'diff', '--name-only', '-z', `${input.base}...HEAD`]);
+  const files = diff.ok ? diff.out.split('\0').filter(Boolean) : null;
+  const patch = run('git', ['-C', input.cwd, 'diff', '--unified=0', `${input.base}...HEAD`]);
+  if (!patch.ok) return guardNewPr({ files: null, seat: input.seat }, { status: 'unknown', reason: `후보 수정 줄 조회 실패: ${patch.err || patch.out}` });
+  return guardNewPr({ files, seat: input.seat, cellId: cellIdFromBody(input.body), hunks: parseDiffHunks(patch.out) }, readOpenPrs(run, { cwd: input.cwd, ...(files ? { candidateFiles: files } : {}) }));
+}
+
 /** ★ PR 매니저 팩토리(대표 2026-07-12) — CmdRunner 주입(테스트 스텁). 실 배선은 기본 러너. */
-export function makePrManager(runner: CmdRunner = defaultCmdRunner): PrManager {
+export function makePrManager(
+  runner: CmdRunner = defaultCmdRunner,
+  createGuard?: (input: { cwd: string; base: string | undefined; seat: Seat | null; body: string }, run: CmdRunner) => GuardVerdict,
+  recordUnmeasured: typeof recordGuardUnmeasured = recordGuardUnmeasured,
+): PrManager {
   const run = withGhRestFallback(runner);
+  const checkCreate = createGuard ?? (runner === defaultCmdRunner ? defaultPrCreateGuard : undefined);
   const findPrForBranchOutcome = (branch: string, cwd?: string): FindPrForBranchOutcome => {
     // ⛔ 표식은 base 를 「생략했다」는 뜻이지 브랜치 이름이 아니다. 그대로 `gh --head` 로 넘기면
     //    gh 가 `no pull requests found for branch "elanous:default-branch"` 를 stderr 로 뱉는다.
@@ -499,8 +522,8 @@ export function makePrManager(runner: CmdRunner = defaultCmdRunner): PrManager {
         //   트림은 신규 경로(resolveDeliverableBase)와 동일하게 — 공백 전용 base 는 미지정으로 본다(리뷰 should-fix).
         const explicitBase = input.base?.trim();
         if (explicitBase && !isBranchSelfRef(explicitBase, input.branch)) editArgs.push('--base', prBaseFromComparison(explicitBase));
-        for (const label of input.labels ?? []) if (label.trim()) editArgs.push('--add-label', label.trim());
-        const edited = run('gh', editArgs, opts);
+        for (const label of new Set((input.labels ?? []).map(label => label.trim()).filter(Boolean))) editArgs.push('--add-label', label);
+        let edited = run('gh', editArgs, opts);
         if (!edited.ok) return { ok: false, reason: 'gh', detail: detailOf(edited) || 'gh pr edit 실패' };
         if (input.draft !== undefined) {
           // 현재 draft 상태 조회 — 조회 실패/비정상 출력은 fail-closed(요청 draft 를 적용 못했는데
@@ -522,13 +545,43 @@ export function makePrManager(runner: CmdRunner = defaultCmdRunner): PrManager {
         if (input.reuseComment) run('gh', ['pr', 'comment', existing.url, '--body', input.reuseComment], opts);
         return { ok: true, url: existing.url, reused: true };
       }
+      let guardUnmeasured = false;
+      if (checkCreate) {
+        const seat = input.seat ?? seatFromEnvironment();
+        const verdict = checkCreate({ cwd, base: comparisonBase, seat, body: input.body }, run);
+        if (verdict.status === 'unknown' && verdict.reasons.length === 1 && verdict.reasons[0]?.code === 'inventory-unknown') {
+          const inPod = process.env.ELANOUS_SUBSTRATE === 'pod'
+            || Object.keys(process.env).some(key => key.startsWith('ELANOUS_POD_'));
+          if (inPod) {
+            // Pod state and mailbox are local to this Job. Count and alert only
+            // in the host parent, where the shared instance root is authoritative.
+            debug.log('pr-tool.open-guard', 'pod-unmeasured', { seat, reason: verdict.reasons[0].detail });
+          } else {
+            const count = recordUnmeasured({ seat, reason: verdict.reasons[0].detail });
+            if (count.blocked) {
+              const alert = run('eln', ['msg', 'post', '--from', seat ?? 'HARNESS', '--to', 'OP', '--kind', 'alert', '--body', `PR open-guard 판정 불가 1시간 ${count.count}회 · 새 PR 차단 · ${count.reason ?? verdict.reasons[0].detail}`]);
+              if (!alert.ok) debug.log('pr-tool.open-guard', 'op-alert-failed', { seat, reason: alert.err || alert.out || 'eln msg post 실패' });
+              return { ok: false, reason: 'guard', detail: `inventory-unknown: 1시간 ${count.count}회 · 새 PR 차단${count.reason ? ` (${count.reason})` : ''}` };
+            }
+          }
+          guardUnmeasured = true;
+        } else if (verdict.status !== 'allow') {
+          return { ok: false, reason: 'guard', detail: verdict.reasons.map(reason => `${reason.code}: ${reason.detail}${reason.prs?.length ? ` (${reason.prs.map(number => `#${number}`).join(', ')})` : ''}`).join('; ') };
+        }
+      }
       const createArgs = ['pr', 'create', '--head', input.branch, '--title', input.title, '--body', input.body];
       if (prBase) createArgs.push('--base', prBase);
       if (input.draft) createArgs.push('--draft');
-      const requestedLabels = (input.labels ?? []).map((label) => label.trim()).filter(Boolean);
+      const seat = input.seat ?? seatFromEnvironment();
+      const requiredLabels = [...(seat ? [`seat:${seat}`] : []), ...(guardUnmeasured ? ['pr-guard:unmeasured'] : [])];
+      const requestedLabels = [...new Set([...(input.labels ?? []), ...requiredLabels].map((label) => label.trim()).filter(Boolean))];
       const labeledArgs = [...createArgs];
       for (const label of requestedLabels) labeledArgs.push('--label', label);
-      const created = run('gh', labeledArgs, opts);
+      let created = run('gh', labeledArgs, opts);
+      if (!created.ok && requiredLabels.length && isLabelNotFoundFailure(created, requiredLabels)) {
+        for (const label of requiredLabels) run('gh', ['label', 'create', label, '--color', 'BFDADC'], opts);
+        created = run('gh', labeledArgs, opts);
+      }
       if (created.ok && created.out) {
         return {
           ok: true,
@@ -538,7 +591,9 @@ export function makePrManager(runner: CmdRunner = defaultCmdRunner): PrManager {
         };
       }
       if (requestedLabels.length > 0 && isLabelNotFoundFailure(created, requestedLabels)) {
-        const retry = run('gh', createArgs, opts);
+        const retryArgs = [...createArgs];
+        for (const label of requiredLabels) retryArgs.push('--label', label);
+        const retry = run('gh', retryArgs, opts);
         if (retry.ok && retry.out) {
           debug.log('autopilot.pr-manager', 'create.labels-omitted', {
             branch: input.branch,

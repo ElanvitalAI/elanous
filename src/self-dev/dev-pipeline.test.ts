@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import {
   planDevPipeline, runDevPipeline, toSelfImplementOptions, toAgentMissionSpec,
   resolveDevInputText, applyManualGoalEvidenceRequirement, DevPipelineError, WIRED_DISPATCHES, buildDefaultSelfImplementSeams, devResultOk,
+  preflightGoalDoneBoundary, GOAL_DONE_BOUNDARY_HUMAN_OBSERVATION_END_MS,
   selectUnmannedToolReviewer, unmannedToolReviewerRateFromConfig, DEFAULT_UNMANNED_TOOL_REVIEWER_RATE, reviewRolePinnedForLaunch,
   buildAgentMissionDevSpec, executeAgentMissionReroute, acpBackendName, toAcpAgentArgs, normalizeAcpResult, defaultDispatchAcp,
   buildSelfImplementDevSpec, selfImplementExitCode, executeSelfImplementReroute,
@@ -28,7 +29,7 @@ import { loadSelfDevRun, selfDevRunsDir } from './run-store.js';
 import { ensureRunIdentity } from '../harness/harness-space.js';
 import { ROLE_MODEL_DEFAULTS, clearLaunchRoleLlmOverrides, getLaunchRoleLlmOverrides, resolveRoleModel, setLaunchRoleLlmOverrides, setUserConfigOverlay } from '../user-config.js';
 import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
-import { formatGoalFileLintFinding, GOAL_FILE_LINT_ORIGINS, type GoalFileLintLevel } from '../self-implement/goal-author.js';
+import { explicitGoalDoneBoundaryLines, formatGoalFileLintFinding, GOAL_FILE_LINT_ORIGINS, inspectGoalDoneBoundary, type GoalFileLintLevel } from '../self-implement/goal-author.js';
 
 const T = (over: Partial<DevPipelineSpec> = {}): DevPipelineSpec => ({ input: { text: '기능 X' }, ...over });
 const presentRemote = () => ({ status: 0, stdout: 'origin\n', stderr: '' });
@@ -62,6 +63,121 @@ function expectedGoalFileLintStderrLine<Tag extends keyof typeof GOAL_FILE_LINT_
   return `[dev] goal-file-lint: ${formatGoalFileLintFinding({ level, tag, message })}\n`;
 }
 const CANONICAL_GOAL_FILE = '## PROBLEM\nproblem\n\n## WHAT TO BUILD\nbuild\n\n## ACCEPTANCE CRITERIA\ncriteria\n\n## REQUIRED EVIDENCE\n- [launch] child launch proof\n\n## TRACED PATHS\npaths\n\n## SCOPE BOUNDARY\nboundary\n\n## 답하지 못하는 것\nlimits\n\n## 불변식\nkeep\n\n## 판정 신호\nsignals';
+
+describe('TA goal done boundary', () => {
+  const boundary = '- 완료 경계 코드: src/self-dev/dev-pipeline.ts 에 사전 검사\n- 완료 경계 실물: 실제 발사 시 자식 생성 전 누락을 거부\n- 완료 경계 증거 명령: bun test src/self-dev/dev-pipeline.test.ts';
+
+  it('copies only explicit values from an ask and ignores code fences and placeholders', () => {
+    const ask = `\`\`\`\n${boundary}\n\`\`\`\n${boundary}`;
+    expect(explicitGoalDoneBoundaryLines(ask)).toEqual(boundary.split('\n'));
+    expect(inspectGoalDoneBoundary(`완료 경계 코드: TBD\n완료 경계 실물: \n완료 경계 증거 명령: -`).missing)
+      .toEqual(['완료 경계 코드', '완료 경계 실물', '완료 경계 증거 명령']);
+    expect(inspectGoalDoneBoundary('완료 경계 코드: ok\n완료 경계 실물: ok\n완료 경계 증거 명령: ok').missing)
+      .toEqual(['완료 경계 코드', '완료 경계 실물', '완료 경계 증거 명령']);
+    expect(inspectGoalDoneBoundary('완료 경계 코드: TBD (fill later)\n완료 경계 실물: TBD (fill later)\n완료 경계 증거 명령: Check that tests pass').missing)
+      .toEqual(['완료 경계 코드', '완료 경계 실물', '완료 경계 증거 명령']);
+    expect(inspectGoalDoneBoundary('완료 경계 코드: TBD - fill later\n완료 경계 실물: 추후 결정\n완료 경계 증거 명령: bun test src/example.test.ts').missing)
+      .toEqual(['완료 경계 코드', '완료 경계 실물']);
+    expect(inspectGoalDoneBoundary('완료 경계 코드: `"TBD - fill later"`\n완료 경계 실물: “\'추후 결정\'”\n완료 경계 증거 명령: bun test src/example.test.ts').missing)
+      .toEqual(['완료 경계 코드', '완료 경계 실물']);
+    expect(inspectGoalDoneBoundary('완료 경계 코드: ** [ ( TBD ) ] **\n완료 경계 실물: ~~“추후 결정”~~!\n완료 경계 증거 명령: bun test src/example.test.ts').missing)
+      .toEqual(['완료 경계 코드', '완료 경계 실물']);
+    expect(inspectGoalDoneBoundary('완료 경계 코드: src/example.ts의 TODO 표시를 제거\n완료 경계 실물: CLI가 TBD 표지를 거부\n완료 경계 증거 명령: bun test src/example.test.ts').missing)
+      .toEqual([]);
+    expect(inspectGoalDoneBoundary('완료 경계 코드: `src/example.ts의 TODO 표시를 제거`\n완료 경계 실물: "CLI가 TBD 표지를 거부"\n완료 경계 증거 명령: `bun test src/example.test.ts`').missing)
+      .toEqual([]);
+    expect(inspectGoalDoneBoundary('완료 경계 코드: src/example.ts 변경\n완료 경계 실물: CLI 가 누락 요청을 거부\n완료 경계 증거 명령: test results pass').missing)
+      .toEqual(['완료 경계 증거 명령']);
+    expect(inspectGoalDoneBoundary('완료 경계 코드: src/example.ts 변경\n완료 경계 실물: CLI 가 누락 요청을 거부\n완료 경계 증거 명령: test -f src/example.ts').missing)
+      .toEqual([]);
+    expect(inspectGoalDoneBoundary('완료 경계 코드: src/example.ts 변경\n완료 경계 실물: CLI 가 누락 요청을 거부\n완료 경계 증거 명령: test -e src/example.ts').missing)
+      .toEqual([]);
+    for (const evidence of ['test -f', 'test -e', 'bun', 'env']) {
+      const request = `완료 경계 코드: src/example.ts 변경\n완료 경계 실물: CLI 가 누락 요청을 거부\n완료 경계 증거 명령: ${evidence}`;
+      expect(inspectGoalDoneBoundary(request).missing).toEqual(['완료 경계 증거 명령']);
+      expect(() => preflightGoalDoneBoundary({ file: '<harness request>' }, request,
+        'ta-boundary-test', 'cli-harness-say', 'request')).toThrow(/골 완료 경계 누락: 완료 경계 증거 명령/);
+    }
+    expect(inspectGoalDoneBoundary('완료 경계 코드: src/example.ts 변경\n완료 경계 실물: CLI 가 누락 요청을 거부\n완료 경계 증거 명령: 테스트 결과 확인').missing)
+      .toEqual(['완료 경계 증거 명령']);
+    expect(inspectGoalDoneBoundary('완료 경계 코드: src/example.ts 변경\n완료 경계 실물: CLI 가 누락 요청을 거부\n완료 경계 증거 명령: ELANOUS_STATE_DIR=/tmp/proof eln --test=/tmp/proof logs --event goal-done-boundary-rejected').missing)
+      .toEqual([]);
+    expect(inspectGoalDoneBoundary('완료 경계 코드: src/example.ts 변경\n완료 경계 실물: CLI 가 누락 요청을 거부\n완료 경계 증거 명령: `eln logs --event goal-done-boundary-rejected`').missing)
+      .toEqual([]);
+    expect(inspectGoalDoneBoundary('완료 경계 코드: src/example.ts 변경\n완료 경계 실물: CLI 가 누락 요청을 거부\n완료 경계 증거 명령: FOO="a b" bun test src/example.test.ts').missing)
+      .toEqual([]);
+  });
+
+  it('blocks a TA-origin goal at the real pipeline dispatch even when old lint bypasses are set', async () => {
+    const old = process.env.ELANOUS_TASK_CARD_ID;
+    process.env.ELANOUS_TASK_CARD_ID = 'ta-boundary-test';
+    let launched = false;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      await expect(runDevPipeline(T({ input: { file: '/ta-goal.md' }, allowNoEvidence: true, allowGoalLintErrors: true }), {
+        readFile: () => CANONICAL_GOAL_FILE,
+        buildSelfImplementSeams: () => ({} as SelfImplementSeams),
+        runSelfImplement: async () => { launched = true; return { ok: true } as SelfImplementResult; },
+      })).rejects.toThrow(/골 완료 경계 누락: 완료 경계 코드 · 완료 경계 실물 · 완료 경계 증거 명령.*TA 카드 ta-boundary-test/);
+      expect(launched).toBe(false);
+      expect(log).toHaveBeenCalledWith('dev-pipeline', 'goal-done-boundary-rejected', expect.objectContaining({ taskCardId: 'ta-boundary-test', missing: ['완료 경계 코드', '완료 경계 실물', '완료 경계 증거 명령'] }));
+      const insideAcceptance = CANONICAL_GOAL_FILE.replace('## ACCEPTANCE CRITERIA\ncriteria', `## ACCEPTANCE CRITERIA\ncriteria\n${boundary}`);
+      preflightGoalDoneBoundary({ file: '/ta-goal.md' }, insideAcceptance, 'ta-boundary-test');
+      expect(() => preflightGoalDoneBoundary({ file: '/ta-goal.md' }, `${CANONICAL_GOAL_FILE}\n${boundary}`, 'ta-boundary-test'))
+        .toThrow(/골 완료 경계 누락/);
+      const placeholders = CANONICAL_GOAL_FILE.replace('## ACCEPTANCE CRITERIA\ncriteria',
+        '## ACCEPTANCE CRITERIA\ncriteria\n- 완료 경계 코드: ok\n- 완료 경계 실물: ok\n- 완료 경계 증거 명령: ok');
+      expect(() => preflightGoalDoneBoundary({ file: '/ta-placeholder.md' }, placeholders, 'ta-boundary-test'))
+        .toThrow(/골 완료 경계 누락: 완료 경계 코드 · 완료 경계 실물 · 완료 경계 증거 명령/);
+      expect(() => preflightGoalDoneBoundary({ file: '<harness request>' },
+        '완료 경계 코드: TBD - fill later\n완료 경계 실물: 추후 결정\n완료 경계 증거 명령: bun test src/example.test.ts',
+        'ta-boundary-test', 'cli-harness-say', 'request'))
+        .toThrow(/골 완료 경계 누락: 완료 경계 코드 · 완료 경계 실물.*원 요청/);
+    } finally {
+      log.mockRestore();
+      if (old === undefined) delete process.env.ELANOUS_TASK_CARD_ID;
+      else process.env.ELANOUS_TASK_CARD_ID = old;
+    }
+  });
+
+  it('lets a human goal launch during observation and emits a warning event', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const write = spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      preflightGoalDoneBoundary({ file: '/human-goal.md' }, CANONICAL_GOAL_FILE, undefined, 'cli-harness-say', 'goal', Date.parse('2026-10-16T12:00:00+09:00'));
+      expect(log).toHaveBeenCalledWith('dev-pipeline', 'goal-done-boundary-warned', expect.objectContaining({ file: '/human-goal.md', taskCardId: null }));
+      expect(write).toHaveBeenCalledWith(expect.stringContaining('사람 요청 관측 기간에는 발사를 계속합니다'));
+    } finally {
+      log.mockRestore();
+      write.mockRestore();
+    }
+  });
+
+  it('warns for the authored dev --say GOAL and stops human observation after one week', () => {
+    // dev --say is authored into a file by index.ts before buildDevCliSpec stamps cli-dev-ask.
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const write = spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      preflightGoalDoneBoundary({ file: '/dev-say-authored.md' }, CANONICAL_GOAL_FILE, undefined,
+        'cli-dev-ask', 'goal', GOAL_DONE_BOUNDARY_HUMAN_OBSERVATION_END_MS - 1);
+      expect(log).toHaveBeenCalledWith('dev-pipeline', 'goal-done-boundary-warned', expect.objectContaining({ file: '/dev-say-authored.md', source: 'goal' }));
+      expect(write).toHaveBeenCalledTimes(1);
+      log.mockClear();
+      write.mockClear();
+      preflightGoalDoneBoundary({ file: '/dev-say-authored.md' }, CANONICAL_GOAL_FILE, undefined,
+        'cli-dev-ask', 'goal', GOAL_DONE_BOUNDARY_HUMAN_OBSERVATION_END_MS);
+      expect(log).not.toHaveBeenCalled();
+      expect(write).not.toHaveBeenCalled();
+      // TA remains fail-closed after the human observation window ends.
+      expect(() => preflightGoalDoneBoundary({ file: '/ta-goal.md' }, CANONICAL_GOAL_FILE,
+        'ta-after-window', 'cli-dev-ask', 'goal', GOAL_DONE_BOUNDARY_HUMAN_OBSERVATION_END_MS))
+        .toThrow(/골 완료 경계 누락/);
+    } finally {
+      log.mockRestore();
+      write.mockRestore();
+    }
+  });
+});
 
 describe('planDevPipeline — 순수 정규화/검증/디스패치(계약 SSOT)', () => {
   it('reviewer context는 spec에서 resolved plan까지 순서와 라벨을 보존한다', () => {

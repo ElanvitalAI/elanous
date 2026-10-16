@@ -6,6 +6,11 @@
 // trip 은 별 integration test (사용자 환경에서 manual smoke).
 
 import { describe, test, expect, beforeEach } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { withTestHome } from '../../test/helpers/with-test-home.js';
+import { withFakeBins } from '../ux-sim/fake-bin.js';
 import {
   GrokLeaderManager,
   getGrokLeaderManager,
@@ -68,22 +73,35 @@ describe('GrokLeaderManager · singleton', () => {
 });
 
 describe('GrokLeaderManager · ensureLeader idempotency contract', () => {
-  // 본 테스트는 실 binary spawn — `grok` 명령이 PATH 또는 ~/.grok/bin/
-  // 에 있을 때만 의미 있음. 없으면 spawn 이 ENOENT 로 즉시 fail · child
-  // exitCode 가 set 됨. contract: ensureLeader 가 throw 안 함 (exit 은
-  // 비동기), 두 번째 호출이 새 spawn 시도 (첫 instance 가 dead 인 경우).
+  // 실 grok 을 띄우지 않는다: 게이트 Pod 엔 grok 이 없고(`Executable not found in $PATH: "grok"`),
+  // 개발 기계엔 ~/.grok/bin/grok 이 있어 진짜 leader 가 떴다. 빈 HOME(~/.grok 없음) ⊕ PATH 앞
+  // 가짜 grok(src/ux-sim/fake-bin)으로 «PATH fallback → spawn → 상태 반환» 경로만 잰다.
 
-  test('ensureLeader returns state object (does not throw)', () => {
-    const mgr = new GrokLeaderManager();
-    // 실 binary 미존재 시 ENOENT 가 'error' event 로 emit 됨 (sync 에서
-    // throw 안 함). state 가 정상 반환되는지만 검증.
-    const state = mgr.ensureLeader();
-    expect(state).toBeDefined();
-    expect(typeof state.pid === 'number' || state.pid === null).toBe(true);
-    // Cleanup — leader 가 spawn 됐다면 즉시 kill (테스트 hang 방지)
-    const proc = mgr._leaderProcess();
-    if (proc && proc.exitCode === null) {
-      proc.kill('SIGKILL');
+  test('ensureLeader returns state object (does not throw)', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'grok-leader-home-'));
+    try {
+      await withTestHome(home, () => withFakeBins({ grok: { sleepSeconds: 30 } }, async (fakeBins) => {
+        const mgr = new GrokLeaderManager();
+        try {
+          const state = mgr.ensureLeader();
+          expect(state).toBeDefined();
+          expect(typeof state.pid).toBe('number');
+          expect(mgr._leaderProcess()).not.toBeNull();
+          // 살아 있으면 두 번째 호출은 새로 띄우지 않는다.
+          expect(mgr.ensureLeader().pid).toBe(state.pid);
+          expect(await fakeBins.waitForCalls(1)).toEqual([{ name: 'grok', argv: ['agent', 'leader'] }]);
+        } finally {
+          // 단언이 실패해도 가짜 leader(30초 sleep)를 남기지 않는다.
+          const proc = mgr._leaderProcess();
+          if (proc && proc.exitCode === null) {
+            const exited = new Promise((resolve) => proc.once('exit', resolve));
+            proc.kill('SIGKILL');
+            await exited;
+          }
+        }
+      }));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });

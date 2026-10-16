@@ -189,12 +189,13 @@ if (process.argv[2] === 'rev-list') console.log('0');
       writeFileSync(notes, '# Release\n');
       const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, previousVersion: '0.2.18' }, deps: { root, runBash } });
       expect(first.status).toBe('failed');
-      expect(first.path.slice(-2)).toEqual(['gate', 'failed']);
+      expect(first.path.slice(-3)).toEqual(['gate', 'gate-triage', 'failed']);
       const stateFile = join(root, 'graph-runs', 'release-loop', `${first.runId}.json`);
       if (shape === 'stopped') {
         // The ledger `graph runs stop` leaves when it cuts a running gate (manageGraphRun): the gate is the last record.
         const saved = JSON.parse(readFileSync(stateFile, 'utf8')) as GraphRunState;
-        saved.path.pop(); saved.nodes.pop();
+        // A stopped gate never reaches either the shadow triage or failed node.
+        saved.path.splice(-2); saved.nodes.splice(-2);
         saved.nodes[saved.nodes.length - 1] = { nodeId: 'gate', ok: false, exit: null, executed: false, error: STOPPED_NODE_ERROR, endedAt: '2026-10-12T00:10:00.000Z' };
         saved.executed = saved.nodes.filter((node) => node.executed).length;
         writeFileSync(stateFile, `${JSON.stringify(saved, null, 2)}\n`);

@@ -1,6 +1,7 @@
 graph_id: harness-gc
 loop:
   title: Harness GC
+  root: 수호자
   description: Reclaim only ladder-safe harness worktrees and merged branch-only refs in bounded ticks
   owner: OP
   trigger:

@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { GATE_REMOTE_DEFAULTS, runOnRemote, type GateRemoteRunner, type SshResult } from './gate-remote.js';
 import { runTrainGateOnHost, trainGateOnHost, trainGateScript, type TrainGateObservation } from './train-gate-remote.js';
 
@@ -10,7 +13,7 @@ const settings = { ...GATE_REMOTE_DEFAULTS, slotWaitSeconds: 0 };
 const RAN = (rc: number): SshResult => ({ rc: 0, stdout: 'out\n', stderr: `\n__GATE_REMOTE_RC=${rc}\n` });
 const BUSY: SshResult = { rc: 98, stdout: '', stderr: '__GATE_REMOTE_BUSY\n' };
 
-function fakeRunner(opts: { dirty?: boolean; ssh?: SshResult; diff?: string } = {}): GateRemoteRunner & { calls: string[][]; scripts: string[] } {
+function fakeRunner(opts: { dirty?: boolean; ssh?: SshResult; diff?: string; missingTest?: string; symlinkTest?: string } = {}): GateRemoteRunner & { calls: string[][]; scripts: string[] } {
   const calls: string[][] = [];
   const scripts: string[] = [];
   return {
@@ -19,7 +22,9 @@ function fakeRunner(opts: { dirty?: boolean; ssh?: SshResult; diff?: string } = 
       calls.push([cmd, ...args]);
       if (cmd !== 'git') return { rc: 127, stdout: '', stderr: 'not git' };
       if (args[0] === 'status') return { rc: 0, stdout: opts.dirty ? ' M src/x.ts\n' : '', stderr: '' };
-      if (args[0] === 'cat-file') return { rc: 0, stdout: 'commit\n', stderr: '' };
+      if (args[0] === 'cat-file') return opts.missingTest && args.at(-1)?.endsWith(`:${opts.missingTest}`)
+        ? { rc: 1, stdout: '', stderr: 'missing' } : { rc: 0, stdout: 'commit\n', stderr: '' };
+      if (args[0] === 'ls-tree') return { rc: 0, stdout: `${opts.symlinkTest === args.at(-1) ? '120000' : '100644'} blob ${'f'.repeat(40)}\t${args.at(-1)}\0`, stderr: '' };
       if (args[0] === 'diff') return { rc: 0, stdout: opts.diff ?? '', stderr: '' };
       if (args[0] === 'rev-parse') {
         const ref = args.at(-1)!.replace('^{commit}', '');
@@ -35,6 +40,34 @@ const HEAVY = ['tsc', 'bun test', 'test:deterministic', 'nexus', 'ci-typecheck-c
 const localText = (runner: { calls: string[][] }) => runner.calls.map((call) => call.join(' '));
 
 describe('runTrainGateOnHost', () => {
+  test('scenario importer test is added on the remote host; stale scenario is unmeasured without execution', async () => {
+    const scenario = { version: 1, baseSha: BASE, headSha: COMMIT, changedFiles: ['src/a.ts'], selectedTests: [{ path: 'test/importer.test.ts', reasons: ['import'] }], coverage: { status: 'measured', unmeasured: [], reach: [{ path: 'src/a.ts', changed: [], import: ['test/importer.test.ts'], spawn: [], unmeasured: [] }] } };
+    const runner = fakeRunner();
+    const input = { repo: '/r', commit: COMMIT, baseSha: BASE, changedFiles: ['src/a.ts'], settings, scenario };
+    expect((await runTrainGateOnHost(input, runner, { observe: () => {} })).outcome).toBe('pass');
+    expect(runner.scripts[0]).toContain('test/importer.test.ts');
+    const dir = mkdtempSync(join(tmpdir(), 'train-scenario-'));
+    try {
+      const scenarioFile = join(dir, 'scenario.json');
+      writeFileSync(scenarioFile, JSON.stringify(scenario));
+      const fromFile = fakeRunner();
+      expect((await runTrainGateOnHost({ ...input, scenario: undefined, scenarioFile }, fromFile, { observe: () => {} })).outcome).toBe('pass');
+      expect(fromFile.scripts[0]).toContain('test/importer.test.ts');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+    const stale = fakeRunner();
+    expect((await runTrainGateOnHost({ ...input, scenario: { ...scenario, headSha: MAIN } }, stale, { observe: () => {} })).outcome).toBe('unmeasured');
+    expect(stale.scripts).toHaveLength(0);
+    const missing = fakeRunner({ missingTest: 'test/importer.test.ts' });
+    const absent = await runTrainGateOnHost(input, missing, { observe: () => {} });
+    expect(absent).toMatchObject({ outcome: 'unmeasured', reason: 'selected test missing at head: test/importer.test.ts' });
+    expect(missing.scripts).toHaveLength(0);
+    const symlink = fakeRunner({ symlinkTest: 'test/importer.test.ts' });
+    expect(await runTrainGateOnHost(input, symlink, { observe: () => {} })).toMatchObject({ outcome: 'unmeasured', reason: 'selected test is not a regular file at head: test/importer.test.ts' });
+    expect(symlink.scripts).toHaveLength(0);
+    const incomplete = fakeRunner();
+    expect((await runTrainGateOnHost({ ...input, scenario: { ...scenario, coverage: { ...scenario.coverage, reach: [] } } }, incomplete, { observe: () => {} })).outcome).toBe('unmeasured');
+    expect(incomplete.scripts).toHaveLength(0);
+  });
   test('rc 0 on the host is pass; heavy steps run only in the ssh script, never locally', async () => {
     const runner = fakeRunner();
     const observed: TrainGateObservation[] = [];

@@ -590,8 +590,11 @@ function pruneUnusedVersions(dir: string, outcome: VersionPruneOutcome, listProc
             try { owner = statSync(join('/proc', pid)).uid; stat = readFileSync(join('/proc', pid, 'stat'), 'utf8'); }
             catch (failure) { if (exited(failure) && !existsSync(join('/proc', pid))) continue; throw failure; }
             if (procStatHoldsNothing(stat)) continue;
-            // Our own links must be readable. Another UID's link failure (denied, or ENOENT from a live process) falls back to its argv.
-            if ((code === 'EACCES' || code === 'EPERM' || code === 'ENOENT') && owner !== process.getuid?.()) {
+            // A denied link falls back to argv for any owner: Linux ptrace access also refuses same-UID
+            // processes holding extra capabilities or another user namespace (systemd --user, rootless
+            // containers), so requiring them would disable pruning on every systemd host. ENOENT from a
+            // live process stays fatal for our own UID and falls back to argv only for another UID.
+            if (code === 'EACCES' || code === 'EPERM' || (code === 'ENOENT' && owner !== process.getuid?.())) {
               if (!argvRead.has(pid)) {
                 argvRead.add(pid);
                 let argv: string | undefined;

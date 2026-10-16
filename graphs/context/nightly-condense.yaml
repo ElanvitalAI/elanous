@@ -2,6 +2,7 @@ graph_id: nightly-condense
 version: 1
 loop:
   title: Nightly context condensation
+  root: 조율자
   description: Condense yesterday's context into project/seat memory and OP conflict-card candidates; never publish cards.
   trigger:
     cron: '30 3 * * *'

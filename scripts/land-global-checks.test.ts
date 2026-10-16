@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LAND_GLOBAL_CHECKS, landGlobalChecks, runLandGlobalChecksGate, type LandGlobalChecksRun } from './land-global-checks.js';
+import { TUI_ENTRY_PATH } from '../test/helpers/dashboard-source.js';
 
 const ROOT = join(import.meta.dir, '..');
 
@@ -29,7 +30,7 @@ test('새 CLI 하위 명령(src/index.ts · src/cli/ 등록 모듈)은 src/index
   expect(landGlobalChecks(['src/index.ts'])).toEqual(['src/index.test.ts']);
   expect(landGlobalChecks(['src/cli/harness/sub-cli.ts'])).toEqual(['src/index.test.ts']);
   expect(landGlobalChecks(['src/cli/new-command-cli.test.ts'])).toEqual([]);
-  expect(landGlobalChecks(['src/dashboard/index.ts'])).toEqual([]);
+  expect(landGlobalChecks([TUI_ENTRY_PATH])).toEqual([]);
 });
 
 // 10-11 #26232 — src/cli 밖 명령 등록 모듈이 하위 명령을 더해 index.test 목록 스냅샷을 깼다(main 빨강).

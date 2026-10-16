@@ -366,6 +366,29 @@ describe('author_grade overlay state — 적응형 저작(GRAPH-AUTHOR-GRADE) �
     expect(demoted.stateExtraKeys).toBeUndefined();
   });
 
+  test('L1 생산자가 제공한 일곱 상태 값은 기존 graph-overlay-decision state에 그대로 남는다', () => {
+    const state = {
+      substrate: 'pod', freeze: false, docs_only: true, provider: 'openai-codex',
+      quota: 0, machines: 2, seats: 0,
+    };
+    const observation = overlayDecisionObservation({ stage: 'launch', considered: 1, state: { ...state, unrelated: 'not projected' } });
+    expect(observation).toEqual({ stage: 'launch', considered: 1, state, stateExtraKeys: ['unrelated'] });
+  });
+
+  test('L1 생산자가 키를 제공하지 않으면 state에 없는 채로 남고 false·0과 구별된다', () => {
+    const observation = overlayDecisionObservation({ stage: 'runtime', state: { freeze: false, quota: 0 } });
+    expect(observation).toEqual({ stage: 'runtime', state: { freeze: false, quota: 0 } });
+    for (const key of ['substrate', 'docs_only', 'provider', 'machines', 'seats']) {
+      expect(Object.hasOwn(observation.state, key)).toBe(false);
+    }
+    const absent = overlayDecisionObservation({ stage: 'launch', state: {} });
+    for (const key of ['substrate', 'freeze', 'docs_only', 'provider', 'quota', 'machines', 'seats']) {
+      expect(Object.hasOwn(absent.state, key)).toBe(false);
+    }
+    expect(observation.stateExtraKeys).toBeUndefined();
+    expect(absent.stateExtraKeys).toBeUndefined();
+  });
+
   test('ⓑ normalizeAuthorGrade — full→normal · lite→lite · complex→complex · 그 밖은 지어내지 않는다', () => {
     expect(normalizeAuthorGrade('full')).toBe('normal');
     expect(normalizeAuthorGrade('lite')).toBe('lite');

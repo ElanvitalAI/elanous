@@ -9,7 +9,9 @@
 // 인가 서버가 RFC 8628 을 광고할 때는 장치 코드로 자격을 얻는다.
 // 경계: 새 CLI 하위 명령은 더하지 않는다.
 
-import { join } from 'node:path';
+import { chmodSync, closeSync, fchmodSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { dirname, join } from 'node:path';
 import { generatePkcePair } from '../oauth/pkce.js';
 import {
   authStorePath,
@@ -19,6 +21,7 @@ import {
   saveTokens,
   type OAuthTokens,
   type ProviderAuthState,
+  type WriteTokensOpts,
 } from '../oauth/store.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
@@ -175,7 +178,7 @@ function loadIssuerState(
   if (legacy === path) return null;
   const stranded = loadTokens(issuer, legacy);
   if (!stranded || stranded.authMode !== AUTH_MODE) return null;
-  saveTokens(
+  saveMcpTokens(
     issuer,
     stranded.tokens,
     {
@@ -424,6 +427,15 @@ function registrationFromState(state: ProviderAuthState | null): ClientRegistrat
   };
 }
 
+function saveMcpTokens(issuer: string, tokens: OAuthTokens, opts: WriteTokensOpts, path: string): void {
+  // The shared store creates path.tmp with default permissions and chmods only
+  // after rename. Restrict the temporary file before this MCP credential write.
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(`${path}.tmp`, '', { mode: 0o600, flag: 'w' });
+  chmodSync(`${path}.tmp`, 0o600);
+  saveTokens(issuer, tokens, opts, path);
+}
+
 function persistRegistration(
   issuer: string,
   registration: ClientRegistration,
@@ -431,7 +443,7 @@ function persistRegistration(
   tokens?: OAuthTokens,
 ): void {
   const existing = loadTokens(issuer, path);
-  saveTokens(
+  saveMcpTokens(
     issuer,
     tokens ?? existing?.tokens ?? { accessToken: '', refreshToken: '', expiresAt: null },
     {
@@ -685,8 +697,45 @@ function persistTokens(
 ): void {
   const existing = loadTokens(issuer, path);
   const clientId = registration?.clientId ?? existing?.accountUuid;
-  const clientSecret = registration?.clientSecret ?? existing?.organizationUuid;
-  saveTokens(
+  const switchingClient = registration !== null && existing !== null && registration.clientId !== existing.accountUuid;
+  const clientSecret = registration?.clientSecret ?? (switchingClient ? undefined : existing?.organizationUuid);
+  if (switchingClient) {
+    // Build the complete replacement in memory. A failed temporary write or rename
+    // must leave the old client's registration AND refresh token together on disk.
+    const store = JSON.parse(readFileSync(path, 'utf8')) as { providers: Record<string, ProviderAuthState> };
+    const previous = store.providers[issuer];
+    if (!previous || previous.accountUuid !== existing?.accountUuid) {
+      throw new McpOAuthError('token', 'stored client registration changed during token exchange');
+    }
+    const replacement: ProviderAuthState = {
+      ...previous,
+      tokens,
+      lastRefresh: new Date().toISOString(),
+      authMode: AUTH_MODE,
+      accountUuid: registration.clientId,
+    };
+    delete replacement.redirectUri;
+    delete replacement.organizationUuid;
+    if (clientSecret) replacement.organizationUuid = clientSecret;
+    if (registration.redirectUri) replacement.redirectUri = registration.redirectUri;
+    store.providers[issuer] = replacement;
+    // A stale path.tmp may be 0644. Never write new tokens into it, even briefly.
+    // The unique sibling is created exclusively and private before any token bytes are written.
+    const tmp = `${path}.${randomUUID()}.tmp`;
+    const fd = openSync(tmp, 'wx', 0o600);
+    try {
+      fchmodSync(fd, 0o600);
+      writeFileSync(fd, `${JSON.stringify(store, null, 2)}\n`, 'utf8');
+      closeSync(fd);
+      renameSync(tmp, path);
+    } catch (error) {
+      try { closeSync(fd); } catch { /* already closed */ }
+      try { unlinkSync(tmp); } catch { /* already renamed */ }
+      throw error;
+    }
+    return;
+  }
+  saveMcpTokens(
     issuer,
     tokens,
     {

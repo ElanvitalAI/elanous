@@ -1,9 +1,22 @@
-import { expect, test } from 'bun:test';
-import { defaultResyncRun, probeReleaseRun, releaseWindowState, resyncTickWithReleaseProbe, stewardResyncRepoRoot } from './resync-tick.js';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, beforeEach, expect, test } from 'bun:test';
+import { acquireOpSeatFlock, defaultResyncRun, opSeatFlockPath, opSeatLockRoot, probeReleaseRun, releaseWindowState, resyncTickWithReleaseProbe, stewardResyncRepoRoot } from './resync-tick.js';
+import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { dlopen, FFIType } from 'bun:ffi';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+
+const instanceRoots: string[] = [];
+beforeEach(() => {
+  const root = mkdtempSync(join(tmpdir(), 'resync-instance-'));
+  instanceRoots.push(root);
+  setElanousConfigDir(root);
+});
+afterEach(() => {
+  resetElanousConfigDir();
+  for (const dir of instanceRoots.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 
 test('resync tick passes the measured result to the steward log', async () => {
   const rows: unknown[] = [];
@@ -125,5 +138,118 @@ test('scheduled cut minus 40 minutes through publish plus 60 minutes skips resyn
       (event, data) => events.push({ event, data }), resyncPendingPathForTest(), () => 'idle', () => window);
     expect(result).toEqual({ decision: 'skipped-release-window', reason });
     expect(events).toEqual([{ event: 'resync-tick', data: result }]);
+  }
+});
+
+function tryNonBlockingFlock(path: string): (() => void) | null {
+  const libc = process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6';
+  const lib = dlopen(libc, { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } });
+  const flock = lib.symbols.flock as (fd: number, op: number) => number;
+  const fd = openSync(path, constants.O_RDWR | constants.O_NOFOLLOW);
+  if (flock(fd, 2 | 4) !== 0) { closeSync(fd); return null; }
+  return () => { try { flock(fd, 8); } finally { closeSync(fd); } };
+}
+
+test('a second concurrent acquirer cannot enter the OP-seat critical section until release frees the lock', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'op-seat-flock-'));
+  try {
+    const first = await acquireOpSeatFlock(root);
+    expect(first.path).toBe(opSeatFlockPath(root));
+    const inspect = openSync(first.path, constants.O_RDONLY);
+    try {
+      expect(fstatSync(inspect).isFile()).toBe(true);
+      expect((lstatSync(first.path).mode & 0o077)).toBe(0);
+    } finally { closeSync(inspect); }
+    expect(tryNonBlockingFlock(first.path)).toBeNull();
+    let entered = false;
+    const second = acquireOpSeatFlock(root, 5_000).then((held) => { entered = true; held.release(); });
+    await Bun.sleep(80);
+    expect(entered).toBe(false);
+    first.release();
+    await second;
+    expect(entered).toBe(true);
+    const after = tryNonBlockingFlock(first.path);
+    expect(after).not.toBeNull();
+    after!();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('resyncTickWithReleaseProbe holds the shared OP-seat flock across the mutating section and releases it on every exit', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'resync-flock-'));
+  setElanousConfigDir(root);
+  try {
+    const pendingPath = join(root, 'steward', 'resync-pending.json');
+    const summary = { candidates: 1, tried: 1, saved: 1, savedRatio: 1 };
+    let heldDuringRun = false;
+    const result = await resyncTickWithReleaseProbe(async () => {
+      heldDuringRun = tryNonBlockingFlock(opSeatFlockPath(root)) === null;
+      return summary;
+    }, () => {}, pendingPath, () => 'idle', () => 'outside');
+    expect(result).toEqual({ decision: 'ran', summary });
+    expect(heldDuringRun).toBe(true);
+    const after = tryNonBlockingFlock(opSeatFlockPath(root));
+    expect(after).not.toBeNull();
+    after!();
+    let heldDuringSkip = false;
+    expect(await resyncTickWithReleaseProbe(async () => { throw new Error('must not run'); }, () => {}, pendingPath, () => {
+      heldDuringSkip = tryNonBlockingFlock(opSeatFlockPath(root)) === null;
+      return 'active';
+    })).toEqual({ decision: 'skipped-release', reason: 'release run active' });
+    expect(heldDuringSkip).toBe(true);
+    const afterSkip = tryNonBlockingFlock(opSeatFlockPath(root));
+    expect(afterSkip).not.toBeNull();
+    afterSkip!();
+  } finally {
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('every OP-seat locker resolves one canonical lock file: default, explicit, and trailing-slash roots agree', () => {
+  const root = mkdtempSync(join(tmpdir(), 'op-seat-root-'));
+  setElanousConfigDir(root);
+  try {
+    const canonical = join(root, 'steward', 'op-seat.flock');
+    expect(opSeatLockRoot()).toBe(root);
+    expect(opSeatFlockPath()).toBe(canonical);
+    expect(opSeatFlockPath(root)).toBe(canonical);
+    expect(opSeatFlockPath(`${root}/`)).toBe(canonical);
+    expect(opSeatFlockPath(`${root}//`)).toBe(canonical);
+  } finally {
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('OP-seat flock acquisition failure takes the failed-tick path (decision + log) instead of throwing', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'resync-flock-fail-'));
+  setElanousConfigDir(root);
+  try {
+    const pendingPath = join(root, 'steward', 'resync-pending.json');
+    let ran = false;
+    const noop = async () => { ran = true; return { candidates: 0, tried: 0, saved: 0, savedRatio: null }; };
+    const rows: Array<{ event: string; data: Record<string, unknown> }> = [];
+
+    // (a) the lock path cannot be opened — a directory sits where the lock file belongs
+    mkdirSync(opSeatFlockPath(root), { recursive: true });
+    const openFailure = await resyncTickWithReleaseProbe(noop, (event, data) => rows.push({ event, data }), pendingPath, () => 'idle', () => 'outside');
+    expect(openFailure.decision).toBe('failed');
+    expect(openFailure.reason ?? '').not.toBe('');
+    expect(ran).toBe(false);
+    expect(rows).toEqual([{ event: 'resync-tick', data: { ...openFailure } }]);
+    rmSync(opSeatFlockPath(root), { recursive: true, force: true });
+
+    // (b) the lock file exists but is not private (0644) — acquisition refuses it
+    writeFileSync(opSeatFlockPath(root), '');
+    chmodSync(opSeatFlockPath(root), 0o644);
+    rows.length = 0;
+    const reason = 'OP seat flock must be a private regular file (0600)';
+    expect(await resyncTickWithReleaseProbe(noop, (event, data) => rows.push({ event, data }), pendingPath, () => 'idle', () => 'outside'))
+      .toEqual({ decision: 'failed', reason });
+    expect(ran).toBe(false);
+    expect(rows).toEqual([{ event: 'resync-tick', data: { decision: 'failed', reason } }]);
+  } finally {
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
   }
 });

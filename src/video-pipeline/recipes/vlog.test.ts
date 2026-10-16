@@ -4,13 +4,13 @@
 //   🩸 2026-09-23: `recipes` 명령이 find-narrative 를 «묶임»으로 셌는데 계약이 달라 걸으면 죽었다.
 //   ⇒ 관문(frame-exact · duck)은 «지어낸 음성»으로 빨강이 나는지까지 본다.
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ffmpeg } from './ffmpeg.js';
+import { ffmpeg, run } from './ffmpeg.js';
 import type { RecipeCtx } from './types.js';
 import {
-  alphaMean, authorShotsJson, bodyThenDuck, buildLayers, extractCutsWithHandles, frameExactGate, levelBasedDuckGate,
+  alphaMean, alphaMeanFor, authorShotsJson, bodyThenDuck, buildLayers, extractCutsWithHandles, frameExactGate, levelBasedDuckGate,
   LINE_CHARS, probeSources, resolvePing, resolveTimeline, timelineReadback, VLOG, wrapLines, type HandleManifest,
 } from './vlog.js';
 import { findNarrative } from './upstream.js';
@@ -18,7 +18,13 @@ import { findNarrative } from './upstream.js';
 let root = '';
 let src = '';
 const ctxOf = (state: Record<string, unknown>, workdir = join(root, 'work')): RecipeCtx => ({ workdir, state, log: () => {} });
+const renderToolBin = process.env.ELANOUS_TEST_FFMPEG_DRAW_BIN || 'ffmpeg';
+const measureWithRenderTool = alphaMeanFor(renderToolBin);
+const filterProbe = run(renderToolBin, ['-hide_banner', '-filters']);
+const hasLayerFilters = filterProbe.ok && ['drawtext', 'alphaextract', 'signalstats'].every((filter) =>
+  new RegExp(`\\b${filter}\\b`).test(filterProbe.out));
 
+// 빈 HOME의 cold ffmpeg 기동은 Bun의 기본 5초 hook 한도를 넘을 수 있다.
 beforeAll(() => {
   root = mkdtempSync(join(tmpdir(), 'vlog-rec-'));
   src = join(root, 'src');
@@ -34,7 +40,7 @@ beforeAll(() => {
   }
   const music = ffmpeg(['-f', 'lavfi', '-i', 'sine=f=220:d=20', '-af', 'volume=0.5', join(root, 'music.wav')]);
   if (!music.ok) throw new Error(music.err);
-});
+}, 60_000);
 afterAll(() => { rmSync(root, { recursive: true, force: true }); });
 
 describe('vlog 레시피 — 실제 ffmpeg', () => {
@@ -99,15 +105,68 @@ describe('vlog 레시피 — 실제 ffmpeg', () => {
     expect(g.outcome).toBe('weak');
   }, 60_000);
 
-  it('⭐ build-layers — 덮는 층(스크림·자막)이 «투명»하다 (🩸 불투명 자막이 영상 전체를 덮었다)', async () => {
+  it.skipIf(!hasLayerFilters)('⭐ build-layers — 실물 필터가 있으면 스크림·자막 알파를 잰다', async () => {
     const shots = join(root, 'shots-text.json');
     writeFileSync(shots, JSON.stringify({ fps: 30, width: 320, height: 240, target_dur: 2, chapters: [{ id: 'C01', text: '안녕하세요', cuts: [{ src: '/x', in: 0, dur: 2 }] }] }));
-    const r = await buildLayers(ctxOf({ shots_json: shots }, join(root, 'lay')));
+    const font = join(import.meta.dir, '../../../apps/ios/ElanousiOS/ElanousiOS/Fonts/D2Coding-Ver1.3.2-20180524.ttc');
+    expect(existsSync(font)).toBe(true);
+    const renderCalls: string[][] = [];
+    const state: Record<string, unknown> = {
+      shots_json: shots,
+      font_file: font,
+      ffmpeg: (args: readonly string[], timeout?: number) => {
+        renderCalls.push([...args]);
+        return run(renderToolBin, ['-hide_banner', '-loglevel', 'error', '-y', ...args], timeout);
+      },
+      alpha_mean: measureWithRenderTool,
+    };
+    const r = await buildLayers(ctxOf(state, join(root, 'lay')));
+    expect(renderCalls.length).toBe(3);
+    if (r.outcome !== 'ok') throw new Error(r.note ?? 'build-layers failed without a note');
     expect(r.outcome).toBe('ok');
     expect(r.produced?.text).toBeTruthy();
-    expect(alphaMean(String(r.produced!.text), 1)!).toBeLessThan(50);
-    expect(alphaMean(String(r.produced!.scrim), 0)!).toBeLessThan(200);
+    const textAlpha = measureWithRenderTool(String(r.produced!.text), 1);
+    expect(textAlpha).not.toBeNull();
+    expect(textAlpha!).toBeLessThan(50);
+    // 평균만 낮으면 자막이 아예 없는 투명 프레임도 통과한다. 같은 렌더 도구의 실제 픽셀 최댓값을 잰다.
+    const peak = run(renderToolBin, ['-hide_banner', '-nostats', '-ss', '1.00', '-i', String(r.produced!.text), '-frames:v', '1', '-vf', 'alphaextract,signalstats,metadata=print:key=lavfi.signalstats.YMAX', '-f', 'null', '-']);
+    expect(peak.ok, peak.err).toBe(true);
+    const peakAlpha = /YMAX=([\d.]+)/.exec(peak.err);
+    expect(peakAlpha, peak.err).not.toBeNull();
+    expect(Number(peakAlpha![1])).toBeGreaterThan(0);
+    expect(measureWithRenderTool(String(r.produced!.scrim), 0)!).toBeLessThan(200);
   }, 120_000);
+
+  it('build-layers — 주입한 렌더 도구 가용성과 알파 측정 실패를 구별한다', async () => {
+    const shots = join(root, 'shots-tool-availability.json');
+    writeFileSync(shots, JSON.stringify({ fps: 30, width: 320, height: 240, target_dur: 2, chapters: [{ id: 'C01', text: '안녕하세요', cuts: [{ src: '/x', in: 0, dur: 2 }] }] }));
+    const font = join(import.meta.dir, '../../../apps/ios/ElanousiOS/ElanousiOS/Fonts/D2Coding-Ver1.3.2-20180524.ttc');
+    const success = { ok: true, code: 0, signal: null, err: '', out: '' };
+    const unavailable = { ok: false, code: null, signal: null, err: 'ffmpeg filter unavailable', out: '' };
+    const renderCalls: string[][] = [];
+    let toolAvailable = false;
+    const state = {
+      shots_json: shots,
+      font_file: font,
+      ffmpeg: (args: readonly string[]) => {
+        renderCalls.push([...args]);
+        return toolAvailable ? success : unavailable;
+      },
+      alpha_mean: () => 10,
+    };
+    const missingTool = await buildLayers(ctxOf(state, join(root, 'lay-missing-tool')));
+    expect(missingTool.outcome).toBe('error');
+    expect(missingTool.note).toContain('ffmpeg filter unavailable');
+
+    toolAvailable = true;
+    const availableTool = await buildLayers(ctxOf(state, join(root, 'lay-available-tool')));
+    expect(availableTool.outcome).toBe('ok');
+    expect(availableTool.produced?.text).toBeTruthy();
+    expect(renderCalls.some((args) => args.some((arg) => arg.includes('drawtext=')))).toBe(true);
+    const nullMeasurement = await buildLayers(ctxOf({ ...state, alpha_mean: () => null }, join(root, 'lay-null')));
+    expect(nullMeasurement.outcome).toBe('error');
+    expect(nullMeasurement.note).toContain('알파를 못 쟀다');
+  });
 
   it('⛔ 지어낸 음성 — 알파 자는 «불투명»을 불투명이라고 말한다 (자가 산다)', () => {
     const opaque = join(root, 'opaque.mov');

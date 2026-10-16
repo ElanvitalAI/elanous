@@ -41,6 +41,10 @@ import { attachLifecycleBridge } from '../signal/lifecycle-bridge.js';
 import { getChannelBus } from '../terminal-matrix/index.js';
 import type { ChannelBus } from '../terminal-matrix/channel-bus.js';
 import { startChildLivenessHeartbeat } from './child-liveness-heartbeat.js';
+import {
+  SEAT_IDLE_NO_WORK_NOTICE, SEAT_TURN_CAP_CONTINUE_PROMPT, SEAT_TURN_CAP_TOOL_NOTICE,
+  isEmptyMailListResult, isIdleWaitCall, type SeatTurnCapConfig,
+} from './seat-turn-cap.js';
 
 export {
   CHILD_LIVENESS_HEARTBEAT_ENV,
@@ -259,6 +263,37 @@ export function buildRejectedToolCompletionPrompt(rejectedTools: readonly string
   ].join('\n');
 }
 
+/** TUI-GOAL-REPEAT-ANSWER(0.2.32) — goal loop 반복에서 모델이 이전 답을 다시 말할 때 화면에
+ * 같은 답이 두 번 그려지는 중복을 스트림 쪽에서 가려내는 «읽기-되돌림 인사(readback preface)»
+ * 문형. completion 판정의 readbackPreface(이 파일 하단 duplicate-answer 판정)와 같은 문형을
+ * 스트림 쪽에서도 쓴다 — 화면 중복 제거와 원장 중복 제거가 같은 모양을 같은 것으로 본다. 스트림은
+ * 문형이 한 글자씩 이어지는 중에도 판정해야 하므로(regex 전체 매칭이 아니라) 어구를 펼쳐둔 목록이다. */
+const GOAL_REPEAT_READBACK_VERBS = [
+  '', '했습니다', '했지만', '해보니', '해 보니', '해봤지만', '해 봤지만', '했으나', '했는데',
+] as const;
+const GOAL_REPEAT_READBACK_PHRASES: readonly string[] = [
+  '확인 결과',
+  ...GOAL_REPEAT_READBACK_VERBS.flatMap((verb) => (verb === ''
+    ? ['다시 확인', '방금 다시 확인']
+    : [`다시 확인${verb}`, `방금 다시 확인${verb}`])),
+];
+/** preface 뒤에 올 수 있는 구분자(여백·콜론·마침표 등) — 답 앞에 붙은 만큼 통째로 뗀다. */
+const GOAL_REPEAT_PREFACE_SEPS = /^[\s:：,.!?。！？-]+/u;
+/** TUI-GOAL-REPEAT-ANSWER — 스트림 쪽 답 비교 정규화: 여백 종류를 하나로 접고 끝여백을 뗀다. */
+function goalRepeatStreamNormalize(text: string): string {
+  return text.replace(/\s+/gu, ' ').trim();
+}
+
+/** TUI-GOAL-REPEAT-ANSWER — «읽기-되돌림 인사(readback preface) ⊕ 답»에서 인사+구분자를 뗀 나머지(답
+ * 부분)를 돌려준다. 인사가 없으면 원문 그대로. 골 루프의 화면 중복 제거(스트림 대기·버림)와 브리지의
+ * 재표면화 판정(이미 그린 답인가)이 같은 문형을 같은 것으로 보게 하려고 내보낸다. */
+export function stripGoalRepeatReadbackPreface(text: string): string {
+  for (const phrase of GOAL_REPEAT_READBACK_PHRASES) {
+    if (text.startsWith(phrase)) return text.slice(phrase.length).replace(GOAL_REPEAT_PREFACE_SEPS, '');
+  }
+  return text;
+}
+
 export interface GoalLoopOptions {
   /** 목표 문구(관측·프레이밍용). 생략 시 마지막 user 메시지에서 추출. */
   objective?: string;
@@ -296,7 +331,21 @@ export interface GoalLoopOptions {
    *  최대 2번 재촉한다. 생략하면 harness role 이 executor 인 프로세스에서만 활성 provider 로 푼다.
    *  null = 가드 꺼짐. 시험은 이 인자를 명시해 env 에 기대지 않는다. */
   intentStallProvider?: string | null;
+  /** TUI-H1-SEAT-GOALLOOP(#29 처방) — 자리 TUI 의 운영·읽기 지시를 goal loop 로 되돌린 턴에서만 참.
+   *  update_goal(complete) 의 evidence 가 비었을 때 «증거 없음» 반려(재주입) 대신 그 턴의 (비지 않은) 답을 증거로 받아 끝낸다
+   *  (10-14 OPT: 완료 선언 → 증거 부족 반려 → 재호출이 14회 · 사용자 답에 사과 문장). 시험 실패·거부된 도구 반려는 그대로다. */
+  lenientCompletionEvidence?: boolean;
+  /** TUI-SEAT-TURN-CAP — 자리 TUI 의 goal loop 에서만 준다(브리지가 route.reason 'seat-*' 로 판정). 없으면 상한·idle 판정 0(종전).
+   *  ⓐ core 턴 1회당 도구 수·벽시계 상한 — 닿으면 넘는 도구는 실행하지 않고 «한 줄 진행 요약 ⊕ 턴 마감» 을 안내,
+   *     턴이 끝나면 stopReason 을 max_turns 로 두고 다음 반복으로 잇는다(반복 하드캡 maxIterations 는 그대로).
+   *  ⓑ 같은 core 턴의 «새 항목 0» 우편 조회가 연속 idleEmptyMsgListLimit 번이면 «할 일 0» 으로 goal 을 완료한다(idle-no-work). */
+  seatTurnCap?: SeatTurnCapConfig & { seat: string };
+  /** Test seam — 벽시계(ms). 기본 Date.now. */
+  now?: () => number;
 }
+
+/** TUI-SEAT-TURN-CAP — 상한·idle 안내 «뒤» 에도 도구 호출이 이만큼 넘게 오면 그 core 턴을 끝낸다. */
+const SEAT_CAP_REFUSAL_BACKSTOP = 3;
 
 export type GoalLoopStopReason =
   | CoreTurnStopReason        // aborted | error | end_turn | max_turns (마지막 turn 것)
@@ -466,6 +515,8 @@ export async function runGoalLoop(
   const tools: LLMToolSpec[] = [...ctx.tools, updateGoalSpec];
 
   const noProgressLimit = opts.noProgressLimit ?? 2;
+  const now = opts.now ?? Date.now;
+  let seatCapHits = 0;
   let iterations = 0;
   let noProgress = 0;
   let blockedStreak = 0;
@@ -632,12 +683,91 @@ export async function runGoalLoop(
     let iterUsageMissing = 0;
     let postToolSoftStop = false;
     const turnAbortController = new AbortController();
+    // TUI-SEAT-TURN-CAP — 이번 core 턴의 상한·idle 상태(반복마다 새로).
+    const seatCap = opts.seatTurnCap;
+    const turnStartedAt = now();
+    let seatTools = 0;
+    let seatClosing: 'tools' | 'wall' | 'idle' | null = null;
+    let seatRefusedAfterClose = 0;
+    let seatCapAborted = false;
+    let emptyMailStreak = 0;
+    // 벽시계는 «다음 도구 호출» 에서 잰다 — 도는 스트림·도구는 끊지 않는다(끊고 멈춤이 아니라 마감 안내).
+    // ⛔ 상한이 없으면(사람 TUI·하니스 자식) caller dispatcher 의 Promise 를 «그대로» 돌려준다 — async 로 감싸면
+    //    새 Promise 가 되어 caller-side dispatch 동일성 계약(core-turn-goal-loop.test)이 깨진다(열차 r19d 회귀).
+    //    기본 실행기는 `ctx.dispatchTool(...)` 를 «메서드로» 부른다 — 꺼내 담아 부르면 수신자(this)가 빠진다(리뷰 r5).
+    const seatDispatch = (
+      name: string, args: Record<string, unknown>, dctx: Parameters<CoreTurnContext['dispatchTool']>[2],
+      execute?: CoreTurnContext['dispatchTool'],
+    ): Promise<unknown> => {
+      const run: CoreTurnContext['dispatchTool'] = execute ?? ((n, a, c) => ctx.dispatchTool(n, a, c));
+      if (!seatCap) return run(name, args, dctx);
+      return seatCappedDispatch(seatCap, name, args, dctx, run);
+    };
+    const seatCappedDispatch = async (
+      cap: SeatTurnCapConfig, name: string, args: Record<string, unknown>,
+      dctx: Parameters<CoreTurnContext['dispatchTool']>[2], execute: CoreTurnContext['dispatchTool'],
+    ): Promise<unknown> => {
+      if (seatClosing === null && now() - turnStartedAt >= cap.maxWallMs) seatClosing = 'wall';
+      if (seatClosing === null && seatTools >= cap.maxTools) seatClosing = 'tools';
+      if (seatClosing !== null) {
+        seatRefusedAfterClose += 1;
+        // 받침 — 안내를 받고도 도구를 계속 부르면 이 core 턴만 끝낸다(goal loop 는 다음 반복으로 잇는다).
+        if (seatRefusedAfterClose > SEAT_CAP_REFUSAL_BACKSTOP) {
+          seatCapAborted = true;
+          turnAbortController.abort();
+        }
+        return { error: seatClosing === 'idle'
+          ? SEAT_IDLE_NO_WORK_NOTICE(cap.idleEmptyMsgListLimit)
+          : SEAT_TURN_CAP_TOOL_NOTICE(seatClosing, cap) };
+      }
+      seatTools += 1;
+      const result = await execute(name, args, dctx);
+      if (isEmptyMailListResult(name, result)) {
+        emptyMailStreak += 1;
+        if (emptyMailStreak >= cap.idleEmptyMsgListLimit) {
+          seatClosing = 'idle';
+          return { ...(result as Record<string, unknown>), notice: SEAT_IDLE_NO_WORK_NOTICE(cap.idleEmptyMsgListLimit) };
+        }
+      } else if (!isIdleWaitCall(name, args)) {
+        // 새 우편이 왔거나(비지 않은 조회) 다른 일을 했다 — «할 일 0» 연속이 끊긴다. 대기용 sleep 은 끊지 않는다.
+        emptyMailStreak = 0;
+      }
+      return result;
+    };
     const abortForCaller = () => turnAbortController.abort(ctx.signal.reason);
     if (ctx.signal.aborted) abortForCaller();
     else ctx.signal.addEventListener('abort', abortForCaller, { once: true });
     const abortTurnForSoftStop = () => {
       postToolSoftStop = true;
       turnAbortController.abort();
+    };
+    // TUI-GOAL-REPEAT-ANSWER(0.2.32) — goal loop 반복에서 모델이 이전 iteration 의 답을
+    // 다시 말하면 화면에 같은 답이 두 번 그려진다(관측 2026-10-14 05:37). 원장 쪽 중복은
+    // 아래 completion 판정이 이미 접는다 — 이 검은 화면 push 만 담당한다: 이번 iteration 의
+    // 스트림이 «읽기-되돌림 인사(preface) ⊕ 이전 답»의 접두사로만 진행되는 동안 caller 의
+    // onText 로 흘리지 않고 대기하다, 갈라지는 순간(새 내용) 모은 걸 한 번에 흘린 뒤 그대로
+    // 흘린다. iteration 마감의 순수 중복 판정·버림은 onTurnComplete 에서 한다.
+    const previousFinalText = lastResult.finalText;
+    const goalRepeatPreviousAnswer = goalRepeatStreamNormalize(previousFinalText);
+    let goalRepeatWithheld = '';
+    let goalRepeatWithholding = goalRepeatPreviousAnswer.length > 0;
+    const goalRepeatStreamConsistent = (text: string): boolean => {
+      if (previousFinalText.startsWith(text)) return true;
+      const normalized = goalRepeatStreamNormalize(text);
+      if (goalRepeatPreviousAnswer.startsWith(normalized)) return true;
+      for (const phrase of GOAL_REPEAT_READBACK_PHRASES) {
+        if (phrase.startsWith(normalized)) return true;
+        if (!normalized.startsWith(phrase)) continue;
+        const rest = normalized.slice(phrase.length).replace(GOAL_REPEAT_PREFACE_SEPS, '');
+        if (goalRepeatPreviousAnswer.startsWith(rest)) return true;
+      }
+      return false;
+    };
+    const flushGoalRepeatWithheld = (full: string): void => {
+      if (goalRepeatWithheld === '') return;
+      const withheld = goalRepeatWithheld;
+      goalRepeatWithheld = '';
+      ctx.callbacks?.onText?.(withheld, full);
     };
     const turnCtx: CoreTurnContext = {
       ...ctx,
@@ -646,6 +776,8 @@ export async function runGoalLoop(
       signal: turnAbortController.signal,
       // 진입 시 한 번 정한 사람 문장을 매 라운드에 그대로 내린다(위 주석 참조).
       ...(surfaceUserText !== undefined ? { userText: surfaceUserText } : {}),
+      // TUI-GOAL-LOOP-FRICTION(#46·#63) — update_goal 은 도구 예산 거부를 받지 않고, 답과 함께 오면 그 턴으로 마감한다.
+      terminalToolNames: [...(ctx.terminalToolNames ?? []), UPDATE_GOAL_TOOL_NAME],
       // update_goal 은 종결 신호 — 실 dispatcher 로 새지 않게 가로채 ack 만 돌려준다.
       dispatchTool: (name, args, dctx) => {
         dispatchCount += 1;
@@ -660,12 +792,34 @@ export async function runGoalLoop(
           // Observability must not prevent the selected tool from dispatching.
         }
         if (name === UPDATE_GOAL_TOOL_NAME) {
-          return Promise.resolve({ ok: true, recorded: (args as { status?: unknown }).status ?? null });
+          const ack = () => Promise.resolve({ ok: true, recorded: (args as { status?: unknown }).status ?? null });
+          // TUI-SEAT-TURN-CAP — 진행 선언도 «다른 일» 이다: 빈 우편 조회 연속을 끊는다(리뷰 r1).
+          emptyMailStreak = 0;
+          // 완료 신호(complete)는 상한 «뒤» 에도 받고 도구로 세지 않는다 — 상한 안내가 바로 «마감하라» 이고,
+          // 종결 신호는 예산 거부를 받지 않는다(#28503 terminalToolNames 계약과 같은 방향). 그 밖의 진행 선언
+          // (in_progress·blocked)은 도구 한 번으로 세고 상한 뒤엔 같은 안내로 거부한다(리뷰 r2 — 61번 넘게 불러도 안 막히던 구멍).
+          if ((args as { status?: unknown }).status === 'complete') return ack();
+          return seatDispatch(name, args, dctx, ack);
         }
-        return ctx.dispatchTool(name, args, dctx);
+        return seatDispatch(name, args, dctx);
       },
       callbacks: {
         ...ctx.callbacks,
+        // TUI-GOAL-REPEAT-ANSWER — 이번 iteration 의 스트림이 이전 답의 재방출로만 진행되는
+        // 동안은 caller 의 onText 로 흘리지 않고 대기한다(중복 후보). 갈라지는 순간 모은 걸
+        // 한 번에 흘리고 이후 그대로 흘린다. 빈 청크(라운드 경계·commit)는 상태와 무관하게
+        // 그대로 흘린다 — TUI 의 라운드 확정 신호를 끊지 않는다.
+        onText: (delta, full) => {
+          if (delta !== '' && goalRepeatWithholding) {
+            if (goalRepeatStreamConsistent(goalRepeatWithheld + delta)) {
+              goalRepeatWithheld += delta;
+              return;
+            }
+            goalRepeatWithholding = false;
+            flushGoalRepeatWithheld(full);
+          }
+          ctx.callbacks?.onText?.(delta, full);
+        },
         // OH8 후속 PR-2 — run_tests 결과를 캡처(last-wins). 텍스트 파싱이 아니라 구조체 ok 를 본다.
         onToolResult: (call) => {
           if (call.name === 'run_tests' && call.result && typeof call.result === 'object') {
@@ -706,6 +860,17 @@ export async function runGoalLoop(
           }
         },
         onTurnComplete: (msgs) => {
+          // TUI-GOAL-REPEAT-ANSWER — iteration 마감: 순수 중복이면(이전 답 ± preface 전부)
+          // 흴린 건 버린다 — 이전 답이 이미 화면에 그려져 있어 두 번째는 필요 없다. 아니면
+          // 모은 걸 한 번에 흘린 다음 마감을 넘긴다(브리지 재표면화 판정이 흘린 분량을 본다).
+          if (goalRepeatWithholding) {
+            goalRepeatWithholding = false;
+            const normalized = goalRepeatStreamNormalize(goalRepeatWithheld);
+            const pureRepeat = normalized === goalRepeatPreviousAnswer
+              || GOAL_REPEAT_READBACK_PHRASES.some((phrase) => normalized.startsWith(phrase)
+                && normalized.slice(phrase.length).replace(GOAL_REPEAT_PREFACE_SEPS, '') === goalRepeatPreviousAnswer);
+            if (!pureRepeat) flushGoalRepeatWithheld(normalized);
+          }
           turnNewMessages = msgs;
           ctx.callbacks?.onTurnComplete?.(msgs);
         },
@@ -732,12 +897,20 @@ export async function runGoalLoop(
       },
     };
 
-    const previousFinalText = lastResult.finalText;
     try {
       lastResult = await runTurn(turnCtx);
     } finally {
       ctx.signal.removeEventListener('abort', abortForCaller);
     }
+    // TUI-SEAT-TURN-CAP — 상한·idle 안내 뒤 «정상 마감» 했거나 받침이 끊은 core 턴만 고쳐 읽는다.
+    //   사람 중단(caller signal)·error·auth_rejected 는 그대로 둔다 — 실제 오류를 상한으로 덮지 않는다(리뷰 r1).
+    const seatClosedTurn = seatCap !== undefined && !ctx.signal.aborted && seatClosing !== null
+      && (lastResult.stopReason === 'end_turn' || lastResult.stopReason === 'max_turns'
+        || (lastResult.stopReason === 'aborted' && seatCapAborted));
+    const seatCapHit = seatClosedTurn && (seatClosing === 'tools' || seatClosing === 'wall');
+    const seatIdleHit = seatClosedTurn && seatClosing === 'idle';
+    if (seatCapHit) lastResult = { ...lastResult, stopReason: 'max_turns' };
+    else if (seatIdleHit && lastResult.stopReason === 'aborted') lastResult = { ...lastResult, stopReason: 'end_turn' };
     messages.push(...turnNewMessages);
 
     const goalUpdate = findGoalUpdate(turnNewMessages);
@@ -756,6 +929,18 @@ export async function runGoalLoop(
       finalChars: lastResult.finalText.length,
       finalTextExcerpt: finalTextExcerpt.text, finalTextExcerptTruncated: finalTextExcerpt.truncated,
     }, { level: 'debug' });
+
+    // ①-0 #29 처방 — 자리 운영 턴은 빈 evidence 를 반려하지 않고 이 턴의 답을 증거로 받는다(관측 남김).
+    //      답도 비었으면 받을 증거가 없다 — 종전 반려(evidence required)로 그대로 간다.
+    const lenientAnswer = opts.lenientCompletionEvidence === true
+      ? boundReadableText(lastResult.finalText, 200).text.trim()
+      : '';
+    if (goalUpdate?.status === 'complete' && goalUpdate.evidence.trim().length === 0 && lenientAnswer.length > 0) {
+      goalUpdate.evidence = `(자리 운영 턴 — 답을 증거로 수용) ${lenientAnswer}`;
+      debug.log('goal.loop', 'complete-evidence-lenient', {
+        sessionId: ctx.sessionId, ...runAttribution, iterations, finalChars: lastResult.finalText.length,
+      }, { level: 'info' });
+    }
 
     // ① authoritative 완료 — update_goal(complete) + 비지 않은 evidence.
     if (goalUpdate?.status === 'complete') {
@@ -875,6 +1060,33 @@ export async function runGoalLoop(
       });
     }
 
+    // TUI-SEAT-TURN-CAP ⓑ — «할 일 0»(빈 우편 조회 연속): 이 반복을 완료로 보고 끝낸다(lenient · 대기는 H4/H5 몫).
+    if (seatIdleHit && seatCap) {
+      debug.log('goal.loop', 'idle-no-work', {
+        sessionId: ctx.sessionId, ...runAttribution, seat: seatCap.seat, iteration: iterations,
+        tools: seatTools, wallMs: now() - turnStartedAt, emptyMailStreak,
+      }, { level: 'info' });
+      return finish(
+        { finalText: lastResult.finalText, iterations, stopReason: 'goal_complete', goalComplete: true },
+        { summary: `idle-no-work — ${emptyMailStreak} consecutive empty mailbox checks (seat ${seatCap.seat})`, changedFiles: [] },
+      );
+    }
+    // TUI-SEAT-TURN-CAP ⓐ — 도구·벽시계 상한으로 마감한 core 턴: 요약을 이어받아 다음 반복으로(하드캡이 이긴다).
+    //    ⛔ 빈 근거 complete 가 함께 온 턴은 여기서 잇지 않고 아래 «근거 없는 완료» 판정에 맡긴다(리뷰 r3) —
+    //    적격 완료(lenient 답 수용)는 위 ① 에서 이미 끝났고, 남은 빈 근거 complete 는 종전 계약대로 근거를 다시 묻는다.
+    if (seatCapHit && seatCap && goalUpdate?.status !== 'complete') {
+      debug.log('goal.loop', 'seat-turn-cap', {
+        sessionId: ctx.sessionId, ...runAttribution, seat: seatCap.seat, reason: seatClosing, iteration: iterations,
+        tools: seatTools, wallMs: now() - turnStartedAt, maxTools: seatCap.maxTools, maxWallMs: seatCap.maxWallMs,
+        backstopAborted: seatCapAborted, maxIterations,
+      }, { level: 'info' });
+      seatCapHits += 1;
+      blockedStreak = 0;
+      readbackStreak = 0;
+      messages.push({ role: 'user', content: SEAT_TURN_CAP_CONTINUE_PROMPT });
+      continue;
+    }
+
     // Evidence-less completion is not authoritative; only retry after stop and terminal outcomes
     // from this same turn have received priority.
     if (goalUpdate?.status === 'complete') {
@@ -985,6 +1197,13 @@ export async function runGoalLoop(
   }
 
   debug.log('goal.loop', 'max-iterations', { sessionId: ctx.sessionId, ...runAttribution, iterations }, { level: 'warn' });
+  if (opts.seatTurnCap && seatCapHits > 0) {
+    // 실패 시 누구에게(상한에 한 번이라도 닿은 런만 — 일반 하드캡 종료와 섞지 않는다 · 리뷰 r3) — 자리 TUI 가 반복 하드캡까지 다 쓰고 멈췄다: 자리 OP 가 보는 경고 이벤트.
+    debug.log('goal.loop', 'seat-turn-cap-exhausted', {
+      sessionId: ctx.sessionId, ...runAttribution, seat: opts.seatTurnCap.seat, iterations, maxIterations, capHits: seatCapHits,
+      notify: 'seat-op',
+    }, { level: 'warn' });
+  }
   return finish({ finalText: lastResult.finalText, iterations, stopReason: 'max_iterations', goalComplete: false });
   } finally {
     stopLivenessHeartbeat();

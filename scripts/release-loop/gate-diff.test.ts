@@ -28,6 +28,13 @@ test('Bun failure headers associate test names with files, strip timing and dedu
   expect(parseFailures('(fail) orphan [1ms]\n 1 fail\n')).toEqual([]);
 });
 
+test('failure marker in a passing test title is not parsed as a failure line', () => {
+  const isolated = `src/self-implement/decision-signal-press.test.ts:\n(pass) moves a signal out of pressedRed when every (fail) name also failed on the baseline [0.61ms]\n 21 pass\n 0 fail\nRan 21 tests across 1 file.\n`;
+  const mixed = `${isolated}src/real.test.ts:\n(pass) title contains (fail) as ordinary text\n(fail) actual broken case [1.00ms]\n 1 pass\n 1 fail\nRan 2 tests across 1 file.\n`;
+  expect(parseFailures(isolated)).toEqual([]);
+  expect(parseFailures(mixed)).toEqual(['src/real.test.ts > actual broken case']);
+});
+
 test('parser consumes the actual Bun failure reporter, including the file header', () => {
   const probe = spawnSync('bun', ['test', '--dots', import.meta.path, '-t', 'deliberate parser fixture failure'], {
     env: { ...process.env, GATE_PARSER_PROBE: '1' }, encoding: 'utf8', timeout: 15_000,

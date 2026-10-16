@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { landOrderLedgerPath } from './land-order-ledger.js';
 import { classifyLandFailure, liveLandArgs, type TaskAgentLiveMove } from './live-moves.js';
-import { CATCH_UP_CAP, defaultCatchUpMain, defaultRequestRegate, overlapEvidencePath, parseRegateResult, REJUDGE_HEAD_CAP, regateResultPath, regateRunArgs, rejudgeCandidates, rejudgeCardOnHead, rejudgeAsyncResultCard, rejudgeCompletedTaskRegate, rejudgeShadowCard, remoteBoundRunTerminal, type CatchUpGit, type CatchUpRequest, type CatchUpResult, type RegateRequest } from './rejudge-on-head.js';
+import { CATCH_UP_CAP, defaultCatchUpMain, defaultRequestRegate, overlapEvidencePath, parseRegateResult, REJUDGE_HEAD_CAP, regateResultPath, regateRunArgs, rejudgeCandidates, rejudgeCardOnHead, rejudgeAsyncResultCard, rejudgeCompletedTaskRegate, rejudgeShadowCard, regateUnmeasured, remoteBoundRunTerminal, type CatchUpGit, type CatchUpRequest, type CatchUpResult, type RegateRequest } from './rejudge-on-head.js';
 import { captureReviewResults, rejudgeCompletedTaskReview, reviewResultPath, TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_RESULT_ENV, TA_REVIEW_COMPLETION_STATE_ENV } from './review-result-capture.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
 import { setUserConfigOverlay } from '../user-config.js';
@@ -48,6 +48,7 @@ function fixture(opts: { regates?: TaskCard['regates']; landAttempts?: TaskCard[
   const landOutcomes: Array<{ status: number; stdout: string; stderr?: string }> = [];
   const deps = (moves: TaskAgentLiveMove[] = ['review', 'propose-land']) => ({
     liveMoves: new Set(moves),
+    prFiles: async () => ['src/feature.ts'],
     log: (_c: string, event: string, data: Record<string, unknown>) => { logs.push({ event, data }); },
     requestRegate: async (request: RegateRequest) => { regateRequests.push(request); regateOutcome?.(request); },
     catchUpMain: async (request: CatchUpRequest) => {
@@ -89,6 +90,23 @@ function fixture(opts: { regates?: TaskCard['regates']; landAttempts?: TaskCard[
 }
 
 describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트·리뷰·land 를 다시 판단한다', () => {
+  test('goal-only PR remains a measured target-diff-0 stop across rejudge ticks', async () => {
+    const f = fixture();
+    const queried: Array<[number, string]> = [];
+    const guard = { ...f.deps(), prFiles: async (pr: number, url: string) => {
+      queried.push([pr, url]);
+      return ['docs/goals/GOAL-generated.md'];
+    } };
+    const first = await rejudgeCardOnHead('ta-rj-1', guard);
+    const second = await rejudgeCardOnHead('ta-rj-1', guard);
+    expect(first.at(-1)).toMatchObject({ decision: 'goal-only-pr', step: 'target' });
+    expect(second.at(-1)).toMatchObject({ decision: 'goal-only-pr', step: 'target' });
+    expect(f.regateRequests).toHaveLength(0);
+    expect(f.reviewRequests).toHaveLength(0);
+    expect(f.lands).toHaveLength(0);
+    expect(queried).toEqual([[30, URL], [30, URL]]);
+    expect(f.card().history.filter((row) => row.event === 'rejudge-on-head' && row.effect === 'goal-only-pr')).toHaveLength(1);
+  });
   test('adopted unchanged head gets its first review request, then only one pending request', async () => {
     const f = fixture();
     writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
@@ -121,6 +139,32 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     expect(passed.decisions()).toContain('regate:regate-requested');
     expect(passed.regateRequests).toHaveLength(1);
     expect(passed.reviewRequests).toHaveLength(0);
+  });
+
+  test('configured queue path takes exact-head captured review to one queue request without host regate or direct land', async () => {
+    const f = fixture();
+    const resultPath = f.card().reviewRequests![0]!.resultPath!;
+    mkdirSync(dirname(resultPath), { recursive: true });
+    writeFileSync(resultPath, reviewJson(A));
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true, history: [{ at: '2026-10-11T00:20:00.000Z', event: 'live-move-result',
+      kind: 'review', pr: 30, head: A, verdict: 'pass', reviewed: true, mustFix: 0, resultPath,
+      effect: 'review result captured · verdict pass · reviewed true · must-fix 0' }] }]);
+    const queue: Array<{ pr: number; head: string; reviewResult: string }> = [];
+    const base = f.deps();
+    const deps = { ...base, live: { ...base.live,
+      landQueueConfig: { command: '/ops/land-enqueue.sh', remote: 'node-c' },
+      landWorktree: { localHead: () => A, localBranch: () => 'feature' },
+      queueLanding: async (request: { pr: number; head: string; reviewResult: string }) => {
+        queue.push(request); return { status: 0, stdout: 'OK #30 queued' };
+      },
+    } };
+    expect((await rejudgeCardOnHead(f.card().id, deps)).at(-1)).toMatchObject({ step: 'land', decision: 'queued' });
+    expect(queue).toEqual([expect.objectContaining({ pr: 30, head: A, reviewResult: resultPath })]);
+    expect(f.card().landAttempts).toEqual([expect.objectContaining({ pr: 30, head: A, ok: true })]);
+    expect(f.regateRequests).toHaveLength(0);
+    expect(f.lands).toHaveLength(0);
+    expect((await rejudgeCardOnHead(f.card().id, deps)).at(-1)).toMatchObject({ step: 'land', decision: 'queue-skipped' });
+    expect(queue).toHaveLength(1);
   });
 
   test('captured exact-head must-fix enters next-move and launches one same-PR repair worker', async () => {
@@ -1014,6 +1058,64 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     expect(f.card().history.at(-1)).toMatchObject({ event: 'rejudge-on-head', kind: 'regate', effect: 'cap-reached', head: B });
   });
 
+  test('TA-REGATE-UNMEASURED — draft pr-head 거부(unmeasured) 3번은 상한을 소진하지 않는다 · 새 머리는 다시 잰다', async () => {
+    const draft = 'pr-head: PR head, base commit, ready state or open state unavailable or changed (state=OPEN · isDraft=true · base=main@x)';
+    const heads = ['1', '2', '3'].map((d) => d.repeat(40));
+    // 새 결과(status=unmeasured) 둘 ⊕ 옛 결과(noMerge 에 status 없음 · draft 문면) 하나.
+    const f = fixture({ regates: heads.map((h, i) => ({ pr: 30, head: h, at: '2026-10-11T00:30:00.000Z', passed: false,
+      ...(i < 2 ? { status: 'unmeasured' } : {}), detail: draft })) });
+    f.setHead(B);
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.decisions()).not.toContain('regate:cap-reached');
+    expect(f.decisions()).toContain('regate:regate-requested');
+    expect(f.regateRequests.map((request) => request.head)).toEqual([B]);
+  });
+
+  test('TA-REGATE-UNMEASURED — 진짜 실패 3번은 unmeasured 가 섞여도 그대로 상한을 소진한다', async () => {
+    const draft = 'pr-head: PR head, base commit, ready state or open state unavailable or changed (state=OPEN · isDraft=true · base=main@x)';
+    const failed = ['1', '2', '3'].map((d) => ({ pr: 30, head: d.repeat(40), at: '2026-10-11T00:30:00.000Z', passed: false, status: 'failed', detail: 'typecheck: error TS1' }));
+    const unmeasured = ['4', '5'].map((d) => ({ pr: 30, head: d.repeat(40), at: '2026-10-11T00:31:00.000Z', passed: false, status: 'unmeasured', detail: draft }));
+    const f = fixture({ regates: [...unmeasured, ...failed] });
+    f.setHead(B);
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.regateRequests).toEqual([]);
+    expect(f.decisions()).toEqual(['regate:cap-reached']);
+    expect(f.logs.find((entry) => entry.event === 'rejudge-on-head')?.data.reason).toContain('re-gated 3 times already (cap 3 · unmeasured 2 not counted)');
+  });
+
+  test('TA-REGATE-UNMEASURED — 회수한 결과가 unmeasured 면 regate-failed 가 아니라 regate-unmeasured 로 적는다', async () => {
+    const f = fixture();
+    f.setHead(B);
+    f.onRegate(f.writeRegate(false, { status: 'unmeasured', failures: [{ step: 'pr-head', detail: 'PR head ... (state=OPEN · isDraft=true · base=main@x)' }] }));
+    f.onReview((path) => writeFileSync(path, reviewJson(B)));
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.card().regates?.[0]).toMatchObject({ passed: false, status: 'unmeasured' });
+    expect(f.decisions()).toContain('regate:regate-unmeasured');
+    expect(f.decisions()).not.toContain('regate:regate-failed');
+    expect(f.lands).toEqual([]);
+  });
+
+  test('TA-REGATE-UNMEASURED — 회수한 결과가 진짜 실패(status=failed)면 regate-failed 그대로', async () => {
+    const f = fixture();
+    f.setHead(B);
+    f.onRegate(f.writeRegate(false));
+    f.onReview((path) => writeFileSync(path, reviewJson(B)));
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.decisions()).toContain('regate:regate-failed');
+    expect(f.decisions()).not.toContain('regate:regate-unmeasured');
+  });
+
+  test('regateUnmeasured — status unmeasured ⊕ 옛 draft 문면만 · 통과·진짜 실패·결과 없음은 아니다', () => {
+    expect(regateUnmeasured({ passed: false, status: 'unmeasured' })).toBe(true);
+    expect(regateUnmeasured({ passed: false, detail: 'pr-head: x (state=OPEN · isDraft=true · base=main@y)' })).toBe(true);
+    expect(regateUnmeasured({ passed: false, status: 'failed', detail: 'typecheck: error' })).toBe(false);
+    expect(regateUnmeasured({ passed: false, status: 'no-result' })).toBe(false);
+    expect(regateUnmeasured({ passed: true, status: 'unmeasured' })).toBe(false);
+    expect(regateUnmeasured({ passed: undefined })).toBe(false);
+  });
+
   test('상한은 잠금 안에서 다시 잰다 — 판단 뒤 다른 틱이 머리를 채웠으면 claim 하지 않는다', async () => {
     const heads = ['1', '2'].map((d) => d.repeat(40));
     const f = fixture({ regates: heads.map((h) => ({ pr: 30, head: h, at: '2026-10-11T00:30:00.000Z', passed: false, status: 'failed' })) });
@@ -1087,6 +1189,42 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
       expect(f.reviewRequests).toHaveLength(0);
       expect(f.lands).toHaveLength(0);
     }
+  });
+
+  test('verified train closes a component card once without a new repair or regate', async () => {
+    const f = fixture();
+    // A run-bound component can be train-landed even when its older card has no taLand flag.
+    const oldTerminal = { pr: 30, url: URL, head: B, state: 'CLOSED' as const, at: '2026-10-11T00:30:00.000Z' };
+    writeTaskCards(f.statePath, [{ ...f.card(), prTerminal: oldTerminal }]);
+    let observedHead = B;
+    const deps = { ...f.deps(), trainLanding: () => ({ componentPr: 30, integrationPr: 91, mergeSha: BASE, train: 'c2' }),
+      live: { ...f.deps().live, prHead: async () => ({ head: observedHead, state: 'CLOSED', url: URL }) } };
+    expect((await rejudgeCardOnHead(f.card().id, deps)).at(-1)?.decision).toBe('landed-via-train');
+    expect(f.card()).toMatchObject({ status: 'done', trainLanding: { componentPr: 30, integrationPr: 91, mergeSha: BASE },
+      prTerminal: { state: 'CLOSED' } });
+    expect(f.card().prTerminal).toEqual(oldTerminal);
+    expect(f.card().history.filter((entry) => entry.event === 'landed-via-train')).toHaveLength(1);
+    await rejudgeCardOnHead(f.card().id, deps);
+    expect(f.card().history.filter((entry) => entry.event === 'landed-via-train')).toHaveLength(1);
+    observedHead = BASE;
+    await rejudgeCardOnHead(f.card().id, deps);
+    expect(f.card().history.filter((entry) => entry.event === 'landed-via-train')).toHaveLength(1);
+    expect(f.card().prTerminal?.head).toBe(BASE);
+    expect(rejudgeCandidates({ [f.card().id]: f.card() })).toEqual([]);
+    expect(f.regateRequests).toHaveLength(0);
+    expect(f.reviewRequests).toHaveLength(0);
+    expect(f.lands).toHaveLength(0);
+  });
+
+  test('an unreviewed CLOSED PR without train proof keeps the old start guard', async () => {
+    const f = fixture();
+    writeTaskCards(f.statePath, [{ ...f.card(), reviewRequests: [], history: [] }]);
+    const deps = { ...f.deps(), trainLanding: () => null,
+      live: { ...f.deps().live, prHead: async () => ({ head: B, state: 'CLOSED', url: URL }) } };
+    expect((await rejudgeCardOnHead(f.card().id, deps)).at(-1)?.decision).toBe('not-started');
+    expect(f.card().prTerminal).toBeUndefined();
+    expect(f.card().status).toBe('launched');
+    expect(f.regateRequests).toHaveLength(0);
   });
 
   test('terminal marker applies only to its exact binding; explicit rejudge clears it after reopen', async () => {

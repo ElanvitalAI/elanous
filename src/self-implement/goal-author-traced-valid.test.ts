@@ -146,6 +146,19 @@ test('a bare evidence filename cannot borrow an explicitly new path as if it exi
   expect(result.section).toContain('미해석: new-cycle-e2e.ts');
 });
 
+test('an attached residual token is not rewritten into a nested traced path', async () => {
+  const result = await authoredPaths('대상 경로: src/a.ts???\n대상을 고친다.', [], [], ['src/a.ts']);
+  expect(result.paths).toEqual([]);
+  expect(result.section).toContain('미해석: src/a.ts???');
+  expect(result.section).not.toContain('1. src/a.ts');
+});
+
+test('a declared repository-root file stays a root file and is not rewritten to a nested twin', async () => {
+  const result = await authoredPaths('대상 경로: README.md\n표지를 고친다.', [], [], ['README.md']);
+  expect(result.paths).toEqual(['README.md']);
+  expect(result.section).not.toContain('미해석:');
+});
+
 test('authoring without a repository root preserves the existing evidence rendering contract', async () => {
   const authored = await authorGoal('대상 경로: src/plugins/core/trust-store.ts\n고립된 근거를 기록한다.', {
     ground: async () => ({ ...empty, persistentEvidence: ['src/plugins/core/trust-store.ts was named; plugin-trust.json was also named'] }),

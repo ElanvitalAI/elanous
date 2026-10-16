@@ -19,8 +19,11 @@
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { readlinkSync, statSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 import { LOG_LEVEL_ORDER, type LogLevel, type LogRecord } from './record.js';
 import type { LogSink } from './sink.js';
@@ -978,6 +981,224 @@ function ownerDead(owner: RetentionLockOwner): boolean {
   }
 }
 
+// ── ⓑ 수호자: «설치 sha 보다 옛 판으로 logs.db 를 연 프로세스» 경보 (LOGS-RETENTION-46MIN) ──
+//
+// 사고(10-12 · 운영 보존 46분): 하한 이전 판을 쥔 옛 크론 프로세스들이 6시간마다
+// «오래된 행 50%» 삭제를 겹쳐 돌려 보존 창을 무너뜨렸다. retention 주기마다 lsof
+// 상당(/proc/<pid>/fd 스캔)으로 logs.db(-wal/-shm 포함)를 연 프로세스를 찾고, lstart
+// 상당(이 파일의 processStart() = /proc/<pid>/stat starttime)으로 «현재 설치 sha 의
+// 설치 시점보다 먼저 기동»한 프로세스(=옛 판 코드를 쥔 채 살아 있는 것)를 경보한다.
+// 마커는 git ref/HEAD 파일의 mtime(=이 sha 가 체크아웃된 시점)이지 모듈 파일 mtime 이
+// 아니다(must-fix — 그 파일이 변경되지 않은 채 새 판을 설치하면 옛 판을 놓친다). 전부 fail-soft.
+
+export interface LogDbOpenerInfo {
+  pid: number;
+  /** /proc/<pid>/stat starttime(clock ticks) — lstart 상당(pid 재사용 판별용). */
+  start: string | null;
+  /** 기동 절대시각(ms) — /proc/stat btime + ticks/100(리눅스 CLK_TCK=100 환산). */
+  startedAtMs: number | null;
+  cmdline: string[] | null;
+  cwd: string | null;
+  /** 열린 프로세스의 checkout ref. 설치 후 다른 checkout에서 기동한 옛 판도 구별한다. */
+  revisionSha?: string | null;
+}
+
+/** procfs 부팅 시각(ms). 읽기 실패 시 null(=환산 불가 → 경보하지 않는다, fail-safe). */
+function procBootTimeMs(): number | null {
+  try {
+    for (const line of readFileSync('/proc/stat', 'utf8').split('\n')) {
+      if (line.startsWith('btime ')) return Number(line.slice(6).trim()) * 1000;
+    }
+  } catch { /* fail-soft */ }
+  return null;
+}
+
+/** lsof 상당 — logs.db(와 -wal/-shm)를 연 fd 를 든 프로세스 목록. 개별 pid 실패는 조용히 건너뛴다. */
+export function scanLogDbOpeners(dbPath: string, opts: { selfPid?: number } = {}): LogDbOpenerInfo[] {
+  const selfPid = opts.selfPid ?? process.pid;
+  const wanted = new Set([dbPath, `${dbPath}-wal`, `${dbPath}-shm`]);
+  const bootMs = procBootTimeMs();
+  const openers: LogDbOpenerInfo[] = [];
+  let pids: string[];
+  try { pids = readdirSync('/proc').filter((name) => /^[0-9]+$/.test(name)); } catch { return openers; }
+  for (const name of pids) {
+    const pid = Number(name);
+    if (pid === selfPid) continue;
+    let holds = false;
+    try {
+      for (const fdName of readdirSync(`/proc/${pid}/fd`)) {
+        let target: string;
+        try { target = readlinkSync(`/proc/${pid}/fd/${fdName}`); } catch { continue; }
+        if (wanted.has(target)) { holds = true; break; }
+      }
+    } catch { continue; }
+    if (!holds) continue;
+    const start = processStart(pid);
+    const ticks = start === null ? null : Number(start);
+    let cmdline: string[] | null = null;
+    try { cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean); } catch { /* fail-soft */ }
+    let cwd: string | null = null;
+    try { cwd = readlinkSync(`/proc/${pid}/cwd`); } catch { /* fail-soft */ }
+    // cwd는 새 checkout일 수 있다. 실행한 스크립트 경로가 가리키는 판을 먼저 읽는다.
+    // 절대 경로뿐 아니라 cwd 상대 스크립트도 처리한다. 찾지 못할 때만 cwd로 폴백.
+    const scriptSha = cmdline?.slice(1).filter((arg) => /\.(?:[cm]?[jt]s|sh)$/.test(arg))
+      .map((arg) => resolveCheckoutRevisionFromCwd(dirname(resolve(cwd ?? '/', arg))))
+      .find((sha) => sha !== null) ?? null;
+    const revisionSha = scriptSha ?? (cwd === null ? null : resolveCheckoutRevisionFromCwd(cwd));
+    openers.push({ pid, start, startedAtMs: ticks !== null && bootMs !== null ? bootMs + (ticks / 100) * 1000 : null, cmdline, cwd, revisionSha });
+  }
+  return openers;
+}
+
+export interface InstalledRevisionMarker {
+  /** 이 체크아웃의 HEAD sha. 실패 시 null. */
+  sha: string | null;
+  /** 현재 sha 가 이 체크아웃에 설치된 시점(ms) — git ref/HEAD 파일의 mtime. 실패 시 null. */
+  installedAtMs: number | null;
+  /** 마커로 읽은 파일 경로 — 경보 payload 에 싣는 용도. */
+  marker: string | null;
+}
+
+/** /proc/<pid>/cwd에서 위로 올라가 첫 Git checkout의 현재 ref를 읽는다. */
+function resolveCheckoutRevisionFromCwd(cwd: string): string | null {
+  let current = cwd;
+  while (true) {
+    if (existsSync(join(current, '.git'))) return resolveInstalledRevisionMarker(current).sha;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+/** 설치 판 마커 — HEAD sha 와 «그 sha 가 설치된 시점»을 함께 돌린다(worktree 의 .git 파일·
+ * commondir 도 해석). must-fix(리뷰): 옛 판 판정 기준은 모듈 파일 mtime 이 아니라 «설치
+ * 시점»이다 — 같은 파일이 변경되지 않은 채 새 판을 설치하면 모듈 mtime 은 옛 채로 있어
+ * 옛 판 오프너를 놓친다. 설치 시점의 파일시스템 근거: 브랜치 체크아웃은 ref 파일 mtime
+ * (=pull·merge·reset·commit 로 ref 가 움직인 시점), detached 전환은 HEAD 파일 mtime —
+ * 둘 중 늦은 쪽. 전부 실패 시 null(fail-safe — 경보하지 않는다). */
+export function resolveInstalledRevisionMarker(root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')): InstalledRevisionMarker {
+  const none: InstalledRevisionMarker = { sha: null, installedAtMs: null, marker: null };
+  try {
+    const dotGit = join(root, '.git');
+    let gitDir: string;
+    if (statSync(dotGit).isDirectory()) gitDir = dotGit;
+    else {
+      const firstLine = readFileSync(dotGit, 'utf8').trim();
+      if (!firstLine.startsWith('gitdir:')) return none;
+      gitDir = resolve(root, firstLine.slice(7).trim());
+    }
+    const headPath = join(gitDir, 'HEAD');
+    let head: string;
+    try { head = readFileSync(headPath, 'utf8').trim(); } catch { return none; }
+    if (!head.startsWith('ref: ')) {
+      // detached — HEAD 파일이 sha 를 직접 쥔다: 그 mtime = 체크아웃(=설치) 시점.
+      if (!/^[0-9a-f]{40}$/.test(head)) return none;
+      try { return { sha: head, installedAtMs: statSync(headPath).mtimeMs, marker: headPath }; } catch { return none; }
+    }
+    const ref = head.slice(5).trim();
+    const commonDir = existsSync(join(gitDir, 'commondir'))
+      ? resolve(gitDir, readFileSync(join(gitDir, 'commondir'), 'utf8').trim())
+      : gitDir;
+    const looseRef = [join(gitDir, ref), join(commonDir, ref)].find(existsSync);
+    const markerPath = looseRef ?? join(commonDir, 'packed-refs');
+    const sha = looseRef
+      ? readFileSync(looseRef, 'utf8').trim()
+      : readFileSync(markerPath, 'utf8').split('\n')
+          .find((line) => line.endsWith(` ${ref}`) && /^[0-9a-f]{40} /.test(line))?.slice(0, 40) ?? '';
+    if (!/^[0-9a-f]{40}$/.test(sha)) return none;
+    // packed-refs mtime은 재패킹만 해도 움직이므로 설치 시각으로 쓰면 오경보가 난다.
+    // packed ref의 체크아웃 시각은 HEAD mtime만 사용한다. loose ref는 ref 갱신과
+    // 체크아웃 중 늦은 시각을 사용한다.
+    let installedAtMs: number | null = null;
+    try { installedAtMs = looseRef
+      ? Math.max(statSync(markerPath).mtimeMs, statSync(headPath).mtimeMs)
+      : statSync(headPath).mtimeMs; } catch { /* fail-soft */ }
+    return { sha, installedAtMs, marker: markerPath };
+  } catch { return none; }
+}
+
+/** 설치 sha — 이 체크아웃의 HEAD. 실패 시 null. */
+export function resolveInstalledSha(): string | null {
+  return resolveInstalledRevisionMarker().sha;
+}
+
+export interface StaleOpenerCheck {
+  selfPid: number;
+  /** 현재 설치 sha 가 설치된 시점(ms) — 이보다 먼저 기동한 오프너는 옛 판이다(must-fix: 모듈 mtime 아님). */
+  installedAtMs: number | null;
+  /** 경보 문자열에 싣는 현재 설치 sha. */
+  installedSha?: string | null;
+  revisionRelation?: 'older' | 'newer' | 'different' | 'same';
+}
+
+/** 설치 checkout의 Git 객체 그래프에서 선후를 확인한다. 알 수 없으면 다른 판으로 남긴다. */
+function revisionRelation(openerSha: string | null | undefined, installedSha: string | null): StaleOpenerCheck['revisionRelation'] {
+  if (!openerSha || !installedSha) return 'different';
+  if (openerSha === installedSha) return 'same';
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+  const ancestor = (from: string, to: string): boolean =>
+    spawnSync('git', ['-C', root, 'merge-base', '--is-ancestor', from, to], { timeout: 2_000, stdio: 'ignore' }).status === 0;
+  if (ancestor(openerSha, installedSha)) return 'older';
+  if (ancestor(installedSha, openerSha)) return 'newer';
+  return 'different';
+}
+
+/** 순수 — 오프너 하나가 «옛 판»인가? 이유 문자열, 정상이면 null. 측정 결측은 정상 취급(fail-safe). */
+export function staleOpenerReason(opener: LogDbOpenerInfo, check: StaleOpenerCheck): string | null {
+  if (opener.pid === check.selfPid) return null;
+  if (check.revisionRelation === 'newer' || check.revisionRelation === 'different') return null;
+  if (check.revisionRelation === 'older') {
+    return `checkout revision ${opener.revisionSha} precedes installed revision ${check.installedSha}`;
+  }
+  if (check.installedAtMs === null || opener.startedAtMs === null) return null;
+  if (opener.startedAtMs >= check.installedAtMs) return null;
+  return `started ${new Date(opener.startedAtMs).toISOString()} before installed revision ${check.installedSha ?? 'unknown'} (installed at ${new Date(check.installedAtMs).toISOString()})`;
+}
+
+export interface StaleOpenerAlert {
+  pid: number;
+  start: string | null;
+  startedAt: string | null;
+  reason: string;
+}
+
+/** 수호자 본체 — 옛 판 오프너를 찾아 `log-store.retention`/`stale-opener-alert` 경보 관측을
+ *  남긴다. caller: runStampedRetention(보존 주기마다 1회 · registerLogStoreSink 가 스케줄).
+ *  전 경로 fail-soft — 수호자가 retention 을 절대 깨지 않는다. */
+export function alertStaleLogDbOpeners(
+  dbPath: string,
+  deps: { openers?: () => LogDbOpenerInfo[]; installedAtMs?: number | null } = {},
+): StaleOpenerAlert[] {
+  const alerts: StaleOpenerAlert[] = [];
+  try {
+    // must-fix: 옛 판 판정 마커는 모듈 파일 mtime 이 아니라 «설치 sha 의 설치 시점»이다.
+    const marker = resolveInstalledRevisionMarker();
+    const installedAtMs = deps.installedAtMs ?? marker.installedAtMs;
+    const openers = (deps.openers ?? (() => scanLogDbOpeners(dbPath)))();
+    for (const opener of openers) {
+      const relation = opener.revisionSha && marker.sha
+        ? revisionRelation(opener.revisionSha, marker.sha) : undefined;
+      if (relation === 'different') {
+        debug.log('log-store.retention', 'different-opener-alert', {
+          pid: opener.pid, db: dbPath, openerSha: opener.revisionSha, installedSha: marker.sha,
+          reason: 'checkout revision ancestry unavailable or divergent',
+        }, { level: 'warn' });
+        continue;
+      }
+      const reason = staleOpenerReason(opener, { selfPid: process.pid, installedAtMs, installedSha: marker.sha, revisionRelation: relation });
+      if (!reason) continue;
+      const startedAt = opener.startedAtMs === null ? null : new Date(opener.startedAtMs).toISOString();
+      alerts.push({ pid: opener.pid, start: opener.start, startedAt, reason });
+      debug.log('log-store.retention', 'stale-opener-alert', {
+        pid: opener.pid, start: opener.start, startedAt, reason,
+        db: dbPath, installedSha: marker.sha, openerSha: opener.revisionSha ?? null, installedAtMs,
+        marker: marker.marker, via: 'procfs-fd+stat',
+      }, { level: 'warn' });
+    }
+  } catch { /* fail-soft — 수호자가 retention 을 깨지지 않게 한다 */ }
+  return alerts;
+}
+
 /** Only the guard row can authorize removal. A pre-publication temp file belongs to its row's token. */
 function removeRetentionLockDirectory(lockPath: string, token: string, interrupted: boolean): void {
   if (!existsSync(lockPath)) return;
@@ -1071,6 +1292,9 @@ function runStampedRetention(store: LogStore, retention: LogStoreRetention, owne
   if (!release) return;
   try {
     if (!owner && isFresh()) return;
+    // ⓑ 수호자 — 설치 판보다 먼저 기동한(=옛 판) logs.db 오프너 경보(lsof⊕lstart 상당,
+    // fail-soft). 보존 주기(6h · owner=nexus)마다 함께 돈다.
+    alertStaleLogDbOpeners(store.path);
     store.enforceRetention(retention);
     try { store.reclaimFreePages(); }
     catch (error) { debug.log('log-store.retention', 'reclaim-failed', { reason: error instanceof Error ? error.message : String(error) }); }

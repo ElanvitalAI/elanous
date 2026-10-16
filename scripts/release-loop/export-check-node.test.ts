@@ -14,7 +14,7 @@ function check(exportStatus: number, buildStatus: number, index = false, pwaDepe
   const previous = process.env.ELANOUS_GRAPH_CONTEXT;
   mkdirSync(join(repo, 'node_modules'), { recursive: true });
   if (pwaDependencies) mkdirSync(join(repo, 'apps', 'pwa', 'node_modules'), { recursive: true });
-  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.8', previousVersion: '0.2.7' }, outputs: { 'version-release': { commit }, gate: { outcome: 'ok' } } });
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.8', previousVersion: '0.2.7' }, outputs: { 'version-release': { commit } } });
   const run: CommandRunner = (command, args, cwd) => {
     calls.push({ command, args, cwd });
     if (command === 'git' && args[0] === 'worktree' && args[1] === 'add') {

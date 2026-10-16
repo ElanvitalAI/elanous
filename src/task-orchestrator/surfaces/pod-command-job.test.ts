@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
@@ -15,6 +15,7 @@ import {
   podCpuMillis,
   resolvePodCpu,
   POD_RESULT_MARKER,
+  POD_MARKER_LOG_RETRIES,
   runPodCommand,
   splitPodResultMarker,
   tailBytes,
@@ -22,6 +23,7 @@ import {
 import type { Kubectl } from './self-implement-pod.js';
 import { PodPoolScheduler, syncPoolImages, type PodPoolMember, type RemoteRun } from './pod-pool.js';
 import { podSourceScript } from './pod-source-receive.js';
+import { hostShellWithin, podHostDirsNodeIdsScript, podHostDirsNodeScript, prepareHostDirsOnce, resetHostDirsPrepMemo } from './pod-install-slots.js';
 import { LogStore } from '../../mss/logging/log-store.js';
 
 const base = {
@@ -63,7 +65,7 @@ describe('pod command job manifest', () => {
     const spec = (withMirror.spec as { template: { spec: { volumes: unknown[]; containers: Array<{ volumeMounts: unknown[] }> } } }).template.spec;
     expect(spec.volumes).toContainEqual({ name: 'host-mirror', hostPath: { path: '/mirror-host/elanous-agent.git', type: 'Directory' } });
     expect(spec.containers[0]!.volumeMounts).toContainEqual({ name: 'host-mirror', mountPath: '/host-mirror', readOnly: true });
-    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('90f7e8782899622b3a57a6f3f37b6b6ed79e330e5a2615fb70721d9b9712ae24');
+    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('375fc057e967327bb86afaaa8174f9b01b465b61c387a5c6e56b2f2020d4dcff');
     expect(JSON.stringify(manifest({ clone: true, hostMirror: undefined }))).toBe(JSON.stringify(original));
   });
 
@@ -81,41 +83,84 @@ describe('pod command job manifest', () => {
       { name: 'host-mirror', mountPath: '/host-mirror', readOnly: true },
       { name: 'bun-cache', mountPath: '/bun-cache', readOnly: false },
     ]);
-    // GATE-WARM-BOOT: the one isolation init container also hands the host dir over (no second init container).
-    expect(spec.initContainers).toHaveLength(1);
-    expect(spec.initContainers[0]!.volumeMounts).toEqual([{ name: 'bun-cache', mountPath: '/bun-cache', readOnly: false }]);
+    // GATE-WARM-BOOT-NO-INIT: no init container; the host dir is handed over on the node (runPodCommand), the child only reports.
+    expect(spec.initContainers).toBeUndefined();
+    expect(podCommandScript(cached)).toContain(`[host-dirs] could not prepare $d`);
     expect(podCommandScript(cached)).toContain('if [ -d /bun-cache ] && [ -w /bun-cache ]; then export BUN_INSTALL_CACHE_DIR=/bun-cache; fi;');
-    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('90f7e8782899622b3a57a6f3f37b6b6ed79e330e5a2615fb70721d9b9712ae24');
+    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('375fc057e967327bb86afaaa8174f9b01b465b61c387a5c6e56b2f2020d4dcff');
     expect(JSON.stringify(manifest({ clone: true, bunCache: undefined }))).toBe(JSON.stringify(original));
     expect(podCommandScript(original)).not.toContain('BUN_INSTALL_CACHE_DIR');
   });
 
-  test('GATE-INSTALL-CACHE: install slots mount a hostPath and a root init container hands the host dirs to uid 1000', () => {
+  test('GATE-INSTALL-CACHE: install slots mount a hostPath; no init container and no root container hands them over', () => {
     const original = manifest({ clone: true });
     const slotted = manifest({ clone: true, bunCache: '/srv/bun-cache', installSlots: '/var/lib/elanous/gate-install-slots' });
-    const spec = (slotted.spec as { template: { spec: { volumes: unknown[]; containers: Array<{ volumeMounts: unknown[] }>; initContainers: Array<Record<string, unknown>> } } }).template.spec;
+    const spec = (slotted.spec as { template: { spec: { volumes: unknown[]; containers: Array<Record<string, unknown> & { volumeMounts: unknown[] }>; initContainers?: unknown[] } } }).template.spec;
     expect(spec.volumes).toContainEqual({ name: 'install-slots', hostPath: { path: '/var/lib/elanous/gate-install-slots', type: 'DirectoryOrCreate' } });
     expect(spec.containers[0]!.volumeMounts).toContainEqual({ name: 'install-slots', mountPath: '/gate-install-slots', readOnly: false });
-    // GATE-WARM-BOOT (10-15): one init container — a second one cost minutes per Pod on a loaded k3d node.
-    expect(spec.initContainers).toHaveLength(1);
-    const init = spec.initContainers[0]!;
-    expect(init).toMatchObject({ name: 'isolation-gate', securityContext: { runAsUser: 0 } });
-    expect(init.volumeMounts).toEqual([
-      { name: 'bun-cache', mountPath: '/bun-cache', readOnly: false },
-      { name: 'install-slots', mountPath: '/gate-install-slots', readOnly: false },
-    ]);
-    const args = String((init.args as string[])[0]);
-    // The hand-over runs only after the isolation probe passed; a failed probe still fails the Pod.
-    expect(args.indexOf('chown 1000:1000')).toBeGreaterThan(args.indexOf('isolation enforced'));
-    expect(args).toContain('ISOLATION NOT ENFORCED within 30s"; exit 1');
+    // GATE-WARM-BOOT-NO-INIT (10-15): #27805 measured init 2 → 354 s · init 1 → 41 s · none → 1 s on node-b k3d.
+    expect(spec.initContainers).toBeUndefined();
+    expect(spec.containers[0]!.securityContext).toBeUndefined();
+    const script = podCommandScript(slotted);
+    expect(script).not.toContain('chown');
+    // The child only reports an unwritable dir (never fails on it), after the isolation probe passed.
+    expect(script).toContain(`for d in '/bun-cache' '/gate-install-slots'; do [ -d "$d" ] && [ -w "$d" ] || echo "[host-dirs] could not prepare $d`);
+    expect(script.indexOf('[host-dirs]')).toBeGreaterThan(script.indexOf('isolation enforced'));
     expect(JSON.stringify(manifest({ clone: true, installSlots: undefined }))).toBe(JSON.stringify(original));
+  });
+
+  test('GATE-WARM-BOOT-NO-INIT: every manifest has zero init containers and the isolation probe is the child shell first line', () => {
+    for (const over of [{}, { clone: true }, { skills: ['omni-crawl'] }, { llm: 'grok' as const }, { clone: true, bunCache: '/srv/bun-cache', installSlots: '/var/lib/elanous/gate-install-slots' }]) {
+      const m = manifest(over);
+      const spec = (m.spec as { template: { spec: Record<string, unknown> } }).template.spec;
+      expect(spec.initContainers).toBeUndefined();
+      const script = podCommandScript(m);
+      expect(script.split('\n')[0]).toBe('elanous_isolation_gate() {');
+      // The probe passes before any credential line or the command runs.
+      const probe = script.indexOf('elanous_isolation_gate || exit 1');
+      expect(probe).toBeGreaterThan(0);
+      for (const later of ['/creds/', 'set -- ', '"$@"']) if (script.includes(later)) expect(script.indexOf(later)).toBeGreaterThan(probe);
+      // Same probe, same log lines and exit code as the old `isolation-gate` init container.
+      expect(script).toContain('curl -s -m 1 -o /dev/null http://host.orb.internal:31415/health || curl -s -m 1 -o /dev/null http://core.elanous-prod:8080/');
+      expect(script).toContain('echo "[gate] isolation enforced after ${i} probes"; return 0;');
+      expect(script).toContain('echo "[gate] ISOLATION NOT ENFORCED within 30s"; exit 1');
+    }
+  });
+
+  test('GATE-WARM-BOOT-NO-INIT: the probe lines run in bash — enforced continues, unreachable daemons pass, a reachable one exits 1', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-iso-probe-'));
+    try {
+      const probe = podCommandScript(manifest({})).split('\n').slice(0, 10).join('\n');
+      expect(probe.split('\n').at(-1)).toBe('elanous_isolation_gate || exit 1');
+      const run = (curlRc: number) => {
+        writeFileSync(join(dir, 'curl'), `#!/bin/sh\nexit ${curlRc}\n`); chmodSync(join(dir, 'curl'), 0o755);
+        writeFileSync(join(dir, 'sleep'), '#!/bin/sh\nexit 0\n'); chmodSync(join(dir, 'sleep'), 0o755);
+        return spawnSync('bash', ['-c', `${probe}\necho CHILD-RAN`], { encoding: 'utf8', env: { PATH: `${dir}:${process.env.PATH}` } });
+      };
+      const blocked = run(7);
+      expect(blocked.status).toBe(0);
+      expect(blocked.stdout).toBe('[gate] isolation enforced after 3 probes\nCHILD-RAN\n');
+      const open = run(0);
+      expect(open.status).toBe(1);
+      expect(open.stdout).toBe('[gate] ISOLATION NOT ENFORCED within 30s\n');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('W5: tmpfsSizeLimit mounts a memory emptyDir as TMPDIR; omitted keeps the pre-change bytes', () => {
+    const original = manifest({ clone: true });
+    const spec = (manifest({ clone: true, tmpfsSizeLimit: '2Gi' }).spec as { template: { spec: { volumes: unknown[]; containers: Array<{ env: unknown[]; volumeMounts: unknown[] }> } } }).template.spec;
+    expect(spec.volumes).toContainEqual({ name: 'tmp-mem', emptyDir: { medium: 'Memory', sizeLimit: '2Gi' } });
+    expect(spec.containers[0]!.volumeMounts).toContainEqual({ name: 'tmp-mem', mountPath: '/tmp-mem' });
+    expect(spec.containers[0]!.env).toContainEqual({ name: 'TMPDIR', value: '/tmp-mem' });
+    expect(JSON.stringify(manifest({ clone: true, tmpfsSizeLimit: undefined }))).toBe(JSON.stringify(original));
+    expect(JSON.stringify(manifest({ clone: true, tmpfsSizeLimit: ' ' }))).toBe(JSON.stringify(original));
   });
 
   test('GATE-SPEED A3①: cpu omitted keeps request 1 / limit 4 and the pre-change bytes; cpu override reaches the Job spec', () => {
     const res = (m: ReturnType<typeof manifest>) => (m.spec as { template: { spec: { containers: Array<{ resources: { requests: Record<string, string>; limits: Record<string, string> } }> } } }).template.spec.containers[0]!.resources;
     const original = manifest({ clone: true });
     expect(res(original)).toEqual({ requests: { cpu: '1', memory: '6Gi' }, limits: { memory: '16Gi', cpu: '4' } });
-    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('90f7e8782899622b3a57a6f3f37b6b6ed79e330e5a2615fb70721d9b9712ae24');
+    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('375fc057e967327bb86afaaa8174f9b01b465b61c387a5c6e56b2f2020d4dcff');
     expect(JSON.stringify(manifest({ clone: true, cpu: undefined }))).toBe(JSON.stringify(original));
     expect(JSON.stringify(manifest({ clone: true, cpu: {} }))).toBe(JSON.stringify(original));
     expect(res(manifest({ clone: true, cpu: { request: '1', limit: '1' } }))).toEqual({ requests: { cpu: '1', memory: '6Gi' }, limits: { memory: '16Gi', cpu: '1' } });
@@ -179,6 +224,27 @@ describe('pod command job manifest', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  test('outbox sends smaller files first, breaks size ties by name, and preserves the 20 MiB budget', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-cmd-artifact-order-'));
+    const outbox = join(dir, 'outbox');
+    mkdirSync(outbox);
+    try {
+      const large = Buffer.alloc(5 * 1024 * 1024, 'x');
+      for (const name of ['large-4', 'large-3', 'large-2', 'large-1']) writeFileSync(join(outbox, name), large);
+      writeFileSync(join(outbox, 'note-z'), 'z');
+      writeFileSync(join(outbox, 'note-a'), 'a');
+      const script = podCommandScript(manifest({ command: ['true'] }));
+      const ran = spawnSync('bash', ['-c', script.slice(script.indexOf('set -- '))], {
+        encoding: 'utf8', env: { ...process.env, HOME: dir }, maxBuffer: 2 * 1024 * 1024,
+      });
+      expect(ran.status).toBe(0);
+      const names = ran.stdout.split('\n').filter((line) => line.startsWith('ELANOUS_POD_ARTIFACT '))
+        .map((line) => Buffer.from(line.split(' ')[1]!, 'base64url').toString());
+      expect(names).toEqual(['note-a', 'note-z', 'large-1', 'large-2', 'large-3']);
+      expect(ran.stdout).toContain('ELANOUS_POD_ARTIFACT_SKIPPED large-4 5242880');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('skills·llm 이 없으면 Secret 자격 키가 0개다', () => {
     const job = manifest();
     const script = podCommandScript(job);
@@ -215,10 +281,10 @@ describe('pod command job manifest', () => {
     expect(podCommandSecretKeys(secret)).toEqual(['gh-token']);
   });
 
-  // SHA-256 of the default JSON manifest (base + clone: true) — re-pinned 10-15 for GATE-POD-RESULT-MARKER (done-marker line); a change here means the default manifest moved.
+  // SHA-256 of the default JSON manifest (base + clone: true) — re-pinned 10-15 for GATE-POD-RESULT-MARKER (done-marker line) then GATE-WARM-BOOT-NO-INIT (no init container · probe in the child shell), 10-16 TA-POD-WARMBOOT-PARITY (MIRROR_SKIP reason line); a change here means the default manifest moved.
   test('commit source checks out the requested SHA; omitted source retains the default manifest bytes', () => {
     const source = { kind: 'commit' as const, sha: 'a'.repeat(40) };
-    const original = '90f7e8782899622b3a57a6f3f37b6b6ed79e330e5a2615fb70721d9b9712ae24';
+    const original = '375fc057e967327bb86afaaa8174f9b01b465b61c387a5c6e56b2f2020d4dcff';
     const script = podCommandScript(manifest({ clone: true, source }));
     expect(script).toContain(podSourceScript(source, base.repoUrl));
     expect(script).toContain(`git checkout --detach ${source.sha}`);
@@ -303,7 +369,7 @@ describe('runPodCommand', () => {
       const job = applied.find((body) => body.kind === 'Job')!;
       expect(podCommandImageFor(variant.skills, false, variant.lite)).toBe(variant.expected);
       expect(result.image).toBe(variant.expected);
-      expect(job.spec.template.spec.initContainers[0].image).toBe(variant.expected);
+      expect(job.spec.template.spec.initContainers).toBeUndefined();
       expect(job.spec.template.spec.containers[0].image).toBe(variant.expected);
       expect(job.spec.template.spec.containers[0].resources.limits.memory).toBe(variant.memory);
     }
@@ -331,7 +397,7 @@ describe('runPodCommand', () => {
     });
     expect(syncedImage).toBe('elanous-harness-lite:local');
     expect(result.image).toBe(imageRef);
-    expect(applied!.spec.template.spec.initContainers[0]).toMatchObject({ image: imageRef, imagePullPolicy: 'IfNotPresent' });
+    expect(applied!.spec.template.spec.initContainers).toBeUndefined();
     expect(applied!.spec.template.spec.containers[0]).toMatchObject({ image: imageRef, imagePullPolicy: 'IfNotPresent' });
   });
 
@@ -379,7 +445,7 @@ describe('runPodCommand', () => {
     expect(unbounded.n).toBe(6);
   });
 
-  test('pool registry tag uses IfNotPresent for both the isolation gate and child', async () => {
+  test('pool registry tag uses IfNotPresent for the child (no init container)', async () => {
     const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool', registry: 'k3d-elanous-registry:5050' };
     const ref = 'k3d-elanous-registry:5050/elanous-harness:abcdef123456';
     const run: RemoteRun = (_host, cmd) => ({ status: 0, stdout: cmd.includes('/tags/list') ? '{"tags":["abcdef123456"]}' : 'abcdef1234567890', stderr: '' });
@@ -394,7 +460,7 @@ describe('runPodCommand', () => {
       }, env: { ELANOUS_POD_POOL: 'pool-node-b@node-b:1#k3d-elanous-registry:5050' }, configHostMirror: () => undefined, artifactsRoot: '/tmp/pod-command-registry-test',
     });
     expect(result.image).toBe(ref);
-    expect(job!.spec.template.spec.initContainers[0]).toMatchObject({ image: ref, imagePullPolicy: 'IfNotPresent' });
+    expect(job!.spec.template.spec.initContainers).toBeUndefined();
     expect(job!.spec.template.spec.containers[0]).toMatchObject({ image: ref, imagePullPolicy: 'IfNotPresent' });
   });
 
@@ -427,6 +493,174 @@ describe('runPodCommand', () => {
     expect(seeds).toHaveLength(1);
   });
 
+  test('GATE-WARM-BOOT-NO-INIT: host dirs are handed over on the placed member once before the Job; failure only logs', async () => {
+    const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool' };
+    const order: string[] = [];
+    const preps: Array<{ member: PodPoolMember; hostPaths: readonly string[] }> = [];
+    const events: Array<Record<string, unknown>> = [];
+    const launch = (o: { ok: boolean; installSlots?: string; pool?: boolean }) => runPodCommand({ command: ['true'], name: 'host-dirs-prep', imageCommit: null,
+      ...(o.pool === false ? {} : { poolScheduler: new PodPoolScheduler([member]) }),
+      ...(o.installSlots ? { installSlots: o.installSlots, bunCache: '/srv/bun-cache' } : {}),
+      prepareHostDirs: async (p) => { order.push('prep'); preps.push(p); return o.ok ? { host: 'node-b', ok: true, ms: 7 } : { host: 'node-b', ok: false, ms: 3, detail: 'no k3d node' }; },
+      log: (_c, e, d) => { if (e === 'host-dirs-prep') events.push(d as Record<string, unknown>); },
+      syncImages: async () => new Map([[member.context, { ok: true, action: 'fresh' as const, detail: 'ready', ms: 1 }]]),
+      kubectl: (args, input) => {
+        if (input && JSON.parse(input).kind === 'Job') order.push('job');
+        if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+        return { status: 0, stdout: '0', stderr: '' };
+      }, env: {}, configHostMirror: () => undefined, artifactsRoot: '/tmp/pod-command-host-dirs-test',
+    });
+    await launch({ ok: true, installSlots: '/var/lib/elanous/gate-install-slots' });
+    expect(order).toEqual(['prep', 'job']);
+    expect(preps).toEqual([{ member, hostPaths: ['/srv/bun-cache', '/var/lib/elanous/gate-install-slots'] }]);
+    expect(events).toEqual([{ host: 'node-b', ok: true, ms: 7, paths: ['/srv/bun-cache', '/var/lib/elanous/gate-install-slots'] }]);
+    // A failed hand-over still launches the Job (the child falls back) and leaves the reason in the log.
+    order.length = 0;
+    await launch({ ok: false, installSlots: '/var/lib/elanous/gate-install-slots' });
+    expect(order).toEqual(['prep', 'job']);
+    expect(events.at(-1)).toMatchObject({ ok: false, detail: 'no k3d node' });
+    // No host dirs: nothing to hand over. No pool member: observable skip.
+    order.length = 0;
+    await launch({ ok: true });
+    expect(order).toEqual(['job']);
+    await launch({ ok: true, installSlots: '/var/lib/elanous/gate-install-slots', pool: false });
+    expect(events.at(-1)).toEqual({ ok: false, reason: 'no-pool-member', paths: ['/srv/bun-cache', '/var/lib/elanous/gate-install-slots'] });
+    // An injected kubectl without a seam never reaches a host, but the skip is still observed.
+    const skipped: Array<Record<string, unknown>> = [];
+    await runPodCommand({ command: ['true'], name: 'host-dirs-skip', imageCommit: null, poolScheduler: new PodPoolScheduler([member]),
+      installSlots: '/var/lib/elanous/gate-install-slots',
+      log: (_c, e, d) => { if (e === 'host-dirs-prep') skipped.push(d as Record<string, unknown>); },
+      syncImages: async () => new Map([[member.context, { ok: true, action: 'fresh' as const, detail: 'ready', ms: 1 }]]),
+      kubectl: (args) => args.some((arg) => arg.includes('.status.conditions')) ? { status: 0, stdout: 'Complete', stderr: '' } : { status: 0, stdout: '0', stderr: '' },
+      env: {}, configHostMirror: () => undefined, artifactsRoot: '/tmp/pod-command-host-dirs-test',
+    });
+    expect(skipped).toEqual([{ ok: false, reason: 'prep-disabled', paths: ['/var/lib/elanous/gate-install-slots'] }]);
+  });
+
+  test('GATE-WARM-BOOT-NO-INIT: when the node-side hand-over did not succeed the Job keeps a root host-dirs init (uid 1000 can write)', async () => {
+    const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool' };
+    const initsOf = async (o: { prep?: 'ok' | 'fail'; pool?: boolean; hostDirs?: boolean }) => {
+      let job: { spec: { template: { spec: { initContainers?: Array<{ name: string; securityContext?: { runAsUser: number }; args: string[]; volumeMounts: Array<{ mountPath: string }> }> } } } } | undefined;
+      await runPodCommand({ command: ['true'], name: 'host-dirs-init', imageCommit: null,
+        ...(o.pool === false ? {} : { poolScheduler: new PodPoolScheduler([member]) }),
+        ...(o.hostDirs === false ? {} : { installSlots: '/var/lib/elanous/gate-install-slots', bunCache: '/srv/bun-cache' }),
+        ...(o.prep ? { prepareHostDirs: async () => o.prep === 'ok' ? { host: 'node-b', ok: true, ms: 1 } : { host: 'node-b', ok: false, ms: 1, detail: 'no k3d node' } } : {}),
+        log: () => {},
+        syncImages: async () => new Map([[member.context, { ok: true, action: 'fresh' as const, detail: 'ready', ms: 1 }]]),
+        kubectl: (args, input) => {
+          if (input && JSON.parse(input).kind === 'Job') job = JSON.parse(input);
+          if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+          return { status: 0, stdout: '0', stderr: '' };
+        }, env: {}, configHostMirror: () => undefined, artifactsRoot: '/tmp/pod-command-host-dirs-init-test',
+      });
+      return job!.spec.template.spec.initContainers;
+    };
+    // Prepared on the node → no init container (the warm-boot path).
+    expect(await initsOf({ prep: 'ok' })).toBeUndefined();
+    // No host dirs → nothing to hand over → no init.
+    expect(await initsOf({ prep: 'ok', hostDirs: false })).toBeUndefined();
+    // No pool member · hand-over failed · no seam (injected kubectl): the old in-Pod root hand-over comes back.
+    for (const inits of [await initsOf({ pool: false }), await initsOf({ prep: 'fail' }), await initsOf({})]) {
+      expect(inits).toHaveLength(1);
+      expect(inits![0]!.name).toBe('host-dirs');
+      expect(inits![0]!.securityContext).toEqual({ runAsUser: 0 });
+      expect(inits![0]!.args[0]).toContain('chown 1000:1000');
+      expect(inits![0]!.volumeMounts.length).toBe(2);
+    }
+  });
+
+  test('GATE-WARM-BOOT-NO-INIT: the node script chowns in every k3d server/agent node and the memo runs once per member', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-host-dirs-'));
+    try {
+      const calls = join(dir, 'calls');
+      writeFileSync(join(dir, 'docker'), `#!/bin/sh
+if [ "$1" = ps ]; then echo "$*" >> ${calls}; printf 'k3d-elanous-pool-server-0 server\nk3d-elanous-pool-serverlb loadbalancer\nk3d-elanous-pool-agent-0 agent\n'; exit 0; fi
+echo "$2 $5" >> ${calls}
+exit 0
+`);
+      chmodSync(join(dir, 'docker'), 0o755);
+      const script = podHostDirsNodeScript({ cluster: 'elanous-pool', hostPaths: ['/var/lib/elanous/gate-install-slots'] });
+      const r = spawnSync('bash', ['-c', script], { encoding: 'utf8', env: { PATH: `${dir}:${process.env.PATH}` } });
+      expect(r.status).toBe(0);
+      const lines = readFileSync(calls, 'utf8').trim().split('\n');
+      expect(lines[0]).toContain('label=k3d.cluster=elanous-pool');
+      expect(lines.slice(1)).toEqual([
+        'k3d-elanous-pool-server-0 for d in /var/lib/elanous/gate-install-slots; do mkdir -p "$d" && chown 1000:1000 "$d" && chmod 0775 "$d" || { echo "[host-dirs] could not prepare $d"; exit 1; }; done',
+        'k3d-elanous-pool-agent-0 for d in /var/lib/elanous/gate-install-slots; do mkdir -p "$d" && chown 1000:1000 "$d" && chmod 0775 "$d" || { echo "[host-dirs] could not prepare $d"; exit 1; }; done',
+      ]);
+      expect(() => podHostDirsNodeScript({ cluster: 'elanous-pool', hostPaths: ["/x'; rm -rf /"] })).toThrow('invalid host dir');
+      expect(() => podHostDirsNodeScript({ cluster: 'a b', hostPaths: ['/x'] })).toThrow('invalid k3d cluster');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+
+    resetHostDirsPrepMemo();
+    // Fake host shell: the node-IDs query answers with the current node set; every other script is a hand-over run.
+    let nodeIds = 'id-server id-agent0';
+    let idsRc = 0;
+    let rc = 1;
+    const runs: Array<string | undefined> = [];
+    const scripts: string[] = [];
+    const shell = async (host: string | undefined, script: string) => {
+      if (script.includes('{{.ID}}')) return { rc: idsRc, output: idsRc ? '' : `${nodeIds} ` };
+      runs.push(host); scripts.push(script);
+      return { rc, output: rc ? 'docker: not found' : '' };
+    };
+    const member = { sshHost: 'node-b', k3dCluster: 'elanous-pool' };
+    expect(await prepareHostDirsOnce({ member, hostPaths: ['/a'], shell })).toMatchObject({ host: 'node-b', ok: false, detail: 'docker: not found' });
+    rc = 0;
+    const [a, b] = await Promise.all([prepareHostDirsOnce({ member, hostPaths: ['/a'], shell }), prepareHostDirsOnce({ member, hostPaths: ['/a'], shell })]);
+    expect([a.ok, b.ok]).toEqual([true, true]);
+    await prepareHostDirsOnce({ member: { k3dCluster: 'elanous-h1' }, hostPaths: ['/a'], shell });
+    // failure not memoized (retried) · concurrent calls share one run · a local member runs without ssh.
+    expect(runs).toEqual(['node-b', 'node-b', undefined]);
+    // Same node set → remembered (no new run).
+    expect((await prepareHostDirsOnce({ member, hostPaths: ['/a'], shell })).ok).toBe(true);
+    expect(runs).toHaveLength(3);
+    // Review mf: a recreated cluster / new agent (other container IDs) is a new generation → the hand-over runs again.
+    nodeIds = 'id-server id-agent0 id-agent1';
+    expect((await prepareHostDirsOnce({ member, hostPaths: ['/a'], shell })).ok).toBe(true);
+    expect(runs).toHaveLength(4);
+    // Unreadable node IDs → no memo: every call runs and success is not remembered.
+    idsRc = 1;
+    await prepareHostDirsOnce({ member, hostPaths: ['/a'], shell });
+    await prepareHostDirsOnce({ member, hostPaths: ['/a'], shell });
+    expect(runs).toHaveLength(6);
+    idsRc = 0;
+    // Memo is per path: a list overlapping an already-prepared path runs only the new path.
+    scripts.length = 0;
+    expect((await prepareHostDirsOnce({ member, hostPaths: ['/a', '/b'], shell })).ok).toBe(true);
+    expect((await prepareHostDirsOnce({ member, hostPaths: ['/a', '/c'], shell })).ok).toBe(true);
+    expect(await prepareHostDirsOnce({ member, hostPaths: ['/b', '/c'], shell })).toMatchObject({ ok: true });
+    expect(scripts.map((script) => /for d in ([^;]+);/.exec(script)?.[1])).toEqual(['/b', '/c']);
+    // The IDs query lists only server/agent containers of that cluster, sorted.
+    expect(podHostDirsNodeIdsScript('elanous-pool')).toContain('label=k3d.cluster=elanous-pool');
+    expect(podHostDirsNodeIdsScript('elanous-pool')).toContain('$2=="server"||$2=="agent"');
+    expect(() => podHostDirsNodeIdsScript('a b')).toThrow('invalid k3d cluster');
+    resetHostDirsPrepMemo();
+  });
+
+  test('GATE-WARM-BOOT-NO-INIT: a stuck host shell returns at the limit even when a grandchild holds the pipe', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-host-shell-'));
+    try {
+      const pidFile = join(dir, 'pid');
+      // `docker exec` stand-in: a grandchild that inherits stdout and never exits.
+      const start = Date.now();
+      const r = await hostShellWithin(undefined, `sh -c 'echo $$ > ${pidFile}; exec sleep 30' | cat`, 300);
+      expect(Date.now() - start).toBeLessThan(5_000);
+      expect(r.rc).toBe(124);
+      expect(r.output).toContain('[host-dirs] timed out after 300 ms');
+      const pid = Number(readFileSync(pidFile, 'utf8').trim());
+      await new Promise((done) => setTimeout(done, 100));
+      expect(() => process.kill(pid, 0)).toThrow();
+      // A timed-out prep is a failure (not memoized) and the Job launch behind it goes on.
+      resetHostDirsPrepMemo();
+      const prep = await prepareHostDirsOnce({ member: { k3dCluster: 'elanous-pool' }, hostPaths: ['/a'], limitMs: 300,
+        shell: (host, _script, limitMs) => hostShellWithin(host, 'sleep 30 | cat', limitMs) });
+      expect(prep).toMatchObject({ host: 'local', ok: false });
+      expect(prep.detail).toContain('timed out after 300 ms');
+      resetHostDirsPrepMemo();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('an unavailable registry tag falls back to the local image with one observable reason', async () => {
     let job: Record<string, any> | undefined;
     const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
@@ -441,7 +675,7 @@ describe('runPodCommand', () => {
       env: {}, configHostMirror: () => undefined, artifactsRoot: '/tmp/pod-command-registry-test',
     });
     expect(result.image).toBe('elanous-harness:local');
-    expect(job!.spec.template.spec.initContainers[0]).toMatchObject({ image: 'elanous-harness:local', imagePullPolicy: 'Never' });
+    expect(job!.spec.template.spec.initContainers).toBeUndefined();
     expect(job!.spec.template.spec.containers[0]).toMatchObject({ image: 'elanous-harness:local', imagePullPolicy: 'Never' });
     expect(events.filter(({ event }) => event === 'image-fallback-local')).toEqual([
       { category: 'pod.command-job', event: 'image-fallback-local', data: { reason: 'registry-tag-unavailable' } },
@@ -534,6 +768,28 @@ describe('runPodCommand', () => {
       kubectl: (args) => { kubectlCalls.push([...args]); return { status: 0, stdout: '', stderr: '' }; } })).rejects.toThrow('exceeds limit');
     expect(kubectlCalls).toEqual([]);
     expect(applied.length).toBe(before);
+  });
+
+  test('W5: runPodCommand passes tmpfsSizeLimit into the Job — volume, mount and TMPDIR together; omitted adds none', async () => {
+    const run = async (tmpfsSizeLimit?: string) => {
+      const inputs: string[] = [];
+      await runPodCommand({ command: ['true'], env: {}, configHostMirror: () => undefined, ...(tmpfsSizeLimit ? { tmpfsSizeLimit } : {}),
+        kubectl: (args, input) => {
+          if (input) inputs.push(input);
+          if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+          return { status: 0, stdout: '0', stderr: '' };
+        }, imageCommit: null, name: 'tmpfs-test', artifactsRoot: '/tmp/pod-command-tmpfs-test',
+      });
+      const job = inputs.map((body) => JSON.parse(body) as { kind: string; spec?: { template: { spec: { volumes?: unknown[]; containers: Array<{ env: unknown[]; volumeMounts?: unknown[] }> } } } }).find((item) => item.kind === 'Job');
+      return job!.spec!.template.spec;
+    };
+    const withTmpfs = await run('2Gi');
+    expect(withTmpfs.volumes).toContainEqual({ name: 'tmp-mem', emptyDir: { medium: 'Memory', sizeLimit: '2Gi' } });
+    expect(withTmpfs.containers[0]!.volumeMounts).toContainEqual({ name: 'tmp-mem', mountPath: '/tmp-mem' });
+    expect(withTmpfs.containers[0]!.env).toContainEqual({ name: 'TMPDIR', value: '/tmp-mem' });
+    const plain = await run();
+    expect(JSON.stringify(plain)).not.toContain('tmp-mem');
+    expect(plain.containers[0]!.env).not.toContainEqual({ name: 'TMPDIR', value: '/tmp-mem' });
   });
 
   test('clone-free Job mounts a configured host mirror when an environment mirror is set', async () => {
@@ -865,10 +1121,10 @@ describe('GATE-POD-RESULT-MARKER — the child prints a done marker so the host 
   });
 
   // conditions: what each condition poll returns · tails: what each tail read returns (last one repeats).
-  const run = async (o: { conditions: string[]; tails: Array<{ status: number; stdout: string }>; logs: string; podExit?: string }) => {
+  const run = async (o: { conditions: string[]; tails: Array<{ status: number; stdout: string }>; logs: string; podExit?: string; logReads?: Array<{ status: number; stdout: string }> }) => {
     const calls: string[][] = [];
     const events: Array<Record<string, unknown>> = [];
-    let cond = 0, tail = 0, launch = '';
+    let cond = 0, tail = 0, logRead = 0, launch = '';
     const bind = (text: string) => text.replaceAll('LAUNCH', launch);
     const dir = mkdtempSync(join(tmpdir(), 'pod-marker-'));
     try {
@@ -883,7 +1139,7 @@ describe('GATE-POD-RESULT-MARKER — the child prints a done marker so the host 
           if (joined.includes('.status.conditions')) return { status: 0, stdout: o.conditions[Math.min(cond++, o.conditions.length - 1)]!, stderr: '' };
           if (joined.includes('containerStatuses')) return { status: 0, stdout: o.podExit ?? '9', stderr: '' };
           if (args.includes('--tail=2')) { const t = o.tails[Math.min(tail++, o.tails.length - 1)]!; return { status: t.status, stdout: bind(t.stdout), stderr: '' }; }
-          if (args.includes('logs')) return { status: 0, stdout: bind(o.logs), stderr: '' };
+          if (args.includes('logs')) { const r = o.logReads?.[Math.min(logRead++, o.logReads.length - 1)]; return r ? { status: r.status, stdout: bind(r.stdout), stderr: r.status ? 'logs: transient' : '' } : { status: 0, stdout: bind(o.logs), stderr: '' }; }
           return { status: 0, stdout: '', stderr: '' };
         },
       });
@@ -903,6 +1159,47 @@ describe('GATE-POD-RESULT-MARKER — the child prints a done marker so the host 
     expect(calls.some((c) => c.join(' ').includes('containerStatuses'))).toBe(false);
     expect(events.find((e) => e.event === 'result-marker-early')).toMatchObject({ job: 'si-cmd-marker', rc: 0 });
     expect(events.find((e) => e.event === 'job-finished')).toMatchObject({ exitCode: 0 });
+  });
+
+  test('marker path: a transient full-log failure is re-read (≤2) before the artifacts count as lost', async () => {
+    const { result, events, childLog } = await run({
+      conditions: [''], tails: [{ status: 0, stdout: `ran\n${done(0)}` }], logs: '',
+      logReads: [{ status: 1, stdout: '' }, { status: 0, stdout: `ran\n${done(0)}` }],
+    });
+    expect(result.exitCode).toBe(0);
+    expect(childLog).toBe('ran\n');
+    expect(events.filter((e) => e.event === 'result-marker-log-retry')).toHaveLength(1);
+    expect(events.find((e) => e.event === 'job-finished')).not.toHaveProperty('artifactError');
+  });
+
+  test('marker path: full-log reads that keep failing stop after the retry cap (artifacts lost · exit code kept)', async () => {
+    const { result, calls, events } = await run({
+      conditions: [''], tails: [{ status: 0, stdout: `x${done(3)}` }], logs: '', logReads: [{ status: 1, stdout: '' }],
+    });
+    expect(result.exitCode).toBe(3);
+    expect(events.filter((e) => e.event === 'result-marker-log-retry')).toHaveLength(POD_MARKER_LOG_RETRIES);
+    expect(calls.filter((c) => c.includes('logs') && !c.includes('--tail=2'))).toHaveLength(POD_MARKER_LOG_RETRIES + 1);
+    expect(events.find((e) => e.event === 'job-finished')).toHaveProperty('artifactError');
+  });
+
+  test('marker path: a full log that reads ok but stops before this launch\'s marker is re-read; still missing → explicit failure', async () => {
+    // Cut-off read first, then the complete log: recovered on the retry.
+    const healed = await run({ conditions: [''], tails: [{ status: 0, stdout: `ran\n${done(0)}` }], logs: '',
+      logReads: [{ status: 0, stdout: 'ran\n' }, { status: 0, stdout: `ran\n${done(0)}` }] });
+    expect(healed.result.exitCode).toBe(0);
+    expect(healed.childLog).toBe('ran\n');
+    expect(healed.events.filter((e) => e.event === 'result-marker-log-retry')).toEqual([expect.objectContaining({ attempt: 1, reason: 'marker-missing-in-full-log' })]);
+    expect(healed.events.find((e) => e.event === 'job-finished')).not.toHaveProperty('artifactError');
+    // Empty every time: retries run out and the collection is reported as failed (not taken as a complete log).
+    const empty = await run({ conditions: [''], tails: [{ status: 0, stdout: `x${done(0)}` }], logs: '', logReads: [{ status: 0, stdout: '' }] });
+    expect(empty.result.exitCode).toBe(0);
+    expect(empty.events.filter((e) => e.event === 'result-marker-log-retry')).toHaveLength(POD_MARKER_LOG_RETRIES);
+    expect(String(empty.events.find((e) => e.event === 'job-finished')?.artifactError)).toContain('result marker');
+  });
+
+  test('condition path: a full-log failure is not retried (unchanged)', async () => {
+    const { events } = await run({ conditions: ['Complete'], tails: [{ status: 0, stdout: '' }], logs: '', logReads: [{ status: 1, stdout: '' }], podExit: '0' });
+    expect(events.some((e) => e.event === 'result-marker-log-retry')).toBe(false);
   });
 
   test('marker rc≠0 → that rc is the exit code (no Pod status read)', async () => {

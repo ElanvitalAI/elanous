@@ -19,6 +19,8 @@ import {
   type ToolLoopFollowupPhase,
   type ToolLoopPhaseRejectionLogFields,
 } from '../src/llm.js';
+import { ACTION_PHASE_OPS_TOOLS } from '../src/llm/tool-loop-steered-rejection.js';
+import { LEDGER_CLI_NATIVE_TOOL } from '../src/skills/tools/shell.js';
 
 const phases: Array<{
   phase: ToolLoopFollowupPhase;
@@ -70,7 +72,7 @@ function toolsInSet(source: string, name: string): string[] {
   return source.slice(start, end).match(/'([^']+)'/g)?.map((tool) => tool.slice(1, -1)) ?? [];
 }
 
-const TOOLS = ['Agent', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', 'Read'].map((name) => ({
+const TOOLS = ['Agent', 'Edit', 'Write', 'Bash', 'RunShell', 'Glob', 'Grep', 'Read', 'MsgList', 'ChecklistList', 'MsgPost', 'MsgAck', 'AgentOutput'].map((name) => ({
   name,
   description: 'd',
   parameters: { type: 'object' },
@@ -169,6 +171,82 @@ describe('tool-loop followup phase rejection', () => {
     expect(getToolLoopPhaseRejectedCalls(phase, calls).map((call) => call.id)).toEqual(['blocked', 'grep-files']);
   });
 
+  // TUI-VERIFY-PHASE-MSG-TOOLS(#67) · TUI-REPAIR-PHASE-DELEGATE-RESULT(#41)
+  test.each(['inspect-action', 'inspect-execution', 'repair-action', 'verify-action'] as const)(
+    '%s keeps every RunShell ledger steer target and delegate result runnable (no dead end)',
+    (phase) => {
+      const steerTargets = [...new Set(Object.values(LEDGER_CLI_NATIVE_TOOL)), 'ChecklistEdit'];
+      const calls = [...steerTargets, 'AgentOutput', 'AgentList', 'RunShell', 'Agent'].map((name) => ({ id: name, name, args: {} }));
+      expect(getToolLoopPhaseRejectedCalls(phase, calls)).toEqual([]);
+      for (const name of steerTargets) expect(ACTION_PHASE_OPS_TOOLS as readonly string[]).toContain(name);
+      // exploratory tools stay blocked — the phase still forces action
+      expect(getToolLoopPhaseRejectedCalls(phase, [{ id: 'g', name: 'Glob', args: {} }]).map((c) => c.id)).toEqual(['g']);
+    },
+  );
+
+  test('verify phase runs MsgPost/MsgList/MsgAck after edits and still rejects Glob', async () => {
+    const dispatched: string[] = [];
+    const { provider, capturedMessagesAt } = scriptedProvider([
+      [{ type: 'tool_call', id: 'fail', name: 'Bash', args: { command: 'bun test focused.ts' } }],
+      [{ type: 'tool_call', id: 'edit', name: 'Edit', args: { file_path: 'a.ts', old_string: 'a', new_string: 'b' } }],
+      [
+        { type: 'tool_call', id: 'post', name: 'MsgPost', args: { to: 'OP', body: 'done' } },
+        { type: 'tool_call', id: 'list', name: 'MsgList', args: {} },
+        { type: 'tool_call', id: 'ack', name: 'MsgAck', args: { id: 1 } },
+        { type: 'tool_call', id: 'blocked', name: 'Glob', args: { pattern: '**/*.ts' } },
+      ],
+      [{ type: 'text', delta: 'reported' }],
+    ]);
+
+    const result = await streamLLMWithTools(
+      [{ role: 'user', content: 'fix and report' }],
+      {
+        onText() {},
+        dispatchTool: async (name) => {
+          dispatched.push(name);
+          return name === 'Bash' ? { output: 'failed', exitCode: 1, outcome: 'exit' } : `${name} ran`;
+        },
+      },
+      { provider, tools: TOOLS, maxTurns: 30 },
+    );
+
+    expect(result).toContain('reported');
+    expect(dispatched).toEqual(['Bash', 'Edit', 'MsgPost', 'MsgList', 'MsgAck']);
+    const results = toolResults(capturedMessagesAt(3)).slice(-4);
+    expect(results.map((block) => block.content)).toEqual(['MsgPost ran', 'MsgList ran', 'MsgAck ran', expect.stringContaining('Glob did NOT run')]);
+    expect(String(results[3]!.content)).toContain('VERIFY ACTION REQUIRED');
+  });
+
+  test('repair phase receives a delegated result via AgentOutput and still rejects Glob', async () => {
+    const dispatched: string[] = [];
+    const { provider, capturedMessagesAt } = scriptedProvider([
+      [{ type: 'tool_call', id: 'fail', name: 'Bash', args: { command: 'false' } }],
+      [
+        { type: 'tool_call', id: 'out', name: 'AgentOutput', args: { taskId: 't1', block: true } },
+        { type: 'tool_call', id: 'blocked', name: 'Glob', args: { pattern: '**/*.ts' } },
+      ],
+      [{ type: 'text', delta: 'used delegate result' }],
+    ]);
+
+    const result = await streamLLMWithTools(
+      [{ role: 'user', content: 'delegate and repair' }],
+      {
+        onText() {},
+        dispatchTool: async (name) => {
+          dispatched.push(name);
+          return name === 'Bash' ? { output: 'failed', exitCode: 1, outcome: 'exit' } : `${name} ran`;
+        },
+      },
+      { provider, tools: TOOLS, maxTurns: 30 },
+    );
+
+    expect(result).toContain('used delegate result');
+    expect(dispatched).toEqual(['Bash', 'AgentOutput']);
+    const results = toolResults(capturedMessagesAt(2)).slice(-2);
+    expect(results[0]!.content).toBe('AgentOutput ran');
+    expect(String(results[1]!.content)).toContain('REPAIR ACTION REQUIRED');
+  });
+
   test('reports rejected and executed tool names separately in a partial rejection', () => {
     const message = buildToolLoopPhaseRejectionMessage('repair-action', ['Glob'], 0, ['Read', 'Bash']);
 
@@ -176,6 +254,74 @@ describe('tool-loop followup phase rejection', () => {
     expect(message).toContain('The following allowed tool call(s) are not blocked and continue in original order: Read, Bash.');
     expect(message).toContain('REPAIR ACTION REQUIRED');
     expect(getToolLoopPhaseRejectedTools(message)).toEqual(['Glob']);
+  });
+
+  test.each([
+    { approvalKey: 'rejected:ops-ledger-cli', nextTool: 'MsgList', nextArgs: {}, shellArgs: (index: number) => ({ command: ['eln', 'msg', 'list', `--page=${index}`] }) },
+    { approvalKey: 'rejected:cd', nextTool: 'Glob', nextArgs: { pattern: '**/*.ts' }, shellArgs: (index: number) => ({ command: ['cd', `directory-${index}`] }) },
+  ])('five $approvalKey steer turns do not arm repair before $nextTool', async ({ approvalKey, nextTool, nextArgs, shellArgs }) => {
+    const dispatched: string[] = [];
+    const { provider, capturedMessagesAt } = scriptedProvider([
+      ...Array.from({ length: 5 }, (_, index): LLMStreamEvent[] => [
+        { type: 'tool_call', id: `steer-${index}`, name: 'RunShell', args: shellArgs(index) },
+      ]),
+      [{ type: 'tool_call', id: 'read-after-steer', name: nextTool, args: nextArgs }],
+      [{ type: 'text', delta: 'read complete' }],
+    ]);
+
+    const result = await streamLLMWithTools(
+      [{ role: 'user', content: 'read the ledger' }],
+      {
+        onText() {},
+        dispatchTool: async (name) => {
+          dispatched.push(name);
+          return name === 'RunShell'
+            ? { output: `use ${nextTool} instead`, exitCode: null, outcome: 'spawn-error', elapsedMs: 0, approvalKey }
+            : `${name} ran`;
+        },
+      },
+      { provider, tools: TOOLS, maxTurns: 30 },
+    );
+
+    expect(result).toContain('read complete');
+    expect(dispatched).toEqual([...Array(5).fill('RunShell'), nextTool]);
+    const results = Array.from({ length: 6 }, (_, index) => toolResults(capturedMessagesAt(index + 1))).flat();
+    expect(results.find((block) => block.tool_use_id === 'read-after-steer')?.content).toBe(`${nextTool} ran`);
+    expect(results.every((block) => !String(block.content).includes('REPAIR ACTION REQUIRED'))).toBe(true);
+  });
+
+  test('real Bash failure permits operational ledger reads but still rejects Glob', async () => {
+    const dispatched: string[] = [];
+    const { provider, capturedMessagesAt } = scriptedProvider([
+      [{ type: 'tool_call', id: 'fail', name: 'Bash', args: { command: 'false' } }],
+      [
+        { type: 'tool_call', id: 'mail', name: 'MsgList', args: {} },
+        { type: 'tool_call', id: 'checklist', name: 'ChecklistList', args: {} },
+        { type: 'tool_call', id: 'blocked', name: 'Glob', args: { pattern: '**/*.ts' } },
+      ],
+      [{ type: 'text', delta: 'repair continues' }],
+    ]);
+
+    const result = await streamLLMWithTools(
+      [{ role: 'user', content: 'run and inspect' }],
+      {
+        onText() {},
+        dispatchTool: async (name) => {
+          dispatched.push(name);
+          return name === 'Bash' ? { output: 'failed', exitCode: 1, outcome: 'exit' } : `${name} ran`;
+        },
+      },
+      { provider, tools: TOOLS, maxTurns: 30 },
+    );
+
+    expect(result).toContain('repair continues');
+    expect(dispatched).toEqual(['Bash', 'MsgList', 'ChecklistList']);
+    const results = toolResults(capturedMessagesAt(2)).slice(-3);
+    expect(results.map((block) => block.tool_use_id)).toEqual(['mail', 'checklist', 'blocked']);
+    expect(results[0]!.content).toBe('MsgList ran');
+    expect(results[1]!.content).toBe('ChecklistList ran');
+    expect(results[2]!.content).toContain('Glob did NOT run');
+    expect(results[2]!.content).toContain('REPAIR ACTION REQUIRED');
   });
 
   test('dispatches permitted repair calls from a mixed batch and preserves call-id result order', async () => {

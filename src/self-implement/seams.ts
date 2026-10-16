@@ -2493,6 +2493,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
 
     openPr: async ({ title, body, head, base, draft, labels, cwd }) => {
       const resolvedBase = assertBaseBranchOnOrigin(cwd, base);
+      const harnessSeat = process.env.ELANOUS_HARNESS_SEAT;
       const outcome = (o.prManager ?? makePrManager()).upsertPr({
         branch: head,
         worktreePath: cwd,
@@ -2501,6 +2502,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         commitMessage: title,
         ...(resolvedBase ? { base: resolvedBase } : {}),
         ...(draft !== undefined ? { draft } : {}),
+        ...(harnessSeat === 'OP' || harnessSeat === 'TC' || harnessSeat === 'MK' || harnessSeat === 'UX' ? { seat: harnessSeat } : {}),
         // BENCH-ISOLATED-ARMS ② — base 가 `bench/<id>/base` 면 라벨 `elanous:bench` 를 더한다.
         ...(() => {
           const all = benchIdFromBase(resolvedBase) && !labels?.includes(BENCH_LABEL) ? [...(labels ?? []), BENCH_LABEL] : labels;

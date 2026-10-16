@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readJunitFileSeconds } from './gate-method';
 import { readFileDurations } from './shard-plan';
-import { createGateRunner, graphGateResult, judgeGate, readBaselineFileCache, readIsolatedRun } from './gate-node';
+import { createGateRunner, graphGateResult, judgeGate, readBaselineFileCache, readIsolatedRun, shardFailureIds } from './gate-node';
 import { formatGateTiming, gateTiming } from './gate-timing';
 import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 
@@ -69,6 +69,10 @@ function gateFixture(cutRc: number, baseRc: number, cutRan = true) {
   };
   const runner = createGateRunner(repo, undefined, command, podCommand,
     new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+  // These cases exercise the host's isolated-output and cache classification.
+  // The fake Pod only supplies sweep artifacts, not final recheck artifacts.
+  runner.recheckPod = undefined;
+  runner.recheckPodBatch = undefined;
   runner.add = async () => {};
   runner.snapshot = async () => {};
   runner.remove = async () => {};
@@ -177,6 +181,76 @@ test('readIsolatedRun preserves incomplete summaries, zero tests, multiple files
     '3 pass\n0 fail\n# Unhandled error between tests\nRan 3 tests across 1 file.\n',
     '3 pass\n0 fail\n  # Unhandled error between tests\nRan 3 tests across 1 file.\n']) {
     expect(() => readIsolatedRun({ rc: 1, output }, 'isolated', FILE)).toThrow('incomplete');
+  }
+});
+
+test('two between-tests errors after one file header remain attributed to that file', () => {
+  const output = `${FILE}:\n# Unhandled error between tests\n# Unhandled error between tests\n3 pass\n0 fail\n2 errors\nRan 3 tests across 1 file.\n`;
+  expect(shardFailureIds(output, undefined, 0, 2)).toEqual({ failures: [], errors: [`${FILE} > [error]`] });
+  expect(readIsolatedRun({ rc: 1, output }, 'isolated', FILE))
+    .toEqual({ kind: 'read', failures: [], errors: [`${FILE} > [error]`] });
+});
+
+test('a shard-only between-tests error clears after file isolation; a reproduced error stays unmeasured', async () => {
+  for (const reproduced of [false, true]) {
+    const { root, runner, opts } = gateFixture(0, 0);
+    runner.sweep = async () => ({ rc: 1, output: `${FILE}:\n# Unhandled error between tests\n3 pass\n0 fail\n1 errors\nRan 3 tests across 1 file.\n`, validatedShards: true });
+    const original = runner.command;
+    let rechecks = 0;
+    runner.command = async (cmd, args, cwd, limitMs) => {
+      if (cmd === 'bun' && args[0] === 'run' && cwd.endsWith('/cut')) {
+        rechecks++;
+        return reproduced
+          ? { rc: 1, output: `${FILE}:\n# Unhandled error between tests\n3 pass\n0 fail\n1 errors\nRan 3 tests across 1 file.\n` }
+          : { rc: 0, output: `${FILE}:\n3 pass\n0 fail\n0 errors\nRan 3 tests across 1 file.\n` };
+      }
+      return original(cmd, args, cwd, limitMs);
+    };
+    const result = await judgeGate(opts, runner);
+    expect(rechecks).toBe(1);
+    expect(result.introduced).toEqual([]);
+    expect(result.outcome).toBe(reproduced ? 'error' : 'ok');
+    expect(result.unmeasuredErrors?.[0]?.reason).toBe(reproduced ? 'reproduced' : undefined);
+    expect(result.interferenceErrors).toEqual(reproduced ? undefined : [`${FILE} > [error]`]);
+    const verdict = JSON.parse(readFileSync(join(root, 'release', opts.version, 'gate-verdict.json'), 'utf8'));
+    expect(verdict.unmeasuredErrors?.[0]?.reason).toBe(reproduced ? 'reproduced' : undefined);
+    expect(verdict.interferenceErrors).toEqual(reproduced ? undefined : [`${FILE} > [error]`]);
+  }
+});
+
+test('a timed-out, unreadable, or failed-to-launch unhandled isolation stays unmeasured', async () => {
+  for (const mode of ['timeout', 'unreadable', 'launch'] as const) {
+    const { root, runner, opts } = gateFixture(0, 0);
+    runner.sweep = async () => ({ rc: 1, output: `${FILE}:\n# Unhandled error between tests\n3 pass\n0 fail\n1 errors\nRan 3 tests across 1 file.\n`, validatedShards: true });
+    const original = runner.command;
+    runner.command = async (cmd, args, cwd, limitMs) => {
+      if (cmd === 'bun' && args[0] === 'run' && cwd.endsWith('/cut')) {
+        if (mode === 'launch') throw new Error('pod job unavailable');
+        return mode === 'timeout' ? { rc: 124, output: '', timedOut: true } : { rc: 1, output: 'incomplete' };
+      }
+      return original(cmd, args, cwd, limitMs);
+    };
+    const result = await judgeGate(opts, runner);
+    expect(result).toMatchObject({ outcome: 'error', introduced: [], unmeasuredRecheckFiles: [FILE],
+      unmeasuredErrors: [{ file: FILE, reason: mode === 'timeout' ? 'timeout' : 'unreadable' }] });
+    expect(readBaselineFileCache(root, opts.commit).size).toBe(0);
+  }
+});
+
+test('only an aggregate of individually validated shard failures tolerates a repeated printed id', async () => {
+  for (const validatedShards of [false, true]) {
+    const { runner, opts } = gateFixture(1, 0);
+    const original = runner.command;
+    runner.command = async (cmd, args, cwd, limitMs) => cmd === 'bun' && args[0] === 'run' && cwd.endsWith('/cut')
+      ? { rc: 1, output: `${FILE}:\n(fail) A [1.00ms]\n2 pass\n1 fail\nRan 3 tests across 1 file.\n` }
+      : original(cmd, args, cwd, limitMs);
+    runner.sweep = async () => ({ rc: 1,
+      output: `${FILE}:\n(fail) A [1.00ms]\n(fail) A [1.00ms]\n2 pass\n1 fail\n0 errors\nRan 3 tests across 1 file.\n`,
+      validatedShards });
+    const result = await judgeGate(opts, runner);
+    expect(result.outcome).toBe(validatedShards ? 'regression' : 'error');
+    if (validatedShards) expect(result.introduced).toEqual([`${FILE} > A`]);
+    else expect(result.error).toContain('failure attribution incomplete');
   }
 });
 

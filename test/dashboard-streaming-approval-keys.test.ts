@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
 
 import type { ApprovalModalHandle, ApprovalModalRouter } from '../src/approval-modal.js';
 import { routeStreamingApprovalModalKey } from '../src/dashboard/index.js';
 import type { Key } from '../src/tui.js';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
 function key(name: string): Key {
   return { name, ctrl: false, shift: false };
@@ -59,7 +59,7 @@ describe('dashboard streaming approval and question keys', () => {
   });
 
   test('keeps the active interrupt confirmation ahead of the approval router in production streaming wiring', () => {
-    const source = readFileSync(new URL('../src/dashboard/index.ts', import.meta.url), 'utf8');
+    const source = tuiSourceText();
     const start = source.indexOf('const cleanup = attachStreamingKeys(async (key) => {');
     const end = source.indexOf('await runStreamingKeyUnifiedDispatch(key);', start);
     const handler = source.slice(start, end);
@@ -73,7 +73,7 @@ describe('dashboard streaming approval and question keys', () => {
     const active = {} as ApprovalModalHandle;
     const throwing = router(active, () => { throw new Error('modal failure'); });
     const healthy = router(active);
-    const source = readFileSync(new URL('../src/dashboard/index.ts', import.meta.url), 'utf8');
+    const source = tuiSourceText();
     const start = source.indexOf('const cleanup = attachStreamingKeys(async (key) => {');
     const end = source.indexOf('await runStreamingKeyUnifiedDispatch(key);', start);
     const handler = source.slice(start, end);

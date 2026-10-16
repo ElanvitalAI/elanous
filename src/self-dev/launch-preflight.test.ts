@@ -254,6 +254,31 @@ test('a relative authored goal read from declaredPathsRoot still checks its miss
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('an authored full traced path is not rewritten to a bare filename and is not an injected missing-traced-path', () => {
+  const root = mkdtempSync(join(tmpdir(), 'traced-full-path-proof-'));
+  try {
+    mkdirSync(join(root, 'src', 'self-implement'), { recursive: true });
+    writeFileSync(join(root, 'src', 'self-implement', 'row.ts'), 'export {};\n');
+    writeFileSync(join(root, 'README.md'), 'root\n');
+    const goalFile = join(root, 'goal.md');
+    const document = '## TRACED PATHS\n- src/self-implement/row.ts\n- README.md\n';
+    writeFileSync(goalFile, document);
+    const decision = decideAskPreflight({
+      goalFile, declaredPathsRoot: root, liveRunWindowMinutes: 30, recentChangeWindowDays: 7,
+    }, {
+      readGoalDocument: () => document,
+      tracedPaths: () => ['src/self-implement/row.ts', 'row.ts', 'src/a.ts???', '(빈 대상 경로)', 'README.md'],
+      listOpenPrs: () => [], listUnfinishedRuns: () => [], countRecentChanges: () => ({}),
+    }, false);
+    expect(decision.result.paths).toEqual(['src/self-implement/row.ts', 'README.md']);
+    expect(decision.result.paths).not.toContain('row.ts');
+    expect(decision.result.paths).not.toContain('src/a.ts???');
+    expect(decision.result.paths).not.toContain('(빈 대상 경로)');
+    expect(decision.result.blockers.filter((blocker) => blocker.kind === 'missing-traced-path')).toEqual([]);
+    expect(decision.shouldLaunch).toBe(true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('an authored goal with no preserved traced path cannot force launch', () => {
   const root = mkdtempSync(join(tmpdir(), 'traced-empty-goal-'));
   try {
@@ -271,6 +296,87 @@ test('an authored goal with no preserved traced path cannot force launch', () =>
       kind: 'missing-traced-path', name: '최종 골의 TRACED PATHS 경로 0',
     }));
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('goal-read failure and traced-path errors record separate reason code, check name, and untruncated target path', () => {
+  const root = mkdtempSync(join(tmpdir(), 'traced-structured-'));
+  try {
+    mkdirSync(join(root, 'src'));
+    writeFileSync(join(root, 'src', 'occupied.ts'), 'export {};');
+    mkdirSync(join(root, 'src', 'dir'));
+    const longMissing = `src/${'deep/'.repeat(50)}missing-file.ts`;
+    const goalFile = join(root, 'goal.md');
+    const options = { goalFile, declaredPathsRoot: root, liveRunWindowMinutes: 30, recentChangeWindowDays: 7 };
+    const deps = {
+      listOpenPrs: () => [], listUnfinishedRuns: () => [], countRecentChanges: () => ({}),
+    };
+
+    const unreadable = decideAskPreflight(options, {
+      ...deps,
+      tracedPaths: () => [],
+      readGoalDocument: () => { throw new Error('read denied'); },
+    }, true);
+    expect(unreadable.shouldLaunch).toBe(false);
+    expect(unreadable.result.blockers).toContainEqual(expect.objectContaining({
+      kind: 'goal-unreadable',
+      reasonCode: 'goal-unreadable',
+      checkName: 'goal-read',
+      targetPath: goalFile,
+    }));
+    const goalRead = unreadable.result.blockers.find((blocker) => blocker.kind === 'goal-unreadable');
+    expect(goalRead?.targetPath).toBe(goalFile);
+    expect(goalRead?.name).not.toContain(' — ');
+    expect(unreadable.result.blockers.some((blocker) => blocker.kind === 'missing-traced-path')).toBe(false);
+
+    const document = [
+      '## TRACED PATHS',
+      '- src/occupied.ts',
+      '- src/dir',
+      `- ${longMissing}`,
+      '- src/occupied.ts/locked.ts',
+      '신설: src/occupied.ts',
+    ].join('\n') + '\n';
+    writeFileSync(goalFile, document);
+    const lockedPath = join(root, 'src', 'occupied.ts', 'locked.ts');
+    expect(() => readFileSync(lockedPath)).toThrow(expect.objectContaining({ code: 'ENOTDIR' }));
+    const traced = decideAskPreflight(options, {
+      ...deps,
+      readGoalDocument: () => document,
+      tracedPaths: () => ['src/occupied.ts', 'src/dir', longMissing, 'src/occupied.ts/locked.ts'],
+    }, true);
+    expect(traced.shouldLaunch).toBe(false);
+    const tracedBlockers = traced.result.blockers.filter((blocker) => blocker.kind === 'missing-traced-path');
+    expect(tracedBlockers).toContainEqual(expect.objectContaining({
+      kind: 'missing-traced-path',
+      reasonCode: 'missing-traced-path',
+      checkName: 'occupied-new',
+      targetPath: 'src/occupied.ts',
+    }));
+    expect(tracedBlockers).toContainEqual(expect.objectContaining({
+      kind: 'missing-traced-path',
+      reasonCode: 'missing-traced-path',
+      checkName: 'not-file',
+      targetPath: 'src/dir',
+    }));
+    expect(tracedBlockers).toContainEqual(expect.objectContaining({
+      kind: 'missing-traced-path',
+      reasonCode: 'missing-traced-path',
+      checkName: 'missing',
+      targetPath: longMissing,
+    }));
+    const missing = tracedBlockers.find((blocker) => blocker.checkName === 'missing');
+    expect(missing?.targetPath).toBe(longMissing);
+    expect(missing?.targetPath?.length).toBeGreaterThan(240);
+    expect(tracedBlockers).toContainEqual(expect.objectContaining({
+      kind: 'missing-traced-path',
+      reasonCode: 'missing-traced-path',
+      checkName: 'inaccessible',
+      targetPath: 'src/occupied.ts/locked.ts',
+    }));
+    expect(traced.result.blockers.some((blocker) => blocker.kind === 'goal-unreadable')).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('an existing traced file must be openable for reading', () => {

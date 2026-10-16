@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { Command } from 'commander';
 import { registerA2ACommands } from './a2a-cli.js';
+import { simInProcessCli } from '../ux-sim/in-process-cli.js';
 
 function commands() {
   const program = new Command();
@@ -11,17 +12,17 @@ function commands() {
 }
 
 describe('a2a CLI commands', () => {
-  test('elanous entry dispatches card and serves a mandatory --tool-cwd error', () => {
+  test('registered a2a card prints its public card; real entry rejects serve without --tool-cwd', async () => {
     const entry = new URL('../../bin/elanous.mjs', import.meta.url).pathname;
-    const card = spawnSync(process.execPath, [entry, '--test', 'a2a', 'card'], { encoding: 'utf8', timeout: 20000 });
-    expect(card.status).toBe(0);
+    const card = await simInProcessCli(['a2a', 'card'], { allowPaths: [['a2a', 'card']] });
+    expect(card.exitCode).toBe(0);
     expect(card.stdout).toContain('"url": "http://127.0.0.1:31490/a2a"');
     expect(card.stdout).toContain('"kind": "remote"');
     expect(card.stdout).toContain('"agent_card_url": "http://127.0.0.1:31490/.well-known/agent-card.json"');
     const serve = spawnSync(process.execPath, [entry, '--test', 'a2a', 'serve'], { encoding: 'utf8', timeout: 20000 });
     expect(serve.status).not.toBe(0);
     expect(serve.stderr).toContain("required option '--tool-cwd <directory>' not specified");
-  }, 30_000);   // two real CLI starts (~2.5s each) exceed the 5s default
+  }, 30_000);   // in-process card plus one real process-boundary check
 
   test('serve requires --tool-cwd and defaults to loopback port 31490', async () => {
     const { program, serve } = commands();

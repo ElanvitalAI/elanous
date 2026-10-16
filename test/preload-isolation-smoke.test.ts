@@ -117,6 +117,38 @@ describe('preload-isolation contract', () => {
     }
   });
 
+  test('ENV-PREFIX-SCRUB: Pod identity, cluster service and harness marker env are gone before the first test (prefix, not a name list)', () => {
+    const fixture = `
+      import { test } from 'bun:test';
+      import { debug } from ${JSON.stringify(join(REPO_ROOT, 'src/debug/log.ts'))};
+      const scrubbed = debug.events().find((event) => event.category === 'test.preload' && event.event === 'env-scrubbed');
+      const seen = {
+        podName: process.env.ELANOUS_POD_NAME,
+        podFutureName: process.env.ELANOUS_POD_SOME_FUTURE_NAME,
+        k8sHost: process.env.KUBERNETES_SERVICE_HOST,
+        entrance: process.env.ELANOUS_HARNESS_ENTRANCE,
+        seat: process.env.ELANOUS_HARNESS_SEAT,
+        nearMiss: process.env.ELANOUS_PODIUM,
+        scrubbedKeys: (scrubbed?.data as { keys?: string[] } | undefined)?.keys ?? null,
+      };
+      process.env.ELANOUS_POD_POOL = 'fake:1';
+      console.log('PRELOAD_ENV=' + JSON.stringify({ ...seen, testSet: process.env.ELANOUS_POD_POOL }));
+      test('fixture', () => {});
+    `;
+    const result = runPreloadFixture({
+      ELANOUS_POD_NAME: 'gate-pod-x', ELANOUS_POD_SOME_FUTURE_NAME: 'new-name', KUBERNETES_SERVICE_HOST: '10.43.0.1',
+      ELANOUS_HARNESS_ENTRANCE: 'harness-say', ELANOUS_HARNESS_SEAT: 'TF', ELANOUS_PODIUM: 'kept',
+    }, fixture);
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(readFixtureEnvironment(result.stdout)).toEqual({
+      podName: undefined, podFutureName: undefined, k8sHost: undefined, entrance: undefined, seat: undefined,
+      nearMiss: 'kept',
+      scrubbedKeys: expect.arrayContaining(['ELANOUS_POD_NAME', 'ELANOUS_POD_SOME_FUTURE_NAME', 'KUBERNETES_SERVICE_HOST',
+        'ELANOUS_HARNESS_ENTRANCE', 'ELANOUS_HARNESS_SEAT']),
+      testSet: 'fake:1',
+    });
+  });
+
   test('child without ELANOUS_RUN_ID preserves an explicitly supplied state directory', () => {
     const explicitStateDir = mkdtempSync(join(tmpdir(), 'elanous-explicit-state-'));
     const fixture = `

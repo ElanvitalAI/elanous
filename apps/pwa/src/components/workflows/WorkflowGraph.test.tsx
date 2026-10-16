@@ -54,8 +54,10 @@ test('editable graph history: an edit records the exact previous YAML and ⌘Z r
   expect(key('z')).toBe(true);
   expect(yaml).toBe(initial);
   // Redo needs the post-undo commit, which this test avoids on purpose — checked live (⇧⌘Z).
-  renderer.unmount();
-  listeners.clear(); // unmount outside act does not flush the effect cleanup
+  // act 로 unmount 해 passive effect 정리(단축키 해제)를 «지금» 흘린다 — 맨몸 unmount 는 그 정리를
+  // 스케줄러로 미뤄 afterAll 이 window 를 걷은 뒤 «window is not defined» 로 터진다(0.2.30 게이트 pod-49).
+  await act(async () => renderer.unmount());
+  expect(listeners.size).toBe(0);
 });
 
 test('read-only graph never registers editing shortcuts or changes YAML', async () => {

@@ -247,24 +247,29 @@ describe('measureAutoLandRatio — 원장 집계와 손 착지 수의 순수 결
     ],
   });
 
-  it('자율 2 · 손 1은 2/3이고 제공자 둘의 멈춤 사유를 합쳐 많은 순으로 낸다', () => {
+  it('measureAutoLandRatio: 자율 2 · 손 1 → 2/3', () => {
     const measured = measureAutoLandRatio(report(), 1);
     expect(measured).toMatchObject({ selfLanded: 2, handMerges: 1, totalMerges: 3, autoLandRatio: 2 / 3 });
-    expect(Object.entries(measured.blockReasons)).toEqual([['timeout', 3], ['stalled', 2]]);
     expect(formatAutoLandRatio(measured)).toBe('자율 착지 2 / 전체 3 (66.7%) · 손 착지 1 · 멈춤 사유 timeout=3,stalled=2');
   });
 
-  it('손 착지 수가 없으면 비율과 전체를 못 잰 값으로 낸다', () => {
+  it('handMerges null → 비율 null 이고 형식 줄에 -', () => {
     const measured = measureAutoLandRatio(report(), null);
     expect(measured.autoLandRatio).toBeNull();
     expect(measured.totalMerges).toBeNull();
     expect(formatAutoLandRatio(measured)).toContain('전체 - (-) · 손 착지 -');
   });
 
-  it('읽지 못한 런 원장이 있으면 손 수가 있어도 비율을 못 잰다', () => {
+  it('unreadableLedgers>0 → 비율 null', () => {
     const measured = measureAutoLandRatio(report(1), 1);
     expect(measured.autoLandRatio).toBeNull();
     expect(measured.totalMerges).toBeNull();
+  });
+
+  it('provider 둘의 blockReasons 가 사유별로 합쳐진다', () => {
+    const measured = measureAutoLandRatio(report(), 1);
+    expect(Object.entries(measured.blockReasons)).toEqual([['timeout', 3], ['stalled', 2]]);
+    expect(formatAutoLandRatio(measured)).toContain('timeout=3,stalled=2');
   });
 
   it('분모가 0이면 0%라고 지어내지 않는다', () => {

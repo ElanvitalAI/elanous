@@ -41,6 +41,7 @@ const EXPECTED: Record<RunStopClass, AutohealAction> = {
   'review-out-of-scope': 'needs-owner',
   fabric: 'needs-owner',
   'launch-failed': 'needs-owner',
+  'gate-failed': 'needs-owner',
   unclassified: 'needs-owner',
 };
 

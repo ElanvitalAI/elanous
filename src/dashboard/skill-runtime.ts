@@ -1,4 +1,5 @@
 import { C } from '../tui.js';
+import { logTurnThrew } from './turn-busy-teardown.js';
 import { startThinking } from '../thinking-line.js';
 import type { ContextRegistry } from '../context.js';
 import { loadAllAttachments } from '../extractors.js';
@@ -261,6 +262,7 @@ export async function runDashboardSkillByName(
   } catch (err: any) {
     skillStatus = 'failed';
     skillError = err?.message || String(err);
+    logTurnThrew('skill-run', err);
     deps.pushDebugLine(C.error(`Error: ${err?.message || err}`));
   } finally {
     cleanupEsc?.();

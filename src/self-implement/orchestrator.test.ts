@@ -16422,6 +16422,15 @@ describe('declaredScopeUnmadeLine — ***「하나도 안 만들었나」만 말
 });
 
 describe('detectDeclaredScopeDiff — 선언한 대상 밖 변경', () => {
+  test('only the run-bound GOAL is a scope artifact while unrelated GOALs and reports remain outside', () => {
+    const scope = detectDeclaredScopeDiff({
+      goalDocument: goalDocumentWithDeclaredTargets('src/feature.ts'),
+      goalDocumentPath: '/repo/docs/goals/GOAL-generated.md',
+      changedFiles: ['src/feature.ts', 'docs/goals/GOAL-generated.md', 'docs/goals/GOAL-other.md', 'docs/reports/unrelated.md'],
+    });
+    expect(scope).toMatchObject({ status: 'known', outsideCount: 2,
+      outsideNames: ['docs/goals/GOAL-other.md', 'docs/reports/unrelated.md'] });
+  });
   // SCOPE-LOCKFILE-PAIR — 10-11 TSGO-TRIAL: a declared package.json change rewrote bun.lock, which was held as out-of-scope.
   test('a declared package.json covers the bun.lock beside it, not other lockfiles', () => {
     const scope = detectDeclaredScopeDiff({

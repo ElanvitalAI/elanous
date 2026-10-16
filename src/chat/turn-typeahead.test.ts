@@ -1,5 +1,4 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import {
   applyTurnTypeaheadKey,
   attachTurnTypeaheadPendingId,
@@ -12,6 +11,7 @@ import {
   drainedIntoTurn,
   restoreTurnTypeaheadSubmission,
 } from './turn-typeahead.js';
+import { tuiSourceText } from '../../test/helpers/dashboard-source.js';
 
 const key = (name: string) => ({ name });
 
@@ -129,19 +129,19 @@ describe('renderTurnTypeaheadQueueRow — 큐 «행»', () => {
   test('⭐ 대기 «내용»을 보여 준다 — 「1건」만으로는 무엇이 대기 중인지 모른다', () => {
     const row = renderTurnTypeaheadQueueRow(withQueue('카이사르 이후'), 80)!;
     expect(row).toContain('카이사르 이후');
-    expect(row).toContain('대기 1건');
+    expect(row).toContain('대기(응답 뒤) 1건');
   });
 
   test('여럿이면 «가장 먼저 나갈 것»(FIFO 머리)을 보여 준다', () => {
     const row = renderTurnTypeaheadQueueRow(withQueue('첫째', '둘째'), 80)!;
-    expect(row).toContain('대기 2건');
+    expect(row).toContain('대기(응답 뒤) 2건');
     expect(row).toContain('첫째');
     expect(row).not.toContain('둘째');
   });
 
   test('폭을 넘으면 «내용»을 줄이고 라벨은 지킨다', () => {
     const row = renderTurnTypeaheadQueueRow(withQueue('가'.repeat(300)), 40)!;
-    expect(row).toContain('대기 1건');
+    expect(row).toContain('대기(응답 뒤) 1건');
     expect(row).toContain('…');
     expect(row.length).toBeLessThan(300);
   });
@@ -159,25 +159,25 @@ describe('drainedIntoTurn — 라이브 턴 배수 문장', () => {
   test('배수된 발화가 있으면 큐에서 FIFO로 떨어지고 무엇이 들어갔는지 문장을 낸다', () => {
     const state = { buffer: 'draft', queuedSubmissions: ['MIDLOOPTEST456', '둘째'] };
     const result = drainedIntoTurn(state, ['MIDLOOPTEST456']);
-    expect(result.state).toEqual({ buffer: 'draft', queuedSubmissions: ['둘째'] });
+    expect(result.state).toEqual({ buffer: 'draft', queuedSubmissions: ['둘째'], injectedCount: 1 });
     expect(result.sentence).toBe('⏳ 턴 안 1건 · "MIDLOOPTEST456" · 라이브 턴으로 전송');
     expect(renderTurnTypeaheadQueueRow(
       { buffer: '', queuedSubmissions: ['MIDLOOPTEST456'] },
       80,
-    )).toBe('⏳ 대기 1건 · "MIDLOOPTEST456" · 턴 종료 시 전송 · Ctrl+↑ 되꺼내기');
+    )).toBe('⏳ 대기(응답 뒤) 1건 · "MIDLOOPTEST456" · Ctrl+↑ 되꺼내기 · 빈 Enter 지금 밀어 넣기');
   });
 
   test('여러 건이면 앞에서부터 떨어지고 들어간 내용을 모두 보여 준다', () => {
     const state = { buffer: '', queuedSubmissions: ['첫째', '둘째', '셋째'] };
     const result = drainedIntoTurn(state, ['첫째', '둘째']);
-    expect(result.state).toEqual({ buffer: '', queuedSubmissions: ['셋째'] });
+    expect(result.state).toEqual({ buffer: '', queuedSubmissions: ['셋째'], injectedCount: 2 });
     expect(result.sentence).toBe('⏳ 턴 안 2건 · "첫째" · "둘째" · 라이브 턴으로 전송');
   });
 });
 
 describe('queued speech is delivered only once', () => {
   test('dashboard live drain pairs registry ids and releases handed-off items', () => {
-    const dashboard = readFileSync(new URL('../dashboard/index.ts', import.meta.url), 'utf8');
+    const dashboard = tuiSourceText();
     expect(dashboard).toContain('steerLastTurnTypeaheadSubmission(turnTypeaheadRef, sid,');
     expect(dashboard).toContain("if (r.releasedPendingIds) releaseTurnTypeaheadPending(r.releasedPendingIds, 'recalled');");
     // 턴 종료 핸드오프(드레인 → 해제 → Enter)는 다리 모듈 한 함수다 — 순서·Enter 는 turn-steer-bridge.test.ts 가 행동으로 문다.
@@ -187,6 +187,11 @@ describe('queued speech is delivered only once', () => {
     expect(turnEnd.slice(0, 200)).toContain("injectKey({ name: 'enter', ctrl: false, shift: false });");
     expect(dashboard).not.toContain('drainTurnTypeaheadOnce(turnTypeaheadRef.state');
     expect(dashboard).not.toContain('queuedSubmissions.slice(drained.length)');
+    // «지금 밀어 넣기»로 끊은 턴은 복원이 아니라 제출로 간다.
+    expect(dashboard).toContain('const interrupted = consumeTurnEndInterrupted(lastTurnFinalStatus, steerInterruptRef);');
+    expect(dashboard).toContain('steerInterruptRef.pending = true;');
+    expect(dashboard).toContain('runTurnTypeaheadPushNow(turnTypeaheadRef, {');
+    expect(dashboard).toContain('abortTurnOnly(abortCtrl);');
   });
 
   test('live-drained items cannot be handed off again at turn end; remaining items retain FIFO order', () => {

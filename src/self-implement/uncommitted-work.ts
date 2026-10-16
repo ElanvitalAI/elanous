@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { isElanousRuntimeArtifactPath } from './gate-scope.js';
 
 export type UncommittedWork =
@@ -19,6 +20,7 @@ export function detectUncommittedWork(worktree: string): UncommittedWork {
       env: gitEnv,
       encoding: 'utf8',
       timeout: 10_000,
+      maxBuffer: SPAWN_SYNC_MAX_BUFFER,
     });
   } catch (error) {
     return { status: 'unavailable', reason: error instanceof Error ? error.message : String(error) };

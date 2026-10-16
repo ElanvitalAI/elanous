@@ -20,7 +20,8 @@ function snapshot(version: string): Checklist {
   return { version, released: '0.2.12', dev: '0.2.15-dev.1', items: [{ id, title: id, owner: 'UX', status: 'yellow', updatedAt: '2026-10-03T00:00:00Z', updatedBy: 'UX' }], history: [] };
 }
 
-function harness(versions: string[], released = '0.2.12') {
+type GhResult = { status: number; stdout: string; stderr: string };
+function harness(versions: string[], released = '0.2.12', runImpl?: (command: string, args: readonly string[]) => GhResult) {
   const logs: string[] = [], errors: string[] = [], stdout: string[] = [];
   const gh: string[] = [], checks: string[] = [];
   const added: Array<{ id: string; version: string; ref: string }> = [];
@@ -42,7 +43,7 @@ function harness(versions: string[], released = '0.2.12') {
     released: () => released,
     checklist,
     now: () => new Date('2026-10-04T09:00:00Z'),
-    run: ((command, args) => { gh.push(`${command} ${args.join(' ')}`); return { status: 0, stdout: JSON.stringify(prs), stderr: '' }; }) as Runner,
+    run: ((command, args) => { gh.push(`${command} ${args.join(' ')}`); return runImpl ? runImpl(command, args) : { status: 0, stdout: JSON.stringify(prs), stderr: '' }; }) as Runner,
     evidenceAdd: ((id, version, ref) => { added.push({ id, version, ref }); }) as NonNullable<LandedButYellowDeps['evidenceAdd']>,
   };
   // 본부 임대 없음(no-lease) = 쓰기 허용 — 시험이 실제 판정자(ssh)에 닿지 않게 빈 파일 원장을 준다(FENCE-CLI #23632).
@@ -181,6 +182,31 @@ describe('landed-but-yellow --open', () => {
       await h.run('--version', '0.2.13', '--dry-run', '--json');
       expect(JSON.parse(h.stdout.at(-1)!)).toEqual([{ id: 'CL-AUTO', ref: '#123' }]);
       expect(h.added).toEqual([]);
+    } finally { h.restore(); }
+  });
+
+  test('같은 판·같은 owner 에서 --version 과 --open 이 같은 병합 PR 창과 같은 결과 집합을 낸다(칸 updatedAt 보다 오래 병합된 PR 포함)', async () => {
+    const older = { number: 126, title: 'older landing', body: '칸: CL-AUTO', mergedAt: '2026-09-28T00:00:00Z' };
+    const runImpl = (_command: string, args: readonly string[]) => {
+      const since = args[args.indexOf('--search') + 1]!.slice('merged:>='.length);
+      return { status: 0, stdout: JSON.stringify([...prs, older].filter((pr) => pr.mergedAt >= since)), stderr: '' };
+    };
+    const h = harness(['0.2.13', '0.2.15'], '0.2.12', runImpl);
+    try {
+      h.snapshots.set('0.2.15', { ...snapshot('0.2.15'), items: [{ ...snapshot('0.2.15').items[0]!, updatedAt: '2026-09-26T00:00:00Z' }] });
+      const searchCommand = 'gh pr list --state merged --search merged:>=2026-09-26 --limit 400 --json number,title,body,mergedAt';
+      await h.run('--open', '--json', '--owner', 'UX');
+      const openGh = h.gh[0]!;
+      const openResults = JSON.parse(h.stdout.at(-1)!) as Array<{ version: string; rows: Array<{ id: string; prs: Array<{ number: number }> }> }>;
+      const openRows = openResults.find((entry) => entry.version === '0.2.13')!.rows;
+      expect(openGh).toBe(searchCommand);
+      expect(openRows[0]!.prs.map((pr) => pr.number)).toContain(126);
+      h.gh.length = 0; h.stdout.length = 0;
+      await h.run('--version', '0.2.13', '--json', '--owner', 'UX');
+      expect(h.gh).toEqual([openGh]);
+      const versionRows = JSON.parse(h.stdout.at(-1)!) as Array<{ id: string; prs: Array<{ number: number }> }>;
+      expect(versionRows).toEqual(openRows);
+      expect(versionRows[0]!.prs.map((pr) => pr.number)).toContain(126);
     } finally { h.restore(); }
   });
 });

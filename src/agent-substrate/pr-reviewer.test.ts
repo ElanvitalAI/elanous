@@ -6,7 +6,7 @@ import {
   worseReviewVerdict, reviewPullRequest, parseReviewResult, buildReviewPrompt, renderReview,
   splitDiffByFile, budgetFileDiff, budgetedDiff, diffSection, diffShownPercent, reviewDiffCharLimit, budgetReviewerContext, capReviewImages,
   planReviewChunks, foldReviewResults, reviewMaxPasses,
-  isScopeRevertMustFix, NO_VERDICT_LINE_REASON, type ReviewInput, type ReviewerContextItem,
+  isScopeRevertMustFix, isNoneSentinelFinding, NO_VERDICT_LINE_REASON, type ReviewInput, type ReviewerContextItem,
 } from './pr-reviewer.js';
 
 describe('reviewPullRequest — REVIEW-PROMPT-SIZE 관측(review.prompt-size 범주)', () => {
@@ -132,6 +132,23 @@ describe('isScopeRevertMustFix — 범위 사유 되돌림/분리 관측 분류'
 });
 
 describe('parseReviewResult — VERDICT + MUST-FIX/SHOULD-FIX 파싱', () => {
+  it('GLM 괄호 무소견·빈 항목은 0건, 실제 지적은 보존한다', () => {
+    for (const placeholder of [
+      '', '  ', '(없음 …)', '(해당 없음...)', '(none.)', '(n/a)', '(no blocker)',
+      '(첫 조각 가시 범위 내 블로커 없음...)', '(visible chunk: no blockers…)', '(차단 없음。)',
+    ]) {
+      expect(isNoneSentinelFinding(placeholder)).toBe(true);
+      expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${placeholder}`).mustFix).toEqual([]);
+    }
+    for (const finding of [
+      '(회귀 시험 없음)', '(none: no blockers are checked because access control is disabled)',
+      '(첫 조각 블로커 없음, 뒤 조각은 미검토)', '(no blockers: release gate is skipped)',
+      '회귀 시험 없음',
+    ]) {
+      expect(isNoneSentinelFinding(finding)).toBe(false);
+      expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${finding}`).mustFix).toEqual([finding]);
+    }
+  });
   it('FAIL + 블로커 분해', () => {
     const r = parseReviewResult('VERDICT: FAIL\nMUST-FIX:\n- 미배선\nSHOULD-FIX:\n- 네이밍');
     expect(r.verdict).toBe('fail');

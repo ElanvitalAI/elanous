@@ -10,11 +10,14 @@ import { getSeats, type OpsSeats } from '@/lib/ops-api';
 import type { DaemonClient } from '@/lib/daemon-client';
 import { DraftMetricsCard, readDraftMetrics, type DraftMetricsCardValue } from '@/components/ops/draft-metrics-card';
 import type { GridData } from '../../../../../src/nexus/api/grid';
+import { parseOverviewStrip, type FlowStrip } from './overview-strip';
 
 type Risk = { id: string; kind: string; title: string; at: string };
 type SchedulesResult = { summary: Record<string, number>; risks: Risk[] };
 type DecisionsResult = { count: number; risks: Risk[] };
+
 type Snapshot = {
+  flow: FlowStrip | null | undefined;
   release: { green: number; yellow: number } | null | undefined;
   loops: Record<string, number> | null | undefined;
   decisions: number | null | undefined;
@@ -24,9 +27,17 @@ type Snapshot = {
   drafts: DraftMetricsCardValue;
 };
 
-const empty: Snapshot = { release: undefined, loops: undefined, decisions: undefined, merged: undefined, risks: undefined, grid: undefined, drafts: { kind: 'loading' } };
+const empty: Snapshot = { flow: undefined, release: undefined, loops: undefined, decisions: undefined, merged: undefined, risks: undefined, grid: undefined, drafts: { kind: 'loading' } };
 const validTime = (value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value));
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+
+async function readOverview(client: DaemonClient): Promise<FlowStrip | null> {
+  try {
+    const response = await client.fetchResponse('/v1/ops/overview');
+    if (!response.ok) return null;
+    return parseOverviewStrip(await response.json());
+  } catch { return null; }
+}
 
 function isSchedule(value: unknown): value is LoopSchedule {
   if (value === null || typeof value !== 'object') return false;
@@ -181,6 +192,7 @@ function readDrafts(client: DaemonClient, update: (patch: Partial<Snapshot>) => 
 function readSnapshot(client: DaemonClient, update: (patch: Partial<Snapshot>) => void, alive: () => boolean = () => true): void {
   const now = Date.now();
   const today = todayStart(new Date(now));
+  const flow = readWithDeadline(readOverview(client), null);
   const seats = readWithDeadline(getSeats(client), { kind: 'error' as const, status: 0 });
   const loops = readWithDeadline(readSchedules(client), null);
   const loopFailures = readWithDeadline(readLoopFailures(client), null);
@@ -190,6 +202,7 @@ function readSnapshot(client: DaemonClient, update: (patch: Partial<Snapshot>) =
   const grid = readWithDeadline(readGrid(client), null);
   readDrafts(client, update, alive);
 
+  void flow.then((value) => update({ flow: value }));
   void seats.then((value) => update({ release: value.kind === 'ready' ? releaseFromSeats(value.data) : null }));
   void loops.then((value) => update({ loops: value?.summary ?? null }));
   void decisions.then((value) => update({ decisions: value?.count ?? null }));
@@ -222,8 +235,18 @@ export default function CeoPage() {
     return () => { active = false; };
   }, [client]);
 
+  const flowText = snapshot.flow === undefined ? '불러오는 중…' : snapshot.flow === null ? '못 잼'
+    : `${snapshot.flow.label} · ${snapshot.flow.reason ?? '사유 없음'}${snapshot.flow.stale ? ' · 낡음' : ''}`;
+  const flowHref = snapshot.flow?.verdict === 'loop-down' || snapshot.flow?.verdict === 'blocked'
+    ? '/loops?view=map' : '/ops/resources';
+
   return <main className="mx-auto w-full min-w-0 max-w-3xl px-3 py-4 text-foreground sm:px-6">
     <header className="mb-4"><p className="text-xs text-muted-foreground">운영 · 오늘</p><h1 className="text-xl font-semibold">대표 조망판</h1></header>
+    <p aria-label="흐름 판정" className="mb-3 min-w-0 truncate rounded-xl border border-border bg-card px-3 py-2 text-sm">
+      {snapshot.flow === undefined || snapshot.flow === null
+        ? flowText
+        : <Link href={flowHref} className="rounded underline-offset-4 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary">{flowText}</Link>}
+    </p>
     <div className="grid grid-cols-2 gap-2 sm:gap-4" aria-label="대표 조망 카드">
       <Card title="릴리스 판 진행">{snapshot.release === undefined ? '불러오는 중…' : snapshot.release
         ? <><span className="text-emerald-600">green {snapshot.release.green}</span><span className="block text-amber-600">노랑 {snapshot.release.yellow}</span></>

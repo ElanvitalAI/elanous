@@ -69,7 +69,8 @@ export interface GoalUsage {
   tokensUsed: number;
   /** Whether every recorded auto-turn supplied a token measurement. */
   tokensMeasured: boolean;
-  /** Wall-clock since createdAt, refreshed on read. */
+  /** Wall-clock since this activation began (`activeSince`, falling back to
+   *  `createdAt` for old snapshots), refreshed on read. */
   elapsedMs: number;
 }
 
@@ -97,6 +98,11 @@ export interface Goal {
   status: GoalStatus;
   /** Epoch ms. */
   createdAt: number;
+  /** TUI-GOAL-LOOP-FRICTION(#35) — epoch ms when the goal last entered `active`
+   *  (start · resume · process restart hydrate). The wall-clock budget is measured
+   *  from here, not from `createdAt`: a goal created days ago and resumed now must
+   *  not report 4.9e8 ms elapsed. Optional so older snapshots still parse. */
+  activeSince?: number;
   /** Last time status transitioned. */
   updatedAt: number;
   budget: GoalBudget;

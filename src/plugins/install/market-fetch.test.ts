@@ -333,6 +333,42 @@ describe('signed market fetch', () => {
     }
   });
 
+  // node-b-opens-internal-market → mbp-discovers-signed-pack-metadata — a refutation scenario.
+  // mbp discovers pack metadata only by fetching via ensureInternalMarketIndex with the market-bound key
+  // and its allowed tenant; every alternative receive path is refuted below. The original ask's (b)
+  // clause is truncated mid-sentence ("바깥 공…") and is deliberately not guessed: the refutation
+  // boundary covers only the lines grounded in this repository — tenant allowlist, market-bound key,
+  // and invisibility of the internal market to the public fetch path.
+  test('node-b internal market exposes signed pack metadata only to the bound key and allowed tenant', async () => {
+    const opts = setup();
+    const bound = generateIndexKeyPair();
+    const global = generateIndexKeyPair();
+    const indexObject = (enterpriseId: string) => ({ name: 'private', interface: { displayName: 'Private' }, sequence: 1, plugins: [],
+      knowledgePacks: [{ name: 'sales', version: '1.0.0', visibility: 'internal', enterpriseId, artifact: { sha256: 'a'.repeat(64), bytes: 1, key: 'sales.tgz' } }] });
+    const index = (enterpriseId: string) => Buffer.from(JSON.stringify(indexObject(enterpriseId)));
+    // node-b opens the internal market: the signing key is bound to the market and only tenant-a (mbp)
+    // is on the allowlist. The global plugin trust pool holds a different key that must never verify it.
+    writeFileSync(opts.configPath, JSON.stringify({ market: { trustedKeys: [{ keyId: global.keyId, publicKey: global.publicKey }], internalMarkets: [
+      { name: 'private', url: 'https://private.example.org/', enterpriseIds: ['tenant-a'], trustedKeys: [{ keyId: bound.keyId, publicKey: bound.publicKey }] },
+    ] } }));
+    const serve = (bytes: Buffer, keys: ReturnType<typeof generateIndexKeyPair>) => server(bytes, signIndex(bytes, keys.privateKeyPem, keys.keyId));
+    // 판정선 refutations — each alternative way of receiving the pack is rejected before the one
+    // allowed path publishes anything, following the refutation pattern of the tests above.
+    await expect(ensureInternalMarketIndex('private', 'tenant-b', { ...opts, fetcher: serve(index('tenant-a'), bound).fetcher })).rejects.toThrow('enterprise not allowed');
+    await expect(ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher: serve(index('tenant-b'), bound).fetcher })).rejects.toThrow('outside enterprise allowlist');
+    await expect(ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher: serve(index('tenant-a'), global).fetcher,
+      trustedKeys: [{ keyId: global.keyId, publicKey: global.publicKey }] })).rejects.toMatchObject({ reason: 'signature', message: expect.stringContaining('unknown-key') });
+    await expect(ensureMarketIndex('private', { ...opts, fetcher: serve(index('tenant-a'), bound).fetcher })).rejects.toThrow('market not configured');
+    expect(existsSync(join(opts.root, 'markets', '.internal', 'private'))).toBe(false);
+    // The companion plugin-knowledge-requires test calls installPlugin, which fetches the archive.
+    const received = await ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher: serve(index('tenant-a'), bound).fetcher });
+    expect(received).toMatchObject({ market: { name: 'private' }, signature: 'ok', keyId: bound.keyId });
+    expect(received.index).toMatchObject(indexObject('tenant-a'));
+    expect(readFileSync(join(received.directory, 'marketplace.json'))).toEqual(index('tenant-a'));
+    const cached = await ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher: (async () => { throw new Error('cache missed'); }) as unknown as typeof fetch });
+    expect(cached.index).toMatchObject(indexObject('tenant-a'));
+  });
+
   // 🅢 R3 must-fix ① — the config may hold secrets: addMarket keeps its permission bits.
   test('addMarket keeps the config file permission (0600 stays 0600)', () => {
     const opts = setup();

@@ -26,6 +26,7 @@ describe('raw terminal control keys', () => {
 
 const REPO_ROOT = join(import.meta.dir, '..');
 const TUI_PATH = join(REPO_ROOT, 'src/tui.ts');
+const CHAT_PATH = join(REPO_ROOT, 'src/chat/index.ts');
 
 function runChild(source: string, opts?: {
   signal?: NodeJS.Signals;
@@ -282,6 +283,88 @@ describe('tui exit handlers are start-gated', () => {
       key: { name: 'x', ctrl: false, shift: false },
     });
   }, 10_000);
+
+  // ⭐ TUI-ESC-ABORT-TOOLS (2026-10-15) — 바깥 키(`pty key` · 제어 IPC input-key)는 `injectKey`
+  //    큐로 들어온다. 턴 중 키를 받는 스트리밍 리스너가 그 큐를 비우지 않으면 Esc 가 escGate 에
+  //    닿지 않고 턴 끝까지 잠든다(TUI 결함 #60 · #40). 반증: takeInjectedKeys 배수를 빼면 두 시험이 깨진다.
+  test('PTY streaming listener receives an injected Escape within 1s', async () => {
+    const { code, stdout } = await runPtyChild(`
+      const { initTui, injectKey } = await import(${JSON.stringify(TUI_PATH)});
+      const { attachStreamingKeys } = await import(${JSON.stringify(CHAT_PATH)});
+      initTui(false);
+      const got = [];
+      const cleanup = attachStreamingKeys((key) => { got.push(key.name); });
+      await new Promise((r) => setTimeout(r, 50));
+      const t0 = Date.now();
+      injectKey({ name: 'escape', ctrl: false, shift: false });
+      while (!got.includes('escape') && Date.now() - t0 < 1000) await new Promise((r) => setTimeout(r, 10));
+      cleanup();
+      process.stdout.write('STREAM-KEYS:' + JSON.stringify({ got, withinMs: Date.now() - t0 }) + '\\n');
+      process.exit(0);
+    `, { signal: 'SIGTERM', timeoutMs: 45_000 });
+    const marked = stdout.match(/STREAM-KEYS:(\{.*\})/);
+    expect(marked?.[1]).toBeTruthy();
+    expect(code).toBe(0);
+    const parsed = JSON.parse(marked![1]!) as { got: string[]; withinMs: number };
+    expect(parsed.got).toEqual(['escape']);
+    expect(parsed.withinMs).toBeLessThan(1000);
+  }, 60_000);
+
+  test('PTY onEscAbort aborts the controller on an injected Escape within 1s (incl. key queued before attach)', async () => {
+    const { code, stdout } = await runPtyChild(`
+      const { initTui, injectKey } = await import(${JSON.stringify(TUI_PATH)});
+      const { onEscAbort } = await import(${JSON.stringify(CHAT_PATH)});
+      initTui(false);
+      const live = new AbortController();
+      const cleanupLive = onEscAbort(live);
+      await new Promise((r) => setTimeout(r, 50));
+      const t0 = Date.now();
+      injectKey({ name: 'escape', ctrl: false, shift: false });
+      while (!live.signal.aborted && Date.now() - t0 < 1000) await new Promise((r) => setTimeout(r, 10));
+      const liveMs = Date.now() - t0;
+      cleanupLive();
+      // 턴 시작 «전»에 주입돼 큐에 남은 Esc — attach 직후 배수로 받는다.
+      injectKey({ name: 'escape', ctrl: false, shift: false });
+      const queued = new AbortController();
+      const t1 = Date.now();
+      const cleanupQueued = onEscAbort(queued);
+      while (!queued.signal.aborted && Date.now() - t1 < 1000) await new Promise((r) => setTimeout(r, 10));
+      cleanupQueued();
+      process.stdout.write('ESC-ABORT:' + JSON.stringify({ live: live.signal.aborted, liveMs, queued: queued.signal.aborted, queuedMs: Date.now() - t1 }) + '\\n');
+      process.exit(0);
+    `, { signal: 'SIGTERM', timeoutMs: 45_000 });
+    const marked = stdout.match(/ESC-ABORT:(\{.*\})/);
+    expect(marked?.[1]).toBeTruthy();
+    expect(code).toBe(0);
+    const parsed = JSON.parse(marked![1]!) as { live: boolean; liveMs: number; queued: boolean; queuedMs: number };
+    expect(parsed.live).toBe(true);
+    expect(parsed.liveMs).toBeLessThan(1000);
+    expect(parsed.queued).toBe(true);
+    expect(parsed.queuedMs).toBeLessThan(1000);
+  }, 60_000);
+
+  test('PTY readKey keeps ownership of injected keys while it is awaiting', async () => {
+    const { code, stdout } = await runPtyChild(`
+      const { initTui, injectKey, readKey } = await import(${JSON.stringify(TUI_PATH)});
+      const { attachStreamingKeys } = await import(${JSON.stringify(CHAT_PATH)});
+      initTui(false);
+      // 스트리밍 리스너가 «먼저» 붙어 있어도 readKey 가 걸려 있으면 주입 키는 readKey 몫이다.
+      const streamed = [];
+      const cleanup = attachStreamingKeys((key) => { streamed.push(key.name); });
+      await new Promise((r) => setTimeout(r, 20));
+      const pending = readKey();
+      injectKey({ name: 'y', ctrl: false, shift: false });
+      const key = await pending;
+      await new Promise((r) => setTimeout(r, 50));
+      cleanup();
+      process.stdout.write('OWNED:' + JSON.stringify({ streamed, key: key.name }) + '\\n');
+      process.exit(0);
+    `, { signal: 'SIGTERM', timeoutMs: 45_000 });
+    const marked = stdout.match(/OWNED:(\{.*\})/);
+    expect(marked?.[1]).toBeTruthy();
+    expect(code).toBe(0);
+    expect(JSON.parse(marked![1]!)).toEqual({ streamed: [], key: 'y' });
+  }, 60_000);
 
   test('PTY initTui registers handlers once and SIGINT exits 130', async () => {
     const { code, stdout } = await runPtyChild(startedTuiSource(`JSON.stringify({

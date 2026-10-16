@@ -8,8 +8,10 @@ Arguments:
   text                                            Prompt text for the single-turn agent.
 
 Options:
-  --new                                           Force a new session instead of using the active one
-  --session <id>                                  Continue an explicit session (id or unique prefix). Overrides --new and active session.
+  --new                                           Start a new session (the default since 0.2.31 — kept for compatibility)
+  --continue                                      Continue the active session instead of starting a new one
+  --resume [id]                                   Continue a session: the given id (or unique prefix), or the active session when no id is given. A word after --resume that is not session-id shaped (hex uuid) is read as the prompt, not the id.
+  --session <id>                                  Continue an explicit session (id or unique prefix). Overrides --new, --continue and --resume.
   --json                                          Emit a single JSON line {sessionId, provider, model, reply, logPath, budget} instead of streaming text + ui.info trailer. Stable shape for LLM self-spawn.
   --no-tools                                      Disable the tool loop and fall back to text-only chat (for benchmarking / parity with `chat`).
   -h, --help                                      display help for command

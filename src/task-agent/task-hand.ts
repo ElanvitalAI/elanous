@@ -5,7 +5,7 @@
  *   종전 칸(landingDay·landingsToday·failureCounts)은 그대로 두고 덧붙이기만 한다(하위 호환 — 실행부 쓰기는 `...disk` 로 보존).
  * - 첫 수는 «launch» = `harness say [--seat <자리>] --substrate pod --merge-by-host "<원문>"`.
  * - 기본은 SHADOW: 카드와 명령만 남기고 아무것도 띄우지 않는다. `--live` 일 때만 주입된 launcher 로 띄운다.
- * - 관측: `debug.log('task-agent', 'handed', {taskId, seat, checklistId, mode})`.
+ * - 관측: `debug.log('task-agent', 'handed', {taskId, seat, checklistId, mode, runPriority})`.
  */
 import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
@@ -22,7 +22,12 @@ import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { withFileLockSync } from '../storage/file-lock.js';
 import { checkCompletionEvidence, deliverableReceiptEvidence } from './completion-evidence.js';
 import { judgeNextMove } from './judge.js';
+import { checklistDevVersion, listChecklist } from '../release-loop/checklist.js';
 import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
+import { applyRunIdentityTag, applyRunIdentityTags, deriveBirthIdentity, parseRunIdentityTag, runIdentityFieldText, runIdentityQueuePriority, runPriorityClass, validateRunIdentity, type RunIdentity, type RunIdentityCell, type RunIdentityOrigin } from './run-identity.js';
+import { parseWorkOrder, renderWorkOrderGoal, WORK_ORDER_FILE_PATTERN, type WorkOrder } from './work-order.js';
+import { inspectPrelaunchAlreadyDone, type AlreadyDoneDecision, type AlreadyDoneCandidate,
+  type PrelaunchGitRunnerForTest } from './prelaunch-already-done.js';
 
 export interface ResolveHandTextDeps {
   cwd: string;
@@ -33,11 +38,28 @@ export interface ResolveHandTextDeps {
 export type ResolvedHandText =
   | { kind: 'unchanged'; text: string }
   | { kind: 'inlined'; text: string; path: string; chars: number; sha256: string }
-  | { kind: 'rejected'; path: string; reason: '없다' | '디렉터리' | '읽기 실패' | '비었다' };
+  /** TA-WORK-ORDER — `.work-order.json` 골 파일이 검증을 통과해 지시서를 골 문면으로 펼친 것(`work-order.ts`). */
+  | { kind: 'work-order'; text: string; path: string; order: WorkOrder }
+  | { kind: 'rejected'; path: string; reason: string };
 
 function missingOrReadFailure(error: unknown): '없다' | '읽기 실패' {
   const code = (error as NodeJS.ErrnoException | undefined)?.code;
   return code === 'ENOENT' || code === 'ENOTDIR' ? '없다' : '읽기 실패';
+}
+
+/**
+ * TA-WORK-ORDER — `.work-order.json` 골 파일의 내용을 지시서로 검증한다.
+ * 통과하면 골 문면으로 펼쳐 `work-order` 로, 깨진 JSON·칸 id 없음은 `rejected`(사유) 로 돌린다.
+ * 관측: `debug.log('task-agent.work-order', 'parsed' | 'rejected', { cellId, unknownFields })`.
+ */
+function resolveWorkOrderFile(content: string, path: string): ResolvedHandText {
+  const parsed = parseWorkOrder(content);
+  if (!parsed.ok) {
+    try { debug.log('task-agent.work-order', 'rejected', { cellId: null, unknownFields: [] }); } catch { /* fail-soft */ }
+    return { kind: 'rejected', path, reason: parsed.reason };
+  }
+  try { debug.log('task-agent.work-order', 'parsed', { cellId: parsed.order.cellId, unknownFields: parsed.order.unknownFields }); } catch { /* fail-soft */ }
+  return { kind: 'work-order', text: renderWorkOrderGoal(parsed.order), path, order: parsed.order };
 }
 
 /** 파일 판정만 한다. 관측과 카드 작성은 호출자가 결과에 따라 수행한다. */
@@ -55,6 +77,8 @@ export function resolveHandText(text: string, deps: ResolveHandTextDeps = { cwd:
   let content: string;
   // stat 과 read 사이에 지워지거나 경로가 바뀌어도 사유는 같은 규칙(없다/읽기 실패)으로 가른다.
   try { content = deps.readFile(path, 'utf8'); } catch (error) { return { kind: 'rejected', path, reason: missingOrReadFailure(error) }; }
+  // TA-WORK-ORDER — 지시서 골 파일은 인라인하지 않고 지시서로 검증해 골 문면으로 펼친다.
+  if (WORK_ORDER_FILE_PATTERN.test(text)) return resolveWorkOrderFile(content, path);
   const carried = content.trim();
   if (!carried) return { kind: 'rejected', path, reason: '비었다' };
   return { kind: 'inlined', text: content, path, chars: carried.length, sha256: createHash('sha256').update(carried).digest('hex') };
@@ -163,6 +187,8 @@ export interface TaskCardEvent {
   sourceId?: string;
   /** `closed-by-hand` 줄만 — 닫은 사유 · 닫은 자리(`closeTaskCard`). */
   reason?: string; by?: string;
+  /** RUN-IDENTITY-TAGS — `run-tag-change` 줄만 — 바꾼 칸 값(from → to). */
+  from?: string; to?: string;
   kind?: string; executed?: boolean; ok?: boolean; executorResult?: 'shadow' | 'live'; head?: string; effect?: string;
   /** TA-REVIEW-RESULT-CAPTURE — review live-move 줄 · 결과 줄(`live-move-result`)의 결과 파일 경로. */
   resultPath?: string;
@@ -222,6 +248,8 @@ export interface TaskCard {
   adoptedPr?: { pr: number; url: string; head: string; at: string };
   /** Bound PR observed in a terminal GitHub state. Only applies while the card still binds the same PR and URL. */
   prTerminal?: { pr: number; url: string; head: string; state: 'MERGED' | 'CLOSED'; at: string };
+  /** Component PR closed by a verified merged integration train. Source PR remains CLOSED. */
+  trainLanding?: { componentPr: number; integrationPr: number; mergeSha: string; train: string; at: string };
   /** Post-land checklist judgement. A partial slice closes this card while leaving the checklist cell yellow. */
   postLand?: { pr: number; head: string; at: string; outcome: 'complete' | 'partial'; evidence: string[]; remaining: string[] };
   goalId?: string;
@@ -241,6 +269,8 @@ export interface TaskCard {
   parentHost?: { host: string; configDir?: string; pid?: number; log?: string };
   /** 미션 카드만 — 모든 조각 착지 → 칸 green «제안»(체크리스트는 손대지 않는다 · OP/주인이 뒤집는다). */
   greenProposal?: { at: string; checklistId: string | null; evidence: Record<string, string> };
+  /** A passed explicit evidence command on current main only proposes green to an owner. No run or checklist change. */
+  alreadyDoneCandidate?: AlreadyDoneCandidate & { at: string };
   /** TA-JUDGE-LIVE-SAFE — live `review` 수가 리뷰를 요청한 PR 머리들(머리마다 한 번 · 띄우기 실패면 error · 이력은 지우지 않는다). */
   reviewRequests?: Array<{ pr: number; head: string; at: string; error?: string; /** TA-REVIEW-RESULT-CAPTURE — 자식 `--json` stdout 을 받는 파일. */ resultPath?: string }>;
   /**
@@ -264,6 +294,10 @@ export interface TaskCard {
   taLand?: true;
   /** TASKS-HAND-CHILD-LLM — `tasks hand --child-llm <provider>/<model> [--child-llm-effort <level>]` → 발사 인자 `--child-llm-provider/-model/-effort`. */
   childLlm?: TaskChildLlm;
+  /** Dispatch difficulty, fixed at handoff so repair uses the same judgement. */
+  tier?: '하' | '중' | '상' | '특';
+  /** RUN-IDENTITY-TAGS — 출생 신분 묶음(`run-identity.js` 정본): 칸 우선순위·대표 표시에서 태어나고 `--tag k=v` 가 덮는다. 카드 상태 파일이 원장 정본이다. */
+  identity?: RunIdentity;
   /** Same-PR repair launches; exact source head and worker result are retained for CAS and retry limits. */
   repairs?: Array<{ pr: number; head: string; branch: string; at: string; move: string; runId: string;
     resultPath: string; fromModel: string; toModel: string; status: 'requested' | 'unconfirmed' | 'failed' | 'applied';
@@ -397,12 +431,79 @@ export function closeTaskCard(card: TaskCard, input: { reason: string; by: strin
   return { ...card, status: 'failed', history: [...card.history, { at: input.at, event: CLOSED_BY_HAND_EVENT, kind: CLOSED_BY_HAND_EVENT, detail: reason, reason, by: input.by }] };
 }
 
+/** RUN-IDENTITY-TAGS — 카드 history 의 런 신분 태그 바꾸기 줄(`runTagChange`): 닫힌 목록 신분을 바꾼 감사 {from, to, by, reason}. */
+export const RUN_TAG_CHANGE_EVENT = 'run-tag-change';
+
+/** RUN-IDENTITY-TAGS — 칸 조회 seam 의 답(조회 실패·빠칸 = `undefined` = «모른다»). */
+export type RunIdentityCellLookup = (checklistId: string) => RunIdentityCell | undefined;
+
+/**
+ * RUN-IDENTITY-TAGS-2 — 조회한 칸이 «기대한 판»의 칸일 때만 쓴다. 기대 판(카드 `checklistVersion`·호출자가 넘긴 판)을
+ * 알면 칸의 `version` 이 그 판과 같아야 한다 — 다르거나 비면 다른 판의 같은 id 일 수 있으니 «모른다»(`undefined`).
+ */
+export function cellOnExpectedBoard(cell: RunIdentityCell | undefined, expectedVersion: string | undefined): RunIdentityCell | undefined {
+  if (cell === undefined || expectedVersion === undefined) return cell;
+  return cell.version === expectedVersion ? cell : undefined;
+}
+
+/**
+ * RUN-IDENTITY-TAGS — 확인된 칸만 담은 신분: 조회에 성공한 칸이 있으면 그 출생값, 없으면 `{ origin }` 뿐이고
+ * 명시 태그를 얹는다. ⛔ 칸을 못 읽었으면 나머지 칸(care·rights·protect·class)을 기본값으로 채우지 않는다(«미기록»).
+ */
+export function confirmedRunIdentity(cell: RunIdentityCell | undefined, origin: RunIdentityOrigin, tags: readonly string[]): RunIdentity {
+  return applyRunIdentityTags(cell ? deriveBirthIdentity(cell, origin) : { origin }, tags);
+}
+
+/**
+ * RUN-IDENTITY-TAGS — `tasks tag <card> k=v`: 카드 history 에 `run-tag-change` 줄 {from, to, by, reason} 을
+ * 남기고 신분을 바꾼다(카드 상태 파일 = 원장 정본 — 같은 잠금 안에서 적는다). 목록 밖 값·모르는 칸은
+ * 카드를 적기 전에 거부한다(`run-identity.js` 정본).
+ * 신분 없는 옛 카드는 `checklistId` 로 칸을 «다시 조회»해 출생값을 세운다 — 못 읽으면 명시 태그만 담고 나머지는 «미기록».
+ * 출생 자리(origin.launcher)는 그 카드가 어디서 났는지 원장이 모르므로 비운다(지어내지 않는다).
+ */
+export function runTagChange(id: string, input: { tag: string; by: string; reason?: string; checklistCell?: RunIdentityCellLookup }, path: string = taskAgentStatePath(), now: () => Date = () => new Date()): TaskCard | undefined {
+  const tag = parseRunIdentityTag(input.tag);   // 목록 밖 값·모르는 칸은 여기서 거부한다.
+  const at = now().toISOString();
+  // 재조회는 잠금 밖에서 한 번 — 잠금 안에서 칸보드를 읽지 않는다.
+  const before = readTaskCard(id, path);
+  // RUN-IDENTITY-TAGS-2 — 카드의 판(checklistVersion)을 알 때만 «그 판»에서 다시 읽는다. 판을 모르면 «판 모름»:
+  // 개발 판의 같은 id 를 그 칸이라 짐작하지 않고 명시 태그만 담는다(나머지 «미기록»).
+  const boardVersion = before?.checklistVersion;
+  const lookup: RunIdentityCellLookup | undefined = input.checklistCell
+    ?? (boardVersion !== undefined ? (checklistId: string) => readChecklistCellForBirth(checklistId, boardVersion) : undefined);
+  const relookup = before && !before.identity && before.checklistId && lookup ? lookup(before.checklistId) : undefined;
+  return updateTaskCard(path, id, (current) => {
+    if (!current) return undefined;
+    // 잠금 밖에서 읽은 칸은 «같은 칸 ⊕ 같은 판»일 때만 쓴다 — 그 사이 판이 바뀌었으면 옛 판의 신분을 새 카드에 적지 않는다.
+    const sameCell = current.checklistId !== undefined && current.checklistId === before?.checklistId && current.checklistVersion === before?.checklistVersion;
+    const cell = !current.identity && sameCell ? cellOnExpectedBoard(relookup, current.checklistVersion) : undefined;
+    const identity = current.identity ? validateRunIdentity(current.identity) : confirmedRunIdentity(cell, {
+      ...(current.checklistId ? { checklistId: current.checklistId } : {}),
+      ...(cell?.version ? { version: cell.version } : {}),
+      ...(current.seat ? { seat: current.seat } : {}),
+    }, []);
+    const from = runIdentityFieldText(identity, tag.key);   // 확인 안 된 칸은 «미기록»
+    const to = tag.key === 'protect' ? String(tag.value) : tag.value;
+    return { ...current, identity: applyRunIdentityTag(identity, tag), history: [...current.history, { at, event: RUN_TAG_CHANGE_EVENT, kind: RUN_TAG_CHANGE_EVENT, detail: `${tag.key} ${from}→${to}`, from, to, by: input.by, ...(input.reason ? { reason: input.reason } : {}) }] };
+  });
+}
+
+/** RUN-IDENTITY-TAGS — 칸 읽기(기본): 칸보드 `version`(기본 = 개발 판)에서 `checklistId` 로 읽는다. 읽기 실패·빠칸은 조용히 `undefined`(= «모른다») — 호출자는 기본 신분을 세우지 않고 명시 태그만 담는다(나머지 «미기록»). */
+export function readChecklistCellForBirth(checklistId: string, boardVersion?: string): { title?: string; priority?: string; version?: string } | undefined {
+  try {
+    const version = boardVersion ?? checklistDevVersion();
+    const cell = listChecklist(version).items.find((item) => item.id === checklistId);
+    return cell ? { title: cell.title, priority: cell.priority, version } : undefined;
+  } catch { return undefined; }
+}
+
 /** 첫 수의 elanous 인자(진입점·--config-dir 앞붙임은 launcher 몫). */
-export function launchArgs(card: Pick<TaskCard, 'text' | 'seat' | 'childLlm'>): string[] {
+export function launchArgs(card: Pick<TaskCard, 'text' | 'seat' | 'childLlm' | 'identity'>): string[] {
   const child = card.childLlm
     ? ['--child-llm-provider', card.childLlm.provider, '--child-llm-model', card.childLlm.model, ...(card.childLlm.effort ? ['--child-llm-effort', card.childLlm.effort] : [])]
     : [];
-  return ['harness', 'say', ...(card.seat ? ['--seat', card.seat] : []), '--substrate', 'pod', '--merge-by-host', ...child, card.text];
+  const runPriority = runIdentityQueuePriority(card.identity);
+  return ['harness', 'say', ...(card.seat ? ['--seat', card.seat] : []), '--substrate', 'pod', '--merge-by-host', ...(runPriority !== undefined ? ['--run-priority', String(runPriority)] : []), ...child, card.text];
 }
 
 /**
@@ -413,6 +514,7 @@ export function launchArgs(card: Pick<TaskCard, 'text' | 'seat' | 'childLlm'>): 
 export function nextMoveFor(card: TaskCard, landed?: ReadonlySet<string>, deps: { ledgerDir?: string } = {}): TaskCardMove {
   // Completion callbacks record a shadow decision; do not suggest the live CLI here.
   if (card.pieces) return { kind: 'wait', reason: `미션 — 조각 ${card.pieces.length}장이 선후대로 발사된다` };
+  if (card.alreadyDoneCandidate) return { kind: 'wait', reason: `main ${card.alreadyDoneCandidate.mainSha.slice(0, 12)} (검사 시점) 증거 명령 통과 — green 후보 · 주인 판정 대기` };
   const unmet = (card.after ?? []).filter((id) => !landed?.has(id));
   if (card.status !== 'launched' && unmet.length > 0) return { kind: 'wait', reason: `after ${unmet.join(', ')}${landed ? '' : ' · 착지 미확인'}` };
   if (card.status === 'handed') return { kind: 'launch', command: launchArgs(card), reason: '넘겨받은 과제 — 첫 발사' };
@@ -462,11 +564,26 @@ export interface HandTaskOptions {
   /** TASKS-HAND-CHILD-LLM — `<provider>/<model>`(`parseChildLlm`) ⊕ 선택 추론 노력. effort 만 주면 거부. */
   childLlm?: string;
   childLlmEffort?: string;
+  tier?: TaskCard['tier'];
+  /** RUN-IDENTITY-TAGS — `tasks hand --tag k=v`(반복): 출생 신분을 덮는다. 목록 밖 값은 거부한다(`run-identity.js`). */
+  tags?: string[];
+  /** RUN-IDENTITY-TAGS — 칸 읽기 seam(우선순위·대표 표시). 주면 그 답이 최종이다(«칸 없음» 포함). */
+  checklistCell?: RunIdentityCellLookup;
+  /**
+   * RUN-IDENTITY-TAGS-2 — 칸을 찾은 칸보드 판. 주면 그 판에서 `checklistId` 로 칸을 읽는다(`checklistCell` 이 없을 때).
+   * 안 주면 «판 모름» — 다른 판의 같은 id(우선순위가 다를 수 있다)를 그 칸이라 짐작하지 않으므로 칸에서 파생되는
+   * 신분 칸(class·care·protect·rights)을 확정하지 않는다(명시 `--tag` 만 담고 나머지 «미기록»).
+   */
+  checklistVersion?: string;
   statePath?: string;
   /** 시험에서만 조합 저장소를 바꿔 해석·거부를 검증한다. */
   compositionRoot?: string;
   /** `--live` 일 때만 불린다. */
   launcher?: TaskLauncher;
+  /** Deterministic contract seam; production uses the pinned-main verifier. */
+  prelaunchInspector?: (text: string, projectTarget?: string) => AlreadyDoneDecision;
+  /** Test-only: inject Git calls into the production verifier; no CLI/config surface. */
+  prelaunchGitRunnerForTest?: PrelaunchGitRunnerForTest;
   now?: () => Date;
   id?: string;
   /** 미션 조각으로 넘길 때 — 카드에 소속 미션·선후를 싣는다. */
@@ -533,6 +650,24 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     if (value !== undefined && (!value.trim() || /\p{Cc}/u.test(value))) throw new Error(`${flag} id 가 비었거나 제어 문자를 담았다: ${JSON.stringify(value)}`);
   }
   if (opts.childLlmEffort !== undefined && opts.childLlm === undefined) throw new Error('--child-llm-effort 는 --child-llm <provider>/<model> 과 함께 준다');
+  if (opts.tier !== undefined && !['하', '중', '상', '특'].includes(opts.tier)) throw new Error(`--tier 는 하|중|상|특 중 하나다: ${opts.tier}`);
+  // RUN-IDENTITY-TAGS — 출생 신분: 칸 우선순위(P0 = critical·special·protect · P1 = normal · 그 외 normal)·대표 표시에서 단다.
+  // `--tag k=v`(반복) 이 덮는다 — 칸·태그 없는 손은 오늘 모양 그대로다(신분 없음). 목록 밖 값은 카드를 적기 전에 거부한다(`run-identity.js` 정본).
+  const birthCell = opts.checklistId === undefined ? undefined
+    // 주입한 칸 조회가 있으면 그 답(«칸 없음» 포함)이 최종이다 — 칸보드는 조회기가 없을 때만 읽는다.
+    : opts.checklistCell !== undefined ? cellOnExpectedBoard(opts.checklistCell(opts.checklistId), opts.checklistVersion)
+    // 판을 받았으면 «그 판»에서 읽는다 · 판을 모르면 읽지 않는다(개발 판의 같은 id 를 그 칸이라 짐작하지 않는다 — «미기록»).
+    : opts.checklistVersion !== undefined ? readChecklistCellForBirth(opts.checklistId, opts.checklistVersion) : undefined;
+  const birthTags = opts.tags ?? [];
+  // 칸을 줬는데 칸보드에서 못 읽었으면(조회 실패·빠칸) 우선순위를 «모른다» — 기본 normal 을 사실처럼 적지 않고 신분을 비운다(화면은 «미기록»).
+  // 명시 `--tag` 가 있으면 «그 태그만» 신분에 담는다 — 칸을 못 읽었으면 덮지 않은 칸(care·rights·protect…)은 «미기록»으로 남는다(기본값으로 확정하지 않는다).
+  const identity = birthTags.length === 0 && (opts.checklistId === undefined || birthCell === undefined) ? undefined
+    : confirmedRunIdentity(birthCell, {
+      ...(opts.checklistId ? { checklistId: opts.checklistId } : {}),
+      ...(birthCell?.version ? { version: birthCell.version } : {}),
+      ...(opts.seat ? { seat: opts.seat } : {}),
+      launcher: 'hand',
+    }, birthTags);
   const childLlm = opts.childLlm !== undefined ? parseChildLlm(opts.childLlm, opts.childLlmEffort) : undefined;
   const completion = opts.completion ?? 'code-pr';
   const selected = selectTaskComposition(completion, opts.compositionRoot);
@@ -562,6 +697,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     id, text,
     ...(opts.seat ? { seat: opts.seat } : {}),
     ...(opts.checklistId ? { checklistId: opts.checklistId } : {}),
+    ...(opts.checklistVersion !== undefined ? { checklistVersion: opts.checklistVersion } : {}),
     ...(opts.completion ? { completion: opts.completion } : {}),
     ...(selected.composition ? { composition: selected.composition, graphSelectedBy: 'completion' as const } : {}),
     unitsResolved: selected.unitsResolved,
@@ -571,6 +707,8 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(opts.milestone ? { milestone: opts.milestone } : {}),
     ...(opts.taLand === true ? { taLand: true as const } : {}),
     ...(childLlm ? { childLlm } : {}),
+    ...(opts.tier ? { tier: opts.tier } : {}),
+    ...(identity ? { identity } : {}),
     createdAt: now.toISOString(),
     status: selectionFailure ? 'failed' : 'handed',
     history: selectionFailure ? [{ at: now.toISOString(), event: !selected.composition ? 'composition-missing'
@@ -604,12 +742,27 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   }); } catch { /* fail-soft */ }
   if (selectionFailure) throw new Error(`${selectionFailure} (카드 ${id})`);
   if (!move || move.kind !== 'launch') throw new Error('조합 선택 뒤 발사 수가 없다');
-  try { debug.log('task-agent', 'handed', { taskId: id, seat: card.seat ?? null, checklistId: card.checklistId ?? null, mode, projectId: project?.id ?? null, targetIsGit, taLand: card.taLand === true }); } catch { /* fail-soft */ }
+  try { debug.log('task-agent', 'handed', { taskId: id, seat: card.seat ?? null, checklistId: card.checklistId ?? null, mode, projectId: project?.id ?? null, targetIsGit, taLand: card.taLand === true, runPriority: card.identity ? runPriorityClass(card.identity) : null }); } catch { /* fail-soft */ }
   if (childLlm) {
     try { debug.log('task-agent', 'child-llm', { taskId: id, input: opts.childLlm, provider: childLlm.provider, model: childLlm.model, effort: childLlm.effort ?? null, mode }); } catch { /* fail-soft */ }
   }
   if (mode === 'shadow') return { card, move, mode, launched: false, ...(project ? { cwd: project.target } : {}) };
   if (!opts.launcher) throw new Error('--live 인데 launcher 가 없다');
+  let prelaunch: AlreadyDoneDecision;
+  try { prelaunch = completion === 'code-pr'
+    ? (opts.prelaunchInspector ?? ((input, target) => inspectPrelaunchAlreadyDone(input, target,
+      opts.prelaunchGitRunnerForTest ? { runGit: opts.prelaunchGitRunnerForTest } : {})))(text, project?.target)
+    : { reason: 'completion-not-code-pr' }; }
+  catch { prelaunch = { reason: 'prelaunch-unmeasured' }; }
+  try { debug.log('task-agent', 'prelaunch-already-done', { taskId: id, result: prelaunch.reason,
+    mainSha: prelaunch.candidate?.mainSha ?? null, command: prelaunch.candidate?.command ?? null }); } catch { /* fail-soft */ }
+  if (prelaunch.candidate) {
+    const candidate: TaskCard = { ...card, alreadyDoneCandidate: { ...prelaunch.candidate, at: (opts.now ?? (() => new Date()))().toISOString() },
+      history: [...card.history, { at: (opts.now ?? (() => new Date()))().toISOString(), event: 'already-done-candidate',
+        detail: `${prelaunch.candidate.repository} main ${prelaunch.candidate.mainSha} · rc=0 · ${prelaunch.candidate.command}` }] };
+    writeCard(path, candidate);
+    return { card: candidate, move: nextMoveFor(candidate), mode, launched: false, ...(project ? { cwd: project.target } : {}) };
+  }
   const runId = mintRunId();
   const launchId = `tl-${randomBytes(6).toString('hex')}`;
   const context: TaskLaunchContext = { runId, launchId, env: { [HARNESS_RUN_ID_ENV]: runId, ELANOUS_TASK_CARD_ID: card.id,

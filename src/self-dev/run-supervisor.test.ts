@@ -7,7 +7,7 @@ import { readTaskCard, writeTaskCards, type TaskCard } from '../task-agent/task-
 import { rejudgeCardOnHead } from '../task-agent/rejudge-on-head.js';
 import * as rejudgeOnHead from '../task-agent/rejudge-on-head.js';
 import { saveSelfDevRun, loadSelfDevRun, selfDevRunsDir } from './run-store.js';
-import { decideNextRun, superviseRun, rejudgeTerminalTaskCard, madeProgress, countLanded, countBaseCompleted, appendRound, noPrStreakKey, SUPERVISOR_STOP_REASONS, type SupervisorRound, type SupervisorStopReason } from './run-supervisor.js';
+import { decideNextRun, superviseRun, rejudgeTerminalTaskCard, madeProgress, countLanded, countBaseCompleted, appendRound, noPrStreakKey, SUPERVISOR_STOP_REASONS, mineFailurePatterns, bindPatternMineKey, patternMineLivesFromRounds, patternMineSignaturesFromDecision, type SupervisorRound, type SupervisorStopReason } from './run-supervisor.js';
 
 const merged = (id: string) => ({ taskId: id, feature: id, status: 'done', stage: 'merged', merged: true }) as never;
 const worktreeCompleted = (id: string) => ({ taskId: id, feature: id, status: 'done', stage: 'worktree-completed' }) as never;
@@ -489,7 +489,7 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     expect(d.stopReason).toBe('no-progress');
     expect(d.repairable).toEqual(['a', 'b']);
     expect(d.why).toContain('2');
-    expect(appendRound(history, results)[2]).toEqual({ round: 2, landed: 0, actionable: 2 });
+    expect(appendRound(history, results)[2]).toEqual({ round: 2, landed: 0, actionable: 2, unknownTimeTaskIds: ['a', 'b'] });
     expect(madeProgress({ round: 0, landed: 0, actionable: 3 }, { round: 1, landed: 0, actionable: 1 })).toBe(true);
   });
 
@@ -500,14 +500,14 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     expect(d.decomposable).toEqual(['split-a', 'split-b']);
     expect(d.repairable).toEqual([]);
     expect(d.why).toContain('분해 2');
-    expect(appendRound([], results)).toEqual([{ round: 0, landed: 0, actionable: 2 }]);
+    expect(appendRound([], results)).toEqual([{ round: 0, landed: 0, actionable: 2, unknownTimeTaskIds: ['split-a', 'split-b'] }]);
   });
 
   test('rerunnable 만 있는 기존 입력의 판정과 숫자는 그대로다', () => {
     const d = decideNextRun({ results: [lockRace('a'), lockRace('b')] });
     expect(d.action).toBe('relaunch');
     expect(d.why).toContain('그대로 재실행 2');
-    expect(appendRound([], [lockRace('a'), lockRace('b')])).toEqual([{ round: 0, landed: 0, actionable: 2, noPrTaskIds: ['a', 'b'], noPrFeatureKeys: ['a', 'b'] }]);
+    expect(appendRound([], [lockRace('a'), lockRace('b')])).toEqual([{ round: 0, landed: 0, actionable: 2, noPrTaskIds: ['a', 'b'], noPrFeatureKeys: ['a', 'b'], unknownTimeTaskIds: ['a', 'b'] }]);
   });
 
   test('⭐ 착지가 «하나라도» 있으면 제자리가 아니다 — 계속 돈다', () => {
@@ -565,7 +565,7 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     const next = appendRound(history, results)[2]!;
     expect(countLanded(results)).toBe(0);
     expect(countBaseCompleted(results)).toBe(2);
-    expect(next).toEqual({ round: 2, landed: 0, baseCompleted: 2, base: 'bench/x', actionable: 3 });
+    expect(next).toEqual({ round: 2, landed: 0, baseCompleted: 2, base: 'bench/x', actionable: 3, unknownTimeTaskIds: ['a', 'b', 'open'] });
     expect(madeProgress(history[1], next)).toBe(true);
     const decision = decideNextRun({ results, history, limits: { maxRounds: 9, stallRounds: 2 } });
     expect(decision.stopReason).not.toBe('no-progress');
@@ -600,7 +600,7 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     ];
     const results = [unfinished('a')];
     expect(countBaseCompleted(results)).toBe(0);
-    expect(appendRound(history, results)[2]).toEqual({ round: 2, landed: 0, baseCompleted: 0, base: 'bench/x', actionable: 1, noPrTaskIds: ['a'], noPrFeatureKeys: ['a'] });
+    expect(appendRound(history, results)[2]).toEqual({ round: 2, landed: 0, baseCompleted: 0, base: 'bench/x', actionable: 1, noPrTaskIds: ['a'], noPrFeatureKeys: ['a'], unknownTimeTaskIds: ['a'] });
     const decision = decideNextRun({ results, history, limits: { maxRounds: 9, stallRounds: 2 } });
     expect(decision.stopReason).toBe('no-progress');
     expect(decision.why).toContain('base=bench/x 기준 완료 0 · 착지 0');
@@ -611,9 +611,9 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     const second = [worktreeCompleted('a'), lockRace('b')];
     const history = appendRound([], first);
     const next = appendRound(history, second)[1]!;
-    expect(history[0]).toEqual({ round: 0, landed: 0, actionable: 2, noPrTaskIds: ['a', 'b'], noPrFeatureKeys: ['a', 'b'] });
+    expect(history[0]).toEqual({ round: 0, landed: 0, actionable: 2, noPrTaskIds: ['a', 'b'], noPrFeatureKeys: ['a', 'b'], unknownTimeTaskIds: ['a', 'b'] });
     expect(countLanded(second)).toBe(1);
-    expect(next).toEqual({ round: 1, landed: 1, actionable: 1, noPrTaskIds: ['b'], noPrFeatureKeys: ['b'] });
+    expect(next).toEqual({ round: 1, landed: 1, actionable: 1, noPrTaskIds: ['b'], noPrFeatureKeys: ['b'], unknownTimeTaskIds: ['b'] });
     expect(madeProgress(history[0], next)).toBe(true);
     const decision = decideNextRun({ results: second, history, limits: { maxRounds: 9, stallRounds: 1 } });
     expect(decision.action).toBe('relaunch');
@@ -630,14 +630,14 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
 
   test('appendRound — 라운드 기록이 «잰 값»으로 쌓인다', () => {
     let h = appendRound([], [merged('a'), lockRace('b')]);
-    expect(h).toEqual([{ round: 0, landed: 1, actionable: 1, noPrTaskIds: ['b'], noPrFeatureKeys: ['b'] }]);
+    expect(h).toEqual([{ round: 0, landed: 1, actionable: 1, noPrTaskIds: ['b'], noPrFeatureKeys: ['b'], unknownTimeTaskIds: ['b'] }]);
     h = appendRound(h, [merged('b')]);
     expect(h[1]).toEqual({ round: 1, landed: 1, actionable: 0 });
   });
 
   test('appendRound는 결정의 이미 정규화된 review must-fix 추이를 다음 제자리 비교용 이력에 보존한다', () => {
     const history = appendRound([], [lockRace('retry')], 'improving');
-    expect(history).toEqual([{ round: 0, landed: 0, actionable: 1, reviewMustFixTrend: 'improving', noPrTaskIds: ['retry'], noPrFeatureKeys: ['retry'] }]);
+    expect(history).toEqual([{ round: 0, landed: 0, actionable: 1, reviewMustFixTrend: 'improving', noPrTaskIds: ['retry'], noPrFeatureKeys: ['retry'], unknownTimeTaskIds: ['retry'] }]);
     expect(madeProgress(history[0], { round: 1, landed: 0, actionable: 1, reviewMustFixTrend: 'stable' })).toBe(false);
   });
 
@@ -1776,5 +1776,235 @@ describe('REVIEW-MUSTFIX-CLASSIFY — 슈퍼바이저는 추이 대신 회차 �
     // 순수 판정(repairGoalExecution 미선언)에서의 지금 동작 — 진동 수리 결정 칸만 낸다.
     expect(d.action).toBe('add-repair-task');
     expect(d.stopReason).toBeUndefined();
+  });
+});
+
+describe('PATTERN-MINE — 생애 기록부 struggled·watch ⊕ 종단 서명', () => {
+  test('순수 집계는 struggled·watch 를 종단 서명과 묶어 빈도·생애 수·잃은 시간을 낸다', () => {
+    const mined = mineFailurePatterns({
+      lives: [
+        { lifeId: 'life-a', struggled: 'must-fix 2 가 3라운드 진동', watch: 'MF-bc5634f3 는 X 를 건드리면 재발', lostTimeMs: 8 * 60 * 60 * 1000 },
+        { lifeId: 'life-b', struggled: 'must-fix 2 가 3라운드 진동', watch: 'MF-bc5634f3 는 X 를 건드리면 재발', lostTimeMs: 6 * 60 * 60 * 1000 },
+        { lifeId: 'life-c', struggled: '게이트 조각 측정 불가', lostTimeMs: 1_000 },
+      ],
+      signatures: [
+        { lifeId: 'life-a', stopReason: 'review-oscillating', oscillationSignature: 'sig-a', classificationKind: 'review-blocked' },
+        { lifeId: 'life-b', stopReason: 'review-oscillating', oscillationSignature: 'sig-a', classificationKind: 'review-blocked' },
+        { lifeId: 'life-c', stopReason: 'deliverable-unobserved' },
+      ],
+    });
+    expect(mined.lifeCount).toBe(3);
+    expect(mined.lostTimeMs).toBe(14 * 60 * 60 * 1000 + 1_000);
+    expect(mined.patterns[0]).toMatchObject({
+      pattern: 'must-fix 2 가 3라운드 진동 · MF-bc5634f3 는 X 를 건드리면 재발 ⊕ review-oscillating · sig-a · review-blocked',
+      frequency: 2,
+      lifeCount: 2,
+      lostTimeMs: 14 * 60 * 60 * 1000,
+    });
+    expect(mined.patterns).toHaveLength(2);
+    expect(bindPatternMineKey({ lifeId: 'empty' })).toBe('');
+    expect(mineFailurePatterns({ lives: [] })).toEqual({ patterns: [], lifeCount: 0, lostTimeMs: 0 });
+  });
+
+  test('appendRound 원장과 decideNextRun 종단 서명이 집계 입력으로 묶인다', () => {
+    const results = [{
+      taskId: 'osc', feature: 'osc', status: 'failed' as const, stage: 'error', durationMs: 3_600_000,
+      error: { code: 'SELF_IMPL_FAILED', message: "error: cannot lock ref 'refs/remotes/origin/main': is at abc123" },
+      prNumber: 4242,
+      rework: { trend: 'oscillating' as const, signature: 'sig-osc', rounds: 2 },
+      reviewMustFix: ['게이트을 고쳐라'],
+    } as never];
+    const history = appendRound([], results);
+    // PATTERN-MINE LOST-TIME — 회차 0 실행의 시간은 원장에 은행된다(보류 없는 순수 기록이라 전부).
+    expect(history[0]!.lostTimeMsByTask).toEqual({ osc: 3_600_000 });
+    const decision = decideNextRun({
+      results,
+      history: [{ round: 0, landed: 0, actionable: 1, oscillationRepairTaskIds: ['osc'],
+        mustFix: { items: [{ text: '게이트을 고쳐라', taskId: 'osc' }] } }],
+      repairGoalExecution: true,
+    });
+    expect(decision.stopReason).toBe('review-oscillating');
+    // 종단 세대는 «다음» 재실행 결과다(같은 조각 · 다른 소요) — 원장 은행 ⊕ 종단을 합산한다.
+    const rerunResults = [{
+      taskId: 'osc', feature: 'osc', status: 'failed' as const, stage: 'error', durationMs: 1_800_000,
+      error: { code: 'SELF_IMPL_FAILED', message: "error: cannot lock ref 'refs/remotes/origin/main': is at abc123" },
+      prNumber: 4242,
+      rework: { trend: 'oscillating' as const, signature: 'sig-osc', rounds: 2 },
+      reviewMustFix: ['게이트을 고쳐라'],
+    } as never];
+    const lives = patternMineLivesFromRounds(history, rerunResults);
+    const signatures = patternMineSignaturesFromDecision(decision);
+    const mined = mineFailurePatterns({ lives, signatures });
+    expect(lives[0]).toMatchObject({ lifeId: 'osc', lostTimeMs: 3_600_000 + 1_800_000 });
+    expect(lives[0]!.struggled).toContain('리뷰 진동 sig-osc');
+    expect(lives[0]!.watch).toContain('게이트을 고쳐라');
+    expect(signatures[0]).toMatchObject({ lifeId: 'osc', stopReason: 'review-oscillating', oscillationSignature: 'sig-osc' });
+    expect(mined.lifeCount).toBe(1);
+    expect(mined.lostTimeMs).toBe(3_600_000 + 1_800_000);
+    expect(mined.patterns[0]!.frequency).toBe(1);
+    expect(mined.patterns[0]!.pattern).toContain('review-oscillating');
+  });
+
+  test('앞 회차의 미측정 실패는 뒤 회차 시간을 재도 unknown으로 남는다', () => {
+    const first = [{ taskId: 'osc', feature: 'osc', status: 'failed', stage: 'error',
+      error: { code: 'SELF_IMPL_FAILED', message: 'timeout' }, prNumber: 4242 } as never];
+    const history = appendRound([], first);
+    expect(history[0]!.unknownTimeTaskIds).toEqual(['osc']);
+    const final = [{ taskId: 'osc', feature: 'osc', status: 'failed', stage: 'error', durationMs: 2_000,
+      error: { code: 'SELF_IMPL_FAILED', message: 'timeout' }, prNumber: 4242 } as never];
+    const lives = patternMineLivesFromRounds(history, final);
+    expect(lives[0]!.lostTimeMs).toBeUndefined();
+    expect(mineFailurePatterns({ lives, signatures: [{ lifeId: 'osc', stopReason: 'review-oscillating' }] }).lostTimeMs).toBeNull();
+  });
+
+  test('생애 기록 없는 종단 서명은 미측정 시간이지 0ms가 아니다', () => {
+    const mined = mineFailurePatterns({ lives: [], signatures: [{ lifeId: 'missing', stopReason: 'review-oscillating' }] });
+    expect(mined.lifeCount).toBe(1);
+    expect(mined.lostTimeMs).toBeNull();
+    expect(mined.patterns[0]!.lostTimeMs).toBeNull();
+  });
+
+  test('superviseRun 종단 훅(recordTaskAgentShadowMove / rejudgeTerminalTaskCard)에서 집계를 낸다', async () => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const shadow: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+      if (event === 'pattern-mine' && data && typeof data === 'object') logs.push({ event, data: data as Record<string, unknown> });
+    });
+    try {
+      await superviseRun({
+        initial: [{
+          taskId: 'osc', feature: 'osc', status: 'failed', stage: 'error', durationMs: 2_000,
+          error: { code: 'SELF_IMPL_FAILED', message: "error: cannot lock ref 'refs/remotes/origin/main': is at abc123" },
+          prNumber: 4242,
+          rework: { trend: 'oscillating', signature: 'sig-osc', rounds: 2 },
+          reviewMustFix: ['live 호출자를 못 봤다'],
+        } as never],
+        repairGoalExecution: true,
+        taskAgentShadow: async () => { shadow.push('shadow'); },
+        taskAgentRejudge: false,
+        sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+        observe: (event, data) => { events.push({ event, data }); },
+        rerun: async () => [],
+        limits: { stallRounds: 4 },
+      });
+    } finally { log.mockRestore(); }
+
+    expect(shadow).toEqual(['shadow']);
+    const observed = events.find(({ event }) => event === 'pattern-mine');
+    expect(observed).toBeDefined();
+    expect(observed!.data).toMatchObject({ lifeCount: 1, lostTimeMs: 2_000, frequency: 1, stopReason: 'review-oscillating' });
+    expect((observed!.data.patterns as Array<{ pattern: string }>)[0]!.pattern).toContain('review-oscillating');
+    expect(logs).toHaveLength(1);
+    expect(logs[0]!.data).toMatchObject({ lifeCount: 1, lostTimeMs: 2_000, frequency: 1 });
+  });
+
+  test('bindPatternMineKey — 생애 기록부 ⊕ 종단 서명 묶기(서명 없는 생애 · 빈 생애 ⊕ 서명)', () => {
+    // 서명 없는 생애는 생애 부분(struggled · watch)이 키 전부다.
+    expect(bindPatternMineKey({ lifeId: 'l', struggled: 's', watch: 'w' })).toBe('s · w');
+    expect(bindPatternMineKey({ lifeId: 'l', watch: 'w' })).toBe('w');
+    // 생애 ⊕ 종단 서명 — 서명 부분은 멈춤 어휘 · 진동 서명 · 분류 · must-fix 순서로 붙는다.
+    expect(bindPatternMineKey({ lifeId: 'l', struggled: 's', watch: 'w' }, { stopReason: 'r', mustFix: 'm' }))
+      .toBe('s · w ⊕ r · m');
+    // 기록 없는 생애에 서명만 있으면 '(기록 없음)' 이 생애 자리를 지킨다.
+    expect(bindPatternMineKey({ lifeId: 'l' }, { stopReason: 'r' })).toBe('(기록 없음) ⊕ r');
+    // 양쪽 다 비면 패턴이 아니다(빈 키).
+    expect(bindPatternMineKey({ lifeId: 'l' })).toBe('');
+    expect(bindPatternMineKey({ lifeId: 'l' }, {})).toBe('');
+  });
+
+  test('생애 없는 종단 서명(런 단위)은 모든 생애에 묶인다 — converged 종단이 대표 사례다', () => {
+    const decision = decideNextRun({ results: [merged('done-a')] });
+    expect(decision).toMatchObject({ action: 'stop', stopReason: 'converged' });
+    const signatures = patternMineSignaturesFromDecision(decision);
+    expect(signatures).toEqual([{ stopReason: 'converged' }]);
+    const mined = mineFailurePatterns({
+      lives: [
+        { lifeId: 'life-a', struggled: 'must-fix 진동', watch: '재발 관측', lostTimeMs: 1_000 },
+        { lifeId: 'life-b', struggled: 'must-fix 진동', watch: '재발 관측', lostTimeMs: 2_000 },
+      ],
+      signatures,
+    });
+    expect(mined.patterns).toHaveLength(1);
+    expect(mined.patterns[0]).toMatchObject({
+      pattern: 'must-fix 진동 · 재발 관측 ⊕ converged',
+      frequency: 2,
+      lifeCount: 2,
+      lostTimeMs: 3_000,
+    });
+    expect(mined).toMatchObject({ lifeCount: 2, lostTimeMs: 3_000 });
+  });
+
+  test('같은 패턴에 아는 시간과 모르는 시간이 섞이면 그 패턴의 합은 null 이다 — 부분 합이 아니다', () => {
+    const mined = mineFailurePatterns({
+      lives: [
+        { lifeId: 'known', struggled: '같은 지적', watch: '같은 관측', lostTimeMs: 5_000 },
+        { lifeId: 'unknown', struggled: '같은 지적', watch: '같은 관측' },
+        { lifeId: 'other', struggled: '다른 지적', lostTimeMs: 100 },
+      ],
+      signatures: [
+        { lifeId: 'known', stopReason: 'review-oscillating', oscillationSignature: 'sig' },
+        { lifeId: 'unknown', stopReason: 'review-oscillating', oscillationSignature: 'sig' },
+        { lifeId: 'other', stopReason: 'deliverable-unobserved' },
+      ],
+    });
+    expect(mined.patterns).toHaveLength(2);
+    // 빈도 내림차순 — 빈도 2 패턴이 먼저고, 그 합은 unknown(null)이다(5_000 이 아니다).
+    expect(mined.patterns[0]).toMatchObject({
+      pattern: '같은 지적 · 같은 관측 ⊕ review-oscillating · sig',
+      frequency: 2,
+      lifeCount: 2,
+      lostTimeMs: null,
+    });
+    // 아는 시간만 남은 패턴의 합은 그대로다.
+    expect(mined.patterns[1]).toMatchObject({ frequency: 1, lifeCount: 1, lostTimeMs: 100 });
+    // 런 단위 합도 unknown 이 섞이면 null — 5_100 이 아니다.
+    expect(mined.lostTimeMs).toBeNull();
+    expect(mined.lifeCount).toBe(3);
+  });
+
+  test('종단 전용 — 재실행 회차엔 안 나오고 판정 라우팅 뒤 종단에서 한 번만 나온다(실물 1회)', async () => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const debugEvents: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event) => { debugEvents.push(event); });
+    const stuck = {
+      taskId: 'stuck', feature: 'stuck', status: 'failed' as const, stage: 'error', durationMs: 4_000,
+      error: { code: 'SELF_IMPL_FAILED', message: "error: cannot lock ref 'refs/remotes/origin/main': is at abc123" },
+    } as never;
+    const decisions: Array<{ action: string; stopReason?: string }> = [];
+    let reruns = 0;
+    try {
+      const out = await superviseRun({
+        initial: [stuck],
+        limits: { maxRounds: 9, stallRounds: 1 },
+        sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+        observe: (event, data) => { events.push({ event, data }); },
+        onDecision: (decision) => { decisions.push({ action: decision.action, stopReason: decision.stopReason }); },
+        taskAgentShadow: false,
+        rerun: async (previous) => { reruns++; return previous; },
+      });
+      expect(reruns).toBe(1);
+      expect(decisions).toEqual([
+        { action: 'relaunch', stopReason: undefined },
+        { action: 'stop', stopReason: 'no-progress' },
+      ]);
+      // 판정은 채굴 없는 순수 판정 replay 와 같은 결론이다 — 채굴이 판정을 바꾸지 않았다.
+      expect(decideNextRun({ results: [stuck], history: appendRound([], [stuck]), limits: { maxRounds: 9, stallRounds: 1 } }))
+        .toMatchObject({ action: 'stop', stopReason: 'no-progress' });
+      // 종단 전용 — 정확히 한 번, 종단 회차에서만.
+      const mineEvents = events.filter(({ event }) => event === 'pattern-mine');
+      expect(mineEvents).toHaveLength(1);
+      expect(mineEvents[0]!.data).toMatchObject({ stopReason: 'no-progress', lifeCount: 1, lostTimeMs: 8_000, frequency: 1 });
+      expect((mineEvents[0]!.data.patterns as Array<{ pattern: string }>)[0]!.pattern).toContain('PR 없이 실패');
+      expect((mineEvents[0]!.data.patterns as Array<{ pattern: string }>)[0]!.pattern).toContain('no-progress');
+      // 종단 판정 관측 뒤에 나온다.
+      const eventNames = events.map(({ event }) => event);
+      expect(eventNames.lastIndexOf('decision')).toBeLessThan(eventNames.indexOf('pattern-mine'));
+      // 판정 라우팅(routeSupervisorVerdict)이 채굴보다 먼저다.
+      expect(debugEvents.filter((event) => event === 'verdict-edge')).toHaveLength(1);
+      expect(debugEvents.lastIndexOf('verdict-edge')).toBeLessThan(debugEvents.indexOf('pattern-mine'));
+      // 라우팅된 판정(next)은 결과에 그대로 실린다 — 채굴이 판정을 바꾸지 않는다.
+      expect(out[0]?.next).toBe('scope-decompose');
+    } finally { log.mockRestore(); }
   });
 });

@@ -1,5 +1,6 @@
 import type { ThinkingHandle } from '../../thinking-line.js';
 import { debug, redactSecretText } from '../../debug/log.js';
+import { logTurnThrew } from '../turn-busy-teardown.js';
 import type { SubmitTurnIntent } from '../../input/input-intent.js';
 import type { InputSourceRef } from '../../input/input-source-kind.js';
 import { findRecentQuickPassSignal } from '../../input/turn-submit-revision.js';
@@ -88,7 +89,7 @@ export interface DashboardChatMainPlainTurnRuntimeDeps {
 
   attachChatStreamingKeys: (abortCtrl: AbortController) => () => void;
   /** ⭐ 관측 심 — 형제 `chat-main-entry-runtime` 과 «같은 형태»다(재발명 0 · `OBS-T124`). */
-  debugLog?: (category: string, event: string, payload: Record<string, unknown>) => void;
+  debugLog?: (category: string, event: string, payload: Record<string, unknown>, opts?: { level?: 'warn' }) => void;
   createOptionalSpecs: () => Promise<unknown[]>;
   createTurnStreamRuntime: (initialAssistantStart: number) => {
     onText(chunk: string, accumulated: string): void;
@@ -553,6 +554,8 @@ export async function runDashboardChatMainPlainTurn(
       message: redactSecretText(detail),
       stackHead: stackHead === undefined ? undefined : redactSecretText(stackHead),
     });
+    // TUI-STALE-BUSY-MARKER(#58) — 턴 본문 실패도 tui 범주 한 곳(`tui.turn turn-threw`)에서 보인다.
+    logTurnThrew(`turn:${stage}`, err, deps.debugLog);
     const firstLine = detail.split(/\r?\n/, 1)[0]?.trim() ?? '';
     finalError = detail === ''
       ? err?.message || String(err)

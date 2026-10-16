@@ -14,7 +14,7 @@ export interface RunDashboardChatMainEntryDeps {
   promptFrame: PromptFrame;
   getPromptFrame?: () => PromptFrame;
   inputCols: number;
-  getInputCols?: () => number;
+  getInputCols: () => number;
   surfaceRegistry: SurfaceRegistry;
   invalidateRenderCacheRow: (row0: number) => void;
   buildPromptFrameDividerRows: (promptFrame: PromptFrame, divider: string) => Array<{ row: number; text: string }>;

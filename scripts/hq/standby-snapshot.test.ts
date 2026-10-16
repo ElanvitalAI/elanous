@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,6 +7,18 @@ import { spawnSync } from 'node:child_process';
 import { SMALL_LEDGER_BYTES, buildGeneration, isSecretPath, planSnapshot, snapshotItem, stripHostLocalConfig, survivalPaths } from './standby-snapshot';
 
 const roots: string[] = [];
+// GATE-PREEXISTING-ZERO — fixtures and read-backs go through bun:sqlite (in-process); only the product's own
+//   `sqlite3 VACUUM INTO` stays a real spawn. On a loaded gate Pod each sqlite3 spawn took ~2s, so a fixture of three
+//   spawns plus the snapshot ran past bun's 5s default (0.2.30 HARD #3). Tests that spawn get an explicit cap.
+const SPAWN_TEST_TIMEOUT_MS = 60_000;
+function sqlExec(path: string, sql: string): void {
+  const db = new Database(path, { create: true });
+  try { db.exec(sql); } finally { db.close(); }
+}
+function sqlRows(path: string, sql: string): string[] {
+  const db = new Database(path, { readonly: true });
+  try { return db.query(sql).values().map(row => String(row[0])); } finally { db.close(); }
+}
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
 
 function fixture(): string {
@@ -14,7 +27,7 @@ function fixture(): string {
   const write = (rel: string, body: string | Buffer) => { mkdirSync(join(root, rel, '..'), { recursive: true }); writeFileSync(join(root, rel), body); };
   const db = (rel: string) => {
     mkdirSync(join(root, rel, '..'), { recursive: true });
-    spawnSync('sqlite3', [join(root, rel), 'CREATE TABLE t(x); INSERT INTO t VALUES (1),(2),(3);']);
+    sqlExec(join(root, rel), 'CREATE TABLE t(x); INSERT INTO t VALUES (1),(2),(3);');
   };
   db('schedules.db');
   db('tasks/tasks.db');
@@ -60,8 +73,7 @@ test('a generation has a consistent SQLite copy, a sha256 per file, and a surviv
   expect(manifest.generation).toBe('20261004T000000Z');
   // The manifest names the host that took the snapshot (the round-trip check reads it) — not a fixed «mbp».
   expect(manifest.host).toBe(hostname().replace(/\.local$/, ''));
-  const rows = spawnSync('sqlite3', [join(out, 'schedules.db'), 'SELECT count(*) FROM t;'], { encoding: 'utf8' }).stdout.trim();
-  expect(rows).toBe('3');
+  expect(sqlRows(join(out, 'schedules.db'), 'SELECT count(*) FROM t;')).toEqual(['3']);
   const sums = readFileSync(join(out, 'SHA256SUMS'), 'utf8');
   expect(sums.split('\n').filter(Boolean)).toHaveLength(manifest.entries.length);
   const check = spawnSync('shasum', ['-a', '256', '-c', 'SHA256SUMS'], { cwd: out, encoding: 'utf8' });
@@ -71,7 +83,7 @@ test('a generation has a consistent SQLite copy, a sha256 per file, and a surviv
   expect(survival).toContain('schedules.db');
   expect(survival).not.toContain('config.json');
   expect(survival.some(isSecretPath)).toBe(false);
-});
+}, SPAWN_TEST_TIMEOUT_MS);
 
 test('the copied config.json drops the host-local hq block (OP 12:02) and keeps everything else; the checksum matches the copy', () => {
   const root = fixture();
@@ -87,7 +99,7 @@ test('the copied config.json drops the host-local hq block (OP 12:02) and keeps 
   expect(spawnSync('shasum', ['-a', '256', '-c', 'SHA256SUMS'], { cwd: out, encoding: 'utf8' }).stdout).toContain('config.json: OK');
   // the source is untouched
   expect(JSON.parse(readFileSync(join(root, 'config.json'), 'utf8')).hq).toEqual({ hostName: 'mbp', arbiter: 'cloud-vm' });
-});
+}, SPAWN_TEST_TIMEOUT_MS);
 
 test('stripHostLocalConfig leaves a config without hq, and unparsable text, byte-identical', () => {
   expect(stripHostLocalConfig('{"a":1}')).toBe('{"a":1}');
@@ -100,11 +112,11 @@ test('sqlite snapshot uses one consistent copy and replaces a stale destination 
   roots.push(root);
   const out = join(root, 'out');
   mkdirSync(join(root, 'logs'), { recursive: true });
-  spawnSync('sqlite3', [join(root, 'logs/logs.db'), 'PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (1),(2),(3);']);
+  sqlExec(join(root, 'logs/logs.db'), 'PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (1),(2),(3);');
   // A destination left by an earlier generation must not make VACUUM INTO fail ("output file already exists").
   mkdirSync(join(out, 'logs'), { recursive: true });
   writeFileSync(join(out, 'logs/logs.db'), 'stale');
   snapshotItem(root, out, { rel: 'logs/logs.db', kind: 'sqlite' } as Parameters<typeof snapshotItem>[2]);
-  const rows = spawnSync('sqlite3', [join(out, 'logs/logs.db'), 'SELECT count(*) FROM t; PRAGMA integrity_check;'], { encoding: 'utf8' }).stdout.trim().split('\n');
-  expect(rows).toEqual(['3', 'ok']);
-});
+  expect(sqlRows(join(out, 'logs/logs.db'), 'SELECT count(*) FROM t;')).toEqual(['3']);
+  expect(sqlRows(join(out, 'logs/logs.db'), 'PRAGMA integrity_check;')).toEqual(['ok']);
+}, SPAWN_TEST_TIMEOUT_MS);

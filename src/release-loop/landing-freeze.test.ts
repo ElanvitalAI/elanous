@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { prodInstanceRoot } from '../instance/resolve.js';
 import { Command } from 'commander';
 import { registerFreezeCommands } from '../cli/freeze-cli.js';
-import { awaitLandingMergesDrained, beginLandingMerge, disableLandingFreeze, enableLandingFreeze, inFlightLandingMerges, landingFreezePath, readLandingFreeze } from './landing-freeze.js';
+import { awaitLandingMergesDrained, beginLandingMerge, disableLandingFreeze, enableLandingFreeze, inFlightLandingMerges, landingFreezePath, landingFreezeState, readLandingFreeze } from './landing-freeze.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 
 const at = new Date('2026-10-04T06:00:00Z');
@@ -23,6 +23,25 @@ test('landing-freeze.json records reason, start, end and actor; expires automati
     disableLandingFreeze(root);
     expect(readLandingFreeze(root)).toBeNull();
     expect(() => enableLandingFreeze({ until: '2026-10-04T05:00:00Z' }, root, at)).toThrow('--until must be a future ISO timestamp with timezone');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('L1 freeze state follows the producer across enable, expiry, and disable', () => {
+  const root = mkdtempSync(join(tmpdir(), 'landing-freeze-state-'));
+  try {
+    expect(landingFreezeState(readLandingFreeze(root, at))).toBe('off');
+    enableLandingFreeze({ until: '2026-10-04T07:00:00Z', holdLaunches: true }, root, at);
+    expect(readLandingFreeze(root, new Date('2026-10-04T06:59:59Z'))?.holdLaunches).toBe(true);
+    expect(landingFreezeState(readLandingFreeze(root, new Date('2026-10-04T06:59:59Z')))).toBe('on');
+    expect(landingFreezeState(readLandingFreeze(root, new Date('2026-10-04T07:00:00Z')))).toBe('off');
+    expect(existsSync(landingFreezePath(root))).toBe(true);
+    enableLandingFreeze({ holdLaunches: false }, root, at);
+    expect(readLandingFreeze(root, at)?.holdLaunches).toBe(false);
+    expect(landingFreezeState(readLandingFreeze(root, at))).toBe('on');
+    disableLandingFreeze(root);
+    expect(landingFreezeState(readLandingFreeze(root, at))).toBe('off');
+    writeFileSync(landingFreezePath(root), '{}');
+    expect(() => readLandingFreeze(root, at)).toThrow('invalid landing freeze');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

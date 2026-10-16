@@ -31,6 +31,17 @@ function fixture(title: string) {
 }
 
 describe('TA postland cell and card closure', () => {
+  test('goal-only merged PR cannot make the TA card or release cell green', () => {
+    const f = fixture('판정 신호: 조건=focused; 관측=bun test feature.test.ts; 기대=0 fail');
+    try {
+      const result = closeMergedTaskCard({ ...pr, files: [{ path: 'docs/goals/GOAL-feature.md' }] }, f.dir,
+        { ...f.deps, judge: () => { throw new Error('goal-only must not reach judge'); } });
+      expect(result).toBeNull();
+      expect(f.writes).toHaveLength(0);
+      expect(f.item.status).toBe('yellow');
+      expect(f.read().status).toBe('launched');
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
   test('green only on a passed explicit judge signal; repeat merge is idempotent', () => {
     const f = fixture('판정 신호: 조건=focused; 관측=bun test feature.test.ts; 기대=0 fail');
     try {
@@ -110,13 +121,12 @@ describe('TA postland cell and card closure', () => {
     } finally { rmSync(f.dir, { recursive: true, force: true }); }
   });
 
-  test('missing changed paths still closes on exact binding and measured judgment', () => {
+  test('measured empty changed paths do not close an exact-bound card', () => {
     const f = fixture('판정 신호: 조건=x; 관측=bun test x.test.ts; 기대=0 fail');
     try {
-      expect(closeMergedTaskCard({ ...pr, files: [] }, f.dir, { ...f.deps, judge: () => 'proposed' })).toBe('CELL');
-      expect(f.item.status).toBe('green');
-      expect(f.item.evidence).toContain('경로 목록 미제공');
-      expect(f.read().status).toBe('done');
+      expect(closeMergedTaskCard({ ...pr, files: [] }, f.dir, { ...f.deps, judge: () => 'proposed' })).toBeNull();
+      expect(f.item.status).toBe('yellow');
+      expect(f.read().status).toBe('launched');
     } finally { rmSync(f.dir, { recursive: true, force: true }); }
   });
 

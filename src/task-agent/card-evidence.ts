@@ -76,7 +76,27 @@ export function podChildRunIds(host: readonly RunLedgerEntry[] | null, runId?: s
     && RUN_ID.test(entry.data.childRunId) && entry.data.childRunId !== runId).map((entry) => entry.data.childRunId as string))];
 }
 
-/** 순수 — 카드 런의 골 id · PR. PR 은 호스트 → 자식(나중 자식 먼저) → job-finished 순으로 처음 찾은 것. */
+/**
+ * TA-BIND-PR-TERMINAL — 부모(호스트) 원장의 `pr-terminal{childRunId, prNumber, prUrl}`(draft-residue `applyPodTerminal`).
+ * gate-failed draft 자식은 `pr-opened` 없이 `rework-blocked-draft-pr`·`pr.comment.mode` 만 남겨서, PR 근거는 부모의 이 줄뿐이다.
+ * 자식은 부모의 `pod-child-run` 자식이어야 하고, url 은 같은 번호의 PR 주소여야 한다. 나중 줄이 먼저다.
+ */
+export function podTerminalPr(host: readonly RunLedgerEntry[] | null, childRunIds: readonly string[]): { number: number; url: string; childRunId: string } | undefined {
+  const children = new Set(childRunIds);
+  for (let at = (host?.length ?? 0) - 1; at >= 0; at--) {
+    const entry = host![at]!;
+    if (entry.event !== 'pr-terminal') continue;
+    const childRunId = entry.data?.childRunId;
+    const number = entry.data?.prNumber;
+    const url = entry.data?.prUrl;
+    if (typeof childRunId !== 'string' || !children.has(childRunId) || !Number.isSafeInteger(number) || (number as number) <= 0
+      || typeof url !== 'string' || PR_URL.exec(url)?.[1] !== String(number)) continue;
+    return { number: number as number, url, childRunId };
+  }
+  return undefined;
+}
+
+/** 순수 — 카드 런의 골 id · PR. PR 은 호스트 → 자식(나중 자식 먼저) → 호스트 `pr-terminal` → job-finished 순으로 처음 찾은 것. */
 export function bindCardEvidence(card: Pick<TaskCard, 'runId'>, snapshot: CardRunSnapshot): CardRunEvidence {
   if (!card.runId || !snapshot.host) return { ledgerFound: false };
   const children = podChildRunIds(snapshot.host, card.runId).reverse();
@@ -87,6 +107,10 @@ export function bindCardEvidence(card: Pick<TaskCard, 'runId'>, snapshot: CardRu
     if (pr) break;
     const found = entries ? lastPr(entries) : undefined;
     if (found) { pr = found; childRunId = id; }
+  }
+  if (!pr) {
+    const terminal = podTerminalPr(snapshot.host, children);
+    if (terminal) { pr = { number: terminal.number, url: terminal.url }; childRunId = terminal.childRunId; }
   }
   for (const id of children) {
     if (pr) break;

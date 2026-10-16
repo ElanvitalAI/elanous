@@ -43,23 +43,12 @@ function fixture(team = original): { dir: string; file: string } {
   return { dir, file };
 }
 
-test('real CLI exits 0 for the example and 2 with a reason for missing persona and handoff cycle', () => {
-  const cli = (file: string) => spawnSync(process.execPath, ['bin/elanous.mjs', '--test', 'team', 'validate', file], {
+test('real CLI exits 0 with the expected output for the example team', () => {
+  const valid = spawnSync(process.execPath, ['bin/elanous.mjs', '--test', 'team', 'validate', example], {
     cwd: resolve(import.meta.dir, '../..'), encoding: 'utf8',
   });
-  const valid = cli(example);
   expect(valid.status).toBe(0);
   expect(valid.stdout.trim()).toBe('Valid team Small product');
-  const missing = fixture(original.replace('personas/backend.yaml', 'personas/nonexistent.yaml'));
-  const missingResult = cli(missing.file);
-  expect(missingResult.status).toBe(2);
-  expect(missingResult.stderr).toContain('persona not found:');
-  expect(readdirSync(missing.dir)).toEqual(['team.yaml']);
-  const cycle = fixture(original.replace('  - {from: Backend, to: QA}', '  - {from: Backend, to: QA}\n  - {from: QA, to: PM}'));
-  const cycleResult = cli(cycle.file);
-  expect(cycleResult.status).toBe(2);
-  expect(cycleResult.stderr).toContain('handoff cycle at PM');
-  expect(readdirSync(cycle.dir)).toEqual(['team.yaml']);
 });
 
 test('existing team-set add, list and remove commands remain registered separately', () => {

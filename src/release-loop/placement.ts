@@ -6,7 +6,7 @@ import { resolveRepositoryName } from '../harness/repository-name.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { userConfigPath } from '../user-config.js';
-import { addItem, checklistHistory, listChecklist, ownerMatches, parseOwner, setItem, validateCeoLoad, type ChecklistItem } from './checklist.js';
+import { addItem, checklistHistory, inspectChecklistTargetPaths, listChecklist, ownerMatches, parseOwner, setItem, validateCeoLoad, type ChecklistItem } from './checklist.js';
 import { assignedVersions, move, releasedVersion } from './feature-store.js';
 import { debug } from '../debug/log.js';
 import { kstDay, listSchedules, type ReleaseSchedule } from './release-schedule.js';
@@ -109,6 +109,12 @@ function validCeoCap(cap: number): number {
 }
 
 export function placementCeoDailyCap(): number { return validCeoCap(placementConfig().ceoDailyCap ?? 30); }
+
+/** One configuration snapshot for the read-only pull-forward caller. */
+export function pullForwardPlacementConfig(): { seatCap: Record<string, number>; ceoDailyCap: number; ceoCalendar: CeoCalendar } {
+  const config = placementConfig();
+  return { seatCap: config.seatCap ?? {}, ceoDailyCap: validCeoCap(config.ceoDailyCap ?? 30), ceoCalendar: config.ceoCalendar ?? {} };
+}
 
 function validDay(day: string): boolean {
   return typeof day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(day) && Number.isFinite(Date.parse(`${day}T00:00:00Z`))
@@ -403,6 +409,91 @@ export function rebalance(version: string, deps: PlacementDeps = {}): RebalanceR
     snapshots.get(next!.version)!.push(item);
   }
   if (!deps.dryRun) for (const decision of result.decisions) move(decision.id, version, decision.version, deps.by ?? 'OP', undefined, undefined, decision.reason);
+  return result;
+}
+
+export interface PullForwardDeps {
+  now: Date;
+  schedules: readonly ReleaseSchedule[];
+  checklists: ReadonlyMap<string, readonly ChecklistItem[]>;
+  released: string;
+  merged24h: number;
+  seatCap: Record<string, number>;
+  ceoDailyCap: number;
+  ceoCalendar: CeoCalendar;
+  signal: { order?: readonly string[]; hold?: readonly string[] };
+  targetPathExists: (path: string) => boolean;
+  backlog?: readonly string[];
+}
+
+/** Read-only plan: every operational input is supplied by the caller. */
+export function planPullForward(deps: PullForwardDeps): RebalanceResult {
+  if (typeof deps.targetPathExists !== 'function') throw new CliUserError('대상 저장소 경로 판정기가 필요하다');
+  const rows = [...deps.schedules].sort((a, b) => versionOrder(a.version, b.version));
+  const now = deps.now.getTime();
+  const backlog = deps.backlog ?? BACKLOG_VERSIONS;
+  const released = deps.released;
+  const open = rows.filter((row) => (!released || versionOrder(row.version, released) > 0) && available(row, now, backlog));
+  const target = open[0];
+  if (!target) throw new CliUserError('당겨올 판이 없다 — 착지 마감이 안 지난 판이 필요하다');
+  const result: RebalanceResult = { decisions: [], blocked: [] };
+  const source = rows.find((row) => versionOrder(row.version, target.version) > 0 && !backlog.includes(row.version));
+  if (!source || !available(source, now, backlog)) return result;
+  const sources = [...new Set([...rows.map((row) => row.version), ...deps.checklists.keys(), ...backlog])];
+  const snapshots = new Map(sources.map((version) => [version, [...(deps.checklists.get(version) ?? [])]]));
+  const remainingP0 = snapshots.get(target.version)!.filter((item) => item.priority === 'P0' && item.status !== 'green' && item.status !== 'done').length;
+  const hold = new Set(deps.signal?.hold ?? []);
+  const rank = new Map<string, number>();
+  for (const [index, id] of (deps.signal?.order ?? []).entries()) if (!rank.has(id)) rank.set(id, index);
+  // Untyped legacy cells are fail-closed on human-action words in either language. These
+  // conservative markers may exclude code about approvals, but must never move a manual gate.
+  const human = /\uD83D\uDC51|실기기|실기 |사람|대표|손|라이브 1회|녹화|세미나|수동|승인|검토|결정|HITL|manual|human|approval|sign.off|review|operator|ceo/i;
+  const complete = new Set<string>();
+  const incomplete = new Set<string>();
+  for (const items of snapshots.values()) for (const item of items) {
+    if (item.status === 'green' || item.status === 'done') complete.add(item.id);
+    else incomplete.add(item.id);
+  }
+  const targetPathsReady = (title: string): boolean => {
+    const check = inspectChecklistTargetPaths({ title }, { existsAtMain: deps.targetPathExists });
+    return check.targets.length > 0 && check.warnings.length === 0;
+  };
+  const candidates = snapshots.get(source.version)!.filter((item) =>
+    (item.priority === 'P0' || item.priority === 'P1') && item.status !== 'green' && item.status !== 'done'
+    && !hold.has(item.id) && !human.test(item.title) && (!item.dispatchKind || item.dispatchKind === 'code')
+    && (item.ceoMinutes === undefined || item.ceoMinutes === 0)
+    && targetPathsReady(item.title)
+    && (item.predecessors ?? []).every((id) => complete.has(id) && !incomplete.has(id)))
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => (rank.get(a.item.id) ?? Infinity) - (rank.get(b.item.id) ?? Infinity)
+      || (a.item.priority === 'P0' ? 0 : 1) - (b.item.priority === 'P0' ? 0 : 1) || a.index - b.index);
+  if (!candidates.length) return result;
+  if (Date.parse(target.landBy ?? target.cutAt) - now < 4 * 60 * 60 * 1000) {
+    for (const { item } of candidates)
+      result.blocked.push({ id: item.id, from: source.version, to: target.version, reason: `지금 판 ${target.version} 착지 마감까지 4시간 미만 — 당겨오기 보류` });
+    return result;
+  }
+  if (remainingP0 > 3) {
+    for (const { item } of candidates)
+      result.blocked.push({ id: item.id, from: source.version, to: target.version, reason: `지금 판 ${target.version} 남은 P0 ${remainingP0} > 3 — 당겨오기 보류` });
+    return result;
+  }
+  const rate = deps.merged24h;
+  if (!Number.isInteger(rate) || rate < 0) throw new CliUserError('24시간 병합 PR 수가 잘못됐다');
+  const caps = deps.seatCap;
+  const ceoCap = validCeoCap(deps.ceoDailyCap);
+  const calendar = deps.ceoCalendar;
+  for (const { item } of candidates) {
+    if (result.decisions.length >= 5) break;
+    const from = source.version;
+    // The pull-forward contract uses the schedule's cutAt only when landBy is absent.
+    const destination = { ...target, landBy: target.landBy ?? target.cutAt };
+    const violation = moveConstraint(item, destination, backlog, snapshots, now, rate, caps, rows, ceoCap, calendar, released);
+    if (violation) { result.blocked.push({ id: item.id, from, to: target.version, reason: violation }); continue; }
+    result.decisions.push({ id: item.id, from, version: target.version, reason: `다음 판 ${from} → 지금 판 ${target.version} 당겨오기 · 남은 P0 ${remainingP0} ≤ 3 · 착지 마감 ≥ 4h`, displaced: [] });
+    snapshots.set(from, snapshots.get(from)!.filter((cell) => cell.id !== item.id));
+    snapshots.get(target.version)!.push(item);
+  }
   return result;
 }
 

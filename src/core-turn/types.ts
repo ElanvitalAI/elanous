@@ -155,6 +155,9 @@ export interface CoreTurnContext {
    *  named tools (e.g. the PtyShell family driving a headless coding
    *  agent) are actually being dispatched. Absent ⇒ no extension. */
   budgetGrant?: LLMOpts['budgetGrant'];
+  /** TUI-GOAL-LOOP-FRICTION — 종결 신호 도구 이름. `streamLLMWithTools` 의 `terminalToolNames` 로 그대로 간다
+   *  (예산 거부 면제 · 신호뿐인 턴 ⊕ 답 = 마감). goal loop 가 `update_goal` 을 넣는다. */
+  terminalToolNames?: LLMOpts['terminalToolNames'];
   /** Optional model override (forwarded to `streamLLMWithTools`). */
   modelOverride?: string;
 }

@@ -1218,7 +1218,7 @@ test('index wires tasks instead of the retirement stub, and scheduler stays reti
   registerTasksCommands(program);
   const command = program.commands.find((entry) => entry.name() === 'tasks');
   expect(command?.aliases()).toContain('task');
-  expect(command?.commands.map((entry) => entry.name())).toEqual(['green-sweep', 'cover', 'list', 'hand', 'hand-move', 'live-verified', 'close', 'parents', 'adopt-pr', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'repair-run', 'approve']);
+  expect(command?.commands.map((entry) => entry.name())).toEqual(['green-sweep', 'cover', 'list', 'hand', 'tag', 'hand-move', 'live-verified', 'close', 'parents', 'adopt-pr', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'repair-run', 'approve']);
 });
 
 test('tasks hand-move — 카드 history 에 손으로 쓴 한 줄을 남긴다 · 모르는 kind 는 원장을 건드리지 않는다', async () => {
@@ -1324,6 +1324,8 @@ function exitingSpawn(code: number | null, stderr = ''): { spawn: DetachedSpawn;
   return { spawn, stdio };
 }
 
+// ⛔ R7(2026-10-16): context 가 있으면 원격 부모 경로가 가짜 spawn 보다 먼저 돈다 — 시험은 `parentHost: null` 로 원격을 끈다
+// (비우면 운영 `taskAgent.parentHost` 로 진짜 ssh 발사가 나갔다 · 호스트 재게이트 실사고).
 const launchContext = (runId: string) => ({ runId, launchId: 'tl-test', env: { ELANOUS_RUN_ID: runId } });
 
 test('STOP-RECORD launch-failed: a child that exits nonzero right after launch writes exactly one stop line and throws', async () => {
@@ -1332,7 +1334,7 @@ test('STOP-RECORD launch-failed: a child that exits nonzero right after launch w
   const longTail = `error: unknown command 'tick.ts'\n${Array.from({ length: 40 }, (_, i) => `    at frame${i} (x.ts:${i})`).join('\n')}`;
   const { spawn, stdio } = exitingSpawn(2, longTail);
   await expect(defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-launchfail-0001'),
-    { spawn, stderrDir, earlyExitWindowMs: 1_000, writeStop: (entry) => { written.push(entry); } })).rejects.toThrow('rc=2');
+    { parentHost: null, spawn, stderrDir, earlyExitWindowMs: 1_000, writeStop: (entry) => { written.push(entry); } })).rejects.toThrow('rc=2');
   expect((stdio[0] as unknown[]).slice(0, 2)).toEqual(['ignore', 'ignore']);
   expect(written).toHaveLength(1);
   expect(written[0]).toMatchObject({ runId: 'run-launchfail-0001', event: 'stop', data: {
@@ -1345,10 +1347,10 @@ test('STOP-RECORD launch-failed: a child still running after the window (or exit
   const stderrDir = mkdtempSync(join(tmpdir(), 'tasks-cli-launch-'));
   const written: RunLedgerEntry[] = [];
   const alive = await defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-launchok-0001'),
-    { spawn: exitingSpawn(null).spawn, stderrDir, earlyExitWindowMs: 50, writeStop: (entry) => { written.push(entry); } });
+    { parentHost: null, spawn: exitingSpawn(null).spawn, stderrDir, earlyExitWindowMs: 50, writeStop: (entry) => { written.push(entry); } });
   expect(alive).toEqual({ runId: 'run-launchok-0001' });
   const clean = await defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-launchok-0002'),
-    { spawn: exitingSpawn(0).spawn, stderrDir, earlyExitWindowMs: 1_000, writeStop: (entry) => { written.push(entry); } });
+    { parentHost: null, spawn: exitingSpawn(0).spawn, stderrDir, earlyExitWindowMs: 1_000, writeStop: (entry) => { written.push(entry); } });
   expect(clean).toEqual({ runId: 'run-launchok-0002' });
   expect(written).toHaveLength(0);
 });
@@ -1356,7 +1358,7 @@ test('STOP-RECORD launch-failed: a child still running after the window (or exit
 test('STOP-RECORD launch-failed: no stderr still records rc only', async () => {
   const written: RunLedgerEntry[] = [];
   await expect(defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-launchfail-0002'),
-    { spawn: exitingSpawn(7).spawn, stderrDir: mkdtempSync(join(tmpdir(), 'tasks-cli-launch-')), earlyExitWindowMs: 1_000, writeStop: (entry) => { written.push(entry); } })).rejects.toThrow();
+    { parentHost: null, spawn: exitingSpawn(7).spawn, stderrDir: mkdtempSync(join(tmpdir(), 'tasks-cli-launch-')), earlyExitWindowMs: 1_000, writeStop: (entry) => { written.push(entry); } })).rejects.toThrow();
   expect(written.map((entry) => entry.data.cause)).toEqual(['child rc=7']);
 });
 
@@ -1365,10 +1367,10 @@ test('STOP-RECORD launch-failed: a rerun truncates the old stderr and an existin
   writeFileSync(join(stderrDir, 'run-launchfail-0003.stderr'), 'stale error from the previous attempt\n');
   const written: RunLedgerEntry[] = [];
   await expect(defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-launchfail-0003'),
-    { spawn: exitingSpawn(3, 'fresh error\n').spawn, stderrDir, earlyExitWindowMs: 1_000, hasStop: () => false, writeStop: (entry) => { written.push(entry); } })).rejects.toThrow('fresh error');
+    { parentHost: null, spawn: exitingSpawn(3, 'fresh error\n').spawn, stderrDir, earlyExitWindowMs: 1_000, hasStop: () => false, writeStop: (entry) => { written.push(entry); } })).rejects.toThrow('fresh error');
   expect(written.map((entry) => entry.data.cause)).toEqual(['child rc=3: fresh error']);
   await expect(defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-launchfail-0004'),
-    { spawn: exitingSpawn(3, 'boom\n').spawn, stderrDir, earlyExitWindowMs: 1_000, hasStop: () => true, writeStop: (entry) => { written.push(entry); } })).rejects.toThrow('rc=3');
+    { parentHost: null, spawn: exitingSpawn(3, 'boom\n').spawn, stderrDir, earlyExitWindowMs: 1_000, hasStop: () => true, writeStop: (entry) => { written.push(entry); } })).rejects.toThrow('rc=3');
   expect(written).toHaveLength(1);
 });
 
@@ -1379,7 +1381,7 @@ test('STOP-RECORD launch-failed: through task hand --live the card is launch-fai
   const result = await run(['task', 'hand', 'ship it', '--live'], {
     taskStatePath, registerSink: async () => true,
     taskLauncher: (args, cwd, context) => defaultTaskLauncher(args, cwd, context,
-      { spawn: exitingSpawn(2, 'error: bad argv\n').spawn, stderrDir, earlyExitWindowMs: 1_000, hasStop: () => false, writeStop: (entry) => { written.push(entry); } }),
+      { parentHost: null, spawn: exitingSpawn(2, 'error: bad argv\n').spawn, stderrDir, earlyExitWindowMs: 1_000, hasStop: () => false, writeStop: (entry) => { written.push(entry); } }),
   });
   expect(result.code).toBe(1);
   const cards = Object.values(JSON.parse(readFileSync(taskStatePath, 'utf8')).tasks) as Array<{ status: string; history: Array<{ event: string; detail?: string }> }>;

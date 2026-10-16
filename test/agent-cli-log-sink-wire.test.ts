@@ -68,9 +68,9 @@ describe('elanous agent action wires the log sink initializer', () => {
   const HERE = dirname(fileURLToPath(import.meta.url));
   const SOURCE = readFileSync(resolve(HERE, '..', 'src', 'cli', 'agent-cli.ts'), 'utf8');
 
-  test('the `agent <text...>` action calls initializeAgentCliLogSink before runChatTurnCli', () => {
+  test('the `agent` action calls initializeAgentCliLogSink before runChatTurnCli', () => {
     const agentAction = SOURCE.match(
-      /\.command\('agent <text\.\.\.>'\)[\s\S]*?\.action\(async \(parts[\s\S]*?await runChatTurnCli\(/,
+      /\.command\('agent'\)[\s\S]*?\.argument\('\[text\.\.\.\]'\)[\s\S]*?\.action\(async \(rawParts[\s\S]*?await runChatTurnCli\(/,
     )?.[0];
     expect(agentAction).toBeDefined();
     expect(agentAction).toContain('initializeAgentCliLogSink()');

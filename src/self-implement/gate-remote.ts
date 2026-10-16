@@ -7,6 +7,7 @@ import { existsSync, lstatSync, realpathSync } from 'node:fs';
 import { loadavg } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { debug } from '../debug/log.js';
+import { gateHostReservationRoot, inspectReleaseGateHost } from '../release-loop/gate-host-reservation.js';
 import type { GateRemoteConfig } from '../user-config.js';
 
 export type GateRemoteTool = 'self-gate' | 'ci-typecheck-changed' | 'public-export-test-run';
@@ -16,14 +17,15 @@ export interface GateRemoteSettings {
   host: string;
   loadThreshold: number;
   hostCap: number;
+  hostCaps?: Record<string, number>;
   mirror: string;
   slotWaitSeconds: number;
 }
 
-export const MAX_HOST_CAP = 2;
+export const MAX_HOST_CAP = 8;
 
 export const GATE_REMOTE_DEFAULTS: GateRemoteSettings = {
-  enabled: true, host: 'node-b', loadThreshold: 20, hostCap: 2, mirror: '~/mirror/elanous-agent.git', slotWaitSeconds: 600,
+  enabled: true, host: 'node-b', loadThreshold: 20, hostCap: 2, hostCaps: {}, mirror: '~/mirror/elanous-agent.git', slotWaitSeconds: 600,
 };
 
 const hostPattern = /^(?:[\w.-]+@)?[\w.-]+$/;
@@ -43,11 +45,21 @@ export function resolveGateRemoteSettings(config: GateRemoteConfig | undefined, 
     enabled: config?.enabled ?? envEnabled ?? GATE_REMOTE_DEFAULTS.enabled,
     host: isValidGateHost(host) ? host : GATE_REMOTE_DEFAULTS.host,
     loadThreshold: config?.loadThreshold ?? envLoad ?? GATE_REMOTE_DEFAULTS.loadThreshold,
-    // The cell's ceiling is 2 per host (GATE-REMOTE acceptance); config may only lower it.
-    hostCap: Math.min(MAX_HOST_CAP, Math.max(1, Math.floor(config?.hostCap ?? GATE_REMOTE_DEFAULTS.hostCap))),
+    hostCap: Math.min(GATE_REMOTE_DEFAULTS.hostCap, Math.max(1, Math.floor(config?.hostCap ?? GATE_REMOTE_DEFAULTS.hostCap))),
+    hostCaps: Object.fromEntries(Object.entries(config?.hostCaps ?? {}).filter(([key, value]) =>
+      isValidGateHost(key) && Number.isSafeInteger(value) && value >= 1 && value <= MAX_HOST_CAP)),
     mirror: mirrorPattern.test(mirror) && !mirror.split('/').includes('..') ? mirror : GATE_REMOTE_DEFAULTS.mirror,
     slotWaitSeconds: config?.slotWaitSeconds ?? GATE_REMOTE_DEFAULTS.slotWaitSeconds,
   };
+}
+
+/** Explicit and rerouted hosts use their own slot budget; absent entries retain the default cap. */
+export function gateRemoteHostCap(settings: GateRemoteSettings, host: string): number {
+  const caps = settings.hostCaps;
+  const bareHost = host.split('@').at(-1)!;
+  const configured = caps && Object.hasOwn(caps, host) ? caps[host]
+    : caps && Object.hasOwn(caps, bareHost) ? caps[bareHost] : undefined;
+  return Math.min(MAX_HOST_CAP, Math.max(1, Math.floor(configured ?? settings.hostCap)));
 }
 
 /** The token after a bare `--remote` is its host when it is a valid ssh destination that is not an existing path and does
@@ -105,15 +117,19 @@ export type SlotLockTool = 'flock' | 'lockf';
 const SLOT_LOCK = { flock: 'flock -n', lockf: 'lockf -k -s -t 0' } as const;
 
 /** `tools` is the preference order (default: Linux flock, then BSD/macOS lockf); a test can pin one path. */
-export function hostSlotScript(cap: number, dir = SLOT_DIR, tools: readonly SlotLockTool[] = ['flock', 'lockf']): string[] {
+function hostSlotScriptWithSlot(cap: number, dir: string, tools: readonly SlotLockTool[], passSlot: boolean): string[] {
   const n = Math.min(MAX_HOST_CAP, Math.max(1, Math.floor(cap)));
   const pick = tools.map((tool, i) => `${i ? 'elif' : 'if'} command -v ${tool} >/dev/null 2>&1; then GL="${SLOT_LOCK[tool]}"; `).join('');
   return [
     `GS=${quote(dir)}; mkdir -p "$GS" || infra slots`,
     `${pick}else infra lock-tool; fi`,
-    `n=1; while [ $n -le ${n} ]; do $GL "$GS/slot$n" sh "$W/run.sh"; s=$?; [ -f "$W/started" ] && exit $s; n=$((n+1)); done`,
-    `echo "${BUSY}" >&2; exit 98`,
+    `n=1; while [ $n -le ${n} ]; do $GL "$GS/slot$n" ${passSlot ? 'env GATE_REMOTE_SLOT="$n" ' : ''}sh "$W/run.sh"; s=$?; [ -f "$W/started" ] && exit $s; n=$((n+1)); done`,
+    `echo "${BUSY}=$((n-1))" >&2; exit 98`,
   ];
+}
+
+export function hostSlotScript(cap: number, dir = SLOT_DIR, tools: readonly SlotLockTool[] = ['flock', 'lockf']): string[] {
+  return hostSlotScriptWithSlot(cap, dir, tools, false);
 }
 
 // ── remote execution ───────────────────────────────────────────────
@@ -149,7 +165,7 @@ export const PUSH_TIMEOUT_MS = 10 * 60_000;
 
 export type RemoteRunOutcome =
   | { kind: 'ran'; rc: number; stdout: Buffer; stderr: Buffer; commit: string; host: string; ms: number }
-  | { kind: 'busy' }
+  | { kind: 'busy'; occupied?: number }
   | { kind: 'infra'; reason: string };
 
 export interface RemoteRunOptions {
@@ -167,6 +183,8 @@ export interface RemoteRunOptions {
   /** Extra local refs whose commits must exist remotely (e.g. a --base ref). Resolved to shas. */
   refs?: string[];
   installPwa?: boolean;
+  /** An exclusive slot checkout path allows the opt-in TypeScript graph cache to survive scratch runs. */
+  stableCheckout?: boolean;
   timeoutMs?: number;
   /** Files the remote run needs from this machine (e.g. the private export redaction table): sent over ssh stdin, written
    *  mode 600 inside the scratch directory, exposed to the tool via `env`, removed with it. Never on argv. */
@@ -177,7 +195,7 @@ export interface PayloadFile { env: string; content: string }
 export type RemoteArgv = string[] | ((sha: (ref: string) => string) => string[]);
 
 /** Build the remote shell script (exported for tests). Every setup failure ends in an INFRA marker, the tool's rc in an RC marker. */
-export function remoteScript(input: { mirror: string; commit: string; fetchShas: string[]; mainSha?: string; argv: string[]; installPwa: boolean; payloadFiles?: PayloadFile[]; hostCap?: number; slotDir?: string }): string {
+export function remoteScript(input: { mirror: string; commit: string; fetchShas: string[]; mainSha?: string; argv: string[]; installPwa: boolean; stableCheckout?: boolean; payloadFiles?: PayloadFile[]; hostCap?: number; slotDir?: string }): string {
   const mirror = input.mirror.startsWith('~/') ? `"$HOME"/${quote(input.mirror.slice(2))}` : quote(input.mirror);
   const fetches = input.fetchShas.map((sha) => `refs/elanous/gate/${sha}:refs/elanous/gate/${sha}`).join(' ');
   const payloads = (input.payloadFiles ?? []).filter((file) => /^[A-Z_][A-Z0-9_]*$/.test(file.env));
@@ -193,8 +211,25 @@ export function remoteScript(input: { mirror: string; commit: string; fetchShas:
   const work = [
     `infra() { echo "${INFRA}$1" >&2; exit 97; }`,
     ': > "$W/started"',
-    `git clone -q --shared --no-checkout ${mirror} "$W/t" >"$W/setup.log" 2>&1 || infra clone`,
-    'cd "$W/t" || infra cd',
+    ...(input.stableCheckout ? [
+      'T="$HOME/.cache/elanous/gate-remote/slot$GATE_REMOTE_SLOT/checkout"',
+      'mkdir -p "$(dirname "$T")" || infra stable-dir',
+      'if [ -d "$T/.git" ]; then',
+      '  git -C "$T" reset --hard -q >>"$W/setup.log" 2>&1 || infra stable-reset',
+      '  git -C "$T" clean -ffd -q >>"$W/setup.log" 2>&1 || infra stable-clean',
+      `  git -C "$T" remote set-url origin ${mirror} >>"$W/setup.log" 2>&1 || infra stable-origin`,
+      'else',
+      '  rm -rf "$T" || infra stable-remove',
+      `  git clone -q --shared --no-checkout ${mirror} "$T" >"$W/setup.log" 2>&1 || infra clone`,
+      'fi',
+      'rm -rf "$T/apps/pwa/.next" || infra pwa-build-clean',
+      'rm -f "$T/apps/pwa/"*.tsbuildinfo || infra pwa-buildinfo-clean',
+      'ELANOUS_TSC_CACHE_DIR="$HOME/.cache/elanous/gate-remote/slot$GATE_REMOTE_SLOT/cache"; export ELANOUS_TSC_CACHE_DIR',
+    ] : [
+      'T="$W/t"',
+      `git clone -q --shared --no-checkout ${mirror} "$T" >"$W/setup.log" 2>&1 || infra clone`,
+    ]),
+    'cd "$T" || infra cd',
     `git fetch -q origin ${fetches} >>"$W/setup.log" 2>&1 || infra fetch`,
     `git checkout -q --detach ${input.commit} >>"$W/setup.log" 2>&1 || infra checkout`,
     ...(input.mainSha ? [`git update-ref refs/remotes/origin/main ${input.mainSha} || infra origin-main`] : []),
@@ -221,7 +256,7 @@ export function remoteScript(input: { mirror: string; commit: string; fetchShas:
     `cat > "$W/run.sh" <<'${RUN}' || infra run-script`,
     ...work,
     RUN,
-    ...hostSlotScript(input.hostCap ?? GATE_REMOTE_DEFAULTS.hostCap, input.slotDir),
+    ...hostSlotScriptWithSlot(input.hostCap ?? GATE_REMOTE_DEFAULTS.hostCap, input.slotDir ?? SLOT_DIR, ['flock', 'lockf'], !!input.stableCheckout),
     '}',
     '',
   ].join('\n');
@@ -277,7 +312,7 @@ export function runOnRemote(opts: RemoteRunOptions, runner: GateRemoteRunner = r
     env: { ...process.env, GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o ConnectTimeout=10', GIT_TERMINAL_PROMPT: '0' },
   });
   if (push.rc !== 0 || push.error) return { kind: 'infra', reason: `push-failed rc=${push.rc}: ${(push.stderr || push.error || '').trim().split('\n').slice(-2).join(' | ')}` };
-  const script = remoteScript({ mirror: opts.mirror, commit, fetchShas: shas, mainSha, argv, installPwa: opts.installPwa ?? false, payloadFiles: opts.payloadFiles, hostCap: opts.hostCap, slotDir: opts.slotDir });
+  const script = remoteScript({ mirror: opts.mirror, commit, fetchShas: shas, mainSha, argv, installPwa: opts.installPwa ?? false, stableCheckout: opts.stableCheckout, payloadFiles: opts.payloadFiles, hostCap: opts.hostCap, slotDir: opts.slotDir });
   const run = runner.ssh(opts.host, script, opts.timeoutMs ?? 120 * 60_000);
   // The script prints "\n<marker><rc>\n": everything before that leading newline is the tool's own stderr, byte for byte.
   const stdoutBytes = Buffer.from(run.stdout);
@@ -288,7 +323,10 @@ export function runOnRemote(opts: RemoteRunOptions, runner: GateRemoteRunner = r
   // run exits 0 after the rc marker, and its stderr belongs to the tool — never scanned for markers.
   if (!(run.rc === 0 && marker >= 0)) {
     const last = stderrText.trimEnd().split('\n').at(-1) ?? '';
-    if (run.rc === 98 && last === BUSY) return { kind: 'busy' };
+    if (run.rc === 98) {
+      const busy = /^__GATE_REMOTE_BUSY(?:=(\d+))?$/.exec(last);
+      if (busy) return { kind: 'busy', ...(busy[1] !== undefined ? { occupied: Number(busy[1]) } : {}) };
+    }
     if (run.rc === 97 && last.startsWith(INFRA)) return { kind: 'infra', reason: `remote-${last.slice(INFRA.length).trim()}` };
   }
   // No marker, or ssh did not end cleanly after it (the script always exits 0 once the marker is written): output may be cut.
@@ -371,10 +409,20 @@ export interface DispatchOptions {
   installPwa?: boolean;
   payloadFiles?: PayloadFile[];
   json?: boolean;
-  /** Set when this invocation cannot be reproduced remotely (e.g. self gate without --base): a remote decision becomes a
-   *  logged fallback with this reason instead of a silent local run. */
+  /** Set when this invocation cannot be reproduced remotely (e.g. self gate without --base): automatic placement
+   *  falls back with this reason; an explicit self gate --remote reports an unmeasured check instead. */
   localOnlyReason?: string;
+  /** Self gate CLI only: explicit --remote must never be measured by a local fallback. */
+  explicitRemoteOnly?: boolean;
+  /** Self gate CLI only: name the host for both automatic and explicit remote execution. */
+  reportRemoteHost?: boolean;
+  /** Self gate's state universe; omitted by other callers and injected tests. */
+  reservationRoot?: string;
   runLocal: () => number | Promise<number>;
+  /** Called once with the final remote outcome (never on a local decision), before its output passes through or the
+   *  local fallback runs — e.g. `self gate --artifact-dir` fetches (ran) or removes (infra) the host-side artifact dir.
+   *  A throw is logged and swallowed: the hook never changes the check's rc. */
+  onRemoteOutcome?: (outcome: RemoteRunOutcome, host: string, runner: GateRemoteRunner) => void;
 }
 
 export interface DispatchDeps {
@@ -394,21 +442,52 @@ async function loadSettings(): Promise<GateRemoteSettings> {
   } catch { return resolveGateRemoteSettings(undefined); }
 }
 
-/** Decide local/remote, run, and return the tool's exit code. Infra failure ⇒ local fallback (never a test result). */
+/** Decide local/remote, run, and return the tool's exit code. Automatic infra failure ⇒ visible local fallback. */
 export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDeps = {}): Promise<number> {
   const settings = deps.settings ?? await loadSettings();
   const env = deps.env ?? process.env;
   const write = deps.write ?? { out: (d: string | Uint8Array) => process.stdout.write(d), err: (d: string | Uint8Array) => process.stderr.write(d) };
   const decision = decideGateDispatch({ flags: opts.flags, settings, load1: deps.load1 ?? loadavg()[0]!, env });
   debug.log('gate.remote', 'decision', { tool: opts.tool, mode: decision.mode, host: decision.host, reason: decision.reason, load1: decision.load1 });
-  if (decision.mode === 'local') return opts.runLocal();
-  const host = decision.host!;
+  if (decision.mode === 'local') {
+    if (opts.explicitRemoteOnly && opts.flags.remote !== undefined && decision.reason !== 'flag-local') {
+      write.err(`[gate.remote] remote unmeasured — ${decision.reason}\n`);
+      return 1;
+    }
+    return opts.runLocal();
+  }
+  let host = decision.host!;
+  const reservationRoot = opts.tool === 'self-gate' ? opts.reservationRoot ?? (deps.runner ? undefined : gateHostReservationRoot()) : undefined;
+  if (reservationRoot) {
+    const reservationHost = host.split('@').at(-1)!;
+    const first = inspectReleaseGateHost(reservationRoot, reservationHost);
+    if (first.status !== 'free') {
+      const alternate = reservationHost === 'node-b' ? 'node-c' : null;
+      const other = alternate ? inspectReleaseGateHost(reservationRoot, alternate) : null;
+      if (alternate && other?.status === 'free') {
+        debug.log('gate.remote', 'host-reserved-reroute', { from: host, to: alternate, reason: first.reason, status: first.status });
+        write.err(`[gate.remote] ${host} reserved (${first.reason}) — using ${alternate}\n`);
+        host = alternate;
+      } else {
+        const reason = `host-reserved: ${host} (${first.reason}); alternate ${alternate ?? '(none)'} ${other?.status ?? 'unavailable'}`;
+        debug.log('gate.remote', 'host-reserved-unmeasured', { host, reason });
+        write.err(`[gate.remote] remote unmeasured — ${reason}\n`);
+        return 1;
+      }
+    }
+  }
   const fallback = (reason: string) => {
+    if (opts.explicitRemoteOnly && opts.flags.remote !== undefined) {
+      debug.log('gate.remote', 'remote-unmeasured', { tool: opts.tool, host, reason });
+      write.err(`[gate.remote] remote unmeasured on ${host} — ${reason.replace(/\s+/g, ' ').trim()}\n`);
+      return 1;
+    }
     debug.log('gate.remote', 'fallback', { tool: opts.tool, host, reason });
     write.err(`[gate.remote] fallback to local — ${reason}\n`);
     return opts.runLocal();
   };
   if (opts.localOnlyReason) return fallback(opts.localOnlyReason);
+  const hostCap = gateRemoteHostCap(settings, host);
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = deps.now ?? Date.now;
   const deadline = now() + settings.slotWaitSeconds * 1000;
@@ -416,26 +495,32 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
   let outcome: RemoteRunOutcome;
   for (;;) {
     try {
-      outcome = runOnRemote({ repo: opts.repo, host, mirror: settings.mirror, argv: opts.remoteArgv, refs: opts.refs, ...(opts.commit !== undefined ? { commit: opts.commit } : {}), installPwa: opts.installPwa, payloadFiles: opts.payloadFiles, hostCap: settings.hostCap }, deps.runner);
+      outcome = runOnRemote({ repo: opts.repo, host, mirror: settings.mirror, argv: opts.remoteArgv, refs: opts.refs, ...(opts.commit !== undefined ? { commit: opts.commit } : {}), installPwa: opts.installPwa, payloadFiles: opts.payloadFiles, hostCap }, deps.runner);
     } catch (error) {
       outcome = { kind: 'infra', reason: `exception: ${error instanceof Error ? error.message : String(error)}` };
     }
     if (outcome.kind !== 'busy') break;
-    debug.log('gate.remote', 'host-busy', { tool: opts.tool, host, cap: settings.hostCap });
-    // Never start an attempt past the deadline: an expired wait means local, even if a slot would free a moment later.
+    debug.log('gate.remote', 'host-busy', { tool: opts.tool, host, cap: hostCap, occupied: outcome.occupied ?? null });
+    // Never start an attempt past the deadline: an expired wait falls back only for automatic placement.
     const left = deadline - now();
     if (left <= 0) break;
     await sleep(Math.min(15_000, left));
     if (now() >= deadline) break;
   }
-  if (outcome.kind === 'busy') return fallback(`host-busy (cap ${settings.hostCap} held for ${settings.slotWaitSeconds}s)`);
+  if (opts.onRemoteOutcome) {
+    try { opts.onRemoteOutcome(outcome, host, deps.runner ?? realGateRemoteRunner); }
+    catch (error) { debug.log('gate.remote', 'outcome-hook-failed', { tool: opts.tool, host, error: error instanceof Error ? error.message : String(error) }); }
+  }
+  if (outcome.kind === 'busy') return fallback(`host-busy (occupied ${outcome.occupied ?? 'unknown'}/${hostCap}, held for ${settings.slotWaitSeconds}s)`);
   if (outcome.kind === 'infra') return fallback(outcome.reason);
-  // Parity: the tool's own stdout/stderr/rc pass through unchanged — only a JSON stdout gains host · remote:true.
+  // Parity: the tool's own stdout/stderr/rc pass through unchanged; JSON gains host · remote:true,
+  // and the self gate CLI appends a host diagnostic to human-readable stderr.
   debug.log('gate.remote', 'result', { tool: opts.tool, host: outcome.host, commit: outcome.commit, rc: outcome.rc, ms: outcome.ms });
-  // Bytes pass through untouched; only a JSON object stdout is re-serialised (to add host · remote:true).
+  // Tool bytes pass through untouched; only a JSON object stdout is re-serialised (to add host · remote:true).
   const text = opts.json ? outcome.stdout.toString('utf8') : undefined;
   const annotated = text !== undefined ? annotateJsonStdout(text, outcome.host) : undefined;
   write.out(annotated !== undefined && annotated !== text ? annotated : outcome.stdout);
   write.err(outcome.stderr);
+  if (opts.reportRemoteHost && !opts.json) write.err(`[gate.remote] executed on ${outcome.host} (rc=${outcome.rc})\n`);
   return outcome.rc;
 }

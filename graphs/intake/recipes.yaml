@@ -1,5 +1,6 @@
 # 기존 흡수 몸은 저장소 밖 스킬(yt-vault)이다 — 자리는 YT_VAULT_DIR 로 받는다(크론이 준다).
 # 뉴스 흡수는 이 저장소 scripts/intake-news.ts · 소스 배열은 news-sources.yaml.
+# 커뮤니티 동향 흡수는 scripts/intake-social.ts — 몸은 omni-crawl 스킬의 grok-community 엔진(자리는 OMNI_CRAWL_DIR 로 덮을 수 있고 기본 ~/.claude/skills/omni-crawl).
 intake-trend:
   command: 'zsh "${YT_VAULT_DIR:?YT_VAULT_DIR 필요}/scripts/intake-daily.sh" trend'
   timeout_ms: 1200000
@@ -7,6 +8,10 @@ intake-news:
   # 크론 입구(intake-cron.sh)는 cd "$YT_VAULT_DIR" 뒤 그래프를 돌린다 — 상대 경로면 yt-vault 쪽을 찾아 죽는다.
   command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/intake-news.ts"'
   timeout_ms: 600000
+intake-social:
+  # 하루 AI 커뮤니티(X·Reddit) 동향 — grok-community 엔진이 모은 점을 흡수 요약(관심 뉴스 절) 줄로 쓴다. 엔진이 죽어도 판은 끝까지 간다(fail → 다음 노드).
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/intake-social.ts"'
+  timeout_ms: 900000
 intake-ingest:
   command: 'zsh "${YT_VAULT_DIR:?YT_VAULT_DIR 필요}/scripts/intake-daily.sh" ingest'
   timeout_ms: 300000

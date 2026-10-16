@@ -26,8 +26,16 @@ export interface LoopRun {
   failedNodes: string[];
   durationMs: number | null;
 }
+export type LoopRoot = '조율자' | '수호자';
+export type LoopStage = 'proposed' | 'shadow' | 'live' | 'retiring' | 'retired';
+const LOOP_STAGES: readonly LoopStage[] = ['proposed', 'shadow', 'live', 'retiring', 'retired'];
+
 export interface LoopEntry {
   id: string;
+  parent?: string | null;
+  root?: LoopRoot | null;
+  purpose?: string | null;
+  stage?: LoopStage | null;
   msgAddress?: string | null;
   replyBody?: LoopReplyBody;
   wake?: MessageWake;
@@ -209,6 +217,8 @@ export function defaultLoopRoot(): string {
   return installedCronRoot() ?? repoRoot();
 }
 
+const warnedLegacyRoots = new Set<string>();
+
 export function listLoops(opts: LoopRegistryOptions = {}): LoopEntry[] {
   const root = resolve(opts.root ?? defaultLoopRoot());
   const stateRoot = opts.stateRoot ?? effectiveInstanceRoot();
@@ -234,6 +244,14 @@ export function listLoops(opts: LoopRegistryOptions = {}): LoopEntry[] {
     if (!declaredCron && !events.length && !matched.length) continue;
     if (!/^[a-zA-Z0-9][\w.-]*$/.test(doc.graph_id)) throw new Error(`unsafe loop graph_id: ${doc.graph_id}`);
     if (loops.some(loop => loop.id === doc.graph_id)) throw new Error(`duplicate loop graph_id: ${doc.graph_id}`);
+    if (header?.root != null && header.root !== '조율자' && header.root !== '수호자')
+      throw new Error(`invalid loop root for ${doc.graph_id}: ${String(header.root)}`);
+    if (header?.stage !== undefined && (typeof header.stage !== 'string' || !LOOP_STAGES.includes(header.stage as LoopStage)))
+      throw new Error(`invalid loop stage for ${doc.graph_id}: ${String(header.stage)}`);
+    if (header?.root == null && !warnedLegacyRoots.has(file)) {
+      warnedLegacyRoots.add(file);
+      debug.log('loops.registry', 'legacy-root-missing', { id: doc.graph_id, file });
+    }
     const jobs = matched.map(row => ({ id: row.id, cron: row.cron, enabled: !!row.enabled,
       ...(entryRows.includes(row) ? { entryScript: true } : {}) }));
     const active = matched.filter(row => !!row.enabled && !!row.cron);
@@ -241,6 +259,10 @@ export function listLoops(opts: LoopRegistryOptions = {}): LoopEntry[] {
     const title = typeof header?.title === 'string' ? header.title : doc.graph_id;
     const entry: LoopEntry = { id: doc.graph_id, title, ...messageFields(doc.graph_id, stateRoot),
       description: typeof header?.description === 'string' ? header.description : null,
+      ...(typeof header?.parent === 'string' ? { parent: header.parent } : {}),
+      ...(header?.root === '조율자' || header?.root === '수호자' ? { root: header.root } : {}),
+      ...(typeof header?.purpose === 'string' ? { purpose: header.purpose } : {}),
+      ...(typeof header?.stage === 'string' ? { stage: header.stage as LoopStage } : {}),
       ...resolveOwner(doc.graph_id, title, config, header?.owner),
       mode: typeof header?.mode === 'string' ? header.mode : null, file: relative(root, file),
       trigger: { cron: declaredCron, events }, jobs, enabled: matched.some(row => !!row.enabled),
@@ -252,6 +274,10 @@ export function listLoops(opts: LoopRegistryOptions = {}): LoopEntry[] {
 }
 
 export interface AllLoopEntry extends CheckEntry {
+  parent?: LoopEntry['parent'];
+  root?: LoopEntry['root'];
+  purpose?: LoopEntry['purpose'];
+  stage?: LoopEntry['stage'];
   msgAddress?: string | null;
   replyBody?: LoopReplyBody;
   wake?: MessageWake;
@@ -618,6 +644,8 @@ export function listAllLoops(opts: LoopRegistryOptions = {}): AllLoopEntry[] {
     const declaredHost = typeof header.host === 'string' && header.host ? header.host : undefined;
     const declaredCategory = typeof header.observationCategory === 'string' && header.observationCategory ? header.observationCategory : undefined;
     return { kind: 'graph', id: loop.id, title: loop.title, owner: loop.owner ?? undefined, ownerSource: loop.ownerSource,
+      ...(loop.parent ? { parent: loop.parent } : {}), ...(loop.root ? { root: loop.root } : {}),
+      ...(loop.purpose ? { purpose: loop.purpose } : {}), ...(loop.stage ? { stage: loop.stage } : {}),
       msgAddress: loop.msgAddress, replyBody: loop.replyBody, wake: loop.wake, ...(loop.wakeSource ? { wakeSource: loop.wakeSource } : {}), unreadCount: loop.unreadCount,
       ...(declaredHost || installed.length ? { host: declaredHost ?? hostname() } : {}),
       observationCategory: declaredCategory ?? 'graph.runner',
@@ -749,6 +777,8 @@ export async function setLoopEnabled(id: string, enabled: boolean, yes = false, 
   const loop = loopStatus(id, opts);
   const action = enabled ? 'start' : 'stop';
   if (!loop.jobs.length && (!enabled || !loop.trigger.cron)) throw new Error(`loop ${id} has no cron job to ${action}`);
+  // Registration creates a new cron; toggling an already installed legacy cron remains supported.
+  if (enabled && !loop.jobs.length && !loop.root) throw new Error(`loop ${id} requires root (조율자|수호자) for new registration`);
   const pending = loop.jobs.filter(job => job.enabled !== enabled);
   const entryScript = loop.jobs.some(job => job.entryScript);
   const entryLabel = entryScript ? { entryScript: true } : {};

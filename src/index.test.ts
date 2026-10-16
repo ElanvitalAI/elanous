@@ -980,6 +980,101 @@ describe('harness ask production entry wiring', () => {
     expect(runIdAtPreflight).toMatch(/^run-/);
   });
 
+  test('TA harness say 는 parallel/Pod 발사 전에 완료 경계 누락 골을 거부한다', async () => {
+    const { program, setRunDevAskFromGoalFileDepsForTesting } = await import('./index.js');
+    const dir = mkdtempSync(join(tmpdir(), 'ta-goal-boundary-'));
+    let goalFile = join(dir, 'GOAL-missing-done-boundary.md');
+    writeFileSync(goalFile, '# Goal\n\n## ACCEPTANCE CRITERIA\n\n- 기존 수용 조건\n');
+    const previousCard = process.env.ELANOUS_TASK_CARD_ID;
+    const previousExitCode = process.exitCode;
+    process.env.ELANOUS_TASK_CARD_ID = 'ta-test-boundary';
+    let launches = 0;
+    const events: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event) => { events.push(event); });
+    const errors: string[] = [];
+    const error = spyOn(console, 'error').mockImplementation((line: unknown) => { errors.push(String(line)); });
+    try {
+      setRunDevAskFromGoalFileDepsForTesting({
+        ...passingPreflightDeps(),
+        loadDevCli: async () => ({
+          renderDevCompletionLine: (() => '') as never,
+          assertDevCliPathOptions: (() => {}) as never,
+          buildDevCliSpec: ((input: unknown, executor: unknown, opts: unknown) => ({ input, executor, opts })) as never,
+          selectDevAuthorInput: (() => ({ kind: 'say', value: 'test' })) as never,
+        }),
+        loadDevPipeline: async () => ({
+          runDevPipeline: (async () => { launches++; return { kind: 'interactive', result: null, plan: {} } as never; }) as never,
+          devResultOk: (() => true) as never,
+        }),
+        runSayLaunchFlow: async () => ({ kind: 'launch', goalFile } as never),
+        setExitCode: () => {},
+      });
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'test']);
+      expect(launches).toBe(0);
+      expect(events).toContain('goal-done-boundary-rejected');
+      expect(errors.join('\n')).toMatch(/골 완료 경계 누락.*TA 카드 ta-test-boundary/);
+      expect(process.exitCode).toBe(1);
+      // If an injected author returns text instead of a file, retain the named
+      // TA refusal rather than throwing an opaque ENOENT from readFileSync.
+      goalFile = '수정해라';
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'test']);
+      expect(launches).toBe(0);
+      expect(events.filter((event) => event === 'goal-done-boundary-rejected')).toHaveLength(2);
+      expect(errors.at(-1)).toMatch(/완료 경계 실물.*완료 경계 증거 명령.*TA 카드 ta-test-boundary/);
+    } finally {
+      setRunDevAskFromGoalFileDepsForTesting(undefined);
+      if (previousCard === undefined) delete process.env.ELANOUS_TASK_CARD_ID;
+      else process.env.ELANOUS_TASK_CARD_ID = previousCard;
+      process.exitCode = previousExitCode ?? 0;
+      error.mockRestore();
+      log.mockRestore();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('사람 harness say 는 완료 경계 누락을 관측하고 발사를 계속한다', async () => {
+    const { program, setRunDevAskFromGoalFileDepsForTesting } = await import('./index.js');
+    const dir = mkdtempSync(join(tmpdir(), 'human-goal-boundary-'));
+    const goalFile = join(dir, 'GOAL-missing-done-boundary.md');
+    writeFileSync(goalFile, '# Goal\n\n## ACCEPTANCE CRITERIA\n\n- 기존 수용 조건\n');
+    const previousCard = process.env.ELANOUS_TASK_CARD_ID;
+    delete process.env.ELANOUS_TASK_CARD_ID;
+    let launches = 0;
+    const events: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event) => { events.push(event); });
+    const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const clock = spyOn(Date, 'now').mockImplementation(() => Date.parse('2026-10-16T12:00:00+09:00'));
+    try {
+      setRunDevAskFromGoalFileDepsForTesting({
+        ...passingPreflightDeps(),
+        loadDevCli: async () => ({
+          renderDevCompletionLine: (() => '') as never,
+          assertDevCliPathOptions: (() => {}) as never,
+          buildDevCliSpec: ((input: unknown, executor: unknown, opts: unknown) => ({ input, executor, opts })) as never,
+          selectDevAuthorInput: (() => ({ kind: 'say', value: 'test' })) as never,
+        }),
+        loadDevPipeline: async () => ({
+          runDevPipeline: (async () => { launches++; return { kind: 'interactive', result: null, plan: {} } as never; }) as never,
+          devResultOk: (() => true) as never,
+        }),
+        runSayLaunchFlow: async () => ({ kind: 'launch', goalFile } as never),
+        setExitCode: () => {},
+      });
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'test']);
+      expect(launches).toBe(1);
+      expect(events).toContain('goal-done-boundary-warned');
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('사람 요청 관측 기간에는 발사를 계속합니다'));
+    } finally {
+      setRunDevAskFromGoalFileDepsForTesting(undefined);
+      if (previousCard === undefined) delete process.env.ELANOUS_TASK_CARD_ID;
+      else process.env.ELANOUS_TASK_CARD_ID = previousCard;
+      stderr.mockRestore();
+      clock.mockRestore();
+      log.mockRestore();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   // ⛔ 리뷰 should-fix ②: mint-once ⊕ 「자식 값이 이긴다」를 PR 본문에만 적어 뒀다 — 시험이 지키게 한다.
   //   ⚠️ 이 둘은 «다른 계약»이라 한 시험에 접지 않는다.
   test('mint-once — 이미 선 runId 는 다시 불러도 «안 바뀌고» source 가 inherited 다', async () => {
@@ -3532,6 +3627,91 @@ describe('dev CLI help tiers', () => {
 
     expect(() => assertExistingOptions(primary, extendedWithoutForce)).toThrow(/force-preflight/);
   }, 30_000);
+});
+
+describe('self gate explicit remote CLI wiring', () => {
+  test('three explicit remote failures never invoke the local gate; automatic fallback is visible; remote rc and host survive', async () => {
+    const remote = await import('./self-implement/gate-remote.js');
+    const reservationRoot = mkdtempSync(join(tmpdir(), 'index-gate-reservation-'));
+    mkdirSync(join(reservationRoot, 'release', 'gate-host-reservations'), { recursive: true });
+    const actualDispatch = remote.dispatchHeavyCheck;
+    const dispatch = spyOn(remote, 'dispatchHeavyCheck').mockImplementation((opts) => {
+      const runner: import('./self-implement/gate-remote.js').GateRemoteRunner = {
+        local(_cmd, args) {
+          if (args[0] === 'status') return { rc: 0, stdout: '', stderr: '' };
+          if (args[0] === 'rev-parse') return { rc: 0, stdout: `${(args.at(-1)!.startsWith('HEAD') ? 'a' : 'b').repeat(40)}\n`, stderr: '' };
+          if (args[0] === 'push') return { rc: 0, stdout: '', stderr: '' };
+          return { rc: 0, stdout: '', stderr: '' };
+        },
+        ssh() { return remoteResult; },
+      };
+      return actualDispatch({ ...opts, reservationRoot, runLocal: () => { localCalls++; return 7; } }, {
+        runner, settings: { ...remote.GATE_REMOTE_DEFAULTS, slotWaitSeconds: 0 }, env: {}, load1: 25,
+        write: { out: (data) => output.push(String(data)), err: (data) => errors.push(String(data)) },
+      });
+    });
+    let localCalls = 0;
+    let remoteResult: import('./self-implement/gate-remote.js').SshResult = { rc: 255, stdout: '', stderr: 'ssh unreachable' };
+    const output: string[] = [];
+    const errors: string[] = [];
+    const invoke = async (args: string[]) => {
+      localCalls = 0; output.length = 0; errors.length = 0;
+      process.exitCode = 0;
+      await program.parseAsync(['node', 'elanous', 'self', 'gate', '--changed', ...args]);
+      return process.exitCode;
+    };
+    try {
+      expect(await invoke(['--remote', 'node-b'])).toBe(1);
+      expect(localCalls).toBe(0);
+      expect(errors.join('')).toContain('without --base');
+      expect(await invoke(['--base', 'HEAD', '--remote', 'node-b'])).toBe(1);
+      expect(localCalls).toBe(0);
+      expect(errors.join('')).toContain('ssh rc=255');
+      remoteResult = { rc: 98, stdout: '', stderr: '__GATE_REMOTE_BUSY\n' };
+      expect(await invoke(['--base', 'HEAD', '--remote', 'node-b'])).toBe(1);
+      expect(localCalls).toBe(0);
+      expect(errors.join('')).toContain('host-busy');
+      expect(await invoke(['--base', 'HEAD'])).toBe(7);
+      expect(localCalls).toBe(1);
+      expect(errors.join('')).toContain('fallback to local — host-busy');
+      remoteResult = { rc: 0, stdout: 'auto success\n', stderr: '\n__GATE_REMOTE_RC=0\n' };
+      expect(await invoke(['--base', 'HEAD'])).toBe(0);
+      expect(localCalls).toBe(0);
+      expect(errors.join('')).toContain('executed on node-b (rc=0)');
+      remoteResult = { rc: 0, stdout: 'remote result\n', stderr: '\n__GATE_REMOTE_RC=3\n' };
+      expect(await invoke(['--base', 'HEAD', '--remote', 'node-c'])).toBe(3);
+      expect(localCalls).toBe(0);
+      expect(output.join('')).toBe('remote result\n');
+      expect(errors.join('')).toContain('executed on node-c (rc=3)');
+      expect(await invoke([])).toBe(7);
+      expect(localCalls).toBe(1);
+      expect(errors.join('')).toContain('fallback to local — self gate without --base');
+    } finally { dispatch.mockRestore(); await rm(reservationRoot, { recursive: true, force: true }); }
+  });
+
+  test('dispatch setup exception refuses local execution only for an explicit --remote', async () => {
+    const git = await import('./git-fs/runner.js');
+    const gate = await import('./self-implement/gate-cli.js');
+    const ui = await import('./ui.js');
+    const runGit = spyOn(git, 'runGitCommand').mockImplementation(() => { throw new Error('git setup unavailable'); });
+    const runLocal = spyOn(gate, 'runSelfGateCli').mockImplementation(() => ({ exitCode: 7, lines: ['local measurement'] }) as never);
+    const error = spyOn(ui, 'error').mockImplementation(() => {});
+    try {
+      process.exitCode = 0;
+      await program.parseAsync(['node', 'elanous', 'self', 'gate', '--changed', '--remote', 'node-b']);
+      expect(process.exitCode).toBe(1);
+      expect(runLocal).not.toHaveBeenCalled();
+      expect(error).toHaveBeenCalledWith('self gate remote unmeasured — git setup unavailable');
+      process.exitCode = 0;
+      await program.parseAsync(['node', 'elanous', 'self', 'gate', '--changed']);
+      expect(process.exitCode).toBe(7);
+      expect(runLocal).toHaveBeenCalledTimes(1);
+    } finally {
+      error.mockRestore();
+      runGit.mockRestore();
+      runLocal.mockRestore();
+    }
+  });
 });
 
 describe('file-backed self CLI entrances', () => {

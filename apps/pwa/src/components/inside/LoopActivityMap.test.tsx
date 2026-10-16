@@ -51,6 +51,29 @@ function mountMap(search: string, mapRows: readonly LoopRow[] = rows) {
   }), updateEdges: (edges: readonly ActivityEdge[]) => act(() => root!.update(renderMap(edges))) };
 }
 
+test('resource flow panel only claims launch relations from a ready snapshot', () => {
+  const launch: ActivityEdge[] = [
+    { at: '2026-10-05T09:59:00Z', kind: 'run', from: 'OP', to: 'loop:run-abc123', ref: 'run-abc123' },
+  ];
+  const map = (state: 'loading' | 'ready' | 'error' | 'unauthorized', edges: readonly ActivityEdge[] = []) =>
+    renderToStaticMarkup(<SearchParamsContext.Provider value={new URLSearchParams()}><LoopActivityMap rows={rows} edges={edges} seenAt={{}} now={now} state={state} /></SearchParamsContext.Provider>);
+  const readyEmpty = map('ready');
+  expect(readyEmpty).toContain('aria-label="자원 발사 흐름"');
+  expect(readyEmpty).toContain('실제 발사 관계가 아직 없습니다');
+  const readyLive = map('ready', launch);
+  expect(readyLive).toContain('COO → 런 · run-abc123');
+  expect(readyLive).not.toContain('실제 발사 관계가 아직 없습니다');
+  for (const state of ['loading', 'error', 'unauthorized'] as const) {
+    const html = map(state);
+    expect(html).not.toContain('실제 발사 관계가 아직 없습니다');
+    expect(html).not.toContain('aria-label="자원 발사 흐름"');
+  }
+  const errorWithStale = map('error', launch);
+  expect(errorWithStale).toContain('지도 원천을 읽지 못했습니다');
+  expect(errorWithStale).not.toContain('실제 발사 관계가 아직 없습니다');
+  expect(errorWithStale).not.toContain('aria-label="자원 발사 흐름"');
+});
+
 test('map exposes four seats, unknown owner, red verdict and clickable node list at phone width', () => {
   const html = renderToStaticMarkup(<SearchParamsContext.Provider value={new URLSearchParams()}><LoopActivityMap rows={rows} edges={[]} seenAt={{}} now={now} state="ready" /></SearchParamsContext.Provider>);
   for (const label of ['COO', 'CMO', 'CTO', 'CXO', '미지정', '늦은 루프', '꺼진 루프']) expect(html).toContain(label);

@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
+import { simInProcessCli } from './ux-sim/in-process-cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -70,6 +71,44 @@ async function runBinWithDelayedStdout(args: string[], env: NodeJS.ProcessEnv = 
   };
 }
 
+// Commander registration and option rejection are S1 contracts. Keep this
+// group serial: simInProcessCli temporarily owns process globals.
+describe('CLI registered command contract (in process)', () => {
+  test.each(['--resume', '--bogus-flag'])('self goal-run-search가 %s를 Commander의 unknown option으로 거부한다', async (flag) => {
+    const result = await simInProcessCli(['self', 'goal-run-search', '--limit', '1', flag, 'XYZ'], {
+      allowPaths: [['self', 'goal-run-search']],
+    });
+    expect(result.stdout + result.stderr).toContain('unknown option');
+    expect(result.exitCode).not.toBe(0);
+  });
+
+  test('harness ask --graph is no longer accepted', async () => {
+    const result = await simInProcessCli(['harness', 'ask', '/tmp/goal.md', '--graph', 'maybe', '--dry-run'], {
+      allowPaths: [['harness', 'ask']],
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain("error: unknown option '--graph'");
+    expect(result.stderr).not.toMatch(/\bat\s+.*\(/);
+  });
+
+  test('nexus run 도움말 끝은 등록된 숨은 옵션의 수와 이름을 알린다', async () => {
+    const result = await simInProcessCli(['nexus', 'run', '--help'], { allowPaths: [['nexus', 'run']] });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout + result.stderr).toMatch(/Hidden options \(7\):\s*--headless, --foreground, --bg, --http-port, --http-host, --tools, --history-dir\s*$/);
+  });
+
+  test('self parked 도움말은 JSON 출력의 updatedAt 필드를 명시한다', async () => {
+    const result = await simInProcessCli(['self', 'parked', '--help'], { allowPaths: [['self', 'parked']] });
+    expect(result.exitCode).toBe(0);
+    // Commander wraps help at terminal width, so compare normalized whitespace.
+    // The envelope and its parked[] fields are separate contracts.
+    const help = (result.stdout + result.stderr).replace(/\s+/g, ' ');
+    expect(help).toContain('{parked, counts, displayLimit, omittedCount, population, stores, limitation}');
+    expect(help).toContain('[{feature, status, stage?, error?, runId, branch?, updatedAt, source}]');
+  });
+});
+
 describe.concurrent('배포 엔트리 bin/elanous.mjs', () => {
   test('release checklist 중복 칸과 없는 칸은 두 줄의 사용자 오류만 stderr로 낸다', async () => {
     const id = `cli-user-error-${process.pid}-${Date.now()}`;
@@ -118,20 +157,6 @@ describe.concurrent('배포 엔트리 bin/elanous.mjs', () => {
     expect(status).not.toBe(0);
   }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test.each(['--resume', '--bogus-flag'])('self goal-run-search가 %s를 Commander의 unknown option으로 거부한다', async (flag) => {
-    const { stdout, stderr, status } = await runBin(['self', 'goal-run-search', '--limit', '1', flag, 'XYZ']);
-    expect(`${stdout}${stderr}`).toContain('unknown option');
-    expect(status).not.toBe(0);
-  }, CONCURRENT_TEST_TIMEOUT_MS);
-
-  test('harness ask --graph is no longer accepted', async () => {
-    const { stdout, stderr, status } = await runBin(['--test', 'harness', 'ask', '/tmp/goal.md', '--graph', 'maybe', '--dry-run']);
-    expect(status).toBe(1);
-    expect(stdout).toBe('');
-    expect(stderr).toContain("error: unknown option '--graph'");
-    expect(stderr).not.toMatch(/\bat\s+.*\(/);
-  }, CONCURRENT_TEST_TIMEOUT_MS);
-
   test.each(['repro', 'eval-prompt'])('%s 는 LLM 실행 없이 attach 대체 경로를 안내한다', async (command) => {
     const { stdout, stderr, status } = await runBin([command, '문장']);
     const output = `${stdout}${stderr}`;
@@ -168,13 +193,6 @@ describe.concurrent('배포 엔트리 bin/elanous.mjs', () => {
     expect(stdout).toContain('--transport=websocket');
   }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('nexus run 도움말 끝은 등록된 숨은 옵션의 수와 이름을 알린다', async () => {
-    const { stdout, stderr, status } = await runBin(['nexus', 'run', '--help']);
-    const output = `${stdout}${stderr}`;
-    expect(status).toBe(0);
-    expect(output).toMatch(/Hidden options \(7\):\s*--headless, --foreground, --bg, --http-port, --http-host, --tools, --history-dir\s*$/);
-  }, CONCURRENT_TEST_TIMEOUT_MS);
-
   test('self entrances --json은 1.2초 늦게 읽는 실제 stdout 파이프 소비자에게도 대용량 JSON을 끝까지 출력한다', async () => {
     // `self entrances`는 fixture를 스캔하지 않고 1.2초 지연 전에 대용량 JSON을 쓴다.
     // 따라서 실제 셸 파이프에서 non-blocking stdout short-write를 재현한다.
@@ -188,18 +206,6 @@ describe.concurrent('배포 엔트리 bin/elanous.mjs', () => {
     expect(piped.bytes).toBe(Buffer.byteLength(redirected.stdout));
     expect(piped.validJson).toBe(true);
     JSON.parse(redirected.stdout);
-  }, CONCURRENT_TEST_TIMEOUT_MS);
-
-  test('self parked 도움말은 JSON 출력의 updatedAt 필드를 명시한다', async () => {
-    const { stdout, stderr, status } = await runBin(['self', 'parked', '--help']);
-    expect(status).toBe(0);
-    // ⛔⭐ Commander 가 도움말을 «폭에 맞춰 접는다» — 줄바꿈이 필드 사이 «아무 데나» 들어간다.
-    //   ⇒ 공백을 먼저 «한 칸으로 접고» 문다. 안 그러면 이 시험이 「문면」이 아니라
-    //     ***「터미널 폭」***을 무는 자가 된다(폭이 바뀌면 빨개진다).
-    const help = `${stdout}${stderr}`.replace(/\s+/g, ' ');
-    // ⛔ 봉투만 적혀 있으면 도구를 쓰는 사람이 parked[] «안»을 모른다 — 둘 다 문다.
-    expect(help).toContain('{parked, counts, displayLimit, omittedCount, population, stores, limitation}');
-    expect(help).toContain('[{feature, status, stage?, error?, runId, branch?, updatedAt, source}]');
   }, CONCURRENT_TEST_TIMEOUT_MS);
 
   test('self parked는 사람용 행에 갱신 나이를 싣고 JSON parked 계약은 보존한다', async () => {

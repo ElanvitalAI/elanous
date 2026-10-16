@@ -295,8 +295,10 @@ test('live graph stores project/seat memories and conflict candidate file withou
   expect(JSON.parse(readFileSync(join(state, 'context-memory', 'conflict-candidates.json'), 'utf8'))).toHaveLength(1);
 }, 120_000); // two live runs spawn ~16 short task workers (librarian · guardian); 30s overflows a loaded host
 
-test('nightly graph collects the isolated bus, channel and decision ledger before recording librarian candidates', async () => {
+test('disabled nightly loop can be run once against isolated bus, channel and decision stores without enabling its schedule', async () => {
   const { state, input } = fixture();
+  const loop = () => listLoops({ root, stateRoot: state, schedules: [] }).find(entry => entry.id === 'nightly-condense');
+  expect(loop()).toMatchObject({ enabled: false, jobs: [], nextRun: null });
   const previousState = process.env.ELANOUS_STATE_DIR;
   process.env.ELANOUS_STATE_DIR = state;
   try {
@@ -324,12 +326,21 @@ test('nightly graph collects the isolated bus, channel and decision ledger befor
     };
     const result = await runGraph(graph, { input: { day: input.day, summaries }, deps: { root: state } });
     expect(result.status).toBe('done');
+    expect(result.path).toEqual(['collect', 'condense', 'record', 'conflict-candidates', 'done']);
+    expect(loop()).toMatchObject({ enabled: false, jobs: [], nextRun: null });
     expect(lastJsonObject(result.nodes[0]?.output)).toMatchObject({ events: [
       { surface: 'coord:channel', refs: { seat: 'TC' } },
       { surface: 'context:external', refs: { seat: 'UX' } },
       { surface: 'context:session', refs: { seat: 'MK' } },
     ], decisions: [{ id: decision.id, title: 'beta launch route' }] });
-    expect(lastJsonObject(result.nodes[2]?.output)).toMatchObject({ items: 4, dryRun: false });
+    expect(lastJsonObject(result.nodes[1]?.output)).toMatchObject({ assignments: [
+      { owner: 'coordinator', assignee: 'nightly-task-agent', contract: 'librarian', recipe: 'sleep-review' },
+      { owner: 'coordinator', assignee: 'nightly-task-agent', contract: 'librarian', recipe: 'sleep-review' },
+      { owner: 'coordinator', assignee: 'nightly-task-agent', contract: 'librarian', recipe: 'sleep-review' },
+      { owner: 'coordinator', assignee: 'nightly-task-agent', contract: 'librarian', recipe: 'sleep-review' },
+    ] });
+    expect(lastJsonObject(result.nodes[2]?.output)).toMatchObject({ items: 4, dryRun: false,
+      guardian: { assignee: 'guardian', recipe: 'retire-aged' } });
     expect(JSON.parse(readFileSync(join(state, 'context-memory', 'beta', 'OP.json'), 'utf8')))
       .toMatchObject([{ source: `elanous://decisions/${decision.id}`, summary: 'route selected' }]);
     expect(JSON.parse(readFileSync(join(state, 'context-memory', 'alpha', 'UX.json'), 'utf8')))
@@ -337,6 +348,7 @@ test('nightly graph collects the isolated bus, channel and decision ledger befor
     expect(JSON.parse(readFileSync(join(state, 'context-memory', 'conflict-candidates.json'), 'utf8')))
       .toMatchObject([{ owner: 'OP', status: 'candidate', sources: ['https://example.test/0', 'https://example.test/1'] }]);
     expect(ledger.list({ status: 'all' }).map(entry => entry.id)).toEqual([decision.id]);
+    expect(loop()).toMatchObject({ enabled: false, jobs: [], nextRun: null });
   } finally {
     if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = previousState;
@@ -455,4 +467,4 @@ test('CLI loop list in the isolated instance shows nightly condensation disabled
   expect(loops.find(loop => loop.id === 'nightly-condense')).toMatchObject({
     file: 'graphs/context/nightly-condense.yaml', enabled: false, trigger: { cron: '30 3 * * *' }, jobs: [],
   });
-});
+}, 15_000);

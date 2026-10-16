@@ -92,6 +92,7 @@ export interface DraftResidueAdapters {
   loadLedger(runId: string, ledgerDir: string): readonly RunLedgerEntry[] | null;
   appendLedger(entry: RunLedgerEntry, ledgerDir: string): void;
   getPr(number: number): Promise<ResiduePr | undefined> | ResiduePr | undefined;
+  /** Undefined means the open-draft inventory could not be observed («못 셌음») — never a disguised zero count. */
   listOpenDrafts(repository: string): Promise<readonly ResiduePr[] | undefined> | readonly ResiduePr[] | undefined;
   addLabel(repository: string, number: number, label: string): Promise<void> | void;
   setLabels(repository: string, number: number, change: { add: string; remove: readonly string[] }): Promise<void> | void;
@@ -112,8 +113,15 @@ export interface DraftResidueContext {
 }
 export type DraftResidueResult = { status: 'recorded' | 'skipped' | 'failed'; reason?: string; step?: string };
 
+/** A REST pulls page carries up to 100 full PR bodies; the spawn default buffer (1 MiB) overflowed daily as
+ *  `spawnSync gh ENOBUFS`, so every gh call gets an explicit ceiling that fits a full page of large-bodied drafts. */
+const GH_MAX_BUFFER = 64 * 1024 * 1024;
+/** Only the fields the residue consumes. The raw REST page (base/head repo objects, _links, review metadata, …) is
+ *  several times larger than this projection, so the listing asks gh to project each page down to these fields. */
+const OPEN_DRAFT_FIELDS = '[.[] | {number, title, headRefName: .head.ref, createdAt: .created_at, body, labels: [.labels[] | {name}], draft}]';
+
 function gh(args: string[]): string {
-  const result = spawnSync('gh', args, { cwd: findGitDir(process.cwd())?.root ?? process.cwd(), encoding: 'utf8', timeout: 60_000 });
+  const result = spawnSync('gh', args, { cwd: findGitDir(process.cwd())?.root ?? process.cwd(), encoding: 'utf8', timeout: 60_000, maxBuffer: GH_MAX_BUFFER });
   if (result.status !== 0) throw new Error((result.stderr || result.error?.message || `gh exited ${result.status}`).trim().slice(0, 200));
   return result.stdout.trim();
 }
@@ -173,15 +181,22 @@ export function defaultAdapters(sources: ResidueRunStatusSources = defaultRunSta
     getPr: (number) => ghPr(JSON.parse(gh(['pr', 'view', String(number), '-R', hostRepository() ?? '', '--json', fields]))),
     listOpenDrafts: (repository) => {
       const rows: ResiduePr[] = [];
-      for (let page = 1; page <= 100; page++) {
-        const result = JSON.parse(gh(['api', `repos/${repository}/pulls?state=open&per_page=100&page=${page}`])) as Array<{
-          number: number; title: string; head: { ref: string }; created_at: string; body: string; draft: boolean; labels: Array<{ name: string }>;
-        }>;
-        if (!Array.isArray(result)) throw new Error('Invalid open PR inventory');
-        rows.push(...result.filter((pr) => pr.draft).map((pr) => ghPr({ number: pr.number, title: pr.title, headRefName: pr.head.ref, createdAt: pr.created_at, body: pr.body, labels: pr.labels })));
-        if (result.length < 100) return rows;
+      try {
+        for (let page = 1; page <= 100; page++) {
+          const result = JSON.parse(gh(['api', `repos/${repository}/pulls?state=open&per_page=100&page=${page}`, '--jq', OPEN_DRAFT_FIELDS])) as Array<{
+            number: number; title: string; headRefName: string; createdAt: string; body: string;
+            labels: Array<{ name: string }>; draft: boolean;
+          }>;
+          if (!Array.isArray(result)) throw new Error('Invalid open PR inventory');
+          rows.push(...result.filter((pr) => pr.draft).map((pr) => ghPr({ number: pr.number, title: pr.title, headRefName: pr.headRefName, createdAt: pr.createdAt, body: pr.body, labels: pr.labels })));
+          if (result.length < 100) return rows;
+        }
+        throw new Error('Open PR inventory exceeded pagination limit');
+      } catch (error) {
+        // «못 셌음»: a failed (or truncated) listing is unmeasurable — it must never surface as a counted zero.
+        debug.log('draft.residue', 'list-open-drafts-unobserved', { repository, reason: error instanceof Error ? error.message : String(error) });
+        return undefined;
       }
-      throw new Error('Open PR inventory exceeded pagination limit');
     },
     addLabel: (repository, number, label) => { gh(['pr', 'edit', String(number), '-R', repository, '--add-label', label]); },
     setLabels: (repository, number, change) => { gh(['pr', 'edit', String(number), '-R', repository, '--add-label', change.add, ...change.remove.flatMap((label) => ['--remove-label', label])]); },

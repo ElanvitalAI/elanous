@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MsgStore } from '../src/msg/msg-store.js';
 import { answerSeatAsk, askSeat, deliverSeatAnswers, getTuiSeatAskClientId, type AskOrigin } from '../src/seat-dispatch/seat-ask.js';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
 /** Exercise the persisted return address, not merely the old in-process worker. */
 export async function assertTuiSeatAskRestartContract(): Promise<void> {
@@ -12,7 +13,7 @@ export async function assertTuiSeatAskRestartContract(): Promise<void> {
   const received: string[] = [];
   let now = 0;
   try {
-    const dashboard = await Bun.file(join(import.meta.dir, '../src/dashboard/index.ts')).text();
+    const dashboard = tuiSourceText();
     expect(dashboard.includes('const tuiSeatAskClientId = getTuiSeatAskClientId();')).toBe(true);
     expect(dashboard.includes("askSeat(submitIntent.text, { channel: 'tui', clientId: tuiSeatAskClientId }")).toBe(true);
     expect(dashboard.includes("channel: 'tui' as const, clientId: tuiSeatAskClientId,")).toBe(true);

@@ -81,14 +81,35 @@ export type InvokerBehindDefaultBranch =
   | { readonly state: 'measured'; readonly commits: number; readonly baseRef: string }
   | { readonly state: 'unmeasurable'; readonly reason: string };
 
+/** Ambient git location vars override `git -C <cwd>`; the invoker tree is the given cwd only. */
+const GIT_LOCATION_ENV_KEYS = [
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
+  'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+] as const;
+
+function gitReadEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const key of GIT_LOCATION_ENV_KEYS) delete env[key];
+  return env;
+}
+
+function gitRead(cwd: string, args: readonly string[]): string {
+  // git-spawn-allow: Reads only the given cwd after dropping ambient GIT_DIR/GIT_WORK_TREE so the invoker tree is that cwd, not the parent harness checkout.
+  return execFileSync('git', ['-C', cwd, ...args], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: gitReadEnv(),
+  }).trim();
+}
+
 /** 현재 인보커 작업 트리의 HEAD를 이미 알려진 원격 기본 브랜치 ref와만 비교한다. */
 export function measureInvokerBehindDefaultBranch(cwd: string): InvokerBehindDefaultBranch {
   try {
     // git-spawn-allow: Reads the known origin/HEAD remote-tracking ref without fetching or changing repository state.
-    const baseRef = execFileSync('git', ['-C', cwd, 'rev-parse', '--abbrev-ref', 'origin/HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    const baseRef = gitRead(cwd, ['rev-parse', '--abbrev-ref', 'origin/HEAD']);
     if (!baseRef || baseRef === 'origin/HEAD') throw new Error('원격 기본 브랜치 ref를 해석하지 못했다');
     // git-spawn-allow: Counts commits reachable from the known remote default branch but not local HEAD without changing repository state.
-    const raw = execFileSync('git', ['-C', cwd, 'rev-list', '--count', `HEAD..${baseRef}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    const raw = gitRead(cwd, ['rev-list', '--count', `HEAD..${baseRef}`]);
     const commits = Number(raw);
     if (!Number.isSafeInteger(commits) || commits < 0) throw new Error(`뒤처진 커밋 수가 유효하지 않다: ${raw || '(빈 값)'}`);
     return { state: 'measured', commits, baseRef };
@@ -102,7 +123,7 @@ export function measureInvokerBehindDefaultBranch(cwd: string): InvokerBehindDef
 function gitTopLevel(dir: string): string | null {
   try {
     // git-spawn-allow: Reads the repository top-level path without changing repository state.
-    return execFileSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || null;
+    return gitRead(dir, ['rev-parse', '--show-toplevel']) || null;
   } catch { return null; }
 }
 

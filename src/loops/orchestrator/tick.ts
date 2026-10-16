@@ -5,7 +5,7 @@ import { CardStore, taskCardsDir, type TaskCard } from '../../task-cards/card-st
 import { Database } from 'bun:sqlite';
 import { type ChecklistItem } from '../../release-loop/checklist.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
-import { getUserConfig, resolveConfiguredAgentRoleLlm, type OrchestratorLoopConfig } from '../../user-config.js';
+import { getUserConfig, ORCHESTRATOR_DEFAULTS, resolveConfiguredAgentRoleLlm, type OrchestratorLoopConfig } from '../../user-config.js';
 import { rubricPriority } from '../../release-loop/rubric.js';
 import { debug } from '../../debug/log.js';
 import { emitLoopHeartbeat } from '../neighbor-runtime.js';
@@ -15,7 +15,11 @@ import { addHarnessQueue, harnessQueueOutcome, setQueuedPoolHint } from '../../h
 import { placeOnGrid, type GridHost } from './grid-place.js';
 import { checkPodPool, parsePodPool, resolvePodPoolSpec } from '../../task-orchestrator/surfaces/pod-pool.js';
 import { leaseKubectl } from '../../task-orchestrator/surfaces/pod-lease.js';
-import type { TrafficSeatRow } from './traffic.js';
+import { isLaunchEligible, isTrafficLaunch, recordDispatchCycle, seatOfTree, type TrafficProcess } from './traffic.js';
+import { defaultListHarnessProcesses } from '../../harness/harness-cli-command.js';
+import * as testGuard from '../../instance/test-write-guard.js';
+import { seatCapDetails } from '../budget.js';
+export { isLaunchEligible } from './traffic.js';
 import { readTaskAgentState, TASK_SEATS, type HandTaskOptions, type TaskCard as TaskAgentCard, type HandTaskResult, type TaskLauncher, type TaskSeat } from '../../task-agent/task-hand.js';
 import { runCoordinatorAgentInbox, runCoordinatorInbox, type CoordinatorInboxResult } from './inbox.js';
 import { loadAgentRolePack, type AgentReplyInput } from '../agent-reply.js';
@@ -26,12 +30,6 @@ export type Node = 'intake' | 'split' | 'place' | 'delegate' | 'launch' | 'recon
 export type Mode = 'off' | 'shadow' | 'live';
 const SEAT_LOOP_IDS: Readonly<Record<string, string>> = { OP: 'op-seat', MK: 'cmo-seat', TC: 'tc-seat', UX: 'ux-seat' };
 export interface Cell { id: string; title: string; kind?: string; seat?: string; host?: string; gridHost?: boolean; version?: string; cardId: string; origin: 'candidate' | 'flow1a'; priority?: 'P0' | 'P1' | 'P2' | 'P3' | 'P4'; predecessors?: string[] }
-/** Pure launch decision over observed traffic; dispatch-c will wire it into the periodic launch path. */
-export function isLaunchEligible(row: Pick<TrafficSeatRow, 'nextCell' | 'running' | 'launchCap'>,
-  skipReason?: string): boolean {
-  return row.nextCell !== null && row.running < row.launchCap &&
-    skipReason !== 'degraded-skip' && skipReason !== 'cap-deferred';
-}
 export interface TickState {
   runId: string; window: Window; mode: Mode; day: string;
   cards: TaskCard[]; skippedCards: Array<{ id: string; reason: string }>; cells: Cell[]; placed: number; unplaced?: number; delegated: number; wouldDelegate: number; rebalanced?: number; rebalanceBlocked?: Array<{ id: string; reason: string }>;
@@ -70,6 +68,8 @@ export interface TickDeps {
   gridHosts?: readonly GridHost[];
   seatTurn?: (seat: string, root: string, host?: string, options?: Pick<SeatDeps, 'enqueue'>) => Promise<{ status: string; queueId?: string; runId?: string; item?: { source: string; id: string } }>;
   queueOutcome?: (queueId: string, root: string) => 'pending' | 'unknown' | 'retryable' | 'succeeded';
+  /** Snapshot of running harness processes for launch-cap decisions; an unreadable snapshot blocks launches. */
+  launchProcesses?: () => { status: 'ok'; records: readonly TrafficProcess[] } | { status: 'incomplete' };
   /** 발사 전 대기열 항목의 풀 힌트 갱신(주입 안 하면 harness-queue `setQueuedPoolHint`). */
   setPoolHint?: (queueId: string, poolHint: string | undefined, root: string) => Promise<boolean>;
   loadAdapter?: (path: string, name: string) => Promise<unknown>;
@@ -750,8 +750,55 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
         && (orchestratorConfig?.maxDelegatePerTick === undefined || state.delegatedKeys?.includes(`orch:${cell.cardId}:${cell.id}`)
           || (mode === 'live' && latestRequests.has(`orch:${cell.cardId}:${cell.id}`))));
       const seats = [...new Set(eligible.map(cell => cell.seat!))];
+      const supplied = state.cells.filter(cell => cell.origin === 'flow1a' && cell.seat && SEAT_LOOP_IDS[cell.seat]);
+      const eligibleKeys = new Set(eligible.map(cell => `orch:${cell.cardId}:${cell.id}`));
+      const deferredKeys = new Set((state.deferredCells ?? []).map(cell => `orch:${cell.cardId}:${cell.id}`));
+      const skipped: Record<string, number> = {};
+      for (const cell of supplied) {
+        const key = `orch:${cell.cardId}:${cell.id}`;
+        if (eligibleKeys.has(key)) continue;
+        const reason = state.degradation?.level === 2 ? 'degraded-skip'
+          : deferredKeys.has(key) ? 'cap-deferred' : 'not-queued';
+        skipped[reason] = (skipped[reason] ?? 0) + 1;
+      }
+      if (!supplied.length) skipped['no-supply'] = 1;
+      // Use the same process inventory and seat mapping as traffic for production live launches.
+      // A shadow/test tick must not synchronously scan host processes (up to 2.5s per tick).
+      const observed = seats.length ? deps.launchProcesses?.() ?? (() => {
+        if (mode === 'shadow' || testGuard.testProcessSignal()) {
+          observe('launch-inventory-skipped', mode === 'shadow' ? 'shadow' : 'test', 1);
+          return { status: 'ok' as const, records: [] };
+        }
+        const snapshot = defaultListHarnessProcesses({ include: record => isTrafficLaunch(record.command), cwdOnly: true, deadlineMs: 2_500 });
+        // The inventory itself must be complete; an unreadable cwd is handled as one reserved slot below.
+        return snapshot.status === 'ok' ? snapshot : { status: 'incomplete' as const };
+      })() : { status: 'ok' as const, records: [] };
+      const processes = observed.status === 'ok' ? observed.records : null;
+      const identified = (processes ?? []).filter(process => isTrafficLaunch(process.command)).map(process =>
+        'seat' in process ? process.seat : seatOfTree(process.cwd, orchestratorConfig ?? ORCHESTRATOR_DEFAULTS));
+      const unknown = identified.filter(seat => !seat).length;
+      // OP policy: unknown launches together reserve one conservative slot per seat, rather than
+      // closing every seat. An incomplete process inventory still fails closed.
+      identified.forEach((seat, index) => { if (!seat) observe('launch-unknown-seat', `cwd-unknown:${index}`, 1); });
+      const reserve = unknown ? 1 : 0;
+      const running = (seat: string): number => identified.filter(value => value === seat).length;
+      const free = (seat: string): number => Math.max(0, seatCapDetails({ seat: seat as keyof typeof ORCHESTRATOR_DEFAULTS.seatCaps,
+        caps: orchestratorConfig?.seatCaps, gate: orchestratorConfig?.releaseGate }).cap - running(seat) - reserve);
+      const launchSeats = seats.filter(seat => {
+        const cell = eligible.find(row => row.seat === seat)!;
+        const cap = free(seat);
+        if (processes === null || !isLaunchEligible({ nextCell: { id: cell.id, title: cell.title, owner: seat, status: 'yellow' },
+          running: 0, launchCap: cap })) {
+          // Every eligible cell of this seat stays unlaunched, not just one — count them all per reason.
+          skipped['capacity'] = (skipped['capacity'] ?? 0) + eligible.filter(row => row.seat === seat).length;
+          return false;
+        }
+        const leftovers = eligible.filter(row => row.seat === seat).length - 1;
+        if (leftovers > 0) skipped['seat-occupied'] = (skipped['seat-occupied'] ?? 0) + leftovers;
+        return true;
+      });
       state.launched = [];
-      for (const seat of seats) {
+      for (const seat of launchSeats) {
         if (mode === 'shadow') {
           const cell = eligible.find(row => row.seat === seat)!;
           const item: SeatItem = { source: 'request', id: `orch:${cell.cardId}:${cell.id}`, title: cell.title, text: cell.title };
@@ -774,7 +821,7 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
             : undefined;
           const options = enqueue ? { enqueue } : undefined;
           const turn = await (deps.seatTurn ?? ((assigned: string, stateRoot: string, _preferred?: string, overrides?: Pick<SeatDeps, 'enqueue'>) =>
-            runSeatLoopOnce(assigned, { root: stateRoot,
+            runSeatLoopOnce(assigned, { root: stateRoot, needsOwnerGate: true, // autonomous launch: needs-owner hold on
               config: { ...getUserConfig().loops?.seat, mode: 'live-safe', seats: [assigned] }, ...overrides })))(seat, root, host, options);
           // 자리 턴이 «이 틱이 넣은 의뢰»를 처리했을 때만 칸에 잇는다 — 대기열의 다른 의뢰는 이 카드의 발사가 아니다.
           const targets = new Set(eligible.filter(row => row.seat === seat).map(row => `orch:${row.cardId}:${row.id}`));
@@ -787,6 +834,13 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
           observe('exchange', `seat-turn:${seat}:${turn.status}`, 1, SEAT_LOOP_IDS[seat]);
         }
       }
+      // `dispatch` (podTarget · localLane, RFC A3) is record-only at this stage: it is copied from config into the
+      // dispatch ledger and does not change launch or capacity decisions — seatCaps · running · isLaunchEligible decide those.
+      recordDispatchCycle(root, { at: now.toISOString(), source: 'tick', mode, runId,
+        supply: supplied.length, capacity: processes === null ? 0 : seats.reduce((total, seat) => total + free(seat), 0),
+        eligible: launchSeats.length, skipped,
+        dispatch: orchestratorConfig?.dispatch ?? ORCHESTRATOR_DEFAULTS.dispatch,
+      });
     } else if (node === 'reconcile') {
       if (window !== '08') {
         // 새 카드가 있어도 앞 틱의 의뢰·발사를 같이 대조한다 — 지금 틱 것이 같은 키를 이긴다.

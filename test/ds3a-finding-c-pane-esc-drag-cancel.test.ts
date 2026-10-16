@@ -14,12 +14,12 @@
 // this test loudly.
 //
 // 2026-07-07 · dashboard decomposition: the pane common-key handler
-// moved out of dashboard/index.ts into
+// moved out of the dashboard entry (index) into
 // `src/dashboard/input/pane-common-key-route.ts`. The pane-escape
 // transition is now `deps.enterInput({ ... reason: 'pane-escape' })`
 // preceded by `await deps.tryConsumeEscape?.()`, and the dispatcher
 // route + dragManager wire live at the `routePaneCommonKey` call site
-// in `src/dashboard/index.ts` (tryConsumeEscape body). The invariant
+// in the TUI source bundle (tryConsumeEscape body). The invariant
 // is unchanged — pane-ESC must hit routeInputEventAsync (A-8 guard)
 // with a live dragManager BEFORE the escape transition — it is just
 // asserted across the two files the decomposition split it into.
@@ -27,8 +27,8 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
-const DASHBOARD_TS = join(import.meta.dir, '..', 'src', 'dashboard', 'index.ts');
 const PANE_COMMON_KEY_ROUTE_TS = join(
   import.meta.dir, '..', 'src', 'dashboard', 'input', 'pane-common-key-route.ts',
 );
@@ -50,7 +50,7 @@ describe('DS-3a-follow · pane-ESC drag-cancel guard (Finding C · A-5b.3)', () 
   });
 
   test('dashboard wires tryConsumeEscape with routeInputEventAsync + dragManager', () => {
-    const src = readFileSync(DASHBOARD_TS, 'utf8');
+    const src = tuiSourceText();
     // Anchor on the routePaneCommonKey call site — its deps literal
     // must wire tryConsumeEscape through the input-core dispatcher
     // with a live dragManager (A-8 guard).

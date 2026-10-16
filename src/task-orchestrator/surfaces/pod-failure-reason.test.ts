@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { classifyPodExit, extractPodFailureReason, POD_EXIT_CLASSES } from './pod-failure-reason.js';
+import { classifyPodExit, extractPodFailureReason, nestedPodResult, podTerminalRow, POD_EXIT_CLASSES } from './pod-failure-reason.js';
 
 describe('classifyPodExit', () => {
   test('exports the closed class set and preserves terminal metadata fields', () => {
@@ -11,7 +11,7 @@ describe('classifyPodExit', () => {
       errorCode: 'pod-secret', containerReason: 'Error', containerExitCode: 2, jobReason: 'BackoffLimitExceeded', logs: '',
     })).toEqual({
       class: 'pod-secret', errorCode: 'pod-secret', containerReason: 'Error', exitCode: 2,
-      jobReason: 'BackoffLimitExceeded', tail: [],
+      jobReason: 'BackoffLimitExceeded', tail: [], noResultLine: true,
     });
   });
 
@@ -33,6 +33,24 @@ describe('classifyPodExit', () => {
     expect(classifyPodExit({ logs: 'Error: child failed' }).class).toBe('child-error');
     expect(classifyPodExit({ logs: JSON.stringify({ kind: 'self', ok: true, result: { stage: 'merged', ok: true } }) }).class).toBe('unknown');
     expect(classifyPodExit({ logs: '' }).class).toBe('no-result-line');
+  });
+
+  test('records missing result independently of the exit class, including a plain child error and metadata failure', () => {
+    expect(classifyPodExit({ logs: 'Error: child failed' })).toMatchObject({ class: 'child-error', noResultLine: true });
+    expect(classifyPodExit({ logs: '[ask] implementation_target is missing; please provide a target' }))
+      .toMatchObject({ class: 'ask-reprompt', noResultLine: true });
+    expect(classifyPodExit({ jobReason: 'DeadlineExceeded', logs: '' }))
+      .toMatchObject({ class: 'deadline-exceeded', noResultLine: true });
+    const row = JSON.stringify({ kind: 'self', ok: false, result: { stage: 'soft-stopped', ok: false } });
+    expect(classifyPodExit({ jobReason: 'DeadlineExceeded', logs: row }))
+      .toMatchObject({ class: 'deadline-exceeded' });
+    expect(classifyPodExit({ jobReason: 'DeadlineExceeded', logs: row }).noResultLine).toBeUndefined();
+    expect(classifyPodExit({ logs: '', result: { stage: 'soft-stopped', ok: false } }))
+      .toMatchObject({ class: 'child-unconverged', noResultLine: true });
+    expect(classifyPodExit({ logs: '', result: { stage: 'completed', ok: true } }))
+      .toMatchObject({ class: 'no-result-line', noResultLine: true });
+    expect(classifyPodExit({ logs: 'Error: child failed', result: { stage: 'completed', ok: true } }))
+      .toMatchObject({ class: 'child-error', noResultLine: true });
   });
 
   test('excludes bookkeeping-only output from the bounded tail', () => {
@@ -192,4 +210,134 @@ test('classifyPodExit — a non-terminal progress JSON line mentioning error is 
   expect(childError.class).toBe('child-error');
   expect(childError.tail.join('\n')).toContain('~/repo/x.ts');
   expect(childError.tail.join('\n')).not.toContain('/home/');
+});
+
+test('preflight-blocked stores goal-read vs traced-path as separate ledger fields, not one name/detail sentence', () => {
+  const longPath = `src/${'deep/'.repeat(50)}missing-file.ts`;
+  const goalRead = {
+    kind: 'self', ok: false, stage: 'preflight-blocked',
+    blockers: [{
+      kind: 'goal-unreadable', name: '골 문서 판독 불가: goals/long.md',
+      detail: '골 문서 판독 불가: read denied — 최종 골의 traced path 를 확인할 수 없어 발사를 멈춘다',
+      reasonCode: 'goal-unreadable', checkName: 'goal-read', targetPath: '/untruncated/goals/long.md',
+    }],
+  };
+  const traced = {
+    kind: 'self', ok: false, stage: 'preflight-blocked',
+    blockers: [{
+      kind: 'missing-traced-path', name: `실재하지 않는 traced path: ${longPath}`,
+      detail: `골의 TRACED PATHS 에 선언됐지만 /root 에 없고 유효한 신설: 목록에도 없다 — ${longPath}`,
+      reasonCode: 'missing-traced-path', checkName: 'missing', targetPath: longPath,
+    }],
+  };
+
+  const goalRow = podTerminalRow(goalRead);
+  expect(goalRow).toMatchObject({
+    stage: 'preflight-blocked', ok: false,
+    reasonCode: 'goal-unreadable', checkName: 'goal-read', targetPath: '/untruncated/goals/long.md',
+  });
+  expect(goalRow?.error).toBe('goal-unreadable · goal-read');
+  expect(goalRow?.error).not.toContain(' — ');
+  expect(goalRow?.targetPath).toBe('/untruncated/goals/long.md');
+
+  const withError = { ...goalRead, error: 'Error: explicit' };
+  expect(podTerminalRow(withError)).toEqual({
+    stage: 'preflight-blocked', ok: false, error: 'Error: explicit',
+    reasonCode: 'goal-unreadable', checkName: 'goal-read', targetPath: '/untruncated/goals/long.md',
+  });
+  expect(extractPodFailureReason({ logs: JSON.stringify(withError) })).toBe('Error: explicit');
+  expect(classifyPodExit({ logs: JSON.stringify(withError) })).toMatchObject({
+    class: 'child-unconverged', reasonCode: 'goal-unreadable', checkName: 'goal-read', targetPath: '/untruncated/goals/long.md',
+  });
+
+  const tracedRow = podTerminalRow(traced);
+  expect(tracedRow).toMatchObject({
+    stage: 'preflight-blocked', ok: false,
+    reasonCode: 'missing-traced-path', checkName: 'missing', targetPath: longPath,
+  });
+  expect(tracedRow?.error).toBe('missing-traced-path · missing');
+  expect(tracedRow?.error).not.toContain(' — ');
+  expect(tracedRow?.targetPath).toBe(longPath);
+  expect(tracedRow?.targetPath?.length).toBeGreaterThan(240);
+
+  const classifiedGoal = classifyPodExit({ logs: JSON.stringify(goalRead) });
+  expect(classifiedGoal.class).toBe('child-unconverged');
+  expect(classifiedGoal.reasonCode).toBe('goal-unreadable');
+  expect(classifiedGoal.checkName).toBe('goal-read');
+  expect(classifiedGoal.targetPath).toBe('/untruncated/goals/long.md');
+  expect(classifiedGoal.noResultLine).toBeUndefined();
+
+  const classifiedTraced = classifyPodExit({ logs: JSON.stringify(traced) });
+  expect(classifiedTraced.class).toBe('child-unconverged');
+  expect(classifiedTraced.reasonCode).toBe('missing-traced-path');
+  expect(classifiedTraced.checkName).toBe('missing');
+  expect(classifiedTraced.targetPath).toBe(longPath);
+  expect(classifiedTraced.noResultLine).toBeUndefined();
+
+  const missingResult = classifyPodExit({ logs: '' });
+  expect(missingResult.class).toBe('no-result-line');
+  expect(missingResult.noResultLine).toBe(true);
+  expect(missingResult.reasonCode).toBeUndefined();
+  expect(missingResult.checkName).toBeUndefined();
+  expect(missingResult.targetPath).toBeUndefined();
+
+  const otherStage = podTerminalRow({
+    kind: 'self', ok: false, stage: 'review-blocked',
+    blockers: [{ kind: 'goal-unreadable', name: '골 문서 판독 불가: x', detail: 'hidden', reasonCode: 'goal-unreadable', checkName: 'goal-read', targetPath: 'x' }],
+  });
+  expect(otherStage).toEqual({ stage: 'review-blocked', ok: false });
+});
+
+test('preflight-blocked keeps each traced-path check and its actual path as an independent ledger value', () => {
+  const row = {
+    kind: 'self', ok: false, stage: 'preflight-blocked', error: 'Error: explicit', blockers: [
+      { kind: 'missing-traced-path', reasonCode: 'missing-traced-path', checkName: 'missing', targetPath: 'src/a.ts', name: 'missing a', detail: 'a' },
+      { kind: 'missing-traced-path', reasonCode: 'missing-traced-path', checkName: 'not-file', targetPath: 'src/b', name: 'not file b', detail: 'b' },
+    ],
+  };
+  const checks = [
+    { reasonCode: 'missing-traced-path', checkName: 'missing', targetPath: 'src/a.ts' },
+    { reasonCode: 'missing-traced-path', checkName: 'not-file', targetPath: 'src/b' },
+  ];
+  expect(podTerminalRow(row)).toEqual({ stage: 'preflight-blocked', ok: false, error: 'Error: explicit', preflightChecks: checks });
+  expect(classifyPodExit({ logs: JSON.stringify(row) })).toMatchObject({ class: 'child-unconverged', preflightChecks: checks });
+  expect(classifyPodExit({ logs: '', result: row })).toMatchObject({ class: 'child-unconverged', preflightChecks: checks, noResultLine: true });
+  expect(podTerminalRow({ ...row, error: undefined })?.error).toBe('missing-traced-path · missing · missing-traced-path · not-file');
+});
+
+test('legacy preflight blockers without structured check fields keep name and detail even for structured kinds', () => {
+  const row = { kind: 'self', ok: false, stage: 'preflight-blocked', blockers: [
+    { kind: 'goal-unreadable', name: '골 판독 불가', detail: 'read denied' },
+    { kind: 'missing-traced-path', name: 'traced path 누락', detail: 'src/old.ts' },
+  ] };
+  expect(podTerminalRow(row)).toEqual({ stage: 'preflight-blocked', ok: false, error: '골 판독 불가 — read denied · traced path 누락 — src/old.ts' });
+  expect(extractPodFailureReason({ logs: JSON.stringify(row) })).toBe('골 판독 불가 — read denied · traced path 누락 — src/old.ts');
+  expect(podTerminalRow({ ...row, blockers: [{ kind: 'goal-unreadable', name: '골 판독 불가', detail: 'read denied' }] })?.error)
+    .toBe('골 판독 불가 — read denied');
+});
+
+test('a nested child-result preflight rejection keeps reason code, check name, and path on the ledger row', () => {
+  // 실제 자식 결과의 «중첩» 형식 {kind, ok, result:{stage, …}} — harness ask --json 진입점이 남기는 거절 행이다(must-fix #1).
+  const row = { kind: 'self', ok: false, result: { stage: 'preflight-blocked', ok: false, blockers: [
+    { kind: 'missing-traced-path', name: '실재하지 않는 traced path: docs/x.md', detail: 'docs/x.md', reasonCode: 'missing-traced-path', checkName: 'missing', targetPath: 'docs/x.md' },
+  ] } };
+  expect(nestedPodResult(row)).toEqual({
+    stage: 'preflight-blocked',
+    ok: false,
+    error: 'missing-traced-path · missing',
+    reasonCode: 'missing-traced-path',
+    checkName: 'missing',
+    targetPath: 'docs/x.md',
+  });
+  expect(podTerminalRow(row)).toMatchObject({ stage: 'preflight-blocked', ok: false, reasonCode: 'missing-traced-path', checkName: 'missing', targetPath: 'docs/x.md' });
+  expect(classifyPodExit({ logs: JSON.stringify(row) })).toMatchObject({ class: 'child-unconverged', reasonCode: 'missing-traced-path', checkName: 'missing', targetPath: 'docs/x.md' });
+
+  const multi = { ...row, result: { ...row.result, blockers: [
+    { kind: 'missing-traced-path', reasonCode: 'missing-traced-path', checkName: 'missing', targetPath: 'src/a.ts', name: 'a', detail: 'a' },
+    { kind: 'missing-traced-path', reasonCode: 'missing-traced-path', checkName: 'not-file', targetPath: 'src/b', name: 'b', detail: 'b' },
+  ] } };
+  expect(classifyPodExit({ logs: JSON.stringify(multi) })).toMatchObject({ class: 'child-unconverged', preflightChecks: [
+    { reasonCode: 'missing-traced-path', checkName: 'missing', targetPath: 'src/a.ts' },
+    { reasonCode: 'missing-traced-path', checkName: 'not-file', targetPath: 'src/b' },
+  ] });
 });

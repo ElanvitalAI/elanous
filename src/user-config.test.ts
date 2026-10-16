@@ -1,4 +1,4 @@
-import { setDefaultTimeout, afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { lookupLlmTierSpec } from './model-tier/llm-tier-map.js';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -135,6 +135,20 @@ test('orchestrator maxDelegatePerTick is optional, accepts safe nonnegative inte
     expect(config.loops?.orchestrator?.maxDelegatePerTick).toBe(limit);
     saveUserConfig(config, configPath);
     expect(buildUserConfig(configPath).loops?.orchestrator?.maxDelegatePerTick).toBe(limit);
+  }
+});
+
+test('orchestrator dispatch defaults, validation and save/reload preserve other settings', () => {
+  writeConfig({});
+  expect(buildUserConfig(configPath).loops?.orchestrator?.dispatch).toEqual({ podTarget: 18, localLane: 1 });
+  writeConfig({ loops: { orchestrator: { maxDelegatePerTick: 2, trafficMode: 'live', dispatch: { podTarget: 9, localLane: 0 } } } });
+  const configured = buildUserConfig(configPath);
+  expect(configured.loops?.orchestrator).toMatchObject({ maxDelegatePerTick: 2, trafficMode: 'live', dispatch: { podTarget: 9, localLane: 0 } });
+  saveUserConfig(configured, configPath);
+  expect(buildUserConfig(configPath).loops?.orchestrator).toEqual(configured.loops?.orchestrator);
+  for (const bad of [-1, 1.2, '2', null, Number.MAX_SAFE_INTEGER + 1]) {
+    writeConfig({ loops: { orchestrator: { dispatch: { podTarget: bad, localLane: bad } } } });
+    expect(buildUserConfig(configPath).loops?.orchestrator?.dispatch).toEqual({ podTarget: 18, localLane: 1 });
   }
 });
 
@@ -275,6 +289,38 @@ describe('pod memory advice opt-in', () => {
   });
 });
 
+describe('pod warm reuse switches', () => {
+  test('every consumer defaults off and only literal true turns a flag on', () => {
+    writeConfig({});
+    expect(buildUserConfig(configPath).pod?.warmReuse).toEqual({ gateRecheck: false, land: false, ta: false, minMatchSamples: 3 });
+    writeConfig({ pod: { warmReuse: { gateRecheck: 'true', land: 1, ta: null } } });
+    expect(buildUserConfig(configPath).pod?.warmReuse).toMatchObject({ gateRecheck: false, land: false, ta: false });
+    writeConfig({ pod: { warmReuse: { gateRecheck: true, land: true, ta: true } } });
+    expect(buildUserConfig(configPath).pod?.warmReuse).toMatchObject({ gateRecheck: true, land: true, ta: true });
+  });
+
+  test('minMatchSamples accepts only positive safe integers', () => {
+    for (const invalid of [0, -2, 2.5, '5', Number.MAX_SAFE_INTEGER + 1]) {
+      writeConfig({ pod: { warmReuse: { minMatchSamples: invalid } } });
+      expect(buildUserConfig(configPath).pod?.warmReuse?.minMatchSamples).toBe(3);
+    }
+    writeConfig({ pod: { warmReuse: { minMatchSamples: 7 } } });
+    expect(buildUserConfig(configPath).pod?.warmReuse?.minMatchSamples).toBe(7);
+  });
+
+  test('a raw-mirrored set survives save and reload, and an untouched save writes no defaults', () => {
+    writeConfig({ pod: { lease: { perAccount: 5 } } });
+    const cfg = buildUserConfig(configPath);
+    saveUserConfig(cfg, configPath);
+    expect(JSON.parse(readFileSync(configPath, 'utf8')).pod?.warmReuse).toBeUndefined();
+    const raw = cfg.raw as Record<string, unknown>;
+    raw.pod = { ...(raw.pod as Record<string, unknown>), warmReuse: { gateRecheck: true, minMatchSamples: 4 } };
+    saveUserConfig(cfg, configPath);
+    expect(buildUserConfig(configPath).pod?.warmReuse).toEqual({ gateRecheck: true, land: false, ta: false, minMatchSamples: 4 });
+    expect(buildUserConfig(configPath).pod?.lease?.perAccount).toBe(5);
+  });
+});
+
 describe('pod Grok API key opt-in', () => {
   test('only literal true enables the billed Pod credential path', () => {
     for (const [value, expected] of [[undefined, false], [false, false], ['true', false], [true, true]] as const) {
@@ -285,6 +331,30 @@ describe('pod Grok API key opt-in', () => {
 });
 
 describe('role model tiers', () => {
+  // ⛔ 이 블록은 해석 «층» 자체를 시험한다(tier·config·environment·default) — pod 하니스가 내려준
+  //    ELANOUS_ROLE_LLM_REVIEW(①b 고정층) · ELANOUS_LLM_PROVIDER/MODEL(활성 provider 고정)이 있으면
+  //    환경층이 tier·config·default 기대값을 덮어 써서 이 블록이 환경 오염으로 빨개진다(실측 2026-10).
+  //    블록 안에서만 치우고 끝나면 원복한다 — 시험 4가 스스로 ELANOUS_PR_REVIEW_MODEL 를 다룐다.
+  const hermeticEnvKeys = [
+    'ELANOUS_ROLE_LLM_REVIEW',
+    'ELANOUS_PR_REVIEW_MODEL',
+    'ELANOUS_LLM_PROVIDER',
+    'ELANOUS_LLM_MODEL',
+  ];
+  const hermeticEnvSaved = new Map<string, string | undefined>();
+  beforeAll(() => {
+    for (const key of hermeticEnvKeys) {
+      hermeticEnvSaved.set(key, process.env[key]);
+      delete process.env[key];
+    }
+  });
+  afterAll(() => {
+    for (const [key, value] of hermeticEnvSaved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
   test('resolves a configured role tier through each active provider ladder', () => {
     writeConfig({ llm: { provider: 'grok' }, roleModelTiers: { review: 'best' } });
     const grok = resolveRoleModel('review', buildUserConfig(configPath));

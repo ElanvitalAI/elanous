@@ -72,5 +72,32 @@ export function seedMirrorOnce(o: { host: string; commit: string; cwd: string; p
   return pending;
 }
 
+/**
+ * SI-SEED-DEFAULT — a default-source si-task Job (main HEAD, or `--base <branch>`) has no pinned sha, so the host resolves
+ * the branch tip once (`git ls-remote`, bounded) and makes sure the seeding tree has that commit (a bounded fetch of that
+ * one sha when it does not — objects only, no ref is moved). Never throws: a miss returns `reason` and the caller skips
+ * the seed (best effort — the Job keeps its GitHub path).
+ */
+export async function resolveDefaultSourceHead(o: { repoUrl: string; base?: string; cwd: string; git?: Push; limitMs?: number }): Promise<{ sha?: string; reason?: string }> {
+  const git = o.git ?? gitWithin;
+  const limitMs = o.limitMs ?? 30_000;
+  const base = o.base || 'main';
+  if (base.startsWith('-') || !/^[\w./-]+$/.test(base) || o.repoUrl.startsWith('-')) return { reason: 'invalid-ref' };
+  try {
+    const listed = await git(['ls-remote', '--', o.repoUrl, `refs/heads/${base}`], o.cwd, limitMs);
+    if (listed.rc !== 0) return { reason: 'ls-remote-failed' };
+    // Only the exact ref asked for — never the first `refs/heads/*` line (a branch named `a/refs/heads/main` must not pass).
+    const want = `refs/heads/${base}`;
+    const sha = listed.output.split(/\r?\n/).map((line) => line.split('\t')).find(([hash, ref]) => ref === want && /^[0-9a-f]{40}$/.test(hash ?? ''))?.[0];
+    if (!sha) return { reason: 'ls-remote-no-sha' };
+    if ((await git(['cat-file', '-e', `${sha}^{commit}`], o.cwd, limitMs)).rc === 0) return { sha };
+    const fetched = await git(['fetch', '--quiet', '--no-write-fetch-head', '--', o.repoUrl, sha], o.cwd, GATE_MIRROR_SEED_LIMIT_MS);
+    if (fetched.rc !== 0) return { reason: 'commit-fetch-failed' };
+    return (await git(['cat-file', '-e', `${sha}^{commit}`], o.cwd, limitMs)).rc === 0 ? { sha } : { reason: 'commit-not-local' };
+  } catch {
+    return { reason: 'resolve-threw' };
+  }
+}
+
 /** Test seam — forget the per-process seed memo. */
 export function resetMirrorSeedMemo(): void { seeded.clear(); }

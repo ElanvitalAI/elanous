@@ -10,6 +10,8 @@ export interface GroupBoxData extends Record<string, unknown> {
   group: string;
   state: GroupState;
   memberCount: number;
+  /** Editor-only step count; absent in live runs, which continue showing node count. */
+  stepCount?: number;
   /** Finished run that never entered any member — «기록 없음» rather than «대기». */
   unrecorded?: boolean;
   width: number;
@@ -32,7 +34,7 @@ export function GraphGroupBox({ data }: NodeProps) {
       <div className="pointer-events-auto flex items-center gap-2 px-2.5 py-1 text-xs">
         <span className="font-mono font-semibold text-text-primary">{box.group}</span>
         <span className="text-[11px]" style={{ color: tint }}>{box.unrecorded ? '기록 없음' : WORD[box.state]}</span>
-        <span className="text-[11px] text-text-tertiary">노드 {box.memberCount}</span>
+        <span className="text-[11px] text-text-tertiary">{box.stepCount === undefined ? `노드 ${box.memberCount}` : `걸음 ${box.stepCount}`}</span>
         {box.onCollapse && (
           <button type="button" onClick={(event) => { event.stopPropagation(); box.onCollapse?.(box.group); }}
             className="nodrag ml-auto rounded border border-border bg-background px-1.5 text-[11px] text-text-secondary">접기</button>

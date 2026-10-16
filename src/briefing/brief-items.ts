@@ -105,6 +105,25 @@ function needsDecision(item: BriefItem, today: string): boolean {
   return item.priority === 'P0' || (item.deadline !== null && deadlineDate(item.deadline) === today);
 }
 
+/**
+ * Reorder BRIEF_DOMAINS from already-recorded weekly action rates.
+ * Domains with total>0 sort by action rate (not raw event count).
+ * Domains with total=0 keep their relative fixed BRIEF_DOMAINS order.
+ * Missing rate data returns the default BRIEF_DOMAINS order unchanged.
+ */
+export function orderBriefDomains(actions?: BriefWeeklyActions | null): BriefDomain[] {
+  if (actions == null) return [...BRIEF_DOMAINS];
+  const byKind = actions.byKind;
+  if (!BRIEF_DOMAINS.some(domain => (byKind[domain]?.total ?? 0) > 0)) return [...BRIEF_DOMAINS];
+  return [...BRIEF_DOMAINS].sort((a, b) => {
+    const xTotal = byKind[a]?.total ?? 0;
+    const yTotal = byKind[b]?.total ?? 0;
+    const xRate = xTotal > 0 ? byKind[a]!.rate : 0;
+    const yRate = yTotal > 0 ? byKind[b]!.rate : 0;
+    return yRate - xRate || BRIEF_DOMAINS.indexOf(a) - BRIEF_DOMAINS.indexOf(b);
+  });
+}
+
 /** Unsent decisions needing immediate delivery, using the same KST deadline rule as slot pages. */
 export function pendingRealtime(items: readonly BriefItem[], now: Date): BriefItem[] {
   const today = dateKey(now, { timeZone: KST });
@@ -113,8 +132,9 @@ export function pendingRealtime(items: readonly BriefItem[], now: Date): BriefIt
 
 /**
  * One briefing page. Item text is copied verbatim.
- * Order: decisions due (P0, then a deadline of today) → domain groups →
- * duplicate claims dropped (same normalized sentence, most urgent kept).
+ * Order: decisions due (P0, then a deadline of today) → domain groups ordered
+ * by recorded weekly action rate (sampled high-rate first; zero-sample kinds
+ * keep BRIEF_DOMAINS order) → duplicate claims dropped (same normalized sentence, most urgent kept).
  */
 export function composeBriefMarkdown(items: readonly BriefItem[], slot: BriefSlot, now: Date): string {
   return composeBriefPage(items, slot, now).markdown;
@@ -124,7 +144,6 @@ export function composeBriefMarkdown(items: readonly BriefItem[], slot: BriefSlo
 export function composeBriefPage(
   items: readonly BriefItem[], slot: BriefSendSlot, now: Date,
   actions?: BriefWeeklyActions,
-  observedKinds?: ReadonlySet<BriefDomain>,
 ): { markdown: string; ids: number[] } {
   const today = dateKey(now, { timeZone: KST });
   // A duplicate left out of a delivered page stays unsent in the ledger, but must not reappear on a later page.
@@ -151,17 +170,7 @@ export function composeBriefPage(
     for (const item of decisions) lines.push(itemLine(item));
     lines.push('');
   }
-  const domains = [...BRIEF_DOMAINS];
-  // Measured action leads. An unobserved kind keeps its normal position; a sent-but-unobserved
-  // item is not evidence of being ignored. Keep every domain heading in this first slice.
-  if (actions && Object.values(actions.byKind).some(count => count.acted > 0)) {
-    domains.sort((a, b) => {
-      const x = actions.byKind[a], y = actions.byKind[b];
-      const xRate = observedKinds?.has(a) ? x.rate : 0;
-      const yRate = observedKinds?.has(b) ? y.rate : 0;
-      return yRate - xRate || BRIEF_DOMAINS.indexOf(a) - BRIEF_DOMAINS.indexOf(b);
-    });
-  }
+  const domains = orderBriefDomains(actions);
   for (const domain of domains) {
     const group = unique.filter(item => item.domain === domain && !decisionIds.has(item.id));
     if (group.length === 0) continue;
@@ -463,14 +472,7 @@ export class BriefItemsLedger {
         this.log('briefing.items', 'requirement-funnel-failed', { slot, error: error instanceof Error ? error.message : String(error) });
       }
     }
-    const since = this.weekStart(now);
-    const until = now.toISOString();
-    const observedKinds = new Set((db.query(`SELECT DISTINCT i.domain FROM items i
-      JOIN reactions r ON r.item_id = i.id
-      WHERE r.reacted_at >= ? AND r.reacted_at <= ? AND EXISTS (
-        SELECT 1 FROM sends s WHERE s.item_id = i.id AND s.sent_at >= ? AND s.sent_at <= ?
-      )`).all(since, until, since, until) as Array<{ domain: BriefDomain }>).map(row => row.domain));
-    const composed = composeBriefPage([...items, ...funnelItems], slot, now, this.weeklyActionsFromDb(db, now), observedKinds);
+    const composed = composeBriefPage([...items, ...funnelItems], slot, now, this.weeklyActionsFromDb(db, now));
     // Ephemeral funnel lines appear on the page but have no ledger row to mark sent.
     const page = { markdown: composed.markdown, ids: composed.ids.filter(id => id > 0) };
     const candidates = (slot === 'realtime' ? pendingRealtime(items, now) : items.filter(item => item.sent_at === null && beforeSlot(item.created_at, slot, now))).length;

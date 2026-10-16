@@ -16,7 +16,7 @@ import { collectPodArtifacts } from './pod-artifact-return.js';
 import { getDefaultLogStore, type LogStore } from '../../mss/logging/log-store.js';
 import { podBunCacheVolume } from './pod-bun-cache.js';
 import { POD_JOB_TTL_AFTER_FINISHED_SECONDS } from './pod-lease.js';
-import { podHostDirsScript, podInstallSlotsVolume } from './pod-install-slots.js';
+import { podHostDirsCheckScript, podInstallSlotsVolume, prepareHostDirsOnce, type HostDirsPrepResult, podHostDirsScript } from './pod-install-slots.js';
 import { type PodPoolMember, PodPoolScheduler, resolvePodPoolSpec, parsePodPool, checkPodPool, syncPoolImages, type PoolKubectl } from './pod-pool.js';
 import { podSkillsDigest, readSkillEnvFiles, resolvePodSkills } from './pod-skills.js';
 import { podSourceScript, type PodSource } from './pod-source-receive.js';
@@ -40,11 +40,18 @@ export const POD_LITE_IMAGE = 'elanous-harness-lite:local';
 
 export const POD_LITE_MEMORY_LIMIT = '2Gi';
 
+/** W5 (10-15 #27801): where a memory-backed TMPDIR is mounted for release gate shards — the overlayfs `/tmp` made SQLite
+ *  tests take 0.4~5s per turn (once 124s). tmpfs pages count against the container memory limit, so the caller's cap
+ *  (`tmpfsSizeLimit`) stays small next to the 16Gi shard limit (request 6Gi). */
+export const POD_TMPFS_MOUNT_PATH = '/tmp-mem';
+
 /** 요청은 한도를 넘을 수 없다(쿠버네티스가 Job 을 거부한다) — lite 2Gi 처럼 한도가 기본 요청보다 작으면 한도로 맞춘다. */
 /** The command Job container's CPU limit when the caller names none (GATE-SPEED A3①: unchanged default). */
 export const POD_COMMAND_CPU_LIMIT_DEFAULT = '4';
 /** 게이트 조각·pod-command 의 CPU 요청 기본 — 하니스 Pod(POD_CHILD_REQUESTS.cpu)와 따로 둔다(조각은 bun test 로 CPU 를 실제로 쓴다). */
 export const POD_COMMAND_CPU_REQUEST_DEFAULT = '1';
+/** Gate and command Pods retain their measured 6Gi scheduler request; si-task admission uses its own size. */
+export const POD_COMMAND_MEMORY_REQUEST_DEFAULT = '6Gi';
 
 /** Container CPU request/limit override. Omitted fields keep the defaults (request `POD_COMMAND_CPU_REQUEST_DEFAULT` · limit 4). */
 export interface PodCpu { request?: string; limit?: string }
@@ -93,9 +100,9 @@ export function parsePodCpu(value: unknown, label = 'cpu'): PodCpu | undefined {
 
 export function memoryRequestWithin(limit: string | undefined): string {
   const gi = (value: string | undefined) => { const m = /^(\d+)Gi$/.exec(value ?? ''); return m ? Number(m[1]) : null; };
-  const request = gi(POD_CHILD_REQUESTS.memory);
+  const request = gi(POD_COMMAND_MEMORY_REQUEST_DEFAULT);
   const max = gi(limit);
-  return request !== null && max !== null && request > max ? limit! : POD_CHILD_REQUESTS.memory;
+  return request !== null && max !== null && request > max ? limit! : POD_COMMAND_MEMORY_REQUEST_DEFAULT;
 }
 
 /** POD7 must-fix: the skill list alone can't tell a network-only job from one that needs ffmpeg/browser — so lite is
@@ -133,18 +140,24 @@ export function tailBytes(text: string, maxBytes: number): string {
   return `…[앞 ${bytes.length - maxBytes}바이트 생략]\n${cut.subarray(start).toString('utf8')}`;
 }
 
-/** The isolation probe: wait until the NetworkPolicy blocks the host/prod daemons, then run `onPass` (default `exit 0`). */
-function isolationGateScript(onPass = 'exit 0'): string {
-  return `ok=0
-for i in $(seq 1 60); do
-  if curl -s -m 1 -o /dev/null http://host.orb.internal:31415/health || curl -s -m 1 -o /dev/null http://core.elanous-prod:8080/; then ok=0; else ok=$((ok+1)); fi
-  [ "$ok" -ge 3 ] && { echo "[gate] isolation enforced after \${i} probes"; ${onPass}; }
-  sleep 0.5
-done
-echo "[gate] ISOLATION NOT ENFORCED within 30s"; exit 1`;
+/**
+ * The isolation probe: wait until the NetworkPolicy blocks the host/prod daemons, then go on with the child shell.
+ * GATE-WARM-BOOT-NO-INIT (10-15) — this used to be the `isolation-gate` init container; it is now the child shell's first
+ * lines, before any credential is read. Same probes, same log lines, same exit 1 when isolation is not enforced in 30 s.
+ * Measured on node-b k3d (#27805): init 2 → 354 s · init 1 → 41 s · none → 1 s from Pod creation to the child start.
+ */
+export function isolationGateLines(): string {
+  return `elanous_isolation_gate() {
+  local ok=0 i
+  for i in $(seq 1 60); do
+    if curl -s -m 1 -o /dev/null http://host.orb.internal:31415/health || curl -s -m 1 -o /dev/null http://core.elanous-prod:8080/; then ok=0; else ok=$((ok+1)); fi
+    [ "$ok" -ge 3 ] && { echo "[gate] isolation enforced after \${i} probes"; return 0; }
+    sleep 0.5
+  done
+  echo "[gate] ISOLATION NOT ENFORCED within 30s"; exit 1
 }
-
-const GATE = isolationGateScript();
+elanous_isolation_gate || exit 1`;
+}
 
 /** Export the command's log store into the existing outbox return channel without changing the command exit status. */
 const COMMAND_LOG_EXPORT = `if mkdir -p "$HOME/outbox/pod-logs" && elanous --test="$HOME/.elanous-test" logs --instance prod --since 12h --limit 20000 --json --json-data > "$HOME/outbox/pod-logs/logs.jsonl"; then
@@ -182,7 +195,7 @@ if [ -d "$HOME/outbox" ]; then
     else
       printf 'ELANOUS_POD_ARTIFACT_SKIPPED %s %s\\n' "$relative" "$size"
     fi
-  done < <(find "$HOME/outbox" -type f -print0)
+  done < <(find "$HOME/outbox" -type f -print0 | while IFS= read -r -d '' f; do printf '%s\\t%s\\0' "$(( $(wc -c < "$f") ))" "$f"; done | LC_ALL=C sort -z -t $'\\t' -k1,1n -k2 | while IFS= read -r -d '' row; do printf '%s\\0' "\${row#*$'\\t'}"; done)
 fi`;
 
 export interface PodCommandJobInput {
@@ -208,9 +221,13 @@ export interface PodCommandJobInput {
   memoryLimit?: string;
   /** GATE-SPEED A3①: CPU request/limit override (release gate shards only). Omitted = request 1 / limit 4. */
   cpu?: PodCpu;
+  /** W5 — emptyDir{medium: Memory} sizeLimit mounted at {@link POD_TMPFS_MOUNT_PATH} ⊕ `TMPDIR` (release gate shards only). Omitted = image `/tmp`. */
+  tmpfsSizeLimit?: string;
   source?: PodSource;
   deadlineSeconds: number;
   runId?: string;
+  /** GATE-WARM-BOOT-NO-INIT fallback: the node-side hand-over did not run, so a root init container hands the hostPath dirs to uid 1000. */
+  hostDirsInit?: boolean;
 }
 
 function bashSingleQuote(value: string): string {
@@ -226,8 +243,11 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
   const grok = o.llm === 'grok';
   const bunCache = o.bunCache ? podBunCacheVolume(o.bunCache) : undefined;
   const installSlots = o.installSlots ? podInstallSlotsVolume(o.installSlots) : undefined;
-  // hostPath directories the uid-1000 child writes: a root init container hands them over (DirectoryOrCreate is root 0755).
+  // hostPath directories the uid-1000 child writes. DirectoryOrCreate makes them root 0755, so runPodCommand hands them to
+  // uid 1000 once per node (prepareHostDirsOnce); the child only reports a directory it still cannot write.
   const hostDirMounts = [...(bunCache ? [bunCache.volumeMount] : []), ...(installSlots ? [installSlots.volumeMount] : [])];
+  const tmpfs = o.tmpfsSizeLimit?.trim() || undefined;
+  const tmpfsMounts = tmpfs ? [{ name: 'tmp-mem', mountPath: POD_TMPFS_MOUNT_PATH }] : [];
   const cpu = resolvePodCpu(o.cpu);
   const quotedArgs = o.command.map(bashSingleQuote).join(' ');
   const credLines = [
@@ -237,12 +257,14 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
       : []),
   ];
   const script = [
+    isolationGateLines(),
     'set -u',
     ...credLines,
     'curl -s -m 3 -o /dev/null http://host.orb.internal:31415/health && { echo "[pod] ISOLATION FAIL"; exit 3; }',
     ...(o.clone
       ? ['export GH_TOKEN="$(cat /creds/gh-token)" && gh auth setup-git', podSourceScript(o.source ?? { kind: 'default' }, o.repoUrl)]
       : ['mkdir -p ~/work && cd ~/work']),
+    ...(hostDirMounts.length ? [podHostDirsCheckScript(hostDirMounts)] : []),
     ...(bunCache ? [bunCache.shellPrefix] : []),
     `set -- ${quotedArgs}`,
     '"$@"',
@@ -270,14 +292,10 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
         spec: {
           restartPolicy: 'Never',
           securityContext: { runAsUser: 1000, fsGroup: 1000 },
-          initContainers: [
-            // GATE-WARM-BOOT (10-15): ONE init container. Each extra container cost minutes on a loaded k3d node (the measured
-            // gap between a finished init script and the next container start), so the root host-dir hand-over runs inside
-            // the isolation init after the probe passes instead of as a second `host-dirs` container.
-            hostDirMounts.length
-              ? { name: 'isolation-gate', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never', securityContext: { runAsUser: 0 }, command: ['bash', '-c'], args: [isolationGateScript(podHostDirsScript(hostDirMounts))], volumeMounts: hostDirMounts.map((mount) => ({ ...mount })) }
-              : { name: 'isolation-gate', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never', command: ['bash', '-c'], args: [GATE] },
-          ],
+          // Normal path: no init container. Fallback only when the node-side hand-over did not run (no member · prep failed).
+          ...(o.hostDirsInit && hostDirMounts.length ? { initContainers: [
+            { name: 'host-dirs', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never', securityContext: { runAsUser: 0 }, command: ['bash', '-c'], args: [podHostDirsScript(hostDirMounts)], volumeMounts: hostDirMounts.map((mount) => ({ ...mount })) },
+          ] } : {}),
           containers: [{
             name: 'child', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never',
             resources: { requests: { ...POD_CHILD_REQUESTS, cpu: cpu.request, memory: memoryRequestWithin(o.memoryLimit) }, limits: { memory: o.memoryLimit ?? '16Gi', cpu: cpu.limit } },
@@ -286,18 +304,21 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
               ...(o.runId ? [{ name: 'ELANOUS_RUN_ID', value: o.runId }] : []),
               { name: 'ELANOUS_SUBSTRATE', value: 'pod' },
               { name: 'ELANOUS_POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } },
+              ...(tmpfs ? [{ name: 'TMPDIR', value: POD_TMPFS_MOUNT_PATH }] : []),
             ],
-            ...(secretKeys || o.hostMirror || hostDirMounts.length ? { volumeMounts: [
+            ...(secretKeys || o.hostMirror || hostDirMounts.length || tmpfs ? { volumeMounts: [
               ...(secretKeys ? [{ name: 'creds', mountPath: '/creds', readOnly: true }] : []),
               ...(o.hostMirror ? [{ name: 'host-mirror', mountPath: '/host-mirror', readOnly: true }] : []),
               ...hostDirMounts,
+              ...tmpfsMounts,
             ] } : {}),
           }],
-          ...(secretKeys || o.hostMirror || hostDirMounts.length ? { volumes: [
+          ...(secretKeys || o.hostMirror || hostDirMounts.length || tmpfs ? { volumes: [
             ...(secretKeys ? [{ name: 'creds', secret: { secretName: `${o.name}-creds`, defaultMode: 0o400 } }] : []),
             ...(o.hostMirror ? [{ name: 'host-mirror', hostPath: { path: o.hostMirror, type: 'Directory' } }] : []),
             ...(bunCache ? [bunCache.volume] : []),
             ...(installSlots ? [installSlots.volume] : []),
+            ...(tmpfs ? [{ name: 'tmp-mem', emptyDir: { medium: 'Memory', sizeLimit: tmpfs } }] : []),
           ] } : {}),
         },
       },
@@ -374,6 +395,8 @@ export interface RunPodCommandOptions {
   memoryLimit?: string;
   /** GATE-SPEED A3①: CPU request/limit override — only the release gate passes it. Omitted = request 1 / limit 4. */
   cpu?: PodCpu;
+  /** W5 — memory-backed TMPDIR sizeLimit mounted at {@link POD_TMPFS_MOUNT_PATH}; only the release gate passes it. Omitted = image `/tmp`. */
+  tmpfsSizeLimit?: string;
   /** POD7: 호출부가 «네트워크 스킬만 쓰는 명령»이라고 말할 때만 lite 이미지 ⊕ 2Gi. */
   lite?: boolean;
   source?: PodSource;
@@ -398,6 +421,8 @@ export interface RunPodCommandOptions {
   seedMirror?: (o: { host: string; commit: string; cwd: string }) => Promise<MirrorSeedResult | undefined>;
   /** GATE-WARM-BOOT — the git tree the seed pushes from (default: the process cwd — the gate runs in the repo tree). */
   mirrorSeedCwd?: string;
+  /** GATE-WARM-BOOT-NO-INIT — hands the hostPath dirs to uid 1000 on the member's nodes (test seam · default {@link prepareHostDirsOnce}). */
+  prepareHostDirs?: (o: { member: PodPoolMember; hostPaths: readonly string[] }) => Promise<HostDirsPrepResult | undefined>;
   checkPool?: typeof checkPodPool;
   syncImages?: typeof syncPoolImages;
   imageCommit?: string | null;
@@ -417,6 +442,8 @@ export interface RunPodCommandOptions {
 /** GATE-POD-RESULT-MARKER — the child script's final line (`\n<marker> <token> rc=<n>\n`), printed after the artifact emit. */
 export const POD_RESULT_MARKER = '__ELANOUS_POD_DONE__';
 /** The marker bound to one launch (`token` = the launch's random id · the Job name when the manifest has no launch). */
+/** Full-log re-reads after an early marker return before the artifacts count as lost (GATE-POD-RESULT-MARKER follow-up). */
+export const POD_MARKER_LOG_RETRIES = 2;
 export function podResultMarker(token: string): string { return `${POD_RESULT_MARKER} ${token}`; }
 
 /** Split the child's logs into the command output (marker tail removed, bytes otherwise unchanged) and the marker rc (null = no marker for this token). */
@@ -563,6 +590,24 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
         .catch((error: unknown) => ({ host: member!.sshHost!, ok: false, ms: 0, detail: String(error).slice(0, 300) }));
       log('pod.command-job', 'mirror-seed', { host: member.sshHost, commit: options.source.sha, ok: seed?.ok ?? false, ms: seed?.ms ?? 0, ...(seed?.detail ? { detail: seed.detail } : {}) });
     }
+    // GATE-WARM-BOOT-NO-INIT (10-15): the hostPath dirs the uid-1000 child writes are handed over on the node itself, once per
+    // member·paths in this process (no init container). Best effort: a failure only logs; the child then falls back.
+    const hostDirPaths = [...(bunCache ? [bunCache] : []), ...(installSlots ? [installSlots] : [])];
+    const prepareHostDirs = options.prepareHostDirs ?? (options.kubectl ? undefined : prepareHostDirsOnce);
+    let hostDirsPrepared = false;
+    if (hostDirPaths.length) {
+      // Observed whether or not a hand-over runs: no member (nothing to reach) and an injected kubectl without a seam are skips.
+      if (!member) log('pod.command-job', 'host-dirs-prep', { ok: false, reason: 'no-pool-member', paths: hostDirPaths });
+      else if (!prepareHostDirs) log('pod.command-job', 'host-dirs-prep', { ok: false, reason: 'prep-disabled', paths: hostDirPaths });
+      else {
+        const prep = await prepareHostDirs({ member, hostPaths: hostDirPaths })
+          .catch((error: unknown) => ({ host: member!.sshHost ?? 'local', ok: false, ms: 0, detail: String(error).slice(0, 300) }));
+        hostDirsPrepared = prep?.ok === true;
+        log('pod.command-job', 'host-dirs-prep', { host: prep?.host ?? member.sshHost ?? 'local', ok: prep?.ok ?? false, ms: prep?.ms ?? 0, paths: hostDirPaths, ...(prep?.detail ? { detail: prep.detail } : {}) });
+      }
+    }
+    // Any path where the node-side hand-over did not succeed keeps the old in-Pod hand-over (review mf: uid 1000 could not write).
+    const hostDirsInit = hostDirPaths.length > 0 && !hostDirsPrepared;
     const ghToken = options.clone ? (options.ghToken ?? defaultGhToken)() : undefined;
     const secret = commandJobSecret({ name, namespace, launch, skills, skillEnvText, ...(grokAuth !== undefined ? { grokAuth } : {}), ...(ghToken !== undefined ? { ghToken } : {}) });
     if (secret) {
@@ -573,8 +618,9 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       name, namespace, launch, image: imageRef ?? image,
       ...(imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}),
       repoUrl, command, skills, ...(options.returnLogs ? { returnLogs: true } : {}), ...(llm ? { llm } : {}), ...(options.clone ? { clone: true } : {}),
-      ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(installSlots ? { installSlots } : {}), ...(memoryLimit ? { memoryLimit } : {}), ...(options.cpu ? { cpu: options.cpu } : {}), deadlineSeconds,
+      ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(installSlots ? { installSlots } : {}), ...(memoryLimit ? { memoryLimit } : {}), ...(options.cpu ? { cpu: options.cpu } : {}), ...(options.tmpfsSizeLimit ? { tmpfsSizeLimit: options.tmpfsSizeLimit } : {}), deadlineSeconds,
       ...(options.runId ? { runId: options.runId } : {}),
+      ...(hostDirsInit ? { hostDirsInit: true } : {}),
     });
     kubectl(['-n', namespace, 'delete', 'job', '-l', own, '--ignore-not-found']);
     const applied = kubectl(['apply', '-f', '-'], JSON.stringify(manifest));
@@ -611,7 +657,21 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       } else unreadableSince = null;
       await sleep(options.pollMs ?? 15_000);
     }
-    const logsResult = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child']);
+    let logsResult = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child']);
+    // Marker path returns before the Job condition — a full-log read can hit the same transient window the tail read
+    // already survived (container log rotation · API hiccup). Retry it a little before calling the artifacts lost.
+    // A read that «succeeds» but stops before this launch's marker (empty · cut off) is incomplete too (review mf · #27842).
+    const fullLogIncomplete = (r: { status: number | null; stdout: string }) =>
+      r.status !== 0 || splitPodResultMarker(r.stdout.startsWith('\n') ? r.stdout : `\n${r.stdout}`, launch).rc === null;
+    for (let attempt = 1; markerRc !== null && fullLogIncomplete(logsResult) && attempt <= POD_MARKER_LOG_RETRIES; attempt++) {
+      log('pod.command-job', 'result-marker-log-retry', { job: name, attempt, ...(logsResult.status !== 0 ? { error: (logsResult.stderr ?? '').trim().slice(0, 200) } : { reason: 'marker-missing-in-full-log' }) });
+      await sleep(options.pollMs === undefined ? 1_000 : Math.min(options.pollMs, 1_000));   // ≤2 re-reads within ≈2s total
+      logsResult = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child']);
+    }
+    // Still without this launch's marker after the retries: the artifacts are not trusted as complete (explicit failure).
+    if (markerRc !== null && logsResult.status === 0 && fullLogIncomplete(logsResult)) {
+      logsResult = { ...logsResult, status: 1, stderr: 'full log ended before this launch\'s result marker (incomplete after retries)' };
+    }
     const logsFailed = logsResult.status !== 0;
     const logs = logsFailed ? '' : splitPodResultMarker(logsResult.stdout, launch).logs;
     const artifactDir = artifactRoot;

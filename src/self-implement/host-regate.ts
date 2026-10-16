@@ -11,6 +11,7 @@ import { releaseGitDiffPaths, releasePathHold, releasePathHoldShouldPost, releas
 import { detectTestInterference, failedNamesFromStreams, parseFailureCount, runBunTest, type MeasuredRun } from '../../scripts/detect-test-interference.js';
 import { MAX_INSPECTED_TEST_FILES, runTestInterferenceGate } from '../../scripts/ci-test-interference-gate.js';
 import { pwaGraph, pwaReach } from '../../scripts/ci-pwa-build-gate.js';
+import { changedPathPairs, changedTsFiles, readGitFile, requiredExportFieldsInChanges } from '../../scripts/ci-typecheck-changed.js';
 import { classifyMergeFailure, clipRegateDetail, parseConflictFiles, type HostRegateFailure } from './regate-detail.js';
 import { buildImporterTestIndex, isTestPath } from './importer-test-index.js';
 
@@ -54,6 +55,48 @@ export type HostRegateDeps = {
   runExposeGate?: typeof runExposeGate;
   syncMergedChecklist?: typeof import('../release-loop/merged-pr-checklist.js').syncMergedPrChecklist;
 };
+
+/**
+ * REGATE-PWA-DEPS-FOR-TSC (#26698 → #27484 must-fix): the typecheck gate requires apps/pwa dependencies for
+ * `runsPwa || wholeRepository` — present .ts/.tsx under apps/pwa/ in its own changed set, or any of its
+ * whole-repository promotion triggers (필수 export 필드 추가 · exported 심볼 삭제 · exported 함수 매개변수 증가,
+ * in ANY changed file). Decide it with the gate's own collectors — changedTsFiles ⊕ changedPathPairs ⊕
+ * requiredExportFieldsInChanges — against the candidate worktree and the same TSC_BASE_REF the gate receives,
+ * so dependency provision and restoration can never be narrower than the real typecheck scope. Git observation
+ * goes through the regate's injectable `command` seam (hermetic tests); changedTsFiles composes whitespace-token
+ * command strings, so its shell runner just splits them into (bin, args).
+ */
+export function typecheckGateTouchesPwa(
+  worktree: string,
+  typecheckBase: string,
+  command: NonNullable<HostRegateDeps['command']>,
+): boolean {
+  const git = (bin: string, args: readonly string[]): unknown => {
+    const r = command(bin, args, worktree);
+    if (r.status !== 0) throw Object.assign(new Error((r.stderr || r.stdout || `${bin} exited ${String(r.status)}`).trim()), { status: r.status });
+    return r.stdout;
+  };
+  const changed = changedTsFiles((cmd) => {
+    const [bin, ...args] = cmd.split(' ');
+    return git(bin, args) as string;
+  }, { ...process.env, TSC_BASE_REF: typecheckBase }, worktree);
+  // Collection failures make the gate exit(1) before its dependency requirement; an empty changed set makes it
+  // pass without running tsc — neither path can demand apps/pwa dependencies.
+  if ((changed.failures?.length ?? 0) > 0 || changed.files.size === 0) return false;
+  // runsPwa: a present .ts/.tsx under apps/pwa/ in the gate's own changed set.
+  if ([...changed.files].some((file) => file.startsWith('apps/pwa/'))) return true;
+  const triggers = requiredExportFieldsInChanges(
+    changed.files,
+    changed.base,
+    changedPathPairs(changed.base, git),
+    (ref, path) => readGitFile(ref, path, git),
+    (file) => readFileSync(join(worktree, file), 'utf8'),
+  );
+  // A judgement failure makes the gate exit(1) before its dependency requirement, like the collection failures above.
+  if (triggers.failure) return false;
+  // wholeRepository: any promotion trigger widens the inspection to the whole repository, apps/pwa included.
+  return triggers.fields.length > 0 || triggers.removedSymbols.length > 0 || triggers.parameterIncreases.length > 0;
+}
 
 const SPAWN_MAX_BUFFER = 256 * 1024 * 1024;
 
@@ -271,7 +314,10 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
   const result = (event: 'passed' | 'failed' | 'unmeasured', step?: string, detail?: string, facts: Omit<HostRegateFailure, 'step' | 'detail'> = {}): HostRegateResult => {
     if (step) failures.push({ step, detail: clipRegateDetail(detail ?? 'unknown'), ...facts });
     log(event, { pr: input.prNumber, files, os: process.platform, ...interferenceNote, ...(step ? { failedStep: step, detail: clipRegateDetail(detail ?? 'unknown'), ...facts } : {}) });
-    return { passed: event === 'passed', failures, os: process.platform, ...(input.verifyOnly ? { status: event, ...(verifiedBase ? { baseCommit: verifiedBase } : {}) } : {}) };
+    // TA-REGATE-UNMEASURED — noMerge(TA 재게이트) 도 status 를 싣는다: draft `pr-head` 거부 같은 «못 잼»을 «실패»와 가르게.
+    return { passed: event === 'passed', failures, os: process.platform,
+      ...(input.verifyOnly || input.noMerge ? { status: event } : {}),
+      ...(input.verifyOnly && verifiedBase ? { baseCommit: verifiedBase } : {}) };
   };
   const run = (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv): string => {
     const r = command(bin, args, cwd, env);
@@ -305,6 +351,11 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     let stalePrBase: string | undefined;
     const initialPrBase = baseCommit;
     let buildPwa = false;
+    // REGATE-PWA-DEPS-FOR-TSC (#26698 → #27484 must-fix): the typecheck gate picks its own changed set and its own
+    // whole-repository promotion triggers — TSC_BASE_REF..HEAD — which can carry apps/pwa files that landed on
+    // main after this PR branched, and root-file export changes that widen the inspection to the whole repository.
+    // Set in the worktree phase below.
+    let typecheckTouchesPwa = false;
     try {
       let fetchedBase = fetchRef(`refs/heads/${baseRefName}`, 'base');
       if (input.verifyOnly) { baseCommit = fetchedBase; verifiedBase = fetchedBase; }
@@ -406,7 +457,14 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
       const provide = (dir: string, marker: string): void => provideCheckoutDependencies(candidate, input.repoRoot, dir, marker, (cwd) => { run('bun', ['install', '--frozen-lockfile'], cwd); });
       provide('', 'typescript');
       buildPwa = needsPwaBuild(files, worktree);
-      if (buildPwa && existsSync(join(worktree, 'apps/pwa'))) provide('apps/pwa', 'next');
+      // REGATE-PWA-DEPS-FOR-TSC (#26698 → #27484 must-fix): provide('apps/pwa') must also fire when the typecheck
+      // gate's own scope — the same TSC_BASE_REF..HEAD it receives below — holds present .ts/.tsx files under
+      // apps/pwa/ OR any of its whole-repository promotion triggers (필수 export 필드 추가 · exported 심볼 삭제 ·
+      // exported 함수 매개변수 증가, in ANY changed file), even when buildPwa never turns on: without app deps
+      // the gate fails such runs as «의존성 없음» for environment reasons, not code defects.
+      const typecheckBase = input.verifyOnly ? baseCommit : base;
+      typecheckTouchesPwa = typecheckGateTouchesPwa(worktree, typecheckBase, command);
+      if ((buildPwa || typecheckTouchesPwa) && existsSync(join(worktree, 'apps/pwa'))) provide('apps/pwa', 'next');
     } catch (e) { return result('unmeasured', 'worktree', String(e)); }
     try {
       const interferenceOptions = { neighbors: !input.verifyOnly };
@@ -427,7 +485,7 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     }
     // The checked checkout is shared with interference/exposure gates. Verify dependencies at the
     // typecheck boundary as well: a missing PWA link here made #27414 fail as an unmeasured host regate.
-    if (buildPwa && !existsSync(join(worktree, 'apps/pwa/node_modules'))) {
+    if ((buildPwa || typecheckTouchesPwa) && !existsSync(join(worktree, 'apps/pwa/node_modules'))) {
       let failure: string | null = null;
       try {
         if (existsSync(join(worktree, 'apps/pwa'))) {

@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { ORIGINAL_ASK_MARKER } from '../self-implement/goal-author.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -64,6 +64,9 @@ import {
   type HarnessWorktreeListObservation,
   openHarnessProcessHandle,
 } from './harness-cli-command.js';
+
+const harnessTestCwd = process.cwd();
+afterEach(() => { process.chdir(harnessTestCwd); });
 
 const MEASURED_LAUNCHCTL_LIST = [
   '46480   0     com.elanous.nexus',
@@ -1926,6 +1929,57 @@ describe('harness CLI command', () => {
       dispatch.mockRestore();
       process.exitCode = exit ?? 0;
       rmSync(goal, { force: true });
+    }
+  });
+
+  test('harness ask reports an occupied-path preflight as launch-failed through the parent CLI', async () => {
+    const root = mkdtempSync(join(tmpdir(), `pod-preflight-parent-${crypto.randomUUID()}-`));
+    const origin = mkdtempSync(join(tmpdir(), `pod-preflight-origin-${crypto.randomUUID()}-`));
+    const goal = join(root, 'goal.md');
+    const previousCwd = process.cwd();
+    execFileSync('git', ['init', '-q', '-b', 'main', root]);
+    execFileSync('git', ['-C', root, 'config', 'user.name', 'Harness CLI test']);
+    execFileSync('git', ['-C', root, 'config', 'user.email', 'harness-cli@example.invalid']);
+    mkdirSync(join(root, 'src'));
+    writeFileSync(join(root, 'src', 'occupied.ts'), 'export {};\n');
+    writeFileSync(goal, 'Original ask (verbatim, unmodified):\n```\n신설: src/occupied.ts\n```\n## TRACED PATHS\n- src/occupied.ts\n');
+    execFileSync('git', ['-C', root, 'add', '.']);
+    execFileSync('git', ['-C', root, 'commit', '-qm', 'occupied path fixture']);
+    execFileSync('git', ['clone', '-q', '--bare', root, origin]);
+    execFileSync('git', ['-C', root, 'remote', 'add', 'origin', origin]);
+    execFileSync('git', ['-C', origin, 'symbolic-ref', 'HEAD', 'refs/heads/main']);
+    const previousState = process.env.ELANOUS_STATE_DIR;
+    const previousExit = process.exitCode;
+    const errors: string[] = [];
+    const logs: Array<{ category: string; event: string; data: unknown }> = [];
+    const originalError = console.error;
+    const originalLog = debug.log;
+    process.chdir(root);
+    process.env.ELANOUS_STATE_DIR = root;
+    process.exitCode = 0;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    debug.log = ((category: string, event: string, data?: unknown) => { logs.push({ category, event, data }); }) as typeof debug.log;
+    try {
+      const { program } = install(async () => {}, async () => {});
+      await program.parseAsync(['node', 'elanous', 'harness', 'ask', goal, '--substrate', 'pod', '--pod-pool', 'pool-test:1']);
+
+      expect(process.exitCode).toBe(2);
+      const output = errors.join('\n');
+      expect(output).toMatch(/\[self-dev\] run (run-[0-9a-f-]+) \[preflight:new-path-occupied:[0-9a-f-]+\]/);
+      const runId = output.match(/\[self-dev\] run (run-[0-9a-f-]+) /)?.[1];
+      expect(runId).toBeDefined();
+      expect(loadRunLedger(runId!)?.some((entry) => entry.event === 'preflight-refused' && entry.data.path === 'src/occupied.ts')).toBe(true);
+      expect(logs).toContainEqual(expect.objectContaining({ category: 'harness.pod', event: 'exit-classified', data: expect.objectContaining({ runId, reason: 'preflight-refused', status: 2 }) }));
+      expect(loadRunLedger(runId!)?.some((entry) => entry.event === 'stop' && entry.data.class === 'launch-failed')).toBe(true);
+    } finally {
+      console.error = originalError;
+      debug.log = originalLog;
+      process.exitCode = previousExit ?? 0;
+      process.chdir(previousCwd);
+      if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousState;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(origin, { recursive: true, force: true });
     }
   });
 
@@ -3966,5 +4020,52 @@ describe('recordHarnessPodStop — AUT-POD-EXIT-UNCLASSIFIED wiring', () => {
       expect(entries[0]!.data.tail).toEqual([]);
       expect(entries[0]!.data.cause).toBe('Pod exit 1: unknown');
     }
+  });
+});
+
+test('occupied new path preflight remains a deterministic refusal, not a Pod failure', () => {
+  const attemptId = '01234567-89ab-cdef-0123-456789abcdef';
+  const runId = 'run-0123456789abcdef';
+  const line = `[self-dev] run ${runId} [preflight:new-path-occupied:${attemptId}] 신설 traced path 가 이미 점유됨: src/taken.ts — 골의 신설: 경로를 바로잡아야 한다`;
+  const receipt = { runId, event: 'preflight-refused', data: { kind: 'occupied-new-traced-path', path: 'src/taken.ts', attemptId } };
+  expect(classifyHarnessPodExit({ status: 2 }, `${line}\n`, {
+    runId: receipt.runId, loadLedger: () => [receipt],
+  })).toEqual({
+    reason: 'preflight-refused', lines: [line],
+  });
+  // A Pod may print the same text; without the matching host receipt and refusal exit, it is not a host preflight.
+  const podFailureEvidence = { runId: receipt.runId, event: 'job-applied', data: {} };
+  expect(classifyHarnessPodExit({ status: 1 }, `${line}\n`, {
+    runId: receipt.runId, loadLedger: () => [podFailureEvidence], hasJobApplied: () => true,
+  }).reason).toBe('unknown');
+  expect(classifyHarnessPodExit({ status: 2 }, `${line}\n`, {
+    runId: receipt.runId, loadLedger: () => [podFailureEvidence], hasJobApplied: () => true,
+  }).reason).toBe('unknown');
+  const casesThatCannotProveRefusal = [
+    { ...receipt, runId: 'run-ffffffffffffffff' },
+    { ...receipt, data: { ...receipt.data, attemptId: 'fedcba98-7654-3210-fedc-ba9876543210' } },
+    { ...receipt, data: { ...receipt.data, kind: 'other' } },
+    { ...receipt, data: { ...receipt.data, path: 'src/other.ts' } },
+  ];
+  for (const invalidReceipt of casesThatCannotProveRefusal) {
+    expect(classifyHarnessPodExit({ status: 2 }, `${line}\n`, {
+      runId: receipt.runId, loadLedger: () => [invalidReceipt], hasJobApplied: () => true,
+    }).reason).toBe('unknown');
+  }
+  expect(classifyHarnessPodExit({ status: null, signal: 'SIGTERM' }, `${line}\n`, {
+    runId: receipt.runId, loadLedger: () => [receipt],
+  }).reason).toBe('signal');
+  // An append-only receipt from an earlier attempt with the same run ID cannot classify this attempt.
+  expect(classifyHarnessPodExit({ status: 2 }, `${line}\n`, {
+    runId: receipt.runId, loadLedger: () => [receipt, podFailureEvidence], hasJobApplied: () => true,
+  }).reason).toBe('unknown');
+  let stop: { site?: string; class?: string; cause?: string; nextMove?: string } | undefined;
+  expect(recordHarnessPodStop('run-0123456789abcdef', 2, { reason: 'preflight-refused', lines: [line] }, line, {
+    loadLedger: () => null,
+    record: ((input: typeof stop) => { stop = input; return {} as never; }) as never,
+  })).toBe(true);
+  expect(stop).toMatchObject({
+    site: 'preflight', class: 'launch-failed', cause: 'Preflight refused: occupied new traced path',
+    nextMove: 'Correct the declared new path in the goal before relaunch',
   });
 });

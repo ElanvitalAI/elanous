@@ -14,7 +14,7 @@ import {
   _setSelfImplementDecomposeForTesting,
   _setSelfImplementFabricDecomposeForTesting,
   _setSelfImplementFabricDecomposeConfigReaderForTesting,
-  _setSelfImplementSeamsFactoryForTesting,
+  _setSelfImplementSeamsFactoryForTesting as setRuntimeSeamsFactory,
   _setSelfImplementCliCommandForTesting,
   _setSelfImplementNonBlockingLedgerDirForTesting,
   _setSelfImplementOrchestrateCliCommandForTesting,
@@ -28,14 +28,26 @@ import {
 import { _setAutoOpenPrConfigReaderForTesting } from './auto-open-pr.js';
 import { isObserveOnly, _setObserveOnlyConfigReaderForTesting } from './observe-only.js';
 import type { DefaultSeamsOptions } from './seams.js';
+import type { SelfImplementSeams } from './orchestrator.js';
 import { runSelfImplementCliCommand, type SelfImplementCliOpts, type SingleRunSuperviseOptions } from './self-implement-cli.js';
 import { runSelfImplement as runProductionSelfImplement } from './orchestrator.js';
 import { buildSelfImplementDevSpec, planDevPipeline } from '../self-dev/dev-pipeline.js';
-import { loadRunLedger, readNonBlockingRunRecord } from './run-ledger.js';
+import { appendRunLedgerEntry, loadRunLedger, queryFederatedUnfinishedRunLedgers, queryUnfinishedRunLedgers, readNonBlockingRunRecord } from './run-ledger.js';
+import { assessRunningRuns, queryRunningRuns, renderRunningRuns } from './running-runs.js';
 import { buildSelfImplementDaemonSpec, dispatchSelfImplement } from '../boot/daemon-tools/self-implement.js';
 import { getUserConfig } from '../user-config.js';
 import type { ToolRuntimeContext } from '../tool-runtime/types.js';
 import type { FeedbackEnvelope } from '../feedback/envelope.js';
+
+// ⛔⭐ 이 파일의 fake seam 은 «쿼터 갱신»을 기본으로 끈다(GATE-PREEXISTING-ZERO · 2026-10-16).
+//   runSelfImplement 는 seam 에 `refreshCodexQuotaSignals` 가 없으면 «실» 갱신을 탄다 — 정본 계정
+//   스토어를 읽고 계정마다 `codex app-server` 자식을 띄운다. HOME 이 없는 셸(env -i)에선 신호가
+//   «낡음»으로 읽혀 계정당 5초씩 기다려 시험이 5s 한도에 걸렸고(node-c 실측 25 fail), 키 있는 셸에선
+//   운영 쿼터를 건드린다. 공용 `test-seams.ts` 의 기본과 «같은» 무동작을 여기서도 깐다.
+//   ⭐ factory 가 스스로 `refreshCodexQuotaSignals` 를 주면 그것이 이긴다(스프레드 뒤).
+function _setSelfImplementSeamsFactoryForTesting(f: ((o: DefaultSeamsOptions) => SelfImplementSeams) | null): void {
+  setRuntimeSeamsFactory(f && ((o) => ({ refreshCodexQuotaSignals: async () => ({ accounts: [] }), ...f(o) })));
+}
 
 const ctx = { surface: 'chat', sessionId: 's-1', signal: new AbortController().signal } as unknown as ToolRuntimeContext;
 let goalDirectory: string;
@@ -2034,6 +2046,169 @@ describe('selfImplementRuntime — opt-in non-blocking return', () => {
     } finally {
       _setSelfImplementNonBlockingLedgerDirForTesting(null);
       rmSync(ledgerDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test('완료 격리 시험 — non-blocking-result 원장 항목이 kind·next 를 그대로 남기고 eln self runs 가 같은 requestId 로 재조회한다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'runtime-nonblocking-completed-requery-'));
+    const ledgerDirectory = join(root, 'state', 'run-ledger');
+    _setSelfImplementNonBlockingLedgerDirForTesting(ledgerDirectory);
+    _setSelfImplementCliCommandForTesting(async (_feature, opts) => ({
+      ok: true, kind: 'self', exitCode: 0,
+      result: { ok: true, stage: 'pr-opened', runId: opts.runId, node: 'open-pr' },
+    } as never));
+    try {
+      const pending = await selfImplementRuntime.run({ feature: '완료 격리 재조회', non_blocking: true }, ctx);
+      const requestId = pending.requestId;
+      if (requestId === undefined) throw new Error('expected a pending requestId');
+      await waitUntil(() => loadRunLedger(requestId, ledgerDirectory)?.some((entry) => entry.event === 'non-blocking-result') ?? false, 5000);
+      const ledger = loadRunLedger(requestId, ledgerDirectory)!;
+      expect(ledger.map((entry) => entry.event)).toEqual(['non-blocking-pending', 'non-blocking-result']);
+      const resultEntry = ledger.find((entry) => entry.event === 'non-blocking-result')!;
+      expect(resultEntry.runId).toBe(requestId);
+      expect(resultEntry.data.requestId).toBe(requestId);
+      // kind·next 는 런이 산출한 값을 그대로(verbatim) — reason 은 산출되지 않아 키 자체를 생략한다(unknown 보존).
+      expect(resultEntry.data.kind).toBe('launched');
+      expect(resultEntry.data.next).toBe(`eln self run ${requestId}`);
+      expect(resultEntry.data).not.toHaveProperty('reason');
+      // eln self runs(queryRunningRuns → renderRunningRuns)가 같은 requestId 로 재조회한다.
+      const result = queryRunningRuns({}, {
+        queryLedgers: (options) => queryFederatedUnfinishedRunLedgers({ ...options, goalsDir: root, ledgerDirectories: [ledgerDirectory], noCache: true }),
+        ptyTargets: () => [],
+        listPtyRefs: () => ({ refs: [], unreadable: [] }),
+        readRunPhases: () => ({ events: [], targetCount: 0, unreadableTargets: [] }),
+      });
+      const entry = result.entries.find((candidate) => candidate.runId === requestId);
+      expect(entry?.nonBlocking).toMatchObject({ requestId, kind: 'launched', next: `eln self run ${requestId}` });
+      expect(entry?.nonBlocking).not.toHaveProperty('reason');
+      const rendered = renderRunningRuns(result);
+      expect(rendered).toContain(`runId=${requestId}`);
+      expect(rendered).toContain(`nonBlocking=kind:launched reason:none next:eln self run ${requestId}`);
+    } finally {
+      _setSelfImplementNonBlockingLedgerDirForTesting(null);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('발사 전 실패 격리 시험 — reject 원장 항목이 reason 을 그대로 남기고 eln self runs 가 같은 requestId 로 재조회한다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'runtime-nonblocking-failure-requery-'));
+    const ledgerDirectory = join(root, 'state', 'run-ledger');
+    _setSelfImplementNonBlockingLedgerDirForTesting(ledgerDirectory);
+    _setSelfImplementCliCommandForTesting(async () => { throw new Error('runner unavailable'); });
+    try {
+      const pending = await selfImplementRuntime.run({ feature: '실패 격리 재조회', non_blocking: true }, ctx);
+      const requestId = pending.requestId;
+      if (requestId === undefined) throw new Error('expected a pending requestId');
+      await waitUntil(() => loadRunLedger(requestId, ledgerDirectory)?.some((entry) => entry.event === 'non-blocking-result') ?? false, 5000);
+      const ledger = loadRunLedger(requestId, ledgerDirectory)!;
+      expect(ledger.map((entry) => entry.event)).toEqual(['non-blocking-pending', 'non-blocking-result']);
+      const resultEntry = ledger.find((entry) => entry.event === 'non-blocking-result')!;
+      expect(resultEntry.runId).toBe(requestId);
+      expect(resultEntry.data.requestId).toBe(requestId);
+      // reject 경로의 kind·reason 은 런이 산출한 값을 그대로 — next 는 산출되지 않아 키를 생략한다(unknown 보존).
+      expect(resultEntry.data.kind).toBe('failed');
+      expect(resultEntry.data.reason).toBe('runner unavailable');
+      expect(resultEntry.data).not.toHaveProperty('next');
+      const result = queryRunningRuns({}, {
+        queryLedgers: (options) => queryFederatedUnfinishedRunLedgers({ ...options, goalsDir: root, ledgerDirectories: [ledgerDirectory], noCache: true }),
+        ptyTargets: () => [],
+        listPtyRefs: () => ({ refs: [], unreadable: [] }),
+        readRunPhases: () => ({ events: [], targetCount: 0, unreadableTargets: [] }),
+      });
+      const entry = result.entries.find((candidate) => candidate.runId === requestId);
+      expect(entry?.nonBlocking).toMatchObject({ requestId, kind: 'failed', reason: 'runner unavailable' });
+      expect(entry?.nonBlocking).not.toHaveProperty('next');
+      const rendered = renderRunningRuns(result);
+      expect(rendered).toContain(`runId=${requestId}`);
+      expect(rendered).toContain('nonBlocking=kind:failed reason:runner unavailable next:none');
+    } finally {
+      _setSelfImplementNonBlockingLedgerDirForTesting(null);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('재시작 뒤 완료 requestId — 디스크 원장만으로 원본 next 를 반환하고 종결 런을 다시 미완로 열지 않는다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'runtime-nonblocking-restart-completed-'));
+    const ledgerDirectory = join(root, 'state', 'run-ledger');
+    _setSelfImplementNonBlockingLedgerDirForTesting(ledgerDirectory);
+    // 실제 하니스처럼 CLI 가 같은 정본 원장 dir 에 run lifecycle(start·종결 run-status)을 남긴다.
+    _setSelfImplementCliCommandForTesting(async (_feature, opts) => {
+      const runId = opts.runId;
+      if (runId === undefined) throw new Error('expected the runtime to pass its runId');
+      appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId, event: 'start', data: {} }, ledgerDirectory);
+      appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId, event: 'run-status', data: { runStatus: 'completed' } }, ledgerDirectory);
+      return {
+        ok: true, kind: 'self', exitCode: 0,
+        result: { ok: true, stage: 'pr-opened', runId, node: 'open-pr' },
+      } as never;
+    });
+    try {
+      const pending = await selfImplementRuntime.run({ feature: '재시작 회복 완료', non_blocking: true }, ctx);
+      const requestId = pending.requestId;
+      if (requestId === undefined) throw new Error('expected a pending requestId');
+      await waitUntil(() => loadRunLedger(requestId, ledgerDirectory)?.some((entry) => entry.event === 'non-blocking-result') ?? false, 5000);
+      expect(loadRunLedger(requestId, ledgerDirectory)!.map((entry) => entry.event))
+        .toEqual(['non-blocking-pending', 'start', 'run-status', 'non-blocking-result']);
+
+      // 프로세스 재시작 시뮬레이션 — 디스패처의 in-memory 상태(원장 dir seam·CLI 심)를 지우고 디스크 원장만으로 새 조회.
+      _setSelfImplementNonBlockingLedgerDirForTesting(null);
+      _setSelfImplementCliCommandForTesting(null);
+
+      // (a) 원장 계층 — 종결 run-status 뒤의 non-blocking 기록은 런을 다시 미완로 열지 않는다(trailing bookkeeping 규칙).
+      const unfinished = queryUnfinishedRunLedgers({ dir: ledgerDirectory, goalsDir: root, noCache: true });
+      expect(unfinished.terminalByTrailingRunStatus).toBe(1);
+      const ledgerEntry = unfinished.entries.find((candidate) => candidate.runId === requestId);
+      expect(ledgerEntry).toBeDefined();
+      expect(ledgerEntry?.lifecycle).toBe('terminal-run-status-superseded');
+      expect(ledgerEntry?.nonBlocking).toMatchObject({ requestId, kind: 'launched', next: `eln self run ${requestId}` });
+
+      // (b) 판정 계층 — 종결 런은 ended-unclosed 로 보이고 도는 런으로 세지 않는다.
+      const federated = queryFederatedUnfinishedRunLedgers({ goalsDir: root, ledgerDirectories: [ledgerDirectory], noCache: true });
+      const assessed = assessRunningRuns(federated.entries, { refs: [], unreadable: [] });
+      const assessment = assessed.entries.find((candidate) => candidate.runId === requestId);
+      expect(assessment).toMatchObject({ runId: requestId, status: 'ended-unclosed', lifecycle: 'terminal-run-status-superseded' });
+      expect(assessed.counts.running).toBe(0);
+      expect(assessed.counts['probable-running']).toBe(0);
+
+      // (c) 렌더 계층 — 원본 kind·next 가 requestId 줄에 그대로 돌아온다.
+      const rendered = renderRunningRuns(assessed);
+      expect(rendered).toContain(`runId=${requestId} status=ended-unclosed`);
+      expect(rendered).toContain(`nonBlocking=kind:launched reason:none next:eln self run ${requestId}`);
+    } finally {
+      _setSelfImplementNonBlockingLedgerDirForTesting(null);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('재시작 뒤 발사 전 실패 requestId — 디스크 원장만으로 원본 reason 을 반환한다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'runtime-nonblocking-restart-failure-'));
+    const ledgerDirectory = join(root, 'state', 'run-ledger');
+    _setSelfImplementNonBlockingLedgerDirForTesting(ledgerDirectory);
+    _setSelfImplementCliCommandForTesting(async () => { throw new Error('runner unavailable'); });
+    try {
+      const pending = await selfImplementRuntime.run({ feature: '재시작 회복 실패', non_blocking: true }, ctx);
+      const requestId = pending.requestId;
+      if (requestId === undefined) throw new Error('expected a pending requestId');
+      await waitUntil(() => loadRunLedger(requestId, ledgerDirectory)?.some((entry) => entry.event === 'non-blocking-result') ?? false, 5000);
+
+      _setSelfImplementNonBlockingLedgerDirForTesting(null);
+      _setSelfImplementCliCommandForTesting(null);
+
+      const unfinished = queryUnfinishedRunLedgers({ dir: ledgerDirectory, goalsDir: root, noCache: true });
+      const ledgerEntry = unfinished.entries.find((candidate) => candidate.runId === requestId);
+      expect(ledgerEntry?.nonBlocking).toMatchObject({ requestId, kind: 'failed', reason: 'runner unavailable' });
+      expect(ledgerEntry?.nonBlocking).not.toHaveProperty('next');
+
+      const federated = queryFederatedUnfinishedRunLedgers({ goalsDir: root, ledgerDirectories: [ledgerDirectory], noCache: true });
+      const assessed = assessRunningRuns(federated.entries, { refs: [], unreadable: [] });
+      const assessment = assessed.entries.find((candidate) => candidate.runId === requestId);
+      expect(assessment?.nonBlocking).toMatchObject({ requestId, kind: 'failed', reason: 'runner unavailable' });
+      const rendered = renderRunningRuns(assessed);
+      expect(rendered).toContain(`runId=${requestId}`);
+      expect(rendered).toContain('nonBlocking=kind:failed reason:runner unavailable next:none');
+    } finally {
+      _setSelfImplementNonBlockingLedgerDirForTesting(null);
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

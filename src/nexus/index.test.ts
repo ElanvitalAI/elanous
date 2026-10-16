@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { buildNexusWsBridgeAuth, runNexus } from './index.js';
+import { buildNexusWsBridgeAuth, daemonThinStage1, DAEMON_THIN_STAY_ALLOWLIST, runNexus, type DaemonThinStayAllowlistClass } from './index.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { ProjectStore } from '../project/project-store.js';
 import { createSession } from '../session/index.js';
@@ -951,4 +951,90 @@ test('NEXUS boot prunes 30-day error reports without a receipt and arms a daily 
     setTestStateRoot(null);
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+function parseDaemonThinInventory(markdown: string): {
+  stay: Array<{ id: string; fileFunction: string; allowlistClass: DaemonThinStayAllowlistClass }>;
+  leave: Array<{ id: string; fileFunction: string; why: string }>;
+  removalOrder: string[];
+} {
+  const stay: Array<{ id: string; fileFunction: string; allowlistClass: DaemonThinStayAllowlistClass }> = [];
+  const leave: Array<{ id: string; fileFunction: string; why: string }> = [];
+  const removalOrder: string[] = [];
+  const allowlist = new Set<string>(DAEMON_THIN_STAY_ALLOWLIST);
+  let section: 'stay' | 'leave' | 'removalOrder' | null = null;
+  for (const raw of markdown.split('\n')) {
+    const line = raw.trim();
+    if (line === '## stay') { section = 'stay'; continue; }
+    if (line === '## leave') { section = 'leave'; continue; }
+    if (line === '## removalOrder') { section = 'removalOrder'; continue; }
+    if (!line || line.startsWith('#')) continue;
+    if (section === 'stay') {
+      const [id, fileFunction, allowlistClass] = line.split(' | ').map((part) => part.trim());
+      if (!allowlist.has(allowlistClass)) throw new Error(`stay allowlist class not in allowlist: ${allowlistClass}`);
+      stay.push({ id, fileFunction, allowlistClass: allowlistClass as DaemonThinStayAllowlistClass });
+    } else if (section === 'leave') {
+      const [id, fileFunction, why] = line.split(' | ').map((part) => part.trim());
+      leave.push({ id, fileFunction, why });
+    } else if (section === 'removalOrder') {
+      removalOrder.push(line);
+    }
+  }
+  return { stay, leave, removalOrder };
+}
+
+describe('daemonThinStage1 matches src/nexus/daemon-thin-inventory.md', () => {
+  const inventory = parseDaemonThinInventory(readFileSync(join(import.meta.dir, 'daemon-thin-inventory.md'), 'utf8'));
+  const encoded = daemonThinStage1();
+  const allowlist = new Set<string>(DAEMON_THIN_STAY_ALLOWLIST);
+
+  test('encodes the stay list, leave list, and removalOrder already written in the markdown', () => {
+    expect([...encoded.stay]).toEqual(inventory.stay.map((row) => ({
+      id: row.id, fileFunction: row.fileFunction, allowlistClass: row.allowlistClass,
+    })));
+    expect([...encoded.leave]).toEqual(inventory.leave.map((row) => ({
+      id: row.id, fileFunction: row.fileFunction, why: row.why,
+    })));
+    expect([...encoded.removalOrder]).toEqual(inventory.removalOrder);
+  });
+
+  test('every stay entry is in the allowlist HTTP, PWA, dispatch/발송, SSE, cards', () => {
+    expect(encoded.stay.length).toBeGreaterThan(0);
+    for (const entry of encoded.stay) {
+      expect(allowlist.has(entry.allowlistClass)).toBe(true);
+    }
+  });
+
+  test('every leave entry is outside that allowlist', () => {
+    expect(encoded.leave.length).toBeGreaterThan(0);
+    for (const entry of encoded.leave) {
+      expect(allowlist.has(entry.why.split(/[;·]/)[0]!.trim())).toBe(false);
+    }
+  });
+
+  test('judgment, agent loop, and harness are leave when the measurement found them', () => {
+    const leaveIds = new Set(encoded.leave.map((entry) => entry.id));
+    expect(leaveIds.has('executor')).toBe(true);
+    expect(leaveIds.has('agent-loop')).toBe(true);
+    expect(leaveIds.has('harness')).toBe(true);
+    expect(encoded.leave.find((entry) => entry.id === 'executor')?.why).toMatch(/judgment/);
+    expect(encoded.leave.find((entry) => entry.id === 'agent-loop')?.why).toMatch(/agent loop/i);
+    expect(encoded.leave.find((entry) => entry.id === 'harness')?.why).toMatch(/harness/);
+  });
+
+  test('removalOrder lists each leave id once and no stay id', () => {
+    const leaveIds = encoded.leave.map((entry) => entry.id);
+    const stayIds = new Set(encoded.stay.map((entry) => entry.id));
+    expect([...encoded.removalOrder].sort()).toEqual([...leaveIds].sort());
+    expect(new Set(encoded.removalOrder).size).toBe(encoded.removalOrder.length);
+    for (const id of encoded.removalOrder) {
+      expect(stayIds.has(id)).toBe(false);
+    }
+  });
+
+  test('intentional wiring boundary: runNexus source does not call daemonThinStage1', () => {
+    const source = readFileSync(join(import.meta.dir, 'index.ts'), 'utf8');
+    const runNexusBody = source.slice(source.indexOf('export async function runNexus'));
+    expect(runNexusBody).not.toMatch(/\bdaemonThinStage1\s*\(/);
+  });
 });

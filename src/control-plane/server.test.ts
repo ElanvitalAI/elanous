@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { allowedControlHostname, DEFAULT_CONTROL_PORT, ensureControlTokens, startControlServer } from './server.js';
 import { issueMemberToken } from './member-tokens.js';
-import { createLeaseHolderView } from './lease-holder.js';
+import { createLeaseHolderView, type LeaseHolderView } from './lease-holder.js';
+import { ResourceLedger } from './ledger.js';
+import { acquireLockSync } from '../storage/file-lock.js';
 import type { RoleLeaseRead } from '../roles/role-lease.js';
 import { createHash } from 'node:crypto';
 import { runNexus } from '../nexus/index.js';
@@ -18,10 +20,11 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function setup() {
+const heldPrimary: LeaseHolderView = { async get() { return { holder: 'local', generation: 1, iAmHolder: true, known: true }; } };
+function setup(leaseView?: LeaseHolderView) {
   const root = mkdtempSync(join(tmpdir(), 'elanous-control-'));
   roots.push(root);
-  const server = startControlServer({ root, port: 0 });
+  const server = startControlServer({ root, port: 0, ...(leaseView ? { leaseView } : {}) });
   servers.push(server);
   const tokens = ensureControlTokens(root);
   const call = (path: string, token?: string, method = 'GET', body?: unknown, leaseId?: string) => fetch(`${server.url}${path}`, {
@@ -33,6 +36,131 @@ function setup() {
 }
 
 const record = { id: 'i1', kind: 'instance', machine: 'local', name: 'nexus', owner: 'forged', endpoint: 'http://127.0.0.1:31415', attrs: { load: 1 }, observedAt: 0, ttlMs: 30_000 };
+
+test('warm worker lease API fences attempts and keeps the shared ledger authoritative', async () => {
+  const { root, tokens, call } = setup(heldPrimary);
+  const hostToken = issueMemberToken('local', root);
+  const key = { context: 'local', imageDigest: 'sha256:image', lockHash: 'lock-a', architecture: 'arm64' };
+  const worker = { workerId: 'worker-1', machine: 'local', key, ttlMs: 30_000 };
+  expect((await call('/v1/workers/pod', tokens.query, 'POST', worker)).status).toBe(403);
+  expect((await call('/v1/workers/pod', tokens.member, 'POST', worker)).status).toBe(403);
+  expect((await call('/v1/resources/register', tokens.member, 'POST', {
+    id: 'pod-worker-lease:worker-1', kind: 'pod-worker-lease', machine: 'local', name: 'worker-1', attrs: {}, ttlMs: 30_000,
+  })).status).toBe(403);
+  expect((await call('/v1/workers/pod', hostToken, 'POST', worker)).status).toBe(200);
+  expect((await call('/v1/leases/pod-worker', hostToken, 'POST', { machine: 'local', key, runId: 'run-host', attemptId: 'attempt-host', ttlMs: 10_000 })).status).toBe(403);
+  const claimed = await call('/v1/leases/pod-worker', tokens.member, 'POST', { machine: 'local', key, runId: 'run-1', attemptId: 'attempt-1', ttlMs: 10_000 });
+  expect(claimed.status).toBe(200);
+  const lease = await claimed.json() as { attrs: { leaseId: string; generation: number; state: string } };
+  expect(lease.attrs.state).toBe('leased');
+  expect((await call('/v1/leases/pod-worker', tokens.member, 'POST', { machine: 'local', key, runId: 'run-2', attemptId: 'attempt-2', ttlMs: 10_000 })).status).toBe(409);
+  const observed = await (await call('/v1/resources?kind=pod-worker-lease', tokens.query)).json() as { resources: Array<{ attrs: Record<string, unknown> }> };
+  expect(observed.resources).toHaveLength(1);
+  expect(observed.resources[0]!.attrs.leaseId).toBeUndefined();
+  expect(observed.resources[0]!.attrs.runId).toBeUndefined();
+  expect(observed.resources[0]!.attrs.attemptId).toBeUndefined();
+  expect((await call('/v1/resources/pod-worker-lease%3Aworker-1/heartbeat', tokens.member, 'POST', { attrs: { state: 'idle' } })).status).toBe(403);
+  const path = '/v1/leases/pod-worker/worker-1';
+  expect((await call(`${path}/release`, tokens.member, 'POST', { leaseId: 'wrong', generation: lease.attrs.generation })).status).toBe(409);
+  expect((await call(`${path}/release`, tokens.member, 'POST', { leaseId: lease.attrs.leaseId, generation: lease.attrs.generation })).status).toBe(200);
+  expect((await call('/v1/leases/pod-worker', tokens.member, 'POST', { machine: 'local', key, runId: 'run-2', attemptId: 'attempt-2', ttlMs: 10_000 })).status).toBe(409);
+  expect((await call(`${path}/sanitize`, tokens.member, 'POST', { leaseId: lease.attrs.leaseId, generation: lease.attrs.generation })).status).toBe(403);
+  expect((await call(`${path}/sanitize`, hostToken, 'POST', { leaseId: lease.attrs.leaseId, generation: lease.attrs.generation })).status).toBe(200);
+  const next = await (await call('/v1/leases/pod-worker', tokens.member, 'POST', { machine: 'local', key, runId: 'run-2', attemptId: 'attempt-2', ttlMs: 10_000 })).json() as typeof lease;
+  expect(next.attrs.generation).toBe(lease.attrs.generation + 1);
+  expect((await call(`${path}/renew`, tokens.member, 'POST', { leaseId: lease.attrs.leaseId, generation: lease.attrs.generation })).status).toBe(409);
+  expect(readFileSync(join(root, 'control', 'ledger.json'), 'utf8')).toContain('pod-worker-lease:worker-1');
+});
+
+test('warm worker writes fail closed when there is no primary observation', async () => {
+  const { root, tokens, call } = setup();
+  const host = issueMemberToken('local', root);
+  const key = { context: 'local', imageDigest: 'sha256:image', lockHash: 'lock', architecture: 'arm64' };
+  const response = await call('/v1/workers/pod', host, 'POST', { workerId: 'worker-1', machine: 'local', key, ttlMs: 30_000 });
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({ error: 'primary-unmeasured' });
+  expect((await call('/v1/leases/pod-worker', tokens.member, 'POST', { machine: 'local', key, runId: 'r', attemptId: 'a', ttlMs: 10_000 })).status).toBe(409);
+  expect(new ResourceLedger(root).list({ kind: 'pod-worker-lease' })).toEqual([]);
+});
+
+test('warm allocation rechecks primary after the request body instead of writing with an old generation', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-worker-primary-'));
+  roots.push(root);
+  const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock', architecture: 'arm64' };
+  const ledger = new ResourceLedger(root);
+  ledger.registerPodWorker({ workerId: 'worker-1', machine: 'node-c', key, owner: 'host', ttlMs: 30_000 });
+  const control = startControlServer({ root, port: 0, requireKnownLeaseForWrites: true,
+    leaseView: { async get(options) { return options?.fresh
+      ? { holder: 'other', generation: 2, iAmHolder: false, known: true }
+      : { holder: 'local', generation: 1, iAmHolder: true, known: true }; } } });
+  servers.push(control);
+  const token = ensureControlTokens(root).member;
+  const response = await fetch(`${control.url}/v1/leases/pod-worker`, {
+    method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ machine: 'node-c', key, runId: 'run', attemptId: 'attempt', ttlMs: 10_000 }),
+  });
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({ error: 'not-primary', holder: 'other', generation: 2 });
+  expect(response.headers.get('x-primary-generation')).toBe('2');
+  expect(ledger.list({ kind: 'pod-worker-lease' })[0]?.attrs.state).toBe('idle');
+});
+
+test('warm allocation rejects a primary change while waiting for the ledger lock', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-worker-primary-lock-'));
+  roots.push(root);
+  const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock', architecture: 'arm64' };
+  const ledger = new ResourceLedger(root);
+  ledger.registerPodWorker({ workerId: 'worker-1', machine: 'node-c', key, owner: 'host', ttlMs: 30_000 });
+  let currentGeneration = 1;
+  let freshReads = 0;
+  const control = startControlServer({ root, port: 0, requireKnownLeaseForWrites: true,
+    leaseView: { async get(options) {
+      if (options?.fresh) freshReads++;
+      return currentGeneration === 1
+        ? { holder: 'local', generation: 1, iAmHolder: true, known: true }
+        : { holder: 'other', generation: 2, iAmHolder: false, known: true };
+    } } });
+  servers.push(control);
+  const release = acquireLockSync(`${ledger.path}.lock`);
+  let response: Response;
+  try {
+    const pending = fetch(`${control.url}/v1/leases/pod-worker`, {
+      method: 'POST', headers: { authorization: `Bearer ${ensureControlTokens(root).member}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ machine: 'node-c', key, runId: 'run', attemptId: 'attempt', ttlMs: 10_000 }),
+    });
+    for (let i = 0; i < 100 && freshReads === 0; i++) await Bun.sleep(10);
+    expect(freshReads).toBe(1);
+    currentGeneration = 2;
+    release();
+    response = await pending;
+  } catch (error) { release(); throw error; }
+  expect(response.status).toBe(409);
+  expect(ledger.list({ kind: 'pod-worker-lease' })[0]?.attrs.state).toBe('idle');
+  expect(freshReads).toBe(2);
+});
+
+test('a slow guarded primary read queues ordinary resource writes instead of failing them', async () => {
+  let freshReads = 0;
+  let releaseFresh!: () => void;
+  let enteredFresh!: () => void;
+  const waiting = new Promise<void>(resolve => { enteredFresh = resolve; });
+  const hold = new Promise<void>(resolve => { releaseFresh = resolve; });
+  const primary: LeaseHolderView = { async get(options) {
+    if (options?.fresh && ++freshReads === 2) { enteredFresh(); await hold; }
+    return { holder: 'local', generation: 1, iAmHolder: true, known: true };
+  } };
+  const { root, tokens, call } = setup(primary);
+  const key = { context: 'local', imageDigest: 'sha256:image', lockHash: 'lock', architecture: 'arm64' };
+  const workerWrite = call('/v1/workers/pod', issueMemberToken('local', root), 'POST',
+    { workerId: 'worker-queue', machine: 'local', key, ttlMs: 30_000 });
+  await waiting;
+  const ordinaryWrite = call('/v1/resources/register', tokens.member, 'POST', record);
+  await Bun.sleep(30);
+  releaseFresh();
+  expect((await workerWrite).status).toBe(200);
+  expect((await ordinaryWrite).status).toBe(200);
+  expect(new ResourceLedger(root).list()).toHaveLength(2);
+});
 
 test('NEXUS boot starts the separate authenticated control listener and releases it on shutdown', async () => {
   const root = mkdtempSync(join(tmpdir(), 'elanous-control-nexus-'));

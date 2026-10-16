@@ -66,7 +66,7 @@ import { localOcrText } from './telegram-card-followup.js';
 import type { runGraph } from './graph-runner/runner.js';
 import { readSlashContextNow, renderContextFirstNow, renderTelegramNow } from './context-bus/context-now-surfaces.js';
 import { contextNow, type ContextNowDeps } from './context-bus/context-now.js';
-import { createContextFirstGate, renderContextFirst } from './context-bus/context-first.js';
+import { createContextFirstGate, renderContextFirst, takeContextFirstOpening } from './context-bus/context-first.js';
 import { telegramLoopsStatus, type LoopsSources } from './telegram-loops-command.js';
 import { botUnavailableSlashReply, deriveTuiSlashAvailability, type TuiSlashAvailability } from './maturity/tui-slash-availability.js';
 
@@ -157,8 +157,8 @@ export function buildDiscordSelfOnMessage(deps: DiscordSelfMessageDeps): DcMessa
   const log = deps.log ?? ((): void => {});
   const cfg = deps.userConfig;
   const contextFirstGate = createContextFirstGate({ now: deps.contextFirstNow ?? Date.now });
-  const maybeSendContextFirst = async (channelId: string): Promise<void> => {
-    if (!contextFirstGate.take(channelId) || cfg.discord?.contextFirst === false) return;
+  const maybeSendContextFirst = async (channelId: string, text?: string): Promise<void> => {
+    if (!takeContextFirstOpening({ gate: contextFirstGate, key: channelId, text, enabled: cfg.discord?.contextFirst !== false })) return;
     try {
       await deps.getBot()?.sendMessage(channelId, renderContextFirst(contextNow, deps.nowDeps, renderContextFirstNow));
     } catch (err) {
@@ -426,7 +426,7 @@ export function buildDiscordSelfOnMessage(deps: DiscordSelfMessageDeps): DcMessa
       if (unavailable) return unavailable;
     }
     const cmd = parseDiscordAcpCommand(ctx.text);
-    if (!cmd && !/^[!/]/.test(ctx.text.trim())) await maybeSendContextFirst(ctx.channelId);
+    if (!cmd && !/^[!/]/.test(ctx.text.trim())) await maybeSendContextFirst(ctx.channelId, ctx.text);
     log(`◀ ${ctx.userName ?? ctx.userId}: ${ctx.text.slice(0, 80)}${ctx.attachments.length ? ` (+첨부 ${ctx.attachments.length})` : ''}`);
     debug.log('discord.self.turn', 'inbound', { channelId: ctx.channelId, chars: ctx.text.length, attachments: ctx.attachments.length });
     // C2+ — 첨부 기억(사진만 먼저 올리는 패턴 지원). 명령 여부와 무관.

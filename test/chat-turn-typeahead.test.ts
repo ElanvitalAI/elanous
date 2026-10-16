@@ -55,11 +55,14 @@ describe('applyTurnTypeaheadKey', () => {
 
   test('enter — 버퍼 있으면 FIFO에 넣고 빈 입력은 미소유', () => {
     expect(applyTurnTypeaheadKey(createTurnTypeaheadState(), key('enter')).consumed).toBe(false);
+    // 대기 항목이 있으면 빈 Enter 는 «지금 밀어 넣기» 요청이다(10-14).
+    const pushNow = applyTurnTypeaheadKey(submit('queued'), key('enter'));
+    expect(pushNow).toEqual({ state: submit('queued'), consumed: true, changed: false, pushNowRequested: true });
     const st = submit('go');
     expect(st).toEqual({ buffer: '', queuedSubmissions: ['go'] });
   });
 
-  test('ctrl+up: 마지막 대기 항목을 현재 버퍼 뒤로 되꺼내고 FIFO 순서를 보존한다', () => {
+  test('ctrl+up: 대기 항목 «전부»를 입력 순서대로 되꺼낸다(10-14 · 마지막 한 건 → 전부)', () => {
     let state = createTurnTypeaheadState();
     for (const text of ['first', 'second', 'third']) state = submit(text, state);
 
@@ -67,16 +70,17 @@ describe('applyTurnTypeaheadKey', () => {
     expect(Object.keys(recalled).sort()).toEqual(['changed', 'consumed', 'state']);
     expect(recalled.consumed).toBe(true);
     expect(recalled.changed).toBe(true);
-    expect(recalled.state).toEqual({ buffer: 'third', queuedSubmissions: ['first', 'second'] });
+    expect(recalled.state).toEqual({ buffer: 'first\nsecond\nthird', queuedSubmissions: [] });
 
+    // 고쳐서 다시 Enter 하면 한 덩어리로 다시 큐에 든다.
     const requeued = applyTurnTypeaheadKey(recalled.state, key('enter'));
-    expect(requeued.state.queuedSubmissions).toEqual(['first', 'second', 'third']);
+    expect(requeued.state.queuedSubmissions).toEqual(['first\nsecond\nthird']);
   });
 
-  test('ctrl+up: 기존 버퍼는 잃지 않고 마지막 대기 항목 뒤에 이어 붙인다', () => {
+  test('ctrl+up: 치던 초안은 잃지 않고 되꺼낸 항목 뒤에 둔다', () => {
     const state = type('draft-', submit('queued'));
     expect(applyTurnTypeaheadKey(state, key('up', { ctrl: true })).state)
-      .toEqual({ buffer: 'draft-queued', queuedSubmissions: [] });
+      .toEqual({ buffer: 'queued\ndraft-', queuedSubmissions: [] });
   });
 
   test('ctrl+up: 빈 큐에서는 미소유이고 상태를 그대로 돌려준다', () => {

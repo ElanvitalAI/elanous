@@ -31,6 +31,14 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<b
   return predicate();
 }
 
+// ⭐ 0.2.30 게이트 cut/pod-66(«fixture did not publish process ids» · 2008ms): 시간초과를 100ms 로 줬더니
+//   차가운 Pod 에서 픽스처(⊕ tree 모드의 손자 bun)가 «SIGTERM 무시 처리기를 걸기 전에» 그룹 SIGTERM 을
+//   맞아 죽었다 → pid 파일이 영영 안 생긴다. 시험이 재려는 것은 «TERM 을 무시하는 트리를 유예 뒤 KILL 로
+//   거두나» 이지 기동 속도가 아니므로, 시간초과는 기동 여유를 둔 값으로 주고 pid 대기는 그보다 길게 둔다.
+const TREE_TIMEOUT_MS = 1_500;
+const PID_PUBLISH_WAIT_MS = TREE_TIMEOUT_MS + 3_500;
+const TREE_TEST_TIMEOUT_MS = 20_000;
+
 async function readFixturePids(path: string): Promise<FixturePids> {
   const ready = await waitUntil(() => {
     try {
@@ -38,7 +46,7 @@ async function readFixturePids(path: string): Promise<FixturePids> {
     } catch {
       return false;
     }
-  });
+  }, PID_PUBLISH_WAIT_MS);
   if (!ready) throw new Error('fixture did not publish process ids');
   return JSON.parse(readFileSync(path, 'utf8')) as FixturePids;
 }
@@ -95,11 +103,13 @@ describe('integrity gate process-tree timeout cleanup', () => {
     const state = makeStateFile();
     let pgid: number | undefined;
     try {
-      const running = defaultRunCmd(process.execPath, [fixture, 'direct', state.path], process.cwd(), 100);
+      const started = Date.now();
+      const running = defaultRunCmd(process.execPath, [fixture, 'direct', state.path], process.cwd(), TREE_TIMEOUT_MS);
       const pids = await readFixturePids(state.path);
       pgid = pids.parentPid;
 
-      await Bun.sleep(250);
+      // SIGTERM(시간초과) «뒤»·SIGKILL(유예 2s) «전» 창에서 살아 있어야 한다.
+      await Bun.sleep(Math.max(0, started + TREE_TIMEOUT_MS + 250 - Date.now()));
       expect(isAlive(pids.parentPid)).toBe(true);
 
       const result = await running;
@@ -110,19 +120,19 @@ describe('integrity gate process-tree timeout cleanup', () => {
       killProcessGroup(pgid);
       rmSync(state.dir, { recursive: true, force: true });
     }
-  }, 10_000);
+  }, TREE_TEST_TIMEOUT_MS);
 
   test('부모 close 뒤에도 TERM을 무시한 손자를 grace 경계까지 살려 두고 그룹 SIGKILL로 거둔다', async () => {
     const state = makeStateFile();
     let pgid: number | undefined;
     try {
-      const running = defaultRunCmd(process.execPath, [fixture, 'tree', state.path], process.cwd(), 100);
+      const running = defaultRunCmd(process.execPath, [fixture, 'tree', state.path], process.cwd(), TREE_TIMEOUT_MS);
       const pids = await readFixturePids(state.path);
       pgid = pids.parentPid;
       const grandchildPid = pids.grandchildPid;
       if (grandchildPid === undefined) throw new Error('fixture did not publish grandchild pid');
 
-      expect(await waitUntil(() => !isAlive(pids.parentPid), 1_000)).toBe(true);
+      expect(await waitUntil(() => !isAlive(pids.parentPid), PID_PUBLISH_WAIT_MS)).toBe(true);
       expect(isAlive(grandchildPid)).toBe(true);
 
       const result = await running;
@@ -133,7 +143,7 @@ describe('integrity gate process-tree timeout cleanup', () => {
       killProcessGroup(pgid);
       rmSync(state.dir, { recursive: true, force: true });
     }
-  }, 10_000);
+  }, TREE_TEST_TIMEOUT_MS);
 
   test('16MB 출력 한도를 넘긴 프로세스를 종료하고 ENOBUFS 실패로 반환한다', async () => {
     const state = makeStateFile();

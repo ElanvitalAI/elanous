@@ -230,4 +230,61 @@ describe('dispatchWithParallelSafety', () => {
     // Original order preserved via index writeback.
     expect(results).toEqual(['r1', 'w1', 'r2']);
   });
+
+  // ⭐ TUI-ESC-ABORT-TOOLS (2026-10-15) — 턴 중단(Esc)이 묶음 안 «남은» 호출을 새로 시작하지 않는다.
+  test('sequential batch: abort inside the first call skips the second and third', async () => {
+    pushFake({ id: 'ab_write', aliases: ['AbWrite'], displayName: 'AbWrite', supportsParallel: false });
+    const calls = [
+      { name: 'AbWrite', id: 'a' },
+      { name: 'AbWrite', id: 'b' },
+      { name: 'AbWrite', id: 'c' },
+    ];
+    const controller = new AbortController();
+    const called: string[] = [];
+    const summary = await dispatchWithParallelSafety(calls, async (call) => {
+      called.push(call.id);
+      if (call.id === 'a') controller.abort();
+    }, controller.signal);
+    expect(called).toEqual(['a']);
+    expect(summary.skippedIndices).toEqual([1, 2]);
+  });
+
+  test('mixed batch: abort during the safe group skips every unsafe call', async () => {
+    pushFake({ id: 'ab_read', aliases: ['AbRead'], displayName: 'AbRead', supportsParallel: true });
+    pushFake({ id: 'ab_write2', aliases: ['AbWrite2'], displayName: 'AbWrite2', supportsParallel: false });
+    const calls = [
+      { name: 'AbRead', id: 'r1' },
+      { name: 'AbWrite2', id: 'w1' },
+      { name: 'AbRead', id: 'r2' },
+      { name: 'AbWrite2', id: 'w2' },
+    ];
+    const controller = new AbortController();
+    const called: string[] = [];
+    const summary = await dispatchWithParallelSafety(calls, async (call) => {
+      called.push(call.id);
+      if (call.id === 'r1') controller.abort();
+    }, controller.signal);
+    expect(summary.parallelActivated).toBe(true);
+    expect(called.sort()).toEqual(['r1', 'r2']);
+    expect(summary.skippedIndices).toEqual([1, 3]);
+  });
+
+  test('already-aborted signal dispatches nothing; caller can fill every slot (tool_call/tool_result pairing)', async () => {
+    pushFake({ id: 'ab_read3', aliases: ['AbRead3'], displayName: 'AbRead3', supportsParallel: true });
+    const calls = [
+      { name: 'AbRead3', id: 'r1' },
+      { name: 'AbRead3', id: 'r2' },
+    ];
+    const controller = new AbortController();
+    controller.abort();
+    const results: Array<string | null> = new Array(calls.length).fill(null);
+    const summary = await dispatchWithParallelSafety(calls, async (call, index) => { results[index] = call.id; }, controller.signal);
+    for (const i of summary.skippedIndices) results[i] = 'aborted';
+    expect(results).toEqual(['aborted', 'aborted']);
+  });
+
+  test('no signal keeps skippedIndices empty (behaviour unchanged)', async () => {
+    const summary = await dispatchWithParallelSafety([{ name: 'Whatever', id: 'x' }], async () => {});
+    expect(summary.skippedIndices).toEqual([]);
+  });
 });

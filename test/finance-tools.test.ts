@@ -1,9 +1,9 @@
 // A1 — first-class finance tools (structure + safety + wire).
 //
-// The dispatch bodies hit machine-local DBs (absent in CI → fail-soft
-// {error}), so behavior is covered by dogfood; here we guard the spec
-// surface, the SQL-injection token guard, unknown-tool handling, and that
-// the messenger-turn assembly merges the finance tools only via the finance pack.
+// Most dispatch bodies hit machine-local DBs (absent in CI → fail-soft
+// {error}), so their full behavior is covered by dogfood. The SQL-injection
+// guards run against a disposable SQLite fixture below; here we also guard
+// the spec surface, unknown-tool handling, and messenger-turn assembly wiring.
 //
 // ⭐ 배선 주어 — 실측으로 갈랐다(후보 둘이 있었고 하나는 «닿지 않는다»):
 //   telegram-agent.ts:18  makeTelegramAgentRunTurn → makeElanousAgentRunTurn(cfg,'telegram')
@@ -19,10 +19,55 @@
 //   프로세스가 중간에 죽었을 때 «빈 DB»가 남아 진짜 조회가 조용히 빈손이 된다).
 
 import { describe, test, expect } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { Database } from 'bun:sqlite';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { buildFinanceTools, FINANCE_ALERT_VIEWS } from '../src/domains/finance-tools.js';
+
+/** finance-tools resolves scores.db from homedir() at import time. Run these
+ * guard checks in a child with a disposable HOME so they reach validation
+ * without reading or creating the developer's real scores.db. */
+function dispatchWithScoresFixture(requests: Array<{ name: string; args: Record<string, unknown> }>): Array<Record<string, unknown>> {
+  const home = mkdtempSync(join(tmpdir(), 'finance-scores-'));
+  try {
+    const dbDir = join(home, '.cache', 'asset-attractiveness');
+    mkdirSync(dbDir, { recursive: true });
+    const db = new Database(join(dbDir, 'scores.db'));
+    try {
+      db.run('CREATE TABLE scores (preset TEXT, symbol TEXT, as_of TEXT, total_score REAL, z_score REAL, signal TEXT)');
+      db.prepare('INSERT INTO scores VALUES (?, ?, ?, ?, ?, ?)').run(
+        'semis', '005930.KO', new Date().toISOString().slice(0, 10), 53.9, -1.2, 'SELL',
+      );
+    } finally {
+      db.close();
+    }
+    const child = `
+      const { buildFinanceTools } = await import(process.env.FINANCE_TOOLS_MODULE);
+      const { dispatch } = buildFinanceTools();
+      const requests = JSON.parse(process.env.FINANCE_REQUESTS);
+      const results = [];
+      for (const request of requests) results.push(await dispatch(request.name, request.args));
+      console.log(JSON.stringify(results));
+    `;
+    const output = execFileSync(process.execPath, ['-e', child], {
+      encoding: 'utf-8',
+      timeout: 15_000,
+      env: {
+        ...process.env,
+        HOME: home,
+        ELANOUS_STATE_DIR: home,
+        FINANCE_TOOLS_MODULE: pathToFileURL(join(import.meta.dir, '..', 'src', 'domains', 'finance-tools.ts')).href,
+        FINANCE_REQUESTS: JSON.stringify(requests),
+      },
+    });
+    return JSON.parse(output) as Array<Record<string, unknown>>;
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
 
 describe('finance tool surface', () => {
   const { specs, names, dispatch } = buildFinanceTools();
@@ -58,10 +103,16 @@ describe('finance tool surface', () => {
     expect((spec.parameters as { required?: string[] }).required).toEqual(['topic']);
   });
 
-  test('SQL-injection guard on attractiveness args', async () => {
-    const r = await dispatch('finance_attractiveness', { symbol: "005930'; DROP TABLE scores;--" }) as { error?: string };
-    expect(r.error).toMatch(/invalid symbol/);
-  });
+  test('SQL-injection guard on attractiveness args', () => {
+    const [valid, bad, after] = dispatchWithScoresFixture([
+      { name: 'finance_attractiveness', args: { symbol: '005930.KO' } },
+      { name: 'finance_attractiveness', args: { symbol: "005930'; DROP TABLE scores;--" } },
+      { name: 'finance_attractiveness', args: { symbol: '005930.KO' } },
+    ]);
+    expect(valid.table).toContain('005930.KO');
+    expect(bad.error).toMatch(/invalid symbol/);
+    expect(after.table).toBe(valid.table);
+  }, 20_000);
 
   test('finance_13f_sectors (A2.2b): aggregate money-movement lens, non-throwing', async () => {
     const r = await dispatch('finance_13f_sectors', {}) as Record<string, unknown>;
@@ -249,11 +300,17 @@ describe('finance tool surface', () => {
     const trendSpec = specs.find(s => s.name === 'finance_trend')!;
     expect(trendSpec.description).toMatch(/country|국가/i);
     expect(trendSpec.description).toMatch(/sector|섹터/i);
-    const bad = await dispatch('finance_trend', { scope: 'attractiveness', key: "x'; DROP--" }) as { error?: string };
+    const [validHistory, bad, noKey, after] = dispatchWithScoresFixture([
+      { name: 'finance_trend', args: { scope: 'attractiveness', key: '005930.KO', days: 730 } },
+      { name: 'finance_trend', args: { scope: 'attractiveness', key: "x'; DROP--" } },
+      { name: 'finance_trend', args: { scope: 'attractiveness' } },
+      { name: 'finance_trend', args: { scope: 'attractiveness', key: '005930.KO', days: 730 } },
+    ]);
+    expect(validHistory.series).toContain('SELL');
     expect(bad.error).toMatch(/needs key=symbol|invalid/);
-    const noKey = await dispatch('finance_trend', { scope: 'attractiveness' }) as { error?: string };
     expect(noKey.error).toMatch(/needs key=symbol/);
-  });
+    expect(after.series).toBe(validHistory.series);
+  }, 20_000);
 });
 
 describe('finance-tools wire (messenger-turn assembly)', () => {

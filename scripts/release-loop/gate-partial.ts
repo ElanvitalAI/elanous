@@ -5,12 +5,15 @@
 // GATE-REUSE-BY-DIFF (0.2.25): a code change no longer forces the full sweep — with the tip's import closure
 // (gate-closure.ts) the plan adds every test that can reach a changed file, and every test whose closure is opaque.
 // `release resume --from gate` now plans this by default when the tip moved (`--no-partial` = full gate).
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { CODE_FILE, type ClosureVerdict } from './gate-closure';
 
 export interface PartialPlan {
+  /** A verified docs-only append carries the completed, clean cut without starting a test Pod. */
+  kind?: 'carry' | 'recheck';
   version: string;
   /** Commit the previous (full) gate measured — its recorded failures are carried for every file not re-run. */
   priorCommit: string;
@@ -22,6 +25,80 @@ export interface PartialPlan {
   priorErrors: string[];
 }
 
+/** G1: a second measurement of only the failed files on the very same release commit.
+ * This is deliberately separate from PartialPlan, which compares two different commits. */
+export interface RecheckPlan extends PartialPlan { kind: 'recheck' }
+
+const FULL_SHA = /^[0-9a-f]{40}$/i;
+const RELEASE_VERSION = /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/;
+export const recheckPlanPath = (root: string, version: string) => partialPlanPath(root, version);
+
+/** A recheck never broadens its scope to passing or changed tests. Any uncertain input fails closed. */
+export function planSameCommitRecheck(input: { version: string; measuredCommit: string; forCommit: string;
+  failures: readonly string[]; errors: readonly string[]; existsAtCommit: (file: string) => boolean }):
+  { ok: true; plan: RecheckPlan } | { ok: false; reason: string } {
+  if (!RELEASE_VERSION.test(input.version)) return { ok: false, reason: 'invalid release version' };
+  if (!FULL_SHA.test(input.measuredCommit) || !FULL_SHA.test(input.forCommit)) return { ok: false, reason: 'commit is not a full sha' };
+  if (input.measuredCommit !== input.forCommit) return { ok: false, reason: 'recheck requires the same commit' };
+  let files: string[];
+  try { files = [...new Set([...input.failures, ...input.errors].map(testFileOfId))].sort(); }
+  catch (error) { return { ok: false, reason: String(error instanceof Error ? error.message : error) }; }
+  if (!files.length) return { ok: false, reason: 'no failed test files to recheck' };
+  try {
+    const missing = files.find((file) => !input.existsAtCommit(file));
+    if (missing) return { ok: false, reason: `failed test file missing at commit: ${missing}` };
+  } catch (error) { return { ok: false, reason: `test file existence unreadable: ${String(error)}` }; }
+  return { ok: true, plan: { kind: 'recheck', version: input.version, priorCommit: input.measuredCommit,
+    forCommit: input.forCommit, files, priorFailures: [...input.failures], priorErrors: [...input.errors] } };
+}
+
+export function writeRecheckPlan(root: string, plan: RecheckPlan): string {
+  validateRecheckPlan(plan, plan.version, recheckPlanPath(root, plan.version));
+  const path = recheckPlanPath(root, plan.version);
+  const inspectExisting = (): void => {
+    const existing = JSON.parse(readFileSync(path, 'utf8')) as Partial<RecheckPlan>;
+    if (existing.kind !== 'recheck') throw new Error(`gate partial plan already exists: ${path}`);
+    validateRecheckPlan(existing, plan.version, path);
+    if (existing.forCommit !== plan.forCommit)
+      throw new Error(`gate recheck plan already exists for another commit: ${path}`);
+    if (JSON.stringify(existing) !== JSON.stringify(plan))
+      throw new Error(`different gate recheck plan already exists: ${path}`);
+  };
+  return publishPlanIfVacant(path, plan, inspectExisting);
+}
+
+/** Both writers of gate-partial.json must use the same no-clobber publication rule. */
+function publishPlanIfVacant(path: string, plan: PartialPlan, inspectExisting: () => void): string {
+  if (existsSync(path)) { inspectExisting(); return path; }
+  mkdirSync(dirname(path), { recursive: true });
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temp, `${JSON.stringify(plan, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+    // Same-directory hard link publishes a complete file only if the slot is still empty.
+    // renameSync would overwrite a different writer's commit between inspection and publication.
+    try { linkSync(temp, path); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      inspectExisting();
+    }
+  } finally { rmSync(temp, { force: true }); }
+  return path;
+}
+
+function validateRecheckPlan(raw: Partial<RecheckPlan>, version: string, path: string): asserts raw is RecheckPlan {
+  const invalid = () => { throw new Error(`invalid gate recheck plan: ${path}`); };
+  if (!RELEASE_VERSION.test(version) || raw.kind !== 'recheck' || raw.version !== version ||
+      typeof raw.priorCommit !== 'string' || !FULL_SHA.test(raw.priorCommit) ||
+      typeof raw.forCommit !== 'string' || !FULL_SHA.test(raw.forCommit) || raw.priorCommit !== raw.forCommit ||
+      !Array.isArray(raw.priorFailures) || !raw.priorFailures.every((id) => typeof id === 'string') ||
+      !Array.isArray(raw.priorErrors) || !raw.priorErrors.every((id) => typeof id === 'string') ||
+      !Array.isArray(raw.files) || !raw.files.length || !raw.files.every((file) => typeof file === 'string')) invalid();
+  let expected: string[] = [];
+  try { expected = [...new Set([...raw.priorFailures!, ...raw.priorErrors!].map(testFileOfId))].sort(); }
+  catch { invalid(); }
+  if (JSON.stringify(raw.files) !== JSON.stringify(expected)) invalid();
+}
+
 export const partialPlanPath = (root: string, version: string) => join(root, 'release', version, 'gate-partial.json');
 /** The same test-file set the gate sweep runs (`git ls-files` filtered by this suffix). */
 const TEST_FILE = /^(?:[\w.-]+\/)*[\w.-]+\.test\.(?:tsx?|jsx?|mts|cts)$/;
@@ -30,6 +107,12 @@ const TEST_FILE = /^(?:[\w.-]+\/)*[\w.-]+\.test\.(?:tsx?|jsx?|mts|cts)$/;
 const INERT_MD = /\.md$/;
 const TEST_INPUT = /(?:^|\/)(?:test|tests|fixtures|__fixtures__|__snapshots__|__mocks__)\//;
 const isInert = (file: string) => INERT_MD.test(file) && !TEST_INPUT.test(file);
+
+/** Recheck the immutable Git diff at the consumer; a mutable plan file alone cannot authorize a zero-file gate. */
+export function verifyDocsOnlyCarry(repo: string, priorCommit: string, forCommit: string): boolean {
+  const files = changedFilesBetween(repo, priorCommit, forCommit);
+  return files.length > 0 && files.every(isInert);
+}
 
 /** The test file of a failure id (`<file> > <case>`). One rule for the gate and the partial plan: ids come only from the
  *  gate's output parsers, which accept `dir/….test.ts(x)` — anything else (a root file, `..`, no case) is unsafe. */
@@ -75,18 +158,22 @@ export function planPartialRegate(input: { version: string; priorCommit: string;
   const gone = failureFiles.filter((file) => !exists(file));
   if (gone.length) return { ok: false, reason: `prior failure file deleted at the tip → full gate: ${list(gone)}` };
   const files = [...new Set([...input.changedFiles.filter((file) => TEST_FILE.test(file) && exists(file)), ...failureFiles, ...reaching])].sort();
-  if (!files.length) return { ok: false, reason: 'nothing to re-run' };
-  return { ok: true, plan: { version: input.version, priorCommit: input.priorCommit, forCommit: input.forCommit, files,
+  // An empty selection is safe only for a genuinely docs-only diff. A deleted test also selects zero files,
+  // but it changes the measured suite and must not masquerade as a carry.
+  if (!files.length && (!input.changedFiles.length || input.changedFiles.some((file) => !isInert(file))))
+    return { ok: false, reason: 'nothing to re-run (not a docs-only append)' };
+  return { ok: true, plan: { ...(!files.length ? { kind: 'carry' as const } : {}), version: input.version, priorCommit: input.priorCommit, forCommit: input.forCommit, files,
     priorFailures: [...input.priorFailures], priorErrors: [...input.priorErrors] }, ...(closure ? { closure } : {}) };
 }
 
 export function writePartialPlan(root: string, plan: PartialPlan): string {
   const path = partialPlanPath(root, plan.version);
-  mkdirSync(dirname(path), { recursive: true });
-  const temp = `${path}.${process.pid}.tmp`;
-  writeFileSync(temp, `${JSON.stringify(plan, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temp, path);
-  return path;
+  return publishPlanIfVacant(path, plan, () => {
+    const existing = JSON.parse(readFileSync(path, 'utf8')) as PartialPlan & { kind?: unknown };
+    if (existing.kind === 'recheck') throw new Error(`gate recheck plan already exists: ${path}`);
+    if (JSON.stringify(existing) !== JSON.stringify(plan))
+      throw new Error(`different gate partial plan already exists: ${path}`);
+  });
 }
 
 export function clearPartialPlan(root: string, version: string): void {
@@ -100,10 +187,20 @@ export function readPartialPlan(roots: readonly string[], version: string, commi
     const path = partialPlanPath(root, version);
     if (!existsSync(path)) continue;
     const raw = JSON.parse(readFileSync(path, 'utf8')) as Partial<PartialPlan>;
+    if ((raw as Partial<RecheckPlan>).kind !== undefined && (raw as Partial<RecheckPlan>).kind !== 'recheck' && raw.kind !== 'carry')
+      throw new Error(`invalid gate partial plan: ${path}`);
+    // Until the gate consumer connects G1, the opt-in recheck plan is a shadow record.
+    // A legacy full gate may run, but it must never interpret a same-commit recheck as a changed-tip partial gate.
+    if ((raw as Partial<RecheckPlan>).kind === 'recheck') {
+      validateRecheckPlan(raw as Partial<RecheckPlan>, version, path);
+      continue;
+    }
     if (raw.version !== version || typeof raw.priorCommit !== 'string' || !/^[0-9a-f]{40}$/i.test(raw.priorCommit)
       || typeof raw.forCommit !== 'string' || !/^[0-9a-f]{40}$/i.test(raw.forCommit) || raw.priorCommit === raw.forCommit
-      || !Array.isArray(raw.files) || raw.files.length === 0 || !raw.files.every((file) => typeof file === 'string' && TEST_FILE.test(file) && !file.split('/').includes('..'))
+      || !Array.isArray(raw.files) || (raw.files.length === 0) !== (raw.kind === 'carry')
+      || !raw.files.every((file) => typeof file === 'string' && TEST_FILE.test(file) && !file.split('/').includes('..'))
       || !Array.isArray(raw.priorFailures) || !Array.isArray(raw.priorErrors)) throw new Error(`invalid gate partial plan: ${path}`);
+    if (raw.kind === 'carry' && (raw.priorFailures.length || raw.priorErrors.length)) throw new Error(`invalid gate partial plan: ${path}`);
     // Every prior failure's file is re-run (planPartialRegate guarantees it) — a plan that would carry a failure it did
     // not re-run is malformed, not «partial».
     const rerun = new Set(raw.files);

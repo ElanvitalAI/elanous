@@ -88,6 +88,7 @@ import type { McpReloadOutcome, McpReloadServerResult } from './api/admin-mcp-re
 import { loadOrCreateSigningKey, NonceStore } from './api/edit-in-pwa-core.js';
 import { subscribeErrorSnapshotWriter } from './supervisor/error-snapshot.js';
 import { NexusEventBus } from './api/event-bus.js';
+import { startTaRepairEventCollector } from '../steward/ta-repair-event-collect.js';
 import type { SessionSurface } from '../session/index.js';
 import { wireWorkflowApprovalEvents } from './api/workflow-event-bridge.js';
 import { wireAgentStatusEvents } from './api/agent-status-event-bridge.js';
@@ -274,6 +275,73 @@ import { packageVersion } from '../version/code-revision.js';
 // 데몬 배너·`nexus status`·연결 라벨이 보이는 판 = 제품 판(`package.json`) — 옛 내부 상수 `0.17.0` 이 0.2.x 제품 옆에 떴다(🅞 M5 · M5c).
 export const NEXUS_VERSION = packageVersion();
 export const NEXUS_PHASE = 'N-5 PR χ (graceful exit + restart pending)';
+
+// DAEMON-THIN stage 1 — inventory only (RFC-universe-by-house §4).
+// Intentional wiring boundary: do not call daemonThinStage1 from runNexus.
+// A runtime caller would change process composition, which stage 1 forbids.
+export const DAEMON_THIN_STAY_ALLOWLIST = ['HTTP', 'PWA', '발송/dispatch', 'SSE', 'cards'] as const;
+export type DaemonThinStayAllowlistClass = (typeof DAEMON_THIN_STAY_ALLOWLIST)[number];
+
+export interface DaemonThinStayEntry {
+  id: string;
+  fileFunction: string;
+  allowlistClass: DaemonThinStayAllowlistClass;
+}
+
+export interface DaemonThinLeaveEntry {
+  id: string;
+  fileFunction: string;
+  why: string;
+}
+
+export interface DaemonThinStage1 {
+  stay: readonly DaemonThinStayEntry[];
+  leave: readonly DaemonThinLeaveEntry[];
+  removalOrder: readonly string[];
+}
+
+export function daemonThinStage1(): DaemonThinStage1 {
+  return {
+    stay: [
+      { id: 'http', fileFunction: 'src/nexus/api/http-server.ts:startNexusHttpServer', allowlistClass: 'HTTP' },
+      { id: 'pwa', fileFunction: 'src/nexus/pwa-registration.ts:createPwaRegistration', allowlistClass: 'PWA' },
+      { id: 'workflow-dispatch', fileFunction: 'src/workflow-runtime/daemon.ts:dispatchWebhook', allowlistClass: '발송/dispatch' },
+      { id: 'outbound', fileFunction: 'src/notifications/outbound-boot.ts:buildOutboundSubstrate', allowlistClass: '발송/dispatch' },
+      { id: 'sse-bus', fileFunction: 'src/nexus/api/event-bus.ts:NexusEventBus', allowlistClass: 'SSE' },
+      { id: 'sse-events', fileFunction: 'src/nexus/api/events.ts:handleSseEvents', allowlistClass: 'SSE' },
+      { id: 'sse-heartbeat', fileFunction: 'src/nexus/api/sse-heartbeat.ts:SSE_HEARTBEAT_MS', allowlistClass: 'SSE' },
+      { id: 'task-cards', fileFunction: 'src/nexus/api/task-cards-api.ts:handleTaskCardsGet', allowlistClass: 'cards' },
+      { id: 'decision-cards', fileFunction: 'src/decisions/decision-cards.ts:DecisionCardService', allowlistClass: 'cards' },
+      { id: 'hitl-pending', fileFunction: 'src/nexus/api/hitl-runtime.ts:createHitlPendingCallbacks', allowlistClass: 'cards' },
+    ],
+    leave: [
+      { id: 'executor', fileFunction: 'src/workflow-runtime/executor.ts:runWorkflowToCompletion', why: 'judgment/executor; daemon emit awaits this in-process — ops rail must consume a short-lived run instead (process extraction is remaining work, out of stage 1)' },
+      { id: 'harness', fileFunction: 'src/boot/daemon-tools/self-implement.ts:dispatchSelfImplement', why: 'harness/self-implement wired into TOX externalExec on this boot — already process-shaped; must leave the daemon' },
+      { id: 'agent-loop', fileFunction: 'src/telegram-agent.ts:makeTelegramAgentRunTurn', why: 'agent loop started on this boot (telegram Q&A; discord makeDiscordAgentRunTurn and ACP createAgentTurnRunner siblings). AutopilotLoopDriver in src/autopilot/agent-loop.ts is not started here' },
+      { id: 'tox', fileFunction: 'src/task-orchestrator/boot.ts:wireTox', why: 'TOX TaskFeedbackLoop + startToxLoop long-lived dispatcher started on this boot' },
+      { id: 'continuation', fileFunction: 'src/dispatch/continuation-scheduler.ts:ContinuationScheduler.start', why: 'idle-continuation scheduler constructed on this boot (starts when dispatch.enabled)' },
+      { id: 'workflow-schedule', fileFunction: 'src/workflow-runtime/daemon.ts:start', why: 'scheduleSource.start is a long-lived trigger scheduler; dispatch methods stay' },
+      { id: 'intent-prediction', fileFunction: 'src/intent-prediction/index.ts:createIntentPredictionService', why: 'long-lived ranker tick / judgment scheduler' },
+      { id: 'patcher', fileFunction: 'src/background-reasoning/patcher-boot.ts:buildPatcherSubstrate', why: 'self-improving patcher loop started on this boot' },
+      { id: 'daily-reflection', fileFunction: 'src/notes/daily-reflection-scheduler.ts:startDailyReflectionScheduler', why: 'daily reflection scheduler' },
+      { id: 'discovery-cron', fileFunction: 'src/registry/discovery/cron.ts:startDiscoveryCron', why: 'discovery cron scheduler' },
+      { id: 'watch-default', fileFunction: 'src/domains/watch-default-scheduler.ts:startWatchDefaultScheduler', why: 'watch default scheduler' },
+    ],
+    removalOrder: [
+      'executor',
+      'harness',
+      'agent-loop',
+      'tox',
+      'continuation',
+      'workflow-schedule',
+      'intent-prediction',
+      'patcher',
+      'daily-reflection',
+      'discovery-cron',
+      'watch-default',
+    ],
+  };
+}
 
 type TelegramAgentRunTurnFactory = typeof import('../telegram-agent.js').makeTelegramAgentRunTurn;
 type TelegramChannelResolver = typeof import('../domains/telegram-channels.js').resolveTelegramChannels;
@@ -1067,6 +1135,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   }
 
   const eventBus = new NexusEventBus();
+  const stopTaRepairEventCollector = startTaRepairEventCollector(eventBus);
   const state = createNexusState({ nexusVersion: NEXUS_VERSION, phase: NEXUS_PHASE });
   state.bus = eventBus;
   // BACKLOG #9 — fan workflow approval lifecycle into `/v1/events` SSE
@@ -3315,6 +3384,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     pushEvent(state, { kind: 'nexus.shutdown' });
     pwaRegistration.unregister();
     try { unsubscribeWebtermTabLifecycle(); } catch { /* swallow */ }
+    try { stopTaRepairEventCollector(); } catch { /* swallow */ }
     try { unsubscribeErrorSnapshots(); } catch { /* swallow */ }
     if (supervisor) {
       void supervisor.shutdown({ graceMs: 0 });

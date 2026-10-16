@@ -1,12 +1,20 @@
 import { describe, expect, test } from 'bun:test';
-import { buildRuntimeOverlayState, evaluateOverlayCondition, parseOverlayCondition } from './graph-overlay-condition.js';
+import { buildRuntimeOverlayState, evaluateOverlayCondition, l1OverlayStateInput, parseOverlayCondition } from './graph-overlay-condition.js';
+import { enableLandingFreeze, disableLandingFreeze, readLandingFreeze } from '../release-loop/landing-freeze.js';
+import { resolveRunContract } from './graph-run-contract.js';
+import { routeGate } from './graph-authority.js';
+import { inspectActiveProvider } from '../provider-summary.js';
+import { buildUserConfig } from '../user-config.js';
+import { listMachineResources } from '../cli/control-cli.js';
+import { ResourceLedger } from '../control-plane/ledger.js';
+import { assessQuotaExhaustion } from './orchestrator.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runSelfImplement } from './orchestrator.js';
 import { seams } from './test-seams.js';
 import { appendRunLedgerEntry, loadRunLedger, type RunLedgerEntry } from './run-ledger.js';
-import { GRAPH_SPECS } from './graph-templates.js';
+import { GRAPH_SPECS, GRAPH_TEMPLATES } from './graph-templates.js';
 import type { GraphOverlaySpec } from './graph-overlay-yaml.js';
 import { RUN_STOP_CLASSES } from './run-stop.js';
 
@@ -47,6 +55,10 @@ describe('RFC §5 4단계 — applies_when 을 «코드»가 판정한다', () =
       expect(evaluateOverlayCondition(`stop_class == ${cls}`, { stop_class: cls })).toEqual({ kind: 'applies' });
       expect(evaluateOverlayCondition(`stop_class != ${cls}`, { stop_class: cls })).toEqual({ kind: 'does-not-apply' });
     }
+    // gate-failed 는 RUN_STOP_CLASSES 순회로 자동 커버되고, pod-died 와 갈라져야 한다.
+    expect(RUN_STOP_CLASSES).toContain('gate-failed');
+    expect(evaluateOverlayCondition('stop_class == gate-failed', { stop_class: 'gate-failed' })).toEqual({ kind: 'applies' });
+    expect(evaluateOverlayCondition('stop_class == gate-failed', { stop_class: 'pod-died' })).toEqual({ kind: 'does-not-apply' });
     expect(evaluateOverlayCondition('stop_class == review-repeat', state)).toEqual({ kind: 'applies' });
     expect(evaluateOverlayCondition('stop_class == main-sync', state)).toEqual({ kind: 'does-not-apply' });
     expect(evaluateOverlayCondition('review_repeat >= 2', state)).toEqual({ kind: 'applies' });
@@ -98,6 +110,119 @@ describe('RFC §5 4단계 — applies_when 을 «코드»가 판정한다', () =
     expect(evaluateOverlayCondition('sibling_overlap == true', state)).toEqual({ kind: 'key-absent', key: 'sibling_overlap' });
     expect(Object.hasOwn(buildRuntimeOverlayState({ attempts: 1, siblingOverlap: null, authorGrade: 7 }), 'sibling_overlap')).toBe(false);
     expect(evaluateOverlayCondition('sibling_overlap == true', buildRuntimeOverlayState({ attempts: 1, siblingOverlap: true }))).toEqual({ kind: 'applies' });
+  });
+
+  test('L1 producer readings become seven condition keys, with false and zero distinct from absent', () => {
+    const state = buildRuntimeOverlayState({
+      attempts: 0, substrate: 'pod', freeze: 'on', docsOnly: false,
+      provider: 'openai-codex', quota: 'low', machines: 0, seats: 'steward-only',
+    });
+    expect(state).toEqual({
+      attempts: 0, substrate: 'pod', freeze: 'on', docs_only: false,
+      provider: 'openai-codex', quota: 'low', machines: 0, seats: 'steward-only',
+    });
+    for (const condition of [
+      'substrate == pod', 'freeze == on', 'docs_only == false',
+      'provider == openai-codex', 'quota == low', 'machines == 0', 'seats == steward-only',
+    ]) expect(evaluateOverlayCondition(condition, state)).toEqual({ kind: 'applies' });
+    expect(evaluateOverlayCondition('docs_only == true', state)).toEqual({ kind: 'does-not-apply' });
+    expect(evaluateOverlayCondition('machines > 0', state)).toEqual({ kind: 'does-not-apply' });
+  });
+
+  test('producer observations override conflicting direct L1 inputs; missing producer keys stay absent', () => {
+    const state = buildRuntimeOverlayState({
+      attempts: 0, substrate: 'pod', freeze: 'on', docsOnly: true,
+      provider: 'grok', quota: 'exhausted', machines: 5, seats: 'on',
+      producers: {
+        runContract: { substrate: 'local' }, landingFreeze: null,
+        gateRoute: routeGate(GRAPH_TEMPLATES['research-loop']!, ['src/changed.ts']),
+        activeProvider: { provider: 'openai-codex' },
+        quotaAssessment: { exhausted: false, accountAvailability: { currentUsedPercent: 10, thresholdPercent: 95 } },
+        machineResources: [], seatConfig: { mode: 'shadow' }, stewardConfig: { mode: 'live' },
+      },
+    });
+    expect(state).toEqual({ attempts: 0, substrate: 'local', freeze: 'off', docs_only: false,
+      provider: 'openai-codex', quota: 'ok', machines: 0, seats: 'steward-only' });
+    expect(evaluateOverlayCondition('freeze == off', state)).toEqual({ kind: 'applies' });
+    expect(evaluateOverlayCondition('freeze == on', state)).toEqual({ kind: 'does-not-apply' });
+    const missing = buildRuntimeOverlayState({ attempts: 0, freeze: 'on', producers: {} });
+    expect(missing).toEqual({ attempts: 0 });
+    expect(evaluateOverlayCondition('freeze == on', missing)).toEqual({ kind: 'key-absent', key: 'freeze' });
+  });
+
+  test('L1 state comes from the run contract, expiry-aware freeze, gate route, provider, quota, Nexus machines and loop modes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'overlay-l1-readings-'));
+    const at = new Date('2026-10-04T06:00:00Z');
+    try {
+      enableLandingFreeze({ until: '2026-10-04T07:00:00Z' }, root, at);
+      const runContract = resolveRunContract({ launch: 'pod', env: {} });
+      const gateRoute = routeGate(GRAPH_TEMPLATES['research-loop']!, ['docs/a.md']);
+      const cfg = buildUserConfig(join(root, 'missing-config.json'));
+      const activeProvider = inspectActiveProvider({ ...cfg, llm: { ...cfg.llm, provider: 'openai-codex' } });
+      const quotaAssessment = assessQuotaExhaustion('openai-codex', { reason: 'no-candidate', candidateCount: 1, currentUsedPercent: 80, thresholdPercent: 95 });
+      const ledger = new ResourceLedger(root);
+      ledger.register({ id: 'machine:a', kind: 'machine', machine: 'a', name: 'a', owner: 'test', attrs: {}, observedAt: at.getTime(), ttlMs: 60_000 }, 'test');
+      ledger.register({ id: 'machine:expired', kind: 'machine', machine: 'expired', name: 'expired', owner: 'test', attrs: {}, observedAt: at.getTime() - 60_000, ttlMs: 1 }, 'test');
+      const machineResources = await listMachineResources({ primaryUrl: 'http://127.0.0.1:9000', queryToken: 'a'.repeat(64), root,
+        fetch: async () => new Response(JSON.stringify({ resources: ledger.list({ kind: 'machine' }, at.getTime()) }), { status: 200 }) });
+      const readings = {
+        runContract, landingFreeze: readLandingFreeze(root, at), gateRoute, activeProvider,
+        quotaAssessment, machineResources,
+        seatConfig: { mode: 'shadow' as const }, stewardConfig: { mode: 'live' as const },
+      };
+      const state = buildRuntimeOverlayState({ attempts: 0, producers: readings });
+      expect(state).toEqual({ attempts: 0, substrate: 'pod', freeze: 'on', docs_only: true,
+        provider: 'openai-codex', quota: 'ok', machines: 1, seats: 'steward-only' });
+      for (const condition of ['substrate == pod', 'freeze == on', 'docs_only == true',
+        'provider == openai-codex', 'quota == ok', 'machines == 1', 'seats == steward-only']) {
+        expect(evaluateOverlayCondition(condition, state)).toEqual({ kind: 'applies' });
+      }
+      expect(buildRuntimeOverlayState({ attempts: 0, producers: { ...readings,
+        landingFreeze: readLandingFreeze(root, new Date('2026-10-04T07:00:00Z')),
+        quotaAssessment: assessQuotaExhaustion('openai-codex', { reason: 'no-candidate', candidateCount: 1, currentUsedPercent: 96, thresholdPercent: 95 }),
+        seatConfig: { mode: 'live-safe' },
+      } })).toMatchObject({ freeze: 'off', quota: 'exhausted', seats: 'on' });
+      expect(l1OverlayStateInput({ quotaAssessment: assessQuotaExhaustion('openai-codex', {
+        reason: 'candidate-available', candidateCount: 1, currentUsedPercent: 96, thresholdPercent: 95,
+      }) })).toEqual({ quota: 'low' });
+      expect(l1OverlayStateInput({ quotaAssessment: assessQuotaExhaustion('grok', undefined) })).toEqual({});
+      expect(buildRuntimeOverlayState({ attempts: 0, producers: {} })).toEqual({ attempts: 0 });
+      expect(l1OverlayStateInput({ machineResources: [] })).toEqual({ machines: 0 });
+      expect(l1OverlayStateInput({ gateRoute, seatConfig: { mode: 'shadow' }, stewardConfig: { mode: 'shadow' } }))
+        .toEqual({ docsOnly: true });
+      disableLandingFreeze(root);
+      expect(l1OverlayStateInput({ landingFreeze: readLandingFreeze(root, at) })).toEqual({ freeze: 'off' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('L1 producer absence remains key-absent, but observed off, false and zero are values', () => {
+    const unknown = buildRuntimeOverlayState({ attempts: 0, producers: {} });
+    const observed = buildRuntimeOverlayState({ attempts: 0, producers: {
+      landingFreeze: null,
+      gateRoute: routeGate(GRAPH_TEMPLATES['research-loop']!, ['src/changed.ts']),
+      machineResources: [],
+    } });
+    expect(observed).toEqual({ attempts: 0, freeze: 'off', docs_only: false, machines: 0 });
+    for (const [key, condition] of [
+      ['freeze', 'freeze == off'], ['docs_only', 'docs_only == false'], ['machines', 'machines == 0'],
+    ]) {
+      expect(evaluateOverlayCondition(condition, unknown)).toEqual({ kind: 'key-absent', key });
+      expect(evaluateOverlayCondition(condition, observed)).toEqual({ kind: 'applies' });
+    }
+  });
+
+  test('unknown or invalid L1 producer readings keep each condition key-absent', () => {
+    const missing = buildRuntimeOverlayState({ attempts: 0 });
+    const invalid = buildRuntimeOverlayState({
+      attempts: 0, substrate: 'remote', freeze: 'expired', docsOnly: 'false',
+      provider: ' ', quota: 'unknown', machines: -1, seats: 'unknown',
+    });
+    expect(invalid).toEqual(missing);
+    for (const key of ['substrate', 'freeze', 'docs_only', 'provider', 'quota', 'machines', 'seats']) {
+      const condition = `${key} == 0`;
+      expect(evaluateOverlayCondition(condition, missing)).toEqual({ kind: 'key-absent', key });
+      expect(evaluateOverlayCondition(condition, invalid)).toEqual({ kind: 'key-absent', key });
+    }
   });
 
   test('조건이 «없는» 오버레이는 항상 후보다', () => {

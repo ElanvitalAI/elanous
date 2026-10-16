@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { lastJsonObject, runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
+import { withOpSeatFlock } from '../../src/steward/resync-tick.js';
 import { releaseRunUniverse } from './release-universe.js';
 import { isReleaseVersion } from './release-version.js';
 import { changedFilesBetween, clearPartialPlan, planPartialRegate, writePartialPlan } from './gate-partial.js';
@@ -104,9 +105,12 @@ export function refreshReleaseBranchTip(runId: string, deps: ResumeReleaseDeps =
   }
   // A new tip invalidates everything built from the old one (gate verdict, prepared archive, …): restart no later
   // than the first node that consumed the commit, so each of them runs again on the new tip.
-  const firstConsumer = state.path.indexOf('gate');
+  // The public export now consumes the cut before the gate. Old saved graphs still have export-check after gate,
+  // so use the earliest consumer in this run's recorded path rather than assuming either graph version.
+  const consumers = ['export-check', 'gate'].map((node) => state.path.indexOf(node)).filter((index) => index >= 0);
+  const firstConsumer = consumers.length ? Math.min(...consumers) : -1;
   if (restartAt >= 0 && firstConsumer >= 0 && restartAt > firstConsumer) {
-    throw new Error(`${branch} moved (${recorded.slice(0, 12)} → ${to.slice(0, 12)}): resume at gate or earlier — later nodes were built from the old tip`);
+    throw new Error(`${branch} moved (${recorded.slice(0, 12)} → ${to.slice(0, 12)}): resume at ${state.path[firstConsumer]} or earlier — later nodes were built from the old tip`);
   }
   const stamp = (deps.now?.() ?? new Date()).toISOString().replace(/[:.]/g, '-');
   const backup = `${statePath}.before-tip-${stamp}-${process.pid}-${to.slice(0, 12)}.bak`;
@@ -135,14 +139,20 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
   // Any resume starts from no plan: one without a partial plan (from whatever node) never inherits an older plan.
   clearPartialPlan(root, tip.version);
   const auto = opts.partial === undefined;
+  // The current graph checks public export before gate. A moved tip must resume there, so its gate still needs
+  // the diff plan; in older saved graphs export-check followed gate and cannot consume one.
+  const saved = JSON.parse(readFileSync(tip.statePath, 'utf8')) as GraphRunState;
+  const fromIndex = saved.path.indexOf(opts.from);
+  const gateIndex = saved.path.indexOf('gate');
+  const reachesGate = (opts.from === 'gate' || opts.from === 'export-check') && fromIndex >= 0 && gateIndex >= fromIndex;
   // The default applies only where it can help: a gate re-run on a tip that moved. An unchanged tip re-uses its own
   // shard results by commit already.
-  if (opts.partial === false || (auto && (opts.from !== 'gate' || !tip.changed))) return { requested: false };
+  if (opts.partial === false || (auto && (!reachesGate || !tip.changed))) return { requested: false };
   const fallback = (reason: string): PartialOutcome => {
     debug.log('release-loop.resume', 'partial-fallback', { version: tip.version, reason, auto });
     return { requested: true, applied: false, reason, ...(auto ? { auto: true as const } : {}) };
   };
-  if (opts.from !== 'gate') return fallback('--partial only applies to --from gate');
+  if (!reachesGate) return fallback('--partial requires a restart that reaches gate');
   if (!tip.changed) return fallback('release branch tip unchanged — nothing new to re-check');
   let prior: { commit?: unknown; failures?: unknown; errors?: unknown } | undefined;
   for (const location of [...new Set([deps.ledgerRoot ?? releaseLedgerRoot(), root])]) {
@@ -178,6 +188,19 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
     closure: (changedCode) => testsReachingChanged(tree, changedCode, tests, { cliEntries: CLI_ENTRIES }) });
   if (!planned.ok) return fallback(planned.reason);
   if (planned.plan.files.length >= tests.length) return fallback(`every test is re-run (${tests.length}) — full gate`);
+  if (planned.plan.kind === 'carry') {
+    // A cut-failures file can exist even when a later gate check errored. Reuse only a completed, clean verdict.
+    const verdicts = [...new Set([deps.ledgerRoot ?? releaseLedgerRoot(), root])].map((location) => join(location, 'release', tip.version, 'gate-verdict.json'));
+    let clean = false;
+    for (const verdictPath of verdicts) {
+      if (!existsSync(verdictPath)) continue;
+      try {
+        const verdict = JSON.parse(readFileSync(verdictPath, 'utf8')) as { commit?: unknown; outcome?: unknown };
+        if (verdict.commit === tip.from && verdict.outcome === 'ok') { clean = true; break; }
+      } catch { return fallback(`unreadable prior gate verdict: ${verdictPath}`); }
+    }
+    if (!clean) return fallback(`no clean gate verdict for ${tip.from.slice(0, 12)} — full gate`);
+  }
   const path = writePartialPlan(root, planned.plan);
   debug.log('release-loop.resume', 'partial-planned', { version: tip.version, priorCommit: tip.from, commit: tip.to, files: planned.plan.files.length,
     tests: tests.length, auto, path, ...(planned.closure ? { reached: planned.closure.reached, opaque: planned.closure.opaque } : {}) });
@@ -195,6 +218,12 @@ function savedGraphPath(statePath: string): string | undefined {
 
 /** Refresh the branch tip, then restart the failed run at `from` with the saved graph snapshot. */
 export async function resumeReleaseRun(opts: { runId: string; from: string; partial?: boolean; waive?: string; reason?: string; acceptedRegressions?: AcceptedRegression[]; gateExecutor?: string; gateHost?: string }, deps: ResumeReleaseDeps = {}): Promise<{ tip: TipRefresh; partial: PartialOutcome; state: GraphRunState }> {
+  // The lock root is the OP seat's (opSeatLockRoot), never the injected ledger root: a different `deps.root` must not
+  // move this run onto a separate lock inode from the steward resync and the unattended release.
+  return withOpSeatFlock(() => resumeReleaseRunLocked(opts, deps));
+}
+
+async function resumeReleaseRunLocked(opts: { runId: string; from: string; partial?: boolean; waive?: string; reason?: string; acceptedRegressions?: AcceptedRegression[]; gateExecutor?: string; gateHost?: string }, deps: ResumeReleaseDeps): Promise<{ tip: TipRefresh; partial: PartialOutcome; state: GraphRunState }> {
   if (opts.from === 'version-release') throw new Error('--from version-release would cut again — resume at a later node');
   // RELEASE-LEDGER-UNIVERSE: decide the universe once; the run lookup and every resumed node use it.
   deps = { ...deps, root: releaseRunUniverse({ root: deps.root }) };

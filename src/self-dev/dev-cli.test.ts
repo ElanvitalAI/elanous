@@ -2388,10 +2388,10 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
   //   `decomposable-no-progress` 로 «스스로» 멎는다. 그래서 그 시퀀스를 여기 못 박는다.
   //   ⛔ 순수 함수 시험(`describeNonPromotableReason` 의 already-promoted)은 이 축을 «안 답한다» —
   //   그것은 「그 문자열을 만드나」이고, 이것은 「라운드가 어떻게 끝나나」다.
-  // ⛔⭐ 승격 «못 한» 다조각 런에서도 순서 계산의 간선 수가 원장에 남아야 한다.
-  //   🩸 2026-09-07: 그것이 «승격 성공 경로에만» 실려서, 관측된 hotPathEdges 가 승격 2건뿐이었고
-  //   「hotPaths 축이 안 돈다」로 읽힐 뻔했다(실제로는 분해 조각쌍 25% 가 겹친다).
-  it('승격하지 못해도 순서 계산을 했으면 간선 수를 사유에 싣는다', async () => {
+  // ⛔⭐ 승격 «못 한» 다조각 런에서도 순서 계산의 의미 간선 수가 원장에 남아야 한다.
+  //   2026-10-16: hotPaths 겹침은 더 이상 순서 간선을 만들지 않는다(#28299).
+  //   같은 파일을 만지는 조각이어도 dependsOn 간선만 승격 실패 사유에 센다.
+  it('승격하지 못해도 순서 계산을 했으면 의미 간선 수를 사유에 싣는다', async () => {
     const decisions: Array<Record<string, unknown>> = [];
     const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
       if (event === 'decision') decisions.push(data as Record<string, unknown>);
@@ -2403,7 +2403,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
         readProposals: () => ({
           proposals: new Map([['run-dev-supervision', { shardId: 'run-dev-supervision', pieces: [
             { id: 'part-a', feature: 'part a', dependsOn: [], hotPaths: ['src/x.ts'] },
-            { id: 'part-b', feature: 'part b', dependsOn: [], hotPaths: ['src/x.ts'] },
+            { id: 'part-b', feature: 'part b', dependsOn: ['part-a'], hotPaths: ['src/x.ts'] },
           ] }]]), goalPlanRevisions: new Map(),
           scannedFiles: 1, unreadableFiles: 0, directoryMissing: false, ledgerDirectory: '/ledger',
         }),
@@ -2415,9 +2415,8 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       .map((d) => String(d.decomposePromotionReason ?? ''))
       .find((r) => r.startsWith('dev-no-promotable-pieces')) ?? '');
     expect(reason).toContain('dev-no-promotable-pieces');
-    // ⭐ 겹치는 hotPaths 가 «간선을 만들었다»는 사실이 승격 실패에도 남는다.
-    expect(reason).toContain('hotPathEdges=1');
-    expect(reason).toContain('dependsOnEdges=0');
+    expect(reason).toContain('dependsOnEdges=1');
+    expect(reason).toContain('hotPathEdges=0');
   });
 
   it('조각 배치 뒤 라운드는 캐시 대신 재실행하고 max-rounds로 멎는다', async () => {

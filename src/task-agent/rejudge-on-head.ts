@@ -35,6 +35,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { prodInstanceRoot } from '../instance/resolve.js';
+import { getUserConfig } from '../user-config.js';
 import { loadRunLedger, type RunLedgerEntry } from '../self-implement/run-ledger.js';
 import type { DetachedSpawn } from '../cli/tasks-cli.js';
 import { remoteLedgerMirrorDir } from './parent-host.js';
@@ -46,6 +47,9 @@ import type { RepairCasOutcome, RepairCasRequest } from './repair-branch-cas.js'
 import { defaultLandPrHead, defaultPrHead, defaultReviewRepoCandidates, executeLiveLand, executeLiveReview, landRetryPending, type LiveMoveDeps, type LiveMoveResult, type PrHeadView, type ReviewRepoCandidate, type TaskAgentLiveMove } from './live-moves.js';
 import { capturedLandReview, captureReviewResults, parseReviewResultOutput, pendingReviewResults, reviewResultPath, type ParsedReviewResult } from './review-result-capture.js';
 import { boundPrTerminal, cardPrNumber, LIVE_MOVE_RESULT_EVENT, readTaskCard, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
+import { verifiedTrainLanding, type TrainLanding } from './train-landing.js';
+import { isGoalOnlyPr } from './judge.js';
+import { defaultPrFiles } from './shadow.js';
 
 export const REJUDGE_ON_HEAD_EVENT = 'rejudge-on-head';
 /** 카드·PR 당 재게이트하는 머리 수 상한(머리가 바뀔 때마다 하나) — 넘으면 멈추고 사람에게 넘긴다. */
@@ -60,6 +64,7 @@ export type CatchUpDecision = 'pushed' | 'conflict' | 'cap-reached' | 'failed';
 export interface RejudgeOutcome {
   card: string; pr: number | null; fromHead: string | null; toHead: string | null; step: RejudgeStep; decision: string; reason: string;
   fromBase?: string; toBase?: string; newHead?: string;
+  repairRunId?: string; repairHead?: string;
 }
 
 export interface RegateRequest { card: string; pr: number; head: string; repoRoot: string; resultPath: string }
@@ -77,6 +82,8 @@ export type CatchUpGit = (cwd: string, args: string[]) => { status: number | nul
 export interface RejudgeDeps {
   live?: LiveMoveDeps;
   liveMoves: ReadonlySet<TaskAgentLiveMove>;
+  /** Complete PR target paths; undefined means the PR diff could not be measured. */
+  prFiles?: (pr: number, prUrl: string) => Promise<readonly string[] | undefined>;
   /** Only phase ① shadow callbacks may inspect a previously judged head without a regate. */
   shadowSameHead?: boolean;
   /** HQ mirror proof that the bound remote child has stopped. Test seam; absence fails closed. */
@@ -96,6 +103,8 @@ export interface RejudgeDeps {
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
   /** 시험 seam — 결과 파일 읽기(없으면 ENOENT). */
   readFile?: (path: string) => string;
+  /** Verify a CLOSED component PR against the HQ train ledger and merged integration PR. */
+  trainLanding?: (pr: number, cwd: string) => TrainLanding | null;
 }
 
 /** PR binding alone does not mean a remote parent has stopped. Require its child edge and terminal ledger row. */
@@ -283,6 +292,15 @@ export function parseRegateResult(text: string, pr: number, head: string): Regat
 const sameUrl = (a: string, b: string) => a.trim().replace(/\/+$/, '').toLowerCase() === b.trim().replace(/\/+$/, '').toLowerCase();
 const sameHead = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 
+/**
+ * TA-REGATE-UNMEASURED — «못 잰» 재게이트(draft `pr-head` 거부·띄우기 실패 등 status=unmeasured)는 코드 판정이 아니다.
+ * 재게이트 상한(REJUDGE_HEAD_CAP)에 세지 않는다. 옛 결과 파일은 noMerge 에 status 가 없어서 draft 거부 문면으로도 가린다.
+ */
+export function regateUnmeasured(entry: { passed?: boolean; status?: string; detail?: string }): boolean {
+  return entry.passed === false && (entry.status === 'unmeasured' || /^pr-head:.*\bisDraft=true\b/.test(entry.detail ?? ''));
+}
+const cappedRegates = <T extends { passed?: boolean; status?: string; detail?: string }>(entries: readonly T[]): T[] => entries.filter((entry) => !regateUnmeasured(entry));
+
 const defaultCatchUpGit: CatchUpGit = (cwd, args) => {
   const r = spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 120_000 });
   return { status: r.status, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? '') };
@@ -416,8 +434,6 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   // 원격 부모는 node-b 의 liveMoves 가 꺼져 리뷰 이력이 0일 수 있다. HQ 거울의 종결 증거가 있을 때만 시작한다.
   const adopted = card.adoptedPr?.pr === pr && typeof card.pr === 'object'
     && !!card.pr.url && sameUrl(card.adoptedPr.url, card.pr.url) && /^[a-f0-9]{40}$/i.test(card.adoptedPr.head);
-  if (!reviews.length && !adopted && (!card.parentHost || !(deps.remoteRunTerminal ?? remoteBoundRunTerminal)(card)))
-    return target('not-started', 'no task-agent review on this PR yet (remote terminal unproven or run not stopped/judged)', pr);
   // 떼어 띄운 재게이트 결과를 «머리와 무관하게» 먼저 회수한다 — 결과가 나오기 전에 머리가 또 바뀌어도 그 머리의 결과는 카드에 남는다.
   for (const pending of (card.regates ?? []).filter((entry) => entry.pr === pr && entry.passed === undefined && entry.resultPath)) {
     let text: string | null = null;
@@ -435,7 +451,7 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
       wrote = true;
       return { ...current, regates: current.regates.map((entry) => entry.pr === pr && entry.head === pending.head && entry.at === pending.at ? { ...entry, ...patch } : entry) };
     });
-    if (wrote) emit({ card: card.id, pr, fromHead: null, toHead: pending.head, step: 'regate', decision: patch.passed ? 'regate-passed' : 'regate-failed',
+    if (wrote) emit({ card: card.id, pr, fromHead: null, toHead: pending.head, step: 'regate', decision: patch.passed ? 'regate-passed' : regateUnmeasured(patch) ? 'regate-unmeasured' : 'regate-failed',
       reason: `head ${pending.head.slice(0, 12)} · base ${(patch as { baseCommit?: string }).baseCommit?.slice(0, 12) ?? '-'} · ${patch.detail}` }, true);
   }
   card = readTaskCard(card.id, statePath) ?? card;
@@ -453,15 +469,40 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   if ('reason' in found) return target('pr-unreadable', found.reason, pr, fromHead);
   const { cwd, view } = found;
   const toHead = view.head;
+  const eligible = !!reviews.length || adopted || (!!card.parentHost && (deps.remoteRunTerminal ?? remoteBoundRunTerminal)(card));
+  const trustedTrain = view.state === 'CLOSED' && card.status === 'launched'
+    ? (() => { try { return (deps.trainLanding ?? verifiedTrainLanding)(pr, cwd); } catch { return null; } })() : null;
+  // An unreviewed or unproven remote card retains the old guard. Only verified train
+  // evidence may cross it; an arbitrary CLOSED PR must not disappear from rejudge.
+  if (!eligible && !trustedTrain)
+    return target('not-started', 'no task-agent review on this PR yet (remote terminal unproven or run not stopped/judged)', pr);
+  try {
+    const paths = await (deps.prFiles ?? defaultPrFiles)(pr, url);
+    if (isGoalOnlyPr(paths)) return target('goal-only-pr', `PR #${pr} target diff 0 (docs/goals/** only) — review·land·같은 골 재큐 중지`, pr, fromHead, toHead, true);
+  } catch (error) {
+    try { log('task-agent', 'pr-target-diff-unavailable', { card: card.id, pr,
+      reason: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+  }
   if (view.state === 'MERGED' || view.state === 'CLOSED') {
     const at = now().toISOString();
+    const train = trustedTrain;
     updateTaskCard(statePath, card.id, (current) => {
       if (!current || cardPrNumber(current) !== pr || typeof current.pr !== 'object' || current.pr.url !== url) return undefined;
       const previous = boundPrTerminal(current);
-      if (previous?.state === view.state && previous.head === toHead) return undefined;
-      return { ...current, prTerminal: { pr, url, head: toHead, state: view.state as 'MERGED' | 'CLOSED', at } };
+      const alreadyLanded = train && current.trainLanding?.componentPr === pr
+        && current.trainLanding.integrationPr === train.integrationPr && current.trainLanding.mergeSha === train.mergeSha;
+      if (previous?.state === view.state && previous.head === toHead && (!train || alreadyLanded) && (!train || current.status === 'done')) return undefined;
+      return {
+        ...current,
+        ...(train ? { status: 'done' as const, trainLanding: alreadyLanded ? current.trainLanding : { ...train, at }, history: alreadyLanded ? current.history : [...(current.history ?? []), {
+          at, event: 'landed-via-train', pr, head: toHead, detail: `train #${train.integrationPr} merged ${train.mergeSha}`,
+        }] } : {}),
+        prTerminal: previous?.state === view.state && previous.head === toHead ? previous
+          : { pr, url, head: toHead, state: view.state as 'MERGED' | 'CLOSED', at },
+      };
     });
-    return target('pr-not-open', `PR #${pr} is ${view.state}`, pr, fromHead, toHead);
+    return train ? target('landed-via-train', `PR #${pr} via train #${train.integrationPr} merge ${train.mergeSha}`, pr, fromHead, toHead)
+      : target('pr-not-open', `PR #${pr} is ${view.state}`, pr, fromHead, toHead);
   }
   if (view.state !== 'OPEN') return target('pr-not-open', `PR #${pr} is ${view.state}`, pr, fromHead, toHead);
   // An explicitly rejudged PR can be reopened. Clear the old marker before normal head judgement.
@@ -537,7 +578,8 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
         ...(deps.applyRepair ? { apply: deps.applyRepair } : {}),
         ...(deps.notifyRepair ? { notify: deps.notifyRepair } : {}),
         ...(deps.repairBudget ? { repairBudget: deps.repairBudget } : {}) });
-      step('repair', result.decision, result.reason, true);
+      step('repair', result.decision, result.reason, true,
+        result.repairRunId && result.repairHead ? { repairRunId: result.repairRunId, repairHead: result.repairHead } : {});
       return outcomes;
     }
   }
@@ -582,6 +624,40 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
       recordMove(statePath, card.id, card.runId, 'review', result, pr, before, now, deps.log);
       step('review', result.executed ? 'review-requested' : 'review-request-failed', result.detail, true);
     }
+    return outcomes;
+  }
+
+  // TA-LAND-AFTER-REVIEW: configured queue mode owns its one remote changed gate inside
+  // the queue adapter. The older host regate below is the direct-merge path only.
+  const queueMode = live.landQueueConfig === undefined ? getUserConfig().taskAgent?.landQueue : live.landQueueConfig;
+  if (queueMode) {
+    const latest = readTaskCard(card.id, statePath) ?? card;
+    const priorQueue = (latest.landAttempts ?? []).filter((entry) => entry.pr === pr && sameHead(entry.head, toHead));
+    if (priorQueue.length && !landRetryPending(latest, pr, toHead)) {
+      step('land', 'queue-skipped', `PR #${pr} head ${toHead.slice(0, 12)} already claimed or queued`, false);
+      return outcomes;
+    }
+    const review = capturedLandReview(latest, pr, toHead);
+    if (!review || review.mustFixCount !== 0) {
+      if (pendingReviewResults(latest).some((entry) => entry.pr === pr && sameHead(entry.head, toHead))) {
+        step('review', 'awaiting-review-result', 'exact-head review result pending', false);
+      } else if (!latest.reviewRequests?.some((entry) => entry.pr === pr && sameHead(entry.head, toHead)) && deps.liveMoves.has('review')) {
+        const before = { reviewRequests: latest.reviewRequests, landAttempts: latest.landAttempts };
+        const result = await executeLiveReview(latest, pr, { runId: latest.runId ?? null, stopReason: 'queue-exact-head', cwd }, { ...live, ...(deps.log ? { log: deps.log } : {}) });
+        recordMove(statePath, latest.id, latest.runId, 'review', result, pr, before, now, deps.log);
+        step('review', result.executed ? 'review-requested' : 'review-request-failed', result.detail, true);
+      } else step('review', 'not-landing', 'exact-head PASS/WARN mf0 review not captured', true);
+      return outcomes;
+    }
+    if (!readyConfirmed) { step('ready', 'ready-unconfirmed', 'exact-head ready PR not confirmed', false); return outcomes; }
+    if (!deps.liveMoves.has('propose-land')) { step('land', 'would-land', 'propose-land not enabled — queue shadow', false); return outcomes; }
+    const reviewResult = latest.reviewRequests?.find((entry) => entry.pr === pr && sameHead(entry.head, toHead) && entry.resultPath)?.resultPath;
+    if (!reviewResult) { step('land', 'not-landing', 'exact-head review JSON path missing', true); return outcomes; }
+    const before = { reviewRequests: latest.reviewRequests, landAttempts: latest.landAttempts };
+    const queued = await executeLiveLand(latest, pr, { runId: latest.runId ?? null, cycleId: `queue:${latest.id}:${toHead}`, cwd,
+      review, reviewResultPath: reviewResult }, { ...live, landQueueConfig: queueMode, ...(deps.log ? { log: deps.log } : {}) });
+    recordMove(statePath, latest.id, latest.runId, 'propose-land', queued, pr, before, now, deps.log);
+    step('land', queued.queued ? 'queued' : queued.ok && !queued.executed ? 'queue-skipped' : 'queue-refused', queued.detail, true);
     return outcomes;
   }
 
@@ -653,8 +729,9 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   if (!regate || staleBase || retryDraft) {
     const why = staleBase ? `base-stale-overlap — gate base ${staleBase.slice(0, 12)} went stale (${(stale!.reason ?? '').replace(/^base-stale-overlap:\s*/, '').slice(0, 160)})`
       : retryDraft ? 'draft rejection became stale after PR ready' : '';
-    if (regates.length >= REJUDGE_HEAD_CAP) {
-      step('regate', 'cap-reached', `${why ? `${why} · ` : ''}re-gated ${regates.length} times already (cap ${REJUDGE_HEAD_CAP}) — no more rejudge; needs owner`, true);
+    const counted = cappedRegates(regates).length;
+    if (counted >= REJUDGE_HEAD_CAP) {
+      step('regate', 'cap-reached', `${why ? `${why} · ` : ''}re-gated ${counted} times already (cap ${REJUDGE_HEAD_CAP} · unmeasured ${regates.length - counted} not counted) — no more rejudge; needs owner`, true);
       return outcomes;
     }
     if (!deps.liveMoves.has('propose-land')) step('regate', 'would-regate', `${why ? `${why} · ` : ''}propose-land not enabled in taskAgent.liveMoves — shadow`, false);
@@ -670,7 +747,7 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
         if (!current || held.some((entry) => sameHead(entry.head, toHead) && (staleBase ? entry.staleBase !== undefined && sameHead(entry.staleBase, staleBase)
           : retryDraft ? entry.readyRetry === true : true))) return undefined;
         // 상한은 잠금 안의 «지금» 카드로 다시 잰다 — 다른 머리를 본 두 틱이 겹쳐도 상한을 넘지 않게.
-        if (held.length >= REJUDGE_HEAD_CAP) { capped = true; return undefined; }
+        if (cappedRegates(held).length >= REJUDGE_HEAD_CAP) { capped = true; return undefined; }
         claimed = true;
         return { ...current, regates: [...(current.regates ?? []), { pr, head: toHead, at, resultPath, ...(staleBase ? { staleBase } : {}), ...(retryDraft ? { readyRetry: true as const } : {}) }] };
       });
@@ -753,7 +830,7 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   const before = { reviewRequests: latest.reviewRequests, landAttempts: latest.landAttempts };
   // 주기 id — base-stale 재게이트 뒤의 land 는 새 base 를 붙여 앞 land 의 주기 표시(모듈 전역)와 갈린다 · gateAt 이 앞 base-stale 시도를 소비한다.
   const cycleId = `rejudge:${card.id}:${toHead}${regate.staleBase ? `:${regate.baseCommit.slice(0, 12)}` : ''}`;
-  const landed = await executeLiveLand(latest, pr, { runId: card.runId ?? null, cycleId, cwd, review, overlapEvidence, gateAt: regate.at },
+  const landed = await executeLiveLand(latest, pr, { runId: card.runId ?? null, cycleId, cwd, review, reviewResultPath: reviewResult, overlapEvidence, gateAt: regate.at },
     { ...live, ...(deps.log ? { log: deps.log } : {}) });
   // LAND-ORDER-LEDGER — executeLiveLand 직후 원장 한 줄(같은 pr+head 는 한 줄만). 쓰기가 실패해도 land 결과는 그대로(삼킨다).
   const landOrderLog = (event: 'appended' | 'append-failed') => { try { log('task-agent.land-order', event, { pr, head: toHead }); } catch { /* fail-soft */ } };
@@ -771,7 +848,7 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   const attempt = landed.landAttempt?.class
     ? ` · land-class ${landed.landAttempt.class} (${landed.landAttempt.reason}) · attempt ${landed.landAttempt.attempt} · ${landed.landAttempt.class === 'base-stale' ? 'base-stale → re-gate on a new base next tick (cap counts)' : landed.landAttempt.retryAllowed ? 'retry allowed on this head' : 'no retry on this head'}`
     : '';
-  step('land', landed.executed && landed.ok ? 'landed'
+  step('land', landed.queued ? 'queued' : landed.executed && landed.ok ? 'landed'
     : !landed.executed && landed.ok ? 'land-skipped' : 'land-rejected',
   `${landed.detail}${attempt} · overlap-evidence ${overlapEvidence}`, true);
   return outcomes;

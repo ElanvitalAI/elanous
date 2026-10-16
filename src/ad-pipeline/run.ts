@@ -223,6 +223,8 @@ export interface AdProductionDeps {
   readonly render?: CommandRunner;
   /** Optional calibrated thresholds; omitted thresholds intentionally preserve unmeasured QC findings. */
   readonly qcThresholds?: QcThresholds;
+  /** Platform that decides whether on-screen text OCR (macOS Vision via swiftc) is planned; defaults to `process.platform`. */
+  readonly qcPlatform?: NodeJS.Platform;
 }
 
 export interface AdOutputIdentity {
@@ -828,7 +830,7 @@ async function runQc(
   captionedMasterPath?: string,
 ): Promise<QcResult | undefined> {
   if (!production?.render || !scene || !masterPath) return undefined;
-  const { measurements, unavailableTextRegions } = await measureQc(production, buildQcMeasurementPlan(scene, masterPath));
+  const { measurements, unavailableTextRegions } = await measureQc(production, buildQcMeasurementPlan(scene, masterPath, production.qcPlatform ?? process.platform));
   if (unavailableTextRegions !== undefined) {
     debug.log('ad-pipeline.qc', 'text-regions-unavailable', { reason: unavailableTextRegions });
   }
@@ -851,7 +853,7 @@ async function runQc(
     debug.log('ad-pipeline.qc', 'captioned-master-absent', { reason: !captionedMasterPath ? 'captioned-master-unavailable' : 'no-caption-lines' });
     return baseResult;
   }
-  const captionedPlan = buildQcMeasurementPlan(scene, captionedMasterPath, process.platform, {
+  const captionedPlan = buildQcMeasurementPlan(scene, captionedMasterPath, production.qcPlatform ?? process.platform, {
     textFrameAtSeconds: (line.startMs + line.endMs) / 2000,
   });
   const captionedMeasurement = await measureQc(production, captionedPlan, (step) => step === 'probe' || step.startsWith('text-'));

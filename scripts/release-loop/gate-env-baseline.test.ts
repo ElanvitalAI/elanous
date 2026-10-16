@@ -3,6 +3,7 @@
 import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { GATE_POD_ENV_BASELINE, gateEnvBaselineLine, gateShardShell } from './gate-node';
+import { gateTestBaseline } from '../lib/gate-test-env';
 import { prepareIsolatedTestEnv } from '../test-deterministic';
 
 const base = { parts: [['src/a.test.ts']], cdpPatterns: [], softSeconds: 100, cachePrefix: '', installSlots: 4 };
@@ -17,7 +18,7 @@ test('the shard shell exports the baseline before the part runs, with or without
     const lines = shell.split('\n');
     const at = lines.indexOf(gateEnvBaselineLine());
     expect(at).toBeGreaterThanOrEqual(0);
-    expect(at).toBeLessThan(lines.findIndex((line) => line.includes('test:deterministic')));
+    expect(at).toBeLessThan(lines.findIndex((line) => line.includes('scripts/test-deterministic.ts') || line.includes('test:deterministic')));
   }
 });
 
@@ -25,6 +26,21 @@ test('the exported line sets exactly those values in bash', () => {
   const ran = spawnSync('bash', ['-c', `${gateEnvBaselineLine()}; printf '%s|%s|%s|%s' "$TZ" "$LANG" "$LC_ALL" "$ELANOUS_TEST_FAKE_LLM"`], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } });
   expect(ran.status).toBe(0);
   expect(ran.stdout).toBe('UTC|C.UTF-8|C.UTF-8|1');
+});
+
+test('release shell preserves an explicit fake LLM off through the shared baseline', () => {
+  const previous = process.env.ELANOUS_TEST_FAKE_LLM;
+  try {
+    process.env.ELANOUS_TEST_FAKE_LLM = '0';
+    const expected = gateEnvBaselineLine(gateTestBaseline({ ELANOUS_TEST_FAKE_LLM: '0' }));
+    expect(gateShardShell(base).split('\n')).toContain(expected);
+    const ran = spawnSync('bash', ['-c', `${expected}; printf '%s' "$ELANOUS_TEST_FAKE_LLM"`],
+      { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } });
+    expect(ran.stdout).toBe('0');
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_TEST_FAKE_LLM;
+    else process.env.ELANOUS_TEST_FAKE_LLM = previous;
+  }
 });
 
 test('test:deterministic keeps the baseline in the test env (it strips credentials, not these)', () => {

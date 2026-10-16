@@ -1,11 +1,14 @@
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { sendOutbound } from '../domains/outbound-alert.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
-import { runLightRc, type LightRcResult } from './light-rc.js';
+import { isValidGateHost } from '../self-implement/gate-remote.js';
+import { LIGHT_RC_UNKNOWN_HOST, runLightRc, type LightRcResult } from './light-rc.js';
+import { planRehearsalShards, type RehearsalShardPlan, type RehearsalShardPlanDeps } from './rehearsal-shard-plan.js';
 import { listSchedules, type ReleaseSchedule } from './release-schedule.js';
 
 export type StepId = 'rc-7h' | 'rc-150m';
@@ -50,6 +53,9 @@ export interface RehearsalStamp {
   summary?: string;
   regressionFiles?: string[];
   result?: LightRcResult;
+  shardPlan?: RehearsalShardPlan;
+  leakCheck?: { outcome: 'ok' | 'fail'; sha: string; exitCode: number | null };
+  selection?: { shards?: number; remote?: string };
   notifiedAt?: string;
   ownerPid?: number;
 }
@@ -58,14 +64,19 @@ export interface RehearsalOptions {
   apply?: boolean;
   checkout?: string;
   ledgerRoot?: string;
+  shards?: number;
+  remote?: string;
 }
 
 export interface RehearsalDeps {
   now?: () => Date;
   schedules?: (root: string) => ReleaseSchedule[];
-  lightRc?: (version: string, checkout: string) => Promise<LightRcResult>;
+  lightRc?: (version: string, checkout: string, selection: { shards?: number; remote?: string }) => Promise<LightRcResult>;
+  shardPlan?: typeof planRehearsalShards;
+  shardPlanDeps?: RehearsalShardPlanDeps;
   notify?: (text: string) => void | boolean | Promise<void | boolean>;
   git?: (args: string[], cwd: string) => { rc: number | null; stdout: string; stderr?: string };
+  leakCheck?: (checkout: string) => { status: number | null };
 }
 
 export type RehearsalTickResult = RehearsalPlan & { applied?: boolean; stamps?: RehearsalStamp[]; notificationFailures?: number };
@@ -86,6 +97,17 @@ function gitResult(git: NonNullable<RehearsalDeps['git']>, args: string[], check
   return result.stdout.trim();
 }
 
+/** Public export checks the pinned rehearsal checkout before any remote RC work. Its output is private and ephemeral. */
+function runRehearsalLeakCheck(checkout: string): { status: number | null } {
+  const out = mkdtempSync(join(tmpdir(), 'elanous-rehearsal-export-'));
+  try {
+    const result = spawnSync('bun', ['scripts/public-export.ts', '--out', join(out, 'export')], {
+      cwd: checkout, encoding: 'utf8', timeout: 1_800_000, maxBuffer: 64 * 1024 * 1024,
+    });
+    return { status: result.status };
+  } finally { rmSync(out, { recursive: true, force: true }); }
+}
+
 function oneLine(text: string): string { return text.replace(/\s+/g, ' ').trim(); }
 
 function outcomeLine(stamp: RehearsalStamp): string {
@@ -95,7 +117,11 @@ function outcomeLine(stamp: RehearsalStamp): string {
   if (!stamp.result) return `${head}${stamp.summary ? ` · ${stamp.summary}` : ''}`;
   const result = stamp.result;
   const duration = Math.max(0, Math.round((Date.parse(stamp.endedAt!) - Date.parse(stamp.startedAt)) / minute));
-  return `${head} · 새 회귀 ${result.introduced ?? '못 쟀다'} · 기존 ${result.preexisting ?? '못 쟀다'} · 미분류 ${result.unclassified ?? '못 쟀다'} · ${result.remote ?? 'local'} · ${duration}분${stamp.outcome === 'error' ? ` · gate rc ${result.gateExitCode}${!result.ok ? ' · RC 실패' : ''}` : ''}${stamp.regressionFiles?.length ? ` · 파일 ${stamp.regressionFiles.slice(0, 3).join(', ')}` : ''}`;
+  const planningGap = stamp.shardPlan?.unmeasured
+    || (stamp.selection?.shards !== undefined && result.shards !== stamp.selection.shards)
+    || (stamp.selection?.remote !== undefined && result.remote !== stamp.selection.remote);
+  const detail = stamp.summary && (stamp.outcome === 'unmeasured' || stamp.outcome === 'error' && planningGap) ? ` · ${stamp.summary}` : '';
+  return `${head} · 새 회귀 ${result.introduced ?? '못 쟀다'} · 기존 ${result.preexisting ?? '못 쟀다'} · 미분류 ${result.unclassified ?? '못 쟀다'} · ${result.remote ?? 'local'} · ${duration}분${stamp.outcome === 'error' ? ` · gate rc ${result.gateExitCode}${!result.ok ? ' · RC 실패' : ''}` : ''}${stamp.regressionFiles?.length ? ` · 파일 ${stamp.regressionFiles.slice(0, 3).join(', ')}` : ''}${detail}`;
 }
 
 function persistStamp(path: string, stamp: RehearsalStamp): void {
@@ -207,6 +233,12 @@ function interruptStamp(path: string, saved: RehearsalStamp, now: Date): Rehears
 
 /** wx claim is permanent per version/step; a crashed run is reported as interrupted without running RC twice. */
 export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: RehearsalDeps = {}): Promise<RehearsalTickResult> {
+  if (opts.shards !== undefined && (!Number.isSafeInteger(opts.shards) || opts.shards < 1)) {
+    throw new Error(`release rehearsal tick: invalid --shards count: ${opts.shards}`);
+  }
+  if (opts.remote !== undefined && !isValidGateHost(opts.remote)) {
+    throw new Error(`release rehearsal tick: invalid --remote host: ${opts.remote}`);
+  }
   const root = opts.ledgerRoot ?? releaseLedgerRoot();
   const now = (deps.now ?? (() => new Date()))();
   const schedules = (deps.schedules ?? listSchedules)(root);
@@ -289,26 +321,50 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
             gitResult(git, ['checkout', '-q', '--detach', 'origin/main'], checkout);
             stamp.sha = gitResult(git, ['rev-parse', 'HEAD'], checkout);
             if (!stamp.sha) throw new Error('git rev-parse HEAD returned no sha');
+            const leak = (deps.leakCheck ?? runRehearsalLeakCheck)(checkout);
+            stamp.leakCheck = { outcome: leak.status === 0 ? 'ok' : 'fail', sha: stamp.sha, exitCode: leak.status };
+            if (leak.status !== 0) throw new Error(`public export leak-check failed (rc=${leak.status ?? 'spawn'})`);
             const regressionFiles: string[] = [];
-            const result = await (deps.lightRc ?? ((version, cwd) => runLightRc(version, { ledgerRoot: root, head: stamp.sha, rehearsalTui: true, log: (line) => {
-              for (const entry of line.split(/\r?\n/)) {
-                const file = /^- introduced: (.+?)(?: > |$)/.exec(entry)?.[1];
-                if (file && regressionFiles.length < 3) regressionFiles.push(file);
-              }
-              console.error(line);
-            } }, { cwd })))(plan.version, checkout);
+            const shardPlan = opts.shards === undefined ? (deps.shardPlan ?? planRehearsalShards)(plan.version, root, checkout, { ...deps.shardPlanDeps, remoteGate: true }) : undefined;
+            if (shardPlan) stamp.shardPlan = shardPlan;
+            const selection = { shards: opts.shards ?? shardPlan?.shards, remote: opts.remote };
+            stamp.selection = selection;
+            const result = await (deps.lightRc ?? ((version, cwd) => runLightRc(version, { ledgerRoot: root, head: stamp.sha, ...selection, rehearsalTui: true, log: (line) => {
+                for (const entry of line.split(/\r?\n/)) {
+                  const file = /^- introduced: (.+?)(?: > |$)/.exec(entry)?.[1];
+                  if (file && regressionFiles.length < 3) regressionFiles.push(file);
+                }
+                console.error(line);
+              } }, { cwd })))(plan.version, checkout, selection);
             stamp.result = result;
             if (regressionFiles.length) stamp.regressionFiles = regressionFiles;
-            stamp.outcome = result.introduced === null || result.unclassified === null ? 'unmeasured'
-              : result.introduced > 0 ? 'regression'
-              : result.unclassified > 0 ? 'unmeasured'
-              : !result.ok || result.gateExitCode !== 0 ? 'error' : 'ok';
-            stamp.summary = oneLine(`introduced ${result.introduced} · preexisting ${result.preexisting ?? 'unmeasured'} · unclassified ${result.unclassified} · ${result.remote ?? 'local'} · gate rc ${result.gateExitCode}${!result.ok ? ' · RC 실패' : ''}`);
+            const shardMismatch = selection.shards !== undefined && result.shards !== selection.shards
+              ? `selected shards ${selection.shards} but RC reported ${result.shards}` : null;
+            const remoteMismatch = opts.remote && result.remote !== opts.remote
+              ? `requested remote ${opts.remote} but RC reported ${result.remote ?? 'local'}` : null;
+            if (shardPlan?.remoteCapacityPending && result.remote && result.remote !== LIGHT_RC_UNKNOWN_HOST
+              && !remoteMismatch && result.unmeasured === null
+              && result.introduced !== null && result.unclassified === 0 && result.ok
+              && result.gateExitCode === 0 && !shardMismatch) {
+              // Only the completed RC can validate capacity of the actual remote host. Keep independent
+              // selection/RSS gaps; clear just the provisional remote-capacity gap.
+              stamp.shardPlan = { ...shardPlan, remoteCapacityPending: false, rssRevisionPending: false,
+                remoteCapacityVerifiedBy: result.remote,
+                unmeasured: shardPlan.planningGaps?.length ? shardPlan.planningGaps.join('; ') : null };
+            }
+            const planningGap = stamp.shardPlan?.unmeasured || shardMismatch || remoteMismatch;
+            const missingEvidence = result.introduced === null || result.unclassified === null
+              || result.unmeasured !== null || result.unclassified > 0 || !!planningGap;
+            stamp.outcome = result.introduced !== null && result.introduced > 0 ? missingEvidence ? 'unmeasured' : 'regression'
+              : result.introduced === null || result.unclassified === null || result.unmeasured !== null || result.unclassified > 0 ? 'unmeasured'
+              : result.unmeasured === null && (!result.ok || result.gateExitCode !== 0) ? 'error'
+              : planningGap ? 'unmeasured' : 'ok';
+            stamp.summary = oneLine(`introduced ${result.introduced} · preexisting ${result.preexisting ?? 'unmeasured'} · unclassified ${result.unclassified} · ${result.remote ?? 'local'} · gate rc ${result.gateExitCode}${!result.ok ? ' · RC 실패' : ''}${result.unmeasured !== null ? ` · unmeasured: ${result.unmeasured || 'RC reason empty'}` : ''}${stamp.shardPlan?.unmeasured ? ` · unmeasured: ${stamp.shardPlan.unmeasured}` : ''}${shardMismatch ? ` · unmeasured: ${shardMismatch}` : ''}${remoteMismatch ? ` · unmeasured: ${remoteMismatch}` : ''}`);
           }
         }
       } catch (error) {
         stamp.outcome = 'error';
-        stamp.summary = oneLine(String(error instanceof Error ? error.message : error).split(/\r?\n/, 1)[0] ?? 'unknown error');
+        stamp.summary = oneLine(`${String(error instanceof Error ? error.message : error).split(/\r?\n/, 1)[0] ?? 'unknown error'}${stamp.shardPlan?.unmeasured ? ` · unmeasured: ${stamp.shardPlan.unmeasured}` : ''}`);
       }
       await finish(path, stamp);
     }

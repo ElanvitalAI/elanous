@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 
-import { readFileSync } from 'node:fs';
 
 import { buildDashboardSlashRegistry } from '../src/dashboard/slash-runtime/dashboard-handlers.js';
 import { executeImmediateDashboardSlash } from '../src/dashboard/input/slash-executor.js';
@@ -11,6 +10,7 @@ import {
   _resetDashboardSlashExecutorForTesting,
   ALLOWED_SLASHES,
 } from '../src/skills/tools/dashboard-slash.js';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
 afterEach(() => {
   _resetDashboardSlashExecutorForTesting();
@@ -130,7 +130,7 @@ describe('ALLOWED_SLASHES — «약속한 이름»이 실제로 닿는가', () =
 
   // 레거시 switch 는 «부를 수 있는 표면»이 없어 소스에서 읽는다.
   // ⛔ 읽기가 실패하면 집합이 비고 이 시험이 «조용히 통과»하므로, 비었는지를 «먼저» 막는다.
-  const dashboardSource = readFileSync(new URL('../src/dashboard/index.ts', import.meta.url).pathname, 'utf8');
+  const dashboardSource = tuiSourceText();
   const dispatchAt = dashboardSource.indexOf('const slashOutcome = await dashboardSlashRegistry.dispatch(cmdLower, args, slashCtx);');
   const switchAt = dashboardSource.indexOf('switch (cmdLower) {', dispatchAt);
   const legacy = new Set(

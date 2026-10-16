@@ -2,7 +2,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isMainThread, parentPort, workerData, Worker } from 'node:worker_threads';
 import { queryRunningRuns, type QueriedRunningRunsResult } from '../self-implement/running-runs.js';
-import { loadRunLedger } from '../self-implement/run-ledger.js';
+import { loadRunLedger, resolveFederatedRunLedgerDirectories, runLedgerDir } from '../self-implement/run-ledger.js';
 import { localLoopRows } from '../dashboard/slash-runtime/loops-table.js';
 import { checkBrand } from '../../scripts/brand/check.js';
 import { debug, redactSecretText } from '../debug/log.js';
@@ -69,7 +69,15 @@ const releaseSource = 'elanous://graph-runs/release-loop';
 const scheduleSource = 'elanous://schedules';
 const oneLine = (text: string) => redactSecretText(text.split(/\r?\n/, 1)[0] ?? '').slice(0, 120);
 
-function runningRunFacts(now: Date, queryRuns: () => QueriedRunningRunsResult = () => queryRunningRuns({ includeTest: false, caller: 'context-now' })): Extract<ContextFact, { kind: 'run' }>[] {
+// src/dashboard/slash-runtime/dashboard-handlers.ts:buildDashboardSlashRegistry /now calls contextNowInWorker;
+// contextNow → queryRunningRuns → queryFederatedUnfinishedRunLedgers → queryUnfinishedRunLedgers (persisted scan index).
+function runningRunFacts(now: Date, queryRuns: () => QueriedRunningRunsResult = () => queryRunningRuns({
+  includeTest: false,
+  caller: 'context-now',
+  noCache: false,
+}, {
+  ledgerDirectories: () => [...new Set([runLedgerDir(), ...resolveFederatedRunLedgerDirectories({ includeTest: false })])],
+})): Extract<ContextFact, { kind: 'run' }>[] {
   const observed = queryRuns();
   const unreadable = observed.completeness === 'partial' || observed.pty.unreadable.length || !!observed.phases?.unreadableTargetCount;
   const facts = observed.entries.filter(entry => observed.countedStatuses.includes(entry.status)).slice(0, 8).flatMap(entry => {
@@ -239,6 +247,7 @@ export function scanContextNowInWorker(options: Parameters<typeof contextNow>[0]
   createWorker: () => Worker = () => new Worker(new URL(import.meta.url), { workerData: { kind: 'context-now' } }),
   timeoutMs = WORKER_SCAN_TIMEOUT_MS): Promise<ContextNowAnswer> {
   const worker = createWorker();
+  const startedAt = Date.now();
   return new Promise((resolve, reject) => {
     let settled = false;
     const timeout = setTimeout(() => {
@@ -249,6 +258,8 @@ export function scanContextNowInWorker(options: Parameters<typeof contextNow>[0]
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      // 첫 호출 지연은 색인과 무관하게 «따로» 재야 판정선과 비교할 수 있다 — 스캔 자체의 ms 를 남긴다.
+      debug.log('context.now', 'worker-answer', { topic: options?.topic ?? null, ok: !error, ms: Date.now() - startedAt });
       void worker.terminate();
       if (error) reject(error);
       else resolve(answer!);

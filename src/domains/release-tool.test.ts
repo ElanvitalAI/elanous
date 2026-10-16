@@ -123,6 +123,50 @@ test('a simultaneous topic and action is rejected with one error naming both bef
   })).toThrow('topic 과 action 을 동시에 쓸 수 없습니다 — 둘 중 하나만: topic=features 는 피처 목록 · action 은 짧은 요약');
 });
 
+test('a blank topic or action counts as not sent — "" beside action=landed is the landed summary, not the simultaneous error (#70)', () => {
+  const now = new Date('2026-10-11T03:00:00.000Z');
+  const landed = dispatchReleaseStatus({ topic: '', action: 'landed' }, { now, mergedPrsLast24h: () => 2 });
+  expect(landed.text).toBe('어제 착지: 최근 24시간 병합 PR 2건');
+  const landedSpaces = dispatchReleaseStatus({ topic: '  ', action: 'landed' }, { now, mergedPrsLast24h: () => 2 });
+  expect(landedSpaces.text).toBe(landed.text);
+  // A real topic beside a real action is still rejected.
+  expect(() => dispatchReleaseStatus({ topic: 'features', action: 'landed' }, { checklist: () => { throw new Error('원장을 읽으면 안 됩니다'); } }))
+    .toThrow('topic 과 action 을 동시에 쓸 수 없습니다');
+});
+
+test('the default topic=status beside an action is the action — the exact args the TUI model sent (#70 · 10-15)', () => {
+  const now = new Date('2026-10-11T03:00:00.000Z');
+  const landed = dispatchReleaseStatus({ version: '', topic: 'status', action: 'landed', owner: '', status: '', id: '' }, { now, mergedPrsLast24h: () => 4 });
+  expect(landed.text).toBe('어제 착지: 최근 24시간 병합 PR 4건');
+  // topic=features beside an action is still rejected.
+  expect(() => dispatchReleaseStatus({ topic: 'features', action: 'landed' }, { checklist: () => { throw new Error('원장을 읽으면 안 됩니다'); } }))
+    .toThrow('topic 과 action 을 동시에 쓸 수 없습니다');
+});
+
+test('a non-features topic beside an action answers the action with one warning line in front (#70b · 10-15)', () => {
+  const now = new Date('2026-10-11T03:00:00.000Z');
+  // The exact args the TUI model kept sending.
+  const schedule = dispatchReleaseStatus({ version: '', topic: 'ops', action: 'schedule', owner: '', status: '', id: '' }, {
+    devVersion: () => '0.2.30',
+    checklist: () => ({ version: '0.2.30', released: '0.2.29', items: [] } as unknown as Checklist),
+    schedules: () => [],
+    contextNow: () => { throw new Error('ops 개관을 읽으면 안 됩니다'); },
+  });
+  expect(schedule.text).toBe('topic(ops) 은 무시하고 action 으로 답함\n다음 컷 시각: 일정 없음');
+  expect(schedule.structured).toEqual({ schedules: [], ignoredTopic: 'ops' });
+  const landed = dispatchReleaseStatus({ topic: 'cell', action: 'landed' }, {
+    now, mergedPrsLast24h: () => 3, checklist: () => { throw new Error('칸 원장을 읽으면 안 됩니다'); },
+  });
+  expect(landed.text).toBe('topic(cell) 은 무시하고 action 으로 답함\n어제 착지: 최근 24시간 병합 PR 3건');
+  expect(landed.structured.mergedPrsLast24h).toBe(3);
+  expect(landed.structured.ignoredTopic).toBe('cell');
+  expect(() => dispatchReleaseStatus({ topic: 'features', action: 'landed' }, { checklist: () => { throw new Error('원장을 읽으면 안 됩니다'); } }))
+    .toThrow('topic 과 action 을 동시에 쓸 수 없습니다 — 둘 중 하나만: topic=features 는 피처 목록 · action 은 짧은 요약');
+  // An unknown topic is still a topic error, not silently ignored.
+  expect(() => dispatchReleaseStatus({ topic: 'nope', action: 'landed' }, { now, mergedPrsLast24h: () => 3 }))
+    .toThrow('topic 은 status, features, cell, schedule, ops 중 하나');
+});
+
 test('features applies owner and status filters and counts matching ledger entries beyond display limit', () => {
   const items: ChecklistItem[] = Array.from({ length: 65 }, (_, index) => ({
     id: `UX${index + 1}`, title: `UX 칸 ${index + 1}`, status: 'yellow', owner: 'UX', updatedAt: '', updatedBy: '',

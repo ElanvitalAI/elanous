@@ -14,6 +14,8 @@ describe('podSourceScript', () => {
     expect(script).toContain("git -C repo remote set-url origin 'https://github.com/o/r'");
     expect(script).toContain("git clone -q --depth 50 'https://github.com/o/r' repo");
     expect(script).toContain("printf 'ELANOUS_POD_SOURCE_VIA %s\\n'");
+    expect(script).toContain("printf 'ELANOUS_POD_SOURCE_MIRROR_SKIP %s\\n' \"$mirror_skip\"");
+    for (const reason of ['no-mount', 'rev-parse-failed', 'clone-failed']) expect(script).toContain(`mirror_skip=${reason}`);
     expect(script).toContain("printf 'ELANOUS_POD_SOURCE default %s\\n'");
   });
 
@@ -50,6 +52,32 @@ describe('podSourceScript', () => {
       expect(podSourceScript({ kind: 'default', base: 'main' }, origin, mirror)).toBe(podSourceScript({ kind: 'default' }, origin, mirror));
       expect(() => podSourceScript({ kind: 'default', base: 'bench/missing' }, origin, mirror)).toThrow('Pod base ref not found on origin: bench/missing');
       expect(() => podSourceScript({ kind: 'default', base: 'bench/sample;echo wrong' }, origin, mirror)).toThrow('invalid Pod base ref');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('stageMarkers (si-task only): mirror start always, mirror end only when the mirror clone succeeded; off = byte-identical', () => {
+    const plain = podSourceScript({ kind: 'default' }, 'https://github.com/o/r');
+    expect(plain).not.toContain('ELANOUS_POD_STAGE');
+    expect(podSourceScript({ kind: 'default' }, 'https://github.com/o/r', undefined, { stageMarkers: false })).toBe(plain);
+    const root = mkdtempSync(join(tmpdir(), 'pod-src-stage-'));
+    try {
+      const origin = join(root, 'origin');
+      const mirror = join(root, 'mirror.git');
+      execFileSync('git', ['init', '-q', '-b', 'main', origin]);
+      execFileSync('git', ['-C', origin, '-c', 'user.email=pod@example.com', '-c', 'user.name=pod', 'commit', '-q', '--allow-empty', '-m', 'base']);
+      execFileSync('git', ['clone', '-q', '--bare', origin, mirror]);
+      const stageLines = (out: string) => out.split('\n').filter((line) => line.startsWith('ELANOUS_POD_STAGE '));
+      for (const [name, path, ends] of [['via-mirror', mirror, true], ['via-github', join(root, 'absent'), false]] as const) {
+        const cwd = join(root, name);
+        execFileSync('mkdir', ['-p', cwd]);
+        const result = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, path, { stageMarkers: true })}`], { cwd });
+        expect(result.exitCode, result.stderr.toString()).toBe(0);
+        const lines = stageLines(result.stdout.toString());
+        expect(lines.map((line) => line.replace(/ \d+$/, ''))).toEqual(ends ? ['ELANOUS_POD_STAGE mirror start', 'ELANOUS_POD_STAGE mirror end'] : ['ELANOUS_POD_STAGE mirror start']);
+        for (const line of lines) expect(line).toMatch(/^ELANOUS_POD_STAGE mirror (start|end) \d{9,12}$/);
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -148,6 +176,19 @@ describe('podSourceScript', () => {
       const brokenResult = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, brokenMirror)}`], { cwd: brokenCwd });
       expect(brokenResult.exitCode).toBe(0);
       expect(brokenResult.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_VIA github\nELANOUS_POD_SOURCE default ${head}`);
+      // TA-POD-WARMBOOT-PARITY: each fallback names the step that failed, right before the route line.
+      expect(fallback.output).toContain('ELANOUS_POD_SOURCE_MIRROR_SKIP no-mount\nELANOUS_POD_SOURCE_VIA github\n');
+      expect(brokenResult.stdout.toString()).toContain('ELANOUS_POD_SOURCE_MIRROR_SKIP rev-parse-failed\nELANOUS_POD_SOURCE_VIA github\n');
+      // A path git can resolve but cannot clone from (a work tree's subdirectory) → clone-failed, still a clean github fallback.
+      const work = join(root, 'skip-work');
+      execFileSync('git', ['init', '-q', work]);
+      execFileSync('git', ['-C', work, '-c', 'user.email=pod@example.com', '-c', 'user.name=pod', 'commit', '-q', '--allow-empty', '-m', 'x']);
+      execFileSync('mkdir', ['-p', join(work, 'sub'), join(root, 'clone-failed')]);
+      const cloneFailed = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, join(work, 'sub'))}`], { cwd: join(root, 'clone-failed') });
+      expect(cloneFailed.exitCode, cloneFailed.stderr.toString()).toBe(0);
+      expect(cloneFailed.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_MIRROR_SKIP clone-failed\nELANOUS_POD_SOURCE_VIA github\nELANOUS_POD_SOURCE default ${head}`);
+      // The mirror route stays silent about skipping.
+      expect(forcedCheckedOut.output).not.toContain('ELANOUS_POD_SOURCE_MIRROR_SKIP');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

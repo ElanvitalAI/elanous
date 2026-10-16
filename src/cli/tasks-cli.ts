@@ -14,7 +14,8 @@ import { assignedVersions, releasedVersion, validateVersion } from '../release-l
 import { compareVersions } from '../directives/version-at.js';
 import { cardsBoard, countBoardTasks, INTERNAL_PACK_PROJECT, mergeBoards, releasePackBoard, type BoardNode } from '../task-agent/board.js';
 import type { Task } from '../task-orchestrator/types.js';
-import { cardPrNumber, CLOSED_BY_HAND_EVENT, closeTaskCard, COMPLETION_KINDS, handTask, updateTaskCard, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, nextMoveFor, resolveHandText, readTaskAgentState, readTaskCard, taskAgentStatePath as taskStatePathDefault, shellQuote, TASK_CARD_PREFIX, TASK_SEATS, type CompletionKind, type TaskCard, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
+import { cardPrNumber, CLOSED_BY_HAND_EVENT, closeTaskCard, COMPLETION_KINDS, handTask, updateTaskCard, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, nextMoveFor, resolveHandText, readTaskAgentState, readTaskCard, runTagChange, taskAgentStatePath as taskStatePathDefault, taskCardLabelContext, shellQuote, TASK_CARD_PREFIX, TASK_SEATS, type CompletionKind, type TaskCard, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
+import { RUN_TAG_KEYS, runIdentityFieldText, runPriorityClass } from '../task-agent/run-identity.js';
 import { readCardSalvageBranch, recordWiringLiveVerified, refreshCardRunBinding, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
 import { captureReviewResults } from '../task-agent/review-result-capture.js';
 import { replayRemoteCardMoves } from '../task-agent/shadow.js';
@@ -33,6 +34,9 @@ export interface TasksCliDeps {
   bearerToken?: string;
   fetch?: typeof fetch;
   output?: (line: string) => void;
+  /** green-sweep entrypoint test seam: keep the actual CLI decision chain, replace only process reads. */
+  greenSweepChecklist?: typeof listChecklist;
+  greenSweepRun?: (command: string, args: string[]) => { status: number | null; stdout: string };
   /** `task hand --live` 의 발사기(시험 주입). 기본은 운영 config-dir 로 `harness say` 를 떼어 띄운다. */
   taskLauncher?: TaskLauncher;
   /** TA-REVIEW-RESULT-CAPTURE — `tasks show` 의 리뷰 결과 회수 시각(시험 주입 · 기본 지금). */
@@ -185,6 +189,12 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
     failed(targets[0]!, ['project-target-is-local']);
     return null;
   }
+  // ⛔ R7(2026-10-16): 시험 안에서 실 ssh 원격 발사는 명시 허용 없이 거부한다(가짜 ssh 주입은 통과).
+  //   ⚠️ 이 가드는 hold(launchHoldActive) 판정보다 «앞»이어야 한다 — hold 는 preflightParentHost 의 입력일 뿐이고,
+  //   preflightParentHost(parent-host.ts `preflightParentHost` 첫 줄)는 hold 와 무관하게 먼저 실 ssh 를 부른다(다중 대상이면
+  //   그 앞의 readParentHostCapacity 도 ssh). 가드를 아래로 내리면 hold 경로에서 시험이 실 ssh 를 쏜다(R7 사고 모양).
+  //   hold 경로를 재는 시험은 deps.ssh 가짜 또는 parentHost:null 을 주입한다(real-launch-guard.test 가 이 순서를 문다).
+  if (!deps.ssh) (await import('../task-agent/real-launch-guard.js')).refuseRealLaunchUnderTest('remote-parent-ssh', targets.map((target) => target.host).join(','));
   let launchHoldActive = false;
   try {
     if (deps.launchHoldActive) launchHoldActive = deps.launchHoldActive();
@@ -236,6 +246,8 @@ export async function defaultTaskLauncher(args: string[], cwd?: string, context?
     const remote = await tryRemoteParent(args, cwd, context, deps);
     if (remote) return remote;
   }
+  // ⛔ R7(2026-10-16): 시험 안에서 실 `elanous harness say` 를 띄우는 것은 명시 허용 없이 거부한다(가짜 spawn 주입은 통과).
+  if (!deps.spawn) (await import('../task-agent/real-launch-guard.js')).refuseRealLaunchUnderTest('local-harness-spawn', args.slice(0, 2).join(' '));
   const spawn = deps.spawn ?? ((await import('node:child_process')).spawn as unknown as DetachedSpawn);
   const { getElanousConfigDirOverride } = await import('../elanous-config-dir.js');
   const { prodInstanceRoot } = await import('../instance/resolve.js');
@@ -366,9 +378,26 @@ function runLinkLine(card: TaskCard): string[] {
   return [`런: ${card.runId} · 골: ${card.goalId ?? '-'} · PR: ${pr}${card.runChildId ? ` · 자식 런: ${card.runChildId}` : ''}`];
 }
 
+/** RUN-IDENTITY-TAGS — 신분 한 줄 + Pod 라벨 한 줄(원장 정본 2줄 렌더 · 신분 없는 카드는 «미기록»으로 적고 기본값 정책을 밝힌다). */
+function cardIdentityLines(card: TaskCard): string[] {
+  const identity = card.identity;
+  const { labels } = taskCardLabelContext({ id: card.id });
+  // 경계: Pod 에 실제로 붙는 라벨은 카드 id 하나뿐이다 — 신분 값은 Pod 라벨에 아직 안 실린다(RUN-IDENTITY-ADMIT 몫). 화면도 그렇게 말한다.
+  const podLine = `Pod 라벨 ${Object.entries(labels).map(([key, value]) => `${key}=${value}`).join(' ')} (신분 값은 Pod 라벨 미탑재 — RUN-IDENTITY-ADMIT)`;
+  if (!identity) return [`신분 미기록 — 원장에 identity 없음 · 승인·선점은 기본 class=${runPriorityClass(identity)} 로 읽는다`, podLine];
+  // ⛔ 모르는 칸을 기본값으로 보이지 않는다 — 원장에 없는 칸은 «미기록»으로 적는다(확인된 칸만 값으로).
+  const identityText = RUN_TAG_KEYS.map((key) => `${key}=${runIdentityFieldText(identity, key)}`).join(' · ');
+  const originParts = [identity.origin?.checklistId, identity.origin?.version, identity.origin?.seat, identity.origin?.launcher].filter((part) => part !== undefined);
+  return [
+    `신분 ${identityText}${originParts.length > 0 ? ` — 출생 ${originParts.join(' · ')}` : ''}`,
+    podLine,
+  ];
+}
+
 function taskCardLines(card: TaskCard): string[] {
   return [
     [card.id, card.status, card.seat ?? '-', card.checklistId ?? '-', card.createdAt, card.text].join('\t'),
+    ...cardIdentityLines(card),
     ...(card.mission ? [`미션: ${card.mission} · after: ${card.after?.length ? card.after.join(', ') : '-'}`] : []),
     ...runLinkLine(card),
     ...liveMoveLines(card),
@@ -786,7 +815,9 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .action((opts: { version: string; cell?: string; traffic?: string; json?: boolean }) => {
       try {
         validateVersion(opts.version);
-        const snapshot = listChecklist(opts.version);
+        const snapshot = (deps.greenSweepChecklist ?? listChecklist)(opts.version);
+        const run = deps.greenSweepRun ?? ((command: string, args: string[]) => spawnSync(command, args,
+          { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000 }));
         const cards = Object.values(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(deps.taskStatePath ?? taskStatePathDefault()).tasks ?? {});
         let holds: Set<string> | null = null;
         if (opts.traffic) {
@@ -800,14 +831,11 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         }
         const prCache = new Map<number, GreenSweepPr | null>();
         const ambiguousPrs = ambiguousGreenSweepPrs(snapshot.items, opts.version, cards);
-        const origin = spawnSync('git', ['remote', 'get-url', 'origin'],
-          { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000 });
+        const origin = run('git', ['remote', 'get-url', 'origin']);
         const originRepo = origin.status === 0
           ? /github\.com[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?$/i.exec(origin.stdout.trim())?.[1]?.toLowerCase() : undefined;
-        const localMain = spawnSync('git', ['rev-parse', 'origin/main'],
-          { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000 });
-        const remoteMain = spawnSync('git', ['ls-remote', 'origin', 'refs/heads/main'],
-          { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000 });
+        const localMain = run('git', ['rev-parse', 'origin/main']);
+        const remoteMain = run('git', ['ls-remote', 'origin', 'refs/heads/main']);
         const localMainSha = localMain.status === 0 ? localMain.stdout.trim() : '';
         const remoteMainSha = remoteMain.status === 0 ? remoteMain.stdout.trim().split(/\s+/)[0] : '';
         const mainFresh = /^[a-f0-9]{40}$/i.test(localMainSha) && localMainSha === remoteMainSha;
@@ -817,8 +845,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           return candidates.map((candidate) => {
             let pr = prCache.get(candidate.pr);
             if (pr === undefined) {
-              const view = spawnSync('gh', ['pr', 'view', String(candidate.pr), '--json', 'number,state,mergeCommit,url'],
-                { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000 });
+              const view = run('gh', ['pr', 'view', String(candidate.pr), '--json', 'number,state,mergeCommit,url']);
               try {
                 if (view.status !== 0) throw new Error('gh failed');
                 const parsed = JSON.parse(view.stdout) as { number?: number; state?: string; mergeCommit?: { oid?: string }; url?: string };
@@ -827,16 +854,31 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
               } catch { pr = null; }
               prCache.set(candidate.pr, pr);
             }
-            const sha = pr?.mergeSha;
+            // A component PR stays CLOSED after a merged train. Reverify the integration PR
+            // recorded on the card before using its merge commit as landing evidence.
+            let landingPr = pr;
+            const train = candidate.card?.trainLanding;
+            if (pr?.state === 'CLOSED' && train?.componentPr === candidate.pr && /^[a-f0-9]{40}$/i.test(train.mergeSha)) {
+              const view = run('gh', ['pr', 'view', String(train.integrationPr), '--json', 'number,state,mergeCommit']);
+              try {
+                if (view.status === 0) {
+                  const parsed = JSON.parse(view.stdout) as { number?: number; state?: string; mergeCommit?: { oid?: string } };
+                  if (parsed.number === train.integrationPr && parsed.state === 'MERGED'
+                    && parsed.mergeCommit?.oid?.toLowerCase() === train.mergeSha.toLowerCase()) {
+                    landingPr = { ...pr, state: 'MERGED', mergeSha: train.mergeSha, viaTrain: { integrationPr: train.integrationPr } };
+                  }
+                }
+              } catch { /* Unverified train is still a CLOSED component PR. */ }
+            }
+            const sha = landingPr?.mergeSha;
             const prRepo = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/\d+(?:\/|$)/i.exec(pr?.url ?? '')?.[1]?.toLowerCase();
             const repositoryMatches = originRepo && prRepo ? originRepo === prRepo : null;
             const ancestor = !mainFresh || !sha || !/^[a-f0-9]{40}$/i.test(sha) ? null : (() => {
-              const check = spawnSync('git', ['merge-base', '--is-ancestor', sha, 'origin/main'],
-                { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000 });
+              const check = run('git', ['merge-base', '--is-ancestor', sha, 'origin/main']);
               return check.status === 0 ? true : check.status === 1 ? false : null;
             })();
             const decision = decideGreenSweep({ item, candidate, candidateCount: candidates.length,
-              pr: pr ?? null, ancestor, hold: holds === null ? null : holds.has(item.id), repositoryMatches,
+              pr: landingPr ?? null, ancestor, hold: holds === null ? null : holds.has(item.id), repositoryMatches,
               ambiguousAcrossCells: ambiguousPrs.has(candidate.pr) });
             observeGreenSweep(decision);
             return decision;
@@ -954,9 +996,13 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .option('--ta-land', 'TA-LIVE-LAND-2 — 호스트는 재게이트만 하고 병합은 TASK-AGENT 의 propose-land(`pr land --expected-head`)에 맡긴다 · 카드 taLand ⊕ 발사 env ELANOUS_TA_LAND=1 · taskAgent.liveMoves 에 propose-land 가 없으면 종전대로 호스트가 병합')
     .option('--child-llm <provider/model>', 'TASKS-HAND-CHILD-LLM — 구현 자식 LLM(예: grok/grok-4.7) → 발사 인자 --child-llm-provider <provider> --child-llm-model <model> · «첫» `/` 에서만 가른다(모델 id 의 `/` 는 보존) · openrouter 는 모델 id 가 openrouter/ 접두를 포함하므로 전체를 모델로(openrouter/z-ai/glm-5.3 → --child-llm-model openrouter/z-ai/glm-5.3) · 카드 childLlm · 안 주면 명령·카드 무변경')
     .option('--child-llm-effort <level>', '구현 자식 추론 노력 → 발사 인자 --child-llm-effort(검증은 하니스 · --child-llm 과 함께)')
+    .addOption(new Option('--tier <level>', '디스패처 난이도(하|중|상|특) — 카드에 보존해 수리 모델 정책에 사용').choices(['하', '중', '상', '특']))
+    .option('--tag <k=v>', 'RUN-IDENTITY-TAGS — 출생 신분을 덮는다(class|care|rights|protect 의 k=v · 반복: --tag class=gate --tag protect=true) — 카드 원장 identity 에 남는다', (value: string, previous: string[] | undefined) => [...(previous ?? []), value])
     .option('--json', 'JSON 출력')
-    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; version?: string; completion?: CompletionKind; mission?: string; project?: string; target?: string; goal?: string; milestone?: string; live?: boolean; taLand?: boolean; childLlm?: string; childLlmEffort?: string; json?: boolean }) => {
+    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; version?: string; completion?: CompletionKind; mission?: string; project?: string; target?: string; goal?: string; milestone?: string; live?: boolean; taLand?: boolean; childLlm?: string; childLlmEffort?: string; tier?: TaskCard['tier']; tag?: string[]; json?: boolean }) => {
       const suppliedText = text !== undefined;
+      /** RUN-IDENTITY-TAGS — 칸을 찾은 판(출생 신분이 그 판의 칸 우선순위를 읽는다 · 개발 판 밖 칸도). */
+      let birthBoardVersion: string | undefined;
       if (opts.version !== undefined && opts.checklist === undefined) {
         out('--version 은 --checklist 와 함께 준다');
         process.exitCode = 1;
@@ -1014,6 +1060,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           return;
         }
         if (matches.length > 1) console.error(`⚠ 체크리스트 칸 ${opts.checklist} 중복: ${matches.map((match) => match.version).join(', ')} — 가장 가까운 판 ${matches[0]!.version} 선택 (--version 으로 고정 가능)`);
+        birthBoardVersion = matches[0]!.version;
         if (opts.mission === undefined && text === undefined) text = title;
       }
       if (opts.checklist !== undefined && opts.mission === undefined && suppliedText && !text!.split(/\r?\n/, 1)[0]!.startsWith('대상 경로:')) {
@@ -1032,8 +1079,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         process.exitCode = 1;
         return;
       }
-      if (opts.mission !== undefined && (opts.completion !== undefined || opts.project !== undefined || opts.goal !== undefined || opts.milestone !== undefined || opts.taLand === true || opts.childLlm !== undefined || opts.childLlmEffort !== undefined)) {
-        out('--completion/--project/--target/--goal/--milestone/--ta-land/--child-llm 은 과제 한 줄에만 준다 — --mission 조각은 종전처럼 code-pr 이다');
+      if (opts.mission !== undefined && (opts.completion !== undefined || opts.project !== undefined || opts.goal !== undefined || opts.milestone !== undefined || opts.taLand === true || opts.childLlm !== undefined || opts.childLlmEffort !== undefined || opts.tier !== undefined || opts.tag !== undefined)) {
+        out('--completion/--project/--target/--goal/--milestone/--ta-land/--child-llm/--tier/--tag 는 과제 한 줄에만 준다 — --mission 조각은 종전처럼 code-pr 이다');
         process.exitCode = 1;
         return;
       }
@@ -1089,6 +1136,9 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           ...(opts.taLand === true ? { taLand: true } : {}),
           ...(opts.childLlm !== undefined ? { childLlm: opts.childLlm } : {}),
           ...(opts.childLlmEffort !== undefined ? { childLlmEffort: opts.childLlmEffort } : {}),
+          ...(opts.tier !== undefined ? { tier: opts.tier } : {}),
+          ...(opts.tag !== undefined ? { tags: opts.tag } : {}),
+          ...(birthBoardVersion !== undefined ? { checklistVersion: birthBoardVersion } : {}),
           ...(deps.taskStatePath ? { statePath: deps.taskStatePath } : {}),
           ...(deps.taskCompositionRoot ? { compositionRoot: deps.taskCompositionRoot } : {}),
           launcher: deps.taskLauncher ?? defaultTaskLauncher,
@@ -1096,13 +1146,41 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         if (opts.json) out(JSON.stringify(result));
         else {
           out(`${result.card.id}\t${result.mode}\t${result.launched ? 'launched' : 'not launched'}`);
-          out(`elanous ${result.move.command!.map(shellQuote).join(' ')}`);
+          if (result.move.command) out(`elanous ${result.move.command.map(shellQuote).join(' ')}`);
+          else out(result.move.reason);
           if (result.cwd) out(`(cwd: ${result.cwd})`);
           if (result.card.taLand) out('(ta-land — 발사 env ELANOUS_TA_LAND=1 · 원격 또는 로컬 부모 · taskAgent.liveMoves 에 propose-land 가 있으면 병합은 TASK-AGENT 몫, 없으면 종전대로 호스트 병합)');
-          if (!result.launched) out('(shadow — 띄우지 않았다 · 띄우려면 --live)');
+          if (!result.launched && result.card.alreadyDoneCandidate) out('(main 증거 통과 — 발사 0 · green 후보만 기록, 주인 판정 대기)');
+          else if (!result.launched) out('(shadow — 띄우지 않았다 · 띄우려면 --live)');
         }
       } catch (error) {
         out(error instanceof Error ? error.message : '과제 넘기기 실패');
+        process.exitCode = 1;
+      }
+    });
+
+  tasks.command('tag <id> <k=v>')
+    .description('RUN-IDENTITY-TAGS — 카드의 런 신분 태그를 바꾼다(class|care|rights|protect 의 k=v · 카드 history 에 감사 줄 run-tag-change {from, to, by, reason} 이 남는다 · 카드 상태 파일이 원장 정본 · 목록 밖 값은 거부)')
+    .option('--by <seat>', '바꾼 자리(예: OP·MK·TC·UX) — 안 주면 호출 자리 ELANOUS_TRACK, 그것도 없으면 «unknown» 으로 감사 줄에 적는다(지어내지 않는다)')
+    .option('--reason <text>', '왜 바꾸나 — 감사 줄에 남긴다')
+    .option('--json', '바뀐 카드를 JSON 으로 출력')
+    .action((id: string, kv: string, opts: { by?: string; reason?: string; json?: boolean }) => {
+      try {
+        const by = opts.by?.trim() || process.env.ELANOUS_TRACK?.trim() || 'unknown';
+        const card = runTagChange(id, { tag: kv, by, ...(opts.reason !== undefined ? { reason: opts.reason } : {}) }, deps.taskStatePath ?? taskStatePathDefault());
+        if (card === undefined) {
+          out(`카드가 없습니다: ${id}`);
+          process.exitCode = 1;
+          return;
+        }
+        if (opts.json) {
+          out(JSON.stringify(card));
+          return;
+        }
+        out(`${card.id}\t${kv}`);
+        for (const line of cardIdentityLines(card)) out(line);
+      } catch (error) {
+        out(error instanceof Error ? error.message : '태그 바꾸기 실패');
         process.exitCode = 1;
       }
     });

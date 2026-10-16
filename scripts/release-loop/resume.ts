@@ -35,7 +35,8 @@ const SWEEP_INCOMPLETE = /^(?:pod sweep incomplete|sweep incomplete|[\w-]+ shard
  * Fail-closed: only three shapes count, each read from what the runner and gate-node actually write:
  *  ① stopped — `graph runs stop` wrote {ok:false, executed:false, exit:null, error:STOPPED_NODE_ERROR} as the run's last record;
  *  ② no verdict — the gate process ended with exit null (signal, idle timeout, or a spawn that failed) and printed no result line at
- *     all (no output line is a JSON object with an `outcome`), so the run went gate → failed. A verdict followed by more
+ *     all (no output line is a JSON object with an `outcome`), so the run went gate → failed (possibly through the
+ *     release-only gate-triage shadow). A verdict followed by more
  *     log lines and then a kill is still a verdict: refused;
  *  ③ sweep incomplete — gate-node printed outcome `error` (no verdict: the baseline comparison never ran, so `introduced`
  *     is still the empty initial list) and the error is an incomplete sweep (stalled shards / no tests ran). The finished
@@ -52,6 +53,14 @@ function printedVerdict(output: unknown): boolean {
   });
 }
 
+/** The only post-gate detour allowed before the terminal failure is the executed, release-only triage shadow. */
+function failedAfterGate(state: GraphRunState, index: number): boolean {
+  if (state.nodes.length !== state.path.length || state.path.at(-1) !== 'failed' || state.nodes.at(-1)?.nodeId !== 'failed') return false;
+  if (index === state.path.length - 2) return true;
+  return index === state.path.length - 3 && state.path[index + 1] === 'gate-triage'
+    && state.nodes[index + 1]?.nodeId === 'gate-triage' && state.nodes[index + 1]?.executed === true;
+}
+
 export function gateUnmeasuredDetail(state: GraphRunState, index: number): string | undefined {
   const record = state.nodes[index];
   if (!record || record.nodeId !== 'gate' || state.path[index] !== 'gate' || record.ok !== false || record.waiver !== undefined) return undefined;
@@ -60,9 +69,7 @@ export function gateUnmeasuredDetail(state: GraphRunState, index: number): strin
   if (last && record.executed === false && record.exit === null && record.error === STOPPED_NODE_ERROR && record.output === undefined) {
     return `stopped: ${STOPPED_NODE_ERROR}${typeof record.seconds === 'number' ? ` after ${record.seconds}s` : ''}`;
   }
-  const failedAfter = index === state.path.length - 2 && state.path.at(-1) === 'failed' && state.nodes.at(-1)?.nodeId === 'failed'
-    && state.nodes.length === state.path.length;
-  if (!failedAfter || record.executed !== true) return undefined;
+  if (!failedAfterGate(state, index) || record.executed !== true) return undefined;
   const result = lastJsonObject(record.output);
   if (result === undefined) {
     if (record.exit !== null || printedVerdict(record.output)) return undefined;
@@ -105,7 +112,8 @@ export function releaseResumeWaiver(
       [...(opts.acceptedRegressions ?? []), { id: `waive:${opts.waive}`, note: reason }]) };
   }
   if (!unique || state.path.lastIndexOf(opts.waive) !== index || state.nodes[index]?.nodeId !== opts.waive || state.nodes[index]?.ok !== false ||
-    state.nodes[index]?.executed !== true || state.path.at(-2) !== opts.waive || state.path.at(-1) !== 'failed' || state.nodes.at(-1)?.nodeId !== 'failed') {
+    state.nodes[index]?.executed !== true || (opts.waive === 'gate' ? !failedAfterGate(state, index)
+      : state.path.at(-2) !== opts.waive || state.path.at(-1) !== 'failed' || state.nodes.at(-1)?.nodeId !== 'failed')) {
     throw new Error(`--waive ${opts.waive} requires the failed executable node on the saved path`);
   }
   // Only user-visible, non-publication checks can become accepted regressions; build, safety and approval gates stay blocking.

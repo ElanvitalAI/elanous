@@ -132,7 +132,7 @@ export function createGlobalSubagentCallable(
     const done = drainToResult(handle.events, () => ({
       durationMs: Date.now() - startedAt,
       modelId: effectiveDefinition.model,
-    }));
+    }), () => handle.task.controller?.signal.aborted ?? (signal?.aborted === true));
 
     return { address, done };
   };
@@ -154,6 +154,7 @@ async function drainToResult(
     unknown
   >,
   closing: () => { durationMs: number; modelId?: string },
+  signalAborted: () => boolean,
 ): Promise<{
   status: 'completed' | 'failed' | 'cancelled';
   output: string;
@@ -190,7 +191,7 @@ async function drainToResult(
 
   const close = closing();
   const baseModel = close.modelId ? { modelId: close.modelId } : {};
-  if (aborted) {
+  if (aborted || signalAborted()) {
     return { status: 'cancelled', output: accumulated, durationMs: close.durationMs, ...baseModel };
   }
   if (errorMsg !== null) {

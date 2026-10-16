@@ -188,4 +188,24 @@ export type SupervisorStopReason =
   | 'deliverable-unobserved'
   | 'deliverable-merged';
 
+/** Lightweight runtime catalogue shared by the supervisor and pure local judge. */
+export const SUPERVISOR_STOP_REASONS = [
+  'converged',
+  'human-stopped',
+  'parent-signals-red',
+  'needs-human',
+  'no-actionable-work',
+  'harvestable-awaiting-human',
+  'handed-off-to-salvage',
+  'max-rounds',
+  'no-progress',
+  'provider-exhausted',
+  'step-timeout',
+  'decomposable-no-progress',
+  'review-unobserved',
+  'review-oscillating',
+  'deliverable-unobserved',
+  'deliverable-merged',
+] as const satisfies readonly SupervisorStopReason[];
+
 export type SupervisorNext = 'harvest' | 'scope-decompose' | 'self-review' | 'human-gate' | 'proposal';

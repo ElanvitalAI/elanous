@@ -1,11 +1,13 @@
 import { defaultListHarnessProcesses } from '../../harness/harness-cli-command.js';
 import { devVersion, listChecklist } from '../../release-loop/checklist.js';
 import { listSchedules } from '../../release-loop/release-schedule.js';
-import { releaseLedgerRoot } from '../../instance/resolve.js';
+import { effectiveInstanceRoot, releaseLedgerRoot } from '../../instance/resolve.js';
+import { ResourceLedger, type ResourceView } from '../../control-plane/ledger.js';
 import { getUserConfig, ORCHESTRATOR_DEFAULTS } from '../../user-config.js';
 import { seatOfTree, trafficTick, TRAFFIC_SEATS, type TrafficCell, type TrafficResult } from '../../loops/orchestrator/traffic.js';
 import { finishAdvice, measureFinish } from '../../loops/orchestrator/finish-rate.js';
 import { jsonResponse } from './json-response.js';
+import { debug } from '../../debug/log.js';
 
 /** Read-only snapshot of the same ORCH traffic decision used by the scheduled tick. */
 export function observeLoopResources(deps: {
@@ -36,7 +38,21 @@ export function observeLoopResources(deps: {
   });
 }
 
-export function handleLoopResourcesGet(observe: () => TrafficResult = observeLoopResources): Response {
-  try { return jsonResponse({ resource: observe() }); }
+/** The Nexus resource view reads the existing control ledger; it never allocates a second pool ledger. */
+export function handleLoopResourcesGet(
+  observe: () => TrafficResult = observeLoopResources,
+  listPodWorkers: () => ResourceView[] = () => new ResourceLedger(effectiveInstanceRoot()).list({ kind: 'pod-worker-lease' }),
+): Response {
+  try {
+    const resource = observe();
+    try {
+      const podWorkers = listPodWorkers().map(row => ({ id: row.id, machine: row.machine, workerId: row.name,
+        key: row.attrs.key, state: row.attrs.state, generation: row.attrs.generation, ageMs: row.ageMs, expired: row.expired }));
+      return jsonResponse({ resource, podWorkers });
+    } catch (error) {
+      debug.log('nexus.resource', 'pod-worker-ledger-unmeasured', { errorKind: error instanceof Error ? error.name : typeof error });
+      return jsonResponse({ resource, podWorkers: null, podWorkersError: 'unmeasured' });
+    }
+  }
   catch { return jsonResponse({ error: 'resource-unavailable' }, 503); }
 }

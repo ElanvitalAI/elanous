@@ -158,6 +158,8 @@ for (const status of [401, 403, 500] as const) {
         expect(text).not.toContain('지도를 읽는 중');
         expect(text).not.toContain('데몬 연결을 확인하세요');
       }
+      expect(text).not.toContain('실제 발사 관계가 아직 없습니다');
+      expect(text).not.toContain('자원 발사 흐름');
     } finally { act(() => { root!.unmount(); }); }
   });
 }
@@ -207,6 +209,8 @@ for (const status of [401, 403] as const) {
       expect(text).not.toContain('visible-edge');
       expect(text).not.toContain('지도를 읽는 중');
       expect(text).not.toContain('데몬 연결을 확인하세요');
+      expect(text).not.toContain('실제 발사 관계가 아직 없습니다');
+      expect(text).not.toContain('자원 발사 흐름');
     } finally { act(() => { root!.unmount(); }); }
   });
 }
@@ -236,6 +240,8 @@ test('non-NexusApiError map failure keeps the existing error', async () => {
     const text = JSON.stringify(root!.toJSON());
     expect(text).toContain('지도 원천을 읽지 못했습니다');
     expect(text).not.toContain('지도 원천에 접근 권한이 없습니다');
+    expect(text).not.toContain('실제 발사 관계가 아직 없습니다');
+    expect(text).not.toContain('자원 발사 흐름');
   } finally { act(() => { root!.unmount(); }); }
 });
 

@@ -23,6 +23,7 @@ export interface InProcessCliOptions {
 type MutableCommand = {
   commands: MutableCommand[];
   name(): string;
+  aliases(): string[];
   _optionValues?: Record<string, unknown>;
   _optionValueSources?: Record<string, string>;
   args: string[];
@@ -35,7 +36,7 @@ function registeredCommandPath(root: MutableCommand, args: readonly string[]): s
   let command = root;
   for (const arg of args) {
     if (arg.startsWith('-')) break;
-    const child = command.commands.find((candidate) => candidate.name() === arg);
+    const child = command.commands.find((candidate) => candidate.name() === arg || candidate.aliases().includes(arg));
     if (!child) break;
     path.push(arg);
     command = child;

@@ -295,7 +295,7 @@ test('TUI route selects one core turn, matching tools and visible/logged decisio
     expect(coreCalls.at(-1)?.tools.map((tool) => tool.name)).not.toContain('Bash');
     expect(pushes[0]).toBe(`라우팅: ${expected}\n`);
     expect(routeLog).toHaveBeenCalledWith('chat.route', 'decided', {
-      route: expected, reason: expect.any(String), goalLoop: false,
+      route: expected, reason: expect.any(String), goalLoop: false, seat: null, seatKnown: false,
     });
   }
   expect(coreCalls).toHaveLength(4);
@@ -356,6 +356,73 @@ test('TUI read question runs one full-tool turn outside the goal loop; a write r
   expect(write.pushes.some((delta) => delta.startsWith('라우팅:'))).toBe(false);
 });
 
+test('TUI-H1-SEAT-GOALLOOP: a seat TUI sends an operational directive to the goal loop; a human TUI keeps the single read turn', async () => {
+  const coreCalls: CoreTurnContext[] = [];
+  spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
+    coreCalls.push(ctx);
+    return { stopReason: 'end_turn', finalText: '' };
+  });
+  const log = spyOn(debug, 'log');
+  const specs = ['Edit', 'Read', 'RunShell'].map((name) => ({ name, description: '', parameters: { type: 'object' as const } }));
+  const text = 'OP 13:14: 계속 — draft 다음 행.';
+  const run = async (seat: string | null, goalLoop: boolean) => {
+    const base = config.getUserConfig();
+    spyOn(config, 'getUserConfig').mockReturnValue({ ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: goalLoop } } });
+    const pushes: string[] = [];
+    await bridgeCoreTurnToAcp({
+      tuiRouting: true, resolveSeat: () => seat,
+      getMessages: () => [{ role: 'user', content: text }], getTools: () => specs,
+      dispatchTool: async () => ({}),
+    })({
+      sessionId: 'seat-route', cwd: '/tmp', userText: text,
+      promptBlocks: [{ type: 'text', text }], isAborted: () => false,
+      push: async (delta: string) => { pushes.push(delta); },
+      pushWithMeta: async () => {}, pushSessionUpdate: async () => {},
+      pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
+    } as unknown as AcpTurnContext);
+    return { tools: coreCalls.at(-1)!.tools.map((tool) => tool.name), pushes };
+  };
+  // A fast short question is a deliberate single turn even in a seat — no warning (review r4 · «OP 13:14 뭐야?» is ops-shaped yet short).
+  const short = 'OP 13:14 뭐야?';
+  const shortTurn = bridgeCoreTurnToAcp({
+    tuiRouting: true, resolveSeat: () => 'OPT',
+    getMessages: () => [{ role: 'user', content: short }], getTools: () => specs, dispatchTool: async () => ({}),
+  });
+  await shortTurn({
+    sessionId: 'seat-short', cwd: '/tmp', userText: short,
+    promptBlocks: [{ type: 'text', text: short }], isAborted: () => false,
+    push: async () => {}, pushWithMeta: async () => {}, pushSessionUpdate: async () => {},
+    pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
+  } as unknown as AcpTurnContext);
+  expect(log).toHaveBeenCalledWith('chat.route', 'decided', expect.objectContaining({ reason: 'short-question', goalLoop: false, seat: 'OPT' }));
+  expect(log.mock.calls.some(([c, e]) => c === 'chat.route' && e === 'seat-ops-single-turn')).toBe(false);
+  const seatTurn = await run('OPT', true);
+  expect(seatTurn.tools).toEqual([...specs.map((spec) => spec.name), 'update_goal']);
+  expect(seatTurn.pushes.some((delta) => delta.startsWith('라우팅:'))).toBe(false);
+  expect(log).toHaveBeenCalledWith('chat.route', 'decided', { route: '읽기·분석', reason: 'seat-read', goalLoop: true, seat: 'OPT', seatKnown: true });
+  const human = await run(null, true);
+  expect(human.tools).toEqual(specs.map((spec) => spec.name));
+  expect(human.pushes[0]).toBe('라우팅: 읽기·분석\n');
+  expect(log).toHaveBeenCalledWith('chat.route', 'decided', { route: '읽기·분석', reason: 'read', goalLoop: false, seat: null, seatKnown: true });
+  expect(log.mock.calls.some(([c, e]) => c === 'chat.route' && e === 'seat-ops-single-turn')).toBe(false);
+  // 인지: a seat operational directive that still runs as a single turn (goal loop off) is warned, not silent.
+  await run('OPT', false);
+  expect(log).toHaveBeenCalledWith('chat.route', 'seat-ops-single-turn', expect.objectContaining({ seat: 'OPT', goalLoopEnabled: false }), { level: 'warn' });
+  // A failed seat lookup is «unknown», not «not a seat» (review r2): routed as a human TUI, logged seatKnown:false.
+  const failing = bridgeCoreTurnToAcp({
+    tuiRouting: true, resolveSeat: () => { throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); },
+    getMessages: () => [{ role: 'user', content: text }], getTools: () => specs, dispatchTool: async () => ({}),
+  });
+  await failing({
+    sessionId: 'seat-route-err', cwd: '/tmp', userText: text,
+    promptBlocks: [{ type: 'text', text }], isAborted: () => false,
+    push: async () => {}, pushWithMeta: async () => {}, pushSessionUpdate: async () => {},
+    pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
+  } as unknown as AcpTurnContext);
+  expect(log).toHaveBeenCalledWith('chat.route', 'seat-unresolved', expect.objectContaining({ error: expect.stringContaining('EACCES') }), { level: 'warn' });
+  expect(log).toHaveBeenCalledWith('chat.route', 'decided', { route: '읽기·분석', reason: 'read', goalLoop: false, seat: null, seatKnown: false });
+});
+
 test('TUI routing skips only an explicit executor harness child; a human TUI in a harness space is routed', async () => {
   const coreCalls: CoreTurnContext[] = [];
   const coreSpy = spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
@@ -404,5 +471,18 @@ test('memory_recall is on every quick route (the self-access discipline asks eve
     const names = toolsForTuiRoute(specs, route).map((tool) => tool.name);
     expect(names).toContain('memory_recall');
     expect(names).not.toContain('Edit');
+  }
+});
+
+test('«조사» carries the read-only MsgList and no shell or mailbox writer (TUI-QUICK-ROUTE-EXPLICIT-CMD)', () => {
+  const specs = ['WebSearch', 'Read', 'MsgList', 'MsgPost', 'MsgAck', 'RunShell', 'Bash', 'Edit', 'Write'].map((name) => ({
+    name, description: '', parameters: { type: 'object' as const },
+  }));
+  const research = toolsForTuiRoute(specs, '조사').map((tool) => tool.name);
+  expect(research).toContain('MsgList');
+  for (const writer of ['MsgPost', 'MsgAck', 'RunShell', 'Bash', 'Edit', 'Write']) expect(research).not.toContain(writer);
+  // The other quick routes are unchanged — MsgList is added to «조사» only.
+  for (const route of ['조회', '설정 변경', '상시 일'] as const) {
+    expect(toolsForTuiRoute(specs, route).map((tool) => tool.name)).not.toContain('MsgList');
   }
 });

@@ -18,6 +18,22 @@ test('GATE-PARTIAL: test-only changes plan the changed tests plus the prior fail
   expect(planned.plan).toMatchObject({ priorCommit: P, forCommit: N });
 });
 
+test('GATE-REUSE-BY-DIFF: docs-only append with a clean prior cut produces a zero-file carry plan', () => {
+  const planned = planPartialRegate({ ...base, changedFiles: ['README.md', 'docs/manual/usage.md'], priorFailures: [], priorErrors: [] });
+  expect(planned).toMatchObject({ ok: true, plan: { kind: 'carry', files: [], priorCommit: P, forCommit: N } });
+  if (!planned.ok) return;
+  const root = mkdtempSync(join(tmpdir(), 'gate-carry-'));
+  try {
+    writePartialPlan(root, planned.plan);
+    expect(readPartialPlan([root], base.version, N)).toMatchObject({ kind: 'carry', files: [] });
+    expect(readPartialPlan([root], base.version, 'c'.repeat(40))).toBeNull();
+    writeFileSync(partialPlanPath(root, base.version), JSON.stringify({ ...planned.plan, priorFailures: ['src/x.test.ts > failure'] }));
+    expect(() => readPartialPlan([root], base.version, N)).toThrow('invalid gate partial plan');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+  expect(planPartialRegate({ ...base, changedFiles: ['test/fixtures/readme.md'], priorFailures: [], priorErrors: [] }).ok).toBe(false);
+  expect(planPartialRegate({ ...base, changedFiles: ['src/deleted.test.ts'], priorFailures: [], priorErrors: [], existsAtTip: () => false }).ok).toBe(false);
+});
+
 test('GATE-PARTIAL: any non-test source change, the same commit, or an unsafe id falls back to a full gate', () => {
   expect(planPartialRegate({ ...base, changedFiles: ['src/x.test.ts', 'src/release-loop/gate.ts'] })).toMatchObject({ ok: false, reason: expect.stringContaining('non-test change') });
   expect(planPartialRegate({ ...base, forCommit: P, changedFiles: ['src/x.test.ts'] })).toMatchObject({ ok: false, reason: expect.stringContaining('no new commit') });

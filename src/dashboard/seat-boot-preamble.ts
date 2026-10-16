@@ -35,6 +35,24 @@ export function detectSeat(cwd: string, env: NodeJS.ProcessEnv = process.env): S
   return null;
 }
 
+/** 자리(무인) TUI 판정 — `detectSeat` ⊕ `~/elanous-hq/seat-state/<자리>` 가 실재(부트 카드와 같은 기준).
+ *  TUI 라우팅(TUI-H1-SEAT-GOALLOOP)이 «자리면 운영 지시를 goal loop 로» 가를 때 쓴다. 자리가 아니면 null(사람 대화 TUI) · 조회 실패는 throw. */
+export function detectSeatTui(
+  cwd: string,
+  deps: { home?: string; env?: NodeJS.ProcessEnv; stat?: (path: string) => { isDirectory(): boolean } } = {},
+): SeatDetection | null {
+  const detection = detectSeat(cwd, deps.env ?? process.env);
+  if (!detection) return null;
+  try {
+    return (deps.stat ?? statSync)(join(deps.home ?? homedir(), 'elanous-hq', 'seat-state', detection.seat)).isDirectory() ? detection : null;
+  } catch (error) {
+    // «없다»(ENOENT·ENOTDIR)만 «자리 아님»이다. 권한 오류 등 조회 실패는 던진다 — 호출부(bridge)가 seatKnown:false 로 남긴다.
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+    throw error;
+  }
+}
+
 export interface SeatBootDeps {
   home?: string;
   msgPath?: string;

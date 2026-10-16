@@ -1,10 +1,11 @@
 import { afterEach, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test';
+import { explicitGoalDoneBoundaryLines, inspectGoalDoneBoundary } from './goal-author.js';
 import { existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { authorGoal, resolveGoalAuthorGrade, boundaryLinesVerbatim, classifyAbsentFirstPathPresence, defaultGoalAuthorDeps, PARENT_BOUNDARY_HEADER, parentBoundaryLines, _setGoalAuthorPersistentGroundingDepsForTesting, resolveGoalAuthorPersistentGrounding, rfcGoalProseSection, classifyAcceptanceCriterionEvidence, classifyGoalCommandExecution, classifyGroundingFailure, countAuthoredGroundingPathSections, countMissingAuthoredConstraintMarkers, goalFileName, goalContextEvidence, groundForGoalAuthor, GOAL_RULES_POLICY, EVIDENCE_LOCATION_REQUIREMENT, IMPLEMENTATION_TARGET_CLARIFICATION, inspectArtifactLaunchDeclaration, linesOutsideFencedCode, inspectAskBoundaryMarker, inspectAskDecisionSignalMarker, inspectAskInvariantMarker, inspectTestScenarioDeclaration, lintGoalFile, markUntranscribedCriteria, markdownSection, parseArtifactLaunchDeclaration, parseAskFile, parseGoalId, parseRootIntent, parseTestScenarioDeclaration, planGateSignals, requiresImplementationTargetClarification, tracedPathReferences, writeAuthoredGoal, type GoalAuthorDeps, ASK_INVARIANT_MARKER, ASK_DECISION_SIGNAL_MARKER, ASK_BOUNDARY_MARKER, askSectionCountInformation, hasUnmetRequirementOutsidePreservationClause, WIRING_CRITERION_LINE, extractVerbatimOriginalAsk, verbatimOriginalAsk, ORIGINAL_ASK_MARKER, GOAL_FILE_LINT_ORIGINS, formatGoalFileLintFinding, allNegativeSignalsLintMessage, unreadableSignalsLintMessage, type GoalFileLintTag, summarizeGroundingFileKinds} from './goal-author.js';
+import { authorGoal, resolveGoalAuthorGrade, boundaryLinesVerbatim, classifyAbsentFirstPathPresence, classifyTracedPathToken, canonicalTracedPathToken, defaultGoalAuthorDeps, PARENT_BOUNDARY_HEADER, parentBoundaryLines, _setGoalAuthorPersistentGroundingDepsForTesting, resolveGoalAuthorPersistentGrounding, rfcGoalProseSection, classifyAcceptanceCriterionEvidence, classifyGoalCommandExecution, classifyGroundingFailure, countAuthoredGroundingPathSections, countMissingAuthoredConstraintMarkers, goalFileName, goalContextEvidence, groundForGoalAuthor, GOAL_RULES_POLICY, EVIDENCE_LOCATION_REQUIREMENT, IMPLEMENTATION_TARGET_CLARIFICATION, inspectArtifactLaunchDeclaration, isAskPathLocatorToken, linesOutsideFencedCode, inspectAskBoundaryMarker, inspectAskDecisionSignalMarker, inspectAskInvariantMarker, inspectTestScenarioDeclaration, lintGoalFile, markUntranscribedCriteria, markdownSection, parseArtifactLaunchDeclaration, parseAskFile, parseGoalId, parseRootIntent, parseTestScenarioDeclaration, planGateSignals, requiresImplementationTargetClarification, tracedPathReferences, writeAuthoredGoal, type GoalAuthorDeps, ASK_INVARIANT_MARKER, ASK_DECISION_SIGNAL_MARKER, ASK_BOUNDARY_MARKER, askSectionCountInformation, hasUnmetRequirementOutsidePreservationClause, WIRING_CRITERION_LINE, extractVerbatimOriginalAsk, verbatimOriginalAsk, ORIGINAL_ASK_MARKER, GOAL_FILE_LINT_ORIGINS, formatGoalFileLintFinding, allNegativeSignalsLintMessage, unreadableSignalsLintMessage, type GoalFileLintTag, summarizeGroundingFileKinds} from './goal-author.js';
 import { groundMissionInCodebase } from '../autopilot/mission-codebase-gate.js';
 import { REQUIRED_EVIDENCE_COMMAND_SEPARATOR, requiredEvidenceFromGoal } from './off-diff-evidence.js';
 import { setMissionSlugStreamForTest } from '../autopilot/mission-registry.js';
@@ -100,6 +101,87 @@ afterEach(() => {
 });
 
 describe('goal author grade', () => {
+  test('shell operators make completion evidence commands unsupported', () => {
+    const commands = [
+      'test -f /tmp/proof && echo ok',
+      'test -f /tmp/proof || echo missing',
+      'test -f /tmp/proof; echo ok',
+      'test -f /tmp/proof | cat',
+      'test -f /tmp/proof > /tmp/result',
+      'test -f /tmp/proof < /tmp/input',
+      'test -f $(printf /tmp/proof)',
+      'test -f `/bin/printf /tmp/proof`',
+    ];
+    for (const command of commands) {
+      const document = [
+        '완료 경계 코드: src/example.ts',
+        '완료 경계 실물: 완료 이벤트가 기록된다',
+        `완료 경계 증거 명령: ${command}`,
+      ].join('\n');
+      expect(inspectGoalDoneBoundary(document).missing).toContain('완료 경계 증거 명령');
+    }
+    const simpleFileCheck = [
+      '완료 경계 코드: src/example.ts',
+      '완료 경계 실물: 완료 이벤트가 기록된다',
+      '완료 경계 증거 명령: test -f /tmp/proof',
+    ].join('\n');
+    expect(inspectGoalDoneBoundary(simpleFileCheck).missing).toEqual([]);
+  });
+
+  test('full and lite goals carry explicit completion boundaries without adding a canonical H2 block', async () => {
+    const explicit = [
+      '완료 경계 코드: src/self-dev/dev-pipeline.ts 에 세 필드 검사',
+      '완료 경계 실물: 누락 골로 실행하면 자식 Pod가 생기기 전에 거부',
+      '완료 경계 증거 명령: bun test src/self-dev/dev-pipeline.test.ts',
+    ].join('\n');
+    const source = `대상 경로: src/self-dev/dev-pipeline.ts\n판정선(반증): 누락 골 발사는 거부된다.\n${explicit}`;
+    expect(explicitGoalDoneBoundaryLines(source)).toHaveLength(3);
+    for (const grade of ['full', 'lite'] as const) {
+      const authored = await authorGoal(source, { ...deps, authorGrade: { grade, source: 'flag' } });
+      expect(inspectGoalDoneBoundary(authored.document).missing).toEqual([]);
+      expect(markdownSection(authored.document, 'ACCEPTANCE CRITERIA')).toContain('- 완료 경계 코드: src/self-dev/dev-pipeline.ts');
+      expect(authored.document).not.toContain('## 완료 경계');
+    }
+  });
+
+  test('model checklist cannot mint completion boundaries absent from the original ask', async () => {
+    const invented = [
+      '완료 경계 코드: src/example.ts changed',
+      '완료 경계 실물: runtime response changed',
+      '완료 경계 증거 명령: bun test src/example.test.ts',
+    ];
+    for (const grade of ['full', 'lite'] as const) {
+      const authored = await authorGoal('대상 경로: src/example.ts\n판정선(반증): 기존 기능을 시험한다.', {
+        ...deps,
+        authorGrade: { grade, source: 'flag' },
+        enhance: async (original) => ({ original, checklist: invented, verbatimPreserved: true }),
+      });
+      expect(inspectGoalDoneBoundary(markdownSection(authored.document, 'ACCEPTANCE CRITERIA') ?? '').missing)
+        .toHaveLength(3);
+    }
+  });
+
+  test('full authoring refuses completion promises inserted into enhancement.original', async () => {
+    const cwd = existingGoalDocumentsRoot('goal-done-boundary-');
+    let writes = 0;
+    await expect(writeAuthoredGoal('대상 경로: src/example.ts\n판정선(반증): 기존 기능을 시험한다.', cwd, {
+      ...deps,
+      authorGrade: { grade: 'full', source: 'flag' },
+      enhance: async (original) => ({
+        original: `${original}\n완료 경계 코드: invented\n완료 경계 실물: invented\n완료 경계 증거 명령: bun test invented.test.ts`,
+        checklist: [],
+        verbatimPreserved: true,
+      }),
+    }, { write: () => { writes += 1; } })).rejects.toThrow('does not preserve its input verbatim');
+    expect(writes).toBe(0);
+    expect(readdirSync(join(cwd, 'docs', 'goals'))).toEqual([]);
+  });
+
+  test('quoted-only completion lines never become an authored completion boundary', () => {
+    const quoted = '```\n완료 경계 코드: src/example.ts\n완료 경계 실물: run it\n완료 경계 증거 명령: bun test src/example.test.ts\n```';
+    expect(explicitGoalDoneBoundaryLines(quoted)).toEqual([]);
+  });
+
   test('flag overrides config; absent and malformed configuration preserve full', () => {
     expect(resolveGoalAuthorGrade('lite', 'full')).toEqual({ grade: 'lite', source: 'flag' });
     expect(resolveGoalAuthorGrade(undefined, 'lite')).toEqual({ grade: 'lite', source: 'config' });
@@ -10462,5 +10544,70 @@ describe('default-invocation-observation lint', () => {
 
   test('lite refuses an ask without any falsifiable signal line instead of emitting a goal without one', async () => {
     await expect(authorGoal('대상 경로: src/a.ts\n그냥 고쳐 주세요', { authorGrade: { grade: 'lite', source: 'flag' } } as never)).rejects.toThrow('falsifiable signal');
+  });
+});
+
+describe('TRACED PATHS declaration token classification', () => {
+  test('classifies a nested path, residual characters, a repository-root file, a bare filename, and an empty cover', () => {
+    const root = mkdtempSync(join(tmpdir(), 'goal-author-traced-token-'));
+    writeFileSync(join(root, 'README.md'), 'root\n');
+    try {
+      expect(classifyTracedPathToken('src/a.ts')).toEqual({ token: 'src/a.ts', kind: 'path', path: 'src/a.ts', residual: null });
+      expect(classifyTracedPathToken('src/a.ts???')).toEqual({ token: 'src/a.ts???', kind: 'residual', path: 'src/a.ts', residual: '???' });
+      expect(classifyTracedPathToken('README.md', root)).toEqual({ token: 'README.md', kind: 'repository-root', path: 'README.md', residual: null });
+      expect(classifyTracedPathToken('row.ts')).toEqual({ token: 'row.ts', kind: 'bare', path: 'row.ts', residual: null });
+      expect(classifyTracedPathToken('(빈 대상 경로)')).toEqual({ token: '(빈 대상 경로)', kind: 'empty-cover', path: null, residual: null });
+      expect(classifyTracedPathToken('')).toEqual({ token: '', kind: 'empty-cover', path: null, residual: null });
+      expect(isAskPathLocatorToken('src/a.ts???')).toBe(true);
+      expect(isAskPathLocatorToken('(빈 대상 경로)')).toBe(true);
+      expect(isAskPathLocatorToken('src/a.ts')).toBe(false);
+      expect(isAskPathLocatorToken('row.ts')).toBe(false);
+      expect(canonicalTracedPathToken('src/a.ts???')).toBeNull();
+      expect(canonicalTracedPathToken('row.ts')).toBeNull();
+      expect(canonicalTracedPathToken('(빈 대상 경로)')).toBeNull();
+      expect(canonicalTracedPathToken('src/a.ts')).toBe('src/a.ts');
+      expect(canonicalTracedPathToken('README.md', root)).toBe('README.md');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('does not inject residual or empty-cover tokens into tracedPathReferences', () => {
+    const document = [
+      '## TRACED PATHS',
+      '- src/self-implement/goal-author.ts',
+      '- src/a.ts???',
+      '- (빈 대상 경로)',
+      '## SCOPE BOUNDARY',
+      '- boundary',
+    ].join('\n');
+    expect(tracedPathReferences(document)).toEqual([
+      { path: 'src/self-implement/goal-author.ts', line: null, endLine: null },
+    ]);
+  });
+
+  test('keeps a repository-root file and a nested path and does not inject a bare twin', () => {
+    const root = mkdtempSync(join(tmpdir(), 'goal-author-traced-root-'));
+    writeFileSync(join(root, 'README.md'), 'root\n');
+    try {
+      const document = [
+        '## TRACED PATHS',
+        '- src/self-implement/row.ts',
+        '- README.md',
+        '- row.ts',
+        '## SCOPE BOUNDARY',
+        '- boundary',
+      ].join('\n');
+      expect(tracedPathReferences(document)).toEqual([
+        { path: 'src/self-implement/row.ts', line: null, endLine: null },
+        { path: 'README.md', line: null, endLine: null },
+        { path: 'row.ts', line: null, endLine: null },
+      ]);
+      expect(canonicalTracedPathToken('README.md', root)).toBe('README.md');
+      expect(canonicalTracedPathToken('row.ts', root)).toBeNull();
+      expect(classifyTracedPathToken('row.ts', root).kind).toBe('bare');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

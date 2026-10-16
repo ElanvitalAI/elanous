@@ -247,6 +247,21 @@ describe('startTuiSelfReport · wiring (injected deps)', () => {
     expect(pollerStops).toBe(1);
   });
 
+  test('starts the deferred-wake poller for its own pty and stops it with the TUI (TUI-H4)', () => {
+    const started: string[] = [];
+    let stops = 0;
+    const stop = startTuiSelfReport({
+      surfaceId: 'tui:wake', createMirror: () => null, heartbeatMs: 1_000_000,
+      register: () => {}, publishFrame: () => {}, registerRow: () => {}, writeFrame: () => {}, writeScreen: () => {},
+      heartbeat: () => {}, markClosed: () => {}, onExit: () => {},
+      registerControlTarget: () => () => {}, startControlPoller: () => () => {},
+      startWakePoller: id => { started.push(id); return () => { stops++; }; },
+    });
+    expect(started).toEqual(['tui:wake']);
+    stop();
+    expect(stops).toBe(1);
+  });
+
   test('control-target registration failure is fail-soft and never advertises the TUI', () => {
     const rows: string[] = [];
     const cleanup: string[] = [];

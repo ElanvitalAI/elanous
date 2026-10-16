@@ -5,7 +5,7 @@ import { randomBytes } from 'node:crypto';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getUserConfig } from '../user-config.js';
 import { debug, redactSecretText } from '../debug/log.js';
-import { realGateRemoteRunner, resolveGateRemoteSettings, runOnRemote, type GateRemoteRunner, type RemoteRunOutcome } from '../self-implement/gate-remote.js';
+import { gateRemoteHostCap, realGateRemoteRunner, resolveGateRemoteSettings, runOnRemote, type GateRemoteRunner, type RemoteRunOutcome } from '../self-implement/gate-remote.js';
 
 const SHA = /^[0-9a-f]{40}$/i;
 // WSL is excluded until its push permissions and gate environment are proven stable.
@@ -179,7 +179,7 @@ export function ensurePrLandHeavyRemote(input: HeavyRemoteInput, deps: HeavyRemo
     try {
       outcome = (deps.runRemote ?? runOnRemote)({
         repo: input.repo, host, mirror: settings.mirror, commit: input.head,
-        refs: [input.main], hostCap: settings.hostCap, installPwa: true,
+        refs: [input.main], hostCap: gateRemoteHostCap(settings, host), installPwa: true, stableCheckout: true,
         // Test the tree GitHub will merge: scratch-checkout the reviewed head, merge the pinned main tip there,
         // then run typecheck and self gate (changed tests and PWA reach/build) at that exact pair.
         // The detached integration commit stays on the selected host and never changes the PR branch.

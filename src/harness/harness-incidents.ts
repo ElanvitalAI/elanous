@@ -26,6 +26,7 @@ export interface IncidentBurst {
   runIds: string[];
   entrance?: string;
   seat?: string;
+  hostname?: string;
 }
 
 /** Scrub before bounding: a token crossing the 200-character boundary must not leak. */
@@ -111,33 +112,69 @@ export function recordRunExit(row: RunExit, root: string): void {
   }
 }
 
-/** Non-overlapping, maximal same-reason/seat/entrance windows; no run contributes to two bursts. */
-export function detectBursts(rows: readonly RunExit[], { windowMs = 60_000, threshold = 3 }: {
-  windowMs?: number; threshold?: number;
-} = {}): IncidentBurst[] {
-  const bursts: IncidentBurst[] = [];
-  const byIdentity = new Map<string, RunExit[]>();
+const HOSTNAME_BURST_WINDOW_MS = 60 * 60_000;
+
+function uniqueRunExits(rows: readonly RunExit[]): RunExit[] {
+  const unique: RunExit[] = [];
   const seen = new Set<string>();
   for (const row of rows) {
     if (!row.runId || seen.has(row.runId) || !Number.isFinite(Date.parse(row.at))) continue;
     seen.add(row.runId);
-    const key = JSON.stringify([row.reason, row.seat ?? null, row.entrance ?? null]);
+    unique.push(row);
+  }
+  return unique;
+}
+
+function groupRunExits(rows: readonly RunExit[], keyOf: (row: RunExit) => string): RunExit[][] {
+  const byIdentity = new Map<string, RunExit[]>();
+  for (const row of rows) {
+    const key = keyOf(row);
     const group = byIdentity.get(key) ?? [];
     group.push(row);
     byIdentity.set(key, group);
   }
-  for (const group of byIdentity.values()) {
-    const { reason, seat, entrance } = group[0]!;
-    group.sort((a, b) => Date.parse(a.at) - Date.parse(b.at) || a.runId.localeCompare(b.runId));
-    for (let start = 0; start < group.length;) {
-      let end = start + 1;
-      while (end < group.length && Date.parse(group[end]!.at) - Date.parse(group[start]!.at) <= windowMs) end++;
-      if (end - start < threshold) { start++; continue; }
-      const members = group.slice(start, end);
-      bursts.push({ reason, count: members.length, firstAt: members[0]!.at,
-        lastAt: members[members.length - 1]!.at, runIds: members.map((row) => row.runId),
-        ...(seat ? { seat } : {}), ...(entrance ? { entrance } : {}) });
-      start = end;
+  return [...byIdentity.values()];
+}
+
+function burstMemberWindows(group: RunExit[], windowMs: number, threshold: number): RunExit[][] {
+  const sorted = group.slice().sort((a, b) => Date.parse(a.at) - Date.parse(b.at) || a.runId.localeCompare(b.runId));
+  const windows: RunExit[][] = [];
+  for (let start = 0; start < sorted.length;) {
+    let end = start + 1;
+    while (end < sorted.length && Date.parse(sorted[end]!.at) - Date.parse(sorted[start]!.at) <= windowMs) end++;
+    if (end - start < threshold) { start++; continue; }
+    windows.push(sorted.slice(start, end));
+    start = end;
+  }
+  return windows;
+}
+
+function burstFromMembers(members: RunExit[], extra: Pick<IncidentBurst, 'seat' | 'entrance' | 'hostname'>): IncidentBurst {
+  return {
+    reason: members[0]!.reason, count: members.length, firstAt: members[0]!.at,
+    lastAt: members[members.length - 1]!.at, runIds: members.map((row) => row.runId),
+    ...(extra.seat ? { seat: extra.seat } : {}),
+    ...(extra.entrance ? { entrance: extra.entrance } : {}),
+    ...(extra.hostname ? { hostname: extra.hostname } : {}),
+  };
+}
+
+/** Non-overlapping windows within each identity; seat and host are independent views of an exit. */
+export function detectBursts(rows: readonly RunExit[], { windowMs = 60_000, threshold = 3 }: {
+  windowMs?: number; threshold?: number;
+} = {}): IncidentBurst[] {
+  const unique = uniqueRunExits(rows);
+  const bursts: IncidentBurst[] = [];
+  for (const group of groupRunExits(unique, (row) => JSON.stringify([row.reason, row.seat ?? null, row.entrance ?? null]))) {
+    const { seat, entrance } = group[0]!;
+    for (const members of burstMemberWindows(group, windowMs, threshold)) {
+      bursts.push(burstFromMembers(members, { ...(seat ? { seat } : {}), ...(entrance ? { entrance } : {}) }));
+    }
+  }
+  for (const group of groupRunExits(unique.filter((row) => row.hostname), (row) => JSON.stringify([row.reason, row.hostname]))) {
+    const hostname = group[0]!.hostname;
+    for (const members of burstMemberWindows(group, HOSTNAME_BURST_WINDOW_MS, 3)) {
+      bursts.push(burstFromMembers(members, { ...(hostname ? { hostname } : {}) }));
     }
   }
   return bursts.sort((a, b) => Date.parse(a.firstAt) - Date.parse(b.firstAt) || a.reason.localeCompare(b.reason));
@@ -149,7 +186,7 @@ export function recentBurst(root: string, now: Date | number, { lookbackMs = 15 
   const time = typeof now === 'number' ? now : now.getTime();
   const recent = detectBursts(readRunExits(root)).filter((burst) => {
     const last = Date.parse(burst.lastAt);
-    return last <= time && last >= time - lookbackMs
+    return !burst.hostname && last <= time && last >= time - lookbackMs
       && burst.seat === seat && burst.entrance === entrance;
   });
   return recent.sort((a, b) => Date.parse(a.lastAt) - Date.parse(b.lastAt)).at(-1) ?? null;

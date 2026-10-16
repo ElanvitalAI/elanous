@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { debug } from '../debug/log.js';
 
 type ExposeMode = 'warn' | 'strict';
@@ -15,7 +16,7 @@ export function runExposeGate(
   changed: readonly string[],
   mode: ExposeMode,
   run: (command: string, args: string[], cwd: string) => ProcessResult = (command, args, dir) => {
-    const result = spawnSync(command, args, { cwd: dir, encoding: 'utf8', timeout: 300_000 });
+    const result = spawnSync(command, args, { cwd: dir, encoding: 'utf8', timeout: 300_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
     return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '', error: result.error };
   },
 ): ExposeResult {

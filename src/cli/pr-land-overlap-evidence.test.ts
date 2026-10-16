@@ -21,6 +21,26 @@ function check(filenameHead: string, contentHead: string, filenamePr = PR, conte
 }
 
 describe('PR land review filename head prefix', () => {
+  test('accepts a decimal string PR in overlap evidence and still rejects another PR', () => {
+    const run: CmdRunner = () => ({ ok: true, out: '', err: '' });
+    const verify = (pr: unknown, expectedPr = PR) => verifyOverlapEvidence({
+      evidencePath: '/evidence.json', pr: expectedPr, expectedHead: HEAD, remote: 'origin', branch: 'main', cwd: '/repo', run,
+      reviewResultsDir: '/state/review-results', overlappingLandings: ['abcdef1234567'],
+      listDir: () => [`card-${PR}-${HEAD.slice(0, 12)}.json`], reviewMtime: () => 1, reviewRealPath: (path) => path,
+      readFile: (path) => path === '/evidence.json'
+        ? JSON.stringify({ pr, head: HEAD, reviewResult: `/state/review-results/card-${PR}-${HEAD.slice(0, 12)}.json` })
+        : review(HEAD),
+    });
+    expect(verify(String(PR))).toMatchObject({ ok: true, mode: 'already-ancestor' });
+    expect(verify(`0${PR}`)).toMatchObject({ ok: true, mode: 'already-ancestor' });
+    expect(verify(String(PR + 1))).toEqual({ ok: false, reason: `evidence-pr-mismatch: ${PR + 1} ≠ ${PR}` });
+    expect(verify(`${PR}x`)).toEqual({ ok: false, reason: `evidence-pr-mismatch: ${PR}x ≠ ${PR}` });
+    expect(verify('0')).toEqual({ ok: false, reason: `evidence-pr-mismatch: 0 ≠ ${PR}` });
+    expect(verify('9007199254740993', 9007199254740992)).toEqual({
+      ok: false, reason: 'evidence-pr-mismatch: 9007199254740993 ≠ 9007199254740992',
+    });
+  });
+
   test('accepts a 10-character filename prefix only when review headCommit exactly matches', () => {
     expect(check(HEAD.slice(0, 10), HEAD)).toMatchObject({ ok: true, mode: 'already-ancestor' });
   });
@@ -81,6 +101,70 @@ describe('PR land review filename head prefix', () => {
       readFile: () => review(HEAD),
     });
     expect(result).toEqual({ ok: false, reason: 'review-missing' });
+  });
+});
+
+describe('review provider evidence', () => {
+  const name = `card-${PR}-${HEAD.slice(0, 12)}.json`;
+  const path = `/state/review-results/${name}`;
+  const inspect = (body: Record<string, unknown>, automatic = false) => {
+    const input = {
+      pr: PR, expectedHead: HEAD, cwd: '/repo', run: (() => ({ ok: true, out: '', err: '' })) as CmdRunner,
+      readFile: (file: string) => file === '/evidence.json'
+        ? JSON.stringify({ pr: PR, head: HEAD, reviewResult: path })
+        : JSON.stringify({ pr: PR, headCommit: HEAD, reviewed: true, verdict: 'pass', mustFix: [], ...body }),
+      reviewResultsDir: '/state/review-results', listDir: () => [name], overlappingLandings: ['abcdef1234567'],
+    };
+    return automatic ? verifyAncestorAutoPass(input) : verifyOverlapEvidence({ ...input, evidencePath: '/evidence.json', remote: 'origin', branch: 'main', reviewMtime: () => 1, reviewRealPath: (file) => file });
+  };
+
+  test('warns the user about requested versus actual provider on both landing paths without altering the evidence format', () => {
+    const warnings: string[] = [];
+    const old = console.warn;
+    console.warn = (line) => { warnings.push(line); };
+    try {
+      const mismatched = { requestedModel: 'openrouter/z-ai/glm-5.3', actualBackend: 'acp:grok', model: 'acp:grok', reviewRoute: 'acp-fallback' };
+      expect(inspect(mismatched)).toEqual({ ok: true, mode: 'already-ancestor', reviewResult: path });
+      expect(inspect(mismatched, true)).toEqual({ ok: true, mode: 'already-ancestor-auto', reviewResult: path });
+      expect(warnings).toHaveLength(2);
+      expect(warnings[0]).toContain('requestedModel=openrouter/z-ai/glm-5.3 actualBackend=acp:grok model=acp:grok reviewRoute=acp-fallback');
+      expect(inspect({ requestedModel: 'openrouter/z-ai/glm-5.3', model: 'openrouter/z-ai/glm-5.3', reviewRoute: 'api' })).toMatchObject({ ok: true });
+      expect(inspect({ requestedModel: 'acp:grok/grok-4', actualBackend: 'acp:grok', model: 'acp:grok/grok-4', reviewRoute: 'acp' })).toMatchObject({ ok: true });
+      expect(warnings).toHaveLength(2);
+      expect(inspect({ requestedModel: 'acp:grok/grok-4', actualBackend: 'acp:grok', model: 'acp:grok/grok-4', reviewRoute: 'acp-fallback' })).toMatchObject({ ok: true });
+      expect(warnings.at(-1)).toContain('reviewRoute=acp-fallback');
+      expect(inspect({ requestedModel: 'openrouter/z-ai/glm-5.3', actualBackend: 'openai', model: 'openrouter/z-ai/glm-5.3', reviewRoute: 'api' })).toMatchObject({ ok: true });
+      expect(warnings.at(-1)).toContain('actualBackend=openai');
+      expect(inspect({ requestedModel: 'openrouter/z-ai/glm-5.3', model: 'openrouter/other/model', reviewRoute: 'api' })).toMatchObject({ ok: true });
+      expect(warnings.at(-1)).toContain('model=openrouter/other/model');
+      expect(inspect({ requestedModel: 'openrouter/z-ai/glm-5.3', model: 'openrouter/z-ai/glm-5.3', reviewRoute: 'acp' })).toMatchObject({ ok: true });
+      expect(warnings.at(-1)).toContain('reviewRoute=acp');
+      expect(inspect({ requestedModel: 'openrouter/z-ai/glm-5.3', model: 'openrouter/z-ai/glm-5.3', reviewRoute: 'api', respondedProvider: 'openrouter', respondedModel: 'z-ai/glm-5.3' })).toMatchObject({ ok: true });
+      expect(warnings).toHaveLength(6);
+      expect(inspect({ requestedModel: 'openrouter/z-ai/glm-5.3', model: 'openrouter/z-ai/glm-5.3', reviewRoute: 'api', respondedProvider: 'openai', respondedModel: 'z-ai/glm-5.3' })).toMatchObject({ ok: true });
+      expect(warnings.at(-1)).toContain('respondedProvider=openai');
+      expect(inspect({ requestedModel: 'openrouter/z-ai/glm-5.3', model: 'openrouter/z-ai/glm-5.3', reviewRoute: 'api', respondedProvider: 'openrouter', respondedModel: 'other/model' })).toMatchObject({ ok: true });
+      expect(warnings.at(-1)).toContain('respondedModel=other/model');
+      expect(inspect({ requestedModel: 'openrouter/z-ai/glm-5.3', model: 'openrouter/z-ai/glm-5.3', reviewRoute: 'api', respondedModel: 'other/model' })).toMatchObject({ ok: true });
+      expect(warnings.at(-1)).toContain('respondedModel=other/model');
+      const beforeBare = warnings.length;
+      expect(inspect({ requestedModel: 'claude-sonnet-4', model: 'claude-sonnet-4', reviewRoute: 'api', respondedProvider: 'anthropic', respondedModel: 'claude-sonnet-4' })).toMatchObject({ ok: true });
+      expect(inspect({ requestedModel: 'gpt-6-sol', model: 'gpt-6-sol', reviewRoute: 'api', respondedProvider: 'openai-codex', respondedModel: 'gpt-6-sol' })).toMatchObject({ ok: true });
+      expect(warnings).toHaveLength(beforeBare);
+    } finally { console.warn = old; }
+  });
+
+  test('forbidden acp:claude is never landing evidence, including automatic lookup', () => {
+    for (const body of [
+      { model: 'acp:claude', reviewRoute: 'acp' },
+      { model: 'acp:claude/opus', reviewRoute: 'acp' },
+      { actualBackend: 'acp:claude/opus', reviewRoute: 'acp' },
+      { requestedModel: 'openrouter/z-ai/glm-5.3', actualBackend: 'acp:claude', model: 'openrouter/z-ai/glm-5.3', reviewRoute: 'acp-fallback' },
+      { reviewRoute: 'acp-fallback', fallbackBackend: 'claude' },
+    ]) {
+      expect(inspect(body)).toEqual({ ok: false, reason: 'review-forbidden-acp-claude' });
+      expect(inspect(body, true)).toEqual({ ok: false, reason: 'review-forbidden-acp-claude' });
+    }
   });
 });
 

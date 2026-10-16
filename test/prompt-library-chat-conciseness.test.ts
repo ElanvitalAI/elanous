@@ -44,6 +44,12 @@ describe('getConcisenessSystemPrompt', () => {
       flatBullets: true,
     });
     expect(prompt).toContain('Do not narrate each step');
+    // TUI-INITIATIVE 0단(대표 10-15 «시키는 일만 하고 끝나는 상태부터 막자»): every brevity rule has an act-first path.
+    expect(prompt).toContain('## Initiative');
+    expect(prompt).toContain('Act first');
+    expect(prompt).toContain('state\n  the assumption in one line');
+    expect(prompt).toContain('end with up to 3 concrete next steps');
+    expect(prompt).toContain('A stop always comes with a path');
     expect(prompt).toContain('Do not use tables');
     expect(prompt).toContain('monospace CommonMark');
   });

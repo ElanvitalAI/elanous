@@ -1,12 +1,18 @@
 #!/usr/bin/env bun
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, extname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { debug } from '../../src/debug/log.js';
 import { runOcr } from '../../skills/omni-digest/src/ocr.js';
 import { streamLLM } from '../../src/llm.js';
+import { decodeFieldAudio } from '../../src/field-note/telegram.js';
+import { createBatchSttEngine, transcribeFieldAudio, type FieldAudio, type TranscriptionEngine } from '../../src/field-note/transcribe.js';
+import { createSTTProvider } from '../../src/voice/stt-provider.js';
+import { resolveObsidianRoot } from '../../src/acp/fs-roots.js';
+import { assertVaultWriteAllowed } from '../../src/obsidian/vault-write-guard.js';
 import { unified } from 'unified';
 import remarkParse from 'remark-parse';
 import remarkGfm from 'remark-gfm';
@@ -15,7 +21,7 @@ import rehypeSanitize from 'rehype-sanitize';
 import rehypeStringify from 'rehype-stringify';
 
 export type Stage = 'collect' | 'draft' | 'render' | 'html' | 'pdf';
-export interface Input { name: string; kind: 'pdf' | 'image' | 'markdown'; text: string }
+export interface Input { name: string; kind: 'pdf' | 'image' | 'markdown' | 'audio'; text: string }
 export interface Counts { inputs: number; diagrams: number; rendered: number; html: 'yes' | 'no'; pdf: 'yes' | 'skipped' }
 export interface StageResult extends Counts { outcome: 'ok' | 'skipped' }
 export interface StageOptions {
@@ -23,11 +29,15 @@ export interface StageOptions {
   ocr?: (filePath: string) => Promise<string>;
   toolsPath?: string;
   referenceRoot?: string;
+  engine?: TranscriptionEngine;
+  decodeAudio?: (filePath: string, recordedAt: string) => FieldAudio;
+  vaultRoot?: string;
 }
 
 const ownRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../skills');
 const kinds: Record<string, Input['kind']> = {
   '.pdf': 'pdf', '.md': 'markdown', '.png': 'image', '.jpg': 'image', '.jpeg': 'image', '.webp': 'image',
+  '.wav': 'audio', '.mp3': 'audio', '.m4a': 'audio', '.ogg': 'audio', '.webm': 'audio',
 };
 const mermaid = /^```mermaid\s*\n([\s\S]*?)^```\s*$/gm;
 const escapeHtml = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -92,13 +102,20 @@ export async function collect(folder: string, options: StageOptions = {}): Promi
   const sources = resolve(folder, 'sources/common');
   const scan = [{ base: folder, prefix: '' }, ...(pathStatus(sources)?.isDirectory() && !pathStatus(sources)?.isSymbolicLink()
     ? [{ base: sources, prefix: 'sources/common/' }] : [])];
+  let engine = options.engine;
   for (const { base, prefix } of scan) for (const entry of readdirSync(base, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
     const kind = kinds[extname(entry.name).toLowerCase()];
     if (!entry.isFile() || !kind) continue;
     const at = join(base, entry.name);
     let text: string;
     if (kind === 'markdown') text = readFileSync(at, 'utf8');
-    else if (kind === 'image') {
+    else if (kind === 'audio') {
+      if (!engine) engine = createBatchSttEngine(await createSTTProvider({ id: 'openai-whisper' }));
+      const recordedAt = statSync(at).mtime.toISOString();
+      const entries = await transcribeFieldAudio((options.decodeAudio ?? decodeFieldAudio)(at, recordedAt), engine);
+      if (!entries.length) throw new Error(`오디오 전사 결과가 비었다: ${prefix + entry.name}`);
+      text = entries.map(({ timestamp, speaker, text }) => `${timestamp} · ${speaker}: ${text}`).join('\n');
+    } else if (kind === 'image') {
       try {
         const extracted = await (options.ocr ?? runOcr)(at);
         if (!extracted.trim()) throw new Error('Upstage/OCR.space 폴백 결과가 비었다');
@@ -130,12 +147,61 @@ export async function draft(folder: string, options: StageOptions = {}): Promise
   const dir = outputDir(folder);
   const inputs = readInputs(dir);
   if (!inputs.length) throw new Error('강의 자료가 없다');
-  const prompt = `${instructions}\n\n자료:\n${inputs.map(i => `### ${i.name} (${i.kind})\n${i.text}`).join('\n\n')}`;
+  const audioInstructions = inputs.some(i => i.kind === 'audio')
+    ? '\n오디오 전사에서 근거를 찾아 노트 본문에 ## 요약 (내용 포함) 및 ## 할 일 셋 (번호 목록 1. 2. 3.)을 작성하라. 근거 없는 할 일은 만들지 말고 해당 항목은 없음으로 표시하라.' : '';
+  const prompt = `${instructions}${audioInstructions}\n\n자료:\n${inputs.map(i => `### ${i.name} (${i.kind})\n${i.text}`).join('\n\n')}`;
   const ask = options.llm ?? ((request: string) => streamLLM([{ role: 'user', content: request }], () => {}));
   const notes = (await ask(prompt)).trim();
   if (!notes) throw new Error('LLM 초안이 비었다');
+  if (audioInstructions && !hasAudioSummaryAndTasks(notes)) {
+    throw new Error('오디오 노트에 요약·할 일 셋이 없다');
+  }
   writeFileSync(artifact(dir, 'notes.md'), notes + '\n');
   return { ...counts(dir), outcome: 'ok' };
+}
+
+function hasAudioSummaryAndTasks(notes: string): boolean {
+  const lines = notes.split(/\r?\n/);
+  const section = (title: string): string | undefined => {
+    const start = lines.findIndex(line => line.trimEnd() === `## ${title}`);
+    if (start < 0) return undefined;
+    const next = lines.slice(start + 1).findIndex(line => /^#{1,2}\s/.test(line));
+    return lines.slice(start + 1, next < 0 ? undefined : start + 1 + next).join('\n').trim();
+  };
+  const summary = section('요약');
+  const tasks = section('할 일 셋');
+  const summaryContent = summary?.split('\n').some(line => line.trim() && !/^#{1,6}\s/.test(line));
+  return !!summaryContent && !!tasks && /^1\. [^\S\n]*\S[^\n]*\n(?:[^\S\n]*\n)*2\. [^\S\n]*\S[^\n]*\n(?:[^\S\n]*\n)*3\. [^\S\n]*\S[^\n]*/m.test(tasks);
+}
+
+function publishAudioNote(folder: string, dir: string, notes: string, options: StageOptions): void {
+  if (!readInputs(dir).some(i => i.kind === 'audio')) return;
+  if (!hasAudioSummaryAndTasks(notes)) {
+    throw new Error('오디오 노트에 요약·할 일 셋이 없다');
+  }
+  const resolvedVault = options.vaultRoot ? { root: resolve(options.vaultRoot), available: true } : resolveObsidianRoot();
+  if (!resolvedVault.available) return;
+  const vault = resolve(resolvedVault.root);
+  const vaultStatus = pathStatus(vault);
+  if (vaultStatus?.isSymbolicLink()) throw new Error('vault 루트가 안전하지 않다');
+  if (!vaultStatus?.isDirectory()) return;
+  const course = resolve(folder);
+  const target = join(vault, 'lecture-notes', `${createHash('sha256').update(course + '\0' + notes.trim()).digest('hex')}.md`);
+  const section = pathStatus(join(vault, 'lecture-notes'));
+  if (section && (!section.isDirectory() || section.isSymbolicLink())) throw new Error('vault 강의 노트 폴더가 안전하지 않다');
+  assertVaultWriteAllowed(target);
+  if (!section) mkdirSync(join(vault, 'lecture-notes'));
+  const existing = pathStatus(target);
+  if (existing && (!existing.isFile() || existing.isSymbolicLink())) throw new Error('vault 노트 파일이 안전하지 않다');
+  if (existing && readFileSync(target, 'utf8') !== notes) throw new Error('vault 노트 해시 충돌');
+  if (!existing) {
+    try { copyFileSync(artifact(dir, 'notes.md'), target, constants.COPYFILE_EXCL); }
+    catch (error) {
+      const current = pathStatus(target);
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || !current?.isFile() ||
+          current.isSymbolicLink() || readFileSync(target, 'utf8') !== notes) throw error;
+    }
+  }
 }
 
 export function render(folder: string, options: StageOptions = {}): StageResult {
@@ -208,6 +274,7 @@ export function html(folder: string, options: StageOptions = {}): StageResult {
     `<style>${css}</style></head><body><div class="cover"><h1>${escapeHtml(title)}</h1></div>` +
     `<div class="toc"><h2>목차</h2><ol>${sections.join('\n')}</ol></div><div class="section">${numbered}</div></body></html>\n`;
   writeFileSync(artifact(dir, 'notes.html'), page);
+  publishAudioNote(folder, dir, notes, options);
   return { ...counts(dir), outcome: 'ok' };
 }
 

@@ -108,7 +108,14 @@ test('retro facts: unreadable incidents are reported unavailable while logs.db f
 test('recorded events reach the installed CLI facts JSON', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'retro-cli-recorded-'));
   const stateDir = join(dir, '.elanous-test');
-  const previous = process.env.ELANOUS_STATE_DIR;
+    const previous = process.env.ELANOUS_STATE_DIR;
+    // A Pod child routes auto-merge to its host (routePodMergeToHost), so this local-merge test would
+    // stop at merge-ready inside a gate Pod. This test exercises the in-process merge seam, so the
+    // Pod routing env is removed for its duration to keep the run deterministic anywhere.
+    const podSubstrate = process.env.ELANOUS_SUBSTRATE;
+    const podName = process.env.ELANOUS_POD_NAME;
+    delete process.env.ELANOUS_SUBSTRATE;
+    delete process.env.ELANOUS_POD_NAME;
   try {
     process.env.ELANOUS_STATE_DIR = stateDir;
     const nodeEnv = process.env.NODE_ENV;
@@ -187,6 +194,10 @@ test('recorded events reach the installed CLI facts JSON', async () => {
   } finally {
     if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = previous;
+    if (podSubstrate === undefined) delete process.env.ELANOUS_SUBSTRATE;
+    else process.env.ELANOUS_SUBSTRATE = podSubstrate;
+    if (podName === undefined) delete process.env.ELANOUS_POD_NAME;
+    else process.env.ELANOUS_POD_NAME = podName;
     rmSync(dir, { recursive: true, force: true });
   }
   // Two real CLI spawns (task-agent-action, then retro facts): a cold `bin/elanous.mjs` boot takes several seconds in a

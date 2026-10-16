@@ -2,13 +2,14 @@ import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-import { RESOURCE_KINDS, ResourceLedger, ResourceLedgerError, type ResourceRecord } from './ledger.js';
+import { RESOURCE_KINDS, ResourceLedger, ResourceLedgerError, type PodWorkerKey, type ResourceRecord } from './ledger.js';
 import { leasePort, PORT_BANDS } from './ports.js';
 import { machineForToken } from './member-tokens.js';
 import type { LeaseHolderView } from './lease-holder.js';
 
 export const DEFAULT_CONTROL_PORT = PORT_BANDS.reserved[0];
 export const CONTROL_HOSTNAME = '127.0.0.1';
+const MAX_POD_WORKER_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function allowedControlHostname(hostname: string): boolean {
   if (hostname === '127.0.0.1' || hostname === '::1') return true;
@@ -69,6 +70,20 @@ function recordFromBody(value: unknown, owner: string): ResourceRecord {
   };
 }
 
+function podWorkerKey(value: unknown): PodWorkerKey {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ResourceLedgerError(400, 'invalid-worker-key');
+  const key = value as Record<string, unknown>;
+  if (!['context', 'imageDigest', 'lockHash', 'architecture'].every(name => typeof key[name] === 'string' && (key[name] as string).trim())) {
+    throw new ResourceLedgerError(400, 'invalid-worker-key');
+  }
+  return key as unknown as PodWorkerKey;
+}
+
+function podWorkerBody(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ResourceLedgerError(400, 'invalid-pod-worker-lease');
+  return value as Record<string, unknown>;
+}
+
 export interface ControlServerOptions {
   root?: string;
   port?: number;
@@ -94,6 +109,7 @@ export function startControlServer(opts: ControlServerOptions = {}): {
     port,
     async fetch(req) {
       const lease = await opts.leaseView?.get();
+      let responseLease = lease;
       const respond = async (): Promise<Response> => {
         const url = new URL(req.url);
         const path = url.pathname;
@@ -108,7 +124,10 @@ export function startControlServer(opts: ControlServerOptions = {}): {
         const leaseRequest = path === '/v1/leases/port' && method === 'POST';
         const leaseDeletion = /^\/v1\/leases\/port\/([^/]+)$/.exec(path);
         const leaseRenewal = /^\/v1\/leases\/port\/([^/]+)\/heartbeat$/.exec(path);
-        if (!resourcePath && !registerPath && !leaseRequest && !(leaseDeletion && method === 'DELETE') && !(leaseRenewal && method === 'POST') && !(heartbeat && method === 'POST') && !(deletion && method === 'DELETE')) {
+        const workerRegister = path === '/v1/workers/pod' && method === 'POST';
+        const workerAcquire = path === '/v1/leases/pod-worker' && method === 'POST';
+        const workerTransition = /^\/v1\/leases\/pod-worker\/([^/]+)\/(renew|release|sanitize|quarantine)$/.exec(path);
+        if (!resourcePath && !registerPath && !leaseRequest && !workerRegister && !workerAcquire && !(workerTransition && method === 'POST') && !(leaseDeletion && method === 'DELETE') && !(leaseRenewal && method === 'POST') && !(heartbeat && method === 'POST') && !(deletion && method === 'DELETE')) {
           return json({ error: 'not-found' }, 404);
         }
         const authorization = req.headers.get('authorization');
@@ -118,7 +137,7 @@ export function startControlServer(opts: ControlServerOptions = {}): {
           : undefined;
         const machine = !scope && presented ? machineForToken(presented, root) : undefined;
         if (!scope && !machine) return json({ error: 'unauthorized' }, 401);
-        if (!resourcePath && (scope === 'query' || ((leaseRequest || leaseDeletion || leaseRenewal) && scope !== 'member' && !machine))) return json({ error: 'forbidden' }, 403);
+        if (!resourcePath && (scope === 'query' || ((leaseRequest || leaseDeletion || leaseRenewal || workerRegister || workerAcquire || workerTransition) && scope !== 'member' && !machine))) return json({ error: 'forbidden' }, 403);
         if (!resourcePath && (lease?.known ? !lease.iAmHolder : opts.requireKnownLeaseForWrites)) {
           return json({ error: 'not-primary', holder: lease?.holder ?? null, generation: lease?.generation ?? null }, 409);
         }
@@ -132,7 +151,62 @@ export function startControlServer(opts: ControlServerOptions = {}): {
             if (target) requireMachine(target.machine);
           }
         };
+        const currentWorkerPrimary = async (): Promise<Response | undefined> => {
+          if (!opts.leaseView) return json({ error: 'primary-unmeasured' }, 409);
+          const current = await opts.leaseView.get({ fresh: true });
+          responseLease = current;
+          if (!current.known || !current.iAmHolder || current.generation !== lease?.generation) {
+            return json({ error: 'not-primary', holder: current.holder, generation: current.generation }, 409);
+          }
+          return undefined;
+        };
         try {
+          if (workerRegister) {
+            if (!machine) throw new ResourceLedgerError(403, 'worker-host-required');
+            const body = podWorkerBody(await req.json());
+            const { workerId, machine: workerMachine, key, ttlMs } = body;
+            if (typeof workerId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$/.test(workerId)
+              || typeof workerMachine !== 'string' || !workerMachine.trim()
+              || typeof ttlMs !== 'number' || !Number.isSafeInteger(ttlMs) || ttlMs <= 0 || ttlMs > MAX_POD_WORKER_TTL_MS) throw new ResourceLedgerError(400, 'invalid-pod-worker-lease');
+            requireMachine(workerMachine);
+            const stale = await currentWorkerPrimary();
+            if (stale) return stale;
+            return json(await ledger.withGuardedWorkerMutation(async () => !(await currentWorkerPrimary()),
+              () => ledger.registerPodWorker({ workerId, machine: workerMachine, key: podWorkerKey(key), ttlMs, owner })));
+          }
+          if (workerAcquire) {
+            if (scope !== 'member') throw new ResourceLedgerError(403, 'worker-consumer-required');
+            const body = podWorkerBody(await req.json());
+            const { machine: workerMachine, key, runId, attemptId, ttlMs } = body;
+            if (workerMachine !== undefined && (typeof workerMachine !== 'string' || !workerMachine.trim())) throw new ResourceLedgerError(400, 'invalid-pod-worker-lease');
+            if (typeof runId !== 'string' || !runId.trim() || typeof attemptId !== 'string' || !attemptId.trim()
+              || typeof ttlMs !== 'number' || !Number.isSafeInteger(ttlMs) || ttlMs <= 0 || ttlMs > MAX_POD_WORKER_TTL_MS) throw new ResourceLedgerError(400, 'invalid-pod-worker-lease');
+            const stale = await currentWorkerPrimary();
+            if (stale) return stale;
+            return json(await ledger.withGuardedWorkerMutation(async () => !(await currentWorkerPrimary()),
+              () => ledger.acquirePodWorker({ ...(workerMachine ? { machine: workerMachine } : {}), key: podWorkerKey(key),
+                runId, attemptId, ttlMs, owner })));
+          }
+          if (workerTransition) {
+            const workerId = decodeURIComponent(workerTransition[1]!);
+            if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$/.test(workerId)) throw new ResourceLedgerError(400, 'invalid-worker-id');
+            const action = workerTransition[2] as 'renew' | 'release' | 'sanitize' | 'quarantine';
+            if (action === 'sanitize' ? !machine : (action === 'renew' || action === 'release') && scope !== 'member') {
+              throw new ResourceLedgerError(403, 'worker-scope');
+            }
+            const body = podWorkerBody(await req.json());
+            const { leaseId, generation, ttlMs, reason } = body;
+            if (typeof leaseId !== 'string' || !leaseId || !Number.isSafeInteger(generation) || (generation as number) < 1
+              || (ttlMs !== undefined && (typeof ttlMs !== 'number' || !Number.isSafeInteger(ttlMs) || ttlMs <= 0 || ttlMs > MAX_POD_WORKER_TTL_MS))
+              || (reason !== undefined && (typeof reason !== 'string' || !reason.trim()))) throw new ResourceLedgerError(400, 'invalid-pod-worker-lease');
+            const id = `pod-worker-lease:${workerId}`;
+            requireTarget(id);
+            const stale = await currentWorkerPrimary();
+            if (stale) return stale;
+            return json(await ledger.withGuardedWorkerMutation(async () => !(await currentWorkerPrimary()),
+              () => ledger.transitionPodWorker(id, { owner, leaseId, generation: generation as number, action,
+                ...(ttlMs ? { ttlMs: ttlMs as number } : {}), ...(reason ? { reason: reason as string } : {}) })));
+          }
           if (leaseRequest) {
             const body: unknown = await req.json();
             if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ResourceLedgerError(400, 'invalid-port-lease');
@@ -144,7 +218,8 @@ export function startControlServer(opts: ControlServerOptions = {}): {
               throw new ResourceLedgerError(400, 'invalid-port-lease');
             }
             requireMachine(machine);
-            const lease = leasePort({ machine, purpose, ttlMs, owner, excluded: excluded as number[] | undefined }, ledger);
+            const lease = await ledger.withSerializedMutation(() =>
+              leasePort({ machine, purpose, ttlMs, owner, excluded: excluded as number[] | undefined }, ledger));
             return json({ port: lease.attrs.port, lease });
           }
           if (leaseRenewal || leaseDeletion) {
@@ -156,10 +231,10 @@ export function startControlServer(opts: ControlServerOptions = {}): {
             const leaseId = req.headers.get('x-port-lease-id');
             if (!leaseId) throw new ResourceLedgerError(400, 'missing-lease-id');
             if (leaseRenewal) {
-              const renewed = ledger.renewTestPort(port, owner, leaseId);
+              const renewed = await ledger.withSerializedMutation(() => ledger.renewTestPort(port, owner, leaseId));
               return json({ ...renewed, attrs: { ...renewed.attrs, leaseId: undefined } });
             }
-            ledger.deleteTestPort(port, owner, leaseId);
+            await ledger.withSerializedMutation(() => ledger.deleteTestPort(port, owner, leaseId));
             return new Response(null, { status: 204 });
           }
           if (resourcePath) {
@@ -168,19 +243,23 @@ export function startControlServer(opts: ControlServerOptions = {}): {
               machine: url.searchParams.get('machine') || undefined,
               name: url.searchParams.get('name') || undefined,
             });
-            return json({ resources: rows.map(row => row.kind === 'port-lease'
+            return json({ resources: rows.map(row => row.kind === 'pod-worker-lease'
+              ? { ...row, attrs: { key: row.attrs.key, state: row.attrs.state, generation: row.attrs.generation } }
+              : row.kind === 'port-lease'
               ? { ...row, attrs: { ...row.attrs, leaseId: undefined } }
               : row) });
           }
           if (registerPath) {
             const row = recordFromBody(await req.json(), owner);
             if (row.kind === 'port-lease' || row.id.startsWith('port-lease:')) throw new ResourceLedgerError(403, 'port-lease-requires-allocator');
+            if (row.kind === 'pod-worker-lease' || row.id.startsWith('pod-worker-lease:')) throw new ResourceLedgerError(403, 'pod-worker-requires-allocator');
             requireMachine(row.machine);
             requireTarget(row.id);
-            return json(ledger.register(row, owner));
+            return json(await ledger.withSerializedMutation(() => ledger.register(row, owner)));
           }
           if (heartbeat && method === 'POST') {
             if (decodeURIComponent(heartbeat[1]!).startsWith('port-lease:')) throw new ResourceLedgerError(403, 'port-lease-requires-allocator');
+            if (decodeURIComponent(heartbeat[1]!).startsWith('pod-worker-lease:')) throw new ResourceLedgerError(403, 'pod-worker-requires-allocator');
             const body: unknown = await req.json();
             if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ResourceLedgerError(400, 'invalid-heartbeat');
             if (machine && 'machine' in body) requireMachine((body as Record<string, unknown>).machine as string);
@@ -190,12 +269,13 @@ export function startControlServer(opts: ControlServerOptions = {}): {
             }
             const id = decodeURIComponent(heartbeat[1]!);
             requireTarget(id);
-            return json(ledger.heartbeat(id, owner, attrs as Record<string, unknown> | undefined));
+            return json(await ledger.withSerializedMutation(() => ledger.heartbeat(id, owner, attrs as Record<string, unknown> | undefined)));
           }
           if (decodeURIComponent(deletion![1]!).startsWith('port-lease:')) throw new ResourceLedgerError(403, 'port-lease-requires-allocator');
+          if (decodeURIComponent(deletion![1]!).startsWith('pod-worker-lease:')) throw new ResourceLedgerError(403, 'pod-worker-requires-allocator');
           const id = decodeURIComponent(deletion![1]!);
           requireTarget(id);
-          ledger.delete(id, owner);
+          await ledger.withSerializedMutation(() => ledger.delete(id, owner));
           return new Response(null, { status: 204 });
         } catch (err) {
           if (err instanceof ResourceLedgerError) return json({ error: err.message }, err.status);
@@ -204,7 +284,7 @@ export function startControlServer(opts: ControlServerOptions = {}): {
         }
       };
       const response = await respond();
-      if (lease?.known && lease.generation !== null) response.headers.set('x-primary-generation', String(lease.generation));
+      if (responseLease?.known && responseLease.generation !== null) response.headers.set('x-primary-generation', String(responseLease.generation));
       return response;
     },
   });

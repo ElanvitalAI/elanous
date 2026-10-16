@@ -15,19 +15,28 @@ setDefaultTimeout(60_000);
 const CORPUS_RUNNER_PATH = resolve(import.meta.dir, 'measure-nl-routing-corpus.ts');
 const resolveCorpusRunSafetyFromProcessEnv = (surfaceToolNames: readonly string[]) => resolveCorpusRunSafety(process.env, undefined, surfaceToolNames);
 
+// R4 (gate 0.2.30 pod-7·pod-42): with only PATH the child had no HOME, so os.homedir() fell back to the account's real
+// home and the runner resolved that home's provider/credentials — the measured tool surface then followed whoever ran
+// the test (a gpt-6-sol login exposes Bash, Edit, Write; a grok key or no login exposes only Bash). The child gets an
+// empty HOME and state dir of its own, so the answer is the clean machine's on every host.
 async function runCorpusRunner(env: Record<string, string>): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  const child = Bun.spawn({
-    cmd: [process.execPath, 'run', CORPUS_RUNNER_PATH],
-    cwd: import.meta.dir,
-    env: { PATH: process.env.PATH ?? '', ...env },
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-  return {
-    exitCode: await child.exited,
-    stdout: await new Response(child.stdout).text(),
-    stderr: await new Response(child.stderr).text(),
-  };
+  const home = mkdtempSync(resolve(tmpdir(), 'nl-routing-home-'));
+  try {
+    const child = Bun.spawn({
+      cmd: [process.execPath, 'run', CORPUS_RUNNER_PATH],
+      cwd: import.meta.dir,
+      env: { PATH: process.env.PATH ?? '', HOME: home, ELANOUS_STATE_DIR: resolve(home, 'state'), ...env },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    return {
+      exitCode: await child.exited,
+      stdout: await new Response(child.stdout).text(),
+      stderr: await new Response(child.stderr).text(),
+    };
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 }
 
 async function runEmptyCorpus(env: Record<string, string>, surfaceTools: readonly string[] = ['Read']): Promise<{ logs: string[]; output: Record<string, unknown>; cwds: Array<string | undefined> }> {
@@ -104,8 +113,11 @@ describe('NL routing corpus runner safety gate', () => {
       expect(result.exitCode).not.toBe(0);
       expect(result.stdout).toBe('');
       expect(result.stderr).toContain('exposed mutating tools can modify this worktree');
-      expect(result.stderr).toContain('Unprotected host mutating tools exposed: Bash, Edit, Write.');
-      expect(result.stderr).toContain('Exposed mutating tools: Bash, Edit, Write.');
+      // The child's HOME is empty, so no provider resolves and the runner measures the last-resort model (gpt-5.5 →
+      // codex family). That family edits through apply_patch, so Bash is the one host-mutating tool it exposes. The old
+      // «Bash, Edit, Write» held only on a machine whose real HOME carried a gpt-family login (gpt-6-sol).
+      expect(result.stderr).toContain('Unprotected host mutating tools exposed: Bash.');
+      expect(result.stderr).toContain('Exposed mutating tools: Bash.');
       expect(result.stderr).toContain('Known mutating tool surface: SelfImplement, Bash, Edit, Write.');
       expect(result.stderr).toContain(NL_ROUTING_UNSAFE_RUN_ENV);
     } finally {

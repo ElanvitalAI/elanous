@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { superviseRun, type SupervisorJobResult, type SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import { executeNextAction } from './actions.js';
-import { recordTaskAgentShadowMove, replayRemoteCardMoves, REMOTE_CARD_MOVE_PENDING, selectDeliveryCandidates, shadowJudgeInput } from './shadow.js';
+import { defaultPrFiles, prRepositoryFromUrl, recordTaskAgentShadowMove, replayRemoteCardMoves, REMOTE_CARD_MOVE_PENDING, selectDeliveryCandidates, shadowJudgeInput } from './shadow.js';
 import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
 
 const job = (over: Partial<SupervisorJobResult> = {}): SupervisorJobResult =>
@@ -39,6 +39,41 @@ function deliveryFixture() {
 }
 
 describe('TASK-AGENT-SHADOW — 멈춤 확정 → 판단부 → 실행부(shadow)', () => {
+  test('PR file query repository is bound to the exact PR URL, never the current checkout', async () => {
+    expect(prRepositoryFromUrl(77, 'https://github.com/owner/other-repo/pull/77')).toBe('owner/other-repo');
+    expect(prRepositoryFromUrl(77, 'https://github.com/owner/other-repo/pull/78')).toBeUndefined();
+    expect(prRepositoryFromUrl(77, undefined)).toBeUndefined();
+    const commands: string[][] = [];
+    expect(await defaultPrFiles(77, 'https://github.com/owner/other-repo/pull/77', async (args) => {
+      commands.push([...args]); return 'docs/goals/GOAL-1.md\nsrc/x.ts\n';
+    })).toEqual(['docs/goals/GOAL-1.md', 'src/x.ts']);
+    expect(commands).toEqual([['pr', 'diff', '77', '--name-only', '-R', 'owner/other-repo']]);
+  });
+  test('goal-only PR은 review·green·재큐 없이 사유와 target diff 0을 런 원장에 남긴다', async () => {
+    const card: TaskCard = { id: 'ta-goal-only', runId: 'run-goal-only', text: 'implement feature', createdAt: '', status: 'launched', history: [],
+      pr: { number: 77, url: 'https://github.com/owner/bound-repo/pull/77' } };
+    const entries: RunLedgerEntry[] = [];
+    const queried: Array<[number, string | undefined]> = [];
+    const deps = { readCard: () => card, env: {}, log: () => {}, liveMoves: new Set(['review', 'propose-green'] as const),
+      prFiles: async (pr: number, url: string | undefined) => { queried.push([pr, url]); return ['docs/goals/GOAL-feature.md']; },
+      queueMove: (entry: RunLedgerEntry) => { entries.push(entry); } };
+    for (const [stopReason, merged] of [['needs-human', false], ['converged', true], ['no-progress', false]] as const) {
+      const out = await recordTaskAgentShadowMove({ runId: 'run-goal-only', stopReason,
+        results: [job({ taskId: card.id, ok: true, worktreePath: '/repo', prNumber: 77, merged })] }, deps);
+      expect(out.move).toBe('wait');
+      expect(out.executorKind).toBeNull();
+      expect(out.liveMove).toBeUndefined();
+    }
+    expect(entries).toHaveLength(3);
+    expect(queried).toEqual(Array(3).fill([77, 'https://github.com/owner/bound-repo/pull/77']));
+    expect(entries[0]).toMatchObject({ event: 'task-agent-goal-only-pr', data: { pr: 77,
+      paths: ['docs/goals/GOAL-feature.md'], targetDiff: 0, requeue: 'stopped' } });
+    const mixed = await recordTaskAgentShadowMove({ runId: 'run-goal-only', stopReason: 'needs-human',
+      results: [job({ taskId: card.id, ok: true, worktreePath: '/repo', prNumber: 78 })] }, {
+      ...deps, prFiles: async () => ['docs/goals/GOAL-feature.md', 'src/feature.ts'],
+    });
+    expect(mixed.move).toBe('review');
+  });
   test('새 파일만 종류별로 선택하고 caller 는 shadow 에서 복사 없이 경로를 남긴다', async () => {
     const { worktree, target, card } = deliveryFixture();
     expect(selectDeliveryCandidates(worktree, 'research-report')).toEqual(['report.md']);
@@ -492,7 +527,8 @@ describe('종결 종류를 판단부 입력·shadow-move 관측에 싣는다 (RF
     const { worktree } = deliveryFixture();
     const logged: Array<Record<string, unknown>> = [];
     const out = await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
-      readCard: () => { throw new Error('state unreadable'); }, log: (_c, _e, data) => { logged.push(data); },
+      // HQ(비-Pod) 판단을 단언한다 — 게이트 Pod 의 ELANOUS_POD_NAME 이 새어 «원격 자식»으로 읽히지 않게 env 를 못 박는다(#28308 과 같은 원인).
+      readCard: () => { throw new Error('state unreadable'); }, log: (_c, _e, data) => { logged.push(data); }, env: {},
     });
     expect(out.move).toBe('wait');
     expect(out.reason).toBe('완주했으나 PR 병합 근거 대기 · 종결 종류 미확인(카드 조회 실패)');

@@ -115,14 +115,16 @@ test('ops preserves operational facts including unreadable; invalid topic throws
   expect(() => dispatchReleaseStatus({ topic: 'weather' }, fixture())).toThrow('topic 은 status, features, cell, schedule, ops 중 하나');
 });
 
-test('a simultaneous topic and action throws one error naming both before any read; action-only and topic-only keep their response shapes', () => {
+test('topic=features beside an action throws one error naming both before any read; other topics yield to the action; action-only and topic-only keep their response shapes', () => {
   const rejected = fixture({ checklist: () => { throw new Error('원장을 읽으면 안 됩니다'); } });
   for (const action of ['schedule', 'blocked', 'landed'] as const) {
     expect(() => dispatchReleaseStatus({ topic: 'features', action }, rejected))
       .toThrow('topic 과 action 을 동시에 쓸 수 없습니다 — 둘 중 하나만: topic=features 는 피처 목록 · action 은 짧은 요약');
   }
-  expect(() => dispatchReleaseStatus({ topic: 'ops', action: 'landed' }, fixture({ contextNow: () => { throw new Error('관측을 읽으면 안 됩니다'); } })))
-    .toThrow('topic 과 action 을 동시에 쓸 수 없습니다 — 둘 중 하나만: topic=features 는 피처 목록 · action 은 짧은 요약');
+  // A non-features topic beside an action answers the action (topic ignored, one warning line) — #70b.
+  const opsLanded = dispatchReleaseStatus({ topic: 'ops', action: 'landed' }, fixture({ mergedPrsLast24h: () => 1, contextNow: () => { throw new Error('관측을 읽으면 안 됩니다'); } }));
+  expect(opsLanded.text.split('\n')[0]).toBe('topic(ops) 은 무시하고 action 으로 답함');
+  expect(opsLanded.structured).toMatchObject({ mergedPrsLast24h: 1, ignoredTopic: 'ops' });
   const deps = fixture({ checklist: v => data(v, [item('Y', 'yellow')]) });
   const actionOnly = dispatchReleaseStatus({ action: 'blocked' }, deps);
   expect(actionOnly.text).toBe('막힌 칸 없음');

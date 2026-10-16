@@ -2,7 +2,7 @@
 // Integrates into the dashboard log pane as an inline chat
 
 import { getGrokApiKey, GROK_MODEL, GROK_API_URL } from '../config.js';
-import { C, ansi, KeyStreamParser, readKey, traceKey, traceKeyListener, termSize, pad, visibleWidth, stripAnsi, truncate, render, hLine, closeTui, resetRenderCache, invalidateRenderCacheFromRow, injectKey } from '../tui.js';
+import { C, ansi, KeyStreamParser, readKey, traceKey, traceKeyListener, termSize, pad, visibleWidth, stripAnsi, truncate, render, hLine, closeTui, resetRenderCache, invalidateRenderCacheFromRow, injectKey, takeInjectedKeys, cancelPendingReadKey } from '../tui.js';
 import { paintCursorMove, paintCursorVisibility, type CursorState } from '../display/cursor-state.js';
 import { firstVisibleInputLineIdx, inputLineWindow } from '../display/prompt-frame.js';
 import { createChatPickerFamilySource, createChatPickerFamilySources } from './pickers/modals.js';
@@ -248,6 +248,8 @@ export interface TextInputRenderActions {
   repaintUserMutation: () => void;
 }
 
+/** Prefix painted in place of the prompt on input continuation rows. */
+const TEXT_INPUT_CONTINUATION_PREFIX = '  \u00B7 ';
 const TEXT_INPUT_CURSOR_PROTOCOL_ENABLE = '\x1b[>1u\x1b[>4;2m';
 const TEXT_INPUT_CURSOR_PROTOCOL_DISABLE = '\x1b[<u\x1b[>4;0m';
 const SYNCHRONIZED_OUTPUT_BEGIN = '\x1b[?2026h';
@@ -678,6 +680,20 @@ export interface InputResult {
    *  similar. textInput itself doesn't act on the chord beyond
    *  returning — the host decides. */
   saved?: boolean;
+  /** H2 내부 턴 문 — 입력칸이 «비켜 줬다»(버퍼가 비어 있었다). 텍스트 없음 · 제출 아님. 호스트는
+   *  내부 턴 문(`InternalTurnGate.takePending`)에서 실행할 턴을 꺼낸다. */
+  yieldedToInternalTurn?: true;
+}
+
+/** H2 내부 턴 문이 마운트된 textInput 에 «비켜 달라»를 청하는 자리.
+ *  ⛔ 입력칸 버퍼·합성 키를 쓰지 않는다 — textInput 은 버퍼가 «비었을 때만» 스스로 물러난다. */
+export interface TextInputInternalTurnYieldPort {
+  /** textInput 이 마운트되면 부른다. 넘긴 함수는 버퍼가 비었으면 true(물러남 예약), 아니면 false. */
+  attach(requestYield: () => boolean): void;
+  /** textInput 이 내려가면 부른다. `yielded` 가 아니면 열린 내부 턴은 거둬진다(사람이 먼저 끝냈다). */
+  detach(opts?: { yielded?: boolean }): void;
+  /** 물러남을 예약한 뒤 그 사이 사람이 글자를 넣어 «물러나지 않았다». */
+  declined?(detail: string): void;
 }
 
 export interface TextInputExternalSubmitRequest {
@@ -895,6 +911,8 @@ export async function textInput(opts: {
    *  side-effect boundary instead of a flat callback bag. Legacy
    *  fields above remain supported for compatibility/tests. */
   host?: TextInputHost;
+  /** H2 내부 턴 문 — 버퍼가 비었을 때 입력 루프가 물러나 호스트가 내부 턴을 실행하게 한다. */
+  internalTurnYield?: TextInputInternalTurnYieldPort;
 }): Promise<InputResult> {
   const { row: initialRow, col, width, maxLines = 5, prompt = '\u276f ', placeholder = '' } = opts;
   const getWidth = (): number => opts.getWidth?.() ?? width;
@@ -907,7 +925,8 @@ export async function textInput(opts: {
   setInputPromptStartRow(row);
   const commands = opts.commands ?? SLASH_COMMANDS;
   const history = opts.history ?? [];
-  let lines: string[] = [opts.initialText ?? ''];
+  // 턴 중 typeahead 가 Shift+Enter 로 만든 여러 줄 prefill 은 줄 단위로 연다.
+  let lines: string[] = (opts.initialText ?? '').split('\n');
   // Line-count reporting: only fires when the visible count actually
   // changes, so hosts don't re-render on every keystroke.
   const resolvedHost = resolveTextInputHost(opts);
@@ -915,8 +934,8 @@ export async function textInput(opts: {
   const onLinesChangeHandler = resolvedHost.onLinesChange;
   const dispatchGlobalAction = resolvedHost.dispatchGlobalAction;
   let lastReportedLines = -1;
-  let lineIdx = 0;   // current line
-  let colIdx = lines[0]!.length;  // cursor at end of initial text
+  let lineIdx = lines.length - 1;   // current line
+  let colIdx = lines[lineIdx]!.length;  // cursor at end of initial text
   let ctrlCArmedAt: number | null = null;
   let ctrlCHintTimer: ReturnType<typeof setTimeout> | null = null;
   let ctrlCHint: string | null = null;
@@ -1134,7 +1153,12 @@ export async function textInput(opts: {
     setInputPromptStartRow(row);
     const promptStr = C.accent(prompt);
     const promptW = visibleWidth(prompt);
-    const textW = Math.max(0, getWidth() - promptW - 1);
+    // Continuation rows carry a 4-cell `  · ` prefix instead of the prompt,
+    // so each row gets its own text width — sharing the first row's width
+    // let continuation rows overrun the terminal by `contPfxW - promptW` cells.
+    const contPfxW = visibleWidth(TEXT_INPUT_CONTINUATION_PREFIX);
+    const textWFor = (idx: number): number =>
+      Math.max(0, getWidth() - (idx === 0 ? promptW : contPfxW) - 1);
     const numLines = lines.length;
     // Visible window: at most `maxLines` rows on screen, but the buffer
     // (`lines`) may exceed that. `firstVisibleIdx` keeps the cursor's
@@ -1177,16 +1201,17 @@ export async function textInput(opts: {
       if (i < visibleLines) {
         const lineIdxInArray = firstVisibleIdx + (visibleLines - 1 - i);
         const lineContent = lines[lineIdxInArray]!;
-        const pfx = lineIdxInArray === 0 ? promptStr : C.muted('  ' + '\u00B7' + ' ');
+        const pfx = lineIdxInArray === 0 ? promptStr : C.muted(TEXT_INPUT_CONTINUATION_PREFIX);
+        const rowTextW = textWFor(lineIdxInArray);
         const display = lineIdxInArray === 0 && numLines === 1 && !lineContent
-          ? truncate(C.muted(placeholder), Math.max(0, textW))
+          ? truncate(C.muted(placeholder), Math.max(0, rowTextW))
           : inputLineWindow(
             lineContent,
             lineIdxInArray === lineIdx ? colIdx : lineContent.length,
-            textW,
+            rowTextW,
           ).display;
 
-        const padded = display + ' '.repeat(Math.max(0, textW - visibleWidth(display)));
+        const padded = display + ' '.repeat(Math.max(0, rowTextW - visibleWidth(display)));
         writeTerminal(ansi.moveTo(r, col) + '\x1b[2K' + pfx + padded);
       } else {
         // This row had content on the previous paint but doesn't anymore
@@ -1216,8 +1241,8 @@ export async function textInput(opts: {
       Math.min(lineIdx - firstVisibleIdx, visibleLines - 1),
     );
     const curR = row - (visibleLines - 1 - cursorScreenLine);
-    const pfxW = lineIdx === 0 ? visibleWidth(prompt) : 4;
-    const { cursorCol } = inputLineWindow(lines[lineIdx]!, colIdx, textW);
+    const pfxW = lineIdx === 0 ? visibleWidth(prompt) : contPfxW;
+    const { cursorCol } = inputLineWindow(lines[lineIdx]!, colIdx, textWFor(lineIdx));
     const curX = col + pfxW + cursorCol;
     // P2.2.c — coordinator owns the cursor emit when wired; falls
     // back to direct stdout for non-coordinator callers (tests, non-dashboard
@@ -1382,6 +1407,7 @@ export async function textInput(opts: {
   const finalizeInput = (result: InputResult): InputResult => {
     // 외부 주입 라우터가 «composer 가 안 떠 있다»를 알 수 있게 내린다.
     if (hostControl) hostControl.getBufferText = undefined;
+    detachInternalTurnYield(result.yieldedToInternalTurn === true);
     clearPicker();
     writeTerminal(endTextInputCursor(opts.cursorSink));
     return result;
@@ -1454,9 +1480,34 @@ export async function textInput(opts: {
     };
   }
 
+  // ⭐ H2 내부 턴 문 — 버퍼가 비었을 때만 물러남을 예약하고 걸린 readKey 를 «빈 키»로 깨운다.
+  //   ⛔ 버퍼·커서·키 큐는 건드리지 않는다(대표 비침투). 마운트가 끝나면(어느 반환 길이든) 무효다.
+  let internalYieldRequested = false;
+  let internalYieldMounted = true;
+  function detachInternalTurnYield(yielded = false): void {
+    if (!internalYieldMounted) return;
+    internalYieldMounted = false;
+    internalYieldRequested = false;
+    opts.internalTurnYield?.detach({ yielded });
+  }
+  opts.internalTurnYield?.attach(() => {
+    if (!internalYieldMounted || lines.join('\n').length > 0) return false;
+    internalYieldRequested = true;
+    cancelPendingReadKey();
+    return true;
+  });
+
   drawAll();
 
   while (true) {
+    if (internalYieldRequested) {
+      internalYieldRequested = false;
+      if (lines.join('\n').length === 0) {
+        return finalizeInput({ text: '', submitted: false, yieldedToInternalTurn: true });
+      }
+      // 판정과 물러남 사이에 사람이 글자를 넣었다 — 사람이 먼저다.
+      opts.internalTurnYield?.declined?.('buffer');
+    }
     // IDX-F2.5 — picker.onKey may have set pendingSubmit on the
     // previous iteration (the closure can't return from textInput
     // itself). Consume the signal at the top of the loop, tear
@@ -1471,6 +1522,7 @@ export async function textInput(opts: {
     }
 
     const key = await (opts.readKey ?? (() => readKey('input')))();
+    if (internalYieldRequested && !key.name) continue; // H2 — 내부 턴 문이 깨운 빈 키
     traceAfterSubmitKey(key);
 
     // Raw-key trace — diagnoses "modifier bit dropped before global-action
@@ -1671,6 +1723,7 @@ export async function textInput(opts: {
         // input loop exits cleanly and the dashboard's pane dispatcher
         // picks up the keys.
         if (hostControl) hostControl.getBufferText = undefined;
+        detachInternalTurnYield();
         return { text: '', submitted: false, gotoPane: true };
       }
       drawAll();
@@ -2001,8 +2054,18 @@ export function attachStreamingKeys(
   //    ⭐ 창 길이는 `readKey` 와 같은 25ms — 두 진입점이 같은 규칙을 쓴다.
   let escapeTimer: ReturnType<typeof setTimeout> | undefined;
   const clearEscapeTimer = () => { if (escapeTimer) { clearTimeout(escapeTimer); escapeTimer = undefined; } };
+  // ⭐ TUI-ESC-ABORT-TOOLS (2026-10-15) — 바깥 키(`pty key` · 제어 IPC input-key)는 stdin 이
+  //    아니라 `injectKey` 큐로 들어오고 빈 청크로 깨울 뿐이다. 이 리스너가 큐를 안 보면 턴 중
+  //    Esc 가 escGate 에 닿지 않고 다음 readKey(턴 끝)까지 잠든다. 주입이 먼저 왔으므로 먼저 배달한다.
+  const deliverInjected = () => {
+    const injected = takeInjectedKeys();
+    if (injected.length === 0) return;
+    for (const key of injected) debug.log('tui.input', 'injected-key-stream-delivered', { key: key.name });
+    deliver(injected);
+  };
   const listener = (data: string | Buffer) => {
     clearEscapeTimer();
+    deliverInjected();
     const keys = parser.push(data);
     deliver(keys);
     // ⚠️ `unref()` — 이 타이머가 프로세스를 붙잡아 두면 안 된다(입력 대기는 stdin 의 몫).
@@ -2033,6 +2096,9 @@ export function attachStreamingKeys(
   // leaves streaming typeahead and lone Escape with no events at all.
   process.stdin.resume();
   traceKeyListener('attach', 'stream');
+  // 턴 시작 «전»에 주입돼 큐에 남은 키도 배달한다 — 마이크로태스크로 미뤄 호출자가 cleanup 을
+  // 손에 쥔 뒤에 handler 가 불리게 한다.
+  queueMicrotask(() => { if (!cleanedUp) deliverInjected(); });
   return () => {
     if (cleanedUp) return;
     cleanedUp = true;

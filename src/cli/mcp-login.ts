@@ -91,9 +91,8 @@ export async function runMcpLogin(opts: McpLoginOpts): Promise<McpLoginResult> {
     const discovered = await discoverMcpOAuth(challenge.resourceMetadata, {
       resourceUrl: spec.url, ...oauthOpts,
     });
-    if ((why || !discovered.metadata.authorizationEndpoint) && discovered.metadata.deviceAuthorizationEndpoint) {
-      if (early?.server.listening) await closeServer(early.server);
-      if (why) out.log(why);
+    const loginWithDevice = async (): Promise<McpLoginResult> => {
+      if (server?.listening) await closeServer(server);
       const stored = loadStoredRegistration(discovered.metadata.issuer, oauthOpts);
       const deviceRegistration = await ensureClientRegistration(discovered.metadata, { ...oauthOpts, deviceCode: true });
       const authorizeDevice = (registration: typeof deviceRegistration) => authorizeMcpDevice(discovered.metadata, registration, {
@@ -119,6 +118,10 @@ export async function runMcpLogin(opts: McpLoginOpts): Promise<McpLoginResult> {
       out.log(`✓ credentials saved for '${opts.serverId}' (${discovered.metadata.issuer})`);
       persistLoginDiscovery(opts, discovered.metadata, out);
       return { exitCode: 0 };
+    };
+    if ((why || !discovered.metadata.authorizationEndpoint) && discovered.metadata.deviceAuthorizationEndpoint) {
+      if (why) out.log(why);
+      return await loginWithDevice();
     }
     const callbackListener = early ?? await listenForCallback(opts.createListener, 0);
     server = callbackListener.server;
@@ -170,7 +173,17 @@ export async function runMcpLogin(opts: McpLoginOpts): Promise<McpLoginResult> {
         }
       }
     }
-    const callback = await callbackPromise;
+    let callback: Callback;
+    try {
+      callback = await callbackPromise;
+    } catch (error) {
+      // A missing browser callback can use the advertised device flow. An explicit
+      // denial, mismatched state, or malformed callback must never silently fall back.
+      if (!discovered.metadata.deviceAuthorizationEndpoint ||
+          !/^authorization callback timed out after \d+ms$/.test(error instanceof Error ? error.message : '')) throw error;
+      out.log(`Browser approval did not complete for '${opts.serverId}'; trying device code.`);
+      return await loginWithDevice();
+    }
     await exchangeAuthorizationCode(authorization.metadata, authorization.request, callback, oauthOpts);
     out.log(`✓ credentials saved for '${opts.serverId}' (${authorization.metadata.issuer})`);
     persistLoginDiscovery(opts, authorization.metadata, out);
@@ -424,7 +437,10 @@ async function listenForCallback(
       }
       settle = resolve;
       reject = rejectWait;
-      const timer = setTimeout(() => rejectWait(new Error(`authorization callback timed out after ${timeoutMs}ms`)), timeoutMs);
+      const timer = setTimeout(() => {
+        completed = true;
+        settleCallback(new Error(`authorization callback timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
       (timer as unknown as { unref?: () => void }).unref?.();
       // ⛔ 성공·실패 어느 쪽으로 끝나든 타이머를 «반드시» 거둔다.
       clearWaitTimer = () => clearTimeout(timer as unknown as ReturnType<typeof setTimeout>);

@@ -16,7 +16,8 @@ const ESSENTIAL_KEYS = [
   ['Home / End', 'Move to start / end of line'],
   ['Ctrl+A / E', 'Move to start / end of line'],
   ['PgUp / PgDn', 'Scroll chat log'],
-  ['Ctrl+↑', 'Recall a queued line (Enter while answering queues it)'],
+  // 10-14 — 줄 수는 그대로(행 예산) · 큐는 다음 도구 경계에 들어가고, 빈 Enter 가 «지금 밀어 넣기»다.
+  ['Ctrl+↑', 'Recall all queued lines (Enter while answering queues · empty Enter pushes now)'],
 ] as const;
 
 function fitLine(text: string, width: number): string {

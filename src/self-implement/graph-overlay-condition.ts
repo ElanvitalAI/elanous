@@ -1,4 +1,10 @@
 import type { RunStopClass } from './run-stop.js';
+import type { RunContract } from './graph-run-contract.js';
+import type { GateRoutingReason } from './graph-authority.js';
+import { landingFreezeState, type LandingFreeze } from '../release-loop/landing-freeze.js';
+import type { ActiveProviderInfo } from '../provider-summary.js';
+import type { ResourceView } from '../control-plane/ledger.js';
+import type { UserConfig } from '../user-config.js';
 
 /** ⭐ RFC §5 «4단계» — `applies_when` 을 «코드»가 판정한다.
  *
@@ -33,9 +39,29 @@ export function parseOverlayCondition(source: string): OverlayConditionParse {
   return { ok: true, condition: { key: key!, operator: operator as OverlayConditionOperator, literal } };
 }
 
+/** L1 values are producer observations; an unobserved field is absent, never a default. */
+export interface GraphRunState {
+  readonly attempts: number;
+  readonly goal_id?: string;
+  readonly stop_class?: RunStopClass;
+  readonly review_repeat?: number;
+  readonly sibling_overlap?: boolean;
+  readonly main_sync_conflict?: boolean;
+  readonly author_grade?: string;
+  readonly substrate?: 'local' | 'pod';
+  readonly freeze?: 'on' | 'off';
+  readonly docs_only?: boolean;
+  readonly provider?: string;
+  readonly quota?: 'ok' | 'low' | 'exhausted';
+  readonly machines?: number;
+  readonly seats?: 'on' | 'steward-only';
+}
+
 /** Inputs known at a runtime overlay decision. Every field except `attempts` may be unknown. */
 export interface RuntimeOverlayStateInput {
   readonly attempts: number;
+  /** Producer results captured for this decision; omitted in callers not yet wired to L1. */
+  readonly producers?: L1OverlayProducerReadings;
   readonly goalId?: string;
   readonly stopClass?: RunStopClass;
   readonly reviewRepeat?: number;
@@ -44,10 +70,68 @@ export interface RuntimeOverlayStateInput {
   readonly mainSyncConflict?: unknown;
   /** Only a non-empty string is a measurement. */
   readonly authorGrade?: unknown;
+  /** Pass resolved producer values, not configuration wishes or fallback guesses. */
+  readonly substrate?: unknown;
+  /** Derived from readLandingFreeze's validated, expiry-aware result. */
+  readonly freeze?: unknown;
+  readonly docsOnly?: unknown;
+  readonly provider?: unknown;
+  readonly quota?: unknown;
+  readonly machines?: unknown;
+  readonly seats?: unknown;
+}
+
+/** Producer outputs supplied at the decision boundary; omission means the producer was not read. */
+export interface L1OverlayProducerReadings {
+  readonly runContract?: Pick<RunContract, 'substrate'>;
+  readonly landingFreeze?: LandingFreeze | null;
+  /** routeGate's documents-only verdict is the known docs-only observation. */
+  readonly gateRoute?: { readonly reason: GateRoutingReason };
+  readonly activeProvider?: Pick<ActiveProviderInfo, 'provider'>;
+  /** Snapshot returned by assessQuotaExhaustion/readQuotaExhausted; only measured usage implies ok/low. */
+  readonly quotaAssessment?: { readonly exhausted: boolean | undefined; readonly accountAvailability: {
+    readonly currentUsedPercent?: number;
+    readonly thresholdPercent?: number;
+  } | undefined };
+  /** Result of listMachineResources (Nexus live membership), not fleet intent. */
+  readonly machineResources?: readonly Pick<ResourceView, 'machine' | 'expired'>[];
+  /** Resolved loop modes; do not pass an unreadable config as a default measurement. */
+  readonly seatConfig?: NonNullable<UserConfig['loops']>['seat'];
+  readonly stewardConfig?: NonNullable<UserConfig['loops']>['steward'];
+}
+
+/** Derive only observations from named producers. A missing producer never becomes false or zero. */
+export function l1OverlayStateInput(readings: L1OverlayProducerReadings): Omit<RuntimeOverlayStateInput, 'attempts'> {
+  const quota = readings.quotaAssessment;
+  const currentUsed = quota?.accountAvailability?.currentUsedPercent;
+  const threshold = quota?.accountAvailability?.thresholdPercent;
+  const seat = readings.seatConfig;
+  return {
+    ...(readings.runContract ? { substrate: readings.runContract.substrate } : {}),
+    ...(readings.landingFreeze !== undefined ? { freeze: landingFreezeState(readings.landingFreeze) } : {}),
+    ...(readings.gateRoute ? { docsOnly: readings.gateRoute.reason === 'documents-only' } : {}),
+    ...(readings.activeProvider ? { provider: readings.activeProvider.provider } : {}),
+    ...(quota?.exhausted === true ? { quota: 'exhausted' } :
+      quota?.exhausted === false && currentUsed !== undefined && threshold !== undefined
+        ? { quota: currentUsed >= threshold ? 'low' : 'ok' } : {}),
+    ...(readings.machineResources ? { machines: new Set(readings.machineResources.filter((row) => !row.expired).map((row) => row.machine)).size } : {}),
+    ...(seat && readings.stewardConfig?.mode === 'live'
+      ? { seats: seat.mode === 'on' || seat.mode === 'live-safe' ? 'on' : 'steward-only' }
+      : {}),
+  };
 }
 
 /** ⛔ 아는 값만 싣는다 — 모르면 키를 «뺀다». 0·false·빈 문자열을 지어내지 않는다. */
-export function buildRuntimeOverlayState(input: RuntimeOverlayStateInput): Record<string, unknown> {
+export function buildRuntimeOverlayState(input: RuntimeOverlayStateInput): GraphRunState & Record<string, unknown> {
+  const produced: Omit<RuntimeOverlayStateInput, 'attempts'> = input.producers === undefined ? {} : l1OverlayStateInput(input.producers);
+  // Once producers are supplied, even an omitted reading is unknown; direct legacy inputs cannot override it.
+  const substrate = input.producers === undefined ? input.substrate : produced.substrate;
+  const freeze = input.producers === undefined ? input.freeze : produced.freeze;
+  const docsOnly = input.producers === undefined ? input.docsOnly : produced.docsOnly;
+  const provider = input.producers === undefined ? input.provider : produced.provider;
+  const quota = input.producers === undefined ? input.quota : produced.quota;
+  const machines = input.producers === undefined ? input.machines : produced.machines;
+  const seats = input.producers === undefined ? input.seats : produced.seats;
   return {
     attempts: input.attempts,
     ...(input.goalId === undefined ? {} : { goal_id: input.goalId }),
@@ -56,6 +140,13 @@ export function buildRuntimeOverlayState(input: RuntimeOverlayStateInput): Recor
     ...(typeof input.siblingOverlap === 'boolean' ? { sibling_overlap: input.siblingOverlap } : {}),
     ...(typeof input.mainSyncConflict === 'boolean' ? { main_sync_conflict: input.mainSyncConflict } : {}),
     ...(typeof input.authorGrade === 'string' && input.authorGrade.length > 0 ? { author_grade: input.authorGrade } : {}),
+    ...(substrate === 'local' || substrate === 'pod' ? { substrate } : {}),
+    ...(freeze === 'on' || freeze === 'off' ? { freeze } : {}),
+    ...(typeof docsOnly === 'boolean' ? { docs_only: docsOnly } : {}),
+    ...(typeof provider === 'string' && provider.trim().length > 0 ? { provider } : {}),
+    ...(quota === 'ok' || quota === 'low' || quota === 'exhausted' ? { quota } : {}),
+    ...(typeof machines === 'number' && Number.isSafeInteger(machines) && machines >= 0 ? { machines } : {}),
+    ...(seats === 'on' || seats === 'steward-only' ? { seats } : {}),
   };
 }
 

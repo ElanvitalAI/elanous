@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -9,13 +10,13 @@ export interface CutBranchOptions { version: string; base: string; pick: string[
 
 // git-spawn-allow: release branch operations happen only in an isolated temporary worktree; main is never checked out or changed.
 function git(repo: string, args: string[]): string {
-  const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+  const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   if (result.status !== 0 || result.error) throw new Error(`git ${args[0]} failed: ${(result.stderr || result.error || result.stdout || 'no output').toString().trim()}`);
   return result.stdout.trim();
 }
 
 function ancestor(repo: string, sha: string, ref: string): boolean {
-  const result = spawnSync('git', ['merge-base', '--is-ancestor', sha, ref], { cwd: repo });
+  const result = spawnSync('git', ['merge-base', '--is-ancestor', sha, ref], { cwd: repo, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   if (result.status !== 0 && result.status !== 1) throw new Error(`git merge-base failed: ${result.error || result.stderr || 'unknown'}`);
   return result.status === 0;
 }
@@ -41,7 +42,7 @@ export function cutReleaseBranch(opts: CutBranchOptions): { branch: string; comm
     const remoteLine = git(repo, ['ls-remote', '--heads', 'origin', `refs/heads/${branch}`]);
     if (remoteLine && !opts.append) throw new Error(`${branch} already exists on origin — use --append to fast-forward more picks onto it`);
     if (!remoteLine && opts.append) throw new Error(`${branch} does not exist on origin — omit --append to create it`);
-    if (spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: repo }).status === 0) throw new Error(`${branch} already exists locally`);
+    if (spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: repo, maxBuffer: SPAWN_SYNC_MAX_BUFFER }).status === 0) throw new Error(`${branch} already exists locally`);
     let remoteTip: string | undefined;
     if (opts.append) {
       const advertised = remoteLine.split(/\s+/)[0] ?? '';

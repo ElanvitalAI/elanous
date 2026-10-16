@@ -1,5 +1,4 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
 
 import {
   composeDashboardFrameWithCoordinatorModal,
@@ -10,6 +9,7 @@ import { createEscAbortGate } from '../src/esc-abort-gate.js';
 import { DisplayCoordinator } from '../src/display/coordinator.js';
 import { DEFAULT_THEME_TOKENS } from '../src/theme/tokens.js';
 import type { RenderOptions } from '../src/tui.js';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
 const frameInput: DashboardFrameInput = {
   overlay: '',
@@ -114,7 +114,7 @@ describe('ESC abort confirmation composed-screen visibility', () => {
   });
 
   test('showDashboard frame flush composes coordinator modals before rendering', () => {
-    const source = readFileSync(new URL('../src/dashboard/index.ts', import.meta.url), 'utf8');
+    const source = tuiSourceText();
     const showDashboardAt = source.indexOf('export async function showDashboard(');
     const frameFlush = source.indexOf('renderDashboardFrame(baseLines, composeDashboardFrameWithCoordinatorModal(display, {', showDashboardAt);
 

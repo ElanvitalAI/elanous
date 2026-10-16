@@ -2,12 +2,14 @@ import { expect, setDefaultTimeout, spyOn, test } from 'bun:test';
 import { execFile } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { debug } from '../debug/log.js';
 import { openSurfaceEventsDb, recordEvent } from '../domains/surface-events.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
-import { resolveSeat } from '../seat-address/seat-address.js';
+import { setGitCommandRunnerForTesting } from '../git-fs/runner.js';
+import { installedCliArgv, resolveHqLaunchSeat } from '../hq/seats.js';
+import { registeredSeats, resolveSeat } from '../seat-address/seat-address.js';
 import * as runningRunsModule from '../self-implement/running-runs.js';
 import { dispatchHook } from '../hooks/dispatch.js';
 import { openMsgStore } from '../msg/msg-store.js';
@@ -15,13 +17,14 @@ import { answerCrossCheck, askSeat, hasSeatAnswer, seatCrossChecks, seatQuestion
 import * as checklistModule from '../release-loop/checklist.js';
 import { listChecklist, setItem } from '../release-loop/checklist.js';
 import { importJson } from '../release-loop/feature-store.js';
-import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
+import { getElanousConfigDirOverride, setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
 import type { Checklist } from '../release-loop/checklist.js';
 import { buildUserConfig, parseEventsConfig } from '../user-config.js';
 import { PersonaRegistry } from '../persona/registry.js';
 import { writePersonaTodos } from '../persona/persona-todo.js';
-import { FORBID_JUDGMENT_LINE, alreadyHandled, gatherSeatInputs, personaShadowLedgerPath, pickNext, planAction, runPersonaLoopOnce, runSeatLoopOnce, runSeatLoopTurn, seatLedgerPath, seatLoopTickLine, seatTargetPaths, seatTaskText, type SeatDeps, type SeatItem } from './seat-loop.js';
+import { FORBID_JUDGMENT_LINE, alreadyHandled, gatherSeatInputs, personaShadowLedgerPath, pickNext, planAction, runPersonaLoopOnce, runSeatLoopOnce, runSeatLoopTurn, seatLedgerPath, seatLoopLaunchCommand, seatLoopLaunchSeat, seatLoopTickLine, seatTargetPaths, seatTaskText, type SeatDeps, type SeatItem } from './seat-loop.js';
 import { parseAskTargetPathHints } from '../self-dev/launch-preflight.js';
+import { SEAT_PACK_TOTAL_BUDGET_CHARS } from './seat-knowhow.js';
 // The owner mark is assembled at runtime so the public export carries no literal (LEAK1).
 const CEO = '\u{1F451}';
 
@@ -1540,13 +1543,14 @@ test('unreadable checklist logs the version and does not block another open vers
   } finally { spy.mockRestore(); f.close(); }
 });
 
-test('role excerpt is at most 4,000 characters', async () => {
+test('role charter loads in full — 4,000-char cut abolished, overall seat-pack budget applies', async () => {
   const f = fixture();
   try {
     mkdirSync(join(f.root, 'docs', 'roles'), { recursive: true });
     writeFileSync(join(f.root, 'docs', 'roles', 'TC.md'), 'T'.repeat(5000));
     const inputs = await gatherSeatInputs('TC', f.deps);
-    expect(inputs.role).toBe('T'.repeat(4000));
+    expect(inputs.role).toBe('T'.repeat(5000));
+    expect(inputs.role.length).toBeLessThanOrEqual(SEAT_PACK_TOTAL_BUDGET_CHARS);
     expect(inputs).not.toHaveProperty('seat');
   } finally { f.close(); }
 });
@@ -2522,4 +2526,88 @@ test('AUTO-TARGET: items without path fragments and request items keep the old o
 test('AUTO-TARGET: paths are deduplicated, capped at six, refuse `..` and drop trailing punctuation', () => {
   const evidence = 'src/x.ts. src/x.ts src/../etc/passwd ' + Array.from({ length: 8 }, (_, i) => `src/f${i}.ts`).join(' ');
   expect(seatTargetPaths({ ...targetItem, evidence }, () => true)).toEqual(['src/x.ts', 'src/f0.ts', 'src/f1.ts', 'src/f2.ts', 'src/f3.ts', 'src/f4.ts']);
+});
+
+// HQ-STEW option A: seatLoopLaunchSeat / seatLoopLaunchCommand / defaultRun start every seat
+// with installedCliArgv and cwd=resolveHqLaunchSeat(seats/<role>), refusing a source-tree fallback.
+const sourceTree = resolve(import.meta.dir, '../..');
+const installedEntry = resolve(import.meta.dir, '../../bin/elanous.mjs');
+
+test('seatLoopLaunchCommand starts every registry seat with installedCliArgv in seats/<role> and refuses a source-tree fallback', () => {
+  const temp = realpathSync(mkdtempSync(join(tmpdir(), 'seat-loop-launch-house-')));
+  const home = join(temp, 'home');
+  const house = join(temp, 'registered-house');
+  const hqRoot = join(home, 'elanous-hq');
+  const repo = join(hqRoot, 'repo.git');
+  const seats = registeredSeats().map(({ id }) => id);
+  mkdirSync(house, { recursive: true });
+  mkdirSync(repo, { recursive: true });
+  for (const seat of seats) mkdirSync(join(hqRoot, 'seats', seat), { recursive: true });
+  writeFileSync(join(hqRoot, 'house.json'),
+    `${JSON.stringify({ home: { kind: 'home', path: house, source: 'cli-resolved' }, sandboxes: {} }, null, 2)}\n`);
+  setGitCommandRunnerForTesting((_cwd, args) => {
+    const command = args.join(' ');
+    if (command === 'rev-parse --is-bare-repository') return { status: 0, stdout: 'true\n', stderr: '' };
+    if (command === 'worktree list --porcelain') return { status: 0,
+      stdout: [repo, ...seats.map(seat => join(hqRoot, 'seats', seat))].map(path => `worktree ${path}\n`).join(''), stderr: '' };
+    if (command === 'symbolic-ref --quiet HEAD') return { status: 1, stdout: '', stderr: '' };
+    if (command === 'rev-parse --git-common-dir') return { status: 0, stdout: `${repo}\n`, stderr: '' };
+    throw new Error(`unexpected git in the seat launch fixture: ${command}`);
+  });
+  const priorHome = process.env.HOME;
+  const priorConfigDir = getElanousConfigDirOverride();
+  process.env.HOME = home;
+  setElanousConfigDir(house);
+  try {
+    const ledgerBefore = readFileSync(join(hqRoot, 'house.json'), 'utf8');
+    expect(seats).toContain('OP');
+    for (const seat of seats) {
+      const command = seatLoopLaunchCommand(seat, ['harness', 'budget', '--json']);
+      expect(command.cwd).toBe(join(hqRoot, 'seats', seat));
+      expect(command.cwd).toBe(resolveHqLaunchSeat(seat, house, { root: hqRoot }));
+      expect(command.cwd).toBe(seatLoopLaunchSeat(seat));
+      expect(command.cwd.startsWith(sourceTree)).toBe(false);
+      expect(command.argv).toEqual(installedCliArgv(['--config-dir', command.argv[3]!, 'harness', 'budget', '--json']));
+      expect(command.argv[0]).toBe(process.execPath);
+      expect(command.argv[1]).toBe(installedEntry);
+      expect(isAbsolute(command.argv[1]!)).toBe(true);
+      expect(command.argv).not.toContain('bin/elanous.mjs');
+      expect(command.argv[2]).toBe('--config-dir');
+      expect(command.argv.slice(4)).toEqual(['harness', 'budget', '--json']);
+      expect(command.env.ELANOUS_STATE_DIR).toBe(command.argv[3]);
+    }
+    expect(() => seatLoopLaunchCommand('NOT-A-SEAT', ['harness', 'budget', '--json']))
+      .toThrow('refusing to launch from the source tree');
+    expect(readFileSync(join(hqRoot, 'house.json'), 'utf8')).toBe(ledgerBefore);
+    expect(Object.keys(JSON.parse(ledgerBefore) as Record<string, unknown>)).toEqual(['home', 'sandboxes']);
+    expect((JSON.parse(ledgerBefore) as { home: unknown }).home)
+      .toEqual({ kind: 'home', path: house, source: 'cli-resolved' });
+  } finally {
+    setGitCommandRunnerForTesting(undefined);
+    if (priorHome === undefined) delete process.env.HOME;
+    else process.env.HOME = priorHome;
+    if (priorConfigDir === undefined) resetElanousConfigDir();
+    else setElanousConfigDir(priorConfigDir);
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('defaultRun is the seat-turn process boundary: a missing seats/<role> folder stops the turn instead of falling back to the source tree', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'seat-loop-default-run-'));
+  const at = new Date('2026-10-04T20:40:00Z');
+  try {
+    const resolved: string[] = [];
+    const deps: SeatDeps = { root: dir, repo: dir, now: () => at, config: { mode: 'on', seats: ['TC'] },
+      read: (path) => { try { return readFileSync(path, 'utf8'); } catch { return ''; } },
+      versions: () => ['0.2.9'], schedules: () => [{ version: '0.2.9', cutAt: '2099-01-01T00:00:00Z' }],
+      checklistItems: () => [{ id: 'HQ-STEW', owner: 'TC', title: '기기 검증', status: 'red' }],
+      pullRequests: async () => [], running: () => [], inquire: () => null,
+      launchSeat: (seat) => { resolved.push(seat); throw new Error('seats/TC is not registered in house.json'); } };
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-budget');
+    expect(resolved).toEqual(['TC']);
+    const ledger = readFileSync(seatLedgerPath('TC', dir, at), 'utf8');
+    expect(ledger.trim().split('\n').map(row => JSON.parse(row) as Record<string, unknown>).at(-1))
+      .toMatchObject({ seat: 'TC', status: 'skipped-budget', action: 'skipped-budget', item: { id: 'HQ-STEW' } });
+    expect(ledger).not.toContain(sourceTree);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

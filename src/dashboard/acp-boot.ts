@@ -36,6 +36,7 @@ import {
 import type { AcpTransportConnection } from '../acp/transport/index.js';
 import { debug } from '../debug/log.js';
 import { recordDashboardToolCatalog } from './tool-catalog-observability.js';
+import { detectSeatTui } from './seat-boot-preamble.js';
 
 type DashboardAcpBootBranch = 'remote-daemon' | 'in-process';
 
@@ -232,6 +233,8 @@ export async function bootDashboardAcpSession(
       const model = deps.getActiveModel({ userText });
       return model ?? undefined;
     },
+    // TUI-H1-SEAT-GOALLOOP — 자리(무인) TUI 면 운영 지시를 goal loop 로(사람 대화 TUI 는 종전 그대로).
+    resolveSeat: () => detectSeatTui(deps.getCwd())?.seat ?? null,
     ...(deps.agentName !== undefined ? { agentName: deps.agentName } : {}),
     ...(deps.agentVersion !== undefined ? { agentVersion: deps.agentVersion } : {}),
     ...(gateway

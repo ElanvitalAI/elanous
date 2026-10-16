@@ -17,6 +17,7 @@ import {
 import { applyGraphOverlays, selectOverlays, type GraphOverlaySpec, type OverlayRejection, type OverlaySelection, type OverlayStage } from './graph-overlay-yaml.js';
 import type { OverlayPatch } from './graph-overlay.js';
 import type { GraphTemplateSpec } from './graph-yaml.js';
+import { pickSupervisorHealOverlay, type SupervisorOverlayPick } from './heal-triage.js';
 
 /** 2026-09-26 설정 졸업 — 그래프 권위는 항상 켬. 관측 출처는 default로 고정한다. */
 export type GraphAuthoritySource = 'default';
@@ -282,7 +283,10 @@ export function graphAuthorityFields(authority: GraphAuthority, template: GraphT
 /** 오버레이 조건이 «읽을 수 있는» 상태 키. ⛔ 여기 없는 키는 원장에 값이 안 실린다.
  *  🔑 그래서 «떨어뜨리되 말은 한다» — 아래 `stateExtraKeys` 가 그 이름을 남긴다.
  *  ⭐ `author_grade` — 적응형 저작(GRAPH-AUTHOR-GRADE) 첫 조각: 저작 등급을 오버레이 상태의 «이름»으로 싣는다. */
-export const OVERLAY_STATE_KEYS = ['attempts', 'author_grade', 'goal_id'] as const;
+export const OVERLAY_STATE_KEYS = [
+  'attempts', 'author_grade', 'goal_id',
+  'substrate', 'freeze', 'docs_only', 'provider', 'quota', 'machines', 'seats',
+] as const;
 
 /** 저작 등급의 오버레이 어휘 — `goal-author` 의 `GoalAuthorGrade`(`full|lite`) 를 오버레이 등급(`normal`) 로 옮긴다.
  *  ⛔ 모르는 값(빈 값·오타)은 `undefined` — 등급을 «지어내지 않는다». */
@@ -303,7 +307,7 @@ export function normalizeAuthorGrade(value: unknown): 'lite' | 'normal' | 'compl
  *        여기서 «조용히» 떨어뜨리면 같은 병을 한 층 아래에서 다시 짓는 것이다. */
 export function overlayDecisionObservation<T extends Readonly<Record<string, unknown>>>(input: T & {
   readonly state: Readonly<Record<string, unknown>>;
-}): T & { readonly state: Readonly<Record<string, unknown>>; readonly stateExtraKeys?: readonly string[] } {
+}): Omit<T, 'state'> & { readonly state: Readonly<Record<string, unknown>>; readonly stateExtraKeys?: readonly string[] } {
   const state: Record<string, unknown> = {};
   for (const key of OVERLAY_STATE_KEYS) {
     if (!Object.hasOwn(input.state, key)) continue;
@@ -312,6 +316,14 @@ export function overlayDecisionObservation<T extends Readonly<Record<string, unk
   const extra = Object.keys(input.state).filter((key) => !(OVERLAY_STATE_KEYS as readonly string[]).includes(key)).sort();
   return { ...input, state, ...(extra.length > 0 ? { stateExtraKeys: extra } : {}) };
 }
+
+/** ⭐ 칸 GRAPH-SUPERVISOR-PICK(0.2.32) — `graph-overlay-decision` 원장에 실릴 슈퍼바이저 고르기 기록.
+ *  `overlayDecisionObservation` 을 그대로 거친다 — 판단(outcome)·근거(evidence 한 줄)와 함께
+ *  판정에 쓴 상태 칸(`state`/`stateExtraKeys`)이 같이 남는다(예: `stop_class`). */
+export type SupervisorPickRecord = SupervisorOverlayPick & {
+  readonly state: Readonly<Record<string, unknown>>;
+  readonly stateExtraKeys?: readonly string[];
+};
 
 export function decideTemplate(input: {
   readonly goalType: GoalType | undefined;
@@ -329,22 +341,42 @@ export function decideTemplate(input: {
   readonly rejections: readonly OverlayRejection[];
   readonly appliedIds: readonly string[];
   readonly appliedPatches: readonly OverlayPatch[];
+  /** ⭐ 칸 GRAPH-SUPERVISOR-PICK(0.2.32) — `stage: 'heal'` 판에만 싣는다: 슈퍼바이저가 «선언된»
+   *  오버레이 중에서 고른 판단·근거. 다른 단계는 이 칸이 없다(기본 동작 보존). */
+  readonly supervisorPick?: SupervisorPickRecord;
 } {
   const base = activeTemplate(input.goalType, input.authority);
   if (!input.authority.enabled) return { template: base, selections: [], rejections: [], appliedIds: [], appliedPatches: [] };
+  // ⭐ 칸 GRAPH-SUPERVISOR-PICK(0.2.32) — 슈퍼바이저가 «선언된» heal 오버레이 중 하나를 고른다(능력표 ③b).
+  //   ⛔ 고르기만 한다 — 새 노드를 짓지 않는다. 노드를 더하는 것은 선언의 patch 고, 그 적용은
+  //     아래 기존 selectOverlays/applyGraphOverlays 경로가 그대로 말한다.
+  //   ⛔ 후보는 graphs/overlays/ 선언(loadGraphOverlays) 중 `stage: heal` 뿐이다 — 호출부가 준
+  //     overlays 목록과 무관하게 «선언에서만» 고른다.
+  //   판단·근거는 overlayDecisionObservation(graph-overlay-decision 원장 칸)을 거쳐 기록 형태로 나간다.
+  let supervisorPick: SupervisorPickRecord | undefined;
+  if (input.stage === 'heal') {
+    const chosen = pickSupervisorHealOverlay({ state: input.state, graphId: base.graphId });
+    supervisorPick = overlayDecisionObservation({
+      outcome: chosen.outcome,
+      ...(chosen.overlayId !== undefined ? { overlayId: chosen.overlayId } : {}),
+      evidence: chosen.evidence,
+      state: input.state,
+    });
+  }
+  const pick: { supervisorPick?: SupervisorPickRecord } = supervisorPick === undefined ? {} : { supervisorPick };
   // ⛔ 「최초 결정」은 launch 단계다 — `runtime` 오버레이는 여기서 «후보가 아니다»(③ 다이나믹의 몫).
   const { applied, selections } = selectOverlays(input.overlays, {
     graphId: base.graphId, stage: input.stage, state: input.state,
   });
-  if (applied.length === 0) return { template: base, selections, rejections: [], appliedIds: [], appliedPatches: [] };
+  if (applied.length === 0) return { template: base, selections, rejections: [], appliedIds: [], appliedPatches: [], ...pick };
   const spec = (input.specs ?? GRAPH_SPECS)[base.graphId];
   // ⛔ spec 을 못 얻으면 «변형하지 않는다» — 얹은 척하지 않는다(내장 폴백으로 돌 때가 그렇다).
-  if (spec === undefined) return { template: base, selections, rejections: [], appliedIds: [], appliedPatches: [] };
+  if (spec === undefined) return { template: base, selections, rejections: [], appliedIds: [], appliedPatches: [], ...pick };
   const result = applyGraphOverlays(spec, applied);
   // ⛔ 전부 아니면 전무다 — 하나라도 거절되면 «기준 선언»으로 돈다(반쯤 얹힌 그래프를 만들지 않는다).
   return result.ok
-    ? { template: specToTemplate(result.template), selections, rejections: [], appliedIds: result.overlayIds, appliedPatches: result.patches }
-    : { template: base, selections, rejections: result.rejections, appliedIds: [], appliedPatches: [] };
+    ? { template: specToTemplate(result.template), selections, rejections: [], appliedIds: result.overlayIds, appliedPatches: result.patches, ...pick }
+    : { template: base, selections, rejections: result.rejections, appliedIds: [], appliedPatches: [], ...pick };
 }
 
 /** ⭐ RFC §5 — 노드 «방문 예산»(`max_visits`)을 실행이 «읽게» 한다.

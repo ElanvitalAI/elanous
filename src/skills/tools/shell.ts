@@ -193,7 +193,7 @@ function rejectedCdResult(): RunShellDispatchResult {
 // always serve THIS process's instance.
 const LEDGER_CLI_BIN = /(?:^|[/\\])(?:elanous|elanous\.mjs|elanous\.cjs|eln)$/;
 const LEDGER_ENV_BIN = /(?:^|[/\\])env$/;
-const LEDGER_CLI_NATIVE_TOOL: Readonly<Record<string, string>> = {
+export const LEDGER_CLI_NATIVE_TOOL: Readonly<Record<string, string>> = {
   'msg list': 'MsgList',
   'msg post': 'MsgPost',
   'msg ack': 'MsgAck',

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { isRuntimeLlmModelCompatibleWithProvider } from '../user-config.js';
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
 import { tierModel, tierCall, budgetModel } from './model-defaults.js';
+import { TUI_ENTRY_PATH } from '../../test/helpers/dashboard-source.js';
 
 describe('tierModel — 지점은 «성능»만 선언하고 provider 가 모델을 채운다 (대표 2026-08-18)', () => {
   // ⛔⭐ 2026-09-23 — 종전엔 provider 마다 «모델 이름»을 박았고, 사다리가 GPT-6 으로
@@ -132,7 +133,7 @@ describe('회귀 가드 — 호출 지점에 모델 이름을 박지 않는다',
   it('only the legacy slash implementation is exempt; other dashboard code is scanned', () => {
     expect(ALLOWED.has(`src/dashboard/slash-runtime/${['dashboard', 'handlers'].join('-')}.ts`)).toBe(true);
     expect(ALLOWED.has('src/dashboard/slash-runtime/split-handlers.ts')).toBe(false);
-    expect(ALLOWED.has('src/dashboard/index.ts')).toBe(false);
+    expect(ALLOWED.has(TUI_ENTRY_PATH)).toBe(false);
   });
 
   it("src/ 안 'gpt-5.6-sol' 하드코딩은 허용된 자리에만 남는다", () => {

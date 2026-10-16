@@ -76,7 +76,7 @@ describe('createGlobalSubagentCallable', () => {
 
     expect(registry.get(handle.address)?.controller.signal.aborted).toBe(true);
     const result = await handle.done;
-    expect(['cancelled', 'failed']).toContain(result.status);
+    expect(result.status).toBe('cancelled');
     expect(typeof result.output).toBe('string');
     expect(typeof result.durationMs).toBe('number');
   });

@@ -30,6 +30,7 @@ import {
 import {
   resolveSessionId,
   loadSession,
+  listSessions,
   setActiveSessionId,
   getActiveSessionId,
 } from '../session/index.js';
@@ -41,6 +42,7 @@ import {
 } from '../user-config.js';
 import { setAmbientSessionId, debug } from '../debug/log.js';
 import { decideSigintAction } from './sigint.js';
+import { decideSessionStart, observeSessionStart } from '../session/session-start.js';
 import { buildReplayTurnsFromSession } from './replay.js';
 import type { LLMToolSpec, ContentBlock } from '../llm.js';
 import { inspectActiveProvider } from '../provider-summary.js';
@@ -58,6 +60,8 @@ export interface ReplOpts {
   initialSessionId: string | undefined;
   /** Force a fresh session even if active marker exists. */
   forceNew: boolean;
+  /** `--continue`/`--resume` — 활성 세션 이어하기(명시). 대표 #73: 기본은 새 세션. */
+  continueActive?: boolean;
   /** Enable the tool loop (Read/Grep/Bash/...). Default true — REPL
    *  is the agent surface; users opt out with --no-tools. */
   enableTools: boolean;
@@ -445,11 +449,25 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       return 1;
     }
     initialId = id;
-  } else if (!opts.forceNew) {
-    initialId = getActiveSessionId() ?? undefined;
   }
+  const startDecision = decideSessionStart({
+    ...(initialId ? { explicitSessionId: initialId } : {}),
+    continueActive: opts.continueActive === true,
+    forceNew: opts.forceNew,
+    activeSessionId: () => getActiveSessionId(),
+    // TUI-H8-FOLLOW ① — 활성 표지가 사라진 세션이면 최신 세션으로.
+    sessionExists: (id) => loadSession(id) !== null,
+    latestSessionId: () => listSessions({ limit: 1 })[0]?.id ?? null,
+  });
+  initialId = startDecision.sessionIdHint;
   const session = ensureCliSession(cfg, initialId);
   setActiveSessionId(session.id);
+  observeSessionStart({
+    surface: 'repl',
+    origin: initialId && session.id === initialId ? startDecision.origin : 'new',
+    reason: initialId && session.id !== initialId ? 'resume-target-missing' : startDecision.reason,
+    sessionId: session.id,
+  });
   setAmbientSessionId(session.id);
   if (!opts.jsonOutput && (!initialId || session.id !== initialId)) {
     try {

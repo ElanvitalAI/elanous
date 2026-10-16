@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { buildRouteConsumerTestIndex } from './route-consumer-test-index.js';
 import { buildImporterTestIndex } from './importer-test-index.js';
 import { resolveGateScope } from './gate-scope.js';
-import { runSelfGateCli } from './gate-cli.js';
+import { runSelfGateCli, selectGateTestFiles } from './gate-cli.js';
 
 function repo(files: Record<string, string>) {
   const cwd = mkdtempSync(join(tmpdir(), 'gate-callers-'));
@@ -127,11 +127,15 @@ test('CLI runs the old PWA consumer when a committed server route is removed or 
     for (const updated of ["server.get('/v1/other/:id', handler);\n", '']) {
       writeFileSync(join(fixture.cwd, source), updated);
       const ran: string[][] = [];
-      const result = runSelfGateCli(fixture.cwd, {}, {
+      const deps = {
         changedFiles: () => ({ files: [source], baseRef: 'HEAD' }),
-        runTests: (_cwd, files) => { ran.push([...files]); return { status: 0, stdout: '', stderr: '' }; },
+        runTests: (_cwd: string, files: readonly string[]) => { ran.push([...files]); return { status: 0, stdout: '', stderr: '' }; },
         runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
-      });
+      };
+      const preflight = selectGateTestFiles(fixture.cwd, {}, deps);
+      expect(ran).toEqual([]);
+      const result = runSelfGateCli(fixture.cwd, {}, deps);
+      expect(preflight.testFiles).toEqual(result.testFiles);
       expect(ran).toEqual([[consumer]]);
       expect(result.lines).toContain(`caller tests: ${consumer} (route)`);
     }

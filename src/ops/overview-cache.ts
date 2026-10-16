@@ -106,10 +106,10 @@ export function createOverviewCache(deps: {
     podTimer = schedule(() => { void refreshPods(); }, POD_MS);
     podTimer.unref();
   };
-  const present = (entry: Entry): OverviewData => {
-    const at = now();
+  /** Response-time Pod occupancy overlay — shared by /v1/ops/overview and /v1/ops/resources. */
+  const overlayPods = (snapshot: OverviewSnapshot, at: number): PodMemberRow[] => {
     const byContext = new Map(podRows.map((row) => [row.context, row]));
-    const pods: PodMemberRow[] = entry.snapshot.machines.pods.map((pod) => {
+    return snapshot.machines.pods.map((pod) => {
       const row = byContext.get(pod.context);
       const stale = row && at - row.observedAt >= POD_STALE_MS;
       const occupied = !podFailure && row && !stale && row.occupied !== null
@@ -117,10 +117,22 @@ export function createOverviewCache(deps: {
         : unmeasured<number>('pod pool background measure', podFailure ?? (stale ? '낡음(120초)' : row?.reason ?? '측정 대기'), row ? new Date(row.observedAt).toISOString() : null);
       return { ...pod, occupied };
     });
+  };
+  const present = (entry: Entry): OverviewData => {
+    const at = now();
+    const pods = overlayPods(entry.snapshot, at);
     const full = { ...entry.snapshot, machines: { ...entry.snapshot.machines, pods } };
     return { ...full, ...computeVerdict(full), durationMs: entry.durationMs,
       sources: [full.release.run.source, full.tasks.launchable.source, full.tasks.capacity.source],
       cacheAgeMs: Math.max(0, at - entry.at), refreshFailed: entry.failure ?? null };
+  };
+  /** Read-only view of the freshest memo entry (RES-FLOOR-API) — never collects, never measures, never waits. */
+  const peek = (): { snapshot: OverviewSnapshot; pods: PodMemberRow[]; at: number } | null => {
+    let freshest: Entry | null = null;
+    for (const entry of memo.values()) if (!freshest || entry.at > freshest.at) freshest = entry;
+    if (!freshest) return null;
+    const at = now();
+    return { snapshot: freshest.snapshot, pods: overlayPods(freshest.snapshot, at), at };
   };
   const get = async (options: Pick<CollectOptions, 'version' | 'owner'> & { sinceMs?: number; sinceLabel?: string } = {}): Promise<OverviewData> => {
     start();
@@ -171,5 +183,5 @@ export function createOverviewCache(deps: {
     }
     return present(memo.get(key)!);
   };
-  return { get, memoSize: () => memo.size, stop: () => { if (podTimer) clearInterval(podTimer); podTimer = null; memo.clear(); } };
+  return { get, peek, memoSize: () => memo.size, stop: () => { if (podTimer) clearInterval(podTimer); podTimer = null; memo.clear(); } };
 }

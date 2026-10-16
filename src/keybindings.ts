@@ -104,11 +104,14 @@ export const KEYBINDINGS: KeyBinding[] = [
 
   // ── Chat input ───────────────────────────────────────────
   { keys: ['Enter'],               action: 'Submit message or slash command', context: 'input' },
-  { keys: ['Shift+Enter', 'Ctrl+J'], action: 'Insert newline',              context: 'input' },
+  { keys: ['Shift+Enter', 'Alt+Enter', 'Ctrl+J'], action: 'Insert newline', context: 'input', note: 'Shift+Enter 가 안 되는 터미널은 Alt+Enter / Ctrl+J' },
   { keys: ['Ctrl+Shift+V'],        action: 'Paste clipboard image',          context: 'input' },
   { keys: ['Ctrl+T'],              action: 'Toggle → pane mode',             context: 'input', note: 'also Ctrl+M on Kitty-protocol terminals' },
   { keys: ['Tab'],                 action: 'Autocomplete slash command / path', context: 'input' },
   { keys: ['Esc'],                 action: 'Abort current stream or exit input', context: 'input' },
+  { keys: ['Enter (while answering)'], action: 'Queue message — inserted at the next tool boundary', context: 'input', note: '10-14 steer' },
+  { keys: ['Enter on empty input (while answering)'], action: 'Push queued messages now — interrupt if running tools are cancelable, else first at next boundary', context: 'input', note: '10-14 steer' },
+  { keys: ['Ctrl+↑'],              action: 'Recall all queued messages into the input', context: 'input', note: '10-14 — was last one only' },
 
   // ── Browsers (files / obsidian / skills) ─────────────────
   { keys: ['j', '↓'],              action: 'Move cursor down',               context: 'browser' },

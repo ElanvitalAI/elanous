@@ -9,6 +9,11 @@ import { buildGeneration } from './standby-snapshot';
 import { parsePromoteArgs, promote } from './standby-promote';
 
 const roots: string[] = [];
+// GATE-PREEXISTING-ZERO — every test here spawns for real: the fixture runs the product snapshot twice through a python3
+//   `sqlite3` stand-in (VACUUM INTO per SQLite item) and `run` starts `bun scripts/hq/standby-promote.ts`. On a loaded gate Pod
+//   (0.2.30 HARD #3, pod-59) a single test took 5–22s, past bun's 5s default, and bun then killed the in-flight sqlite3
+//   (`sqlite backup failed: … rc=null`). Same explicit cap as the sibling standby-snapshot.test.ts (#28324).
+const SPAWN_TEST_TIMEOUT_MS = 60_000;
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 function write(path: string, contents: string): void { mkdirSync(join(path, '..'), { recursive: true }); writeFileSync(path, contents); }
@@ -86,7 +91,7 @@ test('promotes verified core then big; backs up config, switches pollers off and
   for (const entry of [...f.core.entries, ...f.big.entries]) expect(promoted).toContain(entry.path);
   expect(files(f.standby)).toEqual(f.before);
   expect(JSON.parse(readFileSync(join(f.host, 'config.json'), 'utf8')).hq.hostName).toBe('node-b');
-});
+}, SPAWN_TEST_TIMEOUT_MS);
 
 test('existing target is refused without changing target or standby, including on a second invocation', () => {
   const f = fixture();
@@ -97,7 +102,7 @@ test('existing target is refused without changing target or standby, including o
   expect(r.stderr).toContain('target already exists');
   expect(files(f.to)).toEqual(beforeTarget);
   expect(files(f.standby)).toEqual(f.before);
-});
+}, SPAWN_TEST_TIMEOUT_MS);
 
 test('corrupted or missing standby bytes refuse before creating target', () => {
   for (const change of ['corrupt', 'missing']) {
@@ -112,7 +117,7 @@ test('corrupted or missing standby bytes refuse before creating target', () => {
     expect(existsSync(f.to)).toBe(false);
     expect(files(f.standby)).toEqual(before);
   }
-});
+}, SPAWN_TEST_TIMEOUT_MS);
 
 test('dry-run checks checksums and existing target, prints plan and writes no target', () => {
   const f = fixture();
@@ -131,7 +136,7 @@ test('dry-run checks checksums and existing target, prints plan and writes no ta
   expect(run(f, '--dry-run').status).toBe(1);
   expect(existsSync(f.to)).toBe(false);
   expect(files(f.standby)).toEqual(beforeCorruptDryRun);
-});
+}, SPAWN_TEST_TIMEOUT_MS);
 
 test('target cannot be placed inside standby, including through a parent symlink', () => {
   const f = fixture();
@@ -145,7 +150,7 @@ test('target cannot be placed inside standby, including through a parent symlink
   expect(linked.status).toBe(1);
   expect(existsSync(join(f.standby, 'new-target'))).toBe(false);
   expect(files(f.standby)).toEqual(f.before);
-});
+}, SPAWN_TEST_TIMEOUT_MS);
 
 test('a listed symlink cannot copy bytes from outside the verified generation', () => {
   const f = fixture();
@@ -160,7 +165,7 @@ test('a listed symlink cannot copy bytes from outside the verified generation', 
   expect(result.stderr).toContain('symlink in generation');
   expect(existsSync(f.to)).toBe(false);
   expect(files(f.standby)).toEqual(before);
-});
+}, SPAWN_TEST_TIMEOUT_MS);
 
 test('config rewrite failure removes only the newly created target and allows retry', async () => {
   const f = fixture();
@@ -182,7 +187,7 @@ test('config rewrite failure removes only the newly created target and allows re
   expect(retry.status).toBe(0);
   expect(JSON.parse(readFileSync(join(f.to, 'config.json'), 'utf8')).telegram.enabled).toBe(false);
   expect(files(f.standby)).toEqual(f.before);
-});
+}, SPAWN_TEST_TIMEOUT_MS);
 
 test('json, tier selection and missing host block fail closed', () => {
   const f = fixture();
@@ -194,4 +199,4 @@ test('json, tier selection and missing host block fail closed', () => {
   expect(refused.status).toBe(1);
   expect(existsSync(f.to)).toBe(false);
   expect(files(f.standby)).toEqual(f.before);
-});
+}, SPAWN_TEST_TIMEOUT_MS);

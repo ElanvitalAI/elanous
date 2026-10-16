@@ -12,11 +12,9 @@
 // routeMouseWiring block). If a future refactor drops the hook
 // from any site again, this test fails loudly per site.
 
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
-const DASHBOARD_TS = join(import.meta.dir, '..', 'src', 'dashboard', 'index.ts');
 
 describe('DS-3a-follow · dashboard route parity', () => {
   test('dragWire.onMouse(displayMouse) is called in all 3 routeMouseWiring sites (+3 modal-guard sites)', () => {
@@ -28,7 +26,7 @@ describe('DS-3a-follow · dashboard route parity', () => {
     // mx-mouse modal-fellthrough, textInput foreground-modal guard) —
     // drag evaluation must run on modal-routed mouse too. Exact count
     // kept so a dropped hook at any site still fails loudly.
-    const src = readFileSync(DASHBOARD_TS, 'utf8');
+    const src = tuiSourceText();
     const hookPattern = /dragWire\.onMouse\(displayMouse\);/g;
     const matches = src.match(hookPattern) ?? [];
     expect(matches.length).toBe(6);
@@ -38,7 +36,7 @@ describe('DS-3a-follow · dashboard route parity', () => {
     // Find every `routeMouseWiring: ... {` block and check it
     // includes the hook. Block scan is char-based to avoid TS AST
     // import cost.
-    const src = readFileSync(DASHBOARD_TS, 'utf8');
+    const src = tuiSourceText();
     const blocks = extractRouteMouseWiringBlocks(src);
     expect(blocks.length).toBe(3);
     for (const block of blocks) {

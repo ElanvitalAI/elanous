@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { GATE_POOL_MIRROR_PATH, resetMirrorSeedMemo, seedMirrorOnce, seedPoolMirrors } from './pod-mirror-seed.js';
+import { GATE_POOL_MIRROR_PATH, resetMirrorSeedMemo, resolveDefaultSourceHead, seedMirrorOnce, seedPoolMirrors } from './pod-mirror-seed.js';
 
 const sha = 'e1783835d5b719e397b697452d1c2fe358b7c3f1';
 
@@ -50,5 +50,47 @@ describe('GATE-WARM-BOOT seedPoolMirrors', () => {
     expect(pushes).toBe(2);
     expect(await seedMirrorOnce({ host: 'node-b', commit: 'HEAD', cwd: '/r', push: failing })).toMatchObject({ ok: false, detail: expect.stringContaining('invalid gate commit') });
     resetMirrorSeedMemo();
+  });
+});
+
+describe('SI-SEED-DEFAULT resolveDefaultSourceHead', () => {
+  const tip = 'd'.repeat(40);
+  const git = (answers: Record<string, { rc: number; output?: string } | Array<{ rc: number; output?: string }>>) => {
+    const calls: string[][] = [];
+    const seen: Record<string, number> = {};
+    const fn = async (args: string[]) => {
+      calls.push(args);
+      const answer = answers[args[0]!];
+      if (!answer) throw new Error(`unexpected git ${args[0]}`);
+      const pick = Array.isArray(answer) ? answer[Math.min((seen[args[0]!] = (seen[args[0]!] ?? -1) + 1), answer.length - 1)]! : answer;
+      return { rc: pick.rc, output: pick.output ?? '' };
+    };
+    return { calls, fn };
+  };
+
+  test('resolves refs/heads/<base> (main by default) and uses the local commit without fetching', async () => {
+    const g = git({ 'ls-remote': { rc: 0, output: `${tip}\trefs/heads/main\n` }, 'cat-file': { rc: 0 } });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'https://example.invalid/r', cwd: '/t', git: g.fn })).toEqual({ sha: tip });
+    expect(g.calls).toEqual([['ls-remote', '--', 'https://example.invalid/r', 'refs/heads/main'], ['cat-file', '-e', `${tip}^{commit}`]]);
+    const b = git({ 'ls-remote': { rc: 0, output: `${tip}\trefs/heads/bench/x\n` }, 'cat-file': { rc: 0 } });
+    await resolveDefaultSourceHead({ repoUrl: 'u', base: 'bench/x', cwd: '/t', git: b.fn });
+    expect(b.calls[0]).toEqual(['ls-remote', '--', 'u', 'refs/heads/bench/x']);
+  });
+
+  test('a commit missing from the seeding tree is fetched by sha (objects only); every miss is a reason, never a throw', async () => {
+    const fetched = git({ 'ls-remote': { rc: 0, output: `${tip}\trefs/heads/main\n` }, 'cat-file': [{ rc: 1 }, { rc: 0 }], fetch: { rc: 0 } });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: fetched.fn })).toEqual({ sha: tip });
+    expect(fetched.calls[2]).toEqual(['fetch', '--quiet', '--no-write-fetch-head', '--', 'u', tip]);
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: git({ 'ls-remote': { rc: 128 } }).fn })).toEqual({ reason: 'ls-remote-failed' });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: git({ 'ls-remote': { rc: 0, output: '' } }).fn })).toEqual({ reason: 'ls-remote-no-sha' });
+    // Only the exact ref counts: a longer branch name listed first is not `main`.
+    const other = 'e'.repeat(40);
+    const exact = git({ 'ls-remote': { rc: 0, output: `${other}\trefs/heads/a/refs/heads/main\n${tip}\trefs/heads/main\n` }, 'cat-file': { rc: 0 } });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: exact.fn })).toEqual({ sha: tip });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: git({ 'ls-remote': { rc: 0, output: `${other}\trefs/heads/a/refs/heads/main\n` } }).fn })).toEqual({ reason: 'ls-remote-no-sha' });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: git({ 'ls-remote': { rc: 0, output: `${tip}\trefs/heads/main\n` }, 'cat-file': { rc: 1 }, fetch: { rc: 1 } }).fn })).toEqual({ reason: 'commit-fetch-failed' });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: git({ 'ls-remote': { rc: 0, output: `${tip}\trefs/heads/main\n` }, 'cat-file': { rc: 1 }, fetch: { rc: 0 } }).fn })).toEqual({ reason: 'commit-not-local' });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: async () => { throw new Error('spawn'); } })).toEqual({ reason: 'resolve-threw' });
+    for (const base of ['-x', 'a b', 'x;rm']) expect(await resolveDefaultSourceHead({ repoUrl: 'u', base, cwd: '/t', git: git({}).fn })).toEqual({ reason: 'invalid-ref' });
   });
 });

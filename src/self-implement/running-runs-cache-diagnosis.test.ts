@@ -45,7 +45,7 @@ function childQuery(root: string, directory: string): { pid: number; hits: numbe
   return JSON.parse(child.stdout.toString().trim()) as { pid: number; hits: number; misses: number; total: number };
 }
 
-test('the real running-runs query reuses ledger facts in one process, not across fresh children', () => {
+test('the real running-runs query reuses ledger facts in one process and through the persisted index across fresh children', () => {
   const { root, directory } = fixture(3);
   try {
     const cold = query(directory);
@@ -58,12 +58,12 @@ test('the real running-runs query reuses ledger facts in one process, not across
     expect([warm.ledger.cacheHits, warm.ledger.cacheMisses]).toEqual([3, 0]);
     expect([bypass.ledger.cacheHits, bypass.ledger.cacheMisses]).toEqual([0, 3]);
     expect([afterBypass.ledger.cacheHits, afterBypass.ledger.cacheMisses]).toEqual([3, 0]);
-    expect([firstChild.hits, firstChild.misses, firstChild.total]).toEqual([0, 3, 0]);
-    expect([secondChild.hits, secondChild.misses, secondChild.total]).toEqual([0, 3, 0]);
+    expect([firstChild.hits, firstChild.misses, firstChild.total]).toEqual([3, 0, 0]);
+    expect([secondChild.hits, secondChild.misses, secondChild.total]).toEqual([3, 0, 0]);
     expect(firstChild.pid).not.toBe(secondChild.pid);
     expect(cold.entries).toEqual(warm.entries);
     expect(cold.entries).toEqual([]);
-    console.log(`CACHE_PROCESS_PROBE same-process=0/3,3/0 bypass=0/3 after-bypass=3/0 fresh-children=0/3,0/3 different-pid=true`);
+    console.log(`CACHE_PROCESS_PROBE same-process=0/3,3/0 bypass=0/3 after-bypass=3/0 fresh-children=3/0,3/0 different-pid=true`);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

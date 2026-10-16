@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { resolve } from 'node:path';
 import { debug } from '../debug/log.js';
 import { gitStdout, type GitRunner } from './harness-clean.js';
@@ -146,7 +147,7 @@ export function renderHarnessWorktreesReport(report: WorktreeAssessmentReport, r
 
 export type GhWorktreeRunner = (args: string[], cwd: string) => { status: number | null; stdout: string };
 const defaultGhRunner: GhWorktreeRunner = (args, cwd) => {
-  const result = spawnSync('gh', args, { cwd, encoding: 'utf8', timeout: 25_000 });
+  const result = spawnSync('gh', args, { cwd, encoding: 'utf8', timeout: 25_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   return { status: result.status, stdout: result.stdout ?? '' };
 };
 
@@ -366,7 +367,7 @@ export function execHarnessWorktrees(deps: {
   progress?: (line: string) => void;
 } = {}): WorktreeAssessmentReport {
   const run: GitRunner = deps.run ?? ((args) => {
-    const result = spawnSync('git', args, { encoding: 'utf8', timeout: 25_000 });
+    const result = spawnSync('git', args, { encoding: 'utf8', timeout: 25_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
     return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
   });
   const worktrees = listRegisteredWorktrees(run);

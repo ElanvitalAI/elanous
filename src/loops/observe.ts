@@ -28,7 +28,18 @@ export function loopCategory(id: string): string {
   return `loop.${id}`;
 }
 
-/** Emit an RFC loop event, retaining absent context as a measurable list. */
+/** Collapse whitespace runs so a value stays on a single line. */
+function oneLine(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Emit an RFC loop event, retaining absent context as a measurable list. The approval
+ * observation ('hitl') settles the «왜 한 줄 ⊕ 근거 포인터» convention at this boundary:
+ * reason and sourceRef are collapsed onto a copy as single-line strings, so every approval
+ * emission carries a one-line why and evidence pointer without mutating caller data or
+ * fabricating fields REQUIRED_CONTEXT reports as missing.
+ */
 export function loopEvent(loopId: string, event: string, data: Record<string, unknown>): void {
   if (!validId(loopId)) {
     reject('invalid-loop-id');
@@ -44,9 +55,14 @@ export function loopEvent(loopId: string, event: string, data: Record<string, un
     reject('invalid-data');
     return;
   }
+  const payload: Record<string, unknown> = { ...data };
+  if (event === 'hitl') {
+    if (typeof payload.reason === 'string') payload.reason = oneLine(payload.reason);
+    if (typeof payload.sourceRef === 'string') payload.sourceRef = oneLine(payload.sourceRef);
+  }
   const missingRequired = REQUIRED_CONTEXT.filter(field =>
-    typeof data[field] !== 'string' || !(data[field] as string).trim());
-  debug.log(`loop.${loopId}`, event, { ...data, loopId, missingRequired });
+    typeof payload[field] !== 'string' || !(payload[field] as string).trim());
+  debug.log(`loop.${loopId}`, event, { ...payload, loopId, missingRequired });
   if (event === 'tick' && (data.outcome === 'failed' || data.status === 'failed')) {
     try {
       recordFailureEvent({ source: 'loop-tick', kind: event, ref: loopId,

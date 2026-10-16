@@ -89,7 +89,11 @@ test('GET /v1/loops/resources is bearer-gated and read-only, preserving existing
     const headers = { ...outsider, authorization: 'Bearer auth' };
     const response = await fetch(endpoint, { headers });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ resource: { ...resource, now: resource.now.toISOString() } });
+    // #27836 added the warm-pod worker ledger beside `resource`; it reads the host ledger, so assert its shape
+    // (array, or null with podWorkersError) instead of a host-dependent value.
+    const body = await response.json() as { resource: unknown; podWorkers: unknown; podWorkersError?: unknown };
+    expect(body.resource).toEqual({ ...resource, now: resource.now.toISOString() });
+    expect(Array.isArray(body.podWorkers) || (body.podWorkers === null && body.podWorkersError === 'unmeasured')).toBe(true);
     expect(observations).toBe(1);
     const health = await fetch(`${server.url}/v1/health`);
     expect(health.status).toBe(200);

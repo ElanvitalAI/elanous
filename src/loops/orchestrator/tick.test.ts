@@ -1,9 +1,12 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 import { addItem, setItem, listChecklist } from '../../release-loop/checklist.js';
 import { splitCard } from '../../flow-loop/split.js';
 import { spawnSync } from 'node:child_process';
+import * as harnessCommand from '../../harness/harness-cli-command.js';
+import * as testGuard from '../../instance/test-write-guard.js';
+import { debug } from '../../debug/log.js';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
@@ -37,6 +40,182 @@ describe('isLaunchEligible (dispatch-c decision seam)', () => {
   });
 });
 
+test('launch node records one dispatch cycle, reason-specific skips and preserves seat journal', async () => fixture(async (root, _id, logged) => {
+  const configDir = mkdtempSync(join(tmpdir(), 'orch-dispatch-config-'));
+  setElanousConfigDir(configDir);
+  try {
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: {
+      maxDelegatePerTick: 1, dispatch: { podTarget: 4, localLane: 2 },
+    } } }));
+    const state = await invoke(root, 'dispatch-check', '08', { mode: 'live', gridHosts: [], launchProcesses: () => ({ status: 'ok', records: [] }),
+      split: () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }, { id: 'C2', title: '보류 칸', seat: 'TC' }],
+      placeCell: () => ({ version: '0.2.32' }), seatTurn: async () => ({ status: 'skipped-empty' }) }, logged);
+    const path = join(root, 'orchestrator', 'dispatch-ledger.jsonl');
+    const rows = readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(rows).toEqual([{ at: '2026-10-04T00:00:00.000Z', source: 'tick', mode: 'live', runId: 'dispatch-check',
+      supply: 2, capacity: 4, eligible: 1, skipped: { 'cap-deferred': 1 }, dispatch: { podTarget: 4, localLane: 2 } }]);
+    expect(state.launched?.map(row => row.seat)).toEqual(['MK']);
+    const before = readFileSync(join(root, 'seat-requests', 'requests.jsonl'), 'utf8');
+    await runOrchestratorNode('launch', { root, runId: 'dispatch-check', mode: 'live', window: '08', now: new Date('2026-10-04T00:00:00Z') });
+    expect(readFileSync(path, 'utf8').trim().split('\n')).toHaveLength(1);
+    expect(readFileSync(join(root, 'seat-requests', 'requests.jsonl'), 'utf8')).toBe(before);
+  } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
+}), 30_000);
+
+test('default live launch inventory filters harness launches, bounds cwd reads and reserves unknown cwd without globally closing seats', async () => fixture(async (root, _id, logged) => {
+  const list = spyOn(harnessCommand, 'defaultListHarnessProcesses');
+  const signal = spyOn(testGuard, 'testProcessSignal').mockReturnValue(null);
+  try {
+    const statePath = join(root, 'loop', 'orchestrator', 'bounded.json');
+    mkdirSync(dirname(statePath), { recursive: true });
+    writeFileSync(statePath, JSON.stringify({ runId: 'bounded', window: '08', mode: 'live', day: '2026-10-04', cards: [], skippedCards: [],
+      cells: [{ cardId: 'card', id: 'C1', title: '칸', seat: 'MK', version: '0.2.32', origin: 'flow1a' }],
+      placed: 1, delegated: 1, wouldDelegate: 0, reconciled: { reached: 0, progressing: 0, blocked: 0, unknown: 0 },
+      steps: [], nodes: { delegate: 'ok' }, missing: [] }));
+    const request = join(root, 'seat-requests', 'requests.jsonl');
+    mkdirSync(dirname(request), { recursive: true });
+    writeFileSync(request, `${JSON.stringify({ key: 'orch:card:C1', seat: 'MK', status: 'queued' })}\n`);
+    const options: Parameters<typeof harnessCommand.defaultListHarnessProcesses>[0][] = [];
+    list.mockImplementation(optionsArg => {
+      options.push(optionsArg);
+      return { status: 'ok', records: [{ pid: 101, ppid: 1, cpuPercent: 0, elapsedSeconds: 60,
+        command: 'bun bin/elanous.mjs harness say one', cwdStatus: 'unknown' }], excludedCount: 0 };
+    });
+    let turns = 0;
+    const state = await runOrchestratorNode('launch', { root, runId: 'bounded', mode: 'live', window: '08', now: new Date('2026-10-04T00:00:00Z'),
+      observe: (event, data) => logged.push({ event, reason: data.reason }),
+      seatTurn: async () => { turns++; return { status: 'queued' }; } });
+    expect(turns).toBe(1);
+    expect(state.launched).toEqual([{ seat: 'MK', status: 'queued' }]);
+    expect(JSON.parse(readFileSync(join(root, 'orchestrator', 'dispatch-ledger.jsonl'), 'utf8')))
+      .toMatchObject({ supply: 1, capacity: 3, eligible: 1 });
+    expect(logged).toContainEqual(expect.objectContaining({ event: 'launch-unknown-seat', reason: 'cwd-unknown:0' }));
+    expect(options).toHaveLength(1);
+    expect(options[0]).toMatchObject({ cwdOnly: true, deadlineMs: 2_500 });
+    expect(options[0]!.include!({ command: 'bun bin/elanous.mjs harness say one' } as never)).toBe(true);
+    expect(options[0]!.include!({ command: 'bun bin/elanous.mjs harness queue tick' } as never)).toBe(false);
+  } finally { signal.mockRestore(); list.mockRestore(); }
+}));
+
+test('test and shadow launch nodes skip host inventory with an observation; injected inventory still takes priority', async () => fixture(async (root, _id, logged) => {
+  const list = spyOn(harnessCommand, 'defaultListHarnessProcesses');
+  try {
+    const statePath = join(root, 'loop', 'orchestrator', 'shadow-no-scan.json');
+    mkdirSync(dirname(statePath), { recursive: true });
+    writeFileSync(statePath, JSON.stringify({ runId: 'shadow-no-scan', window: '08', mode: 'shadow', day: '2026-10-04', cards: [], skippedCards: [],
+      cells: [{ cardId: 'card', id: 'C1', title: '칸', seat: 'MK', version: '0.2.32', origin: 'flow1a' }],
+      placed: 1, delegated: 0, wouldDelegate: 1, reconciled: { reached: 0, progressing: 0, blocked: 0, unknown: 0 },
+      steps: [], nodes: { delegate: 'ok' }, missing: [] }));
+    const shadow = await runOrchestratorNode('launch', { root, runId: 'shadow-no-scan', mode: 'shadow', window: '08', now: new Date('2026-10-04T00:00:00Z'),
+      observe: (event, data) => logged.push({ event, reason: data.reason }) });
+    expect(shadow.launched).toEqual([expect.objectContaining({ seat: 'MK', status: 'would-launch' })]);
+    expect(logged).toContainEqual(expect.objectContaining({ event: 'launch-inventory-skipped', reason: 'shadow' }));
+    expect(list).not.toHaveBeenCalled();
+    logged.length = 0;
+    const live = await invoke(root, 'test-no-scan', '08', { mode: 'live', gridHosts: [],
+      split: () => [{ id: 'C2', title: '칸', seat: 'MK' }], placeCell: () => ({ version: '0.2.32' }),
+      seatTurn: async () => ({ status: 'queued' }), launchProcesses: undefined }, logged);
+    expect(live.launched).toEqual([expect.objectContaining({ seat: 'MK', status: 'queued' })]);
+    expect(logged).toContainEqual(expect.objectContaining({ event: 'launch-inventory-skipped', reason: 'test' }));
+    expect(list).not.toHaveBeenCalled();
+  } finally { list.mockRestore(); }
+}));
+
+test('unknown cwd reserves capacity per seat while known occupied seat blocks; an unrelated seat remains launchable', async () => fixture(async (root, _id, logged) => {
+  let turns = 0;
+  const state = await invoke(root, 'mixed-processes', '08', { mode: 'live', gridHosts: [],
+    split: () => [{ id: 'C1', title: 'MK 칸', seat: 'MK' }, { id: 'C2', title: 'UX 칸', seat: 'UX' }],
+    placeCell: () => ({ version: '0.2.32' }),
+    launchProcesses: () => ({ status: 'ok', records: [
+      { seat: 'MK', command: 'bun bin/elanous.mjs harness say work', elapsedSeconds: 60, cwd: root },
+      { seat: null, command: 'bun bin/elanous.mjs harness say remote', elapsedSeconds: 60, cwd: undefined },
+    ] }), seatTurn: async () => { turns++; return { status: 'queued' }; } }, logged);
+  expect(turns).toBe(2); // MK: 4 - 1 known - 1 unknown; UX: 4 - 1 unknown
+  expect(state.launched?.map(row => row.seat)).toEqual(['MK', 'UX']);
+  expect(JSON.parse(readFileSync(join(root, 'orchestrator', 'dispatch-ledger.jsonl'), 'utf8')))
+    .toMatchObject({ supply: 2, capacity: 5, eligible: 2 });
+  expect(logged).toContainEqual(expect.objectContaining({ event: 'launch-unknown-seat', reason: 'cwd-unknown:1' }));
+}));
+
+test('unknown cwd consumes the only free slot and prevents launch on a saturated seat', async () => fixture(async (root, _id, logged) => {
+  const configDir = mkdtempSync(join(tmpdir(), 'orch-unknown-cap-'));
+  setElanousConfigDir(configDir);
+  try {
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { seatCaps: { MK: 1 } } } }));
+    let turns = 0;
+    const state = await invoke(root, 'unknown-at-cap', '08', { mode: 'live', gridHosts: [],
+      split: () => [{ id: 'C1', title: '칸', seat: 'MK' }], placeCell: () => ({ version: '0.2.32' }),
+      launchProcesses: () => ({ status: 'ok', records: [
+        { seat: null, command: 'bun bin/elanous.mjs harness say remote', elapsedSeconds: 60, cwd: undefined },
+      ] }), seatTurn: async () => { turns++; return { status: 'queued' }; } }, logged);
+    expect(turns).toBe(0);
+    expect(state.launched).toEqual([]);
+    expect(JSON.parse(readFileSync(join(root, 'orchestrator', 'dispatch-ledger.jsonl'), 'utf8')))
+      .toMatchObject({ supply: 1, capacity: 0, eligible: 0, skipped: { capacity: 1 } });
+    expect(logged).toContainEqual(expect.objectContaining({ event: 'launch-unknown-seat', reason: 'cwd-unknown:0' }));
+  } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
+}));
+
+test('a failed process snapshot blocks the seat turn but still records capacity skip', async () => fixture(async (root, _id, logged) => {
+  let turns = 0;
+  const state = await invoke(root, 'unknown-processes', '08', { mode: 'live', gridHosts: [],
+    split: () => [{ id: 'C1', title: '칸', seat: 'MK' }], placeCell: () => ({ version: '0.2.32' }),
+    launchProcesses: () => ({ status: 'incomplete' }), seatTurn: async () => { turns++; return { status: 'queued' }; } }, logged);
+  expect(turns).toBe(0);
+  expect(state.launched).toEqual([]);
+  expect(JSON.parse(readFileSync(join(root, 'orchestrator', 'dispatch-ledger.jsonl'), 'utf8')))
+    .toMatchObject({ supply: 1, capacity: 0, eligible: 0, skipped: { capacity: 1 } });
+}));
+
+test('a malformed dispatch shadow journal cannot undo a completed seat turn or change the request rows', async () => fixture(async (root, id, logged) => {
+  const path = join(root, 'orchestrator', 'dispatch-ledger.jsonl');
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, '{broken\n');
+  const logs = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    let turns = 0;
+    const state = await invoke(root, 'broken-cycle', '08', { mode: 'live', gridHosts: [],
+      split: () => [{ id: 'C1', title: '칸', seat: 'MK' }], placeCell: () => ({ version: '0.2.32' }),
+      seatTurn: async () => { turns++; return { status: 'queued', item: { source: 'request', id: `orch:${id}:C1` } }; } }, logged);
+    expect(turns).toBe(1);
+    expect(state.nodes.launch).toBe('ok');
+    expect(state.launched).toEqual([{ seat: 'MK', status: 'queued', key: `orch:${id}:C1` }]);
+    expect(JSON.parse(readFileSync(join(root, 'seat-requests', 'requests.jsonl'), 'utf8')).key).toBe(`orch:${id}:C1`);
+    const rows = readFileSync(path, 'utf8').trim().split('\n');
+    expect(rows[0]).toBe('{broken');
+    expect(JSON.parse(rows[1]!)).toMatchObject({ source: 'tick', mode: 'live', runId: 'broken-cycle' });
+    expect(logs).toHaveBeenCalledWith('loop.orchestrator', 'dispatch-cycle-malformed', expect.objectContaining({ path }));
+    expect(logs).not.toHaveBeenCalledWith('loop.orchestrator', 'dispatch-cycle-failed', expect.anything(), expect.anything());
+  } finally { logs.mockRestore(); }
+}));
+
+test('launch cycle counts same-seat waiting cells and refuses a saturated seat without a turn', async () => fixture(async (root, _id, logged) => {
+  const configDir = mkdtempSync(join(tmpdir(), 'orch-dispatch-cap-'));
+  setElanousConfigDir(configDir);
+  try {
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { seatCaps: { MK: 1 } } } }));
+    const split: TickDeps['split'] = () => ['C1', 'C2'].map(id => ({ id, title: id, seat: 'MK' }));
+    const process = { seat: 'MK' as const, command: 'bun bin/elanous.mjs harness say work', elapsedSeconds: 3000, cwd: root };
+    let turns = 0;
+    const deps: TickDeps = { mode: 'live', gridHosts: [], split, placeCell: () => ({ version: '0.2.32' }),
+      launchProcesses: () => ({ status: 'ok', records: [process] }), seatTurn: async () => { turns++; return { status: 'queued' }; } };
+    await invoke(root, 'full-seat', '08', deps, logged);
+    const ledger = (id: string) => JSON.parse(readFileSync(join(root, 'orchestrator', 'dispatch-ledger.jsonl'), 'utf8')
+      .trim().split('\n').find(line => JSON.parse(line).runId === id)!);
+    expect(ledger('full-seat')).toMatchObject({ supply: 2, capacity: 0, eligible: 0, skipped: { capacity: 2 } });
+    expect(turns).toBe(0);
+    const saved = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'full-seat.json'), 'utf8'));
+    writeFileSync(join(root, 'loop', 'orchestrator', 'free-seat.json'), JSON.stringify({ ...saved, runId: 'free-seat',
+      nodes: { intake: 'ok', split: 'ok', place: 'ok', delegate: 'ok' } }));
+    const free = await runOrchestratorNode('launch', { ...deps, root, runId: 'free-seat', window: '08',
+      now: new Date('2026-10-04T00:00:00Z'), launchProcesses: () => ({ status: 'ok', records: [] }) });
+    expect(free.launched?.map(row => row.seat)).toEqual(['MK']);
+    expect(ledger('free-seat')).toMatchObject({ supply: 2, capacity: 1, eligible: 1, skipped: { 'seat-occupied': 1 } });
+    expect(turns).toBe(1);
+    expect(readFileSync(join(root, 'seat-requests', 'requests.jsonl'), 'utf8').trim().split('\n')).toHaveLength(2);
+  } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
+}));
+
 const stages: Node[] = ['intake', 'split', 'place', 'delegate', 'launch', 'reconcile', 'report'];
 const fixture = async (run: (root: string, id: string, logged: Array<{ event: string; reason: string; targetLoopId?: string }>) => Promise<void>) => {
   const root = mkdtempSync(join(tmpdir(), 'orch-test-'));
@@ -53,7 +232,7 @@ const invoke = async (root: string, runId: string, window: '08' | '12' | '18', d
   let final;
   for (const node of stages) final = await runOrchestratorNode(node, { root, runId, window, now: new Date('2026-10-04T00:00:00Z'),
     print: () => {}, observe: (event, data) => logged.push({ event, reason: data.reason, ...(data.targetLoopId ? { targetLoopId: data.targetLoopId } : {}) }),
-    seatTurn: async () => ({ status: 'skipped-empty' }), ...deps });
+    seatTurn: async () => ({ status: 'skipped-empty' }), launchProcesses: () => ({ status: 'ok', records: [] }), ...deps });
   return final!;
 };
 
@@ -167,7 +346,7 @@ describe('COORD-HA ③ progress heartbeat — tick completion and board write ti
     expect(readCompletionHeartbeat(root)).toMatchObject({ runId: 'hb-live', node: 'place',
       boardWrittenAt: at.toISOString(), tickCompletedAt: null });
     for (const node of stages.slice(3)) await runOrchestratorNode(node, { ...common,
-      seatTurn: async () => ({ status: 'skipped-empty' }), print: () => {} });
+      seatTurn: async () => ({ status: 'skipped-empty' }), launchProcesses: () => ({ status: 'ok', records: [] }), print: () => {} });
     expect(readCompletionHeartbeat(root)).toMatchObject({ node: 'report', boardWrittenAt: at.toISOString() });
     const later = new Date('2026-10-05T00:10:00Z');
     await completeShadowRun(root, 'hb-shadow', later);
@@ -191,7 +370,7 @@ describe('COORD-HA ③ progress heartbeat — tick completion and board write ti
       placeCell: () => { writeFileSync(boardPath, 'placed'); return { version: '0.2.28' }; } });
     expect(failed.placementFailed).toBe(true);
     for (const node of stages.slice(3)) await runOrchestratorNode(node, { ...common, print: () => {},
-      seatTurn: async () => ({ status: 'skipped-empty' }) });
+      seatTurn: async () => ({ status: 'skipped-empty' }), launchProcesses: () => ({ status: 'ok', records: [] }) });
     expect(readCompletionHeartbeat(root)).toEqual(completed);
   }));
 
@@ -226,7 +405,7 @@ describe('COORD-HA ③ progress heartbeat — tick completion and board write ti
     expect(readCompletionHeartbeat(root)).toMatchObject({ runId: completed?.runId, tickCompletedAt: completed?.tickCompletedAt,
       boardWrittenAt: later.toISOString() });
     for (const node of stages.slice(3)) await runOrchestratorNode(node, { ...common,
-      seatTurn: async () => ({ status: 'skipped-empty' }), print: () => {} });
+      seatTurn: async () => ({ status: 'skipped-empty' }), launchProcesses: () => ({ status: 'ok', records: [] }), print: () => {} });
     expect(readCompletionHeartbeat(root)).toMatchObject({ runId: completed?.runId, tickCompletedAt: completed?.tickCompletedAt,
       boardWrittenAt: later.toISOString() });
   }));
@@ -365,7 +544,7 @@ describe('orchestrator degradation and per-tick cap', () => {
       let state;
       for (const node of stages) state = await runOrchestratorNode(node, { root, runId: 'carry-second', window: '08', mode: 'shadow',
         now: new Date('2026-10-05T00:00:00Z'), split: card => [{ id: card.id, title: card.title, seat: 'TC' }],
-        placeCell: () => null, gridHosts: [], loadAdapter: async () => undefined, print: () => {} });
+        placeCell: () => null, gridHosts: [], loadAdapter: async () => undefined, print: () => {}, launchProcesses: () => ({ status: 'ok', records: [] }) });
       expect(state!.cells.map(cell => cell.id)).toEqual(['C1', fresh.id, id]);
       expect(state!.wouldDelegate).toBe(3);
       expect(state!.deferredCells).toEqual([]);
@@ -1343,7 +1522,7 @@ test('COORD-HA: a cell split normally that meets L2 at placement is carried and 
   const split: TickDeps['split'] = () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }];
   const base: TickDeps = { root, runId: 'l2place', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {},
     observe: (event, data) => logged.push({ event, reason: data.reason }), seatTurn: async () => ({ status: 'skipped-empty' }),
-    split, placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined };
+    split, placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined, launchProcesses: () => ({ status: 'ok', records: [] }) };
   for (const node of ['intake', 'split'] as const) await runOrchestratorNode(node, base);
   const degraded: TickDeps = { ...base, degradation: () => ({ llm: true, board: false }) };
   await runOrchestratorNode('place', degraded);
@@ -1482,7 +1661,7 @@ test('COORD-HA: board down only during place (back by delegate) still carries th
   const split: TickDeps['split'] = () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }];
   const base: TickDeps = { root, runId: 'placeOnly', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {},
     observe: (event, data) => logged.push({ event, reason: data.reason }), seatTurn: async () => ({ status: 'skipped-empty' }),
-    split, placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined };
+    split, placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined, launchProcesses: () => ({ status: 'ok', records: [] }) };
   for (const node of ['intake', 'split'] as const) await runOrchestratorNode(node, base);
   await runOrchestratorNode('place', { ...base, degradation: () => ({ llm: true, board: false }) });
   const delegated = await runOrchestratorNode('delegate', { ...base, degradation: () => ({ llm: true, board: true }) });

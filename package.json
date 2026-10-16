@@ -1,7 +1,7 @@
 {
   "name": "elanous",
   "mcpName": "io.github.ElanvitalAI/elanous",
-  "version": "0.2.29",
+  "version": "0.2.31",
   "description": "Self-healing coding harness where eyes, hands, and memory all turn on one sentence — it authors its own goals, implements them in isolated worktrees, and reviews its own work.",
   "license": "Apache-2.0",
   "author": "Elanvital AI",
@@ -129,6 +129,7 @@
     "telegram": "^2.26.22"
   },
   "devDependencies": {
+    "@copilotkit/aimock": "1.45.1",
     "@types/bun": "^1.2.0",
     "@types/diff": "^8.0.0",
     "@types/node-cron": "^3.0.11",

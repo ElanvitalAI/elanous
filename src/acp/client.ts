@@ -692,6 +692,7 @@ export class AcpAgent {
     sessionId: SessionId;
     cwd?: string;
     mcpServers?: McpServer[];
+    _meta?: Record<string, unknown>;
   }): Promise<LoadSessionResponse> {
     if (!this.connection) throw new Error('AcpAgent not started');
     if (!this.peerCapabilities?.loadSession) {
@@ -701,6 +702,7 @@ export class AcpAgent {
       sessionId: req.sessionId,
       cwd: req.cwd ?? this.cwd,
       mcpServers: req.mcpServers ?? [],
+      ...(req._meta ? { _meta: req._meta } : {}),
     });
   }
 
@@ -764,13 +766,14 @@ export class AcpAgent {
 
   /** Begin a new session in the configured cwd. Returns the agent-
    *  assigned sessionId — caller stores this for follow-up turns. */
-  async newSession(): Promise<SessionId> {
+  async newSession(meta?: Record<string, unknown>): Promise<SessionId> {
     if (!this.connection) throw new Error('AcpAgent not started');
     let response;
     try {
       response = await this.connection.newSession({
         cwd: this.cwd,
         mcpServers: [],
+        ...(meta ? { _meta: meta } : {}),
       });
     } catch (error) {
       if (this.spec.id === 'claude'

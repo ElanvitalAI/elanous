@@ -1,10 +1,14 @@
 import { describe, expect, test } from 'bun:test';
-import { tmpdir, homedir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { autoApproveConfirmChannel, assertThrowawayTarget, formatHarnessDogfoodReport, HARNESS_DOGFOOD_DEPRECATION_NOTICE, HARNESS_DOGFOOD_REPLACEMENT_FROM_GOAL_FILE, HARNESS_DOGFOOD_REPLACEMENT_FROM_SENTENCE, HARNESS_DOGFOOD_REPLACEMENT, refuseHarnessDogfoodCli, runHarnessDogfood } from './dogfood.js';
 
 const THROWAWAY = join(tmpdir(), 'dogfood-target');   // 시스템 temp 하위 = 허용
+// ⭐ 실경로 표본은 «고정 경로»다 — `homedir()` 를 쓰면 게이트 Pod·`env -i` 빈 HOME 처럼 HOME 이
+//   temp 하위(`/tmp/...`)인 환경에선 그 «홈»이 정말 throwaway 라 가드가 (옳게) 허용하고 시험만 깨진다
+//   (0.2.30 gate #3 preexisting 2건). 가드 계약은 그대로 — 「temp 밖 실경로는 refuse」를 환경 무관하게 문다.
+const REAL_HOME = '/home/dogfood-real-user';
 
 describe('harness dogfood adapter', () => {
   test('uses an explicit always-yes confirmation channel', async () => {
@@ -56,12 +60,12 @@ describe('assertThrowawayTarget — C 안전 가드(auto-approve 우회 방지)'
   });
 
   test('★ 실경로(홈·repo·시스템) → refuse with current CLI guidance', () => {
-    const refused = () => assertThrowawayTarget(homedir());
+    const refused = () => assertThrowawayTarget(REAL_HOME);
     expect(refused).toThrow('throwaway');
     expect(refused).toThrow('CLI path');
     expect(refused).toThrow('tools.runDevHarness.modelSurface');
     expect(refused).not.toThrow('use RunDevHarness');
-    expect(() => assertThrowawayTarget(join(homedir(), 'source/repo'))).toThrow('throwaway');
+    expect(() => assertThrowawayTarget(join(REAL_HOME, 'source/repo'))).toThrow('throwaway');
     expect(() => assertThrowawayTarget('/etc/zshrc')).toThrow('throwaway');
     expect(() => assertThrowawayTarget(process.cwd())).toThrow('throwaway');
   });
@@ -71,7 +75,7 @@ describe('assertThrowawayTarget — C 안전 가드(auto-approve 우회 방지)'
   });
 
   test('runHarnessDogfood 도 실경로 target 을 current CLI guidance와 함께 refuse', async () => {
-    const refuse = () => runHarnessDogfood({ target: homedir(), objective: 'x', dispatch: async () => ({ output: 'unexpected' }) });
+    const refuse = () => runHarnessDogfood({ target: REAL_HOME, objective: 'x', dispatch: async () => ({ output: 'unexpected' }) });
     await expect(refuse()).rejects.toThrow('throwaway');
     await expect(refuse()).rejects.toThrow('CLI path');
     await expect(refuse()).rejects.toThrow('tools.runDevHarness.modelSurface');

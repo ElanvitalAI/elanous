@@ -24,7 +24,8 @@ const DEFAULT_SEAT_ROUTES = [
  *  So a delivered card with the seat loop off is not retried (the card waits in the inbox), and a shadow loop's wake is
  *  recorded as `wake_status = 'shadow'` — visible as «not executed», not mistaken for a real run. */
 export async function dispatchHook(event: QueuedHook, root: string, config: EventsConfig,
-  wake: HookWake = seat => runSeatLoopOnce(seat, { root, config: getUserConfig().loops?.seat ?? { mode: 'off' } }),
+  // Autonomous hook wake: the needs-owner hold stays on (NEEDS-OWNER-BOUNDARY).
+  wake: HookWake = seat => runSeatLoopOnce(seat, { root, needsOwnerGate: true, config: getUserConfig().loops?.seat ?? { mode: 'off' } }),
   now: () => number = Date.now): Promise<void> {
   const key = `${event.provider}:${event.eventId}`;
   const route = config.routes.find(candidate => candidate.source === event.provider && candidate.kind === event.kind);

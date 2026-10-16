@@ -14,6 +14,7 @@
 import { existsSync, readdirSync, readFileSync, readlinkSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { debug } from '../debug/log.js';
 import { selfDevRunsDir } from '../self-dev/run-store.js';
 import { launchBindingRunIds, launchRegistryDir, readLaunchBinding } from './launch-registry.js';
@@ -124,7 +125,7 @@ export function discoverStopProcesses(runId: string, goalPath: string | null, ta
 function stopProcessCwd(pid: number): string | null {
   try {
     if (process.platform === 'linux') return readlinkSync(`/proc/${pid}/cwd`);
-    const r = spawnSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { encoding: 'utf8', timeout: 5_000 });
+    const r = spawnSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { encoding: 'utf8', timeout: 5_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
     if (r.error || r.status !== 0 || typeof r.stdout !== 'string') return null;
     return r.stdout.split(/\r?\n/).find((line) => line.startsWith('n/'))?.slice(1) ?? null;
   } catch { return null; }
@@ -206,7 +207,7 @@ export function pidRecordFromLaunchBinding(runId: string, registryDir = launchRe
 /** macOS·Linux 공통 — UTC 시작 시각과 상태를 같은 ps 관측에서 읽는다. */
 export function psProcessStartMs(pid: number): number | null {
   const r = spawnSync('ps', ['-o', 'lstart=,stat=', '-p', String(pid)], {
-    encoding: 'utf8', timeout: 5_000, env: { ...process.env, TZ: 'UTC' },
+    encoding: 'utf8', timeout: 5_000, env: { ...process.env, TZ: 'UTC' }, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
   });
   if (r.status !== 0) return null;
   const match = /^\s*((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\w+\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(\S+)\s*$/.exec(r.stdout);
@@ -220,7 +221,7 @@ export function defaultHarnessStopDeps(overrides: Partial<HarnessStopDeps> = {},
   const env = { ...process.env };
   for (const key of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']) delete env[key];
   const kubectl = (args: readonly string[]) => {
-    const r = spawnSync('kubectl', [...args], { encoding: 'utf8', timeout: 15_000, env });
+    const r = spawnSync('kubectl', [...args], { encoding: 'utf8', timeout: 15_000, env, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
     return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? String(r.error ?? '') };
   };
   return {

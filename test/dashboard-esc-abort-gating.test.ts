@@ -1,5 +1,4 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
 
 import {
   clearEscAbortToolState,
@@ -17,6 +16,7 @@ import { SELF_IMPLEMENT_TOOL_NAMES } from '../src/boot/daemon-tools/self-impleme
 import { createEscAbortGate } from '../src/esc-abort-gate.js';
 import type { ModalSurface } from '../src/display/modal-stack.js';
 import { DEFAULT_THEME_TOKENS } from '../src/theme/tokens.js';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
 function toolCall(id: string, name: string) {
   return { id, name };
@@ -60,7 +60,7 @@ function finalizeTurnClearsEscAbortToolState(source: string): boolean {
 
 describe('dashboard ESC abort gating', () => {
   test('production dashboard wiring tracks stream callbacks and clears at turn boundaries', () => {
-    const source = readFileSync(new URL('../src/dashboard/index.ts', import.meta.url), 'utf8');
+    const source = tuiSourceText();
     const start = source.indexOf('const attachChatStreamingKeys =');
     const end = source.indexOf('// Scroll the log pane', start);
     const gateCallback = source.slice(start, end);
@@ -131,7 +131,7 @@ describe('dashboard ESC abort gating', () => {
   });
 
   test('cleanup still clears turn activity when settle throws', () => {
-    const source = readFileSync(new URL('../src/dashboard/index.ts', import.meta.url), 'utf8');
+    const source = tuiSourceText();
     const start = source.indexOf('const attachChatStreamingKeys =');
     const end = source.indexOf('// ── Working-directory workspace widgets', start);
     const body = source.slice(start, end);

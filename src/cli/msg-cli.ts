@@ -21,6 +21,14 @@ export interface MsgCliDeps {
   registerLogSink?: () => Promise<unknown>;
   /** Wake the recipient after a durable post; never changes the post outcome. */
   wake?: (address: string, msgId: number, message: { from: string; kind?: string }, deps: WakeDeps) => Promise<WakeOutcome>;
+  /** Test seams for the existing self-send transport and the selected task-card ledger. */
+  readCard?: typeof import('../task-agent/task-hand.js').readTaskCard;
+  podFragmentsForRun?: typeof import('../harness/self-send-target.js').listPodFragmentsForRun;
+  sendPod?: typeof import('../harness/self-send-target.js').dispatchPodSelfSend;
+  runScreen?: typeof import('../self-implement/run-ledger.js').queryRunScreenKey;
+  sendMemo?: typeof import('../harness/control-inbox.js').enqueueControlMemo;
+  sendStop?: typeof import('../harness/control-inbox.js').enqueueSoftStop;
+  screenAlive?: (spaceId: string) => boolean;
 }
 
 type CommonOptions = { json?: boolean };
@@ -59,6 +67,83 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
   const setExitCode = deps.setExitCode ?? ((code: number) => { process.exitCode = code; });
   const msg = program.command('msg').description('Durable seat-addressed messages');
 
+  // Called by both msg post and msg ask after their durable TA request is written.
+  const handleTaMessage = async (request: Message): Promise<void> => {
+    if (request.to !== 'TA' || request.from === 'TA' || request.replyTo !== undefined) return;
+    const command = /\b(stop|memo|status)\b/i.exec(request.body);
+    const cardId = /\bta-[a-zA-Z0-9][a-zA-Z0-9._-]*\b/.exec(request.body)?.[0]?.replace(/[.,!?]+$/, '');
+    if (!command || !cardId) return;
+    const { readTaskCard } = await import('../task-agent/task-hand.js');
+    const { queryRunScreenKey } = await import('../self-implement/run-ledger.js');
+    const { listHarnessScreens } = await import('../harness/harness-screen.js');
+    const { normalizeRunId } = await import('../harness/harness-space.js');
+    const { dispatchPodSelfSend, listPodFragmentsForRun } = await import('../harness/self-send-target.js');
+    const { enqueueControlMemo, enqueueSoftStop } = await import('../harness/control-inbox.js');
+    withStore(store => {
+      // Reserve one linked reply and pending delivery before touching another store or Pod.
+      const pending = store.db.transaction(() => {
+        // A concurrent sender may have claimed after an earlier read. Keep this
+        // check in the same write transaction as any pending reply change.
+        if (store.taDeliveryClaimState(request.id) === 'held') return null;
+        const reply = store.listReplies(request.id, 1)[0];
+        if (reply && store.taDeliveryStatus(request.id) !== 'pending') return null;
+        let delivery: (() => void) | undefined;
+        let deliveryReply: string | undefined;
+        let answer: string;
+        try {
+          const card = (deps.readCard ?? readTaskCard)(cardId);
+          if (!card) throw new Error(`카드 없음: ${cardId}`);
+          if (command[1]!.toLowerCase() === 'status') {
+            answer = `${card.id}: ${card.status}${card.runId ? ` · run ${card.runId}` : ''}`;
+          } else {
+            const runId = card.runId;
+            if (!runId || normalizeRunId(runId) !== runId) throw new Error(`${cardId}: 연결된 런 없음`);
+            const fragments = (deps.podFragmentsForRun ?? listPodFragmentsForRun)(runId);
+            const resolved = fragments.length === 0 ? (deps.runScreen ?? queryRunScreenKey)(runId) : null;
+            const screen = resolved?.logStoreStatus === 'read' ? resolved.screenKey : null;
+            if (fragments.length > 1 || (fragments.length === 0 && (!screen || !(deps.screenAlive ?? ((id: string) => listHarnessScreens().some(row => row.spaceId === id)))(screen)))) {
+              throw new Error(`${cardId}: 실행 중인 단일 런 공간을 찾을 수 없음`);
+            }
+            const space = fragments[0]?.spaceId ?? screen!;
+            const stop = command[1]!.toLowerCase() === 'stop';
+            const body = stop ? '' : request.body.replace(command[0], '').replace(cardId, '').trim().replace(/^[,.:;\s-]+/, '');
+            if (!stop && (!body || /[\r\n]/.test(body))) throw new Error('memo는 비어 있지 않은 한 줄이어야 한다');
+            const memo = { version: 1 as const, kind: 'supervisor', urgency: 'normal' as const, body };
+            answer = `${cardId}: run ${runId} 전달 여부 미확인 (${space}) — 자동 재시도 중지; 런 인박스를 확인하세요.`;
+            delivery = () => {
+              if (fragments.length) {
+                if (!(deps.sendPod ?? dispatchPodSelfSend)(space, stop ? { stop: true } : { memo })) throw new Error(`${cardId}: Pod 전달 실패`);
+              } else if (stop) (deps.sendStop ?? enqueueSoftStop)(space);
+              else (deps.sendMemo ?? enqueueControlMemo)(space, memo);
+            };
+            deliveryReply = stop ? `${cardId}: run ${runId} soft stop 요청 기록 (${space})`
+              : `${cardId}: run ${runId} 감독 메모 기록 (${space})`;
+          }
+        } catch (error) {
+          answer = `${cardId}: ${error instanceof Error ? error.message : String(error)}`;
+        }
+        if (delivery) store.setTaDeliveryStatus(request.id, 'pending');
+        if (reply) store.updateTaReply(request.id, answer);
+        else store.post({ from: 'TA', to: request.from, kind: 'reply', body: answer, replyTo: request.id });
+        return delivery && deliveryReply ? { delivery, reply: deliveryReply } : null;
+      }).immediate();
+      if (pending) {
+        const claim = store.claimTaDelivery(request.id);
+        if (!claim) return;
+        try {
+          pending.delivery();
+          store.settleTaDelivery(request.id, claim, pending.reply, true);
+        }
+        catch (error) {
+          // A transport error or failed DB settlement may follow a successful publication.
+          // Keep the claim and require inspection rather than send the same memo again.
+          store.markTaDeliveryUnknown(request.id, claim,
+            `${cardId}: 전달 여부 미확인 — 자동 재시도 중지: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    });
+  };
+
   const run = (action: () => void | Promise<void>) => async () => {
     try { await action(); }
     catch (error) {
@@ -94,6 +179,7 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
         ? store.post(envelope)
         : store.appendWithProvenance(envelope, opts.originKey));
       emit(posted, opts.json, () => out.log(formatMessage(posted)));
+      await handleTaMessage(posted); // msg post: process the durable TA request (including pending retry).
       const noBody = noReplyBodyNotice(to);
       if (noBody) out.error(noBody);
       // 저장 «뒤» 한 번 — 읽는 몸이 없다는 안내가 이미 나갔으면 깨움 경고는 겹쳐 내지 않는다.
@@ -273,6 +359,8 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       let store: MsgStore | undefined;
       try {
         const asked = withStore(ledger => ledger.post({ from, to, body: question }));
+        // msg ask uses the same saved-message handler before waiting for its linked reply.
+        await handleTaMessage(asked);
         const deadline = Date.now() + waitSeconds * 1000;
         let reply: Message | undefined;
         store = open();

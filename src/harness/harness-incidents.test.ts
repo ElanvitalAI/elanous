@@ -47,6 +47,85 @@ test('seven signal exits in a minute form exactly one burst; spread unknown exit
     row('run-c', 'unknown', at + 10 * 60_000)])).toEqual([]);
 });
 
+test('same hostname and reason form a 60-minute common-cause burst across seats', () => {
+  const at = Date.parse('2026-10-02T13:49:07.000Z');
+  const rows: RunExit[] = [
+    { ...row('run-a', 'signal', at), hostname: 'node-b', seat: 'MK', entrance: 'cli-harness-ask' },
+    { ...row('run-b', 'signal', at + 20 * 60_000), hostname: 'node-b', seat: 'UX', entrance: 'cli-dev-ask' },
+    { ...row('run-c', 'signal', at + 50 * 60_000), hostname: 'node-b', seat: 'TC', entrance: 'cli-harness-say' },
+  ];
+  expect(detectBursts(rows)).toEqual([{
+    reason: 'signal', count: 3, firstAt: rows[0]!.at, lastAt: rows[2]!.at,
+    runIds: ['run-a', 'run-b', 'run-c'], hostname: 'node-b',
+  }]);
+});
+
+test('hostname common-cause burst requires three exits, one host, one reason, and a 60-minute window', () => {
+  const at = Date.parse('2026-10-02T13:49:07.000Z');
+  expect(detectBursts([
+    { ...row('run-a', 'signal', at), hostname: 'node-b' },
+    { ...row('run-b', 'signal', at + 20 * 60_000), hostname: 'node-b' },
+  ])).toEqual([]);
+  expect(detectBursts([
+    { ...row('run-a', 'signal', at), hostname: 'node-b' },
+    { ...row('run-b', 'signal', at + 20 * 60_000), hostname: 'msb2' },
+    { ...row('run-c', 'signal', at + 40 * 60_000), hostname: 'msb3' },
+  ])).toEqual([]);
+  expect(detectBursts([
+    { ...row('run-a', 'signal', at), hostname: 'node-b' },
+    { ...row('run-b', 'unknown', at + 20 * 60_000), hostname: 'node-b' },
+    { ...row('run-c', 'pod-error', at + 40 * 60_000), hostname: 'node-b' },
+  ])).toEqual([]);
+  expect(detectBursts([
+    { ...row('run-a', 'signal', at), hostname: 'node-b' },
+    { ...row('run-b', 'signal', at + 20 * 60_000), hostname: 'node-b' },
+    { ...row('run-c', 'signal', at + 60 * 60_000 + 1), hostname: 'node-b' },
+  ])).toEqual([]);
+  const onWindow = [
+    { ...row('run-a', 'signal', at), hostname: 'node-b' },
+    { ...row('run-b', 'signal', at + 20 * 60_000), hostname: 'node-b' },
+    { ...row('run-c', 'signal', at + 60 * 60_000), hostname: 'node-b' },
+  ];
+  expect(detectBursts(onWindow)).toEqual([{
+    reason: 'signal', count: 3, firstAt: onWindow[0]!.at, lastAt: onWindow[2]!.at,
+    runIds: ['run-a', 'run-b', 'run-c'], hostname: 'node-b',
+  }]);
+});
+
+test('hostname grouping remains visible beside a same-seat burst inside the default one-minute window', () => {
+  const at = Date.parse('2026-10-02T13:49:07.000Z');
+  const rows = Array.from({ length: 3 }, (_, n) => ({
+    ...row(`run-${n}`, 'signal', at + n), hostname: 'node-b', seat: 'MK', entrance: 'cli-harness-ask',
+  }));
+  expect(detectBursts(rows)).toEqual([
+    { reason: 'signal', count: 3, firstAt: rows[0]!.at, lastAt: rows[2]!.at,
+      runIds: ['run-0', 'run-1', 'run-2'], seat: 'MK', entrance: 'cli-harness-ask' },
+    { reason: 'signal', count: 3, firstAt: rows[0]!.at, lastAt: rows[2]!.at,
+      runIds: ['run-0', 'run-1', 'run-2'], hostname: 'node-b' },
+  ]);
+});
+
+test('recorded cross-seat host burst does not enter the existing retry warning path', () => {
+  const dir = root();
+  const at = Date.now() - 60_000;
+  for (const [index, seat] of ['MK', 'UX', 'TC'].entries()) {
+    recordRunExit({ ...row(`host-${index}`, 'signal', at + index), hostname: 'node-b', seat,
+      entrance: 'cli-harness-ask' }, dir);
+  }
+  expect(detectBursts(readRunExits(dir)).find((burst) => burst.hostname === 'node-b')).toMatchObject({ count: 3 });
+  const lines: string[] = [];
+  expect(warnRecentIncidentBurst(dir, new Date(), (line) => lines.push(line))).toBe(false);
+  expect(lines).toEqual([]);
+});
+
+test('host common cause keeps its three-exit threshold when seat threshold changes', () => {
+  const at = Date.parse('2026-10-15T00:00:00Z');
+  const rows = [0, 1, 2].map((index) => ({ ...row(`host-${index}`, 'signal', at + index * 60_000),
+    hostname: 'node-b', seat: `seat-${index}` }));
+  expect(detectBursts(rows, { threshold: 2 }).filter((burst) => burst.hostname === 'node-b'))
+    .toMatchObject([{ count: 3, hostname: 'node-b' }]);
+});
+
 test('KST ledger is idempotent per run even across files, and absent runId is not recorded', () => {
   const dir = root();
   const first = row('run-first', 'signal', Date.parse('2026-10-02T14:59:59Z'));

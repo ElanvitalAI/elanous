@@ -6,6 +6,7 @@ export type TrafficSignal = {
   global: string;
   versions?: string[];
   hold?: string[];
+  order?: string[];
   paused?: Record<string, boolean>;
 };
 export type TrafficSignalRead = TrafficSignal | { unreadable: true } | null;
@@ -29,10 +30,12 @@ export function readTrafficSignal(path?: string): TrafficSignalRead {
     if (typeof row.global !== 'string'
       || (row.versions !== undefined && (!Array.isArray(row.versions) || !row.versions.every((version) => typeof version === 'string')))
       || (row.hold !== undefined && (!Array.isArray(row.hold) || !row.hold.every((id) => typeof id === 'string')))
+      || (row.order !== undefined && (!Array.isArray(row.order) || !row.order.every((id) => typeof id === 'string')))
       || (row.paused !== undefined && (!row.paused || typeof row.paused !== 'object' || Array.isArray(row.paused)
         || !Object.values(row.paused).every((paused) => typeof paused === 'boolean')))) return { unreadable: true };
     return { global: row.global, ...(row.versions !== undefined ? { versions: row.versions as string[] } : {}),
       ...(row.hold !== undefined ? { hold: row.hold as string[] } : {}),
+      ...(row.order !== undefined ? { order: row.order as string[] } : {}),
       ...(row.paused !== undefined ? { paused: row.paused as Record<string, boolean> } : {}) };
   } catch (error) {
     return missing(error) ? null : { unreadable: true };

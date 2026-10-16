@@ -27,10 +27,10 @@
 
 import {
   existsSync, readFileSync, writeFileSync, mkdirSync, renameSync,
-  chmodSync, realpathSync,
+  chmodSync, lstatSync, readlinkSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, dirname, basename, resolve } from 'node:path';
+import { join, dirname, parse, resolve, sep } from 'node:path';
 import { extractChatGPTClaims, decodeJWTPayload, type ChatGPTClaims } from './jwt.js';
 import { debug } from '../debug/log.js';
 import { isCodexStoreKey } from './codex-account.js';
@@ -347,12 +347,37 @@ export function listProviders(path: string = authStorePath()): string[] {
 /** 두 경로가 «실체로» 같은 파일인가. ⛔ 문자열 비교로는 심볼릭 링크가 가드를 통과한다
  *  (`CODEX_HOME` 이 `~/.codex` 로 가는 링크면 resolve() 결과가 다르다 · 리뷰 must-fix).
  *  ⚠️ 파일이 아직 없을 수 있으므로 «부모까지» 실체화하고 이름을 붙인다. */
+export function resolveMirrorGuardPath(path: string): string {
+  let candidate = resolve(path);
+  const visited = new Set<string>();
+  for (let hop = 0; hop < 40; hop++) {
+    if (visited.has(candidate)) throw new Error('mirror path symlink cycle');
+    visited.add(candidate);
+    const root = parse(candidate).root;
+    const parts = candidate.slice(root.length).split(sep).filter(Boolean);
+    let prefix = root;
+    let expanded = false;
+    for (const [index, part] of parts.entries()) {
+      const next = join(prefix, part);
+      let link = false;
+      try { link = lstatSync(next).isSymbolicLink(); }
+      catch (error) {
+        if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+      }
+      if (link) {
+        candidate = resolve(dirname(next), readlinkSync(next), ...parts.slice(index + 1));
+        expanded = true;
+        break;
+      }
+      prefix = next;
+    }
+    if (!expanded) return candidate;
+  }
+  throw new Error('mirror path symlink depth exceeded');
+}
+
 function sameRealFile(a: string, b: string): boolean {
-  const norm = (p: string): string => {
-    try { return realpathSync(p); } catch { /* 아직 없다 — 부모로 내려간다 */ }
-    try { return join(realpathSync(dirname(p)), basename(p)); } catch { return resolve(p); }
-  };
-  return norm(a) === norm(b);
+  return resolveMirrorGuardPath(a) === resolveMirrorGuardPath(b);
 }
 
 /** ⛔ 테스트 러너 판정 — 이 값이 «거짓»이면 가드는 영영 안 도는 장식이 된다.

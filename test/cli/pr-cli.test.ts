@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { Command } from 'commander';
 import { debug } from '../../src/debug/log.js';
+import { runLandingPodShadowJob } from '../../src/cli/pr-land-pod-shadow-job.js';
 import { setGitCommandRunnerForTesting } from '../../src/git-fs/runner.js';
 import { parseNumstat, parsePorcelainStatus, registerPrCommands as realRegisterPrCommands, runPrGranularity, runPrLand as realRunPrLand, decideOverlapLanding, overlapDecisionFromConfirm, publicLeakWarning, exportLeakBlock, runPrLandExportLeakCheck, docsCliWarning, publicDocPaths, OVERLAP_DECISION_PROMPT, createOverlapConfirmChannel, formatCommitMessageFallbackNotice, formatLandReasonNotice, codePointLength, branchLineageSlug, findSiblingPrs } from '../../src/cli/pr-cli.js';
 import type { ConfirmOpts, ConfirmResult } from '../../src/hitl/confirm.js';
@@ -1196,6 +1197,7 @@ describe('elanous pr land', () => {
         if (cmd === 'git' && command === 'status --porcelain') return { ok: true, out: '' };
         if (cmd === 'git' && command === 'fetch --quiet origin main') return { ok: true, out: '' };
         if (cmd === 'git' && command === 'rev-parse --verify origin/main') return { ok: true, out: `${TIP}\n` };
+        if (cmd === 'git' && command === 'rev-parse --verify refs/remotes/origin/main') return { ok: true, out: `${TIP}\n` };
         if (cmd === 'git' && command === 'ls-remote origin refs/heads/main') return { ok: true, out: `${TIP}\trefs/heads/main\n` };
         if (cmd === 'git' && command === `merge-base --is-ancestor ${TIP} ${HEAD}`) return { ok: opts.ancestor ?? true, out: '' };
         const w = opts.window;
@@ -1271,7 +1273,7 @@ describe('elanous pr land', () => {
         expect(localTypecheckCalls).toBe(0);
         expect(calls).not.toContain('merge');
       } finally { rmSync(dir, { recursive: true, force: true }); }
-    });
+    }, 30_000);
 
     it('rechecks overlap after main advances during the remote gate and refuses the new non-ancestor landing', async () => {
       const { run: inner } = pinnedRun({ landingAncestors: LANDINGS });
@@ -1297,7 +1299,7 @@ describe('elanous pr land', () => {
         expect(sink.errors.join('\n')).toContain('ancestor-auto-not-ancestor:');
         expect(calls).not.toContain('merge');
       } finally { rmSync(dir, { recursive: true, force: true }); }
-    });
+    }, 30_000);
 
     it('rechecks overlap after main advances during a local pinned gate', async () => {
       const { run: inner } = pinnedRun({ landingAncestors: LANDINGS });
@@ -1320,16 +1322,178 @@ describe('elanous pr land', () => {
         expect(sink.errors.join('\n')).toContain('ancestor-auto-not-ancestor:');
         expect(calls).not.toContain('merge');
       } finally { rmSync(dir, { recursive: true, force: true }); }
-    });
+    }, 30_000);
 
-    it('pinned dry-run checks identity without marking a PR for resync', async () => {
+    it('pinned dry-run checks overlap and refuses without marking a PR for resync', async () => {
       const { run, commands } = pinnedRun({ landingAncestors: [LANDINGS[0]!] });
       const sink = output();
       expect(await runPrLand({ pr: '51', expectedHead: HEAD, dryRun: true }, {
         ...baseDeps, run, manager: pinnedManager().manager, out: sink.out,
-      })).toBe(0);
+      })).toBe(1);
       expect(sink.logs.join('\n')).toContain('✓ preflight');
+      expect(sink.errors).toContain('✗ expected-head: overlap merge approval unavailable for the reviewed head');
       expect(commands.some(({ cmd, args }) => cmd === 'gh' && args.includes('--add-label'))).toBe(false);
+      expect(commands.some(({ cmd, args }) => cmd === 'git' && args[0] === 'fetch')).toBe(false);
+      expect(commands.some(({ cmd, args }) => cmd === 'git' && args[0] === 'diff' && args.at(-1) === 'refs/remotes/origin/main...HEAD')).toBe(true);
+      expect(commands.some(({ cmd, args }) => cmd === 'git' && args[0] === 'log' && args.includes('refs/remotes/origin/main'))).toBe(true);
+    });
+
+    it('pinned dry-run refuses a stale tracking ref before measuring overlap or writing refs', async () => {
+      const { run, commands } = pinnedRun();
+      const sink = output();
+      expect(await runPrLand({ pr: '51', expectedHead: HEAD, dryRun: true }, {
+        ...baseDeps, run: (cmd, args) => args[0] === 'ls-remote'
+          ? { ok: true, out: `${'c'.repeat(40)}\trefs/heads/main\n` }
+          : run(cmd, args),
+        manager: pinnedManager().manager, out: sink.out,
+      })).toBe(1);
+      expect(sink.errors.some((line) => line.startsWith('✗ overlap-preflight:'))).toBe(true);
+      expect(commands.some(({ cmd, args }) => cmd === 'git' && (args[0] === 'log' || args[0] === 'diff' || args[0] === 'fetch'))).toBe(false);
+      expect(commands.some(({ cmd, args }) => cmd === 'gh' && args[1] === 'edit')).toBe(false);
+    });
+
+    it('pinned dry-run checks the full tracking ref when a local branch shadows origin/main', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'land-preview-ref-collision-'));
+      const repo = join(root, 'repo');
+      const remote = join(root, 'remote.git');
+      try {
+        git(root, 'init', '--bare', remote);
+        git(root, 'init', '-b', 'main', repo);
+        git(repo, 'config', 'user.name', 'Preview Test');
+        git(repo, 'config', 'user.email', 'preview@example.test');
+        writeFileSync(join(repo, 'base.txt'), 'old\n');
+        git(repo, 'add', 'base.txt');
+        git(repo, 'commit', '-m', 'old base');
+        const oldTip = git(repo, 'rev-parse', 'HEAD');
+        git(repo, 'remote', 'add', 'origin', remote);
+        git(repo, 'push', '-u', 'origin', 'main');
+        git(repo, 'switch', '-c', 'feat/land');
+        writeFileSync(join(repo, 'feature.txt'), 'feature\n');
+        git(repo, 'add', 'feature.txt');
+        git(repo, 'commit', '-m', 'feature');
+        const head = git(repo, 'rev-parse', 'HEAD');
+        git(repo, 'switch', 'main');
+        writeFileSync(join(repo, 'base.txt'), 'new\n');
+        git(repo, 'add', 'base.txt');
+        git(repo, 'commit', '-m', 'new base');
+        const newTip = git(repo, 'rev-parse', 'HEAD');
+        git(repo, 'push', 'origin', 'main');
+        git(repo, 'update-ref', 'refs/remotes/origin/main', oldTip);
+        git(repo, 'branch', 'origin/main', newTip);
+        git(repo, 'switch', 'feat/land');
+        const fetchHead = join(repo, '.git', 'FETCH_HEAD');
+        writeFileSync(fetchHead, 'sentinel\n');
+        const sink = output();
+        const run: CmdRunner = (cmd, args, options) => {
+          if (cmd === 'gh') return { ok: true, out: JSON.stringify({ headRefOid: head, headRefName: 'feat/land', baseRefName: 'main', state: 'OPEN', isDraft: false, url: URL }) };
+          const result = spawnSync(cmd, [...args], { cwd: options?.cwd ?? repo, encoding: 'utf8' });
+          return { ok: result.status === 0, out: result.stdout ?? '', err: result.stderr ?? '' };
+        };
+        expect(await runPrLand({ pr: '51', expectedHead: head, dryRun: true, cwd: repo, base: 'main' }, {
+          ...baseDeps, run, resolveBase: () => 'main', manager: pinnedManager().manager, out: sink.out,
+        })).toBe(1);
+        expect(sink.errors.some((line) => line.startsWith('✗ overlap-preflight:'))).toBe(true);
+        expect(git(repo, 'rev-parse', 'refs/remotes/origin/main')).toBe(oldTip);
+        expect(git(repo, 'rev-parse', 'refs/heads/origin/main')).toBe(newTip);
+        expect(readFileSync(fetchHead, 'utf8')).toBe('sentinel\n');
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it('pinned dry-run accepts verified overlap evidence without a write or heavy gate', async () => {
+      const { run, commands } = pinnedRun();
+      const { dir, evidence } = evidenceFiles();
+      const { manager, calls } = pinnedManager();
+      const sink = output();
+      try {
+        expect(await runPrLand({ pr: '51', expectedHead: HEAD, dryRun: true, overlapEvidence: evidence }, {
+          ...baseDeps, run, manager, out: sink.out, reviewResultsDir: join(dir, 'review-results'),
+          runTypecheckGate: () => { throw new Error('dry-run must not typecheck'); },
+          runHeavyRemote: () => { throw new Error('dry-run must not launch heavy gate'); },
+        })).toBe(0);
+        expect(sink.logs.some((line) => line.startsWith('✓ overlap-evidence:'))).toBe(true);
+        expect(calls).toEqual([]);
+        expect(commands.some(({ cmd, args }) => cmd === 'git' && args[0] === 'fetch')).toBe(false);
+        expect(commands.some(({ cmd, args }) => cmd === 'gh' && args[1] === 'edit')).toBe(false);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it('pinned dry-run accepts a reviewed virtual rebase with unchanged Git state', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'land-virtual-preview-'));
+      const repo = join(root, 'repo');
+      const remote = join(root, 'remote.git');
+      try {
+        git(root, 'init', '--bare', remote);
+        git(root, 'init', '-b', 'main', repo);
+        git(repo, 'config', 'user.name', 'Virtual Preview');
+        git(repo, 'config', 'user.email', 'preview@example.test');
+        mkdirSync(join(repo, 'src'));
+        const file = join(repo, 'src', 'land.ts');
+        const lines = Array.from({ length: 30 }, (_, index) => `line ${index}\n`);
+        writeFileSync(file, lines.join(''));
+        git(repo, 'add', '.');
+        git(repo, 'commit', '-m', 'base');
+        git(repo, 'remote', 'add', 'origin', remote);
+        git(repo, 'push', '-u', 'origin', 'main');
+        git(repo, 'switch', '-c', 'feat/land');
+        lines[25] = 'feature line\n';
+        writeFileSync(file, lines.join(''));
+        git(repo, 'commit', '-am', 'feature');
+        const head = git(repo, 'rev-parse', 'HEAD');
+        git(repo, 'switch', 'main');
+        lines[25] = 'line 25\n';
+        lines[2] = 'main line\n';
+        writeFileSync(file, lines.join(''));
+        git(repo, 'commit', '-am', 'chore: land another PR');
+        git(repo, 'push', 'origin', 'main');
+        git(repo, 'switch', 'feat/land');
+        const reviewDir = join(root, 'review-results');
+        mkdirSync(reviewDir);
+        writeFileSync(join(reviewDir, `VIRTUAL-51-${head.slice(0, 12)}.json`),
+          `${JSON.stringify({ pr: 51, verdict: 'pass', reviewed: true, mustFix: [], headCommit: head })}\n`);
+        const fetchHead = join(repo, '.git', 'FETCH_HEAD');
+        writeFileSync(fetchHead, 'sentinel\n');
+        const refs = git(repo, 'show-ref');
+        const objects = git(repo, 'count-objects', '-v');
+        const sink = output();
+        const run: CmdRunner = (command, args, options) => {
+          if (command === 'gh') return { ok: true, out: JSON.stringify({ headRefOid: head, headRefName: 'feat/land', baseRefName: 'main', state: 'OPEN', isDraft: false, url: URL }) };
+          if (command === 'git' && args.join(' ') === 'remote get-url origin') return { ok: true, out: 'git@github.com:example/repo.git\n' };
+          const result = spawnSync(command, [...args], { cwd: options?.cwd ?? repo, encoding: 'utf8' });
+          return { ok: result.status === 0, out: result.stdout ?? '', err: result.stderr ?? '' };
+        };
+        expect(await runPrLand({ pr: '51', expectedHead: head, dryRun: true, cwd: repo, base: 'main' }, {
+          ...baseDeps, run, resolveBase: () => 'main', reviewResultsDir: reviewDir,
+          manager: pinnedManager().manager, out: sink.out,
+        })).toBe(0);
+        expect(sink.logs.join('\n')).toContain('virtual-rebase');
+        expect(git(repo, 'show-ref')).toBe(refs);
+        expect(git(repo, 'count-objects', '-v')).toBe(objects);
+        expect(readFileSync(fetchHead, 'utf8')).toBe('sentinel\n');
+        const landing = pinnedManager();
+        const landingOutput = output();
+        const landingCode = await runPrLand({ pr: '51', expectedHead: head, cwd: repo, base: 'main' }, {
+          ...baseDeps, run, resolveBase: () => 'main', reviewResultsDir: reviewDir,
+          manager: landing.manager, out: landingOutput.out,
+          decideOverlapLanding: () => ({ outcome: 'unavailable', channel: 'all-failed', interactive: false }),
+        });
+        if (landingCode !== 0) throw new Error(`landing refused: ${landingOutput.errors.join(' | ')} / ${landingOutput.logs.join(' | ')}`);
+        expect(landingOutput.logs.join('\n')).toContain('virtual-rebase');
+        expect(landing.calls).toContain('merge');
+        writeFileSync(fetchHead, 'sentinel\n');
+        const refsAfterLanding = git(repo, 'show-ref');
+        const objectsAfterLanding = git(repo, 'count-objects', '-v');
+        writeFileSync(join(reviewDir, `VIRTUAL-FAIL-51-${head.slice(0, 12)}.json`),
+          `${JSON.stringify({ pr: 51, verdict: 'fail', reviewed: true, mustFix: ['blocked'], headCommit: head })}\n`);
+        const refused = output();
+        expect(await runPrLand({ pr: '51', expectedHead: head, dryRun: true, cwd: repo, base: 'main' }, {
+          ...baseDeps, run, resolveBase: () => 'main', reviewResultsDir: reviewDir,
+          manager: pinnedManager().manager, out: refused.out,
+        })).toBe(1);
+        expect(refused.errors.join('\n')).toContain('review-verdict-fail');
+        expect(git(repo, 'show-ref')).toBe(refsAfterLanding);
+        expect(git(repo, 'count-objects', '-v')).toBe(objectsAfterLanding);
+        expect(readFileSync(fetchHead, 'utf8')).toBe('sentinel\n');
+      } finally { rmSync(root, { recursive: true, force: true }); }
     });
 
     it('verified evidence (rebased · gated on that base · review pass must-fix 0) lands the pinned head', async () => {
@@ -1344,6 +1508,12 @@ describe('elanous pr land', () => {
         expect(sink.logs.some((line) => line.startsWith('✓ overlap-evidence:'))).toBe(true);
         expect(commands.some(({ cmd, args }) => cmd === 'git' && args[0] === 'ls-remote')).toBe(true);
         expect(commands.filter(({ cmd, args }) => cmd === 'git' && args[0] === 'fetch').every(({ args }) => args.join(' ') === 'fetch --quiet origin main')).toBe(true);
+        const fetchIndex = commands.findIndex(({ cmd, args }) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main');
+        const landingLogIndexes = commands.flatMap(({ cmd, args }, index) => cmd === 'git' && args[0] === 'log'
+          && args.includes('--since=1 day ago') && args.includes('--name-only') && args.includes('--no-merges') && args.includes('origin/main') ? [index] : []);
+        expect(fetchIndex).toBeGreaterThanOrEqual(0);
+        expect(landingLogIndexes.some((index) => index < fetchIndex)).toBe(true);
+        expect(landingLogIndexes.some((index) => index > fetchIndex)).toBe(true);
         const seen = logged.mock.calls.filter((call) => call[0] === 'pr.land' && call[1] === 'overlap-evidence').map((call) => call[2]);
         expect(seen).toEqual([expect.objectContaining({ decision: 'accepted', pr: 51, head: HEAD, baseTip: TIP })]);
       } finally {
@@ -1438,12 +1608,13 @@ describe('elanous pr land', () => {
       const { dir, evidence } = evidenceFiles();
       let mainReads = 0;
       const pairs: Array<{ head: string; main: string }> = [];
+      const shadowPairs: Array<{ head: string; main: string }> = [];
       const loads: unknown[] = [];
       const logged = spyOn(debug, 'log').mockImplementation((...call: unknown[]) => { loads.push(call); });
       const samples = [[1.25, 0.5, 0.25], [1.5, 0.75, 0.3], [2.25, 1.1, 0.4], [2.5, 1.2, 0.45]] as const;
       let sample = 0;
       try {
-        const code = await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence, heavyRemote: true }, {
+        const code = await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence, heavyRemote: true, heavyOnPodShadow: true }, {
           ...baseDeps, reviewResultsDir: join(dir, 'review-results'), manager, out: sink.out,
           loadavg: () => samples[Math.min(sample++, samples.length - 1)]!,
           run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main'
@@ -1459,7 +1630,19 @@ describe('elanous pr land', () => {
             : inner(cmd, args),
           runHeavyRemote: ({ head, main }) => {
             pairs.push({ head, main });
-            return { ok: true, host: 'node-c', source: 'remote', elapsedMs: 1, evidencePath: '/tmp/injected-heavy.json', interferenceMeasured: false };
+            return { ok: true, host: 'node-c', source: 'remote', elapsedMs: 1, evidencePath: '/tmp/injected-heavy.json', interferenceMeasured: false,
+              rootPlan: { mode: 'affected', roots: 4, promoted: false, reason: null } };
+          },
+          runLandingPodShadow: async ({ head, main }) => {
+            shadowPairs.push({ head, main });
+            return runLandingPodShadowJob({ head, main }, {
+              runPod: async (options) => {
+                expect(options.source).toEqual({ kind: 'commit', sha: head });
+                expect(options.command[2]).toContain(`self gate --changed --base '${main}'`);
+                return { exitCode: 0, artifactsDir: '/tmp/shadow-test', job: 'shadow-pod' };
+              },
+              readLog: () => `ELANOUS_PRLAND_SHADOW_TSC_PLAN {"mode":"affected","roots":4,"promoted":false,"reason":null}\nELANOUS_PRLAND_SHADOW head=${head} main=${main} tsc=0 gate=1\n`,
+            });
           },
           runTypecheckGate: () => { throw new Error('local tsc ran'); },
           runPwaGate: () => { throw new Error('local PWA build ran'); },
@@ -1470,6 +1653,10 @@ describe('elanous pr land', () => {
         // initial read, moved read, post-gate confirm that WINDOW_A is still main
         expect(mainReads).toBe(3);
         expect(pairs).toEqual([{ head: HEAD, main: TIP }, { head: HEAD, main: WINDOW_A }]);
+        expect(shadowPairs).toEqual([{ head: HEAD, main: TIP }]);
+        expect(loads.some((call) => Array.isArray(call) && call[0] === 'pr.land' && call[1] === 'heavy-on-pod-shadow'
+          && (call[2] as { agree?: boolean; pod?: { job?: string } }).agree === false
+          && (call[2] as { pod?: { job?: string } }).pod?.job === 'shadow-pod')).toBe(true);
         expect(calls).toContain('merge');
         expect(sink.errors.join('\n')).toContain('node-c 검사 미측정');
         expect(sink.logs.join('\n')).toContain('heavy-remote: host=node-c');
@@ -1797,7 +1984,7 @@ describe('elanous pr land', () => {
         expect(heavyCalls).toBe(1);
         expect(sink.errors.join('\n')).toContain('ancestor-auto-not-ancestor:');
       } finally { rmSync(dir, { recursive: true, force: true }); }
-    });
+    }, 30_000);
 
     it('fails closed without merging when origin/main keeps moving past the stability bound', async () => {
       const { run: inner } = pinnedRun();
@@ -1976,8 +2163,19 @@ describe('elanous pr land', () => {
       const sink = output();
       const { dir, evidence } = evidenceFiles(files);
       const logged = spyOn(debug, 'log').mockImplementation(() => {});
+      let typecheckCalls = 0;
+      let isolationCalls = 0;
+      let heavyCalls = 0;
       try {
-        expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence }, { ...baseDeps, reviewResultsDir: join(dir, 'review-results'), run, manager, out: sink.out })).toBe(1);
+        expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence, heavyRemote: true }, {
+          ...baseDeps, reviewResultsDir: join(dir, 'review-results'), run, manager, out: sink.out,
+          runTypecheckGate: () => { typecheckCalls += 1; return true; },
+          runIsolationGate: () => { isolationCalls += 1; return true; },
+          runHeavyRemote: () => { heavyCalls += 1; return { ok: true, source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }; },
+        })).toBe(1);
+        expect(typecheckCalls).toBe(0);
+        expect(isolationCalls).toBe(0);
+        expect(heavyCalls).toBe(0);
         expect(sink.errors.some((line) => line.startsWith(`✗ overlap-evidence: ${reason}`))).toBe(true);
         expect(sink.errors).toContain('✗ expected-head: overlap merge approval unavailable for the reviewed head');
         expect(calls).not.toContain('merge');
@@ -1989,13 +2187,73 @@ describe('elanous pr land', () => {
       }
     });
 
+    it.each([
+      ['review missing', {}, 'review-unreadable', true],
+      ['review head mismatch', { review: { headCommit: 'd'.repeat(40) } }, 'review-head-mismatch', false],
+      ['base window overlaps a PR file', { gateBase: GATE_BASE }, 'base-stale-overlap', false],
+    ] as const)('rejects %s before local gates', async (_label, files, reason, removeReview) => {
+      const { run } = pinnedRun({
+        ...(reason === 'base-stale-overlap'
+          ? { ancestor: false, window: { windowLog: `\u0001${WINDOW_A}\n\nsrc/land.ts\n` } }
+          : {}),
+      });
+      const { dir, evidence } = evidenceFiles(files);
+      const { manager, calls } = pinnedManager();
+      if (removeReview) {
+        const record = JSON.parse(readFileSync(evidence, 'utf8')) as { reviewResult: string };
+        rmSync(record.reviewResult);
+      }
+      try {
+        for (const heavyRemote of [false, true]) {
+          const sink = output();
+          const gateCalls: string[] = [];
+          expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence, heavyRemote }, {
+            ...baseDeps, run, manager, out: sink.out, reviewResultsDir: join(dir, 'review-results'),
+            runTypecheckGate: () => { gateCalls.push('typecheck'); return true; },
+            runIsolationGate: () => { gateCalls.push('isolation'); return true; },
+            runHeavyRemote: () => { gateCalls.push('heavy-remote'); return { ok: true, source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }; },
+          })).toBe(1);
+          expect(sink.errors.join('\n')).toContain(`✗ overlap-evidence: ${reason}`);
+          expect(gateCalls).toEqual([]);
+          expect(calls).not.toContain('merge');
+        }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it('fails closed before any gate when the pinned changed-file diff is unreadable', async () => {
+      const { run: inner } = pinnedRun();
+      const { manager, calls } = pinnedManager();
+      const sink = output();
+      const gateCalls: string[] = [];
+      expect(await runPrLand({ pr: '51', expectedHead: HEAD, heavyRemote: true }, {
+        ...baseDeps, manager, out: sink.out,
+        run: (cmd, args) => cmd === 'git' && args[0] === 'diff' && args.includes('--name-only')
+          ? { ok: false, out: '', err: 'unreadable' }
+          : inner(cmd, args),
+        runTypecheckGate: () => { gateCalls.push('typecheck'); return true; },
+        runIsolationGate: () => { gateCalls.push('isolation'); return true; },
+        runHeavyRemote: () => { gateCalls.push('heavy-remote'); return { ok: true, source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }; },
+      })).toBe(1);
+      expect(sink.errors.join('\n')).toContain('✗ overlap-preflight: PR 변경 파일을 읽지 못했다');
+      expect(gateCalls).toEqual([]);
+      expect(calls).not.toContain('merge');
+    });
+
     it('review verdict warn with zero must-fix lands the pinned head (same rule as canAuto)', async () => {
       const { run } = pinnedRun();
       const { manager, calls } = pinnedManager();
       const sink = output();
       const { dir, evidence } = evidenceFiles({ review: { verdict: 'warn' } });
+      const gateCalls: string[] = [];
       try {
-        expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence }, { ...baseDeps, reviewResultsDir: join(dir, 'review-results'), run, manager, out: sink.out })).toBe(0);
+        expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence }, {
+          ...baseDeps, reviewResultsDir: join(dir, 'review-results'), run, manager, out: sink.out,
+          runTypecheckGate: () => { gateCalls.push('typecheck'); return true; },
+          runIsolationGate: () => { gateCalls.push('isolation'); return true; },
+        })).toBe(0);
+        expect(gateCalls).toEqual(['typecheck', 'isolation']);
+        expect(logIndex(sink.logs, (line) => line.startsWith('✓ overlap-evidence:')))
+          .toBeLessThan(logIndex(sink.logs, (line) => line.startsWith('✓ typecheck:')));
         expect(calls).toContain('merge');
       } finally {
         rmSync(dir, { recursive: true, force: true });
@@ -2016,6 +2274,10 @@ describe('elanous pr land', () => {
         expect(calls).toContain('merge');
         expect(sink.logs.some((line) => line.startsWith('✓ overlap-evidence: base-advanced-disjoint'))).toBe(true);
         expect(commands.filter(({ cmd, args }) => cmd === 'git' && args[0] === 'fetch').every(({ args }) => args.join(' ') === 'fetch --quiet origin main')).toBe(true);
+        const fetchIndex = commands.findIndex(({ cmd, args }) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main');
+        const windowLogIndex = commands.findIndex(({ cmd, args }) => cmd === 'git' && args[0] === 'log' && args.includes('--first-parent') && args.includes('--name-only'));
+        expect(fetchIndex).toBeGreaterThanOrEqual(0);
+        expect(windowLogIndex).toBeGreaterThan(fetchIndex);
         expect(commands.some(({ cmd, args }) => cmd === 'git' && args.join(' ') === `diff --name-only --no-renames ${FORK} ${HEAD}`)).toBe(true);
         const seen = logged.mock.calls.filter((call) => call[0] === 'pr.land' && call[1] === 'overlap-evidence').map((call) => call[2]);
         expect(seen).toEqual([expect.objectContaining({ decision: 'accepted', reason: 'base-advanced-disjoint', baseTip: TIP, gateBase: GATE_BASE, windowCommits: 2 })]);
@@ -3874,6 +4136,14 @@ describe('pinned PR landing preview', () => {
       if (cmd === 'gh') return { ok: true, out: JSON.stringify({ headRefOid: prHead, headRefName: 'feat/land', state: 'OPEN', isDraft, url: `https://github.com/example/repo/pull/${pr}` }) };
       if (args.join(' ') === 'rev-parse HEAD') return { ok: true, out: head };
       if (args.join(' ') === 'status --porcelain') return { ok: true, out: status };
+      if (cmd === 'git' && args.join(' ') === 'remote') return { ok: true, out: 'origin\n' };
+      if (cmd === 'git' && args[0] === 'ls-remote') return { ok: true, out: `${'b'.repeat(40)}\trefs/heads/main\n` };
+      if (cmd === 'git' && args[0] === 'rev-parse' && args.includes('origin/main')) return { ok: true, out: `${'b'.repeat(40)}\n` };
+      if (cmd === 'git' && args[0] === 'rev-parse' && args.includes('refs/remotes/origin/main')) return { ok: true, out: `${'b'.repeat(40)}\n` };
+      if (cmd === 'git' && args[0] === 'status' && args.includes('--porcelain=v1')) return { ok: true, out: '' };
+      if (cmd === 'git' && args[0] === 'diff' && args.includes('--name-only')) return { ok: true, out: 'src/x.ts\n' };
+      if (cmd === 'git' && args[0] === 'log') return { ok: true, out: '' };
+      if (cmd === 'git' && args[0] === 'rev-list') return { ok: true, out: '0 0\n' };
       throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
     };
     const code = await runPrLand({ pr, expectedHead: head, dryRun: true }, { ...baseDeps, manager, out: sink.out, run });
@@ -3881,11 +4151,15 @@ describe('pinned PR landing preview', () => {
     expect(sink.logs.join('\n')).toContain(signal);
     if (isDraft) expect(sink.logs).toContain(`[dry-run] 선행: eln gh pr ready ${pr}`);
     expect(mutations).toEqual([]);
-    expect(calls).toEqual([
+    expect(calls.slice(0, 3)).toEqual([
       `gh pr view ${pr} --json headRefOid,headRefName,baseRefName,state,isDraft,url`,
       'git rev-parse HEAD',
       'git status --porcelain',
     ]);
+    if (expectedCode === 0) {
+      expect(calls.some((call) => call.startsWith('git ls-remote origin refs/heads/main'))).toBe(true);
+      expect(calls.every((call) => !/^git (fetch|push|merge|commit|checkout)\b|^gh pr (edit|ready|merge)\b/u.test(call))).toBe(true);
+    } else expect(calls).toHaveLength(3);
     if (expectedCode === 1) {
       const actual = output();
       const edges: { event: string; data?: unknown }[] = [];
@@ -3916,13 +4190,22 @@ describe('pinned PR landing preview', () => {
       if (cmd === 'gh') return { ok: true, out: JSON.stringify({ headRefOid: head, headRefName: 'feat/land', state: 'OPEN', isDraft: false, url: `https://github.com/example/repo/pull/${pr}` }) };
       if (args.join(' ') === 'rev-parse HEAD') return { ok: true, out: head };
       if (args.join(' ') === 'status --porcelain') return { ok: true, out: '' };
+      if (cmd === 'git' && args.join(' ') === 'remote') return { ok: true, out: 'origin\n' };
+      if (cmd === 'git' && args[0] === 'ls-remote') return { ok: true, out: `${'b'.repeat(40)}\trefs/heads/main\n` };
+      if (cmd === 'git' && args[0] === 'rev-parse' && args.includes('origin/main')) return { ok: true, out: `${'b'.repeat(40)}\n` };
+      if (cmd === 'git' && args[0] === 'rev-parse' && args.includes('refs/remotes/origin/main')) return { ok: true, out: `${'b'.repeat(40)}\n` };
+      if (cmd === 'git' && args[0] === 'status' && args.includes('--porcelain=v1')) return { ok: true, out: '' };
+      if (cmd === 'git' && args[0] === 'diff' && args.includes('--name-only')) return { ok: true, out: 'src/x.ts\n' };
+      if (cmd === 'git' && args[0] === 'log') return { ok: true, out: '' };
+      if (cmd === 'git' && args[0] === 'rev-list') return { ok: true, out: '0 0\n' };
       throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
     } });
     await program.parseAsync(['pr', 'land', '--pr', pr, '--expected-head', head, '--dry-run'], { from: 'user' });
     expect(sink.errors).toEqual([]);
     expect(sink.logs.join('\n')).toContain('✓ preflight');
     expect(mutations).toEqual([]);
-    expect(commands).toEqual([`gh pr view ${pr} --json headRefOid,headRefName,baseRefName,state,isDraft,url`, 'git rev-parse HEAD', 'git status --porcelain']);
+    expect(commands.slice(0, 3)).toEqual([`gh pr view ${pr} --json headRefOid,headRefName,baseRefName,state,isDraft,url`, 'git rev-parse HEAD', 'git status --porcelain']);
+    expect(commands.some((call) => call.startsWith('git ls-remote origin refs/heads/main'))).toBe(true);
   });
 
   it('fails closed when a pinned PR lookup returns a non-object', async () => {

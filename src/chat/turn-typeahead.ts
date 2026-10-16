@@ -19,6 +19,10 @@ export interface TurnTypeaheadState {
    * «짝지어» 떨어낸다 — 위치·문자열로 짝지으면 같은 발화가 두 번 들어간다(10-14 중복 수리).
    */
   queuedPendingIds?: (string | null)[];
+  /** «지금 밀어 넣기»가 «다음 도구 경계 최우선»으로 떨어졌다(도는 도구가 취소 불가). 큐가 비거나 턴이 끝나면 지운다. */
+  steerPriority?: boolean;
+  /** 이번 턴에 도구 경계로 들어간 수 — 큐가 비었을 때 «✓ 넣음» 줄로 보인다. 턴이 끝나면 지운다. */
+  injectedCount?: number;
 }
 
 /** 큐 길이에 맞춘 id 짝(모자라면 null 로 채운다). 순수. */
@@ -89,16 +93,31 @@ export type TurnTypeaheadKeyResult = {
   submissionDisposition?: 'immediate' | 'fifo';
   /** 큐에서 «다른 길»로 빠진 항목의 레지스트리 id — 호출측이 레지스트리에서도 떨어낸다(되꺼내기). */
   releasedPendingIds?: string[];
+  /** 빈 입력에서 Enter(대기 항목이 있을 때) = «지금 밀어 넣기» 요청. 판정·실행은 호출측의 책임이다. */
+  pushNowRequested?: boolean;
 };
 
 /** 등록소 소유의 관측용 표시 조회. 이름·문법·실행 정책은 이 순수 판정기에 두지 않는다. */
 export type TurnTypeaheadImmediateSubmissionLookup = (text: string) => boolean;
 
+/** 줄바꿈 키 — Shift+Enter · Alt+Enter · Ctrl+J(`input-control-key.ts` 와 같은 꼴). */
+export function isTypeaheadNewlineKey(key: { name: string; ctrl?: boolean; alt?: boolean; shift?: boolean; meta?: boolean }): boolean {
+  if (key.name === 'enter') return !key.ctrl && !key.meta && (!!key.shift || !!key.alt);
+  return key.name === 'j' && !!key.ctrl && !key.alt && !key.shift && !key.meta;
+}
+
+/** 에코·큐 행은 한 줄로 그린다 — 버퍼 속 줄바꿈은 `↵` 로 보여 준다(행을 깨지 않는다). */
+function oneLine(text: string): string {
+  return text.replace(/\n/g, '↵');
+}
+
 /** 스트리밍 중 키 1개 판정(순수). mouse/비-press/수정키는 소유하지 않는다.
  *  - printable → buffer 누적
  *  - backspace → 마지막 코드포인트 제거(빈 버퍼면 미소유 — 기존 semantics 보존)
+ *  - shift/alt+enter · ctrl+j → buffer 에 줄바꿈(빈 buffer 면 소유만)
  *  - enter → 비어 있지 않은 buffer를 FIFO 제출 큐에 넣고 다음 문장을 위한 buffer를 비운다
- *  - ctrl+up → 마지막 제출 큐 항목을 buffer 끝으로 되꺼낸다
+ *  - 빈 buffer 에서 enter(대기 항목이 있을 때) → «지금 밀어 넣기» 요청(`pushNowRequested`)
+ *  - ctrl+up → 대기 항목 «전부»를 입력 순서대로 buffer 앞으로 되꺼낸다(편집 가능한 것만 이 큐에 든다)
  *  - escape 등 나머지 → 미소유(턴 중단 등 기존 경로 그대로) */
 export function applyTurnTypeaheadKey(
   state: TurnTypeaheadState,
@@ -117,8 +136,20 @@ export function applyTurnTypeaheadKey(
     return { state: { ...state, buffer: cps.join('') }, consumed: true, changed: true };
   }
 
-  if (key.name === 'enter' && !key.ctrl && !key.alt) {
-    if (!state.buffer.trim()) return { state, consumed: false, changed: false };
+  // ⭐ 턴 중에도 Shift+Enter(⊕ Alt+Enter · Ctrl+J)는 «줄바꿈»이다 — 유휴 입력창과 같은 계약.
+  //    종전엔 수식자를 안 보고 «제출»(FIFO 대기)로 떨어져, 도는 턴 위에 쓰던 여러 줄이 반토막으로 나갔다.
+  //    빈 버퍼의 줄바꿈은 소유만 하고 버퍼는 안 바꾼다(맨 앞 빈 줄을 만들지 않는다).
+  if (isTypeaheadNewlineKey(key)) {
+    if (!state.buffer) return { state, consumed: true, changed: false };
+    return { state: { ...state, buffer: `${state.buffer}\n` }, consumed: true, changed: true };
+  }
+
+  if (key.name === 'enter' && !key.ctrl && !key.alt && !key.shift) {
+    if (!state.buffer.trim()) {
+      // ⭐ 「한 번 더 Enter = 지금」 — 큐가 비면 옛 계약 그대로 소유하지 않는다.
+      if (state.queuedSubmissions.length === 0) return { state, consumed: false, changed: false };
+      return { state, consumed: true, changed: false, pushNowRequested: true };
+    }
     try {
       if (state.buffer.startsWith('/') && isImmediateSubmission?.(state.buffer)) {
         return {
@@ -147,18 +178,16 @@ export function applyTurnTypeaheadKey(
   // ⛔ 정확한 조합만 소유한다 — 수식자를 덜 보면 `ctrl+shift+up` 같은 조합까지 삼켜
   //    다른 층이 쓸 키를 조용히 먹는다.
   if (key.name === 'up' && key.ctrl && !key.alt && !key.shift && !key.meta) {
-    const recalled = state.queuedSubmissions.at(-1);
-    if (recalled === undefined) return { state, consumed: false, changed: false };
-    const ids = turnTypeaheadPendingIds(state);
+    if (state.queuedSubmissions.length === 0) return { state, consumed: false, changed: false };
+    // ⭐ 전부 꺼낸다(Claude Code 동형) — 한 건씩이면 여러 건을 고칠 때 순서가 뒤집힌다.
+    //   입력 순서를 지키고, 치던 초안은 맨 뒤에 둔다.
+    const recalled = [...state.queuedSubmissions, ...(state.buffer ? [state.buffer] : [])].join('\n');
+    const released = presentIds(turnTypeaheadPendingIds(state));
     return {
-      state: {
-        buffer: state.buffer + recalled,
-        queuedSubmissions: state.queuedSubmissions.slice(0, -1),
-        ...idsField(ids.slice(0, -1)),
-      },
+      state: { ...withoutIds(state), buffer: recalled, queuedSubmissions: [], steerPriority: undefined },
       consumed: true,
       changed: true,
-      ...(ids.at(-1) ? { releasedPendingIds: presentIds(ids.slice(-1)) } : {}),
+      ...(released.length > 0 ? { releasedPendingIds: released } : {}),
     };
   }
 
@@ -203,6 +232,18 @@ export function dequeueTurnTypeaheadHandoff(
   return { handoff: { kind: 'prefill', text: state.buffer }, state: createTurnTypeaheadState() };
 }
 
+/** 턴 범위 표시(최우선·넣음 수)를 지운다 — 다음 턴으로 넘기지 않는다. 순수. */
+function clearTurnScopedMarks(state: TurnTypeaheadState): TurnTypeaheadState {
+  if (state.steerPriority === undefined && state.injectedCount === undefined) return state;
+  const { steerPriority: _p, injectedCount: _n, ...rest } = state;
+  return rest;
+}
+
+/** «지금 밀어 넣기»가 다음 경계 최우선으로 떨어졌음을 적는다. 레지스트리에 든 항목이 없으면 그대로. 순수. */
+export function markTurnTypeaheadPriority(state: TurnTypeaheadState): TurnTypeaheadState {
+  return presentIds(turnTypeaheadPendingIds(state)).length > 0 ? { ...state, steerPriority: true } : state;
+}
+
 /** ⭐ 턴 종료 드레인 **한 걸음** — `src/dashboard/index.ts` 의 inner-loop 가 반복마다 이걸 부른다.
  *  ⛔ 종전엔 그 순서(dequeue → state 교체 → nextInitial 누적 → submit 이면 enter 주입)가
  *     `index.ts` 안에만 있어서, 테스트가 그 순서를 **베껴 모사**할 수밖에 없었다. 베낀 테스트는
@@ -223,6 +264,7 @@ export function drainTurnTypeaheadOnce(
    */
   releasedPendingIds: string[];
 } {
+  state = clearTurnScopedMarks(state);
   if (opts?.interrupted && state.queuedSubmissions.length > 0) {
     const restored = [...state.queuedSubmissions, ...(state.buffer ? [state.buffer] : [])].join('\n');
     return {
@@ -308,6 +350,8 @@ export function drainedIntoTurn(
     };
   }
   if (matched.length === 0) return { state: next, sentence: null, matched };
+  next = { ...next, injectedCount: (next.injectedCount ?? 0) + matched.length };
+  if (presentIds(turnTypeaheadPendingIds(next)).length === 0) delete next.steerPriority;
   const count = matched.length;
   const label = count === 1 ? '⏳ 턴 안 1건' : `⏳ 턴 안 ${count}건`;
   const quoted = matched.map(text => `"${text}"`).join(' · ');
@@ -333,8 +377,9 @@ export function renderTurnTypeaheadEcho(
   const count = state.queuedSubmissions.length;
   const suffix = opts?.includeQueueSuffix && count > 0 ? `  ⏎ ${count}건 대기 · 턴 종료 시 전송` : '';
   const budget = Math.max(8, width - 2 - [...suffix].length);
-  const cps = [...state.buffer];
-  const shown = cps.length > budget ? cps.slice(cps.length - budget).join('') : state.buffer;
+  const buffer = oneLine(state.buffer);
+  const cps = [...buffer];
+  const shown = cps.length > budget ? cps.slice(cps.length - budget).join('') : buffer;
   return `${shown}${suffix}`;
 }
 
@@ -351,13 +396,23 @@ export function renderTurnTypeaheadQueueRow(
   width: number,
 ): string | null {
   const count = state.queuedSubmissions.length;
-  if (count === 0) return null;
-  const head = state.queuedSubmissions[0] ?? '';
-  const label = count === 1 ? '⏳ 대기 1건' : `⏳ 대기 ${count}건`;
-  // 되꺼내기 키를 화면에 적는다 — 안내가 없어 대기 발화를 취소·수정할 길을 몰랐다(2026-09-26 베어 VM 실측 · UX 12).
-  const tail = ' · 턴 종료 시 전송 · Ctrl+↑ 되꺼내기';
+  if (count === 0) {
+    // ✓ 넣음 — 도구 경계로 들어간 뒤 큐가 비었다(턴이 끝나면 지워진다).
+    const injected = state.injectedCount ?? 0;
+    return injected > 0 ? `✓ 넣음 ${injected}건 · 도는 턴에 이어서 반영` : null;
+  }
+  const head = oneLine(state.queuedSubmissions[0] ?? '');
+  // ⭐ 항목 상태를 보인다 — 레지스트리에 든 것은 다음 도구 경계에, 안 든 것(슬래시·세션 없음)은 응답 뒤에 나간다.
+  const steerable = presentIds(turnTypeaheadPendingIds(state)).length;
+  const waiting = count - steerable;
+  const parts: string[] = [];
+  if (steerable > 0) parts.push(`${state.steerPriority ? '⚡ 최우선 · 다음 도구 경계에 넣음' : '↳ 다음 도구 경계에 넣음'} ${steerable}건`);
+  if (waiting > 0) parts.push(`⏳ 대기(응답 뒤) ${waiting}건`);
+  const label = parts.join(' · ');
+  // 되꺼내기·밀어 넣기 키를 화면에 적는다 — 안내가 없어 대기 발화를 취소·수정할 길을 몰랐다(2026-09-26 베어 VM 실측 · UX 12).
+  const tail = ' · Ctrl+↑ 되꺼내기 · 빈 Enter 지금 밀어 넣기';
   const budget = Math.max(8, width - [...label].length - [...tail].length - 5);
   const cps = [...head];
-  const shown = cps.length > budget ? `${cps.slice(0, budget).join('')}…` : head;
+  const shown = cps.length > budget ? `${cps.slice(0, budget).join('')}…` : cps.join('');
   return `${label} · "${shown}"${tail}`;
 }

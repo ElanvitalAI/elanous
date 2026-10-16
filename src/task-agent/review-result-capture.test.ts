@@ -50,6 +50,9 @@ function fixture() {
     },
     // TA-WIRING-CHECK — 병합 PR 배선 관측이 실물 `gh pr diff` 로 나가지 않게(밀폐).
     wiring: { prDiff: () => '', loadLedger: () => null },
+    // GATE-PREEXISTING-ZERO — 밀폐: 기본 env 는 process.env 라, 게이트 Pod 의 ELANOUS_POD_NAME 이 새어 들면
+    //   판단부가 «원격 자식»으로 읽어 live 수를 보류한다(0.2.30 HARD #3 preexisting 6). 이 시험은 HQ 판단부를 잰다.
+    env: {},
   });
   const card = () => readTaskCard('ta-rr-1', statePath)!;
   const lines = (event: string) => card().history.filter((item) => item.event === event);

@@ -1,4 +1,5 @@
 import type { TranscriptEntry } from './index';
+import type { STTProvider } from '../voice/stt-provider.js';
 
 /** Mono, normalized PCM. The capture instant is required for NOTE1's absolute photo alignment. */
 export interface FieldAudio {
@@ -67,6 +68,22 @@ export function createCloudSttEngine(client: CloudSttClient): TranscriptionEngin
       audio: chunk.samples, sampleRate: chunk.sampleRate, language: request.language,
       timestamps: true, diarization: true,
     }),
+  };
+}
+
+export function createBatchSttEngine(provider: STTProvider): TranscriptionEngine {
+  return {
+    async transcribe(chunk, request) {
+      if (chunk.sampleRate !== 16000) throw new RangeError('Batch STT requires 16 kHz mono PCM');
+      const pcm = Buffer.alloc(chunk.samples.length * 2);
+      for (let i = 0; i < chunk.samples.length; i++) {
+        const sample = chunk.samples[i]!;
+        if (!Number.isFinite(sample)) throw new RangeError('Audio samples must be finite');
+        pcm.writeInt16LE(Math.round(Math.max(-1, Math.min(1, sample)) * (sample < 0 ? 32768 : 32767)), i * 2);
+      }
+      const { text } = await provider.transcribeBatch(pcm, { language: request.language });
+      return text.trim() ? [{ startSeconds: 0, endSeconds: chunk.samples.length / chunk.sampleRate, text }] : [];
+    },
   };
 }
 

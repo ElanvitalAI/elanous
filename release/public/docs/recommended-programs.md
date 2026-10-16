@@ -195,17 +195,28 @@ marketing; those are separate workflows.
 Set it up in this order:
 
 1. Install Tailscale on the Elanous host and each device from
-   [tailscale.com/download](https://tailscale.com/download).
-2. Sign in on each device and join the host's tailnet. If different people
-   use their own accounts, [invite them to the tailnet](https://tailscale.com/docs/features/sharing/how-to/invite-any-user).
-   Keep Tailscale running on the host and confirm it is connected.
-3. On the host, enable sharing for the web app:
+   [tailscale.com/download](https://tailscale.com/download) — the macOS app
+   bundle or `brew install tailscale` both work. elanous looks for the CLI
+   in that order: the macOS app bundle first
+   (`/Applications/Tailscale.app/Contents/MacOS/Tailscale`), then
+   `/opt/homebrew/bin` (Homebrew), then your `PATH`.
+2. Sign in on each device and join the host's tailnet. Keep Tailscale
+   running on the host and confirm it is connected.
+3. If another person will use their own account, invite them to the tailnet
+   from the Tailscale admin console → **Users** → **Invite external users**:
+   by email, or by generating and sharing an invite link. The invited person
+   opens the link, signs in with their own account, and the devices they
+   connect join your tailnet. Inviting needs an Owner, Admin or IT admin
+   role; see
+   [Tailscale's invite guide](https://tailscale.com/docs/features/sharing/how-to/invite-any-user)
+   for the current procedure.
+4. On the host, enable sharing for the web app:
 
    ```bash
    elanous nexus pwa share enable
    ```
 
-4. Open the shared URL from a browser on a signed-in phone, tablet or other
+5. Open the shared URL from a browser on a signed-in phone, tablet or other
    device. See [The web app](pwa.md#use-it-from-another-device).
 
 Check the host's Tailscale connection and its MagicDNS name with this
@@ -223,14 +234,23 @@ tailscale serve status --json
 ```
 
 `elanous nexus pwa share enable` forwards the Nexus web app through Tailscale
-Serve's TLS-terminated TCP mode on the daemon's port. A successful command
-prints a URL in the form `https://<host>:<port>/app/`; use that exact URL on
-another device in the same tailnet. The port is part of the URL. In the Serve
+Serve's TLS-terminated TCP mode on the daemon's port, mounted under
+`/app/showroom/`. A successful command prints the share URL with your
+tailnet's MagicDNS name for the host; use that exact URL on another device
+in the same tailnet. The port is part of the URL. In the Serve
 status JSON, find `TCP["<port>"]` using the port printed in that URL; its
 `TCPForward` should target `localhost:<port>` and `TerminateTLS` should name
 the host. If sharing fails, confirm that Tailscale is running and that the
 Nexus daemon has a known port, then retry the command. These status checks do
 not by themselves prove another device can open the app.
+
+One macOS quirk to know when scripting these checks: the app-bundle binary
+behaves as a GUI app when its environment is empty — for example when a
+daemon (with no `TERM`) runs the check — prints "The Tailscale GUI failed to
+start", and exits 0 with no JSON, so a status check reads as failure while
+Tailscale itself is fine. Set `TAILSCALE_BE_CLI=1` in the environment you
+give the CLI to pin command-line behavior; elanous does this for its own
+checks (measured 2026-09-27).
 
 Tailscale is optional: without it, the web app remains available on the host
 but is not shared through this tailnet path. The documented benefit here is

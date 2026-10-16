@@ -5,6 +5,7 @@ import type { DeployVerifyFinding } from '../harness/browser-verify.js';
 import type { SelfDevJobResult, SupervisorStopReason, SupervisorNext, ReviewRework } from './run-types.js';
 import { authorRepairGoal } from '../harness/helper-repair.js';
 export type { SupervisorStopReason } from './run-types.js';
+export { SUPERVISOR_STOP_REASONS } from './run-types.js';
 import { recordSelfDevRunSupervisorStop, selfDevRunsDir } from './run-store.js';
 import { debug } from '../debug/log.js';
 import { sweepFrozenMerges } from '../self-implement/frozen-merges.js';
@@ -49,6 +50,16 @@ export interface SupervisorRound {
   noPrFeatureKeys?: string[];
   /** REVIEW-MUSTFIX-CLASSIFY — that round's observed must-fix items; pairs the next round's classification. */
   mustFix?: MustFixRoundObservation;
+  /**
+   * PATTERN-MINE LOST-TIME — ms that round's undelivered results spent, banked into the ledger when their
+   * generation is replaced by a rerun (failures and re-runs both count — «잃은 시간» is not only the last round).
+   * A task held for a human (`decision.oscillation.heldTaskIds`) survives into the next round as the same
+   * execution, so its time banks only when it leaves or at the terminal mine — never twice. Omitted when
+   * nothing banked, so older history and rounds without a measured duration stay comparable.
+   */
+  lostTimeMsByTask?: Record<string, number>;
+  /** Tasks that left this round without a measured duration; a later measured rerun cannot make their total known. */
+  unknownTimeTaskIds?: string[];
 }
 
 /** Failed without a PR — a result that carries either a PR number or a PR URL has one (fixtures and older producers set only one). */
@@ -63,25 +74,6 @@ function failedWithoutPr(result: SupervisorJobResult): boolean {
 export function noPrStreakKey(feature: unknown): string {
   return typeof feature === 'string' ? resumeKey(feature).replace(/[\s.,;:!?。…·]+$/u, '') : '';
 }
-
-export const SUPERVISOR_STOP_REASONS = [
-  'converged',
-  'human-stopped',
-  'parent-signals-red',
-  'needs-human',
-  'no-actionable-work',
-  'harvestable-awaiting-human',
-  'handed-off-to-salvage',
-  'max-rounds',
-  'no-progress',
-  'provider-exhausted',
-  'step-timeout',
-  'decomposable-no-progress',
-  'review-unobserved',
-  'review-oscillating',
-  'deliverable-unobserved',
-  'deliverable-merged',
-] as const satisfies readonly SupervisorStopReason[];
 
 export const SUPERVISOR_ACTIONS = ['relaunch', 'add-repair-task', 'stop'] as const;
 
@@ -656,6 +648,17 @@ export function appendRound(
   const noPrResults = results.filter(failedWithoutPr);
   const noPrTaskIds = noPrResults.map((result) => result.taskId);
   const noPrFeatureKeys = noPrResults.map((result) => noPrStreakKey(result.feature));
+  // PATTERN-MINE LOST-TIME — 이 회차의 배달 안 된 실행 시간을 원장에 은행한다(실패·재실행 모두).
+  //   진동 보류(held) 조각은 다음 회차로 «같은 실행»으로 살아 남으므로 여기서는 안 세고,
+  //   떠나는 회차나 종단에서 한 번만 센다. durationMs 를 안 잰 결과는 지어내지 않는다(모르는 시간은 0 이 아니다).
+  const heldTaskIds = new Set(decision?.oscillation?.heldTaskIds ?? []);
+  const lostTimeMsByTask: Record<string, number> = {};
+  const unknownTimeTaskIds = new Set<string>();
+  for (const result of results) {
+    if (heldTaskIds.has(result.taskId) || hasDelivered(result)) continue;
+    if (result.durationMs === undefined) { unknownTimeTaskIds.add(result.taskId); continue; }
+    lostTimeMsByTask[result.taskId] = (lostTimeMsByTask[result.taskId] ?? 0) + result.durationMs;
+  }
   return [...history, {
     round: history.length,
     landed: countLanded(results),
@@ -663,6 +666,8 @@ export function appendRound(
     actionable: countActionable(t),
     ...(reviewMustFixTrend === undefined ? {} : { reviewMustFixTrend }),
     ...((mustFix.items ?? []).length > 0 ? { mustFix } : {}),
+    ...(Object.keys(lostTimeMsByTask).length > 0 ? { lostTimeMsByTask } : {}),
+    ...(unknownTimeTaskIds.size > 0 ? { unknownTimeTaskIds: [...unknownTimeTaskIds] } : {}),
     ...(results.some((result) => result.rework?.signature)
       ? { signatures: Object.fromEntries(results.filter((result) => result.rework?.signature).map((result) => [result.taskId, result.rework!.signature])) } : {}),
     ...(decision && decision.action !== 'stop' && decision.relaunchOnMain.length > 0 ? {
@@ -685,6 +690,195 @@ export function appendRound(
     })() : {}),
     ...(noPrTaskIds.length > 0 ? { noPrTaskIds, noPrFeatureKeys } : {}),
   }];
+}
+
+/** PATTERN-MINE — 생애 기록부 한 줄. `struggled`·`watch` 원문과 그 생애가 잃은 시간. */
+export interface PatternMineLifeRecord {
+  readonly lifeId: string;
+  readonly struggled?: string;
+  readonly watch?: string;
+  readonly lostTimeMs?: number;
+}
+
+/** PATTERN-MINE — decideNextRun 종단 서명(멈춤 어휘 · 진동 서명 · 실패 분류 · must-fix). */
+export interface PatternMineTerminalSignature {
+  readonly lifeId?: string;
+  readonly stopReason?: string;
+  readonly oscillationSignature?: string;
+  readonly classificationKind?: string;
+  readonly mustFix?: string;
+}
+
+export interface MinedFailurePattern {
+  readonly pattern: string;
+  readonly frequency: number;
+  readonly lifeCount: number;
+  /** Known only when every life bound to this pattern carried a time; null preserves unknown — never a default 0. */
+  readonly lostTimeMs: number | null;
+}
+
+export interface PatternMineAggregate {
+  readonly patterns: readonly MinedFailurePattern[];
+  readonly lifeCount: number;
+  /** Known only when every life carried a time; null preserves unknown — a missing input time is never summed as 0. */
+  readonly lostTimeMs: number | null;
+}
+
+function patternMineLifePart(life: PatternMineLifeRecord): string {
+  return [life.struggled, life.watch].filter((part): part is string => !!part && part.length > 0).join(' · ');
+}
+
+function patternMineSignaturePart(signature: PatternMineTerminalSignature | undefined): string {
+  if (!signature) return '';
+  return [signature.stopReason, signature.oscillationSignature, signature.classificationKind, signature.mustFix]
+    .filter((part): part is string => !!part && part.length > 0).join(' · ');
+}
+
+/** Bind struggled/watch with a terminal signature. Empty both sides is not a pattern. */
+export function bindPatternMineKey(life: PatternMineLifeRecord, signature?: PatternMineTerminalSignature): string {
+  const lifePart = patternMineLifePart(life);
+  const signaturePart = patternMineSignaturePart(signature);
+  if (!lifePart && !signaturePart) return '';
+  return signaturePart ? `${lifePart || '(기록 없음)'} ⊕ ${signaturePart}` : lifePart;
+}
+
+/**
+ * PATTERN-MINE — 순수 집계. 생애 기록부 struggled·watch 를 종단 서명과 묶어
+ * 패턴 빈도·생애 수·잃은 시간을 낸다. 입력이 비면 전부 0 이고 지어내지 않는다.
+ * 잃은 시간을 모르는 생애가 하나라도 섞이면 그 합은 unknown(null)을 보존한다 — 0 으로 확정하지 않는다.
+ */
+export function mineFailurePatterns(input: {
+  readonly lives: readonly PatternMineLifeRecord[];
+  readonly signatures?: readonly PatternMineTerminalSignature[];
+}): PatternMineAggregate {
+  const lives = input.lives;
+  const signatures = input.signatures ?? [];
+  const runLevel = signatures.find((signature) => !signature.lifeId);
+  const byLife = new Map(signatures.flatMap((signature) => signature.lifeId ? [[signature.lifeId, signature] as const] : []));
+  const groups = new Map<string, { lives: Set<string>; frequency: number; lostTimeMs: number | undefined }>();
+
+  const add = (pattern: string, lifeId: string | undefined, lostTimeMs: number | undefined): void => {
+    if (!pattern) return;
+    const group = groups.get(pattern) ?? { lives: new Set<string>(), frequency: 0, lostTimeMs: 0 };
+    group.frequency += 1;
+    if (lifeId) group.lives.add(lifeId);
+    // UNKNOWN 보존 — 모르는 시간(전달 안 됨)은 0 이 아니라 unknown 이고, 한 번 섞이면 그 합은 끝까지 unknown 이다.
+    if (lostTimeMs === undefined) group.lostTimeMs = undefined;
+    else if (group.lostTimeMs !== undefined) group.lostTimeMs += lostTimeMs;
+    groups.set(pattern, group);
+  };
+
+  for (const life of lives) {
+    add(bindPatternMineKey(life, (life.lifeId ? byLife.get(life.lifeId) : undefined) ?? runLevel), life.lifeId, life.lostTimeMs);
+  }
+  for (const signature of signatures) {
+    if (signature.lifeId ? lives.some((life) => life.lifeId === signature.lifeId) : lives.length > 0) continue;
+    add(bindPatternMineKey({ lifeId: signature.lifeId ?? '' }, signature), signature.lifeId, undefined);
+  }
+
+  const lifeIds = new Set(lives.map((life) => life.lifeId));
+  for (const signature of signatures) if (signature.lifeId) lifeIds.add(signature.lifeId);
+  const signatureWithoutLife = signatures.some((signature) => signature.lifeId && !lives.some((life) => life.lifeId === signature.lifeId));
+  const patternWithoutLife = groups.size > 0 && lives.length === 0;
+
+  return {
+    patterns: [...groups].map(([pattern, group]) => ({
+      pattern, frequency: group.frequency, lifeCount: group.lives.size, lostTimeMs: group.lostTimeMs ?? null,
+    })).sort((a, b) => b.frequency - a.frequency || a.pattern.localeCompare(b.pattern)),
+    lifeCount: lifeIds.size,
+    lostTimeMs: !signatureWithoutLife && !patternWithoutLife && lives.every((life) => life.lostTimeMs !== undefined)
+      ? lives.reduce((sum, life) => sum + (life.lostTimeMs ?? 0), 0)
+      : null,
+  };
+}
+
+interface PatternMineLifeAccumulator {
+  struggled: string[];
+  watch: string[];
+  lostTimeMs: number;
+  /** True once any duration-carrying fact touched this life — a delivered result counts as known 0. */
+  timeKnown: boolean;
+  /** True when a contributing execution's duration was not measured — unknown wins over any known sum. */
+  timeUnknown: boolean;
+}
+
+function patternMineRow(byLife: Map<string, PatternMineLifeAccumulator>, lifeId: string): PatternMineLifeAccumulator {
+  const row = byLife.get(lifeId) ?? { struggled: [], watch: [], lostTimeMs: 0, timeKnown: false, timeUnknown: false };
+  if (!byLife.has(lifeId)) byLife.set(lifeId, row);
+  return row;
+}
+
+/** appendRound 회차 원장 ⊕ 이번 결과에서 struggled·watch 생애 기록부를 읽는다. */
+export function patternMineLivesFromRounds(
+  rounds: readonly SupervisorRound[],
+  results: readonly SupervisorJobResult[],
+): PatternMineLifeRecord[] {
+  const byLife = new Map<string, PatternMineLifeAccumulator>();
+
+  for (const result of results) {
+    const row = patternMineRow(byLife, result.taskId);
+    if (result.rework?.trend === 'oscillating' && result.rework.signature) {
+      row.struggled.push(`리뷰 진동 ${result.rework.signature}`);
+    }
+    for (const text of result.reviewMustFix ?? []) {
+      row.struggled.push(text);
+      row.watch.push(text);
+    }
+    // PATTERN-MINE LOST-TIME — 종단 세대의 실행 시간. 배달된 결과는 잃은 시간이 0(known)이고,
+    //   durationMs 를 안 실은 실패는 unknown 을 보존한다(0 이 아니다).
+    if (hasDelivered(result)) row.timeKnown = true;
+    else if (result.durationMs === undefined) row.timeUnknown = true;
+    else {
+      row.lostTimeMs += result.durationMs;
+      row.timeKnown = true;
+    }
+  }
+
+  for (const round of rounds) {
+    for (const taskId of round.unknownTimeTaskIds ?? []) patternMineRow(byLife, taskId).timeUnknown = true;
+    for (const [taskId, signature] of Object.entries(round.signatures ?? {})) {
+      patternMineRow(byLife, taskId).struggled.push(`서명 ${signature}`);
+    }
+    for (const item of round.mustFix?.items ?? []) {
+      const row = patternMineRow(byLife, item.taskId ?? `round-${round.round}`);
+      row.struggled.push(item.text);
+      if (item.evidence) row.watch.push(item.evidence);
+    }
+    for (const taskId of round.noPrTaskIds ?? []) patternMineRow(byLife, taskId).struggled.push('PR 없이 실패');
+    // PATTERN-MINE LOST-TIME — 앞선 회차가 원장에 은행한 실패·재실행 시간을 생애에 합산한다.
+    for (const [taskId, lostTimeMs] of Object.entries(round.lostTimeMsByTask ?? {})) {
+      const row = patternMineRow(byLife, taskId);
+      row.lostTimeMs += lostTimeMs;
+      row.timeKnown = true;
+    }
+  }
+
+  return [...byLife].map(([lifeId, row]) => ({
+    lifeId,
+    ...(row.struggled.length ? { struggled: [...new Set(row.struggled)].join(' · ') } : {}),
+    ...(row.watch.length ? { watch: [...new Set(row.watch)].join(' · ') } : {}),
+    // 아는 입력에 대해서만 시간을 낸다 — unknown 이 섞였거나 아는 것이 없으면 칸 자체를 안 만든다(0 이 아니다).
+    ...(row.timeUnknown || !row.timeKnown ? {} : { lostTimeMs: row.lostTimeMs }),
+  }));
+}
+
+/** decideNextRun 종단 결정에서 서명(실패 분류 · must-fix · 멈춤 어휘 · 진동 서명)을 읽는다. */
+export function patternMineSignaturesFromDecision(decision: SupervisorDecision): PatternMineTerminalSignature[] {
+  const shared = {
+    ...(decision.stopReason ? { stopReason: decision.stopReason } : {}),
+    ...(decision.oscillation?.signature ? { oscillationSignature: decision.oscillation.signature } : {}),
+  };
+  const perTask = decision.classifications.map((classification) => {
+    const mustFix = decision.mustFixByTask?.[classification.taskId]?.class ?? decision.mustFix?.class;
+    return {
+      lifeId: classification.taskId,
+      ...shared,
+      classificationKind: classification.kind,
+      ...(mustFix ? { mustFix } : {}),
+    };
+  });
+  if (perTask.length > 0) return perTask;
+  return shared.stopReason || shared.oscillationSignature ? [{ ...shared }] : [];
 }
 
 export interface SuperviseRunOptions {
@@ -870,6 +1064,22 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
       const reason = decision.stopReason ?? 'unregistered-stop';
       const next = routeSupervisorVerdict(reason, results).next;
       try { debug.log('self-dev.supervisor', 'verdict-edge', { runId, reason, next }); } catch { /* observation must not interrupt supervision */ }
+      // PATTERN-MINE — 종단에서만 채굴한다. 판정·원장 형식은 그대로이고 관측만 남긴다.
+      const patternMine = mineFailurePatterns({
+        lives: patternMineLivesFromRounds(history, results),
+        signatures: patternMineSignaturesFromDecision(decision),
+      });
+      try {
+        opts.observe?.('pattern-mine', {
+          runId,
+          stopReason: decision.stopReason ?? null,
+          lifeCount: patternMine.lifeCount,
+          lostTimeMs: patternMine.lostTimeMs,
+          frequency: patternMine.patterns.reduce((sum, mined) => sum + mined.frequency, 0),
+          patterns: patternMine.patterns,
+        });
+      } catch { /* fail-open */ }
+      try { debug.log('self-dev.supervisor', 'pattern-mine', { runId, lifeCount: patternMine.lifeCount, lostTimeMs: patternMine.lostTimeMs, frequency: patternMine.patterns.reduce((sum, mined) => sum + mined.frequency, 0), patterns: patternMine.patterns }); } catch { /* fail-open */ }
       results = results.map((result) => ({ ...result, next }));
       if (runId && decision.stopReason) {
         const storage = resolveSupervisorStopStorage(opts.runStore);

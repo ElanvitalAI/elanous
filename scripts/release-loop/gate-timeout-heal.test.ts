@@ -6,7 +6,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  createGateRunner, gateBatchTestWallSeconds, gateShardShell, POD_SHARD_FILE_CAP, POD_SHARD_TIMEOUT_CAP_SECONDS, readGatePodLifecycle, readShardArtifacts, shardDeadlineSeconds, shardParts,
+  createGateRunner, gateBatchTestWallSeconds, gateShardShell, POD_SHARD_FILE_CAP, POD_SHARD_TIMEOUT_CAP_SECONDS, readGatePodLifecycle, readIsolatedRun, readShardArtifacts, shardDeadlineSeconds, shardParts,
   softDeadlineSeconds, type GateRunner,
 } from './gate-node';
 import { installSlotScript } from '../../src/task-orchestrator/surfaces/pod-install-slots.js';
@@ -73,6 +73,10 @@ function fakeTools(bin: string) {
   writeFileSync(join(bin, 'bun'), `#!/bin/bash
 if [ "$1" = install ]; then echo "5 packages installed [750ms]"; exit 0; fi
 shift 2 # run test:deterministic
+if [ -n "$FAKE_PARALLEL_TRACE" ]; then
+  echo "start $BASHPID" >> "$FAKE_PARALLEL_TRACE"
+  trap 'echo "end $BASHPID" >> "$FAKE_PARALLEL_TRACE"' EXIT
+fi
 files=(); out=
 for a in "$@"; do case "$a" in --reporter-outfile=*) out="\${a#--reporter-outfile=}";; --*) ;; *) files+=("\${a#./}");; esac; done
 for f in "\${files[@]}"; do case "$f" in *slow*) sleep 30;; esac; done
@@ -90,8 +94,11 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "TEST_GIT_LOCAL=$(git config --local gate.batch-part)"
 fi
 if [ -d "$ELANOUS_STATE_DIR" ] && [ -d "$TMPDIR" ] && [ -d "$XDG_CONFIG_HOME" ] && [ -d "$XDG_CACHE_HOME" ] && [ -d "$XDG_DATA_HOME" ] && [ -d "$XDG_STATE_HOME" ]; then echo 'TEST_DIRS_READY=yes'; else echo 'TEST_DIRS_READY=no'; fi
+failed=0
+for f in "\${files[@]}"; do if [ "$f" = "$FAKE_FAIL_FILE" ]; then failed=1; echo "$f:"; echo '(fail) works [1.00ms]'; fi; done
 { echo '<testsuites>'; for f in "\${files[@]}"; do echo "<testsuite name=\\"$f\\" file=\\"$f\\"><testcase name=\\"works\\" file=\\"$f\\"></testcase></testsuite>"; done; echo '</testsuites>'; } > "$out"
-echo "\${#files[@]} pass"; echo "0 fail"; echo "Ran \${#files[@]} tests across \${#files[@]} files."
+echo "$(( \${#files[@]} - failed )) pass"; echo "$failed fail"; echo "Ran \${#files[@]} tests across \${#files[@]} files."
+exit "$failed"
 `);
   // GNU timeout's contract the shell relies on: TERM after N s, exit 124 when it fired.
   writeFileSync(join(bin, 'timeout'), `#!/bin/bash
@@ -237,6 +244,48 @@ test('isolation batch runs four files in one shell with separate HOME and comple
   expect(spawnSync('git', ['-C', repo, 'config', '--local', '--get', 'gate.batch-part']).status).toBe(1);
   expect(gateShardShell({ parts, cdpPatterns: [], softSeconds: 15, cachePrefix: '', installSlots: 0, parallelParts: 1 }))
     .toContain('ELANOUS_STATE_DIR="$isolated/state"');
+});
+
+test('final recheck shell executes four file parts, reports each rc, and runs at most two tests together', () => {
+  const root = temp('gate-recheck-shell-');
+  const home = join(root, 'home');
+  const repo = join(root, 'work', 'repo');
+  const trace = join(root, 'parallel.trace');
+  mkdirSync(join(repo, 'apps/pwa'), { recursive: true });
+  mkdirSync(home);
+  fakeTools(join(root, 'bin'));
+  mkdirSync(join(repo, 'src'));
+  writeFileSync(join(repo, 'src/fixture.txt'), 'source');
+  expect(spawnSync('git', ['-C', repo, 'init', '-q']).status).toBe(0);
+  expect(spawnSync('git', ['-C', repo, 'add', 'src/fixture.txt']).status).toBe(0);
+  expect(spawnSync('git', ['-C', repo, '-c', 'user.name=TC', '-c', 'user.email=tc@example.invalid', 'commit', '-qm', 'fixture']).status).toBe(0);
+  const files = ['a', 'b', 'c', 'd'].map((name) => `src/${name}.test.ts`);
+  const shell = gateShardShell({ parts: files.map((file) => [file]), cdpPatterns: [], softSeconds: 20,
+    cachePrefix: '', installSlots: 0, parallelParts: 2, partLimitSeconds: 10 })
+    .replace(/^pod_age=\$\(awk.*$/m, 'pod_age=0');
+  const run = spawnSync('bash', ['-c', shell], { cwd: repo, encoding: 'utf8', timeout: 25_000,
+    env: { PATH: `${join(root, 'bin')}:/usr/bin:/bin`, HOME: home, TMPDIR_FIRED: root,
+      FAKE_PARALLEL_TRACE: trace, FAKE_FAIL_FILE: files[1]!, FAKE_TEST_SLEEP: '1' } });
+  expect(run.status).toBe(0);
+  const outbox = join(home, 'outbox');
+  expect(readFileSync(join(outbox, 'install.rc'), 'utf8').trim()).toBe('0');
+  for (const [index, file] of files.entries()) {
+    const rc = Number(readFileSync(join(outbox, `part-${index}.rc`), 'utf8').trim());
+    const output = readFileSync(join(outbox, `part-${index}.log`), 'utf8');
+    expect(rc).toBe(index === 1 ? 1 : 0);
+    const reading = readIsolatedRun({ rc, output }, 'final Pod recheck', file);
+    expect(reading.kind).toBe('read');
+    if (reading.kind === 'read') expect(reading.failures).toEqual(index === 1 ? [`${file} > works`] : []);
+  }
+  let active = 0;
+  let peak = 0;
+  for (const line of readFileSync(trace, 'utf8').trim().split('\n')) {
+    active += line.startsWith('start ') ? 1 : -1;
+    expect(active).toBeGreaterThanOrEqual(0);
+    peak = Math.max(peak, active);
+  }
+  expect(active).toBe(0);
+  expect(peak).toBe(2);
 });
 
 test('readShardArtifacts: every part done → one summary and rc; a crashed part → its exit; the old single-run layout still reads', () => {
@@ -435,6 +484,59 @@ test('a cut shard whose finished files have a failure keeps that failure for the
   expect(result.output).toContain(`${files[3]}:\n(fail) works`);
   expect(result.output).toContain('29 pass\n1 fail\n0 errors\nRan 30 tests across 30 files.');
 });
+
+for (const withRunningOutput of [true, false]) {
+  test(`GATE-UNFINISHED-HINT: a cut shard ${withRunningOutput ? 'points pod-N.log at pod-N.unfinished.log and records its bytes' : 'with no running-part output adds no hint line and no json field'}`, async () => {
+    const files = Array.from({ length: 30 }, (_, i) => `src/f-${String(i).padStart(2, '0')}.test.ts`);
+    let pods = 0;
+    const { root, repo, runner } = sweepRunner(files, async (o, parts) => {
+      pods += 1;
+      const dir = join(root, o.name!);
+      mkdirSync(dir);
+      writeFileSync(join(dir, 'install.log'), '3 packages installed [2.50s]\n');
+      writeFileSync(join(dir, 'install.rc'), '0\n');
+      parts.forEach((part, index) => {
+        if (pods === 1 && index > 0) {
+          // The deadline cut this part mid-run: output, no rc.
+          if (withRunningOutput) writeFileSync(join(dir, `part-${index}.log`), `${part[0]}:\n(pass) works [1.00ms]\n`);
+          return;
+        }
+        writeFileSync(join(dir, `part-${index}.log`), summary(part));
+        writeFileSync(join(dir, `part-${index}.rc`), '0\n');
+        writeFileSync(join(dir, `part-${index}.junit.xml`), junitFor(part));
+      });
+      if (pods === 1) writeFileSync(join(dir, 'shard.timeout'), '1\n');
+      return { exitCode: 0, artifactsDir: dir, job: 'fake' };
+    });
+    const logs = join(root, 'logs');
+    const result = await runner.sweep(repo, logs, { pool: 'pool-test', shards: 1 });
+    // The verdict is untouched either way.
+    expect(result.rc).toBe(0);
+    expect(result.output).toContain('Ran 30 tests across 30 files.');
+    expect(result.output).not.toContain('[gate] unfinished:');
+    const log = readFileSync(join(logs, 'pod-0.log'), 'utf8');
+    const meta = JSON.parse(readFileSync(join(logs, 'pod-0.json'), 'utf8'));
+    expect(meta).toMatchObject({ reason: 'timeout', rc: null });
+    const unfinishedPath = join(logs, 'pod-0.unfinished.log');
+    if (withRunningOutput) {
+      const bytes = readFileSync(unfinishedPath).byteLength;
+      expect(bytes).toBeGreaterThan(0);
+      expect(meta.unfinishedLogBytes).toBe(bytes);
+      expect(log.trimEnd().split('\n').at(-1)).toBe(`[gate] unfinished: pod-0.unfinished.log · ${bytes}B (진행 중 part 출력은 그 파일)`);
+      // The existing lines stay as they were: the finished part's output comes first, unchanged.
+      expect(log).toContain('3 packages installed [2.50s]');
+      expect(log).toContain(`Ran ${POD_SHARD_FILE_CAP} tests across ${POD_SHARD_FILE_CAP} files.`);
+    } else {
+      expect(existsSync(unfinishedPath)).toBe(false);
+      expect(meta).not.toHaveProperty('unfinishedLogBytes');
+      expect(log).not.toContain('[gate] unfinished:');
+    }
+    // Shards that finished whole never carry the hint.
+    for (const name of readdirSync(logs).filter((file) => file.endsWith('.log') && file !== 'pod-0.log' && !file.endsWith('.unfinished.log'))) {
+      expect(readFileSync(join(logs, name), 'utf8')).not.toContain('[gate] unfinished:');
+    }
+  });
+}
 
 test('depth-two isolation keeps unlisted files in their own Pod and batches opt-in files', async () => {
   const files = Array.from({ length: 8 }, (_, i) => `src/f-${i}.test.ts`);

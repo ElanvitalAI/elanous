@@ -1,5 +1,5 @@
 import type { PromptFrame } from '../../display/prompt-frame.js';
-import { hLine, ansi } from '../../tui.js';
+import { hLine, ansi, renderCacheRowIs } from '../../tui.js';
 import type { SurfaceRegistry } from '../../surface/index.js';
 
 export interface ChatMainInputSession {
@@ -20,6 +20,8 @@ export interface CreateChatMainInputSessionDeps {
   getInputCols?: () => number;
   surfaceRegistry: SurfaceRegistry;
   invalidateRenderCacheRow: (row0: number) => void;
+  /** Frame-cache probe (0-based row). Defaults to the live render cache. */
+  renderCacheRowIs?: (row0: number, text: string) => boolean;
   buildPromptFrameDividerRows: (promptFrame: PromptFrame, divider: string) => Array<{ row: number; text: string }>;
   shouldPaint: () => boolean;
   debugLog?: (event: string, label: string, payload: Record<string, unknown>) => void;
@@ -40,9 +42,14 @@ export function createChatMainInputSession(
   const inputWidth = deps.inputCols;
   const getInputWidth = (): number => deps.getInputCols?.() ?? inputWidth;
 
+  const cacheRowIs = deps.renderCacheRowIs ?? renderCacheRowIs;
   const paintChrome = () => {
     const divider = hLine(getInputWidth());
     for (const row of deps.buildPromptFrameDividerRows(getPromptFrame(), divider)) {
+      // The frame renderer already painted this exact divider — rewriting
+      // it (and dirtying the cache) only re-erases a settled row every
+      // repaint (RESEARCH-tui-bottom-flicker-2026-10-14 §3).
+      if (cacheRowIs(row.row - 1, row.text)) continue;
       deps.invalidateRenderCacheRow(row.row - 1);
       process.stdout.write(ansi.moveTo(row.row, 1) + '\x1b[2K' + row.text);
     }

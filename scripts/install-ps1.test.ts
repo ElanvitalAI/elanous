@@ -198,6 +198,34 @@ describe('scripts/install.ps1', () => {
     expect(source).toContain('bootstrapped: $bootstrapped; missing: $missing');
   });
 
+  test('refuses Windows on ARM64 before touching the prefix or the profile (WIN-ARM64-VM-TRIAL)', () => {
+    const source = readFileSync(installer, 'utf8');
+    expect(source).toContain('$env:PROCESSOR_ARCHITEW6432');
+    expect(source).toContain("$osArchitecture -eq 'ARM64'");
+    expect(source).toContain("Fail (Say 'Windows on ARM (ARM64) is not supported yet");
+    expect(source).toContain("') 78");
+    expect(source).toContain('no Windows ARM64 build');
+    expect(source).toContain('WIN-ARM64-VM-TRIAL');
+    // the gate needs the language setup above it (Say reads $installLang) and must stay above the
+    // first filesystem write so a refused host never leaves a prefix or profile behind.
+    const gate = source.indexOf("$osArchitecture -eq 'ARM64'");
+    expect(gate).toBeGreaterThan(source.indexOf('$installLang = if ($installLang -match'));
+    expect(gate).toBeLessThan(source.indexOf('New-Item -ItemType Directory -Force -Path $Prefix'));
+  });
+
+  test('resolves a scrubbed environment block through RuntimeInformation before the ARM64 refusal (WIN-ARM64-VM-TRIAL)', () => {
+    const source = readFileSync(installer, 'utf8');
+    expect(source).toContain("if (-not $osArchitecture -and $env:OS -eq 'Windows_NT')");
+    expect(source).toContain('[System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture');
+    expect(source).toContain('.ToUpperInvariant()');
+    // a type-resolution failure on pre-4.7.1 .NET must leave the gate exactly as before, not add a failure mode
+    expect(source).toContain('} catch { $osArchitecture = $null }');
+    // the environment variables stay authoritative: the fallback sits after them and before the ARM64 refusal
+    const fallback = source.indexOf('[System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture');
+    expect(fallback).toBeGreaterThan(source.indexOf('if (-not $osArchitecture) { $osArchitecture = $env:PROCESSOR_ARCHITECTURE }'));
+    expect(fallback).toBeLessThan(source.indexOf("$osArchitecture -eq 'ARM64'"));
+  });
+
   executionTest('PowerShell execution: checkout still requires git before modifying the prefix or profile', () => {
     const home = fixture();
     const commandPath = join(home, 'commands');
@@ -209,6 +237,57 @@ describe('scripts/install.ps1', () => {
     expect(result.stderr).toContain('required command missing: git');
     expect(existsSync(prefix)).toBe(false);
     expect(existsSync(profile)).toBe(false);
+  });
+
+  executionTest('PowerShell execution: an ARM64 host is refused with exit 78 before any file is written', () => {
+    const architectures: Record<string, string>[] = [
+      { PROCESSOR_ARCHITECTURE: 'ARM64' },
+      { PROCESSOR_ARCHITECTURE: 'x86', PROCESSOR_ARCHITEW6432: 'ARM64' },
+    ];
+    for (const architecture of architectures) {
+      const home = fixture();
+      const prefix = join(home, 'prefix');
+      const profile = join(home, 'profile.ps1');
+      const { result } = run([], { home, prefix, profile, env: architecture });
+      expect(result.status, result.stderr).toBe(78);
+      expect(result.stderr).toContain('not supported yet');
+      expect(result.stderr).toContain('no Windows ARM64 build');
+      expect(existsSync(prefix)).toBe(false);
+      expect(existsSync(profile)).toBe(false);
+    }
+  });
+
+  executionTest('PowerShell execution: an x64 host still passes the ARM64 gate unchanged', () => {
+    const architectures: Record<string, string>[] = [
+      { PROCESSOR_ARCHITECTURE: 'AMD64' },
+      { PROCESSOR_ARCHITECTURE: 'x86', PROCESSOR_ARCHITEW6432: 'AMD64' },
+    ];
+    for (const architecture of architectures) {
+      const home = fixture();
+      const commandPath = join(home, 'commands');
+      mkdirSync(commandPath);
+      commandStub(commandPath, 'bun');
+      const profile = join(home, 'new-profile.ps1');
+      const { result } = run(['-NoModifyPath'], { home, profile, path: commandPath, env: architecture });
+      expect(result.status, result.stderr).toBe(127);
+      expect(result.stderr).toContain('required command missing: git');
+    }
+  });
+
+  executionTest('PowerShell execution: an empty architecture environment falls back to RuntimeInformation on Windows and keeps the pre-fallback gate elsewhere (WIN-ARM64-VM-TRIAL)', () => {
+    // Both PROCESSOR_* variables empty exercises the third tier: on Windows RuntimeInformation resolves
+    // the real architecture (an ARM64 PowerShell is refused with 78); elsewhere the Windows_NT guard
+    // skips the fallback and the gate keeps its pre-fallback behavior, so the git preflight stops the run.
+    const probe = spawnSync(shell!, ['-NoProfile', '-Command', '[System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture'], { encoding: 'utf8' });
+    const refused = process.platform === 'win32' && probe.status === 0 && probe.stdout.trim() === 'Arm64';
+    const home = fixture();
+    const commandPath = join(home, 'commands');
+    mkdirSync(commandPath);
+    commandStub(commandPath, 'bun');
+    const { prefix, result } = run(['-NoModifyPath'], { home, prefix: join(home, 'scrubbed-prefix'), profile: join(home, 'scrubbed.ps1'), path: commandPath, env: { PROCESSOR_ARCHITECTURE: '', PROCESSOR_ARCHITEW6432: '' } });
+    expect(result.status, result.stderr).toBe(refused ? 78 : 127);
+    expect(result.stderr).toContain(refused ? 'not supported yet' : 'required command missing: git');
+    expect(existsSync(prefix)).toBe(false);
   });
 
   windowsExecutionTest('standalone with no git or Bun bootstraps once and installs with a Korean path intact', () => {

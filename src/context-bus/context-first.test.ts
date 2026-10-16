@@ -1,8 +1,10 @@
 import { expect, test } from 'bun:test';
-import { createContextFirstFileStore, createContextFirstGate, isOperationalQuery, renderContextFirst } from './context-first.js';
-import type { ContextNowAnswer } from './context-now.js';
+import { createContextFirstFileStore, createContextFirstGate, isOperationalQuery, renderContextFirst, takeContextFirstOpening } from './context-first.js';
+import type { ContextNowAnswer, ContextNowDeps } from './context-now.js';
 import { renderContextFirstNow, renderContextFirstOpening, renderTelegramNow } from './context-now-surfaces.js';
 import { TelegramBot, botFromConfig } from '../telegram.js';
+import { buildDiscordSelfOnMessage } from '../discord-self-message.js';
+import type { DcIncoming, DiscordBot } from '../discord.js';
 import { runTurn } from '../session/chat.js';
 import type { LLMProvider } from '../llm.js';
 import { buildAcpContextPreamble } from '../telegram-commands.js';
@@ -249,4 +251,65 @@ test('an ordinary first message after a restart still gets an opening of at most
   expect(opening!.split('\n').length).toBeLessThanOrEqual(3);
   expect(sent.join('\n')).not.toContain('최근:');
   expect(sent).toContain('본 답');
+});
+
+test('the shared gate decision consumes the pending opening and skips it for disabled surfaces and operational questions', () => {
+  let time = 0;
+  const gate = createContextFirstGate({ now: () => time });
+  gate.note('chat');
+  expect(takeContextFirstOpening({ gate, key: 'chat', text: '안녕' })).toBe(true);
+  expect(takeContextFirstOpening({ gate, key: 'chat' })).toBe(false);
+  time += 6 * 60 * 60 * 1000;
+  gate.note('chat');
+  expect(takeContextFirstOpening({ gate, key: 'chat', text: '현재 버전 발행 준비 상태?' })).toBe(false);
+  time += 6 * 60 * 60 * 1000;
+  gate.note('chat');
+  expect(takeContextFirstOpening({ gate, key: 'chat', enabled: false })).toBe(false);
+  time += 6 * 60 * 60 * 1000;
+  gate.note('chat');
+  expect(takeContextFirstOpening({ gate, key: 'other' })).toBe(false);
+  expect(takeContextFirstOpening({ gate, key: 'chat', text: '안녕' })).toBe(true);
+  expect(takeContextFirstOpening({ gate, key: 'chat' })).toBe(false);
+});
+
+const discordNowDeps: ContextNowDeps = {
+  now: () => new Date('2026-10-06T00:00:00.000Z'), version: () => '0.2.16',
+  checklist: version => ({ version, released: '', dev: version, history: [], items: [] }),
+  decisions: () => [], seatEntries: () => [], events: () => [],
+  runningRuns: () => [], releaseRun: () => null, lateSchedules: () => null,
+};
+
+function makeDiscordHandler(sent: string[], options: { contextFirst?: boolean } = {}) {
+  const config = { llm: { provider: 'test' }, discord: { contextFirst: options.contextFirst } } as unknown as UserConfig;
+  const bot = { sendMessage: async (_channelId: string, text: string) => { sent.push(text); return { id: 'summary' }; }, fileSinkForChannel: () => ({}) } as unknown as DiscordBot;
+  const handler = buildDiscordSelfOnMessage({
+    userConfig: config, getBot: () => bot,
+    runTurnImpl: (async () => { sent.push('본 답'); return { text: '본 답' }; }) as unknown as NonNullable<Parameters<typeof buildDiscordSelfOnMessage>[0]['runTurnImpl']>,
+    contextFirstNow: () => 0,
+    nowDeps: discordNowDeps,
+    tuiSlashAvailability: [],
+  });
+  return (text: string) => handler({ channelId: 'dm', userId: 'owner', text, messageId: '1', isDm: true, attachments: [], raw: {} } as DcIncoming);
+}
+
+test('Discord general replies take the common gate: an operational question skips the summary, ordinary talk gets it', async () => {
+  const sent: string[] = [];
+  const dc = makeDiscordHandler(sent);
+  expect(await dc('현재 버전 발행 준비 상태?')).toBe('본 답');
+  expect(sent).toEqual(['본 답']);
+  expect(await dc('또 뭐라고')).toBe('본 답');
+  expect(sent).toEqual(['본 답', '본 답']);
+
+  const fresh: string[] = [];
+  const dc2 = makeDiscordHandler(fresh);
+  expect(await dc2('안녕')).toBe('본 답');
+  expect(fresh[0]).toBe(renderContextFirstNow(contextNow({}, discordNowDeps)));
+  expect(fresh[1]).toBe('본 답');
+});
+
+test('Discord general replies honor the surface switch through the common gate', async () => {
+  const sent: string[] = [];
+  const dc = makeDiscordHandler(sent, { contextFirst: false });
+  expect(await dc('안녕')).toBe('본 답');
+  expect(sent).toEqual(['본 답']);
 });

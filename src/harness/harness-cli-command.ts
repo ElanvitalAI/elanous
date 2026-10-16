@@ -15,7 +15,7 @@ import { stateDirSourceForChild } from '../agent/identity-env.js';
 import { lookupGoal, type GoalLookupOptions, type GoalLookupResult } from '../self-implement/goal-lookup.js';
 import { archiveGoals, type GoalArchiveOptions } from '../self-implement/goal-archive.js';
 import { detectBursts, formatIncidentBurstWarning, incidentLastLines, readRunExits, recentBurst, recordRunExit } from './harness-incidents.js';
-import { Command, Option } from 'commander';
+import { Command, InvalidArgumentError, Option } from 'commander';
 import { runGitCommand } from '../git-fs/runner.js';
 import { GOAL_TYPES, lintGoalFile, parseGoalId, parseGoalType, resolveGoalAuthorGrade, tracedPathReferences, type GoalAuthorGrade, type GoalAuthorGradeSelection, type GoalType } from '../self-implement/goal-author.js';
 import { templateForGoalType } from '../self-implement/graph-templates.js';
@@ -132,6 +132,8 @@ export interface HarnessAskSayOptions {
   /** Depth 0 only. At depth >= 1 this flag is ignored and the launch stays refused. */
   nestedElanous?: 'allow';
   queue?: boolean;
+  /** RUN-IDENTITY — 태스크 카드 신분이 대기열 줄 우선순위로 옮겨온 값(승인·선점이 신분을 읽는다 · 칸 러브릭보다 위). */
+  runPriority?: number;
 }
 
 export interface ResolvedHarnessSupervisor {
@@ -294,6 +296,11 @@ function registerHarnessAskSayOptions(command: Command): Command {
     .option('--correlation <id>', '요청과 런을 잇는 불투명 correlation 값')
     .addOption(new Option('--seat <seat>', '런 귀속 자리 (OP|TC|MK|UX)').choices(['OP', 'TC', 'MK', 'UX']))
     .option('--no-queue', '비상시 자리별 대기열을 건너뛰고 직접 발사')
+    .option('--run-priority <n>', 'RUN-IDENTITY — 태스크 카드 신분이 대기열 줄 우선순위로 옮겨온 값(승인·선점이 신분을 읽는다 · 칸 러브릭보다 위)', (value: string) => {
+      const n = Number(value);
+      if (!Number.isFinite(n)) throw new InvalidArgumentError('유한한 숫자여야 한다');
+      return n;
+    })
     .addOption(new Option('--goal-type <type>', `골 종류 (${GOAL_TYPES.join('|')})`).choices([...GOAL_TYPES]))
     .option('--force-preflight', '전제 검사 막힘을 명시 요청으로 우회(관측에 남음)')
     .option('--force-gate', '같은 골 실행 중 막힘을 명시 요청으로 우회(관측에 남음; 예산 막힘은 우회 불가)')
@@ -371,6 +378,7 @@ function normalizeHarnessAskSayOptions(opts: HarnessAskSayChildLlmOptions): Harn
     ...(opts.target !== undefined ? { target: opts.target } : {}),
     ...(opts.correlation !== undefined ? { correlation: opts.correlation } : {}),
     ...(opts.forcePreflight === true ? { forcePreflight: true } : {}),
+    ...(opts.runPriority !== undefined ? { runPriority: opts.runPriority } : {}),
     ...(opts.childLlmProvider !== undefined ? { childLlmProvider: opts.childLlmProvider } : {}),
     ...(opts.childLlmModel !== undefined ? { childLlmModel: opts.childLlmModel } : {}),
     // ⛔⭐⭐ 🩸 2026-09-12 — ***이 줄이 «없어서» `--child-llm-effort` 가 조용히 삼켜졌다.***
@@ -408,7 +416,7 @@ function resolveLaunchSubstrate(opts: HarnessSubstrateOpts): ResolvedHarnessSubs
   return resolved;
 }
 type PodExit = { status: number | null; signal?: string | null };
-type PodExitReason = 'signal' | 'human-stop' | 'supervisor' | 'no-launch' | 'unknown'
+type PodExitReason = 'signal' | 'human-stop' | 'supervisor' | 'no-launch' | 'unknown' | 'preflight-refused'
   | 'pod-error' | 'launch-gate-blocked' | 'ENOBUFS' | 'OOMKilled';
 
 function unknownPodExitTailReason(output: string): PodExitReason | undefined {
@@ -442,6 +450,28 @@ export function classifyHarnessPodExit(
     runId?: string;
   } = {},
 ): { lines: string[]; reason: PodExitReason | 'pod-failure' } {
+  const occupiedNewLine = output.split('\n').find((line) =>
+    /^\[self-dev\] run run-[a-z0-9_-]{8,64} \[preflight:new-path-occupied:[0-9a-f-]{36}\] /.test(line));
+  const observedRunId = deps.runId ?? harnessPodRunId(output);
+  const preflightRunId = occupiedNewLine ? harnessPodRunId(occupiedNewLine) : undefined;
+  const preflightAttemptId = occupiedNewLine?.match(/\[preflight:new-path-occupied:([0-9a-f-]{36})\]/)?.[1];
+  const preflightPath = occupiedNewLine?.match(/신설 traced path 가 이미 점유됨: (.+) — 골의 신설: 경로를 바로잡아야 한다$/)?.[1];
+  let preflightReceipt = false;
+  if (exit.status === 2 && !exit.signal && occupiedNewLine && preflightRunId && preflightRunId === observedRunId && preflightPath && preflightAttemptId) {
+    try {
+      const entries = (deps.loadLedger ?? loadRunLedger)(preflightRunId) ?? [];
+      const receiptIndex = entries.findIndex((entry) => entry.runId === preflightRunId && entry.event === 'preflight-refused'
+        && entry.data.kind === 'occupied-new-traced-path' && entry.data.path === preflightPath
+        && entry.data.attemptId === preflightAttemptId);
+      preflightReceipt = receiptIndex >= 0 && !entries.slice(receiptIndex + 1).some((entry) => LAUNCH_EVIDENCE_EVENTS.has(entry.event));
+    } catch { /* Unreadable run evidence cannot establish a host refusal. */ }
+  }
+  if (preflightReceipt && occupiedNewLine) {
+    const runId = preflightRunId;
+    try { debug.log('harness.pod', 'exit-classified', { runId, reason: 'preflight-refused', status: exit.status, signal: exit.signal ?? null }); }
+    catch { /* observation is fail-soft */ }
+    return { reason: 'preflight-refused', lines: [occupiedNewLine] };
+  }
   let podFailure: string | undefined;
   let podJobFailed = false;
   let podChildFailed = false;
@@ -470,7 +500,6 @@ export function classifyHarnessPodExit(
     podChildFailed = summary?.includes(' — pod-child-failed: ') ?? false;
   }
   // Only the run announced at launch — another run id quoted in the output is not this run (review round 3).
-  const observedRunId = deps.runId ?? harnessPodRunId(output);
   const runId = observedRunId ? normalizeRunId(observedRunId) : undefined;
   if (podFailure) {
     const childError = podJobFailed ? podFailure.split('childError=')[1]?.split('\\n', 1)[0]?.split('\n', 1)[0] : undefined;
@@ -726,6 +755,15 @@ export function recordHarnessPodStop(
   try {
     if (runStopRecorded(runId)) return false;
     if ((deps.loadLedger ?? loadRunLedger)(runId)?.some((entry) => entry.event === RUN_STOP_EVENT)) return false;
+    if (classified.reason === 'preflight-refused') {
+      (deps.record ?? recordRunStop)({
+        runId, site: 'preflight', class: 'launch-failed',
+        cause: 'Preflight refused: occupied new traced path',
+        evidenceRef: `run-ledger:${runId}:preflight-refused`,
+        nextMove: 'Correct the declared new path in the goal before relaunch',
+      }, ...(deps.write ? [deps.write] : []));
+      return true;
+    }
     const nextMove = classified.reason === 'no-launch' ? 'Check Pod launch gate and pool, then relaunch'
       : 'Inspect Pod exit classification and harvest the branch before relaunch';
     const evidenceRef = `logs:harness.pod/exit-classified:${runId}`;
@@ -943,6 +981,8 @@ async function dispatchHarnessAskSay(
         ['--child-llm-model', opts.childLlmModel], ['--child-llm-effort', opts.childLlmEffort],
         ['--pod-pool', (opts as HarnessSubstrateOpts).podPool], ['--pod-memory', (opts as HarnessSubstrateOpts).podMemory],
         ['--after', (opts as HarnessSubstrateOpts).after], ['--source', (opts as HarnessSubstrateOpts).source], ['--repair-commit-only', (opts as HarnessSubstrateOpts).repairCommitOnly],
+        // RUN-IDENTITY — 신분이 줄 우선순위로 흐른다(승인·선점이 읽는다 · 대기열 자식이 다시 상속).
+        ['--run-priority', opts.runPriority !== undefined ? String(opts.runPriority) : undefined],
       ];
       for (const [flag, value] of values) if (value !== undefined) flags.push(flag, value);
       if ((opts as HarnessSubstrateOpts).source !== undefined && resolved.substrate !== 'pod') {
@@ -967,6 +1007,7 @@ async function dispatchHarnessAskSay(
       try {
         row = await addHarnessQueue({ seat: stampedSeat, launchCwd: process.cwd(), refuseDuplicate: true,
         ...(dryRunPreview.goalPath ? { ask: dryRunPreview.goalPath } : { say: dryRunPreview.input }),
+        ...(opts.runPriority !== undefined ? { runPriority: opts.runPriority } : {}),
         launchArgs: ['harness', dryRunPreview.goalPath ? 'ask' : 'say', dryRunPreview.goalPath ?? dryRunPreview.input,
           '--seat', stampedSeat, ...((opts as HarnessSubstrateOpts).substrate ? ['--substrate', (opts as HarnessSubstrateOpts).substrate!] : []), ...flags,
           ...(opts.nestedElanous ? ['--nested-elanous', opts.nestedElanous] : [])],
@@ -982,7 +1023,11 @@ async function dispatchHarnessAskSay(
         process.exitCode = 1;
         return;
       }
-      const result = await withJourneyNode('queue', journey, () => tickHarnessQueue({ ...queueDeps, ...(immediateLaunch ? { launch: immediateLaunch } : {}) }, row.id));
+      // NEEDS-OWNER-BOUNDARY (direct say/ask): the immediate-launch tick stays ungated — a person-initiated
+      // command answers itself, so pre-hold launch behavior is preserved. An embedder can still opt in via
+      // deps.queue.needsOwnerGate.
+      const result = await withJourneyNode('queue', journey, () => tickHarnessQueue(
+        { ...queueDeps, ...(immediateLaunch ? { launch: immediateLaunch } : {}), needsOwnerGate: queueDeps?.needsOwnerGate ?? false }, row.id));
       exitJourneyNode('queue', { ...journey, outcome: result.outcome === 'launched' && result.item?.id === row.id ? 'launched' : 'waiting', data: { queueItemId: row.id, queueTick: result.outcome } });
       if (result.outcome === 'launched' && result.item?.id === row.id) {
         if (immediateExit) process.exitCode = await immediateExit();
@@ -3336,7 +3381,9 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
     console.log(`${id} ${await reconcileHarnessQueue(id, queueDeps)}`);
   }));
   queue.command('tick').description('자리별 맨 앞 항목을 라운드로빈으로 돌며 자리 몫·Pod 풀 여유·마무리 관문을 확인하고 발사 — 여유가 있으면 한 tick 에 여러 건(30초 간격 · harness.queue.burstMax 기본 5)').action(() => queueAction(async () => {
-    const result = await tickHarnessQueue(queueDeps);
+    // NEEDS-OWNER-BOUNDARY (queue tick = autonomous): the needs-owner hold defaults ON here — this is
+    // the cron surface. The census runs once per tick and is shared across every candidate seat.
+    const result = await tickHarnessQueue({ ...queueDeps, needsOwnerGate: queueDeps.needsOwnerGate ?? true });
     console.log(`${result.outcome}${result.item ? ` ${result.item.id}` : ''}: ${result.reason}`);
     // QUEUE-BURST: the first line stays as before; every further launch of the burst gets its own line.
     for (const row of result.launched?.slice(1) ?? []) console.log(`launched ${row.id}: spawned`);

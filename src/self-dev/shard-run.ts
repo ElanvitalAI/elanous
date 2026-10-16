@@ -1,11 +1,13 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug, redactSecretText } from '../debug/log.js';
 import { prepareDeterministicChildEnvironment } from '../../scripts/lib/deterministic-env.js';
+import { withGateTestEnv } from '../../scripts/lib/gate-test-env.js';
 import { withBaselineWorktree } from '../self-implement/gate-baseline.js';
 import { aggregateGateTestShards, type GateShardAttempt, type GateShardAggregate } from './shard-aggregate.js';
-import { planGateTestShards, type GateTestShard } from './shard-plan.js';
+import { planFixedGateTestShards, planSelfGateSpawnSeparatedShards, type GateTestShard } from './shard-plan.js';
+import { isGateSpawnLaneFile } from './spawn-lane-files.js';
 
 export interface ShardRunResult {
   aggregate: GateShardAggregate;
@@ -13,6 +15,33 @@ export interface ShardRunResult {
   attempts: GateShardAttempt[];
   reason?: string;
   measurementFailures?: number;
+  /** Present only for opt-in `--fixed-shard-distribution` (no RSS pre-measurement). Absent = the measured planner. */
+  distribution?: 'fixed';
+  /** OP FU (MK #8178 shard-9) — raw evidence of every failed shard process (exit≠0 · signal · no JUnit). Observation only:
+   *  the aggregate never reads it. Absent = no shard process reported failure output. */
+  failureEvidence?: ShardFailureEvidence[];
+}
+
+/** What a failed shard process leaves behind so «test failure vs runner error» can be told apart after the fact. */
+export interface ShardFailureOutput {
+  durationMs: number;
+  /** Last 64KB of the child's stdout/stderr (redacted). */
+  stdoutTail: string;
+  stderrTail: string;
+}
+
+export interface ShardFailureEvidence extends ShardFailureOutput {
+  shardId: string;
+  side: 'current' | 'baseline';
+  attempt: number;
+  files: string[];
+  exitCode: number | null;
+  signal: string | null;
+}
+
+export interface ShardRunMode {
+  /** OP FU — sorted round-robin into `count` shards, zero pre-measurement runs. Default off: the measured planner. */
+  fixedDistribution?: boolean;
 }
 
 export type ShardProcess = (cwd: string, files: readonly string[]) => {
@@ -23,7 +52,36 @@ export type ShardProcess = (cwd: string, files: readonly string[]) => {
   seconds?: number;
   /** Bounded, redacted process output for an abnormal exit before JUnit exists. */
   diagnostic?: string;
+  /** Present only when the process failed (exit≠0 · signal · no JUnit) — observation only, never part of the verdict. */
+  failure?: ShardFailureOutput;
 };
+
+export const SHARD_FAILURE_TAIL_BYTES = 64 * 1024;
+
+function outputTail(bytes: Uint8Array | undefined): string {
+  if (!bytes?.length) return '';
+  const tail = bytes.length > SHARD_FAILURE_TAIL_BYTES ? bytes.subarray(bytes.length - SHARD_FAILURE_TAIL_BYTES) : bytes;
+  return redactSecretText(Buffer.from(tail).toString('utf8'));
+}
+
+/** `<shardId>.failure.json` per failed shard (shard ids are already `shard-<n>`). Top level = the latest current-side
+ *  failure (else the latest baseline one); `failures` keeps every failed side/attempt. Returns the written paths. */
+export function writeShardFailureEvidence(dir: string, evidence: readonly ShardFailureEvidence[]): string[] {
+  if (!evidence.length) return [];
+  mkdirSync(dir, { recursive: true });
+  const byShard = new Map<string, ShardFailureEvidence[]>();
+  for (const item of evidence) byShard.set(item.shardId, [...(byShard.get(item.shardId) ?? []), item]);
+  const written: string[] = [];
+  for (const [shardId, failures] of byShard) {
+    const primary = [...failures].reverse().find((item) => item.side === 'current') ?? failures[failures.length - 1]!;
+    const path = join(dir, `${shardId.replace(/[^A-Za-z0-9._-]/g, '_')}.failure.json`);
+    const { side, attempt, ...fields } = primary;
+    writeFileSync(path, `${JSON.stringify({ ...fields, side, attempt, failures }, null, 2)}\n`);
+    debug.log('self-dev.shard', 'failure-evidence', { shardId, path, failures: failures.length, exitCode: primary.exitCode, signal: primary.signal });
+    written.push(path);
+  }
+  return written;
+}
 
 const DIAGNOSTIC_STREAM_LIMIT = 240;
 
@@ -56,8 +114,17 @@ export function runShardedGateTests(
   run: ShardProcess = runBunShard,
   baselineWorktree: typeof withBaselineWorktree = withBaselineWorktree,
   budgetGiB = 8,
+  mode: ShardRunMode = {},
 ): ShardRunResult {
   if (!Number.isSafeInteger(count) || count < 1) throw new Error('invalid --shards count');
+  if (mode.fixedDistribution) {
+    // Opt-in: no per-file pre-measurement at all — the shard runs themselves (JUnit · rc · signal · baseline) decide.
+    let fixed: GateTestShard[];
+    try { fixed = planFixedGateTestShards(files, count); }
+    catch (error) { return { aggregate: { status: 'unmeasured', retryShardIds: [] }, shards: [], attempts: [], reason: String(error), distribution: 'fixed' }; }
+    debug.log('self-dev.shard', 'fixed-distribution', { shards: fixed.length, files: fixed.reduce((sum, shard) => sum + shard.files.length, 0) });
+    return { ...runPlannedShards(cwd, fixed, baseRef, run, baselineWorktree), distribution: 'fixed' };
+  }
   const rss = new Map<string, number>();
   const seconds = new Map<string, number>();
   const failedMeasurements: string[] = [];
@@ -90,11 +157,27 @@ export function runShardedGateTests(
   const measurementFailures = failedMeasurements.length || undefined;
   let shards: GateTestShard[];
   try {
-    shards = planGateTestShards(files, rss, seconds, budgetGiB, count);
+    shards = planSelfGateSpawnSeparatedShards(files, rss, seconds, budgetGiB, count);
   } catch (error) {
     return { aggregate: { status: 'unmeasured', retryShardIds: [] }, shards: [], attempts: [], reason: String(error), ...(measurementFailures ? { measurementFailures } : {}) };
   }
+  return { ...runPlannedShards(cwd, shards, baseRef, run, baselineWorktree), ...(measurementFailures ? { measurementFailures } : {}) };
+}
+
+/** Shared by the measured and the fixed planner: current + baseline per shard, one retry round, one aggregate. */
+function runPlannedShards(
+  cwd: string,
+  shards: GateTestShard[],
+  baseRef: string,
+  run: ShardProcess,
+  baselineWorktree: typeof withBaselineWorktree,
+): ShardRunResult {
   const attempts: GateShardAttempt[] = [];
+  const failureEvidence: ShardFailureEvidence[] = [];
+  const keepFailure = (shardId: string, side: ShardFailureEvidence['side'], attempt: number, files: readonly string[], result: ReturnType<ShardProcess>) => {
+    if (!result.failure) return;
+    failureEvidence.push({ shardId, side, attempt, files: [...files], exitCode: result.exitCode, signal: result.signal ?? null, ...result.failure });
+  };
   const baseline = baselineWorktree(cwd, baseRef, (dir) => {
     // LIGHT-RC-MEASURE ① — bun silently skips a path that is not in the baseline tree (exit 0), so a shard holding a
     // new test file could never yield a complete baseline JUnit. Run the baseline side on the files the base has; an
@@ -114,6 +197,8 @@ export function runShardedGateTests(
         }
         const current = runSafely(cwd, shard.files);
         const base = baselineFiles.length ? runSafely(dir, baselineFiles) : { exitCode: 0 };
+        keepFailure(shard.id, 'current', round, shard.files, current);
+        keepFailure(shard.id, 'baseline', round, baselineFiles, base);
         attempts.push({
           shardId: shard.id, attempt: round,
           currentJUnit: current.junit, baselineJUnit: base.junit,
@@ -128,22 +213,38 @@ export function runShardedGateTests(
     }
     return aggregateGateTestShards(shards, attempts);
   });
-  if ('retryShardIds' in baseline) return { aggregate: baseline, shards, attempts, ...(measurementFailures ? { measurementFailures } : {}) };
-  return { aggregate: { status: 'unmeasured', retryShardIds: shards.map((shard) => shard.id) }, shards, attempts, reason: baseline.log, ...(measurementFailures ? { measurementFailures } : {}) };
+  const evidence = failureEvidence.length ? { failureEvidence } : {};
+  if ('retryShardIds' in baseline) return { aggregate: baseline, shards, attempts, ...evidence };
+  return { aggregate: { status: 'unmeasured', retryShardIds: shards.map((shard) => shard.id) }, shards, attempts, reason: baseline.log, ...evidence };
+}
+
+export function selfGateShardTimeoutMs(files: readonly string[]): number {
+  const spawnFiles = files.filter(isGateSpawnLaneFile);
+  if (spawnFiles.length && spawnFiles.length !== files.length) throw new Error('self gate spawn lane mixed with regular tests');
+  return spawnFiles.length ? 120_000 : 300_000;
 }
 
 export function runBunShard(cwd: string, files: readonly string[]): ReturnType<ShardProcess> {
+  return runBunShardWithSpawn(cwd, files, Bun.spawnSync);
+}
+
+/** Child launch seam for verifying the actual command and process timeout. */
+export function runBunShardWithSpawn(cwd: string, files: readonly string[], spawn: typeof Bun.spawnSync): ReturnType<ShardProcess> {
+  const timeout = selfGateShardTimeoutMs(files);
+  const spawnLane = timeout === 120_000;
   const dir = mkdtempSync(join(tmpdir(), 'elanous-shard-junit-'));
   const report = join(dir, 'result.xml');
-  const isolated = prepareDeterministicChildEnvironment('elanous-shard-test-env-');
+  const isolated = prepareDeterministicChildEnvironment('elanous-shard-test-env-', { env: withGateTestEnv(process.env) });
   try {
     const measured = files.length === 1;
-    const args = ['test', '--reporter=junit', `--reporter-outfile=${report}`, ...files];
+    const args = ['test', ...(spawnLane ? ['--timeout=120000'] : []), '--reporter=junit', `--reporter-outfile=${report}`, ...files];
     const started = performance.now();
-    const result = Bun.spawnSync(['bun', ...args], {
-      cwd, env: isolated.env, stdout: 'pipe', stderr: 'pipe', timeout: 300_000,
+    const result = spawn(['bun', ...args], {
+      cwd, env: isolated.env, stdout: 'pipe', stderr: 'pipe', timeout,
     });
+    const durationMs = performance.now() - started;
     const junit = existsSync(report) ? readFileSync(report, 'utf8') : undefined;
+    const failed = result.exitCode !== 0 || !!result.signalCode || junit === undefined;
     return {
       exitCode: result.exitCode,
       signal: result.signalCode ? String(result.signalCode) : undefined,
@@ -151,7 +252,8 @@ export function runBunShard(cwd: string, files: readonly string[]): ReturnType<S
       ...(junit === undefined && (result.exitCode !== 0 || result.signalCode)
         ? { diagnostic: boundedDiagnostic(result.stdout, result.stderr) } : {}),
       rssMb: measured ? result.resourceUsage.maxRSS / (1024 * 1024) : undefined,
-      seconds: measured ? (performance.now() - started) / 1000 : undefined,
+      seconds: measured ? durationMs / 1000 : undefined,
+      ...(failed ? { failure: { durationMs: Math.round(durationMs), stdoutTail: outputTail(result.stdout), stderrTail: outputTail(result.stderr) } } : {}),
     };
   } finally {
     isolated.cleanup();

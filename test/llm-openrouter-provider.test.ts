@@ -17,7 +17,11 @@ delete process.env.ELANOUS_KEEP_ENV_KEYS;
 
 const llm = await import('../src/llm.js');
 const uc = await import('../src/user-config.js');
-const { OPENROUTER_API_URL } = await import('../src/config.js');
+const { OPENROUTER_API_URL, _resetKeyCacheForTests } = await import('../src/config.js');
+// R4 (gate 0.2.30 pod-15): the memo is per «process», not per file — an earlier file in the same shard had already read
+// OPENROUTER_API_KEY (no cache file → null), so the cache dir above was never consulted. Forget it here and on the way out
+// (the fixture key must not outlive this file either).
+_resetKeyCacheForTests();
 
 type Capture = { url: string; headers: Record<string, string>; body: any };
 let calls: Capture[];
@@ -38,6 +42,7 @@ beforeEach(() => {
 afterEach(() => { globalThis.fetch = prior; });
 beforeAll(() => {});
 afterAll(() => {
+  _resetKeyCacheForTests();
   if (savedKeyDir === undefined) delete process.env.ELANOUS_KEY_CACHE_DIR; else process.env.ELANOUS_KEY_CACHE_DIR = savedKeyDir;
   if (savedKeep !== undefined) process.env.ELANOUS_KEEP_ENV_KEYS = savedKeep;
 });

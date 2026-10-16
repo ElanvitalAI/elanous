@@ -24,7 +24,7 @@ test('a remote pass is reused only for the same PR head and main tip', () => {
     expect(ensurePrLandHeavyRemote(input, deps)).toMatchObject({ ok: true, source: 'remote' });
     expect(ensurePrLandHeavyRemote(input, deps)).toMatchObject({ ok: true, source: 'cached', interferenceMeasured: true, rootPlan: { mode: 'affected', roots: 534, promoted: false, reason: 'large-affected-kept' } });
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toMatchObject({ host: 'node-b', commit: HEAD, refs: [MAIN], installPwa: true });
+    expect(calls[0]).toMatchObject({ host: 'node-b', commit: HEAD, refs: [MAIN], installPwa: true, stableCheckout: true });
     const argv = (calls[0]!.argv as (sha: (ref: string) => string) => string[])((ref) => ref);
     expect(argv).toEqual(['sh', '-c', expect.stringContaining('merge --no-ff --no-edit "$1"'), 'sh', MAIN]);
     expect(argv.join(' ')).toContain('TSC_BASE_REF="$1" bun run scripts/ci-typecheck-changed.ts --local');
@@ -376,11 +376,11 @@ test('remote interference unmeasured warning is cached as unmeasured without blo
 test('busy node-b selects node-c and caches only its exact head/main evidence', () => {
   const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
   const input = { pr: 52, head: HEAD, main: MAIN, repo: '/repo', evidenceDir };
-  const hosts: string[] = [];
+  const hosts: Array<[string, number | undefined]> = [];
   const deps = {
-    settings: GATE_REMOTE_DEFAULTS, observe: () => {},
+    settings: { ...GATE_REMOTE_DEFAULTS, hostCaps: { node-b: 6, node-c: 3 } }, observe: () => {},
     runRemote: (options: RemoteRunOptions) => {
-      hosts.push(options.host);
+      hosts.push([options.host, options.hostCap]);
       return options.host === 'node-b' ? { kind: 'busy' as const } : {
         kind: 'ran' as const, rc: 0, stdout: Buffer.from('[pr-land-extra-gates] pass global=measured interference=measured files=2\n'),
         stderr: Buffer.alloc(0), commit: HEAD, host: 'node-c', ms: 8,
@@ -389,12 +389,12 @@ test('busy node-b selects node-c and caches only its exact head/main evidence', 
   };
   try {
     expect(ensurePrLandHeavyRemote(input, deps)).toMatchObject({ ok: true, source: 'remote', host: 'node-c' });
-    expect(hosts).toEqual(['node-b', 'node-c']);
+    expect(hosts).toEqual([['node-b', 6], ['node-c', 3]]);
     expect(ensurePrLandHeavyRemote(input, deps)).toMatchObject({ ok: true, source: 'cached', host: 'node-c' });
     expect(hosts).toHaveLength(2);
     expect(JSON.parse(readFileSync(join(evidenceDir, '52.json'), 'utf8'))).toMatchObject({ host: 'node-c', head: HEAD, main: MAIN });
     expect(ensurePrLandHeavyRemote({ ...input, main: NEXT_MAIN }, deps)).toMatchObject({ ok: true, source: 'remote', host: 'node-c' });
-    expect(hosts).toEqual(['node-b', 'node-c', 'node-b', 'node-c']);
+    expect(hosts).toEqual([['node-b', 6], ['node-c', 3], ['node-b', 6], ['node-c', 3]]);
   } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
 });
 

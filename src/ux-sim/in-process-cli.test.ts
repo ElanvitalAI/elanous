@@ -42,6 +42,12 @@ test('allowPaths matches registered commands and leaves positional arguments out
     .rejects.toThrow('not allowed');
 });
 
+test('allowPaths accepts a registered Commander alias by its invoked name', async () => {
+  const result = await simInProcessCli(['drive', '--help'], { allowPaths: [['drive']] });
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout).toContain('drive');
+});
+
 test('one real CLI process confirms the same where contract at the entry boundary', () => {
   const root = mkdtempSync(join(tmpdir(), 'ux-sim-cli-entry-'));
   try {

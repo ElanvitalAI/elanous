@@ -10,6 +10,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { envLiteral } from '../../src/platform/env-literal.js';
 
 /** True when the variable name has the SHAPE of a credential.
  *
@@ -88,4 +89,65 @@ export function prepareDeterministicChildEnvironment(
     cleanup();
     throw error;
   }
+}
+
+// A deterministic test child is not a harness executor: these inherited
+// markers would activate write-boundary policy against each test's temp files.
+const HARNESS_TEST_ENV_KEYS = [
+  'ELANOUS_HARNESS_SPACE',
+  'ELANOUS_HARNESS_SPACE_ID',
+  'ELANOUS_HARNESS_BOUNDARY',
+  'ELANOUS_HARNESS_ROLE',
+  'ELANOUS_HARNESS_DETACHED',
+] as const;
+
+// Discovery: rg -n "process\.env\.ELANOUS_(HOST|RUN|ORIGIN|SUPERVISOR|PARENT)" src
+// These are ambient execution identities, not inputs to a deterministic test.
+// debug.log also attributes SUBSTRATE and ARM_ID to every plain-object record.
+export const GIT_LOCATION_ENV_KEYS = [
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
+  'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+] as const;
+
+const EXECUTION_ORIGIN_ENV_KEYS = [
+  'ELANOUS_HOST_ID',
+  'ELANOUS_RUN_ID',
+  'ELANOUS_RUN_CONTEXT',
+  'ELANOUS_PARENT_RUN_ID',
+  'ELANOUS_PARENT_PTY_ID',
+  'ELANOUS_PARENT_SELF_DEV_RUNS_DIR',
+  'ELANOUS_SUBSTRATE',
+  'ELANOUS_ARM_ID',
+  // Parent account selection changes CLI rotation assertions in the child.
+  'ELANOUS_CODEX_ACCOUNT',
+  // A parent's derived-root label must not reclassify a test's explicit state dir.
+  'ELANOUS_STATE_DIR_SOURCE',
+] as const;
+
+export function prepareIsolatedTestEnv(sourceEnv: NodeJS.ProcessEnv, testRoot: string): NodeJS.ProcessEnv {
+  const env = Object.fromEntries(
+    Object.entries(sourceEnv).filter(([key]) => !isCredentialKey(key)
+      && !HARNESS_TEST_ENV_KEYS.includes(key as typeof HARNESS_TEST_ENV_KEYS[number])
+      && !EXECUTION_ORIGIN_ENV_KEYS.includes(key as typeof EXECUTION_ORIGIN_ENV_KEYS[number])
+      && !GIT_LOCATION_ENV_KEYS.includes(key as typeof GIT_LOCATION_ENV_KEYS[number])),
+  );
+  env.HOME = testRoot;
+  // userConfigPath() warns whenever XDG_CONFIG_HOME is set, including when
+  // config.json is absent. Use its non-XDG path; migrateLegacyXdgUserConfig()
+  // resolves the old path through ELANOUS_TEST_HOME rather than the real home.
+  delete env.XDG_CONFIG_HOME;
+  env.ELANOUS_TEST_HOME = testRoot;
+  // HOME and ELANOUS_STATE_DIR isolate both the state and default config roots.
+  // ELANOUS_CONFIG_DIR is not a config-dir override; discard an inherited value
+  // rather than passing an ignored variable that appears to provide isolation.
+  env.ELANOUS_STATE_DIR = join(testRoot, 'state');
+  delete env.ELANOUS_CONFIG_DIR;
+  // All ambient execution identities are removed by EXECUTION_ORIGIN_ENV_KEYS
+  // above, before the child is spawned; logger API-shape tests need their absence.
+  // ⚠️ No `ELANOUS_TEST_DETERMINISTIC` marker is exported. Nothing reads it yet,
+  // and an env var with no consumer is a surface that looks like a contract
+  // while guaranteeing nothing — a later test could branch on it believing it
+  // means something. The tier work in PLAN-test-suite-diet introduces the
+  // signal together with the code that honours it.
+  return envLiteral(env);
 }

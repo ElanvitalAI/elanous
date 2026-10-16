@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -11,6 +11,22 @@ import { decisionRaiseArgs, executeNextAction } from './actions.js';
 import { defaultPrHead, defaultRequestReview, defaultReviewRepoCandidates, executeLiveDecisionCard, executeLiveLand, executeLiveReview, type LiveDecisionCardContext, liveLandArgs, liveReviewArgs, type PrHeadView, type ReviewRepoCandidate, resolveTaskAgentLiveMoves, TASK_AGENT_LIVE_MOVES_ENV, type TaskAgentLiveMove } from './live-moves.js';
 import { recordTaskAgentShadowMove } from './shadow.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
+
+// GATE-PREEXISTING-ZERO-1 — 이 파일의 시험은 전부 «HQ(비-Pod) 판단부»를 단언한다. 그런데 정식 게이트는 Pod 안에서 돌고
+// Pod 는 `ELANOUS_POD_NAME`(⊕ `ELANOUS_RUN_ID`)을 프로세스 env 로 갖는다(pod-command-job.ts). shadow.ts 는 주입 env 가
+// 없으면 process.env 를 읽어 그 값을 «원격 자식» 표지로 쓰므로, 게이트에선 카드 묶기 대기(card-binding-pending)로 빠져
+// 21건이 깨졌다(0.2.30 HARD #3 preexisting). 제품이 맞다 — 시험이 주변 env 에 기대지 않게 Pod 신원 넷을 매 시험 지우고 되돌린다.
+const POD_IDENTITY_ENV = ['ELANOUS_POD_NAME', 'ELANOUS_TASK_CARD_ID', 'ELANOUS_PARENT_RUN_ID', 'ELANOUS_RUN_ID'] as const;
+let savedPodIdentityEnv: Array<[string, string | undefined]> = [];
+beforeEach(() => {
+  savedPodIdentityEnv = POD_IDENTITY_ENV.map((name) => [name, process.env[name]]);
+  for (const name of POD_IDENTITY_ENV) delete process.env[name];
+});
+afterEach(() => {
+  for (const [name, value] of savedPodIdentityEnv) {
+    if (value === undefined) delete process.env[name]; else process.env[name] = value;
+  }
+});
 
 const HEAD_A = 'a'.repeat(40);
 const HEAD_B = 'b'.repeat(40);
@@ -520,6 +536,55 @@ describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => 
     expect(t.calls).toEqual([{ pr: 51, head: HEAD_A, cwd: '/state/land-worktrees/x' }]);
     expect(w.events).toEqual(['head:/tmp/land-wt', 'create', 'cleanup']);
     expect(t.f.logs.filter(entry => entry.event === 'land-worktree').map(entry => [entry.data.created, entry.data.removed])).toEqual([[true, false], [true, true]]);
+  });
+
+  test('queue acceptance retains the exact-head worktree for the train; refusal records the reason and removes it', async () => {
+    const accepted = landFixture();
+    const first = worktreeSeam(accepted, { local: HEAD_B });
+    const queued = await executeLiveLand(accepted.card(), 51, { ...accepted.ctx, reviewResultPath: '/state/review-results/ta-51-a.json' }, {
+      ...first.live, landQueueConfig: { command: '/ops/land-enqueue.sh', remote: 'node-c' },
+      queueLanding: async (input) => ({ status: 0, stdout: `OK #${input.pr} queued ${input.cwd}` }),
+    });
+    expect(queued).toMatchObject({ executed: true, ok: true, queued: true });
+    expect(first.events).toEqual(['head:/tmp/land-wt', 'create']);
+    expect(accepted.card().landAttempts).toEqual([expect.objectContaining({ pr: 51, head: HEAD_A, ok: true })]);
+
+    const refused = landFixture();
+    const second = worktreeSeam(refused, { local: HEAD_B });
+    const failed = await executeLiveLand(refused.card(), 51, { ...refused.ctx, reviewResultPath: '/state/review-results/ta-51-a.json' }, {
+      ...second.live, landQueueConfig: { command: '/ops/land-enqueue.sh', remote: 'node-c' },
+      queueLanding: async () => ({ status: 1, stdout: 'REFUSE review-fail-newer' }),
+    });
+    expect(failed).toMatchObject({ executed: true, ok: false, detail: expect.stringContaining('REFUSE review-fail-newer') });
+    expect(second.events).toEqual(['head:/tmp/land-wt', 'create', 'cleanup']);
+    expect(refused.card().landAttempts).toEqual([expect.objectContaining({ pr: 51, head: HEAD_A, ok: false })]);
+  });
+
+  test('invalid queue config refuses before a worktree or land attempt exists', async () => {
+    const t = landFixture();
+    const out = await executeLiveLand(t.card(), 51, t.ctx, {
+      ...t.live, landQueueConfig: { command: '', remote: '' },
+      landWorktree: { localHead: () => { throw new Error('must not inspect worktree'); } },
+    });
+    expect(out).toMatchObject({ executed: false, ok: false, detail: expect.stringContaining('land queue command/remote invalid') });
+    expect(t.card().landAttempts).toBeUndefined();
+  });
+
+  test('supervisor propose-land carries the captured review path into the queue adapter', async () => {
+    const t = landFixture();
+    const reviewResultPath = join(t.f.statePath, '..', 'review-51.json');
+    writeFileSync(reviewResultPath, JSON.stringify({ pr: 51, headCommit: HEAD_A, verdict: 'pass', mustFix: [], reviewed: true }));
+    writeTaskCards(t.f.statePath, [{ ...t.card(), reviewRequests: [{ pr: 51, head: HEAD_A, at: new Date().toISOString(), resultPath: reviewResultPath }] }]);
+    const queued: string[] = [];
+    const out = await recordTaskAgentShadowMove({
+      runId: 'queue-supervisor-1', stopReason: 'needs-human',
+      results: [job({ prNumber: 51, harvestable: true, worktreePath: '/tmp/land-wt' })], selfReview: reviewed,
+    }, { ...t.f.deps(['propose-land']), live: {
+      ...t.live, landQueueConfig: { command: '/ops/land-enqueue.sh', remote: 'node-c' },
+      queueLanding: async (input) => { queued.push(input.reviewResult); return { status: 0, stdout: 'OK #51 head=aaaaaaaaaaaa' }; },
+    } });
+    expect(out.liveMove).toMatchObject({ kind: 'land', executed: true, ok: true, queued: true });
+    expect(queued).toEqual([reviewResultPath]);
   });
 
   test('a clean registered PR branch owner is used for land and never cleaned up', async () => {

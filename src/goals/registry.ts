@@ -75,8 +75,18 @@ export function hydrateGoalFromSnapshot(): Goal | null {
       persistSnapshot(null);
       return null;
     }
-    current = parsed;
-    debug.log('goal', 'snapshot.hydrated', { id: current.id, status: current.status });
+    // TUI-GOAL-LOOP-FRICTION(#35) — 프로세스가 죽어 있던 시간은 이 목표가 «돈» 시간이 아니다.
+    //   active 로 되살아나면 벽시계 기준을 지금으로 다시 잡는다(낡은 createdAt 기준 4.9억 ms 소진 오판 방지).
+    const now = Date.now();
+    const staleStart = goalWallClockStart(parsed);
+    current = parsed.status === 'active'
+      ? { ...parsed, activeSince: now, usage: { ...parsed.usage, elapsedMs: 0 } }
+      : parsed;
+    debug.log('goal', 'snapshot.hydrated', {
+      id: current.id, status: current.status,
+      wallClockRestarted: parsed.status === 'active',
+      staleElapsedMs: Math.max(0, now - staleStart),
+    });
     notify(current, null);
     return getCurrentGoal();
   } catch (error) {
@@ -100,12 +110,25 @@ export function generateGoalId(): string {
   return `g-${ts}-${rand}`;
 }
 
+/** TUI-GOAL-LOOP-FRICTION(#35) — 벽시계 예산의 기준 시각 = 이번에 active 로 들어선 때.
+ *  옛 스냅숏(activeSince 없음)만 createdAt 으로 떨어진다. */
+export function goalWallClockStart(goal: Goal): number {
+  return typeof goal.activeSince === 'number' && Number.isFinite(goal.activeSince)
+    ? goal.activeSince
+    : goal.createdAt;
+}
+
+/** 이번 활성화 기준 벽시계 경과(ms). 시계가 거꾸로 가도 음수는 내지 않는다. */
+export function goalWallClockElapsedMs(goal: Goal, now: number): number {
+  return Math.max(0, now - goalWallClockStart(goal));
+}
+
 export function getCurrentGoal(): Goal | null {
   if (!current) return null;
   // Refresh elapsed ms on read so callers don't see stale values.
   return {
     ...current,
-    usage: { ...current.usage, elapsedMs: Date.now() - current.createdAt },
+    usage: { ...current.usage, elapsedMs: goalWallClockElapsedMs(current, Date.now()) },
   };
 }
 
@@ -155,6 +178,7 @@ export function startGoal(input: GoalCreateInput): { ok: true; goal: Goal } | { 
     status: 'active',
     createdAt: now,
     updatedAt: now,
+    activeSince: now,
     budget,
     usage: { turnsUsed: 0, tokensUsed: 0, tokensMeasured: true, elapsedMs: 0 },
     linkedTaskId: input.linkedTaskId,
@@ -173,8 +197,22 @@ export function setStatus(next: GoalStatus, reason?: string): { ok: true; goal: 
     return { ok: false, error: { code: 'GoalNotFound', message: 'No active goal.' } };
   }
   const prev = { ...current };
-  current = { ...current, status: next, updatedAt: Date.now() };
+  const now = Date.now();
+  // TUI-GOAL-LOOP-FRICTION(#35) — paused·budget-limited·resume_required → active 는 «새 활성화»다.
+  //   벽시계는 여기서 다시 잰다 — 멈춰 있던 시간(며칠)을 이번 실행 예산에 싣지 않는다.
+  const reactivated = next === 'active' && prev.status !== 'active';
+  current = {
+    ...current,
+    status: next,
+    updatedAt: now,
+    ...(reactivated ? { activeSince: now, usage: { ...current.usage, elapsedMs: 0 } } : {}),
+  };
   debug.log('goal', 'status', { id: current.id, from: prev.status, to: next, reason: reason ?? '' });
+  if (reactivated) {
+    debug.log('goal', 'wall-clock-restart', {
+      id: current.id, from: prev.status, priorElapsedMs: goalWallClockElapsedMs(prev, now),
+    });
+  }
   try {
     writeGoalTransitionLedger({
       timestamp: new Date().toISOString(),
@@ -210,7 +248,7 @@ export function recordTurn(opts: { tokens?: number; verdict?: Goal['lastVerdict'
       turnsUsed: current.usage.turnsUsed + 1,
       tokensUsed: current.usage.tokensUsed + (opts.tokens ?? 0),
       tokensMeasured: current.usage.tokensMeasured && opts.tokens !== undefined,
-      elapsedMs: Date.now() - current.createdAt,
+      elapsedMs: goalWallClockElapsedMs(current, Date.now()),
     },
     lastVerdict: opts.verdict ?? current.lastVerdict,
     lastSummary: opts.summary ?? current.lastSummary,
@@ -251,7 +289,9 @@ const NO_GOAL_BUDGET_DIAGNOSTICS: GoalBudgetDiagnostics = {
 export function evaluateGoalBudget(goal: Goal, now: number): GoalBudgetDiagnostics {
   const { turnsUsed, tokensUsed, elapsedMs, tokensMeasured } = goal.usage;
   const { maxTurns, tokenBudget, wallClockMaxMs } = goal.budget;
-  const elapsedWallClockMs = Math.max(elapsedMs, now - goal.createdAt);
+  // TUI-GOAL-LOOP-FRICTION(#35) — 기준 = 이번 활성화 시작(activeSince · 옛 스냅숏만 createdAt).
+  //   usage.elapsedMs 도 같은 기준으로만 쓰인다(재활성화·hydrate 때 0 으로 되돌린다).
+  const elapsedWallClockMs = Math.max(elapsedMs, goalWallClockElapsedMs(goal, now));
   const exceededAxes = [
     ...(turnsUsed >= maxTurns ? [{ axis: 'maxTurns' as const, used: turnsUsed, limit: maxTurns }] : []),
     ...(tokenBudget > 0 && tokensUsed >= tokenBudget

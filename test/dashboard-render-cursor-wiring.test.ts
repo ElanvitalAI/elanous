@@ -1,5 +1,4 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
 
 import { ansi, type RenderOptions } from '../src/tui.js';
 import {
@@ -7,6 +6,7 @@ import {
   renderDashboardFrame,
 } from '../src/dashboard/index.js';
 import { paintCursor } from '../src/display/cursor-state.js';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
 // ⛔ showDashboard() 를 테스트에서 부르지 않는다. 대시보드는 raw 입력을 잡고 이벤트 루프를
 //    점유하므로, 프레임 뒤에 예외를 던져 빠져나오려 해도 그 예외가 전파되지 않는다.
@@ -179,7 +179,7 @@ describe('dashboard frame cursor wiring', () => {
   // 배선 회귀 가드 — 헬퍼를 지나지 않고 render 로 직접 그리면 커서 슬롯이 사라진다.
   // 런타임 가드가 아니라 형태 가드다(위 주석의 이유). 되돌리기를 실패시키는 것이 목적이다.
   test('dashboard index keeps chatOnlyMode and has no UI mode axis', () => {
-    const src = readFileSync(new URL('../src/dashboard/index.ts', import.meta.url), 'utf8');
+    const src = tuiSourceText();
     expect(src).toContain('let chatOnlyMode = true;');
     expect(src).toContain('setChatOnlyLayout(next, opts)');
     // D1a — /ui 모드 축 자체가 없다(uiModeSlash 슬롯도 없다).
@@ -190,7 +190,7 @@ describe('dashboard frame cursor wiring', () => {
   });
 
   test('showDashboard 의 프레임 flush 가 헬퍼를 지난다', () => {
-    const src = readFileSync(new URL('../src/dashboard/index.ts', import.meta.url), 'utf8');
+    const src = tuiSourceText();
     const showDashboardAt = src.indexOf('export async function showDashboard(');
     // ⛔ 함수 **정의**만으로 참이 되면 가드가 아니다 — 등장 횟수로 정의와 호출을 가른다.
     //    (파일 끝까지 훑는 것으로는 "이후 어딘가의 우연한 호출"에 속는다 — 무인 리뷰 should-fix.)

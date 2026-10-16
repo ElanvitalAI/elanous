@@ -79,5 +79,8 @@ test('empty canvas adds one note to localStorage without changing YAML; read-onl
   expect(loadNotes('canvas').map((note) => note.id)).toEqual(['note-1', 'note-2']);
   expect(yamlChanges).toBe(0);
   expect(renderer.root.findAllByType('button').find((button) => button.children.includes('Undo'))?.props.disabled).toBe(true);
-  renderer.unmount();
+  // act 로 감싸 passive unmount effect(키보드 단축키 해제)를 «지금» 흘린다. 맨몸 unmount 는 그 정리를
+  // 스케줄러에 미뤄 afterAll 이 window 를 걷은 뒤에 돌게 하고, 다음 파일에서 «window is not defined»
+  // 로 터진다(0.2.30 게이트 pod-49).
+  await act(async () => renderer.unmount());
 });

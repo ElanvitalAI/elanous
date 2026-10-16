@@ -15,11 +15,15 @@ import {
   drainedIntoTurn,
   drainTurnTypeaheadOnce,
   isTurnTypeaheadSteerable,
+  markTurnTypeaheadPriority,
+  turnTypeaheadPendingIds,
   type TurnTypeaheadState,
 } from '../../chat/turn-typeahead.js';
+import { canInterruptRunningTools } from '../../chat/tool-interrupt-behavior.js';
 import { debug } from '../../debug/log.js';
 import {
   enqueuePendingUserInput,
+  prioritizePendingUserInput,
   removePendingUserInput,
   type PendingUserInputRemovalReason,
 } from '../../session/pending-input.js';
@@ -91,4 +95,70 @@ export function handoffTurnTypeaheadAtTurnEnd(
   releaseTurnTypeaheadPending(drained.releasedPendingIds, drained.injectEnter ? 'submitted-as-prompt' : 'restored-after-interrupt');
   if (drained.injectEnter) injectEnter();
   return drained;
+}
+
+export type PushNowDecision =
+  /** 대기 항목이 없다. */
+  | { kind: 'nothing' }
+  /** 도는 도구가 전부 끊어도 된다 — 턴만 끊고(자식은 산다) 턴 종료 FIFO 가 곧바로 그 발화로 잇는다. */
+  | { kind: 'interrupt'; runningTools: string[] }
+  /** 끊을 수 없는 도구가 돈다 — 다음 도구 경계에 최우선으로 넣는다. */
+  | { kind: 'priority'; blockingTools: string[] }
+  /** 끊을 수 없는 도구가 돌고, 대기 항목이 전부 경계에 못 들어간다(슬래시·세션 없음) — 응답 뒤에 나간다. */
+  | { kind: 'deferred'; blockingTools: string[] };
+
+/** «지금 밀어 넣기» 판정. 순수. */
+export function decidePushNow(
+  state: TurnTypeaheadState,
+  runningToolNames: readonly string[],
+): PushNowDecision {
+  if (state.queuedSubmissions.length === 0) return { kind: 'nothing' };
+  const { ok, blocking } = canInterruptRunningTools(runningToolNames);
+  if (ok) return { kind: 'interrupt', runningTools: [...new Set(runningToolNames)].sort() };
+  const steerable = turnTypeaheadPendingIds(state).some(id => typeof id === 'string');
+  return steerable ? { kind: 'priority', blockingTools: blocking } : { kind: 'deferred', blockingTools: blocking };
+}
+
+/** 큐의 레지스트리 항목을 버킷 맨 앞으로 옮기고 상태에 «최우선»을 적는다. 옮긴 수를 낸다. */
+export function prioritizeTurnTypeaheadPending(ref: TurnTypeaheadRef): number {
+  const ids = turnTypeaheadPendingIds(ref.state).filter((id): id is string => typeof id === 'string');
+  const moved = prioritizePendingUserInput(ids);
+  ref.state = markTurnTypeaheadPriority(ref.state);
+  return moved;
+}
+
+export interface PushNowDeps {
+  /** 지금 도는 도구 이름(중복 허용). */
+  runningToolNames: () => readonly string[];
+  /** 턴만 끊는다(자식은 산다) — 호출측이 «밀어 넣기 사유»를 적어 턴 종료가 복원 대신 제출하게 한다. */
+  interruptTurn: () => void;
+  pushNotice: (line: string) => void;
+}
+
+/** «지금 밀어 넣기» 한 번 — 판정하고 끊거나 최우선으로 올린다. 판정을 낸다. */
+export function runTurnTypeaheadPushNow(ref: TurnTypeaheadRef, deps: PushNowDeps): PushNowDecision {
+  const decision = decidePushNow(ref.state, deps.runningToolNames());
+  if (decision.kind === 'interrupt') {
+    deps.pushNotice('  ⚡ 지금 밀어 넣기 — 도는 응답을 끊고 바로 이어서 보냅니다.');
+    deps.interruptTurn();
+  } else if (decision.kind === 'priority') {
+    prioritizeTurnTypeaheadPending(ref);
+    deps.pushNotice(`  ⚡ 최우선 — ${decision.blockingTools.join(', ')} 은(는) 끊을 수 없어 끝나는 다음 도구 경계에 먼저 넣습니다.`);
+  } else if (decision.kind === 'deferred') {
+    deps.pushNotice(`  ⏳ 지금 넣을 수 있는 항목이 없습니다(슬래시 등) — ${decision.blockingTools.join(', ')} 은(는) 끊을 수 없어 응답 뒤에 보냅니다.`);
+  }
+  return decision;
+}
+
+/**
+ * 턴 종료 핸드오프가 이 턴을 «중단»(큐를 composer 로 복원)으로 읽을지. «지금 밀어 넣기»로 끊은 턴은
+ * 중단이 아니다 — 복원하지 않고 큐 머리를 곧바로 제출한다. 표지는 한 번 읽으면 지운다.
+ */
+export function consumeTurnEndInterrupted(
+  lastTurnFinalStatus: 'completed' | 'interrupted' | 'failed' | undefined,
+  steerInterruptRef: { pending: boolean },
+): boolean {
+  const steerInterrupted = steerInterruptRef.pending;
+  steerInterruptRef.pending = false;
+  return lastTurnFinalStatus === 'interrupted' && !steerInterrupted;
 }

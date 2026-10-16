@@ -11,13 +11,23 @@ import { hostLeaseBaseDir, type PendingJobIdentity } from '../../pod-lease/host-
 // POD-CPU-REQUEST-RIGHTSIZE(10-09 · OP 실측): 하니스 Pod 실사용은 대부분 100m 미만(LLM 응답 대기)인데 요청 1 CPU 를
 //   잡아 node-b 32코어가 «요청 31/32»로 막혔다(실사용 4.6코어 · 14%). 요청은 실사용 근처로, 한도(4)는 그대로 — 몰릴 때는 한도까지 쓴다.
 //   게이트·pod-command 기본은 pod-command-job.ts 의 POD_COMMAND_CPU_REQUEST_DEFAULT(1)로 따로 둔다(테스트 조각은 CPU 를 실제로 쓴다).
-export const POD_CHILD_REQUESTS = { cpu: '250m', memory: '6Gi' } as const;
+// SI-TASK-ADMIT-RIGHTSIZE: one host env restores the previous 6Gi request and uncapped p95 admission.
+// An invalid override fails conservative at 6Gi rather than silently under-reserving a Pod.
+export function resolveSiTaskMemoryPolicy(override: string | undefined): { requestMemory: string; admissionCapBytes: number | null; source: string } {
+  if (override === undefined) return { requestMemory: '3Gi', admissionCapBytes: 3 * 1024 ** 3, source: 'default' };
+  if (override === '6Gi') return { requestMemory: '6Gi', admissionCapBytes: null, source: 'override' };
+  return { requestMemory: '6Gi', admissionCapBytes: null, source: 'invalid-override-fallback' };
+}
+const siMemoryPolicy = resolveSiTaskMemoryPolicy(process.env.ELANOUS_POD_SI_REQUEST_MEMORY);
+export const POD_CHILD_REQUESTS = { cpu: '250m', memory: siMemoryPolicy.requestMemory } as const;
 /** Finished harness and command Jobs release their Pod slots after 30 minutes. */
 export const POD_JOB_TTL_AFTER_FINISHED_SECONDS = 1800;
 /** 게이트가 돌 때 하니스 «한 자리»로 셈하는 CPU — 요청(250m)보다 보수적으로 1 코어를 잡아 게이트 조각의 CPU 를 지킨다(GATE-RESERVE-AUTO 셈은 그대로). */
 export const HARNESS_SLOT_CPU_BESIDE_GATE = '1';
 /** POD-ADMIT-BY-USAGE — observed usage is scaled by this before it reserves memory. */
 const POD_USAGE_HEADROOM = 1.5;
+/** New standard si-task admission only. Existing Running Pods keep their observed/requested reservation. */
+export const POD_SI_ADMISSION_CAP_BYTES = siMemoryPolicy.admissionCapBytes;
 /** POD-ADMIT-BY-USAGE — a node keeps at least this share of allocatable memory free (real usage and bookkeeping). */
 const POD_NODE_FREE_FLOOR_RATIO = 0.1;
 
@@ -477,6 +487,7 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
         const leasedJobs = new Set<string>();
         const gateJobs = new Map<string, number>();
         const boundGateJobs = new Set<string>();
+        const commandJobs = new Set<string>();
         let jobsValid = true;
         for (const job of jobItems) {
           const meta = object(job.metadata);
@@ -484,6 +495,7 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
           if (object(meta.labels)?.['elanous.substrate'] !== 'pod') continue;
           if (typeof meta.name !== 'string' || !meta.name) { jobsValid = false; continue; }
           jobNames.add(meta.name);
+          if (object(meta.labels)?.['elanous.kind'] === 'command') commandJobs.add(meta.name);
           // GATE-RESERVE-AUTO: a release-gate shard Job (`gate-<uuid>`, kind=command) reserves its Pod template's CPU
           // from creation until it is terminal — also while its Pod is still Pending or not created yet.
           if (meta.name.startsWith('gate-') && object(meta.labels)?.['elanous.kind'] === 'command') {
@@ -521,7 +533,8 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
           } else reservationsValid = false;
           const ownerJob = String(labels?.['elanous.job'] ?? labels?.['job-name'] ?? '');
           const gatePod = metadata?.namespace === 'elanous-test' && gateJobs.has(ownerJob);
-          const harness = metadata?.namespace === 'elanous-test' && labels?.['elanous.probe'] !== 'dns' && !gatePod &&
+          const commandPod = labels?.['elanous.kind'] === 'command' || commandJobs.has(ownerJob);
+          const harness = metadata?.namespace === 'elanous-test' && labels?.['elanous.probe'] !== 'dns' && !gatePod && !commandPod &&
             (labels?.['elanous.substrate'] === 'pod' || jobNames.has(String(labels?.['elanous.job'] ?? '')));
           const spec = object(pod.spec);
           let limit: number | null = null;
@@ -642,7 +655,7 @@ export function recommendConcurrency(measure: PoolLeaseMeasure, options: { capac
   if (goalBytes === null || goalBytes <= 0) return { ...empty, reason: '측정 불가: perGoalMemory' };
   const admission = admissionByUsage(measure, goalBytes, options.perGoalMemory !== undefined);
   if (!measure.members.length || measure.members.some((m) => m.running === null || m.pending === null || m.unleasedRunning === null || m.allocatableMemoryBytes === null || m.memoryLimitBytes === null || m.allocatableCpuMillicores === null || m.availableMemoryByNodeBytes === null)) {
-    debug.log('pod-lease', 'admit-by-usage', { samples: admission.samples, p95Bytes: admission.p95Bytes, admitBytes: admission.admitBytes, fallback: admission.fallback, recommended: null, limitedBy: null, capacity: options.capacity, capacitySlots: null, memorySlots: null, running: null, pending: null });
+    debug.log('pod-lease', 'admit-by-usage', { samples: admission.samples, p95Bytes: admission.p95Bytes, admitBytes: admission.admitBytes, fallback: admission.fallback, requestMemory: siMemoryPolicy.requestMemory, admissionCapBytes: POD_SI_ADMISSION_CAP_BYTES, policySource: siMemoryPolicy.source, recommended: null, limitedBy: null, capacity: options.capacity, capacitySlots: null, memorySlots: null, running: null, pending: null });
     return { ...empty, reason: `측정 불가: cluster${measure.members.map((m) => m.reason ? ` ${m.context}: ${m.reason}` : '').join('')}` };
   }
   if (!Number.isSafeInteger(options.capacity) || options.capacity < 0) return { ...empty, reason: '측정 불가: capacity' };
@@ -694,7 +707,7 @@ export function recommendConcurrency(measure: PoolLeaseMeasure, options: { capac
     && m.reason !== 'dns' && m.running !== null && m.pending !== null && m.running + m.pending >= m.capacity);
   const limitedBy: PoolLeaseRecommendation['limitedBy'] = memoryBound < capacitySlots ? 'memory' : defaultCapFull ? 'pool-cap' : 'capacity';
   if (unleasedRunning > 0) debug.log('pod-lease', 'unleased', { unleasedRunning, running, recommended });
-  debug.log('pod-lease', 'admit-by-usage', { samples: admission.samples, p95Bytes: admission.p95Bytes, admitBytes: admission.admitBytes, fallback: admission.fallback, recommended, limitedBy, capacity: options.capacity, capacitySlots, memorySlots, running, pending });
+  debug.log('pod-lease', 'admit-by-usage', { samples: admission.samples, p95Bytes: admission.p95Bytes, admitBytes: admission.admitBytes, fallback: admission.fallback, requestMemory: siMemoryPolicy.requestMemory, admissionCapBytes: POD_SI_ADMISSION_CAP_BYTES, policySource: siMemoryPolicy.source, recommended, limitedBy, capacity: options.capacity, capacitySlots, memorySlots, running, pending });
   return { recommended, limitedBy, reason: measure.members.some((m) => m.reason === 'dns') ? 'dns' : null, capacitySlots, memorySlots, liteMemorySlots, placeableSlots, accountSlots, running, pending, pendingJobs, unleasedRunning, admission };
 }
 
@@ -714,7 +727,8 @@ function admissionByUsage(measure: PoolLeaseMeasure, goalBytes: number, explicit
       : live.some((m) => m.harnessUsageBytes == null) ? (live.map((m) => m.harnessUsageBytes == null ? `${m.context}: ${m.usageReason ?? 'usage not measured'}` : '').filter(Boolean).join('; '))
         : p95Bytes === null ? 'no Running harness Pod usage samples'
           : null;
-  const admitBytes = fallback !== null || p95Bytes === null ? goalBytes
-    : Math.min(goalBytes, Math.max(requestBytes, Math.ceil(p95Bytes * POD_USAGE_HEADROOM)));
+  const observedBytes = p95Bytes === null ? null : Math.ceil(p95Bytes * POD_USAGE_HEADROOM);
+  const admitBytes = fallback !== null || observedBytes === null ? goalBytes
+    : Math.min(goalBytes, Math.max(requestBytes, POD_SI_ADMISSION_CAP_BYTES === null ? observedBytes : Math.min(observedBytes, POD_SI_ADMISSION_CAP_BYTES)));
   return { samples: samples.length, p95Bytes, admitBytes, fallback };
 }

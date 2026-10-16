@@ -114,6 +114,38 @@ describe('signed marketplace index', () => {
     expect(verifyIndex({ ...signed, marketplaceBytes: changed })).toMatchObject({ ok: false, reason: 'bad-signature' });
   });
 
+  test('rejects internal reference markers leaking through public packs and loop bundles', () => {
+    const cases: Array<[string, string, string]> = [
+      ['description', 'See docs/marketing/launch-plan.md for the rollout plan', 'internal-doc-path'],
+      ['description', 'Follow-up tracked as PR #21849', 'private-pr-number'],
+      ['description', 'Shipped after 컷 4b964658', 'cut-hash'],
+    ];
+    for (const [field, value, marker] of cases) {
+      const entry = {
+        name: 'open-process', version: '1.0.0', visibility: 'public', [field]: value,
+        artifact: { sha256: 'b'.repeat(64), bytes: 12, key: 'open-process/1.0.0/archive.tgz' },
+      };
+      const index = { ...structuredClone(validIndex), knowledgePacks: [entry] };
+      const expected = `knowledgePacks[0] (open-process).${field}: expected no internal reference (${marker})`;
+      expect(validateMarketplaceIndex(index)).toBe(expected);
+      expect(verifyIndex(fixture(index))).toMatchObject({ ok: false, reason: 'malformed', detail: `marketplace.json.${expected}` });
+    }
+    const bundle = {
+      name: 'open-loop', version: '1.0.0', visibility: 'public',
+      graphs: ['graphs/open.yaml', 'docs/marketing/loop.yaml'],
+      artifact: { sha256: 'e'.repeat(64), bytes: 78, key: 'open-loop/1.0.0/archive.tgz' },
+    };
+    expect(validateMarketplaceIndex({ ...structuredClone(validIndex), loopBundles: [bundle] }))
+      .toBe('loopBundles[0] (open-loop).graphs: expected no internal reference (internal-doc-path)');
+    const internalLeak = {
+      name: 'sales', version: '1.0.0', visibility: 'internal', enterpriseId: 'tenant-a',
+      description: 'See docs/marketing/launch-plan.md and PR #21849 (컷 4b964658) for rollout details',
+      artifact: { sha256: 'b'.repeat(64), bytes: 12, key: 'sales/1.0.0/archive.tgz' },
+    };
+    expect(validateMarketplaceIndex({ ...structuredClone(validIndex), knowledgePacks: [internalLeak] })).toBeNull();
+    expect(verifyIndex(fixture({ ...structuredClone(validIndex), knowledgePacks: [internalLeak] }))).toMatchObject({ ok: true });
+  });
+
   test('rejects signed scoped entries with an empty artifact key', () => {
     for (const collection of ['knowledgePacks', 'loopBundles'] as const) {
       for (const key of ['', '   ']) {

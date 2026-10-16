@@ -34,9 +34,37 @@ import type { CommandRunner } from '../ad-pipeline/higgsfield-backend.js';
 import { dispatchDashboardSessionRuntimeTool } from './session-runtime-dispatch.js';
 import { HYDRATED_TOOLS_KEY } from '../skills/tools/tool-search-spec.js';
 import { toolSearchRuntime } from '../tool-runtime/tool-search-runtime.js';
+import { tuiSourceText } from '../../test/helpers/dashboard-source.js';
 
 const repoRoot = resolve(import.meta.dir, '../..');
-const dashboard = readFileSync(resolve(repoRoot, 'src/dashboard/index.ts'), 'utf8');
+const dashboard = tuiSourceText();
+
+describe('dashboard /loop wiring (index.ts production path)', () => {
+  test('the loop scheduler ref lives once in showDashboard scope and is passed by name into every per-command slashCtx', () => {
+    // ref 영속성: dashboardLoopSchedulerRef 는 showDashboard 본문에 한 번 선언되고,
+    // 명령마다 재구성되는 slashCtx 블록은 그 이름을 건넬 뿐 ref 를 새로 만들지 않는다.
+    // 그래야 /loop start 로 만든 스케줄러가 /loop stop · 세션 종료에서 같은 ref 를 통해 멈춘다.
+    const nameHits = dashboard.split('dashboardLoopSchedulerRef').length - 1;
+    expect(nameHits).toBe(2);
+
+    const showStart = dashboard.indexOf('export async function showDashboard(');
+    const refDecl = dashboard.indexOf('const dashboardLoopSchedulerRef');
+    const slashCtxStart = dashboard.indexOf('const slashCtx: DashboardSlashContext = {');
+    const dispatchCall = dashboard.indexOf('dashboardSlashRegistry.dispatch(cmdLower, args, slashCtx)');
+    expect(showStart).toBeGreaterThan(-1);
+    expect(refDecl).toBeGreaterThan(showStart);
+    expect(slashCtxStart).toBeGreaterThan(refDecl);
+    expect(dispatchCall).toBeGreaterThan(slashCtxStart);
+
+    const ctxBlock = dashboard.slice(slashCtxStart, dispatchCall);
+    expect(ctxBlock).toContain('schedulerRef: dashboardLoopSchedulerRef');
+    expect(ctxBlock).not.toContain('current: null');
+
+    const registryDecl = dashboard.indexOf('const dashboardSlashRegistry = buildDashboardSlashRegistry();');
+    expect(registryDecl).toBeGreaterThan(-1);
+    expect(registryDecl).toBeLessThan(showStart);
+  });
+});
 
 function makeProbeRuntime(onRun: (ctxSignal: AbortSignal | undefined) => void): ToolRuntime<Record<string, unknown>, ToolRunResult> {
   return {

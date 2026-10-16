@@ -41,6 +41,19 @@ describe('GREEN-FROM-LEDGER pure decision', () => {
       .toMatchObject({ verdict: 'record-only', reason: 'origin-main-ref-unverified' });
   });
 
+  test('closed component can use a verified merged train, while mismatched binding stays closed', () => {
+    const trainCard = card({ prTerminal: { pr: 123, url, head: sha, state: 'CLOSED', at: '2026-10-13T00:00:00.000Z' },
+      trainLanding: { componentPr: 123, integrationPr: 456, mergeSha: sha, train: 'c2', at: '2026-10-13T00:00:00.000Z' }, postLand: undefined });
+    const candidate = greenSweepCandidates(cell(), '0.2.28', [trainCard])[0]!;
+    const viaTrain = { ...merged, viaTrain: { integrationPr: 456 } };
+    expect(decideGreenSweep({ item: cell(), candidate, candidateCount: 1, pr: viaTrain, ancestor: true, hold: false, repositoryMatches: true }))
+      .toMatchObject({ verdict: 'green', reason: 'bound-card-train-merged' });
+    expect(decideGreenSweep({ item: cell(), candidate, candidateCount: 1, pr: { ...viaTrain, viaTrain: { integrationPr: 789 } },
+      ancestor: true, hold: false, repositoryMatches: true }).reason).toBe('train-binding-mismatch');
+    expect(decideGreenSweep({ item: cell(), candidate, candidateCount: 1, pr: { ...merged, state: 'CLOSED' },
+      ancestor: true, hold: false, repositoryMatches: true }).verdict).toBe('skip');
+  });
+
   test('explicit landed evidence is a candidate; incidental PR mention is not', () => {
     expect(explicitEvidencePrs('PR #123 참고 · 다른 PR #456 본문 mention')).toEqual([]);
     expect(explicitEvidencePrs('PR #123 참고, 다른 변경 착지')).toEqual([]);

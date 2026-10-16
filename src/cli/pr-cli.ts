@@ -58,12 +58,16 @@ import { branchLineageSlug, findSiblingPrs } from './pr-lineage.js';
 import { parseReleaseNoteSection } from '../release-loop/release-note.js';
 import { landingFreezeMessage } from '../release-loop/landing-freeze.js';
 import { admitLandingMerge } from '../self-implement/frozen-merges.js';
-import { verifyAncestorAutoPass, verifyOverlapEvidence } from './pr-land-overlap-evidence.js';
+import { verifyAllSameHeadReviews, verifyAncestorAutoPass, verifyOverlapEvidence } from './pr-land-overlap-evidence.js';
+import { verifyVirtualRebasePatch } from './pr-land-virtual-rebase.js';
 import { observePrLandRefusal } from './pr-land-refusal.js';
 import { ensurePrLandHeavyRemote, type HeavyRemoteInput, type HeavyRemoteResult } from './pr-land-heavy-remote.js';
+import { runHeavyOnPodShadow } from './pr-land-pod-shadow.js';
+import type { LandingPodShadowInput, LandingPodShadowVerdict } from './pr-land-pod-shadow-job.js';
 import { taskAgentStatePath } from '../task-agent/task-hand.js';
 import { PR_LABEL_NAMES } from '../github/pr-labels.js';
 import { enqueueL8ShadowQueue, runL8ShadowQueue, shadowPrNumber, statusL8ShadowQueue, type L8ShadowQueueDeps } from '../self-implement/l8-merge-queue.js';
+import { censusOpenPrs, guardNewPr, parseDiffHunks, readOpenPrs, type Seat } from '../pr-tool/census.js';
 
 export { branchLineageSlug, findSiblingPrs };
 
@@ -93,6 +97,8 @@ export interface PrLandOpts {
   overlapEvidence?: string;
   /** Pinned landing opt-in: run the heavy changed-file gate on node-b at the reviewed head and current main tip. */
   heavyRemote?: boolean;
+  /** Opt-in comparison of the heavy remote verdict with a Pod Job; the remote verdict still decides landing. */
+  heavyOnPodShadow?: boolean;
 }
 
 export interface PrGranularityOpts {
@@ -146,6 +152,7 @@ export interface PrLandDeps {
   runIosGate?: (out: { log: (message: string) => void; error: (message: string) => void }, changedFiles: readonly string[]) => boolean;
   runPwaGate?: (out: { log: (message: string) => void; error: (message: string) => void }, changedFiles: readonly string[]) => boolean;
   runHeavyRemote?: (input: HeavyRemoteInput) => HeavyRemoteResult;
+  runLandingPodShadow?: (input: LandingPodShadowInput) => Promise<LandingPodShadowVerdict>;
   isInteractive?: () => boolean;
   /** Clock for the recent-landings window (test seam · default Date.now). */
   now?: () => number;
@@ -819,12 +826,21 @@ function renderConflictRunIds(runIds: readonly { runId: string; status: string }
 }
 
 function currentChangePaths(
+  run: CmdRunner, cwd: string, staged: PorcelainStatusRecord[] | null, base: string,
+  out: { log: (message: string) => void }, strict: true,
+): string[] | null;
+function currentChangePaths(
+  run: CmdRunner, cwd: string, staged: PorcelainStatusRecord[] | null, base: string,
+  out: { log: (message: string) => void }, strict?: false,
+): string[];
+function currentChangePaths(
   run: CmdRunner,
   cwd: string,
   staged: PorcelainStatusRecord[] | null,
   base: string,
   out: { log: (message: string) => void },
-): string[] {
+  strict = false,
+): string[] | null {
   const fromStatus = staged
     ? staged.flatMap(({ path, originalPath }) => (originalPath ? [path, originalPath] : [path]))
     : [];
@@ -847,6 +863,7 @@ function currentChangePaths(
   }
 
   const diff = run('git', ['diff', '--name-only', '--no-renames', `${comparisonBase}...HEAD`], { cwd });
+  if (strict && !diff.ok) return null;
   const fromDiff = diff.ok ? parseNameOnlyList(diff.out) : [];
   return unionPaths(fromStatus, fromDiff);
 }
@@ -1014,12 +1031,13 @@ function emitLandingOverlapAdvisory(
   currentFiles: readonly string[],
   out: { log: (message: string) => void },
   overlappingLandings: string[] = [],
+  resolvedLandings?: NonNullable<ReturnType<typeof collectResolvedBaseLandings>>,
 ): boolean {
   if (currentFiles.length === 0) {
     record('overlap', true, { outcome: 'no-changed-files' });
     return false;
   }
-  const commits = collectResolvedBaseLandings(run, cwd, DEFAULT_GRANULARITY_SINCE, base);
+  const commits = resolvedLandings ?? collectResolvedBaseLandings(run, cwd, DEFAULT_GRANULARITY_SINCE, base);
   if (commits === null) {
     record('overlap', false, { outcome: 'lookup-failed' });
     return false;
@@ -1039,6 +1057,88 @@ function emitLandingOverlapAdvisory(
   }
   record('overlap', true, { outcome: 'none' });
   return false;
+}
+
+/** The pinned overlap evidence decision is shared by landing and its read-only preview. */
+function verifyPinnedOverlapDecision(input: {
+  opts: PrLandOpts;
+  deps: PrLandDeps;
+  run: CmdRunner;
+  cwd: string;
+  base: string;
+  readFile: (path: string) => string;
+  overlappingLandings: readonly string[];
+  decision: OverlapLandingDecisionOutcome | undefined;
+  out: { log: (message: string) => void; error: (message: string) => void };
+  refuse: (message: string) => void;
+}): boolean {
+  const { opts, deps, run, cwd, base, readFile, overlappingLandings, decision, out, refuse } = input;
+  if (decision === undefined || decision === 'user-merge') return true;
+  let accepted = false;
+  let ancestorResyncNeeded = false;
+  if (decision === 'unavailable' && opts.overlapEvidence !== undefined) {
+    const ref = resolveRemoteBranchRef(run, cwd, base);
+    const verdict = verifyOverlapEvidence({
+      evidencePath: opts.overlapEvidence, pr: Number(opts.pr), expectedHead: opts.expectedHead!,
+      remote: ref.remote, branch: ref.branch, cwd, run, readFile,
+      reviewResultsDir: deps.reviewResultsDir ?? join(dirname(taskAgentStatePath()), 'review-results'),
+      listDir: (dir) => readdirSync(dir), reviewMtime: (path) => statSync(path).mtimeMs,
+      reviewRealPath: (path) => realpathSync(path), overlappingLandings,
+    });
+    accepted = verdict.ok;
+    if (verdict.ok) {
+      out.log(verdict.mode === 'already-ancestor'
+        ? `✓ overlap-evidence: already-ancestor — 겹친 최근 착지 ${overlappingLandings.length}개가 전부 head ${opts.expectedHead!.slice(0, 12)} 의 조상 · review pass must-fix 0 (${verdict.reviewResult})`
+        : verdict.mode === 'base-advanced-disjoint'
+          ? `✓ overlap-evidence: base-advanced-disjoint — gate base ${verdict.gateBase.slice(0, 12)} ⊂ head ${opts.expectedHead!.slice(0, 12)} · ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} 까지 ${verdict.windowCommits}개 커밋이 PR 파일을 안 건드린다 · review pass|warn must-fix 0 (${verdict.reviewResult})`
+          : `✓ overlap-evidence: ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} ⊂ head ${opts.expectedHead!.slice(0, 12)} · gate passed on that base · review pass must-fix 0 (${verdict.reviewResult})`);
+    } else refuse(`✗ overlap-evidence: ${verdict.reason}`);
+  } else if (decision === 'unavailable') {
+    const verdict = verifyAncestorAutoPass({
+      pr: Number(opts.pr), expectedHead: opts.expectedHead!, cwd, run, readFile, overlappingLandings,
+      reviewResultsDir: deps.reviewResultsDir ?? join(dirname(taskAgentStatePath()), 'review-results'),
+      listDir: (dir) => readdirSync(dir),
+    });
+    accepted = verdict.ok;
+    if (verdict.ok) {
+      out.log(`✓ overlap-evidence: already-ancestor-auto — 겹친 최근 착지 ${overlappingLandings.length}개가 전부 head ${opts.expectedHead!.slice(0, 12)} 의 조상 · review pass|warn must-fix 0 (${verdict.reviewResult})`);
+    } else {
+      ancestorResyncNeeded = verdict.reason.startsWith('ancestor-auto-not-ancestor:');
+      if (ancestorResyncNeeded) {
+        const ref = resolveRemoteBranchRef(run, cwd, base);
+        const remote = run('git', ['ls-remote', ref.remote, `refs/heads/${ref.branch}`], { cwd });
+        const baseTip = remote.ok ? remote.out.trim().split(/\s+/u, 1)[0] ?? '' : '';
+        const local = run('git', ['rev-parse', '--verify', `refs/remotes/${ref.remote}/${ref.branch}`], { cwd });
+        const reviews = verifyAllSameHeadReviews({
+          pr: Number(opts.pr), expectedHead: opts.expectedHead!, readFile,
+          reviewResultsDir: deps.reviewResultsDir ?? join(dirname(taskAgentStatePath()), 'review-results'),
+          listDir: (dir) => readdirSync(dir),
+        });
+        const patch = reviews.ok && /^[a-f0-9]{40}$/iu.test(baseTip) && local.ok && local.out.trim() === baseTip
+          ? verifyVirtualRebasePatch({ cwd, baseTip, head: opts.expectedHead! })
+          : { ok: false as const, reason: reviews.ok ? 'base-stale-or-unmeasured' : reviews.reason };
+        accepted = patch.ok;
+        ancestorResyncNeeded = !accepted;
+        record('virtual-rebase', patch.ok, {
+          pr: Number(opts.pr), head: opts.expectedHead, baseTip: baseTip || null,
+          reason: patch.ok ? 'same-patch-id' : patch.reason,
+          reviewResult: reviews.ok ? reviews.reviewResult : null,
+        });
+        if (patch.ok) {
+          out.log(`✓ overlap-evidence: virtual-rebase — ${ref.remote}/${ref.branch} ${baseTip.slice(0, 12)} 와 head ${opts.expectedHead!.slice(0, 12)} 충돌 없음 · patch-id ${patch.patchId.slice(0, 12)} 동일 · review pass|warn must-fix 0 (${reviews.reviewResult})`);
+        } else refuse(`✗ virtual-rebase: ${patch.reason} · ${verdict.reason}`);
+      } else refuse(`✗ ancestor-auto: ${verdict.reason}`);
+    }
+  }
+  if (!accepted) {
+    if (ancestorResyncNeeded && !opts.dryRun) {
+      const marked = run('gh', ['pr', 'edit', String(opts.pr), '--add-label', PR_LABEL_NAMES.needsRebase], { cwd });
+      record('resync-marker', marked.ok, { pr: Number(opts.pr), reason: 'ancestor-auto-not-ancestor' });
+      if (!marked.ok) out.error('⚠ resync-marker: needs-rebase 라벨을 남기지 못했습니다');
+    }
+    out.error('✗ expected-head: overlap merge approval unavailable for the reviewed head');
+  }
+  return accepted;
 }
 
 const SOURCE_SPLIT_PR_LIST_LIMIT = 200;
@@ -1217,6 +1317,10 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     out.error('✗ heavy-remote: --pr ⊕ --expected-head 머리 고정 착지에서만 쓴다.');
     return 1;
   }
+  if (opts.heavyOnPodShadow && !opts.heavyRemote) {
+    out.error('✗ heavy-on-pod-shadow: --heavy-remote 머리 고정 착지에서만 쓴다.');
+    return 1;
+  }
 
   const readFile = deps.readFile ?? ((path: string) => readFileSync(path, 'utf8'));
   let title = opts.title;
@@ -1310,8 +1414,8 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
       out.error('✗ dry-run: --hold 는 머리 고정 읽기 전용 예행과 함께 사용할 수 없습니다.');
       return 1;
     }
-    if (opts.overlapEvidence !== undefined) {
-      out.error('✗ dry-run: --overlap-evidence 는 머리 고정 읽기 전용 예행에서 사용할 수 없습니다.');
+    if (opts.overlapEvidence !== undefined && !opts.overlapEvidence.trim()) {
+      out.error('✗ overlap-evidence: --overlap-evidence <file> 는 비어 있을 수 없습니다.');
       return 1;
     }
     const inspected = inspectPinnedPr(run, cwd, pr, opts.expectedHead!);
@@ -1322,8 +1426,55 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     for (const reason of reasons) out.log(`[dry-run] ✗ preflight: ${reason}`);
     if (reasons.includes('PR is draft')) out.log(`[dry-run] 선행: eln gh pr ready ${pr}`);
     if (reasons.length === 0) out.log('[dry-run] ✓ preflight: PR OPEN non-draft, matching PR/local HEAD and branch, clean worktree');
-    out.log('[dry-run] Remaining landing gates, freeze, overlap and merge: UNMEASURED; no PR or git state changed.');
-    return reasons.length === 0 ? 0 : 1;
+    if (reasons.length > 0) return 1;
+    // A dry-run may inspect the remote tip but must not update refs, FETCH_HEAD, objects or PR labels.
+    const readOnlyRun: CmdRunner = (command, args, options) => {
+      if ((command === 'git' && /^(fetch|pull|push|merge|commit|checkout|switch|worktree|update-ref|reset|apply|am|rebase)$/u.test(args[0] ?? ''))
+        || (command === 'gh' && args[0] === 'pr' && /^(edit|ready|merge|create|close|reopen)$/u.test(args[1] ?? ''))) {
+        return { ok: false, out: '', err: 'dry-run forbids mutation' };
+      }
+      return run(command, args, options);
+    };
+    const base = (deps.resolveBase ?? resolveDeliverableBase)(readOnlyRun, cwd, opts.base);
+    if (!base) { out.error('✗ base: 비교 base를 선택하지 못했습니다.'); return 1; }
+    const ref = resolveRemoteBranchRef(readOnlyRun, cwd, base);
+    const measuredBase = `refs/remotes/${ref.remote}/${ref.branch}`;
+    const remoteTip = readOnlyRun('git', ['ls-remote', ref.remote, `refs/heads/${ref.branch}`], { cwd });
+    const tip = remoteTip.ok ? remoteTip.out.trim().split(/\s+/u, 1)[0] : undefined;
+    const localTip = readOnlyRun('git', ['rev-parse', '--verify', measuredBase], { cwd });
+    if (!tip || !/^[a-f0-9]{40}$/iu.test(tip) || !localTip.ok || localTip.out.trim() !== tip) {
+      out.error(`✗ overlap-preflight: ${base} 최신 SHA를 로컬에서 읽지 못했다. 읽기 전용 예행은 ref를 갱신하지 않는다.`);
+      return 1;
+    }
+    const staged = stagedPaths(readOnlyRun, cwd);
+    if (staged === null) {
+      out.error('✗ overlap-preflight: PR 변경 파일을 읽지 못했다. 겹침을 미측정 상태로 둔다.');
+      return 1;
+    }
+    const changed = readOnlyRun('git', ['diff', '--name-only', '--no-renames', `${measuredBase}...HEAD`], { cwd });
+    if (!changed.ok) {
+      out.error('✗ overlap-preflight: PR 변경 파일을 읽지 못했다. 겹침을 미측정 상태로 둔다.');
+      return 1;
+    }
+    const changedPaths = unionPaths(staged.flatMap(({ path, originalPath }) => originalPath ? [path, originalPath] : [path]), parseNameOnlyList(changed.out));
+    const landings = collectResolvedBaseLandings(readOnlyRun, cwd, DEFAULT_GRANULARITY_SINCE, measuredBase);
+    if (landings === null) {
+      out.error('✗ overlap-preflight: 최근 착지 조회가 실패했다. 겹침을 미측정 상태로 둔다.');
+      return 1;
+    }
+    const overlappingLandings: string[] = [];
+    const overlapFound = emitLandingOverlapAdvisory(readOnlyRun, cwd, measuredBase, changedPaths, out, overlappingLandings, landings);
+    emitSiblingPrAdvisory(branch!, deps.listOpenPrs ?? (() => lookupOpenPrs(readOnlyRun, cwd)), out);
+    if (overlapFound && !verifyPinnedOverlapDecision({
+      opts, deps, run: readOnlyRun, cwd, base, readFile, overlappingLandings,
+      decision: 'unavailable', out, refuse: out.error,
+    })) {
+      out.log('[dry-run] Remaining landing gates, freeze and merge: UNMEASURED; no PR or git state changed.');
+      return 1;
+    }
+    out.log(`[dry-run] ✓ overlap: ${overlapFound ? 'evidence accepted' : 'no recent overlapping landing'}`);
+    out.log('[dry-run] Remaining landing gates, freeze and merge: UNMEASURED; no PR or git state changed.');
+    return 0;
   }
   if (opts.overlapEvidence !== undefined && (!pinned || !opts.overlapEvidence.trim())) {
     out.error('✗ overlap-evidence: --overlap-evidence <file> 는 --pr ⊕ --expected-head 머리 고정 착지에서만 쓴다.');
@@ -1592,7 +1743,12 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   }
   // Pinned landings reject a known non-ancestor before local or remote heavy gates.
   // Unpinned landings keep their existing gate and advisory order.
-  let changedPaths = pinned ? currentChangePaths(run, cwd, staged, base, out) : [];
+  const initialChangedPaths = pinned ? currentChangePaths(run, cwd, staged, base, out, true) : [];
+  if (initialChangedPaths === null) {
+    out.error('✗ overlap-preflight: PR 변경 파일을 읽지 못했다. 겹침을 미측정 상태로 두고 무거운 게이트를 시작하지 않는다.');
+    return 1;
+  }
+  let changedPaths: string[] = initialChangedPaths;
   let hold = !!opts.hold;
   const checkOverlap = async (): Promise<number | undefined> => {
     const overlappingLandings: string[] = [];
@@ -1627,54 +1783,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
       });
     }
     hold = !!opts.hold || overlapDecision?.outcome === 'user-hold';
-    // TA-LAND-OVERLAP — 비대화형 «승인 불가»만 증거로 대신한다(사람의 hold 는 증거로 뒤집지 않는다) · 증거가 없거나 어긋나면 종전 거부 그대로.
-    let overlapEvidenceAccepted = false;
-    let ancestorResyncNeeded = false;
-    if (pinned && overlapDecision?.outcome === 'unavailable' && opts.overlapEvidence !== undefined) {
-      const ref = resolveRemoteBranchRef(run, cwd, base);
-      const verdict = verifyOverlapEvidence({
-        evidencePath: opts.overlapEvidence, pr: Number(opts.pr), expectedHead: opts.expectedHead!,
-        remote: ref.remote, branch: ref.branch, cwd, run, readFile,
-        reviewResultsDir: deps.reviewResultsDir ?? join(dirname(taskAgentStatePath()), 'review-results'),
-        listDir: (dir) => readdirSync(dir), reviewMtime: (path) => statSync(path).mtimeMs,
-        reviewRealPath: (path) => realpathSync(path), overlappingLandings,
-      });
-      overlapEvidenceAccepted = verdict.ok;
-      if (verdict.ok) {
-        out.log(verdict.mode === 'already-ancestor'
-          ? `✓ overlap-evidence: already-ancestor — 겹친 최근 착지 ${overlappingLandings.length}개가 전부 head ${opts.expectedHead!.slice(0, 12)} 의 조상 · review pass must-fix 0 (${verdict.reviewResult})`
-          : verdict.mode === 'base-advanced-disjoint'
-            ? `✓ overlap-evidence: base-advanced-disjoint — gate base ${verdict.gateBase.slice(0, 12)} ⊂ head ${opts.expectedHead!.slice(0, 12)} · ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} 까지 ${verdict.windowCommits}개 커밋이 PR 파일을 안 건드린다 · review pass|warn must-fix 0 (${verdict.reviewResult})`
-            : `✓ overlap-evidence: ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} ⊂ head ${opts.expectedHead!.slice(0, 12)} · gate passed on that base · review pass must-fix 0 (${verdict.reviewResult})`);
-      }
-      else refuse(`✗ overlap-evidence: ${verdict.reason}`);
-    } else if (pinned && overlapDecision?.outcome === 'unavailable') {
-      // 증거 파일이 없을 때 — 겹친 착지가 전부 머리의 조상이고 표준 자리의 리뷰가 pass|warn ⊕ must-fix 0 이면 통과(아니면 종전 거부).
-      const verdict = verifyAncestorAutoPass({
-        pr: Number(opts.pr), expectedHead: opts.expectedHead!, cwd, run, readFile, overlappingLandings,
-        reviewResultsDir: deps.reviewResultsDir ?? join(dirname(taskAgentStatePath()), 'review-results'),
-        listDir: (dir) => readdirSync(dir),
-      });
-      overlapEvidenceAccepted = verdict.ok;
-      if (verdict.ok) {
-        out.log(`✓ overlap-evidence: already-ancestor-auto — 겹친 최근 착지 ${overlappingLandings.length}개가 전부 head ${opts.expectedHead!.slice(0, 12)} 의 조상 · review pass|warn must-fix 0 (${verdict.reviewResult})`);
-      }
-      else {
-        refuse(`✗ ancestor-auto: ${verdict.reason}`);
-        ancestorResyncNeeded = verdict.reason.startsWith('ancestor-auto-not-ancestor:');
-      }
-    }
-    if (pinned && overlapDecision && overlapDecision.outcome !== 'user-merge' && !overlapEvidenceAccepted) {
-      // A clean GitHub PR can still be behind a recently landed overlapping head. Preserve the cue
-      // across hosts; the current steward tick acts only if it can also prove local run ownership.
-      if (ancestorResyncNeeded && !opts.dryRun) {
-        const marked = run('gh', ['pr', 'edit', String(opts.pr), '--add-label', PR_LABEL_NAMES.needsRebase], { cwd });
-        record('resync-marker', marked.ok, { pr: Number(opts.pr), reason: 'ancestor-auto-not-ancestor' });
-        if (!marked.ok) out.error('⚠ resync-marker: needs-rebase 라벨을 남기지 못했습니다');
-      }
-      out.error('✗ expected-head: overlap merge approval unavailable for the reviewed head');
-      return 1;
-    }
+    if (pinned && !verifyPinnedOverlapDecision({ opts, deps, run, cwd, base, readFile, overlappingLandings, decision: overlapDecision?.outcome, out, refuse })) return 1;
     return undefined;
   };
   if (pinned && (await checkOverlap()) !== undefined) return 1;
@@ -1724,6 +1833,18 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     verifiedHeavyBase = main;
     out.log(`✓ heavy-remote: host=${verdict.host ?? 'unknown'} head=${opts.expectedHead!.slice(0, 12)} main=${main.slice(0, 12)} source=${verdict.source} elapsed=${verdict.elapsedMs}ms`);
     out.log(`✓ typecheck-roots: ${JSON.stringify(verdict.rootPlan ?? { mode: 'not-applicable', roots: null, promoted: false, reason: 'no-root-plan-in-gate-output' })}`);
+    if (opts.heavyOnPodShadow) {
+      await runHeavyOnPodShadow({
+        enabled: true, pr: Number(opts.pr), head: opts.expectedHead!,
+        local: { measured: verdict.rootPlan != null, ok: verdict.ok, rootPlan: verdict.rootPlan ?? null },
+        runPod: async () => {
+          const runPod = deps.runLandingPodShadow ?? (await import('./pr-land-pod-shadow-job.js')).runLandingPodShadowJob;
+          return runPod({ head: opts.expectedHead!, main });
+        },
+        log: (category, event, data) => debug.log(category, event, { ...data, main, phase: 'initial' }),
+        warn: (message) => out.error(`⚠ heavy-on-pod-shadow: ${message}`),
+      });
+    }
   }
   // Call immediately before the first mergePrOutcome and again before every UNKNOWN retry.
   // A move during the wait is the same race as a move during the gate: rerun or fail closed.
@@ -1751,7 +1872,12 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   };
   const recheckOverlapAtBase = async (currentBase: string): Promise<number | undefined> => {
     if (currentBase === overlapCheckedBase) return undefined;
-    changedPaths = currentChangePaths(run, cwd, staged, base, out);
+    const refreshedPaths = currentChangePaths(run, cwd, staged, base, out, true);
+    if (refreshedPaths === null) {
+      out.error('✗ overlap-preflight: 움직인 base의 PR 변경 파일을 읽지 못했다. 재게이트하지 않는다.');
+      return 1;
+    }
+    changedPaths = refreshedPaths;
     const refused = await checkOverlap();
     if (refused !== undefined) return refused;
     overlapCheckedBase = currentBase;
@@ -2294,6 +2420,36 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
 
 export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queueDeps: L8ShadowQueueDeps = {}): void {
   const pr = program.command('pr').description('PR landing commands');
+  const prToolRun = deps.run ?? defaultCmdRunner;
+  const prToolOut = deps.out ?? liveOut;
+  const prToolExit = deps.setExitCode ?? ((code: number) => { process.exitCode = code; });
+  pr.command('census')
+    .description('열린 PR 전체·골 문서만·2일 무커밋 draft·미닫힌 superseded 집계')
+    .option('--cwd <path>', '저장소 경로')
+    .action((opts: { cwd?: string }) => {
+      const result = censusOpenPrs(readOpenPrs(prToolRun, { cwd: opts.cwd, includeDraftCommitDates: true }));
+      prToolOut.log(JSON.stringify(result));
+      if (result.status === 'unknown') prToolExit(1);
+    });
+  pr.command('open-guard')
+    .description('새 PR 전에 같은 파일 OPEN PR·골 문서만·자리별 상한 검사')
+    .option('--cwd <path>', '작업 트리 경로')
+    .option('--base <ref>', '비교 base ref', 'origin/main')
+    .option('--seat <seat>', 'PR 소유 자리(OP|TC|MK|UX)')
+    .option('--cell <id>', '릴리스 칸 id (같은 칸 OPEN PR 검사)')
+    .option('--seat-cap <number>', '자리별 열린 PR 경고 상한', '30')
+    .action((opts: { cwd?: string; base: string; seat?: string; cell?: string; seatCap: string }) => {
+      const cwd = opts.cwd ?? process.cwd();
+      const diff = prToolRun('git', ['-C', cwd, 'diff', '--name-only', '-z', `${opts.base}...HEAD`]);
+      const files = diff.ok ? diff.out.split('\0').filter(Boolean) : null;
+      const patch = prToolRun('git', ['-C', cwd, 'diff', '--unified=0', `${opts.base}...HEAD`]);
+      const inventory = readOpenPrs(prToolRun, { cwd, ...(files ? { candidateFiles: files } : {}) });
+      const result = guardNewPr({ files: patch.ok ? files : null, seat: opts.seat as Seat | undefined, seatCap: Number(opts.seatCap), cellId: opts.cell, hunks: patch.ok ? parseDiffHunks(patch.out) : undefined }, inventory);
+      // Inspection never spends the three-creation unmeasured allowance.
+      // Only pr-manager records an actual new-PR attempt in that ledger.
+      prToolOut.log(JSON.stringify(result));
+      if (result.status !== 'allow') prToolExit(1);
+    });
   const queue = pr.command('queue').description('Shadow merge queue (never lands PRs)');
   const queueAction = async (action: () => Promise<unknown>) => {
     try {
@@ -2314,6 +2470,7 @@ export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queu
     .option('--pr <number>', '기존 PR 번호 고정 (--expected-head 와 함께)')
     .option('--expected-head <sha>', '리뷰된 PR 머리 SHA 고정 (--pr 와 함께)')
     .option('--heavy-remote', '머리 고정 착지의 무거운 게이트를 node-b·node-c 중 빈 호스트에서 실행; head⊕main 증거가 없거나 실패하면 거부(로컬 폴백 없음)')
+    .option('--heavy-on-pod-shadow', '--heavy-remote 판정을 유지하고 같은 head/main의 Pod 타입·변경 시험 결과를 비교만 한다')
     .option('--dry-run', '변경 없이 landing 계획만 출력')
     .option('--hold', 'PR을 생성 또는 갱신한 뒤 병합하지 않고 쌓아 둔다')
     .option('--title <title>', 'PR title')

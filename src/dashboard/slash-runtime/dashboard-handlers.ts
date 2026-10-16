@@ -342,7 +342,6 @@ import {
   removeAllowed,
 } from '../../tool-hints/api-allowlist.js';
 import { inputHistoryDbPath, inputHistoryJsonPath } from '../../input-history.js';
-import { terminalModalRouter } from '../input/terminal-modal-router.js';
 import { termSize, stripAnsi } from '../../tui.js';
 import { SLASH_COMMANDS } from '../../chat/index.js';
 import { buildEssentialHelpLines } from './help-from-registry.js';
@@ -358,10 +357,11 @@ import {
   resolveDashboardLogTurnAction,
 } from '../input/chat-main-log-actions.js';
 import { debug } from '../../debug/log.js';
+import { observeSessionStart } from '../../session/session-start.js';
 import { resolveDebugCompanionTargets } from '../../window/debug-window-consumers.js';
 import { getPromptBankStore, buildPromptInjection } from '../../prompt-bank/index.js';
 import { inspectActiveProvider } from '../../provider-summary.js';
-import { currentRouteDecision, formatRouteDecisionSummary, resolveRouteDecision, sessionModelPin, setSessionModelPin, type RouteDecision } from '../../llm/route-decision.js';
+import { currentRouteDecision, formatRouteDecisionSummary, resolveRouteDecision, sessionModelPin, setSessionModelPin } from '../../llm/route-decision.js';
 import {
   listSessions as sessionListSessions,
   resolveSessionId as sessionResolveId,
@@ -388,15 +388,15 @@ import {
   fetchDaemonSessionHistory,
 } from '../acp-boot.js';
 import { resolveLocalEndpoints, runLocalLLMCompat } from '../../local-llm-test.js';
-import { getShellRegistry } from '../../shell-runner/registry.js';
-import { renderHandleStatusChip, type HandleStatus } from '../../status/chip.js';
-import type { DashboardTermSlashRuntime } from '../term-slash-runtime.js';
-import { resolveTerminalMoveDestination } from '../../terminal-matrix/mobility.js';
-import { loadPersistedSessions } from '../../terminal/session-persistence.js';
-import { dispatchTerminalModalObserve } from '../../skills/tools/terminal-modal.js';
+// TUI-SLASH-SPLIT-TERM(D4b) — /term·/terminal 은 src/tui/slash/term.ts 로 이사(그 구현의 정적 import 도 함께 갔다).
+import { registerTermSlash, type TermSlashHost } from '../../tui/slash/term.js';
+// 옛 입구 re-export shim 은 slash-runtime/index.ts 한 곳뿐(RFC A5 · /mission 과 같은 꼴).
 import { SlashCommandRegistry } from './registry.js';
+import { createLoopScheduler, type LoopScheduler } from '../loop-scheduler.js';
 import { registerShellSlash } from './shell-slash.js';
 export { registerShellSlash } from './shell-slash.js';
+import { registerMissionSlash } from '../../tui/slash/mission.js';
+// TUI-SLASH-SPLIT-MISSION(D4b) — /mission 은 src/tui/slash/mission.ts 로 이사. 옛 입구 re-export shim 은 slash-runtime/index.ts 한 곳뿐(RFC A5).
 import { cronSecondDueAt, filterLoopRows, formatLoopsTable, localLoopRows, type LoopsTableRow } from './loops-table.js';
 import { loopCronVerdict } from '../../loops/verdict.js';
 import { checklistBoardSlash } from '../../release-loop/checklist-board.js';
@@ -1062,6 +1062,8 @@ export interface DashboardSlashContext {
     remoteDaemon(): { url: string; token: string | undefined } | null;
     /** Swap ACP session id via the existing connection (no restart). */
     acpSwapTo(sessionId: string, cwd: string): Promise<void>;
+    /** TUI-H8 ② — `/session new` 때 백엔드(ACP) 세션도 새로 받는다. 새 id 를 돌려준다(없으면 종전처럼 TUI 기록만 비움). */
+    acpRenew?(cwd: string): Promise<string>;
   };
 
   // B-3.c.2 additions — /term /terminal. The biggest single case
@@ -1073,137 +1075,7 @@ export interface DashboardSlashContext {
   // four module-level helpers (resolveTerminalMoveDestination +
   // loadPersistedSessions + dispatchTerminalModalObserve +
   // renderHandleStatusChip) are static-imported.
-  termSlash: {
-    /** Line formatters (existing factory output type re-used). */
-    slashRuntime: DashboardTermSlashRuntime;
-    openNewTerminal(command?: string): void;
-
-    /** Terminal session registry (the modal-pty side). */
-    sessionRegistry: {
-      list(): readonly {
-        id: string;
-        title: string;
-        state: HandleStatus;
-        cwd: string;
-        exitCode: number | null;
-        agentBrand?: string | null;
-        attentionLevel: number;
-        modal?: unknown;
-      }[];
-      foreground(): { id: string; title: string } | null;
-      detach(id: string): void;
-      attach(id: string, opts: { termCols: number; termRows: number }):
-        { id: string; title: string; modal?: unknown } | null;
-      kill(id: string): void;
-      get(id: string): { id: string; title: string; modal?: unknown } | null;
-      spawn(
-        spec: {
-          title: string;
-          cwd: string;
-          command?: string | undefined;
-          termName: string;
-          kind: string;
-          agentBrand?: string | undefined;
-        },
-        opts: { termCols: number; termRows: number },
-      ): { id: string; title: string; modal?: unknown };
-    };
-
-    /** Terminal matrix — the multi-terminal coordination layer. */
-    terminalMatrix: {
-      get(needle: string): {
-        id: string;
-        legacySessionId?: string | null;
-        title: string;
-        readOnly: boolean;
-        exitCode: number | null;
-        broadcastGroups: Set<string>;
-        character: { kind: string };
-        transport: { kind: string };
-        placement: { kind: string; windowId?: string | number; slotId?: string };
-        pty: { write(data: string): void };
-      } | null;
-      list(opts?: { includeExited?: boolean }): readonly {
-        id: string;
-        legacySessionId?: string | null;
-        title: string;
-        readOnly: boolean;
-        exitCode: number | null;
-        broadcastGroups: Set<string>;
-        character: { kind: string };
-        transport: { kind: string };
-        placement: { kind: string; windowId?: string | number; slotId?: string };
-        pty: { write(data: string): void };
-      }[];
-      move(id: string, dest: ReturnType<typeof resolveTerminalMoveDestination>): void;
-      joinGroup(id: string, group: string): void;
-      leaveGroup(id: string, group: string): void;
-      setReadOnly(id: string, value: boolean): void;
-      recharacterAndReexec(
-        id: string,
-        character: { kind: 'shell' | 'claude-code' | 'codex' | 'custom'; name?: string },
-      ): { reexeced: boolean };
-      pipeToChannel(id: string, channel: string, opts: { lineMode: boolean }): { id: number };
-      listPipes(): readonly {
-        id: number;
-        terminalId: string;
-        channel: string;
-        lineMode: boolean;
-        unsubscribe(): void;
-      }[];
-    };
-
-    /** Virtual-windows registry · subset used by /term vw-bar / move. */
-    vwRegistry: {
-      current(): { id: number; isSyncInputBarActive(): boolean; setSyncInputBar(v: boolean): void } | null;
-      get(id: number): { id: number; isSyncInputBarActive(): boolean; setSyncInputBar(v: boolean): void } | null;
-    };
-
-    /** Broadcast bus — used by /term group + /term vw-sync. */
-    broadcastBus: {
-      groups(): readonly string[];
-      members(group: string): readonly { id: string; title: string; readOnly: boolean }[];
-      broadcastBytes(group: string, text: string): {
-        delivered: readonly unknown[];
-        skippedExited: readonly unknown[];
-        skippedReadOnly: readonly unknown[];
-        errored: readonly unknown[];
-      };
-    };
-
-    /** Channel bus — used by /term channel + /term pipe + /term unpipe. */
-    channelBus: {
-      channels(): readonly string[];
-      statsFor(channel: string): {
-        subscriberCount: number;
-        publishedCount: number;
-        lastPublishAt: number | null;
-      };
-      publish(channel: string, msg: { from: string; payload: string | Buffer }): number;
-      snapshot(channel: string, limit: number): readonly { from: string; payload: string | Buffer }[];
-      subscribe(
-        channel: string,
-        cb: (msg: { from: string; payload: string | Buffer }) => void,
-        opts: { label: string; replay: boolean },
-      ): { id: number };
-    };
-
-    /** Open the /term switch session-picker modal · wraps createSessionPickerModal +
-     *  attachSurfaceToWorkspace + display.pushModal + agentSearchModal/Handle
-     *  mutation. The handler's only responsibility is calling this once. */
-    openSessionPicker(): void;
-
-    /** Wraps the inline `openSession` closure (terminalModalRouter.set +
-     *  detach-on-close + draw). Called after a successful session attach
-     *  / spawn / resume. */
-    openSession(session: { id: string; title: string; modal?: unknown }): void;
-
-    /** Set working focus to 'preview' (for /term move <id> preview). */
-    setWorkingFocusPreview(): void;
-
-    /** Compute next vw-slot id for a terminal · used by resolveTerminalMoveDestination. */
-    nextTerminalVwSlotId(terminalId: string): string;
-  };
+  termSlash: TermSlashHost;
 
   /** `/ad` — 광고 파이프라인. ⛔ 운반(그리기·승인 카드)은 index.ts 가 쥐고, 여기는 «부르기»만 한다. */
   ad: {
@@ -1246,6 +1118,21 @@ export interface DashboardSlashContext {
     virtualWindowsSwitchTo(windowId: number): void;
     /** Resolve a virtual-window id by spawn-title (used by /shell attach). */
     resolveVwIdByLabel(label: string): number | null;
+  };
+
+  // TUI-LOOP-COMMAND — /loop <간격> <프롬프트> idle-gated 루프 스케줄러
+  // (src/dashboard/loop-scheduler.ts · 판정: idle 발사 1 · busy 미룸 · stop 0).
+  // 스케줄러 인스턴스와 idle/busy 신호는 showDashboard 로컬 상태라
+  // chatModeStateRef / voiceChatStateRef 선례대로 ctx 로 스레드한다.
+  // Optional — 배선 없는 격리 dispatch 시험은 /loop 가 «배선 없음» 줄로
+  // 답하는 것이 규약(던지지 않는다).
+  loopCommand?: {
+    /** 대시보드가 쉬고 있는가(스트리밍 턴이 없는가) — 쉬는 동안만 발사한다. */
+    isIdle(): boolean;
+    /** 프롬프트를 대시보드의 평소 채팅 입력 경로로 낸다. */
+    submitPrompt(prompt: string): void;
+    /** 실행 중 스케줄러를 쥐는 호스트 로컬 ref(멈추면 null). */
+    schedulerRef: { current: LoopScheduler | null };
   };
 }
 
@@ -1356,7 +1243,7 @@ export const DASHBOARD_SLASH_CATALOG_BASELINE = {
     'ag', 'agent', 'agents', 'attach-clear', 'attach-pin', 'attach-unpin',
     'bg', 'cb', 'ce', 'child', 'clip', 'clipboard',
     'code-edit', 'compact', 'compress', 'cost', 'detail', 'dv',
-    'harness-llm', 'intake', 'me', 'memo',
+    'harness-llm', 'intake', 'loop', 'me', 'memo',
     'note', 'pause', 'plan-board', 'preview', 'pv', 'report',
     'sh', 'shell', 'signal', 'signals', 'skill-reload',
     'skills-reload', 'spend', 'squeeze',
@@ -1408,6 +1295,23 @@ async function fetchLoopsDaemonJson<T>(url: string, headers: Record<string, stri
   } finally {
     if (timeout) clearTimeout(timeout);
   }
+}
+
+/** TUI-LOOP-COMMAND — /loop <간격> 파서. `30s` · `5m` · `1h` · 맨숫자=분. 1초 미만은 거부한다. */
+function parseLoopInterval(raw: string): { intervalMs: number; label: string } | null {
+  const match = /^(\d+)(s|sec|초|m|min|분|h|시간)?$/i.exec(raw.trim());
+  if (!match) return null;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  const unit = (match[2] ?? 'm').toLowerCase();
+  const intervalMs = unit === 's' || unit === 'sec' || unit === '초' ? amount * 1_000
+    : unit === 'h' || unit === '시간' ? amount * 3_600_000
+    : amount * 60_000;
+  if (intervalMs < 1_000) return null;
+  const label = unit === 's' || unit === 'sec' || unit === '초' ? `${amount}초`
+    : unit === 'h' || unit === '시간' ? `${amount}시간`
+    : `${amount}분`;
+  return { intervalMs, label };
 }
 
 export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedger?: DecisionLedger): SlashCommandRegistry<DashboardSlashContext, DashboardSlashReturn> {
@@ -1477,6 +1381,65 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     const filtered = filterLoopRows(rows, args[0]);
     for (const line of formatLoopsTable(filtered, text => ctx.error(text))) ctx.pushChatLine(`  ${line}`);
     if (!filtered.length) ctx.pushChatLine(ctx.muted('  No loops or cron jobs found.'));
+    ctx.setChatScrollOffset(-1);
+  });
+
+  // ── TUI-LOOP-COMMAND ───────────────────────────────────────────────
+  // /loop <간격> <프롬프트> · 쉬는 동안만 발사 — L6 · PR #27482.
+  // 판정: idle 발사 1 · busy 미룸 · stop 0 — 판정선은
+  // src/dashboard/loop-scheduler.test.ts 가 증명하고, 이 핸들러는
+  // 그 스케줄러를 이 세션의 ctx 번들로 구동한다(start on /loop ·
+  // stop on /loop stop 또는 세션 끝 — 세션 끝 정지선은 /session
+  // new|clear 쪽에 같은 칸의 stop 조건으로 있다).
+  registry.register('loop', (args, ctx) => {
+    const loop = ctx.loopCommand;
+    if (!loop) {
+      ctx.pushChatLine(ctx.muted('  /loop: 이 화면에는 루프 스케줄러 배선이 없다'));
+      ctx.setChatScrollOffset(-1);
+      return;
+    }
+    const sub = (args[0] ?? '').trim().toLowerCase();
+    if (args.length === 0 || sub === 'help') {
+      ctx.pushChatLine(ctx.muted('  usage: /loop <간격> <프롬프트> · /loop stop'));
+      ctx.pushChatLine(ctx.muted('    간격: 30s · 5m · 1h · 맨숫자=분 — 대시보드가 쉬는 동안만 프롬프트를 발사한다'));
+      ctx.setChatScrollOffset(-1);
+      return;
+    }
+    if (sub === 'stop') {
+      const current = loop.schedulerRef.current;
+      if (current?.isRunning()) {
+        current.stop();
+        loop.schedulerRef.current = null;
+        ctx.pushChatLine(ctx.success('  ⏹ /loop 정지 — 더 이상 발사하지 않는다'));
+      } else {
+        ctx.pushChatLine(ctx.muted('  /loop: 실행 중인 루프가 없다'));
+      }
+      ctx.setChatScrollOffset(-1);
+      return;
+    }
+    const parsed = parseLoopInterval(args[0] ?? '');
+    const prompt = args.slice(1).join(' ').trim();
+    if (!parsed || !prompt) {
+      ctx.pushChatLine(ctx.warning('  usage: /loop <간격> <프롬프트> · /loop stop'));
+      ctx.setChatScrollOffset(-1);
+      return;
+    }
+    // 다시 /loop 를 치면 이전 루프를 멈추고 새 간격으로 갈아탄다.
+    loop.schedulerRef.current?.stop();
+    const scheduler = createLoopScheduler({
+      intervalMs: parsed.intervalMs,
+      isIdle: loop.isIdle,
+      fire: () => {
+        try { loop.submitPrompt(prompt); }
+        catch (err) {
+          ctx.pushChatLine(ctx.error(`  /loop 발사 실패: ${err instanceof Error ? err.message : String(err)}`));
+        }
+      },
+    });
+    scheduler.start();
+    loop.schedulerRef.current = scheduler;
+    ctx.pushChatLine(ctx.success(`  🔁 /loop 시작 — ${parsed.label} 간격 · 쉬는 동안만 "${prompt}"`));
+    ctx.pushChatLine(ctx.muted('  멈추기: /loop stop'));
     ctx.setChatScrollOffset(-1);
   });
 
@@ -2532,424 +2495,7 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     }
   });
 
-  registry.register('mission', async (args, ctx) => {
-    const sub = (args[0] ?? 'list').toLowerCase();
-    const { dispatchAutopilotMissions } = await import('../../autopilot/mission-tool.js');
-    ctx.chatLines.push('');
-
-    // C-b-2 PR① — 채팅에서 미션 생성. 텔레그램 "미션:" 발화와 동형(submitIntent
-    // 단일 허리 · origin channel='tui'). 등록 확인 라인 후 ready 워처 시작 —
-    // detached prepare(외부조사+분해)가 끝나면 페이즈 보드 + 인라인 HITL 이 뜬다.
-    if (sub === 'new') {
-      const goal = args.slice(1).join(' ').replace(/^["'“]|["'”]$/g, '').trim();
-      ctx.chatLines.push(ctx.accent(`❯ /mission new`));
-      if (!goal) {
-        ctx.chatLines.push(ctx.warning('  usage: /mission new <goal 문장>'));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const { submitIntent } = await import('../../intent-gate/gate.js');
-      const gate = await submitIntent({
-        text: `미션: ${goal}`, channel: 'tui', source: 'human-intent',
-        origin: { channel: 'tui' },
-      });
-      if (gate.route !== 'mission') {
-        ctx.chatLines.push(ctx.error('  ✗ 미션 등록 실패(게이트 passthrough)'));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      ctx.chatLines.push(ctx.success(`  🎯 미션 등록: ${gate.goal.slice(0, 72)}`));
-      // R2: preparation board shows a prediction only. It is deliberately
-      // not persisted as a pin; arming/execution re-resolves capability and
-      // explicit selection at the later authority boundary.
-      const cfg = getUserConfig();
-      const expectedRoute = resolveRouteDecision({
-        provider: cfg.llm.provider,
-        configuredModel: inspectActiveProvider().model,
-        text: goal,
-        routePolicy: cfg.llm.routePolicy,
-      });
-      ctx.chatLines.push(ctx.muted(`  · 예상 실행 레인 ${formatRouteDecisionSummary(expectedRoute)} (승인 시 재확인)`));
-      ctx.chatLines.push(ctx.muted(`  · 실행모델 ${gate.executionModel} (${gate.tier === 'heavy' ? '무거움' : '가벼움'})`));
-      ctx.chatLines.push(ctx.muted(`  · 🔎 외부조사 보강${gate.heavy ? ' + 멀티페이즈 분해' : ''} 준비 중 (백그라운드·수십초~분)`));
-      ctx.chatLines.push(ctx.muted(`  · id ${gate.missionId}`));
-      ctx.chatLines.push(ctx.muted('  ⏳ 준비되면 페이즈 보드 + 승인 선택이 이 채팅에 뜨집니다 (진행 확인: /mission trace)'));
-      ctx.missionTui.startReadyWatch(gate.missionId);
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-
-    // C-b-2 PR① — 정정 코멘트 재분해(HITL 픽커 ✉ 직접입력 경로의 착지점).
-    // 텔레그램 force_reply 답장과 동형 — spawnMissionPrepare(comment) 후 재준비 워처.
-    if (sub === 'revise') {
-      const id = (args[1] ?? '').trim();
-      const comment = args.slice(2).join(' ').trim();
-      ctx.chatLines.push(ctx.accent(`❯ /mission revise ${id}`));
-      if (!id || !comment) {
-        ctx.chatLines.push(ctx.warning('  usage: /mission revise <apm_id> <정정 코멘트>'));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const { spawnMissionPrepare } = await import('../../autopilot/mission-prepare-spawn.js');
-      try { spawnMissionPrepare(id, { comment }); } catch { /* fail-soft */ }
-      ctx.chatLines.push(ctx.success(`  🔧 정정 반영 중: "${comment.slice(0, 60)}"`));
-      ctx.chatLines.push(ctx.muted('  재분해 후 새 페이즈 보드 + 승인 선택을 다시 보여드립니다'));
-      ctx.missionTui.startReadyWatch(id);
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-
-    // PR ③ — 페이즈 보드 + 조정(trim/defer/edit) + 재실행(rerun/rebuild).
-    // 전부 dispatchAutopilotMissions 단일 창구 — 텔레그램/PWA/CLI 와 같은 write 경로.
-    const pushPhaseBoard = async (id: string): Promise<void> => {
-      const r = await dispatchAutopilotMissions({ action: 'phases', id }) as {
-        error?: string; count?: number; phases?: Array<{ index: number; status: string; title: string }>; note?: string;
-      };
-      if (r.error) { ctx.chatLines.push(ctx.error(`  ✗ ${r.error}`)); return; }
-      if (!r.phases || r.phases.length === 0) {
-        ctx.chatLines.push(ctx.muted('  (페이즈 없음 — 단일/미분해 미션)'));
-        return;
-      }
-      for (const p of r.phases) {
-        const st = p.status === 'done' ? ctx.success(p.status)
-          : p.status === 'failed' ? ctx.error(p.status)
-          : p.status === 'running' ? ctx.info(p.status)
-          : p.status === 'scheduled' ? ctx.warning(p.status)
-          : ctx.muted(p.status);
-        ctx.chatLines.push(`  ${ctx.muted(String(p.index).padStart(2) + '.')} [${st}] ${ctx.text(p.title)}`);
-      }
-    };
-
-    if (sub === 'phases') {
-      const id = (args[1] ?? '').trim();
-      ctx.chatLines.push(ctx.accent(`❯ /mission phases ${id}`));
-      if (!id) {
-        ctx.chatLines.push(ctx.warning('  usage: /mission phases <apm_id>'));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      await pushPhaseBoard(id);
-      ctx.chatLines.push(ctx.muted('  조정: /mission trim|defer <id> <n> · edit <id> <n> <새 제목> · rebuild <id> <n>'));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-
-    if (sub === 'trim' || sub === 'defer') {
-      const id = (args[1] ?? '').trim();
-      const phase = (args[2] ?? '').trim();
-      ctx.chatLines.push(ctx.accent(`❯ /mission ${sub} ${id} ${phase}`));
-      if (!id || !phase) {
-        ctx.chatLines.push(ctx.warning(`  usage: /mission ${sub} <apm_id> <phase index|task id>`));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const r = await dispatchAutopilotMissions({ action: sub, id, phase }) as { error?: string; note?: string };
-      if (r.error) ctx.chatLines.push(ctx.error(`  ✗ ${r.error}`));
-      else {
-        ctx.chatLines.push(ctx.success(`  ✓ ${r.note ?? `${sub} 완료`}`));
-        await pushPhaseBoard(id); // 조정 결과를 새 보드로 즉시 확인.
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-
-    if (sub === 'edit') {
-      const id = (args[1] ?? '').trim();
-      const phase = (args[2] ?? '').trim();
-      const title = args.slice(3).join(' ').trim();
-      ctx.chatLines.push(ctx.accent(`❯ /mission edit ${id} ${phase}`));
-      if (!id || !phase || !title) {
-        ctx.chatLines.push(ctx.warning('  usage: /mission edit <apm_id> <phase> <새 제목> (설명 교정은 CLI/tool 의 description)'));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const r = await dispatchAutopilotMissions({ action: 'edit', id, phase, title }) as { error?: string; note?: string };
-      if (r.error) ctx.chatLines.push(ctx.error(`  ✗ ${r.error}`));
-      else {
-        ctx.chatLines.push(ctx.success(`  ✓ ${r.note ?? '교정 완료'}`));
-        await pushPhaseBoard(id);
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-
-    // dogfood 지적 — 픽커를 Esc(나중에)로 닫으면 TUI 재승인 경로가 없었다(arm 만 존재).
-    // 픽커 승인과 동일 경로(dispatch approve via:'tui' — 텔레그램 역싱크 포함) + 워처 attach.
-    if (sub === 'approve' || sub === 'hold') {
-      const id = (args[1] ?? '').trim();
-      ctx.chatLines.push(ctx.accent(`❯ /mission ${sub} ${id}`));
-      if (!id) {
-        ctx.chatLines.push(ctx.warning(`  usage: /mission ${sub} <apm_id>${sub === 'hold' ? ' — 보류(기록 유지·실행 안 함)' : ' — 승인·집행 시작'}`));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const r = await dispatchAutopilotMissions(
-        sub === 'approve'
-          ? { action: 'approve', id, via: 'tui' }
-          : { action: 'cancel', id, via: 'tui', defer: true },
-      ) as { error?: string; note?: string; scheduledCron?: string };
-      if (r.error) ctx.chatLines.push(ctx.error(`  ✗ ${r.error}`));
-      else if (sub === 'approve') {
-        ctx.chatLines.push(ctx.success(`  ✅ 승인 — ${r.note ?? '실행 시작'}`));
-        if (!r.scheduledCron) ctx.missionTui.startRunWatch(id);
-      } else ctx.chatLines.push(ctx.warning(`  ⏸️ 보류 — ${r.note ?? '기록 유지'}`));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-
-    // P4 (2026-07-13) — split/skip 합류: 텔레그램 3층 탈출구의 slash 패리티(dispatch 단일 창구).
-    if (sub === 'rerun' || sub === 'rebuild' || sub === 'rereflect' || sub === 'split' || sub === 'skip') {
-      const id = (args[1] ?? '').trim();
-      const phase = (args[2] ?? '').trim();
-      const needsPhase = sub === 'rebuild' || sub === 'split' || sub === 'skip';
-      ctx.chatLines.push(ctx.accent(`❯ /mission ${sub} ${id}${phase ? ` ${phase}` : ''}`));
-      if (!id || (needsPhase && !phase)) {
-        ctx.chatLines.push(ctx.warning(sub === 'rerun'
-          ? '  usage: /mission rerun <apm_id> — 처음부터 재실행(세대+1·이전 PR close)'
-          : sub === 'rereflect'
-            ? '  usage: /mission rereflect <apm_id> — 비평 지적 페이즈만 자동 재구현(머지는 HITL)'
-            : sub === 'split'
-              ? '  usage: /mission split <apm_id> <phase index> — 과대 페이즈를 단일책임 서브페이즈로 재분해'
-              : sub === 'skip'
-                ? '  usage: /mission skip <apm_id> <phase index> — 페이즈 건너뛰기(기능 제외·부분 완주)'
-                : '  usage: /mission rebuild <apm_id> <phase index|task id> — 그 페이즈부터 재구현'));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const r = await dispatchAutopilotMissions({
-        action: sub, id, ...(needsPhase ? { phase } : {}), via: 'tui',
-      }) as { error?: string; note?: string };
-      if (r.error) ctx.chatLines.push(ctx.error(`  ✗ ${r.error}`));
-      else {
-        ctx.chatLines.push(ctx.success(`  🔄 ${r.note ?? `${sub} 시작`}`));
-        ctx.missionTui.startRunWatch(id); // 재실행 진행을 즉시 관찰(페이즈 전이·진행바·종결).
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-
-    // P5 (2026-07-13) — 미션 실행 로그 tail. O3 영속 run.log 를 채팅에서 바로(진단 근거 실체).
-    if (sub === 'log') {
-      const id = (args[1] ?? '').trim();
-      const n = (args[2] ?? '').trim();
-      ctx.chatLines.push(ctx.accent(`❯ /mission log ${id}${n ? ` ${n}` : ''}`));
-      if (!id) {
-        ctx.chatLines.push(ctx.warning('  usage: /mission log <apm_id> [줄수(기본 40)] — 미션 실행 로그 tail'));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const r = await dispatchAutopilotMissions({
-        action: 'log', id, ...(n ? { tail: Number(n) } : {}),
-      }) as { error?: string; exists?: boolean; lines?: string[]; runLogPath?: string; note?: string };
-      if (r.error) ctx.chatLines.push(ctx.error(`  ✗ ${r.error}`));
-      else if (!r.exists) ctx.chatLines.push(ctx.muted(`  ${r.note ?? '로그 없음'}`));
-      else {
-        for (const line of r.lines ?? []) ctx.chatLines.push(ctx.muted(`  │ ${line}`));
-        ctx.chatLines.push(ctx.subtext(`  ${r.note ?? r.runLogPath ?? ''}`));
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-
-    // PR ② — 실행 관찰 attach. 타 서피스(텔레그램/PWA/CLI)에서 승인된 미션의 진행을
-    // TUI 채팅에서도 보고 싶을 때 수동으로 워처를 붙인다(TUI approve 는 자동 attach).
-    if (sub === 'watch') {
-      const id = (args[1] ?? '').trim();
-      ctx.chatLines.push(ctx.accent(`❯ /mission watch ${id}`));
-      if (!id) {
-        ctx.chatLines.push(ctx.warning('  usage: /mission watch <apm_id>'));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      ctx.chatLines.push(ctx.muted('  ⏳ 실행 워처 attach — 페이즈 전이·진행바·종결 리포트가 이 채팅에 뜹니다'));
-      ctx.missionTui.startRunWatch(id);
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-
-    if (sub === 'list' || sub === 'ls') {
-      const status = (args[1] ?? '').trim();
-      const result = await dispatchAutopilotMissions({
-        action: 'list',
-        ...(status ? { status } : {}),
-      }) as { error?: string; count?: number; missions?: Array<Record<string, unknown>>; note?: string };
-      ctx.chatLines.push(ctx.accent(`\u276f /mission list${status ? ` ${status}` : ''}  (${result.count ?? 0})`));
-      if (result.error) {
-        ctx.chatLines.push(ctx.error(`  \u2717 ${result.error}`));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      for (const m of result.missions ?? []) {
-        const st = String(m.status ?? '?');
-        const stColored = st === 'running' ? ctx.info(st.padEnd(9))
-          : st === 'done' ? ctx.success(st.padEnd(9))
-          : st === 'failed' ? ctx.error(st.padEnd(9))
-          : st === 'armed' ? ctx.warning(st.padEnd(9))
-          : ctx.muted(st.padEnd(9));
-        const d = m.derived as { total: number; ok: number; error: number; active: number } | undefined;
-        const health = d && d.total > 0
-          ? ctx.subtext(` \u2705${d.ok}${d.error > 0 ? ` \u274c${d.error}` : ''}${d.active > 0 ? ` \ud83d\udd35${d.active}` : ''}`)
-          : '';
-        ctx.chatLines.push(`  ${stColored} ${ctx.muted(String(m.source ?? '').padEnd(10))} ${ctx.text(String(m.id ?? ''))}${health}`);
-        ctx.chatLines.push(ctx.subtext(`            ${String(m.goal ?? '').slice(0, 72)}`));
-      }
-      if (result.note) ctx.chatLines.push(ctx.muted(`  ${result.note}`));
-      ctx.chatLines.push(ctx.muted('  /mission new <goal> \u2014 \uc0dd\uc131 \u00b7 trace <id> \u2014 \uacc4\ubcf4 \u00b7 briefing <id> \u2014 \uc2e4\uc9d1\ud589 \uc804 \uc885\ud569 \ube0c\ub9ac\ud551 \u00b7 arm <id> \u2014 \uc2b9\uc778 \u00b7 \uad6c\uccb4\ud654/\uc885\ub8cc\ub294 `elanous autopilot` CLI'));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-
-    if (sub === 'trace') {
-      const id = (args[1] ?? '').trim();
-      ctx.chatLines.push(ctx.accent(`\u276f /mission trace ${id}`));
-      if (!id) {
-        ctx.chatLines.push(ctx.warning('  usage: /mission trace <apm_id>'));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const result = await dispatchAutopilotMissions({ action: 'trace', id }) as {
-        error?: string;
-        mission?: Record<string, unknown>;
-        routeDecision?: RouteDecision;
-        derived?: Array<{ kind: string; name: string; status: string; detail?: string | null }>;
-        note?: string;
-      };
-      if (result.error) {
-        ctx.chatLines.push(ctx.error(`  \u2717 ${result.error}`));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const m = result.mission ?? {};
-      ctx.chatLines.push(`  ${ctx.text(String(m.id ?? ''))}  ${ctx.muted(String(m.status ?? ''))} \u00b7 ${ctx.muted(String(m.source ?? ''))} \u00b7 ${ctx.muted(String(m.kind ?? ''))}`);
-      ctx.chatLines.push(ctx.subtext(`  ${String(m.goal ?? '').slice(0, 76)}`));
-      if (result.routeDecision) ctx.chatLines.push(ctx.muted(`  route: ${formatRouteDecisionSummary(result.routeDecision)}`));
-      // \uc900\ube44 \ub9e5\ub77d \uc804\ubb38(dogfood \uc9c0\uc801: "\uc804\ubb38: /mission trace" \ud78c\ud2b8\uc758 \uc2e4\uccb4) \u2014 grounding \ud30c\uc77c
-      // \ubaa9\ub85d\u00b7\uc678\ubd80\uc870\uc0ac \ubcf4\uac15/\uad50\uc815\u00b7\uc911\ubcf5\uae4c\uc9c0. \uacfc\ub3c4\ud55c \uc2a4\ud06c\ub864 \ubc29\uc9c0\ub85c 40\uc904 \ucea1.
-      if (typeof m.description === 'string' && m.description.trim()) {
-        const descLines = m.description.split('\n');
-        for (const dl of descLines.slice(0, 40)) {
-          ctx.chatLines.push(dl.startsWith('## ') ? ctx.subtext(`  ${dl.slice(3)}`) : ctx.muted(`  ${dl}`));
-        }
-        if (descLines.length > 40) ctx.chatLines.push(ctx.muted(`  \u2026 \uc678 ${descLines.length - 40}\uc904`));
-      }
-      for (const dv of result.derived ?? []) {
-        const mark = dv.status === 'ok' ? ctx.success('\u2705')
-          : dv.status === 'error' ? ctx.error('\u274c')
-          : dv.status === 'active' ? ctx.info('\ud83d\udd35')
-          : ctx.muted('\u00b7');
-        ctx.chatLines.push(`    ${mark} ${ctx.muted(dv.kind.padEnd(9))} ${dv.name}${dv.detail ? ctx.subtext(`  ${String(dv.detail).slice(0, 40)}`) : ''}`);
-      }
-      if (result.note) ctx.chatLines.push(ctx.muted(`  ${result.note}`));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-
-    // \ubbf8\uc158 \ucd5c\uc885 \ube0c\ub9ac\ud551(B6\u00b7TUI \ud328\ub9ac\ud2f0\u00b7PLAN-mission-pre-arming-briefing \u00a7B4) \u2014 \uc2e4\uc9d1\ud589 \uc804 \uc885\ud569
-    // \uc810\uac80(\uace8 \uc9c4\ud654\u00b7\uc5ec\uc815\u00b7\uc0b0\ucd9c\ubb3c grounded\u00b7\uc815\ucc29)\uc744 \ucc44\ud305\uc5d0\uc11c \uc77d\ub294\ub2e4. grounded \uc778\uc790\uba74 PR merge \ud604\uc2e4
-    // \ub300\uc870(gh/git\u00b7\ub290\ub9bc). \ubc1c\uc1a1(--send)\uc740 \ud154\ub808\uadf8\ub7a8 \uc804\uc6a9\uc774\ub77c CLI \ub85c \uc548\ub0b4(TUI \ub294 \ud310\ub2e8 \ud45c\uba74).
-    if (sub === 'briefing' || sub === 'brief') {
-      const id = (args[1] ?? '').trim();
-      const grounded = (args[2] ?? '').toLowerCase() === 'grounded';
-      ctx.chatLines.push(ctx.accent(`\u276f /mission briefing ${id}${grounded ? ' grounded' : ''}`));
-      if (!id) {
-        ctx.chatLines.push(ctx.warning('  usage: /mission briefing <apm_id> [grounded] \u2014 \uc2e4\uc9d1\ud589 \uc804 \uc885\ud569 \ube0c\ub9ac\ud551(\uace8 \uc9c4\ud654\u00b7\uc5ec\uc815\u00b7\uc0b0\ucd9c\ubb3c\u00b7\uc815\ucc29). grounded=PR merge \ud604\uc2e4 \ub300\uc870(\ub290\ub9bc)'));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      if (grounded) ctx.chatLines.push(ctx.muted('  \u23f3 grounded \ud604\uc2e4 \ub300\uc870(gh/git) \uc911\u2026 (\uc218\ucd08 \uc18c\uc694)'));
-      const r = await dispatchAutopilotMissions({ action: 'briefing', id, ...(grounded ? {} : { grounded: false }) }) as {
-        error?: string;
-        briefing?: {
-          currentGoal: string;
-          goalEvolution: Array<{ generation: number; reason?: string; phaseCount: number }>;
-          journey: { splits: number; edits: number; decisions: number; drifts: number; externalInterventions: number; notable: string[] };
-          deliverables: { logicPhases: string[]; prUrls: string[]; resourceCount: number; driftWarnings: Array<{ phase: string; issue: string }>; groundedChecked: boolean };
-          settlement: { arcs: Array<{ name: string; status: string; phaseCount: number }>; phasesDone: number; phasesTotal: number; missionStatus: string };
-          pendingArming?: { phaseId: string; title: string };
-          routeDecision?: { provider: string; model: string; effort?: string; source: string };
-        };
-      };
-      if (r.error) { ctx.chatLines.push(ctx.error(`  \u2717 ${r.error}`)); ctx.setChatScrollOffset(-1); return; }
-      const b = r.briefing;
-      if (!b) { ctx.chatLines.push(ctx.muted('  (\ube0c\ub9ac\ud551 \uc5c6\uc74c)')); ctx.setChatScrollOffset(-1); return; }
-      ctx.chatLines.push(`  ${ctx.text('\uace8')} ${ctx.muted(String(b.currentGoal).replace(/\s+/g, ' ').slice(0, 72))}`);
-      if (b.routeDecision) ctx.chatLines.push(ctx.muted(`  \uc2e4\ud589 \ub808\uc778: ${b.routeDecision.provider}/${b.routeDecision.model}${b.routeDecision.effort ? `\u00b7${b.routeDecision.effort}` : ''} (${b.routeDecision.source})`));
-      // \u2460 \uace8 \uc9c4\ud654(\ucd5c\ucd08\u2192\uc911\uac04\u2192\ucd5c\uc885)
-      ctx.chatLines.push(ctx.subtext(`  \u2460 \uace8 \uc9c4\ud654 (${b.goalEvolution.length}\uc138\ub300 \uad6c\uc870 \uc804\uc774)`));
-      for (const g of b.goalEvolution) ctx.chatLines.push(ctx.muted(`    gen${g.generation} [${g.reason ?? ''}] ${g.phaseCount}\ud398\uc774\uc988`));
-      // \u2461 \uc5ec\uc815
-      ctx.chatLines.push(ctx.subtext(`  \u2461 \uc5ec\uc815 \u2014 split ${b.journey.splits}\u00b7\ud3b8\uc9d1 ${b.journey.edits}\u00b7\uacb0\uc815 ${b.journey.decisions}(\uc678\ubd80 ${b.journey.externalInterventions})\u00b7drift ${b.journey.drifts}`));
-      for (const n of b.journey.notable.slice(-4)) ctx.chatLines.push(ctx.muted(`    \u00b7 ${String(n).slice(0, 68)}`));
-      // \u2462 \uc0b0\ucd9c\ubb3c grounded \uc810\uac80
-      const dv = b.deliverables;
-      const gmark = dv.driftWarnings.length ? ctx.error(`\u26a0\ufe0f \ubbf8\ud655\uc815 ${dv.driftWarnings.length}`) : (dv.groundedChecked ? ctx.success('\u2713 grounded') : ctx.muted('\ud734\ub9ac\uc2a4\ud2f1'));
-      ctx.chatLines.push(ctx.subtext(`  \u2462 \uc0b0\ucd9c\ubb3c \u2014 \ub85c\uc9c1 ${dv.logicPhases.length}\u00b7PR ${dv.prUrls.length}\u00b7\ub9ac\uc18c\uc2a4 ${dv.resourceCount} \u00b7 ${gmark}`));
-      for (const w of dv.driftWarnings.slice(0, 8)) ctx.chatLines.push(`    ${ctx.error('\u26a0\ufe0f')} ${ctx.text(String(w.phase).slice(0, 26))} ${ctx.muted('\u2014 ' + String(w.issue).slice(0, 52))}`);
-      // \u2463 \uc815\ucc29
-      const arcStr = b.settlement.arcs.map((a) => `${a.name.slice(0, 8)}[${a.status}]`).join('\u00b7') || 'flat';
-      ctx.chatLines.push(ctx.subtext(`  \u2463 \uc815\ucc29 \u2014 ${arcStr} \u00b7 ${b.settlement.phasesDone}/${b.settlement.phasesTotal} done \u00b7 ${b.settlement.missionStatus}`));
-      if (b.pendingArming) ctx.chatLines.push(ctx.warning(`  \ud83d\udd12 \uc2e4\uc9d1\ud589 \uc2b9\uc778 \ub300\uc0c1: ${b.pendingArming.title.slice(0, 48)}`));
-      if (!grounded) ctx.chatLines.push(ctx.muted('  \u00b7 grounded \uc2e4\uce21(PR merge \ud604\uc2e4 \ub300\uc870): /mission briefing <id> grounded \u00b7 \ube60\ub978 \ubbf8\uba38\uc9c0 \uc2a4\uce94: /mission landing <id>'));
-      ctx.chatLines.push(ctx.muted('  \u00b7 \ud154\ub808\uadf8\ub7a8 \uce74\ub4dc \ubc1c\uc1a1: elanous autopilot briefing <id> --send'));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-
-    // \ub79c\ub529 \ube60\ub978 \uc2a4\uce94(B7) \u2014 \uc644\uc8fc/arming \uc804 "\ubbf8\uba38\uc9c0 \uc788\ub098?" \uc989\ub2f5(\uae30\ub85d PR merge \uc0c1\ud0dc\ub9cc\u00b71\ud68c gh \ubc30\uce58\u00b7\uc218\ucd08).
-    // \u26d4 open=\ud655\uc815 \ubbf8\uba38\uc9c0(\uc644\uc8fc \ucc28\ub2e8) \u00b7 \u26a0\ufe0f closed=\ub300\uccb4 \ub79c\ub529 \ud655\uc778 \uad8c\uc7a5(\u2192 briefing grounded).
-    if (sub === 'landing' || sub === 'land') {
-      const id = (args[1] ?? '').trim();
-      ctx.chatLines.push(ctx.accent(`\u276f /mission landing ${id}`));
-      if (!id) {
-        ctx.chatLines.push(ctx.warning('  usage: /mission landing <apm_id> \u2014 \uc644\uc8fc \uc804 \ubbf8\uba38\uc9c0 PR \ube60\ub978 \uc2a4\uce94'));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      ctx.chatLines.push(ctx.muted('  \u23f3 \uae30\ub85d PR merge \uc0c1\ud0dc \uc2a4\uce94 \uc911\u2026 (gh\u00b7\uc218\ucd08)'));
-      const r = await dispatchAutopilotMissions({ action: 'landing', id }) as {
-        error?: string; summary?: string;
-        scan?: { total: number; merged: number; open: number; closed: number; none: number; blocking: number; needsRecheck: number; phases: Array<{ phaseTitle: string; pr: number | null; state: string }> };
-      };
-      if (r.error) { ctx.chatLines.push(ctx.error(`  \u2717 ${r.error}`)); ctx.setChatScrollOffset(-1); return; }
-      const s = r.scan;
-      if (!s) { ctx.chatLines.push(ctx.muted('  (\uc2a4\uce94 \uc5c6\uc74c)')); ctx.setChatScrollOffset(-1); return; }
-      const line = s.blocking > 0 ? ctx.error(r.summary ?? '') : s.needsRecheck > 0 ? ctx.warning(r.summary ?? '') : ctx.success(r.summary ?? '');
-      ctx.chatLines.push(`  ${line}`);
-      ctx.chatLines.push(ctx.muted(`  \ucd1d ${s.total} \u00b7 merged ${s.merged} \u00b7 open ${s.open} \u00b7 closed ${s.closed} \u00b7 none ${s.none}`));
-      for (const p of s.phases) {
-        if (p.state === 'none') continue;
-        const mk = p.state === 'merged' ? ctx.success('\u2705') : p.state === 'open' ? ctx.error('\u26d4') : ctx.warning('\u26a0\ufe0f');
-        ctx.chatLines.push(`    ${mk} ${ctx.muted(`[${p.state}]${p.pr ? ` #${p.pr}` : ''}`)} ${ctx.text(p.phaseTitle.slice(0, 42))}`);
-      }
-      if (s.needsRecheck > 0) ctx.chatLines.push(ctx.muted('  \u00b7 \ub2eb\ud78c PR \ub300\uccb4 \ub79c\ub529 \ud655\uc778: /mission briefing <id> grounded'));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-
-    if (sub === 'arm') {
-      const id = (args[1] ?? '').trim();
-      ctx.chatLines.push(ctx.accent(`\u276f /mission arm ${id}`));
-      if (!id) {
-        ctx.chatLines.push(ctx.warning('  usage: /mission arm <apm_id>'));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const result = await dispatchAutopilotMissions({ action: 'arm', id }) as { error?: string; ok?: boolean };
-      if (result.error) {
-        ctx.chatLines.push(ctx.error(`  \u2717 ${result.error}`));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      ctx.chatLines.push(ctx.success(`  \u2713 armed \u2014 ${id} (materialize spec \uc800\uc7a5 \u00b7 \uc2e4\ud589\uc740 materialize \uc2dc)`));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-
-    ctx.chatLines.push(ctx.accent('\u276f /mission'));
-    ctx.chatLines.push(ctx.warning(`  unknown subcommand: ${sub}`));
-    ctx.chatLines.push(ctx.muted('  usage: /mission [list [status]] | new <goal> | approve|hold <id> | phases <id> | trim|defer <id> <n> | edit <id> <n> <\uc81c\ubaa9> | rerun <id> | rebuild <id> <n> | rereflect <id> | watch <id> | trace <id> | briefing <id> [grounded] | landing <id> | arm <id> | revise <id> <\ucf54\uba58\ud2b8>'));
-    ctx.setChatScrollOffset(-1);
-  });
+  registerMissionSlash(registry);
 
   // ── B-1.i ─────────────────────────────────────────────────────────
 
@@ -2964,629 +2510,7 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
 
   // ── B-3.c.2 ───────────────────────────────────────────────────────
 
-  registry.register(['term', 'terminal'], async (args, ctx) => {
-    // The biggest /term — 23 subcommands across 6 host-local subsystems
-    // (sessionRegistry · terminalMatrix · vwRegistry · broadcastBus ·
-    // channelBus + session-picker modal lifecycle). Static-imported in
-    // this module: getShellRegistry · renderHandleStatusChip ·
-    // resolveTerminalMoveDestination · loadPersistedSessions ·
-    // dispatchTerminalModalObserve. Behavior preserved verbatim from
-    // the inline case.
-    const sub = (args[0] ?? '').toLowerCase();
-    const slashRuntime = ctx.termSlash.slashRuntime;
-    const sessionRegistry = ctx.termSlash.sessionRegistry;
-    const terminalMatrix = ctx.termSlash.terminalMatrix;
-    const vwRegistry = ctx.termSlash.vwRegistry;
-    const broadcastBus = ctx.termSlash.broadcastBus;
-    const channelBus = ctx.termSlash.channelBus;
-
-    if (!sub || sub === 'help') {
-      for (const line of slashRuntime.helpLines()) ctx.chatLines.push(line);
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'new') {
-      ctx.termSlash.openNewTerminal(args.slice(1).join(' ').trim() || undefined);
-      return;
-    }
-    if (sub === 'list') {
-      const alive = sessionRegistry.list();
-      if (alive.length === 0) {
-        ctx.chatLines.push(slashRuntime.terminalSessionsEmptyLine());
-      } else {
-        for (const s of alive) {
-          const chip = renderHandleStatusChip(s.state);
-          ctx.chatLines.push(slashRuntime.terminalSessionLine({
-            idSuffix: s.id.slice(-8),
-            title: s.title,
-            chip,
-            agentBrand: s.agentBrand ?? null,
-            attentionLevel: s.attentionLevel,
-            attentionLabel: s.attentionLevel > 0 ? ctx.warning(` attn:${s.attentionLevel}`) : '',
-          }));
-        }
-      }
-      // SP-F · mirror shell-runner handles in the same list so users
-      // don't have to remember that there are two distinct registries.
-      try {
-        const shellReg = getShellRegistry();
-        const handles = shellReg.list();
-        if (handles.length > 0) {
-          ctx.chatLines.push(slashRuntime.shellRunnerSectionDividerLine());
-          for (const h of handles) {
-            const chip = renderHandleStatusChip(h.status);
-            ctx.chatLines.push(slashRuntime.shellHandleLine({
-              idSuffix: h.id.slice(-8),
-              chip,
-              mode: h.mode,
-              label: shellReg.getVwLabel(h.id),
-            }));
-          }
-          ctx.chatLines.push(slashRuntime.shellRunnerFooterLine());
-        }
-      } catch { /* shell-runner not booted */ }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'detach') {
-      const fg = sessionRegistry.foreground();
-      if (!fg) {
-        ctx.chatLines.push(slashRuntime.detachEmptyLine());
-      } else {
-        sessionRegistry.detach(fg.id);
-        terminalModalRouter.set(null);
-        ctx.chatLines.push(slashRuntime.detachedLine(fg.title));
-        ctx.draw();
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'attach') {
-      const target = (args[1] ?? '').trim();
-      if (!target) {
-        ctx.chatLines.push(slashRuntime.attachUsageLine());
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const candidates = sessionRegistry.list().filter(s => s.id.endsWith(target) || s.id === target);
-      if (candidates.length === 0) {
-        ctx.chatLines.push(slashRuntime.attachMissingLine(target));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const match = candidates[0]!;
-      const { cols: tc, rows: tr } = termSize();
-      const session = sessionRegistry.attach(match.id, { termCols: tc, termRows: tr });
-      if (session?.modal) ctx.termSlash.openSession(session);
-      return;
-    }
-    if (sub === 'switch') {
-      ctx.termSlash.openSessionPicker();
-      return;
-    }
-    if (sub === 'kill') {
-      const target = (args[1] ?? '').trim();
-      const fg = sessionRegistry.foreground();
-      const victim = target
-        ? sessionRegistry.list().find(s => s.id.endsWith(target) || s.id === target)
-        : fg;
-      if (!victim) {
-        ctx.chatLines.push(slashRuntime.killEmptyLine());
-      } else {
-        sessionRegistry.kill(victim.id);
-        if (terminalModalRouter.current()?.id === victim.id) terminalModalRouter.set(null);
-        ctx.chatLines.push(slashRuntime.killedLine(victim.title));
-        ctx.draw();
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    // /term spawn was removed (NT-C3) and /term snapshot is wired
-    // separately via dispatchTerminalModalObserve below.
-    if (sub === 'snapshot') {
-      // Wires to dispatchTerminalModalObserve (the same capture path
-      // used by the LLM-side TerminalModalObserve tool).
-      // Usage: /term snapshot <id> [tail [bytes]]
-      const target = (args[1] ?? '').trim();
-      if (!target) {
-        ctx.chatLines.push(slashRuntime.snapshotUsageLine());
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const list = sessionRegistry.list();
-      const match = list.find(s => s.id === target) ?? list.find(s => s.id.endsWith(target));
-      if (!match) {
-        ctx.chatLines.push(slashRuntime.snapshotUnknownIdLine(target));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const tailMode = (args[2] ?? '').toLowerCase() === 'tail';
-      const maxBytes = tailMode && args[3]
-        ? Math.max(256, Math.min(64_000, Number(args[3]) || 8_000))
-        : 8_000;
-      try {
-        // dispatchTerminalModalObserve's typed signature expects
-        // TerminalSessionRegistry · we cast the structural ctx shape
-        // since the registry surface is identical (the dispatcher
-        // only calls .get() + reads .preview/.id/.state/.title).
-        const r = await dispatchTerminalModalObserve(
-          {
-            id: match.id,
-            mode: tailMode ? 'tail' : 'snapshot',
-            ...(tailMode ? { max_bytes: maxBytes } : {}),
-          },
-          { registry: sessionRegistry as unknown as Parameters<typeof dispatchTerminalModalObserve>[1] extends { registry?: infer R } | undefined ? R : never },
-        );
-        ctx.chatLines.push(slashRuntime.snapshotHeaderLine(
-          match.id,
-          match.state,
-          match.title,
-          tailMode ? 'tail' : 'snapshot',
-        ));
-        for (const line of r.output.split('\n')) ctx.chatLines.push('  ' + line);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ctx.chatLines.push(ctx.error(`  snapshot failed: ${msg}`));
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'move') {
-      const target = (args[1] ?? '').trim();
-      const destRaw = (args[2] ?? '').trim().toLowerCase();
-      if (!target || !destRaw) {
-        ctx.chatLines.push(slashRuntime.moveUsageLine());
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const inst = target.startsWith('term:')
-        ? terminalMatrix.get(target)
-        : terminalMatrix.list({ includeExited: true })
-            .find(i => i.id.endsWith(`:${target}`)
-              || i.legacySessionId === target
-              || (i.legacySessionId ?? '').endsWith(target));
-      if (!inst) {
-        ctx.chatLines.push(slashRuntime.moveMissingLine(target));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const currentVw = vwRegistry.current();
-      const dest = resolveTerminalMoveDestination(destRaw, {
-        currentVwWindowId: currentVw ? String(currentVw.id) : null,
-        vwSlotId: ctx.termSlash.nextTerminalVwSlotId(inst.id),
-        modalId: inst.id,
-      });
-      if (!dest) {
-        if (destRaw === 'vw' || destRaw === 'window') {
-          ctx.chatLines.push(slashRuntime.moveMissingWindowTargetLine());
-        } else {
-          ctx.chatLines.push(slashRuntime.moveUnknownPlacementLine(destRaw));
-        }
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      try {
-        terminalMatrix.move(inst.id, dest);
-        // Keep modal router + openSession plumbing in sync with
-        // whichever way we moved.
-        if ((dest.kind === 'background' || dest.kind === 'preview' || dest.kind === 'vw')
-            && terminalModalRouter.current()?.id === inst.legacySessionId) {
-          terminalModalRouter.set(null);
-        }
-        if (dest.kind === 'modal' && inst.legacySessionId) {
-          const session = sessionRegistry.get(inst.legacySessionId);
-          if (session) ctx.termSlash.openSession(session);
-        }
-        if (dest.kind === 'preview') {
-          ctx.termSlash.setWorkingFocusPreview();
-        }
-        const destLabel = dest.kind === 'vw'
-          ? `vw:${(dest as { kind: 'vw'; windowId: string | number }).windowId}`
-          : dest.kind;
-        ctx.chatLines.push(slashRuntime.movedLine(inst.id, destLabel));
-        ctx.draw();
-      } catch (err) {
-        ctx.chatLines.push(slashRuntime.moveFailedLine(
-          err instanceof Error ? err.message : String(err),
-        ));
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'group') {
-      const op = (args[1] ?? '').toLowerCase();
-      const resolveInst = (needle: string) =>
-        terminalMatrix.get(needle)
-        ?? terminalMatrix.list({ includeExited: true })
-          .find(i => i.id.endsWith(`:${needle}`)
-            || i.legacySessionId === needle
-            || (i.legacySessionId ?? '').endsWith(needle));
-      if (!op || op === 'list') {
-        const groups = broadcastBus.groups();
-        if (groups.length === 0) {
-          ctx.chatLines.push(slashRuntime.groupsEmptyLine());
-        } else {
-          for (const g of groups) {
-            const members = broadcastBus.members(g);
-            ctx.chatLines.push(slashRuntime.groupHeaderLine(g, members.length));
-            for (const m of members) {
-              ctx.chatLines.push(slashRuntime.groupMemberLine(m.id, m.title, m.readOnly));
-            }
-          }
-        }
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      if (op === 'join' || op === 'leave') {
-        const targetRaw = (args[2] ?? '').trim();
-        const group = (args[3] ?? '').trim();
-        if (!targetRaw || !group) {
-          ctx.chatLines.push(slashRuntime.groupUsageLine(op));
-          ctx.setChatScrollOffset(-1);
-          return;
-        }
-        const inst = resolveInst(targetRaw);
-        if (!inst) {
-          ctx.chatLines.push(ctx.warning(`  No terminal matched "${targetRaw}".`));
-          ctx.setChatScrollOffset(-1);
-          return;
-        }
-        if (op === 'join') terminalMatrix.joinGroup(inst.id, group);
-        else terminalMatrix.leaveGroup(inst.id, group);
-        ctx.chatLines.push(slashRuntime.groupResultLine(inst.id, op, group));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      if (op === 'send') {
-        const group = (args[2] ?? '').trim();
-        const text = args.slice(3).join(' ');
-        if (!group || !text) {
-          ctx.chatLines.push(slashRuntime.groupSendUsageLine());
-          ctx.setChatScrollOffset(-1);
-          return;
-        }
-        const r = broadcastBus.broadcastBytes(group, text);
-        ctx.chatLines.push(slashRuntime.groupSendResultLine(
-          group,
-          r.delivered.length,
-          r.skippedExited.length + r.skippedReadOnly.length,
-          r.errored.length,
-        ));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      ctx.chatLines.push(slashRuntime.unknownGroupOpLine(op));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'channel') {
-      const op = (args[1] ?? '').toLowerCase();
-      if (!op || op === 'list') {
-        const chans = channelBus.channels();
-        if (chans.length === 0) {
-          ctx.chatLines.push(slashRuntime.channelEmptyLine());
-        } else {
-          ctx.chatLines.push(slashRuntime.channelHeaderLine());
-          for (const c of chans) {
-            const s = channelBus.statsFor(c);
-            const last = s.lastPublishAt
-              ? new Date(s.lastPublishAt).toISOString().slice(11, 19)
-              : '-';
-            ctx.chatLines.push(
-              slashRuntime.channelListLine(c, s.subscriberCount, s.publishedCount, last),
-            );
-          }
-        }
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      if (op === 'pub') {
-        const channel = (args[2] ?? '').trim();
-        const text = args.slice(3).join(' ');
-        if (!channel || !text) {
-          ctx.chatLines.push(slashRuntime.channelPubUsageLine());
-          ctx.setChatScrollOffset(-1);
-          return;
-        }
-        const n = channelBus.publish(channel, { from: 'slash', payload: text });
-        ctx.chatLines.push(slashRuntime.channelPubResultLine(channel, n));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      if (op === 'snapshot' || op === 'snap') {
-        const ch = (args[2] ?? '').trim();
-        const limitArg = Number(args[3] ?? 10);
-        if (!ch) {
-          ctx.chatLines.push(slashRuntime.channelSnapshotUsageLine());
-          ctx.setChatScrollOffset(-1);
-          return;
-        }
-        const limit = Number.isFinite(limitArg) && limitArg > 0 ? limitArg : 10;
-        const snap = channelBus.snapshot(ch, limit);
-        if (snap.length === 0) {
-          ctx.chatLines.push(slashRuntime.channelSnapshotEmptyLine(ch));
-        } else {
-          ctx.chatLines.push(slashRuntime.channelSnapshotHeaderLine(ch, snap.length));
-          for (const m of snap) {
-            const p = typeof m.payload === 'string' ? m.payload : m.payload.toString('utf8');
-            const preview = p.length > 80 ? p.slice(0, 77) + '…' : p;
-            ctx.chatLines.push(
-              slashRuntime.channelSnapshotEntryLine(m.from, preview.replace(/\n/g, '⏎')),
-            );
-          }
-        }
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      if (op === 'tail') {
-        const targetRaw = (args[2] ?? '').trim();
-        const channel = (args[3] ?? '').trim();
-        if (!targetRaw || !channel) {
-          ctx.chatLines.push(slashRuntime.channelTailUsageLine());
-          ctx.setChatScrollOffset(-1);
-          return;
-        }
-        const inst = terminalMatrix.get(targetRaw)
-          ?? terminalMatrix.list({ includeExited: true })
-            .find(i => i.id.endsWith(`:${targetRaw}`));
-        if (!inst) {
-          ctx.chatLines.push(ctx.warning(`  No terminal matched "${targetRaw}".`));
-          ctx.setChatScrollOffset(-1);
-          return;
-        }
-        // Subscribe inst's PTY stdin to the channel. Simple injection:
-        // each message's payload is written as-is + newline. Future
-        // T5b adds a formatter hook. U3 — pass --replay to also inject
-        // backlog messages.
-        const replay = args.includes('--replay');
-        const subscription = channelBus.subscribe(channel, (msg) => {
-          if (inst.exitCode !== null) return;
-          const payload = typeof msg.payload === 'string'
-            ? msg.payload
-            : msg.payload.toString('utf8');
-          try { inst.pty.write(payload + (payload.endsWith('\n') ? '' : '\n')); }
-          catch { /* ignore — surface issues end the tail */ }
-        }, { label: `tail→${inst.id}`, replay });
-        ctx.chatLines.push(
-          slashRuntime.channelTailResultLine(subscription.id, channel, inst.id, replay),
-        );
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      ctx.chatLines.push(slashRuntime.unknownChannelOpLine(op));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'pipe') {
-      const targetRaw = (args[1] ?? '').trim();
-      const channel = (args[2] ?? '').trim();
-      const lineMode = args.includes('--line');
-      if (!targetRaw || !channel) {
-        ctx.chatLines.push(slashRuntime.pipeUsageLine());
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const inst = terminalMatrix.get(targetRaw)
-        ?? terminalMatrix.list({ includeExited: true })
-          .find(i => i.id.endsWith(`:${targetRaw}`));
-      if (!inst) {
-        ctx.chatLines.push(ctx.warning(`  No terminal matched "${targetRaw}".`));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      try {
-        const h = terminalMatrix.pipeToChannel(inst.id, channel, { lineMode });
-        ctx.chatLines.push(slashRuntime.pipeResultLine(h.id, inst.id, channel, lineMode));
-      } catch (err) {
-        ctx.chatLines.push(slashRuntime.pipeFailedLine(
-          err instanceof Error ? err.message : String(err),
-        ));
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'unpipe') {
-      const idArg = (args[1] ?? '').trim();
-      const pipeNum = Number(idArg);
-      if (!Number.isFinite(pipeNum)) {
-        ctx.chatLines.push(slashRuntime.unpipeUsageLine());
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const p = terminalMatrix.listPipes().find(x => x.id === pipeNum);
-      if (!p) {
-        ctx.chatLines.push(slashRuntime.activePipeMissingLine(pipeNum));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      p.unsubscribe();
-      ctx.chatLines.push(slashRuntime.unpipeResultLine(pipeNum, p.terminalId, p.channel));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'pipes') {
-      const all = terminalMatrix.listPipes();
-      if (all.length === 0) {
-        ctx.chatLines.push(slashRuntime.pipesEmptyLine());
-      } else {
-        ctx.chatLines.push(slashRuntime.pipesHeaderLine());
-        for (const p of all) {
-          ctx.chatLines.push(slashRuntime.pipesEntryLine(p.id, p.terminalId, p.channel, p.lineMode));
-        }
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'readonly') {
-      const targetRaw = (args[1] ?? '').trim();
-      const stateArg = (args[2] ?? '').trim().toLowerCase();
-      if (!targetRaw) {
-        ctx.chatLines.push(slashRuntime.readonlyUsageLine());
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const inst = terminalMatrix.get(targetRaw)
-        ?? terminalMatrix.list({ includeExited: true })
-          .find(i => i.id.endsWith(`:${targetRaw}`));
-      if (!inst) {
-        ctx.chatLines.push(slashRuntime.terminalMissingLine(targetRaw));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const next = stateArg === 'on' ? true
-        : stateArg === 'off' ? false
-        : !inst.readOnly;
-      terminalMatrix.setReadOnly(inst.id, next);
-      ctx.chatLines.push(slashRuntime.readonlyResultLine(inst.id, next));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'vw-bar' || sub === 'vwbar') {
-      const winArg = (args[1] ?? '').trim();
-      const stateArg = (args[2] ?? '').trim().toLowerCase();
-      const w = winArg
-        ? vwRegistry.get(Number(winArg))
-        : vwRegistry.current();
-      if (!w) {
-        ctx.chatLines.push(slashRuntime.vwBarMissingLine(winArg || '(current)'));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const next = stateArg === 'on' ? true
-        : stateArg === 'off' ? false
-        : !w.isSyncInputBarActive();
-      w.setSyncInputBar(next);
-      ctx.chatLines.push(slashRuntime.vwBarResultLine(w.id, next));
-      ctx.setChatScrollOffset(-1);
-      ctx.draw();
-      return;
-    }
-    if (sub === 'vw-sync' || sub === 'vwsync') {
-      const winArg = (args[1] ?? '').trim();
-      const text = args.slice(2).join(' ');
-      if (!winArg || !text) {
-        ctx.chatLines.push(slashRuntime.vwSyncUsageLine());
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const group = `_vw:${winArg}`;
-      const r = broadcastBus.broadcastBytes(group, text);
-      ctx.chatLines.push(slashRuntime.vwSyncResultLine(
-        group,
-        r.delivered.length,
-        r.skippedExited.length + r.skippedReadOnly.length,
-        r.errored.length,
-      ));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'recharacter') {
-      const targetRaw = (args[1] ?? '').trim();
-      const charRaw = (args[2] ?? '').trim();
-      if (!targetRaw || !charRaw) {
-        ctx.chatLines.push(slashRuntime.recharacterUsageLine());
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const inst = terminalMatrix.get(targetRaw)
-        ?? terminalMatrix.list({ includeExited: true })
-          .find(i => i.id.endsWith(`:${targetRaw}`));
-      if (!inst) {
-        ctx.chatLines.push(slashRuntime.terminalMissingLine(targetRaw));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      let character: { kind: 'shell' | 'claude-code' | 'codex' | 'custom'; name?: string };
-      if (charRaw === 'shell') character = { kind: 'shell' };
-      else if (charRaw === 'claude' || charRaw === 'claude-code') character = { kind: 'claude-code' };
-      else if (charRaw === 'codex') character = { kind: 'codex' };
-      else if (charRaw.startsWith('custom:')) character = { kind: 'custom', name: charRaw.slice(7) };
-      else {
-        ctx.chatLines.push(slashRuntime.unknownCharacterLine(charRaw));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const r = terminalMatrix.recharacterAndReexec(inst.id, character);
-      ctx.chatLines.push(slashRuntime.recharacterResultLine(inst.id, character.kind, r.reexeced));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'matrix') {
-      const all = terminalMatrix.list({ includeExited: true });
-      if (all.length === 0) {
-        ctx.chatLines.push(slashRuntime.matrixEmptyLine());
-      } else {
-        ctx.chatLines.push(ctx.accent('  term:ID    character    transport   placement         groups     title'));
-        for (const i of all) {
-          const char = i.character.kind.padEnd(12);
-          const tp = i.transport.kind.padEnd(10);
-          const place = (i.placement.kind === 'vw'
-            ? `vw:${i.placement.windowId}/${i.placement.slotId}`
-            : i.placement.kind).padEnd(18);
-          const groups = i.broadcastGroups.size
-            ? `[${[...i.broadcastGroups].join(',')}]`
-            : '-';
-          const dead = i.exitCode !== null ? ctx.error(' exited') : '';
-          ctx.chatLines.push(`  ${i.id.padEnd(10)} ${char} ${tp} ${place} ${groups.padEnd(10)} ${i.title}${dead}`);
-        }
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'resume') {
-      // P16 — list persisted sessions from prior runs and re-spawn on
-      // selection. Metadata-only: we can't revive the original PTY
-      // buffer, but the command is stored so "my claude-code from
-      // yesterday" can come back in one slash.
-      const persisted = loadPersistedSessions();
-      if (persisted.length === 0) {
-        ctx.chatLines.push(slashRuntime.noPersistedSessionsLine());
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const target = (args[1] ?? '').trim();
-      if (!target) {
-        for (const line of slashRuntime.resumeHelpLines(
-          persisted.map((entry) => ({
-            id: entry.id,
-            title: entry.title,
-            command: entry.command,
-            kind: entry.kind,
-          })),
-        )) ctx.chatLines.push(line);
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const match = persisted.find(p => p.id.endsWith(target) || p.id === target);
-      if (!match) {
-        ctx.chatLines.push(slashRuntime.persistedSessionMissingLine(target));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      try {
-        const { cols: tc, rows: tr } = termSize();
-        const session = sessionRegistry.spawn(
-          {
-            title: match.title,
-            cwd: match.cwd,
-            command: match.command,
-            termName: match.termName ?? 'xterm-ghostty',
-            kind: match.kind,
-            agentBrand: match.agentBrand,
-          },
-          { termCols: tc, termRows: tr },
-        );
-        ctx.termSlash.openSession(session);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ctx.chatLines.push(ctx.error(`  Resume failed: ${msg}`));
-        ctx.setChatScrollOffset(-1);
-      }
-      return;
-    }
-    ctx.chatLines.push(slashRuntime.unknownSubcommandLine(sub));
-    ctx.setChatScrollOffset(-1);
-  });
+  registerTermSlash(registry);
 
   // ── B-3.c.1 ───────────────────────────────────────────────────────
 
@@ -4035,6 +2959,14 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
       try {
         recordSeatSessionEnd(seSub === 'new' ? 'session-new' : 'session-clear');
       } catch { /* 기록이 새 대화를 막지 않는다 */ }
+      // TUI-LOOP-COMMAND — 세션이 끝나면 이 세션의 /loop 도 같이 멈춘다
+      // (칸 경계: stop on /loop stop or session end · /session 의 나머지
+      // 동작은 그대로다).
+      const endedLoop = ctx.loopCommand?.schedulerRef.current;
+      if (endedLoop?.isRunning()) {
+        endedLoop.stop();
+        ctx.loopCommand!.schedulerRef.current = null;
+      }
       if (seSub === 'new') {
         try {
           const { suggestProjectForFolder } = await import('../../project/project-store.js');
@@ -4062,10 +2994,23 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
         : `  ✓ cleared history`));
       // 🪪 L1 — 새 대화 = 새 자리 부트 카드.
       //   ⛔ 정적 import · 동기 호출 — history 를 비운 «같은 틱»에 카드 캐시를 비운다(비동기 대기 틈에 새 턴이 옛 카드를 읽지 않게).
+      //   ⛔ 아래 ACP renew(await) «앞»에 둔다 — 그 대기 틈도 같은 틈이다(HARD #2 회귀 · #28520).
       try {
         startSeatBootConversation({ reason: seSub === 'new' ? 'session-new' : 'session-clear' });
         markSeatConversationStarted();
       } catch { /* 부트 카드가 새 대화를 막지 않는다 */ }
+      // TUI-H8 ② — 백엔드(ACP) 세션도 새로(종전엔 sessionId 가 그대로라 서버 쪽 세션 상태가 이어졌다 · #69).
+      if (seSub === 'new' && ctx.sessionSlash.acpRenew) {
+        try {
+          const renewed = await ctx.sessionSlash.acpRenew(getSessionCwd());
+          ctx.chatLines.push(ctx.muted(`    new backend session: ${renewed}`));
+          observeSessionStart({ surface: 'tui', origin: 'new', reason: 'session-new', sessionId: renewed });
+        } catch (error) {
+          // 실패해도 TUI 기록은 이미 비웠다 — 다음 턴은 옛 백엔드 세션으로 간다는 것을 보이고 남긴다.
+          ctx.chatLines.push(ctx.warning(`  ⚠ backend session renew failed: ${error instanceof Error ? error.message : String(error)}`));
+          try { debug.log('session', 'renew-failed', { surface: 'tui', error: String(error) }); } catch { /* best-effort */ }
+        }
+      }
       ctx.setChatScrollOffset(-1);
       return;
     }

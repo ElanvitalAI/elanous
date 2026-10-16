@@ -16,6 +16,7 @@
 // check can drive `buildTurnMessages` with mutating inputs.
 
 import { describe, expect, test, mock, spyOn, beforeEach, afterEach } from 'bun:test';
+import * as seatBoot from '../src/dashboard/seat-boot-preamble.js';
 
 import type { ChatMessage } from '../src/chat/index.js';
 import { resumeInProcessDashboardSession } from '../src/dashboard/index.js';
@@ -337,6 +338,22 @@ describe('bootDashboardAcpSession — getter injection (fresh reads)', () => {
     model = 'claude-opus-4-7';
     expect(opts.resolveModel!({ sessionId: 's', userText: 'plan it' })).toBe('claude-opus-4-7');
     expect(seen).toEqual(['build it', 'review it', 'plan it']);
+  });
+
+  // TUI-H1-SEAT-GOALLOOP — acp-boot hands the bridge a seat resolver over the live cwd (detectSeatTui).
+  test('resolveSeat asks detectSeatTui with the fresh cwd and returns its seat or null', async () => {
+    const seen: string[] = [];
+    spyOn(seatBoot, 'detectSeatTui').mockImplementation((cwd: string) => {
+      seen.push(cwd);
+      return cwd.includes('/seats/ZTSEAT') ? { seat: 'ZTSEAT', source: 'cwd' } : null;
+    });
+    let cwd = '/h/elanous-hq/seats/ZTSEAT';
+    await bootDashboardAcpSession(makeMinimalDeps({ getCwd: () => cwd }));
+    const opts = createCalls[0]!.opts;
+    expect(opts.resolveSeat!()).toBe('ZTSEAT');
+    cwd = '/tmp/not-a-seat';
+    expect(opts.resolveSeat!()).toBeNull();
+    expect(seen).toEqual(['/h/elanous-hq/seats/ZTSEAT', '/tmp/not-a-seat']);
   });
 
   test('onTurnComplete forwards new messages to pushTurnToolHistory', async () => {

@@ -36,3 +36,14 @@ test('unmeasured, absent and thrown lease reads are unknown; concurrent requests
   expect((await createLeaseHolderView({ machine: 'mbp', read: () => ({ kind: 'absent' }) }).get()).known).toBe(false);
   expect((await createLeaseHolderView({ machine: 'mbp', read: () => { throw new Error('offline'); } }).get()).known).toBe(false);
 });
+
+test('fresh primary read bypasses the cached holder before a worker lease mutation', async () => {
+  let current = lease('mbp', 1);
+  let reads = 0;
+  const view = createLeaseHolderView({ machine: 'mbp', ttlMs: 10_000, read: () => { reads++; return current; } });
+  expect((await view.get()).iAmHolder).toBe(true);
+  current = lease('node-b', 2);
+  expect((await view.get()).iAmHolder).toBe(true);
+  expect(await view.get({ fresh: true })).toEqual({ holder: 'node-b', generation: 2, iAmHolder: false, known: true });
+  expect(reads).toBe(2);
+});

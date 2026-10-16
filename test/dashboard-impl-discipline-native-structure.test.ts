@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { promptForPhase } from '../src/impl-discipline/index.js';
 import { buildDashboardTurnPreamble } from '../src/dashboard/turn-preamble.js';
 import { getUserConfig } from '../src/user-config.js';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
 function userConfig(nativeStructureEnabled: boolean): Parameters<typeof buildDashboardTurnPreamble>[0]['userConfig'] {
   // Reuse the normalized repository default rather than enumerate UserConfig fields.
@@ -39,7 +39,7 @@ function implementationDisciplineContent(preamble: ReturnType<typeof buildDashbo
 
 describe('dashboard turn-preamble implementation-discipline wiring', () => {
   test('index buildTurnPreamble callback passes runtime config and active tool names to the production builder', () => {
-    const source = readFileSync(new URL('../src/dashboard/index.ts', import.meta.url), 'utf8');
+    const source = tuiSourceText();
     const callbackStart = source.indexOf('buildTurnPreamble: (args) => {');
     const callbackEnd = source.indexOf('\n            runAutoCompact:', callbackStart);
     expect(callbackStart).toBeGreaterThanOrEqual(0);

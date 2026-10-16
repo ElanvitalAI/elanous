@@ -106,7 +106,9 @@ test('GET /v1/projects/:id/autopsy requires owner authentication', async () => {
 });
 
 test('authenticated POST persists a project and GET lists it from the project store', async () => {
-  const folder = join(root, 'source');
+  const allowed = join(realpathSync(root), 'allowed');
+  const folder = join(allowed, 'source');
+  mkdirSync(folder, { recursive: true });
   const created = await request('POST', { name: 'A', primaryFolder: folder });
   expect(created.status).toBe(201);
   const { project } = await created.json() as { project: { id: string; name: string; primaryFolder: string; createdAt: string } };
@@ -122,6 +124,20 @@ test('authenticated POST persists a project and GET lists it from the project st
   expect((await max.json() as { project: { name: string; primaryFolder?: string } }).project)
     .toEqual(expect.objectContaining({ name: 'N'.repeat(80) }));
   expect(listProjects()).toHaveLength(2);
+});
+
+test('POST rejects a primaryFolder outside the allowed roots with 403 outside_allowed_roots', async () => {
+  const allowed = join(realpathSync(root), 'allowed');
+  mkdirSync(allowed, { recursive: true });
+  const outside = join(realpathSync(root), 'outside');
+  mkdirSync(outside, { recursive: true });
+  symlinkSync(outside, join(allowed, 'escape'));
+  for (const escape of [outside, join(allowed, 'escape')]) {
+    const refused = await request('POST', { name: 'Escape', primaryFolder: escape });
+    expect(refused.status).toBe(403);
+    expect(await refused.json()).toEqual({ error: 'outside_allowed_roots' });
+  }
+  expect(listProjects()).toEqual([]);
 });
 
 test('POST rejects missing, blank, oversized, and non-string names before writing', async () => {
@@ -141,4 +157,21 @@ test('POST rejects invalid JSON and non-absolute primaryFolder before writing', 
   expect(relative.status).toBe(400);
   expect(await relative.json()).toEqual({ error: 'invalid_primary_folder' });
   expect(listProjects()).toEqual([]);
+});
+
+test('POST rejects a primaryFolder outside projectFolderRoots with 403 and still accepts an inside-root folder', async () => {
+  const allowed = join(realpathSync(root), 'allowed');
+  const inside = join(allowed, 'source');
+  const outside = join(realpathSync(root), 'outside');
+  mkdirSync(inside, { recursive: true });
+  mkdirSync(outside, { recursive: true });
+  const refused = await request('POST', { name: 'Outside', primaryFolder: outside });
+  expect(refused.status).toBe(403);
+  expect(await refused.json()).toEqual({ error: 'outside_allowed_roots' });
+  expect(listProjects()).toEqual([]);
+  const created = await request('POST', { name: 'Inside', primaryFolder: inside });
+  expect(created.status).toBe(201);
+  const { project } = await created.json() as { project: { name: string; primaryFolder: string } };
+  expect(project).toMatchObject({ name: 'Inside', primaryFolder: inside });
+  expect(listProjects()).toEqual([expect.objectContaining({ name: 'Inside', primaryFolder: inside })]);
 });

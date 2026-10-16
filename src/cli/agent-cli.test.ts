@@ -194,8 +194,12 @@ describe('agent CLI chat-turn errors', () => {
     for (const key of [
       'XAI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY',
       'OPENROUTER_API_KEY', 'LOCAL_LLM_URL', 'CODEX_HOME', 'ELANOUS_HARNESS_SPACE',
-      'ELANOUS_HARNESS_SPACE_ID',
+      'ELANOUS_HARNESS_SPACE_ID', 'ELANOUS_KEY_CACHE_DIR',
     ]) delete withoutCredentials[key];
+    // R4 (gate 0.2.30 pod-31): the gate baseline exports ELANOUS_TEST_FAKE_LLM=1 (scripts/lib/gate-test-env.ts), and the
+    // fake provider is a real provider to resolveDefaultProvider — the «no provider» branch then never runs (exit 0).
+    // '0' is the explicit opt-out the baseline preserves; this test is about the machine with nothing configured.
+    withoutCredentials.ELANOUS_TEST_FAKE_LLM = '0';
     expect(withoutCredentials.XDG_CONFIG_HOME).toBeUndefined();
     try {
       const result = spawnSync(process.execPath, ['bin/elanous.mjs', `--test=${configDir}`, 'chat', '--new', '--json', 'hello'], {

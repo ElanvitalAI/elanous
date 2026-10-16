@@ -8,6 +8,7 @@ import {
   buildSeatBootSystemMessages,
   describeSeatBoot,
   detectSeat,
+  detectSeatTui,
   resetSeatBootCacheForTest,
   startSeatBootConversation,
 } from '../src/dashboard/seat-boot-preamble.js';
@@ -15,6 +16,7 @@ import { buildDashboardTurnPreamble } from '../src/dashboard/turn-preamble.js';
 import { MsgStore } from '../src/msg/msg-store.js';
 import { debug } from '../src/debug/log.js';
 import type { getUserConfig } from '../src/user-config.js';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
 // llm 블록 없는 부분 config — provider 해석을 안 타게(빈 HOME 게이트에서 NoLlmProvider 로 죽었다).
 const fakeConfig = { chat: { conciseness: 'balanced' } } as unknown as ReturnType<typeof getUserConfig>;
@@ -47,6 +49,37 @@ describe('detectSeat — cwd /seats/<자리> → COORD_ID', () => {
   });
   test('둘 다 없으면 null', () => {
     expect(detectSeat('/h/work/x', {})).toBeNull();
+  });
+});
+
+describe('detectSeatTui — 자리 판정 ⊕ seat-state 실재 (TUI-H1-SEAT-GOALLOOP)', () => {
+  test('seat-state/<자리> 가 있으면 자리, 없으면 null(사람 대화 TUI)', () => {
+    const home = mkdtempSync(join(tmpdir(), 'seat-tui-'));
+    try {
+      mkdirSync(join(home, 'elanous-hq', 'seat-state', 'OPT'), { recursive: true });
+      expect(detectSeatTui('/h/elanous-hq/seats/OPT', { home, env: {} })).toEqual({ seat: 'OPT', source: 'cwd' });
+      expect(detectSeatTui('/h/elanous-hq/seats/NOPE', { home, env: {} })).toBeNull();
+      expect(detectSeatTui('/h/work/x', { home, env: {} })).toBeNull();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+  test('ENOTDIR 는 «자리 아님», 권한 오류 같은 조회 실패는 던진다 (review r2)', () => {
+    const home = mkdtempSync(join(tmpdir(), 'seat-tui-err-'));
+    const hq = join(home, 'elanous-hq');
+    try {
+      mkdirSync(hq, { recursive: true });
+      writeFileSync(join(hq, 'seat-state'), 'not a dir');
+      expect(detectSeatTui('/h/elanous-hq/seats/OPT', { home, env: {} })).toBeNull();
+      rmSync(join(hq, 'seat-state'));
+      // 권한 오류는 stat 주입으로 만든다 — root 에서도 같은 단언이 선다(review r3).
+      const eacces = () => { throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }); };
+      expect(() => detectSeatTui('/h/elanous-hq/seats/OPT', { home, env: {}, stat: eacces })).toThrow('EACCES');
+      const enoent = () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); };
+      expect(detectSeatTui('/h/elanous-hq/seats/OPT', { home, env: {}, stat: enoent })).toBeNull();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 
@@ -162,7 +195,7 @@ describe('배선 — 대시보드 호출부', () => {
     expect(handlers).toContain("import { startSeatBootConversation } from '../seat-boot-preamble.js';");
     const afterClear = branch.slice(branch.indexOf('chatHistory.length = 0'));
     expect(afterClear.slice(0, afterClear.indexOf('startSeatBootConversation(')).includes('await ')).toBe(false);
-    const index = readFileSync(join(import.meta.dir, '../src/dashboard/index.ts'), 'utf8');
+    const index = tuiSourceText();
     expect(index.match(/seatBoot: true,/g)?.length).toBe(2);
     expect(index).toContain("startSeatBootConversation({ reason: 'boot' })");
   });

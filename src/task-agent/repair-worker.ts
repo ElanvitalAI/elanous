@@ -4,6 +4,7 @@ import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { RepairCommitResult } from './repair-branch-cas.js';
 import type { TaskChildLlm } from './task-hand.js';
+import { publishInsideEvent } from '../nexus/api/inside-events.js';
 
 const SHA40 = /^[0-9a-f]{40}$/i;
 const SHA256 = /^[0-9a-f]{64}$/i;
@@ -70,6 +71,12 @@ export async function runRepairWorker(request: RepairWorkerRequest): Promise<Rep
   const tmp = `${request.resultPath}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(result));
   renameSync(tmp, request.resultPath);
+  // The result file, rather than this best-effort notification, is the durable source.
+  try {
+    publishInsideEvent({ kind: 'ta.repair.completed', schema: 1, card: request.card,
+      pr: request.pr, head: request.head, runId: request.runId,
+      resultPath: request.resultPath, completedAt: new Date().toISOString() });
+  } catch { /* a missing daemon cannot change the worker result */ }
   return result;
 }
 

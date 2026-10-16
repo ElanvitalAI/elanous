@@ -6,9 +6,83 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
 import { dispatchHarnessOnPod, podOrchestrateArgs } from './harness-pod-dispatch.js';
 import { podMemoryLimitFor } from '../task-orchestrator/surfaces/self-implement-pod.js';
+import { podSourceScript } from '../task-orchestrator/surfaces/pod-source-receive.js';
 import { HARNESS_RUN_ID_ENV } from './harness-space.js';
+import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
+
+function matchDefaultPodSource(root: string): string {
+  const origin = mkdtempSync(join(tmpdir(), 'pod-default-origin-'));
+  execFileSync('git', ['init', '--bare', '-q', origin]);
+  execFileSync('git', ['-C', root, 'config', 'user.name', 'Pod preflight test']);
+  execFileSync('git', ['-C', root, 'config', 'user.email', 'pod-preflight@example.invalid']);
+  execFileSync('git', ['-C', root, 'add', '.']);
+  execFileSync('git', ['-C', root, 'commit', '-qm', 'fixture']);
+  execFileSync('git', ['-C', root, 'remote', 'add', 'origin', origin]);
+  execFileSync('git', ['-C', root, 'push', '-q', '-u', 'origin', 'HEAD:main']);
+  execFileSync('git', ['-C', origin, 'symbolic-ref', 'HEAD', 'refs/heads/main']);
+  return origin;
+}
 
 describe('harness say/ask --substrate pod', () => {
+  test('TA source request and GOAL must carry three completion lines before Pod child spawn', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-ta-boundary-'));
+    const goal = join(root, 'GOAL-ta-boundary.md');
+    const complete = '- 완료 경계 코드: 수정 코드가 있다\n- 완료 경계 실물: CLI 경로에서 확인한다\n- 완료 경계 증거 명령: bun test src/example.test.ts';
+    writeFileSync(goal, `# Goal\n\n## ACCEPTANCE CRITERIA\n\n- 기존 조건\n`);
+    const previous = process.env.ELANOUS_TASK_CARD_ID;
+    process.env.ELANOUS_TASK_CARD_ID = 'ta-pod-boundary';
+    const events: Array<{ event: string; data: unknown }> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((_category, event, data) => { events.push({ event, data }); }) as typeof debug.log);
+    let launches = 0;
+    const run = () => { launches++; return 0; };
+    try {
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: '수정해라', authorOnPod: true }, { run })).toBe(2);
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-ask', input: goal }, { run })).toBe(2);
+      expect(launches).toBe(0);
+      expect(events.filter((row) => row.event === 'goal-done-boundary-rejected')).toEqual([
+        expect.objectContaining({ data: expect.objectContaining({ source: 'request', taskCardId: 'ta-pod-boundary' }) }),
+        expect.objectContaining({ data: expect.objectContaining({ source: 'goal', taskCardId: 'ta-pod-boundary' }) }),
+      ]);
+      const wrapped = '- 완료 경계 코드: **[TBD]**\n- 완료 경계 실물: ~~(추후 결정)~~\n- 완료 경계 증거 명령: bun test src/example.test.ts';
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: wrapped, authorOnPod: true }, { run })).toBe(2);
+      writeFileSync(goal, `# Goal\n\n## ACCEPTANCE CRITERIA\n\n${wrapped}\n`);
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-ask', input: goal }, { run })).toBe(2);
+      expect(launches).toBe(0);
+      expect(events.filter((row) => row.event === 'goal-done-boundary-rejected')).toHaveLength(4);
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: complete, authorOnPod: true }, { run })).toBe(0);
+      writeFileSync(goal, `# Goal\n\n## ACCEPTANCE CRITERIA\n\n${complete}\n`);
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-ask', input: goal }, { run })).toBe(0);
+      expect(launches).toBe(2);
+    } finally {
+      log.mockRestore();
+      if (previous === undefined) delete process.env.ELANOUS_TASK_CARD_ID;
+      else process.env.ELANOUS_TASK_CARD_ID = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('human say without completion lines warns and still dispatches the Pod child', () => {
+    const previous = process.env.ELANOUS_TASK_CARD_ID;
+    delete process.env.ELANOUS_TASK_CARD_ID;
+    let launches = 0;
+    const events: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((_category, event) => { events.push(event); }) as typeof debug.log);
+    const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: '수정해라', authorOnPod: true }, {
+        nowMs: Date.parse('2026-10-16T12:00:00+09:00'), run: () => { launches++; return 0; },
+      })).toBe(0);
+      expect(launches).toBe(1);
+      expect(events).toContain('goal-done-boundary-warned');
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('사람 요청 관측 기간에는 발사를 계속합니다'));
+    } finally {
+      stderr.mockRestore();
+      log.mockRestore();
+      if (previous === undefined) delete process.env.ELANOUS_TASK_CARD_ID;
+      else process.env.ELANOUS_TASK_CARD_ID = previous;
+    }
+  });
+
   test('unspecified document selects lite; implement retains standard and explicit tier wins', () => {
     const previous = process.env.ELANOUS_POD_MEMORY_TIER;
     const previousReason = process.env.ELANOUS_POD_MEMORY_REASON;
@@ -221,6 +295,73 @@ describe('harness say/ask --substrate pod', () => {
       expect(log).toHaveBeenCalledWith('harness.substrate', 'goal-file', { entrance: 'cli-harness-ask', mode: 'path' });
       expect(log).toHaveBeenCalledWith('harness.substrate', 'goal-file', { entrance: 'cli-harness-say', mode: 'temp' });
     } finally { log.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('say leaves occupied new-path validation to the Pod in this partial landing', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-new-path-preflight-'));
+    let origin: string | undefined;
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      mkdirSync(join(root, 'src'));
+      writeFileSync(join(root, 'src', 'existing.ts'), 'export {};');
+      mkdirSync(join(root, 'src', 'taken.ts'));
+      writeFileSync(join(root, 'src', 'taken.ts', 'child.ts'), 'export {};');
+      symlinkSync(join(root, 'src', 'existing.ts'), join(root, 'src', 'link.ts'));
+      origin = matchDefaultPodSource(root);
+      const input = '대상 경로: src/existing.ts\n신설: src/existing.ts';
+      const seen: string[][] = [];
+      const deps = { cwd: root, recordRunLedgerEntry: (_entry: RunLedgerEntry) => {},
+        run: (_command: string, args: readonly string[]) => { seen.push([...args]); return 0; } };
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input, authorOnPod: true }, deps)).toBe(0);
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: '신설: src/taken.ts', authorOnPod: true }, deps)).toBe(0);
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: '신설: src/link.ts', authorOnPod: true }, deps)).toBe(0);
+      expect(seen).toHaveLength(3);
+      expect(seen.every((args) => !args.includes('--pod-source'))).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); if (origin) rmSync(origin, { recursive: true, force: true }); }
+  });
+
+  test('ask checks occupied new paths only in the Original ask and TRACED PATHS intersection', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-new-path-ask-'));
+    let origin: string | undefined;
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      mkdirSync(join(root, 'src'));
+      writeFileSync(join(root, 'src', 'existing.ts'), 'export {};');
+      origin = matchDefaultPodSource(root);
+      const goal = join(root, 'goal.md');
+      const document = (ask: string, path = 'src/existing.ts') => `Original ask (verbatim, unmodified):\n\`\`\`\n${ask}\n\`\`\`\n## TRACED PATHS\n- ${path}\n`;
+      writeFileSync(goal, document('신설: src/existing.ts'));
+      let launches = 0;
+      let launchArgs: string[] = [];
+      const deps = { cwd: root, onOutput: () => {}, recordRunLedgerEntry: () => {}, run: (_command: string, args: readonly string[]) => { launches++; launchArgs = [...args]; return 0; } };
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-ask', input: goal }, deps)).toBe(2);
+      expect(launches).toBe(0);
+      writeFileSync(goal, document('신설: src/fresh.ts', 'src/fresh.ts'));
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-ask', input: goal }, deps)).toBe(0);
+      expect(launches).toBe(1);
+      expect(launchArgs.slice(launchArgs.indexOf('--pod-source'), launchArgs.indexOf('--pod-source') + 2)).toEqual([
+        '--pod-source', `commit:${execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()}`,
+      ]);
+      const verified = launchArgs[launchArgs.indexOf('--pod-source') + 1]!.slice('commit:'.length);
+      const moved = mkdtempSync(join(tmpdir(), 'pod-new-path-moved-origin-'));
+      const podCwd = mkdtempSync(join(tmpdir(), 'pod-new-path-source-resolution-'));
+      try {
+        execFileSync('git', ['clone', '-q', origin, moved]);
+        execFileSync('git', ['-C', moved, 'config', 'user.name', 'Pod source test']);
+        execFileSync('git', ['-C', moved, 'config', 'user.email', 'pod-source@example.invalid']);
+        writeFileSync(join(moved, 'later.ts'), 'export {};');
+        execFileSync('git', ['-C', moved, 'add', 'later.ts']);
+        execFileSync('git', ['-C', moved, 'commit', '-qm', 'move default HEAD']);
+        execFileSync('git', ['-C', moved, 'push', '-q', 'origin', 'HEAD:main']);
+        const resolved = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'commit', sha: verified }, origin)}`], { cwd: podCwd });
+        expect(resolved.exitCode, resolved.stderr.toString()).toBe(0);
+        expect(resolved.stdout.toString()).toContain(`ELANOUS_POD_SOURCE commit ${verified}`);
+        expect(execFileSync('git', ['-C', join(podCwd, 'repo'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(verified);
+      } finally {
+        rmSync(moved, { recursive: true, force: true });
+        rmSync(podCwd, { recursive: true, force: true });
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); if (origin) rmSync(origin, { recursive: true, force: true }); }
   });
 
   test('real spawned orchestrator stdout reaches the CLI observer without changing its exit status', async () => {

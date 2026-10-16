@@ -19,6 +19,7 @@ export interface GreenSweepPr {
   state: string;
   mergeSha?: string;
   url?: string;
+  viaTrain?: { integrationPr: number };
 }
 export interface GreenSweepDecision {
   cell: string;
@@ -112,7 +113,8 @@ export function decideGreenSweep(input: {
   const { item, candidate, pr } = input;
   const mergeSha = pr?.mergeSha && /^[a-f0-9]{40}$/i.test(pr.mergeSha) ? pr.mergeSha : null;
   const result = (verdict: GreenSweepVerdict, reason: string): GreenSweepDecision => {
-    const evidence = `GREEN-FROM-LEDGER: PR #${candidate.pr}${mergeSha ? ` merged ${mergeSha}` : ''} · ${verdict} · ${reason}`;
+    const landing = pr?.viaTrain ? ` via train #${pr.viaTrain.integrationPr}` : '';
+    const evidence = `GREEN-FROM-LEDGER: PR #${candidate.pr}${landing}${mergeSha ? ` merged ${mergeSha}` : ''} · ${verdict} · ${reason}`;
     return { cell: item.id, pr: candidate.pr, mergeSha, source: candidate.source, verdict, reason,
       evidence, existingEvidence: item.evidence ?? '', plannedEvidence: appendGreenSweepEvidence(item.evidence, evidence) };
   };
@@ -122,6 +124,9 @@ export function decideGreenSweep(input: {
   if (input.repositoryMatches === false) return result('skip', 'repository-mismatch');
   if (input.repositoryMatches !== true) return result('record-only', 'repository-unreadable');
   if (pr.state !== 'MERGED') return result('skip', `pr-${pr.state.toLowerCase()}`);
+  if (pr.viaTrain && (candidate.card?.trainLanding?.componentPr !== candidate.pr
+    || candidate.card.trainLanding.integrationPr !== pr.viaTrain.integrationPr
+    || candidate.card.trainLanding.mergeSha !== pr.mergeSha)) return result('skip', 'train-binding-mismatch');
   if (!mergeSha) return result('skip', 'merge-sha-unreadable');
   if (input.ancestor === null) return result('record-only', 'origin-main-ref-unverified');
   if (!input.ancestor) return result('skip', 'merge-sha-not-on-origin-main');
@@ -159,8 +164,8 @@ export function decideGreenSweep(input: {
   if (typeof card.pr === 'object' && pr.url && card.pr.url
     && card.pr.url.replace(/\/+$/, '') !== pr.url.replace(/\/+$/, ''))
     return result('record-only', 'card-pr-url-mismatch');
-  if (card.prTerminal?.state === 'CLOSED') return result('record-only', 'card-terminal-conflict');
-  return result('green', card.postLand?.outcome === 'complete' ? 'bound-card-complete' : 'bound-card-merged');
+  if (card.prTerminal?.state === 'CLOSED' && !pr.viaTrain) return result('record-only', 'card-terminal-conflict');
+  return result('green', card.postLand?.outcome === 'complete' ? 'bound-card-complete' : pr.viaTrain ? 'bound-card-train-merged' : 'bound-card-merged');
 }
 
 /** Every candidate emits one structured decision, including refusals. */

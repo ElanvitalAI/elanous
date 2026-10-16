@@ -4,10 +4,17 @@
 // removed createChannelBotTabView with the TUI detail surface; retain spec, restart,
 // external-detection, and runNexus contracts because Bun executes this file directly.
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeAll, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import {
+  bootNexus,
+  drainNexusBoots,
+  warmNexusModule,
+  NEXUS_DRAIN_TIMEOUT_MS,
+  NEXUS_WARM_TIMEOUT_MS,
+} from './helpers/nexus-boot-guard.js';
 import {
   createChannelBotTabSpec,
   detectExternalChannelBot,
@@ -34,7 +41,13 @@ beforeEach(() => {
   delete process.env.ELANOUS_TELEGRAM_BOT_TOKEN;
   delete process.env.ELANOUS_DISCORD_BOT_TOKEN;
 });
-afterEach(() => {
+// 0.2.30 게이트 간섭(OP #9292) — 무거운 nexus import 는 시험 5s 예산 밖에서 데운다.
+beforeAll(warmNexusModule, NEXUS_WARM_TIMEOUT_MS);
+
+afterEach(async () => {
+  // env 를 되돌리기 «전»에 남은 runNexus 를 끝까지 기다린다 — 시간초과된 시험의 부팅이
+  // 다음 시험 폴더의 잠금을 잡지 못하게(TelegramLockError 간섭).
+  await drainNexusBoots();
   if (prevNexus === undefined) delete process.env.ELANOUS_NEXUS_DIR;
   else process.env.ELANOUS_NEXUS_DIR = prevNexus;
   if (prevTg === undefined) delete process.env.ELANOUS_TELEGRAM_BOT_TOKEN;
@@ -42,7 +55,7 @@ afterEach(() => {
   if (prevDc === undefined) delete process.env.ELANOUS_DISCORD_BOT_TOKEN;
   else process.env.ELANOUS_DISCORD_BOT_TOKEN = prevDc;
   try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* ignore */ }
-});
+}, NEXUS_DRAIN_TIMEOUT_MS);
 
 function metaOf(spec: ReturnType<typeof createChannelBotTabSpec>): ChannelBotMeta {
   return spec.meta as unknown as ChannelBotMeta;
@@ -266,16 +279,14 @@ describe('detectExternalLock + detectExternalChannelBot', () => {
 
 describe('runNexus integration · channel-bot opt-in', () => {
   test('default off (no enableChannelBots) → no telegram tab', async () => {
-    const { runNexus } = await import('../src/nexus/index.js');
-    const handle = await runNexus({ detachForTesting: true });
+    const handle = await bootNexus({ detachForTesting: true });
     expect(handle!.registry.has('telegram:1')).toBe(false);
     expect(handle!.registry.has('discord:1')).toBe(false);
     handle!.release();
   });
 
   test('enableChannelBots=[telegram] registers telegram tab', async () => {
-    const { runNexus } = await import('../src/nexus/index.js');
-    const handle = await runNexus({
+    const handle = await bootNexus({
       detachForTesting: true,
       enableChannelBots: ['telegram'],
       autoStartChannelBots: false,
@@ -286,8 +297,7 @@ describe('runNexus integration · channel-bot opt-in', () => {
   });
 
   test('enableChannelBots=[telegram, discord] registers both', async () => {
-    const { runNexus } = await import('../src/nexus/index.js');
-    const handle = await runNexus({
+    const handle = await bootNexus({
       detachForTesting: true,
       enableChannelBots: ['telegram', 'discord'],
       autoStartChannelBots: false,

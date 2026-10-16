@@ -11,6 +11,7 @@ import { getUserConfig } from '../user-config.js';
 import { projectDecisionsToLinear } from '../decisions/decision-linear-projection.js';
 import { DecisionLedger, importDecisionMarkdown, type DecisionCategory, type DecisionLedgerOptions, type DecisionOption, type DecisionTrack, type DecisionEntry, type Seat, type SeatDecisionRecord } from '../decisions/decision-ledger.js';
 import { formatProactMeter, readProactMeter } from '../decisions/proact-meter.js';
+import { CROWN_MARK, CROWN_THRESHOLD_CATEGORIES, CONSENSUS_CATEGORIES, ConsensusEngine, MAX_REVIEW_ROUND_TRIPS, categoryLabel, representativeLabel, type ConsensusCategory, type ConsensusRepresentative, type CrownCard, type ProposalCard } from '../loops/consensus.js';
 import { writeStdoutFully } from './stdout-flush.js';
 
 const repeat = (value: string, values: string[]) => [...values, value];
@@ -60,6 +61,14 @@ export function formatDecisionDetail(e: DecisionEntry): string {
 
 export function formatSeatDecisionRow(e: SeatDecisionRecord): string {
   return `${e.id} · 결정: ${e.decidedAt ? kst(e.decidedAt) : '시각 미상'} · 기록: ${e.recordedAt ? kst(e.recordedAt) : '시각 미상'} · ${e.seat} 결정 · 사후 보고 · ${e.title} → ${e.decision} · 위임: ${e.delegation}${e.refs?.length ? ` · 참조: ${e.refs.join(' · ')}` : ''}`;
+}
+
+export function formatProposalRow(p: ProposalCard): string {
+  return `${p.id} · ${categoryLabel(p.category)} · ${p.title} · 사실 ${p.factId} · 비용 ${p.cost} · 되돌리기 ${p.undo}${p.thresholds.length ? ` · ${CROWN_MARK} 몫 ${p.thresholds.join('|')}` : ''} · 제안 ${representativeLabel(p.proposedBy)} · ${kst(p.proposedAt)} · 왕복 ${p.roundTrips}/${MAX_REVIEW_ROUND_TRIPS} · ${p.status === 'open' ? '검토 중' : p.status === 'agreed' ? '합의·실행·기록' : '불합의'}`;
+}
+
+export function formatCrownCardRow(c: CrownCard): string {
+  return `${c.id} · ${CROWN_MARK} ${c.reason === 'disagreement' ? '불합의' : '임계 승인'} · 제안 ${c.proposalId} · 조율자 주장: ${c.coordinatorClaim} | 수호자 주장: ${c.guardianClaim}${c.decisionId ? ` · 결정 카드 ${c.decisionId}` : ''}`;
 }
 
 export function registerDecisionsCommands(program: Command, config: DecisionLedgerOptions = {}, out: Pick<Console, 'log'> = console, hqDeps: HqDeps = {}): void {
@@ -176,14 +185,24 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
       if (!o.auto && (o.delegation || o.track || o.agent)) throw new Error('delegation/track/agent require --auto');
       const by = o.auto ? { kind: 'auto' as const, agent: agent(o.agent), delegation: o.delegation!, ...(o.track ? { track: o.track } : {}) } : { kind: 'human' as const };
       if (!mayWrite('decide', o.hqOverride)) return;
-      const { entry, delivery } = new DecisionLedger(config).decideWithDelivery(id, choice, by, o.note);
-      if (delivery && !delivery.ok) {
-        // The decision is recorded; only the answer to the waiting run failed — say so and how to retry, never «success».
-        const hint = `⚠ 답 전달 실패(${delivery.questionId} · ${delivery.reason}) — 결정은 기록됐다 · 다시: elanous decisions retry-answer ${entry.id}`;
+      const { entry, delivery, notice } = new DecisionLedger(config).decideWithDelivery(id, choice, by, o.note);
+      const failures = [
+        ...(delivery && !delivery.ok ? [`⚠ 답 전달 실패(${delivery.questionId} · ${delivery.reason}) — 결정은 기록됐다 · 다시: elanous decisions retry-answer ${entry.id}`] : []),
+        ...(notice.status === 'failed' ? [`⚠ 자리 우편 실패(${notice.seat} · ${notice.reason}) — 결정은 기록됐다 · 다시: elanous decisions retry-notify ${entry.id}`] : []),
+      ];
+      if (failures.length) {
         process.exitCode = 3;
-        return emit({ ...entry, delivery }, o.json, `결정: ${formatDecisionDetail(entry)}\n${hint}`);
+        return emit({ ...entry, ...(delivery ? { delivery } : {}), notice }, o.json, `결정: ${formatDecisionDetail(entry)}\n${failures.join('\n')}`);
       }
-      return emit(delivery ? { ...entry, delivery } : entry, o.json, `결정: ${formatDecisionDetail(entry)}`);
+      const sent = notice.status === 'sent' ? `\n자리 우편: ${notice.seat} #${notice.messageId}` : '';
+      return emit({ ...entry, ...(delivery ? { delivery } : {}), notice }, o.json, `결정: ${formatDecisionDetail(entry)}${sent}`);
+    }));
+  root.command('retry-notify <id>').description('기록된 결정의 올린 자리 우편만 중복 없이 재시도한다').option('--json').option('--hq-override')
+    .action((id: string, o: { json?: boolean; hqOverride?: boolean }) => fail(() => {
+      if (!mayWrite('retry-notify', o.hqOverride)) return;
+      const notice = new DecisionLedger(config).retryNotice(id);
+      if (notice.status === 'failed') process.exitCode = 3;
+      return emit(notice, o.json, notice.status === 'sent' ? `자리 우편: ${notice.seat} #${notice.messageId}` : notice.status === 'skipped' ? '올린 자리 없음 — 우편 대상 없음' : `⚠ 자리 우편 실패(${notice.seat} · ${notice.reason})`);
     }));
   root.command('retry-answer <id>').description('기록된 결정의 대기 질문 답 전달만 재시도한다').option('--json').option('--hq-override')
     .action((id: string, o: { json?: boolean; hqOverride?: boolean }) => fail(() => {
@@ -208,5 +227,60 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
       const result = importDecisionMarkdown(new DecisionLedger(config), file);
       if (result.unread.length) process.exitCode = 1;
       return emit(result, o.json, `가져옴 ${result.imported.length} · 기존 ${result.existing.length} · 불완전 ${result.incomplete.length} · 못 읽음 ${result.unread.length}${result.incomplete.length ? `\n${result.incomplete.join('\n')}` : ''}${result.unread.length ? `\n${result.unread.join('\n')}` : ''}`);
+    }));
+  const consensusRoot = root.command('consensus').description('두 대표 합의 — 조율자(일의 흐름)·수호자(몸)의 다섯 범주는 «둘의 합의» 뒤에 실행');
+  const consensusEngine = () => new ConsensusEngine({ stateDir: config.stateDir, now: config.now, resolveVersion: config.resolveVersion });
+  consensusRoot.command('propose').description('제안 카드를 올린다 — 사실 id·비용·되돌리기')
+    .requiredOption('--by <representative>', '제안 대표 (coordinator|guardian)')
+    .requiredOption('--category <category>', `합의 범주 (${CONSENSUS_CATEGORIES.join('|')})`)
+    .requiredOption('--title <text>').requiredOption('--fact-id <id>', '사실 id')
+    .requiredOption('--cost <text>', '비용').requiredOption('--undo <text>', '되돌리기')
+    .option('--threshold <category>', `${CROWN_MARK} 몫 임계 범주 (반복: ${CROWN_THRESHOLD_CATEGORIES.join('|')})`, repeat, [])
+    .option('--provider <name>', 'LLM 제공자 표식 — 가능하면 상대와 다른 제공자 (메아리 방지)')
+    .option('--json').option('--hq-override')
+    .action((o: { by: string; category: string; title: string; factId: string; cost: string; undo: string; threshold: string[]; provider?: string; json?: boolean; hqOverride?: boolean }) => fail(() => {
+      if (!mayWrite('consensus propose', o.hqOverride)) return;
+      const proposal = consensusEngine().propose({
+        by: o.by as ConsensusRepresentative, category: o.category as ConsensusCategory, title: o.title, factId: o.factId, cost: o.cost, undo: o.undo,
+        thresholds: o.threshold.map(threshold => threshold as DecisionCategory), provider: o.provider,
+      });
+      return emit(proposal, o.json, `제안: ${formatProposalRow(proposal)}`);
+    }));
+  consensusRoot.command('review <id>').description('상대 검토 왕복을 남긴다 — 최대 2왕복, 마지막 왕복은 결론으로')
+    .requiredOption('--by <representative>', '검토 대표 — 제안한 대표의 상대 (coordinator|guardian)')
+    .requiredOption('--claim <text>', '검토 주장')
+    .option('--provider <name>', 'LLM 제공자 표식 (메아리 방지)')
+    .option('--json').option('--hq-override')
+    .action((id: string, o: { by: string; claim: string; provider?: string; json?: boolean; hqOverride?: boolean }) => fail(() => {
+      if (!mayWrite('consensus review', o.hqOverride)) return;
+      const proposal = consensusEngine().review(id, { by: o.by as ConsensusRepresentative, claim: o.claim, provider: o.provider });
+      return emit(proposal, o.json, `검토 ${proposal.roundTrips}/${MAX_REVIEW_ROUND_TRIPS}왕복: ${formatProposalRow(proposal)}`);
+    }));
+  consensusRoot.command('agree <id>').description(`상대 대표의 합의 — 실행·합의 원장 기록 (임계 범주면 ${CROWN_MARK} 카드도 함께)`)
+    .requiredOption('--by <representative>', '합의 대표 — 제안한 대표의 상대 (coordinator|guardian)')
+    .option('--claim <text>', '합의 주장 (생략 시 제안대로 실행)')
+    .option('--provider <name>', 'LLM 제공자 표식 (메아리 방지)')
+    .option('--json').option('--hq-override')
+    .action((id: string, o: { by: string; claim?: string; provider?: string; json?: boolean; hqOverride?: boolean }) => fail(() => {
+      if (!mayWrite('consensus agree', o.hqOverride)) return;
+      const { proposal, crownCard } = consensusEngine().agree(id, { by: o.by as ConsensusRepresentative, claim: o.claim, provider: o.provider });
+      return emit({ proposal, ...(crownCard ? { crownCard } : {}) }, o.json,
+        `합의: ${formatProposalRow(proposal)}${crownCard ? `\n${CROWN_MARK} 카드: ${formatCrownCardRow(crownCard)}` : ''}`);
+    }));
+  consensusRoot.command('disagree <id>').description(`상대 대표의 불합의 — 양쪽 주장 나란히 ${CROWN_MARK} 결정 카드`)
+    .requiredOption('--by <representative>', '불합의 대표 — 제안한 대표의 상대 (coordinator|guardian)')
+    .requiredOption('--claim <text>', `불합의 주장 — ${CROWN_MARK} 카드에 나란히 실린다`)
+    .option('--provider <name>', 'LLM 제공자 표식 (메아리 방지)')
+    .option('--json').option('--hq-override')
+    .action((id: string, o: { by: string; claim: string; provider?: string; json?: boolean; hqOverride?: boolean }) => fail(() => {
+      if (!mayWrite('consensus disagree', o.hqOverride)) return;
+      const { proposal, crownCard } = consensusEngine().disagree(id, { by: o.by as ConsensusRepresentative, claim: o.claim, provider: o.provider });
+      return emit({ proposal, crownCard }, o.json, `불합의: ${formatProposalRow(proposal)}\n${CROWN_MARK} 카드: ${formatCrownCardRow(crownCard)}`);
+    }));
+  consensusRoot.command('crown').description(`${CROWN_MARK} 결정 카드 목록 — 불합의·임계 범주만 만든다`)
+    .option('--json')
+    .action((o: { json?: boolean }) => fail(() => {
+      const cards = consensusEngine().crownCards();
+      return emit(cards, o.json, cards.length ? cards.map(formatCrownCardRow).join('\n') : `${CROWN_MARK} 결정 카드 0건`);
     }));
 }

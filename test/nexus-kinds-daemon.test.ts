@@ -4,10 +4,17 @@
 // removed createDaemonTabView with the TUI detail surface; retain spec, external-detection,
 // and runNexus contracts because Bun executes this file directly.
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeAll, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import {
+  bootNexus,
+  drainNexusBoots,
+  warmNexusModule,
+  NEXUS_DRAIN_TIMEOUT_MS,
+  NEXUS_WARM_TIMEOUT_MS,
+} from './helpers/nexus-boot-guard.js';
 import {
   createDaemonTabSpec,
   detectExternalDaemon,
@@ -31,12 +38,18 @@ beforeEach(() => {
   process.env.ELANOUS_NEXUS_DIR = tmpRoot;
   setElanousConfigDir(tmpRoot);
 });
-afterEach(() => {
+// 0.2.30 게이트 간섭(OP #9292) — 무거운 nexus import 는 시험 5s 예산 밖에서 데운다.
+beforeAll(warmNexusModule, NEXUS_WARM_TIMEOUT_MS);
+
+afterEach(async () => {
+  // env 를 되돌리기 «전»에 남은 runNexus 를 끝까지 기다린다 — 시간초과된 시험의 부팅이
+  // 다음 시험 폴더의 잠금을 잡지 못하게(TelegramLockError 간섭).
+  await drainNexusBoots();
   if (prevNexus === undefined) delete process.env.ELANOUS_NEXUS_DIR;
   else process.env.ELANOUS_NEXUS_DIR = prevNexus;
   resetElanousConfigDir();
   try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* ignore */ }
-});
+}, NEXUS_DRAIN_TIMEOUT_MS);
 
 describe('createDaemonTabSpec · default policy', () => {
   test('default id and command', () => {
@@ -200,8 +213,7 @@ describe('detectExternalDaemon · stale lock', () => {
 
 describe('runNexus integration · daemon registration', () => {
   test('detachForTesting=true skips daemon by default (regression preserve)', async () => {
-    const { runNexus } = await import('../src/nexus/index.js');
-    const handle = await runNexus({ detachForTesting: true });
+    const handle = await bootNexus({ detachForTesting: true });
     expect(handle!.registry.has(DAEMON_DEFAULT_TAB_ID)).toBe(false);
     // chat only — webterm gated default-OFF (PWA mirror prep cleanup).
     expect(handle!.registry.list()).toHaveLength(1);
@@ -209,8 +221,7 @@ describe('runNexus integration · daemon registration', () => {
   });
 
   test('registerDaemonTab=true opts in to daemon entry', async () => {
-    const { runNexus } = await import('../src/nexus/index.js');
-    const handle = await runNexus({
+    const handle = await bootNexus({
       detachForTesting: true,
       registerDaemonTab: true,
       autoStartDaemonTab: false, // don't actually spawn

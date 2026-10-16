@@ -3,7 +3,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireSlot, defaultInterference, needsPwaBuild, runHostRegate, type HostRegateDeps } from './host-regate.js';
+import { acquireSlot, defaultInterference, needsPwaBuild, runHostRegate, typecheckGateTouchesPwa, type HostRegateDeps } from './host-regate.js';
 import { regateFailureFacts } from './regate-detail.js';
 import { MAX_INSPECTED_TEST_FILES } from '../../scripts/ci-test-interference-gate.js';
 import { releasePathHoldComment } from '../self-dev/release-path-guard.js';
@@ -86,6 +86,22 @@ test('two concurrent regates in one repo read separate base and head refs and re
     expect(calls).toContain(`git update-ref -d ${ref}`);
   }
   expect(calls.some((call) => call.includes('FETCH_HEAD'))).toBe(false);
+});
+
+test('TA-REGATE-UNMEASURED — noMerge regate of a draft PR reports status unmeasured (pr-head), not a bare failure', async () => {
+  const draftView = JSON.stringify({ headRefOid: HEAD, baseRefName: 'main', baseRefOid: BASE, state: 'OPEN', isDraft: true });
+  const base = mock();
+  const command = base.deps.command!;
+  const deps: HostRegateDeps = { ...base.deps, command: (bin, args, cwd, env) => `${bin} ${args.join(' ')}` === 'gh pr view 42 --json headRefOid,baseRefName,baseRefOid,state,isDraft'
+    ? { status: 0, stdout: draftView, stderr: '' } : command(bin, args, cwd, env) };
+  const noMerge = await runHostRegate({ ...input, noMerge: true }, deps);
+  expect(noMerge).toMatchObject({ passed: false, status: 'unmeasured', failures: [{ step: 'pr-head' }] });
+  expect(noMerge.failures[0]?.detail).toContain('isDraft=true');
+  expect(noMerge.baseCommit).toBeUndefined();
+  // 병합 경로(verifyOnly·noMerge 아님)의 결과 모양은 그대로 — status 를 싣지 않는다.
+  const merging = await runHostRegate(input, deps);
+  expect(merging.passed).toBe(false);
+  expect(merging.status).toBeUndefined();
 });
 
 describe('host regate: never merge without a measured host pass', () => {
@@ -1260,6 +1276,161 @@ describe('needsPwaBuild — pr-land PWA reachability', () => {
       expect(calls.filter((call) => call === 'bun bin/elanous.mjs --test nexus build')).toHaveLength(builds);
       expect(calls.filter((call) => call === 'bun install --frozen-lockfile')).toHaveLength(1 + builds);
       expect(calls.some((call) => call.startsWith('gh pr merge'))).toBe(false);
+    } finally { rmSync(tree, { recursive: true, force: true }); }
+  });
+
+  test('typecheck-scope PWA files provide app dependencies exactly once without a PWA build', async () => {
+    const tree = mkdtempSync(join(tmpdir(), 'host-regate-tsc-pwa-'));
+    const write = (file: string, body: string) => {
+      mkdirSync(join(tree, file, '..'), { recursive: true });
+      writeFileSync(join(tree, file), body);
+    };
+    write('apps/pwa/tsconfig.json', JSON.stringify({ compilerOptions: { module: 'esnext', moduleResolution: 'bundler', noEmit: true }, include: ['src/**/*.ts'] }));
+    write('apps/pwa/src/landed-on-main.ts', 'export const landed = 1;\n');
+    write('src/steward/triage.ts', 'export const triage = 1;\n');
+    const { deps, calls } = mock();
+    const command = deps.command!;
+    const pwaInstalls: string[] = [];
+    deps.makeTemp = () => tree;
+    deps.removeTemp = () => {};
+    deps.command = (bin, args, cwd, env) => {
+      const call = `${bin} ${args.join(' ')}`;
+      if (call === `git diff --name-only ${MERGE_BASE} ${HEAD}`) return { status: 0, stdout: 'src/steward/triage.ts\n', stderr: '' };
+      if (bin === 'git' && args[0] === 'diff' && args[1] === '--name-only' && args[2] === `${BASE}...HEAD`) return { status: 0, stdout: 'apps/pwa/src/landed-on-main.ts\n', stderr: '' };
+      if (call === 'bun install --frozen-lockfile') {
+        if (cwd === join(tree, 'apps/pwa')) pwaInstalls.push(call);
+        mkdirSync(join(cwd, 'node_modules'), { recursive: true });
+      }
+      return command(bin, args, cwd, env);
+    };
+    try {
+      expect(await runHostRegate({ ...input, verifyOnly: true }, deps)).toMatchObject({ passed: true, status: 'passed' });
+      expect(pwaInstalls).toHaveLength(1);
+      expect(calls.filter((call) => call === 'bun install --frozen-lockfile')).toHaveLength(2);
+      expect(calls.filter((call) => call === 'bun bin/elanous.mjs --test nexus build')).toHaveLength(0);
+    } finally { rmSync(tree, { recursive: true, force: true }); }
+  });
+
+  test('typecheck scope without PWA files provides no app dependencies', async () => {
+    const tree = mkdtempSync(join(tmpdir(), 'host-regate-tsc-no-pwa-'));
+    const write = (file: string, body: string) => {
+      mkdirSync(join(tree, file, '..'), { recursive: true });
+      writeFileSync(join(tree, file), body);
+    };
+    write('apps/pwa/tsconfig.json', JSON.stringify({ compilerOptions: { module: 'esnext', moduleResolution: 'bundler', noEmit: true }, include: ['src/**/*.ts'] }));
+    write('apps/pwa/src/landed-on-main.ts', 'export const landed = 1;\n');
+    write('src/steward/triage.ts', 'export const triage = 1;\n');
+    const { deps, calls } = mock();
+    const command = deps.command!;
+    const pwaInstalls: string[] = [];
+    deps.makeTemp = () => tree;
+    deps.removeTemp = () => {};
+    deps.command = (bin, args, cwd, env) => {
+      const call = `${bin} ${args.join(' ')}`;
+      if (call === `git diff --name-only ${MERGE_BASE} ${HEAD}`) return { status: 0, stdout: 'src/steward/triage.ts\n', stderr: '' };
+      if (bin === 'git' && args[0] === 'diff' && args[1] === '--name-only' && args[2] === `${BASE}...HEAD`) return { status: 0, stdout: 'src/steward/triage.ts\n', stderr: '' };
+      if (call === 'bun install --frozen-lockfile') {
+        if (cwd === join(tree, 'apps/pwa')) pwaInstalls.push(call);
+        mkdirSync(join(cwd, 'node_modules'), { recursive: true });
+      }
+      return command(bin, args, cwd, env);
+    };
+    try {
+      expect(await runHostRegate({ ...input, verifyOnly: true }, deps)).toMatchObject({ passed: true, status: 'passed' });
+      expect(pwaInstalls).toHaveLength(0);
+      expect(calls.filter((call) => call === 'bun install --frozen-lockfile')).toHaveLength(1);
+      expect(calls.filter((call) => call === 'bun bin/elanous.mjs --test nexus build')).toHaveLength(0);
+    } finally { rmSync(tree, { recursive: true, force: true }); }
+  });
+
+  test('typecheck-scope promotion triggers provide app dependencies without PWA files or a build', async () => {
+    const tree = mkdtempSync(join(tmpdir(), 'host-regate-tsc-promotion-'));
+    const write = (file: string, body: string) => {
+      mkdirSync(join(tree, file, '..'), { recursive: true });
+      writeFileSync(join(tree, file), body);
+    };
+    write('apps/pwa/tsconfig.json', JSON.stringify({ compilerOptions: { module: 'esnext', moduleResolution: 'bundler', noEmit: true }, include: ['src/**/*.ts'] }));
+    write('apps/pwa/src/landed-on-main.ts', 'export const landed = 1;\n');
+    write('src/steward/triage.ts', 'export const triage = 1;\n');
+    const { deps, calls } = mock();
+    const command = deps.command!;
+    const pwaInstalls: string[] = [];
+    deps.makeTemp = () => tree;
+    deps.removeTemp = () => {};
+    deps.command = (bin, args, cwd, env) => {
+      const call = `${bin} ${args.join(' ')}`;
+      if (call === `git diff --name-only ${MERGE_BASE} ${HEAD}`) return { status: 0, stdout: 'src/steward/triage.ts\n', stderr: '' };
+      if (bin === 'git' && args[0] === 'diff' && args[1] === '--name-only' && args[2] === `${BASE}...HEAD`) return { status: 0, stdout: 'src/steward/triage.ts\n', stderr: '' };
+      if (bin === 'git' && args[0] === 'show' && args[1] === `${BASE}:src/steward/triage.ts`) {
+        return { status: 0, stdout: 'export const gone = 1;\nexport const triage = 1;\n', stderr: '' };
+      }
+      if (call === 'bun install --frozen-lockfile') {
+        if (cwd === join(tree, 'apps/pwa')) pwaInstalls.push(call);
+        mkdirSync(join(cwd, 'node_modules'), { recursive: true });
+      }
+      return command(bin, args, cwd, env);
+    };
+    try {
+      expect(await runHostRegate({ ...input, verifyOnly: true }, deps)).toMatchObject({ passed: true, status: 'passed' });
+      expect(pwaInstalls).toHaveLength(1);
+      expect(calls.filter((call) => call === 'bun install --frozen-lockfile')).toHaveLength(2);
+      expect(calls.filter((call) => call === 'bun bin/elanous.mjs --test nexus build')).toHaveLength(0);
+    } finally { rmSync(tree, { recursive: true, force: true }); }
+  });
+});
+
+describe('typecheckGateTouchesPwa — the gate\'s runsPwa || wholeRepository mirror', () => {
+  test('deleted apps/pwa files and trigger-free root files stay below the dependency requirement', () => {
+    const tree = mkdtempSync(join(tmpdir(), 'host-regate-tsc-mirror-'));
+    try {
+      mkdirSync(join(tree, 'src/steward'), { recursive: true });
+      writeFileSync(join(tree, 'src/steward/triage.ts'), 'export const triage = 1;\n');
+      const command = (bin: string, args: readonly string[], _cwd: string) => {
+        if (bin === 'git' && args[0] === 'diff' && args[1] === '--name-only' && args[2] === `${BASE}...HEAD`) {
+          return { status: 0, stdout: 'apps/pwa/deleted.ts\nsrc/steward/triage.ts\n', stderr: '' };
+        }
+        if (bin === 'git' && args[0] === 'show' && args[1] === `${BASE}:src/steward/triage.ts`) {
+          return { status: 0, stdout: 'export const triage = 1;\n', stderr: '' };
+        }
+        return { status: 0, stdout: '', stderr: '' };
+      };
+      expect(typecheckGateTouchesPwa(tree, BASE, command)).toBe(false);
+    } finally { rmSync(tree, { recursive: true, force: true }); }
+  });
+
+  test('a present apps/pwa file requires dependencies before any trigger analysis', () => {
+    const tree = mkdtempSync(join(tmpdir(), 'host-regate-tsc-mirror-pwa-'));
+    try {
+      mkdirSync(join(tree, 'apps/pwa/src'), { recursive: true });
+      writeFileSync(join(tree, 'apps/pwa/src/landed.ts'), 'export const landed = 1;\n');
+      const asked: string[] = [];
+      const command = (bin: string, args: readonly string[], _cwd: string) => {
+        asked.push(`${bin} ${args.join(' ')}`);
+        if (bin === 'git' && args[0] === 'diff' && args[1] === '--name-only' && args[2] === `${BASE}...HEAD`) {
+          return { status: 0, stdout: 'apps/pwa/src/landed.ts\n', stderr: '' };
+        }
+        return { status: 0, stdout: '', stderr: '' };
+      };
+      expect(typecheckGateTouchesPwa(tree, BASE, command)).toBe(true);
+      expect(asked.some((call) => call.startsWith('git show'))).toBe(false);
+    } finally { rmSync(tree, { recursive: true, force: true }); }
+  });
+
+  test('an export-shape promotion trigger in a root file promotes the dependency requirement', () => {
+    const tree = mkdtempSync(join(tmpdir(), 'host-regate-tsc-mirror-promote-'));
+    try {
+      mkdirSync(join(tree, 'src/steward'), { recursive: true });
+      writeFileSync(join(tree, 'src/steward/triage.ts'), 'export const triage = 1;\n');
+      const command = (bin: string, args: readonly string[], _cwd: string) => {
+        if (bin === 'git' && args[0] === 'diff' && args[1] === '--name-only' && args[2] === `${BASE}...HEAD`) {
+          return { status: 0, stdout: 'src/steward/triage.ts\n', stderr: '' };
+        }
+        if (bin === 'git' && args[0] === 'show' && args[1] === `${BASE}:src/steward/triage.ts`) {
+          return { status: 0, stdout: 'export const gone = 1;\nexport const triage = 1;\n', stderr: '' };
+        }
+        return { status: 0, stdout: '', stderr: '' };
+      };
+      expect(typecheckGateTouchesPwa(tree, BASE, command)).toBe(true);
     } finally { rmSync(tree, { recursive: true, force: true }); }
   });
 });

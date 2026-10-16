@@ -716,6 +716,68 @@ describe('🚨 이 게이트가 «고치려는 병»을 스스로 앓지 않는�
     // 변경 파일을 «필터로 넘기지 않는다» — 러너는 인자 없이 한 번 불린다.
     expect(gradleArgsSeen).toBe(1);
   });
+
+  // R5a(0.2.31 · OP #8961): 툴체인 없는 사이드 호스트에서 bun 시험만 바꾼 PR 이 «돈 시험 0개»로 막혔다.
+  const BUN_ONLY = 'apps/android/app/src/test/kotlin/x/ChatHarnessBubble.test.ts';
+  const MISSING = 'Android SDK(/nowhere 없음)';
+
+  test('⭐ 바뀐 안드로이드 파일이 «전부» bun 시험이고 툴체인이 없으면 «측정 대상 아님»(Gradle 안 돌림 · 0 · 「통과」라 말하지 않음)', () => {
+    const c = capture();
+    let gradleCalls = 0;
+    const code = runAndroidUnitTestGate({
+      args: ['--changed-files', BUN_ONLY, 'src/a.ts'], cwd: rootWithGradlew(), log: c.log, error: c.error,
+      toolchainMissing: () => MISSING,
+      runGradle: () => { gradleCalls += 1; return { status: 1, output: '' }; },
+      readResults: () => [],
+    });
+    expect(code).toBe(0);
+    expect(gradleCalls).toBe(0);
+    const said = c.out.join('\n');
+    expect(said).toContain('측정 대상 아님');
+    expect(said).toContain(MISSING);
+    expect(said).not.toContain('PASS');
+    expect(said).not.toContain('돌았고');
+  });
+
+  test('⛔ 툴체인이 없어도 Kotlin 이 하나라도 바뀌었으면 기존 판정 그대로 — 0개는 실패', () => {
+    const c = capture();
+    const code = runAndroidUnitTestGate({
+      args: ['--changed-files', BUN_ONLY, 'apps/android/app/src/main/kotlin/A.kt'], cwd: rootWithGradlew(), log: c.log, error: c.error,
+      toolchainMissing: () => MISSING,
+      runGradle: () => ({ status: 1, output: 'Unable to locate a Java Runtime.' }),
+      readResults: () => [],
+    });
+    expect(code).toBe(1);
+    expect(c.err.join('\n')).toContain('0 은 통과가 아니다');
+    expect(c.out.join('\n')).not.toContain('측정 대상 아님');
+  });
+
+  test('⛔ Kotlin 소스셋 «밖»의 .test.ts 는 면제하지 않는다 — 툴체인 없으면 기존 판정(0 = 실패)', () => {
+    const c = capture();
+    const code = runAndroidUnitTestGate({
+      args: ['--changed-files', BUN_ONLY, 'apps/android/scripts/foo.test.ts'], cwd: rootWithGradlew(), log: c.log, error: c.error,
+      toolchainMissing: () => MISSING,
+      runGradle: () => ({ status: 1, output: '' }),
+      readResults: () => [],
+    });
+    expect(code).toBe(1);
+    expect(c.err.join('\n')).toContain('0 은 통과가 아니다');
+    expect(c.out.join('\n')).not.toContain('측정 대상 아님');
+  });
+
+  test('⭐ bun 시험만 바뀌어도 툴체인이 «있으면» 지금처럼 Gradle 을 돌린다', () => {
+    const c = capture();
+    let gradleCalls = 0;
+    const code = runAndroidUnitTestGate({
+      args: ['--changed-files', BUN_ONLY], cwd: rootWithGradlew(), log: c.log, error: c.error,
+      toolchainMissing: () => null,
+      runGradle: () => { gradleCalls += 1; return { status: 0, output: 'BUILD SUCCESSFUL' }; },
+      readResults: () => [{ path: 'p', xml: '<testsuite><testcase name="a"/></testsuite>' }],
+    });
+    expect(code).toBe(0);
+    expect(gradleCalls).toBe(1);
+    expect(c.out.join('\n')).toContain('testcase 1개 돌았고');
+  });
 });
 
 describe('⛔ 재발명 방지 — 기존 러너를 «부른다»', () => {

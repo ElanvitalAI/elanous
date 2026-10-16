@@ -17,6 +17,7 @@ import {
   writeLastSession,
 } from '../src/dashboard/seat-local-instructions.js';
 import { PROJECT_ANCHOR_LAST_SESSION_MAX_CHARS, loadProjectAnchor, loadProjectAnchorWithMeta, resetUniversalPreambleCache, setGlobalAnchorPathForTest } from '../src/prompt-library/universal-preamble.js';
+import { tuiSourceText } from './helpers/dashboard-source.js';
 
 const AGENTS_FIXTURE = [
   '# Repository Collaboration Rules',
@@ -351,7 +352,7 @@ describe('실제 /session clear 핸들러 경로', () => {
 
 describe('배선 — 대시보드 호출부', () => {
   test('기동 때 생성·recorder 설치, /session new·clear 는 비우기 «전»에 기록', () => {
-    const index = readFileSync(join(import.meta.dir, '../src/dashboard/index.ts'), 'utf8');
+    const index = tuiSourceText();
     expect(index).toContain('const seatLocal = ensureSeatLocalInstructions(getSessionCwd());');
     expect(index).toContain('installSeatSessionRecorder({ getCwd: () => getSessionCwd(), getHistory: () => chat.history });');
     const handlers = readFileSync(join(import.meta.dir, '../src/dashboard/slash-runtime/dashboard-handlers.ts'), 'utf8');

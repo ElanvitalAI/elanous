@@ -102,8 +102,9 @@ test('adopt twice then backfill once leaves one card found by needs-human shadow
     writeLaunchBinding(f.birth.runId, { pid: 1, startedAt: 1, cwd: f.root, goalPath: f.goalPath, runsDir: f.runsDir }, f.registryDir);
     expect(adoptUncardedRuns(f.deps)).toEqual({ scanned: 1, adopted: 0, skipped: { 'already-carded': 1 } });
     const observed: Array<Record<string, unknown>> = [];
+    // HQ(비-Pod) 판단을 단언한다 — 게이트 Pod 의 ELANOUS_POD_NAME 이 새어 «원격 자식»으로 읽히지 않게 env 를 못 박는다(#28308 과 같은 원인).
     await recordTaskAgentShadowMove({ runId: f.birth.runId, stopReason: 'needs-human', results: [{ taskId: 'not-the-card', feature: 'different feature', status: 'done', prNumber: 5 }] },
-      { log: (_category, event, data) => { if (event === 'shadow-move') observed.push(data); } });
+      { log: (_category, event, data) => { if (event === 'shadow-move') observed.push(data); }, env: {} });
     expect(observed).toMatchObject([{ card: `ta-${f.birth.runId}` }]);
     expect(Object.keys(readTaskAgentState<{ tasks: Record<string, TaskCard> }>(f.statePath).tasks)).toHaveLength(1);
   } finally {

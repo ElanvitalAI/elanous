@@ -7,6 +7,8 @@ import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-di
 import { checklistHistory, listChecklist, devVersion, refRoots } from '../release-loop/checklist.js';
 import { CliUserError } from './cli-user-error.js';
 import { getSchedule, setSchedule } from '../release-loop/release-schedule.js';
+import type { RehearsalDeps } from '../release-loop/rehearsal.js';
+import type { LightRcResult } from '../release-loop/light-rc.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -15,6 +17,62 @@ import { enableLandingFreeze } from '../release-loop/landing-freeze.js';
 import { fileLeaseStore, serializeLease } from '../hq/lease.js';
 import type { HqDeps } from '../hq/hq.js';
 import { isPrerelease, isReleaseVersion, planPublish, publishRelease, registerReleaseCommands, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
+
+test('rehearsal CLI refuses malformed shards and remote before making any stamp', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-rehearsal-cli-'));
+  const exit = process.exitCode;
+  const lines: string[] = [];
+  const out = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write);
+  let rcCalls = 0;
+  const deps: RehearsalDeps = {
+    now: () => new Date('2026-10-10T06:00:00Z'),
+    schedules: () => [{ version: '0.2.23', cutAt: '2026-10-10T13:00:00Z' } as ReturnType<NonNullable<RehearsalDeps['schedules']>>[number]],
+    lightRc: async () => { rcCalls++; throw new Error('invalid selection launched RC'); },
+  };
+  try {
+    setElanousConfigDir(root);
+    const cmd = new Command(); registerReleaseCommands(cmd, { ledgerRoot: root }, {}, {}, {}, deps);
+    for (const args of [['--shards', '0'], ['--shards', '1.5'], ['--remote', '-invalid']]) {
+      lines.length = 0;
+      process.exitCode = 0;
+      await cmd.parseAsync(['release', 'rehearsal', 'tick', '--apply', '--json', ...args], { from: 'user' });
+      expect(JSON.parse(lines[0]!)).toMatchObject({ ok: false, error: expect.stringMatching(/invalid --(?:shards|remote)/) });
+      expect(process.exitCode).toBe(1);
+      expect(rcCalls).toBe(0);
+      expect(existsSync(join(root, 'release'))).toBe(false);
+    }
+  } finally { out.mockRestore(); resetElanousConfigDir(); process.exitCode = exit ?? 0; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('rehearsal CLI no-option tick forwards planned shards and records a measured gate failure as error', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-rehearsal-cli-gate-'));
+  const exit = process.exitCode;
+  const lines: string[] = [], selections: Array<{ shards?: number; remote?: string }> = [];
+  const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write);
+  const version = '0.2.23', cutAt = '2026-10-10T13:00:00Z';
+  const deps: RehearsalDeps = {
+    now: () => new Date('2026-10-10T06:00:00Z'),
+    schedules: () => [{ version, cutAt } as ReturnType<NonNullable<RehearsalDeps['schedules']>>[number]],
+    git: args => ({ rc: 0, stdout: args[0] === 'rev-parse' ? 'a'.repeat(40) : '' }),
+    leakCheck: () => ({ status: 0 }),
+    shardPlan: () => ({ shards: 2, testFiles: 7, gatePlanShards: 4, resources: { cpus: 2, freeBytes: 2e9, totalBytes: 4e9 }, unmeasured: 'sufficiency threshold not measured' }),
+    lightRc: async (_version, _checkout, selection) => {
+      selections.push(selection);
+      return { version, base: 'base', measuredCommit: 'a'.repeat(40), worktreeHead: 'a'.repeat(40), importerTests: 0, introduced: 0, preexisting: 0, unclassified: 0, alwaysInclude: 1, alwaysIncludeMissing: [], shards: 2, remote: null, gateExitCode: 1, ok: false, unmeasured: null } satisfies LightRcResult;
+    },
+    notify: () => {},
+  };
+  try {
+    setElanousConfigDir(root);
+    const cmd = new Command(); registerReleaseCommands(cmd, { ledgerRoot: root }, {}, {}, {}, deps);
+    process.exitCode = 0;
+    await cmd.parseAsync(['release', 'rehearsal', 'tick', '--apply', '--checkout', '/fake/checkout', '--json'], { from: 'user' });
+    expect(process.exitCode).toBe(1);
+    expect(selections).toEqual([{ shards: 2, remote: undefined }]);
+    expect(JSON.parse(lines[0]!)).toMatchObject({ ok: false, stamps: [{ outcome: 'error', selection: { shards: 2 }, shardPlan: { testFiles: 7, unmeasured: 'sufficiency threshold not measured' }, result: { gateExitCode: 1 } }] });
+    expect(JSON.parse(readFileSync(join(root, 'release', version, 'rehearsal', 'rc-7h.json'), 'utf8'))).toMatchObject({ outcome: 'error', shardPlan: { testFiles: 7 }, result: { gateExitCode: 1 } });
+  } finally { output.mockRestore(); resetElanousConfigDir(); process.exitCode = exit ?? 0; rmSync(root, { recursive: true, force: true }); }
+});
 
 test('gate-history CLI --json --apply-watchlist reports the files actually written in an isolated checkout', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-gate-history-cli-'));
@@ -152,6 +210,64 @@ describe('release checklist CLI', () => {
     }
   });
 
+  test('budget --version --json aggregates P0/P1 rubric S, missing S, and empty versions without writing the ledger', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-budget-cli-'));
+    setElanousConfigDir(dir);
+    const stdout: string[] = [];
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => {
+      stdout.push(String(chunk));
+      (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.();
+      return true;
+    }) as typeof process.stdout.write);
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const cli = new Command(); registerReleaseCommands(cli);
+    const run = (...args: string[]) => cli.parseAsync(['release', ...args], { from: 'user' });
+    const rubric = (s: number) => `루브릭: A1 E2 R1 D0 M1 B0 S${s} X0`;
+    try {
+      const ledger = join(dir, 'release', 'features.sqlite');
+      expect(existsSync(ledger)).toBe(false);
+      await run('budget', '--version', '9.9.6', '--json');
+      expect(JSON.parse(stdout.pop()!)).toMatchObject({ version: '9.9.6', total: 0, missing: 0 });
+      expect(existsSync(ledger)).toBe(false);
+      await run('checklist', 'add', 'P0-ZERO', rubric(0), '--priority', 'P0', '--version', '9.9.9');
+      await run('checklist', 'add', 'P0-THREE', 'large', '--priority', 'P0', '--version', '9.9.9');
+      await run('checklist', 'set', 'P0-THREE', '--evidence', rubric(3), '--version', '9.9.9');
+      await run('checklist', 'add', 'P0-MISSING', 'no rubric', '--priority', 'P0', '--version', '9.9.9');
+      await run('checklist', 'add', 'P1-ONE', rubric(1), '--priority', 'P1', '--version', '9.9.9');
+      await run('checklist', 'add', 'P1-TWO', rubric(2), '--priority', 'P1', '--version', '9.9.9');
+      await run('checklist', 'add', 'P1-MISSING', 'partial', '--priority', 'P1', '--version', '9.9.9');
+      await run('checklist', 'set', 'P1-MISSING', '--evidence', '루브릭: A1 E2 R1 D0 M1 B0 X0', '--version', '9.9.9');
+      await run('checklist', 'add', 'P2-IGNORED', rubric(3), '--priority', 'P2', '--version', '9.9.9');
+      await run('checklist', 'add', 'UNPRIORITIZED', 'no rubric', '--version', '9.9.9');
+      const before = readFileSync(ledger);
+      const snapshot = listChecklist('9.9.9');
+      await run('budget', '--version', '9.9.9', '--json');
+      expect(stdout).toHaveLength(1);
+      expect(stdout[0]!.endsWith('\n')).toBe(true);
+      expect(JSON.parse(stdout[0]!)).toEqual({ version: '9.9.9', byPriority: {
+        P0: { s: { 0: 1, 1: 0, 2: 0, 3: 1 }, total: 3, missing: 1 },
+        P1: { s: { 0: 0, 1: 1, 2: 1, 3: 0 }, total: 3, missing: 1 },
+      }, total: 6, missing: 2 });
+      expect(readFileSync(ledger)).toEqual(before);
+      expect(listChecklist('9.9.9')).toEqual(snapshot);
+      stdout.length = 0;
+      await run('budget', '--version', '9.9.8', '--json');
+      expect(stdout).toHaveLength(1);
+      expect(JSON.parse(stdout[0]!)).toEqual({ version: '9.9.8', byPriority: {
+        P0: { s: { 0: 0, 1: 0, 2: 0, 3: 0 }, total: 0, missing: 0 },
+        P1: { s: { 0: 0, 1: 0, 2: 0, 3: 0 }, total: 0, missing: 0 },
+      }, total: 0, missing: 0 });
+      expect(existsSync(join(dir, 'release', '9.9.8'))).toBe(false);
+      await run('checklist', 'add', 'P0-SOLO', rubric(3), '--priority', 'P0', '--version', '9.9.7');
+      stdout.length = 0;
+      await run('budget', '--version', '9.9.7', '--json');
+      expect(JSON.parse(stdout[0]!)).toMatchObject({
+        byPriority: { P0: { s: { 3: 1 }, total: 3, missing: 0 } },
+        total: 3,
+      });
+    } finally { log.mockRestore(); write.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('add → set → status JSON · actor · 사람 상태 · rm, 기존 help 명령 보존', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-checklist-cli-'));
     setElanousConfigDir(dir);
@@ -176,7 +292,7 @@ describe('release checklist CLI', () => {
       expect(listChecklist('9.9.9').items).toHaveLength(0);
       const cmd = new Command(); registerReleaseCommands(cmd);
       const release = cmd.commands.find((c) => c.name() === 'release')!;
-      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'place', 'rebalance', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'gate-history', 'rehearsal', 'auto-start']);
+      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'place', 'rebalance', 'budget', 'pull-forward', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'gate-history', 'rehearsal', 'auto-start']);
       expect(release.commands.find((c) => c.name() === 'prepare')!.helpInformation()).toContain('네트워크 쓰기 없음');
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');
@@ -798,6 +914,10 @@ describe('release run CLI', () => {
       git(dir, 'init', '-q', '-b', 'main', repo);
       git(repo, 'config', 'user.name', 'Fixture');
       git(repo, 'config', 'user.email', 'fixture@example.invalid');
+      // This disposable repository must exercise the real push even when the parent pod installs a global hook.
+      const hooks = join(dir, 'empty-hooks');
+      mkdirSync(hooks);
+      git(repo, 'config', 'core.hooksPath', hooks);
       git(repo, 'remote', 'add', 'origin', remote);
       writeFileSync(join(repo, 'package.json'), '{"version":"0.2.4"}\n');
       git(repo, 'add', 'package.json');

@@ -5,10 +5,17 @@ import { join } from 'node:path';
 import { canonicalGraphJson, parseGraphTemplateYaml } from '../../../../../src/self-implement/graph-yaml';
 import { CORE_GRAPH_KINDS } from '@/lib/run-graph-yaml-edit';
 import {
+  CANVAS_NODE_SIZE,
   addNode,
   applyCanvasRunStep,
   applyCanvasRunSteps,
+  autoLayoutToFit,
+  canvasUnitNames,
+  canvasUnitOf,
+  collapseCanvasUnits,
   connect,
+  canvasGroupGraph,
+  projectCanvasGroups,
   defaultOutcome,
   emptyGraph,
   failTarget,
@@ -28,6 +35,11 @@ import {
 import { saveCanvasGraph, type CanvasSaveClient } from './graph-canvas-save';
 import { NexusApiError } from '@/nexus/client';
 import type { RunStep } from '../../../../../src/self-implement/run-step-projection';
+import { createElement } from 'react';
+import { act, create } from 'react-test-renderer';
+import { ReactFlow } from '@xyflow/react';
+import { GraphCanvasEditor, type GraphCanvasContext } from './GraphCanvasEditor';
+import { groupBoxes } from './graph-groups';
 
 function threeNodeLine(): CanvasGraph {
   let graph = emptyGraph('cge-demo');
@@ -143,6 +155,86 @@ describe('graph canvas model (CGE-EDIT)', () => {
     expect(failTarget(graph, 'B')).toBeNull();
     expect(() => setFailTarget(graph, 'B', 'B')).toThrow();
   });
+});
+
+describe('editor unit views', () => {
+  test('group tags round-trip through the YAML ledger; expanded boxes keep original positions and edges', () => {
+    const original = threeNodeLine();
+    const tagged = { ...original, nodes: original.nodes.map((node, index) => index < 2
+      ? { ...node, extra: { group: 'planning', contract: { visits: 2 } } } : node) };
+    const yaml = toYaml(tagged);
+    const loaded = fromYaml(yaml);
+    expect(loaded.nodes[0]?.extra).toEqual({ group: 'planning', contract: { visits: 2 } });
+    expect(canvasGroupGraph(loaded).nodes.map((node) => node.group)).toEqual(['planning', 'planning', undefined]);
+    expect(projectCanvasGroups(loaded, new Set())).toBe(loaded);
+    expect(projectCanvasGroups(loaded, new Set(['unknown']))).toBe(loaded);
+    expect(toYaml(projectCanvasGroups(loaded, new Set()))).toBe(yaml);
+  });
+
+  test('folded view has one clickable unit id and rewired edges; opening shows only inside edges, without changing YAML', () => {
+    const base = threeNodeLine();
+    const tagged = { ...base, nodes: base.nodes.map((node, index) => index < 2 ? { ...node, extra: { group: 'planning' } } : node) };
+    const before = toYaml(tagged);
+    const folded = projectCanvasGroups(tagged, new Set(['planning']));
+    expect(folded.nodes.map((node) => node.id)).toEqual(['group:planning', 'C']);
+    expect(folded.edges).toEqual([{ from: 'group:planning', to: 'C', outcome: '' }]);
+    expect(folded.entry).toBe('group:planning');
+    expect(folded.terminals).toEqual(['C']);
+    expect(folded.nodes[0]?.recipe).toBe('묶음 · 노드 2개');
+    const inside = projectCanvasGroups(tagged, new Set(['planning']), 'planning');
+    expect(inside.nodes.map((node) => node.id)).toEqual(['A', 'B']);
+    expect(inside.edges).toEqual([{ from: 'A', to: 'B', outcome: '' }]);
+    expect(toYaml(tagged)).toBe(before);
+    const ending = { ...tagged, terminals: ['B'] };
+    expect(projectCanvasGroups(ending, new Set(['planning'])).terminals).toEqual(['group:planning']);
+  });
+});
+
+test('GraphCanvasEditor routes global fold, unit click, breadcrumb and per-box fold without editing YAML', () => {
+  const base = threeNodeLine();
+  const graph = { ...base, nodes: base.nodes.map((node, index) => index < 2 ? { ...node, extra: { group: 'planning' } } : node) };
+  const before = toYaml(graph);
+  const state: { context?: GraphCanvasContext } = {};
+  let root!: ReturnType<typeof create>;
+  const globals = globalThis as Record<string, unknown>;
+  const previousAct = globals.IS_REACT_ACT_ENVIRONMENT;
+  const previousWindow = globals.window;
+  const previousResize = globals.ResizeObserver;
+  const previousRaf = globals.requestAnimationFrame;
+  const noop = () => {};
+  globals.IS_REACT_ACT_ENVIRONMENT = true;
+  globals.requestAnimationFrame ??= (fn: () => void) => setTimeout(fn, 0);
+  globals.ResizeObserver ??= class { observe() {} unobserve() {} disconnect() {} };
+  globals.window ??= { requestAnimationFrame: globals.requestAnimationFrame, cancelAnimationFrame: clearTimeout, addEventListener: noop, removeEventListener: noop, devicePixelRatio: 1, matchMedia: () => ({ matches: false, addEventListener: noop, removeEventListener: noop }) };
+  try {
+    act(() => { root = create(createElement(GraphCanvasEditor, { palette: [], client: null, initialGraph: graph, onChange: (context) => { state.context = context; } })); });
+    const flow = () => root.root.findByType(ReactFlow);
+    expect(flow().props.nodes.filter((node: { type: string }) => node.type === 'groupBox')).toHaveLength(1);
+    const box = flow().props.nodes.find((node: { type: string }) => node.type === 'groupBox');
+    expect(box.data).toMatchObject({ group: 'planning', state: 'pending', stepCount: 2 });
+    act(() => { root.update(createElement(GraphCanvasEditor, { palette: [], client: null, initialGraph: graph, nodeStatus: { A: 'done', B: 'failed' } })); });
+    expect(flow().props.nodes.find((node: { type: string }) => node.type === 'groupBox').data.state).toBe('failed');
+    act(() => { root.update(createElement(GraphCanvasEditor, { palette: [], client: null, initialGraph: graph, nodeStatus: { A: 'running', B: 'failed' } })); });
+    expect(flow().props.nodes.find((node: { type: string }) => node.type === 'groupBox').data.state).toBe('running');
+    act(() => { box.data.onCollapse('planning'); });
+    expect(flow().props.nodes.map((node: { id: string }) => node.id)).toContain('group:planning');
+    const unit = flow().props.nodes.find((node: { id: string }) => node.id === 'group:planning');
+    act(() => { flow().props.onNodeClick({}, unit); });
+    expect(root.root.findByProps({ 'aria-label': '유닛 보기' }).findAllByType('span').some((span) => span.children.includes('planning'))).toBe(true);
+    expect(flow().props.nodes.map((node: { id: string }) => node.id)).toEqual(['A', 'B']);
+    act(() => { root.root.findByProps({ 'aria-label': '부모 그래프' }).props.onClick(); });
+    expect(flow().props.nodes.map((node: { id: string }) => node.id)).toContain('group:planning');
+    act(() => { root.root.findByProps({ 'data-testid': 'editor-toggle-units' }).props.onClick(); });
+    expect(flow().props.nodes.filter((node: { type: string }) => node.type === 'groupBox')).toHaveLength(1);
+    expect(state.context?.yaml).toBe(before);
+    act(() => root.unmount());
+  } finally {
+    if (previousAct === undefined) delete globals.IS_REACT_ACT_ENVIRONMENT;
+    else globals.IS_REACT_ACT_ENVIRONMENT = previousAct;
+    if (previousWindow === undefined) delete globals.window; else globals.window = previousWindow;
+    if (previousResize === undefined) delete globals.ResizeObserver; else globals.ResizeObserver = previousResize;
+    if (previousRaf === undefined) delete globals.requestAnimationFrame; else globals.requestAnimationFrame = previousRaf;
+  }
 });
 
 describe('canvas run steps', () => {
@@ -306,4 +398,92 @@ test('tap-added nodes line up in reading order; the rework edge is the only back
     const [a, b] = graph.nodes;
     expect(flow === 'vertical' ? [a!.x === b!.x, a!.y < b!.y] : [a!.y === b!.y, a!.x < b!.x]).toEqual([true, true]);
   }
+});
+
+function unitGraph(): CanvasGraph {
+  const yaml = `graph_id: cge-units
+entry_node: intake-1
+terminal_nodes: [merge]
+nodes:
+  - { node_id: intake-1, kind: observe, recipe: r, max_visits: 1, group: intake }
+  - { node_id: intake-2, kind: observe, recipe: r, max_visits: 1, group: intake }
+  - { node_id: build, kind: agent, recipe: r, max_visits: 1 }
+  - { node_id: gate, kind: gate, recipe: r, max_visits: 1 }
+  - { node_id: open-pr, kind: git, recipe: r, max_visits: 2, group: land }
+  - { node_id: merge, kind: git, recipe: r, max_visits: 2, group: land }
+edges:
+  - { from: intake-1, to: intake-2 }
+  - { from: intake-2, to: build }
+  - { from: build, to: gate }
+  - from: gate
+    on: outcome
+    map: { pass: open-pr, fail: build }
+  - { from: open-pr, to: merge }
+`;
+  return fromYaml(yaml);
+}
+
+describe('unit views (CGE-UNITS)', () => {
+  test('units come from the `group:` node tags in first-declared order; a graph without tags has none', () => {
+    const graph = unitGraph();
+    expect(canvasUnitNames(graph)).toEqual(['intake', 'land']);
+    expect(canvasUnitOf(graph).get('intake-1')).toBe('intake');
+    expect(canvasUnitOf(graph).get('build')).toBeUndefined();
+    expect(canvasUnitNames(threeNodeLine())).toEqual([]);
+    // The tag survives the canvas round trip, so a saved unit graph keeps its units.
+    expect(canvasUnitNames(fromYaml(toYaml(graph)))).toEqual(['intake', 'land']);
+    expect(parseGraphTemplateYaml(toYaml(graph)).errors).toEqual([]);
+  });
+
+  test('folding reuses graph-groups collapseGroups: one node per folded unit, outer edges rewired, nothing duplicated', () => {
+    const graph = unitGraph();
+    expect(collapseCanvasUnits(graph, new Set())).toBe(graph);
+    const folded = collapseCanvasUnits(graph, new Set(['intake', 'land']));
+    expect([...folded.nodes.map((node) => node.id)].sort()).toEqual(['build', 'gate', 'group:intake', 'group:land']);
+    const intake = folded.nodes.find((node) => node.id === 'group:intake')!;
+    expect(intake).toMatchObject({ kind: 'subgraph', recipe: '묶음 · 노드 2개', maxVisits: 1 });
+    expect(folded.nodes.filter((node) => node.id === 'group:intake')).toHaveLength(1);
+    expect(folded.entry).toBe('group:intake');
+    expect(folded.terminals).toEqual(['group:land']);
+    expect(folded.edges.map((edge) => `${edge.from}->${edge.to}(${edge.outcome})`).sort()).toEqual([
+      'build->gate()', 'gate->build(fail)', 'gate->group:land(pass)', 'group:intake->build()',
+    ]);
+    // A view, not an edit: the source graph still has all six nodes and its own entry.
+    expect(graph.nodes).toHaveLength(6);
+    expect(graph.entry).toBe('intake-1');
+  });
+
+  test('folding one unit replaces only that unit — the other keeps its member nodes', () => {
+    const folded = collapseCanvasUnits(unitGraph(), new Set(['land']));
+    expect([...folded.nodes.map((node) => node.id)].sort()).toEqual(['build', 'gate', 'group:land', 'intake-1', 'intake-2']);
+    expect(folded.entry).toBe('intake-1');
+    expect(folded.terminals).toEqual(['group:land']);
+    expect(folded.edges.map((edge) => `${edge.from}->${edge.to}(${edge.outcome})`).sort()).toEqual([
+      'build->gate()', 'gate->build(fail)', 'gate->group:land(pass)', 'intake-1->intake-2()', 'intake-2->build()',
+    ]);
+  });
+
+  test('opening a folded unit gives the expanded box a fitView target that exists in the rendered node set', () => {
+    const graph = unitGraph();
+    const unitOf = canvasUnitOf(graph);
+    const sizeOf = (nodes: CanvasGraph['nodes']) =>
+      nodes.map((node) => ({ id: node.id, position: { x: node.x, y: node.y }, ...CANVAS_NODE_SIZE }));
+    // Before the click both units are folded — no box anywhere, so there is nothing to fit yet.
+    const before = autoLayoutToFit(collapseCanvasUnits(graph, new Set(['intake', 'land'])), 'horizontal', undefined);
+    expect(groupBoxes(sizeOf(before.nodes), unitOf)).toEqual([]);
+    // onNodeClick → openUnit('land'): what stays folded is intake alone — the exact view the editor renders.
+    const viewGraph = autoLayoutToFit(collapseCanvasUnits(graph, new Set(['intake'])), 'horizontal', undefined);
+    const boxes = groupBoxes(sizeOf(viewGraph.nodes), unitOf);
+    const target = boxes.find((box) => box.group === 'land');
+    expect(target).toBeDefined();
+    // The canvas renders exactly these ids (boxNodes + flowNodes); the fit target is the box the opened unit
+    // actually got — a hand-built id that missed this set would make fitView a silent no-op.
+    expect(boxes.some((box) => box.id === target!.id)).toBe(true);
+    expect(viewGraph.nodes.some((node) => node.id === target!.id)).toBe(false);
+    expect([...target!.members].sort()).toEqual(['merge', 'open-pr']);
+    expect(target!.width).toBeGreaterThan(0);
+    expect(target!.height).toBeGreaterThan(0);
+    // Still-folded intake has no box — nothing to fit and nothing opened.
+    expect(boxes.some((box) => box.group === 'intake')).toBe(false);
+  });
 });

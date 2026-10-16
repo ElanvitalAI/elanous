@@ -16,22 +16,24 @@ export interface TextInputControlState {
 }
 
 export function resolveTextInputControlAction(
-  key: Pick<Key, 'name' | 'ctrl' | 'shift'>,
+  key: Pick<Key, 'name' | 'ctrl' | 'shift'> & { alt?: boolean },
   state: TextInputControlState,
 ): TextInputControlAction {
   const stripTrailingBackslash =
     key.name === 'enter'
     && state.cursor > 0
     && state.currentLine[state.cursor - 1] === '\\';
+  // ⭐ Alt+Enter 도 줄바꿈이다 — kitty 프로토콜을 켠 멀티플렉서(herdr)는 바깥의 `ESC CR` 을
+  //    `CSI 13;3u`(alt) 로 바꿔 넘긴다. 종전엔 그 꼴이 «제출»로 떨어져 대체 키가 죽어 있었다.
   const isNewline =
-    (key.name === 'enter' && key.shift)
+    (key.name === 'enter' && (key.shift || key.alt === true))
     || (key.name === 'j' && key.ctrl)
     || stripTrailingBackslash;
 
   if (isNewline) {
     return { kind: 'newline', stripTrailingBackslash };
   }
-  if (key.name === 'enter' && !key.shift) {
+  if (key.name === 'enter' && !key.shift && !key.alt) {
     return { kind: 'submit' };
   }
   if (key.name === 'escape') {

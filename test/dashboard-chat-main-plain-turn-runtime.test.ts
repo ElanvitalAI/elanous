@@ -36,14 +36,14 @@ function buildDeps(overrides: Partial<DashboardChatMainPlainTurnRuntimeDeps> = {
   const errorLines: string[] = [];
   const actionEffects: unknown[] = [];
   const armedTurnRefs: Array<{ userText: string }> = [];
-  const debugEvents: Array<{ category: string; event: string; payload: Record<string, unknown> }> = [];
+  const debugEvents: Array<{ category: string; event: string; payload: Record<string, unknown>; level?: string }> = [];
   const userMsg = { content: 'user text' };
 
   const deps: DashboardChatMainPlainTurnRuntimeDeps = {
     userText: 'hello world',
     contextText: 'ctx',
     turnStartedAt: 123,
-    debugLog: (category, event, payload) => { debugEvents.push({ category, event, payload }); },
+    debugLog: (category, event, payload, opts) => { debugEvents.push({ category, event, payload, ...(opts?.level ? { level: opts.level } : {}) }); },
     thinking: makeThinking(),
     benchmarkMode: false,
     attachedSessionId: null,
@@ -402,6 +402,10 @@ describe('runDashboardChatMainPlainTurn', () => {
     expect(failed?.category).toBe('chat-main.plain-turn');
     expect(failed?.payload).toMatchObject({ stage: expect.any(String), message: 'stream exploded' });
     expect(typeof failed?.payload.stackHead === 'string' || failed?.payload.stackHead === undefined).toBe(true);
+    // TUI-STALE-BUSY-MARKER(#58) — 같은 실패가 tui 범주 한 곳에도 남는다.
+    const threw = ctx.debugEvents.find((event) => event.category === 'tui.turn' && event.event === 'turn-threw');
+    expect(threw?.payload).toMatchObject({ error: 'stream exploded', phase: expect.stringMatching(/^turn:/) });
+    expect(threw?.level).toBe('warn');
   });
 
   it('uses JSON-RPC internal-error details for the failed-turn summary and error line', async () => {

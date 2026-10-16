@@ -12,6 +12,9 @@
 //    - Enter 없는 글: 빈 composer 면 종전대로 채우고, 바쁘면(턴 중·버퍼에 글자) «거부»한다 —
 //      나중에 사용자 composer 에 채우면 다시 섞이므로 대기시키지 않는다(IPC 가 실패로 정산 → rc≠0).
 //    대기열은 «턴이 끝나고 composer 가 비었을 때» 한 건씩 나간다 — 사용자 버퍼는 건드리지 않는다.
+//    - ⏹ 정확히 `/stop`·`/esc` 인 글(TUI-STOP-INPUT-BYPASS · #68): 대기열을 «건너뛰고» 지금 턴의 ESC 중단 경로
+//      (`requestStop` → 대시보드 escGate)를 바로 부른다. 대기 중인 일반 항목은 그대로·순서대로 남는다.
+//      턴이 없으면 아무것도 안 하고 `tui-stop-no-active-turn`(멈출 길이 없으면 `tui-stop-undelivered`)으로 던져 바깥 호출자(rc≠0)에게 알린다.
 //
 // ⚠️ herdr/tmux 처럼 «터미널 자체»에 쓰는 길은 키보드와 구별할 수 없다 — 이 라우터는
 //    elanous 제어 IPC(`pty text`) 경로만 가른다.
@@ -33,11 +36,15 @@ export interface ExternalInputHost {
   hasPendingKeys(): boolean;
   /** 별도 메시지로 제출한다. 못 보냈으면 false(항목은 대기열에 남는다). */
   submit(text: string, source: InputSourceRef): boolean;
+  /** 지금 턴을 ESC 와 같은 경로로 멈춘다. 멈출 턴(escGate)이 없으면 false. 없으면 외부 stop 은 «턴 없음»으로 처리. */
+  requestStop?(): boolean;
+  /** 외부 stop 의 결과 표지(채팅 로그 한 줄). */
+  onExternalStop?(result: 'stopped' | 'no-turn' | 'failed'): void;
   /** 대기열이 바뀌었다 — 화면 표지를 다시 그린다. */
   onQueueChange?(pending: readonly ExternalInputItem[], event: 'queued' | 'delivered'): void;
 }
 
-export type ExternalInputRoute = 'passthrough' | 'submitted' | 'queued';
+export type ExternalInputRoute = 'passthrough' | 'submitted' | 'queued' | 'stopped';
 export type ExternalInputDecision = 'passthrough' | 'submit-now' | 'queue' | 'reject';
 
 const EXTERNAL_INPUT_SOURCE: InputSourceRef = { kind: 'terminal', provider: 'pty' };
@@ -55,6 +62,11 @@ export function parseExternalTextLine(chars: string): { text: string; submit: bo
   // eslint-disable-next-line no-control-regex
   if (/[\x00-\x1f\x7f]/.test(text)) return null;
   return { text, submit };
+}
+
+/** 외부 «멈춰» 명령인가 — 정확히 `/stop` 또는 `/esc`(앞뒤 공백·대소문자 변형은 일반 글). */
+export function isExternalStopCommand(text: string): boolean {
+  return text === '/stop' || text === '/esc';
 }
 
 /** 라우팅 판정(순수). */
@@ -102,11 +114,14 @@ export interface ExternalInputQueueDeps {
   /** 펌프 스케줄러 — 정지 함수를 돌려준다. 시험이 손으로 돌린다. */
   schedule?: (tick: () => void, ms: number) => () => void;
   log?: (event: string, data: Record<string, unknown>) => void;
+  /** 외부 stop 관측 — 기본 `debug.log('tui.input', …)`. */
+  logInput?: (event: string, data: Record<string, unknown>) => void;
 }
 
 export function createExternalInputQueue(deps: ExternalInputQueueDeps = {}) {
   const now = deps.now ?? Date.now;
   const log = deps.log ?? ((event, data) => debug.log('tui.external-input', event, data));
+  const logInput = deps.logInput ?? ((event, data) => debug.log('tui.input', event, data));
   const schedule = deps.schedule ?? ((tick, ms) => {
     const t = setInterval(tick, ms);
     (t as { unref?: () => void }).unref?.();
@@ -153,6 +168,22 @@ export function createExternalInputQueue(deps: ExternalInputQueueDeps = {}) {
     return true;
   }
 
+  /** ⏹ 외부 stop — 대기열을 건너뛰고 지금 턴의 escGate 로. 대기열은 건드리지 않는다. */
+  function routeStop(h: ExternalInputHost, text: string): ExternalInputRoute {
+    let turnActive = false;
+    try { turnActive = h.isTurnActive(); } catch { turnActive = false; }
+    let stopped = false;
+    if (turnActive && h.requestStop) {
+      try { stopped = h.requestStop(); } catch { stopped = false; }
+    }
+    logInput('external-stop', { hadTurn: turnActive, stopped, command: text, pending: pending.length });
+    const result = stopped ? 'stopped' : turnActive ? 'failed' : 'no-turn';
+    try { h.onExternalStop?.(result); } catch { /* fail-soft */ }
+    if (result === 'no-turn') throw new Error('tui-stop-no-active-turn');
+    if (result === 'failed') throw new Error('tui-stop-undelivered');
+    return 'stopped';
+  }
+
   return {
     register(next: ExternalInputHost): () => void {
       host = next;
@@ -169,6 +200,7 @@ export function createExternalInputQueue(deps: ExternalInputQueueDeps = {}) {
       // `pty key`(input-key)는 «키»다 — 공백·`j` 처럼 출력 가능한 키도 종전대로 넣는다.
       if (keyCommandDepth > 0) return 'passthrough';
       const line = parseExternalTextLine(chars);
+      if (line && host && isExternalStopCommand(line.text)) return routeStop(host, line.text);
       let turnActive = false; let composer: string | undefined; let pendingKeys = false;
       if (host && line) {
         try { turnActive = host.isTurnActive(); composer = host.composerText(); pendingKeys = host.hasPendingKeys(); }

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { orderProviderChoices, runFirstRun } from './first-run.js';
+import { orderProviderChoices, parseMenuAnswer, promptProviderMenu, runFirstRun } from './first-run.js';
 import { debug } from '../debug/log.js';
 import { unattendedNextStepLine } from './entry-hints.js';
 import { buildUserConfig, saveUserConfig } from '../user-config.js';
@@ -317,6 +317,40 @@ describe('first run', () => {
         chooseProvider: async () => null })).toEqual({ outcome: 'cancelled', inputs: 1 });
       expect(buildUserConfig(f.path).onboarding.ready).toBeUndefined();
     } finally { f.cleanup(); }
+  });
+
+  test('menu answer: empty cancels, a valid index chooses, whitespace trims like before', () => {
+    const choices = orderProviderChoices(['grok']);
+    expect(parseMenuAnswer('', choices)).toEqual({ kind: 'cancel' });
+    expect(parseMenuAnswer('   ', choices)).toEqual({ kind: 'cancel' });
+    expect(parseMenuAnswer('1', choices)).toEqual({ kind: 'chosen', provider: 'grok' });
+    expect(parseMenuAnswer(' 2 ', choices)).toEqual({ kind: 'chosen', provider: 'openai-codex' });
+  });
+
+  // FIRST10-FIX 판정선: 오타가 first-run 전체를 취소(구 동작)하는지, 재질문(신 동작)하는지.
+  test('a menu typo no longer cancels the first run — every miss re-asks instead of cancelling', () => {
+    const choices = orderProviderChoices(['grok']);
+    expect(parseMenuAnswer('4', choices).kind).toBe('miss'); // out of range
+    expect(parseMenuAnswer('0', choices).kind).toBe('miss'); // not an offered index
+    expect(parseMenuAnswer('-1', choices).kind).toBe('miss');
+    expect(parseMenuAnswer('grok', choices).kind).toBe('miss'); // provider names are not menu input
+    expect(parseMenuAnswer('1.5', choices).kind).toBe('miss');
+    expect(parseMenuAnswer('1e1', choices).kind).toBe('miss');
+    expect(parseMenuAnswer('１', choices).kind).toBe('miss'); // full-width digit
+  });
+
+  test('promptProviderMenu re-asks the same menu until a real choice or an explicit cancel', async () => {
+    const prompts: string[] = [];
+    const ask = async (prompt: string): Promise<string> => {
+      prompts.push(prompt);
+      return ['4', 'abc', ' 2 '][prompts.length - 1] ?? '';
+    };
+    await expect(promptProviderMenu(ask, ['grok'])).resolves.toBe('openai-codex');
+    expect(prompts).toHaveLength(3);
+    expect(new Set(prompts).size).toBe(1); // the menu never changes between re-asks
+    expect(prompts[0]).toContain('Enter to cancel');
+    expect(prompts[0]).toContain('1 Grok');
+    await expect(promptProviderMenu(async () => '', ['grok'])).resolves.toBeNull();
   });
 
   // ⚠️ util-linux `script -q -e -c` 문법이다 — 맥(BSD script)은 이 문법도, 파이프 입력으로 PTY 를 세우는 것도 못 한다

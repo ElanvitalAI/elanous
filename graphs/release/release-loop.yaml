@@ -15,10 +15,13 @@ nodes:
   - { node_id: cutoff, kind: judge, recipe: 'cmd:cutoff', max_visits: 1 }
   - { node_id: checklist-gate, kind: gate, recipe: 'cmd:checklist-gate', max_visits: 1 }
   # cmd:docs dispatches by graph node ID: bounded prefetch before gate, TUI join after upgrade, docs write after both.
+  # Public export is checked before expensive prefetch/gate work; a leak stops the release immediately.
+  - { node_id: export-check, kind: gate, recipe: 'cmd:export-check', max_visits: 1 }
   - { node_id: prefetch, kind: agent, recipe: 'cmd:docs', max_visits: 1 }
   - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1, notify: { on: [fail] } }
+  # S1 shadow: classify and record only; all exits still terminate through the existing failed node.
+  - { node_id: gate-triage, kind: judge, recipe: 'cmd:gate-triage', max_visits: 1 }
   - { node_id: mac-smoke, kind: gate, recipe: 'cmd:mac-smoke', max_visits: 1 }
-  - { node_id: export-check, kind: gate, recipe: 'cmd:export-check', max_visits: 1 }
   - { node_id: pwa, kind: gate, recipe: 'cmd:pwa', max_visits: 1, notify: { on: [fail] } }
   - { node_id: prepare, kind: agent, recipe: 'cmd:prepare', max_visits: 1, notify: { on: [fail] } }
   - { node_id: upgrade, kind: gate, recipe: 'cmd:upgrade', max_visits: 1 }
@@ -42,13 +45,14 @@ nodes:
 edges:
   - { from: version-release, on: outcome, map: { ok: cutoff, fail: failed, error: failed } }
   - { from: cutoff, on: outcome, map: { ok: checklist-gate, fail: failed, error: failed } }
-  - { from: checklist-gate, on: outcome, map: { ok: prefetch, fail: failed, error: failed } }
+  - { from: checklist-gate, on: outcome, map: { ok: export-check, fail: failed, error: failed } }
+  - { from: export-check, on: outcome, map: { ok: prefetch, fail: failed, error: failed } }
   # Prefetch never gates: even a crashed prefetch node is a cache miss — the late nodes take their original paths.
   - { from: prefetch, on: outcome, map: { ok: gate, fail: gate, error: gate } }
-  - { from: gate, on: outcome, map: { ok: mac-smoke, fail: failed, error: failed } }
+  - { from: gate, on: outcome, map: { ok: mac-smoke, fail: gate-triage, error: gate-triage } }
+  - { from: gate-triage, on: outcome, map: { ok: failed, fail: failed, error: failed } }
   # Warning-only: a macOS failure or unmeasured run never blocks publishing — auto-approve shows it as a warning row.
-  - { from: mac-smoke, on: outcome, map: { ok: export-check, fail: export-check, error: export-check } }
-  - { from: export-check, on: outcome, map: { ok: pwa, fail: failed, error: failed } }
+  - { from: mac-smoke, on: outcome, map: { ok: pwa, fail: pwa, error: pwa } }
   - { from: pwa, on: outcome, map: { ok: prepare, fail: failed, error: failed } }
   - { from: prepare, on: outcome, map: { ok: upgrade, fail: failed, error: failed } }
   - { from: upgrade, on: outcome, map: { ok: tui, fail: failed, error: failed } }

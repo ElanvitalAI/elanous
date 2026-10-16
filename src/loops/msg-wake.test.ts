@@ -3,8 +3,9 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { MsgStore } from '../msg/msg-store.js';
 import { spawn } from 'node:child_process';
-import { claimWake, resolveWake, wakeLine, wakeRecipient, WAKE_DEBOUNCE_MS, type WakeDeps } from './msg-wake.js';
+import { claimWake, MAX_REDELIVER_ATTEMPTS, PENDING_WAKE_TTL_MS, redeliverLine, redeliverPendingWakes, resolveWake, startPendingWakePoller, wakeLine, wakeRecipient, WAKE_DEBOUNCE_MS, type WakeDeps } from './msg-wake.js';
 
 // Real Bun subprocesses can exceed Bun's 5 s default under gate-pod load.
 setDefaultTimeout(60_000);
@@ -363,4 +364,200 @@ test('a symlink named wake-inject is not an opt-in, even when it points at a reg
   const f = fixture({ seatStateRoot: seats, readPane: undefined, hasOptIn: undefined });
   expect(await wakeRecipient('MK', 1, { from: 'UX' }, f.deps)).toMatchObject({ result: 'skipped', reason: 'human-pane-no-opt-in', optIn: false });
   expect(f.herdr).toEqual([]);
+});
+
+// ── 미룬 깨움(TUI-H4) — 버리지 않고 미뤘다가 idle 뒤 한 번 ─────────────────────
+
+const pendingEvents = (log: { mock: { calls: unknown[][] } }) =>
+  log.mock.calls.filter(call => call[0] === 'loops.msg-wake').map(call => [call[1], (call[2] as { seat: string; count: number }).seat, (call[2] as { count: number }).count]);
+
+test('a wake that meets a busy TUI is deferred, then redelivered exactly once after the turn is recorded idle', async () => {
+  const f = fixture();
+  const log = spyOn(debug, 'log');
+  try {
+    f.setTurn('busy');
+    expect((await wakeRecipient('OPT', 11, { from: 'OP' }, f.deps)).result).toBe('busy');
+    expect(pendingEvents(log)).toEqual([['deferred', 'OPT', 1]]);
+    // 아직 턴 중 — 그대로 미룸(주입 0 · 로그 0).
+    expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'waiting', count: 1, reason: 'turn=busy' }]);
+    expect(f.injected).toEqual([]);
+    f.setTurn('idle');
+    expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'redelivered', count: 1 }]);
+    expect(f.injected).toEqual([['tui:1', '[우편 깨움 · 미룬 1통] OP → OPT #11 — eln msg list --to OPT 로 읽고 처리']]);
+    expect(pendingEvents(log)).toEqual([['deferred', 'OPT', 1], ['redelivered', 'OPT', 1]]);
+    // 한 번만 — 다음 틱은 할 일이 없다.
+    f.advance(WAKE_DEBOUNCE_MS);
+    expect(await redeliverPendingWakes(f.deps)).toEqual([]);
+    expect(f.injected).toHaveLength(1);
+  } finally { log.mockRestore(); }
+});
+
+test('several posts inside the debounce window fold into one redelivery that waits for the window too', async () => {
+  const f = fixture();
+  expect((await wakeRecipient('OPT', 20, { from: 'OP' }, f.deps)).result).toBe('injected');
+  expect((await wakeRecipient('OPT', 21, { from: 'OP' }, f.deps)).result).toBe('debounced');
+  expect((await wakeRecipient('OPT', 22, { from: 'MK' }, f.deps)).result).toBe('debounced');
+  // idle 이어도 5분 창 안이면 버림이 아니라 미룸.
+  expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'waiting', count: 2, reason: 'debounced' }]);
+  expect(f.injected).toHaveLength(1);
+  f.advance(WAKE_DEBOUNCE_MS);
+  expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'redelivered', count: 2 }]);
+  expect(f.injected.at(-1)).toEqual(['tui:1', '[우편 깨움 · 미룬 2통] MK → OPT #21..#22 — eln msg list --to OPT 로 읽고 처리']);
+  f.advance(WAKE_DEBOUNCE_MS);
+  expect(await redeliverPendingWakes(f.deps)).toEqual([]);
+  expect(f.injected).toHaveLength(2);
+});
+
+test('a fresh injected wake absorbs what was pending; the poller only re-knocks its own pty', async () => {
+  const f = fixture();
+  f.setTurn('busy');
+  await wakeRecipient('OPT', 30, { from: 'OP' }, f.deps);
+  expect(await redeliverPendingWakes(f.deps, { target: 'tui:other' })).toEqual([]);
+  f.setTurn('idle');
+  expect((await wakeRecipient('OPT', 31, { from: 'OP' }, f.deps)).result).toBe('injected');
+  f.advance(WAKE_DEBOUNCE_MS);
+  expect(await redeliverPendingWakes(f.deps)).toEqual([]);
+  expect(f.injected).toEqual([['tui:1', wakeLine('OP', 'OPT', 31)]]);
+});
+
+test('failed re-knocks count toward the cap and then give up; a stale deferral gives up by TTL', async () => {
+  let fail = true;
+  const f = fixture({ ptyInjector: async () => async () => { if (fail) throw new Error('denied'); } });
+  const log = spyOn(debug, 'log');
+  try {
+    f.setTurn('busy');
+    await wakeRecipient('OPT', 40, { from: 'OP' }, f.deps);
+    f.setTurn('idle');
+    for (let i = 1; i < MAX_REDELIVER_ATTEMPTS; i++) {
+      expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'failed', count: 1, reason: 'denied' }]);
+    }
+    // 상한째 실패는 «그 틱에» gave-up 으로 닫힌다.
+    expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'gave-up', count: 1, reason: `attempts>=${MAX_REDELIVER_ATTEMPTS}:denied` }]);
+    expect(pendingEvents(log).at(-1)).toEqual(['gave-up', 'OPT', 1]);
+    expect(await redeliverPendingWakes(f.deps)).toEqual([]);
+    fail = false;
+    f.setTurn('busy');
+    await wakeRecipient('OPT', 41, { from: 'OP' }, f.deps);
+    f.advance(PENDING_WAKE_TTL_MS + 1);
+    expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'gave-up', count: 1, reason: 'ttl' }]);
+    // 폴러가 없어도(TUI 가 안 돌아옴) 다음 post 가 낡은 줄을 거둔다.
+    await wakeRecipient('OPT', 42, { from: 'OP' }, f.deps);
+    f.advance(PENDING_WAKE_TTL_MS + 1);
+    const before = pendingEvents(log).length;
+    await wakeRecipient('COORDINATOR', 43, { from: 'OP' }, f.deps);
+    expect(pendingEvents(log).slice(before)).toEqual([['gave-up', 'OPT', 1]]);
+    expect(await redeliverPendingWakes(f.deps)).toEqual([]);
+  } finally { log.mockRestore(); }
+});
+
+test('the test universe never records or redelivers deferrals; the poller re-knocks on its tick', async () => {
+  const isolated = fixture({ live: false });
+  isolated.setTurn('busy');
+  await wakeRecipient('OPT', 50, { from: 'OP' }, isolated.deps);
+  expect(await redeliverPendingWakes({ ...isolated.deps, live: true })).toEqual([]);
+  const f = fixture();
+  f.setTurn('busy');
+  await wakeRecipient('OPT', 51, { from: 'OP' }, f.deps);
+  f.setTurn('idle');
+  const stop = startPendingWakePoller('tui:1', f.deps, 5);
+  try {
+    for (let i = 0; i < 100 && f.injected.length === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  } finally { stop(); }
+  expect(f.injected).toEqual([['tui:1', redeliverLine({ address: 'OPT', last_from: 'OP', first_msg_id: 51, last_msg_id: 51, count: 1 })]]);
+});
+
+test('a slow fresh wake only absorbs what was stored before it — a later deferral survives and is redelivered', async () => {
+  let release: () => void = () => {};
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const injected: string[] = [];
+  const f = fixture({ ptyInjector: async () => async (_id, line) => { injected.push(line); if (injected.length === 1) await gate; } });
+  // B(#60) 주입이 끝나기 전에 A(#61) 가 창에 막혀 미뤄진다 — B 의 늦은 정리가 A 를 지우면 안 된다.
+  const slow = wakeRecipient('OPT', 60, { from: 'OP' }, { ...f.deps, timeoutMs: 5_000 });
+  for (let i = 0; i < 100 && injected.length === 0; i++) await new Promise(resolve => setTimeout(resolve, 1));
+  expect((await wakeRecipient('OPT', 61, { from: 'MK' }, f.deps)).result).toBe('debounced');
+  release();
+  expect((await slow).result).toBe('injected');
+  f.advance(WAKE_DEBOUNCE_MS);
+  expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'redelivered', count: 1 }]);
+  expect(injected.at(-1)).toBe('[우편 깨움 · 미룬 1통] MK → OPT #61 — eln msg list --to OPT 로 읽고 처리');
+});
+
+test('concurrent deferrals that land in reverse id order still show the id range and the newest sender', async () => {
+  const f = fixture();
+  f.setTurn('busy');
+  await wakeRecipient('OPT', 72, { from: 'MK' }, f.deps);
+  await wakeRecipient('OPT', 71, { from: 'OP' }, f.deps);
+  f.setTurn('idle');
+  expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'redelivered', count: 2 }]);
+  expect(f.injected).toEqual([['tui:1', '[우편 깨움 · 미룬 2통] MK → OPT #71..#72 — eln msg list --to OPT 로 읽고 처리']]);
+});
+
+test('a new letter merged during the capped failing re-knock is not given up — it gets fresh attempts', async () => {
+  let fail = true;
+  let merge = false;
+  const injected: string[] = [];
+  const holder: { f?: ReturnType<typeof fixture> } = {};
+  const f = fixture({ ptyInjector: async () => async (_id, line) => {
+    if (merge) { merge = false; holder.f!.setTurn('busy'); await wakeRecipient('OPT', 81, { from: 'MK' }, holder.f!.deps); holder.f!.setTurn('idle'); }
+    if (fail) throw new Error('denied');
+    injected.push(line);
+  } });
+  holder.f = f;
+  const log = spyOn(debug, 'log');
+  try {
+    f.setTurn('busy');
+    await wakeRecipient('OPT', 80, { from: 'OP' }, f.deps);
+    f.setTurn('idle');
+    for (let i = 1; i < MAX_REDELIVER_ATTEMPTS; i++) await redeliverPendingWakes(f.deps);
+    merge = true;
+    // 상한째 실패 — 그러나 그 사이 #81 이 합쳐져 묶음이 바뀌었다: gave-up 기록 0 · 줄은 남는다.
+    expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'waiting', count: 1, reason: 'batch-changed' }]);
+    expect(pendingEvents(log).filter(event => event[0] === 'gave-up')).toEqual([]);
+    fail = false;
+    expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'redelivered', count: 2 }]);
+    expect(injected).toEqual(['[우편 깨움 · 미룬 2통] MK → OPT #80..#81 — eln msg list --to OPT 로 읽고 처리']);
+  } finally { log.mockRestore(); }
+});
+
+// ── H4-FOLLOW ③ — 재두드림 전에 미읽음을 잰다(10-16 OPT 가 이미 ack 한 #9250 재두드림) ──
+
+test('a deferred wake whose letters were already read (unread 0) is dropped, not re-knocked — dropped-read', async () => {
+  let unread: number | null = 0;
+  const f = fixture({ readUnread: () => unread });
+  const log = spyOn(debug, 'log');
+  try {
+    f.setTurn('busy');
+    await wakeRecipient('OPT', 90, { from: 'OP' }, f.deps);
+    f.setTurn('idle');
+    expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'dropped-read', count: 1 }]);
+    expect(f.injected).toEqual([]);
+    expect(pendingEvents(log)).toEqual([['deferred', 'OPT', 1], ['dropped-read', 'OPT', 1]]);
+    // 줄이 지워졌다 — 다음 틱은 할 일이 없다.
+    expect(await redeliverPendingWakes(f.deps)).toEqual([]);
+    // 반증: 미읽음 > 0 이면 그대로 재두드림 · «모름»(null)도 지우지 않는다.
+    for (const value of [2, null]) {
+      unread = value;
+      f.setTurn('busy');
+      await wakeRecipient('OPT', 91, { from: 'OP' }, f.deps);
+      f.setTurn('idle');
+      f.advance(WAKE_DEBOUNCE_MS);
+      expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'redelivered', count: 1 }]);
+    }
+    expect(f.injected).toHaveLength(2);
+  } finally { log.mockRestore(); }
+});
+
+test('without an injected reader the re-knock reads the real msg ledger beside the claims db', async () => {
+  const f = fixture();
+  mkdirSync(join(f.deps.stateRoot!, 'msg'), { recursive: true });
+  const store = new MsgStore(join(f.deps.stateRoot!, 'msg', 'messages.db'));
+  try {
+    const posted = store.post({ from: 'OP', to: 'OPT', body: 'hello' });
+    f.setTurn('busy');
+    await wakeRecipient('OPT', posted.id, { from: 'OP' }, f.deps);
+    store.ack('OPT', posted.id);
+    f.setTurn('idle');
+    expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'dropped-read', count: 1 }]);
+    expect(f.injected).toEqual([]);
+  } finally { store.close(); }
 });

@@ -24,6 +24,7 @@
 
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { debug } from '../debug/log.js';
 import { runLedgerDir } from '../self-implement/run-ledger.js';
 import type { SelfDevGoal, SelfDevJobResult } from './orchestrate.js';
 
@@ -36,10 +37,23 @@ export interface DecomposePiece {
   hotPaths?: readonly string[];
 }
 
+/** 형제 겹침 한 쌍 — 같은 hotPaths 를 만지는 조각 «둘» (a 가 배열에서 앞선 조각이다). */
+export interface HotPathOverlap {
+  a: string;
+  b: string;
+  paths: readonly string[];
+}
+
 export interface DecomposeProposal {
   /** 이 제안을 소비할 키. shardId 가 있으면 그것, 없으면 원장 런의 runId 다. */
   shardId: string;
   pieces: DecomposePiece[];
+  /**
+   * 형제 겹침 — 같은 파일을 만지는 조각쌍 목록. ⓑ 겹침 간선 제거(2026-10-16) 후 겹침은
+   * 직렬화하지 않고 «여기» 남는다(관측 `hot-path-overlap` — 형제 맥락 주입 ②·OVERLAP-SIBLING-CTX MK 가 읽는다).
+   * 겹침이 없으면 빈 배열이다 — 키를 생략하지 않는다.
+   */
+  hotPathOverlaps: readonly HotPathOverlap[];
   /** 몇 번째 라운드의 제안인가(늦게 난 것이 이긴다). 없으면 모른다. */
   round?: number;
 }
@@ -55,7 +69,22 @@ type GoalPlanRevisionObservation = NonNullable<SelfDevJobResult['goalPlanRevisio
 type GoalPlanRevisionReadObservation = Extract<GoalPlanRevisionObservation, { status: 'read' }>;
 type GoalPlanRevisionReadFailureObservation = Extract<GoalPlanRevisionObservation, { status: 'read-failed' }>;
 
-/** 순수: 원장 엔트리들에서 조각별 «가장 늦은» 분해 제안을 뽑는다. */
+/** 형제 겹침을 계산한다 — 같은 hotPaths 를 만지는 조각쌍(«배열 앞선 것»이 a 다). 순수 함수. */
+function hotPathOverlapsOf(pieces: readonly DecomposePiece[]): HotPathOverlap[] {
+  const pairs: HotPathOverlap[] = [];
+  for (let i = 0; i < pieces.length; i++) {
+    const a = pieces[i]!;
+    if (!a.hotPaths?.length) continue;
+    for (let j = i + 1; j < pieces.length; j++) {
+      const b = pieces[j]!;
+      const paths = a.hotPaths.filter((path) => b.hotPaths?.includes(path));
+      if (paths.length) pairs.push({ a: a.id, b: b.id, paths });
+    }
+  }
+  return pairs;
+}
+
+/** 원장 엔트리들에서 조각별 «가장 늦은» 분해 제안을 뽑는다. 형제 겹침이 있으면 hot-path-overlap 관측을 낸다(fail-open). */
 export function pickDecomposeProposals(entries: readonly Ledgerish[]): Map<string, DecomposeProposal> {
   const out = new Map<string, DecomposeProposal>();
   for (const entry of entries) {
@@ -85,7 +114,18 @@ export function pickDecomposeProposals(entries: readonly Ledgerish[]): Map<strin
     const prior = out.get(shardId);
     // 늦은 라운드가 이긴다. 라운드를 모르면 나중에 온 것이 이긴다(원장은 append-only).
     if (prior && round !== undefined && prior.round !== undefined && prior.round > round) continue;
-    out.set(shardId, { shardId, pieces, ...(round === undefined ? {} : { round }) });
+    // ⛔ 겹침은 «버리지 않는다» — 간선을 만들지 않는 대신 형제 겹침으로 따로 세어 관측한다.
+    //    형제 맥락 주입(②·OVERLAP-SIBLING-CTX MK)이 이 목록을 읽는다. 관측이 실패해도 읽기는 막지 않는다.
+    const hotPathOverlaps = hotPathOverlapsOf(pieces);
+    if (hotPathOverlaps.length) {
+      try { debug.log('self-dev.decompose', 'hot-path-overlap', { pairs: hotPathOverlaps }); } catch { /* fail-open */ }
+    }
+    out.set(shardId, {
+      shardId,
+      pieces,
+      hotPathOverlaps,
+      ...(round === undefined ? {} : { round }),
+    });
   }
   return out;
 }
@@ -97,7 +137,7 @@ export interface DecomposePieceOrdering {
   ordered?: DecomposePiece[];
   /** `dependsOn` 에서 «실제로 이어진» 간선 수. */
   dependsOnEdges: number;
-  /** `hotPaths` 겹침에서 파생된 간선 수. ⛔ 위와 «따로» 센다 — 합치면 어느 축이 일했는지 못 본다. */
+  /** `hotPaths` 겹침 간선 수. ⓑ 간선 제거(2026-10-16) 후에는 «항상 0» — 옛 독자를 위해 필드는 남는다. */
   hotPathEdges: number;
   /** `dependsOn` 이 «조각 목록에 없는 id» 를 가리켜 버린 수. 0 이 아니면 분해기 산출이 어긋난 것이다. */
   danglingDependsOn: number;
@@ -113,15 +153,10 @@ export interface DecomposePieceOrdering {
  *   📏 실측(2026-09-06 · `decomposition-shadow-goals` 전수): 분해 표본 13건 중 의존 0 = **0건**
  *     ⇒ 승격 가능 **0/13 = 0%**. 원장 132건 중 `attempted=true` 21건이 «전부» 실패했다.
  *
- * ⛔ 간선은 «두 축»이고 둘 다 「거부」가 아니라 「순서」다:
- *   ⓐ `dependsOn` — 분해기가 «의미»로 명시한 것.
- *   ⓑ `hotPaths` 겹침 — 같은 파일을 만지는 조각은 «앞선 것 먼저». 새로 만든 규칙이 아니라
- *      연합 경로 `orchestrate.ts:1105` 가 이미 쓰던 이 저장소의 «기존 결정»을 단일 경로에도 잇는 것이다.
- *
- * ⛔⭐ **두 축은 방향을 «다른 근거»로 정한다** — ⓐ 는 의미, ⓑ 는 배열 위치다.
- *   그래서 «섞어 걸면 가짜 순환»이 난다(B 가 A 에 의존하는데 B 가 배열 앞이면 A→B ⊕ B→A).
- *   ⇒ ⓐ 를 «먼저 전부» 걸고, ⓑ 는 반대 방향으로 이미 길이 있으면 «건너뛴다».
- *     건너뛰어도 안전한 이유: 길이 있다는 것은 그 둘이 «이미 직렬»이라는 뜻이고, ⓑ 의 목적이 직렬화다.
+ * ⛔ 간선은 «한 축»이다 — ⓐ `dependsOn`, 분해기가 «의미»로 명시한 것만 순서를 만든다.
+ *   ⓑ `hotPaths` 겹침 간선은 «제거됐다»(2026-10-16 · 대표 10-11 «겹침이라 미루는 현상 제거») —
+ *   겹침은 직렬화하지 않고 `DecomposeProposal.hotPathOverlaps` 로 형제 겹침으로 따로 남는다.
+ *   덕분에 ⓐ 와 배열 위치가 반대 방향을 가리켜 가짜 순환을 만들던 충돌 자체가 사라졌다.
  *
  * ⛔ 매달린 `dependsOn`(조각 목록에 없는 id)은 «버리고 센다» — 그것 때문에 승격 전체를 막지 않는다
  *   (연합 경로의 `pruneDanglingDependencies` 와 같은 판단).
@@ -135,7 +170,6 @@ export function orderPiecesTopologically(pieces: readonly DecomposePiece[]): Dec
   const edges: Set<number>[] = pieces.map(() => new Set<number>());
   const indegree = pieces.map(() => 0);
   let dependsOnEdges = 0;
-  let hotPathEdges = 0;
   let danglingDependsOn = 0;
 
   const addEdge = (from: number, to: number): boolean => {
@@ -155,28 +189,8 @@ export function orderPiecesTopologically(pieces: readonly DecomposePiece[]): Dec
     }
   });
 
-  /** `from` 에서 `to` 로 «이미» 갈 수 있나. 조각 상한이 24(maxGoals)라 단순 DFS 로 충분하다. */
-  const reaches = (from: number, to: number): boolean => {
-    const seen = new Set<number>([from]);
-    const stack = [from];
-    while (stack.length) {
-      const at = stack.pop()!;
-      if (at === to) return true;
-      for (const next of edges[at]!) if (!seen.has(next)) { seen.add(next); stack.push(next); }
-    }
-    return false;
-  };
-
-  // ⓑ hotPaths — 반대 방향으로 이미 길이 있으면 건너뛴다(가짜 순환 방지).
-  pieces.forEach((piece, index) => {
-    if (!piece.hotPaths?.length) return;
-    for (let earlier = 0; earlier < index; earlier++) {
-      const other = pieces[earlier]!;
-      if (!other.hotPaths?.some((path) => piece.hotPaths!.includes(path))) continue;
-      if (reaches(index, earlier)) continue;
-      if (addEdge(earlier, index)) hotPathEdges++;
-    }
-  });
+  // ⓑ hotPaths 겹침 간선은 제거됐다(2026-10-16) — 순서는 ⓐ dependsOn 만 만든다.
+  //    겹침은 pickDecomposeProposals 가 hotPathOverlaps 로 따로 세고, 여기서는 간선을 만들지 않는다.
 
   // Kahn — ready 는 «원래 index 오름차순»으로만 꺼낸다.
   const ordered: DecomposePiece[] = [];
@@ -195,12 +209,12 @@ export function orderPiecesTopologically(pieces: readonly DecomposePiece[]): Dec
   if (ordered.length !== pieces.length) {
     return {
       dependsOnEdges,
-      hotPathEdges,
+      hotPathEdges: 0,
       danglingDependsOn,
       cycle: pieces.filter((_, i) => !done[i]).map((piece) => piece.id),
     };
   }
-  return { ordered, dependsOnEdges, hotPathEdges, danglingDependsOn };
+  return { ordered, dependsOnEdges, hotPathEdges: 0, danglingDependsOn };
 }
 
 export interface DecomposeProposalScan {
@@ -423,7 +437,8 @@ export function applyDecomposeProposals(
         feature: inherited.length ? [...inherited, piece.feature].join('\n') : piece.feature,
         ...(piece.dependsOn.length ? { dependsOn: [...piece.dependsOn] } : {}),
         // ⛔⭐ `...goal` 이 «부모의» hotPaths 를 그대로 흘린다 — 그러면 조각 전부가 서로 겹쳐
-        //   `orchestrate.ts` 가 전부를 직렬화한다(위상이 아니라 «한 줄»이 된다).
+        //   «가짜 형제 겹침» 관측을 낸다. 겹침 간선·직렬화는 제거됐다(2026-10-16) — hotPaths 는
+        //   hot-path-overlap 관측의 원천이므로 부모 것을 물려주면 그 관측이 오염된다.
         //   ⇒ 조각 자신의 것이 있으면 그것으로 덮고, 없으면 «지운다»(부모 것을 상속하지 않는다).
         ...(piece.hotPaths?.length ? { hotPaths: [...piece.hotPaths] } : { hotPaths: undefined }),
       } as SelfDevGoal);

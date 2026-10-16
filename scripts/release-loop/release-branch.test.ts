@@ -179,6 +179,50 @@ test('RELEASE-BRANCH resume refuses a non-fast-forward tip, a run that is not fa
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('moved tip in the early export graph cannot resume at gate and skip leak-check', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-early-export-resume-'));
+  try {
+    const runFile = join(root, 'graph-runs', 'release-loop', 'r.json');
+    mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
+    writeFileSync(runFile, JSON.stringify({ graphId: 'release-loop', runId: 'r', status: 'failed',
+      input: { version: '0.2.18', branchCut: true },
+      path: ['version-release', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate', 'failed'],
+      nodes: [{ nodeId: 'version-release', ok: true, output: JSON.stringify({ outcome: 'ok', version: '0.2.18',
+        branch: 'release/0.2.18', commit: 'a'.repeat(40) }) }],
+    }));
+    const git = (args: string[]) => args[0] === 'ls-remote' ? `${'b'.repeat(40)}\trefs/heads/release/0.2.18` : args[0] === 'rev-parse' ? 'b'.repeat(40) : '';
+    expect(() => refreshReleaseBranchTip('r', { root, git, isAncestor: () => true }, 'gate'))
+      .toThrow('resume at export-check or earlier');
+    expect(JSON.parse(readFileSync(runFile, 'utf8')).nodes[0].output).toContain('a'.repeat(40));
+    expect(refreshReleaseBranchTip('r', { root, git, isAncestor: () => true }, 'export-check'))
+      .toMatchObject({ changed: true, from: 'a'.repeat(40), to: 'b'.repeat(40) });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('GATE-REUSE-BY-DIFF: a current-graph export-check resume plans the later gate carry', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-export-carry-'));
+  try {
+    const old = 'a'.repeat(40), tip = 'b'.repeat(40), version = '0.2.18';
+    const runFile = join(root, 'graph-runs/release-loop/r.json');
+    const releaseDir = join(root, 'release', version);
+    mkdirSync(join(root, 'graph-runs/release-loop'), { recursive: true });
+    mkdirSync(releaseDir, { recursive: true });
+    writeFileSync(runFile, JSON.stringify({ graphId: 'release-loop', runId: 'r', status: 'failed',
+      input: { version, branchCut: true }, path: ['version-release', 'export-check', 'prefetch', 'gate', 'failed'],
+      nodes: [{ nodeId: 'version-release', ok: true, output: JSON.stringify({ outcome: 'ok', version, branch: `release/${version}`, commit: old }) }],
+    }));
+    writeFileSync(join(releaseDir, 'gate-failures.json'), JSON.stringify({ commit: old, failures: [] }));
+    writeFileSync(join(releaseDir, 'gate-verdict.json'), JSON.stringify({ commit: old, outcome: 'ok' }));
+    const git = (args: string[]) => args[0] === 'ls-remote' ? `${tip}\trefs/heads/release/${version}` : args[0] === 'rev-parse' ? tip
+      : args[0] === 'diff' ? 'README.md\n' : '';
+    const result = await resumeReleaseRun({ runId: 'r', from: 'export-check' }, { root, ledgerRoot: root, git,
+      isAncestor: () => true, closureTree: () => ({ files: ['src/a.test.ts'], read: () => '', preload: [] }),
+      graph: (async () => ({ status: 'done', runId: 'r' })) as never });
+    expect(result.partial).toEqual({ requested: true, applied: true, files: 0, priorCommit: old, auto: true });
+    expect(JSON.parse(readFileSync(join(releaseDir, 'gate-partial.json'), 'utf8'))).toMatchObject({ kind: 'carry', forCommit: tip, files: [] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('RELEASE-REHEARSAL-RC: an rc branch is cut from main -dev.N and main is untouched; the dev bump is skipped', () => {
   const f = fixture();
   try {
@@ -279,19 +323,22 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     const first = await runGraph(join(import.meta.dir, '../../graphs/release/release-loop.yaml'),
       { input: { version: '0.2.18', previousVersion: '0.2.17', gatePodPool: 'pool', branchCut: true }, deps: { root: state, runBash } });
     expect(first.status).toBe('failed');
-    expect(first.path.slice(0, 5)).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate']);
+    expect(first.path.slice(0, 6)).toEqual(['version-release', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate']);
     const cut = git(f.origin, 'rev-parse', 'release/0.2.18');
-    expect(seen.map((item) => item.commit)).toEqual([cut, cut, cut, cut]);
+    expect(seen.map((item) => item.nodeId)).toEqual(['cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate', 'gate-triage']);
+    expect(seen.map((item) => item.commit)).toEqual([cut, cut, cut, cut, cut, cut]);
     const fix = f.land('fix.ts', 'export const fix = true;\n');
     const base = git(f.origin, 'rev-parse', `${cut}^`);
     cutReleaseBranch({ version: '0.2.18', base, pick: [fix], append: true, repoRoot: f.repo, log: () => {} });
     const tip = git(f.origin, 'rev-parse', 'release/0.2.18');
     gateFails = false;
     seen.length = 0;
-    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'gate' }, { root: state, repo: f.repo, runBash });
+    await expect(resumeReleaseRun({ runId: first.runId, from: 'gate' }, { root: state, repo: f.repo, runBash }))
+      .rejects.toThrow('resume at export-check or earlier');
+    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'export-check' }, { root: state, repo: f.repo, runBash });
     expect(resumed.tip).toMatchObject({ changed: true, from: cut, to: tip });
     expect(resumed.state.status).toBe('done');
-    expect(seen.map((item) => item.nodeId)).toEqual(['gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues',
+    expect(seen.map((item) => item.nodeId)).toEqual(['export-check', 'prefetch', 'gate', 'mac-smoke', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues',
       'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump']);
     // Shadow publication on the real resume path: the three post-approval visits must dispatch three
     // distinct commands. The injected runner never publishes anything outside this temporary test universe.
@@ -388,10 +435,11 @@ test('GATE-PARTIAL resume: the graph is resumed at the run’s own saved path; -
   try {
     const runFile = join(root, 'graph-runs', 'release-loop', 'r.json');
     mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
-    const old = 'a'.repeat(40), tip = 'b'.repeat(40);
-    const write = () => writeFileSync(runFile, JSON.stringify({ graphId: 'release-loop', runId: 'r', status: 'failed', input: { version: '0.2.18', branchCut: true },
+    const old = 'a'.repeat(40);
+    let tip = 'b'.repeat(40);
+    const write = (recorded = old) => writeFileSync(runFile, JSON.stringify({ graphId: 'release-loop', runId: 'r', status: 'failed', input: { version: '0.2.18', branchCut: true },
       path: ['version-release', 'cutoff', 'gate'], graphPath: '/elsewhere/wt-release/graphs/release/release-loop.yaml',
-      nodes: [{ nodeId: 'version-release', ok: true, exit: 0, executed: true, output: JSON.stringify({ outcome: 'ok', version: '0.2.18', commit: old, branch: 'release/0.2.18' }) },
+      nodes: [{ nodeId: 'version-release', ok: true, exit: 0, executed: true, output: JSON.stringify({ outcome: 'ok', version: '0.2.18', commit: recorded, branch: 'release/0.2.18' }) },
         { nodeId: 'cutoff', ok: true, exit: 0, executed: true, output: '{"outcome":"ok"}' },
         { nodeId: 'gate', ok: false, exit: 1, executed: true, output: '{"outcome":"fail"}' }],
       executed: 1, dryRun: false, statePath: runFile }));
@@ -414,11 +462,18 @@ test('GATE-PARTIAL resume: the graph is resumed at the run’s own saved path; -
     expect(applied.partial).toEqual({ requested: true, applied: true, files: 2, priorCommit: old });
     expect(JSON.parse(readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8'))).toMatchObject({ forCommit: tip, files: ['scripts/audit.test.ts', 'src/x.test.ts'] });
     // A code change: the tests reaching it join the plan (GATE-REUSE-BY-DIFF); src/other.test.ts is reused.
-    write();
+    const previousTip = tip;
+    tip = 'c'.repeat(40);
+    write(previousTip);
+    writeFileSync(join(ledger, 'release', '0.2.18', 'gate-failures.json'), JSON.stringify({ commit: previousTip, failures: ['src/x.test.ts > slow'] }));
     changed = 'scripts/audit.test.ts\nsrc/release-loop/gate.ts\n';
     const reached = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now, closureTree });
-    expect(reached.partial).toEqual({ requested: true, applied: true, files: 3, priorCommit: old, closure: { reached: 2, opaque: 0 } });
-    expect(JSON.parse(readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8')).files).toEqual(['scripts/audit.test.ts', 'src/release-loop/gate.test.ts', 'src/x.test.ts']);
+    expect(reached.partial).toEqual({ requested: true, applied: true, files: 3, priorCommit: previousTip, closure: { reached: 2, opaque: 0 } });
+    expect(JSON.parse(readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8'))).toMatchObject({
+      forCommit: tip, priorCommit: previousTip, files: ['scripts/audit.test.ts', 'src/release-loop/gate.test.ts', 'src/x.test.ts'],
+    });
+    tip = previousTip;
+    writeFileSync(join(ledger, 'release', '0.2.18', 'gate-failures.json'), JSON.stringify({ commit: old, failures: ['src/x.test.ts > slow'] }));
     // A non-code change (or an unreadable tip tree): fall back to a full gate — and the old plan is removed, not reused.
     write();
     changed = 'scripts/audit.test.ts\npackage.json\n';

@@ -154,6 +154,12 @@ export interface DraftMetrics {
   readonly inventory: number;
   readonly oldestAgeHours: number | null;
   readonly needsOwner: number;
+  /**
+   * Per-seat needsOwner counts (own keys, finite numbers only). Unattributed drafts
+   * stay in the global `needsOwner` total and are absent here. Optional so existing
+   * screen/ledger constructors stay valid; collectDraftMetrics always fills it.
+   */
+  readonly needsOwnerBySeat?: Readonly<Record<string, number>>;
   /** Open running claims whose last update cannot be read; neither owned nor needs-owner. */
   readonly claimUnobserved?: number;
   readonly converted48h: number;
@@ -164,6 +170,8 @@ export interface DraftMetrics {
 /** Default maximum unclaimed open harness drafts for one seat. */
 export const DRAFT_NEEDS_OWNER_SEAT_CAP = 15;
 
+const NEEDS_OWNER_SEATS = ['OP', 'TC', 'MK', 'UX'] as const;
+
 /** Compare one seat's observed needsOwner count; the caller supplies counts of open drafts by seat. */
 export function isSeatDraftNeedsOwnerOverCap(
   seat: string,
@@ -172,6 +180,50 @@ export function isSeatDraftNeedsOwnerOverCap(
 ): boolean {
   const count = Object.hasOwn(needsOwnerBySeat, seat) ? needsOwnerBySeat[seat] : undefined;
   return typeof count === 'number' && Number.isFinite(count) && count > cap;
+}
+
+/** Hold that seat's new launches when its needsOwner drafts exceed the default cap of 15. */
+export function shouldHoldSeatNewLaunch(
+  seat: string,
+  needsOwnerBySeat: Readonly<Record<string, number>>,
+): boolean {
+  return isSeatDraftNeedsOwnerOverCap(seat, needsOwnerBySeat, DRAFT_NEEDS_OWNER_SEAT_CAP);
+}
+
+function draftNeedsOwner(draft: SweepDraft, owner: string | undefined, now: Date): boolean {
+  const state = draftClaimState(draft, now);
+  return state !== 'unobserved' && (state !== 'claimed' || !owner?.trim());
+}
+
+/** Seat for a needsOwner draft: active claim owner, else a unique `elanous:seat-<자리>` label. */
+function needsOwnerSeatOf(draft: SweepDraft, owner: string | undefined): string | undefined {
+  const claimed = owner?.trim();
+  if (claimed && (NEEDS_OWNER_SEATS as readonly string[]).includes(claimed)) return claimed;
+  const found = new Set<string>();
+  for (const name of draft.labels) {
+    const seat = /^elanous:seat-(OP|TC|MK|UX)$/.exec(name)?.[1];
+    if (seat) found.add(seat);
+  }
+  return found.size === 1 ? [...found][0] : undefined;
+}
+
+/** Own-key, finite-number per-seat counts of drafts that still need an owner. */
+export function aggregateNeedsOwnerBySeat(
+  drafts: readonly SweepDraft[],
+  owners: readonly (string | undefined)[],
+  now: Date,
+): Record<string, number> {
+  const needsOwnerBySeat: Record<string, number> = {};
+  for (let index = 0; index < drafts.length; index++) {
+    const draft = drafts[index]!;
+    if (!draftNeedsOwner(draft, owners[index], now)) continue;
+    const seat = needsOwnerSeatOf(draft, owners[index]);
+    if (typeof seat !== 'string' || !seat) continue;
+    const current = Object.hasOwn(needsOwnerBySeat, seat) ? needsOwnerBySeat[seat] : 0;
+    if (typeof current !== 'number' || !Number.isFinite(current)) continue;
+    needsOwnerBySeat[seat] = current + 1;
+  }
+  return needsOwnerBySeat;
 }
 
 export async function collectDraftMetrics(repository: string, adapters: Pick<DraftSweepAdapters, 'listDrafts' | 'listRecentClosed' | 'getActiveClaimOwner'>, now: Date): Promise<DraftMetrics> {
@@ -209,13 +261,16 @@ export async function collectDraftMetrics(repository: string, adapters: Pick<Dra
   const converted48h = cohort.filter((pr) => 'mergedAt' in pr && typeof pr.mergedAt === 'string'
     && Date.parse(pr.mergedAt) >= Date.parse(pr.createdAt!) && Date.parse(pr.mergedAt) <= clock
     && Date.parse(pr.mergedAt) - Date.parse(pr.createdAt!) <= 48 * 3_600_000).length;
+  const needsOwnerBySeat = aggregateNeedsOwnerBySeat(open, owners, now);
+  // This observation reports over-cap seats; the dispatchers enforce the hold before launch.
+  const heldSeats = Object.keys(needsOwnerBySeat).filter((seat) =>
+    isSeatDraftNeedsOwnerOverCap(seat, needsOwnerBySeat, DRAFT_NEEDS_OWNER_SEAT_CAP));
+  try { debug.log('self-dev.draft-metrics', 'seat-launch-hold', { heldSeats, needsOwnerBySeat }); } catch { /* fail-soft */ }
   return {
     inventory: open.length,
     oldestAgeHours: open.length ? Math.max(...open.map((pr) => Math.max(0, (clock - Date.parse(pr.createdAt)) / 3_600_000))) : null,
-    needsOwner: open.filter((draft, index) => {
-      const state = draftClaimState(draft, now);
-      return state !== 'unobserved' && (state !== 'claimed' || !owners[index]?.trim());
-    }).length,
+    needsOwner: open.filter((draft, index) => draftNeedsOwner(draft, owners[index], now)).length,
+    needsOwnerBySeat,
     claimUnobserved: open.filter((draft) => draftClaimState(draft, now) === 'unobserved').length,
     converted48h,
     cohort48h: cohort.length,

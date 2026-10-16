@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import * as childProcess from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createInflightGuard, INFLIGHT_DRAIN_TIMEOUT_MS } from '../helpers/inflight-test-guard.js';
 
 const requestId = 'req:v1:abcdef0123456789';
 const roots: string[] = [];
@@ -52,14 +53,30 @@ function observeGh(): ReturnType<typeof spyOn> {
   }) as never);
 }
 
-afterEach(() => {
+// ⭐ 0.2.30 게이트 cut/pod-66: 첫 시험이 차가운 Pod 에서 registry/loader import 로 5s 를 넘겼고,
+//   afterEach 가 임시 폴더를 지운 «뒤에» 본문이 그 폴더로 chdir 해 ENOENT 로 터졌다.
+//   ① 무거운 import·첫 탐색을 beforeAll(넉넉한 hook 한도)로 ② afterEach 는 남은 본문을 기다린 뒤 정리.
+const WARM_TIMEOUT_MS = 120_000;
+const TEST_TIMEOUT_MS = 30_000;
+const startCwd = process.cwd();
+const guard = createInflightGuard();
+
+beforeAll(async () => {
+  const { discoverCapabilityProviders } = await import('../../src/mission-capabilities/registry.js');
+  await import('../../src/mission-blueprints/loader.js');
+  await discoverCapabilityProviders();
+}, WARM_TIMEOUT_MS);
+
+afterEach(async () => {
+  await guard.drain();
+  if (process.cwd() !== startCwd) process.chdir(startCwd);
   ghCwds.splice(0);
   ghSuccessRoot = '';
   for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true });
-});
+}, INFLIGHT_DRAIN_TIMEOUT_MS);
 
 describe('capability probe authority context', () => {
-  test('the loader sends authorityRoot to discovered tree-measuring providers', async () => {
+  test('the loader sends authorityRoot to discovered tree-measuring providers', guard.track(async () => {
     const cwdRoot = root('cwd');
     const authorityRoot = root('authority');
     repository(cwdRoot, false);
@@ -92,9 +109,9 @@ describe('capability probe authority context', () => {
     } finally {
       ghSpy.mockRestore();
     }
-  });
+  }), TEST_TIMEOUT_MS);
 
-  test('missing authority roots fail with the requested root rather than silently using cwd', async () => {
+  test('missing authority roots fail with the requested root rather than silently using cwd', guard.track(async () => {
     const missingRoot = join(root('missing-parent'), 'does-not-exist');
     const ghSpy = observeGh();
     try {
@@ -110,9 +127,9 @@ describe('capability probe authority context', () => {
     } finally {
       ghSpy.mockRestore();
     }
-  });
+  }), TEST_TIMEOUT_MS);
 
-  test('direct no-argument probes retain cwd behavior and the open-pr failure string', async () => {
+  test('direct no-argument probes retain cwd behavior and the open-pr failure string', guard.track(async () => {
     const cwdRoot = root('cwd');
     const authorityRoot = root('authority');
     repository(cwdRoot, false);
@@ -139,5 +156,5 @@ describe('capability probe authority context', () => {
     } finally {
       ghSpy.mockRestore();
     }
-  });
+  }), TEST_TIMEOUT_MS);
 });

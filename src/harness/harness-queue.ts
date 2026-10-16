@@ -23,6 +23,7 @@ import { parsePodPool, podPoolHostLease, resolvePodPoolSpec } from '../task-orch
 import { writeHarnessQueueReceipt } from './harness-queue-child.js';
 import { adviseLaunch, compareLaunchAdvice, type LaunchAdvice } from './launch-advice.js';
 import { finishAdvice, measureFinish, recordFinishHistory, type FinishMetrics } from '../loops/orchestrator/finish-rate.js';
+import { collectDraftMetrics, DRAFT_NEEDS_OWNER_SEAT_CAP, shouldHoldSeatNewLaunch, type DraftMetrics } from '../self-dev/draft-sweep.js';
 
 export type QueueSeat = 'OP' | 'TC' | 'MK' | 'UX';
 export type QueueItem = {
@@ -74,6 +75,13 @@ export interface HarnessQueueDeps {
   root?: string;
   configPath?: string;
   cap?: (seat: QueueSeat) => number;
+  /** Fresh GitHub draft inventory for the dispatch boundary; tests inject an isolated source. */
+  draftMetrics?: (now: Date) => Promise<DraftMetrics>;
+  /** Explicit needs-owner hold gate — the hold is an autonomous-launch guard. Cron `harness queue tick`
+   *  and the seat-loop launch/wake sites pass true; the direct `harness say`/`ask` immediate-launch tick
+   *  passes false (a person-initiated command answers itself, pre-hold launch behavior preserved).
+   *  Tests assert this option instead of inferring the boundary from which seams are injected. */
+  needsOwnerGate?: boolean;
   pool?: () => QueuePool;
   /** Shadow-only advice seam; exceptions must not affect the queue decision. */
   advice?: typeof adviseLaunch;
@@ -322,8 +330,8 @@ function defaultQueuePriority(cellId: string | undefined, root: string, deps: Ha
   }
 }
 
-/** Seat head order: priority descending (none = lowest), then arrival ascending, then file order. */
-function queueHeadBefore(a: QueueItem, b: QueueItem): boolean {
+/** Seat head order: priority descending (none = lowest), then arrival ascending, then file order. RUN-IDENTITY — 신분에서 온 `runPriority` 가 여기서 승인·선점 순서를 정한다. */
+export function queueHeadBefore(a: QueueItem, b: QueueItem): boolean {
   const pa = a.priority ?? -Infinity, pb = b.priority ?? -Infinity;
   if (pa !== pb) return pa > pb;
   const ta = Date.parse(a.at), tb = Date.parse(b.at);
@@ -336,7 +344,7 @@ export class HarnessQueueDuplicateError extends Error {
   }
 }
 
-export async function addHarnessQueue(input: { seat: string; say?: string; ask?: string; hold?: boolean; heavy?: boolean; idempotencyKey?: string; launchArgs?: string[]; poolHint?: string; poolHintSource?: 'grid'; launchCwd?: string; refuseDuplicate?: boolean }, deps: HarnessQueueDeps = {}): Promise<QueueItem> {
+export async function addHarnessQueue(input: { seat: string; say?: string; ask?: string; hold?: boolean; heavy?: boolean; idempotencyKey?: string; launchArgs?: string[]; poolHint?: string; poolHintSource?: 'grid'; launchCwd?: string; refuseDuplicate?: boolean; runPriority?: number }, deps: HarnessQueueDeps = {}): Promise<QueueItem> {
   const assigned = seat(input.seat);
   if ((input.say === undefined) === (input.ask === undefined)) throw new Error('harness queue add: --say 또는 --ask 중 하나만 필요');
   const kind = input.ask === undefined ? 'say' : 'ask';
@@ -370,7 +378,8 @@ export async function addHarnessQueue(input: { seat: string; say?: string; ask?:
         throw new HarnessQueueDuplicateError(existing, key);
       }
     }
-    const priority = defaultQueuePriority(cellId, root, deps);
+    // RUN-IDENTITY — 신분에서 온 줄 우선순위가 칸 러브릭보다 위다(승인·선점이 신분을 읽는다 · GATE-PRIORITY 흡수).
+    const priority = input.runPriority ?? defaultQueuePriority(cellId, root, deps);
     const item: QueueItem = { id: `hq-${randomUUID()}`, seat: assigned, kind, input: value,
       hold: input.hold === true, heavy: input.heavy === true, at: new Date().toISOString(), status: 'queued',
       ...(input.launchArgs === undefined ? {} : { launchArgs: input.launchArgs }),
@@ -1486,6 +1495,23 @@ async function tickHarnessQueueOnce(deps: HarnessQueueDeps, requestedId: string 
       }
       return waiting();
     }
+    // NEEDS-OWNER-CENSUS: one draft census per tick, shared by every candidate. A full census pages all
+    // open drafts, the 48h closed cohort, and one claim-comment gh call per open draft — re-running it
+    // per candidate multiplied those calls by the seat count and raced the rate limit the seat-loop tick
+    // also spends. The memo lives in this tick only; the next tick re-collects.
+    const needsOwnerGate = deps.needsOwnerGate ?? false;
+    let draftCensus: Promise<DraftMetrics> | undefined;
+    const censusOnce = (): Promise<DraftMetrics> => {
+      draftCensus ??= (deps.draftMetrics
+        ? deps.draftMetrics((deps.now ?? (() => new Date()))())
+        : (async () => {
+          const [{ resolveRepositoryName }, { githubDraftSweepAdapters }] = await Promise.all([
+            import('./repository-name.js'), import('./harness-cli-command.js'),
+          ]);
+          return collectDraftMetrics(resolveRepositoryName({}), githubDraftSweepAdapters(), (deps.now ?? (() => new Date()))());
+        })());
+      return draftCensus;
+    };
     for (const item of candidates) {
       const injectedCap = deps.cap?.(item.seat);
       const details = seatCapDetails({ seat: item.seat, caps, gate, injectedCap });
@@ -1544,6 +1570,29 @@ async function tickHarnessQueueOnce(deps: HarnessQueueDeps, requestedId: string 
         try { debug.log('loop.orchestrator', 'freeze-held-launch', { reason: lateHold.freezeReason, until: lateHold.until, queued: 1, phase: 'pre-launch' }); }
         catch { /* Observation cannot affect dispatch. */ }
         return { outcome: 'waiting', item: { ...item, waitingReason: lateHold.reason }, reason: lateHold.reason };
+      }
+      // A queued request can outlive the seat's earlier census: check again at the actual launcher boundary.
+      // NEEDS-OWNER-BOUNDARY: the hold is an autonomous-launch guard — cron `harness queue tick` (and any
+      // embedder) opts in via deps.needsOwnerGate; the direct `harness say`/`ask` immediate-launch tick does
+      // not, because a person-initiated command answers itself. The census itself is shared: one call per
+      // tick (censusOnce), never one per candidate.
+      if (needsOwnerGate) {
+        let metrics: DraftMetrics | undefined;
+        try {
+          metrics = await censusOnce();
+          if (!metrics.needsOwnerBySeat) throw new Error('per-seat draft inventory missing');
+        } catch (error) {
+          // NEEDS-OWNER-POLICY: an unreadable census — gh unavailable, rate-limited, or one unreadable
+          // claim comment — is unobserved, not failed-closed. Unobserved input never holds any seat's
+          // launch; only an observed count over the cap does. The next tick re-collects.
+          try {
+            debug.log('loop.orchestrator', 'needs-owner-unobserved', { seat: item.seat, reason: String(error).slice(0, 140) });
+          } catch { /* observation must not affect the dispatch decision */ }
+        }
+        if (metrics && shouldHoldSeatNewLaunch(item.seat, metrics.needsOwnerBySeat ?? {})) {
+          blocked.set(item.seat, { reason: `needs-owner ${item.seat}: ${metrics.needsOwnerBySeat?.[item.seat]} > ${DRAFT_NEEDS_OWNER_SEAT_CAP}`, active });
+          continue;
+        }
       }
       // QUEUE-BURST: scheduled launches stay `launchStaggerMs` after the last queue launch — any tick or process, a direct
       // launch included — so an overlapping cron tick cannot double a burst. A requested (direct say/ask) tick keeps its

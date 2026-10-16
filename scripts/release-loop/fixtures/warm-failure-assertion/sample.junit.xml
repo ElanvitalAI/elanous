@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="1" assertions="1" failures="1" skipped="0" time="0.453759">
+  <testsuite name="scripts/release-loop/.warm-failure-verify.test.ts" file="scripts/release-loop/.warm-failure-verify.test.ts" tests="1" assertions="1" failures="1" skipped="0" time="0.324634" hostname="MacBookProM5">
+    <testcase name="real multiline assertion" classname="" time="0.000284" file="scripts/release-loop/.warm-failure-verify.test.ts" line="2" assertions="1">
+      <failure type="AssertionError" message="expect(received).toEqual(expected)&#10;&#10;  {&#10;-   &quot;expected&quot;: 2,&#10;+   &quot;actual&quot;: 1,&#10;  }&#10;&#10;- Expected  - 1&#10;+ Received  + 1&#10;">AssertionError: expect(received).toEqual(expected)&#10;&#10;  {&#10;-   &quot;expected&quot;: 2,&#10;+   &quot;actual&quot;: 1,&#10;  }&#10;&#10;- Expected  - 1&#10;+ Received  + 1&#10;&#10;      at scripts/release-loop/.warm-failure-verify.test.ts:3:25&#10;</failure>
+    </testcase>
+  </testsuite>
+</testsuites>

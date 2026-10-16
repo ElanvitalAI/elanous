@@ -14,6 +14,9 @@ import type { HitlRelay } from '../../harness/detached-hitl.js';
 import { debug } from '../../debug/log.js';
 import { dispatchTask, type DispatchTaskInput, type DispatchTaskResult } from '../../execution-loop/dispatch-task.js';
 import { CardStore } from '../../task-cards/card-store.js';
+import { createTempGitRemote } from '../../ux-sim/temp-git-remote.js';
+import { resolveMainRepoRoot } from '../../git-fs/worktree.js';
+import { resolveHarnessTarget } from '../../self-implement/harness-target-options.js';
 
 const okResult: HarnessResult = { runId: 'test-run', ok: true, terminal: 'deployed', rounds: 2, deployRef: 'https://pr/1', state: {} as never };
 
@@ -439,15 +442,24 @@ describe('dispatchRunDevHarness — P3 외부 repo 타깃', () => {
 
   test('target 실 git repo → repoRoot+elanousBinRoot 를 seam 으로', async () => {
     const seamCalls: Array<{ repoRoot?: string; elanousBinRoot?: string }> = [];
+    const fixture = createTempGitRemote();
     const d: DevHarnessDeps = {
       runHarness: async () => okResult,
       seamsFactory: (o) => { seamCalls.push(o as never); return {} as never; },
+      targetHome: fixture.root,
     };
-    // 이 테스트가 도는 elanous repo 자체를 '외부 target' 으로 사용(실 git repo).
-    const res = await dispatchRunDevHarness({ objective: 'x', target: process.cwd() }, {} as DaemonToolDispatchCtx, d);
-    expect(res.output).not.toContain('거부');
-    expect(seamCalls[0]?.repoRoot).toBeTruthy();
-    expect(seamCalls[0]?.elanousBinRoot).toBeTruthy();
+    try {
+      // 실제 Git 원격 fixture의 checkout 을 격리 HOME 안의 target 으로 검증한다.
+      const target = fixture.checkout;
+      expect(resolveHarnessTarget(target).status).toBe('outside-home'); // 주입 없이는 실 HOME 밖.
+      const res = await dispatchRunDevHarness({ objective: 'x', target }, {} as DaemonToolDispatchCtx, d);
+      expect(res.output).not.toContain('거부');
+      expect(seamCalls[0]?.repoRoot).toBe(realpathSync(target));
+      expect(seamCalls[0]?.elanousBinRoot).toBe(resolveMainRepoRoot(process.cwd()) ?? process.cwd());
+      expect(seamCalls[0]?.elanousBinRoot).not.toBe(realpathSync(target));
+    } finally {
+      fixture.cleanup();
+    }
   });
 
   test('target 생략/self → 외부 검증 스킵(seamsOptions 없음)', async () => {
@@ -459,32 +471,35 @@ describe('dispatchRunDevHarness — P3 외부 repo 타깃', () => {
 });
 
 describe('dispatchRunDevHarness — #25 P4 target 종류 라우팅(비-git dir·config·안전벽)', () => {
-  // 홈 안에 실 디렉토리/파일을 만들어 라우팅 검증(resolveTargetKind 는 홈 밖=outside-home 거부).
-  const inHome: string[] = [];
-  const mkHome = (make: (dir: string) => void): string => {
-    const dir = mkdtempSync(join(homedir(), '.elanous-devharness-test-'));
-    inHome.push(dir);
-    make(dir);
-    return dir;
+  // /tmp 아래 시험 HOME을 주입해 실제 HOME 쓰기 없이 target 경로를 검증한다.
+  const tempRoots: string[] = [];
+  const mkTargetHome = (make: (target: string) => void): { home: string; target: string } => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), 'elanous-devharness-home-')));
+    const target = join(home, 'target');
+    tempRoots.push(home);
+    mkdirSync(target);
+    make(target);
+    return { home, target };
   };
-  afterEach(() => { for (const d of inHome.splice(0)) rmSync(d, { recursive: true, force: true }); });
+  afterEach(() => { for (const d of tempRoots.splice(0)) rmSync(d, { recursive: true, force: true }); });
 
   test('비-git 디렉토리 → targetKind=non-git-dir·targetPath 전파(거부 아님)', async () => {
-    const dir = mkHome((d) => writeFileSync(join(d, 'note.txt'), 'hi\n'));
+    const { home, target } = mkTargetHome((d) => writeFileSync(join(d, 'note.txt'), 'hi\n'));
+    expect(resolveHarnessTarget(homedir()).canonicalHome).toBe(realpathSync(homedir())); // 주입 생략 시 제품 기본 HOME 불변.
     const seamCalls: DefaultSeamsOptions[] = [];
-    const d: DevHarnessDeps = { runHarness: async () => okResult, seamsFactory: (o) => { seamCalls.push(o); return {} as never; } };
-    const res = await dispatchRunDevHarness({ objective: 'x', target: dir }, {} as DaemonToolDispatchCtx, d);
+    const d: DevHarnessDeps = { targetHome: home, runHarness: async () => okResult, seamsFactory: (o) => { seamCalls.push(o); return {} as never; } };
+    const res = await dispatchRunDevHarness({ objective: 'x', target }, {} as DaemonToolDispatchCtx, d);
     expect(res.output).not.toContain('거부');
     expect(seamCalls[0]?.targetKind).toBe('non-git-dir');
-    expect(seamCalls[0]?.targetPath).toBe(dir);
+    expect(seamCalls[0]?.targetPath).toBe(target);
     expect(seamCalls[0]?.repoRoot).toBeUndefined();
   });
 
   test('config 파일 → targetKind=file·targetPath 전파', async () => {
-    const dir = mkHome((d) => writeFileSync(join(d, 'config.json'), '{"a":1}\n'));
-    const file = join(dir, 'config.json');
+    const { home, target } = mkTargetHome((d) => writeFileSync(join(d, 'config.json'), '{"a":1}\n'));
+    const file = join(target, 'config.json');
     const seamCalls: DefaultSeamsOptions[] = [];
-    const d: DevHarnessDeps = { runHarness: async () => okResult, seamsFactory: (o) => { seamCalls.push(o); return {} as never; } };
+    const d: DevHarnessDeps = { targetHome: home, runHarness: async () => okResult, seamsFactory: (o) => { seamCalls.push(o); return {} as never; } };
     const res = await dispatchRunDevHarness({ objective: 'x', target: file }, {} as DaemonToolDispatchCtx, d);
     expect(res.output).not.toContain('거부');
     expect(seamCalls[0]?.targetKind).toBe('file');
@@ -494,7 +509,7 @@ describe('dispatchRunDevHarness — #25 P4 target 종류 라우팅(비-git dir·
   test('★ 홈 밖 시스템경로(실존) + HITL 승인 → 진행(dir=non-git-dir·2단 HITL 진입 게이트)', async () => {
     // 실존 홈 밖 디렉토리로 진입 확인 승인 경로 검증. yesChannel → ux.confirm true.
     const sysDir = mkdtempSync(join(tmpdir(), 'devharness-sys-'));  // tmpdir 은 홈 밖(outside-home)
-    inHome.push(sysDir); // 정리 재사용(경로 무관)
+    tempRoots.push(sysDir); // 정리 재사용(경로 무관)
     const seamCalls: DefaultSeamsOptions[] = [];
     const d: DevHarnessDeps = { runHarness: async () => okResult, seamsFactory: (o) => { seamCalls.push(o); return {} as never; } };
     const ctx = { surfaceHitlChannels: [yesChannel()] } as unknown as DaemonToolDispatchCtx;
@@ -506,7 +521,7 @@ describe('dispatchRunDevHarness — #25 P4 target 종류 라우팅(비-git dir·
 
   test('홈 밖 시스템경로(실존) + HITL 미승인/채널없음 → fail-closed 거부', async () => {
     const sysDir = mkdtempSync(join(tmpdir(), 'devharness-sys2-'));
-    inHome.push(sysDir);
+    tempRoots.push(sysDir);
     const calls: RunHarnessOnSurfaceOptions[] = [];
     const d: DevHarnessDeps = { runHarness: async (o) => { calls.push(o); return okResult; }, seamsFactory: () => ({} as never) };
     // 빈 ctx → 승인 채널 없음 → ux.confirm fail-closed(false) → 거부.
@@ -516,23 +531,29 @@ describe('dispatchRunDevHarness — #25 P4 target 종류 라우팅(비-git dir·
   });
 
   test('홈 안 존재하지 않는 경로 → 거부', async () => {
+    const { home } = mkTargetHome(() => {});
     const res = await dispatchRunDevHarness(
-      { objective: 'x', target: join(homedir(), '.elanous-nope-xyz-does-not-exist') },
+      { objective: 'x', target: join(home, 'not-created') },
       {} as DaemonToolDispatchCtx,
-      { runHarness: async () => okResult, seamsFactory: () => ({} as never) },
+      { targetHome: home, runHarness: async () => okResult, seamsFactory: () => ({} as never) },
     );
     expect(res.output).toContain('거부');
     expect(res.output).toContain('target을 생략하세요(그러면 elanous 자신을 대상으로 합니다)');
   });
 
   test('스테이징 직전 symlink 재지정은 dispatch를 통과해도 createWorktree에서 차단한다', async () => {
-    const first = mkHome((d) => mkdirSync(join(d, 'first')));
+    const home = realpathSync(mkdtempSync(join(tmpdir(), 'elanous-devharness-link-home-')));
+    tempRoots.push(home);
+    const first = join(home, 'target');
+    mkdirSync(first);
+    mkdirSync(join(first, 'first'));
     const second = join(first, 'second');
     const link = join(first, 'mutable');
     mkdirSync(second);
     symlinkSync(join(first, 'first'), link, 'dir');
     let staged = false;
     const d: DevHarnessDeps = {
+      targetHome: home,
       seamsFactory: () => ({
         createWorktree: async () => { staged = true; return { path: first, branch: 'dev-test' }; },
       } as never),

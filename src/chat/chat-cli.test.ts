@@ -5,10 +5,18 @@ import type { runDevPipeline, DevPipelineSpec, DevPipelineDeps, DevChatOpts, Res
 describe('toDevChatOpts — CLI 옵션 → DevChatOpts 매핑(무손실)', () => {
   it('--new→forceNew · json/tools/goalLoop→boolean · session 통과', () => {
     expect(toDevChatOpts({ session: 's1', new: true, json: true, tools: true, goalLoop: true }))
-      .toEqual({ session: 's1', forceNew: true, json: true, enableTools: true, goalLoop: true });
+      .toEqual({ session: 's1', forceNew: true, continueActive: false, json: true, enableTools: true, goalLoop: true });
   });
   it('옵션 없음 → 전부 false · session 생략(undefined)', () => {
-    expect(toDevChatOpts({})).toEqual({ forceNew: false, json: false, enableTools: false, goalLoop: false });
+    expect(toDevChatOpts({})).toEqual({ forceNew: false, continueActive: false, json: false, enableTools: false, goalLoop: false });
+  });
+  it('#73 — 이어하기는 명시만: --continue · 값 없는 --resume → continueActive · --resume <id> → session', () => {
+    expect(toDevChatOpts({ continue: true }).continueActive).toBe(true);
+    expect(toDevChatOpts({ resume: true }).continueActive).toBe(true);
+    expect(toDevChatOpts({ resume: 'abc123' })).toMatchObject({ session: 'abc123', continueActive: false });
+    expect(toDevChatOpts({ session: 's1', resume: 'other' }).session).toBe('s1');
+    // 반증: 인자 없음은 이어하지 않는다.
+    expect(toDevChatOpts({}).continueActive).toBe(false);
   });
   it('빈 문자열 session 도 통과(!== undefined·원 explicitSessionId 정확 등가)', () => {
     expect(toDevChatOpts({ session: '' }).session).toBe(''); // 누락 아님 — 중간값까지 무손실
@@ -29,7 +37,7 @@ describe('runChatCliCommand — interactive 재라우팅 글루', () => {
       input: { text: 'hi' },
       executor: { kind: 'self' },
       context: 'interactive',
-      chat: { forceNew: true, json: false, enableTools: true, goalLoop: false },
+      chat: { forceNew: true, continueActive: false, json: false, enableTools: true, goalLoop: false },
     });
     expect(gotDeps?.runChatTurn).toBe(runChatTurn); // 주입된 chat 엔진 그대로 전달
   });
@@ -86,6 +94,6 @@ describe('runChatCliCommand — interactive 재라우팅 글루', () => {
     const deps: ChatCliDeps = { runChatTurn: async (text, chat) => { gotText = text; gotChat = chat; } };
     await runChatCliCommand('실제 텍스트', { session: 'sX', goalLoop: true }, deps);
     expect(gotText).toBe('실제 텍스트');
-    expect(gotChat).toEqual({ session: 'sX', forceNew: false, json: false, enableTools: false, goalLoop: true });
+    expect(gotChat).toEqual({ session: 'sX', forceNew: false, continueActive: false, json: false, enableTools: false, goalLoop: true });
   });
 });

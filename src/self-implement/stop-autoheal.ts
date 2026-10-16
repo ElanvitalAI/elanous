@@ -13,7 +13,7 @@
  *   main-sync          → rebase-regate            리베이스(MERGE-INTENT-RESOLVE 의도 해석) 뒤 재게이트
  *   pod-died           → resume-from-salvage      `salvage/run-<6hex>/<leaf>` 가지에서 resume(DRAFT-NOT-ARCHIVE)
  *   evidence-uncovered → derive-evidence-rejudge  런 출력·시험·배선에서 증거를 끌어내 1회 재판정
- *   review-repeat · review-out-of-scope · fabric · launch-failed · unclassified → needs-owner(새 라운드 없음)
+ *   review-repeat · review-out-of-scope · fabric · launch-failed · gate-failed · unclassified → needs-owner(새 라운드 없음)
  *
  * 사다리의 «출처»: `graphs/overlays/stop-heal-ladder.yaml` 이 갈래마다 처방 노드(id = 처방 이름)를 선언한다.
  *    그 갈래에 얹힌 오버레이가 더한 노드 id 가 처방이다(source='graph'). 선언이 없거나 못 읽으면
@@ -52,6 +52,7 @@ export const AUTOHEAL_ACTION_BY_CLASS: Readonly<Record<RunStopClass, AutohealAct
   'review-out-of-scope': 'needs-owner',
   fabric: 'needs-owner',
   'launch-failed': 'needs-owner',
+  'gate-failed': 'needs-owner',
   unclassified: 'needs-owner',
 };
 

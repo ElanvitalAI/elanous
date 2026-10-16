@@ -3,7 +3,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { debug } from '../src/debug/log.js';
 import { effectiveInstanceRoot } from '../src/instance/resolve.js';
-import { GATE_REMOTE_DEFAULTS, isValidGateHost, resolveGateRemoteSettings, runOnRemote, type ExecResult, type RemoteRunOptions, type RemoteRunOutcome } from '../src/self-implement/gate-remote.js';
+import { GATE_REMOTE_DEFAULTS, gateRemoteHostCap, isValidGateHost, resolveGateRemoteSettings, runOnRemote, type ExecResult, type RemoteRunOptions, type RemoteRunOutcome } from '../src/self-implement/gate-remote.js';
 import { getUserConfig } from '../src/user-config.js';
 import { parseTypecheckErrors, tscEnv } from '../src/typecheck-ratchet.js';
 import { compareDiagnostics, normalizeDiagnostics, type NormalizedDiagnostic } from './tsc-baseline-comparison.js';
@@ -143,7 +143,7 @@ export async function runSafetyNet(repo: string, argv: readonly string[] = [], d
       diagnostics = diagnosticsOf(result, worktree);
       if (!diagnostics) reason = 'local tsc did not produce a complete measurement';
     } else {
-      const result = remote({ repo: worktree, host, mirror: settings.mirror, hostCap: settings.hostCap, argv: TSC_ARGV });
+      const result = remote({ repo: worktree, host, mirror: settings.mirror, hostCap: gateRemoteHostCap(settings, host), argv: TSC_ARGV });
       if (result.kind === 'ran') {
         if (result.commit !== commit) throw new Error('remote measured a different commit');
         diagnostics = diagnosticsOf({ rc: result.rc, stdout: result.stdout.toString('utf8'), stderr: result.stderr.toString('utf8') }, worktree);

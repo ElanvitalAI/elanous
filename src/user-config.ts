@@ -71,6 +71,7 @@ import { migrateLegacyXdgUserConfig } from './storage/legacy-elanous-config-migr
 import { withFileLockSync } from './storage/file-lock.js';
 import { debug } from './debug/log.js';
 import { setConfigTimeZoneSource } from './time/format.js';
+import { parseGeminiServerTools } from './user-config/gemini-server-tools.js';
 import type { FoldMode } from './log-entry.js';
 import {
   CLAUDE_PACKAGE_MISSING,
@@ -85,6 +86,7 @@ import {
   parseGroundingSources,
   type GroundingConfig,
 } from './grounding/sources.js';
+import { parseSeatTurnCapConfig, type SeatTurnCapConfig } from './core-turn/seat-turn-cap.js';
 
 // ── SkillRouter (existing) ───────────────────────────────────────────
 
@@ -1544,6 +1546,8 @@ export function parseErrorReportsConfig(raw: unknown): ErrorReportsConfig | unde
 
 export interface ChatConfig {
   factQuestion: { maxToolTurns: number };
+  /** TUI-SEAT-TURN-CAP — 자리 TUI goal loop 한정 core 턴 상한 덮어쓰기(기본값 = core-turn/seat-turn-cap.ts). 설정했을 때만 있다. */
+  seatTurnCap?: Partial<SeatTurnCapConfig>;
   /** Short questions may receive a tool-free first reply. Default true. */
   fastPath: boolean;
   conciseness: ChatConcisenessConfig;
@@ -3656,6 +3660,8 @@ export interface OrchestratorLoopConfig {
   seatCaps: Record<OrchestratorSeat, number>;
   /** Max new delegations per tick; absent means no limit. */
   maxDelegatePerTick?: number;
+  /** Dispatch placement preference and local concurrency lane. Defaults preserve the existing Pod preference and one local lane. */
+  dispatch: { podTarget: number; localLane: number };
   /** Per-seat release gate; absent seats retain the spawn-budget default. */
   releaseGate?: Partial<Record<OrchestratorSeat, number>>;
   trafficMode: 'shadow' | 'live';
@@ -3673,7 +3679,7 @@ export interface OrchestratorLoopConfig {
 }
 
 export const ORCHESTRATOR_DEFAULTS: OrchestratorLoopConfig = {
-  mode: 'shadow', seatTrees: {}, seatCaps: { TC: 8, UX: 6, MK: 6, OP: 4 }, trafficMode: 'shadow', idleRequest: 'shadow', finishGate: 'shadow',
+  mode: 'shadow', seatTrees: {}, seatCaps: { TC: 8, UX: 6, MK: 6, OP: 4 }, dispatch: { podTarget: 18, localLane: 1 }, trafficMode: 'shadow', idleRequest: 'shadow', finishGate: 'shadow',
 };
 
 export function parseOrchestratorLoopConfig(raw: unknown): OrchestratorLoopConfig {
@@ -3696,7 +3702,14 @@ export function parseOrchestratorLoopConfig(raw: unknown): OrchestratorLoopConfi
   }
   const mode = value.mode === 'off' || value.mode === 'live' ? value.mode : 'shadow';
   const maxDelegatePerTick = value.maxDelegatePerTick;
-  return { mode, seatTrees, seatCaps,
+  const rawDispatch = value.dispatch && typeof value.dispatch === 'object' && !Array.isArray(value.dispatch)
+    ? value.dispatch as Record<string, unknown> : {};
+  const dispatch = { ...ORCHESTRATOR_DEFAULTS.dispatch };
+  for (const field of ['podTarget', 'localLane'] as const) {
+    const setting = rawDispatch[field];
+    if (typeof setting === 'number' && Number.isSafeInteger(setting) && setting >= 0) dispatch[field] = setting;
+  }
+  return { mode, seatTrees, seatCaps, dispatch,
     ...(typeof maxDelegatePerTick === 'number' && Number.isSafeInteger(maxDelegatePerTick) && maxDelegatePerTick >= 0 ? { maxDelegatePerTick } : {}),
     ...(Object.keys(releaseGate).length ? { releaseGate } : {}),
     trafficMode: value.trafficMode === 'live' ? 'live' : 'shadow',
@@ -3792,8 +3805,10 @@ export interface GateRemoteConfig {
   host?: string;
   /** Local 1-min load average above which checks go remote (default 20). */
   loadThreshold?: number;
-  /** Concurrent heavy checks per remote host (default and ceiling 2 — config may only lower it). */
+  /** Legacy default cap for hosts without an entry in hostCaps (1..2, default 2). */
   hostCap?: number;
+  /** Per SSH host concurrent heavy-check slots (1..8); overrides hostCap for that host. */
+  hostCaps?: Record<string, number>;
   /** Bare mirror on the host (default ~/mirror/elanous-agent.git — shared with the release gate). */
   mirror?: string;
   /** Seconds to wait for a free host slot before running locally (default 600). */
@@ -3811,6 +3826,12 @@ export function parseGateRemoteConfig(raw: unknown): GateRemoteConfig | undefine
     if (typeof v === 'number' && Number.isFinite(v) && v >= 0) out[key] = v;
   }
   if (typeof r.hostCap === 'number' && Number.isSafeInteger(r.hostCap) && r.hostCap > 0 && r.hostCap <= 2) out.hostCap = r.hostCap;
+  if (r.hostCaps && typeof r.hostCaps === 'object' && !Array.isArray(r.hostCaps)) {
+    const caps = Object.fromEntries(Object.entries(r.hostCaps).filter(([host, cap]) =>
+      /^(?:[\w.-]+@)?[\w.-]+$/.test(host) && !host.startsWith('-') &&
+      typeof cap === 'number' && Number.isSafeInteger(cap) && cap >= 1 && cap <= 8)) as Record<string, number>;
+    if (Object.keys(caps).length) out.hostCaps = caps;
+  }
   return Object.keys(out).length ? out : undefined;
 }
 
@@ -3871,7 +3892,7 @@ export interface UserConfig {
   guardian?: { mode?: 'shadow' | 'live'; /** Orphan CLI GC on the guardian tick: off = no ps collection, shadow (default) = evidence only, on = evidence then SIGTERM. */ orphanGc?: 'off' | 'shadow' | 'on' };
   /** Task-agent live move allow-list (`src/task-agent/live-moves.ts` validates its vocabulary).
    *  Absent = env ELANOUS_TASK_AGENT_LIVE_MOVES, else none (pure shadow). */
-  taskAgent?: { liveMoves?: string[]; /** TA-REJUDGE-PERIODIC — steward tick runs `tasks rejudge --all` every N minutes (absent/0 = off). */ rejudgeEveryMinutes?: number; /** 1-minute load average above which that tick is skipped (default 60). */ rejudgeMaxLoad?: number; /** TA-REPAIR-TICK-CAP — new repair launches per `tasks rejudge --all` (default 3, 0 = none). */ repairMaxPerTick?: number; parentHost?: { host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number } | Array<{ host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number }> };
+  taskAgent?: { liveMoves?: string[]; /** TA-REJUDGE-PERIODIC — steward tick runs `tasks rejudge --all` every N minutes (absent/0 = off). */ rejudgeEveryMinutes?: number; /** 1-minute load average above which that tick is skipped (default 60). */ rejudgeMaxLoad?: number; /** TA-REPAIR-TICK-CAP — new repair launches per `tasks rejudge --all` (default 3, 0 = none). */ repairMaxPerTick?: number; /** TA-LAND-AFTER-REVIEW — opt-in external queue adapter, never a direct merge command. */ landQueue?: { command: string; remote: string }; parentHost?: { host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number } | Array<{ host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number }> };
   events?: EventsConfig;
   /** GATE-REMOTE — see GateRemoteConfig. Absent = defaults (auto on · node-b · load 20 · cap 2). */
   gateRemote?: GateRemoteConfig;
@@ -3907,7 +3928,7 @@ export interface UserConfig {
   followUp?: 'shadow' | 'live';
 };
   /** ☸️ Pod 실행 칸 — `pool` = 기존 기본 풀(`컨텍스트[@ssh호스트][:상한][#k3d-레지스트리:포트]` 쉼표 · 앞이 우선). harness 실행은 인자·ELANOUS_POD_POOL·harness.podPool 다음으로 읽는다. */
-  pod?: { pool?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string; /** 읽기 전용 Pod lease 권장에 쓰는 계정별 동시 수. */ lease?: { perAccount?: number }; /** 실측 권고를 Pod 발사 기본값으로 쓸지 (기본 off). */ memory?: { adviseDefaults?: boolean }; /** 명령 Job 자식 로그(child.log) 상한 바이트. 양의 정수만. 넘으면 끝부분 우선. */ childLogMaxBytes?: number };
+  pod?: { pool?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string; /** 읽기 전용 Pod lease 권장에 쓰는 계정별 동시 수. */ lease?: { perAccount?: number }; /** 실측 권고를 Pod 발사 기본값으로 쓸지 (기본 off). */ memory?: { adviseDefaults?: boolean }; /** 명령 Job 자식 로그(child.log) 상한 바이트. 양의 정수만. 넘으면 끝부분 우선. */ childLogMaxBytes?: number; /** warm Pod 재사용 실전 손잡이(소비자별 · 기본 off · 문자 그대로 true 만). 판정 = pod-warm-switch.ts `decideWarmReuse` — 증거가 모자라면 flag 가 켜져도 off. */ warmReuse?: { gateRecheck?: boolean; land?: boolean; ta?: boolean; /** 연속 일치 표본 하한(양의 정수 · 기본 3). */ minMatchSamples?: number } };
   skillRouter: SkillRouterConfig;
   llm: LLMConfig;
   skills: SkillsConfig;
@@ -4195,7 +4216,21 @@ function parseTaskAgentConfig(raw: unknown): UserConfig['taskAgent'] {
     if (Number.isSafeInteger(repairMaxPerTick) && (repairMaxPerTick as number) >= 0) rejudge.repairMaxPerTick = repairMaxPerTick as number;
     else warnUserConfigDrop('taskAgent.repairMaxPerTick', `음이 아닌 정수가 아니다(${JSON.stringify(repairMaxPerTick)}) — 기본 3`);
   }
-  const extras = { ...rejudge, ...(parentHost ? { parentHost } : {}) };
+  const queueRaw = (raw as Record<string, unknown>).landQueue;
+  let landQueue: { command: string; remote: string } | undefined;
+  if (queueRaw !== undefined) {
+    if (queueRaw && typeof queueRaw === 'object' && !Array.isArray(queueRaw)
+      && typeof (queueRaw as Record<string, unknown>).command === 'string'
+      && isAbsolute((queueRaw as Record<string, string>).command)
+      && typeof (queueRaw as Record<string, unknown>).remote === 'string'
+      && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test((queueRaw as Record<string, string>).remote)) {
+      landQueue = { command: (queueRaw as Record<string, string>).command, remote: (queueRaw as Record<string, string>).remote };
+    } else {
+      warnUserConfigDrop('taskAgent.landQueue', '절대 command 경로와 유효한 remote 호스트가 필요 — 착지 fail-closed');
+      landQueue = { command: '', remote: '' };
+    }
+  }
+  const extras = { ...rejudge, ...(parentHost ? { parentHost } : {}), ...(landQueue ? { landQueue } : {}) };
   const liveMoves = (raw as Record<string, unknown>).liveMoves;
   if (liveMoves === undefined) return Object.keys(extras).length ? extras : undefined;
   // 설정이 «있으면» 환경 변수로 내려가지 않는다 — 배열이 아니면 빈 목록(fail-closed), 문자열 밖 항목은 글자로 바꿔 넘겨
@@ -5083,6 +5118,17 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
         return typeof lease.perAccount === 'number' && Number.isSafeInteger(lease.perAccount) && lease.perAccount > 0
           ? lease.perAccount : 4;
       })() },
+      warmReuse: (() => {
+        const warm = legacyPod.warmReuse && typeof legacyPod.warmReuse === 'object' && !Array.isArray(legacyPod.warmReuse)
+          ? (legacyPod.warmReuse as Record<string, unknown>) : {};
+        return {
+          gateRecheck: warm.gateRecheck === true,
+          land: warm.land === true,
+          ta: warm.ta === true,
+          minMatchSamples: typeof warm.minMatchSamples === 'number' && Number.isSafeInteger(warm.minMatchSamples) && warm.minMatchSamples > 0
+            ? warm.minMatchSamples : 3,
+        };
+      })(),
     },
     harness: {
       edgeRail: (() => {
@@ -5452,6 +5498,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
           && Number.isSafeInteger(chatFactQuestion.maxToolTurns) && chatFactQuestion.maxToolTurns > 0
           ? chatFactQuestion.maxToolTurns : CHAT_DEFAULTS.factQuestion.maxToolTurns,
       },
+      ...((): { seatTurnCap?: Partial<SeatTurnCapConfig> } => { const c = parseSeatTurnCapConfig(chat.seatTurnCap); return c ? { seatTurnCap: c } : {}; })(),
       fastPath: chat.fastPath === false || chat.fastPath === 'false' ? false : CHAT_DEFAULTS.fastPath,
       conciseness: {
         enabled: chatConciseness.enabled === false ? false : CHAT_CONCISENESS_DEFAULTS.enabled,
@@ -7076,16 +7123,6 @@ function parseMemoryJudge(raw: unknown): { enabled?: boolean; model?: string; cr
   if (typeof obj.model === 'string' && obj.model.trim()) out.model = obj.model.trim();
   if (typeof obj.crossRecall === 'boolean') out.crossRecall = obj.crossRecall;
   return (out.enabled !== undefined || out.model !== undefined || out.crossRecall !== undefined) ? out : undefined;
-}
-
-function parseGeminiServerTools(raw: unknown): { googleSearch?: boolean; codeExecution?: boolean; urlContext?: boolean } | undefined {
-  if (!raw || typeof raw !== 'object') return undefined;
-  const obj = raw as Record<string, unknown>;
-  const out: { googleSearch?: boolean; codeExecution?: boolean; urlContext?: boolean } = {};
-  if (obj.googleSearch === true) out.googleSearch = true;
-  if (obj.codeExecution === true) out.codeExecution = true;
-  if (obj.urlContext === true) out.urlContext = true;
-  return (Object.keys(out).length > 0) ? out : undefined;
 }
 
 function parseAnswerPriority(raw: unknown): 'cost' | 'balanced' | 'quality' | 'exhaustive' | undefined {

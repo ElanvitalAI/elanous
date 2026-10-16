@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { judgeNextMove } from './judge.js';
+import { judgeNextMove, mustFixSignature } from './judge.js';
 import { STOP_CLASS_NO_LAUNCH, STOP_CLASS_POD_FAILURE } from '../task-orchestrator/surfaces/pod-failure-reason.js';
 
 describe('TASK-AGENT 판단부 — 종료 어휘 → 다음 한 수 (RFC §A2)', () => {
@@ -25,6 +25,26 @@ describe('TASK-AGENT 판단부 — 종료 어휘 → 다음 한 수 (RFC §A2)',
     const j = judgeNextMove({ stopReason: 'converged', prState: 'MERGED', pr: 123 });
     expect(j.move).toBe('propose-green');
     expect(j.executorKind).toBe('green');
+  });
+
+  test('goal-only PR 46건·최근 7건 중 5건은 target diff 0으로 진척 제외하고 같은 골 재큐를 멈춘다', () => {
+    const daily = Array.from({ length: 46 }, (_, index) => [`docs/goals/GOAL-${index}.md`]);
+    const recent = [...daily.slice(0, 5), ['docs/goals/GOAL-46.md', 'src/feature.ts'], ['src/feature.test.ts']];
+    for (const paths of daily) {
+      for (const input of [{ stopReason: 'needs-human' as const, prState: 'OPEN' as const },
+        { stopReason: 'converged' as const, prState: 'MERGED' as const },
+        { stopReason: 'no-progress' as const, prState: 'OPEN' as const }]) {
+        const judged = judgeNextMove({ ...input, pr: 77, prTargetPaths: paths });
+        expect(judged.move).toBe('wait');
+        expect(judged.executorKind).toBeUndefined();
+        expect(judged.reason).toContain('goal-only-pr');
+      }
+    }
+    expect(recent.filter((paths) => judgeNextMove({ stopReason: 'needs-human', pr: 77, prTargetPaths: paths }).reason.includes('goal-only-pr'))).toHaveLength(5);
+    expect(judgeNextMove({ stopReason: 'needs-human', pr: 77, prTargetPaths: recent[5] }).move).toBe('review');
+    expect(judgeNextMove({ stopReason: 'needs-human', pr: 77, prTargetPaths: recent[6] }).move).toBe('review');
+    expect(judgeNextMove({ stopReason: 'needs-human', pr: 77, prTargetPaths: [] }).move).toBe('wait');
+    expect(judgeNextMove({ stopReason: 'needs-human', pr: 77 }).move).toBe('review');
   });
 
   test('converged 인데 병합 근거 없음 → 대기 (green 아님)', () => {
@@ -140,5 +160,96 @@ describe('종결 종류 — code-pr 밖은 확인 증거로 종결 (RFC-loop-age
     }
     expect(judgeNextMove({ stopReason: 'provider-exhausted', completion: 'watch-brief' }).move).toBe('wait-retry');
     expect(judgeNextMove({ stopReason: 'no-progress', completion: 'content' }).move).toBe('narrow-relaunch');
+  });
+});
+
+describe('TASK-AGENT 판단부 — 선례(precedent) — 같은 must-fix 서명의 앞 런 (RFC adaptive-graph-ops §9.10)', () => {
+  const mustFix = ['A 원문 확보', '테스트 추가'];
+
+  test('서명은 must-fix 원문의 정규화 해시 ⊕ 분류 — 순서·공백 무관하게 같은 서명, 내용이 다르면 다른 서명', () => {
+    expect(mustFixSignature(mustFix)).toBe(mustFixSignature(['테스트   추가', 'A  원문 확보']));
+    expect(mustFixSignature(mustFix)).toMatch(/^fnv1a-[0-9a-f]{8}$/u);
+    expect(mustFixSignature(['다른 must-fix'])).not.toBe(mustFixSignature(mustFix));
+    expect(mustFixSignature([])).toBeUndefined();
+    expect(mustFixSignature(undefined)).toBeUndefined();
+  });
+
+  test('precedents 없음 → 지금 표 그대로 (narrow-relaunch)', () => {
+    expect(judgeNextMove({ stopReason: 'needs-human', review: 'fail', mustFix }).move).toBe('narrow-relaunch');
+  });
+
+  test('다른 서명 선례 → 지금 표 그대로 (narrow-relaunch)', () => {
+    expect(judgeNextMove({ stopReason: 'needs-human', review: 'fail', mustFix,
+      precedents: [{ runId: 'run-0', outcome: 'no-progress', signature: 'fnv1a-deadbeef' }] }).move).toBe('narrow-relaunch');
+  });
+
+  test('같은 서명 선례 1 → narrow 대신 alternative · 이유에 선례 runId·같은 서명', () => {
+    const signature = mustFixSignature(mustFix)!;
+    const precedents = [{ runId: 'run-1', outcome: 'no-progress', signature }];
+    const judged = judgeNextMove({ stopReason: 'needs-human', review: 'fail', mustFix, precedents });
+    expect(judged.move).toBe('alternative');
+    expect(judged.stage).toBe('repairing');
+    expect(judged.executorVariant).toBe('alternative');
+    expect(judged.reason).toContain('run-1');
+    expect(judged.reason).toContain(signature);
+  });
+
+  test('salvage 도 같은 서명 선례 → alternative (wait-retry 는 대기라 그대로)', () => {
+    const signature = mustFixSignature(mustFix)!;
+    const precedents = [{ runId: 'run-1', outcome: 'handed-off-to-salvage', signature }];
+    expect(judgeNextMove({ stopReason: 'handed-off-to-salvage', mustFix, precedents }).move).toBe('alternative');
+    expect(judgeNextMove({ stopReason: 'provider-exhausted', mustFix, precedents }).move).toBe('wait-retry');
+  });
+
+  test('같은 서명으로 alternative 도 실패한 선례(outcome=alternative-failed) → decision-card · 이유에 선례 runId·서명', () => {
+    const signature = mustFixSignature(mustFix)!;
+    const judged = judgeNextMove({ stopReason: 'no-progress', mustFix,
+      precedents: [{ runId: 'run-2', outcome: 'alternative-failed', signature }] });
+    expect(judged.move).toBe('decision-card');
+    expect(judged.stage).toBe('escalated');
+    expect(judged.reason).toContain('run-2');
+    expect(judged.reason).toContain(signature);
+  });
+
+  test('이번 수가 alternative 인데 같은 서명 선례 → decision-card', () => {
+    const signature = mustFixSignature(mustFix)!;
+    const judged = judgeNextMove({ stopReason: 'no-progress', mustFix, failures: { 'narrow-relaunch': 2 },
+      precedents: [{ runId: 'run-3', outcome: 'no-progress', signature }] });
+    expect(judged.move).toBe('decision-card');
+    expect(judged.stage).toBe('escalated');
+    expect(judged.reason).toContain('run-3');
+  });
+
+  test('같은 서명 선례가 여럿이면 전체를 본다 — alternative-failed 가 목록 뒤에 있어도 decision-card (순서 무관)', () => {
+    const signature = mustFixSignature(mustFix)!;
+    // 순서 의존 재현: no-progress 앞에 alternative-failed 가 있으면 첫 일치만 보면 놓친다.
+    const behind = [{ runId: 'run-a', outcome: 'no-progress', signature },
+      { runId: 'run-b', outcome: 'alternative-failed', signature }];
+    const ahead = [...behind].reverse();
+    for (const precedents of [behind, ahead]) {
+      const judged = judgeNextMove({ stopReason: 'needs-human', review: 'fail', mustFix, precedents });
+      expect(judged.move).toBe('decision-card');
+      expect(judged.stage).toBe('escalated');
+      expect(judged.reason).toContain(precedents[0]!.runId);
+      expect(judged.reason).toContain(signature);
+    }
+  });
+
+  test('관측 — task-agent.judge 이벤트에 precedent {matched, priorRunId, signature} 를 싣는다', () => {
+    const signature = mustFixSignature(mustFix)!;
+    const events: Array<[string, { precedent: { matched: boolean; priorRunId?: string; signature?: string } }]> = [];
+    const observe = (event: 'task-agent.judge', data: { precedent: { matched: boolean; priorRunId?: string; signature?: string } }) => {
+      events.push([event, data]);
+    };
+    judgeNextMove({ stopReason: 'needs-human', review: 'fail', mustFix,
+      precedents: [{ runId: 'run-1', outcome: 'no-progress', signature }], observe });
+    expect(events).toEqual([['task-agent.judge', { precedent: { matched: true, priorRunId: 'run-1', signature } }]]);
+    events.length = 0;
+    judgeNextMove({ stopReason: 'needs-human', review: 'fail', mustFix,
+      precedents: [{ runId: 'run-9', outcome: 'no-progress', signature: 'fnv1a-00000000' }], observe });
+    expect(events).toEqual([['task-agent.judge', { precedent: { matched: false, priorRunId: undefined, signature } }]]);
+    events.length = 0;
+    judgeNextMove({ stopReason: 'needs-human', review: 'fail', mustFix, observe });
+    expect(events).toEqual([['task-agent.judge', { precedent: { matched: false, priorRunId: undefined, signature } }]]);
   });
 });

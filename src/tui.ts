@@ -523,6 +523,12 @@ const _keyQueue: Key[] = [];
 export type KeyTraceSource = 'main' | 'stream' | 'input';
 
 let _keyTracer: ((key: Key, source: KeyTraceSource) => void) | null = null;
+let _lastHumanKeyAt = 0;
+
+/** 마지막으로 배달된 사람 키 시각(ms · 0 = 아직 없음) — 내부 턴 문(H2)의 조용창 판정에 쓴다. */
+export function lastHumanKeyAt(): number {
+  return _lastHumanKeyAt;
+}
 
 /** Install a tracer invoked with every dispatched Key. Set to null to
  *  detach. Exceptions thrown by the tracer are swallowed so a broken
@@ -534,6 +540,8 @@ export function setKeyTracer(fn: ((key: Key, source: KeyTraceSource) => void) | 
 /** Call the installed tracer, if any. Safe to invoke unconditionally —
  *  becomes a noop when no tracer is registered. */
 export function traceKey(key: Key, source: KeyTraceSource): void {
+  // H2 내부 턴 문 — «마지막 사람 키» 시각. 빈 이름(readKey 취소·빈 깨움)·리스너 표지는 사람 키가 아니다.
+  if (key.name && !key.name.startsWith('listener-')) _lastHumanKeyAt = Date.now();
   if (!_keyTracer) return;
   try { _keyTracer(key, source); } catch { /* swallow — never break input */ }
 }
@@ -956,12 +964,45 @@ export function readKey(source: KeyTraceSource = 'main'): Promise<Key> {
 export function injectKey(key: Key): boolean {
   if (!_raw) return false;
   _keyQueue.push(key);
+  _injectedKeys.add(key);
   // Wake any in-flight readKey awaiting on stdin by emitting an empty
   // chunk. The handler's queue-drain branch picks up the injected key
   // immediately.
   if (process.stdin.listenerCount('data') > 0) {
     process.stdin.emit('data', Buffer.from(''));
   }
+  return true;
+}
+
+/** `injectKey` 로 들어온 키 표지 — `takeInjectedKeys` 가 stdin 잔여 키(readKey 몫)는 두고 주입 키만 꺼낸다. */
+const _injectedKeys = new WeakSet<Key>();
+
+/** ⭐ TUI-ESC-ABORT-TOOLS (2026-10-15) — 턴 중 스트리밍 리스너(`attachStreamingKeys`)가
+ *  바깥에서 주입된 키(`pty key` · 제어 IPC input-key → `injectKey`)를 받게 큐에서 꺼낸다.
+ *  ⛔ readKey 가 걸려 있으면(`_cancelReadKey`) 큐는 그 readKey 의 몫이다 — 빈 배열을 돌려준다.
+ *  ⛔ stdin 청크 잔여 키(readKey 가 넣은 것)는 건드리지 않는다. readKey 의 drain 동작은 그대로다. */
+export function takeInjectedKeys(): Key[] {
+  if (_cancelReadKey || _keyQueue.length === 0) return [];
+  const taken: Key[] = [];
+  for (let i = 0; i < _keyQueue.length; ) {
+    const k = _keyQueue[i]!;
+    if (_injectedKeys.has(k)) {
+      taken.push(k);
+      _keyQueue.splice(i, 1);
+    } else {
+      i += 1;
+    }
+  }
+  // 같은 Key 객체가 두 번 주입될 수 있으므로 표지는 다 꺼낸 «뒤에» 지운다.
+  for (const k of taken) _injectedKeys.delete(k);
+  return taken;
+}
+
+/** ⭐ H2 내부 턴 문 — 걸려 있는 readKey 를 «빈 키»로 깨운다(키를 만들지도 큐에 넣지도 않는다).
+ *  stdin 에 남은 바이트는 그대로 다음 readKey 몫이다. 걸린 readKey 가 없으면 false. */
+export function cancelPendingReadKey(): boolean {
+  if (!_cancelReadKey) return false;
+  _cancelReadKey();
   return true;
 }
 
@@ -995,6 +1036,13 @@ export function resetRenderCache(): void {
   _lastFrameLines = [];
   _lastFrameRows = 0;
   _lastFrameCols = 0;
+}
+
+/** True when the frame cache says `row` (0-based) currently shows
+ *  exactly `text` — a direct writer can skip repainting it. Invalidated
+ *  rows hold a sentinel that never matches. */
+export function renderCacheRowIs(row: number, text: string): boolean {
+  return row >= 0 && row < _lastFrameLines.length && _lastFrameLines[row] === text;
 }
 
 /** Invalidate a specific row in the frame cache without nuking the

@@ -1,7 +1,7 @@
 import { describe, it, expect, spyOn } from 'bun:test';
 import { AcpAgent, type AcpAgentOpts, type AcpPermissionApprover } from '../acp/client.js';
 import { debug } from '../debug/log.js';
-import { decideImplementerPermission, makeAcpImplementer } from './acp-implementer.js';
+import { CLAUDE_IMPLEMENTER_META, decideImplementerPermission, makeAcpImplementer } from './acp-implementer.js';
 
 const WORKTREE = '/tmp/run-worktree';
 
@@ -27,6 +27,11 @@ describe('makeAcpImplementer', () => {
         worktree: WORKTREE, env: { PATH: '/bin', NODE_ENV: 'test' }, proxyBaseUrl: 'http://localhost:3456',
       })('implement');
       expect(stub.start).toHaveBeenCalledTimes(1);
+      expect(stub.newSession).toHaveBeenCalledWith(CLAUDE_IMPLEMENTER_META);
+      expect(CLAUDE_IMPLEMENTER_META.claudeCode.options).toEqual({
+        tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'], settingSources: [], plugins: [],
+        mcpServers: {}, strictMcpConfig: true,
+      });
       expect(stub.prompt).toHaveBeenCalledTimes(1);
       expect(stub.stop).toHaveBeenCalledTimes(1);
       expect(stub.seen.child?.spec.command).toBe('claude-agent-acp');
@@ -119,7 +124,7 @@ describe('makeAcpImplementer', () => {
     const result = await makeAcpImplementer({
       worktree: WORKTREE, resumeSessionId: 'old-session', createAgent: () => agent,
     })('continue');
-    expect(loaded).toEqual([{ sessionId: 'old-session', cwd: WORKTREE }]);
+    expect(loaded).toEqual([{ sessionId: 'old-session', cwd: WORKTREE, _meta: CLAUDE_IMPLEMENTER_META }]);
     expect(result.sessionId).toBe('old-session');
   });
 });

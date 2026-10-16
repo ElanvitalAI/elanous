@@ -1,4 +1,9 @@
 #!/usr/bin/env bun
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { prepareIsolatedTestEnv } from './lib/deterministic-env.js';
+
 export const EXIT_NO_INTERFERENCE = 0;
 export const EXIT_INTERFERENCE = 1;
 export const EXIT_INVALID_INPUT = 2;
@@ -19,7 +24,7 @@ export type BunTestChild = {
   exited: Promise<number>;
   signalCode: string | null;
 };
-export type BunSpawn = (options: { cmd: string[]; cwd: string; stdout: 'pipe'; stderr: 'pipe' }) => BunTestChild;
+export type BunSpawn = (options: { cmd: string[]; cwd: string; env: NodeJS.ProcessEnv; stdout: 'pipe'; stderr: 'pipe' }) => BunTestChild;
 
 export type MeasuredRun = {
   files: string[];
@@ -45,10 +50,38 @@ export const MAX_ISOLATED_FAILURE_FILES = 8;
 
 const defaultBunSpawn: BunSpawn = (options) => Bun.spawn(options) as unknown as BunTestChild;
 
-export async function runBunTest(files: readonly string[], spawn: BunSpawn = defaultBunSpawn, cwd: string = process.cwd()): Promise<RunnerResult> {
-  const child = spawn({ cmd: [process.execPath, 'test', ...files], cwd, stdout: 'pipe', stderr: 'pipe' });
-  const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-  return { stdout, stderr, exitCode, signal: child.signalCode };
+/**
+ * ⛔ 2026-10-16 사고(R7 · OP #8751) — 이 러너가 `bun test` 를 env 지정 없이 띄워 호스트 재게이트가 mbp 의 실 HOME·운영
+ * config 를 시험에 물려줬다. seam 이 빠진 시험 둘(tasks-cli · COORD-ONE)이 운영 `taskAgent.parentHost` 목록으로 진짜 ssh
+ * 발사를 해 원격 prod 런 25 · draft PR 11 이 생겼다.
+ * ⇒ 시험은 «게이트와 같은» 격리 env 로 띄운다(`prepareIsolatedTestEnv` — 임시 HOME ⊕ 임시 ELANOUS_STATE_DIR ⊕ 자격·실행
+ *   정체성·`ELANOUS_STATE_DIR_SOURCE` 제거 · PATH 보존) ⊕ 원격 부모 끔(`ELANOUS_TA_PARENT_HOST=off`).
+ */
+export async function isolatedBunTestEnv(sourceEnv: NodeJS.ProcessEnv = process.env): Promise<{ env: NodeJS.ProcessEnv; cleanup: () => void }> {
+  // ⛔ Import the side-effect-free lib, never `test-deterministic.ts`: that file pulls `typescript` and Bun stream
+  //    types into every graph that reaches this runner — the PWA tsc program failed on it (#28474 train · 10-16).
+  const root = mkdtempSync(join(tmpdir(), 'elanous-interference-test-'));
+  const cleanup = (): void => {
+    try { rmSync(root, { recursive: true, force: true }); }
+    catch (error) {
+      // 판정은 막지 않되 숨기지 않는다 — 남은 임시 뿌리는 경로로 찾을 수 있게 한 줄 남긴다(리뷰 should-fix).
+      try { process.stderr.write(`[detect-test-interference] temp env root cleanup failed: ${root}: ${error instanceof Error ? error.message : String(error)}\n`); } catch { /* ignore */ }
+    }
+  };
+  try {
+    return { env: { ...prepareIsolatedTestEnv(sourceEnv, root), ELANOUS_TA_PARENT_HOST: 'off' }, cleanup };
+  } catch (error) { cleanup(); throw error; }
+}
+
+export async function runBunTest(files: readonly string[], spawn: BunSpawn = defaultBunSpawn, cwd: string = process.cwd(), sourceEnv: NodeJS.ProcessEnv = process.env): Promise<RunnerResult> {
+  const isolated = await isolatedBunTestEnv(sourceEnv);
+  try {
+    const child = spawn({ cmd: [process.execPath, 'test', ...files], cwd, env: isolated.env, stdout: 'pipe', stderr: 'pipe' });
+    const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    return { stdout, stderr, exitCode, signal: child.signalCode };
+  } finally {
+    isolated.cleanup();
+  }
 }
 
 export function parseFailureCount(output: string): number | null {

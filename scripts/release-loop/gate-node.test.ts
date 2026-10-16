@@ -1,9 +1,9 @@
 import { setDefaultTimeout, afterEach, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, realpathSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
+import { hostname, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { createGateRunner, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, GATE_HOST_RECHECK_FILE_LIMIT, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, parseOptions, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, admitGateShard, poolGateAdmission, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, type GateAdmission, type GateRunner } from './gate-node';
+import { createGateRunner, gateShardShell, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, GATE_HOST_RECHECK_FILE_LIMIT, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, parseOptions, readIsolatedRun, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, admitGateShard, poolGateAdmission, reportSelectionTimed, reservedGateHosts, runGateNode, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, type GateAdmission, type GateRunner } from './gate-node';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { releaseLedgerRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
 import { debug } from '../../src/debug/log.js';
@@ -14,6 +14,9 @@ import { parsePodCpu, runPodCommand, type RunPodCommandOptions } from '../../src
 import { PodPoolScheduler, parsePodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { HostPoolLease } from '../../src/pod-lease/host-lease.js';
 import { gateShardsPath, readGateShards } from '../../src/release-loop/gate-shards.js';
+import { warmReferenceFromJobArtifacts, writeWarmJobManifest } from './gate-warm-artifacts.js';
+import { inspectReleaseGateHost } from '../../src/release-loop/gate-host-reservation.js';
+import { runGraph } from '../../src/graph-runner/runner.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -31,6 +34,41 @@ test('freeze prevents starting the release gate before runner side effects', asy
 const CUT = 'a'.repeat(40), BASE = 'b'.repeat(40);
 const A = 'src/a.test.ts > A', B = 'src/b.test.ts > B', C = 'src/c.test.ts > C', D = 'src/d.test.ts > D';
 const scratch: string[] = [];
+test('gate host reservation names the actual executor rather than every remote host', () => {
+  expect(reservedGateHosts({ remote: 'node-b' })).toEqual(['node-b']);
+  expect(reservedGateHosts({ remote: 'agent@node-b' })).toEqual(['node-b']);
+  expect(reservedGateHosts({})).toEqual([hostname()]);
+  expect(reservedGateHosts({ pod: { pool: 'local-pod:1' } })).toEqual([hostname()]);
+  expect(reservedGateHosts({ pod: { pool: 'pod-a@node-b:1,pod-b@node-c:1' } })).toEqual(['node-b', 'node-c']);
+});
+
+test('graph-runner context reserves the gate host during the real judge sweep', async () => {
+  const { root, instanceRoot, runner } = fake([], []);
+  const command = runner.command.bind(runner);
+  runner.command = async (cmd, args, cwd, limitMs) => cmd === 'mktemp'
+    ? { rc: 0, output: '/tmp/release-gate-proof\n' } : command(cmd, args, cwd, limitMs);
+  setElanousConfigDir(instanceRoot);
+  const graph = join(root, 'reservation-graph.yaml');
+  writeFileSync(join(root, 'recipes.yaml'), 'gate:\n  command: "gate-node"\n');
+  writeFileSync(graph, `graph_id: release-gate-reservation\nversion: 1\nentry_node: gate\nterminal_nodes: [done, failed]\nnodes:\n  - { node_id: gate, kind: agent, recipe: 'cmd:gate', max_visits: 1 }\n  - { node_id: done, kind: gate, max_visits: 1 }\n  - { node_id: failed, kind: gate, max_visits: 1 }\nedges:\n  - from: gate\n    on: outcome\n    map: { ok: done, fail: failed }\n`);
+  let finish!: () => void;
+  const wait = new Promise<void>(resolve => { finish = resolve; });
+  let entered!: () => void;
+  const sweepEntered = new Promise<void>(resolve => { entered = resolve; });
+  const sweep = runner.sweep.bind(runner);
+  runner.sweep = async (tree, logDir, pod, only) => { entered(); await wait; return sweep(tree, logDir, pod, only); };
+  const running = runGraph(graph, { runId: 'gate-live-run', pinChildUniverse: true,
+    input: { commit: CUT, version: '1.0.1', previousVersion: '1.0.0', gateExecutor: 'host', gateRemote: 'node-b' },
+    deps: { root: instanceRoot, runBash: async (_body, opts) => {
+      const rc = await runGateNode(['--json'], opts.env!, runner);
+      return { exitCode: rc, stdout: JSON.stringify({ outcome: rc === 0 ? 'ok' : 'fail', verdict: rc === 0 ? 'pass' : 'fail' }), stderr: '' };
+    } } });
+  await Promise.race([sweepEntered, running.then(() => { throw new Error('gate ended before sweep'); })]);
+  expect(inspectReleaseGateHost(instanceRoot, 'node-b')).toMatchObject({ status: 'reserved', runId: 'gate-live-run' });
+  finish();
+  await running;
+  expect(inspectReleaseGateHost(instanceRoot, 'node-b')).toEqual({ status: 'free' });
+});
 afterEach(() => { resetElanousConfigDir(); for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'gate-node-unit-'));
@@ -83,6 +121,99 @@ function fake(cut = [A, B, C], baseline = [A, D], cached = true) {
   return { root, instanceRoot, ledgerRoot, runner, calls };
 }
 const options = (instanceRoot: string) => ({ commit: CUT, version: '1.0.1', baselineVersion: '1.0.0', instanceRoot, ledgerRoot: join(dirname(instanceRoot), 'machine-ledger') });
+
+
+test('a multi-file part after a warm one-file part has no source stamp', () => {
+  const shell = gateShardShell({ parts: [['src/warm-reference.test.ts'], ['src/a.test.ts', 'src/b.test.ts']],
+    cdpPatterns: [], softSeconds: 30, cachePrefix: '', installSlots: 0 });
+  const calls = [...shell.matchAll(/(?:WARM_REFERENCE_FILE='[^']*' )?run_part \d+/g)].map((match) => match[0]);
+  expect(calls).toHaveLength(2);
+  expect(calls[1]).toBe('run_part 1');
+  const run = spawnSync('bash', ['-c', `run_part() { if [ -n "$WARM_REFERENCE_FILE" ]; then printf '[warm-worker] file=%s\\n' "$WARM_REFERENCE_FILE"; else printf 'part-no-stamp\\n'; fi; }; ${calls.join('; ')}`], { encoding: 'utf8' });
+  expect(run.status).toBe(0);
+  expect(run.stdout.trim().split('\n')).toEqual(['[warm-worker] file=src/warm-reference.test.ts', 'part-no-stamp']);
+});
+
+test('a real one-file gate shell produces a named Job reference after collection', async () => {
+  const { root, runner: fallback } = fake([], []);
+  const repo = join(root, 'repo');
+  const file = 'src/warm-reference.test.ts';
+  mkdirSync(join(repo, 'src'), { recursive: true });
+  mkdirSync(join(repo, 'scripts'), { recursive: true });
+  mkdirSync(join(repo, 'apps/pwa'), { recursive: true });
+  mkdirSync(join(root, 'working'));
+  mkdirSync(join(root, 'bin'));
+  mkdirSync(join(root, 'home'));
+  expect(spawnSync('git', ['init', '-q', repo], { encoding: 'utf8' }).status).toBe(0);
+  symlinkSync(resolve(import.meta.dir, '../test-deterministic.ts'), join(repo, 'scripts/test-deterministic.ts'));
+  writeFileSync(join(repo, file), "import { expect, test } from 'bun:test'; test('works', () => expect(1).toBe(1)); test('fails', () => { throw new Error('boom'); });\n");
+  writeFileSync(join(root, 'bin/bun'), `#!/bin/sh\nif [ "$1" = install ]; then exit 0; fi\nexec '${process.execPath}' "$@"\n`);
+  writeFileSync(join(root, 'bin/timeout'), '#!/bin/sh\n[ "$1" = -k ] && shift 2\nshift\nexec "$@"\n');
+  chmodSync(join(root, 'bin/bun'), 0o755);
+  chmodSync(join(root, 'bin/timeout'), 0o755);
+  let shell = '';
+  let shellDiagnostics = '';
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: file };
+    return fallback.command(cmd, args, cwd);
+  }, async (request) => {
+    shell = request.command[2]!;
+    const run = spawnSync('bash', ['-c', shell], { cwd: join(root, 'working'), encoding: 'utf8',
+      timeout: 30_000, env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH ?? ''}`, HOME: join(root, 'home') } });
+    const artifactsDir = join(root, 'home/outbox');
+    shellDiagnostics = `shell rc=${run.status} stderr=${run.stderr} stdout=${run.stdout} error=${run.error ?? ''} install=${existsSync(join(artifactsDir, 'install.log')) ? readFileSync(join(artifactsDir, 'install.log'), 'utf8') : 'missing'} part=${existsSync(join(artifactsDir, 'part-0.log')) ? readFileSync(join(artifactsDir, 'part-0.log'), 'utf8') : 'missing'}`;
+    expect(run.status).toBe(0);
+    expect(readFileSync(join(artifactsDir, 'part-0.rc'), 'utf8').trim()).toBe('1');
+    expect(readFileSync(join(artifactsDir, 'part-0.log'), 'utf8')).toContain(`[warm-worker] file=${file}`);
+    expect(readFileSync(join(artifactsDir, 'part-0.log'), 'utf8')).toMatch(/\[warm-worker\] junit-sha256=[0-9a-f]{64}/);
+    expect(readFileSync(join(artifactsDir, 'part-0.log'), 'utf8')).toContain('(pass) works');
+    expect(readFileSync(join(artifactsDir, 'part-0.log'), 'utf8')).toContain('(fail) fails');
+    return { exitCode: 0, artifactsDir, job: 'real-one-file-shell' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]), () => '');
+  const logDir = join(root, 'logs');
+  try { await runner.sweep(repo, logDir, { pool: 'pool-test', shards: 1, installSlots: 0 }); }
+  catch (error) { throw new Error(`${error}\n${shellDiagnostics}`); }
+  expect(shell).toContain("'scripts/test-deterministic.ts'");
+  expect(shell).not.toContain("'test:deterministic'");
+  const prefix = join(logDir, 'pod-0');
+  const meta = JSON.parse(readFileSync(`${prefix}.json`, 'utf8')) as { attemptId: string };
+  expect(existsSync(`${prefix}.warm-manifest.json`)).toBe(true);
+  expect(warmReferenceFromJobArtifacts(prefix, file, { cutSha: CUT, attemptId: meta.attemptId })).toEqual({
+    file, rc: 1, failureIds: [`${file} > fails`], errorIds: [], junitComplete: true,
+  });
+  // Two real one-file shells produce distinct source attempt stamps. A fresh
+  // collector manifest cannot relabel the first Job as the second.
+  writeFileSync(join(repo, file), "import { expect, test } from 'bun:test'; test('works', () => expect(1).toBe(1)); test('fails', () => { throw new Error('later'); });\n");
+  const laterDir = join(root, 'later-logs');
+  const laterHome = join(root, 'later-home');
+  const laterWorking = join(root, 'later-working');
+  mkdirSync(laterHome);
+  mkdirSync(laterWorking);
+  const laterRunner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: file };
+    return fallback.command(cmd, args, cwd);
+  }, async (request) => {
+    const run = spawnSync('bash', ['-c', request.command[2]!], { cwd: laterWorking, encoding: 'utf8',
+      timeout: 30_000, env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH ?? ''}`, HOME: laterHome } });
+    const artifactsDir = join(laterHome, 'outbox');
+    expect(run.status).toBe(0);
+    expect(readFileSync(join(artifactsDir, 'part-0.rc'), 'utf8').trim()).toBe('1');
+    return { exitCode: 0, artifactsDir, job: 'later-real-one-file-shell' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]), () => '');
+  await laterRunner.sweep(repo, laterDir, { pool: 'pool-test', shards: 1, installSlots: 0 });
+  const laterPrefix = join(laterDir, 'pod-0');
+  const laterMeta = JSON.parse(readFileSync(`${laterPrefix}.json`, 'utf8')) as { attemptId: string };
+  expect(laterMeta.attemptId).not.toBe(meta.attemptId);
+  expect(warmReferenceFromJobArtifacts(laterPrefix, file, { cutSha: CUT, attemptId: laterMeta.attemptId })?.rc).toBe(1);
+  copyFileSync(`${prefix}.log`, `${laterPrefix}.log`);
+  copyFileSync(`${prefix}.junit.xml`, `${laterPrefix}.junit.xml`);
+  expect(writeWarmJobManifest(laterPrefix, file, CUT, laterMeta.attemptId)).toBe(true);
+  expect(warmReferenceFromJobArtifacts(laterPrefix, file, { cutSha: CUT, attemptId: laterMeta.attemptId })).toBeNull();
+});
 
 test('rehearsal gate invokes executable TUI screen node and refuses a failed screen; regular gate does not invoke it', async () => {
   const f = fake([A], [A]);
@@ -197,6 +328,47 @@ test('pod JUnit records only executed passing known ids, not skipped, missing, o
   fixtureRunner.sweep = real.sweep;
   const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 1 } }, fixtureRunner);
   expect(result).toMatchObject({ outcome: 'ok', knownEnv: 1, knownEnvCleared: [passing] });
+});
+
+test('GATE-WARM-BOOT-SCAN selectionMs: the pod cut sweep times its test selection into the result, the verdict file and one event; a local gate has none', async () => {
+  const { root, instanceRoot, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo, { recursive: true });
+  const real = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    // A slow listing is part of the selection: the timed value must include it.
+    if (cmd === 'git' && args[0] === 'ls-files') { await Bun.sleep(40); return { rc: 0, output: 'src/a.test.ts\nsrc/b.test.ts\n' }; }
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    const artifactsDir = join(root, o.name!);
+    mkdirSync(artifactsDir);
+    writeFileSync(join(artifactsDir, 'shard.log'), 'src/a.test.ts:\n(pass) a [1.00ms]\nsrc/b.test.ts:\n(pass) b [1.00ms]\n2 pass\n0 fail\nRan 2 tests across 2 files.\n');
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+  fixtureRunner.sweep = real.sweep;
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const spy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'release-loop.gate') events.push({ event, data: data as Record<string, unknown> });
+  });
+  let result;
+  try { result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 1 } }, fixtureRunner); }
+  finally { spy.mockRestore(); }
+  expect(result.outcome).toBe('ok');
+  expect(typeof result.selectionMs).toBe('number');
+  expect(result.selectionMs!).toBeGreaterThanOrEqual(35);
+  const timed = events.filter((item) => item.event === 'selection-timed');
+  expect(timed.map((item) => item.data)).toEqual([{ ms: result.selectionMs, files: 2 }]);
+  const verdict = JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8'));
+  expect(verdict).toMatchObject({ outcome: 'ok', selectionMs: result.selectionMs });
+  // Counter-case: a gate whose runner has no pod sweep never invents the field.
+  const local = fake([], []);
+  const plain = await judgeGate(options(local.instanceRoot), local.runner);
+  expect(plain.selectionMs).toBeUndefined();
+  expect(JSON.parse(readFileSync(join(local.root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8')).selectionMs).toBeUndefined();
+  // An observer that throws never stops the sweep.
+  expect(() => reportSelectionTimed(1, 1, () => { throw new Error('observer'); })).not.toThrow();
 });
 
 test('pod rejects malformed known-failure list instead of reporting a clean gate; local ignores it', async () => {
@@ -972,6 +1144,60 @@ test('an incomplete sweep is an error, not a clean release', async () => {
   expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'error', error: expect.stringContaining('cut sweep incomplete') });
 });
 
+test('validated Pod sweep counts failures after an earlier shard failure summary', async () => {
+  // 0.2.30 cut: shard 77 ended with a repeated Bun failure list, then shard 79
+  // reported two more actual failures. The aggregate had 74 named failures but
+  // the old global slice counted only 72 execution lines and errored.
+  const ids = Array.from({ length: 74 }, (_, i) => `src/case-${i}.test.ts > failure ${i}`);
+  const { instanceRoot, runner } = fake(ids, []);
+  const command = runner.command;
+  runner.command = async (cmd, args, cwd) => {
+    if (cmd === 'bun' && args[0] === 'run' && cwd.endsWith('/cut')) {
+      const file = args[2]!.replace(/^\.\//, '');
+      const id = ids.find((candidate) => candidate.startsWith(`${file} > `));
+      return { rc: id ? 1 : 0, output: runOutput(id ? [id] : []) };
+    }
+    return command(cmd, args, cwd);
+  };
+  runner.sweep = async () => {
+    const body = (items: string[]) => items.map((id) => {
+      const [file, name] = id.split(' > ');
+      return `${file}:\n(fail) ${name} [1.00ms]\n`;
+    }).join('');
+    return { rc: 1, validatedShards: true, output: `${body(ids.slice(0, 72))}1 tests failed:\n(fail) failure 71 [1.00ms]\n\n\n${body(ids.slice(72))}\n74 fail\n0 errors\nRan 74 tests across 74 files.\n` };
+  };
+  const result = await judgeGate(options(instanceRoot), runner);
+  expect(result).toMatchObject({ outcome: 'regression', introduced: [...ids].sort() });
+});
+
+test('unvalidated sweep keeps the single-run summary boundary', async () => {
+  const { instanceRoot, runner } = fake([A, B], []);
+  runner.sweep = async () => ({ rc: 1, output: 'src/a.test.ts:\n(fail) A [1.00ms]\n1 tests failed:\n(fail) A [1.00ms]\n\nsrc/b.test.ts:\n(fail) B [1.00ms]\n2 fail\nRan 2 tests across 2 files.\n' });
+  expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'error', error: expect.stringContaining('failure attribution incomplete') });
+});
+
+test('a passing title containing (fail) cannot make an under-attributed failure summary complete', async () => {
+  const { instanceRoot, runner } = fake([A], []);
+  runner.sweep = async () => ({ rc: 1, output: `src/a.test.ts:\n(pass) title contains (fail) as ordinary text\n(fail) A [1.00ms]\n1 pass\n2 fail\nRan 2 tests across 1 file.\n` });
+  expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({
+    outcome: 'error', error: expect.stringContaining('failure attribution incomplete: summary=2, identified=1'),
+  });
+});
+
+test('the original decision-signal passing titles do not turn a clean isolated summary into an error', async () => {
+  const { instanceRoot, runner } = fake();
+  runner.sweep = async () => ({ rc: 0, output: `src/self-implement/decision-signal-press.test.ts:\n(pass) moves a signal out of pressedRed when every (fail) name also failed on the baseline [0.61ms]\n(pass) reads (fail) names from stderr — real bun test prints them there, not on stdout [0.07ms]\n21 pass\n0 fail\nRan 21 tests across 1 file.\n` });
+  expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'ok', introduced: [], preexisting: 0 });
+});
+
+test('a CRLF failure line is counted while a passing title containing (fail) is ignored', async () => {
+  const { instanceRoot, runner } = fake([B], [A]);
+  runner.sweep = async () => ({ rc: 1, output: `src/b.test.ts:\r\n(pass) title contains (fail)\r\n(fail) B [1.00ms]\r\n1 pass\r\n1 fail\r\nRan 2 tests across 1 file.\r\n` });
+  const result = await judgeGate(options(instanceRoot), runner);
+  expect(result).toMatchObject({ outcome: 'regression', introduced: [B] });
+  expect(result.error).toBeUndefined();
+});
+
 test('a leaked non-zero exit under a complete clean summary is read as clean, not incomplete', async () => {
   // 0.2.7 gate: agent-cli at v0.2.6 left process.exitCode = 2 — «12 pass · 0 fail · Ran 12 tests» with rc 2 stopped the gate.
   const { instanceRoot, runner } = fake();
@@ -1011,6 +1237,15 @@ test('a zero-exit sweep reporting failures cannot be called healthy', async () =
   const { instanceRoot, runner } = fake();
   runner.sweep = async () => ({ rc: 0, output: runOutput([A]) });
   expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'error', error: expect.stringContaining('failure attribution incomplete') });
+});
+
+test('isolated gate reads the 2026-10-16 Bun log with one failure repeated in its closing summary', () => {
+  const output = readFileSync(join(import.meta.dir, 'fixtures/gate-recheck-webclone-20261016.log'), 'utf8');
+  expect(readIsolatedRun({ rc: 1, output }, 'cut isolated src/webclone/archive-run.test.ts', 'src/webclone/archive-run.test.ts')).toEqual({
+    kind: 'read',
+    failures: ['src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > 실제 wget은 POSIX ERE를 컴파일해 www 형제 자산만 받고 외부 호스트는 받지 않는다'],
+    errors: [],
+  });
 });
 
 test('an explicit baseline commit rejects stale caches and sweeps when neither location matches', async () => {
@@ -1171,6 +1406,7 @@ test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the se
     return { exitCode: 0, artifactsDir, job: 'fake' };
   };
   const runner = createGateRunner(repo, undefined, command, pod, new PodPoolScheduler([{ context: 'pool-test', capacity: 3, k3dCluster: 'test' }]));
+  runner.recheckPod = undefined; // This case measures sweep placement; final recheck has its own Pod contract test.
   runner.add = fixtureRunner.add;
   runner.remove = fixtureRunner.remove;
   runner.snapshot = fixtureRunner.snapshot;
@@ -1257,7 +1493,8 @@ test('Pod sweep opts into the Bun cache and records the first install timing', a
     expect(invoked[1]!.command[2]).toContain(`O="$HOME/outbox"`);
     expect(invoked[1]!.command[2]).toContain(cachePrefix);
     expect(invoked[1]!.command[2]!.indexOf(`O="$HOME/outbox"`)).toBeLessThan(invoked[1]!.command[2]!.indexOf(cachePrefix));
-    expect(invoked[1]!.command[2]!.replace(cachePrefix, '')).toBe(invoked[0]!.command[2]);
+    const withoutAttemptNonce = (shell: string) => shell.replace(/[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}/g, '<attempt>');
+    expect(withoutAttemptNonce(invoked[1]!.command[2]!.replace(cachePrefix, ''))).toBe(withoutAttemptNonce(invoked[0]!.command[2]!));
     expect(observed).toEqual([
       { event: 'pod-bun-cache', data: { source: 'none' } },
       { event: 'pod-shard', data: expect.objectContaining({ installSeconds: 0.75 }) },
@@ -1424,6 +1661,7 @@ test('with no baseline cache, the baseline is swept on the same Pod pool as the 
     writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
     return { exitCode: 0, artifactsDir, job: 'fake' };
   }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+  runner.recheckPod = undefined;
   runner.add = fixtureRunner.add;
   runner.remove = fixtureRunner.remove;
   runner.snapshot = fixtureRunner.snapshot;
@@ -1552,6 +1790,7 @@ test('judgeGate plans cut and swept baseline from the prior ledger JUnit; the lo
       writeFileSync(join(artifactsDir, 'shard.rc'), `${fails.length ? 1 : 0}\n`);
       return { exitCode: 0, artifactsDir, job: 'fake' };
     }, new PodPoolScheduler([{ context: 'pool-test', capacity: 2, k3dCluster: 'test' }]));
+    runner.recheckPod = undefined;
     runner.add = fixtureRunner.add;
     runner.remove = fixtureRunner.remove;
     runner.snapshot = fixtureRunner.snapshot;
@@ -1723,6 +1962,7 @@ test('a no-output Pod shard retries once in a fresh Job and its measured result 
         writeFileSync(join(artifactsDir, 'shard.rc'), failed ? '1\n' : '0\n');
         return { exitCode: 0, artifactsDir, job: 'fake' };
       }, new PodPoolScheduler([{ context: 'pool-test', capacity: 2, k3dCluster: 'test' }]));
+      runner.recheckPod = undefined;
       runner.add = fixtureRunner.add;
       runner.remove = fixtureRunner.remove;
       runner.snapshot = fixtureRunner.snapshot;
@@ -1779,6 +2019,7 @@ test('GATE-STALL2: two silent Pod jobs produce a verdict from other shards and o
         writeFileSync(join(artifactsDir, 'shard.rc'), isA ? '1\n' : '0\n');
         return { exitCode: 0, artifactsDir, job: 'fake' };
       }, new PodPoolScheduler([{ context: 'pool-test', capacity: 3, k3dCluster: 'test' }]));
+      runner.recheckPod = undefined;
       runner.add = fixtureRunner.add;
       runner.remove = fixtureRunner.remove;
       runner.snapshot = fixtureRunner.snapshot;
@@ -1829,6 +2070,8 @@ test('a silent Pod shard does not hide a separate measured shard regression', as
   runner.snapshot = fixtureRunner.snapshot;
   runner.removeSnapshot = fixtureRunner.removeSnapshot;
   runner.localCommand = async () => ({ rc: 0, output: runOutput([]) });
+  runner.recheckPod = async (_file, commit) => ({ rc: commit === CUT ? 1 : 0, output: runOutput(commit === CUT ? [C] : []) });
+  runner.recheckPodBatch = undefined;
   const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 2 } }, runner);
   expect(result).toMatchObject({ outcome: 'regression', introduced: [C], preexisting: 0,
     stalledEnv: [{ file: 'src/b.test.ts', reason: 'no-output', local: 'passed' }] });
@@ -1870,15 +2113,19 @@ test('a silent Pod shard preserves a completed zero-test file error when the sta
     if (cmd === 'bun' && args[0] === 'run') hostRuns.push(args[2]!);
     return { rc: 0, output: runOutput([]) };
   };
+  runner.recheckPod = async (_file, commit) => ({ rc: commit === CUT ? 1 : 0, output: commit === CUT ? fileError : runOutput([]) });
+  runner.recheckPodBatch = undefined;
   const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 2 } }, runner);
-  expect(result).toMatchObject({ outcome: 'regression', introduced: ['src/c.test.ts > [error]'], preexisting: 0,
+  expect(result).toMatchObject({ outcome: 'error', introduced: [], unmeasuredRecheckFiles: ['src/c.test.ts'],
+    unmeasuredErrors: [{ file: 'src/c.test.ts', reason: 'reproduced', ids: ['src/c.test.ts > [error]'] }], preexisting: 0,
     stalledEnv: [{ file: 'src/b.test.ts', reason: 'no-output', local: 'passed' }] });
   expect(graphGateResult(result, true).verdict).toBe('fail');
   expect(attempts).toEqual(['src/b.test.ts', 'src/c.test.ts', 'src/b.test.ts']);
   expect(hostRuns).toEqual(['./src/b.test.ts']);
   writeFileSync(join(instanceRoot, 'release/1.0.0/gate-failures.json'), JSON.stringify({ commit: BASE, failures: [], errors: ['src/c.test.ts > [error]'] }));
   const preexisting = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 2 } }, runner);
-  expect(preexisting).toMatchObject({ outcome: 'ok', introduced: [], preexisting: 1,
+  expect(preexisting).toMatchObject({ outcome: 'error', introduced: [], preexisting: 0,
+    unmeasuredRecheckFiles: ['src/c.test.ts'],
     stalledEnv: [{ file: 'src/b.test.ts', reason: 'no-output', local: 'passed' }] });
   expect(hostRuns).toEqual(['./src/b.test.ts', './src/b.test.ts']);
 });
@@ -2113,6 +2360,8 @@ test('Pod isolates every file of an out-of-memory shard so only the files that f
   mkdirSync(repo);
   const files = Array.from({ length: 44 }, (_, index) => `src/file-${String(index).padStart(2, '0')}.test.ts`);
   const calls: string[][] = [];
+  let activeFiles = 0;
+  let peakFiles = 0;
   const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
     if (cmd === 'rg') return { rc: 1, output: '' };
     if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
@@ -2121,6 +2370,12 @@ test('Pod isolates every file of an out-of-memory shard so only the files that f
   }, async (o) => {
     const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
     calls.push(assigned);
+    if (assigned.length === 1) {
+      activeFiles++;
+      peakFiles = Math.max(peakFiles, activeFiles);
+      await Bun.sleep(2);
+      activeFiles--;
+    }
     const artifactsDir = join(root, o.name!);
     mkdirSync(artifactsDir);
     if (assigned.length > 1 || assigned[0] === files[43]) return { exitCode: 137, artifactsDir, job: 'fake' };
@@ -2129,7 +2384,7 @@ test('Pod isolates every file of an out-of-memory shard so only the files that f
     return { exitCode: 0, artifactsDir, job: 'fake' };
   }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]), () => '');
   try {
-    await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 });
+    await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1, isolationConcurrency: 2 });
     throw new Error('expected the one stalled file');
   } catch (error) {
     const result = error as { stalledShards: Array<{ files: string[]; reason: string }>; partialSummary: { pass: number; files: number } };
@@ -2138,6 +2393,7 @@ test('Pod isolates every file of an out-of-memory shard so only the files that f
     expect(result.stalledShards.every((item) => item.reason === 'job-failed')).toBe(true);
   }
   expect(calls.filter((assigned) => assigned.length === 1)).toHaveLength(44);
+  expect(peakFiles).toBe(2);
 });
 
 test('Pod isolates every file of a depth-two shard that ends with no output', async () => {
@@ -2359,7 +2615,7 @@ test('a shard with no Ran summary reports its name, rc and last output', async (
   await expect(runner.sweep(root, join(root, 'logs'))).rejects.toThrow(/src-cli shard: .*rc=1; Ran=missing; errors=missing.*last diagnostic/s);
 });
 
-test('file-level errors compare against the baseline and only reproduced new errors regress', async () => {
+test('reproduced between-tests errors stay unmeasured regardless of baseline identity', async () => {
   const { instanceRoot, runner } = fake([], []);
   const errorOutput = (file: string) => `${file}:\n# Unhandled error between tests\n0 fail\n1 errors\nRan 1 test across 1 file.\n`;
   const old = runner.command;
@@ -2369,17 +2625,29 @@ test('file-level errors compare against the baseline and only reproduced new err
     : old(cmd, args, cwd);
   const cached = join(instanceRoot, 'release/1.0.0/gate-failures.json');
   writeFileSync(cached, JSON.stringify({ commit: BASE, failures: [], errors: ['src/a.test.ts > [error]'] }));
-  expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'regression', introduced: ['src/b.test.ts > [error]'] });
+  expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'error', introduced: [], unmeasuredRecheckFiles: ['src/b.test.ts'] });
   writeFileSync(cached, JSON.stringify({ commit: BASE, failures: [], errors: ['src/b.test.ts > [error]'] }));
-  expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'ok', introduced: [] });
+  expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'error', introduced: [], unmeasuredRecheckFiles: ['src/b.test.ts'] });
+});
+
+test('a clean isolated error is recorded as interference while another file is still judged as a regression', async () => {
+  const { instanceRoot, runner } = fake([], []);
+  const old = runner.command;
+  runner.sweep = async () => ({ rc: 1, output: 'src/a.test.ts:\n# Unhandled error between tests\nsrc/b.test.ts:\n(fail) B [1.00ms]\n1 fail\n1 errors\nRan 4 tests across 2 files.\n' });
+  runner.command = async (cmd, args, cwd, limitMs) => cmd === 'bun' && args[0] === 'run' && args[2] === './src/a.test.ts' && cwd.endsWith('/cut')
+    ? { rc: 0, output: runOutput([]) }
+    : old(cmd, args, cwd, limitMs);
+  const result = await judgeGate(options(instanceRoot), runner);
+  expect(result).toMatchObject({ outcome: 'regression', introduced: [B], interferenceErrors: ['src/a.test.ts > [error]'] });
+  expect(result.unmeasuredRecheckFiles).toBeUndefined();
 });
 
 test('CLI and graph Pod options reach the cut gate and reject invalid shard counts before checkout', () => {
   const { root } = fixture();
   const context = join(root, 'pod-context.json');
-  writeFileSync(context, JSON.stringify({ input: { commit: CUT, version: '1.0.1', previousVersion: '1.0.0', gatePodPool: 'pool-test', gatePodShards: 0 }, outputs: {} }));
+  writeFileSync(context, JSON.stringify({ runId: 'gate-pod-invalid', input: { commit: CUT, version: '1.0.1', previousVersion: '1.0.0', gatePodPool: 'pool-test', gatePodShards: 0 }, outputs: {} }));
   const graph = spawnSync('bun', [resolve(import.meta.dir, 'gate-node.ts'), '--json'], {
-    encoding: 'utf8', env: { ...process.env, ELANOUS_GRAPH_CONTEXT: context },
+    encoding: 'utf8', env: { ...process.env, ELANOUS_GRAPH_CONTEXT: context, ELANOUS_STATE_DIR: root },
   });
   expect(graph.status).toBe(2);
   expect(JSON.parse(graph.stdout.trim())).toMatchObject({ outcome: 'error', error: 'invalid pod sweep options' });
@@ -2393,9 +2661,9 @@ test('CLI and graph Pod options reach the cut gate and reject invalid shard coun
 test('graph gateRemoteMirror input is validated before touching the remote host', () => {
   const { root } = fixture();
   const context = join(root, 'context.json');
-  writeFileSync(context, JSON.stringify({ input: { commit: CUT, version: '1.0.1', previousVersion: '1.0.0', gateRemote: 'test-host', gateRemoteMirror: '/tmp/../caller' }, outputs: {} }));
+  writeFileSync(context, JSON.stringify({ runId: 'gate-mirror-invalid', input: { commit: CUT, version: '1.0.1', previousVersion: '1.0.0', gateRemote: 'test-host', gateRemoteMirror: '/tmp/../caller' }, outputs: {} }));
   const result = spawnSync('bun', [resolve(import.meta.dir, 'gate-node.ts'), '--json'], {
-    encoding: 'utf8', env: { ...process.env, ELANOUS_GRAPH_CONTEXT: context },
+    encoding: 'utf8', env: { ...process.env, ELANOUS_GRAPH_CONTEXT: context, ELANOUS_STATE_DIR: root },
   });
   expect(result.status).toBe(2);
   expect(JSON.parse(result.stdout.trim())).toMatchObject({ outcome: 'error', error: 'invalid remote mirror path' });
@@ -2412,9 +2680,9 @@ test('CLI --remote-mirror is validated before touching the remote host', () => {
 test('graph gateRemote input is validated by the existing ssh host guard', () => {
   const { root } = fixture();
   const context = join(root, 'context.json');
-  writeFileSync(context, JSON.stringify({ input: { commit: CUT, version: '1.0.1', previousVersion: '1.0.0', gateRemote: 'bad;host' }, outputs: {} }));
+  writeFileSync(context, JSON.stringify({ runId: 'gate-host-invalid', input: { commit: CUT, version: '1.0.1', previousVersion: '1.0.0', gateRemote: 'bad;host' }, outputs: {} }));
   const result = spawnSync('bun', [resolve(import.meta.dir, 'gate-node.ts'), '--json'], {
-    encoding: 'utf8', env: { ...process.env, ELANOUS_GRAPH_CONTEXT: context },
+    encoding: 'utf8', env: { ...process.env, ELANOUS_GRAPH_CONTEXT: context, ELANOUS_STATE_DIR: root },
   });
   expect(result.status).toBe(2);
   expect(JSON.parse(result.stdout.trim())).toMatchObject({ outcome: 'error', error: 'invalid ssh host' });
@@ -2479,9 +2747,9 @@ test('graph gate regression maps to fail while preserving measured counts', asyn
 test('graph context supplies input values and an un-runnable gate emits JSON error with rc 2', () => {
   const { root } = fixture();
   const context = join(root, 'graph-context.json');
-  writeFileSync(context, JSON.stringify({ input: { commit: 'invalid', version: '1.0.1', previousVersion: '1.0.0' }, outputs: {} }));
+  writeFileSync(context, JSON.stringify({ runId: 'gate-commit-invalid', input: { commit: 'invalid', version: '1.0.1', previousVersion: '1.0.0' }, outputs: {} }));
   const result = spawnSync('bun', [resolve(import.meta.dir, 'gate-node.ts'), '--json'], {
-    encoding: 'utf8', timeout: 15_000, env: { ...process.env, ELANOUS_GRAPH_CONTEXT: context },
+    encoding: 'utf8', timeout: 15_000, env: { ...process.env, ELANOUS_GRAPH_CONTEXT: context, ELANOUS_STATE_DIR: root },
   });
   expect(result.status).toBe(2);
   expect(JSON.parse(result.stdout.trim().split('\n').at(-1)!)).toMatchObject({ outcome: 'error', commit: 'invalid', introduced: [], error: 'invalid commit or version' });
@@ -2493,6 +2761,11 @@ test('explicit CLI arguments do not read an ambient graph context file', () => {
   });
   expect(result.status).toBe(2);
   expect(JSON.parse(result.stdout.trim().split('\n').at(-1)!)).toMatchObject({ commit: 'invalid', outcome: 'error', error: 'invalid commit or version' });
+  const empty = spawnSync('bun', [resolve(import.meta.dir, 'gate-node.ts')], {
+    encoding: 'utf8', timeout: 15_000, env: { ...process.env, ELANOUS_GRAPH_CONTEXT: '/nonexistent/context.json' },
+  });
+  expect(empty.status).toBe(2);
+  expect(JSON.parse(empty.stdout.trim().split('\n').at(-1)!)).toMatchObject({ outcome: 'error', error: 'invalid commit or version' });
 });
 
 test('--help prints options and exits 0 without invoking a gate', () => {
@@ -2758,7 +3031,7 @@ test('a new-failure file whose cut or baseline re-check times out is an environm
     const logs = spyOn(debug, 'log');
     try {
       const result = await judgeGate(options(instanceRoot), runner);
-      expect(result).toMatchObject({ outcome: 'ok', introduced: [] });
+      expect(result).toMatchObject({ outcome: 'error', introduced: [], unmeasuredRecheckFiles: ['src/b.test.ts'] });
       expect(result.stalledEnv).toContainEqual({ file: 'src/b.test.ts', reason: 'isolated-timeout', local: 'timeout' });
       expect(limits.every((limit) => limit === GATE_ISOLATED_TIMEOUT_MS)).toBe(true);
       expect(logs.mock.calls.some(([category, event, data]) => category === 'release-loop.gate' && event === 'isolated-timeout'
@@ -2787,6 +3060,73 @@ test('GATE-PARTIAL: the plan made by planPartialRegate re-runs exactly the chang
   expect(result).toMatchObject({ outcome: 'ok', introduced: [], preexisting: 1, partial: { priorCommit: 'c'.repeat(40), files: 2 } });
   expect(graphGateResult(result, true).summary).toStartWith('부분 재검 2파일');
   expect(JSON.parse(readFileSync(join(instanceRoot, 'release/1.0.1/gate-failures.json'), 'utf8'))).toMatchObject({ commit: CUT, failures: [A] });
+});
+
+function carryCommits(root: string, changed: 'README.md' | 'src/changed.test.ts') {
+  const repo = join(root, 'carry-repo');
+  mkdirSync(repo);
+  const git = (...args: string[]) => {
+    const run = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (run.status !== 0) throw new Error(`git ${args.join(' ')}: ${run.stderr}`);
+    return run.stdout.trim();
+  };
+  git('init', '-q');
+  writeFileSync(join(repo, 'README.md'), '# first\n');
+  git('add', '.');
+  git('-c', 'user.name=TC', '-c', 'user.email=tc@example.test', 'commit', '-qm', 'first');
+  const priorCommit = git('rev-parse', 'HEAD');
+  if (changed.startsWith('src/')) mkdirSync(join(repo, 'src'));
+  writeFileSync(join(repo, changed), '# changed\n');
+  git('add', '.');
+  git('-c', 'user.name=TC', '-c', 'user.email=tc@example.test', 'commit', '-qm', 'append');
+  return { repo, priorCommit, commit: git('rev-parse', 'HEAD') };
+}
+
+test('GATE-REUSE-BY-DIFF: a clean docs-only carry writes the new SHA without starting a cut sweep', async () => {
+  const { root, instanceRoot, runner } = fake([], []);
+  const { repo, priorCommit, commit } = carryCommits(root, 'README.md');
+  const dir = join(instanceRoot, 'release/1.0.1');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'gate-failures.json'), JSON.stringify({ commit: priorCommit, failures: [] }));
+  writeFileSync(join(dir, 'gate-verdict.json'), JSON.stringify({ commit: priorCommit, outcome: 'ok' }));
+  const planned = planPartialRegate({ version: '1.0.1', priorCommit, forCommit: commit,
+    changedFiles: ['README.md'], priorFailures: [], priorErrors: [] });
+  if (!planned.ok) throw new Error(planned.reason);
+  writePartialPlan(instanceRoot, planned.plan);
+  runner.sweep = async () => { throw new Error('cut or baseline Pod sweep started'); };
+  const result = await judgeGate({ ...options(instanceRoot), repo, commit }, runner);
+  expect(result).toMatchObject({ outcome: 'ok', introduced: [], partial: { priorCommit, files: 0 } });
+  expect(JSON.parse(readFileSync(join(dir, 'gate-failures.json'), 'utf8'))).toEqual({ commit, failures: [] });
+  expect(JSON.parse(readFileSync(join(dir, 'gate-verdict.json'), 'utf8'))).toMatchObject({ commit, outcome: 'ok' });
+});
+
+test('GATE-REUSE-BY-DIFF: carry refuses a prior verdict from another SHA', async () => {
+  const { root, instanceRoot, runner } = fake([], []);
+  const { repo, priorCommit, commit } = carryCommits(root, 'README.md');
+  const dir = join(instanceRoot, 'release/1.0.1');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'gate-failures.json'), JSON.stringify({ commit: priorCommit, failures: [] }));
+  writeFileSync(join(dir, 'gate-verdict.json'), JSON.stringify({ commit: 'd'.repeat(40), outcome: 'ok' }));
+  writePartialPlan(instanceRoot, { kind: 'carry', version: '1.0.1', priorCommit, forCommit: commit,
+    files: [], priorFailures: [], priorErrors: [] });
+  runner.sweep = async () => { throw new Error('sweep started'); };
+  const result = await judgeGate({ ...options(instanceRoot), repo, commit }, runner);
+  expect(result).toMatchObject({ outcome: 'error', error: expect.stringContaining('no complete clean gate') });
+});
+
+test('GATE-REUSE-BY-DIFF: a forged carry plan cannot skip a changed test', async () => {
+  const { root, instanceRoot, runner } = fake([], []);
+  const { repo, priorCommit, commit } = carryCommits(root, 'src/changed.test.ts');
+  const dir = join(instanceRoot, 'release/1.0.1');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'gate-failures.json'), JSON.stringify({ commit: priorCommit, failures: [] }));
+  writeFileSync(join(dir, 'gate-verdict.json'), JSON.stringify({ commit: priorCommit, outcome: 'ok' }));
+  writePartialPlan(instanceRoot, { kind: 'carry', version: '1.0.1', priorCommit, forCommit: commit,
+    files: [], priorFailures: [], priorErrors: [] });
+  runner.sweep = async () => { throw new Error('sweep started'); };
+  const result = await judgeGate({ ...options(instanceRoot), repo, commit }, runner);
+  expect(result).toMatchObject({ outcome: 'error', error: expect.stringContaining('not docs-only') });
+  expect(JSON.parse(readFileSync(join(dir, 'gate-failures.json'), 'utf8')).commit).toBe(priorCommit);
 });
 
 test('GATE-PARTIAL: a plan for another commit is ignored — the gate sweeps every file', async () => {
@@ -2942,32 +3282,145 @@ test('GATE-INTRO-RECHECK: an assertion failure is introduced as before, with no 
   expect(calls.some((call) => call.includes('--timeout'))).toBe(false);
 });
 
-test('GATE-HOST-RECHECK-CAP: excess new-failure files are named unmeasured and gate exits through the human error path', async () => {
-  const ids = Array.from({ length: 33 }, (_, i) => `src/intro-${i}.test.ts > fails`).reverse();
-  const orderedFiles = ids.map((id) => id.split(' > ')[0]!).sort();
-  const omitted = orderedFiles[32]!;
-  const measured = orderedFiles.slice(0, 32);
+test('GATE-RECHECK-FANOUT: 106 new files cross 32-file windows with no unmeasured result and at most four Pods', async () => {
+  const ids = Array.from({ length: 106 }, (_, i) => `src/intro-${i}.test.ts > fails`).reverse();
   const { root, instanceRoot, runner, calls } = fake(ids, []);
-  const original = runner.command;
-  runner.command = async (cmd, args, cwd, limitMs) => {
-    if (cmd === 'bun' && args[0] === 'run' && args[1] === 'test:deterministic') {
-      calls.push(`${cmd} ${args.join(' ')} @${cwd}`);
-      const file = args[2]!.replace(/^\.\//, '');
-      return cwd.endsWith('/cut')
-        ? { rc: 1, output: runOutput([`${file} > fails`]) }
-        : { rc: 0, output: '1 pass\n0 fail\nRan 1 tests across 1 files.\n' };
-    }
-    return original(cmd, args, cwd, limitMs);
+  let active = 0;
+  let peak = 0;
+  let cutJobs = 0;
+  const checked: string[] = [];
+  runner.recheckPodBatch = async (files, commit) => {
+    cutJobs++;
+    active++;
+    peak = Math.max(peak, active);
+    for (const file of files) checked.push(`${commit}:${file}`);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    active--;
+    return new Map(files.map((file) => [file, { rc: 1, output: runOutput([`${file} > fails`]) }]));
   };
-  const result = await judgeGate(options(instanceRoot), runner);
-  expect(result).toMatchObject({ outcome: 'error', introduced: measured.map((file) => `${file} > fails`), knownEnv: 0,
-    stalledEnv: [], unmeasuredRecheckFiles: [omitted] });
-  expect(result.error).toContain('isolated recheck unmeasured: 1 files exceed limit 32');
-  expect(graphGateResult(result, true).verdict).toBe('fail');
+  runner.recheckPod = async (file, commit) => {
+    active++;
+    peak = Math.max(peak, active);
+    checked.push(`${commit}:${file}`);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    active--;
+    return commit === CUT ? { rc: 1, output: runOutput([`${file} > fails`]) }
+      : { rc: 0, output: '1 pass\n0 fail\nRan 1 tests across 1 files.\n' };
+  };
+  const result = await judgeGate({ ...options(instanceRoot), recheckFileLimit: 32, pod: { pool: 'test', isolationConcurrency: 4 } }, runner);
+  expect(result).toMatchObject({ outcome: 'regression', introduced: [...ids].sort(), knownEnv: 0, stalledEnv: [] });
+  expect(result.unmeasuredRecheckFiles).toBeUndefined();
+  expect(peak).toBe(4);
+  expect(cutJobs).toBe(14); // Four windows: 32, 32, 32, 10 files; eight files per Pod.
+  expect(checked.filter((item) => item.startsWith(`${CUT}:`))).toHaveLength(106);
+  expect(checked.filter((item) => item.startsWith(`${BASE}:`))).toHaveLength(106);
+  expect(calls.filter((call) => call.startsWith('bun run test:deterministic'))).toHaveLength(0);
   expect(JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8')))
-    .toMatchObject({ outcome: 'error', unmeasuredRecheckFiles: [omitted] });
-  expect(calls.filter((call) => call.startsWith('bun run test:deterministic') && call.includes('/cut'))
-    .map((call) => /\.\/src\/intro-\d+\.test\.ts/.exec(call)?.[0])).toEqual(measured.map((file) => `./${file}`));
+    .toMatchObject({ outcome: 'regression', introduced: [...ids].sort() });
+});
+
+test('GATE-RECHECK-POD: a final isolated check pins its commit and reads the real one-part Pod artifact', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-recheck-pod-'));
+  const requests: RunPodCommandOptions[] = [];
+  try {
+    const runner = createGateRunner(root, undefined, async () => ({ rc: 0, output: '' }), async (request) => {
+      requests.push(request);
+      const artifactsDir = join(root, `artifact-${requests.length}`);
+      mkdirSync(artifactsDir);
+      writeFileSync(join(artifactsDir, 'install.rc'), '0\n');
+      writeFileSync(join(artifactsDir, 'part-0.log'), runOutput([A]));
+      writeFileSync(join(artifactsDir, 'part-0.rc'), '1\n');
+      if (request.command[2]!.includes("'./src/b.test.ts'")) {
+        writeFileSync(join(artifactsDir, 'part-1.log'), '1 pass\n0 fail\nRan 1 tests across 1 files.\n');
+        writeFileSync(join(artifactsDir, 'part-1.rc'), '0\n');
+      }
+      if (request.command[2]!.includes("'./src/c.test.ts'")) {
+        writeFileSync(join(artifactsDir, 'part-2.log'), '1 pass\n0 fail\nRan 1 tests across 1 files.\n');
+        writeFileSync(join(artifactsDir, 'part-2.rc'), '0\n');
+      }
+      if (request.command[2]!.includes("'./src/d.test.ts'")) {
+        writeFileSync(join(artifactsDir, 'part-0.log'), 'timed out\n');
+        writeFileSync(join(artifactsDir, 'part-0.rc'), '124\n');
+        writeFileSync(join(artifactsDir, 'part-0.timeout'), '0\n');
+      }
+      return { exitCode: 0, artifactsDir, job: 'fake-recheck' };
+    }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+    const result = await runner.recheckPod!('src/a.test.ts', CUT, { pool: 'pool-test', installSlots: 0 }, GATE_ISOLATED_TIMEOUT_MS, true);
+    expect(result.rc).toBe(1);
+    expect(result.timedOut).toBeUndefined();
+    expect(result.output).toContain('(fail)');
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ pool: 'pool-test', clone: true, source: { kind: 'commit', sha: CUT }, memoryLimit: expect.any(String), deadlineSeconds: 480 });
+    expect(requests[0]!.command[2]).toContain("'--timeout' '60000'");
+    expect(requests[0]!.command[2]).toContain('ELANOUS_TEST_FAKE_LLM');
+    expect(requests[0]!.command[2]).toContain('left=300');
+    expect(requests[0]!.command[2]).toContain('part-$i.timeout');
+    const batch = await runner.recheckPodBatch!(['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'], BASE, { pool: 'pool-test', installSlots: 0 }, GATE_ISOLATED_TIMEOUT_MS);
+    expect(batch.get('src/a.test.ts')?.rc).toBe(1);
+    expect(batch.get('src/b.test.ts')?.rc).toBe(0);
+    expect(batch.get('src/c.test.ts')?.rc).toBe(0);
+    expect(requests[1]).toMatchObject({ source: { kind: 'commit', sha: BASE }, deadlineSeconds: 780 });
+    expect(requests[1]!.command[2]).toContain('gate-isolate.');
+    const shell = requests[1]!.command[2]!;
+    expect(shell.indexOf("run_part 0 'bun'")).toBeLessThan(shell.indexOf("run_part 1 'bun'"));
+    expect(shell.indexOf('for pid in "${pids[@]}"', shell.indexOf("run_part 1 'bun'"))).toBeLessThan(shell.indexOf("run_part 2 'bun'"));
+    const timeout = await runner.recheckPod!('src/d.test.ts', CUT, { pool: 'pool-test', installSlots: 0 }, GATE_ISOLATED_TIMEOUT_MS);
+    expect(timeout).toMatchObject({ rc: 124, timedOut: true });
+    const rootFile = await runner.recheckPod!('root.test.ts', CUT, { pool: 'pool-test', installSlots: 0 }, GATE_ISOLATED_TIMEOUT_MS);
+    expect(rootFile.rc).toBe(1);
+    expect(requests.at(-1)!.command[2]).toContain("'./root.test.ts'");
+    await expect(runner.recheckPod!('../escape.test.ts', CUT, { pool: 'pool-test' }, GATE_ISOLATED_TIMEOUT_MS)).rejects.toThrow('unsafe pod recheck files');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('GATE-RECHECK-FANOUT: a failing batch or baseline waits for already-started siblings before the error verdict', async () => {
+  for (const failAt of ['batch', 'baseline'] as const) {
+    const ids = Array.from({ length: failAt === 'batch' ? 16 : 2 }, (_, i) => `src/intro-${i}.test.ts > fails`);
+    const { instanceRoot, runner } = fake(ids, []);
+    let started = 0;
+    let finished = 0;
+    runner.recheckPodBatch = async (files) => {
+      started++;
+      if (failAt === 'batch' && started === 1) throw new Error('batch failed');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      finished++;
+      return new Map(files.map((file) => [file, { rc: 1, output: runOutput([`${file} > fails`]) }]));
+    };
+    runner.recheckPod = async (_file) => {
+      started++;
+      if (failAt === 'baseline' && started === 2) throw new Error('baseline failed');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      finished++;
+      return { rc: 0, output: runOutput([]) };
+    };
+    const result = await judgeGate({ ...options(instanceRoot), pod: { pool: 'test', isolationConcurrency: 2 } }, runner);
+    expect(result).toMatchObject({ outcome: 'error', error: expect.stringContaining(`${failAt} failed`) });
+    expect(started).toBe(failAt === 'batch' ? 2 : 3);
+    expect(finished).toBe(failAt === 'batch' ? 1 : 2);
+  }
+});
+
+test('GATE-RECHECK-POD: a timed-out file stays unmeasured and cannot yield an ok verdict', async () => {
+  const { instanceRoot, runner } = fake([B], []);
+  runner.recheckPod = async () => { throw new Error('single-file fallback should not run'); };
+  runner.recheckPodBatch = async (files) => new Map(files.map((file) => [file, { rc: 124, output: '', timedOut: true }]));
+  const result = await judgeGate({ ...options(instanceRoot), pod: { pool: 'test' } }, runner);
+  expect(result).toMatchObject({ outcome: 'error', unmeasuredRecheckFiles: ['src/b.test.ts'],
+    stalledEnv: [{ file: 'src/b.test.ts', reason: 'isolated-timeout', local: 'timeout' }] });
+});
+
+test('GATE-RECHECK-HOST: a timed-out host recheck stays unmeasured and cannot yield an ok verdict', async () => {
+  const { instanceRoot, runner } = fake([B], []);
+  const command = runner.command;
+  runner.command = async (cmd, args, cwd, limitMs) =>
+    cmd === 'bun' && args[0] === 'run' && cwd.endsWith('/cut')
+      ? { rc: 124, output: '', timedOut: true }
+      : command(cmd, args, cwd, limitMs);
+  const result = await judgeGate(options(instanceRoot), runner);
+  expect(result).toMatchObject({ outcome: 'error', unmeasuredRecheckFiles: ['src/b.test.ts'],
+    error: expect.stringContaining('isolated recheck timed out: src/b.test.ts'),
+    stalledEnv: [{ file: 'src/b.test.ts', reason: 'isolated-timeout', local: 'timeout' }] });
+  expect(result.introduced).toEqual([]);
 });
 
 // GATE-SHARD-RESUME (0.2.19) — 0.2.18 gate 2 stopped after 33 minutes on a tool error and gate 3 re-ran every finished shard.

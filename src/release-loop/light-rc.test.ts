@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Command } from 'commander';
-import { runSelfGateCli, type SelfGateCliOptions, type SelfGateCliResult } from '../self-implement/gate-cli.js';
+import { runSelfGateCli, selectGateTestFiles, type SelfGateCliOptions, type SelfGateCliResult } from '../self-implement/gate-cli.js';
 import { GATE_CALLER_TEST_LIMIT } from '../self-implement/gate-scope.js';
 import { GATE_REMOTE_DEFAULTS, type DispatchDeps, type DispatchOptions, type GateRemoteRunner } from '../self-implement/gate-remote.js';
 import { registerReleaseCommands } from '../cli/release-cli.js';
@@ -42,10 +42,15 @@ describe('self gate alwaysInclude (LIGHT-RC ⑴)', () => {
   test('① zero changed files ⊕ an existing always-include path runs it; a missing one is reported, not dropped', () => {
     const cwd = tempRepo({ 'a.test.ts': 'test("x", () => {});\n' });
     const { ran, deps } = quietGateDeps(() => ({ status: 0, stdout: '1 pass\n', stderr: '' }));
-    const result = runSelfGateCli(cwd, { base: 'base-sha', alwaysInclude: ['a.test.ts', 'b.test.ts', './a.test.ts'] }, deps);
+    const options = { base: 'base-sha', alwaysInclude: ['a.test.ts', 'b.test.ts', './a.test.ts'] };
+    const preflight = selectGateTestFiles(cwd, options, deps);
+    const result = runSelfGateCli(cwd, options, deps);
     expect(ran).toEqual([['a.test.ts']]);
     expect(result.testFiles).toEqual(['a.test.ts']);
     expect(result.alwaysIncludeMissing).toEqual(['b.test.ts']);
+    expect(preflight.testFiles).toEqual(result.testFiles);
+    expect(preflight.alwaysIncludeMissing).toEqual([...result.alwaysIncludeMissing]);
+    expect(preflight.skipTestStep).toBe(false);
     expect(result.baseline).toEqual({ introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 });
     expect(result.lines.some((line) => line.startsWith('always include: 1/2 (added 1 · missing: b.test.ts)'))).toBe(true);
     expect(result.exitCode).toBe(0);
@@ -148,6 +153,20 @@ describe('runLightRc (LIGHT-RC ⑶)', () => {
     expect(result.rehearsalTui?.outcome).toBe('ok');
   });
 
+  test('--fixed-shard-distribution is forwarded to self gate and the remote child only when opted in', async () => {
+    const plain = localDeps();
+    await runLightRc('0.2.19', { base: 'abc123', head: MAIN_SHA, shards: 16, log: () => {} }, plain.deps);
+    expect(plain.calls[0]).not.toHaveProperty('fixedShardDistribution');
+    expect(plain.calls[0]).toMatchObject({ base: 'abc123', shards: 16 });
+    const plainArgv = (plain.dispatched[0]!.remoteArgv as (sha: (ref: string) => string) => string[])((sha) => sha);
+    expect(plainArgv).not.toContain('--fixed-shard-distribution');
+    const fixed = localDeps();
+    await runLightRc('0.2.19', { base: 'abc123', head: MAIN_SHA, shards: 16, fixedShardDistribution: true, log: () => {} }, fixed.deps);
+    expect(fixed.calls[0]).toMatchObject({ base: 'abc123', shards: 16, fixedShardDistribution: true });
+    const fixedArgv = (fixed.dispatched[0]!.remoteArgv as (sha: (ref: string) => string) => string[])((sha) => sha);
+    expect(fixedArgv.slice(fixedArgv.indexOf('--shards'), fixedArgv.indexOf('--shards') + 3)).toEqual(['--shards', '16', '--fixed-shard-distribution']);
+  });
+
   test('remote rehearsal carries opt-in to child and refuses a missing screen result', async () => {
     let remoteArgv: string[] = [];
     const { deps } = localDeps({ dispatch: async (opts, channels) => {
@@ -177,7 +196,7 @@ describe('runLightRc (LIGHT-RC ⑶)', () => {
     const result = await runLightRc('0.2.19', { base: 'abc123', head: MAIN_SHA, rehearsalTui: true, log: () => {} }, deps);
     expect(result).toMatchObject({ ok: false, unmeasured: 'shard-2', rehearsalTui: { outcome: 'ok' } });
   });
-  test('③ no --base: merge-base of the previous cut is the base · shards 4 · the six always-include paths · one gate call', async () => {
+  test('③ no --base: merge-base of the previous cut is the base · shards 4 · the seven always-include paths · one gate call', async () => {
     const gitCalls: string[][] = [];
     const { calls, dispatched, deps } = localDeps({ git: (args) => { gitCalls.push(args); return fakeGit(args); } });
     const result = await runLightRc('0.2.19', { log: () => {} }, deps);
@@ -188,10 +207,11 @@ describe('runLightRc (LIGHT-RC ⑶)', () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]!.base).toBe('abc123');
     expect(calls[0]!.shards).toBe(4);
-    expect(calls[0]!.alwaysInclude).toHaveLength(6);
+    expect(calls[0]!.alwaysInclude).toHaveLength(7);
     expect(calls[0]!.alwaysInclude).toContain('scripts/discord-seat-probe.test.ts');
+    expect(calls[0]!.alwaysInclude).toContain('scripts/ratchets/test-interference-patterns.test.ts');
     expect(dispatched[0]!.flags).toEqual({ remote: true, local: false });
-    expect(result).toMatchObject({ version: '0.2.19', base: 'abc123', introduced: 0, preexisting: 0, alwaysInclude: 6, alwaysIncludeMissing: [], ok: true, remote: null });
+    expect(result).toMatchObject({ version: '0.2.19', base: 'abc123', introduced: 0, preexisting: 0, alwaysInclude: 7, alwaysIncludeMissing: [], ok: true, remote: null });
   });
 
   test('③ every listed always-include path exists in this tree', () => {

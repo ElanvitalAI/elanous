@@ -1,0 +1,40 @@
+#!/bin/sh
+# Opt-in only: the launcher must prepend this directory to its isolated child's PATH.
+case ${ELANOUS_GH_REAL_BIN-} in
+  /*) ;;
+  *) printf '%s\n' 'gh-surface: real gh absolute path required' >&2; exit 70 ;;
+esac
+if [ ! -f "$ELANOUS_GH_REAL_BIN" ] || [ ! -x "$ELANOUS_GH_REAL_BIN" ] || [ "$ELANOUS_GH_REAL_BIN" -ef "$0" ]; then
+  printf '%s\n' 'gh-surface: real gh unavailable' >&2
+  exit 70
+fi
+case $0 in
+  */*) capture=${0%/*}/capture.ts ;;
+  *) printf '%s\n' 'gh-surface: wrapper path unavailable' >&2; exit 70 ;;
+esac
+capture_pid=
+forward_signal() {
+  signal=$1
+  trap - INT TERM
+  if [ -n "$capture_pid" ]; then
+    # Noninteractive shells may start an async child with SIGINT ignored.
+    # TERM reliably stops capture; the wrapper still exits with the original signal.
+    child_signal=$signal
+    if [ "$signal" = INT ]; then child_signal=TERM; fi
+    kill -s "$child_signal" "$capture_pid" 2>/dev/null || :
+    wait "$capture_pid" 2>/dev/null || :
+  fi
+  kill -s "$signal" "$$"
+}
+trap 'forward_signal INT' INT
+trap 'forward_signal TERM' TERM
+bun "$capture" "$@" &
+capture_pid=$!
+wait "$capture_pid"
+capture_status=$?
+trap - INT TERM
+if [ "$capture_status" -ne 0 ]; then
+  printf '%s\n' 'gh-surface: capture failed' >&2
+  exit 70
+fi
+exec "$ELANOUS_GH_REAL_BIN" "$@"

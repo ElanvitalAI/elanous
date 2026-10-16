@@ -13,6 +13,9 @@
 // generator terminates instead of hanging.
 
 import {
+  inferProviderFromModel,
+  isModelCompatible,
+  resolveDefaultProvider,
   streamLLMWithTools,
   type LLMMessage,
   type LLMToolSpec,
@@ -20,6 +23,7 @@ import {
 import { debug } from '../debug/log.js';
 import { buildUniversalPreamble } from '../prompt-library/universal-preamble.js';
 import { getModelFamily } from '../models/prompts.js';
+import { resolveModelAlias } from '../intelligence-map/model-alias.js';
 import type {
   AgentDefinition, AgentEvent, AgentSpawnOpts, AgentTask,
 } from './types.js';
@@ -57,6 +61,151 @@ class AsyncEventQueue<T> {
   }
 }
 
+// ── Model resolution (TUI-AGENT-MODEL-FALLBACK · 결함 #34) ──
+//
+// A definition's frontmatter `model:` is a REQUEST, not a guarantee. The
+// runner must check it against the provider the child will actually run
+// on BEFORE handing it to streamLLMWithTools — a codex parent used to
+// request `haiku` verbatim and die (the provider chain re-routed the
+// Claude-family id to Anthropic, 결함 #34, 2026-10-14).
+//
+// `model: undefined` in the result means "inherit the parent": the child
+// then rides streamLLMWithTools's own provider decision
+// (`opts.provider ?? resolveDefaultProvider(opts.model)`), exactly like a
+// spawn with no model hint at all.
+
+/** Why resolveAgentModel returned the model it did. Six distinct exits —
+ *  never collapse them into one value: "fell back to parent" and "sent an
+ *  unrecognized id verbatim" must stay separable in the logs. */
+export type AgentModelResolutionReason =
+  | 'no-definition-model'
+  | 'declared-inherit'
+  | 'definition'
+  | 'incompatible-provider'
+  | 'unknown-model'
+  | 'provider-unknown';
+
+export interface AgentModelResolution {
+  /** Canonical model id; undefined = inherit the parent's model. */
+  model: string | undefined;
+  reason: AgentModelResolutionReason;
+}
+
+/** Injection seams so tests can pin the provider / inference without
+ *  touching user config. Defaults are the production functions. */
+export interface ResolveAgentModelDeps {
+  currentProviderName: () => string;
+  isCompatible: (providerName: string, model: string) => boolean;
+  inferProvider: (model: string) => string | null;
+}
+
+/** Production `currentProviderName` — the provider a model-less spawn
+ *  would run on right now (the parent-configured default). A lookup
+ *  failure is NOT hidden behind a made-up name: it throws, and
+ *  resolveAgentModel turns it into the separate `provider-unknown` exit
+ *  (judging compatibility against a fake name like 'auto' would drop a
+ *  usable definition model to inherit). */
+function productionCurrentProviderName(): string {
+  return resolveDefaultProvider().name;
+}
+
+const defaultResolveAgentModelDeps: ResolveAgentModelDeps = {
+  currentProviderName: productionCurrentProviderName,
+  isCompatible: isModelCompatible,
+  inferProvider: inferProviderFromModel,
+};
+
+/** Resolve a definition model against the provider the child would run
+ *  on RIGHT NOW. Decision order — each step guards the next:
+ *    1. no model → { undefined, 'no-definition-model' }
+ *    2. `inherit` (trimmed, case-insensitive; an inheritance MARKER, not
+ *       a model name) → { undefined, 'declared-inherit' }
+ *    3. resolveModelAlias → canonical id
+ *    4. inferProvider(canonical) === null → { canonical, 'unknown-model' }
+ *       — do NOT fall back: free-form names ride the provider as-is
+ *       (isModelCompatible's "unknown prefix is the provider's problem"
+ *       stance; dropping a local free-form name to inherit is a regression)
+ *    5. isCompatible(currentProviderName, canonical)
+ *       true  → { canonical, 'definition' }
+ *       false → { undefined, 'incompatible-provider' } (parent fallback)
+ *       currentProviderName throws → { undefined, 'provider-unknown' } —
+ *       compatibility cannot be judged, so the definition model is NOT
+ *       sent (sending it could re-route the provider by model name); the
+ *       child inherits the parent model — the goal's «can't call it →
+ *       parent model» intent, kept as its own reason so a lookup failure
+ *       is never confused with a real incompatibility
+ *
+ *  Inference (4) runs BEFORE compatibility (5) because isModelCompatible
+ *  returns true on null inference — checking compatibility first would
+ *  mislabel every unknown model as compatible and the unknown-model exit
+ *  would be unreachable. */
+export function resolveAgentModel(
+  defModel: string | undefined,
+  deps: Partial<ResolveAgentModelDeps> = {},
+): AgentModelResolution {
+  const d: ResolveAgentModelDeps = { ...defaultResolveAgentModelDeps, ...deps };
+  if (defModel === undefined || defModel.trim() === '') {
+    return { model: undefined, reason: 'no-definition-model' };
+  }
+  const trimmed = defModel.trim();
+  if (trimmed.toLowerCase() === 'inherit') {
+    return { model: undefined, reason: 'declared-inherit' };
+  }
+  const canonical = resolveModelAlias(trimmed) ?? trimmed;
+  if (d.inferProvider(canonical) === null) {
+    return { model: canonical, reason: 'unknown-model' };
+  }
+  let providerName: string;
+  try {
+    providerName = d.currentProviderName();
+  } catch {
+    return { model: undefined, reason: 'provider-unknown' };
+  }
+  if (d.isCompatible(providerName, canonical)) {
+    return { model: canonical, reason: 'definition' };
+  }
+  return { model: undefined, reason: 'incompatible-provider' };
+}
+
+/** Resolve + record exactly one `agent.model` observation. Every runtime
+ *  resolution goes through here (runAgent ⊕ a direct buildAgentMessages call
+ *  without a pre-resolved `model`) so «one observation per resolution» holds
+ *  on both paths. incompatible-provider (parent fallback), unknown-model
+ *  (verbatim pass-through of an unrecognizable id) and provider-unknown
+ *  (provider lookup failed, inherited the parent unjudged) are the exits an
+ *  operator must tell apart from a log line alone — they get warn level. */
+function resolveAgentModelObserved(
+  def: Pick<AgentDefinition, 'name' | 'model'>,
+  pinnedProviderName?: string,
+): AgentModelResolution {
+  let providerError: string | undefined;
+  let currentProviderName: string | undefined = pinnedProviderName;
+  const resolution = resolveAgentModel(def.model, {
+    currentProviderName: () => {
+      if (currentProviderName !== undefined) return currentProviderName;
+      try {
+        currentProviderName = productionCurrentProviderName();
+        return currentProviderName;
+      } catch (error) {
+        providerError = error instanceof Error ? error.message : String(error);
+        throw error;
+      }
+    },
+  });
+  debug.log('agent.model', 'resolved', {
+    agent: def.name,
+    declared: def.model,
+    model: resolution.model,
+    reason: resolution.reason,
+    provider: currentProviderName ?? null,
+    ...(providerError !== undefined ? { providerError } : {}),
+  }, resolution.reason === 'incompatible-provider' || resolution.reason === 'unknown-model'
+    || resolution.reason === 'provider-unknown'
+    ? { level: 'warn' as const }
+    : undefined);
+  return resolution;
+}
+
 // ── Helpers ──
 
 /** Assemble the initial message history. The parent's rendered system
@@ -74,7 +223,7 @@ export function buildAgentMessages(
   def: AgentDefinition,
   prompt: string,
   systemPromptPrefix?: string,
-  ctx: { cwd?: string; enabledTools?: readonly string[] } = {},
+  ctx: { cwd?: string; enabledTools?: readonly string[]; model?: string } = {},
 ): LLMMessage[] {
   let effectivePrefix: string | undefined = systemPromptPrefix;
   if (def.omitInheritedContext) {
@@ -108,7 +257,15 @@ export function buildAgentMessages(
   // omitInheritedContext contract stable we honor it strictly.
   let universalPreamble: LLMMessage[] = [];
   if (!def.omitInheritedContext && ctx.cwd) {
-    const agentModelFamily = def.model ? getModelFamily(def.model) : undefined;
+    // TUI-AGENT-MODEL-FALLBACK: the preamble's modelFamily must track the
+    // model the run will actually use. runAgent passes the already-resolved
+    // model (one resolution + one `agent.model` observation per spawn);
+    // direct callers that omit `model` resolve here so a definition model
+    // the current provider can't run never reaches the preamble either.
+    const effectiveModel = 'model' in ctx
+      ? ctx.model
+      : resolveAgentModelObserved(def).model;
+    const agentModelFamily = effectiveModel ? getModelFamily(effectiveModel) : undefined;
     universalPreamble = buildUniversalPreamble({
       cwd: ctx.cwd,
       ...(agentModelFamily !== undefined ? { modelFamily: agentModelFamily } : {}),
@@ -206,6 +363,14 @@ export async function* runAgent(
   // `Agent` → search-vs-spawn split, `TaskCreate` → don't batch).
   const tools = filterAgentTools(opts.tools, task.definition.tools);
 
+  // TUI-AGENT-MODEL-FALLBACK (결함 #34): resolve the definition model
+  // against the provider the child will ACTUALLY run on — the pinned
+  // `opts.provider` when the dispatcher chose one, otherwise the
+  // parent-configured default (what streamLLMWithTools picks for a
+  // model-less spawn). `model: undefined` = inherit: the child then takes
+  // the same provider/model decision path as the parent.
+  const modelResolution = resolveAgentModelObserved(task.definition, opts.provider?.name);
+
   // Build history on the task so callers can inspect it after the run.
   // PFC-S1 P5: pass task.cwd so the slim-context notice (when
   // omitInheritedContext) can name the child's working directory.
@@ -214,6 +379,7 @@ export async function* runAgent(
     task.prompt,
     opts.systemPromptPrefix,
     {
+      model: modelResolution.model,
       ...(task.cwd ? { cwd: task.cwd } : {}),
       ...(tools ? { enabledTools: tools.map(t => t.name) } : {}),
     },
@@ -252,7 +418,7 @@ export async function* runAgent(
       dispatchTool,
     },
     {
-      model: task.definition.model,
+      model: modelResolution.model,
       tools,
       signal: task.controller.signal,
       provider: opts.provider,

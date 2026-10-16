@@ -4,10 +4,17 @@
 // removed createPwaHostTabView with the TUI detail surface; retain spec, restart,
 // and runNexus contracts because Bun executes this file directly.
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeAll, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import {
+  bootNexus,
+  drainNexusBoots,
+  warmNexusModule,
+  NEXUS_DRAIN_TIMEOUT_MS,
+  NEXUS_WARM_TIMEOUT_MS,
+} from './helpers/nexus-boot-guard.js';
 import {
   createPwaHostTabSpec,
   PWA_HOST_DEFAULT_TAB_ID,
@@ -28,11 +35,17 @@ beforeEach(() => {
   prevEnv = process.env.ELANOUS_NEXUS_DIR;
   process.env.ELANOUS_NEXUS_DIR = tmpRoot;
 });
-afterEach(() => {
+// 0.2.30 게이트 간섭(OP #9292) — 무거운 nexus import 는 시험 5s 예산 밖에서 데운다.
+beforeAll(warmNexusModule, NEXUS_WARM_TIMEOUT_MS);
+
+afterEach(async () => {
+  // env 를 되돌리기 «전»에 남은 runNexus 를 끝까지 기다린다 — 시간초과된 시험의 부팅이
+  // 다음 시험 폴더의 잠금을 잡지 못하게(TelegramLockError 간섭).
+  await drainNexusBoots();
   if (prevEnv === undefined) delete process.env.ELANOUS_NEXUS_DIR;
   else process.env.ELANOUS_NEXUS_DIR = prevEnv;
   try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* ignore */ }
-});
+}, NEXUS_DRAIN_TIMEOUT_MS);
 
 describe('createPwaHostTabSpec · default policy', () => {
   test('default id, command, healthz', () => {
@@ -171,15 +184,13 @@ describe('halt-pattern integration via supervisor + restart', () => {
 
 describe('runNexus integration · pwa-host opt-in', () => {
   test('default (no opt-in) → pwa-host not registered', async () => {
-    const { runNexus } = await import('../src/nexus/index.js');
-    const handle = await runNexus({ detachForTesting: true });
+    const handle = await bootNexus({ detachForTesting: true });
     expect(handle!.registry.has(PWA_HOST_DEFAULT_TAB_ID)).toBe(false);
     handle!.release();
   });
 
   test('enablePwaHostTab=true → registers but does not auto-spawn under detachForTesting', async () => {
-    const { runNexus } = await import('../src/nexus/index.js');
-    const handle = await runNexus({
+    const handle = await bootNexus({
       detachForTesting: true,
       enablePwaHostTab: true,
       autoStartPwaHostTab: false,

@@ -221,30 +221,40 @@ describe('readClaudePackageLedger', () => {
     });
   });
 
-  test('reads this machine live ledger without a pluginsRoot override', () => {
-    const result = readClaudePackageLedger();
-    expect(result.status).toBe('ok');
-    expect(result.packages.length).toBeGreaterThan(0);
+  test('reads packages from the injected plugin ledger fixture', () => {
+    withTempRoot((root) => {
+      writeLedger(
+        root,
+        {
+          version: 2,
+          plugins: {
+            'antv-infographic-skills@antv-infographic': [{
+              scope: 'user',
+              installPath: '/tmp/antv-infographic-skills',
+              version: '1.2.3',
+            }],
+          },
+        },
+        {
+          'antv-infographic': { source: { source: 'github', repo: 'antv/infographic' } },
+        },
+      );
 
-    const names = result.packages.map((pkg) => pkg.name);
-    expect(names).toContain('antv-infographic-skills@antv-infographic');
+      const result = readClaudePackageLedger({ pluginsRoot: root });
+      expect(result.status).toBe('ok');
+      expect(result.packages).toEqual([{
+        name: 'antv-infographic-skills@antv-infographic',
+        plugin: 'antv-infographic-skills',
+        marketplace: 'antv-infographic',
+        installPath: '/tmp/antv-infographic-skills',
+        scope: 'user',
+        source: 'github:antv/infographic',
+        revision: '1.2.3',
+      }]);
 
-    for (const pkg of result.packages) {
-      expect(pkg.name.length).toBeGreaterThan(0);
-      expect(pkg.installPath).not.toBe(CLAUDE_PACKAGE_MISSING);
-      expect(pkg.scope.length).toBeGreaterThan(0);
-      expect(typeof pkg.source).toBe('string');
-      expect(typeof pkg.revision).toBe('string');
-    }
-
-    const antv = result.packages.find(
-      (pkg) => pkg.name === 'antv-infographic-skills@antv-infographic',
-    );
-    expect(antv).toBeDefined();
-    expect(antv!.installPath.length).toBeGreaterThan(0);
-    expect(antv!.scope).toBe('user');
-    expect(antv!.source).not.toBe(CLAUDE_PACKAGE_MISSING);
-    expect(antv!.revision).not.toBe(CLAUDE_PACKAGE_MISSING);
-    expect(antv!.marketplace).toBe('antv-infographic');
+      const emptyFixture = readClaudePackageLedger({ pluginsRoot: join(root, 'empty') });
+      expect(emptyFixture.status).toBe('installed-plugins-unreadable');
+      expect(emptyFixture.packages).toEqual([]);
+    });
   });
 });

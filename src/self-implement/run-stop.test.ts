@@ -12,7 +12,7 @@ describe('recordRunStop', () => {
     expect(entries).toHaveLength(2);
     expect(entries[0]).toBe(prior);
     expect(entries[1]).toMatchObject({ runId: 'run-test', event: 'stop', data: { class: 'main-sync', cause: 'merge held: main-sync-conflict-unresolved', evidenceRef: 'run-ledger:run-test:merge-decision', nextMove: 'Review merge decision' } });
-    expect(RUN_STOP_CLASSES).toEqual(['env-unrelated', 'main-sync', 'pod-died', 'review-repeat', 'review-out-of-scope', 'evidence-uncovered', 'fabric', 'launch-failed', 'unclassified']);
+    expect(RUN_STOP_CLASSES).toEqual(['env-unrelated', 'main-sync', 'pod-died', 'review-repeat', 'review-out-of-scope', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed', 'unclassified']);
   });
 
   test('unknown class is unclassified; cause is one line at most 120 characters without truncation marker', () => {
@@ -48,6 +48,8 @@ describe('recordRunStop', () => {
     expect(classifyMergeHoldStop('something-new')).toBe('unclassified');
     expect(classifyMergeHoldStop(undefined)).toBe('unclassified');
     expect(classifyPodExitStop('pod-failure')).toBe('pod-died');
+    // 호스트 재게이트 실패 종료 — stage 둘째 인자가 있으면 gate-failed, 없으면 지금과 똑같이 pod-died.
+    expect(classifyPodExitStop('pod-failure', 'host-regate-failed')).toBe('gate-failed');
     expect(classifyPodExitStop('OOMKilled')).toBe('pod-died');
     expect(classifyPodExitStop('no-launch')).toBe('launch-failed');
     expect(classifyPodExitStop('unknown')).toBe('unclassified');

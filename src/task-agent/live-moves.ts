@@ -6,7 +6,7 @@
  *   TA-REVIEW-RESULT-CAPTURE — 자식 stdout(`--json`)은 결과 파일로 받고, 자식 완료 뒤 해당 카드만 회수·재판정한다.
  *   회수한 pass 는 그 틱의 판단부·land 관문 입력(`selfReview`)이 될 뿐 land 판정 로직은 그대로다.
  * - `propose-green`: 카드에 green «제안»(`greenProposal`)만 적는다 — 체크리스트는 손대지 않는다.
- * - `propose-land`: 카드·현재 머리의 self review 통과(pass «또는» warn ⊕ must-fix 0 · TA-LAND-WARN-MUSTFIX0)·non-draft 를 확인하고 기존 `pr land` 를 머리 고정으로 한 번 부른다.
+ * - `propose-land`: 카드·현재 머리의 self review 통과(pass «또는» warn ⊕ must-fix 0 · TA-LAND-WARN-MUSTFIX0)·non-draft 를 확인한다. 큐 설정이 있으면 원격 changed gate 뒤 착지 줄에 등록하고, 없으면 기존 `pr land` 를 머리 고정으로 한 번 부른다.
  * - 사다리 R4: `narrow-relaunch` · `wait-retry` · `salvage-relaunch` · `alternative` 도 허용 목록 어휘다 — 실제 발사는 실행부
  *   `executeNextAction`(`actions.ts`)이 «목록 ⊕ 같은 수 2회 상한 ⊕ 회당 1건 ⊕ 부하 관문»을 모두 넘을 때만 한다.
  * - `decision-card`: 막힌 과제를 «근거(서명 · 화면 · must-fix)» 붙은 결정 카드로 올린다 — 근거가 하나도 없으면 카드를 올리지 않는다.
@@ -28,6 +28,7 @@ import { decisionCardGrounds, decisionRaiseArgs, type DecisionCardEvidence, type
 import { pendingReviewResults, reviewResultPath, TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_RESULT_ENV, TA_REVIEW_COMPLETION_STATE_ENV } from './review-result-capture.js';
 import { buildPriorFixContext, PRIOR_FIX_SCOPE_LINE, priorFixBlock, priorFixObservation, type PriorDiffReader, type PriorFixContext } from './review-prior-fix.js';
 import { createLandWorktree, localBranch, localHead, observeLandWorktree, type LandWorktree, type LandWorktreeFailure, type LandWorktreeInput, type LandWorktreeRemoval } from './land-worktree.js';
+import { runQueuedLanding, type QueueLandingInput } from './land-queue.js';
 
 export const TASK_AGENT_LIVE_MOVES = ['review', 'propose-green', 'propose-land', 'decision-card', ...LIVE_RETRY_MOVES] as const;
 export type TaskAgentLiveMove = typeof TASK_AGENT_LIVE_MOVES[number];
@@ -90,6 +91,9 @@ export interface LiveMoveDeps {
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
   /** TA-LAND-WORKTREE — cwd HEAD 읽기 · PR 머리 임시 워크트리 만들기(시험 주입 · 기본 = git). */
   landWorktree?: { localHead?: (cwd: string) => string | null; localBranch?: (cwd: string) => string | null; create?: (input: LandWorktreeInput) => Promise<LandWorktree | LandWorktreeFailure> };
+  /** TA-LAND-AFTER-REVIEW — injected queue adapter; absent uses configured command after a remote changed gate. */
+  queueLanding?: (input: QueueLandingInput) => Promise<{ status: number; stdout: string; stderr?: string }>;
+  landQueueConfig?: { command: string; remote: string } | null;
 }
 
 /** `executed` = 부작용을 실제로 냈다(리뷰를 띄웠다 · 제안을 적었다). ok 이지만 이미 한 수(같은 머리·이미 제안)면 false. */
@@ -101,6 +105,8 @@ export interface LiveMoveResult {
   resultPath?: string;
   /** TA-LAND-RETRY-ON-INFRA — 실행한 land 의 그 머리 몇 번째 시도인가 · 실패면 갈래(infra|judgement|base-stale)·사유·재시도 가능 여부. */
   landAttempt?: { attempt: number; class?: LandFailureClass; reason?: string; retryAllowed?: boolean };
+  /** A queue accepted this head. Merge confirmation belongs to the later train receipt. */
+  queued?: boolean;
 }
 
 export interface PrHeadView { head: string; state: string; branch?: string; url?: string }
@@ -543,10 +549,11 @@ export const LAND_RETRY_ON_INFRA_EVENT = 'land-retry-on-infra';
 
 const landedCycles = new Set<string>();
 
-/** `propose-land` — only a passing self review (pass or warn, with must-fix 0) of this exact OPEN, non-draft head may invoke pr land. */
+/** `propose-land` — only a passing self review (pass or warn, with must-fix 0) of this exact OPEN, non-draft head may enqueue or invoke pr land. */
 export async function executeLiveLand(
   card: TaskCard | undefined, pr: number | undefined,
   ctx: { runId?: string | null; cycleId?: string; cwd?: string; produced?: { headCommit?: string; branch?: string; prUrl?: string }; review?: { verdict: 'pass' | 'warn' | 'fail'; head: string; /** TA-LAND-WARN-MUSTFIX0 — `false` 면 리뷰가 실제로 안 돌았다 → land 거부. 슈퍼바이저 입력은 reviewed 리뷰로만 만들어져 칸이 없다. */ reviewed?: boolean };
+    /** Exact bytes consumed by the queue's own review check; no path means queue mode cannot proceed. */ reviewResultPath?: string;
     /** TA-REJUDGE-ON-HEAD — 겹침 증거 파일(있으면 land 에 넘길 뿐 · 판정은 그대로). */ overlapEvidence?: string;
     /** REJUDGE base-stale — 증거의 재게이트를 요청한 시각 · 그 앞의 base-stale 시도는 소비됨(`openLandAttempts`). */ gateAt?: string },
   deps: LiveMoveDeps = {},
@@ -584,6 +591,10 @@ export async function executeLiveLand(
   const mustFixCount = (ctx.review as { mustFixCount?: unknown }).mustFixCount;
   if (typeof mustFixCount !== 'number' || !Number.isSafeInteger(mustFixCount) || mustFixCount < 0) return reject(card.id, `PR #${pr} review-must-fix-unknown`, reviewRepo);
   if (mustFixCount > 0) return reject(card.id, `PR #${pr} review-warn-with-must-fix: pass carries ${mustFixCount} must-fix`, reviewRepo);
+  const queueConfig = deps.landQueueConfig === undefined ? getUserConfig().taskAgent?.landQueue : deps.landQueueConfig;
+  if (queueConfig && (!isAbsolute(queueConfig.command) || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(queueConfig.remote)))
+    return reject(card.id, `PR #${pr} land queue command/remote invalid`, reviewRepo);
+  if (queueConfig && !ctx.reviewResultPath) return reject(card.id, `PR #${pr} queue review result path missing`, reviewRepo);
   const cycle = ctx.cycleId ?? ctx.runId;
   if (cycle && landedCycles.has(cycle)) return reject(card.id, `cycle ${cycle} already landed — stays shadow`, reviewRepo);
   const path = deps.statePath ?? taskAgentStatePath();
@@ -695,11 +706,16 @@ export async function executeLiveLand(
   let failure: LandFailureClassification | undefined;
   try {
     // The CLI rechecks the pinned PR/head immediately before merge, after its own gates and freeze admission.
-    const outcome = overlapEvidence
-      ? await (deps.land ?? defaultLand)(pr, view.head, landCwd, { overlapEvidence })
-      : await (deps.land ?? defaultLand)(pr, view.head, landCwd);
+    const outcome = queueConfig
+      ? await (deps.queueLanding ?? runQueuedLanding)({ card: card.id, pr, head: view.head, cwd: landCwd, statePath: path,
+        reviewResult: ctx.reviewResultPath!, command: queueConfig.command, remote: queueConfig.remote,
+        entry: (await import('../cli/tasks-cli.js')).ELANOUS_CLI_ENTRY,
+        configDir: (await import('../elanous-config-dir.js')).getElanousConfigDirOverride() ?? (await import('../instance/resolve.js')).effectiveInstanceRoot() })
+      : overlapEvidence
+        ? await (deps.land ?? defaultLand)(pr, view.head, landCwd, { overlapEvidence })
+        : await (deps.land ?? defaultLand)(pr, view.head, landCwd);
     ok = outcome.status === 0;
-    detail = (ok ? outcome.stdout || `land merged #${pr} head ${view.head.slice(0, 12)}` : outcome.stderr || outcome.stdout || `exit ${outcome.status}`).slice(-300);
+    detail = (ok ? outcome.stdout || `${queueConfig ? 'queued' : 'land merged'} #${pr} head ${view.head.slice(0, 12)}` : outcome.stderr || outcome.stdout || `exit ${outcome.status}`).slice(-300);
     if (!ok) failure = classifyLandFailure(outcome);
   } catch (error) {
     detail = (error instanceof Error ? error.message : String(error)).slice(-300);
@@ -708,8 +724,13 @@ export async function executeLiveLand(
   const retryAllowed = failure?.class === 'infra' && attempt < LAND_ATTEMPTS_PER_HEAD_ON_INFRA;
   // 인프라 실패로 재시도가 남으면 주기 표시도 푼다 — 같은 주기 id(재판정 틱의 `rejudge:<card>:<head>`)가 그 한 번을 막지 않게.
   if (retryAllowed && cycle) landedCycles.delete(cycle);
-  if (worktree) {
-    // 성공이든 실패든 걷는다.
+  if (worktree && queueConfig && ok) {
+    // The queue row pins this exact path until the train consumes it. Removing it here
+    // would turn a successful enqueue into a guaranteed missing-tree landing failure.
+    observeLandWorktree({ card: card.id, pr, head: view.head, created: worktree.created ?? null,
+      removed: false, reason: 'queued — train owns this exact-head worktree until its receipt' }, deps.log);
+  } else if (worktree) {
+    // Direct land and rejected queue attempts no longer need the temporary checkout.
     let removal: LandWorktreeRemoval;
     try { removal = worktree.cleanup(); } catch (error) { removal = { removed: false, reason: String(error).slice(-200) }; }
     observeLandWorktree({ card: card.id, pr, head: view.head, created: worktree.created ?? null, removed: removal.removed, ...(removal.branchRemoved !== undefined ? { branchRemoved: removal.branchRemoved } : {}),
@@ -746,7 +767,7 @@ export async function executeLiveLand(
     return observe(deps, withRepo({ kind, card: card.id, ok: false, executed: true, landAttempt,
       detail: `land ${ok ? 'succeeded' : 'failed'} but card update failed: ${String(error).slice(-230)}` }));
   }
-  return observe(deps, withRepo({ kind, card: card.id, ok, executed: true, detail, landAttempt }));
+  return observe(deps, withRepo({ kind, card: card.id, ok, executed: true, detail, landAttempt, ...(queueConfig && ok ? { queued: true } : {}) }));
 }
 
 /** `propose-green` — 비지 않은 근거가 있을 때만 카드에 제안을 적는다(한 번). 체크리스트는 쓰지 않는다. */

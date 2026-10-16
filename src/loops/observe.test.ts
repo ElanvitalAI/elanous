@@ -40,6 +40,37 @@ test('valid events expose missing required context without fabricating values or
   expect(data).toEqual({ runId: 'r', profile: '', reason: null, denominator: 3 });
 });
 
+test('approval (hitl) observation emits a one-line reason and sourceRef without mutating caller data', () => {
+  const data = { runId: 'run-1', profile: 'shadow', reason: '민감 결정 —  사람\n승인 필요 ', sourceRef: 'docs/roles/TC.md' };
+  loopEvent('tc-seat', 'hitl', data);
+  expect(log).toHaveBeenCalledTimes(1);
+  for (const [category, event, payload] of log.mock.calls) {
+    const fields = payload as Record<string, unknown>;
+    expect(category).toBe('loop.tc-seat');
+    expect(event).toBe('hitl');
+    expect(payload).toEqual({
+      ...data, reason: '민감 결정 — 사람 승인 필요', sourceRef: 'docs/roles/TC.md',
+      loopId: 'tc-seat', missingRequired: [],
+    });
+    expect(String(fields.reason)).not.toBe('');
+    expect(String(fields.reason)).not.toMatch(/[\r\n\u2028\u2029]/);
+    expect(String(fields.sourceRef)).not.toBe('');
+    expect(String(fields.sourceRef)).not.toMatch(/[\r\n\u2028\u2029]/);
+  }
+  expect(data).toEqual({ runId: 'run-1', profile: 'shadow', reason: '민감 결정 —  사람\n승인 필요 ', sourceRef: 'docs/roles/TC.md' });
+});
+
+test('approval (hitl) observation flags blank reason and sourceRef as missing without fabricating them', () => {
+  const data = { runId: 'run-1', profile: 'shadow', reason: '  \n ', sourceRef: '' };
+  loopEvent('tc-seat', 'hitl', data);
+  expect(log).toHaveBeenCalledTimes(1);
+  expect(log.mock.calls[0]).toEqual([
+    'loop.tc-seat', 'hitl',
+    { ...data, reason: '', sourceRef: '', loopId: 'tc-seat', missingRequired: ['reason', 'sourceRef'] },
+  ]);
+  expect(data).toEqual({ runId: 'run-1', profile: 'shadow', reason: '  \n ', sourceRef: '' });
+});
+
 test('only failed ticks reach the heal inbox; repeats fold by source and loop id', () => {
   const root = mkdtempSync(join(tmpdir(), 'heal-loop-wire-'));
   setElanousConfigDir(root);

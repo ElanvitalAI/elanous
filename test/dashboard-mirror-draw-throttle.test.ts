@@ -1,10 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import {
   createMirrorDrawThrottle,
   MIRROR_DRAW_MIN_INTERVAL_MS,
   MIRROR_DRAW_OBSERVE_SUPPRESSED_THRESHOLD,
 } from '../src/dashboard/mirror-draw-throttle.js';
+import { tuiSourceFileWith, tuiSourceText } from './helpers/dashboard-source.js';
 
 /** 시간을 «인자»로 준다 — 실제 타이머를 기다리지 않는다. */
 function harness() {
@@ -144,15 +144,17 @@ describe('로그 미러가 부르는 그리기 — 시간으로 묶는다', () =
   });
 });
 
-// ⛔⭐ 위 시험들은 스로틀 «단위»만 문다 — 누가 `src/dashboard/index.ts` 에서 «배선»을 빼도 전부 초록이다.
+// ⛔⭐ 위 시험들은 스로틀 «단위»만 문다 — 누가 TUI 진입(대시보드 index) 에서 «배선»을 빼도 전부 초록이다.
 //   📏 이것이 이 저장소가 반복해 밟은 계급이다: 「그 파일이 초록」은 「그 축이 닫혔다」가 아니다.
 //   ⇒ 그래서 «배선 자체»를 문다 — 미러 훅이 스로틀을 거치지 않고 draw() 를 «직접» 부르면 빨강.
 describe('미러 훅의 «배선» — 단위가 아니라 그 자리를 문다', () => {
-  const dashboardSource = () => readFileSync(new URL('../src/dashboard/index.ts', import.meta.url), 'utf8');
+  const dashboardSource = () => tuiSourceText();
 
   test('미러 훅이 스로틀을 «거친다» — draw() 를 직접 부르지 않는다', () => {
-    const source = dashboardSource();
-    const hookStart = source.indexOf('debug.setMirrorHook(');
+    // 훅을 «거는» 줄로 닻을 내린다 — mirror-draw-throttle.ts 머리 주석에도 같은 글자가 있어 첫 출현으로는 못 집는다.
+    const hookCall = /^\s*debug\.setMirrorHook\(/m;
+    const { text: source } = tuiSourceFileWith(hookCall);
+    const hookStart = source.search(hookCall);
     expect(hookStart).toBeGreaterThan(-1);
     const hookBody = source.slice(hookStart, source.indexOf('});', hookStart));
     // ⛔ 되먹임을 다시 만드는 «그 한 줄»이 돌아오면 빨강이 된다.

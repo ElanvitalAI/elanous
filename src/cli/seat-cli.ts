@@ -1,12 +1,19 @@
 import type { Command } from 'commander';
-import { existsSync, lstatSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, relative, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { redactSecretText } from '../debug/log.js';
 import { defaultMsgStorePath, readUnreadCount } from '../msg/msg-store.js';
+import { parseKnowhowItems, splitKnowhow } from '../seat-loop/seat-knowhow.js';
 
 export const SEAT_ROLES = ['OP', 'TC', 'MK', 'UX'] as const;
 export type SeatRole = typeof SEAT_ROLES[number];
+export const SEAT_AGENTS = ['codex', 'elanous', 'claude'] as const;
+export type SeatAgent = typeof SEAT_AGENTS[number];
+export const SEAT_QUICKSTART_MANUAL = join('docs', 'manual', 'MANUAL-seat-agent-quickstart-2026-10-12.md');
+export const SEAT_TRUST_LADDER = '신뢰 사다리: 지시 > 코드 > 문서 > 기억 — 어긋나면 앞이 이긴다';
+export const SEAT_TACIT_TOP_N = 5;
 
 const MAX_FIELD = 160;
 const MAX_ROWS = 12;
@@ -107,11 +114,138 @@ export function collectSeatBootSections(seat: string, options: { home: string; m
   return { sections, unread };
 }
 
-export function registerSeatBootCommands(command: Command, options: { home?: () => string; contextNow?: () => unknown; msgPath?: () => string } = {}): void {
+/** 표 줄을 칸으로 — 백틱 안의 `|`(예: `<pass|fail>`)는 칸 경계가 아니다. */
+const cells = (line: string): string[] => (line.replace(/^\s*\|/, '').replace(/\|\s*$/, '').match(/(?:`[^`]*`|[^|`])+|(?<=\|)(?=\|)/g) ?? []).map(cell => cell.trim());
+const backticked = (text: string): string[] => [...text.matchAll(/`([^`]+)`/g)].map(match => match[1]!);
+
+/** L1 — 빠른 길 매뉴얼의 «무엇을 하려면 → 명령» 표를 고른 에이전트용 한 줄씩으로 접는다. ⚠️ 주석은 다른 에이전트만 이름 대면 뺀다. */
+export function assembleSeatQuickPath(manual: string, agent: SeatAgent): string[] {
+  const lines = manual.split(/\r?\n/);
+  const start = lines.findIndex(line => /^##\s.*무엇.*명령/.test(line));
+  if (start < 0) return [];
+  const rows: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (/^#{1,2}\s/.test(line)) break;
+    if (!line.trim().startsWith('|') || /^\s*\|\s*-/.test(line)) continue;
+    const [what = '', command = '', dont = ''] = cells(line);
+    if (!what || what === '하려는 것') continue;
+    const segments = command.split(' · ').filter(segment => {
+      if (!segment.trim().startsWith('⚠️')) return true;
+      const named = SEAT_AGENTS.filter(name => new RegExp(`\\b${name}\\b`, 'i').test(segment));
+      return named.length === 0 || named.includes(agent);
+    });
+    const commands = segments.flatMap(segment => segment.trim().startsWith('⚠️') ? [segment.replace(/[`*]/g, '').trim()] : backticked(segment));
+    rows.push(`${what.replace(/\*\*/g, '')} → ${commands.join(' · ') || '미관측: 명령 없음'}${dont ? ` ⛔ ${dont.replace(/\*\*/g, '')}` : ''}`);
+  }
+  return rows;
+}
+
+export type SeatMemoryEntry = { title: string; hook: string; updated: string };
+type TacitCandidate = { label: string; details?: string[]; updated: string; hits: number; index: number };
+
+const tokens = (text: string): Set<string> => new Set(text.toLowerCase().split(/[^\p{L}\p{N}_]+/u).filter(Boolean));
+const hitsOf = (text: string, query: Set<string>): number => [...tokens(text)].filter(token => query.has(token)).length;
+/** 최근(날짜) 먼저, 같은 날이면 적중(질의 낱말 겹침) 많은 것, 그다음 원래 순서. */
+const recentThenHits = (a: TacitCandidate, b: TacitCandidate): number => b.updated.slice(0, 10).localeCompare(a.updated.slice(0, 10)) || b.hits - a.hits || a.index - b.index;
+
+/** 제목 이외의 운영 지침을 보존한다. 상태·검증은 분류에 이미 반영되어 중복 표시하지 않는다. */
+function knowhowDetails(text: string, prefix: string): string[] {
+  return text.split(/\r?\n/).slice(1)
+    .filter(line => line.trim() && !/^\s*-\s*(?:상태|검증)\s*:/.test(line))
+    .flatMap(line => (line.trim().match(/.{1,140}/gu) ?? []).map(part => `${prefix} ↳ ${part}`));
+}
+
+/** L3 — 최근 문서 상위 5개는 본문까지, 기억은 상위 N을 보인다. 절별 출력 하드 캡은 없다. */
+export function assembleSeatTacitKnowledge(input: { seat: string; agent: SeatAgent; knowhow: string; memories: readonly SeatMemoryEntry[]; now: Date; limit?: number }): string[] {
+  const limit = Math.max(0, input.limit ?? SEAT_TACIT_TOP_N);
+  const query = tokens(`${input.seat} ${input.agent}`);
+  const { facts, refs } = splitKnowhow(parseKnowhowItems(input.knowhow, input.seat), input.now);
+  const knowhow = [...facts, ...refs].map((item, index): TacitCandidate => {
+    const prefix = `[문서${facts.includes(item) ? '' : '·검증 안 됨'}]`;
+    const title = (item.text.split('\n', 1)[0] ?? '').replace(/^##\s*/, '');
+    return {
+      label: `${prefix} ${title}`,
+      details: knowhowDetails(item.text, prefix),
+      updated: item.verifiedAt?.toISOString() ?? '',
+      hits: hitsOf(item.text, query),
+      index,
+    };
+  }).sort(recentThenHits);
+  const memories = input.memories.map((entry, index): TacitCandidate => ({
+    label: `[기억] ${entry.title}${entry.hook ? ` — ${entry.hook}` : ''} (갱신 ${entry.updated.slice(0, 10) || '미상'})`,
+    updated: entry.updated,
+    hits: hitsOf(`${entry.title} ${entry.hook}`, query),
+    index,
+  })).sort(recentThenHits).slice(0, limit);
+  const visibleKnowhow = knowhow.slice(0, SEAT_TACIT_TOP_N);
+  const omittedKnowhow = knowhow.length - visibleKnowhow.length;
+  return [SEAT_TRUST_LADDER,
+    ...visibleKnowhow.flatMap(row => [row.label, ...(row.details ?? [])]),
+    ...(omittedKnowhow ? [`[문서] 나머지 ${omittedKnowhow}항목은 원문 KNOWHOW 참고`] : []),
+    ...memories.map(row => row.label)];
+}
+
+/** 저장소 안 일반 파일만 읽는다 — 링크가 저장소 밖을 가리키면 없는 것으로 친다. */
+function readRepoDoc(repoRoot: string, path: string): { updated: string; text: string } | null {
+  try {
+    const suffix = relative(realpathSync(repoRoot), realpathSync(path));
+    if (!suffix || suffix === '..' || suffix.startsWith(`..${sep}`) || suffix.startsWith(sep)) return null;
+    const stat = statSync(path);
+    if (!stat.isFile()) return null;
+    return { updated: stat.mtime.toISOString(), text: readFileSync(path, 'utf8').slice(0, 256_000) };
+  } catch { return null; }
+}
+
+function memoryEntries(home: string, root: string): { entries: SeatMemoryEntry[]; reason?: string } {
+  const dir = join(root, 'memory');
+  const index = join(dir, 'MEMORY.md');
+  try {
+    if (!existsSync(index)) return { entries: [], reason: '미관측: 기억 색인 파일 없음' };
+    if (!isRegularSeatPath(home, root, index)) return { entries: [], reason: '미관측: 기억 색인이 일반 경로가 아님' };
+    const entries = readFileSync(index, 'utf8').slice(0, 256_000).split(/\r?\n/).flatMap(line => {
+      const match = line.match(/^-\s*\[([^\]]+)\]\(([^)]+)\)\s*(?:[—-]\s*(.*))?$/);
+      if (!match) return [];
+      const file = join(dir, match[2]!);
+      try {
+        if (!existsSync(file) || !isRegularSeatPath(home, root, file)) return [];
+        return [{ title: match[1]!, hook: match[3] ?? '', updated: statSync(file).mtime.toISOString() }];
+      } catch { return []; }
+    });
+    return entries.length ? { entries } : { entries, reason: '미관측: 기억 색인에 읽을 항목 없음' };
+  } catch { return { entries: [], reason: '미관측: 기억 색인 읽기 실패' }; }
+}
+
+/** L1·L3 절 — `--agent` 를 줬을 때만 L0 카드 뒤에 붙는다. */
+export function collectSeatLadderSections(seat: string, agent: SeatAgent, options: { home: string; repoRoot: string; now: Date }): SeatBootSection[] {
+  const manualPath = join(options.repoRoot, SEAT_QUICKSTART_MANUAL);
+  const manual = readRepoDoc(options.repoRoot, manualPath);
+  const quick = manual ? assembleSeatQuickPath(manual.text, agent) : [];
+  const knowhowPath = join(options.repoRoot, 'docs', 'roles', seat, 'KNOWHOW.md');
+  const knowhow = readRepoDoc(options.repoRoot, knowhowPath);
+  const root = join(options.home, 'elanous-hq', 'seat-state');
+  const memories = memoryEntries(options.home, root);
+  const tacit = assembleSeatTacitKnowledge({ seat, agent, knowhow: knowhow?.text ?? '', memories: memories.entries, now: options.now });
+  const docs = tacit.filter(row => row.startsWith('[문서'));
+  const remembered = tacit.filter(row => row.startsWith('[기억]'));
+  const tacitRows = [
+    SEAT_TRUST_LADDER,
+    ...(docs.length ? docs : [knowhow ? '미관측: KNOWHOW 에 읽을 항목 없음' : '미관측: KNOWHOW 파일 없음']),
+    ...(remembered.length ? remembered : [memories.reason ?? '미관측: 기억 없음']),
+  ];
+  return [
+    { title: `L1 빠른 길 (${agent})`, source: manualPath, updated: manual?.updated ?? '미상', rows: quick, ...(quick.length ? {} : { reason: manual ? '미관측: «무엇→명령» 표 없음' : '미관측: 파일 없음' }) },
+    { title: `L3 암묵지 (${agent})`, source: `${knowhowPath} ⊕ ${join(root, 'memory', 'MEMORY.md')}`, updated: knowhow?.updated ?? '미상', rows: tacitRows },
+  ];
+}
+
+export function registerSeatBootCommands(command: Command, options: { home?: () => string; contextNow?: () => unknown; msgPath?: () => string; repoRoot?: () => string; now?: () => Date } = {}): void {
   command.command('boot <seat>').description('현재 자리 카드 — 허용된 메타데이터만 읽기 전용 표시')
-    .action(async (rawSeat: string) => {
+    .option('--agent <agent>', '에이전트(codex|elanous|claude) — 주면 L1 빠른 길 ⊕ L3 암묵지를 붙인다')
+    .action(async (rawSeat: string, flags: { agent?: string }) => {
       const seat = rawSeat.toUpperCase();
       if (!(SEAT_ROLES as readonly string[]).includes(seat)) { console.error(`seat boot: unknown seat ${rawSeat} (OP|TC|MK|UX)`); process.exitCode = 2; return; }
+      const agent = flags.agent?.toLowerCase();
+      if (agent !== undefined && !(SEAT_AGENTS as readonly string[]).includes(agent)) { console.error(`seat boot: unknown agent ${flags.agent} (codex|elanous|claude)`); process.exitCode = 2; return; }
       const home = options.home?.() ?? homedir();
       let facts: string[] = [];
       let contextUpdated = '미상';
@@ -125,6 +259,7 @@ export function registerSeatBootCommands(command: Command, options: { home?: () 
         facts = contextFacts(snapshot);
       } catch { facts = []; contextUpdated = '미관측: contextNow 조회 실패'; }
       const sections = collectSeatBootSections(seat, { home, msgPath: options.msgPath?.() ?? defaultMsgStorePath() }).sections;
+      if (agent !== undefined) sections.push(...collectSeatLadderSections(seat, agent as SeatAgent, { home, repoRoot: options.repoRoot?.() ?? fileURLToPath(new URL('../../', import.meta.url)), now: options.now?.() ?? new Date() }));
       console.log(renderSeatBootCard(seat as SeatRole, sections, facts, contextUpdated));
     });
 }

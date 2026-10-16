@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  createCloudSttEngine, createLocalWhisperEngine, splitAudioIntoChunks, transcribeFieldAudio,
+  createBatchSttEngine, createCloudSttEngine, createLocalWhisperEngine, splitAudioIntoChunks, transcribeFieldAudio,
   type FieldAudio, type TranscriptionEngine,
 } from './transcribe';
+import type { STTProvider } from '../voice/stt-provider';
 
 const recording: FieldAudio = {
   samples: Float32Array.from({ length: 100 }, (_, index) => index), sampleRate: 10,
@@ -169,6 +170,37 @@ describe('field audio transcription', () => {
       .toEqual([{ speaker: 'A', timestamp: '2026-09-30T00:00:00.000Z', text: '여기' }]);
     expect(localInputs).toEqual([{ audio: expect.any(Float32Array), sampleRate: 10, language: 'ko', task: 'transcribe' }]);
     expect(cloudInputs).toEqual([{ audio: expect.any(Float32Array), sampleRate: 10, language: 'en', timestamps: true, diarization: true }]);
+  });
+
+  test('batch STT adapter trims response and omits whitespace-only transcriptions', async () => {
+    const provider: STTProvider = { id: 'openai-whisper', transcribeBatch: async () => ({ text: '  ' }) };
+    const audio: FieldAudio = { samples: new Float32Array(16000), sampleRate: 16000, recordedAt: recording.recordedAt };
+    expect(await transcribeFieldAudio(audio, createBatchSttEngine(provider))).toEqual([]);
+  });
+
+  test('batch STT adapter converts normalized PCM to 16-bit mono and keeps chunk times in the field transcript', async () => {
+    const calls: Array<{ pcm: Buffer; language?: string }> = [];
+    const provider: STTProvider = {
+      id: 'openai-whisper',
+      async transcribeBatch(pcm, opts) {
+        calls.push({ pcm: Buffer.from(pcm), language: opts?.language });
+        return { text: '강의 핵심 개념' };
+      },
+    };
+    const audio: FieldAudio = { samples: Float32Array.from([-1, -0.5, 0, 0.5, 1]),
+      sampleRate: 16000, recordedAt: recording.recordedAt };
+    expect(await transcribeFieldAudio(audio, createBatchSttEngine(provider))).toEqual([
+      { timestamp: '2026-09-30T00:00:00.000Z', speaker: '화자 미상', text: '강의 핵심 개념' },
+    ]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.language).toBe('ko');
+    expect([...Array(5).keys()].map(i => calls[0]!.pcm.readInt16LE(i * 2))).toEqual([-32768, -16384, 0, 16384, 32767]);
+    await expect(transcribeFieldAudio({ ...audio, sampleRate: 8000 }, createBatchSttEngine(provider)))
+      .rejects.toThrow('16 kHz');
+    expect(calls).toHaveLength(1);
+    await expect(transcribeFieldAudio({ ...audio, samples: Float32Array.of(Number.NaN) }, createBatchSttEngine(provider)))
+      .rejects.toThrow('Audio samples must be finite');
+    expect(calls).toHaveLength(1);
   });
 
   test('rejects invalid absolute capture time and out-of-bounds segment times', async () => {

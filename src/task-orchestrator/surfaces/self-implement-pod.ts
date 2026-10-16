@@ -12,6 +12,7 @@
 // 부작용(kubectl·파일)은 주입받는다 — 시험은 가짜 kubectl 로 누른다.
 
 import { podSkillsDigest, readSkillEnvFiles, resolvePodSkills } from './pod-skills.js';
+import { emitPodLifecycle, parseSiTaskPodStages, siTaskPodLifecycleEvent, siTaskPodStageShell } from './pod-lifecycle-stages.js';
 import { podSourceScript, type PodSource } from './pod-source-receive.js';
 import { GROUNDING_TOKEN_ENV, GROUNDING_URL_ENV, mintGroundingToken, revokeGroundingRun, type GroundingTokenScope } from '../../grounding/token.js';
 import { POD_CREDENTIAL_GROK_PATH, POD_CREDENTIAL_GITHUB_PATH, POD_GITHUB_CREDENTIAL_TOKEN_ENV, POD_GITHUB_CREDENTIAL_URL_ENV, installationRepositories } from '../../nexus/api/pod-credential-api.js';
@@ -55,7 +56,7 @@ export const POD_JOB_DEADLINE_SECONDS = 10_800;
 // Node allocatable ≈ 343Gi ≫ 25 × 6Gi. One-minute samples can miss the true peak (lower bound).
 import { podWorkLabels, type PodWorkIdentity, type PodPlacement, type PodPlacementKind, type PodPoolMember, type PodPoolScheduler } from './pod-pool.js';
 export { POD_CHILD_REQUESTS } from './pod-lease.js';
-import { measurePoolLease, recommendConcurrency, POD_CHILD_REQUESTS, POD_HOST_LEASE_ANNOTATION, POD_JOB_TTL_AFTER_FINISHED_SECONDS, LEASE_KUBECTL_MAX_BUFFER, memoryQuantityBytes } from './pod-lease.js';
+import { measurePoolLease, recommendConcurrency, POD_CHILD_REQUESTS, POD_SI_ADMISSION_CAP_BYTES, POD_HOST_LEASE_ANNOTATION, POD_JOB_TTL_AFTER_FINISHED_SECONDS, LEASE_KUBECTL_MAX_BUFFER, memoryQuantityBytes } from './pod-lease.js';
 import { ACTUAL_SUBSTRATE_ENV, RUN_CONTRACT_ENV, carryRunContract, completionFloorFor } from '../../self-implement/graph-run-contract.js';
 import { execFile, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -94,6 +95,7 @@ import { inferProviderFromModel } from '../../llm.js';
 import { classifyPodExit, extractPodFailureReason, podTerminalRow, type PodExitClass } from './pod-failure-reason.js';
 import { kubectlTransientReason, retryKubectlTransient } from './kubectl-transient-retry.js';
 import { OLD_DOOR_STAMP_ENV } from '../../self-dev/old-door.js';
+import { resolveDefaultSourceHead, seedMirrorOnce, type MirrorSeedResult } from './pod-mirror-seed.js';
 
 export type Kubectl = (args: readonly string[], input?: string) => { status: number | null; stdout: string; stderr: string };
 
@@ -137,6 +139,17 @@ export interface PodSpawnOptions {
   repoUrl?: string;
   /** 호스트 Git 미러 디렉터리 — 명시 옵션 > 환경변수 > pod.hostMirror. */
   hostMirror?: string;
+  /** TA-POD-WARMBOOT-PARITY — the child prints this launch's result marker last and the host ends its wait on it when the
+   *  Job condition lags (pod-result-marker-wait.ts). Default: on, off with an injected kubectl (tests) unless set. */
+  resultMarker?: boolean;
+  /** TA-POD-WARMBOOT-PARITY — seeds a commit-pinned source into the pool host mirror before the Job (test seam · default
+   *  {@link seedMirrorOnce}; none with an injected kubectl unless given). */
+  seedMirror?: (o: { host: string; commit: string; cwd: string }) => Promise<MirrorSeedResult | undefined>;
+  /** Git tree that has the pinned commit for the mirror seed (default: process.cwd()). */
+  mirrorSeedCwd?: string;
+  /** SI-SEED-DEFAULT — resolves a default source's branch tip for the mirror seed (test seam · default
+   *  {@link resolveDefaultSourceHead}; none with an injected kubectl unless given). */
+  resolveSourceHead?: (o: { repoUrl: string; base?: string; cwd: string }) => Promise<{ sha?: string; reason?: string }>;
   /** 설정 읽기(시험 주입). kubectl 주입 시험에서는 기본 사용자 설정을 읽지 않는다. */
   configHostMirror?: () => string | undefined;
   /** AUTHOR-POD2 host config seam; Pod itself has no host config. */
@@ -767,8 +780,12 @@ export const POD_MEMORY_HIGH_DEFAULT = '32Gi';
 /** POD7 — `lite`(`ELANOUS_POD_MEMORY_LITE` 또는 2Gi): research/document 기본값; OOM 시 standard 로 한 단계 승급한다. */
 export const POD_MEMORY_LITE_DEFAULT = '2Gi';
 
-/** Reserve from measured per-run peaks, never from the advisory limit tier. Sparse or missing measurements keep the old reservation. */
+/** Standard si-task request follows measured peaks up to its admission cap; OOM retries reserve their explicit tier separately. */
 export function podMemoryRequestFor(kind: GoalType | null, advice?: PodMemoryAdvice): string {
+  return podMemoryRequestForWithCap(kind, advice, true);
+}
+
+function podMemoryRequestForWithCap(kind: GoalType | null, advice: PodMemoryAdvice | undefined, capToAdmission: boolean): string {
   const evidence = advice?.byGoalType.find((entry) => entry.goalType === kind)?.evidence;
   const peak = evidence?.peakMiB.p95;
   const reason = !kind ? 'unknown-kind' : !evidence ? 'no-advice'
@@ -778,7 +795,10 @@ export function podMemoryRequestFor(kind: GoalType | null, advice?: PodMemoryAdv
     debug.log('pod.memory', 'request-default', { kind, reason });
     return POD_CHILD_REQUESTS.memory;
   }
-  return `${Math.max(1, Math.ceil(peak! * 1.25 / 1024))}Gi`;
+  const measuredGi = Math.max(1, Math.ceil(peak! * 1.25 / 1024));
+  const capGi = capToAdmission && POD_SI_ADMISSION_CAP_BYTES !== null ? Math.floor(POD_SI_ADMISSION_CAP_BYTES / 1024 ** 3) : null;
+  const requestGi = capGi !== null ? Math.min(measuredGi, capGi) : measuredGi;
+  return `${requestGi}Gi`;
 }
 export const POD_MEMORY_TIERS = ['lite', 'standard', 'high'] as const;
 export type PodMemoryTier = (typeof POD_MEMORY_TIERS)[number];
@@ -977,7 +997,7 @@ export function podSigtermTrapScript(seqFile: string = POD_USAGE_PARTIAL_SEQ_FIL
   return `trap '{ [ -n "$si_pid" ] && kill "$si_pid" 2>/dev/null || true; [ -n "\${usage_partial_pid:-}" ] && kill "$usage_partial_pid" 2>/dev/null || true; si_seq=$(cat ${seqFile} 2>/dev/null || true); case "$si_seq" in ""|*[!0-9]*) si_seq=0;; esac; si_seq=$((10#$si_seq + 1)); { [ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h --partial --seq "$si_seq"; } & si_rollup_pid=$!; for si_i in 1 2 3 4 5 6 7 8; do kill -0 "$si_rollup_pid" 2>/dev/null || break; sleep 1; done; kill "$si_rollup_pid" 2>/dev/null || true; wait "$si_rollup_pid" 2>/dev/null || true; exit 143; }' TERM`;
 }
 
-export function podJobManifest(o: { name: string; namespace: string; image: string; workIdentity?: PodWorkIdentity; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; repairCommitOnly?: { pr: number; baseHead: string }; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; memoryRequest?: string; goalDoc?: string; /** AUTHOR-POD2 — run `harness say` on /creds/feature inside the Pod (authoring happens off the host). */ authorSentence?: boolean; authorGrade?: 'full' | 'lite'; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number; /** Which goal execution and attempt this Job is — a resumed host verifies it before following the Job (POD9). */ execution?: { key: string; attempt: number }; hostLeaseAdmitted?: boolean; /** POD-ROLE-LLM — OpenRouter 자식 Pod 에 리뷰어용 codex 자격을 깐다. */ reviewerCodexAuth?: boolean; /** BEDROCK-PROVIDER ② — bedrock 자식만: 이름 있는 AWS Secret 의 키(secretKeyRef) ⊕ 리전 ⊕ 이그레스 라벨. */ bedrock?: BedrockPodSpec; /** ZAI-POD-CHILD — glm(ZAI) 자식만: 이름 있는 ZAI Secret 의 키(secretKeyRef) ⊕ 이그레스·동시 상한 라벨(Pod ⊕ Job). */ zai?: ZaiPodSpec; fallbackChain?: { steps: readonly FallbackStep[]; source: 'host' | 'default' } }): Record<string, unknown> {
+export function podJobManifest(o: { name: string; namespace: string; image: string; workIdentity?: PodWorkIdentity; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; repairCommitOnly?: { pr: number; baseHead: string }; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; memoryRequest?: string; goalDoc?: string; /** AUTHOR-POD2 — run `harness say` on /creds/feature inside the Pod (authoring happens off the host). */ authorSentence?: boolean; authorGrade?: 'full' | 'lite'; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number; /** Which goal execution and attempt this Job is — a resumed host verifies it before following the Job (POD9). */ execution?: { key: string; attempt: number }; hostLeaseAdmitted?: boolean; /** POD-ROLE-LLM — OpenRouter 자식 Pod 에 리뷰어용 codex 자격을 깐다. */ reviewerCodexAuth?: boolean; /** BEDROCK-PROVIDER ② — bedrock 자식만: 이름 있는 AWS Secret 의 키(secretKeyRef) ⊕ 리전 ⊕ 이그레스 라벨. */ bedrock?: BedrockPodSpec; /** ZAI-POD-CHILD — glm(ZAI) 자식만: 이름 있는 ZAI Secret 의 키(secretKeyRef) ⊕ 이그레스·동시 상한 라벨(Pod ⊕ Job). */ zai?: ZaiPodSpec; fallbackChain?: { steps: readonly FallbackStep[]; source: 'host' | 'default' }; /** TA-POD-WARMBOOT-PARITY — the child's final line (podResultMarkerShellLine), just before `exit $rc`. */ resultMarkerLine?: string }): Record<string, unknown> {
   if (o.repairCommitOnly && (o.source?.kind !== 'pr' || o.source.number !== o.repairCommitOnly.pr || !/^[0-9a-f]{40}$/.test(o.repairCommitOnly.baseHead) || o.args.includes('--open-pr') || o.args.includes('--merge-by-host') || o.args.includes('--auto-merge'))) {
     throw new Error('repair commit-only requires matching PR source and no PR/merge flags');
   }
@@ -1000,6 +1020,9 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
   const quotedChildLlm = delegatedChildLlm
     ? ` '--child-llm-provider' ${shellQuote(delegatedChildLlm.provider)}${delegatedChildLlm.model ? ` '--child-llm-model' ${shellQuote(delegatedChildLlm.model)}` : ''}`
     : '';
+  // SI-POD-STAGE-MARKERS — `run end` 는 본체 `wait` 가 돌아온 «바로 다음»(`rc=$?` 직후)에 찍는다: 결과 평탄화·repair 내보내기·
+  //   AUTHOR finished 줄 같은 후처리는 run 에 넣지 않는다(리뷰 mf). 표지 줄은 rc 값을 건드리지 않는다.
+  const RUN_END = siTaskPodStageShell('run', 'end');
   const script = [
     'set -u',
     ...(o.fallbackChain ? [
@@ -1027,7 +1050,12 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
     'git config --global user.name "elanous pod child" && git config --global user.email "noreply@anthropic.com" && gh auth setup-git',
     podGitPushGuardScript(),
     'curl -s -m 3 -o /dev/null http://host.orb.internal:31415/health && { echo "[pod] ISOLATION FAIL"; exit 3; }',
-    podSourceScript(o.source ?? { kind: 'default' }, o.repoUrl),
+    // SI-POD-STAGE-MARKERS — Pod 시계 단계 표지(`ELANOUS_POD_STAGE <stage> <start|end> <epoch초>`): 호스트가 Job 로그에서 읽어
+    //   pod.lifecycle stages 의 clone · mirror · run 을 채운다. 실패한 단계는 끝 표지가 없다(→ missing · 지어내지 않는다).
+    //   clone 끝 = podSourceScript 전체가 끝난 뒤(갈래마다 마지막 줄이 `ELANOUS_POD_SOURCE` 또는 `cd repo` — 둘 다 소스 받기의 일부).
+    siTaskPodStageShell('clone', 'start'),
+    podSourceScript(o.source ?? { kind: 'default' }, o.repoUrl, undefined, { stageMarkers: true }),
+    siTaskPodStageShell('clone', 'end'),
     ...(o.repairCommitOnly ? [`[ "$(git rev-parse HEAD)" = '${o.repairCommitOnly.baseHead}' ] || { echo 'ELANOUS_POD_REPAIR_FAILED source-head-mismatch'; exit 8; }`] : []),
     ...(goalPath ? [
       `mkdir -p -- "$(dirname -- ${goalPath})" && cp -- /creds/goal-doc ${goalPath} || exit 6`,
@@ -1045,13 +1073,14 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
     // 마지막 줄 JSON 이 «맨 끝»이어야 한다(parseSelfImplementJson) — rollup 은 그 앞에.
     // ⛔ `--author-grade` 는 Pod 안 `elanous`(이미지에 깔린 판)가 모를 수 있어 넘기지 않는다 — 10-06 «unknown option» 즉사(#24445 되돌림).
     // AUTHOR-LITE2-POD — 등급은 환경변수 `ELANOUS_AUTHOR_GRADE` 로 싣는다(옛 Pod elanous 는 모르는 환경변수를 무시하고 full 로 돈다).
+    siTaskPodStageShell('run', 'start'),
     o.repairCommitOnly
-      ? `export ${OLD_DOOR_STAMP_ENV}=self-implement; elanous self implement "$(cat /creds/feature)" --json --no-open-pr ${quoted} > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; if [ "$rc" -eq 0 ]; then elanous self repair-commit-export '${o.repairCommitOnly.pr}' '${o.repairCommitOnly.baseHead}' /tmp/si.out "$PWD" "$HOME/outbox" || rc=8; fi`
+      ? `export ${OLD_DOOR_STAMP_ENV}=self-implement; elanous self implement "$(cat /creds/feature)" --json --no-open-pr ${quoted} > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; ${RUN_END}; if [ "$rc" -eq 0 ]; then elanous self repair-commit-export '${o.repairCommitOnly.pr}' '${o.repairCommitOnly.baseHead}' /tmp/si.out "$PWD" "$HOME/outbox" || rc=8; fi`
       : o.authorSentence
-      ? `echo "ELANOUS_AUTHOR_ON_POD started host=$(hostname) at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; author_t0=$(date +%s); ${o.authorGrade === 'lite' || o.authorGrade === 'full' ? `ELANOUS_AUTHOR_GRADE=${o.authorGrade} ` : ''}elanous harness say --substrate local --json${quotedAsk}${quotedChildLlm} -- "$(cat /creds/feature)" > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; echo "ELANOUS_AUTHOR_ON_POD finished host=$(hostname) rc=$rc seconds=$(( $(date +%s) - author_t0 ))"; ${POD_RESULT_FLATTEN}`
+      ? `echo "ELANOUS_AUTHOR_ON_POD started host=$(hostname) at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; author_t0=$(date +%s); ${o.authorGrade === 'lite' || o.authorGrade === 'full' ? `ELANOUS_AUTHOR_GRADE=${o.authorGrade} ` : ''}elanous harness say --substrate local --json${quotedAsk}${quotedChildLlm} -- "$(cat /creds/feature)" > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; ${RUN_END}; echo "ELANOUS_AUTHOR_ON_POD finished host=$(hostname) rc=$rc seconds=$(( $(date +%s) - author_t0 ))"; ${POD_RESULT_FLATTEN}`
       : goalPath
-      ? `elanous harness ask ${goalPath} --json${quotedAsk}${quotedChildLlm} > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; ${POD_RESULT_FLATTEN}`
-      : `export ${OLD_DOOR_STAMP_ENV}=self-implement; elanous self implement "$(cat /creds/feature)" --json ${quoted} > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?`,
+      ? `elanous harness ask ${goalPath} --json${quotedAsk}${quotedChildLlm} > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; ${RUN_END}; ${POD_RESULT_FLATTEN}`
+      : `export ${OLD_DOOR_STAMP_ENV}=self-implement; elanous self implement "$(cat /creds/feature)" --json ${quoted} > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; ${RUN_END}`,
     'cat /tmp/si.out',
     '[ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h || echo "ELANOUS_USAGE_ROLLUP {\"measured\":false,\"reason\":\"no rollup script\"}"',
     // A long run's log export can pass the 5MB artifact limit; skipping it whole left no window into why a
@@ -1089,7 +1118,7 @@ if [ -d "$HOME/outbox" ]; then
     else
       printf 'ELANOUS_POD_ARTIFACT_SKIPPED %s %s\\n' "$relative" "$size"
     fi
-  done < <(find "$HOME/outbox" -type f -print0)
+  done < <(find "$HOME/outbox" -type f -print0 | while IFS= read -r -d '' f; do printf '%s\\t%s\\0' "$(( $(wc -c < "$f") ))" "$f"; done | sort -z -n -k1,1 | while IFS= read -r -d '' row; do printf '%s\\0' "\${row#*$'\\t'}"; done)
 fi
 found=0
 for ledger in "\${ELANOUS_STATE_DIR:-$HOME/.elanous}"/run-ledger/*.jsonl; do
@@ -1114,6 +1143,8 @@ if [ "$found" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi`,
     '[ -n "${usage_partial_pid:-}" ] && wait "$usage_partial_pid" 2>/dev/null || true',
     'tail -n 1 /tmp/si.out',
     ...(o.repairCommitOnly ? [] : [podSalvageScript()]),
+    // TA-POD-WARMBOOT-PARITY: the last line says «the child is done» so the host need not wait for the Job condition.
+    ...(o.resultMarkerLine ? [o.resultMarkerLine] : []),
     'exit $rc',
   ].join('\n');
   return {
@@ -1196,6 +1227,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
   const hostMirror = (options.hostMirror ?? env.ELANOUS_POD_HOST_MIRROR ?? (options.configHostMirror ?? (options.kubectl ? () => undefined : configHostMirror))())?.trim() || undefined;
   if (hostMirror && !isAbsolute(hostMirror)) throw new Error('pod.hostMirror must be an absolute directory path');
   const hostSupervised = options.hostSupervised ?? true;
+  const resultMarkerOn = options.resultMarker ?? !options.kubectl;
   return (input) => {
     if (options.repairCommitOnly && (input.autoMerge || input.openPr || input.base !== `pr-${options.repairCommitOnly.pr}`)) {
       throw new Error('repair commit-only refuses auto merge, new PR, or a different base');
@@ -1398,7 +1430,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
       const cleanupSecret = () => { kubectl(['-n', namespace, 'delete', 'secret', `${name}-creds`, '--ignore-not-found']); };
       let repairResultAnnounced = false;
       let repairArtifactReady = false;
-      const collectFullLogs = (unavailableEvent: string, replace?: ReadonlySet<string>, onEvent?: (event: string, data: Record<string, unknown>) => void, childId?: string): { status: 'ok' | 'unavailable' | 'incomplete'; childLedgerIncomplete: boolean; samples: ReturnType<typeof parseMemSamples> } => {
+      const collectFullLogs = (unavailableEvent: string, replace?: ReadonlySet<string>, onEvent?: (event: string, data: Record<string, unknown>) => void, childId?: string): { status: 'ok' | 'unavailable' | 'incomplete'; childLedgerIncomplete: boolean; samples: ReturnType<typeof parseMemSamples>; podStages?: Record<string, number> } => {
         let full: ReturnType<Kubectl>;
         try {
           full = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child']);
@@ -1409,7 +1441,9 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           return { status: 'unavailable', childLedgerIncomplete: false, samples: [] };
         }
         const via = /^ELANOUS_POD_SOURCE_VIA (mirror|github)\r?$/m.exec(full.stdout)?.[1];
-        if (via) debug.log('self-implement.pod', 'source-via', { job: name, via });
+        // #28246 names why the mirror was skipped on the line before `VIA github`; carry it on the same event.
+        const mirrorSkip = /^ELANOUS_POD_SOURCE_MIRROR_SKIP (no-mount|rev-parse-failed|clone-failed)\r?$/m.exec(full.stdout)?.[1];
+        if (via) debug.log('self-implement.pod', 'source-via', { job: name, via, ...(mirrorSkip ? { mirrorSkip } : {}) });
         let ledgerIncomplete = false;
         let childLedgerIncomplete = false;
         let artifactIncomplete = false;
@@ -1442,7 +1476,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             record('self-implement.pod', 'repair-artifact-incomplete', { job: name, reason: error instanceof Error ? error.message : String(error) });
           }
         }
-        return { status: ledgerIncomplete || artifactIncomplete ? 'incomplete' : 'ok', childLedgerIncomplete, samples: parseMemSamples(full.stdout) };
+        return { status: ledgerIncomplete || artifactIncomplete ? 'incomplete' : 'ok', childLedgerIncomplete, samples: parseMemSamples(full.stdout), podStages: parseSiTaskPodStages(full.stdout) };
       };
       let retryAccount: string | undefined;
       let retrySamples: ReturnType<typeof parseMemSamples> = [];
@@ -1788,9 +1822,12 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const jobImage = member?.imageRef ?? image;
         const launchRunId = retryAccount || oomRetried || ghLoginRetried ? mintRunId() : childRunId;
         let liveChildRunId = launchRunId;
+        // TA-POD-WARMBOOT-PARITY — the id the followed Job prints in its result marker (null = wait on the condition only).
+        let markerToken: string | null = null;
         let reattachedMemoryLimit: string | undefined;
         let existingExecutionKey: string | undefined;
         let existingAttempt = NaN;
+        let existingChildScript = '';
         const existing = kubectl(['-n', namespace, 'get', 'job', name, '-o', 'jsonpath={.metadata.uid} {.status.conditions[*].type}']);
         const [existingUid = '', ...existingConditions] = existing.status === 0 ? existing.stdout.trim().split(/\s+/u) : [];
         const hasExistingJob = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(existingUid);
@@ -1805,6 +1842,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
               existingAttempt = Number(job.metadata?.annotations?.[POD_ATTEMPT_ANNOTATION] ?? NaN);
               const child = job.spec?.template?.spec?.containers?.find((c) => c.name === 'child');
               reattachedMemoryLimit = child?.resources?.limits?.memory;
+              existingChildScript = (child?.args ?? []).join('\n');
               const inherited = child?.env?.find((e) => e.name === 'ELANOUS_RUN_ID')?.value;
               if (inherited && inherited !== parentRunId && inherited === normalizeRunId(inherited)) liveChildRunId = inherited;
               if (oomRetried && reattach && reattachedMemoryLimit && (memoryGi(reattachedMemoryLimit) ?? 0) < (memoryGi(memoryLimit) ?? Infinity)) reattach = false;
@@ -1841,6 +1879,13 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         if (reattach) {
           if (reattachedMemoryLimit) memoryLimit = reattachedMemoryLimit;
           debug.log('self-implement.pod', 'job-reattach', { job: name, conditions: existingConditions.join(' ') || 'running', spaceId: input.spaceId });
+          // A Job made before the marker existed never prints one — its wait stays on the condition (review mf: verify
+          // the existing Job's own script carries this run's marker line before arming the tail read).
+          if (resultMarkerOn) {
+            const line = (await import('./pod-result-marker-wait.js')).podResultMarkerShellLine(liveChildRunId);
+            if (line && existingChildScript.includes(line)) markerToken = liveChildRunId;
+            else debug.log('self-implement.pod', 'result-marker-skipped', { job: name, reason: 'reattached-job-without-marker' });
+          }
         }
         if (!hostRefresh && ghTokenExpiresAt === null && !githubRelay) debug.log('self-implement.pod', 'gh-token-app-skipped', { job: name, reason: 'no-verified-app-or-refresh-path' });
         let appliedMemoryRequest: string | undefined;
@@ -1918,13 +1963,22 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
               ...(githubRelay ? { [POD_GITHUB_CREDENTIAL_URL_ENV]: `${new URL(groundingUrl!).origin}${POD_CREDENTIAL_GITHUB_PATH}` } : {}),
             }
           : undefined;
-        const measuredRequest = podMemoryRequestFor(requestKind, advice);
+        // OOM retry has its own explicit full-tier admission, so preserve the measured request there.
+        const measuredRequest = podMemoryRequestForWithCap(requestKind, advice, !oomRetried);
         const requestGi = memoryGi(measuredRequest);
         const limitGi = memoryGi(memoryLimit);
         const documentDefaultLite = !oomRetried && selectedGoalType === 'document' && memoryTier === 'lite'
           && (memorySource === 'goal-type-auto' || memoryReason === 'goal-type-default');
         const memoryRequest = documentDefaultLite ? memoryLimit
           : requestGi !== null && limitGi !== null && requestGi > limitGi ? memoryLimit : measuredRequest;
+        const peakMiB = advice?.byGoalType.find((entry) => entry.goalType === requestKind)?.evidence.peakMiB.p95;
+        const rawMeasuredGi = typeof peakMiB === 'number' && Number.isFinite(peakMiB) && peakMiB >= 0
+          ? Math.max(1, Math.ceil(peakMiB * 1.25 / 1024)) : null;
+        const appliedGi = memoryGi(memoryRequest);
+        if (rawMeasuredGi !== null && appliedGi !== null && appliedGi < rawMeasuredGi) {
+          debug.log('pod.memory', 'request-adjusted', { spaceId: input.spaceId, kind: requestKind, measuredGi: rawMeasuredGi,
+            requestGi: appliedGi, memoryLimit, reason: limitGi === appliedGi ? 'memory-limit' : 'admission-cap' });
+        }
         appliedMemoryRequest = memoryRequest;
         debug.log('self-implement.pod', 'memory-request', { spaceId: input.spaceId, job: name,
           tier: oomRetried ? retryTier : memoryTier, reason: oomRetried ? 'OOMKilled' : memoryReason,
@@ -1938,7 +1992,47 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           slotId: env.ELANOUS_POD_SLOT_ID,
           work: !goalDoc && env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? 'authoring' : (oomRetried ? retryTier : memoryTier) === 'lite' ? 'lite' : 'harness',
         };
-        const job = podJobManifest({ name, namespace, fallbackChain, image: jobImage, workIdentity, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(options.repairCommitOnly ? { repairCommitOnly: options.repairCommitOnly } : {}), ...(hostMirror ? { hostMirror } : {}), args: jobArgs, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? { authorSentence: true, ...(env.ELANOUS_POD_AUTHOR_GRADE === 'lite' || env.ELANOUS_POD_AUTHOR_GRADE === 'full' ? { authorGrade: env.ELANOUS_POD_AUTHOR_GRADE } : {}) } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, memoryRequest, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission, ...(roleCodexCredential ? { reviewerCodexAuth: true } : {}), ...(bedrockSpec ? { bedrock: bedrockSpec } : {}), ...(zaiSpec ? { zai: zaiSpec } : {}) });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
+        // TA-POD-WARMBOOT-PARITY (GATE-WARM-BOOT parity · #27805): a commit-pinned source on a pool host — put that commit into
+        // the host mirror first (once per host·commit in this process) so podSourceScript finds it instead of fetching
+        // from GitHub. Best effort: a failed seed only logs; the Job is applied either way.
+        // SI-SEED-DEFAULT: a default source (TA's main HEAD Jobs) seeds too — the host resolves the branch tip once and seeds
+        // that sha. When a condition is false the skip is one `mirror-seed-skipped` line naming it (no silent fallback).
+        const seedMirror = options.seedMirror ?? (options.kubectl ? undefined : seedMirrorOnce);
+        const seedSource: PodSource = options.source ?? { kind: 'default' };
+        const seedCwd = options.mirrorSeedCwd ?? process.cwd();
+        let seedCommit: string | undefined;
+        let seedSkip: string | undefined;
+        if (!seedMirror) seedSkip = 'no-seeder';
+        else if (!hostMirror) seedSkip = 'no-host-mirror';
+        else if (!member?.sshHost) seedSkip = 'no-ssh-host';
+        else if (seedSource.kind === 'commit') seedCommit = seedSource.sha;
+        else if (seedSource.kind !== 'default') seedSkip = `source-${seedSource.kind}`;
+        else {
+          const resolveHead = options.resolveSourceHead ?? (options.kubectl ? undefined : resolveDefaultSourceHead);
+          let head: { sha?: string; reason?: string } | undefined;
+          try { head = resolveHead ? await resolveHead({ repoUrl, ...(seedSource.base ? { base: seedSource.base } : {}), cwd: seedCwd }) : undefined; }
+          catch { head = { reason: 'resolve-threw' }; }
+          if (!resolveHead) seedSkip = 'no-head-resolver';
+          else if (head?.sha && /^[0-9a-f]{40}$/.test(head.sha)) seedCommit = head.sha;
+          else seedSkip = `default-head-${head?.reason ?? 'unresolved'}`;
+        }
+        if (seedMirror && seedCommit && member?.sshHost) {
+          const seedHost = member.sshHost;
+          // try/catch as well as .catch (review mf): an injected seed that throws synchronously must not stop the Job.
+          let seed: MirrorSeedResult | undefined;
+          try {
+            seed = await seedMirror({ host: seedHost, commit: seedCommit, cwd: seedCwd });
+          } catch (error) {
+            seed = { host: seedHost, ok: false, ms: 0, detail: String(error).slice(0, 300) };
+          }
+          debug.log('self-implement.pod', 'mirror-seed', { job: name, host: seedHost, commit: seedCommit, sourceKind: seedSource.kind, ok: seed?.ok ?? false, ms: seed?.ms ?? 0, ...(seed?.detail ? { detail: seed.detail } : {}) }, seed?.ok ? undefined : { level: 'warn' });
+        } else {
+          debug.log('self-implement.pod', 'mirror-seed-skipped', { job: name, reason: seedSkip ?? 'unknown', sourceKind: seedSource.kind, ...(member?.sshHost ? { host: member.sshHost } : {}) });
+        }
+        // TA-POD-WARMBOOT-PARITY (GATE-POD-RESULT-MARKER parity · #27815): this launch's marker is the child's last line.
+        const resultMarkerLine = resultMarkerOn ? (await import('./pod-result-marker-wait.js')).podResultMarkerShellLine(launchRunId) ?? undefined : undefined;
+        if (resultMarkerLine) markerToken = launchRunId;
+        const job = podJobManifest({ name, namespace, fallbackChain, ...(resultMarkerLine ? { resultMarkerLine } : {}), image: jobImage, workIdentity, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(options.repairCommitOnly ? { repairCommitOnly: options.repairCommitOnly } : {}), ...(hostMirror ? { hostMirror } : {}), args: jobArgs, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? { authorSentence: true, ...(env.ELANOUS_POD_AUTHOR_GRADE === 'lite' || env.ELANOUS_POD_AUTHOR_GRADE === 'full' ? { authorGrade: env.ELANOUS_POD_AUTHOR_GRADE } : {}) } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, memoryRequest, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission, ...(roleCodexCredential ? { reviewerCodexAuth: true } : {}), ...(bedrockSpec ? { bedrock: bedrockSpec } : {}), ...(zaiSpec ? { zai: zaiSpec } : {}) });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
         const carriedBranch = goalDoc ? 'goal-doc' as const : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? 'author' as const : undefined;
         const carriedChildLlm = carriedBranch ? podDelegatedChildLlm(jobArgs) : undefined;
         const a = kubectl(['apply', '-f', '-'], JSON.stringify(job));
@@ -2003,6 +2097,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         let livePartialLine: string | null = null;
         let pollsSinceCapture = 0;
         const capturePolls = Math.max(1, options.usagePartialCapturePolls ?? Math.round(POD_USAGE_PARTIAL_CAPTURE_MS / Math.max(1, options.pollMs ?? 15_000)));
+        const markerWait = markerToken ? await import('./pod-result-marker-wait.js') : null;
+        const waitStartedAt = Date.now();
         for (;;) {
           if (input.signal?.aborted) {
             // METER-POD-ROLLUP-GAP — Job 삭제 «전»에 로그를 한 번 거둔다: PARTIAL 줄이 삭제와 함께 사라지면 사용량이 0 처럼 보인다.
@@ -2037,6 +2133,19 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             } catch { /* Pod 가 사라졌거나 조회 불가 — 종료 사유는 미상. */ }
             debug.log('self-implement.pod', 'container-terminated', { job: name, container: 'child', reason: containerReason, exitCode: containerExitCode, jobReason: failedReason || null, memoryLimit });
             break;
+          }
+          // TA-POD-WARMBOOT-PARITY: the condition is not there yet — the child may already be done (k3d condition lag).
+          // A tail read that fails (Pod pending · init container) or lacks this launch's marker changes nothing.
+          if (markerWait && markerToken) {
+            const seen = markerWait.podResultMarkerRc(kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child', '--tail=2']), markerToken);
+            if (seen !== null) {
+              releaseAdmission?.observed?.();
+              state = seen === 0 ? 'complete' : 'failed';
+              // The child's own rc (the Pod's terminated state may lag like the condition) — exit-code paths read it as before.
+              if (seen !== 0) containerExitCode = seen;
+              debug.log('self-implement.pod', 'result-marker-early', { job: name, waitedMs: Date.now() - waitStartedAt, rc: seen });
+              break;
+            }
           }
           if (releaseAdmission?.observed) {
             const podPhase = kubectl(['-n', namespace, 'get', 'pods', '-l', `job-name=${name}`, '-o', 'jsonpath={.items[*].status.phase}']);
@@ -2086,6 +2195,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         } catch (error) { logTailReason = error instanceof Error ? error.message : String(error); }
         // METER-POD-ROLLUP-GAP — 삭제된 abort Job 의 로그는 이후 못 읽는다: abort 때 거둔 사본으로 대신한다.
         if (!logs && abortLogs) logs = abortLogs;
+        // TA-POD-WARMBOOT-PARITY: the marker line is not child output — remove it so the last-line result parse sees the same bytes.
+        if (markerWait && markerToken && logs) logs = markerWait.stripPodResultMarker(logs, markerToken);
         let ledgerReason = '';
         let ledgerCollected = false;
         const collection = collectFullLogs('ledger-collect-incomplete', follower.owned ? new Set([liveChildRunId]) : undefined, (event, data) => {
@@ -2270,6 +2381,12 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
               // POD-NORESULT: a parsed result row without error text is not a missing result line (UX 10-07 01:01: 28 of 28 exit-2 Jobs printed one).
               childError: childFailure?.error ?? (disposition?.stage ? 'result-without-error' : 'no-result-line') } : {}) },
           state === 'failed' && !oomKilled && failedReason !== 'DeadlineExceeded' ? { compact: { stringMax: 500 } } : undefined);
+        // POD-LIFECYCLE-STAGES: one `pod.lifecycle stages` line — clone · mirror · run come from the Pod's own
+        //   `ELANOUS_POD_STAGE` markers (SI-POD-STAGE-MARKERS), read from the «full» Job log only. ⛔ No `--tail=400` fallback:
+        //   a tail can lose the real `run start` and pair a child-printed look-alike with the real `run end` (review mf) —
+        //   when the full log cannot be read, every stage stays «missing».
+        emitPodLifecycle(siTaskPodLifecycleEvent({ runId: liveChildRunId, podJob: name, host: member?.context ?? null, watchStart: waitStartedAt, watchEnd: Date.now(),
+          podStages: collection.podStages ?? {}, outcome: oomKilled ? 'oom' : state }));
         if (oomKilled && reattach && !oomRetried && (!reattachedMemoryLimit || memoryGi(reattachedMemoryLimit) === null)) {
           return { exitCode: 1, output: '', error: { code: 'pod-memory-unavailable', message: `Job ${name} 실제 메모리 한도를 확인할 수 없다` } };
         }

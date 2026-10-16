@@ -593,6 +593,314 @@ test('bad seats, body, kind, cursor, limit and future ack exit 2 with one-line e
   finally { store.close(); }
 });
 
+test('TA status, memo and stop use the card run and link exactly one reply to each message', async () => {
+  const sent: Array<{ space: string; message: unknown }> = [];
+  const card = { id: 'ta-20261015-a1b2c3', status: 'launched' as const, runId: 'run-card-1',
+    text: 'task', createdAt: new Date().toISOString(), history: [] };
+  const f = fixture('', () => ({
+    readCard: id => id === card.id ? card : undefined,
+    podFragmentsForRun: () => [{ spaceId: 'pod-card-1', runId: card.runId, context: 'ctx', namespace: 'ns', job: 'job', inboxDir: '/tmp/inbox' }],
+    sendPod: (space, message) => { sent.push({ space, message }); return { job: 'job' }; },
+  }));
+  await f.run('ask', 'TA', `status ${card.id}?`, '--from', 'OP', '--wait', '0', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ from: 'TA', to: 'OP', replyTo: 1, body: `${card.id}: launched · run ${card.runId}` });
+  await f.run('post', `memo ${card.id} please check the build`, '--from', 'OP', '--to', 'TA');
+  await f.run('post', `stop ${card.id}`, '--from', 'OP', '--to', 'TA');
+  const store = f.store();
+  try {
+    const messages = store.list('TA');
+    expect(messages).toHaveLength(3);
+    for (const message of messages) expect(store.listReplies(message.id)).toHaveLength(1);
+    expect(store.listReplies(messages[1]!.id)[0]!.body).toContain('감독 메모 기록');
+    expect(store.listReplies(messages[2]!.id)[0]!.body).toContain('soft stop 요청');
+  } finally { store.close(); }
+  expect(sent).toEqual([
+    { space: 'pod-card-1', message: { memo: { version: 1, kind: 'supervisor', urgency: 'normal', body: 'please check the build' } } },
+    { space: 'pod-card-1', message: { stop: true } },
+  ]);
+  expect(f.exits).toEqual([]);
+});
+
+test('TA retries of the same origin-key request do not send a second memo or reply', async () => {
+  const sent: unknown[] = [];
+  const card = { id: 'ta-20261015-a1b2c3', status: 'launched' as const, runId: 'run-card-1',
+    text: 'task', createdAt: new Date().toISOString(), history: [] };
+  const f = fixture('', () => ({
+    readCard: id => id === card.id ? card : undefined,
+    podFragmentsForRun: () => [{ spaceId: 'pod-card-1', runId: card.runId, context: 'ctx', namespace: 'ns', job: 'job', inboxDir: '/tmp/inbox' }],
+    sendPod: (_space, message) => { sent.push(message); return { job: 'job' }; },
+  }));
+  const args = ['post', `memo ${card.id} once only`, '--from', 'OP', '--to', 'TA', '--origin-key', 'coord:7:TA'];
+  await f.run(...args);
+  await f.run(...args);
+  const store = f.store();
+  try {
+    expect(store.list('TA')).toHaveLength(1);
+    expect(store.listReplies(1)).toHaveLength(1);
+  } finally { store.close(); }
+  expect(sent).toEqual([{ memo: { version: 1, kind: 'supervisor', urgency: 'normal', body: 'once only' } }]);
+});
+
+test('TA does not resend an ambiguous memo when the previous sender died', async () => {
+  const sent: unknown[] = [];
+  const card = { id: 'ta-20261015-a1b2c3', status: 'launched' as const, runId: 'run-card-1',
+    text: 'task', createdAt: new Date().toISOString(), history: [] };
+  const f = fixture('', () => ({
+    readCard: () => undefined,
+    podFragmentsForRun: () => [{ spaceId: 'pod-card-1', runId: card.runId, context: 'ctx', namespace: 'ns', job: 'job', inboxDir: '/tmp/inbox' }],
+    sendPod: (_space, message) => { sent.push(message); return { job: 'job' }; },
+  }));
+  const key = 'coord:77:TA';
+  const store = f.store();
+  try {
+    const request = store.appendWithProvenance({ from: 'OP', to: 'TA', body: `memo ${card.id} check build` }, key);
+    store.post({ from: 'TA', to: 'OP', body: '전달 여부 미확인 — 런 인박스를 확인하세요', replyTo: request.id });
+    store.setTaDeliveryStatus(request.id, 'pending');
+    store.claimTaDelivery(request.id);
+  } finally { store.close(); }
+  await f.run('post', `memo ${card.id} check build`, '--from', 'OP', '--to', 'TA', '--origin-key', key);
+  expect(sent).toEqual([]);
+  const after = f.store();
+  try {
+    expect(after.list('TA')).toHaveLength(1);
+    expect(after.listReplies(1)).toHaveLength(1);
+    expect(after.listReplies(1)[0]!.body).toContain('전달 여부 미확인');
+  } finally { after.close(); }
+});
+
+test('TA keeps a claim when DB settlement fails after Pod publication', async () => {
+  let sent = 0;
+  const card = { id: 'ta-20261015-a1b2c3', status: 'launched' as const, runId: 'run-card-1',
+    text: 'task', createdAt: new Date().toISOString(), history: [] };
+  const f = fixture('', ({ path }) => ({
+    openStore: () => {
+      const store = new MsgStore(path);
+      store.settleTaDelivery = () => { throw new Error('settlement interrupted'); };
+      return store;
+    },
+    readCard: id => id === card.id ? card : undefined,
+    podFragmentsForRun: () => [{ spaceId: 'pod-card-1', runId: card.runId, context: 'ctx', namespace: 'ns', job: 'job', inboxDir: '/tmp/inbox' }],
+    sendPod: () => { sent++; return { job: 'job' }; },
+  }));
+  const args = ['post', `memo ${card.id} once only`, '--from', 'OP', '--to', 'TA', '--origin-key', 'coord:78:TA'];
+  await f.run(...args);
+  await f.run(...args);
+  const store = f.store();
+  try {
+    expect(store.list('TA')).toHaveLength(1);
+    expect(store.listReplies(1)).toHaveLength(1);
+    expect(store.listReplies(1)[0]!.body).toContain('전달 여부 미확인');
+    expect(store.taDeliveryStatus(1)).toBe('pending');
+    expect(store.taDeliveryClaimState(1)).toBe('held');
+  } finally { store.close(); }
+  expect(sent).toBe(1);
+});
+
+test('TA stops automatic Pod memo retry when transport failure leaves publication uncertain', async () => {
+  let sent = 0;
+  const card = { id: 'ta-20261015-a1b2c3', status: 'launched' as const, runId: 'run-card-1',
+    text: 'task', createdAt: new Date().toISOString(), history: [] };
+  const f = fixture('', ({ path }) => ({
+    readCard: id => id === card.id ? card : undefined,
+    podFragmentsForRun: () => [{ spaceId: 'pod-card-1', runId: card.runId, context: 'ctx', namespace: 'ns', job: 'job', inboxDir: '/tmp/inbox' }],
+    sendPod: () => {
+      const before = new MsgStore(path);
+      try { expect(before.listReplies(1)[0]!.body).toContain('런 인박스를 확인하세요'); }
+      finally { before.close(); }
+      sent++;
+      throw new Error('Pod publication uncertain');
+    },
+  }));
+  const args = ['post', `memo ${card.id} once only`, '--from', 'OP', '--to', 'TA', '--origin-key', 'coord:8:TA'];
+  await f.run(...args);
+  const failed = f.store();
+  try {
+    expect(failed.taDeliveryStatus(1)).toBe('pending');
+    expect(failed.listReplies(1)[0]!.body).toContain('전달 여부 미확인');
+  } finally { failed.close(); }
+  await f.run(...args);
+  await f.run(...args);
+  const store = f.store();
+  try {
+    expect(store.list('TA')).toHaveLength(1);
+    expect(store.listReplies(1)).toHaveLength(1);
+    expect(store.taDeliveryStatus(1)).toBe('pending');
+    expect(store.listReplies(1)[0]!.body).toContain('전달 여부 미확인');
+  } finally { store.close(); }
+  expect(sent).toBe(1);
+});
+
+test('TA leaves a local memo transport error uncertain without a second send', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-cli-ta-memo-retry-'));
+  dirs.push(dir);
+  const { inspectControlInbox } = await import('../harness/control-inbox.js');
+  const card = { id: 'ta-20261015-a1b2c3', status: 'launched' as const, runId: 'run-card-1',
+    text: 'task', createdAt: new Date().toISOString(), history: [] };
+  let attempts = 0;
+  const f = fixture('', () => ({
+    readCard: id => id === card.id ? card : undefined,
+    podFragmentsForRun: () => [],
+    runScreen: () => ({ screenKey: 'local-card-space', logStoreStatus: 'read' }) as ReturnType<NonNullable<MsgCliDeps['runScreen']>>,
+    screenAlive: space => space === 'local-card-space',
+    sendMemo: () => { attempts++; throw new Error('memo publication uncertain'); },
+  }));
+  const args = ['post', `memo ${card.id} check build`, '--from', 'OP', '--to', 'TA', '--origin-key', 'coord:10:TA'];
+  await f.run(...args);
+  expect(inspectControlInbox('local-card-space', { env: { ELANOUS_STATE_DIR: dir } }).memoCount).toBe(0);
+  await f.run(...args);
+  await f.run(...args);
+  expect(attempts).toBe(1);
+  expect(inspectControlInbox('local-card-space', { env: { ELANOUS_STATE_DIR: dir } }).memoCount).toBe(0);
+  const store = f.store();
+  try {
+    expect(store.list('TA')).toHaveLength(1);
+    expect(store.listReplies(1)).toHaveLength(1);
+    expect(store.taDeliveryStatus(1)).toBe('pending');
+    expect(store.listReplies(1)[0]!.body).toContain('전달 여부 미확인');
+  } finally { store.close(); }
+});
+
+test('TA leaves a failed stop send uncertain without repeating it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-cli-ta-stop-retry-'));
+  dirs.push(dir);
+  const { inspectControlInbox } = await import('../harness/control-inbox.js');
+  const card = { id: 'ta-20261015-a1b2c3', status: 'launched' as const, runId: 'run-card-1',
+    text: 'task', createdAt: new Date().toISOString(), history: [] };
+  let attempts = 0;
+  const f = fixture('', () => ({
+    readCard: id => id === card.id ? card : undefined,
+    podFragmentsForRun: () => [],
+    runScreen: () => ({ screenKey: 'local-card-space', logStoreStatus: 'read' }) as ReturnType<NonNullable<MsgCliDeps['runScreen']>>,
+    screenAlive: space => space === 'local-card-space',
+    sendStop: () => { attempts++; throw new Error('stop publication uncertain'); },
+  }));
+  const args = ['post', `stop ${card.id}`, '--from', 'OP', '--to', 'TA', '--origin-key', 'coord:9:TA'];
+  await f.run(...args);
+  expect(inspectControlInbox('local-card-space', { env: { ELANOUS_STATE_DIR: dir } }).stop).toBe(false);
+  await f.run(...args);
+  await f.run(...args);
+  expect(attempts).toBe(1);
+  expect(inspectControlInbox('local-card-space', { env: { ELANOUS_STATE_DIR: dir } }).stop).toBe(false);
+  const store = f.store();
+  try {
+    expect(store.listReplies(1)).toHaveLength(1);
+    expect(store.taDeliveryStatus(1)).toBe('pending');
+    expect(store.listReplies(1)[0]!.body).toContain('전달 여부 미확인');
+  } finally { store.close(); }
+});
+
+test('TA local run inbox receives exactly one memo and stop; invalid card never controls a run', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-cli-ta-inbox-'));
+  dirs.push(dir);
+  const { inspectControlInbox } = await import('../harness/control-inbox.js');
+  const card = { id: 'ta-20261015-a1b2c3', status: 'launched' as const, runId: 'run-card-1',
+    text: 'task', createdAt: new Date().toISOString(), history: [] };
+  const f = fixture('', () => ({
+    readCard: id => id === card.id ? card : undefined,
+    podFragmentsForRun: () => [],
+    runScreen: () => ({ screenKey: 'local-card-space', logStoreStatus: 'read' }) as ReturnType<NonNullable<MsgCliDeps['runScreen']>>,
+    screenAlive: space => space === 'local-card-space',
+    sendMemo: (space, memo) => {
+      const { enqueueControlMemo } = require('../harness/control-inbox.js') as typeof import('../harness/control-inbox.js');
+      return enqueueControlMemo(space, memo, { env: { ELANOUS_STATE_DIR: dir } });
+    },
+    sendStop: space => {
+      const { enqueueSoftStop } = require('../harness/control-inbox.js') as typeof import('../harness/control-inbox.js');
+      enqueueSoftStop(space, { env: { ELANOUS_STATE_DIR: dir } });
+    },
+  }));
+  await f.run('post', `memo ${card.id} check next step`, '--from', 'OP', '--to', 'TA');
+  await f.run('post', `stop ${card.id}`, '--from', 'OP', '--to', 'TA');
+  expect(inspectControlInbox('local-card-space', { env: { ELANOUS_STATE_DIR: dir } })).toMatchObject({ memoCount: 1, stop: true });
+  await f.run('post', 'stop ta-20261015-deadbeef', '--from', 'OP', '--to', 'TA');
+  const store = f.store();
+  try {
+    const requests = store.list('TA');
+    expect(requests).toHaveLength(3);
+    expect(store.listReplies(requests[0]!.id)).toHaveLength(1);
+    expect(store.listReplies(requests[1]!.id)).toHaveLength(1);
+    expect(store.listReplies(requests[2]!.id)[0]!.body).toContain('카드 없음');
+  } finally { store.close(); }
+  expect(inspectControlInbox('local-card-space', { env: { ELANOUS_STATE_DIR: dir } })).toMatchObject({ memoCount: 1, stop: true });
+  const { drainControlInbox, readSoftStopRequest } = await import('../harness/control-inbox.js');
+  const inbox = drainControlInbox('local-card-space', { env: { ELANOUS_STATE_DIR: dir } });
+  expect(inbox).toMatchObject({ stop: true, receivedCount: 1, memos: ['check next step'] });
+  expect(readSoftStopRequest('local-card-space', { env: { ELANOUS_STATE_DIR: dir } })?.version).toBe(1);
+});
+
+test('a running card run honors TA CLI stop before its gate and records its terminal stage', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-cli-ta-run-'));
+  dirs.push(dir);
+  const oldState = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = dir;
+  try {
+    const { runSelfImplement } = await import('../self-implement/orchestrator.js');
+    const { seams } = await import('../self-implement/test-seams.js');
+    const card = { id: 'ta-20261015-a1b2c3', status: 'launched' as const, runId: 'run-card-1',
+      text: 'task', createdAt: new Date().toISOString(), history: [] };
+    const f = fixture('', () => ({
+      readCard: id => id === card.id ? card : undefined,
+      podFragmentsForRun: () => [],
+      runScreen: () => ({ screenKey: 'local-card-space', logStoreStatus: 'read' }) as ReturnType<NonNullable<MsgCliDeps['runScreen']>>,
+      screenAlive: space => space === 'local-card-space',
+    }));
+    const { appendRunLedgerEntry, loadRunLedger, runLedgerDir } = await import('../self-implement/run-ledger.js');
+    let gateCalls = 0;
+    const result = await runSelfImplement({
+      feature: 'TA stop running card', runId: card.runId,
+      seams: seams({
+        createWorktree: async ({ branch, base }) => ({ path: '/wt/local-card-space', branch, base }),
+        implement: async () => {
+          await f.run('post', `stop ${card.id}`, '--from', 'OP', '--to', 'TA');
+          expect(f.exits).toEqual([]);
+          return { ok: true, summary: 'implementation completed' };
+        },
+        gate: async () => { gateCalls++; return { passed: true, log: 'ok' }; },
+        writeRunLedger: entry => appendRunLedgerEntry(entry, runLedgerDir(dir)),
+      }),
+    });
+    expect(result.stage).toBe('soft-stopped');
+    expect(loadRunLedger(card.runId, runLedgerDir(dir))?.map(entry => entry.event)).toContain('soft-stop-honored');
+    expect(gateCalls).toBe(0);
+    const store = f.store();
+    try { expect(store.listReplies(store.list('TA')[0]!.id)).toHaveLength(1); }
+    finally { store.close(); }
+  } finally {
+    if (oldState === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = oldState;
+  }
+});
+
+test('a failed TA reply insert cannot dispatch a memo; retry of the same origin delivers once', async () => {
+  const sent: unknown[] = [];
+  let failReply = true;
+  const card = { id: 'ta-20261015-a1b2c3', status: 'launched' as const, runId: 'run-card-1',
+    text: 'task', createdAt: new Date().toISOString(), history: [] };
+  const f = fixture('', ({ path }) => ({
+    openStore: () => {
+      const store = new MsgStore(path);
+      const post = store.post.bind(store);
+      store.post = input => {
+        if (failReply && input.from === 'TA') { failReply = false; throw new Error('reply insert failed'); }
+        return post(input);
+      };
+      return store;
+    },
+    readCard: id => id === card.id ? card : undefined,
+    podFragmentsForRun: () => [{ spaceId: 'pod-card-1', runId: card.runId, context: 'ctx', namespace: 'ns', job: 'job', inboxDir: '/tmp/inbox' }],
+    sendPod: (_space, message) => { sent.push(message); return { job: 'job' }; },
+  }));
+  const args = ['post', `memo ${card.id} once only`, '--from', 'OP', '--to', 'TA', '--origin-key', 'coord:7:TA'];
+  await f.run(...args);
+  expect(f.stderr.at(-1)).toBe('msg: reply insert failed');
+  expect(sent).toHaveLength(0);
+  await f.run(...args);
+  const store = f.store();
+  try { expect(store.listReplies(1)).toHaveLength(1); }
+  finally { store.close(); }
+  expect(sent).toHaveLength(1);
+});
+
 test('human line puts a kind emoji right before the unchanged [kind] text; unknown or missing kind stays as before', () => {
   const base: Message = { id: 7, createdAt: '2026-10-15T00:00:00.000Z', from: 'OP', to: 'MK', body: 'hi' };
   expect(formatMessage({ ...base, kind: 'coord' })).toBe('#7 2026-10-15T00:00:00.000Z OP → MK 🤝[coord]: hi');

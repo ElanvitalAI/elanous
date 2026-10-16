@@ -2,15 +2,127 @@ import { afterEach, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { applyTraffic, runTrafficTick, seatOfTree, trafficLine, trafficTick, withFinishAdvice, type TrafficProcess } from './traffic.js';
+import { applyTraffic, isLaunchEligible, runTrafficTick, seatOfTree, trafficLine, trafficTick, withFinishAdvice, type TrafficProcess } from './traffic.js';
 import { collectAuthorDepth, type AuthorCell } from './author-depth.js';
 import { AuthorLedger } from './author-ledger.js';
 import * as harnessQueue from '../../harness/harness-queue.js';
 import { ORCHESTRATOR_DEFAULTS, buildUserConfig, saveUserConfig } from '../../user-config.js';
+import { debug } from '../../debug/log.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 
 const roots: string[] = [];
 function temp(): string { const root = mkdtempSync(join(tmpdir(), 'orch-traffic-')); roots.push(root); return root; }
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+
+test('traffic dispatch records supply and capacity without changing request rows', () => {
+  const root = temp();
+  const at = new Date('2026-10-05T00:00:00Z');
+  const cell = { id: 'MK-1', title: 'one', owner: 'MK', status: 'yellow' as const };
+  const row = { nextCell: cell, running: 0, launchCap: 1 };
+  expect(isLaunchEligible(row)).toBe(true);
+  expect(isLaunchEligible({ ...row, nextCell: null })).toBe(false);
+  expect(isLaunchEligible({ ...row, launchCap: 0 })).toBe(false);
+  expect(isLaunchEligible(row, 'cap-deferred')).toBe(false);
+  const input = { now: at, processes: [] as TrafficProcess[], caps: ORCHESTRATOR_DEFAULTS.seatCaps,
+    openCells: [cell], mode: 'shadow' as const, applyDeps: { root, log: () => {} },
+    finishDeps: { listStarts: () => ({ starts: [], unreadable: [] }), runGh: () => '[]' },
+    collectAuthor: () => ({ seats: [], unreadable: [], receiptCounts: { held: 0, queuedForAuthor: 0 } }),
+  };
+  runTrafficTick(input);
+  runTrafficTick(input);
+  const path = join(root, 'orchestrator', 'dispatch-ledger.jsonl');
+  const rows = readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({ source: 'traffic', supply: 1, capacity: expect.any(Number), skipped: { 'no-supply': 3, 'not-idle': 1 } });
+  expect(rows[0].capacity).toEqual(24);
+  expect(existsSync(join(root, 'seat-requests'))).toBe(false);
+});
+
+test('a corrupt dispatch shadow ledger cannot change traffic decisions, queue count or exit status', () => {
+  const root = temp();
+  const path = join(root, 'orchestrator', 'dispatch-ledger.jsonl');
+  mkdirSync(join(root, 'orchestrator'));
+  writeFileSync(path, '{broken\n');
+  const now = new Date('2026-10-05T00:00:00Z');
+  const input = { now, processes: [] as TrafficProcess[], caps: ORCHESTRATOR_DEFAULTS.seatCaps,
+    openCells: [] as Array<{ id: string; title: string; owner: string; status: 'yellow' }>, mode: 'shadow' as const,
+    applyDeps: { root, log: () => {} },
+    finishDeps: { listStarts: () => ({ starts: [], unreadable: [] }), runGh: () => '[]' },
+    collectAuthor: () => ({ seats: [], unreadable: [], receiptCounts: { held: 0, queuedForAuthor: 0 } }),
+  };
+  const logs = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const exitCode = process.exitCode;
+    const broken = runTrafficTick(input);
+    expect(process.exitCode).toBe(exitCode);
+    expect(broken.queued).toBe(0);
+    expect(broken.authorShadow?.status).toBe('complete');
+    const rows = readFileSync(path, 'utf8').trim().split('\n');
+    expect(rows[0]).toBe('{broken');
+    expect(JSON.parse(rows[1]!)).toMatchObject({ source: 'traffic', mode: 'shadow', runId: expect.any(String) });
+    runTrafficTick(input);
+    expect(readFileSync(path, 'utf8').trim().split('\n')).toHaveLength(2); // valid runId is not appended twice
+    expect(existsSync(join(root, 'seat-requests', 'requests.jsonl'))).toBe(false);
+    expect(logs).toHaveBeenCalledWith('loop.orchestrator', 'dispatch-cycle-malformed', expect.objectContaining({ path }));
+    expect(logs).not.toHaveBeenCalledWith('loop.orchestrator', 'dispatch-cycle-failed', expect.anything(), expect.anything());
+    const healthyRoot = temp();
+    const healthy = runTrafficTick({ ...input, applyDeps: { root: healthyRoot, log: () => {} } });
+    expect(broken.result).toEqual(healthy.result);
+    expect(broken.queued).toBe(healthy.queued);
+  } finally { logs.mockRestore(); }
+});
+
+test('torn final dispatch row is separated, valid rows deduplicate, and later cycles keep recording', () => {
+  const root = temp();
+  const path = join(root, 'orchestrator', 'dispatch-ledger.jsonl');
+  mkdirSync(join(root, 'orchestrator'));
+  writeFileSync(path, '{torn');
+  const input = { now: new Date('2026-10-05T00:00:00Z'), processes: [] as TrafficProcess[],
+    caps: ORCHESTRATOR_DEFAULTS.seatCaps, openCells: [], mode: 'shadow' as const,
+    applyDeps: { root, log: () => {} },
+    finishDeps: { listStarts: () => ({ starts: [], unreadable: [] }), runGh: () => '[]' },
+    collectAuthor: () => ({ seats: [], unreadable: [], receiptCounts: { held: 0, queuedForAuthor: 0 } }),
+  };
+  runTrafficTick(input);
+  runTrafficTick(input); // same runId deduplicates despite the malformed row
+  runTrafficTick({ ...input, now: new Date('2026-10-05T01:00:00Z') });
+  const lines = readFileSync(path, 'utf8').trim().split('\n');
+  expect(lines[0]).toBe('{torn');
+  expect(lines.slice(1).map(line => JSON.parse(line).runId)).toHaveLength(2);
+  expect(new Set(lines.slice(1).map(line => JSON.parse(line).runId)).size).toBe(2);
+});
+
+test('live idle seat with a next cell retains its request even when its borrowed-out launch cap is zero', () => {
+  const root = temp();
+  const now = new Date('2026-10-05T00:00:00Z');
+  const cell = { id: 'OP-1', title: 'one', owner: 'OP', status: 'yellow' as const };
+  const result = trafficTick({ now, processes: [], caps: ORCHESTRATOR_DEFAULTS.seatCaps, openCells: [cell] });
+  const op = result.seats.find(row => row.seat === 'OP')!;
+  const borrowedOut = { ...result, seats: [{ ...op, idle: true, nextCell: cell, running: 0, launchCap: 0, lent: op.cap }] };
+  expect(isLaunchEligible(borrowedOut.seats[0]!)).toBe(false);
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  expect(applyTraffic(borrowedOut, { mode: 'live', root, log: (_category, event, data) => events.push({ event, data }) })).toBe(1);
+  expect(JSON.parse(readFileSync(join(root, 'seat-requests', 'requests.jsonl'), 'utf8')))
+    .toMatchObject({ key: 'orch-traffic:OP:2026-10-05T00', receiptId: 'orch-traffic:OP:2026-10-05T00', source: 'orchestrator-traffic' });
+  expect(events.find(row => row.event === 'exchange')?.data.outcome).toBe('queued');
+});
+
+test('traffic resolves one implicit root for its request and dispatch journals', () => {
+  const root = temp();
+  setElanousConfigDir(root);
+  try {
+    const now = new Date('2026-10-05T00:00:00Z');
+    const { queued } = runTrafficTick({ now, processes: [], caps: ORCHESTRATOR_DEFAULTS.seatCaps,
+      openCells: [{ id: 'MK-1', title: 'one', owner: 'MK', status: 'yellow' }], mode: 'shadow',
+      finishDeps: { listStarts: () => ({ starts: [], unreadable: [] }), runGh: () => '[]' },
+      collectAuthor: () => ({ seats: [], unreadable: [], receiptCounts: { held: 0, queuedForAuthor: 0 } }),
+      applyDeps: { log: () => {} } });
+    expect(queued).toBe(0);
+    expect(JSON.parse(readFileSync(join(root, 'orchestrator', 'dispatch-ledger.jsonl'), 'utf8')))
+      .toMatchObject({ source: 'traffic', supply: 1, mode: 'shadow' });
+    expect(existsSync(join(root, 'seat-requests', 'requests.jsonl'))).toBe(false);
+  } finally { resetElanousConfigDir(); }
+});
 
 test('marker walks up to git root, overrides configured trees, and unknown trees stay unassigned', () => {
   const root = temp();
@@ -104,7 +216,7 @@ test('config defaults and explicit seat trees, caps, mode survive parsing and sa
   expect(buildUserConfig(path).loops?.orchestrator).toEqual(ORCHESTRATOR_DEFAULTS);
   writeFileSync(path, JSON.stringify({ loops: { orchestrator: { seatTrees: { MK: ['/tmp/mk', 42], UX: ['relative'] }, seatCaps: { TC: 4, MK: 3, UX: -1 }, trafficMode: 'live' } } }));
   const cfg = buildUserConfig(path);
-  expect(cfg.loops?.orchestrator).toEqual({ mode: 'shadow', seatTrees: { MK: ['/tmp/mk'], UX: [] }, seatCaps: { TC: 4, MK: 3, UX: 6, OP: 4 }, trafficMode: 'live', idleRequest: 'shadow', finishGate: 'shadow' });
+  expect(cfg.loops?.orchestrator).toEqual({ mode: 'shadow', seatTrees: { MK: ['/tmp/mk'], UX: [] }, seatCaps: { TC: 4, MK: 3, UX: 6, OP: 4 }, dispatch: ORCHESTRATOR_DEFAULTS.dispatch, trafficMode: 'live', idleRequest: 'shadow', finishGate: 'shadow' });
   saveUserConfig(cfg, path);
   expect(buildUserConfig(path).loops?.orchestrator).toEqual(cfg.loops?.orchestrator);
   writeFileSync(path, JSON.stringify({ loops: { orchestrator: { idleRequest: 'off' } } }));

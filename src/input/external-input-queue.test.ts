@@ -6,6 +6,7 @@ import {
   STALE_TURN_SUSPECTED_MS,
   parseExternalTextLine,
   renderExternalInputQueueNotice,
+  isExternalStopCommand,
   withExternalKeyCommand,
   type ExternalInputHost,
 } from './external-input-queue.js';
@@ -273,5 +274,100 @@ describe('renderExternalInputQueueNotice', () => {
     expect(renderExternalInputQueueNotice([])).toBeNull();
     expect(renderExternalInputQueueNotice([{ text: '깨어나라', at: 0 }]))
       .toBe('⤵ 외부 입력 1건 대기 · "깨어나라" · 턴이 끝나고 입력창이 비면 별도 메시지로 전송');
+  });
+});
+
+describe('외부 /stop — 대기열 건너뛰기 (TUI-STOP-INPUT-BYPASS · #68)', () => {
+  function stopHost(init: { turn?: boolean; stopOk?: boolean } = {}) {
+    const f = fakeHost({ turn: init.turn ?? true });
+    const stops: number[] = [];
+    const results: string[] = [];
+    f.host.requestStop = () => { stops.push(1); return init.stopOk ?? true; };
+    f.host.onExternalStop = (r) => { results.push(r); };
+    return { ...f, stops, results };
+  }
+  function stopQueue() {
+    const inputLogs: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const q = createExternalInputQueue({
+      now: () => 1000,
+      schedule: () => () => {},
+      log: () => {},
+      logInput: (event, data) => inputLogs.push({ event, data }),
+    });
+    return { q, inputLogs };
+  }
+
+  test('정확히 /stop·/esc 만 stop 명령이다', () => {
+    expect(isExternalStopCommand('/stop')).toBe(true);
+    expect(isExternalStopCommand('/esc')).toBe(true);
+    expect(isExternalStopCommand(' /stop')).toBe(false);
+    expect(isExternalStopCommand('/stop now')).toBe(false);
+    expect(isExternalStopCommand('/STOP')).toBe(false);
+    expect(isExternalStopCommand('stop')).toBe(false);
+  });
+
+  test('턴 중 /stop → 대기열을 건너뛰고 escGate 1회 · 앞선 대기 항목 순서 유지', () => {
+    const { q, inputLogs } = stopQueue();
+    const h = stopHost({ turn: true });
+    q.register(h.host);
+    expect(q.route('첫째\r')).toBe('queued');
+    expect(q.route('둘째\r')).toBe('queued');
+    expect(q.route('/stop\r')).toBe('stopped');
+    expect(h.stops.length).toBe(1);
+    expect(h.results).toEqual(['stopped']);
+    expect(q.pending().map((i) => i.text)).toEqual(['첫째', '둘째']);
+    expect(h.submitted).toEqual([]);
+    expect(inputLogs).toEqual([{ event: 'external-stop', data: { hadTurn: true, stopped: true, command: '/stop', pending: 2 } }]);
+    // 턴이 끝나면 일반 항목은 종전대로 FIFO 로 나간다.
+    h.state.turn = false;
+    expect(q.pump()).toBe(true);
+    expect(q.pump()).toBe(true);
+    expect(h.submitted.map((s) => s.text)).toEqual(['첫째', '둘째']);
+  });
+
+  test('Enter 없는 /esc 도 턴 중이면 멈춘다(거부되지 않는다)', () => {
+    const { q } = stopQueue();
+    const h = stopHost({ turn: true });
+    q.register(h.host);
+    expect(q.route('/esc')).toBe('stopped');
+    expect(h.stops.length).toBe(1);
+  });
+
+  test('턴이 없으면 /stop 은 무시 ⊕ 이벤트 ⊕ 안내(throw → IPC rc≠0) · 사용자 composer 에 안 들어간다', () => {
+    const { q, inputLogs } = stopQueue();
+    const h = stopHost({ turn: false });
+    q.register(h.host);
+    expect(() => q.route('/stop\r')).toThrow('tui-stop-no-active-turn');
+    expect(h.stops.length).toBe(0);
+    expect(h.submitted).toEqual([]);
+    expect(q.pending()).toEqual([]);
+    expect(h.results).toEqual(['no-turn']);
+    expect(inputLogs[0]).toEqual({ event: 'external-stop', data: { hadTurn: false, stopped: false, command: '/stop', pending: 0 } });
+  });
+
+  test('턴 중인데 중단 경로가 없으면 undelivered 로 알린다', () => {
+    const { q } = stopQueue();
+    const h = stopHost({ turn: true, stopOk: false });
+    q.register(h.host);
+    expect(() => q.route('/stop\r')).toThrow('tui-stop-undelivered');
+    expect(h.results).toEqual(['failed']);
+  });
+
+  test('일반 외부 입력은 여전히 대기 · /stop 비슷한 글도 일반 글이다', () => {
+    const { q } = stopQueue();
+    const h = stopHost({ turn: true });
+    q.register(h.host);
+    expect(q.route('그만 멈춰\r')).toBe('queued');
+    expect(q.route('/stop now\r')).toBe('queued');
+    expect(h.stops.length).toBe(0);
+    expect(q.pending().map((i) => i.text)).toEqual(['그만 멈춰', '/stop now']);
+  });
+
+  test('pty key(withExternalKeyCommand) 안의 /stop 은 키로 통과 — stop 을 안 탄다', () => {
+    const { q } = stopQueue();
+    const h = stopHost({ turn: true });
+    q.register(h.host);
+    expect(withExternalKeyCommand(() => q.route('/stop'))).toBe('passthrough');
+    expect(h.stops.length).toBe(0);
   });
 });

@@ -453,6 +453,22 @@ export function inferHotPaths(text: string): string[] {
   return [...new Set(matches)];
 }
 
+/** A child without implementation targets inherits the parent's explicit target line and ask. */
+export function inheritDecomposedTargetPaths(parentFeature: string, goals: SelfDevGoal[]): SelfDevGoal[] {
+  const declaredTargets = (feature: string) => [...new Set(feature.split(/\r?\n/)
+    .filter((line) => /^\s*(?:[-*]\s*)?대상 경로\s*:/.test(line))
+    .flatMap(inferHotPaths))];
+  const parentTargets = declaredTargets(parentFeature);
+  if (!parentTargets.length) return goals;
+  return goals.map((goal) => {
+    // hotPaths also contains inferred references; only an explicit target line establishes child scope.
+    const own = declaredTargets(goal.feature ?? '');
+    if (own.length) return goal;
+    return { ...goal, hotPaths: [...new Set([...(goal.hotPaths ?? []), ...parentTargets])],
+      feature: `${goal.feature}\n대상 경로: ${parentTargets.join(' · ')}` };
+  });
+}
+
 /** Tolerant JSON extraction — LLM may wrap in a fence or prose. */
 function extractJsonObject(raw: string): unknown | null {
   const trimmed = raw.trim();
@@ -525,6 +541,7 @@ async function finalizeDecomposition(
   arcHint: number | undefined,
   foldedRegistration = 0,
 ): Promise<SelfDevDecomposition> {
+  goals = inheritDecomposedTargetPaths(feature, goals);
   if (arcHint === undefined || goals.length === 0) return observeDecomposition(goals, decomposition, undefined, opts.observation, opts.pathGrounding, foldedRegistration);
   try {
     const arcLlm = opts.arcLlm ?? opts.llm ?? (await defaultDecomposeLlm(opts.model));

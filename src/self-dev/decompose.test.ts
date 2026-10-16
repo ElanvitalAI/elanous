@@ -137,6 +137,19 @@ describe('parseSelfDevDecomposition', () => {
 });
 
 describe('foldRegistrationOnlyGoals', () => {
+  test('a decomposed child without paths inherits the parent card target paths in its ask and hot path fence', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/alpha.ts · src/beta.ts\nImplement both units', {
+      llm: async () => JSON.stringify({ subtasks: [{ id: 'a', feature: 'Implement the first unit' },
+        { id: 'b', feature: '대상 경로: src/beta.ts\nEdit src/beta.ts', hotPaths: ['src/beta.ts'] },
+        { id: 'c', feature: 'Read docs/goals/GOAL-parent.md and docs/reports/context.md, then implement the missing unit',
+          hotPaths: ['docs/goals/GOAL-parent.md', 'docs/reports/context.md'] }] }),
+    });
+    expect(result.goals[0]).toMatchObject({ hotPaths: ['src/alpha.ts', 'src/beta.ts'],
+      feature: 'Implement the first unit\n대상 경로: src/alpha.ts · src/beta.ts' });
+    expect(result.goals[1]?.feature).toBe('대상 경로: src/beta.ts\nEdit src/beta.ts');
+    expect(result.goals[2]).toMatchObject({ hotPaths: ['docs/goals/GOAL-parent.md', 'docs/reports/context.md', 'src/alpha.ts', 'src/beta.ts'],
+      feature: 'Read docs/goals/GOAL-parent.md and docs/reports/context.md, then implement the missing unit\n대상 경로: src/alpha.ts · src/beta.ts' });
+  });
   test('folds a route into its handler with unioned paths and one path-only event', async () => {
     const events: Array<{ category: string; event: string; data: unknown }> = [];
     const original = debug.log;

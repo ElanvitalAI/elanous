@@ -79,7 +79,7 @@ else if (args.includes('config')) console.log('fake');
   return { root, state, env };
 }
 
-test('independent harness ask/say and self CLI dispatch run real kubectl apply only when lease permits', async () => {
+test('independent harness ask/say CLI dispatches run real kubectl apply only when lease permits', async () => {
   const { root, state, env } = fixture();
   const goal = join(root, 'goal.md');
   writeFileSync(goal, 'First distinct goal');
@@ -106,7 +106,9 @@ test('independent harness ask/say and self CLI dispatch run real kubectl apply o
     run(['harness', 'say', 'Second distinct goal', '--substrate', 'pod', '--pod-pool', 'fake:3']);
     await wait(() => applied().length === 2);
     const measurementsBeforeThird = snapshot().measured.length;
-    run(['self', 'orchestrate', 'Third distinct goal', '--substrate', 'pod', '--pod-pool', 'fake:3', '--pod-account', 'team', '--no-supervise']);
+    // `self orchestrate` is a closed entrance now (#24330 · prints «harness say / harness ask 로» and launches nothing), so
+    // the third waiting dispatch goes through the open door. Gate 0.2.30 pod-33 read that closure as «did not reach state».
+    run(['harness', 'say', 'Third distinct goal', '--substrate', 'pod', '--pod-pool', 'fake:3']);
     await wait(() => snapshot().measured.length > measurementsBeforeThird);
     await Bun.sleep(500);
     expect(applied()).toHaveLength(2);

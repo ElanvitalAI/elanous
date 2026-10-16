@@ -1,15 +1,17 @@
 import { expect, test, setDefaultTimeout, setSystemTime } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { contextNow, contextNowInWorker, scanContextNowInWorker, seatStatusNow, type ContextNowDeps } from './context-now.js';
 import { renderTuiNow, renderVoiceNow } from './context-now-surfaces.js';
 import type { QueriedRunningRunsResult } from '../self-implement/running-runs.js';
+import { runLedgerDir, runLedgerScanIndexPath } from '../self-implement/run-ledger.js';
 import { recordExternalEvent } from './external-events.js';
 import { openSurfaceEventsDb } from '../domains/surface-events.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
 import { add } from '../release-loop/feature-store.js';
+import { devVersion } from '../release-loop/checklist.js';
 import { seatLedgerPath } from '../seat-loop/seat-loop.js';
 import { routeRequest } from '../nexus/api/http-server.js';
 import { createDevProxyRuntimeRef } from '../nexus/api/admin-dev-proxy.js';
@@ -61,6 +63,60 @@ test('context_now worker returns a source-labelled answer without blocking the c
     clearInterval(timer);
     if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = previous;
+    if (previousOverride) setElanousConfigDir(previousOverride);
+    else resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('consecutive /now worker topics retain the full aggregate for each request', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'context-now-topics-'));
+  const previousState = process.env.ELANOUS_STATE_DIR;
+  const previousOverride = getElanousConfigDirOverride();
+  process.env.ELANOUS_STATE_DIR = root;
+  setElanousConfigDir(root);
+  try {
+    const now = new Date();
+    const directory = join(root, 'seat-loop', 'TC');
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(seatLedgerPath('TC', root, now), [
+      { seat: 'TC', at: now.toISOString(), status: 'working', item: { source: 'checklist', id: 'ALPHA', title: 'Alpha topic' } },
+      { seat: 'TC', at: now.toISOString(), status: 'working', item: { source: 'checklist', id: 'BETA', title: 'Beta topic' } },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+    const version = devVersion().replace(/-.*$/, '');
+    add(version, { id: 'ALPHA', title: 'Alpha checklist', status: 'red', updatedAt: now.toISOString(), updatedBy: 'TC' });
+    add(version, { id: 'BETA', title: 'Beta checklist', status: 'yellow', updatedAt: now.toISOString(), updatedBy: 'TC' });
+    const db = openSurfaceEventsDb();
+    try {
+      recordExternalEvent({ origin: 'claude-code', kind: 'done', summary: 'Alpha event', source: 'https://example.org/alpha' }, { db });
+      recordExternalEvent({ origin: 'claude-code', kind: 'done', summary: 'Beta event', source: 'https://example.org/beta' }, { db });
+    } finally { db.close(); }
+    const ledgerDir = runLedgerDir(root);
+    mkdirSync(ledgerDir, { recursive: true });
+    const runId = 'run-11111111-1111-4111-8111-111111111111';
+    writeFileSync(join(ledgerDir, `${runId}.jsonl`), JSON.stringify({ runId, event: 'start', timestamp: now.toISOString(), data: { feature: 'Alpha Beta run' } }) + '\n');
+    const indexPath = runLedgerScanIndexPath(ledgerDir);
+    const alpha = await contextNowInWorker({ topic: 'Alpha', audience: 'operator' });
+    expect(existsSync(indexPath)).toBe(true);
+    const indexed = JSON.parse(readFileSync(indexPath, 'utf8')) as { entries: Record<string, unknown> };
+    expect(indexed.entries[runId]).toBeDefined();
+    const firstIndex = statSync(indexPath).mtimeMs;
+    const beta = await contextNowInWorker({ topic: 'Beta', audience: 'operator' });
+    expect(statSync(indexPath).mtimeMs).toBe(firstIndex);
+    const alphaAgain = await contextNowInWorker({ topic: 'Alpha', audience: 'operator' });
+    const aggregate = (answer: typeof alpha) => ({
+      cells: answer.facts.filter(fact => fact.kind === 'cell').map(fact => fact.id),
+      seats: answer.facts.filter(fact => fact.kind === 'seat').map(fact => fact.id),
+      events: answer.events.map(event => event.summary),
+    });
+    expect(aggregate(alpha)).toEqual({ cells: ['ALPHA'], seats: ['ALPHA'], events: ['Alpha event'] });
+    expect(aggregate(beta)).toEqual({ cells: ['BETA'], seats: ['BETA'], events: ['Beta event'] });
+    expect(aggregate(alphaAgain)).toEqual(aggregate(alpha));
+    expect(alpha.facts).toContainEqual(expect.objectContaining({ kind: 'run', goal: 'Alpha Beta run' }));
+    expect(beta.facts).toContainEqual(expect.objectContaining({ kind: 'run', goal: 'Alpha Beta run' }));
+  } finally {
+    if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousState;
     if (previousOverride) setElanousConfigDir(previousOverride);
     else resetElanousConfigDir();
     rmSync(root, { recursive: true, force: true });
@@ -425,7 +481,7 @@ test('authenticated HTTP and chat runtime return the same JSON from isolated rel
   process.env.ELANOUS_STATE_DIR = root;
   setElanousConfigDir(root);
   try {
-    const version = (await import('../release-loop/checklist.js')).devVersion().replace(/-.*$/, '');
+    const version = devVersion().replace(/-.*$/, '');
     add(version, { id: 'K6', title: 'Context door', status: 'red', updatedAt: at, updatedBy: 'TC' });
     add(version, { id: 'K7', title: 'Unrelated feature', status: 'yellow', updatedAt: at, updatedBy: 'TC' });
     const ledger = new DecisionLedger({ stateDir: root, resolveVersion: () => ({ released: version, dev: version, codename: version }) });

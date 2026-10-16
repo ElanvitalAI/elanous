@@ -2,8 +2,8 @@
  * TASK-AGENT-SHADOW — 슈퍼바이저가 런의 멈춤을 확정한 자리에서 판단부를 «그림자»로 부른다.
  *
  * RFC-task-agent-any-task-to-completion-2026-10-06 §A9 «판단부 호출부 0»을 메운다.
- * - 입력은 슈퍼바이저 결과에 «이미 실려 있는» 값만 쓴다(네트워크 호출 0): 종료 어휘 ·
- *   PR 번호/병합 여부(`prNumber`·`merged`). 리뷰 판정·must-fix 는 결과에 없으므로 비운다
+ * - 기본 판단은 슈퍼바이저 결과에 이미 실린 종료 어휘·PR 번호·병합 여부를 쓴다.
+ *   카드가 묶인 코드 PR의 target diff는 저장소가 고정된 gh 조회로 별도 측정한다. 리뷰 판정·must-fix 는 결과에 없으므로 비운다
  *   («통과»로 읽지 않는다 — 판단부가 review 수를 고른다).
  * - 슈퍼바이저의 기본 호출은 shadow: «했을 수»만 기록하고 명령·복사는 하나도 돌리지 않는다.
  *   전달 과제의 명시적 live 호출만 파일을 복사한다. 설정 `taskAgent.mode=live` 는 기본 호출에 먹지 않는다.
@@ -11,6 +11,8 @@
  */
 import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { extname, join, relative, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
 import { readTaskAgentState, readTaskCard, taskAgentStatePath, TASK_CARD_PREFIX, type CompletionKind, type TaskCard } from './task-hand.js';
@@ -72,10 +74,30 @@ export interface TaskAgentShadowDeps {
   statePath?: string;
   /** TA-WIRING-CHECK — 배선 근거 수집 의존(시험 주입 · 기본 = gh pr diff 한 번 ⊕ 카드 런 원장). */
   wiring?: Omit<WiringEvidenceDeps, 'card'>;
+  /** Complete PR target paths; undefined means unmeasured, never goal-only. */
+  prFiles?: (pr: number, prUrl: string | undefined) => Promise<readonly string[] | undefined>;
   /** Process env for the launched-run id (`ELANOUS_RUN_ID`) — test seam; default process.env. */
   env?: NodeJS.ProcessEnv;
   /** Remote pending-move ledger seam; defaults to the run ledger. */
   queueMove?: typeof appendRunLedgerEntry;
+}
+
+const execFileAsync = promisify(execFile);
+export function prRepositoryFromUrl(pr: number, prUrl: string | undefined): string | undefined {
+  const match = prUrl?.match(/^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)\/?$/);
+  return match && Number(match[3]) === pr ? `${match[1]}/${match[2]}` : undefined;
+}
+
+export async function defaultPrFiles(pr: number, prUrl: string | undefined,
+  run: (args: readonly string[]) => Promise<string> = async (args) => {
+    const { stdout } = await execFileAsync('gh', [...args],
+      { encoding: 'utf8', timeout: 20_000, maxBuffer: 4 * 1024 * 1024 });
+    return stdout;
+  }): Promise<readonly string[]> {
+  const repository = prRepositoryFromUrl(pr, prUrl);
+  if (!repository) throw new Error('bound PR repository unavailable');
+  const stdout = await run(['pr', 'diff', String(pr), '--name-only', '-R', repository]);
+  return stdout.split(/\r?\n/).filter(Boolean);
 }
 
 export const REMOTE_CARD_MOVE_PENDING = 'task-agent-card-move-pending';
@@ -258,6 +280,17 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
     }
   }
   if (selfReview) judgeInput.review = selfReview.verdict;
+  if (card && typeof judgeInput.pr === 'number' && (!kind || kind === 'code-pr')) {
+    try {
+      const prUrl = typeof card.pr === 'object' && card.pr.number === judgeInput.pr && card.pr.url
+        ? card.pr.url : successful?.prUrl;
+      const files = await (deps.prFiles ?? defaultPrFiles)(judgeInput.pr, prUrl);
+      if (files) judgeInput.prTargetPaths = files;
+    } catch (error) {
+      try { (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', 'pr-target-diff-unavailable',
+        { runId: input.runId, pr: judgeInput.pr, reason: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+    }
+  }
   const delivery = successful?.worktreePath && card?.project?.target && isDeliveryKind(kind)
     ? { kind, worktreePath: successful.worktreePath, projectTarget: card.project.target, files: selectDeliveryCandidates(successful.worktreePath, kind) }
     : undefined;
@@ -266,6 +299,16 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
       ? { move: 'wait', stage: 'observing', reason: '전달 후보 확인 — 산출물 판독 대기', executorKind: 'deliver' }
       : { move: 'wait', stage: 'waiting', reason: '전달 후보 없음' }
     : judgeNextMove(judgeInput);
+  if (judgement.reason.startsWith('goal-only-pr —') && input.runId) {
+    try {
+      (deps.queueMove ?? appendRunLedgerEntry)({ timestamp: new Date().toISOString(), runId: input.runId,
+        event: 'task-agent-goal-only-pr', data: { pr: judgeInput.pr, paths: judgeInput.prTargetPaths,
+          targetDiff: 0, reason: judgement.reason, requeue: 'stopped' } });
+    } catch (error) {
+      try { (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', 'goal-only-pr-ledger-failed',
+        { runId: input.runId, pr: judgeInput.pr, reason: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+    }
+  }
   if (cardLookupFailed) judgement.reason = `${judgement.reason} · 종결 종류 미확인(카드 조회 실패)`;
   // 판단마다 해석한다 — 허용되지 않은 수를 판단할 때도 모르는 항목 경고가 남게.
   const liveMoves = deps.liveMoves ?? await configuredTaskAgentLiveMoves();
@@ -342,8 +385,12 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
           } } : {}),
         }, liveMoveDeps(deps));
     } else if (liveKind === 'propose-land') {
+      // A supervisor live move can reach land before the periodic rejudge tick. Carry
+      // the captured review file for this PR/head so queue mode can verify its bytes.
+      const reviewResultPath = boundCard?.reviewRequests?.find((request) => request.pr === prResult?.prNumber
+        && request.head.toLowerCase() === selfReview?.head.toLowerCase() && request.resultPath && !request.error)?.resultPath;
       liveMove = await executeLiveLand(boundCard, prResult?.prNumber,
-        { runId: input.runId, cycleId: input.cycleId, review: selfReview,
+        { runId: input.runId, cycleId: input.cycleId, review: selfReview, ...(reviewResultPath ? { reviewResultPath } : {}),
           ...(prResult?.worktreePath ? { cwd: prResult.worktreePath } : {}),
           ...(prResult && !prResult.worktreePath ? { produced: {
             ...(prResult.checkedHeadCommit !== undefined ? { headCommit: prResult.checkedHeadCommit } : {}),

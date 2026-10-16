@@ -101,6 +101,25 @@ for ($index = 0; $index -lt $RemainingArgs.Count; $index++) {
 if ($Help) { Show-Usage; exit 0 }
 $installLang = if ($env:ELANOUS_INSTALL_LANG) { $env:ELANOUS_INSTALL_LANG } else { [Globalization.CultureInfo]::CurrentUICulture.Name }
 $installLang = if ($installLang -match '^ko(?:-|$)') { 'ko' } else { 'en' }
+
+# WIN-ARM64-VM-TRIAL (0.2.40): Windows on ARM reports ARM64 via PROCESSOR_ARCHITECTURE (ARM64-native
+# host) or PROCESSOR_ARCHITEW6432 (32-bit host on 64-bit Windows). bun, the required runtime, publishes
+# no Windows ARM64 build (its installer fetches bun-windows-x64), so refuse before touching the prefix
+# or the profile. Exit 78 (EX_CONFIG) keeps this distinct from 127 (required command missing) and 1.
+# Third tier (re-issued fragment): a host that spawns PowerShell with a scrubbed environment block still
+# reports its architecture through the .NET runtime (RuntimeInformation, in .NET since 4.7.1, the floor
+# under PowerShell 5.1), so fall back to it only when both environment variables are absent. Guarded to
+# Windows_NT: elsewhere the host architecture says nothing about Windows installability and the gate must
+# keep its pre-fallback behavior. Uppercased: the enum prints Arm64, the check below reads ARM64.
+$osArchitecture = $env:PROCESSOR_ARCHITEW6432
+if (-not $osArchitecture) { $osArchitecture = $env:PROCESSOR_ARCHITECTURE }
+if (-not $osArchitecture -and $env:OS -eq 'Windows_NT') {
+  try { $osArchitecture = ([string][System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture).ToUpperInvariant() } catch { $osArchitecture = $null }
+}
+if ($osArchitecture -eq 'ARM64') {
+  Fail (Say 'Windows on ARM (ARM64) is not supported yet: bun, the required runtime, has no Windows ARM64 build, so nothing was installed. Use x64 Windows for now (WIN-ARM64-VM-TRIAL tracks the first live measurement).' '\uc708\ub3c4\uc6b0 ARM(ARM64)\uc740 \uc544\uc9c1 \uc9c0\uc6d0\ud558\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4: \ud544\uc218 \ub7f0\ud0c0\uc784 bun \uc5d0 \uc708\ub3c4\uc6b0 ARM64 \ube4c\ub4dc\uac00 \uc5c6\uc5b4 \uc544\ubb34\uac83\ub3c4 \uc124\uce58\ud558\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4. \ub2f9\ubd84\uac04 x64 \uc708\ub3c4\uc6b0\ub97c \uc0ac\uc6a9\ud558\uc138\uc694(WIN-ARM64-VM-TRIAL \uce78\uc774 \uccab \uc2e4\uce21\uc744 \ucd94\uc801\ud569\ub2c8\ub2e4).') 78
+}
+
 if (-not $Prefix) {
   $dataHome = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $HOME 'AppData\Local' }
   $Prefix = if ($env:ELANOUS_INSTALL_PREFIX) { $env:ELANOUS_INSTALL_PREFIX } else { Join-Path $dataHome 'elanous' }

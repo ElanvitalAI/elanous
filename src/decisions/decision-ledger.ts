@@ -7,6 +7,7 @@ import { createVersionResolver, type VersionOptions, type Versions } from '../di
 import { getUserConfig } from '../user-config.js';
 import { registeredSeats, resolveSeat } from '../seat-address/seat-address.js';
 import { isSeatId } from '../seat-dispatch/seat-questions.js';
+import { openMsgStore } from '../msg/msg-store.js';
 
 export type DecisionCategory = 'secret' | 'publish' | 'money' | 'security' | 'scope' | 'irreversible' | 'other';
 /** Old track letters (S·T·F·O) stay readable; seat names (OP·MK·TC·UX) are the current identities. */
@@ -42,10 +43,22 @@ export interface SeatDecisionRecord {
 }
 export type SeatDecisionInput = Pick<SeatDecisionRecord, 'title' | 'decision' | 'seat' | 'delegation' | 'refs'> & { decidedAt?: string };
 type Event = { type: 'raised'; entry: DecisionEntry } | { type: 'seat-recorded'; entry: SeatDecisionRecord } | { type: 'options-added'; id: string; at: string; options: DecisionOption[]; by: string } | { type: 'decided'; id: string; at?: string; by: DecisionActor; choice?: string; version?: Versions; note?: string } | { type: 'withdrawn'; id: string; at: string; reason: string; version: Versions };
-export interface DecisionLedgerOptions extends VersionOptions { stateDir?: string; now?: () => Date; resolveVersion?: (at: string) => Versions; writeAnswer?: typeof writePendingQuestionAnswer }
+export interface DecisionLedgerOptions extends VersionOptions { stateDir?: string; now?: () => Date; resolveVersion?: (at: string) => Versions; writeAnswer?: typeof writePendingQuestionAnswer; postDecisionNotice?: (entry: DecisionEntry, stateDir: string, seat: string) => number }
 
 /** null = the decision resumes no run; otherwise whether the answer file was written (or already matched). */
 export type AnswerDelivery = null | { ok: true; questionId: string } | { ok: false; questionId: string; reason: string };
+export type DecisionNotice = { status: 'skipped' } | { status: 'sent'; seat: string; messageId: number } | { status: 'failed'; seat: string; reason: string };
+
+function postDecisionNotice(entry: DecisionEntry, stateDir: string, seat: string): number {
+  const selected = entry.options.find(option => option.key === entry.choice);
+  if (!selected || !entry.choice) throw new Error('recorded choice not found');
+  const recommendedWhy = 'option' in entry.recommendation && entry.recommendation.option === entry.choice ? entry.recommendation.why : undefined;
+  const rationale = (entry.note ?? recommendedWhy ?? entry.scqa.c).replace(/\s+/g, ' ').trim();
+  const body = `**[OP]** 결정 ${entry.id} · ${entry.title} · 선택 ${entry.choice}: ${selected.label} · 근거 ${rationale}`;
+  const store = openMsgStore(join(stateDir, 'msg', 'messages.db'));
+  try { return store.appendWithProvenance({ from: 'OP', to: seat, kind: 'info', body }, `decision:${entry.id}:${seat}`).id; }
+  finally { store.close(); }
+}
 
 /** The decision is durable even when delivery fails; retryAnswer(id) only retries delivery. */
 export class DecisionAnswerDeliveryError extends Error {
@@ -144,6 +157,7 @@ export class DecisionLedger {
   private readonly lockPath: string;
   private readonly now: () => Date;
   private readonly writeAnswer: typeof writePendingQuestionAnswer;
+  private readonly postDecisionNotice: NonNullable<DecisionLedgerOptions['postDecisionNotice']>;
   private readonly stateDir: string;
   private versionResolver?: (at: string) => Versions;
   private readonly versionOptions: DecisionLedgerOptions;
@@ -153,6 +167,7 @@ export class DecisionLedger {
     this.lockPath = `${this.path}.lock`;
     this.now = options.now ?? (() => new Date());
     this.writeAnswer = options.writeAnswer ?? writePendingQuestionAnswer;
+    this.postDecisionNotice = options.postDecisionNotice ?? postDecisionNotice;
     this.versionOptions = options;
     this.versionResolver = options.resolveVersion;
   }
@@ -300,13 +315,13 @@ export class DecisionLedger {
     return entry;
   }
   /** Record the decision and say whether its answer reached the waiting run (null = the decision resumes nothing). */
-  decideWithDelivery(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string): { entry: DecisionEntry; delivery: AnswerDelivery } {
+  decideWithDelivery(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string): { entry: DecisionEntry; delivery: AnswerDelivery; notice: DecisionNotice } {
     return this.decideLocked(id, choice, by, note, decidedAt);
   }
   decide(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string): DecisionEntry {
     return this.decideLocked(id, choice, by, note, decidedAt).entry;
   }
-  private decideLocked(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string): { entry: DecisionEntry; delivery: AnswerDelivery } {
+  private decideLocked(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string): { entry: DecisionEntry; delivery: AnswerDelivery; notice: DecisionNotice } {
     if (!by || (by.kind !== 'human' && by.kind !== 'auto')) throw new Error('decidedBy is required');
     if (by.kind === 'auto') {
       single(by.delegation, 'delegation'); single(by.agent, 'agent');
@@ -322,8 +337,34 @@ export class DecisionLedger {
       this.append({ type: 'decided', id, at, by, choice, version: this.version(at), ...(note ? { note: safe(single(note, 'note')) } : {}) });
       debug.log('decisions', 'decided', { id, category: old.category, by: by.kind });
       const decided = this.show(id);
-      return { entry: decided, delivery: this.deliverAnswer(decided) };
+      return { entry: decided, delivery: this.deliverAnswer(decided), notice: this.notifyDecided(decided) };
     });
+  }
+  /** Retry only the seat notice; the message provenance key prevents duplicate delivery. */
+  retryNotice(id: string): DecisionNotice {
+    return this.locked(() => {
+      const entry = this.show(id);
+      if (entry.status !== 'decided') throw new Error(`decision is not decided: ${id}`);
+      return this.notifyDecided(entry);
+    });
+  }
+  private notifyDecided(entry: DecisionEntry): DecisionNotice {
+    const track = entry.raisedBy.track;
+    if (!track) return { status: 'skipped' };
+    const seat = resolveSeat(track)?.id;
+    if (!seat) {
+      debug.log('decisions', 'decided-notify-unknown-seat', { id: entry.id, track });
+      return { status: 'failed', seat: track, reason: '올린 자리 미상' };
+    }
+    try {
+      const messageId = this.postDecisionNotice(entry, this.stateDir, seat);
+      debug.log('decisions', 'decided-notify-sent', { id: entry.id, seat, messageId });
+      return { status: 'sent', seat, messageId };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      debug.log('decisions', 'decided-notify-failed', { id: entry.id, seat, reason });
+      return { status: 'failed', seat, reason };
+    }
   }
   /** Retry delivery of the recorded choice without adding another decided event or changing its actor/note. */
   retryAnswer(id: string): DecisionEntry {

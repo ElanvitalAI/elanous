@@ -1,4 +1,6 @@
 import { planShards } from './shard-plan';
+import { isGateSpawnLaneFile } from '../../src/self-dev/spawn-lane-files.js';
+export { GATE_SPAWN_LANE_FILES, isGateSpawnLaneFile } from '../../src/self-dev/spawn-lane-files.js';
 
 /**
  * Gate tests that exercise a real process or PTY. Keep them in their own Pod
@@ -9,26 +11,7 @@ import { planShards } from './shard-plan';
  * real child. Add a file only after checking its test body, not merely because
  * its name mentions a process.
  */
-export const GATE_SPAWN_LANE_FILES = [
-  'scripts/lib/tui-runshell-group-e2e.test.ts',
-  'scripts/lib/tui-streaming-e2e.test.ts',
-  'src/agent-mission/doc-guided-install.test.ts',
-  'src/dashboard/first-screen-band-wiring.test.ts',
-  'src/git-fs/spawn-discipline.test.ts',
-  'src/self-implement/run-ledger.test.ts',
-  'src/video-pipeline/recipes/reframe.test.ts',
-  'test/ch5730-watch-delivery.test.ts',
-  'test/cli-dev-command.test.ts',
-  'test/preview-terminal.test.ts',
-] as const;
-
-const SPAWN_FILES = new Set<string>(GATE_SPAWN_LANE_FILES);
-
 export const GATE_SPAWN_LANE_SHARDS = 3;
-
-export function isGateSpawnLaneFile(file: string): boolean {
-  return SPAWN_FILES.has(file);
-}
 
 /** Every assigned test file is returned exactly once, including a partial gate. */
 export function partitionGateSpawnLane(files: readonly string[]): { regular: string[]; spawn: string[] } {

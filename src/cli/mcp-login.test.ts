@@ -1,5 +1,7 @@
-import { describe, expect, test } from 'bun:test';
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { describe, expect, spyOn, test } from 'bun:test';
+import * as fs from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { persistDiscoveredIssuer, runMcpLogin } from './mcp-login.js';
@@ -167,11 +169,13 @@ describe('runMcpLogin browser and device integration', () => {
 
   test('device-only authorization server selects device flow with DISPLAY and no SSH', async () => {
     const f = loginFixture(true);
+    let listener: Server | undefined;
     const fetchDeviceOnly: McpOAuthFetch = async (url, init) => {
       if (url === `${issuer}/.well-known/oauth-authorization-server`) return json({
         issuer, token_endpoint: `${issuer}/token`, registration_endpoint: `${issuer}/register`,
         device_authorization_endpoint: `${issuer}/device`,
       });
+      if (url === `${issuer}/device`) expect(listener?.listening).toBe(false);
       return f.fetch(url, init);
     };
     let now = 0;
@@ -179,10 +183,12 @@ describe('runMcpLogin browser and device integration', () => {
     const result = await runMcpLogin({ ...f.opts, fetch: fetchDeviceOnly,
       browserEnv: { DISPLAY: ':1' }, deviceNow: () => now,
       deviceSleep: async (ms) => { now += ms; },
+      createListener: (handler) => { listener = createServer(handler); return listener; },
       approveBrowser: async () => { browserCalls++; throw new Error('browser must not approve'); },
       openBrowser: async () => { browserCalls++; throw new Error('browser must not open'); },
     });
     expect(result.exitCode).toBe(0);
+    expect(listener?.listening).toBe(false);
     expect(browserCalls).toBe(0);
     expect(f.calls.some((call) => call.url === `${issuer}/device`)).toBe(true);
     expect(f.calls.some((call) => call.url === `${issuer}/token` && call.body.includes('grant_type=authorization_code'))).toBe(false);
@@ -288,6 +294,48 @@ describe('runMcpLogin registration reuse and the real aside path', () => {
     expect(loadTokens(issuer, f.storePath)?.tokens.accessToken).toBe('access');
   });
 
+  test('aside/browser callback timeout falls back to an advertised device code and commits only the device client with its tokens', async () => {
+    const f = loginFixture(true);
+    let registers = 0;
+    const fetchDevice: McpOAuthFetch = async (url, init) => {
+      if (url === `${issuer}/register`) return json({ client_id: ++registers === 1 ? 'browser-client' : 'device-client' });
+      return f.fetch(url, init);
+    };
+    let now = 0;
+    const result = await runMcpLogin({ ...f.opts, fetch: fetchDevice, browserEnv: { DISPLAY: ':1' },
+      deviceNow: () => now, deviceSleep: async (ms) => { now += ms; },
+      approveBrowser: async () => { /* no callback */ },
+      openBrowser: async () => { /* no callback */ },
+      timeoutMs: 50, asideCallbackGraceMs: 10,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(registers).toBe(2);
+    expect(f.lines.join(' ')).toContain('trying device code');
+    expect(f.lines).toContain('Device code: ABCD');
+    expect(f.calls.some((call) => call.url === `${issuer}/device`)).toBe(true);
+    const stored = loadTokens(issuer, f.storePath)!;
+    expect(stored.accountUuid).toBe('device-client');
+    expect(stored.redirectUri).toBeUndefined();
+    expect(stored.tokens.refreshToken).toBe('refresh');
+  });
+
+  test('explicit browser denial does not start a device login or replace a stored registration', async () => {
+    const f = loginFixture(true);
+    let now = 0;
+    expect((await runMcpLogin({ ...f.opts, deviceNow: () => now, deviceSleep: async (ms) => { now += ms; } })).exitCode).toBe(0);
+    const before = loadTokens(issuer, f.storePath)!;
+    const result = await runMcpLogin({ ...f.opts, browserEnv: { DISPLAY: ':1' },
+      approveBrowser: async (url) => {
+        await fetch(`${new URL(url).searchParams.get('redirect_uri')}?error=access_denied`);
+      },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(f.calls.filter((call) => call.url === `${issuer}/device`)).toHaveLength(1);
+    const after = loadTokens(issuer, f.storePath)!;
+    expect(after.accountUuid).toBe(before.accountUuid);
+    expect(after.tokens.refreshToken).toBe(before.tokens.refreshToken);
+  });
+
   test('device → browser: a cancelled browser approval keeps the device client and its refresh token; success commits the new client', async () => {
     const f = loginFixture(true);
     let now = 0;
@@ -318,6 +366,253 @@ describe('runMcpLogin registration reuse and the real aside path', () => {
     expect(committed.accountUuid).toMatch(/^browser-client-/);
     expect(committed.redirectUri).toBeDefined();
     expect(committed.tokens.refreshToken).toBe('browser-refresh');
+  });
+
+  test('first device login: token temp is private under umask 022', async () => {
+    const f = loginFixture(true);
+    let now = 0;
+    const modes: number[] = [];
+    const originalRename = fs.renameSync;
+    const rename = spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (from === `${f.storePath}.tmp`) modes.push(fs.statSync(from).mode & 0o777);
+      return originalRename(from, to);
+    });
+    const umask = process.umask(0o022);
+    try {
+      expect((await runMcpLogin({ ...f.opts, deviceNow: () => now,
+        deviceSleep: async (ms) => { now += ms; } })).exitCode).toBe(0);
+      expect(modes).toEqual([0o600]);
+      expect(loadTokens(issuer, f.storePath)?.tokens.accessToken).toBe('access');
+    } finally {
+      rename.mockRestore();
+      process.umask(umask);
+    }
+  });
+
+  test('first browser login: registration temp is private under umask 022', async () => {
+    const f = loginFixture(false);
+    const modes: number[] = [];
+    const originalRename = fs.renameSync;
+    const rename = spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (from === `${f.storePath}.tmp`) modes.push(fs.statSync(from).mode & 0o777);
+      return originalRename(from, to);
+    });
+    const umask = process.umask(0o022);
+    try {
+      expect((await runMcpLogin({ ...f.opts, browserEnv: { DISPLAY: ':1' }, approveBrowser: async (url) => {
+        const auth = new URL(url);
+        await fetch(`${auth.searchParams.get('redirect_uri')}?code=browser-code&state=${encodeURIComponent(auth.searchParams.get('state')!)}`);
+      } })).exitCode).toBe(0);
+      expect(modes).toEqual([0o600, 0o600]);
+      expect(loadTokens(issuer, f.storePath)?.tokens.accessToken).toBe('access');
+    } finally {
+      rename.mockRestore();
+      process.umask(umask);
+    }
+  });
+
+  test('browser → device: token temp writes stay private under umask 022', async () => {
+    const f = loginFixture(true);
+    expect((await runMcpLogin({ ...f.opts, browserEnv: { DISPLAY: ':1' }, approveBrowser: async (url) => {
+      const auth = new URL(url);
+      await fetch(`${auth.searchParams.get('redirect_uri')}?code=browser-code&state=${encodeURIComponent(auth.searchParams.get('state')!)}`);
+    } })).exitCode).toBe(0);
+    let now = 0;
+    const modes: number[] = [];
+    const originalRename = fs.renameSync;
+    const rename = spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (to === f.storePath && from !== `${f.storePath}.tmp`) modes.push(fs.statSync(from).mode & 0o777);
+      return originalRename(from, to);
+    });
+    const umask = process.umask(0o022);
+    try {
+      expect((await runMcpLogin({ ...f.opts, deviceNow: () => now,
+        deviceSleep: async (ms) => { now += ms; },
+        fetch: async (url, init) => url === `${issuer}/register`
+          ? json({ client_id: 'device-client' }) : f.fetch(url, init),
+      })).exitCode).toBe(0);
+      expect(modes).toEqual([0o600]);
+      expect(statSync(f.storePath).mode & 0o777).toBe(0o600);
+      expect(loadTokens(issuer, f.storePath)?.accountUuid).toBe('device-client');
+      expect(loadTokens(issuer, f.storePath)?.redirectUri).toBeUndefined();
+    } finally {
+      rename.mockRestore();
+      process.umask(umask);
+    }
+  });
+
+  test('stored browser client switches to device after aside timeout without carrying browser registration', async () => {
+    const f = loginFixture(true);
+    const browserFetch: McpOAuthFetch = async (url, init) => url === `${issuer}/register`
+      ? json({ client_id: 'browser-client', client_secret: 'browser-secret' }) : f.fetch(url, init);
+    expect((await runMcpLogin({ ...f.opts, fetch: browserFetch, browserEnv: { DISPLAY: ':1' },
+      approveBrowser: async (url) => {
+        const auth = new URL(url);
+        await fetch(`${auth.searchParams.get('redirect_uri')}?code=browser-code&state=${encodeURIComponent(auth.searchParams.get('state')!)}`);
+      },
+    })).exitCode).toBe(0);
+    const before = loadTokens(issuer, f.storePath)!;
+    expect(before).toMatchObject({ accountUuid: 'browser-client', organizationUuid: 'browser-secret', tokens: { refreshToken: 'refresh' } });
+    expect(before.redirectUri).toBeDefined();
+    let deviceRegistrations = 0;
+    let now = 0;
+    const result = await runMcpLogin({ ...f.opts, browserEnv: { DISPLAY: ':1' },
+      fetch: async (url, init) => {
+        if (url === `${issuer}/register`) { deviceRegistrations++; return json({ client_id: 'device-client' }); }
+        if (url === `${issuer}/token`) return json({ access_token: 'device-access', refresh_token: 'device-refresh', expires_in: 3600 });
+        return f.fetch(url, init);
+      },
+      approveBrowser: async () => {}, openBrowser: async () => {}, timeoutMs: 50, asideCallbackGraceMs: 5,
+      deviceNow: () => now, deviceSleep: async (ms) => { now += ms; },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(deviceRegistrations).toBe(1);
+    expect(f.lines.join(' ')).toContain('trying device code');
+    expect(f.lines).toContain('Device code: ABCD');
+    const after = loadTokens(issuer, f.storePath)!;
+    expect(after.accountUuid).toBe('device-client');
+    expect(after.tokens.accessToken).toBe('device-access');
+    expect(after.tokens.refreshToken).toBe('device-refresh');
+    expect(after.redirectUri).toBeUndefined();
+    expect(after.organizationUuid).toBeUndefined();
+  });
+
+  test('stored browser client survives aside timeout and denied device code without adopting a pending device client', async () => {
+    const f = loginFixture(true);
+    const browserFetch: McpOAuthFetch = async (url, init) => url === `${issuer}/register`
+      ? json({ client_id: 'browser-client', client_secret: 'browser-secret' }) : f.fetch(url, init);
+    expect((await runMcpLogin({ ...f.opts, fetch: browserFetch, browserEnv: { DISPLAY: ':1' },
+      approveBrowser: async (url) => {
+        const auth = new URL(url);
+        await fetch(`${auth.searchParams.get('redirect_uri')}?code=browser-code&state=${encodeURIComponent(auth.searchParams.get('state')!)}`);
+      },
+    })).exitCode).toBe(0);
+    const before = readFileSync(f.storePath, 'utf8');
+    let deviceRegistrations = 0;
+    let now = 0;
+    const result = await runMcpLogin({ ...f.opts, browserEnv: { DISPLAY: ':1' },
+      fetch: async (url, init) => {
+        if (url === `${issuer}/register`) { deviceRegistrations++; return json({ client_id: 'device-client' }); }
+        if (url === `${issuer}/token` && new URLSearchParams(init?.body).get('grant_type') === 'urn:ietf:params:oauth:grant-type:device_code') {
+          return json({ error: 'access_denied' }, 400);
+        }
+        return f.fetch(url, init);
+      },
+      approveBrowser: async () => {}, openBrowser: async () => {}, timeoutMs: 50, asideCallbackGraceMs: 5,
+      deviceNow: () => now, deviceSleep: async (ms) => { now += ms; },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(deviceRegistrations).toBe(1);
+    expect(f.lines.join(' ')).toContain('trying device code');
+    expect(readFileSync(f.storePath, 'utf8')).toBe(before);
+  });
+
+  test('browser → device: stale 0644 temp is not reused and token write starts on a private file', async () => {
+    const f = loginFixture(true);
+    expect((await runMcpLogin({ ...f.opts, browserEnv: { DISPLAY: ':1' }, approveBrowser: async (url) => {
+      const auth = new URL(url);
+      await fetch(`${auth.searchParams.get('redirect_uri')}?code=browser-code&state=${encodeURIComponent(auth.searchParams.get('state')!)}`);
+    } })).exitCode).toBe(0);
+    const stale = `${f.storePath}.tmp`;
+    writeFileSync(stale, 'interrupted write');
+    chmodSync(stale, 0o644);
+    const modesAtWrite: number[] = [];
+    const originalWrite = fs.writeFileSync;
+    const write = spyOn(fs, 'writeFileSync').mockImplementation((file, data, options) => {
+      if (typeof file === 'number' && typeof data === 'string' && data.includes('device-refresh')) {
+        modesAtWrite.push(fs.fstatSync(file).mode & 0o777);
+        expect(fs.readFileSync(stale, 'utf8')).toBe('interrupted write');
+        expect(fs.statSync(stale).mode & 0o777).toBe(0o644);
+      }
+      return originalWrite(file, data, options);
+    });
+    let now = 0;
+    try {
+      expect((await runMcpLogin({ ...f.opts, deviceNow: () => now,
+        deviceSleep: async (ms) => { now += ms; },
+        fetch: async (url, init) => {
+          if (url === `${issuer}/register`) return json({ client_id: 'device-client' });
+          if (url === `${issuer}/token`) return json({ access_token: 'device-access', refresh_token: 'device-refresh', expires_in: 3600 });
+          return f.fetch(url, init);
+        },
+      })).exitCode).toBe(0);
+      expect(modesAtWrite).toEqual([0o600]);
+      expect(loadTokens(issuer, f.storePath)).toMatchObject({ accountUuid: 'device-client', tokens: { refreshToken: 'device-refresh' } });
+      expect(readFileSync(stale, 'utf8')).toBe('interrupted write');
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  test('browser → device: failed atomic replacement preserves the old registration and token together', async () => {
+    const f = loginFixture(true);
+    const browserFetch: McpOAuthFetch = async (url, init) => url === `${issuer}/register`
+      ? json({ client_id: 'browser-client', client_secret: 'browser-secret' }) : f.fetch(url, init);
+    expect((await runMcpLogin({ ...f.opts, fetch: browserFetch, browserEnv: { DISPLAY: ':1' },
+      approveBrowser: async (url) => {
+        const auth = new URL(url);
+        await fetch(`${auth.searchParams.get('redirect_uri')}?code=browser-code&state=${encodeURIComponent(auth.searchParams.get('state')!)}`);
+      },
+    })).exitCode).toBe(0);
+    const before = readFileSync(f.storePath, 'utf8');
+    expect(loadTokens(issuer, f.storePath)).toMatchObject({
+      accountUuid: 'browser-client', organizationUuid: 'browser-secret',
+      tokens: { refreshToken: 'refresh' },
+    });
+    let now = 0;
+    const device = { ...f.opts, deviceNow: () => now, deviceSleep: async (ms: number) => { now += ms; },
+      fetch: (async (url: string, init?: Parameters<McpOAuthFetch>[1]) => {
+        if (url === `${issuer}/register`) return json({ client_id: 'device-client' });
+        if (url === `${issuer}/token`) return json({ access_token: 'device-access', refresh_token: 'device-refresh', expires_in: 3600 });
+        return f.fetch(url, init);
+      }) satisfies McpOAuthFetch };
+    const originalRename = fs.renameSync;
+    let attempted = 0;
+    const rename = spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (to === f.storePath && from !== `${f.storePath}.tmp`) {
+        attempted++;
+        throw new Error('injected rename failure');
+      }
+      return originalRename(from, to);
+    });
+    try {
+      expect((await runMcpLogin(device)).exitCode).toBe(1);
+    } finally {
+      rename.mockRestore();
+    }
+    expect(attempted).toBe(1);
+    expect(readFileSync(f.storePath, 'utf8')).toBe(before);
+    expect(fs.existsSync(`${f.storePath}.tmp`)).toBe(false);
+    expect((await runMcpLogin(device)).exitCode).toBe(0);
+    const after = loadTokens(issuer, f.storePath)!;
+    expect(after.accountUuid).toBe('device-client');
+    expect(after.tokens.accessToken).toBe('device-access');
+    expect(after.tokens.refreshToken).toBe('device-refresh');
+    expect(after.redirectUri).toBeUndefined();
+    expect(after.organizationUuid).toBeUndefined();
+  });
+
+  test('browser → device: a successful device login replaces the browser client without carrying its redirect URI', async () => {
+    const f = loginFixture(true);
+    const browser = await runMcpLogin({ ...f.opts, browserEnv: { DISPLAY: ':1' }, approveBrowser: async (url) => {
+      const auth = new URL(url);
+      await fetch(`${auth.searchParams.get('redirect_uri')}?code=browser-code&state=${encodeURIComponent(auth.searchParams.get('state')!)}`);
+    } });
+    expect(browser.exitCode).toBe(0);
+    expect(loadTokens(issuer, f.storePath)?.redirectUri).toBeDefined();
+    let now = 0;
+    let deviceRegistrations = 0;
+    const deviceFetch: McpOAuthFetch = async (url, init) => {
+      if (url === `${issuer}/register`) { deviceRegistrations++; return json({ client_id: 'device-client' }); }
+      return f.fetch(url, init);
+    };
+    expect((await runMcpLogin({ ...f.opts, fetch: deviceFetch,
+      deviceNow: () => now, deviceSleep: async (ms) => { now += ms; } })).exitCode).toBe(0);
+    expect(deviceRegistrations).toBe(1);
+    const stored = loadTokens(issuer, f.storePath)!;
+    expect(stored.accountUuid).toBe('device-client');
+    expect(stored.redirectUri).toBeUndefined();
+    expect(stored.tokens.refreshToken).toBe('refresh');
   });
 
   test('a failed device login leaves the stored browser registration and its refresh token untouched', async () => {

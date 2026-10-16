@@ -43,6 +43,8 @@ import {
   type CoreTurnContext,
   type CoreTurnDispatchTool,
 } from '../core-turn/index.js';
+import { stripGoalRepeatReadbackPreface } from '../core-turn/run-goal-loop.js';
+import { parseSeatTurnCapConfig, resolveSeatTurnCap } from '../core-turn/seat-turn-cap.js';
 import { getUserConfig } from '../user-config.js';
 import { getModelFamily } from '../models/prompts.js';
 import { resolveModelContextWindow } from '../models/context-window.js';
@@ -50,7 +52,7 @@ import type { AcpServerOptions, AcpTurnContext } from './server.js';
 import { acpToolDenialResult } from './tool-approval.js';
 import { readOriginSessionMeta } from './origin-session-meta.js';
 import { isFactQuestion } from './fact-question.js';
-import { classifyTuiChatIntent, formatTuiRouteLine, type TuiChatRoute } from '../core-turn/short-question.js';
+import { classifyTuiChatIntent, formatTuiRouteLine, isSeatOpsDirective, type TuiChatRoute } from '../core-turn/short-question.js';
 import { HARNESS_ROLE_ENV } from '../harness/harness-space.js';
 
 const FACT_QUESTION_INSTRUCTION = '사실·최신 정보 질문이다. WebSearch 를 1~2회 쓰고 검색 결과(제목·스니펫·URL)로 답하라. 출처 링크를 붙여라. 셸·브라우저·파일 도구는 검색 결과로 부족할 때만. 도구 예산에 닿으면 지금까지 근거로 답하고 끝에 «더 찾아볼까요?»를 붙여라.';
@@ -64,7 +66,8 @@ type QuickTuiRoute = Exclude<TuiChatRoute, '코딩·구현' | '읽기·분석'>;
 const QUICK_TOOLS: Record<QuickTuiRoute, readonly string[]> = {
   '조회': ['decisions_pending', 'ops_seats', 'ops_status', 'release_status', 'logs_query', 'context_now', 'memory_recall', 'Read'],
   '설정 변경': ['DashboardConfigGet', 'DashboardConfigSet', 'LlmListAvailableModels', 'prompt_getRuntimeConfig', 'prompt_setRuntimeConfig', 'view_getConfig', 'view_applyRuntimeConfig', 'view_saveConfig', 'memory_recall'],
-  '조사': ['WebSearch', 'OmniSearch', 'Grep', 'Glob', 'Read', 'fact_check', 'memory_recall'],
+  // MsgList is a read-only ledger listing (never acks); MsgPost · MsgAck · RunShell · Bash stay out (TUI-QUICK-ROUTE-EXPLICIT-CMD).
+  '조사': ['WebSearch', 'OmniSearch', 'Grep', 'Glob', 'Read', 'fact_check', 'memory_recall', 'MsgList'],
   '상시 일': ['schedule_manage', 'schedule_list', 'schedule_create', 'schedule_update', 'session_manage', 'ops_status', 'memory_recall'],
 };
 
@@ -133,6 +136,9 @@ export interface CoreTurnBridgeDeps {
   abortPollMs?: number;
   /** Only the in-process dashboard session opts into TUI routing; daemon ACP stays unchanged. */
   tuiRouting?: boolean;
+  /** TUI-H1-SEAT-GOALLOOP — the seat this TUI works for (`detectSeatTui`), read per turn. null/absent = a human
+   *  conversation TUI (routing unchanged). A seat TUI sends operational directives to the goal loop. */
+  resolveSeat?: () => string | null;
 }
 
 /** Default abort-poll cadence. 50ms = 20 Hz: responsive without
@@ -228,16 +234,24 @@ export function bridgeCoreTurnToAcp(
       // Only a goal-driven harness child (explicit executor role — dev-harness · self-implement surfaces) keeps every
       // turn on the goal loop. A human TUI inside a harness space (one-word `dev --elanous`, `--hold`) is routed (UX 10-07).
       const harness = process.env[HARNESS_ROLE_ENV]?.trim() === 'executor';
+      // seatKnown=false: no resolver (or it threw) — routed as a human TUI, but the log keeps «unknown», not «not a seat».
+      let seat: string | null = null;
+      let seatKnown = false;
+      if (deps.tuiRouting && !harness && deps.resolveSeat) {
+        try { seat = deps.resolveSeat(); seatKnown = true; }
+        catch (error) { debug.log('chat.route', 'seat-unresolved', { error: String(error) }, { level: 'warn' }); }
+      }
       const route = deps.tuiRouting && !harness
         ? classifyTuiChatIntent(turnCtx.userText, {
             hasAttachments: turnCtx.promptBlocks?.some((block) => block.type !== 'text') ?? false,
+            seat: seat !== null,
           })
         : { route: '코딩·구현' as const, reason: harness ? 'harness' : 'legacy', goalLoop: true };
       const tools = !route.goalLoop && route.route !== '코딩·구현' && route.route !== '읽기·분석'
         ? toolsForTuiRoute(availableTools, route.route)
         : availableTools;
       if (deps.tuiRouting) {
-        debug.log('chat.route', 'decided', { route: route.route, reason: route.reason, goalLoop: route.goalLoop });
+        debug.log('chat.route', 'decided', { route: route.route, reason: route.reason, goalLoop: route.goalLoop, seat, seatKnown });
         // Only a quick route is announced: a coding turn's transcript stays exactly as before (preservation).
         // Awaited so the route line precedes the answer; a failed write is observed, not fatal to the turn.
         if (!route.goalLoop) {
@@ -253,6 +267,17 @@ export function bridgeCoreTurnToAcp(
       // 하드코딩 기본 ON 아님 — config 로 아밍(안전).
       const goalLoopCfg = getUserConfig().llm.goalLoop;
       const armGoalLoop = goalLoopCfg?.enabled === true && route.goalLoop;
+      // 인지(TUI-H1-SEAT-GOALLOOP) — 자리 TUI 의 운영 지시가 그래도 단일 턴이면(예: llm.goalLoop 꺼짐) 경고로 남긴다.
+      // 빠른 짧은 물음(short-*)은 자리에서도 «의도적» 단일 턴이라 경고에서 뺀다(«다음 행이 뭐야?»).
+      if (deps.tuiRouting && seat !== null && !armGoalLoop && !route.reason.startsWith('short-')
+        && isSeatOpsDirective(turnCtx.userText)) {
+        try {
+          debug.log('chat.route', 'seat-ops-single-turn', {
+            seat, route: route.route, reason: route.reason, goalLoop: route.goalLoop,
+            goalLoopEnabled: goalLoopCfg?.enabled === true,
+          }, { level: 'warn' });
+        } catch { /* observation cannot interrupt a turn */ }
+      }
       // 사실 질문 예산은 «단일 턴» 전용이다 — goal loop 와 겹치면 예산을 다 쓴 뒤에도 루프가 계속 재촉해
       // 매 continuation 이 «Tool budget reached» 로 거부되고, 모델은 그것을 도구 장애로 읽어 blocked 를 남긴다
       // (10-14 13:48 운영 TUI OP: route short-question·goalLoop ⊕ factQuestion → 소진 뒤 헛호출 7회).
@@ -307,10 +332,17 @@ export function bridgeCoreTurnToAcp(
           safeguard: 'context-pressure-bail',
         });
       }
+      // TUI-SEAT-TURN-CAP — 자리 판정으로 goal loop 에 온 턴만 core 턴 상한·«할 일 0» 판정을 받는다(사람 TUI·하니스 자식 0).
+      const seatTurnCap = armGoalLoop && seat !== null && route.reason.startsWith('seat-')
+        ? { seat, ...resolveSeatTurnCap(parseSeatTurnCapConfig(getUserConfig().chat?.seatTurnCap)) }
+        : undefined;
       const runTurnDispatch = (c: CoreTurnContext): Promise<unknown> =>
         armGoalLoop
           ? runGoalLoop(c, {
               ...(goalLoopCfg?.maxIterations !== undefined ? { maxIterations: goalLoopCfg.maxIterations } : {}),
+              // #29 처방 — 자리 판정으로 goal loop 에 «되돌아온» 턴만 빈 evidence 완료를 답으로 받는다.
+              ...(route.reason.startsWith('seat-') ? { lenientCompletionEvidence: true } : {}),
+              ...(seatTurnCap !== undefined ? { seatTurnCap } : {}),
               ...(goalCtxWindow > 0 ? { contextTokenLimit: goalCtxWindow } : {}),
             })
           : runCoreTurn(c);
@@ -462,10 +494,19 @@ export function bridgeCoreTurnToAcp(
             const visibleFinalText = needsFollowup ? extractLastAssistantText(completedMessages) : finalAssistantText;
             const originalFinalStreamed = needsFollowup && finalAssistantText !== null
               && streamedTextSum.endsWith(finalAssistantText);
+            // TUI-GOAL-REPEAT-ANSWER — 골 루프가 «인사 + 같은 답» 재방출을 화면에서 가리면(원장은 그대로)
+            // 브리지의 스트림 합계에는 그 답이 없다. 그대로 보면 «마지막 답을 못 그렸다»고 재표면화로 다시
+            // 그린다 — 이전 답이 이미 화면에 있는데도. 인사를 뗀 답 부분이 스트림 꼬리에 있으면 «그렸다»로
+            // 본다(골 루프 경로에서만 — 다른 경로의 판정은 그대로).
+            const goalRepeatStrippedFinalText = armGoalLoop && visibleFinalText !== null
+              ? stripGoalRepeatReadbackPreface(visibleFinalText)
+              : visibleFinalText;
             const synthesisAlreadyStreamed =
               visibleFinalText !== null
               && visibleFinalText.length > 0
-              && streamedTextSum.endsWith(visibleFinalText);
+              && (streamedTextSum.endsWith(visibleFinalText)
+                || (goalRepeatStrippedFinalText !== null && goalRepeatStrippedFinalText.length > 0
+                  && streamedTextSum.endsWith(goalRepeatStrippedFinalText)));
             // ⭐ 최종 답 = 모델 답 ⊕ 런타임 검증 보충이면 사용자에겐 «모델 답»만 보인다 — 보충은 로그로(#25).
             //   대화 이력(completedMessages)엔 그대로 남아 다음 턴 맥락은 바뀌지 않는다.
             const supplement = finalSupplement !== null && finalAssistantText === finalSupplement.finalText
@@ -491,7 +532,11 @@ export function bridgeCoreTurnToAcp(
               });
             }
             if (supplement !== null) {
-              const answerStreamed = supplement.answer.length > 0 && streamedTextSum.trimEnd().endsWith(supplement.answer);
+              // TUI-GOAL-REPEAT-ANSWER — 위와 같은 이유: 인사를 뗀 답 부분이 스트림 꼬리에 있으면 그렸다(골 루프만).
+              const answerStreamed = supplement.answer.length > 0
+                && (streamedTextSum.trimEnd().endsWith(supplement.answer)
+                  || (armGoalLoop
+                    && streamedTextSum.trimEnd().endsWith(stripGoalRepeatReadbackPreface(supplement.answer))));
               try {
                 // 보충 «전체»를 남긴다 — 한 행이 저장 전에 잘리지 않게 조각(part/parts)으로 나눈다(리뷰 r3·r4).
                 const redacted = redactSecretText(supplement.supplement);

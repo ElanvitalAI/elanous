@@ -1,8 +1,8 @@
-# Lecture materials → draft → human outline approval → diagrams → HTML → optional PDF.
+# Lecture materials (including audio transcribed during collect) → draft → human outline approval → diagrams → HTML (audio note published to configured PWA vault) → optional PDF.
 graph_id: lecture-note
 loop:
   title: 강의 노트 디지털화
-  description: 자료를 모아 종합 노트를 작성하고 사람 확인 뒤 그림·HTML·PDF를 만든다
+  description: PDF·이미지·Markdown·오디오 조각을 모아(오디오는 전사) 종합 노트를 작성하고 사람 확인 뒤 그림·HTML·PDF를 만든다. 오디오 노트는 HTML 단계에서 설정된 PWA vault에 Markdown으로 발행한다
   exec_request: true
   inputs: [folder]
   trigger:

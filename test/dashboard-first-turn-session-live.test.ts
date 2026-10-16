@@ -1,120 +1,129 @@
-import { expect, test } from 'bun:test';
-import { Database } from 'bun:sqlite';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { ptyAvailable, startPty } from '../src/pty-shell/registry.js';
+import { join } from 'node:path';
+import { closeDashboardForExit } from '../src/dashboard/index.js';
+import { drawDashboardTurnTypeaheadPromptRows } from '../src/dashboard/index.js';
+import { createTurnSubmitFromIntent } from '../src/input/turn-submit.js';
+import { adoptSession, getActiveSessionId, listSessions, setActiveSessionId } from '../src/session/index.js';
+import { startPinnedThinking } from '../src/thinking-line.js';
+import { simHeadlessDashboardFrames, type HeadlessDashboardFrame } from '../src/ux-sim/headless-tui.js';
+import { simTypeaheadState } from '../src/ux-sim/turn-states.js';
 
-test.skipIf(!ptyAvailable())('isolated real TUI first turn attributes input.submit and core.turn to one session', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'elanous-first-turn-'));
-  const state = join(root, 'state');
-  const xdg = join(root, 'xdg');
-  mkdirSync(state);
-  mkdirSync(xdg);
-  const llm = Bun.serve({
-    hostname: '127.0.0.1', port: 0,
-    fetch: () => new Response([
-      'data: {"choices":[{"delta":{"content":"안녕!"},"finish_reason":null}]}',
-      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
-      'data: [DONE]',
-      '',
-    ].join('\n\n'), { headers: { 'content-type': 'text/event-stream' } }),
+// ── 첫 턴 세션 계약 — 장치판 (OP #6509·#6513) ─────────────────────────────────
+//  종전 이 파일은 실물 TUI(PTY ⊕ 로컬 SSE)를 띄워 «첫 턴이 세션 하나를 만들고 submit·turn 이 그 세션에
+//  묶이며 원장에 등록·active 가 되고 /quit 안내가 그 id 를 싣는다»를 쟀다. 게이트 env(XDG_CONFIG_HOME)에서
+//  설정 폴더를 잘못 읽어 LLM 선택 화면에 갇혀 60초 시간초과로 죽었다(preexisting · NOTE-mock-tui-two).
+//  ⇒ 계약을 이루는 «진짜» 조각을 같은 프로세스에서 문다 — 격리 ELANOUS_STATE_DIR 위의
+//  `createTurnSubmitFromIntent`(귀속) · `adoptSession`/`setActiveSessionId`(대시보드 턴 완료 뒤 등록과 같은 호출) ·
+//  `closeDashboardForExit`(종료 안내) · `simHeadlessDashboardFrames`(첫 턴 화면).
+//  ⚠️ 대시보드 클로저의 배선(턴 완료 → currentSessionId → 등록)과 logs.db 행 귀속은 장치 밖이다 —
+//  그 끝-끝 계약은 실물 1건(`scripts/lib/tui-streaming-e2e.test.ts` · spawn 레인)이 문다.
+const SESSION = 'elanous-session-7';
+let root = '';
+let savedStateDir: string | undefined;
+let savedSessionRoot: string | undefined;
+
+beforeEach(() => {
+  root = mkdtempSync(join(tmpdir(), 'elanous-first-turn-sim-'));
+  savedStateDir = process.env.ELANOUS_STATE_DIR;
+  savedSessionRoot = process.env.ELANOUS_SESSION_ROOT;
+  process.env.ELANOUS_STATE_DIR = join(root, 'state');
+  delete process.env.ELANOUS_SESSION_ROOT;
+});
+
+afterEach(() => {
+  if (savedStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+  else process.env.ELANOUS_STATE_DIR = savedStateDir;
+  if (savedSessionRoot === undefined) delete process.env.ELANOUS_SESSION_ROOT;
+  else process.env.ELANOUS_SESSION_ROOT = savedSessionRoot;
+  rmSync(root, { recursive: true, force: true });
+});
+
+const intent = (text: string, sessionId?: string) => ({
+  kind: 'submit-turn' as const,
+  source: { kind: 'keyboard' as const, surface: 'dashboard-chat-main' },
+  text,
+  route: 'plain' as const,
+  ...(sessionId ? { sessionId } : {}),
+});
+
+/** 대시보드가 첫 턴 완료 뒤 부르는 등록(adopt → active) — 같은 함수·같은 인자. */
+function registerCompletedTurn(sessionId: string): void {
+  adoptSession(sessionId, { source: 'tui', transport: 'acp' });
+  setActiveSessionId(sessionId);
+}
+
+describe('first TUI turn session (in-process devices)', () => {
+  test('an isolated universe starts with no session and attributes nothing before the first turn', () => {
+    expect(getActiveSessionId()).toBeNull();
+    expect(listSessions()).toEqual([]);
+    expect(createTurnSubmitFromIntent(intent('안녕')).sessionId).toBeUndefined();
   });
-  writeFileSync(join(root, 'config.json'), JSON.stringify({
-    onboarding: { completed: true },
-    llm: { provider: 'local', model: 'stub-model', baseUrl: `http://127.0.0.1:${llm.port}/v1` },
-  }));
-  const repo = resolve(import.meta.dir, '..');
-  const handle = startPty({
-    cmd: 'bun',
-    args: ['bin/elanous.mjs', `--test=${root}`, '--chat-only'],
-    workdir: repo,
-    cols: 100,
-    rows: 30,
-    env: { ...process.env, NODE_ENV: 'development', XDG_STATE_HOME: xdg, ELANOUS_STATE_DIR: state, TERM: 'xterm-256color' },
+
+  test('first turn registers exactly one session, makes it active, and later submits fall back to it', () => {
+    // 첫 submit 은 ACP 가 민팅한 currentSessionId 를 명시로 싣는다.
+    const first = createTurnSubmitFromIntent(intent('안녕', SESSION));
+    expect(first.sessionId).toBe(SESSION);
+    registerCompletedTurn(SESSION);
+    registerCompletedTurn(SESSION); // 멱등 — 같은 세션은 한 번만 등록된다
+
+    const state = process.env.ELANOUS_STATE_DIR!;
+    expect(existsSync(join(state, 'sessions', `${SESSION}.jsonl`))).toBe(true);
+    expect(readFileSync(join(state, 'elanous', 'active'), 'utf8').trim()).toBe(SESSION);
+    expect(getActiveSessionId()).toBe(SESSION);
+    expect(listSessions().map((session) => session.id)).toEqual([SESSION]);
+    // 명시 id 가 없는 다음 submit 도 같은 세션에 묶인다(active 포인터 폴백).
+    expect(createTurnSubmitFromIntent(intent('둘째')).sessionId).toBe(SESSION);
   });
-  try {
-    // TUI-INPUT-PLACEHOLDER-OFF — the composer no longer paints a guide line,
-    // so an input row holding only «❯» means the first turn is ready.
-    const emptyComposer = (screen: string) => screen.split('\n').some((line) => line.trim() === '❯');
-    const deadline = Date.now() + 60_000;
-    while (!emptyComposer(await handle.renderScreen()) && Date.now() < deadline) await Bun.sleep(100);
-    expect(emptyComposer(await handle.renderScreen())).toBe(true);
-    handle.write('안녕\r');
 
-    const dbPath = join(root, 'logs', 'logs.db');
-    let ids: { category: string; event: string; session_id: string | null }[] = [];
-    while (Date.now() < deadline) {
-      if (existsSync(dbPath)) {
-        const db = new Database(dbPath, { readonly: true });
-        try {
-          ids = db.query("select category,event,session_id from logs where category in ('input.submit','core.turn') order by id").all() as typeof ids;
-        } finally { db.close(); }
-      }
-      if (ids.filter((row) => row.category === 'input.submit').length >= 3
-        && ids.filter((row) => row.category === 'core.turn').length >= 2) break;
-      await Bun.sleep(100);
-    }
-    const submits = ids.filter((row) => row.category === 'input.submit');
-    const turns = ids.filter((row) => row.category === 'core.turn');
-    expect(submits.map((row) => row.event)).toEqual(['create', 'execute.begin', 'execute.ok']);
-    expect(turns.map((row) => row.event)).toEqual(['callbacks-wired', 'dispatch-summary']);
-    const sessionId = submits[0]?.session_id;
-    expect(sessionId).toMatch(/^elanous-session-/);
-    if (typeof sessionId !== 'string') throw new Error(`first turn session id missing: ${String(sessionId)}`);
-    expect([...submits, ...turns].every((row) => row.session_id === sessionId)).toBe(true);
+  test('/quit guidance names the first-turn session and warns only when none was recorded', () => {
+    registerCompletedTurn(SESSION);
+    const named: string[] = [];
+    closeDashboardForExit({ closeTui: () => {}, getSessionId: () => getActiveSessionId() ?? undefined, write: (m) => named.push(m), forceQuit: true });
+    expect(named.join('')).toContain('[session]');
+    expect(named.join('')).toContain(SESSION);
+    expect(named.join('')).not.toContain('기록하지 못했');
 
-    // SESSION-RESUME-ISOLATED 판정선: 첫 턴 완료 뒤 격리 state 에 그 ACP 세션이 등록되고 active 로 지정된다.
-    const sessionFile = join(state, 'sessions', `${sessionId}.jsonl`);
-    let registered = false;
-    while (Date.now() < deadline && !registered) {
-      if (existsSync(sessionFile)) registered = true;
-      else await Bun.sleep(100);
-    }
-    expect(registered).toBe(true);
-    const activePath = join(state, 'elanous', 'active');
-    let activeId: string | undefined;
-    while (Date.now() < deadline && activeId === undefined) {
-      if (existsSync(activePath)) activeId = readFileSync(activePath, 'utf8').trim();
-      else await Bun.sleep(100);
-    }
-    expect(activeId).toBe(sessionId);
-    const sessionDir = join(state, 'sessions');
-    let listed: string[] = [];
-    while (Date.now() < deadline && listed.length === 0) {
-      listed = readdirSync(sessionDir).filter((name) => name.endsWith('.jsonl'));
-      if (listed.length === 0) await Bun.sleep(100);
-    }
-    expect(listed).toEqual([`${sessionId}.jsonl`]);
-    const sessionList = Bun.spawnSync({
-      cmd: ['bun', 'bin/elanous.mjs', `--test=${root}`, 'session', 'list', '--json'],
-      cwd: repo,
-      env: {
-        ...process.env,
-        NODE_ENV: 'development',
-        XDG_STATE_HOME: xdg,
-        ELANOUS_STATE_DIR: state,
-        ELANOUS_SUPPRESS_XDG_WARNING: '1',
-      },
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    expect(sessionList.exitCode).toBe(0);
-    const sessions = JSON.parse(Buffer.from(sessionList.stdout).toString('utf8')) as Array<{ id: string }>;
-    expect(sessions.map((session) => session.id)).toEqual([sessionId]);
+    const missing: string[] = [];
+    closeDashboardForExit({ closeTui: () => {}, getSessionId: () => undefined, write: (m) => missing.push(m), forceQuit: true });
+    expect(missing.join('')).toContain('기록하지 못했');
+  });
 
-    // /quit 경고 0: 첫 턴 뒤 종료 안내에 그 세션 id 가 실린다(«세션 id 를 기록하지 못했습니다» 없음).
-    handle.write('/quit\r');
-    let exitOutput = '';
-    while (Date.now() < deadline && !exitOutput.includes('[session]')) {
-      exitOutput = handle.snapshot();
-      if (!exitOutput.includes('[session]')) await Bun.sleep(100);
-    }
-    expect(exitOutput).not.toContain('기록하지 못했');
-    expect(exitOutput).toContain(sessionId);
-  } finally {
-    handle.kill();
-    llm.stop(true);
-    rmSync(root, { recursive: true, force: true });
-  }
-}, 75_000);
+  test('first turn screen: empty composer → echoed prompt and streamed answer → empty composer again', async () => {
+    const rows = 12;
+    const cols = 80;
+    const frame = (log: string[], turnLine: string | null): HeadlessDashboardFrame => {
+      let caret: { row: number; col: number; visible: boolean } | null = null;
+      const prompt = drawDashboardTurnTypeaheadPromptRows({
+        frame: { inputHeight: 1, promptTopRow: rows, promptBottomRow: rows, topDividerRow: rows - 1, bottomDividerRow: rows },
+        height: 1, placeholder: '❯ ', prompt: '❯ ', state: simTypeaheadState({ phase: turnLine ? 'streaming' : 'idle' }), width: cols,
+      }, (paint) => { caret = paint.caret; });
+      const body = rows - 3;
+      const tail = log.slice(-body);
+      return {
+        lines: [...tail, ...Array.from({ length: body - tail.length }, () => ''), turnLine ?? '', '─'.repeat(cols), ...prompt],
+        input: { overlay: '', force: false, cursorOwner: 'none', claimedCursor: null, promptCaret: caret, suppressPromptArea: false },
+      };
+    };
+    const target: { current: string | null } = { current: null };
+    const thinking = startPinnedThinking({ target, onFrame: () => {}, message: 'Streaming', intervalMs: 0, metrics: { startedAt: Date.now() - 1_000, hint: 'esc 중단' } });
+    const streaming = target.current ?? '';
+    thinking.stop();
+    const done = target.current ?? '';
+    const [boot, turn, after] = await simHeadlessDashboardFrames([
+      frame([], null),
+      frame(['', '❯ 안녕', '안녕!'], streaming),
+      frame(['', '❯ 안녕', '안녕!', done], null),
+    ], { rows, cols });
+    const emptyComposer = (lines: readonly string[]) => lines.some((line) => line.trim() === '❯');
+    expect(emptyComposer(boot!.lines)).toBe(true);
+    expect(turn!.lines.join('\n')).toContain('esc 중단');
+    expect(emptyComposer(turn!.lines)).toBe(true);
+    expect(after!.lines.join('\n')).toContain('✔ 완료');
+    expect(after!.lines.join('\n')).not.toContain('Streaming…');
+    expect(after!.lines.filter((line) => line.includes('❯ 안녕'))).toHaveLength(1);
+    expect(emptyComposer(after!.lines)).toBe(true);
+    expect(after!.cursor).toEqual({ row: rows, col: '❯ '.length + 1 });
+  });
+});

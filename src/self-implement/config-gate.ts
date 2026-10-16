@@ -8,6 +8,7 @@
 //   셸 검사는 `zsh -n`/`bash -n`(구문만·미실행). JSON/TOML 은 인-프로세스 파싱(외부 프로세스 불필요).
 
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 
@@ -32,7 +33,7 @@ export function runConfigSyntaxGate(filePath: string): ConfigGateResult {
   const isBash = /(^|\.)(bashrc|bash_profile|bash_login|profile|bash_aliases)$/.test(name) || name.endsWith('.bash') || name.endsWith('.sh');
   if (isZsh || isBash) {
     const shell = isZsh ? 'zsh' : 'bash';
-    const r = spawnSync(shell, ['-n', filePath], { encoding: 'utf8', timeout: SHELL_TIMEOUT_MS });
+    const r = spawnSync(shell, ['-n', filePath], { encoding: 'utf8', timeout: SHELL_TIMEOUT_MS, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
     // 셸 미설치(status=null·ENOENT) → 검사 불가로 skip(차단 아님·HITL diff 로 검증).
     if (r.error || r.status === null) return { passed: true, checked: false, label: `${shell} -n (미설치)`, log: String(r.error?.message ?? 'shell 없음') };
     return { passed: r.status === 0, checked: true, label: `${shell} -n`, log: `${r.stdout ?? ''}${r.stderr ?? ''}`.slice(-2000) };

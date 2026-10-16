@@ -1,10 +1,11 @@
-import { expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { describe, expect, test } from 'bun:test';
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { aggregateGateTestShards } from './shard-aggregate.js';
-import { runBunShard, runShardedGateTests, type ShardProcess } from './shard-run.js';
-import type { GateTestShard } from './shard-plan.js';
+import { runBunShard, runBunShardWithSpawn, runShardedGateTests, SHARD_FAILURE_TAIL_BYTES, selfGateShardTimeoutMs, writeShardFailureEvidence, type ShardProcess } from './shard-run.js';
+import { GATE_SPAWN_LANE_FILES, isGateSpawnLaneFile } from './spawn-lane-files.js';
+import { planFixedGateTestShards, type GateTestShard } from './shard-plan.js';
 
 const xml = (files: readonly string[], failing: readonly string[]) => `<testsuites tests="${files.length}">`
   + files.map((file) => `<testsuite file="${file}" tests="1" failures="${failing.includes(file) ? 1 : 0}">`
@@ -36,6 +37,57 @@ test('six fake test files in two processes have the same introduced/preexisting 
   expect(result.aggregate.report).toMatchObject({ introduced: unsharded.report?.introduced, preexisting: unsharded.report?.preexisting });
   expect(result.aggregate.report?.failures.map((f) => [f.name, f.attribution]).sort())
     .toEqual(unsharded.report?.failures.map((f) => [f.name, f.attribution]).sort());
+});
+
+test('self gate separates real spawn files under the same shard budget and retains every file', () => {
+  const files = ['test/preview-terminal.test.ts', 'test/cli-dev-command.test.ts', 'test/plain-a.test.ts', 'test/plain-b.test.ts'];
+  const calls: string[][] = [];
+  const run: ShardProcess = (cwd, selected) => {
+    calls.push([cwd, ...selected]);
+    return { exitCode: 0, junit: xml(selected, []), rssMb: 100, seconds: 1 };
+  };
+  const baseline = (_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base');
+  const result = runShardedGateTests('/head', files, 'HEAD', 3, run,
+    baseline as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree, 1);
+  expect(result.aggregate.status).toBe('passed');
+  expect(result.shards.flatMap((shard) => shard.files).sort()).toEqual(files.sort());
+  expect(new Set(result.shards.map((shard) => shard.id)).size).toBe(result.shards.length);
+  expect(result.shards.every((shard) => shard.files.every(isGateSpawnLaneFile)
+    || shard.files.every((file) => !isGateSpawnLaneFile(file)))).toBe(true);
+  expect(calls.filter(([cwd]) => cwd === '/head')).toHaveLength(files.length + result.shards.length);
+  expect(selfGateShardTimeoutMs(['test/plain-a.test.ts'])).toBe(300_000);
+  expect(selfGateShardTimeoutMs(['test/preview-terminal.test.ts'])).toBe(120_000);
+  expect(() => selfGateShardTimeoutMs(['test/plain-a.test.ts', 'test/preview-terminal.test.ts'])).toThrow('mixed');
+  expect(runShardedGateTests('/head', files, 'HEAD', 1, run,
+    baseline as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree, 1).aggregate.status).toBe('unmeasured');
+});
+
+test('all ten real child files occupy three bounded shards beside a regular shard', () => {
+  const files = [...GATE_SPAWN_LANE_FILES, 'test/ordinary.test.ts'];
+  const run: ShardProcess = (_cwd, selected) => ({
+    exitCode: 0, junit: xml(selected, []), rssMb: 100, seconds: 1,
+  });
+  const baseline = (_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base');
+  const result = runShardedGateTests('/head', files, 'HEAD', 4, run,
+    baseline as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree, 8);
+  expect(result.aggregate.status).toBe('passed');
+  expect(result.shards.flatMap((shard) => shard.files).sort()).toEqual(files.sort());
+  expect(result.shards.filter((shard) => shard.files.every(isGateSpawnLaneFile))).toHaveLength(3);
+  expect(result.shards.filter((shard) => shard.files.every((file) => !isGateSpawnLaneFile(file)))).toHaveLength(1);
+});
+
+test('explicit four shards are all spawn shards when only real child files are selected', () => {
+  const files = [...GATE_SPAWN_LANE_FILES];
+  const run: ShardProcess = (_cwd, selected) => ({
+    exitCode: 0, junit: xml(selected, []), rssMb: 100, seconds: 1,
+  });
+  const baseline = (_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base');
+  const result = runShardedGateTests('/head', files, 'HEAD', 4, run,
+    baseline as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree, 8);
+  expect(result.aggregate.status).toBe('passed');
+  expect(result.shards).toHaveLength(4);
+  expect(result.shards.flatMap((shard) => shard.files).sort()).toEqual(files.sort());
+  expect(result.shards.every((shard) => shard.files.every(isGateSpawnLaneFile))).toBe(true);
 });
 
 test('one unavailable file measurement uses the mean weights and still executes every shard', () => {
@@ -124,6 +176,50 @@ test('real Bun JUnit runner records process RSS, duration, and selected files on
   }
 });
 
+test('Bun child launch gets 120s for real spawn files and retains 300s for regular tests', () => {
+  const launched: Array<{ command: readonly string[]; timeout: number | undefined }> = [];
+  const spawn = ((command: string[], options: { timeout?: number }) => {
+    launched.push({ command, timeout: options.timeout });
+    return { exitCode: 0, signalCode: null, stdout: new Uint8Array(), stderr: new Uint8Array(), resourceUsage: { maxRSS: 1024 * 1024 } };
+  }) as unknown as typeof Bun.spawnSync;
+  const cwd = mkdtempSync(join(tmpdir(), 'elanous-shard-launch-test-'));
+  try {
+    runBunShardWithSpawn(cwd, ['test/preview-terminal.test.ts'], spawn);
+    runBunShardWithSpawn(cwd, ['test/ordinary.test.ts'], spawn);
+    expect(launched).toHaveLength(2);
+    expect(launched[0]?.command).toContain('--timeout=120000');
+    expect(launched[0]?.timeout).toBe(120_000);
+    expect(launched[1]?.command).not.toContain('--timeout=120000');
+    expect(launched[1]?.timeout).toBe(300_000);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('Bun child receives the isolated baseline with explicit fake LLM off and endpoint', () => {
+  const previousFake = process.env.ELANOUS_TEST_FAKE_LLM;
+  const previousEndpoint = process.env.OPENAI_BASE_URL;
+  const cwd = mkdtempSync(join(tmpdir(), 'elanous-shard-env-test-'));
+  let childEnv: Record<string, string | undefined> | undefined;
+  try {
+    process.env.ELANOUS_TEST_FAKE_LLM = '0';
+    process.env.OPENAI_BASE_URL = 'http://127.0.0.1:9555';
+    const spawn = ((_command: string[], options: { env?: Record<string, string | undefined> }) => {
+      childEnv = options.env;
+      return { exitCode: 0, signalCode: null, stdout: new Uint8Array(), stderr: new Uint8Array(), resourceUsage: { maxRSS: 1024 * 1024 } };
+    }) as unknown as typeof Bun.spawnSync;
+    runBunShardWithSpawn(cwd, ['test/preview-terminal.test.ts'], spawn);
+    expect(childEnv).toMatchObject({ TZ: 'UTC', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8',
+      ELANOUS_TEST_FAKE_LLM: '0', OPENAI_BASE_URL: 'http://127.0.0.1:9555' });
+  } finally {
+    if (previousFake === undefined) delete process.env.ELANOUS_TEST_FAKE_LLM;
+    else process.env.ELANOUS_TEST_FAKE_LLM = previousFake;
+    if (previousEndpoint === undefined) delete process.env.OPENAI_BASE_URL;
+    else process.env.OPENAI_BASE_URL = previousEndpoint;
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test('a Bun exit 2 before JUnit preserves only bounded, redacted output', () => {
   const cwd = mkdtempSync(join(tmpdir(), 'elanous-shard-exit-test-'));
   try {
@@ -144,4 +240,138 @@ test('a Bun exit 2 before JUnit preserves only bounded, redacted output', () => 
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
+});
+
+describe('fixed shard distribution (opt-in · no pre-measurement)', () => {
+  type Baseline = typeof import('../self-implement/gate-baseline.js').withBaselineWorktree;
+  const baseline = ((_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base')) as unknown as Baseline;
+  const files = Array.from({ length: 7 }, (_, i) => `test/g${i}.test.ts`);
+
+  test('the same file set in any order gets the same sorted round-robin assignment, every file exactly once', () => {
+    const expected = planFixedGateTestShards(files, 3);
+    expect(expected.map((shard) => shard.files)).toEqual([
+      ['test/g0.test.ts', 'test/g3.test.ts', 'test/g6.test.ts'],
+      ['test/g1.test.ts', 'test/g4.test.ts'],
+      ['test/g2.test.ts', 'test/g5.test.ts'],
+    ]);
+    for (const order of [[...files].reverse(), [files[3]!, files[0]!, files[6]!, files[1]!, files[5]!, files[2]!, files[4]!], [...files, files[2]!]]) {
+      const planned = planFixedGateTestShards(order, 3);
+      expect(planned).toEqual(expected);
+      const dealt = planned.flatMap((shard) => shard.files);
+      expect(dealt.length).toBe(files.length);
+      expect([...dealt].sort()).toEqual([...files].sort());
+    }
+  });
+
+  test('no empty shards, invalid N rejected, spawn lane kept apart', () => {
+    expect(planFixedGateTestShards(files.slice(0, 2), 8).map((shard) => shard.id)).toEqual(['shard-1', 'shard-2']);
+    expect(planFixedGateTestShards([], 4)).toEqual([]);
+    for (const bad of [0, -1, 1.5, Number.NaN]) expect(() => planFixedGateTestShards(files, bad)).toThrow('invalid shard count');
+    const spawnFile = [...GATE_SPAWN_LANE_FILES][0]!;
+    const mixed = planFixedGateTestShards([spawnFile, ...files], 4);
+    expect(mixed.every((shard) => shard.files.every(isGateSpawnLaneFile) || shard.files.every((file) => !isGateSpawnLaneFile(file)))).toBe(true);
+    expect(mixed.flatMap((shard) => shard.files).sort()).toEqual([spawnFile, ...files].sort());
+    expect(() => planFixedGateTestShards([spawnFile, files[0]!], 1)).toThrow('spawn lane');
+  });
+
+  test('runShardedGateTests makes zero single-file measurement runs and keeps the aggregate shape', () => {
+    const calls: string[][] = [];
+    const run: ShardProcess = (cwd, selected) => {
+      calls.push([cwd, ...selected]);
+      return { exitCode: 0, junit: xml(selected, []) };
+    };
+    const result = runShardedGateTests('/head', [...files].reverse(), 'HEAD', 3, run, baseline, undefined, { fixedDistribution: true });
+    expect(result.distribution).toBe('fixed');
+    expect(result.measurementFailures).toBeUndefined();
+    expect(result.shards.map((shard) => shard.files)).toEqual(planFixedGateTestShards(files, 3).map((shard) => shard.files));
+    // one current + one baseline run per shard — none is a per-file RSS sample
+    expect(calls).toHaveLength(6);
+    expect(calls.filter(([cwd]) => cwd === '/head').map((call) => call.slice(1))).toEqual(result.shards.map((shard) => shard.files));
+    expect(result.aggregate).toEqual({ status: 'passed', retryShardIds: [] });
+  });
+
+  test('a timed-out / OOM-killed or JUnit-less shard is unmeasured, never passed', () => {
+    const killed: ShardProcess = (cwd, selected) => selected.includes('test/g1.test.ts') && cwd === '/head'
+      ? { exitCode: null, signal: 'SIGKILL' }
+      : { exitCode: 0, junit: xml(selected, []) };
+    const oom = runShardedGateTests('/head', files, 'HEAD', 3, killed, baseline, undefined, { fixedDistribution: true });
+    expect(oom.aggregate.status).toBe('unmeasured');
+    expect(oom.aggregate.retryShardIds).toEqual(['shard-2']);
+    expect(oom.attempts.filter((attempt) => attempt.shardId === 'shard-2')).toHaveLength(2);
+    const noJUnit: ShardProcess = (cwd, selected) => cwd === '/head' && selected.includes('test/g0.test.ts')
+      ? { exitCode: 1, junit: undefined }
+      : { exitCode: 0, junit: xml(selected, []) };
+    expect(runShardedGateTests('/head', files, 'HEAD', 3, noJUnit, baseline, undefined, { fixedDistribution: true }).aggregate.status).toBe('unmeasured');
+  });
+
+  test('without the mode the measured planner still samples every file first', () => {
+    const singles: string[] = [];
+    const run: ShardProcess = (cwd, selected) => {
+      if (selected.length === 1 && cwd === '/head') singles.push(selected[0]!);
+      return { exitCode: 0, junit: xml(selected, []), rssMb: 100, seconds: 1 };
+    };
+    const result = runShardedGateTests('/head', files, 'HEAD', 3, run, baseline, 1);
+    expect(result.distribution).toBeUndefined();
+    expect(singles.slice(0, files.length)).toEqual(files);
+  });
+});
+
+describe('OP FU (MK #8178 shard-9) — a failed shard leaves <shardId>.failure.json; a passing one leaves nothing', () => {
+  const files = ['test/ok.test.ts', 'test/boom.test.ts'];
+  const baseline = ((_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base')) as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree;
+  // Fake child: test/boom exits 2 before writing JUnit (huge stdout, a secret on stderr); everything else writes JUnit and exits 0.
+  const fakeSpawn = ((command: string[]) => {
+    const outfile = command.find((arg) => arg.startsWith('--reporter-outfile='))!.slice('--reporter-outfile='.length);
+    const selected = command.filter((arg) => arg.endsWith('.test.ts'));
+    if (selected.includes('test/boom.test.ts')) {
+      const stdout = new TextEncoder().encode(`HEAD-MARKER ${'x'.repeat(SHARD_FAILURE_TAIL_BYTES)} TAIL-MARKER`);
+      const stderr = new TextEncoder().encode('error: preload crashed API_KEY=supersecretvalue12345');
+      return { exitCode: 2, signalCode: null, stdout, stderr, resourceUsage: { maxRSS: 1024 * 1024 } };
+    }
+    writeFileSync(outfile, xml(selected, []));
+    return { exitCode: 0, signalCode: null, stdout: new Uint8Array(), stderr: new Uint8Array(), resourceUsage: { maxRSS: 1024 * 1024 } };
+  }) as unknown as typeof Bun.spawnSync;
+  const run: ShardProcess = (cwd, selected) => runBunShardWithSpawn(cwd, selected, fakeSpawn);
+
+  test('exit 2 · no JUnit → failure.json with the shard files and the bounded stdout/stderr tails', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-shard-failure-test-'));
+    try {
+      const result = runShardedGateTests('/head', files, 'HEAD', 2, run, baseline, undefined, { fixedDistribution: true });
+      expect(result.aggregate.status).toBe('unmeasured');
+      const boomShard = result.shards.find((shard) => shard.files.includes('test/boom.test.ts'))!;
+      const okShard = result.shards.find((shard) => shard.files.includes('test/ok.test.ts'))!;
+      expect(boomShard.id).not.toBe(okShard.id);
+      expect(result.failureEvidence!.every((item) => item.shardId === boomShard.id)).toBe(true);
+      const written = writeShardFailureEvidence(dir, result.failureEvidence!);
+      expect(written).toEqual([join(dir, `${boomShard.id}.failure.json`)]);
+      expect(readdirSync(dir)).toEqual([`${boomShard.id}.failure.json`]);
+      const record = JSON.parse(readFileSync(written[0]!, 'utf8'));
+      expect(record).toMatchObject({ shardId: boomShard.id, files: boomShard.files, exitCode: 2, signal: null, side: 'current' });
+      expect(record.durationMs).toBeGreaterThanOrEqual(0);
+      expect(record.stdoutTail).toEndWith('TAIL-MARKER');
+      expect(record.stdoutTail).not.toContain('HEAD-MARKER');
+      expect(Buffer.byteLength(record.stdoutTail)).toBeLessThanOrEqual(SHARD_FAILURE_TAIL_BYTES);
+      expect(record.stderrTail).toContain('preload crashed');
+      expect(record.stderrTail).not.toContain('supersecretvalue12345');
+      // both sides and both rounds are kept under `failures`
+      expect(record.failures.map((item: { side: string; attempt: number }) => `${item.side}#${item.attempt}`))
+        .toEqual(['current#1', 'baseline#1', 'current#2', 'baseline#2']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('passing shards report no failure output and write no file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-shard-failure-pass-'));
+    try {
+      const result = runShardedGateTests('/head', ['test/ok.test.ts'], 'HEAD', 1, run, baseline, undefined, { fixedDistribution: true });
+      expect(result.aggregate.status).toBe('passed');
+      expect(result.failureEvidence).toBeUndefined();
+      expect(run('/head', ['test/ok.test.ts']).failure).toBeUndefined();
+      expect(writeShardFailureEvidence(join(dir, 'never'), [])).toEqual([]);
+      expect(existsSync(join(dir, 'never'))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

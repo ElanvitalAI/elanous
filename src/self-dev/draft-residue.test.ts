@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, chmodSync } from 'node:fs';
 import { gzipSync } from 'node:zlib';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -739,5 +739,66 @@ describe('Pod terminal residue', () => {
       expect(failed.disposition?.stage).toBe(good.disposition?.stage);
       expect(events.filter((row) => row.event === 'failed' && row.data.reason === 'test hook failed')).toHaveLength(1);
     } finally { off(); }
+  });
+
+  test('default adapter lists hundreds of open drafts carrying large bodies across paginated gh pages — no spawnSync ENOBUFS (DRAFT-RESIDUE-ENOBUFS)', async () => {
+    // 350 open PRs × 24 KiB bodies → each 100-item REST page is ~2.4 MiB, far past the 1 MiB spawnSync default
+    // that produced the daily `spawnSync gh ENOBUFS`. The listing must still come back whole (DRAFT-RESIDUE-ENOBUFS).
+    const binDir = mkdtempSync(join(tmpdir(), 'draft-residue-gh-pages-'));
+    writeFileSync(join(binDir, 'gh'), [
+      `#!${process.execPath}`,
+      `const arg = process.argv.find((a) => a.startsWith('repos/')) || '';`,
+      `const page = Number(new URLSearchParams(arg.split('?')[1] || '').get('page') || '1');`,
+      `const rows = [];`,
+      `for (let i = (page - 1) * 100; i < page * 100 && i < 350; i++) {`,
+      `  rows.push({ number: i + 1, title: 'Goal ' + (i + 1), headRefName: 'self-impl/br-' + (i + 1), createdAt: '2026-10-14T00:00:00Z',`,
+      `    body: 'b'.repeat(24576), labels: [{ name: 'elanous:harvestable' }], draft: true });`,
+      `}`,
+      `// page 1 also carries a non-draft PR — it must never surface in the open-draft inventory`,
+      `if (page === 1) rows.push({ number: 900001, title: 'human PR', headRefName: 'main', createdAt: '2026-10-14T00:00:00Z', body: '', labels: [], draft: false });`,
+      `process.stdout.write(JSON.stringify(rows));`,
+    ].join('\n'));
+    chmodSync(join(binDir, 'gh'), 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${binDir}${previousPath ? `:${previousPath}` : ''}`;
+    try {
+      const drafts = await defaultAdapters().listOpenDrafts('ElanvitalAI/elanous');
+      expect(drafts).toHaveLength(350);
+      expect(drafts?.every((draft) => draft.number >= 1 && draft.number <= 350)).toBe(true);
+      expect(drafts?.every((draft) => (draft.body ?? '').length === 24576)).toBe(true);
+      expect(drafts?.[0]).toMatchObject({ number: 1, branch: 'self-impl/br-1', labels: ['elanous:harvestable'] });
+    } finally {
+      process.env.PATH = previousPath;
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  test('a failed open-draft listing is «못 셍음» — undefined with an unobserved event, never a disguised zero (DRAFT-RESIDUE-ENOBUFS)', async () => {
+    const binDir = mkdtempSync(join(tmpdir(), 'draft-residue-gh-fail-'));
+    writeFileSync(join(binDir, 'gh'), [
+      `#!${process.execPath}`,
+      `process.stderr.write('gh: API rate limit exceeded\\n');`,
+      `process.exitCode = 1;`,
+    ].join('\n'));
+    chmodSync(join(binDir, 'gh'), 0o755);
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const off = debug.registerSink({ name: 'draft-residue-unobserved-test', emit: (row) => {
+      if (row.category === 'draft.residue' && row.event === 'list-open-drafts-unobserved') events.push({ event: row.event, data: row.data as Record<string, unknown> });
+    } });
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${binDir}${previousPath ? `:${previousPath}` : ''}`;
+    try {
+      const drafts = await defaultAdapters().listOpenDrafts('ElanvitalAI/elanous');
+      // Unmeasurable, not zero: no array, no count — nothing downstream may read a failed listing as "0 open drafts".
+      expect(drafts).toBeUndefined();
+      expect(Array.isArray(drafts)).toBe(false);
+      expect(events).toHaveLength(1);
+      expect(events[0]?.data).toMatchObject({ repository: 'ElanvitalAI/elanous' });
+      expect(String(events[0]?.data.reason)).toContain('gh: API rate limit exceeded');
+    } finally {
+      off();
+      process.env.PATH = previousPath;
+      rmSync(binDir, { recursive: true, force: true });
+    }
   });
 });

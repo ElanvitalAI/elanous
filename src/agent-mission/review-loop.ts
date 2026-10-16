@@ -361,9 +361,12 @@ export function extractAppliedReviewItems(comments: readonly NonNullable<LatestR
 /** 브랜치의 열린 PR 코멘트에서 이전 self-dev 반영분을 fail-soft로 읽는다. */
 export function fetchAppliedReviewItemsForBranch(branch: string, runGh: (args: string[]) => string = gh): AppliedReviewItems {
   try {
-    const raw = runGh(['pr', 'view', branch, '--json', 'comments']);
-    const source = JSON.parse(raw) as LatestReviewSource;
-    const signals = filterReviewSignals(source);
+    // A Pod repair uses the synthetic worktree base `pr-N`; GitHub knows that
+    // source by PR number, not by the synthetic branch name.
+    const source = /^pr[:-]([1-9]\d*)$/.exec(branch)?.[1] ?? branch;
+    const raw = runGh(['pr', 'view', source, '--json', 'comments']);
+    const reviewSource = JSON.parse(raw) as LatestReviewSource;
+    const signals = filterReviewSignals(reviewSource);
     return { basePrLocated: true, ...analyzeAppliedReviewItems(signals.selfAuthoredComments) };
   } catch {
     return { basePrLocated: false, items: [], headlineComments: 0 };

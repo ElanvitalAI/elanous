@@ -26,6 +26,7 @@ import {
 import { debug, redactSecrets, redactSecretText } from './debug/log.js';
 import { llmUsageCostFields } from './budget/llm-cost.js';
 import { accumulateByokUsage } from './llm/openrouter-byok-cost.js';
+import { ACTION_PHASE_OPS_TOOLS, isSteeredShellRejection, REPAIR_PHASE_READ_ONLY_OPS_TOOLS } from './llm/tool-loop-steered-rejection.js';
 import { ToolCallTiming } from './chat/tool-call-timing.js';
 import {
   dispatchWithParallelSafety,
@@ -397,6 +398,14 @@ export interface LLMOpts {
    *  e.g. driving a headless coding-agent terminal (SpawnCodingAgentHeadless
    *  + PtyShell Snapshot/Send loop). Absent ⇒ no extension (default). */
   budgetGrant?: { tools: readonly string[]; perCall: number; ceiling: number };
+  /** TUI-GOAL-LOOP-FRICTION(#46·#63) — «종결 신호» 도구 이름(예: goal loop 의 `update_goal`).
+   *  ① 도구 예산·탐색 예산·후속 단계의 거부를 받지 않는다 — 완료 신호를 «TOOL CALL REJECTED» 로
+   *    막으면 모델이 둘째 답 ⊕ 사과를 쓴다(#46).
+   *  ② 한 턴의 호출이 «종결 신호뿐»이고 그 턴(또는 이전 도구 라운드)에 답 텍스트가 있으면, 신호를
+   *    디스패치한 뒤 다음 모델 턴을 열지 않고 그 답으로 끝낸다 — 빈 턴 반복 → `[NO FINAL SYNTHESIS]`(#63) 차단.
+   *  ③ 종결 신호를 받은 뒤의 빈 턴 포기에도 이미 쓴 답이 있으면 `[NO FINAL SYNTHESIS]` 를 붙이지 않는다.
+   *  비우면(기본) 종전 동작 그대로. */
+  terminalToolNames?: readonly string[];
   /** Prompt-caching toggle. Honored by Anthropic (attaches
    *  cache_control markers on system + tools + 2nd-to-last history
    *  message) and OpenAI (passes stream_options.include_usage so
@@ -5774,10 +5783,13 @@ const TOOL_LOOP_PHASE_DIRECTIVES: Record<ToolLoopFollowupPhase, (autoNarrowedRea
   'repair-action': () =>
     'REPAIR ACTION REQUIRED — execution has already failed or a debugging repair step is armed. '
     + 'Stop gathering more files and move to Edit/Write/RunShell/Bash or a narrow code-intel followup (Read/Lsp/AstGrep/Grep content/count), '
+    + 'ops ledger/delegate tools (MsgList/MsgPost/MsgAck/Checklist*/AgentOutput) still run, '
     + 'or answer in plain text if no code change is needed (e.g. a read-only investigation whose finding is the deliverable).',
   'verify-action': () =>
     'VERIFY ACTION REQUIRED — edits already happened. '
-    + 'Stop gathering more files and move to RunShell/Bash/Agent or a narrow verification followup (Read/Lsp/Grep content/count), or answer in plain text if verification is not needed.',
+    + 'Stop gathering more files and move to RunShell/Bash/Agent or a narrow verification followup (Read/Lsp/Grep content/count), '
+    + 'ops ledger/delegate tools (MsgList/MsgPost/MsgAck/Checklist*/AgentOutput) still run, '
+    + 'or answer in plain text if verification is not needed.',
 };
 
 const TOOL_LOOP_PHASE_REJECTION_EVENTS: Record<ToolLoopFollowupPhase, string> = {
@@ -7819,6 +7831,7 @@ const EXPLORATORY_TOOLS = new Set([
 ]);
 
 const INSPECT_ACTION_TOOLS = new Set([
+  ...ACTION_PHASE_OPS_TOOLS,
   'Edit',
   'Write',
   'Bash',
@@ -7833,6 +7846,7 @@ const INSPECT_ACTION_TOOLS = new Set([
 ]);
 
 const VERIFY_ACTION_TOOLS = new Set([
+  ...ACTION_PHASE_OPS_TOOLS,
   'Edit',
   'Write',
   'RunShell',
@@ -7848,6 +7862,7 @@ const VERIFY_ACTION_TOOLS = new Set([
 ]);
 
 const EXECUTION_ACTION_TOOLS = new Set([
+  ...ACTION_PHASE_OPS_TOOLS,
   'RunShell',
   'Bash',
   'Agent',
@@ -7861,6 +7876,8 @@ const EXECUTION_ACTION_TOOLS = new Set([
 ]);
 
 const REPAIR_ACTION_TOOLS = new Set([
+  ...REPAIR_PHASE_READ_ONLY_OPS_TOOLS,
+  ...ACTION_PHASE_OPS_TOOLS,
   'Edit',
   'Write',
   'RunShell',
@@ -8194,10 +8211,14 @@ export async function streamLLMWithTools(
   let blockedProviders: ProviderFallbackAttempt[] = [];
   const effectiveModel = activeModel;
   const modelFamily = getModelFamily(effectiveModel);
+  // TUI-GPT6-GUARD-PARITY — codex «모델 행동» 가드 켬 여부(단일 원천 = models/prompts.ts
+  // usesCodexBehaviorGuards). gpt-6 세대도 true. 넓힌 자리·안 넓힌 자리는 그 함수 주석이 정본.
+  const codexBehaviorGuards = usesCodexBehaviorGuards(effectiveModel);
   debug.log('llm.router', 'streamLLMWithTools', {
     provider: provider.name,
     model: effectiveModel,
     modelFamily,
+    codexBehaviorGuards,
     messageCount: messages.length,
     messageRoles: summarizeRoles(messages),
     tools: opts.tools?.map(t => t.name),
@@ -8373,6 +8394,12 @@ export async function streamLLMWithTools(
   };
   let fullText = '';
   let sawToolRound = false;
+  // TUI-GOAL-LOOP-FRICTION — 종결 신호 도구(LLMOpts.terminalToolNames). 비면 아래 분기는 전부 꺼진다.
+  const terminalToolNames: ReadonlySet<string> = new Set(opts.terminalToolNames ?? []);
+  /** 이 스트림에서 종결 신호를 한 번이라도 디스패치했나. */
+  let terminalSignalDispatched = false;
+  /** 도구 라운드에 실린 마지막 «비지 않은» 답 텍스트(종결 신호 턴 마감·빈 턴 포기에서 쓴다). */
+  let lastToolRoundText = '';
   const agentBatchTickIntervalMs = opts.agentBatchTickIntervalMs ?? BATCH_TICK_INTERVAL_MS;
 
   // Empty-turn guard: smaller models (gpt-5.4-mini, haiku) sometimes
@@ -8436,6 +8463,8 @@ export async function streamLLMWithTools(
   // instructing the model to reuse prior tool_results or write its
   // final answer. Codex-family-only: Claude path is unaffected.
   const seenToolCallSignatures = new Map<string, number>();
+  // TUI-INITIATIVE-S ② — 같은 도구·같은 인자가 «같은 오류»로 끝난 횟수(성공하면 지운다). 아래 L-2 차단을 gpt 계열·비탐색 도구로 넓힌다.
+  const erroredToolCallSignatures = new Map<string, { error: string; count: number }>();
   // W3-A + extension (2026-05-03) — Broad-spot dedup map. MUST live
   // outside the turn loop so the counter persists across turns. (Bug
   // 2026-05-03 PM: original placement inside turn loop reset the map
@@ -9006,6 +9035,17 @@ export async function streamLLMWithTools(
     // MAX_EMPTY_RETRIES times. Beyond that, return an explicit
     // no-synthesis notice instead of silently ending the turn empty.
     if (pendingCalls.length === 0 && turnText.length === 0) {
+      // TUI-GOAL-LOOP-FRICTION(#63) — 종결 신호(update_goal)를 이미 받았고 답도 이미 썼다 = 할 말이 없는 게 맞다.
+      //   빈 턴을 «정체»로 보고 재촉·`[NO FINAL SYNTHESIS]` 를 붙이지 않고 그 답으로 끝낸다.
+      if (terminalSignalDispatched && lastToolRoundText.trim().length > 0) {
+        const answer = lastToolRoundText;
+        debug.log('goal.loop', 'empty-turn-after-terminal-signal', {
+          turn, emptyRetries, answerChars: answer.length,
+        }, { level: 'info' });
+        if (answer !== fullText) handlers.onText('', answer);
+        emitTurnComplete(answer);
+        return answer;
+      }
       if (emptyRetries >= MAX_EMPTY_RETRIES) {
         const notice = buildNoFinalSynthesisNotice('empty-turn');
         const visibleText = finalizeVisibleAssistantText(
@@ -9041,6 +9081,11 @@ export async function streamLLMWithTools(
       clearVisibleAssistantTextForToolRound(handlers, sawToolRound);
     }
     sawToolRound = true;
+    if (turnText.trim().length > 0) lastToolRoundText = turnText;
+    // TUI-GOAL-LOOP-FRICTION(#46) — 이 턴의 호출이 «종결 신호뿐»이면 예산·후속 단계 거부를 걸지 않는다.
+    const terminalOnlyTurn = terminalToolNames.size > 0
+      && pendingCalls.length > 0
+      && pendingCalls.every((call) => terminalToolNames.has(call.name));
     const wasExploratoryTurn = isExploratoryTurn(pendingCalls);
     const prevExploratoryStreak = exploratoryTurnStreak;
     exploratoryTurnStreak = wasExploratoryTurn ? exploratoryTurnStreak + 1 : 0;
@@ -9097,40 +9142,47 @@ export async function streamLLMWithTools(
     // maxTurns hard-stops it, producing 0 chars of output. Hard
     // rejection forces the synthesis that soft pressure couldn't.
     const inSynthesisPhase =
-      maxTurns >= BUDGET_WARNING_MIN_TURNS
+      !terminalOnlyTurn
+      && maxTurns >= BUDGET_WARNING_MIN_TURNS
       && turn >= maxTurns - FINAL_SYNTHESIS_TURNS;
     const codexInspectionStillProgressing =
       modelFamily === 'codex'
       && autoNarrowedReadCount > 0
       && autoNarrowedReadCount < inspectBudgetThreshold;
     const inExplorationSynthesisPhase =
-      exploratoryTurnStreak >= explorationThresholdForTurn
+      !terminalOnlyTurn
+      && exploratoryTurnStreak >= explorationThresholdForTurn
       && isExploratoryTurn(pendingCalls)
       && !codexInspectionStillProgressing;
     const inInspectSynthesisPhase =
-      inspectSynthesisArmed
+      !terminalOnlyTurn
+      && inspectSynthesisArmed
       && inspectFollowupMode === 'synthesis'
       && pendingCalls.length > 0;
     const inInspectActionPhase =
-      inspectSynthesisArmed
+      !terminalOnlyTurn
+      && inspectSynthesisArmed
       && inspectFollowupMode === 'action'
       && !verifyActionArmed
       && pendingCalls.length > 0
       && !isInspectActionTurn(pendingCalls);
     const inInspectExecutionPhase =
-      inspectSynthesisArmed
+      !terminalOnlyTurn
+      && inspectSynthesisArmed
       && inspectFollowupMode === 'execution'
       && !repairActionArmed
       && !verifyActionArmed
       && pendingCalls.length > 0
       && !isExecutionActionTurn(pendingCalls);
     const inRepairActionPhase =
-      repairActionArmed
+      !terminalOnlyTurn
+      && repairActionArmed
       && !verifyActionArmed
       && pendingCalls.length > 0
       && !isRepairActionTurn(pendingCalls);
     const inVerifyActionPhase =
-      verifyActionArmed
+      !terminalOnlyTurn
+      && verifyActionArmed
       && pendingCalls.length > 0
       && !isVerifyActionTurn(pendingCalls);
     const inInspectFollowupPhase =
@@ -9180,11 +9232,18 @@ export async function streamLLMWithTools(
     let callsToDispatch = pendingCalls;
     let appendedToolResultNotice: string | null = null;
     let phaseRejectionMessage: string | null = null;
-    const phaseRejectedCalls = getToolLoopPhaseRejectedCalls(inspectFollowupPhase, pendingCalls);
+    // TUI-GOAL-LOOP-FRICTION(#46) — 섞인 턴에서도 종결 신호는 거부 대상에서 뺀다(다른 호출만 거부).
+    const phaseRejectedCalls = getToolLoopPhaseRejectedCalls(inspectFollowupPhase, pendingCalls)
+      .filter((call) => !terminalToolNames.has(call.name));
     const phaseRejectedCallIds = new Set(phaseRejectedCalls.map((call) => call.id));
     const rejectsWholeBatch = inSynthesisPhase || inExplorationSynthesisPhase || inInspectSynthesisPhase;
+    /** 통째 거부 턴에 섞인 종결 신호 — 거부 스텁 대신 수신 확인을 준다. */
+    const isTerminalCall = (call: { name: string }): boolean => terminalToolNames.has(call.name);
+    const terminalAck = (call: { name: string }): string => JSON.stringify({
+      ok: true, terminalSignal: call.name, note: 'terminal signal recorded; other tool calls in this turn did not run',
+    });
     if (rejectsWholeBatch || phaseRejectedCalls.length > 0) {
-      const rejectedCalls = rejectsWholeBatch ? pendingCalls : phaseRejectedCalls;
+      const rejectedCalls = rejectsWholeBatch ? pendingCalls.filter((call) => !isTerminalCall(call)) : phaseRejectedCalls;
       const executedCalls = rejectsWholeBatch ? [] : pendingCalls.filter((call) => !phaseRejectedCallIds.has(call.id));
       const rejectionMsg =
         inspectFollowupPhase
@@ -9207,8 +9266,17 @@ export async function streamLLMWithTools(
       phaseRejectionMessage = rejectionMsg;
       if (rejectsWholeBatch) {
         callsToDispatch = [];
-        for (const call of rejectedCalls) {
-          resultBlocks.push({ type: 'tool_result', tool_use_id: call.id, content: rejectionMsg });
+        // 공급자 순서를 지키려고 pendingCalls 순서대로 채운다 — 종결 신호만 수신 확인, 나머지는 거부 스텁.
+        for (const call of pendingCalls) {
+          if (isTerminalCall(call)) {
+            terminalSignalDispatched = true;
+            resultBlocks.push({ type: 'tool_result', tool_use_id: call.id, content: terminalAck(call) });
+            debug.log('goal.loop', 'terminal-signal-exempt-from-budget', {
+              turn, maxTurns, tool: call.name, rejectedTools: rejectedCalls.map((c) => c.name),
+            }, { level: 'info' });
+          } else {
+            resultBlocks.push({ type: 'tool_result', tool_use_id: call.id, content: rejectionMsg });
+          }
         }
       }
       // P2 (2026-05-03) — Three predicates as before, but each now consults
@@ -9459,7 +9527,9 @@ export async function streamLLMWithTools(
       for (const call of pendingCalls) {
         handlers.onToolCall?.(call);
         toolCallHistory.push({ name: call.name, args: call.args });
-        handlers.onToolResult?.({ id: call.id, name: call.name, result: phaseRejectionMessage! });
+        handlers.onToolResult?.({
+          id: call.id, name: call.name, result: isTerminalCall(call) ? terminalAck(call) : phaseRejectionMessage!,
+        });
       }
     }
     if (!rejectsWholeBatch && hardStopText === null) {
@@ -9503,6 +9573,14 @@ export async function streamLLMWithTools(
         result: unknown,
       ): void => {
         if (call.name !== 'RunShell' && call.name !== 'Bash') return;
+        if (isSteeredShellRejection(result)) {
+          debug.log('llm.router', 'tool-loop.steered-rejection-not-failure', {
+            turn,
+            tool: call.name,
+            approvalKey: (result as { approvalKey: string }).approvalKey,
+          });
+          return;
+        }
         const verificationAttempt = verifyActionArmed;
         const executionCommand = summarizeExecutionCommand(call.name, call.args);
         const executionSummary = summarizeExecutionResult(result);
@@ -9954,7 +10032,14 @@ export async function streamLLMWithTools(
         // naturally rotates files (verified 2026-04-25T06:56
         // reproduction: docs/CAPABILITIES → PLAN → HANDOFF → ROADMAP
         // → src/code-edit/{index,apply,safety}.ts across 5 turns).
-        if (modelFamily === 'codex' && EXPLORATORY_TOOLS.has(call.name)) {
+        // TUI-INITIATIVE-S ② — 같은 호출이 같은 오류로 DEDUP_THRESHOLD 번 끝났으면 계열·도구 무관(openai-codex·gpt 계열)하게 같은 RE-CALL 차단을 건다.
+        const repeatedError = (modelFamily === 'codex' || modelFamily === 'gpt' || activeProvider.name === 'openai-codex')
+          ? erroredToolCallSignatures.get(signatureOf(call)) : undefined;
+        if (repeatedError && repeatedError.count >= DEDUP_THRESHOLD) {
+          debug.log('llm.router', 'tool-loop.dedup-blocked', { turn, tool: call.name, signature: signatureOf(call), priorCount: repeatedError.count, threshold: DEDUP_THRESHOLD, reason: 'repeated-error' });
+          return { result: `${buildDedupStub(call, repeatedError.count)} Every one of those calls failed with the same error: ${repeatedError.error.slice(0, 200)}`, isError: false, phaseRejected: false };
+        }
+        if (codexBehaviorGuards && EXPLORATORY_TOOLS.has(call.name)) {
           // W4-anchor — Anchor file Grep blocking. AGENTS.md / CLAUDE.md
           // are already in the system prompt; greppling them is pure
           // token waste and trains codex to ignore the in-prompt copy.
@@ -10259,6 +10344,13 @@ export async function streamLLMWithTools(
         // 스펙을 프로바이더에 선언하지 않는다는 의도가 우회되지 않게.
         const resultSignalsError = !!result && typeof result === 'object'
           && typeof (result as { error?: unknown }).error === 'string';
+        {
+          const errSig = signatureOf(call);
+          const errText = resultSignalsError ? (result as { error: string }).error : isError ? String(result) : null;
+          const prevErr = erroredToolCallSignatures.get(errSig);
+          if (errText === null) erroredToolCallSignatures.delete(errSig);
+          else erroredToolCallSignatures.set(errSig, { error: errText, count: prevErr?.error === errText ? prevErr.count + 1 : 1 });
+        }
         if (!isError && !resultSignalsError) {
           for (const spec of hydrated) {
             if (activeToolNames.has(spec.name)) continue;
@@ -10286,7 +10378,7 @@ export async function streamLLMWithTools(
         // W4-A — Track Read dispatches (only successful ones; error
         // results don't count as "the file is in your context"). The
         // post-Read broad-search guard above reads this counter.
-        if (call.name === 'Read' && !isError && modelFamily === 'codex') {
+        if (call.name === 'Read' && !isError && codexBehaviorGuards) {
           dispatchedReadCount++;
         }
         return { result, isError, phaseRejected: false };
@@ -10479,11 +10571,24 @@ export async function streamLLMWithTools(
         };
         const partition = phaseRejectedCalls.length > 0
           ? { parallelActivated: false, safeCount: 0, unsafeCount: callsToDispatch.length }
-          : await dispatchWithParallelSafety(callsToDispatch, dispatchWithPostProc);
+          : await dispatchWithParallelSafety(callsToDispatch, dispatchWithPostProc, opts.signal);
         if (phaseRejectedCalls.length > 0) {
           for (let index = 0; index < callsToDispatch.length; index++) {
+            if (opts.signal?.aborted) continue;
             await dispatchWithPostProc(callsToDispatch[index]!, index);
           }
+        }
+        // ⭐ TUI-ESC-ABORT-TOOLS — 중단(Esc)으로 «시작하지 않은» 호출은 «중단됨» 결과로 채운다
+        //   (tool_call/tool_result 짝 유지). `phaseRejected: true` 로 둬 doom·반복 추적에서 뺀다.
+        //   다음 바퀴 머리의 `opts.signal?.aborted` 가 루프를 멈춘다.
+        if (opts.signal?.aborted) {
+          let skipped = 0;
+          for (let index = 0; index < callsToDispatch.length; index++) {
+            if (dispatchedResults[index]) continue;
+            dispatchedResults[index] = { result: 'Tool call not started: the turn was aborted by the user (Esc).', isError: true, phaseRejected: true };
+            skipped++;
+          }
+          if (skipped > 0) debug.log('llm.tools.aborted', 'batch-remaining-skipped', { turn, skipped });
         }
         if (debug.enabled && partition.parallelActivated) {
           debug.log('llm.tool-loop.parallel', 'safe-batch-dispatch', {
@@ -10810,6 +10915,20 @@ export async function streamLLMWithTools(
       // route — see routeDoomLoopToAskUser above.
       history.push({ role: LOOP_SELF_NOTE_ROLE, content: postToolResultUserNote });
     }
+    // 신호뿐인 턴 · 섞인 턴(정상 디스패치 · 부분 거부 · 통째 거부의 수신 확인) 모두 — 종결 신호가 이 턴에 «받아들여졌다».
+    if (!hardStopText && pendingCalls.some(isTerminalCall)) terminalSignalDispatched = true;
+    // TUI-GOAL-LOOP-FRICTION(#63) — 종결 신호뿐인 턴 ⊕ 같은 턴에 쓴 답 = 이 턴이 최종 답이다.
+    //   다음 모델 턴을 열면 할 말이 없는 모델이 빈 턴을 되풀이하고 `[NO FINAL SYNTHESIS]` 가 붙는다(10-15 22:36Z 표본).
+    //   이 턴에 답이 없으면 종전처럼 다음 턴을 연다(앞 라운드 글은 «하겠습니다» 류 서술일 수 있다 — 모델이 답을 쓰게).
+    if (terminalOnlyTurn && !hardStopText && !postToolResultUserNote && turnText.trim().length > 0) {
+      const answer = turnText;
+      debug.log('goal.loop', 'terminal-signal-finish', {
+        turn, maxTurns, tools: pendingCalls.map((call) => call.name), answerChars: answer.length,
+      }, { level: 'info' });
+      if (answer !== fullText) handlers.onText('', answer);
+      emitTurnComplete(answer);
+      return answer;
+    }
     if (hardStopText) {
       // W5-E (2026-05-03 PM) — Force-synthesis no-tools pass. Before
       // emitting the [SYNTHESIS IGNORED] / [ACTION IGNORED] / [VERIFY
@@ -10845,7 +10964,7 @@ export async function streamLLMWithTools(
       // fix shape (no-tools synthesis with prior tool_results as
       // context) lifts the empty reply to substantive answer.
       const isForceSynthesisFamily =
-        modelFamily === 'codex' || modelFamily === 'gemini';
+        codexBehaviorGuards || modelFamily === 'gemini';
       const shouldForceSynthesis =
         isForceSynthesisFamily
         && !isUserInterventionRequired
@@ -11013,7 +11132,7 @@ export async function streamLLMWithTools(
   let synthesizedText: string | null = null;
   const shouldForceSynthesisOnBudget =
     loopTermination === 'budget-exhausted'
-    && (modelFamily === 'codex' || modelFamily === 'gemini')
+    && (codexBehaviorGuards || modelFamily === 'gemini')
     && !forceSynthesisAttempted;
   if (shouldForceSynthesisOnBudget) {
     forceSynthesisAttempted = true;
@@ -11894,7 +12013,7 @@ export function getProviderForConfig(
   // union without a case here fails loud at first call.
   throw new Error(`unknown provider: ${provider as string}`);
 }
-import { getModelFamily } from './models/prompts.js';
+import { getModelFamily, usesCodexBehaviorGuards } from './models/prompts.js';
 import type { ModelFamily } from './models/prompts.js';
 
 // COMPAT(llm-facade-openai-sampling-fields) · 기존 llm.ts 공개 API 유지.

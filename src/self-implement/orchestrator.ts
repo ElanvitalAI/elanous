@@ -86,7 +86,6 @@ import { LogStore, logsDbPath, type LogQuery, type LogStoreRow } from '../mss/lo
 import { refreshCodexQuotaSignals } from '../budget/codex-quota-refresh.js';
 import { inspectActiveProvider, type ActiveProviderInfo } from '../provider-summary.js';
 import { recordHitlEvent } from '../self-dev/hitl-log.js';
-import { parseAskProseTitle } from '../self-dev/launch-preflight.js';
 import { classifyReviewProviderFailure } from '../self-dev/review-provider-fallback.js';
 import { classifyError } from '../session-runtime/retry-policy.js';
 import { decomposeSelfDevGoal, inferHotPaths, type SelfDevDecomposeOptions } from '../self-dev/decompose.js';
@@ -154,6 +153,8 @@ import { plannedSelfImplBranch } from '../harness/worktree-branch-prefix.js';
 export { slugifyFeature } from '../harness/worktree-branch-prefix.js';
 import { AUTO_REVIEW_LABEL, resolveAutoReviewLabels } from './context-capsule.js';
 import { GOAL_TYPES, extractVerbatimOriginalAsk, leadingGoalMetadata, parseAskFile, parseGoalType, type GoalType } from './goal-author.js';
+import { goalDocumentForReleaseNote, goalChecklistIds, prTitle } from './pr-title.js';
+export { goalChecklistIds, prTitle } from './pr-title.js';
 import { renderRoundSummaryCard, type RoundSummaryEntry } from './round-summary-card.js';
 import { computeFlexSignals } from './flex-signals.js';
 import { resolveAdaptiveMaxReworkDecision, resolveEscalateTier, resolveEscalateTarget, buildReworkFeature, failIndicator, isRepeatedUnverifiedOnlyGateFailure, unverifiedRepeatKey, appendReworkHistory, truncateReworkHistoryByItem, applyReworkBudgetDecision, parseContractConflictRelaxation, parseReworkBudgetDecision, resolveReworkBudgetCarry, stripReworkBudgetHeaders, countConsecutiveMustFixIds, mergeReworkNotes, resolveReworkKind, type ReworkPlanRevision, type ReworkNotePart } from './rework-policy.js';
@@ -862,8 +863,15 @@ export function isHarnessTempArtifact(file: string): boolean {
   return /(^|\/)\.elanous-typecheck-scope-[^/]+\.json$/.test(file);
 }
 
+/** Only this run's GOAL document is a harness artifact; unrelated GOAL edits remain in scope accounting. */
+export function isHarnessGeneratedGoal(file: string, goalDocumentPath?: string): boolean {
+  const ownGoal = goalDocumentPath?.replace(/\\/g, '/').match(/(?:^|\/)(docs\/goals\/GOAL-[^/]+\.(?:md|txt))$/)?.[1];
+  return !!ownGoal && normalizeDeclaredScopePath(file) === ownGoal;
+}
+
 export function detectDeclaredScopeDiff(input: {
   goalDocument?: string | null;
+  goalDocumentPath?: string;
   changedFiles?: readonly string[] | null;
   nameCap?: number;
 }): DeclaredScopeDiff {
@@ -879,7 +887,8 @@ export function detectDeclaredScopeDiff(input: {
     return { status: 'unknown-changed-files', outsideCount: null, outsideNames: [], nameCapReached: false, unmadeCount: null, unmadeNames: [], declaredCount: null };
   }
   const outside = [...new Set(input.changedFiles.map(normalizeDeclaredScopePath).filter(Boolean))]
-    .filter((file) => !declared.paths.some((target) => changedFileIsInsideDeclaredTarget(file, target)));
+    .filter((file) => !isHarnessGeneratedGoal(file, input.goalDocumentPath)
+      && !declared.paths.some((target) => changedFileIsInsideDeclaredTarget(file, target)));
   // ⭐ 「선언했는데 «안 채워진»」 것 — `outside` 의 반대 방향이다.
   const changed = [...new Set(input.changedFiles.map(normalizeDeclaredScopePath).filter(Boolean))];
   const unmade = declared.paths.filter((target) => !changed.some((file) => changedFileIsInsideDeclaredTarget(file, target)));
@@ -914,6 +923,7 @@ function observeDeclaredScopeDiff(
   }
   const diff = detectDeclaredScopeDiff({
     goalDocument,
+    goalDocumentPath: input.goalFile,
     changedFiles: input.changedFiles,
     nameCap: input.nameCap,
   });
@@ -2357,120 +2367,6 @@ function addedDiffEvidence(diff: string): { text: string; truncated: boolean } {
   };
 }
 
-function isRepositoryRelativePath(candidate: string): boolean {
-  if (/^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/|[\\/]|[A-Za-z]:[\\/])/.test(candidate)) return false;
-  const parts = candidate.split('/');
-  return parts.length > 1
-    && parts.every((part) => part !== '.' && part !== '..' && /^[A-Za-z0-9_.-]+$/.test(part))
-    && /\.[A-Za-z0-9]+$/.test(parts.at(-1)!);
-}
-
-function extractRepositoryRelativePaths(first: string): string[] {
-  const candidates = first.split(/[\s,;()[\]{}"'`<>]+/).filter(Boolean);
-  return candidates.filter(isRepositoryRelativePath);
-}
-
-function parseAskMarkdownH1(feature: string): string | undefined {
-  // ⛔ 펜스는 «문자»만이 아니라 «길이»로 닫힌다(CommonMark): 닫는 줄은 같은 문자 · 여는 줄 이상의 길이 · 뒤에 정보 문자열 없음.
-  //   🩸 2026-09-23(#20050 착지 직후 실물): GOAL 문서가 원래 ask 를 ```` 네 개 펜스로 싸고, 그 안에 ``` 블록이 있다.
-  //   문자만 보면 안쪽 ``` 이 바깥 ```` 를 «닫아» 안팎이 뒤집히고 ```bash 안의 `# 주석` 이 다시 제목이 됐다.
-  let fence: { marker: '`' | '~'; run: number } | undefined;
-  for (const line of feature.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    const marker = trimmed[0] === '`' || trimmed[0] === '~' ? trimmed[0] : undefined;
-    let run = 0;
-    if (marker) {
-      while (run < trimmed.length && trimmed[run] === marker) run += 1;
-    }
-    if (marker && run >= 3) {
-      if (!fence) {
-        fence = { marker, run };
-        continue;
-      }
-      if (fence.marker === marker && run >= fence.run && trimmed.slice(run).trim() === '') {
-        fence = undefined;
-        continue;
-      }
-    }
-    if (fence) continue;
-    if (line[0] !== '#' || line[1] === '#') continue;
-    if (line.length < 2 || !/\s/.test(line[1]!)) continue;
-    const text = line.slice(1).trim();
-    if (text) return text;
-  }
-  return undefined;
-}
-
-function prTitleCodePointCount(text: string): number {
-  return Array.from(text).length;
-}
-
-function truncatePrTitle(text: string): string {
-  const points = Array.from(text);
-  return points.length <= 72 ? text : `${points.slice(0, 69).join('')}...`;
-}
-
-export function goalChecklistIds(feature: string, goalFile?: string): string[] {
-  const document = goalFile ? goalDocumentForReleaseNote(goalFile) : feature;
-  const declaration = document.split(/\r?\n/).find((line) => line.startsWith('- 칸 id: '));
-  const declared = declaration?.slice('- 칸 id: '.length).trim();
-  if (declared && declared !== 'not declared') {
-    return [...new Set(declared.split(' · ').map((id) => id.trim()).filter(Boolean))];
-  }
-  const firstLine = feature.split(/\r?\n/, 1)[0] ?? '';
-  return [...new Set(Array.from(firstLine.matchAll(/\b[A-Z][A-Z0-9]+-[A-Z0-9]+\b/g), (match) => match[0]))];
-}
-
-function prTitleWithoutChecklistId(feature: string): string {
-  const proseTitle = parseAskProseTitle(feature);
-  if (proseTitle) return truncatePrTitle(proseTitle);
-
-  const headingTitle = parseAskMarkdownH1(feature);
-  if (headingTitle) return truncatePrTitle(headingTitle);
-
-  // ⛔ GOAL 문서는 원래 ask 를 `Original ask (verbatim, unmodified):` 아래 ```` 펜스로 싣는다 — 그 안은 «코드»가 아니라 인용된 마크다운이다.
-  //   🩸 2026-09-23: #20051 이 펜스를 길이로 닫게 고치자 그 인용 블록 안의 H1 까지 «건너뛰어»,
-  //   첫 줄이 `대상 경로:` 인 GOAL 문서 대부분이 경로 요약 제목으로 떨어졌다(실물: #20055 `src/self-implement: gate-baseline.ts, …`).
-  //   ⇒ 인용된 ask 를 꺼내 그 «안»에서 같은 규칙(제목: 줄 → 펜스 밖 H1)으로 한 번 더 찾는다.
-  //   ⚠️ 정보 문자열이 붙은 펜스(```bash 등)로 싸였으면 그 안은 «코드»다 — 인용된 마크다운으로 보지 않는다.
-  const verbatim = extractVerbatimOriginalAsk(feature);
-  const opener = verbatim?.range ? feature.slice(0, verbatim.range.start).split(/\r?\n/).filter((line, i, all) => i === all.length - 2)[0] ?? '' : '';
-  const verbatimAsk = verbatim && /^\s*(`{3,}|~{3,})\s*$/.test(opener) ? verbatim.ask : undefined;
-  if (verbatimAsk) {
-    const askTitle = parseAskProseTitle(verbatimAsk) ?? parseAskMarkdownH1(verbatimAsk);
-    if (askTitle) return truncatePrTitle(askTitle);
-  }
-
-  const first = feature.split('\n')[0]!.trim();
-  const paths = extractRepositoryRelativePaths(first);
-  if (!paths.length) return truncatePrTitle(first);
-
-  const pathParts = paths.map((path) => path.split('/'));
-  const commonParts: string[] = [];
-  for (let index = 0; index < pathParts[0]!.length - 1; index++) {
-    const part = pathParts[0]![index]!;
-    if (!pathParts.every((parts) => parts[index] === part)) break;
-    commonParts.push(part);
-  }
-  const fileNames = pathParts.map((parts) => parts.at(-1)!);
-  const directoryPrefix = commonParts.length ? `${commonParts.join('/')}: ` : '';
-  const titlePrefix = prTitleCodePointCount(directoryPrefix) + prTitleCodePointCount(fileNames[0]!) <= 72 ? directoryPrefix : '';
-  const title = fileNames.reduce((result, fileName) => {
-    const next = result ? `${result}, ${fileName}` : fileName;
-    return prTitleCodePointCount(titlePrefix) + prTitleCodePointCount(next) <= 72 ? next : result;
-  }, '');
-  if (title) return `${titlePrefix}${title}`;
-  const firstFileName = fileNames[0]!;
-  return truncatePrTitle(firstFileName);
-}
-
-export function prTitle(feature: string, goalFile?: string): string {
-  const title = prTitleWithoutChecklistId(feature);
-  const id = goalChecklistIds(feature, goalFile)[0];
-  if (!id) return title;
-  return truncatePrTitle(title.startsWith(`${id}: `) ? title : `${id}: ${title}`);
-}
-
 const BLOCKED_DRAFT_PR_HUMAN_JUDGMENT_ANCHOR = '## 사람 판단 필요';
 
 /** 사람이 읽는 중단 사유 상한. 관측 `reason.slice(0, 240)` 과 같은 길이라 표시가 앞부분을 버리지 않는다. */
@@ -2681,12 +2577,6 @@ export class MergedReleaseNoteWriteError extends Error {
     this.directory = directory;
     this.fragment = fragment;
   }
-}
-
-function goalDocumentForReleaseNote(goalFile?: string): string {
-  if (!goalFile) return '';
-  try { return readFileSync(goalFile, 'utf8'); }
-  catch { return ''; }
 }
 
 function shardReleaseNote(feature: string): ReleaseNoteSection | undefined {
@@ -7261,7 +7151,8 @@ async function runSelfImplementInner(
       try { goalDocument = readFileSync(opts.goalFile, 'utf8'); } catch { /* unknown scope */ }
       // 🩸 10-09: 범위 타입검사 임시 tsconfig(.elanous-typecheck-scope-*.json · scoped-typecheck-config.ts)가 옛 가지에 커밋된 뒤 지워지면
       //   «추적 파일 삭제» 라 impact=critical → 결정 카드가 «irreversible» 로 대표에게 갔다(D-20·35·43·80). 하니스 임시물은 범위 판정 밖이다.
-      const scope = detectDeclaredScopeDiff({ goalDocument, changedFiles: gateRouteFiles?.filter(file => !harnessSeededPaths.includes(file) && !isHarnessTempArtifact(file)), nameCap: gateRouteFiles?.length });
+      const scope = detectDeclaredScopeDiff({ goalDocument, goalDocumentPath: opts.goalFile,
+        changedFiles: gateRouteFiles?.filter(file => !harnessSeededPaths.includes(file) && !isHarnessTempArtifact(file)), nameCap: gateRouteFiles?.length });
       // SCOPE-HELD-DELIVER — no declared target means the declaration was unreadable (e.g. paths listed with spaces), not
       // that every edit is outside it: treat it like an unknown declaration and go on to the gate.
       if (scope.status === 'known' && scope.declaredCount === 0 && (scope.outsideCount ?? 0) > 0) {

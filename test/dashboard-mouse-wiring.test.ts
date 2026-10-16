@@ -1222,6 +1222,10 @@ describe('M1 handleMouse diagnostics — mouse.pill trace events', () => {
 
   test('scroll/drag events do not emit trace records (noise reduction)', () => {
     debug.enable();
+    const traced: string[] = [];
+    const off = debug.registerSink({ name: 'mouse-pill-noise-test', emit: (record) => {
+      if (record.category === 'mouse.pill' && record.event.startsWith('handleMouse:')) traced.push(record.event);
+    } });
     try {
       const h = mkDeps();
       h.wiring.buildStatusLine({
@@ -1229,13 +1233,12 @@ describe('M1 handleMouse diagnostics — mouse.pill trace events', () => {
         providerInfo: PROVIDER,
       });
       h.wiring.setStatusRow(20);
-      const before = debug.tail(50).filter(l => l.includes('mouse.pill') && l.includes('handleMouse:')).length;
       h.wiring.handleMouse(mouse('scroll-up', 10, 10));
       h.wiring.handleMouse(mouse('scroll-down', 10, 10));
       h.wiring.handleMouse(mouse('drag', 10, 10));
-      const after = debug.tail(50).filter(l => l.includes('mouse.pill') && l.includes('handleMouse:')).length;
-      expect(after).toBe(before);
+      expect(traced).toEqual([]);
     } finally {
+      off();
       debug.disable();
     }
   });

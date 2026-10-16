@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { debug } from '../debug/log.js';
+import { readBudgetInputsLive, type BudgetInputs } from '../self-implement/budget-gate.js';
 import { mintRunId } from '../harness/harness-space.js';
 import { spawnElanousSync } from '../instance/spawn-elanous.js';
 import { passJourneyNode } from '../self-dev/graph-journey-nodes.js';
@@ -32,11 +33,17 @@ export interface RepairCycleInput {
   resolveOwner?: (card: TaskCard) => RepairOwner;
   /** Shared only by one `tasks rejudge --all` invocation; a single-card rejudge has no cap. */
   repairBudget?: RepairTickBudget;
+  /** Test seam; production reads the existing subscription quota signals. */
+  modelAvailability?: RepairModelAvailability;
+  /** Test seam for the same live quota reader used when availability is not injected. */
+  readBudgetInputs?: () => Promise<Pick<BudgetInputs, 'codexCandidates' | 'grokUsedPercent' | 'maxUsedPercent'>>;
 }
 
 export interface RepairTickBudget { max: number; requested: number; capped: number }
 
-export type RepairCycleOutcome = { decision: 'would-repair' | 'repair-requested' | 'repair-pending' | 'repair-applied' | 'repair-failed' | 'repair-stopped'; reason: string };
+export type RepairCycleOutcome = { decision: 'would-repair' | 'repair-requested' | 'repair-pending' | 'repair-applied' | 'repair-failed' | 'repair-stopped'; reason: string;
+  /** Present only when this tick actually consumed a bound worker result. */
+  repairRunId?: string; repairHead?: string };
 export type RepairOwner = { seat?: TaskSeat; source: string; reason?: string };
 
 /** A missing card seat may use only a uniquely identified checklist cell's valid seat. */
@@ -70,12 +77,39 @@ export function resolveRepairOwner(card: TaskCard, deps: {
   } catch { return { source: 'none', reason: `checklist owner invalid: ${cell.version}/${card.checklistId}` }; }
 }
 
-export function alternateRepairModel(card: TaskCard): { from: string; to: TaskChildLlm } {
+export interface RepairModelAvailability { codexSubscription: boolean; grokSubscription: boolean }
+
+export async function repairModelAvailability(readInputs: () => Promise<Pick<BudgetInputs, 'codexCandidates' | 'grokUsedPercent' | 'maxUsedPercent'>> = readBudgetInputsLive): Promise<RepairModelAvailability> {
+  try {
+    const input = await readInputs();
+    const codexCap = input.maxUsedPercent['openai-codex'] ?? 95;
+    const grokCap = input.maxUsedPercent.grok ?? 100;
+    return {
+      codexSubscription: input.codexCandidates.some((candidate) => candidate.reached !== true
+        && typeof candidate.usedPercent === 'number' && candidate.usedPercent < codexCap),
+      grokSubscription: typeof input.grokUsedPercent === 'number' && input.grokUsedPercent < grokCap,
+    };
+  } catch { return { codexSubscription: false, grokSubscription: false }; }
+}
+
+/** Repair stays inside the dispatch tier. A missing legacy tier is high, with Sol allowed only on measured subscription quota. */
+export function alternateRepairModel(card: TaskCard, availability: RepairModelAvailability = { codexSubscription: false, grokSubscription: false }): { from: string; to: TaskChildLlm } {
   const last = card.repairs?.at(-1);
   const from = last?.toModel ?? (card.childLlm ? `${card.childLlm.provider}/${card.childLlm.model}` : 'unknown');
-  const to = from.includes('openrouter/') || from.includes('glm')
-    ? { provider: 'openai-codex', model: 'gpt-6-sol' }
-    : { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' };
+  const glm: TaskChildLlm = { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' };
+  const sol: TaskChildLlm = { provider: 'openai-codex', model: 'gpt-6-sol' };
+  const grok: TaskChildLlm = { provider: 'grok', model: 'grok-4.6' };
+  const tier = card.tier ?? '상';
+  const pr = typeof card.pr === 'number' ? card.pr : card.pr?.number;
+  const mixEven = ((pr ?? [...card.id].reduce((sum, ch) => sum + ch.charCodeAt(0), 0)) % 2) === 0;
+  let to: TaskChildLlm;
+  if (tier === '특') to = sol;
+  else if (tier === '상' && availability.codexSubscription && mixEven && !from.includes('gpt-6-sol')) to = sol;
+  else if (tier === '상') to = availability.grokSubscription && from.includes('glm') ? grok
+    : from.includes('glm-5.3-flash') ? glm
+    : from.includes('glm-5.3') ? { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' } : glm;
+  else to = from.includes('glm-5.3-flash') ? glm : from.includes('glm-5.3')
+    ? { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' } : glm;
   return { from, to };
 }
 
@@ -131,6 +165,7 @@ export async function runRepairCycle(input: RepairCycleInput): Promise<RepairCyc
             runId: latest.runId, effect: status, detail: applied.ok ? applied.toHead : applied.reason }] } : undefined);
     } catch (error) { return { decision: 'repair-pending', reason: `repair confirmation card write failed: ${String(error).slice(-200)}` }; }
     const recorded = readTaskCard(card.id, statePath)?.repairs?.find((entry) => entry.runId === latest.runId)?.status === status;
+    // This confirms a result already claimed by another tick; it did not consume the worker result.
     return recorded ? { decision: applied.ok ? 'repair-applied' : 'repair-failed', reason: applied.ok ? `same PR #${pr} fast-forward ${latest.head.slice(0, 12)} → ${applied.toHead.slice(0, 12)}` : applied.reason }
       : { decision: 'repair-pending', reason: 'repair confirmation card changed concurrently' };
   }
@@ -187,7 +222,8 @@ export async function runRepairCycle(input: RepairCycleInput): Promise<RepairCyc
             runId: latest.runId, effect: status, detail }] } : undefined);
     } catch (error) { return { decision: 'repair-pending', reason: `repair card write failed after CAS: ${String(error).slice(-200)}` }; }
     const recorded = readTaskCard(card.id, statePath)?.repairs?.find((entry) => entry.runId === latest.runId)?.status === status;
-    return recorded ? { decision: applied?.ok ? 'repair-applied' : applied?.unconfirmed ? 'repair-pending' : 'repair-failed', reason: detail }
+    return recorded ? { decision: applied?.ok ? 'repair-applied' : applied?.unconfirmed ? 'repair-pending' : 'repair-failed', reason: detail,
+      repairRunId: latest.runId, repairHead: latest.head }
       : { decision: 'repair-pending', reason: 'repair result card changed concurrently' };
   }
   if (latest?.status === 'applied' && latest.head.toLowerCase() === head.toLowerCase())
@@ -244,7 +280,9 @@ export async function runRepairCycle(input: RepairCycleInput): Promise<RepairCyc
   }
   const next = attempts.length + 1;
   const runId = mintRunId();
-  const { from, to } = alternateRepairModel(card);
+  const availability = input.modelAvailability ?? (card.tier === '특' || card.tier === '중' || card.tier === '하'
+    ? { codexSubscription: false, grokSubscription: false } : await repairModelAvailability(input.readBudgetInputs));
+  const { from, to } = alternateRepairModel(card, availability);
   const resultPath = repairResultPath(statePath, card.id, pr, head, next, runId);
   const goalFile = resultPath.replace(/\.json$/, '.goal.txt');
   const goal = `기존 PR #${pr}의 리뷰 때 head ${head}를 같은 가지에서 수리한다. 새 PR을 열지 말고 아래 must-fix 원문만 고쳐 commit-only 결과를 반환한다.\n\n${input.mustFix.map((item, i) => `${i + 1}. ${item}`).join('\n')}`;

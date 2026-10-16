@@ -57,17 +57,19 @@ export interface ClosureOptions {
   cliEntries?: readonly string[];
 }
 
-interface ClosureGraph {
+export interface ClosureGraph {
   /** Every dependency a file can load: imports of any kind ⊕ literal repo paths. */
-  forward: Map<string, string[]>;
+  readonly forward: ReadonlyMap<string, readonly string[]>;
   /** Only top-level `import`/`export … from` — what loading the file evaluates before any of its code runs. */
-  staticImports: Map<string, string[]>;
-  opaque: Map<string, string>;
-  tracked: Set<string>;
+  readonly staticImports: ReadonlyMap<string, readonly string[]>;
+  /** Static self-imports are omitted from closure traversal but remain visible to structural diagnostics. */
+  readonly selfStaticImports: ReadonlySet<string>;
+  readonly opaque: ReadonlyMap<string, string>;
+  readonly tracked: ReadonlySet<string>;
 }
 
 /** Forward dependency edges of every code file at the tip ⊕ the files whose dependencies we cannot fully name. */
-function closureGraph(tree: ClosureTree, options: ClosureOptions = {}): ClosureGraph {
+export function buildClosureGraph(tree: ClosureTree, options: ClosureOptions = {}): ClosureGraph {
   const tracked = new Set(tree.files);
   const dirs = new Set<string>();
   for (const file of tree.files) for (let at = file.indexOf('/'); at > 0; at = file.indexOf('/', at + 1)) dirs.add(file.slice(0, at));
@@ -98,6 +100,7 @@ function closureGraph(tree: ClosureTree, options: ClosureOptions = {}): ClosureG
   const transpilers = { ts: new Bun.Transpiler({ loader: 'ts' }), tsx: new Bun.Transpiler({ loader: 'tsx' }), js: new Bun.Transpiler({ loader: 'js' }) };
   const forward = new Map<string, string[]>();
   const staticImports = new Map<string, string[]>();
+  const selfStaticImports = new Set<string>();
   const opaque = new Map<string, string>();
   const blindAs = (file: string, why: string): void => { if (!opaque.has(file)) opaque.set(file, why); };
   for (const file of tree.files) {
@@ -175,17 +178,18 @@ function closureGraph(tree: ClosureTree, options: ClosureOptions = {}): ClosureG
       // is all we see — and a code file we cannot find is a path we miss.
       else if (CODE_FILE.test(plain) && !TEST_FILE.test(plain)) blindAs(file, `unresolved path ${plain}`);
     }
+    if (eager.has(file)) selfStaticImports.add(file);
     edges.delete(file);
     eager.delete(file);
     forward.set(file, [...edges]);
     staticImports.set(file, [...eager]);
   }
-  return { forward, staticImports, opaque, tracked };
+  return { forward, staticImports, selfStaticImports, opaque, tracked };
 }
 
 /** The tests among `tests` that can reach any of `changed` (code files) — or whose closure is opaque. */
 export function testsReachingChanged(tree: ClosureTree, changed: readonly string[], tests: readonly string[], options: ClosureOptions = {}): ClosureVerdict {
-  const { forward, staticImports, opaque, tracked } = closureGraph(tree, options);
+  const { forward, staticImports, opaque, tracked } = buildClosureGraph(tree, options);
   const reverse = new Map<string, string[]>();
   for (const [from, edges] of forward) for (const to of edges) {
     const list = reverse.get(to);

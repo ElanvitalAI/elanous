@@ -19,7 +19,7 @@
 import { execFileSync } from 'node:child_process';
 import { closeSync, existsSync, lstatSync, openSync, readSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, resolve, sep } from 'node:path';
-import { linesOutsideFencedCode } from '../self-implement/goal-author.js';
+import { classifyTracedPathToken, linesOutsideFencedCode } from '../self-implement/goal-author.js';
 import { declaredNewFilePaths } from '../self-implement/goal-new-paths.js';
 import { resolveLogTargets } from '../cli/logs-cli.js';
 import { debug } from '../debug/log.js';
@@ -778,6 +778,18 @@ function isFileShapedTracedPath(path: string): boolean {
   return path.trim().length > 0 && (!/\s/.test(path) || path.includes('/'));
 }
 
+/** Residual, empty-cover, and bare-only twins of an already-declared nested path are not injected into preflight. */
+function isInjectedBareOrResidualTracedPath(path: string, declared: readonly string[], repositoryRoot?: string): boolean {
+  const classification = classifyTracedPathToken(path, repositoryRoot);
+  if (classification.kind === 'residual' || classification.kind === 'empty-cover') return true;
+  if (classification.kind !== 'bare') return false;
+  return declared.some((candidate) => candidate !== path && (candidate.endsWith(`/${path}`) || candidate.endsWith(`\\${path}`)));
+}
+
+function inspectableAuthoredTracedPaths(paths: readonly string[], repositoryRoot?: string): string[] {
+  return paths.filter((path) => !isInjectedBareOrResidualTracedPath(path, paths, repositoryRoot));
+}
+
 // Keep lexical `..`/`.` segments: resolving them first hides ENOTDIR behind a file parent.
 function tracedFsPath(path: string, root: string): string {
   return isAbsolute(path) ? path : `${root}${root.endsWith(sep) ? '' : sep}${path}`;
@@ -1097,11 +1109,13 @@ export function decideAskPreflight(
   // filesystem checks when no authored file exists there.
   const hasAuthoredGoal = !opts.pathsOverride && opts.goalFile !== '' && goalDocument !== null
     && existsSync(resolvedGoalFile);
-  const authoredTracedPaths = goalDocument === null ? [] : deps.tracedPaths(goalDocument);
-  const tracedPathsRaw = opts.pathsOverride ?? authoredTracedPaths;
   const inspectionRoot = goalDocument === null || !hasAuthoredGoal
     ? undefined
     : opts.declaredPathsRoot?.trim() || process.cwd();
+  const authoredTracedPaths = goalDocument === null
+    ? []
+    : inspectableAuthoredTracedPaths(deps.tracedPaths(goalDocument), inspectionRoot);
+  const tracedPathsRaw = opts.pathsOverride ?? authoredTracedPaths;
   const tracedPaths = inspectionRoot && !opts.pathsOverride
     ? tracedPathsRaw.filter((path) => tracedPathExists(path, inspectionRoot) || isFileShapedTracedPath(path))
     : tracedPathsRaw;
@@ -1305,6 +1319,8 @@ export function decideAskPreflight(
       kind: 'missing-traced-path' as const,
       name: '최종 골의 TRACED PATHS 경로 0',
       detail: '정리 후 보존된 traced 경로가 없다 — 실제 파일 또는 유효한 신설: 파일 경로를 골에 선언해야 발사할 수 있다',
+      reasonCode: 'missing-traced-path' as const,
+      checkName: 'empty-traced-paths',
     }] : []),
     ...invalidTracedPaths.map(({ path, reason }) => ({
       kind: 'missing-traced-path' as const,
@@ -1318,12 +1334,18 @@ export function decideAskPreflight(
           : reason === 'inaccessible'
             ? `골의 TRACED PATHS 경로 ${path} 를 검사할 수 없다 — 부모가 파일이거나 접근 권한이 없다. 경로를 바로잡아야 한다`
             : `골의 TRACED PATHS 에 선언됐지만 ${inspectionRoot} 에 없고 유효한 신설: 목록에도 없다 — 발사 전에 골 경로를 바로잡아야 한다. 신설은 파일 경로로(확장자 포함) 선언한다`,
+      reasonCode: 'missing-traced-path' as const,
+      checkName: reason,
+      targetPath: path,
     })),
   ];
   const goalReadBlockers: LaunchPreflightBlocker[] = goalReadFailed ? [{
     kind: 'goal-unreadable',
     name: `골 문서 판독 불가: ${opts.goalFile}`,
     detail: `${goalRulersUnknownReason} — 최종 골의 traced path 를 확인할 수 없어 발사를 멈춘다`,
+    reasonCode: 'goal-unreadable' as const,
+    checkName: 'goal-read',
+    targetPath: resolvedGoalFile,
   }] : [];
   const decisionResult = {
     ...result,

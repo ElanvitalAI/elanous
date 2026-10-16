@@ -40,13 +40,13 @@ const decode = (text: string): string => text.replace(/&(#x[0-9a-f]+|#\d+|amp|lt
   return ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" } as Record<string, string>)[key.toLowerCase()] ?? entity;
 });
 
-interface XmlElement { name: string; attrs: Record<string, string>; children: XmlElement[]; text: string }
+export interface XmlElement { name: string; attrs: Record<string, string>; children: XmlElement[]; text: string }
 
 /** Strict, dependency-free XML reader for JUnit reports: the whole document must be well formed
  *  (one root, balanced tags, nothing but whitespace/comments after the root). CDATA and comments are
  *  text, never elements — so a `<testcase>` inside a failure message is not a test case, and a report
  *  followed by a truncated tail is rejected as unmeasured rather than read as complete. */
-function parseXml(xml: string): XmlElement | undefined {
+export function parseXml(xml: string): XmlElement | undefined {
   const stack: XmlElement[] = [];
   let root: XmlElement | undefined;
   let i = xml.charCodeAt(0) === 0xfeff ? 1 : 0;
@@ -191,6 +191,17 @@ function readJUnit(xml: string, files: readonly string[]): JUnitCase[] | undefin
     || !matchesCount(root.attrs.failures, failures) || !matchesCount(root.attrs.errors, errors))) return undefined;
   if (cases.length === 0 || [...expected].some((file) => !counts.has(file))) return undefined;
   return cases;
+}
+
+/** Reuse the gate XML count checks, then require zero skips for a one-file warm-worker artifact. */
+export function isCompleteOneFileGateJunit(xml: string, file: string): boolean {
+  const root = parseXml(xml);
+  if (!root) return false;
+  const noDeclaredSkips = (element: XmlElement): boolean =>
+    (element.attrs.skipped === undefined || element.attrs.skipped === '0') && element.children.every(noDeclaredSkips);
+  if (!noDeclaredSkips(root)) return false;
+  const cases = readJUnit(xml, [file]);
+  return !!cases && cases.every(item => !item.skipped);
 }
 
 const SKIPPED_PASSED_AT_BASE = 'skipped now · passed at base — a skip must not hide a regression (LIGHT-RC-MEASURE ②)';

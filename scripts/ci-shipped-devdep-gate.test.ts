@@ -161,6 +161,7 @@ describe('checkShippedDevDependencies', () => {
     expect(result.measurementFailure).toBeNull();
     expect(result.violations).toEqual([]);
     expect(result.devDependencyNames).toEqual([
+      '@copilotkit/aimock',
       '@types/bun',
       '@types/diff',
       '@types/node-cron',

@@ -12,13 +12,15 @@ import type { GraphKindEntry, GraphWizardSteps, NexusClient } from '@/nexus/clie
 import type { NodeRunStatus } from '@/components/workflows/run-status-helpers';
 import { nodeStatusClass } from '@/components/workflows/node-status-class';
 import {
-  CANVAS_NODE_SIZE, OUTCOME_SUGGESTIONS, addNode, autoLayoutToFit, canvasOutcomeLabel, connect, defaultOutcome, emptyGraph, failTarget, fromYaml, mapServerIssues, moveNode, removeEdge, removeNode, setEntry, setFailTarget,
+  CANVAS_NODE_SIZE, OUTCOME_SUGGESTIONS, addNode, autoLayoutToFit, canvasOutcomeLabel, canvasUnitNames, canvasUnitOf, collapseCanvasUnits, projectCanvasGroups, connect, defaultOutcome, emptyGraph, failTarget, fromYaml, mapServerIssues, moveNode, removeEdge, removeNode, setEntry, setFailTarget,
   setGraphId, setTerminal, terminalNodes, toYaml, updateEdge, updateNode, validateGraph,
   type CanvasFlow, type CanvasGraph, type CanvasIssue,
 } from './graph-canvas-model';
 import { saveCanvasGraph } from './graph-canvas-save';
 import { hoverFocus, mergeParallelEdges, routeEdges, WIRING_STYLE, wiringEdgeStyle } from '@/lib/graph-edge-route';
 import { TIDY_EDGE_TYPES, type TidyEdgeData } from '@/components/workflows/TidyEdge';
+import { aggregateGroupState, groupBoxes, groupNames, groupOf, isGroupNodeId, GROUP_NODE_PREFIX, type GroupState } from './graph-groups';
+import { GROUP_BOX_NODE_TYPES, type GroupBoxData } from './GraphGroupBox';
 
 /** What a toolbar extension (e.g. CGE-RUN's «실행») reads from the canvas. */
 export interface GraphCanvasContext {
@@ -49,6 +51,9 @@ interface CanvasNodeData extends Record<string, unknown> {
   runStatus?: NodeRunStatus;
   /** GRAPH-WIZARD v2 — Korean display name; the id stays underneath. */
   label?: string;
+  /** CGE-UNITS — on a folded unit node (`group:<name>`): the card is that unit's headline (▣ 이름 · 눌러서 펼치기). */
+  unit?: { name: string; state: GroupState };
+  openUnit?: (name: string) => void;
 }
 
 /** Run state stays on the card as colour AND a word: the shared CSS only flashes «done» once, so without this a finished
@@ -61,34 +66,57 @@ export const RUN_STATUS_LOOK: Record<NodeRunStatus, { word: string; ring: string
   awaiting_approval: { word: '⏸ 승인 대기', ring: '#f59e0b', chip: 'bg-amber-500/15 text-amber-400' },
 };
 
+/** CGE-UNITS — a folded unit card carries the unit's aggregated state; the tint follows GraphGroupBox's border. */
+const UNIT_STATE_LOOK: Record<GroupState, { word: string; tint: string }> = {
+  pending: { word: '대기', tint: 'var(--border, #94a3b8)' },
+  running: { word: '도는 중', tint: '#f59e0b' },
+  passed: { word: '통과', tint: 'var(--chart-2, #16a34a)' },
+  failed: { word: '실패', tint: 'var(--destructive, #ef4444)' },
+};
+/** CGE-RUN node status → the unit state graph-groups aggregates over (a member with no run counts as 대기). */
+const NODE_STATUS_TO_UNIT: Record<NodeRunStatus, GroupState> = {
+  running: 'running', done: 'passed', failed: 'failed', skipped: 'pending', awaiting_approval: 'running',
+};
+
 export function CanvasNodeCard({ data, selected }: NodeProps) {
   const node = data as CanvasNodeData;
   const vertical = node.flow === 'vertical';
   const run = node.runStatus ? RUN_STATUS_LOOK[node.runStatus] : undefined;
+  const unit = node.unit ? UNIT_STATE_LOOK[node.unit.state] : undefined;
   return (
     <div data-testid={`canvas-node-${node.id}`} data-run-status={node.runStatus}
-      className={`rounded-lg border bg-background px-3 py-2 shadow-sm ${node.issueCount ? 'border-red-500' : selected ? 'border-primary' : 'border-border'}`}
-      style={{ width: CANVAS_NODE_SIZE.width, borderLeft: `4px solid ${KIND_COLORS[node.kind] ?? '#64748b'}`, ...(run ? { boxShadow: `0 0 0 2px ${run.ring}` } : {}) }}>
+      role={node.unit ? 'button' : undefined} tabIndex={node.unit ? 0 : undefined}
+      onClick={(event) => { if (node.unit) { event.stopPropagation(); node.openUnit?.(node.unit.name); } }}
+      onKeyDown={(event) => { if (node.unit && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); node.openUnit?.(node.unit.name); } }}
+      className={`rounded-lg border bg-background px-3 py-2 shadow-sm ${node.issueCount ? 'border-red-500' : selected ? 'border-primary' : 'border-border'} ${node.unit ? 'cursor-pointer nodrag nopan' : ''}`}
+      style={{ width: CANVAS_NODE_SIZE.width, borderLeft: `4px solid ${unit ? unit.tint : KIND_COLORS[node.kind] ?? '#64748b'}`, ...(run ? { boxShadow: `0 0 0 2px ${run.ring}` } : {}) }}>
       <Handle id="in" type="target" position={vertical ? Position.Top : Position.Left} className="!h-3 !w-3" />
       {/* Back edges are routed below the row by graph-edge-route (GRAPH-EDGE-TIDY) — every edge still leaves «out» and enters «in». */}
       <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
-        <span>{node.kind}</span>
+        <span>{node.unit ? '묶음 · 눌러서 펼치기' : node.kind}</span>
         {node.entry && <span className="rounded bg-emerald-500/15 px-1 text-emerald-500">시작</span>}
         {node.terminal && <span className="rounded bg-sky-500/15 px-1 text-sky-500">끝</span>}
         {node.issueCount > 0 && <span className="rounded bg-red-500/15 px-1 text-red-500">오류 {node.issueCount}</span>}
+        {unit && <span className="rounded px-1 font-semibold" style={{ color: unit.tint }}>{unit.word}</span>}
         {run && <span className={`rounded px-1 font-semibold ${run.chip}`}>{run.word}</span>}
       </div>
-      {node.label ? <>
-        <div className="max-w-[150px] truncate text-sm font-semibold text-foreground" title={node.label}>{node.label}</div>
-        <div className="font-mono text-[10px] text-muted-foreground">{node.id}</div>
-      </> : <div className="font-mono text-sm font-semibold text-foreground">{node.id}</div>}
+      {node.unit
+        ? <>
+          {node.kind === 'subgraph' && isGroupNodeId(node.id) && <span className="text-[10px] text-violet-400">묶음 · 눌러서 안쪽 그래프 열기</span>}
+          <div className="max-w-[150px] truncate text-sm font-semibold text-foreground" title={node.unit.name}>▣ {node.unit.name}</div>
+        </>
+        : node.label ? <>
+          <div className="max-w-[150px] truncate text-sm font-semibold text-foreground" title={node.label}>{node.label}</div>
+          <div className="font-mono text-[10px] text-muted-foreground">{node.id}</div>
+        </> : <div className="font-mono text-sm font-semibold text-foreground">{node.id}</div>}
       <div className="max-w-[150px] truncate text-[10px] text-muted-foreground" title={node.recipe}>{node.recipe}</div>
       <Handle id="out" type="source" position={vertical ? Position.Bottom : Position.Right} className="!h-3 !w-3" />
     </div>
   );
 }
 
-const NODE_TYPES: NodeTypes = { canvas: CanvasNodeCard };
+// CGE-UNITS — group boxes use the shared live-run GraphGroupBox component.
+const NODE_TYPES: NodeTypes = { canvas: CanvasNodeCard, ...GROUP_BOX_NODE_TYPES };
 /** Smallest zoom a fit may pick: 14px card ids and 12px edge labels stay ≥ ~11px on screen. */
 const FIT_MIN_ZOOM = 0.85;
 /** GRAPH-WIZARD — while the «말로 만들기» chat drives the canvas, a turn may fit the whole graph down to this zoom
@@ -230,6 +258,67 @@ export function GraphCanvasEditor({
   /** Measured card sizes (React Flow `dimensions` changes) — routing uses them, the fixed card size until measured. */
   const [sizes, setSizes] = useState<Record<string, { width: number; height: number }>>({});
 
+  // CGE-UNITS — 유닛 두 보기를 라이브 런 페이지와 같은 graph-groups 부품으로 배선한다: 접은 보기(묶음마다 노드 하나 ·
+  // 눌러서 안쪽 그래프 열기 · 부모›유닛 빵부스러기)와 통합 보기(모든 묶음을 한 그래프에 펼쳐 이름 붙은 그룹 상자).
+  const [collapsedUnits, setCollapsedUnits] = useState<ReadonlySet<string>>(() => new Set());
+  const [enteredUnit, setEnteredUnit] = useState<string | null>(null);
+  // Per-box navigation focuses that unit; global folding keeps other folded units visible.
+  const [focusOnlyUnit, setFocusOnlyUnit] = useState(false);
+  const units = useMemo(() => canvasUnitNames(graph), [graph]);
+  const unitOf = useMemo(() => canvasUnitOf(graph), [graph]);
+  const unitMembers = useMemo(() => {
+    const byUnit = new Map<string, string[]>();
+    for (const node of graph.nodes) {
+      const unit = unitOf.get(node.id);
+      if (unit) byUnit.set(unit, [...(byUnit.get(unit) ?? []), node.id]);
+    }
+    return byUnit;
+  }, [graph, unitOf]);
+  // A loaded graph may not carry the units the view had folded — keep only names this graph still has.
+  useEffect(() => {
+    setCollapsedUnits((current) => {
+      const next = new Set([...current].filter((unit) => units.includes(unit)));
+      return next.size === current.size ? current : next;
+    });
+  }, [units]);
+  /** 한 묶음이라도 접혀 있으면 캔버스는 보기(읽기 전용) — 편집은 통합 보기에서 한다. */
+  const navigation = (collapsedUnits.size > 0 || enteredUnit !== null) && units.length > 0;
+  const viewGraph = useMemo(() => enteredUnit !== null && focusOnlyUnit
+    ? projectCanvasGroups(graph, collapsedUnits, enteredUnit)
+    : navigation ? autoLayoutToFit(collapseCanvasUnits(graph, enteredUnit !== null
+      ? new Set([...collapsedUnits].filter((unit) => unit !== enteredUnit)) : collapsedUnits), flow, lineLength)
+    : graph,
+    [graph, collapsedUnits, enteredUnit, focusOnlyUnit, navigation, flow, lineLength]);
+  /** 상자 머리 «접기» — 그 묶음만 접는다(보고 있던 유닛이면 빵부스러기도 지운다). */
+  const foldUnit = useCallback((unit: string) => {
+    setCollapsedUnits((current) => new Set([...current, unit]));
+    setEnteredUnit((current) => (current === unit ? null : current));
+    setFocusOnlyUnit(true);
+  }, []);
+  /** 접힌 묶음 노드를 누르면 그 묶음의 안쪽 그래프가 열리고 빵부스러기가 부모›유닛 을 가리킨다. */
+  const openUnit = useCallback((unit: string) => {
+    setEnteredUnit(unit);
+    // Wait for ReactFlow to commit the expanded box before fitting that box alone.
+    setTimeout(() => {
+      const instance = flowRef.current;
+      const target = instance?.getNodes().find((entry) => entry.type === 'groupBox' && (entry.data as GroupBoxData | undefined)?.group === unit);
+      if (instance && target) void instance.fitView({ nodes: [{ id: target.id }], duration: 600, maxZoom: 1.4, padding: 0.2 });
+    }, 80);
+  }, []);
+  /** 전역 토글 — 접은 보기(전부 접힘) ↔ 통합 보기(전부 펼침). */
+  const toggleUnitView = useCallback(() => {
+    setCollapsedUnits((current) => (current.size === units.length ? new Set() : new Set(units)));
+    setEnteredUnit(null);
+    setFocusOnlyUnit(false);
+  }, [units]);
+  const unitState = useCallback((members: readonly string[]): GroupState =>
+    aggregateGroupState(members.map((id) => {
+      const status = nodeStatus?.[id];
+      return status !== undefined ? NODE_STATUS_TO_UNIT[status] : 'pending';
+    })), [nodeStatus]);
+  // Opening a unit fits its own box below; a whole-canvas fit here would override that target.
+  useEffect(() => { if (enteredUnit === null) fitCanvas(300); }, [collapsedUnits, enteredUnit, fitCanvas]);
+
   const appliedRev = useRef<number | null>(null);
   useEffect(() => {
     if (!replace || appliedRev.current === replace.rev) return;
@@ -272,6 +361,8 @@ export function GraphCanvasEditor({
   }, [client, saved]);
 
   const edit = useCallback((change: (current: CanvasGraph) => CanvasGraph) => {
+    // A folded canvas is a computed view. Keep every editor entry point from mutating its source graph.
+    if (navigation) return;
     setGraph((current) => {
       try {
         const next = change(current);
@@ -282,11 +373,12 @@ export function GraphCanvasEditor({
         return current;
       }
     });
-  }, []);
+  }, [navigation]);
 
   const fitSoon = useCallback(() => fitCanvas(200), [fitCanvas]);
 
   function addKind(kind: string, at?: { x: number; y: number }) {
+    if (navigation) return;
     let added: string | null = null;
     edit((current) => {
       const result = addNode(current, { kind, flow, ...(at ?? {}) });
@@ -302,29 +394,32 @@ export function GraphCanvasEditor({
     for (const issue of issues) if (issue.nodeId) counts.set(issue.nodeId, (counts.get(issue.nodeId) ?? 0) + 1);
     return counts;
   }, [issues]);
-  const ends = useMemo(() => new Set(terminalNodes(graph)), [graph]);
+  const ends = useMemo(() => new Set(terminalNodes(viewGraph)), [viewGraph]);
   // GRAPH-EDGE-TIDY — same-pair outcomes merge into one edge; forward edges curve, a forward edge that would cross a
   // card detours above the row, back edges arc below it in their own lane; label pills avoid cards and each other.
   const routed = useMemo(() => routeEdges(
-    graph.nodes.map((node) => ({ id: node.id, x: node.x, y: node.y, ...(sizes[node.id] ?? CANVAS_NODE_SIZE) })),
-    mergeParallelEdges(graph.edges),
+    viewGraph.nodes.map((node) => ({ id: node.id, x: node.x, y: node.y, ...(sizes[node.id] ?? CANVAS_NODE_SIZE) })),
+    mergeParallelEdges(viewGraph.edges),
     { flow, rename: canvasOutcomeLabel },
-  ), [graph.nodes, graph.edges, sizes, flow]);
-  const focus = hoverFocus(graph.nodes.some((node) => node.id === hovered) ? hovered : null, routed);
-  const flowNodes: Node[] = graph.nodes.map((node) => ({
+  ), [viewGraph.nodes, viewGraph.edges, sizes, flow]);
+  const focus = hoverFocus(viewGraph.nodes.some((node) => node.id === hovered) ? hovered : null, routed);
+  const cards: Node[] = viewGraph.nodes.map((node) => ({
     id: node.id,
     type: 'canvas',
     position: { x: node.x, y: node.y },
     selected: selection?.type === 'node' && selection.id === node.id,
+    draggable: graph.nodes.some((candidate) => candidate.id === node.id),
+    zIndex: 1,
     className: [nodeStatus ? nodeStatusClass(nodeStatus[node.id]) : '', newNodes.has(node.id) ? 'graph-wizard-new' : ''].filter(Boolean).join(' ') || undefined,
     ...(focus && !focus.nodes.has(node.id) ? { style: { opacity: WIRING_STYLE.dimNode } } : {}),
-    data: { id: node.id, kind: node.kind, recipe: node.recipe, ...(nodeLabels?.[node.id] ? { label: nodeLabels[node.id] } : {}), entry: graph.entry === node.id, terminal: ends.has(node.id), issueCount: nodeIssueCount.get(node.id) ?? 0, flow,
+    data: { id: node.id, kind: node.kind, recipe: node.recipe, ...(nodeLabels?.[node.id] ? { label: nodeLabels[node.id] } : {}), entry: viewGraph.entry === node.id, terminal: ends.has(node.id), issueCount: nodeIssueCount.get(node.id) ?? 0, flow,
+      ...(isGroupNodeId(node.id) ? { unit: { name: node.id.slice(GROUP_NODE_PREFIX.length), state: unitState(unitMembers.get(node.id.slice(GROUP_NODE_PREFIX.length)) ?? []) }, openUnit } : {}),
       ...(nodeStatus?.[node.id] ? { runStatus: nodeStatus[node.id] } : {}) } satisfies CanvasNodeData,
   }));
   const flowEdges: Edge[] = routed.map((route) => {
     // GRAPH-WIZARD — edges the chat just added stay highlighted (thicker, wizard purple, animated).
     const fresh = route.indexes.some((index) => {
-      const edge = graph.edges[index];
+      const edge = viewGraph.edges[index];
       return edge !== undefined && newEdges.has(`${edge.from}->${edge.to}:${edge.outcome}`);
     });
     const wiring = wiringEdgeStyle(focus, route.id);
@@ -336,12 +431,27 @@ export function GraphCanvasEditor({
     targetHandle: 'in',
     type: 'tidy',
     data: { route } satisfies TidyEdgeData,
-    selected: selection?.type === 'edge' && route.indexes.includes(selection.index),
+    selected: selection?.type === 'edge' && route.indexes.some((index) => {
+      const edge = viewGraph.edges[index];
+      const original = graph.edges[selection.index];
+      return !!(edge && original && edge.from === original.from && edge.to === original.to && edge.outcome === original.outcome);
+    }),
     className: focus?.edges.has(route.id) ? 'wiring-edge-flow' : undefined,
     animated: wiring.animated || fresh || (nodeStatus?.[route.from] === 'done' && nodeStatus?.[route.to] === 'running'),
     ...(focus ? { style: wiring.style } : fresh ? { style: { stroke: '#a855f7', strokeWidth: 3 } } : {}),
     };
   });
+  // CGE-UNITS: shared group-box projection; folded views are navigational and read-only.
+  const boxes = useMemo(() => groupBoxes(
+    viewGraph.nodes.map((node) => ({ id: node.id, position: { x: node.x, y: node.y }, ...(sizes[node.id] ?? CANVAS_NODE_SIZE) })),
+    unitOf,
+  ), [viewGraph, sizes, unitOf]);
+  const boxNodes: Node[] = focusOnlyUnit && enteredUnit !== null ? [] : boxes.map((box) => ({
+    id: box.id, type: 'groupBox', position: { x: box.x, y: box.y }, zIndex: 0,
+    selectable: false, draggable: false, focusable: false,
+    data: { group: box.group, state: unitState(box.members), memberCount: box.members.length, stepCount: box.members.length, width: box.width, height: box.height, onCollapse: foldUnit } satisfies GroupBoxData,
+  }));
+  const flowNodes: Node[] = [...boxNodes, ...cards];
 
   function onNodesChange(changes: NodeChange[]) {
     for (const change of changes) {
@@ -349,10 +459,11 @@ export function GraphCanvasEditor({
         const { id, dimensions } = change;
         setSizes((current) => current[id]?.width === dimensions.width && current[id]?.height === dimensions.height ? current : { ...current, [id]: dimensions });
       }
-      if (change.type === 'position' && change.position) {
+      if (change.type === 'position' && change.position && graph.nodes.some((node) => node.id === change.id)) {
         const { id, position } = change;
         if (change.dragging) userMoved.current = true;
-        edit((current) => moveNode(current, id, position.x, position.y));
+        // In a unit view the canvas shows a computed layout — the stored graph keeps its own positions.
+        if (!navigation) edit((current) => moveNode(current, id, position.x, position.y));
       }
     }
   }
@@ -428,7 +539,7 @@ export function GraphCanvasEditor({
     <div className="flex min-h-0 flex-1 flex-col" data-graph-id={graph.graphId} aria-label="그래프 만들기">
       <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2 text-xs">
         <label className="flex items-center gap-1 text-muted-foreground">그래프 id
-          <input ref={idRef} aria-label="그래프 id" value={graph.graphId} spellCheck={false} placeholder="예: my-graph" autoCapitalize="off" autoCorrect="off"
+          <input ref={idRef} aria-label="그래프 id" value={graph.graphId} disabled={navigation} spellCheck={false} placeholder="예: my-graph" autoCapitalize="off" autoCorrect="off"
             onChange={(event) => edit((current) => setGraphId(current, event.target.value))}
             className="w-36 rounded border border-border bg-background px-2 py-1 font-mono text-foreground" />
         </label>
@@ -443,6 +554,13 @@ export function GraphCanvasEditor({
         )}
         <span className="text-muted-foreground">{context.saved ? `저장됨${saved?.version !== undefined ? ` · v${saved.version}` : ''}` : saved?.id === graph.graphId ? '저장 안 된 변경' : '아직 저장 안 함'}</span>
         <div className="ml-auto flex flex-wrap items-center gap-2">
+          {units.length > 0 && (
+            <button type="button" data-testid="toggle-units" onClick={toggleUnitView}
+              title="모든 묶음을 한 그래프에 펼치거나(통합 보기), 묶음마다 노드 하나로 절습니다(접은 보기)"
+              className="rounded border border-border px-2 py-1">
+              {collapsedUnits.size === units.length ? '묶음 펼치기 (통합 보기)' : '묶음 접기'}
+            </button>
+          )}
           <button type="button" onClick={() => { void runCheck(); }} disabled={busy !== null}
             title={client ? '저장하지 않고 서버의 그래프 로더로 검증합니다' : 'Daemon 연결이 없어 로컬 검사만 합니다'}
             className="rounded border border-border px-3 py-1 disabled:opacity-50">{busy === 'validate' ? '검증 중…' : '검증'}</button>
@@ -466,14 +584,38 @@ export function GraphCanvasEditor({
       {(editError || notice) && (
         <p role={editError ? 'alert' : 'status'} className={`border-b border-border px-3 py-1 text-xs ${editError ? 'text-red-500' : 'text-emerald-500'}`}>{editError ?? notice}</p>
       )}
+      {units.length > 0 && (
+        <div data-testid="unit-view-bar" className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-1.5 text-xs">
+          {enteredUnit !== null ? (
+            <nav aria-label="묶음 위치" data-testid="unit-breadcrumb" className="flex items-center gap-1">
+              <button type="button" onClick={() => { setCollapsedUnits(new Set(units)); setEnteredUnit(null); }}
+                title="모든 묶음을 접어 돌아갑니다" className="font-mono text-muted-foreground hover:underline">
+                {graph.graphId || '그래프'}
+              </button>
+              <span aria-hidden className="text-muted-foreground">›</span>
+              <span className="font-mono font-semibold text-foreground">▣ {enteredUnit}</span>
+            </nav>
+          ) : (
+            <span className="text-muted-foreground">
+              {navigation ? '접은 보기 — 묶음을 눌러 안쪽 그래프를 여세요 (편집은 통합 보기에서)' : '통합 보기 — 모든 묶음이 한 그래프에 펼쳐 있습니다'}
+            </span>
+          )}
+          <span className="ml-auto text-muted-foreground">묶음 {units.length} · 접힘 {collapsedUnits.size}</span>
+        </div>
+      )}
       <datalist id="graph-canvas-outcomes">{OUTCOME_SUGGESTIONS.map((name) => <option key={name} value={name} />)}</datalist>
+      {units.length > 0 && <nav aria-label="유닛 보기" className="sr-only">
+        <button type="button" aria-label="부모 그래프" onClick={() => { setEnteredUnit(null); setSelection(null); fitSoon(); }}>{graph.graphId || '부모'}</button>
+        {enteredUnit && <span>› <span>{enteredUnit}</span></span>}
+        <button type="button" data-testid="editor-toggle-units" onClick={toggleUnitView}>{collapsedUnits.size === units.length ? '묶음 펼치기 (통합 보기)' : '묶음 접기'}</button>
+      </nav>}
       <div className={`flex min-h-0 flex-1 flex-col ${wizardMode ? '' : 'min-[900px]:flex-row'}`}>
         <aside aria-label="노드 팔레트" className={wizardMode ? 'flex shrink-0 items-center gap-2 border-b border-border px-2 py-1.5' : 'shrink-0 border-b border-border p-2 min-[900px]:w-44 min-[900px]:overflow-y-auto min-[900px]:border-b-0 min-[900px]:border-r'}>
           <p className={`text-[11px] text-muted-foreground ${wizardMode ? 'shrink-0' : 'mb-1'}`}>{wizardMode ? '눌러서 추가' : <><span className="min-[900px]:hidden">눌러서 추가</span><span className="hidden min-[900px]:inline">끌어 놓거나 눌러서 추가</span></>}</p>
           <ul className={wizardMode ? 'flex min-w-0 gap-1 overflow-x-auto' : 'flex gap-1 overflow-x-auto min-[900px]:flex-col min-[900px]:overflow-visible'}>
             {palette.map((entry) => (
               <li key={`${entry.plugin ?? 'core'}:${entry.kind}`} className="shrink-0">
-                <button type="button" draggable title={entry.description || entry.kind}
+                <button type="button" draggable={!navigation} disabled={navigation} title={entry.description || entry.kind}
                   aria-label={`${entry.kind} 노드 추가`}
                   onDragStart={(event) => { event.dataTransfer.setData(KIND_MIME, entry.kind); event.dataTransfer.effectAllowed = 'copy'; }}
                   onClick={() => addKind(entry.kind)}
@@ -493,7 +635,7 @@ export function GraphCanvasEditor({
           }}
           onDrop={(event) => {
             const kind = event.dataTransfer.getData(KIND_MIME);
-            if (!kind || !kinds.includes(kind)) return;
+            if (navigation || !kind || !kinds.includes(kind)) return;
             event.preventDefault();
             const at = flowRef.current?.screenToFlowPosition({ x: event.clientX, y: event.clientY }) ?? { x: 40, y: 40 };
             addKind(kind, { x: at.x - 85, y: at.y - 30 });
@@ -505,14 +647,25 @@ export function GraphCanvasEditor({
           )}
           <ReactFlow nodes={flowNodes} edges={flowEdges} nodeTypes={NODE_TYPES} edgeTypes={TIDY_EDGE_TYPES}
             onInit={(instance) => { flowRef.current = instance; }}
+            nodesDraggable={!navigation} nodesConnectable={!navigation}
             onNodesChange={onNodesChange}
             onConnect={(connection: Connection) => {
-              if (connection.source && connection.target) edit((current) => connect(current, connection.source, connection.target, defaultOutcome(current, connection.source)));
+              if (navigation || !connection.source || !connection.target || !graph.nodes.some((node) => node.id === connection.source) || !graph.nodes.some((node) => node.id === connection.target)) return;
+              edit((current) => connect(current, connection.source, connection.target, defaultOutcome(current, connection.source)));
             }}
             onNodeMouseEnter={(_event, node) => setHovered(node.id)}
             onNodeMouseLeave={() => setHovered(null)}
-            onNodeClick={(_event, node) => setSelection({ type: 'node', id: node.id })}
-            onEdgeClick={(_event, edge) => setSelection({ type: 'edge', index: Number(edge.id.slice(1)) })}
+            onNodeClick={(_event, node) => {
+              if (node.type === 'groupBox') return;
+              if (isGroupNodeId(node.id) && !graph.nodes.some((entry) => entry.id === node.id)) { openUnit(node.id.slice(GROUP_NODE_PREFIX.length)); return; }
+              if (!navigation) setSelection({ type: 'node', id: node.id });
+            }}
+            onEdgeClick={(_event, edge) => {
+              if (navigation) return;
+              const projected = viewGraph.edges[Number(edge.id.slice(1))];
+              const index = projected ? graph.edges.findIndex((candidate) => candidate.from === projected.from && candidate.to === projected.to && candidate.outcome === projected.outcome) : -1;
+              if (index >= 0) setSelection({ type: 'edge', index });
+            }}
             onPaneClick={() => setSelection(null)}
             deleteKeyCode={null} fitView fitViewOptions={{ padding: 0.12, maxZoom: 1.1, minZoom: wizardMode ? WIZARD_FIT_MIN_ZOOM : FIT_MIN_ZOOM }}
             minZoom={0.3} maxZoom={1.5} className="!bg-background" style={CANVAS_CONTROL_TOKENS}>
@@ -520,7 +673,7 @@ export function GraphCanvasEditor({
             <Controls showInteractive={false} position="bottom-left" />
           </ReactFlow>
         </section>
-        {(!wizardMode || selection) && (
+        {!navigation && (!wizardMode || selection) && (
         <aside aria-label="속성" className="shrink-0 overflow-y-auto border-t border-border p-3 text-xs min-[900px]:w-72 min-[900px]:border-l min-[900px]:border-t-0">
           {selectedNode ? (
             <NodePanel key={selectedNode.id} graph={graph} nodeId={selectedNode.id} palette={palette}

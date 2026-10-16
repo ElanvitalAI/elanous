@@ -5,7 +5,9 @@
  * Past `tools.selfImplement.runTtlHours` (default 24) since its last commit, the sweep makes one pre-emptive move:
  *   · live owning run → one resync memo in its control inbox (same path as SIBLING-RESYNC #24893/#24899),
  *                       at most once per (PR, head sha) — a rebase moves the head and re-arms it
- *   · no live run     → the registered `elanous:needs-rebase` label, once (QUIET-PR-COMMENTS: never a comment)
+ *   · no live run     → the registered `elanous:needs-rebase` label, once (QUIET-PR-COMMENTS: never a comment);
+ *                       when `requestRegate` is supplied, at most one of those stale PRs is also selected
+ *                       for a re-gate request (shadow: would-regate observation only; live: one call)
  *
  * Mode `tools.selfImplement.runTtl.mode`: `shadow` (default) only logs what it would do; `live` writes.
  * Cost bound: a PR opened inside the TTL is still inside its own time-to-landing and is never fetched
@@ -63,6 +65,8 @@ export interface RunTtlResult {
   readonly memo: readonly number[];
   /** Label added (live) or would be added (shadow). */
   readonly label: readonly number[];
+  /** Re-gate requested (live) or would be requested (shadow). Empty when the adapter is omitted. */
+  readonly regate: readonly number[];
   readonly alreadyMarked: readonly number[];
   readonly alreadyMemoed: readonly number[];
   /** Owning run lookup failed — left alone (a failed lookup is not a dead run). */
@@ -109,6 +113,8 @@ export async function runRunTtlSweep(input: {
   concurrency?: number;
   now?: () => number;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
+  /** Optional: among stale PRs with no live run, request a re-gate for at most one per sweep. */
+  requestRegate?: (pr: RunTtlCandidate) => Promise<void> | void;
 }): Promise<RunTtlResult> {
   const { adapters } = input;
   const now = input.now ?? Date.now;
@@ -132,6 +138,7 @@ export async function runRunTtlSweep(input: {
   const stale: number[] = [];
   const memo: number[] = [];
   const label: number[] = [];
+  const regate: number[] = [];
   const alreadyMarked: number[] = [];
   const alreadyMemoed: number[] = [];
   const unresolved: number[] = [];
@@ -139,17 +146,17 @@ export async function runRunTtlSweep(input: {
   const skippedFetchCap: number[] = [];
   const failed: number[] = [];
   const result = (reason?: string): RunTtlResult => ({
-    mode, ttlHours, considered, freshByCreation, fetched, fresh, unknown, stale, memo, label, alreadyMarked,
+    mode, ttlHours, considered, freshByCreation, fetched, fresh, unknown, stale, memo, label, regate, alreadyMarked,
     alreadyMemoed, unresolved, skippedOverCap, skippedFetchCap, failed, durationMs: Math.max(0, now() - startedAt),
     ...(reason ? { reason } : {}),
   });
   const summary = (out: RunTtlResult): RunTtlResult => {
     emit('summary', {
       ttlHours, cap, maxFetch, concurrency, considered, freshByCreation, fetched, fresh,
-      unknown: unknown.length, stale: stale.length, memo: memo.length, label: label.length,
+      unknown: unknown.length, stale: stale.length, memo: memo.length, label: label.length, regate: regate.length,
       alreadyMarked: alreadyMarked.length, alreadyMemoed: alreadyMemoed.length, unresolved: unresolved.length,
       skippedOverCap: skippedOverCap.length, skippedFetchCap: skippedFetchCap.length, failed: failed.length,
-      memoPrs: memo, labelPrs: label, durationMs: out.durationMs, ...(out.reason ? { reason: out.reason } : {}),
+      memoPrs: memo, labelPrs: label, regatePrs: regate, durationMs: out.durationMs, ...(out.reason ? { reason: out.reason } : {}),
     });
     return out;
   };
@@ -200,6 +207,7 @@ export async function runRunTtlSweep(input: {
   }
   stalePrs.sort((a, b) => b.ageMs - a.ageMs || a.pr.number - b.pr.number);
   let actions = 0;
+  let selectedRegate = false;
   for (const { pr, target, ageMs } of stalePrs) {
     const ageHours = ageMs / 3_600_000;
     const key = `${pr.number}:${pr.headSha}`;
@@ -240,9 +248,15 @@ export async function runRunTtlSweep(input: {
       }
     }
     const reason = target.alive ? 'memo-failed' : target.reason;
+    const canRegate = Boolean(input.requestRegate) && !target.alive && !selectedRegate;
     if (mode === 'shadow') {
       label.push(pr.number);
       emit('would-label', { pr: pr.number, label: RUN_TTL_MARKER_LABEL, reason, ageHours: Math.floor(ageHours) });
+      if (canRegate) {
+        selectedRegate = true;
+        regate.push(pr.number);
+        emit('would-regate', { pr: pr.number, reason, ageHours: Math.floor(ageHours) });
+      }
       continue;
     }
     try {
@@ -252,6 +266,16 @@ export async function runRunTtlSweep(input: {
     } catch (error) {
       failed.push(pr.number);
       emit('label-failed', { pr: pr.number, error: String(error) });
+    }
+    if (canRegate) {
+      selectedRegate = true;
+      try {
+        await input.requestRegate!(pr);
+        regate.push(pr.number);
+        emit('regate-requested', { pr: pr.number, reason, ageHours: Math.floor(ageHours) });
+      } catch (error) {
+        emit('regate-failed', { pr: pr.number, error: String(error) });
+      }
     }
   }
   return summary(result());

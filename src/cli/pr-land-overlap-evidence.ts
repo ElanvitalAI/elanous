@@ -29,7 +29,7 @@ import { parseReviewResultOutput } from '../task-agent/review-result-capture.js'
 const SHA40 = /^[0-9a-f]{40}$/i;
 
 interface OverlapEvidenceFile {
-  pr: number;
+  pr: number | string;
   head: string;
   /** ①② 경로에서만 필수 — 겹친 착지가 전부 조상(already-ancestor)이면 생략해도 된다. */
   gate?: { head: string; baseCommit: string; passed: boolean };
@@ -174,6 +174,47 @@ function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'>,
   if (!review) return { ok: false, reason: 'review-no-result', baseTip };
   if (review.pr !== input.pr) return { ok: false, reason: 'review-pr-mismatch', baseTip };
   if (!review.head || review.head.toLowerCase() !== head) return { ok: false, reason: 'review-head-mismatch', baseTip };
+  // The capture parser projects away model provenance; inspect the same last result-shaped line here.
+  let raw: Record<string, unknown> | undefined;
+  for (const line of text.split('\n').reverse()) {
+    if (!line.trim().startsWith('{')) continue;
+    let value: unknown;
+    try { value = JSON.parse(line); } catch { continue; }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const result = value as Record<string, unknown>;
+    if (result.pr === undefined || !(('verdict' in result && Array.isArray(result.mustFix)) || typeof result.error === 'string')) continue;
+    raw = result;
+    break;
+  }
+  if (raw) {
+    const actualBackend = typeof raw.actualBackend === 'string' ? raw.actualBackend.trim().toLowerCase() : '';
+    const model = typeof raw.model === 'string' ? raw.model.trim().toLowerCase() : '';
+    const route = typeof raw.reviewRoute === 'string' ? raw.reviewRoute.trim().toLowerCase() : '';
+    const respondedProvider = typeof raw.respondedProvider === 'string' ? raw.respondedProvider.trim().toLowerCase() : '';
+    const respondedModel = typeof raw.respondedModel === 'string' ? raw.respondedModel.trim().toLowerCase() : '';
+    if (actualBackend === 'acp:claude' || actualBackend.startsWith('acp:claude/')
+      || model === 'acp:claude' || model.startsWith('acp:claude/')
+      || ((route === 'acp' || route === 'acp-fallback') && typeof raw.fallbackBackend === 'string' && raw.fallbackBackend.trim().toLowerCase() === 'claude')) {
+      return { ok: false, reason: 'review-forbidden-acp-claude', baseTip };
+    }
+    const requested = typeof raw.requestedModel === 'string' ? raw.requestedModel.trim().toLowerCase() : '';
+    if (requested) {
+      const requestedAcpBackend = requested.startsWith('acp:') ? requested.split('/')[0] : '';
+      // Only explicit provider-qualified forms identify a provider here. Bare model IDs
+      // (for example claude-sonnet-4 or gpt-6-sol) cannot be compared to a provider name.
+      const apiProvider = requested.startsWith('openrouter/') ? 'openrouter'
+        : requested.startsWith('local:') ? 'local' : '';
+      const expectedResponseModel = requested.startsWith('openrouter/') ? requested.slice('openrouter/'.length) : requested;
+      const mismatch = (model !== '' && model !== requested)
+        || (actualBackend !== '' && (requestedAcpBackend ? actualBackend !== requestedAcpBackend : actualBackend !== 'api'
+          && (apiProvider === '' || actualBackend !== apiProvider)))
+        || (route !== '' && route !== (requestedAcpBackend ? 'acp' : 'api'))
+        || (!requestedAcpBackend && apiProvider !== '' && respondedProvider !== '' && respondedProvider !== apiProvider)
+        || (!requestedAcpBackend && respondedModel !== '' && respondedModel !== expectedResponseModel
+          && respondedModel !== requested);
+      if (mismatch) console.warn(`⚠ overlap-evidence: review provider mismatch — requestedModel=${requested} actualBackend=${actualBackend || 'unmeasured'} model=${model || 'unmeasured'} reviewRoute=${route || 'unmeasured'} respondedProvider=${respondedProvider || 'unmeasured'} respondedModel=${respondedModel || 'unmeasured'} (${e.reviewResult})`);
+    }
+  }
   if (review.error) return { ok: false, reason: 'review-error', baseTip };
   if (review.reviewed !== true) return { ok: false, reason: 'review-not-reviewed', baseTip };
   if (review.verdict === null || !ACCEPTED_REVIEW_VERDICTS.has(review.verdict)) return { ok: false, reason: `review-verdict-${review.verdict ?? 'null'}`, baseTip };
@@ -245,7 +286,11 @@ function check(input: VerifyOverlapEvidenceInput): Checked {
   }
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'evidence-not-object' };
   const e = raw as Partial<OverlapEvidenceFile>;
-  if (e.pr !== input.pr) return { ok: false, reason: `evidence-pr-mismatch: ${String(e.pr)} ≠ ${input.pr}` };
+  const evidencePr = typeof e.pr === 'number' ? e.pr
+    : typeof e.pr === 'string' && /^[0-9]+$/.test(e.pr) ? Number(e.pr) : NaN;
+  const prMatches = Number.isSafeInteger(input.pr) && input.pr > 0
+    && Number.isSafeInteger(evidencePr) && evidencePr === input.pr;
+  if (!prMatches) return { ok: false, reason: `evidence-pr-mismatch: ${String(e.pr)} ≠ ${input.pr}` };
   if (typeof e.head !== 'string' || e.head.toLowerCase() !== head) return { ok: false, reason: 'evidence-head-mismatch' };
 
   // ⓐ 이미 조상 — 겹친 착지가 전부 머리 안에 있으면 그 머리의 게이트·리뷰가 이미 그것을 보고 쟀다.
@@ -317,13 +362,10 @@ export interface VerifyAncestorAutoInput {
   overlappingLandings: readonly string[];
 }
 
-function checkAncestorAuto(input: VerifyAncestorAutoInput): AncestorAutoVerdict {
+/** Standard same-head reviews must all pass; a later passing review cannot hide a failed attempt. */
+export function verifyAllSameHeadReviews(input: Pick<VerifyAncestorAutoInput, 'pr' | 'expectedHead' | 'readFile' | 'reviewResultsDir' | 'listDir'>):
+  { ok: true; reviewResult: string } | { ok: false; reason: string } {
   const head = input.expectedHead.toLowerCase();
-  const landings = input.overlappingLandings;
-  if (landings.length === 0) return { ok: false, reason: 'ancestor-auto-no-overlapping-landings' };
-  const notAncestor = landings.find((sha) => !(/^[0-9a-f]{7,40}$/i.test(sha)
-    && input.run('git', ['merge-base', '--is-ancestor', sha, head], { cwd: input.cwd }).ok));
-  if (notAncestor !== undefined) return { ok: false, reason: `ancestor-auto-not-ancestor: ${notAncestor.slice(0, 12)} is not an ancestor of ${head.slice(0, 12)}` };
   let names: readonly string[];
   try { names = input.listDir(input.reviewResultsDir); } catch { return { ok: false, reason: 'review-missing' }; }
   const filename = new RegExp(`^[A-Za-z0-9][A-Za-z0-9._-]*-${input.pr}-([a-f0-9]{10,40})\\.json$`, 'i');
@@ -333,11 +375,23 @@ function checkAncestorAuto(input: VerifyAncestorAutoInput): AncestorAutoVerdict 
     const match = filename.exec(n);
     return Boolean(match && match[1]!.length >= 10 && head.startsWith(match[1]!.toLowerCase()));
   }).sort()) {
+    // The auto-ancestor landing path uses the same provider/forbidden-backend check as explicit evidence.
     const review = checkReview(input, { reviewResult: join(input.reviewResultsDir, name) }, head);
     if (!review.ok) return { ok: false, reason: review.reason };
     accepted = review.reviewResult;
   }
-  return accepted === undefined ? { ok: false, reason: 'review-missing' } : { ok: true, mode: 'already-ancestor-auto', reviewResult: accepted };
+  return accepted === undefined ? { ok: false, reason: 'review-missing' } : { ok: true, reviewResult: accepted };
+}
+
+function checkAncestorAuto(input: VerifyAncestorAutoInput): AncestorAutoVerdict {
+  const head = input.expectedHead.toLowerCase();
+  const landings = input.overlappingLandings;
+  if (landings.length === 0) return { ok: false, reason: 'ancestor-auto-no-overlapping-landings' };
+  const notAncestor = landings.find((sha) => !(/^[0-9a-f]{7,40}$/i.test(sha)
+    && input.run('git', ['merge-base', '--is-ancestor', sha, head], { cwd: input.cwd }).ok));
+  if (notAncestor !== undefined) return { ok: false, reason: `ancestor-auto-not-ancestor: ${notAncestor.slice(0, 12)} is not an ancestor of ${head.slice(0, 12)}` };
+  const reviews = verifyAllSameHeadReviews(input);
+  return reviews.ok ? { ok: true, mode: 'already-ancestor-auto', reviewResult: reviews.reviewResult } : reviews;
 }
 
 /**
