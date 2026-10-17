@@ -7,6 +7,15 @@ import { debug } from '../debug/log.js';
 import { runSelfImplement, type SelfImplementSeams } from './orchestrator.js';
 import { seams } from './test-seams.js';
 
+const codexNoCandidateSeams = (): Pick<SelfImplementSeams, 'currentProviderName' | 'inspectCodexRotation'> => ({
+  currentProviderName: () => 'openai-codex',
+  inspectCodexRotation: (() => ({
+    reason: 'no-candidate',
+    candidateCount: 0,
+    knownAccountCount: 2,
+    currentReached: true,
+  })) as SelfImplementSeams['inspectCodexRotation'],
+});
 
 test('quota-exhausted blocked run preserves its branch without opening a draft; implementation deficit still opens one', async () => {
   const original = debug.log;
@@ -30,8 +39,7 @@ test('quota-exhausted blocked run preserves its branch without opening a draft; 
       feature: 'quota stopped work', maxReworkRounds: 0,
       seams: seams({
         ...common,
-        currentProviderName: () => 'openai-codex',
-        inspectCodexRotation: (() => ({ reason: 'no-candidate', candidateCount: 0, knownAccountCount: 2, currentReached: true })) as SelfImplementSeams['inspectCodexRotation'],
+        ...codexNoCandidateSeams(),
         gate: async () => ({ passed: false, log: 'quota stopped gate' }),
       }),
     });
@@ -67,8 +75,7 @@ test('no changes takes precedence over environment branch preservation', async (
     await runSelfImplement({
       feature: 'quota stopped without changes', maxReworkRounds: 0,
       seams: seams({
-        currentProviderName: () => 'openai-codex',
-        inspectCodexRotation: (() => ({ reason: 'no-candidate', candidateCount: 0, knownAccountCount: 2, currentReached: true })) as SelfImplementSeams['inspectCodexRotation'],
+        ...codexNoCandidateSeams(),
         gate: async () => ({ passed: false, log: 'quota stopped gate' }),
         preservationHasChanges: () => false,
         preserveBlockedBranch: async () => { pushes++; return true; },
@@ -144,8 +151,7 @@ test('worktree-only environment stop never pushes, even when an origin exists', 
     const result = await runSelfImplement({
       feature: 'worktree-only quota stop', completion: 'worktree-only', maxReworkRounds: 0,
       seams: seams({
-        currentProviderName: () => 'openai-codex',
-        inspectCodexRotation: (() => ({ reason: 'no-candidate', candidateCount: 0, knownAccountCount: 2, currentReached: true })) as SelfImplementSeams['inspectCodexRotation'],
+        ...codexNoCandidateSeams(),
         gate: async () => ({ passed: false, log: 'quota stopped gate' }),
         preservationHasChanges: () => true,
         persistPrBodyArtifact: ({ origin }) => { artifactOrigin = origin; return { path: '/tmp/blocked-worktree-quota.md' }; },
@@ -173,8 +179,7 @@ test('failed environment push is reported to the caller and never presented as p
     await expect(runSelfImplement({
       feature: 'failed quota branch push', maxReworkRounds: 0,
       seams: seams({
-        currentProviderName: () => 'openai-codex',
-        inspectCodexRotation: (() => ({ reason: 'no-candidate', candidateCount: 0, knownAccountCount: 2, currentReached: true })) as SelfImplementSeams['inspectCodexRotation'],
+        ...codexNoCandidateSeams(),
         gate: async () => ({ passed: false, log: 'quota stopped gate' }),
         preservationHasChanges: () => true,
         persistPrBodyArtifact: () => ({ path: '/tmp/blocked-push-failure.md' }),
@@ -205,8 +210,7 @@ test('missing worktree keeps provider attribution and reports failed preservatio
       feature: 'missing environment worktree', maxReworkRounds: 0,
       seams: seams({
         createWorktree: async ({ branch }) => ({ path: join(tmpdir(), `nonexistent-${branch}`), branch, resolvedBase: 'a'.repeat(40) }),
-        currentProviderName: () => 'openai-codex',
-        inspectCodexRotation: (() => ({ reason: 'no-candidate', candidateCount: 0, knownAccountCount: 2, currentReached: true })) as SelfImplementSeams['inspectCodexRotation'],
+        ...codexNoCandidateSeams(),
         gate: async () => ({ passed: false, log: 'quota stopped gate' }),
         preservationHasChanges: () => true,
         persistPrBodyArtifact: () => ({ path: '/tmp/blocked-missing-worktree.md' }),
@@ -251,8 +255,7 @@ test('environment stop without origin commits changes on the local branch for ch
       feature: 'local quota stop', maxReworkRounds: 0,
       seams: seams({
         createWorktree: async () => ({ path: repo, branch: 'self-impl/local-only', resolvedBase: git(repo, 'rev-parse', 'main') }),
-        currentProviderName: () => 'openai-codex',
-        inspectCodexRotation: (() => ({ reason: 'no-candidate', candidateCount: 0, knownAccountCount: 2, currentReached: true })) as SelfImplementSeams['inspectCodexRotation'],
+        ...codexNoCandidateSeams(),
         gate: async () => ({ passed: false, log: 'quota stopped gate' }),
         preservationHasChanges: () => true,
         persistPrBodyArtifact: () => ({ path: '/tmp/blocked-local-only.md' }),
@@ -306,8 +309,7 @@ test('environment branch is committed and pushed to an existing origin without o
       feature: 'environment branch push', maxReworkRounds: 0,
       seams: seams({
         createWorktree: async () => ({ path: repo, branch: 'self-impl/blocked-environment', resolvedBase: git(repo, 'rev-parse', 'main') }),
-        currentProviderName: () => 'openai-codex',
-        inspectCodexRotation: (() => ({ reason: 'no-candidate', candidateCount: 0, knownAccountCount: 2, currentReached: true })) as SelfImplementSeams['inspectCodexRotation'],
+        ...codexNoCandidateSeams(),
         gate: async () => ({ passed: false, log: 'quota stopped gate' }),
         preservationHasChanges: () => true,
         persistPrBodyArtifact: () => ({ path: '/tmp/blocked-environment-body.md' }),
@@ -326,8 +328,7 @@ test('environment branch is committed and pushed to an existing origin without o
       feature: 'worktree-only quota stop with origin', completion: 'worktree-only', maxReworkRounds: 0,
       seams: seams({
         createWorktree: async () => ({ path: repo, branch: 'self-impl/blocked-environment', resolvedBase: git(repo, 'rev-parse', 'main') }),
-        currentProviderName: () => 'openai-codex',
-        inspectCodexRotation: (() => ({ reason: 'no-candidate', candidateCount: 0, knownAccountCount: 2, currentReached: true })) as SelfImplementSeams['inspectCodexRotation'],
+        ...codexNoCandidateSeams(),
         gate: async () => ({ passed: false, log: 'quota stopped gate' }),
         preservationHasChanges: () => true,
         persistPrBodyArtifact: () => ({ path: '/tmp/blocked-worktree-quota.md' }),

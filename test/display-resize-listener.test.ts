@@ -82,4 +82,31 @@ describe('installResizeListener', () => {
     expect(drawCalls).toBe(1);
     expect(repaintCalls).toBe(1);
   });
+
+  test('requestOverlayFrame runs LAST so modal overlays land on top of the prompt chrome (TUI-PICKER-RESIZE-SHRINK)', () => {
+    const order: string[] = [];
+    const dispose = installResizeListener({
+      draw: () => { order.push('draw'); },
+      promptCtl: { repaint: () => { order.push('repaint'); } },
+      requestOverlayFrame: () => { order.push('overlay-frame'); },
+    });
+    disposers.push(dispose);
+
+    process.stdout.emit('resize');
+    expect(order).toEqual(['draw', 'repaint', 'overlay-frame']);
+  });
+
+  test('swallows requestOverlayFrame errors so the listener survives', () => {
+    let overlayCalls = 0;
+    const dispose = installResizeListener({
+      draw: () => {},
+      promptCtl: { repaint: () => {} },
+      requestOverlayFrame: () => { overlayCalls++; throw new Error('frame-boom'); },
+    });
+    disposers.push(dispose);
+
+    expect(() => process.stdout.emit('resize')).not.toThrow();
+    expect(() => process.stdout.emit('resize')).not.toThrow();
+    expect(overlayCalls).toBe(2);
+  });
 });

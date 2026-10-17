@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, 
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { aggregateGateTestShards } from './shard-aggregate.js';
-import { runBunShard, runBunShardWithSpawn, runShardedGateTests, SHARD_FAILURE_TAIL_BYTES, selfGateShardTimeoutMs, writeShardFailureEvidence, type ShardProcess } from './shard-run.js';
+import { maxAutomaticShardCount, runBunShard, runBunShardWithSpawn, runShardedGateTests, SHARD_FAILURE_TAIL_BYTES, selfGateShardTimeoutMs, writeShardFailureEvidence, type ShardProcess } from './shard-run.js';
 import { GATE_SPAWN_LANE_FILES, isGateSpawnLaneFile } from './spawn-lane-files.js';
 import { planFixedGateTestShards, type GateTestShard } from './shard-plan.js';
 
@@ -58,8 +58,126 @@ test('self gate separates real spawn files under the same shard budget and retai
   expect(selfGateShardTimeoutMs(['test/plain-a.test.ts'])).toBe(300_000);
   expect(selfGateShardTimeoutMs(['test/preview-terminal.test.ts'])).toBe(120_000);
   expect(() => selfGateShardTimeoutMs(['test/plain-a.test.ts', 'test/preview-terminal.test.ts'])).toThrow('mixed');
-  expect(runShardedGateTests('/head', files, 'HEAD', 1, run,
-    baseline as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree, 1).aggregate.status).toBe('unmeasured');
+  const expanded = runShardedGateTests('/head', files, 'HEAD', 1, run,
+    baseline as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree, 1,
+    { hostResources: { cores: 16, freeMemoryGiB: 16, freeTmpGiB: 16 } });
+  expect(expanded.aggregate.status).toBe('passed');
+  expect(expanded.expandedFrom).toBe(1);
+});
+
+test('183 measured importer files expand the requested 16 shards until every 8 GiB bundle fits', () => {
+  const files = Array.from({ length: 183 }, (_, i) => `test/importer-${String(i).padStart(3, '0')}.test.ts`);
+  const run: ShardProcess = (cwd, selected) => {
+    const failed = selected.filter((file) => (cwd === '/head' ? [files[0], files[1]] : [files[0]]).includes(file));
+    return { exitCode: failed.length ? 1 : 0, junit: xml(selected, failed), rssMb: 1741, seconds: 1 };
+  };
+  const baseline = (_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base');
+  const result = runShardedGateTests('/head', files, 'HEAD', 16, run,
+    baseline as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree, 8,
+    { hostResources: { cores: 64, freeMemoryGiB: 512, freeTmpGiB: 64 } });
+  expect(result.aggregate.status).toBe('failed');
+  expect(result.aggregate.report).toMatchObject({ introduced: 1, preexisting: 1 });
+  expect(result.expandedFrom).toBe(16);
+  expect(result.shards.length).toBeGreaterThanOrEqual(39);
+  expect(result.shards.every((shard) => shard.plannedRssMb <= 8192)).toBe(true);
+  expect(result.shards.flatMap((shard) => shard.files).sort()).toEqual(files);
+});
+
+test('host expansion cap runs a fixed plan instead of declaring all importer tests unmeasured', () => {
+  expect(maxAutomaticShardCount(2, 8, { cores: 16, freeMemoryGiB: 24, freeTmpGiB: 6 })).toBe(3);
+  expect(maxAutomaticShardCount(2, 8, { cores: 16, freeMemoryGiB: 80, freeTmpGiB: 2 })).toBe(2);
+  const files = Array.from({ length: 8 }, (_, i) => `test/importer-${i}.test.ts`);
+  let bundleRuns = 0;
+  const run: ShardProcess = (_cwd, selected) => {
+    if (selected.length > 1) bundleRuns++;
+    return { exitCode: 0, junit: xml(selected, []), rssMb: 5000, seconds: 1 };
+  };
+  const baseline = (_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base');
+  const result = runShardedGateTests('/head', files, 'HEAD', 2, run,
+    baseline as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree, 8,
+    { hostResources: { cores: 16, freeMemoryGiB: 24, freeTmpGiB: 6 } });
+  expect(result.aggregate.status).toBe('passed');
+  expect(result.distribution).toBe('fixed-cap-fallback');
+  expect(result.fallbackReason).toContain('host shard expansion cap 3 < needed 5');
+  expect(result.shards).toHaveLength(3);
+  expect(result.shards.flatMap((shard) => shard.files).sort()).toEqual(files);
+  expect(bundleRuns).toBeGreaterThan(0);
+});
+
+test('requested shards above file count do not trip the automatic expansion cap', () => {
+  const file = 'test/one.test.ts';
+  const run: ShardProcess = (_cwd, selected) => ({ exitCode: 0, junit: xml(selected, []), rssMb: 100, seconds: 1 });
+  const baseline = (_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base');
+  const result = runShardedGateTests('/head', [file], 'HEAD', 16, run,
+    baseline as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree, 8,
+    { hostResources: { cores: 32, freeMemoryGiB: 64, freeTmpGiB: 64 } });
+  expect(result.aggregate.status).toBe('passed');
+  expect(result.shards).toHaveLength(1);
+  expect(result.shards[0]?.files).toEqual([file]);
+});
+
+test('packing failure at host cap also tries the bounded fixed plan', () => {
+  const files = ['test/a.test.ts', 'test/b.test.ts', 'test/c.test.ts'];
+  let bundles = 0;
+  const run: ShardProcess = (_cwd, selected) => {
+    if (selected.length > 1) bundles++;
+    return { exitCode: 0, junit: xml(selected, []), rssMb: 5120, seconds: 1 };
+  };
+  const baseline = (_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base');
+  const result = runShardedGateTests('/head', files, 'HEAD', 2, run,
+    baseline as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree, 8,
+    { hostResources: { cores: 8, freeMemoryGiB: 16, freeTmpGiB: 8 } });
+  expect(result.aggregate.status).toBe('passed');
+  expect(result.distribution).toBe('fixed-cap-fallback');
+  expect(result.fallbackReason).toContain('host shard expansion cap 2 < needed ≥3');
+  expect(result.fallbackReason).toContain('requested 2');
+  expect(result.shards).toHaveLength(2);
+  expect(bundles).toBeGreaterThan(0);
+});
+
+test('a failed fixed fallback shard remains unmeasured with its child failure evidence', () => {
+  const files = Array.from({ length: 4 }, (_, i) => `test/importer-${i}.test.ts`);
+  const run: ShardProcess = (_cwd, selected) => selected.length === 1
+    ? { exitCode: 0, junit: xml(selected, []), rssMb: 6000, seconds: 1 }
+    : { exitCode: 137, signal: 'SIGKILL', diagnostic: 'out of memory' };
+  const baseline = (_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base');
+  const result = runShardedGateTests('/head', files, 'HEAD', 2, run,
+    baseline as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree, 8,
+    { hostResources: { cores: 4, freeMemoryGiB: 16, freeTmpGiB: 4 } });
+  expect(result.distribution).toBe('fixed-cap-fallback');
+  expect(result.aggregate.status).toBe('unmeasured');
+  expect(result.attempts).not.toHaveLength(0);
+  expect(Object.values(result.unmeasuredByShard ?? {}).join(' ')).toContain('SIGKILL');
+});
+
+test('each incomplete shard records the final child exit and diagnostic after retry', () => {
+  const files = ['test/a.test.ts', 'test/b.test.ts'];
+  const run: ShardProcess = (cwd, selected) => selected.length === 1
+    ? { exitCode: 0, junit: xml(selected, []), rssMb: 100, seconds: 1 }
+    : cwd === '/head'
+      ? { exitCode: 1, diagnostic: 'stderr: ENOSPC in /tmp' }
+      : { exitCode: 0, junit: xml(selected, []) };
+  const baseline = (_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base');
+  const result = runShardedGateTests('/head', files, 'HEAD', 1, run,
+    baseline as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree, 8);
+  expect(result.aggregate).toEqual({ status: 'unmeasured', retryShardIds: ['shard-1'] });
+  expect(result.unmeasuredByShard?.['shard-1']).toContain('current: exit 1, signal none, JUnit missing; stderr: ENOSPC in /tmp');
+  expect(result.unmeasuredByShard?.['shard-1']).toContain('baseline: exit 0, signal none, JUnit present');
+});
+
+test('large spawn files can expand beyond the normal three spawn bundles without mixing lanes', () => {
+  const files = [...GATE_SPAWN_LANE_FILES, 'test/ordinary.test.ts'];
+  const run: ShardProcess = (_cwd, selected) => ({ exitCode: 0, junit: xml(selected, []), rssMb: selected[0] === 'test/ordinary.test.ts' ? 100 : 5000, seconds: 1 });
+  const baseline = (_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base');
+  const result = runShardedGateTests('/head', files, 'HEAD', 2, run,
+    baseline as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree, 8,
+    { hostResources: { cores: 16, freeMemoryGiB: 128, freeTmpGiB: 16 } });
+  expect(result.aggregate.status).toBe('passed');
+  expect(result.shards).toHaveLength(files.length);
+  expect(result.expandedFrom).toBe(2);
+  expect(result.shards.every((shard) => shard.plannedRssMb <= 8192)).toBe(true);
+  expect(result.shards.every((shard) => shard.files.every(isGateSpawnLaneFile)
+    || shard.files.every((file) => !isGateSpawnLaneFile(file)))).toBe(true);
 });
 
 test('all ten real child files occupy three bounded shards beside a regular shard', () => {

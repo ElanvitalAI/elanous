@@ -11,7 +11,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { deriveChildController } from '../agent/identity-env.js';
-import { establishElanousTuiIsolation, elanousTuiSpawnOptions } from './elanous-tui-spawn.js';
+import { establishElanousTuiIsolation, elanousTuiSpawnOptions, PREAMBLE_SYNC_BLOCK_ENV } from './elanous-tui-spawn.js';
+import { PREAMBLE_SYNC_BLOCK_ENV as TURN_PREAMBLE_SEAM_ENV } from '../dashboard/turn-preamble.js';
+import { buildPtyEnv } from '../agent/identity-env.js';
+import { resetCapturedEnvForTesting, setCapturedEnvForTesting } from '../shell-env-bootstrap.js';
 
 const base = {
   repoRoot: '/repo',
@@ -254,5 +257,58 @@ describe('elanousTuiSpawnOptions — 경계 요청 우편함', () => {
     expect(env.ELANOUS_HARNESS_BOUNDARY).toBe('/w');
     expect(env.ELANOUS_STATE_DIR).toBe('/s');
     expect(env.ELANOUS_PTY_ID).toBe('pty_abcdef01');
+  });
+});
+
+describe('elanousTuiSpawnOptions — 시험 지연 seam env 전달(TUI-TYPING-LAG-OBS-2)', () => {
+  const saved = process.env[PREAMBLE_SYNC_BLOCK_ENV];
+  const withSeam = (value: string | undefined, action: () => void): void => {
+    if (value === undefined) delete process.env[PREAMBLE_SYNC_BLOCK_ENV];
+    else process.env[PREAMBLE_SYNC_BLOCK_ENV] = value;
+    try { action(); } finally {
+      if (saved === undefined) delete process.env[PREAMBLE_SYNC_BLOCK_ENV];
+      else process.env[PREAMBLE_SYNC_BLOCK_ENV] = saved;
+    }
+  };
+
+  test('이름은 turn-preamble 의 seam 과 같은 값이다', () => {
+    expect(PREAMBLE_SYNC_BLOCK_ENV).toBe(TURN_PREAMBLE_SEAM_ENV);
+  });
+
+  test('격리 자식이면 부모의 seam env 를 자식 env 에 싣고 관측한다', () => {
+    withSeam('300', () => {
+      let env: Record<string, string> | undefined;
+      const events = observeIsolationConfig(() => { env = elanousTuiSpawnOptions(base).env; });
+      expect(env?.[PREAMBLE_SYNC_BLOCK_ENV]).toBe('300');
+      expect(events).toContainEqual({ category: 'self-implement.elanous-tui-spawn', event: 'test-seam-env', data: { name: PREAMBLE_SYNC_BLOCK_ENV, value: '300' } });
+    });
+  });
+
+  // 실제 자식 env = registry 가 쓰는 buildPtyEnv 합성 결과. 로그인 셸 캡처본에 변수가 있어도 새면 안 된다.
+  const childEnv = (opts: Parameters<typeof elanousTuiSpawnOptions>[0]): Record<string, string> => {
+    const start = elanousTuiSpawnOptions(opts);
+    setCapturedEnvForTesting({ PATH: '/usr/bin:/bin', [PREAMBLE_SYNC_BLOCK_ENV]: '999' });
+    try { return buildPtyEnv(start.env ?? {}, process.env, { unset: start.unsetEnv }); } finally { resetCapturedEnvForTesting(); }
+  };
+
+  test('격리 자식의 실제 env 는 부모 값을 쓴다(캡처본 값이 아니라)', () => {
+    withSeam('300', () => {
+      expect(childEnv(base)[PREAMBLE_SYNC_BLOCK_ENV]).toBe('300');
+    });
+  });
+
+  test('반증 — 격리 아닌 자식의 실제 env 에는 없다(캡처본에 있어도)', () => {
+    withSeam('300', () => {
+      const opts = { ...base, configDir: undefined, stateDir: undefined, requireIsolation: false };
+      expect(elanousTuiSpawnOptions(opts).env?.[PREAMBLE_SYNC_BLOCK_ENV]).toBeUndefined();
+      expect(childEnv(opts)[PREAMBLE_SYNC_BLOCK_ENV]).toBeUndefined();
+    });
+  });
+
+  test('부모에 seam env 가 없으면 실제 자식 env 에도 없다(캡처본에 있어도)', () => {
+    withSeam(undefined, () => {
+      expect(elanousTuiSpawnOptions(base).env?.[PREAMBLE_SYNC_BLOCK_ENV]).toBeUndefined();
+      expect(childEnv(base)[PREAMBLE_SYNC_BLOCK_ENV]).toBeUndefined();
+    });
   });
 });

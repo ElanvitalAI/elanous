@@ -41,7 +41,7 @@ export function ledgerLineToLogEvent(line: string, runId: string): {
   const sources = [entry, details].filter((source): source is Record<string, unknown> => source !== undefined);
   const knownSecrets = secretValues(entry);
   const containsCredential = (value: string) => SECRET_VALUE.test(value) || knownSecrets.some((secret) => value.includes(secret));
-  if (containsCredential(entry.event) || !EVENT_ALLOWED.test(entry.event)) return undefined;
+  if (containsCredential(entry.event) || (!EVENT_ALLOWED.test(entry.event) && entry.event !== 'ask-auto-target-candidates' && entry.event !== 'ask-auto-reauthor')) return undefined;
 
   const data: Record<string, unknown> = { runId };
   let fields = 0;

@@ -47,20 +47,25 @@ function toolResults(messages: LLMMessage[], name: string): string[] {
   return out;
 }
 
-async function run(turns: LLMStreamEvent[][], terminal: boolean, maxTurns = 10) {
+async function run(turns: LLMStreamEvent[][], terminal: boolean, maxTurns = 10, priorAnswerVisible = false) {
   const { provider, callsSeen } = scriptedProvider(turns);
   const dispatched: string[] = [];
+  const shown: string[] = [];
   let newMessages: LLMMessage[] = [];
   const result = await streamLLMWithTools(
     [{ role: 'user', content: '우편 확인하고 대조해' }],
     {
-      onText: () => {},
+      onText: (delta: string, full: string) => { shown.push(`${delta}|${full}`); },
       dispatchTool: async (name: string) => { dispatched.push(name); return name === 'update_goal' ? { ok: true } : 'tool-out'; },
       onTurnComplete: (msgs: LLMMessage[]) => { newMessages = msgs; },
     },
-    { provider, tools: TOOLS, maxTurns, ...(terminal ? { terminalToolNames: ['update_goal'] } : {}) },
+    {
+      provider, tools: TOOLS, maxTurns,
+      ...(terminal ? { terminalToolNames: ['update_goal'] } : {}),
+      ...(priorAnswerVisible ? { terminalPriorAnswerVisible: true } : {}),
+    },
   );
-  return { result, calls: callsSeen(), dispatched, newMessages };
+  return { result, calls: callsSeen(), dispatched, newMessages, shown };
 }
 
 describe('streamLLMWithTools — terminal signal tools (TUI-GOAL-LOOP-FRICTION)', () => {
@@ -200,6 +205,32 @@ describe('streamLLMWithTools — terminal signal tools (TUI-GOAL-LOOP-FRICTION)'
       [], [], [],
     ];
     const r = await run(script, true);
+    expect(r.result).toContain('[NO FINAL SYNTHESIS]');
+  });
+
+  // TUI-H1-GOALLOOP-EMPTY-TAIL — 답이 이 스트림 «앞»(goal loop 앞 iteration)에 이미 보였으면 신호뿐인 턴 뒤 빈 턴은
+  //   재촉·경고 없이 빈 답으로 끝난다 — 화면도 건드리지 않는다(빈 onText 0). 반증 = 위 시험(앞 답이 없으면 경고 유지).
+  test('signal-only turn after an answer the caller already showed → empty result, no retry, no notice, no screen write', async () => {
+    const script: LLMStreamEvent[][] = [
+      [{ type: 'tool_call', id: 'g1', name: 'update_goal', args: COMPLETE }],
+      [], [], [],
+    ];
+    const r = await run(script, true, 10, true);
+    expect(r.calls).toBe(2);
+    expect(r.result).toBe('');
+    expect(r.shown).toEqual([]);
+    expect(r.dispatched).toEqual(['update_goal']);
+    // 이력에 신호 호출은 남고(goal loop 가 complete 를 읽는다) 빈 답 메시지는 안 실린다.
+    expect(toolResults(r.newMessages, 'update_goal')).toHaveLength(1);
+    expect(r.newMessages.at(-1)?.role).not.toBe('assistant');
+  });
+
+  test('prior-answer hint alone does not silence a real empty stall without a terminal signal', async () => {
+    const script: LLMStreamEvent[][] = [
+      [{ type: 'tool_call', id: 'x1', name: 'X', args: {} }],
+      [], [], [],
+    ];
+    const r = await run(script, true, 10, true);
     expect(r.result).toContain('[NO FINAL SYNTHESIS]');
   });
 });

@@ -10,6 +10,7 @@ import type { ChatPickerKind } from './pickers/kinds.js';
 import { createPickerState, type BufferAction, type PickerBufferView } from './pickers/state.js';
 import { createChatPickerModalRuntime } from './pickers/modal-runtime.js';
 import type { ModalSurface } from '../display/modal-stack.js';
+import type { PromptRowOwner } from '../display/prompt-row-owner.js';
 // Type-only import: avoids the runtime circular dep that streamGrok
 // below sidesteps with a dynamic `await import('../llm.js')`. Keeping
 // ChatMessage structurally compatible with LLMMessage lets the
@@ -35,6 +36,7 @@ import {
 } from '../input-core/index.js';
 import { applyInlineEditorKey } from '../input-core/inline-editor-key.js';
 import type { InputSourceRef } from '../input/input-source-kind.js';
+import { routeRawPtyStop } from '../input/external-input-queue.js';
 import {
   multilineEditorBackspace,
   multilineEditorInsertLineBreak,
@@ -70,6 +72,7 @@ export interface ModalSink {
  *  DisplayCoordinator that satisfies both. */
 export interface DisplaySink extends CursorSink, ModalSink {}
 import type { Key } from '../tui.js';
+import { noteInputLagKey, noteInputLagPaint } from '../tui/input-lag-probe.js';
 import {
   createSpinner,
   createToolLoader,
@@ -173,6 +176,8 @@ function writeTerminal(chunk: string): void {
   process.stdout.write(chunk);
   // viaCoordinator=false — this is the bypass path /perf highlights.
   perf.recordStdoutWrite(chunk.length, false);
+  // 입력칸 키 echo 는 render() 가 아니라 이 직접 쓰기로 칠해진다 — 키→칠 관측의 칠 지점.
+  noteInputLagPaint();
 }
 
 /** textInput reports the current prompt's top row so writeTerminal
@@ -324,11 +329,16 @@ export function createTextInputRenderActions(opts: {
    *  coordinator-owned cursor sinks re-show it at the final position. */
   hideCursorBeforePaint?: boolean;
   beforePaint?: () => void;
+  /** The frame renderer owns the prompt band (TUI-PROMPT-SINGLE-OWNER):
+   *  `paint` only publishes, so there are no direct writes to wrap in
+   *  synchronized output. */
+  frameOwned?: boolean;
   modalSink?: ModalSink;
   shouldRequestModalRender?: () => boolean;
 }): TextInputRenderActions {
-  const paintAll = (synchronizedOutput = false) => {
+  const paintAll = (requestSynchronizedOutput = false) => {
     if (opts.shouldPaint?.() === false) return false;
+    const synchronizedOutput = requestSynchronizedOutput && !opts.frameOwned;
     if (synchronizedOutput) writeTerminal(SYNCHRONIZED_OUTPUT_BEGIN);
     try {
       if (opts.beforePaint) {
@@ -837,6 +847,10 @@ export async function textInput(opts: {
      *  input is idle. */
     insertAtCursor?: (text: string) => void;
   };
+  /** TUI-PROMPT-SINGLE-OWNER — when supplied, the frame renderer owns
+   *  the prompt band: drawInput publishes its rows/hint/caret here and
+   *  writes nothing to the prompt rows itself (no direct `\x1b[2K`). */
+  promptRowOwner?: PromptRowOwner;
   /** P2.2.c — sink for cursor placement. When supplied, drawInput
    *  routes its caret-position decision through this instead of
    *  emitting `\\x1b[r;cH` directly. The coordinator owns the
@@ -1194,6 +1208,8 @@ export async function textInput(opts: {
     // from there as lines accumulate. `startOffset` is how many rows
     // up from `row` we start touching — zero when both current and
     // previous drew only one line.
+    const promptRowOwner = opts.promptRowOwner;
+    const ownedRows: string[] = [];
     for (let i = 0; i < rowsToTouch; i++) {
       const r = row - i; // i=0 → bottom row; i=1 → one row up; etc.
       if (r < 1) continue;
@@ -1212,8 +1228,9 @@ export async function textInput(opts: {
           ).display;
 
         const padded = display + ' '.repeat(Math.max(0, rowTextW - visibleWidth(display)));
-        writeTerminal(ansi.moveTo(r, col) + '\x1b[2K' + pfx + padded);
-      } else {
+        if (promptRowOwner) ownedRows.unshift(pfx + padded);
+        else writeTerminal(ansi.moveTo(r, col) + '\x1b[2K' + pfx + padded);
+      } else if (!promptRowOwner) {
         // This row had content on the previous paint but doesn't anymore
         // (user deleted a line / shrank the input). Clear it so stale
         // text doesn't linger on what is now part of the log / divider
@@ -1223,7 +1240,9 @@ export async function textInput(opts: {
     }
     prevDrawnLines = visibleLines;
 
-    if (ctrlCHint) {
+    if (promptRowOwner) {
+      // The frame renders the hint row from the published paint.
+    } else if (ctrlCHint) {
       writeTerminal(ansi.moveTo(row + 2, col) + '\x1b[2K' + C.muted(truncate(ctrlCHint, getWidth())));
       ctrlCHintPainted = true;
     } else if (ctrlCHintPainted) {
@@ -1244,6 +1263,12 @@ export async function textInput(opts: {
     const pfxW = lineIdx === 0 ? visibleWidth(prompt) : contPfxW;
     const { cursorCol } = inputLineWindow(lines[lineIdx]!, colIdx, textWFor(lineIdx));
     const curX = col + pfxW + cursorCol;
+    promptRowOwner?.publish({
+      rows: ownedRows,
+      hint: ctrlCHint ? C.muted(truncate(ctrlCHint, getWidth())) : null,
+      caret: curR >= 1 ? { row: curR, col: curX, visible: true } : null,
+      source: 'text-input',
+    });
     // P2.2.c — coordinator owns the cursor emit when wired; falls
     // back to direct stdout for non-coordinator callers (tests, non-dashboard
     // entry points) so the change is non-breaking.
@@ -1342,19 +1367,28 @@ export async function textInput(opts: {
     const display = prefix + result;
     const padded = display + ' '.repeat(Math.max(0, textW - visibleWidth(display)));
 
-    for (let i = 0; i < rowsToTouch; i++) {
-      const r = row - i;
-      if (r < 1) continue;
-      if (i === 0) {
-        writeTerminal(ansi.moveTo(searchRow, col) + '\x1b[2K' + promptStr + padded);
-      } else {
-        writeTerminal(ansi.moveTo(r, col) + '\x1b[2K');
+    const curR = searchRow;
+    const curX = col + promptW + visibleWidth(prefix);
+    if (opts.promptRowOwner) {
+      opts.promptRowOwner.publish({
+        rows: [promptStr + padded],
+        hint: null,
+        caret: { row: curR, col: curX, visible: true },
+        source: 'reverse-search',
+      });
+    } else {
+      for (let i = 0; i < rowsToTouch; i++) {
+        const r = row - i;
+        if (r < 1) continue;
+        if (i === 0) {
+          writeTerminal(ansi.moveTo(searchRow, col) + '\x1b[2K' + promptStr + padded);
+        } else {
+          writeTerminal(ansi.moveTo(r, col) + '\x1b[2K');
+        }
       }
     }
     prevDrawnLines = visibleLines;
 
-    const curR = searchRow;
-    const curX = col + promptW + visibleWidth(prefix);
     if (opts.cursorSink && (opts.canClaimCursor?.() ?? true)) {
       opts.cursorSink.setCursor({ row: curR, col: curX, visible: true });
     } else if (!opts.cursorSink) {
@@ -1389,11 +1423,16 @@ export async function textInput(opts: {
     syncActivePickerModal();
     drawInput();
   };
+  // A frame-owned prompt band has no direct paint to hide the cursor
+  // for, wrap in synchronized output, or re-assert divider chrome around:
+  // the frame render does all three in its own single write.
+  const frameOwnsPromptBand = opts.promptRowOwner !== undefined;
   const renderActions = createTextInputRenderActions({
     shouldPaint: opts.shouldPaint,
-    paintChrome: opts.onPaintChrome,
+    paintChrome: frameOwnsPromptBand ? undefined : opts.onPaintChrome,
     paint: repaintPure,
-    beforePaint: () => {
+    frameOwned: frameOwnsPromptBand,
+    beforePaint: frameOwnsPromptBand ? () => {} : () => {
       const chunk = hideTextInputCursor(opts.cursorSink);
       if (chunk) writeTerminal(chunk);
       else if (opts.cursorSink) writeTerminal(paintCursorVisibility(false));
@@ -1407,6 +1446,7 @@ export async function textInput(opts: {
   const finalizeInput = (result: InputResult): InputResult => {
     // 외부 주입 라우터가 «composer 가 안 떠 있다»를 알 수 있게 내린다.
     if (hostControl) hostControl.getBufferText = undefined;
+    opts.promptRowOwner?.clear();
     detachInternalTurnYield(result.yieldedToInternalTurn === true);
     clearPicker();
     writeTerminal(endTextInputCursor(opts.cursorSink));
@@ -1723,6 +1763,7 @@ export async function textInput(opts: {
         // input loop exits cleanly and the dashboard's pane dispatcher
         // picks up the keys.
         if (hostControl) hostControl.getBufferText = undefined;
+        opts.promptRowOwner?.clear();
         detachInternalTurnYield();
         return { text: '', submitted: false, gotoPane: true };
       }
@@ -2066,7 +2107,12 @@ export function attachStreamingKeys(
   const listener = (data: string | Buffer) => {
     clearEscapeTimer();
     deliverInjected();
+    // ⏹ TUI-STOP-RAW-PTY — 원시 pty 길로 한 청크에 온 `/stop⏎`·`/esc⏎` 는 typeahead 대기열 대신 지금 턴의 escGate 로.
+    //    파서가 이스케이프·붙여넣기·UTF-8 조각을 쥐고 있으면 그 청크는 앞 입력의 이어짐이라 건드리지 않는다.
+    if (!parser.hasPendingEscape() && !parser.hasPendingPaste() && !parser.hasPendingDecoderBytes()
+      && routeRawPtyStop(typeof data === 'string' ? data : data.toString('utf8'))) return;
     const keys = parser.push(data);
+    if (keys.length > 0) noteInputLagKey(keys.length);
     deliver(keys);
     // ⚠️ `unref()` — 이 타이머가 프로세스를 붙잡아 두면 안 된다(입력 대기는 stdin 의 몫).
     if (parser.hasPendingEscape()) {

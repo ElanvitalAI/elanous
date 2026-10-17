@@ -1083,6 +1083,42 @@ test('재시작 뒤에도 완료 requestId의 원본 reason·next를 eln self ru
   }
 });
 
+test('재시작 뒤에도 종결 실패 requestId의 원본 reason·next를 eln self runs 조회가 함께 반환한다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'running-runs-nb-restart-settled-failure-'));
+  const ledgerDirectory = join(root, 'state', 'run-ledger');
+  const requestId = 'run-00000000-0000-4000-8000-0000000000b5';
+  const now = Date.now();
+  recordNonBlockingRunPending(requestId, { timestamp: new Date(now - 60_000).toISOString(), dir: ledgerDirectory });
+  recordNonBlockingRunResult(
+    requestId,
+    {
+      kind: 'failed',
+      reason: 'goal author failed',
+      next: '실패 이유를 확인한 뒤 다시 요청',
+      ok: false,
+    },
+    { timestamp: new Date(now - 30_000).toISOString(), dir: ledgerDirectory },
+  );
+  try {
+    // 프로세스 재시작 시뮬레이션 — in-memory 상태 없이 on-disk 원장만으로 새 조회
+    const result = queryRunningRuns({ runIds: [requestId] }, {
+      queryLedgers: (options) => queryFederatedUnfinishedRunLedgers({ ...options, goalsDir: root, ledgerDirectories: [ledgerDirectory], noCache: true }),
+      ptyTargets: () => [],
+      listPtyRefs: () => ({ refs: [], unreadable: [] }),
+    });
+    const entry = result.entries.find((candidate) => candidate.runId === requestId);
+    expect(entry?.nonBlocking).toMatchObject({
+      requestId,
+      kind: 'failed',
+      reason: 'goal author failed',
+      next: '실패 이유를 확인한 뒤 다시 요청',
+    });
+    expect(renderRunningRuns(result)).toContain('nonBlocking=kind:failed reason:goal author failed next:실패 이유를 확인한 뒤 다시 요청');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('종결 run-status와 함께 남은 완료 기록도 requestId 조회에서 빠지지 않는다', () => {
   const root = mkdtempSync(join(tmpdir(), 'running-runs-nb-terminal-'));
   const ledgerDirectory = join(root, 'state', 'run-ledger');

@@ -1,13 +1,15 @@
 // TUI 턴 preamble — elanous 자기접근 규율 주입 계약 (P3 · 2026-07-13).
 // 텔레그램(makeElanousAgentRunTurn)과 단일 출처(agent/self-ambient.ts)의 규율이 TUI 채팅
 // systemPrompt 에도 실리는지 — 3박자(툴·기억·규율) 중 '규율' 축의 표면 패리티.
-import { test, expect, describe } from 'bun:test';
+import { test, expect, describe, spyOn } from 'bun:test';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildControllerSystemMessage, buildDashboardTurnPreamble } from './turn-preamble.js';
 import { globalTaskNotificationQueue } from '../agent/task-notification.js';
-import type { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config.js';
+import { debug } from '../debug/log.js';
+import { createSessionPostureState, resolveSessionTurnProfile } from '../session-runtime/index.js';
 
 const fakeConfig = { chat: { conciseness: 'balanced' } } as unknown as ReturnType<typeof getUserConfig>;
 
@@ -198,5 +200,80 @@ describe('buildDashboardTurnPreamble — nativeStructure providers 배선', () =
     }).map(m => String(m.content)).join('\n');
 
     expect(off).toBe(noConfig);
+  });
+});
+
+// TURN-START-BLOCK-REST 1단계 — `chat.turn-preamble built` 이 «어느 빌더가 얼마나 막았나»를 싣는다.
+//   ⭐ 반증: 측정(`timed`)을 빼면 `builderMs` 가 없거나 키가 빠져 실패한다.
+describe('buildDashboardTurnPreamble — 빌더별 ms 관측', () => {
+  const capture = (build: () => unknown): Record<string, unknown>[] => {
+    const events: Record<string, unknown>[] = [];
+    const wasEnabled = debug.enabled;
+    if (!wasEnabled) debug.setDiagEnabled(true);
+    const spy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: Record<string, unknown>) => {
+      if (category === 'chat.turn-preamble' && event === 'built') events.push(data);
+    }) as typeof debug.log);
+    try { build(); } finally {
+      spy.mockRestore();
+      if (!wasEnabled) debug.setDiagEnabled(false);
+    }
+    return events;
+  };
+
+  test('불린 빌더마다 ms 가 실리고, 동기 표지와 합계가 같이 실린다', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'preamble-ms-'));
+    const config = getUserConfig();
+    const chatModeState = createSessionPostureState();
+    const [data] = capture(() => buildDashboardTurnPreamble({
+      userText: '이 기능을 구현해줘',
+      cwd,
+      userConfig: { ...config, llm: { ...config.llm, provider: 'grok' }, tools: { ...config.tools, nativeStructure: { enabled: true } } },
+      turnProfile: resolveSessionTurnProfile({ userText: '이 기능을 구현해줘', chatModeState }),
+      enabledTools: ['Read', 'Edit'],
+      seatBoot: { home: cwd, msgPath: join(cwd, 'msg.db'), env: {} },
+      memory: { root: join(cwd, 'memory'), env: {} },
+      controlEnv: { controller: 'pty:pty_abcd1234' },
+    }));
+
+    expect(data).toBeDefined();
+    const builderMs = data!.builderMs as Record<string, number>;
+    expect(Object.keys(builderMs).sort()).toEqual([
+      ...Object.keys(data!.builderCounts as Record<string, number>),
+      'nativeTools',
+      'taskNotifications',
+    ].sort());
+    for (const ms of Object.values(builderMs)) {
+      expect(typeof ms).toBe('number');
+      expect(ms).toBeGreaterThanOrEqual(0);
+    }
+    expect(data!.builderMsKind).toBe('sync');
+    expect(data!.builderTotalMs as number).toBeGreaterThanOrEqual(0);
+  });
+
+  test('조건부 빌더는 안 불리면 키가 없다 — 0 으로 꾸미지 않는다', () => {
+    const [data] = capture(() => buildDashboardTurnPreamble({
+      userText: 'continue',
+      cwd: mkdtempSync(join(tmpdir(), 'preamble-ms-')),
+      userConfig: fakeConfig,
+      memory: false,
+      controlEnv: {},
+    }));
+
+    expect(Object.keys(data!.builderMs as Record<string, number>).sort()).toEqual([
+      'approval', 'ask', 'conciseness', 'gitSnapshot', 'implDiscipline', 'planMode',
+      'sandbox', 'selfOps', 'taskNotifications', 'universal',
+    ]);
+  });
+
+  test('debug 가 꺼진 턴은 built 를 안 낸다(재지도 않는다)', () => {
+    if (debug.enabled) return;
+    const events: unknown[] = [];
+    const spy = spyOn(debug, 'log').mockImplementation(((category: string) => {
+      if (category === 'chat.turn-preamble') events.push(category);
+    }) as typeof debug.log);
+    try {
+      buildDashboardTurnPreamble({ userText: 'x', cwd: mkdtempSync(join(tmpdir(), 'preamble-ms-')), userConfig: fakeConfig });
+    } finally { spy.mockRestore(); }
+    expect(events).toEqual([]);
   });
 });

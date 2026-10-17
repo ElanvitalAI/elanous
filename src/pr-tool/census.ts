@@ -28,7 +28,9 @@ export type Census = { status: 'checked'; total: number; rows: readonly CensusRo
   | { status: 'unknown'; reason: string };
 export interface DiffHunk { path: string; start: number; end: number }
 export type GuardCode = 'inventory-unknown' | 'candidate-unknown' | 'goal-only' | 'file-overlap' | 'hunk-overlap' | 'same-cell' | 'seat-cap' | 'seat-unattributed';
-export interface GuardReason { code: GuardCode; detail: string; prs?: readonly number[] }
+export interface GuardReason { code: GuardCode; detail: string; prs?: readonly number[]; files?: readonly string[] }
+/** PR-GUARD-HUNK-WARN (대표 10-17): 줄 겹침은 기본 경고 — 착지 쪽 스마트 머지가 푼다. 'refuse' = 옛 거부 동작. */
+export type HunkOverlapMode = 'refuse' | 'warn';
 export interface GuardVerdict { status: 'allow' | 'refuse' | 'unknown'; reasons: readonly GuardReason[]; warnings: readonly GuardReason[] }
 
 const SEATS = ['OP', 'TC', 'MK', 'UX'] as const;
@@ -209,7 +211,7 @@ export function censusOpenPrs(inventory: Inventory, now = Date.now()): Census {
   return result;
 }
 
-export function guardNewPr(input: { files: readonly string[] | null; seat?: Seat | null; seatCap?: number; cellId?: string | null; hunks?: readonly DiffHunk[] }, inventory: Inventory): GuardVerdict {
+export function guardNewPr(input: { files: readonly string[] | null; seat?: Seat | null; seatCap?: number; cellId?: string | null; hunks?: readonly DiffHunk[]; hunkOverlap?: HunkOverlapMode }, inventory: Inventory): GuardVerdict {
   if (!input.files || input.files.length === 0 || input.files.some(file => !file || file.startsWith('/') || file.includes('..'))) {
     const reasons: GuardReason[] = [{ code: 'candidate-unknown', detail: '새 PR 변경 파일을 확인할 수 없음' }];
     debug.log('pr.tool', 'guard-refuse', { status: 'unknown', reasons });
@@ -226,8 +228,21 @@ export function guardNewPr(input: { files: readonly string[] | null; seat?: Seat
   const sameCell = input.cellId ? inventory.prs.filter(pr => pr.cellId === input.cellId) : [];
   if (sameCell.length) reasons.push({ code: 'same-cell', detail: `같은 칸 ${input.cellId} OPEN PR이 있음`, prs: sameCell.map(pr => pr.number) });
   const overlaps = inventory.prs.filter(pr => pr.files.some(file => candidate.has(file)));
-  const sameHunk = overlaps.filter(pr => pr.hunks?.some(other => input.hunks?.some(own => own.path === other.path && own.start <= other.end && other.start <= own.end)));
-  if (sameHunk.length) reasons.push({ code: 'hunk-overlap', detail: '같은 파일의 수정 줄 범위가 겹침', prs: sameHunk.map(pr => pr.number) });
+  const hunkFiles = new Set<string>();
+  const sameHunk = overlaps.filter(pr => {
+    const paths = (pr.hunks ?? []).filter(other => input.hunks?.some(own => own.path === other.path && own.start <= other.end && other.start <= own.end)).map(other => other.path);
+    for (const path of paths) hunkFiles.add(path);
+    return paths.length > 0;
+  });
+  if (sameHunk.length) {
+    const refuseHunk = input.hunkOverlap === 'refuse';
+    (refuseHunk ? reasons : warnings).push({
+      code: 'hunk-overlap',
+      detail: refuseHunk ? '같은 파일의 수정 줄 범위가 겹침' : '같은 파일의 수정 줄 범위가 겹침 · 착지 때 머지로 푼다',
+      prs: sameHunk.map(pr => pr.number),
+      files: [...hunkFiles],
+    });
+  }
   if (overlaps.length) warnings.push({ code: 'file-overlap', detail: '같은 파일의 OPEN PR이 있음 · 줄 겹침은 별도 판정', prs: overlaps.map(pr => pr.number) });
   const seat = seatValue(input.seat);
   if (input.seat !== undefined && input.seat !== null && !seat) reasons.push({ code: 'candidate-unknown', detail: '호출자 자리 값 오류' });

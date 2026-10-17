@@ -25,6 +25,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
 import type { CmdRunner } from '../autopilot/pr-manager.js';
 import { parseReviewResultOutput } from '../task-agent/review-result-capture.js';
+import { verifyVirtualRebasePatch } from './pr-land-virtual-rebase.js';
 
 const SHA40 = /^[0-9a-f]{40}$/i;
 
@@ -45,7 +46,7 @@ export type OverlapEvidenceVerdict =
   | { ok: true; mode: 'already-ancestor'; reviewResult: string }
   | { ok: true; mode: 'rebased'; baseTip: string; reviewResult: string }
   | { ok: true; mode: 'base-advanced-disjoint'; baseTip: string; gateBase: string; windowCommits: number; reviewResult: string }
-  | { ok: false; reason: string };
+  | { ok: false; reason: string; baseTip?: string };
 
 export interface VerifyOverlapEvidenceInput {
   evidencePath: string;
@@ -220,6 +221,47 @@ function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'>,
   if (review.verdict === null || !ACCEPTED_REVIEW_VERDICTS.has(review.verdict)) return { ok: false, reason: `review-verdict-${review.verdict ?? 'null'}`, baseTip };
   if (review.mustFix !== 0) return { ok: false, reason: review.mustFix === null ? 'review-must-fix-unknown' : `review-must-fix-${review.mustFix}`, baseTip };
   return { ok: true, reviewResult: e.reviewResult };
+}
+
+/** Reuse the evidence-selected review when a pinned head needs a read-only virtual rebase. */
+export function verifyOverlapEvidenceVirtualRebase(input: VerifyOverlapEvidenceInput, baseTip: string):
+  { ok: true; reviewResult: string; patchId: string } | { ok: false; reason: string; baseTip?: string } {
+  const head = input.expectedHead.toLowerCase();
+  if (!SHA40.test(head) || !SHA40.test(baseTip)) return { ok: false, reason: 'virtual-rebase-invalid-sha' };
+  let raw: unknown;
+  try { raw = JSON.parse(input.readFile(input.evidencePath)); }
+  catch { return { ok: false, reason: 'evidence-unreadable' }; }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'evidence-not-object' };
+  const evidence = raw as Partial<OverlapEvidenceFile>;
+  const evidencePr = typeof evidence.pr === 'number' ? evidence.pr
+    : typeof evidence.pr === 'string' && /^[0-9]+$/.test(evidence.pr) ? Number(evidence.pr) : NaN;
+  if (!Number.isSafeInteger(evidencePr) || evidencePr !== input.pr) return { ok: false, reason: 'evidence-pr-mismatch' };
+  if (typeof evidence.head !== 'string' || evidence.head.toLowerCase() !== head) return { ok: false, reason: 'evidence-head-mismatch' };
+  const gate = evidence.gate;
+  if (!gate || typeof gate !== 'object') return { ok: false, reason: 'gate-missing' };
+  if (gate.passed !== true) return { ok: false, reason: 'gate-not-passed' };
+  if (typeof gate.head !== 'string' || gate.head.toLowerCase() !== head) return { ok: false, reason: 'gate-head-mismatch' };
+  if (typeof gate.baseCommit !== 'string' || !SHA40.test(gate.baseCommit)) return { ok: false, reason: 'gate-base-unmeasured' };
+  const review = checkReview(input, evidence, head, baseTip);
+  if (!review.ok) return review;
+  const attempts = checkSelectedReviewAttempts(input, evidence, head);
+  if (!attempts.ok) return attempts;
+  const remote = input.run('git', ['ls-remote', input.remote, `refs/heads/${input.branch}`], { cwd: input.cwd });
+  if (!remote.ok || remote.out.trim().split(/\s+/)[0]?.toLowerCase() !== baseTip.toLowerCase()) {
+    return { ok: false, reason: 'virtual-rebase-base-advanced' };
+  }
+  const local = input.run('git', ['rev-parse', '--verify', `refs/remotes/${input.remote}/${input.branch}`], { cwd: input.cwd });
+  if (!local.ok || local.out.trim().toLowerCase() !== baseTip.toLowerCase()) {
+    return { ok: false, reason: 'virtual-rebase-base-stale-or-unmeasured' };
+  }
+  const patch = verifyVirtualRebasePatch({ cwd: input.cwd, baseTip, head });
+  if (!patch.ok) return patch;
+  const oldBase = patch.oldBase.toLowerCase();
+  const gateBase = gate.baseCommit.toLowerCase();
+  if (!input.run('git', ['merge-base', '--is-ancestor', gateBase, oldBase], { cwd: input.cwd }).ok) {
+    return { ok: false, reason: 'gate-base-not-ancestor-of-old-base' };
+  }
+  return { ok: true, reviewResult: review.reviewResult, patchId: patch.patchId };
 }
 
 type WindowResult = { ok: true; windowCommits: number } | { ok: false; reason: string; windowCommits?: number };
@@ -431,7 +473,9 @@ export function verifyOverlapEvidence(input: VerifyOverlapEvidenceInput): Overla
     gateBase: (verdict.ok ? (verdict.mode === 'base-advanced-disjoint' ? verdict.gateBase : undefined) : verdict.gateBase) ?? null,
     windowCommits: (verdict.ok ? (verdict.mode === 'base-advanced-disjoint' ? verdict.windowCommits : undefined) : verdict.windowCommits) ?? null,
   });
-  if (!verdict.ok) return { ok: false, reason: verdict.reason };
+  if (!verdict.ok) return (verdict.reason.startsWith('not-rebased:') || verdict.reason.startsWith('base-stale-overlap:')) && verdict.baseTip
+    ? { ok: false, reason: verdict.reason, baseTip: verdict.baseTip }
+    : { ok: false, reason: verdict.reason };
   if (verdict.mode === 'already-ancestor') return { ok: true, mode: 'already-ancestor', reviewResult: verdict.reviewResult };
   if (verdict.mode === 'base-advanced-disjoint') {
     return { ok: true, mode: 'base-advanced-disjoint', baseTip: verdict.baseTip!, gateBase: verdict.gateBase, windowCommits: verdict.windowCommits, reviewResult: verdict.reviewResult };

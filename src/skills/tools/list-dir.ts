@@ -24,6 +24,7 @@ import { readdirSync, statSync, lstatSync, readlinkSync } from 'node:fs';
 import { isAbsolute, resolve, join } from 'node:path';
 import type { LLMToolSpec } from '../../llm.js';
 import { getSessionCwd } from '../../session/working-dir.js';
+import { debug } from '../../debug/log.js';
 import { noteBroadSearch } from './search-loop-guard.js';
 
 const DEFAULT_HEAD_LIMIT = 200;
@@ -99,6 +100,16 @@ export async function dispatchListDir(args: Record<string, unknown>): Promise<Li
     String(head),
   ]);
   if (searchLoop.blocked) {
+    // 관측(TUI-OPS-TURN-GUARD 공백 ①): Grep(grep.ts) 과 «같은» 범주·이벤트로 차단을 남긴다 —
+    //   종전엔 throw 만 해서 ListDir 차단은 조회하면 0 이었고, 그 0 은 「안 막혔다」가 아니라 「안 쟀다」였다.
+    //   경로 원문·내용은 싣지 않는다(깊이·옵션 축만). 동작·문구는 그대로.
+    debug.log('tools.search', 'broad-search-blocked', {
+      tool: 'ListDir',
+      consecutive: searchLoop.consecutive,
+      pathDepth: abs.split(/[\\/]+/).filter(Boolean).length,
+      showHidden,
+      sort,
+    }, { level: 'warn' });
     throw new Error(
       `RUNTIME BLOCKED — repeated broad search loop detected (${searchLoop.consecutive} consecutive broad-search calls). ` +
       `You already listed ${abs}. Stop re-listing the same tree. Pick concrete files or directories from prior results ` +

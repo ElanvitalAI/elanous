@@ -14,7 +14,7 @@ const questions = [
 // All core specs are available as actual host definitions, not merely string mentions in the prompt.
 test('TUI essential catalog always exposes release_status and context_now for all five questions', () => {
   for (const question of questions) {
-    const names = buildSessionRuntimeToolSpecs({ userText: question, hostTools, rich: false }).map(spec => spec.name);
+    const names = buildSessionRuntimeToolSpecs({ userText: question, hostTools }).map(spec => spec.name);
     expect(names).toContain('release_status');
     expect(names).toContain('context_now');
     expect(names).not.toContain('release_change');
@@ -25,12 +25,4 @@ test('TUI essential catalog always exposes release_status and context_now for al
   }
 });
 
-test('rich dynamic catalog opens release-read on each release question but not weather', () => {
-  for (const question of questions) {
-    const names = buildSessionRuntimeToolSpecs({ userText: question, hostTools }).map(spec => spec.name);
-    expect(names).toContain('release_status');
-    expect(names).toContain('context_now');
-  }
-  const weather = buildSessionRuntimeToolSpecs({ userText: '오늘 날씨 어때', hostTools }).map(spec => spec.name);
-  expect(weather).not.toContain('release_status');
-});
+// TUI-DIET-D1-TAIL — the «rich dynamic catalog» case was removed with the legacy catalog branch it guarded.

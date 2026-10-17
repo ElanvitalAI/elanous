@@ -197,6 +197,20 @@ describe('runSelfGateCli', () => {
     expect(calls).toHaveLength(2);
   });
 
+  test('automatic host-cap fixed fallback is visible without changing the real shard verdict', () => {
+    const result = runSelfGateCli('/repo', { shards: 12 }, {
+      changedFiles: () => ({ files: ['test/a.test.ts'], baseRef: 'HEAD' }), exists: () => true,
+      runShards: () => ({ shards: [{ id: 'shard-1', files: ['test/a.test.ts'], plannedRssMb: 0, plannedSeconds: 0 }],
+        attempts: [], aggregate: { status: 'passed', retryShardIds: [] }, distribution: 'fixed-cap-fallback',
+        fallbackReason: 'host shard expansion cap 12 < needed 42' }),
+      runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+      runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.lines.find((line) => line.startsWith('shards: '))).toContain('호스트 상한 자동 고정 분배(host shard expansion cap 12 < needed 42)');
+  });
+
   test('default gate gives all ten real child tests three spawn shards beside regular tests', () => {
     const files = [...GATE_SPAWN_LANE_FILES, 'test/ordinary.test.ts'];
     let shardCount: number | undefined;

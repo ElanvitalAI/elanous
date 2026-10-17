@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parsePodPool, type PoolKubectl } from './pod-pool.js';
-import { harnessCpuSlotsBesideGate, measurePoolLease, probePoolDns, recommendConcurrency, resolveSiTaskMemoryPolicy, POD_HOST_LEASE_ANNOTATION, type PoolLeaseMeasure } from './pod-lease.js';
+import { harnessCpuSlotsBesideGate, measurePoolLease, probePoolDns, probePoolGitHub, recommendConcurrency, resolveSiTaskMemoryPolicy, POD_HOST_LEASE_ANNOTATION, type PoolLeaseMeasure } from './pod-lease.js';
 import { podJobManifest } from './self-implement-pod.js';
 import { podCommandJobManifest } from './pod-command-job.js';
 import { debug } from '../../debug/log.js';
@@ -17,6 +17,49 @@ const uncachedProbe = (context: string, kubectl: PoolKubectl) => {
 };
 const emptyDnsProbeList = JSON.stringify({ items: [] });
 const gi = 1024 ** 3;
+
+test('GitHub egress Pod records DNS and HTTPS separately, caches measured results, and deletes its own name', () => {
+  for (const scenario of ['dns', 'https', 'ok', 'timeout', 'image'] as const) {
+    const dir = mkdtempSync(join(tmpdir(), 'github-egress-test-'));
+    const calls: string[][] = [];
+    let createdName = '';
+    const kubectl: PoolKubectl = (args, input) => {
+      calls.push([...args]);
+      if (args.includes('create')) {
+        const manifest = JSON.parse(input!);
+        createdName = manifest.metadata.name;
+        expect(manifest.metadata.namespace).toBe('elanous-test');
+        expect(manifest.spec.containers[0].command.join(' ')).toContain('github.com');
+      }
+      if (args.includes('get')) return { status: 0, stderr: '', stdout: JSON.stringify({ status: {
+        containerStatuses: scenario === 'image' ? [{ state: { waiting: { reason: 'ImagePullBackOff' } } }] : [],
+      } }) };
+      if (args.includes('logs')) return { status: scenario === 'timeout' ? 1 : 0, stderr: '', stdout:
+        scenario === 'dns' ? 'EXTERNAL_DNS_FAILED\n'
+          : scenario === 'https' ? 'EXTERNAL_DNS_OK\nGITHUB_HTTPS_FAILED\n'
+            : 'EXTERNAL_DNS_OK\nGITHUB_HTTPS_OK\n' };
+      if (args.includes('wait')) return { status: scenario === 'timeout' ? 1 : 0, stderr: '', stdout: '' };
+      return { status: 0, stderr: '', stdout: '' };
+    };
+    try {
+      const result = probePoolGitHub('node-b', kubectl, { dir, now: () => Date.parse('2026-10-16T12:00:00Z') });
+      expect(result).toMatchObject(scenario === 'dns' ? { externalDns: false, githubHttps: null, reason: 'external DNS failed' }
+        : scenario === 'https' ? { externalDns: true, githubHttps: false, reason: 'GitHub HTTPS failed' }
+          : scenario === 'ok' ? { externalDns: true, githubHttps: true, reason: null }
+            : scenario === 'image' ? { externalDns: null, githubHttps: null, measuredAt: null, reason: 'probe image unavailable' }
+              : { externalDns: null, githubHttps: null, measuredAt: null, reason: 'probe timeout' });
+      const creates = calls.filter((args) => args.includes('create'));
+      const deletes = calls.filter((args) => args.includes('delete'));
+      expect(creates).toHaveLength(1);
+      expect(deletes).toHaveLength(1);
+      expect(deletes[0]).toContain(`pod/${createdName}`);
+      if (result.measuredAt) {
+        expect(probePoolGitHub('node-b', kubectl, { dir, now: () => Date.parse('2026-10-16T12:00:30Z') })).toEqual(result);
+        expect(calls.filter((args) => args.includes('create'))).toHaveLength(1);
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
 const node = (memory = '263471132Ki', cpu = '32') => JSON.stringify({ items: [{ metadata: { name: 'node-1' }, status: { allocatable: { memory, cpu }, conditions: [{ type: 'Ready', status: 'True' }] } }] });
 interface FixturePod {
   metadata: { namespace: string; name: string; labels: Record<string, string> };

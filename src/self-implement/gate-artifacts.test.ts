@@ -8,7 +8,7 @@ import {
   fetchRemoteGateArtifacts, newRemoteArtifactDir, parseRemoteArtifactFetch, remoteArtifactCleanupScript, remoteArtifactFetchScript,
   remoteCommitSupportsArtifactDir, writeRemoteUnavailableGateArtifacts, type RemoteSsh,
 } from './gate-artifacts.js';
-import type { ShardRunResult } from '../self-dev/shard-run.js';
+import { runShardedGateTests, type ShardRunResult } from '../self-dev/shard-run.js';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -36,6 +36,7 @@ const sharded: ShardRunResult = {
       currentDiagnostic: 'stderr: bootstrap error' },
   ],
   aggregate: { status: 'unmeasured', retryShardIds: ['shard-2'] },
+  unmeasuredByShard: { 'shard-2': 'current: exit 2; stderr: bootstrap error' },
 };
 
 function runSharded(artifactDir?: string) {
@@ -46,6 +47,38 @@ function runSharded(artifactDir?: string) {
 }
 
 describe('self gate --artifact-dir (R2 입력 재료)', () => {
+  test('baseline setup failure with zero attempts preserves the cause for every planned shard', () => {
+    const dir = join(tmp(), 'out');
+    let measurements = 0;
+    const failingBaseline = () => ({
+      status: 'unknown' as const, unknownReason: 'infrastructure-failure' as const,
+      childResponsibility: 'none' as const, log: 'baseline setup failed:\nENOSPC in /tmp',
+    });
+    const result = runSelfGateCli('/repo', { base: 'origin/main', shards: 2, artifactDir: dir }, {
+      changedFiles: () => ({ files, baseRef: 'origin/main' }), exists: () => true,
+      runShards: (cwd, selected, base, count) => runShardedGateTests(cwd, selected, base, count,
+        (_location, measuredFiles) => {
+          measurements++;
+          expect(measuredFiles).toHaveLength(1);
+          return { exitCode: 0, junit: '<testsuite/>', rssMb: 100, seconds: 1 };
+        }, failingBaseline as typeof import('./gate-baseline.js').withBaselineWorktree,
+        8, { hostResources: { cores: 8, freeMemoryGiB: 64, freeTmpGiB: 8 } }),
+      ...quietGates, ...artifactDeps,
+    });
+    const summary = JSON.parse(readFileSync(join(dir, 'summary.json'), 'utf8'));
+    expect(measurements).toBe(files.length);
+    expect(summary).toMatchObject({
+      verdict: 'unmeasured', shards: 2, shardsDetail: [],
+      unmeasuredReason: 'baseline setup failed: ENOSPC in /tmp',
+      unmeasuredByShard: {
+        'shard-1': 'baseline worktree: baseline setup failed: ENOSPC in /tmp',
+        'shard-2': 'baseline worktree: baseline setup failed: ENOSPC in /tmp',
+      },
+    });
+    expect(result.lines).toContain('shards: unmeasured (baseline setup failed: ENOSPC in /tmp)');
+    expect(result.lines).toContain('shard unmeasured: shard-1 · baseline worktree: baseline setup failed: ENOSPC in /tmp');
+  });
+
   test('writes summary.json and per-shard current/baseline JUnit; a side without JUnit gets no junitPath, only a diagnostic', () => {
     const dir = join(tmp(), 'out');
     const result = runSharded(dir);
@@ -54,6 +87,7 @@ describe('self gate --artifact-dir (R2 입력 재료)', () => {
       head40: HEAD, base40: BASE, envKey: ENV, shards: 2,
       cohort: ['src/a.test.ts', 'src/m.test.ts', 'src/z.test.ts'],
       verdict: 'unmeasured', unmeasuredReason: 'shard-2', verdictLine: 'shards: unmeasured (shard-2)', exitCode: 1,
+      unmeasuredByShard: { 'shard-2': 'current: exit 2; stderr: bootstrap error' },
     });
     expect(summary.artifactsUnavailable).toBeUndefined();
     const [s1, s2] = summary.shardsDetail;
@@ -65,6 +99,7 @@ describe('self gate --artifact-dir (R2 입력 재료)', () => {
         resultPath: join(dir, 'shard-1-1-baseline.result.json'), junitPath: join(dir, 'shard-1-1-baseline.xml') },
     });
     expect(s2.current.junitPath).toBeUndefined();
+    expect(s2.unmeasuredReason).toBe('current: exit 2; stderr: bootstrap error');
     expect('junitPath' in s2.current).toBe(false);
     expect(s2.current).toMatchObject({ rc: 2, diagnostic: 'stderr: bootstrap error' });
     expect(s2.baseline.junitPath).toBe(join(dir, 'shard-2-1-baseline.xml'));
@@ -541,7 +576,7 @@ describe('self gate --artifact-dir · 원격 산출 회수', () => {
     expect(() => remoteArtifactFetchScript('/tmp/x')).toThrow();
     expect(() => remoteArtifactCleanupScript("/tmp/elanous-gate-artifacts-abcdef12'; rm -rf ~")).toThrow();
     expect(() => newRemoteArtifactDir('../x')).toThrow();
-    expect(remoteArtifactCleanupScript(newRemoteArtifactDir('ab'.repeat(8)))).toContain(`rm -rf '/tmp/elanous-gate-artifacts-${'ab'.repeat(8)}'`);
+    expect(remoteArtifactCleanupScript(newRemoteArtifactDir('ab'.repeat(8)))).toContain(`rm -rf '/var/tmp/elanous-gate-artifacts-${'ab'.repeat(8)}'`);
   });
 
   test('a measured commit without the artifact module is remote-unsupported (the flag is not sent)', () => {

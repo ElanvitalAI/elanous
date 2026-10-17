@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { debug } from '../src/debug/log.js';
 import { readFileSync } from 'node:fs';
 import { requestPause, resetPauseFlag } from '../src/turn-checkpoint/index.js';
 import {
@@ -183,6 +184,31 @@ describe('tool-loop followup phase rejection', () => {
       expect(getToolLoopPhaseRejectedCalls(phase, [{ id: 'g', name: 'Glob', args: {} }]).map((c) => c.id)).toEqual(['g']);
     },
   );
+
+  // TUI-OPS-TURN-GUARD 관측 공백 ② — 옛 빌드에서 수리·검증 단계가 거부한 운영 도구 넷.
+  //   읽기·관측(logs_query · PtyShellPoll)만 통과, 쓰기 동작이 있는 schedule_manage · se_build 는 그대로 거부.
+  test.each(['inspect-action', 'inspect-execution', 'repair-action', 'verify-action'] as const)(
+    '%s runs read-only ops observation tools but still rejects write-capable ops tools',
+    (phase) => {
+      const allowed = ['logs_query', 'PtyShellPoll'].map((name) => ({ id: name, name, args: {} }));
+      expect(getToolLoopPhaseRejectedCalls(phase, allowed)).toEqual([]);
+      for (const { name } of allowed) expect(ACTION_PHASE_OPS_TOOLS as readonly string[]).toContain(name);
+
+      const writeCapable = ['schedule_manage', 'se_build', 'Glob'].map((name) => ({ id: name, name, args: {} }));
+      expect(getToolLoopPhaseRejectedCalls(phase, writeCapable).map((c) => c.id)).toEqual(['schedule_manage', 'se_build', 'Glob']);
+      for (const name of ['schedule_manage', 'se_build']) expect(ACTION_PHASE_OPS_TOOLS as readonly string[]).not.toContain(name);
+    },
+  );
+
+  test('inspect-execution still rejects edit tools next to the added observation tools', () => {
+    const calls = ['logs_query', 'PtyShellPoll', 'Edit', 'Write'].map((name) => ({ id: name, name, args: {} }));
+    expect(getToolLoopPhaseRejectedCalls('inspect-execution', calls).map((c) => c.id)).toEqual(['Edit', 'Write']);
+  });
+
+  test('inspect-synthesis still rejects every tool, including the added observation tools', () => {
+    const calls = ['logs_query', 'PtyShellPoll'].map((name) => ({ id: name, name, args: {} }));
+    expect(getToolLoopPhaseRejectedCalls('inspect-synthesis', calls).map((c) => c.id)).toEqual(['logs_query', 'PtyShellPoll']);
+  });
 
   test('verify phase runs MsgPost/MsgList/MsgAck after edits and still rejects Glob', async () => {
     const dispatched: string[] = [];
@@ -530,6 +556,7 @@ describe('tool-loop followup phase rejection', () => {
       { type: 'tool_call' as const, id: `missing-${index}`, name: 'MissingTool', args: {} },
     ]));
     let dispatched = 0;
+    const logSpy = spyOn(debug, 'log');
 
     const result = await streamLLMWithTools(
       [{ role: 'user', content: 'exercise invalid tool tracking' }],
@@ -543,9 +570,11 @@ describe('tool-loop followup phase rejection', () => {
       { provider, tools: TOOLS, maxTurns: 8 },
     );
 
+    const heal = logSpy.mock.calls.find((call) => call[1] === 'doom-loop-self-heal');
+    logSpy.mockRestore();
     expect(dispatched).toBe(0);
-    expect(result).toContain('[ASK USER]');
-    expect(result).toContain('plan mode is active');
+    expect(result).not.toContain('[ASK USER]');
+    expect(heal?.[2]).toMatchObject({ reason: 'plan-mode', attempt: 1, action: 'guidance', tool: 'MissingTool' });
     expect(toolResults(capturedMessagesAt(1)).slice(-1)[0]!.content).toContain('INVALID TOOL — "MissingTool"');
   });
 

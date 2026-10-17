@@ -88,6 +88,25 @@ export function extractGateRemoteFlags(argv: readonly string[]): GateRemoteFlags
   return out;
 }
 
+/** A remote importer sweep must not silently become one large test process. The measured planner may grow this
+ *  starting count further when the observed RSS needs more memory-bounded bundles. */
+export function remoteSelfGateArgv(input: {
+  changed?: boolean;
+  base?: string;
+  shards?: number;
+  fixedShardDistribution?: boolean;
+  includeImporters?: boolean;
+  artifactDir?: string;
+}, sha: (ref: string) => string): string[] {
+  const shards = input.shards ?? (input.includeImporters ? 2 : undefined);
+  return ['bun', 'bin/elanous.mjs', 'self', 'gate', '--local', ...(input.changed ? ['--changed'] : []),
+    ...(input.base ? ['--base', input.base === 'origin/main' ? input.base : sha(input.base)] : []),
+    ...(shards !== undefined ? ['--shards', String(shards)] : []),
+    ...(input.fixedShardDistribution ? ['--fixed-shard-distribution'] : []),
+    ...(input.includeImporters ? ['--include-importers'] : []),
+    ...(input.artifactDir ? ['--artifact-dir', input.artifactDir] : [])];
+}
+
 export interface GateDispatchDecision { mode: 'local' | 'remote'; host?: string; reason: string; load1: number }
 
 export function decideGateDispatch(input: { flags: Pick<GateRemoteFlags, 'remote' | 'local'>; settings: GateRemoteSettings; load1: number; env?: NodeJS.ProcessEnv }): GateDispatchDecision {
@@ -249,7 +268,13 @@ export function remoteScript(input: { mirror: string; commit: string; fetchShas:
     'umask 077',
     'PATH="$HOME/.bun/bin:/opt/homebrew/bin:$PATH"; export PATH',
     `infra() { echo "${INFRA}$1" >&2; exit 97; }`,
-    'W=$(mktemp -d /tmp/gate-remote-XXXXXXXX) || infra mktemp',
+    // `/tmp` is a 20 GiB tmpfs on WSL. One baseline checkout can exhaust it before any shard starts.
+    // Keep the entire child temp tree on the host disk; a low-space host yields infra fallback.
+    'TMPDIR=/var/tmp; export TMPDIR',
+    'free_kib=$(df -Pk "$TMPDIR" 2>/dev/null | awk \'NR==2 {print $4}\')',
+    'case "$free_kib" in ""|*[!0-9]*) infra disk-unmeasured;; esac',
+    'if [ "$free_kib" -lt 8388608 ]; then infra "disk-low:${free_kib}KiB"; fi',
+    'W=$(mktemp -d /var/tmp/elanous-gate-remote-XXXXXXXX) || infra mktemp',
     'export W',
     'trap \'rm -rf "$W"\' EXIT',
     ...payloadLines,

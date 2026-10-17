@@ -62,7 +62,7 @@ describe('pty takeover CLI commands', () => {
 
     expect(runPtyList(deps)).toEqual({
       exitCode: 0,
-      message: 'pty_local\ttui\tlocal-tui\tlocal\talive\tauto\t-\t-\torigin=unknown reason=legacy-or-malformed-origin-decision\tpurpose=workdir-not-recorded\npty_ro\tshell\tread-only\tlocal\talive\tread\t-\t-\torigin=unknown reason=legacy-or-malformed-origin-decision\tpurpose=workdir-not-recorded\npty_shared\tlocal-shell\tlocal-shared\tlocal\tdead\twrite\t-\t-\torigin=unknown reason=legacy-or-malformed-origin-decision\tpurpose=workdir-not-recorded\npty_remote\tshell\tremote-shell\tremote\tdead\t?\t-\t-\torigin=unknown reason=legacy-or-malformed-origin-decision\tpurpose=workdir-not-recorded\npurpose-known rows: 0/4',
+      message: 'pty_local\ttui\tlocal-tui\tlocal\talive\tauto\t-\t-\torigin=unknown reason=legacy-or-malformed-origin-decision\tpurpose=workdir-not-recorded\tturn=?\npty_ro\tshell\tread-only\tlocal\talive\tread\t-\t-\torigin=unknown reason=legacy-or-malformed-origin-decision\tpurpose=workdir-not-recorded\npty_shared\tlocal-shell\tlocal-shared\tlocal\tdead\twrite\t-\t-\torigin=unknown reason=legacy-or-malformed-origin-decision\tpurpose=workdir-not-recorded\npty_remote\tshell\tremote-shell\tremote\tdead\t?\t-\t-\torigin=unknown reason=legacy-or-malformed-origin-decision\tpurpose=workdir-not-recorded\npurpose-known rows: 0/4',
     });
     expect(refs.filter((ref) => ref.id === 'pty_shared')).toEqual([{
       id: 'pty_shared', kind: 'local-shell', nickname: 'local-shared', source: 'local', alive: false, mode: 'write',
@@ -97,13 +97,64 @@ describe('pty takeover CLI commands', () => {
       resolveWorktreeProvenance: () => ({ known: false, provenanceReason: 'workdir-not-recorded' }),
     };
     const lines = runPtyList(deps).message.split('\n');
-    expect(lines[0]).toEndWith('\trun=aaaaaaa,stale');
-    expect(lines[1]).toEndWith('\trun=bbbbbbb');
-    expect(lines[2]).toEndWith('\trun=?,stale');
+    // ⭐ H10: TUI 행엔 턴 칸이 붙는다 — 턴 기록이 없는 행은 «모른다»(`turn=?`) · 셸 행엔 없다.
+    expect(lines[0]).toEndWith('\trun=aaaaaaa,stale\tturn=?');
+    expect(lines[1]).toEndWith('\trun=bbbbbbb\tturn=?');
+    expect(lines[2]).toEndWith('\trun=?,stale\tturn=?');
     expect(lines[3]).not.toContain('run=');
-    // 설치본 판독기가 없는 구성은 칸을 안 낸다(기계마다 다른 값이 새지 않게).
+    expect(lines[3]).not.toContain('turn=');
+    // 설치본 판독기가 없는 구성은 판 칸을 안 낸다(기계마다 다른 값이 새지 않게).
     const { readInstalledBuild: _omit, ...withoutReader } = deps;
     expect(runPtyList(withoutReader).message).not.toContain('run=');
+    // ⭐ 턴 칸은 판독기와 무관하다 — 판독기가 없어도 TUI 행마다 그대로 나온다.
+    const bare = runPtyList(withoutReader).message.split('\n');
+    expect(bare.slice(0, 3).every((line) => line.endsWith('\tturn=?'))).toBe(true);
+    expect(bare[3]).not.toContain('turn=');
+  });
+
+  test('list shows the self-reported turn cell (busy with elapsed seconds · idle) without reading the screen', () => {
+    const row = (id: string, extra: Partial<PtyManifestRow> = {}): PtyManifestRow => ({
+      id, kind: 'tui', cmd: 'elanous', ownerPid: 1, ptyPid: 0, instance: 'prod', startedAt: 100, alive: true, exitCode: null,
+      snapshot: '', snapshotAt: 0, outputBytesTotal: 0, updatedAt: 200, frame: '', frameAt: 0, runId: '', runIdSource: '', spaceId: '', sessionId: '',
+      parentPtyId: '', parentPid: 0, parentKind: '', closedAt: 0, codeSha: '',
+      build: { version: 'v', sha: 'c'.repeat(40), source: 'installed' }, ...extra,
+    });
+    let screenReads = 0;
+    const deps: PtyTakeoverCommandDeps = {
+      getPty: () => undefined, requestPtyTakeover: () => false,
+      requestRemote: async () => { screenReads++; return { status: 'unknown-pty' as const }; }, log() {},
+      listRefs: () => [
+        { id: 'tui:busy', kind: 'tui', source: 'remote', alive: true },
+        { id: 'tui:idle', kind: 'tui', source: 'remote', alive: true },
+      ],
+      listManifestRows: () => [
+        row('tui:busy', { turnState: 'busy', turnAt: 1_000_000 }),
+        row('tui:idle', { turnState: 'idle', turnAt: 1_040_000 }),
+      ],
+      readInstalledBuild: () => ({ sha: 'c'.repeat(40) }),
+      resolveWorktreeProvenance: () => ({ known: false, provenanceReason: 'workdir-not-recorded' }),
+      now: () => 1_042_500,
+    };
+    const lines = runPtyList(deps).message.split('\n');
+    expect(lines[0]).toEndWith('\trun=ccccccc\tturn=busy,42s');
+    expect(lines[1]).toEndWith('\trun=ccccccc\tturn=idle,2s');
+    expect(screenReads).toBe(0);
+    // 설치본 판독기가 없어도(판 칸 없음) 턴 칸은 같은 값으로 나온다.
+    const { readInstalledBuild: _r, ...noReader } = deps;
+    const bare = runPtyList(noReader).message.split('\n');
+    expect(bare[0]).toEndWith('\tpurpose=workdir-not-recorded\tturn=busy,42s');
+    expect(bare[1]).toEndWith('\tpurpose=workdir-not-recorded\tturn=idle,2s');
+    // manifest 행이 없는 TUI ref → «모른다»(`turn=?`) · 셸 ref 엔 칸이 없다.
+    const noRows = runPtyList({ ...deps, listRefs: () => [{ id: 'tui:ghost', kind: 'tui', source: 'remote', alive: true }, { id: 'sh:1', kind: 'shell', source: 'remote', alive: true }] }).message.split('\n');
+    expect(noRows[0]).toEndWith('\tturn=?');
+    expect(noRows[1]).not.toContain('turn=');
+    // 행 조회 예외 → «모른다».
+    const throwing = runPtyList({ ...deps, listManifestRows: () => { throw new Error('manifest locked'); } }).message.split('\n');
+    expect(throwing[0]).toEndWith('\tturn=?');
+    // ref 는 TUI 인데 같은 id 의 manifest 행 종류가 다르면 칸을 «빼지 않고» 모른다로 낸다(r2 mf).
+    const mismatch = runPtyList({ ...deps, listManifestRows: () => [row('tui:busy', { kind: 'shell', turnState: 'busy', turnAt: 1_000_000 }), row('tui:idle', { turnState: 'idle', turnAt: 1_040_000 })] }).message.split('\n');
+    expect(mismatch[0]).toEndWith('\tturn=?');
+    expect(mismatch[1]).toEndWith('\tturn=idle,2s');
   });
 
   test('list distinguishes no PTYs from unavailable reference listing', () => {
@@ -138,7 +189,86 @@ describe('pty takeover CLI commands', () => {
       ageMs: 1_099,
       // ⭐ #14980 이 원격·로컬 «키 대칭»으로 더한 셋 — null 은 「모른다」이지 「없다」가 아니다.
       webUrl: null, webUrlSource: null, pwaUnavailableReason: null,
+      // ⭐ H10 — 턴·판 칸은 «언제나» 실린다. 턴 기록이 없는 행은 unknown/null.
+      turn: { state: 'unknown', at: null, sinceSec: null }, build: null,
     }]);
+  });
+
+  test('list --json carries the self-reported turn (busy + elapsed) and the boot build of a TUI row', () => {
+    const row: PtyManifestRow = {
+      id: 'tui:7', kind: 'tui', cmd: 'elanous', ownerPid: 7, ptyPid: 0, instance: 'test', startedAt: 1,
+      alive: true, exitCode: null, snapshot: '', snapshotAt: 0, outputBytesTotal: 0, updatedAt: 99_000,
+      frame: '', frameAt: 0, runId: '', runIdSource: '', spaceId: '', sessionId: '', parentPtyId: '', parentPid: 0, parentKind: '', closedAt: 0, codeSha: '',
+      turnState: 'busy', turnAt: 58_000, build: { version: '0.2.31-dev.0', sha: 'd'.repeat(40), source: 'installed' },
+    };
+    let installedReads = 0;
+    const logs: Array<[string, unknown]> = [];
+    const deps: PtyTakeoverCommandDeps = {
+      getPty: () => undefined, requestPtyTakeover: () => false, requestRemote: async () => ({ status: 'unknown-pty' }),
+      log: (event, data) => logs.push([event, data]),
+      currentManifestDbPath: () => '/r/pty/manifest.db', manifestTargets: () => [{ name: 'test', dbPath: '/r/pty/manifest.db' }],
+      isProcessAlive: () => true, now: () => 100_000, listManifestRowsAt: () => [row, { ...row, id: 'tui:8' }],
+      readInstalledBuild: () => { installedReads++; return { sha: 'e'.repeat(40) }; },
+    };
+    const json = JSON.parse(runPtyList(deps, { json: true }).message);
+    expect(json[0].turn).toEqual({ state: 'busy', at: 58_000, sinceSec: 42 });
+    expect(json[0].build).toEqual({ version: '0.2.31-dev.0', sha: 'd'.repeat(40), source: 'installed', stale: true, staleReason: 'installed-moved' });
+    // 설치본 기록은 목록 한 번에 한 번만 읽는다(r2 should-fix).
+    expect(installedReads).toBe(1);
+    // 턴 끝 → idle 로 바뀌면 같은 칸이 idle 과 그 경과를 낸다.
+    const idle = JSON.parse(runPtyList({ ...deps, listManifestRowsAt: () => [{ ...row, turnState: 'idle', turnAt: 99_000 }] }, { json: true }).message);
+    expect(idle[0].turn).toEqual({ state: 'idle', at: 99_000, sinceSec: 1 });
+    expect(logs.filter(([event]) => event === 'list-build-read-failed')).toEqual([]);
+    // 판독 예외 계약: 기록된 턴은 그대로 · 판 sha 는 기록값 그대로 · 낡음만 «모른다»(stale=null) · `list-build-read-failed` 관측.
+    const broken = JSON.parse(runPtyList({ ...deps, readCheckoutHead: () => { throw new Error('git exploded'); }, listManifestRowsAt: () => [{ ...row, build: { version: 'v', sha: 'a'.repeat(40), source: 'checkout', codeRoot: '/r' } }] }, { json: true }).message);
+    expect(broken[0].turn).toEqual({ state: 'busy', at: 58_000, sinceSec: 42 });
+    expect(broken[0].build).toEqual({ version: 'v', sha: 'a'.repeat(40), source: 'checkout', stale: null, staleReason: 'unknown' });
+    expect(logs.filter(([event]) => event === 'list-build-read-failed')).toEqual([['list-build-read-failed', { ptyId: 'tui:7', source: 'checkout-head', error: 'git exploded' }]]);
+    logs.length = 0;
+    const thrownInstalled = JSON.parse(runPtyList({ ...deps, readInstalledBuild: () => { throw new Error('install.json unreadable'); } }, { json: true }).message);
+    expect(thrownInstalled.map((r: { turn: unknown }) => r.turn)).toEqual([{ state: 'busy', at: 58_000, sinceSec: 42 }, { state: 'busy', at: 58_000, sinceSec: 42 }]);
+    expect(thrownInstalled[0].build).toEqual({ version: '0.2.31-dev.0', sha: 'd'.repeat(40), source: 'installed', stale: null, staleReason: 'unknown' });
+    // 목록당 한 줄(행마다 아님).
+    expect(logs.filter(([event]) => event === 'list-build-read-failed')).toEqual([['list-build-read-failed', { source: 'installed', error: 'install.json unreadable' }]]);    // 행의 build 접근 자체가 터져도 그 행만 build:null — 목록 전체와 그 행의 턴은 산다.
+    logs.length = 0;
+    const poisoned = Object.defineProperty({ ...row, id: 'tui:poison' }, 'build', { get() { throw new Error('poisoned build'); }, enumerable: true }) as PtyManifestRow;
+    const listed = runPtyList({ ...deps, listManifestRowsAt: () => [poisoned, row] }, { json: true });
+    expect(listed.exitCode).toBe(0);
+    const pj = JSON.parse(listed.message);
+    expect(pj.map((r: { id: string; build: unknown; turn: { state: string } }) => [r.id, r.build === null, r.turn.state])).toEqual([['tui:poison', true, 'busy'], ['tui:7', false, 'busy']]);
+    expect(logs.filter(([event]) => event === 'list-build-read-failed')).toEqual([['list-build-read-failed', { ptyId: 'tui:poison', source: 'describe', error: 'poisoned build' }]]);
+  });
+
+  test('list text keeps the turn cell when the build read fails (installed reader throws · run column throws)', () => {
+    const logs: Array<[string, unknown]> = [];
+    const row: PtyManifestRow = {
+      id: 'tui:9', kind: 'tui', cmd: 'elanous', ownerPid: 9, ptyPid: 0, instance: 'prod', startedAt: 100, alive: true, exitCode: null,
+      snapshot: '', snapshotAt: 0, outputBytesTotal: 0, updatedAt: 200, frame: '', frameAt: 0, runId: '', runIdSource: '', spaceId: '', sessionId: '',
+      parentPtyId: '', parentPid: 0, parentKind: '', closedAt: 0, codeSha: '',
+      turnState: 'busy', turnAt: 10_000, build: { version: 'v', sha: 'f'.repeat(40), source: 'installed' },
+    };
+    const deps: PtyTakeoverCommandDeps = {
+      getPty: () => undefined, requestPtyTakeover: () => false, requestRemote: async () => ({ status: 'unknown-pty' as const }),
+      log: (event, data) => logs.push([event, data]),
+      listRefs: () => [{ id: 'tui:9', kind: 'tui', source: 'remote', alive: true }],
+      listManifestRows: () => [row],
+      readInstalledBuild: () => { throw new Error('install.json unreadable'); },
+      resolveWorktreeProvenance: () => ({ known: false, provenanceReason: 'workdir-not-recorded' }),
+      now: () => 52_000,
+    };
+    const result = runPtyList(deps);
+    expect(result.exitCode).toBe(0);
+    expect(result.message.split('\n')[0]).toEndWith('\trun=fffffff\tturn=busy,42s');
+    expect(logs.some(([event, data]) => event === 'list-build-read-failed' && (data as { source: string }).source === 'installed')).toBe(true);
+    // 판 칸 계산 자체가 터져도(뜻밖의 행 모양) 그 행과 턴 칸은 산다 — 판 칸만 비운다.
+    logs.length = 0;
+    const poisoned = { ...row, build: Object.defineProperty({ version: 'v', source: 'installed' }, 'sha', { get() { throw new Error('poisoned row'); }, enumerable: true }) as PtyManifestRow['build'] };
+    const survived = runPtyList({ ...deps, readInstalledBuild: () => ({}), listManifestRows: () => [poisoned] });
+    expect(survived.exitCode).toBe(0);
+    const line = survived.message.split('\n')[0]!;
+    expect(line).toEndWith('\tpurpose=workdir-not-recorded\tturn=busy,42s');
+    expect(line).not.toContain('run=');
+    expect(logs.filter(([event]) => event === 'list-build-read-failed')).toEqual([['list-build-read-failed', { ptyId: 'tui:9', source: 'run-column', error: 'poisoned row' }]]);
   });
 
   test('list --all --json preserves colliding instance names while identifying each manifest root', () => {
@@ -588,16 +718,16 @@ describe('pty takeover CLI commands', () => {
       requestRemote: async () => ({ status: 'success', screen: '❯ /command, or type a question' }),
       listRefs: () => [{ id: 'pty_x', kind: 'tui', source: 'remote', alive: true }], now: () => 1234, log() {},
     };
-    await expect(runPtyState('pty_x', deps, true)).resolves.toEqual({ exitCode: 0, message: JSON.stringify({ id: 'pty_x', state: 'idle', label: 'bare-prompt', at: 1234, turn: 'unknown', build: null, installed: null, stale: null, staleReason: 'unknown' }) });
-    await expect(runPtyState('pty_x', deps)).resolves.toEqual({ exitCode: 0, message: 'pty state: pty_x state=idle label=bare-prompt turn=unknown build=unknown installed=- stale=unknown' });
+    await expect(runPtyState('pty_x', deps, true)).resolves.toEqual({ exitCode: 0, message: JSON.stringify({ id: 'pty_x', state: 'idle', stateSource: 'screen', screenState: 'idle', label: 'bare-prompt', at: 1234, turn: 'unknown', build: null, installed: null, stale: null, staleReason: 'unknown' }) });
+    await expect(runPtyState('pty_x', deps)).resolves.toEqual({ exitCode: 0, message: 'pty state: pty_x state=idle source=screen label=bare-prompt turn=unknown build=unknown installed=- stale=unknown' });
   });
 
-  test('state reports the TUI-recorded turn and a stale running build (not the screen guess)', async () => {
+  test('state follows the TUI-recorded turn over the screen guess and reports a stale running build', async () => {
     const boot = 'a'.repeat(40); const current = 'b'.repeat(40);
     const logs: Array<[string, unknown]> = [];
     const deps: PtyTakeoverCommandDeps = {
       getPty: () => undefined, requestPtyTakeover: () => false,
-      // 화면은 idle 로 보이지만 TUI 가 적은 턴은 busy 다 — 둘은 다른 칸으로 나간다.
+      // 화면은 idle 로 보이지만 TUI 가 적은 턴은 busy 다 — ⭐ H10: state 는 턴을 따르고(working) 화면 원값은 guess 로 남는다.
       requestRemote: async () => ({ status: 'success', screen: '❯ /command, or type a question' }),
       listRefs: () => [{ id: 'tui:42', kind: 'tui', source: 'remote', alive: true }], now: () => 1234,
       readManifestRow: (id) => id === 'tui:42' ? {
@@ -610,9 +740,41 @@ describe('pty takeover CLI commands', () => {
       log: (event, data) => logs.push([event, data]),
     };
     const json = JSON.parse((await runPtyState('tui:42', deps, true)).message);
-    expect(json).toMatchObject({ state: 'idle', turn: 'busy', turnAt: 150, build: { version: '0.2.29-dev.0', sha: boot, source: 'installed' }, installed: current, stale: true, staleReason: 'installed-moved' });
-    await expect(runPtyState('tui:42', deps)).resolves.toEqual({ exitCode: 0, message: 'pty state: tui:42 state=idle label=bare-prompt turn=busy build=0.2.29-dev.0@aaaaaaa(installed) installed=bbbbbbb stale=true (installed-moved)' });
+    expect(json).toMatchObject({ state: 'working', stateSource: 'turn', screenState: 'idle', turn: 'busy', turnAt: 150, build: { version: '0.2.29-dev.0', sha: boot, source: 'installed' }, installed: current, stale: true, staleReason: 'installed-moved' });
+    await expect(runPtyState('tui:42', deps)).resolves.toEqual({ exitCode: 0, message: 'pty state: tui:42 state=working source=turn guess=idle label=bare-prompt turn=busy build=0.2.29-dev.0@aaaaaaa(installed) installed=bbbbbbb stale=true (installed-moved)' });
     expect(logs.filter(([event]) => event === 'state-run-unknown')).toEqual([]);
+    expect(logs.filter(([event]) => event === 'state-reconciled')[0]).toEqual(['state-reconciled', { ptyId: 'tui:42', turn: 'busy', screenState: 'idle', label: 'bare-prompt', state: 'working' }]);
+  });
+
+  test('state never prints working next to turn=idle: a leftover «Streaming» line yields to the recorded idle turn', async () => {
+    const logs: Array<[string, unknown]> = [];
+    const tuiRow = (turnState: 'busy' | 'idle'): PtyManifestRow => ({
+      id: 'tui:55', kind: 'tui', cmd: 'elanous', ownerPid: 55, ptyPid: 0, instance: 'prod', startedAt: 100, alive: true, exitCode: null,
+      snapshot: '', snapshotAt: 0, outputBytesTotal: 0, updatedAt: 200, frame: '', frameAt: 0, runId: '', runIdSource: '', spaceId: '', sessionId: '',
+      parentPtyId: '', parentPid: 0, parentKind: '', closedAt: 0, codeSha: '',
+      turnState, turnAt: 150, build: { version: 'v', sha: 'a'.repeat(40), source: 'installed' },
+    });
+    // 10-16 실측 꼴: 턴은 끝났는데 스크롤백 하단 10줄 안에 «· Streaming… (5s · esc 중단)» 이 남아 화면 규칙이 working 을 문다.
+    const screen = ['· Streaming…  (5s · esc 중단)', '✔ 완료', '', '❯ '].join('\n');
+    let turn: 'busy' | 'idle' = 'idle';
+    const deps: PtyTakeoverCommandDeps = {
+      getPty: () => undefined, requestPtyTakeover: () => false,
+      requestRemote: async () => ({ status: 'success', screen }),
+      listRefs: () => [{ id: 'tui:55', kind: 'tui', source: 'remote', alive: true }], now: () => 1,
+      readManifestRow: () => tuiRow(turn),
+      readInstalledBuild: () => ({ sha: 'a'.repeat(40) }),
+      log: (event, data) => logs.push([event, data]),
+    };
+    const json = JSON.parse((await runPtyState('tui:55', deps, true)).message);
+    expect(json).toMatchObject({ state: 'idle', stateSource: 'turn', screenState: 'working', label: 'elanous-tui-turn-in-progress', turn: 'idle' });
+    expect(json.state === 'working' && json.turn === 'idle').toBe(false);
+    const text = (await runPtyState('tui:55', deps)).message;
+    expect(text).toStartWith('pty state: tui:55 state=idle source=turn guess=working label=elanous-tui-turn-in-progress turn=idle ');
+    expect(logs.some(([event, data]) => event === 'state-reconciled' && (data as { state: string }).state === 'idle')).toBe(true);
+    // 턴 중이면 같은 화면이 working 으로 «합의»한다 — 덮어쓰기 관측은 없다.
+    turn = 'busy'; logs.length = 0;
+    expect(JSON.parse((await runPtyState('tui:55', deps, true)).message)).toMatchObject({ state: 'working', stateSource: 'turn', screenState: 'working', turn: 'busy' });
+    expect(logs.filter(([event]) => event === 'state-reconciled')).toEqual([]);
   });
 
   test('wait polls until idle and reports the third acquired screen', async () => {
@@ -693,7 +855,7 @@ describe('pty takeover CLI commands', () => {
       readCheckoutHead: () => { throw new Error('git exploded'); },
       log() {},
     };
-    await expect(runPtyState('tui:43', deps)).resolves.toEqual({ exitCode: 0, message: 'pty state: tui:43 state=idle label=bare-prompt turn=idle build=v@aaaaaaa(checkout) installed=- stale=unknown' });
+    await expect(runPtyState('tui:43', deps)).resolves.toEqual({ exitCode: 0, message: 'pty state: tui:43 state=idle source=turn label=bare-prompt turn=idle build=v@aaaaaaa(checkout) installed=- stale=unknown' });
   });
 
   test('state still reports the recorded turn and build when the screen cannot be read', async () => {
@@ -710,8 +872,8 @@ describe('pty takeover CLI commands', () => {
       readInstalledBuild: () => ({ sha: 'a'.repeat(40) }),
       log() {},
     };
-    expect(JSON.parse((await runPtyState('tui:42', deps, true)).message)).toMatchObject({ state: 'unknown', screenUnavailable: 'screen-unavailable', turn: 'busy', stale: false });
-    await expect(runPtyState('tui:42', deps)).resolves.toEqual({ exitCode: 0, message: 'pty state: tui:42 state=unknown label=- screen=unavailable(screen-unavailable) turn=busy build=v@aaaaaaa(installed) installed=aaaaaaa stale=false (same-as-installed)' });
+    expect(JSON.parse((await runPtyState('tui:42', deps, true)).message)).toMatchObject({ state: 'working', stateSource: 'turn', screenState: 'unknown', screenUnavailable: 'screen-unavailable', turn: 'busy', stale: false });
+    await expect(runPtyState('tui:42', deps)).resolves.toEqual({ exitCode: 0, message: 'pty state: tui:42 state=working source=turn label=- screen=unavailable(screen-unavailable) turn=busy build=v@aaaaaaa(installed) installed=aaaaaaa stale=false (same-as-installed)' });
   });
 
   test('state preserves snapshot-equivalent screen acquisition failures', async () => {

@@ -36,9 +36,7 @@ describe('dashboard tool catalog observability', () => {
       userText: '최근 30분 task-agent 로그에서 exit-classified 몇 건이야?',
       hostTools: host.hostLLMTools(),
       runtimeTools: listToolRuntimes('tui'),
-      pluginTools: host.activePluginLLMTools(),
       toolAvailability: availability,
-      rich: false,
     });
     const logs = assemble().filter(spec => spec.name === 'logs_query');
     expect(logs).toHaveLength(1);
@@ -138,11 +136,16 @@ describe('dashboard tool catalog observability', () => {
       _resetToolRuntimeRegistryForTest();
     }
 
+    // TUI-DIET-D1-TAIL — the legacy coding/turn catalog is gone; this pins the essential catalog the TUI assembles.
     expect(names).toEqual([
       'Read', 'Grep', 'Glob', 'ListDir', 'Edit', 'Write',
-      'Agent', 'AgentOutput', 'AgentReply', 'AgentStop', 'AgentList',
-      'Bash', 'RunShell', 'PtyShellStart', 'PtyShellPoll', 'PtyShellSend',
+      'Agent', 'AgentOutput', 'AgentReply', 'AgentStop', 'AgentList', 'SelfImplement',
+      'Bash', 'RunShell',
+      'MsgList', 'MsgPost', 'MsgAck',
+      'ChecklistList', 'ChecklistAdd', 'ChecklistSet', 'ChecklistEdit', 'ChecklistMove',
+      'PtyShellStart', 'PtyShellPoll', 'PtyShellSend',
       'PtyShellKill', 'PtyShellList', 'run_tests', 'elanous_skills_list', 'skill_exec',
+      'PersistentGrounding',
     ]);
     expect(new Set(names).size).toBe(names.length);
     expect(records).toHaveLength(1);

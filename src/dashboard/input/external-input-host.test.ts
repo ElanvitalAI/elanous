@@ -1,6 +1,18 @@
 import { describe, expect, test } from 'bun:test';
-import { createDashboardExternalInputHost, stopTurnViaEscGate } from './external-input-host.js';
+import { createDashboardExternalInputHost, stopTurnViaEscGate, updateDashboardExternalInputQueueNotice } from './external-input-host.js';
 import { simEscGate } from '../../ux-sim/interaction.js';
+
+describe('updateDashboardExternalInputQueueNotice', () => {
+  test('updates one status row in place and removes it when the queue drains', () => {
+    const lines = ['existing chat line'];
+    const format = (notice: string): string => `[muted] ${notice}`;
+    expect(updateDashboardExternalInputQueueNotice(lines, null, '⤵ 외부 입력 1건 대기', format)).toBe(true);
+    expect(updateDashboardExternalInputQueueNotice(lines, '⤵ 외부 입력 1건 대기', '⤵ 외부 입력 2건 대기', format)).toBe(true);
+    expect(lines).toEqual(['existing chat line', '[muted] ⤵ 외부 입력 2건 대기']);
+    expect(updateDashboardExternalInputQueueNotice(lines, '⤵ 외부 입력 2건 대기', null, format)).toBe(true);
+    expect(lines).toEqual(['existing chat line']);
+  });
+});
 
 describe('createDashboardExternalInputHost', () => {
   test('composer 가 안 떠 있으면(getBufferText 없음) 제출을 거부한다', () => {
@@ -9,6 +21,7 @@ describe('createDashboardExternalInputHost', () => {
       isTurnActive: () => false,
       promptCtl: { submit: (r) => { calls.push(r); } },
       pushNotice: () => {},
+      setQueueNotice: () => {},
     });
     expect(host.composerText()).toBeUndefined();
     expect(host.submit('x', { kind: 'terminal', provider: 'pty' })).toBe(false);
@@ -18,10 +31,12 @@ describe('createDashboardExternalInputHost', () => {
   test('composer 가 떠 있으면 출처를 실어 제출 · 표지를 남긴다', () => {
     const calls: unknown[] = [];
     const notices: string[] = [];
+    const queueNotices: Array<string | null> = [];
     const host = createDashboardExternalInputHost({
       isTurnActive: () => true,
       promptCtl: { submit: (r) => { calls.push(r); }, getBufferText: () => '치던 중' },
       pushNotice: (l) => notices.push(l),
+      setQueueNotice: (line) => queueNotices.push(line),
     });
     expect(host.isTurnActive()).toBe(true);
     expect(host.composerText()).toBe('치던 중');
@@ -32,18 +47,24 @@ describe('createDashboardExternalInputHost', () => {
       isTurnActive: () => false,
       promptCtl: { submit: () => false, getBufferText: () => '' },
       pushNotice: () => {},
+      setQueueNotice: () => {},
     });
     expect(refused.submit('wake', { kind: 'terminal', provider: 'pty' })).toBe(false);
     const keyed = createDashboardExternalInputHost({
-      isTurnActive: () => false, promptCtl: { getBufferText: () => '' }, pushNotice: () => {}, pendingKeyCount: () => 1,
+      isTurnActive: () => false, promptCtl: { getBufferText: () => '' }, pushNotice: () => {}, setQueueNotice: () => {}, pendingKeyCount: () => 1,
     });
     expect(keyed.hasPendingKeys()).toBe(true);
     expect(refused.hasPendingKeys()).toBe(false);
-    host.onQueueChange?.([{ text: 'wake', at: 0 }], 'queued');
-    host.onQueueChange?.([], 'delivered');
-    expect(notices).toEqual([
+    host.onQueueChange?.([{ text: 'wake', at: 0 }]);
+    host.onQueueChange?.([{ text: 'wake', at: 0 }, { text: 'later', at: 1 }]);
+    host.onQueueChange?.([{ text: 'later', at: 1 }]);
+    host.onQueueChange?.([]);
+    expect(notices).toEqual([]);
+    expect(queueNotices).toEqual([
       '⤵ 외부 입력 1건 대기 · "wake" · 턴이 끝나고 입력창이 비면 별도 메시지로 전송',
-      '⤵ 외부 입력 1건 전송',
+      '⤵ 외부 입력 2건 대기 · "wake" · 턴이 끝나고 입력창이 비면 별도 메시지로 전송',
+      '⤵ 외부 입력 1건 대기 · "later" · 턴이 끝나고 입력창이 비면 별도 메시지로 전송',
+      null,
     ]);
   });
 });
@@ -55,6 +76,7 @@ describe('외부 /stop → escGate (TUI-STOP-INPUT-BYPASS)', () => {
     const notices: string[] = [];
     const host = createDashboardExternalInputHost({
       isTurnActive: () => true, promptCtl: { getBufferText: () => '' }, pushNotice: (l) => notices.push(l),
+      setQueueNotice: () => {},
       getTurnStop: () => current,
     });
     expect(host.requestStop?.()).toBe(true);

@@ -185,7 +185,8 @@ describe('dashboard frame cursor wiring', () => {
     // D1a — /ui 모드 축 자체가 없다(uiModeSlash 슬롯도 없다).
     expect(src).not.toContain('uiModeSlash');
     expect(src).not.toMatch(/\bdashboardUiMode\b|\bisDashboardHeavyFeatureEnabled\b|\bcreateRichScratchViewers\b/);
-    expect(src).toContain('rich: false,');
+    // TUI-DIET-D1-TAIL — the `rich` catalog argument itself is folded away; it must not come back.
+    expect(src).not.toMatch(/\brich: (?:true|false),/);
     expect(src).toContain("slot: 'bottom'");
   });
 

@@ -1667,9 +1667,9 @@ interface UnfinishedLedgerFacts {
   nonBlocking: NonBlockingRunLedgerRecord | null;
 }
 
-// A full federated scan can exceed 5,000 files; keep the previous scan resident for mtime-checked reuse.
+// A full federated scan can exceed 5,000 files; keep the previous scan resident for stat-checked reuse.
 const UNFINISHED_LEDGER_CACHE_LIMIT = 32_768;
-const unfinishedLedgerCache = new Map<string, { size: number; mtimeMs: number; facts: UnfinishedLedgerFacts }>();
+const unfinishedLedgerCache = new Map<string, { size: number; mtimeMs: number; ctimeMs: number; facts: UnfinishedLedgerFacts }>();
 const unfinishedReaderIds = new WeakMap<RunLedgerReader, number>();
 let nextUnfinishedReaderId = 1;
 
@@ -1686,10 +1686,10 @@ function unfinishedLedgerCacheKey(path: string, read?: RunLedgerReader): string 
 // ⭐ 프로세스 간 유효 스캔 색인(칸 CONTEXT-NOW-RUN-SCAN-INDEX).
 //   `/now`(contextNowInWorker)는 요청마다 «새 워커 프로세스»를 띄우므로 위 프로세스 캐시는 매번 빈 채로 시작한다
 //   (실측 2026-10-14: scanned=7893, cacheHits=0, 조회 6.3~8.9초). 색인은 파싱된 파일별 facts 를
-//   원장 옆에 (size, mtimeMs) 스탬프로 저장하고, 스탬프가 같으면 재사용한다. 원장에 무엇이 «붙으면»
-//   스탬프가 바뀌므로 무효화는 자동이다. 읽기 실패는 전부 fail-soft: 색인이 없으면 그냥 새로 읽는다.
+//   원장 옆에 (size, mtimeMs, ctimeMs) 스탬프로 저장하고, 스탬프가 같으면 재사용한다. 원장에 무엇이 «붙으면»
+//   스탬프가 바뀌므로 무효화는 자동이다 (같은 크기로 덮고 mtime 을 되돌려도 ctime 이 바뀐다). 읽기 실패는 전부 fail-soft: 색인이 없으면 그냥 새로 읽는다.
 const RUN_LEDGER_SCAN_INDEX_FILE = '.unfinished-scan-index.json';
-const RUN_LEDGER_SCAN_INDEX_VERSION = 1;
+const RUN_LEDGER_SCAN_INDEX_VERSION = 2;
 const RUN_LEDGER_SCAN_INDEX_LIMIT = 32_768;
 
 /** Where the persisted scan index lives: beside its ledgers, never mistaken for one (readdir filters canonical names). */
@@ -1700,6 +1700,7 @@ export function runLedgerScanIndexPath(dir: string): string {
 export interface RunLedgerScanIndexRecord {
   size: number;
   mtimeMs: number;
+  ctimeMs: number;
   facts: UnfinishedLedgerFacts;
 }
 
@@ -1726,7 +1727,7 @@ function isScanIndexFacts(value: unknown): value is UnfinishedLedgerFacts {
 function isScanIndexRecord(value: unknown): value is RunLedgerScanIndexRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
-  return Number.isFinite(record.size) && Number.isFinite(record.mtimeMs) && isScanIndexFacts(record.facts);
+  return Number.isFinite(record.size) && Number.isFinite(record.mtimeMs) && Number.isFinite(record.ctimeMs) && isScanIndexFacts(record.facts);
 }
 
 const scanIndexCache = new Map<string, { stamp: string; entries: Map<string, RunLedgerScanIndexRecord> }>();
@@ -1800,7 +1801,7 @@ function readUnfinishedLedgerFacts(
   const key = noCache ? null : unfinishedLedgerCacheKey(path, read);
   const stamp = noCache ? null : statSync(path);
   const cached = key === null ? undefined : unfinishedLedgerCache.get(key);
-  if (cached && stamp && key !== null && cached.size === stamp.size && cached.mtimeMs === stamp.mtimeMs) {
+  if (cached && stamp && key !== null && cached.size === stamp.size && cached.mtimeMs === stamp.mtimeMs && cached.ctimeMs === stamp.ctimeMs) {
     unfinishedLedgerCache.delete(key);
     unfinishedLedgerCache.set(key, cached);
     return { facts: cached.facts, hit: true, source: 'process' };
@@ -1810,8 +1811,8 @@ function readUnfinishedLedgerFacts(
   //   주입된 reader 는 실제 파일 내용과 무관한 대역이라 색인에 넣지 «도», 색인에서 읽지 «도» 않는다.
   if (index !== undefined && stamp && read === undefined) {
     const record = index.get(runId);
-    if (record && record.size === stamp.size && record.mtimeMs === stamp.mtimeMs) {
-      if (key !== null) unfinishedLedgerCache.set(key, { size: stamp.size, mtimeMs: stamp.mtimeMs, facts: record.facts });
+    if (record && record.size === stamp.size && record.mtimeMs === stamp.mtimeMs && record.ctimeMs === stamp.ctimeMs) {
+      if (key !== null) unfinishedLedgerCache.set(key, { size: stamp.size, mtimeMs: stamp.mtimeMs, ctimeMs: stamp.ctimeMs, facts: record.facts });
       return { facts: record.facts, hit: true, source: 'index' };
     }
   }
@@ -1821,13 +1822,14 @@ function readUnfinishedLedgerFacts(
     const facts = unfinishedLedgerFacts(ledger ?? []);
     if (stamp !== null && key !== null) {
       const after = statSync(path);
-      if (after.size === stamp.size && after.mtimeMs === stamp.mtimeMs) {
-        unfinishedLedgerCache.set(key, { size: stamp.size, mtimeMs: stamp.mtimeMs, facts });
+      if (after.size === stamp.size && after.mtimeMs === stamp.mtimeMs && after.ctimeMs === stamp.ctimeMs) {
+        unfinishedLedgerCache.set(key, { size: stamp.size, mtimeMs: stamp.mtimeMs, ctimeMs: stamp.ctimeMs, facts });
         if (unfinishedLedgerCache.size > UNFINISHED_LEDGER_CACHE_LIMIT) unfinishedLedgerCache.delete(unfinishedLedgerCache.keys().next().value!);
+        // Persist only facts read from a stable ledger; an append during the read must be retried next scan.
+        if (index !== undefined && read === undefined) index.set(runId, { size: stamp.size, mtimeMs: stamp.mtimeMs, ctimeMs: stamp.ctimeMs, facts });
+      } else {
+        index?.delete(runId);
       }
-    }
-    if (index !== undefined && stamp !== null && read === undefined) {
-      index.set(runId, { size: stamp.size, mtimeMs: stamp.mtimeMs, facts });
     }
     return { facts, hit: false, source: 'read' };
   } catch (error) {

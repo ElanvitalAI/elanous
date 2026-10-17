@@ -3,7 +3,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { POD_GITHUB_CREDENTIAL_TOKEN_ENV, POD_GITHUB_CREDENTIAL_URL_ENV } from '../nexus/api/pod-credential-api.js';
-import { ghAutomationEnv, defaultCmdRunner, makePrManager, extractPrNumber, resolveDeliverableBase, prBaseFromComparison, collectLandedCommitsOnBase, landingHistoryGitLogArgs, type CmdRunner, type CmdResult } from './pr-manager.js';
+import { ghAutomationEnv, defaultCmdRunner, makePrManager, configuredHunkOverlapMode, extractPrNumber, resolveDeliverableBase, prBaseFromComparison, collectLandedCommitsOnBase, landingHistoryGitLogArgs, type CmdRunner, type CmdResult } from './pr-manager.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE } from '../git-fs/worktree.js';
 import { debug } from '../debug/log.js';
 import { guardNewPr } from '../pr-tool/census.js';
@@ -205,6 +205,56 @@ describe('makePrManager.upsertPr — 기존 PR 재활용(대표 2026-07-12)', ()
     const result = makePrManager(run, () => ({ status: 'allow', reasons: [], warnings: [] })).upsertPr({ ...input, seat: 'UX' });
     expect(result).toMatchObject({ ok: true, reused: false });
     expect(calls.find(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toContain('seat:UX');
+  });
+
+  it('줄 겹침 경고(기본 warn)는 PR 을 막지 않고 pr-guard:hunk-overlap 라벨 ⊕ 관측 이벤트를 남긴다', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const { run, calls } = stubRunner({ 'pr list': { ok: true, out: '' }, 'pr create': { ok: true, out: 'https://github.com/o/r/pull/91' } });
+      const inventory = { status: 'checked' as const, prs: [{ number: 7, title: 't', draft: false, updatedAt: '2026-10-17T00:00:00Z', headSha: 'a', labels: [], files: ['src/a.ts'], seat: null, cellId: null, hunks: [{ path: 'src/a.ts', start: 10, end: 20 }] }] };
+      const guard = () => guardNewPr({ files: ['src/a.ts'], hunks: [{ path: 'src/a.ts', start: 15, end: 16 }] }, inventory);
+      const result = makePrManager(run, guard).upsertPr({ ...input, seat: 'UX' });
+      expect(result).toMatchObject({ ok: true, reused: false });
+      const create = calls.find(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create');
+      expect(create).toContain('pr-guard:hunk-overlap');
+      expect(log).toHaveBeenCalledWith('pr-tool.guard', 'hunk-overlap-warn', { pr: 91, files: ['src/a.ts'], against: [7] });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('줄 겹침 라벨 생성이 실패해도 라벨을 빼고 PR 을 연다', () => {
+    const calls: string[][] = [];
+    const run: CmdRunner = (cmd, args) => {
+      calls.push([cmd, ...args]);
+      const key = [cmd, ...args].join(' ');
+      if (key.includes('pr list')) return { ok: true, out: '' };
+      if (key.includes('label create')) return { ok: false, out: '', err: 'HTTP 403' };
+      if (key.includes('pr create')) {
+        return args.includes('pr-guard:hunk-overlap')
+          ? { ok: false, out: '', err: "could not add label: 'pr-guard:hunk-overlap' not found" }
+          : { ok: true, out: 'https://github.com/o/r/pull/92' };
+      }
+      return { ok: true, out: '' };
+    };
+    const guard = () => ({ status: 'allow' as const, reasons: [], warnings: [{ code: 'hunk-overlap' as const, detail: 'x', prs: [7], files: ['src/a.ts'] }] });
+    const result = makePrManager(run, guard).upsertPr(input);
+    expect(result).toMatchObject({ ok: true, url: 'https://github.com/o/r/pull/92', reused: false });
+    expect(calls.some(call => call[0] === 'gh' && call[1] === 'label' && call[2] === 'create' && call[3] === 'pr-guard:hunk-overlap')).toBe(true);
+  });
+
+  it('refuse 모드 줄 겹침은 옛 동작대로 PR 을 막는다', () => {
+    const { run, calls } = stubRunner({ 'pr list': { ok: true, out: '' } });
+    const inventory = { status: 'checked' as const, prs: [{ number: 7, title: 't', draft: false, updatedAt: '2026-10-17T00:00:00Z', headSha: 'a', labels: [], files: ['src/a.ts'], seat: null, cellId: null, hunks: [{ path: 'src/a.ts', start: 10, end: 20 }] }] };
+    const guard = () => guardNewPr({ files: ['src/a.ts'], hunks: [{ path: 'src/a.ts', start: 15, end: 16 }], hunkOverlap: 'refuse' }, inventory);
+    expect(makePrManager(run, guard).upsertPr(input)).toMatchObject({ ok: false, reason: 'guard', detail: expect.stringContaining('hunk-overlap') });
+    expect(calls.some(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toBe(false);
+  });
+
+  it('config prTool.hunkOverlap 은 refuse 만 옛 동작, 없거나 그 밖은 warn', () => {
+    expect(configuredHunkOverlapMode({})).toBe('warn');
+    expect(configuredHunkOverlapMode({ prTool: { hunkOverlap: 'refuse' } })).toBe('refuse');
+    expect(configuredHunkOverlapMode({ prTool: { hunkOverlap: 'block' } })).toBe('warn');
   });
 
   it('열린 PR 조회 불가 세 번은 unmeasured 라벨로 진행하고 네 번째는 새 PR을 차단한다', () => {

@@ -113,6 +113,11 @@ export class TaskNotificationQueue {
     return this.queue.length;
   }
 
+  /** Is this task's notification still queued (not yet drained into a turn)? */
+  has(taskId: string): boolean {
+    return this.queue.some((n) => n.taskId === taskId);
+  }
+
   /** Forget everything — tests use this for isolation. Listeners are
    *  preserved: clear() empties queue + seen, not the wake wiring. */
   clear(): void {

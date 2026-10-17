@@ -5,6 +5,7 @@
 import chalk from 'chalk';
 import { StringDecoder } from 'node:string_decoder';
 import { perf } from './perf-counters.js';
+import { noteInputLagKey, noteInputLagPaint } from './tui/input-lag-probe.js';
 import { debug } from './debug/log.js';
 
 // ── ANSI escape sequences ──
@@ -911,6 +912,7 @@ export function readKey(source: KeyTraceSource = 'main'): Promise<Key> {
       // split across chunk boundaries need a pending buffer that belongs
       // to this stream alone.
       const keys = _stdinParser.push(data);
+      if (keys.length > 0) noteInputLagKey(keys.length);
 
       // 2026-04-30 — also drain `_keyQueue` here so an `injectKey`
       // call that happened while `readKey` was already awaiting on
@@ -963,6 +965,7 @@ export function readKey(source: KeyTraceSource = 'main'): Promise<Key> {
  *  §8.6 — "(A) auto-Enter via injectKey" approach. */
 export function injectKey(key: Key): boolean {
   if (!_raw) return false;
+  noteInputLagKey();
   _keyQueue.push(key);
   _injectedKeys.add(key);
   // Wake any in-flight readKey awaiting on stdin by emitting an empty
@@ -1109,6 +1112,7 @@ export function render(lines: string[], opts: RenderOptions = {}): void {
   }
   perf.recordStdoutWrite(buf.length, true);
   perf.markDrawEnd();
+  noteInputLagPaint();
 
   _lastFrameLines = lines.slice(0, lineCount);
   _lastFrameRows = rows;

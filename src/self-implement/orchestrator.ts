@@ -155,6 +155,22 @@ import { AUTO_REVIEW_LABEL, resolveAutoReviewLabels } from './context-capsule.js
 import { GOAL_TYPES, extractVerbatimOriginalAsk, leadingGoalMetadata, parseAskFile, parseGoalType, type GoalType } from './goal-author.js';
 import { goalDocumentForReleaseNote, goalChecklistIds, prTitle } from './pr-title.js';
 export { goalChecklistIds, prTitle } from './pr-title.js';
+
+/** TA's card slot is carried by the Pod, independent of goal-author prose. */
+export function prChecklistLine(feature: string, goalFile?: string, slotId = process.env.ELANOUS_POD_SLOT_ID): string {
+  const slot = slotId?.trim();
+  if (slot && /^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$/.test(slot)) return `칸: ${slot}`;
+  const goalIds = goalChecklistIds(feature, goalFile);
+  return `칸: 미상\n골 ID: ${goalIds.join(' · ') || '없음'}`;
+}
+/** Preserve authored card lines as quoted prose; only the first line is machine readable. */
+function onePrChecklistLine(body: string): string {
+  let first = true;
+  return body.replace(/^칸:[^\n]*$/gm, (line) => {
+    if (first) { first = false; return line; }
+    return `> ${line}`;
+  });
+}
 import { renderRoundSummaryCard, type RoundSummaryEntry } from './round-summary-card.js';
 import { computeFlexSignals } from './flex-signals.js';
 import { resolveAdaptiveMaxReworkDecision, resolveEscalateTier, resolveEscalateTarget, buildReworkFeature, failIndicator, isRepeatedUnverifiedOnlyGateFailure, unverifiedRepeatKey, appendReworkHistory, truncateReworkHistoryByItem, applyReworkBudgetDecision, parseContractConflictRelaxation, parseReworkBudgetDecision, resolveReworkBudgetCarry, stripReworkBudgetHeaders, countConsecutiveMustFixIds, mergeReworkNotes, resolveReworkKind, type ReworkPlanRevision, type ReworkNotePart } from './rework-policy.js';
@@ -2305,7 +2321,7 @@ export interface SelfImplementResult {
   /** Additive hard-cap disposition; outcome remains the stable public terminal contract. */
   salvage?: 'launched' | 'parked';
   /** Rework stopped on exclusively baseline/flaky/precondition failures; do not retry this goal against the same base. */
-  terminationReason?: 'blocked-by-baseline';
+  terminationReason?: 'blocked-by-baseline' | 'goal-only-rework-exhausted';
   sessionId?: string;
   worktreePath?: string;
   branch?: string;
@@ -2615,13 +2631,13 @@ export function gateNotRunSection(gateLog?: string): string[] {
   return lines.length ? ['', '## Gate · 안 돈 소비자 시험(상한 초과)', ...lines.map((line) => `- ${line.replace(/^⚠️ caller test cap exceeded — not run: /, '')}`)] : [];
 }
 
-function prBody(feature: string, implSummary: string, gateLog?: string, review?: SelfImplementReview, reviewIntent?: string, autoReviewDeclineReasons?: readonly string[], evidence?: string, goalFile?: string, planRevision?: ReworkPlanRevision, releaseNote?: ReturnType<typeof harnessReleaseNote>, revertGuard?: RevertGuardResult): string {
+export function prBody(feature: string, implSummary: string, gateLog?: string, review?: SelfImplementReview, reviewIntent?: string, autoReviewDeclineReasons?: readonly string[], evidence?: string, goalFile?: string, planRevision?: ReworkPlanRevision, releaseNote?: ReturnType<typeof harnessReleaseNote>, revertGuard?: RevertGuardResult): string {
   const note = releaseNote ?? releaseNoteForRun(goalFile, feature);
   const relaxation = planRevision?.relaxation
     ? ['', '## 감독 수용 기준 완화', `- 대상: ${planRevision.relaxation.target}`, `- 이전: ${planRevision.relaxation.expected}`, `- 완화: ${planRevision.relaxation.replacement}`, `- 이유: ${planRevision.reason}`, `- 적용: ${planRevision.application?.status ?? 'failed'}${planRevision.application?.detail ? ` (${planRevision.application.detail})` : ''}`, ...(planRevision.disposition ? [`- 충돌 처분: ${planRevision.disposition}`] : [])]
     : [];
-  return [
-    `칸: ${goalChecklistIds(feature, goalFile).join(' · ') || '없음'}`,
+  return onePrChecklistLine([
+    prChecklistLine(feature, goalFile),
     '## 요청',
     ...(goalFile ? [`- 골 파일: ${formatGoalFileForPrBody(goalFile)}`] : []),
     feature.trim(),
@@ -2650,7 +2666,7 @@ function prBody(feature: string, implSummary: string, gateLog?: string, review?:
     ...relaxation,
     '',
     '🤖 self-implement 오케스트레이터 (elanous 자율 구현·리뷰-게이트 병합)',
-  ].join('\n');
+  ].join('\n'));
 }
 
 /**
@@ -2838,8 +2854,8 @@ export function formatBlockedDraftClassificationSection(
 }
 
 function blockedDraftPrBody(feature: string, implSummary: string, state: BlockedDraftPrState, goalFile?: string): string {
-  return [
-    `칸: ${goalChecklistIds(feature, goalFile).join(' · ') || '없음'}`,
+  return onePrChecklistLine([
+    prChecklistLine(feature, goalFile),
     BLOCKED_DRAFT_PR_HUMAN_JUDGMENT_ANCHOR,
     state.salvageStatusExpected
       ? BLOCKED_DRAFT_PR_SALVAGE_STATUS_INSTRUCTION
@@ -2886,8 +2902,10 @@ function blockedDraftPrBody(feature: string, implSummary: string, state: Blocked
       : [`- passed: ${state.typecheck.passed}`, ...(state.typecheck.log ? ['```', state.typecheck.log.trim().slice(0, 3000), '```'] : [])]),
     ...(state.review?.mustFix.length ? ['', '## 마지막 리뷰 must-fix', ...state.review.mustFix.map((item) => `- ${item}`)] : []),
     '',
-    prBody(feature, implSummary, undefined, state.review, undefined, undefined, undefined, goalFile, state.planRevision),
-  ].join('\n');
+    // The blocked body already carries the card line above; keep exactly one machine-readable line.
+    prBody(feature, implSummary, undefined, state.review, undefined, undefined, undefined, goalFile, state.planRevision)
+      .replace(/^칸: [^\n]*\n/, ''),
+  ].join('\n'));
 }
 
 type PreparedPrBody = {
@@ -5583,6 +5601,9 @@ async function runSelfImplementInner(
     };
   }
   let round = 0;
+  // A goal-only retry spends its one allowance for this run even if a later
+  // gate/review round removes the target diff and reaches the same disposition.
+  let goalOnlyReworkUsed = false;
   // PR이 열리기 전에 프로세스가 죽으면 PR 자체가 없으므로 잃을 대화도 없다. 따라서 파일로 영속화하지 않는다.
   const prCommentBuffer: string[] = [];
   // GitHub PR comment bodies are bounded; retain the RFC header and disclose omitted source rather than losing the whole record.
@@ -6948,6 +6969,75 @@ async function runSelfImplementInner(
     // ⭐ 성공 경로에서도 닫는다 — 이 호출은 끝났고, 이후 자식이 늦게 보내는 입력은
     //   「이 라운드의 재투입」이 아니다(다음 라운드는 자기 콜백을 새로 만든다).
     closeSupervisorInput();
+    // A child that actually worked and declared completion may still leave only the
+    // harness-seeded goal document. Give it one actionable implementation retry before
+    // the blocked-artifact path reaches the goal-only PR guard.
+    let goalOnlyReworkExhausted = false;
+    if (!impl.ok && impl.completionDisposition === 'completed-without-changes'
+      && impl.terminalStatus?.reached === true && impl.terminalStatus.timedOut === false
+      && !goalOnlyReworkUsed && round < effectiveMax && !hasCurrentProviderError() && !hasCurrentCredentialFailure()
+      && opts.goalFile) {
+      let targets: readonly string[] | undefined;
+      let goalDocument: string | undefined;
+      try {
+        goalDocument = readFileSync(opts.goalFile, 'utf8');
+        const declared = declaredPathsFromGoalDocumentText(goalDocument);
+        if (declared.readable && declared.paths.length > 0) targets = declared.paths;
+      } catch { /* unreadable scope is not grounds for an automatic retry */ }
+      let before: readonly string[] | undefined;
+      try { before = (s.changedFilesForGateRoute ?? changedFiles)(wt.path); } catch { /* unknown diff */ }
+      if (targets && goalDocument && before !== undefined) {
+        const eligible = (files: readonly string[]): string[] => files.filter(path =>
+          !harnessSeededPaths.includes(path) && !isHarnessTempArtifact(path)
+          && targets!.some(target => changedFileIsInsideDeclaredTarget(path, target)));
+        if (eligible(before).length === 0) {
+          goalOnlyReworkUsed = true;
+          const firstToolCalls = impl.toolCalls ?? null;
+          const retryRound = round + 1;
+          const retryNote = [
+            '[구현 재작업 · completed-without-changes]',
+            `대상 경로: ${targets.join(' · ')}`,
+            '원래 골의 완료 경계를 위 대상 경로에 구현하라. 해당 파일에 실제 변경을 남기고 바꾼 경로와 검증 결과를 RESULT: 한 줄에 적어라.',
+            '직전 자식은 완료를 선언했지만 대상 변경이 0개였다. 원래 골의 요구와 완료 경계를 다시 읽고 그 구현에 집중하라.',
+            '원래 골 문서(완료 경계 포함):',
+            goalDocument,
+          ].join('\n');
+          observe('implementation-goal-only-rework', { status: 'started', round: retryRound, targets, firstToolCalls, targetDiffCount: 0 });
+          progress('implementing', `대상 변경 0 — 구현 재작업 ${retryRound} 시작`);
+          onNodeEntry(node('rework'), retryRound);
+          onNodeEntry(node('implement'), retryRound);
+          const retryAbort = new AbortController();
+          const first = impl;
+          try {
+            impl = await stepTimeout(s.implement({
+              sessionId, cwd: wt.path, feature: `${feature}\n\n${retryNote}`, runId, shardIdentity,
+              signal: retryAbort.signal,
+              ...(harnessSeededPaths.length ? { harnessSeededPaths } : {}),
+              onSurfaceProgress: line => progress('implementing', line.trimEnd()),
+              roundContext: { round: retryRound, effectiveMax, previousRoundFailure: retryNote },
+              ...(opts.childLlm ? { childLlm: opts.childLlm } : {}),
+              ...(opts.documentReferences ? { documentReferences: opts.documentReferences } : {}),
+            }), T.implement, 'implement');
+          } catch (error) {
+            retryAbort.abort();
+            impl = { ok: false, summary: `goal-only-rework-exhausted: ${safeErrorDescription(error)}`, completionDisposition: first.completionDisposition };
+          }
+          let after: readonly string[] | undefined;
+          try { after = (s.changedFilesForGateRoute ?? changedFiles)(wt.path); } catch { /* unknown diff */ }
+          const targetDiff = after === undefined ? undefined : eligible(after);
+          const resultLine = /(?:^|\n)\s*RESULT:\s*\S/m.test(impl.evidenceTranscript ?? impl.summary);
+          const succeeded = impl.ok && !!targetDiff?.length && resultLine;
+          goalOnlyReworkExhausted = !succeeded;
+          observe('implementation-goal-only-rework', {
+            status: succeeded ? 'succeeded' : 'exhausted', round: retryRound, targets,
+            firstToolCalls, retryToolCalls: impl.toolCalls ?? null,
+            targetDiffCount: targetDiff?.length ?? null, diffMeasured: after !== undefined, resultLine,
+          }, succeeded ? {} : { level: 'warn' });
+          if (!succeeded) impl = { ...impl, ok: false, summary: `goal-only-rework-exhausted: ${impl.summary}` };
+          round = retryRound;
+        }
+      }
+    }
     // A finished child can leave edits without a commit. Measure them before any
     // diff/no-changes classification, and commit only paths declared in the goal.
     finishedChildCommitMissing = false;
@@ -7121,7 +7211,7 @@ async function runSelfImplementInner(
         toolCalls: impl.toolCalls ?? null,
       });
       progress('aborted', progressLine);
-      const pr = await preserveBlockedArtifacts({
+      const pr = goalOnlyReworkExhausted ? undefined : await preserveBlockedArtifacts({
         stage: 'aborted',
         reason: abort.reason,
         childSummary: abort.childSummary,
@@ -7132,7 +7222,7 @@ async function runSelfImplementInner(
         salvageStatusExpected: false,
         ...(abort.terminalStatus ? { terminalStatus: abort.terminalStatus } : {}),
       });
-      return { ok: false, stage: 'aborted', node: 'implement', ...resolveRunOutcome({ termination: 'abandoned' }), sessionId, worktreePath: wt.path, branch: wt.branch, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(impl.completionDisposition ? { completionDisposition: impl.completionDisposition } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: impl.summary };
+      return { ok: false, stage: 'aborted', node: 'implement', ...resolveRunOutcome({ termination: 'abandoned' }), ...(goalOnlyReworkExhausted ? { terminationReason: 'goal-only-rework-exhausted' as const } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(impl.completionDisposition ? { completionDisposition: impl.completionDisposition } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: impl.summary };
     }
 
     if (finishedChildCommitMissing) {

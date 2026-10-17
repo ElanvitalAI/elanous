@@ -6,6 +6,7 @@ import { accessSync, constants as fsConstants, existsSync, lstatSync, readFileSy
 import type { SelfDevRunParticipant, SelfDevRunState } from './self-dev/run-store.js';
 import { applyConfigDirFlagFromArgv } from './cli/config-dir-flag.js';
 import { LOGS_SINCE_OPTION, registerLogsCommands } from './cli/logs-cli.js';
+import { registerSimCommands } from './cli/sim-cli.js';
 import { registerDocsCommands } from './cli/docs-cli.js';
 import { registerBenchCommands } from './cli/bench-cli.js';
 import { registerRetroCommands } from './cli/retro-cli.js';
@@ -4370,7 +4371,7 @@ selfCmd
       }
     };
     try {
-      const { dispatchHeavyCheck } = await import('./self-implement/gate-remote.js');
+      const { dispatchHeavyCheck, remoteSelfGateArgv } = await import('./self-implement/gate-remote.js');
       const { runGitCommand } = await import('./git-fs/runner.js');
       const topLevel = runGitCommand(process.cwd(), ['rev-parse', '--show-toplevel'], { encoding: 'utf8' });
       if (topLevel.status !== 0) throw new Error(`git rev-parse --show-toplevel failed: ${topLevel.stderr.trim() || `rc=${topLevel.status}`}`);
@@ -4389,13 +4390,13 @@ selfCmd
         const { remoteCommitSupportsArtifactDir, newRemoteArtifactDir } = await import('./self-implement/gate-artifacts.js');
         remoteArtifacts = remoteCommitSupportsArtifactDir(repo) ? { dir: newRemoteArtifactDir() } : { unsupported: true };
       }
-      const remoteArtifactArgs = remoteArtifacts && 'dir' in remoteArtifacts ? ['--artifact-dir', remoteArtifacts.dir] : [];
       // origin/main is pinned to this machine's origin/main on the host; any other base is passed as its resolved sha.
-      const remoteArgv = (sha: (ref: string) => string) => ['bun', 'bin/elanous.mjs', 'self', 'gate', '--local', ...(opts.changed ? ['--changed'] : []),
-        ...(opts.base ? ['--base', opts.base === 'origin/main' ? opts.base : sha(opts.base)] : []), ...(shards !== undefined ? ['--shards', String(shards)] : []),
+      const remoteArgv = (sha: (ref: string) => string) => remoteSelfGateArgv({
+        changed: opts.changed, base: opts.base, shards, fixedShardDistribution: opts.fixedShardDistribution,
+        includeImporters: opts.includeImporters,
         // A measured commit without this option rejects it (exit ≠ 0) — read as not passed, never as a silent measured run.
-        ...(opts.fixedShardDistribution ? ['--fixed-shard-distribution'] : []),
-        ...(opts.includeImporters ? ['--include-importers'] : []), ...remoteArtifactArgs];
+        artifactDir: remoteArtifacts && 'dir' in remoteArtifacts ? remoteArtifacts.dir : undefined,
+      }, sha);
       const { gateHostReservationRoot } = await import('./release-loop/gate-host-reservation.js');
       process.exitCode = await dispatchHeavyCheck({
         tool: 'self-gate', repo, installPwa: true, remoteArgv, refs: opts.base ? [opts.base] : [], reservationRoot: gateHostReservationRoot(),
@@ -6175,6 +6176,7 @@ async function loadJevAccessOrExit(): Promise<import('./decide/jev.js').JevAcces
 registerIntakeCommands(program);
 
 registerLogsCommands(program);
+registerSimCommands(program);
 
 // ── ad (marketing-ad pipeline entrance) ──
 /** ⛔ 「있다」와 「읽을 수 있는 파일이다」는 다른 값 — 디렉토리·권한 없는 파일을 실사로 읽지 않는다. */

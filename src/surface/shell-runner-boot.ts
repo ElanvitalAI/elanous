@@ -7,7 +7,7 @@ interface BackgroundSurfaceLike<Handle> {
 
 export interface DashboardShellRunnerBootDeps<Handle> {
   createBackgroundSurface: (deps: {
-    onUpdate: (rollup: { running: number; backgrounded: number }) => void;
+    onUpdate: (rollup: { running: number; backgrounded: number; background: number }) => void;
   }) => BackgroundSurfaceLike<Handle>;
   initShellRegistry: (deps: {
     onRegister: (handle: Handle) => void;
@@ -19,7 +19,7 @@ export interface DashboardShellRunnerBootDeps<Handle> {
     registry: ShellRegistryLike<Handle>;
     fileEngine?: unknown;
   }): void;
-  setLatestShellRollup: (rollup: { running: number; backgrounded: number }) => void;
+  setLatestShellRollup: (rollup: { running: number; backgrounded: number; background: number }) => void;
 }
 
 export function bootDashboardShellRunner<Handle>(
@@ -30,6 +30,9 @@ export function bootDashboardShellRunner<Handle>(
       deps.setLatestShellRollup({
         running: rollup.running,
         backgrounded: rollup.backgrounded,
+        // TUI-BG-JOB-VISIBILITY — turn-outliving jobs (bg mode ⊕ backgrounded).
+        //   Required: guessing it from `backgrounded` would under-count running bg-mode jobs.
+        background: rollup.background,
       });
     },
   });

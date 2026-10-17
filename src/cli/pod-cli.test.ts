@@ -53,6 +53,26 @@ describe('elanous pod lease status', () => {
     await program.parseAsync(['pod', 'lease', 'status', ...(json ? ['--json'] : [])], { from: 'user' });
     return cap;
   };
+  test('GitHub egress is opt-in and cannot change the admission result', async () => {
+    const results: Record<string, unknown>[] = [];
+    let probes = 0;
+    for (const enabled of [false, true]) {
+      const cap = capture(); const program = new Command(); program.exitOverride();
+      registerPodCommands(program, { io: cap.io, kubectl, dns: () => 'ready', accounts: () => 10,
+        perAccount: () => 4, poolSpec: () => 'node-b:20', externalGitHub: () => {
+          probes++;
+          return { externalDns: false, githubHttps: null, measuredAt: '2026-10-16T12:00:00Z', reason: 'external DNS failed' };
+        } });
+      await program.parseAsync(['pod', 'lease', 'status', '--json', ...(enabled ? ['--github-egress'] : [])], { from: 'user' });
+      expect(cap.code()).toBe(0);
+      results.push(JSON.parse(cap.lines[0]!));
+    }
+    expect(probes).toBe(1);
+    expect(results[0]).not.toHaveProperty('externalGitHub');
+    expect(results[1]).toMatchObject({ externalGitHub: { node-b: { externalDns: false, githubHttps: null, reason: 'external DNS failed' } } });
+    expect(results[1]!.recommended).toBe(results[0]!.recommended);
+    expect(results[1]!.limitedBy).toBe(results[0]!.limitedBy);
+  });
   test('status separates authoring reservations, waiting Jobs, and Running Pods', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'pod-lease-status-'));
     const previous = process.env.ELANOUS_POD_LEASE_DIR;

@@ -276,3 +276,42 @@ export const AGENT_MISSION_STATE_RULES: readonly StateRule[] = [
     match: { kind: 'lineRegex', re: /^\s*[❯›](\s|$)|▌/ },
   },
 ];
+
+// ── 자기보고 턴 ⊕ 화면 추정 정합 (H10 조각 1 · TUI-H10-HEALTH-REPORT) ──
+//
+// 🩸 10-16 실측: 같은 `eln pty state opt` 가 `state=working`(화면 추정 — 스크롤백에 남은 «· Streaming… (5s · esc 중단)»
+//   줄을 `elanous-tui-turn-in-progress` 가 물었다)과 `turn=idle`(TUI 가 스스로 적은 값)을 «동시에» 냈다(#55 이원 판정).
+//   OP·TF 는 둘 중 무엇을 믿을지 몰라 herdr 화면을 긁었다.
+// ⇒ 원천은 하나다: TUI 가 스스로 적은 턴(`tui-run-state` → manifest)이 있으면 그것이 «바쁜가/한가한가»를 정한다.
+//   화면 추정은 턴 값이 «모를 때»와, 턴과 모순되지 않는 «더 구체적인» 상태(승인 대기 blocked·waiting·done)일 때만 쓴다.
+//   ⛔ 화면 추정은 버리지 않는다 — `screenState` 로 같이 내서 둘이 갈린 순간이 관측에 남게 한다.
+
+/** TUI 가 스스로 적은 턴(manifest `turnState`). 'unknown' = 기록 없음·죽은 행. */
+export type SelfReportedTurn = 'busy' | 'idle' | 'unknown';
+
+export interface ReconciledFrameState {
+  /** 바깥에 내는 하나의 상태. */
+  readonly state: FrameState;
+  /** 'turn' = 자기보고 턴이 정했다(화면과 같았던 경우 포함) · 'screen' = 화면 추정을 그대로 썼다. */
+  readonly source: 'turn' | 'screen';
+  /** 화면 분류 원값(화면을 못 읽었으면 'unknown'). */
+  readonly screenState: FrameState;
+  /** 화면 추정이 턴과 «모순»돼 턴이 덮어썼나 — 관측 이벤트를 남길 자리. */
+  readonly overridden: boolean;
+}
+
+/**
+ * 화면 추정과 자기보고 턴을 하나로 접는다(순수).
+ * - turn=busy: 화면 blocked·waiting 은 «턴 안의 더 구체적인 상태»라 유지, 그 밖(idle·unknown·done·working)은 working.
+ * - turn=idle: 화면 blocked·waiting·done 은 유지(한가할 때 뜨는 선택 UI 등), working·unknown 은 idle.
+ * - turn=unknown: 화면 추정 그대로.
+ */
+export function reconcileFrameStateWithTurn(screenState: FrameState, turn: SelfReportedTurn): ReconciledFrameState {
+  if (turn === 'unknown') return { state: screenState, source: 'screen', screenState, overridden: false };
+  if (turn === 'busy') {
+    if (screenState === 'blocked' || screenState === 'waiting') return { state: screenState, source: 'screen', screenState, overridden: false };
+    return { state: 'working', source: 'turn', screenState, overridden: screenState !== 'working' && screenState !== 'unknown' };
+  }
+  if (screenState === 'blocked' || screenState === 'waiting' || screenState === 'done') return { state: screenState, source: 'screen', screenState, overridden: false };
+  return { state: 'idle', source: 'turn', screenState, overridden: screenState === 'working' };
+}

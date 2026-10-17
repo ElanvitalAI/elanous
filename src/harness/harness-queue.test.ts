@@ -610,6 +610,44 @@ test('queue tick counts a parent and child as one active run by runId or launch-
   }
 });
 
+test('GATE-RESERVE shadow measures active, inactive and unavailable gates without changing approval or ledger rows', async () => {
+  const results: Array<{ outcome: string; reason: string; rows: Array<{ input: string; status: string; waitingReason?: string }> }> = [];
+  for (const active of [true, false, null]) {
+    const detect = () => { if (active === null) throw Error('probe unavailable'); return active; };
+    const dir = root(), launches: string[][] = [], events: Record<string, unknown>[] = [];
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify({ loops: { orchestrator: { releaseGate: { TC: 2 } } } }));
+    const deps: HarnessQueueDeps = { ...fixture(dir, launches), configPath, cap: undefined, releaseGateActive: detect,
+      processes: () => [{ pid: 71, seat: 'TC' }],
+      log: () => {} };
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      if (category === 'harness.queue' && event === 'gate-reserve-shadow') {
+        events.push(data as Record<string, unknown>);
+        if (active === null) throw Error('shadow log unavailable');
+      }
+    }) as typeof debug.log;
+    try {
+      await addHarnessQueue({ seat: 'TC', say: 'one' }, deps);
+      await addHarnessQueue({ seat: 'TC', say: 'two' }, deps);
+      const launched = await tickHarnessQueue(deps);
+      const waiting = await tickHarnessQueue(deps);
+      await Promise.resolve(); // The shadow log is emitted after the approval path has progressed.
+      expect(launched.outcome).toBe('launched');
+      expect(waiting).toMatchObject({ outcome: 'waiting', reason: 'seat TC: 2/2 (releaseGate.TC=2 · seatCaps.TC=8)' });
+      expect(launches).toHaveLength(1);
+      expect(events).toEqual([
+        { seat: 'TC', active: active === true, wouldCap: active === true ? 1 : 2, cap: 2, running: 1 },
+        { seat: 'TC', active: active === true, wouldCap: active === true ? 1 : 2, cap: 2, running: 2 },
+      ]);
+      results.push({ outcome: waiting.outcome, reason: waiting.reason,
+        rows: listHarnessQueue(deps).map(({ input, status, waitingReason }) => ({ input, status, waitingReason })) });
+    } finally { (debug as { log: typeof debug.log }).log = original; }
+  }
+  expect(results[1]).toEqual(results[0]);
+  expect(results[2]).toEqual(results[0]);
+});
+
 test('release gate charges running processes from the seat inventory before queue launch', async () => {
   const dir = root(), launches: string[][] = [];
   const deps = { ...fixture(dir, launches, { running: 0, pending: 0, reserved: 0, limit: 32 }), cap: () => 8,

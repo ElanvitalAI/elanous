@@ -2,9 +2,11 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { join, resolve, sep } from 'node:path';
+import { basename, dirname, join, parse, relative, resolve, sep } from 'node:path';
 import { warmReferenceFromJobArtifacts } from '../../../scripts/release-loop/gate-warm-artifacts.js';
 import { stateDirSourceForChild } from '../../agent/identity-env.js';
+import { debug } from '../../debug/log.js';
+import { decidePodReuseCleanup } from './pod-reuse-cleanup.js';
 import type { WarmWorkerCommand, WarmWorkerFileResult, WarmWorkerReply } from './pod-warm-worker-protocol.js';
 
 const token = (s: unknown): s is string => typeof s === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(s);
@@ -22,6 +24,76 @@ const withoutGitEnvironment = (): NodeJS.ProcessEnv => {
   return env;
 };
 
+function resolveThroughExistingAncestor(path: string): string | null {
+  let ancestor = resolve(path);
+  const suffix: string[] = [];
+  for (;;) {
+    try { return join(realpathSync(ancestor), ...suffix); }
+    catch {
+      const parent = dirname(ancestor);
+      if (parent === ancestor) return null;
+      suffix.unshift(basename(ancestor));
+      ancestor = parent;
+    }
+  }
+}
+
+function hasCheckoutLocalSymlink(repoDir: string, path: string): boolean {
+  if (path.split(sep).includes('..')) return true;
+  const absolute = resolve(path);
+  let current = parse(absolute).root;
+  for (const part of absolute.slice(current.length).split(sep).filter(Boolean)) {
+    current = join(current, part);
+    try {
+      if (!lstatSync(current).isSymbolicLink()) continue;
+      const physicalParent = resolveThroughExistingAncestor(dirname(current));
+      if (!physicalParent) continue;
+      const physicalLink = join(physicalParent, basename(current));
+      if (physicalLink === repoDir || physicalLink.startsWith(`${repoDir}${sep}`)) return true;
+    } catch { return false; }
+  }
+  return false;
+}
+
+function runtimeDirectoryExclusions(repoDir: string, repoLexicalDir: string, directories: readonly { name: string; path: string }[]) {
+  const additionalCleanExclusions: Array<{ name: string; pattern: string }> = [];
+  const statusExclusions = new Set<string>();
+  for (const directory of directories) {
+    const lexical = resolve(directory.path);
+    if (hasCheckoutLocalSymlink(repoDir, directory.path)) return null;
+    const candidates = new Set([lexical]);
+    const resolvedThroughAncestor = resolveThroughExistingAncestor(directory.path);
+    if (resolvedThroughAncestor) candidates.add(resolvedThroughAncestor);
+    for (const candidate of candidates) {
+      const root = candidate.startsWith(`${repoDir}${sep}`) ? repoDir
+        : candidate.startsWith(`${repoLexicalDir}${sep}`) ? repoLexicalDir : null;
+      if (candidate === repoDir || candidate === repoLexicalDir) return null;
+      if (!root) continue;
+      const path = relative(root, candidate).split(sep).join('/');
+      if (!path || path === '..' || path.startsWith('../')) return null;
+      const escaped = path.replace(/[\\*?\[\]]/g, '\\$&');
+      const pattern = `/${escaped}/`;
+      if (!additionalCleanExclusions.some(item => item.pattern === pattern)) {
+        additionalCleanExclusions.push({ name: directory.name, pattern });
+      }
+      statusExclusions.add(path);
+    }
+  }
+  return { additionalCleanExclusions, statusExclusions: [...statusExclusions] };
+}
+
+function remainingGitStatusPaths(statusPorcelainZ: string): string[] {
+  const records = statusPorcelainZ.split('\0').filter(Boolean);
+  const paths: string[] = [];
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i]!;
+    if (!/^[ MADRCU?!][ MADRCU?!] /.test(record)) continue;
+    paths.push(record.slice(3));
+    if (/[RC]/.test(record.slice(0, 2))) i++;
+  }
+  return paths;
+}
+
 export interface WarmWorkerRunFile {
   file: string;
   cutSha: string;
@@ -33,6 +105,7 @@ export interface WarmWorkerRunFile {
   deadlineAt: number;
 }
 export type WarmWorkerFileRunner = (request: WarmWorkerRunFile) => Promise<number>;
+type WarmWorkerGitResult = { status: number | null; stdout?: string | null };
 
 /** Recheck the source bytes before every request, not only at Pod init. */
 export function warmWorkerSourceMatches(repoDir: string, cutSha: string, lockHash: string): boolean {
@@ -71,12 +144,13 @@ export class WarmWorkerRuntime {
     artifactsRoot: string;
     workerId: string;
     runFile: WarmWorkerFileRunner;
+    runGit?: (args: readonly string[]) => WarmWorkerGitResult;
     removeScratch?: (path: string) => void;
     now?: () => number;
   }) {}
 
   handle(command: WarmWorkerCommand): Promise<WarmWorkerOutcome> {
-    const next = this.tail.then(() => this.execute(command)).catch((): WarmWorkerOutcome => {
+    const next = this.tail.then(() => this.execute(command)).catch((error): WarmWorkerOutcome => {
       this.quarantined = true;
       return { reply: null, quarantineWorker: true, reason: 'execution-error' };
     });
@@ -131,6 +205,18 @@ export class WarmWorkerRuntime {
     if (!artifactsDir.startsWith(`${artifactsRoot}${sep}`) || existsSync(artifactsDir)) {
       return { reply: null, quarantineWorker: false, reason: 'invalid-command' };
     }
+    const runtimeExclusions = runtimeDirectoryExclusions(repo, resolve(this.options.repoDir), [
+      { name: 'worker scratch directory', path: this.options.scratchDir },
+      { name: 'worker artifacts directory', path: artifactsRoot },
+    ]);
+    if (!runtimeExclusions) {
+      this.quarantined = true;
+      try { debug.log('pod.reuse', 'clean-failed', {
+        runId: command.runId, attemptId: command.attemptId, workerId: command.workerId,
+        reason: 'unsafe-runtime-directory', remainingPaths: [],
+      }, { level: 'warn' }); } catch { /* observation cannot revive an unsafe worker */ }
+      return { reply: null, quarantineWorker: true, reason: 'cleanup-failed', artifactsDir };
+    }
     mkdirSync(this.options.scratchDir, { recursive: true });
     mkdirSync(artifactsRoot, { recursive: true });
     mkdirSync(artifactsDir, { recursive: true, mode: 0o700 });
@@ -180,6 +266,74 @@ export class WarmWorkerRuntime {
       if (reason !== 'complete') break;
     }
     if (now() >= command.deadlineAt) reason = 'execution-error';
+    const sourceMatchedBeforeCleanup = warmWorkerSourceMatches(repo, command.cutSha, command.key.lockHash);
+    // A worker accepts another request only after restoring the pinned source and removing prior-request artifacts.
+    const cleanupPlan = decidePodReuseCleanup({
+      base: command.cutSha,
+      resetExitCode: 0,
+      cleanExitCode: 0,
+      statusExitCode: 0,
+      statusPorcelain: '',
+      ...runtimeExclusions,
+    });
+    const git = (args: readonly string[]): WarmWorkerGitResult => {
+      try {
+        return this.options.runGit?.(args) ?? spawnSync('git', [...args], {
+          cwd: repo, encoding: 'utf8', env: withoutGitEnvironment(), maxBuffer: 16 * 1024 * 1024,
+        });
+      } catch {
+        return { status: null, stdout: null };
+      }
+    };
+    const rootMatches = () => {
+      const top = git(['rev-parse', '--show-toplevel']);
+      if (top.status !== 0 || !top.stdout?.trim()) return false;
+      try { return realpathSync(top.stdout.trim()) === repo; } catch { return false; }
+    };
+    const discard = (reason: string, remainingPaths: readonly string[] = []): WarmWorkerOutcome => {
+      this.quarantined = true;
+      try { debug.log('pod.reuse', 'clean-failed', {
+        runId: command.runId,
+        attemptId: command.attemptId,
+        workerId: command.workerId,
+        reason,
+        remainingPaths: remainingPaths.slice(0, 5),
+      }, { level: 'warn' }); } catch { /* observation cannot revive an unsafe worker */ }
+      return { reply: null, quarantineWorker: true, reason: 'cleanup-failed', artifactsDir };
+    };
+    if (!rootMatches()) return discard('checkout-root-mismatch');
+    const reset = git(cleanupPlan.resetArgs);
+    if (reset.status !== 0) {
+      const failed = decidePodReuseCleanup({ base: command.cutSha, resetExitCode: reset.status,
+        cleanExitCode: null, statusExitCode: null, statusPorcelain: '', ...runtimeExclusions });
+      return discard(failed.reason ?? 'reset-failed');
+    }
+    if (!rootMatches()) return discard('checkout-root-mismatch');
+    const clean = git(cleanupPlan.cleanArgs);
+    if (clean.status !== 0) {
+      const failed = decidePodReuseCleanup({ base: command.cutSha, resetExitCode: 0,
+        cleanExitCode: clean.status, statusExitCode: null, statusPorcelain: '', ...runtimeExclusions });
+      return discard(failed.reason ?? 'clean-failed');
+    }
+    if (!rootMatches()) return discard('checkout-root-mismatch');
+    const status = git(cleanupPlan.statusArgs);
+    if (status.status === 0 && typeof status.stdout !== 'string') return discard('status-output-missing');
+    const cleanup = decidePodReuseCleanup({
+      base: command.cutSha,
+      resetExitCode: reset.status,
+      cleanExitCode: clean.status,
+      statusExitCode: status.status,
+      statusPorcelain: status.stdout ?? '',
+      remainingPaths: remainingGitStatusPaths(status.stdout ?? ''),
+      ...runtimeExclusions,
+    });
+    if (cleanup.outcome === 'discard') {
+      return discard(cleanup.reason ?? 'unknown', cleanup.remainingPaths);
+    }
+    if (!sourceMatchedBeforeCleanup) {
+      this.quarantined = true;
+      return { reply: null, quarantineWorker: true, reason: 'quarantined', artifactsDir };
+    }
     if (reason !== 'complete') this.quarantined = true;
     if (reason !== 'complete' || files.length !== command.files.length) return { reply: null, quarantineWorker: true, reason, artifactsDir };
     if (!warmWorkerSourceMatches(repo, command.cutSha, command.key.lockHash)) {

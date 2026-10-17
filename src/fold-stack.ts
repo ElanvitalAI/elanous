@@ -216,8 +216,9 @@ export class FoldStack {
   /** Toggle the latest-pushed static target whose range contains
    *  `lineIndex`. Returns true when a target was toggled, false
    *  when none contained the line (live targets are never chosen).
-   *  Reuses the single-target splice/cascade path. */
-  toggleAtLine(lineIndex: number): boolean {
+   *  Reuses the single-target splice/cascade path. `logContext` (the
+   *  click's screen frame) is merged into the expanded/recollapsed line. */
+  toggleAtLine(lineIndex: number, logContext: Record<string, unknown> = {}): boolean {
     const t = this.findLatestStaticContaining(lineIndex);
     if (!t) {
       this.logToggleAtLineMiss(lineIndex);
@@ -236,6 +237,7 @@ export class FoldStack {
         lineIndex,
         lineStart,
         lineEnd,
+        ...logContext,
       });
     }
     return toggled;

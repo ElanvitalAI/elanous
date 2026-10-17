@@ -19,7 +19,6 @@ describe('essential catalog exposes persistent grounding', () => {
       userText: '아무 문장',
       hostTools: [],
       runtimeTools: [runtimeStub('persistent_grounding', 'PersistentGrounding')],
-      rich: false,
     }).map(spec => spec.name);
 
     expect(names).toContain('PersistentGrounding');
@@ -30,7 +29,6 @@ describe('essential catalog exposes persistent grounding', () => {
       userText: '아무 문장',
       hostTools: [],
       runtimeTools: [],
-      rich: false,
     }).map(spec => spec.name);
 
     expect(names).not.toContain('PersistentGrounding');
@@ -54,7 +52,7 @@ describe('essential catalog exposes persistent grounding', () => {
       .map(name => ({ name, description: name, parameters: { type: 'object' } }));
 
     const names = buildSessionRuntimeToolSpecs({
-      userText: '아무 문장', hostTools, runtimeTools, optionalTools, rich: false,
+      userText: '아무 문장', hostTools, runtimeTools, optionalTools,
     }).map(spec => spec.name);
 
     expect(names).toEqual([

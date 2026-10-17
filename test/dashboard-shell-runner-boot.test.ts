@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 import { bootDashboardShellRunner } from '../src/dashboard/shell-runner-boot.js';
 
-type Rollup = { running: number; backgrounded: number };
+type Rollup = { running: number; backgrounded: number; background: number };
 type Handle = { id: string };
 
 describe('bootDashboardShellRunner', () => {
@@ -37,10 +37,11 @@ describe('bootDashboardShellRunner', () => {
       setLatestShellRollup: (rollup) => { rollups.push(rollup); },
     });
 
-    onUpdate?.({ running: 2, backgrounded: 1 });
+    // TUI-BG-JOB-VISIBILITY — the surface's turn-outliving count is forwarded as-is.
+    onUpdate?.({ running: 2, backgrounded: 1, background: 3 });
     onRegister?.({ id: 'h1' });
     onUnregister?.('h1');
-    expect(rollups).toEqual([{ running: 2, backgrounded: 1 }]);
+    expect(rollups).toEqual([{ running: 2, backgrounded: 1, background: 3 }]);
     expect(tracked).toEqual([{ id: 'h1' }]);
     expect(forgotten).toEqual(['h1']);
     expect(wiredRegistries).toEqual([registry]);

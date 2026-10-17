@@ -9,8 +9,6 @@ import { registerAllDefaultToolRuntimes } from '../tool-runtime/index.js';
 import { listToolRuntimes } from '../tool-runtime/registry.js';
 import { CORE_TOOL_SPECS } from '../domains/core-tools.js';
 
-const CODING_SURFACES = ['coding/turn', 'coding/agent'] as const;
-const NON_CODING_SURFACES: readonly SessionSurfaceId[] = ['research/turn', 'research/agent', 'control/agent', 'ops-ui/agent', 'ops-fleet/agent'];
 
 function withModelSurfaceConfig<T>(config: object, callback: () => T): T {
   const savedXdg = process.env.XDG_CONFIG_HOME;
@@ -43,17 +41,18 @@ function withDefaultModelSurface<T>(callback: () => T): T {
 //   🔄 되돌리기 = native-tool-catalog.ts 의 defaultEnabled 한 줄.
 // The eight in-process ops-ledger runtimes are deliberately in the fixed
 // essential TUI catalog: an OP turn must be able to replace the corresponding
-// RunShell CLI calls even when rich coding profiles omit that family.
-const EXPECTED_ESSENTIAL_ONLY = [
+// RunShell CLI calls.
+// TUI-DIET-D1-TAIL — the legacy rich coding profiles are gone, so the former
+// «essential-only vs rich» parity checks became membership checks on essential alone.
+const EXPECTED_ESSENTIAL_MEMBERS = [
   'SelfImplement',
   'MsgList', 'MsgPost', 'MsgAck',
   'ChecklistList', 'ChecklistAdd', 'ChecklistSet', 'ChecklistEdit', 'ChecklistMove',
   'PersistentGrounding',
 ];
-const PARITY_GUARD = 'The essential fixed catalog and coding profile defaults diverged; if intentional, update this test with the reason. This guard makes divergence visible rather than forbidding it.';
+const PARITY_GUARD = 'The essential fixed catalog changed; if intentional, update this test with the reason. This guard makes the change visible rather than forbidding it.';
 
 function toolNames(
-  rich: boolean,
   preferredSurfaceId?: SessionSurfaceId,
   config: object = {},
   userText = '',
@@ -64,21 +63,14 @@ function toolNames(
       userText,
       hostTools: [],
       runtimeTools: listToolRuntimes('tui'),
-      pluginTools: [],
       optionalTools: [],
       preferredSurfaceId,
-      rich,
     }).map(spec => spec.name);
   });
 }
 
-function difference(left: readonly string[], right: readonly string[]): string[] {
-  const rightNames = new Set(right);
-  return left.filter(name => !rightNames.has(name));
-}
-
 describe('essential fixed catalog and coding profile parity', () => {
-  const essentialNames = withDefaultModelSurface(() => toolNames(false));
+  const essentialNames = withDefaultModelSurface(() => toolNames());
 
   it('exposes the registered logs_query host tool in essential mode and honors availability', () => {
     registerAllDefaultToolRuntimes();
@@ -93,9 +85,7 @@ describe('essential fixed catalog and coding profile parity', () => {
       userText: '최근 로그를 조회해줘',
       hostTools,
       runtimeTools: runtimes,
-      pluginTools: [],
       optionalTools: [],
-      rich: false,
     });
     expect(essentialWithLogs.find(spec => spec.name === 'logs_query')).toMatchObject({
       name: logsSpec?.name,
@@ -108,9 +98,7 @@ describe('essential fixed catalog and coding profile parity', () => {
       userText: '최근 로그를 조회해줘',
       hostTools: hostTools.filter(tool => tool.name !== 'logs_query'),
       runtimeTools: runtimes,
-      pluginTools: [],
       optionalTools: [],
-      rich: false,
     });
     expect(essentialWithLogs.filter(spec => spec.name !== 'logs_query'))
       .toEqual(withoutLogs);
@@ -119,45 +107,22 @@ describe('essential fixed catalog and coding profile parity', () => {
       userText: '최근 로그를 조회해줘',
       hostTools,
       runtimeTools: runtimes,
-      pluginTools: [],
       optionalTools: [],
       toolAvailability: { logs_query: false },
-      rich: false,
     });
     expect(unavailable.map(spec => spec.name)).not.toContain('logs_query');
 
-    const controlTools = buildSessionRuntimeToolSpecs({
-      userText: '지금 자율 운영 상태',
-      hostTools,
-      runtimeTools: runtimes,
-      pluginTools: [],
-      optionalTools: [],
-      preferredSurfaceId: 'control/agent',
-      rich: true,
-    });
-    expect(controlTools.map(spec => spec.name)).not.toContain('logs_query');
-  });
-
-  it('does not expose tools only in either rich coding profile', () => {
-    for (const surfaceId of CODING_SURFACES) {
-      const richNames = toolNames(true, surfaceId);
-      const richOnly = difference(richNames, essentialNames);
-
-      if (richOnly.length > 0) {
-        throw new Error(`${PARITY_GUARD} ${surfaceId} rich-only tools: ${richOnly.join(', ')}`);
-      }
-    }
   });
 
   it('a dev-harness phrase drops Edit and Write from the essential TUI tool list and keeps SelfImplement', () => {
-    const currentEssentialNames = toolNames(false);
-    const harnessNames = toolNames(false, undefined, {}, '하니스로 구현해줘: src/ux-sim/fault-pool-cap.ts');
+    const currentEssentialNames = toolNames();
+    const harnessNames = toolNames(undefined, {}, '하니스로 구현해줘: src/ux-sim/fault-pool-cap.ts');
     expect(harnessNames).not.toContain('Edit');
     expect(harnessNames).not.toContain('Write');
     expect(harnessNames).toContain('SelfImplement');
     expect(harnessNames).toEqual(currentEssentialNames.filter(name => name !== 'Edit' && name !== 'Write'));
 
-    const ordinaryNames = toolNames(false, undefined, {}, '이 파일을 확인해줘');
+    const ordinaryNames = toolNames(undefined, {}, '이 파일을 확인해줘');
     expect(ordinaryNames).toEqual(currentEssentialNames);
   });
 
@@ -171,38 +136,10 @@ describe('essential fixed catalog and coding profile parity', () => {
     }
   });
 
-  // PersistentGrounding remains essential-only at the default cost gate; explicit nativeStructure opt-in adds it to coding.
-  it('keeps SelfImplement, eight ops-ledger tools, and PersistentGrounding beyond either default rich coding profile', () => {
-    for (const surfaceId of CODING_SURFACES) {
-      const richNames = toolNames(true, surfaceId);
-      const essentialOnly = difference(essentialNames, richNames);
-
-      if (JSON.stringify(essentialOnly) !== JSON.stringify(EXPECTED_ESSENTIAL_ONLY)) {
-        throw new Error(`${PARITY_GUARD} ${surfaceId} essential-only tools: ${essentialOnly.join(', ') || '(none)'}`);
-      }
-    }
-  });
-
-  it('keeps default and explicit false coding catalogs unchanged while explicit true exposes PersistentGrounding', () => {
-    for (const surfaceId of CODING_SURFACES) {
-      const defaultNames = toolNames(true, surfaceId);
-      const falseNames = toolNames(true, surfaceId, { tools: { nativeStructure: { enabled: false } } });
-      const trueNames = toolNames(true, surfaceId, { tools: { nativeStructure: { enabled: true } } });
-
-      expect(defaultNames).toEqual(falseNames);
-      expect(defaultNames).not.toContain('PersistentGrounding');
-      expect(trueNames).toContain('PersistentGrounding');
-      expect(difference(trueNames, defaultNames)).toEqual(['PersistentGrounding']);
-    }
-  });
-
-  it('limits nativeStructure opt-in to coding surfaces', () => {
-    for (const surfaceId of NON_CODING_SURFACES) {
-      const defaultNames = toolNames(true, surfaceId);
-      const enabledNames = toolNames(true, surfaceId, { tools: { nativeStructure: { enabled: true } } });
-
-      expect(enabledNames).toEqual(defaultNames);
-      expect(enabledNames).not.toContain('PersistentGrounding');
+  it('keeps SelfImplement, eight ops-ledger tools, and PersistentGrounding in the essential catalog', () => {
+    const missing = EXPECTED_ESSENTIAL_MEMBERS.filter(name => !essentialNames.includes(name));
+    if (missing.length > 0) {
+      throw new Error(`${PARITY_GUARD} essential catalog is missing: ${missing.join(', ')}`);
     }
   });
 

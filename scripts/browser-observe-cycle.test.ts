@@ -488,6 +488,27 @@ describe('observeBrowserCycle — loopback owner token on MCP calls', () => {
     expect(result.status).toBe(BROWSER_OBSERVE_OK);
     expect(readTokenCalls).toBe(0);
   });
+
+  test('omitted readToken uses the config-dir acp-token file as Authorization Bearer', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'browser-observe-default-token-'));
+    setElanousConfigDir(dir);
+    writeFileSync(join(dir, 'acp-token'), '  file-owner-token\n', 'utf8');
+    try {
+      const fixture = createMcpHttpFixture();
+      const result = await observeBrowserCycle({
+        fetch: fixture.fetch,
+        log: () => {},
+      });
+      expect(result.status).toBe(BROWSER_OBSERVE_OK);
+      expect(fixture.posts.length).toBeGreaterThan(0);
+      for (const post of fixture.posts) {
+        expect(post.headers.authorization).toBe('Bearer file-owner-token');
+      }
+    } finally {
+      resetElanousConfigDir();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('readBrowserObserveToken — read-only loopback acp-token', () => {
@@ -507,6 +528,13 @@ describe('readBrowserObserveToken — read-only loopback acp-token', () => {
   test('token path is acp-token inside the elanous config dir', () => {
     const dir = withTempConfigDir();
     expect(browserObserveTokenPath()).toBe(join(dir, 'acp-token'));
+  });
+
+  test('observe cycle does not import ensureAuthToken (read-only; never creates a token)', () => {
+    const source = readFileSync(join(import.meta.dir, 'browser-observe-cycle.ts'), 'utf8');
+    expect(source).not.toMatch(/from ['"][^'"]*auth\/acp-token/);
+    expect(source).not.toMatch(/import\s*\{[^}]*\bensureAuthToken\b/);
+    expect(source).toContain("join(getElanousConfigDir(), 'acp-token')");
   });
 
   test('reads the stored token, trimmed', () => {

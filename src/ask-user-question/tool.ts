@@ -363,6 +363,7 @@ export async function dispatchAskUserQuestion(
   let dispatched: AskUserQuestionDispatchResult | undefined;
   let explicitOutcome: AskUserQuestionDispatchOutcome | undefined;
   let resolvedPresentation: { surface: 'file'; delivery: 'file' } | undefined;
+  let cancelledBySignal = false;
   try {
     if (parsed.ok !== true) {
       dispatched = { output: `AskUserQuestion failed: ${parsed.reason}` };
@@ -487,6 +488,15 @@ export async function dispatchAskUserQuestion(
     };
   }
 
+  // A caller that already gave up (turn cancel, doom-loop ask timeout) must
+  // not pop a modal that would then sit on screen taking the operator's keys.
+  const abortSignal = dispatchCtx?.signal;
+  if (abortSignal?.aborted) {
+    cancelledBySignal = true;
+    const result: AskUserQuestionResult = { answers: {}, cancelled: true };
+    return dispatched = { output: JSON.stringify(result), result };
+  }
+
   const { cols, rows } = deps.termSize();
   const width = Math.min(90, Math.max(44, cols - 6));
   // Height: header(1) + separator(1) + Q-text(2) + gap(1) + ≤5 opts + actions(1) + border(2) ≈ 13
@@ -556,6 +566,16 @@ export async function dispatchAskUserQuestion(
     });
   }
 
+  // TUI-DOOM-ASK-TIMEOUT-STALE-MODAL — honour the caller's AbortSignal the way
+  // the ACP bridge does: close the modal (resolves as cancelled, which releases
+  // the approval router and disposes the surface) instead of leaving it open
+  // after the caller stopped waiting. A late answer would be dropped anyway.
+  const onAbort = (): void => {
+    cancelledBySignal = true;
+    modal.dispose(true);
+  };
+  abortSignal?.addEventListener('abort', onAbort, { once: true });
+
   try {
     const result = await modal.promise;
     publishQuestionResult(result, parsed.req.questions.map((q) => q.id));
@@ -565,6 +585,7 @@ export async function dispatchAskUserQuestion(
       result,
     };
   } finally {
+    abortSignal?.removeEventListener('abort', onAbort);
     let pendingRemoved = false;
     try {
       pendingQuestionPersistence.remove(pendingQuestion.id);
@@ -592,6 +613,7 @@ export async function dispatchAskUserQuestion(
       ...(resolvedPresentation === undefined ? {} : { surface: resolvedPresentation.surface }),
       outcome: classifyAskUserQuestionOutcome(parsed, dispatched, explicitOutcome),
       ...(answerState === undefined ? {} : { answerState }),
+      ...(cancelledBySignal ? { cancelledBySignal: true } : {}),
       elapsedMs: Math.max(0, Date.now() - startedAt),
     });
   }

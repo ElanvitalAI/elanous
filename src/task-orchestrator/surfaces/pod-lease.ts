@@ -230,6 +230,13 @@ function runningLimit(spec: Record<string, unknown>): number | null {
 
 /** A short-lived Pod proves cluster DNS from inside the same namespace as harness Jobs. Image pull failures are not DNS failures. */
 export type PoolDnsProbe = 'ready' | 'dns' | 'image' | 'unknown';
+/** Separate, opt-in observation. null means the probe could not measure that step. */
+export interface ExternalGitHubProbe {
+  externalDns: boolean | null;
+  githubHttps: boolean | null;
+  measuredAt: string | null;
+  reason: string | null;
+}
 const DNS_CACHE_MS = 10 * 60_000;
 const DNS_STALE_OK_MS = 30 * 60_000;
 const DNS_LOCK_WAIT_MS = 6 * 60_000;
@@ -239,6 +246,97 @@ const dnsFlock = process.platform === 'linux' || process.platform === 'darwin'
   ? dlopen(process.platform === 'linux' ? 'libc.so.6' : 'libSystem.B.dylib', {
     flock: { args: ['int', 'int'], returns: 'int' },
   }).symbols.flock : null;
+
+/** A disposable Pod in the Job namespace measures GitHub reachability without changing admission. */
+export function probePoolGitHub(context: string, kubectl: PoolKubectl = leaseKubectl, options: { dir?: string; now?: () => number } = {}): ExternalGitHubProbe {
+  const unknown = (reason: string): ExternalGitHubProbe => ({ externalDns: null, githubHttps: null, measuredAt: null, reason });
+  const now = options.now ?? Date.now;
+  const dir = options.dir ?? hostLeaseBaseDir();
+  const key = createHash('sha256').update(context).digest('hex');
+  const cache = join(dir, `github-egress-${key}.cache`);
+  const lock = join(dir, `github-egress-${key}.flock`);
+  const cached = (): ExternalGitHubProbe | null => {
+    try {
+      const record = object(JSON.parse(readFileSync(cache, 'utf8')));
+      if (typeof record?.at !== 'number' || now() < record.at || now() - record.at >= 60_000) return null;
+      if (typeof record.measuredAt !== 'string' || ![true, false].includes(record.externalDns as boolean) ||
+          ![true, false, null].includes(record.githubHttps as boolean | null) ||
+          !(record.reason === null || typeof record.reason === 'string')) return null;
+      return { externalDns: record.externalDns as boolean, githubHttps: record.githubHttps as boolean | null,
+        measuredAt: record.measuredAt, reason: record.reason as string | null };
+    } catch { return null; }
+  };
+  const fresh = cached();
+  if (fresh) return fresh;
+  try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return unknown('probe cache unavailable'); }
+  if (!dnsFlock) return unknown('probe lock unavailable');
+  let fd: number;
+  try { fd = openSync(lock, 'a', 0o600); } catch { return unknown('probe lock unavailable'); }
+  let held = false;
+  try {
+    const deadline = Date.now() + 2_000;
+    while (!held) {
+      const shared = cached();
+      if (shared) return shared;
+      if (dnsFlock(fd, 2 | 4) === 0) { held = true; break; }
+      if (Date.now() >= deadline) return unknown('probe busy');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+    const shared = cached();
+    if (shared) return shared;
+    const result = runPoolGitHubProbe(context, kubectl, new Date(now()).toISOString());
+    if (result.measuredAt !== null) {
+      const temp = `${cache}.${randomUUID()}.tmp`;
+      try { writeFileSync(temp, JSON.stringify({ ...result, at: now() }), { mode: 0o600 }); renameSync(temp, cache); }
+      catch { try { rmSync(temp, { force: true }); } catch { /* observation remains valid without cache */ } }
+    }
+    return result;
+  } finally {
+    if (held) dnsFlock(fd, 8);
+    closeSync(fd);
+  }
+}
+
+function runPoolGitHubProbe(context: string, kubectl: PoolKubectl, measuredAt: string): ExternalGitHubProbe {
+  const name = `elanous-egress-${randomUUID().slice(0, 12)}`;
+  const base = ['--context', context, '--request-timeout=15s'];
+  const unknown = (reason: string): ExternalGitHubProbe => ({ externalDns: null, githubHttps: null, measuredAt: null, reason });
+  let created = false;
+  try {
+    const manifest = JSON.stringify({ apiVersion: 'v1', kind: 'Pod', metadata: { name, namespace: 'elanous-test', labels: { 'elanous.probe': 'github-egress' } }, spec: {
+      restartPolicy: 'Never', activeDeadlineSeconds: 35, automountServiceAccountToken: false,
+      containers: [{ name: 'probe', image: 'busybox:1.36', command: ['sh', '-c',
+        'if nslookup github.com >/dev/null 2>&1; then echo EXTERNAL_DNS_OK; if wget -q -T 8 -O /dev/null https://github.com/; then echo GITHUB_HTTPS_OK; else echo GITHUB_HTTPS_FAILED; fi; else echo EXTERNAL_DNS_FAILED; fi'],
+      resources: { requests: { cpu: '0', memory: '16Mi' }, limits: { cpu: '100m', memory: '64Mi' } } }],
+    } });
+    if (kubectl([...base, 'create', '-f', '-'], manifest).status !== 0) return unknown('probe create failed');
+    created = true;
+    const waited = kubectl([...base, '-n', 'elanous-test', 'wait', '--for=jsonpath={.status.phase}=Succeeded', `pod/${name}`, '--timeout=25s']);
+    const podResult = kubectl([...base, '-n', 'elanous-test', 'get', `pod/${name}`, '-o', 'json']);
+    if (podResult.status !== 0) return unknown('probe status unavailable');
+    const pod = object(JSON.parse(podResult.stdout));
+    const statuses = object(pod?.status)?.containerStatuses;
+    if (Array.isArray(statuses) && statuses.some((c) =>
+          ['ErrImagePull', 'ImagePullBackOff', 'InvalidImageName'].includes(String(object(object(object(c)?.state)?.waiting)?.reason))))
+      return unknown('probe image unavailable');
+    const logs = kubectl([...base, '-n', 'elanous-test', 'logs', `pod/${name}`]);
+    if (logs.status !== 0) return unknown(waited.status === 0 ? 'probe output unavailable' : 'probe timeout');
+    const markers = logs.stdout.trim().split(/\r?\n/u);
+    const dnsOk = markers.includes('EXTERNAL_DNS_OK');
+    const dnsFail = markers.includes('EXTERNAL_DNS_FAILED');
+    const httpsOk = markers.includes('GITHUB_HTTPS_OK');
+    const httpsFail = markers.includes('GITHUB_HTTPS_FAILED');
+    if (dnsFail && !dnsOk && !httpsOk && !httpsFail)
+      return { externalDns: false, githubHttps: null, measuredAt, reason: 'external DNS failed' };
+    if (dnsOk && !dnsFail && httpsOk !== httpsFail)
+      return { externalDns: true, githubHttps: httpsOk, measuredAt, reason: httpsFail ? 'GitHub HTTPS failed' : null };
+    return unknown(waited.status === 0 ? 'probe output unavailable' : 'probe timeout');
+  } catch { return unknown('probe failed'); }
+  finally {
+    if (created) try { kubectl([...base, '-n', 'elanous-test', 'delete', `pod/${name}`, '--ignore-not-found=true', '--wait=false']); }
+    catch { /* best effort; Kubernetes activeDeadlineSeconds also bounds the Pod */ }
+  }
+}
 
 /** The cache and lock are shared by CLI processes, keyed by context rather than pool composition. */
 export function probePoolDns(context: string, kubectl: PoolKubectl = leaseKubectl, options: { dir?: string; now?: () => number } = {}): PoolDnsProbe {

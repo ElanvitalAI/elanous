@@ -1496,6 +1496,85 @@ describe('elanous pr land', () => {
       } finally { rmSync(root, { recursive: true, force: true }); }
     });
 
+    it('rechecks reviewed virtual rebase through runPrLand after main moves during the heavy gate', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'land-virtual-late-'));
+      const repo = join(root, 'repo');
+      const remote = join(root, 'remote.git');
+      const logged = spyOn(debug, 'log').mockImplementation(() => {});
+      try {
+        git(root, 'init', '--bare', remote);
+        git(root, 'init', '-b', 'main', repo);
+        git(repo, 'config', 'user.name', 'Virtual Late');
+        git(repo, 'config', 'user.email', 'late@example.test');
+        mkdirSync(join(repo, 'src'));
+        const file = join(repo, 'src', 'land.ts');
+        const lines = Array.from({ length: 30 }, (_, index) => `line ${index}\n`);
+        writeFileSync(file, lines.join(''));
+        git(repo, 'add', '.');
+        git(repo, 'commit', '-m', 'base');
+        const gateBase = git(repo, 'rev-parse', 'HEAD');
+        git(repo, 'remote', 'add', 'origin', remote);
+        git(repo, 'push', '-u', 'origin', 'main');
+        git(repo, 'switch', '-c', 'feat/land');
+        lines[25] = 'feature line\n';
+        writeFileSync(file, lines.join(''));
+        git(repo, 'commit', '-am', 'feature');
+        const head = git(repo, 'rev-parse', 'HEAD');
+        git(repo, 'switch', 'main');
+        lines[25] = 'line 25\n';
+        lines[2] = 'main line\n';
+        writeFileSync(file, lines.join(''));
+        git(repo, 'commit', '-am', 'chore: land another PR');
+        const firstMain = git(repo, 'rev-parse', 'HEAD');
+        git(repo, 'push', 'origin', 'main');
+        lines[1] = 'later main line\n';
+        writeFileSync(file, lines.join(''));
+        git(repo, 'commit', '-am', 'chore: land later PR');
+        const laterMain = git(repo, 'rev-parse', 'HEAD');
+        git(repo, 'switch', 'feat/land');
+        const reviewDir = join(root, 'review-results');
+        mkdirSync(reviewDir);
+        const reviewResult = join(reviewDir, `VIRTUAL-51-${head.slice(0, 12)}.json`);
+        writeFileSync(reviewResult, `${JSON.stringify({ pr: 51, verdict: 'pass', reviewed: true, mustFix: [], headCommit: head })}\n`);
+        const evidence = join(root, 'evidence.json');
+        writeFileSync(evidence, JSON.stringify({ pr: 51, head, gate: { passed: true, head, baseCommit: gateBase }, reviewResult }));
+        const sink = output();
+        const landing = pinnedManager();
+        const gatedBases: string[] = [];
+        const run: CmdRunner = (command, args, options) => {
+          if (command === 'gh' && args[1] === 'view' && args.includes('mergeCommit,state')) {
+            return { ok: true, out: JSON.stringify({ state: 'MERGED', mergeCommit: { oid: 'd'.repeat(40) } }) };
+          }
+          if (command === 'gh') return { ok: true, out: JSON.stringify({ headRefOid: head, headRefName: 'feat/land', baseRefName: 'main', state: 'OPEN', isDraft: false, url: URL }) };
+          if (command === 'git' && args.join(' ') === 'remote get-url origin') return { ok: true, out: 'git@github.com:example/repo.git\n' };
+          if (command === 'git' && args.join(' ') === `fetch --quiet origin ${'d'.repeat(40)}`) return { ok: true, out: '' };
+          if (command === 'git' && args.join(' ') === `rev-parse --verify ${'d'.repeat(40)}^1`) return { ok: true, out: `${laterMain}\n` };
+          const result = spawnSync(command, [...args], { cwd: options?.cwd ?? repo, encoding: 'utf8' });
+          return { ok: result.status === 0, out: result.stdout ?? '', err: result.stderr ?? '' };
+        };
+        const code = await runPrLand({ pr: '51', expectedHead: head, cwd: repo, base: 'main', overlapEvidence: evidence, heavyRemote: true }, {
+          ...baseDeps, run, resolveBase: () => 'main', reviewResultsDir: reviewDir,
+          manager: landing.manager, out: sink.out,
+          decideOverlapLanding: () => ({ outcome: 'unavailable', channel: 'all-failed', interactive: false }),
+          runHeavyRemote: ({ main }) => {
+            gatedBases.push(main);
+            if (main === firstMain) {
+              git(repo, 'push', 'origin', `${laterMain}:refs/heads/main`);
+              git(repo, 'update-ref', 'refs/remotes/origin/main', laterMain);
+            }
+            return { ok: true, host: 'node-b', source: 'remote', elapsedMs: 1, evidencePath: '/tmp/virtual-late-heavy.json' };
+          },
+        });
+        if (code !== 0) throw new Error(`landing refused: ${sink.errors.join(' | ')} / ${sink.logs.join(' | ')}`);
+        expect(gatedBases).toEqual([firstMain, laterMain]);
+        expect(sink.logs.filter((line) => line.startsWith('✓ overlap-evidence: virtual-rebase'))).toHaveLength(2);
+        expect(landing.calls).toContain('merge');
+      } finally {
+        logged.mockRestore();
+        rmSync(root, { recursive: true, force: true });
+      }
+    }, 60_000);
+
     it('verified evidence (rebased · gated on that base · review pass must-fix 0) lands the pinned head', async () => {
       const { run, commands } = pinnedRun();
       const { manager, calls } = fakeManager({ findPrForBranchOutcome: () => { calls.push('find'); return { status: 'ok OUTPUT', url: URL }; } });
@@ -2114,6 +2193,39 @@ describe('elanous pr land', () => {
         expect(sink.errors.join('\n')).toContain('ssh-down');
         expect(calls).not.toContain('merge');
       } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it('records busy and merge-conflict refusal edges from runPrLand without merging', async () => {
+      const { run: inner } = pinnedRun();
+      const { manager, calls } = pinnedManager();
+      const { dir, evidence } = evidenceFiles();
+      const edges: unknown[] = [];
+      const off = debug.registerSink({ name: 'pr-land-busy-refusal-test', emit: (row) => {
+        if (row.event === 'graph-edge-taken') edges.push(row.data);
+      } });
+      try {
+        const cases = [
+          ['gate-host-busy', 'gate-host-busy', 'next-move'],
+          ['gate-rc-1 · remote: stdout: CONFLICT (content): Merge conflict in scripts/test-deterministic.ts', 'gate-merge-conflict', 'main-sync'],
+        ] as const;
+        for (const [reason, label, destination] of cases) {
+          const sink = output();
+          expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence, heavyRemote: true }, {
+            ...baseDeps, reviewResultsDir: join(dir, 'review-results'), manager, out: sink.out,
+            run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main' ? { ok: true, out: '' }
+              : cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main' ? { ok: true, out: `${TIP}\n` } : inner(cmd, args),
+            runHeavyRemote: () => ({ ok: false, source: 'unmeasured', reason, elapsedMs: 1, evidencePath: '/tmp/injected-heavy.json' }),
+            runTypecheckGate: () => { throw new Error('local tsc ran'); },
+          })).toBe(1);
+          expect(sink.errors).toContain(`✗ heavy-remote: 원격 게이트 ${reason} — 로컬 게이트로 폴백하지 않는다.`);
+          expect(edges).toContainEqual(expect.objectContaining({
+            from: 'merge', on: 'refusal', label, to: destination,
+            taken: destination, reason: 'pr-land-refused; recovery-execution=none',
+          }));
+        }
+        expect(calls).not.toContain('merge');
+        expect(edges).toHaveLength(cases.length);
+      } finally { off(); rmSync(dir, { recursive: true, force: true }); }
     });
 
     it('heavy remote fails closed if main moves and the second remote gate cannot run', async () => {
@@ -3987,7 +4099,9 @@ describe('public-export-leak at landing (LEAK1)', () => {
 
   it('a changed file that would leak after the export transforms stops the landing', () => {
     const o = io();
-    expect(exportLeakBlock(['src/a.test.ts'], () => ({ measured: true, hits: [hit] }), false, o.out)).toBe(false);
+    const observed: string[] = [];
+    expect(exportLeakBlock(['src/a.test.ts'], () => ({ measured: true, hits: [hit] }), false, o.out, process.cwd(), (line) => observed.push(line))).toBe(false);
+    expect(observed).toEqual([o.error[0]!]);
     expect(o.error.join('\n')).toContain('src/a.test.ts:3 · ceo-mark');
     expect(o.error.join('\n')).toContain('--allow-public-leak');
   });
@@ -4056,13 +4170,24 @@ describe('public-export-leak at landing (LEAK1)', () => {
   it('runPrLand returns 1 before upsert when the check finds a leak', async () => {
     const { manager, calls } = fakeManager();
     const o = io();
-    const code = await runPrLand({ title: 't', body: 'b' }, {
-      ...baseDeps, manager, out: o.out,
-      run: (cmd: string, args: readonly string[]) => (cmd === 'git' && args[0] === 'diff' ? { ok: true, out: 'src/a.test.ts\n' } : baseLookupRun(cmd, args)),
-      runExportLeakCheck: () => ({ measured: true, hits: [hit] }),
-    } as never);
+    const edges: unknown[] = [];
+    const off = debug.registerSink({ name: 'pr-land-export-refusal-test', emit: (row) => {
+      if (row.event === 'graph-edge-taken') edges.push(row.data);
+    } });
+    let code: number;
+    try {
+      code = await runPrLand({ title: 't', body: 'b' }, {
+        ...baseDeps, manager, out: o.out,
+        run: (cmd: string, args: readonly string[]) => (cmd === 'git' && args[0] === 'diff' ? { ok: true, out: 'src/a.test.ts\n' } : baseLookupRun(cmd, args)),
+        runExportLeakCheck: () => ({ measured: true, hits: [hit] }),
+      } as never);
+    } finally { off(); }
     expect(code).toBe(1);
     expect(o.error.join('\n')).toContain('✗ public-export-leak');
+    expect(edges).toContainEqual(expect.objectContaining({
+      from: 'merge', on: 'refusal', label: 'public-export-leak', to: 'next-move',
+      taken: 'next-move', reason: 'pr-land-refused; recovery-execution=none',
+    }));
     expect(calls).not.toContain('upsert');
     expect(calls).not.toContain('merge');
   });

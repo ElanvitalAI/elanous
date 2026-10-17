@@ -18,6 +18,12 @@ export const REPAIR_PHASE_READ_ONLY_OPS_TOOLS = ['MsgList', 'ChecklistList'] as 
  *    rejects the steer target loops forever (#62 repair · #67 verify — MsgPost).
  *  - Agent is allowed in every action phase, so its result (AgentOutput/AgentList) must be
  *    too, or a delegated result is dropped and the parent redoes the work (#41).
+ *  - Read-only observation of the run itself (TUI-OPS-TURN-GUARD gap ②, old-build samples where
+ *    repair/verify rejected these mid-ops-turn): `logs_query` (logs.db READ-ONLY) and
+ *    `PtyShellPoll` (drains output of a PTY the turn already started — no input, no spawn).
+ *    Deliberately NOT here: `schedule_manage` (create/update/delete mutate crontab) and
+ *    `se_build` (`stop` SIGTERMs a mission) — the allow list is by name, so a tool with any
+ *    write action stays phase-governed.
  *  Source edits stay governed by each phase's own Edit/Write entries — nothing here edits files. */
 export const ACTION_PHASE_OPS_TOOLS = [
   'MsgList',
@@ -30,4 +36,6 @@ export const ACTION_PHASE_OPS_TOOLS = [
   'ChecklistMove',
   'AgentOutput',
   'AgentList',
+  'logs_query',
+  'PtyShellPoll',
 ] as const;

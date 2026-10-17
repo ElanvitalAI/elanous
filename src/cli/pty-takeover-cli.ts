@@ -5,7 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { runGitCommand } from '../git-fs/runner.js';
 import { debug } from '../debug/log.js';
 import { getPty, listPty, renamePty, requestPtyTakeover } from '../pty-shell/registry.js';
-import { describePtyRunState, readCheckoutHead, readCurrentInstallRecord, shortSha, type InstalledRecord, type PtyRunStateView } from '../pty-shell/tui-run-state.js';
+import { describePtyRunState, describeTurnCell, formatTurnCell, ptyTurnViewOfRow, readCheckoutHead, readCurrentInstallRecord, shortSha, UNKNOWN_TURN_CELL, type InstalledRecord, type PtyRunStateView, type PtyTurnCell } from '../pty-shell/tui-run-state.js';
 import { getPtyManifest, isProcessAlive, listPtyManifest, listPtyManifestRows, listPtyManifestRowsAt, ptyManifestDbPath, readPtyManifestFrame, reapDeadPtyManifest, reapDeadPtyManifestAt, reapStalePtyManifest, removePtyManifest, PTY_MANIFEST_CLOSED_TTL_MS, PTY_MANIFEST_STALE_MS, type PtyManifestExternalReapResult, type PtyManifestRow } from '../pty-shell/pty-manifest.js';
 import { readPtyEventsAfter, readPtyEventsAfterAt, type PtyEventLogReadResult, type PtyEventRow } from '../pty-shell/pty-event-log.js';
 import { resolvePtyRef, type PtyRefItem } from '../pty-shell/pty-ref.js';
@@ -27,7 +27,7 @@ import { isRunStatus } from '../self-implement/run-status-mapping.js';
 import { terminalTreeLabel } from '../pty-shell/terminal-tree.js';
 import { RemotesStore } from './remotes.js';
 import { bookmarkAttachDefaults } from './remote-resolve.js';
-import { classifyFrameState, type FrameState } from '../capture/frame-state-detect.js';
+import { classifyFrameState, reconcileFrameStateWithTurn, type FrameState } from '../capture/frame-state-detect.js';
 import { installMissingTool, waitForPtyCompletion, type ToolInstallDeps, type ToolInstallResult } from '../agent-mission/tool-install.js';
 
 interface PtyTakeoverCommandResult { readonly exitCode: 0 | 1 | 2; readonly message: string; readonly notice?: string; }
@@ -1441,6 +1441,10 @@ interface PtyListJsonRow extends PtyWebAddress {
    *    그 값은 거의 항상 몇 초이고 「얼마나 오래 있었나」를 못 답한다.
    *  ⚠️ `startedAt` 이 0(미상)이면 이 칸을 «비운다» — 「0분」과 「못 잼」은 다른 값이다. */
   readonly ageMs?: number;
+  /** ⭐ H10 — TUI 가 스스로 적은 턴(화면 추정 아님) ⊕ 그 상태 경과 초. 턴 기록 없는 행·원격 행은 `state:'unknown'`. */
+  readonly turn: PtyTurnCell;
+  /** ⭐ H10 — 기동 판(실행판 sha) ⊕ 낡음. 판 기록 없는 행·판독 실패는 null. */
+  readonly build: { readonly version: string; readonly sha: string; readonly source: string; readonly stale: boolean | null; readonly staleReason: string } | null;
 }
 
 function defaultRunTermination(runId: string, opts: { includeTest: boolean }, log: (event: string, data: Record<string, unknown>) => void): RunTermination {
@@ -1457,7 +1461,7 @@ function ptyAgeField(startedAt: number, now: number): { ageMs?: number } {
   return ageMs >= 0 ? { ageMs } : {};
 }
 
-function ptyListJsonRow(row: PtyManifestRow, instance: string, sourceRoot: PtyManifestSourceRoot, deps: PtyTakeoverCommandDeps, opts: { includeTest: boolean }, pwa?: NexusPwaResolution): PtyListJsonRow {
+function ptyListJsonRow(row: PtyManifestRow, instance: string, sourceRoot: PtyManifestSourceRoot, deps: PtyTakeoverCommandDeps, opts: { includeTest: boolean }, pwa?: NexusPwaResolution, installed: () => InstalledRecord = () => deps.readInstalledBuild?.() ?? {}): PtyListJsonRow {
   // ⛔⭐ 리뷰 should-fix (2026-08-19): 기준 시각을 «한 번만» 읽는다.
   //   종전엔 proof(updatedAgeMs)와 ageMs 가 각각 `deps.now?.()` 를 불러, 한 행의 두 값이
   //   ***«다른 순간»을 가리킬 수 있었다***. 두 값을 나란히 놓고 판정하는 것이 이 축의 용도인데
@@ -1498,7 +1502,54 @@ function ptyListJsonRow(row: PtyManifestRow, instance: string, sourceRoot: PtyMa
     runTerminationSource: resolution?.source ?? 'unknown',
     runStoreIo: resolution?.runStoreIo ?? 'not-checked',
     ownerRunUsage,
+    ...ptyListRunFields(row, deps, observedAt, installed),
   };
+}
+
+/** `pty list --json` 의 턴·판 칸 — ⛔ 키는 «언제나» 싣는다(값으로만 갈린다 · 모르면 unknown/null).
+ *  ⭐ 턴은 행의 자기보고 값만 읽는다 — 판 판독(설치본·git)이 실패해도 기록된 턴은 버리지 않는다. */
+function ptyListRunFields(row: PtyManifestRow, deps: PtyTakeoverCommandDeps, observedAt: number, installed: () => InstalledRecord): Pick<PtyListJsonRow, 'turn' | 'build'> {
+  const turn = describeTurnCell(ptyTurnViewOfRow(row), observedAt);
+  try {
+    if (!row.build) return { turn, build: null };
+    // 판독 예외 계약: 판 sha 는 기록값이라 그대로 두고 낡음만 «모른다»(stale=null · unknown) ⊕ `list-build-read-failed` 관측.
+    //   그 밖의 뜻밖 예외는 판을 null 로(아래 catch) — 어느 쪽이든 기록된 턴은 버리지 않는다.
+    const run = describePtyRunState(row, {
+      readInstalled: installed,
+      readCheckoutHead: (codeRoot) => {
+        try { return deps.readCheckoutHead?.(codeRoot); } catch (error) {
+          deps.log('list-build-read-failed', { ptyId: row.id, source: 'checkout-head', error: error instanceof Error ? error.message : String(error) });
+          return undefined;
+        }
+      },
+    });
+    return { turn, build: run.build ? { version: run.build.version, sha: run.build.sha, source: run.build.source, stale: run.stale, staleReason: run.staleReason } : null };
+  } catch (error) {
+    deps.log('list-build-read-failed', { ptyId: row.id, source: 'describe', error: error instanceof Error ? error.message : String(error) });
+    return { turn, build: null };
+  }
+}
+
+/** 목록 한 번에 설치본 기록을 «한 번만» 읽는다. 예외는 «모른다»({}) ⊕ `list-build-read-failed`(목록당 한 줄) — 목록·턴 칸을 깨지 않는다. */
+function listInstalledReader(deps: PtyTakeoverCommandDeps): () => InstalledRecord {
+  let once: InstalledRecord | undefined;
+  return () => {
+    if (once === undefined) {
+      try { once = deps.readInstalledBuild?.() ?? {}; } catch (error) {
+        once = {};
+        deps.log('list-build-read-failed', { source: 'installed', error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    return once;
+  };
+}
+
+/** 글 표의 판 칸 — 판독이 어떻게 실패해도 그 행(과 뒤따르는 턴 칸)을 깨지 않는다: 판 칸만 비우고 관측 한 줄. */
+function safeListRunColumn(row: PtyManifestRow | undefined, deps: PtyTakeoverCommandDeps, installed: () => InstalledRecord): string {
+  try { return formatListRunColumn(row, deps, installed); } catch (error) {
+    deps.log('list-build-read-failed', { ptyId: row?.id ?? '', source: 'run-column', error: error instanceof Error ? error.message : String(error) });
+    return '';
+  }
 }
 
 function federatedManifestTargets(
@@ -1771,6 +1822,9 @@ function remotePtyListJsonRow(row: RemoteTerminalListItem): PtyListJsonRow {
     runTerminationSource: 'unknown',
     runStoreIo: 'not-checked',
     ownerRunUsage: 'unknown',
+    // 원격 응답은 턴·판을 안 싣는다 — «모른다»로(로컬과 같은 키).
+    turn: UNKNOWN_TURN_CELL,
+    build: null,
   };
 }
 
@@ -1893,9 +1947,11 @@ function runPtyListJson(deps: PtyTakeoverCommandDeps, opts: { all?: boolean; inc
   }
   // Keep the existing list contract: rows whose selected PTY/owner process is dead are not listable.
   const pwa = deps.resolveNexusPwa?.();
+  // 설치본 기록은 목록 한 번에 한 번만 읽는다(행마다 다시 읽으면 I/O 와 행 사이 불일치). 실패는 «모른다» ⊕ 관측 한 줄.
+  const installed = listInstalledReader(deps);
   const payload = rows
     .filter(({ row }) => row.alive && (row.ptyPid > 0 ? deps.isProcessAlive!(row.ptyPid) : deps.isProcessAlive!(row.ownerPid)))
-    .map(({ row, instance, sourceRoot }) => ptyListJsonRow(row, instance, sourceRoot, deps, { includeTest: opts.includeTest === true }, pwa));
+    .map(({ row, instance, sourceRoot }) => ptyListJsonRow(row, instance, sourceRoot, deps, { includeTest: opts.includeTest === true }, pwa, installed));
   deps.log('list', { count: payload.length, federated: opts.all === true, includeTest: opts.includeTest === true, json: true });
   return { exitCode: 0, message: JSON.stringify(payload, null, 2), ...(payload.length === 0 ? { notice: ptyListEmptyNotice(opts) } : {}) };
 }
@@ -1966,12 +2022,15 @@ export function runPtyList(
   const pwa = deps.resolveNexusPwa?.();
   // 판 칸(맨 끝) — 설치본 기록은 목록 한 번에 한 번만 읽는다.
   //    설치본 판독기가 없는 구성(시험 deps)은 이 칸을 안 낸다 — 기계마다 다른 값이 목록에 새지 않게.
-  const manifestRowById = new Map((deps.readInstalledBuild ? deps.listManifestRows?.() ?? [] : []).map((row) => [row.id, row] as const));
-  let installedOnce: InstalledRecord | undefined;
-  const installed = (): InstalledRecord => (installedOnce ??= deps.readInstalledBuild?.() ?? {});
+  //    ⭐ H10 턴 칸은 판독기와 «무관하게» TUI ref 마다 낸다(기계마다 다른 값이 아니다) — 행을 못 얻으면 `turn=?`.
+  let manifestRows: readonly PtyManifestRow[] = [];
+  try { manifestRows = deps.listManifestRows?.() ?? []; } catch { manifestRows = []; }
+  const manifestRowById = new Map(manifestRows.map((row) => [row.id, row] as const));
+  const listedAt = deps.now?.() ?? Date.now();
+  const installed = listInstalledReader(deps);
   const rendered = refs.map((ref) => {
     const provenance = (deps.resolveWorktreeProvenance ?? resolvePtyWorktreeProvenance)(ref.workdir);
-    return { known: ptyPurposeKnown(provenance, ref.purpose), line: `${ref.id}\t${ref.kind}\t${ref.nickname ?? '-'}\t${ref.source}\t${ref.alive ? 'alive' : 'dead'}\t${ref.mode ?? '?'}\t${ref.workdir ?? '-'}\t${ref.runId ?? '-'}${ownerRunUsageById.has(ref.id) ? `\t${ownerRunUsageById.get(ref.id)}` : ''}\t${formatTerminalOrigin(ref)}\t${formatPtyPurpose(provenance, ref.purpose)}${pwa ? `\t${formatPtyWebAddress(ptyWebAddress(ref.id, pwa))}` : ''}${formatListRunColumn(manifestRowById.get(ref.id), deps, installed)}` };
+    return { known: ptyPurposeKnown(provenance, ref.purpose), line: `${ref.id}\t${ref.kind}\t${ref.nickname ?? '-'}\t${ref.source}\t${ref.alive ? 'alive' : 'dead'}\t${ref.mode ?? '?'}\t${ref.workdir ?? '-'}\t${ref.runId ?? '-'}${ownerRunUsageById.has(ref.id) ? `\t${ownerRunUsageById.get(ref.id)}` : ''}\t${formatTerminalOrigin(ref)}\t${formatPtyPurpose(provenance, ref.purpose)}${pwa ? `\t${formatPtyWebAddress(ptyWebAddress(ref.id, pwa))}` : ''}${safeListRunColumn(manifestRowById.get(ref.id), deps, installed)}${formatListTurnColumn(ref.kind, manifestRowById.get(ref.id), listedAt)}` };
   });
   return {
     exitCode: 0,
@@ -2067,24 +2126,30 @@ export async function runPtyState(ref: string, deps: PtyTakeoverCommandDeps = li
     if (run.turn === 'unknown' && run.build === null) return { exitCode: 1, message: formatSnapshotResult(acquired.id, acquired.control) };
     const screenUnavailable = acquired.control.reason ?? acquired.control.status;
     deps.log('state-screen-unavailable', { ptyId: acquired.id, reason: screenUnavailable, turn: run.turn });
-    return formatPtyStateResult(acquired.id, { state: 'unknown', label: null }, run, deps.now?.() ?? Date.now(), json, screenUnavailable);
+    return formatPtyStateResult(acquired.id, { state: 'unknown', label: null }, run, deps.now?.() ?? Date.now(), json, deps, screenUnavailable);
   }
   const verdict = classifyFrameState(acquired.control.screen ?? '');
   const at = deps.now?.() ?? Date.now();
   if (run.turn === 'unknown' || run.stale === null) deps.log('state-run-unknown', { ptyId: acquired.id, turn: run.turn, staleReason: run.staleReason, hasBuild: run.build !== null });
-  return formatPtyStateResult(acquired.id, { state: verdict.state, label: verdict.matchedLabel }, run, at, json);
+  return formatPtyStateResult(acquired.id, { state: verdict.state, label: verdict.matchedLabel }, run, at, json, deps);
 }
 
-function formatPtyStateResult(id: string, screen: { state: string; label?: string | null }, run: PtyRunStateView, at: number, json: boolean, screenUnavailable?: string): PtyTakeoverCommandResult {
+// ⭐ H10 조각 1 — `state` 는 «하나»다: TUI 가 스스로 적은 턴이 있으면 그것이 바쁜가/한가한가를 정하고(`stateSource=turn`),
+//   화면 추정은 턴을 모를 때·턴과 모순 없는 더 구체적인 상태(blocked·waiting·done)일 때만 쓴다(`stateSource=screen`).
+//   화면 원값은 `screenState`(JSON) · `guess=`(글, 갈렸을 때만)로 남긴다 — 둘이 갈린 순간은 `state-reconciled` 관측.
+function formatPtyStateResult(id: string, screen: { state: FrameState; label?: string | null }, run: PtyRunStateView, at: number, json: boolean, deps: PtyTakeoverCommandDeps, screenUnavailable?: string): PtyTakeoverCommandResult {
+  const reconciled = reconcileFrameStateWithTurn(screen.state, run.turn);
+  if (reconciled.overridden) deps.log('state-reconciled', { ptyId: id, turn: run.turn, screenState: reconciled.screenState, label: screen.label ?? null, state: reconciled.state });
+  const guess = reconciled.screenState !== reconciled.state && !screenUnavailable ? ` guess=${reconciled.screenState}` : '';
   return { exitCode: 0, message: json
     ? JSON.stringify({
-      id, state: screen.state, label: screen.label, at,
+      id, state: reconciled.state, stateSource: reconciled.source, screenState: reconciled.screenState, label: screen.label, at,
       ...(screenUnavailable ? { screenUnavailable } : {}),
       turn: run.turn, ...(run.turnAt !== undefined ? { turnAt: run.turnAt } : {}),
       build: run.build ? { version: run.build.version, sha: run.build.sha, source: run.build.source } : null,
       installed: run.installed, stale: run.stale, staleReason: run.staleReason,
     })
-    : `pty state: ${id} state=${screen.state} label=${screen.label ?? '-'}${screenUnavailable ? ` screen=unavailable(${screenUnavailable})` : ''} turn=${run.turn} build=${formatRunBuild(run)} installed=${shortSha(run.installed)} stale=${run.stale ?? 'unknown'}${run.stale === null ? '' : ` (${run.staleReason})`}` };
+    : `pty state: ${id} state=${reconciled.state} source=${reconciled.source}${guess} label=${screen.label ?? '-'}${screenUnavailable ? ` screen=unavailable(${screenUnavailable})` : ''} turn=${run.turn} build=${formatRunBuild(run)} installed=${shortSha(run.installed)} stale=${run.stale ?? 'unknown'}${run.stale === null ? '' : ` (${run.staleReason})`}` };
 }
 
 function ptyRunStateFor(id: string, deps: PtyTakeoverCommandDeps): PtyRunStateView {
@@ -2103,13 +2168,22 @@ function formatRunBuild(run: PtyRunStateView): string {
 
 /** `pty list` 한 칸 — 판을 적는 행(TUI)만. `run=<sha>` · 낡았으면 `,stale` · 옛 행 추정은 `run=?,stale`. */
 function formatListRunColumn(row: PtyManifestRow | undefined, deps: PtyTakeoverCommandDeps, installed: () => InstalledRecord): string {
-  if (!row || (!row.build && row.kind !== 'tui')) return '';
+  // 설치본 판독기가 없는 구성(시험 deps)은 이 칸을 안 낸다 — 기계마다 다른 값이 목록에 새지 않게.
+  if (!deps.readInstalledBuild || !row || (!row.build && row.kind !== 'tui')) return '';
   const run = describePtyRunState(row, {
     readInstalled: installed,
     ...(deps.readCheckoutHead ? { readCheckoutHead: deps.readCheckoutHead } : {}),
   });
   if (!run.build && run.stale !== true) return '';
   return `\trun=${run.build?.sha ? shortSha(run.build.sha) : '?'}${run.stale === true ? ',stale' : ''}`;
+}
+
+/** ⭐ H10 «턴 칸» — ref 가 TUI 면 «언제나» 낸다: `turn=busy,42s` · `turn=idle,300s` · 행 없음·종류 불일치·기록 없음 `turn=?`.
+ *  OP·TF 가 화면(«Streaming…/완료»)을 긁지 않고 «지금 턴 중인가·얼마나 됐나»를 읽는다. 턴은 자기보고 값만 쓴다(설치본·git 무관). */
+function formatListTurnColumn(refKind: string, row: PtyManifestRow | undefined, now: number): string {
+  if (refKind !== 'tui') return '';
+  if (!row || row.kind !== 'tui') return '\tturn=?';
+  return `\tturn=${formatTurnCell(describeTurnCell(ptyTurnViewOfRow(row), now))}`;
 }
 
 export async function runPtyWait(ref: string, until: string, options: { readonly timeoutMs?: number; readonly pollMs?: number } = {}, deps: PtyTakeoverCommandDeps = liveDeps): Promise<PtyTakeoverCommandResult> {

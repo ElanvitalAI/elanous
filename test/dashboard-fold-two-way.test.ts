@@ -4,7 +4,7 @@ import { describe, expect, test } from 'bun:test';
 import { createContextRegistry } from '../src/context.js';
 import { FoldStack } from '../src/fold-stack.js';
 import { createAttachmentRowMap } from '../src/log-pane/attachment-row-map.js';
-import { createDashboardLogClickDeps } from '../src/dashboard/log-click-runtime.js';
+import { createDashboardLogClickDeps, createFoldClickScrollAnchor } from '../src/dashboard/log-click-runtime.js';
 import { tryAttachmentHitAtBodyRow } from '../src/log-pane/click-dispatch.js';
 import { resolveDashboardChatMainLogCommand } from '../src/dashboard/input/chat-main-log-command.js';
 import { createDashboardChordActionRunner, matchDashboardChordAction } from '../src/dashboard/input/dashboard-chord-actions.js';
@@ -77,6 +77,149 @@ describe('#16 click fold is two-way', () => {
     foldStack.toggleTop();
     expect(foldStack.isExpandedCollapseLine(3)).toBe(false);
     expect(foldStack.isExpandedCollapseLine(1)).toBe(true);
+  });
+});
+
+// #81 (대표 10-17) — the old onAfterToggle pinned every toggle to the tail, so
+// expanding a block near the bottom pushed its header up and the same screen
+// spot then hit the body (expanded-body-reject). A click keeps the top row.
+describe('#81 a click fold keeps its screen spot', () => {
+  // computeLogH 18 → body 17 rows, no footer → 17 content rows.
+  const CONTENT_H = 17;
+  const FILLER = 20;
+
+  function scrolledLog(opts: { anchored: boolean; scrollOffset?: number; frozen?: number }) {
+    const chatLines = [...Array.from({ length: FILLER }, (_, i) => `line ${i}`), ...COLLAPSED, 'after'];
+    const scroll = { offset: opts.scrollOffset ?? -1, frozen: opts.frozen ?? null as number | null };
+    const pinTail = (): void => { scroll.offset = -1; };
+    const anchor = createFoldClickScrollAnchor({
+      getScrollOffset: () => scroll.offset,
+      setScrollOffset: (o) => { scroll.offset = o; },
+      maxScroll: () => Math.max(0, chatLines.length - CONTENT_H),
+      getFrozenTail: () => scroll.frozen,
+      setFrozenTail: (i) => { scroll.frozen = i; },
+      lineCount: () => chatLines.length,
+    }, pinTail);
+    const foldStack = new FoldStack({
+      chatLines,
+      onAfterToggle: opts.anchored ? (t, d) => anchor.onAfterToggle(t, d) : pinTail,
+    });
+    foldStack.push({
+      kind: 'static', expanded: false, lineStart: FILLER, lineEnd: FILLER + COLLAPSED.length,
+      rerender: (isExpanded) => isExpanded ? EXPANDED : COLLAPSED,
+    });
+    const deps = createDashboardLogClickDeps({
+      termSize: () => ({ rows: 40, cols: 120 }),
+      computePaneH: () => 20,
+      computeLogH: () => 18,
+      chatLinesLength: () => chatLines.length,
+      chatScrollOffset: () => scroll.offset,
+      logFrozenTailIndex: () => scroll.frozen,
+      chatFooterLine: () => null,
+      attachmentRowMap: createAttachmentRowMap(),
+      contextRegistry: createContextRegistry(),
+      setWorkingFocus: () => {},
+      pushTypedModal: () => null,
+      onAttachmentAction: () => {},
+      draw: () => {},
+      debug: { enabled: false, log: () => {} },
+      foldStack,
+      ...(opts.anchored ? { foldClickAnchor: anchor } : {}),
+    });
+    const tailTop = (): number => Math.max(0, chatLines.length - CONTENT_H);
+    return { chatLines, foldStack, deps, scroll, tailTop, anchor };
+  }
+  const click = (deps: ReturnType<typeof createDashboardLogClickDeps>, row: number) =>
+    tryAttachmentHitAtBodyRow(row, { row, col: 4 }, deps);
+
+  test('pinned to the tail: expand from the header, the same spot again folds back', () => {
+    const { chatLines, foldStack, deps, scroll, tailTop } = scrolledLog({ anchored: true });
+    const headerRow = FILLER - tailTop();
+    expect(click(deps, headerRow)).toBe('popup-opened');
+    expect(foldStack.snapshot()[0]?.expanded).toBe(true);
+    // The header stays on the clicked row instead of scrolling up.
+    expect(scroll.offset).toBe(FILLER - headerRow);
+    expect(click(deps, headerRow)).toBe('popup-opened');
+    expect(foldStack.snapshot()[0]?.expanded).toBe(false);
+    expect(chatLines.slice(FILLER)).toEqual([...COLLAPSED, 'after']);
+    // Folded back to the bottom → follows the tail again.
+    expect(scroll.offset).toBe(-1);
+  });
+
+  test('3 rounds of expand → same spot → fold all succeed', () => {
+    const { foldStack, deps, tailTop } = scrolledLog({ anchored: true });
+    const headerRow = FILLER - tailTop();
+    for (let i = 0; i < 3; i++) {
+      expect(click(deps, headerRow)).toBe('popup-opened');
+      expect(foldStack.snapshot()[0]?.expanded).toBe(true);
+      expect(click(deps, headerRow)).toBe('popup-opened');
+      expect(foldStack.snapshot()[0]?.expanded).toBe(false);
+    }
+  });
+
+  test('a body row still does not fold; the first line does', () => {
+    const { foldStack, deps, tailTop } = scrolledLog({ anchored: true });
+    const hintRow = FILLER + 2 - tailTop();
+    expect(click(deps, hintRow)).toBe('popup-opened');
+    const headerRow = FILLER - (FILLER + 2 - hintRow);
+    // Body row between the header and the expanding row.
+    expect(click(deps, headerRow + 1)).toBe('no-attachment');
+    expect(foldStack.snapshot()[0]?.expanded).toBe(true);
+    expect(click(deps, headerRow)).toBe('popup-opened');
+    expect(foldStack.snapshot()[0]?.expanded).toBe(false);
+  });
+
+  test('① scrolled up: a click expand does not jump to the tail, even when new output arrives', () => {
+    const { chatLines, foldStack, deps, scroll, anchor } = scrolledLog({ anchored: true, scrollOffset: 4 });
+    expect(click(deps, FILLER - 4)).toBe('popup-opened');
+    expect(foldStack.snapshot()[0]?.expanded).toBe(true);
+    expect(scroll.offset).toBe(4);
+    chatLines.push('new output');
+    anchor.reconcile();
+    expect(scroll.offset).toBe(4);
+  });
+
+  test('② following the tail: after a click expand, new output pins the tail again', () => {
+    const { chatLines, foldStack, deps, scroll, tailTop, anchor } = scrolledLog({ anchored: true });
+    expect(click(deps, FILLER - tailTop())).toBe('popup-opened');
+    expect(foldStack.snapshot()[0]?.expanded).toBe(true);
+    // Paints before any new output keep the header under the click.
+    anchor.reconcile();
+    expect(scroll.offset).toBeGreaterThanOrEqual(0);
+    expect(scroll.frozen).toBeNull();
+    chatLines.push('new output');
+    anchor.reconcile();
+    expect(scroll.offset).toBe(-1);
+    expect(scroll.frozen).toBeNull();
+  });
+
+  test('② a manual scroll after the click expand wins over tail-follow', () => {
+    const { chatLines, deps, scroll, tailTop, anchor } = scrolledLog({ anchored: true });
+    click(deps, FILLER - tailTop());
+    scroll.offset = 2;
+    chatLines.push('new output');
+    anchor.reconcile();
+    expect(scroll.offset).toBe(2);
+  });
+
+  test('a frozen tail past the block moves with the expand', () => {
+    const { deps, scroll } = scrolledLog({ anchored: true, scrollOffset: 4, frozen: FILLER + COLLAPSED.length + 1 });
+    click(deps, FILLER - 4);
+    expect(scroll.frozen).toBe(FILLER + EXPANDED.length + 1);
+  });
+
+  test('the f key (toggleTop) still pins to the tail', () => {
+    const { foldStack, scroll } = scrolledLog({ anchored: true, scrollOffset: 4 });
+    foldStack.toggleTop();
+    expect(scroll.offset).toBe(-1);
+  });
+
+  test('control — the tail-pinning host rejects the same-spot second click (the #81 bug)', () => {
+    const { foldStack, deps, tailTop } = scrolledLog({ anchored: false });
+    const headerRow = FILLER - tailTop();
+    expect(click(deps, headerRow)).toBe('popup-opened');
+    expect(click(deps, headerRow)).toBe('no-attachment');
+    expect(foldStack.snapshot()[0]?.expanded).toBe(true);
   });
 });
 

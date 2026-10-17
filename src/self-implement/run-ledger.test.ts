@@ -166,7 +166,10 @@ describe('run shard identity parsing', () => {
   it('round-trips optional shard fields while loading legacy ledger records unchanged', () => {
     const directory = mkdtempSync(join(tmpdir(), 'run-ledger-shard-'));
     const runId = 'run-00000000-0000-4000-8000-000000000998';
+    const originalDevProject = process.env.ELANOUS_DEV_PROJECT;
     try {
+      // 기본 형식 단정 — 환경 표지가 «켜져 있어도» 표지 없음 상태를 고정해 판정한다.
+      delete process.env.ELANOUS_DEV_PROJECT;
       appendRunLedgerEntry({ runId, event: 'start', data: {}, ...parseRunShardIdentity('## Shard identity\n{"orchestrationId":"orchestration-round-trip","shardId":"shard-b","totalShards":3,"position":2,"siblings":[{"shardId":"shard-a"},{"shardId":"shard-c"}]}') }, directory);
       appendRunLedgerEntry({ runId, event: 'identity-read-failed', data: {}, ...parseRunShardIdentity('## Shard identity\n{broken') }, directory);
       appendRunLedgerEntry({ runId, event: 'legacy', data: {} }, directory);
@@ -177,6 +180,8 @@ describe('run shard identity parsing', () => {
         { runId, event: 'legacy', data: {} },
       ]);
     } finally {
+      if (originalDevProject === undefined) delete process.env.ELANOUS_DEV_PROJECT;
+      else process.env.ELANOUS_DEV_PROJECT = originalDevProject;
       rmSync(directory, { recursive: true, force: true });
     }
   });
@@ -1292,14 +1297,22 @@ describe('human-stopped run ledger records', () => {
     const directory = mkdtempSync(join(tmpdir(), 'run-ledger-human-stop-'));
     directories.push(directory);
     const runId = 'run-00000000-0000-4000-8000-000000000105';
-    appendRunLedgerEntry({ timestamp: '2026-08-14T00:00:00.000Z', runId, event: 'pipeline-node-entry', data: {} }, directory);
-    recordHumanStoppedRun(runId, { stoppedBy: 'operator', stoppedAt: '2026-08-14T00:01:00.000Z', dir: directory });
+    const originalDevProject = process.env.ELANOUS_DEV_PROJECT;
+    try {
+      // 기본 형식 단정 — 환경 표지가 «켜져 있어도» 표지 없음 상태를 고정해 판정한다.
+      delete process.env.ELANOUS_DEV_PROJECT;
+      appendRunLedgerEntry({ timestamp: '2026-08-14T00:00:00.000Z', runId, event: 'pipeline-node-entry', data: {} }, directory);
+      recordHumanStoppedRun(runId, { stoppedBy: 'operator', stoppedAt: '2026-08-14T00:01:00.000Z', dir: directory });
 
-    expect(loadRunLedger(runId, directory)).toEqual([
-      expect.objectContaining({ event: 'pipeline-node-entry' }),
-      { timestamp: '2026-08-14T00:01:00.000Z', runId, event: 'human-stop', data: { stoppedBy: 'operator', stoppedAt: '2026-08-14T00:01:00.000Z' } },
-    ]);
-    expect(queryUnfinishedRunLedgers({ dir: directory, goalsDir: directory }).entries).toEqual([]);
+      expect(loadRunLedger(runId, directory)).toEqual([
+        expect.objectContaining({ event: 'pipeline-node-entry' }),
+        { timestamp: '2026-08-14T00:01:00.000Z', runId, event: 'human-stop', data: { stoppedBy: 'operator', stoppedAt: '2026-08-14T00:01:00.000Z' } },
+      ]);
+      expect(queryUnfinishedRunLedgers({ dir: directory, goalsDir: directory }).entries).toEqual([]);
+    } finally {
+      if (originalDevProject === undefined) delete process.env.ELANOUS_DEV_PROJECT;
+      else process.env.ELANOUS_DEV_PROJECT = originalDevProject;
+    }
   });
 
   afterAll(() => {
@@ -1396,14 +1409,54 @@ describe('non-blocking run ledger records — recordHumanStoppedRun 선례를 �
     const directory = mkdtempSync(join(tmpdir(), 'run-ledger-non-blocking-schema-'));
     directories.push(directory);
     const requestId = 'run-00000000-0000-4000-8000-000000000204';
+    const originalDevProject = process.env.ELANOUS_DEV_PROJECT;
+    try {
+      // 기본 형식 단정 — 환경 표지가 «켜져 있어도» 표지 없음 상태를 고정해 판정한다.
+      delete process.env.ELANOUS_DEV_PROJECT;
+      recordNonBlockingRunPending(requestId, { timestamp: '2026-10-14T00:00:00.000Z', dir: directory });
+      const ledger = loadRunLedger(requestId, directory)!;
+      expect(ledger[0]).toEqual({
+        timestamp: '2026-10-14T00:00:00.000Z',
+        runId: requestId,
+        event: 'non-blocking-pending',
+        data: { requestId, kind: 'pending', recordedAt: '2026-10-14T00:00:00.000Z' },
+      });
+    } finally {
+      if (originalDevProject === undefined) delete process.env.ELANOUS_DEV_PROJECT;
+      else process.env.ELANOUS_DEV_PROJECT = originalDevProject;
+    }
+  });
+
+  it('완료(launched) 페이로드는 ok·runId 산출값을 그대로 남기고 같은 requestId 로 재독기한다', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'run-ledger-non-blocking-launched-'));
+    directories.push(directory);
+    const requestId = 'run-00000000-0000-4000-8000-000000000205';
+    const harnessRunId = 'run-11111111-2222-4333-8444-555555555555';
     recordNonBlockingRunPending(requestId, { timestamp: '2026-10-14T00:00:00.000Z', dir: directory });
-    const ledger = loadRunLedger(requestId, directory)!;
-    expect(ledger[0]).toEqual({
-      timestamp: '2026-10-14T00:00:00.000Z',
-      runId: requestId,
-      event: 'non-blocking-pending',
-      data: { requestId, kind: 'pending', recordedAt: '2026-10-14T00:00:00.000Z' },
+    recordNonBlockingRunResult(
+      requestId,
+      {
+        kind: 'launched',
+        next: `eln self run ${harnessRunId}`,
+        ok: true,
+        runId: harnessRunId,
+      },
+      { timestamp: '2026-10-14T00:00:01.000Z', dir: directory },
+    );
+
+    const ledger = loadRunLedger(requestId, directory);
+    expect(ledger).not.toBeNull();
+    expect(ledger!.map((entry) => entry.event)).toEqual(['non-blocking-pending', 'non-blocking-result']);
+    const resultEntry = ledger!.find((entry) => entry.event === 'non-blocking-result')!;
+    expect(resultEntry.data).toMatchObject({
+      requestId,
+      kind: 'launched',
+      next: `eln self run ${harnessRunId}`,
+      ok: true,
+      runId: harnessRunId,
     });
+    expect(resultEntry.data).not.toHaveProperty('dir');
+    expect(readNonBlockingRunRecord(ledger!)).toEqual({ requestId, kind: 'launched', next: `eln self run ${harnessRunId}` });
   });
 
   afterAll(() => {

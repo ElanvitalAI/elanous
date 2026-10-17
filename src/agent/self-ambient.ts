@@ -184,11 +184,18 @@ export function investigationRecallAmbient(taskText: string): string {
 /** 자기인지 ambient — 최근 자기 구현/변경 + 최근 자율행동 + 자율 시스템 이상 + 미션 사건 사실
  *  (+ taskText 주면 조사문맥 관련 회상·축B). 매 턴 fresh · 각각 fail-soft(없음이면 빈 문자열). */
 export function elanousSelfAmbientParts(taskText?: string): string[] {
+  const parts = elanousSelfAmbientBaseParts();
+  if (taskText) { try { parts.push(investigationRecallAmbient(taskText)); } catch { /* fail-soft */ } }
+  return parts.filter(Boolean);
+}
+
+/** The request-independent ambient parts (store scans · `ps` · crontab). Split out so the
+ *  TUI can compute them off its event loop (`self-ambient-cache.ts`). */
+export function elanousSelfAmbientBaseParts(): string[] {
   const parts: string[] = [];
   try { parts.push(recentSelfChangesContext()); } catch { /* fail-soft */ }
   try { parts.push(recentAutonomyContext()); } catch { /* fail-soft */ }
   try { parts.push(opsHealthContext()); } catch { /* fail-soft */ }
   try { parts.push(missionIncidentAmbient()); } catch { /* fail-soft */ }
-  if (taskText) { try { parts.push(investigationRecallAmbient(taskText)); } catch { /* fail-soft */ } }
   return parts.filter(Boolean);
 }

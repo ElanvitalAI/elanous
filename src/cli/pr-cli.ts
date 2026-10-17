@@ -58,13 +58,16 @@ import { branchLineageSlug, findSiblingPrs } from './pr-lineage.js';
 import { parseReleaseNoteSection } from '../release-loop/release-note.js';
 import { landingFreezeMessage } from '../release-loop/landing-freeze.js';
 import { admitLandingMerge } from '../self-implement/frozen-merges.js';
-import { verifyAllSameHeadReviews, verifyAncestorAutoPass, verifyOverlapEvidence } from './pr-land-overlap-evidence.js';
+import { verifyAllSameHeadReviews, verifyAncestorAutoPass, verifyOverlapEvidence, verifyOverlapEvidenceVirtualRebase } from './pr-land-overlap-evidence.js';
+import type { VerifyOverlapEvidenceInput } from './pr-land-overlap-evidence.js';
 import { verifyVirtualRebasePatch } from './pr-land-virtual-rebase.js';
-import { observePrLandRefusal } from './pr-land-refusal.js';
+import { observeDirectPrLandRefusal, observePrLandRefusal } from './pr-land-refusal.js';
 import { ensurePrLandHeavyRemote, type HeavyRemoteInput, type HeavyRemoteResult } from './pr-land-heavy-remote.js';
+import { readPrBaseNameWithRetry } from './pr-land-base-read.js';
 import { runHeavyOnPodShadow } from './pr-land-pod-shadow.js';
 import type { LandingPodShadowInput, LandingPodShadowVerdict } from './pr-land-pod-shadow-job.js';
-import { taskAgentStatePath } from '../task-agent/task-hand.js';
+import { readTaskAgentState, taskAgentStatePath, type TaskCard } from '../task-agent/task-hand.js';
+import { INFLIGHT_REGISTRY_FILE, removeInflightForPr } from '../pr-tool/inflight-registry.js';
 import { PR_LABEL_NAMES } from '../github/pr-labels.js';
 import { enqueueL8ShadowQueue, runL8ShadowQueue, shadowPrNumber, statusL8ShadowQueue, type L8ShadowQueueDeps } from '../self-implement/l8-merge-queue.js';
 import { censusOpenPrs, guardNewPr, parseDiffHunks, readOpenPrs, type Seat } from '../pr-tool/census.js';
@@ -122,6 +125,8 @@ export interface PrLandDeps {
   readFile?: (path: string) => string;
   /** 증거 파일 없는 already-ancestor 자동 판정이 리뷰 결과를 찾는 자리(기본 `<TA 상태 디렉터리>/review-results`). */
   reviewResultsDir?: string;
+  /** INFLIGHT-REGISTRY — 착지 뒤 등록부 줄을 찾을 과제 카드 상태(기본 `taskAgentStatePath()` · 등록부는 그 옆). */
+  taskStatePath?: string;
   listUnfinishedRuns?: () => FederatedUnfinishedRunLedgerQuery | readonly FederatedUnfinishedRunLedgerEntry[];
   queryRunningRuns?: () => RunningRunsResult;
   listOpenPrs?: () => readonly { number: number; headRefName: string }[] | null;
@@ -392,6 +397,7 @@ export function exportLeakBlock(
   allow: boolean,
   out: { log: (message: string) => void; error: (message: string) => void },
   cwd: string = process.cwd(),
+  onRefusal?: (message: string) => void,
 ): boolean {
   if (!changedFiles || changedFiles.length === 0) return true;
   let result: ExportLeakCheck;
@@ -425,7 +431,9 @@ export function exportLeakBlock(
   }
   if (blockedHits.length === 0) { out.log('✓ public-export-leak: 바뀐 파일이 공개본에 사적 흔적을 싣지 않는다(prepare 와 같은 변환 뒤).'); return true; }
   const write = allow ? out.log : out.error;
-  write(`${allow ? '⚠' : '✗'} public-export-leak: 바뀐 파일 ${blockedHits.length}곳이 공개본에 사적 흔적을 싣는다 — 다음 release prepare 가 여기서 실패한다:`);
+  const refusal = `${allow ? '⚠' : '✗'} public-export-leak: 바뀐 파일 ${blockedHits.length}곳이 공개본에 사적 흔적을 싣는다 — 다음 release prepare 가 여기서 실패한다:`;
+  write(refusal);
+  if (!allow) onRefusal?.(refusal);
   for (const hit of blockedHits.slice(0, 20)) write(`   ${hit.file}:${hit.line} · ${hit.marker}${missingReason.includes(hit) ? ' · 사유 없음' : ''}`);
   if (blockedHits.length > 20) write(`   … 외 ${blockedHits.length - 20}곳`);
   write('   확인: bun scripts/public-export.ts --leak-check --all --files <파일…>');
@@ -1060,7 +1068,7 @@ function emitLandingOverlapAdvisory(
 }
 
 /** The pinned overlap evidence decision is shared by landing and its read-only preview. */
-function verifyPinnedOverlapDecision(input: {
+export function verifyPinnedOverlapDecision(input: {
   opts: PrLandOpts;
   deps: PrLandDeps;
   run: CmdRunner;
@@ -1078,13 +1086,14 @@ function verifyPinnedOverlapDecision(input: {
   let ancestorResyncNeeded = false;
   if (decision === 'unavailable' && opts.overlapEvidence !== undefined) {
     const ref = resolveRemoteBranchRef(run, cwd, base);
-    const verdict = verifyOverlapEvidence({
+    const evidenceInput: VerifyOverlapEvidenceInput = {
       evidencePath: opts.overlapEvidence, pr: Number(opts.pr), expectedHead: opts.expectedHead!,
       remote: ref.remote, branch: ref.branch, cwd, run, readFile,
       reviewResultsDir: deps.reviewResultsDir ?? join(dirname(taskAgentStatePath()), 'review-results'),
       listDir: (dir) => readdirSync(dir), reviewMtime: (path) => statSync(path).mtimeMs,
       reviewRealPath: (path) => realpathSync(path), overlappingLandings,
-    });
+    };
+    const verdict = verifyOverlapEvidence(evidenceInput);
     accepted = verdict.ok;
     if (verdict.ok) {
       out.log(verdict.mode === 'already-ancestor'
@@ -1092,7 +1101,24 @@ function verifyPinnedOverlapDecision(input: {
         : verdict.mode === 'base-advanced-disjoint'
           ? `✓ overlap-evidence: base-advanced-disjoint — gate base ${verdict.gateBase.slice(0, 12)} ⊂ head ${opts.expectedHead!.slice(0, 12)} · ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} 까지 ${verdict.windowCommits}개 커밋이 PR 파일을 안 건드린다 · review pass|warn must-fix 0 (${verdict.reviewResult})`
           : `✓ overlap-evidence: ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} ⊂ head ${opts.expectedHead!.slice(0, 12)} · gate passed on that base · review pass must-fix 0 (${verdict.reviewResult})`);
-    } else refuse(`✗ overlap-evidence: ${verdict.reason}`);
+    } else {
+      const pureNotRebased = verdict.baseTip !== undefined && verdict.reason ===
+        `not-rebased: ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} is not an ancestor of ${opts.expectedHead!.slice(0, 12)}`;
+      const measuredOverlap = verdict.baseTip !== undefined && verdict.reason.startsWith('base-stale-overlap:');
+      if (pureNotRebased || measuredOverlap) {
+        const patch = verifyOverlapEvidenceVirtualRebase(evidenceInput, verdict.baseTip!);
+        accepted = patch.ok;
+        record('virtual-rebase', patch.ok, {
+          pr: Number(opts.pr), head: opts.expectedHead, baseTip: verdict.baseTip,
+          reason: patch.ok ? 'same-patch-id' : patch.reason,
+          reviewResult: patch.ok ? patch.reviewResult : null,
+          evidencePath: opts.overlapEvidence,
+        });
+        if (patch.ok) {
+          out.log(`✓ overlap-evidence: virtual-rebase — ${ref.remote}/${ref.branch} ${verdict.baseTip!.slice(0, 12)} 와 head ${opts.expectedHead!.slice(0, 12)} 충돌 없음 · patch-id ${patch.patchId.slice(0, 12)} 동일 · review pass|warn must-fix 0 (${patch.reviewResult})`);
+        } else refuse(`✗ overlap-evidence: ${verdict.reason} · virtual-rebase: ${patch.reason}`);
+      } else refuse(`✗ overlap-evidence: ${verdict.reason}`);
+    }
   } else if (decision === 'unavailable') {
     const verdict = verifyAncestorAutoPass({
       pr: Number(opts.pr), expectedHead: opts.expectedHead!, cwd, run, readFile, overlappingLandings,
@@ -1121,12 +1147,12 @@ function verifyPinnedOverlapDecision(input: {
         ancestorResyncNeeded = !accepted;
         record('virtual-rebase', patch.ok, {
           pr: Number(opts.pr), head: opts.expectedHead, baseTip: baseTip || null,
-          reason: patch.ok ? 'same-patch-id' : patch.reason,
+          reason: patch.ok ? 'same-patch-id' : ('reason' in patch ? patch.reason : 'virtual-rebase-unmeasured'),
           reviewResult: reviews.ok ? reviews.reviewResult : null,
         });
-        if (patch.ok) {
+        if (patch.ok && reviews.ok) {
           out.log(`✓ overlap-evidence: virtual-rebase — ${ref.remote}/${ref.branch} ${baseTip.slice(0, 12)} 와 head ${opts.expectedHead!.slice(0, 12)} 충돌 없음 · patch-id ${patch.patchId.slice(0, 12)} 동일 · review pass|warn must-fix 0 (${reviews.reviewResult})`);
-        } else refuse(`✗ virtual-rebase: ${patch.reason} · ${verdict.reason}`);
+        } else refuse(`✗ virtual-rebase: ${'reason' in patch ? patch.reason : 'virtual-rebase-unmeasured'} · ${verdict.reason}`);
       } else refuse(`✗ ancestor-auto: ${verdict.reason}`);
     }
   }
@@ -1287,11 +1313,15 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
       totalElapsedMs: Math.max(0, Date.now() - landStartedAt), ok, ...extra,
     });
   };
-  // First slice: observe pinned identity/branch, overlap decision, and GitHub merge refusals.
-  // Option syntax and prerequisite gate errors do not describe a merge recovery edge.
+  // Observe actual merge refusals, including the measured remote gate and public export leak.
+  // Option syntax and unmeasured prerequisite errors do not describe a recovery edge.
   const refuse = (message: string, context: { isDraft?: boolean } = {}): void => {
     out.error(message);
     observePrLandRefusal(message, context);
+  };
+  const refuseDirect = (message: string): void => {
+    out.error(message);
+    observeDirectPrLandRefusal(message);
   };
   if (opts.title !== undefined && opts.titleFile !== undefined) {
     out.error('✗ title: --title과 --title-file은 함께 사용할 수 없습니다.');
@@ -1829,7 +1859,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   if (opts.heavyRemote) {
     const main = overlapCheckedBase!;
     const verdict = heavyGate(main, 'initial');
-    if (!verdict?.ok) { out.error(`✗ heavy-remote: 원격 게이트 ${verdict?.reason ?? 'unmeasured'} — 로컬 게이트로 폴백하지 않는다.`); return 1; }
+    if (!verdict?.ok) { refuseDirect(`✗ heavy-remote: 원격 게이트 ${verdict?.reason ?? 'unmeasured'} — 로컬 게이트로 폴백하지 않는다.`); return 1; }
     verifiedHeavyBase = main;
     out.log(`✓ heavy-remote: host=${verdict.host ?? 'unknown'} head=${opts.expectedHead!.slice(0, 12)} main=${main.slice(0, 12)} source=${verdict.source} elapsed=${verdict.elapsedMs}ms`);
     out.log(`✓ typecheck-roots: ${JSON.stringify(verdict.rootPlan ?? { mode: 'not-applicable', roots: null, promoted: false, reason: 'no-root-plan-in-gate-output' })}`);
@@ -1850,22 +1880,19 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   // A move during the wait is the same race as a move during the gate: rerun or fail closed.
   // gh merge pins the head only. A retargeted PR would land on a branch the heavy gate never measured.
   // Unreadable baseRefName is not "main". Normal pr land (no --heavy-remote) does not use this check.
-  const confirmHeavyPrBase = (): number | undefined => {
+  const confirmHeavyPrBase = async (): Promise<number | undefined> => {
     if (!opts.heavyRemote) return undefined;
-    const viewed = run('gh', ['pr', 'view', String(opts.pr), '--json', 'baseRefName,url'], { cwd });
-    // JSON only. A bare "main" from another view (tests, --jq) is not this answer; unreadable is not main.
-    let baseName = '';
-    try {
-      if (viewed.ok) {
-        const parsed: unknown = JSON.parse(viewed.out);
-        const name = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-          ? (parsed as { baseRefName?: unknown }).baseRefName : undefined;
-        if (typeof name === 'string') baseName = name.trim();
-      }
-    } catch { /* unreadable is not main */ }
+    const baseRead = await readPrBaseNameWithRetry({
+      pr: String(opts.pr), cwd, run,
+      sleep: deps.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+    });
+    const baseName = baseRead.baseRefName;
+    record('heavy-remote-pr-base-read', baseName !== null, {
+      pr: Number(opts.pr), baseRefName: baseName, attempts: baseRead.attempts,
+    });
     if (baseName !== 'main') {
-      record('heavy-remote-pr-base', false, { pr: Number(opts.pr), baseRefName: baseName || null });
-      out.error(`✗ heavy-remote: PR base=${baseName || 'unreadable'} ≠ main — 재타기팅된 PR은 통과한 head/main 쌍이 아니다. 병합하지 않는다.`);
+      record('heavy-remote-pr-base', false, { pr: Number(opts.pr), baseRefName: baseName, attempts: baseRead.attempts });
+      refuseDirect(`✗ heavy-remote: PR base=${baseName ?? 'unreadable'} ≠ main — 재타기팅된 PR은 통과한 head/main 쌍이 아니다. 병합하지 않는다.`);
       return 1;
     }
     return undefined;
@@ -1885,7 +1912,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   };
   const confirmHeavyBaseStable = async (): Promise<number | undefined> => {
     if (!opts.heavyRemote) return undefined;
-    const retargeted = confirmHeavyPrBase();
+    const retargeted = await confirmHeavyPrBase();
     if (retargeted !== undefined) return retargeted;
     let stable = false;
     for (let attempt = 0; attempt <= HEAVY_BASE_STABILITY_RETRIES; attempt += 1) {
@@ -1899,7 +1926,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
       if (staleOverlap !== undefined) return staleOverlap;
       const verdict = heavyGate(main, 'late-recheck');
       if (!verdict?.ok) {
-        out.error(`✗ heavy-remote: 병합 직전 원격 게이트 ${verdict?.reason ?? 'unmeasured'} — 로컬 게이트로 폴백하지 않는다.`);
+        refuseDirect(`✗ heavy-remote: 병합 직전 원격 게이트 ${verdict?.reason ?? 'unmeasured'} — 로컬 게이트로 폴백하지 않는다.`);
         return 1;
       }
       verifiedHeavyBase = main;
@@ -1911,7 +1938,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     }
     // A late regate can take minutes. Re-read baseRefName after that wait and before success:
     // the pre-loop check is stale if the PR was retargeted while origin/main was being remeasured.
-    const retargetedAfter = confirmHeavyPrBase();
+    const retargetedAfter = await confirmHeavyPrBase();
     if (retargetedAfter !== undefined) return retargetedAfter;
     return undefined;
   };
@@ -1990,7 +2017,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   nextMdWarning(body ?? '', changedPaths, out);
   if (!conflictMarkerBlock(changedPaths, cwd, out)) return 1;
   publicLeakWarning(changedPaths, deps.runPublicLeakGate ?? ((files, sink) => runPrLandPublicLeakGate(files, sink, cwd, base)), out);
-  if (!exportLeakBlock(changedPaths, () => (deps.runExportLeakCheck ?? runPrLandExportLeakCheck)(changedPaths ?? [], cwd), opts.allowPublicLeak === true, out, cwd)) return 1;
+  if (!exportLeakBlock(changedPaths, () => (deps.runExportLeakCheck ?? runPrLandExportLeakCheck)(changedPaths ?? [], cwd), opts.allowPublicLeak === true, out, cwd, observeDirectPrLandRefusal)) return 1;
   if (!await exportImportBlock(changedPaths, () => (deps.runExportImportCheck ?? runPrLandExportImportCheck)(changedPaths ?? [], cwd), out)) return 1;
   if (publicDocPaths(changedPaths, () => true).length > 0) {
     const top = run('git', ['rev-parse', '--show-toplevel'], { cwd });
@@ -2347,6 +2374,14 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   }
   if (opts.forceFreeze) debug.log('release-loop.freeze', 'force-merge', { pr: prNumber, reason: opts.forceFreeze.trim() });
   record('merge', true, { result: merged.kind, ...(merged.remoteBranchDeletion ? { remoteBranchDeletion: merged.remoteBranchDeletion.detail } : {}) });
+  // INFLIGHT-REGISTRY — 착지하면 비행 중 등록부의 그 런 줄을 지운다(색인 실패는 착지를 막지 않는다).
+  try {
+    const statePath = deps.taskStatePath ?? taskAgentStatePath();
+    const cards = Object.values(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {});
+    removeInflightForPr(prNumber, cards, { path: join(dirname(statePath), INFLIGHT_REGISTRY_FILE) });
+  } catch (error) {
+    try { debug.log('pr-tool.inflight', 'remove-failed', { pr: prNumber, error: String((error as Error)?.message ?? error).slice(0, 200) }, { level: 'warn' }); } catch { /* fail-soft */ }
+  }
   if (merged.remoteBranchDeletion) {
     out.log(`⚠ remote branch deletion: ${merged.remoteBranchDeletion.detail}`);
   }

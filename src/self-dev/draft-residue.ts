@@ -9,7 +9,7 @@ import { appendRunLedgerEntry, listRunLedgers, loadRunLedger, runLedgerDir, type
 import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { clipRegateDetail, regateFailureFacts, type HostRegateFailure } from '../self-implement/regate-detail.js';
 import { DRAFT_SWEEP_CLOSE_CAP } from './draft-sweep.js';
-import { PROTECTED_LABELS, sameVerifiedGoal, type DraftTriagePr } from './draft-triage-rules.js';
+import { PROTECTED_LABELS, type DraftTriagePr } from './draft-triage-rules.js';
 
 export type PodTerminalClass = 'landed' | 'merge-ready-not-merged' | 'failed-with-pr' | 'failed-no-pr' | 'failed-pr-unobserved' | 'timed-out-harvestable';
 export interface PrTerminalRecord {
@@ -43,7 +43,26 @@ export interface PodTerminalInput {
   at?: string;
 }
 
-const cardOf = (text?: string): string | null => /^칸:\s*(\S.*?)\s*$/m.exec(text ?? '')?.[1]?.trim() || null;
+function cardOf(text?: string): string | null {
+  const lines = (text ?? '').split(/\r?\n/).filter((line) => line.startsWith('칸:'));
+  if (lines.length !== 1) return null;
+  const slot = lines[0]!.slice('칸:'.length).trim();
+  // A blank marker cannot borrow an ID from the following line. Duplicate markers are
+  // ambiguous even when they happen to name the same card.
+  return slot && !/\s/.test(slot) ? slot : null;
+}
+const validCardSlot = (text: string | null): text is string => !!text && /^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$/.test(text);
+const goalLineage = (pr: ResiduePr): string | undefined =>
+  /(?:^|[-/])goalid-([a-f0-9]+)(?=-|\/|$)/i.exec(pr.branch)?.[1]?.toLowerCase()
+  ?? /^골(?: ID)?:\s*(\S.*?)\s*$/m.exec(pr.body ?? '')?.[1];
+const hasCodeDiff = (paths: readonly string[]): boolean => paths.some((path) =>
+  !path.startsWith('docs/') && (
+    /\.(?:[cm]?[jt]sx?|py|sh|bash|zsh|rs|go|c|cc|cpp|h|hpp|java|kt|swift|rb|php|lua|sql)$/.test(path)
+    || /(?:^|\/)(?:Dockerfile|Containerfile|Makefile)(?:\.[^/]*)?$/.test(path)
+    || (path.startsWith('graphs/') && /\.ya?ml$/.test(path))));
+function sameCardSlot(previous: ResiduePr, current: ResiduePr, slot: string): boolean {
+  return cardOf(previous.body) === slot && cardOf(current.body) === slot;
+}
 const harvestable = PR_LABELS.find((label) => label.name === 'elanous:harvestable')!.name;
 const superseded = PR_LABELS.find((label) => label.name === 'elanous:superseded')!.name;
 
@@ -83,6 +102,8 @@ export function classifyPodTerminal(input: PodTerminalInput): PrTerminalRecord {
 export interface ResiduePr extends DraftTriagePr {
   createdAt: string;
   labels: readonly string[];
+  headSha?: string;
+  isDraft?: boolean;
   body?: string;
   comments?: readonly string[];
   /** GitHub PR state at lookup time (review r8) — absent only from injected inventories. */
@@ -92,8 +113,12 @@ export interface DraftResidueAdapters {
   loadLedger(runId: string, ledgerDir: string): readonly RunLedgerEntry[] | null;
   appendLedger(entry: RunLedgerEntry, ledgerDir: string): void;
   getPr(number: number): Promise<ResiduePr | undefined> | ResiduePr | undefined;
+  /** Return all issue comments only after pagination completes; undefined means completeness is unknown. */
+  getAllComments?(repository: string, number: number): Promise<readonly string[] | undefined> | readonly string[] | undefined;
   /** Undefined means the open-draft inventory could not be observed («못 셌음») — never a disguised zero count. */
   listOpenDrafts(repository: string): Promise<readonly ResiduePr[] | undefined> | readonly ResiduePr[] | undefined;
+  /** Complete changed-path inventory for the newly opened PR; undefined is unmeasured. */
+  listPrChangedPaths?(repository: string, number: number): Promise<readonly string[] | undefined> | readonly string[] | undefined;
   addLabel(repository: string, number: number, label: string): Promise<void> | void;
   setLabels(repository: string, number: number, change: { add: string; remove: readonly string[] }): Promise<void> | void;
   comment(repository: string, number: number, body: string): Promise<void> | void;
@@ -125,9 +150,9 @@ function gh(args: string[]): string {
   if (result.status !== 0) throw new Error((result.stderr || result.error?.message || `gh exited ${result.status}`).trim().slice(0, 200));
   return result.stdout.trim();
 }
-function ghPr(row: { number: number; title: string; headRefName: string; createdAt: string; body: string; labels: Array<{ name: string }>; comments?: Array<{ body: string }>; state?: string }): ResiduePr {
+function ghPr(row: { number: number; title: string; headRefName: string; headRefOid?: string; isDraft?: boolean; createdAt: string; body: string; labels: Array<{ name: string }>; comments?: Array<{ body: string }>; state?: string }): ResiduePr {
   const state = row.state === 'OPEN' || row.state === 'CLOSED' || row.state === 'MERGED' ? row.state : undefined;
-  return { number: row.number, title: row.title, branch: row.headRefName, createdAt: row.createdAt, body: row.body,
+  return { number: row.number, title: row.title, branch: row.headRefName, headSha: row.headRefOid, isDraft: row.isDraft, createdAt: row.createdAt, body: row.body,
     labels: row.labels.map((label) => label.name), comments: row.comments?.map((comment) => comment.body), ...(state ? { state } : {}) };
 }
 /** Where the default `getRunStatus` reads run facts. Production reads the federated host ledgers and the running-runs
@@ -174,11 +199,22 @@ export function residueRunStatus(draft: Pick<ResiduePr, 'number'>, repository: s
 }
 
 export function defaultAdapters(sources: ResidueRunStatusSources = defaultRunStatusSources): DraftResidueAdapters {
-  const fields = 'number,title,headRefName,createdAt,body,labels,comments,state';
+  const fields = 'number,title,headRefName,headRefOid,isDraft,createdAt,body,labels,comments,state';
   return {
     loadLedger: loadRunLedger,
     appendLedger: appendRunLedgerEntry,
     getPr: (number) => ghPr(JSON.parse(gh(['pr', 'view', String(number), '-R', hostRepository() ?? '', '--json', fields]))),
+    getAllComments: (repository, number) => {
+      try {
+        const pages: unknown = JSON.parse(gh(['api', `repos/${repository}/issues/${number}/comments?per_page=100`, '--paginate', '--slurp']));
+        if (!Array.isArray(pages) || !pages.every((page) => Array.isArray(page)
+          && page.every((row: unknown) => !!row && typeof row === 'object' && typeof (row as { body?: unknown }).body === 'string'))) return undefined;
+        return (pages as Array<Array<{ body: string }>>).flat().map((row) => row.body);
+      } catch (error) {
+        debug.log('draft.residue', 'comments-unobserved', { repository, number, reason: error instanceof Error ? error.message : String(error) });
+        return undefined;
+      }
+    },
     listOpenDrafts: (repository) => {
       const rows: ResiduePr[] = [];
       try {
@@ -198,8 +234,19 @@ export function defaultAdapters(sources: ResidueRunStatusSources = defaultRunSta
         return undefined;
       }
     },
+    listPrChangedPaths: (repository, number) => {
+      try {
+        const pages: unknown = JSON.parse(gh(['api', `repos/${repository}/pulls/${number}/files?per_page=100`, '--paginate', '--slurp']));
+        if (!Array.isArray(pages) || !pages.every((page) => Array.isArray(page)
+          && page.every((row: unknown) => !!row && typeof row === 'object' && typeof (row as { filename?: unknown }).filename === 'string'))) return undefined;
+        return (pages as Array<Array<{ filename: string }>>).flat().map((row) => row.filename);
+      } catch { return undefined; }
+    },
     addLabel: (repository, number, label) => { gh(['pr', 'edit', String(number), '-R', repository, '--add-label', label]); },
-    setLabels: (repository, number, change) => { gh(['pr', 'edit', String(number), '-R', repository, '--add-label', change.add, ...change.remove.flatMap((label) => ['--remove-label', label])]); },
+    setLabels: (repository, number, change) => {
+      const flags = [...(change.add ? ['--add-label', change.add] : []), ...change.remove.flatMap((label) => ['--remove-label', label])];
+      if (flags.length) gh(['pr', 'edit', String(number), '-R', repository, ...flags]);
+    },
     comment: (repository, number, body) => { gh(['pr', 'comment', String(number), '-R', repository, '--body', body]); },
     closePr: (repository, number) => { gh(['pr', 'close', String(number), '-R', repository]); },
     listLiveBranches: (repository) => {
@@ -334,7 +381,7 @@ export async function replayPodTerminals(options: DraftResidueReplayOptions = {}
       const outcome = await applyPodTerminal(record, { ledgerDir, ledgerRunId, adapters: replayAdapters, closeBudget });
       if (outcome.status === 'recorded' || outcome.reason === 'already-recorded') recovered++;
       else if (outcome.status === 'skipped' && outcome.reason === 'repository-unobserved') unresolved++;
-      else if (outcome.status === 'skipped' && !['previous-run-unverified', 'previous-run-live', 'close-cap', 'host-repository-unobserved'].includes(outcome.reason ?? '')) recovered++;
+      else if (outcome.status === 'skipped' && !['previous-run-unverified', 'previous-run-live', 'close-cap', 'host-repository-unobserved', 'restore-unverified'].includes(outcome.reason ?? '')) recovered++;
       else pending++;
     }
   }
@@ -348,6 +395,7 @@ export async function applyPodTerminal(record: PrTerminalRecord, ctx: DraftResid
   const skipped = (reason: string): DraftResidueResult => { log('skipped', { reason }); return { status: 'skipped', reason }; };
   const budget: DraftCloseBudget = ctx.closeBudget ?? { remaining: DRAFT_SWEEP_CLOSE_CAP };
   let step = 'ledger';
+  let pendingSupersession: { repository: string; number: number; prNumber: number; commentMayExist: boolean } | null = null;
   try {
     const ledger = adapters.loadLedger(ctx.ledgerRunId, ctx.ledgerDir);
     if (ledger === undefined) throw new Error('Terminal ledger unavailable');
@@ -422,6 +470,28 @@ export async function applyPodTerminal(record: PrTerminalRecord, ctx: DraftResid
         step = 'ledger';
         acknowledge('owner-comment', pr.number);
       }
+      // PR1a records a recovery pointer but never closes this failed draft. PR1b owns the close decision.
+      if (record.terminalClass === 'failed-with-pr' && !completed('restore-comment', pr.number)) {
+        step = 'get-pr';
+        let latest: ResiduePr | undefined;
+        try { latest = await adapters.getPr(pr.number); }
+        catch { return skipped('restore-unverified'); }
+        if (!latest || latest.state !== 'OPEN' || latest.isDraft !== true || !record.headSha
+          || latest.headSha?.toLowerCase() !== record.headSha.toLowerCase()
+          || !latest.branch?.trim() || latest.branch !== pr.branch || (record.branch && latest.branch !== record.branch)
+          || !Array.isArray(latest.labels) || latest.labels.some((label) => PROTECTED_LABELS.has(label))) {
+          return skipped('restore-unverified');
+        }
+        step = 'list-comments';
+        let comments: readonly string[] | undefined;
+        try { comments = await adapters.getAllComments?.(record.repository, pr.number); }
+        catch { return skipped('restore-unverified'); }
+        if (!Array.isArray(comments) || comments.some((comment) => typeof comment !== 'string'
+          || /landing-verified\s*:|land-enqueue\s*:/i.test(comment))) return skipped('restore-unverified');
+        const restore = `Draft residue: failed-run recovery · run=${record.childRunId} · head=${record.headSha} · branch=${latest.branch} preserved. Restore from this branch.`;
+        if (!comments.includes(restore)) { step = 'comment'; await adapters.comment(record.repository, pr.number, restore); }
+        step = 'ledger'; acknowledge('restore-comment', pr.number);
+      }
     } else skipped('landed');
     step = 'list-open-drafts';
     const drafts = await adapters.listOpenDrafts(record.repository);
@@ -430,12 +500,33 @@ export async function applyPodTerminal(record: PrTerminalRecord, ctx: DraftResid
       throw new Error('Open draft lookup unavailable or incomplete');
     }
     const newerAt = Date.parse(pr.createdAt);
-    const candidates = drafts.filter((draft: ResiduePr) => draft.number !== pr.number && draft.branch.startsWith('self-impl/')
+    const slot = cardOf(pr.body);
+    const taSlot = validCardSlot(slot) ? slot : undefined;
+    const earlier: ResiduePr[] = drafts.filter((draft: ResiduePr) => draft.number !== pr.number && draft.branch.startsWith('self-impl/')
       && Date.parse(draft.createdAt) < newerAt && !draft.labels.some((label: string) => PROTECTED_LABELS.has(label))
-      && !completed('superseded-close', draft.number)
-      && (!draft.labels.includes(superseded) || completed('supersede-intent', draft.number))
-      // Only a verified goal identifier may close a PR — a shared «칸:» value or seat is not the same goal.
-      && sameVerifiedGoal(draft, pr));
+      && !completed('superseded-close', draft.number));
+    const sameSlot = taSlot ? earlier.filter((draft) => /^[a-f0-9]{40}$/i.test(draft.headSha ?? '') && sameCardSlot(draft, pr, taSlot)
+      && !draft.labels.some((label) => label === 'elanous:running' || label.includes('harvest-claimed'))) : [];
+    let codeDiff = false;
+    if (taSlot && sameSlot.length) {
+      // A changed PR head can turn a measured code PR into a goal-only PR while files are being fetched.
+      step = 'get-pr';
+      const beforeFiles = await adapters.getPr(pr.number);
+      if (!beforeFiles || beforeFiles.number !== pr.number || beforeFiles.state !== pr.state
+        || !pr.headSha || beforeFiles.headSha !== pr.headSha || beforeFiles.branch !== pr.branch
+        || !sameCardSlot(beforeFiles, pr, taSlot)) return skipped('new-pr-changed-before-files');
+      step = 'list-pr-changed-paths';
+      const paths = await adapters.listPrChangedPaths?.(record.repository, pr.number);
+      if (!paths || !Array.isArray(paths) || paths.some((path) => typeof path !== 'string')) return skipped('new-pr-code-diff-unobserved');
+      step = 'get-pr';
+      const afterFiles = await adapters.getPr(pr.number);
+      if (!afterFiles || afterFiles.number !== pr.number || afterFiles.state !== pr.state
+        || afterFiles.headSha !== pr.headSha || afterFiles.branch !== pr.branch
+        || !sameCardSlot(afterFiles, pr, taSlot)) return skipped('new-pr-changed-after-files');
+      codeDiff = hasCodeDiff(paths);
+      if (!codeDiff) log('skipped', { reason: 'new-pr-goal-only', prNumber: pr.number });
+    }
+    const candidates = codeDiff ? sameSlot : [];
     let liveBranches: ReadonlySet<string> | undefined;
     if (candidates.length) {
       step = 'list-live-branches';
@@ -446,6 +537,16 @@ export async function applyPodTerminal(record: PrTerminalRecord, ctx: DraftResid
     let capped = false;
     for (const draft of candidates) {
       if (budget.remaining <= 0) { capped = true; break; }
+      if (taSlot) {
+        step = 'get-pr';
+        const latest = await adapters.getPr(draft.number);
+        if (!latest || latest.number !== draft.number || latest.state !== 'OPEN' || latest.isDraft !== true
+          || !draft.headSha
+          || latest.branch !== draft.branch || latest.headSha !== draft.headSha
+          || !Array.isArray(latest.labels) || latest.labels.some((label) => PROTECTED_LABELS.has(label)
+            || label === 'elanous:running' || label.includes('harvest-claimed'))
+          || !sameCardSlot(latest, pr, taSlot)) { deferred = true; skipped('previous-pr-changed'); continue; }
+      }
       step = 'get-run-status';
       const status = await adapters.getRunStatus(draft, record.repository);
       if (liveBranches!.has(draft.branch) || !['completed', 'failed', 'cancelled', 'abandoned', 'self-implement.result final'].includes(status ?? '')) {
@@ -453,38 +554,145 @@ export async function applyPodTerminal(record: PrTerminalRecord, ctx: DraftResid
         skipped(`previous-run-${status === 'running' || status === 'probable-running' || liveBranches!.has(draft.branch) ? 'live' : 'unobserved'}`);
         continue;
       }
+      if (taSlot) {
+        step = 'list-live-branches';
+        const liveNow = await adapters.listLiveBranches(record.repository);
+        step = 'get-run-status';
+        const statusNow = await adapters.getRunStatus(draft, record.repository);
+        if (!liveNow || liveNow.has(draft.branch)
+          || !['completed', 'failed', 'cancelled', 'abandoned', 'self-implement.result final'].includes(statusNow ?? '')) {
+          deferred = true; skipped('previous-run-changed-before-label'); continue;
+        }
+      }
+      // Revalidate the effective diff and both PRs before applying any public supersession marker.
+      if (taSlot) {
+        const newBeforeClose = await adapters.getPr(pr.number);
+        if (!newBeforeClose || newBeforeClose.number !== pr.number || newBeforeClose.state !== pr.state
+          || newBeforeClose.headSha !== pr.headSha || newBeforeClose.branch !== pr.branch
+          || !sameCardSlot(newBeforeClose, pr, taSlot)) { deferred = true; skipped('new-pr-changed-before-close'); continue; }
+        // The base can move without changing this PR's head. Re-read the effective diff before closing the old draft.
+        step = 'list-pr-changed-paths';
+        const currentPaths = await adapters.listPrChangedPaths?.(record.repository, pr.number);
+        if (!currentPaths || !Array.isArray(currentPaths) || currentPaths.some((path) => typeof path !== 'string')
+          || !hasCodeDiff(currentPaths)) { deferred = true; skipped('new-pr-code-diff-changed-before-close'); continue; }
+        step = 'get-pr';
+        const afterCloseDiff = await adapters.getPr(pr.number);
+        if (!afterCloseDiff || afterCloseDiff.number !== pr.number || afterCloseDiff.state !== pr.state
+          || afterCloseDiff.headSha !== pr.headSha || afterCloseDiff.branch !== pr.branch
+          || !sameCardSlot(afterCloseDiff, pr, taSlot)) { deferred = true; skipped('new-pr-changed-after-close-diff'); continue; }
+        const beforeClose = await adapters.getPr(draft.number);
+        if (!beforeClose || beforeClose.number !== draft.number || beforeClose.state !== 'OPEN' || beforeClose.isDraft !== true
+          || !draft.headSha
+          || beforeClose.branch !== draft.branch || beforeClose.headSha !== draft.headSha
+          || !Array.isArray(beforeClose.labels) || beforeClose.labels.some((label) => PROTECTED_LABELS.has(label)
+            || label === 'elanous:running' || label.includes('harvest-claimed'))
+          || !sameCardSlot(beforeClose, pr, taSlot)) { deferred = true; skipped('previous-pr-changed-before-close'); continue; }
+        step = 'list-live-branches';
+        const liveBeforeClose = await adapters.listLiveBranches(record.repository);
+        step = 'get-run-status';
+        const statusBeforeClose = await adapters.getRunStatus(draft, record.repository);
+        if (!liveBeforeClose || liveBeforeClose.has(draft.branch)
+          || !['completed', 'failed', 'cancelled', 'abandoned', 'self-implement.result final'].includes(statusBeforeClose ?? '')) {
+          deferred = true; skipped('previous-run-changed-before-close'); continue;
+        }
+      }
       if (!completed('supersede-intent', draft.number)) {
         step = 'ledger';
         acknowledge('supersede-intent', draft.number);
       }
-      if (!completed('superseded-label', draft.number)) {
-        if (!draft.labels.includes(superseded)) {
-          step = 'set-labels';
-          await adapters.setLabels(record.repository, draft.number, { add: superseded,
-            remove: PR_LABELS.filter((label) => label.axis === 'state' && draft.labels.includes(label.name) && label.name !== superseded).map((label) => label.name) });
-        }
-        step = 'ledger';
-        acknowledge('superseded-label', draft.number);
+      // The inventory was read before the liveness and diff checks. Labels can change while
+      // those checks run, so ownership and the state to restore come from a fresh PR read.
+      step = 'get-pr';
+      const beforeLabel = await adapters.getPr(draft.number);
+      if (!beforeLabel || beforeLabel.number !== draft.number || beforeLabel.state !== 'OPEN'
+        || beforeLabel.isDraft !== true || beforeLabel.branch !== draft.branch
+        || beforeLabel.headSha !== draft.headSha || !Array.isArray(beforeLabel.labels)
+        || beforeLabel.labels.some((label) => PROTECTED_LABELS.has(label)
+          || label === 'elanous:running' || label.includes('harvest-claimed'))
+        || (taSlot && !sameCardSlot(beforeLabel, pr, taSlot))) {
+        deferred = true; skipped('previous-pr-changed-before-label-write'); continue;
       }
-      const body = `Draft residue: superseded-by #${pr.number} (newer run ${record.childRunId} of the same goal). Branch preserved.`;
+      // There is no conditional GitHub add-label operation. A label written before close
+      // cannot be safely removed on a race: another run may have added that same label
+      // between our read and write. Apply the public state marker only after close succeeds.
+      pendingSupersession = { repository: record.repository, number: draft.number, prNumber: pr.number,
+        commentMayExist: false };
+      const body = taSlot
+        ? `Draft residue: superseded-by #${pr.number} (same card ${taSlot}; old goalid=${goalLineage(draft) ?? 'unobserved'}; new goalid=${goalLineage(pr) ?? 'unobserved'}; newer run ${record.childRunId}). Branch preserved.`
+        : `Draft residue: superseded-by #${pr.number} (newer run ${record.childRunId} of the same goal). Branch preserved.`;
+      pendingSupersession.commentMayExist = completed('supersede-comment', draft.number);
       if (!completed('supersede-comment', draft.number)) {
-        // REST draft listings do not contain comments; fetch them on a retry after the label was applied.
+        // REST draft listings do not contain comments; fetch them before deciding whether to comment.
         let comments = draft.comments;
-        if (comments === undefined && completed('superseded-label', draft.number)) {
+        if (comments === undefined) {
           step = 'get-pr';
           const prior = await adapters.getPr(draft.number);
           if (!prior || prior.number !== draft.number) throw new Error('Previous PR lookup unavailable');
           comments = prior.comments;
         }
-        if (!comments?.includes(body)) { step = 'comment'; await adapters.comment(record.repository, draft.number, body); }
+        if (!comments?.includes(body)) {
+          pendingSupersession.commentMayExist = true;
+          step = 'comment'; await adapters.comment(record.repository, draft.number, body);
+        }
         step = 'ledger';
         acknowledge('supersede-comment', draft.number);
       }
+      if (taSlot) {
+        // A claimant or new commit can arrive while GitHub accepts the label/comment writes.
+        step = 'list-pr-changed-paths';
+        const pathsAfterEffects = await adapters.listPrChangedPaths?.(record.repository, pr.number);
+        // The diff lookup can race a new head; bind its result to the head read after it.
+        step = 'get-pr';
+        const newAfterEffects = await adapters.getPr(pr.number);
+        step = 'list-live-branches';
+        const liveAfterEffects = await adapters.listLiveBranches(record.repository);
+        step = 'get-run-status';
+        const statusAfterEffects = await adapters.getRunStatus(draft, record.repository);
+        step = 'get-pr';
+        const oldAfterEffects = await adapters.getPr(draft.number);
+        if (!newAfterEffects || newAfterEffects.number !== pr.number || newAfterEffects.state !== pr.state
+          || newAfterEffects.headSha !== pr.headSha || newAfterEffects.branch !== pr.branch
+          || !sameCardSlot(newAfterEffects, pr, taSlot)
+          || !pathsAfterEffects || !Array.isArray(pathsAfterEffects)
+          || pathsAfterEffects.some((path) => typeof path !== 'string') || !hasCodeDiff(pathsAfterEffects)
+          || !oldAfterEffects || oldAfterEffects.number !== draft.number || oldAfterEffects.state !== 'OPEN'
+          || oldAfterEffects.isDraft !== true || oldAfterEffects.headSha !== draft.headSha
+          || oldAfterEffects.branch !== draft.branch || !Array.isArray(oldAfterEffects.labels)
+          || oldAfterEffects.labels.some((label) => PROTECTED_LABELS.has(label)
+            || label === 'elanous:running' || label.includes('harvest-claimed'))
+          || !sameCardSlot(oldAfterEffects, pr, taSlot)
+          || !liveAfterEffects || liveAfterEffects.has(draft.branch)
+          || !['completed', 'failed', 'cancelled', 'abandoned', 'self-implement.result final'].includes(statusAfterEffects ?? '')) {
+          const correction = `Draft residue: supersession by #${pr.number} deferred after PR or run changed; branch preserved. Prior superseded-by comment is no longer a close decision.`;
+          if (!oldAfterEffects?.comments?.includes(correction)) {
+            step = 'comment';
+            await adapters.comment(record.repository, draft.number, correction);
+          }
+          pendingSupersession = null;
+          deferred = true; skipped('supersession-changed-after-effects'); continue;
+        }
+      }
       step = 'close-pr';
       await adapters.closePr(record.repository, draft.number);
+      pendingSupersession = null;
       budget.remaining--;
       step = 'ledger';
       acknowledge('superseded-close', draft.number);
+      // The close is irreversible. Label failure is diagnostic, never a reason to retry
+      // supersession or to roll back a label whose writer cannot be identified.
+      if (!beforeLabel.labels.includes(superseded)) {
+        try {
+          step = 'set-labels';
+          // A state label read before close may have been written by another run
+          // before this call. Its writer is unknown, so only add our marker.
+          await adapters.setLabels(record.repository, draft.number, { add: superseded, remove: [] });
+          step = 'ledger';
+          if (!completed('superseded-label', draft.number)) acknowledge('superseded-label', draft.number);
+        } catch (labelError) {
+          log('superseded-label-unobserved', { previousPrNumber: draft.number,
+            reason: labelError instanceof Error ? labelError.message : String(labelError) });
+        }
+      }
       log('superseded-previous', { previousPrNumber: draft.number });
     }
     if (deferred) return skipped('previous-run-unverified');
@@ -494,6 +702,17 @@ export async function applyPodTerminal(record: PrTerminalRecord, ctx: DraftResid
     return { status: 'recorded' };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    if (pendingSupersession) {
+      const pending = pendingSupersession;
+      try {
+        if (pending.commentMayExist) await adapters.comment(pending.repository, pending.number,
+          `Draft residue: supersession by #${pending.prNumber} deferred after an interrupted check; branch preserved. Prior superseded-by comment is no longer a close decision.`);
+        log('supersession-compensated', { previousPrNumber: pending.number, failedStep: step });
+      } catch (compensationError) {
+        log('supersession-compensation-failed', { previousPrNumber: pending.number,
+          reason: compensationError instanceof Error ? compensationError.message : String(compensationError) });
+      }
+    }
     log('failed', { step, reason });
     return { status: 'failed', step, reason };
   }

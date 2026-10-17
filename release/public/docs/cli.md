@@ -565,6 +565,35 @@ elanous ops [options] [command]
 | `mission [options] <id>` | One mission in detail — content + per-phase diagnosis (failClass · recommended heal) + related tasks/schedules/autonomous actions + transitions |
 | `mission-log [options] <id>` | Tail a mission's run log (run.log) — the evidence behind the diagnosis (survives reboot) |
 | `build [options] [buildId]` | Observe/control isolated builds — list when no id, snapshot with a buildId. --follow streams like tail -f, --stop stops a running build |
+| `overview [options]` | One-page flow health — the verdict first, then the reason chain behind it (--since <window> · --watch [seconds] · --json) |
+
+### One-page flow view — `elanous ops overview`
+
+`elanous ops overview` answers one question on a single page: is the pipeline
+(authoring → implementation → landing) flowing — and if not, why. The verdict
+comes first, then the reason chain behind it. Unmeasured cells print `null`
+(never 0). Exit codes make it scriptable: `0` = flowing/degraded, `3` = any
+other verdict, `1` = collection failure.
+
+| Verdict (label) | Meaning |
+|---|---|
+| 관측 안 됨 | A core cell (release run · checklist · launchable · capacity) could not be measured |
+| 막힘 | The release run waits on a decision, or a freeze window is active |
+| 루프 멈춤 | A loop with a known cadence stopped beating |
+| 자원 포화 | There is launchable work but zero free seats |
+| 공급 부족 | Seats are free but nothing is launchable |
+| 흐름 저하 | Stale harness parents or machine pressure slow the flow |
+| 흐름 정상 | No hits — work is moving |
+
+Verdicts are checked in this order and the first hit wins.
+`--since <window>` narrows the landing window (`1h` default);
+`--watch [seconds]` re-runs it on a timer.
+
+**Telegram one-line briefs.** The steward watches the same verdict and sends a
+single line to the Telegram **ops** channel (kind `ops-report` — the same
+channel as the daily digest) only when the verdict *changes*, and only after
+the same verdict has been observed **twice in a row** — so a verdict flapping
+across a boundary stays quiet.
 
 ## `elanous plugin`
 

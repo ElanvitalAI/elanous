@@ -3,7 +3,9 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { landingPodShadowScript, runLandingPodShadowJob, type LandingPodShadowVerdict } from './pr-land-pod-shadow-job.js';
+import { runPodCommand } from '../task-orchestrator/surfaces/pod-command-job.js';
+import { PodPoolScheduler, type PodPoolMember } from '../task-orchestrator/surfaces/pod-pool.js';
+import { LANDING_POD_SHADOW_HOST_TIMEOUT_MS, LANDING_POD_SHADOW_STATUS_UNREADABLE_MS, landingPodShadowScript, runLandingPodShadowJob, type LandingPodShadowVerdict } from './pr-land-pod-shadow-job.js';
 import { runHeavyOnPodShadow } from './pr-land-pod-shadow.js';
 
 const head = 'a'.repeat(40);
@@ -18,12 +20,70 @@ test('shadow Pod runs the reviewed head merged with pinned main, then both landi
     },
     readLog: () => `ELANOUS_PRLAND_SHADOW_TSC_PLAN {"mode":"affected","roots":4,"promoted":false,"reason":null}\n[tsc-gate] root-plan {"mode":"full","roots":null,"promoted":true,"reason":"gate spoof"}\nELANOUS_PRLAND_SHADOW head=${head} main=${main} tsc=0 gate=0\n`,
   });
-  expect(options).toMatchObject({ clone: true, source: { kind: 'commit', sha: head }, returnLogs: true });
+  expect(options).toMatchObject({ clone: true, source: { kind: 'commit', sha: head }, returnLogs: true,
+    statusUnreadableMs: LANDING_POD_SHADOW_STATUS_UNREADABLE_MS });
+  expect(options?.signal).toBeInstanceOf(AbortSignal);
+  expect(typeof options?.hostDeadlineAtMs).toBe('number');
   const script = (options?.command as string[])[2]!;
   expect(script).toContain(`git fetch origin '${main}'`);
   expect(script).toContain(`TSC_BASE_REF='${main}' bun scripts/ci-typecheck-changed.ts --local`);
   expect(script).toContain(`self gate --changed --base '${main}' --local --shards 4`);
   expect(verdict).toMatchObject({ measured: true, ok: true, tscRc: 0, gateRc: 0, rootPlan: { mode: 'affected', roots: 4 }, job: 'pod-shadow-77' });
+});
+
+test('PRLAND-SHADOW-HOST-TIMEOUT: stalled Pod is bounded by host timer; landing verdict remains local', async () => {
+  let fireTimeout: (() => void) | undefined;
+  let disarmed = false;
+  const warnings: string[] = [];
+  const events: Array<Record<string, unknown>> = [];
+  const local: LandingPodShadowVerdict = { measured: true, ok: true, rootPlan: { mode: 'full', roots: null, promoted: true, reason: 'promoted' } };
+  const pending = runHeavyOnPodShadow({ enabled: true, pr: 77, head, local,
+    runPod: () => runLandingPodShadowJob({ head, main }, {
+      armTimeout: (fire, ms) => {
+        expect(ms).toBe(LANDING_POD_SHADOW_HOST_TIMEOUT_MS);
+        fireTimeout = fire;
+        return () => { disarmed = true; };
+      },
+      runPod: ({ signal }) => new Promise((_, reject) => {
+        signal!.addEventListener('abort', () => reject(signal!.reason), { once: true });
+      }),
+    }),
+    log: (_category, _event, data) => events.push(data),
+    warn: (message) => warnings.push(message),
+  });
+  expect(fireTimeout).toBeDefined();
+  fireTimeout!();
+  expect(await pending).toBe(local);
+  expect(disarmed).toBe(true);
+  expect(warnings).toEqual([`pod shadow: host timeout after ${LANDING_POD_SHADOW_HOST_TIMEOUT_MS}ms`]);
+  expect(events).toHaveLength(1);
+  expect(events[0]).toMatchObject({ agree: false, pod: { measured: false, ok: false, reason: 'pod-exception:Error' } });
+});
+
+test('PRLAND-SHADOW-HOST-TIMEOUT: landing resumes after real runner deletes Job and releases lease', async () => {
+  let fireTimeout: (() => void) | undefined;
+  const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool' };
+  const pool = new PodPoolScheduler([member]);
+  const commands: string[][] = [];
+  const warnings: string[] = [];
+  const local: LandingPodShadowVerdict = { measured: true, ok: true, rootPlan: { mode: 'full', roots: null, promoted: true, reason: 'promoted' } };
+  const result = await runHeavyOnPodShadow({ enabled: true, pr: 77, head, local,
+    runPod: () => runLandingPodShadowJob({ head, main }, {
+      armTimeout: (fire) => { fireTimeout = fire; return () => {}; },
+      runPod: (options) => runPodCommand({ ...options, name: 'shadow-integration', poolScheduler: pool,
+        kubectl: (args) => { commands.push([...args]); return { status: 0, stdout: '', stderr: '' }; },
+        syncImages: async () => new Map([[member.context, { ok: true, action: 'fresh' as const, detail: 'ready', ms: 1 }]]),
+        sleep: async () => { fireTimeout!(); }, ghToken: () => 'test-token', imageCommit: null,
+        env: {}, configHostMirror: () => undefined, artifactsRoot: '/tmp/pod-command-shadow-integration', log: () => {},
+      }),
+    }),
+    log: () => {}, warn: (message) => warnings.push(message),
+  });
+  expect(result).toBe(local);
+  expect(warnings).toEqual([`pod shadow: host timeout after ${LANDING_POD_SHADOW_HOST_TIMEOUT_MS}ms`]);
+  expect(commands.filter((args) => args.includes('delete') && args.includes('job') && args.includes('shadow-integration'))).toHaveLength(1);
+  expect(commands.some((args) => args.includes('delete') && args.includes('secret'))).toBe(true);
+  expect(pool.snapshot()).toEqual({ 'pool-node-b': 0 });
 });
 
 test('failed check is measured failure; missing or wrong identity marker is unmeasured', async () => {

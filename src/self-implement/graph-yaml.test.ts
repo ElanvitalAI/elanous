@@ -276,8 +276,10 @@ describe('RFC §5 1단계 — YAML 이 «코드 상수»와 같은가', () => {
     const refusalEdges = implement.edges.filter((edge) => edge.from === 'merge' && edge.on === 'refusal');
     expect(refusalEdges).toHaveLength(1);
     expect(refusalEdges[0]?.map).toEqual({
-      draft: 'ready', 'head-branch': 'pr-head-checkout', 'not-ancestor': 'main-sync',
-      'review-missing': 'review', other: 'next-move',
+      draft: 'ready', 'gate-host-busy': 'next-move', 'gate-merge-conflict': 'main-sync',
+      'gate-touch-clean': 'next-move', 'head-branch': 'pr-head-checkout',
+      'not-ancestor': 'main-sync', 'pr-base-unreadable': 'next-move',
+      'public-export-leak': 'next-move', 'review-missing': 'review', other: 'next-move',
     });
     const yamlTargets = new Map<string, Set<string>>();
     for (const edge of implement.edges) {

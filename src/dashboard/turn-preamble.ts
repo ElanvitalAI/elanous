@@ -39,6 +39,8 @@ import {
 } from '../agent/task-notification.js';
 import type { getUserConfig } from '../user-config.js';
 import { isNativeStructureEnabledForProvider, resolveActiveProvider } from '../user-config.js';
+import { measureInputLagTurnStart } from '../tui/input-lag-probe.js';
+import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
 
 type UserConfig = ReturnType<typeof getUserConfig>;
 
@@ -61,8 +63,6 @@ export interface DashboardTurnPreambleContext {
   modelFamily?: ModelFamily;
   /** Current request session ID. It is injected only while this preamble is built for the turn. */
   sessionId?: string;
-  /** Catalog richness for non-dashboard callers; the essential dashboard passes false. */
-  rich?: boolean;
   /** Active tool names for session-specific guidance (Wave 3,
    *  2026-05-04). When provided, the universal preamble emits per-tool
    *  one-liner directives (e.g. AskUserQuestion → use for tool-deny
@@ -85,40 +85,108 @@ export function buildControllerSystemMessage(controller: string, channels?: stri
   };
 }
 
+/** How old a git snapshot the TUI preamble may serve while it rebuilds in the background.
+ *  Edits (post-Edit force refresh) and HEAD moves invalidate it earlier; the dashboard's
+ *  5s git tick keeps it younger than this so an idle-then-type turn still hits. */
+const DASHBOARD_GIT_SNAPSHOT_STALE_MS = 60_000;
+
+/** TUI-TYPING-LAG-OBS 시험 seam — 이 ms 만큼 turn-preamble 을 «동기로» 막아 타이핑 지연을 일으킨다.
+ *  운영 기본 0. 켜는 길 둘: ux-sim·단위 시험은 `setPreambleSyncBlockMsForTesting` · 격리 TUI 는
+ *  env `ELANOUS_TEST_PREAMBLE_SYNC_BLOCK_MS`(⛔ test 우주에서만 읽는다 — 운영 우주에선 무시).
+ *  test 우주 = 이 프로세스의 실효 뿌리가 운영 집이 아닌 것. `--test` 플래그만 보면 pty-drive 가
+ *  `--test` 를 `--config-dir <격리 뿌리>` 로 바꿔 띄운 시험 자식에서 seam 이 안 켜진다. */
+export const PREAMBLE_SYNC_BLOCK_ENV = 'ELANOUS_TEST_PREAMBLE_SYNC_BLOCK_MS';
+let preambleSyncBlockOverrideMs: number | null = null;
+
+export function setPreambleSyncBlockMsForTesting(ms: number | null): void {
+  preambleSyncBlockOverrideMs = ms;
+}
+
+export function preambleSyncBlockMs(
+  env: NodeJS.ProcessEnv = process.env,
+  instanceRoot: () => string = effectiveInstanceRoot,
+): number {
+  if (preambleSyncBlockOverrideMs !== null) return Math.max(0, preambleSyncBlockOverrideMs);
+  const raw = env[PREAMBLE_SYNC_BLOCK_ENV];
+  if (!raw || instanceRoot() === prodInstanceRoot()) return 0;
+  const ms = Number(raw);
+  return Number.isFinite(ms) && ms > 0 ? ms : 0;
+}
+
+/** 일부러 이벤트 루프를 동기로 막는다(시험 seam). 시계를 돌며 도는 바쁜 루프 대신 `Atomics.wait` —
+ *  CPU 를 태우지 않고, 시험이 시계를 가짜로 바꿔도 끝난다. */
+function blockPreambleSync(ms: number): void {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 export function buildDashboardTurnPreamble(
   ctx: DashboardTurnPreambleContext,
 ): LLMMessage[] {
+  return measureInputLagTurnStart(() => {
+    blockPreambleSync(preambleSyncBlockMs());
+    return buildDashboardTurnPreambleUnmeasured(ctx);
+  });
+}
+
+/** TURN-START-BLOCK-REST 1단계 — 빌더마다 걸린 ms(0.1ms 반올림)를 `chat.turn-preamble built` 의
+ *  `builderMs` 칸에 싣는다. 시계는 빌더마다 앞뒤 한 번씩이고, `built` 이벤트가 안 나가는
+ *  (`debug.enabled` 꺼짐) 턴에서는 재지 않는다. 이 함수의 빌더는 전부 동기라 잰 ms 가 곧
+ *  이벤트 루프를 막은 시간이다(`builderMsKind: 'sync'`). */
+type BuilderMs = Record<string, number>;
+
+function timed<T>(ms: BuilderMs | null, name: string, fn: () => T): T {
+  if (ms === null) return fn();
+  const t0 = performance.now();
+  try {
+    return fn();
+  } finally {
+    ms[name] = Math.round((performance.now() - t0) * 10) / 10;
+  }
+}
+
+function buildDashboardTurnPreambleUnmeasured(
+  ctx: DashboardTurnPreambleContext,
+): LLMMessage[] {
+  const builderMs: BuilderMs | null = debug.enabled ? {} : null;
+  const startedAt = builderMs === null ? 0 : performance.now();
   // Universal preamble — surface-agnostic anchor (AGENTS.md +
   // CLAUDE.md). Spread first so the project context lands BEFORE any
   // surface-specific guidance, mirroring Claude Code's Phase 0
   // ordering. Returns [] when neither anchor file exists, so the
   // spread is a no-op outside actual project repos (tests etc.).
-  const universalPreamble = buildUniversalPreamble({
+  const universalPreamble = timed(builderMs, 'universal', () => buildUniversalPreamble({
     cwd: ctx.cwd,
     ...(ctx.modelFamily !== undefined ? { modelFamily: ctx.modelFamily } : {}),
     ...(ctx.enabledTools !== undefined ? { enabledTools: ctx.enabledTools } : {}),
-  });
+  }));
   // 🪪 L1 — 자리 부트 카드(세션마다 한 번 만든 스냅샷). 정체성(앵커) 바로 뒤. 자리가 아니면 [].
-  const seatBootSystemMsgs = ctx.seatBoot
-    ? buildSeatBootSystemMessages(
+  const seatBoot = ctx.seatBoot;
+  const seatBootSystemMsgs = seatBoot
+    ? timed(builderMs, 'seatBoot', () => buildSeatBootSystemMessages(
       { cwd: ctx.cwd, ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}) },
-      ctx.seatBoot === true ? {} : ctx.seatBoot,
-    )
+      seatBoot === true ? {} : seatBoot,
+    ))
     : [];
-  const planModeSystemMsgs = buildPlanModeSystemMessages();
-  const askSystemMsgs = buildExecutionAskSystemMessages() as LLMMessage[];
-  const approvalSystemMsgs = buildApprovalPolicySystemMessages() as LLMMessage[];
-  const sandboxSystemMsgs = buildSandboxEscalationSystemMessages() as LLMMessage[];
+  const planModeSystemMsgs = timed(builderMs, 'planMode', () => buildPlanModeSystemMessages());
+  const askSystemMsgs = timed(builderMs, 'ask', () => buildExecutionAskSystemMessages() as LLMMessage[]);
+  const approvalSystemMsgs = timed(builderMs, 'approval', () => buildApprovalPolicySystemMessages() as LLMMessage[]);
+  const sandboxSystemMsgs = timed(builderMs, 'sandbox', () => buildSandboxEscalationSystemMessages() as LLMMessage[]);
   // Session-scoped (built once, rebuilt on change) — see turn-session-layers.ts.
   const sessionKey = ctx.sessionId ?? 'tui';
-  const memorySystemMsgs = ctx.memory === false
+  const memory = ctx.memory;
+  const memorySystemMsgs = memory === false
     ? []
-    : sessionMemoryLayer({ sessionKey, cwd: ctx.cwd, ...(ctx.memory ?? {}) });
-  const gitSnapshotSystemMsgs = buildSessionRuntimeSystemMessages({
+    : timed(builderMs, 'memory', () => sessionMemoryLayer({ sessionKey, cwd: ctx.cwd, ...(memory ?? {}) }));
+  // TUI-TYPING-LAG — the snapshot is built twice per turn (dashboard ⊕ ACP) with 5+ git
+  // subprocesses each; a recent one is served and rebuilt off the event loop instead.
+  const gitSnapshotSystemMsgs = timed(builderMs, 'gitSnapshot', () => buildSessionRuntimeSystemMessages({
     cwd: ctx.cwd,
-  });
-  const surfaceSystemMsgs = ctx.turnProfile
-    ? buildSessionRuntimeTurnSystemMessages(ctx.turnProfile, ctx.userText)
+    gitSnapshotStaleMs: DASHBOARD_GIT_SNAPSHOT_STALE_MS,
+  }));
+  const turnProfile = ctx.turnProfile;
+  const surfaceSystemMsgs = turnProfile
+    ? timed(builderMs, 'surface', () => buildSessionRuntimeTurnSystemMessages(turnProfile, ctx.userText))
     : ([] as LLMMessage[]);
   // ⭐⭐ `tools.nativeStructure` 는 «어느 provider 에 켤지»를 목록으로 고를 수 있다(2026-08-18).
   //   ⛔ 목록이 없으면 종전대로 «전 provider» — 기존 설정을 쓰는 사람의 값이 안 바뀐다.
@@ -134,43 +202,46 @@ export function buildDashboardTurnPreamble(
     && isNativeStructureEnabledForProvider(nativeStructureConfig, resolveActiveProvider(ctx.userConfig));
   let nativeTools: NativeToolCatalogEntry[] | undefined;
   if (nativeStructureEnabled) {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { findNativeTool } = require('../native-tool-catalog.js') as typeof import('../native-tool-catalog.js');
-    nativeTools = [...new Map((ctx.enabledTools ?? [])
-      .map(findNativeTool)
-      .filter((tool): tool is NativeToolCatalogEntry => tool !== undefined)
-      .map(tool => [tool.id, tool])).values()];
+    nativeTools = timed(builderMs, 'nativeTools', () => {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { findNativeTool } = require('../native-tool-catalog.js') as typeof import('../native-tool-catalog.js');
+      return [...new Map((ctx.enabledTools ?? [])
+        .map(findNativeTool)
+        .filter((tool): tool is NativeToolCatalogEntry => tool !== undefined)
+        .map(tool => [tool.id, tool])).values()];
+    });
   }
-  const implDisciplineSystemMsgs = buildImplDisciplineSystemMessages({
+  const implDisciplineSystemMsgs = timed(builderMs, 'implDiscipline', () => buildImplDisciplineSystemMessages({
     text: ctx.userText,
   }, {
     nativeStructureEnabled,
     ...(nativeTools !== undefined ? { enabledTools: nativeTools } : {}),
-  }) as LLMMessage[];
-  const concisenessSystemMsgs = buildConcisenessSystemMessages(
+  }) as LLMMessage[]);
+  const concisenessSystemMsgs = timed(builderMs, 'conciseness', () => buildConcisenessSystemMessages(
     ctx.userConfig.chat.conciseness,
-  ) as LLMMessage[];
+  ) as LLMMessage[]);
   // ★ elanous 자기접근 규율 + 자기인지 ambient(P3 · 2026-07-13) — 텔레그램/디스코드
   //   (makeElanousAgentRunTurn)와 단일 출처(agent/self-ambient.ts). TUI 채팅에서도 미션
   //   진단("P2 왜 실패?")·자율 시스템 관측·회상이 규율+ambient+툴(self-ops family) 3박자로
   //   성립한다. fail-soft: ambient 조회 실패가 턴을 막지 않는다.
   let selfOpsSystemMsgs: LLMMessage[] = [];
   try {
-    selfOpsSystemMsgs = [
+    selfOpsSystemMsgs = timed(builderMs, 'selfOps', () => [
       elanousSelfAccessPrompt(ctx.sessionId),
       ...sessionSelfAmbientParts(sessionKey),
       investigationRecallAmbient(ctx.userText),
       localRefGroundingAmbient(ctx.userText),
     ]
       .filter(Boolean)
-      .map((content): LLMMessage => ({ role: 'system', content }));
+      .map((content): LLMMessage => ({ role: 'system', content })));
   } catch { /* fail-soft */ }
   const controlEnv = ctx.controlEnv ?? {
     controller: process.env.ELANOUS_CONTROLLER,
     channels: process.env.ELANOUS_CONTROL_CHANNELS,
   };
-  const controllerSystemMsgs = controlEnv.controller
-    ? [buildControllerSystemMessage(controlEnv.controller, controlEnv.channels)]
+  const controller = controlEnv.controller;
+  const controllerSystemMsgs = controller
+    ? timed(builderMs, 'controller', () => [buildControllerSystemMessage(controller, controlEnv.channels)])
     : [];
   const preamble = [
     ...universalPreamble,
@@ -196,24 +267,25 @@ export function buildDashboardTurnPreamble(
   // or (c) the model is simply ignoring what we sent.
   let taskNotificationCount = 0;
   try {
-    const pendingNotifications = globalTaskNotificationQueue.drain();
-    taskNotificationCount = pendingNotifications.length;
-    const taskNotificationsXml = renderTaskNotificationsXml(pendingNotifications);
-    if (taskNotificationsXml) {
-      preamble.push({ role: 'user', content: taskNotificationsXml });
-    }
+    timed(builderMs, 'taskNotifications', () => {
+      const pendingNotifications = globalTaskNotificationQueue.drain();
+      taskNotificationCount = pendingNotifications.length;
+      const taskNotificationsXml = renderTaskNotificationsXml(pendingNotifications);
+      if (taskNotificationsXml) {
+        preamble.push({ role: 'user', content: taskNotificationsXml });
+      }
+    });
   } catch {
     // Fail-soft: a task-notification delivery failure must not block the turn.
   }
 
-  if (debug.enabled) {
+  if (debug.enabled && builderMs !== null) {
     const total = preamble.reduce((sum, m) => {
       const c = m.content;
       return sum + (typeof c === 'string' ? c.length : JSON.stringify(c).length);
     }, 0);
     debug.log('chat.turn-preamble', 'built', {
       hasTurnProfile: ctx.turnProfile != null,
-      rich: ctx.rich === true,
       builderCounts: {
         universal: universalPreamble.length,
         seatBoot: seatBootSystemMsgs.length,
@@ -229,6 +301,10 @@ export function buildDashboardTurnPreamble(
         implDiscipline: implDisciplineSystemMsgs.length,
         conciseness: concisenessSystemMsgs.length,
       },
+      // 실린 빌더만 키가 있다(seatBoot·memory·surface·nativeTools·controller 는 조건부로 안 불린다).
+      builderMs,
+      builderMsKind: 'sync',
+      builderTotalMs: Math.round((performance.now() - startedAt) * 10) / 10,
       totalMessageCount: preamble.length,
       taskNotificationCount,
       totalChars: total,

@@ -3,9 +3,17 @@
 // bus + manifest + heartbeat with fully injectable deps (no real TUI).
 
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { type SelfReportFrame } from '../src/capture/self-report-frame.js';
-import { createTuiControlTarget, createTuiFrameObserver, startTuiSelfReport } from '../src/capture/tui-self-report.js';
+import {
+  createTuiControlTarget, createTuiFrameObserver, startTuiSelfReport, type TuiRowMissingEvent,
+} from '../src/capture/tui-self-report.js';
+import {
+  getPtyManifest, removePtyManifest, setPtyManifestDbPathForTesting, updatePtyManifestFrame, upsertPtyManifest,
+} from '../src/pty-shell/pty-manifest.js';
 
 describe('createTuiFrameObserver · throttle + frame shape', () => {
   test('joins lines to text, emits a well-formed self-report frame', () => {
@@ -425,5 +433,225 @@ describe('startTuiSelfReport · P1b-2 mirror = TIMER-driven grid sample (capture
     });
     tickFn!();
     expect(published).toHaveLength(0);
+  });
+});
+
+describe('startTuiSelfReport · 박동마다 자기 행 확인 → 사라졌으면 다시 세운다 (TUI-PTY-SELF-REREGISTER)', () => {
+  function rowHarness(opts: { lookup?: (id: string) => { alive: boolean } | null; dropWrites?: boolean } = {}) {
+    let t = 10_000;
+    const store = new Map<string, { alive: boolean; nickname?: string; frameAt?: number; build?: string }>();
+    const registered: Array<{ id: string; now: number; nickname?: string }> = [];
+    const heartbeats: number[] = [];
+    const missing: TuiRowMissingEvent[] = [];
+    const builds: string[] = [];
+    let beat: (() => void) | null = null;
+    let sigcont: (() => void) | null = null;
+    let observer: ((l: readonly string[], d: { rows: number; cols: number }) => void) | null = null;
+    const frames: Array<{ text: string; now: number }> = [];
+    const stop = startTuiSelfReport({
+      surfaceId: 'tui:777', nickname: ' opt ', throttleMs: 0, now: () => t, heartbeatMs: 15_000,
+      createMirror: () => null, register: (fn) => { observer = fn; }, publishFrame: () => {},
+      writeFrame: (id, text, now) => {
+        frames.push({ text, now });
+        const row = store.get(id);
+        if (row && !opts.dropWrites) row.frameAt = now;
+      },
+      writeScreen: () => {},
+      markClosed: () => {}, onExit: () => {}, registerControlTarget: () => () => {}, startControlPoller: () => () => {},
+      registerRow: (id, now, nickname) => {
+        registered.push({ id, now, ...(nickname ? { nickname } : {}) });
+        store.set(id, { alive: true, ...(nickname ? { nickname } : {}) });
+      },
+      heartbeat: (_id, now) => heartbeats.push(now),
+      lookupRow: opts.lookup ?? ((id) => store.get(id) ?? null),
+      restoreBuild: (id) => {
+        builds.push(id);
+        const row = store.get(id);
+        if (row && !opts.dropWrites) row.build = 'boot';
+      },
+      logRowMissing: (e) => missing.push(e),
+      driveHeartbeat: (tick) => { beat = tick; return () => { beat = null; }; },
+      onSigcont: (fn) => { sigcont = fn; return () => { sigcont = null; }; },
+    });
+    return {
+      store, registered, heartbeats, missing, builds, frames, stop,
+      render: (text: string) => observer!([text], { rows: 1, cols: 10 }),
+      advance: (ms: number) => { t += ms; },
+      beat: () => beat!(),
+      sigcont: () => sigcont!(),
+      beatArmed: () => beat !== null,
+    };
+  }
+
+  test('행이 있으면 아무것도 안 한다 — 재등록 0 · 로그 0 · 평소 박동만', () => {
+    const h = rowHarness();
+    expect(h.registered).toHaveLength(1);           // 기동 때 한 번
+    h.advance(15_000); h.beat();
+    h.advance(15_000); h.beat();
+    expect(h.registered).toHaveLength(1);
+    expect(h.missing).toEqual([]);
+    expect(h.heartbeats).toEqual([25_000, 40_000]);
+    h.stop();
+  });
+
+  test('행을 지운 뒤 박동 1회 → 별명·surfaceId 그대로 복원 ⊕ row-missing 1줄(단서 포함)', () => {
+    const h = rowHarness();
+    h.render('❯ idle prompt');                       // 화면 한 장 — 그 뒤 idle(거울은 같은 화면을 다시 안 낸다)
+    h.advance(15_000); h.beat();                     // 25_000 에 마지막으로 봤다
+    h.store.delete('tui:777');                       // 남이 걷어 갔다(정지 중 stale 수거 등)
+    h.advance(70_000); h.sigcont();                  // 95_000 — 정지 뒤 재개
+    h.advance(1_000); h.beat();                      // 96_000 — 박동이 71s 만에 돈다
+    expect(h.store.get('tui:777')).toEqual({ alive: true, nickname: 'opt', frameAt: 96_000, build: 'boot' });
+    expect(h.registered.at(-1)).toEqual({ id: 'tui:777', now: 96_000, nickname: 'opt' });
+    expect(h.builds).toEqual(['tui:777']);           // 재등록이 비운 판 칸을 다시 적는다
+    expect(h.frames.at(-1)).toEqual({ text: '❯ idle prompt', now: 96_000 });   // 비운 frame 칸에 마지막 화면
+    expect(h.missing).toHaveLength(1);
+    expect(h.missing[0]).toMatchObject({
+      surfaceId: 'tui:777', pid: process.pid, state: 'absent', reRegistered: true, frameRestored: true, buildRestored: true,
+      lastSeenAt: 25_000, sinceMs: 71_000, gapMs: 71_000, heartbeatMs: 15_000,
+      sigcontAt: 95_000, sigcontSinceLastSeen: true,
+    });
+    expect('error' in h.missing[0]!).toBe(false);
+    h.advance(15_000); h.beat();                     // 다음 박동 — 이제 있으니 조용하다
+    expect(h.missing).toHaveLength(1);
+    h.stop();
+  });
+
+  test('frame·build 쓰기가 조용히 실패하면(다시 읽어도 빈 칸) frameRestored·buildRestored=false 로 남긴다', () => {
+    const h = rowHarness({ dropWrites: true });
+    h.render('❯ idle prompt');
+    h.store.delete('tui:777');
+    h.advance(15_000); h.beat();
+    expect(h.frames.at(-1)).toEqual({ text: '❯ idle prompt', now: 25_000 });   // 쓰기는 시도했다
+    expect(h.missing[0]).toMatchObject({ state: 'absent', reRegistered: true, frameRestored: false, buildRestored: false });
+    h.stop();
+  });
+
+  test('frame·build 쓰기가 던지면 오류를 남기고 복원 false', () => {
+    let t = 1;
+    const missing: TuiRowMissingEvent[] = [];
+    let beat: (() => void) | null = null;
+    let observer: ((l: readonly string[], d: { rows: number; cols: number }) => void) | null = null;
+    const store = new Map<string, { alive: boolean }>();
+    startTuiSelfReport({
+      surfaceId: 'tui:890', throttleMs: 0, now: () => t, heartbeatMs: 15_000,
+      createMirror: () => null, register: (fn) => { observer = fn; }, publishFrame: () => {}, writeScreen: () => {},
+      writeFrame: () => { throw new Error('disk full'); },
+      heartbeat: () => {}, markClosed: () => {}, onExit: () => {}, registerControlTarget: () => () => {}, startControlPoller: () => () => {},
+      registerRow: (id) => { store.set(id, { alive: true }); },
+      lookupRow: (id) => store.get(id) ?? null,
+      restoreBuild: () => { throw new Error('no build'); },
+      logRowMissing: (e) => missing.push(e),
+      driveHeartbeat: (tick) => { beat = tick; return () => {}; }, onSigcont: () => () => {},
+    });
+    observer!(['x'], { rows: 1, cols: 1 });             // 기동 frame 쓰기도 던지지만 fail-soft
+    store.delete('tui:890');
+    t = 15_001; beat!();
+    expect(missing[0]).toMatchObject({ reRegistered: true, frameRestored: false, buildRestored: false, error: 'build: no build; frame: disk full' });
+  });
+
+  test('행이 alive=0(closed)이어도 살아 있는 TUI 면 다시 세운다', () => {
+    const h = rowHarness();
+    h.store.set('tui:777', { alive: false });
+    h.advance(15_000); h.beat();
+    expect(h.store.get('tui:777')?.alive).toBe(true);
+    expect(h.missing[0]).toMatchObject({ state: 'closed', reRegistered: true, frameRestored: false, buildRestored: true, sigcontAt: null, sigcontSinceLastSeen: false });
+    h.stop();
+  });
+
+  test('조회 실패는 «없다» 가 아니다 — 재등록 0 · 로그만(reRegistered:false · error) · 박동은 계속', () => {
+    const h = rowHarness({ lookup: () => { throw new Error('SQLITE_BUSY'); } });
+    h.advance(15_000); h.beat();
+    expect(h.registered).toHaveLength(1);
+    expect(h.heartbeats).toEqual([25_000]);
+    expect(h.missing).toHaveLength(1);
+    expect(h.missing[0]).toMatchObject({ state: 'lookup-failed', reRegistered: false, error: 'SQLITE_BUSY' });
+    h.stop();
+  });
+
+  test('등록이 조용히 실패하면(다시 읽어도 없다) reRegistered:false · error 로 남긴다', () => {
+    let t = 1;
+    const missing: TuiRowMissingEvent[] = [];
+    let beat: (() => void) | null = null;
+    startTuiSelfReport({
+      surfaceId: 'tui:888', throttleMs: 0, now: () => t, heartbeatMs: 15_000,
+      createMirror: () => null, register: () => {}, publishFrame: () => {}, writeFrame: () => {}, writeScreen: () => {},
+      heartbeat: () => {}, markClosed: () => {}, onExit: () => {}, registerControlTarget: () => () => {}, startControlPoller: () => () => {},
+      registerRow: () => {},                           // fail-soft upsert 가 삼킨 꼴
+      lookupRow: () => null, restoreBuild: () => {}, logRowMissing: (e) => missing.push(e),
+      driveHeartbeat: (tick) => { beat = tick; return () => {}; }, onSigcont: () => () => {},
+    })();
+    // stop 뒤 박동은 아무것도 안 한다
+    beat!();
+    expect(missing).toEqual([]);
+    startTuiSelfReport({
+      surfaceId: 'tui:889', throttleMs: 0, now: () => t, heartbeatMs: 15_000,
+      createMirror: () => null, register: () => {}, publishFrame: () => {}, writeFrame: () => {}, writeScreen: () => {},
+      heartbeat: () => {}, markClosed: () => {}, onExit: () => {}, registerControlTarget: () => () => {}, startControlPoller: () => () => {},
+      registerRow: () => {}, lookupRow: () => null, restoreBuild: () => {}, logRowMissing: (e) => missing.push(e),
+      driveHeartbeat: (tick) => { beat = tick; return () => {}; }, onSigcont: () => () => {},
+    });
+    t = 15_001; beat!();
+    expect(missing).toHaveLength(1);
+    expect(missing[0]).toMatchObject({ state: 'absent', reRegistered: false, error: 'row-still-missing-after-register' });
+  });
+
+  test('stop 이 박동 스케줄러 ⊕ SIGCONT 훅을 함께 푼다', () => {
+    const h = rowHarness();
+    h.stop();
+    expect(h.beatArmed()).toBe(false);
+  });
+
+  test('실 manifest — 행을 지우고 박동 1회 → getPtyManifest 가 다시 행 ⊕ 마지막 화면을 돌려준다(쓰기 스로틀 창 안이어도)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tui-self-rereg-'));
+    setPtyManifestDbPathForTesting(join(dir, 'pty', 'manifest.db'));
+    try {
+      const missing: TuiRowMissingEvent[] = [];
+      let beat: (() => void) | null = null;
+      let t = 1_000;
+      let observer: ((l: readonly string[], d: { rows: number; cols: number }) => void) | null = null;
+      const stop = startTuiSelfReport({
+        surfaceId: 'tui:real', nickname: 'opt', throttleMs: 0, now: () => t, heartbeatMs: 15_000,
+        createMirror: () => null, register: (fn) => { observer = fn; }, publishFrame: () => {}, writeScreen: () => {},
+        writeFrame: (id, text, now) => updatePtyManifestFrame(id, () => text, now),
+        markClosed: () => {}, onExit: () => {}, registerControlTarget: () => () => {}, startControlPoller: () => () => {},
+        registerRow: (id, now, nickname) => upsertPtyManifest({ id, kind: 'tui', ...(nickname ? { nickname } : {}), cmd: 'elanous', startedAt: now, now }),
+        heartbeat: () => {},
+        lookupRow: (id) => getPtyManifest(id, { strict: true }),
+        restoreBuild: () => {}, logRowMissing: (e) => missing.push(e),
+        driveHeartbeat: (tick) => { beat = tick; return () => {}; }, onSigcont: () => () => {},
+      });
+      expect(getPtyManifest('tui:real')?.alive).toBe(true);
+      t = 15_000; observer!(['❯ real frame'], { rows: 1, cols: 20 });
+      expect(getPtyManifest('tui:real')?.frame).toBe('❯ real frame');
+      removePtyManifest('tui:real');
+      expect(getPtyManifest('tui:real')).toBeNull();
+      t = 16_000; beat!();                           // 앞 frame 쓰기 1s 뒤 — 쓰기 스로틀(1.5s) 창 안
+      const row = getPtyManifest('tui:real');
+      expect(row?.alive).toBe(true);
+      expect(row?.nickname).toBe('opt');
+      expect(row?.frame).toBe('❯ real frame');
+      expect(row?.frameAt).toBe(16_000);
+      expect(row?.ownerPid).toBe(process.pid);
+      expect(missing).toHaveLength(1);
+      expect(missing[0]).toMatchObject({ state: 'absent', reRegistered: true, frameRestored: true });
+      stop();
+    } finally {
+      setPtyManifestDbPathForTesting(null);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('getPtyManifest strict — 행 없음은 null, 조회 실패는 던진다(기본은 둘 다 null)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tui-self-rereg-strict-'));
+    // 디렉터리를 db 경로로 주면 열기가 실패한다.
+    setPtyManifestDbPathForTesting(dir);
+    try {
+      expect(getPtyManifest('tui:none')).toBeNull();
+      expect(() => getPtyManifest('tui:none', { strict: true })).toThrow();
+    } finally {
+      setPtyManifestDbPathForTesting(null);
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

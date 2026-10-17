@@ -397,6 +397,10 @@ function findRejectedToolCalls(newMessages: readonly LLMMessage[]): string[] {
   return [...rejected];
 }
 
+/** `streamLLMWithTools` 의 빈 턴·예산 포기 경고(`buildNoFinalSynthesisNotice`) 문면 — 완료 판정 관측에서 «답 없음»으로 센다.
+ *  머리 표지만 보지 않고 런타임 문장까지 맞춰, 그 표지를 인용한 정상 답을 «경고»로 세지 않는다. */
+const NO_FINAL_SYNTHESIS_NOTICE = /\[NO FINAL SYNTHESIS\] The model (?:stopped after repeated empty turns|used the available tool-loop turns without writing a plain-text answer)\./;
+
 /** 이 turn 의 새 메시지에서 마지막 `update_goal` 도구 호출을 찾아 구조화 종결 상태를
  *  반환한다. status 가 enum 밖이면 무시(null). evidence/reason 은 문자열만 수용. */
 function findGoalUpdate(
@@ -559,6 +563,20 @@ export async function runGoalLoop(
   ): GoalLoopResult => {
     if (terminalPublished) return result;
     terminalPublished = true;
+    // TUI-H1-GOALLOOP-EMPTY-TAIL — 완료 판정 한 줄: 목표가 닫혔나(goal-complete) · 사람에게 보일 답이 있나
+    //   (answer-present) · 둘 다 아니다(none — 빈 답이거나 «[NO FINAL SYNTHESIS]» 경고가 최종 답).
+    try {
+      const finalTrimmed = result.finalText.trim();
+      const reason = result.goalComplete
+        ? 'goal-complete'
+        : finalTrimmed.length > 0 && !NO_FINAL_SYNTHESIS_NOTICE.test(finalTrimmed) ? 'answer-present' : 'none';
+      debug.log('goal.loop', 'completion-verdict', {
+        sessionId: ctx.sessionId, ...runAttribution,
+        iterations, reason, stopReason: result.stopReason, finalChars: result.finalText.length,
+      }, { level: 'info' });
+    } catch {
+      // Observability must not change the loop result.
+    }
     try {
       if (result.goalComplete) {
         publishGoalLifecycle(bus, 'complete', completePayload ?? {
@@ -778,6 +796,9 @@ export async function runGoalLoop(
       ...(surfaceUserText !== undefined ? { userText: surfaceUserText } : {}),
       // TUI-GOAL-LOOP-FRICTION(#46·#63) — update_goal 은 도구 예산 거부를 받지 않고, 답과 함께 오면 그 턴으로 마감한다.
       terminalToolNames: [...(ctx.terminalToolNames ?? []), UPDATE_GOAL_TOOL_NAME],
+      // TUI-H1-GOALLOOP-EMPTY-TAIL — 앞 iteration 의 답이 이미 화면에 있으면 «update_goal 만 → 빈 턴» 은 할 말이 없는
+      //   것이다 — 재촉·경고 없이 빈 답으로 끝내고 아래 완료 판정이 앞 답으로 마감한다(중복 접기와 같은 길).
+      ...(previousFinalText.trim().length > 0 ? { terminalPriorAnswerVisible: true } : {}),
       // update_goal 은 종결 신호 — 실 dispatcher 로 새지 않게 가로채 ack 만 돌려준다.
       dispatchTool: (name, args, dctx) => {
         dispatchCount += 1;

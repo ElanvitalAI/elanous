@@ -28,6 +28,8 @@ export interface GateTestFailure {
   baselinePresence: GateBaselinePresence;
   attributedBy?: 'name-across-files' | 'copied-across-files';
   precondition?: GateFailurePrecondition;
+  /** 귀속 불일치 등으로 `unknown` 판정을 내린 이유. 판정 enum 은 바꾸지 않는다. */
+  unknownReason?: '귀속 불일치';
   /** 같은 gate 실행 안에서 같은 시험의 통과 기록이 있으면 `may-vary`로 보존한다. 타임아웃은 재실행 결과 변동성도 함께 표현한다. */
   timeoutVariability?: TimeoutVariability;
   /** 시간 초과한 정확한 시험이 base 로그에서는 통과해 자식 회귀로 귀속됐는지 나타낸다. */
@@ -197,6 +199,8 @@ export function baselineTimeoutForFiles(fileCount: number): number {
 export interface GatePassedTestEvidence {
   status: 'available' | 'unavailable';
   tests?: readonly Pick<GateTestFailure, 'file' | 'name'>[];
+  /** 기준선 JUnit 의 전체 testcase 목록(통과·실패·스킵 포함). 귀속 일치 확인에 쓴다. */
+  testCases?: readonly Pick<GateTestFailure, 'file' | 'name'>[];
   reason?: string;
 }
 
@@ -399,11 +403,15 @@ export function extractGateTestFailures(log: string): Array<Omit<GateTestFailure
 
 type GateTestIdentitySource = Pick<GateTestFailure, 'file' | 'name'>;
 
-function gateTestIdentity({ file, name }: GateTestIdentitySource): string | undefined {
+function gateTestName({ file, name }: GateTestIdentitySource): string | undefined {
   if (!file) return undefined;
   const prefix = `${file} > `;
-  const testName = name.startsWith(prefix) ? name.slice(prefix.length) : name;
-  return `${file}\u0000${testName}`;
+  return name.startsWith(prefix) ? name.slice(prefix.length) : name;
+}
+
+function gateTestIdentity(source: GateTestIdentitySource): string | undefined {
+  const testName = gateTestName(source);
+  return testName === undefined ? undefined : `${source.file}\u0000${testName}`;
 }
 
 function extractGatePassedTests(log: string): Array<Pick<GateTestFailure, 'file' | 'name'>> {
@@ -438,6 +446,44 @@ function decodeXmlEntities(value: string): string {
   })[entity]!);
 }
 
+/**
+ * 기준선 JUnit 의 전체 testcase(통과·실패·스킵 무관)를 gate identity 형태로 만든다.
+ * 귀속 일치 확인(#27844)에 쓴다 — 콘솔 실패 헤더의 파일 귀속이 JUnit 과 어긋나는지는 통과 목록만으로는 못 본다.
+ * 파일 = 감싼 testsuite 의 `file=`(바깥으로 상속) → 없으면 testcase `file=`(Bun 산출에선 둘이 같다). `classname` 은 describe 이름일 수 있어
+ * 파일로 쓰지 않는다 — 파일을 못 정하면 그 testcase 는 빼고(귀속 불일치 «양성 신호» 없음 = 기존 판정 유지).
+ * 이름 = 콘솔 `(fail)` 줄과 같은 꼴로 describe 경로를 앞에 붙인다 — 중첩 testsuite 이름들(파일 수준 제외),
+ * 중첩이 없는 평면 JUnit 이면 testcase `classname`(파일과 다를 때).
+ */
+export function extractJUnitTestCases(xml: string): Array<Pick<GateTestFailure, 'file' | 'name'>> {
+  const tests: Array<Pick<GateTestFailure, 'file' | 'name'>> = [];
+  const attribute = (attributes: string, key: string): string | undefined => {
+    const raw = attributes.match(new RegExp(`\\b${key}=(?:"([^"]*)"|'([^']*)')`))?.slice(1).find((value) => value !== undefined);
+    return raw === undefined ? undefined : decodeXmlEntities(raw);
+  };
+  const suites: Array<{ file: string | undefined; name: string | undefined }> = [];
+  const tokenRe = /<testsuite\b([^>]*?)(\/?)>|<\/testsuite\s*>|<testcase\b([^>]*?)(?:\/>|>[\s\S]*?<\/testcase>)/g;
+  for (const match of xml.matchAll(tokenRe)) {
+    const token = match[0];
+    if (token.startsWith('</testsuite')) { suites.pop(); continue; }
+    if (token.startsWith('<testsuite')) {
+      if (match[2] === '/') continue;
+      const attributes = match[1] ?? '';
+      suites.push({ file: attribute(attributes, 'file') ?? suites.at(-1)?.file, name: attribute(attributes, 'name') });
+      continue;
+    }
+    const attributes = match[3] ?? '';
+    const testName = attribute(attributes, 'name');
+    const file = suites.at(-1)?.file ?? attribute(attributes, 'file');
+    if (!testName || !file) continue;
+    const nested = suites.flatMap((suite) => suite.name && suite.name !== file && suite.name !== suite.file ? [suite.name] : []);
+    // 평면 JUnit(describe 가 testsuite 로 중첩되지 않음)은 classname 이 describe 이름이다 — 이름 복원에만 쓴다.
+    const classname = attribute(attributes, 'classname');
+    const describePath = nested.length > 0 ? nested : classname && classname !== file ? [classname] : [];
+    tests.push({ file, name: [file, ...describePath, testName].join(' > ') });
+  }
+  return tests;
+}
+
 export function extractJUnitPassedTests(xml: string): Array<Pick<GateTestFailure, 'file' | 'name'>> {
   const tests: Array<Pick<GateTestFailure, 'file' | 'name'>> = [];
   const testcaseRe = /<testcase\b([^>]*?)(?:\/>|>([\s\S]*?)<\/testcase>)/g;
@@ -459,6 +505,19 @@ function passedIdentities(tests: readonly Pick<GateTestFailure, 'file' | 'name'>
     const identity = gateTestIdentity(test);
     return identity ? [identity] : [];
   }));
+}
+
+/** 기준선 JUnit 전체 testcase 를 시험명 → 파일 집합으로 묶는다. 귀속 불일치 양성 신호 확인에 쓴다. */
+function junitFilesByTestName(testCases: readonly Pick<GateTestFailure, 'file' | 'name'>[]): Map<string, Set<string>> {
+  const filesByTestName = new Map<string, Set<string>>();
+  for (const testCase of testCases) {
+    const testName = gateTestName(testCase);
+    if (testName === undefined || !testCase.file) continue;
+    const files = filesByTestName.get(testName) ?? new Set<string>();
+    files.add(testCase.file);
+    filesByTestName.set(testName, files);
+  }
+  return filesByTestName;
 }
 
 export function classifyGateTestFailures(
@@ -505,6 +564,21 @@ export function classifyGateTestFailures(
       const identity = gateTestIdentity(failure);
       return identity ? [identity] : [];
     }));
+  // #27844: Bun 콘솔의 실패 헤더 귀속은 신뢰할 수 없다 — introduced 로 단정하기 전에
+  // 기준선 JUnit(testsuite file= · classname)으로 귀속을 확인한다. 기준선은 base worktree 라
+  // worktree 에서 새로 추가한 시험명을 담을 수 없어서 «이름이 없다»만으로는 귀속 불일치라 못
+  // 한다. 시험명이 «다른 파일»에 존재한다는 양성 신호가 있을 때만 귀속 불일치로 판정하고,
+  // 시험명이 귀속 파일의 JUnit 에 있으면, 또는 어디에도 없으면(신규 시험) 기존 판정을 유지한다.
+  const baselineJUnitFilesByTestName = baselinePassedEvidence?.status === 'available' && baselinePassedEvidence.testCases !== undefined
+    ? junitFilesByTestName(baselinePassedEvidence.testCases)
+    : undefined;
+  const junitAttributionMismatch = (failure: GateTestIdentitySource): boolean => {
+    if (!baselineJUnitFilesByTestName) return false;
+    const testName = gateTestName(failure);
+    if (testName === undefined || !failure.file) return false;
+    const files = baselineJUnitFilesByTestName.get(testName);
+    return files !== undefined && !files.has(failure.file);
+  };
   const comparable = worktreeFailures.filter((failure) => !isTimeoutDiagnostic(failure.diagnostic) && !matchedGatePrecondition(failure.diagnostic ?? '') && !(failure.file && missing.has(failure.file)) && baselineLog !== undefined && Boolean(failure.file));
   const comparison = classifyAgainstBaseline(baselineFailures, comparable, (failure) => failure.name);
   const preexisting = new Set(comparison.preexisting);
@@ -585,10 +659,18 @@ export function classifyGateTestFailures(
         debug.log('self-implement.gate', 'attributed-copy-across-files', { name: path, file: failure.file, baselineFile: original.file });
         return { ...failure, attribution: 'preexisting' as const, attributedBy: 'copied-across-files' as const, baselinePresence };
       }
+      if (junitAttributionMismatch(failure)) {
+        debug.log('self-implement.gate', 'attribution-mismatch', { name: failure.name, file: failure.file });
+        return { ...failure, attribution: 'unknown' as const, baselinePresence, unknownReason: '귀속 불일치' as const };
+      }
       return { ...failure, attribution: 'introduced' as const, baselinePresence };
     }
     if (baselineLog === undefined || !failure.file) return { ...failure, attribution: 'unknown' as const, baselinePresence };
     const attribution = preexisting.has(failure) ? 'preexisting' as const : 'introduced' as const;
+    if (attribution === 'introduced' && junitAttributionMismatch(failure)) {
+      debug.log('self-implement.gate', 'attribution-mismatch', { name: failure.name, file: failure.file });
+      return { ...failure, attribution: 'unknown' as const, baselinePresence, unknownReason: '귀속 불일치' as const };
+    }
     // 재실행 관측이 `pass`일 때만 흔들림으로 강등한다. 관측이 없거나 실패면 원래 귀속을 유지한다.
     if (attribution === 'introduced' && observationsFor(failure.name).includes('pass')) {
       return { ...failure, attribution: 'flaky-rerun' as const, baselinePresence };
@@ -730,7 +812,15 @@ function runBaselineBunTest(cwd: string, args: string[], timeout: number): Proce
       if (!existsSync(reportPath)) {
         return { ...process, passedTestEvidence: { status: 'unavailable', reason: 'JUnit passed-test evidence unavailable: reporter outfile was not created' } };
       }
-      return { ...process, passedTestEvidence: { status: 'available', tests: extractJUnitPassedTests(readFileSync(reportPath, 'utf8')) } };
+      const junitXml = readFileSync(reportPath, 'utf8');
+      return {
+        ...process,
+        passedTestEvidence: {
+          status: 'available',
+          tests: extractJUnitPassedTests(junitXml),
+          testCases: extractJUnitTestCases(junitXml),
+        },
+      };
     } catch (error) {
       return { ...process, passedTestEvidence: { status: 'unavailable', reason: `JUnit passed-test evidence unreadable: ${String(error)}` } };
     }
@@ -1343,7 +1433,8 @@ export function formatGateBaselineNote(report: GateBaselineReport, unrunImporter
     + (report.missingAtBase > 0 ? `, missing-at-base=${report.missingAtBase}` : '');
   const lines = report.failures.map((failure) => `- ${failure.attribution}: ${failure.name}`
     + (includesBaselinePresence ? ` [baseline=${failure.baselinePresence}]` : '')
-    + (failure.precondition ? ` (${failure.precondition.name}; ${failure.precondition.remediation})` : ''));
+    + (failure.precondition ? ` (${failure.precondition.name}; ${failure.precondition.remediation})` : '')
+    + (failure.unknownReason ? ` (${failure.unknownReason})` : ''));
   const timedOutFailures = report.failures.filter((failure) => failure.attribution === 'flaky-timeout');
   const { mayVary, same, unknown } = report.timeoutVariabilityCounts;
   const timedOutLine = timedOutFailures.length > 0

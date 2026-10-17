@@ -54,10 +54,11 @@ describe('A — identical successful-call repeat detector fires in the real loop
   });
 });
 
-describe('D — doom loop reaches the AskUser gate in the real loop', () => {
-  test('3 identical failing Edits route to the doom-loop resolver', async () => {
+describe('D — doom loop self-heals in the real loop without asking (대표 10-17)', () => {
+  test('3 identical failing Edits never reach the AskUser resolver', async () => {
     let resolverCalled = 0;
     setAskUserQuestionResolver(async () => { resolverCalled += 1; return { answers: { doom_loop_next_step: 'Stop here' } }; });
+    const spy = spyOn(debug, 'log');
     const badEdit = { file_path: '/tmp/x.ts', old_string: 'NOPE', new_string: 'Y' };
     const provider = scriptedProvider([
       [{ type: 'tool_call', id: '1', name: 'Edit', args: badEdit }],
@@ -73,7 +74,10 @@ describe('D — doom loop reaches the AskUser gate in the real loop', () => {
       },
       { provider, model: 'claude-sonnet-5', sessionId: 'sess-doom-live', tools: [{ name: 'Edit', description: 'd', parameters: { type: 'object' } }], maxTurns: 8 },
     );
-    expect(resolverCalled).toBeGreaterThanOrEqual(1);
+    const heal = spy.mock.calls.find((c) => c[0] === 'llm.tool-loop.retry' && c[1] === 'doom-loop-self-heal');
+    spy.mockRestore();
+    expect(resolverCalled).toBe(0);
+    expect(heal?.[2]).toMatchObject({ tool: 'Edit', attempt: 1, action: 'guidance' });
   });
 });
 

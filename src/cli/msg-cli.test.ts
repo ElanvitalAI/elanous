@@ -1,4 +1,5 @@
 import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -274,6 +275,7 @@ test('ask waits for the first reply pointing at its question and exits 0', async
   expect(f.stderr).toEqual([]);
   expect(f.exits).toEqual([]);
   expect(postedDuringWait).toBe(true);
+  expect(JSON.parse(f.stdout[0]!)).toMatchObject({ id: 1, from: 'OP', to: 'TC', body: 'what ships on friday?' });
   expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ id: 2, from: 'TC', to: 'OP', body: '42 ships on friday', replyTo: 1 });
   const store = f.store();
   try {
@@ -297,7 +299,7 @@ test('ask without a reply prints the question id and exits 2', async () => {
   await f.run('ask', 'tc', 'anyone alive?', '--from', 'op', '--wait', '0');
   expect(f.exits.at(-1)).toBe(2);
   expect(f.stderr.at(-1)).toBe('msg: no reply to #1 within 0s');
-  expect(f.stdout).toEqual([]);
+  expect(f.stdout).toEqual(['#1']);
   const store = f.store();
   try { expect(store.list('TC')).toHaveLength(1); expect(store.listReplies(1)).toEqual([]); }
   finally { store.close(); }
@@ -414,6 +416,46 @@ test('thread pages past a full reply page instead of silently truncating the thr
   await f.run('thread', '1');
   expect(f.stdout.at(-1)).toContain('reply 101');
 }, 120000);
+test('CLI list, thread and post --reply-to leave a pre-threading ledger undamaged', async () => {
+  const f = fixture();
+  const legacy = new Database(f.path);
+  try {
+    legacy.exec(`CREATE TABLE msg_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sender TEXT NOT NULL,
+      recipient TEXT NOT NULL,
+      body TEXT NOT NULL,
+      kind TEXT,
+      created_at TEXT NOT NULL
+    );`);
+    legacy.query('INSERT INTO msg_messages(sender, recipient, body, kind, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run('OP', 'TC', 'old question', 'memo', '2026-10-01T00:00:00.000Z');
+    legacy.query('INSERT INTO msg_messages(sender, recipient, body, created_at) VALUES (?, ?, ?, ?)')
+      .run('TC', 'OP', 'old answer', '2026-10-01T00:01:00.000Z');
+  } finally { legacy.close(); }
+  const oldQuestion = { id: 1, from: 'OP', to: 'TC', body: 'old question', kind: 'memo', createdAt: '2026-10-01T00:00:00.000Z' };
+  const oldAnswer = { id: 2, from: 'TC', to: 'OP', body: 'old answer', createdAt: '2026-10-01T00:01:00.000Z' };
+  await f.run('list', '--to', 'TC', '--after', '0', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([oldQuestion]);
+  await f.run('thread', '1', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual({ question: oldQuestion, replies: [] });
+  await f.run('post', 'new reply', '--from', 'TC', '--to', 'OP', '--reply-to', '1', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ id: 3, from: 'TC', to: 'OP', body: 'new reply', replyTo: 1 });
+  await f.run('thread', '1', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({
+    question: oldQuestion,
+    replies: [{ id: 3, body: 'new reply', replyTo: 1 }],
+  });
+  const store = f.store();
+  try {
+    expect(store.getMessage(1)).toEqual(oldQuestion);
+    expect(store.getMessage(2)).toEqual(oldAnswer);
+    expect(store.getMessage(1)!.replyTo).toBeUndefined();
+    expect(store.getMessage(2)!.replyTo).toBeUndefined();
+    expect(store.getCursor('TC')).toBe(0);
+    expect(store.getCursor('OP')).toBe(0);
+  } finally { store.close(); }
+});
 test('watch --sse falls back to the durable ledger during a disconnected service', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'msg-cli-sse-'));
   dirs.push(dir);
@@ -558,6 +600,7 @@ test('real stdin piping and validation failure use process exit 2 without a stac
   const askTimeout = spawnSync('bun', ['-e', script, 'msg', 'ask', 'MK', 'anyone alive?', '--from', 'OP', '--wait', '1'],
     { cwd: process.cwd(), env, encoding: 'utf8' });
   expect(askTimeout.status, askTimeout.stderr).toBe(2);
+  expect(askTimeout.stdout).toContain('#3');
   expect(askTimeout.stderr.trim()).toBe('msg: no reply to #3 within 1s');
   expect(askTimeout.stderr).not.toContain('    at ');
 });

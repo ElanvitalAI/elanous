@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   annotateJsonStdout, decideGateDispatch, dispatchHeavyCheck, extractGateRemoteFlags, GATE_REMOTE_DEFAULTS, relativizeArgs,
-  gateRemoteHostCap, hostSlotScript, isValidGateHost, looksLikeHost, outsideRepoArgs, unreproducibleArgs, remoteScript, resolveGateRemoteSettings, runOnRemote, type GateRemoteRunner, type SshResult,
+  gateRemoteHostCap, hostSlotScript, isValidGateHost, looksLikeHost, outsideRepoArgs, unreproducibleArgs, remoteScript, remoteSelfGateArgv, resolveGateRemoteSettings, runOnRemote, type GateRemoteRunner, type SshResult,
 } from './gate-remote.js';
 import { parseGateRemoteConfig } from '../user-config.js';
 import { reserveReleaseGateHosts } from '../release-loop/gate-host-reservation.js';
@@ -45,6 +45,13 @@ const settings = { ...GATE_REMOTE_DEFAULTS, slotWaitSeconds: 0 };
 const sink = () => { const out: string[] = []; const err: string[] = []; return { out, err, write: { out: (t: string | Uint8Array) => { out.push(typeof t === 'string' ? t : Buffer.from(t).toString()); }, err: (t: string | Uint8Array) => { err.push(typeof t === 'string' ? t : Buffer.from(t).toString()); } } }; };
 
 describe('dispatch decision', () => {
+  test('remote importer sweep carries a shard plan even when --shards was omitted', () => {
+    const argv = remoteSelfGateArgv({ changed: true, base: 'origin/main', includeImporters: true }, () => { throw new Error('origin/main must stay pinned'); });
+    expect(argv).toEqual(['bun', 'bin/elanous.mjs', 'self', 'gate', '--local', '--changed', '--base', 'origin/main', '--shards', '2', '--include-importers']);
+    expect(remoteSelfGateArgv({ changed: true, base: 'feature', shards: 16, includeImporters: true, artifactDir: '/tmp/gate-artifacts' }, () => HEAD))
+      .toEqual(['bun', 'bin/elanous.mjs', 'self', 'gate', '--local', '--changed', '--base', HEAD, '--shards', '16', '--include-importers', '--artifact-dir', '/tmp/gate-artifacts']);
+    expect(remoteSelfGateArgv({ changed: true, base: 'origin/main' }, () => MAIN)).not.toContain('--shards');
+  });
   test('load above the threshold goes remote; at or below stays local', () => {
     expect(decideGateDispatch({ flags: { local: false }, settings, load1: 25, env: {} })).toMatchObject({ mode: 'remote', host: 'node-b' });
     expect(decideGateDispatch({ flags: { local: false }, settings, load1: 20, env: {} })).toMatchObject({ mode: 'local' });
@@ -163,6 +170,19 @@ describe.each([['lockf'], ['flock']] as const)('host lock (on the host) — %s p
 });
 
 describe('host lock wiring', () => {
+  test('remote scratch uses disk and refuses low free space before checkout', () => {
+    const home = slotDir();
+    mkdirSync(join(home, '.bun', 'bin'), { recursive: true });
+    writeFileSync(join(home, '.bun', 'bin', 'df'), '#!/bin/sh\nprintf "Filesystem 1024-blocks Used Available Capacity Mounted on\\n/dev/fake 100 99 1 99%% /var/tmp\\n"\n', { mode: 0o755 });
+    const script = remoteScript({ mirror: '~/m.git', commit: HEAD, fetchShas: [HEAD], argv: ['x'], installPwa: false });
+    expect(script).toContain('TMPDIR=/var/tmp; export TMPDIR');
+    expect(script).toContain('mktemp -d /var/tmp/elanous-gate-remote-XXXXXXXX');
+    const run = spawnSync('sh', ['-s'], { input: script, encoding: 'utf8', env: { HOME: home, PATH: '/usr/bin:/bin:/usr/sbin:/sbin' } });
+    expect(run.status).toBe(97);
+    expect(run.stderr).toContain('__GATE_REMOTE_INFRA=disk-low:1KiB');
+    expect(run.stderr).not.toContain('clone');
+  });
+
   test('heavy typecheck uses a stable slot checkout and a private per-slot cache', () => {
     const script = remoteScript({ mirror: '~/m.git', commit: HEAD, fetchShas: [HEAD],
       argv: ['bun', 'run', 'scripts/ci-typecheck-changed.ts', '--local'], installPwa: true, stableCheckout: true });
@@ -644,17 +664,19 @@ describe('the whole remote script, executed (no ssh)', () => {
         return { rc: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
       },
     };
-    const tool = 'printf "%s|%s|" "$(git rev-parse HEAD)" "$(git rev-parse origin/main)"; cat marker.txt; test -s "$W/bun.calls" && echo installed; echo "tool err" >&2; exit 3';
+    const tool = 'printf "%s|%s|" "$(git rev-parse HEAD)" "$(git rev-parse origin/main)"; cat marker.txt; test -s "$W/bun.calls" && echo installed; printf "tmp=%s scratch=%s\\n" "$TMPDIR" "$W"; echo "tool err" >&2; exit 3';
     const outcome = runOnRemote({ repo, host: 'h', mirror, argv: ['sh', '-c', tool], slotDir: join(root, 'slots') }, runner);
     expect(outcome).toMatchObject({ kind: 'ran', rc: 3, commit: head });
     if (outcome.kind !== 'ran') return;
-    expect(outcome.stdout.toString()).toBe(`${head}|${base}|head\ninstalled\n`);
+    expect(outcome.stdout.toString().startsWith(`${head}|${base}|head\ninstalled\n`)).toBe(true);
+    expect(outcome.stdout.toString()).toContain('tmp=/var/tmp scratch=/var/tmp/elanous-gate-remote-');
     expect(outcome.stderr.toString()).toBe('tool err\n');
     writeFileSync(join(repo, 'marker.txt'), 'dirty\n');
     const pinned = runOnRemote({ repo, host: 'h', mirror, commit: base, argv: ['sh', '-c', tool], slotDir: join(root, 'slots') }, runner);
     expect(pinned).toMatchObject({ kind: 'ran', rc: 3, commit: base });
     if (pinned.kind !== 'ran') return;
-    expect(pinned.stdout.toString()).toBe(`${base}|${base}|base\ninstalled\n`);
+    expect(pinned.stdout.toString().startsWith(`${base}|${base}|base\ninstalled\n`)).toBe(true);
+    expect(pinned.stdout.toString()).toContain('tmp=/var/tmp scratch=/var/tmp/elanous-gate-remote-');
   });
 });
 

@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -26,9 +26,41 @@ export function needsPwaBuild(files: readonly string[], repoRoot: string, graph:
  * land worktree (TA-LAND-WORKTREE).
  */
 export function provideCheckoutDependencies(candidate: string, sourceRoot: string, dir: string, marker: string, install: (cwd: string) => void): void {
-  if (existsSync(join(candidate, dir, 'node_modules'))) return;
-  if (existsSync(join(sourceRoot, dir, 'node_modules', marker, 'package.json'))) {
-    symlinkSync(join(sourceRoot, dir, 'node_modules'), join(candidate, dir, 'node_modules'), 'dir');
+  const candidateModules = join(candidate, dir, 'node_modules');
+  const candidateMarker = join(candidateModules, marker, 'package.json');
+  const sourceModules = join(sourceRoot, dir, 'node_modules');
+  if (existsSync(candidateMarker)) return;
+  if (existsSync(join(sourceModules, marker, 'package.json'))) {
+    let stat: ReturnType<typeof lstatSync> | undefined;
+    try { stat = lstatSync(candidateModules); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    if (stat) {
+      if (stat.isSymbolicLink()) {
+        // A dangling or stale link can block symlinkSync with EEXIST; unlink only the link itself.
+        try { unlinkSync(candidateModules); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      } else if (stat.isDirectory() && readdirSync(candidateModules).length === 0) {
+        try { rmdirSync(candidateModules); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOTEMPTY') {
+            install(join(candidate, dir));
+            return;
+          }
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+      }
+      else {
+        install(join(candidate, dir));
+        return;
+      }
+    }
+    try {
+      symlinkSync(sourceModules, candidateModules, 'dir');
+    } catch (error) {
+      // Concurrent host regates may provision the same checked-out worktree. The first link wins;
+      // accept EEXIST only after confirming its package marker is now visible.
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || !existsSync(candidateMarker)) throw error;
+    }
   } else install(join(candidate, dir));
 }
 

@@ -1,6 +1,48 @@
 import { setDefaultTimeout, expect, spyOn, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { debug } from './debug/log.js';
-import { _usesAdaptiveThinkingForContractTest, AnthropicProvider, PROVIDERS, streamLLM, streamLLMWithTools, type LLMProvider } from './llm.js';
+import { _usesAdaptiveThinkingForContractTest, AnthropicProvider, billingRouteForProvider, codexOAuthAvailable, logAgentTurnUsage, PROVIDERS, streamLLM, streamLLMWithTools, type LLMProvider } from './llm.js';
+import { _resetCodexBillingDecisionForTesting, noteCodexBillingDecision } from './oauth/codex-billing-route.js';
+
+test('credits-allowed Codex rotation records credit billing even when Codex auth is not inferred as OAuth', () => {
+  // 인증 추론이 oauth 가 «아닌» 우주(빈 HOME·자격 미러 결손)를 고정한다 — oauth 우주에선
+  // 수정 전 코드(auth === 'oauth' 조건)도 통과하므로 이 시험이 그 경로를 물지 못한다.
+  const keys = ['HOME', 'ELANOUS_STATE_DIR', 'XDG_CONFIG_HOME', 'CODEX_HOME', 'ELANOUS_CODEX_ACCOUNT', 'ELANOUS_CODEX_ACCOUNT_HOME'] as const;
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  const root = mkdtempSync(join(tmpdir(), 'llm-credit-billing-'));
+  for (const k of ['HOME', 'ELANOUS_STATE_DIR', 'XDG_CONFIG_HOME', 'CODEX_HOME'] as const) process.env[k] = root;
+  delete process.env.ELANOUS_CODEX_ACCOUNT;
+  delete process.env.ELANOUS_CODEX_ACCOUNT_HOME;
+  _resetCodexBillingDecisionForTesting();
+  const spy = spyOn(debug, 'log');
+  try {
+    expect(codexOAuthAvailable()).toBe(false);
+    // 결정이 없으면 기존 경로 그대로 — 크레딧이 아니다.
+    expect(billingRouteForProvider('openai-codex', 'gpt-5.6-terra')).not.toBe('credit');
+    noteCodexBillingDecision('credits-allowed');
+    expect(billingRouteForProvider('openai-codex', 'gpt-5.6-terra')).toBe('credit');
+    logAgentTurnUsage('gpt-5.6-terra', {
+      provider: 'openai', inputTokens: 1_000_000, outputTokens: 0,
+    }, { providerName: 'openai-codex', site: 'codex-credit-billing-test' });
+    const row = spy.mock.calls.find((call) =>
+      call[0] === 'llm.usage'
+      && call[1] === 'llm-usage'
+      && (call[2] as { site?: string })?.site === 'codex-credit-billing-test');
+    expect(row).toBeDefined();
+    expect(row![2]).toMatchObject({ billing: 'credit', billingProvider: 'openai-codex' });
+    expect((row![2] as { cost: unknown }).cost).toMatchObject({ kind: 'credit', usd: null });
+  } finally {
+    spy.mockRestore();
+    _resetCodexBillingDecisionForTesting();
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 async function observeDone(run: () => Promise<unknown>) {
   const done: Record<string, unknown>[] = [];

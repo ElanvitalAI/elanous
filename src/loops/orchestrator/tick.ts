@@ -3,7 +3,9 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renam
 import { dirname, join } from 'node:path';
 import { CardStore, taskCardsDir, type TaskCard } from '../../task-cards/card-store.js';
 import { Database } from 'bun:sqlite';
-import { type ChecklistItem } from '../../release-loop/checklist.js';
+import { checklistDevVersion, listChecklist, type ChecklistItem } from '../../release-loop/checklist.js';
+import { readTrafficSignal } from '../../seat-loop/traffic-signal.js';
+import { runHoldHygiene, type HygieneCell, type HygieneDeps } from '../../steward/hold-hygiene.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { getUserConfig, ORCHESTRATOR_DEFAULTS, resolveConfiguredAgentRoleLlm, type OrchestratorLoopConfig } from '../../user-config.js';
 import { rubricPriority } from '../../release-loop/rubric.js';
@@ -63,6 +65,8 @@ export type RebalanceAdapter = (version: string) => Promise<{ decisions: unknown
 export interface TickDeps {
   root?: string; now?: Date | (() => Date); mode?: Mode; runId?: string; window?: Window;
   heartbeatIntervalMs?: number;
+  hygieneCells?: () => HygieneCell[];
+  hygienePaths?: Pick<HygieneDeps, 'trafficPath' | 'metaPath' | 'dispatcherDir'>;
   cards?: () => TaskCard[]; split?: SplitAdapter; placeCell?: PlaceAdapter;
   degradation?: () => { llm: boolean; board: boolean };
   gridHosts?: readonly GridHost[];
@@ -888,7 +892,25 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
           }
         }
       }
-    } else if (node === 'report') (deps.print ?? console.log)(reportLine(state));
+    } else if (node === 'report') {
+      if (mode === 'live') {
+        try {
+          const signal = readTrafficSignal(deps.hygienePaths?.trafficPath);
+          const versions = signal && !('unreadable' in signal) && signal.versions?.length ? signal.versions : [checklistDevVersion()];
+          let cells: HygieneCell[] = [];
+          if (deps.hygieneCells) cells = deps.hygieneCells();
+          else if (signal && !('unreadable' in signal) && signal.hold?.length) {
+            for (const version of versions) {
+              try { cells.push(...listChecklist(version).items); }
+              catch (error) { observe('hold-hygiene-checklist-unreadable', `${version}:${String(error).slice(0, 100)}`, 0); }
+            }
+          }
+          const sent = runHoldHygiene({ root, now, cells, ...deps.hygienePaths });
+          for (const notice of sent) observe('exchange', `hold-hygiene:${notice.key}`, 1, SEAT_LOOP_IDS[notice.to]);
+        } catch (error) { observe('hold-hygiene-failed', String(error).slice(0, 160), 0); }
+      }
+      (deps.print ?? console.log)(reportLine(state));
+    }
     state.nodes[node] = 'ok';
   } else if (state.nodes[node] !== 'ok') {
     // A rerun of a node that already completed keeps its result (review round 3): only never-run nodes become skipped.

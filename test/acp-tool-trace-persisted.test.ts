@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'bun:test';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { afterEach, describe, expect, it } from 'bun:test';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { persistAcpToolTrace } from '../src/acp/tool-trace.js';
 
 /** ⛔⭐⭐⭐ **PWA 턴도 「어떤 도구를 호출했나」를 세션에 남긴다.**
@@ -133,5 +134,235 @@ describe('배선 — ACP 서버가 그 함수를 «실제로» 부르나', () =>
   it('does not hand-roll the trace message shape in the server', () => {
     // 모양은 `session/chat.ts` 가 갖고 `tool-trace.ts` 만 그것을 쓴다 — 계약을 두 벌로 두지 않는다.
     expect(codeLinesOf(ACP_SERVER).some((line) => line.includes('buildToolTraceMessage'))).toBe(false);
+  });
+});
+
+/** ⛔⭐⭐ TUI-OBS-TRACE-PERSIST(결함 #30·#64) — «새 세션 첫 턴»의 흔적이 사라지던 것.
+ *
+ *  📏 2026-10-16 실측: `trace-persist-failed «session not found: elanous-session-ndusg6»` 7건이 한 턴(13:12:03~15Z)에
+ *  몰렸고 세션 파일 첫 줄은 13:12:48Z(턴 끝 채택)였다. ACP 세션은 턴이 «끝난 뒤» 원장에 채택되는데
+ *  흔적은 «턴 도중» 쓴다 — 그래서 실제 원장(임시 디렉토리)으로 그 순서를 그대로 재연한다. */
+describe('TUI-OBS-TRACE-PERSIST — 원장에 아직 없는 세션의 흔적', () => {
+  let root = '';
+  let prevRoot: string | undefined;
+  afterEach(() => {
+    if (prevRoot === undefined) delete process.env.ELANOUS_SESSION_ROOT;
+    else process.env.ELANOUS_SESSION_ROOT = prevRoot;
+  });
+
+  const load = async () => (await import('../src/acp/tool-trace.js'));
+  const session = async () => (await import('../src/session/index.js'));
+  const flushMicrotasks = () => new Promise<void>((r) => setTimeout(r, 0));
+
+  const beforeEachFn = async () => {
+    prevRoot = process.env.ELANOUS_SESSION_ROOT;
+    root = mkdtempSync(join(tmpdir(), 'acp-trace-persist-'));
+    process.env.ELANOUS_SESSION_ROOT = root;
+    (await load())._resetAcpToolTraceStateForTest();
+  };
+  const afterEachFn = async () => {
+    (await load())._resetAcpToolTraceStateForTest();
+    if (prevRoot === undefined) delete process.env.ELANOUS_SESSION_ROOT;
+    else process.env.ELANOUS_SESSION_ROOT = prevRoot;
+    rmSync(root, { recursive: true, force: true });
+  };
+
+  const runShellArgs = { command: ['bash', '-lc', "ssh node-c 'bun test test/x.test.ts'"], cwd: '/tmp/seat' };
+
+  it('defers instead of failing, then lands exactly one trace row once the turn-end adopt creates the session', async () => {
+    await beforeEachFn();
+    try {
+      const { persistAcpToolTrace, pendingAcpToolTraceCount } = await load();
+      const { adoptSession, loadSession } = await session();
+      const failures: unknown[] = [];
+      const events: Array<[string, Record<string, unknown>]> = [];
+      const deps = {
+        observeFailure: (i: unknown) => { failures.push(i); },
+        observe: (e: string, d: Record<string, unknown>) => { events.push([e, d]); },
+      };
+      const sid = 'elanous-session-tp0001';
+
+      // 턴 도중 — 세션은 아직 원장에 없다(ACP 서버는 id 를 메모리에만 민팅한다).
+      const ok = persistAcpToolTrace(sid, { id: 'call-1', name: 'RunShell', result: { ok: true, output: 'pass' } }, runShellArgs, deps);
+      expect(ok).toBe(false);
+      expect(pendingAcpToolTraceCount(sid)).toBe(1);
+      // ⛔ «session not found» 실패 경고 0 — 지연은 실패가 아니다.
+      expect(failures).toHaveLength(0);
+      expect(events.map(([e]) => e)).toEqual(['trace-persist-deferred']);
+      // ⛔ 출처를 짐작해 여기서 세션을 «만들지» 않는다.
+      expect(loadSession(sid)).toBeNull();
+
+      // 턴 끝 — 원래 주인(대시보드/서버)이 채택한다.
+      adoptSession(sid, { source: 'tui', transport: 'acp' });
+      await flushMicrotasks();
+
+      const loaded = loadSession(sid)!;
+      const toolRows = loaded.messages.filter((m) => m.role === 'tool');
+      expect(toolRows).toHaveLength(1);
+      expect(toolRows[0]!.toolName).toBe('RunShell');
+      expect(String(toolRows[0]!.toolArgs)).toContain('ssh node-c');
+      expect(pendingAcpToolTraceCount(sid)).toBe(0);
+      expect(events.map(([e]) => e)).toEqual(['trace-persist-deferred', 'trace-persist-flushed']);
+      expect(events[1]![1]).toEqual({ sessionId: sid, flushed: 1, failed: 0 });
+
+      // 다음 턴 — 이제 바로 붙는다.
+      expect(persistAcpToolTrace(sid, { id: 'call-2', name: 'MsgList', result: {} }, {}, deps)).toBe(true);
+      expect(loadSession(sid)!.messages.filter((m) => m.role === 'tool')).toHaveLength(2);
+      expect(failures).toHaveLength(0);
+    } finally { await afterEachFn(); }
+  });
+
+  it('warns once per session, not once per tool call — the repeated line of #64', async () => {
+    await beforeEachFn();
+    try {
+      const { persistAcpToolTrace, pendingAcpToolTraceCount } = await load();
+      const events: string[] = [];
+      const sid = 'elanous-session-tp0002';
+      for (let i = 0; i < 7; i += 1) {
+        persistAcpToolTrace(sid, { id: `c${i}`, name: 'MsgList', result: {} }, {}, {
+          observe: (e: string) => { events.push(e); },
+          observeFailure: () => { events.push('failed'); },
+        });
+      }
+      expect(events).toEqual(['trace-persist-deferred']);
+      expect(pendingAcpToolTraceCount(sid)).toBe(7);
+    } finally { await afterEachFn(); }
+  });
+
+  it('keeps the tool rows AFTER the user row when the server-side completion adopt appends user/assistant in the same tick', async () => {
+    // ⭐ 다음 턴의 「직전 턴 도구 관찰」은 «마지막 user 뒤의 tool 행»만 본다(`buildRecentToolObservations`).
+    await beforeEachFn();
+    try {
+      const { persistAcpToolTrace } = await load();
+      const { adoptSession, appendMessage, loadSession } = await session();
+      const sid = 'elanous-session-tp0003';
+      persistAcpToolTrace(sid, { id: 'c1', name: 'RunShell', result: 'x' }, runShellArgs, { observe: () => {} });
+      // `persistCompletedTuiAcpTurn` 의 순서 그대로(동기).
+      adoptSession(sid, { source: 'tui', transport: 'acp' });
+      appendMessage(sid, { role: 'user', content: 'hi', ts: new Date().toISOString() });
+      appendMessage(sid, { role: 'assistant', content: 'done', ts: new Date().toISOString() });
+      await flushMicrotasks();
+      const roles = loadSession(sid)!.messages.map((m) => m.role);
+      expect(roles).toEqual(['user', 'assistant', 'tool']);
+    } finally { await afterEachFn(); }
+  });
+
+  it('반증: a non-"session not found" failure is NOT deferred — it stays a named trace-persist-failed per call', async () => {
+    await beforeEachFn();
+    try {
+      const { persistAcpToolTrace, pendingAcpToolTraceCount } = await load();
+      const reasons: string[] = [];
+      const deferEvents: string[] = [];
+      for (let i = 0; i < 3; i += 1) {
+        const ok = persistAcpToolTrace('sess-disk', { id: `c${i}`, name: 't', result: 1 }, {}, {
+          append: () => { throw new Error('EACCES: disk is gone'); },
+          observeFailure: (info) => { reasons.push(info.reason); },
+          observe: (e: string) => { deferEvents.push(e); },
+        });
+        expect(ok).toBe(false);
+      }
+      expect(reasons).toEqual(['EACCES: disk is gone', 'EACCES: disk is gone', 'EACCES: disk is gone']);
+      expect(deferEvents).toEqual([]);
+      expect(pendingAcpToolTraceCount('sess-disk')).toBe(0);
+    } finally { await afterEachFn(); }
+  });
+
+  it('a non-"session not found" failure while flushing deferred rows goes through the same trace-persist-failed counter', async () => {
+    await beforeEachFn();
+    try {
+      const { persistAcpToolTrace, pendingAcpToolTraceCount } = await load();
+      const { adoptSession } = await session();
+      const sid = 'elanous-session-tp0005';
+      let missing = true;
+      const failures: Array<{ reason: string }> = [];
+      const flushedEvents: Array<Record<string, unknown>> = [];
+      const deps = {
+        append: () => {
+          if (missing) throw new Error(`session not found: ${sid}`);
+          throw new Error('EACCES: disk is gone');
+        },
+        observeFailure: (info: { reason: string }) => { failures.push(info); },
+        observe: (e: string, d: Record<string, unknown>) => { if (e === 'trace-persist-flushed') flushedEvents.push(d); },
+      };
+      for (let i = 0; i < 3; i += 1) persistAcpToolTrace(sid, { id: `c${i}`, name: 'RunShell', result: {} }, {}, deps);
+      expect(pendingAcpToolTraceCount(sid)).toBe(3);
+      missing = false;
+      adoptSession(sid, { source: 'tui', transport: 'acp' });
+      await new Promise<void>((r) => setTimeout(r, 0));
+      // ⛔ 회수 중 실패도 «같은» trace-persist-failed 로 — 합계(flushed.failed)에만 묻지 않는다.
+      expect(failures).toHaveLength(3);
+      expect(failures.every((f) => f.reason.includes('EACCES'))).toBe(true);
+      expect(flushedEvents).toEqual([{ sessionId: sid, flushed: 0, failed: 3 }]);
+      expect(pendingAcpToolTraceCount(sid)).toBe(0);
+    } finally { await afterEachFn(); }
+  });
+
+  it('keeps the rest deferred (not failed) when the session vanishes mid-flush', async () => {
+    await beforeEachFn();
+    try {
+      const { persistAcpToolTrace, pendingAcpToolTraceCount } = await load();
+      const sid = 'elanous-session-tp0006';
+      let mode: 'missing' | 'one-then-missing' = 'missing';
+      let okLeft = 0;
+      const stored: string[] = [];
+      const failures: unknown[] = [];
+      const deps = {
+        append: (_s: string, msg: { toolName?: string }) => {
+          if (mode === 'one-then-missing' && okLeft > 0) { okLeft -= 1; stored.push(String(msg.toolName)); return; }
+          throw new Error(`session not found: ${sid}`);
+        },
+        observeFailure: (i: unknown) => { failures.push(i); },
+        observe: () => {},
+      };
+      for (let i = 0; i < 3; i += 1) persistAcpToolTrace(sid, { id: `c${i}`, name: `T${i}`, result: {} }, {}, deps as never);
+      expect(pendingAcpToolTraceCount(sid)).toBe(3);
+      // 다음 호출 때 회수 — 첫 행만 붙고 세션이 사라진다.
+      mode = 'one-then-missing'; okLeft = 1;
+      expect(persistAcpToolTrace(sid, { id: 'c3', name: 'T3', result: {} }, {}, deps as never)).toBe(false);
+      expect(stored).toEqual(['T0']);
+      // T1·T2 는 보존되고 T3 도 그 뒤에 줄 선다 — 실패로 세지 않는다.
+      expect(pendingAcpToolTraceCount(sid)).toBe(3);
+      expect(failures).toHaveLength(0);
+    } finally { await afterEachFn(); }
+  });
+
+  it('records a partial flushed count when the session vanishes after 2 rows, and keeps the rest', async () => {
+    await beforeEachFn();
+    try {
+      const { persistAcpToolTrace, pendingAcpToolTraceCount } = await load();
+      const sid = 'elanous-session-tp0007';
+      let okLeft = 0;
+      const flushedEvents: Array<Record<string, unknown>> = [];
+      const deps = {
+        append: () => { if (okLeft > 0) { okLeft -= 1; return; } throw new Error(`session not found: ${sid}`); },
+        observeFailure: () => {},
+        observe: (e: string, d: Record<string, unknown>) => { if (e === 'trace-persist-flushed') flushedEvents.push(d); },
+      };
+      for (let i = 0; i < 4; i += 1) persistAcpToolTrace(sid, { id: `c${i}`, name: `T${i}`, result: {} }, {}, deps as never);
+      okLeft = 2; // 다음 호출의 회수 — 2행 붙고 3번째에서 세션 소실
+      persistAcpToolTrace(sid, { id: 'c4', name: 'T4', result: {} }, {}, deps as never);
+      expect(flushedEvents).toEqual([{ sessionId: sid, flushed: 2, failed: 0, partial: true }]);
+      expect(pendingAcpToolTraceCount(sid)).toBe(3); // T2·T3 보존 ⊕ T4 뒤에 줄 섬
+    } finally { await afterEachFn(); }
+  });
+
+  it('반증: a session that never reaches the ledger stays pending (bounded) and creates no file', async () => {
+    await beforeEachFn();
+    try {
+      const { persistAcpToolTrace, pendingAcpToolTraceCount } = await load();
+      const { loadSession } = await session();
+      const sid = 'elanous-session-tp0004';
+      const dropped: Array<Record<string, unknown>> = [];
+      for (let i = 0; i < 150; i += 1) {
+        persistAcpToolTrace(sid, { id: `c${i}`, name: 'MsgList', result: {} }, {}, {
+          observe: (e: string, d: Record<string, unknown>) => { if (e === 'trace-persist-dropped') dropped.push(d); },
+        });
+      }
+      expect(pendingAcpToolTraceCount(sid)).toBe(100);
+      expect(loadSession(sid)).toBeNull();
+      // ⛔ 상한에 닿은 것은 «보인다» — 세션당 한 줄(버린 수 계수·보고 방식은 연결 골 ACP-TRACE-EVICTION-ACCOUNTING).
+      expect(dropped).toHaveLength(1);
+      expect(dropped[0]).toMatchObject({ sessionId: sid, reason: 'pending-per-session-cap' });
+    } finally { await afterEachFn(); }
   });
 });

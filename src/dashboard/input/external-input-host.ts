@@ -16,10 +16,31 @@ export interface DashboardExternalInputHostDeps {
   };
   /** 채팅 로그에 한 줄(표지)을 남기고 다시 그린다. */
   pushNotice: (line: string) => void;
+  /** 외부 입력 대기열의 현재 상태 한 줄을 설정하거나(문면) 지운다(null). */
+  setQueueNotice: (line: string | null) => void;
   /** 지금 턴의 ESC 중단 경로(escGate) — 턴 밖이면 null. 외부 `/stop` 이 이것을 부른다. */
   getTurnStop?: () => (() => void) | null;
   /** 미소비 키 수 — 기본 tui.ts 키 큐. */
   pendingKeyCount?: () => number;
+}
+
+export function updateDashboardExternalInputQueueNotice(
+  lines: string[],
+  previousNotice: string | null,
+  nextNotice: string | null,
+  formatNotice: (notice: string) => string = (notice) => notice,
+): boolean {
+  const previousLine = previousNotice === null ? null : formatNotice(previousNotice);
+  const nextLine = nextNotice === null ? null : formatNotice(nextNotice);
+  if (previousLine === nextLine) return false;
+  const previousIndex = previousLine === null ? -1 : lines.indexOf(previousLine);
+  if (previousIndex >= 0) {
+    if (nextLine === null) lines.splice(previousIndex, 1);
+    else lines[previousIndex] = nextLine;
+  } else if (nextLine !== null) {
+    lines.push(nextLine);
+  }
+  return true;
 }
 
 export function createDashboardExternalInputHost(deps: DashboardExternalInputHostDeps): ExternalInputHost {
@@ -45,15 +66,8 @@ export function createDashboardExternalInputHost(deps: DashboardExternalInputHos
         : result === 'no-turn' ? '⏹ 외부 /stop — 도는 턴이 없어 무시했습니다'
         : '⏹ 외부 /stop — 이 턴의 중단 경로에 닿지 못했습니다(Esc 로 멈춰 주세요)');
     },
-    onQueueChange: (pending, event) => {
-      if (event === 'queued') {
-        const notice = renderExternalInputQueueNotice(pending);
-        if (notice) deps.pushNotice(notice);
-        return;
-      }
-      deps.pushNotice(pending.length > 0
-        ? `⤵ 외부 입력 1건 전송 · 남은 대기 ${pending.length}건`
-        : '⤵ 외부 입력 1건 전송');
+    onQueueChange: (pending) => {
+      deps.setQueueNotice(renderExternalInputQueueNotice(pending));
     },
   };
 }

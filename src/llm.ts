@@ -48,7 +48,8 @@ import {
   type ProviderFallbackAttempt,
   type ProviderFallbackTerminalVerdict,
 } from './session-runtime/retry-policy.js';
-import { fetchApiWithRetry, OverloadFailoverError, type FetchApiWithRetryOpts } from './session-runtime/retry-api.js';
+import { ApiHttpError, fetchApiWithRetry, OverloadFailoverError, type FetchApiWithRetryOpts } from './session-runtime/retry-api.js';
+import { isShapeRelevantRejection, summarizeCodexRequestShape } from './llm-request-shape.js';
 import { BedrockProvider, isBedrockCompatibleModel, makeBedrockProvider } from './llm/bedrock-provider.js';
 import { OPEN_WEIGHT_TOOL_DISCIPLINE } from './llm/open-weight-discipline.js';
 import { makeZaiCodingPlanProvider, zaiCodingPlanAvailable } from './llm/zai-coding-plan.js';
@@ -61,8 +62,6 @@ import { undoTurnRuntime } from './tool-runtime/undo-turn-runtime.js';
 import { listSnapshots } from './undo-turn/index.js';
 // Zero-dep spec module (no tool-runtime registry) — safe for this hot path.
 import { takeHydratedTools } from './skills/tools/tool-search-spec.js';
-import { dispatchAskUserQuestion } from './ask-user-question/index.js';
-import type { AskUserQuestionResult } from './ask-user-question/index.js';
 import { isPlanModeActive } from './plan-mode/session.js';
 import { mintTurnUri } from './mss/uri/builder.js';
 import type { TurnUri } from './mss/uri/brand.js';
@@ -406,6 +405,10 @@ export interface LLMOpts {
    *  ③ 종결 신호를 받은 뒤의 빈 턴 포기에도 이미 쓴 답이 있으면 `[NO FINAL SYNTHESIS]` 를 붙이지 않는다.
    *  비우면(기본) 종전 동작 그대로. */
   terminalToolNames?: readonly string[];
+  /** TUI-H1-GOALLOOP-EMPTY-TAIL — 호출자가 이 스트림 «앞»에 사람에게 답을 이미 보였다(예: goal loop 의 앞 iteration).
+   *  그러면 종결 신호 뒤 빈 턴은 이 스트림에 쓴 답이 없어도 재촉·`[NO FINAL SYNTHESIS]` 없이 빈 답으로 끝낸다.
+   *  비우면(기본) 종전대로 — 답이 «어디에도» 없을 때의 경고는 그대로 보인다. */
+  terminalPriorAnswerVisible?: boolean;
   /** Prompt-caching toggle. Honored by Anthropic (attaches
    *  cache_control markers on system + tools + 2nd-to-last history
    *  message) and OpenAI (passes stream_options.include_usage so
@@ -425,12 +428,9 @@ export interface LLMOpts {
    *  every tool-loop turn gets a stable checkpoint identity without
    *  forcing existing callers to thread the brand through. */
   turnUri?: TurnUri;
-  /** Chat session id forwarded to the AskUserQuestion bridge when the
-   *  tool-loop self-dispatches a doom-loop intervention prompt. Lets
-   *  PWA / iOS peers receive the prompt natively via the ACP
-   *  `elanous/ask/*` envelope instead of the raw `[ASK USER]` text
-   *  fallback. Absent for CLI / startup-script callers without a chat
-   *  session context. */
+  /** Chat session id (context compaction · provider sticky routing).
+   *  Absent for CLI / startup-script callers without a chat session
+   *  context. */
   sessionId?: string;
   /** Server-side built-in tools the provider should advertise to the
    *  model alongside the caller-supplied `tools`. Each provider has
@@ -2195,6 +2195,31 @@ export async function* streamCodexResponsesEvents(
   //                         applies the same tool/SSE conventions
   const promptCache = extra.promptCache !== false;
   const cacheKey = promptCache ? computePromptCacheKey(body.model, body.instructions) : undefined;
+  // TUI-OBS-400-SHAPE(#69) — 전송 객체·문자열을 한 번 만들어 둔다: 4xx 거절 때 «실제로 보낸 것» 의 모양을 잰다.
+  const wireBody: Record<string, unknown> = {
+    ...body,
+    stream: true,
+    // store=true wave: when caller opts in, the backend persists the
+    // response and the next request can thread `previous_response_id`
+    // to send only the delta input items. Default still false so any
+    // caller that doesn't opt in (tests building bodies directly)
+    // sees the legacy wire shape.
+    store: body.store === true,
+    ...(body.tool_choice ? { tool_choice: body.tool_choice } : {}),
+    ...(body.previousResponseId ? { previous_response_id: body.previousResponseId } : {}),
+    ...(cacheKey ? { prompt_cache_key: cacheKey } : {}),
+    // Reasoning opt-in (gpt-5 family). When the caller sets
+    // body.reasoning we mirror it onto the wire AND append the
+    // include directive that lets multi-turn requests thread the
+    // model's encrypted reasoning context. Omit both when absent
+    // so non-reasoning models / opt-out users see the legacy
+    // wire shape unchanged.
+    ...(body.reasoning ? {
+      reasoning: body.reasoning,
+      include: ['reasoning.encrypted_content'],
+    } : {}),
+  };
+  const wireJson = JSON.stringify(wireBody);
   const response = await fetchApiWithRetry(
     url,
     {
@@ -2212,33 +2237,14 @@ export async function* streamCodexResponsesEvents(
         // Codex". See getCodexUserAgent (oauth/codex.ts).
         'User-Agent': getCodexUserAgent(),
       },
-      body: JSON.stringify({
-        ...body,
-        stream: true,
-        // store=true wave: when caller opts in, the backend persists the
-        // response and the next request can thread `previous_response_id`
-        // to send only the delta input items. Default still false so any
-        // caller that doesn't opt in (tests building bodies directly)
-        // sees the legacy wire shape.
-        store: body.store === true,
-        ...(body.tool_choice ? { tool_choice: body.tool_choice } : {}),
-        ...(body.previousResponseId ? { previous_response_id: body.previousResponseId } : {}),
-        ...(cacheKey ? { prompt_cache_key: cacheKey } : {}),
-        // Reasoning opt-in (gpt-5 family). When the caller sets
-        // body.reasoning we mirror it onto the wire AND append the
-        // include directive that lets multi-turn requests thread the
-        // model's encrypted reasoning context. Omit both when absent
-        // so non-reasoning models / opt-out users see the legacy
-        // wire shape unchanged.
-        ...(body.reasoning ? {
-          reasoning: body.reasoning,
-          include: ['reasoning.encrypted_content'],
-        } : {}),
-      }),
+      body: wireJson,
       signal,
     },
     retryOptsFor('codex', 'Codex API', extra.remainingFallbacks),
-  );
+  ).catch((err: unknown) => {
+    observeCodexRequestRejection(err, wireBody, wireJson);
+    throw err;
+  });
   debug.log('llm.response.status', `codex ${response.status}`, {
     url, status: response.status, elapsedMs: Date.now() - startedAt,
   });
@@ -2373,6 +2379,19 @@ export async function* streamCodexResponsesEvents(
   } catch (err: any) {
     if (err.name === 'AbortError') return;
     throw err;
+  }
+}
+
+/** TUI-OBS-400-SHAPE(#69) — Codex 가 요청을 4xx(401·403·429 제외)로 거절하면 보낸 요청의 «모양» 만 남긴다.
+ *  Codex 400 은 `{"detail":"Bad Request"}` 뿐이라 크기·메시지 수·도구 짝 깨짐을 여기서 잰다.
+ *  ⛔ 본문·프롬프트·도구 인자/출력·키는 싣지 않는다(수·바이트·종류·call_id 해시 앞 8자만).
+ *  관측 실패는 오류 계약을 바꾸지 않는다 — 호출부는 원래 오류를 그대로 던진다. */
+function observeCodexRequestRejection(err: unknown, wireBody: Record<string, unknown>, wireJson: string): void {
+  if (!(err instanceof ApiHttpError) || !isShapeRelevantRejection(err.status)) return;
+  try {
+    debug.log('llm.codex', 'request-rejected-shape', summarizeCodexRequestShape(wireBody, wireJson, err.status, err.bodyText));
+  } catch {
+    // Observability must not interfere with the provider error contract.
   }
 }
 
@@ -4998,6 +5017,14 @@ export interface StreamWithToolsHandlers {
    *  before the `onText('', enriched)` re-emit so presentation hosts can
    *  keep the user answer to `answer` and send `supplement` to logs. */
   onFinalAnswerSupplement?(info: { answer: string; supplement: string; finalText: string }): void;
+  /** 검증 보충 — final-answer supplement attachment point. Called after the
+   *  final answer is settled (and after any finalization-snapshot enrichment)
+   *  so callers can append verification-recency / loop-closure wording after
+   *  the final answer. Return a non-empty string to append it to the final
+   *  answer output (it will be joined after `finalText` and the combined
+   *  supplement surfaces via `onFinalAnswerSupplement`); return
+   *  undefined/null/empty to keep the prior behavior unchanged. */
+  onAppendFinalAnswerSupplement?(req: FinalAnswerSupplementAttachmentRequest): string | null | undefined;
   /** Optional: notify when a tool_call is about to fire (for log line,
    *  HUD segment, etc). */
   onToolCall?(call: { id: string; name: string; args: Record<string, unknown> }): void;
@@ -5856,44 +5883,15 @@ function buildAutoUndoRepairNotice(result: { output?: string; restoredId?: strin
   ].filter(Boolean).join('\n');
 }
 
-// Fallback chat text used only when the AskUserQuestion bridge isn't
-// reachable (no resolver, no sessionId, dispatch error). The marker
-// `[ASK USER]` is preserved so `isUserInterventionRequired` downstream
-// still skips force-synthesis — that gate predates the bridge route and
-// other surfaces (TUI) still rely on the marker as a hard-stop signal.
-function buildAutoUndoAskUserNotice(reason: DoomLoopReason, detail?: string | null): string {
-  const why = reason === 'plan-mode'
-    ? 'Auto-undo was skipped because plan mode is active.'
-    : reason === 'no-undo-available'
-      ? 'Auto-undo was skipped because no undo snapshot is available.'
-      : reason === 'undo-failed'
-        ? 'Auto-undo was attempted but the undo runtime failed.'
-        : 'Retry policy did not authorize auto-undo for this failure.';
-  return [
-    '[ASK USER] The same tool call kept failing — stopping to avoid wasting more turns.',
-    why,
-    detail ? `Detail: ${detail}` : '',
-    'Reply with how to proceed (retry, change approach, or stop).',
-  ].filter(Boolean).join(' ');
-}
-
-// ── Doom-loop → AskUserQuestion routing ─────────────────────────
+// ── Doom-loop self-heal ─────────────────────────────────────────
 //
-// When the tool-loop trips the doom-loop gate (same tool error 3x) it
-// previously emitted a raw `[ASK USER]` chat message describing what
-// went wrong. With the AskUserQuestion bridge (PR #2611 PWA, #2612
-// iOS, #2613 multi-option fan-out) live across PWA + iOS surfaces, we
-// can self-dispatch a structured prompt instead so the user sees a
-// modal with retry / different-approach / stop options rather than
-// raw English instructions intended for the LLM.
-//
-// Falls back to the legacy `[ASK USER]` chat text when:
-//   - no `sessionId` plumbed (CLI / startup script callers),
-//   - no resolver wired (TUI-only or dispatch error), or
-//   - the bridge throws (peer disconnected, surface mismatch).
-//
-// The fallback marker `[ASK USER]` is preserved so the downstream
-// `isUserInterventionRequired` gate continues to skip force-synthesis.
+// When the tool-loop trips the doom-loop gate (same tool error 3x) and
+// auto-undo cannot run, the loop heals itself instead of asking the user
+// (대표 10-17 — doom-loop is not a user-facing notice: in 40 h of runs it
+// tripped 3 times and the AskUser prompt was answered 0 times, each one
+// sitting 5 min until timeout). First trip → a «change approach» note for
+// the model and the turn continues; a second trip in the same turn → the
+// turn ends with a plain stop text (no question to the user).
 
 export type DoomLoopReason = 'plan-mode' | 'no-undo-available' | 'undo-failed' | 'policy';
 
@@ -5983,174 +5981,35 @@ function stringifyDoomFailureDetail(value: unknown): string {
 }
 
 export type DoomLoopRouteOutcome =
-  | { kind: 'retry'; interventionClass: DoomLoopInterventionClass }
   | { kind: 'guidance'; userMessage: string; interventionClass: DoomLoopInterventionClass }
-  | { kind: 'stop'; hardStopText: string; interventionClass: DoomLoopInterventionClass }
-  | { kind: 'fallback'; hardStopText: string; interventionClass: DoomLoopInterventionClass };
+  | { kind: 'stop'; hardStopText: string; interventionClass: DoomLoopInterventionClass };
 
-export interface DoomLoopRouteOpts {
-  reason: DoomLoopReason;
-  /** Explicit evidence only. Omission means the intervention class is unknown. */
+/** Visible text when the turn ends on a second doom trip. Deliberately not a
+ *  question and without the `[ASK USER]` marker — nobody is asked. */
+export const DOOM_LOOP_SELF_HEAL_STOP_TEXT =
+  '같은 도구 호출이 방법을 바꾼 뒤에도 계속 실패해 이번 턴을 여기서 마칩니다.';
+
+export interface DoomLoopSelfHealInput {
+  /** 1 = first trip in this turn, 2+ = tripped again after the guidance. */
+  attempt: number;
+  tool?: string;
+  fingerprint: string;
   interventionClass?: DoomLoopInterventionClass | null;
-  detail?: string | null;
-  doomWindow: string[];
-  sessionId?: string;
-  signal?: AbortSignal;
-  /** Override the AskUser gate timeout (ms). Defaults to
-   *  DOOM_ASK_TIMEOUT_MS. Primarily a test seam. */
-  timeoutMs?: number;
 }
 
-export function buildDoomLoopAskRequest(opts: DoomLoopRouteOpts): Record<string, unknown> {
-  const interventionClass = normalizeDoomLoopInterventionClass(opts.interventionClass);
-  const why = opts.reason === 'plan-mode'
-    ? 'plan mode is active so auto-undo was skipped'
-    : opts.reason === 'undo-failed'
-      ? `auto-undo was attempted but failed (${opts.detail ?? 'no detail'})`
-      : `auto-undo was not authorized by the retry policy (${opts.detail ?? 'no detail'})`;
-  const lastFingerprint = opts.doomWindow[opts.doomWindow.length - 1] ?? 'unknown';
-  return {
-    interventionClass,
-    questions: [
-      {
-        id: 'doom_loop_next_step',
-        header: 'Loop blocked',
-        question:
-          'The same tool call kept failing after 3 attempts — '
-          + `${why}. How should I proceed?\n\nLast failure: ${lastFingerprint}`,
-        options: [
-          {
-            label: 'Retry once more',
-            description: 'Reset the retry tracker and let me try the same approach one more time.',
-          },
-          {
-            label: 'Different approach',
-            description: 'Type guidance in Other and I will follow it on the next turn.',
-          },
-          {
-            label: 'Stop here',
-            description: 'Halt this run. I will summarize what was tried and what was blocked.',
-          },
-        ],
-        includeOther: true,
-      },
-    ],
-  };
-}
-
-export function interpretDoomLoopAskResult(
-  result: AskUserQuestionResult,
-  interventionClass: DoomLoopInterventionClass = 'unknown',
-): DoomLoopRouteOutcome {
-  if (result.cancelled === true) {
+export function decideDoomLoopSelfHeal(input: DoomLoopSelfHealInput): DoomLoopRouteOutcome {
+  const interventionClass = normalizeDoomLoopInterventionClass(input.interventionClass);
+  if (input.attempt <= 1) {
     return {
-      kind: 'stop',
+      kind: 'guidance',
       interventionClass,
-      hardStopText:
-        '[ASK USER] The same tool call kept failing and you cancelled the prompt — stopping this run.',
+      userMessage:
+        `The same ${input.tool ?? 'tool'} call failed 3 times in a row (last failure: ${input.fingerprint}). `
+        + 'Do not call it again with the same arguments. Change approach — a different tool or different '
+        + 'arguments, or first verify the precondition that keeps failing — or state plainly what is blocked.',
     };
   }
-  const answer = result.answers?.['doom_loop_next_step'];
-  const picked = Array.isArray(answer) ? (answer[0] ?? '') : (answer ?? '');
-  const otherText = result.otherText?.['doom_loop_next_step']?.trim();
-
-  if (picked.startsWith('Retry')) {
-    return { kind: 'retry', interventionClass };
-  }
-  if (picked.startsWith('Different') || picked === 'Other') {
-    const guidance = otherText && otherText.length > 0
-      ? otherText
-      : 'Please try a different approach to the same goal — the previous tool call kept failing.';
-    return { kind: 'guidance', userMessage: guidance, interventionClass };
-  }
-  if (picked.startsWith('Stop')) {
-    return {
-      kind: 'stop',
-      interventionClass,
-      hardStopText: '[ASK USER] Stopped at your request after the repeated tool failure.',
-    };
-  }
-  return {
-    kind: 'stop',
-    interventionClass,
-    hardStopText:
-      '[ASK USER] The same tool call kept failing and the response was unrecognized — stopping this run.',
-  };
-}
-
-// Doom-loop AskUser gate timeout — the doom-loop HITL prompt awaits an
-// operator answer with NO timeout of its own (TUI modal `await modal.promise`
-// and the ACP bridge `Promise.race([pushAskRequest, cancellation])` both lack
-// a timer). In an autonomous drive there is no operator to answer, so the
-// dispatch region freezes indefinitely — between tool-loop turns, invisible to
-// the stream idle-watchdog (armed only inside the stream loop) and to the
-// goal-loop (which awaits the hung iteration). This was the 16-minute freeze in
-// RESEARCH-autonomous-runaway-discipline-2026-07-19 (R2). Bound the wait: after
-// this budget, fall back to the same auto-undo notice used when no session /
-// no cap-able peer is present. Generous enough that a present operator answers
-// first; short enough that an absent one doesn't stall the run for long.
-const DOOM_ASK_TIMEOUT_MS = 5 * 60_000;
-
-export async function routeDoomLoopToAskUser(opts: DoomLoopRouteOpts): Promise<DoomLoopRouteOutcome> {
-  const interventionClass = normalizeDoomLoopInterventionClass(opts.interventionClass);
-  if (!opts.sessionId) {
-    return {
-      kind: 'fallback',
-      interventionClass,
-      hardStopText: buildAutoUndoAskUserNotice(opts.reason, opts.detail),
-    };
-  }
-  try {
-    const dispatchCtx: { sessionId: string; signal?: AbortSignal } = { sessionId: opts.sessionId };
-    if (opts.signal) dispatchCtx.signal = opts.signal;
-    const timeoutMs = opts.timeoutMs ?? DOOM_ASK_TIMEOUT_MS;
-    const TIMED_OUT = Symbol('doom-ask-timeout');
-    let askTimer: ReturnType<typeof setTimeout> | undefined;
-    const raced = await Promise.race([
-      dispatchAskUserQuestion(buildDoomLoopAskRequest(opts), dispatchCtx),
-      new Promise<typeof TIMED_OUT>((res) => {
-        askTimer = setTimeout(() => res(TIMED_OUT), timeoutMs);
-      }),
-    ]);
-    if (askTimer) clearTimeout(askTimer);
-    if (raced === TIMED_OUT) {
-      debug.log('llm.tool-loop.retry', 'doom-loop-ask-timeout', {
-        reason: opts.reason,
-        interventionClass,
-        timeoutMs,
-      }, { level: 'warn' });
-      return {
-        kind: 'fallback',
-        interventionClass,
-        hardStopText: buildAutoUndoAskUserNotice(opts.reason, opts.detail),
-      };
-    }
-    const r = raced;
-    if (!r.result) {
-      debug.log('llm.tool-loop.retry', 'doom-loop-ask-route-failed', {
-        error: r.output,
-        reason: opts.reason,
-        interventionClass,
-      }, { level: 'error' });
-      return {
-        kind: 'fallback',
-        interventionClass,
-        hardStopText: buildAutoUndoAskUserNotice(opts.reason, opts.detail),
-      };
-    }
-    return interpretDoomLoopAskResult(r.result, interventionClass);
-  } catch (err) {
-    debug.log('llm.tool-loop.retry', 'doom-loop-ask-route-failed', {
-      error: err instanceof Error ? err.message : String(err),
-      reason: opts.reason,
-      interventionClass,
-    }, { level: 'error' });
-    return {
-      kind: 'fallback',
-      interventionClass,
-      hardStopText: buildAutoUndoAskUserNotice(opts.reason, opts.detail),
-    };
-  }
+  return { kind: 'stop', interventionClass, hardStopText: DOOM_LOOP_SELF_HEAL_STOP_TEXT };
 }
 
 interface AutoNarrowedInspection {
@@ -8164,9 +8023,10 @@ export function billingRouteForProvider(provider: string | undefined, model: str
   // local 은 호출이 «일어났다면» 언제나 local 이다 — 주소가 env 가 아니라 config rotation 에 있어도(자격 판정은 env 만 본다).
   if (name === 'local') return 'local';
   try {
+    // A recorded rotation decision is the authoritative route for that Codex call;
+    // auth-kind inference alone can otherwise relabel credit spend as subscription/API.
+    if (name === 'openai-codex' && codexCreditSpendReason()) return 'credit';
     const auth = authKindForProvider(name, model);
-    // CREDIT-BILLING-LABEL(10-14) — codex 회전이 크레딧 소진을 정한 호출은 구독이 아니라 크레딧이다.
-    if (auth === 'oauth' && name === 'openai-codex' && codexCreditSpendReason()) return 'credit';
     return auth === 'oauth' ? 'subscription' : auth === 'local' ? 'local' : auth === 'apikey' ? 'api' : 'unknown';
   } catch {
     return 'unknown';
@@ -8194,6 +8054,41 @@ export function logAgentTurnUsage(model: string, usage: LLMUsage, providerNameOr
       ...llmUsageCostFields(model, usage, undefined, billing),
     });
   } catch { /* usage observation must not change the turn */ }
+}
+
+/** 검증 보충 — final-answer supplement attachment point.
+ *  Request passed to `StreamWithToolsHandlers.onAppendFinalAnswerSupplement`
+ *  after the final answer is settled: `answer` is the visible answer text and
+ *  `finalText` is the current final answer output (including any
+ *  finalization-snapshot enrichment from the onFinalAnswerSupplement
+ *  foundation). */
+export interface FinalAnswerSupplementAttachmentRequest {
+  answer: string;
+  finalText: string;
+}
+
+/** Callback type for the attachment point. Return a non-empty string to have
+ *  it appended after the final answer; undefined/null/empty keeps the final
+ *  answer output unchanged. */
+export type FinalAnswerSupplementAttachment = (
+  req: FinalAnswerSupplementAttachmentRequest,
+) => string | null | undefined;
+
+/** Final-answer supplement attachment point: call the optional
+ *  `onAppendFinalAnswerSupplement` handler and return the final answer text
+ *  with its supplement appended (or the original text when the handler is
+ *  absent or yields nothing). No numeric thresholds are applied. */
+export function attachFinalAnswerSupplement(
+  handlers: { onAppendFinalAnswerSupplement?: FinalAnswerSupplementAttachment },
+  req: FinalAnswerSupplementAttachmentRequest,
+): string {
+  const provider = handlers.onAppendFinalAnswerSupplement;
+  if (!provider) return req.finalText;
+  const supplement = provider(req);
+  if (typeof supplement !== 'string' || supplement.trim().length === 0) return req.finalText;
+  const base = req.finalText;
+  if (base.length === 0 || base.endsWith('\n')) return base + supplement.trim();
+  return base + '\n\n' + supplement.trim();
 }
 
 export async function streamLLMWithTools(
@@ -8519,6 +8414,8 @@ export async function streamLLMWithTools(
   // broken dispatch forever. Window=3 mirrors opencode's
   // session/processor.ts DOOM_LOOP_THRESHOLD.
   const toolErrorDoomTracker = new DoomLoopTracker(3);
+  // Doom-loop self-heal attempts in this turn (guidance first, then stop).
+  let doomSelfHealAttempts = 0;
   // A (RESEARCH-autonomous-runaway-discipline-2026-07-19 R1) — the error tracker
   // above only fires on *failing* calls; identical *successful* calls (the model
   // re-reading / re-grepping the same file over and over — the grep-thrash that
@@ -9022,13 +8919,17 @@ export async function streamLLMWithTools(
         verificationLoopState,
         finalization,
       );
-      if (finalText !== visibleText) {
+      // 검증 보충 — final-answer supplement attachment point: let the caller
+      // append verification-recency / loop-closure wording after the final
+      // answer (on top of the onFinalAnswerSupplement foundation from PR #27520).
+      const attachedText = attachFinalAnswerSupplement(handlers, { answer: visibleText.trim(), finalText });
+      if (attachedText !== visibleText) {
         const answer = visibleText.trim();
-        handlers.onFinalAnswerSupplement?.({ answer, supplement: finalText.slice(answer.length).trim(), finalText });
+        handlers.onFinalAnswerSupplement?.({ answer, supplement: attachedText.slice(answer.length).trim(), finalText: attachedText });
       }
-      if (finalText !== fullText) handlers.onText('', finalText);
-      emitTurnComplete(finalText);
-      return finalText;
+      if (attachedText !== fullText) handlers.onText('', attachedText);
+      emitTurnComplete(attachedText);
+      return attachedText;
     }
 
     // No tool calls + empty text = model stalled. Re-prompt up to
@@ -9037,12 +8938,15 @@ export async function streamLLMWithTools(
     if (pendingCalls.length === 0 && turnText.length === 0) {
       // TUI-GOAL-LOOP-FRICTION(#63) — 종결 신호(update_goal)를 이미 받았고 답도 이미 썼다 = 할 말이 없는 게 맞다.
       //   빈 턴을 «정체»로 보고 재촉·`[NO FINAL SYNTHESIS]` 를 붙이지 않고 그 답으로 끝낸다.
-      if (terminalSignalDispatched && lastToolRoundText.trim().length > 0) {
-        const answer = lastToolRoundText;
+      //   TUI-H1-GOALLOOP-EMPTY-TAIL — 답이 이 스트림 «앞»에 이미 보였어도 같다(opts.terminalPriorAnswerVisible —
+      //   예: Bash → «끝» → 재주입 → update_goal 만 → 빈 턴). 이 스트림에 답이 없으면 빈 문자열로 끝내고 화면은
+      //   건드리지 않는다(onText 생략 · emitTurnComplete 는 빈 답을 이력에 안 싣는다). 마감은 호출자(goal loop) 몫.
+      if (terminalSignalDispatched && (lastToolRoundText.trim().length > 0 || opts.terminalPriorAnswerVisible === true)) {
+        const answer = lastToolRoundText.trim().length > 0 ? lastToolRoundText : '';
         debug.log('goal.loop', 'empty-turn-after-terminal-signal', {
           turn, emptyRetries, answerChars: answer.length,
         }, { level: 'info' });
-        if (answer !== fullText) handlers.onText('', answer);
+        if (answer.length > 0 && answer !== fullText) handlers.onText('', answer);
         emitTurnComplete(answer);
         return answer;
       }
@@ -10659,41 +10563,36 @@ export async function streamLLMWithTools(
         debug.log('llm.tool-loop.retry', 'doom-loop-detected', {
           turn, tool: doomToolName, window: doomWindow,
         }, { level: 'warn' });
-        const applyAskOutcome = async (reason: DoomLoopReason, detail: string | null) => {
+        const applySelfHeal = (reason: DoomLoopReason, detail: string | null) => {
           const interventionClass = classifyDoomLoopIntervention({
             detail: [detail, doomFailureDetail].filter(Boolean).join('\n'), doomWindow,
           });
-          const askDispatchOpts: DoomLoopRouteOpts = {
-            reason, detail, doomWindow, interventionClass,
-          };
-          if (opts.sessionId) askDispatchOpts.sessionId = opts.sessionId;
-          if (opts.signal) askDispatchOpts.signal = opts.signal;
-          const outcome = await routeDoomLoopToAskUser(askDispatchOpts);
-          if (outcome.kind === 'retry') {
-            toolErrorDoomTracker.reset();
-            postToolResultUserNote =
-              'The previous tool call kept failing 3 times in a row. Retry the same approach once more — the user reset the doom-loop tracker.';
-            debug.log('llm.tool-loop.retry', 'doom-loop-ask-retry', {
-              turn, reason, interventionClass: outcome.interventionClass,
-            });
-          } else if (outcome.kind === 'guidance') {
+          doomSelfHealAttempts += 1;
+          const fingerprint = doomWindow[doomWindow.length - 1] ?? 'unknown';
+          const outcome = decideDoomLoopSelfHeal({
+            attempt: doomSelfHealAttempts, tool: doomToolName, fingerprint, interventionClass,
+          });
+          debug.log('llm.tool-loop.retry', 'doom-loop-self-heal', {
+            turn,
+            tool: doomToolName,
+            attempt: doomSelfHealAttempts,
+            action: outcome.kind,
+            fingerprint,
+            reason,
+            interventionClass: outcome.interventionClass,
+          }, { level: 'warn' });
+          if (outcome.kind === 'guidance') {
             toolErrorDoomTracker.reset();
             postToolResultUserNote = outcome.userMessage;
-            debug.log('llm.tool-loop.retry', 'doom-loop-ask-guidance', {
-              turn, reason, interventionClass: outcome.interventionClass,
-            });
           } else {
             hardStopText = outcome.hardStopText;
-            debug.log('llm.tool-loop.retry', outcome.kind === 'fallback' ? 'doom-loop-ask-fallback' : 'doom-loop-ask-stop', {
-              turn, reason, interventionClass: outcome.interventionClass, window: doomWindow,
-            });
           }
         };
         if (retryDecision.action === 'auto-undo') {
           if (isPlanModeActive()) {
-            await applyAskOutcome('plan-mode', retryDecision.reason);
+            applySelfHeal('plan-mode', retryDecision.reason);
           } else if (listSnapshots().length === 0) {
-            await applyAskOutcome('no-undo-available', 'UndoTurn: no snapshots available');
+            applySelfHeal('no-undo-available', 'UndoTurn: no snapshots available');
           } else {
             try {
               const undoResult = await undoTurnRuntime.run({}, { surface: 'tui' });
@@ -10707,11 +10606,11 @@ export async function streamLLMWithTools(
                 window: doomWindow,
               });
             } catch (err) {
-              await applyAskOutcome('undo-failed', err instanceof Error ? err.message : String(err));
+              applySelfHeal('undo-failed', err instanceof Error ? err.message : String(err));
             }
           }
         } else {
-          await applyAskOutcome('policy', retryDecision.reason);
+          applySelfHeal('policy', retryDecision.reason);
         }
       }
       if (executionDoomDetectedThisTurn && !hardStopText) {
@@ -10911,8 +10810,8 @@ export async function streamLLMWithTools(
     if (postToolResultUserNote) {
       // Appended after the tool_result user turn so the wire order is
       // assistant(tool_use) → user(tool_result) → user(intervention).
-      // This is the "retry" or "guidance" branch of the doom-loop ASK
-      // route — see routeDoomLoopToAskUser above.
+      // Also carries the doom-loop self-heal guidance — see
+      // decideDoomLoopSelfHeal above.
       history.push({ role: LOOP_SELF_NOTE_ROLE, content: postToolResultUserNote });
     }
     // 신호뿐인 턴 · 섞인 턴(정상 디스패치 · 부분 거부 · 통째 거부의 수신 확인) 모두 — 종결 신호가 이 턴에 «받아들여졌다».

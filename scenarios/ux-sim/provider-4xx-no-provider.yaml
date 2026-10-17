@@ -1,0 +1,25 @@
+version: 0
+id: codex-request-rejected-shape-400
+isolation: test
+triggers:
+  - id: codex-400
+    type: codex.responses.fetch
+    status: 400
+    count: 2
+expect:
+  screen:
+    mode: widget
+    snapshot:
+      contains:
+        - Codex API 400
+      excludes:
+        - scenario-fake-token
+        - scenario test request
+        - scenario test input
+  logs:
+    - category: llm.codex
+      event: request-rejected-shape
+      level: debug
+      count: 1
+      data:
+        status: 400

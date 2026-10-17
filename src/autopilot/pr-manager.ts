@@ -17,7 +17,8 @@ import { DEFAULT_BRANCH_WORKTREE_BASE } from '../git-fs/worktree.js';
 import { isElanousRuntimeArtifactPath } from '../self-implement/gate-scope.js';
 import { isTransientExecutionFailure } from '../self-dev/execution-transient.js';
 import { withGhRestFallback } from './gh-rest-fallback.js';
-import { cellIdFromBody, guardNewPr, parseDiffHunks, readOpenPrs, recordGuardUnmeasured, type GuardVerdict, type Seat } from '../pr-tool/census.js';
+import { cellIdFromBody, guardNewPr, parseDiffHunks, readOpenPrs, recordGuardUnmeasured, type GuardVerdict, type HunkOverlapMode, type Seat } from '../pr-tool/census.js';
+import { getUserConfig } from '../user-config.js';
 
 /** ★ stderr 캡처(대표 2026-07-21·관측 갭) — 종전엔 stdout 만 담아 git/gh 실패 사유가 소실됐다
  *  (705308: makePr 실패가 bare null 로 뭉뚱그려져 triage 가 "인증·네트워크"로 환각 오라우팅).
@@ -321,13 +322,19 @@ function seatFromEnvironment(): Seat | null {
   return value === 'OP' || value === 'TC' || value === 'MK' || value === 'UX' ? value : null;
 }
 
+/** PR-GUARD-HUNK-WARN: config `prTool.hunkOverlap` — 'refuse' 만 옛 거부, 없거나 그 밖은 'warn'. */
+export function configuredHunkOverlapMode(raw: Record<string, unknown> | undefined = getUserConfig().raw): HunkOverlapMode {
+  const prTool = raw?.prTool as { hunkOverlap?: unknown } | undefined;
+  return prTool?.hunkOverlap === 'refuse' ? 'refuse' : 'warn';
+}
+
 function defaultPrCreateGuard(input: { cwd: string; base: string | undefined; seat: Seat | null; body: string }, run: CmdRunner): GuardVerdict {
   if (!input.base) return guardNewPr({ files: null, seat: input.seat }, { status: 'unknown', reason: '비교 base 없음' });
   const diff = run('git', ['-C', input.cwd, 'diff', '--name-only', '-z', `${input.base}...HEAD`]);
   const files = diff.ok ? diff.out.split('\0').filter(Boolean) : null;
   const patch = run('git', ['-C', input.cwd, 'diff', '--unified=0', `${input.base}...HEAD`]);
   if (!patch.ok) return guardNewPr({ files: null, seat: input.seat }, { status: 'unknown', reason: `후보 수정 줄 조회 실패: ${patch.err || patch.out}` });
-  return guardNewPr({ files, seat: input.seat, cellId: cellIdFromBody(input.body), hunks: parseDiffHunks(patch.out) }, readOpenPrs(run, { cwd: input.cwd, ...(files ? { candidateFiles: files } : {}) }));
+  return guardNewPr({ files, seat: input.seat, cellId: cellIdFromBody(input.body), hunks: parseDiffHunks(patch.out), hunkOverlap: configuredHunkOverlapMode() }, readOpenPrs(run, { cwd: input.cwd, ...(files ? { candidateFiles: files } : {}) }));
 }
 
 /** ★ PR 매니저 팩토리(대표 2026-07-12) — CmdRunner 주입(테스트 스텁). 실 배선은 기본 러너. */
@@ -546,9 +553,12 @@ export function makePrManager(
         return { ok: true, url: existing.url, reused: true };
       }
       let guardUnmeasured = false;
+      let hunkOverlapWarning: { prs: readonly number[]; files: readonly string[] } | null = null;
       if (checkCreate) {
         const seat = input.seat ?? seatFromEnvironment();
         const verdict = checkCreate({ cwd, base: comparisonBase, seat, body: input.body }, run);
+        const hunkWarn = verdict.status === 'allow' ? verdict.warnings.find(warning => warning.code === 'hunk-overlap') : undefined;
+        if (hunkWarn) hunkOverlapWarning = { prs: hunkWarn.prs ?? [], files: hunkWarn.files ?? [] };
         if (verdict.status === 'unknown' && verdict.reasons.length === 1 && verdict.reasons[0]?.code === 'inventory-unknown') {
           const inPod = process.env.ELANOUS_SUBSTRATE === 'pod'
             || Object.keys(process.env).some(key => key.startsWith('ELANOUS_POD_'));
@@ -574,15 +584,22 @@ export function makePrManager(
       if (input.draft) createArgs.push('--draft');
       const seat = input.seat ?? seatFromEnvironment();
       const requiredLabels = [...(seat ? [`seat:${seat}`] : []), ...(guardUnmeasured ? ['pr-guard:unmeasured'] : [])];
-      const requestedLabels = [...new Set([...(input.labels ?? []), ...requiredLabels].map((label) => label.trim()).filter(Boolean))];
+      // PR-GUARD-HUNK-WARN: 줄 겹침 경고 라벨은 «최선» — 만들기 실패해도 아래 재시도가 빼고 PR 을 연다.
+      const guardLabels = hunkOverlapWarning ? ['pr-guard:hunk-overlap'] : [];
+      const creatableLabels = [...requiredLabels, ...guardLabels];
+      const requestedLabels = [...new Set([...(input.labels ?? []), ...creatableLabels].map((label) => label.trim()).filter(Boolean))];
       const labeledArgs = [...createArgs];
       for (const label of requestedLabels) labeledArgs.push('--label', label);
       let created = run('gh', labeledArgs, opts);
-      if (!created.ok && requiredLabels.length && isLabelNotFoundFailure(created, requiredLabels)) {
-        for (const label of requiredLabels) run('gh', ['label', 'create', label, '--color', 'BFDADC'], opts);
+      if (!created.ok && creatableLabels.length && isLabelNotFoundFailure(created, creatableLabels)) {
+        for (const label of creatableLabels) run('gh', ['label', 'create', label, '--color', 'BFDADC'], opts);
         created = run('gh', labeledArgs, opts);
       }
+      const logHunkOverlapWarn = (url: string): void => {
+        if (hunkOverlapWarning) debug.log('pr-tool.guard', 'hunk-overlap-warn', { pr: extractPrNumber(url), files: hunkOverlapWarning.files, against: hunkOverlapWarning.prs });
+      };
       if (created.ok && created.out) {
+        logHunkOverlapWarn(created.out);
         return {
           ok: true,
           url: created.out,
@@ -595,6 +612,7 @@ export function makePrManager(
         for (const label of requiredLabels) retryArgs.push('--label', label);
         const retry = run('gh', retryArgs, opts);
         if (retry.ok && retry.out) {
+          logHunkOverlapWarn(retry.out);
           debug.log('autopilot.pr-manager', 'create.labels-omitted', {
             branch: input.branch,
             labels: requestedLabels,

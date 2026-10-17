@@ -1,6 +1,7 @@
 import type { Database } from 'bun:sqlite';
 import { debug, redactSecretText } from '../debug/log.js';
 import { openSurfaceEventsDb, recordEvent, surfaceEventsDbPath } from '../domains/surface-events.js';
+import { canonicalSeatId } from '../msg/msg-store.js';
 
 export const OPS_EVENT_KINDS = [
   'land.start', 'land.refused', 'land.merged',
@@ -17,6 +18,8 @@ export interface OpsEventInput {
   text: string;
   /** Optional locator — PR number, checklist cell id, config key, release version. */
   ref?: string;
+  /** Optional seat identity, normalized by the shared message-address registry. */
+  seat?: string;
   /** Optional ISO timestamp; unparseable values are dropped. */
   at?: string;
 }
@@ -47,6 +50,7 @@ export function emitOpsEvent(input: OpsEventInput, deps: OpsEventDeps = {}): str
     const text = oneLine(input.text);
     if (!text) return null;
     const ref = oneLine(input.ref) || null;
+    const seat = typeof input.seat === 'string' && input.seat.trim() ? canonicalSeatId(input.seat) : undefined;
     const at = typeof input.at === 'string' && !Number.isNaN(Date.parse(input.at)) ? input.at : undefined;
     if (!db) {
       // Test runners must never fall through to the user's production memory DB
@@ -61,11 +65,11 @@ export function emitOpsEvent(input: OpsEventInput, deps: OpsEventDeps = {}): str
     return record(db, {
       surface: 'ops', direction: 'outbound', domain: 'elanous', category: 'ops',
       kind: input.kind, text, summary: text.slice(0, 120),
-      refs: JSON.stringify({ kind: input.kind, ref, url: null }),
+      refs: JSON.stringify({ kind: input.kind, ref, url: null, ...(seat ? { seat } : {}) }),
       ...(at ? { ts: at } : {}),
     });
   } catch (error) {
-    try { debug.log('ops.event', 'record-failed', {
+    try { debug.log('context.bus', 'write-failed', {
       kind: input.kind, reason: error instanceof Error ? error.message : String(error),
     }, { level: 'warn' }); } catch { /* A broken logger cannot change the caller's result. */ }
     return null;

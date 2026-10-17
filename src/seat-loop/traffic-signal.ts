@@ -18,7 +18,8 @@ export function classifySeatTrafficProposal(message: string): 'hold' | 'UNHOLD' 
   return null;
 }
 
-const defaultPath = (name: string): string => join(homedir(), 'elanous-hq', 'seat-state', 'OP', name);
+export const opSeatStatePath = (name: string): string => join(homedir(), 'elanous-hq', 'seat-state', 'OP', name);
+const defaultPath = opSeatStatePath;
 const missing = (error: unknown): boolean => (error as NodeJS.ErrnoException).code === 'ENOENT';
 
 /** A missing installation has no signal; an invalid or unreadable one cannot authorize a checklist launch. */

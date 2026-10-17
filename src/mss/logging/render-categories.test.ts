@@ -101,3 +101,27 @@ describe('render-categories — 턴 제어 판정 프로브는 음소거되지 �
     }
   });
 });
+
+// ⛔ `TUI-H8-SEAT-BOOT-LOG-MUTED` 회귀 — 자리 부트 카드 항상성 이벤트는 렌더 음소거를 «살아남아야» 한다.
+//   깨지면 `/session new` 뒤 card-injected·conversation-start 가 `logs --all --include-test` 로도 0행이 된다.
+describe('render-categories — 자리 부트 항상성 이벤트는 음소거되지 않는다 (TUI-H8)', () => {
+  it('dashboard.seat-boot 는 렌더 카테고리가 «아니다»', () => {
+    expect(isRenderCategory('dashboard.seat-boot')).toBe(false);
+  });
+
+  it('tui.autoturn · tui.wakeup · tui.autowake 도 렌더가 아니다(tui 는 렌더 접두가 아니다)', () => {
+    for (const c of ['tui.autoturn', 'tui.wakeup', 'tui.autowake', 'tui.agent-wake', 'tui.input-lag']) {
+      expect(isRenderCategory(c)).toBe(false);
+    }
+  });
+
+  it('⛔ 다른 dashboard.* 렌더 범주는 그대로 음소거된다', () => {
+    for (const c of ['dashboard', 'dashboard.draw', 'dashboard.frame-compose', 'dashboard.chat.stream', 'dashboard.seat-bootstrap']) {
+      expect(isRenderCategory(c)).toBe(true);
+    }
+  });
+
+  it('예외에 «이유»가 붙어 있다', () => {
+    expect((RENDER_CATEGORY_EXEMPTIONS.get('dashboard.seat-boot') ?? '').trim().length).toBeGreaterThan(20);
+  });
+});

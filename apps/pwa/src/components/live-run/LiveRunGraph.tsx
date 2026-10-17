@@ -36,6 +36,18 @@ const STATE_CLASS: Record<LiveNodeState, string> = {
   passed: 'workflow-node-status workflow-node-status-done', failed: 'workflow-node-status workflow-node-status-failed',
 };
 const SPEEDS = [1, 4, 16] as const;
+/** 좁은 화면(폰) 문턱 — 390px 실물 폭 판정은 이 값 하나로 한다(렌더 시험도 이 문턱을 잰다). */
+const NARROW_VIEWPORT = 700;
+/** 따라가기 배율 — 넓은 화면은 900px 기준 비율(바닥 0.78), 좁은 화면은 바닥을 0.72 로 낮춰 카드와 양옆 간선이 통째로 들어온다.
+ *  카드 폭(RUN_NODE_WIDTH=190)은 간선 배선이 그 폭으로 미리 계산돼 있어 줄일 수 없다 — 대신 보이는 창을 넓힌다. */
+export function followZoom(width: number): number {
+  return Math.min(1, Math.max(width < NARROW_VIEWPORT ? 0.72 : 0.78, width / 900));
+}
+
+export function replayOverviewMinZoom(narrow: boolean): number | null {
+  // Keep the readable follow-camera zoom on phones after replay; pan or seek to inspect the whole path.
+  return narrow ? null : 0.5;
+}
 
 interface LiveNodeData extends RunGraphNodeData {
   state: LiveNodeState;
@@ -52,11 +64,12 @@ function LiveNode({ data }: NodeProps) {
       className={`relative rounded-lg border-2 bg-surface px-3 py-2 shadow-sm transition-opacity duration-300 ${STATE_CLASS[node.state]} ${node.state === 'pending' ? node.unrecorded ? 'opacity-35' : 'opacity-60' : ''}`}
       style={{ width: RUN_NODE_WIDTH, height: node.height, borderColor: STATE_RING[node.state], borderLeft: `5px solid ${KIND_COLORS[node.kind] ?? '#64748b'}`, outline: node.focused ? '2px solid var(--accent, #8b5cf6)' : undefined, outlineOffset: 3 }}>
       <Handle id="in" type="target" position={Position.Left} className="!pointer-events-none !opacity-0" />
-      <div className="flex items-center gap-1 text-[11px] text-text-tertiary">
-        <span>{node.kind === 'subgraph' ? '묶음 · 눌러서 펼치기' : node.kind}</span>
-        {node.entry && <span className="rounded bg-success/15 px-1 text-success">시작</span>}
-        {node.terminal && <span className="rounded bg-accent/15 px-1 text-accent">끝</span>}
-        <span className="ml-auto font-medium" style={{ color: STATE_RING[node.state] }}>{node.unrecorded ? '기록 없음' : STATE_WORD[node.state]}</span>
+      {/* 고정 폭 카드(RUN_NODE_WIDTH) 안에서 상태 말이 밀려나 잘리지 않게 — 종류 말이 대신 줄어든다. */}
+      <div data-testid={`live-node-meta-${node.label}`} className="flex items-center gap-1 overflow-hidden text-[11px] text-text-tertiary">
+        <span className="truncate">{node.kind === 'subgraph' ? '묶음 · 눌러서 펼치기' : node.kind}</span>
+        {node.entry && <span className="shrink-0 rounded bg-success/15 px-1 text-success">시작</span>}
+        {node.terminal && <span className="shrink-0 rounded bg-accent/15 px-1 text-accent">끝</span>}
+        <span data-state-word className="ml-auto shrink-0 font-medium" style={{ color: STATE_RING[node.state] }}>{node.unrecorded ? '기록 없음' : STATE_WORD[node.state]}</span>
       </div>
       <div className="truncate font-mono text-sm font-semibold text-text-primary">{isGroupNodeId(node.label) ? `▣ ${node.label.slice(GROUP_NODE_PREFIX.length)}` : node.label}</div>
       <div className="truncate text-[11px] text-text-tertiary" title={node.recipe}>{node.recipe} · 최대 {node.maxVisits}회</div>
@@ -174,6 +187,14 @@ export function LiveRunGraph({ runId, initialFolded = false }: { runId: string; 
   // onInit 뒤에 카메라 따라가기를 다시 걸기 위한 신호(첫 이동이 인스턴스 준비 전에 지나가지 않게).
   const [flowReady, setFlowReady] = useState(0);
   const started = useRef(false);
+  // 화면 폭 — 캔버스 높이·타임라인 높이·물러나기가 같은 문턱(700)을 본다(390px 실물 = 좁은 화면).
+  const [viewportWidth, setViewportWidth] = useState(() => (typeof window === 'undefined' || !(window.innerWidth > 0) ? 1024 : window.innerWidth));
+  useEffect(() => {
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+  const narrow = viewportWidth < NARROW_VIEWPORT;
 
   // 처음 열면: 라이브 런은 마지막 노드에, 끝난 런은 처음부터 자동 재생.
   useEffect(() => {
@@ -257,21 +278,21 @@ export function LiveRunGraph({ runId, initialFolded = false }: { runId: string; 
     const node = flow.nodes.find((candidate) => candidate.id === followNode);
     const instance = flowRef.current;
     if (!node || !instance) return;
-    // 폭에 맞춘 배율 — 1440 이면 1, 390 이면 0.78(카드 글자 ≥11px · 노드 두 개 남짓).
+    // 폭에 맞춘 배율 — 1440 이면 1, 390 실물 폭(캔버스 ≈ 358px)이면 0.72: 카드와 양옆 간선이 잘리지 않고 들어온다.
     const width = canvasRef.current?.clientWidth ?? 1000;
-    const zoom = Math.min(1, Math.max(0.78, width / 900));
+    const zoom = followZoom(width);
     void instance.setCenter(node.position.x + RUN_NODE_WIDTH / 2, node.position.y + node.data.height / 2, { zoom, duration: 400 });
   }, [follow, focus, followNode, flow, flowReady]);
 
-  // 재생이 끝나면 한 발 물러나 «밟은 길 전체»를 보여 준다.
+  // 재생이 끝나면 넓은 화면은 밟은 길 전체를 보여 준다. 폰은 읽을 수 있는 따라가기 배율을 유지한다.
   const finished = effectiveMode === 'replay' && !playing && steps.length > 0 && cursor === steps.length - 1;
   useEffect(() => {
-    // 좁은 화면(폰)은 물러나면 글자가 띠처럼 작아진다 — 마지막 노드에 머문다.
-    if (!finished || !follow || focus || (canvasRef.current?.clientWidth ?? 1000) < 700) return;
-    // 밟은 노드만 맞춘다(최소 배율 0.5 — 글자가 띠처럼 작아지지 않게).
-    const timer = window.setTimeout(() => void flowRef.current?.fitView({ nodes: [...visited].map((id) => ({ id })), duration: 800, padding: 0.08, minZoom: 0.5 }), 1200);
+    const minZoom = replayOverviewMinZoom(narrow);
+    if (!finished || !follow || focus || minZoom === null) return;
+    // 넓은 화면에서 밟은 노드를 맞춘다. 좁은 화면은 축소해 글자를 작게 만들지 않는다.
+    const timer = window.setTimeout(() => void flowRef.current?.fitView({ nodes: [...visited].map((id) => ({ id })), duration: 800, padding: 0.08, minZoom }), 1200);
     return () => window.clearTimeout(timer);
-  }, [finished, follow, focus, visited]);
+  }, [finished, follow, focus, visited, narrow]);
 
   const seek = (index: number) => {
     setMode('replay'); setPlaying(false); setCursor(index); setEntering(false);
@@ -329,7 +350,9 @@ export function LiveRunGraph({ runId, initialFolded = false }: { runId: string; 
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col gap-3 lg:flex-row">
-        <section ref={canvasRef} aria-label="실행 그래프" className="relative h-[60dvh] min-h-[340px] min-w-0 overflow-hidden rounded-lg border border-border bg-surface lg:h-[calc(100dvh-230px)] lg:min-h-[520px] lg:flex-1">
+        {/* 좁은 화면(세로 쌓임)에서는 그래프가 이 화면의 본체 — 타임라인을 300px 로 낮춘 만큼 캔버스를 더 준다. */}
+        <section ref={canvasRef} aria-label="실행 그래프" data-viewport={narrow ? 'narrow' : 'wide'}
+          className={`relative min-w-0 overflow-hidden rounded-lg border border-border bg-surface ${narrow ? 'h-[65dvh] min-h-[380px]' : 'h-[60dvh] min-h-[340px]'} lg:h-[calc(100dvh-230px)] lg:min-h-[520px] lg:flex-1`}>
           {steps.length === 0 && <p className="absolute left-3 top-3 z-10 text-xs text-text-tertiary">아직 노드에 들어가지 않았습니다(원장에 `pipeline-node-entry` 없음).</p>}
           {flow && (
             <ReactFlow key={`${graph?.id ?? 'graph'}:${[...collapsed].sort().join(',')}`} nodes={nodes} edges={edges} nodeTypes={NODE_TYPES} edgeTypes={EDGE_TYPES}
@@ -381,7 +404,7 @@ export function LiveRunGraph({ runId, initialFolded = false }: { runId: string; 
           )}
         </section>
 
-        <aside aria-label="실행 타임라인" className="max-h-[420px] overflow-y-auto rounded-lg border border-border bg-surface lg:max-h-[calc(100dvh-230px)] lg:w-[340px] lg:shrink-0">
+        <aside aria-label="실행 타임라인" className={`overflow-y-auto rounded-lg border border-border bg-surface ${narrow ? 'max-h-[300px]' : 'max-h-[420px]'} lg:max-h-[calc(100dvh-230px)] lg:w-[340px] lg:shrink-0`}>
           <h3 className="sticky top-0 border-b border-border bg-surface px-3 py-2 text-xs font-semibold">타임라인 (KST)</h3>
           <ol>
             {steps.map((step, index) => {

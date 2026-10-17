@@ -70,6 +70,18 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     expect(pool.snapshot()).toEqual({ first: 2, second: 1 });
   });
 
+  test('PRLAND-SHADOW-HOST-TIMEOUT: canceled occupancy cannot acquire a late pool lease', async () => {
+    let finish!: (value: Record<string, MemberOccupancy>) => void;
+    const occupancy = new Promise<Record<string, MemberOccupancy>>((resolve) => { finish = resolve; });
+    const pool = new PodPoolScheduler(parsePodPool('pool-node-b@node-b:1'), { occupancy: () => occupancy });
+    const controller = new AbortController();
+    const acquiring = pool.tryAcquire(undefined, undefined, { signal: controller.signal });
+    controller.abort(new Error('shadow deadline'));
+    finish({ 'pool-node-b': { occupied: 0 } });
+    await expect(acquiring).rejects.toThrow('shadow deadline');
+    expect(pool.snapshot()).toEqual({ 'pool-node-b': 0 });
+  });
+
   test('picks the member with the largest real free share, not the biggest or the first one', async () => {
     const events: Array<Record<string, unknown>> = [];
     const original = debug.log.bind(debug);

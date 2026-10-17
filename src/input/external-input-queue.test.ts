@@ -15,13 +15,13 @@ import type { InputSourceRef } from './input-source-kind.js';
 function fakeHost(init: { turn?: boolean; composer?: string | undefined } = {}) {
   const state = { turn: init.turn ?? false, composer: 'composer' in init ? init.composer : '' as string | undefined, keys: 0 };
   const submitted: Array<{ text: string; source: InputSourceRef }> = [];
-  const events: Array<{ event: string; pending: number }> = [];
+  const events: number[] = [];
   const host: ExternalInputHost = {
     isTurnActive: () => state.turn,
     composerText: () => state.composer,
     hasPendingKeys: () => state.keys > 0,
     submit: (text, source) => { submitted.push({ text, source }); return true; },
-    onQueueChange: (pending, event) => { events.push({ event, pending: pending.length }); },
+    onQueueChange: (pending) => { events.push(pending.length); },
   };
   return { state, host, submitted, events };
 }
@@ -81,6 +81,17 @@ describe('createExternalInputQueue', () => {
     expect(q.pending()).toHaveLength(0);
   });
 
+  test('대기 중 등록된 새 호스트에 현재 대기 상태를 동기화한다', () => {
+    const { q } = manualQueue();
+    const first = fakeHost({ turn: true });
+    q.register(first.host);
+    expect(q.route('대기 중인 항목\r')).toBe('queued');
+    const next = fakeHost({ turn: true });
+    q.register(next.host);
+    expect(next.events).toEqual([1]);
+    expect(q.pending().map((item) => item.text)).toEqual(['대기 중인 항목']);
+  });
+
   test('사용자 버퍼에 글자가 있으면 버퍼 불변 ⊕ 별도 항목으로 대기', () => {
     const { q, logs, pumpScheduled } = manualQueue();
     const h = fakeHost({ composer: '사용자 치던 줄' });
@@ -89,7 +100,7 @@ describe('createExternalInputQueue', () => {
     expect(h.state.composer).toBe('사용자 치던 줄');
     expect(h.submitted).toEqual([]);
     expect(q.pending()).toEqual([{ text: '외부 지시', at: 1000 }]);
-    expect(h.events).toEqual([{ event: 'queued', pending: 1 }]);
+    expect(h.events).toEqual([1]);
     expect(pumpScheduled()).toBe(true);
     expect(logs.find((l) => l.event === 'route')?.data).toMatchObject({ route: 'queued', reason: 'user-buffer-nonempty', userBufferLength: '사용자 치던 줄'.length });
     // 버퍼가 남아 있는 동안은 나가지 않는다.
@@ -100,6 +111,7 @@ describe('createExternalInputQueue', () => {
     expect(q.pump()).toBe(true);
     expect(h.submitted).toEqual([{ text: '외부 지시', source: { kind: 'terminal', provider: 'pty' } }]);
     expect(q.pending()).toHaveLength(0);
+    expect(h.events).toEqual([1, 0]);
     expect(pumpScheduled()).toBe(false);
   });
 
@@ -317,7 +329,7 @@ describe('외부 /stop — 대기열 건너뛰기 (TUI-STOP-INPUT-BYPASS · #68)
     expect(h.results).toEqual(['stopped']);
     expect(q.pending().map((i) => i.text)).toEqual(['첫째', '둘째']);
     expect(h.submitted).toEqual([]);
-    expect(inputLogs).toEqual([{ event: 'external-stop', data: { hadTurn: true, stopped: true, command: '/stop', pending: 2 } }]);
+    expect(inputLogs).toEqual([{ event: 'external-stop', data: { hadTurn: true, stopped: true, command: '/stop', pending: 2, path: 'control-ipc' } }]);
     // 턴이 끝나면 일반 항목은 종전대로 FIFO 로 나간다.
     h.state.turn = false;
     expect(q.pump()).toBe(true);
@@ -342,7 +354,7 @@ describe('외부 /stop — 대기열 건너뛰기 (TUI-STOP-INPUT-BYPASS · #68)
     expect(h.submitted).toEqual([]);
     expect(q.pending()).toEqual([]);
     expect(h.results).toEqual(['no-turn']);
-    expect(inputLogs[0]).toEqual({ event: 'external-stop', data: { hadTurn: false, stopped: false, command: '/stop', pending: 0 } });
+    expect(inputLogs[0]).toEqual({ event: 'external-stop', data: { hadTurn: false, stopped: false, command: '/stop', pending: 0, path: 'control-ipc' } });
   });
 
   test('턴 중인데 중단 경로가 없으면 undelivered 로 알린다', () => {
@@ -369,5 +381,63 @@ describe('외부 /stop — 대기열 건너뛰기 (TUI-STOP-INPUT-BYPASS · #68)
     q.register(h.host);
     expect(withExternalKeyCommand(() => q.route('/stop'))).toBe('passthrough');
     expect(h.stops.length).toBe(0);
+  });
+});
+
+describe('원시 pty 길 /stop (TUI-STOP-RAW-PTY)', () => {
+  function rawSetup(init: { turn?: boolean; stopOk?: boolean } = {}) {
+    const inputLogs: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const q = createExternalInputQueue({ now: () => 1000, schedule: () => () => {}, log: () => {}, logInput: (event, data) => inputLogs.push({ event, data }) });
+    const f = fakeHost({ turn: init.turn ?? true });
+    const stops: number[] = [];
+    const results: string[] = [];
+    f.host.requestStop = () => { stops.push(1); return init.stopOk ?? true; };
+    f.host.onExternalStop = (r) => { results.push(r); };
+    q.register(f.host);
+    return { q, inputLogs, stops, results, ...f };
+  }
+
+  test('턴 중 한 청크 /stop⏎ → escGate 1회 ⊕ path=raw-pty · 대기열 무접촉', () => {
+    const r = rawSetup();
+    expect(r.q.routeRawStop('/stop\r')).toBe(true);
+    expect(r.stops.length).toBe(1);
+    expect(r.results).toEqual(['stopped']);
+    expect(r.q.pending()).toEqual([]);
+    expect(r.inputLogs).toEqual([{ event: 'external-stop', data: { hadTurn: true, stopped: true, command: '/stop', pending: 0, path: 'raw-pty' } }]);
+    expect(r.q.routeRawStop('/esc\r')).toBe(true);
+    expect(r.stops.length).toBe(2);
+  });
+
+  test('대기 중인 외부 항목은 원시 stop 뒤에도 순서대로 남는다', () => {
+    const r = rawSetup();
+    expect(r.q.route('첫째\r')).toBe('queued');
+    expect(r.q.routeRawStop('/stop\r')).toBe(true);
+    expect(r.q.pending().map((i) => i.text)).toEqual(['첫째']);
+    expect(r.inputLogs[0]?.data.pending).toBe(1);
+  });
+
+  test('일반 글·Enter 없음·변형은 소비하지 않는다(종전대로 키)', () => {
+    const r = rawSetup();
+    for (const chunk of ['hello\r', '/stop', '/stop now\r', ' /stop\r', '/STOP\r', '/stop\r\r', 's', 'a\r/stop\r', '\x1b[200~/stop\r\x1b[201~', '/stop\n']) {
+      expect(r.q.routeRawStop(chunk)).toBe(false);
+    }
+    expect(r.stops.length).toBe(0);
+    expect(r.inputLogs).toEqual([]);
+  });
+
+  test('턴 밖이면 소비하지 않는다 · 호스트 없으면 false', () => {
+    const r = rawSetup({ turn: false });
+    expect(r.q.routeRawStop('/stop\r')).toBe(false);
+    expect(r.stops.length).toBe(0);
+    expect(r.inputLogs).toEqual([]);
+    const bare = createExternalInputQueue({ schedule: () => () => {}, log: () => {}, logInput: () => {} });
+    expect(bare.routeRawStop('/stop\r')).toBe(false);
+  });
+
+  test('중단 경로가 없으면 소비하되 failed 로 알린다(throw 없음)', () => {
+    const r = rawSetup({ stopOk: false });
+    expect(r.q.routeRawStop('/stop\r')).toBe(true);
+    expect(r.results).toEqual(['failed']);
+    expect(r.inputLogs[0]?.data.path).toBe('raw-pty');
   });
 });

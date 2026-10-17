@@ -51,6 +51,8 @@ export interface HeavyRemoteResult {
   reason?: string;
   elapsedMs: number;
   evidencePath: string;
+  /** Redacted stdout/stderr from a failed remote gate; never a reusable pass. */
+  failureLogPath?: string;
   rootPlan?: RootPlanSummary | null;
   interferenceMeasured?: boolean;
 }
@@ -60,6 +62,8 @@ export interface HeavyRemoteDeps {
   runRemote?: (input: Parameters<typeof runOnRemote>[0], runner: GateRemoteRunner) => RemoteRunOutcome;
   settings?: ReturnType<typeof resolveGateRemoteSettings>;
   now?: () => number;
+  /** Test seam — same cadence as self gate (`dispatchHeavyCheck`): sleep at most 15s while a host stays busy. */
+  sleep?: (ms: number) => void;
   observe?: (event: string, data: Record<string, unknown>) => void;
 }
 
@@ -157,6 +161,38 @@ function failedGateSummary(stdout: Buffer, stderr: Buffer): string | undefined {
   return bounded.length ? bounded.join(' | ') : undefined;
 }
 
+/** The self-gate baseline prints one failure per line after its count header. Keep only distinct test paths here. */
+function failedGateFiles(stdout: Buffer, stderr: Buffer): string | undefined {
+  const files = { introduced: new Set<string>(), preexisting: new Set<string>() };
+  for (const line of `${stdout.toString('utf8')}\n${stderr.toString('utf8')}`.split(/\r?\n/)) {
+    const match = /^- (introduced|preexisting):\s+(\S+\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s+>|\s|$)/.exec(line.trim());
+    if (match) files[match[1] as keyof typeof files].add(match[2]!);
+  }
+  const parts = (['introduced', 'preexisting'] as const).filter((kind) => files[kind].size > 0)
+    .map((kind) => { const names = [...files[kind]].sort(); return `${kind}-files=${names.slice(0, 5).map((name) => redactSecretText(name).slice(0, 160)).join(',')}${names.length > 5 ? `,+${names.length - 5}` : ''}`; });
+  return parts.length ? parts.join(' · ') : undefined;
+}
+
+/** Remote scratch is deleted on exit. Preserve a bounded, redacted copy before returning a refusal. */
+function writeFailedGateLog(path: string, stdout: Buffer, stderr: Buffer): string | undefined {
+  // One latest refusal log per PR; repeated attempts replace it atomically instead of accumulating files.
+  const logPath = `${path}.failure.log`;
+  const tempPath = `${logPath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  const maxBytes = 2 * 1024 * 1024;
+  const render = (label: string, bytes: Buffer): string => {
+    const safe = Buffer.from(redactSecretText(bytes.toString('utf8')), 'utf8');
+    const clipped = safe.length > maxBytes
+      ? `${safe.subarray(0, maxBytes / 2).toString('utf8')}\n[remote log middle truncated]\n${safe.subarray(-maxBytes / 2).toString('utf8')}` : safe.toString('utf8');
+    return `=== ${label} (${bytes.length} bytes${safe.length > maxBytes ? ', middle truncated' : ''}) ===\n${clipped}\n`;
+  };
+  try {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    writeFileSync(tempPath, render('stdout', stdout) + render('stderr', stderr), { mode: 0o600, flag: 'wx' });
+    renameSync(tempPath, logPath);
+    return logPath;
+  } catch { rmSync(tempPath, { force: true }); return undefined; }
+}
+
 /** No local gate fallback: host refusal, an unmeasured run, and a failed gate all block landing. */
 export function ensurePrLandHeavyRemote(input: HeavyRemoteInput, deps: HeavyRemoteDeps = {}): HeavyRemoteResult {
   const path = evidencePath(input);
@@ -170,48 +206,66 @@ export function ensurePrLandHeavyRemote(input: HeavyRemoteInput, deps: HeavyRemo
   }
   const cached = matchingEvidence(path, input);
   if (cached) return { ok: true, host: cached.host, source: 'cached', elapsedMs: 0, evidencePath: path, rootPlan: cached.rootPlan, interferenceMeasured: cached.interferenceMeasured };
-  const started = (deps.now ?? Date.now)();
+  const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? ((ms: number) => { if (ms > 0) Bun.sleepSync(ms); });
+  const started = now();
+  const deadline = started + settings.slotWaitSeconds * 1000;
   let outcome: RemoteRunOutcome = { kind: 'busy' };
   const primaryHost: PrLandHeavyHost = settings.host;
   let selectedHost: PrLandHeavyHost = primaryHost;
-  for (const host of [primaryHost, ...PR_LAND_HEAVY_HOSTS.filter((candidate) => candidate !== primaryHost)]) {
-    selectedHost = host;
-    try {
-      outcome = (deps.runRemote ?? runOnRemote)({
-        repo: input.repo, host, mirror: settings.mirror, commit: input.head,
-        refs: [input.main], hostCap: gateRemoteHostCap(settings, host), installPwa: true, stableCheckout: true,
-        // Test the tree GitHub will merge: scratch-checkout the reviewed head, merge the pinned main tip there,
-        // then run typecheck and self gate (changed tests and PWA reach/build) at that exact pair.
-        // The detached integration commit stays on the selected host and never changes the PR branch.
-        argv: (sha) => ['sh', '-c',
+  const hosts = [primaryHost, ...PR_LAND_HEAVY_HOSTS.filter((candidate) => candidate !== primaryHost)];
+  wait: for (;;) {
+    for (const host of hosts) {
+      selectedHost = host;
+      try {
+        outcome = (deps.runRemote ?? runOnRemote)({
+          repo: input.repo, host, mirror: settings.mirror, commit: input.head,
+          refs: [input.main], hostCap: gateRemoteHostCap(settings, host), installPwa: true, stableCheckout: true,
+          // Test the tree GitHub will merge: scratch-checkout the reviewed head, merge the pinned main tip there,
+          // then run typecheck and self gate (changed tests and PWA reach/build) at that exact pair.
+          // The detached integration commit stays on the selected host and never changes the PR branch.
+          argv: (sha) => ['sh', '-c',
           'git -c user.name=elanous-gate -c user.email=gate@localhost -c commit.gpgsign=false merge --no-ff --no-edit "$1" && TSC_BASE_REF="$1" bun run scripts/ci-typecheck-changed.ts --local && bun bin/elanous.mjs self gate --changed --base "$1" --local --shards 4 && bun scripts/pr-land-extra-remote-gates.ts "$1"',
           'sh', sha(input.main)],
-      }, deps.runner ?? realGateRemoteRunner);
-    } catch (error) {
-      outcome = { kind: 'infra', reason: `exception: ${error instanceof Error ? error.message : String(error)}` };
+        }, deps.runner ?? realGateRemoteRunner);
+      } catch (error) {
+        outcome = { kind: 'infra', reason: `exception: ${error instanceof Error ? error.message : String(error)}` };
+      }
+      // A completed run or infrastructure failure is a verdict. Only a full host slot asks for another host.
+      if (outcome.kind !== 'busy') break wait;
     }
-    // A completed run or infrastructure failure is a verdict. Only a full host slot asks for another host.
-    if (outcome.kind !== 'busy') break;
+    // Both allowlisted hosts were busy. Wait the same slotWaitSeconds window as self gate, then retry.
+    debug.log('pr.land', 'host-busy', { host: selectedHost, occupied: outcome.occupied ?? null, slotWaitSeconds: settings.slotWaitSeconds });
+    const left = deadline - now();
+    if (left <= 0) break;
+    sleep(Math.min(15_000, left));
+    if (now() >= deadline) break;
   }
-  const elapsedMs = Math.max(0, (deps.now ?? Date.now)() - started);
+  const elapsedMs = Math.max(0, now() - started);
   const observe = deps.observe ?? ((event: string, data: Record<string, unknown>) => debug.log('pr.land', event, data));
   const actualHost = outcome.kind === 'ran' ? outcome.host : undefined;
   const base = { pr: input.pr, head: input.head, main: input.main, host: actualHost ?? null, attemptedHost: selectedHost, elapsedMs };
   // The outcome must identify the selected allowlisted host; the configured host alone is not evidence.
   if (outcome.kind !== 'ran' || outcome.commit !== input.head || outcome.rc !== 0 || outcome.host !== selectedHost) {
     const summary = outcome.kind === 'ran' && outcome.rc !== 0 ? failedGateSummary(outcome.stdout, outcome.stderr) : undefined;
+    // A different host cannot attest to this gate, so do not promote its file list into the refusal.
+    const files = outcome.kind === 'ran' && outcome.rc !== 0 && outcome.host === selectedHost && outcome.commit === input.head
+      ? failedGateFiles(outcome.stdout, outcome.stderr) : undefined;
+    const failureLogPath = outcome.kind === 'ran' ? writeFailedGateLog(path, outcome.stdout, outcome.stderr) : undefined;
     const reason = outcome.kind === 'ran'
       ? outcome.host !== selectedHost
-        ? `gate-host-mismatch (${outcome.host})`
-        : `gate-rc-${outcome.rc}${outcome.commit !== input.head ? '-head-mismatch' : ''}${summary ? ` · remote: ${summary}` : ''}`
+        ? `gate-host-mismatch (${outcome.host})${failureLogPath ? ` · remote-log: ${failureLogPath}` : ''}`
+        : `gate-rc-${outcome.rc}${outcome.commit !== input.head ? '-head-mismatch' : ''}${files ? ` · ${files}` : ''}${summary ? ` · remote: ${summary}` : ''}${failureLogPath ? ` · remote-log: ${failureLogPath}` : ' · remote-log: unavailable'}`
       : outcome.kind === 'busy' ? 'gate-host-busy' : outcome.reason;
-    observe('heavy-remote', { ...base, outcome: outcome.kind === 'ran' ? 'fail' : 'unmeasured', reason });
-    return { ok: false, ...(actualHost ? { host: actualHost } : {}), attemptedHost: selectedHost, source: 'unmeasured', reason, elapsedMs, evidencePath: path };
+    observe('heavy-remote', { ...base, outcome: outcome.kind === 'ran' ? 'fail' : 'unmeasured', reason, failureLogPath: failureLogPath ?? null });
+    return { ok: false, ...(actualHost ? { host: actualHost } : {}), attemptedHost: selectedHost, source: 'unmeasured', reason, elapsedMs, evidencePath: path, ...(failureLogPath ? { failureLogPath } : {}) };
   }
   const extraGates = extraGatesFromOutput(outcome.stdout);
   if (!extraGates) {
-    observe('heavy-remote', { ...base, outcome: 'unmeasured', reason: 'extra-global-unmeasured' });
-    return { ok: false, host: selectedHost, attemptedHost: selectedHost, source: 'unmeasured', reason: 'extra-global-unmeasured', elapsedMs, evidencePath: path };
+    const failureLogPath = writeFailedGateLog(path, outcome.stdout, outcome.stderr);
+    const reason = `extra-global-unmeasured${failureLogPath ? ` · remote-log: ${failureLogPath}` : ' · remote-log: unavailable'}`;
+    observe('heavy-remote', { ...base, outcome: 'unmeasured', reason, failureLogPath: failureLogPath ?? null });
+    return { ok: false, host: selectedHost, attemptedHost: selectedHost, source: 'unmeasured', reason, elapsedMs, evidencePath: path, ...(failureLogPath ? { failureLogPath } : {}) };
   }
   const evidence: HeavyRemoteEvidence = {
     schema: 2, pr: input.pr, head: input.head, main: input.main, host: selectedHost,
@@ -225,8 +279,10 @@ export function ensurePrLandHeavyRemote(input: HeavyRemoteInput, deps: HeavyRemo
     renameSync(temp, path);
   } catch (error) {
     rmSync(temp, { force: true });
-    observe('heavy-remote', { ...base, outcome: 'unmeasured', reason: 'evidence-write-failed' });
-    return { ok: false, host: selectedHost, attemptedHost: selectedHost, source: 'unmeasured', reason: `evidence-write-failed: ${error instanceof Error ? error.message : String(error)}`, elapsedMs, evidencePath: path };
+    const failureLogPath = writeFailedGateLog(path, outcome.stdout, outcome.stderr);
+    const reason = `evidence-write-failed: ${error instanceof Error ? error.message : String(error)}${failureLogPath ? ` · remote-log: ${failureLogPath}` : ' · remote-log: unavailable'}`;
+    observe('heavy-remote', { ...base, outcome: 'unmeasured', reason, failureLogPath: failureLogPath ?? null });
+    return { ok: false, host: selectedHost, attemptedHost: selectedHost, source: 'unmeasured', reason, elapsedMs, evidencePath: path, ...(failureLogPath ? { failureLogPath } : {}) };
   }
   observe('heavy-remote', { ...base, outcome: 'pass', evidencePath: path, rootPlan: evidence.rootPlan, interferenceMeasured: evidence.interferenceMeasured });
   return { ok: true, host: selectedHost, source: 'remote', elapsedMs, evidencePath: path, rootPlan: evidence.rootPlan, interferenceMeasured: evidence.interferenceMeasured };

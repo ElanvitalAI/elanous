@@ -424,25 +424,115 @@ describe('runPodCommand', () => {
 
   test('GATE-MULTI-HOST: a Job whose status stays unreadable (member gone mid-Job) throws after statusUnreadableMs instead of polling forever; omitted = keeps polling', async () => {
     const member: PodPoolMember = { context: 'pool-node-c', sshHost: 'node-c', capacity: 2, k3dCluster: 'elanous-pool' };
-    const run = (statusUnreadableMs: number | undefined, polls: { n: number }) => {
+    const run = (statusUnreadableMs: number | undefined, polls: { n: number }, boundedShadow = false) => {
       const pool = new PodPoolScheduler([member]);
-      return { pool, done: runPodCommand({ command: ['true'], poolScheduler: pool, name: 'gate-lost-member', ...(statusUnreadableMs !== undefined ? { statusUnreadableMs } : {}),
+      const commands: string[][] = [];
+      return { pool, commands, done: runPodCommand({ command: ['true'], poolScheduler: pool, name: 'gate-lost-member', ...(statusUnreadableMs !== undefined ? { statusUnreadableMs } : {}),
+        ...(boundedShadow ? { signal: new AbortController().signal } : {}),
         sleep: async () => { if (++polls.n > 5) throw new Error('still polling'); },
-        kubectl: (args) => args.some((arg) => arg.includes('.status.conditions'))
+        kubectl: (args) => { commands.push([...args]); return args.some((arg) => arg.includes('.status.conditions'))
           ? { status: 1, stdout: '', stderr: 'Unable to connect to the server: dial tcp: i/o timeout' }
-          : { status: 0, stdout: '', stderr: '' },
+          : { status: 0, stdout: '', stderr: '' }; },
         syncImages: async () => new Map([[member.context, { ok: true, action: 'fresh' as const, detail: 'ready', ms: 1 }]]),
         imageCommit: null, env: {}, configHostMirror: () => undefined, artifactsRoot: '/tmp/pod-command-lost-member-test', log: () => {},
       }) };
     };
     const bounded = { n: 0 };
-    const a = run(0, bounded);
+    const a = run(0, bounded, true);
     await expect(a.done).rejects.toThrow(/Job 상태를 0초 동안 못 읽었다\(pool-node-c\)/);
     expect(bounded.n).toBe(0);
     expect(a.pool.snapshot()).toEqual({ 'pool-node-c': 0 });
+    expect(a.commands.some((args) => args.includes('delete') && args.includes('job') && args.includes('gate-lost-member'))).toBe(true);
+    const ordinary = run(0, { n: 0 });
+    await expect(ordinary.done).rejects.toThrow(/Job 상태를 0초 동안 못 읽었다/);
+    expect(ordinary.commands.filter((args) => args.includes('delete') && args.includes('job') && args.includes('gate-lost-member'))).toHaveLength(0); // omitted signal keeps the prior cleanup policy
     const unbounded = { n: 0 };
     await expect(run(undefined, unbounded).done).rejects.toThrow('still polling');
     expect(unbounded.n).toBe(6);
+  });
+
+  test('PRLAND-SHADOW-HOST-TIMEOUT: abort stops Pending polling and deletes only its own Job', async () => {
+    const controller = new AbortController();
+    const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool' };
+    const pool = new PodPoolScheduler([member]);
+    const commands: string[][] = [];
+    let polls = 0;
+    const pending = runPodCommand({ command: ['true'], name: 'shadow-timeout-test', signal: controller.signal, poolScheduler: pool,
+      kubectl: (args) => {
+        commands.push([...args]);
+        if (args.some((arg) => arg.includes('.status.conditions'))) polls++;
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      syncImages: async () => new Map([[member.context, { ok: true, action: 'fresh' as const, detail: 'ready', ms: 1 }]]),
+      sleep: async () => { controller.abort(new Error('shadow deadline')); },
+      imageCommit: null, env: {}, configHostMirror: () => undefined,
+      artifactsRoot: '/tmp/pod-command-shadow-timeout-test', log: () => {},
+    });
+    await expect(pending).rejects.toThrow('shadow deadline');
+    expect(polls).toBe(1);
+    expect(commands.filter((args) => args.includes('delete') && args.includes('job') && args.includes('shadow-timeout-test'))).toHaveLength(1);
+    expect(commands.some((args) => args.includes('delete') && args.includes('secret'))).toBe(true);
+    expect(pool.snapshot()).toEqual({ 'pool-node-b': 0 });
+  });
+
+  test('PRLAND-SHADOW-HOST-TIMEOUT: wall clock catches a deadline crossed inside synchronous status read', async () => {
+    const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool' };
+    const pool = new PodPoolScheduler([member]);
+    const commands: string[][] = [];
+    let clock = 0;
+    const pending = runPodCommand({ command: ['true'], name: 'shadow-wall-deadline', signal: new AbortController().signal,
+      hostDeadlineAtMs: 100, nowMs: () => clock, poolScheduler: pool,
+      kubectl: (args) => {
+        commands.push([...args]);
+        if (args.some((arg) => arg.includes('.status.conditions'))) clock = 101;
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      syncImages: async () => new Map([[member.context, { ok: true, action: 'fresh' as const, detail: 'ready', ms: 1 }]]),
+      sleep: async () => { throw new Error('polled after host deadline'); },
+      imageCommit: null, env: {}, configHostMirror: () => undefined,
+      artifactsRoot: '/tmp/pod-command-shadow-wall-test', log: () => {},
+    });
+    await expect(pending).rejects.toThrow('pod shadow: host timeout');
+    expect(commands.filter((args) => args.includes('delete') && args.includes('job') && args.includes('shadow-wall-deadline'))).toHaveLength(1);
+    expect(pool.snapshot()).toEqual({ 'pool-node-b': 0 });
+  });
+
+  test('PRLAND-SHADOW-HOST-TIMEOUT: abort during pre-Job image sync returns and releases lease', async () => {
+    const controller = new AbortController();
+    const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool' };
+    const pool = new PodPoolScheduler([member]);
+    let entered!: () => void;
+    const syncing = new Promise<void>((resolve) => { entered = resolve; });
+    const commands: string[][] = [];
+    const pending = runPodCommand({ command: ['true'], signal: controller.signal, poolScheduler: pool,
+      kubectl: (args) => { commands.push([...args]); return { status: 0, stdout: '', stderr: '' }; },
+      syncImages: async () => { entered(); return new Promise(() => {}); },
+      imageCommit: null, env: {}, configHostMirror: () => undefined, log: () => {},
+    });
+    await syncing;
+    controller.abort(new Error('shadow deadline during image sync'));
+    await expect(pending).rejects.toThrow('shadow deadline during image sync');
+    expect(pool.snapshot()).toEqual({ 'pool-node-b': 0 });
+    expect(commands.some((args) => args.includes('apply'))).toBe(false);
+  });
+
+  test('PRLAND-SHADOW-HOST-TIMEOUT: late pool acquisition is released after caller abort', async () => {
+    const controller = new AbortController();
+    const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool' };
+    let finish!: (member: PodPoolMember) => void;
+    let releases = 0;
+    const pool = {
+      tryAcquire: () => new Promise<PodPoolMember>((resolve) => { finish = resolve; }),
+      release: () => { releases++; },
+    } as unknown as PodPoolScheduler;
+    const pending = runPodCommand({ command: ['true'], signal: controller.signal, poolScheduler: pool,
+      kubectl: () => ({ status: 0, stdout: '', stderr: '' }), imageCommit: null, env: {}, configHostMirror: () => undefined,
+    });
+    controller.abort(new Error('shadow deadline during acquisition'));
+    await expect(pending).rejects.toThrow('shadow deadline during acquisition');
+    finish(member);
+    await Promise.resolve();
+    expect(releases).toBe(1);
   });
 
   test('pool registry tag uses IfNotPresent for the child (no init container)', async () => {

@@ -13,6 +13,7 @@
 import { linesOutsideFencedCode } from '../self-implement/goal-author.js';
 import { existsSync } from 'node:fs';
 import { debug } from '../debug/log.js';
+import { appendRunLedgerEntry, runLedgerDir } from '../self-implement/run-ledger.js';
 import { recordAuthoredGoal } from './authored-goal-trace.js';
 import { findAskPathCandidates, type AskPathCandidateOptions } from './ask-path-candidates.js';
 import { retiredEntranceNotice, type EntranceDeclaration } from './entrance-registry.js';
@@ -849,6 +850,15 @@ export async function runAskLaunchFlow(
   const entrance = input.entrance;
   const askStartedAt = deps.now();
   const selfResolveClarifications = resolveSelfResolveClarifications(input.selfResolveClarifications);
+  // The Pod's logs.db disappears with the Job. Journal the two auto-authoring boundaries in its
+  // existing run ledger so the host's terminal collection can reemit them even on a failed Job.
+  const recordPodAuthoring = (event: 'ask-auto-target-candidates' | 'ask-auto-reauthor', data: Record<string, unknown>): void => {
+    if (process.env.ELANOUS_SUBSTRATE !== 'pod') return;
+    const runId = process.env.ELANOUS_RUN_ID ?? input.runId;
+    if (!runId) return;
+    try { appendRunLedgerEntry({ runId, event, data }, runLedgerDir()); }
+    catch (error) { deps.log('ask-auto-author-ledger-unavailable', { event, reason: error instanceof Error ? error.message : String(error) }, 'warn'); }
+  };
   deps.log('harness.entrance', {
     entrance: entrance.id,
     entranceStatus: entrance.status,
@@ -1082,6 +1092,7 @@ export async function runAskLaunchFlow(
         selection: { path: selectedPath ?? null, reason: selectionReason },
         ...(candidates.error === undefined ? {} : { error: candidates.error }),
       }, candidates.error === undefined && selectedPath ? 'info' : 'warn');
+      recordPodAuthoring('ask-auto-target-candidates', { candidatePathCount: candidates.paths.length, selected: Boolean(selectedPath), outcome: selectionReason });
     }
     const selectedPaths = candidates.selection?.path
       ? [candidates.selection.path]
@@ -1093,6 +1104,7 @@ export async function runAskLaunchFlow(
     } else {
       deps.print('[ask] ⑴ ⚠️ 자동 재저작에 넣을 대상 경로 후보가 없다. 대상 경로를 확인해야 한다');
     }
+    recordPodAuthoring('ask-auto-reauthor', { candidatePathCount: candidates.paths.length, firstPathCount: first.decision.result.paths.length, outcome: 'started' });
     authored = await authorAndPreflight(selectedPaths.length > 0
       ? `대상 경로: ${selectedPaths.join(' · ')}\n${input.askText}`
       : input.askText, selectedPaths);
@@ -1104,6 +1116,7 @@ export async function runAskLaunchFlow(
       secondPathCount: authored.decision.result.paths.length,
       helped: authored.decision.shouldLaunch,
     }, authored.decision.shouldLaunch ? 'info' : 'warn');
+    recordPodAuthoring('ask-auto-reauthor', { candidatePathCount: candidates.paths.length, firstPathCount: first.decision.result.paths.length, secondPathCount: authored.decision.result.paths.length, helped: authored.decision.shouldLaunch });
   }
 
   const { goalFile: effectiveGoalFile, decision } = authored;

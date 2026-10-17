@@ -37,6 +37,7 @@ export async function askBare({ text, provider, model, deps }: {
     ...(provider === undefined ? { initialProvider: chosenProvider } : { provider: chosenProvider }),
     ...(selected.model === '(none)' ? {} : { model: selected.model }),
     onResolvedProvider: (name, activeModel) => { resolvedProvider = name; resolvedModel = activeModel; },
+    usageSite: 'cli.ask-bare',
   });
   return { provider: resolvedProvider, model: resolvedModel, reply };
 }

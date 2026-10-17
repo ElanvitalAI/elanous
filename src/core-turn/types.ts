@@ -158,6 +158,9 @@ export interface CoreTurnContext {
   /** TUI-GOAL-LOOP-FRICTION — 종결 신호 도구 이름. `streamLLMWithTools` 의 `terminalToolNames` 로 그대로 간다
    *  (예산 거부 면제 · 신호뿐인 턴 ⊕ 답 = 마감). goal loop 가 `update_goal` 을 넣는다. */
   terminalToolNames?: LLMOpts['terminalToolNames'];
+  /** TUI-H1-GOALLOOP-EMPTY-TAIL — 이 턴 «앞»에 사람에게 답을 이미 보였다. `streamLLMWithTools` 의
+   *  `terminalPriorAnswerVisible` 로 그대로 간다(종결 신호 뒤 빈 턴 = 경고 없이 빈 답). goal loop 가 넣는다. */
+  terminalPriorAnswerVisible?: LLMOpts['terminalPriorAnswerVisible'];
   /** Optional model override (forwarded to `streamLLMWithTools`). */
   modelOverride?: string;
 }

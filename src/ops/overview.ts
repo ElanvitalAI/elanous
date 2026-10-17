@@ -96,6 +96,62 @@ export interface VerdictResult { verdict: Verdict; reasons: string[]; nextAction
 /** 부하/코어가 이 값을 넘으면 «기계 압박»(흐름 저하의 사유). 디스크 I/O 신호는 OVW-MACHINE-HB 전까지 없다. */
 export const LOAD_PER_CORE_PRESSURE = 3;
 
+/** 자원 지도의 축 어휘(닫힌 집합 · RES-FLOOR-BINDING). I/O·게이트 예약은 이 칸에 원천이 없어 늘 제외다. */
+export type ResourceKind = 'memory' | 'cpu' | 'io' | 'slots' | 'gate';
+
+/** 구속 조건 — 남은 비율이 최소인 축. 남은 비율 = 남은 양/전체 양(CPU 는 압박선 LOAD_PER_CORE_PRESSURE×코어를 전체로 본다). */
+export interface ResourceBinding {
+  kind: ResourceKind;
+  label: string;
+  remainingRatio: number;
+  /** 남은 양/전체 양의 사람 표기 — `5/64GB` · `0/54코어(압박선 3/코어)` · `0/46자리`. */
+  remainingText: string;
+}
+
+function ratio01(n: number): number {
+  return Math.min(1, Math.max(0, n));
+}
+
+function remainingAmount(n: number): string {
+  return Number.isInteger(n) ? n.toFixed(0) : String(Number(n.toPrecision(3)));
+}
+
+/**
+ * 구속 조건 규칙(RES-FLOOR-BINDING) — 메모리·CPU·I/O·슬롯·게이트 예약 중 «남은 비율 최소»인 축이 흐름을 묶는다.
+ * 못 잰 축(하트비트 없는 호스트 · 용량 못 잼 · 원천 없는 I/O·게이트 예약)은 후보에서 뺀다 — «넉넉»으로도 «바닥»으로도 읽지 않는다.
+ * 측정 축이 하나도 없으면 null. 동율은 정해진 순서(호스트 순 메모리→CPU, 그 다음 슬롯)의 첫 축이 이긴다.
+ */
+export function bindingResource(s: OverviewSnapshot): ResourceBinding | null {
+  const candidates: ResourceBinding[] = [];
+  for (const host of s.machines.hosts) {
+    const l = host.load.value;
+    if (!l) continue;
+    if (l.totalGb > 0) {
+      const remaining = Math.max(0, l.freeGb);
+      candidates.push({ kind: 'memory', label: `${host.name} 메모리`, remainingRatio: ratio01(remaining / l.totalGb), remainingText: `${remainingAmount(remaining)}/${l.totalGb.toFixed(0)}GB` });
+    }
+    if (l.cpuCount > 0) {
+      const cpuCap = l.cpuCount * LOAD_PER_CORE_PRESSURE;
+      const remaining = Math.max(0, cpuCap - l.load5);
+      candidates.push({ kind: 'cpu', label: `${host.name} CPU`, remainingRatio: ratio01(remaining / cpuCap), remainingText: `${remainingAmount(remaining)}/${cpuCap.toFixed(0)}코어(압박선 ${LOAD_PER_CORE_PRESSURE}/코어)` });
+    }
+  }
+  const capacity = s.tasks.capacity.value;
+  if (capacity && capacity.podTarget + capacity.localMax > 0) {
+    const total = capacity.podTarget + capacity.localMax;
+    candidates.push({ kind: 'slots', label: '슬롯', remainingRatio: ratio01(capacity.free / total), remainingText: `${capacity.free}/${total}자리` });
+  }
+  let binding: ResourceBinding | null = null;
+  for (const c of candidates) if (binding === null || c.remainingRatio < binding.remainingRatio) binding = c;
+  return binding;
+}
+
+/** 판정 띠 문구 — 측정된 축 중 «무엇이 흐름을 묶고 있나»를 이름으로 단다. 측정 축이 없으면 null. */
+export function bindingPhrase(b: ResourceBinding | null): string | null {
+  if (!b) return null;
+  return `구속 자원 ${b.label} — 남은 비율 최소 ${Math.round(b.remainingRatio * 100)}% (${b.remainingText})`;
+}
+
 export function computeVerdict(s: OverviewSnapshot): VerdictResult {
   const hits = new Map<Verdict, { reasons: string[]; actions: string[] }>();
   const hit = (v: Verdict, reason: string, action?: string): void => {
@@ -155,14 +211,15 @@ export function computeVerdict(s: OverviewSnapshot): VerdictResult {
     }
   }
 
+  const phrase = bindingPhrase(bindingResource(s));
   for (const v of VERDICTS) {
     const row = hits.get(v);
     if (!row) continue;
     // 이유 사슬: 이긴 판정의 사유 먼저, 그 밑에 진 판정들의 사유도 «부가»로 남긴다(한 사슬에 두 원인이 보이게).
     const rest = VERDICTS.filter((o) => o !== v && hits.has(o)).flatMap((o) => hits.get(o)!.reasons.map((r) => `(+${VERDICT_LABEL[o]}) ${r}`));
-    return { verdict: v, reasons: [...row.reasons, ...rest], nextActions: row.actions };
+    return { verdict: v, reasons: [...row.reasons, ...(phrase ? [phrase] : []), ...rest], nextActions: row.actions };
   }
-  return { verdict: 'flowing', reasons: [], nextActions: [] };
+  return { verdict: 'flowing', reasons: phrase ? [phrase] : [], nextActions: [] };
 }
 
 /** exit code — flowing·degraded 0 · 그 밖의 판정 3(수집기 자체 실패 1 은 호출자 몫). */

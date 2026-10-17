@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stateDirSourceForChild } from '../../agent/identity-env.js';
+import { debug } from '../../debug/log.js';
 import type { WarmWorkerCommand } from './pod-warm-worker-protocol.js';
 import { warmWorkerSourceMatches, WarmWorkerRuntime, type WarmWorkerRunFile } from './pod-warm-worker-runtime.js';
 
@@ -17,8 +18,8 @@ const command = (cutSha: string, lockHash: string, attemptId: string): WarmWorke
   generation: 1, workerId: 'worker-1', key: { ...key, lockHash }, deadlineAt: Date.now() + 60_000,
   files: [file], envProfile: 'gate-v1',
 });
-function root() {
-  const dir = mkdtempSync(join(tmpdir(), 'warm-runtime-'));
+function root(parentDir?: string) {
+  const dir = mkdtempSync(join(parentDir ?? tmpdir(), 'warm-runtime-'));
   roots.push(dir);
   mkdirSync(join(dir, 'src/example'), { recursive: true });
   writeFileSync(join(dir, file), 'test(() => {})');
@@ -30,7 +31,7 @@ function root() {
   }
   const cutSha = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
   const lockHash = createHash('sha256').update('pinned-lock').digest('hex');
-  return { repoDir: dir, scratchDir: join(dir, 'scratch'), artifactsRoot: join(dir, 'artifacts'), workerId: 'worker-1',
+  return { repoDir: dir, scratchDir: join(dir, 'scratch[1]'), artifactsRoot: join(dir, 'artifacts[1]'), workerId: 'worker-1',
     request: (attemptId: string) => command(cutSha, lockHash, attemptId) };
 }
 function complete(request: WarmWorkerRunFile) {
@@ -70,13 +71,318 @@ test('two commands execute sequentially with distinct private HOME/state/tmp/XDG
   expect(first.reply?.files).toEqual([{ file, rc: 0, failureIds: [], errorIds: [], junitComplete: true }]);
   expect(second.reply?.files).toEqual(first.reply?.files);
   expect(first.artifactsDir).not.toBe(second.artifactsDir);
+  expect(existsSync(join(first.artifactsDir!, 'reply.json'))).toBe(true);
   expect(JSON.parse(readFileSync(join(second.artifactsDir!, 'reply.json'), 'utf8')).attemptId).toBe('attempt-2');
+  expect(existsSync(options.scratchDir)).toBe(true);
   const prefix = join(second.artifactsDir!, 'file-0');
   const manifest = JSON.parse(readFileSync(`${prefix}.warm-manifest.json`, 'utf8'));
   expect(manifest).toMatchObject({ protocol: 1, file, cutSha: options.request('attempt-2').cutSha, attemptId: 'attempt-2', rc: 0 });
   expect(manifest.logSha256).toMatch(/^[a-f0-9]{64}$/);
   expect(manifest.junitSha256).toMatch(/^[a-f0-9]{64}$/);
   expect(existsSync(seen[1]!.env.HOME!)).toBe(false);
+});
+
+test('cleans each request back to its pinned base before the next request', async () => {
+  const options = root();
+  const artifact = join(options.repoDir, 'previous-request.tmp');
+  let calls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options, runFile: async request => {
+    calls++;
+    if (calls === 1) {
+      writeFileSync(artifact, 'untracked residue');
+    } else {
+      expect(existsSync(artifact)).toBe(false);
+    }
+    complete(request);
+    return 0;
+  } });
+
+  expect((await runtime.handle(options.request('attempt-1'))).reason).toBe('complete');
+  expect((await runtime.handle(options.request('attempt-2'))).reason).toBe('complete');
+  expect(calls).toBe(2);
+});
+
+test('resets a changed HEAD at the request boundary before quarantining source drift', async () => {
+  const options = root();
+  const newTrackedFile = join(options.repoDir, 'src/example/next-head.ts');
+  let calls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options, runFile: async request => {
+    calls++;
+    writeFileSync(newTrackedFile, 'committed by previous request');
+    for (const args of [['add', '--', newTrackedFile], ['-c', 'user.name=TC', '-c', 'user.email=tc@example.test', 'commit', '-qm', 'previous request changed HEAD']]) {
+      const result = spawnSync('git', ['-C', options.repoDir, ...args], { encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(result.stderr);
+    }
+    complete(request);
+    return 0;
+  } });
+  expect(await runtime.handle(options.request('head-drift')))
+    .toMatchObject({ reply: null, quarantineWorker: true, reason: 'quarantined' });
+  expect(spawnSync('git', ['-C', options.repoDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim())
+    .toBe(options.request('head-drift').cutSha);
+  expect(existsSync(newTrackedFile)).toBe(false);
+  expect(await runtime.handle(options.request('after-head-drift')))
+    .toMatchObject({ reply: null, quarantineWorker: true, reason: 'quarantined' });
+  expect(calls).toBe(1);
+});
+
+test('preserves runtime files reached through an external symlink with a missing final directory', async () => {
+  const options = root();
+  const aliasRoot = mkdtempSync(join(tmpdir(), 'warm-runtime-external-alias-'));
+  roots.push(aliasRoot);
+  const alias = join(aliasRoot, 'checkout');
+  symlinkSync(options.repoDir, alias);
+  const scratchDir = join(alias, 'scratch[1]');
+  const persistent = join(options.repoDir, 'scratch[1]', 'external-alias-residue.txt');
+  let calls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options, scratchDir, runFile: async request => {
+    calls++;
+    if (calls === 1) {
+      mkdirSync(join(options.repoDir, 'scratch[1]'), { recursive: true });
+      writeFileSync(persistent, 'must survive request cleanup');
+    } else {
+      expect(readFileSync(persistent, 'utf8')).toBe('must survive request cleanup');
+    }
+    complete(request);
+    return 0;
+  } });
+  expect((await runtime.handle(options.request('external-alias-1'))).reason).toBe('complete');
+  expect((await runtime.handle(options.request('external-alias-2'))).reason).toBe('complete');
+  expect(calls).toBe(2);
+  expect(existsSync(persistent)).toBe(true);
+});
+
+test('a failed request-boundary git cleanup emits evidence and blocks the next request', async () => {
+  const parent = mkdtempSync(join(tmpdir(), 'warm-parent-repo-'));
+  roots.push(parent);
+  const parentGit = (args: string[]) => {
+    const result = spawnSync('git', ['-C', parent, ...args], { encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr);
+  };
+  parentGit(['init', '-q']);
+  parentGit(['config', 'user.name', 'warm-parent']);
+  parentGit(['config', 'user.email', 'warm-parent@example.test']);
+  writeFileSync(join(parent, 'parent-marker.txt'), 'outer repository');
+  parentGit(['add', 'parent-marker.txt']);
+  parentGit(['commit', '-qm', 'outer repository']);
+  const options = root(parent);
+  const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+  const original = debug.log;
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
+    events.push({ category, event, data: data as Record<string, unknown> });
+  }) as typeof debug.log;
+  let calls = 0;
+  try {
+    const runtime = new WarmWorkerRuntime({ ...options, runFile: async request => {
+      calls++;
+      complete(request);
+      writeFileSync(join(options.repoDir, 'parent-artifact.txt'), 'must survive root loss');
+      rmSync(join(options.repoDir, '.git'), { recursive: true, force: true });
+      return 0;
+    } });
+    expect(await runtime.handle(options.request('attempt-1')))
+      .toMatchObject({ reply: null, quarantineWorker: true, reason: 'cleanup-failed' });
+    expect(await runtime.handle(options.request('attempt-2')))
+      .toMatchObject({ reply: null, quarantineWorker: true, reason: 'quarantined' });
+    expect(calls).toBe(1);
+    expect(readFileSync(join(options.repoDir, 'parent-artifact.txt'), 'utf8')).toBe('must survive root loss');
+    expect(events).toContainEqual({ category: 'pod.reuse', event: 'clean-failed', data: {
+      runId: 'run-1', attemptId: 'attempt-1', workerId: 'worker-1', reason: 'checkout-root-mismatch', remainingPaths: [],
+    } });
+  } finally {
+    (debug as { log: typeof debug.log }).log = original;
+  }
+});
+
+test('a failed reset short-circuits before clean or status can run', async () => {
+  const options = root();
+  const commands: string[] = [];
+  let runnerCalls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options,
+    runGit: args => {
+      commands.push(args[0]!);
+      const result = spawnSync('git', ['-C', options.repoDir, ...args], { encoding: 'utf8',
+        env: args[0] === 'reset' ? { ...process.env, GIT_DIR: join(options.repoDir, '.git-missing') } : process.env });
+      return { status: result.status, stdout: result.stdout };
+    },
+    runFile: async request => { runnerCalls++; complete(request); return 0; },
+  });
+  expect(await runtime.handle(options.request('reset-fails')))
+    .toMatchObject({ reply: null, quarantineWorker: true, reason: 'cleanup-failed' });
+  expect(await runtime.handle(options.request('after-reset-fails')))
+    .toMatchObject({ reply: null, quarantineWorker: true, reason: 'quarantined' });
+  expect(commands).toContain('reset');
+  expect(commands).not.toContain('clean');
+  expect(commands).not.toContain('status');
+  expect(runnerCalls).toBe(1);
+});
+
+test('a failed clean short-circuits before status and quarantines the next request', async () => {
+  const options = root();
+  const commands: string[] = [];
+  let runnerCalls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options,
+    runGit: args => {
+      commands.push(args[0]!);
+      const result = spawnSync('git', ['-C', options.repoDir, ...args], { encoding: 'utf8',
+        env: args[0] === 'clean' ? { ...process.env, GIT_DIR: join(options.repoDir, '.git-missing') } : process.env });
+      return { status: result.status, stdout: result.stdout };
+    },
+    runFile: async request => { runnerCalls++; complete(request); return 0; },
+  });
+  expect(await runtime.handle(options.request('clean-fails')))
+    .toMatchObject({ reply: null, quarantineWorker: true, reason: 'cleanup-failed' });
+  expect(await runtime.handle(options.request('after-clean-fails')))
+    .toMatchObject({ reply: null, quarantineWorker: true, reason: 'quarantined' });
+  expect(commands).toContain('clean');
+  expect(commands).not.toContain('status');
+  expect(runnerCalls).toBe(1);
+});
+
+test('rejects a checkout-local runtime path that is a symlink before running work', async () => {
+  const options = root();
+  const target = mkdtempSync(join(tmpdir(), 'warm-runtime-link-target-'));
+  roots.push(target);
+  symlinkSync(target, options.scratchDir);
+  let calls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options, runFile: async request => { calls++; complete(request); return 0; } });
+  expect(await runtime.handle(options.request('symlinked-scratch')))
+    .toMatchObject({ reply: null, quarantineWorker: true, reason: 'cleanup-failed' });
+  expect(calls).toBe(0);
+  expect(existsSync(target)).toBe(true);
+});
+
+test('rejects a checkout-local symlink reached through an external checkout alias', async () => {
+  const options = root();
+  const target = mkdtempSync(join(tmpdir(), 'warm-runtime-nested-link-target-'));
+  const aliasRoot = mkdtempSync(join(tmpdir(), 'warm-runtime-nested-link-alias-'));
+  roots.push(target, aliasRoot);
+  const alias = join(aliasRoot, 'checkout');
+  symlinkSync(options.repoDir, alias);
+  symlinkSync(target, join(options.repoDir, 'internal-link'));
+  let calls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options,
+    scratchDir: join(alias, 'internal-link', 'scratch'),
+    runFile: async request => { calls++; complete(request); return 0; },
+  });
+  expect(await runtime.handle(options.request('nested-checkout-symlink')))
+    .toMatchObject({ reply: null, quarantineWorker: true, reason: 'cleanup-failed' });
+  expect(calls).toBe(0);
+  expect(existsSync(target)).toBe(true);
+});
+
+test('rejects dot-dot paths that would normalize away a checkout-local symlink', async () => {
+  const options = root();
+  const target = mkdtempSync(join(tmpdir(), 'warm-runtime-dotdot-target-'));
+  roots.push(target);
+  symlinkSync(target, join(options.repoDir, 'internal-link'));
+  let calls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options,
+    scratchDir: `${options.repoDir}/internal-link/../scratch`,
+    runFile: async request => { calls++; complete(request); return 0; },
+  });
+  expect(await runtime.handle(options.request('dot-dot-symlink')))
+    .toMatchObject({ reply: null, quarantineWorker: true, reason: 'cleanup-failed' });
+  expect(calls).toBe(0);
+  expect(existsSync(target)).toBe(true);
+});
+
+test('a thrown cleanup command quarantines the worker and rejects its next request', async () => {
+  const options = root();
+  let calls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options,
+    runGit: args => {
+      if (args[0] === 'rev-parse') return { status: 0, stdout: options.repoDir };
+      if (args[0] === 'reset') throw new Error('runner unavailable');
+      return { status: 0, stdout: '' };
+    },
+    runFile: async request => { calls++; complete(request); return 0; },
+  });
+  expect(await runtime.handle(options.request('git-throws')))
+    .toMatchObject({ reply: null, quarantineWorker: true, reason: 'cleanup-failed' });
+  expect(await runtime.handle(options.request('after-git-throws')))
+    .toMatchObject({ reply: null, quarantineWorker: true, reason: 'quarantined' });
+  expect(calls).toBe(1);
+});
+
+test('missing porcelain output quarantines the worker and rejects its next request', async () => {
+  const options = root();
+  let calls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options,
+    runGit: args => {
+      if (args[0] === 'rev-parse') return { status: 0, stdout: options.repoDir };
+      if (args[0] === 'status') return { status: 0 };
+      return { status: 0, stdout: '' };
+    },
+    runFile: async request => { calls++; complete(request); return 0; },
+  });
+  expect(await runtime.handle(options.request('missing-status-output')))
+    .toMatchObject({ reply: null, quarantineWorker: true, reason: 'cleanup-failed' });
+  expect(await runtime.handle(options.request('after-missing-status')))
+    .toMatchObject({ reply: null, quarantineWorker: true, reason: 'quarantined' });
+  expect(calls).toBe(1);
+});
+
+test('cleanup observation keeps unusual residual paths exact with porcelain NUL output', async () => {
+  const options = root();
+  const residual = 'residue [quoted] snow ☃.txt';
+  const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+  const original = debug.log;
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
+    events.push({ category, event, data: data as Record<string, unknown> });
+  }) as typeof debug.log;
+  let calls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options,
+    runGit: args => {
+      if (args[0] === 'rev-parse') {
+        const result = spawnSync('git', ['-C', options.repoDir, ...args], { encoding: 'utf8' });
+        return { status: result.status, stdout: result.stdout };
+      }
+      if (args[0] === 'status') writeFileSync(join(options.repoDir, residual), 'residual');
+      const result = spawnSync('git', ['-C', options.repoDir, ...args], { encoding: 'utf8' });
+      return { status: result.status, stdout: result.stdout };
+    },
+    runFile: async request => { calls++; complete(request); return 0; },
+  });
+  try {
+    expect(await runtime.handle(options.request('nul-status-path')))
+      .toMatchObject({ reply: null, quarantineWorker: true, reason: 'cleanup-failed' });
+    expect(await runtime.handle(options.request('after-nul-status-path')))
+      .toMatchObject({ reply: null, quarantineWorker: true, reason: 'quarantined' });
+    expect(calls).toBe(1);
+    expect(events.some(event => event.category === 'pod.reuse' && event.event === 'clean-failed'
+      && event.data.remainingPaths instanceof Array && event.data.remainingPaths.includes(residual))).toBe(true);
+  } finally {
+    (debug as { log: typeof debug.log }).log = original;
+  }
+});
+
+test('cleanup observation reports a NUL porcelain rename destination without its source path', async () => {
+  const options = root();
+  const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+  const original = debug.log;
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
+    events.push({ category, event, data: data as Record<string, unknown> });
+  }) as typeof debug.log;
+  const runtime = new WarmWorkerRuntime({ ...options,
+    runGit: args => {
+      if (args[0] === 'status') {
+        const moved = spawnSync('git', ['-C', options.repoDir, 'mv', 'src/example/worker.test.ts', 'src/example/renamed test.ts'], { encoding: 'utf8' });
+        if (moved.status !== 0) throw new Error(moved.stderr);
+      }
+      const result = spawnSync('git', ['-C', options.repoDir, ...args], { encoding: 'utf8' });
+      return { status: result.status, stdout: result.stdout };
+    },
+    runFile: async request => { complete(request); return 0; },
+  });
+  try {
+    expect(await runtime.handle(options.request('rename-residue')))
+      .toMatchObject({ reply: null, quarantineWorker: true, reason: 'cleanup-failed' });
+    const event = events.find(item => item.category === 'pod.reuse' && item.event === 'clean-failed');
+    expect(event?.data.remainingPaths).toEqual(['src/example/renamed test.ts']);
+  } finally {
+    (debug as { log: typeof debug.log }).log = original;
+  }
 });
 
 test('missing JUnit never yields a reply and the worker quarantines before another request', async () => {
@@ -254,7 +560,7 @@ test('a command that expires during execution cannot produce a measured reply', 
   expect(await runtime.handle({ ...options.request('attempt-2'), deadlineAt: 3_000 })).toMatchObject({ reason: 'quarantined' });
 });
 
-test('tracked source changed during a successful file run is quarantined before reply', async () => {
+test('tracked source changed during a successful file run is reset but the reply is refused', async () => {
   const options = root();
   const runtime = new WarmWorkerRuntime({ ...options, runFile: async request => {
     complete(request);
@@ -263,6 +569,7 @@ test('tracked source changed during a successful file run is quarantined before 
   } });
   const result = await runtime.handle(options.request('source-drift'));
   expect(result).toMatchObject({ reply: null, quarantineWorker: true, reason: 'quarantined' });
+  expect(readFileSync(join(options.repoDir, file), 'utf8')).toBe('test(() => {})');
   expect(existsSync(join(result.artifactsDir!, 'reply.json'))).toBe(false);
   expect(await runtime.handle(options.request('later'))).toMatchObject({ reason: 'quarantined' });
 });

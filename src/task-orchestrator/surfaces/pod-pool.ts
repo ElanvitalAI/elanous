@@ -474,7 +474,7 @@ export class PodPoolScheduler {
    * member the 0.2.15 gate launched its shards one at a time.
    * Ties keep the configured member order. Returns null when every readable member is full.
    */
-  async tryAcquire(skip?: ReadonlySet<string>, onEmpty?: (reason: string) => void, mode: { selfCapped?: boolean; kind?: PodPlacementKind | null; onPlacement?: (placement: PodPlacement) => void } = {}): Promise<PodPoolMember | null> {
+  async tryAcquire(skip?: ReadonlySet<string>, onEmpty?: (reason: string) => void, mode: { selfCapped?: boolean; kind?: PodPlacementKind | null; onPlacement?: (placement: PodPlacement) => void; signal?: AbortSignal } = {}): Promise<PodPoolMember | null> {
     const selfCapped = mode.selfCapped === true;
     const kind = mode.kind ?? null;
     // POOL-LITE: lite goals try the small member first, implementation goals the big one; full → overflow by free share.
@@ -487,6 +487,8 @@ export class PodPoolScheduler {
       const reason = error instanceof Error ? error.message : String(error);
       reading = Object.fromEntries(this.members.map((m) => [m.context, { occupied: null, reason }]));
     }
+    // A caller may abandon a slow occupancy read. Never acquire its lease after cancellation.
+    if (mode.signal?.aborted) throw mode.signal.reason ?? new Error('pod pool acquisition aborted');
     const free: Record<string, number> = {};
     const measured: Record<string, boolean> = {};
     let best: { member: PodPoolMember; slots: number; measured: boolean; preferred: boolean } | null = null;

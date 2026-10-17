@@ -13,6 +13,10 @@ import { selfDevRunsDir } from '../self-dev/run-store.js';
 import { syncTestConfig } from '../cli/config-test-sync.js';
 import { debug } from '../debug/log.js';
 
+/** = `PREAMBLE_SYNC_BLOCK_ENV`(dashboard/turn-preamble.ts). 그 모듈을 끌어오지 않으려 이름만 둔다 —
+ *  같은 값인지는 elanous-tui-spawn-identity.test.ts 가 잡는다. */
+export const PREAMBLE_SYNC_BLOCK_ENV = 'ELANOUS_TEST_PREAMBLE_SYNC_BLOCK_MS';
+
 export interface ElanousTuiSpawnOptions {
   readonly repoRoot: string;
   readonly cwd: string;
@@ -138,6 +142,13 @@ export function elanousTuiSpawnOptions(opts: ElanousTuiSpawnOptions): StartOpts 
   }
   const { runId } = resolveRunIdentity({ explicit: opts.runId, inherited: opts.space.runId });
   const debugLevel = process.env.ELANOUS_DEBUG_LEVEL;
+  // ⭐ PTY 는 기동 때 잡은 로그인 셸 env 위에 «여기 적은 키만» 얹는다(registry `buildPtyEnv`) —
+  //    부모에 건 시험 seam env 는 적어 주지 않으면 자식에 안 닿는다(run-fbe85b7c · 자식 env 실측).
+  //    격리 자식에만 넘긴다. 자식도 운영 우주면 무시한다(`preambleSyncBlockMs`).
+  const preambleSyncBlock = isolated ? process.env[PREAMBLE_SYNC_BLOCK_ENV]?.trim() : undefined;
+  if (preambleSyncBlock) {
+    debug.log('self-implement.elanous-tui-spawn', 'test-seam-env', { name: PREAMBLE_SYNC_BLOCK_ENV, value: preambleSyncBlock });
+  }
   const controller = opts.controller ?? deriveChildController(process.env, process.pid);
   const channels = 'pty,inbox';
   debug.log('self-implement.elanous-tui-spawn', 'controller', { controller, channels });
@@ -149,6 +160,8 @@ export function elanousTuiSpawnOptions(opts: ElanousTuiSpawnOptions): StartOpts 
     ],
     accessMode: 'auto',
     transitionPolicy: 'open',
+    // 안 넘길 때는 로그인 셸 캡처본에 그 변수가 있어도 지운다 — 비격리 자식에 seam 이 새지 않게.
+    ...(preambleSyncBlock ? {} : { unsetEnv: [PREAMBLE_SYNC_BLOCK_ENV] }),
     // ⭐ 대표 2026-08-02 — 자식 화면 기본 **160×40**. 가상 PTY라 사람 터미널과 무관하고,
     //    좁으면 렌더 블록이 화면을 넘어 **관측이 잘린다**(그 실측이 `--cols/--rows` 를 열게 했다).
     cols: opts.cols ?? 160,
@@ -164,6 +177,7 @@ export function elanousTuiSpawnOptions(opts: ElanousTuiSpawnOptions): StartOpts 
       ELANOUS_CONTROL_CHANNELS: channels,
       ...observeOnlyFlagEnv(opts.observeOnly),
       ...(debugLevel === undefined ? {} : { ELANOUS_DEBUG_LEVEL: debugLevel }),
+      ...(preambleSyncBlock ? { [PREAMBLE_SYNC_BLOCK_ENV]: preambleSyncBlock } : {}),
       ...childRunContextEnv('self-build'),
       ...childNestEnv(),
       ...harnessSpaceEnv(opts.space.kind, opts.space.id, runId),

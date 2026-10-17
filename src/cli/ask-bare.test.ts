@@ -22,7 +22,7 @@ describe('askBare', () => {
     const result = await askBare({ text: '  Hello!\n', deps });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.messages).toEqual([{ role: 'user', content: '  Hello!\n' }]);
-    expect(calls[0]!.options).toEqual({ initialProvider: { name: 'openai-codex' }, model: 'codex-model', onResolvedProvider: expect.any(Function) });
+    expect(calls[0]!.options).toEqual({ initialProvider: { name: 'openai-codex' }, model: 'codex-model', usageSite: 'cli.ask-bare', onResolvedProvider: expect.any(Function) });
     expect(result).toEqual({ provider: 'openai-codex', model: 'codex-model', reply: 'answer' });
   });
 
@@ -50,6 +50,7 @@ describe('askBare', () => {
     expect(streamedOptions).toEqual({
       provider: { name: 'anthropic' },
       model: 'claude-sonnet-4-5',
+      usageSite: 'cli.ask-bare',
       onResolvedProvider: expect.any(Function),
     });
   });

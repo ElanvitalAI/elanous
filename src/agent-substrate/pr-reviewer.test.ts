@@ -289,6 +289,38 @@ describe('parseReviewResult — VERDICT + MUST-FIX/SHOULD-FIX 파싱', () => {
       expect(parseReviewResult(`VERDICT: PASS\nMUST-FIX:\n- ${marker}`).mustFix).toEqual([]);
     }
   });
+  it('REVIEW-MUSTFIX-NONE-PARSE — «없음/none/n/a/—/해당 없음» 변형 6종(괄호·설명 꼬리 포함)은 mustFix 0', () => {
+    const variants = [
+      '없음',
+      'none',
+      'n/a',
+      '—',
+      '해당 없음',
+      '(없음 — 이 조각 범위에서는 차단 결함 없음...)',
+    ];
+    expect(variants).toHaveLength(6);
+    for (const sentinel of variants) {
+      expect(isNoneSentinelFinding(sentinel)).toBe(true);
+      expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${sentinel}`).mustFix).toEqual([]);
+    }
+  });
+  it('REVIEW-MUSTFIX-NONE-PARSE — 실제 지적과 섞이면 그 수 그대로를 남긴다', () => {
+    const real = [
+      '새 export 가 실행 경로에 배선되지 않는다',
+      '회귀 시험이 스트림 경로를 안 탄다',
+    ];
+    const mixed = parseReviewResult([
+      'VERDICT: WARN',
+      'MUST-FIX:',
+      '- (없음 — 이 조각 범위에서는 차단 결함 없음...)',
+      `- ${real[0]}`,
+      '- none',
+      `- ${real[1]}`,
+      '- 해당 없음',
+    ].join('\n'));
+    expect(mixed.mustFix).toEqual(real);
+    expect(mixed.mustFix).toHaveLength(real.length);
+  });
   it('REVIEW-MUSTFIX-NONE-PLACEHOLDER — 제거된 표지 수를 debug 로그로 남긴다', () => {
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {

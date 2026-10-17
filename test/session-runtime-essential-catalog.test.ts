@@ -22,7 +22,7 @@ import { debug } from '../src/debug/log.js';
 //  깨진 것을 정답으로 굳히는 형태였다.
 describe('essential dashboard catalog', () => {
 
-  test('essential dashboard catalog is fixed while rich retains dynamic matching', () => {
+  test('essential dashboard catalog is fixed regardless of user text', () => {
     const savedXdg = process.env.XDG_CONFIG_HOME;
     const xdg = mkdtempSync(join(tmpdir(), 'session-runtime-model-surface-'));
     try {
@@ -89,25 +89,12 @@ describe('essential dashboard catalog', () => {
       hostTools: essentialHostTools,
       runtimeTools: essentialRuntimeTools,
       optionalTools,
-      rich: false,
     }).map(spec => spec.name);
 
     expect(essential('이 코드의 버그를 고쳐줘')).toEqual(expected);
     expect(essential('debug trace와 외부 웹 검색을 해줘')).toEqual(expected);
-    const dynamicNames = buildSessionRuntimeToolSpecs({
-      userText: 'debug trace를 점검해줘',
-      hostTools: essentialHostTools,
-      runtimeTools: essentialRuntimeTools,
-      optionalTools,
-      rich: true,
-    }).map(spec => spec.name);
-    expect(dynamicNames).toContain('debug_getState');
-    expect(buildSessionRuntimeToolSpecs({
-      userText: 'debug trace를 점검해줘',
-      hostTools: essentialHostTools,
-      runtimeTools: essentialRuntimeTools,
-      optionalTools,
-    }).map(spec => spec.name)).toEqual(dynamicNames);
+    // TUI-DIET-D1-TAIL — the legacy `rich` dynamic catalog is gone: a debug phrase gets the same essential list.
+    expect(essential('debug trace를 점검해줘')).toEqual(expected);
 
     const records: Array<{ event: string; data: { surfaceId?: string; toolCount?: number } }> = [];
     const off = debug.registerSink({
@@ -129,7 +116,6 @@ describe('essential dashboard catalog', () => {
       runtimeTools: essentialRuntimeTools,
       hostTools: essentialHostTools.filter(tool => tool.name !== 'logs_query'),
       optionalTools,
-      rich: false,
     }).map(spec => spec.name);
     expect(withoutLogsHost).not.toContain('logs_query');
 
@@ -139,7 +125,6 @@ describe('essential dashboard catalog', () => {
       hostTools: essentialHostTools,
       runtimeTools: essentialRuntimeTools,
       optionalTools,
-      rich: false,
       toolAvailability: Object.fromEntries(unavailableInEssential.map(name => [name, false])),
       }).map(spec => spec.name)).toEqual(expected.filter(name => !unavailableInEssential.includes(name)));
     } finally {

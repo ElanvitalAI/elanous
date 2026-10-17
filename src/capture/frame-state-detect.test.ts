@@ -1,6 +1,6 @@
 // #1 region-rule 화면 상태 감지 — herdr detect/manifest 이식. 순수·합성 프레임.
 import { describe, expect, test } from 'bun:test';
-import { AGENT_MISSION_STATE_RULES, classifyFrameState, DEFAULT_STATE_RULES, detectAgentFromCmd, GOAL_LOOP_STATE_RULES, UNKNOWN_INPUT_MAX_LINE_LENGTH, UNKNOWN_INPUT_MAX_LINES, type StateRule } from './frame-state-detect.js';
+import { AGENT_MISSION_STATE_RULES, classifyFrameState, DEFAULT_STATE_RULES, detectAgentFromCmd, GOAL_LOOP_STATE_RULES, reconcileFrameStateWithTurn, UNKNOWN_INPUT_MAX_LINE_LENGTH, UNKNOWN_INPUT_MAX_LINES, type StateRule } from './frame-state-detect.js';
 
 describe('classifyFrameState (기본 규칙셋)', () => {
   test('blocked — yes/no 승인 UI', () => {
@@ -306,5 +306,37 @@ describe('unknown 진단 — 본 범위 밖 후보', () => {
     const verdict = classifyFrameState(['평범한 산문 한 줄', '두 번째 줄'].join('\n'), AGENT_MISSION_STATE_RULES);
     expect(verdict.state).toBe('unknown');
     expect(verdict.outOfRegionCandidates).toEqual([]);
+  });
+});
+
+describe('reconcileFrameStateWithTurn (H10 · 자기보고 턴 우선)', () => {
+  test('turn=idle 이면 화면 working(남은 Streaming 줄)은 idle 로 — working 과 idle 이 같이 나가지 않는다', () => {
+    const screen = classifyFrameState(['· Streaming…  (5s · esc 중단)', '✔ 완료', '❯ '].join('\n'));
+    expect(screen.state).toBe('working');
+    expect(reconcileFrameStateWithTurn(screen.state, 'idle')).toEqual({ state: 'idle', source: 'turn', screenState: 'working', overridden: true });
+  });
+
+  test('turn=busy 면 working — 화면 idle·unknown·done 을 덮되 blocked·waiting 은 턴 안의 구체 상태로 둔다', () => {
+    expect(reconcileFrameStateWithTurn('idle', 'busy')).toEqual({ state: 'working', source: 'turn', screenState: 'idle', overridden: true });
+    expect(reconcileFrameStateWithTurn('working', 'busy')).toEqual({ state: 'working', source: 'turn', screenState: 'working', overridden: false });
+    expect(reconcileFrameStateWithTurn('unknown', 'busy')).toEqual({ state: 'working', source: 'turn', screenState: 'unknown', overridden: false });
+    expect(reconcileFrameStateWithTurn('blocked', 'busy')).toMatchObject({ state: 'blocked', source: 'screen' });
+    expect(reconcileFrameStateWithTurn('waiting', 'busy')).toMatchObject({ state: 'waiting', source: 'screen' });
+  });
+
+  test('turn=idle 의 blocked·waiting·done 은 화면 값을 둔다 · turn=unknown 이면 화면 그대로', () => {
+    expect(reconcileFrameStateWithTurn('blocked', 'idle')).toMatchObject({ state: 'blocked', source: 'screen', overridden: false });
+    expect(reconcileFrameStateWithTurn('done', 'idle')).toMatchObject({ state: 'done', source: 'screen' });
+    expect(reconcileFrameStateWithTurn('unknown', 'idle')).toEqual({ state: 'idle', source: 'turn', screenState: 'unknown', overridden: false });
+    for (const s of ['idle', 'working', 'blocked', 'waiting', 'done', 'unknown'] as const) {
+      expect(reconcileFrameStateWithTurn(s, 'unknown')).toEqual({ state: s, source: 'screen', screenState: s, overridden: false });
+    }
+  });
+
+  test('전수: 턴을 알면 결과는 «working ∧ idle» 모순을 낼 수 없다', () => {
+    for (const s of ['idle', 'working', 'blocked', 'waiting', 'done', 'unknown'] as const) {
+      expect(reconcileFrameStateWithTurn(s, 'idle').state).not.toBe('working');
+      expect(reconcileFrameStateWithTurn(s, 'busy').state).not.toBe('idle');
+    }
   });
 });

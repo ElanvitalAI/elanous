@@ -176,10 +176,9 @@ export function describePtyRunState(
     ...(checkoutHead ? { checkoutHead } : {}),
     ...(row && row.kind === 'tui' ? { startedAt: row.startedAt } : {}),
   });
-  const turn: PtyTurnView = row?.alive && row.turnState ? row.turnState : 'unknown';
+  const turnView = ptyTurnViewOfRow(row);
   return {
-    turn,
-    ...(turn !== 'unknown' && row?.turnAt ? { turnAt: row.turnAt } : {}),
+    ...turnView,
     build: build ?? null,
     installed: installed.sha ?? null,
     stale: staleness.stale,
@@ -189,6 +188,38 @@ export function describePtyRunState(
 
 export function shortSha(sha: string | null | undefined): string {
   return sha ? sha.slice(0, 7) : '-';
+}
+
+/** 행의 자기보고 턴만 — 설치본·git 판독과 «무관»하다(판독이 실패해도 기록된 턴은 그대로 읽힌다). 죽은 행·기록 없음 = unknown. */
+export function ptyTurnViewOfRow(row: Pick<PtyManifestRow, 'alive' | 'turnState' | 'turnAt'> | null | undefined): Pick<PtyRunStateView, 'turn' | 'turnAt'> {
+  const turn: PtyTurnView = row?.alive && row.turnState ? row.turnState : 'unknown';
+  return { turn, ...(turn !== 'unknown' && row?.turnAt ? { turnAt: row.turnAt } : {}) };
+}
+
+// ── 턴 칸(H10 · `pty list` 가 화면 긁기 없이 «지금 턴 중인가·얼마나 됐나»를 낸다) ──
+
+export interface PtyTurnCell {
+  readonly state: PtyTurnView;
+  /** 지금 턴 상태로 바뀐 시각(epoch ms) — 모르면 null. */
+  readonly at: number | null;
+  /** 지금 턴 상태에 머문 초(busy 면 «이 턴 경과»). ⛔ 모르면 null — 「0초」와 「못 잼」은 다른 값이다. */
+  readonly sinceSec: number | null;
+}
+
+export const UNKNOWN_TURN_CELL: PtyTurnCell = { state: 'unknown', at: null, sinceSec: null };
+
+/** `turnAt` 은 턴 값이 «바뀔 때만» 적힌다(`reportTuiTurn` 이 같은 값을 거른다) ⇒ now−turnAt = 그 상태의 경과. */
+export function describeTurnCell(view: Pick<PtyRunStateView, 'turn' | 'turnAt'>, now: number): PtyTurnCell {
+  if (view.turn === 'unknown' || view.turnAt === undefined || !Number.isFinite(view.turnAt) || view.turnAt <= 0) {
+    return { state: view.turn, at: null, sinceSec: null };
+  }
+  return { state: view.turn, at: view.turnAt, sinceSec: Math.max(0, Math.floor((now - view.turnAt) / 1000)) };
+}
+
+/** 표 한 칸 값: `busy,42s` · `idle,300s` · 시각 모름 `busy,?s` · 턴 모름 `?`. */
+export function formatTurnCell(cell: PtyTurnCell): string {
+  if (cell.state === 'unknown') return '?';
+  return `${cell.state},${cell.sinceSec === null ? '?' : cell.sinceSec}s`;
 }
 
 // ── 기록(TUI) ──

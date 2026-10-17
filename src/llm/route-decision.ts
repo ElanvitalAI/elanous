@@ -40,10 +40,46 @@ const lastBySurface = new Map<string, RouteDecision>();
 
 export function recordCurrentRouteDecision(surface: string, decision: RouteDecision): void {
   lastBySurface.set(surface, decision);
+  // 새 턴의 결정이 서면 지난 턴의 «실제 실행»은 더는 이 턴의 것이 아니다.
+  executionBySurface.delete(surface);
 }
 
 export function currentRouteDecision(surface: string): RouteDecision | null {
   return lastBySurface.get(surface) ?? null;
+}
+
+/** 이번 턴에 «실제로» 응답한 공급자·모델(TUI-MODEL-BADGE-ACTUAL · 10-16).
+ *  결정(`RouteDecision`)은 턴 «시작»에 고른 값이고, 폴백 체인이 다른 공급자로 넘기면 실제는 달라진다.
+ *  ACP 사용량 봉투(`routeProvider`·`model`)로 들어온다 — 이 표면이 결정을 세운 in-process 세션만 적는다.
+ *  ⚠️ 지금 읽는 곳은 완료 배지뿐이다. 상태줄·`/model` «지금:» 의 원천 통일은 후속 칸 TUI-MODEL-BADGE-SOURCE. */
+export interface RouteExecution {
+  provider?: string;
+  model: string;
+}
+
+const executionBySurface = new Map<string, RouteExecution>();
+
+export function recordRouteExecution(surface: string, execution: RouteExecution): void {
+  executionBySurface.set(surface, execution);
+}
+
+export function currentRouteExecution(surface: string): RouteExecution | null {
+  return executionBySurface.get(surface) ?? null;
+}
+
+/** 표면의 결정·실행을 비운다(세션 핀은 사람의 선택이라 남긴다) — 짝이 안 맞는 턴(원격 등)에서 지난 «A → B» 가
+ *  다시 보이지 않게 한다(r5 리뷰). */
+export function clearSurfaceRouteDecision(surface: string): void {
+  lastBySurface.delete(surface);
+  executionBySurface.delete(surface);
+}
+
+/** 턴이 고른 모델과 실제로 응답한 모델이 다르면 «처음 → 실제», 아니면 null(꾸미지 않는다). */
+export function routeFallbackLabel(surface: string): string | null {
+  const decision = lastBySurface.get(surface);
+  const execution = executionBySurface.get(surface);
+  if (!decision?.model || !execution?.model || execution.model === decision.model) return null;
+  return `${decision.model} → ${execution.model}`;
 }
 
 /** A `/model` choice scoped to this process's surface (TUI-MODEL-SESSION-SCOPE · 10-14).

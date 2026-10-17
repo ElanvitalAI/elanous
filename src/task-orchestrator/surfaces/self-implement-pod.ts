@@ -43,8 +43,9 @@ export const POD_LOGS_KEEP_BYTES = 4_500_000;
  *  POD-NORESULT ⓑ (10-07 · 28 failed rc=2 Jobs read back): every child printed its result line, but one
  *  (si-task-71f68d57f6b7, image 0.2.15) had stderr lines (`[graph] collect fail`) after it, so the old
  *  «last line only» check skipped the flatten and the host kept `ok:false` with no stage or PR number.
- *  Scan back to the newest child result line instead; still append exactly one line. */
-const POD_RESULT_FLATTEN = `bun -e 'const fs=require("fs");const p="/tmp/si.out";const lines=fs.readFileSync(p,"utf8").trimEnd().split("\\n");for(let i=lines.length-1;i>=0;i--){const l=lines[i].trim();if(!l.startsWith("{"))continue;let o;try{o=JSON.parse(l)}catch{continue}if(!o||o.kind!=="self")continue;if(o.result&&typeof o.result==="object"&&!Array.isArray(o.result))fs.appendFileSync(p,"\\n"+JSON.stringify({...o.result,...(typeof o.ok==="boolean"?{ok:o.ok}:{})})+"\\n");break}'`;
+ *  Scan back to a terminal child result; an interim JSON row or successful row on rc≠0 cannot hide a later failure.
+ *  Keep this shell command on one physical line: Job command extraction consumes it as one line. */
+export const POD_RESULT_FLATTEN = `ELANOUS_CHILD_RC="$rc" bun -e ' const fs=require("fs"); const p="/tmp/si.out"; const lines=fs.readFileSync(p,"utf8").trimEnd().split("\\n"); const failed=Number(process.env.ELANOUS_CHILD_RC)!==0; let terminal=null; let appendTerminal=false; let successIndex=-1; for(let i=lines.length-1;i>=0;i--){ const l=lines[i].trim(); if(!l.startsWith("{"))continue; let o; try{o=JSON.parse(l)}catch{continue} if(!o||typeof o!=="object"||Array.isArray(o))continue; const nested=o.kind==="self"&&o.result&&typeof o.result==="object"&&!Array.isArray(o.result); const flat=nested ? {...o.result,...(typeof o.ok==="boolean"?{ok:o.ok}:{})} : o.kind===undefined?o:null; if(!flat||typeof flat.ok!=="boolean"||typeof flat.stage!=="string"||!flat.stage||flat.stage==="running")continue; if(failed&&flat.ok===true){successIndex=i;break;} terminal=flat; appendTerminal=i!==lines.length-1||flat!==o; break; } let reason=""; let reasonIndex=-1; if(failed){ for(let i=successIndex>=0?successIndex+1:0;i<lines.length;i++){ const l=lines[i].trim(); if(/골 완료 경계 누락|self-implement PR guard 실패|draft PR 생성 실패/u.test(l)){ reason=l;reasonIndex=i; }else if(/^(Error:|❌)/u.test(l)&&(!reason||lines.slice(reasonIndex+1,i).some(x=>x.trim().startsWith("[retry]")||x.trim().startsWith("재시도:")))){ reason=l;reasonIndex=i; } } } if(terminal){ if(appendTerminal)fs.appendFileSync(p,"\\n"+JSON.stringify(terminal)+"\\n"); }else if(failed){ if(reason)fs.appendFileSync(p,"\\n"+JSON.stringify({stage:reason.includes("골 완료 경계 누락")?"preflight-blocked":"error",ok:false,error:lines.slice(reasonIndex).join("\\n").trim().slice(0,4000)})+"\\n"); else if(successIndex>=0)fs.appendFileSync(p,"\\n"+JSON.stringify({stage:"error",ok:false,error:"child exited rc="+process.env.ELANOUS_CHILD_RC+" after a success result without a terminal failure result"})+"\\n"); }'`;
 
 export const POD_JOB_DEADLINE_SECONDS = 10_800;
 
@@ -240,11 +241,11 @@ export interface PodSpawnOptions {
   memoryAdvice?: () => PodMemoryAdvice;
 }
 
-export function defaultKubectl(args: readonly string[], input?: string): { status: number | null; stdout: string; stderr: string } {
+export function defaultKubectl(args: readonly string[], input?: string, timeoutMs = 120_000): { status: number | null; stdout: string; stderr: string } {
   // 셸 프록시가 kubectl 의 로컬 API 요청을 가로챈다(2026-09-25 실측) — 자식 env 에서 뺀다.
   const env = { ...process.env };
   for (const k of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']) delete env[k];
-  const r = spawnSync('kubectl', [...args], { encoding: 'utf8', input, env, timeout: 120_000, maxBuffer: LEASE_KUBECTL_MAX_BUFFER });
+  const r = spawnSync('kubectl', [...args], { encoding: 'utf8', input, env, timeout: timeoutMs, maxBuffer: LEASE_KUBECTL_MAX_BUFFER });
   const error = (r.error as NodeJS.ErrnoException | undefined)?.code === 'ENOBUFS'
     ? `kubectl 출력 너무 큼 (ENOBUFS; maxBuffer=${LEASE_KUBECTL_MAX_BUFFER} bytes)`
     : r.error ? String(r.error) : '';
@@ -1080,7 +1081,7 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
       ? `echo "ELANOUS_AUTHOR_ON_POD started host=$(hostname) at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; author_t0=$(date +%s); ${o.authorGrade === 'lite' || o.authorGrade === 'full' ? `ELANOUS_AUTHOR_GRADE=${o.authorGrade} ` : ''}elanous harness say --substrate local --json${quotedAsk}${quotedChildLlm} -- "$(cat /creds/feature)" > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; ${RUN_END}; echo "ELANOUS_AUTHOR_ON_POD finished host=$(hostname) rc=$rc seconds=$(( $(date +%s) - author_t0 ))"; ${POD_RESULT_FLATTEN}`
       : goalPath
       ? `elanous harness ask ${goalPath} --json${quotedAsk}${quotedChildLlm} > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; ${RUN_END}; ${POD_RESULT_FLATTEN}`
-      : `export ${OLD_DOOR_STAMP_ENV}=self-implement; elanous self implement "$(cat /creds/feature)" --json ${quoted} > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; ${RUN_END}`,
+      : `export ${OLD_DOOR_STAMP_ENV}=self-implement; elanous self implement "$(cat /creds/feature)" --json ${quoted} > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; ${RUN_END}; ${POD_RESULT_FLATTEN}`,
     'cat /tmp/si.out',
     '[ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h || echo "ELANOUS_USAGE_ROLLUP {\"measured\":false,\"reason\":\"no rollup script\"}"',
     // A long run's log export can pass the 5MB artifact limit; skipping it whole left no window into why a
@@ -1174,6 +1175,7 @@ if [ "$found" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi`,
               ...(o.runId ? [{ name: 'ELANOUS_RUN_ID', value: o.runId }] : []),
               ...(o.parentRunId ? [{ name: 'ELANOUS_PARENT_RUN_ID', value: o.parentRunId }] : []),
               ...(o.workIdentity?.taskCard ? [{ name: 'ELANOUS_TASK_CARD_ID', value: o.workIdentity.taskCard }] : []),
+              ...(o.workIdentity?.slotId ? [{ name: 'ELANOUS_POD_SLOT_ID', value: o.workIdentity.slotId }] : []),
               { name: 'ELANOUS_SUBSTRATE', value: 'pod' },
               ...Object.entries(controlInboxEnv(POD_CONTROL_INBOX_DIR)).map(([name, value]) => ({ name, value })),
               // ⭐ 런 출처(🅣 RFC run-origin §A3 · #20457/#20468 칸 이름) — Pod 는 자기 elanous_id 를 쓰지 않고 «띄운 감독기»의 hostId 를 물려받는다.

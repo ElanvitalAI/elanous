@@ -24,6 +24,7 @@ import { CardStore } from '../task-cards/card-store.js';
 import { draftWithinBudget, triageWithinBudget } from './triage-budget.js';
 import { askSteward, classifyIssue, installedCapabilities, planIssues, ruleJudgment, unsafeReason, type ClassifiedIssue, type StewardAsk } from './triage-plan.js';
 import { failureAlertText, markStageStart, markStageEnd, readFailureStreak, shouldAlert, writeFailureStreak, type FailureStreak, type StewardStage } from './failure-streak.js';
+import { briefVerdictChange } from './digest-delivery.js';
 
 export type Rung = 0 | 1 | 2 | 3 | 4 | 5 | 'hitl';
 /** `other` = the judge chose human review for a reason outside the four named ones (kept as HITL, never downgraded). */
@@ -56,6 +57,8 @@ export interface StewardDeps {
   judge?: (issue: TriageIssue, issues: TriageIssue[], tracks?: Record<string, string>) => Promise<unknown>;
   decide?: typeof emitDecision;
   sendDigest?: (text: string) => Promise<void>;
+  /** 흐름 판정 변화 브리핑 한 줄 발송(OVW-BRIEF) — 생략하면 킨드 `ops-report`(운영 봇)이 기본. */
+  sendBrief?: (text: string) => Promise<void>;
   now?: () => Date;
   root?: string;
   cardStore?: StewardCardDeps['store'];
@@ -601,6 +604,13 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
       state.digestDay = day;
       writeFileSync(path, JSON.stringify(state));
       digested = true;
+    }
+    try {
+      await briefVerdictChange(root, { send: deps.sendBrief });
+    } catch (error) {
+      const message = `steward report: verdict brief failed: ${redactSecretText(error instanceof Error ? error.message : String(error))}`;
+      debug.log('steward.verdict-brief', 'failed', { error: message });
+      (deps.warn ?? console.warn)(message);
     }
     const launched = readLaunchDecision(root);
     if (launched) logTickDecision(root, launched.verdict, launched.reason, launched.goalId);

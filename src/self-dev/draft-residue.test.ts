@@ -17,7 +17,7 @@ const input = { childRunId: runId, state: 'complete' as const, disposition: {
   prUrl: 'https://github.com/ElanvitalAI/elanous/pull/25437', checkedHeadCommit: 'a'.repeat(40),
 }, env: { ELANOUS_HARNESS_SEAT: 'TC' }, at: '2026-10-09T12:00:00Z' };
 const pr = (number: number, branch: string, body = '', labels: string[] = [], createdAt = '2026-10-08T00:00:00Z'): ResiduePr => ({
-  number, branch, body, labels, createdAt, title: `Goal ${number}`,
+  number, branch, body, labels, comments: [], createdAt, title: `Goal ${number}`, state: 'OPEN', isDraft: true, headSha: 'a'.repeat(40),
 });
 const fixture = (current = pr(25437, 'self-impl/main-goalid-abc123-new', '칸: CELL-A', [], '2026-10-09T00:00:00Z'), drafts: ResiduePr[] = []) => {
   const calls: string[] = [];
@@ -26,16 +26,470 @@ const fixture = (current = pr(25437, 'self-impl/main-goalid-abc123-new', '칸: C
     loadLedger: (id, path) => loadRunLedger(id, path),
     appendLedger: appendRunLedgerEntry,
     getPr: () => current, listOpenDrafts: () => drafts,
+    getAllComments: () => current.comments,
     addLabel: (_repo, n, label) => { calls.push(`add:${n}:${label}`); },
-    setLabels: (_repo, n, change) => { calls.push(`set:${n}:${change.add}`); },
-    comment: (_repo, n, body) => { calls.push(`comment:${n}:${body}`); },
+    setLabels: (_repo, n, change) => {
+      const draft = drafts.find((item) => item.number === n);
+      if (draft) draft.labels = [...draft.labels.filter((label) => !change.remove.includes(label)), ...(change.add ? [change.add] : [])];
+      calls.push(`set:${n}:${change.add}`);
+    },
+    comment: (_repo, n, body) => { calls.push(`comment:${n}:${body}`); if (n === current.number) current.comments = [...(current.comments ?? []), body]; },
     closePr: (_repo, n) => { calls.push(`close:${n}`); },
     listLiveBranches: () => new Set(), getRunStatus: () => 'failed',
   };
-  return { calls, dir, adapters, ctx: { ledgerRunId: runId, ledgerDir: dir, adapters }, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { calls, dir, adapters, current, drafts, ctx: { ledgerRunId: runId, ledgerDir: dir, adapters }, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+};
+const enableSameCardSupersession = (f: ReturnType<typeof fixture>) => {
+  f.current.body = '칸: CELL-A';
+  for (const draft of f.drafts) draft.body = '칸: CELL-A';
+  f.adapters.getPr = (number) => number === f.current.number ? f.current : f.drafts.find((draft) => draft.number === number);
+  f.adapters.listPrChangedPaths = () => ['src/example.ts'];
 };
 
 describe('Pod terminal residue', () => {
+  test('new code PR supersedes an ended same-card draft after checking both PR bodies', async () => {
+    const current = pr(200, 'self-impl/new-goalid-def456-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+    const old = pr(100, 'self-impl/old-goalid-abc123-run', '칸: CELL-A');
+    const f = fixture(current, [old]);
+    f.adapters.getPr = (number) => number === 200 ? current : old;
+    f.adapters.listPrChangedPaths = () => ['docs/goals/GOAL.md', 'src/example.ts'];
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect(await applyPodTerminal(record, f.ctx)).toMatchObject({ status: 'recorded' });
+      expect(f.calls.filter((call) => /^(set|close):100/.test(call))).toEqual(['close:100', 'set:100:elanous:superseded']);
+      expect(f.calls.some((call) => call.includes('old goalid=abc123; new goalid=def456'))).toBe(true);
+      expect(await applyPodTerminal(record, f.ctx)).toMatchObject({ status: 'skipped', reason: 'already-recorded' });
+      expect(f.calls.filter((call) => call === 'close:100')).toHaveLength(1);
+    } finally { f.cleanup(); }
+  });
+
+  test('without goalid branches, the supersession comment preserves both observed 골 ID lines', async () => {
+    const current = pr(200, 'self-impl/new-run', '칸: CELL-A\n골 ID: NEW-2', [], '2026-10-09T00:00:00Z');
+    const old = pr(100, 'self-impl/old-run', '칸: CELL-A\n골 ID: OLD-1');
+    const f = fixture(current, [old]);
+    f.adapters.getPr = (number) => number === 200 ? current : old;
+    f.adapters.listPrChangedPaths = () => ['src/example.ts'];
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('recorded');
+      expect(f.calls.some((call) => call.includes('old goalid=OLD-1; new goalid=NEW-2'))).toBe(true);
+    } finally { f.cleanup(); }
+  });
+
+  test('blank or duplicate card markers on either PR never identify a same-card draft', async () => {
+    for (const malformed of ['칸:\nCELL-A', '칸: CELL-A\n칸: OTHER-CARD', '칸: CELL-A\n칸: CELL-A']) {
+      for (const side of ['new', 'old'] as const) {
+        const current = pr(200, 'self-impl/new-run', side === 'new' ? malformed : '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+        const old = pr(100, 'self-impl/old-run', side === 'old' ? malformed : '칸: CELL-A');
+        const f = fixture(current, [old]);
+        f.adapters.getPr = (number) => number === 200 ? current : old;
+        f.adapters.listPrChangedPaths = () => ['src/example.ts'];
+        const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+          stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+        try {
+          await applyPodTerminal(record, f.ctx);
+          expect(f.calls).not.toContain('close:100');
+          expect(f.calls.some((call) => call.startsWith('set:100:'))).toBe(false);
+        } finally { f.cleanup(); }
+      }
+    }
+  });
+
+  test('a Dockerfile-only PR is code-bearing for same-card draft supersession', async () => {
+    const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+    const old = pr(100, 'self-impl/old-run', '칸: CELL-A');
+    const f = fixture(current, [old]);
+    f.adapters.getPr = (number) => number === 200 ? current : old;
+    f.adapters.listPrChangedPaths = () => ['docker/harness/Dockerfile'];
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('recorded');
+      expect(f.calls).toContain('close:100');
+    } finally { f.cleanup(); }
+  });
+
+  test('extensionless files do not supersede a draft without executable evidence', async () => {
+    for (const [path, closes] of [['scripts/deploy', false], ['scripts/notes', false], ['scripts/deploy.sh', true]] as const) {
+      const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+      const old = pr(100, 'self-impl/old-run', '칸: CELL-A');
+      const f = fixture(current, [old]);
+      f.adapters.getPr = (number) => number === 200 ? current : old;
+      f.adapters.listPrChangedPaths = () => [path];
+      const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+        stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+      try {
+        await applyPodTerminal(record, f.ctx);
+        expect(f.calls.includes('close:100')).toBe(closes);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  test('same card alone cannot supersede a live, claimed, or goal-only draft', async () => {
+    for (const [oldBranch, labels, files, runStatus] of [
+      ['self-impl/old-run', [], ['src/example.ts'], 'running'],
+      ['self-impl/old-run', ['elanous:running'], ['src/example.ts'], 'failed'],
+      ['self-impl/old-run', ['elanous:swept:harvest-claimed'], ['src/example.ts'], 'failed'],
+      ['self-impl/old-run', [], ['docs/goals/GOAL.md'], 'failed'],
+      ['self-impl/old-run', [], ['.gitignore', 'assets/logo.png'], 'failed'],
+    ] as const) {
+      const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+      const old = pr(100, oldBranch, '칸: CELL-A', [...labels]);
+      const f = fixture(current, [old]);
+      f.adapters.getPr = (number) => number === 200 ? current : old;
+      f.adapters.listPrChangedPaths = () => files;
+      f.adapters.getRunStatus = () => runStatus;
+      const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+        stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+      try {
+        await applyPodTerminal(record, f.ctx);
+        expect(f.calls.some((call) => /^(set|close):100/.test(call))).toBe(false);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  test('a prior run resumed before effects is never labelled or closed', async () => {
+    const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+    const old = pr(100, 'self-impl/old-run', '칸: CELL-A');
+    const f = fixture(current, [old]);
+    f.adapters.getPr = (number) => number === 200 ? current : old;
+    f.adapters.listPrChangedPaths = () => ['src/example.ts'];
+    let reads = 0;
+    f.adapters.getRunStatus = () => ++reads === 1 ? 'failed' : 'running';
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('skipped');
+      expect(f.calls.some((call) => /^(set|close):100/.test(call))).toBe(false);
+    } finally { f.cleanup(); }
+  });
+
+  test('a changed previous PR head before close preserves its branch and draft', async () => {
+    const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+    const old = pr(100, 'self-impl/old-run', '칸: CELL-A');
+    const f = fixture(current, [old]);
+    let oldReads = 0;
+    f.adapters.getPr = (number) => number === 200 ? current : (++oldReads >= 2 ? { ...old, headSha: 'b'.repeat(40) } : old);
+    f.adapters.listPrChangedPaths = () => ['src/example.ts'];
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('skipped');
+      expect(f.calls.some((call) => call === 'close:100')).toBe(false);
+      expect(oldReads).toBeGreaterThanOrEqual(2);
+    } finally { f.cleanup(); }
+  });
+
+  test('a head race leaves no supersession marker and a later code PR can retry', async () => {
+    const first = pr(200, 'self-impl/first-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+    const second = pr(201, 'self-impl/second-run', '칸: CELL-A', [], '2026-10-10T00:00:00Z');
+    const old = pr(100, 'self-impl/old-run', '칸: CELL-A');
+    const f = fixture(first, [old]);
+    let oldReads = 0;
+    f.adapters.getPr = (number) => {
+      if (number === 100) return ++oldReads >= 2 ? { ...old, headSha: 'b'.repeat(40) } : old;
+      return number === 200 ? first : second;
+    };
+    f.adapters.listPrChangedPaths = () => ['src/example.ts'];
+    f.adapters.setLabels = (_repo, number, change) => {
+      old.labels = [...old.labels.filter((label) => !change.remove.includes(label)), change.add];
+      f.calls.push(`set:${number}:${change.add}`);
+    };
+    const terminal = (number: number, childRunId: string) => classifyPodTerminal({ ...input, childRunId,
+      disposition: { ...input.disposition, stage: 'pr-opened', ok: true, prNumber: number,
+        prUrl: `https://github.com/ElanvitalAI/elanous/pull/${number}` } });
+    try {
+      expect((await applyPodTerminal(terminal(200, runId), f.ctx)).status).toBe('skipped');
+      expect(old.labels).not.toContain('elanous:superseded');
+      expect(f.calls.some((call) => call.startsWith('comment:100:'))).toBe(false);
+      expect(f.calls).not.toContain('close:100');
+      old.headSha = 'b'.repeat(40);
+      expect((await applyPodTerminal(terminal(201, 'run-22222222-2222-2222-2222-222222222222'), f.ctx)).status).toBe('recorded');
+      expect(f.calls).toContain('close:100');
+    } finally { f.cleanup(); }
+  });
+
+  test('a close failure leaves no new supersession label, then retries and labels the closed draft', async () => {
+    const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+    const old = pr(100, 'self-impl/old-run', '칸: CELL-A');
+    const f = fixture(current, [old]);
+    f.adapters.getPr = (number) => number === 200 ? current : old;
+    f.adapters.listPrChangedPaths = () => ['src/example.ts'];
+    f.adapters.setLabels = (_repo, number, change) => {
+      old.labels = [...old.labels.filter((label) => !change.remove.includes(label)), ...(change.add ? [change.add] : [])];
+      f.calls.push(`set:${number}:${change.add}`);
+    };
+    let closes = 0;
+    f.adapters.closePr = (_repo, number) => {
+      f.calls.push(`close:${number}`);
+      if (++closes === 1) throw new Error('temporary close failure');
+    };
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('failed');
+      expect(f.calls.some((call) => call.startsWith('set:100:'))).toBe(false);
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('recorded');
+      expect(f.calls.filter((call) => call === 'close:100')).toHaveLength(2);
+      expect(f.calls.filter((call) => call === 'set:100:elanous:superseded')).toHaveLength(1);
+    } finally { f.cleanup(); }
+  });
+
+  test('a state label replaced by another run at close is not removed by supersession', async () => {
+    const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+    const old = pr(100, 'self-impl/old-run', '칸: CELL-A', ['elanous:stalled']);
+    const f = fixture(current, [old]);
+    f.adapters.getPr = (number) => number === 200 ? current : old;
+    f.adapters.listPrChangedPaths = () => ['src/example.ts'];
+    f.adapters.closePr = (_repo, number) => {
+      f.calls.push(`close:${number}`);
+      old.state = 'CLOSED';
+      old.labels = ['elanous:stalled']; // another writer set the same label after the pre-close read
+    };
+    f.adapters.setLabels = (_repo, number, change) => {
+      expect(old.state).toBe('CLOSED');
+      expect(change.remove).toEqual([]);
+      old.labels = [...old.labels.filter((label) => !change.remove.includes(label)), change.add];
+      f.calls.push(`set:${number}:${change.add}`);
+    };
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('recorded');
+      expect(old.labels).toEqual(['elanous:stalled', 'elanous:superseded']);
+      expect(f.calls).toContain('close:100');
+    } finally { f.cleanup(); }
+  });
+
+  test('a new head or harvest claim during the supersession comment restores the label and leaves the draft open', async () => {
+    for (const change of ['head', 'claim'] as const) {
+      const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+      const old = pr(100, 'self-impl/old-run', '칸: CELL-A');
+      const f = fixture(current, [old]);
+      f.adapters.listOpenDrafts = () => [{ ...old, labels: [...old.labels] }];
+      f.adapters.getPr = (number) => number === 200 ? current : old;
+      f.adapters.listPrChangedPaths = () => ['src/example.ts'];
+      f.adapters.setLabels = (_repo, number, update) => {
+        old.labels = [...old.labels.filter((label) => !update.remove.includes(label)), ...(update.add ? [update.add] : [])];
+        f.calls.push(`set:${number}:${update.add}`);
+      };
+      f.adapters.comment = (_repo, number, body) => {
+        f.calls.push(`comment:${number}:${body}`);
+        if (number === 100 && body.includes('superseded-by')) {
+          if (change === 'head') old.headSha = 'b'.repeat(40);
+          else old.labels = [...old.labels, 'elanous:swept:harvest-claimed'];
+        }
+      };
+      const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+        stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+      try {
+        expect((await applyPodTerminal(record, f.ctx)).status).toBe('skipped');
+        expect(f.calls).not.toContain('close:100');
+        expect(old.labels).not.toContain('elanous:superseded');
+        expect(f.calls.some((call) => call.includes('supersession by #200 deferred'))).toBe(true);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  test('a pre-existing superseded label from another run survives this run losing its close race', async () => {
+    const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+    const old = pr(100, 'self-impl/old-run', '칸: CELL-A', ['elanous:superseded']);
+    const f = fixture(current, [old]);
+    f.adapters.listOpenDrafts = () => [{ ...old, labels: [...old.labels] }];
+    f.adapters.getPr = (number) => number === 200 ? current : old;
+    f.adapters.listPrChangedPaths = () => ['src/example.ts'];
+    f.adapters.comment = (_repo, number, body) => {
+      f.calls.push(`comment:${number}:${body}`);
+      if (number === 100 && body.includes('superseded-by')) old.headSha = 'b'.repeat(40);
+    };
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      // A previous attempt can have recorded this effect, compensated it, then another run
+      // added the same label. The effect row cannot prove ownership in this attempt.
+      appendRunLedgerEntry({ runId, event: 'pr-terminal-effect', data: {
+        childRunId: record.childRunId, effect: 'superseded-label', number: 100 } }, f.dir);
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('skipped');
+      expect(f.calls).not.toContain('close:100');
+      expect(f.calls.some((call) => call.startsWith('set:100:'))).toBe(false);
+      expect(old.labels).toContain('elanous:superseded');
+    } finally { f.cleanup(); }
+  });
+
+  test('a label added after the draft inventory is not claimed or restored by this run', async () => {
+    for (const added of ['elanous:superseded', 'elanous:swept:harvest-claimed']) {
+      const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+      const old = pr(100, 'self-impl/old-run', '칸: CELL-A');
+      const f = fixture(current, [old]);
+      let oldReads = 0;
+      f.adapters.listOpenDrafts = () => [{ ...old, labels: [] }];
+      f.adapters.getPr = (number) => {
+        if (number === 200) return current;
+        if (++oldReads === 3) old.labels = [...old.labels, added];
+        return old;
+      };
+      f.adapters.listPrChangedPaths = () => ['src/example.ts'];
+      f.adapters.comment = (_repo, number, body) => {
+        f.calls.push(`comment:${number}:${body}`);
+        if (number === 100 && body.includes('superseded-by')) old.headSha = 'b'.repeat(40);
+      };
+      const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+        stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+      try {
+        expect((await applyPodTerminal(record, f.ctx)).status).toBe('skipped');
+        expect(f.calls).not.toContain('close:100');
+        expect(f.calls.some((call) => call.startsWith('set:100:'))).toBe(false);
+        expect(old.labels).toContain(added);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  test('a competing superseded label during the post-close write is never removed on write failure', async () => {
+    const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+    const old = pr(100, 'self-impl/old-run', '칸: CELL-A');
+    const f = fixture(current, [old]);
+    enableSameCardSupersession(f);
+    f.adapters.setLabels = (_repo, number) => {
+      old.labels = [...old.labels, 'elanous:superseded'];
+      f.calls.push(`set:${number}:failed`);
+      throw new Error('concurrent label write');
+    };
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('recorded');
+      expect(f.calls.filter((call) => call.startsWith('set:100:'))).toEqual(['set:100:failed']);
+      expect(f.calls).toContain('close:100');
+      expect(old.labels).toContain('elanous:superseded');
+      expect((await applyPodTerminal(record, f.ctx)).reason).toBe('already-recorded');
+    } finally { f.cleanup(); }
+  });
+
+  test('a new PR head moving during the final post-effect diff read leaves the old draft open', async () => {
+    const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+    const old = pr(100, 'self-impl/old-run', '칸: CELL-A');
+    const f = fixture(current, [old]);
+    let moved = false;
+    let diffReads = 0;
+    f.adapters.getPr = (number) => number === 100 ? old : moved ? { ...current, headSha: 'b'.repeat(40) } : current;
+    f.adapters.listPrChangedPaths = () => { if (++diffReads === 3) moved = true; return ['src/example.ts']; };
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('skipped');
+      expect(diffReads).toBe(3);
+      expect(f.calls).not.toContain('close:100');
+      expect(old.labels).not.toContain('elanous:superseded');
+    } finally { f.cleanup(); }
+  });
+
+  test('a lookup error after the supersession comment compensates its label and retries', async () => {
+    const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+    const old = pr(100, 'self-impl/old-run', '칸: CELL-A');
+    const f = fixture(current, [old]);
+    let interrupted = false;
+    f.adapters.getPr = (number) => {
+      if (number === 200) return current;
+      if (!interrupted && f.calls.some((call) => call.startsWith('comment:100:Draft residue: superseded-by'))) {
+        interrupted = true;
+        throw new Error('temporary GitHub lookup failure');
+      }
+      return old;
+    };
+    f.adapters.listPrChangedPaths = () => ['src/example.ts'];
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('failed');
+      expect(f.calls).not.toContain('close:100');
+      expect(old.labels).not.toContain('elanous:superseded');
+      expect(f.calls.some((call) => call.includes('supersession by #200 deferred after an interrupted check'))).toBe(true);
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('recorded');
+      expect(f.calls).toContain('close:100');
+    } finally { f.cleanup(); }
+  });
+
+  test('an unobserved previous PR head never receives a supersede label or close', async () => {
+    const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+    const old = { ...pr(100, 'self-impl/old-run', '칸: CELL-A'), headSha: undefined };
+    const f = fixture(current, [old]);
+    f.adapters.getPr = (number) => number === 200 ? current : old;
+    f.adapters.listPrChangedPaths = () => ['src/example.ts'];
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      await applyPodTerminal(record, f.ctx);
+      expect(f.calls.some((call) => /^(set|close):100/.test(call))).toBe(false);
+    } finally { f.cleanup(); }
+  });
+
+  test('a new PR head change before, after, or after measuring files never closes the prior draft', async () => {
+    for (const changeAt of [2, 3, 4]) {
+      const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+      const old = pr(100, 'self-impl/old-run', '칸: CELL-A');
+      const f = fixture(current, [old]);
+      let currentReads = 0;
+      f.adapters.getPr = (number) => number === 100 ? old
+        : (++currentReads >= changeAt ? { ...current, headSha: 'b'.repeat(40) } : current);
+      f.adapters.listPrChangedPaths = () => ['src/example.ts'];
+      const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+        stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+      try {
+        expect((await applyPodTerminal(record, f.ctx)).status).toBe('skipped');
+        expect(f.calls).not.toContain('close:100');
+      } finally { f.cleanup(); }
+    }
+  });
+
+  test('a moved base that removes code from the new PR diff preserves the previous draft', async () => {
+    const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+    const old = pr(100, 'self-impl/old-run', '칸: CELL-A');
+    const f = fixture(current, [old]);
+    f.adapters.getPr = (number) => number === 200 ? current : old;
+    let diffReads = 0;
+    f.adapters.listPrChangedPaths = () => ++diffReads === 1 ? ['src/example.ts', 'docs/goals/GOAL.md'] : ['docs/goals/GOAL.md'];
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('skipped');
+      expect(diffReads).toBe(2);
+      expect(f.calls).not.toContain('close:100');
+    } finally { f.cleanup(); }
+  });
+
+  test('a new PR head moving during the final diff read cannot close the previous draft', async () => {
+    const current = pr(200, 'self-impl/new-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+    const old = pr(100, 'self-impl/old-run', '칸: CELL-A');
+    const f = fixture(current, [old]);
+    let moved = false;
+    f.adapters.getPr = (number) => number === 200 && moved ? { ...current, headSha: 'b'.repeat(40) } : number === 200 ? current : old;
+    let diffReads = 0;
+    f.adapters.listPrChangedPaths = () => { if (++diffReads === 2) moved = true; return ['src/example.ts']; };
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('skipped');
+      expect(diffReads).toBe(2);
+      expect(f.calls).not.toContain('close:100');
+    } finally { f.cleanup(); }
+  });
+
+  test('a new PR without a card line cannot supersede by matching goal ID alone', async () => {
+    const current = pr(200, 'self-impl/new-goalid-abc123-run', '', [], '2026-10-09T00:00:00Z');
+    const old = pr(100, 'self-impl/old-goalid-abc123-run', '칸: CELL-A');
+    const f = fixture(current, [old]);
+    f.adapters.getPr = (number) => number === 200 ? current : old;
+    f.adapters.listPrChangedPaths = () => ['src/example.ts'];
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('recorded');
+      expect(f.calls).not.toContain('close:100');
+    } finally { f.cleanup(); }
+  });
+
   test('records the failed PR once, marks it harvestable with its owner, and skips a second call', async () => {
     const f = fixture();
     const events: Array<{ event: string; data: Record<string, unknown> }> = [];
@@ -49,13 +503,50 @@ describe('Pod terminal residue', () => {
       expect(loadRunLedger(runId, f.dir)?.filter((row) => row.event === 'pr-terminal')).toEqual([
         expect.objectContaining({ data: expect.objectContaining({ ...record }) }),
       ]);
-      expect(f.calls).toEqual([`add:25437:elanous:harvestable`, expect.stringContaining('comment:25437:Draft residue: failed-with-pr · owner=TC(seat)')]);
+      expect(f.calls).toEqual([`add:25437:elanous:harvestable`, expect.stringContaining('comment:25437:Draft residue: failed-with-pr · owner=TC(seat)'),
+        expect.stringContaining('comment:25437:Draft residue: failed-run recovery')]);
+      expect(f.calls.some((call) => call === 'close:25437')).toBe(false);
       const count = f.calls.length;
       expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'skipped', reason: 'already-recorded' });
       expect(f.calls).toHaveLength(count);
       expect(loadRunLedger(runId, f.dir)?.filter((row) => row.event === 'pr-terminal')).toHaveLength(1);
       expect(events.filter((row) => row.event === 'skipped' && row.data.reason === 'already-recorded')).toHaveLength(1);
     } finally { off(); f.cleanup(); }
+  });
+
+  test('a changed head, missing branch, failed lookup or landing claim leaves the restoration pointer pending', async () => {
+    for (const change of ['head', 'claim', 'ready', 'empty-branch', 'lookup-error'] as const) {
+      const current = pr(25437, 'self-impl/main-goalid-abc123-new', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+      const f = fixture(current);
+      try {
+        let reads = 0;
+        if (change === 'claim') current.comments = ['landing-verified: #25437'];
+        f.adapters.getPr = () => {
+          reads++;
+          if (reads === 1 || change === 'claim') return current;
+          if (change === 'lookup-error') throw new Error('transient GitHub lookup');
+          if (change === 'head') return { ...current, headSha: 'b'.repeat(40) };
+          if (change === 'empty-branch') return { ...current, branch: '' };
+          return { ...current, isDraft: false };
+        };
+        expect(await applyPodTerminal(classifyPodTerminal(input), f.ctx)).toEqual({ status: 'skipped', reason: 'restore-unverified' });
+        expect(reads).toBeGreaterThanOrEqual(2);
+        expect(f.calls.some((call) => call.includes('failed-run recovery'))).toBe(false);
+        expect(f.calls.some((call) => call === 'close:25437')).toBe(false);
+        expect(loadRunLedger(runId, f.dir)?.some((entry) => entry.event === 'pr-terminal-effect' && entry.data.effect === 'complete')).toBe(false);
+        expect(await replayPodTerminals({ ledgerDir: f.dir, adapters: f.adapters, repository: 'ElanvitalAI/elanous' }))
+          .toEqual({ attempted: 1, recovered: 0, pending: 1, unresolved: 0, closed: 0 });
+      } finally { f.cleanup(); }
+    }
+  });
+
+  test('an incomplete comment inventory cannot prove a landing claim is absent', async () => {
+    const f = fixture();
+    try {
+      f.adapters.getAllComments = () => undefined;
+      expect(await applyPodTerminal(classifyPodTerminal(input), f.ctx)).toEqual({ status: 'skipped', reason: 'restore-unverified' });
+      expect(f.calls.some((call) => call.includes('failed-run recovery'))).toBe(false);
+    } finally { f.cleanup(); }
   });
 
   test('distinguishes landed, open, no PR and unobserved result; seat, card and unknown owners', async () => {
@@ -148,7 +639,7 @@ describe('Pod terminal residue', () => {
     } finally { f.cleanup(); }
   });
 
-  test('supersedes only older verified same-goal drafts, labels before closing, and respects protected, unrelated and card-only PRs', async () => {
+  test('a card-marked new PR leaves old drafts without that exact card marker untouched', async () => {
     const current = pr(200, 'self-impl/new-goalid-abc123-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
     const f = fixture(current, [
       pr(100, 'self-impl/x-goalid-abc123-old'), pr(101, 'self-impl/y-goalid-beef12-old'),
@@ -157,12 +648,9 @@ describe('Pod terminal residue', () => {
     ]);
     try {
       const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
-      expect((await applyPodTerminal(record, f.ctx)).status).toBe('recorded');
-      expect(f.calls.filter((call) => /^(set|close):/.test(call))).toEqual([
-        'set:100:elanous:superseded', 'close:100',
-      ]);
-      expect(f.calls.filter((call) => call.includes('superseded-by #200'))).toHaveLength(1);
-      // review must-fix: a shared «칸:» value (#103 has no goal id) is not the same goal — it must not be closed.
+      expect((await applyPodTerminal(record, f.ctx)).status).toBe('skipped');
+      expect(f.calls.filter((call) => /^(set|close):/.test(call))).toEqual([]);
+      // Old #100 has a matching goal ID but no card marker; #103 has the card marker but no measured code diff.
       expect(f.calls.some((call) => /:(101|102|103)(:|$)/.test(call))).toBe(false);
     } finally { f.cleanup(); }
   });
@@ -192,14 +680,15 @@ describe('Pod terminal residue', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  test('a landed newer PR still supersedes an older same-goal draft without harvestable marking', async () => {
+  test('a landed newer code PR still supersedes an ended same-card draft without harvestable marking', async () => {
     const current = pr(200, 'self-impl/new-goalid-abc123-run', '', [], '2026-10-09T00:00:00Z');
     const f = fixture(current, [pr(100, 'self-impl/old-goalid-abc123-run')]);
+    enableSameCardSupersession(f);
     try {
       const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition, merged: true,
         prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
       expect((await applyPodTerminal(record, f.ctx)).status).toBe('recorded');
-      expect(f.calls.filter((call) => /^(set|close):/.test(call))).toEqual(['set:100:elanous:superseded', 'close:100']);
+      expect(f.calls.filter((call) => /^(set|close):/.test(call))).toEqual(['close:100', 'set:100:elanous:superseded']);
       expect(f.calls.some((call) => call.includes('harvestable'))).toBe(false);
     } finally { f.cleanup(); }
   });
@@ -217,36 +706,40 @@ describe('Pod terminal residue', () => {
     } finally { f.cleanup(); }
   });
 
-  test('resumes after a partial GitHub failure without duplicating successful effects or the terminal fact', async () => {
-    const f = fixture(pr(200, 'self-impl/new-goalid-abc123-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z'),
-      [pr(100, 'self-impl/old-goalid-abc123-run')]);
+  test('compensates a partial GitHub failure and resumes without duplicating the terminal fact', async () => {
+    const current = pr(200, 'self-impl/new-goalid-abc123-run', '칸: CELL-A', [], '2026-10-09T00:00:00Z');
+    const old = pr(100, 'self-impl/old-goalid-abc123-run', '칸: CELL-A');
+    const f = fixture(current, [old]);
     const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
       prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
     try {
+      f.adapters.getPr = (number) => number === 200 ? current : old;
+      f.adapters.listPrChangedPaths = () => ['src/example.ts'];
       const close = f.adapters.closePr;
       f.adapters.closePr = () => { throw new Error('transient close'); };
       expect(await applyPodTerminal(record, f.ctx)).toMatchObject({ status: 'failed', step: 'close-pr' });
-      expect(f.calls.filter((call) => call.startsWith('set:100:'))).toHaveLength(1);
+      expect(f.calls.filter((call) => call.startsWith('set:100:'))).toHaveLength(0);
       f.adapters.closePr = close;
       expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'recorded' });
       expect(f.calls.filter((call) => call.startsWith('add:200:'))).toHaveLength(1);
-      expect(f.calls.filter((call) => call.startsWith('comment:200:'))).toHaveLength(1);
+      expect(f.calls.filter((call) => call.startsWith('comment:200:'))).toHaveLength(2);
       expect(f.calls.filter((call) => call.startsWith('set:100:'))).toHaveLength(1);
-      expect(f.calls.filter((call) => call.startsWith('comment:100:'))).toHaveLength(1);
+      expect(f.calls.filter((call) => call.startsWith('comment:100:'))).toHaveLength(2);
+      expect(old.labels).toContain('elanous:superseded');
       expect(f.calls.filter((call) => call.startsWith('close:100'))).toHaveLength(1);
       expect(loadRunLedger(runId, f.dir)?.filter((row) => row.event === 'pr-terminal')).toHaveLength(1);
       expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'skipped', reason: 'already-recorded' });
     } finally { f.cleanup(); }
   });
 
-  test('previous draft label and comment failures resume in order without repeating successful writes', async () => {
+  test('prior comment retries, while post-close label failure leaves the draft closed without removing a label', async () => {
     for (const failure of ['setLabels', 'comment'] as const) {
       const current = pr(200, 'self-impl/new-goalid-abc123-run', '', [], '2026-10-09T00:00:00Z');
       const f = fixture(current, [pr(100, 'self-impl/old-goalid-abc123-run')]);
+      enableSameCardSupersession(f);
       const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
         prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
       try {
-        f.adapters.getPr = (number) => number === 200 ? current : pr(100, 'self-impl/old-goalid-abc123-run');
         const original = f.adapters[failure];
         if (failure === 'comment') {
           const comment = f.adapters.comment;
@@ -257,12 +750,13 @@ describe('Pod terminal residue', () => {
         } else {
           f.adapters.setLabels = () => { throw new Error('transient prior label'); };
         }
-        expect((await applyPodTerminal(record, f.ctx)).status).toBe('failed');
+        expect((await applyPodTerminal(record, f.ctx)).status).toBe(failure === 'comment' ? 'failed' : 'recorded');
         (f.adapters as unknown as Record<string, unknown>)[failure] = original;
-        expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'recorded' });
+        expect(await applyPodTerminal(record, f.ctx)).toEqual(failure === 'comment'
+          ? { status: 'recorded' } : { status: 'skipped', reason: 'already-recorded' });
         expect(f.calls.filter((call) => call.startsWith('add:200:'))).toHaveLength(1);
-        expect(f.calls.filter((call) => call.startsWith('comment:200:'))).toHaveLength(1);
-        expect(f.calls.filter((call) => call.startsWith('set:100:'))).toHaveLength(1);
+        expect(f.calls.filter((call) => call.startsWith('comment:200:'))).toHaveLength(2);
+        expect(f.drafts[0]!.labels.includes('elanous:superseded')).toBe(failure === 'comment');
         expect(f.calls.filter((call) => call.startsWith('comment:100:'))).toHaveLength(1);
         expect(f.calls.filter((call) => call.startsWith('close:100'))).toHaveLength(1);
       } finally { f.cleanup(); }
@@ -285,7 +779,7 @@ describe('Pod terminal residue', () => {
       f.adapters.getPr = () => pr(25437, 'self-impl/main-goalid-abc123-new', '', ['elanous:harvestable'], '2026-10-09T00:00:00Z');
       expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'recorded' });
       expect(f.calls.filter((call) => call.startsWith('add:25437:'))).toHaveLength(1);
-      expect(f.calls.filter((call) => call.startsWith('comment:25437:'))).toHaveLength(1);
+      expect(f.calls.filter((call) => call.startsWith('comment:25437:'))).toHaveLength(2);
     } finally { f.cleanup(); }
   });
 
@@ -300,7 +794,7 @@ describe('Pod terminal residue', () => {
         (f.adapters as unknown as Record<string, unknown>)[failure] = original;
         expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'recorded' });
         expect(f.calls.filter((call) => call.startsWith('add:25437:'))).toHaveLength(1);
-        expect(f.calls.filter((call) => call.startsWith('comment:25437:'))).toHaveLength(1);
+        expect(f.calls.filter((call) => call.startsWith('comment:25437:'))).toHaveLength(2);
         expect(loadRunLedger(runId, f.dir)?.filter((row) => row.event === 'pr-terminal')).toHaveLength(1);
       } finally { f.cleanup(); }
     }
@@ -308,7 +802,8 @@ describe('Pod terminal residue', () => {
 
   test('does not strip a running draft or close it when liveness or run status cannot be verified', async () => {
     const f = fixture(pr(200, 'self-impl/new-goalid-abc123-run', '', [], '2026-10-09T00:00:00Z'),
-      [pr(100, 'self-impl/old-goalid-abc123-run', '', ['elanous:running'])]);
+      [pr(100, 'self-impl/old-goalid-abc123-run')]);
+    enableSameCardSupersession(f);
     const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
       prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
     try {
@@ -326,7 +821,7 @@ describe('Pod terminal residue', () => {
       expect(f.calls.filter((call) => /^(set|close):100/.test(call))).toHaveLength(0);
       f.adapters.getRunStatus = () => 'failed';
       expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'recorded' });
-      expect(f.calls.filter((call) => /^(set|close):100/.test(call))).toEqual(['set:100:elanous:superseded', 'close:100']);
+      expect(f.calls.filter((call) => /^(set|close):100/.test(call))).toEqual(['close:100', 'set:100:elanous:superseded']);
     } finally { f.cleanup(); }
   });
 
@@ -360,6 +855,7 @@ describe('Pod terminal residue', () => {
     const current = pr(200, 'self-impl/new-goalid-abc123-run', '', [], '2026-10-09T00:00:00Z');
     const drafts = Array.from({ length: 12 }, (_, i) => pr(i + 1, `self-impl/old-goalid-abc123-${i}`));
     const f = fixture(current, drafts);
+    enableSameCardSupersession(f);
     try {
       const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
       expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'skipped', reason: 'close-cap' });
@@ -381,6 +877,7 @@ describe('Pod terminal residue', () => {
     const current = pr(200, 'self-impl/new-goalid-abc123-run', '', [], '2026-10-09T00:00:00Z');
     const drafts = Array.from({ length: 3 }, (_, i) => pr(i + 1, `self-impl/old-goalid-abc123-${i}`));
     const f = fixture(current, drafts);
+    enableSameCardSupersession(f);
     try {
       const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
       appendRunLedgerEntry({ runId, event: 'pr-terminal', data: { ...record } }, f.dir);
@@ -524,9 +1021,10 @@ describe('Pod terminal residue', () => {
       expect(loadRunLedger(runId, f.dir)?.filter((row) => row.event === 'pr-terminal')).toHaveLength(1);
       f.adapters.addLabel = add;
       await tick();
-      expect(f.calls).toEqual([`add:25437:elanous:harvestable`, expect.stringContaining('comment:25437:Draft residue:')]);
+      expect(f.calls).toEqual([`add:25437:elanous:harvestable`, expect.stringContaining('comment:25437:Draft residue:'),
+        expect.stringContaining('comment:25437:Draft residue: failed-run recovery')]);
       await tick();
-      expect(f.calls).toHaveLength(2);
+      expect(f.calls).toHaveLength(3);
       expect(loadRunLedger(runId, f.dir)?.filter((row) => row.event === 'pr-terminal')).toHaveLength(1);
       expect(writes).toHaveLength(3);
     } finally { f.cleanup(); process.exitCode = 0; }
@@ -536,6 +1034,7 @@ describe('Pod terminal residue', () => {
     const current = pr(200, 'self-impl/new-goalid-abc123-run', '', [], '2026-10-09T00:00:00Z');
     const old = pr(100, 'self-impl/old-goalid-abc123-run');
     const f = fixture(current, [old]);
+    enableSameCardSupersession(f);
     const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
       prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
     let status: string | undefined;
@@ -569,7 +1068,7 @@ describe('Pod terminal residue', () => {
       expect(f.calls.filter((call) => /^(set|close):100/.test(call))).toHaveLength(0);
       status = 'failed';
       await tick();
-      expect(f.calls.filter((call) => /^(set|close):100/.test(call))).toEqual(['set:100:elanous:superseded', 'close:100']);
+      expect(f.calls.filter((call) => /^(set|close):100/.test(call))).toEqual(['close:100', 'set:100:elanous:superseded']);
       const after = probes;
       await tick();
       expect(probes).toBe(after);
@@ -643,6 +1142,7 @@ describe('Pod terminal residue', () => {
   test('Pod terminal → host ledger → replay closes the older Pod draft: its own pr-terminal proves its run ended (review r5)', async () => {
     const current = pr(200, 'self-impl/new-goalid-abc123-run', '', [], '2026-10-09T00:00:00Z');
     const f = fixture(current, [pr(100, 'self-impl/old-goalid-abc123-run')]);
+    enableSameCardSupersession(f);
     try {
       // The older Pod run left only a pr-terminal on the host (no pr-opened) — the realistic Pod shape.
       const older = classifyPodTerminal({ ...input, childRunId: 'run-older', disposition: { ...input.disposition, prNumber: 100, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/100' } });
@@ -739,6 +1239,25 @@ describe('Pod terminal residue', () => {
       expect(failed.disposition?.stage).toBe(good.disposition?.stage);
       expect(events.filter((row) => row.event === 'failed' && row.data.reason === 'test hook failed')).toHaveLength(1);
     } finally { off(); }
+  });
+
+  test('default comment reader requires complete paginated issue comments', async () => {
+    const binDir = mkdtempSync(join(tmpdir(), 'draft-residue-gh-comments-'));
+    writeFileSync(join(binDir, 'gh'), [
+      `#!${process.execPath}`,
+      `if (!process.argv.includes('--paginate') || !process.argv.includes('--slurp')) process.exit(4);`,
+      `process.stdout.write(JSON.stringify([[{ body: 'owner' }], [{ body: 'landing-verified: #25437' }]]));`,
+    ].join('\n'));
+    chmodSync(join(binDir, 'gh'), 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${binDir}${previousPath ? `:${previousPath}` : ''}`;
+    try {
+      expect(await defaultAdapters().getAllComments?.('ElanvitalAI/elanous', 25437))
+        .toEqual(['owner', 'landing-verified: #25437']);
+    } finally {
+      process.env.PATH = previousPath;
+      rmSync(binDir, { recursive: true, force: true });
+    }
   });
 
   test('default adapter lists hundreds of open drafts carrying large bodies across paginated gh pages — no spawnSync ENOBUFS (DRAFT-RESIDUE-ENOBUFS)', async () => {

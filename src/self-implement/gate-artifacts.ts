@@ -55,6 +55,8 @@ export interface GateArtifactShard {
   files: string[];
   current: GateArtifactRun;
   baseline: GateArtifactRun;
+  /** Latest incomplete attempt only; the verdict remains unmeasured. */
+  unmeasuredReason?: string;
 }
 
 /** SIDE-VERIFY ③ — 판정 «정수»(OPT 열차 영수증 재료). 이름은 게이트 집계(`SelfGateCliResult.baseline` ·
@@ -87,6 +89,8 @@ export interface GateArtifactSummary extends GateArtifactCounts {
   /** 정수 칸 중 하나라도 null 일 때만 — 왜 못 셌나(한 줄). */
   countsUnavailableReason?: string;
   unmeasuredReason?: string;
+  /** Per-shard cause even when no process attempt was recorded. */
+  unmeasuredByShard?: Record<string, string>;
   /** 분할 없는 경로의 지금 쪽 `bun test` 종료 코드(그 경로엔 JUnit 이 없어 shardsDetail 이 비다). */
   unshardedRc?: number | null;
   artifactsUnavailable?: GateArtifactsUnavailable;
@@ -198,7 +202,12 @@ export function writeGateArtifacts(input: GateArtifactInput): { summaryPath: str
       writeFileSync(run.resultPath, runResultBody(run));
       return run;
     };
-    shardsDetail.push({ shardId: attempt.shardId, attempt: attempt.attempt, files, current: side('current'), baseline: side('baseline') });
+    shardsDetail.push({
+      shardId: attempt.shardId, attempt: attempt.attempt, files, current: side('current'), baseline: side('baseline'),
+      ...(input.sharded?.unmeasuredByShard?.[attempt.shardId] !== undefined
+        && attempt === input.sharded.attempts.filter((item) => item.shardId === attempt.shardId).at(-1)
+        ? { unmeasuredReason: input.sharded.unmeasuredByShard[attempt.shardId] } : {}),
+    });
   }
   const counts = input.counts ?? NULL_GATE_ARTIFACT_COUNTS;
   const summary: GateArtifactSummary = {
@@ -219,6 +228,7 @@ export function writeGateArtifacts(input: GateArtifactInput): { summaryPath: str
     ...(Object.values(counts).some((value) => value === null)
       ? { countsUnavailableReason: input.countsUnavailableReason ?? 'not recorded' } : {}),
     ...(input.unmeasuredReason !== undefined ? { unmeasuredReason: input.unmeasuredReason } : {}),
+    ...(input.sharded?.unmeasuredByShard !== undefined ? { unmeasuredByShard: input.sharded.unmeasuredByShard } : {}),
     ...(input.unshardedRc !== undefined ? { unshardedRc: input.unshardedRc } : {}),
     ...(input.artifactsUnavailable !== undefined ? { artifactsUnavailable: input.artifactsUnavailable } : {}),
   };
@@ -252,16 +262,17 @@ export function writeRemoteUnavailableGateArtifacts(
 
 // ── 원격 산출 회수 (SIDE-VERIFY-GATE-SHARDS ②) ──────────────────────────────
 // 원격 run 은 `$W` 임시 트리에서 돌고 끝나면 trap 이 `$W` 를 지운다(gate-remote.ts remoteScript). 그래서 원격 쪽
-// `--artifact-dir` 는 `$W` «밖»의 절대 경로(/tmp/elanous-gate-artifacts-<nonce>)로 준다 — run 이 끝나도 남고, 회수
+// `--artifact-dir` 는 `$W` «밖»의 호스트 디스크 경로(/var/tmp/elanous-gate-artifacts-<nonce>)로 준다 — run 이 끝나도 남고, 회수
 // ssh 가 읽은 뒤 지운다. 회수 프로토콜은 tar 없이 «이름 줄 · base64 한 줄» 쌍 ⊕ 끝 표지(잘림 판별).
 
-export const REMOTE_ARTIFACT_PREFIX = '/tmp/elanous-gate-artifacts-';
+export const REMOTE_ARTIFACT_PREFIX = '/var/tmp/elanous-gate-artifacts-';
 const FETCH_END = '__GATE_ARTIFACTS_END__';
 /** 다 보냈지만 원격 dir 을 못 지웠다 — 회수는 성공, 잔여는 경고로 드러낸다(조용히 남기지 않는다). */
 const FETCH_END_KEPT = '__GATE_ARTIFACTS_END_KEPT__';
 const FETCH_MISSING = '__GATE_ARTIFACTS_MISSING__';
 const FETCH_READ_FAILED = '__GATE_ARTIFACTS_READ_FAILED__';
-const remoteDirPattern = /^\/tmp\/elanous-gate-artifacts-[0-9a-f]{8,64}$/;
+// Legacy `/tmp` receipts remain readable for in-flight runs; new paths use host disk `/var/tmp`.
+const remoteDirPattern = /^\/(?:var\/)?tmp\/elanous-gate-artifacts-[0-9a-f]{8,64}$/;
 const artifactNamePattern = /^[A-Za-z0-9._-]+$/;
 export const REMOTE_ARTIFACT_FETCH_TIMEOUT_MS = 5 * 60_000;
 

@@ -11,7 +11,7 @@ import type {
   Unsubscribe,
 } from '../../src/shell-runner/types.js';
 
-function fakeHandle(id: string = 'h'): ShellHandle & {
+function fakeHandle(id: string = 'h', mode: ShellHandle['mode'] = 'bg'): ShellHandle & {
   emitChunk: (c: OutputChunk) => void;
   emitStatus: (s: ShellStatus) => void;
 } {
@@ -22,7 +22,7 @@ function fakeHandle(id: string = 'h'): ShellHandle & {
   const result = new Promise<ShellResult>(() => { /* never */ });
   return {
     id,
-    mode: 'bg',
+    mode,
     get status() { return status; },
     bookmark,
     kill() { /* noop */ },
@@ -71,6 +71,38 @@ describe('BackgroundSurface', () => {
     expect(snap.total).toBe(2);
     expect(snap.running).toBe(1);
     expect(snap.backgrounded).toBe(1);
+  });
+
+  test('TUI-BG-JOB-VISIBILITY — background = 살아 있는 bg 모드 ⊕ backgrounded · 끝나면 0', () => {
+    const surf = createBackgroundSurface({ retainCompletedMs: 0 });
+    const job = fakeHandle('job', 'bg');
+    surf.track(job);
+    expect(surf.snapshot().background).toBe(1);
+    job.emitStatus('completed');
+    expect(surf.snapshot().background).toBe(0);
+  });
+
+  test('TUI-BG-JOB-VISIBILITY — 인라인(전경) 실행은 background 로 안 센다 · 뒤로 보내면 센다', () => {
+    const surf = createBackgroundSurface();
+    const inline = fakeHandle('in', 'inline');
+    surf.track(inline);
+    let snap = surf.snapshot();
+    expect(snap.running).toBe(1);
+    expect(snap.background).toBe(0);
+    inline.emitStatus('backgrounded');
+    snap = surf.snapshot();
+    expect(snap.backgrounded).toBe(1);
+    expect(snap.background).toBe(1);
+    inline.emitStatus('killed');
+    expect(surf.snapshot().background).toBe(0);
+  });
+
+  test('TUI-BG-JOB-VISIBILITY — onUpdate 집계에 background 가 실린다', () => {
+    const seen: number[] = [];
+    const surf = createBackgroundSurface({ onUpdate: (r) => { seen.push(r.background); } });
+    surf.track(fakeHandle('a', 'bg'));
+    surf.track(fakeHandle('b', 'inline'));
+    expect(seen).toEqual([1, 1]);
   });
 
   test('duplicate track is ignored', () => {

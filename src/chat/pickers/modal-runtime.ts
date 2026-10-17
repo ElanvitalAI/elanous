@@ -146,6 +146,12 @@ export function createChatPickerModalRuntime(deps: ChatPickerModalRuntimeDeps): 
     getInputZoneHeight: deps.getInputZoneHeight,
     width: deps.getBounds().width,
     getWidth: () => deps.getBounds().width,
+    // TUI-PICKER-RESIZE-SHRINK — follow the live prompt row, not the
+    // row captured when the family was created (stale after resize).
+    getAnchor: () => {
+      const b = deps.getBounds();
+      return { row: b.row, col: b.col };
+    },
     onKey: makePickerOnKey(kind),
     onRowClick: makePickerOnRowClick(kind),
   });

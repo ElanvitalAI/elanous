@@ -57,7 +57,43 @@ export const AGENT_TOOL_DEFAULT_MAX_TURNS = 20;
 
 /** Hard ceiling regardless of caller-supplied max_turns. Prevents a
  *  pathological skill prompt from spawning 200-turn workers. */
-const AGENT_TOOL_TURNS_CEILING = 50;
+export const AGENT_TOOL_TURNS_CEILING = 50;
+
+/** Numeric ceiling on concurrent `run_in_background` Agent-tool fan-out.
+ *  Pure declaration — enforcement in dispatchAgent is the follow-up cell
+ *  TUI-AGENT-CAPS-WIRING (not wired here). */
+export const AGENT_TOOL_BACKGROUND_FANOUT_CEILING = 8;
+
+/** Clamp a caller-supplied `max_turns` onto `[1, AGENT_TOOL_TURNS_CEILING]`.
+ *  Non-finite / omitted values fall back to `AGENT_TOOL_DEFAULT_MAX_TURNS`. */
+export function resolveAgentToolMaxTurns(requested: unknown): number {
+  if (typeof requested === 'number' && Number.isFinite(requested)) {
+    return Math.max(1, Math.min(AGENT_TOOL_TURNS_CEILING, Math.floor(requested)));
+  }
+  return AGENT_TOOL_DEFAULT_MAX_TURNS;
+}
+
+/** Strip the Agent tool so nesting stays one level: children never see
+ *  Agent, so they cannot spawn grandchildren through this dispatcher. */
+export function stripAgentToolForOneLevelNesting<T extends { name: string }>(
+  tools: readonly T[],
+): T[] {
+  return tools.filter(t => t.name !== 'Agent');
+}
+
+/** Live `run_in_background` tasks occupy fan-out slots until they terminal.
+ *  Pure judgement — the ceiling check that uses it is TUI-AGENT-CAPS-WIRING. */
+export function countLiveBackgroundFanout(
+  tasks: ReadonlyArray<{ background?: boolean; state?: string }>,
+): number {
+  let n = 0;
+  for (const task of tasks) {
+    if (!task.background) continue;
+    if (task.state === 'done' || task.state === 'error' || task.state === 'aborted') continue;
+    n++;
+  }
+  return n;
+}
 
 /** Fallback agent when subagent_type is missing or unresolvable. The
  *  loader picks this up from src/agents/general-purpose.md — built
@@ -312,9 +348,7 @@ export async function dispatchAgent(
   // *stronger* models on spawn (e.g. upgrade mini → full, or lock
   // sub-agents to the parent's resolved model so a mis-configured
   // agent frontmatter can't weaken them).
-  const requestedMaxTurns = typeof args.max_turns === 'number' && Number.isFinite(args.max_turns)
-    ? Math.max(1, Math.min(AGENT_TOOL_TURNS_CEILING, Math.floor(args.max_turns)))
-    : AGENT_TOOL_DEFAULT_MAX_TURNS;
+  const requestedMaxTurns = resolveAgentToolMaxTurns(args.max_turns);
 
   // PFC-S1 P1: new optional fields.
   const runInBackground = args.run_in_background === true;
@@ -573,8 +607,7 @@ export async function dispatchAgent(
 
   // Strip the Agent tool itself from the sub-agent's available tools.
   // One level of nesting only — see file header rationale.
-  childTools = childTools
-    .filter(t => t.name !== 'Agent');
+  childTools = stripAgentToolForOneLevelNesting(childTools);
   // Wave 5 E1 — apply per-spawn tool_filter. Narrows the intersection
   // further (cannot widen the host's allowlist). When `allow` is
   // explicit-empty `[]`, the worker runs text-only.

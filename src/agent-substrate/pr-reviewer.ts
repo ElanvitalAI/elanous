@@ -656,7 +656,7 @@ const BARE_SENTINEL = new RegExp(String.raw`^${NONE_WORD}\s*[.。]?$`, 'i');
 // 괄호 전체만 검사한다. 중간에 "no blockers" 가 있어도 뒤에 지적이 이어지면 버리지 않는다.
 const BRACKETED_PLACEHOLDER = /^[（(]\s*([\s\S]*?)\s*[）)]$/;
 const PLACEHOLDER_ONLY = /^(?:없음|해당\s*없음|none|n\/a|no\s+blockers?)$/i;
-const PLACEHOLDER_END = /(?:블로커|차단)\s*없음$|no\s+blockers?$/i;
+const PLACEHOLDER_END = /(?:블로커|차단)(?:\s*(?:수준의?\s*)?(?:결함|문제|이슈|지적))?\s*없음$|no\s+blockers?$/i;
 function isBracketedPlaceholder(text: string): boolean {
   const bracketed = BRACKETED_PLACEHOLDER.exec(text);
   if (!bracketed) return false;
@@ -670,6 +670,8 @@ const BRACKETED_SENTINEL = new RegExp(String.raw`^[([（【]\s*${NONE_WORD}(?:\s
 // ⭐ 설명 «전체»가 「지적 없음」 한 문장일 때만 — 일부만 맞아도 접으면 `(none: no blockers are checked because …)` 같은 지적이 사라진다.
 const NO_FINDING_REMARK = new RegExp([
   String.raw`^(?:(?:블로커|차단)\s*)?(?:수준의?\s*)?(?:결함|문제|이슈|지적|블로커)(?:은|는|이|가)?\s*(?:발견되지\s*않(?:음|았(?:다|습니다)?)|없(?:음|다|습니다))[.。]?$`,
+  // REVIEW-MUSTFIX-NONE-PARSE — `(없음 — 이 조각 범위에서는 차단 결함 없음)` 꼬리.
+  String.raw`^(?:이\s*)?(?:조각\s*)?범위(?:에서는|에서|엔)?\s*(?:블로커|차단)(?:\s*(?:수준의?\s*)?(?:결함|문제|이슈|지적))?\s*없(?:음|다|습니다)[.。]?$`,
   String.raw`^(?:no|zero)\s+(?:blocking\s+)?(?:blockers?|issues?|problems?|findings?|must-?fix(?:es)?)(?:\s+found)?\.?$`,
   String.raw`^nothing\s+(?:blocking|to\s+fix)\.?$`,
   // REVIEW-MUSTFIX-NONE-SENTINEL — `(없음 — 수용기준 충족)` · `(none — acceptance criteria met)` (GLM 실측 6건). «미충족» 은 ^ 앵커로 안 맞는다.

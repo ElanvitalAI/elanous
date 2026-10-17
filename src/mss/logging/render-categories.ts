@@ -79,6 +79,11 @@ export const RENDER_CATEGORY_EXEMPTIONS: ReadonlyMap<string, string> = new Map([
   //   ⛔ 접두 전체(`dashboard`)를 풀지 «않는다» — 그러면 진짜 렌더 소음이 되살아난다. 이 둘만 뗀다.
   ['dashboard.turn-typeahead', 'Mid-turn input queueing decisions — which key was consumed, what was queued, and when it drains. Turn-control judgment, not frame noise.'],
   ['dashboard.streaming-key', 'Streaming-window key ownership — whether a key reached the streaming dispatcher at all. This is the probe that answers "is the ladder live?", so it must survive render mute.'],
+  // ⛔ 2026-10-17 (`TUI-H8-SEAT-BOOT-LOG-MUTED`) — 자리 부트 카드는 «항상성» 이벤트다(렌더 소음 아님).
+  //   `/session new` 뒤 카드가 실렸는지를 `logs --all --include-test` 로도 0행으로 만들어
+  //   «카드가 빠졌다»와 «음소거됐다»를 가를 수 없었다. 접두 전체는 풀지 않고 이것만 뗀다.
+  //   (`tui.autoturn`·`tui.wakeup`·`tui.autowake` 는 `tui` 가 렌더 접두가 아니라 애초에 안 잘린다.)
+  ['dashboard.seat-boot', 'Seat boot card lifecycle — conversation-start, card-injected, card-skipped. Homeostasis evidence that the seat card reached the turn, not frame noise.'],
 ]);
 
 /** Reject an exemption without its required, human-readable rationale. */

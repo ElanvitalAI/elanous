@@ -81,7 +81,7 @@ test('TA card seat callback takes precedence over PR seat label', () => {
     .toMatchObject({ status: 'checked', prs: [{ number: 7, seat: 'UX' }] });
 });
 
-test('five open PRs touching pr-cli.ts are warnings; same cell or line-range hunk refuses', () => {
+test('five open PRs touching pr-cli.ts are warnings; same cell refuses; line-range hunk warns unless refuse mode', () => {
   const source = readOpenPrs(fixture([1, 2, 3, 4, 5].map(number => pr(number, ['src/cli/pr-cli.ts']))).run);
   const verdict = guardNewPr({ files: ['src/cli/pr-cli.ts'] }, source);
   expect(verdict.status).toBe('allow');
@@ -91,8 +91,13 @@ test('five open PRs touching pr-cli.ts are warnings; same cell or line-range hun
   expect(guardNewPr({ files: ['src/other.ts'], cellId: 'PR-TOOL-SMART-MERGE' }, sameCell))
     .toMatchObject({ status: 'refuse', reasons: [{ code: 'same-cell', prs: [1] }] });
   const hunk = { status: 'checked' as const, prs: [{ ...source.prs[0]!, hunks: [{ path: 'src/cli/pr-cli.ts', start: 50, end: 55 }] }] };
-  expect(guardNewPr({ files: ['src/cli/pr-cli.ts'], hunks: [{ path: 'src/cli/pr-cli.ts', start: 54, end: 60 }] }, hunk))
-    .toMatchObject({ status: 'refuse', reasons: [{ code: 'hunk-overlap', prs: [1] }] });
+  const hunkWarn = guardNewPr({ files: ['src/cli/pr-cli.ts'], hunks: [{ path: 'src/cli/pr-cli.ts', start: 54, end: 60 }] }, hunk);
+  expect(hunkWarn).toMatchObject({ status: 'allow', reasons: [] });
+  expect(hunkWarn.warnings).toContainEqual(expect.objectContaining({ code: 'hunk-overlap', prs: [1], files: ['src/cli/pr-cli.ts'] }));
+  expect(guardNewPr({ files: ['src/cli/pr-cli.ts'], hunks: [{ path: 'src/cli/pr-cli.ts', start: 54, end: 60 }], hunkOverlap: 'refuse' }, hunk))
+    .toMatchObject({ status: 'refuse', reasons: [{ code: 'hunk-overlap', prs: [1], files: ['src/cli/pr-cli.ts'] }] });
+  expect(guardNewPr({ files: ['src/cli/pr-cli.ts'], hunks: [{ path: 'src/cli/pr-cli.ts', start: 54, end: 60 }], cellId: 'PR-TOOL-SMART-MERGE' }, { status: 'checked', prs: [{ ...hunk.prs[0]!, cellId: 'PR-TOOL-SMART-MERGE' }] }))
+    .toMatchObject({ status: 'refuse', reasons: [{ code: 'same-cell', prs: [1] }] });
   expect(parseDiffHunks('diff --git a/src/a.ts b/src/a.ts\n+++ b/src/a.ts\n@@ -4,2 +9,3 @@\n'))
     .toEqual([{ path: 'src/a.ts', start: 4, end: 5 }]);
   expect(parseDiffHunks('diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ /dev/null\n@@ -10,3 +0,0 @@\n'))

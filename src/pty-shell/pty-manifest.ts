@@ -277,6 +277,9 @@ export function upsertPtyManifest(row: {
   };
 }): void {
   try {
+    // 행을 (다시) 세우면 snapshot·frame 칸이 비워진다 — 같은 프로세스의 쓰기 스로틀도 비워 다음 쓰기가 바로 닿게 한다.
+    _lastSnapshotAt.delete(row.id);
+    _lastFrameAt.delete(row.id);
     const d = db(); if (!d) return;
     const runId = getHarnessRunId(process.env);
     const runIdSource = getHarnessRunIdSource();
@@ -800,12 +803,18 @@ export function listPtyManifestByRun(runId: string): PtyManifestRow[] {
   }
 }
 
-export function getPtyManifest(id: string): PtyManifestRow | null {
+/** `strict` — 조회 실패(db 못 엶·질의 오류)를 «행 없음»(null)과 가르도록 던진다. 기본은 둘 다 null(fail-soft). */
+export function getPtyManifest(id: string, opts: { readonly strict?: boolean } = {}): PtyManifestRow | null {
   try {
-    const d = db(); if (!d) return null;
+    const d = db();
+    if (!d) {
+      if (opts.strict) throw new Error('pty-manifest-db-unavailable');
+      return null;
+    }
     const row = d.query('SELECT * FROM pty_manifest WHERE id=?').get(id) as Record<string, unknown> | null;
     return row ? mapRow(row) : null;
-  } catch {
+  } catch (error) {
+    if (opts.strict) throw error;
     return null;
   }
 }

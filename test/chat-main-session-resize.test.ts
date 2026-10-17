@@ -83,6 +83,53 @@ describe('chat main prompt resize', () => {
     }
   });
 
+  test('fixed-width session callers keep their requested width across terminal resizes', async () => {
+    const originalColumns = process.stdout.columns;
+    const writes: string[] = [];
+    let releaseRead: ((key: Key) => void) | undefined;
+    let pending: Promise<{ submitted: boolean }> | undefined;
+    const controlOut = { repaint: () => {} };
+    const stdout = spyOn(process.stdout, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    const session = createChatMainInputSession({
+      promptFrame: frame,
+      inputCols: 40,
+      surfaceRegistry: { register: () => {}, unregister: () => {} } as never,
+      invalidateRenderCacheRow: () => {},
+      buildPromptFrameDividerRows: (_frame, divider) => [{ row: frame.topDividerRow, text: divider }],
+      shouldPaint: () => true,
+    });
+
+    try {
+      pending = textInput(buildChatMainTextInputRequest({
+        session,
+        history: [],
+        placeholder: '',
+        textInputOpts: { controlOut, readKey: () => new Promise<Key>((resolve) => { releaseRead = resolve; }) },
+      }));
+      await Promise.resolve();
+      for (const cols of [120, 80, 120]) {
+        process.stdout.columns = cols;
+        writes.length = 0;
+        controlOut.repaint();
+        const divider = writes.find((write) => write.startsWith('\x1b[9;1H'));
+        const body = writes.find((write) => write.startsWith('\x1b[10;1H'));
+        expect(divider).toBeDefined();
+        expect(body).toBeDefined();
+        expect(visibleWidth(stripAnsi(divider ?? ''))).toBe(40);
+        expect(visibleWidth(stripAnsi(body ?? ''))).toBe(39);
+      }
+      releaseRead?.(escapeKey);
+      expect((await pending).submitted).toBe(false);
+    } finally {
+      await settleTurn(pending, () => releaseRead);
+      stdout.mockRestore();
+      process.stdout.columns = originalColumns;
+    }
+  });
+
   const driveDividerResize = async (framePaintsDivider: boolean): Promise<void> => {
     const originalColumns = process.stdout.columns;
     const writes: string[] = [];
@@ -384,5 +431,37 @@ describe('chat main prompt resize', () => {
     expect(picker.getBounds?.()?.width).toBe(120);
     cols = 80;
     expect(picker.getBounds?.()?.width).toBe(80);
+  });
+
+  test('an active picker follows the live prompt row after a resize (TUI-PICKER-RESIZE-SHRINK)', () => {
+    let row = 25;
+    const runtime = createChatPickerModalRuntime({
+      picker: { selectedIdx: () => 0 } as PickerState,
+      getBufferView: () => ({ lines: ['/h'], lineIdx: 0, colIdx: 2 }),
+      writeTerminal: () => {},
+      getBounds: () => ({ row, col: 1, width: 80, height: 1 }),
+      getInputZoneHeight: () => 1,
+      onDispatchResult: async () => true,
+    });
+    const family = runtime.createFamily({
+      bounds: { row, col: 1, width: 80, height: 1 },
+      maxVisible: 5,
+      sources: {
+        slash: { id: 'chat:slash', getItems: () => [{ name: 'help', description: 'Help', aliases: [] }] },
+        arg: { id: 'chat:arg', getItems: () => [] },
+        at: { id: 'chat:at', getItems: () => [] },
+        skill: { id: 'chat:skill', getItems: () => [] },
+      },
+    });
+    const picker = family.createSurface('slash');
+    const bottom = (): number => {
+      const b = picker.getBounds?.();
+      return b ? b.row + b.height - 1 : -1;
+    };
+    expect(bottom()).toBe(24);
+    row = 31; // widened 28 → 34 rows: prompt moved down
+    expect(bottom()).toBe(30);
+    row = 25; // shrunk back
+    expect(bottom()).toBe(24);
   });
 });

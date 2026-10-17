@@ -15,6 +15,11 @@
 //    - ⏹ 정확히 `/stop`·`/esc` 인 글(TUI-STOP-INPUT-BYPASS · #68): 대기열을 «건너뛰고» 지금 턴의 ESC 중단 경로
 //      (`requestStop` → 대시보드 escGate)를 바로 부른다. 대기 중인 일반 항목은 그대로·순서대로 남는다.
 //      턴이 없으면 아무것도 안 하고 `tui-stop-no-active-turn`(멈출 길이 없으면 `tui-stop-undelivered`)으로 던져 바깥 호출자(rc≠0)에게 알린다.
+//    - ⏹ 원시 pty 길(TUI-STOP-RAW-PTY): `pty text pty_<id> /stop --enter`·tmux 처럼 TUI 를 띄운 «PTY 자체»에 쓰면
+//      이 라우터를 안 지나 stdin 으로 들어오고, 턴 중 typeahead 가 «대기(응답 뒤)»에 쌓았다(10-17 재점검).
+//      ⇒ 턴 중 스트리밍 리스너가 stdin «한 청크»가 정확히 `/stop⏎`·`/esc⏎` 이면 `routeRawPtyStop` 으로 같은 `routeStop` 을 부른다.
+//      키보드는 한 키씩 오고 붙여넣기는 봉투에 싸이므로, 한 청크에 온 «글 한 줄 ⊕ Enter» 는 바깥 주입이다.
+//      턴 밖·Enter 없음·그 밖의 글은 종전대로 키로 흐른다(관측 `path: 'raw-pty'` · 제어 IPC 는 `'control-ipc'`).
 //
 // ⚠️ herdr/tmux 처럼 «터미널 자체»에 쓰는 길은 키보드와 구별할 수 없다 — 이 라우터는
 //    elanous 제어 IPC(`pty text`) 경로만 가른다.
@@ -40,11 +45,13 @@ export interface ExternalInputHost {
   requestStop?(): boolean;
   /** 외부 stop 의 결과 표지(채팅 로그 한 줄). */
   onExternalStop?(result: 'stopped' | 'no-turn' | 'failed'): void;
-  /** 대기열이 바뀌었다 — 화면 표지를 다시 그린다. */
-  onQueueChange?(pending: readonly ExternalInputItem[], event: 'queued' | 'delivered'): void;
+  /** 대기열의 현재 상태가 바뀌었다 — 화면 표지를 다시 그린다. */
+  onQueueChange?(pending: readonly ExternalInputItem[]): void;
 }
 
 export type ExternalInputRoute = 'passthrough' | 'submitted' | 'queued' | 'stopped';
+/** 외부 stop 이 들어온 길 — 제어 IPC(`tui:<pid>` · 이 라우터) / 원시 pty(stdin 한 청크). */
+export type ExternalStopPath = 'control-ipc' | 'raw-pty';
 export type ExternalInputDecision = 'passthrough' | 'submit-now' | 'queue' | 'reject';
 
 const EXTERNAL_INPUT_SOURCE: InputSourceRef = { kind: 'terminal', provider: 'pty' };
@@ -133,8 +140,8 @@ export function createExternalInputQueue(deps: ExternalInputQueueDeps = {}) {
   // 경고는 머리 항목 «하나»에 한 번 — 머리가 실제로 바뀔 때만 다시 경고할 수 있다(제출 실패로 남은 같은 머리는 유지).
   let staleTurnWarnedHead: ExternalInputItem | null = null;
 
-  const notify = (event: 'queued' | 'delivered'): void => {
-    try { host?.onQueueChange?.(pending, event); } catch { /* fail-soft — 표지 실패가 입력을 막지 않는다 */ }
+  const notify = (): void => {
+    try { host?.onQueueChange?.(pending); } catch { /* fail-soft — 표지 실패가 입력을 막지 않는다 */ }
   };
   const ensurePump = (): void => {
     if (pending.length > 0 && !stopPump) stopPump = schedule(pump, PUMP_MS);
@@ -163,20 +170,20 @@ export function createExternalInputQueue(deps: ExternalInputQueueDeps = {}) {
     if (!ok) { log('deliver-failed', { length: head.text.length, pending: pending.length }); return false; }
     pending = pending.slice(1);
     log('delivered', { length: head.text.length, waitedMs: now() - head.at, pending: pending.length });
-    notify('delivered');
+    notify();
     ensurePump();
     return true;
   }
 
   /** ⏹ 외부 stop — 대기열을 건너뛰고 지금 턴의 escGate 로. 대기열은 건드리지 않는다. */
-  function routeStop(h: ExternalInputHost, text: string): ExternalInputRoute {
+  function routeStop(h: ExternalInputHost, text: string, path: ExternalStopPath): ExternalInputRoute {
     let turnActive = false;
     try { turnActive = h.isTurnActive(); } catch { turnActive = false; }
     let stopped = false;
     if (turnActive && h.requestStop) {
       try { stopped = h.requestStop(); } catch { stopped = false; }
     }
-    logInput('external-stop', { hadTurn: turnActive, stopped, command: text, pending: pending.length });
+    logInput('external-stop', { hadTurn: turnActive, stopped, command: text, pending: pending.length, path });
     const result = stopped ? 'stopped' : turnActive ? 'failed' : 'no-turn';
     try { h.onExternalStop?.(result); } catch { /* fail-soft */ }
     if (result === 'no-turn') throw new Error('tui-stop-no-active-turn');
@@ -189,6 +196,7 @@ export function createExternalInputQueue(deps: ExternalInputQueueDeps = {}) {
       host = next;
       log('host-registered', { pending: pending.length });
       ensurePump();
+      if (pending.length > 0) notify();
       return () => {
         if (host !== next) return;
         host = null;
@@ -200,7 +208,7 @@ export function createExternalInputQueue(deps: ExternalInputQueueDeps = {}) {
       // `pty key`(input-key)는 «키»다 — 공백·`j` 처럼 출력 가능한 키도 종전대로 넣는다.
       if (keyCommandDepth > 0) return 'passthrough';
       const line = parseExternalTextLine(chars);
-      if (line && host && isExternalStopCommand(line.text)) return routeStop(host, line.text);
+      if (line && host && isExternalStopCommand(line.text)) return routeStop(host, line.text, 'control-ipc');
       let turnActive = false; let composer: string | undefined; let pendingKeys = false;
       if (host && line) {
         try { turnActive = host.isTurnActive(); composer = host.composerText(); pendingKeys = host.hasPendingKeys(); }
@@ -229,9 +237,25 @@ export function createExternalInputQueue(deps: ExternalInputQueueDeps = {}) {
       }
       pending = [...pending, { text: line!.text, at: now() }];
       log('route', { ...base, route: 'queued', pending: pending.length });
-      notify('queued');
+      notify();
       ensurePump();
       return 'queued';
+    },
+    /**
+     * ⏹ 원시 pty 길 — 턴 중 stdin «한 청크»가 정확히 `/stop⏎`·`/esc⏎` 이면 `routeStop` 으로 보내고 true(키로 흘리지 않는다).
+     * 턴 밖·호스트 없음·Enter 없음·그 밖의 글은 false — 호출측이 종전대로 키를 넣는다.
+     */
+    routeRawStop(chunk: string): boolean {
+      const h = host;
+      if (!h) return false;
+      const line = parseExternalTextLine(chunk);
+      if (!line?.submit || !isExternalStopCommand(line.text)) return false;
+      let turnActive = false;
+      try { turnActive = h.isTurnActive(); } catch { turnActive = false; }
+      if (!turnActive) return false;
+      // 'failed'(중단 경로 없음)도 소비한다 — 표지(Esc 로 멈춰 주세요)는 routeStop 이 이미 남겼다.
+      try { routeStop(h, line.text, 'raw-pty'); } catch { /* 결과는 이벤트·표지로 남았다 */ }
+      return true;
     },
     pump,
     pending: (): readonly ExternalInputItem[] => pending,
@@ -249,3 +273,4 @@ const shared = createExternalInputQueue();
 
 export function registerExternalInputHost(host: ExternalInputHost): () => void { return shared.register(host); }
 export function routeExternalInput(chars: string): ExternalInputRoute { return shared.route(chars); }
+export function routeRawPtyStop(chunk: string): boolean { return shared.routeRawStop(chunk); }

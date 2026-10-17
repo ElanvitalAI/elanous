@@ -839,6 +839,23 @@ export function rebaseWorktreePaths(diagnostics: readonly TypecheckError[], work
 export type BaselineCacheIo = BaselineCacheOptions & { log?: (message: string) => void };
 
 /**
+ * 기준 worktree 임시 공간의 루트 — 운영자가 TMPDIR 을 못 박지 않았으면 «호스트 디스크»(/var/tmp)를 먼저 고른다.
+ * 🩸 WSL-GATE-ENV(2026-10-17 · host-e-wsl): WSL 의 /tmp 는 20GiB tmpfs 인데 기준 checkout 하나로 끝날 수 있다
+ *   (`src/self-implement/gate-remote.ts` remoteScript 가 같은 이유로 원격 자식에게 TMPDIR=/var/tmp 를 준다).
+ *   이 게이트가 호스트에서 직접 돌 때(self gate --changed · pod) TMPDIR 이 비어 있으면 기준 측정이 같은 tmpfs 에
+ *   걸리고, 공간이 차면 mkdtemp 가 ENOSPC 으로 죽는다 — 그 throw 는 readMergeBaseDiagnostics 의 try «밖»이라
+ *   게이트가 판정 한 줄 없이 통째로 죽는다. node-c 의 /tmp 는 디스크라 같은 head·base 도 0으로 지나간다
+ *   (「wsl 환경 실패(node-c 는 0)」 · introduced/preexisting 판정 불일치의 몸통).
+ * ⛔ TMPDIR 이 이미 정해져 있으면 «그 값»을 그대로 쓴다(원격 러너·운영자 지정이 최우선 · 받은 env 기준). /var/tmp 가 없는 호스트는
+ *   오늘 길(tmpdir())로 물러난다 — 이 선택은 진단 내용에 닿지 않는다(rebaseWorktreePaths 가 worktree 경로를
+ *   실제 트리로 되돌리고, 캐시는 ROOT_PLACEHOLDER 로 저장한다).
+ */
+export function baselineWorkspaceRoot(env: NodeJS.ProcessEnv = process.env, present: (path: string) => boolean = existsSync): string {
+  if (env.TMPDIR) return env.TMPDIR;
+  return present('/var/tmp') ? '/var/tmp' : tmpdir();
+}
+
+/**
  * 같은 base 커밋 ⊕ 같은 명령 ⊕ 같은 설정 해시 ⊕ 같은 작업 트리 설치 키면 저장된 진단을 재사용한다(워크트리·tsc 0회).
  * 캐시의 어떤 실패도 던지지 않는다 — miss 로 떨어져 아래 측정이 그대로 돈다.
  */
@@ -858,7 +875,15 @@ export function readMergeBaseDiagnostics(base: string, command: string, cwd = pr
     const cached = lookupCachedBaseline(cacheKey, command, cwd, cacheIo, installKey);
     if (cached) return cached;
   }
-  const workspace = mkdtempSync(join(tmpdir(), 'ci-typecheck-baseline-'));
+  // ⛔ WSL-GATE-ENV: 임시 공간은 baselineWorkspaceRoot 가 고르고, 고른 루트가 못 쓰이면(권한·용량) 오늘 길로
+  //    물러난다. mkdtemp 실패가 판정 없이 게이트를 통째로 죽이던 길(ENOSPC · try 밖 throw)을 없앤다.
+  //    둘 다 못 쓰이면 던지지 않고 «기준을 못 얻었다»(unavailable)로 판정을 낸다.
+  let workspace: string;
+  try { workspace = mkdtempSync(join(baselineWorkspaceRoot(cacheIo.env ?? process.env), 'ci-typecheck-baseline-')); }
+  catch {
+    try { workspace = mkdtempSync(join(tmpdir(), 'ci-typecheck-baseline-')); }
+    catch (error) { return { unavailable: `기준 임시 공간을 만들 수 없다: ${error instanceof Error ? error.message : String(error)}` }; }
+  }
   const worktree = join(workspace, 'base');
   try {
     execFileSync('git', ['worktree', 'add', '--detach', worktree, base], { cwd, stdio: 'pipe', env: gitEnv() });

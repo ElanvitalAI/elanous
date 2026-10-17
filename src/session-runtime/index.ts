@@ -1,6 +1,5 @@
 import { buildGitSnapshot } from '../git-fs/index.js';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
 import { resolve } from 'node:path';
 import type { ModelFamily } from '../models/prompts.js';
 import type { InputSourceKind, InputSourceRef } from '../input/input-source-kind.js';
@@ -411,46 +410,6 @@ const TOOL_NAME_TO_FAMILY = new Map<string, SessionToolFamilyRule>(
   SESSION_TOOL_FAMILY_RULES.flatMap(rule => rule.names.map(name => [name, rule] as const)),
 );
 
-/** Names belonging to the runtime-debug family — used by the
- *  exposeFullLlmTools=false post-filter to know which tools to drop. */
-const RUNTIME_DEBUG_FAMILY_NAMES: ReadonlySet<string> = new Set(
-  SESSION_TOOL_FAMILY_RULES.find(r => r.id === 'runtime-debug')?.names ?? [],
-);
-
-/** Read-only inspection tools kept alive when minimal mode is on.
- *  Roughly half of the 9-entry runtime-debug family — picked by
- *  chatlog-triage value and gated to read-only-and-safe operations.
- *  Excluded by design (LLM-mutating or UI-stealing):
- *    debug_setLevel    — would let the LLM crank logs to keytrace,
- *                        flooding the file sink during a triage.
- *    debug_openView    — server-side cousin of the user-pressed
- *                        Ctrl+digit shortcut that already annoyed
- *                        the user (incident 2026-05-04).
- *    debug_selectEvent — UI-cursor mutation; steals focus from the
- *                        human reviewer.
- *    input_history_list — redundant with input_history_search.
- *  Leaves the LLM with enough surface to triage chatlogs without
- *  the surface area that lets it disrupt the live session. */
-const RUNTIME_DEBUG_MINIMAL_KEEP: ReadonlySet<string> = new Set([
-  'debug_getLastLlm',     // last request/response pair
-  'debug_getState',       // event-buffer + stats dump
-  'debug_getCallStack',   // call-path triage
-  'debug_getAgentState',  // sub-agent queue inspection
-  'input_history_search', // self-lookup of prior user inputs
-]);
-
-/** Drop runtime-debug tools (except the single essential one) when
- *  the user has set debug.exposeFullLlmTools=false. Other host tool
- *  families pass through untouched. Called at the tail of every host
- *  tool resolver so the gate applies uniformly across surfaces. */
-function applyDebugMinimalFilter<T extends { name: string }>(tools: T[]): T[] {
-  if (getUserConfig().debug.exposeFullLlmTools !== false) return tools;
-  return tools.filter(t => {
-    if (!RUNTIME_DEBUG_FAMILY_NAMES.has(t.name)) return true;
-    return RUNTIME_DEBUG_MINIMAL_KEEP.has(t.name);
-  });
-}
-
 interface SessionNativeToolRule {
   id: string;
   description: string;
@@ -649,19 +608,6 @@ function getNativeToolDispatchRules(): Map<string, SessionNativeToolRule> {
 const HOST_TOOL_FAMILY_RULE_MAP = new Map<string, SessionToolFamilyRule>(
   SESSION_TOOL_FAMILY_RULES.map(rule => [rule.id, rule] as const),
 );
-
-function isCodeGroundingModelSurfaceEnabled(): boolean {
-  const config = getUserConfig();
-  const configured = (config.raw.tools as Record<string, unknown> | undefined)?.nativeStructure;
-  const source = configured
-    && typeof configured === 'object'
-    && typeof (configured as Record<string, unknown>).enabled === 'boolean'
-    ? 'config'
-    : 'default';
-  const enabled = config.tools.nativeStructure.enabled === true;
-  debug.log('tools.surface', 'code-grounding-exposure', { enabled, source });
-  return enabled;
-}
 
 const SESSION_RUNTIME_TOOL_FAMILY_RULES: SessionRuntimeToolFamilyRule[] = [
   {
@@ -979,8 +925,12 @@ function isSessionSurfaceId(value: string | null | undefined): value is SessionS
 
 export function buildSessionRuntimeSystemMessages(opts: {
   cwd: string;
+  /** Serve a snapshot up to this old and rebuild it asynchronously (TUI turn path). */
+  gitSnapshotStaleMs?: number;
 }): LLMMessage[] {
-  const snapshot = buildGitSnapshot(opts.cwd);
+  const snapshot = buildGitSnapshot(opts.cwd, opts.gitSnapshotStaleMs !== undefined
+    ? { staleWhileRevalidateMs: opts.gitSnapshotStaleMs }
+    : {});
   return snapshot
     ? [{ role: 'system', content: `## Git Snapshot\n\n${snapshot}` }]
     : [];
@@ -1694,45 +1644,6 @@ export function buildSessionSurfaceManualSections(
 
   return sections;
 }
-export function resolveDynamicSessionHostTools(opts: {
-  userText: string;
-  hostTools: readonly LLMToolDef[];
-  toolAvailability?: Readonly<Record<string, boolean>>;
-  defaultFamilyIds?: readonly string[];
-  surfaceId?: SessionSurfaceId;
-}): LLMToolDef[] {
-  const text = opts.userText.toLowerCase();
-  const available = new Map(opts.hostTools.map(tool => [tool.name, tool] as const));
-  const selected = new Set<string>();
-
-  for (const familyId of opts.defaultFamilyIds ?? []) {
-    for (const rule of SESSION_TOOL_FAMILY_RULES) {
-      if (rule.id !== familyId) continue;
-      for (const name of rule.names) {
-        if (available.has(name)) selected.add(name);
-      }
-    }
-  }
-
-  for (const tool of opts.hostTools) {
-    if (mentionsTool(text, tool.name)) selected.add(tool.name);
-  }
-  for (const rule of SESSION_TOOL_FAMILY_RULES) {
-    const surfaceMatch = matchesSurfaceAwareFamilyIntent(rule.id, text, opts.surfaceId);
-    if (!rule.match(text) && !surfaceMatch) continue;
-    for (const name of rule.names) {
-      if (available.has(name)) selected.add(name);
-    }
-  }
-
-  return applyDebugMinimalFilter(
-    [...selected]
-      .filter(name => isToolAvailable(name, opts.toolAvailability))
-      .map(name => available.get(name))
-      .filter((tool): tool is LLMToolDef => !!tool),
-  );
-}
-
 const ESSENTIAL_NATIVE_RULE_IDS = [
   'code-read', 'code-grep', 'code-glob', 'code-list-dir', 'code-edit', 'code-write',
   // Keep dev-harness in the assembly candidate set so the catalog policy below is the single model-exposure authority.
@@ -1740,7 +1651,8 @@ const ESSENTIAL_NATIVE_RULE_IDS = [
 ] as const;
 const ESSENTIAL_HOST_FAMILY_IDS = ['self-ops', 'release-read'] as const;
 // Keep this TUI essential addition out of the shared control/agent self-ops family.
-const ESSENTIAL_HOST_EXTRA_NAMES = ['logs_query'] as const;
+// ScheduleWakeup (H5) is a dashboard-only host tool — present only when the TUI registered it.
+const ESSENTIAL_HOST_EXTRA_NAMES = ['logs_query', 'ScheduleWakeup'] as const;
 const ESSENTIAL_RUNTIME_FAMILY_IDS = ['bash', 'run-shell', 'ops-ledger', 'pty-shell', 'run-tests', 'elanous_skills_list', 'skill_exec', 'code-grounding'] as const;
 const ESSENTIAL_OPTIONAL_TOOL_NAMES = [
   'GetDashboardState',
@@ -1802,76 +1714,35 @@ export function buildSessionRuntimeToolSpecs(opts: {
   userText: string;
   hostTools: readonly LLMToolDef[];
   runtimeTools?: readonly ToolRuntime<Record<string, unknown>, ToolRunResult>[];
-  pluginTools?: readonly LLMToolDef[];
-  schedulerTools?: readonly LLMToolSpec[];
   optionalTools?: readonly LLMToolSpec[];
   toolAvailability?: Readonly<Record<string, boolean>>;
   surface?: SessionSurfaceProfile;
   preferredSurfaceId?: SessionSurfaceId;
   controlMode?: boolean;
-  /** TUI --rich preserves the legacy userText-driven surface catalog. */
-  rich?: boolean;
 }): LLMToolSpec[] {
+  // TUI-DIET-D1-TAIL — the legacy userText-driven catalog (`rich !== false`) is gone;
+  // every caller already passed rich=false, so the essential catalog is the only path.
+  // The surface profile is still resolved for the always-on observation below.
   const surface = opts.surface ?? resolveSessionSurfaceProfile({
     userText: opts.userText,
     preferredSurfaceId: opts.preferredSurfaceId,
     controlMode: opts.controlMode,
   });
-  const dynamicHostTools = resolveDynamicSessionHostTools({
-    userText: opts.userText,
+  const essentialSpecs = buildEssentialSessionRuntimeToolSpecs({
     hostTools: opts.hostTools,
-    toolAvailability: opts.toolAvailability,
-    defaultFamilyIds: surface.defaultHostFamilyIds,
-    surfaceId: surface.id,
-  });
-  const dynamicRuntimeTools = resolveDynamicSessionRuntimeToolSpecs({
-    userText: opts.userText,
     runtimeTools: opts.runtimeTools ?? [],
-    defaultFamilyIds: surface.defaultRuntimeFamilyIds,
-    surfaceId: surface.id,
-  });
-  const dynamicNativeTools = resolveDynamicSessionNativeToolSpecs({
-    userText: opts.userText,
+    optionalTools: opts.optionalTools ?? [],
     toolAvailability: opts.toolAvailability,
-    defaultFamilyIds: surface.defaultNativeFamilyIds,
-    surfaceId: surface.id,
   });
-  const hostSpecs = dynamicHostTools.map(toSpec);
-  const pluginSpecs = (opts.pluginTools ?? []).map(toSpec);
-  const schedulerSpecs = opts.schedulerTools ?? [];
-  const optionalSpecs = opts.optionalTools ?? [];
-  // Native tools (Read/Bash/Grep/Edit/Write/...) come first so the
-  // catalog's leading slots are stable across surfaces. research/turn
-  // for example overrides hostSpecs with debug_*/input_history_*; if
-  // those landed in front of native, the LLM mis-recognizes its own
-  // toolset (incident 2026-05-04 — Opus replied "no file tools in this
-  // session" while Bash was actually exposed at position 7+).
-  const finalSpecs: LLMToolSpec[] = opts.rich === false
-    ? (() => {
-        const essentialSpecs = buildEssentialSessionRuntimeToolSpecs({
-          hostTools: opts.hostTools,
-          runtimeTools: opts.runtimeTools ?? [],
-          optionalTools: opts.optionalTools ?? [],
-          toolAvailability: opts.toolAvailability,
-        });
-        if (!hasDevHarnessIntent(opts.userText)) return essentialSpecs;
-        const droppedNames = new Set(['Edit', 'Write']);
-        const filteredSpecs = essentialSpecs.filter(spec => !droppedNames.has(spec.name));
-        if (filteredSpecs.length !== essentialSpecs.length) {
-          debug.log('session-runtime.tools', 'harness-phrase-write-tools-dropped', {
-            dropped: ['Edit', 'Write'],
-          });
-        }
-        return filteredSpecs;
-      })()
-    : [
-        ...dynamicNativeTools,
-        ...hostSpecs,
-        ...dynamicRuntimeTools,
-        ...pluginSpecs,
-        ...schedulerSpecs,
-        ...optionalSpecs,
-      ];
+  const droppedNames = new Set(['Edit', 'Write']);
+  const finalSpecs: LLMToolSpec[] = hasDevHarnessIntent(opts.userText)
+    ? essentialSpecs.filter(spec => !droppedNames.has(spec.name))
+    : essentialSpecs;
+  if (finalSpecs.length !== essentialSpecs.length) {
+    debug.log('session-runtime.tools', 'harness-phrase-write-tools-dropped', {
+      dropped: ['Edit', 'Write'],
+    });
+  }
   // Forensic — final tool list returned to streamLLMWithTools. Lets
   // us diff TUI vs JSON-test (`elanous repro`) tool exposure when codex
   // behavior diverges. Counts AND names so we can spot per-source
@@ -1903,94 +1774,16 @@ export function buildSessionRuntimeToolSpecs(opts: {
   // diag-gated (분석 레벨) 유지 — 매턴 detail 이라 always-on 이면 노이즈 독.
   // 노출 tool 셋을 보려면 `/debug diag` 후 elanous logs --category llm.tool-
   // exposure. always-on 은 이상탐지(surface tool 0개·core 누락) 전용 — 루틴
-  // per-turn 노출은 diag. (2026-07-17 규율: over-log 되돌림·runtime.resolve 는 유지.)
+  // per-turn 노출은 diag. (2026-07-17 규율: over-log 되돌림.)
   if (debug.enabled) {
     debug.log('llm.tool-exposure', 'session-runtime-tool-specs.return', {
       total: finalSpecs.length,
-      counts: {
-        host: hostSpecs.length,
-        runtime: dynamicRuntimeTools.length,
-        native: dynamicNativeTools.length,
-        plugin: pluginSpecs.length,
-        scheduler: schedulerSpecs.length,
-        optional: optionalSpecs.length,
-      },
       names: finalSpecs.map(s => s.name),
       surfaceId: surface.id,
       userTextChars: opts.userText.length,
     });
   }
   return finalSpecs;
-}
-
-function resolveDynamicSessionRuntimeToolSpecs(opts: {
-  userText: string;
-  runtimeTools: readonly ToolRuntime<Record<string, unknown>, ToolRunResult>[];
-  defaultFamilyIds?: readonly string[];
-  surfaceId?: SessionSurfaceId;
-}): LLMToolSpec[] {
-  const text = opts.userText.toLowerCase();
-  const available = new Map(opts.runtimeTools.map(tool => [tool.id, tool] as const));
-  const selected = new Set<string>();
-
-  // Pass 0 — T1 world-I/O substrate (RFC §3 · P2 상시화). Shell/PTY
-  // execution is domain-independent substrate: a coding agent needs to
-  // run what it builds on EVERY surface (research cross-check, ops
-  // triage, control), not only the coding surfaces. Mirrors the native
-  // 6-core Pass-0. Subject to availability — a surface that doesn't wire
-  // the shell runtimes (`available.has` false) simply skips them, so no
-  // phantom tools appear. Trade/financial dispatch is unaffected: these
-  // are exposure only; execution safety stays in bash sandbox / PtyShell
-  // approval (shell.allowDashboardPty) gates.
-  for (const familyId of CORE_RUNTIME_FAMILY_IDS) {
-    const rule = RUNTIME_TOOL_FAMILY_RULE_MAP.get(familyId);
-    if (!rule) continue;
-    for (const name of rule.names) {
-      if (available.has(name)) selected.add(name);
-    }
-  }
-
-  for (const familyId of opts.defaultFamilyIds ?? []) {
-    const rule = RUNTIME_TOOL_FAMILY_RULE_MAP.get(familyId);
-    if (!rule) continue;
-    // code-grounding belongs to coding defaults but remains opt-in to avoid carrying its spec on every coding turn.
-    // Its rule intentionally never dynamically matches: only coding profiles list it as a default family.
-    if (rule.id === 'code-grounding' && !isCodeGroundingModelSurfaceEnabled()) continue;
-    for (const name of rule.names) {
-      if (available.has(name)) selected.add(name);
-    }
-  }
-
-  for (const tool of opts.runtimeTools) {
-    if (mentionsTool(text, tool.id) || mentionsTool(text, tool.spec.name)) {
-      selected.add(tool.id);
-    }
-  }
-
-  for (const rule of SESSION_RUNTIME_TOOL_FAMILY_RULES) {
-    const surfaceMatch = matchesSurfaceAwareRuntimeIntent(rule.id, text, opts.surfaceId);
-    if (!rule.match(text) && !surfaceMatch) continue;
-    for (const name of rule.names) {
-      if (available.has(name)) selected.add(name);
-    }
-  }
-
-  const specs = [...selected]
-    .map(name => available.get(name))
-    .filter((tool): tool is ToolRuntime<Record<string, unknown>, ToolRunResult> => !!tool)
-    .map(tool => tool.spec);
-  // 관측 보강(2026-07-17) — native.resolve 미러. runtime 축(Bash·RunShell 등)이
-  // 어느 surface/family 로 노출됐는지 elanous logs --category llm.tool-exposure 로
-  // 조회 가능하게. runtime 축 로깅이 없어 "Bash 노출됐나" 를 로그로 못 봤던 갭.
-  if (debug.enabled) {
-    debug.log('llm.tool-exposure', 'runtime.resolve', {
-      surfaceId: opts.surfaceId ?? null,
-      defaultFamilyIds: [...(opts.defaultFamilyIds ?? [])],
-      availableCount: available.size,
-      selectedNames: specs.map(s => s.name),
-    });
-  }
-  return specs;
 }
 
 /** Six core file-IO tools that survive on EVERY surface regardless
@@ -2009,19 +1802,6 @@ const CORE_NATIVE_FAMILY_IDS: readonly string[] = [
   'code-list-dir',
   'code-edit',
   'code-write',
-];
-
-/** T1 world-I/O substrate on the RUNTIME axis (RFC §3 · P2 상시화) —
- *  shell + interactive PTY execution that survives on EVERY surface,
- *  regardless of the surface's `defaultRuntimeFamilyIds`. Domain-
- *  independent: a coding agent must run what it builds on the research /
- *  control / ops surfaces too, not only the coding surfaces. The
- *  symmetric counterpart to `CORE_NATIVE_FAMILY_IDS`. Availability-gated
- *  (a surface that doesn't wire these runtimes just skips them). */
-const CORE_RUNTIME_FAMILY_IDS: readonly string[] = [
-  'bash',
-  'run-shell',
-  'pty-shell',
 ];
 
 export function resolveDynamicSessionNativeToolSpecs(opts: {
@@ -2261,13 +2041,6 @@ function toSpec(tool: LLMToolDef): LLMToolSpec {
     description: tool.description,
     parameters: tool.parameters,
   };
-}
-
-function mentionsTool(text: string, toolName: string): boolean {
-  const normalized = toolName.toLowerCase();
-  if (text.includes(normalized)) return true;
-  const humanized = normalized.replace(/[_]/g, ' ');
-  return humanized !== normalized && text.includes(humanized);
 }
 
 function hasAny(text: string, needles: readonly string[]): boolean {
@@ -2804,15 +2577,6 @@ function hasOpsUiIntent(text: string): boolean {
   return matchesIntentLexicon(text, OPS_UI_INTENT_TERMS);
 }
 
-function matchesSurfaceAwareFamilyIntent(
-  familyId: string,
-  text: string,
-  surfaceId?: SessionSurfaceId,
-): boolean {
-  if (!surfaceId) return false;
-  return SURFACE_AWARE_POLICIES[surfaceId]?.hostFamilyMatchers?.[familyId]?.(text) ?? false;
-}
-
 function matchesSurfaceAwareNativeIntent(
   familyId: string,
   text: string,
@@ -2820,15 +2584,6 @@ function matchesSurfaceAwareNativeIntent(
 ): boolean {
   if (!surfaceId) return false;
   return SURFACE_AWARE_POLICIES[surfaceId]?.nativeFamilyMatchers?.[familyId]?.(text) ?? false;
-}
-
-function matchesSurfaceAwareRuntimeIntent(
-  familyId: string,
-  text: string,
-  surfaceId?: SessionSurfaceId,
-): boolean {
-  if (!surfaceId) return false;
-  return SURFACE_AWARE_POLICIES[surfaceId]?.runtimeFamilyMatchers?.[familyId]?.(text) ?? false;
 }
 
 function isToolAvailable(

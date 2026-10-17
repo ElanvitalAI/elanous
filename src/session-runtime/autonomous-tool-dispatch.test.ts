@@ -129,9 +129,7 @@ describe('session-runtime autonomous tool dispatch', () => {
         userText,
         hostTools: [],
         runtimeTools: [],
-        pluginTools: [],
         optionalTools: [],
-        rich: false,
       }),
       { userText },
     );

@@ -659,6 +659,32 @@ export function shellRollupSegment(
   return text(`🐚 ${parts.join(' ')}`, tone, opts);
 }
 
+/** TUI-BG-JOB-VISIBILITY (#71) — 턴이 끝난 뒤에도 남는 백그라운드 일을 상태줄에서 보이게 한다.
+ *
+ *  🚨 10-16 07:3x OPT 가 «남은 리뷰 4건 실행 중 · 다음 점검 = …» 로 턴을 «✔ 완료» 로 끝내자
+ *     바깥에선 «12분 유휴» 로 보였다.
+ *
+ *      ⧗ 백그라운드 2   — 등록된(ShellRegistry) 백그라운드 일 2개가 돈다
+ *      (빈 문자열)       — 0 · 끝나면 사라진다
+ *
+ *  `background` = 살아 있는 bg 모드 핸들 ⊕ backgrounded(인라인 전경 실행은 안 셈 — 그건 🐚 몫).
+ *  명령 안 `&`·`nohup` 으로 떼어 낸 프로세스는 등록되지 않아 여기 안 잡힌다.
+ *  깨우기(끝나면 턴을 여는 것)는 이 세그먼트 몫이 아니다 — TUI-AGENT-IDLE-WAKE 칸.
+ *  `runningAgentsSegment` 와 같은 꼴 · 같은 색 계열(peach). */
+export interface BackgroundJobsSummary {
+  background: number;
+}
+
+export function backgroundJobsSegment(
+  summary: BackgroundJobsSummary | null | undefined,
+  opts: StatusBarRenderOptions = {},
+): string {
+  if (!summary) return '';
+  const live = Number.isFinite(summary.background) ? Math.max(0, Math.floor(summary.background)) : 0;
+  if (live <= 0) return '';
+  return text(`⧗ 백그라운드 ${live}`, 'peach', opts);
+}
+
 export type DockStripDensity = 'full' | 'compact' | 'count-only';
 
 export interface DockStripSegmentOptions extends StatusBarRenderOptions {

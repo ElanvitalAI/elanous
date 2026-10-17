@@ -289,6 +289,7 @@ export async function runCoreTurn(
         ...(ctx.callbacks?.onResolvedProvider !== undefined ? { onResolvedProvider: ctx.callbacks.onResolvedProvider } : {}),
         ...(ctx.budgetGrant !== undefined ? { budgetGrant: ctx.budgetGrant } : {}),
         ...(ctx.terminalToolNames !== undefined ? { terminalToolNames: ctx.terminalToolNames } : {}),
+        ...(ctx.terminalPriorAnswerVisible !== undefined ? { terminalPriorAnswerVisible: ctx.terminalPriorAnswerVisible } : {}),
         // ⭐⭐⭐ `B3`(2026-08-19 · 대표 지시 ②) — 도는 턴 «안»으로 들어오는 사용자 발화의 배수구.
         //   ⛔ 종전엔 스트리밍 중 친 발화가 ***턴이 끝난 뒤***에야 나갔다.
         //   ⭐ 이제 «다음 모델 요청을 만들기 직전»(루프 경계)에 이력으로 들어가고,

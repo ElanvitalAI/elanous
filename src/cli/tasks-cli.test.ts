@@ -1306,6 +1306,31 @@ test('ORCH-LIVE-1008: the hand launcher runs the elanous CLI entry, not whatever
   } finally { process.argv[1] = started; }
 });
 
+test('live checklist hand sends its slot through the production detached launcher environment', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-slot-launch-'));
+  const releaseBoard: BoardNode[] = [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
+    { id: 'TA-DRAFT-NO-LEFTOVER', level: 'task', title: '대상 경로: src/example.ts', status: 'open' },
+  ] }];
+  const seen: Array<{ command: string; args: string[]; env?: NodeJS.ProcessEnv }> = [];
+  const fakeSpawn = ((command: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+    seen.push({ command, args, env: options.env });
+    const handlers: Record<string, () => void> = {};
+    setTimeout(() => handlers.spawn?.(), 0);
+    return { pid: 1, once: (event: string, fn: () => void) => { handlers[event] = fn; }, removeListener: () => undefined, unref: () => undefined };
+  }) as unknown as DetachedSpawn;
+  try {
+    const result = await run(['tasks', 'hand', '--checklist', 'TA-DRAFT-NO-LEFTOVER', '--live', '--json'], {
+      taskStatePath: join(dir, 'cards.json'), registerSink: async () => true, releaseBoard: () => releaseBoard,
+      taskLauncher: (args, cwd, context) => defaultTaskLauncher(args, cwd, context,
+        { parentHost: null, spawn: fakeSpawn, earlyExitWindowMs: 0 }),
+    });
+    expect(result.code ?? 0).toBe(0);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.args[0]).toBe(ELANOUS_CLI_ENTRY);
+    expect(seen[0]!.env?.ELANOUS_POD_SLOT_ID).toBe('TA-DRAFT-NO-LEFTOVER');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 /** A fake detached child that writes `stderr` to the fd it was handed and exits with `code` (or stays alive). */
 function exitingSpawn(code: number | null, stderr = ''): { spawn: DetachedSpawn; stdio: unknown[] } {
   const stdio: unknown[] = [];

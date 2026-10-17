@@ -5,6 +5,7 @@ import type {
   TextInputHost,
 } from '../../chat/index.js';
 import type { PromptFrame } from '../../display/prompt-frame.js';
+import type { PromptRowOwner } from '../../display/prompt-row-owner.js';
 import type { SurfaceRegistry } from '../../surface/index.js';
 import { createChatMainInputHost } from './chat-main-host.js';
 import { createChatMainInputSession } from './chat-main-session.js';
@@ -24,6 +25,9 @@ export interface RunDashboardChatMainEntryDeps {
     insertAtCursor?: (text: string) => void;
     submit?: (request?: string | TextInputExternalSubmitRequest) => void;
   };
+  /** TUI-PROMPT-SINGLE-OWNER — the frame renderer draws the prompt band
+   *  from what textInput publishes here; textInput writes no prompt rows. */
+  promptRowOwner?: PromptRowOwner;
   setInputLines: (visibleLines: number) => boolean;
   redraw: () => void;
   dispatchGlobalAction: (action: TextInputGlobalAction) => void | Promise<void>;
@@ -84,6 +88,7 @@ export async function runDashboardChatMainEntry(
     textInputOpts: {
       ...deps.textInputOpts,
       host,
+      ...(deps.promptRowOwner ? { promptRowOwner: deps.promptRowOwner } : {}),
     },
   });
   // textInput has returned: its paint closure now holds the submitted buffer.

@@ -21,6 +21,7 @@ import { hostLeaseCounts, leaseHasPendingPod } from '../pod-lease/host-lease.js'
 import { leaseKubectl, measurePoolLease } from '../task-orchestrator/surfaces/pod-lease.js';
 import { parsePodPool, podPoolHostLease, resolvePodPoolSpec } from '../task-orchestrator/surfaces/pod-pool.js';
 import { writeHarnessQueueReceipt } from './harness-queue-child.js';
+import { detectReleaseGateActive, gateReserve } from './gate-reserve.js';
 import { adviseLaunch, compareLaunchAdvice, type LaunchAdvice } from './launch-advice.js';
 import { finishAdvice, measureFinish, recordFinishHistory, type FinishMetrics } from '../loops/orchestrator/finish-rate.js';
 import { collectDraftMetrics, DRAFT_NEEDS_OWNER_SEAT_CAP, shouldHoldSeatNewLaunch, type DraftMetrics } from '../self-dev/draft-sweep.js';
@@ -85,6 +86,8 @@ export interface HarnessQueueDeps {
   pool?: () => QueuePool;
   /** Shadow-only advice seam; exceptions must not affect the queue decision. */
   advice?: typeof adviseLaunch;
+  /** Gate-reserve observation only; never changes seatCapDetails or decideSpawn inputs. */
+  releaseGateActive?: () => boolean | Promise<boolean>;
   launch?: (item: QueueItem, args: string[], root: string) => Promise<number>;
   /** Test seam: runs after a direct CLI call enqueued its row and before that call's own tick (race tests). */
   afterEnqueue?: (item: QueueItem) => void | Promise<void>;
@@ -1495,6 +1498,10 @@ async function tickHarnessQueueOnce(deps: HarnessQueueDeps, requestedId: string 
       }
       return waiting();
     }
+    // Shadow measurement runs outside the approval path. One async probe serves all candidates in this tick.
+    const gateActivePromise = !childUniverses?.unreadable.length
+      ? Promise.resolve().then(() => (deps.releaseGateActive ?? detectReleaseGateActive)()).catch(() => false)
+      : undefined;
     // NEEDS-OWNER-CENSUS: one draft census per tick, shared by every candidate. A full census pages all
     // open drafts, the 48h closed cohort, and one claim-comment gh call per open draft — re-running it
     // per candidate multiplied those calls by the seat count and raced the rate limit the seat-loop tick
@@ -1516,6 +1523,14 @@ async function tickHarnessQueueOnce(deps: HarnessQueueDeps, requestedId: string 
       const injectedCap = deps.cap?.(item.seat);
       const details = seatCapDetails({ seat: item.seat, caps, gate, injectedCap });
       const active = seatActive(item.seat);
+      // An unreadable child universe makes the running count incomplete; do not emit a misleading cap sample.
+      if (gateActivePromise) void gateActivePromise.then((gateActive) => {
+        try {
+          const reserve = gateReserve({ releaseGateActive: gateActive === true, seat: item.seat, configuredGateCap: gate?.[item.seat] ?? 4 });
+          debug.log('harness.queue', 'gate-reserve-shadow', { seat: item.seat, active: reserve.active, wouldCap: reserve.wouldCap,
+            cap: details.cap, running: active });
+        } catch { /* Shadow observation cannot affect the decision. */ }
+      });
       if (active >= details.cap) { blocked.set(item.seat, { reason: seatLine(item.seat, active, details), active }); continue; }
       if (!pool && !poolReason) {
         try { pool = (deps.pool ?? readHarnessQueuePool)(); }

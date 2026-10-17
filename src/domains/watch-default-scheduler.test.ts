@@ -2,9 +2,14 @@ import { expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { addSource } from '../intake-plane/intake-sources.js';
+import { addSource, removeSource } from '../intake-plane/intake-sources.js';
 import { listSchedules, openSchedulesDb } from './schedule-registry.js';
 import { startWatchDefaultScheduler } from './watch-default-scheduler.js';
+
+const WATCH_DEFAULT_ROWS = [
+  { id: 'internal:watch-brief', cron: '30 8 * * *', command: 'intake digest --seat user --telegram', run_via: 'daemon' },
+  { id: 'internal:watch-collect', cron: '0 7 * * *', command: 'intake source run-due --seat user', run_via: 'daemon' },
+];
 
 test('daemon executes only user watch jobs at local scheduled minutes and stops when disabled', async () => {
   const root = mkdtempSync(join(tmpdir(), 'watch-tick-'));
@@ -26,7 +31,13 @@ test('daemon executes only user watch jobs at local scheduled minutes and stops 
     await scheduler.tickNow();
     await scheduler.tickNow();
     expect(fired).toEqual(['collect']);
-    expect(listSchedules(registry, { source: 'watch-default' }).map(row => row.run_via)).toEqual(['daemon', 'daemon']);
+    expect(listSchedules(registry, { source: 'watch-default' }).map(({ id, cron, command, run_via }) => ({ id, cron, command, run_via }))).toEqual(WATCH_DEFAULT_ROWS);
+    removeSource('topic', root);
+    await scheduler.tickNow();
+    expect(listSchedules(registry, { source: 'watch-default' })).toEqual([]);
+    addSource({ id: 'topic', seat: 'user', kind: 'github-query', spec: 'agent', every: '1d' }, root);
+    await scheduler.tickNow();
+    expect(listSchedules(registry, { source: 'watch-default' }).map(({ id, cron, command, run_via }) => ({ id, cron, command, run_via }))).toEqual(WATCH_DEFAULT_ROWS);
     clock = new Date('2026-10-05T08:30:00+09:00');
     await scheduler.tickNow();
     expect(fired).toEqual(['collect', 'brief']);

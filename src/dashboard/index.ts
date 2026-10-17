@@ -176,6 +176,7 @@ import {
 } from '../chat/turn-typeahead.js';
 import { dispatchStreamingTurnTypeaheadSubmission } from './input/streaming-turn-typeahead.js';
 import { composeVertical, type LayoutZone } from '../layout/composer.js';
+import { createPromptBandRenderObserver, createPromptRowOwner, renderPromptOwnerHintRow, withPromptRowOwner } from '../display/prompt-row-owner.js';
 import type { CoreTurnDispatchTool } from '../core-turn/index.js';
 // streamGrok kept as back-compat shim in chat.ts — not imported here
 // directly anymore. Dashboard runs every turn through the in-process
@@ -201,6 +202,7 @@ import { startThinking, startPinnedThinking, type ThinkingHandle } from '../thin
 import { goalLoopIterationThinking } from './goal-loop-thinking.js';
 import { debug, getAmbientSessionId } from '../debug/log.js';
 import { startEventLoopStallMonitor, thinkingVerbFromFooter } from './event-loop-stall-monitor.js';
+import { createInputLagProbe, noteInputLagPaint, setInputLagProbe } from '../tui/input-lag-probe.js';
 import { getPushcutClient } from '../pushcut/client.js';
 // P2-3 + P4 + P5 — input-core wiring. Aliased on import to dodge the
 // many existing `resolveInputEvent`-ish names elsewhere in this file.
@@ -434,6 +436,7 @@ import { collectSignals, signalsSummary } from '../tool-hints/signals.js';
 import { resetProbes } from '../tool-hints/probe.js';
 import type { HintScope } from '../tool-hints/types.js';
 import { globalAgentRegistry, type AgentToolCallEvent } from '../agent/registry.js';
+import { createBackgroundJobsStatus } from './background-jobs-status.js';
 import { SELF_IMPLEMENT_TOOL_NAMES } from '../boot/daemon-tools/self-implement-names.js';
 import { type FoldMode } from '../log-entry.js';
 import { renderToolCallEvent, renderToolResultVariants } from '../chat/tool-render/index.js';
@@ -631,7 +634,7 @@ import {
 } from '../user-config.js';
 import { streamLLM, anyProviderAvailable, getProviderForConfig, nextReasoningLevel, reasoningLevelLabel, effectiveReasoningLevel, modelSupportsReasoning, type LLMMessage, type LLMToolSpec } from '../llm.js';
 import { currentRouteDecision, formatRouteDecisionSummary } from '../llm/route-decision.js';
-import { resolveDashboardActiveModel } from './acp-active-model.js';
+import { recordDashboardTurnExecution, resolveDashboardActiveModel } from './acp-active-model.js';
 import { getModelFamily, getModelTier } from '../models/prompts.js';
 import { buildPromptInjection, getPromptBankStore } from '../prompt-bank/index.js';
 import { getInputHistoryStore } from '../input-history.js';
@@ -665,7 +668,7 @@ import { registerDashboardPaneArtifactRuntimes } from './pane-artifact-runtime-r
 import { handleDashboardAttachmentPopupAction } from './attachment-popup-actions.js';
 import { renderDashboardAttachmentSummary } from './attachment-summary.js';
 import { openDashboardFolderAttachModal } from './folder-attach-modal-runtime.js';
-import { createDashboardLogClickDeps } from './log-click-runtime.js';
+import { createDashboardLogClickDeps, createFoldClickScrollAnchor } from './log-click-runtime.js';
 import { runDashboardSidebarSessionJoin } from './sidebar-session-join-runtime.js';
 import {
   runDashboardAutoRouteCountdown,
@@ -877,7 +880,9 @@ import {
   getGitStatusView,
   subscribeGitChanges,
   refreshDirtyAsync as refreshGitDirtyAsync,
+  refreshGitSnapshotAsync,
 } from '../git-fs/index.js';
+import { refreshSelfAmbientCache } from '../agent/self-ambient-cache.js';
 import { getPty, listPty, requestPtyTakeover } from '../pty-shell/registry.js';
 import { listPtyManifestRowsAt } from '../pty-shell/pty-manifest.js';
 import { ptyManifestTargets } from '../domains/fleet.js';
@@ -1027,6 +1032,7 @@ import { consumeTurnEndInterrupted, handoffTurnTypeaheadAtTurnEnd, releaseTurnTy
 import { abortTurnOnly } from '../turn-abort-scope.js';
 import { consumeInternalTurnYield, createInternalTurnGate, formatInternalTurnBanner, resolveInternalTurnSubmitIntent, type InternalTurnRequest } from './input/internal-turn.js';
 import { createSeatAutowake } from './input/seat-autowake.js';
+import { createDashboardWakeupScheduler, registerScheduleWakeupHostTool } from '../skills/tools/schedule-wakeup.js';
 import { createAttachmentRowMap } from '../log-pane/attachment-row-map.js';
 import { createAttachmentPopup, type AttachmentPopupAction } from '../log-pane/attachment-popup.js';
 import { findLogMatches, findVisibleLogMatches, type LogSearchResult } from '../log-pane/search.js';
@@ -1147,6 +1153,8 @@ import { agentBatchScratchTitle, renderAgentBatchScratch } from '../display/agen
 import { type ExecutionSurfaceHandle } from '../display/index.js';
 import { AgentSurfaceStore, renderAgentDetail, renderAgentRoster, type AgentSurfaceState } from '../display/agent-surface.js';
 import { globalAgentFlash } from '../display/agent-flash.js';
+import { globalTaskNotificationQueue } from '../agent/task-notification.js';
+import { createDashboardAgentWakeNotify, installAgentWake, wrapAgentWakePort } from './input/agent-wake.js';
 import { renderDebugEventDetail, renderDebugEventRows, renderDebugStack, renderPromptInjectionDebug } from '../display/debug-surface.js';
 import { buildDebugCallStack } from '../debug/call-stack.js';
 import { buildAstGrepHostTool } from '../skills/tools/ast-grep.js';
@@ -1307,7 +1315,7 @@ import {
   type SpaceLongPressDetector,
 } from './input/space-longpress-detector.js';
 import { isAllowlistedDictationSurface } from './input/dictation-surface-allowlist.js';
-import { createDashboardExternalInputHost, stopTurnViaEscGate } from './input/external-input-host.js';
+import { createDashboardExternalInputHost, stopTurnViaEscGate, updateDashboardExternalInputQueueNotice } from './input/external-input-host.js';
 import { registerExternalInputHost } from '../input/external-input-queue.js';
 // H3 #6 follow-up #3 — background sessions render as a distinct sidebar
 // kind with live state badge + tap-to-Join. Dashboard pulls BG records
@@ -1913,8 +1921,11 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
   const dashboardQuitConfirmationState = createQuitConfirmationState();
   const signalQuitConfirmationState = createQuitConfirmationState();
   let disposeDashboardEventLoopMonitor = (): void => {};
+  // TUI-AGENT-IDLE-WAKE — 이 대시보드 «자기» 완료 알림 구독만 푼다(배선 지점에서 채운다).
+  let disposeDashboardAgentWake = (): void => {};
   const closeDashboardTui = (): void => {
     disposeDashboardEventLoopMonitor();
+    try { disposeDashboardAgentWake(); } catch { /* never block exit */ }
     closeTui();
   };
   const exitDashboardTui = (): void => {
@@ -2233,6 +2244,7 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
     pillRowGetter: () => pillRowGetterForClick?.() ?? null,
     onPillClick: () => onPillClickForClick?.(),
     foldStack,
+    foldClickAnchor,
   });
 
   // Dispatcher for attachment-popup actions (log-pane click → popup
@@ -3392,7 +3404,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     getCwd: () => workingDir.cwd,
     notify: (line) => { chatLines.push(C.muted(line)); draw(); },
   });
-  const internalTurnYieldPort = seatAutowake.wrapPort(internalTurnGate.port);
+  const internalTurnYieldPort = wrapAgentWakePort(seatAutowake.wrapPort(internalTurnGate.port));
+  // ⭐ H5 자기 예약 깨움(TUI-H5-SCHEDULE-WAKEUP) — 프로세스 안 타이머가 그 시각에 H2 문으로 한 턴을 청한다.
+  //   직전 회차 판정 = 그 예약이 연 내부 턴이 아직 도나. 도구 등록은 아래 host tool 자리(하니스 자식 제외).
+  const wakeupScheduler = createDashboardWakeupScheduler(internalTurnGate, {
+    notify: (line) => { chatLines.push(C.muted(line)); draw(); },
+  });
   // ⭐ `B3` — 큐를 «도는 턴»에 넣으려면 그 턴이 도는 ***ACP 세션 id*** 가 필요하다.
   //   ⛔ `attachedSessionId`(대화 세션)와 «다른 축»이다 — 루프는 ACP 세션으로 스코프를 연다.
   //   ⚠️ 세션은 이 함수 «뒤»에서 만들어지므로 참조로 둔다(호출 시점엔 채워져 있다).
@@ -3421,6 +3438,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       });
     }
     try { process.stdout.write(paint); } catch { /* fail-soft */ }
+    noteInputLagPaint();
   };
 
   // Use this instead of bare `chatScrollOffset = -1` inside streaming
@@ -3450,9 +3468,17 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     }),
     log: (category, event, data) => debug.log(category, event, data),
   });
+  // ⌨️ TUI-TYPING-LAG-OBS — 키→칠 ms ⊕ 턴 시작 창 루프 지연(`tui.input-lag`). 훅은 tui.ts·chat·turn-preamble.
+  const inputLagProbe = createInputLagProbe({
+    isBusy: () => streamingInFlight,
+    log: (category, event, data) => debug.log(category, event, { ...data }),
+  });
+  setInputLagProbe(inputLagProbe);
   const disposeEventLoopStallMonitorOnBeforeExit = (): void => disposeDashboardEventLoopMonitor();
   disposeDashboardEventLoopMonitor = (): void => {
     disposeEventLoopStallMonitor();
+    setInputLagProbe(null);
+    inputLagProbe.dispose();
     process.removeListener('beforeExit', disposeEventLoopStallMonitorOnBeforeExit);
   };
   process.once('beforeExit', disposeEventLoopStallMonitorOnBeforeExit);
@@ -3461,14 +3487,24 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // batch status during skill execution, plus static folds already
   // committed to chatLines. The runtime helper owns registration;
   // `f` just toggles the most recent target.
+  // A click toggle keeps the viewport top (#81 — pinning to the tail
+  // moved the clicked header, so the same spot no longer folded back).
+  const foldClickAnchor = createFoldClickScrollAnchor({
+    getScrollOffset: () => chatScrollOffset,
+    setScrollOffset: (offset) => { chatScrollOffset = offset; },
+    maxScroll: () => logScrollMax(computeLogH(termSize().rows)),
+    getFrozenTail: () => logFrozenTailIndex,
+    setFrozenTail: (index) => { logFrozenTailIndex = index; },
+    lineCount: () => chatLines.length,
+  }, () => {
+    // Pin back to tail if the user hadn't scrolled away — expanding
+    // a batch tree adds rows, and losing the bottom anchor is
+    // disorienting when `f` was supposed to reveal more content.
+    chatScrollOffset = -1;
+  });
   const foldStack = new FoldStack({
     chatLines,
-    onAfterToggle: () => {
-      // Pin back to tail if the user hadn't scrolled away — expanding
-      // a batch tree adds rows, and losing the bottom anchor is
-      // disorienting when `f` was supposed to reveal more content.
-      chatScrollOffset = -1;
-    },
+    onAfterToggle: (target, delta) => foldClickAnchor.onAfterToggle(target, delta),
   });
   // The most recent streamed assistant response — kept in both raw and
   // formatted form so Ctrl+Y can copy clean markdown and `r` in log
@@ -3700,7 +3736,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // boot block via bgSurface.onUpdate; read on every status redraw.
   // Null until the first handle is tracked so we don't render an empty
   // pill on a fresh session.
-  let latestShellRollup: { running: number; backgrounded: number } | null = null;
+  let latestShellRollup: { running: number; backgrounded: number; background: number } | null = null;
+  // TUI-BG-JOB-VISIBILITY (#71) — «⧗ 백그라운드 N»(턴을 넘어 사는 셸 일). 관측은 모듈, 여기선 배선만
+  //   (깨우기 0 — TUI-AGENT-IDLE-WAKE 몫).
+  const backgroundJobsStatus = createBackgroundJobsStatus();
   // The ACP bridge is created later during dashboard boot. Keep status renders
   // safe before then, and bind this reader once the bridge exists.
   let activeAcpRuntimeModel = (): string | undefined => undefined;
@@ -3740,6 +3779,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         sshLabel: sshStatusLabel,
         host: hostLabel,
         runningAgents: globalAgentRegistry.list().filter((agent) => agent.state === 'running').length,
+        backgroundJobs: backgroundJobsStatus.summary(),
         controller: process.env.ELANOUS_CONTROLLER?.trim() || undefined,
         shellCount: liveShells,
         shellRollup: latestShellRollup ?? undefined,
@@ -3767,7 +3807,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   let drawQueued = false;
   let queuedDrawForce = false;
   let lastDrawDebugAt = 0;
-  let repaintPromptAfterRender: (opts?: { force?: boolean }) => void = () => {};
+  const promptRowOwner = createPromptRowOwner({ requestFrame: () => draw() });
+  const observePromptBand = createPromptBandRenderObserver();
   const displayEvents = createDisplayEventBus();
   const recentTerminalMouseIntents: Array<{
     surfaceId: string;
@@ -3924,11 +3965,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // and fires onPush/onPop. The modal-surface-adapter (registered
   // below after widgetHost discovery) fans those into the global
   // SurfaceRegistry. Existing pushModal callsites unchanged.
-  const identityHooks = composeIdentityHooks({
-    afterRender: (request) => {
-      try { repaintPromptAfterRender({ force: request.force }); } catch { /* noop */ }
-    },
-  });
+  const identityHooks = composeIdentityHooks({});
   // U4 Bundle B — layer the workspace host wiring on top of modal
   // identity wiring so popup/dialog/terminal modal mounts
   // automatically project into a host-managed workspace set. This is
@@ -4110,7 +4147,17 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // out-of-process modifications (external editor, another PTY,
   // etc.). Throttle inside git-fs prevents back-to-back subprocess
   // spawns when this and a post-Edit refresh overlap.
+  // TUI-TYPING-LAG — keep the turn-preamble caches warm off the event loop (boot ⊕ every tick):
+  // the git snapshot (async subprocesses) and the self-ambient store scan (worker thread). A turn
+  // then serves them from cache instead of rebuilding synchronously on the turn path. Both are
+  // no-ops while the cached value is younger than the threshold; failures are fail-soft.
+  const warmTurnPreambleCaches = (): void => {
+    try { void refreshGitSnapshotAsync(getSessionCwd(), { ifOlderThanMs: 30_000 }); } catch { /* noop */ }
+    try { void refreshSelfAmbientCache({}, { ifOlderThanMs: 25_000 }); } catch { /* noop */ }
+  };
+  warmTurnPreambleCaches();
   const gitDirtyTimer: ReturnType<typeof setInterval> = setInterval(() => {
+    warmTurnPreambleCaches();
     try {
       const before = getGitStatusView(getSessionCwd());
       // TUI-TYPING-LAG — the 5s probe ran `git status` synchronously (130ms+, hundreds under load).
@@ -4236,7 +4283,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         wireShellRunnerSurface,
         createFileCaptureEngine,
         setShellRunnerDeps,
-        setLatestShellRollup: (rollup) => { latestShellRollup = rollup; },
+        setLatestShellRollup: (rollup) => {
+          latestShellRollup = rollup;
+          // 유휴 중 백그라운드가 끝나도 상태줄이 고쳐지도록 — 수가 바뀔 때만 다시 그린다.
+          if (backgroundJobsStatus.noteRollup(rollup)) {
+            try { draw(); } catch { /* TUI torn down */ }
+          }
+        },
       });
     }
     const { setShellApprover } = await import('../shell-primitive/index.js');
@@ -9974,6 +10027,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // kept alive per cwd; reaped on 10-min idle. See
   // 내부 문서 `CAPABILITIES-lsp` for the op surface.
   pluginHost.registerHostTool(buildLspHostTool());
+  // H5 — 이 TUI 로 돌아오는 자기 예약. 하니스 자식(ELANOUS_HARNESS_ROLE 있음)은 무인 런이라 싣지 않는다.
+  registerScheduleWakeupHostTool(pluginHost, wakeupScheduler);
   pluginHost.registerHostTool({
     name: 'view_getConfig',
     description: 'Return dashboard view configuration: native and custom views, order, enabled state, shortcuts, baseView, pane rows, ratios, primary pane, and active view.',
@@ -11301,6 +11356,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // actually scrolled up. If something else (streaming, slash reply)
     // pulls the offset back to -1 (tail), the freeze is no-op'd so the
     // user sees full content at tail regardless of stale index state.
+    foldClickAnchor.reconcile();
     const logProjection = buildDashboardLogProjection({
       chatScrollOffset,
       logFrozenTailIndex,
@@ -11361,7 +11417,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       height: 1,
       render: (_h, c) => [suppressPromptArea ? ' '.repeat(c) : hLine(c)],
     });
-    const inputPromptZone = buildDashboardTurnTypeaheadPromptZone({
+    const inputPromptZone = withPromptRowOwner(buildDashboardTurnTypeaheadPromptZone({
       frame: promptFrame,
       height: promptFrame.inputHeight,
       placeholder: C.muted('\u276f '),
@@ -11371,7 +11427,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       width: totalW,
       suppressPromptArea,
       onPaint: paint => { promptCaret = paint.caret; },
-    });
+    }), promptRowOwner, { suppressPromptArea, onCaret: (caret) => { promptCaret = caret; }, observe: observePromptBand });
     zones.push(observeDashboardTurnTypeaheadPromptZone(inputPromptZone, {
       promptBottomRow: promptFrame.promptBottomRow,
       state: turnTypeaheadRef.state,
@@ -11383,7 +11439,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     });
 
     // Essential bottom area: status line only; no dock row.
-    zones.push({ id: 'status-gap-top', height: 1, render: () => [''] });
+    zones.push({ id: 'status-gap-top', height: 1, render: () => [renderPromptOwnerHintRow(promptRowOwner, { suppressPromptArea })] });
     zones.push({
       id: 'status',
       height: 1,
@@ -11604,11 +11660,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       if (debug.enabled) {
         debug.log('dashboard.draw', 'flush-microtask', {
           force,
-          promptRepainted: true,
+          promptRepainted: false,
         });
       }
       drawNow({ force });
-      try { repaintPromptAfterRender({ force }); } catch { /* noop */ }
     });
   };
 
@@ -12411,18 +12466,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     submit?: (request?: string | TextInputExternalSubmitRequest) => void;
     getBufferText?: () => string;
   } = { repaint: () => {} };
-  repaintPromptAfterRender = () => {
-    if (shouldSuppressDashboardBottomArea()) {
-      display.setCursor(null);
-      return;
-    }
-    promptCtl.repaint();
-  };
-  // V3 note: repaintPromptAfterRender receives {force} from the
-  // coordinator hook but promptCtl.repaint() has no diff state of its
-  // own — the main render's force=true already did eraseDown before
-  // this runs, so prompt rows are clean. Forwarding force is a no-op
-  // today but the signature is there for future direct-paint callers.
 
   // Terminal resize wiring — CAPABILITIES-display.md §1.3 defines the
   // coordinator entry triplet as "readKey / mouse / resize" but the
@@ -12431,14 +12474,36 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // resize to a forced dashboard redraw plus the prompt repaint hook;
   // the hook is a no-op while input is idle so the call is always
   // safe. Dispose on process exit to keep the listener set clean.
-  const disposeResizeListener = installResizeListener({ draw: (opts) => draw(opts), promptCtl });
+  // TUI-PICKER-RESIZE-SHRINK (#76) — the forced coordinator frame
+  // re-emits open overlays (slash picker) AFTER the prompt chrome, so
+  // the divider repaint cannot erase the picker's bottom border.
+  const disposeResizeListener = installResizeListener({
+    draw: (opts) => draw(opts),
+    promptCtl,
+    requestOverlayFrame: () => display.requestRender({ force: true }),
+  });
   process.on('exit', disposeResizeListener);
   // 외부 주입(`pty text`)을 사용자 타이핑과 섞지 않고 별도 대기열로 — 결함 #6(10-14).
+  let externalInputQueueNotice: string | null = null;
+  const setExternalInputQueueNotice = (line: string | null): void => {
+    const changed = updateDashboardExternalInputQueueNotice(
+      chatLines,
+      externalInputQueueNotice,
+      line,
+      (notice) => C.muted(`  ${notice}`),
+    );
+    externalInputQueueNotice = line;
+    if (changed) {
+      chatScrollOffset = -1;
+      draw();
+    }
+  };
   const disposeExternalInputHost = registerExternalInputHost(createDashboardExternalInputHost({
     isTurnActive: () => streamingInFlight,
     getTurnStop: () => currentTurnExternalStop,
     promptCtl,
     pushNotice: (line) => { chatLines.push(C.muted(`  ${line}`)); chatScrollOffset = -1; draw(); },
+    setQueueNotice: setExternalInputQueueNotice,
   }));
   process.on('exit', disposeExternalInputHost);
 
@@ -13034,6 +13099,17 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       try { draw(); } catch { /* TUI torn down */ }
     });
     process.once('beforeExit', () => agentDoneRedraw.dispose());
+    // ⭐ TUI-AGENT-IDLE-WAKE — 배경 자식(⊕ RunShell bg) 완료 큐의 «유일한» 구독(onEnqueue 구독 0 → 1).
+    //   채팅 한 줄 «✓ 위임 끝: <이름> — 다음 턴에 결과» · 결과는 다음 턴 preamble 이 싣는다.
+    //   ⛔ 입력칸·injectKey·pty 주입 0(대표 비침투). dedupe·수명은 모듈, 여기선 배선만.
+    const agentWake = installAgentWake({
+      subscribe: (listener) => globalTaskNotificationQueue.onEnqueue(listener),
+      // 그리기 실패는 삼키지 않는다 — 모듈이 잡아 notified{shown:false} 로 남긴다.
+      notify: createDashboardAgentWakeNotify((line) => { chatLines.push(C.muted(line)); }, () => draw()),
+      // 조각 2 — 자리 TUI ∧ 유휴면 H2 문으로 다음 턴(origin child-complete) · 판정은 모듈.
+      openTurn: { startTurnIfIdle: (text, opts) => internalTurnGate.startTurnIfIdle(text, opts), getCwd: () => workingDir.cwd, isPending: (taskId) => globalTaskNotificationQueue.has(taskId) },
+    });
+    disposeDashboardAgentWake = () => agentWake.dispose();
 
     // PLAN-chat-hud-multi-surface-port-2026-05-13 §4 M5 — 1Hz ticker
     // that pushes the current token-gauge + variant values onto the
@@ -14766,10 +14842,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 userText,
                 hostTools: pluginHost.hostLLMTools(),
                 runtimeTools: runtime.listToolRuntimes('tui'),
-                pluginTools: pluginHost.activePluginLLMTools(),
                 optionalTools: acpTurnRef.optionalSpecs,
                 surface: acpTurnRef.turnProfile?.surface,
-                rich: false,
               })
             : [];
           return [
@@ -14785,7 +14859,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               // codex-only behavioral addendum (fix L-1) inside the
               // universal preamble.
               modelFamily: getModelFamily(inspectActiveProvider().model),
-              rich: false,
               enabledTools: tools.map(t => t.name),
               seatBoot: true,
             }),
@@ -14798,10 +14871,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             userText,
             hostTools: pluginHost.hostLLMTools(),
             runtimeTools: runtime.listToolRuntimes('tui'),
-            pluginTools: pluginHost.activePluginLLMTools(),
             optionalTools: acpTurnRef.optionalSpecs,
             surface: acpTurnRef.turnProfile?.surface,
-            rich: false,
           });
           // ⭐ Remember this turn's catalog so a spawned sub-agent can inherit it.
           //
@@ -16192,6 +16263,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             // C-d-1 — 하단 슬롯 결정 뷰 활성 시 composer 페인트 정지(단일 소유자).
             shouldPaint: () => !shouldSuppressDashboardBottomArea() && !bottomSlotModalActive(),
             promptCtl,
+            promptRowOwner,
             setInputLines: (n) => dashboardState.setInputLines(n),
             redraw: draw,
             dispatchGlobalAction: runChatMainGlobalAction,
@@ -18367,10 +18439,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                     userText: args.userText,
                     hostTools: pluginHost.hostLLMTools(),
                     runtimeTools: runtime.listToolRuntimes('tui'),
-                    pluginTools: pluginHost.activePluginLLMTools(),
                     optionalTools: acpTurnRef.optionalSpecs,
                     surface: acpTurnRef.turnProfile?.surface,
-                    rich: false,
                   })
                 : [];
               return [
@@ -18380,7 +18450,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   cwd: args.cwd,
                   turnProfile: args.turnProfile as SessionTurnProfile,
                   userConfig: args.userConfig,
-                  rich: false,
                   enabledTools: tools.map(t => t.name),
                   seatBoot: true,
                 }),
@@ -18505,6 +18574,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             },
             runTurnUsageRuntime: (usage) => {
               latestTurnUsage = usage as import('../prompt-cache/types.js').LLMUsage;
+              // 이번 턴의 «실제» 공급자·모델(폴백이면 넘어간 쪽) — 완료 배지가 «A → B» 로 보인다(TUI-MODEL-BADGE-ACTUAL).
+              //   원격 데몬 세션은 적지 않는다(결정이 데몬 쪽 · 후속 칸 TUI-MODEL-BADGE-REMOTE).
+              recordDashboardTurnExecution(usage as { model?: string; routeProvider?: string }, { remote: daemonAttached });
               runDashboardTurnUsageRuntime({
                 // The plain-turn pipeline threads usage as `unknown` for
                 // decoupling; at this consumer it is the concrete LLM usage
@@ -18842,5 +18914,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   } finally {
     setSelfImplementSoftStopSpaceObserver(null);
     if (tuiSeatAskTimer) clearInterval(tuiSeatAskTimer);
+    wakeupScheduler.dispose();
   }
 }

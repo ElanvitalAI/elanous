@@ -108,6 +108,10 @@ export interface ChatPickerModalBindings {
   getInputZoneHeight: () => number;
   width: number;
   getWidth?: () => number;
+  /** Live prompt anchor (input bottom row + col). When present it wins
+   *  over the mount-time `bounds` snapshot, so a terminal resize moves
+   *  an already-open picker with the prompt (TUI-PICKER-RESIZE-SHRINK). */
+  getAnchor?: () => { row: number; col: number };
   onKey?: PickerOnKey;
   onRowClick?: PickerOnRowClick;
 }
@@ -124,6 +128,7 @@ type FramedPickerSpec<T> = {
   getInputZoneHeight: () => number;
   width: number;
   getWidth?: () => number;
+  getAnchor?: () => { row: number; col: number };
   onKey?: PickerOnKey;
   onRowClick?: PickerOnRowClick;
 };
@@ -132,7 +137,8 @@ function createFramedPickerModal<T>(spec: FramedPickerSpec<T>): ModalSurface {
   const computeBounds = (): (ModalBounds & { startIdx: number; visibleCount: number }) | null => {
     const rows = spec.getRows();
     const inputZoneHeight = spec.getInputZoneHeight();
-    const bottomRow = spec.bounds.row - inputZoneHeight;
+    const anchor = spec.getAnchor?.() ?? spec.bounds;
+    const bottomRow = anchor.row - inputZoneHeight;
     if (rows.length === 0 || bottomRow < 4) return null;
     const { visibleCount, startIdx } = pickerWindow(
       rows.length,
@@ -142,7 +148,7 @@ function createFramedPickerModal<T>(spec: FramedPickerSpec<T>): ModalSurface {
     if (visibleCount <= 0) return null;
     const height = visibleCount + 3;
     const row = bottomRow - height + 1;
-    return { row, col: spec.bounds.col, width: spec.getWidth?.() ?? spec.width, height, startIdx, visibleCount };
+    return { row, col: anchor.col, width: spec.getWidth?.() ?? spec.width, height, startIdx, visibleCount };
   };
 
   /** Phase 4.5a (substrate Occam · §4-pre.7 · 2026-05-03) — update

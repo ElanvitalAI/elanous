@@ -17,6 +17,8 @@ export interface PodReuseCleanupDecisionInput {
   statusExitCode: number | null;
   statusPorcelain: string;
   remainingPaths?: readonly string[];
+  additionalCleanExclusions?: readonly { name: string; pattern: string }[];
+  statusExclusions?: readonly string[];
 }
 
 export interface PodReuseCleanupDecision {
@@ -30,19 +32,21 @@ export interface PodReuseCleanupDecision {
 }
 
 /**
- * Pure request-boundary decision: return argv for the caller to execute and
- * decide whether the worker can be reused from the command results.
- * Execution/wiring and lifecycle event emission intentionally live in a later slice.
+ * Pure policy: return fixed argv and decide whether the worker can be reused
+ * from actual command results. WarmWorkerRuntime owns execution and lifecycle
+ * event emission at the serialized request boundary.
  */
 export function decidePodReuseCleanup(input: PodReuseCleanupDecisionInput): PodReuseCleanupDecision {
   const remainingPaths = (input.remainingPaths ?? []).slice(0, 5);
   const resetArgs = ['reset', '--hard', input.base] as const;
   const cleanArgs = [
     'clean', '-ffdx',
-    ...POD_REUSE_CLEAN_EXCLUSIONS.flatMap(({ pattern }) => pattern ? ['-e', pattern] : []),
+    ...[...POD_REUSE_CLEAN_EXCLUSIONS, ...(input.additionalCleanExclusions ?? [])]
+      .flatMap(({ pattern }) => pattern ? ['-e', pattern] : []),
   ] as const;
-  const statusArgs = ['status', '--porcelain'] as const;
-  const preserved = POD_REUSE_CLEAN_EXCLUSIONS.map(({ name }) => name);
+  const statusArgs = ['status', '--porcelain', '-z', '--', '.', ...(input.statusExclusions ?? [])
+    .map((path) => `:(exclude,top,literal)${path}`)] as const;
+  const preserved = [...POD_REUSE_CLEAN_EXCLUSIONS, ...(input.additionalCleanExclusions ?? [])].map(({ name }) => name);
 
   let reason: PodReuseCleanupDecision['reason'];
   if (!/^[0-9a-f]{40}$/i.test(input.base)) reason = 'invalid-base';

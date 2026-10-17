@@ -7,6 +7,11 @@ export interface GateTestShard {
   plannedSeconds: number;
 }
 
+/** A requested shard count cannot hold the measured files; more shards may make the same plan valid. */
+export class GateShardCapacityError extends Error {
+  constructor(message: string) { super(message); this.name = 'Error'; }
+}
+
 /** Keep real child/PTY tests out of ordinary self-gate shards, within the caller's shard budget. */
 export function planSelfGateSpawnSeparatedShards(
   files: readonly string[],
@@ -19,8 +24,11 @@ export function planSelfGateSpawnSeparatedShards(
   const spawn = unique.filter(isGateSpawnLaneFile);
   const regular = unique.filter((file) => !isGateSpawnLaneFile(file));
   if (!spawn.length || !regular.length) return planGateTestShards(unique, rssMb, seconds, budgetGiB, shardCount);
-  if (shardCount < 2) throw new Error('self gate spawn lane needs at least two shards when regular and spawn tests coexist');
-  const spawnCount = Math.min(3, spawn.length, shardCount - 1);
+  if (shardCount < 2) throw new GateShardCapacityError('self gate spawn lane needs at least two shards when regular and spawn tests coexist');
+  // Three spawn bundles are the normal lane width, not a memory ceiling. A 5 GiB spawn file cannot share an 8 GiB
+  // bundle with another such file; retain lane isolation while allowing the measured plan to grow past three.
+  const neededSpawn = planGateTestShards(spawn, rssMb, seconds, budgetGiB).length;
+  const spawnCount = Math.min(spawn.length, shardCount - 1, Math.max(3, neededSpawn));
   const planned = [
     ...planGateTestShards(regular, rssMb, seconds, budgetGiB, shardCount - spawnCount),
     ...planGateTestShards(spawn, rssMb, seconds, budgetGiB, spawnCount),
@@ -65,7 +73,7 @@ export function planGateTestShards(
     if (!shard) {
       const totalRssMb = sorted.reduce((sum, candidate) => sum + rssMb.get(candidate)!, 0);
       const largestRssMb = rssMb.get(sorted[0]!)!;
-      throw new Error(`test files exceed ${shardCount} shard memory budgets (files=${unique.length} · totalRssMb=${Math.round(totalRssMb)} · largestRssMb=${Math.round(largestRssMb)} · budgetMb=${capacity} · neededShards≥${Math.ceil(totalRssMb / capacity)})`);
+      throw new GateShardCapacityError(`test files exceed ${shardCount} shard memory budgets (files=${unique.length} · totalRssMb=${Math.round(totalRssMb)} · largestRssMb=${Math.round(largestRssMb)} · budgetMb=${capacity} · neededShards≥${Math.ceil(totalRssMb / capacity)})`);
     }
     shard.files.push(file);
     shard.plannedRssMb += rss;

@@ -305,7 +305,6 @@ describe('ops-ledger RunShell 스티어링', () => {
       userText: 'TC 우편 msg list 확인',
       hostTools: [],
       runtimeTools: listToolRuntimes('tui'),
-      rich: false,
     });
     expect(tools.map(tool => tool.name)).toContain('RunShell');
     expect(tools.map(tool => tool.name)).toContain('MsgList');
@@ -429,7 +428,6 @@ describe('ops-ledger 배선 — 카탈로그 ↔ 런타임 ↔ 등록부', () =>
         userText: '우편을 읽고 판을 점검해 줘',
         hostTools: [],
         runtimeTools: listToolRuntimes('tui'),
-        rich: false,
       });
       const names = new Set(specs.map((spec) => spec.name));
       for (const runtime of ALL_OPS_LEDGER_RUNTIMES) expect(names.has(runtime.spec.name)).toBe(true);
@@ -470,7 +468,7 @@ describe('ops-ledger 한 턴 시나리오 — OP 가 우편 5통을 읽고 판�
     setElanousConfigDir(dir);
     registerAllDefaultToolRuntimes();
     const userText = 'OP 앞 우편 5통 읽고 요약해 줘, 판 칸도 정리';
-    const tools = buildSessionRuntimeToolSpecs({ userText, hostTools: [], runtimeTools: listToolRuntimes('tui'), rich: false });
+    const tools = buildSessionRuntimeToolSpecs({ userText, hostTools: [], runtimeTools: listToolRuntimes('tui') });
     const log = spyOn(debug, 'log');
     const spawn = spyOn(childProcess, 'spawn');
     try {

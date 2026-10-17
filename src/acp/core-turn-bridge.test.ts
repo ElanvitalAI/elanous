@@ -266,7 +266,7 @@ test('TUI route selects one core turn, matching tools and visible/logged decisio
     return { stopReason: 'end_turn', finalText: '' };
   });
   const routeLog = spyOn(debug, 'log');
-  const specs = ['Edit', 'Write', 'Bash', 'decisions_pending', 'ops_seats', 'logs_query',
+  const specs = ['Edit', 'Write', 'Bash', 'Agent', 'decisions_pending', 'ops_seats', 'logs_query',
     'DashboardConfigSet', 'WebSearch', 'schedule_manage', 'Read'].map((name) => ({
     name, description: '', parameters: { type: 'object' as const },
   }));
@@ -293,6 +293,7 @@ test('TUI route selects one core turn, matching tools and visible/logged decisio
     expect(coreCalls.at(-1)?.tools.map((tool) => tool.name)).not.toContain('Edit');
     expect(coreCalls.at(-1)?.tools.map((tool) => tool.name)).not.toContain('Write');
     expect(coreCalls.at(-1)?.tools.map((tool) => tool.name)).not.toContain('Bash');
+    expect(coreCalls.at(-1)?.tools.map((tool) => tool.name).includes('Agent')).toBe(expected === '조사');
     expect(pushes[0]).toBe(`라우팅: ${expected}\n`);
     expect(routeLog).toHaveBeenCalledWith('chat.route', 'decided', {
       route: expected, reason: expect.any(String), goalLoop: false, seat: null, seatKnown: false,
@@ -329,7 +330,7 @@ test('TUI read question runs one full-tool turn outside the goal loop; a write r
     coreCalls.push(ctx);
     return { stopReason: 'end_turn', finalText: '' };
   });
-  const specs = ['Edit', 'Write', 'Bash', 'Read', 'decisions_pending'].map((name) => ({
+  const specs = ['Edit', 'Write', 'Bash', 'Agent', 'Read', 'decisions_pending'].map((name) => ({
     name, description: '', parameters: { type: 'object' as const },
   }));
   const run = async (text: string) => {
@@ -484,5 +485,15 @@ test('«조사» carries the read-only MsgList and no shell or mailbox writer (T
   // The other quick routes are unchanged — MsgList is added to «조사» only.
   for (const route of ['조회', '설정 변경', '상시 일'] as const) {
     expect(toolsForTuiRoute(specs, route).map((tool) => tool.name)).not.toContain('MsgList');
+  }
+});
+
+test('Agent is allowed on the investigation quick route only', () => {
+  const specs = ['Agent', 'Read', 'decisions_pending', 'DashboardConfigSet', 'schedule_manage'].map((name) => ({
+    name, description: '', parameters: { type: 'object' as const },
+  }));
+  expect(toolsForTuiRoute(specs, '조사').map((tool) => tool.name)).toContain('Agent');
+  for (const route of ['조회', '설정 변경', '상시 일'] as const) {
+    expect(toolsForTuiRoute(specs, route).map((tool) => tool.name)).not.toContain('Agent');
   }
 });

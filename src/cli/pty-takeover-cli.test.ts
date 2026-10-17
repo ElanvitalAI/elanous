@@ -1422,6 +1422,11 @@ describe('runPtyList remote bookmark', () => {
       // ⊕ 그리고 생략과 «갈린다».
       expect('workdir' in byId.live_omitted!).toBe(false);
       expect(byId.live_present?.workdir).toBe('/tmp/live/tree');
+      // ⭐ H10 키 대칭 — 원격 행도 로컬과 같은 turn·build 키를 «모른다» 값으로 싣는다.
+      for (const r of rows) {
+        expect(r.turn).toEqual({ state: 'unknown', at: null, sinceSec: null });
+        expect('build' in r && r.build === null).toBe(true);
+      }
     } finally {
       server.stop(true);
       rmSync(dir, { recursive: true, force: true });

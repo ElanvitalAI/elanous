@@ -859,7 +859,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
       : runShards(cwd, testFiles, selection.baseRef, shardCount);
     capture.sharded = sharded;
     capture.verdict = sharded.aggregate.status;
-    lines.push(`shards: ${sharded.shards.length} (${sharded.shards.map((shard) => `${shard.id}=${shard.files.join(',')}`).join('; ')})${sharded.measurementFailures ? ` · 측정 실패 ${sharded.measurementFailures}` : ''}${options.fixedShardDistribution ? ' · 고정 분배(사전 측정 없음)' : ''}`);
+    lines.push(`shards: ${sharded.shards.length} (${sharded.shards.map((shard) => `${shard.id}=${shard.files.join(',')}`).join('; ')})${sharded.expandedFrom !== undefined ? ` · RSS 예산상 ${sharded.expandedFrom}→${sharded.shards.length} 자동 확장` : ''}${sharded.measurementFailures ? ` · 측정 실패 ${sharded.measurementFailures}` : ''}${options.fixedShardDistribution ? ' · 고정 분배(사전 측정 없음)' : ''}${sharded.distribution === 'fixed-cap-fallback' ? ` · 호스트 상한 자동 고정 분배(${sharded.fallbackReason})` : ''}`);
     // 조각이 «못 쟀다»일 때 이유가 줄에 없으면 자리·시간 초과·죽음을 가를 수 없다(OP 10-09 light RC) — 종료 코드·신호를 같이 싣는다.
     const side = (code: number | null, signal: string | null | undefined, junit: string | undefined) => signal ? `signal ${signal}` : code === null ? 'exit ?' : `exit ${code}${junit === undefined ? ' · junit 없음' : ''}`;
     for (const attempt of sharded.attempts) {
@@ -886,7 +886,12 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
     let shardBaseline: SelfGateCliResult['baseline'];
     let unmeasuredReason: string | undefined;
     if (aggregate.status === 'unmeasured') {
-      unmeasuredReason = aggregate.retryShardIds.join(', ') || sharded.reason || 'no complete JUnit';
+      unmeasuredReason = sharded.reason
+        ? redactSecretText(sharded.reason).replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ').slice(0, 500)
+        : aggregate.retryShardIds.join(', ') || 'no complete JUnit';
+      for (const shardId of aggregate.retryShardIds) {
+        lines.push(`shard unmeasured: ${shardId} · ${sharded.unmeasuredByShard?.[shardId] ?? sharded.reason ?? 'cause unavailable'}`);
+      }
       lines.push(`shards: unmeasured (${unmeasuredReason})`);
       capture.unmeasuredReason = unmeasuredReason;
     }

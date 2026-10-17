@@ -34,6 +34,8 @@ import {
 
 /** CLI `--deadline` 생략 시 — 기존 Pod Job 수명 상한과 같다. */
 export const POD_COMMAND_DEADLINE_SECONDS = POD_JOB_DEADLINE_SECONDS;
+/** An opt-in shadow cannot let a synchronous kubectl call hide its host deadline for two minutes. */
+export const POD_COMMAND_CANCEL_KUBECTL_TIMEOUT_MS = 15_000;
 
 export const POD_NETWORK_SKILLS = ['omni-crawl', 'omni-digest'] as const;
 export const POD_LITE_IMAGE = 'elanous-harness-lite:local';
@@ -414,6 +416,12 @@ export interface RunPodCommandOptions {
    * elsewhere. Omitted = poll without a bound (unchanged for every caller but the release gate).
    */
   statusUnreadableMs?: number;
+  /** Optional caller cancellation. Omitted callers keep their existing polling behavior. */
+  signal?: AbortSignal;
+  /** Optional host wall-clock deadline; checked even when a synchronous kubectl delayed the abort timer. */
+  hostDeadlineAtMs?: number;
+  /** Clock seam for deadline checks. */
+  nowMs?: () => number;
   kubectl?: Kubectl;
   /** A caller-owned scheduler is self-capped: acquires count only its own Jobs, never cluster occupancy (POOLGLOBAL-REG). */
   poolScheduler?: PodPoolScheduler;
@@ -486,14 +494,35 @@ export function podCommandTargetCommit(o: { remote: boolean; gitHead: () => stri
   return o.localImageCommit();
 }
 
+/** Only opt-in callers can stop waiting on a pre-Job async operation. Late rejections stay observed. */
+function awaitPodCommandAbort<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return pending;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => { signal.removeEventListener('abort', onAbort); reject(signal.reason ?? new Error('pod command aborted')); };
+    signal.addEventListener('abort', onAbort, { once: true });
+    pending.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+      (error) => { signal.removeEventListener('abort', onAbort); reject(error); },
+    );
+    if (signal.aborted) onAbort();
+  });
+}
+
 /** 풀 자리 · 이미지 판 · Job 적용 · 완료 대기 · 산출 회수 · Secret 정리. */
 export async function runPodCommand(options: RunPodCommandOptions): Promise<PodCommandResult> {
+  const nowMs = options.nowMs ?? Date.now;
+  const ensureLive = () => {
+    if (options.signal?.aborted) throw options.signal.reason ?? new Error('pod command aborted');
+    if (options.hostDeadlineAtMs !== undefined && nowMs() >= options.hostDeadlineAtMs) throw new Error('pod shadow: host timeout');
+  };
+  ensureLive();
   const command = [...options.command];
   if (command.length === 0) throw new Error('pod command: 명령이 비었다');
   const skills = [...new Set((options.skills ?? []).map((s) => s.trim()).filter(Boolean))];
   const llm = options.llm;
   const log = options.log ?? ((c, e, d) => debug.log(c, e, d));
-  const baseKubectl = options.kubectl ?? defaultKubectl;
+  const baseKubectl = options.kubectl ?? ((args: readonly string[], input?: string) =>
+    defaultKubectl(args, input, options.signal ? POD_COMMAND_CANCEL_KUBECTL_TIMEOUT_MS : undefined));
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const namespace = options.namespace ?? 'elanous-test';
   const image = options.image ?? podCommandImageFor(skills, options.clone === true, options.lite === true);
@@ -534,18 +563,32 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     // concurrency cap — its Jobs count against the spec caps, not the cluster's goal Pods (#24253 → 0.2.15 gate ran 1 shard).
     const selfCapped = options.poolScheduler !== undefined;
     for (;;) {
-      member = await pool.tryAcquire(undefined, undefined, { selfCapped });
+      ensureLive();
+      const acquiring = pool.tryAcquire(undefined, undefined, { selfCapped, signal: options.signal });
+      try { member = await awaitPodCommandAbort(acquiring, options.signal); }
+      catch (error) {
+        // If cancellation won the await at the same instant acquisition completed, return that lease.
+        void acquiring.then((late) => { if (late) pool!.release(late); }, () => {});
+        throw error;
+      }
       if (member) break;
-      await sleep(options.pollMs ?? 15_000);
+      await awaitPodCommandAbort(sleep(options.pollMs ?? 15_000), options.signal);
     }
+  }
+  if (options.signal?.aborted) {
+    if (member && pool) pool.release(member);
+    ensureLive();
   }
   const currentContext = member || options.kubectl ? null : baseKubectl(['config', 'current-context']);
   const context = member?.context ?? (currentContext?.status === 0 ? currentContext.stdout.trim() : '');
-  const kubectl: Kubectl = (args, stdin) => baseKubectl(context ? ['--context', context, ...args] : [...args], stdin);
-  const cleanupSecret = () => { kubectl(['-n', namespace, 'delete', 'secret', '-l', own, '--ignore-not-found']); };
+  const kubectlRaw: Kubectl = (args, stdin) => baseKubectl(context ? ['--context', context, ...args] : [...args], stdin);
+  const kubectl: Kubectl = (args, stdin) => { ensureLive(); const result = kubectlRaw(args, stdin); ensureLive(); return result; };
+  const cleanupSecret = () => { kubectlRaw(['-n', namespace, 'delete', 'secret', '-l', own, '--ignore-not-found']); };
   const artifactRoot = options.artifactsRoot ?? `${effectiveInstanceRoot()}/pod-artifacts`;
   const artifactsDir = `${artifactRoot}/${name}`;
+  let jobApplied = false;
   try {
+    ensureLive();
     if (!context && !options.kubectl) throw new Error('pod command: kubectl context 를 확인할 수 없다');
     let grokAuth: string | undefined;
     if (llm === 'grok') {
@@ -573,7 +616,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       const localSkillsDigest = options.kubectl ? null : image === POD_LITE_IMAGE
         ? podSkillsDigest(POD_NETWORK_SKILLS, resolve(import.meta.dir, '../../../skills')).digest
         : podSkillsDigest(resolvePodSkills(env).skills).digest;
-      const syncs = await (options.syncImages ?? syncPoolImages)([member], image, imageCommit, { localSkillsDigest });
+      const syncs = await awaitPodCommandAbort((options.syncImages ?? syncPoolImages)([member], image, imageCommit, { localSkillsDigest }), options.signal);
       const synced = syncs.get(member.context);
       if (synced && !synced.ok) throw new Error(`pod command: 이미지 판을 못 맞췄다: ${synced.detail}`);
       if (synced?.imageRef) member = { ...member, imageRef: synced.imageRef };
@@ -586,8 +629,8 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     const seedMirror = options.seedMirror ?? (options.kubectl ? undefined : seedMirrorOnce);
     if (seedMirror && options.clone && options.source?.kind === 'commit' && hostMirror && member?.sshHost) {
       // Worst case added to a cold start: the push limit (GATE_MIRROR_SEED_LIMIT_MS), once per host·commit.
-      const seed = await seedMirror({ host: member.sshHost, commit: options.source.sha, cwd: options.mirrorSeedCwd ?? process.cwd() })
-        .catch((error: unknown) => ({ host: member!.sshHost!, ok: false, ms: 0, detail: String(error).slice(0, 300) }));
+      const seed = await awaitPodCommandAbort(seedMirror({ host: member.sshHost, commit: options.source.sha, cwd: options.mirrorSeedCwd ?? process.cwd() })
+        .catch((error: unknown) => ({ host: member!.sshHost!, ok: false, ms: 0, detail: String(error).slice(0, 300) })), options.signal);
       log('pod.command-job', 'mirror-seed', { host: member.sshHost, commit: options.source.sha, ok: seed?.ok ?? false, ms: seed?.ms ?? 0, ...(seed?.detail ? { detail: seed.detail } : {}) });
     }
     // GATE-WARM-BOOT-NO-INIT (10-15): the hostPath dirs the uid-1000 child writes are handed over on the node itself, once per
@@ -600,14 +643,15 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       if (!member) log('pod.command-job', 'host-dirs-prep', { ok: false, reason: 'no-pool-member', paths: hostDirPaths });
       else if (!prepareHostDirs) log('pod.command-job', 'host-dirs-prep', { ok: false, reason: 'prep-disabled', paths: hostDirPaths });
       else {
-        const prep = await prepareHostDirs({ member, hostPaths: hostDirPaths })
-          .catch((error: unknown) => ({ host: member!.sshHost ?? 'local', ok: false, ms: 0, detail: String(error).slice(0, 300) }));
+        const prep = await awaitPodCommandAbort(prepareHostDirs({ member, hostPaths: hostDirPaths })
+          .catch((error: unknown) => ({ host: member!.sshHost ?? 'local', ok: false, ms: 0, detail: String(error).slice(0, 300) })), options.signal);
         hostDirsPrepared = prep?.ok === true;
         log('pod.command-job', 'host-dirs-prep', { host: prep?.host ?? member.sshHost ?? 'local', ok: prep?.ok ?? false, ms: prep?.ms ?? 0, paths: hostDirPaths, ...(prep?.detail ? { detail: prep.detail } : {}) });
       }
     }
     // Any path where the node-side hand-over did not succeed keeps the old in-Pod hand-over (review mf: uid 1000 could not write).
     const hostDirsInit = hostDirPaths.length > 0 && !hostDirsPrepared;
+    ensureLive();
     const ghToken = options.clone ? (options.ghToken ?? defaultGhToken)() : undefined;
     const secret = commandJobSecret({ name, namespace, launch, skills, skillEnvText, ...(grokAuth !== undefined ? { grokAuth } : {}), ...(ghToken !== undefined ? { ghToken } : {}) });
     if (secret) {
@@ -623,6 +667,8 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       ...(hostDirsInit ? { hostDirsInit: true } : {}),
     });
     kubectl(['-n', namespace, 'delete', 'job', '-l', own, '--ignore-not-found']);
+    // A wall deadline can elapse inside the synchronous apply; cleanup by this launch's name then remains safe.
+    jobApplied = true;
     const applied = kubectl(['apply', '-f', '-'], JSON.stringify(manifest));
     if (applied.status !== 0) {
       cleanupSecret();
@@ -633,6 +679,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     let markerRc: number | null = null;
     const appliedAt = Date.now();
     for (;;) {
+      ensureLive();
       const got = kubectl(['-n', namespace, 'get', 'job', name, '-o', 'jsonpath={.status.conditions[*].type}']);
       const finished = jobFinished(got.stdout);
       if (finished) { state = finished; break; }
@@ -655,8 +702,9 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
           throw new Error(`pod command: Job 상태를 ${Math.round(options.statusUnreadableMs / 1000)}초 동안 못 읽었다(${context}) — ${(got.stderr ?? '').trim().split('\n').pop()?.slice(0, 200) ?? ''}`);
         }
       } else unreadableSince = null;
-      await sleep(options.pollMs ?? 15_000);
+      await awaitPodCommandAbort(sleep(options.pollMs ?? 15_000), options.signal);
     }
+    ensureLive();
     let logsResult = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child']);
     // Marker path returns before the Job condition — a full-log read can hit the same transient window the tail read
     // already survived (container log rotation · API hiccup). Retry it a little before calling the artifacts lost.
@@ -721,6 +769,12 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     });
     return { exitCode, artifactsDir, job: name, image: imageRef ?? image, artifacts };
   } catch (err) {
+    if (jobApplied && options.signal) {
+      // Opt-in bounded callers remove their own failed/Pending Job, including status-unreadable exits.
+      // On an unreachable API this is best effort; the local lease is always released in finally.
+      try { kubectlRaw(['-n', namespace, 'delete', 'job', name, '--ignore-not-found', '--wait=false']); }
+      catch { /* preserve the cancellation reason */ }
+    }
     cleanupSecret();
     throw err;
   } finally {

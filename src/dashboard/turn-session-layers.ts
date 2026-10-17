@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import type { LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
 import { buildMemoryInjection, memoryRoot, type MemoryEntry } from '../memory.js';
-import { elanousSelfAmbientParts } from '../agent/self-ambient.js';
+import { cachedSelfAmbientBaseParts } from '../agent/self-ambient-cache.js';
 
 /** Token budget for the TUI memory layer — the same default chat.ts gives buildMemoryInjection. */
 export const TUI_MEMORY_BUDGET_TOKENS = 1500;
@@ -157,7 +157,9 @@ export function sessionSelfAmbientParts(sessionKey: string, opts: SessionSelfAmb
     return cached.parts;
   }
   try {
-    const parts = (opts.build ?? (() => elanousSelfAmbientParts()))();
+    // TUI-TYPING-LAG — the stores are scanned by a worker (self-ambient-cache.ts); expiry here must
+    // not bring a synchronous `ps`/crontab/sqlite scan back onto the TUI turn path.
+    const parts = (opts.build ?? (() => cachedSelfAmbientBaseParts()))();
     const hash = contentHash(parts.join('\0'));
     if (cached && cached.hash === hash) {
       remember(ambientCache, sessionKey, { ...cached, at: now });

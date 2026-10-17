@@ -51,6 +51,12 @@ export interface BgRollup {
   finished: number;
   /** Total entries (running + backgrounded + finished). */
   total: number;
+  /** TUI-BG-JOB-VISIBILITY (#71) — live handles that outlive the turn:
+   *  `mode === 'bg'` handles still running ⊕ any handle flipped to
+   *  'backgrounded'. Inline/foreground runs are excluded (they end with
+   *  the turn and already show as `running`). Feeds the status-bar
+   *  `⧗ 백그라운드 N` segment. */
+  background: number;
 }
 
 export interface BackgroundSurfaceOpts {
@@ -200,13 +206,17 @@ function buildRollup(
   rows: Map<string, TrackedRow>,
   now: () => number,
 ): BgRollup {
-  let running = 0, backgrounded = 0, finished = 0;
+  let running = 0, backgrounded = 0, finished = 0, background = 0;
   const entries: BgEntry[] = [];
   for (const row of rows.values()) {
     entries.push(entryOf(row, now));
-    if (row.status === 'running') running++;
-    else if (row.status === 'backgrounded') backgrounded++;
-    else finished++;
+    if (row.status === 'running') {
+      running++;
+      if (row.handle.mode === 'bg') background++;
+    } else if (row.status === 'backgrounded') {
+      backgrounded++;
+      background++;
+    } else finished++;
   }
-  return { entries, running, backgrounded, finished, total: entries.length };
+  return { entries, running, backgrounded, finished, total: entries.length, background };
 }

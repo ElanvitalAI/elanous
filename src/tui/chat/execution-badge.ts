@@ -12,7 +12,7 @@
 // completion-line presentation. dashboard/execution-badge.ts is now a
 // re-export shim for backward compat until callers migrate.
 
-import { currentRouteDecision } from '../../llm/route-decision.js';
+import { currentRouteDecision, routeFallbackLabel } from '../../llm/route-decision.js';
 import { getUserConfig } from '../../user-config.js';
 import { effectiveReasoningLevel, modelSupportsReasoning } from '../../llm.js';
 import { executionBadge } from '../../telegram-exec-footer.js';
@@ -24,6 +24,10 @@ import { executionBadge } from '../../telegram-exec-footer.js';
  *  execution footer uses, so both surfaces report the same truth. */
 export function resolveDashboardExecutionBadge(): string | undefined {
   const cfg = getUserConfig();
+  // 폴백(TUI-MODEL-BADGE-ACTUAL · 10-16) — 턴이 고른 모델과 «실제로 응답한» 모델이 다르면 «sol → grok».
+  //   생각 깊이는 결정 쪽 값이라 넘어간 공급자엔 맞지 않는다 → 폴백 배지엔 안 붙인다.
+  const fallback = routeFallbackLabel('dashboard');
+  if (fallback) return executionBadge({ model: fallback });
   const decision = currentRouteDecision('dashboard');
   const model = decision?.model || cfg.llm.model;
   if (!model) return undefined;

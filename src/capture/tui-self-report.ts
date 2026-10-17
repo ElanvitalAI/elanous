@@ -39,10 +39,11 @@ import { createTuiScreenMirror } from './tui-screen-mirror.js';
 import { getChannelBus } from '../terminal-matrix/index.js';
 import { publishSelfReportFrame } from './self-report-frame.js';
 import {
-  upsertPtyManifest, updatePtyManifestFrame, touchLivePtyManifest, markPtyManifestClosed, removePtyManifest,
+  upsertPtyManifest, updatePtyManifestFrame, touchLivePtyManifest, markPtyManifestClosed, removePtyManifest, getPtyManifest,
+  updatePtyManifestBuild,
 } from '../pty-shell/pty-manifest.js';
 import { writeHarnessScreen } from '../harness/harness-screen.js';
-import { startTuiRunStateRecorder } from '../pty-shell/tui-run-state.js';
+import { runningBuild, startTuiRunStateRecorder } from '../pty-shell/tui-run-state.js';
 import { debug } from '../debug/log.js';
 import { routeExternalInput, type ExternalInputRoute } from '../input/external-input-queue.js';
 
@@ -187,6 +188,46 @@ export interface TuiSelfReportDeps {
   startRunState?: (surfaceId: string) => (() => void);
   /** 미룬 우편 깨움 폴러(TUI-H4)를 연다 — 반환 = 정리. 기본은 실 행 등록과 짝일 때만 늦게 불러온 `startPendingWakePoller`. */
   startWakePoller?: (surfaceId: string) => (() => void);
+  /** 박동마다 자기 행을 본다 — 없으면 null · ⛔ 조회 실패는 «던진다»(없다로 읽지 않는다). 기본 = `getPtyManifest(id, { strict })`. */
+  lookupRow?: (surfaceId: string) => TuiOwnRowView | null;
+  /** 재등록 뒤 실행 판(build) 칸을 다시 적는다 — 기본 = 기동 때 판(`runningBuild`). */
+  restoreBuild?: (surfaceId: string) => void;
+  /** 박동 스케줄러 — 기본 setInterval(unref). 시험이 박동을 손으로 돌린다. */
+  driveHeartbeat?: (tick: () => void, ms: number) => (() => void);
+  /** SIGCONT 수신 훅(행 상실 단서) — 반환 = 해제. 기본 = process.on('SIGCONT'). */
+  onSigcont?: (fn: () => void) => (() => void);
+  /** 행 상실 관측 — 기본 = debug.log('tui.self-report', 'row-missing', data). */
+  logRowMissing?: (data: TuiRowMissingEvent) => void;
+}
+
+/** 박동이 보는 자기 행 — `PtyManifestRow` 의 부분(재등록 뒤 frame·build 복원 확인에도 쓴다). */
+export interface TuiOwnRowView {
+  readonly alive: boolean;
+  readonly frameAt?: number;
+  readonly build?: unknown;
+}
+
+/** `tui.self-report` · `row-missing` 한 줄 — 살아 있는 TUI 의 manifest 행이 사라졌을 때(재등록 시도 결과 ⊕ 원인 단서). */
+export interface TuiRowMissingEvent {
+  readonly surfaceId: string;
+  readonly pid: number;
+  /** 'absent' = 행이 없다 · 'closed' = 행은 있는데 alive=0 · 'lookup-failed' = 조회 자체가 실패(재등록 안 함). */
+  readonly state: 'absent' | 'closed' | 'lookup-failed';
+  /** 마지막으로 자기 행을 «본» 시각(등록·재등록 포함). */
+  readonly lastSeenAt: number;
+  readonly sinceMs: number;
+  /** 직전 박동과의 간격 — 박동 주기보다 훨씬 크면 그 사이 프로세스가 멈췄다(SIGSTOP·SIGTTIN·이벤트 루프 정체). */
+  readonly gapMs: number;
+  readonly heartbeatMs: number;
+  /** 마지막 SIGCONT 시각(없으면 null) — `lastSeenAt` 뒤면 «정지 → 재개» 사이에 걷혔다는 단서. */
+  readonly sigcontAt: number | null;
+  readonly sigcontSinceLastSeen: boolean;
+  readonly reRegistered: boolean;
+  /** 재등록이 비운 frame 칸에 마지막 화면을 다시 적었나(`pty snapshot` 이 바로 닿는다). */
+  readonly frameRestored: boolean;
+  /** 재등록이 비운 실행 판(build) 칸을 다시 적었나(다시 읽어 확인). */
+  readonly buildRestored: boolean;
+  readonly error?: string;
 }
 
 export type TuiControlInitStage = 'create-target' | 'register-target' | 'start-poller' | 'publish-manifest';
@@ -292,8 +333,11 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
   // The manifest row is published only after both input capabilities are
   // live. A listed TUI therefore always has a registered target and poller.
 
+  // 마지막으로 내보낸 화면 — 재등록이 frame 칸을 비우면 다시 적는다(거울은 바뀐 화면만 내보내 idle 이면 영영 빈 칸).
+  let lastEmittedText: string | null = null;
   const emitText = (text: string, cols: number, rows: number): void => {
     const at = now();
+    lastEmittedText = text;
     const frame: SelfReportFrame = { surfaceId, instance, kind: 'tui', mode: 'self-report', text, cols, rows, at, ...(runId ? { runId } : {}) };
     try { publishFrame(frame); } catch { /* fail-soft */ }
     // `at` is shared with the manifest write → its internal throttle keys
@@ -340,16 +384,100 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
   }
 
   // Heartbeat so a live-but-idle TUI isn't culled by reapStale.
-  const hb = setInterval(() => { try { heartbeat(surfaceId, now()); } catch { /* fail-soft */ } }, heartbeatMs);
-  (hb as { unref?: () => void }).unref?.();
-
+  // ⭐ 박동마다 자기 행을 본다 — 남이 걷어 간 행(정지 중 stale 수거 등)을 같은 박동에서 다시 세운다.
+  //   행이 없으면 pty text/key/snapshot·우편 깨움이 이 TUI 에 영영 안 닿는다(#75 · #84).
+  // 행 등록을 갈아 끼운 호출자(시험)는 실 manifest 를 안 읽는다 — 기본 조회는 기본 행 등록과 짝일 때만.
+  const lookupRow: (id: string) => TuiOwnRowView | null = deps.lookupRow
+    ?? (deps.registerRow ? () => ({ alive: true }) : (id: string) => getPtyManifest(id, { strict: true }));
+  const restoreBuild = deps.restoreBuild ?? (deps.registerRow ? () => {} : (id: string) => { updatePtyManifestBuild(id, runningBuild()); });
+  const logRowMissing = deps.logRowMissing ?? ((data: TuiRowMissingEvent) => debug.log('tui.self-report', 'row-missing', data));
+  const rowNickname = deps.nickname?.trim() || undefined;
+  let lastSeenAt = now();
+  let lastBeatAt = lastSeenAt;
+  let sigcontAt: number | null = null;
+  let stopSigcont: () => void = () => {};
+  try {
+    stopSigcont = (deps.onSigcont ?? ((fn) => {
+      process.on('SIGCONT', fn);
+      return () => { process.off('SIGCONT', fn); };
+    }))(() => { sigcontAt = now(); });
+  } catch { /* fail-soft — 단서일 뿐 */ }
   let stopped = false;
+  const beat = (): void => {
+    if (stopped) return;
+    const at = now();
+    const prevSeenAt = lastSeenAt;
+    const gapMs = at - lastBeatAt;
+    lastBeatAt = at;
+    let state: TuiRowMissingEvent['state'] | null = null;
+    let error: string | undefined;
+    try {
+      const row = lookupRow(surfaceId);
+      if (!row) state = 'absent';
+      else if (!row.alive) state = 'closed';
+    } catch (e) {
+      state = 'lookup-failed';
+      error = e instanceof Error ? e.message : String(e);
+    }
+    if (state === null) {
+      lastSeenAt = at;
+      try { heartbeat(surfaceId, at); } catch { /* fail-soft */ }
+      return;
+    }
+    let reRegistered = false;
+    let frameRestored = false;
+    let buildRestored = false;
+    if (state === 'lookup-failed') {
+      // ⛔ 실패를 «없다»로 읽지 않는다 — 재등록 없이 평소 박동만.
+      try { heartbeat(surfaceId, at); } catch { /* fail-soft */ }
+    } else {
+      try {
+        registerRow(surfaceId, at, rowNickname);
+        // 기본 행 등록은 fail-soft(조용히 삼킨다) — «다시 세웠다» 는 다시 읽어서만 말한다.
+        reRegistered = lookupRow(surfaceId)?.alive === true;
+        if (!reRegistered) throw new Error('row-still-missing-after-register');
+        lastSeenAt = at;
+        // 재등록은 실행 판·턴 칸을 비운다 — 판은 기동 때 값으로 다시 적는다. 턴은 비운 채(unknown) 둔다:
+        // 녹음기를 다시 열면 «idle» 을 적는데, 턴 도중이면 거짓 idle 이 깨움을 끼어들게 한다. 다음 턴 변화가 채운다.
+        const restoreErrors: string[] = [];
+        try { restoreBuild(surfaceId); } catch (e) { restoreErrors.push(`build: ${e instanceof Error ? e.message : String(e)}`); }
+        if (lastEmittedText !== null) {
+          try { writeFrame(surfaceId, lastEmittedText, at); } catch (e) { restoreErrors.push(`frame: ${e instanceof Error ? e.message : String(e)}`); }
+        }
+        // 기본 쓰기도 fail-soft — «복원했다» 는 다시 읽어서만 말한다.
+        try {
+          const after = lookupRow(surfaceId);
+          frameRestored = lastEmittedText !== null && (after?.frameAt ?? 0) >= at;
+          buildRestored = after?.build != null;
+        } catch (e) { restoreErrors.push(`verify: ${e instanceof Error ? e.message : String(e)}`); }
+        if (restoreErrors.length) error = restoreErrors.join('; ');
+      } catch (e) {
+        error = e instanceof Error ? e.message : String(e);
+      }
+    }
+    try {
+      logRowMissing({
+        surfaceId, pid: process.pid, state, lastSeenAt: prevSeenAt, sinceMs: at - prevSeenAt, gapMs, heartbeatMs,
+        sigcontAt, sigcontSinceLastSeen: sigcontAt !== null && sigcontAt >= prevSeenAt,
+        reRegistered, frameRestored, buildRestored, ...(error ? { error } : {}),
+      });
+    } catch { /* fail-soft diagnostic */ }
+  };
+  const stopHeartbeat = (deps.driveHeartbeat ?? ((tick, ms) => {
+    // setImmediate 로 한 칸 미룬다 — 정지(SIGSTOP·SIGTTIN)에서 풀리면 밀린 타이머가 SIGCONT 처리기보다 «먼저» 돈다
+    // (WSL bun 실측). 미뤄야 같은 박동의 row-missing 이 sigcontAt 을 본다.
+    const t = setInterval(() => { setImmediate(tick); }, ms);
+    (t as { unref?: () => void }).unref?.();
+    return () => clearInterval(t);
+  }))(beat, heartbeatMs);
+
   const stop = (): void => {
     if (stopped) return;
     stopped = true;
     try { stopSource(); } catch { /* fail-soft — unregisters observer / clears tick timer */ }
     try { mirror?.stop(); } catch { /* fail-soft — restores stdout.write */ }
-    clearInterval(hb);
+    try { stopHeartbeat(); } catch { /* fail-soft */ }
+    try { stopSigcont(); } catch { /* fail-soft */ }
     try { stopRunState(); } catch { /* fail-soft */ }
     wakePollerStopped = true;
     try { stopWakePoller(); } catch { /* fail-soft */ }

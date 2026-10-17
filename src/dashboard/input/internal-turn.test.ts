@@ -340,8 +340,8 @@ describe('대시보드 배선 — 입력 루프가 «분기 함수»를 한 번 
     expect(post).toBeGreaterThan(at);
     expect(src.slice(at, post)).toContain('input = consumed.input;');
     expect(src).toContain('? resolveInternalTurnSubmitIntent(internalTurn, dashboardAcpSession.currentSessionId)');
-    // H3(seat-autowake)가 문 port 를 감싸 «마운트 = 턴 끝 판정 시점»으로 잇는다 — 감싼 것도 같은 문이다.
-    expect(src).toContain('const internalTurnYieldPort = seatAutowake.wrapPort(internalTurnGate.port);');
+    // H3(seat-autowake)·자식 완료 깨움(agent-wake)이 문 port 를 감싸 «마운트 = 턴 끝 판정 시점»으로 잇는다 — 감싼 것도 같은 문이다.
+    expect(src).toContain('const internalTurnYieldPort = wrapAgentWakePort(seatAutowake.wrapPort(internalTurnGate.port));');
     expect(src).toContain('internalTurnYield: internalTurnYieldPort,');
     expect(src).toContain('if (postTurn.historyRecord && !internalTurn) {');
   });

@@ -7,7 +7,7 @@ import { readPodMemoryAdvice } from './pod-memory-advice.js';
 import { getUserConfig } from '../user-config.js';
 import { listCodexAccountsInStore } from '../oauth/codex-account-store.js';
 import { parsePodPool, resolvePodPoolSpec, podPoolHostLease, type PoolKubectl } from '../task-orchestrator/surfaces/pod-pool.js';
-import { leaseKubectl, measurePoolLease, probePoolDns, recommendConcurrency, type PoolLeaseMeasure, type PoolDnsProbe } from '../task-orchestrator/surfaces/pod-lease.js';
+import { leaseKubectl, measurePoolLease, probePoolDns, probePoolGitHub, recommendConcurrency, type PoolLeaseMeasure, type PoolDnsProbe, type ExternalGitHubProbe } from '../task-orchestrator/surfaces/pod-lease.js';
 import { POD_COMMAND_DEADLINE_SECONDS, runPodCommand, type PodCommandResult, type RunPodCommandOptions } from '../task-orchestrator/surfaces/pod-command-job.js';
 import { hostLeaseCounts, leaseHasPendingPod } from '../pod-lease/host-lease.js';
 
@@ -22,6 +22,7 @@ export interface PodCliDeps {
   run?: (options: RunPodCommandOptions) => Promise<PodCommandResult>;
   kubectl?: PoolKubectl;
   dns?: (context: string, kubectl: PoolKubectl) => PoolDnsProbe;
+  externalGitHub?: (context: string, kubectl: PoolKubectl) => ExternalGitHubProbe;
   accounts?: () => number;
   perAccount?: () => number;
   poolSpec?: (explicit?: string) => string | null;
@@ -81,7 +82,8 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
     .command('status').description('지금 추가로 쏠 수 있는 Pod 골과 제한 근거')
     .option('--pool <spec>', '풀 스펙 — 컨텍스트[@ssh호스트][:상한][#레지스트리:포트] 쉼표')
     .option('--json', '표 대신 동일 측정값을 JSON 으로')
-    .action((opts: { pool?: string; json?: boolean }) => {
+    .option('--github-egress', '같은 namespace 임시 Pod에서 GitHub DNS/HTTPS를 별도 관측 (admission 불변)')
+    .action((opts: { pool?: string; json?: boolean; githubEgress?: boolean }) => {
       try {
         const kubectl = deps.kubectl ?? leaseKubectl;
         const spec = (deps.poolSpec ?? ((explicit?: string) => resolvePodPoolSpec(explicit, process.env, () => {
@@ -105,7 +107,14 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
         // Pending Pods and Job-only reservations are disjoint; a lease for an already Pending Job is the same Job.
         const waitingJobs = decision.pending === null ? null : decision.pending +
           records.filter((r) => r.stage === 'job' && !leaseHasPendingPod(r, decision.pendingJobs ?? [])).length;
-        const result = { pool: spec, ...measure, accounts, perAccount, ...decision, reserved: host.reserved, waitingJobs };
+        // This explicit observation runs after the admission calculation. A slow or failed external
+        // probe can never change recommended/limitedBy or slow the ordinary lease status path.
+        const externalGitHub = opts.githubEgress ? Object.fromEntries(members.map((member) => {
+          try { return [member.context, (deps.externalGitHub ?? probePoolGitHub)(member.context, kubectl)]; }
+          catch { return [member.context, { externalDns: null, githubHttps: null, measuredAt: null, reason: 'probe failed' }]; }
+        })) : undefined;
+        const result = { pool: spec, ...measure, accounts, perAccount, ...decision, reserved: host.reserved, waitingJobs,
+          ...(externalGitHub ? { externalGitHub } : {}) };
         debug.log('pod.lease', 'status', { pool: spec ? members.map((m) => ({ capacity: m.capacity })) : null, running: decision.running, pending: decision.pending, reserved: host.reserved, waitingJobs, unleasedRunning: decision.unleasedRunning, recommended: decision.recommended, limitedBy: decision.limitedBy });
         if (opts.json) io.log(JSON.stringify(result));
         else {
@@ -123,6 +132,8 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
           }
           io.log(`예약(저작 중) ${host.reserved} · 대기 Job ${waitingJobs ?? '?'} · 실행 ${decision.running ?? '?'}`);
           io.log(`임대 없는 실행 ${decision.unleasedRunning ?? '?'}`);
+          if (externalGitHub) for (const [context, probe] of Object.entries(externalGitHub))
+            io.log(`GitHub 외부망 ${context}: DNS=${probe.externalDns ?? '?'} HTTPS=${probe.githubHttps ?? '?'} 측정=${probe.measuredAt ?? '?'}${probe.reason ? ` · ${probe.reason}` : ''}`);
           io.log(`capacity: ${decision.capacitySlots ?? '?'} 칸 (상한 ${members.reduce((sum, m) => sum + m.capacity, 0)} − Running ${decision.running ?? '?'} − Pending ${decision.pending ?? '?'}; 권장 수에서 건강한 멤버의 임대 없는 실행 차감)`);
           io.log(`memory: ${decision.memorySlots ?? '?'} 칸 (할당 가능 − Running 하니스 상한 합; 골당 16Gi · 모든 네임스페이스의 노드별 기존 예약을 반영해 배치 가능 ${decision.placeableSlots ?? '?'} 칸)`);
           io.log(`lite: ${decision.liteMemorySlots ?? '?'} 칸 (같은 여유를 lite 골 2Gi 로 센 값 · 관측만 — 권장 수는 위 standard 기준)`);

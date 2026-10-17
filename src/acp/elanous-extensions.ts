@@ -81,6 +81,9 @@ export interface ElanousUiUsagePayload {
   provider?: 'anthropic' | 'openai';
   /** 그 턴이 실제로 요청한 모델(라우팅 결과 — 설정 모델과 다를 수 있다). */
   model?: string;
+  /** 이 사용량을 낸 «실제» 공급자(폴백 체인이 넘겼으면 넘어간 쪽 · 예 `grok`). `provider` 는 과금 계열 축이라 따로 둔다
+   *  (TUI-MODEL-BADGE-ACTUAL · 10-16). */
+  routeProvider?: string;
   inputTokens?: number;
   outputTokens?: number;
   cacheReadInputTokens?: number;

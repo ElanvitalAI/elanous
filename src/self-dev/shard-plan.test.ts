@@ -35,10 +35,12 @@ describe('planGateTestShards', () => {
       /^test files exceed 1 shard memory budgets \(files=3 · totalRssMb=9144 · largestRssMb=4096 · budgetMb=8192 · neededShards≥2\)$/,
     );
     const result = runShardedGateTests('/head', ['a', 'b', 'c', 'a'], 'HEAD', 1,
-      (_cwd, [file]) => ({ exitCode: 0, junit: '<testsuites/>', rssMb: rss.get(file!), seconds: 1 }),
-      () => { throw new Error('planning must fail before baseline'); }, 8);
-    expect(result.reason).toBe('Error: test files exceed 1 shard memory budgets (files=3 · totalRssMb=9144 · largestRssMb=4096 · budgetMb=8192 · neededShards≥2)');
-    expect(result.aggregate.status).toBe('unmeasured');
+      (_cwd, selected) => ({ exitCode: 0, junit: `<testsuites>${selected.map((file) => `<testsuite file="${file}" tests="1"><testcase name="ok"/></testsuite>`).join('')}</testsuites>`, rssMb: rss.get(selected[0]!), seconds: 1 }),
+      (_cwd, _ref, visit) => visit('/base'), 8,
+      { hostResources: { cores: 8, freeMemoryGiB: 64, freeTmpGiB: 8 } });
+    expect(result.shards).toHaveLength(2);
+    expect(result.expandedFrom).toBe(1);
+    expect(result.aggregate.status).toBe('passed');
     expect(() => planGateTestShards(['a', 'b', 'c'], new Map([['a', 4096.6], ['b', 3000.1], ['c', 2048]]), seconds, 8, 1)).toThrow(
       /^test files exceed 1 shard memory budgets \(files=3 · totalRssMb=9145 · largestRssMb=4097 · budgetMb=8192 · neededShards≥2\)$/,
     );

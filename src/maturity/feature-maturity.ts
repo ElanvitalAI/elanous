@@ -82,7 +82,7 @@ export const FEATURE_MATURITY = {
     onboarding: 'beta', login: 'stable', session: 'beta', chat: 'stable', repl: 'stable',
     agent: 'stable', registry: 'beta', tier: 'stable', local: 'beta', scheduler: 'beta',
     attach: 'beta', wf: 'beta', nexus: 'stable', phone: 'beta', token: 'beta',
-    acp: 'beta', voice: 'beta',
+    acp: 'beta', voice: 'beta', sim: 'beta',
     'run-detached': 'system', dogfood: 'system', run: 'system',
   },
   // Canonical names only; aliases inherit their command's grade at lookup.

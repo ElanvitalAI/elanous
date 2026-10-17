@@ -1,4 +1,5 @@
-import { afterEach, describe, test, expect } from 'bun:test';
+import { afterEach, describe, test, expect, spyOn } from 'bun:test';
+import { debug } from '../src/debug/log.js';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -1765,7 +1766,8 @@ describe('streamLLMWithTools — exploration synthesis phase', () => {
     }
   });
 
-  test('doom-loop degrades to ask-user when plan mode is active', async () => {
+  test('doom-loop self-heals (no ask) when plan mode is active', async () => {
+    const logSpy = spyOn(debug, 'log');
     setPlanModeState({
       ...INACTIVE_PLAN_MODE_STATE,
       active: true,
@@ -1797,8 +1799,10 @@ describe('streamLLMWithTools — exploration synthesis phase', () => {
       },
     );
 
-    expect(result).toContain('[ASK USER]');
-    expect(result).toContain('plan mode is active');
+    const heal = logSpy.mock.calls.find((call) => call[1] === 'doom-loop-self-heal');
+    logSpy.mockRestore();
+    expect(result).not.toContain('[ASK USER]');
+    expect(heal?.[2]).toMatchObject({ reason: 'plan-mode', attempt: 1, action: 'guidance' });
   });
 
   // ─────────────────────────────────────────────────────────────────────
@@ -1932,7 +1936,8 @@ describe('streamLLMWithTools — exploration synthesis phase', () => {
     });
   });
 
-  test('doom-loop degrades to ask-user when auto-undo fails', async () => {
+  test('doom-loop self-heals (no ask) when auto-undo has no snapshot', async () => {
+    const logSpy = spyOn(debug, 'log');
     const { provider } = scriptedProvider([
       [{ type: 'tool_call', id: 'a', name: 'Edit', args: { file_path: '/tmp/a.ts', old_string: 'a', new_string: 'b' } }],
       [{ type: 'tool_call', id: 'b', name: 'Edit', args: { file_path: '/tmp/a.ts', old_string: 'a', new_string: 'c' } }],
@@ -1955,9 +1960,10 @@ describe('streamLLMWithTools — exploration synthesis phase', () => {
       },
     );
 
-    expect(result).toContain('[ASK USER]');
-    expect(result).toContain('Auto-undo was skipped because no undo snapshot is available.');
-    expect(result).toContain('Detail: UndoTurn: no snapshots available');
+    const heal = logSpy.mock.calls.find((call) => call[1] === 'doom-loop-self-heal');
+    logSpy.mockRestore();
+    expect(result).not.toContain('[ASK USER]');
+    expect(heal?.[2]).toMatchObject({ reason: 'no-undo-available', attempt: 1, action: 'guidance' });
   });
 
 });

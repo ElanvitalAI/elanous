@@ -41,6 +41,17 @@ test('only allow-listed lifecycle event names are emitted (review R2)', () => {
   }
 });
 
+test('auto-authoring boundaries project only bounded metadata from real writer envelopes', () => {
+  for (const name of ['ask-auto-target-candidates', 'ask-auto-reauthor']) {
+    expect(ledgerLineToLogEvent(JSON.stringify({ event: name, data: {
+      candidatePathCount: 2, firstPathCount: 0, secondPathCount: 1, helped: false,
+      outcome: 'no-candidates', paths: ['src/private.ts'], reason: 'private text', token: 'opaque123',
+    } }), runId)).toEqual({ category: 'self-implement.pod.ledger', event: name,
+      data: { runId, candidatePathCount: 2, firstPathCount: 0, secondPathCount: 1, helped: false, outcome: 'no-candidates', pathsCount: 1 } });
+  }
+  expect(ledgerLineToLogEvent(JSON.stringify({ event: 'ask-auto-unknown' }), runId)).toBeUndefined();
+});
+
 test('a code value that carries a known secret is dropped', () => {
   expect(ledgerLineToLogEvent(JSON.stringify({ event: 'reviewed', token: 'opaque123', outcome: 'opaque123' }), runId)?.data).toEqual({ runId });
 });

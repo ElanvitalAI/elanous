@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runLedgerScanIndexPath } from './run-ledger.js';
@@ -79,7 +79,7 @@ test('a fresh worker process reuses the persisted scan index, invalidates on led
       expect(observed).toMatchObject({ status: 'terminal-status-missing', lifecycle: 'orphaned', lastActivityTimestamp: '2026-01-01T00:00:00Z', lastActivityStatus: 'available' });
     }
     expect(existsSync(index)).toBe(true);
-    expect(JSON.parse(readFileSync(index, 'utf8')).version).toBe(1);
+    expect(JSON.parse(readFileSync(index, 'utf8')).version).toBe(2);
 
     // ② A fresh worker process (the /now shape) reuses the persisted facts: all hits, zero re-reads, identical rows.
     const second = childQuery(dir);
@@ -105,7 +105,25 @@ test('a fresh worker process reuses the persisted scan index, invalidates on led
     const fifth = childQuery(dir);
     expect(fifth).toMatchObject({ cacheHits: 0, cacheMisses: 5, indexHits: 0, indexOrigin: 'fresh', unreadableLedgerCount: 0 });
     expect(fifth.entries).toEqual(fourth.entries);
-    expect(JSON.parse(readFileSync(index, 'utf8')).version).toBe(1);
+    expect(JSON.parse(readFileSync(index, 'utf8')).version).toBe(2);
+
+    // A same-size rewrite with a restored mtime must not reuse either the process cache or disk index.
+    const rewrittenPath = join(dir, `${id(4)}.jsonl`);
+    const fixedTime = new Date('2026-01-01T00:00:00.000Z');
+    utimesSync(rewrittenPath, fixedTime, fixedTime);
+    expect(childQuery(dir)).toMatchObject({ cacheHits: 4, cacheMisses: 1, indexHits: 4, indexOrigin: 'loaded' });
+    const originalStat = statSync(rewrittenPath);
+    const beforeRewrite = readFileSync(rewrittenPath, 'utf8');
+    const afterRewrite = beforeRewrite.replace('2026-02-01T00:00:00Z', '2026-03-01T00:00:00Z');
+    expect(afterRewrite.length).toBe(beforeRewrite.length);
+    writeFileSync(rewrittenPath, afterRewrite, 'utf8');
+    utimesSync(rewrittenPath, originalStat.atime, originalStat.mtime);
+    expect(statSync(rewrittenPath).mtimeMs).toBe(originalStat.mtimeMs);
+    expect(statSync(rewrittenPath).ctimeMs).not.toBe(originalStat.ctimeMs);
+    const rewritten = childQuery(dir);
+    expect(rewritten).toMatchObject({ cacheHits: 4, cacheMisses: 1, indexHits: 4, indexOrigin: 'loaded' });
+    expect(rewritten.entries).toEqual([expect.objectContaining({ runId: id(4), lastActivityTimestamp: '2026-03-01T00:00:00Z' })]);
+    expect(childQuery(dir)).toMatchObject({ cacheHits: 5, cacheMisses: 0, indexHits: 5, indexOrigin: 'loaded' });
 
     // ⑥ noCache bypasses the index and keeps the honest-read contract.
     const bypassed = JSON.parse(execFileSync(process.execPath, ['-e', `import(${JSON.stringify(runLedgerUrl)}).then((m) => {

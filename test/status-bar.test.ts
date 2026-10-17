@@ -6,13 +6,16 @@ import {
   contextUsageSegment, tmuxSegment, sshSegment, hostSegment,
   ctxBarSegment, elapsedSegment, costSegment, speedSegment,
   ptyShellCountSegment, runningAgentsSegment, controllerSegment, shellRollupSegment, dockStripSegment, workspaceDockDensityForCols,
+  backgroundJobsSegment,
   renderPrimaryStatus, renderSecondaryStatus, renderStatusLines,
   vwSegment,
   type StatusBarState,
 } from '../src/status/bar';
 import type { ActiveProviderInfo } from '../src/provider-summary';
 import { DEFAULT_THEME_TOKENS } from '../src/theme/tokens';
-import { createDashboardMouseWiring } from '../src/dashboard/input/mouse-wiring';
+import { createDashboardMouseWiring, fitStatusSegments, statusSegmentKind, truncateToVisibleWidth, clampPillsToWidth } from '../src/dashboard/input/mouse-wiring';
+import { debug } from '../src/debug/log';
+import { visibleWidth } from '../src/tui';
 
 function providerInfo(p: Partial<ActiveProviderInfo> = {}): ActiveProviderInfo {
   return {
@@ -529,6 +532,203 @@ describe('SP-B — shellRollupSegment', () => {
   test('theme option preserves content', () => {
     const s = strip(shellRollupSegment({ running: 1, backgrounded: 0 }, { theme: DEFAULT_THEME_TOKENS }));
     expect(s).toBe('🐚 1▶');
+  });
+});
+
+describe('TUI-BG-JOB-VISIBILITY — backgroundJobsSegment', () => {
+  test('백그라운드 1 → «⧗ 백그라운드 1»', () => {
+    expect(strip(backgroundJobsSegment({ background: 1 }))).toBe('⧗ 백그라운드 1');
+  });
+
+  test('0 → 세그먼트 없음 (끝나면 사라짐)', () => {
+    expect(backgroundJobsSegment({ background: 0 })).toBe('');
+    expect(backgroundJobsSegment(null)).toBe('');
+    expect(backgroundJobsSegment(undefined)).toBe('');
+    expect(backgroundJobsSegment({ background: -1 })).toBe('');
+    expect(backgroundJobsSegment({ background: Number.NaN })).toBe('');
+  });
+
+  test('theme option preserves content', () => {
+    expect(strip(backgroundJobsSegment({ background: 3 }, { theme: DEFAULT_THEME_TOKENS }))).toBe('⧗ 백그라운드 3');
+  });
+});
+
+describe('TUI-BG-JOB-VISIBILITY — 상태줄 배선', () => {
+  const build = (backgroundJobs?: { background: number }) =>
+    createDashboardMouseWiring({
+      termSize: () => ({ rows: 24, cols: 120 }),
+      getRotation: () => [],
+      setActiveModel: () => {},
+      getRecentWds: () => [],
+      setSessionWd: () => {},
+      pushModalSurface: () => ({ dispose: () => {} }),
+      redraw: () => {},
+    }).buildStatusLine({
+      swd: '/Users/test/project',
+      providerInfo: providerInfo(),
+      runningAgents: 2,
+      controller: 'pty:pty_x',
+      ...(backgroundJobs ? { backgroundJobs } : {}),
+    });
+
+  test('유휴여도 bg 1 → 상태줄에 «⧗ 백그라운드 1» · 기존 세그먼트 순서 그대로', () => {
+    const line = strip(build({ background: 1 }));
+    expect(line).toContain('⧗ 백그라운드 1');
+    expect(line.indexOf('◇ 2 agents')).toBeLessThan(line.indexOf('⛭ pty:pty_x'));
+    expect(line.indexOf('⛭ pty:pty_x')).toBeLessThan(line.indexOf('⧗ 백그라운드 1'));
+  });
+
+  test('bg 0 → 줄이 이전과 바이트 동일(ANSI 포함 원본 문자열)', () => {
+    expect(build({ background: 0 })).toBe(build());
+    expect(strip(build())).not.toContain('⧗');
+  });
+});
+
+describe('tf-bg-ghost — 상태줄은 프레임 폭을 넘지 않는다', () => {
+  // 라이브 결함(10-17 · #28743 head f1a8b9f): «⧗ 백그라운드 1» 이 붙자 160칸 화면의 상태줄이 166칸이 돼
+  //   마지막 줄 자동 줄바꿈 → 화면 스크롤 → 차분 렌더러가 모르는 사이 스피너 줄이 유령으로 남았다.
+  const wiring = (cols: number) => createDashboardMouseWiring({
+    termSize: () => ({ rows: 40, cols }),
+    getRotation: () => [],
+    setActiveModel: () => {},
+    getRecentWds: () => [],
+    setSessionWd: () => {},
+    pushModalSurface: () => ({ dispose: () => {} }),
+    redraw: () => {},
+  });
+  // 라이브 화면과 같은 꼴(긴 작업 트리 · 긴 controller · ctx · host · 🐚).
+  const liveInput = (backgroundJobs?: { background: number }) => ({
+    swd: '/Users/user/elanous-hq/work/tf-bg-visibility',
+    providerInfo: providerInfo({ model: 'gpt-6-luna' }),
+    controller: 'agent:claude-code_2-1-270_agent_extra_long_name',
+    runningAgents: 2,
+    contextUsedTokens: 15_000,
+    host: 'MacBookProM5-long-host-label',
+    elapsedSec: 125,
+    shellCount: 1,
+    shellRollup: { running: 1, backgrounded: 0 },
+    ...(backgroundJobs ? { backgroundJobs } : {}),
+  });
+
+  test('160칸 · bg 1 → 폭 ≤ 159 ⊕ «⧗ 백그라운드 1» 은 남는다', () => {
+    const line = wiring(160).buildStatusLine(liveInput({ background: 1 }));
+    expect(visibleWidth(line)).toBeLessThanOrEqual(159);
+    expect(strip(line)).toContain('⧗ 백그라운드 1');
+  });
+
+  test('좁은 화면(100·60·20칸)에서도 폭을 넘지 않는다', () => {
+    for (const cols of [100, 60, 20]) {
+      const line = wiring(cols).buildStatusLine(liveInput({ background: 2 }));
+      expect(visibleWidth(line)).toBeLessThanOrEqual(cols - 1);
+    }
+  });
+
+  test('반증: 맞춤이 없으면 같은 입력이 폭을 넘는다(이 시험이 무는 조건이 실재)', () => {
+    const line = wiring(400).buildStatusLine(liveInput({ background: 1 }));
+    expect(visibleWidth(line)).toBeGreaterThan(159);
+  });
+
+  test('폭 안이면 줄이 그대로(건너뜀 0)', () => {
+    const wide = wiring(400).buildStatusLine(liveInput({ background: 1 }));
+    const fit = fitStatusSegments([10, 5, 5], 3, 400);
+    expect(fit.dropped).toEqual([]);
+    expect(wiring(1000).buildStatusLine(liveInput({ background: 1 }))).toBe(wide);
+  });
+
+  test('필수 «⧗» 는 폭이 빠듯해도 남고 앞의 선택 세그먼트가 대신 빠진다', () => {
+    // 첫 칸 10 · 선택 30 · 필수 8 · 구분자 3 · 폭 25 → 선택(30)은 필수 몫(3+8)을 남길 수 없어 빠진다.
+    const fit = fitStatusSegments([10, 30, 8], 3, 25, [false, false, true]);
+    expect(fit.placed.map((p) => p.index)).toEqual([0, 2]);
+    expect(fit.dropped).toEqual([1]);
+    expect(fit.width).toBeLessThanOrEqual(25);
+    // 반증: 필수 표시가 없으면 같은 폭에서 «⧗» 자리(2)가 빠질 수 있다.
+    expect(fitStatusSegments([10, 10, 8], 3, 25).dropped).toEqual([2]);
+    expect(fitStatusSegments([10, 10, 8], 3, 25, [false, false, true]).placed.map((p) => p.index)).toEqual([0, 2]);
+  });
+
+  test('실화면 꼴 · 앞 세그먼트가 길어도 «⧗ 백그라운드 1» 은 남는다(100·80칸)', () => {
+    for (const cols of [100, 80]) {
+      const line = strip(wiring(cols).buildStatusLine(liveInput({ background: 1 })));
+      expect(line).toContain('⧗ 백그라운드 1');
+      expect(visibleWidth(line)).toBeLessThanOrEqual(cols - 1);
+    }
+  });
+
+  test('관측 overflow-fit 은 건너뛴 «종류» 가 바뀔 때만 — 같은 집합의 리사이즈·값 변화엔 다시 안 남긴다', () => {
+    const events: Array<Record<string, unknown>> = [];
+    const orig = debug.log;
+    (debug as { log: typeof debug.log }).log = ((cat: string, ev: string, data?: Record<string, unknown>) => {
+      if (cat === 'status.bar' && ev === 'overflow-fit') events.push(data ?? {});
+    }) as typeof debug.log;
+    try {
+      let cols = 120;
+      const w = createDashboardMouseWiring({
+        termSize: () => ({ rows: 40, cols }),
+        getRotation: () => [], setActiveModel: () => {}, getRecentWds: () => [], setSessionWd: () => {},
+        pushModalSurface: () => ({ dispose: () => {} }), redraw: () => {},
+      });
+      const kindsOf = (line: string): string[] =>
+        [...new Set(strip(line).split(' │ ').map((seg) => statusSegmentKind(seg)))].sort();
+      const line0 = w.buildStatusLine(liveInput({ background: 1 }));
+      const first = events.length;
+      expect(first).toBeGreaterThanOrEqual(1);
+      expect(first).toBe(1);
+      expect((events[0]!.dropped as string[]).length).toBeGreaterThan(0);
+      // 폭을 한 칸 바꾸고 값(ctx)을 바꿔도 «건너뛴 종류» 가 같으면 다시 안 남긴다.
+      cols = 121;
+      const line1 = w.buildStatusLine(liveInput({ background: 1 }));
+      const line2 = w.buildStatusLine({ ...liveInput({ background: 1 }), contextUsedTokens: 16_000 });
+      expect(kindsOf(line1)).toEqual(kindsOf(line0));
+      expect(kindsOf(line2)).toEqual(kindsOf(line0));
+      expect(events.length).toBe(first);
+      // 넉넉해지면(건너뜀 0) 한 줄 · 그 뒤 같은 상태 반복은 0.
+      cols = 1000;
+      const before = events.length;
+      w.buildStatusLine(liveInput({ background: 1 }));
+      w.buildStatusLine(liveInput({ background: 1 }));
+      expect(events.length).toBe(before + 1);
+      expect(events.at(-1)!.dropped).toEqual([]);
+    } finally {
+      (debug as { log: typeof debug.log }).log = orig;
+    }
+  });
+
+  test('truncateToVisibleWidth — 실폭이 예산 이하가 될 때까지 · 0 이면 빈 문자열', () => {
+    const wide = '📁🐚📁🐚📁🐚📁🐚 백그라운드 백그라운드';
+    // ⚡ 는 truncate(코드포인트 폭)가 1칸으로 세지만 실폭 2칸 — truncate(…, 5) 가 9칸을 낸다(재시도 상한이 있으면 못 맞춘다).
+    const bolts = '⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡';
+    for (const budget of [1, 2, 3, 5, 9, 17]) {
+      expect(visibleWidth(truncateToVisibleWidth(wide, budget))).toBeLessThanOrEqual(budget);
+      expect(visibleWidth(truncateToVisibleWidth(bolts, budget))).toBeLessThanOrEqual(budget);
+    }
+    expect(truncateToVisibleWidth(wide, 0)).toBe('');
+    expect(truncateToVisibleWidth('abc', 10)).toBe('abc');
+  });
+
+  test('clampPillsToWidth — 보이는 폭 밖 pill 은 빼고 걸친 pill 은 줄인다', () => {
+    const pills = [
+      { name: 'workingDir' as const, startCol: 0, endCol: 8 },
+      { name: 'model' as const, startCol: 6, endCol: 14 },
+      { name: 'mode' as const, startCol: 12, endCol: 16 },
+    ];
+    expect(clampPillsToWidth(pills, 10)).toEqual([
+      { name: 'workingDir', startCol: 0, endCol: 8 },
+      { name: 'model', startCol: 6, endCol: 10 },
+    ]);
+  });
+
+  test('statusSegmentKind — 첫 낱말만', () => {
+    expect(statusSegmentKind('\x1b[33mctx 15k\x1b[0m')).toBe('ctx');
+    expect(statusSegmentKind('🐚 1⏸')).toBe('🐚');
+  });
+
+  test('fitStatusSegments — 넘치는 것만 건너뛰고 뒤의 작은 것은 넣는다 · 첫 칸은 늘 둔다', () => {
+    const fit = fitStatusSegments([10, 20, 3], 3, 20);
+    expect(fit.placed.map((p) => p.index)).toEqual([0, 2]);
+    expect(fit.dropped).toEqual([1]);
+    expect(fit.placed[1]).toEqual({ index: 2, startCol: 13, width: 3 });
+    expect(fit.width).toBe(16);
+    expect(fitStatusSegments([30], 3, 10).placed.map((p) => p.index)).toEqual([0]);
   });
 });
 

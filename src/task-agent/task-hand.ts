@@ -28,6 +28,9 @@ import { applyRunIdentityTag, applyRunIdentityTags, deriveBirthIdentity, parseRu
 import { parseWorkOrder, renderWorkOrderGoal, WORK_ORDER_FILE_PATTERN, type WorkOrder } from './work-order.js';
 import { inspectPrelaunchAlreadyDone, type AlreadyDoneDecision, type AlreadyDoneCandidate,
   type PrelaunchGitRunnerForTest } from './prelaunch-already-done.js';
+import { draftReleaseComment } from '../self-dev/draft-triage-rules.js';
+import { parseAskTargetPathHints } from '../self-dev/launch-preflight-text.js';
+import { INFLIGHT_REGISTRY_FILE, registerInflight } from '../pr-tool/inflight-registry.js';
 
 export interface ResolveHandTextDeps {
   cwd: string;
@@ -336,6 +339,16 @@ export function cardPrNumber(card: Pick<TaskCard, 'pr'>): number | undefined {
 export function boundPrTerminal(card: Pick<TaskCard, 'pr' | 'prTerminal'>): TaskCard['prTerminal'] | undefined {
   const marker = card.prTerminal;
   return marker && typeof card.pr === 'object' && card.pr.number === marker.pr && card.pr.url === marker.url ? marker : undefined;
+}
+
+/**
+ * DRAFT-CLAIM-AUTO-2 — 포기 경로(failed · launch-failed)로 끝난 카드가 PR 을 남겼으면 그 PR 에 달 «🔧 처리 끝» 문면.
+ * 이 조각은 순수 함수만 — 실제 PR 코멘트(gh) · draft-sweep 배선은 다음 조각. launched · handed · PR 없음은 null.
+ */
+export function abandonedDraftReleaseNote(card: Pick<TaskCard, 'id' | 'status' | 'pr'>, at: Date): { pr: number; body: string } | null {
+  if (card.status !== 'failed' && card.status !== 'launch-failed') return null;
+  const pr = cardPrNumber(card);
+  return pr === undefined ? null : { pr, body: draftReleaseComment(at, `${card.id} 포기 경로 — 자동`) };
 }
 
 /** A uniquely launched code-PR card may own a draft through its PR or its opening run. */
@@ -796,6 +809,17 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ],
   };
   writeCard(path, launched);
+  // INFLIGHT-REGISTRY — 출발 때 맥락을 남긴다(머지 때 같은 파일 줄의 의도를 스마트 머지가 읽는다 · 착지하면 지운다).
+  try {
+    const [head = '', ...rest] = text.split(/\r?\n/);
+    registerInflight({
+      runId: boundRunId ?? runId, cell: card.checklistId ?? card.id, cardId: card.id,
+      intent: (/^\s*(?:대상\s*경로|target\s*paths?)\s*[:：]/i.test(head) ? rest.join(' ') : text) || text,
+      files: parseAskTargetPathHints(text),
+    }, { path: join(dirname(path), INFLIGHT_REGISTRY_FILE), ...(opts.now ? { now: opts.now } : {}) });
+  } catch (error) {
+    try { debug.log('pr-tool.inflight', 'register-failed', { taskId: id, error: String((error as Error)?.message ?? error).slice(0, 200) }, { level: 'warn' }); } catch { /* fail-soft */ }
+  }
   try { debug.log('task-agent', 'launched', { taskId: id, seat: card.seat ?? null, runId: boundRunId ?? null }); } catch { /* fail-soft */ }
   if (boundRunId) {
     try { debug.log('task-agent', 'card-run-bound', { card: id, runId: boundRunId, launchId }); } catch { /* fail-soft */ }

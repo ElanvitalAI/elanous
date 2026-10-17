@@ -1,12 +1,12 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statfsSync, statSync, writeFileSync } from 'node:fs';
+import { availableParallelism, freemem, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug, redactSecretText } from '../debug/log.js';
 import { prepareDeterministicChildEnvironment } from '../../scripts/lib/deterministic-env.js';
 import { withGateTestEnv } from '../../scripts/lib/gate-test-env.js';
 import { withBaselineWorktree } from '../self-implement/gate-baseline.js';
 import { aggregateGateTestShards, type GateShardAttempt, type GateShardAggregate } from './shard-aggregate.js';
-import { planFixedGateTestShards, planSelfGateSpawnSeparatedShards, type GateTestShard } from './shard-plan.js';
+import { GateShardCapacityError, planFixedGateTestShards, planSelfGateSpawnSeparatedShards, type GateTestShard } from './shard-plan.js';
 import { isGateSpawnLaneFile } from './spawn-lane-files.js';
 
 export interface ShardRunResult {
@@ -15,11 +15,16 @@ export interface ShardRunResult {
   attempts: GateShardAttempt[];
   reason?: string;
   measurementFailures?: number;
-  /** Present only for opt-in `--fixed-shard-distribution` (no RSS pre-measurement). Absent = the measured planner. */
-  distribution?: 'fixed';
+  /** The measured RSS plan needed more bundles than the requested count. */
+  expandedFrom?: number;
+  /** A fixed plan selected explicitly, or after the measured plan exceeds host expansion capacity. */
+  distribution?: 'fixed' | 'fixed-cap-fallback';
+  fallbackReason?: string;
   /** OP FU (MK #8178 shard-9) — raw evidence of every failed shard process (exit≠0 · signal · no JUnit). Observation only:
    *  the aggregate never reads it. Absent = no shard process reported failure output. */
   failureEvidence?: ShardFailureEvidence[];
+  /** Latest failed attempt's reason for each incomplete shard; copied into the gate artifact summary. */
+  unmeasuredByShard?: Record<string, string>;
 }
 
 /** What a failed shard process leaves behind so «test failure vs runner error» can be told apart after the fact. */
@@ -42,6 +47,38 @@ export interface ShardFailureEvidence extends ShardFailureOutput {
 export interface ShardRunMode {
   /** OP FU — sorted round-robin into `count` shards, zero pre-measurement runs. Default off: the measured planner. */
   fixedDistribution?: boolean;
+  /** Measured on the executing host; override only for deterministic planning tests. */
+  hostResources?: { cores: number; freeMemoryGiB: number; freeTmpGiB: number };
+}
+
+function hostResources(): ShardRunMode['hostResources'] | undefined {
+  try {
+    const tmp = statfsSync(tmpdir());
+    // Linux page cache is reclaimable. `freemem()` alone saw only ~10 GiB on a WSL host
+    // with 24 GiB MemAvailable and would incorrectly cap a two-shard plan at one.
+    let freeMemoryGiB = freemem() / (1024 ** 3);
+    if (process.platform === 'linux') {
+      const availableKiB = /^MemAvailable:\s+(\d+)\s+kB/m.exec(readFileSync('/proc/meminfo', 'utf8'))?.[1];
+      if (availableKiB) freeMemoryGiB = Number(availableKiB) / (1024 ** 2);
+    }
+    return {
+      cores: availableParallelism(),
+      freeMemoryGiB,
+      freeTmpGiB: Number(tmp.bavail) * Number(tmp.bsize) / (1024 ** 3),
+    };
+  } catch { return undefined; }
+}
+
+/** One expansion slot needs one CPU, one shard memory budget, and 1 GiB of free tmp space.
+ *  Explicitly requested shards remain the caller's choice; this only limits automatic growth. */
+export function maxAutomaticShardCount(requested: number, budgetGiB: number, resources: ShardRunMode['hostResources']): number {
+  if (!resources || !Number.isFinite(budgetGiB) || budgetGiB <= 0) return requested;
+  const limit = Math.min(
+    Math.floor(resources.cores),
+    Math.floor(resources.freeMemoryGiB / budgetGiB),
+    Math.floor(resources.freeTmpGiB),
+  );
+  return Math.max(requested, Number.isFinite(limit) ? limit : requested);
 }
 
 export type ShardProcess = (cwd: string, files: readonly string[]) => {
@@ -155,13 +192,45 @@ export function runShardedGateTests(
     }
   }
   const measurementFailures = failedMeasurements.length || undefined;
-  let shards: GateTestShard[];
+  const fixedAtHostCap = (maxCount: number, reason: string): ShardRunResult => {
+    try {
+      const fixed = planFixedGateTestShards(files, maxCount);
+      debug.log('self-dev.shard', 'host-cap-fixed-fallback', { requested: count, cap: maxCount,
+        files: new Set(files).size, reason, measurementFailures: measurementFailures ?? 0 });
+      return { ...runPlannedShards(cwd, fixed, baseRef, run, baselineWorktree), distribution: 'fixed-cap-fallback',
+        fallbackReason: reason, ...(measurementFailures ? { measurementFailures } : {}) };
+    } catch (error) {
+      return { aggregate: { status: 'unmeasured', retryShardIds: [] }, shards: [], attempts: [],
+        reason: `host-cap fixed fallback failed: ${String(error)}; measured plan: ${reason}`,
+        ...(measurementFailures ? { measurementFailures } : {}) };
+    }
+  };
+  let shards: GateTestShard[] | undefined;
+  let plannedCount = count;
   try {
-    shards = planSelfGateSpawnSeparatedShards(files, rss, seconds, budgetGiB, count);
+    const fileCount = new Set(files).size;
+    const totalRss = [...rss.values()].reduce((sum, value) => sum + value, 0);
+    const lowerBound = Number.isFinite(budgetGiB) && budgetGiB > 0 ? Math.ceil(totalRss / (budgetGiB * 1024)) : count;
+    plannedCount = Math.max(count, Math.min(fileCount, lowerBound));
+    // The requested count may exceed the number of files. Only expansion is bounded by file count.
+    const maxCount = Math.max(count, Math.min(fileCount, maxAutomaticShardCount(count, budgetGiB, mode.hostResources ?? hostResources())));
+    if (plannedCount > maxCount) return fixedAtHostCap(maxCount, `host shard expansion cap ${maxCount} < needed ${plannedCount} (requested ${count}, measured RSS sum ${Math.round(totalRss)} MiB, budget ${budgetGiB} GiB)`);
+    for (; plannedCount <= maxCount; plannedCount++) {
+      try { shards = planSelfGateSpawnSeparatedShards(files, rss, seconds, budgetGiB, plannedCount); break; }
+      catch (error) {
+        if (!(error instanceof GateShardCapacityError)) throw error;
+        if (plannedCount === maxCount) return fixedAtHostCap(maxCount, `host shard expansion cap ${maxCount} < needed ≥${maxCount + 1} (requested ${count}, ${error.message})`);
+      }
+    }
   } catch (error) {
     return { aggregate: { status: 'unmeasured', retryShardIds: [] }, shards: [], attempts: [], reason: String(error), ...(measurementFailures ? { measurementFailures } : {}) };
   }
-  return { ...runPlannedShards(cwd, shards, baseRef, run, baselineWorktree), ...(measurementFailures ? { measurementFailures } : {}) };
+  if (!shards) return { aggregate: { status: 'unmeasured', retryShardIds: [] }, shards: [], attempts: [], reason: 'shard planning produced no result' };
+  if (plannedCount > count) debug.log('self-dev.shard', 'plan-expanded', {
+    requested: count, planned: shards.length, files: new Set(files).size, budgetGiB,
+    measurementFailures: measurementFailures ?? 0,
+  });
+  return { ...runPlannedShards(cwd, shards, baseRef, run, baselineWorktree), ...(plannedCount > count ? { expandedFrom: count } : {}), ...(measurementFailures ? { measurementFailures } : {}) };
 }
 
 /** Shared by the measured and the fixed planner: current + baseline per shard, one retry round, one aggregate. */
@@ -214,8 +283,32 @@ function runPlannedShards(
     return aggregateGateTestShards(shards, attempts);
   });
   const evidence = failureEvidence.length ? { failureEvidence } : {};
-  if ('retryShardIds' in baseline) return { aggregate: baseline, shards, attempts, ...evidence };
-  return { aggregate: { status: 'unmeasured', retryShardIds: shards.map((shard) => shard.id) }, shards, attempts, reason: baseline.log, ...evidence };
+  if ('retryShardIds' in baseline) return {
+    aggregate: baseline, shards, attempts, ...evidence,
+    ...(baseline.retryShardIds.length ? { unmeasuredByShard: incompleteShardReasons(baseline.retryShardIds, attempts) } : {}),
+  };
+  const retryShardIds = shards.map((shard) => shard.id);
+  return {
+    aggregate: { status: 'unmeasured', retryShardIds }, shards, attempts, reason: baseline.log, ...evidence,
+    unmeasuredByShard: Object.fromEntries(retryShardIds.map((id) => [id, `baseline worktree: ${redactSecretText(baseline.log).replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ').slice(0, 500)}`])),
+  };
+}
+
+function incompleteShardReasons(shardIds: readonly string[], attempts: readonly GateShardAttempt[]): Record<string, string> {
+  return Object.fromEntries(shardIds.map((id) => {
+    const latest = attempts.filter((attempt) => attempt.shardId === id).at(-1);
+    if (!latest) return [id, 'no shard attempt recorded'];
+    const side = (name: string, rc: number | null, signal: string | null | undefined, junit: string | undefined, diagnostic: string | undefined): string => {
+      const safeDiagnostic = diagnostic ? redactSecretText(diagnostic).replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ').slice(0, 500) : undefined;
+      return `${name}: exit ${rc ?? 'unavailable'}, signal ${signal ?? 'none'}, JUnit ${junit === undefined ? 'missing' : 'present'}`
+        + (safeDiagnostic ? `; ${safeDiagnostic}` : '');
+    };
+    const statuses = [
+      side('current', latest.currentExitCode, latest.currentSignal, latest.currentJUnit, latest.currentDiagnostic),
+      ...(latest.baselineFiles?.length === 0 ? [] : [side('baseline', latest.baselineExitCode, latest.baselineSignal, latest.baselineJUnit, latest.baselineDiagnostic)]),
+    ];
+    return [id, `${statuses.join(' · ')} · aggregate rejected (incomplete, malformed JUnit, or exit/JUnit mismatch)`];
+  }));
 }
 
 export function selfGateShardTimeoutMs(files: readonly string[]): number {

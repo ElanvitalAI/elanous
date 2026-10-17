@@ -1,5 +1,6 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
+import { debug } from '../debug/log.js';
 import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,14 +27,17 @@ test('all eight ops kinds are accepted and passed to recordEvent with the event 
     expect(seen.every(evt => JSON.parse(evt.refs ?? '{}').ref === 'PR-7')).toBe(true);
     expect(seen.every(evt => evt.ts === '2026-10-14T01:02:03.000Z')).toBe(true);
     const rows = db.prepare('SELECT kind, text FROM events ORDER BY rowid').all() as Array<{ kind: string; text: string }>;
+    expect(rows).toHaveLength(8);
+    expect(db.prepare('SELECT kind, count(*) AS n FROM events GROUP BY kind ORDER BY kind').all()).toHaveLength(8);
     expect(rows.map(row => row.kind)).toEqual([...OPS_EVENT_KINDS]);
     expect(rows.map(row => row.text)).toEqual(seen.map(evt => evt.text));
   } finally { db.close(); }
 });
 
-test('a throwing recordEvent and a schema-mismatched db never propagate (fail-soft)', () => {
+test('a throwing recordEvent and a schema-mismatched db never propagate and log context.bus/write-failed', () => {
   const db = openSurfaceEventsDb(':memory:');
   const record: typeof recordEvent = () => { throw new Error('record boom'); };
+  const log = spyOn(debug, 'log');
   try {
     expect(() => emitOpsEvent({ kind: 'land.start', text: 'OPS1 throwing record' }, { db, record })).not.toThrow();
     expect(emitOpsEvent({ kind: 'land.start', text: 'OPS1 throwing record' }, { db, record })).toBe(null);
@@ -42,7 +46,23 @@ test('a throwing recordEvent and a schema-mismatched db never propagate (fail-so
       expect(() => emitOpsEvent({ kind: 'gate.rc', text: 'OPS1 schema mismatch' }, { db: bare })).not.toThrow();
       expect(emitOpsEvent({ kind: 'gate.rc', text: 'OPS1 schema mismatch' }, { db: bare })).toBe(null);
     } finally { bare.close(); }
+    expect(log).toHaveBeenCalledWith('context.bus', 'write-failed', expect.objectContaining({ kind: 'land.start', reason: 'record boom' }), { level: 'warn' });
+    expect(log).toHaveBeenCalledWith('context.bus', 'write-failed', expect.objectContaining({ kind: 'gate.rc' }), { level: 'warn' });
     expect(db.prepare('SELECT count(*) AS n FROM events').get()).toEqual({ n: 0 });
+  } finally {
+    log.mockRestore();
+    db.close();
+  }
+});
+
+test('seat metadata uses canonicalSeatId for canonical seats and child sessions', () => {
+  const db = openSurfaceEventsDb(':memory:');
+  try {
+    for (const seat of ['OPC', 'OPT', 'OPT-child-1', 'COO']) {
+      expect(emitOpsEvent({ kind: 'config.set', text: `OPS1 ${seat}`, seat }, { db })).not.toBeNull();
+    }
+    const refs = db.prepare('SELECT refs FROM events ORDER BY rowid').all() as Array<{ refs: string }>;
+    expect(refs.map(({ refs: value }) => JSON.parse(value).seat)).toEqual(['OPC', 'OPT', 'OPT-CHILD-1', 'OP']);
   } finally { db.close(); }
 });
 

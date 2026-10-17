@@ -7,6 +7,9 @@ import type { RootPlanSummary } from './pr-land-heavy-remote.js';
 
 const SHA = /^[0-9a-f]{40}$/i;
 const MARKER = 'ELANOUS_PRLAND_SHADOW';
+/** Shadow evidence is optional; it must not hold a ready landing for the Pod's 45-minute deadline. */
+export const LANDING_POD_SHADOW_HOST_TIMEOUT_MS = 10 * 60_000;
+export const LANDING_POD_SHADOW_STATUS_UNREADABLE_MS = 60_000;
 
 export interface LandingPodShadowInput { head: string; main: string }
 export interface LandingPodShadowVerdict {
@@ -42,12 +45,32 @@ export function landingPodShadowScript(head: string, main: string): string {
 export async function runLandingPodShadowJob(input: LandingPodShadowInput, deps: {
   runPod?: (options: RunPodCommandOptions) => Promise<PodCommandResult>;
   readLog?: (path: string) => string;
+  /** Deterministic timer seam for the host deadline. */
+  armTimeout?: (onTimeout: () => void, ms: number) => () => void;
 } = {}): Promise<LandingPodShadowVerdict> {
   const script = landingPodShadowScript(input.head, input.main);
-  const job = await (deps.runPod ?? runPodCommand)({
-    command: ['bash', '-lc', script], clone: true, source: { kind: 'commit', sha: input.head },
-    returnLogs: true, deadlineSeconds: 45 * 60,
+  const controller = new AbortController();
+  const armTimeout = deps.armTimeout ?? ((onTimeout: () => void, ms: number) => {
+    const timer = setTimeout(onTimeout, ms);
+    return () => clearTimeout(timer);
   });
+  const disarm = armTimeout(() => {
+    const reason = new Error(`pod shadow: host timeout after ${LANDING_POD_SHADOW_HOST_TIMEOUT_MS}ms`);
+    controller.abort(reason);
+  }, LANDING_POD_SHADOW_HOST_TIMEOUT_MS);
+  let job: PodCommandResult;
+  try {
+    // Wait for the runner to observe abort and finish Job/Secret/lease cleanup before landing continues.
+    job = await (deps.runPod ?? runPodCommand)({
+      command: ['bash', '-lc', script], clone: true, source: { kind: 'commit', sha: input.head },
+      returnLogs: true, deadlineSeconds: 45 * 60,
+      statusUnreadableMs: LANDING_POD_SHADOW_STATUS_UNREADABLE_MS,
+      hostDeadlineAtMs: Date.now() + LANDING_POD_SHADOW_HOST_TIMEOUT_MS,
+      signal: controller.signal,
+    });
+  } finally {
+    disarm();
+  }
   let log: string;
   try { log = (deps.readLog ?? ((path: string) => readFileSync(path, 'utf8')))(join(job.artifactsDir, 'child.log')); }
   catch (error) {

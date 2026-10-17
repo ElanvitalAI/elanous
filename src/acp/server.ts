@@ -838,6 +838,8 @@ export interface AcpTurnContext {
   pushUsage: (usage: {
     provider?: 'anthropic' | 'openai';
     model?: string;
+    /** 실제로 응답한 공급자(폴백이면 넘어간 쪽). */
+    routeProvider?: string;
     inputTokens?: number;
     outputTokens?: number;
     cacheReadInputTokens?: number;
@@ -1839,6 +1841,7 @@ function wireAcpConnection(
           id: `turn:${Date.now()}`,
           ...(usage.provider !== undefined ? { provider: usage.provider } : {}),
           ...(usage.model !== undefined ? { model: usage.model } : {}),
+          ...(usage.routeProvider !== undefined ? { routeProvider: usage.routeProvider } : {}),
           ...(usage.inputTokens !== undefined ? { inputTokens: usage.inputTokens } : {}),
           ...(usage.outputTokens !== undefined ? { outputTokens: usage.outputTokens } : {}),
           ...(usage.cacheReadInputTokens !== undefined

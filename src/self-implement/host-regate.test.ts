@@ -1,9 +1,9 @@
 import { afterAll, describe, expect, spyOn, test } from 'bun:test';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireSlot, defaultInterference, needsPwaBuild, runHostRegate, typecheckGateTouchesPwa, type HostRegateDeps } from './host-regate.js';
+import { acquireSlot, defaultInterference, needsPwaBuild, provideCheckoutDependencies, runHostRegate, typecheckGateTouchesPwa, type HostRegateDeps } from './host-regate.js';
 import { regateFailureFacts } from './regate-detail.js';
 import { MAX_INSPECTED_TEST_FILES } from '../../scripts/ci-test-interference-gate.js';
 import { releasePathHoldComment } from '../self-dev/release-path-guard.js';
@@ -743,6 +743,12 @@ describe('host regate: never merge without a measured host pass', () => {
       if (bin === 'bun' && args.join(' ') === 'install --frozen-lockfile') {
         installs.push(cwd);
         mkdirSync(join(cwd, 'node_modules'), { recursive: true });
+        // Root workspace install can leave an app node_modules directory without its package marker.
+        if (cwd === tree) mkdirSync(join(tree, 'apps/pwa/node_modules'), { recursive: true });
+        if (cwd === join(tree, 'apps/pwa')) {
+          mkdirSync(join(tree, 'apps/pwa/node_modules/next'), { recursive: true });
+          writeFileSync(join(tree, 'apps/pwa/node_modules/next/package.json'), '{}');
+        }
       }
       return command(bin, args, cwd, env);
     };
@@ -750,9 +756,47 @@ describe('host regate: never merge without a measured host pass', () => {
       expect(await runHostRegate({ ...input, repoRoot: workspace }, deps)).toMatchObject({ passed: true });
       expect(installs).toEqual([tree, join(tree, 'apps/pwa')]);
       expect(existsSync(join(tree, 'node_modules'))).toBe(true);
+      expect(existsSync(join(tree, 'apps/pwa/node_modules/next/package.json'))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test('a pre-existing empty candidate node_modules is replaced by the installed source link', () => {
+    const root = mkdtempSync(join(tmpdir(), 'host-regate-empty-candidate-'));
+    const source = join(root, 'source');
+    const candidate = join(root, 'candidate');
+    const sourceModules = join(source, 'apps/pwa/node_modules');
+    const candidateModules = join(candidate, 'apps/pwa/node_modules');
+    mkdirSync(join(sourceModules, 'next'), { recursive: true });
+    writeFileSync(join(sourceModules, 'next/package.json'), '{}');
+    mkdirSync(candidateModules, { recursive: true });
+    try {
+      provideCheckoutDependencies(candidate, source, 'apps/pwa', 'next', () => { throw new Error('unexpected install'); });
+      expect(realpathSync(candidateModules)).toBe(realpathSync(sourceModules));
+      expect(existsSync(join(candidateModules, 'next/package.json'))).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('a stale or dangling candidate node_modules link is replaced by the installed source link', () => {
+    const root = mkdtempSync(join(tmpdir(), 'host-regate-stale-link-'));
+    const source = join(root, 'source');
+    const sourceModules = join(source, 'apps/pwa/node_modules');
+    mkdirSync(join(sourceModules, 'next'), { recursive: true });
+    writeFileSync(join(sourceModules, 'next/package.json'), '{}');
+    try {
+      for (const target of ['wrong', 'missing']) {
+        const candidate = join(root, `candidate-${target}`);
+        const candidateModules = join(candidate, 'apps/pwa/node_modules');
+        const staleTarget = join(root, target);
+        if (target === 'wrong') mkdirSync(staleTarget, { recursive: true });
+        mkdirSync(join(candidate, 'apps/pwa'), { recursive: true });
+        symlinkSync(staleTarget, candidateModules, 'dir');
+        provideCheckoutDependencies(candidate, source, 'apps/pwa', 'next', () => { throw new Error('unexpected install'); });
+        expect(realpathSync(candidateModules)).toBe(realpathSync(sourceModules));
+        expect(existsSync(join(candidateModules, 'next/package.json'))).toBe(true);
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   test('integration conflict: no gates run and no PR merge', async () => {

@@ -2212,9 +2212,76 @@ describe('selfImplementRuntime — opt-in non-blocking return', () => {
     }
   });
 
-  test('이 골이 더한 원장 기록 배선을 지우면 위 검사가 그 결손을 잡는다', () => {
-    const source = readFileSync(new URL('./self-implement-runtime.ts', import.meta.url), 'utf8');
-    expect(source).toContain('recordNonBlockingRunPending(requestId, ledgerDirOptions)');
-    expect(source).toContain('recordNonBlockingRunResult(requestId, {');
+  test('완료·종결실패 격리 시험 — 런타임 산출값을 원장에 남기고 재시작 뒤 같은 requestId 로 재조회한다', async () => {
+    const settledLedgerDirectory = mkdtempSync(join(tmpdir(), 'self-impl-nb-settled-payload-'));
+    _setSelfImplementNonBlockingLedgerDirForTesting(settledLedgerDirectory);
+    _setSelfImplementCliCommandForTesting(async (feature, opts) => ({
+      ok: true, kind: 'self', exitCode: 0,
+      result: feature === '완료 산출값 재조회'
+        ? { ok: true, stage: 'pr-opened', runId: opts.runId, node: 'open-pr' }
+        : { ok: false, stage: 'implementation-failed', detail: 'goal author failed', runId: opts.runId, node: 'implement' },
+    } as never));
+    try {
+      const launched = await selfImplementRuntime.run({ feature: '완료 산출값 재조회', non_blocking: true }, ctx);
+      const launchedRequestId = launched.requestId;
+      if (launchedRequestId === undefined) throw new Error('expected the runtime to return a launched requestId');
+      await waitUntil(() => loadRunLedger(launchedRequestId, settledLedgerDirectory)?.some((entry) => entry.event === 'non-blocking-result') ?? false, 5000);
+      const failed = await selfImplementRuntime.run({ feature: '종결실패 산출값 재조회', non_blocking: true }, ctx);
+      const settledFailureRequestId = failed.requestId;
+      if (settledFailureRequestId === undefined) throw new Error('expected the runtime to return a failed requestId');
+      await waitUntil(() => loadRunLedger(settledFailureRequestId, settledLedgerDirectory)?.some((entry) => entry.event === 'non-blocking-result') ?? false, 5000);
+
+      const launchedNext = `eln self run ${launchedRequestId}`;
+      const settledFailureNext = `eln self run ${settledFailureRequestId}`;
+
+      const launchedLedger = loadRunLedger(launchedRequestId, settledLedgerDirectory)!;
+      expect(launchedLedger.map((entry) => entry.event)).toEqual(['non-blocking-pending', 'non-blocking-result']);
+      const launchedResultEntry = launchedLedger.find((entry) => entry.event === 'non-blocking-result')!;
+      expect(launchedResultEntry.data).toMatchObject({
+        requestId: launchedRequestId,
+        kind: 'launched',
+        next: launchedNext,
+        ok: true,
+        runId: launchedRequestId,
+      });
+      const settledFailureLedger = loadRunLedger(settledFailureRequestId, settledLedgerDirectory)!;
+      expect(settledFailureLedger.map((entry) => entry.event)).toEqual(['non-blocking-pending', 'non-blocking-result']);
+      const settledFailureResultEntry = settledFailureLedger.find((entry) => entry.event === 'non-blocking-result')!;
+      expect(settledFailureResultEntry.data).toMatchObject({
+        requestId: settledFailureRequestId,
+        kind: 'failed',
+        reason: 'goal author failed',
+        next: settledFailureNext,
+        ok: false,
+        runId: settledFailureRequestId,
+      });
+
+      // 재시작 시뮬레이션 — in-memory 상태 없이 on-disk 원장만으로 eln self runs 새 조회
+      _setSelfImplementNonBlockingLedgerDirForTesting(null);
+      _setSelfImplementCliCommandForTesting(null);
+      const result = queryRunningRuns({ runIds: [launchedRequestId, settledFailureRequestId] }, {
+        queryLedgers: (options) => queryFederatedUnfinishedRunLedgers({ ...options, goalsDir: settledLedgerDirectory, ledgerDirectories: [settledLedgerDirectory], noCache: true }),
+        ptyTargets: () => [],
+        listPtyRefs: () => ({ refs: [], unreadable: [] }),
+      });
+      const launchedQueryEntry = result.entries.find((candidate) => candidate.runId === launchedRequestId);
+      expect(launchedQueryEntry?.nonBlocking).toMatchObject({ requestId: launchedRequestId, kind: 'launched', next: launchedNext });
+      const settledFailureQueryEntry = result.entries.find((candidate) => candidate.runId === settledFailureRequestId);
+      expect(settledFailureQueryEntry?.nonBlocking).toMatchObject({
+        requestId: settledFailureRequestId,
+        kind: 'failed',
+        reason: 'goal author failed',
+        next: settledFailureNext,
+      });
+      const rendered = renderRunningRuns(result);
+      expect(rendered).toContain(`runId=${launchedRequestId}`);
+      expect(rendered).toContain(`nonBlocking=kind:launched reason:none next:${launchedNext}`);
+      expect(rendered).toContain(`runId=${settledFailureRequestId}`);
+      expect(rendered).toContain(`nonBlocking=kind:failed reason:goal author failed next:${settledFailureNext}`);
+    } finally {
+      _setSelfImplementNonBlockingLedgerDirForTesting(null);
+      _setSelfImplementCliCommandForTesting(null);
+      rmSync(settledLedgerDirectory, { recursive: true, force: true });
+    }
   });
 });

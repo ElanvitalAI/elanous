@@ -1,4 +1,4 @@
-import { setDefaultTimeout, describe, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../../debug/log.js';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -17,7 +17,7 @@ import { CONTROL_INBOX_DIR_ENV } from '../../harness/control-inbox.js';
 import { podFragmentFinished, readPodFragment } from '../../harness/self-send-target.js';
 import { resetLiveDetailCacheForTesting } from '../../live/detail-switch.js';
 import { LEASE_KUBECTL_MAX_BUFFER, measurePoolLease, recommendConcurrency } from './pod-lease.js';
-import { POD_JOB_DEADLINE_SECONDS, POD_LOGS_KEEP_BYTES, defaultKubectl, hostCredentials, k8sLabelValue, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podEarlySalvageScript, podGithubWatchdogScript, podGitPushGuardScript, POD_GH_STALE_SECONDS, podSelfImplementSpawn as realPodSelfImplementSpawn, recordPodSalvage, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
+import { POD_JOB_DEADLINE_SECONDS, POD_LOGS_KEEP_BYTES, POD_RESULT_FLATTEN, defaultKubectl, hostCredentials, k8sLabelValue, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podEarlySalvageScript, podGithubWatchdogScript, podGitPushGuardScript, POD_GH_STALE_SECONDS, podSelfImplementSpawn as realPodSelfImplementSpawn, recordPodSalvage, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
 import type { PodSource } from './pod-source-receive.js';
 import { defaultGrokModel } from '../../grok/models.js';
 import type { UserConfig } from '../../user-config.js';
@@ -61,6 +61,8 @@ describe('Pod kubectl output limit', () => {
       const result = defaultKubectl(['get', 'pods']);
       expect(calls).toHaveLength(1);
       expect(calls[0]).toMatchObject({ command: 'kubectl', args: ['get', 'pods'], options: { encoding: 'utf8', timeout: 120_000, maxBuffer: LEASE_KUBECTL_MAX_BUFFER } });
+      defaultKubectl(['get', 'jobs'], undefined, 15_000);
+      expect(calls[1]).toMatchObject({ command: 'kubectl', args: ['get', 'jobs'], options: { timeout: 15_000 } });
       expect(result.status).toBeNull();
       expect(result.stderr).toContain('출력 너무 큼 (ENOBUFS');
     } finally { spy.mockRestore(); }
@@ -669,6 +671,23 @@ test('a host-recorded dispatch marker reaches the actual Pod Job without alterin
   expect(job.spec.template.spec.containers[0].args[0]).toContain('elanous self implement');
 });
 
+test('TA card slot reaches the actual Pod Job from the host launch environment', async () => {
+  const { k, calls } = fakeKubectl(['Complete'], '');
+  await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_SLOT_ID: 'TA-DRAFT-NO-LEFTOVER' } })
+    ({ feature: 'fix it', spaceId: 'ta-card-slot' }).done;
+  const job = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!))
+    .find((manifest) => manifest.kind === 'Job');
+  expect(job.spec.template.spec.containers[0].env).toContainEqual({ name: 'ELANOUS_POD_SLOT_ID', value: 'TA-DRAFT-NO-LEFTOVER' });
+});
+
+test('TA card slot reaches the Pod child as an explicit environment value', () => {
+  const manifest = podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60,
+    workIdentity: { work: 'harness', taskCard: 'ta-20261017-123456', slotId: 'TA-DRAFT-NO-LEFTOVER' } }) as {
+    spec: { template: { spec: { containers: Array<{ env: Array<{ name: string; value: string }> }> } } };
+  };
+  expect(manifest.spec.template.spec.containers[0]!.env).toContainEqual({ name: 'ELANOUS_POD_SLOT_ID', value: 'TA-DRAFT-NO-LEFTOVER' });
+});
+
 describe('pod memory evidence', () => {
   const lines = [1, 2, 3, 4, 5].map((n) => `ELANOUS_MEM ${1700000000 + n} ${n * 1073741824} ${n * 1048576}:node 512:bun`);
 
@@ -906,6 +925,8 @@ describe('pod memory evidence', () => {
 });
 
 describe('podSelfImplementSpawn', () => {
+  const suiteCwd = process.cwd();
+  afterEach(() => process.chdir(suiteCwd));
   test('self orchestrate CLI passes its actual supervise option into the Pod launch', () => {
     const source = readFileSync(new URL('../../index.ts', import.meta.url), 'utf8');
     const action = source.slice(source.indexOf(".command('orchestrate [goals...]')"), source.indexOf("selfOrchestrateCmd.on('option:help-all'"));
@@ -1853,8 +1874,282 @@ describe('podSelfImplementSpawn', () => {
     } finally { off(); }
   });
 
+  test('early goal-boundary rejection emits a structured preflight result even without a child ledger', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-terminal-fallback-'));
+    const previous = process.cwd();
+    try {
+      const goal = 'GOAL.md';
+      execFileSync('git', ['init', '-q', dir]);
+      writeFileSync(join(dir, goal), '# Goal\n\n## ACCEPTANCE CRITERIA\n\n- 기존 조건: 완료 경계가 없다\n');
+      process.chdir(dir);
+      const { k: manifestKubectl, calls } = fakeKubectl(['Complete'], '');
+      await podSelfImplementSpawn({ kubectl: manifestKubectl, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: goal, ELANOUS_TASK_CARD_ID: 'ta-1' } })({ feature: 'goal', spaceId: 'goal-boundary-manifest' }).done;
+      const job = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!)).find((m) => m.kind === 'Job');
+      const command = (job.spec.template.spec.containers[0].args[0] as string).split('\n').find((line) => line.startsWith('elanous harness ask '))!;
+      const path = join(dir, 'si.out');
+      const bin = join(dir, 'bin');
+      mkdirSync(bin);
+      const entry = join(dir, 'run-ask.ts');
+      writeFileSync(entry, `import { program, setRunDevAskFromGoalFileDepsForTesting } from ${JSON.stringify(import.meta.dir + '/../../index.ts')};\n`
+        + `setRunDevAskFromGoalFileDepsForTesting({ runAskFileLaunchFlow: async (path: string) => ({ kind: 'launch', goalFile: path }) });\n`
+        + `await program.parseAsync(['node', 'elanous', ...process.argv.slice(2)]);\n`);
+      writeFileSync(join(bin, 'elanous'), `#!/bin/sh\nexec bun ${JSON.stringify(entry)} "$@"\n`);
+      chmodSync(join(bin, 'elanous'), 0o755);
+      const emitted = spawnSync('bash', ['-c', `${command.replaceAll('/tmp/si.out', path)}\nexit $rc`], {
+        cwd: dir, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, ELANOUS_STATE_DIR: join(dir, 'state'),
+          ELANOUS_CONFIG_DIR: join(dir, 'state'), ELANOUS_TASK_CARD_ID: 'ta-1', ELANOUS_SUBSTRATE: 'pod', NODE_ENV: 'test' },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      expect(emitted.error).toBeUndefined();
+      expect(emitted.status).not.toBe(0);
+      const cliOutput = readFileSync(path, 'utf8');
+      const diagnostic = cliOutput.split('\n').find((line) => line.includes('골 완료 경계 누락:'));
+      if (!diagnostic) throw new Error(`expected goal-boundary diagnostic; child output:\n${cliOutput.slice(-4000)}`);
+      expect(diagnostic).toContain('TA 카드 ta-1');
+      const row = JSON.parse(readFileSync(path, 'utf8').trimEnd().split('\n').at(-1)!);
+      expect(row).toEqual({ stage: 'preflight-blocked', ok: false, error: diagnostic });
+      const { k } = fakeKubectl(['Failed'], `${readFileSync(path, 'utf8')}\nELANOUS_RUN_LEDGER_NONE`);
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'goal-boundary-fallback' }).done;
+      expect(result.error?.message).toContain(`childStage=preflight-blocked · childError=${diagnostic}`);
+      expect(result.error?.message).not.toContain('childError=no-result-line');
+    } finally {
+      process.chdir(previous);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('PR guard hunk overlap emits the conflict reason after draft PR opening throws', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-terminal-pr-guard-'));
+    try {
+      const root = process.cwd();
+      const repo = join(dir, 'repo');
+      const origin = join(dir, 'origin.git');
+      execFileSync('git', ['init', '--bare', origin]);
+      execFileSync('git', ['init', '-b', 'main', repo]);
+      const git = (...args: string[]) => execFileSync('git', args, { cwd: repo });
+      git('config', 'user.name', 'Pod Test');
+      git('config', 'user.email', 'pod-test@example.invalid');
+      writeFileSync(join(repo, 'README.md'), 'base\n');
+      git('add', 'README.md');
+      git('commit', '-m', 'base');
+      git('remote', 'add', 'origin', origin);
+      git('push', '-u', 'origin', 'main');
+      const cliModule = join(root, 'src/self-implement/self-implement-cli.ts');
+      const preload = join(dir, 'pr-guard-preload.ts');
+      // Keep the real CLI command and runSelfImplement path. The seams replace LLM/gate/network
+      // work, while actual openPr → PrManager → guardNewPr produces the refusal in a temp repo.
+      writeFileSync(preload, `import { mock } from 'bun:test';
+import * as cli from ${JSON.stringify(cliModule)};
+import { makePrManager } from ${JSON.stringify(join(root, 'src/autopilot/pr-manager.ts'))};
+import { guardNewPr } from ${JSON.stringify(join(root, 'src/pr-tool/census.ts'))};
+import { defaultSeams } from ${JSON.stringify(join(root, 'src/self-implement/seams.ts'))};
+import { runSelfImplement } from ${JSON.stringify(join(root, 'src/self-implement/orchestrator.ts'))};
+import { seams } from ${JSON.stringify(join(root, 'src/self-implement/test-seams.ts'))};
+const realRunSelfImplementCliCommand = cli.runSelfImplementCliCommand;
+mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCommand: (feature, opts) => {
+  const candidatePath = 'src/cli/pr-cli.ts';
+  const manager = makePrManager(() => ({ ok: true, out: '' }), () => guardNewPr(
+    { files: [candidatePath], hunks: [{ path: candidatePath, start: 54, end: 60 }], hunkOverlap: 'refuse' },
+    { status: 'checked', prs: [{ number: 28796, title: 'overlap', draft: true, updatedAt: '2026-10-17T00:00:00Z', headSha: 'a'.repeat(40), labels: [], files: [candidatePath], seat: 'UX', cellId: null,
+      hunks: [{ path: candidatePath, start: 50, end: 55 }] }] }));
+  return realRunSelfImplementCliCommand(feature, opts, {
+    resolveWantAutoReview: () => false,
+    pipelineDeps: {
+      runGit: () => ({ status: 0, stdout: 'origin\\n', stderr: '' }),
+      runSelfImplement: (options) => runSelfImplement({ ...options, seams: seams({
+        gateResults: [true],
+        createWorktree: async () => ({ path: ${JSON.stringify(repo)}, branch: 'self-impl/overlap', resolvedBase: 'a'.repeat(40), invokedHead: 'a'.repeat(40) }),
+        implement: async () => ({ ok: true, summary: 'implemented' }),
+        reviewDiff: async () => ({ verdict: 'warn', mustFix: [], shouldFix: ['human follow-up'], summary: 'reviewed', reviewed: true, diffTruncated: false, diffShownChars: 100, diffTotalChars: 100, diffOmittedFiles: 0 }),
+        openPr: defaultSeams({ prManager: manager }).openPr,
+      }) }),
+    },
+  });
+} }));
+`);
+      const path = join(dir, 'si.out');
+      const command = `${process.execPath} --preload ${preload} bin/elanous.mjs --test=${join(dir, 'state')} self implement 'overlap' --json --open-pr > ${path} 2>&1; rc=$?; ${POD_RESULT_FLATTEN.replace('/tmp/si.out', path)}; exit $rc`;
+      const emitted = spawnSync('bash', ['-c', command], { cwd: root, env: { ...process.env, NODE_ENV: 'test', ELANOUS_HARNESS_ENTRANCE: 'self-implement' }, encoding: 'utf8', timeout: 45_000 });
+      expect(emitted.error).toBeUndefined();
+      expect(emitted.status).toBe(1);
+      const cliOutput = readFileSync(path, 'utf8');
+      expect(cliOutput).toContain('self-implement PR guard 실패: hunk-overlap');
+      const row = JSON.parse(readFileSync(path, 'utf8').trimEnd().split('\n').at(-1)!);
+      expect(row).toMatchObject({ stage: 'error', ok: false, error: expect.stringContaining('self-implement PR guard 실패: hunk-overlap') });
+      const { k } = fakeKubectl(['Failed'], readFileSync(path, 'utf8'));
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'pr-guard-fallback' }).done;
+      expect(result.error?.message).toContain('childStage=error · childError=draft PR 생성 실패');
+      expect(result.error?.message).toContain('self-implement PR guard 실패: hunk-overlap');
+      expect(result.error?.message).not.toContain('childError=no-result-line');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('fallback terminal keeps the complete newest diagnostic before host display bounding', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-terminal-long-reason-'));
+    try {
+      const path = join(dir, 'si.out');
+      const reason = `self-implement PR guard 실패: hunk-overlap ${'x'.repeat(900)}`;
+      const detail = `${reason}\n- src/a.ts and src/b.ts overlap\nError: generic stack summary`;
+      writeFileSync(path, `골 완료 경계 누락: stale prior attempt\n${detail}\n`);
+      const emitted = Bun.spawnSync(['bash', '-c', `rc=1; ${POD_RESULT_FLATTEN.replace('/tmp/si.out', path)}`]);
+      expect(emitted.exitCode).toBe(0);
+      const row = JSON.parse(readFileSync(path, 'utf8').trimEnd().split('\n').at(-1)!);
+      expect(row).toEqual({ stage: 'error', ok: false, error: detail });
+      const { k } = fakeKubectl(['Failed'], readFileSync(path, 'utf8'));
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'long-pr-guard-fallback' }).done;
+      expect(result.error?.message).toContain('childStage=error · childError=self-implement PR guard 실패: hunk-overlap');
+      expect(result.error?.message).not.toContain('골 완료 경계 누락');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('already flat terminal JSON remains a single result line', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-terminal-flat-'));
+    try {
+      const path = join(dir, 'si.out');
+      const line = JSON.stringify({ stage: 'error', ok: false, error: 'actual child error' });
+      writeFileSync(path, `${line}\n`);
+      const emitted = Bun.spawnSync(['bash', '-c', `rc=1; ${POD_RESULT_FLATTEN.replace('/tmp/si.out', path)}`]);
+      expect(emitted.exitCode).toBe(0);
+      expect(readFileSync(path, 'utf8')).toBe(`${line}\n`);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('failed child exit after a success result emits a failure terminal', async () => {
+    for (const line of [
+      JSON.stringify({ stage: 'merged', ok: true }),
+      JSON.stringify({ kind: 'self', ok: true, result: { stage: 'merged' } }),
+    ]) {
+      const dir = mkdtempSync(join(tmpdir(), 'pod-terminal-success-before-error-'));
+      try {
+        const path = join(dir, 'si.out');
+        writeFileSync(path, `${JSON.stringify({ stage: 'error', ok: false, error: 'prior attempt' })}\n${line}\nunclassified failure\n`);
+        const emitted = Bun.spawnSync(['bash', '-c', `rc=1; ${POD_RESULT_FLATTEN.replace('/tmp/si.out', path)}`]);
+        expect(emitted.exitCode).toBe(0);
+        const row = JSON.parse(readFileSync(path, 'utf8').trimEnd().split('\n').at(-1)!);
+        expect(row).toEqual({ stage: 'error', ok: false, error: 'child exited rc=1 after a success result without a terminal failure result' });
+        const { k } = fakeKubectl(['Failed'], readFileSync(path, 'utf8'));
+        const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'success-before-error' }).done;
+        expect(result.error?.message).toContain('childStage=error · childError=child exited rc=1');
+        expect(result.error?.message).not.toContain('prior attempt');
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    }
+  });
+
+  test('interim JSON cannot mask a later preflight failure', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-terminal-interim-'));
+    try {
+      const path = join(dir, 'si.out');
+      const reason = '골 완료 경계 누락: TA 카드 ta-1';
+      writeFileSync(path, `${JSON.stringify({ stage: 'running', ok: true })}\n${reason}\n`);
+      const emitted = Bun.spawnSync(['bash', '-c', `rc=1; ${POD_RESULT_FLATTEN.replace('/tmp/si.out', path)}`]);
+      expect(emitted.exitCode).toBe(0);
+      const row = JSON.parse(readFileSync(path, 'utf8').trimEnd().split('\n').at(-1)!);
+      expect(row).toEqual({ stage: 'preflight-blocked', ok: false, error: reason });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('nested interim self JSON cannot mask a later preflight failure', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-terminal-nested-interim-'));
+    try {
+      const path = join(dir, 'si.out');
+      const reason = '골 완료 경계 누락: TA 카드 ta-1';
+      writeFileSync(path, `${JSON.stringify({ kind: 'self', ok: false, result: { stage: 'running', error: 'interim' } })}\n${reason}\n`);
+      const emitted = Bun.spawnSync(['bash', '-c', `rc=1; ${POD_RESULT_FLATTEN.replace('/tmp/si.out', path)}`]);
+      expect(emitted.exitCode).toBe(0);
+      const row = JSON.parse(readFileSync(path, 'utf8').trimEnd().split('\n').at(-1)!);
+      expect(row).toEqual({ stage: 'preflight-blocked', ok: false, error: reason });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('generic cleanup error after a goal-boundary rejection keeps the boundary stage', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-terminal-cleanup-after-boundary-'));
+    try {
+      const path = join(dir, 'si.out');
+      writeFileSync(path, '골 완료 경계 누락: TA 카드 ta-1\n❌ cleanup failed\n');
+      const emitted = Bun.spawnSync(['bash', '-c', `rc=1; ${POD_RESULT_FLATTEN.replace('/tmp/si.out', path)}`]);
+      expect(emitted.exitCode).toBe(0);
+      const row = JSON.parse(readFileSync(path, 'utf8').trimEnd().split('\n').at(-1)!);
+      expect(row).toEqual({ stage: 'preflight-blocked', ok: false, error: '골 완료 경계 누락: TA 카드 ta-1\n❌ cleanup failed' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('a structured child failure stays authoritative over a later matching log line', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-terminal-structured-first-'));
+    try {
+      const path = join(dir, 'si.out');
+      const child = { stage: 'error', ok: false, error: 'child result reason' };
+      writeFileSync(path, `${JSON.stringify(child)}\n❌ 골 완료 경계 누락: graph cleanup text\n`);
+      const emitted = Bun.spawnSync(['bash', '-c', `rc=1; ${POD_RESULT_FLATTEN.replace('/tmp/si.out', path)}`]);
+      expect(emitted.exitCode).toBe(0);
+      const row = JSON.parse(readFileSync(path, 'utf8').trimEnd().split('\n').at(-1)!);
+      expect(row).toEqual(child);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('nested self results retain child-defined terminal stages', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-terminal-self-stage-'));
+    try {
+      const path = join(dir, 'si.out');
+      writeFileSync(path, `${JSON.stringify({ kind: 'self', ok: false, result: { stage: 'custom-terminal', error: 'child result' } })}\n[graph] after result\n`);
+      const emitted = Bun.spawnSync(['bash', '-c', `rc=1; ${POD_RESULT_FLATTEN.replace('/tmp/si.out', path)}`]);
+      expect(emitted.exitCode).toBe(0);
+      const row = JSON.parse(readFileSync(path, 'utf8').trimEnd().split('\n').at(-1)!);
+      expect(row).toEqual({ stage: 'custom-terminal', error: 'child result', ok: false });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('a later separate failure supersedes a stale preflight line', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-terminal-new-failure-'));
+    try {
+      const path = join(dir, 'si.out');
+      writeFileSync(path, '골 완료 경계 누락: stale prior attempt\n[retry] a new attempt started\nError: current child failure\n');
+      const emitted = Bun.spawnSync(['bash', '-c', `rc=1; ${POD_RESULT_FLATTEN.replace('/tmp/si.out', path)}`]);
+      expect(emitted.exitCode).toBe(0);
+      const row = JSON.parse(readFileSync(path, 'utf8').trimEnd().split('\n').at(-1)!);
+      expect(row).toEqual({ stage: 'error', ok: false, error: 'Error: current child failure' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('flat child result followed by stderr stays authoritative at the Pod host', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-terminal-flat-stderr-'));
+    try {
+      const path = join(dir, 'si.out');
+      const line = JSON.stringify({ stage: 'error', ok: false, error: 'actual child failure' });
+      writeFileSync(path, `${line}\n${JSON.stringify({ kind: 'graph', stage: 'merged', ok: true })}\nError: trailing graph report\n`);
+      const emitted = Bun.spawnSync(['bash', '-c', `rc=1; ${POD_RESULT_FLATTEN.replace('/tmp/si.out', path)}`]);
+      expect(emitted.exitCode).toBe(0);
+      expect(readFileSync(path, 'utf8').trimEnd().split('\n').at(-1)).toBe(line);
+      const { k } = fakeKubectl(['Failed'], readFileSync(path, 'utf8'));
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'flat-stderr-fallback' }).done;
+      expect(result.error?.message).toContain('childStage=error · childError=actual child failure');
+      expect(result.error?.message).not.toContain('trailing graph report');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('flat child failure with an unregistered stage survives trailing stderr', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-terminal-custom-stage-'));
+    try {
+      const path = join(dir, 'si.out');
+      const line = JSON.stringify({ stage: 'custom-terminal', ok: false, error: 'child-defined failure' });
+      writeFileSync(path, `${line}\nError: trailing graph report\n`);
+      const emitted = Bun.spawnSync(['bash', '-c', `rc=1; ${POD_RESULT_FLATTEN.replace('/tmp/si.out', path)}`]);
+      expect(emitted.exitCode).toBe(0);
+      expect(readFileSync(path, 'utf8').trimEnd().split('\n').at(-1)).toBe(line);
+      const { k } = fakeKubectl(['Failed'], readFileSync(path, 'utf8'));
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'custom-stage-fallback' }).done;
+      expect(result.error?.message).toContain('childStage=custom-terminal · childError=child-defined failure');
+      expect(result.error?.message).not.toContain('childError=no-result-line');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('a failed Job without a result line records no-result-line', async () => {
-    const { k } = fakeKubectl(['Failed'], 'no result here');
+    const dir = mkdtempSync(join(tmpdir(), 'pod-no-result-line-'));
+    const path = join(dir, 'si.out');
+    writeFileSync(path, 'no result here\n');
+    const emitted = Bun.spawnSync(['bash', '-c', `rc=1; ${POD_RESULT_FLATTEN.replace('/tmp/si.out', path)}`]);
+    expect(emitted.exitCode).toBe(0);
+    expect(readFileSync(path, 'utf8')).toBe('no result here\n');
+    const { k } = fakeKubectl(['Failed'], readFileSync(path, 'utf8'));
     const finished: Array<Record<string, unknown>> = [];
     const off = debug.registerSink({ name: 'pod-missing-result-line', emit: (record) => {
       if (record.category === 'self-implement.pod' && record.event === 'job-finished') finished.push(record.data as Record<string, unknown>);
@@ -1864,7 +2159,7 @@ describe('podSelfImplementSpawn', () => {
       expect(result.error?.message).toContain('childError=no-result-line');
       expect(finished[0]).toMatchObject({ state: 'failed', childError: 'no-result-line' });
       expect(finished[0]).not.toHaveProperty('childStage');
-    } finally { off(); }
+    } finally { off(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   test('a failed Job is a non-zero exit with a named error', async () => {
@@ -3646,6 +3941,8 @@ fi
         .replace(`printf 'ELANOUS_POD_SOURCE default %s\\n' "$head"\n`, `printf 'ELANOUS_POD_SOURCE default %s\\n' "$head"\n${marker('clone', 'end')}\n`)
         .replace('export ELANOUS_HARNESS_ENTRANCE=self-implement; elanous self implement', `${marker('run', 'start')}\nexport ELANOUS_HARNESS_ENTRANCE=self-implement; elanous self implement`)
         .replace('wait "$si_pid"; rc=$?\ncat /tmp/si.out\n', `wait "$si_pid"; rc=$?; ${marker('run', 'end')}\ncat /tmp/si.out\n`);
+      frozenArgs[frozenArgs.length - 1] = frozenArgs[frozenArgs.length - 1]!
+        .replace(`${marker('run', 'end')}\ncat /tmp/si.out\n`, `${marker('run', 'end')}; ${POD_RESULT_FLATTEN}\ncat /tmp/si.out\n`);
       expect(JSON.stringify(job)).toBe(JSON.stringify(expectedHumanJob));
       expect(child.args[0]).toContain('export GH_TOKEN="$(cat /creds/gh-token)"');
       expect(human.calls.filter((call) => call.args.includes('exec') && call.args.includes('--with-token'))).toHaveLength(0);

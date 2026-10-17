@@ -9,7 +9,7 @@ import { join, relative, resolve } from 'node:path';
 import { registerTasksCommands, spawnDetachedConfirmed, type DetachedSpawn } from '../cli/tasks-cli.js';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { closeTaskCard, draftTaskOwner, handTask, launchArgs, nextMoveFor, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, selectTaskComposition, TASK_CARD_LABEL, RUN_TAG_CHANGE_EVENT, runTagChange, taskCardLabelContext, TaskAgentStateError, type TaskCard, type TaskLaunchContext } from './task-hand.js';
+import { abandonedDraftReleaseNote, closeTaskCard, draftTaskOwner, handTask, launchArgs, nextMoveFor, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, selectTaskComposition, TASK_CARD_LABEL, RUN_TAG_CHANGE_EVENT, runTagChange, taskCardLabelContext, TaskAgentStateError, type TaskCard, type TaskLaunchContext } from './task-hand.js';
 import { addItem, checklistDevVersion } from '../release-loop/checklist.js';
 import { listHarnessQueue, queueHeadBefore, type HarnessQueueDeps } from '../harness/harness-queue.js';
 import { installHarnessCliCommand } from '../harness/harness-cli-command.js';
@@ -1194,4 +1194,36 @@ test('TA-WORK-ORDER — task hand <지시서 파일> 은 펼친 골 문면을 �
   expect(card.text.split('\n')[0]).toBe(`대상 경로: ${fullWorkOrder.boundary}`);
   expect(card.text.split('\n')[1]).toBe(`현재 계약: ${fullWorkOrder.contract}`);
   expect(readTaskCard(card.id, path)?.text).toBe(card.text);
+});
+
+test('abandonedDraftReleaseNote — failed 카드 ⊕ PR 있으면 그 PR 의 처리 끝 문면', () => {
+  const at = new Date('2026-10-17T03:00:00Z');
+  const card: TaskCard = { id: 'ta-one', text: 'draft', createdAt: '2026-10-10T00:00:00Z',
+    status: 'failed', history: [], pr: { number: 19 } };
+  expect(abandonedDraftReleaseNote(card, at)).toEqual({ pr: 19, body: `🔧 처리 끝 — 2026-10-17T03:00:00.000Z · ta-one 포기 경로 — 자동` });
+});
+
+test('abandonedDraftReleaseNote — launch-failed 카드 ⊕ PR 있으면 그 PR 의 처리 끝 문면', () => {
+  const at = new Date('2026-10-17T03:00:00Z');
+  const card: TaskCard = { id: 'ta-two', text: 'draft', createdAt: '2026-10-10T00:00:00Z',
+    status: 'launch-failed', history: [], pr: 42 };
+  expect(abandonedDraftReleaseNote(card, at)).toEqual({ pr: 42, body: `🔧 처리 끝 — 2026-10-17T03:00:00.000Z · ta-two 포기 경로 — 자동` });
+});
+
+test('abandonedDraftReleaseNote — launched · handed 는 null', () => {
+  const at = new Date('2026-10-17T03:00:00Z');
+  for (const status of ['launched', 'handed'] as const) {
+    const card: TaskCard = { id: 'ta-three', text: 'draft', createdAt: '2026-10-10T00:00:00Z',
+      status, history: [], pr: { number: 19 } };
+    expect(abandonedDraftReleaseNote(card, at)).toBeNull();
+  }
+});
+
+test('abandonedDraftReleaseNote — PR 없는 포기 카드는 null', () => {
+  const at = new Date('2026-10-17T03:00:00Z');
+  for (const status of ['failed', 'launch-failed'] as const) {
+    const card: TaskCard = { id: 'ta-four', text: 'draft', createdAt: '2026-10-10T00:00:00Z',
+      status, history: [] };
+    expect(abandonedDraftReleaseNote(card, at)).toBeNull();
+  }
 });

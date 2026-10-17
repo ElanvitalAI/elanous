@@ -180,6 +180,19 @@ export function detectBursts(rows: readonly RunExit[], { windowMs = 60_000, thre
   return bursts.sort((a, b) => Date.parse(a.firstAt) - Date.parse(b.firstAt) || a.reason.localeCompare(b.reason));
 }
 
+/** Common-cause candidates: same hostname+reason exits within a 60-minute window, across seats and entrances; hostless rows stay unobserved. */
+export function detectCommonCauseBursts(rows: readonly RunExit[]): IncidentBurst[] {
+  const unique = uniqueRunExits(rows).filter((row) => row.hostname);
+  const bursts: IncidentBurst[] = [];
+  for (const group of groupRunExits(unique, (row) => JSON.stringify([row.reason, row.hostname]))) {
+    const hostname = group[0]!.hostname;
+    for (const members of burstMemberWindows(group, HOSTNAME_BURST_WINDOW_MS, 3)) {
+      bursts.push(burstFromMembers(members, { ...(hostname ? { hostname } : {}) }));
+    }
+  }
+  return bursts.sort((a, b) => Date.parse(a.firstAt) - Date.parse(b.firstAt) || a.reason.localeCompare(b.reason));
+}
+
 export function recentBurst(root: string, now: Date | number, { lookbackMs = 15 * 60_000, seat, entrance }: {
   lookbackMs?: number; seat?: string; entrance?: string;
 } = {}): IncidentBurst | null {

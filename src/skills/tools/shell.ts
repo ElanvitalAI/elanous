@@ -34,6 +34,8 @@ import {
 import type { ShellHandle, ShellResult as RunnerResult } from '../../shell-runner/types.js';
 import { debug } from '../../debug/log.js';
 import { getSessionCwd } from '../../session/working-dir.js';
+import { getUserConfig } from '../../user-config.js';
+import { SCHEDULE_WAKEUP_TOOL_NAME } from './schedule-wakeup.js';
 import {
   globalTaskNotificationQueue,
   type TaskNotificationQueue,
@@ -288,6 +290,231 @@ export function rejectedLedgerCliResult(
   };
 }
 
+// ── long sleep inside a turn (TUI-RUNSHELL-LONG-SLEEP · #38) ──────────────
+// A seat agent told "check again at 22:45" held its turn inside RunShell with
+// a long sleep, so the TUI stayed busy for 8+ minutes and the human could not
+// type. The command still runs unchanged (blocking it would break legitimate
+// waits); the result gains one warning line and `shell.run long-sleep` is
+// logged BEFORE the wait starts, so the hold is visible while it happens.
+// Static argv/script inspection only — no shell is spawned to analyse.
+
+export const DEFAULT_LONG_SLEEP_WARN_SECONDS = 60;
+
+export type LongSleepPattern = 'sleep' | 'shell-sleep' | 'poll-loop' | 'python-sleep' | 'computed-sleep';
+
+export interface LongSleepFinding {
+  pattern: LongSleepPattern;
+  /** Estimated total wait in seconds; null when unbounded or not literal. */
+  seconds: number | null;
+  /** Per-iteration sleep of a poll loop (poll-loop only; null when not literal). */
+  perIterationSeconds?: number | null;
+  limitSeconds: number;
+}
+
+/** `tools.runShell.longSleepWarnSeconds` from a raw config root (positive number) or the default. */
+export function longSleepWarnSecondsFrom(raw: Record<string, unknown> | undefined): number {
+  const tools = raw?.tools as { runShell?: { longSleepWarnSeconds?: unknown } } | undefined;
+  const v = tools?.runShell?.longSleepWarnSeconds;
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : DEFAULT_LONG_SLEEP_WARN_SECONDS;
+}
+
+function longSleepWarnSeconds(): number {
+  try {
+    return longSleepWarnSecondsFrom(getUserConfig().raw);
+  } catch { /* config unreadable → default */ }
+  return DEFAULT_LONG_SLEEP_WARN_SECONDS;
+}
+
+const SLEEP_UNIT_SECONDS: Readonly<Record<string, number>> = { '': 1, s: 1, m: 60, h: 3600, d: 86400 };
+
+/** coreutils `sleep` operand → seconds (`480`, `5m`, `1.5h`, `infinity`), null when not literal. */
+function parseSleepOperand(token: string): number | null {
+  if (/^inf(?:inity)?$/i.test(token)) return Infinity;
+  const m = /^(\d+(?:\.\d+)?|\.\d+)([smhd]?)$/.exec(token);
+  return m ? Number(m[1]) * SLEEP_UNIT_SECONDS[m[2]!]! : null;
+}
+
+function binName(arg: string | undefined): string {
+  return (arg ?? '').split(/[/\\]/).pop() ?? '';
+}
+
+/** Strip argv-preserving wrappers (env/timeout/nice/nohup/command/exec/time).
+ *  `timeout D …` caps the wait, so its duration is returned as `capSeconds`. */
+function unwrapArgv(command: readonly string[]): { argv: readonly string[]; capSeconds: number } {
+  let argv = command;
+  let capSeconds = Infinity;
+  for (let guard = 0; guard < 8 && argv.length > 0; guard += 1) {
+    const bin = binName(argv[0]);
+    let i = 1;
+    if (bin === 'env') {
+      while (i < argv.length && (argv[i]!.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[i]!))) {
+        if (['-u', '--unset', '-C', '--chdir', '-S', '--split-string'].includes(argv[i]!)) i += 1;
+        i += 1;
+      }
+    } else if (bin === 'timeout' || bin === 'gtimeout') {
+      while (i < argv.length && argv[i]!.startsWith('-')) {
+        if (['-s', '--signal', '-k', '--kill-after'].includes(argv[i]!)) i += 1;
+        i += 1;
+      }
+      const cap = parseSleepOperand(argv[i] ?? '');
+      if (cap !== null) capSeconds = Math.min(capSeconds, cap);
+      i += 1;
+    } else if (bin === 'nice') {
+      if (argv[1] === '-n') i = 3;
+      else if ((argv[1] ?? '').startsWith('-')) i = 2;
+    } else if (!['nohup', 'command', 'exec', 'time'].includes(bin)) {
+      break;
+    }
+    argv = argv.slice(i);
+  }
+  return { argv, capSeconds };
+}
+
+interface ScriptSleep { index: number; seconds: number | null }
+interface ScriptScan { sleeps: ScriptSleep[]; loopBodyStart: number; loopIterations: number | null }
+
+function scanShellScript(script: string): ScriptScan {
+  const sleeps: ScriptSleep[] = [];
+  // Command position only — `echo sleep 480` is an argument, not a wait.
+  const sleepRe = /(?:^|[;&|(`{\n]|\b(?:do|then|else)\b)[ \t]*sleep[ \t]+([^;&|)\n`}]+)/g;
+  for (let m = sleepRe.exec(script); m; m = sleepRe.exec(script)) {
+    const operands = m[1]!.trim().split(/\s+/).filter((t) => !t.startsWith('-'));
+    let total = 0;
+    for (const op of operands) {
+      const s = parseSleepOperand(op.replace(/^['"]|['"]$/g, ''));
+      if (s === null) { total = NaN; break; }
+      total += s;
+    }
+    sleeps.push({ index: m.index + m[0].indexOf('sleep'), seconds: operands.length > 0 && !Number.isNaN(total) ? total : null });
+  }
+  const loopRe = /(?:^|[;&|\n({]|\b(?:then|do|else)\b)\s*(while|until|for)\b([\s\S]*?)(?:;|\n)\s*do\b/;
+  const loop = loopRe.exec(script);
+  if (!loop) return { sleeps, loopBodyStart: -1, loopIterations: null };
+  let loopIterations: number | null = null;
+  if (loop[1] === 'for') {
+    const header = loop[2]!;
+    const brace = /\{(\d+)\.\.(\d+)\}/.exec(header);
+    const seq = /\$\(\s*seq\s+(\d+)(?:\s+(\d+))?\s*\)/.exec(header);
+    const words = /\bin\s+([^`$(){}]*)$/.exec(header.trim());
+    if (brace) loopIterations = Math.abs(Number(brace[2]) - Number(brace[1])) + 1;
+    else if (seq) loopIterations = seq[2] === undefined ? Number(seq[1]) : Math.max(0, Number(seq[2]) - Number(seq[1]) + 1);
+    else if (words) loopIterations = words[1]!.trim().split(/\s+/).filter(Boolean).length;
+  }
+  return { sleeps, loopBodyStart: loop.index + loop[0].length, loopIterations };
+}
+
+function scanPythonCode(code: string): ScriptScan {
+  const sleeps: ScriptSleep[] = [];
+  const sleepRe = /\b(?:time\.)?sleep\s*\(\s*([^)]*)\)/g;
+  for (let m = sleepRe.exec(code); m; m = sleepRe.exec(code)) {
+    const arg = m[1]!.trim();
+    sleeps.push({ index: m.index, seconds: /^(\d+(?:\.\d+)?|\.\d+)$/.test(arg) ? Number(arg) : null });
+  }
+  const loop = /(?:^|[;\n])\s*(while|for)\b([^:\n]*):/.exec(code);
+  if (!loop) return { sleeps, loopBodyStart: -1, loopIterations: null };
+  let loopIterations: number | null = null;
+  if (loop[1] === 'for') {
+    const range = /\brange\(\s*(\d+)(?:\s*,\s*(\d+))?\s*\)/.exec(loop[2]!);
+    if (range) loopIterations = range[2] === undefined ? Number(range[1]) : Math.max(0, Number(range[2]) - Number(range[1]));
+  }
+  return { sleeps, loopBodyStart: loop.index + loop[0].length, loopIterations };
+}
+
+function evaluateScan(
+  scan: ScriptScan, sleepPattern: LongSleepPattern, capSeconds: number, limitSeconds: number,
+): LongSleepFinding | null {
+  if (scan.sleeps.length === 0) return null;
+  const inLoop = scan.loopBodyStart >= 0 ? scan.sleeps.filter((s) => s.index >= scan.loopBodyStart) : [];
+  const outside = scan.sleeps.filter((s) => !inLoop.includes(s));
+  let total = outside.reduce((acc, s) => acc + (s.seconds ?? 0), 0);
+  if (inLoop.length > 0) {
+    const perIteration = inLoop.some((s) => s.seconds === null)
+      ? null : inLoop.reduce((acc, s) => acc + s.seconds!, 0);
+    const loopTotal = scan.loopIterations === null || perIteration === null
+      ? Infinity : perIteration * scan.loopIterations;
+    total = Math.min(total + loopTotal, capSeconds);
+    if (total > limitSeconds) {
+      return { pattern: 'poll-loop', seconds: Number.isFinite(total) ? total : null, perIterationSeconds: perIteration, limitSeconds };
+    }
+    return null;
+  }
+  total = Math.min(total, capSeconds);
+  if (total > limitSeconds) return { pattern: sleepPattern, seconds: Number.isFinite(total) ? total : null, limitSeconds };
+  if (outside.some((s) => s.seconds === null) && capSeconds > limitSeconds) {
+    return { pattern: 'computed-sleep', seconds: null, limitSeconds };
+  }
+  return null;
+}
+
+/** Long in-turn wait in a RunShell argv, or null. Exported for tests. */
+export function detectLongSleep(
+  command: readonly string[], limitSeconds: number = DEFAULT_LONG_SLEEP_WARN_SECONDS,
+): LongSleepFinding | null {
+  const { argv, capSeconds } = unwrapArgv(command);
+  const bin = binName(argv[0]);
+  if (bin === 'sleep') {
+    const operands = argv.slice(1).filter((t) => !t.startsWith('-'));
+    let total = 0;
+    for (const op of operands) {
+      const s = parseSleepOperand(op);
+      if (s === null) return null; // sleep itself rejects it — no wait happens
+      total += s;
+    }
+    total = Math.min(total, capSeconds);
+    return total > limitSeconds
+      ? { pattern: 'sleep', seconds: Number.isFinite(total) ? total : null, limitSeconds }
+      : null;
+  }
+  const scriptFlag = argv.findIndex((a, i) => i > 0 && /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
+  const script = scriptFlag > 0 ? argv[scriptFlag + 1] : undefined;
+  if (script === undefined) return null;
+  if (/^(?:ba|z|da|k)?sh$/.test(bin)) {
+    return evaluateScan(scanShellScript(script), 'shell-sleep', capSeconds, limitSeconds);
+  }
+  if (/^python(?:\d+(?:\.\d+)?)?$/.test(bin) && argv[scriptFlag] === '-c') {
+    return evaluateScan(scanPythonCode(script), 'python-sleep', capSeconds, limitSeconds);
+  }
+  return null;
+}
+
+/**
+ * Which resume path the warning names (TUI-RUNSHELL-LONG-SLEEP follow-up):
+ * `schedule-wakeup` when the turn was offered the ScheduleWakeup host tool
+ * (seat TUI · dashboard host tool), `generic` elsewhere (harness children,
+ * MCP, CLI agents) where that tool does not exist.
+ */
+export type LongSleepResumeHint = 'schedule-wakeup' | 'generic';
+
+/** `ScheduleWakeup` in this turn's tool list → name it; otherwise the generic resume advice. */
+export function longSleepResumeHint(availableToolNames: readonly string[] | undefined): LongSleepResumeHint {
+  return availableToolNames?.includes(SCHEDULE_WAKEUP_TOOL_NAME) ? 'schedule-wakeup' : 'generic';
+}
+
+/** The one warning line prefixed to a RunShell result. Exported for tests. */
+export function formatLongSleepWarning(
+  finding: LongSleepFinding, bgAvailable: boolean, resumeHint: LongSleepResumeHint = 'generic',
+): string {
+  const wait = finding.pattern === 'poll-loop'
+    ? `a poll loop sleeping ${finding.perIterationSeconds ?? '?'}s per iteration (total ${finding.seconds === null ? 'unbounded' : `~${finding.seconds}s`})`
+    : finding.pattern === 'computed-sleep'
+      ? 'a sleep of computed length'
+      : `a sleep of ${finding.seconds === null ? 'unbounded length' : `~${finding.seconds}s`}`;
+  const resume = resumeHint === 'schedule-wakeup'
+    ? `end the turn and call ${SCHEDULE_WAKEUP_TOOL_NAME} (delaySeconds ≥60, at "HH:MM", or repeatMinutes) so a wakeup turn resumes the work`
+    : 'end the turn and let the next turn or a mail wake resume the work';
+  return `⚠ RunShell long-sleep: this command waited inside the turn with ${wait} (limit ${finding.limitSeconds}s) — `
+    + `the turn stays busy and the human cannot type meanwhile. Do not hold the turn to wait: ${resume}`
+    + (bgAvailable ? ", or start long-running work with mode:'bg' (its completion arrives as a notification)." : '.');
+}
+
+function withLongSleepWarning(
+  result: RunShellDispatchResult, finding: LongSleepFinding | null, bgAvailable: boolean,
+  resumeHint: LongSleepResumeHint,
+): RunShellDispatchResult {
+  if (!finding) return result;
+  return { ...result, output: `${formatLongSleepWarning(finding, bgAvailable, resumeHint)}\n${result.output}` };
+}
+
 function logShellDispatch(event: string, data: Record<string, unknown>): void {
   debug.log('shell.dispatch', event, data);
 }
@@ -379,6 +606,21 @@ export async function dispatchRunShell(
   // Explicit inline/bg uses the file-backed runner when its deps are installed;
   // omitted mode and uninitialized hosts keep the legacy argv path.
   const deps = mode ? getShellRunnerDeps() : null;
+  // A bg handle returns immediately, so only blocking paths can hold the turn.
+  // Note `mode:'bg'` without runner deps falls through to the blocking legacy path.
+  const longSleep = mode === 'bg' && deps ? null : detectLongSleep(command, longSleepWarnSeconds());
+  const resumeHint = longSleepResumeHint(opts.availableToolNames);
+  if (longSleep) {
+    debug.log('shell.run', 'long-sleep', {
+      seconds: longSleep.seconds,
+      pattern: longSleep.pattern,
+      ...(longSleep.perIterationSeconds !== undefined ? { perIterationSeconds: longSleep.perIterationSeconds } : {}),
+      limitSeconds: longSleep.limitSeconds,
+      path: mode && deps ? 'runner' : 'legacy',
+      resumeHint,
+    });
+  }
+  const bgAvailable = getShellRunnerDeps() !== null;
   if (mode && deps) {
     const result = await dispatchViaRunner({
       command, cwd, timeoutMs, mode, description,
@@ -386,7 +628,7 @@ export async function dispatchRunShell(
       deps,
     });
     logShellDispatch(`runner.${result.outcome}`, { cwd: effectiveCwd, cwdSource });
-    return result;
+    return withLongSleepWarning(result, longSleep, bgAvailable, resumeHint);
   }
 
   const result = await runShell({
@@ -401,7 +643,7 @@ export async function dispatchRunShell(
 
   logShellDispatch(`legacy.${result.outcome}`, { cwd: effectiveCwd, cwdSource });
   const summary = formatSummary(result);
-  return {
+  return withLongSleepWarning({
     output: summary,
     exitCode: result.exitCode,
     outcome: result.outcome,
@@ -412,7 +654,7 @@ export async function dispatchRunShell(
     approvalKey: result.approvalKey,
     sandboxed: result.sandboxed,
     sandboxTool: result.sandboxTool,
-  };
+  }, longSleep, bgAvailable, resumeHint);
 }
 
 /** Route a request through the file-backed shell-runner and project its

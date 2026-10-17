@@ -20,6 +20,7 @@ import {
   classifyGateTestFailures,
   extractGateTestFailures,
   extractJUnitPassedTests,
+  extractJUnitTestCases,
   formatVerifyByBreakingNote,
   formatVerifyByBreakingSkipNote,
   formatVerifyByBreakingScopeSkipNote,
@@ -199,6 +200,168 @@ describe('gate baseline case attribution', () => {
       .toMatchObject([{ attribution: 'introduced', baselinePresence: 'missing' }]);
     expect(classifyGateTestFailures(`${candidate}\n${candidate}`, baseline, [added]))
       .toMatchObject([{ attribution: 'introduced' }, { attribution: 'introduced' }]);
+  });
+
+  // ⛔⭐ #27844 — Bun 콘솔 실패 헤더의 파일 귀속이 JUnit(testsuite file= · classname)과 어긋나면
+  //    introduced 로 단정하지 않는다. 실측: introduced 7 이 엉뚱한 파일로 귀속됐다(base 도 실패).
+  test('#27844 꼴 — 귀속 파일의 JUnit 에 없는 시험명은 introduced 대신 unknown(귀속 불일치)다', () => {
+    const attributed = 'src/self-implement/gate-cli.test.ts';
+    const other = 'src/self-implement/gate-artifacts.test.ts';
+    const caseName = 'gate artifact counts are stable';
+    const worktree = failLog(attributed, caseName);
+    const baseline = failLog(other, caseName);
+    const evidence = {
+      status: 'available' as const,
+      tests: [],
+      testCases: [{ file: other, name: `${other} > ${caseName}` }],
+    };
+
+    const failures = classifyGateTestFailures(worktree, baseline, [], undefined, evidence);
+    expect(failures).toMatchObject([{ attribution: 'unknown', unknownReason: '귀속 불일치', baselinePresence: 'present' }]);
+
+    const report = buildGateBaselineReport(worktree, {
+      status: 'test-fail', output: baseline, log: 'base red', passedTestEvidence: evidence,
+    });
+    expect(report).toMatchObject({ introduced: 0, unknown: 1 });
+    expect(formatGateBaselineNote(report, 0)).toContain('(귀속 불일치)');
+  });
+
+  // ⊕ 반증 — 시험 이름이 귀속 파일의 JUnit 에 있으면 기존 판정(introduced/preexisting)을 그대로 유지한다.
+  test('반증 — 귀속 파일의 JUnit 에 그 시험명이 있으면 기존 판정을 바꾸지 않는다', () => {
+    const attributed = 'src/self-implement/gate-cli.test.ts';
+    const caseName = 'newly added case';
+    const evidence = {
+      status: 'available' as const,
+      tests: [],
+      testCases: [{ file: attributed, name: `${attributed} > ${caseName}` }],
+    };
+
+    const introduced = classifyGateTestFailures(failLog(attributed, caseName), '0 fail', [], undefined, evidence);
+    expect(introduced).toMatchObject([{ attribution: 'introduced', baselinePresence: 'present' }]);
+    expect(introduced[0]?.unknownReason).toBeUndefined();
+
+    const preexisting = classifyGateTestFailures(
+      failLog(attributed, caseName),
+      failLog(attributed, caseName),
+      [],
+      undefined,
+      evidence,
+    );
+    expect(preexisting).toMatchObject([{ attribution: 'preexisting', baselinePresence: 'present' }]);
+  });
+
+  // ⊕ 신규 시험 오판정 방지(리뷰 must-fix) — 기준선 JUnit 은 base worktree 라 worktree 에서 새로
+  //    추가한 시험명을 담을 수 없다. 시험명이 기준선 JUnit «어디에도» 없으면 귀속 불일치의 증거가
+  //    아니므로 기존 판정을 유지한다 — 이름이 «다른 파일»에 있을 때만 #27844 양성 신호다.
+  test('신규 시험 — 시험명이 기준선 JUnit 어디에도 없으면 unknown 이 아니라 기존 판정을 유지한다', () => {
+    const attributed = 'src/self-implement/gate-cli.test.ts';
+    const caseName = 'brand new case';
+    const evidence = {
+      status: 'available' as const,
+      tests: [],
+      testCases: [{ file: attributed, name: `${attributed} > preexisting case` }],
+    };
+
+    const introduced = classifyGateTestFailures(failLog(attributed, caseName), '0 fail', [], undefined, evidence);
+    expect(introduced).toMatchObject([{ attribution: 'introduced', baselinePresence: 'present' }]);
+    expect(introduced[0]?.unknownReason).toBeUndefined();
+
+    const newFile = 'src/self-implement/new-thing.test.ts';
+    const missingAtBase = classifyGateTestFailures(failLog(newFile, caseName), '0 fail', [newFile], undefined, {
+      status: 'available' as const,
+      tests: [],
+      testCases: [],
+    });
+    expect(missingAtBase).toMatchObject([{ attribution: 'introduced', baselinePresence: 'missing' }]);
+    expect(missingAtBase[0]?.unknownReason).toBeUndefined();
+
+    const report = buildGateBaselineReport(failLog(attributed, caseName), {
+      status: 'pass', output: '0 fail', log: 'base clean', passedTestEvidence: evidence,
+    });
+    expect(report).toMatchObject({ introduced: 1, unknown: 0 });
+    expect(formatGateBaselineNote(report, 0)).not.toContain('귀속 불일치');
+  });
+
+  // ⊕ #27844 양성 신호 보존 — 귀속 불일치로 단정할 근거(다른 파일에 그 시험명이 있다)가 있으면
+  //    attributed 파일이 기준선에 없어도(missing-at-base) unknown(귀속 불일치)로 둔다.
+  test('귀속 불일치 양성 신호 — 시험명이 기준선 JUnit 다른 파일에 있으면 missing-at-base 여도 unknown 이다', () => {
+    const newFile = 'src/self-implement/new-thing.test.ts';
+    const owner = 'src/self-implement/gate-artifacts.test.ts';
+    const caseName = 'gate artifact counts are stable';
+    const evidence = {
+      status: 'available' as const,
+      tests: [],
+      testCases: [{ file: owner, name: `${owner} > ${caseName}` }],
+    };
+
+    const failures = classifyGateTestFailures(failLog(newFile, caseName), failLog(owner, caseName), [newFile], undefined, evidence);
+    expect(failures).toMatchObject([{ attribution: 'unknown', unknownReason: '귀속 불일치', baselinePresence: 'missing' }]);
+  });
+
+  // ⊕ 실제 Bun JUnit 꼴 fixture 를 파싱해서 분류한다(testCases 직접 주입 우회 없음) — testsuite file= 상속 ·
+  //    classname(=describe 이름)은 파일이 아니다 · 이름은 콘솔 «describe > case» 꼴.
+  test('#27844 — 실제 JUnit 꼴: testsuite file= 를 상속하고 classname 을 파일로 오인하지 않는다', () => {
+    const attributed = 'src/self-implement/gate-cli.test.ts';
+    const other = 'src/self-implement/gate-artifacts.test.ts';
+    const junit = (owner: string) => `<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="2">
+  <testsuite name="${owner}" file="${owner}" tests="2">
+    <testsuite name="Suite" file="${owner}" line="3" tests="2">
+      <testcase name="counts are stable" classname="Suite" time="0.001" line="4" />
+      <testcase name="other case" classname="Suite" time="0.001" file="${owner}" line="9" />
+    </testsuite>
+  </testsuite>
+</testsuites>`;
+    expect(extractJUnitTestCases(junit(attributed))).toEqual([
+      { file: attributed, name: `${attributed} > Suite > counts are stable` },
+      { file: attributed, name: `${attributed} > Suite > other case` },
+    ]);
+
+    // 시험명이 귀속 파일의 suite 안에 있다(testcase 에 file= 없음 · classname=Suite) → 기존 판정 유지.
+    const sameFile = { status: 'available' as const, tests: [], testCases: extractJUnitTestCases(junit(attributed)) };
+    const kept = buildGateBaselineReport(failLog(attributed, 'Suite > counts are stable'), {
+      status: 'pass', output: '0 fail', log: 'base clean', passedTestEvidence: sameFile,
+    });
+    expect(kept).toMatchObject({ introduced: 1, unknown: 0 });
+    expect(kept.failures[0]?.unknownReason).toBeUndefined();
+
+    // 같은 시험명이 «다른 파일» suite 에만 있다 → unknown(귀속 불일치).
+    const otherFile = { status: 'available' as const, tests: [], testCases: extractJUnitTestCases(junit(other)) };
+    const mismatch = buildGateBaselineReport(failLog(attributed, 'Suite > counts are stable'), {
+      status: 'pass', output: '0 fail', log: 'base clean', passedTestEvidence: otherFile,
+    });
+    expect(mismatch).toMatchObject({ introduced: 0, unknown: 1 });
+    expect(mismatch.failures[0]?.unknownReason).toBe('귀속 불일치');
+  });
+
+  test('#27844 — 평면 JUnit 꼴: classname 을 describe 이름으로 복원해 다른 파일의 같은 시험을 찾는다', () => {
+    const attributed = 'src/self-implement/gate-cli.test.ts';
+    const other = 'src/self-implement/gate-artifacts.test.ts';
+    const flat = (owner: string) => `<testsuites><testsuite name="${owner}" file="${owner}"><testcase name="x" classname="Suite" /></testsuite></testsuites>`;
+    expect(extractJUnitTestCases(flat(other))).toEqual([{ file: other, name: `${other} > Suite > x` }]);
+
+    const mismatch = buildGateBaselineReport(failLog(attributed, 'Suite > x'), {
+      status: 'pass', output: '0 fail', log: 'base clean',
+      passedTestEvidence: { status: 'available' as const, tests: [], testCases: extractJUnitTestCases(flat(other)) },
+    });
+    expect(mismatch).toMatchObject({ introduced: 0, unknown: 1 });
+    expect(mismatch.failures[0]?.unknownReason).toBe('귀속 불일치');
+
+    const kept = buildGateBaselineReport(failLog(attributed, 'Suite > x'), {
+      status: 'pass', output: '0 fail', log: 'base clean',
+      passedTestEvidence: { status: 'available' as const, tests: [], testCases: extractJUnitTestCases(flat(attributed)) },
+    });
+    expect(kept).toMatchObject({ introduced: 1, unknown: 0 });
+  });
+
+  test('extractJUnitTestCases — testsuite file= 이 testcase file= 보다 우선한다', () => {
+    const xml = '<testsuites><testsuite name="a.test.ts" file="a.test.ts"><testcase name="x" classname="a.test.ts" file="b.test.ts" /></testsuite></testsuites>';
+    expect(extractJUnitTestCases(xml)).toEqual([{ file: 'a.test.ts', name: 'a.test.ts > x' }]);
+  });
+
+  test('extractJUnitTestCases — 파일을 못 정하는 testcase 는 뺀다(classname 만으로는 파일이 아니다)', () => {
+    const xml = '<testsuites><testsuite name="loose"><testcase name="x" classname="Suite" /></testsuite></testsuites>';
+    expect(extractJUnitTestCases(xml)).toEqual([]);
   });
 
   test('파일 간 동일 시험 증거가 있을 때만 귀속 로그에 기준선 파일을 기록한다', () => {
@@ -2469,7 +2632,12 @@ describe('verify by breaking', () => {
           status: 'test-fail',
           log: 'baseline tests failed with code 1',
           output: expectedOutput,
-          passedTestEvidence: { status: 'available', tests: [] },
+          passedTestEvidence: {
+            status: 'available',
+            tests: [],
+            // #27844 귀속 일치 확인 — 기준선 JUnit 의 전체 testcase 목록도 함께 나온다.
+            testCases: [{ file: 'test/value.test.js', name: 'test/value.test.js > new contract' }],
+          },
         },
       }],
     });

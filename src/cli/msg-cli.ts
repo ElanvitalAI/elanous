@@ -359,6 +359,7 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       let store: MsgStore | undefined;
       try {
         const asked = withStore(ledger => ledger.post({ from, to, body: question }));
+        emit(asked, opts.json, () => out.log(`#${asked.id}`));
         // msg ask uses the same saved-message handler before waiting for its linked reply.
         await handleTaMessage(asked);
         const deadline = Date.now() + waitSeconds * 1000;

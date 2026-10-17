@@ -77,6 +77,215 @@ const seams = (over: Parameters<typeof baseSeams>[0]): SelfImplementSeams => bas
 import type { DecisionSignalPressResult } from './decision-signal-press.js';
 import type { SoftStopRequestRead } from '../harness/control-inbox.js';
 
+describe('goal-only implementation rework', () => {
+  test('continues only after the retry changes a declared target and reports a RESULT', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'goal-only-rework-success-'));
+    const repo = join(root, 'repo');
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src/example.ts'), 'export const done = false;\n');
+    const git = (...args: string[]) => {
+      const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+      expect(result.status).toBe(0);
+      return result.stdout.trim();
+    };
+    git('init');
+    git('add', 'src/example.ts');
+    git('-c', 'user.name=TC Test', '-c', 'user.email=tc-test@example.invalid', 'commit', '-m', 'baseline');
+    const base = git('rev-parse', 'HEAD');
+    git('update-ref', 'refs/remotes/origin/main', base);
+    const goalFile = join(root, 'GOAL.md');
+    writeFileSync(goalFile, goalDocumentWithDeclaredTargets('src/example.ts').replace('- keep the verbatim ask.', '- src/example.ts 구현'));
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const original = debug.log;
+    let calls = 0;
+    (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
+      events.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      const result = await runSelfImplement({
+        feature: '대상 경로: src/example.ts', goalFile, maxReworkRounds: 1, completion: 'worktree-only',
+        seams: seams({
+          createWorktree: async () => ({ path: repo, branch: 'self-impl/goal-only-rework-success', resolvedBase: base, invokedHead: base }),
+          implement: async () => {
+            calls += 1;
+            if (calls === 1) return { ok: false, summary: 'GOAL-COMPLETE', completionDisposition: 'completed-without-changes',
+              toolCalls: 13, terminalStatus: { reached: true, changed: false, toolCalls: 13, timedOut: false } };
+            writeFileSync(join(repo, 'src/example.ts'), 'export const done = true;\n');
+            return { ok: true, summary: 'RESULT: src/example.ts 구현·검증', evidenceTranscript: 'RESULT: src/example.ts 구현·검증',
+              toolCalls: 7, terminalStatus: { reached: true, changed: true, toolCalls: 7, timedOut: false } };
+          },
+        }),
+      });
+      expect(calls).toBe(2);
+      expect(result).toMatchObject({ ok: true, stage: 'worktree-completed' });
+      expect(git('diff', '--name-only', base, 'HEAD')).toContain('src/example.ts');
+      expect(events.filter(entry => entry.event === 'implementation-goal-only-rework').map(entry => entry.data.status))
+        .toEqual(['started', 'succeeded']);
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('retries one completed child with readable targets, then stops without opening a PR when target diff stays empty', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'goal-only-rework-'));
+    const goalFile = join(repo, 'GOAL.md');
+    writeFileSync(goalFile, goalDocumentWithDeclaredTargets('src/example.ts').replace('- keep the verbatim ask.', '- src/example.ts 구현'));
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const original = debug.log;
+    let calls = 0;
+    let opened = 0;
+    const progress: string[] = [];
+    (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
+      events.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      const result = await runSelfImplement({
+        feature: '대상 경로: src/example.ts', goalFile, maxReworkRounds: 1,
+        seams: seams({
+          createWorktree: async () => ({ path: repo, branch: 'self-impl/goal-only-rework' }),
+          implement: async (context) => {
+            calls += 1;
+            if (calls === 2) {
+              expect(context.feature).toContain('src/example.ts');
+              expect(context.feature).toContain('RESULT:');
+              expect(context.feature).toContain('- src/example.ts 구현');
+            }
+            return { ok: false, summary: 'GOAL-COMPLETE', completionDisposition: 'completed-without-changes',
+              toolCalls: 39, terminalStatus: { reached: true, changed: false, toolCalls: 39, timedOut: false } };
+          },
+          changedFilesForGateRoute: () => [],
+          openPr: async () => { opened += 1; throw new Error('must not open PR'); },
+          onProgress: ({ message }) => { progress.push(message); },
+        }),
+      });
+      expect(calls).toBe(2);
+      expect(opened).toBe(0);
+      expect(result).toMatchObject({ stage: 'aborted', terminationReason: 'goal-only-rework-exhausted', detail: expect.stringContaining('goal-only-rework-exhausted') });
+      expect(progress.some(message => message.includes('goal-only-rework-exhausted'))).toBe(true);
+      expect(events.filter(entry => entry.event === 'implementation-goal-only-rework').map(entry => entry.data.status))
+        .toEqual(['started', 'exhausted']);
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('exhausts the retry when a declared target changes but RESULT is missing', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'goal-only-rework-no-result-'));
+    const repo = join(root, 'repo');
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src/example.ts'), 'export const done = false;\n');
+    const git = (...args: string[]) => {
+      const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+      expect(result.status).toBe(0);
+      return result.stdout.trim();
+    };
+    git('init');
+    git('add', 'src/example.ts');
+    git('-c', 'user.name=TC Test', '-c', 'user.email=tc-test@example.invalid', 'commit', '-m', 'baseline');
+    const base = git('rev-parse', 'HEAD');
+    git('update-ref', 'refs/remotes/origin/main', base);
+    const goalFile = join(root, 'GOAL.md');
+    writeFileSync(goalFile, goalDocumentWithDeclaredTargets('src/example.ts').replace('- keep the verbatim ask.', '- src/example.ts 구현'));
+    let calls = 0;
+    let opened = 0;
+    try {
+      const result = await runSelfImplement({
+        feature: '대상 경로: src/example.ts', goalFile, maxReworkRounds: 1, completion: 'worktree-only',
+        seams: seams({
+          createWorktree: async () => ({ path: repo, branch: 'self-impl/goal-only-rework-no-result', resolvedBase: base, invokedHead: base }),
+          implement: async () => {
+            calls += 1;
+            if (calls === 1) return { ok: false, summary: 'GOAL-COMPLETE', completionDisposition: 'completed-without-changes',
+              terminalStatus: { reached: true, changed: false, toolCalls: 13, timedOut: false } };
+            writeFileSync(join(repo, 'src/example.ts'), 'export const done = true;\n');
+            return { ok: true, summary: '구현 완료', evidenceTranscript: '구현 완료',
+              terminalStatus: { reached: true, changed: true, toolCalls: 7, timedOut: false } };
+          },
+          openPr: async () => { opened += 1; throw new Error('must not open PR'); },
+        }),
+      });
+      expect(calls).toBe(2);
+      expect(git('diff', '--name-only', base)).toContain('src/example.ts');
+      expect(opened).toBe(0);
+      expect(result).toMatchObject({ stage: 'aborted', terminationReason: 'goal-only-rework-exhausted' });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('spends the goal-only retry only once across later gate rework rounds', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'goal-only-rework-once-'));
+    const repo = join(root, 'repo');
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src/example.ts'), 'export const done = false;\n');
+    const git = (...args: string[]) => {
+      const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+      expect(result.status).toBe(0);
+      return result.stdout.trim();
+    };
+    git('init');
+    git('add', 'src/example.ts');
+    git('-c', 'user.name=TC Test', '-c', 'user.email=tc-test@example.invalid', 'commit', '-m', 'baseline');
+    const base = git('rev-parse', 'HEAD');
+    git('update-ref', 'refs/remotes/origin/main', base);
+    const goalFile = join(root, 'GOAL.md');
+    writeFileSync(goalFile, goalDocumentWithDeclaredTargets('src/example.ts').replace('- keep the verbatim ask.', '- src/example.ts 구현'));
+    let calls = 0;
+    let gates = 0;
+    try {
+      const result = await runSelfImplement({
+        feature: '대상 경로: src/example.ts', goalFile, maxReworkRounds: 3,
+        seams: seams({
+          createWorktree: async () => ({ path: repo, branch: 'self-impl/goal-only-rework-once', resolvedBase: base, invokedHead: base }),
+          implement: async () => {
+            calls += 1;
+            if (calls === 2) {
+              writeFileSync(join(repo, 'src/example.ts'), 'export const done = true;\n');
+              return { ok: true, summary: 'RESULT: src/example.ts 구현', evidenceTranscript: 'RESULT: src/example.ts 구현' };
+            }
+            if (calls === 3) git('reset', '--hard', base);
+            return { ok: false, summary: 'GOAL-COMPLETE', completionDisposition: 'completed-without-changes',
+              terminalStatus: { reached: true, changed: false, toolCalls: 13, timedOut: false } };
+          },
+          gate: async () => { gates += 1; return { passed: false, log: '[test] FAIL unmeasured',
+            reflectGateFacts: { introduced: 0, preexisting: 0, unknown: 0, childResponsibility: 'none' } }; },
+        }),
+      });
+      expect(gates).toBe(1);
+      expect(calls).toBe(3);
+      expect(result).toMatchObject({ stage: 'aborted', outcome: 'abandoned' });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('does not retry when the authored rework budget is zero', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'goal-only-no-budget-'));
+    const goalFile = join(repo, 'GOAL.md');
+    writeFileSync(goalFile, goalDocumentWithDeclaredTargets('src/example.ts').replace('- keep the verbatim ask.', '- src/example.ts 구현'));
+    let calls = 0;
+    try {
+      await runSelfImplement({
+        feature: '대상 경로: src/example.ts', goalFile, maxReworkRounds: 0,
+        seams: seams({
+          createWorktree: async () => ({ path: repo, branch: 'self-impl/goal-only-no-budget' }),
+          implement: async () => {
+            calls += 1;
+            return { ok: false, summary: 'GOAL-COMPLETE', completionDisposition: 'completed-without-changes',
+              terminalStatus: { reached: true, changed: false, toolCalls: 13, timedOut: false } };
+          },
+          changedFilesForGateRoute: () => [],
+        }),
+      });
+      expect(calls).toBe(1);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+});
+
 // STOP-AUTOHEAL 의 «프로세스 안 한 번» 기억(#24915)은 런 id 로 남는다 — 같은 런 id 를 다시 쓰는 시험이 앞 시험의 기억을 물려받지 않게 비운다.
 beforeEach(() => { resetAutohealProcessMemory(); });
 
@@ -14974,11 +15183,11 @@ describe('PR checklist cell stamp', () => {
       return { url: 'https://pr/cell', number: 7 };
     } }) });
     expect(openedTitle).toBe(title);
-    expect(body.split('\n')[0]).toBe('칸: KPACK4 · NEXT-2');
+    expect(body.split('\n')[0]).toBe('칸: 미상');
     const blocked = assembleBlockedDraftPrBody(ask, 'summary', {
       reason: 'blocked', rounds: 0, salvageStatusExpected: false, undeliveredSupervisorInputs: [],
     }, goalFile);
-    expect(blocked.body.split('\n')[0]).toBe('칸: KPACK4 · NEXT-2');
+    expect(blocked.body.split('\n')[0]).toBe('칸: 미상');
   });
 
   test('a single GOAL cell puts exactly 칸: KPACK4 first on a blocked draft', () => {
@@ -14986,7 +15195,7 @@ describe('PR checklist cell stamp', () => {
     const blocked = assembleBlockedDraftPrBody(ask, 'summary', {
       reason: 'blocked', rounds: 0, salvageStatusExpected: false, undeliveredSupervisorInputs: [],
     }, goalFile);
-    expect(blocked.body.split('\n')[0]).toBe('칸: KPACK4');
+    expect(blocked.body.split('\n')[0]).toBe('칸: 미상');
   });
 
   test('does not duplicate an existing ID prefix and uses only first-line ask tokens as fallback', () => {
@@ -15002,7 +15211,7 @@ describe('PR checklist cell stamp', () => {
     expect(prTitle(feature, goalFile)).toBe('KPACK-4: 이미 표지한 제목');
     expect(assembleBlockedDraftPrBody(feature, 'summary', {
       reason: 'blocked', rounds: 0, salvageStatusExpected: false, undeliveredSupervisorInputs: [],
-    }, goalFile).body.split('\n')[0]).toBe('칸: KPACK-4');
+    }, goalFile).body.split('\n')[0]).toBe('칸: 미상');
   });
 
   test('not declared GOAL falls back to the ask first line without scanning later lines', () => {
@@ -15021,10 +15230,10 @@ describe('PR checklist cell stamp', () => {
       body = openedBody;
       return { url: 'https://pr/no-cell', number: 7 };
     } }) });
-    expect(body.split('\n')[0]).toBe('칸: 없음');
+    expect(body.split('\n')[0]).toBe('칸: 미상');
     expect(assembleBlockedDraftPrBody(ask, 'summary', {
       reason: 'blocked', rounds: 0, salvageStatusExpected: false, undeliveredSupervisorInputs: [],
-    }, goalFile).body.split('\n')[0]).toBe('칸: 없음');
+    }, goalFile).body.split('\n')[0]).toBe('칸: 미상');
   });
 });
 

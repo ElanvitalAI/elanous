@@ -38,11 +38,26 @@ function executePlan(root: string, decision: ReturnType<typeof decidePodReuseCle
     cleanExitCode: clean.status,
     statusExitCode: status.status,
     statusPorcelain: status.stdout,
-    remainingPaths: status.stdout.split('\n').filter(Boolean).map((line) => line.slice(3)),
+    remainingPaths: status.stdout.split('\0').filter(Boolean).map((record) => record.slice(3)),
   });
 }
 
 describe('pod reusable worker request cleanup decision', () => {
+  test('resets tracked changes to an earlier request base', () => {
+    const { root, base } = makeRepo();
+    writeFileSync(join(root, 'tracked.txt'), 'next request base\n');
+    execFileSync('git', ['add', 'tracked.txt'], { cwd: root });
+    execFileSync('git', ['commit', '-qm', 'next request'], { cwd: root });
+    writeFileSync(join(root, 'tracked.txt'), 'uncommitted previous request\n');
+
+    const plan = decidePodReuseCleanup({ base, resetExitCode: 0, cleanExitCode: 0, statusExitCode: 0, statusPorcelain: '' });
+    const result = executePlan(root, plan);
+
+    expect(result.outcome).toBe('reuse');
+    expect(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim()).toBe(base);
+    expect(readFileSync(join(root, 'tracked.txt'), 'utf8')).toBe('base\n');
+  });
+
   test('removes an untracked artifact from the preceding request', () => {
     const { root, base } = makeRepo();
     const artifact = join(root, 'src/generated/previous-request.ts');
@@ -96,5 +111,23 @@ describe('pod reusable worker request cleanup decision', () => {
     expect(decidePodReuseCleanup({ base, resetExitCode: 0, cleanExitCode: 128, statusExitCode: 0, statusPorcelain: '' }).reason).toBe('clean-failed');
     expect(decidePodReuseCleanup({ base, resetExitCode: 0, cleanExitCode: 0, statusExitCode: 128, statusPorcelain: '' }).reason).toBe('status-failed');
     expect(decidePodReuseCleanup({ base: 'a'.repeat(40), resetExitCode: 0, cleanExitCode: 0, statusExitCode: 0, statusPorcelain: '?? residue\n', remainingPaths: ['residue', 'two', 'three', 'four', 'five', 'six'] }).remainingPaths).toEqual(['residue', 'two', 'three', 'four', 'five']);
+  });
+
+  test('passes an actual failed git command result into the discard decision', () => {
+    const { root, base } = makeRepo();
+    const plan = decidePodReuseCleanup({ base, resetExitCode: 0, cleanExitCode: 0, statusExitCode: 0, statusPorcelain: '' });
+    const env = { ...process.env, GIT_DIR: join(root, '.git-missing') };
+    const reset = spawnSync('git', [...plan.resetArgs], { cwd: root, encoding: 'utf8', env });
+    const result = decidePodReuseCleanup({
+      base,
+      resetExitCode: reset.status,
+      cleanExitCode: 0,
+      statusExitCode: 0,
+      statusPorcelain: '',
+    });
+
+    expect(reset.status).not.toBe(0);
+    expect(result.outcome).toBe('discard');
+    expect(result.reason).toBe('reset-failed');
   });
 });

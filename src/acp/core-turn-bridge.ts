@@ -67,8 +67,9 @@ const QUICK_TOOLS: Record<QuickTuiRoute, readonly string[]> = {
   '조회': ['decisions_pending', 'ops_seats', 'ops_status', 'release_status', 'logs_query', 'context_now', 'memory_recall', 'Read'],
   '설정 변경': ['DashboardConfigGet', 'DashboardConfigSet', 'LlmListAvailableModels', 'prompt_getRuntimeConfig', 'prompt_setRuntimeConfig', 'view_getConfig', 'view_applyRuntimeConfig', 'view_saveConfig', 'memory_recall'],
   // MsgList is a read-only ledger listing (never acks); MsgPost · MsgAck · RunShell · Bash stay out (TUI-QUICK-ROUTE-EXPLICIT-CMD).
-  '조사': ['WebSearch', 'OmniSearch', 'Grep', 'Glob', 'Read', 'fact_check', 'memory_recall', 'MsgList'],
-  '상시 일': ['schedule_manage', 'schedule_list', 'schedule_create', 'schedule_update', 'session_manage', 'ops_status', 'memory_recall'],
+  '조사': ['WebSearch', 'OmniSearch', 'Grep', 'Glob', 'Read', 'fact_check', 'memory_recall', 'MsgList', 'Agent'],
+  // ScheduleWakeup (H5) wakes this TUI in-process; schedule_manage is OS cron — both belong to «상시 일».
+  '상시 일': ['schedule_manage', 'schedule_list', 'schedule_create', 'schedule_update', 'ScheduleWakeup', 'session_manage', 'ops_status', 'memory_recall'],
 };
 
 export function toolsForTuiRoute(tools: readonly LLMToolSpec[], route: QuickTuiRoute): LLMToolSpec[] {
@@ -248,7 +249,7 @@ export function bridgeCoreTurnToAcp(
           })
         : { route: '코딩·구현' as const, reason: harness ? 'harness' : 'legacy', goalLoop: true };
       const tools = !route.goalLoop && route.route !== '코딩·구현' && route.route !== '읽기·분석'
-        ? toolsForTuiRoute(availableTools, route.route)
+        ? toolsForTuiRoute(availableTools, route.route) // bridgeCoreTurnToAcp applies route allowlists here.
         : availableTools;
       if (deps.tuiRouting) {
         debug.log('chat.route', 'decided', { route: route.route, reason: route.reason, goalLoop: route.goalLoop, seat, seatKnown });
@@ -317,6 +318,7 @@ export function bridgeCoreTurnToAcp(
       let finalSupplement: { answer: string; supplement: string; finalText: string } | null = null;
       // turnFamily 는 관측용으로만 유지(goal loop 아밍 판정은 위 사실 질문 판정 앞에서 한다).
       const turnModel = modelOverride ?? getUserConfig().llm.model;
+      let resolvedRoute: { provider: string; model: string } | null = null;
       const turnFamily = getModelFamily(turnModel);
       if (armGoalLoop) {
         // 관측 — 어느 family/모델에서 across-turn goal-loop 가 아밍됐나(전-family 개방 검증).
@@ -421,8 +423,18 @@ export function bridgeCoreTurnToAcp(
             void turnCtx.pushToolCall(call);
           },
           onToolResult: (call) => { void turnCtx.pushToolResult(call); },
+          // 실제로 응답한 공급자·모델을 기억한다 — 폴백 체인이 넘기면(예 codex → grok) 턴 모델(turnModel)과 달라진다.
+          //   streamLLMWithTools 가 스트림을 (다시) 열 때마다 부른다 → 사용량 직전 값 = 그 사용량을 낸 쪽.
+          onResolvedProvider: (provider, model) => { resolvedRoute = { provider, model }; },
           // 턴 모델(라우팅 결과)을 실어 보낸다 — 대시보드 턴 지표가 설정 모델로 ctx·단가를 잡지 않게.
-          onUsage: (usage) => { void turnCtx.pushUsage({ ...usage, model: usage.model ?? turnModel }); },
+          //   ⭐ 폴백이면 «넘어간» 모델·공급자를 싣는다(TUI-MODEL-BADGE-ACTUAL · 완료 배지가 읽는다 · 상태줄·/model 은 후속 TUI-MODEL-BADGE-SOURCE).
+          onUsage: (usage) => {
+            void turnCtx.pushUsage({
+              ...usage,
+              model: usage.model ?? resolvedRoute?.model ?? turnModel,
+              ...(resolvedRoute ? { routeProvider: resolvedRoute.provider } : {}),
+            });
+          },
           // Codex Responses API reasoning summary stream. Currently
           // surfaced via forensic only (debug.log) — acts as the
           // "did the model actually emit reasoning?" verification

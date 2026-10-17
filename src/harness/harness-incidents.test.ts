@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { hostname, tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { Command } from 'commander';
-import { detectBursts, formatIncidentBurstWarning, incidentLastLines, readRunExits, recentBurst, recordRunExit, type RunExit } from './harness-incidents.js';
+import { detectBursts, detectCommonCauseBursts, formatIncidentBurstWarning, incidentLastLines, readRunExits, recentBurst, recordRunExit, type RunExit } from './harness-incidents.js';
 import { installHarnessCliCommand, recordClassifiedHarnessPodExit, warnRecentIncidentBurst } from './harness-cli-command.js';
 import * as podDispatch from './harness-pod-dispatch.js';
 import { debug } from '../debug/log.js';
@@ -124,6 +124,84 @@ test('host common cause keeps its three-exit threshold when seat threshold chang
     hostname: 'node-b', seat: `seat-${index}` }));
   expect(detectBursts(rows, { threshold: 2 }).filter((burst) => burst.hostname === 'node-b'))
     .toMatchObject([{ count: 3, hostname: 'node-b' }]);
+});
+
+test('detectCommonCauseBursts bundles same host+reason exits at 0/30/59 minutes across seats and entrances', () => {
+  const at = Date.parse('2026-10-15T00:00:00Z');
+  const rows: RunExit[] = [
+    { ...row('run-a', 'signal', at), hostname: 'node-b', seat: 'MK', entrance: 'cli-harness-ask' },
+    { ...row('run-b', 'signal', at + 30 * 60_000), hostname: 'node-b', seat: 'UX', entrance: 'cli-dev-ask' },
+    { ...row('run-c', 'signal', at + 59 * 60_000), hostname: 'node-b', seat: 'TC', entrance: 'cli-harness-say' },
+  ];
+  expect(detectCommonCauseBursts(rows)).toEqual([{
+    reason: 'signal', count: 3, firstAt: rows[0]!.at, lastAt: rows[2]!.at,
+    runIds: ['run-a', 'run-b', 'run-c'], hostname: 'node-b',
+  }]);
+});
+
+test('detectCommonCauseBursts needs three same-host same-reason exits', () => {
+  const at = Date.parse('2026-10-15T00:00:00Z');
+  expect(detectCommonCauseBursts([
+    { ...row('run-a', 'signal', at), hostname: 'node-b' },
+    { ...row('run-b', 'signal', at + 20 * 60_000), hostname: 'node-b' },
+  ])).toEqual([]);
+  expect(detectCommonCauseBursts([
+    { ...row('run-a', 'signal', at), hostname: 'node-b' },
+    { ...row('run-b', 'signal', at + 20 * 60_000), hostname: 'msb2' },
+    { ...row('run-c', 'signal', at + 40 * 60_000), hostname: 'msb3' },
+  ])).toEqual([]);
+  expect(detectCommonCauseBursts([
+    { ...row('run-a', 'signal', at), hostname: 'node-b' },
+    { ...row('run-b', 'unknown', at + 20 * 60_000), hostname: 'node-b' },
+    { ...row('run-c', 'pod-error', at + 40 * 60_000), hostname: 'node-b' },
+  ])).toEqual([]);
+});
+
+test('detectCommonCauseBursts merges inside 60 minutes and not one millisecond beyond', () => {
+  const at = Date.parse('2026-10-15T00:00:00Z');
+  expect(detectCommonCauseBursts([
+    { ...row('run-a', 'signal', at), hostname: 'node-b' },
+    { ...row('run-b', 'signal', at + 30 * 60_000), hostname: 'node-b' },
+    { ...row('run-c', 'signal', at + 60 * 60_000 + 1), hostname: 'node-b' },
+  ])).toEqual([]);
+  const onWindow: RunExit[] = [
+    { ...row('run-on-a', 'signal', at), hostname: 'node-b' },
+    { ...row('run-on-b', 'signal', at + 30 * 60_000), hostname: 'node-b' },
+    { ...row('run-on-c', 'signal', at + 60 * 60_000), hostname: 'node-b' },
+  ];
+  expect(detectCommonCauseBursts(onWindow)).toEqual([{
+    reason: 'signal', count: 3, firstAt: onWindow[0]!.at, lastAt: onWindow[2]!.at,
+    runIds: ['run-on-a', 'run-on-b', 'run-on-c'], hostname: 'node-b',
+  }]);
+});
+
+test('detectCommonCauseBursts never judges hostname-unobserved rows a common cause', () => {
+  const at = Date.parse('2026-10-15T00:00:00Z');
+  const hostless: RunExit[] = [
+    { ...row('run-a', 'signal', at), seat: 'MK', entrance: 'cli-harness-ask' },
+    { ...row('run-b', 'signal', at + 20 * 60_000), seat: 'UX', entrance: 'cli-dev-ask' },
+    { ...row('run-c', 'signal', at + 40 * 60_000), seat: 'TC', entrance: 'cli-harness-say' },
+  ];
+  expect(detectCommonCauseBursts(hostless)).toEqual([]);
+  expect(detectCommonCauseBursts([
+    ...hostless,
+    { ...row('run-d', 'signal', at + 50 * 60_000), hostname: 'node-b' },
+    { ...row('run-e', 'signal', at + 55 * 60_000), hostname: 'node-b' },
+  ])).toEqual([]);
+});
+
+test('detectCommonCauseBursts lets one runId contribute to one bundle only', () => {
+  const at = Date.parse('2026-10-15T00:00:00Z');
+  const rows: RunExit[] = [
+    { ...row('run-a', 'signal', at), hostname: 'node-b' },
+    { ...row('run-a', 'signal', at + 10 * 60_000), hostname: 'node-b' },
+    { ...row('run-b', 'signal', at + 20 * 60_000), hostname: 'node-b' },
+    { ...row('run-c', 'signal', at + 30 * 60_000), hostname: 'node-b' },
+  ];
+  expect(detectCommonCauseBursts(rows)).toEqual([{
+    reason: 'signal', count: 3, firstAt: rows[0]!.at, lastAt: rows[3]!.at,
+    runIds: ['run-a', 'run-b', 'run-c'], hostname: 'node-b',
+  }]);
 });
 
 test('KST ledger is idempotent per run even across files, and absent runId is not recorded', () => {

@@ -21,7 +21,7 @@
 // cross-cutting concern. Unit-testable in isolation.
 
 import chalk from 'chalk';
-import { ctp, stripAnsi, visibleWidth } from '../../tui.js';
+import { ctp, stripAnsi, truncate, visibleWidth } from '../../tui.js';
 import { debug } from '../../debug/log.js';
 import {
   modalMoveThreshold,
@@ -77,6 +77,7 @@ import {
   modeSegment,
   ptyShellCountSegment,
   runningAgentsSegment,
+  backgroundJobsSegment,
   runningBuildSegment,
   controllerSegment,
   shellRollupSegment,
@@ -88,6 +89,7 @@ import {
   type GitSegmentState,
   type RunningBuildState,
   type ShellRollupSummary,
+  type BackgroundJobsSummary,
   type StatusBarRenderOptions,
   type VwSummary,
 } from '../../status/bar.js';
@@ -169,6 +171,9 @@ export interface DashboardStatusInput {
   elapsedSec?: number;
   /** Running registered child agents. Omit or pass zero to hide. */
   runningAgents?: number;
+  /** TUI-BG-JOB-VISIBILITY (#71) — turn-outliving shell jobs. Rendered as
+   *  `⧗ 백그라운드 N` after the agents/controller pills. Omit or 0 to hide. */
+  backgroundJobs?: BackgroundJobsSummary | null;
   /** External controller identity. Omit to hide. */
   controller?: string;
   shellCount?: number;
@@ -742,6 +747,62 @@ function createPopupAuthority(deps: {
   };
 }
 
+/** 상태줄 세그먼트를 폭 `budget` 안에 순서대로 놓는다 — 넘치는 세그먼트는 건너뛰고(뒤의 작은 것은
+ *  들어가면 넣는다) `required` 세그먼트(첫 칸 ⊕ 호출자가 지정한 필수 표시)는 늘 둔다: 선택 세그먼트는
+ *  «뒤에 남은 필수 세그먼트 몫» 을 남겨 둘 수 있을 때만 들어간다. 필수만으로 넘치면 `width > budget`
+ *  으로 드러나고 호출자가 잘라 낸다. tf-bg-ghost(10-17): 폭을 넘긴 마지막 줄이 화면을 스크롤해 유령 줄을 남겼다. */
+export function fitStatusSegments(
+  widths: readonly number[],
+  sepWidth: number,
+  budget: number,
+  required: readonly boolean[] = [],
+): { placed: Array<{ index: number; startCol: number; width: number }>; dropped: number[]; width: number } {
+  const isRequired = (i: number): boolean => i === 0 || required[i] === true;
+  const w = (i: number): number => Math.max(0, widths[i] ?? 0);
+  // reserve[i] = i 뒤(제외)에 남은 필수 세그먼트가 차지할 폭(구분자 포함).
+  const reserve: number[] = new Array(widths.length + 1).fill(0);
+  for (let i = widths.length - 1; i >= 0; i--) {
+    reserve[i] = reserve[i + 1]! + (isRequired(i + 1) && i + 1 < widths.length ? sepWidth + w(i + 1) : 0);
+  }
+  const placed: Array<{ index: number; startCol: number; width: number }> = [];
+  const dropped: number[] = [];
+  let col = 0;
+  for (let i = 0; i < widths.length; i++) {
+    const start = placed.length > 0 ? col + sepWidth : 0;
+    if (!isRequired(i) && start + w(i) + reserve[i]! > budget) {
+      dropped.push(i);
+      continue;
+    }
+    placed.push({ index: i, startCol: start, width: w(i) });
+    col = start + w(i);
+  }
+  return { placed, dropped, width: col };
+}
+
+/** 세그먼트 «종류» — 렌더 문자열의 첫 낱말(🐚 · ctx · 🖥 · ⧗ …). 관측 키에 값이 섞이지 않게. */
+export function statusSegmentKind(render: string): string {
+  return stripAnsi(render).trim().split(/\s+/)[0] ?? '';
+}
+
+/** `line` 을 실폭(visibleWidth) `budget` 이하가 될 때까지 자른다 — 상한 없는 축소 · 0 이면 빈 문자열.
+ *  `truncate` 는 코드포인트 폭(isWide)으로 세서 이모지에서 어긋날 수 있어 실폭으로 다시 잰다. */
+export function truncateToVisibleWidth(line: string, budget: number): string {
+  if (budget <= 0) return '';
+  if (visibleWidth(line) <= budget) return line;
+  for (let max = budget; max > 0; max--) {
+    const cut = truncate(line, max);
+    if (visibleWidth(cut) <= budget) return cut;
+  }
+  return '';
+}
+
+/** 잘린 상태줄에 맞춰 pill 경계를 보이는 폭 안으로 줄인다(화면 밖 pill 은 뺀다). */
+export function clampPillsToWidth(pills: readonly PillBound[], shown: number): PillBound[] {
+  return pills
+    .filter((p) => p.startCol < shown)
+    .map((p) => ({ ...p, endCol: Math.min(p.endCol, shown) }));
+}
+
 export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): DashboardMouseWiring {
   const toastStack = new ToastStack({
     placement: 'top-right',
@@ -871,6 +932,7 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
     }
   }
 
+  let lastStatusOverflowKey = '';
   const buildStatusLine = (input: DashboardStatusInput): string => {
     // 2026-05-05 — narrow-width gate. modelSegment honours
     // `compact: true` to truncate model id at the first parameter-size
@@ -879,7 +941,7 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
     // terminal" boundary; everything above stays full-width.
     const { cols } = deps.termSize();
     const opts: StatusBarRenderOptions = { theme: input.theme, compact: cols < 100 };
-    const segments: Array<{ name: PillName | null; render: string }> = [
+    const segments: Array<{ name: PillName | null; render: string; required?: boolean }> = [
       { name: 'workingDir', render: sessionCwdSegment(input.swd, opts) },
       { name: null,         render: gitSegment(input.swd, labelGitState(input.gitState, input.runningBuild ? '트리' : undefined), opts) },
     ];
@@ -890,6 +952,11 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
     if (runningAgentsRender) segments.push({ name: null, render: runningAgentsRender });
     const controllerRender = controllerSegment(input.controller, opts);
     if (controllerRender) segments.push({ name: null, render: controllerRender });
+    // TUI-BG-JOB-VISIBILITY (#71) — turn-outliving work sits with the agents/controller
+    // «activity» cluster (controller stays immediately after agents).
+    const backgroundJobsRender = backgroundJobsSegment(input.backgroundJobs ?? null, opts);
+    // 폭이 모자라도 이 표시는 건너뛰지 않는다(필수) — 다른 세그먼트를 먼저 건너뛴다.
+    if (backgroundJobsRender) segments.push({ name: null, render: backgroundJobsRender, required: true });
     // A1 — mode pill between model and elapsed. `'general'` yields
     // empty render so the pill disappears by default; only sync /
     // control get painted. Name 'mode' is always set so click still
@@ -945,20 +1012,50 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
     // Compute column positions as segments concatenate with the same
     // separator string the renderer uses. `visibleWidth` counts cells
     // (wide-char aware), so the pill bounds stay correct.
+    //
+    // TUI-BG-JOB-VISIBILITY 라이브 결함(tf-bg-ghost · 10-17) — 상태줄은 «마지막 줄» 이라 폭을 넘으면
+    //   터미널 자동 줄바꿈이 화면 전체를 한 줄 위로 «스크롤» 한다. 차분 렌더러(`render`)는 그걸 모르고
+    //   안 바뀐 줄을 다시 안 써서, 스피너 줄이 ChatLog 아래 유령으로 남고 머리 줄이 사라졌다.
+    //   ⇒ 프레임 폭(cols-1 · composeVertical 의 totalW)을 넘는 세그먼트는 «건너뛴다»(순서 유지 ·
+    //   뒤의 작은 세그먼트는 들어갈 수 있으면 넣는다). 관측 = status.bar/overflow-fit(건너뛴 집합이 바뀔 때만).
     const nextPills: PillBound[] = [];
     const parts: string[] = [];
-    let col = 0;
-    const sepW = visibleWidth(stripAnsi(STATUS_SEGMENT_SEPARATOR));
-    for (let i = 0; i < segments.length; i++) {
-      const seg = segments[i]!;
-      if (i > 0) col += sepW;
-      const width = visibleWidth(stripAnsi(seg.render));
-      if (seg.name) nextPills.push({ name: seg.name, startCol: col, endCol: col + width });
-      col += width;
+    const budget = Math.max(0, cols - 1);
+    const fit = fitStatusSegments(
+      segments.map((seg) => visibleWidth(stripAnsi(seg.render))),
+      visibleWidth(stripAnsi(STATUS_SEGMENT_SEPARATOR)),
+      budget,
+      segments.map((seg) => seg.required === true),
+    );
+    for (const placed of fit.placed) {
+      const seg = segments[placed.index]!;
+      if (seg.name) nextPills.push({ name: seg.name, startCol: placed.startCol, endCol: placed.startCol + placed.width });
       parts.push(seg.render);
     }
+    // 키 = 건너뛴 세그먼트 «종류»(첫 낱말 · 🐚·ctx·🖥 …)의 중복 없는 정렬 집합 — 폭·리사이즈·값(ctx 15k→16k)·같은 종류 수는 키가 아니다.
+    const droppedKinds = [...new Set(fit.dropped.map((i) => statusSegmentKind(segments[i]!.render)))].sort();
+    const droppedKey = droppedKinds.join(' ');
+    if (droppedKey !== lastStatusOverflowKey) {
+      lastStatusOverflowKey = droppedKey;
+      try {
+        debug.log('status.bar', 'overflow-fit', {
+          cols,
+          budget,
+          dropped: droppedKinds,
+          width: fit.width,
+        });
+      } catch { /* 관측 실패가 상태줄을 막지 않는다 */ }
+    }
     pills = nextPills;
-    return parts.join(STATUS_SEGMENT_SEPARATOR);
+    const line = parts.join(STATUS_SEGMENT_SEPARATOR);
+    // 첫 칸 하나만으로도 넘치는 아주 좁은 화면 — 잘라서라도 한 줄 안에 둔다.
+    if (fit.width <= budget) return line;
+    //   `truncate` 는 코드포인트 폭(isWide)으로 세서 이모지에서 한두 칸 어긋날 수 있다 — 실폭(visibleWidth)으로 다시 잰다.
+    const cut = truncateToVisibleWidth(line, budget);
+    // pill 경계도 실제로 보이는 범위로 줄인다(잘린 뒤의 클릭·호버가 화면 밖을 가리키지 않게).
+    const shown = visibleWidth(cut);
+    pills = clampPillsToWidth(nextPills, shown);
+    return cut;
   };
 
   const setStatusRow = (row: number | null): void => {

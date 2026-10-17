@@ -21,8 +21,20 @@ export async function buildImportPlan(home = homedir()): Promise<ImportPlan> {
 }
 
 export function registerImportCommand(program: Command): void {
+  const publicContributionHelp = `
+Public contribution (EC1 · 10-28 update; moved from 0.2.8 in the 10-01 release split):
+  Show HN / community: share a working import example and feedback; posting and replies remain with the human author.
+  CB1 contribution entry: open an issue or pull request at https://github.com/ElanvitalAI/elanous
+  Marketplace plugins: propose a plugin in plugins/ via pull request; inclusion in the signed marketplace is reviewed, not automatic.
+  Remaining drafts (not published): Show HN · 긱뉴스 · 3-minute install-to-first-result video
+    docs/marketing/DRAFT-ec1-show-hn-geeknews-and-3min-video-2026-10-01.md
+  Measure adoption separately: GitHub stars · installs · npm downloads (downloads are not unique users).
+  Historical positioning (§4, 2026-10-01; not current counts): elanous ★0 · OpenClaw ~390k · Hermes ~250k · Codex ~127k.
+  10-03 baseline (not current results): stars 0 · npm 7-day downloads 790 (includes our own installs).
+`;
   program.command('import')
     .description('Show what elanous can bring over from Claude Code, Codex, ~/.agents, OpenClaw and Hermes — a plan first; `--apply` registers skills in place and adds MCP switched off, `--undo` puts everything back')
+    .addHelpText('after', publicContributionHelp)
     .option('--json', 'Print the plan (or the apply result) as JSON')
     .option('--apply', 'Apply the plan: skills in place (ref) or as link/copy · MCP switched off · secrets and hooks only listed')
     .option('--mode <mode>', `How skills come over: ${IMPORT_MODES.join('|')} (default ref — nothing copied)`)

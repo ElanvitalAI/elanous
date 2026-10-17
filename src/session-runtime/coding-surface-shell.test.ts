@@ -111,7 +111,9 @@ describe('coding surface — shell 실행 tool 노출', () => {
     expect(legacyNames).not.toHaveLength(0);
   });
 
-  it('coding 표면은 skills 목록과 명시 실행기를 함께 노출하고 다른 표면에는 추가하지 않는다', () => {
+  // TUI-DIET-D1-TAIL — the essential catalog is surface-independent, so the former
+  // «research 표면엔 skills 없음» half (legacy per-surface catalog) was removed.
+  it('coding 표면은 skills 목록과 명시 실행기를 함께 노출한다', () => {
     registerAllDefaultToolRuntimes();
     const runtimeTools = listToolRuntimes('tui');
     for (const surfaceId of ['coding/turn', 'coding/agent'] as const) {
@@ -124,14 +126,6 @@ describe('coding surface — shell 실행 tool 노출', () => {
       expect(names).toContain('elanous_skills_list');
       expect(names).toContain('skill_exec');
     }
-    const researchNames = buildSessionRuntimeToolSpecs({
-      userText: '설치된 스킬을 찾아 실행해줘',
-      hostTools: [],
-      runtimeTools,
-      preferredSurfaceId: 'research/turn',
-    }).map(spec => spec.name);
-    expect(researchNames).not.toContain('elanous_skills_list');
-    expect(researchNames).not.toContain('skill_exec');
   });
 
   it('기본 modelSurface가 없는 하니스 요청은 coding/agent를 고르되 RunDevHarness를 노출하지 않는다', () => {
@@ -141,26 +135,13 @@ describe('coding surface — shell 실행 tool 노출', () => {
 
       expect(resolveSessionSurfaceProfile({ userText: harnessText }).id).toBe('coding/agent');
       expect(names).not.toContain('RunDevHarness');
-      expect(names).toContain('Edit');
+      // TUI-DIET-D1-TAIL — the essential catalog drops Edit/Write on a harness phrase (legacy kept Edit).
+      expect(names).not.toContain('Edit');
     });
   });
 
-  it('명시적으로 켠 modelSurface 하니스 요청은 RunDevHarness를 노출한다', () => {
-    withModelSurfaceConfig({ tools: { runDevHarness: { modelSurface: true } } }, () => {
-      for (const userText of [
-        '하니스로 개발 이 기능을 고쳐줘',
-        '개발 하니스로 이 기능을 고쳐줘',
-        '하니스로 구현 이 기능을 고쳐줘',
-        '하니스로 골 제출 이 기능을 고쳐줘',
-        'implement with the harness this feature',
-        'submit a goal with the harness for this feature',
-      ]) {
-        const names = buildSessionRuntimeToolSpecs({ userText, hostTools: [], runtimeTools: [] }).map(spec => spec.name);
-        expect(resolveSessionSurfaceProfile({ userText }).id).toBe('coding/agent');
-        expect(names).toContain('RunDevHarness');
-      }
-    });
-  });
+  // TUI-DIET-D1-TAIL — «modelSurface:true 면 RunDevHarness 노출» 은 레거시 카탈로그 갈래만 지켰다.
+  // essential 카탈로그는 RunDevHarness 를 싣지 않는다(native-tool-catalog defaultEnabled:false · #8515).
 
   it('기존 ops·research 의도는 하니스 어휘가 함께 있어도 기존 surface 우선순위를 유지한다', () => {
     expect(resolveSessionSurfaceProfile({ userText: 'acp session 하니스로 개발해줘' }).id).toBe('ops-fleet/agent');

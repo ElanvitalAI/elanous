@@ -603,6 +603,11 @@ edges:
       head-branch: pr-head-checkout
       not-ancestor: main-sync
       review-missing: review
+      gate-host-busy: next-move
+      gate-merge-conflict: main-sync
+      gate-touch-clean: next-move
+      pr-base-unreadable: next-move
+      public-export-leak: next-move
       other: next-move
 
   - from: merge

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { computeVerdict, okCell, renderOverview, unmeasured, unmeasuredCells, verdictExitCode, type OverviewSnapshot } from './overview.js';
+import { bindingPhrase, bindingResource, computeVerdict, okCell, renderOverview, unmeasured, unmeasuredCells, verdictExitCode, type OverviewSnapshot } from './overview.js';
 import { collectOverview, launchableCells, ownerRows, parseEtime, parseSince, summarizeParents } from './overview-collect.js';
 import { lineTime, parseDispatcherCapacity, readDispatcherBeats, readDispatcherCapacity, readSeatEraHanded } from './overview-seat-era.js';
 import { createOverviewCache } from './overview-cache.js';
@@ -100,8 +100,84 @@ describe('computeVerdict — 판정 순서(RFC §A1)', () => {
     s.machines.hosts = [{ name: 'mbp', load: okCell({ load1: 120, load5: 100, load15: 90, cpuCount: 18, freeGb: 5, totalGb: 128, ageSeconds: 5 }, 't', AT) }];
     const v = computeVerdict(s);
     expect(v.verdict).toBe('degraded');
-    expect(v.reasons.length).toBe(2);
+    expect(v.reasons).toContain('6시간 넘은 하니스 부모 3(최고 19h)');
+    expect(v.reasons).toContain('mbp 부하 100/18코어(5분)');
+    expect(v.reasons).toContain('구속 자원 mbp CPU — 남은 비율 최소 0% (0/54코어(압박선 3/코어))');
     expect(verdictExitCode(v.verdict)).toBe(0);
+  });
+});
+
+describe('자원 지도 구속 조건 — 남은 비율 최소 축(RES-FLOOR-BINDING)', () => {
+  const host = (name: string, load5: number, cpuCount: number, freeGb: number, totalGb: number) => ({
+    name, load: okCell({ load1: load5, load5, load15: load5, cpuCount, freeGb, totalGb, ageSeconds: 5 }, 't', AT),
+  });
+  test('10-08 표본 형태 — node-b 메모리가 남은 비율 최소라 구속 자원으로 뽑는다', () => {
+    const s = base();
+    s.machines.hosts = [host('mbp', 25, 18, 90, 128), host('node-b', 8, 8, 5, 64)];
+    const b = bindingResource(s);
+    expect(b?.kind).toBe('memory');
+    expect(b?.label).toBe('node-b 메모리');
+    expect(b?.remainingRatio).toBeCloseTo(5 / 64, 5);
+    expect(bindingPhrase(b)).toBe('구속 자원 node-b 메모리 — 남은 비율 최소 8% (5/64GB)');
+    const text = renderOverview(s, computeVerdict(s), { elapsedMs: 12 });
+    expect(text).toContain('✅ 흐름 정상 (flowing)\n   ↳ 구속 자원 node-b 메모리 — 남은 비율 최소 8% (5/64GB)');
+  });
+  test('CPU 남은 비율은 압박선 기준 — 압박선에 닿으면 0%', () => {
+    const s = base();
+    s.machines.hosts = [host('mbp', 54, 18, 90, 128)];
+    const b = bindingResource(s);
+    expect(b?.kind).toBe('cpu');
+    expect(b?.remainingRatio).toBe(0);
+    expect(bindingPhrase(b)).toBe('구속 자원 mbp CPU — 남은 비율 최소 0% (0/54코어(압박선 3/코어))');
+  });
+  test('소수 CPU 부하 — 양수 잔량 0.4코어를 0으로 표시하지 않는다', () => {
+    const s = base();
+    s.machines.hosts = [host('mbp', 53.6, 18, 90, 128)];
+    const b = bindingResource(s);
+    expect(b?.kind).toBe('cpu');
+    expect(b?.remainingRatio).toBeCloseTo(0.4 / 54, 5);
+    expect(bindingPhrase(b)).toBe('구속 자원 mbp CPU — 남은 비율 최소 1% (0.4/54코어(압박선 3/코어))');
+    expect(renderOverview(s, computeVerdict(s), { elapsedMs: 12 })).toContain('구속 자원 mbp CPU — 남은 비율 최소 1% (0.4/54코어(압박선 3/코어))');
+  });
+  test('소수 메모리 잔량 — 양수 0.4GB를 0으로 표시하지 않는다', () => {
+    const s = base();
+    s.machines.hosts = [host('node-b', 8, 8, 0.4, 64)];
+    const b = bindingResource(s);
+    expect(b?.kind).toBe('memory');
+    expect(b?.remainingRatio).toBeCloseTo(0.4 / 64, 5);
+    expect(bindingPhrase(b)).toBe('구속 자원 node-b 메모리 — 남은 비율 최소 1% (0.4/64GB)');
+    expect(renderOverview(s, computeVerdict(s), { elapsedMs: 12 })).toContain('구속 자원 node-b 메모리 — 남은 비율 최소 1% (0.4/64GB)');
+  });
+  test('CPU 압박선 초과 — 남은 비율과 표기 잔량 모두 0', () => {
+    const s = base();
+    s.machines.hosts = [host('mbp', 100, 18, 90, 128)];
+    const b = bindingResource(s);
+    expect(b?.kind).toBe('cpu');
+    expect(b?.remainingRatio).toBe(0);
+    expect(bindingPhrase(b)).toBe('구속 자원 mbp CPU — 남은 비율 최소 0% (0/54코어(압박선 3/코어))');
+    expect(computeVerdict(s).verdict).toBe('degraded');
+    expect(renderOverview(s, computeVerdict(s), { elapsedMs: 12 })).toContain('구속 자원 mbp CPU — 남은 비율 최소 0% (0/54코어(압박선 3/코어))');
+  });
+  test('못 잰 축은 후보에서 뺀다 — 호스트 없으면 슬롯, 용량까지 못 잼이면 null', () => {
+    expect(bindingResource(base())?.kind).toBe('slots');
+    const s = base();
+    s.tasks.capacity = unmeasured('feeder', '디스패처 로그 없음');
+    expect(bindingResource(s)).toBeNull();
+    expect(bindingPhrase(bindingResource(s))).toBeNull();
+  });
+  test('동율은 정해진 축 순서의 첫 축이 이긴다', () => {
+    const s = base();
+    s.machines.hosts = [host('a', 0, 8, 32, 64), host('b', 0, 8, 32, 64)];
+    expect(bindingResource(s)?.label).toBe('a 메모리');
+  });
+  test('포화 띠에 구속 문구가 둘째 사유로 붙는다 — 첫 문면은 그대로', () => {
+    const s = base();
+    s.tasks.capacity = okCell({ podUsed: 46, podTarget: 46, localUsed: 1, localMax: 0, free: 0 }, 't', AT);
+    s.machines.hosts = [host('node-b', 8, 8, 5, 64)];
+    const v = computeVerdict(s);
+    expect(v.verdict).toBe('saturated');
+    expect(v.reasons[0]).toBe('발사 가능 칸 2 · 빈 자리 0 (Pod 46/46 · 로컬 1/0)');
+    expect(v.reasons[1]).toBe('구속 자원 슬롯 — 남은 비율 최소 0% (0/46자리)');
   });
 });
 

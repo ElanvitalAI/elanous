@@ -77,7 +77,6 @@ body-dynamic-import	src/nexus/index.test.ts	1
 body-dynamic-import	src/pty-shell/pty-control-stance.test.ts	12
 body-dynamic-import	src/pty-shell/tui-run-state.test.ts	1
 body-dynamic-import	src/registry/catalog-discovery-fold.test.ts	1
-body-dynamic-import	src/self-dev/ask-launch-flow.test.ts	2
 body-dynamic-import	src/self-dev/dev-cli.test.ts	1
 body-dynamic-import	src/self-dev/dev-pipeline.test.ts	1
 body-dynamic-import	src/self-dev/entrance-registry.test.ts	3
@@ -222,7 +221,6 @@ chdir-without-restore	src/task-orchestrator/surfaces/dev-harness.test.ts	1
 chdir-without-restore	src/task-orchestrator/surfaces/pod-no-result.test.ts	2
 chdir-without-restore	src/task-orchestrator/surfaces/pod-ta-land-owner.test.ts	1
 chdir-without-restore	src/task-orchestrator/surfaces/self-implement-pod-oom-retry.test.ts	1
-chdir-without-restore	src/task-orchestrator/surfaces/self-implement-pod.test.ts	19
 chdir-without-restore	src/task-orchestrator/surfaces/self-implement.test.ts	1
 chdir-without-restore	test/llm-codex-dedup-guard.test.ts	1
 chdir-without-restore	test/oauth/codex-account-mirror.test.ts	1

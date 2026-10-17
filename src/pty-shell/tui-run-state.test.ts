@@ -10,7 +10,7 @@ process.env.ELANOUS_STATE_DIR = stateDir;
 
 const { upsertPtyManifest, getPtyManifest, setPtyManifestDbPathForTesting, updatePtyManifestBuild, updatePtyManifestTurn, markPtyManifestClosed } = await import('./pty-manifest.js');
 const {
-  describePtyRunState, judgeBuildStaleness, readCurrentInstallRecord, reportTuiTurn, resetTuiRunStateForTesting,
+  describePtyRunState, describeTurnCell, formatTurnCell, judgeBuildStaleness, ptyTurnViewOfRow, readCurrentInstallRecord, reportTuiTurn, resetTuiRunStateForTesting,
   resolveRunningBuild, startTuiRunStateRecorder,
 } = await import('./tui-run-state.js');
 
@@ -163,5 +163,34 @@ describe('self-report wiring', () => {
     });
     stop();
     expect(order).toEqual(['row:tui:wire', 'run-state:tui:wire', 'run-state-stop', 'closed']);
+  });
+});
+
+describe('turn cell (H10 · pty list 턴 칸)', () => {
+  test('busy → 이 턴 경과 초 · idle → 한가한 지 초 · 시각 없음/턴 모름은 «모른다»', () => {
+    expect(describeTurnCell({ turn: 'busy', turnAt: 10_000 }, 52_900)).toEqual({ state: 'busy', at: 10_000, sinceSec: 42 });
+    expect(formatTurnCell(describeTurnCell({ turn: 'busy', turnAt: 10_000 }, 52_900))).toBe('busy,42s');
+    expect(formatTurnCell(describeTurnCell({ turn: 'idle', turnAt: 10_000 }, 11_000))).toBe('idle,1s');
+    expect(describeTurnCell({ turn: 'busy' }, 1)).toEqual({ state: 'busy', at: null, sinceSec: null });
+    expect(formatTurnCell(describeTurnCell({ turn: 'busy' }, 1))).toBe('busy,?s');
+    expect(formatTurnCell(describeTurnCell({ turn: 'unknown', turnAt: 5 }, 9))).toBe('?');
+    // 시계 역행은 음수 대신 0 — 「경과」가 음수일 수는 없다.
+    expect(describeTurnCell({ turn: 'idle', turnAt: 9_000 }, 1_000).sinceSec).toBe(0);
+  });
+
+  test('행의 턴만 읽는다 — 죽은 행·기록 없음은 unknown · describePtyRunState 와 같은 값', () => {
+    expect(ptyTurnViewOfRow({ alive: true, turnState: 'busy', turnAt: 5 })).toEqual({ turn: 'busy', turnAt: 5 });
+    expect(ptyTurnViewOfRow({ alive: false, turnState: 'busy', turnAt: 5 })).toEqual({ turn: 'unknown' });
+    expect(ptyTurnViewOfRow({ alive: true })).toEqual({ turn: 'unknown' });
+    expect(ptyTurnViewOfRow(null)).toEqual({ turn: 'unknown' });
+  });
+
+  test('기록된 턴 시각으로 잰다 — busy 로 바뀐 순간이 경과의 0초다', () => {
+    upsertPtyManifest({ id: 'tui:cell', kind: 'tui', cmd: 'elanous', startedAt: 1, now: 1 });
+    expect(updatePtyManifestTurn('tui:cell', 'busy', 70_000)).toBe(true);
+    const view = describePtyRunState(getPtyManifest('tui:cell'), { readInstalled: () => ({}) });
+    expect(describeTurnCell(view, 100_000)).toEqual({ state: 'busy', at: 70_000, sinceSec: 30 });
+    expect(updatePtyManifestTurn('tui:cell', 'idle', 100_000)).toBe(true);
+    expect(formatTurnCell(describeTurnCell(ptyTurnViewOfRow(getPtyManifest('tui:cell')), 100_500))).toBe('idle,0s');
   });
 });
