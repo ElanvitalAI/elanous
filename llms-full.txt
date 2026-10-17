@@ -4425,6 +4425,35 @@ elanous ops [options] [command]
 | `mission [options] <id>` | One mission in detail — content + per-phase diagnosis (failClass · recommended heal) + related tasks/schedules/autonomous actions + transitions |
 | `mission-log [options] <id>` | Tail a mission's run log (run.log) — the evidence behind the diagnosis (survives reboot) |
 | `build [options] [buildId]` | Observe/control isolated builds — list when no id, snapshot with a buildId. --follow streams like tail -f, --stop stops a running build |
+| `overview [options]` | One-page flow health — the verdict first, then the reason chain behind it (--since <window> · --watch [seconds] · --json) |
+
+### One-page flow view — `elanous ops overview`
+
+`elanous ops overview` answers one question on a single page: is the pipeline
+(authoring → implementation → landing) flowing — and if not, why. The verdict
+comes first, then the reason chain behind it. Unmeasured cells print `null`
+(never 0). Exit codes make it scriptable: `0` = flowing/degraded, `3` = any
+other verdict, `1` = collection failure.
+
+| Verdict (label) | Meaning |
+|---|---|
+| 관측 안 됨 | A core cell (release run · checklist · launchable · capacity) could not be measured |
+| 막힘 | The release run waits on a decision, or a freeze window is active |
+| 루프 멈춤 | A loop with a known cadence stopped beating |
+| 자원 포화 | There is launchable work but zero free seats |
+| 공급 부족 | Seats are free but nothing is launchable |
+| 흐름 저하 | Stale harness parents or machine pressure slow the flow |
+| 흐름 정상 | No hits — work is moving |
+
+Verdicts are checked in this order and the first hit wins.
+`--since <window>` narrows the landing window (`1h` default);
+`--watch [seconds]` re-runs it on a timer.
+
+**Telegram one-line briefs.** The steward watches the same verdict and sends a
+single line to the Telegram **ops** channel (kind `ops-report` — the same
+channel as the daily digest) only when the verdict *changes*, and only after
+the same verdict has been observed **twice in a row** — so a verdict flapping
+across a boundary stays quiet.
 
 ## `elanous plugin`
 
@@ -5138,6 +5167,32 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 - The web app's Terminal shows each driven terminal side by side with a strip of what elanous just did and why; you can take over with the keyboard or mouse.
 
 - On a credit policy, the hourly limit alert adds up the credits across your Codex accounts and their combined burn rate, and says when they will run out.
+
+---
+
+# 0.2.32
+
+Source: https://docs.elanous.ai/releases/0-2-32/
+
+## Behavior changes
+
+- The TUI can wake for a completed child while idle, show background job counts, and schedule its own next turn. PRs: #28892, #28743, #28742.
+- Reusable warm Pods are available as an opt-in transport, with request cleanup between uses. PRs: #28292, #28727.
+- External `/stop` and `/esc` requests reach the active turn's escape gate immediately. PR #28769.
+- Task Agent repair launches accept an explicit dispatch tier and select models using subscription availability. PR #27786.
+- The TUI shows when a fallback model answered and keeps the session boot card current after history reset. PRs: #28734, #28746.
+- PWA live run graphs show the current execution graph. PR #28879.
+- TUI click-to-fold controls can be toggled back open in place. PR #28825.
+- The TUI detects a doom loop and changes approach without asking, and avoids false “NO FINAL SYNTHESIS” after a goal loop has ended. PRs: #28795, #28772.
+- Resizing the terminal preserves the open slash picker border; folding panes preserves their position. PRs: #28766, #28825.
+- Long `RunShell` sleeps explain how to schedule a wakeup, and CLI legacy loop warnings no longer pollute standard error. PRs: #28763, #28432.
+- Background input wakeups, PTY state reporting, and session tool traces now reflect the active turn more reliably. PRs: #28750, #28740, #28741, #28876, #28882.
+- Task Agent closes stale drafts after a code PR opens and retries completed no-change children once. PRs: #28829, #28824, #28813.
+- The PR tool warns on overlapping changed lines while allowing a new PR to open. PR #28881.
+- Webclone reads ruler versions portably on Linux. PR #27855.
+- Internal marker text is escaped from the public test export. PR #28754.
+
+Plus 103 internal changes.
 
 ---
 
