@@ -53,6 +53,8 @@ mock.module(${JSON.stringify(join(repo, 'src/domains/outbound-alert.ts'))}, () =
     expect(installed.nodes[1]?.node_id === 'rejudge' && recipes['steward-rejudge']?.command).toContain('src/steward/rejudge-tick.ts');
     const resyncPreload = join(root, 'resync-preload.ts');
     writeFileSync(resyncPreload, `import { mock } from 'bun:test';
+const instance = await import(${JSON.stringify(join(repo, 'src/instance/resolve.ts'))});
+mock.module(${JSON.stringify(join(repo, 'src/instance/resolve.ts'))}, () => ({ ...instance, releaseLedgerRoot: () => ${JSON.stringify(join(root, '.elanous-test'))} }));
 const hqSeats = await import(${JSON.stringify(join(repo, 'src/hq/seats.ts'))});
 mock.module(${JSON.stringify(join(repo, 'src/hq/seats.ts'))}, () => ({ ...hqSeats, resolveHqLaunchSeat: () => ${JSON.stringify(repo)} }));
 mock.module(${JSON.stringify(join(repo, 'src/release-loop/release-schedule.ts'))}, () => ({ listSchedules: () => [{ cutAt: new Date(Date.now() + 3_600_000).toISOString(), publishAt: new Date(Date.now() + 7_200_000).toISOString() }] }));
@@ -76,10 +78,14 @@ mock.module(${JSON.stringify(join(repo, 'src/instance/spawn-elanous.ts'))}, () =
       `steward-${name}`, { ...recipes[`steward-${name}`], command: `bun --preload ${JSON.stringify(preload)} ${recipes[`steward-${name}`]!.command.slice(4)}` },
     ])) }));
     const isolated = join(root, '.elanous-test');
-    mkdirSync(join(root, 'xdg', 'elanous'), { recursive: true });
-    writeFileSync(join(root, 'xdg', 'elanous', 'config.json'), JSON.stringify({ taskAgent: { rejudgeEveryMinutes: 30, rejudgeMaxLoad: 1000 } }));
+    mkdirSync(isolated, { recursive: true });
+    // --test stamps this state root into graph node processes; their config follows it.
+    writeFileSync(join(isolated, 'config.json'), JSON.stringify({ taskAgent: { rejudgeEveryMinutes: 30, rejudgeMaxLoad: 1000 } }));
     const stateDir = join(isolated, 'steward');
     mkdirSync(stateDir, { recursive: true });
+    // This test exercises graph-node decisions, not schedule inventory; a fresh marker keeps
+    // the sync node from scanning the full host repo under shared CI load.
+    writeFileSync(join(stateDir, 'schedule-check.json'), JSON.stringify({ at: new Date().toISOString() }));
     writeFileSync(join(stateDir, 'rejudge-tick.json'), JSON.stringify({ startedAt: new Date().toISOString() }));
     writeFileSync(join(stateDir, 'triage.json'), JSON.stringify([{ issue: issues[0]!.identifier, rung: 4, dependsOn: [], priority: 1,
       why: 'cached', inputHash: triageInputHash(issues[0]!, issues) }]));

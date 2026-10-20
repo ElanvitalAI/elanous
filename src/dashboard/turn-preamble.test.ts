@@ -2,16 +2,51 @@
 // 텔레그램(makeElanousAgentRunTurn)과 단일 출처(agent/self-ambient.ts)의 규율이 TUI 채팅
 // systemPrompt 에도 실리는지 — 3박자(툴·기억·규율) 중 '규율' 축의 표면 패리티.
 import { test, expect, describe, spyOn } from 'bun:test';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildControllerSystemMessage, buildDashboardTurnPreamble } from './turn-preamble.js';
+import { startSeatBootConversation } from './seat-boot-preamble.js';
+import { LAST_SESSION_FILE } from './seat-local-instructions.js';
 import { globalTaskNotificationQueue } from '../agent/task-notification.js';
 import { getUserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
+import { MsgStore } from '../msg/msg-store.js';
 import { createSessionPostureState, resolveSessionTurnProfile } from '../session-runtime/index.js';
 
 const fakeConfig = { chat: { conciseness: 'balanced' } } as unknown as ReturnType<typeof getUserConfig>;
+
+describe('buildDashboardTurnPreamble — L1 자리 부트 카드(TUI-SESSION-BOOT)', () => {
+  test('사람 안내 0: 새 대화 첫 턴이 자리·안 읽은 우편 수를 말한다 — /session new 도 첫 턴에 새 카드를 얻는다', () => {
+    const home = mkdtempSync(join(tmpdir(), 'preamble-seatboot-'));
+    const cwd = join(home, 'elanous-hq', 'seats', 'OP');
+    mkdirSync(cwd, { recursive: true });
+    mkdirSync(join(home, 'elanous-hq', 'seat-state', 'OP'), { recursive: true });
+    writeFileSync(join(cwd, 'AGENTS.local.md'), '역할 = 판정 제안 담당\n');
+    writeFileSync(join(cwd, LAST_SESSION_FILE), '## 지난 세션 (TUI 가 대화 끝마다 갈아 쓴다 · 사람이 고치지 않는 파일)\n- 마지막 요청: 세션 정리해줘\n- 열린 일: 대시보드 첫 화면 검토\n');
+    const msgPath = join(home, 'state', 'msg', 'messages.db');
+    const store = new MsgStore(msgPath);
+    try {
+      store.post({ from: 'TC', to: 'OP', body: 'zero-guidance-mail' });
+      const firstTurn = buildDashboardTurnPreamble({ userText: '', cwd, userConfig: fakeConfig, seatBoot: { home, msgPath, env: {} } });
+      const firstText = firstTurn.map((message) => String(message.content)).join('\n');
+      expect(firstText).toContain('# OP 자리 부팅 카드');
+      expect(firstText).toContain('안 읽은 msg 1 (OP)');
+      expect(firstText).toContain("첫 답에서 자리 이름·'자리 역할' 절의 역할·안 읽은 우편 수");
+      expect(firstText).toContain('역할: 판정 제안 담당');
+      expect(firstText).toContain('## 지난 세션');
+      expect(firstText).toContain('열린 일: 대시보드 첫 화면 검토');
+      startSeatBootConversation({ reason: 'session-new' });
+      store.post({ from: 'TC', to: 'OP', body: 'second-mail' });
+      store.post({ from: 'MK', to: 'ALL', body: 'broadcast-mail' });
+      const newSessionFirstTurn = buildDashboardTurnPreamble({ userText: '', cwd, userConfig: fakeConfig, seatBoot: { home, msgPath, env: {} } });
+      const newText = newSessionFirstTurn.map((message) => String(message.content)).join('\n');
+      expect(newText).toContain('# OP 자리 부팅 카드');
+      expect(newText).toContain('안 읽은 msg 3 (OP)');
+      expect(newText).toContain('역할: 판정 제안 담당');
+    } finally { store.close(); rmSync(home, { recursive: true, force: true }); }
+  });
+});
 
 describe('buildDashboardTurnPreamble — 제어 표면', () => {
   const build = (controlEnv?: { controller?: string; channels?: string }) => buildDashboardTurnPreamble({
@@ -261,7 +296,7 @@ describe('buildDashboardTurnPreamble — 빌더별 ms 관측', () => {
 
     expect(Object.keys(data!.builderMs as Record<string, number>).sort()).toEqual([
       'approval', 'ask', 'conciseness', 'gitSnapshot', 'implDiscipline', 'planMode',
-      'sandbox', 'selfOps', 'taskNotifications', 'universal',
+      'sandbox', 'selfHealth', 'selfOps', 'taskNotifications', 'universal',
     ]);
   });
 
@@ -275,5 +310,103 @@ describe('buildDashboardTurnPreamble — 빌더별 ms 관측', () => {
       buildDashboardTurnPreamble({ userText: 'x', cwd: mkdtempSync(join(tmpdir(), 'preamble-ms-')), userConfig: fakeConfig });
     } finally { spy.mockRestore(); }
     expect(events).toEqual([]);
+  });
+});
+
+// TUI-SELF-HEALTH-LINE(0.2.34) — 매 턴 자기 건강 한 줄 배선. 오류 주입 → 다음 턴 프리앰블 문면이
+//   그 오류를 말하는지 · 낡은 판 상황 → 재기동 필요 문면(stale-install-check 재료 재사용)이 나오는지를
+//   프리앰블 산출로 본다. 판정 seam 없이는 시험 격리가 안 되므로 ctx.selfHealth 로 판정 재료를 주입한다.
+describe('buildDashboardTurnPreamble — 매 턴 자기 건강 한 줄(TUI-SELF-HEALTH-LINE)', () => {
+  const SHA_A = 'a'.repeat(40);
+  const SHA_B = 'b'.repeat(40);
+  const installedBuild = () => ({ version: '0.2.34', sha: SHA_A, source: 'installed' as const, codeRoot: '/r' });
+  const textOf = (msgs: ReturnType<typeof buildDashboardTurnPreamble>) => msgs.map((m) => String(m.content)).join('\n');
+
+  test('오류 주입 뒤 다음 턴 프리앰블 문면이 그 오류를 말한다 — 집계가 없으면 오류 축은 말하지 않는다', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'preamble-health-'));
+    const withErrors = buildDashboardTurnPreamble({
+      userText: 'continue', cwd, userConfig: fakeConfig,
+      selfHealth: {
+        errors: { count: 2, sample: 'llm.response 502 (grok)' },
+        build: installedBuild, readInstalled: () => ({ sha: SHA_A }),
+      },
+    });
+    const text = textOf(withErrors);
+    expect(text).toContain('[자기 건강]');
+    expect(text).toContain('직전 30분 자기 오류 2건');
+    expect(text).toContain('대표: llm.response 502 (grok)');
+    expect(withErrors.filter((m) => m.role === 'system' && String(m.content).includes('[자기 건강]'))).toHaveLength(1);
+
+    const zeroErrors = buildDashboardTurnPreamble({
+      userText: 'continue', cwd, userConfig: fakeConfig,
+      selfHealth: { errors: { count: 0 }, build: installedBuild, readInstalled: () => ({ sha: SHA_A }) },
+    });
+    expect(textOf(zeroErrors)).toContain('직전 30분 자기 오류 0건');
+
+    // 오류 집계 계약(«어떤 이벤트를 오류로 세는지»)은 미결 — 집계가 없으면 그 축을 지어내지 않는다.
+    const withoutAggregate = buildDashboardTurnPreamble({
+      userText: 'continue', cwd, userConfig: fakeConfig,
+      selfHealth: { build: installedBuild, readInstalled: () => ({ sha: SHA_A }) },
+    });
+    expect(textOf(withoutAggregate)).not.toContain('자기 오류');
+  });
+
+  test('낡은 판이면 재기동 필요 문면이 나온다 — stale-install-check 안내·명령 문면을 그대로 쓴다', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'preamble-health-'));
+    const stale = buildDashboardTurnPreamble({
+      userText: 'continue', cwd, userConfig: fakeConfig, sessionId: 'sess-relaunch',
+      selfHealth: { build: installedBuild, readInstalled: () => ({ sha: SHA_B, installedAt: 200 }) },
+    });
+    const staleText = textOf(stale);
+    expect(staleText).toContain('낡은 판 — 재기동 필요');
+    expect(staleText).toContain('새 판이 깔렸습니다');
+    expect(staleText).toContain(`부팅 판 ${SHA_A.slice(0, 7)} → 지금 ${SHA_B.slice(0, 7)}`);
+    expect(staleText).toContain('TUI 를 다시 띄우면 새 판으로 돕니다');
+    expect(staleText).toContain('다시 띄우기: elanous --resume "sess-relaunch"');
+
+    const fresh = buildDashboardTurnPreamble({
+      userText: 'continue', cwd, userConfig: fakeConfig,
+      selfHealth: { build: installedBuild, readInstalled: () => ({ sha: SHA_A }) },
+    });
+    expect(textOf(fresh)).toContain('판 최신(same-as-installed)');
+    expect(textOf(fresh)).not.toContain('재기동 필요');
+  });
+
+  test('판정 재료가 깨져도 프리앰블은 산다(fail-soft) · 크레딧 축은 주어진 것만 실린다', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'preamble-health-'));
+    const broken = buildDashboardTurnPreamble({
+      userText: 'continue', cwd, userConfig: fakeConfig,
+      selfHealth: { build: () => { throw new Error('boom'); } },
+    });
+    expect(broken.some((m) => String(m.content).includes('[자기 건강]'))).toBe(false);
+    expect(broken.length).toBeGreaterThan(0);
+
+    const credited = buildDashboardTurnPreamble({
+      userText: 'continue', cwd, userConfig: fakeConfig,
+      selfHealth: { creditUsage: '1.2M tokens', build: installedBuild, readInstalled: () => ({ sha: SHA_A }) },
+    });
+    expect(textOf(credited)).toContain('크레딧 사용 1.2M tokens');
+  });
+
+  test('자기 건강 칸 관측 — 매 턴 timed() 에 selfHealth ms·count 가 실린다', () => {
+    const events: Record<string, unknown>[] = [];
+    const wasEnabled = debug.enabled;
+    if (!wasEnabled) debug.setDiagEnabled(true);
+    const spy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: Record<string, unknown>) => {
+      if (category === 'chat.turn-preamble' && event === 'built') events.push(data);
+    }) as typeof debug.log);
+    try {
+      buildDashboardTurnPreamble({
+        userText: 'continue', cwd: mkdtempSync(join(tmpdir(), 'preamble-health-')), userConfig: fakeConfig,
+        selfHealth: { errors: { count: 1 }, build: installedBuild, readInstalled: () => ({ sha: SHA_A }) },
+      });
+    } finally {
+      spy.mockRestore();
+      if (!wasEnabled) debug.setDiagEnabled(false);
+    }
+    const [data] = events;
+    expect(data).toBeDefined();
+    expect((data!.builderMs as Record<string, number>).selfHealth).toBeGreaterThanOrEqual(0);
+    expect((data!.builderCounts as Record<string, number>).selfHealth).toBe(1);
   });
 });

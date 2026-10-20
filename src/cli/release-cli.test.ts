@@ -1,10 +1,10 @@
-import { describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { checklistHistory, listChecklist, devVersion, refRoots } from '../release-loop/checklist.js';
+import { checklistHistory, listChecklist, devVersion, refRoots, type Checklist, type ChecklistItem } from '../release-loop/checklist.js';
 import { CliUserError } from './cli-user-error.js';
 import { getSchedule, setSchedule } from '../release-loop/release-schedule.js';
 import type { RehearsalDeps } from '../release-loop/rehearsal.js';
@@ -12,11 +12,17 @@ import type { LightRcResult } from '../release-loop/light-rc.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { runGraph } from '../graph-runner/runner.js';
+import { psProcessStartMs } from '../harness/harness-stop.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 import { enableLandingFreeze } from '../release-loop/landing-freeze.js';
 import { fileLeaseStore, serializeLease } from '../hq/lease.js';
 import type { HqDeps } from '../hq/hq.js';
 import { isPrerelease, isReleaseVersion, planPublish, publishRelease, registerReleaseCommands, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
+import { readActiveForceReleaseRun } from './release-single-flight.js';
+
+const originalCwd = process.cwd();
+afterEach(() => { if (process.cwd() !== originalCwd) process.chdir(originalCwd); });
 
 test('rehearsal CLI refuses malformed shards and remote before making any stamp', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-rehearsal-cli-'));
@@ -69,7 +75,9 @@ test('rehearsal CLI no-option tick forwards planned shards and records a measure
     await cmd.parseAsync(['release', 'rehearsal', 'tick', '--apply', '--checkout', '/fake/checkout', '--json'], { from: 'user' });
     expect(process.exitCode).toBe(1);
     expect(selections).toEqual([{ shards: 2, remote: undefined }]);
-    expect(JSON.parse(lines[0]!)).toMatchObject({ ok: false, stamps: [{ outcome: 'error', selection: { shards: 2 }, shardPlan: { testFiles: 7, unmeasured: 'sufficiency threshold not measured' }, result: { gateExitCode: 1 } }] });
+    const tick = JSON.parse(lines[0]!) as { ok: boolean; stamps: Array<{ step: string }> };
+    expect(tick.ok).toBe(false);
+    expect(tick.stamps.find(stamp => stamp.step === 'rc-7h')).toMatchObject({ outcome: 'error', selection: { shards: 2 }, shardPlan: { testFiles: 7, unmeasured: 'sufficiency threshold not measured' }, result: { gateExitCode: 1 } });
     expect(JSON.parse(readFileSync(join(root, 'release', version, 'rehearsal', 'rc-7h.json'), 'utf8'))).toMatchObject({ outcome: 'error', shardPlan: { testFiles: 7 }, result: { gateExitCode: 1 } });
   } finally { output.mockRestore(); resetElanousConfigDir(); process.exitCode = exit ?? 0; rmSync(root, { recursive: true, force: true }); }
 });
@@ -143,6 +151,113 @@ function fixture() {
 }
 
 describe('release checklist CLI', () => {
+  test('strict add/retitle rejects malformed code cells before ledger writes; skip-note keeps evidence once', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-target-paths-cli-'));
+    setElanousConfigDir(dir);
+    const output = spyOn(console, 'log').mockImplementation(() => {});
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', '--version', '9.9.9', ...args], { from: 'user' }); };
+    const good = '대상 경로: src/release-loop/checklist.ts\n- 완료 경계 코드: 검사기 변경\n- 완료 경계 실물: CLI 저장\n- 완료 경계 증거 명령: bun test src/release-loop/checklist.test.ts';
+    try {
+      await expect(run('add', 'PATH', '설명만 있음', '--strict')).rejects.toThrow('첫 줄 대상 경로');
+      expect(listChecklist('9.9.9').items).toHaveLength(0);
+      await run('add', 'PATH', good, '--strict');
+      await expect(run('retitle', 'PATH', '대상 경로: src/missing.ts', '--strict')).rejects.toThrow('origin/main에 없는 파일');
+      await expect(run('retitle', 'PATH', `${good.split('\n')[0]}\n신설: src/new.ts · 신규 모듈\n${good.split('\n').slice(1).join('\n')}`, '--strict')).rejects.toThrow('신설: 경로가 첫 줄 대상에 없다');
+      await expect(run('retitle', 'PATH', `${good.split('\n')[0]}\n신설: src/release-loop\n${good.split('\n').slice(1).join('\n')}`, '--strict')).rejects.toThrow('origin/main의 디렉터리');
+      await expect(run('retitle', 'PATH', `${good}\n신설: src/new.ts`, '--strict')).rejects.toThrow('신설: 선언은 제목 둘째 줄에만 둔다');
+      expect(listChecklist('9.9.9').items[0]?.title).toBe(good);
+      await run('set', 'PATH', '--evidence', '사람 근거');
+      await run('skip-note', 'PATH', 'src/a.ts (없음)', '--expected-title', good, '--by', 'OP');
+      await run('skip-note', 'PATH', 'src/a.ts (없음)', '--expected-title', good, '--by', 'OP');
+      expect(listChecklist('9.9.9').items[0]?.evidence).toMatch(/^사람 근거\n디스패처 건너뜀 \[[a-f0-9]{16}\]: src\/a\.ts \(없음\)$/);
+      const marker = listChecklist('9.9.9').items[0]?.evidence?.split('\n')[1];
+      await run('set', 'PATH', '--evidence', `${marker}\n사람의 후속 근거`);
+      await run('skip-note', 'PATH', 'src/a.ts (없음)', '--expected-title', good, '--by', 'OP');
+      expect(listChecklist('9.9.9').items[0]?.evidence).toBe(`${marker}\n사람의 후속 근거`);
+      await run('set', 'PATH', '--evidence', `사람의 이전 근거\n${marker}\n사람의 후속 근거`);
+      await run('skip-note', 'PATH', 'src/b.ts (없음)', '--expected-title', good, '--by', 'OP');
+      expect(listChecklist('9.9.9').items[0]?.evidence).toMatch(/^사람의 이전 근거\n디스패처 건너뜀 \[[a-f0-9]{16}\]: src\/b\.ts \(없음\)\n사람의 후속 근거$/);
+    } finally { output.mockRestore(); error.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('strict retitle validates every affected version before changing any title', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-retitle-all-versions-'));
+    setElanousConfigDir(dir);
+    const output = spyOn(console, 'log').mockImplementation(() => {});
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    const run = async (version: string, ...args: string[]) => {
+      const cmd = new Command(); registerReleaseCommands(cmd);
+      await cmd.parseAsync(['release', 'checklist', '--version', version, ...args], { from: 'user' });
+    };
+    try {
+      await run('9.9.8', 'add', 'SHARED', '운영 칸', '--kind', 'ops');
+      await run('9.9.9', 'add', 'SHARED', '대상 경로: src/release-loop/checklist.ts', '--kind', 'code', '--allow-duplicate-id');
+      await expect(run('9.9.8', 'retitle', 'SHARED', '운영 새 제목', '--strict')).rejects.toThrow('첫 줄 대상 경로');
+      expect(listChecklist('9.9.8').items[0]?.title).toBe('운영 칸');
+      expect(listChecklist('9.9.9').items[0]?.title).toBe('대상 경로: src/release-loop/checklist.ts');
+    } finally { output.mockRestore(); error.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('strict add rejects a tracked dotted directory and accepts a declared extensionless new file', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'release-target-paths-git-'));
+    const previousCwd = process.cwd();
+    mkdirSync(join(repo, 'src', 'example.ts'), { recursive: true });
+    writeFileSync(join(repo, 'src', 'example.ts', 'keep.ts'), 'export const keep = true;\n');
+    mkdirSync(join(repo, 'src', '한글 폴더'), { recursive: true });
+    writeFileSync(join(repo, 'src', '한글 폴더', '검사 파일.ts'), 'export const checked = true;\n');
+    const git = (...args: string[]) => {
+      const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+    };
+    try {
+      git('init', '-q');
+      git('config', 'user.name', 'Fixture');
+      git('config', 'user.email', 'fixture@example.invalid');
+      git('add', 'src/example.ts/keep.ts');
+      git('add', 'src/한글 폴더/검사 파일.ts');
+      git('commit', '-qm', 'fixture');
+      const gitlinkSha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).stdout.trim();
+      git('update-index', '--add', '--cacheinfo', `160000,${gitlinkSha},deps/tool`);
+      git('commit', '-qm', 'gitlink fixture');
+      setElanousConfigDir(join(repo, 'state'));
+      process.chdir(repo);
+      const run = async (id: string, title: string) => {
+        const cmd = new Command(); registerReleaseCommands(cmd);
+        await cmd.parseAsync(['release', 'checklist', '--version', '9.9.9', 'add', id, title, '--strict'], { from: 'user' });
+      };
+      const boundary = '\n- 완료 경계 코드: 파일 생성\n- 완료 경계 실물: 파일 확인\n- 완료 경계 증거 명령: bun test';
+      await expect(run('NOREF', `대상 경로: bin/new-tool\n신설: bin/new-tool${boundary}`)).rejects.toThrow('origin/main Git 조회 실패');
+      expect(listChecklist('9.9.9').items).toHaveLength(0);
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+      await expect(run('TREE', `대상 경로: src/example.ts\n신설: src/example.ts${boundary}`)).rejects.toThrow('origin/main의 디렉터리');
+      await expect(run('GITLINK', `대상 경로: deps/tool\n신설: deps/tool${boundary}`)).rejects.toThrow('origin/main의 gitlink');
+      await expect(run('BLOB-CHILD', `대상 경로: src/한글 폴더/검사 파일.ts/child.ts\n신설: src/한글 폴더/검사 파일.ts/child.ts${boundary}`)).rejects.toThrow('상위 파일 아래에는 신설할 수 없다');
+      await expect(run('GITLINK-CHILD', `대상 경로: deps/tool/child.ts\n신설: deps/tool/child.ts${boundary}`)).rejects.toThrow('상위 gitlink 아래에는 신설할 수 없다');
+      expect(listChecklist('9.9.9').items).toHaveLength(0);
+      await run('NEW', `대상 경로: bin/new-tool\n신설: bin/new-tool${boundary}`);
+      await run('ROOT', `대상 경로: new-tool\n신설: new-tool${boundary}`);
+      await run('UNICODE', `대상 경로: src/한글 폴더/검사 파일.ts${boundary}`);
+      expect(listChecklist('9.9.9').items.map((item) => item.id)).toEqual(['NEW', 'ROOT', 'UNICODE']);
+    } finally {
+      process.chdir(previousCwd);
+      resetElanousConfigDir();
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+  test('actual isolated skip-note exits nonzero for a stale title so dispatcher does not mark it sent', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-skip-note-cli-'));
+    const run = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${dir}`, 'release', 'checklist', '--version', '9.9.9', ...args],
+      { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 60_000 });
+    try {
+      expect(run('add', 'SKIP', 'Original').status).toBe(0);
+      const stale = run('skip-note', 'SKIP', 'missing path', '--expected-title', 'Old title', '--by', 'OP');
+      expect(stale.status).toBe(1);
+      expect(stale.stderr).toContain('칸 제목이 바뀌어');
+      expect(JSON.parse(run('list', '--json').stdout).items[0]?.evidence).toBeUndefined();
+      expect(run('skip-note', 'SKIP', 'missing path', '--expected-title', 'Original', '--by', 'OP').status).toBe(0);
+      expect(run('skip-note', 'SKIP', 'missing path', '--expected-title', 'Original', '--by', 'OP').status).toBe(0);
+      expect(JSON.parse(run('list', '--json').stdout).items[0]?.evidence).toMatch(/^디스패처 건너뜀 \[[a-f0-9]{16}\]: missing path$/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 180_000);
   test('refs <doc> lists citing cells across versions as a table or JSON and writes nothing', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-checklist-refs-cli-'));
     setElanousConfigDir(dir);
@@ -235,7 +350,11 @@ describe('release checklist CLI', () => {
       await run('checklist', 'add', 'P0-MISSING', 'no rubric', '--priority', 'P0', '--version', '9.9.9');
       await run('checklist', 'add', 'P1-ONE', rubric(1), '--priority', 'P1', '--version', '9.9.9');
       await run('checklist', 'add', 'P1-TWO', rubric(2), '--priority', 'P1', '--version', '9.9.9');
-      await run('checklist', 'add', 'P1-MISSING', 'partial', '--priority', 'P1', '--version', '9.9.9');
+      await run('checklist', 'add', 'P1-PARTIAL', 'partial', '--priority', 'P1', '--version', '9.9.9');
+      await run('checklist', 'set', 'P1-PARTIAL', '--evidence', '루브릭: S2 (previous S3)', '--version', '9.9.9');
+      await run('checklist', 'add', 'P1-UPDATED', rubric(3), '--priority', 'P1', '--version', '9.9.9');
+      await run('checklist', 'set', 'P1-UPDATED', '--evidence', '루브릭: S2', '--version', '9.9.9');
+      await run('checklist', 'add', 'P1-MISSING', 'no S', '--priority', 'P1', '--version', '9.9.9');
       await run('checklist', 'set', 'P1-MISSING', '--evidence', '루브릭: A1 E2 R1 D0 M1 B0 X0', '--version', '9.9.9');
       await run('checklist', 'add', 'P2-IGNORED', rubric(3), '--priority', 'P2', '--version', '9.9.9');
       await run('checklist', 'add', 'UNPRIORITIZED', 'no rubric', '--version', '9.9.9');
@@ -246,8 +365,8 @@ describe('release checklist CLI', () => {
       expect(stdout[0]!.endsWith('\n')).toBe(true);
       expect(JSON.parse(stdout[0]!)).toEqual({ version: '9.9.9', byPriority: {
         P0: { s: { 0: 1, 1: 0, 2: 0, 3: 1 }, total: 3, missing: 1 },
-        P1: { s: { 0: 0, 1: 1, 2: 1, 3: 0 }, total: 3, missing: 1 },
-      }, total: 6, missing: 2 });
+        P1: { s: { 0: 0, 1: 1, 2: 3, 3: 0 }, total: 7, missing: 1 },
+      }, total: 10, missing: 2 });
       expect(readFileSync(ledger)).toEqual(before);
       expect(listChecklist('9.9.9')).toEqual(snapshot);
       stdout.length = 0;
@@ -266,7 +385,7 @@ describe('release checklist CLI', () => {
         total: 3,
       });
     } finally { log.mockRestore(); write.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
-  });
+  }, 120_000);
 
   test('add → set → status JSON · actor · 사람 상태 · rm, 기존 help 명령 보존', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-checklist-cli-'));
@@ -297,6 +416,7 @@ describe('release checklist CLI', () => {
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');
       expect(release.commands.find((c) => c.name() === 'run')!.helpInformation()).toContain('--if-ready');
+      expect(release.commands.find((c) => c.name() === 'resume')!.helpInformation()).toContain('--dry-run');
     } finally {
       jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
       if (oldTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = oldTrack;
@@ -660,6 +780,170 @@ describe('release schedule CLI', () => {
 });
 
 describe('release run CLI', () => {
+  test('a live graph runner ledger blocks a second CLI process with its actual run identity', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-single-flight-real-ledger-'));
+    const graph = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+    let entered!: () => void;
+    let release!: () => void;
+    const atNode = new Promise<void>((resolve) => { entered = resolve; });
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    const runId = 'real-ledger-first';
+    const first = runGraph(graph, { runId, input: { version: '0.2.34', previousVersion: '0.2.33', gatePodPool: 'pool' }, deps: { root: dir,
+      runBash: async () => { entered(); await waiting; return { exitCode: 1, stdout: '{"outcome":"fail"}\n', stderr: '' }; } } });
+    try {
+      await atNode;
+      const stateFile = join(dir, 'graph-runs', 'release-loop', `${runId}.json`);
+      const saved = JSON.parse(readFileSync(stateFile, 'utf8')) as { status: string; pid: number; startedAt: string };
+      expect(saved.status).toBe('running');
+      const second = Bun.spawnSync([process.execPath, join(import.meta.dir, '../../bin/elanous.mjs'), '--config-dir', dir,
+        'release', 'run', '--version', '0.2.34', '--json'], { env: { ...process.env, ELANOUS_STATE_DIR: dir }, timeout: 30_000 });
+      expect(second.exitCode).toBe(1);
+      const refusal = JSON.parse(second.stdout.toString().trim().split('\n').at(-1)!) as Record<string, unknown>;
+      expect(refusal).toMatchObject({ ok: false, reason: 'already-running', runId, pid: saved.pid, startedAt: saved.startedAt });
+      expect(readFileSync(stateFile, 'utf8')).toContain('"status": "running"');
+    } finally { release(); await first; rmSync(dir, { recursive: true, force: true }); }
+  }, 45_000);
+
+  test('a second direct or scheduled run refuses a live release-loop ledger record before graph launch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-single-flight-cli-'));
+    const runId = 'existing-release-run';
+    const startedAt = '2026-10-20T04:40:00.000Z';
+    const pidStartedAt = new Date(psProcessStartMs(process.pid)!).toISOString();
+    const stateDir = join(dir, 'graph-runs', 'release-loop');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, `${runId}.json`), JSON.stringify({ graphId: 'release-loop', runId,
+      status: 'running', pid: process.pid, pidStartedAt, startedAt, input: { version: '0.2.34' } }));
+    let launches = 0;
+    const errors: string[] = [];
+    const consoleError = spyOn(console, 'error').mockImplementation((...parts: unknown[]) => { errors.push(parts.join(' ')); });
+    const before = process.exitCode;
+    try {
+      for (const args of [[], ['--if-ready']]) {
+        process.exitCode = 0;
+        const cli = new Command();
+        registerReleaseCommands(cli, { ledgerRoot: dir, graph: async () => { launches++; return { status: 'done' } as never; } });
+        await cli.parseAsync(['release', 'run', '--version', '0.2.34', ...args], { from: 'user' });
+        expect(process.exitCode).toBe(1);
+      }
+      expect(launches).toBe(0);
+      expect(errors).toHaveLength(2);
+      for (const message of errors) {
+        expect(message).toContain(runId);
+        expect(message).toContain(`pid=${process.pid}`);
+        expect(message).toContain(`startedAt=${startedAt}`);
+        expect(message).toContain('--force-new');
+      }
+      mkdirSync(join(dir, 'release', '0.2.33'), { recursive: true });
+      writeFileSync(join(dir, 'release', '0.2.33', 'release.json'), JSON.stringify({ version: '0.2.33', publishedAt: startedAt }));
+      process.exitCode = 0;
+      const forced = new Command();
+      registerReleaseCommands(forced, { ledgerRoot: dir, freezeRoot: dir, config: { gatePodPool: 'pool' },
+        checklist: () => ({ ok: true, red: [], undecided: [], blocked: [] }),
+        graph: async () => { launches++; return { status: 'done' } as never; } });
+      await forced.parseAsync(['release', 'run', '--version', '0.2.34', '--force-new'], { from: 'user' });
+      expect(launches).toBe(1);
+      expect(process.exitCode).toBe(0);
+    } finally { process.exitCode = before ?? 0; consoleError.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('direct --force-new rechecks checklist after its start marker before graph launch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-force-start-recheck-'));
+    const before = process.exitCode;
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    let checks = 0;
+    let launches = 0;
+    try {
+      process.exitCode = 0;
+      const cli = new Command();
+      registerReleaseCommands(cli, { ledgerRoot: dir,
+        checklist: () => {
+          checks++;
+          expect(readActiveForceReleaseRun('0.2.34', dir)).toMatchObject({ pid: process.pid });
+          return { ok: false, red: ['hold'], undecided: [], blocked: [] };
+        },
+        graph: async () => { launches++; return { status: 'done' } as never; } });
+      await cli.parseAsync(['release', 'run', '--version', '0.2.34', '--force-new'], { from: 'user' });
+      expect(checks).toBe(1);
+      expect(launches).toBe(0);
+      expect(process.exitCode).toBe(1);
+      expect(readActiveForceReleaseRun('0.2.34', dir)).toBeUndefined();
+    } finally { process.exitCode = before ?? 0; error.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('a resume ledger appearing after CLI preflight is refused under the shared graph flock', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-resume-race-'));
+    const stateDir = join(dir, 'graph-runs', 'release-loop');
+    const before = process.exitCode;
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    let launches = 0;
+    try {
+      mkdirSync(stateDir, { recursive: true });
+      process.exitCode = 0;
+      const cli = new Command();
+      registerReleaseCommands(cli, { ledgerRoot: dir, config: { gatePodPool: 'pool' },
+        checklist: () => {
+          writeFileSync(join(stateDir, 'late-resume.json'), JSON.stringify({ graphId: 'release-loop', runId: 'late-resume',
+            status: 'running', pid: process.pid, pidStartedAt: new Date(psProcessStartMs(process.pid)!).toISOString(),
+            startedAt: new Date().toISOString(), input: { version: '0.2.34' } }));
+          return { ok: true, red: [], undecided: [], blocked: [] };
+        },
+        graph: async () => { launches++; return { status: 'done' } as never; } });
+      await cli.parseAsync(['release', 'run', '--version', '0.2.34'], { from: 'user' });
+      expect(launches).toBe(0);
+      expect(process.exitCode).toBe(1);
+    } finally { process.exitCode = before ?? 0; error.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('release resume --dry-run prints the full-gate plan and changes no resume state', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'release-resume-dry-cli-'));
+    const repo = join(root, 'repo'), remote = join(root, 'remote.git');
+    mkdirSync(repo);
+    const git = (cwd: string, ...args: string[]) => {
+      const result = spawnSync('git', ['-c', 'user.name=cli-test', '-c', 'user.email=cli-test@example.invalid', '-c', 'commit.gpgsign=false', ...args], {
+        cwd, encoding: 'utf8', env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: root, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+      });
+      if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
+      return result.stdout.trim();
+    };
+    const lines: string[] = [];
+    const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write);
+    const beforeExit = process.exitCode, previousCwd = process.cwd();
+    try {
+      git(repo, 'init', '-q', '-b', 'release/0.2.19');
+      writeFileSync(join(repo, 'cut.txt'), 'cut\n');
+      git(repo, 'add', 'cut.txt');
+      git(repo, 'commit', '-q', '-m', 'release cut');
+      const cut = git(repo, 'rev-parse', 'HEAD');
+      git(root, 'init', '-q', '--bare', remote);
+      git(repo, 'remote', 'add', 'origin', remote);
+      git(repo, 'push', '-q', '-u', 'origin', 'release/0.2.19');
+      const runId = 'dry-run-cli';
+      const statePath = join(root, 'graph-runs', 'release-loop', `${runId}.json`);
+      mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
+      const state = {
+        graphId: 'release-loop', runId, status: 'failed', input: { version: '0.2.19', branchCut: true },
+        path: ['version-release', 'gate', 'tui', 'failed'],
+        nodes: [{ nodeId: 'version-release', ok: true, executed: true, exit: 0,
+          output: JSON.stringify({ outcome: 'ok', version: '0.2.19', commit: cut, branch: 'release/0.2.19' }) }],
+        executed: 1, dryRun: false, statePath,
+      };
+      writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+      const originalState = readFileSync(statePath, 'utf8');
+      const refsBefore = git(repo, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/remotes/origin');
+      setElanousConfigDir(root);
+      process.chdir(repo);
+      process.exitCode = 0;
+      const cli = new Command(); registerReleaseCommands(cli);
+      await cli.parseAsync(['release', 'resume', '--run', runId, '--from', 'gate', '--no-partial', '--dry-run', '--command-root', repo, '--json'], { from: 'user' });
+      const result = JSON.parse(lines.at(-1)!) as { ok: boolean; gatePlan: { mode: string }; nextAttempt: number; preflight: string };
+      expect(result).toMatchObject({ ok: true, gatePlan: { mode: 'full' }, nextAttempt: 1, preflight: 'passed' });
+      expect(process.exitCode).toBe(0);
+      expect(readFileSync(statePath, 'utf8')).toBe(originalState);
+      expect(existsSync(join(root, 'release', '0.2.19', 'resume-attempts', `${runId}.json`))).toBe(false);
+      expect(git(repo, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/remotes/origin')).toBe(refsBefore);
+    } finally {
+      process.chdir(previousCwd); process.exitCode = beforeExit ?? 0;
+      output.mockRestore(); resetElanousConfigDir(); rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('--publish-at reaches the publish graph input on direct and --if-ready runs; omission preserves the input', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-publish-at-cli-'));
     mkdirSync(join(dir, 'release', '0.2.3'), { recursive: true });
@@ -742,7 +1026,6 @@ describe('release run CLI', () => {
     const previousState = process.env.ELANOUS_STATE_DIR;
     try {
       process.env.ELANOUS_STATE_DIR = root;
-      const { runGraph } = await import('../graph-runner/runner.js');
       let state: Awaited<ReturnType<typeof runGraph>> | undefined;
       const cli = new Command();
       registerReleaseCommands(cli, { freezeRoot: root, ledgerRoot: ledger, config: { gatePodPool: 'pool' },
@@ -1202,6 +1485,50 @@ describe('release run CLI', () => {
   });
 });
 
+test('actual release resume --dry-run executable prints JSON without mutating run state or refs', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-resume-dry-child-'));
+  const repo = join(root, 'repo'), remote = join(root, 'remote.git');
+  mkdirSync(repo);
+  const git = (cwd: string, ...args: string[]) => {
+    const result = spawnSync('git', ['-c', 'user.name=cli-test', '-c', 'user.email=cli-test@example.invalid', '-c', 'commit.gpgsign=false', ...args], {
+      cwd, encoding: 'utf8', env: { ...process.env, HOME: root, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+    });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+  const run = (...args: string[]) => spawnSync('bun', [join(import.meta.dir, '../../bin/elanous.mjs'), `--test=${root}`, 'release', 'resume', ...args], {
+    cwd: repo, encoding: 'utf8', timeout: 60_000,
+    env: { ...process.env, ELANOUS_TRACK: 'OP', HOME: root, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+  });
+  try {
+    git(repo, 'init', '-q', '-b', 'release/0.2.19');
+    writeFileSync(join(repo, 'cut.txt'), 'cut\n');
+    git(repo, 'add', 'cut.txt');
+    git(repo, 'commit', '-q', '-m', 'release cut');
+    const cut = git(repo, 'rev-parse', 'HEAD');
+    git(root, 'init', '-q', '--bare', remote);
+    git(repo, 'remote', 'add', 'origin', remote);
+    git(repo, 'push', '-q', '-u', 'origin', 'release/0.2.19');
+    const runId = 'dry-run-executable';
+    const statePath = join(root, 'graph-runs', 'release-loop', `${runId}.json`);
+    mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
+    const state = { graphId: 'release-loop', runId, status: 'failed', input: { version: '0.2.19', branchCut: true },
+      path: ['version-release', 'gate', 'tui', 'failed'],
+      nodes: [{ nodeId: 'version-release', ok: true, executed: true, exit: 0,
+        output: JSON.stringify({ outcome: 'ok', version: '0.2.19', commit: cut, branch: 'release/0.2.19' }) }],
+      executed: 1, dryRun: false, statePath };
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+    const beforeState = readFileSync(statePath, 'utf8');
+    const beforeRefs = git(repo, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/remotes/origin');
+    const result = run('--run', runId, '--from', 'gate', '--no-partial', '--dry-run', '--command-root', repo, '--json');
+    expect(result.status, JSON.stringify({ stdout: result.stdout, stderr: result.stderr })).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, gatePlan: { mode: 'full' }, nextAttempt: 1, preflight: 'passed' });
+    expect(readFileSync(statePath, 'utf8')).toBe(beforeState);
+    expect(existsSync(join(root, 'release', '0.2.19', 'resume-attempts', `${runId}.json`))).toBe(false);
+    expect(git(repo, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/remotes/origin')).toBe(beforeRefs);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 90_000);
+
 describe('release — 버전·자산', () => {
   test('버전 모양: x.y.z 와 -rc/-alpha/-beta.N 만 · 접두 v 는 아니다', () => {
     expect(['0.1.0', '0.2.0-rc.1', '1.0.0-beta.2'].every(isReleaseVersion)).toBe(true);
@@ -1635,6 +1962,76 @@ describe('CHECKLIST-PRED-CLEAR — set --no-predecessor', () => {
       await expect(run('--version', '9.9.9', 'set', 'B', '--predecessor', '')).rejects.toBeInstanceOf(CliUserError);
     } finally {
       quiet.mockRestore();
+      resetElanousConfigDir();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('LBY-VERSION-OPEN-MISMATCH — --version 의 since 는 --open 과 같은 판 전체 최초 수정일', () => {
+  test('같은 판·같은 owner 에서 --version 과 --open 결과 집합이 같다 (가짜 gh 러너)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-lby-version-open-'));
+    setElanousConfigDir(dir);
+    // 같은 판(열린 0.2.11 + 선택 0.2.12) · 같은 owner(UX). W3 칸(10-03 갱신)보다 먼저 병합된 PR #4059(10-01) 가 회수 대상.
+    const mergedPrs = [
+      { number: 4060, title: '이전 판 칸 회수 수확', body: '칸: OLD', mergedAt: '2026-09-30T12:00:00Z' },
+      { number: 4059, title: '현재 판 칸 회수 수확', body: '칸: W3', mergedAt: '2026-10-01T12:00:00Z' },
+    ];
+    const itemsBy: Record<string, ChecklistItem[]> = {
+      '0.2.11': [{ id: 'OLD', title: '이전 판 칸 회수', status: 'yellow', owner: 'UX', updatedAt: '2026-09-28T09:00:00Z', updatedBy: 'UX' }],
+      '0.2.12': [{ id: 'W3', title: '현재 판 칸 회수', status: 'yellow', owner: 'UX', updatedAt: '2026-10-03T09:00:00Z', updatedBy: 'UX' }],
+    };
+    const ghCalls: Array<{ since: string; limit: number; fields: string }> = [];
+    // 진짜 gh 처럼 --search merged:>=<since> 를 지키는 가짜 gh 러너 — since 가 늦으면 그 PR 은 돌려주지 않는다
+    const ghRunner: Runner = (command, args) => {
+      if (command !== 'gh' || args[0] !== 'pr' || args[1] !== 'list') return { status: 1, stdout: '', stderr: `unexpected ${command} ${args.join(' ')}` };
+      const since = (args[args.indexOf('--search') + 1] ?? '').replace(/^merged:>=/, '');
+      const limit = Number(args[args.indexOf('--limit') + 1] ?? 0);
+      const fields = args[args.indexOf('--json') + 1] ?? '';
+      ghCalls.push({ since, limit, fields });
+      return { status: 0, stdout: JSON.stringify(mergedPrs.filter((pr) => pr.mergedAt.slice(0, 10) >= since)), stderr: '' };
+    };
+    const checklist = (version: string): Checklist => ({ version, released: '0.2.10', dev: '9.9.9', items: itemsBy[version] ?? [], history: [] });
+    const lines: string[] = [];
+    const run = async (...args: string[]): Promise<string> => {
+      const cli = new Command();
+      registerReleaseCommands(cli, {}, {
+        run: ghRunner,
+        checklist,
+        schedules: () => [
+          { version: '0.2.11', cutAt: '2026-09-29T13:00:00Z', landBy: null, updatedAt: '2026-09-27T09:00:00Z', updatedBy: 'UX' },
+          { version: '0.2.12', cutAt: '2026-10-06T13:00:00Z', landBy: null, updatedAt: '2026-09-30T09:00:00Z', updatedBy: 'UX' },
+        ],
+        released: () => '',
+        now: () => new Date('2026-10-04T04:00:00.000Z'),
+      });
+      const out = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => {
+        lines.push(String(chunk).trim());
+        const done = typeof encodingOrCallback === 'function' ? encodingOrCallback : callback;
+        if (typeof done === 'function') done();
+        return true;
+      }) as typeof process.stdout.write);
+      try { await cli.parseAsync(['release', 'checklist', ...args], { from: 'user' }); } finally { out.mockRestore(); }
+      return lines[lines.length - 1] ?? '';
+    };
+    try {
+      const openJson = await run('--json', 'landed-but-yellow', '--open', '--owner', 'UX');
+      const versionJson = await run('--json', '--version', '0.2.12', 'landed-but-yellow', '--owner', 'UX');
+      const openResults = JSON.parse(openJson) as Array<{ version: string; rows: unknown[] }>;
+      const versionRows = JSON.parse(versionJson) as unknown[];
+      // --version 도 --open 과 같은 판 전체 최초 수정일(2026-09-28) 로 gh 를 조회한다
+      expect(ghCalls).toHaveLength(2);
+      expect(ghCalls[0]).toEqual(ghCalls[1]);
+      expect(ghCalls[0]).toMatchObject({ since: '2026-09-28', limit: 400, fields: 'number,title,body,mergedAt' });
+      // ghCalls[1] 은 --version 호출 — 칸 updatedAt(2026-10-03) 이 아닌 판 전체 최초 수정일로 조회해야 한다(버그 회귀면 여기서 실패한다)
+      expect(ghCalls[1].since).toBe('2026-09-28');
+      // 같은 판 · 같은 owner — 결과 집합이 같다
+      const openRows12 = openResults.find((entry) => entry.version === '0.2.12')?.rows ?? [];
+      expect(openRows12).toHaveLength(1);
+      expect(versionRows).toEqual(openRows12);
+      // 회귀 방어: 칸 자신의 updatedAt(2026-10-03) 보다 먼저 병합된 PR 도 --version 이 놓치지 않는다
+      expect(versionRows).toMatchObject([{ id: 'W3', status: 'yellow', prs: [{ number: 4059, basis: 'cell-line' }] }]);
+    } finally {
       resetElanousConfigDir();
       rmSync(dir, { recursive: true, force: true });
     }

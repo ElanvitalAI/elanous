@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { formatFailureNotice, matchFailureText } from '../../self-health/signatures.js';
 import { createInternalTurnGate, type StartTurnIfIdleOptions, type StartTurnIfIdleResult } from './internal-turn.js';
 import {
   createSeatAutowake,
@@ -132,6 +133,76 @@ function rig(over: Partial<SeatAutowakeDeps> = {}) {
 }
 
 describe('createSeatAutowake — 배선 판정(H2 호출자)', () => {
+  const codex400 = (callId: string) => {
+    const errorDetail = `Codex API 400: No tool call found for function call output with call_id ${callId}.`;
+    return { lastLine: formatFailureNotice(matchFailureText(errorDetail)!, { rawHint: '/detail open' }), errorDetail };
+  };
+
+  test('같은 세션·call_id Codex 400 두 번째에서 terminal 1회, 다음 자동 턴 0 · 다른 세션은 계속', () => {
+    const r = rig();
+    const failure = codex400('call_4eb412c398564aa486d3b17096e5bb7f');
+    r.aw.noteTurnEnded({ sessionId: 'broken-session', ...failure });
+    expect(r.aw.check()).toMatchObject({ opened: true });
+    expect(r.calls).toHaveLength(1);
+
+    // A changed queue would normally open another internal turn. The second
+    // identical provider failure must stop that session before the H2 gate.
+    r.state.unread = { count: 1, maxId: 42 };
+    r.aw.noteTurnEnded({ sessionId: 'broken-session', ...failure });
+    expect(r.aw.check()).toMatchObject({ action: 'skip', reason: 'terminal-codex-400' });
+    expect(r.calls).toHaveLength(1);
+    expect(r.logs.filter(row => row.event === 'terminal')).toEqual([{
+      category: 'tui.autowake', event: 'terminal', data: {
+        seat: 'OPT', sessionId: 'broken-session', errorKind: 'codex-orphan-tool-output-400',
+        callId: 'call_4eb412c398564aa486d3b17096e5bb7f', recommendedAction: '/session new',
+      },
+    }]);
+    expect(r.notices).toHaveLength(1);
+    r.aw.noteTurnEnded({ sessionId: 'broken-session', ...failure });
+    expect(r.logs.filter(row => row.event === 'terminal')).toHaveLength(1);
+
+    r.aw.noteTurnEnded({ sessionId: 'healthy-session', lastLine: 'response complete' });
+    expect(r.aw.check()).toMatchObject({ opened: true });
+    expect(r.calls).toHaveLength(2);
+  });
+
+  test('서로 다른 call_id와 일시 오류는 누적하지 않는다', () => {
+    const r = rig();
+    r.aw.noteTurnEnded({ sessionId: 's1', ...codex400('call_a') });
+    r.aw.noteTurnEnded({ sessionId: 's1', ...codex400('call_b') });
+    r.aw.noteTurnEnded({ sessionId: 's1', lastLine: 'Error: temporary network timeout' });
+    r.aw.noteTurnEnded({ sessionId: 's1', ...codex400('call_b') });
+    expect(r.logs.filter(row => row.event === 'terminal')).toHaveLength(0);
+    expect(r.aw.check()).toMatchObject({ opened: true });
+  });
+
+  test('Codex API 400 축약 안내는 /detail 원문의 같은 call_id로 센다', () => {
+    const r = rig();
+    r.aw.noteTurnEnded({ sessionId: 's1', ...codex400('call_same') });
+    r.aw.noteTurnEnded({ sessionId: 's1', ...codex400('call_same') });
+    expect(r.aw.check()).toMatchObject({ action: 'skip', reason: 'terminal-codex-400' });
+    expect(r.logs.filter(row => row.event === 'terminal')).toHaveLength(1);
+    expect(r.calls).toHaveLength(0);
+  });
+
+  test('정상 답변의 동일 API 오류 인용문은 종료로 세지 않는다', () => {
+    const r = rig();
+    const quoted = 'Codex API 400: No tool call found for function call output with call_id call_same.';
+    r.aw.noteTurnEnded({ sessionId: 's1', lastLine: quoted });
+    r.aw.noteTurnEnded({ sessionId: 's1', lastLine: quoted });
+    expect(r.logs.filter(row => row.event === 'terminal')).toHaveLength(0);
+    expect(r.aw.check()).toMatchObject({ opened: true });
+  });
+
+  test('앞 턴 400 뒤 정상 답변이 축약 안내를 인용해도 이전 /detail 원문을 재사용하지 않는다', () => {
+    const r = rig();
+    const failure = codex400('call_same');
+    r.aw.noteTurnEnded({ sessionId: 's1', ...failure });
+    r.aw.noteTurnEnded({ sessionId: 's1', lastLine: failure.lastLine });
+    expect(r.logs.filter(row => row.event === 'terminal')).toHaveLength(0);
+    expect(r.aw.check()).toMatchObject({ opened: true });
+  });
+
   test('남은 일 있음 → startTurnIfIdle 1회(origin autowake) ⊕ decided 로그', () => {
     const r = rig();
     const d = r.endTurn();
@@ -308,9 +379,11 @@ describe('대시보드 배선 — 글자로 문다(showDashboard 지역 루프�
   const src = readFileSync(resolve(import.meta.dir, '../index.ts'), 'utf8');
   test('H2 문으로만 연다 · 턴 정리(finally)에서 무장 · 입력칸 port 를 감싼다', () => {
     expect(src).toContain('startTurnIfIdle: (text, opts) => internalTurnGate.startTurnIfIdle(text, opts),');
-    expect(src.match(/seatAutowake\.noteTurnEnded\(\);/g)).toHaveLength(1);
-    const idleAt = src.indexOf("reportTuiTurn('idle');\n        seatAutowake.noteTurnEnded();");
+    expect(src.match(/seatAutowake\.noteTurnEnded\(\{ sessionId: currentChatPersonaSessionId\(\), lastLine: chatLines\.at\(-1\) \?\? '', errorDetail: failedTurnRaw \?\? undefined \}\);/g)).toHaveLength(1);
+    const idleAt = src.indexOf("reportTuiTurn('idle');\n        const failedTurnRaw = autowakeTurnFailureRaw;");
     expect(idleAt).toBeGreaterThan(0);
+    expect(src).toContain('autowakeTurnFailureRaw = raw;');
+    expect(src).toContain('autowakeTurnFailureRaw = null;');
     expect(src).toContain('internalTurnYield: internalTurnYieldPort,');
   });
 });

@@ -15,6 +15,7 @@ import { measureLandingThroughput, type LandingThroughput } from '../task-agent/
 import {
   okCell, unmeasured, type Cell, type CapacityInfo, type ChecklistCounts, type LaunchableInfo, type LoopRow, type MachineRow,
   type OverviewSnapshot, type OwnerTaskRow, type ParentsInfo, type PodMemberRow, type ReleaseRunInfo, type ScheduleInfo,
+  type SchedulerMetrics,
 } from './overview.js';
 import { SEAT_ERA_SOURCE, readDispatcherBeats, readDispatcherCapacity, readSeatEraHanded, seatEraFeederDir } from './overview-seat-era.js';
 import { matchesOverviewOwner, normalizeOverviewOwner } from './overview-owner.js';
@@ -204,8 +205,11 @@ function collectMachines(root: string, ledgerRows: ResourceView[] | Error, poolS
   return { hosts, pods, parents };
 }
 
+export interface SchedulerExecutionObservation { ts_ms: number; data: string | null }
+
 export interface CollectDeps {
   listSchedules?: () => ReleaseSchedule[];
+  readSchedulerRuns?: (sinceMs: number, untilMs: number) => SchedulerExecutionObservation[] | Promise<SchedulerExecutionObservation[]>;
   listChecklist?: (v: string) => Checklist;
   readRuns?: (dir: string) => ReturnType<Parameters<typeof collectRelease>[4]>;
   readCards?: () => TaskCard[];
@@ -222,6 +226,14 @@ async function defaultDeps(root: string): Promise<Required<CollectDeps>> {
   ]);
   return {
     listSchedules: () => listSchedules(),
+    readSchedulerRuns: async (sinceMs, untilMs) => {
+      const { LogStore, logsDbPath } = await import('../mss/logging/log-store.js');
+      const store = LogStore.openReadOnly(logsDbPath());
+      try {
+        return store.queryAll({ exactCategories: ['schedule.run'], sinceMs, untilMs })
+          .map(({ ts_ms, data }) => ({ ts_ms, data }));
+      } finally { store.close(); }
+    },
     listChecklist: (v) => listChecklist(v),
     readRuns: (dir) => readReleaseRuns(null, dir),
     readCards: () => {
@@ -351,7 +363,30 @@ export async function collectOverview(opts: CollectOptions, injected: CollectDep
       beat: okCell({ lastAt: b.lastAt, ageSeconds: b.ageSeconds, alive: b.alive }, `${SEAT_ERA_SOURCE} dispatcher-${b.seat}.pid`, b.lastAt) });
   }
 
-  return { generatedAt: iso(now), instanceRoot: root, since: opts.sinceLabel, release, tasks, machines, landings, throughput, loops };
+  let schedulerMetrics: OverviewSnapshot['schedulerMetrics'];
+  try {
+    const runs = await deps.readSchedulerRuns(now - 86_400_000, now);
+    const isCrontabRecord = (row: SchedulerExecutionObservation): boolean => {
+      try {
+        const data = row.data ? JSON.parse(row.data) as { via?: unknown } : null;
+        return data?.via === 'crontab';
+      } catch { return false; }
+    };
+    const lastHourRuns = runs.filter((row) => row.ts_ms >= now - 3_600_000);
+    const crontabRuns = lastHourRuns.filter(isCrontabRecord).length;
+    const crontabRunsLast24h = runs.filter(isCrontabRecord).length;
+    const metrics: SchedulerMetrics = {
+      scheduleRuns: lastHourRuns.length,
+      bunLaunches: crontabRuns,
+      bunLaunchesLast24h: crontabRunsLast24h,
+    };
+    const source = 'logs.db(schedule.run · via=crontab 기록 건수 · 전체 Bun 기동 아님)';
+    schedulerMetrics = okCell(metrics, source, iso(now));
+  } catch (error) {
+    schedulerMetrics = unmeasured<SchedulerMetrics>('logs.db(schedule.run)', errText(error));
+  }
+
+  return { generatedAt: iso(now), instanceRoot: root, since: opts.sinceLabel, release, tasks, machines, landings, throughput, schedulerMetrics, loops };
 }
 
 export function parseSince(raw: string | undefined): { ms: number; label: string } {

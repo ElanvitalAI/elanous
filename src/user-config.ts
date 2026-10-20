@@ -64,6 +64,8 @@ import {
 import { lookupLlmTierSpec } from './model-tier/llm-tier-map.js';
 import { BEDROCK_DEFAULT_MODEL } from './llm/bedrock.js';
 import { userConfigPath as nexusUserConfigPath } from './nexus/config/paths.js';
+import { getElanousConfigDirOverride } from './elanous-config-dir.js';
+import { getTestStateRoot } from './nexus/paths.js';
 import { type StreamingMode, isStreamingMode } from './session/streaming/stream-compositor.js';
 import type { DevRequestRoutingConfig } from './skills/dev-request-router.js';
 import type { UrlRoutingConfig } from './skills/url-router.js';
@@ -72,6 +74,7 @@ import { withFileLockSync } from './storage/file-lock.js';
 import { debug } from './debug/log.js';
 import { setConfigTimeZoneSource } from './time/format.js';
 import { parseGeminiServerTools } from './user-config/gemini-server-tools.js';
+import { clampNum, numArray, positiveIntOr, str, strArray, stringRecord } from './user-config/coercion.js';
 import type { FoldMode } from './log-entry.js';
 import {
   CLAUDE_PACKAGE_MISSING,
@@ -3892,7 +3895,7 @@ export interface UserConfig {
   guardian?: { mode?: 'shadow' | 'live'; /** Orphan CLI GC on the guardian tick: off = no ps collection, shadow (default) = evidence only, on = evidence then SIGTERM. */ orphanGc?: 'off' | 'shadow' | 'on' };
   /** Task-agent live move allow-list (`src/task-agent/live-moves.ts` validates its vocabulary).
    *  Absent = env ELANOUS_TASK_AGENT_LIVE_MOVES, else none (pure shadow). */
-  taskAgent?: { liveMoves?: string[]; /** TA-REJUDGE-PERIODIC — steward tick runs `tasks rejudge --all` every N minutes (absent/0 = off). */ rejudgeEveryMinutes?: number; /** 1-minute load average above which that tick is skipped (default 60). */ rejudgeMaxLoad?: number; /** TA-REPAIR-TICK-CAP — new repair launches per `tasks rejudge --all` (default 3, 0 = none). */ repairMaxPerTick?: number; /** TA-LAND-AFTER-REVIEW — opt-in external queue adapter, never a direct merge command. */ landQueue?: { command: string; remote: string }; parentHost?: { host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number } | Array<{ host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number }> };
+  taskAgent?: { liveMoves?: string[]; /** TA-REJUDGE-PERIODIC — steward tick runs `tasks rejudge --all` every N minutes (absent/0 = off). */ rejudgeEveryMinutes?: number; /** 1-minute load average above which that tick is skipped (default 60). */ rejudgeMaxLoad?: number; /** TA-REPAIR-TICK-CAP — new repair launches per `tasks rejudge --all` (default 3, 0 = none). */ repairMaxPerTick?: number; /** Old cards are skipped by periodic rejudge after this many hours (default 72). */ rejudgeMaxAgeHours?: number; /** TA-LAND-AFTER-REVIEW — opt-in external queue adapter, never a direct merge command. */ landQueue?: { command: string; remote: string }; parentHost?: { host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number } | Array<{ host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number }> };
   events?: EventsConfig;
   /** GATE-REMOTE — see GateRemoteConfig. Absent = defaults (auto on · node-b · load 20 · cap 2). */
   gateRemote?: GateRemoteConfig;
@@ -4204,7 +4207,7 @@ function parseTaskAgentConfig(raw: unknown): UserConfig['taskAgent'] {
   }
   const parentHost = parseTaskAgentParentHost((raw as Record<string, unknown>).parentHost);
   // TA-REJUDGE-PERIODIC — 음이 아닌 유한수만 산다(0 = 끔). 그 밖은 경고하고 버린다(= 끔 · 기본 부하 상한).
-  const rejudge: { rejudgeEveryMinutes?: number; rejudgeMaxLoad?: number; repairMaxPerTick?: number } = {};
+  const rejudge: { rejudgeEveryMinutes?: number; rejudgeMaxLoad?: number; repairMaxPerTick?: number; rejudgeMaxAgeHours?: number } = {};
   for (const key of ['rejudgeEveryMinutes', 'rejudgeMaxLoad'] as const) {
     const value = (raw as Record<string, unknown>)[key];
     if (value === undefined) continue;
@@ -4215,6 +4218,12 @@ function parseTaskAgentConfig(raw: unknown): UserConfig['taskAgent'] {
   if (repairMaxPerTick !== undefined) {
     if (Number.isSafeInteger(repairMaxPerTick) && (repairMaxPerTick as number) >= 0) rejudge.repairMaxPerTick = repairMaxPerTick as number;
     else warnUserConfigDrop('taskAgent.repairMaxPerTick', `음이 아닌 정수가 아니다(${JSON.stringify(repairMaxPerTick)}) — 기본 3`);
+  }
+  const rejudgeMaxAgeHours = (raw as Record<string, unknown>).rejudgeMaxAgeHours;
+  if (rejudgeMaxAgeHours !== undefined) {
+    if (typeof rejudgeMaxAgeHours === 'number' && Number.isFinite(rejudgeMaxAgeHours) && rejudgeMaxAgeHours > 0)
+      rejudge.rejudgeMaxAgeHours = rejudgeMaxAgeHours;
+    else warnUserConfigDrop('taskAgent.rejudgeMaxAgeHours', `양의 유한수가 아니다(${JSON.stringify(rejudgeMaxAgeHours)}) — 기본 72`);
   }
   const queueRaw = (raw as Record<string, unknown>).landQueue;
   let landQueue: { command: string; remote: string } | undefined;
@@ -4541,6 +4550,13 @@ function emitXdgDeprecationWarningOnce(xdgPath: string): void {
 }
 
 export function userConfigPath(): string {
+  // An explicit CLI override or an isolated root selected by --test or a
+  // parent stamp must not be shadowed by legacy XDG from a parent shell.
+  // All state roots, including bun test's isolation root, outrank legacy XDG.
+  // XDG-only callers have no selected state root (covered by a spawned CLI).
+  if (getElanousConfigDirOverride() !== undefined || process.env.ELANOUS_STATE_DIR?.trim() || getTestStateRoot() !== undefined) {
+    return nexusUserConfigPath();
+  }
   const xdg = process.env.XDG_CONFIG_HOME?.trim();
   if (xdg) {
     const xdgPath = join(xdg, 'elanous', 'config.json');
@@ -6993,45 +7009,6 @@ export function markOnboardingComplete(cfg: UserConfig): UserConfig {
 }
 
 export function currentOnboardingVersion(): number { return ONBOARDING_VERSION; }
-
-// ── Coercion helpers ─────────────────────────────────────────────────
-
-function clampNum(v: unknown, fallback: number, min: number, max: number): number {
-  if (typeof v !== 'number' || !Number.isFinite(v)) return fallback;
-  if (v < min) return min;
-  if (v > max) return max;
-  return v;
-}
-
-function positiveIntOr(v: unknown, fallback: number): number {
-  return typeof v === 'number' && Number.isSafeInteger(v) && v > 0 ? v : fallback;
-}
-
-function str(v: unknown): string | undefined {
-  return typeof v === 'string' && v.length > 0 ? v : undefined;
-}
-
-function strArray(v: unknown, fallback: string[]): string[] {
-  if (!Array.isArray(v)) return fallback;
-  const out = v.filter((x): x is string => typeof x === 'string' && x.length > 0);
-  return out.length > 0 ? out : fallback;
-}
-
-function stringRecord(v: unknown): Record<string, string> {
-  if (!v || typeof v !== 'object' || Array.isArray(v)) return {};
-  const out: Record<string, string> = {};
-  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-    if (typeof k === 'string' && k.length > 0 && typeof val === 'string' && val.length > 0) {
-      out[k] = val;
-    }
-  }
-  return out;
-}
-
-function numArray(v: unknown, fallback: number[]): number[] {
-  if (!Array.isArray(v)) return fallback;
-  return v.filter((x): x is number => typeof x === 'number' && Number.isFinite(x));
-}
 
 function normalizeProvider(v: unknown): LLMProviderName {
   const allowed = CONFIG_LLM_PROVIDER_NAMES;

@@ -162,9 +162,16 @@ export interface DefaultTaskLauncherDeps {
   launchHoldActive?: () => boolean;
   /** HQ 판(시험 주입). */
   localVersion?: string;
+  /** HQ-owned, refresh-less Codex access mirror to install before a remote parent launch. */
+  codexAccessMirror?: () => Promise<{ elanousAuth: string; codexAuth: string; account?: string; usedPercent?: number; thresholdPercent?: number } | null>;
+  /** Isolated integration seam; production still reads the HQ rotation snapshot and config directly. */
+  ownerCodexRotation?: () => ReturnType<typeof import('../oauth/codex-account-store.js').inspectCodexRotation>;
+  ownerCodexRotationConfig?: { accountOrder?: readonly string[]; thresholdPercentByAccount?: Readonly<Record<string, unknown>> };
   /** 원격 → 로컬 되돌림 알림(시험 주입). 기본 = stderr 한 줄. */
   notice?: (line: string) => void;
 }
+
+class NoEligibleOwnerCodexAccountError extends Error {}
 
 /**
  * HARNESS-PARENT-ON-MSB1 — 켜져 있고 발사 전 점검이 통과하면 원격(ssh)에서 부모를 띄운다(PR 까지만 · 병합은 HQ).
@@ -185,6 +192,52 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
     try { debug.log('task-agent', 'parent-host-fallback', { host: target.host, runId: context.runId, gaps, facts }); } catch { /* fail-soft */ }
     notice(`[parent-host] ${target.host} 로 못 띄움 — ${multi ? '다음 호스트 또는 로컬 발사로 간다' : '로컬 발사로 간다'}: ${gaps.join(' · ')}`);
   };
+  let accessMirror: { elanousAuth: string; codexAuth: string; account?: string; usedPercent?: number; thresholdPercent?: number } | null | undefined;
+  const getAccessMirror = async (): Promise<{ elanousAuth: string; codexAuth: string; account?: string; usedPercent?: number; thresholdPercent?: number } | null> => {
+    if (accessMirror !== undefined) return accessMirror;
+    if (deps.codexAccessMirror) {
+      accessMirror = await deps.codexAccessMirror();
+      return accessMirror;
+    }
+    const [pod, authStore, codex, hq] = await Promise.all([
+      import('../task-orchestrator/surfaces/self-implement-pod.js'),
+      import('../oauth/store.js'),
+      import('../oauth/codex.js'),
+      import('../hq/hq.js'),
+    ]);
+    const { inspectCodexRotation } = await import('../oauth/codex-account-store.js');
+    const { planOwnerCodexMirrorCandidates, podAccountThresholdPercent } = await import('../task-orchestrator/surfaces/pod-account-broker.js');
+    const { getUserConfig } = await import('../user-config.js');
+    const rotation = deps.ownerCodexRotation?.() ?? inspectCodexRotation();
+    const config = getUserConfig();
+    const ownerConfig = deps.ownerCodexRotationConfig;
+    const candidates = [...rotation.candidates];
+    const eligible = planOwnerCodexMirrorCandidates(candidates, {
+      accountOrder: ownerConfig?.accountOrder ?? config.llm?.codexAccountOrder ?? [],
+      thresholdPercentByAccount: ownerConfig?.thresholdPercentByAccount ?? config.llm?.codexAccountRotationThresholdPercentByAccount,
+    });
+    if (candidates.length > 0 && eligible.length === 0) throw new NoEligibleOwnerCodexAccountError('HQ 소유 Codex 계정이 모두 사용 임계에 도달해 원격 부모 발사를 거부한다');
+    const prerefreshDeps = {
+      credentials: (account: string) => pod.hostCredentials(account, authStore.authStorePath(), () => '', { requireExplicitChatgptAuthMode: true }),
+      refresh: (account: string) => codex.refreshCodexAccountHome(account),
+      isLeaseHolder: () => hq.hqFenceDecision('ledger-cli').run,
+    };
+    for (const candidate of eligible) {
+      // The account's refresh token stays on HQ. Only the selected account's access-only mirror crosses SSH.
+      let credential: Awaited<ReturnType<typeof pod.podCodexCredentialWithPrerefresh>> = null;
+      try { credential = await pod.podCodexCredentialWithPrerefresh(candidate.name, prerefreshDeps); }
+      catch { continue; }
+      if (!credential) continue;
+      accessMirror = { elanousAuth: credential.elanousAuth, codexAuth: credential.codexAuth, account: candidate.name,
+        ...(candidate.usedPercent !== undefined ? { usedPercent: candidate.usedPercent } : {}),
+        thresholdPercent: podAccountThresholdPercent(candidate.name, {
+          thresholdPercentByAccount: ownerConfig?.thresholdPercentByAccount ?? config.llm?.codexAccountRotationThresholdPercentByAccount,
+        }) };
+      return accessMirror;
+    }
+    accessMirror = null;
+    return accessMirror;
+  };
   if (cwd) {
     failed(targets[0]!, ['project-target-is-local']);
     return null;
@@ -204,8 +257,37 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
       launchHoldActive = readLandingFreeze(prodInstanceRoot())?.holdLaunches === true;
     }
   } catch { launchHoldActive = true; /* 못 읽으면 막힌 것으로(fail-closed) */ }
-  const capacities = Object.fromEntries(multi ? targets.map((target) => [target.host, parentHostModule.readParentHostCapacity(target, deps.ssh)]) : []);
-  const ordered = multi ? parentHostModule.orderParentHosts(targets, context.runId, capacities) : targets;
+  const podGoal = context.substrate === 'pod' ? context.podGoal : undefined;
+  // 부모에서 잰 메모리 선택자만 원격 자식에도 넘긴다. 로컬의 나머지 환경·자격은 SSH 로 복사하지 않는다.
+  const remoteEnv = { ...context.env };
+  // These labels describe an HQ-selected Codex access mirror; never forward an inherited label by itself.
+  delete remoteEnv.ELANOUS_REMOTE_CODEX_ACCOUNT;
+  delete remoteEnv.ELANOUS_REMOTE_CODEX_USED_PERCENT;
+  delete remoteEnv.ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT;
+  if (podGoal) for (const key of ['ELANOUS_POD_MEMORY_TIER', 'ELANOUS_POD_MEMORY', 'ELANOUS_POD_MEMORY_HIGH', 'ELANOUS_POD_MEMORY_LITE', 'ELANOUS_POD_GOAL_TYPE'] as const) {
+    const value = context.env[key] ?? process.env[key];
+    if (value !== undefined) remoteEnv[key] = value;
+  }
+  const memoryLimit = podGoal ? (await import('../task-orchestrator/surfaces/self-implement-pod.js')).podMemoryLimitFor(podGoal, remoteEnv).limit : undefined;
+  const fits = Object.fromEntries(targets.map((target) => {
+    const fit = memoryLimit
+      ? parentHostModule.readParentHostPodFit(target, memoryLimit, deps.ssh)
+      : { state: 'unmeasured' as const, memoryLimit: '', requiredBytes: null, allocatableBytes: null, reason: 'pod-context-unmeasured' };
+    try { debug.log('task-agent.parent-host', 'pod-fit', { host: target.host, runId: context.runId, ...fit }); } catch { /* fail-soft */ }
+    if (fit.state === 'never-fits') notice(`[parent-host] ${target.host} 제외 — ${fit.reason}: Pod ${fit.memoryLimit} (${fit.requiredBytes} bytes) > node allocatable ${fit.allocatableBytes} bytes`);
+    return [target.host, fit];
+  }));
+  const eligible = targets.filter((target) => fits[target.host]?.state !== 'never-fits');
+  if (!eligible.length) {
+    const details = targets.map((target) => `${target.host}: Pod ${fits[target.host]!.memoryLimit} (${fits[target.host]!.requiredBytes} bytes) > node allocatable ${fits[target.host]!.allocatableBytes} bytes`).join(' · ');
+    throw new Error(`parent-host memory-never-fits — ${details}; local fallback refused`);
+  }
+  const capacities = Object.fromEntries(multi ? eligible.map((target) => [target.host, parentHostModule.readParentHostCapacity(target, deps.ssh)]) : []);
+  const measured = eligible.filter((target) => fits[target.host]?.state === 'fits');
+  const unknown = eligible.filter((target) => fits[target.host]?.state !== 'fits');
+  const ordered = multi
+    ? [...parentHostModule.orderParentHosts(measured, context.runId, capacities), ...parentHostModule.orderParentHosts(unknown, context.runId, capacities)]
+    : eligible;
   for (const target of ordered) {
     if (multi && (!capacities[target.host] || capacities[target.host]!.approvalHeadroom <= 0)) {
       failed(target, ['capacity-unavailable']);
@@ -217,7 +299,27 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
     if (!preflight.ok) { failed(target, preflight.gaps, preflight.facts); continue; }
     if (preflight.warnings.length) notice(`⚠ ${target.host} 자격: ${preflight.warnings.join(' · ')}`);
     try {
-      const launched = parentHostModule.launchRemoteParent(target, args, context.env, deps.ssh);
+      if (parentHostModule.shouldInstallRemoteCodexAccess(context.effectiveChildProvider)) {
+        let mirror: { elanousAuth: string; codexAuth: string; account?: string; usedPercent?: number; thresholdPercent?: number } | null = null;
+        let mirrorReason = 'credential-source-empty';
+        try { mirror = await getAccessMirror(); }
+        catch (error) {
+          if (error instanceof NoEligibleOwnerCodexAccountError) throw error;
+          mirrorReason = 'credential-source-error';
+        }
+        if (mirror) parentHostModule.installRemoteCodexAccess(target, mirror, deps.ssh);
+        else {
+          try { debug.log('task-agent.parent-host', 'codex-access-mirror-unavailable', { host: target.host, runId: context.runId, reason: mirrorReason }); } catch { /* fail-soft */ }
+          failed(target, ['codex-access-mirror-unavailable']);
+          return null;
+        }
+        if (mirror.account) {
+          remoteEnv.ELANOUS_REMOTE_CODEX_ACCOUNT = mirror.account;
+          remoteEnv.ELANOUS_REMOTE_CODEX_USED_PERCENT = mirror.usedPercent === undefined ? 'unknown' : String(mirror.usedPercent);
+          if (mirror.thresholdPercent !== undefined) remoteEnv.ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT = String(mirror.thresholdPercent);
+        }
+      }
+      const launched = parentHostModule.launchRemoteParent(target, args, remoteEnv, deps.ssh);
       try { debug.log('task-agent', 'parent-host-launched', { host: target.host, runId: context.runId, pid: launched.pid, log: launched.log }); } catch { /* fail-soft */ }
       return { runId: context.runId, parentHost: { host: target.host, ...(target.configDir ? { configDir: target.configDir } : {}), pid: launched.pid, log: launched.log } };
     } catch (error) {
@@ -398,6 +500,7 @@ function taskCardLines(card: TaskCard): string[] {
   return [
     [card.id, card.status, card.seat ?? '-', card.checklistId ?? '-', card.createdAt, card.text].join('\t'),
     ...cardIdentityLines(card),
+    ...(card.targetPaths !== undefined ? [`대상 경로: ${card.targetPaths.length ? card.targetPaths.join(' · ') : '(유효한 경로 없음)'}`] : []),
     ...(card.mission ? [`미션: ${card.mission} · after: ${card.after?.length ? card.after.join(', ') : '-'}`] : []),
     ...runLinkLine(card),
     ...liveMoveLines(card),
@@ -1578,7 +1681,45 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
             : {});
           try { debug.log('task-agent', 'remote-rejudge-bind', binding); } catch { /* fail-soft */ }
         }
-        ids = id ? [id] : rejudgeCandidates(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {});
+        if (id) ids = [id];
+        else {
+          const maxAgeHours = (await import('../user-config.js')).getUserConfig().taskAgent?.rejudgeMaxAgeHours ?? 72;
+          const cards = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {};
+          const candidates = rejudgeCandidates(cards, { maxAgeHours, onAgeSkip: (card, ageHours) => {
+            try { debug.log('task-agent', 'rejudge-age-skip', { card: card.id, ageHours, maxAgeHours }); } catch { /* fail-soft */ }
+          } });
+          const { capturedLandReview } = await import('../task-agent/review-result-capture.js');
+          const { defaultPrHead, defaultReviewRepoCandidates } = await import('../task-agent/live-moves.js');
+          const currentHeads = new Map<string, string>();
+          // Priority is a hint, not a gate. Consider only the three newest candidates;
+          // a non-mf0 card still consumes one of those three places. Everyone else runs in age order.
+          const priorityCandidates = candidates.slice(0, 3);
+          let headProbes = 0;
+          for (const cardId of priorityCandidates) {
+            const card = cards[cardId];
+            if (!card || typeof card.pr !== 'object' || !card.pr?.url) continue;
+            const pr = card.pr.number;
+            const lastHead = card.reviewRequests?.filter((entry) => entry.pr === pr).at(-1)?.head;
+            if (!lastHead || capturedLandReview(card, pr, lastHead)?.mustFixCount !== 0) continue;
+            let repos: readonly import('../task-agent/live-moves.js').ReviewRepoCandidate[] = [];
+            try { repos = (deps.rejudge?.live?.repoCandidates ?? defaultReviewRepoCandidates)(card); } catch { /* no trusted repo */ }
+            const repo = repos[0];
+            if (!repo) continue;
+            headProbes++;
+            let view: Awaited<ReturnType<typeof defaultPrHead>>;
+            try { view = await (deps.rejudge?.live?.prHead
+              ? deps.rejudge.live.prHead(pr, repo.cwd)
+              : defaultPrHead(pr, repo.cwd, (args, options) => spawnSync('gh', args, {
+                encoding: 'utf8', timeout: 3_000, env: options.env, ...(options.cwd ? { cwd: options.cwd } : {}),
+              }))); } catch { view = null; }
+            if (view?.state === 'OPEN' && view.url === card.pr.url) currentHeads.set(cardId, view.head);
+          }
+          if (candidates.length > priorityCandidates.length) {
+            try { debug.log('task-agent', 'rejudge-head-priority-probe-cap', { considered: priorityCandidates.length,
+              probed: headProbes, totalCandidates: candidates.length, max: 3 }); } catch { /* fail-soft */ }
+          }
+          ids = rejudgeCandidates(cards, { maxAgeHours, currentHeads });
+        }
       } catch (error) {
         out(error instanceof Error ? error.message : '과제 카드 읽기 실패'); process.exitCode = 1; return;
       }
@@ -1586,6 +1727,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
       const liveMoves = deps.rejudge?.liveMoves ?? await configuredTaskAgentLiveMoves();
       const repairBudget = opts.all ? { max: (await import('../user-config.js')).getUserConfig().taskAgent?.repairMaxPerTick ?? 3,
         requested: 0, capped: 0 } : undefined;
+      const reviewBudget = opts.all ? { max: 1, requested: 0 } : undefined;
+      const landBudget = opts.all ? { max: 1, requested: 0 } : undefined;
       const all = [];
       for (const cardId of ids) {
         await mirrorRemoteCardLedger(cardId, deps);
@@ -1594,7 +1737,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         }
         let outcomes: Awaited<ReturnType<typeof rejudgeCardOnHead>>;
         try { outcomes = await rejudgeCardOnHead(cardId, { ...deps.rejudge, liveMoves,
-          ...(repairBudget ? { repairBudget } : {}), live: { ...deps.rejudge?.live, statePath } }); } catch (error) {
+          ...(repairBudget ? { repairBudget } : {}), ...(reviewBudget ? { reviewBudget } : {}), ...(landBudget ? { landBudget } : {}),
+          live: { ...deps.rejudge?.live, statePath } }); } catch (error) {
           // 카드 하나의 예외가 --all 의 나머지 카드 판단을 멈추지 않게 — 사유를 남기고 다음 카드로.
           const reason = (error instanceof Error ? error.message : String(error)).slice(-300);
           try { debug.log('task-agent', 'rejudge-on-head', { card: cardId, pr: null, fromHead: null, toHead: null, step: 'target', decision: 'rejudge-threw', reason }, { level: 'warn' }); } catch { /* fail-soft */ }

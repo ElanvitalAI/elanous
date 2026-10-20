@@ -3,6 +3,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statS
 import { join } from 'node:path';
 import { redactSecretText } from '../debug/log.js';
 import { refuseProductionLedgerWriteInTest } from './ledger-write-guard.js';
+import type { PodChildEvidence } from '../task-orchestrator/surfaces/self-implement.js';
 
 export interface RunExit {
   runId: string;
@@ -16,6 +17,7 @@ export interface RunExit {
   hostname?: string;
   pid?: number;
   lastLines?: string[];
+  childEvidence?: PodChildEvidence;
 }
 
 export interface IncidentBurst {
@@ -77,6 +79,8 @@ export function readRunExits(root: string): RunExit[] {
         ...(typeof row.pid === 'number' && Number.isSafeInteger(row.pid) ? { pid: row.pid } : {}),
         ...(Array.isArray(row.lastLines) && row.lastLines.every((line) => typeof line === 'string')
           ? { lastLines: row.lastLines } : {}),
+        ...(row.childEvidence && typeof row.childEvidence === 'object' && !Array.isArray(row.childEvidence)
+          ? { childEvidence: row.childEvidence } : {}),
       });
     }
   }

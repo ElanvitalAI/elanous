@@ -1182,6 +1182,8 @@ describe('TC review must-fixes (ORCH1 #23638)', () => {
 // ORCH-TA-HAND (0.2.18 · 10-08 데모): 오케스트레이터가 고른 칸을 TASK-AGENT(handTask)로 넘긴다.
 describe('ORCH-TA-HAND — delegate hands the picked cell to TASK-AGENT', () => {
   const split: TickDeps['split'] = () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }, { id: 'C2', title: '둘째 칸', seat: 'TC' }];
+  const doneBoundary = '\n완료 경계 코드: src/loops/orchestrator/tick.ts 의 TA 넘김\n완료 경계 실물: 배치된 칸이 한 번 발사되고 자리 저널은 비어 있다\n완료 경계 증거 명령: bun test src/loops/orchestrator/tick.test.ts';
+  const validSplit: TickDeps['split'] = () => [{ id: 'C1', title: `첫 칸${doneBoundary}`, seat: 'MK' }, { id: 'C2', title: `둘째 칸${doneBoundary}`, seat: 'TC' }];
   const base: TickDeps = { mode: 'live', split, placeCell: () => ({ version: '0.2.18' }), loadAdapter: async () => undefined };
   const requests = (root: string) => { const path = join(root, 'seat-requests', 'requests.jsonl'); return existsSync(path) ? readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : []; };
   // A delegate node that died mid-way is retried by the next invocation (its node mark is not «ok») — the real re-entry.
@@ -1231,7 +1233,7 @@ describe('ORCH-TA-HAND — delegate hands the picked cell to TASK-AGENT', () => 
 
   test('live: the real handTask launches once through the launcher (pod · merge-by-host) and the seat journal stays empty', async () => fixture(async (root, id, logged) => {
     const launches: string[][] = [];
-    const deps: TickDeps = { ...base, handToTaskAgent: 'live', taskLauncher: async (args) => { launches.push(args); } };
+    const deps: TickDeps = { ...base, split: validSplit, handToTaskAgent: 'live', taskLauncher: async (args) => { launches.push(args); } };
     const state = await invoke(root, 'live08', '08', deps, logged);
     expect(launches).toHaveLength(2);
     expect(launches[0]).toEqual(expect.arrayContaining(['harness', 'say', '--merge-by-host']));
@@ -1263,7 +1265,7 @@ describe('ORCH-TA-HAND — delegate hands the picked cell to TASK-AGENT', () => 
 
   test('a failed live launch stays claimed: no seat fallback and no relaunch', async () => fixture(async (root, id, logged) => {
     let attempts = 0;
-    const deps: TickDeps = { ...base, handToTaskAgent: 'live', handToTaskAgentCell: 'C1', taskLauncher: async () => { attempts++; throw new Error('spawn failed'); } };
+    const deps: TickDeps = { ...base, split: validSplit, handToTaskAgent: 'live', handToTaskAgentCell: 'C1', taskLauncher: async () => { attempts++; throw new Error('spawn failed'); } };
     const state = await invoke(root, 'fail08', '08', deps, logged);
     expect(attempts).toBe(1);
     expect(logged.some(row => row.event === 'hand-to-task-agent-failed' && row.reason.startsWith(`orch:${id}:C1:`))).toBe(true);
@@ -1369,7 +1371,8 @@ await runOrchestratorNode('delegate', { root, runId: 'shadowcrash08', window: '0
 }), 30_000);
 
 test('ORCH-TA-HAND: an injected mode still honors the configured cell filter; shadow-before-placement then live launches; a seat-delegated cell stays on the seat path', async () => fixture(async (root, id, logged) => {
-  const split: TickDeps['split'] = () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }, { id: 'C2', title: '둘째 칸', seat: 'TC' }];
+  const goal = '둘째 칸\n완료 경계 코드: src/loops/orchestrator/tick.ts 변경\n완료 경계 실물: live hand 발사\n완료 경계 증거 명령: bun test src/loops/orchestrator/tick.test.ts';
+  const split: TickDeps['split'] = () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }, { id: 'C2', title: goal, seat: 'TC' }];
   const launches: string[][] = [];
   setElanousConfigDir(root);
   resetUserConfig();
@@ -1492,7 +1495,8 @@ test('COORD-HA × ORCH-TA-HAND: a live hand uses the per-tick cap; L2 never hand
   try {
     writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { maxDelegatePerTick: 1 } } }));
     const launches: string[][] = [];
-    const split: TickDeps['split'] = () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }, { id: 'C2', title: '둘째 칸', seat: 'TC' }];
+    const goal = '첫 칸\n완료 경계 코드: src/loops/orchestrator/tick.ts 변경\n완료 경계 실물: live hand 발사\n완료 경계 증거 명령: bun test src/loops/orchestrator/tick.test.ts';
+    const split: TickDeps['split'] = () => [{ id: 'C1', title: goal, seat: 'MK' }, { id: 'C2', title: '둘째 칸', seat: 'TC' }];
     const state = await invoke(root, 'capHand', '08', { mode: 'live', split, placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined,
       handToTaskAgent: 'live', handToTaskAgentCell: 'C1', taskLauncher: async (args) => { launches.push(args); } }, logged);
     expect(launches).toHaveLength(1);

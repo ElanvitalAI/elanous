@@ -1,15 +1,18 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { bindingPhrase, bindingResource, computeVerdict, okCell, renderOverview, unmeasured, unmeasuredCells, verdictExitCode, type OverviewSnapshot } from './overview.js';
 import { collectOverview, launchableCells, ownerRows, parseEtime, parseSince, summarizeParents } from './overview-collect.js';
 import { lineTime, parseDispatcherCapacity, readDispatcherBeats, readDispatcherCapacity, readSeatEraHanded } from './overview-seat-era.js';
 import { createOverviewCache } from './overview-cache.js';
-import { mkdirSync, utimesSync } from 'node:fs';
+import { utimesSync } from 'node:fs';
 import type { Checklist, ChecklistItem } from '../release-loop/checklist.js';
 import type { TaskCard } from '../task-agent/task-hand.js';
 import { measureLandingThroughput } from '../task-agent/cover.js';
+import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
+import { openSchedulesDb, schedulesDbPath } from '../domains/schedule-registry.js';
+import { runOpsOverview } from '../cli/ops-overview-cli.js';
 
 const AT = '2026-10-08T00:30:00.000Z';
 
@@ -188,6 +191,7 @@ describe('표기 — 못 잼은 0 이 아니다', () => {
     const text = renderOverview(s, computeVerdict(s), { elapsedMs: 12 });
     expect(text).toContain('node-c 못 잼(하트비트 없음)');
     expect(text).toContain('끝 못 잼(not yet)');
+    expect(text).not.toContain('스케줄(최근 1시간)');
     expect(unmeasuredCells(s)).toEqual(['tasks.done: not yet', 'machines.node-c: 하트비트 없음']);
     expect(text.split('\n')[0]).toBe('✅ 흐름 정상 (flowing)');
     expect(text).not.toContain('처리량(');
@@ -468,5 +472,67 @@ describe('collectOverview — 주입 원천으로 끝까지', () => {
     expect(s.machines.pods[0]!.occupied.value).toBeNull();
     expect(s.landings.reason).toBe('no repo');
     expect(computeVerdict(s).verdict).toBe('unobservable');
+  });
+
+  test('cron-run production records flow through the persistent log, overview collector, cache, and renderer', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ovw-scheduler-root-'));
+    const seat = mkdtempSync(join(tmpdir(), 'ovw-scheduler-seat-'));
+    const previousStateDir = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = root;
+    mkdirSync(join(root, 'logs'), { recursive: true });
+    let store: LogStore | undefined;
+    let stopCache: (() => void) | undefined;
+    try {
+      const schedules = openSchedulesDb(schedulesDbPath());
+      schedules.run(`INSERT INTO schedule_registry (id, name, source, category, enabled, run_via)
+        VALUES ('overview-integration', 'overview-fixture', 'crontab', 'maintenance', 1, 'crontab')`);
+      schedules.close();
+      store = new LogStore(logsDbPath(), { instance: 'overview-scheduler-test' });
+      const target = join(root, 'overview-fixture.ts');
+      writeFileSync(target, 'process.exit(0);\n');
+      const producer = Bun.spawn({
+        cmd: [process.execPath, join(import.meta.dir, '../../scripts/cron-run.ts'), '--schedule-id', 'overview-integration', target],
+        cwd: join(import.meta.dir, '../..'),
+        env: { ...process.env, NODE_ENV: 'production', ELANOUS_STATE_DIR: root, ELANOUS_CONFIG_DIR: root },
+        stdout: 'pipe', stderr: 'pipe',
+      });
+      const [producerExit, producerStderr] = await Promise.all([producer.exited, new Response(producer.stderr).text()]);
+      expect(producerExit).toBe(0);
+      expect(producerStderr).not.toContain('cron-run observation');
+      const now = Date.now();
+      const collect = () => collectOverview({ sinceMs: 3_600_000, sinceLabel: '최근 1h', now, root, seatEraDir: seat }, {
+        listSchedules: () => [], listChecklist: () => ({ version: '', released: '', dev: '', history: [], items: [] }),
+        readRuns: () => [], readCards: () => [], ledger: () => [], poolSpec: () => null, ps: () => '',
+        gitLog: () => ({ lines: [], observedAt: new Date(now).toISOString() }),
+        readSchedulerRuns: (sinceMs, untilMs) => store.queryAll({ exactCategories: ['schedule.run'], sinceMs, untilMs })
+          .map(({ ts_ms, data }) => ({ ts_ms, data })),
+      });
+      const cache = createOverviewCache({ collect, measurePods: async () => [],
+        schedule: () => ({ unref() {} }) as ReturnType<typeof setInterval> });
+      stopCache = () => cache.stop();
+      const snapshot = await cache.get();
+      expect(snapshot.schedulerMetrics?.value?.scheduleRuns).toBe(1);
+      expect(snapshot.schedulerMetrics).toMatchObject({
+        status: 'ok', source: expect.stringContaining('전체 Bun 기동 아님'),
+        value: { scheduleRuns: 1, bunLaunches: 1, bunLaunchesLast24h: 1 },
+      });
+      const rendered = renderOverview(snapshot, computeVerdict(snapshot), { elapsedMs: 12 });
+      expect(rendered).toContain('스케줄 로그 기록(최근 1시간)');
+      expect(rendered).toContain('schedule.run 1건 · crontab 경유 기록 1건');
+      expect(rendered).toContain('최근 24h crontab 경유 기록 1건');
+      const cliLines: string[] = [];
+      const originalLog = console.log;
+      console.log = (...args: unknown[]) => { cliLines.push(args.map(String).join(' ')); };
+      try { await runOpsOverview({}); } finally { console.log = originalLog; }
+      expect(cliLines.join('\n')).toContain('스케줄 로그 기록(최근 1시간)');
+      expect(cliLines.join('\n')).toContain('schedule.run 1건 · crontab 경유 기록 1건');
+    } finally {
+      stopCache?.();
+      store?.close();
+      if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousStateDir;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(seat, { recursive: true, force: true });
+    }
   });
 });

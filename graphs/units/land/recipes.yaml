@@ -1,0 +1,3 @@
+land-enqueue:
+  command: 'bun scripts/graph-units/land-enqueue.ts'
+  timeout_ms: 60000

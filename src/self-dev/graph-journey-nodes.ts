@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { debug } from '../debug/log.js';
+import type { FrontNodeId } from './graph-front-nodes.js';
+import type { PipelineNodeId } from '../self-implement/pipeline-shape.js';
 import { GRAPH_SPECS, GRAPH_TEMPLATES, GRAPH_TEMPLATES_SOURCE, pipelineNodeEntryPayload, templateForGoalType, type GraphTemplate } from '../self-implement/graph-templates.js';
 import type { GoalType } from '../self-implement/goal-author.js';
 
@@ -42,6 +44,8 @@ export const JOURNEY_NODE_IDS = [
   'stopped',
 ] as const;
 export type JourneyNodeId = typeof JOURNEY_NODE_IDS[number];
+/** Existing author/front and self-implement pipeline nodes may use the same observation helpers. */
+export type JourneyObservationNodeId = JourneyNodeId | FrontNodeId | PipelineNodeId;
 
 export const JOURNEY_KEY_ENV = 'ELANOUS_JOURNEY_KEY';
 const QUEUE_LAUNCH_ENV = 'ELANOUS_HARNESS_QUEUE_LAUNCH';
@@ -81,7 +85,7 @@ export interface JourneyObservation {
   readonly data?: Readonly<Record<string, unknown>>;
 }
 
-function emit(entry: boolean, node: JourneyNodeId, o: JourneyObservation): void {
+function emit(entry: boolean, node: JourneyObservationNodeId, o: JourneyObservation): void {
   try {
     const template = journeyTemplate(node, o.goalType);
     const runId = o.runId ?? process.env[RUN_ID_ENV]?.trim();
@@ -104,14 +108,14 @@ function emit(entry: boolean, node: JourneyNodeId, o: JourneyObservation): void 
 }
 
 /** 노드 진입. */
-export function enterJourneyNode(node: JourneyNodeId, o: JourneyObservation): void {
+export function enterJourneyNode(node: JourneyObservationNodeId, o: JourneyObservation): void {
   emit(true, node, o);
 }
 
 /** 노드 출구 — `outcome` 이 그 노드에서 나간 간선의 라벨(YAML `map` 키)이다.
  *  ⭐ 그 라벨이 선언에서 종결 노드 `stopped` 로 가면 `stopped` 진입도 남긴다 — 거절·포기 런이 «선언된 종결점»에서 끝난다.
  *  `outcome: 'error'` = 노드 안 작업이 예외를 던졌다(예외는 호출자에게 그대로 간다). */
-export function exitJourneyNode(node: JourneyNodeId, o: JourneyObservation & { readonly outcome: string }): void {
+export function exitJourneyNode(node: JourneyObservationNodeId, o: JourneyObservation & { readonly outcome: string }): void {
   emit(false, node, o);
   if (node !== 'stopped' && journeyEdgeTarget(node, o.outcome) === 'stopped') {
     const { outcome: _outcome, ...rest } = o;
@@ -130,7 +134,7 @@ export function journeyEdgeTarget(from: string, label: string): string | undefin
 }
 
 /** 노드 안 작업을 감싼다 — 예외면 출구 `error` 를 남기고 다시 던진다(진입 뒤 출구가 빠지지 않게). */
-export function withJourneyNode<T>(node: JourneyNodeId, o: JourneyObservation, work: () => Promise<T>): Promise<T> {
+export function withJourneyNode<T>(node: JourneyObservationNodeId, o: JourneyObservation, work: () => Promise<T>): Promise<T> {
   const onError = (error: unknown): void => {
     exitJourneyNode(node, { ...o, outcome: 'error', data: { ...o.data, error: error instanceof Error ? error.message : String(error) } });
   };
@@ -144,7 +148,7 @@ export function withJourneyNode<T>(node: JourneyNodeId, o: JourneyObservation, w
 }
 
 /** 동기 판. */
-export function withJourneyNodeSync<T>(node: JourneyNodeId, o: JourneyObservation, work: () => T): T {
+export function withJourneyNodeSync<T>(node: JourneyObservationNodeId, o: JourneyObservation, work: () => T): T {
   try { return work(); }
   catch (error) {
     exitJourneyNode(node, { ...o, outcome: 'error', data: { ...o.data, error: error instanceof Error ? error.message : String(error) } });
@@ -153,7 +157,7 @@ export function withJourneyNodeSync<T>(node: JourneyNodeId, o: JourneyObservatio
 }
 
 /** 진입·출구를 한 번에 — 판정만 하는 노드(대기 없는 관문)용. */
-export function passJourneyNode(node: JourneyNodeId, o: JourneyObservation & { readonly outcome: string }): void {
+export function passJourneyNode(node: JourneyObservationNodeId, o: JourneyObservation & { readonly outcome: string }): void {
   enterJourneyNode(node, o);
   exitJourneyNode(node, o);
 }

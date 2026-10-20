@@ -5,8 +5,8 @@
 //   - truncation at MAX_EXTRACT_BYTES
 //   - extractXlsx (workbook built in memory, written via XLSX.writeFile)
 //
-// PDF + DOCX extractors are verified manually — no good way to generate
-// a minimal valid fixture for either without extra deps.
+// DOCX extraction is verified manually. A minimal PDF fixture is generated
+// below to exercise the lazy parser on an actual PDF, without extra deps.
 
 import { describe, test, expect, afterAll } from 'bun:test';
 import { writeFileSync, unlinkSync, mkdtempSync, rmSync } from 'fs';
@@ -18,6 +18,7 @@ import sharp from 'sharp';
 
 import {
   readText,
+  extractPdf,
   extractXlsx,
   loadAttachment,
   loadAllAttachments,
@@ -94,7 +95,40 @@ describe('readText', () => {
 });
 
 // ═══════════════════════════════════════════
-// 2. extractXlsx
+// 2. extractPdf — parser imports only on PDF requests
+// ═══════════════════════════════════════════
+
+test('extractPdf loads the renderer on demand and reads a real PDF', async () => {
+  // A small PDF with a single Helvetica text object, no PDF writer dependency.
+  const chunks: Buffer[] = [Buffer.from('%PDF-1.4\n')];
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    (() => {
+      const stream = 'BT /F1 18 Tf 25 150 Td (Lazy PDF smoke) Tj ET\n';
+      return `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}endstream`;
+    })(),
+  ];
+  const offsets = [0];
+  for (const [index, body] of objects.entries()) {
+    offsets.push(Buffer.concat(chunks).length);
+    chunks.push(Buffer.from(`${index + 1} 0 obj\n${body}\nendobj\n`));
+  }
+  const xref = Buffer.concat(chunks).length;
+  chunks.push(Buffer.from(`xref\n0 ${offsets.length}\n0000000000 65535 f \n`));
+  for (const offset of offsets.slice(1)) chunks.push(Buffer.from(`${String(offset).padStart(10, '0')} 00000 n \n`));
+  chunks.push(Buffer.from(`trailer\n<< /Size ${offsets.length} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`));
+  const p = tmpPath('lazy.pdf');
+  writeFileSync(p, Buffer.concat(chunks));
+  const result = await extractPdf(p);
+  expect(result.text).toContain('Lazy PDF smoke');
+  expect(result.meta?.pages).toBe(1);
+});
+
+// ═══════════════════════════════════════════
+// 3. extractXlsx
 // ═══════════════════════════════════════════
 
 describe('extractXlsx', () => {

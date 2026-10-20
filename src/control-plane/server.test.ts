@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { allowedControlHostname, DEFAULT_CONTROL_PORT, ensureControlTokens, startControlServer } from './server.js';
@@ -41,9 +41,10 @@ test('warm worker lease API fences attempts and keeps the shared ledger authorit
   const { root, tokens, call } = setup(heldPrimary);
   const hostToken = issueMemberToken('local', root);
   const key = { context: 'local', imageDigest: 'sha256:image', lockHash: 'lock-a', architecture: 'arm64' };
-  const worker = { workerId: 'worker-1', machine: 'local', key, ttlMs: 30_000 };
+  const worker = { workerId: 'worker-1', machine: 'local', podUid: 'pod-uid-1', key, ttlMs: 30_000 };
   expect((await call('/v1/workers/pod', tokens.query, 'POST', worker)).status).toBe(403);
   expect((await call('/v1/workers/pod', tokens.member, 'POST', worker)).status).toBe(403);
+  expect((await call('/v1/workers/pod', hostToken, 'POST', { ...worker, podUid: '' })).status).toBe(400);
   expect((await call('/v1/resources/register', tokens.member, 'POST', {
     id: 'pod-worker-lease:worker-1', kind: 'pod-worker-lease', machine: 'local', name: 'worker-1', attrs: {}, ttlMs: 30_000,
   })).status).toBe(403);
@@ -56,6 +57,8 @@ test('warm worker lease API fences attempts and keeps the shared ledger authorit
   expect((await call('/v1/leases/pod-worker', tokens.member, 'POST', { machine: 'local', key, runId: 'run-2', attemptId: 'attempt-2', ttlMs: 10_000 })).status).toBe(409);
   const observed = await (await call('/v1/resources?kind=pod-worker-lease', tokens.query)).json() as { resources: Array<{ attrs: Record<string, unknown> }> };
   expect(observed.resources).toHaveLength(1);
+  expect(observed.resources[0]!.attrs.podUid).toBe('pod-uid-1');
+  expect(observed.resources[0]!.attrs.idleTtlMs).toBe(30_000);
   expect(observed.resources[0]!.attrs.leaseId).toBeUndefined();
   expect(observed.resources[0]!.attrs.runId).toBeUndefined();
   expect(observed.resources[0]!.attrs.attemptId).toBeUndefined();
@@ -76,11 +79,51 @@ test('warm worker writes fail closed when there is no primary observation', asyn
   const { root, tokens, call } = setup();
   const host = issueMemberToken('local', root);
   const key = { context: 'local', imageDigest: 'sha256:image', lockHash: 'lock', architecture: 'arm64' };
-  const response = await call('/v1/workers/pod', host, 'POST', { workerId: 'worker-1', machine: 'local', key, ttlMs: 30_000 });
+  const response = await call('/v1/workers/pod', host, 'POST', { workerId: 'worker-1', machine: 'local', podUid: 'pod-uid-1', key, ttlMs: 30_000 });
   expect(response.status).toBe(409);
   expect(await response.json()).toEqual({ error: 'primary-unmeasured' });
   expect((await call('/v1/leases/pod-worker', tokens.member, 'POST', { machine: 'local', key, runId: 'r', attemptId: 'a', ttlMs: 10_000 })).status).toBe(409);
   expect(new ResourceLedger(root).list({ kind: 'pod-worker-lease' })).toEqual([]);
+});
+
+test('a legacy idle worker row without Pod UID cannot be allocated through the lease API', async () => {
+  const { root, tokens, call } = setup(heldPrimary);
+  const key = { context: 'local', imageDigest: 'sha256:image', lockHash: 'lock', architecture: 'arm64' };
+  const ledger = new ResourceLedger(root);
+  ledger.registerPodWorker({ workerId: 'legacy-worker', machine: 'local', podUid: 'old-uid', key, owner: 'host', ttlMs: 30_000 });
+  const rows = JSON.parse(readFileSync(ledger.path, 'utf8')) as Array<{ attrs: Record<string, unknown> }>;
+  delete rows[0]!.attrs.podUid;
+  writeFileSync(ledger.path, JSON.stringify(rows));
+  const response = await call('/v1/leases/pod-worker', tokens.member, 'POST', {
+    machine: 'local', key, runId: 'run', attemptId: 'attempt', ttlMs: 10_000,
+  });
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({ error: 'no-warm-worker' });
+  expect(new ResourceLedger(root).list({ kind: 'pod-worker-lease' })[0]?.attrs.state).toBe('idle');
+});
+
+test('same worker ID cannot register a different or missing Pod UID and leaves the ledger unchanged', async () => {
+  const { root, call } = setup(heldPrimary);
+  const host = issueMemberToken('local', root);
+  const key = { context: 'local', imageDigest: 'sha256:image', lockHash: 'lock', architecture: 'arm64' };
+  const body = { workerId: 'worker-uid-fence', machine: 'local', podUid: 'first-uid', key, ttlMs: 30_000 };
+  expect((await call('/v1/workers/pod', host, 'POST', body)).status).toBe(200);
+  const ledger = new ResourceLedger(root);
+  const original = readFileSync(ledger.path, 'utf8');
+  for (const podUid of ['first-uid', 'replacement-uid']) {
+    const response = await call('/v1/workers/pod', host, 'POST', { ...body, podUid });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: 'worker-id-used' });
+    expect(readFileSync(ledger.path, 'utf8')).toBe(original);
+  }
+  const legacy = JSON.parse(original) as Array<{ attrs: Record<string, unknown> }>;
+  delete legacy[0]!.attrs.podUid;
+  writeFileSync(ledger.path, JSON.stringify(legacy));
+  const before = readFileSync(ledger.path, 'utf8');
+  const response = await call('/v1/workers/pod', host, 'POST', { ...body, podUid: 'replacement-uid' });
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({ error: 'worker-id-used' });
+  expect(readFileSync(ledger.path, 'utf8')).toBe(before);
 });
 
 test('warm allocation rechecks primary after the request body instead of writing with an old generation', async () => {
@@ -88,7 +131,7 @@ test('warm allocation rechecks primary after the request body instead of writing
   roots.push(root);
   const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock', architecture: 'arm64' };
   const ledger = new ResourceLedger(root);
-  ledger.registerPodWorker({ workerId: 'worker-1', machine: 'node-c', key, owner: 'host', ttlMs: 30_000 });
+  ledger.registerPodWorker({ workerId: 'worker-1', machine: 'node-c', podUid: 'pod-uid-1', key, owner: 'host', ttlMs: 30_000 });
   const control = startControlServer({ root, port: 0, requireKnownLeaseForWrites: true,
     leaseView: { async get(options) { return options?.fresh
       ? { holder: 'other', generation: 2, iAmHolder: false, known: true }
@@ -110,7 +153,7 @@ test('warm allocation rejects a primary change while waiting for the ledger lock
   roots.push(root);
   const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock', architecture: 'arm64' };
   const ledger = new ResourceLedger(root);
-  ledger.registerPodWorker({ workerId: 'worker-1', machine: 'node-c', key, owner: 'host', ttlMs: 30_000 });
+  ledger.registerPodWorker({ workerId: 'worker-1', machine: 'node-c', podUid: 'pod-uid-1', key, owner: 'host', ttlMs: 30_000 });
   let currentGeneration = 1;
   let freshReads = 0;
   const control = startControlServer({ root, port: 0, requireKnownLeaseForWrites: true,
@@ -152,7 +195,7 @@ test('a slow guarded primary read queues ordinary resource writes instead of fai
   const { root, tokens, call } = setup(primary);
   const key = { context: 'local', imageDigest: 'sha256:image', lockHash: 'lock', architecture: 'arm64' };
   const workerWrite = call('/v1/workers/pod', issueMemberToken('local', root), 'POST',
-    { workerId: 'worker-queue', machine: 'local', key, ttlMs: 30_000 });
+    { workerId: 'worker-queue', machine: 'local', podUid: 'pod-uid-1', key, ttlMs: 30_000 });
   await waiting;
   const ordinaryWrite = call('/v1/resources/register', tokens.member, 'POST', record);
   await Bun.sleep(30);
@@ -418,12 +461,12 @@ test('binding rejects public and wildcard hosts before startup and accepts only 
 
 test('machine tokens only write their machine and keep ownership after reissue', async () => {
   const { root, tokens, call } = setup();
-  const node-b = issueMemberToken('node-b', root);
+  const gateMember = issueMemberToken('node-b', root);
   const mbp = issueMemberToken('mbp', root);
   const own = { ...record, machine: 'node-b' };
-  expect((await call('/v1/resources/register', node-b, 'POST', own)).status).toBe(200);
+  expect((await call('/v1/resources/register', gateMember, 'POST', own)).status).toBe(200);
   const owner = createHash('sha256').update('machine:node-b').digest('hex');
-  const listed = await call('/v1/resources', node-b);
+  const listed = await call('/v1/resources', gateMember);
   expect(listed.status).toBe(200);
   expect((await listed.json() as { resources: Array<{ owner: string }> }).resources[0]?.owner).toBe(owner);
   const other = { ...record, id: 'mbp1', machine: 'mbp' };
@@ -435,13 +478,13 @@ test('machine tokens only write their machine and keep ownership after reissue',
     ['/v1/resources/mbp1', 'DELETE', undefined],
     ['/v1/resources/i1/heartbeat', 'POST', { machine: 'mbp' }],
   ] as const) {
-    const response = await call(path, node-b, method, body);
+    const response = await call(path, gateMember, method, body);
     expect(response.status).toBe(403);
     expect(await response.json()).toEqual({ error: 'machine-scope' });
   }
-  expect((await call('/v1/resources/i1/heartbeat', node-b, 'POST', {})).status).toBe(200);
+  expect((await call('/v1/resources/i1/heartbeat', gateMember, 'POST', {})).status).toBe(200);
   const next = issueMemberToken('node-b', root);
-  expect((await call('/v1/resources', node-b)).status).toBe(401);
+  expect((await call('/v1/resources', gateMember)).status).toBe(401);
   const updated = await call('/v1/resources/register', next, 'POST', { ...own, name: 'new-name' });
   expect(updated.status).toBe(200);
   expect((await updated.json() as { owner: string }).owner).toBe(owner);
@@ -451,13 +494,13 @@ test('machine tokens only write their machine and keep ownership after reissue',
 
 test('machine-scoped port leases reject other machines on allocation and target operations', async () => {
   const { root, call } = setup();
-  const node-b = issueMemberToken('node-b', root);
+  const gateMember = issueMemberToken('node-b', root);
   const mbp = issueMemberToken('mbp', root);
   const request = { machine: 'node-b', purpose: 'test', ttlMs: 30_000 };
-  const rejected = await call('/v1/leases/port', node-b, 'POST', { ...request, machine: 'mbp' });
+  const rejected = await call('/v1/leases/port', gateMember, 'POST', { ...request, machine: 'mbp' });
   expect(rejected.status).toBe(403);
   expect(await rejected.json()).toEqual({ error: 'machine-scope' });
-  const allocated = await call('/v1/leases/port', node-b, 'POST', request);
+  const allocated = await call('/v1/leases/port', gateMember, 'POST', request);
   expect(allocated.status).toBe(200);
   const { port, lease } = await allocated.json() as { port: number; lease: { owner: string; attrs: { leaseId: string } } };
   expect(lease.owner).toBe(createHash('sha256').update('machine:node-b').digest('hex'));

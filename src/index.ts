@@ -6,7 +6,6 @@ import { accessSync, constants as fsConstants, existsSync, lstatSync, readFileSy
 import type { SelfDevRunParticipant, SelfDevRunState } from './self-dev/run-store.js';
 import { applyConfigDirFlagFromArgv } from './cli/config-dir-flag.js';
 import { LOGS_SINCE_OPTION, registerLogsCommands } from './cli/logs-cli.js';
-import { registerSimCommands } from './cli/sim-cli.js';
 import { registerDocsCommands } from './cli/docs-cli.js';
 import { registerBenchCommands } from './cli/bench-cli.js';
 import { registerRetroCommands } from './cli/retro-cli.js';
@@ -45,7 +44,6 @@ import { applyTestFlagFromArgv, observeTestFlagOwnership, uncoveredTestFlagPaths
 import { registerPtyTakeoverCommands } from './cli/pty-takeover-cli.js';
 import { registerPtyRecordCommand } from './cli/pty-record-cli.js';
 import { registerLeaderCommands } from './cli/leader-cli.js';
-import { registerPrCommands } from './cli/pr-cli.js';
 import { registerRepoCommands } from './cli/repo-cli.js';
 import { registerAgentCommands, runChatTurnCli, emitDetachedProgress } from './cli/agent-cli.js';
 export { runChatTurnCli, buildCliAgentTools, setCliAgentDispatchForTesting, emitDetachedProgress, emitHarnessFeedbackProgress } from './cli/agent-cli.js';
@@ -917,7 +915,114 @@ async function runDevSayFromWords(
 
 registerPtyTakeoverCommands(program);
 registerPtyRecordCommand(program.commands.find((command) => command.name() === 'pty')!);
-registerPrCommands(program);
+// Keep the public PR help slot but defer its large CI/landing import graph
+// until the PR command is actually selected (including direct Commander use).
+const prCommandOrder = program.commands.length;
+const prShell = program.command('pr').description('PR landing commands');
+// The exported Commander tree is also the public entrance inventory. Keep its
+// lightweight declarations visible without importing the CI/landing graph.
+prShell.command('supersede-drafts').description('확인된 병합 PR의 명시 Supersedes 같은 칸 draft만 정리')
+  .requiredOption('--pr <number>', '병합 PR 번호')
+  .option('--cwd <path>', '저장소 경로');
+prShell.command('census').description('열린 PR 전체·골 문서만·2일 무커밋 draft·미닫힌 superseded 집계').option('--cwd <path>', '저장소 경로');
+prShell.command('open-guard').description('새 PR 전에 같은 파일 OPEN PR·골 문서만·자리별 상한 검사')
+  .option('--cwd <path>', '작업 트리 경로').option('--base <ref>', '비교 base ref', 'origin/main')
+  .option('--seat <seat>', 'PR 소유 자리(OP|TC|MK|UX)').option('--cell <id>', '릴리스 칸 id (같은 칸 OPEN PR 검사)')
+  .option('--seat-cap <number>', '자리별 열린 PR 경고 상한', '30');
+const prQueueShell = prShell.command('queue').description('Shadow merge queue (never lands PRs)');
+prQueueShell.command('status').description('Show pending PRs and shadow verdicts');
+prQueueShell.command('enqueue <pr>').description('Pin a ready PR at the tail of the shadow queue');
+prQueueShell.command('run').description('Evaluate the first PR without merging').requiredOption('--shadow', 'Only evaluate; never land');
+prShell.command('land').description('현재 브랜치 PR을 생성 또는 갱신해 ready 상태로 만들고 squash merge')
+  .option('--base <branch>', 'PR base branch').option('--cwd <path>', '작업 트리 경로')
+  .option('--pr <number>', '기존 PR 번호 고정 (--expected-head 와 함께)')
+  .option('--expected-head <sha>', '리뷰된 PR 머리 SHA 고정 (--pr 와 함께)')
+  .option('--heavy-remote', '머리 고정 착지의 무거운 게이트를 node-b·node-c 중 빈 호스트에서 실행; head⊕main 증거가 없거나 실패하면 거부(로컬 폴백 없음)')
+  .option('--heavy-on-pod-shadow', '--heavy-remote 판정을 유지하고 같은 head/main의 Pod 타입·변경 시험 결과를 비교만 한다')
+  .option('--dry-run', '변경 없이 landing 계획만 출력').option('--hold', 'PR을 생성 또는 갱신한 뒤 병합하지 않고 쌓아 둔다')
+  .option('--title <title>', 'PR title').option('--title-file <path>', 'PR title file')
+  .option('--body <body>', 'PR body').option('--body-file <path>', 'PR body file')
+  .option('--commit-message <message>', 'upsert commit message')
+  .option('--commit-message-file <path>', 'upsert commit message file (takes precedence over --commit-message)')
+  .option('--include-active-run-files', '도는 런 파일을 이번 착지에 포함 (기본 동작)')
+  .option('--exclude-active-run-files', '도는 런과 겹친 파일을 이번 착지에서 제외')
+  .option('--exclude-active-run-sources', '⚠ 위험: --exclude-active-run-files 가 골 문서가 아닌 파일(소스)을 빼도 착지를 강행')
+  .option('--land-reason <text>', '권고를 보고도 지금 내는 이유(예: 남이 기다리는 차단 해제)')
+  .option('--force-freeze <reason>', '동결을 넘겨 병합할 명시적 이유(필수)')
+  .option('--allow-public-leak', '바뀐 파일이 공개본에 사적 흔적을 실어도 착지(이유는 --land-reason)')
+  .option('--overlap-evidence <file>', '머리 고정 착지 전용: 비대화형 겹침 승인을 대신할 증거 JSON {pr, head, gate:{head,baseCommit,passed}, reviewResult} — 재기반·재게이트·리뷰를 CLI 가 다시 잰다(겹친 착지가 전부 머리의 조상이면 리뷰만 · gate 생략 가능)');
+prShell.command('granularity').description('로컬 git log 로 최근 착지 단위(파일 중복·단일 파일 비율)를 센다')
+  .option('--since <window>', 'git log --since 창', '1 day ago')
+  .option('--cwd <path>', '작업 트리 경로').option('--base <branch>', '착지 집계에 쓸 base 브랜치')
+  .option('--with-source', 'PR 번호로 브랜치를 조회해 하니스↔사람 갈래를 함께 낸다 (gh 필요)');
+const parseBeforePrRegistration = program.parse.bind(program);
+const parseAsyncBeforePrRegistration = program.parseAsync.bind(program);
+let prRegistered = false;
+function ensurePrRegistered(): void {
+  if (prRegistered) return;
+  const { registerPrCommands } = require('./cli/pr-cli.js') as typeof import('./cli/pr-cli.js');
+  // Commander exposes this array as readonly in types, while registration still mutates it at runtime.
+  const commands = program.commands as Command[];
+  commands.splice(prCommandOrder, 1);
+  registerPrCommands(program);
+  const registered = commands.pop()!;
+  commands.splice(prCommandOrder, 0, registered);
+  prRegistered = true;
+}
+// Consumers may hold a reference to the exported PR subtree and parse that
+// command directly, bypassing program.parse. Keep those references executable
+// without loading the PR registrar until a direct parse actually occurs.
+function deferPrSubtreeParse(shell: Command, path: number[] = []): void {
+  const selected = () => {
+    ensurePrRegistered();
+    let command = program.commands[prCommandOrder]!;
+    for (const index of path) command = command.commands[index]!;
+    return command;
+  };
+  shell.parse = (...args: Parameters<Command['parse']>) => selected().parse(...args);
+  shell.parseAsync = (...args: Parameters<Command['parseAsync']>) => selected().parseAsync(...args);
+  shell.commands.forEach((child, index) => deferPrSubtreeParse(child, [...path, index]));
+}
+deferPrSubtreeParse(prShell);
+function selectedRootArgs(argv: readonly string[] | undefined, from?: string): { command: string | undefined; next: string | undefined; rootHelp: boolean } {
+  const args = (argv ?? process.argv).slice(from === 'user' ? 0 : from === 'electron' ? 1 : 2);
+  // parseOptions() emits Commander option events, so do not run it before the
+  // real parse. Only inspect leading root options; a subcommand owns the rest.
+  let position = 0;
+  let rootHelp = args.length === 0;
+  while (position < args.length) {
+    const token = args[position];
+    if (token === '--') { position++; break; }
+    if (token === '--help' || token === '-h' || token === '--help-all') {
+      rootHelp = true;
+      position++;
+      continue;
+    }
+    const option = program.options.find((item) => token === item.long || token === item.short
+      || (item.long && token.startsWith(`${item.long}=`)));
+    if (!option) {
+      if (token.startsWith('-')) { position++; continue; }
+      break;
+    }
+    position++;
+    if (option.required && !token.includes('=')) position++;
+    else if (option.optional && position < args.length && !args[position].startsWith('-')) position++;
+  }
+  return { command: args[position], next: args[position + 1], rootHelp };
+}
+function prSelectedForParse(argv: readonly string[] | undefined, from?: string): boolean {
+  const { command, next, rootHelp } = selectedRootArgs(argv, from);
+  return command === 'pr' || (command === 'help' && (!next || next === 'pr'))
+    || (!command && rootHelp);
+}
+program.parse = (...args: Parameters<typeof program.parse>) => {
+  if (prSelectedForParse(args[0], args[1]?.from)) ensurePrRegistered();
+  return parseBeforePrRegistration(...args);
+};
+program.parseAsync = (...args: Parameters<typeof program.parseAsync>) => {
+  if (prSelectedForParse(args[0], args[1]?.from)) ensurePrRegistered();
+  return parseAsyncBeforePrRegistration(...args);
+};
 registerRepoCommands(program);
 registerRoleCommands(program);
 registerMachineCommands(program);
@@ -4941,6 +5046,22 @@ const selfOrchestrateCmd = selfCmd
         const grokKeyNames = ['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY'];
         // 명시 계정은 사람의 선택 — 공급자 폴백과 계정 브로커를 우회한다.
         const explicitPodAccount = (opts as { podAccount?: string }).podAccount;
+        const ownerMirrorAccount = process.env.ELANOUS_REMOTE_CODEX_ACCOUNT?.trim();
+        const childProvider = opts as { childLlmProvider?: string };
+        const requestedChildProvider = childProvider.childLlmProvider?.trim();
+        if (ownerMirrorAccount && explicitPodAccount && explicitPodAccount !== ownerMirrorAccount) {
+          ui.error(`pod: HQ 미러 계정은 ${ownerMirrorAccount} 인데 --pod-account ${explicitPodAccount} 을 사용할 수 없다`);
+          process.exit(2);
+        }
+        if (ownerMirrorAccount && requestedChildProvider && requestedChildProvider !== 'openai-codex') {
+          const reason = `pod: HQ 미러 계정 ${ownerMirrorAccount} 은 openai-codex 전용이라 --child-llm-provider ${requestedChildProvider} 을 사용할 수 없다`;
+          ui.error(reason);
+          debug.log('self-implement.pod', 'child-provider-refused', { provider: requestedChildProvider, reason });
+          process.exit(2);
+        }
+        // An owner mirror pins the Pod child to that access-only Codex account; do not let a configured
+        // podChildDefault route the child to an unrelated provider.
+        if (ownerMirrorAccount && !requestedChildProvider) childProvider.childLlmProvider = 'openai-codex';
         let accountBroker: (() => string) | undefined;
         let rotationAccounts: readonly string[] | undefined;
         let podProvider: import('./task-orchestrator/surfaces/pod-child-providers.js').PodChildProvider = 'openai-codex';
@@ -5032,7 +5153,8 @@ const selfOrchestrateCmd = selfCmd
             }
           }
           // 10-05 PODPROVIDER: a launch that named the child provider gets it, or is refused — never a silent codex.
-          const namedChild = (opts as { childLlmProvider?: string }).childLlmProvider?.trim();
+          const explicitChild = (opts as { childLlmProvider?: string }).childLlmProvider?.trim();
+          const namedChild = ownerMirrorAccount && !explicitChild ? 'openai-codex' : explicitChild;
           const { podNamedChildProvider, podFallbackCredentials, podGrokSubscriptionUsable: namedGrokUsable } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
           const { readFileSync: readPodKeyFile } = await import('node:fs');
           const { homedir: podHome } = await import('node:os');
@@ -5052,12 +5174,27 @@ const selfOrchestrateCmd = selfCmd
           if (namedChildDecision.refuse) { ui.error(namedChildDecision.refuse); debug.log('self-implement.pod', 'child-provider-refused', { provider: namedChild, reason: namedChildDecision.refuse }); process.exit(2); }
           // A named codex child must stay codex — the plan may not fall back to grok (post-review must-fix).
           const namedCodex = namedChildDecision.provider === 'openai-codex';
+          let planCandidates = inspectCodexRotation().candidates;
+          if (ownerMirrorAccount) {
+            const used = process.env.ELANOUS_REMOTE_CODEX_USED_PERCENT;
+            const parsedUsed = used && used !== 'unknown' ? Number(used) : undefined;
+            const threshold = Number(process.env.ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT);
+            if (!Number.isFinite(threshold) || threshold <= 0 || threshold > 100) {
+              ui.error('pod: HQ Codex 미러의 유효 임계 표지가 없어 발사를 거부한다');
+              process.exit(2);
+            }
+            const { ownerCodexMirrorCandidate } = await import('./task-orchestrator/surfaces/pod-account-broker.js');
+            planCandidates = ownerCodexMirrorCandidate(planCandidates, ownerMirrorAccount, parsedUsed !== undefined && Number.isFinite(parsedUsed) ? parsedUsed : undefined);
+            if (planCandidates.length === 0) { ui.error(`pod: HQ Codex 미러 계정 ${ownerMirrorAccount} 이 원격 auth-store 후보에 없다`); process.exit(2); }
+          }
           const plan: import('./task-orchestrator/surfaces/pod-account-broker.js').PodProviderPlan | null = namedChildDecision.provider === 'openrouter' || namedChildDecision.provider === 'anthropic' || namedChildDecision.provider === 'bedrock' || namedChildDecision.provider === 'glm' ? null : namedChildDecision.provider === 'grok'
             ? { provider: 'grok', excluded: [], grokSubscriptionEligible: credential?.kind === 'subscription' }
             : planPodProvider({
-            codexCandidates: inspectCodexRotation().candidates,
+            codexCandidates: planCandidates,
             // Per-account caps (대표 default:97) override the Pod default cap — without them default was dropped at 60%.
-            thresholdPercentByAccount: launchPolicy.llm?.codexAccountRotationThresholdPercentByAccount,
+            thresholdPercentByAccount: ownerMirrorAccount
+              ? { [ownerMirrorAccount]: Number(process.env.ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT) }
+              : launchPolicy.llm?.codexAccountRotationThresholdPercentByAccount,
             // 대표 한도 정책 한 값(`llm.codexQuotaPolicy`) — 크레딧·폴백을 같이 정한다.
             creditsAllowed: codexPolicyAllowsCredits(quotaPolicy),
             // SUBSCRIPTION-EXHAUST-REROUTE — 예비분 이하 잔액(«알려진» 값)의 계정은 크레딧으로 쓰지 않는다.
@@ -5760,7 +5897,8 @@ selfCmd
   .option('--context-text <text>', '리뷰어가 함께 판단할 텍스트(반복 가능)', (value: string, previous: string[] = []) => [...previous, value])
   .option('--json', '구조화 출력 {pr, verdict, mustFix, shouldFix, reviewed}')
   .option('--save <name>', '리뷰 결과를 상태 디렉터리의 review-results/<name>-<PR>-<head12>.json에 저장')
-  .action(async (prParts: string[], opts: { intent?: string; model?: string; acp?: boolean; acpModel?: string; acpBackend?: string; acpTimeout?: string; context?: string[]; contextText?: string[]; json?: boolean; save?: string }) => {
+  .option('--over-cap-reason <reason>', '저장 리뷰 r5 상한 이후 이번 호출 1회 예외 사유(doctor.review cap-override 기록)')
+  .action(async (prParts: string[], opts: { intent?: string; model?: string; acp?: boolean; acpModel?: string; acpBackend?: string; acpTimeout?: string; context?: string[]; contextText?: string[]; json?: boolean; save?: string; overCapReason?: string }) => {
     const prArgs = prParts.flatMap((p) => String(p).split(/[,\s]+/).filter(Boolean)); // 번호/#번호/URL·콤마목록.
     if (!prArgs.length) { ui.error('PR 필요: elanous self review <번호|URL> [..]'); process.exit(2); }
     // ⭐ 본문은 seam(`runSelfReviewCliCommand`)에 있다 — 이 액션은 **의존 배선만** 한다.
@@ -5851,6 +5989,17 @@ selfCmd
       roleFallbackModel: () => (getOpenRouterApiKeyForReview()?.trim() ? ROLE_REVIEWER_FALLBACK_MODEL : undefined),
       registerSink: async (surface) => { await registerStandaloneLogSink(surface); },
       log: (event, data, o) => debug.log('self-review', event, data, o ?? {}),
+      observeDoctorReview: (event, data, o) => debug.log('doctor.review', event, data, o ?? {}),
+      loadDoctorReviewBrief: async ({ pr, head, title, body, changedFiles }) => {
+        // MK's doctor module is a separate PR. Until it lands, keep the original intent and record brief-unavailable.
+        const modulePath = './self-implement/review-round-brief.js';
+        const { effectiveInstanceRoot } = await import('./instance/resolve.js');
+        const doctor = await import(modulePath) as {
+          loadReviewRoundBrief(input: { pr: number; head: string; title: string; body: string; changedFiles: string[]; reviewResultsDir: string }): unknown;
+          renderReviewBriefIntentBlock(brief: unknown): string | null;
+        };
+        return doctor.renderReviewBriefIntentBlock(doctor.loadReviewRoundBrief({ pr, head, title, body, changedFiles, reviewResultsDir: _joinPath(effectiveInstanceRoot(), 'review-results') }));
+      },
       info: (t) => ui.info(t),
       error: (t) => ui.error(t),
       print: (t) => console.log(t),
@@ -6176,7 +6325,36 @@ async function loadJevAccessOrExit(): Promise<import('./decide/jev.js').JevAcces
 registerIntakeCommands(program);
 
 registerLogsCommands(program);
-registerSimCommands(program);
+// Keep the sim command in its public slot until either CLI or direct Commander
+// parsing selects it (or asks for help). The domain registrar owns its definition.
+const simCommandOrder = program.commands.length;
+program.command('sim').description('격리 시나리오를 실행하고 화면·로그 기대값을 대조한다');
+const parseWithRegisteredCommands = program.parse.bind(program);
+const parseAsyncWithRegisteredCommands = program.parseAsync.bind(program);
+let simRegistered = false;
+function ensureSimRegistered(): void {
+  if (simRegistered) return;
+  const { registerSimCommands } = require('./cli/sim-cli.js') as typeof import('./cli/sim-cli.js');
+  const commands = program.commands as Command[];
+  commands.splice(simCommandOrder, 1);
+  registerSimCommands(program);
+  const registered = commands.pop()!;
+  commands.splice(simCommandOrder, 0, registered);
+  simRegistered = true;
+}
+function simSelectedForParse(argv: readonly string[] | undefined, from?: string): boolean {
+  const { command, next, rootHelp } = selectedRootArgs(argv, from);
+  return command === 'sim' || (command === 'help' && next === 'sim')
+    || (!command && rootHelp);
+}
+program.parse = (...parseArgs: Parameters<typeof program.parse>) => {
+  if (simSelectedForParse(parseArgs[0], parseArgs[1]?.from)) ensureSimRegistered();
+  return parseWithRegisteredCommands(...parseArgs);
+};
+program.parseAsync = (...parseArgs: Parameters<typeof program.parseAsync>) => {
+  if (simSelectedForParse(parseArgs[0], parseArgs[1]?.from)) ensureSimRegistered();
+  return parseAsyncWithRegisteredCommands(...parseArgs);
+};
 
 // ── ad (marketing-ad pipeline entrance) ──
 /** ⛔ 「있다」와 「읽을 수 있는 파일이다」는 다른 값 — 디렉토리·권한 없는 파일을 실사로 읽지 않는다. */
@@ -11854,6 +12032,12 @@ async function main(): Promise<void> {
       return;
     }
     const showAll = args[0] === '--help-all';
+    if (firstCommand === 'sim' || (firstCommand === 'help' && args[1] === 'sim') || showAll || firstCommand === '--help' || firstCommand === '-h') {
+      await ensureSimRegistered();
+    }
+    // Maturity filtering mutates command visibility; register the final PR
+    // object before filtering so replacing the placeholder cannot reveal it.
+    if (prSelectedForParse(['node', 'elanous', ...args])) ensurePrRegistered();
     const role = getUserConfig().cli?.helpRole ?? 'owner';
     const { shown, hidden } = filterCliRootHelp(program.commands, role, showAll);
     debug.log('cli.maturity', 'help-filtered', { role, shown, hidden });

@@ -1,10 +1,12 @@
 import { setDefaultTimeout, afterEach, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { createGateRunner, gateShardShell, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, GATE_HOST_RECHECK_FILE_LIMIT, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, parseOptions, readIsolatedRun, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, admitGateShard, poolGateAdmission, reportSelectionTimed, reservedGateHosts, runGateNode, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, type GateAdmission, type GateRunner } from './gate-node';
+import { createGateRunner, gateShardShell, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, GATE_HOST_RECHECK_FILE_LIMIT, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, parseOptions, readIsolatedRun, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, admitGateShard, poolGateAdmission, reportSelectionTimed, reservedGateHosts, runGateNode, warmCommandMatchesRequest, warmEvidenceFromVerdicts, withWarmGateHooks, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, type GateAdmission, type GateRunner } from './gate-node';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
+import { resetUserConfig } from '../../src/user-config.js';
 import { releaseLedgerRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
 import { debug } from '../../src/debug/log.js';
 import { enableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
@@ -390,6 +392,10 @@ test('cut A/B/C versus baseline A/D reruns B and C; only reproduced B is introdu
   expect(calls.some((c) => c.includes('src/b.test.ts @') && c.includes('/cut'))).toBe(true);
   expect(calls.some((c) => c.includes('src/c.test.ts @') && c.includes('/baseline'))).toBe(false);
   expect(calls.filter((c) => c.startsWith('sweep '))).toHaveLength(1);
+  const shadowFiles = readdirSync(join(root, 'machine-ledger/release/1.0.1')).filter((name) => name.startsWith('gate-radius-shadow-'));
+  expect(shadowFiles).toHaveLength(1);
+  expect(JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1', shadowFiles[0]!), 'utf8')))
+    .toMatchObject({ plan: { proposed: 'full', forCommit: CUT }, actual: { commit: CUT, outcome: 'regression', fullSweep: true, introduced: [B] } });
   expect(calls.filter((c) => c.startsWith('bun install '))).toHaveLength(4);
   const path = join(instanceRoot, 'release/1.0.1/gate-failures.json');
   expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ commit: CUT, failures: [A, B, C] });
@@ -2046,6 +2052,103 @@ test('GATE-STALL2: two silent Pod jobs produce a verdict from other shards and o
   }
 });
 
+test('a stalled one-file Pod leaf is remeasured on another pool member and merged into the sweep', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const file = 'src/stalled.test.ts';
+  const members = [
+    { context: 'pool-a', sshHost: 'host-a', capacity: 1, k3dCluster: 'test' },
+    { context: 'pool-b', sshHost: 'host-b', capacity: 1, k3dCluster: 'test' },
+  ];
+  const placements: string[] = [];
+  let activeHost = '';
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: file };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (options) => {
+    const member = await options.poolScheduler!.tryAcquire();
+    if (!member) throw new Error('fake pool unexpectedly had no available member');
+    activeHost = member.context;
+    placements.push(member.context);
+    const artifactsDir = join(root, `tail-remeasure-${placements.length}`);
+    mkdirSync(artifactsDir);
+    try {
+      if (member.context === 'pool-a') {
+        // Keep the Job open until the stall watch observes checkout with no test output.
+        await new Promise((resolve) => setTimeout(resolve, 2_200));
+        return { exitCode: 0, artifactsDir, job: `fake-${member.context}` };
+      }
+      writeFileSync(join(artifactsDir, 'shard.log'), '1 pass\n0 fail\nRan 1 test across 1 file.\n');
+      writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+      return { exitCode: 0, artifactsDir, job: `fake-${member.context}` };
+    } finally {
+      options.poolScheduler!.release(member);
+    }
+  }, new PodPoolScheduler(members, { occupancy: () => Object.fromEntries(members.map((member) => [member.context, { occupied: 0 }])) }));
+  const result = await runner.sweep(repo, undefined, {
+    pool: 'pool-a@host-a:1,pool-b@host-b:1', shards: 1, stallSeconds: 0.001, stallPollMs: 1,
+    liveLog: () => activeHost === 'pool-a'
+      ? `ELANOUS_POD_SOURCE commit ${CUT}\nELANOUS_GATE_BEAT 1 install 0\n`
+      : `ELANOUS_POD_SOURCE commit ${CUT}\nELANOUS_GATE_BEAT 1 test 1 8\n`,
+    stopJob: () => true,
+  });
+  expect(placements).toEqual(['pool-a', 'pool-a', 'pool-b']);
+  expect(result).toMatchObject({ rc: 0, stalledEnv: [], passedIds: [] });
+  expect(result.output).toContain('1 pass\n0 fail\n0 errors\nRan 1 tests across 1 files.');
+});
+
+test('a failed tail remeasure preserves the original stall and does not launch another Pod', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const file = 'src/stalled.test.ts';
+  const members = [
+    { context: 'pool-a', sshHost: 'host-a', capacity: 1, k3dCluster: 'test' },
+    { context: 'pool-b', sshHost: 'host-b', capacity: 1, k3dCluster: 'test' },
+  ];
+  const placements: string[] = [];
+  let activeHost = '';
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: file };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (options) => {
+    const member = await options.poolScheduler!.tryAcquire();
+    if (!member) throw new Error('fake pool unexpectedly had no available member');
+    activeHost = member.context;
+    placements.push(member.context);
+    const artifactsDir = join(root, `tail-remeasure-fail-${placements.length}`);
+    mkdirSync(artifactsDir);
+    try {
+      if (member.context === 'pool-a') {
+        await new Promise((resolve) => setTimeout(resolve, 2_200));
+        return { exitCode: 0, artifactsDir, job: `fake-${member.context}` };
+      }
+      return { exitCode: 1, artifactsDir, job: `fake-${member.context}`, jobFailed: true, jobError: 'member lost' };
+    } finally {
+      options.poolScheduler!.release(member);
+    }
+  }, new PodPoolScheduler(members, { occupancy: () => Object.fromEntries(members.map((member) => [member.context, { occupied: 0 }])) }));
+  let failure: unknown;
+  try {
+    await runner.sweep(repo, undefined, {
+      pool: 'pool-a@host-a:1,pool-b@host-b:1', shards: 1, stallSeconds: 0.001, stallPollMs: 1,
+      probeMember: (member) => member.context !== 'pool-b',
+      liveLog: () => activeHost === 'pool-a'
+        ? `ELANOUS_POD_SOURCE commit ${CUT}\nELANOUS_GATE_BEAT 1 install 0\n`
+        : '',
+      stopJob: () => true,
+    });
+  } catch (error) { failure = error; }
+  expect(placements).toEqual(['pool-a', 'pool-a', 'pool-b']);
+  expect(failure).toMatchObject({ stalledShards: [{ shard: 0, files: [file], reason: 'no-output', lastHost: 'pool-a',
+    stall: { seconds: expect.any(Number), sinceCheckoutMs: expect.any(Number) }, tailRemeasure: { reason: 'job-failed', host: 'pool-b' } }] });
+});
+
 test('a silent Pod shard does not hide a separate measured shard regression', async () => {
   const { root, instanceRoot, runner: fixtureRunner } = fake([], []);
   const repo = join(root, 'repo');
@@ -3319,6 +3422,396 @@ test('GATE-RECHECK-FANOUT: 106 new files cross 32-file windows with no unmeasure
     .toMatchObject({ outcome: 'regression', introduced: [...ids].sort() });
 });
 
+test('GATE-WARM-SHADOW: the first three cut rechecks are separate one-file Jobs', async () => {
+  const { instanceRoot, runner } = fake([A, B, C, D], []);
+  const groups: string[][] = [];
+  const ids = new Map([A, B, C, D].map((id) => [id.split(' > ')[0]!, id]));
+  runner.recheckPodBatch = async (files, commit) => {
+    if (commit === CUT) groups.push([...files]);
+    return new Map(files.map((file) => [file, { rc: 1, output: runOutput([ids.get(file)!]) }]));
+  };
+  runner.recheckPod = async () => ({ rc: 0, output: runOutput([]) });
+  await judgeGate({ ...options(instanceRoot), pod: { pool: 'test', warmReplay: async () => { throw new Error('injected runner does not call provider'); },
+    warmQuarantine: async () => {}, warmFinalize: async () => {} } }, runner);
+  expect(groups).toEqual([['src/a.test.ts'], ['src/b.test.ts'], ['src/c.test.ts'], ['src/d.test.ts']]);
+});
+
+test('GATE-WARM-SHADOW: one-file warm budget applies once across recheck windows', async () => {
+  const { instanceRoot, runner } = fake([A, B, C, D], []);
+  const groups: string[][] = [];
+  const ids = new Map([A, B, C, D].map((id) => [id.split(' > ')[0]!, id]));
+  runner.recheckPodBatch = async (files, commit) => {
+    if (commit === CUT) groups.push([...files]);
+    return new Map(files.map((file) => [file, { rc: 1, output: runOutput([ids.get(file)!]) }]));
+  };
+  runner.recheckPod = async () => ({ rc: 0, output: runOutput([]) });
+  await judgeGate({ ...options(instanceRoot), recheckFileLimit: 2, pod: { pool: 'test',
+    warmReplay: async () => { throw new Error('injected runner does not call provider'); },
+    warmQuarantine: async () => {}, warmFinalize: async () => {} } }, runner);
+  expect(groups).toEqual([['src/a.test.ts'], ['src/b.test.ts'], ['src/c.test.ts'], ['src/d.test.ts']]);
+});
+
+test('GATE-WARM-SHADOW: three files are eligible regardless of completion order', async () => {
+  const { instanceRoot, runner } = fake([A, B, C], []);
+  const completed: Array<{ file: string; eligible: boolean }> = [];
+  const ids = new Map([A, B, C].map((id) => [id.split(' > ')[0]!, id]));
+  runner.recheckPodBatch = async (files, commit, pod) => {
+    if (commit === CUT) {
+      if (files[0] !== 'src/c.test.ts') await new Promise((resolve) => setTimeout(resolve, 20));
+      completed.push({ file: files[0]!, eligible: pod.warmEligible === true });
+    }
+    return new Map(files.map((file) => [file, { rc: 1, output: runOutput([ids.get(file)!]) }]));
+  };
+  runner.recheckPod = async () => ({ rc: 0, output: runOutput([]) });
+  await judgeGate({ ...options(instanceRoot), pod: { pool: 'test',
+    warmReplay: async () => { throw new Error('injected runner does not call provider'); },
+    warmQuarantine: async () => {}, warmFinalize: async () => {} } }, runner);
+  expect(completed.sort((a, b) => a.file.localeCompare(b.file))).toEqual([
+    { file: 'src/a.test.ts', eligible: true },
+    { file: 'src/b.test.ts', eligible: true },
+    { file: 'src/c.test.ts', eligible: true },
+  ]);
+});
+
+test('GATE-WARM-ADOPT: only exact, finalized shadow parity in the recent verdict enables reuse', () => {
+  const key = { context: 'pool', imageDigest: 'sha256:abc', lockHash: 'lock', architecture: 'arm64' };
+  const row = { files: ['src/b.test.ts'], attemptId: 'a', status: 'observed' as const, reason: 'match',
+    quarantined: 'no' as const, finalized: true, cutSha: CUT, baselineSha: BASE, workerKey: key };
+  const history = [{ version: '1.0.1', commit: CUT, baselineCommit: BASE,
+    warmShadow: [row, { ...row, attemptId: 'b' }, { ...row, attemptId: 'c' }] }];
+  expect(warmEvidenceFromVerdicts(history, '1.0.1', CUT, BASE, 'lock')).toMatchObject({
+    consecutiveMatchSamples: 3, recentMismatchCount: 0, canaryPassed: true,
+    expected: { head: CUT, main: CUT, lock: 'lock' }, worker: { head: CUT, main: CUT, lock: 'lock' },
+  });
+  expect(warmEvidenceFromVerdicts(history, '1.0.1', CUT, BASE, 'other')).toBeUndefined();
+  expect(warmEvidenceFromVerdicts([{ ...history[0]!, warmShadow: [{ ...row, workerKey: undefined }] }],
+    '1.0.1', CUT, BASE, 'lock')).toBeUndefined();
+  expect(warmEvidenceFromVerdicts([{ ...history[0]!, warmShadow: [row, { ...row, attemptId: 'b', reason: 'result' }] }],
+    '1.0.1', CUT, BASE, 'lock')?.recentMismatchCount).toBe(1);
+  expect(warmEvidenceFromVerdicts([{ ...history[0]!, warmShadow: [row, row, row] }],
+    '1.0.1', CUT, BASE, 'lock')).toBeUndefined();
+  expect(warmEvidenceFromVerdicts([{ ...history[0]!, warmShadow: [row, { ...row, attemptId: 'b',
+    workerKey: { ...key, imageDigest: 'sha256:other' } }] }], '1.0.1', CUT, BASE, 'lock')).toBeUndefined();
+  expect(warmEvidenceFromVerdicts([{ ...history[0]!, warmShadow: [{ ...row, files: undefined } as unknown as typeof row] }],
+    '1.0.1', CUT, BASE, 'lock')).toBeUndefined();
+  expect(warmEvidenceFromVerdicts([{ ...history[0]!, warmShadow: [{ ...row, quarantined: 'yes' }] }],
+    '1.0.1', CUT, BASE, 'lock')).toBeUndefined();
+  expect(warmEvidenceFromVerdicts([{ ...history[0]!, warmShadow: [{ ...row, files: ['../src/b.test.ts'] }] }],
+    '1.0.1', CUT, BASE, 'lock')).toBeUndefined();
+  expect(warmEvidenceFromVerdicts([{ ...history[0]!, commit: 'c'.repeat(40) }, history[0]!],
+    '1.0.1', CUT, BASE, 'lock')).toBeUndefined();
+});
+
+test('GATE-WARM-ADOPT: verified history skips a fresh Job; bad reply, key or history falls back', async () => {
+  for (const scenario of ['pass', 'bad-reply', 'wrong-key', 'duplicate-history'] as const) {
+    const valid = scenario === 'pass';
+    const { root, instanceRoot, ledgerRoot, runner } = fake([B], []);
+    const lockText = 'pinned lock bytes\n';
+    const lockHash = createHash('sha256').update(lockText).digest('hex');
+    const key = { context: 'pool', imageDigest: 'sha256:abc', lockHash, architecture: 'arm64' };
+    const shadow = (scenario === 'duplicate-history' ? ['a', 'a', 'a'] : ['a', 'b', 'c']).map((attemptId) => ({ files: ['src/b.test.ts'], attemptId,
+      status: 'observed', reason: 'match', quarantined: 'no', finalized: true,
+      cutSha: CUT, baselineSha: BASE, workerKey: key }));
+    mkdirSync(join(ledgerRoot, 'release/1.0.1'), { recursive: true });
+    writeFileSync(join(ledgerRoot, 'release/1.0.1/gate-verdict.json'), JSON.stringify({
+      version: '1.0.1', commit: CUT, baselineCommit: BASE, outcome: 'ok', warmHistory: [], warmShadow: shadow,
+    }));
+    const local = runner.localCommand.bind(runner);
+    runner.localCommand = async (cmd, args, cwd, timeout) => cmd === 'git' && args[0] === 'show'
+      ? { rc: 0, output: lockText } : local(cmd, args, cwd, timeout);
+    let freshCutJobs = 0;
+    let replays = 0;
+    let quarantines = 0;
+    let finalizes = 0;
+    runner.recheckPodBatch = async (files, commit) => {
+      if (commit === CUT) freshCutJobs++;
+      return new Map(files.map((file) => [file, { rc: 1, output: runOutput([B]) }]));
+    };
+    runner.recheckPod = async (file, commit) => {
+      if (commit === CUT) freshCutJobs++;
+      return { rc: commit === CUT ? 1 : 0, output: runOutput(commit === CUT ? [B] : []) };
+    };
+    const result = await judgeGate({ ...options(instanceRoot), pod: { pool: 'test',
+      warmReuseConfig: { gateRecheck: true },
+      warmReplay: async (request) => {
+        replays++;
+        const command = { ...request, leaseId: 'lease', generation: 1, workerId: 'worker',
+          key: scenario === 'wrong-key' ? { ...key, imageDigest: 'sha256:other' } : key };
+        return { command, transport: { status: 'observed' as const, reason: 'complete' as const,
+          reply: { ...command, startedAt: Date.now(), finishedAt: Date.now(),
+            files: [{ file: request.files[0]!, rc: valid ? 0 : 1, junitComplete: true,
+              failureIds: valid ? [] : [B], errorIds: [] }] } } };
+      },
+      warmFinalize: async () => { finalizes++; },
+      warmQuarantine: async () => { quarantines++; },
+    } }, runner);
+    expect(result.outcome).toBe(valid ? 'ok' : 'regression');
+    expect(freshCutJobs).toBe(valid ? 0 : 1);
+    expect(replays).toBe(scenario === 'duplicate-history' ? 0 : 1);
+    expect(finalizes).toBe(valid ? 1 : 0);
+    expect(quarantines).toBe(scenario === 'bad-reply' || scenario === 'wrong-key' ? 1 : 0);
+    expect(JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8')).warmHistory).toHaveLength(1);
+  }
+});
+
+test('GATE-WARM-SHADOW: later recheck failure persists completed cut shadows once', async () => {
+  const { root, instanceRoot, runner } = fake([A, B, C], []);
+  const files = ['src/a.test.ts', 'src/b.test.ts'];
+  let jobs = 0;
+  let replays = 0;
+  const completedFiles: string[] = [];
+  const podRunner = createGateRunner(root, undefined, async () => ({ rc: 0, output: '' }), async (request) => {
+    const file = [...files, 'src/c.test.ts'].find((entry) => request.command[2]!.includes(entry));
+    expect(file).toBeDefined();
+    if (file === 'src/c.test.ts') throw new Error('later recheck batch failed');
+    if (file === 'src/a.test.ts') await new Promise((resolve) => setTimeout(resolve, 20));
+    completedFiles.push(file!);
+    const binding = /attempt=%s\\n" '[a-f0-9]+' '([^']+)'/.exec(request.command[2]!);
+    expect(binding).not.toBeNull();
+    const artifactsDir = join(root, `completed-job-${++jobs}`);
+    mkdirSync(artifactsDir);
+    const junit = `<testsuites tests="1"><testsuite name="${file}" file="${file}" tests="1"><testcase name="pass" file="${file}"/></testsuite></testsuites>`;
+    const digest = createHash('sha256').update(junit).digest('hex');
+    writeFileSync(join(artifactsDir, 'install.rc'), '0\n');
+    writeFileSync(join(artifactsDir, 'part-0.junit.xml'), junit);
+    writeFileSync(join(artifactsDir, 'part-0.rc'), '0\n');
+    writeFileSync(join(artifactsDir, 'part-0.log'), `[warm-worker] file=${file}\n[warm-worker] cut=${CUT} attempt=${binding![1]}\nbun test v1.4.2\n${file}:\n(pass) pass\n1 pass\n0 fail\nRan 1 test across 1 file.\n[warm-worker] junit-sha256=${digest}\n`);
+    return { exitCode: 0, artifactsDir, job: `completed-job-${jobs}` };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 2, k3dCluster: 'test' }]));
+  runner.recheckPod = podRunner.recheckPod;
+  runner.recheckPodBatch = podRunner.recheckPodBatch;
+  const result = await judgeGate({ ...options(instanceRoot), pod: { pool: 'pool-test', installSlots: 0,
+    warmReplay: async () => { replays++; return { command: null,
+      transport: { status: 'fallback', reason: 'no-candidate', reply: null } }; },
+    warmQuarantine: async () => {}, warmFinalize: async () => {} } }, runner);
+  expect(result).toMatchObject({ outcome: 'error', error: expect.stringContaining('later recheck batch failed') });
+  expect(jobs).toBe(2);
+  expect(replays).toBe(2);
+  expect(completedFiles).toEqual(['src/b.test.ts', 'src/a.test.ts']);
+  expect(result.warmShadow).toHaveLength(2);
+  expect(result.warmShadow).toMatchObject([
+    { files: ['src/a.test.ts'], reason: 'no-candidate' },
+    { files: ['src/b.test.ts'], reason: 'no-candidate' },
+  ]);
+  const verdict = JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8'));
+  expect(verdict.warmShadow).toEqual(result.warmShadow);
+  expect(new Set(verdict.warmShadow.map((row: { attemptId: string }) => row.attemptId)).size).toBe(2);
+});
+
+test('gate profile alone wires the live warm provider; injected runners and fixed profile stay off', () => {
+  const opts = { commit: CUT, version: '1.0.1', pod: { pool: 'pool-test' } };
+  expect(withWarmGateHooks(opts, { pod: { warmPoolProfile: 'fixed' } })).toBe(opts);
+  expect(withWarmGateHooks(opts, { pod: { warmPoolProfile: 'gate' } }, true)).toBe(opts);
+  expect(withWarmGateHooks({ commit: CUT, version: '1.0.1' }, { pod: { warmPoolProfile: 'gate' } }).pod).toBeUndefined();
+  const wired = withWarmGateHooks(opts, { pod: { warmPoolProfile: 'gate' } });
+  expect(wired.pod?.warmReplay).toBeFunction();
+  expect(wired.pod?.warmFinalize).toBeFunction();
+  expect(wired.pod?.warmQuarantine).toBeFunction();
+  expect(wired.pod?.pool).toBe('pool-test');
+});
+
+test('runGateNode reads the configured profile before choosing live Pod warm hooks', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-warm-entry-'));
+  scratch.push(root);
+  setElanousConfigDir(root);
+  const wired: boolean[] = [];
+  const judge = async (opts: Parameters<typeof judgeGate>[0]) => {
+    wired.push(!!opts.pod?.warmReplay && !!opts.pod?.warmFinalize && !!opts.pod?.warmQuarantine);
+    return { outcome: 'ok' as const, commit: CUT, introduced: [], preexisting: 0, fixed: 0,
+      knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 0 };
+  };
+  const args = ['--commit', CUT, '--version', '1.0.1', '--baseline-version', '1.0.0', '--pod-pool', 'pool-test', '--json'];
+  try {
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ pod: { warmPoolProfile: 'gate' } }));
+    resetUserConfig();
+    expect(await runGateNode(args, {}, undefined, judge)).toBe(0);
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ pod: { warmPoolProfile: 'fixed' } }));
+    resetUserConfig();
+    expect(await runGateNode(args, {}, undefined, judge)).toBe(0);
+    expect(wired).toEqual([true, false]);
+  } finally { resetUserConfig(); }
+});
+
+test('GATE-WARM-SHADOW: the Job verdict and durable gate record retain separate worker observation', async () => {
+  const { root, instanceRoot, runner } = fake([B], []);
+  const observed = { files: ['src/b.test.ts'], attemptId: 'attempt-1', status: 'observed' as const,
+    reason: 'result', quarantined: 'yes' as const };
+  runner.recheckPodBatch = async (files) => new Map(files.map((file) => [file, {
+    rc: 1, output: runOutput([B]), warmShadow: observed,
+  }]));
+  runner.recheckPod = async () => ({ rc: 0, output: runOutput([]) });
+  const result = await judgeGate({ ...options(instanceRoot), pod: { pool: 'test' } }, runner);
+  expect(result).toMatchObject({ outcome: 'regression', introduced: [B], warmShadow: [observed] });
+  const verdict = JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8'));
+  expect(verdict).toMatchObject({ outcome: 'regression', introduced: [B], warmShadow: [observed] });
+});
+
+test('GATE-WARM-SHADOW: timeout retry observation is persisted and each verdict gets a fresh budget', async () => {
+  const { root, instanceRoot, runner } = fake([B], []);
+  const missing = { files: ['src/b.test.ts'], attemptId: 'initial', status: 'unmeasured' as const,
+    reason: 'reference-unmeasured', quarantined: 'no' as const };
+  const observed = { files: ['src/b.test.ts'], attemptId: 'relaxed', status: 'observed' as const,
+    reason: 'match', quarantined: 'no' as const };
+  const scopes: unknown[] = [];
+  runner.recheckPodBatch = async (files, commit, pod) => {
+    if (commit === CUT) scopes.push(pod.warmShadowScope);
+    return new Map(files.map((file) => [file, { rc: 1, output: timedOutOutput(B),
+      ...(commit === CUT ? { warmShadow: missing } : {}) }]));
+  };
+  runner.recheckPod = async (_file, commit, pod, _limit, relaxed) => {
+    if (commit === CUT && relaxed) {
+      scopes.push(pod.warmShadowScope);
+      return { rc: 0, output: runOutput([]), warmShadow: observed };
+    }
+    return { rc: 0, output: runOutput([]) };
+  };
+  const opts = { ...options(instanceRoot), pod: { pool: 'test',
+    warmReplay: async () => { throw new Error('injected runner does not call provider'); },
+    warmQuarantine: async () => {}, warmFinalize: async () => {} } };
+  const first = await judgeGate(opts, runner);
+  expect(first).toMatchObject({ outcome: 'ok', loadFlaky: [B], warmShadow: [missing, observed] });
+  expect(JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8')))
+    .toMatchObject({ warmShadow: [missing, observed] });
+  expect(scopes[0]).toBe(scopes[1]);
+  await judgeGate(opts, runner);
+  expect(scopes[2]).not.toBe(scopes[0]);
+});
+
+test('GATE-WARM-SHADOW: real recheck Jobs persist both missing and relaxed observations', async () => {
+  const { root, instanceRoot, runner } = fake([B], []);
+  const file = 'src/b.test.ts';
+  let jobs = 0;
+  const podRunner = createGateRunner(root, undefined, async () => ({ rc: 0, output: '' }), async (request) => {
+    const artifactsDir = join(root, `warm-timeout-job-${++jobs}`);
+    mkdirSync(artifactsDir);
+    writeFileSync(join(artifactsDir, 'install.rc'), '0\n');
+    if (request.command[2]!.includes("'--timeout' '60000'")) {
+      const binding = /attempt=%s\\n" '[a-f0-9]+' '([^']+)'/.exec(request.command[2]!);
+      expect(binding).not.toBeNull();
+      const junit = `<testsuites tests="1"><testsuite name="${file}" file="${file}" tests="1"><testcase name="B" file="${file}"/></testsuite></testsuites>`;
+      const digest = createHash('sha256').update(junit).digest('hex');
+      writeFileSync(join(artifactsDir, 'part-0.junit.xml'), junit);
+      writeFileSync(join(artifactsDir, 'part-0.rc'), '0\n');
+      writeFileSync(join(artifactsDir, 'part-0.log'), `[warm-worker] file=${file}\n[warm-worker] cut=${CUT} attempt=${binding![1]}\nbun test v1.4.2\n${file}:\n(pass) B\n1 pass\n0 fail\nRan 1 test across 1 file.\n[warm-worker] junit-sha256=${digest}\n`);
+    } else {
+      writeFileSync(join(artifactsDir, 'part-0.rc'), '1\n');
+      writeFileSync(join(artifactsDir, 'part-0.log'), timedOutOutput(B));
+    }
+    return { exitCode: 0, artifactsDir, job: `warm-timeout-job-${jobs}` };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+  runner.recheckPod = podRunner.recheckPod;
+  runner.recheckPodBatch = podRunner.recheckPodBatch;
+  const result = await judgeGate({ ...options(instanceRoot), pod: { pool: 'pool-test', installSlots: 0,
+    warmReplay: async () => ({ command: null, transport: { status: 'fallback', reason: 'no-candidate', reply: null } }),
+    warmQuarantine: async () => {}, warmFinalize: async () => {} } }, runner);
+  expect(jobs).toBe(2);
+  expect(result).toMatchObject({ outcome: 'ok', loadFlaky: [B],
+    warmShadow: [{ status: 'unmeasured', reason: 'reference-unmeasured' },
+      { status: 'fallback', reason: 'no-candidate' }] });
+  expect(JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8')))
+    .toMatchObject({ warmShadow: [{ status: 'unmeasured', reason: 'reference-unmeasured' },
+      { status: 'fallback', reason: 'no-candidate' }] });
+});
+
+test('GATE-WARM-SHADOW: two incomplete eligible Job references each leave an observation', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-warm-two-missing-'));
+  scratch.push(root);
+  let jobs = 0;
+  const runner = createGateRunner(root, undefined, async () => ({ rc: 0, output: '' }), async () => {
+    const artifactsDir = join(root, `missing-job-${++jobs}`);
+    mkdirSync(artifactsDir);
+    writeFileSync(join(artifactsDir, 'install.rc'), '0\n');
+    writeFileSync(join(artifactsDir, 'part-0.rc'), '1\n');
+    writeFileSync(join(artifactsDir, 'part-0.log'), runOutput([jobs === 1 ? A : B]));
+    return { exitCode: 0, artifactsDir, job: `missing-job-${jobs}` };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+  const scope = { requested: false };
+  const pod = { pool: 'pool-test', installSlots: 0, warmCutSha: CUT, warmEligible: true,
+    warmShadowScope: scope, warmReplay: async () => { throw new Error('incomplete references cannot replay'); },
+    warmQuarantine: async () => {}, warmFinalize: async () => {} };
+  const first = await runner.recheckPod!('src/a.test.ts', CUT, pod, GATE_ISOLATED_TIMEOUT_MS);
+  const second = await runner.recheckPod!('src/b.test.ts', CUT, pod, GATE_ISOLATED_TIMEOUT_MS);
+  expect(first.warmShadow).toMatchObject({ status: 'unmeasured', reason: 'reference-unmeasured' });
+  expect(second.warmShadow).toMatchObject({ status: 'unmeasured', reason: 'reference-unmeasured' });
+  expect(first.warmShadow?.attemptId).not.toBe(second.warmShadow?.attemptId);
+  expect(scope.requested).toBe(false);
+});
+
+test('GATE-WARM-SHADOW: missing part artifacts and timed-out Jobs remain red with persisted missing references', async () => {
+  for (const mode of ['missing-rc', 'part-timeout'] as const) {
+    const { root, instanceRoot, runner } = fake([B], []);
+    const podRunner = createGateRunner(root, undefined, async () => ({ rc: 0, output: '' }), async () => {
+      const artifactsDir = join(root, `warm-${mode}`);
+      mkdirSync(artifactsDir);
+      writeFileSync(join(artifactsDir, 'install.rc'), '0\n');
+      writeFileSync(join(artifactsDir, 'part-0.log'), timedOutOutput(B));
+      if (mode === 'part-timeout') {
+        writeFileSync(join(artifactsDir, 'part-0.rc'), '124\n');
+        writeFileSync(join(artifactsDir, 'part-0.timeout'), '1\n');
+      }
+      return { exitCode: 0, artifactsDir, job: `warm-${mode}` };
+    }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+    runner.recheckPod = podRunner.recheckPod;
+    runner.recheckPodBatch = podRunner.recheckPodBatch;
+    const result = await judgeGate({ ...options(instanceRoot), pod: { pool: 'pool-test', installSlots: 0,
+      warmReplay: async () => { throw new Error('unmeasured reference cannot replay'); },
+      warmQuarantine: async () => {}, warmFinalize: async () => {} } }, runner);
+    expect(result).toMatchObject({ outcome: 'error', unmeasuredRecheckFiles: ['src/b.test.ts'],
+      warmShadow: [{ status: 'unmeasured', reason: 'reference-unmeasured' }] });
+    expect(JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8')))
+      .toMatchObject({ outcome: 'error', warmShadow: [{ status: 'unmeasured', reason: 'reference-unmeasured' }] });
+  }
+});
+
+test('GATE-WARM-SHADOW: two parallel incomplete Jobs both persist their attempt identities', async () => {
+  const { root, instanceRoot, runner } = fake([A, B], []);
+  let jobs = 0;
+  const podRunner = createGateRunner(root, undefined, async () => ({ rc: 0, output: '' }), async () => {
+    const artifactsDir = join(root, `parallel-incomplete-${++jobs}`);
+    mkdirSync(artifactsDir);
+    writeFileSync(join(artifactsDir, 'install.rc'), '0\n');
+    writeFileSync(join(artifactsDir, 'part-0.log'), runOutput([jobs === 1 ? A : B]));
+    return { exitCode: 0, artifactsDir, job: `parallel-incomplete-${jobs}` };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 2, k3dCluster: 'test' }]));
+  runner.recheckPod = podRunner.recheckPod;
+  runner.recheckPodBatch = podRunner.recheckPodBatch;
+  const result = await judgeGate({ ...options(instanceRoot), pod: { pool: 'pool-test', installSlots: 0, isolationConcurrency: 2,
+    warmReplay: async () => { throw new Error('incomplete references cannot replay'); },
+    warmQuarantine: async () => {}, warmFinalize: async () => {} } }, runner);
+  expect(jobs).toBe(2);
+  expect(result).toMatchObject({ outcome: 'error', unmeasuredRecheckFiles: ['src/a.test.ts', 'src/b.test.ts'] });
+  expect(result.warmShadow).toHaveLength(2);
+  expect(new Set(result.warmShadow!.map((row) => row.attemptId)).size).toBe(2);
+  const verdict = JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8'));
+  expect(verdict.warmShadow).toHaveLength(2);
+  expect(new Set(verdict.warmShadow.map((row: { attemptId: string }) => row.attemptId)).size).toBe(2);
+});
+
+test('GATE-WARM-SHADOW: cap-one failure still attempts the second Job and retains its successful shadow', async () => {
+  const { root, instanceRoot, runner } = fake([A, B], []);
+  let jobs = 0;
+  const podRunner = createGateRunner(root, undefined, async () => ({ rc: 0, output: '' }), async () => {
+    const artifactsDir = join(root, `serial-incomplete-${++jobs}`);
+    mkdirSync(artifactsDir);
+    writeFileSync(join(artifactsDir, 'install.rc'), '0\n');
+    writeFileSync(join(artifactsDir, 'part-0.log'), runOutput([jobs === 1 ? A : B]));
+    if (jobs === 2) writeFileSync(join(artifactsDir, 'part-0.rc'), '1\n');
+    return { exitCode: 0, artifactsDir, job: `serial-incomplete-${jobs}` };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+  runner.recheckPod = podRunner.recheckPod;
+  runner.recheckPodBatch = podRunner.recheckPodBatch;
+  const result = await judgeGate({ ...options(instanceRoot), recheckFileLimit: 1,
+    pod: { pool: 'pool-test', installSlots: 0, isolationConcurrency: 1,
+      warmReplay: async () => { throw new Error('incomplete references cannot replay'); },
+      warmQuarantine: async () => {}, warmFinalize: async () => {} } }, runner);
+  expect(jobs).toBe(2);
+  expect(result).toMatchObject({ outcome: 'error', unmeasuredRecheckFiles: ['src/a.test.ts'] });
+  expect(result.warmShadow).toHaveLength(2);
+  expect(new Set(result.warmShadow!.map((row) => row.attemptId)).size).toBe(2);
+  const verdict = JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8'));
+  expect(verdict.warmShadow).toHaveLength(2);
+});
+
 test('GATE-RECHECK-POD: a final isolated check pins its commit and reads the real one-part Pod artifact', async () => {
   const root = mkdtempSync(join(tmpdir(), 'gate-recheck-pod-'));
   const requests: RunPodCommandOptions[] = [];
@@ -3345,9 +3838,18 @@ test('GATE-RECHECK-POD: a final isolated check pins its commit and reads the rea
       }
       return { exitCode: 0, artifactsDir, job: 'fake-recheck' };
     }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
-    const result = await runner.recheckPod!('src/a.test.ts', CUT, { pool: 'pool-test', installSlots: 0 }, GATE_ISOLATED_TIMEOUT_MS, true);
+    let warmCalls = 0;
+    const result = await runner.recheckPod!('src/a.test.ts', CUT, { pool: 'pool-test', installSlots: 0, warmCutSha: CUT, warmEligible: true,
+      warmReplay: async () => { warmCalls++; throw new Error('unmeasured Job cannot be replayed'); },
+      warmQuarantine: async () => {},
+      warmFinalize: async () => {},
+    }, GATE_ISOLATED_TIMEOUT_MS, true);
     expect(result.rc).toBe(1);
     expect(result.timedOut).toBeUndefined();
+    expect(result.warmReference).toBeNull(); // The fake Job has no JUnit; it cannot certify a warm comparison.
+    expect(result.warmShadow).toMatchObject({ status: 'unmeasured', reason: 'reference-unmeasured' });
+    expect(warmCalls).toBe(0);
+    expect(result.warmAttemptId).toMatch(/^[0-9a-f-]{36}$/);
     expect(result.output).toContain('(fail)');
     expect(requests).toHaveLength(1);
     expect(requests[0]).toMatchObject({ pool: 'pool-test', clone: true, source: { kind: 'commit', sha: CUT }, memoryLimit: expect.any(String), deadlineSeconds: 480 });
@@ -3355,6 +3857,8 @@ test('GATE-RECHECK-POD: a final isolated check pins its commit and reads the rea
     expect(requests[0]!.command[2]).toContain('ELANOUS_TEST_FAKE_LLM');
     expect(requests[0]!.command[2]).toContain('left=300');
     expect(requests[0]!.command[2]).toContain('part-$i.timeout');
+    expect(requests[0]!.command[2]).toContain('[warm-worker] cut=');
+    expect(requests[0]!.command[2]).toContain('[warm-worker] file=');
     const batch = await runner.recheckPodBatch!(['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'], BASE, { pool: 'pool-test', installSlots: 0 }, GATE_ISOLATED_TIMEOUT_MS);
     expect(batch.get('src/a.test.ts')?.rc).toBe(1);
     expect(batch.get('src/b.test.ts')?.rc).toBe(0);
@@ -3371,6 +3875,172 @@ test('GATE-RECHECK-POD: a final isolated check pins its commit and reads the rea
     expect(requests.at(-1)!.command[2]).toContain("'./root.test.ts'");
     await expect(runner.recheckPod!('../escape.test.ts', CUT, { pool: 'pool-test' }, GATE_ISOLATED_TIMEOUT_MS)).rejects.toThrow('unsafe pod recheck files');
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+function warmReferenceRunner(root: string, file: string): GateRunner {
+  let requested = 0;
+  return createGateRunner(root, undefined, async () => ({ rc: 0, output: '' }), async (request) => {
+    const binding = /attempt=%s\\n" '[a-f0-9]+' '([^']+)'/.exec(request.command[2]!);
+    expect(binding).not.toBeNull();
+    const attemptId = binding![1]!;
+    const artifactsDir = join(root, `job-${++requested}`);
+    mkdirSync(artifactsDir);
+    const junit = `<testsuites tests="1"><testsuite name="${file}" file="${file}" tests="1"><testcase name="works" file="${file}"/></testsuite></testsuites>`;
+    const digest = createHash('sha256').update(junit).digest('hex');
+    writeFileSync(join(artifactsDir, 'install.rc'), '0\n');
+    writeFileSync(join(artifactsDir, 'part-0.rc'), '0\n');
+    writeFileSync(join(artifactsDir, 'part-0.junit.xml'), junit);
+    writeFileSync(join(artifactsDir, 'part-0.log'), `[warm-worker] file=${file}\n[warm-worker] cut=${CUT} attempt=${attemptId}\nbun test v1.4.2\n${file}:\n(pass) works\n1 pass\n0 fail\nRan 1 test across 1 file.\n[warm-worker] junit-sha256=${digest}\n`);
+    return { exitCode: 0, artifactsDir, job: 'fake-warm-reference' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+}
+
+test('GATE-WARM-SHADOW: a source-bound Job stays authoritative and a divergent worker is quarantined', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-warm-shadow-'));
+  scratch.push(root);
+  const file = 'src/a.test.ts';
+  const key = { context: 'pool-test', imageDigest: `sha256:${'a'.repeat(64)}`, lockHash: 'b'.repeat(64), architecture: 'amd64' };
+  const quarantined: string[] = [];
+  const runner = warmReferenceRunner(root, file);
+  const result = await runner.recheckPod!(file, CUT, { pool: 'pool-test', installSlots: 0, warmCutSha: CUT, warmEligible: true,
+    warmReplay: async (input) => {
+      const command = { ...input, leaseId: 'lease-1', generation: 1, workerId: 'worker-1', key };
+      return { command, transport: { status: 'observed', reason: 'complete', reply: { ...command,
+        startedAt: Date.now() - 10, finishedAt: Date.now(), files: [{ file, rc: 1,
+          failureIds: [`${file} > broken`], errorIds: [], junitComplete: true }] } } };
+    },
+    warmQuarantine: async (_command, reason) => { quarantined.push(reason); },
+    warmFinalize: async () => { throw new Error('mismatch must not finalize'); },
+  }, GATE_ISOLATED_TIMEOUT_MS);
+  expect(result.rc).toBe(0);
+  expect(result.warmReference).toEqual({ file, rc: 0, failureIds: [], errorIds: [], junitComplete: true });
+  expect(result.warmShadow).toMatchObject({ status: 'observed', reason: 'result', quarantined: 'yes' });
+  expect(quarantined).toEqual(['result']);
+});
+
+test('GATE-WARM-SHADOW: a stalled provider cannot hold a completed Job verdict', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-warm-timeout-'));
+  scratch.push(root);
+  const runner = warmReferenceRunner(root, 'src/a.test.ts');
+  const started = Date.now();
+  const result = await runner.recheckPod!('src/a.test.ts', CUT, { pool: 'pool-test', installSlots: 0,
+    warmCutSha: CUT, warmEligible: true, warmShadowTimeoutMs: 20,
+    warmReplay: async () => new Promise(() => {}),
+    warmQuarantine: async () => {}, warmFinalize: async () => {},
+  }, GATE_ISOLATED_TIMEOUT_MS);
+  expect(Date.now() - started).toBeLessThan(2_000);
+  expect(result).toMatchObject({ rc: 0, warmShadow: { status: 'unmeasured', quarantined: 'unavailable' } });
+  expect(result.warmShadow?.reason).toContain('warm replay timeout');
+});
+
+test('GATE-WARM-SHADOW: a late leased reply is fenced after the Job verdict', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-warm-late-replay-'));
+  scratch.push(root);
+  const file = 'src/a.test.ts';
+  const key = { context: 'pool-test', imageDigest: `sha256:${'a'.repeat(64)}`, lockHash: 'b'.repeat(64), architecture: 'amd64' };
+  let deliver: ((reply: any) => void) | undefined;
+  let requested: any;
+  const reasons: string[] = [];
+  const result = await warmReferenceRunner(root, file).recheckPod!(file, CUT, { pool: 'pool-test', installSlots: 0,
+    warmCutSha: CUT, warmEligible: true, warmShadowTimeoutMs: 20,
+    warmReplay: async (input) => { requested = input; return new Promise((resolve) => { deliver = resolve; }); },
+    warmQuarantine: async (_command, reason) => { reasons.push(reason); }, warmFinalize: async () => {},
+  }, GATE_ISOLATED_TIMEOUT_MS);
+  expect(result).toMatchObject({ rc: 0, warmShadow: { status: 'unmeasured', quarantined: 'unavailable' } });
+  deliver!({ command: { ...requested, leaseId: 'lease-late', generation: 1, workerId: 'worker-late', key },
+    transport: { status: 'observed', reason: 'complete', reply: null } });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(reasons).toEqual(['late-replay-after-timeout']);
+});
+
+test('GATE-WARM-SHADOW: an ineligible complete Job never requests replay', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-warm-ineligible-'));
+  scratch.push(root);
+  let requests = 0;
+  const result = await warmReferenceRunner(root, 'src/a.test.ts').recheckPod!('src/a.test.ts', CUT,
+    { pool: 'pool-test', installSlots: 0, warmCutSha: CUT, warmEligible: false,
+      warmReplay: async () => { requests++; throw new Error('unexpected replay'); },
+      warmQuarantine: async () => {}, warmFinalize: async () => {} }, GATE_ISOLATED_TIMEOUT_MS);
+  expect(result).toMatchObject({ rc: 0 });
+  expect(result.warmReference).toBeNull();
+  expect(result.warmShadow).toBeUndefined();
+  expect(requests).toBe(0);
+});
+
+test('GATE-WARM-SHADOW: an uncertain leased replay is quarantined or records quarantine failure', async () => {
+  const file = 'src/a.test.ts';
+  const key = { context: 'pool-test', imageDigest: `sha256:${'a'.repeat(64)}`, lockHash: 'b'.repeat(64), architecture: 'amd64' };
+  for (const quarantineFails of [false, true]) {
+    const root = mkdtempSync(join(tmpdir(), 'gate-warm-uncertain-'));
+    scratch.push(root);
+    const reasons: string[] = [];
+    const result = await warmReferenceRunner(root, file).recheckPod!(file, CUT, { pool: 'pool-test', installSlots: 0, warmCutSha: CUT, warmEligible: true,
+      warmReplay: async (input) => ({ command: { ...input, leaseId: 'lease-1', generation: 1, workerId: 'worker-1', key },
+        transport: { status: 'fallback', reason: 'exec-failed', reply: null } }),
+      warmQuarantine: async (_command, reason) => {
+        reasons.push(reason);
+        if (quarantineFails) throw new Error('control unavailable');
+      },
+      warmFinalize: async () => { throw new Error('uncertain replay must not finalize'); },
+    }, GATE_ISOLATED_TIMEOUT_MS);
+    expect(result.rc).toBe(0);
+    expect(result.warmShadow).toMatchObject({ status: 'fallback', reason: 'exec-failed',
+      quarantined: quarantineFails ? 'failed' : 'yes' });
+    expect(reasons).toEqual(['transport-exec-failed']);
+  }
+});
+
+test('GATE-WARM-SHADOW: only a matching replay finalizes the fenced worker', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-warm-finalize-'));
+  scratch.push(root);
+  const file = 'src/a.test.ts';
+  const key = { context: 'pool-test', imageDigest: `sha256:${'a'.repeat(64)}`, lockHash: 'b'.repeat(64), architecture: 'amd64' };
+  const finalized: string[] = [];
+  const runner = warmReferenceRunner(root, file);
+  const result = await runner.recheckPod!(file, CUT, { pool: 'pool-test', installSlots: 0, warmCutSha: CUT, warmEligible: true,
+    warmReplay: async (input) => {
+      const command = { ...input, leaseId: 'lease-1', generation: 1, workerId: 'worker-1', key };
+      return { command, transport: { status: 'observed', reason: 'complete', reply: { ...command,
+        startedAt: Date.now() - 10, finishedAt: Date.now(), files: [{ file, rc: 0,
+          failureIds: [], errorIds: [], junitComplete: true }] } } };
+    },
+    warmQuarantine: async () => { throw new Error('matching replay must not quarantine'); },
+    warmFinalize: async (command) => { finalized.push(command.attemptId); },
+  }, GATE_ISOLATED_TIMEOUT_MS);
+  expect(result).toMatchObject({ rc: 0, warmShadow: { status: 'observed', reason: 'match', finalized: true, quarantined: 'no' } });
+  expect(result.warmAttemptId).toBeDefined();
+  expect(finalized).toEqual([result.warmAttemptId!]);
+});
+
+test('GATE-WARM-SHADOW: failed finalization quarantines and does not change the Job rc', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-warm-finalize-failed-'));
+  scratch.push(root);
+  const file = 'src/a.test.ts';
+  const key = { context: 'pool-test', imageDigest: `sha256:${'a'.repeat(64)}`, lockHash: 'b'.repeat(64), architecture: 'amd64' };
+  const reasons: string[] = [];
+  const result = await warmReferenceRunner(root, file).recheckPod!(file, CUT, { pool: 'pool-test', installSlots: 0, warmCutSha: CUT, warmEligible: true,
+    warmReplay: async (input) => {
+      const command = { ...input, leaseId: 'lease-1', generation: 1, workerId: 'worker-1', key };
+      return { command, transport: { status: 'observed', reason: 'complete', reply: { ...command,
+        startedAt: Date.now() - 10, finishedAt: Date.now(), files: [{ file, rc: 0,
+          failureIds: [], errorIds: [], junitComplete: true }] } } };
+    },
+    warmQuarantine: async (_command, reason) => { reasons.push(reason); },
+    warmFinalize: async () => { throw new Error('sanitize unavailable'); },
+  }, GATE_ISOLATED_TIMEOUT_MS);
+  expect(result).toMatchObject({ rc: 0, warmShadow: { status: 'fallback', reason: 'finalize-failed', finalized: false, quarantined: 'yes' } });
+  expect(reasons).toEqual(['finalize-failed']);
+});
+
+test('GATE-WARM-SHADOW: provider lease completion cannot switch the compared Job attempt', () => {
+  const request = { protocol: 1 as const, runId: 'run-1', attemptId: 'attempt-1', cutSha: CUT,
+    deadlineAt: Date.now() + 60_000, files: ['src/a.test.ts'], envProfile: 'gate-v1' };
+  const command = { ...request, leaseId: 'lease-1', generation: 1, workerId: 'worker-1',
+    key: { context: 'pool-test', imageDigest: `sha256:${'a'.repeat(64)}`, lockHash: 'b'.repeat(64), architecture: 'amd64' } };
+  expect(warmCommandMatchesRequest(command, request)).toBe(true);
+  expect(warmCommandMatchesRequest({ ...command, cutSha: BASE }, request)).toBe(false);
+  expect(warmCommandMatchesRequest({ ...command, attemptId: 'another-attempt' }, request)).toBe(false);
+  expect(warmCommandMatchesRequest({ ...command, files: ['src/b.test.ts'] }, request)).toBe(false);
 });
 
 test('GATE-RECHECK-FANOUT: a failing batch or baseline waits for already-started siblings before the error verdict', async () => {

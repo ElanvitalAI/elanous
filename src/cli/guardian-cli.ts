@@ -19,6 +19,16 @@ async function guardianPlan(): Promise<{ db: Database; plan: GuardianPlan }> {
 
 export function registerGuardianCommands(program: Command): void {
   const guardian = program.command('guardian').description('크론 수호자 그림자 관측(기존 크론·알림 무변경)');
+  guardian.command('grok-expiry').description('현재 호스트 Grok 구독 만료 시각과 4시간 경보 상태 출력')
+    .action(async () => {
+      const { readGrokSubscriptionExpiry } = await import('../grok/credential.js');
+      const { grokExpiryAlertLine, grokExpiryStatusLine } = await import('../domains/guardian-tick.js');
+      const now = new Date();
+      const expiresAt = readGrokSubscriptionExpiry();
+      console.log(grokExpiryStatusLine({ now, expiresAt }));
+      const alert = grokExpiryAlertLine({ now, expiresAt });
+      if (alert) console.log(alert);
+    });
   guardian.command('tick').description('현재 시각에 발화했을 잡을 관측(잡은 실행하지 않음)')
     .action(async () => {
       const { guardianTick } = await import('../domains/guardian-tick.js');

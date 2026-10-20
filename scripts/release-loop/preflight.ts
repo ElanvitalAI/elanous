@@ -1,12 +1,14 @@
-// `elanous release preflight` — 컷 30분 전 사전 점검(RELEASE-PREFLIGHT · 10-06).
+// `elanous release preflight` — 컷 −30분 운영 점검 + 컷 −60분 main export 사전 점검.
 //
 // 🩸 계기(10-06 실측): 0.2.17 릴리스 런이 첫 노드(checklist-gate)에서 멎었다 — «발행 뒤» 칸(POSTPUB-VERIFY)이 그 판에
-//    남아 있었고 게이트가 그것을 미완으로 셌다. 컷이 올 때까지 아무도 몰랐다. 새 규칙 = 착지 마감 = 컷 − 30분, 그 30분에 이 점검.
+//    남아 있었고 게이트가 그것을 미완으로 셌다. 컷 전 체크리스트 점검은 착지 마감 컷 −30분, F9 export 는 main HEAD 에서 컷 −60분 수동 실행.
 // ⛔ 읽기 전용 — 칸을 옮기지도, 동결을 바꾸지도, push 하지도 않는다. 옮길 것은 «명령»으로 제안만 한다.
 // ⛔ 게이트 규칙을 다시 쓰지 않는다 — checklist-gate 노드 · release run 진입 검사 · 예약 시작 준비 검사(releaseReadiness, #24557)가
 //    함께 쓰는 단 하나의 판정 cutChecklistGate 를 그대로 부르고, 예약 시작 경로는 releaseReadiness 를 CLI 와 같은 인자로 부른다.
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { cutChecklistGate, listChecklist, type ChecklistItem } from '../../src/release-loop/checklist.js';
 import { getSchedule, formatKst, type ReleaseSchedule } from '../../src/release-loop/release-schedule.js';
 import { readLandingFreeze, landingFreezeMessage, type LandingFreeze } from '../../src/release-loop/landing-freeze.js';
@@ -14,9 +16,10 @@ import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { debug } from '../../src/debug/log.js';
 import { releaseReadiness } from './release-readiness.js';
 import { latestPublishedPreviousVersion, runUnattendedRelease, type UnattendedReleaseDeps } from './unattended-release.js';
+import { loadExportConfig, run as runPublicExport, selectExportFiles } from '../public-export.js';
 
 export type PreflightLevel = 'ok' | 'warn' | 'block';
-export type PreflightCheck = 'checklist' | 'postpub' | 'run-input' | 'freeze' | 'schedule';
+export type PreflightCheck = 'checklist' | 'postpub' | 'run-input' | 'freeze' | 'schedule' | 'export';
 export interface PreflightFinding { level: PreflightLevel; check: PreflightCheck; id?: string; message: string; suggestion?: string }
 export interface GateMeasure { version: string; runId: string; gateSeconds: number; toPublishSeconds?: number }
 const compareStable = (a: string, b: string) => { const x = a.split('.').map(Number), y = b.split('.').map(Number); return x[0]! - y[0]! || x[1]! - y[1]! || x[2]! - y[2]!; };
@@ -27,7 +30,8 @@ export interface PreflightResult {
   blockers: number;
   warnings: number;
   findings: PreflightFinding[];
-  schedule: { cutAt: string; landBy: string | null; publishAt: string | null; publishAtSource: 'option' | 'schedule' | 'cadence' | null } | null;
+  schedule: { cutAt: string; landBy: string | null; publishAt: string | null; publishAtSource: 'option' | 'schedule' | 'cadence' | null; exportCheckAt: string } | null;
+  exportCheck: { mainSha: string; files: number; leaks: number; codeLiterals: number } | null;
   /** The immediately previous release (by version order) whose gate is compared. */
   previousVersion: string | null;
   gateMeasure: GateMeasure | null;
@@ -46,6 +50,72 @@ export interface PreflightDeps {
   releaseRunDeps?: UnattendedReleaseDeps;
   /** The immediately previous release; default = the run input's previousVersion (release ledger). */
   previousVersion?: string;
+  /** Injectable for deterministic preflight tests. Production pins origin/main and scans a disposable checkout. */
+  exportCheck?: () => Promise<{ mainSha: string; files: number; leaks: number; codeLiterals: number }>;
+}
+
+function runGit(cwd: string, args: string[]): string {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 16 << 20 });
+  if (result.status !== 0) throw new Error(`git ${args.join(' ')} 실패 rc=${result.status}: ${(result.stderr ?? '').trim().slice(0, 300)}`);
+  return (result.stdout ?? '').trim();
+}
+
+/** Read-only main snapshot: all checkout and cleanup writes are contained in a disposable temp directory. */
+export async function scanOriginMainExport(): Promise<{ mainSha: string; files: number; leaks: number; codeLiterals: number }> {
+  const repoRoot = runGit(process.cwd(), ['rev-parse', '--show-toplevel']);
+  const mainSha = runGit(repoRoot, ['rev-parse', '--verify', 'origin/main^{commit}']);
+  const temp = mkdtempSync(join(tmpdir(), 'release-preflight-main-'));
+  const snapshot = join(temp, 'checkout');
+  try {
+    runGit(temp, ['clone', '--shared', '--no-checkout', '--quiet', repoRoot, snapshot]);
+    runGit(snapshot, ['read-tree', mainSha]);
+    const tracked = runGit(snapshot, ['ls-files', '-z']).split('\0').filter(Boolean);
+    const trackedSet = new Set(tracked);
+    // `git check-ignore --no-index` applies every nested ignore file, including ones below selected paths.
+    const needed = new Set(tracked.filter((file) => file === '.gitignore' || file.endsWith('/.gitignore')));
+    needed.add('release/public-export.yaml');
+    // Read only the paths the pinned manifest can inspect; the full tracked-path index stays at mainSha.
+    const manifestPath = join(snapshot, 'release/public-export.yaml');
+    const manifest = spawnSync('git', ['-C', snapshot, 'show', `${mainSha}:release/public-export.yaml`], { encoding: 'utf8', maxBuffer: 4 << 20 });
+    if (manifest.status !== 0) throw new Error(`origin/main public export manifest 읽기 실패: ${(manifest.stderr ?? '').trim()}`);
+    mkdirSync(join(snapshot, 'release'), { recursive: true });
+    writeFileSync(manifestPath, manifest.stdout ?? '');
+    const config = loadExportConfig(snapshot);
+    const selected = selectExportFiles(tracked, config);
+    for (const file of selected) needed.add(file);
+    for (const source of Object.values(config.replace)) needed.add(source);
+    if (config.skills) {
+      needed.add('catalog/resources.yaml');
+      needed.add('src/video-pipeline/capabilities.ts');
+      for (const file of tracked) if (/^skills\/[^/]+\/SKILL\.md$/u.test(file)) needed.add(file);
+      for (const file of tracked) {
+        const skill = /^skills\/([^/]+)\//u.exec(file)?.[1];
+        if (skill) mkdirSync(join(snapshot, 'skills', skill), { recursive: true });
+      }
+    }
+    const checkout = spawnSync('git', ['-C', snapshot, 'checkout-index', '--stdin', '-z', '-f'], {
+      input: `${[...needed].filter((file) => trackedSet.has(file)).join('\0')}\0`, encoding: 'utf8', maxBuffer: 16 << 20,
+    });
+    if (checkout.status !== 0) throw new Error(`origin/main export 입력 파일 준비 실패 rc=${checkout.status}: ${(checkout.stderr ?? '').trim().slice(0, 300)}`);
+    let output = '';
+    const originalLog = console.log;
+    const originalError = console.error;
+    console.log = (...args: unknown[]) => { output += `${args.map(String).join(' ')}\n`; };
+    console.error = () => {};
+    let code: number;
+    try { code = runPublicExport(['--leak-check', '--json'], snapshot); }
+    finally { console.log = originalLog; console.error = originalError; }
+    const report = JSON.parse(output.trim()) as {
+      files?: number; leaks?: number; hits?: Array<{ marker: string }>; codeLiterals?: { hits?: number };
+      privateRedactions?: { loaded?: boolean };
+    };
+    if (report.privateRedactions?.loaded !== true) throw new Error('개인 치환표를 읽지 못해 export 누수 검사를 완결할 수 없다');
+    if (typeof report.files !== 'number' || typeof report.leaks !== 'number') throw new Error('public-export 검사 결과가 완전하지 않다');
+    if (code !== (report.leaks > 0 ? 1 : 0)) throw new Error(`public-export 종료 코드와 누수 결과 불일치: rc=${code} leaks=${report.leaks}`);
+    return { mainSha, files: report.files, leaks: report.leaks, codeLiterals: report.codeLiterals?.hits ?? 0 };
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
 }
 
 const POSTPUB_ID = /^POSTPUB-/i;
@@ -127,6 +197,7 @@ export async function releasePreflight(version: string, deps: PreflightDeps = {}
   const now = deps.now ?? new Date();
   const next = nextPatch(version);
   const findings: PreflightFinding[] = [];
+  let exportCheck: PreflightResult['exportCheck'] = null;
   const moveHint = (id: string) => `elanous release checklist move ${id} --from ${version} --to ${next} --reason "발행 뒤 칸 — 다음 판에서 확인"`;
 
   // 1·2. Checklist gate simulation «at the cut» (the node and the run entry both judge after land-by) ⊕ post-publish cells.
@@ -176,6 +247,17 @@ export async function releasePreflight(version: string, deps: PreflightDeps = {}
   for (const p of gate.parity ?? []) findings.push({ level: 'warn', check: 'checklist', id: p.id, message: `${p.id} — 화면 짝 경고: ${p.why}` });
   if (!blockReason.size) findings.push({ level: 'ok', check: 'checklist', message: `체크리스트 게이트 모의 통과 — ${data.items.length}칸 · 이월 ${gate.moved.length} · 알려진 문제 ${gate.knownIssues.length}` });
 
+  // 3a. Public export leakage is measured against one pinned origin/main commit, never this possibly dirty branch.
+  try {
+    exportCheck = await (deps.exportCheck ?? scanOriginMainExport)();
+    findings.push(exportCheck.leaks
+      ? { level: 'block', check: 'export', message: `origin/main ${exportCheck.mainSha.slice(0, 12)} 공개 export 누수 ${exportCheck.leaks}건 · ${exportCheck.files} 파일 검사` }
+      : { level: 'ok', check: 'export', message: `origin/main ${exportCheck.mainSha.slice(0, 12)} 공개 export 누수 0건 · ${exportCheck.files} 파일 검사` });
+    if (exportCheck.codeLiterals) findings.push({ level: 'warn', check: 'export', message: `코드 리터럴 표지 ${exportCheck.codeLiterals}건은 문서/주석 누수에서 분리해 기록` });
+  } catch (error) {
+    findings.push({ level: 'block', check: 'export', message: `origin/main 공개 export 검사를 완료하지 못했다 — ${error instanceof Error ? error.message : String(error)}` });
+  }
+
   // 3. The same input check `release run --dry-run` makes.
   let runPrevious: string | undefined;
   try {
@@ -209,7 +291,11 @@ export async function releasePreflight(version: string, deps: PreflightDeps = {}
     // --publish-at > the stored schedule publish time (`release schedule set --publish-at`) > the October cadence.
     const publishAtSource = deps.publishAt ? 'option' : schedule.publishAt ? 'schedule' : 'cadence';
     const publishAt = deps.publishAt ? new Date(deps.publishAt).toISOString() : schedule.publishAt ?? cadencePublishAt(schedule.cutAt);
-    scheduleOut = { cutAt: schedule.cutAt, landBy: schedule.landBy, publishAt, publishAtSource };
+    const exportCheckAt = new Date(cut - 60 * 60_000).toISOString();
+    scheduleOut = { cutAt: schedule.cutAt, landBy: schedule.landBy, publishAt, publishAtSource, exportCheckAt };
+    findings.push(Date.parse(now.toISOString()) < Date.parse(exportCheckAt)
+      ? { level: 'warn', check: 'schedule', message: `main export 검사 시각 ${formatKst(exportCheckAt)}(컷 − 60분)보다 이르다 · OP가 그 시각에 수동 실행` }
+      : { level: 'ok', check: 'schedule', message: `main export 검사 시각 ${formatKst(exportCheckAt)}(컷 − 60분) · 자동 예약 없음` });
     if (!schedule.landBy) findings.push({ level: 'warn', check: 'schedule', message: `착지 마감 없음 — 컷 ${formatKst(schedule.cutAt)} · 규칙은 컷 − 30분` });
     else if (cut - Date.parse(schedule.landBy) < 30 * 60_000) findings.push({ level: 'warn', check: 'schedule', message: `착지 마감 ${formatKst(schedule.landBy)} 이 컷 − 30분보다 늦다(컷 ${formatKst(schedule.cutAt)})` });
     else findings.push({ level: 'ok', check: 'schedule', message: `일정 — 착지 마감 ${formatKst(schedule.landBy)} · 컷 ${formatKst(schedule.cutAt)}` });
@@ -233,7 +319,7 @@ export async function releasePreflight(version: string, deps: PreflightDeps = {}
   const blockers = findings.filter((f) => f.level === 'block').length;
   const warnings = findings.filter((f) => f.level === 'warn').length;
   debug.log('release.preflight', 'checked', { version, blockers, warnings });
-  return { version, next, verdict: blockers ? 'block' : warnings ? 'warn' : 'ok', blockers, warnings, findings, schedule: scheduleOut, previousVersion, gateMeasure, fallbackGateMeasure };
+  return { version, next, verdict: blockers ? 'block' : warnings ? 'warn' : 'ok', blockers, warnings, findings, schedule: scheduleOut, exportCheck, previousVersion, gateMeasure, fallbackGateMeasure };
 }
 
 const ICON: Record<PreflightLevel, string> = { ok: '✅', warn: '⚠️', block: '⛔' };

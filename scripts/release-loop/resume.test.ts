@@ -8,7 +8,7 @@ import { Command } from 'commander';
 import { registerReleaseCommands } from '../../src/cli/release-cli.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { resumeReleaseRun } from './resume-release.js';
-import { releaseResumeWaiver } from './resume.js';
+import { releaseResumeGatePodPool, releaseResumeWaiver } from './resume.js';
 
 const SHA = 'a'.repeat(40);
 const VERSION = '0.2.19';
@@ -396,6 +396,7 @@ test('release resume CLI validates waiver JSON and pairing before opening a save
     expect((await invoke('--waive', 'tui')).error).toContain('supplied together');
     expect((await invoke('--waive', '', '--reason', 'Help does not close')).error).toContain('--waive must not be empty');
     expect((await invoke('--accepted-regressions', '[]')).error).toContain('release run has no input');
+    expect((await invoke('--gate-pod-pool', 'pool-new')).error).toContain('release run has no input');
     expect((await invoke()).error).toContain('run identity mismatch');
   } finally {
     process.stdout.write = write;
@@ -404,6 +405,40 @@ test('release resume CLI validates waiver JSON and pairing before opening a save
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('release resume --gate-pod-pool updates the saved run input before re-running gate and records both values', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-pool-resume-'));
+  const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  const gateContexts: Array<{ nodeId: string; input: Record<string, unknown> }> = [];
+  const runBash = async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
+    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; input: Record<string, unknown> };
+    if (ctx.nodeId === 'gate') {
+      gateContexts.push(ctx);
+      return gateContexts.length === 1
+        ? { exitCode: 2, stdout: '{"outcome":"error","verdict":"fail","summary":"pool unavailable"}\n', stderr: '' }
+        : { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
+    }
+    if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
+    return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
+  };
+  const git = (args: string[]) => args[0] === 'ls-remote' ? `${SHA}\trefs/heads/release/${VERSION}` : args[0] === 'rev-parse' ? SHA : '';
+  try {
+    const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, previousVersion: '0.2.18', gatePodPool: 'pool-old' }, deps: { root, runBash } });
+    expect(first.status).toBe('failed');
+    const stateFile = join(root, 'graph-runs', 'release-loop', `${first.runId}.json`);
+    // Exercise the runner override seam without acquiring the shared OP release flock.
+    const resumed = await runGraph(graphPath, { resumeRunId: first.runId, fromNodeId: 'gate', releaseGatePodPool: ' pool-new ', deps: { root, runBash } });
+    expect(gateContexts.map((ctx) => ctx.input.gatePodPool)).toEqual(['pool-old', 'pool-new']);
+    expect(resumed.input).toMatchObject({ gatePodPool: 'pool-new' });
+    expect(resumed.inputOverrides).toMatchObject([{ kind: 'gate-pod-pool', from: 'gate', set: { gatePodPool: 'pool-new' }, previous: { gatePodPool: 'pool-old' } }]);
+    const saved = JSON.parse(readFileSync(stateFile, 'utf8')) as GraphRunState;
+    expect(saved.inputOverrides).toEqual(resumed.inputOverrides);
+    expect(saved.input).toMatchObject({ gatePodPool: 'pool-new' });
+    const afterGate = { ...first, path: [...first.path.slice(0, first.path.indexOf('gate') + 1), 'mac-smoke', 'failed'] };
+    expect(() => releaseResumeGatePodPool(afterGate, { from: 'mac-smoke', pool: 'pool-new' })).toThrow('re-runs gate');
+    expect(() => releaseResumeGatePodPool(first, { from: 'gate', pool: '  ' })).toThrow('must not be empty');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 120_000);
 
 test('waiver rejects unrecorded nodes, unsafe side effects, invalid input and duplicate public issue IDs', () => {
   const state = { path: ['version-release', 'tui', 'failed'], nodes: [{ nodeId: 'version-release', ok: true, executed: true },

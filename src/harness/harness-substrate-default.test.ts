@@ -110,6 +110,9 @@ test('selfOrchestrateCmd uses operational policy under NODE_ENV=test with a miss
   const originalNodeEnv = process.env.NODE_ENV;
   const originalPool = process.env.ELANOUS_POD_POOL;
   const originalQuota = process.env.ELANOUS_CODEX_QUOTA_POLICY;
+  const originalOwnerAccount = process.env.ELANOUS_REMOTE_CODEX_ACCOUNT;
+  const originalOwnerUsed = process.env.ELANOUS_REMOTE_CODEX_USED_PERCENT;
+  const originalOwnerThreshold = process.env.ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT;
   const warnings: string[] = [];
   const plans: unknown[] = [];
   const poolSpecs: string[] = [];
@@ -204,6 +207,29 @@ test('selfOrchestrateCmd uses operational policy under NODE_ENV=test with a miss
     expect(poolSpecs.at(-1)).toBe('pool-node-b@node-b:8');
     expect(warnings.filter((line) => line.includes('launch policy: 파생 시험 우주 정책이 없거나 운영과 다르다'))).toHaveLength(1);
 
+    // The remote-parent path enters harness say, which dispatches this self-orchestrate CLI before any Pod Job.
+    // Owner markers must pin the real Pod broker despite the remote operational account cap being 99%.
+    process.env.ELANOUS_REMOTE_CODEX_ACCOUNT = 'other';
+    process.env.ELANOUS_REMOTE_CODEX_USED_PERCENT = '48';
+    process.env.ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT = '60';
+    await program.parseAsync(['node', 'elanous', 'self', 'orchestrate', 'remote owner probe', '--substrate', 'pod', '--no-pod-rebuild', '--no-supervise', '--json']);
+    expect(broker.mock.calls.at(-1)?.[0]).toMatchObject({
+      codexCandidates: [{ name: 'other', home: otherHome, storeKey: 'openai-codex:other', reached: false, usedPercent: 48 }],
+      thresholdPercentByAccount: { other: 60 }, creditsAllowed: true,
+    });
+    expect(providerPlans.at(-1)).toEqual({ provider: 'openai-codex', accounts: ['other'], excluded: [], grokSubscriptionEligible: false });
+    const ownerProviderCalls = broker.mock.calls.length;
+    await expect(program.parseAsync(['node', 'elanous', 'self', 'orchestrate', 'remote owner probe', '--substrate', 'pod', '--child-llm-provider', 'grok', '--no-pod-rebuild', '--no-supervise', '--json'])).rejects.toThrow('STOP_1');
+    expect(exit).toHaveBeenCalledWith(2);
+    expect(broker).toHaveBeenCalledTimes(ownerProviderCalls);
+    const callsBeforeMismatchedOverride = broker.mock.calls.length;
+    await expect(program.parseAsync(['node', 'elanous', 'self', 'orchestrate', 'remote owner probe', '--substrate', 'pod', '--pod-account', 'team', '--no-pod-rebuild', '--no-supervise', '--json'])).rejects.toThrow('STOP_1');
+    expect(exit).toHaveBeenCalledWith(2);
+    expect(broker).toHaveBeenCalledTimes(callsBeforeMismatchedOverride);
+    for (const [key, value] of [['ELANOUS_REMOTE_CODEX_ACCOUNT', originalOwnerAccount], ['ELANOUS_REMOTE_CODEX_USED_PERCENT', originalOwnerUsed], ['ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT', originalOwnerThreshold]] as const) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+
     // A usable credential cannot enable Grok when only the derived chain contains Grok.
     writeFileSync(join(operationalRoot, 'config.json'), JSON.stringify({
       ...operational, llm: { ...operational.llm, codexQuotaPolicy: 'fallback', fallbackChain: ['codex-rotate'],
@@ -254,7 +280,7 @@ test('selfOrchestrateCmd uses operational policy under NODE_ENV=test with a miss
     orchestrateCommand.setOptionValue('goalFile', originalGoalFiles);
     resetElanousConfigDir();
     if (originalConfigDirOverride !== undefined) setElanousConfigDir(originalConfigDirOverride);
-    for (const [key, value] of Object.entries({ HOME: originalHome, XDG_CONFIG_HOME: originalXdg, ELANOUS_STATE_DIR: originalState, ELANOUS_STATE_DIR_SOURCE: originalStateSource, ELANOUS_HARNESS_ENTRANCE: originalEntrance, NODE_ENV: originalNodeEnv, ELANOUS_POD_POOL: originalPool, ELANOUS_CODEX_QUOTA_POLICY: originalQuota })) {
+    for (const [key, value] of Object.entries({ HOME: originalHome, XDG_CONFIG_HOME: originalXdg, ELANOUS_STATE_DIR: originalState, ELANOUS_STATE_DIR_SOURCE: originalStateSource, ELANOUS_HARNESS_ENTRANCE: originalEntrance, NODE_ENV: originalNodeEnv, ELANOUS_POD_POOL: originalPool, ELANOUS_CODEX_QUOTA_POLICY: originalQuota, ELANOUS_REMOTE_CODEX_ACCOUNT: originalOwnerAccount, ELANOUS_REMOTE_CODEX_USED_PERCENT: originalOwnerUsed, ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT: originalOwnerThreshold })) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
     error.mockRestore(); warn.mockRestore(); exit.mockRestore(); prepare.mockRestore(); load.mockRestore(); save.mockRestore(); participant.mockRestore(); pid.mockRestore(); prodRoot.mockRestore(); check.mockRestore(); freshness.mockRestore(); sync.mockRestore(); inspect.mockRestore(); broker.mockRestore(); grok.mockRestore(); run.mockRestore();

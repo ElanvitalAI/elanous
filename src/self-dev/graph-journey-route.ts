@@ -1,7 +1,8 @@
 import { debug } from '../debug/log.js';
 import { GRAPH_SPECS } from '../self-implement/graph-templates.js';
 import { applyGraphOverlays, defaultOverlaysDir, loadGraphOverlays, selectOverlays, type GraphOverlaySpec } from '../self-implement/graph-overlay-yaml.js';
-import type { GraphTemplateSpec } from '../self-implement/graph-yaml.js';
+import { L1_PROTECTED_ROUTE_NODES, type GraphTemplateSpec } from '../self-implement/graph-yaml.js';
+import { evaluateOverlayCondition } from '../self-implement/graph-overlay-condition.js';
 import { journeyJoinFields } from './graph-journey-nodes.js';
 
 /** ⭐ HARNESS-FULL-GRAPH 2판 — 「다음 노드」를 코드가 아니라 «그래프»가 정한다.
@@ -21,6 +22,13 @@ export interface JourneyRoute {
   readonly to: string | null;
   readonly source: 'graph' | 'code-default';
   readonly overlays: readonly string[];
+  readonly via?: 'outcome' | 'when';
+  readonly condition?: string;
+  readonly ambiguousConditions?: readonly string[];
+  readonly unobservedConditions?: readonly string[];
+  readonly skippedNode?: string;
+  readonly skipCondition?: string;
+  readonly skippedNodes?: readonly { readonly node: string; readonly condition: string }[];
 }
 
 /** ⛔ 캐시하지 않는다 — 여러 런을 처리하는 프로세스(데몬·대기열 tick)가 다음 발사에서 오버레이 변경을 봐야 한다.
@@ -65,12 +73,46 @@ export function readJourneyEdge(
 ): JourneyRoute {
   const { spec, applied } = journeySpec(state, deps.base ?? GRAPH_SPECS['self-implement'], deps.overlays ?? launchOverlays());
   let route: JourneyRoute = { from, on: null, label, to: null, source: 'code-default', overlays: applied };
-  for (const edge of spec?.edges ?? []) {
-    if (edge.from !== from) continue;
-    if (edge.map !== undefined && Object.hasOwn(edge.map, label)) {
-      route = { from, on: edge.on ?? null, label, to: edge.map[label]!, source: 'graph', overlays: applied };
-      break;
+  const outgoing = (spec?.edges ?? []).filter(edge => edge.from === from);
+  const protectedFrom = L1_PROTECTED_ROUTE_NODES.has(from) || spec?.nodes.some(node => node.nodeId === from && node.kind === 'gate') ||
+    spec?.terminalNodes.includes(from);
+  const conditions = outgoing.filter(edge => edge.when !== undefined && !protectedFrom).map(edge => ({ edge, verdict: evaluateOverlayCondition(edge.when, state) }));
+  const matching = conditions.filter(({ verdict }) => verdict.kind === 'applies').map(({ edge }) => edge);
+  const unobservedConditions = conditions.filter(({ verdict }) => verdict.kind === 'key-absent').map(({ edge }) => edge.when!);
+  if (matching.length === 1 && unobservedConditions.length === 0 && matching[0]!.to !== undefined) {
+    route = { from, on: null, label, to: matching[0]!.to!, source: 'graph', overlays: applied,
+      via: 'when', condition: matching[0]!.when };
+  } else {
+    const mapped = outgoing.find(edge => edge.when === undefined && edge.map !== undefined && Object.hasOwn(edge.map, label));
+    const defaultEdge = mapped ?? outgoing.find(edge => edge.when === undefined && edge.to !== undefined);
+    if (defaultEdge?.map !== undefined) route = { from, on: defaultEdge.on ?? null, label,
+      to: defaultEdge.map[label]!, source: 'graph', overlays: applied, via: 'outcome' };
+    else if (defaultEdge?.to !== undefined) route = { from, on: null, label,
+      to: defaultEdge.to, source: 'graph', overlays: applied, via: 'outcome' };
+    if (matching.length > 1) route = { ...route, ambiguousConditions: matching.map(edge => edge.when!) };
+    if (unobservedConditions.length > 0) route = { ...route, unobservedConditions };
+  }
+  // A skipped optional node needs one unambiguous unconditional successor. Otherwise retain
+  // the ordinary route; neither a missing observation nor a branching node is a skip proof.
+  if (route.to && spec) {
+    const skipped: { node: string; condition: string }[] = [];
+    const visited = new Set<string>();
+    while (route.to && !visited.has(route.to)) {
+      visited.add(route.to);
+      const next = spec.nodes.find(node => node.nodeId === route.to);
+      if (!next?.skipWhen || next.kind === 'gate' ||
+          L1_PROTECTED_ROUTE_NODES.has(next.nodeId) ||
+          spec.terminalNodes.includes(next.nodeId) ||
+          evaluateOverlayCondition(next.skipWhen, state).kind !== 'applies') break;
+      const successors = spec.edges.filter(edge => edge.from === next.nodeId);
+      if (successors.length !== 1 || successors[0]?.to === undefined ||
+          successors[0]?.when !== undefined || (successors[0]?.fallback?.length ?? 0) > 0 ||
+          visited.has(successors[0].to)) break;
+      skipped.push({ node: next.nodeId, condition: next.skipWhen });
+      route = { ...route, to: successors[0]!.to! };
     }
+    if (skipped.length > 0) route = { ...route, skippedNode: skipped[0]!.node,
+      skipCondition: skipped[0]!.condition, skippedNodes: skipped };
   }
   return route;
 }
@@ -78,6 +120,18 @@ export function readJourneyEdge(
 /** 실제로 탄 간선을 남긴다 — `taken` 은 실제 다음 노드(그래프 답과 다르면 `honored: false` · 그 이유를 `reason` 에). */
 export function recordJourneyEdge(route: JourneyRoute, taken: string, reason?: string): void {
   try {
+    if (route.ambiguousConditions?.length) debug.log('self-implement', 'edge-ambiguous', {
+      graphId: 'self-implement', from: route.from, conditions: route.ambiguousConditions,
+      fallback: taken, ...journeyJoinFields(),
+    });
+    if (route.unobservedConditions?.length) debug.log('self-implement', 'edge-unobserved', {
+      graphId: 'self-implement', from: route.from, conditions: route.unobservedConditions,
+      fallback: taken, ...journeyJoinFields(),
+    });
+    if (route.to === taken) for (const skipped of route.skippedNodes ?? []) debug.log('self-implement', 'node-skipped', {
+      graphId: 'self-implement', node: skipped.node, reason: 'condition', condition: skipped.condition,
+      ...journeyJoinFields(),
+    });
     debug.log('self-implement', 'graph-edge-taken', {
       graphId: 'self-implement', ...route, taken, honored: route.to === null || route.to === taken,
       ...(reason === undefined ? {} : { reason }), ...journeyJoinFields(),

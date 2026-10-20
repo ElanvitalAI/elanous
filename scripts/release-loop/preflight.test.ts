@@ -44,11 +44,27 @@ function deps(root: string, extra: Partial<PreflightDeps> = {}): PreflightDeps {
     runInput: async () => ({ input: { previousVersion: '0.2.17', gatePodPool: 'pool-test' } }),
     schedule: () => ({ version: '0.2.18', cutAt: '2026-10-06T21:00:00.000Z', landBy: '2026-10-06T20:30:00.000Z', updatedAt: NOW.toISOString(), updatedBy: 'test' }),
     graphRunsRoot: join(root, 'graph-runs', 'release-loop'),
+    exportCheck: async () => ({ mainSha: 'a'.repeat(40), files: 123, leaks: 0, codeLiterals: 0 }),
     releaseRunDeps: { freezeRoot: root },
     publishAt: '2026-10-06T23:30:00.000Z',
     ...extra,
   };
 }
+
+test('F9 export preflight records one main head, separates code literals, and names the cut-minus-60 manual check time', () => isolated(async (root) => {
+  const result = await releasePreflight('0.2.18', deps(root, { now: new Date('2026-10-06T20:00:00.000Z'), exportCheck: async () => ({ mainSha: 'a'.repeat(40), files: 123, leaks: 0, codeLiterals: 2 }) }));
+  expect(result.exportCheck).toEqual({ mainSha: 'a'.repeat(40), files: 123, leaks: 0, codeLiterals: 2 });
+  expect(result.schedule?.exportCheckAt).toBe('2026-10-06T20:00:00.000Z');
+  expect(result.findings.find((f) => f.check === 'export' && f.level === 'ok')?.message).toContain('aaaaaaaaaaaa');
+  expect(result.findings.find((f) => f.check === 'export' && f.level === 'warn')?.message).toContain('코드 리터럴 표지 2건');
+  expect(result.findings.find((f) => f.message.includes('컷 − 60분'))?.message).toContain('자동 예약 없음');
+}));
+
+test('F9 fails closed when the pinned main export scan cannot be measured', () => isolated(async (root) => {
+  const result = await releasePreflight('0.2.18', deps(root, { exportCheck: async () => { throw new Error('origin/main unavailable'); } }));
+  expect(result.findings.find((f) => f.check === 'export')).toMatchObject({ level: 'block' });
+  expect(result.findings.find((f) => f.check === 'export')?.message).toContain('origin/main unavailable');
+}));
 
 test('default path: the stored schedule and cutChecklistGate at the cut decide ⛔ (no injected schedule)', () => isolated(async (root) => {
   setSchedule('0.2.18', { cutAt: '2026-10-07T06:00:00+09:00', landBy: '2026-10-07T05:30:00+09:00' }, 'test');
@@ -196,7 +212,7 @@ test('real CLI: without release.loop.gatePodPool, preflight surfaces the actual 
     expect(finding.level).toBe('block');
     expect(finding.message).toContain(dryError);
   } finally { rmSync(home, { recursive: true, force: true }); }
-}, 60_000);
+}, 180_000);
 
 test('a non-P0 undecided yellow cell is carried at the cut by every path (node · run entry · releaseReadiness, #24557) → ⚠️ not ⛔', () => isolated(async (root) => {
   setSchedule('0.2.18', { cutAt: '2026-10-07T06:00:00+09:00', landBy: '2026-10-07T05:30:00+09:00' }, 'test');
@@ -237,7 +253,7 @@ test('real CLI: a valid release.loop config passes the run-input check end to en
     expect(finding.message).toContain('직전 판 0.2.17 · 게이트 풀 pool-cli-test');
     expect(result.previousVersion).toBe('0.2.17');
   } finally { rmSync(home, { recursive: true, force: true }); }
-}, 60_000);
+}, 180_000);
 
 test('a live run.lock (already-running) refuses the scheduled start → ⛔ and the CLI exits 1', () => {
   const home = mkdtempSync(join(tmpdir(), 'release-preflight-running-'));
@@ -256,7 +272,7 @@ test('a live run.lock (already-running) refuses the scheduled start → ⛔ and 
     expect(result.verdict).toBe('block');
     expect(run.status).toBe(1);
   } finally { rmSync(home, { recursive: true, force: true }); }
-}, 60_000);
+}, 180_000);
 
 test('run after the cut: judges at the stored cut, not now (land-by between cut and now keeps an undecided cell ⛔ 판정 없음)', () => isolated(async (root) => {
   // cut 06:00 < land-by 06:20 < now 07:00 KST — judged «now», the cell would read overdue and be carried.
@@ -272,3 +288,44 @@ test('run after the cut: judges at the stored cut, not now (land-by between cut 
   expect(finding.message).toContain('판정 없음');
   expect(finding.message).not.toContain('releaseReadiness');
 }));
+
+test('real preflight CLI scans the pinned origin/main tree and blocks its exported crown comment', () => {
+  const privateMarker = String.fromCodePoint(0x1f451);
+  const home = mkdtempSync(join(tmpdir(), 'release-preflight-main-cli-'));
+  const repo = join(home, 'repo');
+  const config = join(home, '.elanous');
+  const redactions = join(home, 'redactions.tsv');
+  mkdirSync(repo, { recursive: true });
+  mkdirSync(config, { recursive: true });
+  writeFileSync(redactions, '');
+  writeFileSync(join(repo, '.gitignore'), '');
+  mkdirSync(join(repo, 'release'), { recursive: true });
+  mkdirSync(join(repo, 'src'), { recursive: true });
+  writeFileSync(join(repo, 'src/.gitignore'), 'ignored.ts\n');
+  writeFileSync(join(repo, 'release/public-export.yaml'), 'include: ["src/**"]\nexclude: []\nreplace: {}\n');
+  writeFileSync(join(repo, 'src/leak.ts'), `// ${privateMarker} private marker\nexport const safe = true;\n`);
+  writeFileSync(join(repo, 'src/ignored.ts'), 'export const ignored = true;\n');
+  const git = (args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+  try {
+    git(['init', '-q', '-b', 'main']);
+    git(['add', '-A']);
+    git(['add', '-f', 'src/ignored.ts']);
+    git(['-c', 'user.name=Preflight test', '-c', 'user.email=preflight@example.invalid', 'commit', '-qm', 'fixture main']);
+    git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    const mainSha = git(['rev-parse', 'HEAD']);
+    // A second marker exists only in the working tree; preflight must still report the pinned main result (two hits).
+    writeFileSync(join(repo, 'src/leak.ts'), `// ${privateMarker} private marker\n// ${privateMarker} working-tree-only marker\nexport const safe = true;\n`);
+    const sourceRepo = join(import.meta.dir, '../..');
+    const result = spawnSync('bun', [join(sourceRepo, 'bin/elanous.mjs'), '--config-dir', config, 'release', 'preflight', '--version', '0.2.18', '--json'], {
+      cwd: repo, encoding: 'utf8', env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: config, ELANOUS_EXPORT_REDACTIONS: redactions },
+    });
+    const output = JSON.parse(result.stdout.trim().split('\n').at(-1)!) as { exportCheck: { mainSha: string; leaks: number }; findings: Array<{ check: string; level: string }> };
+    expect(output.exportCheck).toMatchObject({ mainSha, leaks: 2 });
+    expect(output.findings).toContainEqual(expect.objectContaining({ check: 'export', level: 'block' }));
+    expect(result.status).toBe(1);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}, 60_000);

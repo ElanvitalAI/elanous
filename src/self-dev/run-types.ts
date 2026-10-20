@@ -98,7 +98,7 @@ export interface SelfDevJobResult {
   /** Commits this child added against its own `--base`. 0 is not completion progress. */
   commitsAheadOfBase?: number;
   /** A dependency is done but its result is not on main; no child was launched. */
-  blockReason?: 'parent-unlanded';
+  blockReason?: 'parent-unlanded' | 'dependency-needs-human';
   parentPrNumber?: number;
   /** The upstream completed in a worktree without opening a PR. */
   parentNoPr?: true;
@@ -127,6 +127,10 @@ export interface SelfDevJobResult {
   oscillationRepairOf?: string;
   /** Verbatim final reviewer must-fix items for a bounded helper repair. */
   reviewMustFix?: string[];
+  /** REVIEW-MUSTFIX-CLASSIFY 범위 축 — PR 변경 파일. undefined = 안 쟀다(범위 판정은 ask-owner 로 기운다 · 생산자는 다음 조각). */
+  changedFiles?: string[];
+  /** REVIEW-MUSTFIX-CLASSIFY 범위 축 — 골 대상 경로(goal.hotPaths). undefined = 골이 선언하지 않았다. */
+  targetPaths?: string[];
   /** Whether the child review actually ran; omitted preserves legacy producers. */
   reviewed?: boolean;
   /** Why the child did not run review; omitted preserves legacy review-unobserved handling. */

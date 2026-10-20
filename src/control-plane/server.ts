@@ -164,15 +164,16 @@ export function startControlServer(opts: ControlServerOptions = {}): {
           if (workerRegister) {
             if (!machine) throw new ResourceLedgerError(403, 'worker-host-required');
             const body = podWorkerBody(await req.json());
-            const { workerId, machine: workerMachine, key, ttlMs } = body;
+            const { workerId, machine: workerMachine, podUid, key, ttlMs } = body;
             if (typeof workerId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$/.test(workerId)
               || typeof workerMachine !== 'string' || !workerMachine.trim()
+              || typeof podUid !== 'string' || !podUid.trim()
               || typeof ttlMs !== 'number' || !Number.isSafeInteger(ttlMs) || ttlMs <= 0 || ttlMs > MAX_POD_WORKER_TTL_MS) throw new ResourceLedgerError(400, 'invalid-pod-worker-lease');
             requireMachine(workerMachine);
             const stale = await currentWorkerPrimary();
             if (stale) return stale;
             return json(await ledger.withGuardedWorkerMutation(async () => !(await currentWorkerPrimary()),
-              () => ledger.registerPodWorker({ workerId, machine: workerMachine, key: podWorkerKey(key), ttlMs, owner })));
+              () => ledger.registerPodWorker({ workerId, machine: workerMachine, podUid, key: podWorkerKey(key), ttlMs, owner })));
           }
           if (workerAcquire) {
             if (scope !== 'member') throw new ResourceLedgerError(403, 'worker-consumer-required');
@@ -244,7 +245,8 @@ export function startControlServer(opts: ControlServerOptions = {}): {
               name: url.searchParams.get('name') || undefined,
             });
             return json({ resources: rows.map(row => row.kind === 'pod-worker-lease'
-              ? { ...row, attrs: { key: row.attrs.key, state: row.attrs.state, generation: row.attrs.generation } }
+              ? { ...row, attrs: { key: row.attrs.key, podUid: row.attrs.podUid,
+                state: row.attrs.state, generation: row.attrs.generation, idleTtlMs: row.attrs.idleTtlMs } }
               : row.kind === 'port-lease'
               ? { ...row, attrs: { ...row.attrs, leaseId: undefined } }
               : row) });

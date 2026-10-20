@@ -5,13 +5,34 @@ import { join } from 'node:path';
 import { runOnboarding, runOnboardingNonInteractive, type WizardIO } from '../src/onboarding.js';
 import type { ChoiceOption } from '../src/onboarding/io-extended.js';
 import { nonInteractiveIO } from '../src/onboarding/non-interactive.js';
+import type { LLMProvider } from '../src/llm.js';
+import type { LlmDetectDeps } from '../src/cli/llm-detect-cli.js';
+import type { UserConfig } from '../src/user-config.js';
 import { pickCodexAuthMode } from '../src/codex/setup.js';
 import { saveTokens } from '../src/oauth/store.js';
 
 const providerChoices: ChoiceOption<{ key: string }>[] = [
   { key: 'first', label: '첫 번째', value: { key: 'openai' } },
   { key: 'second', label: '두 번째', value: { key: 'grok' } },
+  { key: 'third', label: '세 번째', value: { key: 'openrouter' } },
 ];
+
+function llmDetectDeps(probeSuccess: boolean, onResolve?: () => void): LlmDetectDeps {
+  return {
+    config: () => ({ llm: { provider: 'auto' } } as UserConfig),
+    resolve: (candidate) => {
+      onResolve?.();
+      return {
+        name: candidate.provider,
+        defaultModel: 'test-model',
+        available: () => true,
+        chat: async function* () { yield 'OK'; },
+      } as LLMProvider;
+    },
+    probeProvider: async () => ({ success: probeSuccess, durationMs: 1, model: 'test-model' }),
+    discoverUpstageModels: async () => [],
+  };
+}
 
 const skillChoices: ChoiceOption<{ kind: 'preset'; preset: { key: string } }>[] = [
   { key: 'first', label: 'カスタム', value: { kind: 'preset', preset: { key: 'opencode' } } },
@@ -30,6 +51,48 @@ describe('onboarding/non-interactive · scripted answer resolution', () => {
     expect(choice).toEqual({ key: 'grok' });
     expect(await io.askSecret!('unrelated localized secret prompt', 'apiKey')).toBe('xai-foo');
     io.close();
+  });
+
+  test('provider detection uses a successful-probe result only when no provider answer is configured', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'onboarding-probe-home-'));
+    const env = {
+      HOME: home,
+      XDG_CONFIG_HOME: join(home, 'xdg'),
+      CODEX_HOME: join(home, 'codex'),
+      OPENROUTER_API_KEY: 'test-openrouter-key',
+    };
+    try {
+      const io = nonInteractiveIO({ answers: {}, env, llmDetectDeps: llmDetectDeps(true) });
+      io.showStep!({ index: 1, total: 5, title: 'LLM' });
+      expect(await io.choose!('provider', providerChoices, {}, 'llm', 'provider')).toEqual({ key: 'openrouter' });
+
+      let explicitProbeCalls = 0;
+      const explicit = nonInteractiveIO({
+        answers: { llm: { provider: 'grok' } },
+        env,
+        llmDetectDeps: llmDetectDeps(true, () => { explicitProbeCalls += 1; }),
+      });
+      explicit.showStep!({ index: 1, total: 5, title: 'LLM' });
+      expect(await explicit.choose!('provider', providerChoices, {}, 'llm', 'provider')).toEqual({ key: 'grok' });
+      expect(explicitProbeCalls).toBe(0);
+
+      const failedProbe = nonInteractiveIO({ answers: {}, env, llmDetectDeps: llmDetectDeps(false) });
+      failedProbe.showStep!({ index: 1, total: 5, title: 'LLM' });
+      expect(await failedProbe.choose!('provider', providerChoices, { defaultIndex: 1 }, 'llm', 'provider')).toEqual({ key: 'grok' });
+
+      let savedProbeCalls = 0;
+      const configured = nonInteractiveIO({
+        answers: {},
+        env,
+        initialProvider: 'grok',
+        llmDetectDeps: llmDetectDeps(true, () => { savedProbeCalls += 1; }),
+      });
+      configured.showStep!({ index: 1, total: 5, title: 'LLM' });
+      expect(await configured.choose!('provider', providerChoices, { defaultIndex: 0 }, 'llm', 'provider')).toEqual({ key: 'grok' });
+      expect(savedProbeCalls).toBe(0);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   test('skills selects the matching key from the actual presented choices', async () => {
@@ -200,6 +263,64 @@ describe('onboarding/non-interactive · scripted answer resolution', () => {
       stderr.mockRestore();
       if (previousLanguage === undefined) delete process.env.ELANOUS_LANG;
       else process.env.ELANOUS_LANG = previousLanguage;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('runOnboardingNonInteractive selects a detected provider only after its probe succeeds', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'onboarding-probed-provider-'));
+    const answerFilePath = join(root, 'answers.json');
+    try {
+      writeFileSync(answerFilePath, JSON.stringify({
+        skills: { activeSet: 'codex' },
+        obsidian: { vault: root },
+        telegram: { enabled: false },
+        discord: { enabled: false },
+      }));
+      const cfg = await runOnboardingNonInteractive({
+        path: join(root, 'config.json'),
+        answerFilePath,
+        env: {
+          HOME: root,
+          XDG_CONFIG_HOME: join(root, 'xdg'),
+          CODEX_HOME: join(root, 'codex'),
+          OPENROUTER_API_KEY: 'test-openrouter-key',
+        },
+        llmDetectDeps: llmDetectDeps(true),
+      });
+      expect(cfg.llm.provider).toBe('openrouter');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('runOnboardingNonInteractive keeps an existing provider when the picker default differs', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'onboarding-saved-provider-'));
+    const answerFilePath = join(root, 'answers.json');
+    const configPath = join(root, 'config.json');
+    let resolveCalls = 0;
+    try {
+      writeFileSync(configPath, JSON.stringify({ llm: { provider: 'grok', apiKey: 'test-grok-key' } }));
+      writeFileSync(answerFilePath, JSON.stringify({
+        skills: { activeSet: 'codex' },
+        obsidian: { vault: root },
+        telegram: { enabled: false },
+        discord: { enabled: false },
+      }));
+      const cfg = await runOnboardingNonInteractive({
+        path: configPath,
+        answerFilePath,
+        env: {
+          HOME: root,
+          XDG_CONFIG_HOME: join(root, 'xdg'),
+          CODEX_HOME: join(root, 'codex'),
+          OPENROUTER_API_KEY: 'test-openrouter-key',
+        },
+        llmDetectDeps: llmDetectDeps(true, () => { resolveCalls += 1; }),
+      });
+      expect(cfg.llm.provider).toBe('grok');
+      expect(resolveCalls).toBe(0);
+    } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });

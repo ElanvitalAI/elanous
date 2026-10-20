@@ -66,6 +66,7 @@ describe.concurrent('config get universe selection', () => {
     delete env.ELANOUS_STATE_DIR;
     delete env.ELANOUS_CONFIG_DIR;
     delete env.ELANOUS_TEST_STATE_DIR;
+    delete env.XDG_CONFIG_HOME;
     try {
       mkdirSync(join(home, '.elanous'), { recursive: true });
       mkdirSync(testRoot, { recursive: true });
@@ -94,6 +95,7 @@ describe.concurrent('config get universe selection', () => {
     const env = { ...process.env };
     delete env.ELANOUS_STATE_DIR;
     delete env.ELANOUS_CONFIG_DIR;
+    delete env.XDG_CONFIG_HOME;
     try {
       await writeFile(join(firstDir, 'config.json'), JSON.stringify({ llm: { provider: 'anthropic' } }));
       await writeFile(join(secondDir, 'config.json'), JSON.stringify({ llm: { provider: 'openai' } }));
@@ -3751,14 +3753,17 @@ describe('file-backed self CLI entrances', () => {
     const self = program.commands.find((command) => command.name() === 'self')!;
     const orchestrate = self.commands.find((command) => command.name() === 'orchestrate')!;
     const implement = self.commands.find((command) => command.name() === 'implement')!;
-    expect(orchestrate.parseOptions(['positional goal', '--goal-file', 'a.md', '--goal-file', 'b.md']).operands).toEqual(['positional goal']);
-    expect(orchestrate.opts().goalFile).toEqual(['a.md', 'b.md']);
-    expect(implement.parseOptions(['--feature-file', 'feature.txt']).operands).toEqual([]);
-    expect(implement.opts().featureFile).toBe('feature.txt');
     const dir = mkdtempSync(join(tmpdir(), 'orchestrate-input-'));
+    const a = join(dir, 'a.md');
+    const b = join(dir, 'b.md');
+    const featurePath = join(dir, 'feature.txt');
+    const previousGoalFile = orchestrate.opts().goalFile;
+    const previousFeatureFile = implement.opts().featureFile;
     try {
-      const a = join(dir, 'a.md');
-      const b = join(dir, 'b.md');
+      expect(orchestrate.parseOptions(['positional goal', '--goal-file', a, '--goal-file', b]).operands).toEqual(['positional goal']);
+      expect(orchestrate.opts().goalFile).toEqual([a, b]);
+      expect(implement.parseOptions(['--feature-file', featurePath]).operands).toEqual([]);
+      expect(implement.opts().featureFile).toBe(featurePath);
       writeFileSync(a, 'first;;goal');
       writeFileSync(b, 'second goal');
       expect(readSelfOrchestrateGoals(['positional goal'], [a, b])).toEqual({
@@ -3767,7 +3772,11 @@ describe('file-backed self CLI entrances', () => {
       });
       expect(readSelfOrchestrateGoals(['positional goal'])).toEqual({ request: 'positional goal', goals: ['positional goal'] });
       expect(() => readSelfOrchestrateGoals([], [join(dir, 'missing.md')])).toThrow();
-    } finally { await rm(dir, { recursive: true, force: true }); }
+    } finally {
+      orchestrate.setOptionValue('goalFile', previousGoalFile);
+      implement.setOptionValue('featureFile', previousFeatureFile);
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

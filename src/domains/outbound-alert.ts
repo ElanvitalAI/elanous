@@ -203,8 +203,8 @@ function deliverToOrigin(origin: MissionOrigin, text: string, onBot?: (bot: stri
   if (origin.channel !== 'telegram' || origin.chatId == null) return false;
   const token = resolveBotToken(origin.botId);
   if (!token) return false;
-  onBot?.(botLabel(token));
   assertTestSendFaked('send a real Telegram message to the origin');
+  onBot?.(botLabel(token));
   try { return sendTelegramRaw(token, origin.chatId, text, origin.threadId); } catch { return false; }
 }
 
@@ -742,7 +742,7 @@ export function sendTelegramDirect(
     } catch { /* unavailable main bot */ }
     const rcToken = cfg?.telegram.reportChannel?.botToken;
     logKindRouteFallback(kind, home ? 'main-home' : 'none', !!mainToken && !!cfg?.telegram.reportChannel && (!rcToken || rcToken === mainToken));
-    if (home) { onBot?.(botLabel(home.botToken)); return sendRaw(home.botToken, String(home.chatId), text); }
+    if (home) { assertTestSendFaked('send a real Telegram message', !deps.sendRaw); onBot?.(botLabel(home.botToken)); return sendRaw(home.botToken, String(home.chatId), text); }
     console.error('[outbound] 운영 kind 메인 봇/홈 미설정 — 콘솔 출력\n' + text);
     return false;
   }
@@ -755,6 +755,7 @@ export function sendTelegramDirect(
   }
   logKindRouteFallback(kind, tok && chat ? 'conatus-env' : 'none', false);
   if (!tok || !chat) { console.error('[outbound] 토큰/chat 미설정 — 콘솔 출력\n' + text); return false; }
+  assertTestSendFaked('send a real Telegram message', !deps.sendRaw);
   onBot?.(botLabel(tok));
   return sendRaw(tok, chat, text);
 }

@@ -10,8 +10,8 @@
 graph_id: research-loop
 version: 5
 entry_node: investigate
-terminal_nodes: [merge]
-runner_inputs: [goal, worktree, branch, review-intent, head-sha, base-branch]
+terminal_nodes: [landed, needs-human]
+runner_inputs: [goal, worktree, branch, review-intent, head-sha, base-branch, ask, context, prior]
 # ⛔ 키 이름은 파서(`src/self-implement/graph-yaml.ts:201`)가 아는 것뿐이다 — 다른 이름은 «조용히» 무시된다.
 docs_only_gate_skip: true
 
@@ -109,6 +109,18 @@ nodes:
       tools: gh-pr-merge
       outputs: [merged]
 
+  # Only a PR landing refusal supplies the pinned context required by recover@1.
+  - node_id: recover
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: recover@1
+    budget: { inner_steps: 4 }
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+
+  - { node_id: landed, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: needs-human, kind: gate, recipe: none, max_visits: 1 }
+
 edges:
   # ⛔⭐ 유일하게 implement-loop 과 «다른» 자리 — gate 를 «건너뛸 수 있다».
   #   조건은 코드가 낸다: 변경 파일에 «코드»가 있나(routeGate). 못 세면 «돈다»(fail-safe).
@@ -150,3 +162,12 @@ edges:
 
   - from: open-pr
     to: merge
+
+  - from: merge
+    on: outcome
+    map: { merged: landed, land-refused: recover, ok: needs-human, fail: needs-human }
+
+  # The train/TA owns retry effects; the unit only classifies the refusal.
+  - from: recover
+    on: outcome
+    map: { done: needs-human, rework: needs-human, needs-human: needs-human, failed: needs-human }

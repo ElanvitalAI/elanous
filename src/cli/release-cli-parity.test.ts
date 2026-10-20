@@ -28,7 +28,8 @@ describe('release checklist five-surface parity at the real CLI entrance', () =>
       expect(missing.stderr).toContain('origin/main에 없는 파일');
       const declared = cli(root, 'retitle', 'PATH-CODE', '대상 경로: src/new-release-cell.ts\n신설: src/new-release-cell.ts', '--version', version);
       expect(declared.exitCode).toBe(0);
-      expect(declared.stderr).not.toContain('⚠ 대상 경로:');
+      expect(declared.stderr).not.toContain('origin/main에 없는 파일');
+      expect(declared.stderr).toContain('- 완료 경계 코드: 줄이 없다');
       const ops = cli(root, 'add', 'OPS', '운영 확인', '--kind', 'ops', '--version', version);
       expect(ops.exitCode).toBe(0);
       expect(ops.stderr).not.toContain('⚠ 대상 경로:');

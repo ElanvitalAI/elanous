@@ -65,7 +65,8 @@ describe('release-loop TUI node checks', () => {
   test('node output includes regress but its pass/flaky/fail/error verdict depends only on TUI sessions', () => {
     const checks = tuiChecks({ readyMs: 9000, first, help, afterEsc: first });
     const regress = { pass: 6, fail: 1, results: Array.from({ length: 7 }, (_, i) => ({ id: `R${i + 1}`, title: 'check', ok: i !== 2, reason: 'measured' })) };
-    expect(tuiNodeOutput('abc', [{ checks }], regress)).toMatchObject({ verdict: 'pass', regress, attempts: 1 });
+    expect(tuiNodeOutput('abc', [{ checks }], regress)).toMatchObject({ verdict: 'pass', regress, attempts: 1,
+      summary: 'TUI pass: basic 6/6 · regress 6 pass / 1 fail (R3)' });
     expect(tuiNodeOutput('abc', [{ checks }, { checks }], { unmeasured: '3분 시간 초과' })).toMatchObject({ verdict: 'flaky', attempts: 2, regress: { unmeasured: '3분 시간 초과' } });
     expect(tuiNodeOutput('abc', [{ checks: [{ id: 'boot', pass: false, detail: 'never ready' }] }], regress).verdict).toBe('fail');
     expect(tuiNodeOutput('abc', [], regress, 'session error').verdict).toBe('error');

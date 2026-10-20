@@ -195,6 +195,20 @@ describe('host lock wiring', () => {
     expect(script).not.toContain('trap \'rm -rf "$T"\' EXIT');
   });
 
+  test('typecheck dispatch forwards stable checkout and does not run locally on remote failure', async () => {
+    const runner = fakeRunner({ ssh: { rc: 97, stdout: '', stderr: '__GATE_REMOTE_INFRA=offline\n' } });
+    const io = sink();
+    let localCalls = 0;
+    const rc = await dispatchHeavyCheck({ tool: 'ci-typecheck-changed', repo: '/r', flags: { remote: true, local: false },
+      explicitRemoteOnly: true, stableCheckout: true, installPwa: true, remoteArgv: ['bun', 'run', 'scripts/ci-typecheck-changed.ts', '--local'],
+      runLocal: () => { localCalls++; return 0; } }, { runner, settings, write: io.write });
+    expect(rc).toBe(1);
+    expect(localCalls).toBe(0);
+    expect(io.err.join('')).toContain('remote unmeasured');
+    expect(runner.scripts[0]).toContain('ELANOUS_TSC_CACHE_DIR="$HOME/.cache/elanous/gate-remote/slot$GATE_REMOTE_SLOT/cache"');
+    expect(runner.scripts[0]).toContain('bun-install-pwa');
+  });
+
   test('the remote script does all work inside run.sh under the slot lock', () => {
     const script = remoteScript({ mirror: '~/m.git', commit: HEAD, fetchShas: [HEAD], argv: ['x'], installPwa: false, hostCap: 2 });
     const runStart = script.indexOf("<<'__GATE_REMOTE_RUN__'");
@@ -285,6 +299,24 @@ describe('onRemoteOutcome hook (self gate --artifact-dir fetch)', () => {
 });
 
 describe('self gate explicit remote placement', () => {
+  test('changed typecheck keeps node-b fixed and becomes unmeasured during a release reservation', async () => {
+    const root = slotDir();
+    const release = reserveReleaseGateHosts(root, 'gate-run', ['node-b']);
+    try {
+      const runner = fakeRunner();
+      const io = sink();
+      let localCalls = 0;
+      const rc = await dispatchHeavyCheck({ tool: 'ci-typecheck-changed', repo: '/r', flags: { local: false, remote: 'node-b' },
+        explicitRemoteOnly: true, reservationRoot: root, remoteArgv: ['x'], runLocal: () => { localCalls++; return 0; } },
+      { runner, settings, env: {}, load1: 1, write: io.write });
+      expect(rc).toBe(1);
+      expect(localCalls).toBe(0);
+      expect(runner.calls.some(([kind]) => kind === 'ssh')).toBe(false);
+      expect(io.err.join('')).toContain('remote unmeasured');
+      expect(io.err.join('')).not.toContain('using node-c');
+    } finally { release(); }
+  });
+
   test('a release gate reservation reroutes node-b to node-c and names the reason', async () => {
     const root = slotDir();
     const release = reserveReleaseGateHosts(root, 'gate-run', ['node-b']);
@@ -697,18 +729,20 @@ describe('entry-point wiring (spawned, no remote work)', () => {
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('invalid --remote host');
   });
-  test('a valid --remote call reaches the dispatcher: missing origin/main preserves tsc fallback but self gate refuses local measurement', () => {
-    // A scratch repo with no origin/main: the dispatcher falls back before any push/ssh, so no host is contacted.
+  test('a valid --remote call reaches the dispatcher: missing origin/main refuses local measurement for tsc and self gate', () => {
+    // A scratch repo with no origin/main: the dispatcher refuses before any push/ssh, so no host is contacted.
     const scratch = slotDir();
     spawnSync('git', ['init', '-q'], { cwd: scratch });
     spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'init'], { cwd: scratch });
     // Drop the remote-child marker: when this suite itself runs inside a remote gate, it would (correctly) skip dispatch.
     const { ELANOUS_GATE_REMOTE_CHILD: _child, ...inherited } = process.env;
     const env = { ...inherited, NODE_ENV: 'test', ELANOUS_STATE_DIR: join(scratch, '.state') };
+    mkdirSync(join(env.ELANOUS_STATE_DIR, 'release', 'gate-host-reservations'), { recursive: true });
     mkdirSync(join(scratch, '.elanous-test', 'release', 'gate-host-reservations'), { recursive: true });
     const tsc = spawnSync('bun', [join(repoRoot, 'scripts/ci-typecheck-changed.ts'), '--remote', 'node-b'], { cwd: scratch, encoding: 'utf8', env });
-    expect(tsc.stderr).toContain('[gate.remote] fallback to local — origin-main-unresolved');
-    expect(`${tsc.stdout}${tsc.stderr}`).toContain('[tsc-gate]');
+    expect(tsc.stderr).toContain('[gate.remote] remote unmeasured on node-b — origin-main-unresolved');
+    expect(tsc.status).toBe(1);
+    expect(`${tsc.stdout}${tsc.stderr}`).not.toContain('[tsc-gate]');
     const gate = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--test', 'self', 'gate', '--changed', '--base', 'HEAD', '--remote', 'node-b'], { cwd: scratch, encoding: 'utf8', env });
     expect(gate.stderr).toContain('[gate.remote] remote unmeasured on node-b — origin-main-unresolved');
     expect(gate.status).toBe(1);

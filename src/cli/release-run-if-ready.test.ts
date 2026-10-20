@@ -45,7 +45,7 @@ test('graph sees exclusive lock with pid and startedAt; both completion and exce
   const now = () => new Date('2026-10-04T04:10:00Z');
   const deps = { ledgerRoot: root, readiness: ready, pid: 427, now };
   expect(await runReleaseIfReady(version, { ...deps, run: async () => {
-    expect(JSON.parse(readFileSync(lock, 'utf8'))).toEqual({ pid: 427, startedAt: '2026-10-04T04:10:00.000Z' });
+    expect(JSON.parse(readFileSync(lock, 'utf8'))).toMatchObject({ pid: 427, startedAt: '2026-10-04T04:10:00.000Z' });
     return 'done';
   } })).toEqual({ skipped: false, result: 'done' });
   expect(existsSync(lock)).toBe(false);
@@ -71,6 +71,83 @@ test('two concurrent ready entrants call the graph only once; existing lock is n
   expect(calls).toBe(1);
   release();
   expect(await first).toEqual({ skipped: false, result: 'first' });
+  expect(existsSync(lock)).toBe(false);
+}));
+
+test('--force-new bypasses only the existing run lock while still checking readiness', async () => fixture(async (root, lock) => {
+  mkdirSync(join(root, 'release', version), { recursive: true });
+  writeFileSync(lock, JSON.stringify({ pid: process.pid, startedAt: '2026-10-20T04:40:00Z' }));
+  let calls = 0;
+  const result = await runReleaseIfReady(version, { ledgerRoot: root, forceNew: true,
+    readiness: (_version, options) => releaseReadiness(version, { ledgerRoot: root, checklist: () => gate, ...options }),
+    run: async () => { calls++; return 'forced'; } });
+  expect(result).toEqual({ skipped: false, result: 'forced' });
+  expect(calls).toBe(1);
+  expect(existsSync(lock)).toBe(true);
+}));
+
+test('a normal entrant refuses while a force-new run is starting before its graph state is saved', async () => fixture(async (root) => {
+  let release!: () => void;
+  let entered!: () => void;
+  const waiting = new Promise<void>((resolve) => { release = resolve; });
+  const running = new Promise<void>((resolve) => { entered = resolve; });
+  let normalCalls = 0;
+  const forced = runReleaseIfReady(version, { ledgerRoot: root, forceNew: true, readiness: ready,
+    run: async () => { entered(); await waiting; return 'forced'; } });
+  await running;
+  const normal = await runReleaseIfReady(version, { ledgerRoot: root, readiness: ready,
+    run: async () => { normalCalls++; return 'normal'; } });
+  expect(normal).toEqual({ skipped: true, reason: 'already-running', detail: 'run.lock already exists' });
+  expect(normalCalls).toBe(0);
+  release();
+  expect(await forced).toEqual({ skipped: false, result: 'forced' });
+  expect(await runReleaseIfReady(version, { ledgerRoot: root, readiness: ready,
+    run: async () => 'after' })).toEqual({ skipped: false, result: 'after' });
+}));
+
+test('force-new rechecks readiness after its start marker and does not launch after publication', async () => fixture(async (root) => {
+  let checks = 0;
+  let calls = 0;
+  const result = await runReleaseIfReady(version, { ledgerRoot: root, forceNew: true,
+    readiness: () => ++checks === 1 ? ready() : { ready: false, reason: 'already-published', details: 'published while starting' },
+    run: async () => { calls++; return 'must-not-run'; } });
+  expect(result).toEqual({ skipped: true, reason: 'already-published', detail: 'published while starting' });
+  expect(checks).toBe(2);
+  expect(calls).toBe(0);
+}));
+
+test('an EEXIST thrown by the graph remains a graph error', async () => fixture(async (root) => {
+  const graphError = Object.assign(new Error('graph file exists'), { code: 'EEXIST' });
+  await expect(runReleaseIfReady(version, { ledgerRoot: root, readiness: ready,
+    run: async () => { throw graphError; } })).rejects.toBe(graphError);
+}));
+
+test('a dead owner lock is reclaimed before the scheduled graph starts', async () => fixture(async (root, lock) => {
+  mkdirSync(join(root, 'release', version), { recursive: true });
+  writeFileSync(lock, JSON.stringify({ pid: 2147483647, startedAt: '2026-10-19T01:00:00Z' }));
+  let calls = 0;
+  const result = await runReleaseIfReady(version, { ledgerRoot: root,
+    readiness: (_version, options) => releaseReadiness(version, { ledgerRoot: root, checklist: () => gate, ...options }),
+    run: async () => { calls++; expect(JSON.parse(readFileSync(lock, 'utf8')).pid).toBe(process.pid); return 'reclaimed'; } });
+  expect(result).toEqual({ skipped: false, result: 'reclaimed' });
+  expect(calls).toBe(1);
+  expect(existsSync(lock)).toBe(false);
+}));
+
+test('a reused live PID does not keep an older owner lock alive', async () => fixture(async (root, lock) => {
+  mkdirSync(join(root, 'release', version), { recursive: true });
+  writeFileSync(lock, JSON.stringify({ pid: process.pid, pidStartedAt: '2026-01-01T00:00:00Z', startedAt: '2026-01-01T00:01:00Z' }));
+  let calls = 0;
+  const result = await runReleaseIfReady(version, { ledgerRoot: root,
+    readiness: (_version, options) => releaseReadiness(version, { ledgerRoot: root, checklist: () => gate, ...options }),
+    run: async () => {
+      calls++;
+      const owner = JSON.parse(readFileSync(lock, 'utf8')) as { pidStartedAt: string };
+      expect(Date.parse(owner.pidStartedAt)).toBeGreaterThan(Date.parse('2026-01-01T00:00:00Z'));
+      return 'reclaimed-reused-pid';
+    } });
+  expect(result).toEqual({ skipped: false, result: 'reclaimed-reused-pid' });
+  expect(calls).toBe(1);
   expect(existsSync(lock)).toBe(false);
 }));
 
@@ -110,8 +187,9 @@ test('a checklist blocked after preflight is rechecked under lock and skips the 
   const result = await runReleaseIfReady(version, { ledgerRoot: root,
     readiness: (_version, options) => {
       checks++;
-      if (!options) return ready();
-      expect(options.isPidAlive?.(process.pid)).toBe(false);
+      if (checks === 1) { expect(existsSync(lock)).toBe(false); return ready(); }
+      expect(existsSync(lock)).toBe(true);
+      expect(options?.isPidAlive?.(process.pid)).toBe(false);
       return { ready: false, reason: 'checklist-blocked', details: { ...gate, ok: false, red: ['K16'] } };
     },
     run: async () => { graphCalls++; return 'graph'; } });

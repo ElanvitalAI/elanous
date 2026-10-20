@@ -14,8 +14,8 @@
 //
 // index.ts 의 액션은 옵션 파싱과 실제 의존 배선만 남는다(얇은 껍데기).
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { tierModel } from '../llm/model-defaults.js';
@@ -49,6 +49,8 @@ export interface SelfReviewCliOpts {
   json?: boolean | undefined;
   /** Save completed reviews under the task-agent state's review-results directory. */
   save?: string | undefined;
+  /** One invocation past r5, only for a PR in OP's traffic.json allowlist; the reason is recorded before review starts. */
+  overCapReason?: string | undefined;
 }
 
 /** 셸/네트워크/로그 경계 — 테스트는 전부 대역으로 채운다. */
@@ -101,6 +103,10 @@ export interface SelfReviewCliDeps {
   registerSink(surface: string): Promise<void>;
   /** `data` 는 payload 객체 — 순수 헬퍼가 만든 관측 타입도 그대로 받는다(인덱스 시그니처 강요 금지). */
   log(event: string, data: object, opts?: { level?: 'info' | 'warn' | 'error' }): void;
+  /** Doctor observation lane, kept separate from the existing self-review event contract. */
+  observeDoctorReview?(event: string, data: object, opts?: { level?: 'info' | 'warn' | 'error' }): void;
+  /** Optional MK doctor module; absence or failure leaves the original intent intact. */
+  loadDoctorReviewBrief?(input: { pr: number; head: string; title: string; body: string; changedFiles: string[] }): Promise<string | null>;
   info(text: string): void;
   error(text: string): void;
   print(text: string): void;
@@ -118,6 +124,68 @@ export interface SelfReviewCliOutcome {
   results: Array<Record<string, unknown>>;
   /** 리뷰하지 못한 PR 수(`gh pr diff` 실패 · ACP 리뷰 reviewed=false) — json·비json 둘 다 센다. index.ts 가 1 이상이면 rc=1. */
   failed: number;
+}
+
+/** Saved results are round evidence only when their PR, exact head and reviewed status agree. */
+export function savedReviewHeads(pr: string, root = effectiveInstanceRoot()): string[] {
+  const dir = join(root, 'review-results');
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return []; }
+  // Manual review saves in the operating house also use head10; the JSON's full head is authoritative.
+  const matching = new RegExp(`^.+-${pr}-([a-f0-9]{7,40})\\.json$`, 'i');
+  const heads = new Set<string>();
+  for (const name of names) {
+    const match = matching.exec(name);
+    if (!match) continue;
+    try {
+      const raw: unknown = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+      const result = raw as Record<string, unknown>;
+      const head = result.headCommit;
+      if (String(result.pr) !== pr || result.reviewed !== true || typeof head !== 'string'
+        || !COMMIT_OID.test(head) || !head.toLowerCase().startsWith(match[1]!.toLowerCase())) continue;
+      heads.add(head.toLowerCase());
+    } catch { /* corrupt or partial result is not a completed round */ }
+  }
+  return [...heads];
+}
+
+function normalizeReviewPrArg(input: string, deps: SelfReviewCliDeps): string | null {
+  if (/^#?[1-9]\d*$/.test(input)) return input.replace(/^#/, '');
+  try {
+    const url = new URL(input);
+    if (url.protocol !== 'https:') return null;
+    const pr = /^\/[^/]+\/[^/]+\/pull\/([1-9]\d*)\/?$/.exec(url.pathname)?.[1];
+    if (!pr) return null;
+    // A URL from another repository must not inherit this repository's saved review history.
+    const view = deps.gh(['pr', 'view', pr, '--json', 'url'], 15_000);
+    if (view.status !== 0) return null;
+    const actual = new URL((JSON.parse(view.stdout) as { url?: string }).url ?? '');
+    const identity = (value: URL): string => `${value.host.toLowerCase()}${value.pathname.replace(/\/$/, '').toLowerCase()}`;
+    return actual.protocol === 'https:' && identity(actual) === identity(url) ? pr : null;
+  } catch { return null; }
+}
+
+function claimCapOverride(pr: string, head: string, reason: string, now: number): boolean {
+  const dir = join(effectiveInstanceRoot(), 'review-results');
+  try {
+    mkdirSync(dir, { recursive: true });
+    // wx is atomic across concurrent CLI processes; a PR receives one recorded exception.
+    writeFileSync(join(dir, `cap-override-${pr}.json`), JSON.stringify({ pr, head, reason, claimedAt: now }) + '\n', { flag: 'wx' });
+    return true;
+  } catch { return false; }
+}
+
+/** OP owns this list. Missing, unreadable, or malformed traffic never grants a review exception. */
+function opAllowsReviewOverCap(pr: string): boolean {
+  const path = process.env.ELANOUS_TRAFFIC_SIGNAL ?? join(homedir(), 'elanous-hq', 'seat-state', 'OP', 'traffic.json');
+  try {
+    const value: unknown = JSON.parse(readFileSync(path, 'utf8'));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const allow = (value as Record<string, unknown>).reviewOverCapAllow;
+    return Array.isArray(allow) && allow.every((number) => Number.isSafeInteger(number) && number > 0)
+      && allow.includes(Number(pr));
+  } catch { return false; }
 }
 
 interface GhResult {
@@ -1285,7 +1353,8 @@ async function runSelfReviewCliCommandPinned(
   // 관측 sink는 모든 종료 경로보다 먼저 등록해 거부도 운영 로그에 남긴다.
   await deps.registerSink('self-review');
 
-  const invalidPrArgs = prArgs.filter((pr) => !/^\d+$/.test(pr));
+  const normalizedPrArgs = prArgs.map((pr) => normalizeReviewPrArg(pr, deps));
+  const invalidPrArgs = prArgs.filter((_, index) => normalizedPrArgs[index] === null);
   if (invalidPrArgs.length > 0) {
     const safeInvalidPrArgs = invalidPrArgs.map((pr) => JSON.stringify(safeLogText(pr)));
     deps.log('invalid-pr-args', {
@@ -1293,7 +1362,7 @@ async function runSelfReviewCliCommandPinned(
       invalidPrArgsCount: invalidPrArgs.length,
       invalidPrArgs: safeInvalidPrArgs,
     }, { level: 'warn' });
-    deps.error(`PR 인자가 올바르지 않습니다: ${safeInvalidPrArgs.join(', ')}. PR 번호는 숫자 형식이어야 합니다 (예: elanous self review 5502).`);
+    deps.error(`PR 인자가 올바르지 않습니다: ${safeInvalidPrArgs.join(', ')}. PR 번호·#번호·URL을 입력하세요 (예: elanous self review 5502).`);
     return { results: [], failed: 0 };
   }
 
@@ -1390,8 +1459,42 @@ async function runSelfReviewCliCommandPinned(
   let failed = 0;
   const providedReviewerContext = loadReviewerContext(opts, deps.readReferencedFile);
   const hasProvidedReviewerContext = (opts.contextOrder?.length ?? 0) > 0 || (opts.context?.length ?? 0) > 0 || (opts.contextText?.length ?? 0) > 0;
-  for (const pr of prArgs) {
+  for (const pr of normalizedPrArgs as string[]) {
+    const previousHeads = savedReviewHeads(pr);
+    const previousRoundCount = previousHeads.length;
+    const reason = opts.overCapReason?.trim();
+    deps.observeDoctorReview?.('round-counted', { pr, previousRoundCount, round: previousRoundCount + 1 });
+    const opAllowed = previousRoundCount >= 5 && opAllowsReviewOverCap(pr);
+    if (previousRoundCount >= 5) {
+      deps.observeDoctorReview?.('cap-attempt', { pr, previousRoundCount, round: previousRoundCount + 1, reasonProvided: Boolean(reason), opAllowed }, { level: 'warn' });
+    }
+    if (previousRoundCount >= 5 && (!reason || !opAllowed)) {
+      const refusalHead = prHeadCommit(pr, deps).value;
+      const message = !opAllowed
+        ? `PR ${pr}: r5 상한 초과 리뷰는 OP traffic.json reviewOverCapAllow 허용 목록에 있어야 합니다.`
+        : `PR ${pr}: 저장된 서로 다른 head 리뷰 ${previousRoundCount}개로 r5 상한에 도달했습니다. 새 리뷰는 --over-cap-reason <사유>로 PR당 한 번만 허용됩니다.`;
+      deps.observeDoctorReview?.('cap-refused', { pr, head: refusalHead, previousRoundCount, round: previousRoundCount + 1, reason: opAllowed ? 'missing-reason' : 'not-op-allowlisted' }, { level: 'warn' });
+      deps.error(message);
+      if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'cap-refused', previousRoundCount, headCommit: refusalHead });
+      failed += 1;
+      continue;
+    }
     const diffRead = readDiffAtHead(pr, deps);
+    if (previousRoundCount >= 5 && reason) {
+      // Claim only the exact SHA-pinned diff that the reviewer will see; never spend the sole
+      // exception on a separately read head that may move before readDiffAtHead.
+      const claimable = diffRead.source === 'sha-pinned' && diffRead.headCommitState === 'known'
+        && diffRead.currentHeadCommitState === 'known' && !diffRead.stale && diffRead.diff.status === 0;
+      if (!claimable || !claimCapOverride(pr, diffRead.headCommit, reason, deps.now())) {
+        const message = `PR ${pr}: r5 상한 예외를 청구하지 못했습니다(정확 head 고정 실패 또는 이미 사용).`;
+        deps.observeDoctorReview?.('cap-refused', { pr, head: diffRead.headCommit, previousRoundCount, round: previousRoundCount + 1, reason: claimable ? 'already-claimed' : 'head-unpinnable' }, { level: 'warn' });
+        deps.error(message);
+        if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'cap-refused', previousRoundCount, headCommit: diffRead.headCommit });
+        failed += 1;
+        continue;
+      }
+      deps.observeDoctorReview?.('cap-override', { pr, head: diffRead.headCommit, previousRoundCount, round: previousRoundCount + 1, reason }, { level: 'warn' });
+    }
     const localHeadComparison = compareLocalHead(pr, { value: diffRead.headCommit, state: diffRead.headCommitState }, deps);
     const { diff } = diffRead;
     const baseReviewerContext = hasProvidedReviewerContext
@@ -1433,6 +1536,24 @@ async function runSelfReviewCliCommandPinned(
       intentTruncation = { ...reviewIntentTruncationFromPr({ title, body }), ...prIntentSectionCoverage({ title, body }) };
       intentSource = body?.trim() ? 'pr-body' : title.trim() ? 'pr-title' : 'fallback';
       if (!intent) intent = `PR ${pr}`;
+    }
+    if (previousRoundCount >= 2 && diff.status === 0 && !diffRead.stale && diffRead.headCommitState === 'known') {
+      if (!deps.loadDoctorReviewBrief) {
+        deps.observeDoctorReview?.('brief-unavailable', { pr, head: diffRead.headCommit, previousRoundCount, reason: 'module-not-wired' });
+      } else {
+        try {
+          const block = await deps.loadDoctorReviewBrief({ pr: Number(pr), head: diffRead.headCommit, title, body: body ?? '', changedFiles: diffFilePaths(diff.stdout) });
+          if (block?.trim()) {
+            intent += `\n\n${block.trim()}`;
+            intentTruncation = { ...intentTruncation, ...reviewIntentTruncationObservation(intent) };
+            deps.observeDoctorReview?.('brief-injected', { pr, head: diffRead.headCommit, previousRoundCount, round: previousRoundCount + 1, briefChars: block.length });
+          } else {
+            deps.observeDoctorReview?.('brief-unavailable', { pr, head: diffRead.headCommit, previousRoundCount, reason: 'no-ready-brief' });
+          }
+        } catch (error) {
+          deps.observeDoctorReview?.('brief-unavailable', { pr, head: diffRead.headCommit, previousRoundCount, reason: safeLogText(String(error), 200) }, { level: 'warn' });
+        }
+      }
     }
     const startObservation = (extra: Record<string, unknown> = {}) => deps.log('start', {
       pr: safeLogText(pr), model: safeLogText(primaryModel),

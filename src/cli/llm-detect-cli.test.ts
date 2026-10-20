@@ -123,6 +123,78 @@ describe('llm detect CLI handler', () => {
     expect(json.outputs[0]).not.toContain(key);
   });
 
+  test('bare OpenRouter probe selects provider and exposes measured Upstage model candidates', async () => {
+    const f = fixture();
+    f.deps.detect = async () => [{ provider: 'openrouter', auth: 'apikey',
+      source: 'env:OPENROUTER_API_KEY', available: true, rank: 9 }];
+    f.deps.discoverUpstageModels = async () => ['openrouter/upstage/solar-mini4', 'openrouter/upstage/solar-pro4'];
+    f.deps.probeProvider = async (p) => ({ success: true, durationMs: 1, model: p.defaultModel });
+    const result = await runLlmDetect({ probe: true, json: true }, f.deps);
+    expect(result).toMatchObject({ selected: 'openrouter', applied: false,
+      upstageCandidates: ['openrouter/upstage/solar-mini4', 'openrouter/upstage/solar-pro4'] });
+    expect(f.outputs[0]).not.toContain(key);
+  });
+
+  test('OpenRouter /models wire IDs reach bare detect JSON through the real discovery source', async () => {
+    const originalFetch = globalThis.fetch;
+    const f = fixture();
+    f.deps.detect = async () => [{ provider: 'openrouter', auth: 'apikey',
+      source: 'env:OPENROUTER_API_KEY', available: true, rank: 9 }];
+    try {
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        expect(String(input)).toBe('https://openrouter.ai/api/v1/models');
+        return new Response(JSON.stringify({ data: [
+          { id: 'upstage/solar-pro4', name: 'Solar Pro 4' },
+          { id: 'z-ai/glm-5.3', name: 'GLM 5.3' },
+          { id: 'upstage/solar-mini4', name: 'Solar Mini 4' },
+        ] }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }) as typeof fetch;
+      const result = await runLlmDetect({ json: true }, f.deps);
+      expect(result.upstageCandidates).toEqual(['openrouter/upstage/solar-mini4', 'openrouter/upstage/solar-pro4']);
+      expect(JSON.parse(f.outputs[0]!).upstageCandidates).toEqual(result.upstageCandidates);
+    } finally { globalThis.fetch = originalFetch; }
+  });
+
+  test('catalogue failure is unmeasured, empty catalogue is empty, and absent OpenRouter makes no request', async () => {
+    const f = fixture();
+    f.deps.detect = async () => [{ provider: 'openrouter', auth: 'apikey',
+      source: 'env:OPENROUTER_API_KEY', available: true, rank: 9 }];
+    f.deps.discoverUpstageModels = async () => null;
+    expect((await runLlmDetect({ json: true }, f.deps)).upstageCandidates).toBeNull();
+    f.deps.discoverUpstageModels = async () => [];
+    expect((await runLlmDetect({ json: true }, f.deps)).upstageCandidates).toEqual([]);
+    f.deps.detect = async () => [{ provider: 'openai', auth: 'apikey',
+      source: 'env:OPENAI_API_KEY', available: true, rank: 1 }];
+    f.deps.discoverUpstageModels = async () => { throw new Error('must not query OpenRouter'); };
+    expect((await runLlmDetect({ json: true }, f.deps)).upstageCandidates).toBeUndefined();
+  });
+
+  test('a higher-ranked successful probe does not wait for OpenRouter catalogue discovery', async () => {
+    const f = fixture();
+    f.deps.detect = async () => [
+      { provider: 'openai', auth: 'apikey', source: 'env:OPENAI_API_KEY', available: true, rank: 1 },
+      { provider: 'openrouter', auth: 'apikey', source: 'env:OPENROUTER_API_KEY', available: true, rank: 9 },
+    ];
+    f.deps.probeProvider = async (p) => ({ success: true, durationMs: 1, model: p.defaultModel });
+    f.deps.discoverUpstageModels = async () => { throw new Error('must not query after OpenAI selection'); };
+    expect(await runLlmDetect({ probe: true, json: true }, f.deps))
+      .toMatchObject({ selected: 'openai', applied: false });
+    expect(JSON.parse(f.outputs[0]!).upstageCandidates).toBeUndefined();
+  });
+
+  test('applying an OpenRouter selection does not wait for model catalogue discovery', async () => {
+    const f = fixture();
+    f.deps.config = () => ({ llm: { provider: 'auto' } } as UserConfig);
+    f.deps.detect = async () => [{ provider: 'openrouter', auth: 'apikey',
+      source: 'env:OPENROUTER_API_KEY', available: true, rank: 9 }];
+    f.deps.probeProvider = async (p) => ({ success: true, durationMs: 1, model: p.defaultModel });
+    f.deps.discoverUpstageModels = async () => { throw new Error('must not query before apply'); };
+    expect(await runLlmDetect({ probe: true, apply: true, json: true }, f.deps))
+      .toMatchObject({ selected: 'openrouter', applied: true });
+    expect(f.saved[0]?.llm.provider).toBe('openrouter');
+    expect(JSON.parse(f.outputs[0]!).upstageCandidates).toBeUndefined();
+  });
+
   test('probe tries available candidates in rank order, stops on first success, never saves without --apply', async () => {
     const f = fixture();
     f.deps.probeProvider = async (p) => {

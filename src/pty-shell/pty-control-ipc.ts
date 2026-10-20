@@ -4,7 +4,7 @@ import { dirname } from 'node:path';
 import { ptyManifestDbPath, getPtyManifest, markPtyControlled } from './pty-manifest.js';
 import { getHarnessRunId } from '../harness/harness-space.js';
 import { renamePty, type PtyControlTarget } from './registry.js';
-import { resizePtyWithOutcome, writePtyWithOutcome } from './pty-write-outcome.js';
+import { resizePtyWithOutcome, writePtyWithOutcome, writePtyWithOutcomeDetail } from './pty-write-outcome.js';
 import { resetExternalWriteProvenanceForTesting } from './pty-write-provenance.js';
 import { parsePtyWriteActor, resolveRemoteControlActor, type PtyWriteActor } from './pty-write-arbiter.js';
 import { isPtyAccessMode } from './pty-ref.js';
@@ -414,13 +414,13 @@ async function processPtyControlRequestsOnce(getHandle: (id: string) => PtyContr
           // ⛔⭐ 여기서 세지 «않는다» — 계기는 `registry.write`(진짜 초크포인트)에 있다.
           //   여기서도 세면 크로스-프로세스 쓰기가 **두 번** 세어진다(`[S]` 리뷰 후 이동).
           //   `input-key` 는 TUI 외부 입력 대기열(`input/external-input-queue`)을 타지 않는다 — 글이 아니라 키다.
-          const write = (): ReturnType<typeof writePtyWithOutcome> => writePtyWithOutcome(handle, payload.chars, authorized.actor);
+          const write = (): ReturnType<typeof writePtyWithOutcomeDetail> => writePtyWithOutcomeDetail(handle, payload.chars, authorized.actor);
           const outcome = row.action === 'input-key' ? withExternalKeyCommand(write) : write();
-          result = outcome === 'success'
+          result = outcome.status === 'success'
             ? { status: 'success' }
-            : outcome === 'denied'
+            : outcome.status === 'denied'
               ? { status: 'denied', reason: 'write-arbiter' }
-              : { status: 'write-failed', reason: 'adapter-write' };
+              : { status: 'write-failed', reason: outcome.reason ?? 'adapter-write' };
         } else result = { status: 'denied', reason: 'invalid-payload' };
       }
     } catch (error) {

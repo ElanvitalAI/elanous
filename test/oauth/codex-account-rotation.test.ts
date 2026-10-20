@@ -14,7 +14,9 @@
 import { describe, expect, mock, test } from 'bun:test';
 
 const defaultOutboundCalls: Array<{ text: string; kind: string | undefined }> = [];
+const outboundAlert = await import('../../src/domains/outbound-alert.js');
 mock.module('../../src/domains/outbound-alert.js', () => ({
+  ...outboundAlert,
   sendOutbound(text: string, kind?: string): boolean {
     defaultOutboundCalls.push({ text, kind });
     return true;

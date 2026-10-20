@@ -14,7 +14,7 @@ import { debug } from '../../debug/log.js';
 
 export const POD_LIFECYCLE_STAGES = ['create', 'schedule', 'clone', 'mirror', 'deps', 'test', 'delete'] as const;
 /** si-task Pod 은 시험이 아니라 `self implement`(또는 harness ask/say) 본체를 돈다 — 그 칸은 `test` 가 아니라 `run` 이다. */
-export const SI_TASK_POD_LIFECYCLE_STAGES = ['create', 'schedule', 'clone', 'mirror', 'deps', 'run', 'delete'] as const;
+export const SI_TASK_POD_LIFECYCLE_STAGES = ['create', 'schedule', 'start', 'clone', 'mirror', 'deps', 'run', 'delete'] as const;
 export type PodLifecycleStageName = typeof POD_LIFECYCLE_STAGES[number] | typeof SI_TASK_POD_LIFECYCLE_STAGES[number];
 export type PodLifecycleClock = 'host' | 'k8s' | 'pod' | 'mixed';
 export type PodLifecycleKind = 'gate' | 'si-task';
@@ -29,6 +29,16 @@ export interface PodLifecycleEvent {
   stages: PodLifecycleStage[];
   outcome: string;
   missing: PodLifecycleStageName[];
+  /** si-task: the Pod whose named logs supplied the stage markers. */
+  podUid?: string | null;
+  podName?: string | null;
+  /** Original Kubernetes timestamps; null means the API did not provide one. */
+  k8s?: { created: string | null; scheduled: string | null; started: string | null; clock: 'k8s' };
+  /** A skipped install is a state with a Pod-clock time, never a fabricated duration. */
+  deps?: { status: 'skipped'; at: number; clock: 'pod'; reason: string } | { status: 'missing'; reason: string };
+  missingReasons?: Partial<Record<PodLifecycleStageName, string>>;
+  podSelectionReason?: string | null;
+  watch?: { start: number; end: number; clock: 'host' };
   [extra: string]: unknown;
 }
 
@@ -118,9 +128,40 @@ export function siTaskPodStageShell(stage: SiTaskMarkedStage, edge: 'start' | 'e
   return `printf 'ELANOUS_POD_STAGE ${stage} ${edge} %s\\n' "$(date +%s)" || true`;
 }
 const SI_TASK_STAGE_LINE = /^ELANOUS_POD_STAGE (clone|mirror|run) (start|end) (\d{1,12})\r?$/gm;
+const SI_TASK_DEPS_SKIPPED_LINE = /^ELANOUS_POD_DEPS skipped (\d{1,12}) (image-prepared-no-install)\r?$/m;
+
+export function parseSiTaskDepsSkipped(logs: string | undefined): { at: number; reason: string } | undefined {
+  const match = logs?.match(SI_TASK_DEPS_SKIPPED_LINE);
+  return match ? { at: Number(match[1]), reason: match[2]! } : undefined;
+}
+
+/** The API timestamps belong to one Pod UID; retries must never combine two Pods' clocks. */
+export function siTaskPodK8sTiming(json: string | undefined, childRunLabel: string, podJob: string, jobUid: string | undefined): { podName?: string; podUid?: string; podCreated?: string; podScheduled?: string; containerStarted?: string; podSelectionReason?: string } {
+  try {
+    const items = (JSON.parse(json ?? '') as { items?: unknown[] }).items;
+    if (!Array.isArray(items)) return {};
+    const matching = items.filter((item): item is Record<string, any> => !!item && typeof item === 'object')
+      .filter((item) => item.metadata?.labels?.['elanous.child-run'] === childRunLabel);
+    // `logs job/<name>` may choose either Pod. No identity can safely be joined when
+    // more than one Pod belongs to this child run, even if one was created later.
+    if (matching.length > 1) return { podSelectionReason: 'ambiguous-pod-attempts' };
+    const pod = matching[0];
+    if (!pod || typeof pod.metadata?.name !== 'string' || typeof pod.metadata?.uid !== 'string') return {};
+    const jobLabels = [pod.metadata.labels?.['batch.kubernetes.io/job-name'], pod.metadata.labels?.['job-name']].filter((value): value is string => typeof value === 'string');
+    const owned = pod.metadata.ownerReferences?.some((owner: any) => owner?.kind === 'Job' && owner?.name === podJob && owner?.uid === jobUid);
+    if (!jobUid || jobLabels.length === 0 || jobLabels.some((value) => value !== podJob) || !owned) return { podSelectionReason: 'pod-job-unverified' };
+    const scheduled = pod.status?.conditions?.find((condition: any) => condition?.type === 'PodScheduled' && condition.status === 'True')?.lastTransitionTime;
+    const child = pod.status?.containerStatuses?.find((status: any) => status?.name === 'child');
+    const started = child?.state?.running?.startedAt ?? child?.state?.terminated?.startedAt;
+    return { podName: pod.metadata.name, podUid: pod.metadata.uid,
+      ...(isoMs(pod.metadata.creationTimestamp) !== undefined ? { podCreated: pod.metadata.creationTimestamp } : {}),
+      ...(isoMs(scheduled) !== undefined ? { podScheduled: scheduled } : {}),
+      ...(isoMs(started) !== undefined ? { containerStarted: started } : {}) };
+  } catch { return {}; }
+}
 
 /**
- * Job 로그에서 단계 표지를 읽는다 → `{ 'clone-start': 초, 'clone-end': 초, … }` (gate 의 podStages 와 같은 꼴).
+ * 선택된 Pod 로그에서 단계 표지를 읽는다 → `{ 'clone-start': 초, 'clone-end': 초, … }` (gate 의 podStages 와 같은 꼴).
  * 같은 표지가 두 번 나오면 «첫» 값 — 셸 표지는 모두 자식 출력(`cat /tmp/si.out`)보다 앞에 찍히므로, 자식이 같은 모양의 줄을
  * 내도 셸 값을 덮지 못한다(리뷰 should-fix). 모르는 단계·꼴은 버린다(지어내지 않는다).
  */
@@ -135,12 +176,12 @@ export function parseSiTaskPodStages(logs: string | undefined): Record<string, n
 }
 
 /**
- * si-task Pod — Pod 셸이 찍은 단계 표지(`parseSiTaskPodStages`)로 clone · mirror · deps · run 을 채운다(pod 시계).
+ * si-task Pod — Kubernetes 원시 시각으로 create · schedule · start, Pod 셸 표지로 clone · mirror · run 을 채운다.
  * - clone  = 소스 받기(`podSourceScript`) 시작 → 그 스크립트 전체가 끝난 뒤(`cd repo` 포함 · 어느 줄에서든 exit 하면 끝이 없다 → missing)
  * - mirror = 호스트 미러 `clone --shared` 시도 → 성공(미러를 건너뛰면 끝이 없다 → missing)
- * - deps   = si-task Job 셸엔 의존성 설치 단계가 없다 → 표지를 읽지 않는다(`deps` 표지 줄이 있어도 늘 missing)
+ * - deps   = 현재 이미지는 의존성을 미리 포함한다. 자식이 install 생략 시각과 이유를 별도 상태로 기록한다.
  * - run    = 본체(`self implement` · `harness ask`/`say`) 띄움 → `wait` 가 돌아옴(SIGTERM 이면 끝이 없다 → missing)
- * - create · schedule · delete = 호스트가 잴 값이 없다 → missing.
+ * - delete = 이 경로에서 관측하지 않는다 → missing.
  * 호스트가 지켜본 구간은 단계가 아닌 `watch`(host 시계)로 따로 싣는다 — 단계로 지어내지 않는다.
  */
 export function siTaskPodLifecycleEvent(input: {
@@ -149,16 +190,53 @@ export function siTaskPodLifecycleEvent(input: {
   host?: string | null;
   watchStart?: number;
   watchEnd?: number;
+  createStart?: number;
   podStages?: Readonly<Record<string, number>>;
+  podUid?: string;
+  podName?: string;
+  podSelectionReason?: string;
+  podCreated?: string;
+  podScheduled?: string;
+  containerStarted?: string;
+  depsSkipped?: { at: number; reason: string };
   outcome: string;
 }): PodLifecycleEvent {
   const pod = input.podStages ?? {};
-  const measured: Measured = {};
+  const created = isoMs(input.podCreated);
+  const scheduled = isoMs(input.podScheduled);
+  const started = isoMs(input.containerStarted);
+  const measured: Measured = {
+    create: { start: input.createStart, end: created, clock: 'mixed' },
+    schedule: { start: created, end: scheduled, clock: 'k8s' },
+    start: { start: scheduled, end: started, clock: 'k8s' },
+  };
   for (const name of SI_TASK_MARKED_STAGES) measured[name] = { start: podSecondsMs(pod[`${name}-start`]), end: podSecondsMs(pod[`${name}-end`]), clock: 'pod' };
   const { stages, missing } = splitPodLifecycleStages(measured, SI_TASK_POD_LIFECYCLE_STAGES);
-  const watched = input.watchStart !== undefined && input.watchEnd !== undefined && Number.isFinite(input.watchStart) && Number.isFinite(input.watchEnd) && input.watchEnd >= input.watchStart;
+  const watchStart = input.watchStart;
+  const watchEnd = input.watchEnd;
+  let watch: PodLifecycleEvent['watch'];
+  if (watchStart !== undefined && watchEnd !== undefined && Number.isFinite(watchStart) && Number.isFinite(watchEnd) && watchEnd >= watchStart) {
+    watch = { start: watchStart, end: watchEnd, clock: 'host' };
+  }
+  const missingReason = (stage: PodLifecycleStageName): string => {
+    if (input.podSelectionReason && stage !== 'delete') return input.podSelectionReason;
+    if (stage === 'deps') return input.depsSkipped ? `skipped:${input.depsSkipped.reason}` : 'child-deps-marker-unavailable';
+    if (stage === 'delete') return 'not-observed';
+    if (stage === 'create' && input.createStart === undefined) return 'host-apply-start-unavailable';
+    if (stage === 'create' || stage === 'schedule' || stage === 'start') {
+      const timestamps = stage === 'create' ? [created] : stage === 'schedule' ? [created, scheduled] : [scheduled, started];
+      return timestamps.some((time) => time === undefined) ? 'k8s-timestamp-unavailable' : 'clock-order-invalid';
+    }
+    return 'stage-marker-unavailable';
+  };
   return { runId: input.runId ?? null, podJob: input.podJob, host: input.host ?? null, kind: 'si-task', stages, outcome: input.outcome, missing,
-    ...(watched ? { watch: { start: input.watchStart, end: input.watchEnd, clock: 'host' as const } } : {}) };
+    podUid: input.podUid ?? null, podName: input.podName ?? null,
+    k8s: { created: input.podCreated ?? null, scheduled: input.podScheduled ?? null, started: input.containerStarted ?? null, clock: 'k8s' },
+    deps: input.depsSkipped ? { status: 'skipped', at: input.depsSkipped.at * 1000, clock: 'pod', reason: input.depsSkipped.reason }
+      : { status: 'missing', reason: input.podSelectionReason ?? 'child-deps-marker-unavailable' },
+    podSelectionReason: input.podSelectionReason ?? null,
+    missingReasons: Object.fromEntries(missing.map((stage) => [stage, missingReason(stage)])),
+    ...(watch ? { watch } : {}) };
 }
 
 export type PodLifecycleLog = (category: string, event: string, data: Record<string, unknown>) => void;

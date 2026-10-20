@@ -21,6 +21,7 @@ import { GOAL_TYPES, lintGoalFile, parseGoalId, parseGoalType, resolveGoalAuthor
 import { templateForGoalType } from '../self-implement/graph-templates.js';
 import { appendRunLedgerEntry, listRunLedgers, loadFederatedRunLedger, loadRunLedger, queryRunScreenKey, runLedgerDir, type RunLedgerEntry, type RunLedgerMatch, type RunLedgerWriter } from '../self-implement/run-ledger.js';
 import { classifyPodExit, type PodExitClass } from '../task-orchestrator/surfaces/pod-failure-reason.js';
+import type { PodChildEvidence } from '../task-orchestrator/surfaces/self-implement.js';
 import { classifyPodExitStop, recordRunStop, runStopRecorded, RUN_STOP_EVENT } from '../self-implement/run-stop.js';
 import { ensureOpenRouterChildModelLive, resolveChildLlmEffort, resolveImplementationChildModel } from '../self-dev/dev-cli.js';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
@@ -571,17 +572,38 @@ export function recordClassifiedHarnessPodExit(runId: string | undefined, reason
   context: { entrance?: string; seat?: string; output?: string } = {}): void {
   if (!runId) return;
   try {
+    const childEvidence = reason === 'preflight-refused' ? undefined : latestPodChildEvidence(loadRunLedger(runId));
     const signal = status > 128
       ? Object.entries(osConstants.signals).find(([, number]) => number === status - 128)?.[0] ?? null : null;
     const cwd = process.cwd();
     const seat = context.seat ?? process.env.ELANOUS_HARNESS_SEAT;
-    recordRunExit({ runId, reason, status, signal, at: new Date().toISOString(),
+    recordRunExit({ runId, reason: childEvidence?.scopeEscape === true ? 'scope-escape' : reason, status, signal, at: new Date().toISOString(),
       ...(context.entrance ? { entrance: context.entrance } : {}),
       ...(['OP', 'TC', 'MK', 'UX'].includes(seat ?? '') ? { seat } : {}),
       cwd: `${basename(dirname(cwd))}/${basename(cwd)}`, hostname: hostname().split('.')[0]!, pid: process.pid,
       ...(context.output ? { lastLines: incidentLastLines(context.output) } : {}),
+      ...(childEvidence ? { childEvidence } : {}),
     }, effectiveInstanceRoot());
   } catch { /* incident writes cannot change Pod output or exit */ }
+}
+
+function latestPodChildEvidence(entries: readonly RunLedgerEntry[] | null | undefined): PodChildEvidence | undefined {
+  // The current attempt's start is the fence. An earlier Pod's terminal facts cannot
+  // classify a later attempt when that attempt has no JSON or its ledger write failed.
+  const current = entries?.filter((entry) => entry.event === 'pod-child-run').at(-1)?.data;
+  if (typeof current?.job !== 'string' || typeof current.childRunId !== 'string') return undefined;
+  const data = entries?.filter((entry) => entry.event === 'pod-child-evidence'
+    && entry.data?.job === current.job && entry.data?.childRunId === current.childRunId).at(-1)?.data;
+  const evidence = data?.childEvidence;
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return undefined;
+  const row = evidence as Record<string, unknown>;
+  const object = (value: unknown): boolean => value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (('scopeEscape' in row && row.scopeEscape !== true)
+    || ('goalCauseObserved' in row && row.goalCauseObserved !== true)
+    || ('classification' in row && typeof row.classification !== 'string')
+    || ('abandonedClassification' in row && !object(row.abandonedClassification))
+    || ('accountAvailability' in row && !object(row.accountAvailability))) return undefined;
+  return row as PodChildEvidence;
 }
 
 /** Every Pod launch entrance (harness ask/say · dev ask --substrate pod) warns once after a recent burst; it never blocks the launch. */
@@ -754,7 +776,10 @@ export function recordHarnessPodStop(
   if (!runId) return false;
   try {
     if (runStopRecorded(runId)) return false;
-    if ((deps.loadLedger ?? loadRunLedger)(runId)?.some((entry) => entry.event === RUN_STOP_EVENT)) return false;
+    const ledger = (deps.loadLedger ?? loadRunLedger)(runId);
+    if (ledger?.some((entry) => entry.event === RUN_STOP_EVENT)) return false;
+    const childEvidence = latestPodChildEvidence(ledger);
+    const scopeEscape = childEvidence?.scopeEscape === true;
     if (classified.reason === 'preflight-refused') {
       (deps.record ?? recordRunStop)({
         runId, site: 'preflight', class: 'launch-failed',
@@ -772,18 +797,18 @@ export function recordHarnessPodStop(
     if (detail) {
       const write = deps.write ?? ((entry: RunLedgerEntry) => appendRunLedgerEntry(entry));
       (deps.record ?? recordRunStop)({
-        runId, site: 'pod-exit', class: classifyPodExitStop(classified.reason),
+        runId, site: 'pod-exit', class: scopeEscape ? 'scope-escape' : classifyPodExitStop(classified.reason),
         cause: `Pod exit ${status}: ${detail.podExitClass}${detail.lead ? ` — ${detail.lead}` : ''}`,
-        evidenceRef, nextMove,
+        evidenceRef, nextMove, ...(childEvidence ? { childEvidence } : {}),
       }, (entry) => write({ ...entry, data: { ...entry.data, podExitClass: detail.podExitClass, tail: detail.tail } }));
       return true;
     }
     // The classified line is our own one-line verdict («Pod 안 자식이 실패했다 — OOMKilled»), not the raw output tail.
     const verdict = classified.lines[0]?.split(' — ').slice(1).join(' — ').trim();
     (deps.record ?? recordRunStop)({
-      runId, site: 'pod-exit', class: classifyPodExitStop(classified.reason),
-      cause: `Pod exit ${status}: ${classified.reason}${verdict ? ` — ${verdict}` : ''}`,
-      evidenceRef, nextMove,
+      runId, site: 'pod-exit', class: scopeEscape ? 'scope-escape' : classifyPodExitStop(classified.reason),
+      cause: `Pod exit ${status}: ${scopeEscape ? 'scope-escape' : classified.reason}${verdict ? ` — ${verdict}` : ''}`,
+      evidenceRef, nextMove, ...(childEvidence ? { childEvidence } : {}),
     }, ...(deps.write ? [deps.write] : []));
     return true;
   } catch { return false; /* ledger observation cannot change Pod output or exit */ }
@@ -2116,6 +2141,7 @@ const executeGh: GhExecute = (args) => {
 export async function supersedeMergedGoalDrafts(
   number: number, cwd: string,
   execute: GhExecute = executeGh, git: DraftSweepGitExecute = runGitCommand,
+  options: { onlyExplicitSameCell?: boolean } = {},
 ): Promise<void> {
   const remote = git(cwd, ['config', '--get', 'remote.origin.url']);
   const repository = remote.status === 0 ? githubRemoteRepository(remote.stdout) : undefined;
@@ -2132,8 +2158,10 @@ export async function supersedeMergedGoalDrafts(
     number: pr.number, title: pr.title, body: pr.body ?? undefined, branch: pr.head.ref,
     createdAt: pr.created_at, mergedAt: pr.merged_at,
   };
+  if (options.onlyExplicitSameCell && !/^Supersedes:\s*#\d+\s*$/m.test(merged.body ?? '')) return;
   const { supersedeDraftsOnMerge } = await import('../self-dev/draft-sweep.js');
-  await supersedeDraftsOnMerge({ repository, merged, adapters: githubDraftSweepAdapters(execute, git, cwd) });
+  await supersedeDraftsOnMerge({ repository, merged, adapters: githubDraftSweepAdapters(execute, git, cwd),
+    ...(options.onlyExplicitSameCell ? { onlyExplicitSameCell: true } : {}) });
 }
 
 /**
@@ -2527,7 +2555,7 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
     }
     return undefined;
   };
-  const issueCommentsFor = async (repository: string, number: number, what: 'review' | 'landing'): Promise<string[]> => {
+  const issueCommentsFor = async (repository: string, number: number, what: 'review' | 'landing' | 'same-cell'): Promise<string[]> => {
     const comments: string[] = [];
     for (let page = 1; page <= 100; page++) {
       const batch = await ghJsonAsync<Array<{ body?: string }>>(['api', `repos/${repository}/issues/${number}/comments?per_page=100&page=${page}`]);
@@ -2535,7 +2563,7 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
       comments.push(...batch.map((comment) => comment.body ?? ''));
       if (batch.length < 100) return comments;
     }
-    throw new Error(`${what === 'review' ? 'Review' : 'Landing'} comment inventory exceeded pagination limit`);
+    throw new Error(`${what === 'review' ? 'Review' : what === 'same-cell' ? 'Same-cell' : 'Landing'} comment inventory exceeded pagination limit`);
   };
   const reviewGateForDraft = async (draft: SweepDraft, repository: string): Promise<SweepReviewGate | undefined> => {
     const cached = await detailFor(repository, draft.number);
@@ -2716,6 +2744,7 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
     listPrTerminals: async () => listRunLedgers().matches.flatMap((match) => match.entries.filter((entry) => entry.event === 'pr-terminal')
       .map((entry) => entry.data as unknown as PrTerminalRecord)),
     commentDraft: async (repository, number, body) => { execute(['pr', 'comment', String(number), '--repo', repository, '--body', body]); },
+    listIssueComments: async (repository, number) => issueCommentsFor(repository, number, 'same-cell'),
     removeLabel: async (repository, number, name) => { execute(['pr', 'edit', String(number), '--repo', repository, '--remove-label', name]); },
     getReviewGate: async (draft, repository) => reviewGateForDraft(draft, repository),
     // DRAFT-LINEAGE-ONE-1 — the sweep calls this only with `--apply`, only for a live run whose newer same-lineage run

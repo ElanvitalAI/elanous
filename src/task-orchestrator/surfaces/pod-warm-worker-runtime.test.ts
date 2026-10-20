@@ -49,6 +49,10 @@ test('two commands execute sequentially with distinct private HOME/state/tmp/XDG
     expect(active++).toBe(0);
     expect(request.env.ELANOUS_STATE_DIR_SOURCE).toBe(stateDirSourceForChild(request.env.ELANOUS_STATE_DIR!));
     expect(request.env.ELANOUS_STATE_DIR_SOURCE).toBe('explicit');
+    expect({ TZ: request.env.TZ, LANG: request.env.LANG, LC_ALL: request.env.LC_ALL,
+      ELANOUS_TEST_FAKE_LLM: request.env.ELANOUS_TEST_FAKE_LLM }).toEqual({
+      TZ: 'UTC', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', ELANOUS_TEST_FAKE_LLM: '1',
+    });
     if (seen.length) {
       expect(existsSync(seen[0]!.env.HOME!)).toBe(false);
       expect(request.env.HOME).not.toBe(seen[0]!.env.HOME);

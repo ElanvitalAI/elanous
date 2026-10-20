@@ -321,6 +321,7 @@ test('TUI route selects one core turn, matching tools and visible/logged decisio
 });
 
 test('TUI read question runs one full-tool turn outside the goal loop; a write request keeps it (10-14 report: UpdateGoal on reads)', async () => {
+  const routeLog = spyOn(debug, 'log');
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
     ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: true } },
@@ -352,6 +353,11 @@ test('TUI read question runs one full-tool turn outside the goal loop; a write r
   expect(read.tools).toEqual(specs.map((spec) => spec.name));
   expect(read.pushes[0]).toBe('라우팅: 읽기·분석\n');
   expect(read.calls).toBe(1);
+  const transcription = await run('도구 쓰지 말고 답해: 문서의 첫 줄을 그대로 옮기고');
+  expect(transcription.pushes[0]).toBe('라우팅: 읽기·분석\n');
+  expect(routeLog).toHaveBeenCalledWith('chat.route', 'decided', {
+    route: '읽기·분석', reason: expect.any(String), goalLoop: false, seat: null, seatKnown: false,
+  });
   const write = await run('지시 문서에 절 추가');
   expect(write.tools).toEqual([...specs.map((spec) => spec.name), 'update_goal']);
   expect(write.pushes.some((delta) => delta.startsWith('라우팅:'))).toBe(false);

@@ -33,6 +33,13 @@ export interface ControlStatusDeps {
   log?: typeof debug.log;
 }
 
+/** The same read-only HQ source used by `control status` and HQ-fenced control serve. */
+export function readControlHqLease(): ReturnType<typeof readHqLease> {
+  return readHqLease(getElanousConfigDirOverride() !== undefined
+    ? { store: fileLeaseStore(join(effectiveInstanceRoot(), 'hq', 'lease.json')), hostPath: join(effectiveInstanceRoot(), 'hq', 'host') }
+    : {});
+}
+
 const missing = (row: ControlStatusRowName, reason: string): ControlStatusRow => ({ row, state: 'unmeasured', text: '못 쟀다', reason });
 
 function localInstallRoot(): string {
@@ -76,9 +83,7 @@ export async function collectControlStatus(deps: ControlStatusDeps = {}): Promis
   };
 
   await add('집', async () => {
-    const readLease = deps.readLease ?? (() => readHqLease(getElanousConfigDirOverride() !== undefined
-      ? { store: fileLeaseStore(join(effectiveInstanceRoot(), 'hq', 'lease.json')), hostPath: join(effectiveInstanceRoot(), 'hq', 'host') }
-      : {}));
+    const readLease = deps.readLease ?? readControlHqLease;
     const { record, ageSeconds, expired } = await readLease();
     if (!record) return missing('집', '본부 임대 기록 없음');
     return { row: '집', state: expired ? 'warn' : 'ok',

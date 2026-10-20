@@ -1,0 +1,45 @@
+graph_id: land
+version: 1
+unit:
+  inputs: [ask, context, prior]
+  outputs: [result, evidence]
+  exits: [done, rework, needs-human, failed]
+policy:
+  express:
+    by: [queueFlag, predecessorOf, multiplierTier, p0InCutWindow2h]
+    waitsForBatch: false
+    directive: "2026-10-19 · prioritize queued P0s, predecessors, multiplier tier, and near-cut work"
+  batch:
+    min: 2
+    max: 4
+    groupBy: [area, cellPrefix]
+    maxWaitMin: 30
+    order: [express, predecessor, enqueued]
+    directive: "2026-10-14 · group by area and cell prefix, with batch size 2–4 and a 30-minute wait"
+  scenarioPrebuild:
+    source: [src/ux-sim, scenarios/ux-sim, fake-llm, fake-harness]
+    mock: required
+    directive: "2026-10-19 · prebuild scenarios with UX simulation, fake LLM, and fake harness inputs"
+  gate:
+    oncePerBatch: true
+    directive: "2026-10-19 · run one gate per batch"
+  land:
+    perPr: squash
+    pinnedHead: true
+    ejectOnFail: true
+    integrationPr: false
+    directive: "2026-10-19 · squash each PR at its pinned head and eject failures"
+entry_node: enqueue
+terminal_nodes: [done, rework, needs-human, failed]
+nodes:
+  - node_id: enqueue
+    kind: agent
+    recipe: 'cmd:land-enqueue'
+    max_visits: 1
+    contract: { inputs: [ask, context, prior], tools: external-write, outputs: [result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: rework, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: needs-human, kind: hitl, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: observe, recipe: none, max_visits: 1 }
+edges:
+  - { from: enqueue, on: outcome, map: { done: done, rework: rework, needs-human: needs-human, failed: failed } }

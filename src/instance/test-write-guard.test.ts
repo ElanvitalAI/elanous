@@ -15,7 +15,7 @@ import { refuseProductionLedgerWriteInTest } from '../harness/ledger-write-guard
 import { getUserConfig } from '../user-config.js';
 import { effectiveInstanceRoot } from './resolve.js';
 import {
-  assertNotTestWritingOps, EXTRA_OPS_ROOTS_ENV, isInsideOpsRoot, opsRoots, physicalPath, setAccountHomeLookupForTesting, setOpsRootsForTesting, testProcessSignal,
+  assertNotTestWritingOps, EXTRA_OPS_ROOTS_ENV, isInsideOpsRoot, isTestDouble, opsRoots, physicalPath, setAccountHomeLookupForTesting, setOpsRootsForTesting, testProcessSignal,
   TestOpsWriteRefusedError,
 } from './test-write-guard.js';
 
@@ -93,6 +93,43 @@ describe('test-process detection (measured under bun test)', () => {
       expect(isInsideOpsRoot(join(isolated, 'logs', 'logs.db'))).toBe(false);
     } finally { setAccountHomeLookupForTesting(null); }
   });
+
+  test('the deployed CLI refuses checklist ledger opens and question answers in an ops-like root', () => {
+    const repo = join(import.meta.dir, '..', '..');
+    const state = join(root, 'cli-ops');
+    const ownState = join(root, 'cli-isolated');
+    const id = 'cli-guard';
+    const pending = createPendingQuestion(id, { questions: [{ id: 'choice', header: 'Choice', question: 'Choose?', options: [{ label: 'A', description: 'A' }] }] },
+      undefined, {}, { surface: 'file', delivery: 'file', expiresAt: new Date(Date.now() + 60_000).toISOString() });
+    for (const target of [state, ownState]) {
+      const dir = join(target, 'ask-user-question', 'pending');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${id}.json`), `${JSON.stringify(pending)}\n`);
+    }
+    const run = (target: string, asTest: boolean, args: string[]) => childProcess.spawnSync(process.execPath,
+      ['bin/elanous.mjs', '--test', '--config-dir', target, ...args], {
+        cwd: repo,
+        env: { ...process.env, NODE_ENV: asTest ? 'test' : '', ELANOUS_TEST_HOME: '',
+          ELANOUS_STATE_DIR: target, ELANOUS_CONFIG_DIR: target, [EXTRA_OPS_ROOTS_ENV]: state },
+        encoding: 'utf8', timeout: 60_000,
+      });
+    const commands = [
+      { args: ['release', 'checklist', 'list', '--version', '0.2.26'], file: (target: string) => join(target, 'release', 'features.sqlite') },
+      { args: ['questions', 'answer', id, '{"answers":{"choice":"A"}}'], file: (target: string) => join(target, 'ask-user-question', 'answers', `${id}.json`) },
+    ];
+    for (const { args, file } of commands) {
+      const refused = run(state, true, args);
+      expect(refused.status).not.toBe(0);
+      expect(`${refused.stdout}\n${refused.stderr}`).toContain('[test-guard] refused');
+      expect(existsSync(file(state))).toBe(false);
+      const isolatedRun = run(ownState, true, args);
+      expect(isolatedRun.status).toBe(0);
+      expect(existsSync(file(ownState))).toBe(true);
+      const real = run(state, false, args);
+      expect(real.status).toBe(0);
+      expect(existsSync(file(state))).toBe(true);
+    }
+  }, 180_000);
 
   test('a real entry process (no test signal) is not refused even when its own root is ops; with NODE_ENV=test it is', () => {
     // outbound-log-probe.ts is a real entry script: it registers the logs.db store sink and sends through curl.
@@ -314,6 +351,17 @@ describe('ops-like root → refused · isolated root → allowed', () => {
     expect(calls).toEqual(['2']);
   });
 
+  test('isTestDouble treats a bare spy as not a fake', () => {
+    const real = childProcess.execFileSync;
+    const bare = spyOn(childProcess, 'execFileSync');
+    try {
+      expect(isTestDouble(bare, real)).toBe(false);
+      expect(isTestDouble(real)).toBe(false);
+      bare.mockImplementation((() => '{"ok":true}') as never);
+      expect(isTestDouble(bare, real)).toBe(true);
+    } finally { bare.mockRestore(); }
+  });
+
   test('a bare spy installed before outbound-alert is imported is still not a fake', () => {
     const state = join(root, 'spy-first-state');
     const r = childProcess.spawnSync(process.execPath, [join(import.meta.dir, 'test-write-guard-spy-first.fixture.ts')], {
@@ -327,13 +375,22 @@ describe('ops-like root → refused · isolated root → allowed', () => {
     const base = getUserConfig();
     const noTarget = { ...base, telegram: { ...base.telegram, channels: [], botToken: undefined, homeChannel: undefined } } as typeof base;
     let calls = 0;
+    let callbacks = 0;
+    const onBot = () => { callbacks++; };
     const sendRaw = () => { calls++; return true; };
     setOpsRootsForTesting([effectiveInstanceRoot(), getElanousConfigDir()]);
-    expect(sendTelegramDirect('body', 'report', { config: noTarget, sendRaw })).toBe(false);
+    expect(sendTelegramDirect('body', 'report', { config: noTarget, sendRaw }, onBot)).toBe(false);
     expect(calls).toBe(0);
+    expect(callbacks).toBe(0);
     const configured = { ...base, telegram: { ...base.telegram, channels: undefined, botToken: '2:fake', homeChannel: 2 } } as typeof base;
-    expect(() => sendTelegramDirect('body', 'ops-alert', { config: configured, sendRaw })).toThrow(TestOpsWriteRefusedError);
+    expect(() => sendTelegramDirect('body', 'ops-alert', { config: configured, sendRaw }, onBot)).toThrow(TestOpsWriteRefusedError);
     expect(calls).toBe(0);
+    expect(callbacks).toBe(0);
+    process.env.TELEGRAM_BOT_TOKEN = '3:fake';
+    process.env.TELEGRAM_CHAT_ID = '3';
+    expect(() => sendTelegramDirect('body', 'report', { config: noTarget, sendRaw }, onBot)).toThrow(TestOpsWriteRefusedError);
+    expect(calls).toBe(0);
+    expect(callbacks).toBe(0);
   });
 
   test('route callback and sender exceptions retain the fallback, but an ops send refusal escapes', () => {

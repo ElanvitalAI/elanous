@@ -12,6 +12,30 @@ import {
 } from '../src/preview/terminal.js';
 import { Terminal } from '@xterm/headless';
 
+function isMissingNodePty(error: unknown): boolean {
+  if (!(error instanceof Error) || (error as NodeJS.ErrnoException).code !== 'MODULE_NOT_FOUND') {
+    return false;
+  }
+  const missingModule = /^Cannot find (?:module|package) ['"]([^'"]+)['"]/.exec(error.message)?.[1];
+  return missingModule === 'node-pty';
+}
+
+// node-pty is an optional native dependency. Some Linux gate images omit the
+// module entirely; only that specific absence skips tests requiring a real
+// PTY. Other load errors and API drift stay visible as test failures.
+const hasNodePtyBinding = (() => {
+  try {
+    const nodePty = require('node-pty');
+    if (typeof nodePty.spawn !== 'function') {
+      throw new TypeError('node-pty does not export spawn()');
+    }
+    return true;
+  } catch (error) {
+    if (isMissingNodePty(error)) return false;
+    throw error;
+  }
+})();
+
 // @xterm/headless Terminal.write() is queued, not synchronous. The
 // callback form guarantees the chunk has been fully applied before
 // we inspect the buffer.
@@ -68,7 +92,17 @@ describe('cellSgr', () => {
 
 // ── PreviewTerminal live (spawns a real bash) ────────────────
 describe('PreviewTerminal', () => {
-  test('spawn bash, write echo, render contains output', async () => {
+  test('only the exact missing node-pty module enables native-PTY skips', () => {
+    const notFound = (moduleName: string) => Object.assign(
+      new Error(`Cannot find module '${moduleName}'\nRequire stack:\n- /repo/node_modules/node-pty/index.js`),
+      { code: 'MODULE_NOT_FOUND' },
+    );
+    expect(isMissingNodePty(notFound('node-pty'))).toBe(true);
+    expect(isMissingNodePty(notFound('node-addon-api'))).toBe(false);
+    expect(isMissingNodePty(Object.assign(new Error('native load failed'), { code: 'ERR_DLOPEN_FAILED' }))).toBe(false);
+  });
+
+  test.skipIf(!hasNodePtyBinding)('spawn bash, write echo, render contains output', async () => {
     const session = new PreviewTerminal({
       cols: 80,
       rows: 10,
@@ -99,7 +133,7 @@ describe('PreviewTerminal', () => {
     expect(snapshot).toContain('PREVIEW_TERMINAL_ECHO');
   }, 5000);
 
-  test('resize propagates to emulator', () => {
+  test.skipIf(!hasNodePtyBinding)('resize propagates to emulator', () => {
     const session = new PreviewTerminal({
       cols: 80,
       rows: 10,
@@ -119,7 +153,7 @@ describe('PreviewTerminal', () => {
   // 부하 걸린 Pod 에서 `-l -i` 로그인 셸이 3초 안에 안 떠 «echo READY» 의 tty 메아리만 보고 넘어갔다 → 셸이 아직
   // 안 읽은 줄에 SZ 가 영영 안 찍혔다). ⓐ 프로필을 안 읽는 셸 ⓑ 메아리가 아니라 «셸의 출력»을 기다린다
   // (`RE""ADY` 는 메아리엔 따옴표째 보이고 출력에만 `READY` 로 붙는다) ⓒ 고정 sleep 0 · 상한은 넉넉히.
-  test('resize reaches the kernel PTY — the shell sees the new size (stty size)', async () => {
+  test.skipIf(!hasNodePtyBinding)('resize reaches the kernel PTY — the shell sees the new size (stty size)', async () => {
     const session = new PreviewTerminal({
       cols: 80,
       rows: 10,
@@ -152,7 +186,7 @@ describe('PreviewTerminal', () => {
     }
   }, 130_000);
 
-  test('stop is idempotent', () => {
+  test.skipIf(!hasNodePtyBinding)('stop is idempotent', () => {
     const session = new PreviewTerminal({
       cols: 80,
       rows: 10,

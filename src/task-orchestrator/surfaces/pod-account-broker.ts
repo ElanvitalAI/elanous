@@ -17,6 +17,17 @@ export type PodProviderPlan =
   | { provider: 'grok'; excluded: PodAccountPlan['excluded']; grokSubscriptionEligible: boolean }
   | { provider: null; reasons: string[]; grokSubscriptionEligible: boolean };
 
+/** Effective cap used by the Pod broker; callers carrying an owner-approved selection must carry this same value. */
+export function podAccountThresholdPercent(name: string, options: {
+  excludeAt?: number;
+  thresholdPercentByAccount?: Readonly<Record<string, unknown>>;
+} = {}): number {
+  return codexAccountThresholdPercent(name, {
+    thresholdPercent: options.excludeAt ?? POD_ACCOUNT_EXCLUDE_AT_PERCENT,
+    thresholdPercentByAccount: options.thresholdPercentByAccount,
+  });
+}
+
 /** Pod 의 codex → grok 선택. 자격 종류는 과금 동의와 별도로 판단한다. */
 export function planPodProvider(input: {
   codexCandidates: readonly RotationCandidate[];
@@ -85,9 +96,7 @@ export function planPodAccounts(
   const known: RotationCandidate[] = [];
   const unknown: RotationCandidate[] = [];
   for (const c of candidates) {
-    const threshold = typeof options === 'number'
-      ? excludeAt
-      : codexAccountThresholdPercent(c.name, { thresholdPercent: excludeAt, thresholdPercentByAccount });
+    const threshold = typeof options === 'number' ? excludeAt : podAccountThresholdPercent(c.name, { excludeAt, thresholdPercentByAccount });
     if (c.reached === true) { excluded.push({ name: c.name, why: 'quota reached' }); continue; }
     if (c.usedPercent !== undefined && c.usedPercent >= threshold) { excluded.push({ name: c.name, why: `used ${c.usedPercent}% ≥ ${threshold}%` }); continue; }
     (c.usedPercent === undefined ? unknown : known).push(c);
@@ -111,6 +120,33 @@ export function planPodAccounts(
     return { usable: credit, excluded: [], creditAccounts: credit };
   }
   return { usable, excluded };
+}
+
+/** HQ selects one owner account before remote-parent launch; keep the configured rotation order. */
+export function planOwnerCodexMirrorCandidates(candidates: readonly RotationCandidate[], options: {
+  accountOrder: readonly string[];
+  thresholdPercentByAccount?: Readonly<Record<string, unknown>>;
+}): RotationCandidate[] {
+  const usable = new Set(planPodAccounts(candidates, { thresholdPercentByAccount: options.thresholdPercentByAccount }).usable);
+  const rank = (name: string): number => {
+    const index = options.accountOrder.indexOf(name);
+    return index < 0 ? options.accountOrder.length : index;
+  };
+  return candidates.map((candidate, index) => ({ candidate, index })).filter(({ candidate }) => usable.has(candidate.name))
+    .sort((a, b) => rank(a.candidate.name) - rank(b.candidate.name) || a.index - b.index)
+    .map(({ candidate }) => candidate);
+}
+
+/** Remote owner-mirror runs may plan against exactly the account HQ selected and its measured usage. */
+export function ownerCodexMirrorCandidate(candidates: readonly RotationCandidate[], account: string, usedPercent?: number): RotationCandidate[] {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(account)) return [];
+  return candidates.filter((candidate) => candidate.name === account).map((candidate) => {
+    const ownerCandidate = { ...candidate };
+    delete ownerCandidate.usedPercent;
+    ownerCandidate.reached = false;
+    const measured = usedPercent !== undefined && Number.isFinite(usedPercent) ? usedPercent : undefined;
+    return { ...ownerCandidate, reached: false, ...(measured !== undefined ? { usedPercent: measured } : {}) };
+  });
 }
 
 /** Job 마다 다음 계정 — 잔량 순으로 돌려 가며. 쓸 계정이 없으면 만들 때 이유를 대고 던진다. */

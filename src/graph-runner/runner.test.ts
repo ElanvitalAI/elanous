@@ -1,11 +1,12 @@
 import { afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { setPluginCredentials } from '../plugins/install/plugin-credentials.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { decideGraphApproval, latestGraphRun, manageGraphRun, runGraph } from './runner.js';
+import { decideGraphApproval, latestGraphRun, manageGraphRun, resolveUnit, runGraph, verifyReleaseCommandRoot } from './runner.js';
 import { getElanousConfigDir, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
@@ -14,6 +15,28 @@ import type { DecisionEntry } from '../decisions/decision-ledger.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+test('unit resolver discovers verb units in nested graphs/units/verbs', () => {
+  const unit = resolveUnit('verb-make-doc@1', join(process.cwd(), 'graphs/work/research-report.yaml'));
+  expect(unit.path).toBe(join(process.cwd(), 'graphs/units/verbs/make-doc.yaml'));
+});
+
+test('release command root accepts a clean checkout with 25k tracked paths', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-command-root-25k-'));
+  try {
+    execFileSync('git', ['init', '--quiet', root]);
+    for (let index = 0; index < 25_000; index++) {
+      writeFileSync(join(root, `tracked-${String(index).padStart(5, '0')}-${'x'.repeat(40)}`), '');
+    }
+    execFileSync('git', ['add', '-A'], { cwd: root });
+    execFileSync('git', ['-c', 'user.name=release-root-test', '-c', 'user.email=release-root-test@invalid', 'commit', '--quiet', '-m', 'fixture'], { cwd: root });
+
+    const cutTip = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+    expect(verifyReleaseCommandRoot(root, cutTip)).toBe(realpathSync(root));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 90_000);
 
 function fixture(command: string, loop = false): { graph: string; root: string } {
   const root = mkdtempSync(join(tmpdir(), 'graph-runner-'));
@@ -103,6 +126,21 @@ edges:
   return { graph, root, unit };
 }
 
+function unitFixtureWithPriorResult(result: string | null = 'from-previous-verb'): { graph: string; root: string; unit: string } {
+  const fixture = unitFixture();
+  writeFileSync(join(fixture.root, 'recipes.yaml'), `seed:\n  command: >-\n    printf '%s' '${result === null ? '{"other":"no-result"}' : JSON.stringify({ result })}'\n`);
+  writeFileSync(join(fixture.root, 'units', 'recipes.yaml'), `produce:\n  command: >-\n    bun -e 'const c=JSON.parse(require("fs").readFileSync(process.env.ELANOUS_GRAPH_CONTEXT,"utf8")); console.log(JSON.stringify({answer:c.input.prior}))'\n`);
+  writeFileSync(fixture.graph, readFileSync(fixture.graph, 'utf8')
+    .replace('entry_node: invoke', 'entry_node: seed')
+    .replace('  - node_id: invoke', "  - { node_id: seed, kind: agent, recipe: 'cmd:seed', max_visits: 1 }\n  - node_id: invoke")
+    .replace('contract: { inputs: [request], tools: read-only, outputs: [answer] }',
+      'contract: { inputs: [prior], tools: read-only, outputs: [answer] }')
+    .replace('edges:\n  - { from: invoke', 'edges:\n  - { from: seed, to: invoke }\n  - { from: invoke'));
+  writeFileSync(fixture.unit, readFileSync(fixture.unit, 'utf8')
+    .replace('inputs: [request]', 'inputs: [prior]'));
+  return fixture;
+}
+
 test('subgraph runs a child with contracted input/output and linked ledgers plus enter/exit events', async () => {
   const { graph, root } = unitFixture();
   const events: Array<{ event: string; data: Record<string, unknown> }> = [];
@@ -126,6 +164,78 @@ test('subgraph runs a child with contracted input/output and linked ledgers plus
   ]);
   expect(debug.events(500).filter(entry => entry.category === 'graph.unit' &&
     (entry.data as { runId?: string })?.runId === parent.runId).map(entry => entry.event)).toEqual(['enter', 'exit']);
+});
+
+test('subgraph prior input receives the previous node result', async () => {
+  const { graph, root } = unitFixtureWithPriorResult();
+  try {
+    const result = await runGraph(graph, { deps: { root } });
+    expect(result.status).toBe('done');
+    expect(result.path).toEqual(['seed', 'invoke', 'done']);
+    expect(result.nodes.find(node => node.nodeId === 'invoke')?.output)
+      .toBe('{"outcome":"done","answer":"from-previous-verb"}');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('explicit input prior takes precedence over the previous node result', async () => {
+  const { graph, root } = unitFixtureWithPriorResult();
+  try {
+    const result = await runGraph(graph, { input: { prior: 'explicit-input' }, deps: { root } });
+    expect(result.status).toBe('done');
+    expect(result.nodes.find(node => node.nodeId === 'invoke')?.output)
+      .toBe('{"outcome":"done","answer":"explicit-input"}');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('unit prior contract fails closed when the previous result is absent', async () => {
+  const { graph, root } = unitFixtureWithPriorResult(null);
+  try {
+    const result = await runGraph(graph, { deps: { root } });
+    expect(result.status).toBe('failed');
+    expect(result.path).toEqual(['seed', 'invoke']);
+    expect(result.nodes.find(node => node.nodeId === 'invoke')?.error).toContain('unit input missing: invoke.prior');
+    expect(result.unitCalls ?? []).toHaveLength(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('unit named terminal exits are returned as outcomes and select the parent route', async () => {
+  const { graph, root, unit } = unitFixture();
+  try {
+    writeFileSync(unit, readFileSync(unit, 'utf8').replaceAll('done', 'rework'));
+    writeFileSync(graph, readFileSync(graph, 'utf8').replace('map: { done: done, failed: failed }',
+      'map: { rework: done, failed: failed }'));
+    const result = await runGraph(graph, { input: { request: 'hello' }, deps: { root } });
+    expect(result.status).toBe('done');
+    expect(result.path).toEqual(['invoke', 'done']);
+    expect(result.unitCalls?.[0]?.exit).toBe('rework');
+    expect(result.nodes[0]?.output).toBe('{"outcome":"rework","answer":"world"}');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a unit failed exit still selects its declared parent outcome edge', async () => {
+  const { graph, root, unit } = unitFixture();
+  try {
+    writeFileSync(join(root, 'units', 'recipes.yaml'), `produce:\n  command: >-\n    printf '%s' '{"outcome":"failed","answer":"world"}'\n`);
+    writeFileSync(unit, readFileSync(unit, 'utf8').replace('map: { ok: done, fail: failed }',
+      'map: { failed: failed, ok: done }'));
+    writeFileSync(graph, readFileSync(graph, 'utf8').replace('map: { done: done, failed: failed }',
+      'map: { done: done, failed: done }'));
+    const result = await runGraph(graph, { input: { request: 'hello' }, deps: { root } });
+    expect(result.status).toBe('done');
+    expect(result.path).toEqual(['invoke', 'done']);
+    expect(result.unitCalls?.[0]?.exit).toBe('failed');
+    expect(result.nodes[0]?.output).toBe('{"outcome":"failed","answer":"world"}');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('a multi-entry unit starts at the call-selected entry and rejects an undeclared entry before execution', async () => {
@@ -977,6 +1087,56 @@ test('unsupported terminal name cannot silently report a failed branch as done',
     return { stdout: '', stderr: '', exitCode: 1 };
   } } })).rejects.toThrow('unsupported terminal node: rejected');
   expect(executed).toBe(0);
+});
+
+test('loop named terminals preserve success and failure status', async () => {
+  const cases: Array<{ graphId: string; terminal: string; command: string; status: 'done' | 'failed' }> = [
+    { graphId: 'default-loop', terminal: 'landed', command: 'exit 0', status: 'done' },
+    { graphId: 'default-loop', terminal: 'stopped', command: 'exit 1', status: 'failed' },
+    { graphId: 'document-loop', terminal: 'landed', command: 'exit 0', status: 'done' },
+    { graphId: 'document-loop', terminal: 'document-blocked', command: 'exit 1', status: 'failed' },
+    { graphId: 'document-loop', terminal: 'needs-human', command: 'exit 1', status: 'failed' },
+    { graphId: 'operate-loop', terminal: 'landed', command: 'exit 0', status: 'done' },
+    { graphId: 'operate-loop', terminal: 'operate-blocked', command: 'exit 1', status: 'failed' },
+    { graphId: 'operate-loop', terminal: 'needs-human', command: 'exit 1', status: 'failed' },
+    { graphId: 'research-loop', terminal: 'landed', command: 'exit 0', status: 'done' },
+    { graphId: 'research-loop', terminal: 'needs-human', command: 'exit 1', status: 'failed' },
+  ];
+  // Keep the executable mapping tied to the checked-in loop declarations.
+  for (const graphId of ['default-loop', 'document-loop', 'operate-loop', 'research-loop']) {
+    const declared = parseYaml(readFileSync(join(import.meta.dir, `../../graphs/${graphId}.yaml`), 'utf8')).terminal_nodes as string[];
+    const covered = cases.filter(item => item.graphId === graphId).map(item => item.terminal);
+    expect(new Set(covered)).toEqual(new Set(declared));
+  }
+  for (const { graphId, terminal, command, status } of cases) {
+    const { graph, root } = fixture(command);
+    writeFileSync(graph, readFileSync(graph, 'utf8')
+      .replace('graph_id: test-graph', `graph_id: ${graphId}`)
+      .replace('terminal_nodes: [done, failed]', `terminal_nodes: [${terminal}]`)
+      .replaceAll(status === 'done' ? 'done' : 'failed', terminal));
+    const result = await runGraph(graph, { deps: { root, runBash: async (body: string) => ({
+      stdout: '', stderr: '', exitCode: body === 'exit 1' ? 1 : 0,
+    }) } });
+    expect(result.status).toBe(status);
+    expect(result.reason).toBe(terminal);
+    expect(result.path.at(-1)).toBe(terminal);
+    expect(JSON.parse(readFileSync(result.statePath, 'utf8')).reason).toBe(terminal);
+  }
+});
+
+test('loop graph still rejects undeclared terminal names before running', async () => {
+  for (const graphId of ['default-loop', 'document-loop', 'operate-loop', 'research-loop']) {
+    for (const terminal of ['done', 'failed', 'blocked', 'rejected']) {
+      const { graph, root } = fixture('exit 0');
+      writeFileSync(graph, `graph_id: ${graphId}\nversion: 1\nentry_node: first\nterminal_nodes: [${terminal}]\nnodes:\n  - { node_id: first, kind: agent, recipe: 'cmd:first', max_visits: 1 }\n  - { node_id: ${terminal}, kind: gate, recipe: none, max_visits: 1 }\nedges:\n  - { from: first, to: ${terminal} }\n`);
+      let executed = 0;
+      await expect(runGraph(graph, { deps: { root, runBash: async () => {
+        executed++;
+        return { stdout: '', stderr: '', exitCode: 0 };
+      } } })).rejects.toThrow(`unsupported terminal node: ${terminal}`);
+      expect(executed).toBe(0);
+    }
+  }
 });
 
 test('ops recipes register a human-readable publication approval', () => {

@@ -26,7 +26,13 @@ test('release-day phases follow the schedule and wait for actual publication bef
     () => ({ publication: { kind: 'unpublished' }, greenObserved: false })).map(row => row.version)).toEqual([schedule.version]);
   expect(decideReleaseDayPhase(schedule, at('2026-10-13T22:00:00Z'), null)).toMatchObject({ phase: 'cut-run', dueAt: schedule.cutAt });
   expect(decideReleaseDayPhase(schedule, at('2026-10-14T00:05:00Z'), null).phase).toBe('cut-run');
-  expect(decideReleaseDayPhase(schedule, at('2026-10-14T00:05:00Z'), '2026-10-14T00:04:00Z')).toMatchObject({ phase: 'green-back', dueAt: '2026-10-14T00:04:00Z' });
+  expect(decideReleaseDayPhase(schedule, at('2026-10-14T00:03:59Z'), '2026-10-14T00:04:00Z').phase).toBe('cut-run');
+  expect(decideReleaseDayPhase(schedule, at('2026-10-14T00:04:00Z'), '2026-10-14T00:04:00Z'))
+    .toMatchObject({ phase: 'green-back', dueAt: '2026-10-14T00:04:00Z' });
+  const delayedPublish = { ...schedule, publishAt: '2026-10-14T00:10:00Z' };
+  expect(decideReleaseDayPhase(delayedPublish, at('2026-10-14T00:09:59Z'), '2026-10-14T00:04:00Z').phase).toBe('cut-run');
+  expect(decideReleaseDayPhase(delayedPublish, at('2026-10-14T00:10:00Z'), '2026-10-14T00:04:00Z'))
+    .toMatchObject({ phase: 'green-back', dueAt: delayedPublish.publishAt });
 });
 
 test('each tick rereads changed schedule and records each version/phase only once in the isolated shadow ledger', () => {
@@ -48,8 +54,10 @@ test('each tick rereads changed schedule and records each version/phase only onc
   expect(runReleaseDayShadow(deps)[0]).toMatchObject({ phase: 'cut-run', recorded: false });
   const db = new Database(join(root, 'steward', 'release-day-shadow.sqlite'));
   try {
-    expect(db.query('SELECT phase FROM phase_observations ORDER BY observed_at').all()).toEqual([
-      { phase: 'gate-mode' }, { phase: 'carry-p0' }, { phase: 'cut-run' },
+    expect(db.query('SELECT phase, due_at, observed_at FROM phase_observations ORDER BY observed_at').all()).toEqual([
+      { phase: 'gate-mode', due_at: '2026-10-13T21:30:00.000Z', observed_at: '2026-10-13T21:30:00.000Z' },
+      { phase: 'carry-p0', due_at: '2026-10-13T21:40:00.000Z', observed_at: '2026-10-13T21:40:00.000Z' },
+      { phase: 'cut-run', due_at: '2026-10-13T22:30:00.000Z', observed_at: '2026-10-13T22:30:00.000Z' },
     ]);
   } finally { db.close(); }
   expect(logs.at(-1)).toMatchObject({ phase: 'cut-run', recorded: false, mode: 'shadow' });

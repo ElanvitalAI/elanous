@@ -41,6 +41,17 @@ export const WAKEUP_MAX_CALLS_PER_TURN = 6;
 export const WAKEUP_REPEAT_INVALID_ERROR =
   'repeatMinutes 는 반복 간격(분 · 1 이상)이다 — 한 번만 깨우려면 repeatMinutes 를 빼거나 0 으로 두고 delaySeconds 또는 at 만 줘라';
 
+function formatWakeupTimeConflictError(req: ScheduleWakeupRequest): string {
+  const corrected = { ...req };
+  delete corrected.at;
+  delete corrected.atProvided;
+  return `at 과 delaySeconds 는 둘 중 하나만 줄 수 있다 — 교정 인자 예시(at 을 빼고 delaySeconds 사용): ${JSON.stringify(corrected)}. 같은 인자를 다시 보내지 말고 이 교정 인자로 한 번만 재시도하라`;
+}
+
+function canonicalToolArgs(args: Record<string, unknown>): string {
+  return JSON.stringify(Object.fromEntries(Object.entries(args).sort(([a], [b]) => a.localeCompare(b))));
+}
+
 export type WakeupTimerHandle = unknown;
 
 export interface WakeupEntry {
@@ -79,7 +90,9 @@ export interface WakeupSchedulerDeps {
 
 export type ScheduleWakeupRequest = {
   /** «HH:MM»(로컬 시각 · 지났으면 내일). delaySeconds 와 둘 중 하나. */
-  at?: string;
+  at?: unknown;
+  /** Host tool must preserve property presence even when the provider sent a non-string value. */
+  atProvided?: boolean;
   delaySeconds?: number;
   reason: string;
   /** 반복 간격(분). 첫 발화는 at/delaySeconds — 둘 다 없으면 지금부터 repeatMinutes 뒤. 0 = 일회성(생략과 같다). */
@@ -93,7 +106,7 @@ export type ScheduleWakeupResult =
 export type CancelWakeupResult = { ok: true } | { ok: false; error: string; capped?: boolean };
 
 export interface WakeupScheduler {
-  schedule(req: ScheduleWakeupRequest): ScheduleWakeupResult;
+  schedule(req: ScheduleWakeupRequest, requestKey?: string): ScheduleWakeupResult;
   list(): WakeupEntry[];
   cancel(id: string): boolean;
   /** cancel 과 같되 거부 사유(없는 id · 턴 상한)를 값으로 낸다 — LLM 도구가 쓴다. */
@@ -151,12 +164,24 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
   const maxCallsPerTurn = deps.maxCallsPerTurn ?? WAKEUP_MAX_CALLS_PER_TURN;
   let callTurnKey: string | null = null;
   let callCount = 0;
+  const conflictErrors = new Map<string, string>();
 
-  /** 한 턴 호출 상한 — 넘었으면 거부 문구, 아니면 null. 턴 경계를 모르면(currentTurnId 없음) 걸지 않는다. */
-  const loopCapError = (action: 'schedule' | 'cancel'): string | null => {
-    if (!deps.currentTurnId) return null;
-    const turnId = deps.currentTurnId() ?? 'none';
-    if (turnId !== callTurnKey) { callTurnKey = turnId; callCount = 0; }
+  const readTurnId = (): string | null => deps.currentTurnId?.() ?? null;
+
+  /** 한 턴 호출 상한 — 넘었으면 거부 문구, 아니면 null. 턴 경계가 unknown 이면 cap·dedupe 상태를 버린다. */
+  const loopCapError = (action: 'schedule' | 'cancel', observedTurnId = readTurnId()): string | null => {
+    if (observedTurnId === null) {
+      callTurnKey = null;
+      callCount = 0;
+      conflictErrors.clear();
+      return null;
+    }
+    const turnId = observedTurnId;
+    if (turnId !== callTurnKey) {
+      callTurnKey = turnId;
+      callCount = 0;
+      conflictErrors.clear();
+    }
     callCount += 1;
     if (callCount <= maxCallsPerTurn) return null;
     log('tui.wakeup', 'loop-capped', { turnId, count: callCount, max: maxCallsPerTurn, action });
@@ -252,20 +277,35 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
   };
 
   return {
-    schedule(req) {
+    schedule(req, requestKey) {
       const t = now();
       const reason = (req.reason ?? '').replace(/\s+/g, ' ').trim();
       const reject = (error: string): ScheduleWakeupResult => {
         log('tui.wakeup', 'rejected', { id: null, reason: 'invalid', error });
         return { ok: false, error };
       };
-      const capped = loopCapError('schedule');
+      // Every schedule attempt consumes the per-turn budget before validation.
+      const turnId = readTurnId();
+      const capped = loopCapError('schedule', turnId);
       if (capped) return { ok: false, error: capped };
+      // Presence is the contract: invalidly typed `at` values from the host
+      // must still conflict with delaySeconds rather than silently disappear.
+      const hasAt = req.atProvided ?? req.at !== undefined;
+      const hasDelay = req.delaySeconds !== undefined;
+      if (hasAt && hasDelay) {
+        const key = requestKey ?? canonicalToolArgs(req as Record<string, unknown>);
+        if (turnId !== null) {
+          const previousError = conflictErrors.get(key);
+          if (previousError !== undefined) {
+            return { ok: false, error: `${previousError} — 같은 충돌 인자의 재시도는 억제했다` };
+          }
+          if (conflictErrors.size < maxCallsPerTurn) conflictErrors.set(key, formatWakeupTimeConflictError(req));
+        }
+        const error = formatWakeupTimeConflictError(req);
+        return reject(error);
+      }
       if (!reason) return reject('reason 이 비었다 — 깨어나서 무엇을 할지 한 줄로 적어라');
       if (entries.size >= maxEntries) return reject(`예약 상한 ${maxEntries}개 — list 로 보고 cancel 뒤 다시`);
-      const hasAt = typeof req.at === 'string' && req.at.trim() !== '';
-      const hasDelay = typeof req.delaySeconds === 'number';
-      if (hasAt && hasDelay) return reject('at 과 delaySeconds 는 둘 중 하나만');
       let repeatMs: number | undefined;
       // ⭐ 0 = 일회성(생략과 같다) — 모델이 «한 번만»을 0 으로 부른다(라이브 실측). 음수·NaN·1 미만 소수는 거부.
       if (req.repeatMinutes !== undefined && req.repeatMinutes !== 0) {
@@ -276,7 +316,8 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
       }
       let dueAt: number;
       if (hasAt) {
-        const resolved = resolveWakeupAt(req.at!, t);
+        if (typeof req.at !== 'string') return reject(`at 은 «HH:MM» 문자열이어야 한다 — 받은 값 ${JSON.stringify(req.at)}`);
+        const resolved = resolveWakeupAt(req.at, t);
         if (resolved === null) return reject(`at 은 «HH:MM»(24시간) 꼴 — 받은 값 ${JSON.stringify(req.at)}`);
         dueAt = resolved;
       } else if (hasDelay) {
@@ -342,7 +383,7 @@ export function buildScheduleWakeupHostTool(scheduler: WakeupScheduler): LLMTool
     name: SCHEDULE_WAKEUP_TOOL_NAME,
     description:
       'Wake THIS TUI later with an internal turn: when you would write «다음 점검 HH:MM» and end the turn, call this instead so the check actually happens. '
-      + 'action=schedule (default) needs reason plus one of at ("HH:MM" local, past → tomorrow) / delaySeconds (≥60) / repeatMinutes (≥1; repeats expire after 7 days). '
+      + 'action=schedule (default) needs reason plus one of at ("HH:MM" local, past → tomorrow) / delaySeconds (≥60) / repeatMinutes (≥1; repeats expire after 7 days). Never provide both at and delaySeconds; the schema requires one timing variant. '
       + 'ONE-SHOT (wake once): give only delaySeconds or at and OMIT repeatMinutes (0 also means one-shot). Set repeatMinutes only when you really want it to repeat. '
       + `action=list shows pending wakeups; action=cancel needs id. Limits: ≥60s ahead, ≤7 days, at most 5 pending, at most ${WAKEUP_MAX_CALLS_PER_TURN} schedule/cancel calls per turn. `
       + 'If the TUI is busy or the human is typing at that time it retries once a minute later, then gives up (repeats move to the next tick). '
@@ -358,6 +399,11 @@ export function buildScheduleWakeupHostTool(scheduler: WakeupScheduler): LLMTool
         id: { type: 'string', description: 'Wakeup id for action=cancel (from schedule/list).' },
       },
       required: [],
+      oneOf: [
+        { not: { anyOf: [{ required: ['at'] }, { required: ['delaySeconds'] }] } },
+        { required: ['at'], not: { required: ['delaySeconds'] } },
+        { required: ['delaySeconds'], not: { required: ['at'] } },
+      ],
     },
     handler: async (args) => {
       const action = typeof args.action === 'string' ? args.action : 'schedule';
@@ -368,12 +414,15 @@ export function buildScheduleWakeupHostTool(scheduler: WakeupScheduler): LLMTool
         return r.ok ? { cancelled: id } : { error: r.error };
       }
       if (action !== 'schedule') return { error: `unknown action ${JSON.stringify(action)}` };
-      const result = scheduler.schedule({
+      const atProvided = Object.prototype.hasOwnProperty.call(args, 'at');
+      const request: ScheduleWakeupRequest = {
         reason: typeof args.reason === 'string' ? args.reason : '',
-        ...(typeof args.at === 'string' ? { at: args.at } : {}),
+        atProvided,
+        ...(atProvided ? { at: args.at } : {}),
         ...(typeof args.delaySeconds === 'number' ? { delaySeconds: args.delaySeconds } : {}),
         ...(typeof args.repeatMinutes === 'number' ? { repeatMinutes: args.repeatMinutes } : {}),
-      });
+      };
+      const result = scheduler.schedule(request, canonicalToolArgs(args));
       return result.ok ? { scheduled: describeEntry(result.entry) } : { error: result.error };
     },
   };

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
@@ -14,6 +14,7 @@ import { loadEnvKnownFailures, splitKnownEnv } from './env-known-failures';
 import { loadGateBatchSafe } from './gate-batch-safe';
 import { baselineFromCutLogs } from './baseline-from-logs';
 import { mergePartialFailures, readPartialPlan, testFileOfId, verifyDocsOnlyCarry } from './gate-partial';
+import { planGateRadiusShadow, shadowActual, writeGateRadiusShadow, type GateRadiusShadowPlan } from './gate-radius-shadow';
 import { logPlanWalltime, planDurations, readFileMemory } from './shard-plan';
 import { defaultGateHostMirrorReaders, resolveGateHostMirror, type GateHostMirror, type GateHostMirrorReaders } from './gate-host-mirror';
 import { isGateSpawnLaneFile, planGateSpawnSeparatedShards } from './spawn-lane';
@@ -28,15 +29,48 @@ import { POD_BUN_CACHE_HOST_PATH, parseInstallSeconds, podBunCacheVolume } from 
 import { PodPoolScheduler, parsePodPool, checkPodPool, defaultRemoteRun, type PodPoolMember } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { POD_INSTALL_SLOTS_DEFAULT, POD_INSTALL_SLOTS_HOST_PATH, installSlotScript } from '../../src/task-orchestrator/surfaces/pod-install-slots.js';
 import { gateDepsInstallScript, parseGateDeps } from '../../src/task-orchestrator/surfaces/pod-gate-deps.js';
-import { writeWarmJobManifest } from './gate-warm-artifacts.js';
+import { warmReferenceFromJobArtifacts, writeWarmJobManifest } from './gate-warm-artifacts.js';
+import { assessWarmWorkerShadow, parseWarmWorkerReply, type WarmWorkerCommand, type WarmWorkerFileResult, type WarmWorkerKey } from '../../src/task-orchestrator/surfaces/pod-warm-worker-protocol.js';
+import type { WarmPodTransportResult } from '../../src/task-orchestrator/surfaces/pod-warm-worker-pod.js';
+import { requestWarmPodReplay, finalizeWarmPodReplay, quarantineWarmPodReplay, type WarmReplayResult } from '../../src/task-orchestrator/surfaces/pod-warm-worker-provider.js';
+import { resolveWarmPoolProfile } from '../../src/self-implement/pod-warm-pool-profile.js';
+import { decideWarmReuse, type WarmReuseSwitchConfig, type WarmReuseEvidence } from '../../src/task-orchestrator/surfaces/pod-warm-switch.js';
+import { getUserConfig } from '../../src/user-config.js';
 import { gateShardsPath, recordGateShardsVerdict, writeGateShards, type GateShard } from '../../src/release-loop/gate-shards.js';
 import { defaultKubectl } from '../../src/task-orchestrator/surfaces/self-implement-pod.js';
 import { executeTuiNodeCheck, type ExecutedTuiCheck } from './tui-node-checks.js';
+import { runWithReleaseGateTraffic } from './gate-traffic-mode.js';
 import { emitPodLifecycle, gatePodLifecycleEvent, gatePodOutcome } from '../../src/task-orchestrator/surfaces/pod-lifecycle-stages.js';
 import { gateHostReservationRoot, reserveReleaseGateHosts } from '../../src/release-loop/gate-host-reservation.js';
 import { normRoot } from '../../src/instance/resolve.js';
 
+export interface WarmShadowObservation {
+  files: string[];
+  attemptId: string;
+  reason: string;
+  status: 'observed' | 'fallback' | 'unmeasured';
+  quarantined: 'yes' | 'no' | 'failed' | 'unavailable';
+  finalized?: boolean;
+  /** Exact producer identity; absent on an old verdict means the sample cannot enable reuse. */
+  cutSha?: string;
+  baselineSha?: string;
+  workerKey?: WarmWorkerKey;
+}
+
+/** A provider may fill only lease identity; it cannot rewrite the Job attempt being compared. */
+export function warmCommandMatchesRequest(command: WarmWorkerCommand, request: Omit<WarmWorkerCommand, 'leaseId' | 'generation' | 'workerId' | 'key'>): boolean {
+  return command.protocol === request.protocol && command.runId === request.runId
+    && command.attemptId === request.attemptId && command.cutSha === request.cutSha
+    && command.baselineSha === request.baselineSha && command.deadlineAt === request.deadlineAt
+    && command.envProfile === request.envProfile && command.files.length === request.files.length
+    && command.files.every((file, index) => file === request.files[index]);
+}
+
 interface CommandResult { rc: number; output: string; passedIds?: string[]; stalledEnv?: Array<{ file: string; reason: 'no-output' }>; timedOut?: boolean;
+  /** Complete, source-bound one-file Job result for shadow comparison; absent means unmeasured. */
+  warmReference?: WarmWorkerFileResult | null;
+  warmAttemptId?: string;
+  warmShadow?: WarmShadowObservation;
   /** GATE-POD-STALL-FAILFAST ① — shard Pods whose tests the mid-run watch aborted in this sweep. */
   abortedShards?: number;
   /** Each contributing Pod leaf already passed failuresOf; repeated printed ids cannot add new failures. */
@@ -76,6 +110,22 @@ export interface GateOptions {
   recheckFileLimit?: number;
   /** freshShards — GATE-SHARD-RESUME off: every shard starts a Pod even when this logDir already holds its result. */
   pod?: { pool: string; shards?: number; shardTimeoutSeconds?: number; durationSource?: string; bunCache?: string; freshShards?: boolean;
+    /** Opt-in gate shadow: provider fills the fenced lease identity. The Job remains authoritative. */
+    warmReplay?: (input: Omit<WarmWorkerCommand, 'leaseId' | 'generation' | 'workerId' | 'key'>) => Promise<{ command: WarmWorkerCommand | null; transport: WarmPodTransportResult }>;
+    warmQuarantine?: (command: WarmWorkerCommand, reason: string) => Promise<void>;
+    warmFinalize?: (command: WarmWorkerCommand) => Promise<void>;
+    /** Set only on the cut recheck; baseline Jobs never consume the cut worker. */
+    warmCutSha?: string;
+    warmBaselineSha?: string;
+    warmReuseConfig?: WarmReuseSwitchConfig;
+    /** At most three cut isolation files may request a shadow replay per verdict. */
+    warmEligible?: boolean;
+    /** An explicitly excluded file cannot race for the shared replay budget. */
+    warmReplayOwner?: boolean;
+    /** Internal budget shared by every recheck in one gate verdict, including timeout retries. */
+    warmShadowScope?: { requested: boolean; attempts?: number };
+    /** Internal shadow wait cap; a stuck provider cannot hold the Job verdict (tests may lower it). */
+    warmShadowTimeoutMs?: number;
     /** Maximum concurrent file-isolation fallback Jobs across the entire sweep; omitted = 4. */
     isolationConcurrency?: number;
     /** GATE-SKIP-KNOWN-RETRY — failure ids the previous release already had (and env-known ones): a shard that fails only
@@ -124,6 +174,16 @@ export interface GateOptions {
     /** GATE-WARM-BOOT-SCAN — observation only: the sweep's test selection (list · filter · duration plan · shard plan) time. */
     onSelectionTimed?: (timed: { ms: number; files: number }) => void };
 }
+
+/** Gate-profile opt-in wires the producer only for the process entry, never a test runner seam. */
+export function withWarmGateHooks(opts: GateOptions, config: unknown, injectedRunner = false): GateOptions {
+  if (injectedRunner || !opts.pod || resolveWarmPoolProfile(config) !== 'gate') return opts;
+  const warmReuseConfig = config && typeof config === 'object' && 'pod' in config
+    && config.pod && typeof config.pod === 'object' && 'warmReuse' in config.pod
+    ? config.pod.warmReuse as WarmReuseSwitchConfig : undefined;
+  return { ...opts, pod: { ...opts.pod, warmReplay: requestWarmPodReplay,
+    warmFinalize: finalizeWarmPodReplay, warmQuarantine: quarantineWarmPodReplay, warmReuseConfig } };
+}
 export interface GateResult {
   outcome: 'ok' | 'regression' | 'error';
   commit: string;
@@ -137,6 +197,8 @@ export interface GateResult {
   rcNonzeroNoFailures: Array<{ file: string; rc: number; pass: number; baseline: 'same' | 'clean' | 'missing' }>;
   /** Files left unmeasured after isolated recheck; these cannot seed a reusable baseline. */
   unmeasuredRecheckFiles?: string[];
+  /** Shadow only: Job verdict is unchanged even on a worker mismatch or failed quarantine. */
+  warmShadow?: WarmShadowObservation[];
   /** GATE-POD-STALL-FAILFAST ① — cut sweep shard Pods ended by the mid-run abort (their files went the timeout way). */
   abortedShards?: number;
   baselineSource?: 'ledger' | 'instance' | 'cut-logs' | 'swept';
@@ -149,6 +211,10 @@ export interface GateResult {
   selectionMs?: number;
   error?: string;
   stalledShards?: Array<{ shard: number; files: string[]; reason: 'incomplete' | 'no-output' | 'job-failed' | 'exit-code' | 'unattributed' | 'timeout'; lastFile?: string; summaryFailures?: number; namedFailures?: number; detail?: string;
+    /** Pool member that ran the final unmeasured attempt; enables a bounded cross-host tail remeasure. */
+    lastHost?: string;
+    /** Failure of the optional cross-host tail attempt; original stall fields remain authoritative. */
+    tailRemeasure?: { reason: string; host?: string; detail?: string };
     /** GATE-POD-STALL-FAILFAST — the shard (and its one fresh retry) printed no test output within the stall window: unmeasured. */
     stall?: { seconds: number; sinceCheckoutMs: number } }>;
   partialSummary?: { pass: number; fail: number; errors: number; ran: number; files: number };
@@ -169,6 +235,124 @@ const versionPattern = /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/;
 const failureFile = (root: string, version: string) => join(root, 'release', version, 'gate-failures.json');
 /** Judged identities live beside the machine release ledger; gate-failures.json keeps its raw baseline schema. */
 const verdictFile = (root: string, version: string) => join(root, 'release', version, 'gate-verdict.json');
+const WARM_VERDICT_HISTORY_LIMIT = 5;
+const WARM_REPLAY_BUDGET = 3;
+interface WarmVerdictSample { version: string; commit: string; baselineCommit: string; warmShadow: WarmShadowObservation[] }
+const recordValue = (value: unknown): Record<string, unknown> | null =>
+  value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+/** The verdict is atomically replaced; carry a bounded prior-verdict window in that same SSOT. */
+function readWarmVerdictHistory(path: string): WarmVerdictSample[] | undefined {
+  if (!existsSync(path)) return [];
+  try {
+    const current = recordValue(JSON.parse(readFileSync(path, 'utf8')));
+    if (!current || !Array.isArray(current.warmHistory)) return undefined;
+    const history = [...current.warmHistory, { version: current.version, commit: current.commit,
+      baselineCommit: current.baselineCommit, warmShadow: current.warmShadow }].slice(-WARM_VERDICT_HISTORY_LIMIT);
+    if (history.some((entry) => { const row = recordValue(entry);
+      return !row || typeof row.version !== 'string' || typeof row.commit !== 'string'
+        || typeof row.baselineCommit !== 'string' || !Array.isArray(row.warmShadow); })) return undefined;
+    return history as WarmVerdictSample[];
+  } catch { return undefined; }
+}
+/** Every counted match has a measured, finalized worker with this exact cut, baseline and lock. */
+export function warmEvidenceFromVerdicts(history: readonly WarmVerdictSample[] | undefined,
+  version: string, head: string, baseline: string, lock: string): WarmReuseEvidence | undefined {
+  if (!history?.length || !lock) return undefined;
+  const rows = history.flatMap((verdict) => {
+    if (verdict.version !== version || verdict.commit !== head || verdict.baselineCommit !== baseline
+      || !Array.isArray(verdict.warmShadow)) return [null];
+    return verdict.warmShadow.length ? verdict.warmShadow : [null];
+  });
+  const attempts = new Set<string>();
+  const key = rows.at(-1)?.workerKey;
+  if (rows.some((entry) => {
+    if (entry === null || !recordValue(entry) || !Array.isArray(entry.files) || !recordValue(entry.workerKey)) return true;
+    if (typeof entry.attemptId !== 'string' || !entry.attemptId || attempts.has(entry.attemptId)
+      || entry.files.length !== 1 || typeof entry.files[0] !== 'string'
+      || !/^(?:[\w.-]+\/)*[\w.-]+\.test\.[cm]?[jt]sx?$/.test(entry.files[0])
+      || entry.files[0].split('/').some((part) => part === '.' || part === '..')) return true;
+    attempts.add(entry.attemptId);
+    return entry.cutSha !== head || entry.baselineSha !== baseline || entry.workerKey?.lockHash !== lock
+      || typeof entry.workerKey.context !== 'string' || !entry.workerKey.context
+      || typeof entry.workerKey.imageDigest !== 'string' || !entry.workerKey.imageDigest
+      || typeof entry.workerKey.architecture !== 'string' || !entry.workerKey.architecture
+      || entry.workerKey.context !== key?.context || entry.workerKey.imageDigest !== key?.imageDigest
+      || entry.workerKey.architecture !== key?.architecture
+      || (entry.reason === 'match' && (entry.status !== 'observed' || entry.finalized !== true || entry.quarantined !== 'no'));
+  })) return undefined;
+  const recentMismatchCount = rows.filter((entry) => entry!.reason !== 'match').length;
+  let consecutiveMatchSamples = 0;
+  for (const row of [...rows].reverse()) {
+    if (row!.status !== 'observed' || row!.reason !== 'match' || row!.finalized !== true) break;
+    consecutiveMatchSamples++;
+  }
+  const latest = rows.at(-1)!;
+  return { consecutiveMatchSamples, recentMismatchCount,
+    leaseValid: latest!.finalized === true,
+    canaryPassed: latest!.status === 'observed' && latest!.reason === 'match' && latest!.finalized === true,
+    // A release cut is the pinned main commit; baselineSha is checked separately above.
+    expected: { head, main: head, lock }, worker: { head: latest!.cutSha, main: latest!.cutSha, lock: latest!.workerKey!.lockHash } };
+}
+/** Live reuse is serial and opt-in. Any uncertain lease, reply, or cleanup returns to the fresh Job. */
+async function tryWarmGateAdoption(file: string, cutSha: string, baselineSha: string, expectedKey: WarmWorkerKey,
+  pod: NonNullable<GateOptions['pod']>): Promise<CommandResult | undefined> {
+  if (!pod.warmReplay || !pod.warmFinalize || !pod.warmQuarantine || !pod.warmShadowScope
+    || (pod.warmShadowScope.attempts ?? 0) >= WARM_REPLAY_BUDGET) return undefined;
+  pod.warmShadowScope.attempts = (pod.warmShadowScope.attempts ?? 0) + 1;
+  pod.warmShadowScope.requested = true;
+  const waitMs = pod.warmShadowTimeoutMs ?? 150_000;
+  const deadline = Date.now() + waitMs;
+  const request = { protocol: 1 as const, runId: randomUUID(), attemptId: randomUUID(), cutSha,
+    baselineSha, deadlineAt: deadline - 1_000, files: [file], envProfile: 'gate-v1' };
+  let command: WarmWorkerCommand | null = null;
+  let timedOut = false;
+  const bounded = async <T>(operation: () => Promise<T>): Promise<T> => {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) throw new Error('warm adoption timeout');
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try { return await Promise.race([Promise.resolve().then(operation), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('warm adoption timeout')), remainingMs);
+    })]); } finally { if (timer) clearTimeout(timer); }
+  };
+  try {
+    const pending = Promise.resolve().then(() => pod.warmReplay!(request));
+    void pending.then((late) => {
+      if (timedOut && late.command) void pod.warmQuarantine!(late.command, 'late-adoption-after-timeout')
+        .catch((error) => debug.log('release-loop.gate', 'warm-adoption-late-quarantine-failed', { file, error: String(error) }));
+    }, () => undefined);
+    let replay: WarmReplayResult;
+    try { replay = await bounded(() => pending); }
+    catch (error) { timedOut = true; throw error; }
+    command = replay.command;
+    if (!command || replay.transport.status !== 'observed' || replay.transport.reason !== 'complete'
+      || !warmCommandMatchesRequest(command, request) || command.key.context !== expectedKey.context
+      || command.key.imageDigest !== expectedKey.imageDigest || command.key.lockHash !== expectedKey.lockHash
+      || command.key.architecture !== expectedKey.architecture) throw new Error('warm adoption lease or identity');
+    const reply = parseWarmWorkerReply(replay.transport.reply);
+    const part = reply?.files[0];
+    if (!reply || !part || reply.files.length !== 1 || part.file !== file || part.rc !== 0 || part.junitComplete !== true
+      || part.failureIds.length !== 0 || part.errorIds.length !== 0
+      || reply.runId !== command.runId || reply.attemptId !== command.attemptId || reply.cutSha !== cutSha
+      || reply.baselineSha !== baselineSha || reply.leaseId !== command.leaseId || reply.generation !== command.generation
+      || reply.workerId !== command.workerId || reply.envProfile !== command.envProfile
+      || reply.key.context !== command.key.context || reply.key.imageDigest !== command.key.imageDigest
+      || reply.key.lockHash !== command.key.lockHash || reply.key.architecture !== command.key.architecture
+      || reply.finishedAt < reply.startedAt || reply.finishedAt > command.deadlineAt) throw new Error('warm adoption result');
+    await bounded(() => pod.warmFinalize!(command!));
+    debug.log('release-loop.gate', 'warm-adopted-recheck', { file, cutSha, attemptId: command.attemptId });
+    return { rc: 0, output: `${file}:\n(pass) warm isolated recheck\n1 pass\n0 fail\nRan 1 test across 1 file.\n` };
+  } catch (error) {
+    if (command) {
+      let quarantineTimer: ReturnType<typeof setTimeout> | undefined;
+      try { await Promise.race([pod.warmQuarantine!(command, 'adoption-fallback'),
+        new Promise<never>((_, reject) => { quarantineTimer = setTimeout(() => reject(new Error('warm quarantine timeout')), 10_000); })]); }
+      catch (fenceError) { debug.log('release-loop.gate', 'warm-adoption-quarantine-failed', { file, error: String(fenceError) }); }
+      finally { if (quarantineTimer) clearTimeout(quarantineTimer); }
+    }
+    debug.log('release-loop.gate', 'warm-adoption-fresh-job', { file, reason: String(error) });
+    return undefined;
+  }
+}
 const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
 const defaultRemoteMirror = '~/mirror/elanous-agent.git';
 
@@ -958,6 +1142,16 @@ class StalledPodShards extends Error {
   }
 }
 
+class WarmRecheckIncomplete extends Error {
+  constructor(message: string, readonly file: string, readonly shadow: WarmShadowObservation) { super(message); }
+}
+
+class SettledRecheckFailures extends Error {
+  constructor(readonly failures: unknown[]) {
+    super(failures[0] instanceof Error ? failures[0].message : String(failures[0]));
+  }
+}
+
 /** Isolated re-runs (host stall re-run · cut and baseline re-checks) are time-limited; sweeps and installs keep their full time. */
 export const GATE_ISOLATED_TIMEOUT_MS = 300_000;
 /** Default final recheck window size; overflow continues in later windows. */
@@ -1212,6 +1406,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     let abortedShards = 0;
     // GATE-MULTI-HOST: members found unreachable during this gate — skipped for placement while any other member is left.
     const downMembers = new Set<string>();
+    let tailPlacedHost: string | undefined;
     const multiHost = poolScheduler.members.length > 1;
     const probeMember = pod.probeMember ?? (poolOverride ? undefined : defaultGateMemberProbe);
     const memberUnreadableSeconds = pod.memberUnreadableSeconds ?? GATE_MEMBER_UNREADABLE_SECONDS_DEFAULT;
@@ -1287,12 +1482,13 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     /** The gate's scheduler, seen through one shard: a slot wait and the Pod start become row states. */
     // GATE-MEM-ADMIT: `placed` releases the shard's admission once a member is chosen — from then on the Job is
     // Pending/Running in the cluster and the next admission reading counts it, so holding the lease would count it twice.
-    const trackedPool = (shard: number, retry: boolean, placed: (member: NonNullable<Awaited<ReturnType<PodPoolScheduler['tryAcquire']>>>) => void = () => {}): PodPoolScheduler => ({
+    const trackedPool = (shard: number, retry: boolean, placed: (member: NonNullable<Awaited<ReturnType<PodPoolScheduler['tryAcquire']>>>) => void = () => {}, skipMembers: ReadonlySet<string> = new Set()): PodPoolScheduler => ({
       members: poolScheduler.members,
       tryAcquire: async (...[skip, onEmpty, mode]: Parameters<PodPoolScheduler['tryAcquire']>) => {
         // GATE-MULTI-HOST: a lost member is skipped while another member is left (all lost = the old behaviour).
         const anyLeft = poolScheduler.members.some((m) => !downMembers.has(m.context));
-        const member = await poolScheduler.tryAcquire(downMembers.size && anyLeft ? new Set([...(skip ?? []), ...downMembers]) : skip, onEmpty, mode);
+        const excluded = new Set([...(skip ?? []), ...skipMembers, ...(downMembers.size && anyLeft ? downMembers : [])]);
+        const member = await poolScheduler.tryAcquire(excluded.size ? excluded : undefined, onEmpty, mode);
         if (member) placed(member);
         if (member) markShard(shard, { state: retry ? 'retry' : 'running', startedAt: board[shard]?.startedAt ?? new Date().toISOString(), host: member.context }, ['waitReason']);
         else markShard(shard, { waitReason: 'Pod 자리 대기' });
@@ -1300,7 +1496,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       },
       release: (member: Parameters<PodPoolScheduler['release']>[0]) => poolScheduler.release(member),
     }) as unknown as PodPoolScheduler;
-    const runShard = async (paths: string[], shard: number, depth = 0, branch = '', retriedNoOutput = false, fresh = pod.freshShards === true, parentAttempt?: string, hostRetries = 0, batchIsolation = false): Promise<{ runs: ShardRun[]; stalled: NonNullable<GateResult['stalledShards']> }> => {
+    const runShard = async (paths: string[], shard: number, depth = 0, branch = '', retriedNoOutput = false, fresh = pod.freshShards === true, parentAttempt?: string, hostRetries = 0, batchIsolation = false, skipMembers: ReadonlySet<string> = new Set(), singleShotTail = false): Promise<{ runs: ShardRun[]; stalled: NonNullable<GateResult['stalledShards']> }> => {
       // 파일별 소요는 junit 으로 남긴다 — 콘솔 요약(판정 원천)은 그대로이고, 느린 시험 목록(K10 D4)·계층 분리(D2)의 자가 된다.
       // GATE-TIMEOUT-HEAL: parts (each with its own junit) under a soft deadline inside this shard's own Job deadline.
       const shardDeadline = shardDeadlineSeconds(batchIsolation ? Math.max(...paths.map((file) => estimated([file]))) * Math.ceil(paths.length / batchWidth) : estimated(paths), deadlineSeconds);
@@ -1356,7 +1552,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       if (descent === 'retry') {
         // «descend» is only the way down; «resumed» comes from each leaf whose log reads cleanly (review r4).
         debug.log('release-loop.gate', 'pod-shard-descend', { shard, branch, files: paths.length, via: 'retry' });
-        return runShard(paths, shard, depth, `${branch}-retry`, true, undefined, attemptId, hostRetries, batchIsolation);
+        return runShard(paths, shard, depth, `${branch}-retry`, true, undefined, attemptId, hostRetries, batchIsolation, skipMembers);
       }
       if (descent === 'split') {
         output = undefined;
@@ -1397,7 +1593,10 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           } : {}) }) : undefined;
         const placed = admitted.release;
         const job = await podCommand({
-          pool: pod.pool, poolScheduler: trackedPool(shard, depth > 0 || branch !== '', (member) => { stamp('poolPlaced'); jobContext = member.context; placedOn = member.context; placed(); }), clone: true, source: { kind: 'commit', sha: commit }, deadlineSeconds: shardDeadline,
+          pool: pod.pool, poolScheduler: trackedPool(shard, depth > 0 || branch !== '', (member) => {
+            stamp('poolPlaced'); jobContext = member.context; placedOn = member.context; placed();
+            if (branch === '-tail') tailPlacedHost = member.context;
+          }, skipMembers), clone: true, source: { kind: 'commit', sha: commit }, deadlineSeconds: shardDeadline,
           ...gateHostMirror(pod),
           ...(multiHost ? { statusUnreadableMs: memberUnreadableSeconds * 1000 } : {}),
           ...(bunCache ? { bunCache } : {}),
@@ -1560,14 +1759,14 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       // A reused result that the current tool cannot read cleanly is not a verdict: run that shard for real.
       if (reused && reason) {
         debug.log('release-loop.gate', 'pod-shard-resume-miss', { shard, branch, reason });
-        return runShard(paths, shard, depth, branch, retriedNoOutput, true, parentAttempt, hostRetries, batchIsolation);
+        return runShard(paths, shard, depth, branch, retriedNoOutput, true, parentAttempt, hostRetries, batchIsolation, skipMembers, singleShotTail);
       }
       // GATE-MULTI-HOST: the Job failed because its member is gone (launch failed · status unreadable) — not the shard's
       // fault, so no split: the same files run again on the members left. Bounded by the roster size.
-      if (jobFailed && placedOn && hostRetries < poolScheduler.members.length && memberLost(placedOn, shard, jobError)
+      if (!singleShotTail && jobFailed && placedOn && hostRetries < poolScheduler.members.length && memberLost(placedOn, shard, jobError)
         && poolScheduler.members.some((m) => !downMembers.has(m.context))) {
         debug.log('release-loop.gate', 'pod-shard-host-retry', { shard, branch, files: paths.length, lostMember: placedOn, attempt: hostRetries + 1 }, { level: 'warn' });
-        return runShard(paths, shard, depth, `${branch}-h${hostRetries}`, retriedNoOutput, undefined, attemptId, hostRetries + 1, batchIsolation);
+        return runShard(paths, shard, depth, `${branch}-h${hostRetries}`, retriedNoOutput, undefined, attemptId, hostRetries + 1, batchIsolation, skipMembers, singleShotTail);
       }
       // GATE-TIMEOUT-HEAL ④: a Pod that died before any test ran (no outbox · jobExitCode≠0 — 0.2.19: isolated retries
       // ending with exit 5, the source checkout) gets the same one fresh retry as «no output» instead of stalling the sweep.
@@ -1575,13 +1774,18 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       const diedBeforeTests = reason === 'job-failed' && output === undefined && !jobFailed && jobExitCode !== undefined && jobExitCode !== 0
         && jobExitCode !== 137 && (paths.length === 1 || jobExitCode === 5);
       if ((reason === 'no-output' || diedBeforeTests) && !retriedNoOutput) {
-        const retry = await runShard(paths, shard, depth, `${branch}-retry`, true, undefined, attemptId, hostRetries, batchIsolation);
+        const retry = await runShard(paths, shard, depth, `${branch}-retry`, true, undefined, attemptId, hostRetries, batchIsolation, skipMembers);
         debug.log('release-loop.gate', 'pod-shard-retry', { shard, files: paths, reason, outcome: retry.stalled[0]?.reason ?? 'ok' });
         return retry;
       }
       // GATE-POD-STALL-FAILFAST: a stall after the fresh retry is unmeasured — no split, no isolation: smaller Pods on the
       // same stalled node only re-measure the stall (10-10: retries and splits repeated it for 2h+).
-      if (stall && reason === 'no-output') return { runs: [], stalled: [{ shard, files: paths, reason, stall }] };
+      if (stall && reason === 'no-output') return { runs: [], stalled: [{ shard, files: paths, reason, stall, ...(placedOn ? { lastHost: placedOn } : {}) }] };
+      // GATE-STALLED-TAIL-REMEASURE: the alternate-host probe is a single observation. Do not split, isolate, or
+      // retry its failed result; the sweep retains the original stall and records this attempt separately.
+      if (singleShotTail && reason) return { runs: [], stalled: [{ shard, files: paths, reason,
+        ...(lastFile ? { lastFile } : {}), ...(placedOn ? { lastHost: placedOn } : {}),
+        ...(reason === 'unattributed' ? { summaryFailures: fails, namedFailures, ...(unattributedDetail ? { detail: unattributedDetail } : {}) } : {}) }] };
       // A shared Job may finish some file parts before another part loses its JUnit/log/rc. Keep every complete part's
       // original verdict, including a failure, and rerun only parts without the full artifact trio.
       if (batchIsolation && !batchArtifactsComplete && batchArtifactDir && reason) {
@@ -1714,8 +1918,43 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const rejected = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
     if (rejected) throw rejected.reason;
     const results = settled.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
-    const stalledShards = results.flatMap((result) => result.stalled);
+    let stalledShards = results.flatMap((result) => result.stalled);
     const measured = results.flatMap((result) => result.runs);
+    // GATE-STALLED-TAIL-REMEASURE: after the sweep, give only a one-file no-output leaf one fresh attempt on a different
+    // pool member. Keep the original unmeasured evidence if no alternate is available or the remeasure is incomplete.
+    const remainingStalls: typeof stalledShards = [];
+    for (const stalled of stalledShards) {
+      const alternatives = stalled.lastHost
+        ? poolScheduler.members.filter((member) => member.context !== stalled.lastHost && !downMembers.has(member.context))
+        : [];
+      if (!stalled.stall || stalled.reason !== 'no-output' || stalled.files.length !== 1 || !stalled.lastHost || !alternatives.length) {
+        remainingStalls.push(stalled);
+        continue;
+      }
+      debug.log('release-loop.gate', 'pod-stalled-tail-remeasure-start', { shard: stalled.shard, file: stalled.files[0], fromHost: stalled.lastHost,
+        availableHosts: alternatives.map((member) => member.context) });
+      try {
+        tailPlacedHost = undefined;
+        const tail = await runShard(stalled.files, stalled.shard, 0, '-tail', true, true, undefined, 0, false, new Set([stalled.lastHost]), true);
+        if (tail.stalled.length) {
+          const unresolved = tail.stalled[0]!;
+          remainingStalls.push({ ...stalled, tailRemeasure: { reason: unresolved.reason,
+            ...(unresolved.lastHost ?? tailPlacedHost ? { host: unresolved.lastHost ?? tailPlacedHost } : {}),
+            ...(unresolved.detail ? { detail: unresolved.detail } : {}) } });
+          debug.log('release-loop.gate', 'pod-stalled-tail-remeasure-incomplete', { shard: stalled.shard, file: stalled.files[0],
+            fromHost: stalled.lastHost, toHost: unresolved.lastHost ?? null, reason: unresolved.reason }, { level: 'warn' });
+        } else {
+          measured.push(...tail.runs);
+          debug.log('release-loop.gate', 'pod-stalled-tail-remeasure-complete', { shard: stalled.shard, file: stalled.files[0],
+            fromHost: stalled.lastHost, toHost: tailPlacedHost ?? null });
+        }
+      } catch (error) {
+        remainingStalls.push({ ...stalled, tailRemeasure: { reason: 'error', ...(tailPlacedHost ? { host: tailPlacedHost } : {}), detail: String(error).slice(0, 500) } });
+        debug.log('release-loop.gate', 'pod-stalled-tail-remeasure-error', { shard: stalled.shard, file: stalled.files[0],
+          fromHost: stalled.lastHost, error: String(error).slice(0, 500) }, { level: 'warn' });
+      }
+    }
+    stalledShards = remainingStalls;
     const total = measured.reduce((sum, run) => ({ pass: sum.pass + run.pass, fail: sum.fail + run.fail,
       errors: sum.errors + run.errors, ran: sum.ran + run.ran, files: sum.files + run.files }),
     { pass: 0, fail: 0, errors: 0, ran: 0, files: 0 });
@@ -1733,6 +1972,21 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       ...(abortedShards ? { abortedShards } : {}) };
   };
   const runPodRecheckBatch = async (files: readonly string[], commit: string, pod: NonNullable<GateOptions['pod']>, timeoutMs: number, relaxed = false): Promise<Map<string, CommandResult>> => {
+    const warmShadowScope = pod.warmShadowScope ?? { requested: false };
+    const shadowTimeoutMs = pod.warmShadowTimeoutMs ?? 150_000;
+    if (!Number.isSafeInteger(shadowTimeoutMs) || shadowTimeoutMs < 1 || shadowTimeoutMs > 150_000)
+      throw new Error('invalid warm shadow timeout');
+    let shadowDeadline = 0;
+    const boundedShadow = async <T>(phase: string, operation: () => Promise<T>): Promise<T> => {
+      const remainingMs = shadowDeadline - Date.now();
+      if (remainingMs <= 0) throw new Error(`warm ${phase} timeout after ${shadowTimeoutMs}ms`);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([Promise.resolve().then(operation), new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(`warm ${phase} timeout after ${shadowTimeoutMs}ms`)), remainingMs);
+        })]);
+      } finally { if (timer) clearTimeout(timer); }
+    };
     if (!files.length || files.length > GATE_RECHECK_POD_BATCH_FILES || new Set(files).size !== files.length
       || files.some((file) => !/^(?:[\w.-]+\/)*[\w.-]+\.test\.[cm]?[jt]sx?$/.test(file)
         || file.split('/').some((part) => part === '.' || part === '..')))
@@ -1741,11 +1995,12 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const installSlots = pod.installSlots ?? POD_INSTALL_SLOTS_DEFAULT;
     if (!Number.isSafeInteger(installSlots) || installSlots < 0) throw new Error('invalid pod recheck install slots');
     const bunCache = pod.bunCache?.trim() || process.env[POD_BUN_CACHE_HOST_PATH]?.trim();
+    const attemptId = randomUUID();
     const partLimitSeconds = Math.ceil(timeoutMs / 1000);
     const deadlineSeconds = partLimitSeconds * Math.ceil(files.length / 2) + POD_SHARD_EMIT_RESERVE_SECONDS + 60;
     const shell = gateShardShell({ parts: files.map((file) => [file]), cdpPatterns: [], softSeconds: softDeadlineSeconds(deadlineSeconds),
       cachePrefix: bunCache ? podBunCacheVolume(bunCache).shellPrefix : '', installSlots, parallelParts: files.length > 1 ? 2 : 1,
-      partLimitSeconds, ...(relaxed ? { testTimeoutMs: GATE_TIMEOUT_RECHECK_MS } : {}) });
+      partLimitSeconds, sourceBinding: { cutSha: commit, attemptId }, ...(relaxed ? { testTimeoutMs: GATE_TIMEOUT_RECHECK_MS } : {}) });
     const job = await podCommand({ pool: pod.pool, ...(poolOverride ? { poolScheduler: poolOverride } : {}), clone: true,
       source: { kind: 'commit', sha: commit }, deadlineSeconds, ...(bunCache ? { bunCache } : {}), ...gateHostMirror(pod),
       ...(installSlots > 0 ? { installSlots: POD_INSTALL_SLOTS_HOST_PATH } : {}), ...(pod.cpu ? { cpu: pod.cpu } : {}),
@@ -1755,8 +2010,13 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       return existsSync(path) ? readFileSync(path, 'utf8') : undefined;
     };
     const installed = artifact('install.rc')?.trim() === '0';
+    const warmEligible = files.length === 1 && pod.warmEligible === true && !!pod.warmReplay && !!pod.warmQuarantine && !!pod.warmFinalize
+      && pod.warmCutSha === commit;
+    const incomplete = (message: string, file: string): Error => warmEligible
+      ? new WarmRecheckIncomplete(message, file, { files: [file], attemptId, status: 'unmeasured', reason: 'reference-unmeasured', quarantined: 'no' })
+      : new Error(message);
     if (!installed || job.exitCode !== 0)
-      throw new Error(`pod isolated recheck setup incomplete: ${commit.slice(0, 9)} job=${job.job} exit=${job.exitCode} install=${installed}`);
+      throw incomplete(`pod isolated recheck setup incomplete: ${commit.slice(0, 9)} job=${job.job} exit=${job.exitCode} install=${installed}`, files[0]!);
     const timedOut = artifact('shard.timeout') !== undefined;
     const results = new Map<string, CommandResult>();
     for (const [index, file] of files.entries()) {
@@ -1765,10 +2025,104 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       const rc = rcText && /^\d+$/.test(rcText) ? Number(rcText) : undefined;
       const partTimedOut = artifact(`part-${index}.timeout`) !== undefined;
       if (rc === undefined || output === undefined || partTimedOut) {
-        if (!timedOut && !partTimedOut) throw new Error(`pod isolated recheck incomplete: ${file} @${commit.slice(0, 9)} job=${job.job} rc=${rc ?? 'missing'}`);
+        if (!timedOut && !partTimedOut) throw incomplete(`pod isolated recheck incomplete: ${file} @${commit.slice(0, 9)} job=${job.job} rc=${rc ?? 'missing'}`, file);
         results.set(file, { rc: 124, output: output ?? '', timedOut: true });
-      } else results.set(file, { rc, output });
+      } else {
+        // The comparator only accepts a complete JUnit/log pair tied to this exact Job attempt.
+        // A missing or damaged artifact leaves the existing Job verdict authoritative.
+        let warmReference: WarmWorkerFileResult | null = null;
+        if (warmEligible) {
+          try {
+            const prefix = join(job.artifactsDir, `recheck-${index}`);
+            const part = (suffix: string) => join(job.artifactsDir, `part-${index}.${suffix}`);
+            for (const suffix of ['log', 'rc', 'junit.xml']) if (existsSync(part(suffix))) copyFileSync(part(suffix), `${prefix}.${suffix}`);
+            writeFileSync(`${prefix}.json`, JSON.stringify({ commit, attemptId, files: [file], rc,
+              jobFailed: false, jobExitCode: job.exitCode }) + '\n', { mode: 0o600 });
+            if (writeWarmJobManifest(prefix, file, commit, attemptId))
+              warmReference = warmReferenceFromJobArtifacts(prefix, file, { cutSha: commit, attemptId });
+          } catch (error) {
+            debug.log('release-loop.gate', 'warm-reference-unmeasured', { file, attemptId, error: String(error) });
+          }
+        }
+        results.set(file, { rc, output, warmReference, warmAttemptId: attemptId });
+      }
       debug.log('release-loop.gate', 'pod-isolated-recheck', { file, commit, job: job.job, rc: rc ?? 124, relaxed });
+    }
+    if (warmEligible && pod.warmReplay && pod.warmQuarantine && pod.warmFinalize) {
+      shadowDeadline = Date.now() + shadowTimeoutMs;
+      const first = results.get(files[0]!)!;
+      const reference = first.warmReference;
+      if (!reference) {
+        first.warmShadow = { files: [...files], attemptId, status: 'unmeasured', reason: 'reference-unmeasured', quarantined: 'no' };
+        debug.log('release-loop.gate', 'warm-shadow-recheck', first.warmShadow);
+      } else if (pod.warmReplayOwner !== false && (warmShadowScope.attempts ?? (warmShadowScope.requested ? 1 : 0)) < WARM_REPLAY_BUDGET) {
+        warmShadowScope.attempts = (warmShadowScope.attempts ?? (warmShadowScope.requested ? 1 : 0)) + 1;
+        warmShadowScope.requested = true;
+        let observation: WarmShadowObservation;
+        try {
+          const request = { protocol: 1 as const, runId: randomUUID(), attemptId, cutSha: commit,
+            ...(pod.warmBaselineSha ? { baselineSha: pod.warmBaselineSha } : {}),
+            deadlineAt: Math.min(Date.now() + timeoutMs * files.length + 60_000, shadowDeadline - 1_000),
+            files, envProfile: 'gate-v1' };
+          // The producer honors deadlineAt. An injected/slow producer may still settle after our wait cap:
+          // fence any late lease before it can be mistaken for a reusable worker.
+          let replayTimedOut = false;
+          const pendingReplay = Promise.resolve().then(() => pod.warmReplay!(request));
+          void pendingReplay.then((late) => {
+            if (replayTimedOut && late.command) void Promise.resolve().then(() => pod.warmQuarantine!(late.command!, 'late-replay-after-timeout'))
+              .catch((error) => debug.log('release-loop.gate', 'warm-shadow-late-quarantine-failed', { attemptId, error: String(error) }));
+          }, (error) => {
+            if (replayTimedOut) debug.log('release-loop.gate', 'warm-shadow-late-replay-failed', { attemptId, error: String(error) });
+          });
+          let replay: WarmReplayResult;
+          try { replay = await boundedShadow('replay', () => pendingReplay); }
+          catch (error) { replayTimedOut = true; throw error; }
+          if (!replay.command) {
+            observation = { files: [...files], attemptId, status: 'fallback', reason: replay.transport.reason, quarantined: 'no' };
+          } else if (replay.transport.status !== 'observed') {
+            let quarantined: WarmShadowObservation['quarantined'] = 'yes';
+            try { await boundedShadow('quarantine', () => pod.warmQuarantine!(replay.command!, `transport-${replay.transport.reason}`)); }
+            catch (error) {
+              quarantined = 'failed';
+              debug.log('release-loop.gate', 'warm-shadow-quarantine-failed', { attemptId,
+                reason: replay.transport.reason, error: String(error) });
+            }
+            observation = { files: [...files], attemptId, status: 'fallback', reason: replay.transport.reason, quarantined };
+          } else {
+            const bound = warmCommandMatchesRequest(replay.command, request);
+            const decision = bound ? assessWarmWorkerShadow(replay.command, [reference], replay.transport.reply)
+              : { reason: 'identity' as const, quarantineWorker: true };
+            let reason: string = decision.reason;
+            let status: WarmShadowObservation['status'] = 'observed';
+            let quarantined: WarmShadowObservation['quarantined'] = 'no';
+            let finalized = false;
+            if (decision.reason === 'match') {
+              try { await boundedShadow('finalize', () => pod.warmFinalize!(replay.command!)); finalized = true; }
+              catch (error) {
+                reason = 'finalize-failed';
+                status = 'fallback';
+                debug.log('release-loop.gate', 'warm-shadow-finalize-failed', { attemptId, error: String(error) });
+              }
+            }
+            if (!finalized) {
+              try { await boundedShadow('quarantine', () => pod.warmQuarantine!(replay.command!, reason)); quarantined = 'yes'; }
+              catch (error) {
+                quarantined = 'failed';
+                debug.log('release-loop.gate', 'warm-shadow-quarantine-failed', { attemptId, reason, error: String(error) });
+              }
+            }
+            observation = { files: [...files], attemptId, status, reason, quarantined, finalized,
+              cutSha: replay.command.cutSha, baselineSha: replay.command.baselineSha, workerKey: replay.command.key };
+          }
+        } catch (error) {
+          observation = { files: [...files], attemptId, status: 'unmeasured', reason: String(error), quarantined: 'unavailable' };
+        }
+        first.warmShadow = observation;
+        debug.log('release-loop.gate', 'warm-shadow-recheck', observation);
+      } else {
+        first.warmShadow = { files: [...files], attemptId, status: 'fallback', reason: 'replay-budget-exhausted', quarantined: 'no' };
+        debug.log('release-loop.gate', 'warm-shadow-recheck', first.warmShadow);
+      }
     }
     return results;
   };
@@ -1943,6 +2297,8 @@ export function saveBaselineFileCache(ledger: string, commit: string, rows: Base
 
 export async function judgeGate(opts: GateOptions, runner: GateRunner = createGateRunner(opts.repo ?? process.cwd(), opts.remote)): Promise<GateResult> {
   const start = Date.now();
+  if (opts.pod?.warmReplay) opts = { ...opts, pod: { ...opts.pod,
+    warmShadowScope: { requested: false, attempts: 0 } } };
   const explicitConfig = getElanousConfigDirOverride();
   const root = explicitConfig ? effectiveInstanceRoot() : (opts.instanceRoot ?? effectiveInstanceRoot());
   // The freeze is read from the same root the gate runs in (a config-dir override must not move it elsewhere).
@@ -1969,17 +2325,26 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
   };
   const repo = resolve(opts.repo ?? process.cwd());
   const result: GateResult = { outcome: 'error', commit: opts.commit, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 0 };
+  let baselineCommitForVerdict = opts.baselineCommit ?? '';
   const preexistingIds: string[] = [];
   let knownEnvIds: string[] = [];
   let work: string | undefined;
   let baseSnapshot = false;
   let cutFailures: SweepFailures | undefined;
+  let cutSweepUsable = false;
+  let cutSweepRc: number | null = null;
+  let radiusShadow: GateRadiusShadowPlan | undefined;
   const trees: string[] = [];
   try {
     if (!sha.test(opts.commit) || !versionPattern.test(opts.version)
       || (opts.baselineVersion && !versionPattern.test(opts.baselineVersion))
       || (opts.baselineCommit && !sha.test(opts.baselineCommit))) throw new Error('invalid commit or version');
     if (!opts.baselineVersion) throw new Error('previous release version required (--baseline-version)');
+    // Observation only. Failure to plan cannot change the gate selector or verdict.
+    try { radiusShadow = planGateRadiusShadow({ repo, ledgerRoot: ledger, version: opts.version,
+      baselineVersion: opts.baselineVersion, forCommit: opts.commit, instanceRoot: root,
+      expectedBaselineCommit: opts.baselineCommit }); }
+    catch (error) { debug.log('release-loop.gate', 'radius-shadow-unavailable', { reason: String(error) }); }
     if (!Number.isSafeInteger(opts.recheckFileLimit ?? GATE_HOST_RECHECK_FILE_LIMIT) || (opts.recheckFileLimit ?? GATE_HOST_RECHECK_FILE_LIMIT) < 1)
       throw new Error('invalid gate recheck file limit');
     if (opts.pod && (!opts.pod.pool || !Number.isSafeInteger(opts.pod.shards ?? 24) || (opts.pod.shards ?? 24) < 1
@@ -2061,6 +2426,9 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         // --ledger-root (tests) keeps it in that ledger.
         shardsFile: { path: opts.ledgerRoot ? gateShardsPath(opts.version, opts.ledgerRoot) : gateShardsPath(opts.version), version: opts.version } } : undefined,
       partial?.files);
+    cutSweepRc = cutRun?.rc ?? null;
+    cutSweepUsable = !!cutRun && (cutRun.rc === 0 || cutRun.rc === 1) && !cutRun.timedOut
+      && !cutRun.abortedShards && !cutRun.stalledEnv?.length;
     if (cutRun?.abortedShards) result.abortedShards = cutRun.abortedShards;
     const localStalled = async (run: CommandResult, tree: string, commit: string, label: string) => {
       const stalled = run.stalledEnv ?? [];
@@ -2145,6 +2513,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     if (partial) result.partial = { priorCommit: partial.priorCommit, files: partial.files.length };
     cutFailures = cut;
     const baseSha = opts.baselineCommit ?? baselineReleaseCommit(opts.baselineVersion);
+    baselineCommitForVerdict = baseSha;
     const cached = cachedBaseline(opts.baselineVersion, baseSha);
     const recorded = cached ? undefined : baselineFromCutLogs(join(ledger, 'release', opts.baselineVersion, 'gate-logs', 'cut'), baseSha);
     const trusted = cached?.saved ?? (recorded?.complete ? recorded : undefined);
@@ -2221,6 +2590,29 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       catch (error) { debug.log('release.gate', 'baseline-cache-write-failed', { commit: row.commit, file: row.file, error: String(error) }); }
     };
     const recheckFiles = [...newFailureFiles].sort();
+    const eligible = recheckFiles.filter((file) => !cutHostFailed.has(file) && !prefetchedCut.has(file));
+    const warmEligibleFiles = new Set(opts.pod?.warmReplay && opts.pod.warmQuarantine && opts.pod.warmFinalize
+      ? eligible.slice(0, WARM_REPLAY_BUDGET) : []);
+    // The source-bound lock comes from the cut commit itself, never from the producer's claim.
+    const history = readWarmVerdictHistory(verdictFile(ledger, opts.version));
+    let warmLockHash = '';
+    if (opts.pod?.warmReuseConfig?.gateRecheck && history?.length) {
+      try {
+        const lock = await runner.localCommand('git', ['show', `${opts.commit}:bun.lock`], repo);
+        if (lock.rc === 0 && lock.output) warmLockHash = createHash('sha256').update(lock.output).digest('hex');
+      } catch { /* Unmeasured evidence keeps reuse off. */ }
+    }
+    const warmEvidence = warmEvidenceFromVerdicts(history, opts.version, opts.commit, baseSha, warmLockHash);
+    const warmDecision = decideWarmReuse('gate-recheck', opts.pod?.warmReuseConfig,
+      warmEvidence ? { 'gate-recheck': warmEvidence } : undefined);
+    const verifiedWorkerKey = history?.at(-1)?.warmShadow.at(-1)?.workerKey;
+    if (warmDecision.live && verifiedWorkerKey && opts.pod && runner.recheckPod) {
+      // Only the first two files may adopt; replay them serially before scheduling fresh fallbacks.
+      for (const file of eligible.slice(0, 2)) {
+        const adopted = await tryWarmGateAdoption(file, opts.commit, baseSha, verifiedWorkerKey, opts.pod);
+        if (adopted) prefetchedCut.set(file, adopted);
+      }
+    }
     const recheckLimit = opts.recheckFileLimit ?? GATE_HOST_RECHECK_FILE_LIMIT;
     const recheckConcurrency = opts.pod?.isolationConcurrency ?? 4;
     if (opts.pod && (!Number.isSafeInteger(recheckConcurrency) || recheckConcurrency < 1)) throw new Error('invalid pod recheck concurrency');
@@ -2230,13 +2622,19 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       concurrency: opts.pod && runner.recheckPod ? recheckConcurrency : 1, executor: opts.pod && runner.recheckPod ? 'pod' : 'host',
       remote: opts.remote ?? null, podBatchFiles: opts.pod && runner.recheckPod && runner.recheckPodBatch ? GATE_RECHECK_POD_BATCH_FILES : 1 });
     const recheckStartedAt = Date.now();
+    const recordWarmShadow = (shadow?: WarmShadowObservation) => {
+      if (shadow && !result.warmShadow?.some((entry) => entry.attemptId === shadow.attemptId))
+        (result.warmShadow ??= []).push(shadow);
+    };
     const recheckFile = async (file: string, index: number) => {
       debug.log('release-loop.gate', 'isolated-recheck-progress',
         { index: index + 1, total: recheckFiles.length, file, elapsedSec: Math.round((Date.now() - recheckStartedAt) / 1000) });
       // 0.2.15: the cut re-check of a new-failure file (InsidePage.test.tsx · headless Chrome) hung for good — limit it like the host re-run.
       const cutCheck = cutHostFailed.has(file) ? undefined : prefetchedCut.get(file) ?? (opts.pod && runner.recheckPod
-        ? await runner.recheckPod(file, opts.commit, opts.pod, GATE_ISOLATED_TIMEOUT_MS)
+          ? await runner.recheckPod(file, opts.commit, { ...opts.pod, warmCutSha: opts.commit, warmBaselineSha: baseSha,
+            warmEligible: warmEligibleFiles.has(file) }, GATE_ISOLATED_TIMEOUT_MS)
         : await runner.command('bun', ['run', 'test:deterministic', asPath(file)], cutTree, GATE_ISOLATED_TIMEOUT_MS));
+      recordWarmShadow(cutCheck?.warmShadow);
       if (cutCheck?.timedOut) {
         debug.log('release-loop.gate', 'isolated-timeout', { file, label: 'cut isolated', limitMs: GATE_ISOLATED_TIMEOUT_MS });
         result.stalledEnv.push({ file, reason: 'isolated-timeout', local: 'timeout' });
@@ -2258,8 +2656,10 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       const shaped = candidates.filter((id) => timedOut.has(id) && isolatedCut.failures.includes(id));
       if (shaped.length) {
         const relaxed = opts.pod && runner.recheckPod
-          ? await runner.recheckPod(file, opts.commit, opts.pod, GATE_ISOLATED_TIMEOUT_MS, true)
+          ? await runner.recheckPod(file, opts.commit, { ...opts.pod, warmCutSha: opts.commit, warmBaselineSha: baseSha,
+            warmEligible: warmEligibleFiles.has(file) }, GATE_ISOLATED_TIMEOUT_MS, true)
           : await runner.command('bun', ['run', 'test:deterministic', asPath(file), '--timeout', String(GATE_TIMEOUT_RECHECK_MS)], cutTree, GATE_ISOLATED_TIMEOUT_MS);
+        recordWarmShadow(relaxed.warmShadow);
         let flaky: string[] = [];
         let recheck: 'read' | 'timeout' | 'unreadable' = 'read';
         if (relaxed.timedOut) recheck = 'timeout';
@@ -2329,20 +2729,51 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     const cap = opts.pod && runner.recheckPod ? recheckConcurrency : 1;
     const settleStarted = async <T>(jobs: Promise<T>[]): Promise<T[]> => {
       const settled = await Promise.allSettled(jobs);
-      const rejected = settled.find((item): item is PromiseRejectedResult => item.status === 'rejected');
-      if (rejected) throw rejected.reason;
+      const rejected = settled.filter((item): item is PromiseRejectedResult => item.status === 'rejected');
+      if (rejected.length) throw new SettledRecheckFailures(rejected.map((item) => item.reason));
       return settled.map((item) => (item as PromiseFulfilledResult<T>).value);
     };
+    // Always attempt both eligible references before a failed Job can end the verdict. A cap of one
+    // still runs the second Job, and successes retain their shadow if a peer throws.
+    if (warmEligibleFiles.size && opts.pod && runner.recheckPod) {
+      const completed = new Map<string, CommandResult>();
+      const failures: unknown[] = [];
+      const warmFiles = [...warmEligibleFiles].filter((file) => !prefetchedCut.has(file));
+      for (let start = 0; start < warmFiles.length; start += cap) {
+        const settled = await Promise.allSettled(warmFiles.slice(start, start + cap).map(async (file) => {
+          const pod = { ...opts.pod!, warmCutSha: opts.commit, warmBaselineSha: baseSha, warmEligible: true,
+            warmReplayOwner: true };
+          return runner.recheckPodBatch
+            ? (await runner.recheckPodBatch([file], opts.commit, pod, GATE_ISOLATED_TIMEOUT_MS)).get(file)
+            : await runner.recheckPod!(file, opts.commit, pod, GATE_ISOLATED_TIMEOUT_MS);
+        }));
+        for (const [index, item] of settled.entries()) {
+          if (item.status === 'rejected') failures.push(item.reason);
+          else if (item.value) completed.set(warmFiles[start + index]!, item.value);
+          else failures.push(new Error(`pod isolated recheck missing result: ${warmFiles[start + index]}`));
+        }
+      }
+      for (const [file, run] of completed) {
+        recordWarmShadow(run.warmShadow);
+        prefetchedCut.set(file, run);
+      }
+      if (failures.length) throw new SettledRecheckFailures(failures);
+    }
     for (let start = 0; start < recheckFiles.length; start += recheckLimit) {
       const window = recheckFiles.slice(start, start + recheckLimit);
       debug.log('release-loop.gate', 'isolated-recheck-window', { start, files: window.length, total: recheckFiles.length });
       if (opts.pod && runner.recheckPod && runner.recheckPodBatch) {
         const pending = window.filter((file) => !cutHostFailed.has(file) && !prefetchedCut.has(file));
-        const groups = Array.from({ length: Math.ceil(pending.length / GATE_RECHECK_POD_BATCH_FILES) }, (_, index) =>
-          pending.slice(index * GATE_RECHECK_POD_BATCH_FILES, (index + 1) * GATE_RECHECK_POD_BATCH_FILES));
+        const warmSingles = pending.filter((file) => warmEligibleFiles.has(file)).length;
+        const groups = [
+          ...pending.slice(0, warmSingles).map((file) => [file]),
+          ...Array.from({ length: Math.ceil((pending.length - warmSingles) / GATE_RECHECK_POD_BATCH_FILES) }, (_, index) =>
+            pending.slice(warmSingles + index * GATE_RECHECK_POD_BATCH_FILES, warmSingles + (index + 1) * GATE_RECHECK_POD_BATCH_FILES)),
+        ];
         for (let next = 0; next < groups.length; next += cap) {
           const batches = await settleStarted(groups.slice(next, next + cap).map((files) =>
-            runner.recheckPodBatch!(files, opts.commit, opts.pod!, GATE_ISOLATED_TIMEOUT_MS)));
+            runner.recheckPodBatch!(files, opts.commit, { ...opts.pod!, warmCutSha: opts.commit, warmBaselineSha: baseSha,
+              warmEligible: files.length === 1 && warmEligibleFiles.has(files[0]!) }, GATE_ISOLATED_TIMEOUT_MS)));
           for (const batch of batches) for (const [file, run] of batch) prefetchedCut.set(file, run);
         }
       }
@@ -2375,6 +2806,13 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     }
   } catch (error) {
     result.error = error instanceof Error ? error.message : String(error);
+    const warmFailures = (error instanceof SettledRecheckFailures ? error.failures : [error])
+      .filter((failure): failure is WarmRecheckIncomplete => failure instanceof WarmRecheckIncomplete);
+    if (warmFailures.length) {
+      (result.warmShadow ??= []).push(...warmFailures.map((failure) => failure.shadow));
+      result.unmeasuredRecheckFiles = [...new Set([...(result.unmeasuredRecheckFiles ?? []),
+        ...warmFailures.map((failure) => failure.file)])].sort();
+    }
     if (error instanceof StalledPodShards) {
       result.stalledShards = error.stalledShards;
       result.partialSummary = error.partialSummary;
@@ -2416,6 +2854,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     }
   }
   {
+    const baselineCommit = baselineCommitForVerdict;
     const ids = {
       introduced: [...result.introduced].sort(),
       knownEnv: [...knownEnvIds].sort(),
@@ -2425,7 +2864,8 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       ...(result.unmeasuredErrors?.length ? { unmeasuredErrors: result.unmeasuredErrors } : {}),
       ...(result.interferenceErrors?.length ? { interferenceErrors: [...result.interferenceErrors].sort() } : {}),
     };
-    const observed = result.selectionMs !== undefined ? { selectionMs: result.selectionMs } : {};
+    const observed = { ...(result.selectionMs !== undefined ? { selectionMs: result.selectionMs } : {}),
+      ...(result.warmShadow?.length ? { warmShadow: result.warmShadow } : {}) };
     try {
       for (const location of roots) {
         const path = verdictFile(location, opts.version);
@@ -2436,7 +2876,10 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         mkdirSync(dirname(path), { recursive: true });
         const temp = join(dirname(path), `.gate-verdict-${process.pid}-${randomUUID()}.tmp`);
         try {
-          writeFileSync(temp, JSON.stringify({ version: opts.version, commit: opts.commit, outcome: result.outcome, ...ids, ...observed }, null, 2) + '\n', { mode: 0o600 });
+          const warmHistory = readWarmVerdictHistory(path) ?? [];
+          writeFileSync(temp, JSON.stringify({ version: opts.version, commit: opts.commit,
+            outcome: result.outcome, ...ids, ...observed,
+            ...(opts.pod?.warmReplay ? { baselineCommit, warmHistory } : {}) }, null, 2) + '\n', { mode: 0o600 });
           chmodSync(temp, 0o600);
           renameSync(temp, path);
         } finally { if (existsSync(temp)) rmSync(temp); }
@@ -2449,7 +2892,10 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         mkdirSync(dirname(path), { recursive: true });
         const temp = join(dirname(path), `.gate-verdict-${process.pid}-${randomUUID()}.tmp`);
         try {
-          writeFileSync(temp, JSON.stringify({ version: opts.version, commit: opts.commit, outcome: result.outcome, ...ids, ...observed }, null, 2) + '\n', { mode: 0o600 });
+          const warmHistory = readWarmVerdictHistory(path) ?? [];
+          writeFileSync(temp, JSON.stringify({ version: opts.version, commit: opts.commit,
+            outcome: result.outcome, ...ids, ...observed,
+            ...(opts.pod?.warmReplay ? { baselineCommit, warmHistory } : {}) }, null, 2) + '\n', { mode: 0o600 });
           chmodSync(temp, 0o600);
           renameSync(temp, path);
         } finally { if (existsSync(temp)) rmSync(temp); }
@@ -2464,6 +2910,20 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       introducedIds: ids.introduced, knownEnvIds: ids.knownEnv, preexistingIds: ids.preexisting, loadFlakyIds: ids.loadFlaky,
       ...(result.outcome === 'error' ? { error: result.error } : {}),
     });
+  }
+  if (radiusShadow) {
+    try {
+      const record = { plan: radiusShadow, recordedAt: new Date().toISOString(),
+        actual: shadowActual({ plan: radiusShadow, outcome: result.outcome,
+          introduced: result.introduced, cutFailures: cutFailures?.failures ?? [], cutErrors: cutFailures?.errors ?? [], cutRc: cutSweepRc,
+          fullSweep: cutSweepUsable && !result.partial && !!cutFailures && result.outcome !== 'error'
+            && !result.rcNonzeroNoFailures.length && !result.stalledShards?.length
+            && !result.stalledEnv.length && !result.unmeasuredRecheckFiles?.length
+            && !result.unmeasuredErrors?.length }) };
+      const path = writeGateRadiusShadow(ledger, record);
+      debug.log('release-loop.gate', 'radius-shadow-recorded', { path, proposed: radiusShadow.proposed,
+        missedIntroduced: record.actual.missedIntroduced.length });
+    } catch (error) { debug.log('release-loop.gate', 'radius-shadow-unavailable', { reason: String(error) }); }
   }
   // GATE-LIVE-OBS-RC-WORDING ⓒ — the shards board says «판정 전» until this lands; then «새 실패 N» only (UX · gate-shards.ts).
   // Same ledger as the board's own writes (sweep's shardsFile). A write failure is logged and never changes the verdict.
@@ -2606,13 +3066,20 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
 
 /** The node's run: judge, emit the graph result line, and return the process exit code (ok 0 · regression 1 · else 2).
  *  `runner` is a seam for tests; the process entry passes none. */
-export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner?: GateRunner): Promise<number> {
+export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner?: GateRunner,
+  judge: (opts: GateOptions, runner?: GateRunner) => Promise<GateResult> = judgeGate): Promise<number> {
   const start = Date.now();
   let result: GateResult;
   let version = '';
   let placement: { executor: string | null; host: string | null } | undefined;
   try {
-    const opts = parseOptions(argv, env);
+    const parsed = parseOptions(argv, env);
+    let config: unknown = null;
+    if (parsed !== 'help' && !runner && parsed.pod) {
+      try { config = getUserConfig(); }
+      catch (error) { debug.log('release-loop.gate', 'warm-profile-unavailable', { error: String(error) }); }
+    }
+    const opts = parsed === 'help' ? parsed : withWarmGateHooks(parsed, config, !!runner);
     if (opts !== 'help') {
       placement = gateExecutorOf(opts);
       debug.log('release-loop.gate', 'executor', { version: opts.version, ...placement, requested: opts.executor ?? null });
@@ -2631,7 +3098,7 @@ export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner
       throw new Error('release gate host reservation requires graph runId and pinned state root');
     const releaseHosts = context && hosts.length
       ? reserveReleaseGateHosts(reservationRoot!, context.runId!, hosts) : () => undefined;
-    try { result = await (runner ? judgeGate(opts, runner) : judgeGate(opts)); }
+    try { result = await judge(opts, runner); }
     finally { releaseHosts(); }
   } catch (error) {
     result = { outcome: 'error', commit: '', introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: Date.now() - start, error: String(error) };
@@ -2647,5 +3114,5 @@ if (import.meta.main) {
   // The graph spawns this file as its own process, which inherits no daemon sink — without this every
   // `release-loop.gate`/`release.gate`/`pod.pool` event stayed in the file trail and `elanous logs` read 0 rows.
   await registerStandaloneLogSink('release-loop');
-  process.exitCode = await runGateNode(process.argv.slice(2), process.env);
+  process.exitCode = await runWithReleaseGateTraffic(process.env, () => runGateNode(process.argv.slice(2), process.env));
 }

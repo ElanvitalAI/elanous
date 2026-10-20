@@ -9,4 +9,4 @@ tick:
     const result=JSON.parse(stdout);
     if (result.ok !== true) throw new Error(result.error ?? "rehearsal tick failed");
     console.log(JSON.stringify({outcome:"ok",tick:result}));'
-  timeout_ms: 5400000
+  timeout_ms: 18000000

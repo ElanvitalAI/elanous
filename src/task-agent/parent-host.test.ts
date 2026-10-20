@@ -1,19 +1,25 @@
 import { describe, expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defaultTaskLauncher, type DetachedSpawn } from '../cli/tasks-cli.js';
 import { debug } from '../debug/log.js';
 import { LogStore, StoreSink } from '../mss/logging/log-store.js';
+import { hostCredentials } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import {
-  judgeParentHostCredentials, judgeParentHostFacts, releaseCore, launchRemoteParent, mirrorRemoteRunLedgers, RemoteParentNotLaunchedError, parseEtime, parseHarnessParents, preflightParentHost, preflightScript, remoteLaunchScript,
-  remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs, resolveParentHost, resolveParentHosts, orderParentHosts, readParentHostCapacity, staleHarnessParents, type ParentHostConfig, type SshRunner,
+  judgeParentHostCredentials, judgeParentHostFacts, releaseCore, launchRemoteParent, mirrorRemoteRunLedgers, RemoteParentNotLaunchedError, parseEtime, parseHarnessParents, preflightParentHost, preflightScript, remoteLaunchScript, shouldInstallRemoteCodexAccess,
+  installRemoteCodexAccess, remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs, resolveParentHost, resolveParentHosts, orderParentHosts, readParentHostCapacity, readParentHostPodFit, staleHarnessParents, type ParentHostConfig, type SshRunner,
 } from './parent-host.js';
 import { handTask } from './task-hand.js';
 
 const TARGET: ParentHostConfig = { host: 'node-b', cwd: '/Users/me/source/elanous' };
 const GOOD_FACTS = 'version=0.2.20-dev.0\nconfig=1\npodPool=1\nrepo=1\nkubectl=1\n';
+const ACCESS_TOKEN = `header.${Buffer.from(JSON.stringify({ exp: 1_900_000_000 })).toString('base64url')}.signature`;
+const TEST_CODEX_MIRROR = {
+  elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: ACCESS_TOKEN, refreshToken: '', refresh_token: '' } } } }),
+  codexAuth: JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: ACCESS_TOKEN, id_token: ACCESS_TOKEN, refresh_token: '', refreshToken: '' } }),
+};
 const capacitySample = (active = 0, waiting = 0, cpu = 0, cores = 4): string =>
   `__ELANOUS_PARENT_CAPACITY__${active}\n${waiting ? JSON.stringify({ category: 'pod-lease', event: 'admit-by-usage', data: { runId: 'run-waiting', recommended: 0 } }) + '\n' : ''}__ELANOUS_PARENT_APPROVALS__\n__ELANOUS_PARENT_LOAD__${cpu.toFixed(3)}\n__ELANOUS_PARENT_LOAD__cores=${cores}\n`;
 
@@ -26,6 +32,11 @@ function stubSsh(responses: Array<{ match: RegExp; stdout?: string; status?: num
   }) as unknown as SshRunner & { calls: string[] };
   fn.calls = calls;
   return fn;
+}
+
+async function launchWithTestMirror(args: string[], cwd: string | undefined, context: Parameters<typeof defaultTaskLauncher>[2],
+  deps: Parameters<typeof defaultTaskLauncher>[3] = {}): ReturnType<typeof defaultTaskLauncher> {
+  return defaultTaskLauncher(args, cwd, context, { codexAccessMirror: async () => TEST_CODEX_MIRROR, ...deps });
 }
 
 describe('resolveParentHost — 기본 OFF', () => {
@@ -44,18 +55,104 @@ describe('resolveParentHost — 기본 OFF', () => {
 
 describe('multi-host parent routing', () => {
   const hosts: ParentHostConfig[] = [TARGET, { host: 'node-c', cwd: '/srv/elanous', approvalCapacity: 8 }];
-  const node-c = hosts[1]!;
+  const minihHost = hosts[1]!;
+  test('node allocatable excludes a 32Gi Job from a 31.36Gi pool without creating a Pod', () => {
+    const target = { ...minihHost, podPool: 'k3d-elanous-pool:8' };
+    const calls: string[] = [];
+    const fit = readParentHostPodFit(target, '32Gi', (_host, script) => {
+      calls.push(script);
+      return { status: 0, stdout: JSON.stringify({ items: [{ status: { allocatable: { memory: '32883343Ki' } } }] }), stderr: '' };
+    });
+    expect(fit).toMatchObject({ state: 'never-fits', memoryLimit: '32Gi', reason: 'memory-never-fits' });
+    expect(fit.allocatableBytes).toBeLessThan(fit.requiredBytes!);
+    expect(calls).toEqual(['kubectl --context k3d-elanous-pool get nodes -o json']);
+    expect(readParentHostPodFit(target, '32Gi', () => ({ status: 1, stdout: '', stderr: 'timeout' })).state).toBe('unmeasured');
+  });
+  test('all known never-fit parents fail closed before local launch', async () => {
+    let localLaunches = 0;
+    const targets = [{ ...TARGET, podPool: 'k3d-elanous-pool:1' }, { ...minihHost, podPool: 'k3d-elanous-pool:8' }];
+    const ssh: SshRunner = () => ({ status: 0, stdout: JSON.stringify({ items: [{ status: { allocatable: { memory: '31Gi' } } }] }), stderr: '' });
+    await expect(launchWithTestMirror(['harness', 'say', '--substrate=pod', 'goal', '--option-after-goal'], undefined,
+      { runId: 'run-fit-closed', launchId: 'tl-fit-closed', substrate: 'pod', podGoal: 'goal', env: { ELANOUS_RUN_ID: 'run-fit-closed', ELANOUS_POD_MEMORY_TIER: 'high' } },
+      { parentHost: targets, ssh, launchHoldActive: () => false, spawn: () => { localLaunches++; throw Error('local launch'); } }))
+      .rejects.toThrow('parent-host memory-never-fits');
+    expect(localLaunches).toBe(0);
+  });
+  test('live hand reads inherited high tier and rejects a 31Gi pool before SSH launch', async () => {
+    const priorTier = process.env.ELANOUS_POD_MEMORY_TIER;
+    const path = join(mkdtempSync(join(tmpdir(), 'parent-fit-hand-')), 'state.json');
+    const goal = 'ship code\n완료 경계 코드: src/task-agent/task-hand.ts 변경\n완료 경계 실물: code-pr 카드 발사\n완료 경계 증거 명령: bun test src/task-agent/parent-host.test.ts';
+    const scripts: string[] = [];
+    const events: unknown[] = [];
+    const off = debug.registerSink({ name: 'parent-fit-hand-test', emit: (rec) => {
+      if (rec.category === 'task-agent.parent-host' && rec.event === 'pod-fit') events.push(rec.data);
+    } });
+    process.env.ELANOUS_POD_MEMORY_TIER = 'high';
+    try {
+      await expect(handTask({ text: goal, live: true, statePath: path,
+        prelaunchInspector: () => ({ reason: 'not-present' }),
+        launcher: (args, cwd, context) => launchWithTestMirror(args, cwd, context, {
+          parentHost: { ...TARGET, podPool: 'k3d-elanous-pool:1' },
+          ssh: (_host, script) => { scripts.push(script); return { status: 0, stdout: JSON.stringify({ items: [{ status: { allocatable: { memory: '31Gi' } } }] }), stderr: '' }; },
+          launchHoldActive: () => false,
+          spawn: () => { throw Error('local launch must not occur'); },
+        }),
+      })).rejects.toThrow('parent-host memory-never-fits');
+      expect(events).toContainEqual(expect.objectContaining({ state: 'never-fits', memoryLimit: '32Gi' }));
+      expect(scripts).toEqual(['kubectl --context k3d-elanous-pool get nodes -o json']);
+    } finally {
+      off();
+      if (priorTier === undefined) delete process.env.ELANOUS_POD_MEMORY_TIER;
+      else process.env.ELANOUS_POD_MEMORY_TIER = priorTier;
+      rmSync(join(path, '..'), { recursive: true, force: true });
+    }
+  });
+  test('inherited memory tier used for fit is passed to the remote parent', async () => {
+    const priorTier = process.env.ELANOUS_POD_MEMORY_TIER;
+    process.env.ELANOUS_POD_MEMORY_TIER = 'high';
+    const scripts: string[] = [];
+    try {
+      const receipt = await launchWithTestMirror(['harness', 'say', '--substrate', 'pod', 'goal'], undefined,
+        { runId: 'run-fit-env', launchId: 'tl-fit-env', substrate: 'pod', podGoal: 'goal', env: { ELANOUS_RUN_ID: 'run-fit-env' } },
+        { parentHost: { ...TARGET, podPool: 'k3d-elanous-pool:1' },
+          ssh: (_host, script) => { scripts.push(script); return { status: 0, stdout: script.includes('kubectl --context')
+            ? JSON.stringify({ items: [{ status: { allocatable: { memory: '64Gi' } } }] })
+            : script.includes('__ELANOUS_PARENT_CAPACITY__') ? capacitySample(0)
+              : script.includes('--version') ? GOOD_FACTS : 'pid=222\n', stderr: '' }; },
+          codexAccessMirror: async () => TEST_CODEX_MIRROR, launchHoldActive: () => false,
+          localVersion: '0.2.20-dev.0', spawn: () => { throw Error('unexpected local'); } });
+      expect(receipt).toMatchObject({ parentHost: { host: 'node-b' } });
+      expect(scripts.find((script) => script.includes('nohup'))).toContain('ELANOUS_POD_MEMORY_TIER=high');
+    } finally {
+      if (priorTier === undefined) delete process.env.ELANOUS_POD_MEMORY_TIER;
+      else process.env.ELANOUS_POD_MEMORY_TIER = priorTier;
+    }
+  });
+  test('a measured fit is tried before an unreadable pool', async () => {
+    const targets = [{ ...TARGET, podPool: 'k3d-elanous-pool:1' }, { ...minihHost, podPool: 'k3d-elanous-pool:8' }];
+    const ssh: SshRunner = (host, script) => {
+      if (script.includes('kubectl --context')) return host === 'node-b'
+        ? { status: 1, stdout: '', stderr: 'timeout' }
+        : { status: 0, stdout: JSON.stringify({ items: [{ status: { allocatable: { memory: '64Gi' } } }] }), stderr: '' };
+      return { status: 0, stdout: script.includes('__ELANOUS_PARENT_CAPACITY__') ? capacitySample(0)
+        : script.includes('--version') ? GOOD_FACTS : 'pid=222\n', stderr: '' };
+    };
+    const receipt = await launchWithTestMirror(['harness', 'say', '--substrate', 'pod', 'goal'], undefined,
+      { runId: 'run-fit-order', launchId: 'tl-fit-order', substrate: 'pod', podGoal: 'goal', env: { ELANOUS_RUN_ID: 'run-fit-order', ELANOUS_POD_MEMORY_TIER: 'high' } },
+      { parentHost: targets, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn: () => { throw Error('unexpected local'); } });
+    expect(receipt).toMatchObject({ parentHost: { host: 'node-c' } });
+  });
   test('list is validated, env off wins and host-specific capacity is measured', () => {
-    expect(resolveParentHosts([{ ...TARGET, approvalCapacity: 2 }, node-c, { host: 'bad;host', cwd: '/x' }, { host: 'invalid', cwd: '/x', approvalCapacity: -1 }], {})).toEqual([{ ...TARGET, approvalCapacity: 2 }, node-c]);
+    expect(resolveParentHosts([{ ...TARGET, approvalCapacity: 2 }, minihHost, { host: 'bad;host', cwd: '/x' }, { host: 'invalid', cwd: '/x', approvalCapacity: -1 }], {})).toEqual([{ ...TARGET, approvalCapacity: 2 }, minihHost]);
     expect(resolveParentHosts([TARGET, { host: 'node-c', cwd: '/srv/elanous' }], {})).toHaveLength(2);
     expect(resolveParentHost({ ...TARGET, approvalCapacity: 0 }, {})).toMatchObject({ host: 'node-b', approvalCapacity: 0 });
     expect(resolveParentHosts(hosts, { ELANOUS_TA_PARENT_HOST: 'off' })).toEqual([]);
-    expect(resolveParentHosts(hosts, { ELANOUS_TA_PARENT_HOST: 'node-c' })).toEqual([node-c]);
-    expect(readParentHostCapacity(node-c, () => ({ status: 0, stdout: capacitySample(2), stderr: '' }))).toEqual({ approvalHeadroom: 6, load: 0 });
-    expect(readParentHostCapacity({ ...node-c, approvalCapacity: 2 }, () => ({ status: 0, stdout: capacitySample(2), stderr: '' }))).toEqual({ approvalHeadroom: 0, load: 0 });
+    expect(resolveParentHosts(hosts, { ELANOUS_TA_PARENT_HOST: 'node-c' })).toEqual([minihHost]);
+    expect(readParentHostCapacity(minihHost, () => ({ status: 0, stdout: capacitySample(2), stderr: '' }))).toEqual({ approvalHeadroom: 6, load: 0 });
+    expect(readParentHostCapacity({ ...minihHost, approvalCapacity: 2 }, () => ({ status: 0, stdout: capacitySample(2), stderr: '' }))).toEqual({ approvalHeadroom: 0, load: 0 });
     expect(readParentHostCapacity(TARGET, () => ({ status: 0, stdout: capacitySample(0), stderr: '' }))).toEqual({ approvalHeadroom: 1, load: 0 });
     expect(readParentHostCapacity(TARGET, () => ({ status: 0, stdout: capacitySample(1), stderr: '' }))).toEqual({ approvalHeadroom: 0, load: 0 });
-    expect(readParentHostCapacity(node-c, () => ({ status: 255, stdout: '', stderr: 'timeout' }))).toBeNull();
+    expect(readParentHostCapacity(minihHost, () => ({ status: 255, stdout: '', stderr: 'timeout' }))).toBeNull();
   });
   test('remote admission backlog and CPU load change the selected host, not just parent process counts', async () => {
     const observedScripts: string[] = [];
@@ -66,7 +163,7 @@ describe('multi-host parent routing', () => {
       }
       return { status: 0, stdout: script.includes('--version') ? GOOD_FACTS : `pid=${host === 'node-b' ? 111 : 222}\n`, stderr: '' };
     };
-    const pair = [{ ...TARGET, approvalCapacity: 2 }, { ...node-c, approvalCapacity: 2 }];
+    const pair = [{ ...TARGET, approvalCapacity: 2 }, { ...minihHost, approvalCapacity: 2 }];
     const sample = readParentHostCapacity(pair[0]!, read('node-b'))!;
     expect(sample).toEqual({ approvalHeadroom: 1, load: 0.75 });
     expect(readParentHostCapacity(pair[1]!, read('node-b'))).toEqual({ approvalHeadroom: 2, load: 0.05 });
@@ -75,7 +172,7 @@ describe('multi-host parent routing', () => {
     const tally = async (congested: string) => {
       const counts = { node-b: 0, node-c: 0 };
       for (let n = 0; n < 100; n++) {
-        const receipt = await defaultTaskLauncher(['harness', 'say', 'g'], undefined, context(n + 500), {
+        const receipt = await launchWithTestMirror(['harness', 'say', 'g'], undefined, context(n + 500), {
           parentHost: pair, ssh: read(congested), launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
           spawn: () => { throw Error('unexpected local'); },
         });
@@ -106,7 +203,7 @@ describe('multi-host parent routing', () => {
     expect(counts.node-c).toBeGreaterThan(250);
     expect(counts.node-c).toBeLessThan(350);
     expect(orderParentHosts(hosts, 'run-1', { ...capacity, node-b: { approvalHeadroom: 0, load: 1 } })[0]!.host).toBe('node-c');
-    const ratioHosts = [{ ...TARGET, approvalCapacity: 32 }, { ...node-c, approvalCapacity: 14 }];
+    const ratioHosts = [{ ...TARGET, approvalCapacity: 32 }, { ...minihHost, approvalCapacity: 14 }];
     const ratio = { node-b: 0, node-c: 0 };
     for (let n = 0; n < 30; n++) ratio[orderParentHosts(ratioHosts, `run-parent-${n}`, {
       node-b: { approvalHeadroom: 32, load: 0 }, node-c: { approvalHeadroom: 14, load: 0 },
@@ -117,7 +214,7 @@ describe('multi-host parent routing', () => {
   });
   const context = (n: number) => ({ runId: `run-multi-${n}`, launchId: `tl-${n}`, env: { ELANOUS_RUN_ID: `run-multi-${n}` } });
   const ssh: SshRunner = (host, script) => ({ status: 0, stderr: '', stdout: script.includes('__ELANOUS_PARENT_CAPACITY__') ? capacitySample(0) : script.includes('--version') ? GOOD_FACTS : `pid=${host === 'node-b' ? 111 : 222}\n` });
-  const targets = [{ ...TARGET, approvalCapacity: 2 }, node-c];
+  const targets = [{ ...TARGET, approvalCapacity: 2 }, minihHost];
   test('launcher distributes and persists host-specific parent-host-launched observations', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'parent-host-ledger-'));
     const store = new LogStore(join(dir, 'logs.db'));
@@ -128,7 +225,7 @@ describe('multi-host parent routing', () => {
     try {
       for (let n = 0; n < 40; n++) {
         const runId = `${runPrefix}${n}`;
-        const receipt = await defaultTaskLauncher(['harness', 'say', 'g'], undefined,
+        const receipt = await launchWithTestMirror(['harness', 'say', 'g'], undefined,
           { runId, launchId: `tl-${n}`, env: { ELANOUS_RUN_ID: runId } },
           { parentHost: targets, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn: () => { throw Error('unexpected local'); } });
         receipts.set(runId, (receipt as { parentHost: { host: string } }).parentHost.host);
@@ -150,10 +247,10 @@ describe('multi-host parent routing', () => {
     }
   });
   test('actual launcher selects 30 parents in 32:14 capacity proportion', async () => {
-    const weighted = [{ ...TARGET, approvalCapacity: 32 }, { ...node-c, approvalCapacity: 14 }];
+    const weighted = [{ ...TARGET, approvalCapacity: 32 }, { ...minihHost, approvalCapacity: 14 }];
     const counts = { node-b: 0, node-c: 0 };
     for (let n = 0; n < 30; n++) {
-      const receipt = await defaultTaskLauncher(['harness', 'say', 'g'], undefined, context(n + 200), {
+      const receipt = await launchWithTestMirror(['harness', 'say', 'g'], undefined, context(n + 200), {
         parentHost: weighted, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
         spawn: () => { throw Error('unexpected local'); },
       });
@@ -164,16 +261,67 @@ describe('multi-host parent routing', () => {
     expect(Math.abs(counts.node-b / 30 - 32 / 46)).toBeLessThanOrEqual(0.2);
   });
   test('a valid list without approvalCapacity launches instead of falling back locally', async () => {
-    const receipt = await defaultTaskLauncher(['harness', 'say', 'g'], undefined, context(101), {
+    const receipt = await launchWithTestMirror(['harness', 'say', 'g'], undefined, context(101), {
       parentHost: [TARGET, { host: 'node-c', cwd: '/srv/elanous' }], ssh,
       launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
       spawn: () => { throw Error('unexpected local'); },
     });
     expect(['node-b', 'node-c']).toContain((receipt as { parentHost: { host: string } }).parentHost.host);
   });
+  test('missing local Codex credentials fail closed on remote, then preserve local launch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'parent-no-codex-'));
+    const beforeXdg = process.env.XDG_CONFIG_HOME;
+    const scripts: string[] = [];
+    const fitEvents: unknown[] = [];
+    const off = debug.registerSink({ name: 'parent-fit-unknown-test', emit: (rec) => {
+      if (rec.category === 'task-agent.parent-host' && rec.event === 'pod-fit') fitEvents.push(rec.data);
+    } });
+    let localLaunches = 0;
+    process.env.XDG_CONFIG_HOME = join(dir, 'xdg');
+    const ssh: SshRunner = (_host, script, _timeout, stdin) => {
+      scripts.push(script);
+      expect(stdin).toBeUndefined();
+      return { status: 0, stdout: script.includes('nohup') ? 'pid=4242\n' : GOOD_FACTS, stderr: '' };
+    };
+    try {
+      const receipt = await defaultTaskLauncher(['harness', 'say', 'g'], undefined,
+        { runId: 'run-no-codex-0001', launchId: 'tl-no-codex', env: { ELANOUS_RUN_ID: 'run-no-codex-0001' } },
+      { parentHost: { host: 'node-c', cwd: '/srv/elanous' }, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', earlyExitWindowMs: 0,
+        spawn: (() => { localLaunches++; return { pid: 4242, once(event: string, listener: () => void) { if (event === 'spawn') queueMicrotask(listener); return this; }, removeListener() { return this; }, unref() {} }; }) as unknown as DetachedSpawn });
+      expect(receipt).toEqual({ runId: 'run-no-codex-0001' });
+      expect(scripts.some((script) => script.includes('nohup'))).toBe(false);
+      expect(localLaunches).toBe(1);
+      expect(scripts.some((script) => script.includes('umask 077'))).toBe(false);
+      expect(fitEvents).toContainEqual(expect.objectContaining({ state: 'unmeasured', reason: 'pod-context-unmeasured' }));
+    } finally {
+      off();
+      if (beforeXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = beforeXdg;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test('failed Codex mirror installation never attempts remote or local launch', async () => {
+    let installs = 0;
+    let remoteLaunches = 0;
+    let localLaunches = 0;
+    const ssh: SshRunner = (_host, script, _timeout, stdin) => {
+      if (stdin !== undefined) { installs++; return { status: 255, stdout: '', stderr: 'broken pipe' }; }
+      if (script.includes('nohup')) { remoteLaunches++; return { status: 0, stdout: 'pid=7777\n', stderr: '' }; }
+      return { status: 0, stdout: GOOD_FACTS, stderr: '' };
+    };
+    await expect(defaultTaskLauncher(['harness', 'say', 'g'], undefined,
+      { runId: 'run-mirror-install-failed', launchId: 'tl-mirror-install-failed', env: { ELANOUS_RUN_ID: 'run-mirror-install-failed' } },
+      { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
+        codexAccessMirror: async () => TEST_CODEX_MIRROR,
+        spawn: () => { localLaunches++; throw Error('should not fall back locally'); } })).rejects.toThrow('remote Codex access mirror failed');
+    expect(installs).toBe(1);
+    expect(remoteLaunches).toBe(0);
+    expect(localLaunches).toBe(0);
+  });
   test('unknown or saturated capacity excludes that host, then all unavailable hosts fall back locally', async () => {
     const reached: string[] = [];
-    const probe: SshRunner = (host, script) => {
+    const probe: SshRunner = (host, script, _timeout, stdin) => {
+      if (stdin !== undefined) return { status: 0, stdout: '', stderr: '' };
       if (script.includes('__ELANOUS_PARENT_CAPACITY__')) return host === 'node-b'
         ? { status: 255, stdout: '', stderr: 'capacity timeout' }
         : { status: 0, stdout: capacitySample(0), stderr: '' };
@@ -182,25 +330,28 @@ describe('multi-host parent routing', () => {
     };
     const spawn: DetachedSpawn = () => ({ pid: 1, once(event: string, listener: () => void) { if (event === 'spawn') queueMicrotask(listener); return this; }, removeListener() { return this; }, unref() {} } as unknown as ReturnType<DetachedSpawn>);
     const deps = { parentHost: targets, ssh: probe, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn, earlyExitWindowMs: 0, notice: () => {} };
-    expect((await defaultTaskLauncher(['harness', 'say', 'g'], undefined, context(105), deps) as { parentHost: { host: string } }).parentHost.host).toBe('node-c');
+    expect((await launchWithTestMirror(['harness', 'say', 'g'], undefined, context(105), deps) as { parentHost: { host: string } }).parentHost.host).toBe('node-c');
     expect(reached).toEqual(['node-c', 'node-c']);
     reached.length = 0;
-    const saturated: SshRunner = (host, script) => script.includes('__ELANOUS_PARENT_CAPACITY__')
+    const saturated: SshRunner = (host, script, _timeout, stdin) => stdin !== undefined
+      ? { status: 0, stdout: '', stderr: '' }
+      : script.includes('__ELANOUS_PARENT_CAPACITY__')
       ? { status: 0, stdout: capacitySample(8), stderr: '' }
       : (reached.push(host), { status: 0, stdout: GOOD_FACTS, stderr: '' });
-    expect(await defaultTaskLauncher(['harness', 'say', 'g'], undefined, context(106), { ...deps, ssh: saturated })).toEqual({ runId: context(106).runId });
+    expect(await launchWithTestMirror(['harness', 'say', 'g'], undefined, context(106), { ...deps, ssh: saturated })).toEqual({ runId: context(106).runId });
     expect(reached).toEqual([]);
   });
   test('preflight rejects the chosen host before trying the other; unavailable capacity never launches there', async () => {
     const first = orderParentHosts(targets, context(99).runId, { node-b: { approvalHeadroom: 2, load: 0 }, node-c: { approvalHeadroom: 8, load: 0 } })[0]!.host;
     const launched: string[] = [];
-    const ssh: SshRunner = (host, script) => {
+    const ssh: SshRunner = (host, script, _timeout, stdin) => {
+      if (stdin !== undefined) return { status: 0, stdout: '', stderr: '' };
       if (script.includes('__ELANOUS_PARENT_CAPACITY__')) return { status: 0, stdout: capacitySample(0), stderr: '' };
       if (script.includes('--version')) return { status: 0, stdout: host === first ? 'version=0.1.0\n' : GOOD_FACTS, stderr: '' };
       launched.push(host);
       return { status: 0, stdout: 'pid=42\n', stderr: '' };
     };
-    const receipt = await defaultTaskLauncher(['harness', 'say', 'g'], undefined, context(99), { parentHost: targets, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn: () => { throw Error('unexpected local'); }, notice: () => {} });
+    const receipt = await launchWithTestMirror(['harness', 'say', 'g'], undefined, context(99), { parentHost: targets, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn: () => { throw Error('unexpected local'); }, notice: () => {} });
     expect(launched).toEqual([targets.find((target) => target.host !== first)!.host]);
     expect((receipt as { parentHost: { host: string } }).parentHost.host).toBe(launched[0]);
   });
@@ -208,7 +359,8 @@ describe('multi-host parent routing', () => {
     const first = orderParentHosts(targets, context(99).runId, { node-b: { approvalHeadroom: 2, load: 0 }, node-c: { approvalHeadroom: 8, load: 0 } })[0]!.host;
     const second = targets.find((target) => target.host !== first)!.host;
     const calls: string[] = [];
-    const run = (failure: 'first' | 'both' | 'uncertain'): SshRunner => (host, script) => {
+    const run = (failure: 'first' | 'both' | 'uncertain'): SshRunner => (host, script, _timeout, stdin) => {
+      if (stdin !== undefined) return { status: 0, stdout: '', stderr: '' };
       if (script.includes('__ELANOUS_PARENT_CAPACITY__')) return { status: 0, stdout: capacitySample(0), stderr: '' };
       if (script.includes('--version')) return { status: 0, stdout: GOOD_FACTS, stderr: '' };
       calls.push(host);
@@ -216,13 +368,13 @@ describe('multi-host parent routing', () => {
         : failure === 'both' ? { status: 4, stdout: 'not-launched=early-exit\n', stderr: '' } : { status: 0, stdout: 'pid=42\n', stderr: '' };
     };
     const spawn: DetachedSpawn = () => ({ pid: 1, once(event: string, listener: () => void) { if (event === 'spawn') queueMicrotask(listener); return this; }, removeListener() { return this; }, unref() {} } as unknown as ReturnType<DetachedSpawn>);
-    expect((await defaultTaskLauncher(['harness', 'say', 'g'], undefined, context(99), { parentHost: targets, ssh: run('first'), launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn }) as { parentHost: { host: string } }).parentHost.host).toBe(second);
+    expect((await launchWithTestMirror(['harness', 'say', 'g'], undefined, context(99), { parentHost: targets, ssh: run('first'), launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn }) as { parentHost: { host: string } }).parentHost.host).toBe(second);
     expect(calls).toEqual([first, second]);
     calls.length = 0;
-    expect(await defaultTaskLauncher(['harness', 'say', 'g'], undefined, context(99), { parentHost: targets, ssh: run('both'), launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn, earlyExitWindowMs: 0 })).toEqual({ runId: context(99).runId });
+    expect(await launchWithTestMirror(['harness', 'say', 'g'], undefined, context(99), { parentHost: targets, ssh: run('both'), launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn, earlyExitWindowMs: 0 })).toEqual({ runId: context(99).runId });
     expect(calls).toEqual([first, second]);
     calls.length = 0;
-    await expect(defaultTaskLauncher(['harness', 'say', 'g'], undefined, context(99), { parentHost: targets, ssh: run('uncertain'), launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn })).rejects.toThrow('불확실');
+    await expect(launchWithTestMirror(['harness', 'say', 'g'], undefined, context(99), { parentHost: targets, ssh: run('uncertain'), launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn })).rejects.toThrow('불확실');
     expect(calls).toEqual([first]);
   });
 });
@@ -284,10 +436,45 @@ describe('defaultTaskLauncher — 원격 부모', () => {
 
   test('점검 통과 → ssh 로 띄우고 영수증에 호스트 · 로컬 spawn 0', async () => {
     const ssh = stubSsh([{ match: /--version/, stdout: GOOD_FACTS }, { match: /nohup/, stdout: 'pid=4242\n' }]);
-    const receipt = await defaultTaskLauncher(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'g'], undefined, context, { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn: noLocal });
+    const receipt = await launchWithTestMirror(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'g'], undefined, context, { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn: noLocal });
     expect(receipt).toMatchObject({ runId: context.runId, parentHost: { host: 'node-b', pid: 4242 } });
     expect(ssh.calls.some((call) => call.includes('--no-auto-merge') && !call.includes('--merge-by-host'))).toBe(true);
     expect(ssh.calls.find((call) => call.includes('nohup'))).toContain('ELANOUS_STATE_DIR="$HOME"/.elanous');
+  });
+
+  test('effective provider만 Codex 미러 적용 여부를 결정하고 미지정은 기존 Codex 기본을 쓴다', () => {
+    expect(shouldInstallRemoteCodexAccess(undefined)).toBe(true);
+    expect(shouldInstallRemoteCodexAccess('openai-codex')).toBe(true);
+    expect(shouldInstallRemoteCodexAccess('openrouter')).toBe(false);
+    expect(shouldInstallRemoteCodexAccess('glm')).toBe(false);
+  });
+
+  test('명시 non-Codex child는 미러 조회·설치·계정 표지 없이 기존 원격 경로로 실행한다', async () => {
+    const calls: Array<{ script: string; stdin?: string }> = [];
+    let mirrorReads = 0;
+    const ssh: SshRunner = (_host, script, _timeout, stdin) => {
+      calls.push({ script, ...(stdin !== undefined ? { stdin } : {}) });
+      return { status: 0, stdout: script.includes('--version') ? GOOD_FACTS : script.includes('nohup') ? 'pid=6161\n' : '', stderr: '' };
+    };
+    const inheritedMirrorLabels = {
+      ELANOUS_RUN_ID: 'run-openrouter-01',
+      ELANOUS_REMOTE_CODEX_ACCOUNT: 'stale-account',
+      ELANOUS_REMOTE_CODEX_USED_PERCENT: '99',
+      ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT: '60',
+    };
+    const receipt = await defaultTaskLauncher(['harness', 'say', '--child-llm-provider', 'openrouter', '--child-llm-model', 'openrouter/deepseek/deepseek-chat'], undefined,
+      { runId: 'run-openrouter-01', launchId: 'tl-openrouter', effectiveChildProvider: 'openrouter', env: inheritedMirrorLabels }, {
+        parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
+        codexAccessMirror: async () => { mirrorReads++; return TEST_CODEX_MIRROR; },
+        spawn: () => { throw Error('local fallback'); },
+      });
+    const launch = calls.find((call) => call.script.includes('nohup'))!;
+    expect(receipt).toMatchObject({ parentHost: { host: 'node-b', pid: 6161 } });
+    expect(mirrorReads).toBe(0);
+    expect(calls.some((call) => call.stdin !== undefined)).toBe(false);
+    expect(launch.script).not.toContain('ELANOUS_REMOTE_CODEX_ACCOUNT=');
+    expect(launch.script).not.toContain('ELANOUS_REMOTE_CODEX_USED_PERCENT=');
+    expect(launch.script).not.toContain('ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT=');
   });
 
   test('점검 막힘 → 로컬로 되돌아가고 알림', async () => {
@@ -298,7 +485,7 @@ describe('defaultTaskLauncher — 원격 부모', () => {
       localSpawned++;
       return { pid: 1, once(event: string, listener: () => void) { if (event === 'spawn') queueMicrotask(listener); return this; }, removeListener() { return this; }, unref() {} } as unknown as ReturnType<DetachedSpawn>;
     };
-    const receipt = await defaultTaskLauncher(['harness', 'say', 'g'], undefined, context, { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn, earlyExitWindowMs: 0, notice: (line) => notices.push(line) });
+    const receipt = await launchWithTestMirror(['harness', 'say', 'g'], undefined, context, { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn, earlyExitWindowMs: 0, notice: (line) => notices.push(line) });
     expect(localSpawned).toBe(1);
     expect(receipt).toEqual({ runId: context.runId });
     expect(notices[0]).toContain('version-mismatch');
@@ -306,9 +493,22 @@ describe('defaultTaskLauncher — 원격 부모', () => {
 
   test('handTask 가 원격 영수증을 카드에 적는다', async () => {
     const statePath = join(mkdtempSync(join(tmpdir(), 'parent-host-')), 'task-agent-actions.json');
-    const result = await handTask({ text: 'docs 한 줄', seat: 'OP', live: true, statePath, launcher: async (_args, _cwd, ctx) => ({ runId: ctx!.runId, parentHost: { host: 'node-b', pid: 7 } }) });
+    let contextProvider: string | undefined;
+    const result = await handTask({ text: 'docs 한 줄', seat: 'OP', live: true, statePath, launcher: async (_args, _cwd, ctx) => {
+      contextProvider = ctx!.effectiveChildProvider;
+      return { runId: ctx!.runId, parentHost: { host: 'node-b', pid: 7 } };
+    } });
     expect(result.card.parentHost).toEqual({ host: 'node-b', pid: 7 });
     expect(result.card.history[0]!.detail).toContain('[parent@node-b · PR 까지만]');
+    expect(contextProvider).toBe('openai-codex');
+  });
+
+  test('handTask carries an explicit non-Codex provider to the launcher context', async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), 'parent-host-provider-')), 'task-agent-actions.json');
+    let contextProvider: string | undefined;
+    await handTask({ text: 'docs 다른 줄', seat: 'UX', childLlm: 'openrouter/deepseek/deepseek-chat', live: true, statePath,
+      launcher: async (_args, _cwd, ctx) => { contextProvider = ctx!.effectiveChildProvider; return { runId: ctx!.runId }; } });
+    expect(contextProvider).toBe('openrouter');
   });
 });
 
@@ -378,8 +578,9 @@ describe('낡은 부모 보고 — 읽기 전용', () => {
 
 /** 실제 셸로 원격 스크립트를 돌린다(ssh 대신 로컬 sh · HOME = 임시 디렉터리). */
 function localShell(home: string): SshRunner {
-  return (_host, script, timeoutMs) => {
-    const result = spawnSync('sh', ['-c', script], { encoding: 'utf8', timeout: timeoutMs, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home } });
+  return (_host, script, timeoutMs, stdin) => {
+    const result = spawnSync('sh', ['-c', script], { encoding: 'utf8', timeout: timeoutMs, input: stdin,
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home } });
     return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
   };
 }
@@ -397,6 +598,73 @@ function fakeHome(body: string): { home: string; cwd: string } {
 
 describe('원격 스크립트 — 실제 셸', () => {
   const env = { ELANOUS_RUN_ID: 'run-shell0001' };
+
+  test('remote owner mirror installs only the selected account when account tokens differ', () => {
+    const { home } = fakeHome('true');
+    const sourceStore = join(home, 'source-auth.json');
+    const accountToken = (exp: number) => `header.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.signature`;
+    const accounts = ['team', 'third'] as const;
+    const access = { team: accountToken(1_900_000_001), third: accountToken(1_900_000_002) };
+    const refresh = { team: 'team-refresh-secret', third: 'third-refresh-secret' };
+    const providers: Record<string, unknown> = {};
+    for (const name of accounts) {
+      const codexHome = join(home, `source-${name}`);
+      mkdirSync(codexHome, { recursive: true });
+      const idToken = `header.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: `${name}-account` } })).toString('base64url')}.signature`;
+      writeFileSync(join(codexHome, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', last_refresh: '2026-10-19T00:00:00Z', tokens: {
+        access_token: access[name], id_token: idToken, refresh_token: refresh[name], account_id: `${name}-account`,
+      } }), { mode: 0o600 });
+      providers[`openai-codex:${name}`] = { authMode: 'chatgpt', codexHome, lastRefresh: '2026-10-19T00:00:00Z', tokens: { accessToken: access[name], refreshToken: refresh[name] } };
+    }
+    writeFileSync(sourceStore, JSON.stringify({ version: 1, providers }), { mode: 0o600 });
+    try {
+      const remoteAccountDir = join(home, '.elanous', 'codex-accounts', 'stray');
+      mkdirSync(remoteAccountDir, { recursive: true });
+      writeFileSync(join(remoteAccountDir, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: 'stray-token', refresh_token: '' } }), { mode: 0o600 });
+      const orphanAccountDir = join(home, '.elanous', 'codex-accounts', 'orphan');
+      mkdirSync(orphanAccountDir, { recursive: true });
+      writeFileSync(join(orphanAccountDir, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: 'orphan-token', refresh_token: '' } }), { mode: 0o600 });
+      writeFileSync(join(home, '.elanous', 'auth.json'), JSON.stringify({ version: 1, providers: {
+        'openai-codex:stray': { codexHome: remoteAccountDir, tokens: { accessToken: 'stray-token' } },
+        anthropic: { tokens: { accessToken: 'keep-unrelated-provider' } },
+      } }), { mode: 0o600 });
+      writeFileSync(join(home, '.elanous', 'remote-codex-mirror.json'), JSON.stringify({ account: 'stray' }), { mode: 0o600 });
+      const credentials = hostCredentials('third', sourceStore, () => '', { requireExplicitChatgptAuthMode: true });
+      installRemoteCodexAccess({ host: 'h', cwd: '/repo' }, { ...credentials, account: 'third' }, localShell(home));
+      const remoteStore = JSON.parse(readFileSync(join(home, '.elanous', 'auth.json'), 'utf8'));
+      const remoteCodex = JSON.parse(readFileSync(join(home, '.codex', 'auth.json'), 'utf8'));
+      expect(Object.keys(remoteStore.providers).sort()).toEqual(['anthropic', 'openai-codex', 'openai-codex:third']);
+      expect(remoteStore.providers['openai-codex:third'].tokens).toMatchObject({ accessToken: access.third, refreshToken: '', refresh_token: '' });
+      expect(remoteStore.providers['openai-codex:third'].codexHome).toBe(join(home, '.elanous', 'codex-accounts', 'third'));
+      expect(remoteStore.providers['openai-codex'].tokens.accessToken).toBe(access.third);
+      expect(remoteStore.providers.anthropic.tokens.accessToken).toBe('keep-unrelated-provider');
+      expect(existsSync(remoteAccountDir)).toBe(false);
+      expect(existsSync(orphanAccountDir)).toBe(false);
+      expect(existsSync(join(home, '.elanous', 'remote-codex-mirror.json'))).toBe(false);
+      expect(JSON.stringify({ remoteStore, remoteCodex })).not.toContain('stray-token');
+      expect(remoteCodex.tokens).toMatchObject({ access_token: access.third, refresh_token: '', refreshToken: '' });
+      expect(JSON.stringify({ remoteStore, remoteCodex })).not.toContain(access.team);
+      expect(JSON.stringify({ remoteStore, remoteCodex })).not.toContain(refresh.team);
+
+      const teamCredentials = hostCredentials('team', sourceStore, () => '', { requireExplicitChatgptAuthMode: true });
+      installRemoteCodexAccess({ host: 'h', cwd: '/repo' }, { ...teamCredentials, account: 'team' }, localShell(home));
+      const afterSwitch = JSON.parse(readFileSync(join(home, '.elanous', 'auth.json'), 'utf8'));
+      const teamHome = join(home, '.elanous', 'codex-accounts', 'team');
+      const teamCodex = JSON.parse(readFileSync(join(teamHome, 'auth.json'), 'utf8'));
+      const defaultCodex = JSON.parse(readFileSync(join(home, '.codex', 'auth.json'), 'utf8'));
+      expect(Object.keys(afterSwitch.providers).sort()).toEqual(['anthropic', 'openai-codex', 'openai-codex:team']);
+      expect(afterSwitch.providers['openai-codex:team'].codexHome).toBe(teamHome);
+      expect(afterSwitch.providers['openai-codex:team'].tokens.accessToken).toBe(access.team);
+      expect(afterSwitch.providers['openai-codex'].tokens.accessToken).toBe(access.team);
+      expect(teamCodex.tokens.access_token).toBe(access.team);
+      expect(defaultCodex.tokens.access_token).toBe(access.team);
+      expect(existsSync(join(home, '.elanous', 'codex-accounts', 'third'))).toBe(false);
+      expect(JSON.stringify({ afterSwitch, teamCodex, defaultCodex })).not.toContain(access.third);
+      expect(JSON.stringify({ afterSwitch, teamCodex, defaultCodex })).not.toContain(refresh.third);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 
   test('살아 있는 부모 → pid · 인자에 --no-auto-merge', () => {
     const { home, cwd } = fakeHome('echo "args: $*"; echo "run=$ELANOUS_RUN_ID"; echo "state=$ELANOUS_STATE_DIR"; sleep 5');
@@ -433,6 +701,104 @@ describe('원격 스크립트 — 실제 셸', () => {
   test('cwd 없음 → 확실히 안 떴다', () => {
     const { home } = fakeHome('sleep 5');
     expect(() => launchRemoteParent({ host: 'h', cwd: join(home, 'missing') }, ['harness', 'say', 'g'], env, localShell(home))).toThrow(RemoteParentNotLaunchedError);
+  });
+
+  test('Codex access mirror is installed from stdin with no refresh authority and private files', () => {
+    const { home } = fakeHome('true');
+    const sourceHome = join(home, 'source-codex-home');
+    mkdirSync(sourceHome);
+    const sourceStore = join(home, 'source-auth.json');
+    const sourceRefresh = 'hq-refresh-token-sentinel';
+    const sourceIdToken = `header.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'fake-account' } })).toString('base64url')}.signature`;
+    mkdirSync(join(home, '.elanous'), { recursive: true });
+    mkdirSync(join(home, '.codex'), { recursive: true });
+    writeFileSync(join(home, '.elanous', 'auth.json'), JSON.stringify({ version: 9, remoteMarker: 'keep-elanous', providers: { other: { keep: true }, 'openai-codex': { providerMarker: 'keep-provider', authMode: 'remote-old', chatGPT: { accountId: 'remote-account', remoteOnly: 'keep-chatgpt-field' }, tokens: { legacy: 'keep-provider-token' } } } }));
+    writeFileSync(join(home, '.codex', 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', last_refresh: 'remote-last-refresh', remoteMarker: 'keep-codex', tokens: { legacy: 'preserve-me' } }));
+    writeFileSync(join(sourceHome, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', last_refresh: 'hq-last-refresh', sourceMarker: 'copy-source-field', tokens: {
+      access_token: ACCESS_TOKEN, id_token: sourceIdToken, refresh_token: sourceRefresh, account_id: 'fake-account',
+    } }), { mode: 0o600 });
+    writeFileSync(sourceStore, JSON.stringify({ version: 1, providers: { 'openai-codex': {
+      tokens: { accessToken: ACCESS_TOKEN, refreshToken: sourceRefresh }, lastRefresh: 'hq-last-refresh', authMode: 'chatgpt', codexHome: sourceHome,
+    } } }), { mode: 0o600 });
+    const credentials = hostCredentials('default', sourceStore, () => '');
+    installRemoteCodexAccess({ host: 'h', cwd: '/repo' }, credentials, localShell(home));
+    const elanousPath = join(home, '.elanous/auth.json');
+    const codexPath = join(home, '.codex/auth.json');
+    const elanous = JSON.parse(readFileSync(elanousPath, 'utf8'));
+    const codex = JSON.parse(readFileSync(codexPath, 'utf8'));
+    expect(elanous.providers['openai-codex'].tokens).toMatchObject({ accessToken: ACCESS_TOKEN, refreshToken: '', refresh_token: '' });
+    expect(elanous.providers['openai-codex']).toMatchObject({ providerMarker: 'keep-provider' });
+    expect(elanous.providers['openai-codex'].tokens.legacy).toBeUndefined();
+    expect(elanous.providers['openai-codex']).toMatchObject({ authMode: 'chatgpt', lastRefresh: 'hq-last-refresh', chatGPT: { accountId: 'fake-account', remoteOnly: 'keep-chatgpt-field' } });
+    expect(codex.tokens).toMatchObject({ access_token: ACCESS_TOKEN, id_token: sourceIdToken, refresh_token: '', refreshToken: '' });
+    expect(codex.auth_mode).toBe('chatgpt');
+    expect(codex.last_refresh).toBe('hq-last-refresh');
+    expect(codex.sourceMarker).toBe('copy-source-field');
+    expect(JSON.stringify(codex)).not.toContain(sourceRefresh);
+    expect(elanous.version).toBe(9);
+    expect(elanous.remoteMarker).toBe('keep-elanous');
+    expect(elanous.providers.other).toEqual({ keep: true });
+    expect(codex.remoteMarker).toBe('keep-codex');
+    expect(codex.tokens.legacy).toBeUndefined();
+    installRemoteCodexAccess({ host: 'h', cwd: '/repo' }, { ...credentials, account: 'third' }, localShell(home));
+    const namedStore = JSON.parse(readFileSync(elanousPath, 'utf8'));
+    expect(namedStore.providers['openai-codex:third'].tokens).toMatchObject({ accessToken: ACCESS_TOKEN, refreshToken: '', refresh_token: '' });
+    expect(namedStore.providers['openai-codex:third'].codexHome).toBe(join(home, '.elanous', 'codex-accounts', 'third'));
+    expect(namedStore.providers['openai-codex'].tokens.accessToken).toBe(ACCESS_TOKEN);
+    delete namedStore.providers['openai-codex'];
+    writeFileSync(elanousPath, JSON.stringify(namedStore));
+    installRemoteCodexAccess({ host: 'h', cwd: '/repo' }, { ...credentials, account: 'third' }, localShell(home));
+    expect(JSON.parse(readFileSync(elanousPath, 'utf8')).providers['openai-codex'].tokens.accessToken).toBe(ACCESS_TOKEN);
+    expect(JSON.parse(hostCredentials('default', sourceStore, () => '', { requireExplicitChatgptAuthMode: true }).codexAuth).auth_mode).toBe('chatgpt');
+    const sourceAuthPath = join(sourceHome, 'auth.json');
+    const withoutLastRefresh = JSON.parse(readFileSync(sourceAuthPath, 'utf8')) as Record<string, unknown>;
+    delete withoutLastRefresh.last_refresh;
+    writeFileSync(sourceAuthPath, JSON.stringify(withoutLastRefresh), { mode: 0o600 });
+    const noLastRefresh = hostCredentials('default', sourceStore, () => '');
+    installRemoteCodexAccess({ host: 'h', cwd: '/repo' }, noLastRefresh, localShell(home));
+    const codexWithoutLastRefresh = JSON.parse(readFileSync(codexPath, 'utf8')) as Record<string, unknown>;
+    expect(Object.hasOwn(codexWithoutLastRefresh, 'last_refresh')).toBe(false);
+
+    const withoutAuthMode = { ...withoutLastRefresh };
+    delete withoutAuthMode.auth_mode;
+    writeFileSync(sourceAuthPath, JSON.stringify(withoutAuthMode), { mode: 0o600 });
+    const podCompatible = hostCredentials('default', sourceStore, () => '');
+    expect(JSON.parse(podCompatible.codexAuth).auth_mode).toBeUndefined();
+    expect(JSON.parse(podCompatible.elanousAuth).providers['openai-codex'].authMode).toBe('chatgpt');
+    expect(() => hostCredentials('default', sourceStore, () => '', { requireExplicitChatgptAuthMode: true }))
+      .toThrow('auth_mode must be explicitly chatgpt for remote parent');
+    expect(statSync(elanousPath).mode & 0o777).toBe(0o600);
+    expect(statSync(codexPath).mode & 0o777).toBe(0o600);
+    const previousCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = join(home, '.codex');
+    try {
+      const reloaded = hostCredentials('default', elanousPath, () => '');
+      expect(JSON.parse(reloaded.elanousAuth).version).toBe(9);
+      expect(JSON.parse(reloaded.codexAuth).auth_mode).toBe('chatgpt');
+    } finally {
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+    }
+  });
+
+  test('failed remote auth write removes the credential-bearing temporary file', () => {
+    const { home } = fakeHome('true');
+    mkdirSync(join(home, '.elanous', 'auth.json'), { recursive: true });
+    expect(() => installRemoteCodexAccess({ host: 'h', cwd: '/repo' }, TEST_CODEX_MIRROR, localShell(home))).toThrow('ssh rc=');
+    expect(readdirSync(join(home, '.elanous'))).toEqual(['auth.json']);
+  });
+
+  test('remote Codex access mirror rejects unsupported auth modes before SSH', () => {
+    let sshCalls = 0;
+    expect(() => installRemoteCodexAccess({ host: 'h', cwd: '/repo' }, {
+      elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: 'access', refreshToken: '', refresh_token: '' } } } }),
+      codexAuth: JSON.stringify({ auth_mode: 'oauth', tokens: { access_token: 'access', refresh_token: '', refreshToken: '' } }),
+    }, () => { sshCalls++; return { status: 0, stdout: '', stderr: '' }; })).toThrow('versioned store, auth mode');
+    expect(() => installRemoteCodexAccess({ host: 'h', cwd: '/repo' }, {
+      elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: 'access', refreshToken: '', refresh_token: '' } } } }),
+      codexAuth: JSON.stringify({ tokens: { access_token: 'access', refresh_token: '', refreshToken: '' } }),
+    }, () => { sshCalls++; return { status: 0, stdout: '', stderr: '' }; })).toThrow('versioned store, auth mode');
+    expect(sshCalls).toBe(0);
   });
 
   test('ssh 끊김 → 불확실(일반 Error · 로컬 재발사 금지)', () => {
@@ -474,7 +840,7 @@ describe('defaultTaskLauncher — 불확실한 원격 발사는 로컬로 다시
     const ssh = stubSsh([{ match: /--version/, stdout: GOOD_FACTS }, { match: /nohup/, status: 255, stderr: 'connection reset' }]);
     let local = 0;
     const spawn: DetachedSpawn = () => { local++; throw new Error('no'); };
-    await expect(defaultTaskLauncher(['harness', 'say', 'g'], undefined, context, { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn })).rejects.toThrow('불확실');
+    await expect(launchWithTestMirror(['harness', 'say', 'g'], undefined, context, { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn })).rejects.toThrow('불확실');
     expect(local).toBe(0);
   });
 });
@@ -506,10 +872,105 @@ describe('LLM 자격 사실 — 막지 않고 경고', () => {
     const runId = 'run-cafe0000-3333-4444-5555-666677778888';
     const ssh = stubSsh([{ match: /--version/, stdout: `${GOOD_FACTS}codexAccounts=1\n` }, { match: /nohup/, stdout: 'pid=4545\n' }]);
     const notices: string[] = [];
-    const receipt = await defaultTaskLauncher(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'g'], undefined, { runId, launchId: 'tl-c', env: { ELANOUS_RUN_ID: runId } },
+    const receipt = await launchWithTestMirror(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'g'], undefined, { runId, launchId: 'tl-c', env: { ELANOUS_RUN_ID: runId } },
       { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn: () => { throw new Error('로컬 발사가 불리면 안 된다'); }, notice: (line) => notices.push(line) });
     expect(receipt).toMatchObject({ parentHost: { host: 'node-b', pid: 4545 } });
     expect(notices).toEqual(['⚠ node-b 자격: codex-accounts-low · grok-credential-missing · openrouter-key-missing']);
+  });
+
+  test('each remote parent launch redeploys the access-only mirror through stdin before starting', async () => {
+    const calls: Array<{ script: string; stdin?: string }> = [];
+    let mirrorReads = 0;
+    const ssh: SshRunner = (_host, script, _timeout, stdin) => {
+      calls.push({ script, ...(stdin !== undefined ? { stdin } : {}) });
+      return { status: 0, stdout: script.includes('--version') ? GOOD_FACTS : script.includes('nohup') ? 'pid=5151\n' : '', stderr: '' };
+    };
+    const context = { runId: 'run-mirror0001', launchId: 'tl-mirror', env: { ELANOUS_RUN_ID: 'run-mirror0001' } };
+    const deps = { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
+      codexAccessMirror: async () => { mirrorReads++; return { ...TEST_CODEX_MIRROR, account: 'third', usedPercent: 47, thresholdPercent: 60 }; }, spawn: () => { throw Error('local fallback'); } };
+
+    const first = await launchWithTestMirror(['harness', 'say', 'g'], undefined, context, deps);
+    const second = await launchWithTestMirror(['harness', 'say', 'g'], undefined, context, deps);
+    const installs = calls.filter((call) => call.stdin !== undefined);
+    expect(first).toMatchObject({ parentHost: { host: 'node-b', pid: 5151 } });
+    expect(second).toMatchObject({ parentHost: { host: 'node-b', pid: 5151 } });
+    expect(mirrorReads).toBe(2);
+    expect(installs).toHaveLength(2);
+    for (const call of installs) {
+      expect(call.script).not.toContain(ACCESS_TOKEN);
+      expect(call.script).not.toContain('refreshCodexAccountHome');
+      const payload = JSON.parse(call.stdin!);
+      expect(payload.provider.tokens.refreshToken).toBe('');
+      expect(payload.provider.tokens.refresh_token).toBe('');
+      expect(payload.codexAuth.tokens.refresh_token).toBe('');
+      expect(payload.codexAuth.tokens.refreshToken).toBe('');
+      expect(payload.codexAuth.tokens.access_token).toBe(ACCESS_TOKEN);
+      expect(payload.codexAuth.tokens.id_token).toBe(ACCESS_TOKEN);
+    }
+    expect(calls.findIndex((call) => call.stdin !== undefined)).toBeLessThan(calls.findIndex((call) => call.script.includes('nohup')));
+    const launchScript = calls.find((call) => call.script.includes('nohup'))!.script;
+    expect(launchScript).toContain('ELANOUS_REMOTE_CODEX_ACCOUNT=third');
+    expect(launchScript).toContain('ELANOUS_REMOTE_CODEX_USED_PERCENT=47');
+    expect(launchScript).toContain('ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT=60');
+    expect(launchScript).not.toContain(ACCESS_TOKEN);
+  });
+
+  test('real HQ selector chooses one ordered account, mirrors only its access, and refuses when all owner accounts exceed caps', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'owner-mirror-selector-'));
+    const previousXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = root;
+    try {
+      const storePath = join(root, 'elanous', 'auth.json');
+      mkdirSync(join(root, 'elanous'), { recursive: true });
+      const accounts = ['third', 'team'] as const;
+      const accountToken = (exp: number) => `header.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.signature`;
+      const accessByAccount = { third: accountToken(1_900_000_001), team: accountToken(1_900_000_002) } as const;
+      const providers: Record<string, unknown> = {};
+      for (const name of accounts) {
+        const home = join(root, `codex-${name}`);
+        mkdirSync(home, { recursive: true });
+        writeFileSync(join(home, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: accessByAccount[name], id_token: accessByAccount[name], refresh_token: `refresh-${name}` } }));
+        providers[`openai-codex:${name}`] = { authMode: 'chatgpt', codexHome: home, tokens: { accessToken: accessByAccount[name], refreshToken: `refresh-${name}` } };
+      }
+      writeFileSync(storePath, JSON.stringify({ version: 1, providers }));
+      const candidates = accounts.map((name, index) => ({ name, storeKey: `openai-codex:${name}`, home: join(root, `codex-${name}`), reached: false, usedPercent: index === 0 ? 47 : 55 }));
+      const rotation = { candidates, accountThresholds: accounts.map((name) => ({ name, thresholdPercent: 91 })) };
+      const calls: Array<{ script: string; stdin?: string }> = [];
+      const ssh: SshRunner = (_host, script, _timeout, stdin) => {
+        calls.push({ script, ...(stdin === undefined ? {} : { stdin }) });
+        return { status: 0, stdout: script.includes('--version') ? GOOD_FACTS : script.includes('nohup') ? 'pid=5152\n' : '', stderr: '' };
+      };
+      const baseDeps = { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn: () => { throw Error('local fallback'); },
+        ownerCodexRotation: () => rotation as unknown as ReturnType<typeof import('../oauth/codex-account-store.js').inspectCodexRotation>,
+        ownerCodexRotationConfig: { accountOrder: ['team', 'third'], thresholdPercentByAccount: { third: 60, team: 60 } } };
+      const launched = await defaultTaskLauncher(['harness', 'say', 'g'], undefined,
+        { runId: 'run-ownerselect01', launchId: 'tl-ownerselect', substrate: 'pod', podGoal: 'document this behavior',
+          env: { ELANOUS_RUN_ID: 'run-ownerselect01', ELANOUS_POD_MEMORY_TIER: 'high', ELANOUS_POD_MEMORY: '16Gi' } }, baseDeps);
+      expect(launched && 'parentHost' in launched ? launched.parentHost?.host : undefined).toBe('node-b');
+      const install = calls.find((call) => call.stdin !== undefined)!;
+      const installed = JSON.parse(install.stdin!);
+      expect(installed.storeKey).toBe('openai-codex:team');
+      expect(installed.provider.tokens.accessToken).toBe(accessByAccount.team);
+      expect(install.stdin).not.toContain(accessByAccount.third);
+      expect(install.stdin).not.toContain('refresh-team');
+      expect(install.stdin).not.toContain('refresh-third');
+      const launchScript = calls.find((call) => call.script.includes('nohup'))?.script ?? '';
+      expect(launchScript).toContain('ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT=60');
+      expect(launchScript).toContain('ELANOUS_REMOTE_CODEX_ACCOUNT=team');
+      expect(launchScript).toContain('ELANOUS_POD_MEMORY_TIER=high');
+      expect(launchScript).toContain('ELANOUS_POD_MEMORY=16Gi');
+
+      calls.length = 0;
+      const exhausted = { ...rotation, candidates: candidates.map((candidate) => ({ ...candidate, usedPercent: 99 })) };
+      await expect(defaultTaskLauncher(['harness', 'say', 'g'], undefined,
+        { runId: 'run-ownerempty01', launchId: 'tl-ownerempty', env: { ELANOUS_RUN_ID: 'run-ownerempty01' } },
+        { ...baseDeps, ownerCodexRotation: () => exhausted as unknown as ReturnType<typeof import('../oauth/codex-account-store.js').inspectCodexRotation> })).rejects.toThrow('모두 사용 임계');
+      expect(calls.some((call) => call.stdin !== undefined || call.script.includes('nohup'))).toBe(false);
+    } finally {
+      if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = previousXdg;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('preflight script measures existence and counts only — real shell on a fake HOME', () => {
@@ -560,7 +1021,7 @@ describe('TA-LAND-REMOTE-PARENT — a ta-land run may use a remote parent', () =
       const counter = { n: 0 };
       const notices: string[] = [];
       const context = { runId, launchId: 'tl-y', env: { ELANOUS_RUN_ID: runId, ELANOUS_TA_LAND: '1' } };
-      const receipt = await defaultTaskLauncher(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'g'], undefined, context,
+      const receipt = await launchWithTestMirror(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'g'], undefined, context,
         { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn: localSpawn(counter), earlyExitWindowMs: 0, notice: (line) => notices.push(line) });
       const launches = ssh.calls.filter((call) => call.includes('nohup'));
       expect(launches).toHaveLength(1);
@@ -579,7 +1040,7 @@ describe('TA-LAND-REMOTE-PARENT — a ta-land run may use a remote parent', () =
   test('no marker → remote parent as before (ssh launch · no local spawn)', async () => {
     const ssh = stubSsh([{ match: /--version/, stdout: GOOD_FACTS }, { match: /nohup/, stdout: 'pid=4343\n' }]);
     const context = { runId, launchId: 'tl-z', env: { ELANOUS_RUN_ID: runId } };
-    const receipt = await defaultTaskLauncher(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'g'], undefined, context,
+    const receipt = await launchWithTestMirror(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'g'], undefined, context,
       { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn: () => { throw new Error('로컬 발사가 불리면 안 된다'); } });
     expect(receipt).toMatchObject({ runId, parentHost: { host: 'node-b', pid: 4343 } });
     expect(ssh.calls.some((call) => call.includes('nohup'))).toBe(true);

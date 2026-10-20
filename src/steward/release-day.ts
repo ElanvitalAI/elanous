@@ -15,16 +15,19 @@ export interface ReleaseDayDecision {
   reason?: string;
 }
 
-/** The release record, rather than publishAt (a planned time), opens green-back. */
+/** Green-back waits for both the scheduled publish end and the actual publication record. */
 export function decideReleaseDayPhase(schedule: ReleaseSchedule, now: Date, publishedAt: string | null): ReleaseDayDecision {
   const cut = Date.parse(schedule.cutAt);
   const land = schedule.landBy ? Date.parse(schedule.landBy) : cut;
   const gate = cut - 30 * 60_000;
   const time = now.getTime();
+  const published = publishedAt ? Date.parse(publishedAt) : Number.NaN;
+  const publishEnd = schedule.publishAt ? Date.parse(schedule.publishAt) : published;
+  const greenAt = Number.isFinite(published) && Number.isFinite(publishEnd) ? Math.max(published, publishEnd) : Number.NaN;
   let phase: ReleaseDayPhase = 'none';
   let dueAt: string | null = null;
-  if (publishedAt && time >= Date.parse(publishedAt)) {
-    phase = 'green-back'; dueAt = publishedAt;
+  if (time >= greenAt) {
+    phase = 'green-back'; dueAt = publishEnd >= published ? schedule.publishAt ?? publishedAt : publishedAt;
   } else if (time >= cut) {
     phase = 'cut-run'; dueAt = schedule.cutAt;
   } else if (time >= land) {
@@ -133,6 +136,7 @@ export function runReleaseDayShadow(deps: ReleaseDayShadowDeps = {}): ReleaseDay
         continue;
       }
       const publishedAt = publication.kind === 'published' ? publication.at : null;
+      // The steward graph tick records this judgment only; release CLI actions remain outside this shadow boundary.
       const decision = decideReleaseDayPhase(schedule, now, publishedAt);
       let recorded = false;
       if (decision.phase !== 'none') {

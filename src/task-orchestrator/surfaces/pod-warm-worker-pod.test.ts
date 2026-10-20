@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { Kubectl } from './self-implement-pod.js';
 import type { WarmWorkerCommand, WarmWorkerReply } from './pod-warm-worker-protocol.js';
-import { WarmPodTransport, warmWorkerPodManifest, WARM_POD_ACK, WARM_POD_EXEC, WARM_POD_INSTALL, WARM_POD_ISOLATION_PROBE, WARM_POD_PREPARE, WARM_POD_READ, type WarmPodSpec } from './pod-warm-worker-pod.js';
+import { WarmPodTransport, probeWarmPodContext, warmWorkerPodManifest, WARM_POD_ACK, WARM_POD_EXEC, WARM_POD_INSTALL, WARM_POD_ISOLATION_PROBE, WARM_POD_PREPARE, WARM_POD_READ, type WarmPodSpec } from './pod-warm-worker-pod.js';
 
 const cutSha = 'a'.repeat(40);
 const key = { context: 'pool-node-b', imageDigest: `sha256:${'b'.repeat(64)}`, lockHash: 'c'.repeat(64), architecture: 'amd64' };
@@ -17,6 +17,24 @@ const spec: WarmPodSpec = { name: 'warm-worker-1', namespace: 'elanous-test', ku
 const command = (attemptId: string): WarmWorkerCommand => ({ protocol: 1, runId: 'run-1', attemptId,
   cutSha, leaseId: 'lease-1', generation: 1, workerId: 'worker-1', key,
   deadlineAt: Date.now() + 60_000, files: ['src/example/worker.test.ts'], envProfile: 'gate-v1' });
+
+test('a missing remote-internal context retains the original kubectl error', () => {
+  const calls: string[][] = [];
+  const stderr = 'error: context k3d-elanous-pool not found\n';
+  const kubectl: Kubectl = args => {
+    calls.push([...args]);
+    return { status: 1, stdout: '', stderr };
+  };
+  expect(probeWarmPodContext('k3d-elanous-pool', kubectl)).toEqual({
+    status: 'fallback', reason: 'context-unavailable', reply: null, kubectlStderr: stderr,
+  });
+  expect(calls).toEqual([['config', 'get-contexts', 'k3d-elanous-pool', '-o', 'name']]);
+  expect(probeWarmPodContext('node-b', kubectl)).toBeNull();
+  expect(calls).toHaveLength(1);
+  expect(probeWarmPodContext('k3d-elanous-pool', () => ({
+    status: 0, stdout: 'k3d-elanous-pool\n', stderr: '',
+  }))).toBeNull();
+});
 const reply = (request: WarmWorkerCommand): WarmWorkerReply => ({ protocol: 1, runId: request.runId,
   attemptId: request.attemptId, cutSha: request.cutSha, leaseId: request.leaseId, generation: request.generation,
   workerId: request.workerId, key: request.key, envProfile: request.envProfile,
@@ -42,7 +60,7 @@ const artifactHashes = (request: WarmWorkerCommand) => [Object.fromEntries(
   Object.entries(artifacts(request)).map(([name, content]) => [name, sha256(content)]))];
 const pod = (uid = 'pod-uid-1') => {
   const manifest = warmWorkerPodManifest(spec) as any;
-  const admittedDefaults = (container: any) => ({ ...container, resources: {},
+  const admittedDefaults = (container: any) => ({ ...container,
     terminationMessagePath: '/dev/termination-log', terminationMessagePolicy: 'File' });
   // These defaults were observed in pool-node-b server-side dry-run on 2026-10-16; no Pod was created.
   return { metadata: { name: spec.name, namespace: spec.namespace, uid, annotations: manifest.metadata.annotations },
@@ -79,6 +97,8 @@ test('manifest pins image, source SHA and lock hash; worker stays Running for la
     { name: 'WARM_CUT_SHA', value: cutSha }, { name: 'WARM_LOCK_HASH', value: key.lockHash },
   ]));
   expect(manifest.spec.containers[0].command).toEqual(['sleep', 'infinity']);
+  expect(manifest.spec.containers[0].resources.limits.memory).toBe('16Gi');
+  expect((warmWorkerPodManifest({ ...spec, memoryLimit: '2Gi' }) as any).spec.containers[0].resources.limits.memory).toBe('2Gi');
   expect(manifest.spec.containers[0].securityContext.runAsUser).toBe(0);
   expect(manifest.spec.containers[0].env).toContainEqual({ name: 'WARM_POD_UID',
     valueFrom: { fieldRef: { apiVersion: 'v1', fieldPath: 'metadata.uid' } } });
@@ -89,7 +109,8 @@ test('manifest pins image, source SHA and lock hash; worker stays Running for la
   expect(manifest.spec.initContainers[2].volumeMounts).toEqual([{ name: 'workspace', mountPath: '/workspace' }]);
   expect(WARM_POD_EXEC).toContain("chmodSync('/workspace/data/scratch', 0o755)");
   expect(WARM_POD_EXEC).toContain('runFile: runWarmWorkerFile');
-  expect(manifest.spec.containers[0].volumeMounts[0]).toEqual({ name: 'workspace', mountPath: '/workspace/repo', subPath: 'repo', readOnly: true });
+  // The worker must reset and clean this emptyDir checkout after each request.
+  expect(manifest.spec.containers[0].volumeMounts[0]).toEqual({ name: 'workspace', mountPath: '/workspace/repo', subPath: 'repo' });
   expect(manifest.spec.volumes).toEqual([{ name: 'workspace', emptyDir: {} }, { name: 'runtime-data', emptyDir: {} }]);
   expect(() => warmWorkerPodManifest({ ...spec, image: 'registry.example/elanous:latest' })).toThrow();
   expect(() => warmWorkerPodManifest({ ...spec, key: { ...key, lockHash: 'wrong' } })).toThrow();
@@ -195,6 +216,21 @@ test('a Running Pod on the wrong node architecture never receives a request', as
   expect(execs).toBe(0);
 });
 
+test('Kubernetes empty init resource defaults allow the pinned Pod to reach exec', async () => {
+  const admitted = pod();
+  admitted.spec.initContainers[0].resources = {};
+  admitted.spec.initContainers[1].resources = {};
+  let execs = 0;
+  const kubectl: Kubectl = args => {
+    if (args.includes('node')) return { status: 0, stdout: JSON.stringify(node()), stderr: '' };
+    if (args.includes('exec')) { execs++; return { status: 1, stdout: '', stderr: 'deliberate exec stop' }; }
+    return { status: 0, stdout: JSON.stringify(admitted), stderr: '' };
+  };
+  expect(await new WarmPodTransport(spec, kubectl).request(command('attempt-1')))
+    .toMatchObject({ status: 'fallback', reason: 'exec-failed' });
+  expect(execs).toBe(1);
+});
+
 test('admission refuses host, privilege and execution-field mutations', async () => {
   for (const mutate of [
     (value: any) => { value.spec.hostNetwork = true; },
@@ -203,6 +239,10 @@ test('admission refuses host, privilege and execution-field mutations', async ()
     (value: any) => { value.spec.containers[0].ports = [{ containerPort: 8080, hostPort: 8080 }]; },
     (value: any) => { value.spec.initContainers[0].securityContext = { privileged: true }; },
     (value: any) => { value.spec.initContainers[1].args = ['--exec=unsafe']; },
+    (value: any) => { value.spec.initContainers[0].resources = { limits: { cpu: '8' } }; },
+    (value: any) => { value.spec.initContainers[1].image = 'registry.example/other@sha256:' + 'd'.repeat(64); },
+    (value: any) => { value.spec.initContainers[1].env = [{ name: 'UNTRUSTED', value: '1' }]; },
+    (value: any) => { value.spec.volumes[0].emptyDir = { medium: 'Memory' }; },
     (value: any) => { value.spec.containers[0].args = ['1']; },
     (value: any) => { value.spec.containers[0].workingDir = '/workspace/data'; },
     (value: any) => { value.spec.containers[0].startupProbe = { exec: { command: ['sh', '-c', 'true'] } }; },

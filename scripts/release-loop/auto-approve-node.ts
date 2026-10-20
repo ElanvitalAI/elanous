@@ -15,8 +15,12 @@ const outcomeMetric = (name: string, node: Record<string, unknown> | undefined):
   verdict: node?.outcome === undefined ? 'unmeasured' : node.outcome === 'ok' ? 'pass' : 'fail',
 });
 
-/** Rows shown in auto-approval.md but never counted toward the 8 blocking metrics. */
+/** Rows outside the original eight fixed metrics. TUI regressions have their own HITL gate below. */
 export const WARNING_ONLY = new Set(['tui-regress', 'mac-smoke']);
+export const BLOCKING_METRIC_NAMES = [
+  'gate regressions and measurement', 'bun version', 'upgrade', 'tui', 'notes-check',
+  'public leak and prepare completeness', 'docs notes page', 'installation files',
+] as const;
 
 /** `ok` · `warn` (a failure) · `unmeasured` (error or no output) — the macOS smoke never blocks publishing. */
 function macSmokeLevel(node: Record<string, unknown> | undefined): 'ok' | 'warn' | 'unmeasured' {
@@ -42,40 +46,50 @@ export function runAutoApprove(context: GraphContext = readGraphContext(), deps:
     catch { distCount = undefined; }
   }
   const gateErrorAbsent = gate && !Object.hasOwn(gate, 'error');
-  const regressStatus = regressWarning(validatedTuiRegress(context.outputs.tui?.regress));
+  const regress = validatedTuiRegress(context.outputs.tui?.regress);
+  const regressStatus = regressWarning(regress);
+  const failedCheckIds = 'unmeasured' in regress ? null : regress.results.filter((result) => !result.ok).map((result) => result.id);
+  const failedLabel = failedCheckIds === null ? 'unmeasured' : `${failedCheckIds.length} [${failedCheckIds.join(', ') || '-'}]`;
+  const regressNeedsApproval = regressStatus.level !== 'ok';
   const macSmoke = context.outputs['mac-smoke'];
   const metrics: ApprovalMetric[] = [
-    { name: 'gate regressions and measurement', value: JSON.stringify({ outcome: gate?.outcome ?? null, introduced: gate?.introduced ?? null, error: gate?.error ?? null }),
+    { name: BLOCKING_METRIC_NAMES[0], value: JSON.stringify({ outcome: gate?.outcome ?? null, introduced: gate?.introduced ?? null, error: gate?.error ?? null }),
       verdict: !gate || gate.outcome === undefined || !Array.isArray(gate.introduced) ? 'unmeasured'
         : gate.outcome === 'ok' && gate.introduced.length === 0 && gateErrorAbsent ? 'pass' : 'fail' },
-    { name: 'bun version', value: `running=${bunVersion}; pinned=${pinned ?? 'missing'}`,
+    { name: BLOCKING_METRIC_NAMES[1], value: `running=${bunVersion}; pinned=${pinned ?? 'missing'}`,
       verdict: !pinned ? 'unmeasured' : bunVersion === pinned ? 'pass' : 'fail' },
-    outcomeMetric('upgrade', context.outputs.upgrade),
-    outcomeMetric('tui', context.outputs.tui),
-    outcomeMetric('notes-check', context.outputs['notes-check']),
-    { name: 'public leak and prepare completeness', value: `prepare=${prepare?.outcome ?? 'missing'}`,
+    outcomeMetric(BLOCKING_METRIC_NAMES[2], context.outputs.upgrade),
+    outcomeMetric(BLOCKING_METRIC_NAMES[3], context.outputs.tui),
+    outcomeMetric(BLOCKING_METRIC_NAMES[4], context.outputs['notes-check']),
+    { name: BLOCKING_METRIC_NAMES[5], value: `prepare=${prepare?.outcome ?? 'missing'}`,
       verdict: prepare?.outcome === undefined ? 'unmeasured' : prepare.outcome === 'ok' ? 'pass' : 'fail' },
-    { name: 'docs notes page', value: `docs=${context.outputs.docs?.outcome ?? 'missing'}; notes=${String(context.outputs.docs?.notes ?? 'missing')}`,
+    { name: BLOCKING_METRIC_NAMES[6], value: `docs=${context.outputs.docs?.outcome ?? 'missing'}; notes=${String(context.outputs.docs?.notes ?? 'missing')}`,
       verdict: context.outputs.docs?.outcome === undefined || context.outputs.docs.notes === undefined ? 'unmeasured'
         : context.outputs.docs.outcome === 'ok' && typeof context.outputs.docs.notes === 'string' && context.outputs.docs.notes.trim() ? 'pass' : 'fail' },
-    { name: 'installation files', value: `dist files=${distCount ?? 'missing'}; prepare.out=${String(out ?? 'missing')}`,
+    { name: BLOCKING_METRIC_NAMES[7], value: `dist files=${distCount ?? 'missing'}; prepare.out=${String(out ?? 'missing')}`,
       verdict: prepare?.outcome !== 'ok' ? prepare?.outcome === undefined ? 'unmeasured' : 'fail'
         : distCount === undefined ? 'unmeasured' : distCount === 5 ? 'pass' : 'fail' },
-    // Warning-only and last, so the numbered rows 1–8 keep their places in auto-approval.md (V1g follow-up).
-    { name: 'tui-regress', value: regressStatus.level, reason: regressStatus.line, verdict: 'pass' },
+    // Kept after the eight fixed metrics; a failed or unmeasured subcheck requires the existing approve-publish HITL node.
+    { name: 'tui-regress', value: regressStatus.level, reason: regressStatus.line,
+      verdict: regressStatus.level === 'ok' ? 'pass' : regressStatus.level === 'warn' ? 'fail' : 'unmeasured' },
     // MAC1: the macOS smoke is warning-only too (ship with known issues) — shown, never counted.
     { name: 'mac-smoke', value: macSmokeLevel(macSmoke), reason: typeof macSmoke?.summary === 'string' ? macSmoke.summary : undefined, verdict: 'pass' },
   ];
-  const outcome = metrics.filter((metric) => !WARNING_ONLY.has(metric.name)).every((metric) => metric.verdict === 'pass') ? 'ok' as const : 'fail' as const;
+  const outcome = metrics.filter((metric) => !WARNING_ONLY.has(metric.name)).every((metric) => metric.verdict === 'pass')
+    && !regressNeedsApproval ? 'ok' as const : 'fail' as const;
   const report = join(root, 'release', version, 'auto-approval.md');
   const lines = [`# v${version} auto-approval`, '', `Outcome: ${outcome}`, '', '| # | Metric | Value | Verdict |', '|---|---|---|---|',
     ...metrics.map((metric, i) => `| ${i + 1} | ${metric.name} | ${[metric.value, metric.reason].filter(Boolean).join(' — ').replaceAll('|', '\\|').replace(/[\r\n]/g, ' ')} | ${metric.verdict} |`),
+    '', `TUI subcheck: ${regressStatus.level} · failed ${failedLabel} · ${regressNeedsApproval ? 'HITL 수용/정지 필요' : '자동 판정 가능'}`,
     '', '## 되돌리는 법', `gh release edit v${version} --draft`, `git tag -d v${version} && git push origin :refs/tags/v${version}`, '해당 docs PR revert', ''];
   mkdirSync(dirname(report), { recursive: true });
   writeFileSync(report, lines.join('\n'));
-  debug.log('release-loop.approve', 'auto-decision', { version, outcome, metrics });
-  return { outcome, verdict: outcome === 'ok' ? 'pass' as const : 'fail' as const, summary: `auto approval ${outcome}: ${metrics.filter((metric) => !WARNING_ONLY.has(metric.name) && metric.verdict === 'pass').length}/8`,
-    ...(outcome === 'ok' ? { decidedBy: 'release-loop metrics' as const } : {}), metrics, report };
+  const tuiSubcheck = { runId: context.runId ?? null, level: regressStatus.level,
+    fail: failedCheckIds?.length ?? null, failedCheckIds, approvalRequired: regressNeedsApproval };
+  debug.log('release-loop.approve', 'auto-decision', { version, outcome, metrics, tuiSubcheck });
+  return { outcome, verdict: outcome === 'ok' ? 'pass' as const : 'fail' as const,
+    summary: `auto approval ${outcome}: ${metrics.filter((metric) => !WARNING_ONLY.has(metric.name) && metric.verdict === 'pass').length}/8${regressNeedsApproval ? ` · tui-regress ${regressStatus.level} failed ${failedLabel} → HITL` : ''}`,
+    runId: context.runId ?? null, tuiSubcheck, ...(outcome === 'ok' ? { decidedBy: 'release-loop metrics' as const } : {}), metrics, report };
 }
 
 if (import.meta.main) {

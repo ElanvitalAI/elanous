@@ -1,7 +1,8 @@
+import { spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
 import { listChecklist, setItemIfSnapshot, type Checklist } from '../release-loop/checklist.js';
 import { judgeLandedCell, parseJudgeSignals, type GreenVerdict } from '../release-loop/landed-to-green.js';
-import { cardPrNumber, readTaskAgentState, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
+import { HAND_MOVE_HISTORY_EVENT, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, cardPrNumber, readTaskAgentState, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
 import { isGoalOnlyPr } from './judge.js';
 
 export interface LandedTaskPr { number: number; url: string; headRefOid: string; state: string; baseRefName: string; mergedAt: string; files?: Array<{ path: string }> }
@@ -141,4 +142,82 @@ export function closeMergedTaskCard(pr: LandedTaskPr, cwd: string, deps: Postlan
   }
   log('task-agent', 'postland-card-closed', { pr: pr.number, card: card.id, version, id: item.id, outcome: complete ? 'complete' : 'partial', verdict });
   return item.id;
+}
+
+const defaultGit = (cwd: string, args: string[]): { status: number; stdout: string; stderr: string } => {
+  const run = spawnSync('git', args, { cwd, encoding: 'utf8' });
+  return { status: run.status ?? 1, stdout: run.stdout ?? '', stderr: run.stderr ?? '' };
+};
+
+export type HandMergeReconcileOutcome =
+  | { outcome: 'reconciled'; card: string; status: 'landed-by-hand' | 'landed'; pr: number; head: string; mergeSha: string; mergedAt: string }
+  | { outcome: 'not-reconciled'; reason: 'pr-not-merged' | 'no-merge-sha' | 'no-bound-card' | 'ambiguous-card' | 'card-not-failed' | 'not-ancestor-of-main' | 'card-binding-changed-before-write' };
+
+export interface HandMergeReconcileDeps {
+  statePath?: string;
+  mainRef?: string;
+  updateCard?: typeof updateTaskCard;
+  git?: (cwd: string, args: string[]) => { status: number; stdout: string; stderr: string };
+  log?: typeof debug.log;
+}
+
+/**
+ * TA-CARD-MERGE-RECONCILE — 실패 카드에 묶인 PR을 사람이 손수 병합했을 때만 카드를 정산한다.
+ * MERGED + merge SHA가 `${mainRef}`(기본 `origin/main`) 조상일 때 status=landed-by-hand(또는 merge 커밋이
+ * land attempt head와 일치하면 landed)로 `updateTaskCard` 파일-락 트랜잭션 하나로 갱신하고,
+ * 이전 status·사유는 history `hand-move` 줄에 보존한다. OPEN·비조상·묶임 없음은 카드를 그대로 둔다.
+ */
+export function reconcileHandMergedCard(pr: LandedTaskPr & { mergeCommit?: string }, cwd: string, deps: HandMergeReconcileDeps = {}): HandMergeReconcileOutcome {
+  const log = deps.log ?? debug.log.bind(debug);
+  if (pr.state !== 'MERGED' || !pr.url) return { outcome: 'not-reconciled', reason: 'pr-not-merged' };
+  const mergeSha = pr.mergeCommit ?? '';
+  if (!/^[a-f0-9]{40}$/i.test(mergeSha)) return { outcome: 'not-reconciled', reason: 'no-merge-sha' };
+  const path = deps.statePath ?? taskAgentStatePath();
+  const tasks = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(path).tasks ?? {};
+  const cards = Object.values(tasks).filter((card) => card.taLand && cardPrNumber(card) === pr.number
+    && typeof card.pr === 'object' && card.pr.url?.replace(/\/+$/, '') === pr.url.replace(/\/+$/, ''));
+  if (cards.length !== 1) {
+    log('task-agent', 'postland-card-hand-skipped', { pr: pr.number, reason: cards.length ? 'ambiguous-card' : 'no-bound-card' });
+    return { outcome: 'not-reconciled', reason: cards.length ? 'ambiguous-card' : 'no-bound-card' };
+  }
+  const card = cards[0]!;
+  if (card.status !== 'failed') {
+    log('task-agent', 'postland-card-hand-skipped', { pr: pr.number, card: card.id, reason: 'card-not-failed', status: card.status });
+    return { outcome: 'not-reconciled', reason: 'card-not-failed' };
+  }
+  const mainRef = deps.mainRef ?? 'origin/main';
+  if ((deps.git ?? defaultGit)(cwd, ['merge-base', '--is-ancestor', mergeSha, mainRef]).status !== 0) {
+    log('task-agent', 'postland-card-hand-skipped', { pr: pr.number, card: card.id, reason: 'not-ancestor-of-main', mainRef });
+    return { outcome: 'not-reconciled', reason: 'not-ancestor-of-main' };
+  }
+  const at = new Date().toISOString();
+  let reconciled: { status: 'landed-by-hand' | 'landed' } | undefined;
+  // The card lock keeps the settlement atomic with its binding checks: a card that flipped off
+  // `failed` mid-flight is left untouched for its owning path to finish.
+  (deps.updateCard ?? updateTaskCard)(path, card.id, (current, currentTasks) => {
+    const matching = Object.values(currentTasks).filter((candidate) => candidate.taLand && cardPrNumber(candidate) === pr.number
+      && typeof candidate.pr === 'object' && candidate.pr.url?.replace(/\/+$/, '') === pr.url.replace(/\/+$/, ''));
+    if (matching.length !== 1 || matching[0]?.id !== card.id) return undefined;
+    if (!current || current.status !== 'failed' || cardPrNumber(current) !== pr.number || typeof current.pr !== 'object'
+      || current.pr.url?.replace(/\/+$/, '') !== pr.url.replace(/\/+$/, '')) return undefined;
+    const status = (current.landAttempts ?? []).some((attempt) => attempt.pr === pr.number
+      && attempt.head.toLowerCase() === mergeSha.toLowerCase()) ? 'landed' : 'landed-by-hand';
+    const priorReason = [...current.history].reverse().find((event) => event.event !== LIVE_MOVE_HISTORY_EVENT
+      && event.event !== LIVE_MOVE_RESULT_EVENT && event.event !== HAND_MOVE_HISTORY_EVENT)?.detail ?? '사유 기록 없음';
+    const detail = status === 'landed'
+      ? `PR #${pr.number} 병합 정산: merge ${mergeSha}가 land attempt head와 일치 — status landed; 이전 status: failed; 이전 사유: ${priorReason}`
+      : `PR #${pr.number} 손 병합 정산: merge ${mergeSha}가 ${mainRef} 조상 — status landed-by-hand; 이전 status: failed; 이전 사유: ${priorReason}`;
+    reconciled = { status };
+    return { ...current,
+      status,
+      prTerminal: { pr: pr.number, url: pr.url, head: mergeSha, state: 'MERGED' as const, at },
+      history: [...current.history, { at, event: HAND_MOVE_HISTORY_EVENT, pr: pr.number, head: mergeSha, detail }],
+    };
+  });
+  if (!reconciled) {
+    log('task-agent', 'postland-card-hand-pending', { pr: pr.number, card: card.id, reason: 'card-binding-changed-before-write' });
+    return { outcome: 'not-reconciled', reason: 'card-binding-changed-before-write' };
+  }
+  log('task-agent', 'postland-card-hand-reconciled', { pr: pr.number, card: card.id, status: reconciled.status, mergeSha, mainRef });
+  return { outcome: 'reconciled', card: card.id, status: reconciled.status, pr: pr.number, head: pr.headRefOid, mergeSha, mergedAt: pr.mergedAt };
 }

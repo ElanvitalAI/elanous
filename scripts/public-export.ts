@@ -283,6 +283,45 @@ export function scanLeaks(root: string, files: readonly string[], markers = LEAK
   return hits;
 }
 
+/** Code literals are reported separately for the crown marker: they are not document/comment leakage. */
+function codeLiteralRanges(file: string, text: string): Array<[number, number]> {
+  if (!/\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/iu.test(file)) return [];
+  const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, /\.(?:tsx|jsx)$/iu.test(file) ? ts.LanguageVariant.JSX : ts.LanguageVariant.Standard, text);
+  const ranges: Array<[number, number]> = [];
+  for (let token = scanner.scan(); token !== ts.SyntaxKind.EndOfFileToken; token = scanner.scan()) {
+    if (token === ts.SyntaxKind.StringLiteral || token === ts.SyntaxKind.NoSubstitutionTemplateLiteral ||
+        token === ts.SyntaxKind.TemplateHead || token === ts.SyntaxKind.TemplateMiddle || token === ts.SyntaxKind.TemplateTail) {
+      ranges.push([scanner.getTokenPos(), scanner.getTextPos()]);
+    }
+  }
+  return ranges;
+}
+
+export function splitCodeLiteralCeoMarks(files: readonly string[], contents: ReadonlyMap<string, string>, hits: readonly LeakHit[]): { leaks: LeakHit[]; codeLiterals: LeakHit[] } {
+  const leaks: LeakHit[] = [];
+  const codeLiterals: LeakHit[] = [];
+  const fileSet = new Set(files);
+  const classification = new Map<string, Set<number>>();
+  for (const file of new Set(hits.filter((hit) => hit.marker === 'ceo-mark' && !/\.(?:test|spec)\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/iu.test(hit.file)).map((hit) => hit.file))) {
+    const text = contents.get(file);
+    if (text === undefined || !fileSet.has(file)) continue;
+    const ranges = codeLiteralRanges(file, text);
+    const lines = new Set<number>();
+    let offset = 0;
+    text.split('\n').forEach((line, index) => {
+      const marks = [...line.matchAll(/\u{1F451}/gu)];
+      if (marks.length && marks.every((mark) => ranges.some(([from, to]) => offset + mark.index! >= from && offset + mark.index! + mark[0].length <= to))) lines.add(index + 1);
+      offset += line.length + 1;
+    });
+    classification.set(file, lines);
+  }
+  for (const hit of hits) {
+    if (hit.marker !== 'ceo-mark' || /\.(?:test|spec)\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/iu.test(hit.file)) { leaks.push(hit); continue; }
+    (classification.get(hit.file)?.has(hit.line) ? codeLiterals : leaks).push(hit);
+  }
+  return { leaks, codeLiterals };
+}
+
 /**
  * 🆕 `runtime-path-outside-export` — 공개되는 «코드»가 공개본에 «없는» 저장소 경로를 문자열로 쥐고 있다.
  * 계기: `docs/graph-templates/**` 가 허용 목록에서 빠져 공개본 영상 라인이 실행 중에 죽을 뻔했다(🅣 · `#20098`).
@@ -448,12 +487,13 @@ export function run(argv: readonly string[], root = resolve(import.meta.dir, '..
       }
       console.error(`exported ${files.length} files (+${Object.keys(config.replace).length} replaced) → ${target}`);
     }
-    const hits = [
+    const rawHits = [
       ...gitIgnoredExportFiles(root, files).filter(inScope).map((file) => ({ marker: 'export-gitignored', file, line: 0, text: '공개본 .gitignore 에 걸린다 — 커밋하면 사라진다' })),
       ...scanLeaks(root, scanned, LEAK_MARKERS, transformed.contents, realDocs),
       ...(redactions ? scanLeaks(root, scanned, privateIdentifierMarkers(redactions), transformed.contents, realDocs) : []),
       ...(!redactions && !noPrivateList ? [{ marker: 'private-identifiers-unchecked', file: privateRedactionsPath(), line: 0, text: 'private redaction list missing' }] : []),
     ];
+    const { leaks: hits, codeLiterals } = splitCodeLiteralCeoMarks(scanned, transformed.contents, rawHits);
     const advisory = scanRuntimePaths(root, files, tracked, transformed.contents).filter((h) => inScope(h.file));
     const summary = summarizeLeaks(hits);
     const advisorySummary = summarizeLeaks(advisory);
@@ -464,6 +504,7 @@ export function run(argv: readonly string[], root = resolve(import.meta.dir, '..
     if (json) {
       console.log(JSON.stringify({
         files: scanned.length, leaks: hits.length, summary, before: { leaks: before.length, summary: beforeSummary }, transforms: transformed.counts, privateRedactions,
+        codeLiterals: { hits: codeLiterals.length, summary: summarizeLeaks(codeLiterals), items: all ? codeLiterals : codeLiterals.slice(0, limit) },
         shownHits: shown.length, truncated, omittedHits: hits.length - shown.length,
         ...(pathPrefix ? { pathPrefix } : {}), hits: shown,
         advisory: { hits: advisory.length, summary: advisorySummary, judge: RUNTIME_PATH_JUDGE, items: all ? advisory : advisory.slice(0, limit) },
@@ -473,6 +514,7 @@ export function run(argv: readonly string[], root = resolve(import.meta.dir, '..
       console.log(`leak check — ${scanned.length} files${pathPrefix ? ` under ${pathPrefix}` : ''} · ${hits.length} hits`);
       for (const [marker, s] of Object.entries(summary)) console.log(`  ${marker.padEnd(20)} ${String(s.files).padStart(5)} files  ${String(s.hits).padStart(6)} lines`);
       for (const hit of shown) console.log(`  ${hit.marker}  ${hit.file}:${hit.line}  ${hit.text}`);
+      if (codeLiterals.length) console.log(`code literals (not document/comment leakage) — ceo-mark ${codeLiterals.length} lines`);
       if (truncated) console.log(`  … ${hits.length - shown.length} more hits not shown — use --all, or narrow with --path <prefix> (⛔ «not in this list» ≠ «no leak»)`);
       if (advisory.length) console.log(`advisory (not counted) — runtime-path-outside-export ${advisory.length} lines · ${advisorySummary['runtime-path-outside-export']?.files ?? 0} files · judge = ${RUNTIME_PATH_JUDGE}`);
     }

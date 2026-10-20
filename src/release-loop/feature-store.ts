@@ -8,7 +8,7 @@ import { CliUserError } from '../cli/cli-user-error.js';
 import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
 import { hqSeenGenerationPath, readHqLease, readSeenGeneration } from '../hq/hq.js';
-import { devVersion, type Checklist, type ChecklistHistory, type ChecklistItem } from './checklist.js';
+import { devVersion, withoutDispatchSkipLine, type Checklist, type ChecklistHistory, type ChecklistItem } from './checklist.js';
 
 export function validateVersion(version: string): void {
   if (!/^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/.test(version)) throw new CliUserError(`체크리스트 판이 아니다: ${version}`);
@@ -487,7 +487,7 @@ export function move(id: string, from: string, to: string, by: string, released 
     return result;
   } finally { db.close(); }
 }
-export function retitle(id: string, title: string, by: string, released = releasedVersion(), dev = devVersion()): void {
+export function retitle(id: string, title: string, by: string, released = releasedVersion(), dev = devVersion(), validate?: (item: ChecklistItem, version: string) => void): void {
   if (!title.trim()) throw new CliUserError('칸 제목이 비었다');
   importLegacyAll();
   const db = open();
@@ -500,10 +500,27 @@ export function retitle(id: string, title: string, by: string, released = releas
       if (!versions.length) throw new CliUserError(`없는 칸: ${id}`);
       const changed = versions.filter((row) => row.title !== title);
       if (!changed.length && old.title === title) return false;
+      // Retitle changes every assignment for this id. Validate every affected
+      // version under the same transaction before the first title write.
+      for (const { version } of changed) {
+        const item = snapshot(db, version, released, dev).items.find((entry) => entry.id === id);
+        if (item) validate?.(item, version);
+      }
       const at = new Date().toISOString();
       db.query('UPDATE features SET title = ? WHERE id = ?').run(title, id);
       db.query('UPDATE assignments SET title_override = NULL WHERE feature_id = ?').run(id);
       for (const { version, title: previousTitle } of changed) {
+        const raw = db.query('SELECT evidence FROM assignments WHERE feature_id = ? AND version = ?').get(id, version) as { evidence: string | null };
+        const last = db.query('SELECT "to" AS value FROM events WHERE feature_id = ? AND version = ? AND field = ? ORDER BY seq DESC LIMIT 1')
+          .get(id, version, 'dispatch-skip') as { value: string | null } | null;
+        const managedLine = last?.value ? JSON.parse(last.value) as string | null : null;
+        const priorEvidence = raw.evidence ?? '';
+        const nextEvidence = withoutDispatchSkipLine(priorEvidence, managedLine);
+        if (nextEvidence !== priorEvidence) {
+          db.query('UPDATE assignments SET evidence = ? WHERE feature_id = ? AND version = ?').run(nextEvidence || null, id, version);
+          record(db, version, { at, by, id, field: 'evidence', from: priorEvidence, to: nextEvidence, released, dev });
+          record(db, version, { at, by, id, field: 'dispatch-skip', from: managedLine, to: null, released, dev });
+        }
         db.query('UPDATE assignments SET updated_at = ?, updated_by = ? WHERE feature_id = ? AND version = ?').run(at, by, id, version);
         record(db, version, { at, by, id, field: 'title', from: previousTitle, to: title, released, dev });
       }

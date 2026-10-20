@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
-import { addItem, cellsReferencingDoc, claimItem, checklistGate, checklistHistory, cutChecklistGate, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
+import { addItem, cellsReferencingDoc, claimItem, checklistGate, checklistHistory, cutChecklistGate, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
 import * as features from './feature-store.js';
 
 const roots: string[] = [];
@@ -15,19 +15,65 @@ function root(): string { const dir = mkdtempSync(join(tmpdir(), 'release-checkl
 afterEach(() => { resetElanousConfigDir(); for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('release checklist ledger', () => {
+  const boundary = '\n- 완료 경계 코드: src/real.ts 변경\n- 완료 경계 실물: 설치본 호출\n- 완료 경계 증거 명령: bun test src/real.test.ts';
   test('CELL-PATH-GATE: shadow warning names missing origin/main paths and existing title/ref/merged PR candidates', () => {
-    const existing = new Set(['src/real.ts', 'src/ref.ts', 'src/merged.ts']);
-    const deps = { existsAtMain: (path: string) => existing.has(path), mergedPrFiles: (number: number) => number === 12345 ? ['src/merged.ts', 'src/gone.ts'] : [] };
-    const result = inspectChecklistTargetPaths({ title: '대상 경로: src/missing.ts · src/real.ts\n경계: src/ref.ts', evidence: '병합 #12345', refs: ['src/ref.ts#part'] }, deps);
+    const existing = new Set(['src/real.ts', 'src/ref.ts', 'src/merged.ts', 'src/view.vue', 'bin/eln', 'Makefile']);
+    const deps = {
+      existsAtMain: (path: string) => existing.has(path),
+      objectTypeAtMain: (path: string): 'blob' | 'tree' | null => path === 'src/release-loop' || path === 'src/example.ts' ? 'tree' : existing.has(path) ? 'blob' : null,
+      mergedPrFiles: (number: number) => number === 12345 ? ['src/merged.ts', 'src/gone.ts'] : [],
+    };
+    const result = inspectChecklistTargetPaths({ title: `대상 경로: src/missing.ts · src/real.ts\n경계: src/ref.ts${boundary}`, evidence: '병합 #12345', refs: ['src/ref.ts#part'] }, deps);
     expect(result.targets).toEqual(['src/missing.ts', 'src/real.ts']);
-    expect(result.warnings).toEqual(['src/missing.ts: origin/main에 없는 파일 · 신설: 둘째 줄 선언 필요']);
+    expect(result.warnings).toEqual(['src/missing.ts: origin/main에 없는 파일 · 신설: 줄에 해당 경로 선언 필요']);
     expect(result.candidates).toEqual(['src/real.ts', 'src/ref.ts', 'src/merged.ts']);
-    expect(inspectChecklistTargetPaths({ title: '작업 설명', refs: ['src/ref.ts'] }, deps).warnings).toEqual(['첫 줄 대상 경로가 없다']);
-    expect(inspectChecklistTargetPaths({ title: '대상 경로: src/missing.ts\n신설: src/missing.ts' }, deps).warnings).toEqual([]);
-    expect(inspectChecklistTargetPaths({ title: '대상 경로: src/missing.ts\n신설: 신규 모듈' }, deps).warnings).toEqual([]);
-    expect(inspectChecklistTargetPaths({ title: '대상 경로: src/missing.ts\n신설:' }, deps).warnings).toEqual([]);
-    expect(inspectChecklistTargetPaths({ title: '설명만 있음\n신설:' }, deps).warnings).toEqual(['첫 줄 대상 경로가 없다']);
+    expect(inspectChecklistTargetPaths({ title: `작업 설명${boundary}`, refs: ['src/ref.ts'] }, deps).warnings).toEqual(['첫 줄 대상 경로가 없다']);
+    expect(inspectChecklistTargetPaths({ title: `대상 경로: src/missing.ts\n신설: src/missing.ts${boundary}` }, deps).warnings).toEqual([]);
+    expect(inspectChecklistTargetPaths({ title: `대상 경로: src/missing.ts${boundary}\n신설: src/missing.ts` }, deps).warnings)
+      .toContain('신설: 선언은 제목 둘째 줄에만 둔다');
+    expect(inspectChecklistTargetPaths({ title: `대상 경로: src/missing.ts\n신설: 신규 모듈${boundary}` }, deps).warnings).toContain('src/missing.ts: origin/main에 없는 파일 · 신설: 줄에 해당 경로 선언 필요');
+    expect(inspectChecklistTargetPaths({ title: `대상 경로: src/missing.ts\n신설: src/missing.ts · 신규 모듈${boundary}` }, deps).warnings)
+      .toContain('신규 모듈: 신설: 경로가 첫 줄 대상에 없다');
+    expect(inspectChecklistTargetPaths({ title: `대상 경로: src/release-loop\n신설: src/release-loop${boundary}` }, deps).warnings)
+      .toContain('src/release-loop: origin/main의 디렉터리는 파일 대상이 아니다');
+    expect(inspectChecklistTargetPaths({ title: `대상 경로: src/example.ts\n신설: src/example.ts${boundary}` }, deps).warnings)
+      .toContain('src/example.ts: origin/main의 디렉터리는 파일 대상이 아니다');
+    expect(inspectChecklistTargetPaths({ title: `대상 경로: bin/new-tool\n신설: bin/new-tool${boundary}` }, deps).warnings).toEqual([]);
+    expect(inspectChecklistTargetPaths({ title: `대상 경로: new-tool\n신설: new-tool${boundary}` }, deps).warnings).toEqual([]);
+    expect(inspectChecklistTargetPaths({ title: `대상 경로: src/real.ts\n신설: src/real.ts${boundary}` }, deps).warnings).toContain('src/real.ts: 이미 있는 파일은 신설:에서 뺀다');
+    expect(inspectChecklistTargetPaths({ title: `대상 경로: src/view.vue · bin/eln · Makefile${boundary}` }, deps).warnings).toEqual([]);
+    expect(inspectChecklistTargetPaths({ title: `대상 경로: src/real.ts, src/ref.ts${boundary}` }, deps).warnings)
+      .toContain('src/real.ts, src/ref.ts: origin/main에 없는 파일 · 신설: 줄에 해당 경로 선언 필요');
+    expect(inspectChecklistTargetPaths({ title: `설명만 있음\n신설:${boundary}` }, deps).warnings).toEqual(['첫 줄 대상 경로가 없다', '신설: (빈 항목): 정확한 새 파일 경로가 아니다']);
+    expect(inspectChecklistTargetPaths({ title: '대상 경로: src/real.ts', dispatchKind: 'code' }, deps).warnings).toHaveLength(3);
     expect(inspectChecklistTargetPaths({ title: '운영 판정', dispatchKind: 'ops' }, deps).warnings).toEqual([]);
+  });
+
+  test('dispatcher skip evidence is atomic, idempotent, and bound to the rejected title', () => {
+    root();
+    addItem('9.9.9', { id: 'PATH', title: 'old title' });
+    setItem('9.9.9', 'PATH', { evidence: '사람 근거' }, 'TC');
+    noteDispatchSkip('9.9.9', 'PATH', 'src/a.ts (없음)', 'old title', 'OP');
+    noteDispatchSkip('9.9.9', 'PATH', 'src/a.ts (없음)', 'old title', 'OP');
+    expect(listChecklist('9.9.9').items.find((item) => item.id === 'PATH')?.evidence).toMatch(/^사람 근거\n디스패처 건너뜀 \[[a-f0-9]{16}\]: src\/a\.ts \(없음\)$/);
+    expect(checklistHistory('PATH').filter((entry) => entry.field === 'evidence')).toHaveLength(2);
+    expect(() => noteDispatchSkip('9.9.9', 'PATH', 'src/b.ts (이미 있음)', 'other title', 'OP'))
+      .toThrow('칸 제목이 바뀌어');
+    expect(listChecklist('9.9.9').items.find((item) => item.id === 'PATH')?.evidence).toContain('src/a.ts (없음)');
+  });
+
+  test('dispatcher note preserves human formatting and retitle removes only its managed line', () => {
+    root();
+    const human = '디스패처 건너뜀: 사람이 쓴 설명\n\n사람 근거\n';
+    addItem('9.9.9', { id: 'PATH', title: 'old title' });
+    setItem('9.9.9', 'PATH', { evidence: human }, 'TC');
+    noteDispatchSkip('9.9.9', 'PATH', 'missing file', 'old title', 'OP');
+    expect(listChecklist('9.9.9').items[0]?.evidence?.startsWith(human)).toBe(true);
+    features.retitle('PATH', 'new title', 'TC');
+    expect(listChecklist('9.9.9').items[0]).toMatchObject({ title: 'new title', evidence: human });
+    expect(() => noteDispatchSkip('9.9.9', 'PATH', 'new refusal', 'old title', 'OP'))
+      .toThrow('칸 제목이 바뀌어');
+    expect(listChecklist('9.9.9').items[0]?.evidence).toBe(human);
   });
 
   test('CELL-PATH-GATE: dispatch kind persists apart from screen/postpub and leaves release gates unchanged', () => {

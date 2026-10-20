@@ -1,0 +1,20 @@
+graph_id: green
+version: 1
+unit:
+  inputs: [ask, context, prior]
+  outputs: [result, evidence]
+  exits: [done, rework, needs-human, failed]
+entry_node: stage
+terminal_nodes: [done, rework, needs-human, failed]
+nodes:
+  - node_id: stage
+    kind: agent
+    recipe: 'cmd:stage'
+    max_visits: 1
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: rework, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: needs-human, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: stage, on: outcome, map: { done: done, rework: rework, needs-human: needs-human, failed: failed, fail: failed } }

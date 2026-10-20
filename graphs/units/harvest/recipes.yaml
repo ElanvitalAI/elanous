@@ -1,0 +1,4 @@
+harvest-review:
+  command: 'bun scripts/graph-harvest-unit.ts'
+  dry_run_command: 'bun scripts/graph-harvest-unit.ts --dry-run'
+  timeout_ms: 330000

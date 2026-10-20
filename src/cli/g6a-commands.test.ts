@@ -46,7 +46,25 @@ const beforeMove = [
 
 describe('G6a extracted command registrations', () => {
   test('matches pre-move top-level and child command names and all declared option flags', () => {
-    const probe = spawnSync(process.execPath, [new URL('./g6a-registration-probe.ts', import.meta.url).pathname], {
+    // Run registrar side effects in a child without retaining a production CLI probe.
+    const script = `
+      import { Command } from 'commander';
+      import { registerLogsCommands } from './src/cli/logs-cli.ts';
+      import { registerDocsCommands } from './src/cli/docs-cli.ts';
+      import { registerFleetCommands } from './src/cli/fleet-cli.ts';
+      const root = new Command();
+      registerLogsCommands(root);
+      registerDocsCommands(root);
+      registerFleetCommands(root);
+      console.log(JSON.stringify(root.commands.map(command => ({
+        name: command.name(),
+        flags: command.options.map(option => option.flags),
+        children: command.commands.map(child => ({
+          name: child.name(), flags: child.options.map(option => option.flags),
+        })),
+      }))));
+    `;
+    const probe = spawnSync(process.execPath, ['-e', script], { cwd: new URL('../..', import.meta.url).pathname,
       encoding: 'utf8',
     });
     expect(probe.status).toBe(0);

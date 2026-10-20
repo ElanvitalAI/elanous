@@ -109,7 +109,7 @@ describe('shell-primitive audit-log: programmatic sink', () => {
 
   test('run event includes truncated when output exceeds budget', async () => {
     await runShell({
-      command: ['sh', '-c', 'printf "%.0s." {1..1000}'],
+      command: ['bash', '-c', 'printf "%.0s." {1..1000}'],
       cwd,
       maxOutputChars: 50,
     });

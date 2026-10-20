@@ -1,4 +1,5 @@
 import type { Database } from 'bun:sqlite';
+import { hostname } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { debug } from '../debug/log.js';
 import { calendarFields, resolveTimeZone } from '../time/format.js';
@@ -16,6 +17,43 @@ export interface GuardianDeps {
   config?: { guardian?: { mode?: 'shadow' | 'live' } };
   /** Inject a cron-run-compatible executor in tests; shadow never calls it. */
   execute?: (command: string) => Promise<SpawnOutcome>;
+  /** Injected only for deterministic expiry-alert tests. Production reads the local Grok auth file. */
+  grokExpiry?: () => string | null;
+  hostName?: string;
+}
+
+export const GROK_EXPIRY_ALERT_WINDOW_MS = 4 * 60 * 60 * 1000;
+
+function durationLabel(ms: number): string {
+  const minutes = Math.max(0, Math.ceil(ms / 60_000));
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return hours ? `${hours}h${String(rest).padStart(2, '0')}m` : `${rest}m`;
+}
+
+/** Return a token-free alert line only when expiry is within four hours (or already past). */
+export function grokExpiryAlertLine(opts: {
+  now: Date; expiresAt: string | null; host?: string;
+}): string | null {
+  if (!opts.expiresAt) return null;
+  const expiresAtMs = Date.parse(opts.expiresAt);
+  if (!Number.isFinite(expiresAtMs)) return null;
+  const remainingMs = expiresAtMs - opts.now.getTime();
+  if (remainingMs > GROK_EXPIRY_ALERT_WINDOW_MS) return null;
+  return `Grok 자격 만료 경보 · host=${opts.host ?? hostname()} · expires=${new Date(expiresAtMs).toISOString()} · remaining=${remainingMs <= 0 ? '만료됨' : durationLabel(remainingMs)} · device-auth=https://accounts.x.ai/oauth2/device · 코드 생성/Allow는 OP(grok login --device-auth)`;
+}
+
+export function grokExpiryStatusLine(opts: {
+  now: Date; expiresAt: string | null; host?: string;
+}): string {
+  const host = opts.host ?? hostname();
+  if (!opts.expiresAt) return `Grok 자격 만료 확인 · host=${host} · expires=unknown · alert=not-set`;
+  const expiresAtMs = Date.parse(opts.expiresAt);
+  if (!Number.isFinite(expiresAtMs)) return `Grok 자격 만료 확인 · host=${host} · expires=invalid · alert=not-set`;
+  const remainingMs = expiresAtMs - opts.now.getTime();
+  const remaining = remainingMs <= 0 ? '만료됨' : durationLabel(remainingMs);
+  const alert = remainingMs <= GROK_EXPIRY_ALERT_WINDOW_MS ? 'active' : `in ${durationLabel(remainingMs - GROK_EXPIRY_ALERT_WINDOW_MS)}`;
+  return `Grok 자격 만료 확인 · host=${host} · expires=${new Date(expiresAtMs).toISOString()} · remaining=${remaining} · 4h-alert=${alert}`;
 }
 
 function shellQuote(value: string): string {
@@ -45,9 +83,23 @@ function liveCommand(jobId: string, raw: string): string {
 }
 
 /** One five-minute guardian observation. No schedule state or crontab is mutated in shadow mode. */
-export async function guardianTick(now: Date, plan: GuardianPlan, deps: GuardianDeps = {}): Promise<{ mode: 'shadow' | 'live'; wouldRun: string[]; executed: number }> {
+export async function guardianTick(now: Date, plan: GuardianPlan, deps: GuardianDeps = {}): Promise<{ mode: 'shadow' | 'live'; wouldRun: string[]; executed: number; credentialAlert?: string }> {
   if (!Number.isFinite(now.getTime())) throw new RangeError('invalid tick time');
   const mode = deps.config?.guardian?.mode === 'live' ? 'live' : 'shadow';
+  let expiryLine: string | null = null;
+  try {
+    const expiryAt = deps.grokExpiry ? deps.grokExpiry() : (await import('../grok/credential.js')).readGrokSubscriptionExpiry();
+    expiryLine = grokExpiryAlertLine({
+      now,
+      expiresAt: expiryAt,
+      ...(deps.hostName ? { host: deps.hostName } : {}),
+    });
+    if (expiryLine) debug.log('guardian.credential-expiry', 'warning', { line: expiryLine });
+  } catch (error) {
+    debug.log('guardian.credential-expiry', 'read-failed', {
+      errorName: error instanceof Error ? error.name : 'unknown',
+    });
+  }
   const timeZone = plan.timeZone ?? resolveTimeZone().timeZone;
   const wouldRun: string[] = [];
   let executed = 0;
@@ -64,7 +116,7 @@ export async function guardianTick(now: Date, plan: GuardianPlan, deps: Guardian
       if (outcome.code !== 0) throw new Error(`guardian job ${job.id} exited ${outcome.code}`);
     }
   }
-  return { mode, wouldRun, executed };
+  return { mode, wouldRun, executed, ...(expiryLine ? { credentialAlert: expiryLine } : {}) };
 }
 
 export interface GuardianDayDeps {

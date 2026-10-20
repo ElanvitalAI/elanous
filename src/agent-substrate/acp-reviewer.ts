@@ -55,6 +55,9 @@ export interface AcpReviewerOpts {
  */
 export const DEFAULT_REVIEW_BACKEND = 'codex';
 
+/** Stable failureReason prefix carried through reviewPullRequest's fail-soft result. */
+export const GROK_ACP_REVIEW_TIMEOUT = 'ACP_REVIEW_TIMEOUT:grok:';
+
 // ACP ToolKind(zToolKind) 중 read-only(부작용 없음) — 리뷰어에게 허가할 계열.
 const READONLY_TOOL_KINDS = new Set(['read', 'search', 'fetch', 'think', 'switch_mode']);
 // 명시적 변경/실행 계열 — 리뷰(read-only)에선 절대 불허.
@@ -84,7 +87,7 @@ const TOOL_REVIEW_PREAMBLE = [
  *  - model 지정 시 selectSessionModel 로 tier 고정(picked 관측).
  *  - ⭐auto-allow permission approver — 리뷰어의 read-only 툴콜을 무조건 허가(대표 지시)해 Read 반복거부
  *    정체를 원천제거. 각 허가는 debug.log 로 각인(제1원칙 관측 관문 — 자동승인은 관측되는 결정).
- *  - timeout: 초과 시 cancel→throw. 오류/타임아웃은 각인 후 rethrow → reviewPullRequest 가 fail-soft
+ *  - timeout: 초과 시 실패를 확정하고 cancel·stop. 오류/타임아웃은 각인 후 rethrow → reviewPullRequest 가 fail-soft
  *    (reviewed=false)로 흡수, CLI 가 reviewed=false 를 "리뷰 실패"로 표면화(부분결과 오판 pass 방지). */
 export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images?: readonly ReviewImage[]) => Promise<string> {
   return async (prompt: string, images?: readonly ReviewImage[]): Promise<string> => {
@@ -117,8 +120,13 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
       model: opts.model ?? '(default)',
       promptChars: prompt.length,
     });
+    const startedAt = Date.now();
+    let phase = 'spawn';
+    let phaseStartedAt = startedAt;
+    const enterPhase = (next: string): void => { phase = next; phaseStartedAt = Date.now(); };
     let allowed = 0;
     let denied = 0;
+    const observedToolCalls = new Set<string>();
     let capabilitiesObserved = false;
     const agentOpts: Omit<AcpAgentOpts, 'backendId'> = {
       cwd: opts.cwd,
@@ -149,10 +157,12 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
     };
     // A review owns its manager and subprocess: the global manager caches
     // chat agents, whose callbacks and lifecycle must not be mutated here.
-    const reviewManager = injected || opts.backendSpec ? undefined : new AcpAgentManager();
+    // Grok's start can hang before the manager registers the subprocess;
+    // own it directly so the handshake timeout can stop that child.
+    const directAgent = injected || Boolean(opts.backendSpec) || backend === 'grok';
+    const reviewManager = directAgent ? undefined : new AcpAgentManager();
     let agent: AcpAgent | undefined;
     let text = '';
-    let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const handshakeTimeoutMs = opts.handshakeTimeoutMs ?? Math.min(timeoutMs, 60_000);
     const handshakeDeadline = Date.now() + handshakeTimeoutMs;
@@ -165,9 +175,16 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
     })]).finally(() => { if (handshakeTimer) clearTimeout(handshakeTimer); });
     try {
       if (opts.createAgent) agent = opts.createAgent({ backendId: requestedBackend, ...agentOpts });
-      else if (opts.backendSpec) agent = new AcpAgent({ backendId: requestedBackend, ...agentOpts });
-      else agent = await withinHandshake(reviewManager!.getAgent(requestedBackend, agentOpts));
-      if (injected || opts.backendSpec) await withinHandshake(agent.start());
+      else if (directAgent) agent = new AcpAgent({ backendId: requestedBackend, ...agentOpts });
+      else {
+        // getAgent owns both spawn and initialize; neither step is independently observable here.
+        enterPhase('spawn-initialize');
+        agent = await withinHandshake(reviewManager!.getAgent(requestedBackend, agentOpts));
+      }
+      if (directAgent) {
+        enterPhase(injected ? 'initialize' : 'spawn-initialize');
+        await withinHandshake(agent.start());
+      }
       if (!capabilitiesObserved) {
         try {
           debug.log('acp-review', 'capabilities', {
@@ -181,12 +198,14 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
           // Observability must not interrupt a review.
         }
       }
+      enterPhase('session-new');
       const sid = await withinHandshake(agent.newSession());
       if (opts.model) {
+        enterPhase('model-select');
         const picked = await withinHandshake(agent.selectSessionModel(sid, opts.model));
         debug.log('acp-review', 'model', { requested: opts.model, picked: picked?.name ?? null, backend });
       }
-      timer = setTimeout(() => { timedOut = true; agent!.cancel(sid).catch(() => { /* noop */ }); }, timeoutMs);
+      enterPhase('prompt');
       // ⭐⭐ `P4b` 멀티미디어 — 이미지를 «별도 ContentBlock» 으로 싣는다.
       //   ⛔ 광고를 «먼저 본다** — 백엔드가 image 를 안 받는다고 말하면 안 보낸다. 보내 봐야
       //      거절이 이 층보다 훨씬 읽기 어려운 자리에서 나고, 그 거절은 리뷰 실패로 보인다.
@@ -211,23 +230,44 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
           // Observation must not prevent the review from running.
         }
       }
-      await agent.prompt(sid, [{ type: 'text', text: TOOL_REVIEW_PREAMBLE + prompt }, ...imageBlocks], (u) => {
+      const promptAttempt = agent.prompt(sid, [{ type: 'text', text: TOOL_REVIEW_PREAMBLE + prompt }, ...imageBlocks], (u) => {
+        if (u.sessionUpdate === 'tool_call' || u.sessionUpdate === 'tool_call_update') {
+          observedToolCalls.add(u.toolCallId);
+        }
         if (u.sessionUpdate === 'agent_message_chunk') {
           const c = u.content;
           if (c.type === 'text' && c.text) text += c.text;
         }
       });
-      if (timedOut) throw new Error(`ACP 리뷰 타임아웃(${timeoutMs}ms·툴콜 ${allowed})`);
+      // Do not rely on cancel causing prompt() to settle: a stalled ACP child may never answer it.
+      await Promise.race([promptAttempt, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          // Commit the timeout before cancel can settle prompt with a partial response.
+          reject(new Error(backend === 'grok'
+            ? `${GROK_ACP_REVIEW_TIMEOUT} ${timeoutMs}ms·툴콜 ${observedToolCalls.size}`
+            : `ACP 리뷰 타임아웃(${timeoutMs}ms·툴콜 ${allowed})`));
+          void agent!.cancel(sid).catch(() => { /* noop */ });
+        }, timeoutMs);
+      })]);
     } catch (e) {
-      debug.log('acp-review', 'error', { backend, model: opts.model ?? '(default)', message: (e as Error).message }, { level: 'error' });
-      throw e;
+      const message = (e as Error).message;
+      const handshakeTimeout = message.startsWith('ACP handshake timeout (');
+      const failure = backend === 'grok' && handshakeTimeout
+        ? new Error(`${GROK_ACP_REVIEW_TIMEOUT} ${message}`) : e;
+      const timeout = message.startsWith(GROK_ACP_REVIEW_TIMEOUT) || message.startsWith('ACP 리뷰 타임아웃(') || handshakeTimeout;
+      debug.log('acp-review', 'error', {
+        backend, provider: backend, model: opts.model ?? '(default)', message: (failure as Error).message,
+        phase, elapsedMs: Date.now() - startedAt, phaseElapsedMs: Date.now() - phaseStartedAt,
+        toolCalls: observedToolCalls.size, allowed, denied, ...(timeout ? { classification: phase === 'prompt' && observedToolCalls.size === 0 ? 'pre-tool-timeout' : 'acp-timeout' } : {}),
+      }, { level: 'error' });
+      throw failure;
     } finally {
       if (timer) clearTimeout(timer);
       // Both paths are review-owned: injected agents retain their direct
       // cleanup seam, while the per-review manager releases its agents and
       // process hooks. An injected agent is external to the manager.
       try {
-        if (injected || opts.backendSpec) await agent?.stop();
+        if (directAgent) await agent?.stop();
         else await reviewManager!.dispose();
       } catch (e) {
         debug.log('acp-review', 'stop-fail', { backend, message: (e as Error).message }, { level: 'error' });

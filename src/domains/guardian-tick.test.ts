@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import { debug } from '../debug/log.js';
 import { openSchedulesDb } from './schedule-registry.js';
 import { ensureScheduleRunsSchema, recordScheduleRun } from './schedule-runs.js';
-import { guardianShadowDay, guardianTick, type GuardianPlan } from './guardian-tick.js';
+import { GROK_EXPIRY_ALERT_WINDOW_MS, grokExpiryAlertLine, grokExpiryStatusLine, guardianShadowDay, guardianTick, type GuardianPlan } from './guardian-tick.js';
 
 const plan: GuardianPlan = { timeZone: 'Asia/Seoul', jobs: [
   { id: 'dawn', cron: '0 4 * * *', command: 'bun scripts/cron-run.ts --schedule-id dawn scripts/dawn.ts', enabled: 1, source: 'crontab', run_via: 'crontab' },
@@ -12,6 +12,48 @@ const plan: GuardianPlan = { timeZone: 'Asia/Seoul', jobs: [
 const kst = (hour: number, minute = 0) => new Date(Date.UTC(2026, 9, 7, hour - 9, minute));
 
 describe('GUARD-ONE-a shadow tick', () => {
+  test('Grok expiry alert starts at four hours and contains host/time without credential material', async () => {
+    const now = kst(14);
+    const expiresAt = new Date(now.getTime() + GROK_EXPIRY_ALERT_WINDOW_MS).toISOString();
+    const line = grokExpiryAlertLine({ now, expiresAt, host: 'node-c' });
+    expect(line).toContain('host=node-c');
+    expect(line).toContain('remaining=4h00m');
+    expect(line).toContain('device-auth=https://accounts.x.ai/oauth2/device');
+    expect(line).toContain('코드 생성/Allow는 OP(grok login --device-auth)');
+    expect(grokExpiryAlertLine({ now, expiresAt: new Date(now.getTime() + GROK_EXPIRY_ALERT_WINDOW_MS + 1).toISOString() })).toBeNull();
+    expect(grokExpiryAlertLine({ now, expiresAt: null })).toBeNull();
+    expect(grokExpiryStatusLine({ now, expiresAt, host: 'node-c' })).toContain('4h-alert=active');
+    expect(grokExpiryStatusLine({ now, expiresAt: new Date(now.getTime() + GROK_EXPIRY_ALERT_WINDOW_MS + 1).toISOString(), host: 'node-c' }))
+      .toContain('4h-alert=in 1m');
+    expect(grokExpiryStatusLine({ now, expiresAt: null, host: 'node-c' })).toContain('expires=unknown');
+
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = await guardianTick(now, { ...plan, jobs: [] }, {
+        grokExpiry: () => expiresAt, hostName: 'node-c',
+      });
+      expect(result.credentialAlert === line).toBe(true);
+      expect(log.mock.calls.some(([category, event, data]) => category === 'guardian.credential-expiry'
+        && event === 'warning' && JSON.stringify(data).includes('host=node-c'))).toBe(true);
+    } finally { log.mockRestore(); }
+  });
+
+  test('Grok expiry read failure is logged without stopping scheduled guardian work', async () => {
+    let executed = 0;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = await guardianTick(kst(4), plan, {
+        config: { guardian: { mode: 'live' } },
+        grokExpiry: () => { throw new Error('credential path unavailable'); },
+        execute: async () => { executed++; return { code: 0, ms: 1 }; },
+      });
+      expect(result.executed).toBe(1);
+      expect(executed).toBe(1);
+      expect(log.mock.calls.some(([category, event, data]) => category === 'guardian.credential-expiry'
+        && event === 'read-failed' && JSON.stringify(data) === '{"errorName":"Error"}')).toBe(true);
+    } finally { log.mockRestore(); }
+  });
+
   test('04:00→1, 08:30→1, 05:00→0 with no injected execution, even on a nonmatch', async () => {
     let executions = 0;
     const execute = async () => { executions++; return { code: 0, ms: 0 }; };

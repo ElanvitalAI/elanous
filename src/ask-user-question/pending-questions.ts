@@ -161,8 +161,8 @@ function pendingQuestionAnswerPath(id: string, root?: string): string {
 }
 
 function writeAtomicRecord(id: string, value: unknown, dir: string, target: string, deps: PendingQuestionStoreDeps): void {
-  const temp = join(dir, `.${encodeURIComponent(id)}.${process.pid}.${(deps.now ?? (() => new Date()))().getTime()}.${Math.random().toString(36).slice(2)}.tmp`);
   assertNotTestWritingOps(target, 'write a pending question record');
+  const temp = join(dir, `.${encodeURIComponent(id)}.${process.pid}.${(deps.now ?? (() => new Date()))().getTime()}.${Math.random().toString(36).slice(2)}.tmp`);
   const remove = deps.removeFile ?? rmSync;
   try {
     (deps.makeDir ?? mkdirSync)(dir, { recursive: true });

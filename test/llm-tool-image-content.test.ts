@@ -210,6 +210,21 @@ describe('toOpenAIMessages — image-bearing tool_result fallback', () => {
 });
 
 describe('messagesToResponsesInput (Codex) — image-bearing tool_result fallback', () => {
+  test('drops a tool result whose call is absent from the retained history and reports the dropped call', () => {
+    const dropped: string[] = [];
+    const messages: LLMMessage[] = [
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_orphan', content: 'old output' }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'call_live', name: 'Read', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_live', content: 'current output' }] },
+    ];
+
+    const out = messagesToResponsesInput(messages, { onOrphanToolResult: (callId) => dropped.push(callId) });
+    expect(dropped).toEqual(['call_orphan']);
+    expect(out.input.filter((item) => 'type' in item && item.type === 'function_call_output'))
+      .toEqual([{ type: 'function_call_output', call_id: 'call_live', output: 'current output' }]);
+    expect(out.input.some((item) => 'type' in item && item.type === 'function_call' && item.call_id === 'call_live')).toBe(true);
+  });
+
   test('function_call_output.output is text-only string', () => {
     const messages: LLMMessage[] = [
       // matching tool_use so the orphan guard doesn't drop the tool_result

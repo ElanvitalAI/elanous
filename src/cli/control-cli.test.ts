@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DEFAULT_CONTROL_PORT, ensureControlTokens } from '../control-plane/server.js';
+import { issueMemberToken } from '../control-plane/member-tokens.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -348,6 +349,60 @@ test('control serve follows the lease only when opted in', async () => {
     else process.env.ELANOUS_STATE_DIR = previous;
   }
 }, 15_000);
+
+async function withHqControl(readHq: NonNullable<Parameters<typeof runControlServe>[0]['readHq']>,
+  check: (port: string, dir: string) => Promise<void>): Promise<void> {
+  const dir = root();
+  const previous = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = dir;
+  const lines: string[] = [];
+  const log = spyOn(console, 'log').mockImplementation(line => { lines.push(String(line)); });
+  const controller = new AbortController();
+  const active = runControlServe({ port: '0', followHqLease: true, machine: 'role-alias', hqHostName: 'mbp', readHq, signal: controller.signal });
+  try {
+    for (let n = 0; n < 100 && lines.length === 0; n++) await Bun.sleep(10);
+    const line = lines[0]!;
+    expect(line).toContain('HQ 임대 따름 · 나=mbp');
+    await check(/관제부 127\.0\.0\.1:(\d+)/.exec(line)![1]!, dir);
+  } finally {
+    controller.abort();
+    await active;
+    log.mockRestore();
+    if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previous;
+  }
+}
+
+const warmWorker = { workerId: 'warm-1', machine: 'mbp', podUid: 'warm-pod-uid-1',
+  key: { context: 'mbp', imageDigest: 'sha256:image', lockHash: 'lock', architecture: 'arm64' }, ttlMs: 30_000 };
+const registerWarm = (port: string, dir: string) => fetch(`http://127.0.0.1:${port}/v1/workers/pod`, {
+  method: 'POST', headers: { authorization: `Bearer ${issueMemberToken('mbp', dir)}`, 'content-type': 'application/json' },
+  body: JSON.stringify(warmWorker),
+});
+
+test('control serve HQ lease holder=this host permits warm worker registration', async () => {
+  await withHqControl(() => ({ record: { holder: 'mbp', generation: 4, acquiredAt: 1, renewedAt: 2, ttlSeconds: 60 }, ageSeconds: 0, expired: false }),
+    async (port, dir) => {
+      const response = await registerWarm(port, dir);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('x-primary-generation')).toBe('4');
+    });
+});
+
+test('control serve HQ lease unreadable rejects warm worker registration', async () => {
+  await withHqControl(() => { throw new Error('unreadable'); }, async (port, dir) => {
+    const response = await registerWarm(port, dir);
+    expect(response.status).toBe(409);
+  });
+});
+
+test('control serve HQ lease held by another host rejects warm worker registration', async () => {
+  await withHqControl(() => ({ record: { holder: 'node-b', generation: 5, acquiredAt: 1, renewedAt: 2, ttlSeconds: 60 }, ageSeconds: 0, expired: false }),
+    async (port, dir) => {
+      const response = await registerWarm(port, dir);
+      expect(response.status).toBe(409);
+    });
+});
 
 test('real CLI also stops on SIGINT', async () => {
   const { child, port } = await serve(root());

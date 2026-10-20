@@ -485,6 +485,12 @@ edges:
     to: decompose
 
   # ⭐ 실행 칸(substrate)이 «Pod 쪽 세 노드»를 켜고 끈다 — local 은 곧장 구현.
+  # ARG L1 r1: 생산 경로가 낸 substrate=pod 관측을 같은 조건 파서로 평가한다.
+  # 아래 기존 map 은 조건 미관측·모호성 때의 안전한 기본 경로다.
+  - from: decompose
+    when: substrate == pod
+    to: pool-admit
+
   - from: decompose
     on: substrate
     map:

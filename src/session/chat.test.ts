@@ -6,6 +6,7 @@ import type { LLMMessage, LLMOpts, LLMProvider, LLMToolSpec, StreamWithToolsHand
 import type { CoreTurnDispatchTool } from '../core-turn/index.js';
 import { PTY_BUDGET_GRANT, TERMINAL_MISSION_DISCIPLINE } from '../agent/terminal-surface.js';
 import * as actualMemory from '../memory.js';
+import { debug } from '../debug/log.js';
 
 const streamCalls: Array<{
   messages: LLMMessage[];
@@ -63,13 +64,13 @@ function tool(name: string): LLMToolSpec {
   };
 }
 
-function testConfig(provider: LLMProvider) {
+function testConfig(provider: LLMProvider, goalLoopEnabled = false) {
   return {
     llm: {
       provider: provider.name,
       model: provider.defaultModel,
       memoryJudge: { enabled: false, crossRecall: false },
-      goalLoop: { enabled: false },
+      goalLoop: { enabled: goalLoopEnabled },
     },
   } as never;
 }
@@ -82,8 +83,10 @@ async function runToolTurn(
     goalLoop?: boolean;
     goalLoopMaxIterations?: number;
     dispatchTool?: CoreTurnDispatchTool;
+    goalLoopConfigEnabled?: boolean;
+    sessionId?: string;
   },
-): Promise<void> {
+): Promise<string> {
   const provider: LLMProvider = {
     name: 'test-provider',
     defaultModel: 'test-model',
@@ -92,12 +95,14 @@ async function runToolTurn(
     async *streamChat() { yield { type: 'text', delta: 'plain' } as const; },
   };
   activeProvider = provider;
-  const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
+  const session = extra?.sessionId
+    ? { id: extra.sessionId }
+    : createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
   const dispatchTool: CoreTurnDispatchTool = extra?.dispatchTool ?? (async (name) => name === 'PtyShellScreenshot'
     ? { output: 'captured', _imageFile: '/tmp/nonexistent-chat-test.png' }
     : { ok: true });
   await runTurn({
-    userConfig: testConfig(provider),
+    userConfig: testConfig(provider, extra?.goalLoopConfigEnabled === true),
     sessionId: session.id,
     userText: extra?.userText ?? 'hello',
     systemPrompt: 'base prompt',
@@ -111,6 +116,7 @@ async function runToolTurn(
       ? { goalLoopMaxIterations: extra.goalLoopMaxIterations }
       : {}),
   });
+  return session.id;
 }
 
 describe('session chat terminal-capable turns', () => {
@@ -266,5 +272,153 @@ describe('session chat dispatchTool ctx forwarding', () => {
 
     expect(recorded.length).toBeGreaterThan(0);
     expect(recorded[0]?.userText).toBe(human);
+  });
+});
+
+describe('session chat child context composition', () => {
+  let sessionRoot: string;
+
+  afterEach(() => {
+    streamCalls.length = 0;
+    activeProvider = undefined;
+    nextDispatchCtx = OMIT_DISPATCH_CTX;
+    if (sessionRoot) rmSync(sessionRoot, { recursive: true, force: true });
+    delete process.env.ELANOUS_SESSION_ROOT;
+    delete process.env.ELANOUS_HARNESS_SPACE;
+    delete process.env.ELANOUS_HARNESS_SPACE_ID;
+    delete process.env.ELANOUS_PROMPT_BUDGET;
+  });
+
+  function compositionEvents() {
+    return debug
+      .events(500)
+      .filter((ev) => ev.category === 'self-implement' && ev.event === 'child.context-composition');
+  }
+
+  async function runGuardedTurn<T>(turn: () => Promise<T>): Promise<T> {
+    const previousGuard = debug.setLogDietGuard(null);
+    try {
+      return await turn();
+    } finally {
+      debug.setLogDietGuard(previousGuard);
+    }
+  }
+
+  test('implementation child first goal-loop turn records exactly one composition event', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-composition-child-first-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    process.env.ELANOUS_HARNESS_SPACE = 'self-implement';
+    process.env.ELANOUS_HARNESS_SPACE_ID = 'chat-composition-first';
+    debug.clear();
+    const goalText = 'wire the child context budget instrumentation';
+    const readTool = tool('Read');
+    await runGuardedTurn(() => runToolTurn([readTool], undefined, {
+      userText: goalText,
+      goalLoop: true,
+      goalLoopMaxIterations: 1,
+    }));
+
+    expect(streamCalls.length).toBeGreaterThan(0);
+    const fired = compositionEvents();
+    expect(fired).toHaveLength(1);
+    const composition = fired[0]?.data as {
+      profile: string;
+      components: Record<string, { inputBytes: number; includedBytes: number; truncated: boolean }>;
+    };
+    expect(composition.profile).toBe('default');
+    expect(composition.components.systemPrompt.inputBytes).toBe(Buffer.byteLength('base prompt'));
+    expect(composition.components.systemPrompt.includedBytes).toBe(Buffer.byteLength('base prompt'));
+    expect(composition.components.systemPrompt.truncated).toBe(false);
+    expect(composition.components.toolSchemas.inputBytes).toBe(Buffer.byteLength(JSON.stringify([readTool])));
+    expect(composition.components.toolSchemas.truncated).toBe(false);
+    expect(composition.components.goal.inputBytes).toBe(Buffer.byteLength(goalText));
+    expect(composition.components.goal.truncated).toBe(false);
+    expect(composition.components.agentsMd.inputBytes).toBe(0);
+    expect(composition.components.claudeMd.inputBytes).toBe(0);
+    expect(composition.components.ledger.inputBytes).toBe(0);
+  });
+
+  test('implementation child with the lean prompt budget records the small profile', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-composition-child-lean-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    process.env.ELANOUS_HARNESS_SPACE = 'self-implement';
+    process.env.ELANOUS_HARNESS_SPACE_ID = 'chat-composition-lean';
+    process.env.ELANOUS_PROMPT_BUDGET = 'lean';
+    debug.clear();
+    await runGuardedTurn(() => runToolTurn([tool('Read')], undefined, {
+      userText: 'measure the lean child context budget',
+      goalLoop: true,
+      goalLoopMaxIterations: 1,
+    }));
+
+    expect(streamCalls.length).toBeGreaterThan(0);
+    const fired = compositionEvents();
+    expect(fired).toHaveLength(1);
+    const composition = fired[0]?.data as { profile: string };
+    expect(composition.profile).toBe('small');
+  });
+
+  test('second goal-loop turn in the same child session does not re-emit the composition event', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-composition-child-second-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    process.env.ELANOUS_HARNESS_SPACE = 'self-implement';
+    process.env.ELANOUS_HARNESS_SPACE_ID = 'chat-composition-second';
+    debug.clear();
+    const firstSessionId = await runGuardedTurn(() => runToolTurn([tool('Read')], undefined, {
+      userText: 'first goal-loop turn of the child session',
+      goalLoop: true,
+      goalLoopMaxIterations: 1,
+    }));
+    expect(compositionEvents()).toHaveLength(1);
+    await runGuardedTurn(() => runToolTurn([tool('Read')], undefined, {
+      userText: 'follow-up goal-loop turn of the same child session',
+      goalLoop: true,
+      goalLoopMaxIterations: 1,
+      sessionId: firstSessionId,
+    }));
+
+    expect(streamCalls.length).toBeGreaterThan(0);
+    expect(compositionEvents()).toHaveLength(1);
+  });
+
+  test('implementation child ordinary tool turn without goal-loop arming emits no composition event', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-composition-child-unarmed-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    process.env.ELANOUS_HARNESS_SPACE = 'self-implement';
+    process.env.ELANOUS_HARNESS_SPACE_ID = 'chat-composition-unarmed';
+    debug.clear();
+    await runGuardedTurn(() => runToolTurn([tool('Read')]));
+
+    expect(streamCalls.length).toBeGreaterThan(0);
+    expect(compositionEvents()).toHaveLength(0);
+  });
+
+  test('ordinary non-child goal-loop-armed chat emits no composition event', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-composition-ordinary-goal-loop-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    debug.clear();
+    await runGuardedTurn(() => runToolTurn([tool('Read')], undefined, {
+      userText: 'ordinary user goal-loop turn outside the child space',
+      goalLoop: true,
+      goalLoopMaxIterations: 1,
+    }));
+    await runGuardedTurn(() => runToolTurn([tool('Read')], undefined, {
+      userText: 'ordinary config-enabled goal-loop turn outside the child space',
+      goalLoopMaxIterations: 1,
+      goalLoopConfigEnabled: true,
+    }));
+
+    expect(streamCalls.length).toBeGreaterThan(0);
+    expect(compositionEvents()).toHaveLength(0);
+  });
+
+  test('emits no composition event on ordinary tool turns', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-composition-ordinary-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    debug.clear();
+    await runGuardedTurn(() => runToolTurn([tool('Read')]));
+
+    expect(streamCalls.length).toBeGreaterThan(0);
+    expect(compositionEvents()).toHaveLength(0);
   });
 });

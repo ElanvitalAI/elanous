@@ -5,6 +5,9 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { GRAPH_SPECS } from '../self-implement/graph-templates.js';
+import type { GraphOverlaySpec } from '../self-implement/graph-overlay-yaml.js';
+import { setJourneyOverlaysForTesting } from '../self-dev/graph-journey-route.js';
 import { superviseRun, type SupervisorJobResult, type SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import { executeNextAction } from './actions.js';
 import { defaultPrFiles, prRepositoryFromUrl, recordTaskAgentShadowMove, replayRemoteCardMoves, REMOTE_CARD_MOVE_PENDING, selectDeliveryCandidates, shadowJudgeInput } from './shadow.js';
@@ -398,6 +401,55 @@ describe('TASK-AGENT-SHADOW — 멈춤 확정 → 판단부 → 실행부(shadow
     expect(commands[0]!.slice(0, 2)).toEqual(['harness', 'say']);
     expect(commands[0]![2]).toStartWith('feature ask');
     expect(loadChecks).toBe(1);
+  });
+
+  test('narrow·salvage liveMoves each take the graph next-move → dispatch edge only after a successful command', async () => {
+    const edges: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'ta-terminal-next-move-edge-test', emit: (record) => {
+      if (record.category === 'self-implement' && record.event === 'graph-edge-taken') edges.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      const commands: string[][] = [];
+      for (const [stopReason, result, move] of [
+        ['no-progress', job(), 'narrow-relaunch'],
+        ['handed-off-to-salvage', job({ salvage: 'launched' }), 'salvage-relaunch'],
+      ] as const) {
+        const out = await recordTaskAgentShadowMove({ runId: `run-${move}`, stopReason, results: [result] }, {
+          env: {}, readCard: () => undefined, log: () => {}, liveMoves: new Set([move]),
+          loadGate: { loadMax: 2, load1: () => 0.5 },
+          command: async (args) => { commands.push(args); return { status: 0, stdout: '' }; },
+        });
+        expect(out).toMatchObject({ move, executorResult: 'done' });
+      }
+      expect(commands).toHaveLength(2);
+      expect(edges).toHaveLength(2);
+      expect(edges.map((edge) => ({ label: edge.label, to: edge.to, taken: edge.taken, honored: edge.honored })))
+        .toEqual([{ label: 'narrow-relaunch', to: 'dispatch', taken: 'dispatch', honored: true },
+          { label: 'salvage-relaunch', to: 'dispatch', taken: 'dispatch', honored: true }]);
+      const shadow = await recordTaskAgentShadowMove({ runId: 'run-shadow-retry', stopReason: 'no-progress', results: [job()] }, {
+        env: {}, readCard: () => undefined, log: () => {}, liveMoves: new Set(),
+        loadGate: { loadMax: 2, load1: () => 0.5 }, command: async () => { throw new Error('shadow command'); },
+      });
+      expect(shadow.executorResult).toBe('shadow');
+      expect(edges).toHaveLength(2);
+    } finally { off(); }
+  });
+
+  test('a graph overlay routing narrow-relaunch to stopped prevents its live command', async () => {
+    const edge = GRAPH_SPECS['self-implement']!.edges.findIndex((item) => item.from === 'next-move');
+    expect(edge).toBeGreaterThanOrEqual(0);
+    const overlay: GraphOverlaySpec = { overlayId: 'test-next-move-stop', target: 'self-implement', stage: 'launch',
+      appliesWhen: 'move == narrow-relaunch', patch: [{ op: 'replace', path: `/edges/${edge}/map/narrow-relaunch`, value: 'stopped' }] } as GraphOverlaySpec;
+    setJourneyOverlaysForTesting([overlay]);
+    try {
+      let commands = 0;
+      const out = await recordTaskAgentShadowMove({ runId: 'run-overlay-stop', stopReason: 'no-progress', results: [job()] }, {
+        env: {}, readCard: () => undefined, log: () => {}, liveMoves: new Set(['narrow-relaunch']),
+        loadGate: { loadMax: 2, load1: () => 0.5 }, command: async () => { commands++; return { status: 0, stdout: '' }; },
+      });
+      expect(out).toMatchObject({ move: 'narrow-relaunch', executorResult: 'shadow' });
+      expect(commands).toBe(0);
+    } finally { setJourneyOverlaysForTesting(undefined); }
   });
 
   test('loadGate 미주입은 narrow-relaunch 허용과 command 주입에도 shadow 로 둔다', async () => {

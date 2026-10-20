@@ -337,6 +337,12 @@ describe('first run', () => {
     expect(parseMenuAnswer('1.5', choices).kind).toBe('miss');
     expect(parseMenuAnswer('1e1', choices).kind).toBe('miss');
     expect(parseMenuAnswer('１', choices).kind).toBe('miss'); // full-width digit
+    // 0.2.35 재측정: Number() 가 정수로 강제 변환해 'chosen' 으로 샜던 수식 표기 — 전부 miss
+    expect(parseMenuAnswer('1e0', choices).kind).toBe('miss');
+    expect(parseMenuAnswer('0x1', choices).kind).toBe('miss');
+    expect(parseMenuAnswer('0b1', choices).kind).toBe('miss');
+    expect(parseMenuAnswer('+1', choices).kind).toBe('miss');
+    expect(parseMenuAnswer('２', choices).kind).toBe('miss'); // full-width in-range digit
   });
 
   test('promptProviderMenu re-asks the same menu until a real choice or an explicit cancel', async () => {
@@ -351,6 +357,22 @@ describe('first run', () => {
     expect(prompts[0]).toContain('Enter to cancel');
     expect(prompts[0]).toContain('1 Grok');
     await expect(promptProviderMenu(async () => '', ['grok'])).resolves.toBeNull();
+  });
+
+  // 0.2.35 재측정: 수식 표기('1e0'·'0x1'·'+1')와 전각 숫자('２')도 miss 로 되물음을 돌리고,
+  // 그 뒤의 진짜 선택은 한 번에 끝난다 — 메뉴 문면은 매번 같다.
+  test('promptProviderMenu turns numeric-notation and full-width misses into re-asks, then resolves', async () => {
+    const answers = ['1e0', '0x1', '+1', '２', '2'];
+    const prompts: string[] = [];
+    const ask = async (prompt: string): Promise<string> => {
+      prompts.push(prompt);
+      return answers[prompts.length - 1] ?? '';
+    };
+    await expect(promptProviderMenu(ask, [])).resolves.toBe('grok');
+    expect(prompts).toHaveLength(5);
+    expect(new Set(prompts).size).toBe(1); // the menu never changes between re-asks
+    expect(prompts[0]).toContain('1 Codex');
+    expect(prompts[0]).toContain('2 Grok');
   });
 
   // ⚠️ util-linux `script -q -e -c` 문법이다 — 맥(BSD script)은 이 문법도, 파이프 입력으로 PTY 를 세우는 것도 못 한다
@@ -409,6 +431,63 @@ describe('first run', () => {
       expect(saved.onboarding).toMatchObject({ ready: true, completed: false });
       expect(saved.llm.provider).toBe('openai-codex');
       expect(saved.errorReports?.noticeShown).toBe(true);
+    } finally { f.cleanup(); }
+  }, 60000);
+
+  // 칸 판정선 실물(0.2.33 수용선 · 🧪맨기계): bin/elanous.mjs bare 진입 → src/index.ts main() →
+  // runFirstRun → promptProviderMenu → parseMenuAnswer 생산 경로 그대로 — 빈 기계 메뉴에서
+  // 범위 밖·수식 표기·전각 오타가 취소가 아니라 같은 메뉴의 재질문이 되고, 진짜 선택이
+  // needs-llm 로 착지한다. 합성 fixture 나 소스 문자열이 아니라 진짜 프로세스다.
+  test.skipIf(process.platform === 'darwin')('bare process: real menu re-asks every miss on the production path before the first run lands', async () => {
+    const f = fixture();
+    try {
+      const home = join(f.dir, 'home');
+      const configDir = join(f.dir, 'cfg');
+      mkdirSync(home);
+      mkdirSync(configDir);
+      const env = { ...process.env, HOME: home, CODEX_HOME: join(home, '.codex'),
+        CLAUDE_CONFIG_DIR: join(home, '.claude'), XDG_CONFIG_HOME: '',
+        ELANOUS_LLM_PROVIDER: '', ELANOUS_ESCALATE_PROVIDER: '',
+        ANTHROPIC_API_KEY: '', OPENAI_API_KEY: '', XAI_API_KEY: '', GROK_API_KEY: '',
+        GROK_CODE_XAI_API_KEY: '', GEMINI_API_KEY: '', GOOGLE_API_KEY: '',
+        OPENROUTER_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_AUTH_TOKEN: '',
+        LOCAL_LLM_URL: '',
+      };
+      const cli = `${process.execPath} ${resolve(import.meta.dir, '../../bin/elanous.mjs')} --test --config-dir ${configDir}`;
+      // Warm Bun's transpile cache for this HOME once; the budget is elanous's own path, not a cold compile.
+      spawnSync(process.execPath, [resolve(import.meta.dir, '../../bin/elanous.mjs'), '--test', '--config-dir', configDir, '--version'],
+        { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 30000 });
+      const processChild = spawn('sh', ['-c', 'script -q -e -c "$1" /dev/null', 'sh', cli],
+        { cwd: resolve(import.meta.dir, '../..'), env, stdio: ['pipe', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      const answers = ['4\n', '1e0\n', '１\n', '1\n']; // 범위 밖 → 수식 표기 → 전각 → 진짜 선택
+      let menus = 0;
+      let sent = 0;
+      let timedOut = false;
+      processChild.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+        stdout += chunk;
+        const shown = stdout.split('Choose LLM').length - 1;
+        if (shown > menus) {
+          menus = shown;
+          const answer = answers[sent++];
+          if (answer !== undefined) setTimeout(() => processChild.stdin.write(answer), 300);
+        }
+      });
+      processChild.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
+      const timeout = setTimeout(() => { timedOut = true; processChild.kill('SIGTERM'); }, 45000);
+      const status = await new Promise<number | null>((resolve, reject) => {
+        processChild.once('error', reject);
+        processChild.once('close', (code) => resolve(code));
+      }).finally(() => clearTimeout(timeout));
+      expect(timedOut).toBe(false);
+      expect(status).toBe(0);
+      // 판정선: 첫 질문 + miss 세 번(4=범위 밖 · 1e0=수식 표기 · １=전각) = 같은 메뉴 네 번
+      expect(stdout.split('Choose LLM').length - 1).toBe(4);
+      expect(stdout).toContain('1 Codex, 2 Grok, 3 Claude');
+      // needs-llm 착지: 선택은 했지만 쓸 수 있는 자격이 없어 ready 는 기록되지 않는다
+      expect(stdout).toContain('eln setup llm 으로 고르세요');
+      expect(buildUserConfig(join(configDir, 'config.json')).onboarding.ready).toBeUndefined();
     } finally { f.cleanup(); }
   }, 60000);
 

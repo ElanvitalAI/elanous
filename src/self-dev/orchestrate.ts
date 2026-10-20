@@ -29,7 +29,7 @@ import { availableParallelism, cpus } from 'node:os';
 import { selfDevRunsDir } from './run-store.js';
 import { HARNESS_RUN_ID_ENV, normalizeRunId } from '../harness/harness-space.js';
 import { plannedSelfImplBranch } from '../harness/worktree-branch-prefix.js';
-import { parseGoalId } from '../self-implement/goal-author.js';
+import { inspectGoalDoneBoundary, parseGoalId } from '../self-implement/goal-author.js';
 import { isTransientExecutionFailure } from './execution-transient.js';
 import type { AbandonedClassification } from '../self-implement/abandoned-classification.js';
 import type { JobKind, SelfDevGoal, SelfDevJobResult } from './run-types.js';
@@ -204,7 +204,7 @@ interface SelfDevTerminalOutcome {
   stage: string | null;
   merged: boolean | null;
   prUrl: string | null;
-  blockReason?: 'parent-unlanded';
+  blockReason?: 'parent-unlanded' | 'dependency-needs-human';
   parentPrNumber?: number | null;
   parentNoPr?: true;
 }
@@ -493,6 +493,7 @@ export function classifyFailure(
   preflightWarning: PreflightWarningObservation = 'unknown',
 ): FailureKind | null {
   if (result.blockReason === 'parent-unlanded') return 'parent-unlanded';
+  if (result.blockReason === 'dependency-needs-human' || result.error?.code === 'GOAL_DONE_BOUNDARY_MISSING') return 'awaiting-human';
   const ledgerKind = result.failureClassification === undefined
     ? undefined
     : result.failureClassification === 'run-deadline-exceeded'
@@ -767,6 +768,8 @@ export function resolveOrchestrateConcurrency(
 
 export interface OrchestrateSelfDevOptions {
   goals: SelfDevGoal[];
+  /** TA 카드 출처. 생략하면 발사 환경의 ELANOUS_TASK_CARD_ID를 읽는다. */
+  taskCardId?: string;
   /** Original composite request. Multi-shard runs carry it to each child; omitted
    *  keeps legacy callers and non-decomposed goal lists byte-for-byte unchanged. */
   parentRequest?: string;
@@ -947,6 +950,77 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
   const now = opts.now ?? Date.now;
   const runId = opts.runId ?? process.env[HARNESS_RUN_ID_ENV];
   if (runId && runId !== normalizeRunId(runId)) throw new Error(`invalid self-dev run ID: ${runId}`);
+  const taskCardId = opts.taskCardId ?? process.env.ELANOUS_TASK_CARD_ID;
+  const boundaryResults: SelfDevJobResult[] = [];
+  if (taskCardId?.trim()) {
+    const parentBoundary = inspectGoalDoneBoundary(opts.parentRequest ?? '');
+    const inherited: Array<{ index: number; labels: string[] }> = [];
+    opts = { ...opts, goals: opts.goals.map((goal, index) => {
+      if (goal.kind && goal.kind !== 'dev') return goal;
+      const missing = inspectGoalDoneBoundary(goal.feature).missing;
+      const lines = missing.flatMap((label) => parentBoundary.values[label] ? [`- ${label}: ${parentBoundary.values[label]}`] : []);
+      if (lines.length === 0) return goal;
+      inherited.push({ index: index + 1, labels: missing.filter((label) => parentBoundary.values[label]) });
+      return { ...goal, feature: `${goal.feature.trimEnd()}\n${lines.join('\n')}` };
+    }) };
+    if (inherited.length > 0) {
+      try { debug.log('self-dev.orchestrate', 'done-boundary-inherited', { taskCardId, inherited }); } catch { /* fail-soft */ }
+    }
+    const boundaryMissing = opts.goals.flatMap((goal, index) => {
+      if (goal.kind && goal.kind !== 'dev') return [];
+      const boundary = inspectGoalDoneBoundary(goal.feature);
+      return boundary.missing.length ? [{ index: index + 1, goal: goal.id ?? goal.feature.split(/\r?\n/, 1)[0]?.slice(0, 80) ?? '', missing: boundary.missing }] : [];
+    });
+    if (boundaryMissing.length > 0) {
+      const blockedGoalIndexes = new Set<number>(boundaryMissing.map(({ index }) => index - 1));
+      const blockedByBoundaryId = new Set(boundaryMissing.map(({ index }) => {
+        const goal = opts.goals[index - 1]!;
+        return goal.id ?? String(index - 1);
+      }));
+      const blockedDependents = new Map<number, string>();
+      let changed = true;
+      while (changed) {
+        changed = false;
+        opts.goals.forEach((goal, index) => {
+          if (blockedDependents.has(index)) return;
+          const goalId = goal.id ?? String(index);
+          const predecessor = (goal.dependsOn ?? []).find((id) => id !== goalId && blockedByBoundaryId.has(id));
+          if (!predecessor) return;
+          blockedGoalIndexes.add(index);
+          blockedByBoundaryId.add(goalId);
+          blockedDependents.set(index, predecessor);
+          changed = true;
+        });
+      }
+      for (const item of boundaryMissing.filter(({ index }) => !blockedDependents.has(index - 1))) {
+        const goal = opts.goals[item.index - 1]!;
+        boundaryResults.push({
+          taskId: `boundary:${taskCardId}:needs-human:${item.index}`,
+          feature: goal.feature,
+          status: 'failed',
+          stage: 'needs-human',
+          stopReason: 'needs-human',
+          error: { code: 'GOAL_DONE_BOUNDARY_MISSING', message: item.missing.join(' · ') },
+        });
+      }
+      for (const [index, predecessor] of blockedDependents) {
+        const goal = opts.goals[index]!;
+        boundaryResults.push({
+          taskId: `boundary:${taskCardId}:blocked:${index + 1}`,
+          feature: goal.feature,
+          status: 'blocked',
+          blockReason: 'dependency-needs-human',
+          stopReason: 'needs-human',
+          error: { code: 'DEPENDENCY_NEEDS_HUMAN', message: `선행 needs-human: ${predecessor}` },
+        });
+      }
+      const withheld = [...blockedGoalIndexes].map((index) => index + 1);
+      try { debug.log('self-dev.orchestrate', 'done-boundary-missing', { taskCardId, boundaryMissing, withheld, action: 'needs-human', eligibleToLaunch: opts.goals.length - blockedGoalIndexes.size }); } catch { /* fail-soft */ }
+      opts = { ...opts, goals: opts.goals.flatMap((goal, index) => blockedGoalIndexes.has(index)
+        ? []
+        : [{ ...goal, id: goal.id ?? String(index) }]) };
+    }
+  }
   const pidPath = runId ? join(opts.runsDir ?? selfDevRunsDir(), runId, 'pid.json') : undefined;
   // Only the real run directory gets a host-wide binding by default — an overridden runsDir is an isolated test.
   const registryDir = opts.launchRegistryDir !== undefined ? opts.launchRegistryDir : opts.runsDir === undefined ? launchRegistryDir() : null;
@@ -1388,7 +1462,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
     // state (with disposition merged when the job has settled). Reused by
     // both `finish()` and the mid-run checkpoint.
     const buildResults = (): SelfDevJobResult[] => {
-      const out: SelfDevJobResult[] = [...resumedResults];
+      const out: SelfDevJobResult[] = [...resumedResults, ...boundaryResults];
       for (const [taskId, goal] of taskByGoal) {
         const status = graph.getTask(taskId)?.status ?? 'failed';
         const resumeDisposition = resumeDispositionByGoal.get(goal);
@@ -1420,6 +1494,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
           ...(disp?.providerErrors ? { providerErrors: disp.providerErrors } : {}),
           ...(disp?.rework ? { rework: disp.rework } : {}),
           ...(disp?.mustFix ? { reviewMustFix: disp.mustFix } : {}),
+          ...(disp?.mustFix && goal.hotPaths?.length ? { targetPaths: [...goal.hotPaths] } : {}),
           ...(goalCauseObservedFromFailureClassification(disp?.failureClassification) === true
             ? { goalCauseObserved: true } : {}),
           ...(disp?.runId ? { runId: disp.runId } : {}),
@@ -1496,6 +1571,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
         unclassified: failureKinds.unclassified,
         mainSyncBlocked: failureKinds.mainSyncBlocked,
         parentUnlanded: out.filter((r) => r.blockReason === 'parent-unlanded').length,
+        dependencyNeedsHuman: out.filter((r) => r.blockReason === 'dependency-needs-human').length,
         failures,
         blockedParents: out.filter((r) => r.blockReason === 'parent-unlanded').map((r) => ({ taskId: r.taskId, blockReason: r.blockReason, parentPrNumber: r.parentPrNumber ?? null, ...(r.parentNoPr ? { parentNoPr: true } : {}) })),
         ...(unionDiff ? { unionDiff } : {}),

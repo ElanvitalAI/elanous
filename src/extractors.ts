@@ -8,7 +8,6 @@
 // not the v1 default-function export. Verified at Phase 0 smoke test.
 
 import { readFile } from 'fs/promises';
-import { PDFParse } from 'pdf-parse';
 import mammoth from 'mammoth';
 import * as XLSX from 'xlsx';
 
@@ -69,6 +68,9 @@ export async function readText(path: string): Promise<ExtractResult> {
 
 export async function extractPdf(path: string): Promise<ExtractResult> {
   const buf = await readFile(path);
+  // pdf-parse loads pdfjs-dist and @napi-rs/canvas (system fonts) at import time.
+  // A plain text/CLI help request must not pay for the PDF renderer.
+  const { PDFParse } = await import('pdf-parse');
   const parser = new PDFParse({ data: new Uint8Array(buf) });
   try {
     const result = await parser.getText();

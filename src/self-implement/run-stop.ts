@@ -11,11 +11,12 @@
  */
 import { debug } from '../debug/log.js';
 import { appendRunLedgerEntry, type RunLedgerEntry, type RunLedgerWriter, type RunShardIdentity } from './run-ledger.js';
+import type { PodChildEvidence } from '../task-orchestrator/surfaces/self-implement.js';
 
 /** 닫힌 목록 — 못 고르면 `unclassified`. */
 export const RUN_STOP_CLASSES = [
   'env-unrelated', 'main-sync', 'pod-died', 'review-repeat',
-  'review-out-of-scope', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed', 'unclassified',
+  'review-out-of-scope', 'scope-escape', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed', 'unclassified',
 ] as const;
 export type RunStopClass = typeof RUN_STOP_CLASSES[number];
 
@@ -28,6 +29,8 @@ export interface RunStopRecord {
   evidenceRef: string;
   /** 다음 한 수(사람·힐러가 읽는다). */
   nextMove: string;
+  /** Facts from the complete child JSON, lifted before the Pod stdout tail is shortened. */
+  childEvidence?: PodChildEvidence;
 }
 
 export const RUN_STOP_EVENT = 'stop';
@@ -44,6 +47,7 @@ export interface RunStopInput {
   nextMove: string;
   /** 관측용 — 어느 자리가 불렀나(merge-hold · implement-aborted · draft-pr-open-failed · pod-exit · launch-failed). */
   site?: string;
+  childEvidence?: PodChildEvidence;
 }
 
 export function isRunStopClass(value: unknown): value is RunStopClass {
@@ -99,6 +103,7 @@ export function recordRunStop(input: RunStopInput, write: RunLedgerWriter = appe
     cause: boundRunStopCause(input.cause),
     evidenceRef: input.evidenceRef,
     nextMove: input.nextMove,
+    ...(input.childEvidence ? { childEvidence: input.childEvidence } : {}),
   };
   const entry: RunLedgerEntry = {
     timestamp: new Date().toISOString(), runId: input.runId, event: RUN_STOP_EVENT,
@@ -120,5 +125,6 @@ export function readRunStopRecord(entry: RunLedgerEntry): RunStopRecord | undefi
   if (entry.event !== RUN_STOP_EVENT) return undefined;
   const data = entry.data as Partial<RunStopRecord>;
   if (typeof data.cause !== 'string' || typeof data.evidenceRef !== 'string' || typeof data.nextMove !== 'string') return undefined;
-  return { class: isRunStopClass(data.class) ? data.class : 'unclassified', cause: data.cause, evidenceRef: data.evidenceRef, nextMove: data.nextMove };
+  return { class: isRunStopClass(data.class) ? data.class : 'unclassified', cause: data.cause, evidenceRef: data.evidenceRef, nextMove: data.nextMove,
+    ...(data.childEvidence ? { childEvidence: data.childEvidence } : {}) };
 }

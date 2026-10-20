@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import * as store from './feature-store.js';
@@ -134,17 +135,50 @@ function mentionedPaths(text: string): string[] {
 /** Shadow check at checklist authorship. Callers supply the origin/main file probe and merged-PR file reader. */
 export function inspectChecklistTargetPaths(input: {
   title: string; evidence?: string; refs?: readonly string[]; dispatchKind?: ChecklistDispatchKind;
-}, deps: { existsAtMain: (path: string) => boolean; mergedPrFiles?: (number: number) => readonly string[] }): {
+}, deps: { existsAtMain: (path: string) => boolean; objectTypeAtMain?: (path: string) => 'blob' | 'tree' | 'commit' | 'blocked-blob' | 'blocked-gitlink' | 'unavailable' | null; mergedPrFiles?: (number: number) => readonly string[] }): {
   targets: string[]; warnings: string[]; candidates: string[];
 } {
   const lines = input.title.split(/\r?\n/);
   const first = /^대상 경로:\s*(.*)$/.exec(lines[0] ?? '');
-  const targets = first ? [...new Set(mentionedPaths(first[1]!))] : [];
-  const newFileDeclared = /^신설:\s*/.test(lines[1] ?? '');
+  const rawTargets = first?.[1]?.split(' · ').map((path) => path.trim()) ?? [];
+  const validPath = (path: string): boolean => path.length > 0 && path.length < 4096
+    && !path.startsWith('/') && !path.includes('\\') && !/[\u0000-\u001f\u007f]/u.test(path)
+    && path.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
+  const targets = [...new Set(rawTargets.filter(validPath))];
+  const misplacedNewFiles = lines.slice(2).filter((line) => /^신설:\s*/.test(line));
+  const rawNewFiles = lines.slice(1, 2).filter((line) => /^신설:\s*/.test(line))
+    .flatMap((line) => line.slice('신설:'.length).split(' · ').map((path) => path.trim()));
+  const newFiles = new Set(rawNewFiles.filter(validPath));
   const warnings: string[] = [];
   if ((input.dispatchKind ?? 'code') === 'code') {
-    if (!first || !first[1]!.trim() || targets.length === 0) warnings.push('첫 줄 대상 경로가 없다');
-    for (const path of targets) if (!deps.existsAtMain(path) && !newFileDeclared) warnings.push(`${path}: origin/main에 없는 파일 · 신설: 둘째 줄 선언 필요`);
+    if (!first || !first[1]!.trim()) warnings.push('첫 줄 대상 경로가 없다');
+    else if (targets.length !== rawTargets.length || targets.length === 0) warnings.push('첫 줄은 실제 파일 경로만 « · »로 구분한다');
+    if (misplacedNewFiles.length) warnings.push('신설: 선언은 제목 둘째 줄에만 둔다');
+    for (const path of rawNewFiles) if (!validPath(path)) warnings.push(`신설: ${path || '(빈 항목)'}: 정확한 새 파일 경로가 아니다`);
+    for (const path of targets) {
+      const objectType = deps.objectTypeAtMain?.(path);
+      const exists = objectType ? objectType === 'blob' : deps.existsAtMain(path);
+      if (objectType === 'unavailable') warnings.push(`${path}: origin/main Git 조회 실패 · 대상 검증 불가`);
+      if (objectType === 'tree' || objectType === 'commit') warnings.push(`${path}: origin/main의 ${objectType === 'tree' ? '디렉터리' : 'gitlink'}는 파일 대상이 아니다`);
+      if (objectType === 'blocked-blob' || objectType === 'blocked-gitlink')
+        warnings.push(`${path}: origin/main의 상위 ${objectType === 'blocked-blob' ? '파일' : 'gitlink'} 아래에는 신설할 수 없다`);
+      if (!exists && !newFiles.has(path)) warnings.push(`${path}: origin/main에 없는 파일 · 신설: 줄에 해당 경로 선언 필요`);
+      if (exists && newFiles.has(path)) warnings.push(`${path}: 이미 있는 파일은 신설:에서 뺀다`);
+    }
+    for (const path of newFiles) if (!targets.includes(path)) warnings.push(`${path}: 신설: 경로가 첫 줄 대상에 없다`);
+    for (const path of newFiles) {
+      const objectType = deps.objectTypeAtMain?.(path);
+      if (objectType === 'unavailable' && !targets.includes(path))
+        warnings.push(`${path}: origin/main Git 조회 실패 · 신설 검증 불가`);
+      if ((objectType === 'tree' || objectType === 'commit') && !targets.includes(path))
+        warnings.push(`${path}: origin/main의 ${objectType === 'tree' ? '디렉터리' : 'gitlink'}는 신설 파일이 아니다`);
+      if ((objectType === 'blocked-blob' || objectType === 'blocked-gitlink') && !targets.includes(path))
+        warnings.push(`${path}: origin/main의 상위 ${objectType === 'blocked-blob' ? '파일' : 'gitlink'} 아래에는 신설할 수 없다`);
+    }
+    for (const label of ['코드', '실물', '증거 명령']) {
+      if (!lines.some((line) => line.startsWith(`- 완료 경계 ${label}:`) && line.slice(`- 완료 경계 ${label}:`.length).trim()))
+        warnings.push(`- 완료 경계 ${label}: 줄이 없다`);
+    }
   }
   if (!warnings.length) return { targets, warnings, candidates: [] };
   const sources = [input.title, input.evidence ?? '', ...(input.refs ?? [])].join('\n');
@@ -300,6 +334,46 @@ export function addItem(v: string, input: { id: string; title: string; refs?: st
 
 export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; refs?: string[]; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; dispatchKind?: ChecklistDispatchKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean | null }, by: string): Checklist {
   return setItemGuarded(v, id, patch, by);
+}
+
+/** Remove only the exact machine-authored line; preserve all other evidence bytes and blank lines. */
+export function withoutDispatchSkipLine(evidence: string, line: string | null): string {
+  if (!line) return evidence;
+  if (evidence === line) return '';
+  if (evidence.endsWith(`\n${line}`)) return evidence.slice(0, -line.length - 1);
+  if (evidence.startsWith(`${line}\n`)) return evidence.slice(line.length + 1);
+  return evidence.replace(`\n${line}\n`, '\n');
+}
+
+/** Record one dispatcher refusal on the same title snapshot, without overwriting a person's evidence. */
+export function noteDispatchSkip(v: string, id: string, reason: string, expectedTitle: string, by: string): Checklist {
+  if (!by.trim()) throw new CliUserError('건너뜀 기록 주체가 비었다');
+  const detail = reason.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 300);
+  if (!detail) throw new CliUserError('건너뜀 사유가 비었다');
+  return mutate(v, (data) => {
+    const item = data.items.find((entry) => entry.id === id);
+    if (!item) throw new CliUserError(`없는 칸: ${id}`);
+    if (item.title !== expectedTitle) throw new CliUserError(`칸 제목이 바뀌어 건너뜀 근거를 기록하지 않았다: ${id}`);
+    const marker = createHash('sha256').update(`${v}\0${id}\0${expectedTitle}`).digest('hex').slice(0, 16);
+    const line = `디스패처 건너뜀 [${marker}]: ${detail}`;
+    const prior = item.evidence ?? '';
+    const previous = data.history.filter((entry) => entry.id === id && entry.field === 'dispatch-skip').at(-1)?.to;
+    const oldLine = typeof previous === 'string' ? previous : null;
+    if (oldLine === line && prior.split(/\r?\n/).includes(line)) return false;
+    const priorLines = prior.split('\n');
+    const oldIndex = oldLine ? priorLines.findIndex((entry) => entry.replace(/\r$/, '') === oldLine) : -1;
+    const next = oldIndex >= 0
+      ? priorLines.map((entry, index) => index === oldIndex ? entry.replace(oldLine!, line) : entry).join('\n')
+      : prior ? `${prior}\n${line}` : line;
+    if (next === prior) return false;
+    const at = new Date().toISOString();
+    item.evidence = next;
+    item.updatedAt = at;
+    item.updatedBy = by;
+    change(data, id, 'evidence', prior, next, by, at);
+    change(data, id, 'dispatch-skip', oldLine, line, by, at);
+    return true;
+  });
 }
 
 /** Apply a measured verdict only while the release cell is still the snapshot that was judged. */

@@ -3004,7 +3004,7 @@ export async function routeRequest(
     return handleGraphAccess(pathname, req);
   }
   // F-M1 read + P-F1 raw YAML. Writes live in the mutation block and never touch core graphs/.
-  if (method === 'GET' && (pathname === '/v1/graphs' || /^\/v1\/graphs\/[^/]+$/.test(pathname) || /^\/v1\/graphs\/[^/]+\/yaml$/.test(pathname))) {
+  if (method === 'GET' && (pathname === '/v1/graphs' || /^\/v1\/graphs\/[^/]+$/.test(pathname) || /^\/v1\/graphs\/[^/]+\/(?:yaml|flat)$/.test(pathname))) {
     return handleGraphsGet(pathname);
   }
   if (method === 'GET' && /^\/v1\/graphs\/[^/]+\/versions$/.test(pathname)) {

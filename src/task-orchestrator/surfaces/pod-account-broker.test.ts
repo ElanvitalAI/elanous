@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { makePodAccountBroker, planPodAccounts, planPodProvider } from './pod-account-broker.js';
+import { makePodAccountBroker, ownerCodexMirrorCandidate, planOwnerCodexMirrorCandidates, planPodAccounts, planPodProvider, podAccountThresholdPercent } from './pod-account-broker.js';
 
 const c = (name: string, usedPercent?: number, reached?: boolean) => ({ name, storeKey: `openai-codex:${name}`, home: `/h/${name}`, reached, ...(usedPercent !== undefined ? { usedPercent } : {}) });
 
@@ -12,6 +12,29 @@ describe('pod account broker — 병렬 Pod 가 한 계정에 몰리지 않게',
   test('Job 마다 돌려 준다 — 넷이면 third · team · third · team', () => {
     const next = makePodAccountBroker(planPodAccounts([c('team', 74), c('third', 47)]));
     expect([next(), next(), next(), next()]).toEqual(['third', 'team', 'third', 'team']);
+  });
+  test('HQ owner mirror follows configured order after the same per-account threshold filter', () => {
+    expect(planOwnerCodexMirrorCandidates([c('default', 73), c('team', 74), c('third', 47)], {
+      accountOrder: ['third', 'team', 'default'], thresholdPercentByAccount: { default: 60 },
+    }).map(({ name }) => name)).toEqual(['third', 'team']);
+    expect(planOwnerCodexMirrorCandidates([c('default', 100), c('team', 100), c('third', 100)], {
+      accountOrder: ['third', 'team', 'default'], thresholdPercentByAccount: { default: 60 },
+    })).toEqual([]);
+    expect(planOwnerCodexMirrorCandidates([c('third', 47), c('team', 74), c('default', 100, true)], {
+      accountOrder: [],
+    }).map(({ name }) => name)).toEqual(['third', 'team']);
+  });
+  test('owner mirror carries the exact effective cap used by candidate selection', () => {
+    expect(podAccountThresholdPercent('default', { thresholdPercentByAccount: { default: 70 } })).toBe(70);
+    expect(podAccountThresholdPercent('third', { thresholdPercentByAccount: { third: 62 } })).toBe(62);
+    expect(podAccountThresholdPercent('third', { thresholdPercentByAccount: { third: 'invalid' } })).toBe(95);
+  });
+  test('remote owner mirror candidate is limited to the selected account and owner usage marker', () => {
+    expect(ownerCodexMirrorCandidate([c('third', 10), c('team', 74, true)], 'team', 48)).toEqual([
+      { ...c('team', 74, true), reached: false, usedPercent: 48 },
+    ]);
+    expect(ownerCodexMirrorCandidate([c('team', 74)], 'bad/name', 48)).toEqual([]);
+    expect(ownerCodexMirrorCandidate([c('team', 74, true)], 'team')).toEqual([{ ...c('team'), reached: false }]);
   });
   test('문턱(95%) 이상은 빼고, 신호 없는 계정은 뒤로(빼지 않음)', () => {
     expect(planPodAccounts([c('a', 96), c('b'), c('c', 10)]).usable).toEqual(['c', 'b']);

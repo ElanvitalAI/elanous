@@ -1,5 +1,6 @@
-import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { describe, expect, spyOn, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { createProject } from '../project/project-store.js';
@@ -27,6 +28,8 @@ import {
   trackEscAbortToolCall,
   settleEscAbortToolCall,
   registerDashboardFinderAndHistoryKeys,
+  activeDashboardTypeaheadSessionId,
+  applyDashboardStreamingTypeaheadKey,
   type LogZoneClickWidgetHost,
 } from './index.js';
 import { buildAdRunSetup } from '../ad-pipeline/ad-run-setup.js';
@@ -35,9 +38,177 @@ import { dispatchDashboardSessionRuntimeTool } from './session-runtime-dispatch.
 import { HYDRATED_TOOLS_KEY } from '../skills/tools/tool-search-spec.js';
 import { toolSearchRuntime } from '../tool-runtime/tool-search-runtime.js';
 import { tuiSourceText } from '../../test/helpers/dashboard-source.js';
+import { createTurnTypeaheadState } from '../chat/turn-typeahead.js';
+import { handoffTurnTypeaheadAtTurnEnd, steerLastTurnTypeaheadSubmission } from './input/turn-steer-bridge.js';
+import { clearPendingUserInput, drainPendingUserInput, pendingUserInputCount } from '../session/pending-input.js';
+import { streamLLMWithTools, type LLMProvider } from '../llm.js';
+import { ptyAvailable, startPty, unregisterPty } from '../pty-shell/registry.js';
 
 const repoRoot = resolve(import.meta.dir, '../..');
 const dashboard = tuiSourceText();
+
+test.skipIf(!ptyAvailable())('real dashboard streaming Enter injects a unique word once into local model requests', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-dedup-live-'));
+  const state = join(root, 'state');
+  mkdirSync(state);
+  const readTarget = join(root, 'read-target.txt');
+  writeFileSync(readTarget, 'safe read target\n');
+  const word = 'unique-dashboard-live-dedup';
+  const requests: Array<{ messages?: Array<{ content?: unknown }> }> = [];
+  let reply: (() => void) | undefined;
+  const server = Bun.serve({
+    hostname: '127.0.0.1', port: 0,
+    async fetch(request) {
+      if (new URL(request.url).pathname === '/v1/models') return Response.json({ data: [{ id: 'test-model' }] });
+      if (new URL(request.url).pathname !== '/v1/chat/completions') return new Response('not found', { status: 404 });
+      const body = await request.json() as { messages?: Array<{ content?: unknown }> };
+      requests.push(body);
+      if (requests.length === 1) await new Promise<void>(resolve => { reply = resolve; });
+      const first = requests.length === 1;
+      const delta = first
+        ? { tool_calls: [{ index: 0, id: 'call-dedup-read', type: 'function',
+          function: { name: 'Read', arguments: JSON.stringify({ file_path: readTarget }) } }] }
+        : { content: 'second done' };
+      const finish = first ? 'tool_calls' : 'stop';
+      return new Response(`data: ${JSON.stringify({ choices: [{ delta, finish_reason: finish }] })}\n\ndata: [DONE]\n\n`,
+        { headers: { 'content-type': 'text/event-stream' } });
+    },
+  });
+  writeFileSync(join(root, 'config.json'), JSON.stringify({
+    onboarding: { completed: true }, llm: { provider: 'local', model: 'test-model', baseUrl: `http://127.0.0.1:${server.port}/v1` },
+    skillRouter: { llmFallback: false }, mcp: { enabled: false },
+  }));
+  const env: Record<string, string> = { ...process.env as Record<string, string>, NODE_ENV: 'development', ELANOUS_STATE_DIR: state, TERM: 'xterm-256color' };
+  for (const key of ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR']) delete env[key];
+  const handle = startPty({ cmd: 'bun', args: ['bin/elanous.mjs', `--test=${root}`, '--chat-only'], workdir: repoRoot,
+    cols: 120, rows: 30, env, unsetEnv: ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR'] });
+  try {
+    const deadline = Date.now() + 50_000;
+    const wait = async (predicate: () => Promise<boolean> | boolean) => {
+      while (Date.now() < deadline) {
+        if (await predicate()) return;
+        await Bun.sleep(100);
+      }
+      throw new Error(`dashboard dedup live timeout: requests=${requests.length}; screen=${(await handle.renderScreen()).slice(-1000)}`);
+    };
+    await wait(async () => (await handle.renderScreen()).split('\n').some(line => line.trim() === '❯'));
+    handle.write('first prompt\r');
+    await wait(() => requests.length === 1 && !!reply);
+    handle.write(`${word}\r`);
+    await wait(async () => (await handle.renderScreen()).includes(word));
+    reply?.();
+    await wait(() => requests.length >= 2);
+    await Bun.sleep(400);
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[0]!.messages ?? [])).not.toContain(word);
+    expect(JSON.stringify(requests[1]!.messages ?? []).split(word)).toHaveLength(2);
+    const count = requests.reduce((n, body) => n + JSON.stringify(body.messages ?? []).split(word).length - 1, 0);
+    expect(count).toBe(1);
+    const db = new Database(join(root, 'logs', 'logs.db'), { readonly: true });
+    try {
+      const entries = db.query("select category, event, data from logs where category in ('llm.interjection', 'dashboard.turn-typeahead') order by id")
+        .all() as Array<{ category: string; event: string; data: string }>;
+      const logged = entries.map(({ category, event, data }) => ({ category, event, data: JSON.parse(data) as { id?: string; ids?: string[]; length?: number } }));
+      const queued = logged.filter(row => row.category === 'dashboard.turn-typeahead' && row.event === 'queued' && row.data.length === word.length);
+      expect(queued).toHaveLength(1);
+      const id = queued[0]!.data.id;
+      expect(id).toMatch(/^pending-/);
+      const drained = logged.filter(row => row.category === 'llm.interjection' && row.event === 'drained' && row.data.ids?.includes(id!)).length;
+      const submitted = logged.filter(row => row.category === 'dashboard.turn-typeahead' && row.event === 'submitted-as-prompt' && row.data.id === id).length;
+      expect(drained).toBe(1);
+      expect(submitted).toBe(0);
+      console.log(`DEDUP live-dashboard: id=${id} drained-mid-turn=${drained} submitted-as-prompt=${submitted} model-request-occurrences=${count}`);
+    } finally { db.close(); }
+  } finally {
+    reply?.();
+    handle.kill();
+    unregisterPty(handle.id);
+    server.stop(true);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+test('dashboard streaming Enter reaches the real LLM mid-turn boundary exactly once', async () => {
+  const sid = 'dashboard-real-llm-dedup';
+  const word = 'unique-dashboard-real-llm-dedup';
+  const ref = { state: createTurnTypeaheadState() };
+  for (const char of word) ref.state = applyDashboardStreamingTypeaheadKey(ref.state, { name: char }, undefined).state;
+  ref.state = applyDashboardStreamingTypeaheadKey(ref.state, { name: 'enter' }, undefined).state;
+  const id = steerLastTurnTypeaheadSubmission(ref, activeDashboardTypeaheadSessionId(sid, false), () => {});
+  expect(id).not.toBeNull();
+  const requests: string[] = [];
+  const provider: LLMProvider = {
+    name: 'dashboard-dedup-test', defaultModel: 'dedup-test', available: () => true,
+    async *chat() { yield 'unused'; },
+    async *streamChat(messages) {
+      requests.push(JSON.stringify(messages));
+      if (requests.length === 1) yield { type: 'tool_call', id: 'one', name: 'Read', args: {} };
+      else yield { type: 'text', delta: 'done' };
+    },
+  };
+  try {
+    await streamLLMWithTools(
+      [{ role: 'user', content: 'original prompt' }],
+      { onText() {}, dispatchTool: async () => 'read result' },
+      { provider, tools: [{ name: 'Read', description: 'Read', parameters: { type: 'object', properties: {} } }], drainPendingUserInput: () => drainPendingUserInput(sid) },
+    );
+    let enters = 0;
+    handoffTurnTypeaheadAtTurnEnd(ref, undefined, { interrupted: false }, () => { enters++; });
+    expect(enters).toBe(0);
+    expect(requests).toHaveLength(2);
+    expect(requests[0]).not.toContain(word);
+    expect(requests[1]!.split(word)).toHaveLength(2);
+    expect(drainPendingUserInput(sid)).toEqual([]);
+    console.log(`DEDUP real-llm: id=${id} model-request-occurrences=1 turn-end-enters=${enters}`);
+  } finally {
+    clearPendingUserInput(sid);
+  }
+});
+
+describe('dashboard streaming Enter → ACP registry → turn-end handoff', () => {
+  for (const { label, remote, drainBeforeEnd } of [
+    { label: 'local loop drains before turn end', remote: false, drainBeforeEnd: true },
+    { label: 'local loop ends before drain', remote: false, drainBeforeEnd: false },
+    { label: 'remote loop submits at turn end', remote: true, drainBeforeEnd: false },
+  ]) {
+    test(label, () => {
+      const sid = `dashboard-dedup-${label}`;
+      const word = `unique-${label.replaceAll(' ', '-')}`;
+      const ref = { state: createTurnTypeaheadState() };
+      for (const char of word) ref.state = applyDashboardStreamingTypeaheadKey(ref.state, { name: char }, undefined).state;
+      const entered = applyDashboardStreamingTypeaheadKey(ref.state, { name: 'enter' }, undefined);
+      expect(entered.submissionDisposition).toBe('fifo');
+      ref.state = entered.state;
+      const log = spyOn(debug, 'log');
+      try {
+        const id = steerLastTurnTypeaheadSubmission(ref, activeDashboardTypeaheadSessionId(sid, remote), () => {});
+        expect(id === null).toBe(remote);
+        expect(pendingUserInputCount(sid)).toBe(remote ? 0 : 1);
+        const injected: string[] = [];
+        if (drainBeforeEnd) injected.push(...drainPendingUserInput(sid));
+        let enters = 0;
+        const handoff = handoffTurnTypeaheadAtTurnEnd(ref, undefined, { interrupted: false }, () => { enters++; });
+        if (handoff.injectEnter) injected.push(handoff.nextInitial!);
+        injected.push(...drainPendingUserInput(sid));
+        expect(injected).toEqual([word]);
+        expect(enters).toBe(drainBeforeEnd ? 0 : 1);
+        if (id) {
+          const drained = log.mock.calls.filter(([category, event, data]) =>
+            category === 'llm.interjection' && event === 'drained' && (data as { ids: string[] }).ids.includes(id)).length;
+          const submitted = log.mock.calls.filter(([category, event, data]) =>
+            category === 'dashboard.turn-typeahead' && event === 'submitted-as-prompt' && (data as { id: string }).id === id).length;
+          expect(drained + submitted).toBe(1);
+          console.log(`DEDUP ${label}: id=${id} drained-mid-turn=${drained} submitted-as-prompt=${submitted} actual-injections=${injected.length}`);
+        } else {
+          console.log(`DEDUP ${label}: remote FIFO actual-injections=${injected.length}`);
+        }
+      } finally {
+        log.mockRestore();
+        clearPendingUserInput(sid);
+      }
+    });
+  }
+});
 
 describe('dashboard /loop wiring (index.ts production path)', () => {
   test('the loop scheduler ref lives once in showDashboard scope and is passed by name into every per-command slashCtx', () => {

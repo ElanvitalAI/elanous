@@ -8,8 +8,10 @@ import { TabRegistry } from '../state/tab-registry.js';
 import { NexusEventBus } from './event-bus.js';
 import { routeRequest } from './http-server.js';
 import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
-import { GRAPH_VERSION_CAP, handleGraphVersionsGet, RESERVED_GRAPH_IDS, handleGraphsClone, handleGraphsCreate, handleGraphsGet, handleGraphsPut, handleGraphsRevert } from './graphs-api.js';
+import { graphAccessForRequest, GRAPH_VERSION_CAP, handleGraphVersionsGet, RESERVED_GRAPH_IDS, handleGraphsClone, handleGraphsCreate, handleGraphsGet, handleGraphsPut, handleGraphsRevert } from './graphs-api.js';
 import { defaultGraphsDir } from '../../self-implement/graph-templates.js';
+import { graphVersionHash, parseGraphTemplateYaml } from '../../self-implement/graph-yaml.js';
+import { flattenGraphTemplate } from '../../self-implement/graph-unit-resolver.js';
 import { handleGraphRunRoute } from '../../graph-runner/graph-run-api.js';
 import { installedGraphs } from '../../exec-requests/planner.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
@@ -55,6 +57,8 @@ test('W9c graph access grant changes another credential’s actual GET/PUT API r
     expect((await peerRequest('owner-secret', 'PUT', '/v1/graphs/research-loop/access', { recipient: peer, permission: 'edit' }))?.status).toBe(403);
     expect((await grant('view'))?.status).toBe(200);
     expect((await peerRequest(peer, 'GET', path))?.status).toBe(200);
+    expect(graphAccessForRequest('/v1/graphs/w9c-peer/flat', 'GET', peer, { mineDir, coreDir: defaultGraphsDir() })).toBe(true);
+    expect(graphAccessForRequest('/v1/graphs/w9c-peer/flat', 'PUT', peer, { mineDir, coreDir: defaultGraphsDir() })).toBe(false);
     expect((await peerRequest(peer, 'GET', '/v1/graphs/w9c-peer'))?.status).toBe(200);
     expect((await peerRequest(peer, 'PUT', path, { yaml: original }))?.status).toBe(401);
     expect((await peerRequest(other, 'GET', path))?.status).toBe(401);
@@ -84,6 +88,32 @@ test('W9c graph access grant changes another credential’s actual GET/PUT API r
     else process.env.ELANOUS_STATE_DIR = priorStateDir;
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('GET /flat resolves graph units server-side and returns the shared flattened hash and edges', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-graph-flat-'));
+  const graphs = join(root, 'graphs');
+  const units = join(graphs, 'units');
+  mkdirSync(units, { recursive: true });
+  const graphPath = join(graphs, 'root.yaml');
+  const graphYaml = `graph_id: root\nversion: 1\nentry_node: start\nterminal_nodes: [done]\nnodes:\n  - { node_id: start, kind: agent, recipe: start, max_visits: 1 }\n  - node_id: unit-call\n    kind: subgraph\n    recipe: none\n    max_visits: 1\n    call: unit@1\n    budget: { inner_steps: 2 }\n    contract: { inputs: [], outputs: [] }\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\nedges:\n  - { from: start, to: unit-call }\n  - { from: unit-call, on: outcome, map: { completed: done } }\n`;
+  const unitYaml = `graph_id: unit\nversion: 1\nunit: { inputs: [], outputs: [], exits: [completed] }\nentry_node: work\nterminal_nodes: [completed]\nnodes:\n  - { node_id: work, kind: agent, recipe: work, max_visits: 1 }\n  - { node_id: completed, kind: observe, recipe: none, max_visits: 1 }\nedges:\n  - from: work\n    to: completed\n    fallback: [{ node: completed, requires: [simulated] }]\n`;
+  writeFileSync(graphPath, graphYaml);
+  writeFileSync(join(units, 'unit.yaml'), unitYaml);
+  try {
+    const response = handleGraphsGet('/v1/graphs/root/flat', graphs, { coreDir: graphs, mineDir: join(root, 'mine') });
+    expect(response.status, await response.clone().text()).toBe(200);
+    const body = await response.json() as { graph_hash: string; nodes: Array<{ node_id: string }>; edges: Array<{ from: string; to?: string; fallback?: Array<{ node: string; requires: string[] }> }> };
+    const parsed = parseGraphTemplateYaml(graphYaml, graphPath);
+    expect(parsed.errors).toEqual([]);
+    const flat = flattenGraphTemplate(parsed.template!, graphPath);
+    expect(body.graph_hash).toBe(graphVersionHash(flat));
+    expect(body.nodes.map((node) => node.node_id)).toEqual(['start', 'done', 'unit-call__work']);
+    expect(body.edges).toEqual([
+      { from: 'start', to: 'unit-call__work' },
+      { from: 'unit-call__work', to: 'done', fallback: [{ node: 'done', requires: ['simulated'] }] },
+    ]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 const RUN_GRAPH = `graph_id: w9c-run
@@ -196,7 +226,8 @@ test('GET /v1/graphs reads real YAML, retains labelled research branches and den
   const list = await request('/v1/graphs');
   expect(list?.status).toBe(200);
   const graphs = (await list!.json() as { graphs: Array<{ id: string; source: string; editable: boolean; nodeCount: number }> }).graphs;
-  expect(graphs).toContainEqual({ id: 'research-loop', source: 'core', editable: false, nodeCount: 7 });
+  // recover@1 및 성공/사람 개입 종결 노드가 추가된 YAML의 현재 목록이다.
+  expect(graphs).toContainEqual({ id: 'research-loop', source: 'core', editable: false, nodeCount: 10 });
 
   const response = await request('/v1/graphs/research-loop');
   expect(response?.status).toBe(200);
@@ -206,7 +237,7 @@ test('GET /v1/graphs reads real YAML, retains labelled research branches and den
     edges: Array<{ from: string; on?: string; map?: Record<string, string> }>;
   };
   expect(detail.entry_node).toBe('investigate');
-  expect(detail.terminal_nodes).toContain('merge');
+  expect(detail.terminal_nodes).toEqual(['landed', 'needs-human']);
   expect(detail.nodes).toContainEqual({ node_id: 'investigate', kind: 'agent', recipe: 'headless-goal-loop', max_visits: 7 });
   expect(detail.edges.find((edge) => edge.from === 'investigate')).toMatchObject({
     on: 'changed-files', map: { 'code-changed': 'gate', 'documents-only': 'judge', unknown: 'gate' },

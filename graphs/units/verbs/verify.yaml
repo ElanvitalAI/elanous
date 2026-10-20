@@ -1,0 +1,55 @@
+graph_id: verb-verify
+version: 1
+entry_node: prepare
+terminal_nodes: [done, rework, needs-human, failed]
+unit:
+  inputs: [ask, context, prior]
+  outputs: [result, evidence]
+  exits: [done, rework, needs-human, failed]
+nodes:
+  - node_id: prepare
+    kind: observe
+    recipe: 'cmd:verify-envelope'
+    max_visits: 1
+    contract:
+      inputs: [ask, context, prior]
+      tools: none
+      outputs: [outcome, worktree, changed-files, diff, review-intent, must-fix, gate-log]
+  - node_id: gate
+    kind: gate
+    recipe: 'cmd:gate-baseline'
+    max_visits: 11
+    progress: [gating, gated]
+    terminal_stages: []
+    contract: { inputs: [worktree, changed-files], tools: read-and-run-tests, outputs: [outcome, passed, gate-log] }
+  - node_id: review
+    kind: judge
+    recipe: 'cmd:pr-reviewer'
+    max_visits: 11
+    progress: [reviewing, reviewed]
+    terminal_stages: [review-blocked]
+    contract: { inputs: [diff, review-intent], tools: read-only, outputs: [outcome, verdict, must-fix, review_summary] }
+  - node_id: rework-loop
+    kind: agent
+    recipe: 'cmd:headless-goal-loop'
+    max_visits: 10
+    progress: [implementing]
+    terminal_stages: [gate-failed, review-blocked, no-changes]
+    contract: { inputs: [must-fix, gate-log, worktree], tools: worktree-write, outputs: [outcome, diff, must-fix, evidence] }
+  - { node_id: done, kind: gate, recipe: 'cmd:verify-output-done', max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+  - { node_id: rework, kind: gate, recipe: 'cmd:verify-output-rework', max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+  - { node_id: needs-human, kind: hitl, recipe: 'cmd:verify-output-needs-human', max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+  - { node_id: failed, kind: observe, recipe: 'cmd:verify-output-failed', max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+edges:
+  - from: prepare
+    on: outcome
+    map: { gate: gate, review: review, rework: rework-loop, failed: failed }
+  - from: gate
+    on: outcome
+    map: { pass: review, fail: rework-loop, needs-human: needs-human, failed: failed }
+  - from: review
+    on: outcome
+    map: { pass: done, fail: rework-loop, needs-human: needs-human, failed: failed }
+  - from: rework-loop
+    on: outcome
+    map: { done: gate, needs-human: needs-human, failed: rework }

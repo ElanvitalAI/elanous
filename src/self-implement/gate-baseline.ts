@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { prepareDeterministicChildEnvironment } from '../../scripts/lib/deterministic-env.js';
 import { debug } from '../debug/log.js';
 import { runGitCommand } from '../git-fs/runner.js';
+import type { GitRunResult } from '../git-fs/retry.js';
 import { linkWorktreeDependencies } from '../git-fs/worktree.js';
 import { reapStaleGateWorktrees } from './gate-baseline-reap.js';
 
@@ -191,6 +192,7 @@ type BaselineUnknownReason = 'module-load-error' | 'infrastructure-failure' | 't
 
 const BASELINE_TIMEOUT_PER_FILE_MS = 300_000;
 const BASELINE_TIMEOUT_TOTAL_CAP_MS = 600_000;
+const BASELINE_WORKTREE_ADD_TIMEOUT_MS = 180_000;
 
 export function baselineTimeoutForFiles(fileCount: number): number {
   return Math.min(Math.max(1, fileCount) * BASELINE_TIMEOUT_PER_FILE_MS, BASELINE_TIMEOUT_TOTAL_CAP_MS);
@@ -787,10 +789,36 @@ function runIsolatedBunTest(cwd: string, args: string[], timeout: number): Proce
   try {
     // SIGKILL — a test that traps SIGTERM while blocked in a native wait never runs its handler, so spawnSync
     // waited forever and its drive grandchildren lived on as ppid=1 orphans (09-30 O1: 19 processes, up to 11h).
-    return spawnSync('bun', ['test', ...args], { cwd, env: isolated.env, encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: 32 * 1024 * 1024 });
+    const started = Date.now();
+    const result = spawnSync('bun', ['test', ...args], { cwd, env: isolated.env, encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: 32 * 1024 * 1024 });
+    debug.log('self-implement.gate-baseline', 'test-process-result', {
+      status: result.status, signal: result.signal, errorCode: (result.error as NodeJS.ErrnoException | undefined)?.code ?? null,
+      elapsedMs: Date.now() - started, timeoutMs: timeout, parentRssBytes: process.memoryUsage().rss,
+      cgroupMemoryCurrentBytes: cgroupMemoryBytes('memory.current'), cgroupMemoryLimitBytes: cgroupMemoryBytes('memory.max'),
+    });
+    return result;
   } finally {
     isolated.cleanup();
   }
+}
+
+function cgroupMemoryBytes(name: 'memory.current' | 'memory.max'): number | null {
+  try {
+    const raw = readFileSync(`/sys/fs/cgroup/${name}`, 'utf8').trim();
+    const value = Number(raw);
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  } catch { return null; }
+}
+
+/** A failed checkout never proves that a baseline test ran. Preserve the Git failure's signal and timeout. */
+export function classifyBaselineWorktreeAddFailure(add: GitRunResult, elapsedMs: number): BaselineProcessResult {
+  const reason = add.errorCode === 'ETIMEDOUT' ? 'worktree-add-timeout'
+    : add.signal ? `worktree-add-signal-${add.signal}` : 'worktree-add-failed';
+  return {
+    status: 'unknown', unknownReason: 'infrastructure-failure', childResponsibility: 'none',
+    log: `baseline ${reason} (code ${String(add.status)}, elapsed ${elapsedMs}ms, limit ${BASELINE_WORKTREE_ADD_TIMEOUT_MS}ms)`,
+    output: `${add.stdout}\n${add.stderr}`,
+  };
 }
 
 function junitReportTemporaryDirectory(): string {
@@ -920,8 +948,16 @@ export function withBaselineWorktree<T>(cwd: string, baseRef: string, run: (base
   const baselineDir = mkdtempSync(join(tmpdir(), 'elanous-gate-baseline-'));
   let attached = false;
   try {
-    const add = runGitCommand(cwd, gateWorktreeAddArgs(baselineDir, baseRef), { encoding: 'utf8', timeout: 60_000 });
-    if (add.status !== 0) return classifyBaselineProcess({ status: add.status, stdout: add.stdout, stderr: add.stderr });
+    const started = Date.now();
+    const add = runGitCommand(cwd, gateWorktreeAddArgs(baselineDir, baseRef), { encoding: 'utf8', timeout: BASELINE_WORKTREE_ADD_TIMEOUT_MS, killSignal: 'SIGKILL' });
+    const elapsedMs = Date.now() - started;
+    debug.log('self-implement.gate-baseline', 'worktree-add-result', {
+      phase: 'baseline',
+      status: add.status, signal: add.signal ?? null, errorCode: add.errorCode ?? null,
+      elapsedMs, timeoutMs: BASELINE_WORKTREE_ADD_TIMEOUT_MS, parentRssBytes: process.memoryUsage().rss,
+      cgroupMemoryCurrentBytes: cgroupMemoryBytes('memory.current'), cgroupMemoryLimitBytes: cgroupMemoryBytes('memory.max'),
+    });
+    if (add.status !== 0) return classifyBaselineWorktreeAddFailure(add, elapsedMs);
     attached = true;
     linkDependencies(cwd, baselineDir);
     return run(baselineDir);
@@ -953,8 +989,16 @@ function withVerifyWorktree<T>(cwd: string, baseRef: string, run: (dir: string) 
   let attached = false;
   try {
     dir = mkdtempSync(join(tmpdir(), 'elanous-gate-baseline-'));
-    const add = runGitCommand(cwd, gateWorktreeAddArgs(dir, baseRef), { encoding: 'utf8', timeout: 60_000 });
-    if (add.status !== 0) return classifyBaselineProcess({ status: add.status, stdout: add.stdout, stderr: add.stderr });
+    const started = Date.now();
+    const add = runGitCommand(cwd, gateWorktreeAddArgs(dir, baseRef), { encoding: 'utf8', timeout: BASELINE_WORKTREE_ADD_TIMEOUT_MS, killSignal: 'SIGKILL' });
+    const elapsedMs = Date.now() - started;
+    debug.log('self-implement.gate-baseline', 'worktree-add-result', {
+      phase: 'verify',
+      status: add.status, signal: add.signal ?? null, errorCode: add.errorCode ?? null,
+      elapsedMs, timeoutMs: BASELINE_WORKTREE_ADD_TIMEOUT_MS, parentRssBytes: process.memoryUsage().rss,
+      cgroupMemoryCurrentBytes: cgroupMemoryBytes('memory.current'), cgroupMemoryLimitBytes: cgroupMemoryBytes('memory.max'),
+    });
+    if (add.status !== 0) return classifyBaselineWorktreeAddFailure(add, elapsedMs);
     attached = true;
     linkDependencies(cwd, dir);
     return run(dir);

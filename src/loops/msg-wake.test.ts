@@ -451,19 +451,42 @@ test('failed re-knocks count toward the cap and then give up; a stale deferral g
 });
 
 test('the test universe never records or redelivers deferrals; the poller re-knocks on its tick', async () => {
-  const isolated = fixture({ live: false });
-  isolated.setTurn('busy');
-  await wakeRecipient('OPT', 50, { from: 'OP' }, isolated.deps);
-  expect(await redeliverPendingWakes({ ...isolated.deps, live: true })).toEqual([]);
-  const f = fixture();
-  f.setTurn('busy');
-  await wakeRecipient('OPT', 51, { from: 'OP' }, f.deps);
-  f.setTurn('idle');
-  const stop = startPendingWakePoller('tui:1', f.deps, 5);
+  const log = spyOn(debug, 'log');
   try {
-    for (let i = 0; i < 100 && f.injected.length === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
-  } finally { stop(); }
-  expect(f.injected).toEqual([['tui:1', redeliverLine({ address: 'OPT', last_from: 'OP', first_msg_id: 51, last_msg_id: 51, count: 1 })]]);
+    const f = fixture();
+    f.setTurn('busy');
+    expect((await wakeRecipient('OPT', 51, { from: 'OP' }, f.deps)).result).toBe('busy');
+    expect(pendingEvents(log)).toEqual([['deferred', 'OPT', 1]]);
+    // A recorded pending wake survives a not-live poll without injection or deletion.
+    expect(await redeliverPendingWakes({ ...f.deps, live: false })).toEqual([]);
+    expect(await redeliverPendingWakes({ ...f.deps, live: false })).toEqual([]);
+    expect(f.injected).toEqual([]);
+    expect(pendingEvents(log)).toEqual([['deferred', 'OPT', 1], ['skip', undefined, undefined]]);
+    expect(log.mock.calls.filter(call => call[0] === 'loops.msg-wake' && call[1] === 'skip').map(call => call[2]))
+      .toEqual([{ reason: 'not-live' }]);
+    f.setTurn('idle');
+    expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'redelivered', count: 1 }]);
+    expect(f.injected).toEqual([['tui:1', redeliverLine({ address: 'OPT', last_from: 'OP', first_msg_id: 51, last_msg_id: 51, count: 1 })]]);
+    expect(pendingEvents(log)).toEqual([['deferred', 'OPT', 1], ['skip', undefined, undefined], ['redelivered', 'OPT', 1]]);
+
+    const isolated = fixture({ live: false });
+    isolated.setTurn('busy');
+    expect((await wakeRecipient('OPT', 50, { from: 'OP' }, isolated.deps)).result).toBe('skipped-test-universe');
+    expect(await redeliverPendingWakes(isolated.deps)).toEqual([]);
+    expect(isolated.injected).toEqual([]);
+    expect(await redeliverPendingWakes({ ...isolated.deps, live: true })).toEqual([]);
+    const poller = fixture();
+    poller.setTurn('busy');
+    await wakeRecipient('OPT', 52, { from: 'OP' }, poller.deps);
+    poller.setTurn('idle');
+    const stop = startPendingWakePoller('tui:1', poller.deps, 5);
+    try {
+      for (let i = 0; i < 100 && poller.injected.length === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
+    } finally { stop(); }
+    expect(poller.injected).toEqual([['tui:1', redeliverLine({ address: 'OPT', last_from: 'OP', first_msg_id: 52, last_msg_id: 52, count: 1 })]]);
+    // The module latch emits one skip only, even after more not-live polls.
+    expect(pendingEvents(log).filter(event => event[0] === 'skip')).toEqual([['skip', undefined, undefined]]);
+  } finally { log.mockRestore(); }
 });
 
 test('a slow fresh wake only absorbs what was stored before it — a later deferral survives and is redelivered', async () => {

@@ -1,0 +1,84 @@
+graph_id: ta-journey
+version: 1
+launcher: harness-say
+entry_node: entry
+terminal_nodes: [done, failed, needs-human, rework]
+nodes:
+  - node_id: entry
+    kind: subgraph
+    recipe: none
+    call: entry@1
+    max_visits: 1
+    budget: { inner_steps: 10 }
+    contract: { inputs: [ask, context, prior], tools: harness-say, outputs: [result, evidence] }
+  - node_id: author
+    kind: subgraph
+    recipe: none
+    call: author@1
+    max_visits: 1
+    budget: { inner_steps: 10 }
+    contract: { inputs: [ask, context, prior], tools: harness-say, outputs: [result, evidence] }
+  - node_id: dispatch-pod
+    kind: subgraph
+    recipe: none
+    call: dispatch-pod@1
+    max_visits: 1
+    budget: { inner_steps: 10 }
+    contract: { inputs: [ask, context, prior], tools: harness-say, outputs: [result, evidence] }
+  - node_id: pr
+    kind: subgraph
+    recipe: none
+    call: pr@1
+    max_visits: 1
+    budget: { inner_steps: 10 }
+    contract: { inputs: [ask, context, prior], tools: harness-say, outputs: [result, evidence] }
+  - node_id: harvest
+    kind: subgraph
+    recipe: none
+    call: verb-harvest@1
+    max_visits: 1
+    budget: { inner_steps: 10 }
+    contract: { inputs: [ask, context, prior], tools: harness-say, outputs: [result, evidence] }
+  - node_id: land
+    kind: subgraph
+    recipe: none
+    call: land@1
+    max_visits: 1
+    budget: { inner_steps: 10 }
+    contract: { inputs: [ask, context, prior], tools: harness-say, outputs: [result, evidence] }
+  - node_id: reflect
+    kind: subgraph
+    recipe: none
+    call: reflect@1
+    max_visits: 3
+    budget: { inner_steps: 10 }
+    contract: { inputs: [ask, context, prior], tools: harness-say, outputs: [result, evidence] }
+  - node_id: green
+    kind: subgraph
+    recipe: none
+    call: green@1
+    max_visits: 1
+    budget: { inner_steps: 10 }
+    contract: { inputs: [ask, context, prior], tools: harness-say, outputs: [result, evidence] }
+  - node_id: remember
+    kind: subgraph
+    recipe: none
+    call: remember@1
+    max_visits: 1
+    budget: { inner_steps: 10 }
+    contract: { inputs: [ask, context, prior], tools: harness-say, outputs: [result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: needs-human, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: rework, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: entry, on: outcome, map: { done: author, rework: rework, needs-human: needs-human, failed: failed } }
+  - { from: author, on: outcome, map: { done: dispatch-pod, rework: rework, needs-human: needs-human, failed: failed } }
+  - { from: dispatch-pod, on: outcome, map: { done: pr, rework: rework, needs-human: needs-human, failed: failed } }
+  - { from: pr, on: outcome, map: { done: harvest, rework: rework, needs-human: needs-human, failed: failed } }
+  - { from: harvest, on: outcome, map: { done: land, rework: rework, needs-human: needs-human, failed: failed } }
+  - { from: land, on: outcome, map: { done: reflect, rework: rework, needs-human: needs-human, failed: failed } }
+  - { from: reflect, on: outcome, map: { done: green, wait: reflect, needs-human: needs-human } }
+  - { from: green, on: outcome, map: { done: remember, rework: rework, needs-human: needs-human, failed: failed } }
+  - { from: remember, on: outcome, map: { done: done, rework: rework, needs-human: needs-human, failed: failed } }
+

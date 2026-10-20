@@ -31,6 +31,15 @@ function writeConfig(value: unknown): void {
   writeFileSync(configPath, JSON.stringify(value));
 }
 
+test('taskAgent.rejudgeMaxAgeHours accepts a positive finite number and drops invalid values', () => {
+  writeConfig({ taskAgent: { rejudgeMaxAgeHours: 48 } });
+  expect(buildUserConfig(configPath).taskAgent?.rejudgeMaxAgeHours).toBe(48);
+  for (const invalid of [0, -1, '48', null]) {
+    writeConfig({ taskAgent: { rejudgeMaxAgeHours: invalid } });
+    expect(buildUserConfig(configPath).taskAgent?.rejudgeMaxAgeHours).toBeUndefined();
+  }
+});
+
 function setProcessEnv(vars: Record<string, string | undefined>): void {
   for (const [key, value] of Object.entries(vars)) {
     if (!savedEnv.has(key)) savedEnv.set(key, process.env[key]);

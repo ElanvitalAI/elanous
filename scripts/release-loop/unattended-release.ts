@@ -10,6 +10,7 @@ import { isLandingFreezeRefusal, readLandingFreeze, LandingFrozenError } from '.
 import { debug } from '../../src/debug/log.js';
 import { runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { withOpSeatFlock } from '../../src/steward/resync-tick.js';
+import { ReleaseRunClaimConflict, findActiveReleaseRun } from '../../src/cli/release-single-flight.js';
 import { releaseRunUniverse } from './release-universe.js';
 import { baseVersion, isStableVersion, nextPrereleaseVersion, type PrereleaseKind } from './release-version.js';
 import { publishAtError } from './publish-at.js';
@@ -19,6 +20,8 @@ const VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
 
 export interface ReleaseLoopConfig {
+  /** Mid-cycle full-gate rehearsal, hours before cut (default 12; 0 disables). */
+  rehearsalHardIntervalHours?: number;
   gatePodPool?: string;
   gatePodBunCache?: string;
   gatePodShards?: number;
@@ -138,7 +141,7 @@ export function buildReleaseRunInput(version: string, deps: UnattendedReleaseDep
 
 /** Fail closed at the entry boundary, before any graph node can change a release. */
 export async function runUnattendedRelease(
-  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string },
+  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; forceNew?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string },
   deps: UnattendedReleaseDeps = {},
 ): Promise<{ input: ReleaseRunInput; dryRun: boolean; state?: GraphRunState }> {
   // A dry run only builds the input and mutates nothing, so it neither creates nor waits on the OP-seat lock.
@@ -149,7 +152,7 @@ export async function runUnattendedRelease(
 }
 
 async function runUnattendedReleaseLocked(
-  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string },
+  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; forceNew?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string },
   deps: UnattendedReleaseDeps,
 ): Promise<{ input: ReleaseRunInput; dryRun: boolean; state?: GraphRunState }> {
   // RELEASE-BRANCH (10-06): the default cut is a release branch, so main keeps landing and the run no longer needs a
@@ -188,6 +191,9 @@ async function runUnattendedReleaseLocked(
   if (beforeGraph && !opts.forceFreeze) throw new LandingFrozenError(beforeGraph);
   // RELEASE-LEDGER-UNIVERSE: one universe for the run ledger, the release ledger and every node subprocess.
   const root = releaseRunUniverse({ root: deps.ledgerRoot });
+  // Resume and fresh runs share the OP-seat flock. Recheck under that flock so a
+  // resume that began after CLI preflight cannot slip between the ledger scan and graph start.
+  if (!opts.forceNew && findActiveReleaseRun(version, root)) throw new ReleaseRunClaimConflict();
   const state = await (deps.graph ?? runGraph)(GRAPH, { input, pinChildUniverse: true, deps: { root } });
   // A freeze switched on while the graph ran stops gate or publish inside it. Only a failed gate/publish node whose own
   // record is the freeze refusal is reported as the freeze; any other failure keeps its own reason.

@@ -169,6 +169,90 @@ describe('RFC §5 3단계 — 오버레이 적용 (⛔ 얹은 «결과»를 다�
     expect(result.rejections.some((r) => r.kind === 'node-without-contract')).toBe(true);
   });
 
+  test('기존 종결 gate 의 무계약은 허용하되 실행 노드의 계약 삭제는 거절한다', () => {
+    const unmodified = applyGraphOverlays(base, []);
+    expect(unmodified.ok).toBe(true);
+
+    const result = applyGraphOverlays(base, [overlay([
+      { op: 'remove', path: '/nodes/6/contract' },
+    ])]);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.rejections).toContainEqual({ kind: 'node-without-contract', overlayId: 'test', nodeId: 'rework' });
+
+    const changedTerminal = applyGraphOverlays(base, [overlay([
+      { op: 'replace', path: '/nodes/13/kind', value: 'agent' },
+    ])]);
+    expect(changedTerminal.ok).toBe(false);
+    if (changedTerminal.ok) return;
+    expect(changedTerminal.rejections).toContainEqual({ kind: 'node-without-contract', overlayId: 'test', nodeId: 'landed' });
+
+    const outgoingTerminal = applyGraphOverlays(base, [overlay([
+      { op: 'add', path: '/edges/-', value: { from: 'landed', to: 'stopped' } },
+    ])]);
+    expect(outgoingTerminal.ok).toBe(false);
+    if (outgoingTerminal.ok) return;
+    expect(outgoingTerminal.rejections).toContainEqual({ kind: 'node-without-contract', overlayId: 'test', nodeId: 'landed' });
+
+    const baselineWithOutgoing = { ...base, edges: [...base.edges, { from: 'landed', to: 'stopped' }] };
+    const removedOutgoing = applyGraphOverlays(baselineWithOutgoing, [overlay([
+      { op: 'remove', path: `/edges/${base.edges.length}` },
+    ])]);
+    expect(removedOutgoing.ok).toBe(false);
+    if (removedOutgoing.ok) return;
+    expect(removedOutgoing.rejections).toContainEqual({ kind: 'node-without-contract', overlayId: 'test', nodeId: 'landed' });
+
+    const emptyTools = applyGraphOverlays(base, [overlay([
+      { op: 'add', path: '/nodes/13/contract', value: { inputs: [], tools: '', outputs: [] } },
+    ])]);
+    expect(emptyTools.ok).toBe(false);
+    if (emptyTools.ok) return;
+    expect(emptyTools.rejections).toContainEqual({ kind: 'node-without-contract', overlayId: 'test', nodeId: 'landed' });
+
+    const executableRecipe = applyGraphOverlays(base, [overlay([
+      { op: 'replace', path: '/nodes/13/recipe', value: 'cmd:run' },
+    ])]);
+    expect(executableRecipe.ok).toBe(false);
+    if (executableRecipe.ok) return;
+    expect(executableRecipe.rejections).toContainEqual({ kind: 'node-without-contract', overlayId: 'test', nodeId: 'landed' });
+
+    const executableBaseline = {
+      ...base,
+      nodes: base.nodes.map((node) => node.nodeId === 'landed' ? { ...node, recipe: 'cmd:run' } : node),
+    };
+    const unchangedExecutable = applyGraphOverlays(executableBaseline, []);
+    expect(unchangedExecutable.ok).toBe(false);
+    if (unchangedExecutable.ok) return;
+    expect(unchangedExecutable.rejections).toContainEqual({ kind: 'node-without-contract', overlayId: '<none>', nodeId: 'landed' });
+
+    const whitespaceTools = applyGraphOverlays(base, [overlay([
+      { op: 'replace', path: '/nodes/6/contract/tools', value: '   ' },
+    ])]);
+    expect(whitespaceTools.ok).toBe(false);
+    if (whitespaceTools.ok) return;
+    expect(whitespaceTools.rejections).toContainEqual({ kind: 'node-without-contract', overlayId: 'test', nodeId: 'rework' });
+
+    const malformedInputs = applyGraphOverlays(base, [overlay([
+      { op: 'replace', path: '/nodes/6/contract/inputs', value: 'worktree' },
+    ])]);
+    expect(malformedInputs.ok).toBe(false);
+    if (malformedInputs.ok) return;
+    expect(malformedInputs.rejections).toContainEqual({ kind: 'node-without-contract', overlayId: 'test', nodeId: 'rework' });
+  });
+
+  test('새 무계약 종결 gate 는 종결 목록에 넣어도 거절한다', () => {
+    const recoverEdgeIndex = base.edges.findIndex((edge) => edge.from === 'recover');
+    expect(recoverEdgeIndex).toBeGreaterThanOrEqual(0);
+    const result = applyGraphOverlays(base, [overlay([
+      { op: 'add', path: '/nodes/-', value: { nodeId: 'extra-terminal', kind: 'gate', recipe: 'none', maxVisits: 1 } },
+      { op: 'add', path: '/terminalNodes/-', value: 'extra-terminal' },
+      { op: 'add', path: `/edges/${recoverEdgeIndex}/map/extra`, value: 'extra-terminal' },
+    ])]);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.rejections).toContainEqual({ kind: 'node-without-contract', overlayId: 'test', nodeId: 'extra-terminal' });
+  });
+
   test('⛔ 얹은 «결과»가 그래프를 깨면 거절한다 — 노드 집합이 그대로여도 도달 가능성은 바뀐다', () => {
     // merge 로 가는 유일한 길을 끊는다.
     const openPrIndex = base.edges.findIndex((e) => e.from === 'open-pr');

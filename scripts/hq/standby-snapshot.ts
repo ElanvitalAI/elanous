@@ -193,8 +193,33 @@ function pushSurvival(target: string, local: string, manifest: Manifest, root: s
   rmSync(staging, { recursive: true, force: true });
 }
 
+/** Flags that need a value before any snapshot work (STANDBY-SURVIVAL-KEEP-ARGS · mirror parseVerifyArgs / parsePromoteArgs). */
+export const SURVIVAL_VALUE_FLAGS = ['--survival-keep', '--survival-keep-daily', '--prune-survival'] as const;
+
+/** Throw when a survival-keep / prune-survival flag is present without its value/target — same rule as `${flag} requires a value`. */
+export function assertSurvivalKeepArgs(argv: string[]): void {
+  for (const flag of SURVIVAL_VALUE_FLAGS) {
+    for (let i = 0; i < argv.length; i += 1) {
+      const token = argv[i];
+      if (token.startsWith(`${flag}=`)) {
+        if (token === `${flag}=`) throw new Error(`${flag} requires a value`);
+        continue;
+      }
+      if (token !== flag) continue;
+      const value = argv[i + 1];
+      if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+    }
+  }
+}
+
 if (import.meta.main) {
   const argv = process.argv.slice(2);
+  try {
+    assertSurvivalKeepArgs(argv);
+  } catch (error) {
+    console.error(`standby-snapshot: ${String(error)}`);
+    process.exit(2);
+  }
   const val = (k: string) => { const i = argv.indexOf(k); return i >= 0 ? argv[i + 1] : undefined; };
   const tier = (val('--tier') ?? 'core') as Tier;
   if (tier !== 'core' && tier !== 'big' && tier !== 'obs') { console.error('--tier core|big|obs'); process.exit(2); }

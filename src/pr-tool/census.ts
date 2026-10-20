@@ -11,6 +11,7 @@ export type PrToolCommand = (command: string, args: readonly string[], opts?: { 
 export type Seat = 'OP' | 'TC' | 'MK' | 'UX';
 export interface OpenPr {
   number: number;
+  headRefName?: string;
   title: string;
   draft: boolean;
   updatedAt: string;
@@ -20,6 +21,8 @@ export interface OpenPr {
   seat: Seat | null;
   lastCommitAt?: string;
   cellId: string | null;
+  cardId?: string | null;
+  cardMarkerPresent?: boolean;
   hunks?: readonly DiffHunk[];
 }
 export type Inventory = { status: 'checked'; prs: readonly OpenPr[] } | { status: 'unknown'; reason: string };
@@ -31,7 +34,8 @@ export type GuardCode = 'inventory-unknown' | 'candidate-unknown' | 'goal-only' 
 export interface GuardReason { code: GuardCode; detail: string; prs?: readonly number[]; files?: readonly string[] }
 /** PR-GUARD-HUNK-WARN (대표 10-17): 줄 겹침은 기본 경고 — 착지 쪽 스마트 머지가 푼다. 'refuse' = 옛 거부 동작. */
 export type HunkOverlapMode = 'refuse' | 'warn';
-export interface GuardVerdict { status: 'allow' | 'refuse' | 'unknown'; reasons: readonly GuardReason[]; warnings: readonly GuardReason[] }
+export interface GuardVerdict { status: 'allow' | 'refuse' | 'unknown'; reasons: readonly GuardReason[]; warnings: readonly GuardReason[];
+  sameCellReuse?: { number: number; branch: string; headSha: string; cellId: string; cardId: string; legacyBound?: true } }
 
 const SEATS = ['OP', 'TC', 'MK', 'UX'] as const;
 const DEFAULT_SEAT_CAP = 30;
@@ -48,6 +52,13 @@ function seatFromLabels(labels: readonly string[]): Seat | null {
 }
 export function cellIdFromBody(body: string): string | null {
   return /^\s*(?:[-*]\s*)?칸\s*:\s*([A-Z][A-Z0-9-]{2,})\s*$/m.exec(body)?.[1] ?? null;
+}
+export function cardIdFromBody(body: string): string | null {
+  const ids = [...body.matchAll(/^\s*(?:[-*]\s*)?카드\s*:\s*([^\r\n]*)$/gm)].map(match => match[1]!.trim());
+  return ids.length > 0 && ids.every(id => /^[A-Za-z0-9][A-Za-z0-9._:-]{2,}$/.test(id) && id === ids[0]) ? ids[0]! : null;
+}
+export function hasCardMarker(body: string): boolean {
+  return /^\s*(?:[-*]\s*)?카드\s*:/m.test(body);
 }
 
 export function parseDiffHunks(patch: string): DiffHunk[] {
@@ -156,10 +167,10 @@ export function readOpenPrs(run: PrToolCommand, options: {
       const body = typeof row.body === 'string' ? row.body : '';
       const seat = seatValue(options.seatOfPr?.({ number: number as number, headRefName, body, labels: labelNames })) ?? seatFromLabels(labelNames);
       const pr: OpenPr = {
-        number: number as number, title: text(row.title, `PR #${number} title`), draft: row.draft,
+        number: number as number, headRefName, title: text(row.title, `PR #${number} title`), draft: row.draft,
         updatedAt: date(row.updated_at, `PR #${number} updated_at`), headSha, labels: labelNames,
         files: projected.get(number as number) ?? pathsForPr(run, number as number, options.cwd), seat,
-        cellId: cellIdFromBody(body),
+        cellId: cellIdFromBody(body), cardId: cardIdFromBody(body), cardMarkerPresent: hasCardMarker(body),
       };
       if (options.candidateFiles?.some(file => pr.files.includes(file))) {
         const patch = run('gh', ['pr', 'diff', String(number), '--patch'], options.cwd ? { cwd: options.cwd } : undefined);
@@ -211,7 +222,7 @@ export function censusOpenPrs(inventory: Inventory, now = Date.now()): Census {
   return result;
 }
 
-export function guardNewPr(input: { files: readonly string[] | null; seat?: Seat | null; seatCap?: number; cellId?: string | null; hunks?: readonly DiffHunk[]; hunkOverlap?: HunkOverlapMode }, inventory: Inventory): GuardVerdict {
+export function guardNewPr(input: { files: readonly string[] | null; seat?: Seat | null; seatCap?: number; cellId?: string | null; cardId?: string | null; boundPrNumber?: number; hunks?: readonly DiffHunk[]; hunkOverlap?: HunkOverlapMode }, inventory: Inventory): GuardVerdict {
   if (!input.files || input.files.length === 0 || input.files.some(file => !file || file.startsWith('/') || file.includes('..'))) {
     const reasons: GuardReason[] = [{ code: 'candidate-unknown', detail: '새 PR 변경 파일을 확인할 수 없음' }];
     debug.log('pr.tool', 'guard-refuse', { status: 'unknown', reasons });
@@ -260,7 +271,14 @@ export function guardNewPr(input: { files: readonly string[] | null; seat?: Seat
   const status = reasons.some(reason => reason.code === 'candidate-unknown') ? 'unknown' : reasons.length ? 'refuse' : 'allow';
   if (status !== 'allow') debug.log('pr.tool', 'guard-refuse', { status, reasons, warnings });
   else if (warnings.length) debug.log('pr.tool', 'guard-warn', { warnings });
-  return { status, reasons, warnings };
+  const legacyBound = sameCell.length === 1 && sameCell[0]?.cardMarkerPresent === false
+    && input.boundPrNumber === sameCell[0].number;
+  const reusable = status === 'refuse' && reasons.length === 1 && reasons[0]?.code === 'same-cell'
+    && input.cardId && sameCell.length === 1 && (sameCell[0]?.cardId === input.cardId || legacyBound)
+    && sameCell[0].headRefName && /^[0-9a-f]{40}$/i.test(sameCell[0].headSha)
+    ? { number: sameCell[0].number, branch: sameCell[0].headRefName, headSha: sameCell[0].headSha,
+      cellId: input.cellId!, cardId: input.cardId, ...(legacyBound ? { legacyBound: true as const } : {}) } : undefined;
+  return { status, reasons, warnings, ...(reusable ? { sameCellReuse: reusable } : {}) };
 }
 
 /** Persist the unknown-read budget across harness processes sharing one instance state root. */

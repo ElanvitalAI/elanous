@@ -1,9 +1,9 @@
 import { setDefaultTimeout, expect, test } from 'bun:test';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { buildUserConfig } from '../user-config.js';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { scheduleTriage, trackTablePrompt, triageIssues, runStewardStage, runStewardStageCommand, runStewardNodeCommand, type TriageIssue, type TriageDecision } from './triage.js';
+import { scheduleTriage, trackTablePrompt, triageIssues, runStewardStage, runStewardStageCommand, runStewardNodeCommand, writeScheduleCheckMarker, type TriageIssue, type TriageDecision } from './triage.js';
 import { markStageStart, readFailureStreak, writeFailureStreak } from './failure-streak.js';
 import { CardStore } from '../task-cards/card-store.js';
 import { triageInputHash, triageWithinBudget } from './triage-budget.js';
@@ -85,6 +85,70 @@ test('a broken schedule check is observed and never stops the Linear sync', asyn
       launchSettings: { mode: 'live' }, scheduleInventory: () => { throw new Error('inventory exploded'); } });
     expect(existsSync(join(root, 'steward', 'issues.json'))).toBe(true);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('sync recovers a corrupt schedule-check marker, reruns the check, and leaves no tmp files', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-marker-recover-'));
+  const fetchFn = (async () => Response.json({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } })) as unknown as typeof fetch;
+  let reads = 0;
+  const reasons: string[] = [];
+  const unregister = debug.registerSink({ name: 'steward-marker-recovered', emit: record => {
+    if (record.category === 'steward.schedule-check' && record.event === 'marker-recovered') reasons.push(String((record.data as { reason: string }).reason));
+  } });
+  const deps = { root, fetch: fetchFn, getSecret: async () => 'key', now: () => new Date('2026-10-04T12:00:00Z'),
+    launchSettings: { mode: 'shadow' as const }, scheduleInventory: () => { reads++; return []; } };
+  try {
+    mkdirSync(join(root, 'steward'), { recursive: true });
+    writeFileSync(join(root, 'steward', 'schedule-check.json'), '{not json');
+    await runStewardStage('sync', deps);
+    expect(reads).toBe(1);
+    expect(reasons.length).toBe(1);
+    expect(reasons[0]).toBeTruthy();
+    expect(JSON.parse(readFileSync(join(root, 'steward', 'schedule-check.json'), 'utf8'))).toEqual({ at: '2026-10-04T12:00:00.000Z' });
+    await runStewardStage('sync', deps);
+    expect(reads).toBe(1);
+    expect(readdirSync(join(root, 'steward')).filter(name => name.includes('.tmp'))).toEqual([]);
+    writeFileSync(join(root, 'steward', 'schedule-check.json'), 'null');
+    await runStewardStage('sync', deps);
+    expect(reads).toBe(2);
+    expect(reasons).toHaveLength(2);
+    expect(reasons[1]).toBe('invalid-marker-shape');
+    expect(JSON.parse(readFileSync(join(root, 'steward', 'schedule-check.json'), 'utf8'))).toEqual({ at: '2026-10-04T12:00:00.000Z' });
+  } finally { unregister(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('failed schedule marker write preserves the previous marker and removes partial tmp', () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-marker-write-fail-'));
+  const marker = join(root, 'schedule-check.json');
+  const before = JSON.stringify({ at: '2026-10-04T11:00:00.000Z' });
+  try {
+    writeFileSync(marker, before);
+    expect(() => writeScheduleCheckMarker(marker, new Date('2026-10-04T12:00:00Z'), (tmp, data) => {
+      writeFileSync(tmp, data.slice(0, 4));
+      throw new Error('injected write failure');
+    })).toThrow('injected write failure');
+    expect(readFileSync(marker, 'utf8')).toBe(before);
+    expect(readdirSync(root)).toEqual(['schedule-check.json']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a non-ENOENT schedule-check marker read error is rethrown and observed without stopping the Linear sync', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-marker-eisdir-'));
+  const fetchFn = (async () => Response.json({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } })) as unknown as typeof fetch;
+  let reads = 0;
+  const failures: string[] = [];
+  const unregister = debug.registerSink({ name: 'steward-marker-read-failure', emit: record => {
+    if (record.category === 'steward.schedule-check' && record.event === 'failed') failures.push(String((record.data as { reason: string }).reason));
+  } });
+  try {
+    mkdirSync(join(root, 'steward', 'schedule-check.json'), { recursive: true });
+    await runStewardStage('sync', { root, fetch: fetchFn, getSecret: async () => 'key', now: () => new Date('2026-10-04T12:00:00Z'),
+      launchSettings: { mode: 'shadow' }, scheduleInventory: () => { reads++; return []; } });
+    expect(reads).toBe(0);
+    expect(failures.length).toBe(1);
+    expect(failures[0]).toContain('EISDIR');
+    expect(existsSync(join(root, 'steward', 'issues.json'))).toBe(true);
+  } finally { unregister(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test('live sync extends a fresh healthy launcher lease, shadow does not mutate it', async () => {

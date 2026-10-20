@@ -47,6 +47,87 @@ describe('supersedeDraftsOnMerge', () => {
   const merged = { number: 90, title: '「하니스로 구현」 DRAFT-TRIAGE', branch: 'self-impl/draft-triage-goalid-1-new',
     createdAt: '2026-09-30T00:00:00Z', mergedAt: '2026-10-01T00:00:00Z' };
 
+  it('closes only the explicitly named old OPEN draft in the merged PR cell, in label-comment-close order', async () => {
+    const successor = { ...merged, branch: 'self-impl/new-cell-run', body: '칸: CELL-A\n카드: card-a\n\nSupersedes: #7' };
+    const old = draft(7, { branch: 'self-impl/old-cell-run', body: '칸: CELL-A\n카드: card-a', labels: [running] });
+    const unrelated = draft(8, { branch: 'self-impl/other-cell-run', body: '칸: CELL-B', labels: [running] });
+    const fixture = make([old, unrelated]);
+    fixture.adapters.listIssueComments = async () => [];
+    fixture.adapters.commentDraft = async (_repository, number, body) => {
+      expect(body).toContain('same-cell-superseded #7 -> #90');
+      fixture.calls.push(`comment:${number}`);
+    };
+    expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged: successor, adapters: fixture.adapters }))
+      .toEqual({ closed: [7], kept: [8] });
+    expect(fixture.calls.filter((call) => /^(label|comment|close):/.test(call)))
+      .toEqual([`label:7:${running}=>${superseded}`, 'comment:7', 'close:7']);
+  });
+
+  it('the CLI-only mode never runs generic merged-goal cleanup for an unmarked other-cell draft', async () => {
+    const successor = { ...merged, body: '칸: CELL-A\nSupersedes: #7' };
+    const old = draft(7, { body: '칸: CELL-A', labels: [stalled] });
+    const other = draft(8, { branch: 'self-impl/other-goalid-1-run', body: '칸: CELL-B', labels: [stalled] });
+    const fixture = make([old, other]);
+    fixture.adapters.listIssueComments = async () => [];
+    fixture.adapters.commentDraft = async () => {};
+    expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged: successor, adapters: fixture.adapters,
+      onlyExplicitSameCell: true })).toEqual({ closed: [7], kept: [8] });
+    expect(fixture.calls.filter((call) => call.startsWith('close:'))).toEqual(['close:7']);
+  });
+
+  it('keeps unmarked same-cell and mismatched-cell drafts open without an inferred close', async () => {
+    const old = draft(7, { branch: 'self-impl/old-goalid-1-run', body: '칸: CELL-A', labels: [stalled] });
+    const fixture = make([old]);
+    const successor = { ...merged, body: '칸: CELL-A' };
+    expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged: successor, adapters: fixture.adapters }))
+      .toEqual({ closed: [], kept: [7] });
+    expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged: { ...successor, body: '칸: CELL-B\nSupersedes: #7' }, adapters: fixture.adapters }))
+      .toEqual({ closed: [], kept: [7] });
+    expect(fixture.calls.some((call) => /^(label|close):/.test(call))).toBe(false);
+  });
+
+  it('observes comment failure and retries without duplicating a comment after close failure', async () => {
+    const old = draft(7, { branch: 'self-impl/old-cell-run', body: '칸: CELL-A', labels: [running] });
+    const fixture = make([old]);
+    const successor = { ...merged, body: '칸: CELL-A\nSupersedes: #7' };
+    const comments: string[] = [];
+    let closeFails = true;
+    fixture.adapters.listIssueComments = async () => comments;
+    fixture.adapters.commentDraft = async (_repository, number, body) => { comments.push(body); fixture.calls.push(`comment:${number}`); };
+    fixture.adapters.closeDraft = async (_repository, number) => {
+      if (closeFails) throw new Error('close unavailable');
+      fixture.calls.push(`close:${number}`);
+    };
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged: successor, adapters: fixture.adapters }))
+        .toEqual({ closed: [], kept: [7] });
+      expect(log).toHaveBeenCalledWith('drafts.cleanup', 'same-cell-supersede-failed', {
+        merged: 90, old: 7, error: 'Error: close unavailable',
+      });
+      closeFails = false;
+      expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged: successor, adapters: fixture.adapters }))
+        .toEqual({ closed: [7], kept: [] });
+      expect(fixture.calls.filter((call) => call === 'comment:7')).toHaveLength(1);
+    } finally { log.mockRestore(); }
+  });
+
+  it('never closes after a failed replacement comment or when the old draft is protected', async () => {
+    const successor = { ...merged, body: '칸: CELL-A\nSupersedes: #7' };
+    const old = draft(7, { branch: 'self-impl/old-cell-run', body: '칸: CELL-A', labels: [running] });
+    const fixture = make([old]);
+    fixture.adapters.listIssueComments = async () => [];
+    fixture.adapters.commentDraft = async () => { throw new Error('comment unavailable'); };
+    expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged: successor, adapters: fixture.adapters }))
+      .toEqual({ closed: [], kept: [7] });
+    expect(fixture.calls.some((call) => call.startsWith('close:'))).toBe(false);
+    fixture.adapters.listDrafts = async () => [{ ...old, labels: [keep] }];
+    fixture.calls.length = 0;
+    expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged: successor, adapters: fixture.adapters }))
+      .toEqual({ closed: [], kept: [7] });
+    expect(fixture.calls.some((call) => /^(label|close):/.test(call))).toBe(false);
+  });
+
   it('closes only an older same-goal draft, protecting release, keep, approval, live and other goals', async () => {
     const rows = [
       draft(1, { title: merged.title, labels: [stalled] }),
@@ -159,7 +240,7 @@ describe('supersedeDraftsOnMerge', () => {
       .toEqual({ closed: [7], kept: [] });
   });
 
-  it('closes earlier open harness drafts matched by goal id, slot id or branch prefix, linking the merged PR', async () => {
+  it('closes earlier open harness drafts matched by goal id or branch prefix while leaving unmarked same-cell drafts open', async () => {
     const landed = { ...merged, title: 'new title', body: '칸: TC-17',
       branch: 'self-impl/shared-aaaaaaaa-r9' };
     const rows = [
@@ -179,13 +260,11 @@ describe('supersedeDraftsOnMerge', () => {
     fixture.adapters.getLatestFileChanges = async () => ({ 'src/a.ts': '2026-09-29T12:00:00Z' });
     const goalLanded = { ...landed, branch: 'self-impl/new-goalid-deadbeef-run' };
     expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged: goalLanded, adapters: fixture.adapters }))
-      .toEqual({ closed: [21, 22], kept: [23, 24, 25, 26] });
+      .toEqual({ closed: [21], kept: [22, 23, 24, 25, 26] });
     fixture.calls.length = 0;
     expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged: landed, adapters: fixture.adapters }))
-      .toEqual({ closed: [22, 23], kept: [21, 24, 25, 26] });
+      .toEqual({ closed: [23], kept: [21, 22, 24, 25, 26] });
     expect(fixture.calls.filter((call) => call.startsWith('label:') || call.startsWith('close:'))).toEqual([
-      `label:22:${stalled}=>${superseded}`,
-      'close:22',
       `label:23:${stalled}=>${superseded}`,
       'close:23',
     ]);

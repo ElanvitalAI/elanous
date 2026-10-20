@@ -9,13 +9,14 @@ import { join, relative, resolve } from 'node:path';
 import { registerTasksCommands, spawnDetachedConfirmed, type DetachedSpawn } from '../cli/tasks-cli.js';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { abandonedDraftReleaseNote, closeTaskCard, draftTaskOwner, handTask, launchArgs, nextMoveFor, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, selectTaskComposition, TASK_CARD_LABEL, RUN_TAG_CHANGE_EVENT, runTagChange, taskCardLabelContext, TaskAgentStateError, type TaskCard, type TaskLaunchContext } from './task-hand.js';
+import { abandonedDraftReleaseNote, cardsTouchingPaths, closeTaskCard, draftTaskOwner, handTask, launchArgs, nextMoveFor, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, selectTaskComposition, TASK_CARD_LABEL, RUN_TAG_CHANGE_EVENT, runTagChange, taskCardLabelContext, TaskAgentStateError, type TaskCard, type TaskLaunchContext } from './task-hand.js';
 import { addItem, checklistDevVersion } from '../release-loop/checklist.js';
 import { listHarnessQueue, queueHeadBefore, type HarnessQueueDeps } from '../harness/harness-queue.js';
 import { installHarnessCliCommand } from '../harness/harness-cli-command.js';
 import { setUserConfigOverlay } from '../user-config.js';
 import { deriveBirthIdentity, parseRunIdentityTag, runPriorityClass, validateRunIdentity, type RunIdentity } from './run-identity.js';
 import { parseWorkOrder } from './work-order.js';
+import { draftReleaseComment } from '../self-dev/draft-triage-rules.js';
 
 test('only a unique launched code-PR card owns the PR or its opening run', () => {
   const base: TaskCard = { id: 'ta-one', text: 'draft', createdAt: '2026-10-10T00:00:00Z',
@@ -54,16 +55,37 @@ test('1판 조합: code-pr의 해석 결과를 기록하고 기존 harness say �
   const off = debug.registerSink({ name: 'graph-select-code-test', emit: (rec) => { if (rec.category === 'task-agent.graph-select') events.push(rec); } });
   let result: Awaited<ReturnType<typeof handTask>>;
   try {
-    result = await handTask({ text: 'ship code', seat: 'MK', statePath: path, live: true,
+    const text = 'ship code\n완료 경계 코드: src/task-agent/task-hand.ts 변경\n완료 경계 실물: code-pr 카드 발사\n완료 경계 증거 명령: bun test src/task-agent/task-hand.test.ts';
+    result = await handTask({ text, seat: 'MK', statePath: path, live: true,
       launcher: (args) => { calls.push(args); } });
+    expect(calls[0]?.at(-1)).toBe(text);
   } finally { off(); }
-  expect(calls).toEqual([['harness', 'say', '--seat', 'MK', '--substrate', 'pod', '--merge-by-host', 'ship code']]);
+  expect(calls).toEqual([['harness', 'say', '--seat', 'MK', '--substrate', 'pod', '--merge-by-host', result.card.text]]);
   expect(readTaskCard(result.card.id, path)).toMatchObject({ composition: selected.composition,
     graphSelectedBy: 'completion', unitsResolved: selected.unitsResolved, missingUnits: selected.missingUnits });
   expect(events).toContainEqual(expect.objectContaining({ event: 'composition-selected', data: expect.objectContaining({
     completion: 'code-pr', file: 'graphs/work/code-pr.yaml', unitsResolved: selected.unitsResolved, missingUnits: selected.missingUnits,
   }) }));
   } finally { resetElanousConfigDir(); }
+});
+
+test('live code-pr 완료 경계 누락은 카드에 수정 지시를 남기고 Pod launcher 호출 전에 멈춘다', async () => {
+  const path = statePath();
+  let launches = 0;
+  const events: Array<{ category: string; event: string; data?: unknown }> = [];
+  const off = debug.registerSink({ name: 'task-done-boundary-test', emit: (record) => events.push(record) });
+  try {
+    await expect(handTask({ id: 'ta-20261018-boundary', text: '대상 경로: src/task-agent/task-hand.ts',
+      checklistId: 'AUT-AC-BOUNDARY-MISSING', live: true, statePath: path,
+      launcher: () => { launches++; } })).rejects.toThrow('goal-revision-required: 완료 경계 누락 완료 경계 코드 · 완료 경계 실물 · 완료 경계 증거 명령');
+  } finally { off(); }
+  expect(launches).toBe(0);
+  const card = readTaskCard('ta-20261018-boundary', path)!;
+  expect(card.status).toBe('failed');
+  expect(card.history.at(-1)).toMatchObject({ event: 'goal-revision-required', detail: expect.stringContaining('완료 경계 증거 명령') });
+  expect(nextMoveFor(card).kind).toBe('wait');
+  expect(events).toContainEqual(expect.objectContaining({ category: 'task-agent.hand', event: 'done-boundary-missing',
+    data: expect.objectContaining({ missing: ['완료 경계 코드', '완료 경계 실물', '완료 경계 증거 명령'] }) }));
 });
 
 test('단위 해석은 러너 resolveUnit 규칙으로 id·판을 확인하고 실제 단위가 생기면 true가 된다', () => {
@@ -282,20 +304,53 @@ test('Pod 카드 라벨 맥락은 원장 id 그대로이며 카드·원장·발�
   expect(move.command).toEqual(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'ship it']);
 });
 
+test('대상 경로는 첫 줄에서 정규화해 카드·show에 남기고 도는 카드의 교집합만 찾는다', async () => {
+  const path = statePath();
+  const events: unknown[] = [];
+  const off = debug.registerSink({ name: 'card-target-paths-test', emit: (rec) => {
+    if (rec.category === 'task-agent.hand' && rec.event === 'target-paths') events.push(rec.data);
+  } });
+  let card: TaskCard;
+  let unlabelled: TaskCard;
+  try {
+    card = (await handTask({ id: 'ta-target-paths-a', text: '대상 경로: src/b.ts · `src/a.ts` · src/a.ts · src/a:b.ts · /tmp/no.ts · ../outside.ts · C:/not-repo.ts\nship code', statePath: path })).card;
+    unlabelled = (await handTask({ id: 'ta-target-paths-old', text: 'ship code without path label', statePath: path })).card;
+  } finally { off(); }
+  expect(card.targetPaths).toEqual(['src/a.ts', 'src/a:b.ts', 'src/b.ts']);
+  expect(Object.hasOwn(unlabelled, 'targetPaths')).toBe(false);
+  expect(readTaskCard(card.id, path)?.targetPaths).toEqual(['src/a.ts', 'src/a:b.ts', 'src/b.ts']);
+  expect(events).toContainEqual(expect.objectContaining({ card: card.id, count: 3, labelMissing: false }));
+  expect(events).toContainEqual(expect.objectContaining({ card: unlabelled.id, count: 0, labelMissing: true }));
+  const liveA = { ...card, status: 'launched' as const, checklistId: 'CELL-A', runId: 'run-a', pr: 100 };
+  const liveB = { ...card, id: 'ta-target-paths-b', status: 'launched' as const, checklistId: 'CELL-B', pr: { number: 101 } };
+  expect(cardsTouchingPaths([liveA, liveB, { ...liveA, id: 'done', status: 'done' },
+    { ...liveA, id: 'landed', postLand: { pr: 100, head: 'abc', at: 'now', outcome: 'complete', evidence: [], remaining: [] } },
+    { ...unlabelled, status: 'launched' }], ['src/a.ts'])).toEqual([
+    { card: liveA, checklistId: 'CELL-A', runId: 'run-a', pr: 100, paths: ['src/a.ts'] },
+    { card: liveB, checklistId: 'CELL-B', pr: 101, paths: ['src/a.ts'] },
+  ]);
+  expect(cardsTouchingPaths([liveA, liveB], ['src/a:b.ts']).map((item) => item.card.id)).toEqual([liveA.id, liveB.id]);
+  const shown = await cli(['task', 'show', card.id], { taskStatePath: path });
+  expect(shown.lines).toContain('대상 경로: src/a.ts · src/a:b.ts · src/b.ts');
+  const json = await cli(['task', 'show', card.id, '--json'], { taskStatePath: path });
+  expect(JSON.parse(json.lines[0]!).card.targetPaths).toEqual(['src/a.ts', 'src/a:b.ts', 'src/b.ts']);
+});
+
 test('live handTask 는 카드 라벨 맥락을 기존 launcher 호출에 싣고 명령·cwd·런 연결을 보존한다', async () => {
   const path = statePath();
   const target = mkdtempSync(join(tmpdir(), 'task-hand-label-target-'));
   execFileSync('git', ['init', '-q', target]);
   const calls: Array<{ args: string[]; cwd?: string; context?: TaskLaunchContext }> = [];
   const result = await handTask({
-    id: 'ta-20261009-label01', text: '  write report  ', completion: 'code-pr',
+    id: 'ta-20261009-label01', text: 'write report\n완료 경계 코드: src/task-agent/task-hand.ts 변경\n완료 경계 실물: code-pr 카드 발사\n완료 경계 증거 명령: bun test src/task-agent/task-hand.test.ts', completion: 'code-pr',
     project: { id: 'p1', target }, seat: 'TC', checklistId: 'CELL-1', live: true, statePath: path,
     launcher: (args, cwd, context) => { calls.push({ args, cwd, context }); return { runId: context!.runId }; },
   });
   expect(calls).toHaveLength(1);
-  expect(calls[0]!.args).toEqual(['harness', 'say', '--seat', 'TC', '--substrate', 'pod', '--merge-by-host', 'write report']);
+  expect(calls[0]!.args).toEqual(['harness', 'say', '--seat', 'TC', '--substrate', 'pod', '--merge-by-host', result.card.text]);
   expect(calls[0]!.cwd).toBe(target);
   expect(calls[0]!.context).toMatchObject({
+    substrate: 'pod', podGoal: result.card.text,
     cardLabelContext: { cardId: result.card.id, labels: { [TASK_CARD_LABEL]: result.card.id } },
     env: { ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: result.card.id, ELANOUS_POD_SLOT_ID: 'CELL-1', ELANOUS_POD_OWNER_KIND: 'seat', ELANOUS_POD_OWNER_ID: 'TC' },
   });
@@ -666,7 +721,7 @@ test('run identity: P0 칸 손 발사가 identity class=critical·care=special·
     checklistCell: () => ({ title: '런 신분 태그 칸', priority: 'P0', version: '0.2.32' }), statePath: path });
   expect(card.identity?.class).toBe('critical');
   expect(card.identity?.care).toBe('special');
-  expect(card.identity?.rights).toBe('s'); // 출생은 권한을 올리지 않는다(올림은 --tag rights=… 명시만)
+  expect(card.identity?.rights).toBeUndefined(); // RUN-IDENTITY-RIGHTS: 권한 근거 없는 출생은 rights 를 기록하지 않는다(«미기록»)
   expect(card.identity?.protect).toBe(true);
   expect(card.identity?.origin).toEqual({ checklistId: 'RUN-IDENTITY-TAGS', version: '0.2.32', launcher: 'hand' });
   expect(readTaskCard('ta-run-id-p0', path)?.identity).toEqual(card.identity); // 카드 상태 파일 = 원장 정본
@@ -781,11 +836,11 @@ test('run identity 정본: parse/validate — 목록 밖 값은 거부한다', (
 
 test('run identity 출생: 칸 우선순위·대표 표시 규칙', () => {
   expect(deriveBirthIdentity({ priority: 'P0' }, { launcher: 'hand' }))
-    .toEqual({ class: 'critical', care: 'special', rights: 's', protect: true, origin: { launcher: 'hand' } });
+    .toEqual({ class: 'critical', care: 'special', protect: true, origin: { launcher: 'hand' } });
   expect(deriveBirthIdentity({ priority: 'P1', title: '칸' }, { launcher: 'dispatcher' }))
-    .toEqual({ class: 'normal', care: 'standard', rights: 's', protect: false, origin: { launcher: 'dispatcher' } });
+    .toEqual({ class: 'normal', care: 'standard', protect: false, origin: { launcher: 'dispatcher' } });
   expect(deriveBirthIdentity({ priority: 'P2', title: '\u{1F451} 지시 칸' }, { launcher: 'hand' })) // 대표 표시는 care·protect 만 올린다.
-    .toEqual({ class: 'normal', care: 'special', rights: 's', protect: true, origin: { launcher: 'hand' } });
+    .toEqual({ class: 'normal', care: 'special', protect: true, origin: { launcher: 'hand' } });
   expect(runPriorityClass(null)).toBe('normal'); // GATE-PRIORITY «run priority» 흡수 — 없으면 normal
   expect(runPriorityClass({ class: 'landing' })).toBe('landing');
 });
@@ -803,7 +858,7 @@ test('run identity 통합: 실제 P0 칸보드 픽스처에서 tasks hand → �
     expect(hand.code ?? 0).toBe(0);
     const handed = JSON.parse(hand.lines[0]!) as { card: TaskCard; move: { command: string[] } };
     const stored = readTaskCard(handed.card.id, path)!; // 카드 상태 파일 = 원장 정본
-    expect(stored.identity).toEqual({ class: 'critical', care: 'special', rights: 's', protect: true,
+    expect(stored.identity).toEqual({ class: 'critical', care: 'special', protect: true,
       origin: { checklistId: 'RUN-ID-P0-FIXTURE', version, seat: 'OP', launcher: 'hand' } });
     const plainHand = await cli(['task', 'hand', '--checklist', 'RUN-ID-P1-FIXTURE', '--seat', 'OP', '--json'], { taskStatePath: path, releaseVersions: () => [] });
     expect(plainHand.code ?? 0).toBe(0);
@@ -913,7 +968,7 @@ test('run identity ③: 신분 없는 옛 카드 tasks tag — 칸을 다시 조
     const changed = runTagChange(card.id, { tag: 'care=icu', by: 'OP', checklistCell: (id) => { lookups.push(id); return { title: '칸', priority: 'P0', version: '0.2.31' }; } }, path)!;
     expect(lookups).toEqual(['OLD-P0-CELL']); // 재조회했다
     // 반증: 수리 전엔 재조회 없이 class=normal·protect=false ⊕ launcher='hand' 로 확정했다.
-    expect(changed.identity).toEqual({ class: 'critical', care: 'icu', rights: 's', protect: true, origin: { checklistId: 'OLD-P0-CELL', version: '0.2.31', seat: 'MK' } });
+    expect(changed.identity).toEqual({ class: 'critical', care: 'icu', protect: true, origin: { checklistId: 'OLD-P0-CELL', version: '0.2.31', seat: 'MK' } });
     expect(changed.identity?.origin.launcher).toBeUndefined();
     const audit = changed.history.filter((item) => item.event === RUN_TAG_CHANGE_EVENT)[0]!;
     expect([audit.from, audit.to]).toEqual(['special', 'icu']);
@@ -960,17 +1015,49 @@ test('run identity 정본: 칸마다 optional — 있는 칸만 검증하고 없
 
 test('run identity 출생: 읽은 칸이라도 priority·title 이 비면 그 값에서 파생되는 칸은 «미기록»', async () => {
   // 반증: 수리 전엔 빈 priority/title 이 class=normal·care=standard·protect=false 로 확정됐다.
-  expect(deriveBirthIdentity({}, { launcher: 'hand' })).toEqual({ rights: 's', origin: { launcher: 'hand' } });
-  expect(deriveBirthIdentity({ priority: '  ', title: '' }, { launcher: 'hand' })).toEqual({ rights: 's', origin: { launcher: 'hand' } });
-  expect(deriveBirthIdentity({ priority: 'P1' }, { launcher: 'hand' })).toEqual({ class: 'normal', rights: 's', origin: { launcher: 'hand' } }); // 대표 여부 모름
-  expect(deriveBirthIdentity({ title: '칸' }, { launcher: 'hand' })).toEqual({ rights: 's', origin: { launcher: 'hand' } }); // P0 여부 모름
-  expect(deriveBirthIdentity({ title: '\u{1F451} 칸' }, { launcher: 'hand' })).toEqual({ care: 'special', rights: 's', protect: true, origin: { launcher: 'hand' } }); // 대표 는 보이면 올린다 · class 는 모름
+  expect(deriveBirthIdentity({}, { launcher: 'hand' })).toEqual({ origin: { launcher: 'hand' } });
+  expect(deriveBirthIdentity({ priority: '  ', title: '' }, { launcher: 'hand' })).toEqual({ origin: { launcher: 'hand' } });
+  expect(deriveBirthIdentity({ priority: 'P1' }, { launcher: 'hand' })).toEqual({ class: 'normal', origin: { launcher: 'hand' } }); // 대표 여부 모름 · rights 는 근거가 없어 미기록
+  expect(deriveBirthIdentity({ title: '칸' }, { launcher: 'hand' })).toEqual({ origin: { launcher: 'hand' } }); // P0 여부 모름
+  expect(deriveBirthIdentity({ title: '\u{1F451} 칸' }, { launcher: 'hand' })).toEqual({ care: 'special', protect: true, origin: { launcher: 'hand' } }); // 대표 는 보이면 올린다 · class 는 모름 · rights 는 근거가 없어 미기록
   const path = statePath();
   const { card } = await handTask({ id: 'ta-run-id-blank-cell', text: '빈 칸 값', checklistId: 'BLANK-CELL', checklistCell: () => ({ version: '0.2.31' }), statePath: path });
-  expect(card.identity).toEqual({ rights: 's', origin: { checklistId: 'BLANK-CELL', version: '0.2.31', launcher: 'hand' } });
+  expect(card.identity).toEqual({ origin: { checklistId: 'BLANK-CELL', version: '0.2.31', launcher: 'hand' } });
   const show = await cli(['task', 'show', card.id], { taskStatePath: path });
-  expect(show.lines).toContain('신분 class=미기록 · care=미기록 · rights=s · protect=미기록 — 출생 BLANK-CELL · 0.2.31 · hand');
+  expect(show.lines).toContain('신분 class=미기록 · care=미기록 · rights=미기록 · protect=미기록 — 출생 BLANK-CELL · 0.2.31 · hand');
   expect(launchArgs(card).includes('--run-priority')).toBe(false);
+});
+
+test('RUN-IDENTITY-TAGS-2 · RUN-IDENTITY-RIGHTS: 출생 rights 는 명시 태그만 기록한다 — 근거 없음 미기록 · 명시 태그 입력 값 보존', async () => {
+  const config = mkdtempSync(join(tmpdir(), 'task-run-identity-rights-'));
+  setElanousConfigDir(config);
+  try {
+    const version = checklistDevVersion();
+    addItem(version, { id: 'RUN-ID-RIGHTS-CLI', title: 'rights 출생 확인', priority: 'P0' });
+    const path = statePath();
+    // ① 실제 task hand CLI가 조회한 체크리스트에는 권한 출처가 없으므로 rights 를 추정하지 않는다.
+    const noBasis = await cli(['task', 'hand', '--checklist', 'RUN-ID-RIGHTS-CLI', '--version', version, '--json'],
+      { taskStatePath: path, releaseVersions: () => [] });
+    expect(noBasis.code ?? 0).toBe(0);
+    const noBasisResult = JSON.parse(noBasis.lines[0]!);
+    expect(noBasisResult).toMatchObject({ mode: 'shadow', launched: false });
+    const noBasisCard = noBasisResult.card as TaskCard;
+    expect(noBasisCard.identity?.rights).toBeUndefined();
+    expect(readTaskCard(noBasisCard.id, path)?.identity?.rights).toBeUndefined();
+    expect(noBasisCard.identity?.class).toBe('critical');
+    // ② 실제 task hand CLI의 명시 태그는 카드 원장에 입력 값을 보존한다. --live를 주지 않아 발사는 없다.
+    const tagged = await cli(['task', 'hand', '--checklist', 'RUN-ID-RIGHTS-CLI', '--version', version, '--tag', 'rights=m', '--json'],
+      { taskStatePath: path, releaseVersions: () => [] });
+    expect(tagged.code ?? 0).toBe(0);
+    const taggedResult = JSON.parse(tagged.lines[0]!);
+    expect(taggedResult).toMatchObject({ mode: 'shadow', launched: false });
+    const taggedCard = taggedResult.card as TaskCard;
+    expect(taggedCard.identity?.rights).toBe('m');
+    expect(readTaskCard(taggedCard.id, path)?.identity?.rights).toBe('m');
+  } finally {
+    resetElanousConfigDir();
+    rmSync(config, { recursive: true, force: true });
+  }
 });
 
 test('RUN-IDENTITY-TAGS-2 ①: 원장 신분의 출생 기록 형태·타입이 틀리면 거부한다(배열 · 문자열 아닌 checklistId/version/seat)', () => {
@@ -1007,7 +1094,7 @@ test('RUN-IDENTITY-TAGS-2 ②: 판이 다른 같은 id(우선순위 다름) — 
     const path = statePath();
     // 반증: 수리 전엔 판을 넘길 길이 없어 늘 개발 판(P1 → normal)을 읽었다.
     const onOther = await handTask({ id: 'ta-run-id-other-board', text: '다른 판', checklistId: 'RUN-ID-TWO-BOARDS', checklistVersion: other, statePath: path });
-    expect(onOther.card.identity).toEqual({ class: 'critical', care: 'special', rights: 's', protect: true,
+    expect(onOther.card.identity).toEqual({ class: 'critical', care: 'special', protect: true,
       origin: { checklistId: 'RUN-ID-TWO-BOARDS', version: other, launcher: 'hand' } });
     expect(launchArgs(onOther.card)).toContain('--run-priority');
     const onDev = await handTask({ id: 'ta-run-id-dev-board', text: '개발 판', checklistId: 'RUN-ID-TWO-BOARDS', checklistVersion: dev, statePath: path });
@@ -1200,14 +1287,16 @@ test('abandonedDraftReleaseNote — failed 카드 ⊕ PR 있으면 그 PR 의 �
   const at = new Date('2026-10-17T03:00:00Z');
   const card: TaskCard = { id: 'ta-one', text: 'draft', createdAt: '2026-10-10T00:00:00Z',
     status: 'failed', history: [], pr: { number: 19 } };
-  expect(abandonedDraftReleaseNote(card, at)).toEqual({ pr: 19, body: `🔧 처리 끝 — 2026-10-17T03:00:00.000Z · ta-one 포기 경로 — 자동` });
+  expect(abandonedDraftReleaseNote(card, at)).toEqual({ pr: 19, body: draftReleaseComment(at, 'ta-one 포기 경로 — 자동') });
+  expect(abandonedDraftReleaseNote(card, at)?.body).toBe(`🔧 처리 끝 — 2026-10-17T03:00:00.000Z · ta-one 포기 경로 — 자동`);
 });
 
 test('abandonedDraftReleaseNote — launch-failed 카드 ⊕ PR 있으면 그 PR 의 처리 끝 문면', () => {
   const at = new Date('2026-10-17T03:00:00Z');
   const card: TaskCard = { id: 'ta-two', text: 'draft', createdAt: '2026-10-10T00:00:00Z',
     status: 'launch-failed', history: [], pr: 42 };
-  expect(abandonedDraftReleaseNote(card, at)).toEqual({ pr: 42, body: `🔧 처리 끝 — 2026-10-17T03:00:00.000Z · ta-two 포기 경로 — 자동` });
+  expect(abandonedDraftReleaseNote(card, at)).toEqual({ pr: 42, body: draftReleaseComment(at, 'ta-two 포기 경로 — 자동') });
+  expect(abandonedDraftReleaseNote(card, at)?.body).toBe(`🔧 처리 끝 — 2026-10-17T03:00:00.000Z · ta-two 포기 경로 — 자동`);
 });
 
 test('abandonedDraftReleaseNote — launched · handed 는 null', () => {

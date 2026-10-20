@@ -932,8 +932,12 @@ describe('runDashboardChatMainPlainTurn', () => {
       const first = bodies[0]!.input;
       expect(bodies[1]!.input).toEqual(first); // provider's own HTTP retry precedes the TUI repair
       const second = bodies[2]!.input;
-      expect(JSON.stringify(first)).toContain('orphan');
+      // Codex now drops unpaired outputs at the wire boundary (#29530), before this turn repairs history.
+      expect(JSON.stringify(first)).not.toContain('orphan');
       expect(JSON.stringify(second)).not.toContain('orphan');
+      expect(ctx.debugEvents.some(event => event.event === 'pair-check'
+        && event.payload.removedResults === 1)).toBe(true);
+      expect(ctx.chatHistory.some(message => JSON.stringify(message).includes('orphan'))).toBe(false);
       const callIndex = second.findIndex(item => 'type' in item
         && item.type === 'function_call' && item.call_id === 'paired');
       const resultIndex = second.findIndex(item => 'type' in item

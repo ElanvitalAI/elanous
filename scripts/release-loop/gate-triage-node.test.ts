@@ -62,6 +62,11 @@ test('graph context consumes gate output without changing it', () => {
   const output = gate({ outcome: 'regression', introduced: ['a'] });
   const context = { input: { version: '0.2.30', previousVersion: '0.2.29' }, outputs: { gate: output as unknown as Record<string, unknown> } };
   expect(gateTriageShadowFromContext(context).classification).toBe('regression');
+  const graphOutput = { ...output, outcome: 'fail', verdict: 'fail' };
+  expect(gateTriageShadowFromContext({ ...context, outputs: { gate: graphOutput } })).toMatchObject({
+    classification: 'regression', commit: output.commit, failureIds: ['a'],
+  });
+  expect(graphOutput.outcome).toBe('fail');
   expect(gateTriageShadowFromContext({ ...context, input: { ...context.input,
     gateTriageEvidence: { highLoad: true, isolatedReproductions: 0, isolatedCheckedFailureIds: ['a'] } },
     outputs: { gate: gate({ ...output, loadFlaky: ['a'] }) as unknown as Record<string, unknown> } }).classification).toBe('load');
@@ -98,7 +103,7 @@ test('shadow decision records a graph.ground event', () => {
 
 test('standalone entrypoint preserves the failure exit and structured classification', () => {
   const context = { input: { version: '0.2.30', previousVersion: '0.2.29' },
-    outputs: { gate: gate({ outcome: 'regression', introduced: ['src/a.test.ts: fails'] }) } };
+    outputs: { gate: { ...gate({ outcome: 'regression', introduced: ['src/a.test.ts: fails'] }), outcome: 'fail' } } };
   const run = spawnSync('bun', ['scripts/release-loop/gate-triage-node.ts'], {
     cwd: process.cwd(), encoding: 'utf8', timeout: 20_000,
     env: { ...process.env, ELANOUS_GRAPH_CONTEXT: JSON.stringify(context) },

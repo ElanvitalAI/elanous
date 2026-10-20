@@ -160,6 +160,8 @@ export interface NexusClient {
   // ---- harness execution graphs (core read-only · mine editable) ----
   getRunGraphs(): Promise<{ graphs: RunGraphSummary[] }>;
   getRunGraph(id: string): Promise<RunGraphDetail>;
+  /** Server-flattened read-only view of graph unit calls. Keeps `/yaml` as editable source. */
+  getRunGraphFlat?(id: string): Promise<RunGraphDetail>;
   getRunGraphYaml(id: string): Promise<{ id: string; source: 'core' | 'mine'; editable: boolean; yaml: string; steps?: GraphWizardSteps }>;
   getRunGraphAccess(id: string): Promise<{ grants: Array<{ recipient: string; permission: 'view' | 'edit' }> }>;
   putRunGraphAccess(id: string, recipient: string, permission: 'view' | 'edit'): Promise<{ recipient: string; permission: 'view' | 'edit' }>;
@@ -436,10 +438,17 @@ export interface RunGraphDetail {
   id: string;
   source: 'core' | 'mine';
   editable: boolean;
+  graph_hash?: string;
   entry_node: string;
   terminal_nodes: string[];
   nodes: Array<{ node_id: string; kind: string; recipe: string; max_visits: number }>;
-  edges: Array<{ from: string; to?: string; on?: string; map?: Record<string, string> }>;
+  edges: Array<{
+    from: string;
+    to?: string;
+    on?: string;
+    map?: Record<string, string>;
+    fallback?: Array<{ node: string; requires: string[]; observed?: number }>;
+  }>;
 }
 
 // Archon-port T2.3 wire format — PWA `/workflows` (T2A) consumes these.
@@ -1354,6 +1363,7 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     getRunGraphs: () => request('GET', '/v1/graphs'),
     getRunGraph: (id) => request('GET', `/v1/graphs/${encodeURIComponent(id)}`),
     getRunGraphYaml: (id) => request('GET', `/v1/graphs/${encodeURIComponent(id)}/yaml`),
+    getRunGraphFlat: (id) => request('GET', `/v1/graphs/${encodeURIComponent(id)}/flat`),
     getRunGraphAccess: (id) => request('GET', `/v1/graphs/${encodeURIComponent(id)}/access`),
     putRunGraphAccess: (id, recipient, permission) => request('PUT', `/v1/graphs/${encodeURIComponent(id)}/access`, { recipient, permission }),
     putRunGraphYaml: (id, yaml, steps) => request('PUT', `/v1/graphs/${encodeURIComponent(id)}/yaml`, { yaml, ...(steps && Object.keys(steps).length ? { steps } : {}) }),

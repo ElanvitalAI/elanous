@@ -1,9 +1,10 @@
 import { expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { buildCoordRolePack, buildCoordRolePackManifest } from './coord-role-pack.js';
+import { buildCoordRolePack, buildCoordRolePackManifest, type RolePack } from './coord-role-pack.js';
 
 test('coordinator and guardian packs start with L0 prohibitions and have deterministic hashes', () => {
   for (const role of ['coordinator', 'guardian'] as const) {
@@ -210,5 +211,43 @@ test('changing a lint-pass knowhow card body changes sources and the pack hash',
   } finally {
     rmSync(first.root, { recursive: true, force: true });
     rmSync(second.root, { recursive: true, force: true });
+  }
+});
+
+// 실물 CLI 진입(import.meta.main)을 서브프로세스로 지나는 증거 — 합성 fixture 나 소스 문자열이 아니라
+// 생산 명령 `bun scripts/coord-role-pack.ts` 자체를 돌려 라이브러리 경로와 같은 팩이 나오는지 잰다.
+test('CLI entry emits the lint-filtered pack deterministically through the production command', () => {
+  const runCli = (args: string[]) => spawnSync(process.execPath, ['scripts/coord-role-pack.ts', ...args], {
+    cwd: join(import.meta.dir, '..'),
+    encoding: 'utf8',
+    timeout: 60000,
+  });
+  const jsonRun = runCli(['--role', 'coordinator', '--json']);
+  expect(jsonRun.status).toBe(0);
+  const pack = JSON.parse(jsonRun.stdout) as RolePack;
+  // CLI 진입이 내는 팩은 라이브러리 경로가 내는 팩과 같다(진입 배선이 어긋나지 않는다).
+  expect(pack).toEqual(buildCoordRolePackManifest('coordinator'));
+  expect(pack.body.startsWith('# 금지 목록\n')).toBe(true);
+  expect(pack.sha256).toBe(createHash('sha256').update(pack.body).digest('hex'));
+  for (const id of pack.excludedCardIds) expect(id).toMatch(/^K-[A-Za-z]+-\d+$/);
+  // 같은 입력 → 프로세스 경계를 넘어도 같은 출력(결정적 해시).
+  expect(runCli(['--role', 'coordinator', '--json']).stdout).toBe(jsonRun.stdout);
+  // 비밀값은 CLI 출력 전체(JSON 메타데이터 포함)에 없다.
+  expect(jsonRun.stdout).not.toMatch(/sk-proj-|credential assignment|api[_-]?key|K-1014-\d+|\/Users\/[A-Za-z0-9._-]+/i);
+  // 비-JSON 모드는 팩 몸을 그대로 낸다.
+  const bodyRun = runCli(['--role', 'guardian']);
+  expect(bodyRun.status).toBe(0);
+  expect(bodyRun.stdout).toBe(buildCoordRolePack('guardian'));
+});
+
+test('CLI entry rejects missing or invalid --role with usage and exit code 2', () => {
+  for (const args of [[], ['--role', 'bogus']] as const) {
+    const run = spawnSync(process.execPath, ['scripts/coord-role-pack.ts', ...args], {
+      cwd: join(import.meta.dir, '..'),
+      encoding: 'utf8',
+      timeout: 60000,
+    });
+    expect(run.status).toBe(2);
+    expect(run.stderr).toContain('usage: bun scripts/coord-role-pack.ts --role coordinator|guardian [--json]');
   }
 });

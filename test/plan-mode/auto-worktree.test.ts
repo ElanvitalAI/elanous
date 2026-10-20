@@ -6,15 +6,16 @@
 //   - on with a real temp git repo → worktree path returned, branch
 //     created, SWD flipped to it
 //
-// We seed an XDG_CONFIG_HOME-rooted config.json with the desired
-// autoWorktree value, then resetUserConfig() so the next
+// We seed a config-dir override with the desired autoWorktree value,
+// then resetUserConfig() so the next
 // getUserConfig() picks it up.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { execSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
+import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 
 import {
   dispatchEnterPlanMode,
@@ -39,24 +40,28 @@ import {
 import { setWorktreeRuntimeDeps } from '../../src/tool-runtime/git-worktree-runtimes.js';
 
 const prevHome = process.env.HOME;
-const prevXdg = process.env.XDG_CONFIG_HOME;
 const prevCwd = process.cwd();
 const dirs: string[] = [];
+let prevConfigDir: string | undefined;
 
 function seedConfig(home: string, autoWorktree: boolean): void {
   const cfgDir = join(home, 'elanous');
   mkdirSync(cfgDir, { recursive: true });
-  const cfg = autoWorktree ? { plan: { autoWorktree: true } } : {};
+  setElanousConfigDir(cfgDir);
+  const cfg = {
+    tools: { selfImplement: { worktreeRoot: join(home, 'worktrees') } },
+    ...(autoWorktree ? { plan: { autoWorktree: true } } : {}),
+  };
   writeFileSync(join(cfgDir, 'config.json'), JSON.stringify(cfg, null, 2));
   resetUserConfig();
   reloadUserConfig(userConfigPath());
 }
 
 beforeEach(() => {
+  prevConfigDir = getElanousConfigDirOverride();
   const d = mkdtempSync(join(tmpdir(), 'pm-aw-'));
   dirs.push(d);
   process.env.HOME = d;
-  process.env.XDG_CONFIG_HOME = d;
   setPolicy({ mode: 'ask-edit' });
   _resetPlanStateForTesting();
   setWorktreeRuntimeDeps({ sessionId: () => 'test' });
@@ -67,10 +72,10 @@ afterEach(() => {
   resetPolicyToDefault();
   setPlanToolPlanModeGuard(null);
   setWorktreeRuntimeDeps(null);
+  if (prevConfigDir === undefined) resetElanousConfigDir();
+  else setElanousConfigDir(prevConfigDir);
   resetUserConfig();
   process.env.HOME = prevHome;
-  if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
-  else process.env.XDG_CONFIG_HOME = prevXdg;
   setSessionCwd(prevCwd, 'tool');
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
@@ -117,6 +122,9 @@ describe('dispatchEnterPlanMode + plan.autoWorktree=true with a real git repo', 
     setSessionCwd(repoDir, 'tool');
     const r = await dispatchEnterPlanMode({ initialTitle: 'Refactor cache' });
     expect(r.worktreePath).toBeTruthy();
+    expect(r.worktreePath!.startsWith(join(process.env.HOME!, 'worktrees') + sep)).toBe(true);
+    expect(existsSync(join(r.worktreePath!, '.git'))).toBe(true);
+    expect(execSync('git rev-parse --is-inside-work-tree', { cwd: r.worktreePath!, encoding: 'utf8' }).trim()).toBe('true');
     expect(r.worktreeBranch).toBeTruthy();
     // Branch synthesised under session/<ts>-refactor-cache
     expect(r.worktreeBranch!).toContain('refactor-cache');

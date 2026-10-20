@@ -1,6 +1,7 @@
 version: 0
 id: codex-request-rejected-shape-400
 isolation: test
+seed: 28736
 triggers:
   - id: codex-400
     type: codex.responses.fetch

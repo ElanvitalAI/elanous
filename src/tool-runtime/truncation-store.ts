@@ -6,6 +6,10 @@ import type { ChatToolOutputConfig } from '../user-config.js';
 function defaultToolResultsRoot(): string {
   return join(effectiveInstanceRoot(), 'tool-results');
 }
+/** 넘침 파일 뿌리 — TUI 가 «넘침 파일 다시 읽기» 를 잡무로 접을 때 같은 뿌리로 판별한다(TUI-TURN-NARRATION FU-5). */
+export function toolResultsRoot(): string {
+  return defaultToolResultsRoot();
+}
 const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const lastSweepAt = new Map<string, number>();
 

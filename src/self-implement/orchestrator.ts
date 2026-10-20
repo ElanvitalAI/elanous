@@ -93,6 +93,7 @@ import { boundaryGlobs, boundaryViolations } from './goal-boundary.js';
 import { askAtExecution, type ExecutionClarificationResult } from './execution-clarification.js';
 import { classifyOutOfScope } from './scope-adjacency.js';
 import { targetScopedGoalText } from './goal-text-path-scope.js';
+import { selectKnowhowPack } from './knowhow-pack.js';
 import { declaredNewFilePaths } from './goal-new-paths.js';
 import { dropStaleReverts, type RevertGuardResult } from './revert-guard.js';
 import type { SelfDevGoalType } from '../self-dev/orchestrate.js';
@@ -4885,11 +4886,13 @@ async function runSelfImplementInner(
         ...(n.progress ? { progress: n.progress } : {}), ...(n.phases ? { phases: n.phases } : {}),
         ...(n.terminalStages ? { terminal_stages: n.terminalStages } : {}),
         ...(n.fanOut ? { fan_out: n.fanOut } : {}), ...(n.contract ? { contract: n.contract } : {}),
+        ...(n.skipWhen ? { skip_when: n.skipWhen } : {}),
       })),
       edges: variantSpec.edges.map(e => ({
         from: e.from, ...(e.to === undefined ? { on: e.on, map: e.map } : { to: e.to }),
         ...(e.fallback ? { fallback: e.fallback } : {}),
         ...(e.observed === undefined ? {} : { observed: e.observed }),
+        ...(e.when ? { when: e.when } : {}),
       })),
     }), { flag: 'wx' });
     observe('graph-variant-applied', { graphId: variant.template.graphId, overlayId: variant.overlay.overlayId,
@@ -5250,6 +5253,11 @@ async function runSelfImplementInner(
       observe('memory', { injected: true, chars: mem.length });
     } else observe('memory', { injected: false });
   }
+
+  // The repository copy travels with both local and Pod worktrees. Operational HQ ledgers are never read here.
+  const knowhow = selectKnowhowPack(wt.path, opts.feature);
+  if (knowhow.text) round0Feature = `${knowhow.text}\n\n${round0Feature}`;
+  observe('knowhow-pack', { ids: knowhow.ids, bytes: knowhow.bytes, injected: knowhow.bytes > 0 });
 
   const maxRework = Math.max(0, opts.maxReworkRounds ?? 2);
   const selfImplementConfig = (await import('../user-config.js')).getUserConfig().tools.selfImplement;

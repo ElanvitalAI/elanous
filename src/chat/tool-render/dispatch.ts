@@ -18,7 +18,12 @@ import type {
 import { renderToolBlock } from './block.js';
 import { renderToolInline } from './inline.js';
 
-const SUPPORTED_TOOLS = new Set<ToolRenderName>([
+/** 접힌 결과 요약 첫 조각은 `MsgPost` 하나뿐이라 이름 확장을 `dispatch.ts` 안에 둔다.
+ *  `types.ts:ToolRenderName` 은 나머지 도구의 공용 계약 그대로 두고, 이 파일의 내부
+ *  시그니처만 넓힌다(블록·인라인 렌더는 `ToolRenderModel.kind` 문자열만 본다). */
+type ToolRenderKind = ToolRenderName | 'MsgPost';
+
+const SUPPORTED_TOOLS = new Set<ToolRenderKind>([
   'Bash',
   'Read',
   'Grep',
@@ -35,9 +40,10 @@ const SUPPORTED_TOOLS = new Set<ToolRenderName>([
   'WebSearch',
   'WebFetch',
   'GetDashboardState',
+  'MsgPost',
 ]);
 
-export function isToolRenderSupported(name: string): name is ToolRenderName | 'update_plan' | 'update_goal' {
+export function isToolRenderSupported(name: string): name is ToolRenderKind | 'update_plan' | 'update_goal' {
   return normalizeToolRenderName(name) !== null;
 }
 
@@ -48,6 +54,9 @@ export function renderToolCallEvent(
   if (config.displayMode !== 'inline-to-block') return null;
   const kind = normalizeToolRenderName(call.name);
   if (!kind) return null;
+  // Keep the generic running block: a MsgPost error must still fall back to
+  // the same generic result block that was used before this summary slice.
+  if (kind === 'MsgPost') return null;
   const model: ToolRenderModel = {
     kind,
     status: 'running',
@@ -75,9 +84,18 @@ export function renderToolResultVariants(
   if (config.displayMode !== 'inline-to-block') return null;
   const kind = normalizeToolRenderName(call.name);
   if (!kind) return null;
+  // Only successful MsgPost results enter the compact renderer. Returning
+  // null for errors lets the dashboard formatter use its existing generic
+  // result path, including its expanded argument/result view.
+  if (kind === 'MsgPost' && extractErrorText(call.result)) return null;
   const model = buildToolRenderModel(kind, call, config);
   const collapsed = renderToolBlock(model, config.blockMaxLines, config.foldMode, config.expandHint);
-  const expanded = renderToolBlock(model, Number.POSITIVE_INFINITY);
+  // ⭐ MsgPost 는 접힌 행에서 본문을 빼고 펼친 행에서만 싣는다 ⇒ 같은 model 로는 두 변형을
+  //   만들 수 없어, 펼친 쪽만 본문 포함 model 을 따로 세운다(다른 도구는 종전과 동일 model).
+  const expandedModel = kind === 'MsgPost'
+    ? buildToolRenderModel(kind, call, config, { includeMsgPostBody: true })
+    : model;
+  const expanded = renderToolBlock(expandedModel, Number.POSITIVE_INFINITY);
   const variants: ToolRenderResultVariants = {
     collapsed,
     expanded: arraysEqual(collapsed, expanded) ? null : expanded,
@@ -88,22 +106,28 @@ export function renderToolResultVariants(
   return variants;
 }
 
-function normalizeToolRenderName(name: string): ToolRenderName | null {
+interface ToolRenderModelOptions {
+  /** 펼친 변형만 `message.body` 를 싣는다 — 접힌 행에는 본문·전체 JSON 이 남지 않는다. */
+  includeMsgPostBody?: boolean;
+}
+
+function normalizeToolRenderName(name: string): ToolRenderKind | null {
   if (name === 'update_plan' || name === 'UpdatePlan') return 'UpdatePlan';
   if (name === 'update_goal' || name === 'UpdateGoal') return 'UpdateGoal';
-  return SUPPORTED_TOOLS.has(name as ToolRenderName) ? (name as ToolRenderName) : null;
+  return SUPPORTED_TOOLS.has(name as ToolRenderKind) ? (name as ToolRenderKind) : null;
 }
 
 function buildToolRenderModel(
-  kind: ToolRenderName,
+  kind: ToolRenderKind,
   call: ToolRenderResult,
   config?: ToolRenderConfig,
+  options?: ToolRenderModelOptions,
 ): ToolRenderModel {
   const resultRecord = asRecord(call.result);
   const errorText = extractErrorText(call.result);
   const bodyLines = errorText
     ? errorText.split('\n')
-    : buildToolBodyLines(kind, call.args, call.result, resultRecord);
+    : buildToolBodyLines(kind, call.args, call.result, resultRecord, options);
   const status = errorText ? 'error' : 'success';
   const model: ToolRenderModel = {
     kind,
@@ -119,7 +143,7 @@ function buildToolRenderModel(
 }
 
 function summarizeCollapsedToolResult(
-  kind: ToolRenderName,
+  kind: ToolRenderKind,
   status: 'success' | 'error',
   resultRecord: Record<string, unknown> | null,
   bodyLines: string[],
@@ -206,10 +230,12 @@ function summarizeCollapsedToolResult(
 }
 
 function summarizeToolCallForRender(
-  kind: ToolRenderName,
+  kind: ToolRenderKind,
   args: Record<string, unknown>,
   result?: unknown,
 ): string {
+  // ⭐ MsgPost — 행위(`post`)·수신자·(결과가 있으면) id 셋만. 본문은 부르지도 읽지도 않는다.
+  if (kind === 'MsgPost') return summarizeMsgPostCall(args, result);
   if (kind === 'UpdatePlan') {
     const plan = Array.isArray(args.plan) ? args.plan : [];
     const current = plan.find((step) => asRecord(step)?.status === 'in_progress');
@@ -228,6 +254,29 @@ function summarizeToolCallForRender(
   const structuralCallSummary = summarizeStructuralSearchCall(kind, args);
   if (structuralCallSummary) return structuralCallSummary;
   return summarizeToolCall(kind, args);
+}
+
+/** MsgPost 머리글 — 행위(`post`)·수신자·id. 펼치기 전에도 세 가지가 한 줄에 다 있다. */
+function summarizeMsgPostCall(args: Record<string, unknown>, result?: unknown): string {
+  const to = typeof args.to === 'string' ? args.to.trim() : '';
+  const id = msgPostMessage(asRecord(result))?.id;
+  const route = to ? `post → ${to}` : 'post';
+  return typeof id === 'string' || typeof id === 'number' ? `${route} #${id}` : route;
+}
+
+/** 결과 페이로드의 `message` 레코드. 모양을 못 읽으면 `null` — 없는 필드를 지어내지 않는다. */
+function msgPostMessage(resultRecord: Record<string, unknown> | null): Record<string, unknown> | null {
+  return asRecord(resultRecord?.message);
+}
+
+/** MsgPost 결과 본문. 접힌 행은 비우고 펼친 변형에는 원래 결과 전체를 한 번만 싣는다. */
+function buildMsgPostBodyLines(
+  resultRecord: Record<string, unknown> | null,
+  includeMsgPostBody: boolean,
+): string[] {
+  if (!includeMsgPostBody) return [];
+  if (!resultRecord) return [];
+  return JSON.stringify(resultRecord, null, 2).split('\n');
 }
 
 function summarizeSpecialToolCall(kind: ToolRenderName, args: Record<string, unknown>): string | null {
@@ -292,13 +341,16 @@ function summarizeStructuralSearchRender(kind: ToolRenderName, bodyText: string 
 }
 
 function buildToolBodyLines(
-  kind: ToolRenderName,
+  kind: ToolRenderKind,
   args: Record<string, unknown>,
   result: unknown,
   resultRecord: Record<string, unknown> | null,
+  options?: ToolRenderModelOptions,
 ): string[] {
   const syntheticGuard = extractSyntheticGuardSummary(result);
   if (syntheticGuard) return [syntheticGuard];
+
+  if (kind === 'MsgPost') return buildMsgPostBodyLines(resultRecord, options?.includeMsgPostBody === true);
 
   if (kind === 'Edit' || kind === 'Write') {
     const edit = resultRecord?.edit && isEditResult(resultRecord.edit) ? resultRecord.edit : null;

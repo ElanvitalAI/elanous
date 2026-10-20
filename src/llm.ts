@@ -1586,6 +1586,7 @@ type ResponsesInputItem =
 export interface MessagesToResponsesInputOpts {
   acceptToolImages?: boolean;
   acceptUserMessageImages?: boolean;
+  onOrphanToolResult?: (callId: string) => void;
 }
 
 /** Exported for tests. Converts the unified LLMMessage shape into the
@@ -1603,21 +1604,23 @@ export function messagesToResponsesInput(
   // P-3 §6.9 — user-message image gating (default true; current gpt-5
   // family all vision-capable per allowlist).
   const acceptUserImages = opts.acceptUserMessageImages ?? true;
-  // First pass — collect every tool_result.tool_use_id that ever
-  // appears across the message list. Second pass below uses this set
-  // to drop orphan tool_use blocks (assistant invoked a tool but no
-  // matching tool_result followed). Orphans happen when the runtime
+  // First pass — collect both sides of each tool round. Second pass
+  // drops either side when its partner is absent from retained history.
+  // Orphan tool_use blocks happen when the runtime
   // pre-empts dispatch (e.g. W5-G early force-synthesis fires
   // immediately after the assistant's tool_use stream completes but
   // before dispatchTool runs) — codex Responses API hard-rejects
   // function_call without function_call_output ("No tool output
   // found for function call X" → 400).
   const seenToolResultIds = new Set<string>();
+  const seenToolUseIds = new Set<string>();
   for (const m of messages) {
     if (!Array.isArray(m.content)) continue;
     for (const b of m.content) {
       if (b && typeof b === 'object' && b.type === 'tool_result' && b.tool_use_id) {
         seenToolResultIds.add(b.tool_use_id);
+      } else if (m.role === 'assistant' && b && typeof b === 'object' && b.type === 'tool_use' && b.id) {
+        seenToolUseIds.add(b.id);
       }
     }
   }
@@ -1695,6 +1698,13 @@ export function messagesToResponsesInput(
             call_id: b.id,
           });
         } else if (b.type === 'tool_result') {
+          // A restored/truncated session can retain an output after its
+          // assistant call was removed. Codex rejects that wire item with
+          // "No tool call found for function call output" on every retry.
+          if (!seenToolUseIds.has(b.tool_use_id)) {
+            opts.onOrphanToolResult?.(b.tool_use_id);
+            continue;
+          }
           // Image-pipeline P3 (2026-05-05) — when the caller opted in
           // (acceptToolImages, set by Codex provider for gpt-5 family)
           // AND the tool_result content carries image bytes, emit the
@@ -4016,6 +4026,13 @@ export const PROVIDERS: Record<string, LLMProvider> = {
     streamChat: (messages, opts = {}) => makeCodexProvider({ provider: 'openai-codex' }).streamChat!(messages, opts),
     chat: (messages, opts = {}) => makeCodexProvider({ provider: 'openai-codex' }).chat!(messages, opts),
   },
+  glm: {
+    name: 'glm',
+    get defaultModel() { return configuredZaiProvider().defaultModel; },
+    available: () => zaiCodingPlanAvailable(),
+    streamChat: (messages, opts = {}) => configuredZaiProvider().streamChat!(messages, opts),
+    chat: (messages, opts = {}) => configuredZaiProvider().chat!(messages, opts),
+  },
   anthropic: AnthropicProvider,
   local: LocalProvider,
   gemini: GeminiProvider,
@@ -4029,6 +4046,11 @@ export const PROVIDERS: Record<string, LLMProvider> = {
   },
   bedrock: BedrockProvider, // 명시 선택 전용 — 자동 순서·폴백 체인에 «안» 넣는다(src/llm/bedrock-provider.ts)
 };
+
+function configuredZaiProvider(): LLMProvider {
+  const { getUserConfig } = require('./user-config.js') as typeof import('./user-config.js');
+  return makeZaiCodingPlanProvider(getUserConfig().llm);
+}
 
 const AUTOMATIC_PROVIDER_ORDER = ['grok', 'anthropic', 'gemini', 'local'] as const;
 const PROVIDER_DECISION_ORDER = ['grok', 'anthropic', 'openai', 'gemini', 'local', 'openrouter'] as const;
@@ -4417,6 +4439,16 @@ function terminalFallbackVerdict(
 
 function providerByName(name: string): LLMProvider | undefined {
   return PROVIDERS[name] ?? automaticProviderCandidates().find((candidate) => candidate.name === name);
+}
+
+function firstAvailableFallbackProvider(attempted: ReadonlySet<string>, opts: LLMOpts): LLMProvider | undefined {
+  // A candidate may lose its credential between chain enumeration and the
+  // switch. Keep scanning the ordered chain instead of stopping at that slot.
+  for (const name of remainingFallbackProviderNames(attempted, opts)) {
+    const candidate = providerByName(name);
+    if (candidate?.available()) return candidate;
+  }
+  return undefined;
 }
 
 function finalizeStreamingProviderModel(provider: LLMProvider, model: string): { provider: LLMProvider; model: string } {
@@ -4821,8 +4853,11 @@ export async function streamLLM(
 
     const err: any = consumed.error;
     if (err instanceof OverloadFailoverError && !opts.provider) {
-      const switched = providerByName('grok');
-      if (switched && !attemptedProviders.has(switched.name) && switched.available() && full.length === 0) {
+      const switched = activeProvider.name === 'openai-codex'
+        ? firstAvailableFallbackProvider(attemptedProviders, opts)
+        : providerByName('grok');
+      if (switched && !attemptedProviders.has(switched.name)
+        && (activeProvider.name === 'openai-codex' || switched.available()) && full.length === 0) {
         debug.log('llm.router', 'overload-failover', {
           blockedProvider: activeProvider.name,
           fallbackProvider: switched.name,
@@ -8501,6 +8536,8 @@ export async function streamLLMWithTools(
       }
     }
     let turnText = '';
+    // TUI-TURN-NARRATION — 이 라운드에 받은 추론 요약 글자 수(내용은 남기지 않는다).
+    let turnReasoningChars = 0;
     turnReasoningDetails = undefined;
     const pendingCalls: Array<{
       id: string;
@@ -8638,6 +8675,7 @@ export async function streamLLMWithTools(
         fullText = fullText.slice(0, fullText.length - turnText.length);
         turnText = '';
       }
+      turnReasoningChars = 0;
       retryDisplay.arm();
       turnReasoningDetails = undefined;
       evCount = 0;
@@ -8666,8 +8704,11 @@ export async function streamLLMWithTools(
       } catch (err) {
         if (idleTimer) clearTimeout(idleTimer);
         if (err instanceof OverloadFailoverError && !opts.provider) {
-          const switched = providerByName('grok');
-          if (switched && !attemptedProviders.has(switched.name) && switched.available() && evCount === 0) {
+          const switched = activeProvider.name === 'openai-codex'
+            ? firstAvailableFallbackProvider(attemptedProviders, opts)
+            : providerByName('grok');
+          if (switched && !attemptedProviders.has(switched.name)
+            && (activeProvider.name === 'openai-codex' || switched.available()) && evCount === 0) {
             debug.log('llm.router', 'overload-failover', {
               turn,
               blockedProvider: activeProvider.name,
@@ -8797,6 +8838,7 @@ export async function streamLLMWithTools(
         // OpenAI-compat `delta.reasoning_content` field — same
         // consumer-side semantics as summary_delta, no part index.
         // Callers that don't render reasoning skip silently.
+        if (ev.kind !== 'summary_part_added') turnReasoningChars += ev.delta.length;
         if (ev.kind === 'summary_part_added') {
           handlers.onReasoning?.({
             kind: 'summary_part_added',
@@ -8873,7 +8915,7 @@ export async function streamLLMWithTools(
 
     // hang 진단 — for-await(SSE 스트림) 정상 종료 확정. 이 로그가 없으면 codex SSE 스트림 hang.
     emitRetryDisplayStep(retryDisplay.settle(turnText));
-    debug.log('llm.stream', 'consume-end', { turn, evCount, lastEvType, textChars: turnText.length, pendingCalls: pendingCalls.length });
+    debug.log('llm.stream', 'consume-end', { turn, evCount, lastEvType, textChars: turnText.length, reasoningChars: turnReasoningChars, pendingCalls: pendingCalls.length });
     const turnInfo = {
       turn,
       durationMs: Date.now() - turnStartedAt,
@@ -11489,6 +11531,10 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
         const { instructions, input } = messagesToResponsesInput(messages, {
           acceptToolImages: codexAcceptToolImages,
           acceptUserMessageImages: codexAcceptUserImages,
+          onOrphanToolResult: (callId) => {
+            try { debug.log('llm.codex', 'orphan-tool-output-dropped', { callId }); }
+            catch { /* observation must not block the request */ }
+          },
         });
         const tools = toCodexResponsesTools(opts.tools, opts.serverTools);
         // Codex backend rejects max_output_tokens + temperature — omit.

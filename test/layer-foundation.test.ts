@@ -6,6 +6,7 @@ import { join, relative, resolve, sep } from 'node:path';
 import ts from 'typescript';
 import { formatClock, resolveTimeZone, setConfigTimeZoneSource } from '../src/time/format.js';
 import { debug } from '../src/debug/log.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
 
 const root = resolve(import.meta.dir, '..');
 const src = join(root, 'src') + sep;
@@ -220,7 +221,7 @@ describe('timezone registration', () => {
       `;
       const { stdout, stderr, exitCode } = Bun.spawnSync({
         cmd: [process.execPath, '-e', script], cwd: root,
-        env: { ...process.env, XDG_CONFIG_HOME: dir, TZ: 'Asia/Seoul', ELANOUS_SUPPRESS_XDG_WARNING: '1' },
+        env: { ...process.env, ELANOUS_STATE_DIR: undefined, XDG_CONFIG_HOME: dir, TZ: 'Asia/Seoul', ELANOUS_SUPPRESS_XDG_WARNING: '1' },
       });
       expect(exitCode, new TextDecoder().decode(stderr)).toBe(0);
       const line = new TextDecoder().decode(stdout).split('\n').find((entry) => entry.startsWith('CLOCK='));
@@ -241,7 +242,7 @@ describe('timezone registration', () => {
       `;
       const { stdout, stderr, exitCode } = Bun.spawnSync({
         cmd: [process.execPath, '-e', script], cwd: root,
-        env: { ...process.env, XDG_CONFIG_HOME: dir, TZ: 'Asia/Seoul', ELANOUS_SUPPRESS_XDG_WARNING: '1' },
+        env: { ...process.env, ELANOUS_STATE_DIR: undefined, XDG_CONFIG_HOME: dir, TZ: 'Asia/Seoul', ELANOUS_SUPPRESS_XDG_WARNING: '1' },
       });
       expect(exitCode, new TextDecoder().decode(stderr)).toBe(0);
       expect(new TextDecoder().decode(stdout).split('\n').find((entry) => entry.startsWith('CLOCK=')))
@@ -265,7 +266,7 @@ describe('timezone registration', () => {
       `;
       const { stdout, stderr, exitCode } = Bun.spawnSync({
         cmd: [process.execPath, '-e', script], cwd: root,
-        env: { ...process.env, XDG_CONFIG_HOME: dir, TZ: 'Asia/Seoul', ELANOUS_SUPPRESS_XDG_WARNING: '1' },
+        env: { ...process.env, ELANOUS_STATE_DIR: undefined, XDG_CONFIG_HOME: dir, TZ: 'Asia/Seoul', ELANOUS_SUPPRESS_XDG_WARNING: '1' },
       });
       expect(exitCode, new TextDecoder().decode(stderr)).toBe(0);
       const line = new TextDecoder().decode(stdout).split('\n').find((entry) => entry.startsWith('SCHEDULER_TZ='));
@@ -299,7 +300,7 @@ describe('timezone registration', () => {
       `;
       const { stdout, stderr, exitCode } = Bun.spawnSync({
         cmd: [process.execPath, '-e', script], cwd: root,
-        env: { ...process.env, XDG_CONFIG_HOME: dir, TZ: 'Asia/Seoul', ELANOUS_SUPPRESS_XDG_WARNING: '1' },
+        env: { ...process.env, ELANOUS_STATE_DIR: undefined, XDG_CONFIG_HOME: dir, TZ: 'Asia/Seoul', ELANOUS_SUPPRESS_XDG_WARNING: '1' },
       });
       expect(exitCode, new TextDecoder().decode(stderr)).toBe(0);
       const line = new TextDecoder().decode(stdout).split('\n').find((entry) => entry.startsWith('RUNNER='));
@@ -325,7 +326,7 @@ describe('timezone registration', () => {
       `;
       const { stdout, stderr, exitCode } = Bun.spawnSync({
         cmd: [process.execPath, '-e', script], cwd: root,
-        env: { ...process.env, XDG_CONFIG_HOME: dir, TZ: 'Asia/Seoul', ELANOUS_SUPPRESS_XDG_WARNING: '1' },
+        env: { ...process.env, ELANOUS_STATE_DIR: undefined, XDG_CONFIG_HOME: dir, TZ: 'Asia/Seoul', ELANOUS_SUPPRESS_XDG_WARNING: '1' },
       });
       expect(exitCode, new TextDecoder().decode(stderr)).toBe(0);
       expect(new TextDecoder().decode(stdout).split('\n').find((entry) => entry.startsWith('MATCH=')))
@@ -370,6 +371,7 @@ describe('timezone registration', () => {
     try {
       process.env.XDG_CONFIG_HOME = dir;
       mkdirSync(join(dir, 'elanous'));
+      setElanousConfigDir(join(dir, 'elanous'));
       const path = join(dir, 'elanous/config.json');
       writeFileSync(path, JSON.stringify({ timezone: 'Europe/Paris' }));
       const { getUserConfig, resetUserConfig } = await import('../src/user-config.js');
@@ -397,6 +399,7 @@ describe('timezone registration', () => {
       if (saved === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = saved;
       resetConfig?.();
+      resetElanousConfigDir();
       rmSync(dir, { recursive: true, force: true });
     }
   });

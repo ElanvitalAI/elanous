@@ -7,6 +7,10 @@ import { CODEX_APP_SERVER_CAPS } from '../acp/codex-app-server-agent.js';
 import type { ReviewImage } from './pr-reviewer.js';
 import type { ElanousCapabilities } from '../acp/capabilities.js';
 import { subscriptionReviewerSpawn } from '../self-dev/review-provider-fallback.js';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { getAcpBackend } from '../acp/backend-registry.js';
 
 // ⛔⭐⭐ 기본 백엔드 회귀 가드 (2026-08-01 · JDG-S9).
 //   이 계약은 **아무 테스트도 안 걸고 있었다** — 기본값을 바꿔도 게이트가 초록이었다.
@@ -118,17 +122,72 @@ describe('ACP reviewer backend factory', () => {
     }
   });
   it('bounds the whole handshake (start → session → model select) with one deadline and stops the child', async () => {
-    for (const hang of ['start', 'newSession', 'selectSessionModel'] as const) {
+    for (const [hang, phase] of [['start', 'initialize'], ['newSession', 'session-new'], ['selectSessionModel', 'model-select']] as const) {
       const agent = reviewAgent({ backendId: 'review-backend' });
       (agent as unknown as Record<string, unknown>)[hang] = () => new Promise(() => {});
       const stop = spyOn(agent, 'stop');
-      const t0 = Date.now();
-      await expect(makeAcpReviewLLM({ cwd: process.cwd(), backend: 'review-backend', model: 'opus',
-        handshakeTimeoutMs: 100, createAgent: () => agent })('review')).rejects.toThrow('ACP handshake timeout');
-      expect(Date.now() - t0).toBeLessThan(5_000);
-      expect(stop).toHaveBeenCalledTimes(1);
+      const events: Array<{ event: string; data?: Record<string, unknown> }> = [];
+      const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+        if (category === 'acp-review') events.push({ event, data });
+      }) as never);
+      try {
+        const t0 = Date.now();
+        await expect(makeAcpReviewLLM({ cwd: process.cwd(), backend: 'review-backend', model: 'opus',
+          handshakeTimeoutMs: 100, createAgent: () => agent })('review')).rejects.toThrow('ACP handshake timeout');
+        expect(Date.now() - t0).toBeLessThan(5_000);
+        expect(stop).toHaveBeenCalledTimes(1);
+        expect(events.find(e => e.event === 'error')?.data).toMatchObject({ phase, provider: 'review-backend', toolCalls: 0,
+          elapsedMs: expect.any(Number), phaseElapsedMs: expect.any(Number), classification: 'acp-timeout' });
+      } finally { log.mockRestore(); }
     }
   });
+  it('stops a production Grok child whose start never completes', async () => {
+    const events: Array<{ event: string; data?: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+      if (category === 'acp-review') events.push({ event, data });
+    }) as never);
+    const start = spyOn(AcpAgent.prototype, 'start').mockImplementation(async () => new Promise(() => {}));
+    const stop = spyOn(AcpAgent.prototype, 'stop').mockResolvedValue();
+    try {
+      await expect(makeAcpReviewLLM({ cwd: process.cwd(), backend: 'grok', handshakeTimeoutMs: 30 })('review'))
+        .rejects.toThrow('ACP_REVIEW_TIMEOUT:grok: ACP handshake timeout');
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(events.find(e => e.event === 'error')?.data).toMatchObject({
+        phase: 'spawn-initialize', provider: 'grok', toolCalls: 0, classification: 'acp-timeout',
+        elapsedMs: expect.any(Number), phaseElapsedMs: expect.any(Number),
+      });
+    } finally { start.mockRestore(); stop.mockRestore(); log.mockRestore(); }
+  });
+
+  it('reaps a real Grok ACP subprocess after its initialize handshake stalls', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-acp-review-timeout-'));
+    const pidFile = join(dir, 'child.pid');
+    const childFile = join(dir, 'stalled-agent.ts');
+    writeFileSync(childFile, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nprocess.stdin.resume();\nsetInterval(() => {}, 1000);\n`);
+    let pid: number | undefined;
+    try {
+      await expect(makeAcpReviewLLM({
+        cwd: dir,
+        backend: 'grok',
+        backendSpec: { ...getAcpBackend('grok'), id: 'grok-test-fixture', command: process.execPath, args: [childFile], extraBinCandidates: [] },
+        env: { PATH: process.env.PATH ?? '/usr/bin' },
+        handshakeTimeoutMs: 1_000,
+      })('review')).rejects.toThrow('ACP_REVIEW_TIMEOUT:grok: ACP handshake timeout');
+      expect(existsSync(pidFile)).toBe(true);
+      pid = Number(readFileSync(pidFile, 'utf8'));
+      expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+      let alive = true;
+      for (let attempt = 0; attempt < 50; attempt++) {
+        try { process.kill(pid, 0); } catch { alive = false; break; }
+        await Bun.sleep(20);
+      }
+      expect(alive).toBe(false);
+    } finally {
+      if (pid) { try { process.kill(pid, 'SIGKILL'); } catch { /* already reaped */ } }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 5_000);
+
   it('canonicalizes a friendly backend alias, records its transport, and uses a review-owned manager', async () => {
     const events: Array<{ category: string; event: string; data?: Record<string, unknown> }> = [];
     const agent = reviewAgent({ backendId: 'codex-app-server' });
@@ -219,6 +278,97 @@ describe('ACP reviewer backend factory', () => {
       start.mockRestore();
       stop.mockRestore();
     }
+  });
+});
+
+describe('ACP review timeout diagnosis', () => {
+  it('classifies a Grok prompt that never settles before the first tool call and stops the child', async () => {
+    const events: Array<{ event: string; data?: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+      if (category === 'acp-review') events.push({ event, data });
+    }) as never);
+    const agent = reviewAgent({ backendId: 'grok' });
+    const cancel = spyOn(agent, 'cancel').mockResolvedValue();
+    const stop = spyOn(agent, 'stop');
+    const prompt = spyOn(agent, 'prompt').mockImplementation(async () => new Promise(() => {}));
+    try {
+      const started = Date.now();
+      await expect(makeAcpReviewLLM({ cwd: '.', backend: 'grok', timeoutMs: 40, createAgent: () => agent })('review'))
+        .rejects.toThrow('ACP_REVIEW_TIMEOUT:grok:');
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(prompt).toHaveBeenCalledTimes(1);
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(events.find(e => e.event === 'error')?.data).toMatchObject({
+        backend: 'grok', provider: 'grok', phase: 'prompt', toolCalls: 0, allowed: 0,
+        classification: 'pre-tool-timeout', elapsedMs: expect.any(Number), phaseElapsedMs: expect.any(Number),
+      });
+    } finally {
+      prompt.mockRestore(); cancel.mockRestore(); stop.mockRestore(); log.mockRestore();
+    }
+  });
+
+  it('rejects the timed-out review even when cancel resolves a partial prompt immediately', async () => {
+    const agent = reviewAgent({ backendId: 'grok' });
+    let finishPrompt: (() => void) | undefined;
+    let chunkSent = false;
+    agent.prompt = (async (_sid, _blocks, onUpdate) => {
+      const update = onUpdate as Parameters<AcpAgent['prompt']>[2];
+      update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial review' } } as Parameters<typeof update>[0]);
+      chunkSent = true;
+      return new Promise<{ stopReason: 'end_turn' }>((resolve) => {
+        finishPrompt = () => resolve({ stopReason: 'end_turn' });
+      });
+    }) as AcpAgent['prompt'];
+    agent.cancel = async () => { finishPrompt?.(); };
+    await expect(makeAcpReviewLLM({ cwd: '.', backend: 'grok', timeoutMs: 30, createAgent: () => agent })('review'))
+      .rejects.toThrow('ACP_REVIEW_TIMEOUT:grok:');
+    expect(chunkSent).toBe(true);
+  });
+
+  it('keeps the non-Grok timeout reason and never labels it as Grok recovery', async () => {
+    const agent = reviewAgent({ backendId: 'claude' });
+    agent.prompt = (async () => new Promise(() => {})) as AcpAgent['prompt'];
+    await expect(makeAcpReviewLLM({ cwd: '.', backend: 'claude', timeoutMs: 30, createAgent: () => agent })('review'))
+      .rejects.toThrow('ACP 리뷰 타임아웃(30ms·툴콜 0)');
+  });
+
+  it('counts ACP tool updates once per tool ID even without a permission request', async () => {
+    const events: Array<{ event: string; data?: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+      if (category === 'acp-review') events.push({ event, data });
+    }) as never);
+    try {
+      await expect(makeAcpReviewLLM({ cwd: '.', backend: 'grok', timeoutMs: 40, createAgent: (opts) => {
+        const agent = reviewAgent(opts);
+        agent.prompt = (async (_sid, _blocks, onUpdate) => {
+          const update = onUpdate as Parameters<AcpAgent['prompt']>[2];
+          update({ sessionUpdate: 'tool_call', toolCallId: 'read-1', title: 'Read file', kind: 'read', status: 'in_progress' } as Parameters<typeof update>[0]);
+          update({ sessionUpdate: 'tool_call_update', toolCallId: 'read-1', status: 'completed' } as Parameters<typeof update>[0]);
+          return new Promise(() => {});
+        }) as AcpAgent['prompt'];
+        return agent;
+      } })('review')).rejects.toThrow('ACP_REVIEW_TIMEOUT:grok: 40ms·툴콜 1');
+      expect(events.find(e => e.event === 'error')?.data).toMatchObject({ phase: 'prompt', toolCalls: 1, allowed: 0, classification: 'acp-timeout' });
+    } finally { log.mockRestore(); }
+  });
+
+  it('does not mistake a permission request for an ACP tool call', async () => {
+    const events: Array<{ event: string; data?: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+      if (category === 'acp-review') events.push({ event, data });
+    }) as never);
+    try {
+      await expect(makeAcpReviewLLM({ cwd: '.', backend: 'grok', timeoutMs: 30, createAgent: (opts) => {
+        const agent = reviewAgent(opts);
+        agent.prompt = (async () => {
+          await opts.permissionApprover?.({ title: 'Read file', kind: 'read' } as Parameters<NonNullable<AcpAgentOpts['permissionApprover']>>[0]);
+          return new Promise(() => {});
+        }) as AcpAgent['prompt'];
+        return agent;
+      } })('review')).rejects.toThrow('ACP_REVIEW_TIMEOUT:grok: 30ms·툴콜 0');
+      expect(events.find(e => e.event === 'error')?.data).toMatchObject({ toolCalls: 0, allowed: 1, classification: 'pre-tool-timeout' });
+    } finally { log.mockRestore(); }
   });
 });
 

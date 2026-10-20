@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { baseVersion, isReleaseVersion, nextPrereleaseVersion, prereleaseKind } from './release-version.js';
@@ -11,6 +11,7 @@ import { refreshReleaseBranchTip, resumeReleaseRun } from './resume-release.js';
 import { labelPrerelease } from './publish-node.js';
 import { parseOptions as gateOptions } from './gate-node.js';
 import { debug } from '../../src/debug/log.js';
+import { TRACEABLE_RELEASE_JSON } from './gate-closure.js';
 
 // RELEASE-BRANCH ⊕ RELEASE-REHEARSAL-RC (10-06): real git against a temporary bare origin; install is injected and
 // nothing is published.
@@ -53,6 +54,11 @@ function fixture(mainVersion = '0.2.18-dev.3') {
   writeVersion(seat, mainVersion);
   mkdirSync(join(seat, 'src'));
   writeFileSync(join(seat, 'src', 'a.ts'), 'export const a = 1;\n');
+  const releaseDir = join(seat, 'graphs/release');
+  mkdirSync(releaseDir, { recursive: true });
+  for (const name of ['release-loop.yaml', 'recipes.yaml']) {
+    copyFileSync(join(import.meta.dir, '../../graphs/release', name), join(releaseDir, name));
+  }
   git(seat, 'add', '-A');
   git(seat, 'commit', '-m', 'seed');
   git(seat, 'push', 'origin', 'HEAD:main');
@@ -223,6 +229,48 @@ test('GATE-REUSE-BY-DIFF: a current-graph export-check resume plans the later ga
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('RELEASE-APPEND-SCOPE-SKIP: export-check resume plans only the verified JSON reader test', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-json-partial-'));
+  try {
+    const old = 'a'.repeat(40), tip = 'b'.repeat(40), version = '0.2.34';
+    const releaseDir = join(root, 'release', version);
+    mkdirSync(join(root, 'graph-runs/release-loop'), { recursive: true });
+    mkdirSync(releaseDir, { recursive: true });
+    const runFile = join(root, 'graph-runs/release-loop/r.json');
+    const savedRun = { graphId: 'release-loop', runId: 'r', status: 'failed',
+      input: { version, branchCut: true }, path: ['version-release', 'export-check', 'prefetch', 'gate', 'failed'],
+      nodes: [{ nodeId: 'version-release', ok: true, output: JSON.stringify({ outcome: 'ok', version, branch: `release/${version}`, commit: old }) }],
+    };
+    writeFileSync(runFile, JSON.stringify(savedRun));
+    writeFileSync(join(releaseDir, 'gate-failures.json'), JSON.stringify({ commit: old, failures: [] }));
+    const reader = "import { readFileSync } from 'node:fs'; import { join } from 'node:path'; export const issues = JSON.parse(readFileSync(join(import.meta.dir, 'known-issues-0.2.33-approved.json'), 'utf8'));";
+    const files: Record<string, string> = {
+      [TRACEABLE_RELEASE_JSON]: '[]',
+      'scripts/release-loop/known-issues-node.ts': reader,
+      'scripts/release-loop/known-issues-node.test.ts': "import { spawnSync } from 'node:child_process'; import { join } from 'node:path'; test('reader', () => spawnSync('bun', [join(import.meta.dir, 'known-issues-node.ts')]));",
+      'src/unrelated.test.ts': "test('other', () => true);",
+    };
+    const git = (args: string[]) => args[0] === 'ls-remote' ? `${tip}\trefs/heads/release/${version}` : args[0] === 'rev-parse' ? tip
+      : args[0] === 'diff' ? `${TRACEABLE_RELEASE_JSON}\n` : '';
+    const result = await resumeReleaseRun({ runId: 'r', from: 'export-check' }, { root, ledgerRoot: root, git,
+      isAncestor: () => true, closureTree: () => ({ files: Object.keys(files), read: (file) => files[file], preload: [] }),
+      graph: (async () => ({ status: 'done', runId: 'r' })) as never });
+    expect(result.partial).toMatchObject({ requested: true, applied: true, files: 1, priorCommit: old, auto: true });
+    expect(JSON.parse(readFileSync(join(releaseDir, 'gate-partial.json'), 'utf8'))).toMatchObject({
+      forCommit: tip, files: ['scripts/release-loop/known-issues-node.test.ts'],
+    });
+    // A test that only opens the JSON cannot prove the production reader still works.
+    files['scripts/release-loop/known-issues-node.test.ts'] =
+      "import { readFileSync } from 'node:fs'; import { join } from 'node:path'; test('direct', () => readFileSync(join(import.meta.dir, 'known-issues-0.2.33-approved.json'), 'utf8'));";
+    writeFileSync(runFile, JSON.stringify(savedRun));
+    const directOnly = await resumeReleaseRun({ runId: 'r', from: 'export-check' }, { root, ledgerRoot: root, git,
+      isAncestor: () => true, closureTree: () => ({ files: Object.keys(files), read: (file) => files[file], preload: [] }),
+      graph: (async () => ({ status: 'done', runId: 'r' })) as never });
+    expect(directOnly.partial).toMatchObject({ requested: true, applied: false, reason: expect.stringContaining('production reader reaches no verified test') });
+    expect(() => readFileSync(join(releaseDir, 'gate-partial.json'), 'utf8')).toThrow();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('RELEASE-REHEARSAL-RC: an rc branch is cut from main -dev.N and main is untouched; the dev bump is skipped', () => {
   const f = fixture();
   try {
@@ -331,11 +379,14 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     const base = git(f.origin, 'rev-parse', `${cut}^`);
     cutReleaseBranch({ version: '0.2.18', base, pick: [fix], append: true, repoRoot: f.repo, log: () => {} });
     const tip = git(f.origin, 'rev-parse', 'release/0.2.18');
+    git(f.repo, 'fetch', 'origin', 'release/0.2.18');
+    const commandRoot = join(f.root, 'cut-command-root');
+    git(f.repo, 'worktree', 'add', '--detach', commandRoot, tip);
     gateFails = false;
     seen.length = 0;
-    await expect(resumeReleaseRun({ runId: first.runId, from: 'gate' }, { root: state, repo: f.repo, runBash }))
+    await expect(resumeReleaseRun({ runId: first.runId, from: 'gate', commandRoot }, { root: state, repo: f.repo, runBash }))
       .rejects.toThrow('resume at export-check or earlier');
-    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'export-check' }, { root: state, repo: f.repo, runBash });
+    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'export-check', commandRoot }, { root: state, repo: f.repo, runBash });
     expect(resumed.tip).toMatchObject({ changed: true, from: cut, to: tip });
     expect(resumed.state.status).toBe('done');
     expect(seen.map((item) => item.nodeId)).toEqual(['export-check', 'prefetch', 'gate', 'mac-smoke', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues',
@@ -437,12 +488,16 @@ test('GATE-PARTIAL resume: the graph is resumed at the run’s own saved path; -
     mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
     const old = 'a'.repeat(40);
     let tip = 'b'.repeat(40);
-    const write = (recorded = old) => writeFileSync(runFile, JSON.stringify({ graphId: 'release-loop', runId: 'r', status: 'failed', input: { version: '0.2.18', branchCut: true },
+    const write = (recorded = old) => {
+      // Each case probes partial planning from a fresh synthetic run; the production cap has its own tests.
+      rmSync(join(root, 'release', '0.2.18', 'resume-attempts', 'r.json'), { force: true });
+      writeFileSync(runFile, JSON.stringify({ graphId: 'release-loop', runId: 'r', status: 'failed', input: { version: '0.2.18', branchCut: true },
       path: ['version-release', 'cutoff', 'gate'], graphPath: '/elsewhere/wt-release/graphs/release/release-loop.yaml',
       nodes: [{ nodeId: 'version-release', ok: true, exit: 0, executed: true, output: JSON.stringify({ outcome: 'ok', version: '0.2.18', commit: recorded, branch: 'release/0.2.18' }) },
         { nodeId: 'cutoff', ok: true, exit: 0, executed: true, output: '{"outcome":"ok"}' },
         { nodeId: 'gate', ok: false, exit: 1, executed: true, output: '{"outcome":"fail"}' }],
       executed: 1, dryRun: false, statePath: runFile }));
+    };
     let changed = 'scripts/audit.test.ts\n';
     const git = (args: string[]) => args[0] === 'ls-remote' ? `${tip}\trefs/heads/release/0.2.18` : args[0] === 'rev-parse' ? tip : args[0] === 'diff' ? changed : '';
     mkdirSync(join(ledger, 'release', '0.2.18'), { recursive: true });

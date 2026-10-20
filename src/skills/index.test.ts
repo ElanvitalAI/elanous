@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSkillIndex, skillIndexProblems, getSkillIndex, resetSkillIndex } from './index.js';
 import { resetUserConfig } from '../user-config.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
 
 // ★ G9 P5a — defaultSkillDirs 단위검증(user-config.defaultskilldirs.test.ts)과 짝을 이뤄, 실제
 //   buildSkillIndex 가 (1) 주어진 dir 를 스캔하고 (2) **무인자 호출 시 user-config 를 따르는** wiring 을 검증.
@@ -90,6 +91,7 @@ describe('buildSkillIndex — G9 P5a dir 스캔 wiring(Goodhart 방지)', () => 
 describe('무인자 buildSkillIndex() — user-config skills.dirs 존중(격리 config)', () => {
   const savedXdg = process.env.XDG_CONFIG_HOME;
   afterEach(() => {
+    resetElanousConfigDir();
     if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = savedXdg;
     resetUserConfig();
@@ -105,6 +107,7 @@ describe('무인자 buildSkillIndex() — user-config skills.dirs 존중(격리 
       writeFileSync(join(xdg, 'elanous', 'config.json'), JSON.stringify({ skills: { activeSet: 'custom', dirs: [fixtureRoot] } }));
 
       process.env.XDG_CONFIG_HOME = xdg;
+      setElanousConfigDir(join(xdg, 'elanous'));
       resetUserConfig();
       resetSkillIndex();
 

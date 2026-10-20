@@ -9,6 +9,7 @@
 // 구현을 교체(누적 아님). 기존 PR 없으면 새로 생성.
 
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { githubAutomationToken } from '../auth/github-app-token.js';
 import { debug } from '../debug/log.js';
 import { POD_GITHUB_CREDENTIAL_TOKEN_ENV, POD_GITHUB_CREDENTIAL_URL_ENV } from '../nexus/api/pod-credential-api.js';
@@ -17,7 +18,8 @@ import { DEFAULT_BRANCH_WORKTREE_BASE } from '../git-fs/worktree.js';
 import { isElanousRuntimeArtifactPath } from '../self-implement/gate-scope.js';
 import { isTransientExecutionFailure } from '../self-dev/execution-transient.js';
 import { withGhRestFallback } from './gh-rest-fallback.js';
-import { cellIdFromBody, guardNewPr, parseDiffHunks, readOpenPrs, recordGuardUnmeasured, type GuardVerdict, type HunkOverlapMode, type Seat } from '../pr-tool/census.js';
+import { cardIdFromBody, cellIdFromBody, guardNewPr, hasCardMarker, parseDiffHunks, readOpenPrs, recordGuardUnmeasured, type GuardVerdict, type HunkOverlapMode, type Seat } from '../pr-tool/census.js';
+import { labelsForAxis, PR_LABEL_NAMES } from '../github/pr-labels.js';
 import { getUserConfig } from '../user-config.js';
 
 /** ★ stderr 캡처(대표 2026-07-21·관측 갭) — 종전엔 stdout 만 담아 git/gh 실패 사유가 소실됐다
@@ -118,7 +120,8 @@ export interface UpsertPrResult { url: string; reused: boolean }
  *  특히 `noop`(nothing to commit)은 **실패가 아니라 이미 반영된 no-op** — 호출부가 정직 PASS 처리.
  *  나머지 reason(add/commit/push/gh)은 진짜 실패로 detail(stderr)과 함께 관측·pr-failed. */
 export type UpsertPrOutcome =
-  | { ok: true; url: string; reused: boolean; labelsApplied?: boolean; labelsOmitted?: boolean }
+  | { ok: true; url: string; reused: boolean; labelsApplied?: boolean; labelsOmitted?: boolean;
+      supersededPr?: number }
   | { ok: false; reason: 'add' | 'commit' | 'base' | 'noop' | 'push' | 'gh' | 'guard'; detail: string };
 
 /** 관측된 문면 두 가지:
@@ -334,7 +337,151 @@ function defaultPrCreateGuard(input: { cwd: string; base: string | undefined; se
   const files = diff.ok ? diff.out.split('\0').filter(Boolean) : null;
   const patch = run('git', ['-C', input.cwd, 'diff', '--unified=0', `${input.base}...HEAD`]);
   if (!patch.ok) return guardNewPr({ files: null, seat: input.seat }, { status: 'unknown', reason: `후보 수정 줄 조회 실패: ${patch.err || patch.out}` });
-  return guardNewPr({ files, seat: input.seat, cellId: cellIdFromBody(input.body), hunks: parseDiffHunks(patch.out), hunkOverlap: configuredHunkOverlapMode() }, readOpenPrs(run, { cwd: input.cwd, ...(files ? { candidateFiles: files } : {}) }));
+  const boundRaw = process.env.ELANOUS_TASK_BOUND_PR;
+  const boundPrNumber = boundRaw && /^[1-9]\d*$/.test(boundRaw) ? Number(boundRaw) : undefined;
+  return guardNewPr({ files, seat: input.seat, cellId: cellIdFromBody(input.body), cardId: cardIdFromBody(input.body),
+    ...(boundPrNumber && Number.isSafeInteger(boundPrNumber) ? { boundPrNumber } : {}),
+    hunks: parseDiffHunks(patch.out), hunkOverlap: configuredHunkOverlapMode() }, readOpenPrs(run, { cwd: input.cwd, ...(files ? { candidateFiles: files } : {}) }));
+}
+
+function editExistingPr(run: CmdRunner, input: UpsertPrInput, url: string): UpsertPrOutcome {
+  const opts = { cwd: input.worktreePath };
+  const detailOf = (r: CmdResult) => (r.err || r.out || '').slice(0, 300);
+  const editArgs = ['pr', 'edit', url, '--title', input.title, '--body', input.body];
+  const explicitBase = input.base?.trim();
+  if (explicitBase && !isBranchSelfRef(explicitBase, input.branch)) editArgs.push('--base', prBaseFromComparison(explicitBase));
+  for (const label of new Set((input.labels ?? []).map(label => label.trim()).filter(Boolean))) editArgs.push('--add-label', label);
+  const edited = run('gh', editArgs, opts);
+  if (!edited.ok) return { ok: false, reason: 'gh', detail: detailOf(edited) || 'gh pr edit 실패' };
+  if (input.draft !== undefined) {
+    const stateR = run('gh', ['pr', 'view', url, '--json', 'isDraft', '-q', '.isDraft'], opts);
+    const raw = stateR.out.trim();
+    if (!stateR.ok || (raw !== 'true' && raw !== 'false'))
+      return { ok: false, reason: 'gh', detail: detailOf(stateR) || `draft 상태 조회 실패(isDraft=${raw || 'empty'})` };
+    if (input.draft === false && raw === 'true') {
+      const ready = run('gh', ['pr', 'ready', url], opts);
+      if (!ready.ok) return { ok: false, reason: 'gh', detail: detailOf(ready) || 'gh pr ready 실패' };
+    } else if (input.draft === true && raw === 'false') {
+      const undo = run('gh', ['pr', 'ready', url, '--undo'], opts);
+      if (!undo.ok) return { ok: false, reason: 'gh', detail: detailOf(undo) || 'gh pr ready --undo 실패' };
+    }
+  }
+  if (input.reuseComment) run('gh', ['pr', 'comment', url, '--body', input.reuseComment], opts);
+  return { ok: true, url, reused: true };
+}
+
+/** Same-card rework may have a new run branch. Merge the bound PR head into that work,
+ * then update the bound branch with a plain fast-forward push. Every identity read is
+ * checked again after the inventory snapshot; an ambiguous or moved PR stays refused. */
+function reuseSameCellPr(run: CmdRunner, input: UpsertPrInput, target: NonNullable<GuardVerdict['sameCellReuse']>, recheck: () => GuardVerdict): UpsertPrOutcome {
+  const cwd = input.worktreePath;
+  const fail = (detail: string): UpsertPrOutcome => ({ ok: false, reason: 'guard', detail: `same-cell reuse: ${detail}` });
+  if (!/^[0-9a-f]{40}$/i.test(target.headSha) || !Number.isSafeInteger(target.number) || target.number < 1
+    || cellIdFromBody(input.body) !== target.cellId || cardIdFromBody(input.body) !== target.cardId)
+    return fail('candidate identity mismatch');
+  const validBranch = run('git', ['-C', cwd, 'check-ref-format', '--branch', target.branch]);
+  if (!validBranch.ok) return fail('PR branch name invalid');
+  const viewFields = 'state,headRefOid,headRefName,body,isCrossRepository,url,isDraft,labels';
+  const view = run('gh', ['pr', 'view', String(target.number), '--json', viewFields], { cwd });
+  if (!view.ok) return fail('PR identity read failed');
+  let pr: Record<string, unknown>;
+  try { pr = JSON.parse(view.out) as Record<string, unknown>; } catch { return fail('PR identity malformed'); }
+  if (pr.state !== 'OPEN' || pr.isCrossRepository !== false || pr.headRefOid !== target.headSha
+    || pr.headRefName !== target.branch || typeof pr.body !== 'string'
+    || cellIdFromBody(pr.body) !== target.cellId
+    || (target.legacyBound ? hasCardMarker(pr.body) || process.env.ELANOUS_TASK_BOUND_PR !== String(target.number)
+      : cardIdFromBody(pr.body) !== target.cardId)
+    || typeof pr.url !== 'string' || extractPrNumber(pr.url) !== target.number)
+    return fail('PR state, head, repository, or card lineage changed');
+  const remoteRef = `refs/heads/${target.branch}`;
+  const remote = run('git', ['-C', cwd, 'ls-remote', '--exit-code', 'origin', remoteRef]);
+  if (!remote.ok || remote.out.trim() !== `${target.headSha}\t${remoteRef}`) return fail('remote head changed');
+  const localRef = `refs/elanous/pr-reuse/${target.number}-${target.headSha.slice(0, 12)}`;
+  const fetched = run('git', ['-C', cwd, 'fetch', 'origin', `${remoteRef}:${localRef}`]);
+  const fetchedHead = fetched.ok ? run('git', ['-C', cwd, 'rev-parse', localRef]) : undefined;
+  if (!fetched.ok || !fetchedHead?.ok || fetchedHead.out.trim() !== target.headSha) return fail('PR head fetch mismatch');
+  const merged = run('git', ['-C', cwd, 'merge', '--no-edit', target.headSha]);
+  if (!merged.ok) {
+    const aborted = run('git', ['-C', cwd, 'merge', '--abort']);
+    if (!aborted.ok) return fail(`PR head merge abort failed: ${(aborted.err || aborted.out).slice(0, 220)}`);
+    // A conflicting same-card draft cannot be fast-forwarded. Preserve this run's
+    // head on its own branch, and let the returned new PR URL bind the card.
+    if (pr.isDraft !== true) return fail('conflicting PR is not a draft');
+    const clean = run('git', ['-C', cwd, 'status', '--porcelain', '--untracked-files=no']);
+    if (!clean.ok || clean.out.trim()) return fail('worktree changed after merge abort');
+    const before = run('gh', ['pr', 'view', String(target.number), '--json', viewFields], { cwd });
+    let old: Record<string, unknown>;
+    try { old = JSON.parse(before.out) as Record<string, unknown>; } catch { return fail('PR pre-create identity malformed'); }
+    const remoteNow = run('git', ['-C', cwd, 'ls-remote', '--exit-code', 'origin', remoteRef]);
+    const latest = recheck().sameCellReuse;
+    if (!before.ok || old.state !== 'OPEN' || old.isDraft !== true || old.headRefOid !== target.headSha
+      || old.headRefName !== target.branch || old.body !== pr.body || old.url !== pr.url
+      || !remoteNow.ok || remoteNow.out.trim() !== `${target.headSha}\t${remoteRef}`
+      || !latest || latest.number !== target.number || latest.branch !== target.branch
+      || latest.headSha !== target.headSha || latest.cellId !== target.cellId
+      || latest.cardId !== target.cardId || Boolean(latest.legacyBound) !== Boolean(target.legacyBound))
+      return fail('PR changed before superseding draft');
+    const newRef = `refs/heads/${input.branch}`;
+    if (!run('git', ['-C', cwd, 'check-ref-format', '--branch', input.branch]).ok) return fail('new run branch name invalid');
+    const newRemote = run('git', ['-C', cwd, 'ls-remote', '--heads', 'origin', newRef]);
+    if (!newRemote.ok || newRemote.out.trim()) return fail('new run branch already exists or remote unreadable');
+    const localHead = run('git', ['-C', cwd, 'rev-parse', 'HEAD']);
+    if (!localHead.ok || !/^[0-9a-f]{40}$/i.test(localHead.out.trim())) return fail('new run head unreadable');
+    // Upload the commit through a unique scratch ref. GitHub's create-ref API then
+    // atomically refuses a concurrent writer of the intended branch name.
+    const scratch = `elanous-pr-create/${randomUUID()}`;
+    const scratchRef = `refs/heads/${scratch}`;
+    const uploaded = run('git', ['-C', cwd, 'push', 'origin', `HEAD:${scratchRef}`]);
+    if (!uploaded.ok) return fail(`new run object upload failed: ${(uploaded.err || uploaded.out).slice(0, 220)}`);
+    const repository = run('gh', ['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'], { cwd });
+    const repoName = repository.out.trim();
+    const createdRef = repository.ok && /^[^/\s]+\/[^/\s]+$/.test(repoName)
+      ? run('gh', ['api', '--method', 'POST', `repos/${repoName}/git/refs`, '-f', `ref=${newRef}`, '-f', `sha=${localHead.out.trim()}`], { cwd })
+      : { ok: false, out: '', err: 'repository identity unavailable' };
+    const removedScratch = run('git', ['-C', cwd, 'push', 'origin', `:${scratchRef}`]);
+    if (!removedScratch.ok) debug.log('autopilot.pr-manager', 'same-cell-scratch-cleanup-failed',
+      { scratchRef, detail: removedScratch.err || removedScratch.out,
+        stderr: removedScratch.err ?? '', stdout: removedScratch.out, truncated: false }, { level: 'warn' });
+    if (!createdRef.ok) return fail(`new run branch create refused: ${(createdRef.err || createdRef.out).slice(0, 220)}`);
+    const stateLabels = new Set(labelsForAxis('state').map(label => label.name));
+    const labels = [...new Set([...(input.labels ?? []).filter(label => !stateLabels.has(label as typeof PR_LABEL_NAMES.running)),
+      PR_LABEL_NAMES.running, ...(input.seat ? [`seat:${input.seat}`] : [])])];
+    const body = `${input.body.trimEnd()}\n\nSupersedes: #${target.number}`;
+    const create = ['pr', 'create', '--draft', '--head', input.branch, '--title', input.title, '--body', body];
+    const base = input.base?.trim();
+    if (base && !isBranchSelfRef(base, input.branch)) create.push('--base', prBaseFromComparison(base));
+    for (const label of labels) create.push('--label', label);
+    const created = run('gh', create, { cwd });
+    const newUrl = created.out.trim();
+    const newNumber = extractPrNumber(newUrl);
+    if (!created.ok || !newNumber) return { ok: false, reason: 'gh', detail: `superseding draft create failed: ${(created.err || created.out).slice(0, 220)}` };
+    debug.log('autopilot.pr-manager', 'same-cell-conflict-new-draft',
+      { oldPr: target.number, newPr: newNumber, cardId: target.cardId, oldDraftCleanup: 'deferred' });
+    return { ok: true, url: newUrl, reused: false, supersededPr: target.number };
+  }
+  if (!run('git', ['-C', cwd, 'merge-base', '--is-ancestor', target.headSha, 'HEAD']).ok) return fail('PR head is not ancestor of result');
+  const finalView = run('gh', ['pr', 'view', String(target.number), '--json', viewFields], { cwd });
+  let finalPr: Record<string, unknown>;
+  try { finalPr = JSON.parse(finalView.out) as Record<string, unknown>; } catch { return fail('PR pre-push identity read failed'); }
+  if (!finalView.ok || finalPr.state !== 'OPEN' || finalPr.isCrossRepository !== false
+    || finalPr.headRefOid !== target.headSha || finalPr.headRefName !== target.branch
+    || typeof finalPr.body !== 'string' || cellIdFromBody(finalPr.body) !== target.cellId
+    || (target.legacyBound ? hasCardMarker(finalPr.body) || process.env.ELANOUS_TASK_BOUND_PR !== String(target.number)
+      : cardIdFromBody(finalPr.body) !== target.cardId)
+    || finalPr.url !== pr.url) return fail('PR changed before push');
+  const finalRemote = run('git', ['-C', cwd, 'ls-remote', '--exit-code', 'origin', remoteRef]);
+  if (!finalRemote.ok || finalRemote.out.trim() !== `${target.headSha}\t${remoteRef}`) return fail('remote head changed before push');
+  const latest = recheck().sameCellReuse;
+  if (!latest || latest.number !== target.number || latest.branch !== target.branch
+    || latest.headSha !== target.headSha || latest.cellId !== target.cellId
+    || latest.cardId !== target.cardId || Boolean(latest.legacyBound) !== Boolean(target.legacyBound))
+    return fail('OPEN PR inventory changed before push');
+  // The result descends from the exact fetched head. The explicit lease binds the
+  // remote update to that head, so a delete or move between reads cannot be revived.
+  const pushed = run('git', ['-C', cwd, 'push', `--force-with-lease=${remoteRef}:${target.headSha}`, 'origin', `HEAD:${remoteRef}`]);
+  if (!pushed.ok) return fail(`fast-forward push refused: ${(pushed.err || pushed.out).slice(0, 220)}`);
+  debug.log('autopilot.pr-manager', 'same-cell-reused', { pr: target.number, cellId: target.cellId, cardId: target.cardId, branch: target.branch });
+  return editExistingPr(run, input, pr.url);
 }
 
 /** ★ PR 매니저 팩토리(대표 2026-07-12) — CmdRunner 주입(테스트 스텁). 실 배선은 기본 러너. */
@@ -496,11 +643,37 @@ export function makePrManager(
         }
         // ahead > 0 + 내용차 존재 → 이미 커밋된 산출. commit 스킵하고 아래 push + PR 로 fall-through.
       }
+      // 카드 계보를 아는 재작업은 새 run 가지를 발사하기 전에 같은 칸 PR 을 찾는다.
+      // 같은 카드로 증명된 단일 PR 만 기존 가지를 빠른 전진시킨다. 다른 계보·모호한 목록은 종전 가드다.
+      const candidateCardId = cardIdFromBody(input.body);
+      if (hasCardMarker(input.body) && !candidateCardId)
+        return { ok: false, reason: 'guard', detail: 'candidate card lineage is ambiguous' };
+      const earlyGuard = candidateCardId && checkCreate
+        ? checkCreate({ cwd, base: comparisonBase, seat: input.seat ?? seatFromEnvironment(), body: input.body }, run)
+        : undefined;
+      const freshGuard = () => checkCreate!({ cwd, base: comparisonBase, seat: input.seat ?? seatFromEnvironment(), body: input.body }, run);
+      if (earlyGuard?.sameCellReuse) return reuseSameCellPr(run, input, earlyGuard.sameCellReuse, freshGuard);
+      if (earlyGuard?.status === 'refuse') return { ok: false, reason: 'guard', detail: earlyGuard.reasons.map(reason => `${reason.code}: ${reason.detail}`).join('; ') };
+      const earlyInventoryUnknown = !!candidateCardId && (!checkCreate || (earlyGuard?.status === 'unknown'
+        && earlyGuard.reasons.length === 1 && earlyGuard.reasons[0]?.code === 'inventory-unknown'));
+      if (candidateCardId && earlyGuard?.status !== 'allow' && !earlyInventoryUnknown)
+        return { ok: false, reason: 'guard', detail: 'candidate card inventory unmeasured before push' };
+      if (earlyInventoryUnknown) debug.log('pr-tool.open-guard', 'candidate-inventory-unmeasured', {
+        branch: input.branch, cardId: candidateCardId, stage: 'before-push',
+        reason: earlyGuard?.reasons[0]?.detail ?? 'create guard unavailable',
+      });
+      if (candidateCardId) {
+        const branchPr = findPrForBranchOutcome(input.branch, cwd);
+        if (branchPr.status === 'FAILED' || branchPr.url)
+          return { ok: false, reason: 'guard', detail: 'candidate run branch PR already exists or is unmeasured before push' };
+      }
       // force-push — 재구현이 이전 구현을 교체(기존 브랜치 갱신 or 신규). 안정 브랜치명이라 기존 PR 이
       //   있으면 GitHub 이 그 PR 을 자동 업데이트(닫고 새로 안 만듦). elanous 자체 SE 브랜치라 force 안전.
       //   일시 원격 실패(5xx·연결 끊김 등)만 최대 3회. 영구 거부는 한 번에 끝낸다.
       const waitForPushRetry = input.waitForPushRetry ?? defaultWaitForPushRetry;
-      const pushArgs = ['-C', cwd, 'push', '--force', '-u', 'origin', input.branch];
+      const pushArgs = candidateCardId
+        ? ['-C', cwd, 'push', '-u', 'origin', input.branch]
+        : ['-C', cwd, 'push', '--force', '-u', 'origin', input.branch];
       let pushR = runGitWrite(pushArgs);
       let pushAttempts = 1;
       while (!pushR.ok && pushAttempts < MAX_PUSH_ATTEMPTS && isTransientPushFailure(detailOf(pushR))) {
@@ -516,47 +689,20 @@ export function makePrManager(
       }
       const existing = findPrForBranchOutcome(input.branch, cwd);
       if (existing.url) {
-        // 재사용: openPr 계약(title/body/base/draft/labels)을 기존 PR 에 반영한다.
-        //   - base: 미전달 시 요청 base 와 어긋난 기존 PR 을 성공으로 반환할 수 있어 명시 전달.
-        //   - labels: --add-label 로 부착(auto-review 등 무인 리뷰 진입 라벨이 재실행에도 유지되도록).
-        //   - draft: 현재 상태를 조회해 실제 전이가 필요할 때만 수행(멱등) — 이미 요청 상태면 no-op.
-        //            draft=false && 현재 draft → gh pr ready · draft=true && 현재 ready → gh pr ready --undo.
-        const editArgs = ['pr', 'edit', existing.url, '--title', input.title, '--body', input.body];
-        // ⚠️ 재사용 경로는 **명시 base 만** 넘긴다(리뷰 must-fix 2026-07-26). 추론한 base 를 넘기면
-        //   `release/*` 등 비기본 브랜치를 대상으로 열려 있던 기존 PR 을 **main 으로 재타기팅**하는
-        //   회귀가 된다(요청자는 base 를 지정하지도 않았는데). 미지정 = "base 는 건드리지 마라".
-        //   신규 생성은 base 가 반드시 필요하므로 그쪽만 추론값을 쓴다.
-        //   트림은 신규 경로(resolveDeliverableBase)와 동일하게 — 공백 전용 base 는 미지정으로 본다(리뷰 should-fix).
-        const explicitBase = input.base?.trim();
-        if (explicitBase && !isBranchSelfRef(explicitBase, input.branch)) editArgs.push('--base', prBaseFromComparison(explicitBase));
-        for (const label of new Set((input.labels ?? []).map(label => label.trim()).filter(Boolean))) editArgs.push('--add-label', label);
-        let edited = run('gh', editArgs, opts);
-        if (!edited.ok) return { ok: false, reason: 'gh', detail: detailOf(edited) || 'gh pr edit 실패' };
-        if (input.draft !== undefined) {
-          // 현재 draft 상태 조회 — 조회 실패/비정상 출력은 fail-closed(요청 draft 를 적용 못했는데
-          //   성공 반환하면 openPr 계약 위반). 정상 조회 시에만 실제 전이가 필요할 때 수행(멱등).
-          const stateR = run('gh', ['pr', 'view', existing.url, '--json', 'isDraft', '-q', '.isDraft'], opts);
-          const raw = stateR.out.trim();
-          if (!stateR.ok || (raw !== 'true' && raw !== 'false')) {
-            return { ok: false, reason: 'gh', detail: detailOf(stateR) || `draft 상태 조회 실패(isDraft=${raw || 'empty'})` };
-          }
-          const isDraft = raw === 'true';
-          if (input.draft === false && isDraft) {
-            const ready = run('gh', ['pr', 'ready', existing.url], opts);
-            if (!ready.ok) return { ok: false, reason: 'gh', detail: detailOf(ready) || 'gh pr ready 실패' };
-          } else if (input.draft === true && !isDraft) {
-            const undo = run('gh', ['pr', 'ready', existing.url, '--undo'], opts);
-            if (!undo.ok) return { ok: false, reason: 'gh', detail: detailOf(undo) || 'gh pr ready --undo 실패' };
-          }
-        }
-        if (input.reuseComment) run('gh', ['pr', 'comment', existing.url, '--body', input.reuseComment], opts);
-        return { ok: true, url: existing.url, reused: true };
+        if (candidateCardId)
+          return { ok: false, reason: 'guard', detail: 'candidate run branch PR appeared after push; refuse edit' };
+        return editExistingPr(run, input, existing.url);
       }
-      let guardUnmeasured = false;
+      if (existing.status === 'FAILED') return { ok: false, reason: 'gh', detail: 'existing PR branch lookup failed' };
+      let guardUnmeasured = earlyInventoryUnknown;
       let hunkOverlapWarning: { prs: readonly number[]; files: readonly string[] } | null = null;
       if (checkCreate) {
         const seat = input.seat ?? seatFromEnvironment();
+        // Another run may open a PR after the early inventory and before this create.
+        // Read the complete OPEN inventory again after push, immediately before create.
         const verdict = checkCreate({ cwd, base: comparisonBase, seat, body: input.body }, run);
+        if (verdict.sameCellReuse)
+          return { ok: false, reason: 'guard', detail: 'same-cell PR appeared after run branch push; retry from fresh inventory' };
         const hunkWarn = verdict.status === 'allow' ? verdict.warnings.find(warning => warning.code === 'hunk-overlap') : undefined;
         if (hunkWarn) hunkOverlapWarning = { prs: hunkWarn.prs ?? [], files: hunkWarn.files ?? [] };
         if (verdict.status === 'unknown' && verdict.reasons.length === 1 && verdict.reasons[0]?.code === 'inventory-unknown') {
@@ -569,9 +715,9 @@ export function makePrManager(
           } else {
             const count = recordUnmeasured({ seat, reason: verdict.reasons[0].detail });
             if (count.blocked) {
-              const alert = run('eln', ['msg', 'post', '--from', seat ?? 'HARNESS', '--to', 'OP', '--kind', 'alert', '--body', `PR open-guard 판정 불가 1시간 ${count.count}회 · 새 PR 차단 · ${count.reason ?? verdict.reasons[0].detail}`]);
+              const alert = run('eln', ['msg', 'post', '--from', seat ?? 'HARNESS', '--to', 'OP', '--kind', 'alert', '--body', `PR open-guard 판정 불가 1시간 ${count.count}회 · ${candidateCardId ? '카드 후보는 draft 관측' : '새 PR 차단'} · ${count.reason ?? verdict.reasons[0].detail}`]);
               if (!alert.ok) debug.log('pr-tool.open-guard', 'op-alert-failed', { seat, reason: alert.err || alert.out || 'eln msg post 실패' });
-              return { ok: false, reason: 'guard', detail: `inventory-unknown: 1시간 ${count.count}회 · 새 PR 차단${count.reason ? ` (${count.reason})` : ''}` };
+              if (!candidateCardId) return { ok: false, reason: 'guard', detail: `inventory-unknown: 1시간 ${count.count}회 · 새 PR 차단${count.reason ? ` (${count.reason})` : ''}` };
             }
           }
           guardUnmeasured = true;
@@ -581,7 +727,7 @@ export function makePrManager(
       }
       const createArgs = ['pr', 'create', '--head', input.branch, '--title', input.title, '--body', input.body];
       if (prBase) createArgs.push('--base', prBase);
-      if (input.draft) createArgs.push('--draft');
+      if (input.draft || guardUnmeasured) createArgs.push('--draft');
       const seat = input.seat ?? seatFromEnvironment();
       const requiredLabels = [...(seat ? [`seat:${seat}`] : []), ...(guardUnmeasured ? ['pr-guard:unmeasured'] : [])];
       // PR-GUARD-HUNK-WARN: 줄 겹침 경고 라벨은 «최선» — 만들기 실패해도 아래 재시도가 빼고 PR 을 연다.
@@ -599,6 +745,9 @@ export function makePrManager(
         if (hunkOverlapWarning) debug.log('pr-tool.guard', 'hunk-overlap-warn', { pr: extractPrNumber(url), files: hunkOverlapWarning.files, against: hunkOverlapWarning.prs });
       };
       if (created.ok && created.out) {
+        if (guardUnmeasured) debug.log('pr-tool.open-guard', 'candidate-draft-unmeasured', {
+          branch: input.branch, cardId: candidateCardId ?? null, url: created.out,
+        });
         logHunkOverlapWarn(created.out);
         return {
           ok: true,

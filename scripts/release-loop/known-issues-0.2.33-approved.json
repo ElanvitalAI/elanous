@@ -1,0 +1,194 @@
+[
+  {
+    "id": "scripts/botlab/bot-routine.test.ts > bot routine dry-run delivery fence > 단계 목록 뒤 관문을 평가·기록하지만 단계를 실행하거나 배달하지 않는다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 사용자 영향은 bot routine dry-run 루틴 사용 금지. 격리 시험은 검증되지 않았으며 0.2.34에서 복원·재검증한다."
+  },
+  {
+    "id": "scripts/botlab/bot-routine.test.ts > bot routine mailbox > prints and records unread messages, marks them read, then does not repeat them",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 사용자 영향은 bot routine dry-run 루틴 사용 금지. 격리 시험은 검증되지 않았으며 0.2.34에서 복원·재검증한다."
+  },
+  {
+    "id": "scripts/botlab/bot-routine.test.ts > bot routine production delivery fence > 신원을 «모르면» 관문을 안 걸고 그 사실을 관측에 남긴다 — ⛔ 지어낸 신원으로 걸지 않는다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 사용자 영향은 bot routine dry-run 루틴 사용 금지. 격리 시험은 검증되지 않았으며 0.2.34에서 복원·재검증한다."
+  },
+  {
+    "id": "scripts/graph-contract-flow.test.ts > graph-contract-flow > keeps every target runner declaration equal to its consumed no-producer implement-loop inputs",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/cli-entry.test.ts > config set llm.provider — provider별 자격증명 동기화 > rotation은 env보다 우선해 저장하고 출력은 키 값을 노출하지 않는다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/cli-entry.test.ts > config set llm.provider — provider별 자격증명 동기화 > rotation이 없으면 provider 환경변수 키를 저장한다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/cli-entry.test.ts > config set llm.provider — provider별 자격증명 동기화 > 같은 provider는 자격증명을 갱신하거나 설정 파일을 다시 쓰지 않는다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/cli-entry.test.ts > config set llm.provider — provider별 자격증명 동기화 > 자격증명 없음은 경고와 기존 키 유지를, keyless와 다른 경로는 무경고 키 유지를 보장한다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/cli-entry.test.ts > provider codex status — 실물 산출 > 우주·임계·신호 나이를 «값으로» 낸다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/cli-entry.test.ts > 배포 엔트리 bin/elanous.mjs > release checklist 중복 칸과 없는 칸은 두 줄의 사용자 오류만 stderr로 낸다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/cli/logs-model-input.test.ts > logs model-input baseline > registered logs model-input reports observations emitted to an isolated log store in JSON and text",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/domains/finance-conatus-native.test.ts > conatusNativePortEnabled: flag=true → true",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/domains/finance-conatus-native.test.ts > finance_backtest(flag true): backtest TS 포트 렌더 · {script,output,note} shape",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/domains/finance-conatus-native.test.ts > finance_backtest(flag true·factor): factorResearch TS 포트 · script=factor_research.py",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/domains/finance-conatus-native.test.ts > finance_signals(flag true·factor): factorResearch TS 포트",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/domains/finance-conatus-native.test.ts > finance_signals(flag true·screen): reportMd TS 포트 · {kind,report,note}",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/domains/finance-conatus-native.test.ts > finance_signals(flag true·trend): computeTrend/render TS 포트(db 없음 → fallback 문자열)",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/intake-plane/check.test.ts > actual repository CLI surfaces include migrated commands without losing index surfaces",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/loops/orchestrator/overlap.test.ts > CLI --json keeps stdout parseable while retaining the summary on stderr; text mode ends in summary",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/loops/orchestrator/tick.test.ts > COORD-HA × ORCH-TA-HAND: a live hand uses the per-tick cap; L2 never hands",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/loops/orchestrator/tick.test.ts > ORCH-TA-HAND: an injected mode still honors the configured cell filter; shadow-before-placement then live launches; a seat-delegated cell stays on the seat path",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/nexus/api/graphs-api.test.ts > GET /v1/graphs reads real YAML, retains labelled research branches and denies anonymous or write requests",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/onboarding/web-first.test.ts > real CLI does not print a link when health responds with an error",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/onboarding/web-first.test.ts > real CLI honors explicit webFirst=false without probing health or issuing a link",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/self-implement/graph-authority.test.ts > 2026-09-26 설정 졸업 — 선언은 항상 실행 권위 > 대응 스펙이 없으면 던지지 않고 null로 남겨 빈 선언 손실과 구별한다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/self-implement/graph-authority.test.ts > 2026-09-26 설정 졸업 — 선언은 항상 실행 권위 > 원장 칸 — 기존 권위 칸, 템플릿 이슈 내용, 선택된 스펙의 버려진 선언 필드를 함께 싣는다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/self-implement/graph-overlay-yaml.test.ts > RFC §5 3단계 — 오버레이 적용 (⛔ 얹은 «결과»를 다시 검사한다) > ⭐ 노드를 «추가»할 수 있다 — 다이나믹 대응의 핵심",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/self-implement/graph-overlay-yaml.test.ts > RFC §5 3단계 — 오버레이 적용 (⛔ 얹은 «결과»를 다시 검사한다) > 예산 조정이 «실제로» 먹는다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/self-implement/graph-overlay-yaml.test.ts > RFC §5 4단계 — 선택 (⛔ 「안 얹혔다」의 이유가 «넷»이다) > ⭐ 선택 → 적용이 «이어진다» — 예산이 실제로 바뀐다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/self-implement/graph-templates.test.ts > RFC §5 3단계 — 템플릿 둘째(research-loop) > ⛔ 두 템플릿의 «차이»가 gate 하나임을 값으로 고정한다 — 그것이 승격이 바꾸는 전부다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/self-implement/graph-templates.test.ts > RFC §5 3단계 — 템플릿 둘째(research-loop) > ⭐ research-loop 은 gate 를 «안 갖고» merge 는 «갖는다» — 산출이 남아야 하기 때문이다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/self-implement/graph-templates.test.ts > RFC §5 3단계 — 템플릿 둘째(research-loop) > 기존 템플릿은 기존 네 종류 그대로이며 타입은 파서의 확장된 종류를 재내보낸다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/self-implement/graph-templates.test.ts > ⭐ 실행 경로가 «YAML 을 지나는가» (RFC §5 배선) > 선언의 출처와 경고 수가 YAML 적재 상태를 말한다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/skills/claude-package-commands.test.ts > buildSkillIndex — includeClaudePackageCommands wiring > 키를 켜면 command 항목이 들어가고 기존 스킬은 이름·설명이 그대로다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/steward/observation-graph.test.ts > spawned steward graph and node scripts store decision rows in isolated logs.db for CLI lookup",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/tool-runtime/elanous-skills-list-runtime.test.ts > dispatchElanousSkillsList · shared HOME discovery > earlier custom root wins a duplicate skill name over shared root",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/tool-runtime/elanous-skills-list-runtime.test.ts > dispatchElanousSkillsList · 다중 루트(user-config skills.dirs) > config.skills.dirs=[a,b] → 두 dir 의 skill 을 모두 열거",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/tool-runtime/elanous-skills-list-runtime.test.ts > dispatchElanousSkillsList · 다중 루트(user-config skills.dirs) > ★ partial-error 표면화 — 일부 root 부재면 error 로 노출(config 은폐 방지)",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/tool-runtime/elanous-skills-list-runtime.test.ts > dispatchElanousSkillsList · 다중 루트(user-config skills.dirs) > ★ 기본 root = user-config skill dir·격리 fixture 노출(CI 안전·비-.elanous·정밀 일치)",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "test/config-unification-audit.test.ts > Phase 6 · XDG_CONFIG_HOME deprecation warning > XDG_CONFIG_HOME set → one-time warning to stderr",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "test/document-loop-graph.test.ts > document-loop YAML graph > loads as the distinct document graph with document-specific nodes",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "test/graph-visit-budget.test.ts > research-loop 실행 경로가 예산 7 을 관측으로 넘긴다 > ⭐ 운영 런치 오버레이(research-wide-launch · investigate 예산 12)가 얹히면 같은 걸음이 예산 «안»이다 — 운영의 「0」은 이 오버레이 몫이다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "test/plan-mode/auto-worktree.test.ts > dispatchEnterPlanMode + plan.autoWorktree=true with a real git repo > creates a worktree, flips SWD, returns path + branch",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "test/plan-mode/auto-worktree.test.ts > dispatchEnterPlanMode + plan.autoWorktree=true, cwd not a git repo > soft-fails; plan mode still active; output carries the skip notice",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "test/test-home-state-write-audit.test.ts > test home/state write inventory contract > reviewed baseline home/state writers have complete inventory rows",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "test/voice-streaming-stt-singleton.test.ts > daemon streaming STT singleton > keeps an explicit config choice even when that id is unusable",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "test/voice-tts-providers.test.ts > TTS provider availability and unpaid default > keeps an explicit config choice even when that id is unusable",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다."
+  },
+  {
+    "id": "src/mss/logging/log-store-stale-opener.test.ts > log-store ⓑ 수호자: 설치 sha 보다 옛 판으로 logs.db 를 연 프로세스 > 시뮬레이트된 옛 판 오프너가 경보 관측에 잡힌다",
+    "note": "KI-0233-REGRESSIONS · 0.2.33: 옛 판 오프너 경보가 지연되거나 누락될 수 있다. 0.2.34에서 독립 fixture와 Linux Pod 실물 검증 후 복원한다."
+  }
+]

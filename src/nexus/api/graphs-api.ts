@@ -6,7 +6,8 @@ import { parse as parseYaml } from 'yaml';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { debug } from '../../debug/log.js';
 import { defaultGraphsDir, loadGraphTemplatesFrom } from '../../self-implement/graph-templates.js';
-import { loadGraphTemplates } from '../../self-implement/graph-yaml.js';
+import { graphVersionHash, loadGraphTemplates, parseGraphTemplateYaml } from '../../self-implement/graph-yaml.js';
+import { flattenGraphTemplate } from '../../self-implement/graph-unit-resolver.js';
 import { validateGraphYaml } from './graph-kinds.js';
 import { parseWizardSteps, readWizardSteps, withWizardSteps } from '../../graph-wizard/saved-steps.js';
 import type { WizardNodeStep } from '../../graph-wizard/steps.js';
@@ -115,7 +116,7 @@ export async function handleGraphAccessPut(pathname: string, req: Request, deps:
 
 /** The peer token works only on this graph and the requested read/edit operation. */
 export function graphAccessForRequest(pathname: string, method: string, token: string | null, deps: GraphsApiDeps = {}): boolean {
-  const match = /^\/v1\/graphs\/([^/]+)(?:\/(yaml))?$/.exec(pathname);
+  const match = /^\/v1\/graphs\/([^/]+)(?:\/(yaml|flat))?$/.exec(pathname);
   const id = match ? resolveId(match[1]!) : null;
   if (!id || !token || !TOKEN_PATTERN.test(token)) return false;
   if (method !== 'GET' && !(method === 'PUT' && match?.[2] === 'yaml')) return false;
@@ -266,7 +267,7 @@ export function handleGraphsGet(pathname: string, dir = defaultGraphsDir(), deps
     return jsonResponse({ graphs: [...(core.ok ? core.graphs : []), ...mine.filter((graph) => !coreIds.has(graph.id))] });
   }
 
-  const yamlMatch = /^\/v1\/graphs\/([^/]+)\/yaml$/.exec(pathname);
+  const yamlMatch = /^\/v1\/graphs\/([^/]+)\/(yaml|flat)$/.exec(pathname);
   if (yamlMatch) {
     const id = resolveId(yamlMatch[1]!);
     if (!id) return jsonResponse({ error: 'bad_request', reason: 'invalid graph id' }, 400);
@@ -274,6 +275,24 @@ export function handleGraphsGet(pathname: string, dir = defaultGraphsDir(), deps
     const coreHit = core.ok ? indexByDeclaredId(coreDir).get(id) : undefined;
     const hit = mineHit ?? coreHit;
     if (!hit) return jsonResponse({ error: 'not-found', id }, 404);
+    if (pathname.endsWith('/flat')) {
+      const parsed = parseGraphTemplateYaml(hit.text, hit.file);
+      const spec = parsed.template;
+      if (!spec || parsed.errors.length) return jsonResponse({ error: 'invalid-graph', id, issues: parsed.errors }, 422);
+      try {
+        const flat = flattenGraphTemplate(spec, join(mineHit ? mineDir : coreDir, hit.file));
+        return jsonResponse({
+          id, source: mineHit ? 'mine' : 'core', editable: false,
+          entry_node: flat.entryNode,
+          terminal_nodes: flat.terminalNodes,
+          graph_hash: graphVersionHash(flat),
+          nodes: flat.nodes.map(({ nodeId, kind, recipe, maxVisits }) => ({ node_id: nodeId, kind, recipe, max_visits: maxVisits })),
+          edges: flat.edges.map(({ from, to, on, map, fallback }) => ({ from, ...(to === undefined ? {} : { to }), ...(on === undefined ? {} : { on }), ...(map === undefined ? {} : { map }), ...(fallback === undefined ? {} : { fallback }) })),
+        });
+      } catch (error) {
+        return jsonResponse({ error: 'unit-flatten-failed', id, message: error instanceof Error ? error.message : String(error) }, 422);
+      }
+    }
     const steps = mineHit ? readWizardSteps(mineDir, id, hit.text) : null;
     return jsonResponse({ id, source: mineHit ? 'mine' : 'core', editable: Boolean(mineHit), yaml: hit.text, ...(steps ? { steps } : {}) });
   }

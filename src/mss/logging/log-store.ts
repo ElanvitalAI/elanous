@@ -1132,10 +1132,9 @@ export interface StaleOpenerCheck {
 }
 
 /** 설치 checkout의 Git 객체 그래프에서 선후를 확인한다. 알 수 없으면 다른 판으로 남긴다. */
-function revisionRelation(openerSha: string | null | undefined, installedSha: string | null): StaleOpenerCheck['revisionRelation'] {
+function revisionRelation(openerSha: string | null | undefined, installedSha: string | null, root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')): StaleOpenerCheck['revisionRelation'] {
   if (!openerSha || !installedSha) return 'different';
   if (openerSha === installedSha) return 'same';
-  const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
   const ancestor = (from: string, to: string): boolean =>
     spawnSync('git', ['-C', root, 'merge-base', '--is-ancestor', from, to], { timeout: 2_000, stdio: 'ignore' }).status === 0;
   if (ancestor(openerSha, installedSha)) return 'older';
@@ -1167,17 +1166,17 @@ export interface StaleOpenerAlert {
  *  전 경로 fail-soft — 수호자가 retention 을 절대 깨지 않는다. */
 export function alertStaleLogDbOpeners(
   dbPath: string,
-  deps: { openers?: () => LogDbOpenerInfo[]; installedAtMs?: number | null } = {},
+  deps: { openers?: () => LogDbOpenerInfo[]; installedAtMs?: number | null; installedRoot?: string } = {},
 ): StaleOpenerAlert[] {
   const alerts: StaleOpenerAlert[] = [];
   try {
     // must-fix: 옛 판 판정 마커는 모듈 파일 mtime 이 아니라 «설치 sha 의 설치 시점»이다.
-    const marker = resolveInstalledRevisionMarker();
+    const marker = resolveInstalledRevisionMarker(deps.installedRoot);
     const installedAtMs = deps.installedAtMs ?? marker.installedAtMs;
     const openers = (deps.openers ?? (() => scanLogDbOpeners(dbPath)))();
     for (const opener of openers) {
       const relation = opener.revisionSha && marker.sha
-        ? revisionRelation(opener.revisionSha, marker.sha) : undefined;
+        ? revisionRelation(opener.revisionSha, marker.sha, deps.installedRoot) : undefined;
       if (relation === 'different') {
         debug.log('log-store.retention', 'different-opener-alert', {
           pid: opener.pid, db: dbPath, openerSha: opener.revisionSha, installedSha: marker.sha,

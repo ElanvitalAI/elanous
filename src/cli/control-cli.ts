@@ -13,7 +13,8 @@ import { RESOURCE_KINDS, type ResourceKind } from '../control-plane/ledger.js';
 import { runControlJoin, type ControlJoinOptions } from './control-join-cli.js';
 import type { ResourceView } from '../control-plane/ledger.js';
 import { issueMemberToken, revokeMemberToken, listMemberTokens } from '../control-plane/member-tokens.js';
-import { collectControlStatus } from '../control/control-status.js';
+import { collectControlStatus, readControlHqLease } from '../control/control-status.js';
+import { getUserConfig } from '../user-config.js';
 
 function controlPort(flag?: string): number {
   const raw = flag ?? (process.env.ELANOUS_CONTROL_PORT?.trim() || undefined);
@@ -97,8 +98,9 @@ export async function runResourcesQuery(options: { where?: string; kind?: string
   }
 }
 
-export async function runControlServe(options: { port?: string; host?: string; followLease?: boolean; bucket?: string;
+export async function runControlServe(options: { port?: string; host?: string; followLease?: boolean; followHqLease?: boolean; bucket?: string;
   read?: (bucket: string) => RoleLeaseRead | Promise<RoleLeaseRead>; machine?: string;
+  readHq?: typeof readControlHqLease; hqHostName?: string;
   /** 시험 seam — 이 신호로 멈춘다. ⛔ 시험이 `process.emit('SIGTERM')` 로 멈추면 같은 프로세스의 다른 SIGTERM 처리기
    *  (로그 저장소가 «남은 처리기가 없으면 자기에게 진짜 SIGTERM 을 다시 보낸다»)가 깨어 **시험 러너가 죽었다**
    *  (📏 09-27 0.2.3 게이트: 전체 한 프로세스면 이 시험 자리에서 rc 143 · 조각으로 나누면 완주). */
@@ -108,12 +110,26 @@ export async function runControlServe(options: { port?: string; host?: string; f
   let bucket: string | undefined;
   try {
     port = controlPort(options.port);
+    if (options.followLease && options.followHqLease) throw new Error('GCS 임대와 HQ 임대는 동시에 따를 수 없음');
     if (options.followLease) bucket = resolveRoleBucket(options.bucket);
   } catch (error) { console.error(reasonFor(error)); process.exitCode = 2; return; }
-  const machine = resolveMachineName({ option: options.machine }).machine;
-  const leaseView = bucket === undefined ? undefined : createLeaseHolderView({
+  const machine = options.followHqLease ? '' : resolveMachineName({ option: options.machine }).machine;
+  // HQ's holder identity is hq.hostName. A caller-controlled role machine alias cannot grant primary writes.
+  let hqHostName: string | undefined;
+  if (options.followHqLease) {
+    try { hqHostName = options.hqHostName ?? getUserConfig().hq?.hostName; }
+    catch { /* Unknown local identity must remain fail closed at the write boundary. */ }
+  }
+  const leaseView = bucket !== undefined ? createLeaseHolderView({
     machine, read: () => (options.read ?? readRoleLeaseAsync)(bucket),
-  });
+  }) : options.followHqLease ? createLeaseHolderView({
+    machine: hqHostName ?? '', read: () => {
+      const { record, expired } = (options.readHq ?? readControlHqLease)();
+      return hqHostName && record && expired === false
+        ? { kind: 'present' as const, doc: { holder: record.holder, generation: record.generation, state: 'held' as const, renewedAt: record.renewedAt } }
+        : { kind: 'unmeasured' as const, why: 'HQ lease missing or expired' };
+    },
+  }) : undefined;
   let server: ReturnType<typeof startControlServer>;
   try { server = startControlServer({ port, hostname: options.host, ...(leaseView ? { leaseView, requireKnownLeaseForWrites: true } : {}) }); }
   catch (error) { console.error(`관제부 시작 실패: ${reasonFor(error)}`); process.exitCode = 2; return; }
@@ -130,7 +146,7 @@ export async function runControlServe(options: { port?: string; host?: string; f
       if (options.signal.aborted) { stop(); return; }
       options.signal.addEventListener('abort', stop, { once: true });
     }
-    console.log(`관제부 ${new URL(server.url).host} · 토큰 ${join(effectiveInstanceRoot(), 'control', 'tokens.json')}${bucket === undefined ? '' : ` · 임대 따름 · ${bucket} · 나=${machine}`}`);
+    console.log(`관제부 ${new URL(server.url).host} · 토큰 ${join(effectiveInstanceRoot(), 'control', 'tokens.json')}${bucket !== undefined ? ` · 임대 따름 · ${bucket} · 나=${machine}` : options.followHqLease ? ` · HQ 임대 따름 · 나=${hqHostName ?? '미확인'}` : ''}`);
   });
 }
 
@@ -199,8 +215,9 @@ export function registerControlCommands(program: Command): void {
     .option('--port <n>', '리스닝 포트(0=임시 포트)')
     .option('--host <addr>', '루프백 또는 tailnet 바인드 주소')
     .option('--follow-lease', '임대 보유자일 때만 쓰기')
+    .option('--follow-hq-lease', 'HQ 임대 보유자일 때만 쓰기')
     .option('--bucket <bucket>', 'GCS 임대 버킷')
-    .action((options: { port?: string; host?: string; followLease?: boolean; bucket?: string }) => runControlServe(options));
+    .action((options: { port?: string; host?: string; followLease?: boolean; followHqLease?: boolean; bucket?: string }) => runControlServe(options));
   control.command('member').description('합류 기계의 자원을 포그라운드에서 등록·심박')
     .option('--resource <kind:name=url>', '등록할 자원', (value: string, previous: string[]) => [...previous, value], [] as string[])
     .option('--interval <seconds>', '심박 간격(초)')

@@ -152,6 +152,18 @@ Do not write tests for reversible, low-impact changes that mirror the implementa
 
 Run tests appropriate to the change and complete required checks. Once those pass, broaden or repeat testing only when new changes, failures, or unresolved concerns justify it; otherwise, continue toward completing the task.`;
 
+// ⭐ 2026-10-18 신설 — ***진행 설명.*** ⛔ 공식 문면이 아니다 — 이 저장소 `codex-family-addendum.ts`
+//   «Narrate Before Each Tool Batch» 절을 줄여 옮겼다(gpt-5 계열만 그 절을 받았다).
+//   🩸 계기(결함 #87 · 대표 10-18): OPT(`gpt-6-sol`) 30분 19라운드 전부 `llm.stream consume-end`
+//     `textChars=0` — 도구만 연달아 부르고 «무엇을 하는지» 한 줄도 안 냈다. TUI 가 숨긴 것이 아니다.
+//   ⛔ 효과는 `consume-end` 의 `textChars>0` 라운드 비율로 잰다(전: 0/19).
+const GPT6_PROGRESS_NARRATION = `## Progress narration (elanous TUI)
+
+Before each batch of tool calls, write one short plain-text sentence in the user's language
+saying what you are about to check and why. After the batch, if the next step changes, say
+so in one sentence. Do not narrate routine bookkeeping calls (mailbox checks, wake-up
+scheduling) one by one.`;
+
 /** 사람이 찾을 수 있게 «출처»를 산출에도 남긴다 — ⛔ 이 줄이 없으면 다음 사람이 창작으로 읽는다. */
 export const GPT6_ADDENDUM_SOURCE =
   'Source: OpenAI GPT-6 Astra prompting guidance '
@@ -160,7 +172,7 @@ export const GPT6_ADDENDUM_SOURCE =
   + 'codex-rs/models-manager/models.json. Quoted, not paraphrased.';
 
 /**
- * GPT-6(astra) 계열 행동 규율을 시스템 메시지 넷으로 낸다.
+ * GPT-6(astra) 계열 행동 규율을 시스템 메시지로 낸다(공식 넷 ⊕ 범위 ⊕ 진행 설명).
  * ⛔ 순서가 뜻을 갖는다 — ***자율 → 허락의 시점 → 우선순위 → 시험***.
  *    금지(우선순위)보다 «자율»을 먼저 둔다: 이 저장소의 앵커가 이미 금지로 가득하고,
  *    관측된 실패가 ***「멈춤」***이었기 때문이다.
@@ -172,5 +184,6 @@ export function buildGpt6FamilyAddendum(): LLMMessage[] {
     { role: 'system', content: GPT6_INSTRUCTION_PRECEDENCE },
     { role: 'system', content: GPT6_TESTING_CALIBRATION },
     { role: 'system', content: GPT6_SCOPE_DISCIPLINE },
+    { role: 'system', content: GPT6_PROGRESS_NARRATION },
   ];
 }

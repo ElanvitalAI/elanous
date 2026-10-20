@@ -1323,7 +1323,7 @@ describe('needsPwaBuild — pr-land PWA reachability', () => {
     } finally { rmSync(tree, { recursive: true, force: true }); }
   });
 
-  test('typecheck-scope PWA files provide app dependencies exactly once without a PWA build', async () => {
+  test('runHostRegate provisions PWA typecheck scope dependencies exactly once without a PWA build', async () => {
     const tree = mkdtempSync(join(tmpdir(), 'host-regate-tsc-pwa-'));
     const write = (file: string, body: string) => {
       mkdirSync(join(tree, file, '..'), { recursive: true });
@@ -1348,7 +1348,8 @@ describe('needsPwaBuild — pr-land PWA reachability', () => {
       return command(bin, args, cwd, env);
     };
     try {
-      expect(await runHostRegate({ ...input, verifyOnly: true }, deps)).toMatchObject({ passed: true, status: 'passed' });
+      const result = await runHostRegate({ ...input, verifyOnly: true }, deps);
+      expect(result).toMatchObject({ passed: true, status: 'passed' });
       expect(pwaInstalls).toHaveLength(1);
       expect(calls.filter((call) => call === 'bun install --frozen-lockfile')).toHaveLength(2);
       expect(calls.filter((call) => call === 'bun bin/elanous.mjs --test nexus build')).toHaveLength(0);

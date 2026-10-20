@@ -6918,6 +6918,45 @@ describe('runSelfImplement — pre-launch authored clarification escalation', ()
 });
 
 describe('runSelfImplement — --ground round-0 codebase grounding', () => {
+  test('TA-KNOWHOW-PACK injects promoted context into the real round-0 implement path and records ids and bytes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'knowhow-orchestrator-'));
+    const file = join(root, 'docs/roles/TC/KNOWHOW.md');
+    mkdirSync(join(root, 'docs/roles/TC'), { recursive: true });
+    writeFileSync(file, '## K-TC-777 scope-escape path\n- 상황: src/self-implement/orchestrator.ts scope-escape.\n- 처방(힐링): 경로를 확인한다.\n- 출처: 시험 · 상태: active\n');
+    const before = readFileSync(file, 'utf8');
+    const features: string[] = [];
+    const ledger: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const feature = '대상 경로: src/self-implement/orchestrator.ts\n실패 서명: scope-escape';
+    try {
+      await runSelfImplement({ feature, memory: false, seams: seams({
+        features,
+        createWorktree: async ({ branch, base }) => ({ path: root, branch, base }),
+        writeRunLedger: (entry) => { ledger.push({ event: entry.event, data: entry.data }); },
+      }) });
+      expect(features[0]).toContain('[KNOWHOW-PACK v1 ids=K-TC-777]');
+      expect(features[0]).toContain(feature);
+      expect(ledger.find((entry) => entry.event === 'knowhow-pack')?.data).toMatchObject({ ids: ['K-TC-777'], injected: true });
+      expect(Number(ledger.find((entry) => entry.event === 'knowhow-pack')?.data.bytes)).toBeGreaterThan(0);
+      expect(readFileSync(file, 'utf8')).toBe(before);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('TA-KNOWHOW-PACK does not repeat the reference block in rework goals', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'knowhow-rework-'));
+    mkdirSync(join(root, 'docs/roles/TC'), { recursive: true });
+    writeFileSync(join(root, 'docs/roles/TC/KNOWHOW.md'), '## K-TC-778 gate-failed\n- 상황: src/self-implement/orchestrator.ts gate-failed.\n- 출처: 시험 · 상태: active\n');
+    const features: string[] = [];
+    try {
+      await runSelfImplement({
+        feature: '대상 경로: src/self-implement/orchestrator.ts\n실패 서명: gate-failed', memory: false, maxReworkRounds: 1,
+        seams: seams({ features, gateResults: [false, true], createWorktree: async ({ branch, base }) => ({ path: root, branch, base }) }),
+      });
+      expect(features.length).toBeGreaterThan(1);
+      expect(features[0]).toContain('[KNOWHOW-PACK v1');
+      expect(features[1]).not.toContain('[KNOWHOW-PACK v1');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test.each([
     ['omitted', undefined],
     ['explicitly false', false],

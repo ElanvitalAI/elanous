@@ -4,6 +4,7 @@ const MAX_GIT_RETRY_ATTEMPTS = 6;
 export type GitRunResult = {
   status: number | null;
   signal?: NodeJS.Signals | null;
+  errorCode?: string;
   stdout: string;
   stderr: string;
 };
@@ -43,6 +44,9 @@ export function runGitWithRetry(
       if (attempt > 1) onRetrySuccess?.(attempt);
       return result;
     }
+    // A killed or timed-out process did not report a Git failure. Its partial
+    // output may mention a lock, but repeating the checkout hides its cause.
+    if (result.status === null) return result;
     const error = result.stderr || result.stdout || '';
     if (!isTransientGitError(error) || attempt === MAX_GIT_RETRY_ATTEMPTS) return result;
     sleepSyncMs(80 * attempt);

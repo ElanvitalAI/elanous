@@ -2,9 +2,10 @@ import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Command } from 'commander';
 import { resetEffectiveInstanceRoot } from '../instance/resolve.js';
 import { INFLIGHT_REGISTRY_FILE, listInflight, registerInflight } from '../pr-tool/inflight-registry.js';
-import { runPrLand, type PrLandDeps } from './pr-cli.js';
+import { registerPrCommands, runPrLand, type PrLandDeps } from './pr-cli.js';
 
 // INFLIGHT-REGISTRY: pr land 가 병합에 성공하면 그 PR 을 연 카드의 비행 중 줄을 지운다.
 let freezeRoot = '';
@@ -24,10 +25,11 @@ afterEach(() => {
   rmSync(stateDir, { recursive: true, force: true });
 });
 
-function land(taskStatePath: string, merged: boolean) {
+function land(taskStatePath: string, merged: boolean, onMergedSupersede?: PrLandDeps['onMergedSupersede']) {
   const deps: PrLandDeps = {
     prodFreezeRoot: freezeRoot,
     taskStatePath,
+    ...(onMergedSupersede ? { onMergedSupersede } : {}),
     currentBranch: () => 'feat/inflight',
     resolveBase: (_run, _cwd, explicit) => explicit ?? 'origin/main',
     run: (command, args) => {
@@ -85,4 +87,25 @@ test('병합 실패면 줄을 남긴다', async () => {
   const { taskStatePath, registry } = fixture();
   expect(await land(taskStatePath, false)).toBe(1);
   expect(listInflight({}, { path: registry }).map((entry) => entry.runId)).toEqual(['run-landed', 'run-other']);
+});
+
+test('병합 확인 뒤 같은 칸 정리 훅을 호출하고, 정리 오류가 착지 결과를 되돌리지 않는다', async () => {
+  const { taskStatePath } = fixture();
+  const called: Array<{ number: number; cwd: string }> = [];
+  expect(await land(taskStatePath, true, async (number, cwd) => {
+    called.push({ number, cwd });
+    throw new Error('GitHub comment unavailable');
+  })).toBe(0);
+  expect(called).toEqual([{ number: 27777, cwd: process.cwd() }]);
+  called.length = 0;
+  expect(await land(taskStatePath, false, async (number, cwd) => { called.push({ number, cwd }); })).toBe(1);
+  expect(called).toEqual([]);
+});
+
+test('pr supersede-drafts --pr dispatches the pinned merged PR to the cleanup hook', async () => {
+  const calls: Array<{ number: number; cwd: string }> = [];
+  const cli = new Command();
+  registerPrCommands(cli, { onMergedSupersede: async (number, cwd) => { calls.push({ number, cwd }); } });
+  await cli.parseAsync(['node', 'test', 'pr', 'supersede-drafts', '--pr', '90']);
+  expect(calls).toEqual([{ number: 90, cwd: process.cwd() }]);
 });

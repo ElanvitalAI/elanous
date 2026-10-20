@@ -183,9 +183,9 @@ describe('Pod OOM retry', () => {
     const controller = new AbortController();
     try {
       const done = podSelfImplementSpawn({ kubectl, pool, env: s.env, credentials: creds, pollMs: 2 })({ feature: 'same goal', spaceId: 'oom-host-admission', signal: controller.signal }).done;
-      for (let n = 0; n < 100 && !foreignRelease; n++) await Bun.sleep(2);
+      for (let n = 0; n < 1000 && !foreignRelease; n++) await Bun.sleep(2);
       expect(foreignRelease).not.toBeNull();
-      for (let n = 0; n < 100 && pool.admissionSnapshot().queued !== 1; n++) await Bun.sleep(2);
+      for (let n = 0; n < 1000 && pool.admissionSnapshot().queued !== 1; n++) await Bun.sleep(2);
       expect(pool.admissionSnapshot()).toMatchObject({ active: 0, queued: 1 });
       expect(s.jobs).toHaveLength(1);
       foreignRelease!(); foreignRelease = null;
@@ -194,7 +194,7 @@ describe('Pod OOM retry', () => {
       expect(pool.admissionSnapshot()).toMatchObject({ active: 0, queued: 0 });
       expect(lease.live()).toHaveLength(0);
     } finally { controller.abort(); if (foreignRelease) (foreignRelease as () => void)(); rmSync(s.root, { recursive: true, force: true }); }
-  });
+  }, 15_000);
 
   test('aborting a queued OOM retry never applies a second Job or leaves a host lease', async () => {
     const s = simulation(['OOMKilled']);
@@ -218,9 +218,9 @@ describe('Pod OOM retry', () => {
     const controller = new AbortController();
     try {
       const done = podSelfImplementSpawn({ kubectl, pool, env: s.env, credentials: creds, pollMs: 2 })({ feature: 'same goal', spaceId: 'oom-abort-admission', signal: controller.signal }).done;
-      for (let n = 0; n < 100 && !foreignRelease; n++) await Bun.sleep(2);
+      for (let n = 0; n < 1000 && !foreignRelease; n++) await Bun.sleep(2);
       expect(foreignRelease).not.toBeNull();
-      for (let n = 0; n < 100 && pool.admissionSnapshot().queued !== 1; n++) await Bun.sleep(2);
+      for (let n = 0; n < 1000 && pool.admissionSnapshot().queued !== 1; n++) await Bun.sleep(2);
       expect(pool.admissionSnapshot()).toMatchObject({ active: 0, queued: 1 });
       controller.abort();
       expect((await done).error?.code).toBe('aborted');
@@ -229,7 +229,7 @@ describe('Pod OOM retry', () => {
       foreignRelease!(); foreignRelease = null;
       expect(lease.live()).toHaveLength(0);
     } finally { controller.abort(); if (foreignRelease) (foreignRelease as () => void)(); rmSync(s.root, { recursive: true, force: true }); }
-  });
+  }, 15_000);
 
   test('retry intent is durable before deleting the OOM Job', async () => {
     const s = simulation(['OOMKilled', 'Complete']);

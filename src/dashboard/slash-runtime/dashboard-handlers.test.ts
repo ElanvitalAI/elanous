@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ProjectStore } from '../../project/project-store.js';
@@ -23,9 +23,11 @@ import {
 import {
   buildDashboardSlashRegistry,
   DASHBOARD_SLASH_CATALOG_BASELINE,
-  readDashboardAskClarification,
+  installDashboardPluginFromPath,
+  unhostedInstalledDashboardPlugins,
   type DashboardSlashContext,
 } from './dashboard-handlers.js';
+import { readDashboardAskClarification } from './ask-clarification.js';
 import { executeImmediateDashboardSlash } from '../input/slash-executor.js';
 import { resolveDashboardHarnessSubmitIntent } from '../index.js';
 import { resolveDashboardChatMainSlashCommand } from '../input/chat-main-slash-command.js';
@@ -177,6 +179,118 @@ function createContext(
     },
   } as unknown as DashboardSlashContext;
 }
+
+test('/plugin install resolves a local directory and delegates to the shared installer', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-plugin-install-'));
+  try {
+    const source = join(root, 'plugin with spaces');
+    mkdirSync(source);
+    writeFileSync(join(source, 'plugin.json'), JSON.stringify({ name: 'sample-plugin', version: '1.0.0' }));
+    const calls: string[] = [];
+    const result = await installDashboardPluginFromPath('./plugin with spaces', {
+      cwd: root,
+      install: async path => {
+        calls.push(path);
+        return { name: 'sample-plugin', version: '1.0.0', market: 'local', path, sha256: null };
+      },
+    });
+    expect(calls).toEqual([source]);
+    expect(result.name).toBe('sample-plugin');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('/plugin install rejects missing directories and manifest-less paths before installing', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-plugin-install-invalid-'));
+  try {
+    const noManifest = join(root, 'legacy-plugin');
+    mkdirSync(noManifest);
+    writeFileSync(join(noManifest, 'plugin.ts'), 'export default {};');
+    const install = mock(async (_path: string) => ({
+      name: 'should-not-install', version: '1.0.0', market: 'local', path: noManifest, sha256: null,
+    }));
+    await expect(installDashboardPluginFromPath(join(root, 'missing'), { install })).rejects.toThrow('not a directory');
+    await expect(installDashboardPluginFromPath(noManifest, { install })).rejects.toThrow('plugin.json required');
+    expect(install).not.toHaveBeenCalled();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('/plugin list deduplicates only host-discovered installations, not same-version built-ins', () => {
+  const installed = [
+    { name: 'loaded-plugin', version: '1.0.0', market: 'local', path: '/plugins/loaded', sha256: null },
+    { name: 'new-plugin', version: '2.0.0', market: 'local', path: '/plugins/new', sha256: null },
+    { name: 'same-name-builtin', version: '1.0.0', market: 'local', path: '/plugins/same-name-builtin', sha256: null },
+  ];
+  expect(unhostedInstalledDashboardPlugins([
+    { source: 'installed', plugin: { name: 'loaded-plugin', version: '1.0.0' } },
+    { source: 'builtin', plugin: { name: 'same-name-builtin', version: '1.0.0' } },
+  ], installed)).toEqual([installed[1], installed[2]]);
+});
+
+test('/plugin install command reports invalid path and missing manifest in ChatLog', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-plugin-dispatch-'));
+  try {
+    const noManifest = join(root, 'legacy-plugin');
+    mkdirSync(noManifest);
+    writeFileSync(join(noManifest, 'plugin.ts'), 'export default {};');
+    const lines: string[] = [];
+    const ctx = {
+      ...createContext(lines),
+      plugin: { host: { list: () => [], isActive: () => false } },
+    } as unknown as DashboardSlashContext;
+    const registry = buildDashboardSlashRegistry();
+    await registry.dispatch('plugin', ['install', join(root, 'missing')], ctx);
+    await registry.dispatch('plugin', ['install', noManifest], ctx);
+    expect(lines.join('\n')).toContain('error: plugin path is not a directory');
+    expect(lines.join('\n')).toContain('error: plugin.json required');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('/plugin install dispatch writes the shared ledger shown by list beside a same-version builtin', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-plugin-list-ledger-'));
+  const previousStateDir = process.env.ELANOUS_STATE_DIR;
+  try {
+    const source = join(root, 'external source');
+    mkdirSync(source, { recursive: true });
+    writeFileSync(join(source, 'plugin.json'), JSON.stringify({ id: 'hello', version: '0.1.0', main: './plugin.ts' }));
+    writeFileSync(join(source, 'plugin.ts'), 'export default {};');
+    process.env.ELANOUS_STATE_DIR = root;
+
+    const hostItems: Array<{ source: 'builtin' | 'user' | 'workspace' | 'installed'; plugin: { name: string; version: string; description: string } }> = [
+      { source: 'builtin', plugin: { name: 'hello', version: '0.1.0', description: 'Built-in hello' } },
+    ];
+    const lines: string[] = [];
+    const ctx = {
+      ...createContext(lines),
+      info: (line: string) => line,
+      plugin: { host: { list: () => hostItems, isActive: () => false }, bold: (text: string) => text },
+    } as unknown as DashboardSlashContext;
+    const registry = buildDashboardSlashRegistry();
+
+    await registry.dispatch('plugin', ['install', source], ctx);
+    await registry.dispatch('plugin', ['list'], ctx);
+    expect(JSON.parse(readFileSync(join(root, 'plugins', 'installed.json'), 'utf8')))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ name: 'hello', version: '0.1.0' })]));
+    expect(lines.join('\n')).toContain('installed: hello@0.1.0');
+    expect(lines.join('\n')).toContain('hello v0.1.0 [built-in]');
+    expect(lines.join('\n')).toContain('hello v0.1.0 [installed:local]');
+
+    lines.length = 0;
+    hostItems[0] = { source: 'installed', plugin: { name: 'hello', version: '0.1.0', description: 'Loaded installation' } };
+    await registry.dispatch('plugin', ['list'], ctx);
+    expect(lines.join('\n')).toContain('hello v0.1.0 [installed]');
+    expect(lines.join('\n')).not.toContain('[installed:local]');
+  } finally {
+    if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousStateDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('/loops uses the dashboardLoops API contract: category is mode, not owner; only proven owners match the filter', async () => {
   const registry = buildDashboardSlashRegistry();
@@ -1148,6 +1262,49 @@ test('dashboard shell slash registration preserves its command aliases', () => {
   const registeredNames = buildDashboardSlashRegistry().names();
   expect(registeredNames).toContain('shell');
   expect(registeredNames).toContain('sh');
+});
+
+test('delegated dashboard slash handlers preserve aliases and render into chat output', async () => {
+  const registry = buildDashboardSlashRegistry();
+  const signalUsage = ['signal runtime help'];
+  const widgetItems = [{
+    source: 'builtin',
+    def: { type: 'sample', description: 'sample widget' },
+  }];
+  const makeContext = (chatLines: string[]) => ({
+    ...createContext(chatLines),
+    controlSignalSlashRuntime: {
+      usageLines: () => signalUsage,
+      statusLines: () => ['signal runtime status'],
+      clearLine: () => 'signals cleared',
+      parseFilterTokens: () => ({ limit: 0, filter: undefined }),
+      latestLines: () => [],
+      listLines: () => [],
+      emitLines: () => [],
+    },
+    widgetHost: {
+      available: () => widgetItems,
+      discover: async () => {},
+      instanceCount: () => 1,
+    },
+  } as unknown as DashboardSlashContext);
+
+  const signals: string[] = [];
+  const signal: string[] = [];
+  await registry.dispatch('signals', ['help'], makeContext(signals));
+  await registry.dispatch('signal', ['help'], makeContext(signal));
+  expect(signal).toEqual(signals);
+  expect(signals).toContain('signal runtime help');
+
+  const widget: string[] = [];
+  const widgets: string[] = [];
+  const shortWidget: string[] = [];
+  await registry.dispatch('widget', ['list'], makeContext(widget));
+  await registry.dispatch('widgets', ['list'], makeContext(widgets));
+  await registry.dispatch('w', ['list'], makeContext(shortWidget));
+  expect(widgets).toEqual(widget);
+  expect(shortWidget).toEqual(widget);
+  expect(widget.join('\n')).toContain('sample widget');
 });
 
 test('dashboard runtime registration catalog does not retain retired harness names as display differences', () => {

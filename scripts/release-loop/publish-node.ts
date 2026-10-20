@@ -1,14 +1,55 @@
 #!/usr/bin/env bun
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { WARNING_ONLY } from './auto-approve-node.js';
+import { BLOCKING_METRIC_NAMES, WARNING_ONLY } from './auto-approve-node.js';
 import { beginLandingMerge, landingFreezeMessage } from '../../src/release-loop/landing-freeze.js';
 import { debug } from '../../src/debug/log.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
+import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { prereleaseKind } from './release-version.js';
 import { publishAtError } from './publish-at.js';
-import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandRunner } from './node-verdict.js';
+import { validatedTuiRegress } from './tui-node-checks.js';
+import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandRunner, type GraphContext } from './node-verdict.js';
+
+/** The approval output alone is not authority: the runner also stores a one-winner decision claim for this visit. */
+export function hasRecordedPublishApproval(context: GraphContext, root: string): boolean {
+  const runId = context.runId;
+  const approval = context.outputs['approve-publish'];
+  if (!runId || !/^[A-Za-z0-9_-]+$/.test(runId) || approval?.outcome !== 'approved'
+    || approval.graphId !== 'release-loop' || approval.runId !== runId || approval.nodeId !== 'approve-publish'
+    || typeof approval.decidedAt !== 'string' || Number.isNaN(Date.parse(approval.decidedAt))) return false;
+  try {
+    const statePath = join(root, 'graph-runs', 'release-loop', `${runId}.json`);
+    const state = JSON.parse(readFileSync(statePath, 'utf8')) as {
+      graphId?: string; runId?: string; path?: string[];
+      nodes?: Array<{ nodeId?: string; ok?: boolean; output?: unknown; decidedAt?: string }>;
+    };
+    const visit = state.path?.lastIndexOf('approve-publish') ?? -1;
+    if (state.graphId !== 'release-loop' || state.runId !== runId || state.path?.at(-1) !== 'publish'
+      || visit < 0 || !Array.isArray(state.nodes)) return false;
+    const node = state.nodes.filter((item) => item.nodeId === 'approve-publish').at(-1);
+    const output = typeof node?.output === 'string' ? JSON.parse(node.output) as Record<string, unknown> : null;
+    if (!node?.ok || node.decidedAt !== approval.decidedAt || output?.runId !== runId
+      || output?.decidedAt !== approval.decidedAt || output?.outcome !== 'approved') return false;
+    const claim = JSON.parse(readFileSync(`${statePath}.${visit + 1}.decision.json`, 'utf8')) as Record<string, unknown>;
+    return claim.nodeId === 'approve-publish' && claim.decision === 'approved'
+      && claim.decidedAt === approval.decidedAt;
+  } catch { return false; }
+}
+
+/** Warning rows may be repeated, but each of the eight fixed gates must occur exactly once in its declared order. */
+export function hasMeasuredApprovalMetrics(metrics: unknown): boolean {
+  if (!Array.isArray(metrics) || !metrics.every((row: unknown) => row && typeof row === 'object'
+    && typeof (row as Record<string, unknown>).name === 'string'
+    && (row as Record<string, unknown>).verdict === 'pass')) return false;
+  const rows = metrics as Array<{ name: string; verdict: string }>;
+  const fixed = rows.filter((row) => !WARNING_ONLY.has(row.name));
+  return fixed.length === BLOCKING_METRIC_NAMES.length
+    && BLOCKING_METRIC_NAMES.every((name, index) => fixed[index]?.name === name)
+    && rows.some((row) => row.name === 'tui-regress')
+    && rows.some((row) => row.name === 'mac-smoke');
+}
 
 export function publicNotes(markdown: string, pages: { pages: Array<{ id: string; slug?: string; source?: string }> }): string {
   if (!Array.isArray(pages.pages)) throw new Error('invalid public pages registry');
@@ -46,7 +87,8 @@ export function waitForAssets(run: CommandRunner, repo: string, tag: string, nam
 }
 
 export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: string,
-  clock: { now: () => number; sleep: (ms: number) => void } = { now: Date.now, sleep: Bun.sleepSync }) {
+  clock: { now: () => number; sleep: (ms: number) => void } = { now: Date.now, sleep: Bun.sleepSync },
+  approvalRoot = effectiveInstanceRoot()) {
   const context = readGraphContext();
   // A resumed graph once invoked this irreversible node at npm-publish, docs-land, and failed.
   // The runner's context is the authority: only the publish visit may publish.
@@ -54,12 +96,21 @@ export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: str
   const version = context.input.version;
   // A measured automatic decision or the existing human approval must authorize publication.
   const auto = context.outputs['auto-approve'];
-  if (context.outputs['approve-publish']?.outcome !== 'approved' &&
+  const regress = validatedTuiRegress(context.outputs.tui?.regress);
+  const approvedForRun = hasRecordedPublishApproval(context, approvalRoot);
+  if (!approvedForRun &&
     !(auto?.outcome === 'ok' && auto.decidedBy === 'release-loop metrics'
-      // The 8 blocking metrics; warning-only rows (tui-regress · mac-smoke) are shown but never counted (V1g · MAC1).
-      && Array.isArray(auto.metrics)
-      && auto.metrics.filter((metric: unknown) => !(metric && typeof metric === 'object' && 'name' in metric && WARNING_ONLY.has(String(metric.name)))).length === 8
-      && auto.metrics.every((metric: unknown) => metric && typeof metric === 'object' && 'verdict' in metric && metric.verdict === 'pass'))) {
+      && !('unmeasured' in regress) && regress.pass === 7 && regress.fail === 0
+      && typeof context.runId === 'string' && context.runId.length > 0 && auto.runId === context.runId
+      && auto.tuiSubcheck && typeof auto.tuiSubcheck === 'object'
+      && (auto.tuiSubcheck as Record<string, unknown>).runId === context.runId
+      && (auto.tuiSubcheck as Record<string, unknown>).level === 'ok'
+      && (auto.tuiSubcheck as Record<string, unknown>).fail === 0
+      && Array.isArray((auto.tuiSubcheck as Record<string, unknown>).failedCheckIds)
+      && ((auto.tuiSubcheck as Record<string, unknown>).failedCheckIds as unknown[]).length === 0
+      && (auto.tuiSubcheck as Record<string, unknown>).approvalRequired === false
+      // Eight fixed metrics; the TUI subcheck is outside that count but its fail/unmeasured verdict still blocks auto-publish.
+      && hasMeasuredApprovalMetrics(auto.metrics))) {
     return { outcome: 'fail' as const, verdict: 'fail' as const, summary: 'publish blocked: neither auto-approve nor approve-publish approved' };
   }
   for (const node of ['gate', 'pwa', 'upgrade', 'tui', 'prepare', 'docs']) {

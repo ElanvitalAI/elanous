@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { changedFilesBetween, mergePartialFailures, partialPlanPath, planPartialRegate, readPartialPlan, writePartialPlan, testFileOfId } from './gate-partial';
-import { bunfigPreload, gitClosureTree, testsReachingChanged, type ClosureTree } from './gate-closure';
+import { bunfigPreload, gitClosureTree, testsReachingChanged, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure';
 
 const P = 'a'.repeat(40);
 const N = 'b'.repeat(40);
@@ -150,6 +150,21 @@ test('one failure-id rule for the gate and the partial plan (TC #24662 review)',
 const treeOf = (files: Record<string, string>, preload: string[] = []): ClosureTree =>
   ({ files: Object.keys(files), read: (path) => files[path], preload });
 const TESTS = (tree: ClosureTree) => tree.files.filter((file) => /\.test\.(?:tsx?|jsx?|mts|cts)$/.test(file));
+
+test('RELEASE-APPEND-SCOPE-SKIP: the known-issues JSON selects its real reader test; other JSON stays full', () => {
+  const tree = treeOf({
+    [TRACEABLE_RELEASE_JSON]: '[]',
+    'scripts/release-loop/known-issues-node.ts': "import { readFileSync } from 'node:fs'; import { join } from 'node:path'; export const issues = JSON.parse(readFileSync(join(import.meta.dir, 'known-issues-0.2.33-approved.json'), 'utf8'));",
+    'scripts/release-loop/known-issues-node.test.ts': "import { spawnSync } from 'node:child_process'; import { join } from 'node:path'; test('issues', () => spawnSync('bun', [join(import.meta.dir, 'known-issues-node.ts')]));",
+    'src/unrelated.test.ts': "test('other', () => true);",
+  });
+  const closure = (changed: string[]) => testsReachingChanged(tree, changed, TESTS(tree));
+  expect(closure([TRACEABLE_RELEASE_JSON])).toMatchObject({ ok: true, tests: ['scripts/release-loop/known-issues-node.test.ts'], reached: 1 });
+  const plan = planPartialRegate({ ...base, changedFiles: [TRACEABLE_RELEASE_JSON], priorFailures: [], closure });
+  expect(plan).toMatchObject({ ok: true, plan: { files: ['scripts/release-loop/known-issues-node.test.ts'] } });
+  expect(planPartialRegate({ ...base, changedFiles: ['scripts/release-loop/other.json'], priorFailures: [], closure }))
+    .toMatchObject({ ok: false, reason: expect.stringContaining('non-test change') });
+});
 
 test('GATE-REUSE-BY-DIFF closure: a test reaching a changed file through helpers is selected; an unrelated test is reused', () => {
   const tree = treeOf({

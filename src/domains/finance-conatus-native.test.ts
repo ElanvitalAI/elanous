@@ -2,7 +2,7 @@
 //
 // 검증 축:
 //   ① 게이트 seam(conatusNativePortEnabled): flag 미설정/false → false(python 경로 불변),
-//      flag true → true. 격리 config(XDG_CONFIG_HOME) + resetUserConfig 로 결정론.
+//      flag true → true. 격리 config-dir override + resetUserConfig 로 결정론.
 //   ② native 경로(flag true): finance_backtest / finance_signals(screen·trend·factor) 가
 //      TS 포트 렌더로 동일 shape({script,output,note} / {kind,report,note})를 반환.
 //      격리 CONATUS_DATA_DIR fixture(conatus-*.test 스타일) — python·네트워크 무의존.
@@ -15,14 +15,15 @@ import { afterAll, afterEach, beforeAll, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 
-// ── 격리 config(XDG_CONFIG_HOME) ─────────────────────────────────────────────
+// ── 격리 config-dir ──────────────────────────────────────────────────────────
 let cfgDir: string;
-const prevXdg = process.env.XDG_CONFIG_HOME;
+let prevConfigDir: string | undefined;
 
 /** 격리 config.json 을 쓰고 getUserConfig 캐시를 무효화(다음 read 가 새 파일 반영). */
 async function writeConfig(obj: unknown): Promise<void> {
-  writeFileSync(join(cfgDir, 'elanous', 'config.json'), JSON.stringify(obj));
+  writeFileSync(join(cfgDir, 'config.json'), JSON.stringify(obj));
   const { resetUserConfig } = await import('../user-config.js');
   resetUserConfig();
 }
@@ -32,7 +33,7 @@ async function writeConfig(obj: unknown): Promise<void> {
 // runScreens() 는 end 미지정 시 '오늘'부터 뒤로 8 거래일을 훑으므로(warm cache 전제),
 // python·네트워크 없이 결정론이 되도록 오늘 기준 롤링 40일 window 를 미리 채운다.
 let dataDir: string;
-const prevData = process.env.CONATUS_DATA_DIR;
+let prevData: string | undefined;
 
 function isoMinus(n: number): string {
   const now = new Date();
@@ -44,11 +45,12 @@ function row(code: string, ex: string, date: string, close: number, vol: number)
 
 beforeAll(() => {
   // config 디렉토리
+  prevConfigDir = getElanousConfigDirOverride();
   cfgDir = mkdtempSync(join(tmpdir(), 'conatus-native-cfg-'));
-  mkdirSync(join(cfgDir, 'elanous'), { recursive: true });
-  process.env.XDG_CONFIG_HOME = cfgDir;
+  setElanousConfigDir(cfgDir);
 
   // 데이터 fixture — 오늘 기준 롤링 40일(주말 포함·recentTradingDates 가 평일만 채택).
+  prevData = process.env.CONATUS_DATA_DIR;
   dataDir = mkdtempSync(join(tmpdir(), 'conatus-native-data-'));
   const cache = join(dataDir, 'cache');
   mkdirSync(cache, { recursive: true });
@@ -88,8 +90,8 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
-  if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
-  else process.env.XDG_CONFIG_HOME = prevXdg;
+  if (prevConfigDir === undefined) resetElanousConfigDir();
+  else setElanousConfigDir(prevConfigDir);
   if (prevData === undefined) delete process.env.CONATUS_DATA_DIR;
   else process.env.CONATUS_DATA_DIR = prevData;
   const { resetUserConfig } = await import('../user-config.js');

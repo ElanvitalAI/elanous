@@ -42,6 +42,8 @@ import {
 // chat 툴루프를 canonical 엔진(runGoalLoop→runCoreTurn→streamLLMWithTools)으로 라우팅.
 // ACP bridge(core-turn-bridge.ts)·dashboard(runGoalLoopHook)와 동일 엔진 재사용(재발명 제거).
 import { runGoalLoop, type CoreTurnContext, type CoreTurnDispatchTool } from '../core-turn/index.js';
+import { composeChildContext, type ChildContextProfile } from '../self-implement/child-context-composition.js';
+import { getHarnessSpace } from '../harness/harness-space.js';
 
 export interface RunTurnOpts {
   userConfig: UserConfig;
@@ -272,6 +274,10 @@ export function buildRecentToolObservations(
   return `[직전 턴에 네가 실행한 도구와 결과 (참고용 컨텍스트) — 이어서 교정·판단할 때 근거로 삼되, 사용자가 이 원문을 봤다고 가정하지 말 것]\n${body}`;
 }
 
+/** CHILD-CONTEXT-BUDGET — 세션별 첫 goal-loop 턴 계측 1회 플래그(모듈 인메모리 —
+ * 원장·세션 저장소 형식은 무변경). 키: runTurn sessionId. */
+const childContextComposedSessions = new Set<string>();
+
 /** Run one conversational turn, persisting both sides to the session
  *  JSONL. Never throws on LLM failure — reraises with context. */
 export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
@@ -435,6 +441,27 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     const goalLoopCfg = opts.userConfig.llm.goalLoop;
     const armGoalLoop = opts.goalLoop === true || goalLoopCfg?.enabled === true;
     if (armGoalLoop) {
+      // ⭐ CHILD-CONTEXT-BUDGET(0.2.35 칸) — 구현 자식(self-implement 공간)의 첫 goal-loop
+      //    턴에서 실제 effectiveSystemPrompt·turnTools 스키마·userText(골)의 구성 바이트를
+      //    composeChildContext 로 계측해 child.context-composition 사건 1회로 남긴다.
+      //    관측 전용 — 프롬프트·메시지는 무변경, 계측이 턴을 깨지 않는다(fail-open).
+      //    게이트: harness-space SSOT 로 구현 자식만 판별(getHarnessSpace().kind === 'self-implement')·
+      //    세션 첫 goal-loop 무장 턴 1회(모듈 인메모리 플래그 — 원장·세션 저장소는 무변경).
+      //    profile 은 자식 프롬프트 예산 신호(ELANOUS_PROMPT_BUDGET=lean — local 자식 스폰 시 주입)에서
+      //    실측 파생한다: lean → small(32k 바이트 상한), 아니면 default(무상한).
+      const isSelfImplementChild = getHarnessSpace()?.kind === 'self-implement';
+      if (isSelfImplementChild && !childContextComposedSessions.has(opts.sessionId)) {
+        childContextComposedSessions.add(opts.sessionId);
+        const childContextProfile: ChildContextProfile
+          = process.env.ELANOUS_PROMPT_BUDGET?.trim() === 'lean' ? 'small' : 'default';
+        try {
+          composeChildContext({
+            systemPrompt: effectiveSystemPrompt,
+            toolSchemas: JSON.stringify(turnTools),
+            goal: opts.userText,
+          }, { profile: childContextProfile });
+        } catch { /* 계측은 턴을 깨지 않는다 */ }
+      }
       const coreCtx: CoreTurnContext = {
         sessionId: opts.sessionId,
         // ⭐ 이 턴의 «사람 문장» 운반자. 없으면 표면 판정이 늘 기본값으로 떨어진다

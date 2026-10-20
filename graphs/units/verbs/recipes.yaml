@@ -1,0 +1,33 @@
+make-doc-input:
+  command: 'bun scripts/graph-units/verbs-envelope.ts make-doc-input'
+  timeout_ms: 10000
+make-doc-output:
+  command: 'bun scripts/graph-units/verbs-envelope.ts make-doc-output'
+  timeout_ms: 10000
+verify-envelope:
+  command: 'bun scripts/graph-units/verbs-envelope.ts verify-envelope'
+  timeout_ms: 10000
+verify-output-done:
+  command: 'bun scripts/graph-units/verbs-envelope.ts verify-output done'
+  timeout_ms: 10000
+verify-output-rework:
+  command: 'bun scripts/graph-units/verbs-envelope.ts verify-output rework'
+  timeout_ms: 10000
+verify-output-needs-human:
+  command: 'bun scripts/graph-units/verbs-envelope.ts verify-output needs-human'
+  timeout_ms: 10000
+verify-output-failed:
+  command: 'bun scripts/graph-units/verbs-envelope.ts verify-output failed'
+  timeout_ms: 10000
+headless-goal-loop:
+  command: 'bun scripts/graph-units/verbs/headless-goal-loop.ts'
+  dry_run_command: 'printf ''{"outcome":"done","result":"dry-run","evidence":{}}\n'''
+  timeout_ms: 300000
+gate-baseline:
+  command: 'bun scripts/graph-units/verbs/verify-stage.ts gate'
+  dry_run_command: 'printf ''{"outcome":"pass","passed":true,"gate-log":"dry-run"}\n'''
+  timeout_ms: 600000
+pr-reviewer:
+  command: 'bun scripts/graph-units/verbs/verify-stage.ts review'
+  dry_run_command: 'printf ''{"outcome":"pass","verdict":"pass","must-fix":[],"review-summary":"dry-run"}\n'''
+  timeout_ms: 180000

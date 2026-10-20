@@ -12,6 +12,21 @@ import { buildUserConfig } from '../user-config.js';
 import { tmpdir } from 'node:os';
 
 const REPO = join(import.meta.dir, '../..');
+// 0.2.33 recover 경로의 종결 gate 는 계약 없는 관측용 노드다.
+// 원장의 경고는 숨기지 않고 YAML의 현재 선언과 함께 전파한다.
+const EXPECTED_TEMPLATE_ISSUES = [
+  'default-loop.yaml/nodes/13/contract',
+  'document-loop.yaml/nodes/10/contract',
+  'document-loop.yaml/nodes/11/contract',
+  'operate-loop.yaml/nodes/11/contract',
+  'operate-loop.yaml/nodes/12/contract',
+  'plan-loop.yaml/nodes/0/contract',
+  'plan-loop.yaml/nodes/1/contract',
+  'plan-loop.yaml/nodes/2/contract',
+  'plan-loop.yaml/nodes/3/contract',
+  'research-loop.yaml/nodes/8/contract',
+  'research-loop.yaml/nodes/9/contract',
+].map((path) => ({ path, message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' }));
 
 // ⛔ 이름을 «갈라» 둔다 — 같은 모듈이 export 하는 `repositoryTestSources`(경로→내용 맵)와
 //   이 지역 함수(경로 목록)는 «다른 값»이고, 한 이름이면 지역이 import 를 가려 조용히 틀린 모양이 흐른다.
@@ -138,13 +153,8 @@ describe('2026-09-26 설정 졸업 — 선언은 항상 실행 권위', () => {
         graphAuthoritativeSource: 'default',
         activeGraphId: 'research-loop',
         graphTemplatesSource: 'yaml',
-        graphTemplatesIssueCount: 4,
-        graphTemplatesIssues: [
-          { path: 'plan-loop.yaml/nodes/0/contract', message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' },
-          { path: 'plan-loop.yaml/nodes/1/contract', message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' },
-          { path: 'plan-loop.yaml/nodes/2/contract', message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' },
-          { path: 'plan-loop.yaml/nodes/3/contract', message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' },
-        ],
+        graphTemplatesIssueCount: EXPECTED_TEMPLATE_ISSUES.length,
+        graphTemplatesIssues: EXPECTED_TEMPLATE_ISSUES,
         graphTemplatesIssuesTruncated: false,
         discardedNodeFields: compileGraphTemplate(GRAPH_SPECS['research-loop']!).discardedNodeFields,
       });
@@ -156,13 +166,8 @@ describe('2026-09-26 설정 졸업 — 선언은 항상 실행 권위', () => {
         graphAuthoritativeSource: 'default',
         activeGraphId: 'self-implement',
         graphTemplatesSource: 'yaml',
-        graphTemplatesIssueCount: 4,
-        graphTemplatesIssues: [
-          { path: 'plan-loop.yaml/nodes/0/contract', message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' },
-          { path: 'plan-loop.yaml/nodes/1/contract', message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' },
-          { path: 'plan-loop.yaml/nodes/2/contract', message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' },
-          { path: 'plan-loop.yaml/nodes/3/contract', message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' },
-        ],
+        graphTemplatesIssueCount: EXPECTED_TEMPLATE_ISSUES.length,
+        graphTemplatesIssues: EXPECTED_TEMPLATE_ISSUES,
         graphTemplatesIssuesTruncated: false,
         discardedNodeFields: compileGraphTemplate(GRAPH_SPECS['self-implement']!).discardedNodeFields,
       });
@@ -186,13 +191,8 @@ describe('2026-09-26 설정 졸업 — 선언은 항상 실행 권위', () => {
       graphAuthoritativeSource: 'default',
       activeGraphId: 'no-such-graph',
       graphTemplatesSource: 'yaml',
-      graphTemplatesIssueCount: 4,
-      graphTemplatesIssues: [
-        { path: 'plan-loop.yaml/nodes/0/contract', message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' },
-        { path: 'plan-loop.yaml/nodes/1/contract', message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' },
-        { path: 'plan-loop.yaml/nodes/2/contract', message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' },
-        { path: 'plan-loop.yaml/nodes/3/contract', message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' },
-      ],
+      graphTemplatesIssueCount: EXPECTED_TEMPLATE_ISSUES.length,
+      graphTemplatesIssues: EXPECTED_TEMPLATE_ISSUES,
       graphTemplatesIssuesTruncated: false,
       discardedNodeFields: null,
     });

@@ -18,6 +18,8 @@ import { debug } from '../debug/log.js';
 import { renderToolBlock } from '../chat/tool-render/block.js';
 import type { ToolRenderModel } from '../chat/tool-render/types.js';
 import { toolOperationKind, type FoldMode } from '../log-entry.js';
+import { sep } from 'node:path';
+import { toolResultsRoot } from '../tool-runtime/truncation-store.js';
 import { stripAnsi } from '../tui.js';
 import type { TurnStreamPresentationEvent } from './turn-stream-presentation-applier.js';
 import { buildFoldedTailLine, splitNoSynthesisTail } from './chat-fold.js';
@@ -161,6 +163,24 @@ export interface TurnStreamFormatter {
   onText(chunk: string, accumulated: string): void;
   onToolCall(call: TurnStreamCall): void;
   onToolResult(call: TurnStreamCall): void;
+  /** TUI-TURN-NARRATION — 추론 요약 한 문단을 흐린 💭 한 줄로 남긴다(결함 #87). */
+  onThought?(text: string): void;
+}
+
+/** 잡무 도구를 접을 때의 종류 이름 — `… (N 내부)`. */
+export const BOOKKEEPING_KIND = '내부';
+const BOOKKEEPING_TOOLS = new Set(['MsgList', 'MsgAck', 'ScheduleWakeup']);
+/** 도구 결과가 길어 넘침 파일로 빠진 것을 다시 읽는 Read — 사람에게는 «같은 결과를 이어 읽음» 이다.
+ *  ⛔ 부분 문자열이 아니라 «실제 넘침 뿌리» 아래인지로 가린다(#28968 리뷰 FU-5 — 남의 같은 이름 경로를 접지 않게). */
+export function isBookkeepingTool(
+  kind: string,
+  args: Record<string, unknown>,
+  spillRoot: string = toolResultsRoot(),
+): boolean {
+  if (BOOKKEEPING_TOOLS.has(kind)) return true;
+  if (kind !== 'Read') return false;
+  const path = args.file_path ?? args.path;
+  return typeof path === 'string' && path.startsWith(`${spillRoot}${sep}`);
 }
 
 export function createTurnStreamFormatter(
@@ -168,6 +188,9 @@ export function createTurnStreamFormatter(
 ): TurnStreamFormatter {
   const groupingKind = (name: string, args: Record<string, unknown>): string | undefined => {
     const kind = toolOperationKind(name, args);
+    // TUI-TURN-NARRATION 조각 3 — 사람이 볼 필요 없는 잡무 도구(우편 확인·깨움 예약 · 넘침 파일 읽기)는
+    //   «내부» 한 종류로 묶어, 연달아 오면 «… (N 내부)» 한 줄로 접는다(결함 #87 화면 소음).
+    if (deps.foldMode && deps.foldMode !== 'line' && isBookkeepingTool(kind, args)) return BOOKKEEPING_KIND;
     return deps.foldMode === 'kind-unit' || (deps.foldMode === 'task-unit' && kind === 'RunShell')
       ? kind
       : undefined;
@@ -189,6 +212,7 @@ export function createTurnStreamFormatter(
   const nonGenericCallIds = new Set<string>();
   let toolCallCount = 0;
   let noSynthesisTailCount = 0;
+  let thoughtCount = 0;
 
   const emitAssistantBlock = (): void => {
     deps.thinking.update('Streaming');
@@ -265,6 +289,13 @@ export function createTurnStreamFormatter(
       }
       emitAssistantBlock();
     },
+    onThought(text: string): void {
+      const line = text.replace(/\s+/g, ' ').trim();
+      if (line.length === 0) return;
+      // 생각 줄은 답 글 «사이»에 끼지 않게 지금까지의 라운드 글을 닫고 붙인다.
+      closeRound();
+      deps.emit({ type: 'tool.appendLine', callId: `thought-${++thoughtCount}`, line: deps.muted(`💭 ${line}`) });
+    },
     onToolCall(call: TurnStreamCall): void {
       toolCallCount += 1;
       deps.thinking.update(`Streaming ${call.name} (${toolCallCount} ${toolCallCount === 1 ? 'tool' : 'tools'})`);
@@ -338,7 +369,9 @@ export function createTurnStreamFormatter(
         collapsedLines: variants.collapsed,
         expandedLines: variants.expanded,
         ...(groupingKind(call.name, args)
-          ? { operationKind: deps.foldMode === 'task-unit'
+          ? { operationKind: groupingKind(call.name, args) === BOOKKEEPING_KIND
+            ? BOOKKEEPING_KIND
+            : deps.foldMode === 'task-unit'
             ? 'RunShell'
             : ('operationKind' in variants ? variants.operationKind : undefined) ?? toolOperationKind(call.name, args) }
           : {}),

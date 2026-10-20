@@ -37,7 +37,9 @@ describe('Pod → self implement flag contract', () => {
     const at = index.indexOf('planPodProvider({');
     expect(at).toBeGreaterThan(0);
     const call = index.slice(at, at + 600);
-    expect(call).toContain('thresholdPercentByAccount: launchPolicy.llm?.codexAccountRotationThresholdPercentByAccount');
+    expect(call).toContain('thresholdPercentByAccount: ownerMirrorAccount');
+    expect(call).toContain('Number(process.env.ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT)');
+    expect(call).toContain(': launchPolicy.llm?.codexAccountRotationThresholdPercentByAccount');
   });
 
   test('--child-llm-provider/--child-llm-model reach the dev spec', () => {

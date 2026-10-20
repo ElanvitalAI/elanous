@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { SMALL_LEDGER_BYTES, buildGeneration, isSecretPath, planSnapshot, snapshotItem, stripHostLocalConfig, survivalPaths } from './standby-snapshot';
+import { SMALL_LEDGER_BYTES, assertSurvivalKeepArgs, buildGeneration, isSecretPath, planSnapshot, snapshotItem, stripHostLocalConfig, survivalPaths } from './standby-snapshot';
 
 const roots: string[] = [];
 // GATE-PREEXISTING-ZERO — fixtures and read-backs go through bun:sqlite (in-process); only the product's own
@@ -119,4 +119,49 @@ test('sqlite snapshot uses one consistent copy and replaces a stale destination 
   snapshotItem(root, out, { rel: 'logs/logs.db', kind: 'sqlite' } as Parameters<typeof snapshotItem>[2]);
   expect(sqlRows(join(out, 'logs/logs.db'), 'SELECT count(*) FROM t;')).toEqual(['3']);
   expect(sqlRows(join(out, 'logs/logs.db'), 'PRAGMA integrity_check;')).toEqual(['ok']);
+}, SPAWN_TEST_TIMEOUT_MS);
+
+function runSnapshotCli(...args: string[]) {
+  // Production entry path: spawn the script so import.meta.main argv parse runs (not a source-string check).
+  return spawnSync(process.execPath, [join(import.meta.dir, 'standby-snapshot.ts'), ...args], {
+    encoding: 'utf8',
+    cwd: join(import.meta.dir, '..', '..'),
+    env: { ...process.env, ELANOUS_STATE_DIR: join(tmpdir(), 'hq-standby-missing-state-never') },
+  });
+}
+
+test('valueless --survival-keep(-daily) and targetless --prune-survival exit 2 before snapshot work', () => {
+  for (const flag of ['--survival-keep', '--survival-keep-daily', '--prune-survival'] as const) {
+    expect(() => assertSurvivalKeepArgs([flag])).toThrow(`${flag} requires a value`);
+    expect(() => assertSurvivalKeepArgs([flag, '--dry-run'])).toThrow(`${flag} requires a value`);
+    expect(() => assertSurvivalKeepArgs([`${flag}=`])).toThrow(`${flag} requires a value`);
+    const bare = runSnapshotCli(flag);
+    expect(bare.status).toBe(2);
+    expect(bare.stderr).toContain(`${flag} requires a value`);
+    // Must refuse before planSnapshot/buildGeneration — a dry-run would otherwise exit 0 with a plan.
+    const withDryRun = runSnapshotCli(flag, '--dry-run', '--json');
+    expect(withDryRun.status).toBe(2);
+    expect(withDryRun.stderr).toContain(`${flag} requires a value`);
+    expect(withDryRun.stdout).toBe('');
+    // Equals-form empty value is still a valueless occurrence on the production entry path.
+    const equalsEmpty = runSnapshotCli(`${flag}=`, '--dry-run', '--json');
+    expect(equalsEmpty.status).toBe(2);
+    expect(equalsEmpty.stderr).toContain(`${flag} requires a value`);
+    expect(equalsEmpty.stdout).toBe('');
+  }
+  // A value present is accepted by the keep/prune gate (other work may still fail later).
+  expect(() => assertSurvivalKeepArgs(['--survival-keep', '7', '--dry-run'])).not.toThrow();
+  expect(() => assertSurvivalKeepArgs(['--survival-keep-daily', '3'])).not.toThrow();
+  expect(() => assertSurvivalKeepArgs(['--prune-survival', 's3://bucket/prefix'])).not.toThrow();
+  // Boundary: a valued equals-form occurrence is not a valueless one; consume-or-reject for that
+  // shape stays outside this cell's line.
+  expect(() => assertSurvivalKeepArgs(['--survival-keep=7'])).not.toThrow();
+  const valued = runSnapshotCli('--survival-keep', '7', '--dry-run', '--json');
+  expect(valued.status).toBe(0);
+  expect(JSON.parse(valued.stdout)).toMatchObject({ tier: 'core' });
+  // A valid first occurrence must not hide a later valueless occurrence on the production entry path.
+  const repeated = runSnapshotCli('--survival-keep', '7', '--survival-keep', '--dry-run', '--json');
+  expect(repeated.status).toBe(2);
+  expect(repeated.stderr).toContain('--survival-keep requires a value');
+  expect(repeated.stdout).toBe('');
 }, SPAWN_TEST_TIMEOUT_MS);

@@ -306,13 +306,20 @@ import {
 } from './render/renderer.js';
 import { buildPromptFrameDividerRows } from '../display/prompt-frame-paint.js';
 import {
-  drawTurnTypeaheadPromptRows,
   paintTurnTypeaheadEchoRow,
   resolveEssentialFrameCursorDecision,
   type EssentialFrameCursorDecision,
-  type TurnTypeaheadPromptPaintSink,
-  type TurnTypeaheadPromptRowsInput,
 } from './input/turn-typeahead-prompt.js';
+import {
+  buildDashboardTurnTypeaheadPromptZone,
+  drawDashboardTurnTypeaheadPromptRows,
+  observeDashboardTurnTypeaheadPromptZone,
+} from './turn-typeahead-prompt-zone.js';
+export {
+  buildDashboardTurnTypeaheadPromptZone,
+  drawDashboardTurnTypeaheadPromptRows,
+  observeDashboardTurnTypeaheadPromptZone,
+} from './turn-typeahead-prompt-zone.js';
 import { DashboardStateStore } from './runtime/state-store.js';
 import { perf } from '../perf-counters.js';
 import { createSearchModal, type SearchModalHandle, type SearchItem } from '../chat/search/modal.js';
@@ -1467,30 +1474,6 @@ export function resolveDashboardSlashSurfaceUx(
     : undefined;
 }
 
-/** Dashboard draw entry for the input-prompt zone. Streaming redraws reach
- * this production binding through the zone renderer below. */
-export function drawDashboardTurnTypeaheadPromptRows(
-  input: TurnTypeaheadPromptRowsInput,
-  sink?: TurnTypeaheadPromptPaintSink,
-): string[] {
-  return drawTurnTypeaheadPromptRows(input, sink);
-}
-
-/** Essential frames own the fallback prompt caret; Z-axis state only wins
- * when a modal has made a visible claim. */
-export function buildDashboardTurnTypeaheadPromptZone(input: TurnTypeaheadPromptRowsInput & {
-  suppressPromptArea: boolean;
-}): LayoutZone {
-  return {
-    id: 'input-prompt',
-    height: input.frame.inputHeight,
-    render: (height, width) => {
-      if (input.suppressPromptArea) return Array.from({ length: height }, () => ' '.repeat(width));
-      return drawDashboardTurnTypeaheadPromptRows({ ...input, height, width });
-    },
-  };
-}
-
 /** The chat-main submit branch calls this before any model dispatch. Keeping
  * the decision here lets the dashboard test execute the same entry point. */
 export function resolveDashboardHarnessSubmitIntent(
@@ -1499,42 +1482,6 @@ export function resolveDashboardHarnessSubmitIntent(
   resolveIntent: typeof resolveDashboardChatMainSubmitIntent = resolveDashboardChatMainSubmitIntent,
 ) {
   return routeDevHarnessSubmitIntent(resolveIntent(text, options));
-}
-
-/** 프롬프트 zone 에 관측만 덧입힌다 — 렌더 산출은 `inner` 가 소유한다.
- *
- *  ⭐ **왜 뽑았나**(무인 리뷰 must-fix · 2026-08-01): 종전엔 이 래퍼가 `zones.push({...})` 안에
- *  인라인이라, 테스트가 `inner`(=`buildDashboardTurnTypeaheadPromptZone`)만 불러도 통과했다.
- *  ⇒ ***래퍼가 `inner.render` 를 부르는 것을 끊어도 검사가 침묵***했다. 이제 그 결선이 검사된다.
- *
- *  ⛔⚠️ **여전히 검사 밖인 한 겹**: 이 함수의 반환이 실제로 `zones` 배열에 **push 되는지**는
- *  `showDashboard` 안의 지역 조립부라 단위 검사가 닿지 않는다. ***무한 후퇴이므로 여기서 경계를 긋는다*** —
- *  그 한 겹은 **라이브 검증**(`dev --elanous --hold` ⊕ `pty snapshot`)이 맡는다. */
-export function observeDashboardTurnTypeaheadPromptZone(
-  inner: LayoutZone,
-  deps: {
-    promptBottomRow: number;
-    state: { buffer: string; queuedSubmissions: string[] };
-    isDebugEnabled?: () => boolean;
-    log?: (category: string, event: string, data: Record<string, unknown>) => void;
-  },
-): LayoutZone {
-  return {
-    ...inner,
-    render: (height, width) => {
-      const rows = inner.render(height, width);
-      const enabled = deps.isDebugEnabled ? deps.isDebugEnabled() : debug.enabled;
-      if (deps.state.buffer && enabled) {
-        (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('dashboard.turn-typeahead-prompt', 'dashboard-draw-prompt', {
-          row: deps.promptBottomRow,
-          text: rows.at(-1) ?? '',
-          bufferLength: deps.state.buffer.length,
-          queuedSubmissionCount: deps.state.queuedSubmissions.length,
-        });
-      }
-      return rows;
-    },
-  };
 }
 
 type DashboardFrameRenderer = (lines: string[], options: RenderOptions) => void;
@@ -1913,6 +1860,20 @@ export function renderDashboardStatusLines(input: Omit<DashboardStatusLinesInput
     debug.log('dashboard.status', 'seats-unreadable', { error: String(error) });
   }
   return buildDashboardStatusLines({ ...input, seatsNow });
+}
+
+/** The pending-input registry is process-local; a remote ACP loop cannot drain it. */
+export function activeDashboardTypeaheadSessionId(acpSessionId: string | null, daemonAttached: boolean): string | null {
+  return daemonAttached ? null : acpSessionId;
+}
+
+/** The streaming keyboard's production typeahead transition. */
+export function applyDashboardStreamingTypeaheadKey(
+  state: Parameters<typeof applyTurnTypeaheadKey>[0],
+  key: Parameters<typeof applyTurnTypeaheadKey>[1],
+  isImmediate: Parameters<typeof applyTurnTypeaheadKey>[2],
+): ReturnType<typeof applyTurnTypeaheadKey> {
+  return applyTurnTypeaheadKey(state, key, isImmediate);
 }
 
 export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<DashboardAction> {
@@ -3404,6 +3365,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     getCwd: () => workingDir.cwd,
     notify: (line) => { chatLines.push(C.muted(line)); draw(); },
   });
+  // Set only by the failed-turn callback and consumed by that turn's streaming cleanup.
+  let autowakeTurnFailureRaw: string | null = null;
   const internalTurnYieldPort = wrapAgentWakePort(seatAutowake.wrapPort(internalTurnGate.port));
   // ⭐ H5 자기 예약 깨움(TUI-H5-SCHEDULE-WAKEUP) — 프로세스 안 타이머가 그 시각에 H2 문으로 한 턴을 청한다.
   //   직전 회차 판정 = 그 예약이 연 내부 턴이 아직 도나. 도구 등록은 아래 host tool 자리(하니스 자식 제외).
@@ -3416,7 +3379,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const acpSessionIdRef: { current: string | null } = { current: null };
   const adoptedAcpSessionIds = new Set<string>();
   let activeAcpSessionId: string | null = null;
-  const activeSessionIdForTypeahead = (): string | null => acpSessionIdRef.current;
   const paintTurnTypeaheadEcho = (): void => {
     const { rows: tr, cols: tc } = termSize();
     const pf = currentPromptFrame(tr);
@@ -6857,7 +6819,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             } catch { /* 승격 실패가 스트리밍을 막지 않는다 */ }
             return 'consumed';
           }
-          const r = applyTurnTypeaheadKey(turnTypeaheadRef.state, k, isStreamingImmediateSlash);
+          const r = applyDashboardStreamingTypeaheadKey(turnTypeaheadRef.state, k, isStreamingImmediateSlash);
           if (r.consumed) {
             turnTypeaheadRef.state = r.state;
             if (r.submissionDisposition) {
@@ -6873,7 +6835,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               // ⛔ H2 — 내부 턴 중의 사람 입력은 그 턴에 끼워 넣지 않는다(턴 끝 FIFO 로 기다린다).
               if (r.submissionDisposition === 'fifo' && !r.immediateSubmission && !internalTurnGate.isInternalTurnActive()) {
                 const queuedText = turnTypeaheadRef.state.queuedSubmissions.at(-1);
-                const sid = activeSessionIdForTypeahead();
+                const sid = activeDashboardTypeaheadSessionId(acpSessionIdRef.current, daemonAttached);
                 if (queuedText && sid) {
                   const queuedHistoryEntry = inputHistoryStore.record({
                     text: queuedText,
@@ -7165,7 +7127,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         userScrolledDuringStream = false;
         streamingInFlight = false;
         reportTuiTurn('idle');
-        seatAutowake.noteTurnEnded();
+        const failedTurnRaw = autowakeTurnFailureRaw;
+        autowakeTurnFailureRaw = null;
+        seatAutowake.noteTurnEnded({ sessionId: currentChatPersonaSessionId(), lastLine: chatLines.at(-1) ?? '', errorDetail: failedTurnRaw ?? undefined });
       }
     };
   };
@@ -18570,6 +18534,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   settleEscAbortToolCall(escAbortToolState, toolCall);
                   escHarnessSpacesByCallId.delete(toolCall.id);
                 },
+                onThought: (text) => {
+                  turnStreamRuntime.onThought?.(text);
+                  draw();
+                },
               };
             },
             runTurnUsageRuntime: (usage) => {
@@ -18690,6 +18658,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             warningLine: (message) => C.warning(`${ICONS.warning} ${message}`),
             pushErrorLine: (message) => { chatLines.push(C.error(`Error: ${message}`)); },
             pushFailureNotice: (notice, raw) => {
+              autowakeTurnFailureRaw = raw;
               chatLines.push(C.warning(notice));
               detailViewerRuntime.stage('turn error', raw.split(/\r?\n/));
             },

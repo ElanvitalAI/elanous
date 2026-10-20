@@ -92,7 +92,16 @@ export type SeatAutowakeSkipReason =
   | 'nothing-pending'
   | 'human-recent'
   | 'same-order'
-  | 'cap';
+  | 'cap'
+  | 'terminal-codex-400';
+
+/** The rendered error line is captured before the turn footer shortens it. */
+export interface SeatAutowakeTurnResult {
+  sessionId: string | null;
+  lastLine: string;
+  /** Raw turn failure staged for /detail open when the visible line is condensed. */
+  errorDetail?: string;
+}
 
 export interface SeatAutowakeInput {
   /** 자리 TUI 의 자리(대문자) — 자리 아님이면 null. */
@@ -187,7 +196,7 @@ export interface SeatAutowakeDeps {
 
 export interface SeatAutowakeController {
   /** 모델 턴이 끝났다(스트리밍 정리 지점) — 다음 입력칸 마운트에서 한 번 잰다. */
-  noteTurnEnded(): void;
+  noteTurnEnded(result?: SeatAutowakeTurnResult): void;
   /** 입력칸이 마운트됐다 — 턴 끝이 무장돼 있으면 판정하고, 남은 일이 있으면 H2 로 연다. */
   check(): SeatAutowakeDecision & { opened?: boolean; rejected?: string };
   /** H2 의 yield port 를 감싸 «마운트 = 판정 시점»으로 잇는다(입력칸 무접촉). */
@@ -229,6 +238,9 @@ export function createSeatAutowake(deps: SeatAutowakeDeps): SeatAutowakeControll
   let lastOpenedAt = 0;
   let capNotified = false;
   let recheckArmed = false;
+  let activeSessionId: string | null = null;
+  let lastOrphanFailure: { callId: string; count: number } | null = null;
+  let terminalCallId: string | null = null;
 
   const check: SeatAutowakeController['check'] = () => {
     const detection = detect(deps.getCwd());
@@ -256,6 +268,14 @@ export function createSeatAutowake(deps: SeatAutowakeDeps): SeatAutowakeControll
       seat, enabled, turnEnded, unread, queue, now: t, lastHumanKeyAt: humanAt,
       humanQuietMs: quietMs, lastFingerprint, consecutive, consecutiveCap: deps.consecutiveCap,
     });
+    if (terminalCallId && activeSessionId) {
+      turnEnded = false;
+      log('tui.autowake', 'terminal-blocked', {
+        seat, sessionId: activeSessionId, errorKind: 'codex-orphan-tool-output-400',
+        callId: terminalCallId, recommendedAction: '/session new',
+      });
+      return { action: 'skip', reason: 'terminal-codex-400', unread: decision.unread, queue: decision.queue };
+    }
     if (decision.action === 'skip' && decision.reason === 'not-turn-end') return decision;
     const base = {
       seat,
@@ -301,7 +321,40 @@ export function createSeatAutowake(deps: SeatAutowakeDeps): SeatAutowakeControll
   };
 
   return {
-    noteTurnEnded() { turnEnded = true; },
+    noteTurnEnded(result) {
+      turnEnded = true;
+      if (!result) return;
+      if (result.sessionId !== activeSessionId) {
+        activeSessionId = result.sessionId;
+        lastOrphanFailure = null;
+        terminalCallId = null;
+        lastFingerprint = null;
+        consecutive = 0;
+      }
+      // The production failed-turn path renders this exact 400 notice and
+      // stages its raw detail. Ordinary assistant text can quote the same API
+      // error, so it must never be parsed as a failed turn by itself.
+      const is400Notice = result.lastLine.includes('모델 API 가 요청을 400 으로 거절')
+        && result.lastLine.includes('원문 /detail open');
+      const match = is400Notice
+        ? /\bCodex API 400\b[^\n]*?No tool call found for function call output with call_id\s+([\w-]+)/iu.exec(result.errorDetail ?? '')
+        : null;
+      if (!match || !activeSessionId) {
+        lastOrphanFailure = null;
+        return;
+      }
+      const callId = match[1]!;
+      lastOrphanFailure = lastOrphanFailure?.callId === callId
+        ? { callId, count: lastOrphanFailure.count + 1 } : { callId, count: 1 };
+      if (lastOrphanFailure.count < 2 || terminalCallId) return;
+      terminalCallId = callId;
+      log('tui.autowake', 'terminal', {
+        seat: detect(deps.getCwd())?.seat ?? null,
+        sessionId: activeSessionId, errorKind: 'codex-orphan-tool-output-400',
+        callId, recommendedAction: '/session new',
+      });
+      deps.notify?.(`⏹ Codex 400 자동 재개 중단 · 세션 ${activeSessionId} · call_id ${callId} · /session new 로 새 세션을 시작하세요`);
+    },
     check,
     wrapPort(port) {
       return {

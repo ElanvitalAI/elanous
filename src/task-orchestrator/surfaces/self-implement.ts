@@ -20,14 +20,16 @@
  */
 import { lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import type { ReviewRework } from '../../self-dev/run-types.js';
+import type { WarmWorkerCommand } from './pod-warm-worker-protocol.js';
 import { oldDoorInternalEnv } from '../../self-dev/old-door.js';
 import { selfDevRunsDir } from '../../self-dev/run-store.js';
-import { debug } from '../../debug/log.js';
+import { debug, redactSecretText } from '../../debug/log.js';
 import { join, resolve } from 'node:path';
 import { findGitDir } from '../../git-fs/locate.js';
 import { isAbandonedClassification, type AbandonedClassificationResult } from '../../self-implement/abandoned-classification.js';
 import { createExecution, type Task, type TaskExecution } from '../types.js';
 import type { DispatchContext, DispatchResult } from '../surface-registry.js';
+import { nestedPodResult } from './pod-failure-reason.js';
 
 /** Result of one self-implement subprocess. */
 export interface SelfImplementJobDone {
@@ -92,6 +94,70 @@ export interface SelfImplementDisposition {
   reviewMustFixCount?: number;
   rework?: ReviewRework;
   mustFix?: string[];
+  /** Structured failure facts copied from the child's terminal JSON into the host ledger. */
+  childEvidence?: PodChildEvidence;
+}
+
+export interface PodChildEvidence {
+  /** Bounded, redacted diagnostics copied only from a failed child terminal result. */
+  error?: string;
+  detail?: string;
+  stderr?: string;
+  exitCode?: number;
+  classification?: string;
+  scopeEscape?: true;
+  outOfScopeEdits?: unknown;
+  abandonedClassification?: Record<string, unknown>;
+  supervisorVerdict?: unknown;
+  goalCauseObserved?: true;
+  terminationReason?: unknown;
+  accountAvailability?: Record<string, unknown>;
+}
+
+/** Preserve only named terminal facts; the full child detail may contain logs or credentials. */
+export function podChildEvidenceFromResult(o: Record<string, unknown>): PodChildEvidence | undefined {
+  const object = (value: unknown): Record<string, unknown> | undefined =>
+    value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+  const scrub = (value: Record<string, unknown> | undefined): Record<string, unknown> | undefined => {
+    if (!value) return undefined;
+    try { return JSON.parse(redactSecretText(JSON.stringify(value))) as Record<string, unknown>; }
+    catch { return undefined; }
+  };
+  const abandoned = scrub(object(o.abandonedClassification));
+  const quota = object(o.quotaExhaustionAssessment);
+  const accountAvailability = scrub(object(quota?.accountAvailability) ?? object(abandoned?.quotaAccountAvailability));
+  const scrubValue = (value: unknown): unknown => {
+    if (value === undefined) return undefined;
+    try { return JSON.parse(redactSecretText(JSON.stringify(value))); }
+    catch { return undefined; }
+  };
+  const failedText = (value: unknown): string | undefined => {
+    if (o.ok !== false || typeof value !== 'string' || !value.trim()) return undefined;
+    return redactSecretText(value).slice(0, 4_000);
+  };
+  const failureExitCode = o.ok === false && typeof o.exitCode === 'number'
+    && Number.isInteger(o.exitCode) && o.exitCode >= 0 && o.exitCode <= 255 ? o.exitCode : undefined;
+  const outOfScopeEdits = scrubValue(o.outOfScopeEdits);
+  const scopeEscape = (Array.isArray(outOfScopeEdits) && outOfScopeEdits.length > 0)
+    || (typeof o.detail === 'string' && /^Out-of-scope edits held in the worktree(?:[.;]|$)/i.test(o.detail.trim()));
+  const classification = scopeEscape ? 'scope-escape'
+    : typeof abandoned?.classification === 'string' ? redactSecretText(abandoned.classification)
+      : typeof o.failureClassification === 'string' ? redactSecretText(o.failureClassification) : undefined;
+  const evidence: PodChildEvidence = {
+    ...(failedText(o.error) ? { error: failedText(o.error) } : {}),
+    ...(failedText(o.detail) ? { detail: failedText(o.detail) } : {}),
+    ...(failedText(o.stderr) ? { stderr: failedText(o.stderr) } : {}),
+    ...(failureExitCode !== undefined ? { exitCode: failureExitCode } : {}),
+    ...(classification ? { classification } : {}),
+    ...(scopeEscape ? { scopeEscape: true } : {}),
+    ...(outOfScopeEdits !== undefined ? { outOfScopeEdits } : {}),
+    ...(abandoned ? { abandonedClassification: abandoned } : {}),
+    ...(o.supervisorVerdict !== undefined ? { supervisorVerdict: scrubValue(o.supervisorVerdict) } : {}),
+    ...(o.goalCauseObserved === true ? { goalCauseObserved: true } : {}),
+    ...(o.terminationReason !== undefined ? { terminationReason: scrubValue(o.terminationReason) } : {}),
+    ...(accountAvailability ? { accountAvailability } : {}),
+  };
+  return Object.keys(evidence).length ? evidence : undefined;
 }
 
 /**
@@ -117,6 +183,8 @@ export interface SelfImplementJobSpawn {
     /** Distinct-per-job harness-space id → own screen/log buffer. */
     spaceId: string;
     signal?: AbortSignal;
+    /** Optional TC-owned warm-worker command. The warm request is advisory; this feature Job remains authoritative. */
+    warmWorkerCommand?: WarmWorkerCommand;
   }): {
     /** `self-impl:<spaceId>` — keyed so `elanous logs --space` / metrics
      *  can attribute without re-parsing. */
@@ -462,7 +530,18 @@ export function parseSelfImplementJson(stdout: string): SelfImplementDisposition
     const line = lines[i]!.trim();
     if (!line.startsWith('{') || !line.endsWith('}')) continue;
     try {
-      const o = JSON.parse(line) as Record<string, unknown>;
+      const row = JSON.parse(line) as Record<string, unknown>;
+      if (typeof row.kind === 'string' && row.kind !== 'self' && row.kind !== 'external') continue;
+      const childKind = row.kind === 'self' || row.kind === 'external';
+      const nestedEnvelope = childKind && Object.prototype.hasOwnProperty.call(row, 'result');
+      let o = row;
+      let nestedSuccess = false;
+      if (nestedEnvelope) {
+        const terminal = nestedPodResult(row);
+        if (!terminal || !row.result || typeof row.result !== 'object' || Array.isArray(row.result)) continue;
+        o = { ...(row.result as Record<string, unknown>), stage: terminal.stage, ok: terminal.ok };
+        nestedSuccess = terminal.ok;
+      }
       if (typeof o.stage !== 'string' && typeof o.ok !== 'boolean') continue;
       const failureClassification = failureClassificationFromJson(o);
       const rawRework = o.rework && typeof o.rework === 'object' && !Array.isArray(o.rework)
@@ -475,6 +554,7 @@ export function parseSelfImplementJson(stdout: string): SelfImplementDisposition
         // A measured trend needs two reviews, a direction change three — a contradictory pair is not an observation.
         && (rawRework.trend === 'unmeasured' ? rawRework.rounds === 1 : rawRework.rounds >= (rawRework.trend === 'oscillating' ? 3 : 2))
         ? { trend: rawRework.trend as ReviewRework['trend'], signature: rawRework.signature, rounds: rawRework.rounds } : undefined;
+      const childEvidence = nestedSuccess ? undefined : podChildEvidenceFromResult(o);
       const mapped: SelfImplementDisposition = {
         ...(typeof o.stage === 'string' ? { stage: o.stage } : {}),
         ...(typeof o.ok === 'boolean' ? { ok: o.ok } : {}),
@@ -502,6 +582,7 @@ export function parseSelfImplementJson(stdout: string): SelfImplementDisposition
         ...(typeof o.completionDisposition === 'string' && o.completionDisposition.trim()
           ? { completionDisposition: o.completionDisposition } : {}),
         ...(failureClassification ? { failureClassification } : {}),
+        ...(childEvidence ? { childEvidence } : {}),
         ...(o.providerErrors && typeof o.providerErrors === 'object' && !Array.isArray(o.providerErrors)
           && typeof (o.providerErrors as Record<string, unknown>).count === 'number'
           && Number.isFinite((o.providerErrors as Record<string, unknown>).count)

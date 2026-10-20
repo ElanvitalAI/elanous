@@ -13,12 +13,12 @@ const fallback = 'Known issues have been reported for this release.';
 const response = (rows: Array<[string, string]>) => JSON.stringify(rows.map(([id, bullet]) => ({ id, bullet })));
 const normalReply = response([['K13', 'An export may take longer; retry if it times out.'], ['R1', 'Some settings do not persist; save them again.']]);
 
-function fixture() {
+function fixture(releaseVersion = version) {
   const root = mkdtempSync(join(tmpdir(), 'release-known-issues-'));
   const remote = join(root, 'remote.git');
   const tree = join(root, 'tree');
   const bin = join(root, 'bin');
-  const notes = join(tree, 'release/public/docs/releases', `${version}.md`);
+  const notes = join(tree, 'release/public/docs/releases', `${releaseVersion}.md`);
   const calls = join(root, 'ask-calls');
   const git = (args: string[], cwd = root) => {
     const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
@@ -34,8 +34,8 @@ function fixture() {
   writeFileSync(notes, base);
   git(['add', '.'], tree);
   git(['commit', '-m', 'initial'], tree);
-  git(['checkout', '-b', `release-docs/${version}`], tree);
-  git(['push', '-u', 'origin', `release-docs/${version}`], tree);
+  git(['checkout', '-b', `release-docs/${releaseVersion}`], tree);
+  git(['push', '-u', 'origin', `release-docs/${releaseVersion}`], tree);
   const fake = join(bin, 'elanous');
   writeFileSync(fake, `#!/usr/bin/env node
 const fs = require('node:fs');
@@ -44,10 +44,19 @@ if (process.env.KNOWN_ASK_FAIL === '1') process.exit(3);
 console.log(JSON.stringify({reply:process.env.KNOWN_ASK_REPLY}));
 `);
   chmodSync(fake, 0o755);
-  const invoke = (checklist: Array<{ id: string; title: string; evidence: string }> = [], acceptedRegressions: Array<{ id: string; note: string }> = [], opts: { reply?: string; fail?: boolean; worktree?: string; outputs?: Record<string, Record<string, unknown>> } = {}) => {
-    const context = { input: { version, previousVersion: '0.2.6', acceptedRegressions }, outputs: { 'checklist-gate': { knownIssues: checklist }, docs: { branch: `release-docs/${version}`, worktree: opts.worktree ?? tree }, ...opts.outputs } };
+  const invoke = (checklist: Array<{ id: string; title: string; evidence: string }> = [], acceptedRegressions: Array<{ id: string; note: string }> = [], opts: { reply?: string; fail?: boolean; worktree?: string; outputs?: Record<string, Record<string, unknown>>; recordedWaiver?: { note: string } } = {}) => {
+    const context = { input: { version: releaseVersion, previousVersion: '0.2.6', acceptedRegressions }, outputs: { 'checklist-gate': { knownIssues: checklist }, docs: { branch: `release-docs/${releaseVersion}`, worktree: opts.worktree ?? tree }, ...(opts.recordedWaiver ? { tui: { verdict: 'waived', reason: opts.recordedWaiver.note } } : {}), ...opts.outputs } };
+    let contextValue = JSON.stringify(context);
+    if (opts.recordedWaiver) {
+      const statePath = join(root, 'graph-runs/release-loop/run-test.json');
+      contextValue = `${statePath}.contexts/2.json`;
+      mkdirSync(`${statePath}.contexts`, { recursive: true });
+      writeFileSync(statePath, JSON.stringify({ graphId: 'release-loop', runId: 'run-test', input: context.input,
+        path: ['tui', 'known-issues'], nodes: [{ nodeId: 'tui', ok: true, executed: false, waiver: { reason: opts.recordedWaiver.note } }] }));
+      writeFileSync(contextValue, JSON.stringify({ ...context, graphId: 'release-loop', runId: 'run-test', nodeId: 'known-issues' }));
+    }
     const run = spawnSync('bun', [join(import.meta.dir, 'known-issues-node.ts')], {
-      cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, ELANOUS_GRAPH_CONTEXT: JSON.stringify(context), KNOWN_ASK_CALLS: calls,
+      cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, ELANOUS_GRAPH_CONTEXT: contextValue, ...(opts.recordedWaiver ? { ELANOUS_STATE_DIR: root } : {}), KNOWN_ASK_CALLS: calls,
         KNOWN_ASK_REPLY: opts.reply ?? normalReply, KNOWN_ASK_FAIL: opts.fail ? '1' : '0' },
     });
     return { code: run.status, result: JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { outcome: string; summary: string; count: number; bullets: string[]; sources: { checklist: number; accepted: number }; fallbackUsed: boolean } };
@@ -75,6 +84,230 @@ test('two sources become public English bullets in one ask and push only to the 
     expect(args[3]).toContain('Settings not persisted');
     expect(args[3]).toContain('using each input ID exactly once');
     expect(f.git(['show', `release-docs/${version}:release/public/docs/releases/${version}.md`], f.remote)).toBe(text.trimEnd());
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('47 accepted IDs sharing two notes need two distinct bullets and both note groups', () => {
+  const f = fixture();
+  try {
+    const groups = [
+      { count: 3, note: 'Dashboard updates do not appear', bullet: 'Dashboard updates do not appear until a refresh.' },
+      { count: 44, note: 'Exports do not finish', bullet: 'Exports do not finish for some users.' },
+    ];
+    const regressions = groups.flatMap(({ count, note }, group) => Array.from({ length: count }, (_, index) => ({ id: `R${group}-${index}`, note })));
+    const good = response(regressions.map(({ id, note }) => [id, groups.find((group) => group.note === note)!.bullet]));
+    const pass = f.invoke([], regressions, { reply: good });
+    expect(pass.code).toBe(0);
+    expect(pass.result).toMatchObject({ outcome: 'ok', count: 2, sources: { accepted: 47 }, fallbackUsed: false });
+    expect(pass.result.bullets).toEqual(groups.map((group) => group.bullet));
+    expect(readFileSync(f.notes, 'utf8').match(/^- /gm)).toHaveLength(3); // existing behavior-change bullet plus two known issues
+    const missing = response(regressions.map(({ id }) => [id, groups[0]!.bullet]));
+    const fail = f.invoke([], regressions, { reply: missing });
+    expect(fail.code).toBe(1);
+    expect(fail.result.summary).toContain('coverage not verified');
+    const split = response(regressions.map(({ id, note }, index) => [id,
+      index === 0 ? 'Dashboard updates fail to appear until a refresh.' : groups.find((group) => group.note === note)!.bullet]));
+    const splitFail = f.invoke([], regressions, { reply: split });
+    expect(splitFail.code).toBe(1);
+    expect(splitFail.result.summary).toContain('repeats or splits an issue');
+    const mixedFallback = response(regressions.map(({ id, note }, index) => [id,
+      index === 0 ? 'Fixed in #123.' : groups.find((group) => group.note === note)!.bullet]));
+    const mixedFail = f.invoke([], regressions, { reply: mixedFallback });
+    expect(mixedFail.code).toBe(1);
+    expect(mixedFail.result.summary).toContain('repeats or splits an issue');
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('real Korean accepted-note groups with only a shared English label retain two safe public bullets', () => {
+  const f = fixture();
+  try {
+    const groups = [
+      { count: 3, note: 'KI-0233-REGRESSIONS · 0.2.33: 사용자 영향은 bot routine dry-run 루틴 사용 금지. 격리 시험은 검증되지 않았으며 0.2.34에서 복원·재검증한다.', bullet: 'The bot routine dry-run must not be used in this release.' },
+      { count: 44, note: 'KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다.', bullet: 'Some paths have a verification gap; their behavior remains unverified.' },
+    ];
+    const regressions = groups.flatMap(({ count, note }, group) => Array.from({ length: count }, (_, index) => ({ id: `real-${group}-${index}`, note })));
+    const good = response(regressions.map(({ id, note }) => [id, groups.find((group) => group.note === note)!.bullet]));
+    const pass = f.invoke([], regressions, { reply: good });
+    expect(pass.code).toBe(0);
+    expect(pass.result).toMatchObject({ outcome: 'ok', count: 2, sources: { accepted: 47 }, fallbackUsed: false });
+    expect(pass.result.bullets).toEqual(groups.map((group) => group.bullet));
+    const collapsed = response(regressions.map(({ id }) => [id, groups[0]!.bullet]));
+    expect(f.invoke([], regressions, { reply: collapsed }).result.summary).toContain('repeats or splits an issue');
+    const unsafe = response(regressions.map(({ id, note }) => [id,
+      note === groups[1]!.note ? 'See src/agent-mission/foo.test.ts.' : groups[0]!.bullet]));
+    expect(f.invoke([], regressions, { reply: unsafe }).result).toMatchObject({ outcome: 'ok', count: 2, fallbackUsed: true });
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('synthetic 48 IDs cannot borrow the approved note-group fallback', () => {
+  const f = fixture();
+  try {
+    // The three source notes are copied from the 0.2.33 accepted-regressions ledger (3 + 44 + 1).
+    const groups = [
+      { count: 3, note: 'KI-0233-REGRESSIONS · 0.2.33: 사용자 영향은 bot routine dry-run 루틴 사용 금지. 격리 시험은 검증되지 않았으며 0.2.34에서 복원·재검증한다.',
+        bullet: 'Bot routine dry runs must not be used until their isolated tests are verified.' },
+      { count: 44, note: 'KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다.',
+        bullet: 'These paths have a validation gap and remain unverified until their tests are restored.' },
+      { count: 1, note: 'KI-0233-REGRESSIONS · 0.2.33: 옛 판 오프너 경보가 지연되거나 누락될 수 있다. 0.2.34에서 독립 fixture와 Linux Pod 실물 검증 후 복원한다.',
+        bullet: 'Old version opener alerts may be delayed or missed until the fixture is verified.' },
+    ];
+    const accepted48 = groups.flatMap(({ count, note }, group) => Array.from({ length: count }, (_, index) => ({ id: `accepted-${group}-${index}`, note })));
+    const answer = (choices: string[]) => response(accepted48.map(({ id, note }) => [id, choices[groups.findIndex((group) => group.note === note)]!]));
+    const good = f.invoke([], accepted48, { reply: answer(groups.map((group) => group.bullet)) });
+    expect(good.code).toBe(0);
+    expect(good.result).toMatchObject({ outcome: 'ok', count: 3, sources: { accepted: 48 }, fallbackUsed: false });
+    expect(good.result.bullets).toEqual(groups.map((group) => group.bullet));
+    const noDistinctive = f.invoke([], accepted48, { reply: answer([
+      groups[0]!.bullet, groups[1]!.bullet, 'Old version opener alerts may be delayed or missed.']) });
+    expect(noDistinctive.code).toBe(1);
+    expect(noDistinctive.result.summary).toContain('deterministic public bullet unavailable');
+    const duplicate = f.invoke([], accepted48, { reply: answer([
+      groups[0]!.bullet, groups[2]!.bullet, groups[2]!.bullet]) });
+    expect(duplicate.code).toBe(1);
+    expect(duplicate.result.summary).toContain('repeats or splits an issue');
+    const resolved = f.invoke([], accepted48, { reply: answer([
+      groups[0]!.bullet, groups[1]!.bullet, 'Old version opener alerts are resolved after the fixture is verified.']) });
+    expect(resolved.code).toBe(1);
+    expect(resolved.result.summary).toContain('deterministic public bullet unavailable');
+    const oneBadId = response(accepted48.map(({ id, note }, index) => [id,
+      index === 0 ? 'Bot routine dry runs were fixed in this release.' : groups.find((group) => group.note === note)!.bullet]));
+    const wholeGroup = f.invoke([], accepted48, { reply: oneBadId });
+    expect(wholeGroup.code).toBe(1);
+    expect(wholeGroup.result.summary).toContain('deterministic public bullet unavailable');
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('actual 0.2.33 accepted 48 replay preserves three note groups under two deliberate model failures', () => {
+  const f = fixture('0.2.33');
+  try {
+    const accepted48 = JSON.parse(readFileSync(join(import.meta.dir, 'known-issues-0.2.33-approved.json'), 'utf8')) as Array<{ id: string; note: string }>;
+    expect(accepted48).toHaveLength(48);
+    expect(new Set(accepted48.map((issue) => issue.note)).size).toBe(3);
+    const reply = response(accepted48.map(({ id, note }) => [id,
+      note.includes('bot routine dry-run') ? 'Bot routine dry runs were fixed in this release.' :
+      note.includes('옛 판 오프너 경보') ? 'Old version opener alerts may be delayed or missed.' :
+      'Some paths remain unverified in this release.']));
+    const { code, result } = f.invoke([], accepted48, { reply });
+    expect(code).toBe(0);
+    expect(result).toMatchObject({ outcome: 'ok', count: 3, sources: { accepted: 48 }, fallbackUsed: true });
+    expect(result.bullets).toEqual([
+      'Bot routine dry runs must not be used in this release.',
+      'Some paths remain unverified in this release.',
+      'Old version opener alerts may be delayed or missed in this release.',
+    ]);
+    expect(readFileSync(f.notes, 'utf8')).not.toContain('were fixed');
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('approved wording on a foreign ID or release cannot trigger the 0.2.33 fallback', () => {
+  const accepted48 = JSON.parse(readFileSync(join(import.meta.dir, 'known-issues-0.2.33-approved.json'), 'utf8')) as Array<{ id: string; note: string }>;
+  for (const [releaseVersion, regressions] of [
+    ['0.2.33', accepted48.map((issue, index) => index === 0 ? { ...issue, id: 'foreign-bot-id' } : issue)],
+    ['0.2.34', accepted48],
+  ] as const) {
+    const f = fixture(releaseVersion);
+    try {
+      const reply = response(regressions.map(({ id, note }) => [id,
+        note.includes('bot routine dry-run') ? 'Bot routine dry runs were fixed in this release.' :
+        note.includes('옛 판 오프너 경보') ? 'Old version opener alerts may be delayed or missed.' :
+        'Some paths remain unverified in this release.']));
+      const { code, result } = f.invoke([], regressions, { reply });
+      expect(code).toBe(1);
+      expect(result.summary).toContain('deterministic public bullet unavailable');
+      expect(readFileSync(f.notes, 'utf8')).toBe(base);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }
+});
+
+test('unknown Korean accepted note cannot be published under an unrelated generic fallback', () => {
+  const f = fixture();
+  try {
+    const { code, result } = f.invoke([], [{ id: 'unknown', note: '결제 오류로 주문이 완료되지 않는다.' }], {
+      reply: response([['unknown', 'The issue is resolved.']]),
+    });
+    expect(code).toBe(1);
+    expect(result.summary).toContain('deterministic public bullet unavailable');
+    expect(readFileSync(f.notes, 'utf8')).toBe(base);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('an unapproved note containing an approved keyword still fails closed', () => {
+  const f = fixture();
+  try {
+    const { code, result } = f.invoke([], [{ id: 'other-gap', note: '새 결제 경로에 검증 공백이 있어 주문이 누락된다.' }], {
+      reply: response([['other-gap', 'All payment issues are resolved.']]),
+    });
+    expect(code).toBe(1);
+    expect(result.summary).toContain('deterministic public bullet unavailable');
+    expect(readFileSync(f.notes, 'utf8')).toBe(base);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('the same unsafe raw bullet cannot stand for two distinct accepted notes', () => {
+  const f = fixture();
+  try {
+    const acceptedNotes = [
+      { id: 'bot', note: 'bot routine dry-run 루틴 사용 금지' },
+      { id: 'opener', note: '옛 판 오프너 경보가 지연될 수 있다' },
+    ];
+    const { code, result } = f.invoke([], acceptedNotes, { reply: response([
+      ['bot', 'See src/private.test.ts.'], ['opener', 'See src/private.test.ts.'],
+    ]) });
+    expect(code).toBe(1);
+    expect(result.summary).toContain('repeats or splits an issue');
+    expect(readFileSync(f.notes, 'utf8')).toBe(base);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('a recorded waiver represents ordinary accepted IDs with the same note once', () => {
+  const f = fixture();
+  try {
+    const note = 'Help does not close when requested';
+    const { code, result } = f.invoke([], [{ id: 'R1', note }, { id: 'waive:tui', note }], {
+      recordedWaiver: { note }, reply: response([['R1', 'Help remains open after a close request.']]),
+    });
+    expect(code).toBe(0);
+    expect(result).toMatchObject({ outcome: 'ok', count: 1, bullets: [`${note}.`], sources: { accepted: 2 } });
+    expect(readFileSync(f.notes, 'utf8').split(`- ${note}.`)).toHaveLength(2);
+    expect(() => readFileSync(f.calls)).toThrow();
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('a model bullet cannot hide a distinct recorded waiver group with identical public wording', () => {
+  const f = fixture();
+  try {
+    const note = 'Help does not close when requested';
+    const acceptedRegressions = [{ id: 'R1', note: 'Help does not close on request' }, { id: 'waive:tui', note }];
+    const { code, result } = f.invoke([], acceptedRegressions, {
+      recordedWaiver: { note }, reply: response([['R1', `${note}.`]]),
+    });
+    expect(code).toBe(1);
+    expect(result.summary).toContain('waiver bullet repeats another issue');
+    expect(readFileSync(f.notes, 'utf8')).toBe(base);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('generic fallback cannot hide a recorded waiver with the same public wording', () => {
+  const f = fixture();
+  try {
+    const acceptedRegressions = [{ id: 'R1', note: 'Settings not persisted' }, { id: 'waive:tui', note: fallback }];
+    const { code, result } = f.invoke([], acceptedRegressions, { recordedWaiver: { note: fallback }, fail: true });
+    expect(code).toBe(1);
+    expect(result.summary).toContain('waiver bullet repeats another issue');
+    expect(readFileSync(f.notes, 'utf8')).toBe(base);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('checklist note does not make a checklist issue part of an accepted note group', () => {
+  const f = fixture();
+  try {
+    const note = 'Exports do not finish';
+    const withNote = [{ id: 'K1', title: note, evidence: 'timeout', note }];
+    const { code, result } = f.invoke(withNote, [{ id: 'R1', note }], {
+      reply: response([['K1', 'Exports do not finish for some users.'], ['R1', 'Exports do not finish for some users.']]),
+    });
+    expect(code).toBe(1);
+    expect(result.summary).toContain('coverage not verified');
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 

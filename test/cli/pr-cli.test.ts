@@ -4288,8 +4288,10 @@ describe('pinned PR landing preview', () => {
     if (expectedCode === 1) {
       const actual = output();
       const edges: { event: string; data?: unknown }[] = [];
+      const recoverShadows: { event: string; data?: unknown }[] = [];
       const off = debug.registerSink({ name: 'pinned-refusal-route-test', emit: (row) => {
         if (row.event === 'graph-edge-taken' && (row.data as { from?: string })?.from === 'merge') edges.push(row);
+        if (row.event === 'recover-shadow') recoverShadows.push(row);
       } });
       let actualCode: number;
       try { actualCode = await runPrLand({ pr, expectedHead: head }, { ...baseDeps, manager, out: actual.out, run }); }
@@ -4299,6 +4301,11 @@ describe('pinned PR landing preview', () => {
       expect(edges).toHaveLength(1);
       expect(edges[0]).toMatchObject({ data: { on: 'refusal', label: isDraft ? 'draft' : 'other',
         to: isDraft ? 'ready' : 'next-move', reason: 'pr-land-refused; recovery-execution=none' } });
+      expect(recoverShadows).toHaveLength(1);
+      expect(recoverShadows[0]).toMatchObject({ data: {
+        pr: Number(pr), head, label: isDraft ? 'draft' : 'other',
+        outcome: 'needs-human', action: 'needs-human', execution: 'none',
+      } });
     }
   });
 

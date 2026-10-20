@@ -1,0 +1,34 @@
+graph_id: verb-make-doc
+version: 1
+entry_node: prepare
+terminal_nodes: [done, rework, needs-human, failed]
+unit:
+  inputs: [ask, context, prior]
+  outputs: [result, evidence]
+  exits: [done, rework, needs-human, failed]
+nodes:
+  - node_id: prepare
+    kind: observe
+    recipe: 'cmd:make-doc-input'
+    max_visits: 1
+    contract:
+      inputs: [ask, context, prior]
+      tools: none
+      outputs: [goal, worktree, branch, review-intent, head-sha, base-branch, prior]
+  - node_id: document-draft
+    kind: agent
+    recipe: 'cmd:headless-goal-loop'
+    max_visits: 4
+    contract:
+      inputs: [goal, worktree]
+      tools: worktree-write
+      outputs: [outcome, result, evidence]
+  - { node_id: done, kind: gate, recipe: 'cmd:make-doc-output', max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+  - { node_id: rework, kind: gate, recipe: 'cmd:make-doc-output', max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+  - { node_id: needs-human, kind: hitl, recipe: 'cmd:make-doc-output', max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+  - { node_id: failed, kind: observe, recipe: 'cmd:make-doc-output', max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+edges:
+  - { from: prepare, to: document-draft }
+  - from: document-draft
+    on: outcome
+    map: { done: done, rework: rework, needs-human: needs-human, failed: failed }

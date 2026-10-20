@@ -1,3 +1,10 @@
 plan:
   command: 'bun scripts/release-loop/gate-recheck-plan-node.ts'
   timeout_ms: 60000
+recover-plan:
+  command: 'bun scripts/graph-units/recover-plan.ts'
+  timeout_ms: 30000
+harvest-review:
+  command: 'bun scripts/graph-harvest-unit.ts'
+  dry_run_command: 'bun scripts/graph-harvest-unit.ts --dry-run'
+  timeout_ms: 330000

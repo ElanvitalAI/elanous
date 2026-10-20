@@ -5,7 +5,7 @@
 #   stop_class == main-sync          → rebase-regate
 #   stop_class == pod-died           → resume-from-salvage
 #   stop_class == evidence-uncovered → derive-evidence-rejudge
-# ⛔ 이 넷 밖의 갈래(review-repeat · review-out-of-scope · fabric · launch-failed · unclassified)는 선언이 «없다» —
+# ⛔ 이 넷 밖의 갈래(review-repeat · review-out-of-scope · scope-escape · fabric · launch-failed · unclassified)는 선언이 «없다» —
 #   처방은 `needs-owner` 이고 그것은 코드 기본(`AUTOHEAL_ACTION_BY_CLASS`)이 말한다.
 #
 # 🔑 노드 id 가 곧 처방 이름이다. `src/self-implement/stop-autoheal.ts` 는 그 갈래에 얹힌 오버레이가 «더한 노드 id» 로

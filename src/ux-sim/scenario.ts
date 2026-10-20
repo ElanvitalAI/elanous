@@ -1,7 +1,8 @@
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { closeSync, constants, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { extname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash, randomUUID } from 'node:crypto';
 import { parse as parseYaml } from 'yaml';
 import { debug } from '../debug/log.js';
 import { streamCodexResponsesEvents } from '../llm.js';
@@ -13,7 +14,8 @@ export interface ScenarioV0 {
   version: 0;
   id: string;
   isolation: 'test';
-  triggers: [{ id: string; type: 'codex.responses.fetch'; status: number; count?: number }];
+  seed: number;
+  triggers: [{ id: string; type: 'codex.responses.fetch' | 'codex.responses.fetch-network-error'; status?: number; count?: number }];
   expect: {
     screen: { mode: 'widget'; snapshot: { contains: string[]; excludes?: string[] } };
     logs: [{ category: string; event: string; level: string; count?: number; data?: Record<string, unknown> }];
@@ -22,8 +24,10 @@ export interface ScenarioV0 {
 
 export interface ScenarioResult {
   id: string;
+  seed: number;
+  evidenceArtifact: string;
   pass: boolean;
-  trigger: { id: string; type: string; status: number; expectedCount: number; fetchCount: number; error: string | null };
+  trigger: { id: string; type: string; status: number | null; expectedCount: number; fetchCount: number; error: string | null };
   screen: { pass: boolean; containsMissing: string[]; excludesFound: string[]; snapshot: string };
   logs: { pass: boolean; category: string; event: string; level: string | null; expectedLevel: string; levelMismatch: boolean; expectedCount: number; observedCount: number; matchedData: Record<string, unknown>; evidenceLine: string; dataMismatch: string[] };
   failureReasons: string[];
@@ -49,18 +53,20 @@ function requiredString(value: unknown, where: string): string {
 
 export function parseScenarioV0(source: string): ScenarioV0 {
   const value = record(parseYaml(source), 'scenario');
-  exactKeys(value, ['version', 'id', 'isolation', 'triggers', 'expect'], 'scenario');
+  exactKeys(value, ['version', 'id', 'isolation', 'seed', 'triggers', 'expect'], 'scenario');
   if (value.version !== 0) throw new Error('scenario.version must be 0');
   const id = requiredString(value.id, 'scenario.id');
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) throw new Error('scenario.id must be lowercase letters, digits, and hyphens');
   if (value.isolation !== 'test') throw new Error('scenario.isolation must be test');
+  if (!Number.isInteger(value.seed) || (value.seed as number) < 0 || (value.seed as number) > 0xffffffff) throw new Error('scenario.seed must be an unsigned 32-bit integer');
 
   if (!Array.isArray(value.triggers) || value.triggers.length !== 1) throw new Error('scenario.triggers must contain exactly one registered trigger');
   const trigger = record(value.triggers[0], 'scenario.triggers[0]');
   exactKeys(trigger, ['id', 'type', 'status', 'count'], 'scenario.triggers[0]');
   const triggerId = requiredString(trigger.id, 'scenario.triggers[0].id');
-  if (trigger.type !== 'codex.responses.fetch') throw new Error(`unregistered scenario trigger: ${String(trigger.type)}`);
-  if (!Number.isInteger(trigger.status) || (trigger.status as number) < 400 || (trigger.status as number) > 499) throw new Error('codex.responses.fetch.status must be an HTTP 4xx status');
+  if (trigger.type !== 'codex.responses.fetch' && trigger.type !== 'codex.responses.fetch-network-error') throw new Error(`unregistered scenario trigger: ${String(trigger.type)}`);
+  if (trigger.type === 'codex.responses.fetch' && (!Number.isInteger(trigger.status) || (trigger.status as number) < 400 || (trigger.status as number) > 499)) throw new Error('codex.responses.fetch.status must be an HTTP 4xx status');
+  if (trigger.type === 'codex.responses.fetch-network-error' && trigger.status !== undefined) throw new Error('codex.responses.fetch-network-error does not accept status');
   if (trigger.count !== undefined && (!Number.isInteger(trigger.count) || (trigger.count as number) < 1)) throw new Error('codex.responses.fetch.count must be a positive integer');
 
   const expect = record(value.expect, 'scenario.expect');
@@ -83,14 +89,16 @@ export function parseScenarioV0(source: string): ScenarioV0 {
   const category = requiredString(expectedLog.category, 'scenario.expect.logs[0].category');
   const event = requiredString(expectedLog.event, 'scenario.expect.logs[0].event');
   const level = requiredString(expectedLog.level, 'scenario.expect.logs[0].level');
-  if (expectedLog.count !== undefined && (!Number.isInteger(expectedLog.count) || (expectedLog.count as number) < 1)) throw new Error('scenario.expect.logs[0].count must be a positive integer; absent events cannot pass');
+  if (expectedLog.count !== undefined && (!Number.isInteger(expectedLog.count) || (expectedLog.count as number) < 0)) throw new Error('scenario.expect.logs[0].count must be a non-negative integer');
+  if (expectedLog.count === 0 && trigger.type !== 'codex.responses.fetch-network-error') throw new Error('zero expected log events are allowed only for codex.responses.fetch-network-error');
   if (expectedLog.data !== undefined) record(expectedLog.data, 'scenario.expect.logs[0].data');
 
   return {
     version: 0,
     id,
     isolation: 'test',
-    triggers: [{ id: triggerId, type: 'codex.responses.fetch', status: trigger.status as number, ...(trigger.count !== undefined ? { count: trigger.count as number } : {}) }],
+    seed: value.seed as number,
+    triggers: [{ id: triggerId, type: trigger.type, ...(trigger.status !== undefined ? { status: trigger.status as number } : {}), ...(trigger.count !== undefined ? { count: trigger.count as number } : {}) }],
     expect: {
       screen: {
         mode: 'widget',
@@ -137,6 +145,20 @@ function rowData(row: LogStoreRow): unknown {
   return row.data;
 }
 
+function assertNoSymlinkComponents(path: string): void {
+  const absolute = resolve(path);
+  let cursor: string = sep;
+  for (const component of absolute.split(sep).filter(Boolean)) {
+    cursor = join(cursor, component);
+    try {
+      if (lstatSync(cursor).isSymbolicLink()) throw new Error('scenario evidence path cannot contain symlinks');
+    } catch (error) {
+      if (error instanceof Error && error.message === 'scenario evidence path cannot contain symlinks') throw error;
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+}
+
 export function resolveScenarioFilePath(filePath: string, repositoryRoot = REPOSITORY_ROOT): string {
   const realRepositoryRoot = realpathSync(repositoryRoot);
   const scenarioRoot = resolve(realRepositoryRoot, 'scenarios');
@@ -180,7 +202,8 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     fetchCount++;
     if (String(input) !== 'https://chatgpt.com/backend-api/codex/responses') throw new Error('scenario fake fetch received an unregistered URL');
-    return new Response('{"detail":"Bad Request"}', { status: trigger.status, headers: { 'content-type': 'application/json' } });
+    if (trigger.type === 'codex.responses.fetch-network-error') throw new Error(`scenario network error seed=${scenario.seed}`);
+    return new Response('{"detail":"Bad Request"}', { status: trigger.status!, headers: { 'content-type': 'application/json' } });
   }) as unknown as typeof fetch;
 
   try {
@@ -188,7 +211,7 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
       for await (const _event of streamCodexResponsesEvents('https://chatgpt.com/backend-api/codex/responses', 'scenario-fake-token', {
         model: 'gpt-6-sol',
         instructions: 'scenario test request',
-        input: [{ role: 'user', content: [{ type: 'input_text', text: 'scenario test input' }] }],
+        input: [{ role: 'user', content: [{ type: 'input_text', text: `scenario test input seed=${scenario.seed}` }] }],
         tools: [{ type: 'function', name: 'RunShell', description: 'test tool', parameters: {} }],
       }, undefined, { promptCache: false })) { /* consume the deterministic fake response */ }
     } catch (error) {
@@ -212,15 +235,17 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
     if (fetchCount !== expectedTriggerCount) failureReasons.push(`trigger-count-mismatch:expected-${expectedTriggerCount}-observed-${fetchCount}`);
     if (errorMessage === null) failureReasons.push('provider-error-not-observed');
     if (!screenPass) failureReasons.push('screen-snapshot-mismatch');
-    if (rows.length === 0) failureReasons.push('expected-log-event-absent');
+    if (rows.length === 0 && expectedCount > 0) failureReasons.push('expected-log-event-absent');
     else if (rows.length !== expectedCount) failureReasons.push(`log-event-count-mismatch:expected-${expectedCount}-observed-${rows.length}`);
     if (levelMismatch) failureReasons.push(`log-level-mismatch:expected-${expected.level}-observed-${rows[0]?.level ?? 'none'}`);
     if (dataMismatch.length) failureReasons.push('log-data-mismatch');
 
-    return {
+    const result: ScenarioResult = {
       id: scenario.id,
+      seed: scenario.seed,
+      evidenceArtifact: '',
       pass: failureReasons.length === 0,
-      trigger: { id: trigger.id, type: trigger.type, status: trigger.status, expectedCount: expectedTriggerCount, fetchCount, error: errorMessage },
+      trigger: { id: trigger.id, type: trigger.type, status: trigger.status ?? null, expectedCount: expectedTriggerCount, fetchCount, error: errorMessage },
       screen: { pass: screenPass, containsMissing, excludesFound, snapshot: screenText },
       logs: {
         pass: logPass,
@@ -237,6 +262,40 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
       },
       failureReasons,
     };
+    const stateRoot = getTestStateRoot()!;
+    const uxSimDir = join(stateRoot, 'ux-sim');
+    const evidenceDir = join(uxSimDir, 'evidence');
+    assertNoSymlinkComponents(evidenceDir);
+    mkdirSync(uxSimDir, { recursive: true });
+    if (!lstatSync(uxSimDir).isDirectory()) throw new Error('scenario evidence directory must stay inside test state');
+    mkdirSync(evidenceDir, { recursive: true });
+    assertNoSymlinkComponents(evidenceDir);
+    if (!lstatSync(evidenceDir).isDirectory()) throw new Error('scenario evidence directory must stay inside test state');
+    const evidenceArtifact = join(evidenceDir, `${scenario.id}-seed-${scenario.seed}.json`);
+    result.evidenceArtifact = evidenceArtifact;
+    const artifact = {
+      version: 0,
+      id: scenario.id,
+      seed: scenario.seed,
+      pass: result.pass,
+      trigger: { type: result.trigger.type, ...(result.trigger.status !== null ? { status: result.trigger.status } : {}), expectedCount: result.trigger.expectedCount, fetchCount: result.trigger.fetchCount, errorObserved: result.trigger.error !== null },
+      screen: { pass: result.screen.pass, snapshotSha256: createHash('sha256').update(result.screen.snapshot).digest('hex'), containsMissingCount: result.screen.containsMissing.length, excludesFoundCount: result.screen.excludesFound.length },
+      logs: { pass: result.logs.pass, expectedCount: result.logs.expectedCount, observedCount: result.logs.observedCount, levelMismatch: result.logs.levelMismatch, dataMismatchCount: result.logs.dataMismatch.length },
+      failureReasonCount: result.failureReasons.length,
+    };
+    const tempArtifact = join(evidenceDir, `.${scenario.id}-${randomUUID()}.tmp`);
+    const fd = openSync(tempArtifact, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    try {
+      writeFileSync(fd, `${JSON.stringify(artifact, null, 2)}\n`);
+      closeSync(fd);
+      assertNoSymlinkComponents(evidenceDir);
+      renameSync(tempArtifact, evidenceArtifact);
+    } catch (error) {
+      try { closeSync(fd); } catch { /* already closed */ }
+      try { unlinkSync(tempArtifact); } catch { /* absent after successful rename */ }
+      throw error;
+    }
+    return result;
   } finally {
     globalThis.fetch = originalFetch;
     off();

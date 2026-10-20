@@ -69,6 +69,7 @@ import { stageNonGitDir, stageFile, applyShadowToTarget, applyFileToTarget } fro
 import type { TargetKind } from './target-kind.js';
 import { basename } from 'node:path';
 import { ghAutomationEnv, makePrManager, type PrManager } from '../autopilot/pr-manager.js';
+import { cardPrNumber, taskAgentStatePath, updateTaskCard } from '../task-agent/task-hand.js';
 import { defaultSpawnGh, lookupOpenDraftPrs } from '../cli/logs-abandoned-draft-prs.js';
 import { loadRunLedger, runLedgerDir } from './run-ledger.js';
 import { readdirSync } from 'node:fs';
@@ -2494,11 +2495,14 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
     openPr: async ({ title, body, head, base, draft, labels, cwd }) => {
       const resolvedBase = assertBaseBranchOnOrigin(cwd, base);
       const harnessSeat = process.env.ELANOUS_HARNESS_SEAT;
+      const taskCardId = process.env.ELANOUS_TASK_CARD_ID;
+      const bodyWithCard = taskCardId && /^[A-Za-z0-9][A-Za-z0-9._:-]{2,}$/.test(taskCardId)
+        ? `${body}\n\n카드: ${taskCardId}` : body;
       const outcome = (o.prManager ?? makePrManager()).upsertPr({
         branch: head,
         worktreePath: cwd,
         title,
-        body: buildPrBody(cwd, body),
+        body: buildPrBody(cwd, bodyWithCard),
         commitMessage: title,
         ...(resolvedBase ? { base: resolvedBase } : {}),
         ...(draft !== undefined ? { draft } : {}),
@@ -2511,6 +2515,33 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       });
       if (!outcome.ok) throw new Error(`self-implement PR ${outcome.reason} 실패: ${outcome.detail}`);
       const number = Number.parseInt(outcome.url.match(/\/pull\/(\d+)/)?.[1] ?? '', 10);
+      if (outcome.supersededPr && Number.isSafeInteger(number) && number > 0) {
+        const rebindFailed = (reason: string): never => {
+          debug.log('self-implement.pr', 'same-cell-card-rebind-failed', {
+            cardId: taskCardId ?? null, oldPr: outcome.supersededPr, newPr: number,
+            url: outcome.url, reason,
+          }, { level: 'warn' });
+          throw new Error(`same-cell 새 draft ${outcome.url} 개설됨; 카드 재결속 실패(${reason}) — 새 PR 수확 필요`);
+        };
+        debug.log('self-implement.pr', 'same-cell-rebound', {
+          cardId: taskCardId ?? null, oldPr: outcome.supersededPr, newPr: number, url: outcome.url,
+          oldDraftCleanup: 'deferred',
+        });
+        const cardId = taskCardId ?? rebindFailed('카드 ID 없음');
+        let rebound: ReturnType<typeof updateTaskCard>;
+        try {
+          rebound = updateTaskCard(taskAgentStatePath(), cardId, (card) => {
+            if (!card || card.refSource === 'manual' || (cardPrNumber(card) !== undefined
+              && cardPrNumber(card) !== outcome.supersededPr && cardPrNumber(card) !== number)) return undefined;
+            if (cardPrNumber(card) === number && card.history.some((event) => event.event === 'same-cell-pr-rebound' && event.pr === number)) return undefined;
+            return { ...card, pr: { number, url: outcome.url }, history: [...card.history, {
+              at: new Date().toISOString(), event: 'same-cell-pr-rebound', pr: number,
+              detail: `이전 draft #${outcome.supersededPr} 정리 후속 · 새 PR #${number} 결속`,
+            }] };
+          });
+        } catch (error) { rebindFailed(error instanceof Error ? error.message : String(error)); }
+        if (!rebound || cardPrNumber(rebound) !== number) rebindFailed('카드 없음 또는 기존 PR 결속 충돌');
+      }
       return { url: outcome.url, number: Number.isFinite(number) ? number : 0 };
     },
 

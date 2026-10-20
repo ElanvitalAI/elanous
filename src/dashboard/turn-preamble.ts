@@ -41,6 +41,8 @@ import type { getUserConfig } from '../user-config.js';
 import { isNativeStructureEnabledForProvider, resolveActiveProvider } from '../user-config.js';
 import { measureInputLagTurnStart } from '../tui/input-lag-probe.js';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
+import { buildSelfHealthLine, type InstalledRecord, type SelfHealthErrors } from '../pty-shell/tui-run-state.js';
+import type { PtyBuildIdentity } from '../pty-shell/pty-manifest.js';
 
 type UserConfig = ReturnType<typeof getUserConfig>;
 
@@ -76,6 +78,25 @@ export interface DashboardTurnPreambleContext {
   controlEnv?: { controller?: string; channels?: string };
   /** File-memory layer seam: a store root and env for scope resolution (tests), or false to omit it. */
   memory?: { root?: string; env?: NodeJS.ProcessEnv } | false;
+
+  /** 🫀 매 턴 자기 건강 한 줄(TUI-SELF-HEALTH-LINE · 0.2.34) 재료. 판(실행 판 vs 설치본) 축은
+   *  이 블록 없이도 tui-run-state 의 실물 판정(runningBuild ⊕ readCurrentInstallRecord)으로 매 턴
+   *  나간다. `errors`·`creditUsage` 는 호출자가 집계한 값 — «직전 30분 창에서 어떤 이벤트를 자기
+   *  오류로 세는지»·«크레딧 사용을 무엇으로 잴지» 는 미결 항목이라 이 빌더가 정하지 않는다. */
+  selfHealth?: {
+    /** 직전 30분 자기 오류 집계 — 없으면(undefined·null) 오류 축은 아예 말하지 않는다. */
+    errors?: SelfHealthErrors | null;
+    /** 크레딧 사용 재료(호출자가 만든 값) — 없으면 그 축은 생략된다. */
+    creditUsage?: string;
+    /** 재기동 명령에 얹을 대화 id — 생략하면 ctx.sessionId. */
+    sessionId?: string;
+    /** 새 판 안내 회차(stale-install-check notifiedCount 회차 문면) — 기본 1. */
+    notifiedCount?: number;
+    /** 판정 seam(시험 격리) — 기본은 실물(runningBuild·readCurrentInstallRecord·readCheckoutHead). */
+    build?: () => PtyBuildIdentity;
+    readInstalled?: () => InstalledRecord;
+    readCheckoutHead?: (codeRoot: string) => string | undefined;
+  };
 }
 
 export function buildControllerSystemMessage(controller: string, channels?: string): LLMMessage {
@@ -160,7 +181,9 @@ function buildDashboardTurnPreambleUnmeasured(
     ...(ctx.modelFamily !== undefined ? { modelFamily: ctx.modelFamily } : {}),
     ...(ctx.enabledTools !== undefined ? { enabledTools: ctx.enabledTools } : {}),
   }));
-  // 🪪 L1 — 자리 부트 카드(세션마다 한 번 만든 스냅샷). 정체성(앵커) 바로 뒤. 자리가 아니면 [].
+  // 🪪 L1 — 자리 부트 카드(세션마다 한 번 만든 스냅샷: 안 읽은 우편·HANDOFF·예약·지난 세션 — `cli/seat-cli.ts` 공용 조립).
+  //    새 세션 부팅·`/session new`·`/session clear` 는 `startSeatBootConversation` 이 스냅샷을 새로 만들어 «첫 턴 = 새 카드» 로 만든다.
+  //    정체성(앵커) 바로 뒤. 자리가 아니면 [].
   const seatBoot = ctx.seatBoot;
   const seatBootSystemMsgs = seatBoot
     ? timed(builderMs, 'seatBoot', () => buildSeatBootSystemMessages(
@@ -235,6 +258,27 @@ function buildDashboardTurnPreambleUnmeasured(
       .filter(Boolean)
       .map((content): LLMMessage => ({ role: 'system', content })));
   } catch { /* fail-soft */ }
+  // 🫀 매 턴 자기 건강 한 줄(TUI-SELF-HEALTH-LINE · 0.2.34) — 자기 관측 → 자기 인지의 사실 칸.
+  //    판(실행 판 vs 설치본) 축은 tui-run-state 의 실물 판정(judgeBuildStaleness ⊕ readCurrentInstallRecord)을
+  //    매 턴 소비하고, 오류·크레딧 축은 호출자가 집계한 재료(ctx.selfHealth)를 얹는다. fail-soft:
+  //    판정이 깨져도 줄만 빠지고 턴은 간다.
+  const selfHealth = ctx.selfHealth;
+  const selfHealthSystemMsgs = timed(builderMs, 'selfHealth', (): LLMMessage[] => {
+    try {
+      const line = buildSelfHealthLine(selfHealth?.errors ?? undefined, {
+        ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}),
+        ...(selfHealth?.sessionId !== undefined ? { sessionId: selfHealth.sessionId } : {}),
+        ...(selfHealth?.build !== undefined ? { build: selfHealth.build } : {}),
+        ...(selfHealth?.readInstalled !== undefined ? { readInstalled: selfHealth.readInstalled } : {}),
+        ...(selfHealth?.readCheckoutHead !== undefined ? { readCheckoutHead: selfHealth.readCheckoutHead } : {}),
+        ...(selfHealth?.notifiedCount !== undefined ? { notifiedCount: selfHealth.notifiedCount } : {}),
+        ...(selfHealth?.creditUsage !== undefined ? { creditUsage: selfHealth.creditUsage } : {}),
+      });
+      return line === null ? [] : [{ role: 'system', content: line }];
+    } catch {
+      return []; // fail-soft — 자기 건강 줄이 턴을 막지 않는다
+    }
+  });
   const controlEnv = ctx.controlEnv ?? {
     controller: process.env.ELANOUS_CONTROLLER,
     channels: process.env.ELANOUS_CONTROL_CHANNELS,
@@ -254,6 +298,7 @@ function buildDashboardTurnPreambleUnmeasured(
     ...gitSnapshotSystemMsgs,
     ...surfaceSystemMsgs,
     ...selfOpsSystemMsgs,
+    ...selfHealthSystemMsgs,
     ...controllerSystemMsgs,
     ...implDisciplineSystemMsgs,
     ...concisenessSystemMsgs,
@@ -297,6 +342,7 @@ function buildDashboardTurnPreambleUnmeasured(
         gitSnapshot: gitSnapshotSystemMsgs.length,
         surface: surfaceSystemMsgs.length,
         selfOps: selfOpsSystemMsgs.length,
+        selfHealth: selfHealthSystemMsgs.length,
         controller: controllerSystemMsgs.length,
         implDiscipline: implDisciplineSystemMsgs.length,
         conciseness: concisenessSystemMsgs.length,

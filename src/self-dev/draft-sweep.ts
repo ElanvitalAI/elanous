@@ -1,6 +1,7 @@
 import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
 import { debug } from '../debug/log.js';
-import { decideDraft, draftClaimComment, draftClaimState, draftReleaseComment, laterMergedTwins, sameGoalPr, type DraftTriagePr } from './draft-triage-rules.js';
+import { decideDraft, draftClaimComment, draftClaimState, draftReleaseComment, laterMergedTwins, sameGoalPr, PROTECTED_LABELS, type DraftTriagePr } from './draft-triage-rules.js';
+import { cellIdFromBody } from '../pr-tool/census.js';
 import { cardPrNumber, draftTaskOwner, type TaskCard } from '../task-agent/task-hand.js';
 import type { PrTerminalRecord } from './draft-residue.js';
 import { branchLineageSlug } from '../cli/pr-lineage.js';
@@ -47,6 +48,8 @@ export interface DraftSweepAdapters {
   /** Host ledger terminal records; undefined means the ledger could not be read. */
   listPrTerminals?(): Promise<readonly PrTerminalRecord[] | undefined>;
   commentDraft?(repository: string, number: number, body: string): Promise<void>;
+  /** Complete issue-comment inventory for idempotent merge-time same-cell cleanup. */
+  listIssueComments?(repository: string, number: number): Promise<readonly string[]>;
   removeLabel?(repository: string, number: number, label: string): Promise<void>;
   /** Whether the current owned run has a self-implement.result final observation, even if its worktree remains. */
   hasFinalRunResult?(draft: SweepDraft, repository: string): Promise<boolean | undefined>;
@@ -587,12 +590,14 @@ export function resolveDraftSweepCloseCap(input: { flag?: unknown; config?: unkn
   return { closeCap: DRAFT_SWEEP_CLOSE_CAP, closeCapSource: 'default', warnings };
 }
 
-/** Post-merge shortcut: only the existing superseded-by decision can authorize a close. */
+/** Post-merge cleanup: an explicit same-cell successor or the existing verified-goal decision can authorize a close. */
 export async function supersedeDraftsOnMerge(input: {
   repository: string;
   merged: SweepMergedPr & { createdAt: string; mergedAt: string };
+  /** `pr land` and HQ train invoke only the explicit same-cell successor path. */
+  onlyExplicitSameCell?: boolean;
   adapters: Pick<DraftSweepAdapters, 'listDrafts' | 'listLiveBranches' | 'getRunStatus' | 'setLabels' | 'closeDraft'>
-    & Pick<Partial<DraftSweepAdapters>, 'getLatestFileChanges' | 'getPrFiles'>;
+    & Pick<Partial<DraftSweepAdapters>, 'getLatestFileChanges' | 'getPrFiles' | 'commentDraft' | 'listIssueComments'>;
 }): Promise<{ closed: number[]; kept: number[] }> {
   const { repository, merged, adapters } = input;
   const closed: number[] = [];
@@ -611,6 +616,43 @@ export async function supersedeDraftsOnMerge(input: {
       || !Number.isFinite(Date.parse(merged.createdAt)) || !Number.isFinite(Date.parse(merged.mergedAt))
       || drafts.some((pr) => !Number.isInteger(pr.number) || !pr.branch || !Array.isArray(pr.labels)
         || !Number.isFinite(Date.parse(pr.createdAt)))) throw new Error('Incomplete merge draft inventory');
+    // The conflicting-PR path writes this exact marker. A marker by itself is not authority:
+    // both PR bodies must identify the same cell, and the old PR must still be an open draft.
+    const markers = [...(merged.body ?? '').matchAll(/^Supersedes:\s*#(\d+)\s*$/gm)];
+    const markedNumber = markers.length === 1 ? Number(markers[0]![1]) : null;
+    const explicitOld = Number.isSafeInteger(markedNumber) && markedNumber! > 0 ? markedNumber : null;
+    const mergedCell = cellIdFromBody(merged.body ?? '');
+    if (explicitOld && explicitOld !== merged.number && mergedCell) {
+      const old = drafts.find((draft) => draft.number === explicitOld);
+      if (old && cellIdFromBody(old.body ?? '') === mergedCell
+        && Date.parse(old.createdAt) < Date.parse(merged.mergedAt)
+        && !old.labels.some((label) => PROTECTED_LABELS.has(label))
+        && PR_LABELS.filter((label) => label.axis === 'state' && old.labels.includes(label.name)).length <= 1) {
+        const marker = `<!-- elanous:same-cell-superseded #${old.number} -> #${merged.number} -->`;
+        const comment = `${marker}\nSame-cell draft superseded by merged PR #${merged.number} (https://github.com/${repository}/pull/${merged.number}). Branch preserved.`;
+        try {
+          if (!adapters.listIssueComments || !adapters.commentDraft) throw new Error('same-cell comment inventory unavailable');
+          const comments = await adapters.listIssueComments(repository, old.number);
+          if (!Array.isArray(comments)) throw new Error('same-cell comment inventory incomplete');
+          const remove = stateLabels.filter((label) => old.labels.includes(label.name) && label.name !== supersededLabel).map((label) => label.name);
+          if (!old.labels.includes(supersededLabel)) await adapters.setLabels(repository, old.number, { add: supersededLabel, remove });
+          if (!comments.some((body) => body.includes(marker))) await adapters.commentDraft(repository, old.number, comment);
+          await adapters.closeDraft(repository, old.number);
+          closed.push(old.number);
+          closeAttempts += 1;
+        } catch (failure) {
+          failed.push(old.number);
+          error = String(failure);
+          debug.log('drafts.cleanup', 'same-cell-supersede-failed', { merged: merged.number, old: old.number, error });
+        }
+      }
+    }
+    if (input.onlyExplicitSameCell) {
+      kept.push(...drafts.map((draft) => draft.number).filter((number) => !closed.includes(number)));
+      debug.log('drafts.cleanup', 'superseded-on-merge', { merged: merged.number, closed, kept,
+        ...(failed.length ? { failed } : {}), ...(error ? { error } : {}) });
+      return { closed, kept };
+    }
     const statuses = new Map<number, string | undefined>();
     const latestChanges = new Map<number, Readonly<Record<string, string>> | undefined>();
     const mergedFiles = await adapters.getPrFiles?.(repository, merged.number);
@@ -625,7 +667,14 @@ export async function supersedeDraftsOnMerge(input: {
       }
     }
     for (const listedDraft of drafts) {
+      if (closed.includes(listedDraft.number)) continue;
       const draft = { ...listedDraft, latestFileChanges: latestChanges.get(listedDraft.number) };
+      // The same-cell route is never inferred from a title, goal, or file overlap.
+      // A failed explicit cleanup also stays open for a later retry instead of falling through to generic triage.
+      if (draft.number === explicitOld || (mergedCell && cellIdFromBody(draft.body ?? '') === mergedCell)) {
+        kept.push(draft.number);
+        continue;
+      }
       if (draft.number === merged.number || !draft.branch.startsWith('self-impl/') || liveBranches.has(draft.branch)
         || Date.parse(draft.createdAt) >= Date.parse(merged.mergedAt)) {
         kept.push(draft.number);

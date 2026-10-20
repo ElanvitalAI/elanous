@@ -13,8 +13,8 @@
 graph_id: default-loop
 version: 3
 entry_node: author
-terminal_nodes: [merge, stopped]
-runner_inputs: [ask_text, worktree, branch]
+terminal_nodes: [landed, stopped]
+runner_inputs: [ask_text, worktree, branch, ask, context, prior]
 
 # 🔑 상태 — 노드 사이를 흐르는 값. 라우터는 «이 값만» 읽는다(외부 상태·시계 금지 · RFC §4.3 ⑵).
 state:
@@ -177,6 +177,16 @@ nodes:
     terminal_stages: [merged, pr-opened, merge-ready]  # merge-ready = Pod 런이 호스트 재게이트에 넘긴 자리(#20988)
     contract: { inputs: [pr_number, head_sha], tools: gh-pr-merge, outputs: [merged] }
 
+  - node_id: recover
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: recover@1
+    budget: { inner_steps: 4 }
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+
+  - { node_id: landed, kind: gate, recipe: none, max_visits: 1 }
+
   - node_id: stopped
     kind: judge
     recipe: human-handoff
@@ -300,5 +310,12 @@ edges:
   - from: merge
     on: outcome
     map:
-      merged: merge                     # 종료(자기 자신 = 흡수)
+      merged: landed
+      land-refused: recover
+      ok: stopped
       blocked: stopped
+      fail: stopped
+
+  - from: recover
+    on: outcome
+    map: { done: stopped, rework: stopped, needs-human: stopped, failed: stopped }

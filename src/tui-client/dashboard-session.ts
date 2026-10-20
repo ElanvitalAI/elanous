@@ -130,6 +130,9 @@ export interface DashboardSendRequest {
    *  more per turn, provider-dependent). Shape matches
    *  `StreamWithToolsHandlers.onUsage` modulo the correlation id. */
   onUsage?(usage: DashboardSessionUsage): void;
+  /** TUI-TURN-NARRATION — `agent_thought_chunk` ⊕ `_meta.reasoning: true`(추론 요약 문단).
+   *  전에는 usage 봉투가 아니면 버려서 화면에 0줄이었다(결함 #87). */
+  onThought?(text: string): void;
 }
 
 export interface DashboardSendResult {
@@ -550,6 +553,7 @@ function buildSendInterceptor(req: DashboardSendRequest): SessionUpdateIntercept
         rawInput?: unknown;
         rawOutput?: unknown;
         status?: string;
+        _meta?: { reasoning?: unknown };
       };
     };
     const inner = n.update;
@@ -582,8 +586,13 @@ function buildSendInterceptor(req: DashboardSendRequest): SessionUpdateIntercept
         return;
       }
       case 'agent_thought_chunk': {
-        if (!req.onUsage || inner.content?.type !== 'text') return;
+        if (inner.content?.type !== 'text') return;
         const text = inner.content.text ?? '';
+        if (inner._meta?.reasoning === true) {
+          req.onThought?.(text);
+          return;
+        }
+        if (!req.onUsage) return;
         const env = parseElanousUiEnvelope(text);
         if (!env || env.method !== 'usage') return;
         const { id: _id, ...rest } = env.payload as unknown as ElanousUiUsagePayload;

@@ -1,12 +1,14 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import * as fs from 'node:fs';
 import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { persistDiscoveredIssuer, runMcpLogin } from './mcp-login.js';
 import { loadTokens } from '../oauth/store.js';
 import type { McpOAuthFetch } from '../mcp/mcp-oauth.js';
+import { McpClient } from '../mcp/client.js';
 import { reloadUserConfig, saveUserConfig } from '../user-config.js';
 
 // 🔴 이 파일이 무는 사고 (2026-09-10 실물):
@@ -113,6 +115,130 @@ function loginFixture(device: boolean) {
     persistDiscoveryFn: (value: { issuer: string; tokenEndpoint?: string }) => { persist.push(value); return { written: true }; },
   } };
 }
+
+test('local HTTP OAuth round trip: login, reuse, cancel, and MCP Bearer', async () => {
+  const storePath = join(mkdtempSync(join(tmpdir(), 'mcp-login-http-')), 'auth.json');
+  const requests: Array<{ phase: string; method: string; path: string; body: string; authorization?: string }> = [];
+  let phase = 'first';
+  let deny = false;
+  let registrations = 0;
+  let exchanges = 0;
+  let base = '';
+  const server = createServer(async (req, res) => {
+    const path = req.url ?? '/';
+    const body = await (async () => {
+      let text = '';
+      for await (const chunk of req) text += chunk.toString();
+      return text;
+    })();
+    requests.push({ phase, method: req.method ?? '', path, body,
+      ...(req.headers.authorization ? { authorization: req.headers.authorization } : {}) });
+    const reply = (status: number, value: object, headers: Record<string, string> = {}) => {
+      res.writeHead(status, { 'content-type': 'application/json', ...headers });
+      res.end(JSON.stringify(value));
+    };
+    if (path === '/mcp') {
+      if (req.headers.authorization !== `Bearer access-${exchanges}`) {
+        reply(401, {}, { 'www-authenticate': `Bearer resource_metadata="${base}/meta", scope="read"` });
+      } else {
+        const rpc = JSON.parse(body) as { id?: number; method: string };
+        if (rpc.method === 'notifications/initialized') { res.writeHead(202); res.end(); }
+        else reply(200, { jsonrpc: '2.0', id: rpc.id, result: rpc.method === 'initialize'
+          ? { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 'local', version: '1' } }
+          : { tools: [] } });
+      }
+    } else if (path === '/meta') reply(200, { resource: `${base}/mcp`, authorization_servers: [base] });
+    else if (path === '/.well-known/oauth-authorization-server') reply(200, {
+      issuer: base, authorization_endpoint: `${base}/authorize`, token_endpoint: `${base}/token`,
+      registration_endpoint: `${base}/register`, code_challenge_methods_supported: ['S256'],
+    });
+    else if (path === '/register') {
+      const registration = JSON.parse(body) as { redirect_uris: string[] };
+      expect(registration.redirect_uris[0]).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/oauth\/callback$/);
+      reply(201, { client_id: `client-${++registrations}` });
+    } else if (path.startsWith('/authorize?')) {
+      const url = new URL(path, base);
+      const redirect = new URL(url.searchParams.get('redirect_uri')!);
+      redirect.searchParams.set('state', url.searchParams.get('state')!);
+      if (deny) redirect.searchParams.set('error', 'access_denied');
+      else redirect.searchParams.set('code', `code-${exchanges + 1}`);
+      res.writeHead(302, { location: redirect.toString() }); res.end();
+    } else if (path === '/token') {
+      const params = new URLSearchParams(body);
+      const authorize = [...requests].reverse().find((entry) => entry.phase === phase && entry.path.startsWith('/authorize?'));
+      const challenge = new URL(authorize!.path, base).searchParams.get('code_challenge');
+      const actual = createHash('sha256').update(params.get('code_verifier')!).digest('base64url');
+      if (params.get('grant_type') !== 'authorization_code' || challenge !== actual ||
+          params.get('code') !== `code-${exchanges + 1}`) reply(400, { error: 'invalid_grant' });
+      else reply(200, { access_token: `access-${++exchanges}`, refresh_token: `refresh-${exchanges}`, expires_in: 3600 });
+    } else reply(404, {});
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('HTTP listener has no port');
+  base = `http://127.0.0.1:${address.port}`;
+  const configPath = seedConfig([{ id: 'local', transport: 'http', url: `${base}/mcp`, enabled: true }]);
+  const lines: string[] = [];
+  const login = () => runMcpLogin({ serverId: 'local', storePath,
+    readConfigFn: () => ({ mcp: { servers: [{ id: 'local', transport: 'http', url: `${base}/mcp` }] } }),
+    persistDiscoveryFn: (input) => persistDiscoveredIssuer({ ...input, configPath }),
+    browserEnv: { DISPLAY: ':1' }, browserPlatform: 'linux',
+    approveBrowser: async (url) => { const response = await fetch(url); expect(response.status).toBe(deny ? 400 : 200); },
+    out: { log: (line) => lines.push(line), error: (line) => lines.push(line) },
+  });
+  try {
+    const before = fs.existsSync(storePath) ? readFileSync(storePath, 'utf8') : null;
+    expect(before).toBeNull();
+    expect((await login()).exitCode).toBe(0);
+    const first = readFileSync(storePath, 'utf8');
+    expect(loadTokens(base, storePath)).toMatchObject({ accountUuid: 'client-1', tokens: { accessToken: 'access-1', refreshToken: 'refresh-1' } });
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as { mcp: { servers: Array<{ oauthIssuer: string; oauthTokenEndpoint: string }> } };
+    expect(config.mcp.servers[0]).toMatchObject({ oauthIssuer: base, oauthTokenEndpoint: `${base}/token` });
+    phase = 'repeat';
+    expect((await login()).exitCode).toBe(0);
+    const repeated = readFileSync(storePath, 'utf8');
+    expect(registrations).toBe(1);
+    expect(repeated).not.toBe(first);
+    expect(loadTokens(base, storePath)).toMatchObject({ accountUuid: 'client-1', tokens: { accessToken: 'access-2', refreshToken: 'refresh-2' } });
+    phase = 'cancel'; deny = true;
+    expect((await login()).exitCode).toBe(1);
+    const cancelled = readFileSync(storePath, 'utf8');
+    expect(cancelled).toBe(repeated);
+    expect(exchanges).toBe(2);
+    expect(requests.filter((entry) => entry.phase === 'first').map((entry) => entry.path.split('?')[0])).toEqual([
+      '/mcp', '/meta', '/.well-known/oauth-authorization-server', '/meta',
+      '/.well-known/oauth-authorization-server', '/meta', '/.well-known/oauth-authorization-server',
+      '/register', '/authorize', '/token',
+    ]);
+    expect(requests.filter((entry) => entry.path === '/register')).toHaveLength(1);
+    expect(requests.filter((entry) => entry.path === '/token')).toHaveLength(2);
+    expect(requests.filter((entry) => entry.phase === 'cancel' && entry.path.startsWith('/authorize?'))).toHaveLength(1);
+    phase = 'client';
+    const client = new McpClient({ id: 'local', url: `${base}/mcp`, oauthIssuer: config.mcp.servers[0]!.oauthIssuer,
+      oauthTokenEndpoint: config.mcp.servers[0]!.oauthTokenEndpoint, oauthStorePath: storePath, reconnectBackoffMs: [] });
+    try {
+      await client.start();
+      expect(await client.listTools()).toEqual([]);
+      expect(client.bearerSource).toEqual({ kind: 'oauth', issuer: base });
+    } finally { await client.dispose(); }
+    expect(requests.filter((entry) => entry.phase === 'client' && entry.path === '/mcp').every((entry) => entry.authorization === 'Bearer access-2')).toBe(true);
+    expect(requests.filter((entry) => entry.phase === 'client' && entry.path === '/mcp')).toHaveLength(3);
+    expect(readFileSync(storePath, 'utf8')).toBe(cancelled);
+    console.log('HTTP-OAUTH-ROUNDTRIP ' + JSON.stringify({ requests: requests.map((entry) => ({
+      phase: entry.phase, method: entry.method, path: entry.path.split('?')[0],
+      hasBody: entry.body.length > 0, hasBearer: entry.authorization?.startsWith('Bearer ') ?? false,
+    })), credentials: {
+      beforeAbsent: before === null, firstStored: first.length > 0,
+      repeatedRotated: repeated !== first, cancelPreserved: cancelled === repeated,
+    }, config: { issuerPersisted: config.mcp.servers[0]!.oauthIssuer === base,
+      tokenEndpointPersisted: config.mcp.servers[0]!.oauthTokenEndpoint === `${base}/token` },
+    exitCodes: [0, 0, 1], cliLineCount: lines.length }));
+  } finally {
+    restoreConfigCache();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
 
 describe('runMcpLogin browser and device integration', () => {
   test('headless 401 → advertised device flow → stored token and config without browser callback', async () => {

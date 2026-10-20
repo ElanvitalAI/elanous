@@ -4,11 +4,15 @@ import { foldKindHint, type FoldMode } from '../log-entry.js';
 import { FoldStack } from '../fold-stack.js';
 import { createDashboardRenderedToolRuntime } from './rendered-tool-runtime.js';
 import {
+  BOOKKEEPING_KIND,
   createTurnStreamFormatter,
+  isBookkeepingTool,
   type TurnStreamCall,
   type TurnStreamFormatterDeps,
 } from './turn-stream-formatter.js';
 import { createDashboardTurnStreamRuntime } from './turn-stream-runtime.js';
+import { join } from 'node:path';
+import { toolResultsRoot } from '../tool-runtime/truncation-store.js';
 import type { TurnStreamPresentationEvent } from './turn-stream-presentation-applier.js';
 
 type Branch = 'pty' | 'rendered' | 'generic';
@@ -365,5 +369,66 @@ describe('createDashboardTurnStreamRuntime foldMode forwarding', () => {
   test('kind-unit is forwarded into collapsed tool-render config without changing the default omit path', () => {
     const { captured } = makeRuntime('kind-unit');
     expect(captured[0]).toEqual({ blockMaxLines: 8, foldMode: 'kind-unit' });
+  });
+});
+
+describe('TUI-TURN-NARRATION — 추론 요약 💭 줄', () => {
+  test('생각 문단은 흐린 💭 한 줄로 붙고 공백은 한 칸으로 접힌다', () => {
+    const { formatter, events } = makeFormatter('generic');
+    formatter.onThought!('**파일 목록을\n  확인합니다**');
+    expect(events).toEqual([
+      { type: 'tool.appendLine', callId: 'thought-1', line: 'mut:💭 **파일 목록을 확인합니다**' },
+    ]);
+  });
+
+  test('빈 생각은 줄을 만들지 않는다 · 줄마다 다른 callId', () => {
+    const { formatter, events } = makeFormatter('generic');
+    formatter.onThought!('   ');
+    formatter.onThought!('a');
+    formatter.onThought!('b');
+    expect(events.map((e) => (e as { callId?: string }).callId)).toEqual(['thought-1', 'thought-2']);
+  });
+});
+
+describe('TUI-TURN-NARRATION 조각 3 — 잡무 도구는 «내부» 로 묶는다', () => {
+  const kindOf = (f: ReturnType<typeof makeFormatter>, name: string, args: Record<string, unknown>) => {
+    f.formatter.onToolCall({ id: `${name}-1`, name, args });
+    return (f.events.at(-1) as { operationKind?: string }).operationKind;
+  };
+
+  test('task-unit 에서 MsgList·MsgAck·ScheduleWakeup·넘침 파일 Read 는 «내부»', () => {
+    for (const [name, args] of [
+      ['MsgList', {}], ['MsgAck', {}], ['ScheduleWakeup', {}],
+      ['Read', { file_path: join(toolResultsRoot(), '67142', 'Read-2026.txt') }],
+    ] as const) {
+      expect(kindOf(makeFormatter('rendered', { foldMode: 'task-unit' }), name, args)).toBe(BOOKKEEPING_KIND);
+    }
+  });
+
+  test('보통 Read·MsgPost 는 묶지 않고 · line 모드는 기존대로 아무것도 안 묶는다', () => {
+    expect(kindOf(makeFormatter('rendered', { foldMode: 'task-unit' }), 'Read', { file_path: 'src/a.ts' })).toBeUndefined();
+    expect(kindOf(makeFormatter('rendered', { foldMode: 'task-unit' }), 'MsgPost', {})).toBeUndefined();
+    expect(kindOf(makeFormatter('rendered', { foldMode: 'line' }), 'MsgList', {})).toBeUndefined();
+    expect(kindOf(makeFormatter('rendered'), 'MsgList', {})).toBeUndefined();
+  });
+
+  test('결과 단계도 «내부» 를 지킨다 — task-unit 의 RunShell 덮어쓰기에 섞이지 않는다', () => {
+    // generic 분기 — 렌더러가 없는 도구가 결과 단계(tool.replaceBlock)를 실제로 탄다.
+    const f = makeFormatter('generic', { foldMode: 'task-unit' });
+    f.formatter.onToolCall({ id: 'm1', name: 'MsgList', args: {} });
+    f.formatter.onToolResult({ id: 'm1', name: 'MsgList', args: {}, result: 'ok' });
+    const replace = f.events.find((e) => e.type === 'tool.replaceBlock') as { operationKind?: string };
+    expect(replace.operationKind).toBe(BOOKKEEPING_KIND);
+  });
+
+  test('isBookkeepingTool — path 인자 이름 둘 다 · 실제 넘침 뿌리 아래만 (FU-5)', () => {
+    const root = '/h/.elanous/tool-results';
+    expect(isBookkeepingTool('Read', { path: '/h/.elanous/tool-results/1/x.txt' }, root)).toBe(true);
+    expect(isBookkeepingTool('Read', { file_path: '/h/.elanous/tool-results/1/x.txt' }, root)).toBe(true);
+    // 같은 이름 조각이 다른 뿌리에 있으면 접지 않는다.
+    expect(isBookkeepingTool('Read', { path: '/repo/fixtures/.elanous/tool-results/1/x.txt' }, root)).toBe(false);
+    expect(isBookkeepingTool('Read', { path: '/h/.elanous/tool-results-old/x.txt' }, root)).toBe(false);
+    expect(isBookkeepingTool('Read', {}, root)).toBe(false);
+    expect(isBookkeepingTool('Grep', { path: '/h/.elanous/tool-results/1/x.txt' }, root)).toBe(false);
   });
 });

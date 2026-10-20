@@ -1,0 +1,28 @@
+graph_id: work-research-report-rehearsal
+version: 1
+entry_node: make-doc
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: make-doc
+    kind: subgraph
+    recipe: none
+    max_visits: 3
+    call: verb-make-doc@1
+    budget: { inner_steps: 16 }
+    contract: { inputs: [ask, context, prior], tools: worktree-write, outputs: [result, evidence] }
+  - node_id: verify
+    kind: subgraph
+    recipe: none
+    max_visits: 3
+    call: verb-verify@1
+    budget: { inner_steps: 16 }
+    contract: { inputs: [ask, context, prior], tools: read-and-run-tests, outputs: [result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - from: make-doc
+    on: outcome
+    map: { done: verify, rework: make-doc, needs-human: failed, failed: failed }
+  - from: verify
+    on: outcome
+    map: { done: done, rework: make-doc, needs-human: failed, failed: failed }

@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { calculateSeatBaseShares, budgetTrafficTick, decideSpawn, SEAT_CAP_STALE_RUN_MINUTES, SEAT_CAP_UNKNOWN_SEAT_CAP, seatCapDetails, seatCapExclusion, seatCapReason } from './budget.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { calculateSeatBaseShares, budgetTrafficTick, computeTrafficMetrics24h, decideSpawn, readTrafficSamples24h, recordTrafficSample24h, SEAT_CAP_STALE_RUN_MINUTES, SEAT_CAP_UNKNOWN_SEAT_CAP, seatCapDetails, seatCapExclusion, seatCapReason } from './budget.js';
+import type { TrafficSeatRow } from './orchestrator/traffic.js';
 
 test('configured seat caps and default four-per-seat gate both constrain spawn', () => {
   expect(decideSpawn({ seat: 'TC', running: 3, caps: { TC: 8 } })).toEqual({ allow: true, reason: 'within-cap', cap: 4 });
@@ -148,4 +152,50 @@ describe('seatCapExclusion (SEAT-CAP-STALE)', () => {
     expect(SEAT_CAP_STALE_RUN_MINUTES).toBe(30);
     expect(SEAT_CAP_UNKNOWN_SEAT_CAP).toBe(2);
   });
+});
+
+test('24h metrics aggregate utilization, wait and preemption over the verbatim sample journal', () => {
+  const root = mkdtempSync(join(tmpdir(), 'budget-24h-'));
+  try {
+    const now = new Date('2026-10-18T03:00:00Z');
+    const row = (over: Partial<TrafficSeatRow>): TrafficSeatRow => ({
+      seat: 'TC', running: 2, cap: 4, baseShare: 1, borrowed: 0, lent: 0,
+      launchCap: 2, idleFor: null, idle: false, nextCell: null, ...over,
+    });
+    recordTrafficSample24h(root, {
+      at: new Date(now.getTime() - 60 * 60_000).toISOString(),
+      seats: [row({ running: 2, cap: 4, borrowed: 1, lent: 0 })],
+    });
+    recordTrafficSample24h(root, {
+      at: now.toISOString(),
+      seats: [row({ running: 1, cap: 4, idle: true, idleFor: 7, nextCell: { id: 'c1', title: 't', owner: 'TC/x', status: 'yellow' } })],
+    });
+    // 창 밖 관측은 24h 창에서 제외된다
+    recordTrafficSample24h(root, {
+      at: new Date(now.getTime() - 30 * 24 * 60 * 60_000).toISOString(),
+      seats: [row({ running: 4 })],
+    });
+    const samples = readTrafficSamples24h(root, now);
+    expect(samples).toHaveLength(2);
+    const metrics = computeTrafficMetrics24h(samples);
+    expect(metrics.running).toBe(3);
+    expect(metrics.capacity).toBe(8);
+    expect(metrics.utilizationRate).toBeCloseTo(0.375);
+    expect(metrics.meanWaitMinutes).toBe(7);
+    expect(metrics.waitSamples).toBe(1);
+    expect(metrics.preemptedSeatTicks).toBe(1);
+    expect(metrics.sampledTicks).toBe(2);
+    expect(metrics.firstSampleAt).not.toBeNull();
+    expect(metrics.lastSampleAt).toBe(now.toISOString());
+    // 빈 저널: 지표는 영이 아니라 관측 부재(0 · null)다
+    const empty = computeTrafficMetrics24h([]);
+    expect(empty.utilizationRate).toBe(0);
+    expect(empty.meanWaitMinutes).toBeNull();
+    expect(empty.preemptedSeatTicks).toBe(0);
+    expect(empty.sampledTicks).toBe(0);
+    // 좁힌 창: 30분 창은 1시간 전 샘플을 자른다
+    expect(readTrafficSamples24h(root, now, 30)).toHaveLength(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

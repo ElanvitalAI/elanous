@@ -20,6 +20,7 @@ import {
 } from '../src/llm';
 import { saveTokens } from '../src/oauth/store';
 import { saveUserConfig, buildUserConfig, resetUserConfig } from '../src/user-config';
+import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir';
 
 interface CapturedLogRecord {
   category?: string;
@@ -33,6 +34,7 @@ let cfgPath: string;
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'skill-provider-'));
+  setElanousConfigDir(join(root, 'elanous'));
   cfgPath = join(root, 'elanous', 'config.json');
   for (const k of ['XAI_API_KEY', 'GROK_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'LOCAL_LLM_URL']) {
     saved[k] = process.env[k];
@@ -49,6 +51,7 @@ afterEach(() => {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
+  resetElanousConfigDir();
   rmSync(root, { recursive: true, force: true });
   resetUserConfig();
 });

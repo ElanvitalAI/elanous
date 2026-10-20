@@ -12,7 +12,10 @@ import { sweepFrozenMerges } from '../self-implement/frozen-merges.js';
 import { routeSupervisorVerdict } from './supervisor-verdict-edges.js';
 import { recordTaskAgentShadowMove, runCardFor, type TaskAgentShadowInput } from '../task-agent/shadow.js';
 import { cardPrNumber, taskAgentStatePath } from '../task-agent/task-hand.js';
-import { classifyMustFixRound, inferMustFixEvidence, type MustFixRoundClassification, type MustFixRoundObservation } from '../self-implement/review-mustfix-class.js';
+import {
+  classifyMustFixRound, inferMustFixEvidence, judgeMustFixScope, proposeMustFixSplit,
+  type MustFixRoundClassification, type MustFixRoundObservation, type MustFixScope, type MustFixScopeJudgement, type MustFixSplitProposal,
+} from '../self-implement/review-mustfix-class.js';
 
 export interface SupervisorRound {
   round: number;
@@ -115,6 +118,16 @@ export interface SupervisorDecision {
   mustFix?: MustFixRoundClassification;
   /** REVIEW-MUSTFIX-CLASSIFY — every oscillating task's measured class, so a mixed round keeps each task's decision. */
   mustFixByTask?: Record<string, MustFixRoundClassification>;
+  /**
+   * REVIEW-MUSTFIX-CLASSIFY 범위 축 — must-fix 한 줄마다 (가) in-scope / (나) split / (다) ask-owner.
+   * split 은 같은 런 재수리에서 빠지고 «중간 착지 ⊕ 연결 골» 제안을 싣는다(파일·칸 쓰기는 다음 조각 — 이번엔 결정 칸까지).
+   * ask-owner 는 칸 주인 HITL 제안. 진동 경로에서 must-fix 를 잰 조각만 — 없으면 생략(지금 동작 그대로).
+   */
+  mustFixScope?: {
+    byTask: Record<string, MustFixScopeJudgement[]>;
+    split?: Array<{ taskId: string; action: '중간 착지 ⊕ 연결 골'; proposals: MustFixSplitProposal[] }>;
+    askOwner?: Array<{ taskId: string; hitl: string; items: string[] }>;
+  };
   oscillation?: { taskIds: string[]; helper: 'review-oscillation'; signature: string; repairGoals?: Record<string, string>; heldTaskIds?: string[] };
   pendingDecision?: 'attempt-care-escalation';
 }
@@ -262,11 +275,70 @@ function classifyTaskMustFix(result: SupervisorJobResult, preceding: SupervisorR
 }
 
 /**
- * Classes that hold a task out of this round's same-run repair. Only ② acts in this slice; ③ recurring is
- * observed (decision `mustFix`/`mustFixByTask` · crossReview suggestion) but behaves as ① — acting on it is a
- * follow-up cell (REVIEW-MUSTFIX-CLASSIFY partial landing).
+ * Classes/scopes that hold a task out of this round's same-run repair: ② post-land-evidence, and (나) split when
+ * every must-fix item of the task is split (③ recurring items are split). A partly split task is repaired with its
+ * non-split items only.
  */
-const MUST_FIX_HELD = new Set<MustFixRoundClassification['class']>(['post-land-evidence']);
+const MUST_FIX_HELD = new Set<MustFixRoundClassification['class'] | MustFixScope>(['post-land-evidence', 'split']);
+// ⚠️ 'post-land-evidence' 는 보류 «사유» 문면에만 쓰인다 — 보류 여부는 줄 단위 'split'(② 줄 포함)이 정한다.
+
+/**
+ * REVIEW-MUSTFIX-CLASSIFY 범위 축 — 한 조각의 must-fix 를 줄마다 범위 판정한다. `prevItems` 는 앞 회차 원장의 같은
+ * 조각(또는 수리 계보) 지적 — 앞 회차가 must-fix 를 안 쟀으면 undefined(new-axis 신호를 안 낸다).
+ */
+function judgeTaskMustFixScope(
+  result: SupervisorJobResult, preceding: SupervisorRound | undefined, classification: MustFixRoundClassification,
+): MustFixScopeJudgement[] {
+  const items = mustFixFromResults([result]).items ?? [];
+  const pairIds = new Set([result.taskId, ...(result.oscillationRepairOf ? [result.oscillationRepairOf] : [])]);
+  const precedingItems = preceding?.mustFix?.items;
+  const prevItems = precedingItems === undefined ? undefined
+    : precedingItems.filter((item) => item.taskId !== undefined && pairIds.has(item.taskId));
+  return items.map((item) => judgeMustFixScope(item, {
+    ...(result.changedFiles ? { changedFiles: result.changedFiles } : {}),
+    ...(result.targetPaths ? { targetPaths: result.targetPaths } : {}),
+    ...(result.prNumber !== undefined ? { prNumber: result.prNumber } : {}),
+    ...(result.rework?.rounds !== undefined ? { reviewRound: result.rework.rounds } : {}),
+    ...(prevItems !== undefined ? { prevItems } : {}),
+    ...(classification.recurring ? { recurring: classification.recurring } : {}),
+  }));
+}
+
+/**
+ * 범위 판정을 결정 칸으로 접고 줄마다 관측을 남긴다 — (나) 는 «중간 착지 ⊕ 연결 골» 제안, (다) 는 칸 주인 HITL 제안.
+ * 실제 연결 골 파일·칸 근거 쓰기·intent 자동 주입 실행은 다음 조각.
+ */
+function mustFixScopeDecision(
+  oscillating: readonly SupervisorJobResult[],
+  taskClasses: ReadonlyMap<string, MustFixRoundClassification>,
+  taskScopes: ReadonlyMap<string, MustFixScopeJudgement[]>,
+): SupervisorDecision['mustFixScope'] {
+  const byTask: Record<string, MustFixScopeJudgement[]> = {};
+  const split: NonNullable<NonNullable<SupervisorDecision['mustFixScope']>['split']> = [];
+  const askOwner: NonNullable<NonNullable<SupervisorDecision['mustFixScope']>['askOwner']> = [];
+  for (const result of oscillating) {
+    const judged = taskScopes.get(result.taskId) ?? [];
+    if (judged.length === 0 || byTask[result.taskId]) continue;
+    byTask[result.taskId] = judged;
+    const cls = taskClasses.get(result.taskId)?.class ?? 'unmeasured';
+    for (const j of judged) {
+      const action = j.scope === 'split' ? 'split-link-goal' : j.scope === 'ask-owner' ? 'ask-owner-hitl' : 'fix-same-run';
+      try { debug.log('self-dev.supervisor', 'mustfix-scope', { taskId: result.taskId, class: cls, scope: j.scope, signals: j.signals, action }); } catch { /* fail-open */ }
+    }
+    const splits = judged.filter((j) => j.scope === 'split');
+    if (splits.length) {
+      split.push({ taskId: result.taskId, action: '중간 착지 ⊕ 연결 골',
+        proposals: splits.map((j) => proposeMustFixSplit(j)) });
+    }
+    const asks = judged.filter((j) => j.scope === 'ask-owner');
+    if (asks.length) {
+      askOwner.push({ taskId: result.taskId, items: asks.map((j) => j.text),
+        hitl: `칸 주인에게 묻는다 — must-fix ${asks.length}건 범위 판단 불가(${[...new Set(asks.map((j) => j.reason))].join(' · ')})` });
+    }
+  }
+  if (Object.keys(byTask).length === 0) return undefined;
+  return { byTask, ...(split.length ? { split } : {}), ...(askOwner.length ? { askOwner } : {}) };
+}
 
 export function decideNextRun(input: {
   results: readonly SupervisorJobResult[];
@@ -557,30 +629,52 @@ export function decideNextRun(input: {
     // REVIEW-MUSTFIX-CLASSIFY — 슈퍼바이저는 추이 대신 회차 분류를 먼저 본다(대표 10-12 «노하우가 아니라 로직으로» · 임의 임계 없음).
     //   ① new-defect — 그대로 수렴(진동 수리 유지).
     //   ② post-land-evidence — 증거는 착지 뒤에만 난다 ⇒ 같은 런 재수리 0, «그림자 착지 → 관측 → live» 쪼개기 결정.
-    //   ③ recurring — 수리 뒤 같은 지적 ⇒ 이 조각에선 관측만(교차 리뷰 제안을 결정에 싣고 동작은 ① 그대로 · 후속 칸).
+    //   ③ recurring — 수리 뒤 같은 지적 ⇒ 교차 리뷰 제안을 결정에 싣고, 그 줄은 범위 축에서 (나) split 으로 같은 런 수리에서 뺀다.
     //   unmeasured — 분류 불가 ⇒ 지금 동작 그대로. 분류는 조각마다 — 한 조각의 분류가 다른 조각의 수리를 끊지 않는다.
     const taskClasses = new Map(oscillating.map((result) => [result.taskId, classifyTaskMustFix(result, preceding)]));
-    const fresh = oscillating.filter((result) => !isRepaired(result) && !MUST_FIX_HELD.has(taskClasses.get(result.taskId)!.class));
+    // 범위 축 — must-fix 한 줄마다 (가)/(나)/(다). 모든 줄이 (나) 면 조각을 보류하고, 일부면 (나) 를 뺀 줄로만 수리한다.
+    const taskScopes = new Map(oscillating.map((result) => [result.taskId,
+      judgeTaskMustFixScope(result, preceding, taskClasses.get(result.taskId)!)]));
+    const allSplit = (taskId: string): boolean => {
+      const judged = taskScopes.get(taskId) ?? [];
+      return judged.length > 0 && judged.every((j) => j.scope === 'split');
+    };
+    // 보류는 줄 단위 범위로만 가른다 — ② 줄은 범위 축에서 늘 split 이므로 ② 회차(모든 줄이 착지 뒤 증거)는 allSplit 와 같고,
+    // 한 줄이라도 (가)/(다) 가 남으면 그 줄은 수리 골로 간다(조각 통째 보류 금지).
+    const isClassHeld = (taskId: string): boolean => MUST_FIX_HELD.has('split') && allSplit(taskId);
+    const fresh = oscillating.filter((result) => !isRepaired(result) && !isClassHeld(result.taskId));
     const classes = [...taskClasses.values()];
     // Decision-level class: ② (the only acting class) first, then observed ③, else ①.
     const mustFixClass = classes.find((c) => c.class === 'post-land-evidence') ?? classes.find((c) => c.class === 'recurring')
       ?? classes.find((c) => c.class === 'new-defect');
-    // Held = already repaired once, or classified ② — either way it never rides this round's rerun.
+    // Held = already repaired once, classified ②, or every must-fix item is (나) split — none rides this round's rerun.
     const classHeld = [...new Set(oscillating.filter((result) => !isRepaired(result)
-      && MUST_FIX_HELD.has(taskClasses.get(result.taskId)!.class)).map((result) => result.taskId))];
+      && isClassHeld(result.taskId)).map((result) => result.taskId))];
     const held = [...new Set([...oscillating.filter(isRepaired).map((result) => result.taskId), ...classHeld])];
     const repairedHeld = held.filter((id) => !classHeld.includes(id));
     // Every task's measured class survives in the decision — a mixed round keeps ② split and the observed ③ cross-review suggestion both.
     const mustFixByTask: Record<string, MustFixRoundClassification> = Object.fromEntries(
       [...taskClasses].filter(([, c]) => c.class !== 'unmeasured'));
-    const heldReasons = [...new Set(classes.filter((c) => MUST_FIX_HELD.has(c.class)).map((c) => c.reason))];
+    const heldReasons = [...new Set([
+      // 사유는 실제로 분류·범위로 보류된 조각에서만 — 수리되거나 이미 수리해 보류된 조각의 ② 사유는 싣지 않는다.
+      ...classHeld.map((id) => taskClasses.get(id)!).filter((c) => MUST_FIX_HELD.has(c.class)).map((c) => c.reason),
+      ...(classHeld.some((id) => !MUST_FIX_HELD.has(taskClasses.get(id)!.class))
+        ? ['must-fix 가 전부 (나) 범위 밖 — 같은 런 재수리 0, 중간 착지 ⊕ 연결 골'] : []),
+    ])];
     const heldReasonSuffix = heldReasons.length ? ` · ${heldReasons.join(' · ')}` : '';
+    // (나) split 줄은 같은 런 수리 골에서 뺀다 — 수리는 (가)·(다) 줄로만.
+    const repairMustFix = (result: SupervisorJobResult): string[] => {
+      const splitTexts = new Set((taskScopes.get(result.taskId) ?? []).filter((j) => j.scope === 'split').map((j) => j.text));
+      return (result.reviewMustFix ?? []).filter((text) => !splitTexts.has(text));
+    };
     const repairGoals: Record<string, string> = Object.fromEntries(fresh.flatMap((result) => {
-      const goal = result.prNumber && result.reviewMustFix?.length
+      const mustFix = repairMustFix(result);
+      const goal = result.prNumber && mustFix.length
         ? authorRepairGoal({ pr: result.prNumber, category: 'review-oscillation', originalRequest: result.feature,
-          mustFix: result.reviewMustFix }) : null;
+          mustFix }) : null;
       return goal ? [[result.taskId, goal]] : [];
     }));
+    const mustFixScope = mustFixScopeDecision(oscillating, taskClasses, taskScopes);
     // A caller that declares it cannot run the authored goal (false), or one that can but has no goal for every fresh
     // oscillating task, would turn add-repair-task into a same-strategy relaunch — stop for a human instead.
     // Undefined is the pure decision (caller unknown): it names the first repair as the goal contract asks.
@@ -606,6 +700,7 @@ export function decideNextRun(input: {
       ...(action === 'stop' ? { stopReason: 'review-oscillating' as const } : {}),
       ...(mustFixClass ? { mustFix: mustFixClass } : {}),
       ...(Object.keys(mustFixByTask).length ? { mustFixByTask } : {}),
+      ...(mustFixScope ? { mustFixScope } : {}),
       oscillation: { taskIds, helper: 'review-oscillation', signature, ...(Object.keys(repairGoals).length ? { repairGoals } : {}),
         ...(action === 'add-repair-task' && held.length ? { heldTaskIds: held } : {}) },
       pendingDecision: 'attempt-care-escalation',

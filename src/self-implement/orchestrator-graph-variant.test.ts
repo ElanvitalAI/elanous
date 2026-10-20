@@ -41,6 +41,9 @@ test('orchestrator executes two validated run-local variants and writes distinct
     const { parseGraphTemplateYaml } = await import('./graph-yaml.js');
     const parsed = parseGraphTemplateYaml(readFileSync(`${runLedgerPath(id)}.graph.yaml`, 'utf8'));
     expect(parsed.errors).toEqual([]);
+    expect(savedVariant.edges).toContainEqual(expect.objectContaining({
+      from: 'decompose', to: 'pool-admit', when: 'substrate == pod',
+    }));
     expect(savedVariant.nodes.find((node: { node_id: string }) => node.node_id === 'implement').max_visits).toBe(visits);
     expect(entries.find(entry => entry.event === 'graph-run-contract-resolved')?.data.graphVersion).toBe(graphVersionHash(parsed.template!));
     expect(entries.some(entry => entry.event === 'graph-visit-budget' && entry.data.node === 'implement' && entry.data.maxVisits === visits)).toBe(true);

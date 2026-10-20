@@ -6,15 +6,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { applyRepairBundle, REPAIR_BUNDLE_REF, type RepairCasDeps } from './repair-branch-cas.js';
 
-const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+// Keep fixture Git calls away from the host's pre-push hooks without changing process.env.
+const gitEnv = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+delete gitEnv.GIT_CONFIG_COUNT;
+delete gitEnv.GIT_CONFIG_PARAMETERS;
+delete gitEnv.GIT_TEMPLATE_DIR;
+const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', env: gitEnv }).trim();
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'ta-repair-cas-'));
   const bare = join(root, 'origin.git');
   const repo = join(root, 'repo');
   const child = join(root, 'child');
-  execFileSync('git', ['init', '--bare', bare]);
-  execFileSync('git', ['init', '-b', 'feature', repo]);
+  execFileSync('git', ['init', '--bare', bare], { env: gitEnv });
+  execFileSync('git', ['init', '-b', 'feature', repo], { env: gitEnv });
   git(repo, 'config', 'user.name', 'test');
   git(repo, 'config', 'user.email', 'test@example.invalid');
   writeFileSync(join(repo, 'file.txt'), 'base\n');
@@ -23,7 +28,7 @@ function fixture() {
   git(repo, 'remote', 'add', 'origin', bare);
   git(repo, 'push', 'origin', 'HEAD:refs/heads/feature');
   const baseHead = git(repo, 'rev-parse', 'HEAD');
-  execFileSync('git', ['clone', bare, child]);
+  execFileSync('git', ['clone', bare, child], { env: gitEnv });
   git(child, 'checkout', '-B', 'feature', 'origin/feature');
   git(child, 'config', 'user.name', 'test');
   git(child, 'config', 'user.email', 'test@example.invalid');
@@ -39,10 +44,10 @@ function fixture() {
   const bundlePath = join(root, 'repair.bundle');
   git(child, 'bundle', 'create', bundlePath, REPAIR_BUNDLE_REF);
   const bundleSha256 = createHash('sha256').update(readFileSync(bundlePath)).digest('hex');
-  const request = { repo, pr: 30, expectedHead: baseHead, bundlePath, result: { pr: 30, baseHead, commit, bundleSha256 } };
+  const request = { repo, pr: 30, expectedHead: baseHead, bundlePath, branch: 'feature', result: { pr: 30, baseHead, commit, bundleSha256 } };
   const deps: RepairCasDeps = {
     git(cwd, args) {
-      const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
+      const r = spawnSync('git', args, { cwd, encoding: 'utf8', env: gitEnv });
       return { status: r.status, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? '') };
     },
     prView() {
@@ -66,6 +71,21 @@ test('repair bundle applies only to the exact existing PR branch by leased fast-
   expect(git(f.repo, 'ls-remote', 'origin', 'refs/heads/feature').split('\t')[0]).toBe(f.result.commit);
   expect(git(f.repo, 'ls-remote', 'origin', 'refs/heads/ta-repair')).toBe('');
   expect(applyRepairBundle(f, f.deps)).toEqual({ ok: true, fromHead: f.expectedHead, toHead: f.result.commit, branch: 'feature' });
+});
+
+test('same reviewed head on a renamed PR branch cannot redirect the bound repair push', () => {
+  const f = fixture();
+  let pushes = 0;
+  const deps: RepairCasDeps = { ...f.deps, prView(cwd, pr) {
+    const view = f.deps.prView(cwd, pr);
+    return view ? { ...view, branch: 'renamed' } : view;
+  }, git(cwd, args) {
+    if (args[0] === 'push') pushes++;
+    return f.deps.git(cwd, args);
+  } };
+  expect(applyRepairBundle(f, deps)).toEqual({ ok: false, reason: 'bound repair branch changed' });
+  expect(pushes).toBe(0);
+  expect(git(f.repo, 'ls-remote', 'origin', 'refs/heads/feature').split('\t')[0]).toBe(f.expectedHead);
 });
 
 test('confirmation-only success reads PR and remote without fetching or pushing again', () => {
@@ -224,5 +244,57 @@ test('a bundle that returns the reviewed head cannot be reported as an applied r
   const f = fixture();
   const unchanged = { ...f, result: { ...f.result, commit: f.expectedHead } };
   expect(applyRepairBundle(unchanged, f.deps)).toEqual({ ok: false, reason: 'repair produced no new commit' });
+  expect(git(f.repo, 'ls-remote', 'origin', 'refs/heads/feature').split('\t')[0]).toBe(f.expectedHead);
+});
+
+test('a PR branch rename between review and push is refused before any push', () => {
+  const f = fixture();
+  let views = 0;
+  let pushes = 0;
+  const deps: RepairCasDeps = { ...f.deps, git(cwd, args) {
+    if (args[0] === 'push') pushes++;
+    return f.deps.git(cwd, args);
+  }, prView(cwd, pr) {
+    const view = f.deps.prView(cwd, pr);
+    return ++views === 2 && view ? { ...view, branch: 'moved/feature' } : view;
+  } };
+  expect(applyRepairBundle(f, deps)).toMatchObject({ ok: false, reason: 'PR head CAS mismatch or PR unavailable' });
+  expect(pushes).toBe(0);
+  expect(git(f.repo, 'ls-remote', 'origin', 'refs/heads/feature').split('\t')[0]).toBe(f.expectedHead);
+});
+
+test('a remote branch move after the reviewed-head fetch is refused before push', () => {
+  const f = fixture();
+  let pushes = 0;
+  let lsRemotes = 0;
+  const deps: RepairCasDeps = { ...f.deps, git(cwd, args) {
+    if (args[0] === 'push') pushes++;
+    if (args[0] === 'ls-remote' && ++lsRemotes === 2) git(f.child, 'push', 'origin', `${f.intermediateHead}:refs/heads/feature`);
+    return f.deps.git(cwd, args);
+  } };
+  expect(applyRepairBundle(f, deps)).toMatchObject({ ok: false, reason: 'remote branch CAS mismatch' });
+  expect(pushes).toBe(0);
+  expect(git(f.repo, 'ls-remote', 'origin', 'refs/heads/feature').split('\t')[0]).toBe(f.intermediateHead);
+});
+
+test('an invalid PR branch name is refused before fetch or push in both paths', () => {
+  const f = fixture();
+  let pushes = 0;
+  let fetches = 0;
+  const deps: RepairCasDeps = { ...f.deps, git(cwd, args) {
+    if (args[0] === 'push') pushes++;
+    if (args[0] === 'fetch') fetches++;
+    return f.deps.git(cwd, args);
+  }, prView(cwd, pr) {
+    const view = f.deps.prView(cwd, pr);
+    return view ? { ...view, branch: 'bad..name' } : view;
+  } };
+  expect(applyRepairBundle({ ...f, branch: 'bad..name' }, deps))
+    .toMatchObject({ ok: false, reason: 'bound repair branch name invalid' });
+  expect(fetches).toBe(0);
+  expect(applyRepairBundle({ ...f, confirmationOnly: true, branch: 'bad..name' }, deps))
+    .toMatchObject({ ok: false, reason: 'confirmed repair branch name invalid' });
+  expect(fetches).toBe(0);
+  expect(pushes).toBe(0);
   expect(git(f.repo, 'ls-remote', 'origin', 'refs/heads/feature').split('\t')[0]).toBe(f.expectedHead);
 });

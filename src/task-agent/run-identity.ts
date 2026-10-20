@@ -6,7 +6,8 @@
  *   디스패처 배선은 RUN-IDENTITY-ADMIT).
  * - parse/validate: 목록 밖 값은 거부한다(조용히 다듬지 않는다).
  * - 출생 신분 자동(`deriveBirthIdentity`): 칸 우선순위(P0 = critical·special·protect ·
- *   P1 = normal · 그 외 normal)·대표 표시에서 단다.
+ *   P1 = normal · 그 외 normal)·대표 표시에서 단다. 권한(rights)은 명시 `--tag rights=…`만 기록한다
+ *   (RUN-IDENTITY-RIGHTS — 체크리스트에는 권한 근거가 없으므로 출생값으로 추정하지 않는다).
  * - 태그 덮기(`applyRunIdentityTags`): `tasks hand --tag k=v`(반복) 이 출생 신분을 덮는다.
  * - ⛔ 모르는 칸을 기본값으로 확정하지 않는다: 칸 조회가 실패하면 명시 태그만 담고 나머지는 «미기록».
  * - 태그 바꾸기 감사(`runTagChange` — task-hand.ts): 카드 history 에 `run-tag-change`
@@ -129,7 +130,8 @@ const CROWN_MARK = '\u{1F451}';
 
 /**
  * 출생 신분 자동 — «조회에 성공한» 칸의 우선순위(P0 = critical·special·protect · P1 = normal · 그 외 normal)·대표 표시에서 단다.
- * 권한(rights)은 출생에서 올리지 않는다(기본 s · 올림은 `--tag rights=…` 명시만).
+ * 권한(rights)은 추정하지 않는다(RUN-IDENTITY-RIGHTS): 체크리스트 출생 정보에는 권한 근거가 없으므로
+ * `--tag rights=…` 명시 태그로만 기록하고, 태그가 없으면 «미기록».
  * ⛔ 칸을 못 읽었으면 부르지 않는다 — 그때는 `{ origin }` 에 명시 태그만 얹는다(나머지 «미기록»).
  * ⛔ 읽은 칸이라도 `priority`·`title` 이 비면 그 값에서 파생되는 칸을 확정하지 않는다(«미기록»):
  *   class 는 priority 가 있어야 · care·protect 는 P0 이거나 대표 가 보이면 올리고, «안 올림»(standard·false)은
@@ -145,7 +147,6 @@ export function deriveBirthIdentity(cell: RunIdentityCell, origin: RunIdentityOr
   return {
     ...(priority !== undefined ? { class: critical ? 'critical' as const : 'normal' as const } : {}),
     ...(careKnown ? { care: raised ? 'special' as const : 'standard' as const, protect: raised } : {}),
-    rights: 's',
     origin,
   };
 }

@@ -1,7 +1,7 @@
 graph_id: release-rehearsal
 loop:
-  title: 판 컷 전 가벼운 RC 리허설
-  description: 판 일정의 컷 −7h · −150m 단계를 15분마다 살펴서 단계당 한 번만 실행
+  title: 판 컷 전 RC·하드 게이트 리허설
+  description: 판 일정의 컷 −12h 하드(기본 간격) · −7h RC · −5h 하드 · −150m RC를 15분마다 살펴서 단계당 한 번만 실행
   owner: OP
   trigger:
     cron: '*/15 * * * *'

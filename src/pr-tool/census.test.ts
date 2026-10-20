@@ -3,7 +3,7 @@ import { debug } from '../debug/log.js';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { censusOpenPrs, guardNewPr, parseDiffHunks, readOpenPrs, recordGuardUnmeasured, type PrToolCommand } from './census.js';
+import { cardIdFromBody, censusOpenPrs, guardNewPr, parseDiffHunks, readOpenPrs, recordGuardUnmeasured, type PrToolCommand } from './census.js';
 
 const pr = (number: number, files: string[], extra: Record<string, unknown> = {}) => ({
   number, title: `PR ${number}`, state: 'open', draft: false, updated_at: '2026-10-16T00:00:00Z',
@@ -104,6 +104,27 @@ test('five open PRs touching pr-cli.ts are warnings; same cell refuses; line-ran
     .toEqual([{ path: 'src/a.ts', start: 10, end: 12 }]);
   expect(parseDiffHunks('diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -4,2 +4,0 @@\n--- a/src/fake.ts\n@@ -20,2 +18,0 @@\n'))
     .toEqual([{ path: 'src/a.ts', start: 4, end: 5 }, { path: 'src/a.ts', start: 20, end: 21 }]);
+});
+
+test('same-cell reuse requires one open PR with the exact card lineage and branch identity', () => {
+  const rows = [pr(7, ['src/a.ts'], { body: '칸: PR-SAME-CELL-REUSE\n카드: ta-123' })];
+  const inventory = readOpenPrs(fixture(rows).run);
+  expect(inventory).toMatchObject({ status: 'checked', prs: [{ headRefName: 'branch-7', cardId: 'ta-123' }] });
+  expect(cardIdFromBody('카드: ta-123\n카드: ta-456')).toBeNull();
+  expect(cardIdFromBody('카드: ta-123\n카드: ta-123')).toBe('ta-123');
+  expect(cardIdFromBody('카드: ta-123\n카드: invalid value')).toBeNull();
+  const candidate = { files: ['src/b.ts'], cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' };
+  expect(guardNewPr(candidate, inventory).sameCellReuse).toMatchObject({ number: 7, branch: 'branch-7', cardId: 'ta-123' });
+  expect(guardNewPr({ ...candidate, cardId: 'ta-other' }, inventory).sameCellReuse).toBeUndefined();
+  const ambiguous = readOpenPrs(fixture([pr(7, ['src/a.ts'], { body: '칸: PR-SAME-CELL-REUSE\n카드: ta-123\n카드: ta-other' })]).run);
+  expect(guardNewPr(candidate, ambiguous).sameCellReuse).toBeUndefined();
+  expect(ambiguous).toMatchObject({ status: 'checked', prs: [{ cardId: null, cardMarkerPresent: true }] });
+  expect(guardNewPr({ ...candidate, boundPrNumber: 7 }, ambiguous).sameCellReuse).toBeUndefined();
+  if (inventory.status !== 'checked') throw new Error('fixture inventory unreadable');
+  expect(guardNewPr(candidate, { status: 'checked', prs: [...inventory.prs, { ...inventory.prs[0]!, number: 8 }] }).sameCellReuse).toBeUndefined();
+  const legacy = readOpenPrs(fixture([pr(7, ['src/a.ts'], { body: '칸: PR-SAME-CELL-REUSE' })]).run);
+  expect(guardNewPr({ ...candidate, boundPrNumber: 7 }, legacy).sameCellReuse).toMatchObject({ number: 7, legacyBound: true });
+  expect(guardNewPr({ ...candidate, boundPrNumber: 8 }, legacy).sameCellReuse).toBeUndefined();
 });
 
 test('census uses last commit date for stale draft and identifies close candidates', () => {

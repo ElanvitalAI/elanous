@@ -66,8 +66,7 @@ export interface Rubric {
 
 const AXES = ['A', 'E', 'R', 'D', 'M', 'B', 'S', 'X'] as const;
 
-/** Read one explicit rubric line; an old score in parentheses is not an axis. */
-export function parseRubric(text: string): Rubric | null {
+function* rubricLines(text: string): Generator<Partial<Rubric>> {
   for (const line of text.split(/\r?\n/)) {
     const match = /(?:^|\s)루브릭:\s*([^\r\n]*)/.exec(line);
     if (!match) continue;
@@ -77,7 +76,22 @@ export function parseRubric(text: string): Rubric | null {
       const axis = /^([AERDMBSX])([0-3])$/.exec(token);
       if (axis) values[axis[1] as keyof Rubric] = Number(axis[2]);
     }
+    yield values;
+  }
+}
+
+/** Read one explicit rubric line; an old score in parentheses is not an axis. */
+export function parseRubric(text: string): Rubric | null {
+  for (const values of rubricLines(text)) {
     if (AXES.every((axis) => values[axis] !== undefined)) return values as Rubric;
+  }
+  return null;
+}
+
+/** Read an explicitly entered S axis even when the other rubric axes are incomplete. */
+export function parseRubricS(text: string): number | null {
+  for (const values of rubricLines(text)) {
+    if (values.S !== undefined) return values.S;
   }
   return null;
 }

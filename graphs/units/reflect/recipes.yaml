@@ -1,0 +1,3 @@
+reflect:
+  command: 'bun scripts/graph-units/reflect-node.ts'
+  timeout_ms: 30000

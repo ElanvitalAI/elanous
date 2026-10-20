@@ -1,0 +1,2 @@
+stage:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../../../scripts/graph-units/journey-stub.ts" green'

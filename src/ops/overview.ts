@@ -55,6 +55,11 @@ export interface MachineLoad { load1: number; load5: number; load15: number; cpu
 export interface MachineRow { name: string; load: Cell<MachineLoad> }
 export interface PodMemberRow { context: string; capacity: number; occupied: Cell<number> }
 export interface ParentsInfo { count: number; staleOver6h: number; oldestHours: number | null }
+export interface SchedulerMetrics {
+  scheduleRuns: number | null;
+  bunLaunches: number | null;
+  bunLaunchesLast24h: number | null;
+}
 export interface LoopRow {
   name: string;
   /** product = 제품 원장 · seat-era = 자리 시대 원천(제품 밖 · 임시) */
@@ -88,6 +93,8 @@ export interface OverviewSnapshot {
   landings: Cell<{ count: number; recent: string[] }>;
   /** Optional until launch/PR/age sources are wired; existing snapshots keep their exact output. */
   throughput?: Cell<LandingThroughput>;
+  /** Scheduler-wrapper observations for the trailing hour and day; absent on legacy snapshots. */
+  schedulerMetrics?: Cell<SchedulerMetrics>;
   loops: LoopRow[];
 }
 
@@ -238,6 +245,7 @@ export function unmeasuredCells(s: OverviewSnapshot): string[] {
   for (const p of s.machines.pods) visit(`pods.${p.context}`, p.occupied);
   visit('machines.parents', s.machines.parents); visit('landings', s.landings);
   if (s.throughput) visit('throughput', s.throughput);
+  if (s.schedulerMetrics) visit('schedulerMetrics', s.schedulerMetrics);
   for (const l of s.loops) visit(`loops.${l.name}`, l.beat);
   return out;
 }
@@ -277,6 +285,9 @@ export function renderOverview(s: OverviewSnapshot, v: VerdictResult, meta: { el
   lines.push(`       Pod ${s.machines.pods.map((p) => `${p.context} ${show(p.occupied, String)}/${p.capacity}`).join(' · ') || '못 잼(풀 설정 없음)'}`);
   lines.push(`       하니스 부모(이 기계) ${show(s.machines.parents, (p) => `${p.count} · 6h 넘음 ${p.staleOver6h}${p.oldestHours !== null ? ` · 최고 ${p.oldestHours}h` : ''}`)}`);
   lines.push(`착지   ${s.since} ${show(s.landings, (l) => `${l.count}`)} [${s.landings.source}]`);
+  if (s.schedulerMetrics) {
+    lines.push(`스케줄 로그 기록(최근 1시간) ${show(s.schedulerMetrics, (m) => `schedule.run ${m.scheduleRuns === null ? '못 잼' : `${m.scheduleRuns}건`} · crontab 경유 기록 ${m.bunLaunches === null ? '못 잼' : `${m.bunLaunches}건`} · 최근 24h crontab 경유 기록 ${m.bunLaunchesLast24h === null ? '못 잼' : `${m.bunLaunchesLast24h}건`}`)} [${s.schedulerMetrics.source}]`);
+  }
   if (s.throughput) {
     lines.push(`${show(s.throughput, formatLandingThroughput)} [${s.throughput.source}]`);
   }

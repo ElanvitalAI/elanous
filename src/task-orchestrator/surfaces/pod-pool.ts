@@ -294,6 +294,8 @@ export class PodPoolScheduler {
    * GATE-RESERVE-AUTO CPU bound, which exists to protect the gate from harness Pods, not from itself.
    */
   private readonly gateAdmission: PodLeaseAdmission;
+  /** A launch with an explicit memory limit must be measured with that limit, not the pool's 16Gi default. */
+  private readonly memoryAdmissions = new Map<string, { admission: PodLeaseAdmission; reading: () => PoolLeaseRecommendation | null; measure: () => Promise<PoolLeaseRecommendation>; take: () => void; release: () => void }>();
   private readonly outstanding = new Set<PodLeaseRelease>();
   private lastFree = 0;
   private budget = 0;
@@ -301,6 +303,8 @@ export class PodPoolScheduler {
   private seenActive = 0;
   private initialized = false;
   private readonly measure: () => Promise<PoolLeaseRecommendation>;
+  private readonly measureForMemory: (memoryLimit: string) => Promise<PoolLeaseRecommendation>;
+  private readonly dependencyMerged: (after: PodLeasePredecessor, signal?: AbortSignal) => PredecessorState | boolean | Promise<PredecessorState | boolean>;
   private lastRaw: PoolLeaseRecommendation | null = null;
   /** GATE-ADMIT-EXEMPT — the same reading before the gate CPU cap (memory/limitedBy unchanged); gate callers read it. */
   private lastUncapped: PoolLeaseRecommendation | null = null;
@@ -308,18 +312,18 @@ export class PodPoolScheduler {
   private readonly pollMs: number;
   private readonly occupancy: () => Record<string, MemberOccupancy> | Promise<Record<string, MemberOccupancy>>;
   private readonly memberMemory: () => Array<{ context: string; allocatableMemoryBytes: number | null }> | Promise<Array<{ context: string; allocatableMemoryBytes: number | null }>>;
-  constructor(readonly members: readonly PodPoolMember[], options: { status?: () => PoolLeaseRecommendation | Promise<PoolLeaseRecommendation>; kubectl?: PoolKubectl; dns?: (context: string) => PoolDnsProbe; pollMs?: number; hostLease?: HostPoolLease; memberMemory?: () => Array<{ context: string; allocatableMemoryBytes: number | null }> | Promise<Array<{ context: string; allocatableMemoryBytes: number | null }>>; occupancy?: () => Record<string, MemberOccupancy> | Promise<Record<string, MemberOccupancy>>; dependencyMerged?: (after: PodLeasePredecessor, signal?: AbortSignal) => PredecessorState | boolean | Promise<PredecessorState | boolean> } = {}) {
+  constructor(readonly members: readonly PodPoolMember[], options: { status?: (memoryLimit?: string) => PoolLeaseRecommendation | Promise<PoolLeaseRecommendation>; kubectl?: PoolKubectl; dns?: (context: string) => PoolDnsProbe; pollMs?: number; hostLease?: HostPoolLease; memberMemory?: () => Array<{ context: string; allocatableMemoryBytes: number | null }> | Promise<Array<{ context: string; allocatableMemoryBytes: number | null }>>; occupancy?: () => Record<string, MemberOccupancy> | Promise<Record<string, MemberOccupancy>>; dependencyMerged?: (after: PodLeasePredecessor, signal?: AbortSignal) => PredecessorState | boolean | Promise<PredecessorState | boolean> } = {}) {
     this.pollMs = options.pollMs ?? 15_000;
     // One lease directory per pool (contexts, not caps) — every CLI process launching into the same clusters shares it.
     this.hostLease = options.hostLease ?? podPoolHostLease(members);
     // GATE-RESERVE-AUTO: the gate reservation is returned beside the recommendation, never folded into it — the
     // delta budget below must not see a gate start/end as a free-slot change (that made the result order-dependent).
-    const measureStatus: () => Promise<{ status: PoolLeaseRecommendation; gateSlots: number | null | undefined }> = options.status
-      ? async () => ({ status: await options.status!(), gateSlots: undefined })
-      : async () => {
+    const measureStatus: (memoryLimit?: string) => Promise<{ status: PoolLeaseRecommendation; gateSlots: number | null | undefined }> = options.status
+      ? async (memoryLimit) => ({ status: await options.status!(memoryLimit), gateSlots: undefined })
+      : async (memoryLimit) => {
         // POD-ADMIT-BY-USAGE: admission reads observed Pod usage (`kubectl top`); tryAcquire's occupancy read does not.
         const measure = measurePoolLease(members, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}), measureUsage: true });
-        return { status: recommendConcurrency(measure, { capacity: members.reduce((n, m) => n + m.capacity, 0), accounts: 0, perAccount: 0 }), gateSlots: harnessCpuSlotsBesideGate(measure) };
+        return { status: recommendConcurrency(measure, { capacity: members.reduce((n, m) => n + m.capacity, 0), ...(memoryLimit ? { perGoalMemory: memoryLimit } : {}), accounts: 0, perAccount: 0 }), gateSlots: harnessCpuSlotsBesideGate(measure) };
       };
     /** Cluster-level additional slots for the cross-process host lease: the measured free slots, capped by the gate's CPU. */
     const capped = ({ status, gateSlots }: { status: PoolLeaseRecommendation; gateSlots: number | null | undefined }): PoolLeaseRecommendation =>
@@ -327,6 +331,7 @@ export class PodPoolScheduler {
         : gateSlots === null ? { ...status, recommended: null, reason: '측정 불가: gate CPU' }
           : { ...status, recommended: Math.min(status.recommended, gateSlots) };
     this.measure = async () => { const reading = await measureStatus(); this.lastUncapped = reading.status; return capped(reading); };
+    this.measureForMemory = async (memoryLimit) => capped(await measureStatus(memoryLimit));
     // An injected status (tests, callers with their own measurement) without memberMemory never shells out to kubectl here.
     this.memberMemory = options.memberMemory ?? (options.status ? (() => []) : () => measurePoolLease(members, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}) }).members
       .map((m: PodLeaseMember) => ({ context: m.context, allocatableMemoryBytes: m.allocatableMemoryBytes })));
@@ -379,28 +384,74 @@ export class PodPoolScheduler {
         ? { ...decision, recommended, reason: '측정 불가: gate CPU' }
         : { ...decision, recommended };
     };
-    const dependencyMerged = options.dependencyMerged ?? ((after: PodLeasePredecessor, signal?: AbortSignal) => predecessorState(after, {}, signal));
-    this.admission = new PodLeaseAdmission({ status: () => decide(false), ...(options.pollMs ? { pollMs: options.pollMs } : {}), dependencyMerged });
-    this.gateAdmission = new PodLeaseAdmission({ status: () => decide(true), ...(options.pollMs ? { pollMs: options.pollMs } : {}), dependencyMerged });
+    this.dependencyMerged = options.dependencyMerged ?? ((after: PodLeasePredecessor, signal?: AbortSignal) => predecessorState(after, {}, signal));
+    this.admission = new PodLeaseAdmission({ status: () => decide(false), ...(options.pollMs ? { pollMs: options.pollMs } : {}), dependencyMerged: this.dependencyMerged });
+    this.gateAdmission = new PodLeaseAdmission({ status: () => decide(true), ...(options.pollMs ? { pollMs: options.pollMs } : {}), dependencyMerged: this.dependencyMerged });
+  }
+  private memoryAdmission(memoryLimit: string): { admission: PodLeaseAdmission; reading: () => PoolLeaseRecommendation | null; measure: () => Promise<PoolLeaseRecommendation>; take: () => void; release: () => void } {
+    const existing = this.memoryAdmissions.get(memoryLimit);
+    if (existing) return existing;
+    let last: PoolLeaseRecommendation | null = null;
+    let admission: PodLeaseAdmission;
+    let lastFree = 0;
+    let budget = 0;
+    let initialized = false;
+    const measure = async () => { last = await this.measureForMemory(memoryLimit); return last; };
+    admission = new PodLeaseAdmission({
+      status: async () => {
+        const raw = await measure();
+        if (raw.recommended === null) return raw;
+        const ownStart = this.hostLease.selfStart();
+        const pendingJobs = raw.pendingJobs ?? [];
+        const transferId = process.env.ELANOUS_POD_RESERVED_LEASE;
+        const transferIsOther = !!transferId && this.hostLease.reservationIsOther(transferId);
+        const others = this.hostLease.live().filter((r) =>
+          (r.pid !== process.pid || r.startedAt !== ownStart) && !leaseHasPendingPod(r, pendingJobs)).length;
+        const available = Math.max(0, raw.recommended - others + (transferIsOther ? 1 : 0));
+        // A repeated stale reading does not mint another permit before an admitted Job is observed.
+        // Other tiers and processes share the host lease, which enforces the pool cap before Job apply.
+        budget = Math.max(0, budget + available - (initialized ? lastFree : 0));
+        initialized = true;
+        lastFree = available;
+        return { ...raw, recommended: admission.snapshot().active + budget };
+      },
+      pollMs: this.pollMs,
+      dependencyMerged: this.dependencyMerged,
+    });
+    const entry = { admission, reading: () => last, measure,
+      take: () => { budget = Math.max(0, budget - 1); },
+      release: () => { if (lastFree > 0) budget = Math.min(lastFree, budget + 1); },
+    };
+    this.memoryAdmissions.set(memoryLimit, entry);
+    return entry;
   }
   /** FIFO gate within this process, then a host lease so independent CLI processes cannot over-admit the same pool. */
-  async acquireAdmission(signal?: AbortSignal, after?: PodLeasePredecessor, opts: { gate?: boolean } = {}): Promise<PodLeaseRelease & { applied: (job: string, context: string, namespace: string) => void; observed: () => void }> {
+  async acquireAdmission(signal?: AbortSignal, after?: PodLeasePredecessor, opts: { gate?: boolean; memoryLimit?: string } = {}): Promise<PodLeaseRelease & { applied: (job: string, context: string, namespace: string) => void; observed: () => void }> {
     const gate = opts.gate === true;
-    const local = await this.acquireLocalAdmission(signal, after, gate);
+    const lane = !gate && opts.memoryLimit && opts.memoryLimit !== '16Gi' ? this.memoryAdmission(opts.memoryLimit) : null;
+    const local = lane ? await lane.admission.acquire(signal, after).then((release) => {
+      lane.take();
+      let done = false;
+      return () => { if (done) return; done = true; lane.release(); release(); };
+    }) : await this.acquireLocalAdmission(signal, after, gate);
     try {
       for (;;) {
         if (signal?.aborted) throw new Error('pod lease admission aborted');
         // GATE-ADMIT-EXEMPT: a gate caller is not bounded by its own gate's CPU reservation (memory still bounds it).
-        const free = (gate ? this.lastUncapped : this.lastRaw)?.recommended ?? null;
+        const reading = lane?.reading() ?? (gate ? this.lastUncapped : this.lastRaw);
+        const free = reading?.recommended ?? null;
         // Same check as the local gate, but atomic across processes: other authoring and pre-Running leases hold slots.
         const reservedId = process.env.ELANOUS_POD_RESERVED_LEASE;
         const transferred = reservedId ? this.hostLease.claim(reservedId) : null;
         if (reservedId && !transferred) throw new Error('pod lease: authoring reservation could not be transferred');
         if (transferred) delete process.env.ELANOUS_POD_RESERVED_LEASE;
-        const pendingJobs = this.lastRaw?.pendingJobs ?? [];
+        const pendingJobs = reading?.pendingJobs ?? [];
         const lease = transferred ?? (free !== null && free > 0 ? this.hostLease.tryReserve((others) =>
           others - this.hostLease.live().filter((r) => leaseHasPendingPod(r, pendingJobs) &&
-            (r.pid !== process.pid || r.startedAt !== this.hostLease.selfStart())).length < free) : (gate && free === null ? this.hostLease.tryReserve(() => true) : null));
+            ((lane || this.memoryAdmissions.size > 0) || r.pid !== process.pid || r.startedAt !== this.hostLease.selfStart())).length < free,
+          // The legacy queue accounts for its own permits locally. Mixed memory tiers have separate queues,
+          // so their host leases must count together under the same pool cap.
+          !!lane || this.memoryAdmissions.size > 0) : (gate && free === null ? this.hostLease.tryReserve(() => true) : null));
         if (lease) {
           let hostReleased = false;
           const releaseHost = () => { if (!hostReleased) { hostReleased = true; lease(); } };
@@ -421,7 +472,8 @@ export class PodPoolScheduler {
           const onAbort = () => { clearTimeout(timer); reject(new Error('pod lease admission aborted')); };
           signal?.addEventListener('abort', onAbort, { once: true });
         });
-        try { this.lastRaw = await this.measure(); } catch { this.lastRaw = null; this.lastUncapped = null; }
+        try { if (lane) await lane.measure(); else this.lastRaw = await this.measure(); }
+        catch { if (!lane) { this.lastRaw = null; this.lastUncapped = null; } }
       }
     } catch (error) {
       local();
@@ -454,14 +506,18 @@ export class PodPoolScheduler {
       ? [{ context: r.context, allocatableMemoryBytes: r.allocatableMemoryBytes }] : []);
   }
   /** Why admission is still waiting: the pool-wide lease measurement (null before any reading). Slot waits get their reason from tryAcquire's onEmpty. */
-  waitReason(): string | null {
-    const r = this.lastRaw;
+  waitReason(memoryLimit?: string): string | null {
+    const r = memoryLimit && memoryLimit !== '16Gi' ? this.memoryAdmissions.get(memoryLimit)?.reading() : this.lastRaw;
     if (!r) return null;
     return `recommended=${r.recommended ?? 'unknown'} limitedBy=${r.limitedBy ?? '-'} memorySlots=${r.memorySlots ?? '?'}${r.reason ? ` reason=${r.reason}` : ''}`;
   }
   /** The harness queue by default; `{ gate: true }` reads the gate-caller queue (GATE-ADMIT-EXEMPT). */
   admissionSnapshot(opts: { gate?: boolean } = {}): ReturnType<PodLeaseAdmission['snapshot']> {
-    return (opts.gate ? this.gateAdmission : this.admission).snapshot();
+    if (opts.gate) return this.gateAdmission.snapshot();
+    const snapshots = [this.admission.snapshot(), ...[...this.memoryAdmissions.values()].map((lane) => lane.admission.snapshot())];
+    return { active: snapshots.reduce((n, item) => n + item.active, 0), queued: snapshots.reduce((n, item) => n + item.queued, 0),
+      recommended: Math.min(this.members.reduce((n, item) => n + item.capacity, 0), snapshots.reduce((n, item) => n + item.recommended, 0)),
+      waiting: snapshots.flatMap((item) => item.waiting) };
   }
   /**
    * Pick the member with the largest free share: (capacity − measured cluster occupancy − this process's inflight) / capacity.

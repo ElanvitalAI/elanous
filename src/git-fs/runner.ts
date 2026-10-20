@@ -27,9 +27,11 @@ export function runGitCommand(
   const run = runner ?? ((gitArgs: string[]): GitRunResult => {
     if (testRunner) return testRunner(cwd, gitArgs, options);
     const result = spawnSync('git', gitArgs, { ...options, cwd });
+    const errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code;
     return {
       status: result.status,
       ...(result.signal ? { signal: result.signal } : {}),
+      ...(errorCode ? { errorCode } : {}),
       stdout: outputText(result.stdout),
       stderr: outputText(result.stderr),
     };

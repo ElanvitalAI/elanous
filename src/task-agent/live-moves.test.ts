@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { SupervisorJobResult, SupervisorStopReason } from '../self-dev/run-supervisor.js';
@@ -11,6 +12,7 @@ import { decisionRaiseArgs, executeNextAction } from './actions.js';
 import { defaultPrHead, defaultRequestReview, defaultReviewRepoCandidates, executeLiveDecisionCard, executeLiveLand, executeLiveReview, type LiveDecisionCardContext, liveLandArgs, liveReviewArgs, type PrHeadView, type ReviewRepoCandidate, resolveTaskAgentLiveMoves, TASK_AGENT_LIVE_MOVES_ENV, type TaskAgentLiveMove } from './live-moves.js';
 import { recordTaskAgentShadowMove } from './shadow.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
+import { captureReviewResults } from './review-result-capture.js';
 
 // GATE-PREEXISTING-ZERO-1 — 이 파일의 시험은 전부 «HQ(비-Pod) 판단부»를 단언한다. 그런데 정식 게이트는 Pod 안에서 돌고
 // Pod 는 `ELANOUS_POD_NAME`(⊕ `ELANOUS_RUN_ID`)을 프로세스 env 로 갖는다(pod-command-job.ts). shadow.ts 는 주입 env 가
@@ -316,6 +318,43 @@ describe('taskAgent.liveMoves 해석 — config > env > 없음 · 모르는 항�
     expect(spawned[0]!.options).toMatchObject({ detached: true, stdio: 'ignore', cwd: '/tmp/wt-live' });
   });
 
+  test('node-b review request uses the remote checkout and leaves JSON stdout in the HQ result file', async () => {
+    const { EventEmitter } = await import('node:events');
+    const root = mkdtempSync(join(tmpdir(), 'ta-remote-review-'));
+    const worker = join(root, 'fake-eln');
+    writeFileSync(worker, `#!/bin/sh\nprintf '%s\\n' '{"pr":77,"headCommit":"${HEAD_A}","verdict":"pass","reviewed":true,"mustFix":[]}'\n`);
+    chmodSync(worker, 0o755);
+    const calls: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
+    const fakeSpawn = ((command: string, args: string[], options: Record<string, unknown>) => {
+      calls.push({ command, args, options });
+      const run = spawnSync('sh', ['-c', args[6]!], { stdio: options.stdio as never, cwd: root });
+      expect(run.status).toBe(0);
+      const child = Object.assign(new EventEmitter(), { pid: 4242, unref: () => {} });
+      queueMicrotask(() => child.emit('spawn'));
+      return child;
+    }) as never;
+    try {
+      const resultPath = join(root, 'review.json');
+      const statePath = join(root, 'task-agent-actions.json');
+      writeTaskCards(statePath, [{ id: 'ta-remote-review', text: 'review', createdAt: new Date().toISOString(), status: 'launched',
+        pr: { number: 77, url: 'https://github.com/o/r/pull/77' },
+        reviewRequests: [{ pr: 77, head: HEAD_A, at: new Date().toISOString(), resultPath }], history: [] }]);
+      await defaultRequestReview(77, "review ' quoted", root, {
+        spawn: fakeSpawn, remote: { host: 'node-b', cwd: root, elanous: worker, configDir: root }, resultPath,
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.command).toBe('ssh');
+      expect(calls[0]!.args.slice(0, 5)).toEqual(['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5']);
+      expect(calls[0]!.args[5]).toBe('node-b');
+      expect(calls[0]!.args[6]).toContain(`cd ${root} && ${worker} --config-dir ${root} self review 77 --json --model gpt-6-sol`);
+      expect(calls[0]!.options.stdio).toEqual(['ignore', expect.any(Number), 'ignore']);
+      expect(JSON.parse(readFileSync(resultPath, 'utf8'))).toMatchObject({ pr: 77, headCommit: HEAD_A, verdict: 'pass' });
+      captureReviewResults(statePath, { cardIds: ['ta-remote-review'] });
+      expect(readTaskCard('ta-remote-review', statePath)?.history.some((entry) =>
+        entry.event === 'live-move-result' && entry.kind === 'review' && entry.verdict === 'pass' && entry.resultPath === resultPath)).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('수확 가능 결과가 ok 가 아니어도 리뷰 cwd 는 그 PR 을 낸 결과의 작업 트리', async () => {
     const f = fixture();
     const seen: Array<string | undefined> = [];
@@ -473,6 +512,65 @@ describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => 
     expect((await executeLiveLand(t.card(), 51, t.ctx, t.live)).detail).toContain('CLOSED');
     expect(t.calls).toHaveLength(0);
     expect(t.card().landAttempts).toBeUndefined();
+  });
+
+  // TA-CARD-MERGE-RECONCILE — 실패 카드에 묶인 PR 을 사람이 손수 병합하면 생산 land 경로가 그대로 정산한다(실물 git 조상 검증 · updateTaskCard 락).
+  test('executeLiveLand settles a hand-merged PR through reconcileHandMergedCard and keeps non-ancestor MERGED refused', async () => {
+    const gitEnv: Record<string, string | undefined> = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+    delete gitEnv.GIT_CONFIG_COUNT;
+    delete gitEnv.GIT_CONFIG_PARAMETERS;
+    delete gitEnv.GIT_TEMPLATE_DIR;
+    const dir = mkdtempSync(join(tmpdir(), 'ta-hand-merge-live-'));
+    const git = (...args: string[]) => {
+      const run = spawnSync('git', args, { cwd: dir, encoding: 'utf8', env: gitEnv });
+      if (run.status !== 0) throw new Error(`git ${args.join(' ')}: ${String(run.stderr).trim()}`);
+      return String(run.stdout).trim();
+    };
+    const commit = (message: string) => git('-c', 'user.name=ta', '-c', 'user.email=ta@example.invalid', 'commit', '--allow-empty', '-m', message);
+    git('init', '-b', 'main');
+    commit('base');
+    git('checkout', '-b', 'feature');
+    commit('feature');
+    git('checkout', 'main');
+    git('-c', 'user.name=ta', '-c', 'user.email=ta@example.invalid', 'merge', '--no-ff', '-m', 'merge feature', 'feature');
+    const mergeCommit = git('rev-parse', 'HEAD');
+    git('update-ref', 'refs/remotes/origin/main', 'main');
+    const stateDir = mkdtempSync(join(tmpdir(), 'ta-hand-merge-live-state-'));
+    const statePath = join(stateDir, 'task-agent-actions.json');
+    const url = 'https://github.com/example/repo/pull/79';
+    const reason = 'failed/needs-owner — run died';
+    const card: TaskCard = { id: 'ta-live-hand', text: 'hand merge', createdAt: '2026-10-13T00:00:00Z', status: 'failed',
+      history: [{ event: 'judge', detail: reason, at: '2026-10-13T00:00:00Z' }],
+      pr: { number: 79, url }, taLand: true, landAttempts: [{ pr: 79, head: HEAD_A, at: '2026-10-13T00:00:00Z' }] };
+    writeTaskCards(statePath, [card]);
+    const deps = {
+      statePath,
+      log: () => {},
+      landPrHead: async () => ({ head: HEAD_A, state: 'MERGED', isDraft: false, url }),
+      handMergePr: async () => ({ state: 'MERGED', url, baseRefName: 'main', mergedAt: '2026-10-14T00:00:00Z', mergeCommit }),
+    };
+    try {
+      const out = await executeLiveLand(card, 79, { cwd: dir }, deps);
+      expect(out).toMatchObject({ kind: 'land', card: 'ta-live-hand', ok: true, executed: true });
+      expect(out.detail).toContain('landed-by-hand');
+      const settled = readTaskCard('ta-live-hand', statePath)!;
+      expect(settled.status).toBe('landed-by-hand');
+      expect(settled.history.at(-1)?.event).toBe('hand-move');
+      expect(settled.history[0]).toMatchObject({ event: 'judge', detail: reason });
+      expect(settled.prTerminal).toMatchObject({ pr: 79, head: mergeCommit, state: 'MERGED' });
+      const offMainUrl = 'https://github.com/example/repo/pull/80';
+      const offMain: TaskCard = { ...card, id: 'ta-live-hand-2', pr: { number: 80, url: offMainUrl },
+        landAttempts: [{ pr: 80, head: HEAD_A, at: '2026-10-13T00:00:00Z' }] };
+      writeTaskCards(statePath, [offMain]);
+      const refused = await executeLiveLand(offMain, 80, { cwd: dir }, { ...deps,
+        handMergePr: async () => ({ state: 'MERGED', url: offMainUrl, baseRefName: 'main', mergedAt: '2026-10-14T00:00:00Z', mergeCommit: HEAD_B }) });
+      expect(refused).toMatchObject({ kind: 'land', card: 'ta-live-hand-2', ok: false, executed: false });
+      expect(refused.detail).toContain('MERGED');
+      expect(readTaskCard('ta-live-hand-2', statePath)?.status).toBe('failed');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   });
 
   // TA-LAND-MUSTFIX-ZERO — pass ⊕ must-fix 1 → land 안 함 · must-fix 수 모름 → land 안 함(fail-closed) · 둘 다 관측에 사유를 남긴다.

@@ -92,14 +92,15 @@ export async function repairModelAvailability(readInputs: () => Promise<Pick<Bud
   } catch { return { codexSubscription: false, grokSubscription: false }; }
 }
 
-/** Repair stays inside the dispatch tier. A missing legacy tier is high, with Sol allowed only on measured subscription quota. */
+/** Repair stays inside the dispatch tier. A missing legacy tier is mid ('중'); Sol is reserved for the 특 tier and measured-subscription 상 repairs. */
 export function alternateRepairModel(card: TaskCard, availability: RepairModelAvailability = { codexSubscription: false, grokSubscription: false }): { from: string; to: TaskChildLlm } {
   const last = card.repairs?.at(-1);
   const from = last?.toModel ?? (card.childLlm ? `${card.childLlm.provider}/${card.childLlm.model}` : 'unknown');
   const glm: TaskChildLlm = { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' };
   const sol: TaskChildLlm = { provider: 'openai-codex', model: 'gpt-6-sol' };
   const grok: TaskChildLlm = { provider: 'grok', model: 'grok-4.6' };
-  const tier = card.tier ?? '상';
+  const luna: TaskChildLlm = { provider: 'openai-codex', model: 'gpt-6-luna' };
+  const tier = card.tier ?? '중';
   const pr = typeof card.pr === 'number' ? card.pr : card.pr?.number;
   const mixEven = ((pr ?? [...card.id].reduce((sum, ch) => sum + ch.charCodeAt(0), 0)) % 2) === 0;
   let to: TaskChildLlm;
@@ -108,6 +109,8 @@ export function alternateRepairModel(card: TaskCard, availability: RepairModelAv
   else if (tier === '상') to = availability.grokSubscription && from.includes('glm') ? grok
     : from.includes('glm-5.3-flash') ? glm
     : from.includes('glm-5.3') ? { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' } : glm;
+  else if (tier === '하') to = from.includes('glm-5.3-flash') ? luna : from.includes('glm-5.3')
+    ? { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' } : glm;
   else to = from.includes('glm-5.3-flash') ? glm : from.includes('glm-5.3')
     ? { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' } : glm;
   return { from, to };
@@ -192,7 +195,7 @@ export async function runRepairCycle(input: RepairCycleInput): Promise<RepairCyc
         const bundlePath = join(artifactDir, 'commit.bundle');
         let pushClaimed = false;
         applied = (input.apply ?? applyRepairBundle)({ repo, pr, expectedHead: latest.head,
-          bundlePath, result: result.result,
+          bundlePath, result: result.result, branch: latest.branch,
           claimBeforePush: () => {
             let claimed = false;
             updateTaskCard(statePath, card.id, (current) => current?.repairs?.some((entry) => entry.runId === latest.runId && entry.status === 'requested')
@@ -307,6 +310,16 @@ export async function runRepairCycle(input: RepairCycleInput): Promise<RepairCyc
     updateTaskCard(statePath, card.id, (current) => current?.repairs?.some((entry) => entry.runId === runId && entry.status === 'requested')
       ? { ...current, repairs: current.repairs.map((entry) => entry.runId === runId ? { ...entry, status: 'failed' as const, detail: reason } : entry) } : undefined);
     return { decision: 'repair-failed', reason };
+  }
+  // The request may throw before a worker exists. A post-launch observation
+  // failure must not turn an accepted worker into a failed launch.
+  try {
+    updateTaskCard(statePath, card.id, (current) => current?.repairs?.some((entry) => entry.runId === runId)
+      && !current.history.some((entry) => entry.event === 'harness.role-llm' && entry.runId === runId)
+      ? { ...current, history: [...current.history, { at: now.toISOString(), event: 'harness.role-llm', pr, head, runId,
+        detail: `repair child model ${to.provider}/${to.model}` }] } : undefined);
+  } catch (error) {
+    try { debug.log('task-agent', 'repair-role-llm-observation-failed', { card: card.id, pr, head, runId, error: String(error) }); } catch { /* fail-soft */ }
   }
   try {
     if (input.observeLaunch) input.observeLaunch(judged.judgement.move, runId);

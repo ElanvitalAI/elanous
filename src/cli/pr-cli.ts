@@ -58,10 +58,11 @@ import { branchLineageSlug, findSiblingPrs } from './pr-lineage.js';
 import { parseReleaseNoteSection } from '../release-loop/release-note.js';
 import { landingFreezeMessage } from '../release-loop/landing-freeze.js';
 import { admitLandingMerge } from '../self-implement/frozen-merges.js';
-import { verifyAllSameHeadReviews, verifyAncestorAutoPass, verifyOverlapEvidence, verifyOverlapEvidenceVirtualRebase } from './pr-land-overlap-evidence.js';
+import { resolveOverlapEvidencePath, verifyAllSameHeadReviews, verifyAncestorAutoPass, verifyOverlapEvidence, verifyOverlapEvidenceVirtualRebase } from './pr-land-overlap-evidence.js';
 import type { VerifyOverlapEvidenceInput } from './pr-land-overlap-evidence.js';
 import { verifyVirtualRebasePatch } from './pr-land-virtual-rebase.js';
 import { observeDirectPrLandRefusal, observePrLandRefusal } from './pr-land-refusal.js';
+import { planPrLandRecovery } from './pr-land-recovery.js';
 import { ensurePrLandHeavyRemote, type HeavyRemoteInput, type HeavyRemoteResult } from './pr-land-heavy-remote.js';
 import { readPrBaseNameWithRetry } from './pr-land-base-read.js';
 import { runHeavyOnPodShadow } from './pr-land-pod-shadow.js';
@@ -117,6 +118,8 @@ export const PR_LAND_MERGEABLE_UNKNOWN_WAIT_MS = 5_000;
 
 export interface PrLandDeps {
   manager?: PrManager;
+  /** Confirmed merge cleanup; failures are observed and never undo the merge. */
+  onMergedSupersede?: (number: number, cwd: string) => Promise<void>;
   /** 병합 재시도 사이 대기(시험 주입용 · 기본 실제 대기). */
   sleep?: (ms: number) => Promise<void>;
   run?: CmdRunner;
@@ -271,14 +274,14 @@ export async function decideOverlapLanding(input: {
 
 const liveOut = { log: (message: string) => console.log(message), error: (message: string) => console.error(message) };
 
-function runPrLandTypecheckGate(out: { log: (message: string) => void; error: (message: string) => void }, cwd: string = process.cwd()): boolean {
+function runPrLandTypecheckGate(out: { log: (message: string) => void; error: (message: string) => void }, cwd: string): boolean {
   let failed = false;
   const exit = ((code: number): never => {
     failed = code !== 0;
     throw new Error(`ci-typecheck-changed exited ${code}`);
   });
   try {
-    runChangedTypecheckGate({ log: out.log, warn: out.error, error: out.error, exit, cwd });
+    runChangedTypecheckGate({ log: out.log, warn: out.error, error: out.error, exit, cwd: resolve(cwd), allowMissingCheckoutDependencies: true });
   } catch (error) {
     if (!failed) throw error;
   }
@@ -1087,7 +1090,7 @@ export function verifyPinnedOverlapDecision(input: {
   if (decision === 'unavailable' && opts.overlapEvidence !== undefined) {
     const ref = resolveRemoteBranchRef(run, cwd, base);
     const evidenceInput: VerifyOverlapEvidenceInput = {
-      evidencePath: opts.overlapEvidence, pr: Number(opts.pr), expectedHead: opts.expectedHead!,
+      evidencePath: resolveOverlapEvidencePath(opts.overlapEvidence, cwd), pr: Number(opts.pr), expectedHead: opts.expectedHead!,
       remote: ref.remote, branch: ref.branch, cwd, run, readFile,
       reviewResultsDir: deps.reviewResultsDir ?? join(dirname(taskAgentStatePath()), 'review-results'),
       listDir: (dir) => readdirSync(dir), reviewMtime: (path) => statSync(path).mtimeMs,
@@ -1318,6 +1321,19 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   const refuse = (message: string, context: { isDraft?: boolean } = {}): void => {
     out.error(message);
     observePrLandRefusal(message, context);
+    const pr = Number(opts.pr);
+    if (Number.isSafeInteger(pr) && pr > 0 && opts.expectedHead) {
+      try {
+        const plan = planPrLandRecovery({ refusal: message, pr, head: opts.expectedHead, isDraft: context.isDraft });
+        debug.log('pr.land', 'recover-shadow', {
+          pr, head: opts.expectedHead, label: plan.evidence.label, route: plan.evidence.route,
+          outcome: plan.outcome, action: plan.result.action, reason: plan.result.reason,
+          delayMs: plan.result.delayMs ?? null, execution: 'none',
+        });
+      } catch {
+        // Recovery observation must never replace the original landing refusal.
+      }
+    }
   };
   const refuseDirect = (message: string): void => {
     out.error(message);
@@ -1885,14 +1901,22 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     const baseRead = await readPrBaseNameWithRetry({
       pr: String(opts.pr), cwd, run,
       sleep: deps.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+      onUnreadable: (attempt, stderr) => {
+        if (stderr?.trim()) out.error(`⚠ heavy-remote: gh pr view base read attempt ${attempt}/3 stderr: ${stderr.trim()}`);
+      },
     });
     const baseName = baseRead.baseRefName;
     record('heavy-remote-pr-base-read', baseName !== null, {
       pr: Number(opts.pr), baseRefName: baseName, attempts: baseRead.attempts,
     });
+    if (baseName === null) {
+      record('heavy-remote-pr-base', false, { pr: Number(opts.pr), baseRefName: null, attempts: baseRead.attempts, reason: 'unreadable' });
+      refuseDirect(`✗ heavy-remote: PR base 조회 불가 (${baseRead.attempts}회) — 통과한 head/main 쌍을 확인하지 못했다. 병합하지 않는다.`);
+      return 1;
+    }
     if (baseName !== 'main') {
-      record('heavy-remote-pr-base', false, { pr: Number(opts.pr), baseRefName: baseName, attempts: baseRead.attempts });
-      refuseDirect(`✗ heavy-remote: PR base=${baseName ?? 'unreadable'} ≠ main — 재타기팅된 PR은 통과한 head/main 쌍이 아니다. 병합하지 않는다.`);
+      record('heavy-remote-pr-base', false, { pr: Number(opts.pr), baseRefName: baseName, attempts: baseRead.attempts, reason: 'non-main' });
+      refuseDirect(`✗ heavy-remote: PR base=${baseName} ≠ main — 재타기팅된 PR은 통과한 head/main 쌍이 아니다. 병합하지 않는다.`);
       return 1;
     }
     return undefined;
@@ -1951,7 +1975,8 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     }
     return recheckOverlapAtBase(currentBase);
   };
-  const typecheckOk = opts.heavyRemote || (deps.runTypecheckGate ?? ((o) => runPrLandTypecheckGate(o, cwd)))(out);
+  // The production gate must receive this land invocation's --cwd, never the launching shell's cwd.
+  const typecheckOk = opts.heavyRemote || (deps.runTypecheckGate ? deps.runTypecheckGate(out) : runPrLandTypecheckGate(out, cwd));
   record('typecheck', typecheckOk);
   if (!typecheckOk) {
     // ⛔⭐ 「왜 막혔나」를 «단정하지 않는다» — 이 게이트는 불리언만 돌려주므로 여기서는 이유를 모른다.
@@ -2374,6 +2399,13 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   }
   if (opts.forceFreeze) debug.log('release-loop.freeze', 'force-merge', { pr: prNumber, reason: opts.forceFreeze.trim() });
   record('merge', true, { result: merged.kind, ...(merged.remoteBranchDeletion ? { remoteBranchDeletion: merged.remoteBranchDeletion.detail } : {}) });
+  if (Number.isSafeInteger(prNumber) && prNumber > 0 && deps.onMergedSupersede) {
+    try { await deps.onMergedSupersede(prNumber, cwd); }
+    catch (error) {
+      try { debug.log('drafts.cleanup', 'same-cell-hook-failed', { merged: prNumber, error: String(error) }, { level: 'warn' }); }
+      catch { /* a cleanup observation cannot undo a confirmed merge */ }
+    }
+  }
   // INFLIGHT-REGISTRY — 착지하면 비행 중 등록부의 그 런 줄을 지운다(색인 실패는 착지를 막지 않는다).
   try {
     const statePath = deps.taskStatePath ?? taskAgentStatePath();
@@ -2437,12 +2469,30 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
       out.log(`✓ heavy-remote: post-merge host=${post.host ?? 'unknown'} head=${opts.expectedHead!.slice(0, 12)} main=${firstParent.slice(0, 12)} source=${post.source}`);
     }
   }
-  const baseRef = upsert.reused
+  const finalBaseRead = upsert.reused && opts.heavyRemote
+    ? await readPrBaseNameWithRetry({
+      pr: upsert.url, cwd, run,
+      sleep: deps.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+      onUnreadable: (attempt, stderr) => {
+        if (stderr?.trim()) out.error(`⚠ heavy-remote: final gh pr view base read attempt ${attempt}/3 stderr: ${stderr.trim()}`);
+      },
+    })
+    : undefined;
+  const baseRef = upsert.reused && !opts.heavyRemote
     ? run('gh', ['pr', 'view', upsert.url, '--json', 'baseRefName', '--jq', '.baseRefName'], { cwd })
     : undefined;
-  const landingBase = baseRef
-    ? (baseRef.ok && baseRef.out.trim() ? baseRef.out.trim() : '<base unavailable>')
-    : base;
+  const landingBase = finalBaseRead
+    ? finalBaseRead.baseRefName ?? '<base unavailable>'
+    : baseRef
+      ? (baseRef.ok && baseRef.out.trim() ? baseRef.out.trim() : '<base unavailable>')
+      : base;
+  if (finalBaseRead?.baseRefName && finalBaseRead.baseRefName !== 'main') {
+    out.error(`✗ heavy-remote: PR base=${finalBaseRead.baseRefName} ≠ main — 병합된 base를 확인했습니다.`);
+    return 1;
+  }
+  if (finalBaseRead?.baseRefName === null) {
+    out.log(`⚠ heavy-remote: final PR base 조회 불가 (${finalBaseRead.attempts}회) — 병합 결과를 실패 처리하지 않습니다.`);
+  }
   out.log(`✓ merge: squash ${upsert.url} → ${landingBase}`);
   if (landingBase === '<base unavailable>') {
     out.log('⚠ local HEAD does not contain the landed result; the landed base is unavailable, so no branch command can be provided.');
@@ -2458,6 +2508,20 @@ export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queu
   const prToolRun = deps.run ?? defaultCmdRunner;
   const prToolOut = deps.out ?? liveOut;
   const prToolExit = deps.setExitCode ?? ((code: number) => { process.exitCode = code; });
+  const supersedeMerged = deps.onMergedSupersede ?? (async (number: number, cwd: string): Promise<void> => {
+    const { supersedeMergedGoalDrafts } = await import('../harness/harness-cli-command.js');
+    await supersedeMergedGoalDrafts(number, cwd, undefined, undefined, { onlyExplicitSameCell: true });
+  });
+  pr.command('supersede-drafts')
+    .description('확인된 병합 PR의 명시 Supersedes 같은 칸 draft만 정리')
+    .requiredOption('--pr <number>', '병합 PR 번호')
+    .option('--cwd <path>', '저장소 경로')
+    .action(async (opts: { pr: string; cwd?: string }) => {
+      const number = Number(opts.pr);
+      if (!Number.isSafeInteger(number) || number < 1) { prToolOut.error('✗ supersede-drafts: 올바른 --pr 번호 필요'); prToolExit(1); return; }
+      try { await supersedeMerged(number, opts.cwd ?? process.cwd()); }
+      catch (error) { prToolOut.error(`✗ supersede-drafts: ${String(error)}`); prToolExit(1); }
+    });
   pr.command('census')
     .description('열린 PR 전체·골 문서만·2일 무커밋 draft·미닫힌 superseded 집계')
     .option('--cwd <path>', '저장소 경로')
@@ -2532,7 +2596,7 @@ export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queu
         const { registerStandaloneLogSink } = await import('../domains/standalone-log-sink.js');
         await registerStandaloneLogSink('pr-land');
       } catch { /* fail-open */ }
-      const code = await runPrLand(opts, deps);
+      const code = await runPrLand(opts, { ...deps, onMergedSupersede: supersedeMerged });
       if (code !== 0) (deps.setExitCode ?? ((exitCode: number) => { process.exitCode = exitCode; }))(code);
     });
   pr.command('granularity')

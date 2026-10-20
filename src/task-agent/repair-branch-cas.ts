@@ -24,7 +24,8 @@ export interface RepairCasRequest {
   result: RepairCommitResult;
   /** A previous push succeeded. Confirmation may inspect the remote and PR, but must never push again. */
   confirmationOnly?: boolean;
-  branch?: string;
+  /** PR branch captured when this repair was requested. A rename cannot retarget its push. */
+  branch: string;
   /** Persist a single-use push intent after bundle/ancestry checks and before the push side effect. */
   claimBeforePush?: () => boolean;
 }
@@ -99,6 +100,8 @@ export function applyRepairBundle(request: RepairCasRequest, deps: RepairCasDeps
   try { bytes = readFileSync(bundlePath); } catch { return fail('repair bundle unreadable'); }
   if (createHash('sha256').update(bytes).digest('hex') !== result.bundleSha256.toLowerCase()) return fail('repair bundle sha256 mismatch');
   if (!initial || !originRepo || initial.headRepo.toLowerCase() !== originRepo) return fail('PR head repository differs from git origin');
+  if (!request.branch || git(['check-ref-format', '--branch', request.branch]).status !== 0) return fail('bound repair branch name invalid');
+  if (initial.branch !== request.branch) return fail('bound repair branch changed');
   const alreadyApplied = initial?.head.toLowerCase() === result.commit.toLowerCase();
   if (!initial || initial.state !== 'OPEN' || initial.crossRepository || (!alreadyApplied && initial.head.toLowerCase() !== expectedHead.toLowerCase()))
     return fail('PR head CAS mismatch or PR unavailable');

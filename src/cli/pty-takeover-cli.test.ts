@@ -12,6 +12,7 @@ import { PTY_MANIFEST_CLOSED_TTL_MS, reapDeadPtyManifestAt, setPtyManifestDbPath
 import { enqueueControlMemo } from '../harness/control-inbox.js';
 import type { PtyEventRow } from '../pty-shell/pty-event-log.js';
 import type { PtyControlResult } from '../pty-shell/pty-control-ipc.js';
+import { createExternalInputQueue, EXTERNAL_INPUT_QUEUE_LIMIT } from '../input/external-input-queue.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -892,6 +893,77 @@ describe('runPtyLineage', () => {
         if (value === undefined) delete process.env[key]; else process.env[key] = value;
       }
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PTY text rejection reason visibility', () => {
+  test('shows real external-input queue refusals through handle.write and the CLI result', async () => {
+    const queue = createExternalInputQueue({ schedule: () => () => {}, log: () => {}, logInput: () => {} });
+    const unregister = queue.register({
+      isTurnActive: () => true,
+      composerText: () => '',
+      hasPendingKeys: () => false,
+      submit: () => false,
+    });
+    const id = 'pty-real-external-queue';
+    const handle = {
+      id,
+      accessMode: 'write',
+      transitionPolicy: 'open',
+      canWrite: () => true,
+      write: (chars: string) => { queue.route(chars); },
+      resize: () => {},
+      isAlive: () => true,
+      setAccessMode: () => true,
+    };
+    const deps = {
+      ...lineageDeps([], []),
+      getPty: () => handle as never,
+      runIdentity: () => ({ requester: '', target: '' }),
+    };
+    try {
+      expect(await runPtyText(id, 'external text', false, deps)).toEqual({
+        exitCode: 1,
+        message: `pty input-text: failed for ${id} (tui-busy-text-without-enter)`,
+      });
+      for (let index = 0; index < EXTERNAL_INPUT_QUEUE_LIMIT; index++) {
+        expect(queue.route(`queued ${index}\r`)).toBe('queued');
+      }
+      expect(await runPtyText(id, 'external text', true, deps)).toEqual({
+        exitCode: 1,
+        message: `pty input-text: failed for ${id} (tui-external-input-queue-full)`,
+      });
+    } finally {
+      unregister();
+    }
+  });
+
+  test('shows external-input refusal reasons in local and owner-IPC CLI results with non-zero exit', async () => {
+    for (const reason of ['tui-busy-text-without-enter', 'tui-external-input-queue-full'] as const) {
+      const id = `pty-rejected-${reason}`;
+      const handle = {
+        id,
+        accessMode: 'write',
+        transitionPolicy: 'open',
+        canWrite: () => true,
+        write: () => { throw new Error(reason); },
+        resize: () => {},
+        isAlive: () => true,
+        setAccessMode: () => true,
+      };
+      const local = await runPtyText(id, 'external text', false, {
+        ...lineageDeps([], []),
+        getPty: () => handle as never,
+        runIdentity: () => ({ requester: '', target: '' }),
+      });
+      expect(local).toEqual({ exitCode: 1, message: `pty input-text: failed for ${id} (${reason})` });
+
+      const remote = await runPtyText(id, 'external text', false, {
+        ...lineageDeps([], []),
+        requestRemote: async () => ({ status: 'write-failed', reason }),
+      });
+      expect(remote).toEqual({ exitCode: 1, message: `pty input-text: failed for ${id} (${reason})` });
     }
   });
 });

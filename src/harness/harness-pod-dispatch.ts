@@ -58,11 +58,41 @@ export interface HarnessPodDispatchInput {
   readonly authorGradeSource?: import('../self-implement/goal-author.js').GoalAuthorGradeSource;
 }
 
+/** The mbp fleet alias must select the installed local k3d context, with a deliberately small first capacity. */
+export function resolveHarnessPodPool(spec: string | undefined): string | undefined {
+  if (!spec) return spec;
+  let changed = false;
+  let mbpCapacity = 0;
+  let mbpMembers = 0;
+  const members = spec.split(',').map((raw) => {
+    const part = raw.trim();
+    const alias = /^pool-mbp@mbp:(\d+)$/.exec(part);
+    const local = /^k3d-monad-h1:(\d+)$/.exec(part);
+    if (!alias && !local) {
+      if (/^pool-mbp@mbp(?::|$)/.test(part) || /^k3d-monad-h1(?::|$)/.test(part)) {
+        throw new Error(`mbp Pod 풀 스펙 오류: ${part}`);
+      }
+      return part;
+    }
+    const capacity = Number((alias ?? local)![1]);
+    if (!Number.isInteger(capacity) || capacity < 1 || capacity > 2) {
+      throw new Error(`mbp Pod 풀 상한은 1~2: ${part}`);
+    }
+    mbpCapacity += capacity;
+    mbpMembers++;
+    if (mbpCapacity > 2) throw new Error(`mbp Pod 풀 합산 상한은 2: ${spec}`);
+    if (mbpMembers > 1) throw new Error(`mbp Pod 풀 컨텍스트 중복: ${spec}`);
+    if (alias) changed = true;
+    return `k3d-monad-h1:${capacity}`;
+  });
+  return changed ? members.join(',') : spec;
+}
+
 export function podOrchestrateArgs(input: HarnessPodDispatchInput, goalFile: string): string[] {
   return [
     ELANOUS_ENTRY_SCRIPT, 'self', 'orchestrate', '--goal-file', goalFile,
     '--substrate', 'pod',
-    ...(input.podPool ? ['--pod-pool', input.podPool] : []),
+    ...(input.podPool ? ['--pod-pool', resolveHarnessPodPool(input.podPool)!] : []),
     // 하니스 기본(자동 병합)을 따른다 · 끄면 PR 까지 — 어느 쪽이든 Pod 가 사라져도 결과가 남는다.
     ...(input.repairCommitOnly ? [] : input.autoMerge === false ? ['--open-pr'] : ['--auto-merge']),
     ...(input.repairCommitOnly && input.source ? ['--base', `pr-${input.source.slice(3)}`] : input.base ? ['--base', input.base] : []),
@@ -99,6 +129,13 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
 export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps?: PodDispatchDeps): number | Promise<number>;
 export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDispatchDeps = {}): number | Promise<number> {
   const cwd = deps.cwd ?? process.cwd();
+  try { resolveHarnessPodPool(input.podPool); }
+  catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    debug.log('harness.substrate', 'pod-pool-refused', { entrance: input.entrance, reason });
+    console.error(reason);
+    return 2;
+  }
   if (input.source !== undefined) {
     try {
       parsePodSourceSpec(input.source);

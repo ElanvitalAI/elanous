@@ -9,10 +9,13 @@ import { debug } from './debug/log.js';
 import { runDashboardPlainTurnStream, type DashboardPlainTurnAcpSend } from './dashboard/input/dashboard-plain-turn-stream.js';
 import { createTurnStreamFormatter } from './dashboard/turn-stream-formatter.js';
 import { setUserConfigOverlay } from './user-config.js';
+import { testFakeLlmProvider } from './ux-sim/fake-llm.js';
+import { OverloadFailoverError } from './session-runtime/retry-api.js';
 import {
   _explainAndLogFallbackCandidatesForTest,
   _setStreamDisconnectRetryDelayForTest,
   PROVIDERS,
+  streamLLM,
   streamLLMWithTools,
   type LLMMessage,
   type LLMProvider,
@@ -268,6 +271,79 @@ describe('retry budget is per provider', () => {
     }
     if (tmpHome) rmSync(tmpHome, { recursive: true, force: true });
     tmpHome = null;
+  });
+
+  it('a simulated codex 503 continues on the configured zai step through the fake LLM', async () => {
+    let codexCalls = 0;
+    PROVIDERS['openai-codex'] = {
+      name: 'openai-codex', defaultModel: 'gpt-6-sol', available: () => true,
+      async *streamChat() {
+        codexCalls++;
+        throw new OverloadFailoverError({ provider: 'codex', status: 503, kind: 'overloaded',
+          streak: 3, cause: new Error('server_is_overloaded') });
+      },
+      async *chat() {},
+    };
+    PROVIDERS.glm = { ...testFakeLlmProvider, name: 'glm', defaultModel: 'glm-5.3', available: () => true };
+    setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm,
+      provider: 'openai-codex', fallbackChain: ['codex-rotate', 'zai'] } }));
+
+    const answer = await streamLLM(
+      [{ role: 'user', content: 'go' }],
+      () => {},
+      { initialProvider: PROVIDERS['openai-codex'] },
+    );
+    expect(answer).toBe('[test-fake-llm] OK');
+    expect(codexCalls).toBe(1);
+    expect(logs).toContainEqual(expect.objectContaining({ category: 'llm.router', event: 'overload-failover',
+      data: expect.objectContaining({ blockedProvider: 'openai-codex', fallbackProvider: 'glm', status: 503 }) }));
+  });
+
+  it('text stream skips a candidate that loses availability before the Codex overload switch', async () => {
+    let grokChecks = 0;
+    PROVIDERS.grok = { ...testFakeLlmProvider, name: 'grok', available: () => ++grokChecks <= 2 };
+    PROVIDERS.glm = { ...testFakeLlmProvider, name: 'glm', defaultModel: 'glm-5.3', available: () => true };
+    setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm,
+      fallbackChain: ['codex-rotate', 'grok', 'zai'] } }));
+    const codex: LLMProvider = {
+      name: 'openai-codex', defaultModel: 'gpt-6-sol', available: () => true,
+      async *chat() {},
+      async *streamChat() {
+        throw new OverloadFailoverError({ provider: 'codex', status: 503, kind: 'overloaded',
+          streak: 3, cause: new Error('server_is_overloaded') });
+      },
+    };
+    const answer = await streamLLM([{ role: 'user', content: 'go' }], () => {}, { initialProvider: codex });
+    expect(answer).toBe('[test-fake-llm] OK');
+    expect(grokChecks).toBeGreaterThanOrEqual(3);
+    expect(logs).toContainEqual(expect.objectContaining({ category: 'llm.router', event: 'overload-failover',
+      data: expect.objectContaining({ fallbackProvider: 'glm' }) }));
+  });
+
+  it('tool stream skips a candidate that loses availability after a real fake HTTP 503 retry', async () => {
+    let grokChecks = 0;
+    let codexFetches = 0;
+    const originalFetch = globalThis.fetch;
+    PROVIDERS.grok = { ...testFakeLlmProvider, name: 'grok', available: () => ++grokChecks <= 2 };
+    PROVIDERS.glm = { ...testFakeLlmProvider, name: 'glm', defaultModel: 'glm-5.3', available: () => true };
+    setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm,
+      provider: 'openai-codex', model: 'gpt-6-sol', apiKey: 'fake-codex-test-only',
+      fallbackChain: ['codex-rotate', 'grok', 'zai'] } }));
+    globalThis.fetch = Object.assign(async () => {
+      codexFetches++;
+      return new Response('{"error":{"message":"server_is_overloaded"}}', { status: 503 });
+    }, { preconnect: originalFetch.preconnect });
+    try {
+      const answer = await streamLLMWithTools([{ role: 'user', content: 'go' }],
+        { onText: () => {}, dispatchTool: async () => ({ ok: true }) },
+        { tools: [{ name: 'probe', description: 'probe', parameters: {} }], maxTurns: 1 });
+      expect(answer).toBe('[test-fake-llm] OK');
+      expect(codexFetches).toBeGreaterThanOrEqual(2);
+      expect(logs.filter((l) => l.category === 'llm.retry' && l.data.status === 503).length).toBeGreaterThanOrEqual(2);
+      expect(grokChecks).toBeGreaterThanOrEqual(3);
+      expect(logs).toContainEqual(expect.objectContaining({ category: 'llm.router', event: 'overload-failover',
+        data: expect.objectContaining({ fallbackProvider: 'glm' }) }));
+    } finally { globalThis.fetch = originalFetch; }
   });
 
   it('falls back only after the first provider spends its retries, then gives the next provider a fresh budget', async () => {

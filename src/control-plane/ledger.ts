@@ -23,6 +23,7 @@ export interface PodWorkerKey { context: string; imageDigest: string; lockHash: 
 type PodWorkerState = 'idle' | 'leased' | 'sanitizing' | 'quarantined';
 interface PodWorkerLeaseAttrs {
   key: PodWorkerKey;
+  podUid: string;
   state: PodWorkerState;
   generation: number;
   idleTtlMs: number;
@@ -203,20 +204,20 @@ export class ResourceLedger {
   }
 
   /** A trusted host registers a clean instance; canary verification is a separate, still unwired step. */
-  registerPodWorker(request: { workerId: string; machine: string; key: PodWorkerKey; owner: string; ttlMs: number }, now?: number): ResourceRecord {
+  registerPodWorker(request: { workerId: string; machine: string; podUid: string; key: PodWorkerKey; owner: string; ttlMs: number }, now?: number): ResourceRecord {
     return this.mutate(() => {
+    if (typeof request.podUid !== 'string' || !request.podUid.trim()) throw new ResourceLedgerError(400, 'invalid-pod-worker-uid');
     now ??= Date.now();
     const rows = this.read();
     const id = `pod-worker-lease:${request.workerId}`;
     const index = rows.findIndex(row => row.id === id);
     const previous = index < 0 ? undefined : rows[index]!;
     if (previous && previous.kind !== 'pod-worker-lease') throw new ResourceLedgerError(409, 'worker-id-conflict');
-    if (previous && previous.owner !== request.owner) throw new ResourceLedgerError(403, 'not-owner');
     // A workerId identifies one Pod instance. Expiry never proves that a leased or quarantined Pod was cleaned.
     if (previous) throw new ResourceLedgerError(409, 'worker-id-used');
     const generation = 0;
     const row: ResourceRecord = { id, kind: 'pod-worker-lease', machine: request.machine, name: request.workerId,
-      owner: request.owner, attrs: { key: request.key, state: 'idle', generation, idleTtlMs: request.ttlMs }, observedAt: now, ttlMs: request.ttlMs };
+      owner: request.owner, attrs: { key: request.key, podUid: request.podUid, state: 'idle', generation, idleTtlMs: request.ttlMs }, observedAt: now, ttlMs: request.ttlMs };
     if (index < 0) rows.push(row); else rows[index] = row;
     this.write(rows);
     return row;
@@ -229,6 +230,7 @@ export class ResourceLedger {
     const rows = this.read();
     const index = rows.findIndex(row => row.kind === 'pod-worker-lease' && (!request.machine || row.machine === request.machine)
       && Math.max(0, at - row.observedAt) < row.ttlMs && workerAttrs(row).state === 'idle'
+      && typeof workerAttrs(row).podUid === 'string' && workerAttrs(row).podUid.trim().length > 0
       && sameWorkerKey(workerAttrs(row).key, request.key));
     if (index < 0) throw new ResourceLedgerError(409, 'no-warm-worker');
     const row = rows[index]!;

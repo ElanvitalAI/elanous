@@ -115,13 +115,20 @@ export function RunGraphView({ palette: sharedPalette, initialGraphId, onNewGrap
     enabled: selected !== null,
   });
   const editable = summary?.editable === true && summary.source === 'mine' && detail.data?.id === selected && detail.data.source === 'mine' && detail.data.editable === true;
+  const flat = useQuery({
+    queryKey: ['run-graph-flat', editable ? null : selected],
+    queryFn: () => client.getRunGraphFlat!(selected!),
+    enabled: !editable && selected !== null && typeof client.getRunGraphFlat === 'function',
+  });
+  const flatSupported = typeof client.getRunGraphFlat === 'function';
   const raw = useQuery({
     queryKey: ['run-graph-yaml', editable ? selected : null],
     queryFn: () => client.getRunGraphYaml(selected!),
     enabled: editable && selected !== null,
   });
   const currentYaml = !editable ? null : draftId === selected ? yaml : raw.data?.id === selected && raw.data.source === 'mine' && raw.data.editable ? raw.data.yaml : null;
-  const flow = useMemo(() => detail.data && detail.data.id === selected ? runGraphToFlow(detail.data) : null, [detail.data, selected]);
+  const displayGraph = editable ? detail.data : flatSupported && flat.data?.id === selected ? flat.data : undefined;
+  const flow = useMemo(() => displayGraph && displayGraph.id === selected ? runGraphToFlow(displayGraph) : null, [displayGraph, selected]);
   const nodes = useMemo(() => flow?.nodes.map((node) => ({ ...node, type: 'run' })) ?? [], [flow]);
   const draftGraph = useMemo(() => currentYaml === null ? null : readRunGraphYaml(currentYaml), [currentYaml]);
   const formNodeId = draftGraph?.toJS()?.nodes?.some((node: { node_id?: string }) => node.node_id === nodeId) ? nodeId : null;
@@ -302,6 +309,9 @@ export function RunGraphView({ palette: sharedPalette, initialGraphId, onNewGrap
         {clone.isError && <p role="alert" className="px-3 py-1 text-xs text-error">{errorText(clone.error)}</p>}
         {detail.isError && <p role="alert" className="p-4 text-xs text-error">그래프를 불러오지 못했습니다.</p>}
         {detail.isLoading && <p className="p-4 text-xs text-text-tertiary">불러오는 중…</p>}
+        {!editable && selected !== null && !flatSupported && <p role="alert" className="p-4 text-xs text-error">정적 그래프 화면을 사용할 수 없습니다.</p>}
+        {!editable && flat.isLoading && <p role="status" className="p-4 text-xs text-text-tertiary">정적 그래프를 불러오는 중…</p>}
+        {!editable && flat.isError && <p role="alert" className="p-4 text-xs text-error">정적 그래프를 불러오지 못했습니다.</p>}
         {flow && (
           <ReactFlow key={selected ?? ''} nodes={nodes}
             onNodeClick={editable ? (_event, selectedNode) => setNodeId(selectedNode.id) : undefined}

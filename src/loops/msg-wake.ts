@@ -309,7 +309,7 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
 
 interface PendingWakeRow { address: string; first_msg_id: number; last_msg_id: number; last_from: string; count: number; since: number; attempts: number; reason: string }
 
-export type PendingWakeEvent = 'deferred' | 'redelivered' | 'gave-up' | 'dropped-read';
+export type PendingWakeEvent = 'deferred' | 'redelivered' | 'gave-up' | 'dropped-read' | 'skip';
 
 function logPending(event: PendingWakeEvent, data: Record<string, unknown>): void {
   try { debug.log('loops.msg-wake', event, data); } catch { /* observability is fail-open */ }
@@ -389,8 +389,14 @@ export function redeliverLine(row: Pick<PendingWakeRow, 'address' | 'last_from' 
  * Re-knock deferred wakes whose TUI is now recorded idle. `target` limits the sweep to one pty (the TUI's own poller).
  * Never throws per row; a row stays pending while the TUI is busy or the 5-minute window is held.
  */
+// not-live 우주의 재점검은 침묵 대신 이유 한 줄을 남긴다 — 폴러가 15초마다 틱하므로 프로세스당 처음 한 번만(래치).
+let notLiveSkipLogged = false;
+
 export async function redeliverPendingWakes(deps: WakeDeps = {}, opts: { target?: string } = {}): Promise<RedeliverOutcome[]> {
-  if (!isLive(deps)) return [];
+  if (!isLive(deps)) {
+    if (!notLiveSkipLogged) { notLiveSkipLogged = true; logPending('skip', { reason: 'not-live' }); }
+    return [];
+  }
   const db = claimDbPath(deps);
   if (!existsSync(db)) return [];
   const conn = openWakeDb(db);

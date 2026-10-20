@@ -36,7 +36,7 @@ interface OverlapEvidenceFile {
   gate?: { head: string; baseCommit: string; passed: boolean };
   /** `self review --json` stdout 을 받은 파일(TA: `<state>/review-results/<card>-<pr>-<head접두 10~40>.json`); 내용의 전체 head도 확인한다. */
   reviewResult: string;
-  /** Explicitly replaced failed reviews. Each reason is the verifier's original refusal reason. */
+  /** Evidence-file override for explicitly replaced failed reviews. Each reason is the verifier's refusal reason. */
   supersedes?: { reviewResult: string; reason: string }[];
   /** OPEN follow-up PR that owns the findings intentionally split from this landing. */
   followupPr?: number;
@@ -47,6 +47,11 @@ export type OverlapEvidenceVerdict =
   | { ok: true; mode: 'rebased'; baseTip: string; reviewResult: string }
   | { ok: true; mode: 'base-advanced-disjoint'; baseTip: string; gateBase: string; windowCommits: number; reviewResult: string }
   | { ok: false; reason: string; baseTip?: string };
+
+/** Resolve CLI-supplied evidence against the selected repository, not the caller's shell cwd. */
+export function resolveOverlapEvidencePath(evidencePath: string, cwd: string): string {
+  return resolve(cwd, evidencePath);
+}
 
 export interface VerifyOverlapEvidenceInput {
   evidencePath: string;
@@ -99,8 +104,12 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
   const entries = e.supersedes;
   if (entries !== undefined && (!Array.isArray(entries) || entries.length === 0)) return { ok: false, reason: 'review-supersedes-invalid' };
   const superseded = new Map<string, string>();
+  const resolvedPriorAccepted: string[] = [];
   let selectedTime: number | undefined;
-  if (entries?.length) {
+  let selectedRecord: Record<string, unknown> | undefined;
+  try { selectedRecord = lastReviewRecord(input.readFile(selected)); } catch { return { ok: false, reason: 'review-unreadable' }; }
+  const hasResolvedPrior = hasResolvedPriorDeclaration(selectedRecord);
+  if (entries?.length || hasResolvedPrior) {
     try { selectedTime = input.reviewMtime(selected); } catch { return { ok: false, reason: 'review-attempt-time-unmeasured' }; }
     if (!Number.isFinite(selectedTime)) return { ok: false, reason: 'review-attempt-time-unmeasured' };
   }
@@ -123,9 +132,22 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
       if (superseded.has(path)) return { ok: false, reason: 'review-supersedes-passing' };
       continue;
     }
-    if (superseded.get(path) !== review.reason) return { ok: false, reason: `review-attempt-not-superseded: ${basename(path)} (${review.reason})` };
-    if (!/^review-(verdict-fail|must-fix-[1-9][0-9]*)$/.test(review.reason)) {
-      return { ok: false, reason: `review-supersedes-not-failed: ${basename(path)} (${review.reason})` };
+    if (superseded.has(path)) {
+      if (superseded.get(path) !== review.reason) return { ok: false, reason: `review-attempt-not-superseded: ${basename(path)} (${review.reason})` };
+      if (!/^review-(verdict-fail|must-fix-[1-9][0-9]*)$/.test(review.reason)) {
+        return { ok: false, reason: `review-supersedes-not-failed: ${basename(path)} (${review.reason})` };
+      }
+      continue;
+    }
+    if (!/^review-(verdict-fail|must-fix-[1-9][0-9]*)$/.test(review.reason)
+      || !selectedRecord || !reviewAttemptExplicitlyResolved(input, selectedRecord, path, head)) {
+      return { ok: false, reason: `review-attempt-not-superseded: ${basename(path)} (${review.reason})` };
+    }
+    resolvedPriorAccepted.push(path);
+    let failedTime: number;
+    try { failedTime = input.reviewMtime(path); } catch { return { ok: false, reason: 'review-attempt-time-unmeasured' }; }
+    if (!Number.isFinite(failedTime) || selectedTime === undefined || failedTime >= selectedTime) {
+      return { ok: false, reason: 'review-selected-not-later-than-failure' };
     }
   }
   if (entries?.length) {
@@ -145,9 +167,135 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
     head,
     selected,
     superseded: [...superseded.entries()].map(([reviewResult, reason]) => ({ reviewResult, reason })),
+    resolvedPriorAccepted,
     followupPr: e.followupPr ?? null,
   });
   return { ok: true };
+}
+
+function lastReviewRecord(text: string): Record<string, unknown> | undefined {
+  const lines = text.split('\n').reverse();
+  for (const line of lines) {
+    if (!line.trim().startsWith('{')) continue;
+    let value: unknown;
+    try { value = JSON.parse(line); } catch { continue; }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const result = value as Record<string, unknown>;
+    if (result.pr !== undefined && (('verdict' in result && Array.isArray(result.mustFix)) || typeof result.error === 'string')) return result;
+  }
+  return undefined;
+}
+
+function hasResolvedPriorDeclaration(review: Record<string, unknown> | undefined): boolean {
+  if (!review) return false;
+  const value = review.resolvedPrior;
+  if (Array.isArray(value) && value.length > 0) return true;
+  if (value && typeof value === 'object' && Object.keys(value).length > 0) return true;
+  return [review.intent, review.intentBlock, review.reviewIntent, review.reviewIntentBlock]
+    .some((intent) => typeof intent === 'string' && /resolved prior|prior review findings resolved/i.test(intent));
+}
+
+function normalizedFinding(value: string): string {
+  return value.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function containsUnresolvedClaim(value: string): boolean {
+  return /\b(?:unresolved|not(?:\s+yet)?[\s-]+resolved|not(?:\s+yet)?[\s-]+fixed|not(?:\s+yet)?[\s-]+addressed|still[\s-]+open|remains?[\s-]+open|still[\s-]+present|status\s*[:=]\s*(?:open|unresolved|pending|in[- ]progress))\b/i.test(value);
+}
+
+function containsUnresolvedDeclaration(value: unknown): boolean {
+  if (typeof value === 'string') return containsUnresolvedClaim(value);
+  if (Array.isArray(value)) return value.some(containsUnresolvedDeclaration);
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  if (record.resolved === false || (typeof record.status === 'string' && /^(?:open|unresolved|pending|in[- ]progress)$/i.test(record.status))) return true;
+  return Object.values(record).some(containsUnresolvedDeclaration);
+}
+
+function referencesReview(value: unknown, path: string): boolean {
+  return typeof value === 'string' && (value === path || value === basename(path));
+}
+
+function findingList(value: unknown): string[] {
+  const values = Array.isArray(value) ? value : typeof value === 'string' ? [value] : [];
+  return values.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0);
+}
+
+/** A later same-head pass/mf0 review may resolve prior attempts only when it names every finding explicitly. */
+function reviewAttemptExplicitlyResolved(input: VerifyOverlapEvidenceInput, selected: Record<string, unknown>, failedPath: string, head: string): boolean {
+  let failed: Record<string, unknown> | undefined;
+  try { failed = lastReviewRecord(input.readFile(failedPath)); } catch { return false; }
+  if (!failed || failed.pr === undefined || String(failed.pr) !== String(input.pr)
+    || (typeof failed.headCommit === 'string' && failed.headCommit.toLowerCase() !== head)
+    || (typeof failed.currentHeadCommit === 'string' && failed.currentHeadCommit.toLowerCase() !== head)) return false;
+  const rawFindings = findingList(failed.mustFix).map((finding) => finding.trim());
+  const findings = rawFindings.map(normalizedFinding);
+  if (findings.length === 0) return false;
+
+  const declared = selected.resolvedPrior;
+  if (declared !== undefined && containsUnresolvedDeclaration(declared)) return false;
+  const intentBlocks = [selected.intent, selected.intentBlock, selected.reviewIntent, selected.reviewIntentBlock]
+    .filter((value): value is string => typeof value === 'string');
+  // A resolution in one field cannot override an OPEN/PENDING declaration in another.
+  if (intentBlocks.some(containsUnresolvedClaim)) return false;
+
+  let resolved: string[] = [];
+  if (Array.isArray(declared)) {
+    for (const entry of declared) {
+      if (typeof entry === 'string') {
+        if (containsUnresolvedClaim(entry)) continue;
+        // A string can be an exact finding axis or an explicit "filename: finding" row.
+        const line = entry.trim();
+        if (rawFindings.includes(line)) resolved.push(line);
+        const prefix = `${basename(failedPath)}: `;
+        if (line.startsWith(prefix)) {
+          const declaredFinding = line.slice(prefix.length).trim();
+          const index = rawFindings.indexOf(declaredFinding);
+          if (index >= 0) resolved.push(findings[index]!);
+        }
+        continue;
+      }
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      const item = entry as Record<string, unknown>;
+      const ref = item.reviewResult ?? item.review ?? item.path;
+      if (ref !== undefined && !referencesReview(ref, failedPath)) continue;
+      if (item.head !== undefined && (typeof item.head !== 'string' || item.head.toLowerCase() !== head)) continue;
+      if (item.headCommit !== undefined && (typeof item.headCommit !== 'string' || item.headCommit.toLowerCase() !== head)) continue;
+      if (item.resolved === false || item.status === 'unresolved'
+        || Object.values(item).some((value) => typeof value === 'string' && containsUnresolvedClaim(value))) continue;
+      const listed = findingList(item.mustFix ?? item.resolvedMustFix ?? item.findings ?? item.axes ?? item.finding ?? item.axis);
+      if (listed.some(containsUnresolvedClaim)) continue;
+      if (ref === undefined && listed.every((finding) => rawFindings.includes(finding.trim()))) {
+        resolved.push(...listed.filter((finding) => rawFindings.includes(finding.trim())));
+      } else if (ref !== undefined) {
+        resolved.push(...listed.filter((finding) => rawFindings.includes(finding.trim())));
+      }
+    }
+  } else if (declared && typeof declared === 'object') {
+    const record = declared as Record<string, unknown>;
+    const value = record[failedPath] ?? record[basename(failedPath)];
+    resolved.push(...findingList(value).filter((finding) => !containsUnresolvedClaim(finding) && rawFindings.includes(finding.trim())));
+  }
+
+  for (const intent of intentBlocks) {
+    const lines = intent.split(/\r?\n/);
+    const header = lines.findIndex((line) => /^resolved prior review findings:\s*$/i.test(line.trim()));
+    if (header < 0) continue;
+    // Only explicit rows under the resolution header count. A finding quoted in
+    // background prose is evidence of context, not a declaration of repair.
+    const prefix = `- ${basename(failedPath)}:`;
+    for (const raw of lines.slice(header + 1)) {
+      const line = raw.trim();
+      if (!line) continue;
+      if (!line.startsWith('- ')) break;
+      if (!line.startsWith(prefix)) continue;
+      const declaredFinding = line.slice(prefix.length).trim();
+      const index = rawFindings.indexOf(declaredFinding);
+      if (index >= 0) resolved.push(findings[index]!);
+    }
+  }
+  const resolvedSet = new Set(resolved.map(normalizedFinding));
+  return findings.every((finding) => resolvedSet.has(finding));
 }
 
 type Checked = { ok: false; reason: string; baseTip?: string; gateBase?: string; windowCommits?: number }
@@ -176,17 +324,7 @@ function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'>,
   if (review.pr !== input.pr) return { ok: false, reason: 'review-pr-mismatch', baseTip };
   if (!review.head || review.head.toLowerCase() !== head) return { ok: false, reason: 'review-head-mismatch', baseTip };
   // The capture parser projects away model provenance; inspect the same last result-shaped line here.
-  let raw: Record<string, unknown> | undefined;
-  for (const line of text.split('\n').reverse()) {
-    if (!line.trim().startsWith('{')) continue;
-    let value: unknown;
-    try { value = JSON.parse(line); } catch { continue; }
-    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
-    const result = value as Record<string, unknown>;
-    if (result.pr === undefined || !(('verdict' in result && Array.isArray(result.mustFix)) || typeof result.error === 'string')) continue;
-    raw = result;
-    break;
-  }
+  const raw = lastReviewRecord(text);
   if (raw) {
     const actualBackend = typeof raw.actualBackend === 'string' ? raw.actualBackend.trim().toLowerCase() : '';
     const model = typeof raw.model === 'string' ? raw.model.trim().toLowerCase() : '';

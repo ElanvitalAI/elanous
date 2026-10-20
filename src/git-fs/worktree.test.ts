@@ -12,6 +12,7 @@ import { isTransientGitError } from './retry.js';
 import { setGitCommandRunnerForTesting } from './runner.js';
 import { debug } from '../debug/log.js';
 import { buildUserConfig, resetUserConfig } from '../user-config.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
 import { reviewScopeDiff } from '../self-implement/seams.js';
 
 function git(repo: string, ...args: string[]): void {
@@ -111,6 +112,7 @@ describe('createWorktree — add timeout and stderr diagnostics', () => {
     const previousConfigHome = process.env.XDG_CONFIG_HOME;
     process.env.XDG_CONFIG_HOME = tmp;
     mkdirSync(join(tmp, 'elanous'));
+    setElanousConfigDir(join(tmp, 'elanous'));
     writeFileSync(join(tmp, 'elanous', 'config.json'), JSON.stringify({ harness: { worktreeAddTimeoutSec: 600 } }));
     resetUserConfig();
     try {
@@ -119,6 +121,7 @@ describe('createWorktree — add timeout and stderr diagnostics', () => {
     } finally {
       if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = previousConfigHome;
+      resetElanousConfigDir();
       resetUserConfig();
     }
   });

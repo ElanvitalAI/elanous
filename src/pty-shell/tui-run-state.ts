@@ -17,9 +17,14 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { debug } from '../debug/log.js';
+import { createHerdrAgentReporter, type HerdrAgentReporterLike } from './herdr-agent-report.js';
 import { runGitCommand } from '../git-fs/runner.js';
 import { codeRevision, packageVersion, readInstallMetadataCommit } from '../version/code-revision.js';
-import { versionedDashboardInstallDir } from '../dashboard/stale-install-check.js';
+import {
+  buildStaleInstallRelaunchCommand,
+  formatStaleInstallNotice,
+  versionedDashboardInstallDir,
+} from '../dashboard/stale-install-check.js';
 import {
   updatePtyManifestBuild, updatePtyManifestTurn,
   type PtyBuildIdentity, type PtyManifestRow, type PtyTurnState,
@@ -138,6 +143,86 @@ export function judgeBuildStaleness(input: {
   return { stale: null, reason: 'unknown' };
 }
 
+// ── 매 턴 자기 건강 한 줄(TUI-SELF-HEALTH-LINE · 0.2.34) ──
+//
+// 대시보드 턴 프리앰블에 매 턴 실리는 자기 관측 한 줄: «실행 판 vs 설치본» 낡음 판정
+// (judgeBuildStaleness ⊕ readCurrentInstallRecord — 이미 있는 실물)에 «직전 30분 자기 오류»
+// ·«크레딧 사용» 재료를 얹는다. 낡은 판이면 재기동 필요를 말하되 안내 문면·재기동 명령은
+// stale-install-check 의 기존 재료(formatStaleInstallNotice · buildStaleInstallRelaunchCommand)를
+// 그대로 쓴다 — 문면을 두벌로 만들지 않는다.
+//
+// ⚠️ 미결(이 모듈이 정하지 않는다): ① 직전 30분 창에서 «어떤 이벤트를 자기 오류로 세는지» —
+//   호출자가 집계해 count·sample 로 넘긴다. ② 크레딧 사용 재료를 무엇으로 잴지 — 호출자가 만든
+//   값을 넘긴다. 두 축은 계약이 정해지는 즉시 호출부에서 주입하면 된다.
+
+export interface SelfHealthErrors {
+  /** 직전 30분 창의 자기 오류 건수. 0 = 오류 없음. */
+  readonly count: number;
+  /** 오류를 대표하는 한 줄(첫 오류 요약 등). 없으면 개수만 말한다. */
+  readonly sample?: string;
+}
+
+export interface SelfHealthLineDeps {
+  /** 기동 판 — 기본 runningBuild(기동 때 한 번 잡힌 값). */
+  readonly build?: () => PtyBuildIdentity;
+  /** 지금 current 설치본 기록 — 기본 readCurrentInstallRecord. */
+  readonly readInstalled?: () => InstalledRecord;
+  /** 체크아웃 HEAD 재독기 — 기동 판이 checkout 일 때만 불린다. 기본 readCheckoutHead. */
+  readonly readCheckoutHead?: (codeRoot: string) => string | undefined;
+  /** 재기동 명령에 얹을 대화 id — 없으면 안내 문면만. */
+  readonly sessionId?: string;
+  /** 새 판 안내 회차(formatStaleInstallNotice notifiedCount) — 기본 1. */
+  readonly notifiedCount?: number;
+  /** 크레딧 사용 재료(호출자가 만든 값) — 없으면 그 축은 생략된다. */
+  readonly creditUsage?: string;
+}
+
+/** 매 턴 자기 건강 한 줄. 판 축 재료가 깨져도 오류·크레딧 축은 살리고, 말할 것이 없으면 null —
+ *  줄이 턴을 막지 않는다(fail-soft). */
+export function buildSelfHealthLine(
+  errors: SelfHealthErrors | null | undefined,
+  deps: SelfHealthLineDeps = {},
+): string | null {
+  const segments: string[] = [];
+  try {
+    const build = (deps.build ?? runningBuild)();
+    const installed = (deps.readInstalled ?? readCurrentInstallRecord)();
+    let checkoutHead: string | undefined;
+    if (build.source === 'checkout' && build.codeRoot) {
+      checkoutHead = (deps.readCheckoutHead ?? readCheckoutHead)(build.codeRoot);
+    }
+    const staleness = judgeBuildStaleness({ build, installed, ...(checkoutHead ? { checkoutHead } : {}) });
+    segments.push(`실행 판 ${build.version}@${shortSha(build.sha)}(${build.source})`);
+    if (staleness.stale === true) {
+      const relaunch = deps.sessionId
+        ? ` · 다시 띄우기: ${buildStaleInstallRelaunchCommand(deps.sessionId)}`
+        : '';
+      if (staleness.reason === 'installed-moved' && build.sha && installed.sha) {
+        segments.push(`낡은 판 — 재기동 필요: ${formatStaleInstallNotice(
+          { state: 'changed', bootCommit: build.sha, installedCommit: installed.sha },
+          deps.notifiedCount ?? 1,
+        )}${relaunch}`);
+      } else {
+        segments.push(`낡은 판(${staleness.reason}) — 재기동 필요${relaunch}`);
+      }
+    } else if (staleness.stale === false) {
+      segments.push(`판 최신(${staleness.reason})`);
+    } else {
+      // stale=null 은 «안 낡았다»가 아니다 — 못 잼을 못 잼으로 말한다.
+      segments.push(`판 낡음 모름(${staleness.reason})`);
+    }
+  } catch {
+    // 판 축 재료가 깨져도 오류·크레딧 축은 살린다 — 관측이 턴을 막지 않는다.
+  }
+  if (errors) {
+    segments.push(errors.count > 0
+      ? `직전 30분 자기 오류 ${errors.count}건${errors.sample ? ` — 대표: ${errors.sample}` : ''}`
+      : '직전 30분 자기 오류 0건');
+  }
+  if (deps.creditUsage) segments.push(`크레딧 사용 ${deps.creditUsage}`);
+  return segments.length > 0 ? `[자기 건강] ${segments.join(' · ')}` : null;
+}
+
 // ── 판독(CLI) ──
 
 export type PtyTurnView = PtyTurnState | 'unknown';
@@ -230,6 +315,12 @@ export interface TuiRunStateRecorderDeps {
   readonly writeBuild?: (id: string, build: PtyBuildIdentity) => boolean;
   readonly writeTurn?: (id: string, turn: PtyTurnState, at: number) => boolean;
   readonly log?: (event: string, data: Record<string, unknown>) => void;
+  /**
+   * herdr pane 신고기. 생략 시: `writeTurn` 을 주입하지 않은 기본 녹음기만
+   * `createHerdrAgentReporter` 를 만든다(시험이 실 herdr 를 안 건드리게).
+   * `null` 이면 신고하지 않는다.
+   */
+  readonly herdr?: HerdrAgentReporterLike | null;
 }
 
 interface ActiveRecorder {
@@ -237,7 +328,11 @@ interface ActiveRecorder {
   readonly now: () => number;
   readonly writeTurn: (id: string, turn: PtyTurnState, at: number) => boolean;
   readonly log: (event: string, data: Record<string, unknown>) => void;
+  readonly herdr: HerdrAgentReporterLike | null;
+  /** manifest 에 실제로 적힌 마지막 턴. 실패면 안 바뀐다(재시도). */
   last?: PtyTurnState;
+  /** herdr 에 마지막으로 알린 턴. manifest 성패와 따로 둔다. */
+  herdrLast?: PtyTurnState;
 }
 
 let active: ActiveRecorder | null = null;
@@ -249,6 +344,10 @@ export function startTuiRunStateRecorder(surfaceId: string, deps: TuiRunStateRec
   const now = deps.now ?? Date.now;
   const log = deps.log ?? defaultLog;
   const writeTurn = deps.writeTurn ?? updatePtyManifestTurn;
+  // 기본 신고기는 기본 manifest 쓰기와 짝일 때만. writeTurn 주입(시험)은 herdr 를 안 만든다.
+  const herdr = deps.herdr !== undefined
+    ? deps.herdr
+    : (deps.writeTurn ? null : createHerdrAgentReporter({ sessionId: surfaceId }));
   let build: PtyBuildIdentity | undefined;
   try { build = (deps.build ?? runningBuild)(); } catch (error) {
     log('build-resolve-failed', { ptyId: surfaceId, error: error instanceof Error ? error.message : String(error) });
@@ -257,10 +356,15 @@ export function startTuiRunStateRecorder(surfaceId: string, deps: TuiRunStateRec
     const ok = (() => { try { return (deps.writeBuild ?? updatePtyManifestBuild)(surfaceId, build); } catch { return false; } })();
     log(ok ? 'build-recorded' : 'build-write-failed', { ptyId: surfaceId, sha: build.sha, version: build.version, source: build.source });
   }
-  const recorder: ActiveRecorder = { surfaceId, now, writeTurn, log };
+  // 기동 순서: 판 → manifest 초기 idle → herdr 신고. herdr start 가 idle 을 신고하므로 초기 idle 을 turn 으로 다시 안 보낸다.
+  const recorder: ActiveRecorder = { surfaceId, now, writeTurn, log, herdr, herdrLast: herdr ? 'idle' : undefined };
   active = recorder;
   writeTurnState(recorder, 'idle');
-  return () => { if (active === recorder) active = null; };
+  if (herdr) { try { herdr.start(); } catch { /* 신고 실패가 녹음기를 깨지 않는다 */ } }
+  return () => {
+    if (herdr) { try { herdr.release(); } catch { /* 종료 경로를 깨지 않는다 */ } }
+    if (active === recorder) active = null;
+  };
 }
 
 /** 대시보드가 턴 시작(busy)·끝(idle)에 부른다. 녹음기가 없으면(자기보고 꺼짐) 아무것도 안 한다. */
@@ -276,6 +380,16 @@ function writeTurnState(recorder: ActiveRecorder, turn: PtyTurnState): void {
   if (ok) recorder.last = turn;
   // 실패는 관측으로 남긴다 — 바깥 제어자는 그 사이 «unknown/낡은 값»을 본다. 성공은 남기지 않는다(턴마다 두 줄은 소음).
   else recorder.log('turn-write-failed', { ptyId: recorder.surfaceId, turn, at });
+  // herdr 는 manifest 쓰기 성패와 무관하게, 값이 바뀔 때 알린다(같은 값 재시도는 한 번만).
+  if (recorder.herdr && recorder.herdrLast !== turn) {
+    // 신고가 동기로 던지면 «보낸 상태» 로 적지 않는다 — herdr 가 아는 값(herdrLast)과 다음 전이를 비교해 다시 보낸다(r4 리뷰 sf).
+    try {
+      recorder.herdr.turn(turn);
+      recorder.herdrLast = turn;
+    } catch (error) {
+      recorder.log('herdr-turn-threw', { turn, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
 }
 
 export function resetTuiRunStateForTesting(): void {

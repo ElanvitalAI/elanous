@@ -168,7 +168,7 @@ describe('AcpAgent.prompt · _meta forwarding', () => {
       () => {},
     );
     expect(captured).toHaveLength(1);
-    expect(captured[0]!._meta).toBeUndefined();
+    expect(captured[0]!).not.toHaveProperty('_meta');
     expect(captured[0]!.prompt).toEqual([{ type: 'text', text: 'hi' }]);
 
     const grokFake = {
@@ -180,12 +180,18 @@ describe('AcpAgent.prompt · _meta forwarding', () => {
       },
       pendingBySession: new Map(),
     };
+    // The actionable hint intentionally follows host capability: graphical
+    // hosts receive OAuth, while headless Linux/WSL receives device auth.
+    // Keep this fake-connection check independent of process-global env state.
+    const supportedGrokLoginHint = /grok login --(?:oauth|device-auth)`/;
     await expect(AcpAgent.prototype.prompt.call(
       grokFake as any,
       'sess-grok' as any,
       [{ type: 'text', text: 'hi' }] as any,
       () => {},
-    )).rejects.toThrow(/grok login --oauth/);
+    )).rejects.toThrow(supportedGrokLoginHint);
+    expect('grok login --oauth=invalid').not.toMatch(supportedGrokLoginHint);
+    expect('grok login --oauth --other').not.toMatch(supportedGrokLoginHint);
   });
 
   test('meta supplied → request carries _meta blob verbatim', async () => {

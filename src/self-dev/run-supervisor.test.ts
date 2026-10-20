@@ -1767,6 +1767,136 @@ describe('REVIEW-MUSTFIX-CLASSIFY — 슈퍼바이저는 추이 대신 회차 �
     expect(d.stopReason).toBe('review-oscillating');
   });
 
+  // 범위 축 — 10-17 사례 재구성. 조각 결과에 PR 변경 파일 ⊕ 리뷰 라운드가 실린다.
+  const scoped = (id: string, mustFix: string[], extra: Record<string, unknown> = {}) => ({
+    ...(oscillatingFailed(id, mustFix) as object),
+    prNumber: 28819,
+    changedFiles: ['src/harness/detach.ts', 'src/harness/fake-llm.ts'],
+    ...extra,
+  }) as never;
+
+  test('범위 축 (나) split — 전부 split 이면 같은 런 재수리 0 · 결정에 «중간 착지 ⊕ 연결 골» 제안 · 관측 한 줄', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const d = decideNextRun({
+        results: [scoped('osc', ['detached descendant 검출이 없다 — src/pty/process-tree.ts 와 #28751 이 먼저'])],
+        history: [{ round: 0, landed: 0, actionable: 1 }], repairGoalExecution: true,
+      });
+      expect(d.action).toBe('stop');
+      expect(d.oscillation?.repairGoals ?? {}).toEqual({});
+      expect(d.mustFixScope?.byTask.osc?.[0]).toMatchObject({ scope: 'split' });
+      const split = d.mustFixScope?.split?.[0];
+      expect(split).toMatchObject({ taskId: 'osc', action: '중간 착지 ⊕ 연결 골' });
+      expect(split?.proposals[0]?.intentScopeBoundary).toContain('미완이 아니라 이 PR 의 결정');
+      expect(split?.proposals[0]?.linkGoal.targetPaths).toEqual(['src/pty/process-tree.ts']);
+      expect(split?.proposals[0]?.linkGoal.verdictLine).toContain('bun test src/pty/process-tree.test.ts');
+      expect(d.why).toContain('연결 골');
+      const scopeLogs = log.mock.calls.filter((call) => call[0] === 'self-dev.supervisor' && call[1] === 'mustfix-scope');
+      expect(scopeLogs).toHaveLength(1);
+      expect(scopeLogs[0]![2]).toMatchObject({ taskId: 'osc', class: 'new-defect', scope: 'split', action: 'split-link-goal' });
+      expect((scopeLogs[0]![2] as { signals: string[] }).signals).toEqual(expect.arrayContaining(['path-outside', 'other-pr']));
+    } finally { log.mockRestore(); }
+  });
+
+  test('범위 축 혼합 — (가) 줄만 수리 골에 남고 (나) 줄은 빠져 연결 골 제안으로 간다(#28819 · #28827 재구성)', () => {
+    const d = decideNextRun({
+      results: [scoped('osc', [
+        'detach.ts: Windows 정상 종료를 실패로 처리한다',
+        'fake LLM env 계약이 src/harness/fake-llm.ts 에서 깨진다',
+        'detached descendant 검출 — src/pty/process-tree.ts 가 먼저',
+      ])],
+      history: [{ round: 0, landed: 0, actionable: 1 }], repairGoalExecution: true,
+    });
+    expect(d.action).toBe('add-repair-task');
+    const goal = d.oscillation?.repairGoals?.osc ?? '';
+    expect(goal).toContain('Windows 정상 종료');
+    expect(goal).toContain('fake LLM env 계약');
+    expect(goal).not.toContain('detached descendant');
+    expect(d.mustFixScope?.byTask.osc?.map((j) => j.scope)).toEqual(['in-scope', 'in-scope', 'split']);
+    expect(d.mustFixScope?.split?.[0]?.proposals).toHaveLength(1);
+  });
+
+  test('범위 축 — r≥3 에 앞 라운드에 없던 축(«child runId attestation»)은 split', () => {
+    const history: SupervisorRound[] = [{ round: 0, landed: 0, actionable: 1,
+      mustFix: { items: [{ text: 'fake LLM env 계약이 src/harness/fake-llm.ts 에서 깨진다', taskId: 'osc' }] } }];
+    const d = decideNextRun({
+      results: [scoped('osc', ['Child runId attestation is missing for spawned workers'], {
+        prNumber: 28827, rework: { trend: 'oscillating', signature: 'sig-osc', rounds: 4 } })],
+      history, repairGoalExecution: true,
+    });
+    expect(d.mustFixScope?.byTask.osc?.[0]).toMatchObject({ scope: 'split' });
+    expect(d.mustFixScope?.byTask.osc?.[0]?.signals).toContain('new-axis');
+    expect(d.action).toBe('stop');
+  });
+
+  test('범위 축 — ③ recurring 줄은 split(같은 런 재수리에서 빠진다)', () => {
+    const history: SupervisorRound[] = [{ round: 0, landed: 0, actionable: 2, oscillationRepairTaskIds: ['osc'],
+      mustFix: { items: [{ text: 'src/harness/detach.ts 게이트를 고쳐라', taskId: 'osc' }] } }];
+    const piece = scoped('b', ['src/harness/detach.ts 게이트를 고쳐라'], { oscillationRepairOf: 'osc' });
+    const d = decideNextRun({ results: [piece], history, repairGoalExecution: true });
+    expect(d.mustFixByTask?.b).toMatchObject({ class: 'recurring' });
+    expect(d.mustFixScope?.byTask.b?.[0]).toMatchObject({ scope: 'split' });
+    expect(d.mustFixScope?.byTask.b?.[0]?.signals).toContain('recurring');
+  });
+
+  test('범위 축 (다) ask-owner — 범위 입력이 없으면 HITL 제안만 싣고 수리 동작은 지금 그대로', () => {
+    const d = decideNextRun({
+      results: [oscillatingFailed('osc', ['null 검사를 고쳐라'])],
+      history: [{ round: 0, landed: 0, actionable: 1 }], repairGoalExecution: true,
+    });
+    expect(d.action).toBe('add-repair-task');
+    expect(Object.keys(d.oscillation?.repairGoals ?? {})).toEqual(['osc']);
+    expect(d.mustFixScope?.byTask.osc?.[0]).toMatchObject({ scope: 'ask-owner' });
+    expect(d.mustFixScope?.byTask.osc?.[0]?.signals).toContain('no-scope-input');
+    expect(d.mustFixScope?.askOwner?.[0]).toMatchObject({ taskId: 'osc', items: ['null 검사를 고쳐라'] });
+    expect(d.mustFixScope?.askOwner?.[0]?.hitl).toContain('칸 주인');
+    expect(d.mustFixScope?.split).toBeUndefined();
+  });
+
+  test('범위 축 — ② 줄과 (가) 줄이 섞인 조각은 통째로 보류하지 않는다: (가) 는 수리 골, ② 는 split 제안', () => {
+    const d = decideNextRun({
+      results: [scoped('osc', ['live 호출자를 못 봤다', 'detach.ts: Windows 정상 종료를 실패로 처리한다'])],
+      history: [{ round: 0, landed: 0, actionable: 1 }], repairGoalExecution: true,
+    });
+    expect(d.action).toBe('add-repair-task');
+    const goal = d.oscillation?.repairGoals?.osc ?? '';
+    expect(goal).toContain('Windows 정상 종료');
+    expect(goal).not.toContain('live 호출자');
+    expect(d.mustFixScope?.byTask.osc?.map((j) => j.scope)).toEqual(['split', 'in-scope']);
+    expect(d.mustFixScope?.split?.[0]?.proposals[0]?.text).toBe('live 호출자를 못 봤다');
+  });
+
+  test('범위 축 — ② 회차는 범위 입력이 있어도 줄마다 split 제안이 실린다(수리도 split 도 없는 줄 0)', () => {
+    const d = decideNextRun({
+      results: [scoped('osc', ['live 호출자를 못 봤다'], { changedFiles: ['src/x.ts'], targetPaths: ['src/x.ts'] })],
+      history: [{ round: 0, landed: 0, actionable: 1 }], repairGoalExecution: true,
+    });
+    expect(d.mustFix).toMatchObject({ class: 'post-land-evidence' });
+    expect(d.action).toBe('stop');
+    expect(d.mustFixScope?.split?.[0]?.proposals).toHaveLength(1);
+  });
+
+  test('반증 — 보류 사유는 실제로 분류·범위로 보류된 조각에서만(이미 수리해 보류된 ② 조각 사유는 why 에 안 실린다)', () => {
+    const history: SupervisorRound[] = [{ round: 0, landed: 0, actionable: 2, oscillationRepairTaskIds: ['evid'] }];
+    const d = decideNextRun({
+      results: [scoped('evid', ['live 호출자를 못 봤다']), scoped('real', ['detach.ts: Windows 정상 종료를 실패로 처리한다'])],
+      history, repairGoalExecution: true,
+    });
+    expect(d.mustFixByTask?.evid).toMatchObject({ class: 'post-land-evidence' });
+    expect(d.action).toBe('add-repair-task');
+    expect(d.oscillation?.taskIds).toEqual(['real']);
+    expect(d.why).not.toContain('증거는 착지 뒤에만');
+  });
+
+  test('범위 축 — 신호가 하나도 없으면(입력은 있음) ask-owner', () => {
+    const d = decideNextRun({
+      results: [scoped('osc', ['Handle the error better'])],
+      history: [{ round: 0, landed: 0, actionable: 1 }], repairGoalExecution: true,
+    });
+    expect(d.mustFixScope?.byTask.osc?.[0]).toMatchObject({ scope: 'ask-owner', signals: ['no-signal'] });
+    expect(d.action).toBe('add-repair-task');
+  });
+
   test('분류 불가(unmeasured)면 결정에 분류가 안 실리고 지금 동작 그대로다', () => {
     const d = decideNextRun({
       results: [oscillatingFailed('osc', [])],

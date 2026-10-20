@@ -74,6 +74,7 @@ RESULT: 51 pass, 0 fail, 390 expect() calls; Ran 51 tests across 2 files.
 | 파일 | 무엇 | 원본(전문) |
 |---|---|---|
 | [`01-goal-authoring-checks.md`](01-goal-authoring-checks.md) | 골을 쓰기 «전»에 답하는 여섯 | [`CONCEPT-self-implement-closed-loop-map`](../CONCEPT-self-implement-closed-loop-map-2026-08-08.md) §8 |
+| [`refactoring.md`](../refactoring.md) | 리팩터링·seam·큰 파일 쪼개기 골은 냄새 → seam → 패턴 순서를 따르고, 이론상 깔끔함만으로 패턴을 도입하지 않는다 | [`refactoring.md`](../refactoring.md) |
 
 ## Cross-ref
 [[CONCEPT-self-implement-closed-loop-map-2026-08-08]](폐루프 전도 · §7a 가 이 두 계층의 근거) ·

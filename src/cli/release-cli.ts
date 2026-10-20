@@ -5,11 +5,11 @@
 //   elanous release tag --version <x.y.z> --source <commit> [--yes]
 //   elanous release verify  [--version <x.y.z>]
 //   elanous release notes   --from <ref> [--to <ref>]
-//   elanous release run     --version <x.y.z> [--prerelease rc] [--main-cut | --cut-commit <sha>] [--publish-at <iso>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--dry-run] [--json] [--if-ready]
-//   elanous release resume  --run <runId> --from <node> [--waive <node> --reason <text>] [--accepted-regressions <json>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--json]
+//   elanous release run     --version <x.y.z> [--prerelease rc] [--main-cut | --cut-commit <sha>] [--publish-at <iso>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--dry-run] [--json] [--if-ready] [--force-new]
+//   elanous release resume  --run <runId> --from <node> [--waive <node> --reason <text>] [--accepted-regressions <json>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--gate-pod-pool <pool>] [--json]
 //   elanous release auto-start [--window-minutes <n>] [--apply] [--json]
 //   elanous release rehearsal tick [--apply] [--checkout <dir>] [--shards <n>] [--remote <host>] [--json]
-//   elanous release preflight --version <x.y.z> [--publish-at <iso>] [--json]   (컷 30분 전 사전 점검 · 읽기 전용 · ⛔ 있으면 exit 1)
+//   elanous release preflight --version <x.y.z> [--publish-at <iso>] [--json]   (컷 − 60분 main export 포함 사전 점검 · 읽기 전용 · ⛔ 있으면 exit 1)
 //   elanous release cut-branch --version <x.y.z> --base <sha> --pick <sha>... [--dry-run]
 //
 // 🩸 계기(2026-09-25 v0.1.0 첫 공개): 손으로 밟은 절차에서 둘을 빠뜨릴 뻔했다 — 공개본 git 커밋(판 커밋이 공개본 커밋이 된다) ·
@@ -28,13 +28,13 @@ import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { envLiteral } from '../platform/env-literal.js';
 import { getUserConfig, userConfigPath } from '../user-config.js';
-import { addItem, cellsReferencingDoc, claimItem, decodeClaimHistoryEntry, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarizeChecklist, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind, type ChecklistDispatchKind } from '../release-loop/checklist.js';
+import { addItem, cellsReferencingDoc, claimItem, decodeClaimHistoryEntry, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarizeChecklist, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind, type ChecklistDispatchKind } from '../release-loop/checklist.js';
 import * as features from '../release-loop/feature-store.js';
 import { evidencePlan, landedButYellow, type MergedChecklistPr } from '../release-loop/landed-but-yellow.js';
 import { formatSchedule, getSchedule, listSchedules, setSchedule } from '../release-loop/release-schedule.js';
 import { mergedPrsLast24h, placeCell, planPullForward, pullForwardPlacementConfig, rebalance, seatMove, type PlacementPriority } from '../release-loop/placement.js';
 import { readTrafficSignal } from '../seat-loop/traffic-signal.js';
-import { parseRubric, readRubricItems, rubricGrade, rubricScore } from '../release-loop/rubric.js';
+import { parseRubric, parseRubricS, readRubricItems, rubricGrade, rubricScore } from '../release-loop/rubric.js';
 import { writeStdoutJson } from './stdout-json.js';
 import { CliUserError } from './cli-user-error.js';
 import { hqCliWriteAllowed, type HqDeps } from '../hq/hq.js';
@@ -43,11 +43,12 @@ import { isIsolatedLedgerWriteRoot } from '../hq/ledger-write-target.js';
 import { runUnattendedRelease, type UnattendedReleaseDeps } from '../../scripts/release-loop/unattended-release.js';
 import { publishAtError } from '../../scripts/release-loop/publish-at.js';
 import { cutReleaseBranch } from '../../scripts/release-loop/cut-branch.js';
-import { resumeReleaseRun } from '../../scripts/release-loop/resume-release.js';
+import { planResumeReleaseRun, resumeReleaseRun } from '../../scripts/release-loop/resume-release.js';
 import type { AcceptedRegression } from '../../scripts/release-loop/resume.js';
 import type { PrereleaseKind } from '../../scripts/release-loop/release-version.js';
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
 import { runReleaseIfReady } from './release-run-if-ready.js';
+import { ReleaseRunClaimConflict, findActiveReleaseRun, readActiveForceReleaseRun, readReleaseRunLock, withDirectReleaseRunLock, withForceReleaseRunMarker } from './release-single-flight.js';
 import { formatPreflight, releasePreflight } from '../../scripts/release-loop/preflight.js';
 import { defaultReleaseGraphRunsRoot, formatPublishProposal, measurePublishWindow, proposePublishAt, publishWindowWarning } from '../../scripts/release-loop/publish-window.js';
 import { autoStartScheduledRelease, type AutoStartDeferral } from '../release-loop/auto-start.js';
@@ -491,13 +492,33 @@ async function jsonAction<T>(json: boolean | undefined, body: (log: (l: string) 
   }
 }
 
-function warnChecklistTargetPaths(input: { title: string; evidence?: string; refs?: readonly string[]; dispatchKind?: ChecklistDispatchKind }): void {
+function warnChecklistTargetPaths(input: { title: string; evidence?: string; refs?: readonly string[]; dispatchKind?: ChecklistDispatchKind }, strict = false): void {
   const cwd = process.cwd();
-  const existsAtMain = (path: string): boolean => {
-    if (path.startsWith('/') || path.split('/').includes('..')) return false;
-    const result = spawnSync('git', ['cat-file', '-e', `origin/main:${path}`], { cwd, timeout: 5_000, stdio: 'ignore' });
-    return result.status === 0;
+  const objectTypeAtMain = (path: string): 'blob' | 'tree' | 'commit' | 'blocked-blob' | 'blocked-gitlink' | 'unavailable' | null => {
+    if (path.startsWith('/') || path.split('/').includes('..')) return null;
+    const segments = path.split('/');
+    for (let length = 1; length < segments.length; length++) {
+      const ancestor = segments.slice(0, length).join('/');
+      const lookup = spawnSync('git', ['cat-file', '-t', `origin/main:${ancestor}`], { cwd, timeout: 5_000, encoding: 'utf8' });
+      if (lookup.status === 0) {
+        if (lookup.stdout.trim() === 'blob') return 'blocked-blob';
+        if (lookup.stdout.trim() === 'commit') return 'blocked-gitlink';
+        if (lookup.stdout.trim() !== 'tree') return 'unavailable';
+        continue;
+      }
+      const missing = spawnSync('git', ['ls-tree', 'origin/main', '--', ancestor], { cwd, timeout: 5_000, encoding: 'utf8' });
+      return missing.status === 0 && missing.stdout.trim() === '' ? null : 'unavailable';
+    }
+    const result = spawnSync('git', ['cat-file', '-t', `origin/main:${path}`], { cwd, timeout: 5_000, encoding: 'utf8' });
+    const type = result.status === 0 ? result.stdout.trim() : '';
+    if (type === 'blob' || type === 'tree' || type === 'commit') return type;
+    if (result.status === 0) return 'unavailable';
+    // cat-file also fails for a genuinely new path. ls-tree distinguishes that
+    // from a missing ref or another Git read failure before --strict accepts 신설:.
+    const probe = spawnSync('git', ['ls-tree', 'origin/main', '--', path], { cwd, timeout: 5_000, encoding: 'utf8' });
+    return probe.status === 0 && probe.stdout.trim() === '' ? null : 'unavailable';
   };
+  const existsAtMain = (path: string): boolean => objectTypeAtMain(path) === 'blob';
   const mergedPrFiles = (number: number): string[] => {
     const result = spawnSync('gh', ['pr', 'view', String(number), '--json', 'state,files'], { cwd, encoding: 'utf8', timeout: 10_000 });
     if (result.status !== 0) return [];
@@ -506,7 +527,8 @@ function warnChecklistTargetPaths(input: { title: string; evidence?: string; ref
       return pr.state === 'MERGED' ? (pr.files ?? []).map((file) => file.path).filter((path): path is string => typeof path === 'string') : [];
     } catch { return []; }
   };
-  const report = inspectChecklistTargetPaths(input, { existsAtMain, mergedPrFiles });
+  const report = inspectChecklistTargetPaths(input, { existsAtMain, objectTypeAtMain, mergedPrFiles });
+  if (strict && report.warnings.length) throw new CliUserError(`칸 대상 경로/완료 경계 검사: ${report.warnings.join(' · ')}`, '문면을 고치거나 --strict 없이 경고로 저장한다');
   for (const warning of report.warnings) {
     console.error(`⚠ 대상 경로: ${warning}${report.candidates.length ? ` · 후보: ${report.candidates.join(' · ')}` : ''}`);
     debug.log('release.checklist', 'target-path-warning', { warning, candidates: report.candidates });
@@ -713,9 +735,9 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       for (const item of readRubricItems(version, releaseLedgerRoot())) {
         if (item.priority !== 'P0' && item.priority !== 'P1') continue;
         const group = byPriority[item.priority];
-        const rubric = parseRubric(`${item.title}\n${item.evidence ?? ''}`);
-        if (rubric === null) group.missing++;
-        else { group.s[rubric.S as 0 | 1 | 2 | 3]++; group.total += rubric.S; }
+        const s = parseRubricS(item.evidence ?? '') ?? parseRubric(item.title)?.S ?? parseRubricS(item.title);
+        if (s === null) group.missing++;
+        else { group.s[s as 0 | 1 | 2 | 3]++; group.total += s; }
       }
       const result = { version, byPriority, total: byPriority.P0.total + byPriority.P1.total, missing: byPriority.P0.missing + byPriority.P1.missing };
       if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
@@ -858,7 +880,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         if (opts.applyEvidence && !opts.dryRun && !mayWrite(cmd)) return;
         const snapshots = opts.open ? openSnapshots : [(landedDeps.checklist ?? listChecklist)(context(cmd).version)];
         const now = (landedDeps.now ?? (() => new Date()))();
-        // --version 도 --open 과 같은 판 전체 최좌 수정일로 병합 PR 을 찾는다 — 선택 판 칸의 updatedAt 에 묶이면 그보다 오래 전에 병합된 PR 을 놓친다(LBY-VERSION-OPEN-MISMATCH · OPT #4059).
+        // --version 도 --open 과 같은 판 전체 최초 수정일로 병합 PR 을 찾는다 — 선택 판 칸의 updatedAt 에 묶이면 그보다 오래 전에 병합된 PR 을 놓친다(LBY-VERSION-OPEN-MISMATCH · OPT #4059).
         const sinceSnapshots = opts.open ? snapshots : [...openSnapshots, ...snapshots];
         const updated = sinceSnapshots.flatMap(({ items }) => items
           .filter((item) => (item.status === 'yellow' || item.status === 'red') && (opts.owner === undefined || ownerMatches(item.owner, opts.owner)))
@@ -908,13 +930,14 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--ceo-minutes <minutes>', '대표 손 분량(분)').option('--ceo-date <date>', '대표 손 날짜 YYYY-MM-DD (없으면 판 착지일 KST)')
     .option('--accelerator', '가속 등급 — 다른 칸의 처리량을 올리는 칸(자율성·효율성·동시성). 생략하면 등급 없음')
     .option('--allow-duplicate-id', '다른 판에 같은 id 가 있어도 경고 후 추가')
+    .option('--strict', '대상 경로·완료 경계 경고가 있으면 저장 전 거부')
     .option('--ref <path...>', '근거 문서 — 저장소 상대 경로[#절] (반복 가능)')
-    .action((id: string, title: string, opts: { ref?: string[]; owner?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[]; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean; allowDuplicateId?: boolean }, cmd: Command) => {
+    .action((id: string, title: string, opts: { ref?: string[]; owner?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[]; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean; allowDuplicateId?: boolean; strict?: boolean }, cmd: Command) => {
     const { version, json } = context(cmd);
     if (!mayWrite(cmd)) return;
     const dispatchKind = opts.kind && !['screen', 'postpub'].includes(opts.kind) ? opts.kind as ChecklistDispatchKind : undefined;
+    warnChecklistTargetPaths({ title, refs: opts.ref, dispatchKind }, opts.strict);
     const data = addItem(version, { id, title, ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.kind !== undefined && !dispatchKind ? { kind: opts.kind as ChecklistKind } : {}), ...(dispatchKind ? { dispatchKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator ? { accelerator: true } : {}) }, { allowDuplicateId: opts.allowDuplicateId });
-    warnChecklistTargetPaths({ title, refs: opts.ref, dispatchKind });
     if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 추가`);
   });
   withContext(checklist.command('set <id>').description('칸 상태·근거·담당·처분 갱신'))
@@ -977,15 +1000,26 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       else features.move(id, from, to, actor(), undefined, undefined, opts.reason);
       if (json) console.log(JSON.stringify(listChecklist(to))); else console.log(`✅ ${id} ${from} → ${to}`);
     });
-  withContext(checklist.command('retitle <id> <title>').description('칸 제목 수정')).action((id: string, title: string, _opts: unknown, cmd: Command) => {
+  withContext(checklist.command('retitle <id> <title>').description('칸 제목 수정')).option('--strict', '대상 경로·완료 경계 경고가 있으면 저장 전 거부').action((id: string, title: string, opts: { strict?: boolean }, cmd: Command) => {
     const { version, json } = context(cmd);
     if (!mayWrite(cmd)) return;
     const snapshot = listChecklist(version);
-    features.retitle(id, title, actor(), snapshot.released, snapshot.dev);
     const item = snapshot.items.find((entry) => entry.id === id);
-    warnChecklistTargetPaths({ title, evidence: item?.evidence, refs: item?.refs, dispatchKind: item?.dispatchKind });
+    if (!opts.strict) warnChecklistTargetPaths({ title, evidence: item?.evidence, refs: item?.refs, dispatchKind: item?.dispatchKind });
+    features.retitle(id, title, actor(), snapshot.released, snapshot.dev, opts.strict
+      ? (affected) => warnChecklistTargetPaths({ title, evidence: affected.evidence, refs: affected.refs, dispatchKind: affected.dispatchKind }, true)
+      : undefined);
     if (json) console.log(JSON.stringify(listChecklist(version))); else console.log(`✅ ${id} 제목 수정`);
   });
+  withContext(checklist.command('skip-note <id> <reason>').description('디스패처 건너뜀 사유를 칸 근거에 중복 없이 기록'))
+    .requiredOption('--expected-title <title>', '검사한 칸 제목; 바뀐 제목이면 기록하지 않는다')
+    .requiredOption('--by <actor>', '실제 기록 주체(디스패처 자리)')
+    .action((id: string, reason: string, opts: { expectedTitle: string; by: string }, cmd: Command) => {
+      const { version, json } = context(cmd);
+      if (!mayWrite(cmd)) return;
+      const data = noteDispatchSkip(version, id, reason, opts.expectedTitle, opts.by);
+      if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 건너뜀 근거 확인`);
+    });
   const evidence = checklist.command('evidence').description('칸의 PR·커밋 근거');
   withContext(evidence.command('add <id> <ref>').description('근거 참조 추가')).action((id: string, ref: string, _opts: unknown, cmd: Command) => {
       const { version, json } = context(cmd);
@@ -1082,7 +1116,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .action(async (o: { version: string; base: string; pick: string[]; append?: boolean; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => cutReleaseBranch({ ...o, log }), () => true);
     });
-  const runAction = async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; gateExecutor?: string; gateHost?: string; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {
+  const runAction = async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; forceNew?: boolean; gateExecutor?: string; gateHost?: string; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {
       // Only the rc rehearsal channel is operated for now (alpha/beta stay valid version shapes, not run options).
       if (o.prerelease !== undefined && o.prerelease !== 'rc') {
         const message = `--prerelease supports rc only: ${o.prerelease}`;
@@ -1098,6 +1132,18 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         else console.error(`⛔ ${publishAtInvalid}`);
         process.exitCode = 1;
         return false;
+      }
+      const ledgerRoot = releaseRunDeps.ledgerRoot ?? releaseLedgerRoot();
+      if (!o.dryRun && !o.forceNew) {
+        const active = findActiveReleaseRun(o.version, ledgerRoot) ?? readActiveForceReleaseRun(o.version, ledgerRoot);
+        if (active) {
+          const error = `release run already running: ${o.version} runId=${active.runId} pid=${active.pid} startedAt=${active.startedAt} (--force-new to bypass)`;
+          debug.log('release.run', 'already-running', { version: o.version, ...active });
+          if (o.json) await writeStdoutJson(`${JSON.stringify({ ok: false, reason: 'already-running', error, ...active })}\n`);
+          else console.error(`⛔ ${error}`);
+          process.exitCode = 1;
+          return false;
+        }
       }
       const prerelease = o.prerelease as PrereleaseKind | undefined;
       if (!o.dryRun) {
@@ -1130,10 +1176,20 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         try {
           const outcome = await runReleaseIfReady(o.version, {
             ledgerRoot: releaseRunDeps.ledgerRoot,
+            forceNew: o.forceNew,
             readiness: (version, options) => releaseReadiness(version, { ledgerRoot: releaseRunDeps.ledgerRoot, checklist: releaseRunDeps.checklist, ...options }),
-            run: () => runUnattendedRelease({ version: o.version, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost }, releaseRunDeps),
+            run: () => runUnattendedRelease({ version: o.version, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, forceNew: o.forceNew, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost }, releaseRunDeps),
           });
           if (outcome.skipped) {
+            if (outcome.reason === 'already-running') {
+              const active = findActiveReleaseRun(o.version, ledgerRoot) ?? readActiveForceReleaseRun(o.version, ledgerRoot);
+              const lock = readReleaseRunLock(o.version, ledgerRoot);
+              const error = `release run already running: ${o.version} runId=${active?.runId ?? 'pending'} pid=${active?.pid ?? lock?.pid ?? 'unknown'} startedAt=${active?.startedAt ?? lock?.startedAt ?? 'unknown'} (--force-new to bypass)`;
+              if (o.json) await writeStdoutJson(`${JSON.stringify({ ok: false, reason: 'already-running', error, ...(active ?? {}) })}\n`);
+              else console.error(`⛔ ${error}`);
+              process.exitCode = 1;
+              return false;
+            }
             if (o.json) await writeStdoutJson(`${JSON.stringify(outcome)}\n`);
             else logRun(`· 준비 안 됨 ${o.version} · ${outcome.reason} · ${outcome.detail}`);
             return { deferred: true, reason: outcome.reason };
@@ -1159,7 +1215,20 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         }
       }
       await jsonAction(o.json, async (log) => {
-        const result = await runUnattendedRelease({ version: o.version, dryRun: o.dryRun, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost }, releaseRunDeps);
+        const run = () => runUnattendedRelease({ version: o.version, dryRun: o.dryRun, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, forceNew: o.forceNew, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost }, releaseRunDeps);
+        const forceRun = () => {
+          const atStart = releaseReadiness(o.version, { ledgerRoot, checklist: releaseRunDeps.checklist, isPidAlive: () => false });
+          if (!atStart.ready) throw new Error(`release run --force-new not ready after claim: ${atStart.reason}`);
+          return run();
+        };
+        let result: Awaited<ReturnType<typeof runUnattendedRelease>>;
+        try { result = o.dryRun ? await run() : o.forceNew ? await withForceReleaseRunMarker(o.version, ledgerRoot, forceRun) : await withDirectReleaseRunLock(o.version, ledgerRoot, run); }
+        catch (error) {
+          if (!(error instanceof ReleaseRunClaimConflict)) throw error;
+          const active = findActiveReleaseRun(o.version, ledgerRoot) ?? readActiveForceReleaseRun(o.version, ledgerRoot);
+          const lock = readReleaseRunLock(o.version, ledgerRoot);
+          throw new Error(`release run already running: ${o.version} runId=${active?.runId ?? 'pending'} pid=${active?.pid ?? lock?.pid ?? 'unknown'} startedAt=${active?.startedAt ?? lock?.startedAt ?? 'unknown'} (--force-new to bypass)`);
+        }
         log(`${result.dryRun ? '· 드라이런' : '▶ 릴리스 루프'} ${result.input.version} · 입력 ${JSON.stringify(result.input)}`);
         return result;
       }, (r) => r.dryRun || r.state?.status === 'done' || r.state?.status === 'awaiting-approval');
@@ -1174,12 +1243,13 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--if-ready', '준비되지 않았으면 사유를 출력하고 성공으로 건너뛴다')
     .option('--publish-at <iso>', '승인·선행 노드 통과 뒤 지정 시각까지 발행 대기(오프셋 포함 ISO 시각)')
     .option('--force-freeze', '동결 중 게이트·발행 강행(관측 기록) — 가지 컷은 동결이 필요 없다 · 동결은 비상 스위치로 남는다')
+    .option('--force-new', '같은 판의 살아 있는 릴리스 런을 확인한 뒤에도 새 런을 명시적으로 시작')
     .option('--gate-executor <pod|host>', 'gate 노드 실행기(기본 pod) — host 는 Pod 대신 SSH 호스트의 깨끗한 클론에서 같은 판정(면제 아님)')
     .option('--gate-host <ssh-host>', '--gate-executor host 의 SSH 호스트(기본 release.loop.gateRemote)')
     .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
-    .action(async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; gateExecutor?: string; gateHost?: string; json?: boolean }) => { await runAction(o); });
+    .action(async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; forceNew?: boolean; gateExecutor?: string; gateHost?: string; json?: boolean }) => { await runAction(o); });
   release.command('preflight')
-    .description('컷 30분 전 사전 점검(읽기 전용) — 체크리스트 게이트 모의 · 발행 뒤 칸 · run --dry-run 입력 · 동결 · 일정/게이트 실측. ⛔ 있으면 exit 1')
+    .description('컷 전 사전 점검(읽기 전용) — 체크리스트·런 입력·동결·일정 + 컷 − 60분 origin/main export(자동 예약 없음). ⛔ 있으면 exit 1')
     .requiredOption('--version <v>', '점검할 판(x.y.z)')
     .option('--publish-at <iso>', '계획 발행 시각(기본: 컷 뒤 첫 07·18시 KST)')
     .option('--json', '결과 한 줄 JSON(stdout)')
@@ -1229,8 +1299,11 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--accepted-regressions <json>', '알려진 문제 추가 입력 JSON 배열 [{"id":"…","note":"…"}]')
     .option('--gate-executor <pod|host>', '다시 도는 gate 의 실행기 전환(--from gate 이전만) — 런 입력에 기록 · 면제 아님')
     .option('--gate-host <ssh-host>', '--gate-executor host 의 SSH 호스트(기본 저장된 런 입력 gateRemote)')
+    .option('--gate-pod-pool <pool>', '다시 도는 gate 의 Pod 풀을 전환(--from gate 이전만) — 런 입력에 기록')
+    .option('--command-root <path>', '노드 명령을 실행할 컷 tip checkout(생략 시 현재 폴더)')
+    .option('--dry-run', '재개 preflight만 수행하고 런·상태 원장·시도 횟수는 변경하지 않는다')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { run: string; from: string; partial?: boolean; waive?: string; reason?: string; acceptedRegressions?: string; gateExecutor?: string; gateHost?: string; json?: boolean }) => {
+    .action(async (o: { run: string; from: string; partial?: boolean; waive?: string; reason?: string; acceptedRegressions?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string; commandRoot?: string; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => {
         let acceptedRegressions: AcceptedRegression[] | undefined;
         if (o.acceptedRegressions !== undefined) {
@@ -1241,21 +1314,34 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
             throw new Error('acceptedRegressions must be an array of {id, note}');
           }
         }
-        const result = await resumeReleaseRun({ runId: o.run, from: o.from, partial: o.partial,
+        const resumeOptions = { runId: o.run, from: o.from, partial: o.partial, commandRoot: o.commandRoot,
           ...(o.waive === undefined ? {} : { waive: o.waive }),
           ...(o.reason === undefined ? {} : { reason: o.reason }),
           ...(o.acceptedRegressions === undefined ? {} : { acceptedRegressions }),
           ...(o.gateExecutor === undefined ? {} : { gateExecutor: o.gateExecutor }),
-          ...(o.gateHost === undefined ? {} : { gateHost: o.gateHost }) });
-        const override = result.state.inputOverrides?.at(-1);
-        if (o.gateExecutor !== undefined && override) log(`⇄ gate 실행기 ${override.set.gateExecutor}${override.set.gateRemote ? ` @ ${override.set.gateRemote}` : ''} (런 입력에 기록 · 면제 아님)`);
+          ...(o.gateHost === undefined ? {} : { gateHost: o.gateHost }),
+          ...(o.gatePodPool === undefined ? {} : { gatePodPool: o.gatePodPool }) };
+        if (o.dryRun) {
+          const plan = await planResumeReleaseRun(resumeOptions, { onSource: log });
+          const gate = plan.gatePlan.mode === 'not-run' ? 'gate 실행 없음'
+            : plan.gatePlan.mode === 'partial' ? `부분 gate 계획 ${plan.partial.requested && plan.partial.applied ? `${plan.partial.files}파일` : '미상'}`
+              : `전체 gate${plan.gatePlan.reason ? ` (${plan.gatePlan.reason})` : ''}`;
+          log(`· 재개 preflight 통과 · ${plan.version} · ${plan.fromNode}부터 · tip ${plan.tip.to.slice(0, 12)}${plan.tip.changed ? ` (기록 tip ${plan.tip.from.slice(0, 12)}에서 이동)` : ''} · ${gate} · 시도 ${plan.nextAttempt}/${plan.attemptLimit} · 실행·원장 변경 없음`);
+          return plan;
+        }
+        const result = await resumeReleaseRun(resumeOptions, { onSource: log });
+        const executorOverride = [...(result.state.inputOverrides ?? [])].reverse().find((item) => item.kind === 'gate-executor');
+        const poolOverride = [...(result.state.inputOverrides ?? [])].reverse().find((item) => item.kind === 'gate-pod-pool');
+        if (o.gateExecutor !== undefined && executorOverride?.kind === 'gate-executor') log(`⇄ gate 실행기 ${executorOverride.set.gateExecutor}${executorOverride.set.gateRemote ? ` @ ${executorOverride.set.gateRemote}` : ''} (런 입력에 기록 · 면제 아님)`);
+        if (o.gatePodPool !== undefined && poolOverride?.kind === 'gate-pod-pool') log(`⇄ gate Pod 풀 ${poolOverride.set.gatePodPool} (런 입력에 기록)`);
         if (result.partial.requested) log(result.partial.applied
           ? `◐ 부분 재검${result.partial.auto ? '(기본)' : ''}: ${result.partial.files}파일${result.partial.closure ? ` (코드 닿음 ${result.partial.closure.reached} · 닫힘 불투명 ${result.partial.closure.opaque})` : ''} · 나머지는 앞 게이트(${result.partial.priorCommit.slice(0, 12)}) 결과를 잇는다`
           : `● 전체 게이트로: ${result.partial.reason}`);
         log(`${result.tip.changed ? `↻ ${result.tip.branch} ${result.tip.from.slice(0, 12)} → ${result.tip.to.slice(0, 12)} (백업 ${result.tip.backup})` : `· ${result.tip.branch} 끝 그대로 ${result.tip.to.slice(0, 12)}`} · ${o.from} 부터 → ${result.state.status}`);
         return { tip: result.tip, partial: result.partial, status: result.state.status, runId: result.state.runId,
-          ...(o.gateExecutor !== undefined && result.state.inputOverrides?.length ? { gateExecutor: result.state.inputOverrides.at(-1) } : {}) };
-      }, (r) => r.status === 'done' || r.status === 'awaiting-approval');
+          ...(o.gateExecutor !== undefined && executorOverride?.kind === 'gate-executor' ? { gateExecutor: executorOverride } : {}),
+          ...(o.gatePodPool !== undefined && poolOverride?.kind === 'gate-pod-pool' ? { gatePodPool: poolOverride } : {}) };
+      }, (r) => 'preflight' in r || r.status === 'done' || r.status === 'awaiting-approval');
     });
   release.command('gate-history')
     .description('GATE-FAIL-HISTORY (0.2.29) — 판을 넘는 게이트 실패 표 — 모든 release-loop·light-rc 런 원장 ⊕ gate-verdict 에서 시험 파일별 introduced·preexisting·env·flaky 횟수 · 마지막 실패 판 · 원인 PR(수리 PR 본문 «원인 #N»)')
@@ -1308,6 +1394,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       await jsonAction(o.json, async (log) => {
         const ledgerRoot = scheduleLedgerRoot();
         if (o.apply && !mayWriteLedger('release rehearsal tick', false, ledgerRoot)) throw new Error('release rehearsal tick: ledger write denied');
+        // The tick reports a preflight shard shortage as an unmeasured attempt; its released stage can be claimed on the next CLI tick.
         const result = await runRehearsalTick({ apply: o.apply, checkout: o.checkout, shards: o.shards === undefined ? undefined : Number(o.shards), remote: o.remote, ledgerRoot }, rehearsalDeps);
         log(`· 리허설 ${result.status}${'version' in result ? ` ${result.version}` : ''}${result.status === 'due' ? ` · 실행 ${result.run ?? '-'} · 건너뜀 ${result.supersede.join(', ') || '-'}` : ''}`);
         return result;

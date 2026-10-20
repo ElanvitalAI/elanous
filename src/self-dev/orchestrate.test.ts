@@ -10,6 +10,151 @@ import { decideNextRun } from './run-supervisor.js';
 import type { SelfImplementJobSpawn, SelfImplementJobDone } from '../task-orchestrator/surfaces/self-implement.js';
 import type { LogRecord } from '../mss/logging/record.js';
 
+test('TA 분해 조각마다 부모 완료 경계 3행을 상속해 자식 발사 문면에 싣는다', async () => {
+  let launches = 0;
+  const features: string[] = [];
+  const parent = '대상 경로: src/task-agent/repair-cycle.ts\n완료 경계 코드: src/task-agent/repair-cycle.ts 변경\n완료 경계 실물: 수리 완료 이벤트\n완료 경계 증거 명령: bun test src/task-agent/repair-cycle.test.ts';
+  await orchestrateSelfDev({
+    taskCardId: 'ta-20261018-fec86f', parentRequest: parent,
+    goals: [{ id: 'repair-cycle', feature: '대상 경로: src/task-agent/repair-cycle.ts\n수리 완료 이벤트' },
+      { id: 'rejudge', feature: '대상 경로: src/task-agent/rejudge-on-head.ts\n재판정' }],
+    spawn: (input) => { launches++; features.push(input.feature); return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: { stage: 'worktree-completed', ok: true } }) }; },
+  });
+  expect(launches).toBe(2);
+  for (const feature of features) {
+    expect(feature).toContain('완료 경계 코드: src/task-agent/repair-cycle.ts 변경');
+    expect(feature).toContain('완료 경계 실물: 수리 완료 이벤트');
+    expect(feature).toContain('완료 경계 증거 명령: bun test src/task-agent/repair-cycle.test.ts');
+  }
+});
+
+test('TA 경계 누락 조각만 needs-human 으로 빼고 경계가 완성된 무관 조각은 발사한다', async () => {
+  let launches = 0;
+  const results = await orchestrateSelfDev({
+    taskCardId: 'ta-20261018-fec86f', parentRequest: '완료 경계 코드: src/task-agent/repair-cycle.ts 변경',
+    goals: [
+      { id: 'repair-cycle', feature: '대상 경로: src/task-agent/repair-cycle.ts' },
+      { id: 'boundary:ta-20261018-fec86f:needs-human:1', feature: '완료 경계 코드: docs/independent.md 갱신\n완료 경계 실물: 문서가 저장소에 있음\n완료 경계 증거 명령: bun test src/docs/independent.test.ts' },
+    ],
+    spawn: (input) => { launches++; return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: { stage: 'worktree-completed', ok: true } }) }; },
+  });
+  expect(launches).toBe(1);
+  expect(results).toHaveLength(2);
+  expect(results).toContainEqual(expect.objectContaining({
+    taskId: 'boundary:ta-20261018-fec86f:needs-human:1', status: 'failed', stage: 'needs-human', stopReason: 'needs-human',
+    error: expect.objectContaining({ code: 'GOAL_DONE_BOUNDARY_MISSING' }),
+  }));
+  expect(results).toContainEqual(expect.objectContaining({ feature: expect.stringContaining('docs/independent.md'), status: 'done' }));
+  expect(new Set(results.map(({ taskId }) => taskId)).size).toBe(results.length);
+});
+
+test('TA 분해 조각이 모두 경계를 잃으면 spawn 없이 needs-human 결과로 끝난다', async () => {
+  let launches = 0;
+  const results = await orchestrateSelfDev({
+    taskCardId: 'ta-20261018-fec86f', parentRequest: '',
+    goals: [{ id: 'missing', feature: '대상 경로: src/task-agent/missing.ts' }],
+    spawn: () => { launches++; throw new Error('Pod launcher reached'); },
+  });
+  expect(launches).toBe(0);
+  expect(results).toHaveLength(1);
+  expect(results[0]).toMatchObject({ status: 'failed', stage: 'needs-human', stopReason: 'needs-human' });
+  expect(triageRun(results).needsHuman).toContain('boundary:ta-20261018-fec86f:needs-human:1');
+  expect(classifyFailure({
+    taskId: 'ordinary-needs-human-stop', feature: 'ordinary provider interruption', status: 'failed',
+    stopReason: 'needs-human', error: { code: 'CHILD_FAILED', message: 'provider execution stopped' },
+  } as SelfDevJobResult)).toBe('unclassified');
+});
+
+test('TA 경계 누락 조각을 선행으로 기다리는 하위 조각은 blocked 하고 무관 조각은 진행한다', async () => {
+  let launches = 0;
+  const results = await orchestrateSelfDev({
+    taskCardId: 'ta-20261018-fec86f', parentRequest: '완료 경계 코드: src/task-agent/repair-cycle.ts 변경',
+    goals: [
+      { feature: '대상 경로: src/task-agent/missing.ts' },
+      { dependsOn: ['0'], feature: '완료 경계 코드: src/task-agent/downstream.ts 갱신\n완료 경계 실물: downstream 코드 연결\n완료 경계 증거 명령: bun test src/task-agent/downstream.test.ts' },
+      { dependsOn: ['1'], feature: '완료 경계 코드: src/task-agent/finalize.ts 갱신\n완료 경계 실물: finalizer 연결\n완료 경계 증거 명령: bun test src/task-agent/finalize.test.ts' },
+      { id: 'independent', feature: '완료 경계 코드: docs/independent.md 갱신\n완료 경계 실물: 문서가 저장소에 있음\n완료 경계 증거 명령: bun test src/docs/independent.test.ts' },
+    ],
+    spawn: (input) => { launches++; return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: { stage: 'worktree-completed', ok: true } }) }; },
+  });
+  expect(launches).toBe(1);
+  expect(results).toContainEqual(expect.objectContaining({
+    taskId: 'boundary:ta-20261018-fec86f:needs-human:1', status: 'failed', stage: 'needs-human', stopReason: 'needs-human',
+  }));
+  expect(results).toContainEqual(expect.objectContaining({
+    taskId: 'boundary:ta-20261018-fec86f:blocked:2', status: 'blocked', blockReason: 'dependency-needs-human',
+    stopReason: 'needs-human', error: { code: 'DEPENDENCY_NEEDS_HUMAN', message: '선행 needs-human: 0' },
+  }));
+  expect(results).toContainEqual(expect.objectContaining({
+    taskId: 'boundary:ta-20261018-fec86f:blocked:3', status: 'blocked', blockReason: 'dependency-needs-human',
+    stopReason: 'needs-human', error: { code: 'DEPENDENCY_NEEDS_HUMAN', message: '선행 needs-human: 1' },
+  }));
+  expect(results).toContainEqual(expect.objectContaining({ feature: expect.stringContaining('docs/independent.md'), status: 'done' }));
+  expect(triageRun(results).needsHuman).toContain('boundary:ta-20261018-fec86f:blocked:2');
+  expect(triageRun(results).needsHuman).toContain('boundary:ta-20261018-fec86f:blocked:3');
+});
+
+test('경계 누락 후손도 needs-human 대신 선행 needs-human 차단으로 남긴다', async () => {
+  let launches = 0;
+  const results = await orchestrateSelfDev({
+    taskCardId: 'ta-20261018-fec86f', parentRequest: '',
+    goals: [
+      { id: 'A', feature: '대상 경로: src/task-agent/missing-a.ts' },
+      { id: 'B', dependsOn: ['A'], feature: '대상 경로: src/task-agent/missing-b.ts' },
+      { id: 'C', dependsOn: ['B'], feature: '완료 경계 코드: src/task-agent/descendant.ts\n완료 경계 실물: descendant 연결\n완료 경계 증거 명령: bun test descendant.test.ts' },
+    ],
+    spawn: () => { launches++; throw new Error('boundary descendants must not launch'); },
+  });
+  expect(launches).toBe(0);
+  expect(results).toContainEqual(expect.objectContaining({
+    taskId: 'boundary:ta-20261018-fec86f:needs-human:1', stage: 'needs-human',
+    error: expect.objectContaining({ code: 'GOAL_DONE_BOUNDARY_MISSING' }),
+  }));
+  expect(results).toContainEqual(expect.objectContaining({
+    taskId: 'boundary:ta-20261018-fec86f:blocked:2', blockReason: 'dependency-needs-human',
+    error: expect.objectContaining({ message: '선행 needs-human: A' }),
+  }));
+  expect(results).toContainEqual(expect.objectContaining({
+    taskId: 'boundary:ta-20261018-fec86f:blocked:3', blockReason: 'dependency-needs-human',
+    error: expect.objectContaining({ message: '선행 needs-human: B' }),
+  }));
+});
+
+test('앞의 needs-human 조각을 제거해도 남은 ID 없는 실행 가능 의존 조각의 연결을 보존한다', async () => {
+  const started: string[] = [];
+  let markPrerequisiteStarted!: () => void;
+  const prerequisiteStarted = new Promise<void>((resolve) => { markPrerequisiteStarted = resolve; });
+  let releasePrerequisite!: (value: { exitCode: number; output: string }) => void;
+  const prerequisiteDone = new Promise<{ exitCode: number; output: string }>((resolve) => { releasePrerequisite = resolve; });
+  const run = orchestrateSelfDev({
+    taskCardId: 'ta-20261018-fec86f', parentRequest: '', concurrency: 4,
+    goals: [
+      { feature: '대상 경로: src/task-agent/missing.ts' },
+      { dependsOn: ['0'], feature: '완료 경계 코드: src/task-agent/blocked.ts\n완료 경계 실물: blocked child\n완료 경계 증거 명령: bun test blocked.test.ts' },
+      { feature: '완료 경계 코드: src/task-agent/prerequisite.ts\n완료 경계 실물: prerequisite child\n완료 경계 증거 명령: bun test prerequisite.test.ts' },
+      { dependsOn: ['2'], feature: '완료 경계 코드: src/task-agent/consumer.ts\n완료 경계 실물: consumer child\n완료 경계 증거 명령: bun test consumer.test.ts' },
+    ],
+    spawn: (job) => {
+      started.push(job.feature.split(/\r?\n/, 1)[0]!);
+      if (job.feature.includes('prerequisite.ts')) markPrerequisiteStarted();
+      return {
+        address: job.spaceId,
+        done: job.feature.includes('prerequisite.ts')
+          ? prerequisiteDone
+          : Promise.resolve({ exitCode: 0, output: '' }),
+      };
+    },
+  });
+  await prerequisiteStarted;
+  expect(started.some((feature) => feature.includes('prerequisite.ts'))).toBe(true);
+  expect(started.some((feature) => feature.includes('consumer.ts'))).toBe(false);
+  releasePrerequisite({ exitCode: 0, output: '' });
+  const results = await run;
+  expect(started.some((feature) => feature.includes('consumer.ts'))).toBe(true);
+  expect(results).toContainEqual(expect.objectContaining({ taskId: 'boundary:ta-20261018-fec86f:needs-human:1', stage: 'needs-human' }));
+  expect(results).toContainEqual(expect.objectContaining({ taskId: 'boundary:ta-20261018-fec86f:blocked:2', blockReason: 'dependency-needs-human' }));
+});
+
 test('child ok and worktreePath cross the orchestrator boundary for delivery selection', async () => {
   const [result] = await orchestrateSelfDev({
     goals: [{ feature: 'research report' }],

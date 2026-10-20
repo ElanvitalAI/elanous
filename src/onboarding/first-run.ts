@@ -33,12 +33,14 @@ export type MenuAnswer =
   | { kind: 'miss' };
 
 // FIRST10-FIX: 첫 화면의 오타 한 번이 first-run 전체를 취소하던 마찰 — 빈 입력(취소 의사)과 달리
-// 선택지를 가리키지 못하는 입력(오타·범위 밖·전각 숫자)은 취소가 아니라 다시 묻는다.
+// 선택지를 가리키지 못하는 입력(범위 밖·전각·비정수)은 취소가 아니라 다시 묻는다.
+// 메뉴 답으로 인정하는 건 반각 십진 자릿수 문자열뿐이다 — Number() 는 '1e0'·'0x1'·'+1' 같은
+// 수식 표기를 정수로 강제 변환해 선택지로 샌다(0.2.35 재측정).
 export function parseMenuAnswer(answer: string, choices: readonly LLMProviderName[]): MenuAnswer {
   const trimmed = answer.trim();
   if (trimmed === '') return { kind: 'cancel' };
-  const index = Number(trimmed) - 1;
-  const provider = Number.isInteger(index) && index >= 0 ? choices[index] : undefined;
+  if (!/^[0-9]+$/.test(trimmed)) return { kind: 'miss' };
+  const provider = choices[Number(trimmed) - 1];
   return provider !== undefined ? { kind: 'chosen', provider } : { kind: 'miss' };
 }
 

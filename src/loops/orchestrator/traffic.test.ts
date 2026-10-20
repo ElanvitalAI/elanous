@@ -1,8 +1,9 @@
 import { afterEach, expect, spyOn, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { applyTraffic, isLaunchEligible, runTrafficTick, seatOfTree, trafficLine, trafficTick, withFinishAdvice, type TrafficProcess } from './traffic.js';
+import { applyTraffic, gateHaltedLaunchMinutes, gateLevelOf, isLaunchEligible, observeGateHalt, readDispatchLedger, readGateObservations24h, recordDispatchCycle, runTrafficTick, seatOfTree, trafficLine, trafficTick, withFinishAdvice, type DispatchCycle, type GateObservation, type TrafficProcess } from './traffic.js';
+import { readTrafficSamples24h } from '../budget.js';
 import { collectAuthorDepth, type AuthorCell } from './author-depth.js';
 import { AuthorLedger } from './author-ledger.js';
 import * as harnessQueue from '../../harness/harness-queue.js';
@@ -530,4 +531,109 @@ test('seat trees match by real path — a /private/var cwd matches a configured 
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+test('gate-halt metric derives zero launch attempts from the verbatim dispatch ledger', () => {
+  const root = temp();
+  const now = new Date('2026-10-18T03:00:00Z');
+  const cycle = (at: Date, eligible: number): DispatchCycle => ({
+    at: at.toISOString(), source: 'tick', mode: 'shadow', runId: at.toISOString(),
+    supply: 0, capacity: 4, eligible,
+    skipped: eligible === 0 ? { 'degraded-skip': 4 } : {},
+    dispatch: ORCHESTRATOR_DEFAULTS.dispatch,
+  });
+  // 원문 저널: recordDispatchCycle이 쓰는 그 형식의 줄들
+  mkdirSync(join(root, 'orchestrator'), { recursive: true });
+  const ledgerPath = join(root, 'orchestrator', 'dispatch-ledger.jsonl');
+  writeFileSync(ledgerPath, `${JSON.stringify(cycle(new Date(now.getTime() - 10 * 60_000), 0))}\n${JSON.stringify(cycle(now, 0))}\n`);
+  const ledger = readDispatchLedger(root, now);
+  expect(ledger).toHaveLength(2);
+  expect(ledger[0].eligible).toBe(0);
+  expect(ledger[0].skipped['degraded-skip']).toBe(4);
+  // 게이트 활성 10분 동안 발사 시도 0: «게이트 동안 발사 멈춘 분»은 10분
+  const gate: GateObservation[] = [
+    { at: new Date(now.getTime() - 10 * 60_000).toISOString(), level: 'L1' },
+    { at: now.toISOString(), level: 'L1' },
+  ];
+  expect(gateHaltedLaunchMinutes({ gate, ledger }))
+    .toEqual({ minutes: 10, launchAttempts: 0, haltedTicks: 1, activeObservations: 2 });
+  // 게이트가 꺼져 있으면 멈춘 분도 0
+  expect(gateHaltedLaunchMinutes({ gate: [{ at: now.toISOString(), level: null }], ledger }))
+    .toEqual({ minutes: 0, launchAttempts: 0, haltedTicks: 0, activeObservations: 0 });
+  // 게이트 활성 구간에 발사 시도가 있던 원문이면 그 분은 «멈춘 분»에서 제외된다
+  appendFileSync(ledgerPath, `${JSON.stringify(cycle(new Date(now.getTime() - 5 * 60_000), 2))}\n`);
+  const ledger2 = readDispatchLedger(root, now);
+  const active = gateHaltedLaunchMinutes({ gate, ledger: ledger2 });
+  expect(active.launchAttempts).toBe(2);
+  expect(active.minutes).toBe(0);
+  // 24h 창 밖 시점에서는 원문이 모두 제외된다
+  expect(readDispatchLedger(root, new Date(now.getTime() + 25 * 60 * 60_000))).toHaveLength(0);
+});
+
+test('observeGateHalt records the probe level into the 24h gate journal', () => {
+  const root = temp();
+  const quiet = () => {};
+  expect(observeGateHalt(root, { signal: { llm: false, board: true }, log: quiet }).level).toBe('L1');
+  expect(observeGateHalt(root, { signal: { llm: true, board: false }, log: quiet }).level).toBe('L2');
+  expect(gateLevelOf({ llm: true, board: true })).toBeNull();
+  const later = new Date(Date.now() + 60_000);
+  const journal = readGateObservations24h(root, later);
+  expect(journal).toHaveLength(2);
+  expect(journal[1].level).toBe('L2');
+  // 24h 창 밖 시점에서는 관측이 모두 제외된다
+  expect(readGateObservations24h(root, new Date(Date.now() + 25 * 60 * 60_000))).toHaveLength(0);
+});
+
+test('runTrafficTick records a 24h sample of its seat rows for the metrics journal', () => {
+  const root = temp();
+  const now = new Date('2026-10-18T03:00:00Z');
+  runTrafficTick({
+    now, processes: [] as TrafficProcess[], caps: ORCHESTRATOR_DEFAULTS.seatCaps,
+    openCells: [], mode: 'shadow',
+    applyDeps: { root, log: () => {} },
+    finishDeps: { listStarts: () => ({ starts: [], unreadable: [] }), runGh: () => '[]' },
+    collectAuthor: () => ({ seats: [], unreadable: [], receiptCounts: { held: 0, queuedForAuthor: 0 } }),
+  });
+  const samples = readTrafficSamples24h(root, now);
+  expect(samples).toHaveLength(1);
+  expect(samples[0].seats).toHaveLength(4);
+  expect(samples[0].seats.map(row => row.seat)).toEqual(['OP', 'TC', 'MK', 'UX']);
+  expect(samples[0].seats.find(row => row.seat === 'TC')).toMatchObject({ seat: 'TC', cap: 8, running: 0 });
+});
+
+test('gate-halt minutes need the ledger degraded-skip reason, not just an active gate', () => {
+  const root = temp();
+  const now = new Date('2026-10-18T03:00:00Z');
+  const cycle = (at: Date, skipped: Record<string, number>): DispatchCycle => ({
+    at: at.toISOString(), source: 'tick', mode: 'shadow', runId: at.toISOString(),
+    supply: 1, capacity: 4, eligible: 0, skipped,
+    dispatch: ORCHESTRATOR_DEFAULTS.dispatch,
+  });
+  const gate: GateObservation[] = [
+    { at: new Date(now.getTime() - 10 * 60_000).toISOString(), level: 'L2' },
+    { at: now.toISOString(), level: 'L2' },
+  ];
+  // 원문 저널: recordDispatchCycle이 쓰는 그 형식의 줄
+  mkdirSync(join(root, 'orchestrator'), { recursive: true });
+  const ledgerPath = join(root, 'orchestrator', 'dispatch-ledger.jsonl');
+  // 게이트가 켜져 있어도 원장이 수요 없음(no-supply)만 기록하면 «멈춘 분»이 아니다
+  writeFileSync(ledgerPath, `${JSON.stringify(cycle(new Date(now.getTime() - 5 * 60_000), { 'no-supply': 1 }))}\n`);
+  expect(gateHaltedLaunchMinutes({ gate, ledger: readDispatchLedger(root, now) }))
+    .toEqual({ minutes: 0, launchAttempts: 0, haltedTicks: 0, activeObservations: 2 });
+  // 원장의 degraded-skip 사유가 게이트가 실제로 발사를 막았다는 증거일 때만 계상한다
+  appendFileSync(ledgerPath, `${JSON.stringify(cycle(new Date(now.getTime() - 4 * 60_000), { 'degraded-skip': 2 }))}\n`);
+  const halted = gateHaltedLaunchMinutes({ gate, ledger: readDispatchLedger(root, now) });
+  expect(halted).toEqual({ minutes: 10, launchAttempts: 0, haltedTicks: 1, activeObservations: 2 });
+});
+
+test('recordDispatchCycle observes the gate every standing cycle — a deduped dispatch still journals it', () => {
+  const root = temp();
+  const cycle: DispatchCycle = { at: new Date().toISOString(), source: 'tick', mode: 'shadow', runId: 'gate-standing-1',
+    supply: 0, capacity: 4, eligible: 0, skipped: { 'degraded-skip': 4 }, dispatch: ORCHESTRATOR_DEFAULTS.dispatch };
+  recordDispatchCycle(root, cycle);
+  recordDispatchCycle(root, cycle); // 같은 runId: dispatch 줄은 중복 억제되어도 관측은 매 사이클 쌓인다
+  expect(readFileSync(join(root, 'orchestrator', 'dispatch-ledger.jsonl'), 'utf8').trim().split('\n')).toHaveLength(1);
+  const observations = readGateObservations24h(root, new Date(Date.now() + 60_000));
+  expect(observations).toHaveLength(2);
+  expect(observations.every(row => typeof row.at === 'string' && 'level' in row)).toBe(true);
 });

@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'bun:test';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { closeMergedTaskCard, type LandedTaskPr } from './postland-card.js';
+import { closeMergedTaskCard, reconcileHandMergedCard, type LandedTaskPr } from './postland-card.js';
 import { judgeLandedCell } from '../release-loop/landed-to-green.js';
-import type { TaskCard } from './task-hand.js';
+import { updateTaskCard, type TaskCard } from './task-hand.js';
 import type { Checklist, ChecklistItem } from '../release-loop/checklist.js';
 
 const head = 'a'.repeat(40);
@@ -354,4 +355,186 @@ describe('TA postland cell and card closure', () => {
       expect(f.read().history).toHaveLength(1);
     } finally { rmSync(f.dir, { recursive: true, force: true }); }
   });
+});
+
+describe('TA hand-merge reconcile', () => {
+  const mergeSha = 'c'.repeat(40);
+  const ancestorGit = { git: (_cwd: string, args: string[]) => (args.includes('--is-ancestor') ? { status: 0, stdout: '', stderr: '' } : { status: 1, stdout: '', stderr: '' }) };
+  const handDeps = (statePath: string) => ({ statePath, log: () => {}, ...ancestorGit });
+
+  function handFixture(number = 79, reason = 'failed/needs-owner — run died without a PR') {
+    const dir = mkdtempSync(join(tmpdir(), 'ta-postland-hand-'));
+    const statePath = join(dir, 'task-agent-actions.json');
+    const card: TaskCard = { id: `ta-${number}`, text: 'implement', createdAt: '2026-10-12T00:00:00Z', status: 'failed',
+      history: [{ at: '2026-10-12T01:00:00Z', event: 'judge', detail: reason }], checklistId: 'CELL',
+      pr: { number, url: `https://github.com/example/repo/pull/${number}` }, taLand: true,
+      landAttempts: [{ pr: number, head, at: '2026-10-13T00:00:00Z' }] };
+    writeFileSync(statePath, JSON.stringify({ tasks: { [card.id]: card } }));
+    return { dir, statePath, reason, read: () => JSON.parse(readFileSync(statePath, 'utf8')).tasks[`ta-${number}`] };
+  }
+
+  test('merged PR whose merge SHA is a main ancestor settles the failed card as landed-by-hand', () => {
+    const f = handFixture();
+    try {
+      const out = reconcileHandMergedCard({ ...pr, mergeCommit: mergeSha }, f.dir, handDeps(f.statePath));
+      expect(out).toMatchObject({ outcome: 'reconciled', card: 'ta-79', status: 'landed-by-hand', pr: 79, mergeSha });
+      expect(f.read().status).toBe('landed-by-hand');
+      expect(f.read().history).toHaveLength(2);
+      expect(f.read().history[1].event).toBe('hand-move');
+      expect(f.read().history[1].pr).toBe(79);
+      expect(f.read().history[1].head).toBe(mergeSha);
+      expect(f.read().history[1].detail).toContain('이전 status: failed');
+      expect(f.read().history[1].detail).toContain(`이전 사유: ${f.reason}`);
+      expect(f.read().history[0].detail).toBe(f.reason);
+      expect(f.read().landAttempts).toEqual([{ pr: 79, head, at: '2026-10-13T00:00:00Z' }]);
+      expect(f.read().prTerminal).toMatchObject({ pr: 79, head: mergeSha, state: 'MERGED' });
+      expect(f.read().postLand).toBeUndefined();
+      const again = reconcileHandMergedCard({ ...pr, mergeCommit: mergeSha }, f.dir, handDeps(f.statePath));
+      expect(again).toMatchObject({ outcome: 'not-reconciled', reason: 'card-not-failed' });
+      expect(f.read().history).toHaveLength(2);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  test('a merge SHA matching a recorded land attempt head settles as landed, keeping the prior reason', () => {
+    const f = handFixture();
+    try {
+      const out = reconcileHandMergedCard({ ...pr, mergeCommit: head }, f.dir, handDeps(f.statePath));
+      expect(out).toMatchObject({ outcome: 'reconciled', status: 'landed', mergeSha: head });
+      expect(f.read().status).toBe('landed');
+      expect(f.read().history).toHaveLength(2);
+      expect(f.read().history[1].event).toBe('hand-move');
+      expect(f.read().history[1].detail).toContain('land attempt head와 일치');
+      expect(f.read().history[1].detail).toContain('이전 status: failed');
+      expect(f.read().history[1].detail).toContain(`이전 사유: ${f.reason}`);
+      expect(f.read().history[0].detail).toBe(f.reason);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  test('an OPEN PR leaves the failed card unchanged', () => {
+    const f = handFixture();
+    try {
+      const out = reconcileHandMergedCard({ ...pr, state: 'OPEN' }, f.dir, handDeps(f.statePath));
+      expect(out).toMatchObject({ outcome: 'not-reconciled', reason: 'pr-not-merged' });
+      expect(f.read().status).toBe('failed');
+      expect(f.read().history).toHaveLength(1);
+      expect(f.read().prTerminal).toBeUndefined();
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  test('a MERGED PR whose merge SHA is not an ancestor of main leaves the card unchanged', () => {
+    const f = handFixture();
+    try {
+      const out = reconcileHandMergedCard({ ...pr, mergeCommit: mergeSha }, f.dir, { statePath: f.statePath, log: () => {}, git: () => ({ status: 1, stdout: '', stderr: '' }) });
+      expect(out).toMatchObject({ outcome: 'not-reconciled', reason: 'not-ancestor-of-main' });
+      expect(f.read().status).toBe('failed');
+      expect(f.read().history).toHaveLength(1);
+      expect(f.read().prTerminal).toBeUndefined();
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  test('a MERGED PR without a usable merge commit is skipped', () => {
+    const f = handFixture();
+    try {
+      const out = reconcileHandMergedCard({ ...pr, mergeCommit: 'not-a-sha' }, f.dir, handDeps(f.statePath));
+      expect(out).toMatchObject({ outcome: 'not-reconciled', reason: 'no-merge-sha' });
+      expect(f.read().status).toBe('failed');
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  test('a card another path already closed is not reconciled', () => {
+    const f = handFixture();
+    try {
+      const disk = JSON.parse(readFileSync(f.statePath, 'utf8'));
+      disk.tasks['ta-79'].status = 'done';
+      writeFileSync(f.statePath, JSON.stringify(disk));
+      const out = reconcileHandMergedCard({ ...pr, mergeCommit: mergeSha }, f.dir, handDeps(f.statePath));
+      expect(out).toMatchObject({ outcome: 'not-reconciled', reason: 'card-not-failed' });
+      expect(f.read().status).toBe('done');
+      expect(f.read().history).toHaveLength(1);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  test('a PR no card is bound to is skipped, and two bound cards are ambiguous', () => {
+    const unbound = handFixture(80);
+    const ambiguous = handFixture();
+    try {
+      expect(reconcileHandMergedCard({ ...pr, mergeCommit: mergeSha }, unbound.dir, handDeps(unbound.statePath)))
+        .toMatchObject({ outcome: 'not-reconciled', reason: 'no-bound-card' });
+      expect(unbound.read().status).toBe('failed');
+      const disk = JSON.parse(readFileSync(ambiguous.statePath, 'utf8'));
+      disk.tasks['ta-79b'] = { ...disk.tasks['ta-79'], id: 'ta-79b' };
+      writeFileSync(ambiguous.statePath, JSON.stringify(disk));
+      expect(reconcileHandMergedCard({ ...pr, mergeCommit: mergeSha }, ambiguous.dir, handDeps(ambiguous.statePath)))
+        .toMatchObject({ outcome: 'not-reconciled', reason: 'ambiguous-card' });
+      expect(ambiguous.read().status).toBe('failed');
+      expect(ambiguous.read().history).toHaveLength(1);
+    } finally { rmSync(unbound.dir, { recursive: true, force: true }); rmSync(ambiguous.dir, { recursive: true, force: true }); }
+  });
+
+  test('a card that flips off failed before the guarded write is left for its owning path', () => {
+    const f = handFixture();
+    try {
+      const updateCard: typeof updateTaskCard = (_path, id, mutate) => {
+        const disk = JSON.parse(readFileSync(f.statePath, 'utf8'));
+        disk.tasks[id].status = 'done';
+        writeFileSync(f.statePath, JSON.stringify(disk));
+        return updateTaskCard(f.statePath, id, mutate);
+      };
+      const out = reconcileHandMergedCard({ ...pr, mergeCommit: mergeSha }, f.dir, { statePath: f.statePath, log: () => {}, updateCard, ...ancestorGit });
+      expect(out).toMatchObject({ outcome: 'not-reconciled', reason: 'card-binding-changed-before-write' });
+      expect(f.read().status).toBe('done');
+      expect(f.read().history).toHaveLength(1);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  test('real git ancestry: only a merge commit on main settles the card', () => {
+    const gitEnv: Record<string, string | undefined> = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+    delete gitEnv.GIT_CONFIG_COUNT;
+    delete gitEnv.GIT_CONFIG_PARAMETERS;
+    delete gitEnv.GIT_TEMPLATE_DIR;
+    const dir = mkdtempSync(join(tmpdir(), 'ta-postland-git-'));
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', env: gitEnv }).trim();
+    const commit = (message: string) => git('-c', 'user.name=ta', '-c', 'user.email=ta@example.invalid', 'commit', '--allow-empty', '-m', message);
+    git('init', '-b', 'main');
+    commit('base');
+    git('checkout', '-b', 'feature');
+    commit('feature');
+    git('checkout', 'main');
+    git('-c', 'user.name=ta', '-c', 'user.email=ta@example.invalid', 'merge', '--no-ff', '-m', 'merge feature', 'feature');
+    const mergeCommit = git('rev-parse', 'HEAD');
+    git('checkout', '-b', 'dangling', 'main~1');
+    commit('not on main');
+    const dangling = git('rev-parse', 'HEAD');
+    const settled = handFixture();
+    const offMain = handFixture();
+    try {
+      const out = reconcileHandMergedCard({ ...pr, mergeCommit }, dir, { statePath: settled.statePath, mainRef: 'main', log: () => {} });
+      expect(out).toMatchObject({ outcome: 'reconciled', status: 'landed-by-hand', mergeSha: mergeCommit });
+      expect(settled.read().status).toBe('landed-by-hand');
+      expect(settled.read().history[1].event).toBe('hand-move');
+      const offMainOut = reconcileHandMergedCard({ ...pr, mergeCommit: dangling }, dir, { statePath: offMain.statePath, mainRef: 'main', log: () => {} });
+      expect(offMainOut).toMatchObject({ outcome: 'not-reconciled', reason: 'not-ancestor-of-main' });
+      expect(offMain.read().status).toBe('failed');
+      expect(offMain.read().history).toHaveLength(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); rmSync(settled.dir, { recursive: true, force: true }); rmSync(offMain.dir, { recursive: true, force: true }); }
+  });
+
+  for (const number of [26668, 27043, 27032, 26945]) {
+    test(`hand-landed card #${number}: merged+main-ancestor reconciles to landed-by-hand with prior status and reason preserved`, () => {
+      const reason = `failed/needs-owner — run died; 손수리 PR #${number} 병합됨`;
+      const f = handFixture(number, reason);
+      try {
+        const out = reconcileHandMergedCard({ number, url: `https://github.com/example/repo/pull/${number}`, headRefOid: head, state: 'MERGED', baseRefName: 'main', mergedAt: '2026-10-14T00:00:00Z', files: [{ path: 'src/task-agent/postland-card.ts' }], mergeCommit: mergeSha }, f.dir, handDeps(f.statePath));
+        expect(out).toMatchObject({ outcome: 'reconciled', card: `ta-${number}`, status: 'landed-by-hand', pr: number });
+        const card = f.read();
+        expect(card.status).toBe('landed-by-hand');
+        expect(card.history[0].detail).toBe(reason);
+        expect(card.history[1].event).toBe('hand-move');
+        expect(card.history[1].detail).toContain('이전 status: failed');
+        expect(card.history[1].detail).toContain(`이전 사유: ${reason}`);
+        expect(card.prTerminal).toMatchObject({ pr: number, head: mergeSha, state: 'MERGED' });
+        expect(card.landAttempts).toEqual([{ pr: number, head, at: '2026-10-13T00:00:00Z' }]);
+      } finally { rmSync(f.dir, { recursive: true, force: true }); }
+    });
+  }
 });

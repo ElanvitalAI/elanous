@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LogStore, logsDbPath } from '../../mss/logging/log-store.js';
 import { getUserConfig, resetUserConfig } from '../../user-config.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 import { goalTouchesPwa, podMemoryLimitFor, podMemoryRequestFor, podJobManifest, podSelfImplementSpawn } from './self-implement-pod.js';
 import { advisePodMemory, readPodMemoryAdvice } from '../../cli/pod-memory-advice.js';
 import { measurePodMemoryByGoal } from '../../../scripts/measure-pod-memory-by-goal.js';
@@ -317,6 +318,7 @@ describe('POD7 measured advice launch opt-in', () => {
     };
     try {
       mkdirSync(join(root, 'elanous'));
+      setElanousConfigDir(join(root, 'elanous'));
       const store = new LogStore(logsDbPath());
       try {
         store.insertBatch([...rows, ...[1, 2, 3].flatMap((n) => [
@@ -358,6 +360,7 @@ describe('POD7 measured advice launch opt-in', () => {
       else process.env.XDG_CONFIG_HOME = previous.config;
       if (previous.state === undefined) delete process.env.ELANOUS_STATE_DIR;
       else process.env.ELANOUS_STATE_DIR = previous.state;
+      resetElanousConfigDir();
       resetUserConfig();
       rmSync(root, { recursive: true, force: true });
     }

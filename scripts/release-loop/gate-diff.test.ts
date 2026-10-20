@@ -30,8 +30,10 @@ test('Bun failure headers associate test names with files, strip timing and dedu
 
 test('failure marker in a passing test title is not parsed as a failure line', () => {
   const isolated = `src/self-implement/decision-signal-press.test.ts:\n(pass) moves a signal out of pressedRed when every (fail) name also failed on the baseline [0.61ms]\n 21 pass\n 0 fail\nRan 21 tests across 1 file.\n`;
-  const mixed = `${isolated}src/real.test.ts:\n(pass) title contains (fail) as ordinary text\n(fail) actual broken case [1.00ms]\n 1 pass\n 1 fail\nRan 2 tests across 1 file.\n`;
+  const body = `src/self-implement/decision-signal-press.test.ts:\n(pass) assertion body mentions (fail) without failing [0.20ms]\n  expected: every (fail) name also failed\n  received: (fail) was only in the assertion body\n  (fail) indented reporter-shaped text is still body\n 21 pass\n 0 fail\nRan 21 tests across 1 file.\n`;
+  const mixed = `${isolated}src/real.test.ts:\n(pass) title contains (fail) as ordinary text\n  body also says (fail) here\n(fail) actual broken case [1.00ms]\n 1 pass\n 1 fail\nRan 2 tests across 1 file.\n`;
   expect(parseFailures(isolated)).toEqual([]);
+  expect(parseFailures(body)).toEqual([]);
   expect(parseFailures(mixed)).toEqual(['src/real.test.ts > actual broken case']);
 });
 

@@ -18,6 +18,7 @@ import {
   resetSkillIndex,
 } from './index.js';
 import { buildUserConfig, resetUserConfig } from '../user-config.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 
 type ObservedLog = { category: string; event: string; data?: unknown };
 
@@ -81,12 +82,14 @@ function withCommandFlag(enabled: boolean, run: () => void): void {
     if (enabled) skills.includeClaudePackageCommands = true;
     writeFileSync(join(xdg, 'elanous', 'config.json'), JSON.stringify({ skills }));
     process.env.XDG_CONFIG_HOME = xdg;
+    setElanousConfigDir(join(xdg, 'elanous'));
     resetUserConfig();
     resetSkillIndex();
     run();
   } finally {
     if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = savedXdg;
+    resetElanousConfigDir();
     resetUserConfig();
     resetSkillIndex();
     rmSync(xdg, { recursive: true, force: true });
@@ -339,6 +342,7 @@ describe('buildSkillIndex — includeClaudePackageCommands wiring', () => {
   afterEach(() => {
     if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = savedXdg;
+    resetElanousConfigDir();
     resetUserConfig();
     resetSkillIndex();
   });
@@ -387,6 +391,7 @@ describe('buildSkillIndex — includeClaudePackageCommands wiring', () => {
           skills: { includeClaudePackageSkills: true },
         }));
         process.env.XDG_CONFIG_HOME = xdg;
+        setElanousConfigDir(join(xdg, 'elanous'));
         resetUserConfig();
         resetSkillIndex();
         const idx = buildSkillIndex([skillRoot], { pluginsRoot: root });
@@ -396,6 +401,7 @@ describe('buildSkillIndex — includeClaudePackageCommands wiring', () => {
       } finally {
         if (saved === undefined) delete process.env.XDG_CONFIG_HOME;
         else process.env.XDG_CONFIG_HOME = saved;
+        resetElanousConfigDir();
         rmSync(xdg, { recursive: true, force: true });
       }
     });

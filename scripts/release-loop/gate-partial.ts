@@ -9,7 +9,7 @@ import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } 
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
-import { CODE_FILE, type ClosureVerdict } from './gate-closure';
+import { CODE_FILE, TRACEABLE_RELEASE_JSON, type ClosureVerdict } from './gate-closure';
 
 export interface PartialPlan {
   /** A verified docs-only append carries the completed, clean cut without starting a test Pod. */
@@ -137,13 +137,13 @@ export function planPartialRegate(input: { version: string; priorCommit: string;
   const source = input.changedFiles.filter((file) => !TEST_FILE.test(file) && !isInert(file));
   const list = (files: string[]) => `${files.slice(0, 5).join(', ')}${files.length > 5 ? ` (+${files.length - 5})` : ''}`;
   // Only code is followed through the closure: a changed fixture, JSON, lockfile, config or script is a full gate.
-  const notCode = source.filter((file) => !CODE_FILE.test(file));
+  const notCode = source.filter((file) => !CODE_FILE.test(file) && file !== TRACEABLE_RELEASE_JSON);
   if (source.length && (!input.closure || notCode.length)) return { ok: false, reason: `non-test change → full gate: ${list(notCode.length ? notCode : source)}` };
   let reaching: string[] = [];
   let closure: { reached: number; opaque: number } | undefined;
   if (source.length) {
     let verdict: ClosureVerdict;
-    try { verdict = input.closure!(input.changedFiles.filter((file) => CODE_FILE.test(file))); }
+    try { verdict = input.closure!(input.changedFiles.filter((file) => CODE_FILE.test(file) || file === TRACEABLE_RELEASE_JSON)); }
     catch (error) { return { ok: false, reason: `import closure unreadable → full gate: ${String(error instanceof Error ? error.message : error).slice(0, 200)}` }; }
     if (!verdict.ok) return { ok: false, reason: verdict.reason };
     const unsafe = verdict.tests.filter((file) => !TEST_FILE.test(file) || file.split('/').includes('..'));

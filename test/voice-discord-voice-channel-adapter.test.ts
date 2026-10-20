@@ -14,11 +14,13 @@ import {
 import { createDiscordVoiceChannelDispatcher } from '../src/voice/channel-adapters/discord-voice-channel-commands.js';
 import { bootDiscordVoiceChannel } from '../src/voice/channel-adapters/discord-voice-channel-host-boot.js';
 import { resetUserConfig } from '../src/user-config.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
 
 const ORIGINAL_ENV = { ...process.env };
 let tempConfigRoot: string | null = null;
 
 afterEach(() => {
+  resetElanousConfigDir();
   for (const k of Object.keys(process.env)) {
     if (!(k in ORIGINAL_ENV)) delete process.env[k];
   }
@@ -38,6 +40,7 @@ function writeConfig(raw: unknown): void {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'config.json'), JSON.stringify(raw, null, 2));
   process.env.XDG_CONFIG_HOME = tempConfigRoot;
+  setElanousConfigDir(dir);
   resetUserConfig();
 }
 

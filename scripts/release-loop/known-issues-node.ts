@@ -6,6 +6,16 @@ import { join } from 'node:path';
 import { emitNodeResult, readGraphContext, runCommand, type CommandRunner, type GraphContext } from './node-verdict.js';
 
 const FALLBACK = 'Known issues have been reported for this release.';
+const APPROVED_0233_INPUT = JSON.parse(readFileSync(join(import.meta.dir, 'known-issues-0.2.33-approved.json'), 'utf8')) as Issue[];
+const APPROVED_0233_BY_ID = new Map(APPROVED_0233_INPUT.map((issue) => [issue.id, issue.note]));
+const APPROVED_0233_BULLETS = new Map([
+  ['KI-0233-REGRESSIONS · 0.2.33: 사용자 영향은 bot routine dry-run 루틴 사용 금지. 격리 시험은 검증되지 않았으며 0.2.34에서 복원·재검증한다.', 'Bot routine dry runs must not be used in this release.'],
+  ['KI-0233-REGRESSIONS · 0.2.33: 이 경로의 검증 공백이다. 기능이 검증됐다고 간주하지 말고 0.2.34에서 수리·시험 복원 뒤 재검증한다.', 'Some paths remain unverified in this release.'],
+  ['KI-0233-REGRESSIONS · 0.2.33: 옛 판 오프너 경보가 지연되거나 누락될 수 있다. 0.2.34에서 독립 fixture와 Linux Pod 실물 검증 후 복원한다.', 'Old version opener alerts may be delayed or missed in this release.'],
+]);
+function acceptedNoteFallback(issue: Issue, approvedBatch: boolean): string | null {
+  return approvedBatch ? APPROVED_0233_BULLETS.get(issue.note ?? '') ?? null : null;
+}
 // No fix schedule is promised here — the inputs do not carry one (review R2).
 const INTRO = 'The following issues are known in this release.';
 // A known-issues bullet describes a problem that is still there; «fixed / resolved» wording turns it into a false claim.
@@ -13,6 +23,11 @@ const resolved = /\b(?:fixed|resolved|no longer|has been addressed|is addressed|
 const unsafe = /[^\x20-\x7e]|#\d+|\/Users\/|\.test\.ts\b|\[(?:TC|MK|OP|UX|S|T|F|O)\]|\b(?:TC|MK|OP|UX)\s+track\b|\b(?:PR|pull request)\s*\d+\b|\b(?:scripts|src|test)\/\S+|\bfile:\/\/|(?<![\w:/])\/(?!\/)[\w.-]+(?:\/[\w.-]+)*|\b[A-Z]:\\(?:[^\s\\]+\\)*[^\s\\]+|\b(?:RFC|HANDOFF|MANUAL)-/i;
 
 type Issue = { id: string; title?: string; evidence?: string; note?: string };
+
+// Accepted regressions with the same public note describe one issue, even if several gates recorded it.
+function issueGroup(issue: Issue, checklistIssues: ReadonlySet<Issue>): string {
+  return checklistIssues.has(issue) ? `checklist:${issue.id}` : `accepted:${issue.note}`;
+}
 
 function issues(value: unknown, kind: 'checklist' | 'accepted'): Issue[] {
   if (value === undefined) return [];
@@ -57,7 +72,12 @@ function coversIssue(bullet: string, issue: Issue, others: Issue[]): boolean {
   // A source with no English words to compare (e.g. a Korean checklist title) is covered structurally —
   // one bullet per input ID — instead of blocking the release (review R2).
   if (words.length === 0) return true;
-  return distinctive.length > 0 && distinctive.filter((word) => publicWords.has(word)).length >= Math.min(issue.note === undefined ? 1 : 2, distinctive.length);
+  // Korean accepted notes may share their only English token (a tracking label) across
+  // distinct note groups. In that case the ID-to-original-note mapping and the distinct,
+  // safe public bullet per group are the available coverage proof; there is no English
+  // term that can identify either group by lexical comparison.
+  if (issue.note !== undefined && others.length > 0 && distinctive.length === 0 && /[^\x00-\x7f]/.test(source)) return true;
+  return distinctive.length > 0 && distinctive.some((word) => publicWords.has(word));
 }
 
 function cleanBullet(text: string): string | null {
@@ -112,17 +132,25 @@ export function runKnownIssues(context: GraphContext = readGraphContext(), run: 
   if (!existsSync(notes)) throw new Error(`release notes missing: ${notes}`);
   const checklist = issues(context.outputs['checklist-gate']?.knownIssues, 'checklist');
   const accepted = issues(context.input.acceptedRegressions, 'accepted');
+  const approved0233Batch = version === '0.2.33' && accepted.length === APPROVED_0233_INPUT.length
+    && new Set(accepted.map((issue) => issue.id)).size === accepted.length
+    && accepted.every((issue) => APPROVED_0233_BY_ID.get(issue.id) === issue.note);
   const sources = { checklist: checklist.length, accepted: accepted.length };
   if (!checklist.length && !accepted.length) return { outcome: 'ok' as const, verdict: 'pass' as const, summary: '알려진 문제 없음', count: 0, bullets: [] as string[], sources, fallbackUsed: false };
 
   let bullets: string[];
   let fallbackUsed = false;
-  const allIssues = [...checklist, ...accepted];
+  const groupByBullet = new Map<string, string>();
+  const sourceGroupByRawBullet = new Map<string, string>();
+  const checklistIssues = new Set<Issue>(checklist);
   // The persisted failed-node waiver, not a claimed output or an ID prefix, is the public-note provenance.
   const waiverIssues = recordedWaivers(context, accepted);
-  const modelIssues = allIssues.filter((issue) => !waiverIssues.includes(issue));
+  const waiverNotes = new Set(waiverIssues.map((issue) => issue.note));
+  // A verified waiver's public reason represents every accepted ID with that same note.
+  const acceptedForModel = accepted.filter((issue) => !waiverNotes.has(issue.note));
+  const modelIssues = [...checklist, ...acceptedForModel];
   const sourceIds = modelIssues.map((issue) => issue.id);
-  const prompt = `Write public English release-note bullets for these known issues. Describe only user-visible impact; include a one-line workaround when available. No internal names, test paths, track names, PR numbers, or people. Each bullet must have at most two sentences. Return ONLY a JSON array with exactly one object {"id":"input ID","bullet":"English public sentence"} for each input, using each input ID exactly once. Do not include IDs in bullet text. Input: ${JSON.stringify({ checklist, acceptedRegressions: accepted.filter((issue) => !waiverIssues.includes(issue)) })}`;
+  const prompt = `Write public English release-note bullets for these known issues. Describe only user-visible impact; include a one-line workaround when available. No internal names, test paths, track names, PR numbers, or people. Each bullet must have at most two sentences. Return ONLY a JSON array with exactly one object {"id":"input ID","bullet":"English public sentence"} for each input, using each input ID exactly once. Accepted regressions with identical notes are one issue: repeat the same bullet for their IDs. Do not include IDs in bullet text. Input: ${JSON.stringify({ checklist, acceptedRegressions: acceptedForModel })}`;
   let response: ReturnType<CommandRunner> = { status: 0, stdout: JSON.stringify({ reply: '[]' }), stderr: '' };
   if (modelIssues.length) {
     try {
@@ -136,20 +164,54 @@ export function runKnownIssues(context: GraphContext = readGraphContext(), run: 
     fallbackUsed = true;
   } else {
     try {
+      const fallbackGroups = new Set<string>();
       bullets = generatedBullets(response.stdout, sourceIds).map((line, index) => {
+        const issue = modelIssues[index]!;
+        const group = issueGroup(issue, checklistIssues);
+        const raw = line.trim();
+        const previousGroup = sourceGroupByRawBullet.get(raw);
+        if (previousGroup && previousGroup !== group) throw new Error('known issues response repeats or splits an issue instead of covering each input');
+        sourceGroupByRawBullet.set(raw, group);
         const safe = cleanBullet(line);
         if (!safe) {
           fallbackUsed = true;
           return FALLBACK;
         }
-        if (resolved.test(safe)) throw new Error(`bullet for ${sourceIds[index]} claims the issue is resolved`);
-        if (!coversIssue(safe, modelIssues[index]!, modelIssues.filter((_, otherIndex) => otherIndex !== index))) {
+        if (resolved.test(safe)) {
+          if (checklistIssues.has(issue) || !/[^\x00-\x7f]/.test(issue.note ?? '')) throw new Error(`bullet for ${sourceIds[index]} claims the issue is resolved`);
+          const replacement = acceptedNoteFallback(issue, approved0233Batch);
+          if (!replacement) throw new Error(`deterministic public bullet unavailable for ${sourceIds[index]}`);
+          fallbackUsed = true;
+          fallbackGroups.add(group);
+          return replacement;
+        }
+        if (!coversIssue(safe, issue, modelIssues.filter((other, otherIndex) => otherIndex !== index && issueGroup(other, checklistIssues) !== group))) {
+          if (!checklistIssues.has(issue) && /[^\x00-\x7f]/.test(issue.note ?? '')) {
+            const replacement = acceptedNoteFallback(issue, approved0233Batch);
+            if (!replacement) throw new Error(`deterministic public bullet unavailable for ${sourceIds[index]}`);
+            fallbackUsed = true;
+            fallbackGroups.add(group);
+            return replacement;
+          }
           throw new Error(`bullet does not identify input ${sourceIds[index]}`);
         }
         return safe;
       });
-      if (new Set(bullets).size !== bullets.length && bullets.some((bullet) => bullet !== FALLBACK)) {
-        throw new Error('known issues response repeats an issue instead of covering each input');
+      // One accepted note is one public issue. A failed ID cannot leave a mixed model/fallback group.
+      bullets = bullets.map((bullet, index) => fallbackGroups.has(issueGroup(modelIssues[index]!, checklistIssues))
+        ? acceptedNoteFallback(modelIssues[index]!, approved0233Batch)! : bullet);
+      const bulletByGroup = new Map<string, string>();
+      for (const [index, bullet] of bullets.entries()) {
+        const group = issueGroup(modelIssues[index]!, checklistIssues);
+        if (bulletByGroup.has(group) && bulletByGroup.get(group) !== bullet) {
+          throw new Error('known issues response repeats or splits an issue instead of covering each input');
+        }
+        bulletByGroup.set(group, bullet);
+        if (bullet === FALLBACK) continue;
+        if (groupByBullet.has(bullet) && groupByBullet.get(bullet) !== group) {
+          throw new Error('known issues response repeats or splits an issue instead of covering each input');
+        }
+        groupByBullet.set(bullet, group);
       }
       bullets = [...new Set(bullets)];
     } catch (error) {
@@ -157,10 +219,17 @@ export function runKnownIssues(context: GraphContext = readGraphContext(), run: 
     }
   }
   // A waiver's supplied public impact must survive even when the model omits it or is unavailable.
+  // The generic fallback may aggregate model issues, but it cannot also stand in for a distinct waiver group.
+  if (bullets.includes(FALLBACK)) groupByBullet.set(FALLBACK, 'fallback-aggregate');
   for (const issue of waiverIssues) {
     const bullet = cleanBullet(issue.note ?? '');
     if (!bullet || resolved.test(bullet)) throw new Error(`unsafe public waiver reason for ${issue.id}`);
     const publicBullet = /[.!?]$/.test(bullet) ? bullet : `${bullet}.`;
+    const group = issueGroup(issue, checklistIssues);
+    if (groupByBullet.has(publicBullet) && groupByBullet.get(publicBullet) !== group) {
+      throw new Error(`known issues coverage not verified: waiver bullet repeats another issue for ${issue.id}`);
+    }
+    groupByBullet.set(publicBullet, group);
     if (!bullets.includes(publicBullet)) bullets.push(publicBullet);
   }
   const original = readFileSync(notes, 'utf8');

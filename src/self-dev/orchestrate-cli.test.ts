@@ -101,6 +101,41 @@ describe('runSelfOrchestrateCliCommand — parallel 재라우팅 글루 seam', (
     expect(identities.map((identity) => identity.parentRequest)).toEqual([parentRequest, parentRequest, parentRequest]);
   });
 
+  it('TA task-card 진입점도 불완전한 조각만 보류하고 부모 경계를 이어 독립 조각은 실행한다', async () => {
+    const previousTaskCardId = process.env.ELANOUS_TASK_CARD_ID;
+    process.env.ELANOUS_TASK_CARD_ID = 'ta-cli-boundary-test';
+    const spawned: string[] = [];
+    try {
+      const out = await runSelfOrchestrateCliCommand({
+        parentRequest: '완료 경계 코드: src/task-agent/parent.ts 변경',
+        goals: [
+          { feature: '대상 경로: src/task-agent/incomplete.ts' },
+          { feature: '완료 경계 코드: docs/independent.md 갱신\n완료 경계 실물: 문서가 저장소에 있음\n완료 경계 증거 명령: bun test src/docs/independent.test.ts' },
+        ],
+        runtime: {},
+      }, {
+        pipelineDeps: {
+          orchestrateSelfDev: (opts) => orchestrateSelfDev({
+            ...opts,
+            spawn: (job) => {
+              spawned.push(job.feature);
+              return { address: job.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: { stage: 'worktree-completed', ok: true } }) };
+            },
+          }),
+        },
+      });
+      expect(out.ok).toBe(true);
+      if (!out.ok) return;
+      expect(spawned).toHaveLength(1);
+      expect(spawned[0]).toContain('완료 경계 코드: src/task-agent/parent.ts 변경');
+      expect(out.results).toContainEqual(expect.objectContaining({ stage: 'needs-human', stopReason: 'needs-human' }));
+      expect(out.results).toContainEqual(expect.objectContaining({ feature: expect.stringContaining('docs/independent.md'), status: 'done' }));
+    } finally {
+      if (previousTaskCardId === undefined) delete process.env.ELANOUS_TASK_CARD_ID;
+      else process.env.ELANOUS_TASK_CARD_ID = previousTaskCardId;
+    }
+  });
+
   it('비분해 실행 → 실제 Shard identity에 parentRequest 키 자체가 없음', async () => {
     const received: string[] = [];
     const spawn: SelfImplementJobSpawn = (input) => {
@@ -837,9 +872,9 @@ describe('decompose-and-retry — 단일이 «연합으로 승격»된다', () =
       { executeReroute, readProposals: (input) => {
         requests.push({ shardIds: input!.shardIds, ...(input!.runIds ? { runIds: input!.runIds } : {}) });
         return { proposals: new Map([['run-single', { shardId: 'run-single', pieces: [
-          { id: 'p1', feature: 'part one', dependsOn: [] },
-          { id: 'p2', feature: 'part two', dependsOn: [] },
-        ] }]]), goalPlanRevisions: new Map(), scannedFiles: 1, unreadableFiles: 0, directoryMissing: false, ledgerDirectory: '/x' };
+          { id: 'p1', feature: 'part one', dependsOn: [], hotPathOverlaps: [] },
+          { id: 'p2', feature: 'part two', dependsOn: [], hotPathOverlaps: [] },
+        ], hotPathOverlaps: [] }]]), goalPlanRevisions: new Map(), scannedFiles: 1, unreadableFiles: 0, directoryMissing: false, ledgerDirectory: '/x' };
       } },
     );
     expect(requests[0]).toEqual({ shardIds: ['task-single'], runIds: ['run-single'] });
@@ -875,9 +910,9 @@ describe('decompose-and-retry — 단일이 «연합으로 승격»된다', () =
       { executeReroute, pipelineDeps: { orchestrateSelfDev }, readProposals: (input) => {
         expect(input?.runIds).toEqual(['run-produced']);
         return { proposals: new Map([['run-produced', { shardId: 'run-produced', pieces: [
-          { id: 'p1', feature: 'part one', dependsOn: [] },
-          { id: 'p2', feature: 'part two', dependsOn: [] },
-        ] }]]), goalPlanRevisions: new Map(), scannedFiles: 1, unreadableFiles: 0, directoryMissing: false, ledgerDirectory: '/x' };
+          { id: 'p1', feature: 'part one', dependsOn: [], hotPathOverlaps: [] },
+          { id: 'p2', feature: 'part two', dependsOn: [], hotPathOverlaps: [] },
+        ], hotPathOverlaps: [] }]]), goalPlanRevisions: new Map(), scannedFiles: 1, unreadableFiles: 0, directoryMissing: false, ledgerDirectory: '/x' };
       } },
     );
     if (!out.ok) throw new Error(out.message);
@@ -1019,9 +1054,9 @@ describe('decompose-and-retry — 단일이 «연합으로 승격»된다', () =
     await runSelfOrchestrateCliCommand(
       { goals: [{ feature: 'big goal' }], runtime: {}, supervise: { rounds: 2 } },
       { executeReroute, readProposals: () => ({ proposals: new Map([['run-other', { shardId: 'run-other', pieces: [
-        { id: 'p1', feature: 'part one', dependsOn: [] },
-        { id: 'p2', feature: 'part two', dependsOn: [] },
-      ] }]]), goalPlanRevisions: new Map(), scannedFiles: 1, unreadableFiles: 0, directoryMissing: false, ledgerDirectory: '/x' }) },
+        { id: 'p1', feature: 'part one', dependsOn: [], hotPathOverlaps: [] },
+        { id: 'p2', feature: 'part two', dependsOn: [], hotPathOverlaps: [] },
+      ], hotPathOverlaps: [] }]]), goalPlanRevisions: new Map(), scannedFiles: 1, unreadableFiles: 0, directoryMissing: false, ledgerDirectory: '/x' }) },
     );
     const second = specs[1] as { parallel?: { goals?: { feature: string }[] } };
     expect(second.parallel?.goals?.map((g) => g.feature)).toEqual(['big goal']);

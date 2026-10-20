@@ -1,0 +1,2 @@
+observe:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../../../scripts/graph-units/ta-journey-observe.ts" author'

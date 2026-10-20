@@ -10,7 +10,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, readFileSync, statSync, writeFileSync, type Stats } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { validateUnitCalls } from '../graph-runner/runner.js';
@@ -29,7 +29,8 @@ import { parseWorkOrder, renderWorkOrderGoal, WORK_ORDER_FILE_PATTERN, type Work
 import { inspectPrelaunchAlreadyDone, type AlreadyDoneDecision, type AlreadyDoneCandidate,
   type PrelaunchGitRunnerForTest } from './prelaunch-already-done.js';
 import { draftReleaseComment } from '../self-dev/draft-triage-rules.js';
-import { parseAskTargetPathHints } from '../self-dev/launch-preflight-text.js';
+import { parseAskTargetPathHints, parseAskTargetPathHintsResult } from '../self-dev/launch-preflight-text.js';
+import { inspectGoalDoneBoundary } from '../self-implement/goal-author.js';
 import { INFLIGHT_REGISTRY_FILE, registerInflight } from '../pr-tool/inflight-registry.js';
 
 export interface ResolveHandTextDeps {
@@ -210,6 +211,8 @@ export interface TaskCardMove { kind: 'launch' | 'wait'; command?: string[]; rea
 export interface TaskCard {
   id: string;
   text: string;
+  /** 첫 줄 대상 경로 라벨에서 확인한 저장소 상대 경로. 필드 부재는 경로를 모른다는 뜻이다. */
+  targetPaths?: string[];
   seat?: TaskSeat;
   checklistId?: string;
   /** Explicit release version for an adopted PR; post-land still confirms the cell exists there. */
@@ -231,8 +234,11 @@ export interface TaskCard {
    * launch-failed = 발사기가 띄우기에 실패했다(사유는 history 마지막 칸) — 다음 수는 다시 발사.
    * failed = 발사된 런이 PR·수확 가지 없이 죽었거나 끝내 안 떴다(TA-JUDGE-DEAD-RUN · `card-evidence.ts`) — 사유
    * (`failed/needs-owner|needs-relaunch — …`)는 history 마지막 칸 · 자동 재발사하지 않는다(사람/판단부 몫).
+   * landed-by-hand = 실패 카드에 묶인 PR을 사람이 손수 병합해 main 에 안착시켰다(TA-CARD-MERGE-RECONCILE ·
+   * `postland-card.ts` `reconcileHandMergedCard`) — 이전 status·사유는 history `hand-move` 줄에 보존된다.
+   * landed = 병합된 merge 커밋이 카드의 land attempt head 와 정확히 일치해 에이전트 착지로 확정했다(같은 정산 경로).
    */
-  status: 'handed' | 'launched' | 'launch-failed' | 'failed' | 'done';
+  status: 'handed' | 'launched' | 'launch-failed' | 'failed' | 'landed-by-hand' | 'landed' | 'done';
   history: TaskCardEvent[];
   /** 미션 카드만 — 조각 카드 id(순서대로) · 쪼갠 출처(`mission.ts` splitMission). */
   pieces?: string[];
@@ -292,7 +298,7 @@ export interface TaskCard {
    * REJUDGE base-stale — `base-stale` (overlap evidence gate base went stale with PR-file overlap) waits for a re-gate on a new base;
    * only after that re-gate passes is the attempt consumed (`openLandAttempts`) and the same head may land once more.
    */
-  landAttempts?: Array<{ pr: number; head: string; at: string; ok?: boolean; detail?: string; class?: 'infra' | 'judgement' | 'base-stale'; reason?: string }>;
+  landAttempts?: Array<{ pr: number; head: string; at: string; ok?: boolean; detail?: string; class?: 'infra' | 'judgement' | 'base-stale' | 'recovery'; reason?: string }>;
   /** TA-LIVE-LAND-2 — `tasks hand --ta-land`: this card's run leaves the merge to the task agent (propose-land). */
   taLand?: true;
   /** TASKS-HAND-CHILD-LLM — `tasks hand --child-llm <provider>/<model> [--child-llm-effort <level>]` → 발사 인자 `--child-llm-provider/-model/-effort`. */
@@ -434,6 +440,25 @@ export function readTaskCard(id: string, path = taskAgentStatePath()): TaskCard 
   return readState(path).tasks?.[id];
 }
 
+function canonicalTargetPaths(paths: readonly string[]): string[] {
+  return [...new Set(paths.filter((path): path is string => typeof path === 'string').map((path) => posix.normalize(path))
+    .filter((path) => path !== '.' && path !== '..' && !posix.isAbsolute(path)
+      && !path.startsWith('../') && !path.includes('\\') && !/^[A-Za-z]:\//.test(path)))].sort();
+}
+
+/** 같은 저장소 경로를 만지는 착지 전 카드만 돌려준다. 경로 미기록 카드는 추측하지 않는다. */
+export function cardsTouchingPaths(cards: readonly TaskCard[], paths: readonly string[]): Array<{
+  card: TaskCard; checklistId?: string; runId?: string; pr?: number; paths: string[];
+}> {
+  const wanted = new Set(canonicalTargetPaths(paths));
+  if (wanted.size === 0) return [];
+  return cards.filter((card) => card.status === 'launched' && !card.postLand && !card.trainLanding && !card.prTerminal)
+    .map((card) => ({ card, paths: canonicalTargetPaths(card.targetPaths ?? []).filter((path) => wanted.has(path)) }))
+    .filter((item) => item.paths.length > 0)
+    .map(({ card, paths }) => ({ card, ...(card.checklistId ? { checklistId: card.checklistId } : {}),
+      ...(card.runId ? { runId: card.runId } : {}), ...(cardPrNumber(card) !== undefined ? { pr: cardPrNumber(card) } : {}), paths }));
+}
+
 export const CLOSED_BY_HAND_EVENT = 'closed-by-hand';
 
 /** 카드를 손으로 닫는다 — 상태를 `failed` 로 두고 history 에 한 줄(`closed-by-hand`)을 남긴다. 이미 손으로 닫은 카드는 그대로 돌려준다(멱등). */
@@ -552,7 +577,7 @@ export function shellQuote(arg: string): string {
 }
 
 /** 발사기에 넘기는 연결 — env(`ELANOUS_RUN_ID`)를 자식 환경에 얹으면 하니스 런이 `runId` 로 돈다(`resolveRunIdentity` 상속). launchId 는 카드에만 남는 발사 토큰이다. */
-export interface TaskLaunchContext { runId: string; launchId: string; env: Record<string, string>; cardLabelContext?: TaskCardLabelContext }
+export interface TaskLaunchContext { runId: string; launchId: string; env: Record<string, string>; cardLabelContext?: TaskCardLabelContext; substrate?: 'pod'; podGoal?: string; effectiveChildProvider?: string }
 /** 발사기가 «이 런 id 로 띄웠다»고 돌려주는 영수증 — 없으면 카드에 런 id 를 적지 않는다(추측하지 않는다). */
 export interface TaskLaunchReceipt {
   runId?: string;
@@ -657,6 +682,8 @@ export function dispatchDeliverableCompletion(id: string, input: { ref: string; 
 export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const text = opts.text.trim();
   if (!text) throw new Error('과제 한 줄이 비어 있다');
+  const targetPathHints = parseAskTargetPathHintsResult(text);
+  const targetPaths = canonicalTargetPaths(targetPathHints.paths);
   if (opts.seat !== undefined && !TASK_SEATS.includes(opts.seat)) throw new Error(`자리는 ${TASK_SEATS.join('|')} 중 하나다: ${opts.seat}`);
   if (opts.completion !== undefined && !COMPLETION_KINDS.includes(opts.completion)) throw new Error(`종결 종류는 ${COMPLETION_KINDS.join('|')} 중 하나다: ${opts.completion}`);
   for (const [flag, value] of [['--goal', opts.goal], ['--milestone', opts.milestone]] as const) {
@@ -708,6 +735,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const path = opts.statePath ?? taskAgentStatePath();
   const card: TaskCard = {
     id, text,
+    ...(!targetPathHints.labelMissing ? { targetPaths } : {}),
     ...(opts.seat ? { seat: opts.seat } : {}),
     ...(opts.checklistId ? { checklistId: opts.checklistId } : {}),
     ...(opts.checklistVersion !== undefined ? { checklistVersion: opts.checklistVersion } : {}),
@@ -748,6 +776,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     if (!owned.ok) throw new TaskCardSupersededError(next.id);
   };
   writeCard(path, card);
+  try { debug.log('task-agent.hand', 'target-paths', { card: id, count: targetPaths.length, labelMissing: targetPathHints.labelMissing }); } catch { /* fail-soft */ }
   try { debug.log('task-agent.graph-select', !selected.composition ? 'composition-missing' : selected.error ? 'composition-invalid' : 'composition-selected', {
     completion, file: selected.composition?.file ?? `graphs/work/${completion}.yaml`,
     unitsResolved: selected.unitsResolved, missingUnits: selected.missingUnits,
@@ -761,6 +790,17 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   }
   if (mode === 'shadow') return { card, move, mode, launched: false, ...(project ? { cwd: project.target } : {}) };
   if (!opts.launcher) throw new Error('--live 인데 launcher 가 없다');
+  if (completion === 'code-pr' && card.checklistId) {
+    const { missing } = inspectGoalDoneBoundary(text);
+    if (missing.length > 0) {
+      const reason = `goal-revision-required: 완료 경계 누락 ${missing.join(' · ')} — 골 문면을 고친 뒤 다시 넘기세요`;
+      const failed: TaskCard = { ...card, status: 'failed', history: [...card.history,
+        { at: (opts.now ?? (() => new Date()))().toISOString(), event: 'goal-revision-required', detail: reason }] };
+      writeCard(path, failed);
+      try { debug.log('task-agent.hand', 'done-boundary-missing', { taskId: id, checklistId: card.checklistId ?? null, missing, reason }); } catch { /* fail-soft */ }
+      throw new Error(`${reason} (카드 ${id})`);
+    }
+  }
   let prelaunch: AlreadyDoneDecision;
   try { prelaunch = completion === 'code-pr'
     ? (opts.prelaunchInspector ?? ((input, target) => inspectPrelaunchAlreadyDone(input, target,
@@ -779,9 +819,14 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const runId = mintRunId();
   const launchId = `tl-${randomBytes(6).toString('hex')}`;
   const context: TaskLaunchContext = { runId, launchId, env: { [HARNESS_RUN_ID_ENV]: runId, ELANOUS_TASK_CARD_ID: card.id,
+    ...(cardPrNumber(card) ? { ELANOUS_TASK_BOUND_PR: String(cardPrNumber(card)) } : {}),
     ...(card.checklistId ? { ELANOUS_POD_SLOT_ID: card.checklistId } : {}),
     ...(card.seat ? { ELANOUS_POD_OWNER_KIND: 'seat', ELANOUS_POD_OWNER_ID: card.seat } : {}),
-    ...(card.taLand ? { [TA_LAND_ENV]: '1' } : {}) }, cardLabelContext: taskCardLabelContext(card) };
+    ...(card.taLand ? { [TA_LAND_ENV]: '1' } : {}) }, cardLabelContext: taskCardLabelContext(card),
+    // An omitted card provider uses the established Pod default. Carry the effective value explicitly so
+    // remote-parent code never has to infer a provider from the serialized CLI argv.
+    effectiveChildProvider: card.childLlm?.provider ?? 'openai-codex',
+    ...(completion === 'code-pr' && selected.launcher === 'harness-say' ? { substrate: 'pod' as const, podGoal: card.text } : {}) };
   let receipt: void | TaskLaunchReceipt;
   try {
     receipt = await opts.launcher(move.command!, project?.target, context);
@@ -812,9 +857,11 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   // INFLIGHT-REGISTRY — 출발 때 맥락을 남긴다(머지 때 같은 파일 줄의 의도를 스마트 머지가 읽는다 · 착지하면 지운다).
   try {
     const [head = '', ...rest] = text.split(/\r?\n/);
+    const intentLines = (/^\s*(?:대상\s*경로|target\s*paths?)\s*[:：]/i.test(head) ? rest : [head, ...rest])
+      .filter((line) => !/^\s*(?:[-*]\s*)?완료 경계 (?:코드|실물|증거 명령)\s*:/.test(line));
     registerInflight({
       runId: boundRunId ?? runId, cell: card.checklistId ?? card.id, cardId: card.id,
-      intent: (/^\s*(?:대상\s*경로|target\s*paths?)\s*[:：]/i.test(head) ? rest.join(' ') : text) || text,
+      intent: intentLines.join(' ').trim() || text,
       files: parseAskTargetPathHints(text),
     }, { path: join(dirname(path), INFLIGHT_REGISTRY_FILE), ...(opts.now ? { now: opts.now } : {}) });
   } catch (error) {

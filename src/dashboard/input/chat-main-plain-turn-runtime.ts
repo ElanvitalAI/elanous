@@ -95,6 +95,7 @@ export interface DashboardChatMainPlainTurnRuntimeDeps {
     onText(chunk: string, accumulated: string): void;
     onToolCall(call: unknown): void;
     onToolResult(call: unknown): void;
+    onThought?(text: string): void;
     getAssistantStart(): number;
   };
   runTurnUsageRuntime: (usage: unknown) => void;
@@ -117,6 +118,7 @@ export interface DashboardChatMainPlainTurnRuntimeDeps {
       onToolCall: (call: unknown) => void;
       onToolResult: (call: unknown) => void;
       onUsage: (usage: unknown) => void;
+      onThought?: (text: string) => void;
     }): Promise<unknown>;
   };
   autoTts: {
@@ -483,6 +485,7 @@ export async function runDashboardChatMainPlainTurn(
       onUsage: (usage) => {
         deps.runTurnUsageRuntime(usage);
       },
+      onThought: (text) => { turnStreamRuntime.onThought?.(text); },
       autoTts: deps.autoTts,
       voiceChat: deps.voiceChat,
       drainCooldownMs: userConfig.voice.tts.drainCooldownMs,

@@ -1,5 +1,5 @@
 import { describe, expect, test, spyOn } from 'bun:test';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { detectSkillCliAuth, type SkillCli } from '../onboarding/cli-auth-status.js';
@@ -16,7 +16,7 @@ const ELANOUS_AUTH = JSON.stringify({ version: 1, providers: { 'openai-codex': {
 const CODEX_AUTH = JSON.stringify({ tokens: { access_token: 'access', refresh_token: 'refresh' } });
 const config = (provider?: string, fastPath = true) => ({ llm: { provider }, chat: { fastPath } }) as UserConfig;
 
-type SetupState = { elanous?: boolean; provider?: string; codex?: boolean; externalReady?: boolean; elanousAuth?: string; codexAuth?: string; answer?: string; recommendationAnswer?: string; nonInteractive?: boolean; yes?: boolean; stdinTty?: boolean; runtimeProvider?: string; fastPath?: boolean; doctorFixExitCode?: number; cliPath?: string; deniedSkills?: string[] };
+type SetupState = { elanous?: boolean; provider?: string; codex?: boolean; externalReady?: boolean; elanousAuth?: string; codexAuth?: string; answer?: string; recommendationAnswer?: string; nonInteractive?: boolean; yes?: boolean; stdinTty?: boolean; runtimeProvider?: string; fastPath?: boolean; doctorFixExitCode?: number; cliPath?: string; deniedSkills?: string[]; firstRunTopics?: boolean };
 
 async function runSetup(state: SetupState = {}) {
   const output: string[] = [];
@@ -34,6 +34,7 @@ async function runSetup(state: SetupState = {}) {
   const program = new Command();
   registerSetupCommand(program, {
     homeDir: () => '/home/fake',
+    firstRunTopics: state.firstRunTopics,
     exists: (path) => files.has(path),
     readFile: (path) => {
       const value = files.get(path);
@@ -521,5 +522,81 @@ describe('setup CLI', () => {
   test('대조군 — provider=auto 가 다른 provider(grok)로 풀리면 여전히 «미완»이다', async () => {
     const r = await runSetup({ elanous: true, codex: true, provider: 'auto', runtimeProvider: 'auto:grok' });
     expect(r.text).toContain('missing: LLM provider configuration');
+  });
+
+  test('격리 첫 실행(대화형)에서는 기본 묶음 1건과 항목별 승인 등급을 보이고 승인 전 설치·자격 쓰기는 0이다', async () => {
+    const result = await runSetup({ firstRunTopics: true, provider: 'openai-codex', nonInteractive: false, stdinTty: true, recommendationAnswer: 'n' });
+    const proposal = section(result.text, 'Setup: 기본 플러그인·커넥터 묶음 제안 (읽기 전용)', '고칠 것 고치기');
+    expect(result.text.match(/^묶음 1\/1:/gm) ?? []).toHaveLength(1);
+    expect(proposal).toContain('묶음 1/1: 기본 묶음 — 키 없이 항상 켬(0층) · 항목 10개');
+    expect(proposal).toContain('보안 등급: 읽기 · 승인: 불요');
+    expect(proposal).toContain('보안 등급: 쓰기(로컬) · 승인: 기존 모래상자·워크트리 규칙');
+    expect(proposal).toContain('보안 등급: 쓰기(로컬) · 승인: vault-write-guard');
+    expect(proposal).toContain('보안 등급: 읽기(네트워크) · 승인: 불요(클릭·입력은 쓰기 → 승인)');
+    expect(proposal).toContain('후속 층(승인 뒤 조각): 1층 로그인된 CLI 재사용 · 2층 원격 MCP 한 번 OAuth · 3층 채널');
+    expect(proposal).toContain('승인 전 설치 0 · 자격 쓰기 0');
+    expect(result.writes).toEqual([]);
+    expect(result.doctorFixCalls).toEqual([]);
+    expect(result.prompts).toEqual(['관심 주제는 무엇인가요? (쉼표로 구분 · 건너뛰려면 Enter) ', '추천대로 켤까요? [Y/n] ']);
+    expect(result.exitCodes).toEqual([0]);
+    // recommendedSetup 두 줄은 제안이 끼어들어도 여전히 맨 끄트마다(보존 계약).
+    expect(result.output.at(-2)).toContain('고칠 것 고치기');
+    expect(result.output.at(-1)).toContain('chat.fastPath');
+  });
+
+  test('비대화형 격리 첫 실행에서도 묶음 제안은 표시만 한다 — 묻지 않고 쓰지 않는다', async () => {
+    const result = await runSetup({ firstRunTopics: true, provider: 'openai-codex' });
+    expect(result.text).toContain('Setup: 기본 플러그인·커넥터 묶음 제안 (읽기 전용)');
+    expect(result.text).toContain('묶음 1/1: 기본 묶음 — 키 없이 항상 켬(0층)');
+    expect(result.text).toContain('보안 등급: 읽기 · 승인: 불요');
+    expect(result.writes).toEqual([]);
+    expect(result.prompts).toEqual([]);
+    expect(result.doctorFixCalls).toEqual([]);
+    expect(result.exitCodes).toEqual([0]);
+  });
+
+  test('실제 격리 CLI 첫 실행: 기본 묶음 제안 출력 뒤 설치 원장·자격 저장소는 없다', () => {
+    const root = mkdtempSync(join(tmpdir(), 'setup-cli-live-'));
+    const home = join(root, 'home');
+    mkdirSync(home, { recursive: true });
+    try {
+      const env: NodeJS.ProcessEnv = {
+        PATH: process.env.PATH ?? '',
+        HOME: home,
+        USERPROFILE: home,
+        TMPDIR: root,
+        LANG: 'C.UTF-8',
+        ELANOUS_SUPPRESS_XDG_WARNING: '1',
+      };
+      const cli = fileURLToPath(new URL('../../bin/elanous.mjs', import.meta.url));
+      const result = spawnSync(process.execPath, [cli, `--test=${root}/instance`, 'setup', '--non-interactive'], {
+        cwd: process.cwd(), env, encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+      });
+      expect(result.error?.message).toBeUndefined();
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('Setup: 기본 플러그인·커넥터 묶음 제안 (읽기 전용)');
+      expect(result.stdout).toContain('묶음 1/1: 기본 묶음 — 키 없이 항상 켬(0층) · 항목 10개');
+      expect(result.stdout).toContain('보안 등급: 읽기 · 승인: 불요');
+      expect(result.stdout).toContain('보안 등급: 쓰기(로컬) · 승인: vault-write-guard');
+      expect(result.stdout).toContain('승인 전 설치 0 · 자격 쓰기 0');
+      expect(result.stderr).not.toContain('ERROR');
+      // The production CLI ran with an isolated state/config root and an empty HOME.
+      // Check the actual install ledger and both credential stores, not injected save callbacks.
+      expect(existsSync(join(root, 'instance', 'plugins', 'installed.json'))).toBe(false);
+      expect(existsSync(join(root, 'instance', 'config.json'))).toBe(false);
+      expect(existsSync(join(root, 'instance', 'secrets.json'))).toBe(false);
+      expect(existsSync(join(home, '.elanous', 'auth.json'))).toBe(false);
+      expect(existsSync(join(home, '.codex', 'auth.json'))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('첫 실행이 아닌 대화형 실행에서는 묶음 제안이 없다 — 기존 화면 그대로', async () => {
+    const result = await runSetup({ provider: 'openai-codex', nonInteractive: false, stdinTty: true, recommendationAnswer: 'n' });
+    expect(result.text).not.toContain('기본 플러그인·커넥터 묶음 제안');
+    expect(result.writes).toEqual([]);
+    expect(result.prompts).toEqual(['추천대로 켤까요? [Y/n] ']);
+    expect(result.output.at(-1)).toContain('chat.fastPath');
   });
 });

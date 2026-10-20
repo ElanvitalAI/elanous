@@ -1196,6 +1196,56 @@ describe('harness CLI command', () => {
     expect(requests).toEqual([]);
   });
 
+  test('merge-time explicit same-cell cleanup reads only the merged PR when Supersedes is absent', async () => {
+    const requests: string[][] = [];
+    const gh = (args: string[]) => {
+      requests.push(args);
+      if (args[1] === 'repos/my/repo/pulls/90') return JSON.stringify({
+        number: 90, state: 'closed', title: 'merged', head: { ref: 'feature/merged' }, labels: [],
+        created_at: '2026-10-01T00:00:00Z', merged_at: '2026-10-02T00:00:00Z', body: '칸: CELL-A',
+      });
+      throw new Error('unexpected GitHub call');
+    };
+    const git = () => ({ status: 0, stdout: 'https://github.com/my/repo.git', stderr: '' });
+    await supersedeMergedGoalDrafts(90, '/tmp/launch-tree', gh, git, { onlyExplicitSameCell: true });
+    expect(requests).toEqual([['api', 'repos/my/repo/pulls/90']]);
+  });
+
+  test('merge-time explicit same-cell cleanup verifies MERGED and writes label, replacement comment, close', async () => {
+    const writes: string[][] = [];
+    const merged = { number: 90, state: 'closed', title: 'new cell draft', head: { ref: 'self-impl/new-cell' },
+      labels: [], created_at: '2026-10-01T00:00:00Z', merged_at: '2026-10-02T00:00:00Z',
+      body: '칸: CELL-A\n카드: card-a\n\nSupersedes: #7' };
+    const gh = (args: string[]) => {
+      if (args[0] === 'pr' || args[0] === 'label') { writes.push(args); return ''; }
+      if (args[1] === 'repos/my/repo/pulls/90') return JSON.stringify(merged);
+      if (args[1]?.includes('state=open')) return JSON.stringify([{ number: 7, draft: true, state: 'open',
+        title: 'old cell draft', head: { ref: 'self-impl/old-cell' }, labels: [{ name: 'elanous:running' }],
+        created_at: '2026-09-30T00:00:00Z', merged_at: null, body: '칸: CELL-A\n카드: card-a' }]);
+      if (args[1]?.includes('/files?') || args[1]?.includes('/comments?')) return '[]';
+      return '{}';
+    };
+    const git = (_cwd: string, args: string[]) => ({ status: 0, stderr: '', stdout: args[0] === 'config'
+      ? 'https://github.com/my/repo.git' : '' });
+    await supersedeMergedGoalDrafts(90, '/tmp/launch-tree', gh, git, { onlyExplicitSameCell: true });
+    expect(writes.map((args) => args.slice(0, 3))).toEqual([
+      ['pr', 'edit', '7'], ['pr', 'comment', '7'], ['pr', 'close', '7'],
+    ]);
+    expect(writes[1]?.at(-1)).toContain('Same-cell draft superseded by merged PR #90 (https://github.com/my/repo/pull/90). Branch preserved.');
+  });
+
+  test('same-cell comment inventory refuses a 100-page partial read before any cleanup write', async () => {
+    const requests: string[][] = [];
+    const adapters = githubDraftSweepAdapters((args) => {
+      requests.push(args);
+      if (args[1]?.includes('/comments?')) return JSON.stringify(Array.from({ length: 100 }, () => ({ body: 'old' })));
+      throw new Error('unexpected GitHub call');
+    });
+    await expect(adapters.listIssueComments!('my/repo', 7)).rejects.toThrow('Same-cell comment inventory exceeded pagination limit');
+    expect(requests).toHaveLength(100);
+    expect(requests.every((args) => args[0] === 'api')).toBe(true);
+  });
+
   test('merge-time lookup uses edited GitHub goal metadata and refuses unmerged or incomplete PRs', async () => {
     const writes: string[][] = [];
     const merged = { number: 90, state: 'closed', draft: false, title: 'edited goal',
@@ -3948,6 +3998,39 @@ describe('recordHarnessPodStop — AUT-POD-EXIT-UNCLASSIFIED wiring', () => {
     const entries: Array<{ event: string; data: Record<string, unknown> }> = [];
     return { entries, write: (entry: { event: string; data: Record<string, unknown> }) => { entries.push(entry); } };
   };
+
+  test('lifts the full child facts from the parent ledger when the Pod output tail has no JSON', () => {
+    const runId = uniqueRunId('scope-escape');
+    const childEvidence = { classification: 'scope-escape', scopeEscape: true as const,
+      abandonedClassification: { classification: 'implementation-deficit' },
+      supervisorVerdict: 'UNCONVERGEABLE', goalCauseObserved: true as const,
+      terminationReason: 'goal-only-rework-exhausted', accountAvailability: { reason: 'no-candidate', candidateCount: 0 } };
+    const { entries, write } = capture();
+    expect(recordHarnessPodStop(runId, 1, { reason: 'pod-failure', lines: ['Pod 안 자식이 실패했다'] }, 'short tail', {
+      loadLedger: (() => [
+        { runId, event: 'pod-child-run', data: { job: 'current', childRunId: 'run-current' } },
+        { runId, event: 'pod-child-evidence', data: { job: 'current', childRunId: 'run-current', childEvidence } },
+      ]) as never,
+      write: write as never,
+    })).toBe(true);
+    expect(entries[0]?.data).toMatchObject({ class: 'scope-escape', childEvidence });
+  });
+
+  test('the current no-evidence Pod marker masks an earlier scope escape', () => {
+    const runId = uniqueRunId('scope-mask');
+    const { entries, write } = capture();
+    expect(recordHarnessPodStop(runId, 1, { reason: 'pod-failure', lines: ['Pod failed'] }, 'current failure', {
+      loadLedger: (() => [
+        { runId, event: 'pod-child-run', data: { job: 'old', childRunId: 'run-old' } },
+        { runId, event: 'pod-child-evidence', data: { job: 'old', childRunId: 'run-old', childEvidence: { scopeEscape: true } } },
+        { runId, event: 'pod-child-run', data: { job: 'new', childRunId: 'run-new' } },
+        { runId, event: 'pod-child-evidence', data: { job: 'new', childRunId: 'run-new', childEvidence: null } },
+      ]) as never,
+      write: write as never,
+    })).toBe(true);
+    expect(entries[0]?.data.class).not.toBe('scope-escape');
+    expect(entries[0]?.data.childEvidence).toBeUndefined();
+  });
 
   test('① an unknown exit whose child died on ENOSPC records podExitClass child-error ⊕ the tail in the stop line', () => {
     const runId = uniqueRunId('enospc');

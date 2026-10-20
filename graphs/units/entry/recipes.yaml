@@ -1,0 +1,14 @@
+# Read-only observations of the existing entry group. The command result is
+# wrapped in the unit contract so callers retain both result and evidence.
+harness-entrance:
+  command: >-
+    bun -e 'const args=["harness","doors","--json"],p=Bun.spawnSync(["eln",...args]),raw=p.stdout.toString();let parsed;try{parsed=JSON.parse(raw)}catch{};const observed=parsed&&typeof parsed==="object"?{keys:Object.keys(parsed),rows:Array.isArray(parsed.rows)?parsed.rows.length:undefined}:{lineCount:raw.split("\n").filter(Boolean).length};const result={command:["eln",...args].join(" "),observed};console.log(JSON.stringify({outcome:p.exitCode===0?"done":"failed",entrance:observed,journey_key:process.env.ELANOUS_RUN_ID??null,result,evidence:{exitCode:p.exitCode}}))'
+  timeout_ms: 30000
+harness-queue:
+  command: >-
+    bun -e 'const args=["harness","queue","list"],p=Bun.spawnSync(["eln",...args]),raw=p.stdout.toString(),observed={lineCount:raw.split("\n").filter(Boolean).length};console.log(JSON.stringify({outcome:p.exitCode===0?"done":"failed",queue_item:observed,queue_outcome:p.exitCode===0?"read":"unavailable",result:{command:["eln",...args].join(" "),observed},evidence:{exitCode:p.exitCode}}))'
+  timeout_ms: 30000
+pre-launch-gate:
+  command: >-
+    bun -e 'const args=["harness","budget","--json"],p=Bun.spawnSync(["eln",...args]),raw=p.stdout.toString();let parsed;try{parsed=JSON.parse(raw)}catch{};const allowed=p.exitCode===0&&parsed?.outcome==="proceed";const observed=parsed&&typeof parsed==="object"?{outcome:parsed.outcome??null,keys:Object.keys(parsed)}:{lineCount:raw.split("\n").filter(Boolean).length};console.log(JSON.stringify({outcome:p.exitCode!==0?"failed":allowed?"done":"needs-human",launch_decision:observed,result:{command:["eln",...args].join(" "),observed},evidence:{exitCode:p.exitCode,decision:parsed?.outcome??null}}))'
+  timeout_ms: 30000

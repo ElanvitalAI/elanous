@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
-import { citedReviewSymbols, MAX_CITED_REVIEW_SYMBOL_CHARS, measureReviewFindingKeyOverlap, normalizeCitedReviewSymbolForComparison, normalizeReviewFindingKey, REVIEW_FINDING_KEY_VERSION, reviewFindingKey, shortNormalizedReviewFindingHash } from './review-finding-key.js';
+import { checkCitedReviewPathsAtHead, citedReviewPaths, citedReviewSymbols, MAX_CITED_REVIEW_SYMBOL_CHARS, measureReviewFindingKeyOverlap, normalizeCitedReviewSymbolForComparison, normalizeReviewFindingKey, REVIEW_FINDING_KEY_VERSION, reviewFindingKey, shortNormalizedReviewFindingHash } from './review-finding-key.js';
 
 describe('review finding key', () => {
   test('preserves the review finding key version used by historical observations', () => {
@@ -123,5 +127,50 @@ describe('review finding key', () => {
       rightSymbolCount: 0,
       overlapRatio: undefined,
     });
+  });
+
+  test('an old-head-only cited file is missing at the exact new head, not a verified finding', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'review-finding-head-'));
+    const git = (...args: string[]): string => {
+      const result = spawnSync('git', ['-C', repo, ...args], {
+        encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.invalid', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.invalid' },
+      });
+      if (result.status !== 0) throw new Error(`git ${args[0]} failed: ${result.stderr}`);
+      return result.stdout.trim();
+    };
+    try {
+      git('init', '-q');
+      mkdirSync(join(repo, 'src'));
+      writeFileSync(join(repo, 'src/old.ts'), 'export const old = true;\n');
+      git('add', 'src/old.ts');
+      git('commit', '-qm', 'old head');
+      const oldHead = git('rev-parse', 'HEAD');
+      git('rm', 'src/old.ts');
+      mkdirSync(join(repo, 'src'), { recursive: true });
+      writeFileSync(join(repo, 'src/new.ts'), 'export const current = true;\n');
+      git('add', 'src/new.ts');
+      git('commit', '-qm', 'new head');
+      const newHead = git('rev-parse', 'HEAD');
+      const treeObject = git('rev-parse', 'HEAD^{tree}');
+      const finding = 'Must fix `src/old.ts` in this PR';
+
+      expect(citedReviewPaths('`terminal.id`, `https://example.test/page`, and `src/old.ts:17`')).toEqual(['src/old.ts']);
+      expect(citedReviewPaths('`src/worker.go`, `queries/read.sql`, `src/run-task()`')).toEqual(['src/worker.go', 'queries/read.sql']);
+      expect(checkCitedReviewPathsAtHead(finding, repo, oldHead)).toMatchObject({
+        status: 'verified', paths: [{ path: 'src/old.ts', status: 'present' }],
+      });
+      expect(checkCitedReviewPathsAtHead(finding, repo, newHead)).toMatchObject({
+        status: 'path-missing', paths: [{ path: 'src/old.ts', status: 'missing' }],
+      });
+      expect(checkCitedReviewPathsAtHead('`src/new.ts` and `src/old.ts`', repo, newHead)).toMatchObject({
+        status: 'path-missing', paths: [{ status: 'present' }, { status: 'missing' }],
+      });
+      expect(checkCitedReviewPathsAtHead(finding, repo, 'not-a-head').status).toBe('unreadable');
+      expect(checkCitedReviewPathsAtHead(finding, repo, '0'.repeat(40)).status).toBe('unreadable');
+      expect(checkCitedReviewPathsAtHead(finding, repo, treeObject).status).toBe('unreadable');
+      expect(checkCitedReviewPathsAtHead('Check `terminal.id`', repo, newHead).status).toBe('no-cited-path');
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 });

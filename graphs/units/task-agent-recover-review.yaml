@@ -1,0 +1,17 @@
+graph_id: task-agent-recover-review
+version: 1
+entry_node: recover
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: recover
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: recover@1
+    call_entry: request-review
+    budget: { inner_steps: 3 }
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: recover, on: outcome, map: { done: done, rework: done, needs-human: failed, failed: failed } }

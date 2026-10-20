@@ -87,7 +87,7 @@ test('CLI --json keeps stdout parseable while retaining the summary on stderr; t
   }
   const run = (args: string[], prList = '[]') => spawnSync(process.execPath, [join(import.meta.dir, 'overlap.ts'), ...args], {
     cwd: root, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, NODE_ENV: 'test',
-      PR_LIST: prList, XDG_CONFIG_HOME: join(root, 'config'), ELANOUS_SUPPRESS_XDG_WARNING: '1' },
+      PR_LIST: prList, ELANOUS_STATE_DIR: join(root, '.elanous'), XDG_CONFIG_HOME: join(root, 'config'), ELANOUS_SUPPRESS_XDG_WARNING: '1' },
   });
   const json = run(['--json']);
   expect(json.status).toBe(0);
@@ -97,7 +97,7 @@ test('CLI --json keeps stdout parseable while retaining the summary on stderr; t
   expect(text.status).toBe(0);
   expect(text.stdout.trim()).toBe('overlap work=0 files=0 cells=0 crossSeat=0 unreadable=0 excluded=stalled:0,superseded:0,draft:0 seatNull=0 unreadableTrees=0 unreadableGoals=0');
 
-  const configDir = join(root, 'config', 'elanous');
+  const configDir = join(root, '.elanous');
   mkdirSync(configDir, { recursive: true });
   writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { seatTrees: { TC: [join(root, 'missing')] } } } }));
   const logDir = join(root, '.elanous', 'debug');
@@ -124,7 +124,7 @@ test('CLI --json keeps stdout parseable while retaining the summary on stderr; t
       seatNull: 0, excluded: { stalled: 0, superseded: 0, draft: prs[0]?.number === 302 ? 1 : 0 },
     });
   }
-});
+}, 60_000);
 
 test('relative goal paths require observed cwd even when another tree has a same-named document', () => {
   const root = mkdtempSync(join(tmpdir(), 'orch-overlap-cwd-')); roots.push(root);

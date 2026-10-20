@@ -1,0 +1,15 @@
+graph_id: reflect
+version: 1
+unit:
+  inputs: [ask, context, prior]
+  outputs: [result, evidence]
+  exits: [done, wait, needs-human]
+entry_node: reflect
+terminal_nodes: [done, wait, needs-human]
+nodes:
+  - { node_id: reflect, kind: agent, recipe: 'cmd:reflect', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: wait, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: needs-human, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: reflect, on: outcome, map: { done: done, wait: wait, needs-human: needs-human } }

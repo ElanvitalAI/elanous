@@ -14,6 +14,7 @@ import { DEFAULT_FALLBACK_CHAIN, normalizeFallbackChain } from '../src/oauth/fal
 import { saveTokens } from '../src/oauth/store';
 import { _resetKeyCacheForTests } from '../src/config';
 import { saveUserConfig, buildUserConfig, resetUserConfig } from '../src/user-config';
+import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir';
 
 const saved: Record<string, string | undefined> = {};
 let root: string;
@@ -32,6 +33,7 @@ beforeEach(() => {
     delete process.env[k];
   }
   process.env.XDG_CONFIG_HOME = root;
+  setElanousConfigDir(join(root, 'elanous'));
   process.env.CODEX_HOME = join(root, 'codex-home');
   process.env.HOME = root;
   process.env.ELANOUS_KEY_CACHE_DIR = join(root, 'key-cache');
@@ -39,6 +41,7 @@ beforeEach(() => {
   resetUserConfig();
 });
 afterEach(() => {
+  resetElanousConfigDir();
   for (const [k, v] of Object.entries(saved)) {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;

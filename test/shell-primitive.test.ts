@@ -75,7 +75,7 @@ describe('shell-primitive: runShell (no approval)', () => {
   test('maxOutputChars truncates and sets truncated=true', async () => {
     // 1000 chars of "a" → capped at 50 on stdout.
     const res = await runShell({
-      command: ['sh', '-c', 'printf "%.0s." {1..1000}'],
+      command: ['bash', '-c', 'printf "%.0s." {1..1000}'],
       cwd,
       maxOutputChars: 50,
     });

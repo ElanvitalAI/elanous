@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildNextFluentRouteOpts } from './next-fluent-wiring.js';
 import { resetUserConfig } from '../../user-config.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 import { handleNextFluentPreview } from './next-fluent.js';
 
 const preview = () => new Request('http://x/v1/next-fluent/preview', {
@@ -15,6 +16,7 @@ describe('next-fluent route wiring', () => {
   test('empty nextFluent config opens the deterministic route without a persona lane', async () => {
     const originalXdg = process.env.XDG_CONFIG_HOME;
     const root = mkdtempSync(join(tmpdir(), 'next-fluent-route-'));
+    setElanousConfigDir(join(root, 'elanous'));
     process.env.XDG_CONFIG_HOME = root;
     resetUserConfig();
     try {
@@ -39,6 +41,7 @@ describe('next-fluent route wiring', () => {
       expect(withPersona.deps.enabled()).toBe(true);
       expect(withPersona.deps.laneCallable).toBeDefined();
     } finally {
+      resetElanousConfigDir();
       if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = originalXdg;
       resetUserConfig();

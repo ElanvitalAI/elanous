@@ -1,29 +1,47 @@
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
+import { stateDirSourceForChild } from '../agent/identity-env.js';
 import { sendOutbound } from '../domains/outbound-alert.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 import { isValidGateHost } from '../self-implement/gate-remote.js';
+import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
+import { latestPublishedPreviousVersion, releaseLoopConfig } from '../../scripts/release-loop/unattended-release.js';
+import { LEAK_MARKERS, loadExportConfig, selectExportFiles } from '../../scripts/public-export.js';
 import { LIGHT_RC_UNKNOWN_HOST, runLightRc, type LightRcResult } from './light-rc.js';
 import { planRehearsalShards, type RehearsalShardPlan, type RehearsalShardPlanDeps } from './rehearsal-shard-plan.js';
 import { listSchedules, type ReleaseSchedule } from './release-schedule.js';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 
-export type StepId = 'rc-7h' | 'rc-150m';
+export type StepId = 'hard-mid' | 'rc-7h' | 'hard-5h' | 'rc-150m';
 export type RehearsalOutcome = 'ok' | 'regression' | 'unmeasured' | 'error' | 'no-checkout' | 'checkout-dirty' | 'superseded' | 'interrupted';
+export interface HardGateResult {
+  outcome: 'ok' | 'regression' | 'error';
+  commit: string;
+  executor: 'pod' | 'host' | null;
+  introduced: string[];
+  preexisting: number;
+  error?: string;
+}
 export type RehearsalPlan =
   | { status: 'no-schedule' }
   | { status: 'not-yet'; version: string; cutAt: string; nextStepAt: string }
   | { status: 'due'; version: string; cutAt: string; run: StepId | null; supersede: StepId[] }
   | { status: 'nothing-due'; version: string; cutAt: string };
 
-const steps = [{ id: 'rc-7h', minutes: 420 }, { id: 'rc-150m', minutes: 150 }] as const;
+const fixedSteps = [{ id: 'rc-7h', minutes: 420 }, { id: 'hard-5h', minutes: 300 }, { id: 'rc-150m', minutes: 150 }] as const;
 const minute = 60_000;
+function rehearsalSteps(intervalHours = 12): Array<{ id: StepId; minutes: number }> {
+  if (!Number.isSafeInteger(intervalHours) || intervalHours < 8 || intervalHours > 72)
+    throw new Error('release.loop.rehearsalHardIntervalHours must be an integer from 8 to 72');
+  return [{ id: 'hard-mid', minutes: intervalHours * 60 }, ...fixedSteps];
+}
 
-/** Only the earliest future cut is eligible. A missed early step is never run back-to-back with the late step. */
-export function planRehearsal(schedules: readonly ReleaseSchedule[], now: Date, stamps: Readonly<Partial<Record<StepId, boolean>>>): RehearsalPlan {
+/** Only the earliest future cut is eligible. A missed step is superseded rather than run beside a later one. */
+export function planRehearsal(schedules: readonly ReleaseSchedule[], now: Date, stamps: Readonly<Partial<Record<StepId, boolean>>>, intervalHours = 12): RehearsalPlan {
   const current = now.getTime();
   if (!Number.isFinite(current)) throw new Error('now must be a valid date');
   const schedule = schedules.filter(row => Number.isFinite(Date.parse(row.cutAt)) && Date.parse(row.cutAt) > current)
@@ -31,14 +49,20 @@ export function planRehearsal(schedules: readonly ReleaseSchedule[], now: Date, 
   if (!schedule) return { status: 'no-schedule' };
   const { version, cutAt } = schedule;
   const cut = Date.parse(cutAt);
+  const steps = rehearsalSteps(intervalHours);
   const open = steps.filter(step => !stamps[step.id]);
   if (!open.length) return { status: 'nothing-due', version, cutAt };
   if (current >= cut - 45 * minute) return { status: 'due', version, cutAt, run: null, supersede: open.map(step => step.id) };
-  if (current >= cut - 150 * minute) {
-    return { status: 'due', version, cutAt, run: stamps['rc-150m'] ? null : 'rc-150m', supersede: stamps['rc-7h'] ? [] : ['rc-7h'] };
+  const latestDue = [...steps].reverse().find(step => current >= cut - step.minutes * minute);
+  if (latestDue) {
+    const run = stamps[latestDue.id] ? null : latestDue.id;
+    const supersede = steps.filter(step => step.minutes > latestDue.minutes && !stamps[step.id]).map(step => step.id);
+    if (!run && supersede.length === 0) {
+      const next = open.find(step => current < cut - step.minutes * minute);
+      if (next) return { status: 'not-yet', version, cutAt, nextStepAt: new Date(cut - next.minutes * minute).toISOString() };
+    }
+    return { status: 'due', version, cutAt, run, supersede };
   }
-  const due = open.filter(step => current >= cut - step.minutes * minute);
-  if (due.length) return { status: 'due', version, cutAt, run: due[0]!.id, supersede: [] };
   return { status: 'not-yet', version, cutAt, nextStepAt: new Date(cut - open[0]!.minutes * minute).toISOString() };
 }
 
@@ -53,8 +77,13 @@ export interface RehearsalStamp {
   summary?: string;
   regressionFiles?: string[];
   result?: LightRcResult;
+  hardGate?: HardGateResult;
+  hardGateRunId?: string;
+  hardGateLog?: string;
+  /** B6: an unmeasured hard gate always retains a cause, run id and durable local evidence path. */
+  measurementGap?: { cause: string; runId: string; evidence: string };
   shardPlan?: RehearsalShardPlan;
-  leakCheck?: { outcome: 'ok' | 'fail'; sha: string; exitCode: number | null };
+  leakCheck?: { outcome: 'ok' | 'fail'; sha: string; exitCode: number | null; detail?: string };
   selection?: { shards?: number; remote?: string };
   notifiedAt?: string;
   ownerPid?: number;
@@ -69,14 +98,16 @@ export interface RehearsalOptions {
 }
 
 export interface RehearsalDeps {
+  hardIntervalHours?: number;
   now?: () => Date;
   schedules?: (root: string) => ReleaseSchedule[];
   lightRc?: (version: string, checkout: string, selection: { shards?: number; remote?: string }) => Promise<LightRcResult>;
+  hardGate?: (version: string, checkout: string, sha: string, ledgerRoot: string, runId: string) => Promise<HardGateResult>;
   shardPlan?: typeof planRehearsalShards;
   shardPlanDeps?: RehearsalShardPlanDeps;
   notify?: (text: string) => void | boolean | Promise<void | boolean>;
   git?: (args: string[], cwd: string) => { rc: number | null; stdout: string; stderr?: string };
-  leakCheck?: (checkout: string) => { status: number | null };
+  leakCheck?: (checkout: string) => { status: number | null; detail?: string };
 }
 
 export type RehearsalTickResult = RehearsalPlan & { applied?: boolean; stamps?: RehearsalStamp[]; notificationFailures?: number };
@@ -97,15 +128,101 @@ function gitResult(git: NonNullable<RehearsalDeps['git']>, args: string[], check
   return result.stdout.trim();
 }
 
+export function rehearsalLeakFailureDetail(stdout: string, stderr: string, spawnError?: string): string {
+  try {
+    const report = JSON.parse(stdout.trim()) as {
+      leaks?: number; hits?: Array<{ marker?: string; file?: string; line?: number; text?: string }>;
+    };
+    const first = report.hits?.[0];
+    if (Number.isSafeInteger(report.leaks) && report.leaks! >= 0) {
+      if (!first) return `${report.leaks} hit(s)`;
+      return sanitizeRehearsalLeakDetail(`${report.leaks} hit(s) · ${first.marker ?? ''} ${first.file ?? ''}:${first.line ?? ''}`);
+    }
+  } catch { /* fall through to the process diagnostic */ }
+  return 'leak-check produced no structured diagnostic';
+}
+
+/** Validate before evidence persistence: JSON and injected checkers are both untrusted diagnostic inputs. */
+export function sanitizeRehearsalLeakDetail(detail: string, checkout?: string): string {
+  if (detail === 'leak-check produced no structured diagnostic') return detail;
+  const parsed = /^(?<count>\d+) hit\(s\) · (?<marker>[a-z][a-z0-9-]{0,63}) (?<file>.+):(?<line>[1-9]\d*)$/.exec(detail);
+  if (!parsed?.groups) return 'leak-check produced no structured diagnostic';
+  const { count, marker, file, line } = parsed.groups;
+  const countValue = Number(count), lineValue = Number(line);
+  if (!Number.isSafeInteger(countValue) || countValue < 1 || !Number.isSafeInteger(lineValue) || lineValue < 1)
+    return 'leak-check produced no structured diagnostic';
+  const parts = file!.split('/');
+  if (!LEAK_MARKERS.some(item => item.marker === marker) || file!.startsWith('/')
+    || /[\p{Cc}]/u.test(file!) || parts.some(part => !part || part === '.' || part === '..'))
+    return 'leak-check produced no structured diagnostic';
+  if (checkout) {
+    try {
+      const tracked = spawnSync('git', ['ls-files', '-z'], { cwd: checkout, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+      if (tracked.status !== 0 || tracked.error) return 'leak-check produced no structured diagnostic';
+      const publicFiles = selectExportFiles((tracked.stdout ?? '').split('\0').filter(Boolean), loadExportConfig(checkout));
+      if (!publicFiles.includes(file!)) return 'leak-check produced no structured diagnostic';
+      const checkoutRoot = realpathSync(checkout);
+      const realFile = realpathSync(resolve(checkoutRoot, file!));
+      if (!realFile.startsWith(`${checkoutRoot}/`))
+        return 'leak-check produced no structured diagnostic';
+      const sourceLine = readFileSync(realFile, 'utf8').split(/\r?\n/)[lineValue - 1];
+      const markerPattern = LEAK_MARKERS.find(item => item.marker === marker)?.pattern;
+      if (!sourceLine || !markerPattern?.test(sourceLine)) return 'leak-check produced no structured diagnostic';
+    } catch { return 'leak-check produced no structured diagnostic'; }
+  }
+  return `${countValue} hit(s) · ${marker} ${file}:${lineValue}`;
+}
+
 /** Public export checks the pinned rehearsal checkout before any remote RC work. Its output is private and ephemeral. */
-function runRehearsalLeakCheck(checkout: string): { status: number | null } {
+export function runRehearsalLeakCheck(checkout: string): { status: number | null; detail?: string } {
   const out = mkdtempSync(join(tmpdir(), 'elanous-rehearsal-export-'));
   try {
-    const result = spawnSync('bun', ['scripts/public-export.ts', '--out', join(out, 'export')], {
+    const result = spawnSync('bun', ['scripts/public-export.ts', '--out', join(out, 'export'), '--json', '--all'], {
       cwd: checkout, encoding: 'utf8', timeout: 1_800_000, maxBuffer: 64 * 1024 * 1024,
     });
-    return { status: result.status };
+    if (result.status === 0) return { status: 0 };
+    return { status: result.status, detail: rehearsalLeakFailureDetail(result.stdout ?? '', result.stderr ?? '', result.error?.message) };
   } finally { rmSync(out, { recursive: true, force: true }); }
+}
+
+/** The hard rehearsal uses the release gate itself, pinned to the fetched main SHA and node-b Pod member. */
+async function runHardGate(version: string, checkout: string, sha: string, ledgerRoot: string, runId: string): Promise<HardGateResult> {
+  const configuredPool = releaseLoopConfig().gatePodPool;
+  if (!configuredPool) throw new Error('hard rehearsal requires release.loop.gatePodPool');
+  const members = parsePodPool(configuredPool);
+  const gateMember = members.find(member => member.sshHost === 'node-b');
+  if (!gateMember) throw new Error('hard rehearsal requires a live node-b Pod member');
+  const pool = configuredPool.split(',').map(part => part.trim())
+    .find(part => part.split(/[#:]/, 1)[0] === `${gateMember.context}@${gateMember.sshHost}`);
+  if (!pool) throw new Error('hard rehearsal cannot isolate the node-b Pod member');
+  const previous = latestPublishedPreviousVersion(version, ledgerRoot);
+  const logPath = join(ledgerRoot, 'release', version, 'rehearsal', `${runId}.log`);
+  mkdirSync(dirname(logPath), { recursive: true });
+  const run = (() => {
+    const log = openSync(logPath, 'wx', 0o600);
+    try { return spawnSync('bun', ['scripts/release-loop/gate-node.ts', '--commit', sha, '--version', version,
+      '--baseline-version', previous, '--executor', 'pod', '--pod-pool', pool, '--pod-shards', '12', '--json'], {
+      cwd: checkout, encoding: 'utf8', stdio: ['ignore', log, log], timeout: 4 * 60 * 60_000,
+      env: { ...process.env, ELANOUS_STATE_DIR: ledgerRoot, ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(ledgerRoot) },
+    }); } finally { closeSync(log); }
+  })();
+  // stdout and stderr stream to the claim's durable evidence while the child is still running.
+  const output = readFileSync(logPath, 'utf8');
+  const line = output.split(/\r?\n/).reverse().find(value => value.trim().startsWith('{'));
+  if (!line) throw new Error(`hard rehearsal gate produced no JSON (rc=${run.status ?? 'spawn'}${run.error ? `: ${run.error.message}` : ''}; log ${logPath})`);
+  const result = JSON.parse(line) as HardGateResult;
+  if (!['ok', 'regression', 'error'].includes(result.outcome) || !Array.isArray(result.introduced)
+      || result.introduced.some(item => typeof item !== 'string')) {
+    throw new Error('hard rehearsal gate result lacks a valid verdict');
+  }
+  if (result.outcome !== 'error' && (result.commit !== sha || result.executor !== 'pod')) {
+    throw new Error('hard rehearsal gate result lacks pinned commit, Pod executor or verdict evidence');
+  }
+  if (result.outcome === 'ok' && result.introduced.length) throw new Error('hard rehearsal gate ok verdict contains introduced failures');
+  if (run.status === 0 && result.outcome === 'ok') return result;
+  if (run.status === 1 && result.outcome === 'regression') return result;
+  if (run.status === 2 && result.outcome === 'error') return result;
+  throw new Error(`hard rehearsal gate rc=${run.status ?? 'spawn'} disagrees with outcome=${result.outcome}`);
 }
 
 function oneLine(text: string): string { return text.replace(/\s+/g, ' ').trim(); }
@@ -121,7 +238,7 @@ function outcomeLine(stamp: RehearsalStamp): string {
     || (stamp.selection?.shards !== undefined && result.shards !== stamp.selection.shards)
     || (stamp.selection?.remote !== undefined && result.remote !== stamp.selection.remote);
   const detail = stamp.summary && (stamp.outcome === 'unmeasured' || stamp.outcome === 'error' && planningGap) ? ` · ${stamp.summary}` : '';
-  return `${head} · 새 회귀 ${result.introduced ?? '못 쟀다'} · 기존 ${result.preexisting ?? '못 쟀다'} · 미분류 ${result.unclassified ?? '못 쟀다'} · ${result.remote ?? 'local'} · ${duration}분${stamp.outcome === 'error' ? ` · gate rc ${result.gateExitCode}${!result.ok ? ' · RC 실패' : ''}` : ''}${stamp.regressionFiles?.length ? ` · 파일 ${stamp.regressionFiles.slice(0, 3).join(', ')}` : ''}${detail}`;
+  return `${head} · 새 회귀 ${result.introduced ?? 'UNKNOWN'} · 기존 ${result.preexisting ?? 'UNKNOWN'} · 미분류 ${result.unclassified ?? 'UNKNOWN'} · ${result.remote ?? 'local'} · ${duration}분${stamp.outcome === 'error' ? ` · gate rc ${result.gateExitCode}${!result.ok ? ' · RC 실패' : ''}` : ''}${stamp.regressionFiles?.length ? ` · 파일 ${stamp.regressionFiles.slice(0, 3).join(', ')}` : ''}${detail}`;
 }
 
 function persistStamp(path: string, stamp: RehearsalStamp): void {
@@ -221,9 +338,19 @@ function interruptStamp(path: string, saved: RehearsalStamp, now: Date): Rehears
   try {
     const latest = JSON.parse(readFileSync(path, 'utf8')) as RehearsalStamp;
     if (latest.outcome !== 'running' || latest.endedAt || latest.startedAt !== saved.startedAt || latest.ownerPid !== saved.ownerPid || !ownerIsDead(latest.ownerPid)) return null;
+    if (latest.step === 'hard-mid' || latest.step === 'hard-5h') {
+      // The claim stores this identity atomically. Older running stamps may lack it, so recovery mints one.
+      const runId = latest.hardGateRunId || `hard-${randomUUID()}`;
+      const evidence = join(dirname(path), `${runId}.log`);
+      const cause = `hard rehearsal process ended before a gate verdict (pid ${latest.ownerPid})`;
+      appendFileSync(evidence, `${cause}\n`, { mode: 0o600 });
+      latest.hardGateRunId = runId;
+      latest.hardGateLog = evidence;
+      latest.measurementGap = { cause, runId, evidence };
+      latest.summary = `${cause} · runId ${runId} · evidence ${evidence}`;
+    } else latest.summary = '실행 프로세스 종료 · RC 재실행 안 함';
     latest.outcome = 'interrupted';
     latest.endedAt = now.toISOString();
-    latest.summary = '실행 프로세스 종료 · RC 재실행 안 함';
     persistStamp(path, latest);
     return latest;
   } finally {
@@ -231,7 +358,7 @@ function interruptStamp(path: string, saved: RehearsalStamp, now: Date): Rehears
   }
 }
 
-/** wx claim is permanent per version/step; a crashed run is reported as interrupted without running RC twice. */
+/** A started RC claim is permanent; a preflight with no runnable shards releases its claim for the next tick. */
 export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: RehearsalDeps = {}): Promise<RehearsalTickResult> {
   if (opts.shards !== undefined && (!Number.isSafeInteger(opts.shards) || opts.shards < 1)) {
     throw new Error(`release rehearsal tick: invalid --shards count: ${opts.shards}`);
@@ -242,11 +369,13 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
   const root = opts.ledgerRoot ?? releaseLedgerRoot();
   const now = (deps.now ?? (() => new Date()))();
   const schedules = (deps.schedules ?? listSchedules)(root);
+  const intervalHours = deps.hardIntervalHours ?? releaseLoopConfig().rehearsalHardIntervalHours ?? 12;
+  const steps = rehearsalSteps(intervalHours);
   if (!Number.isFinite(now.getTime())) throw new Error('now must be a valid date');
-  const candidate = planRehearsal(schedules, now, {});
+  const candidate = planRehearsal(schedules, now, {}, intervalHours);
   const stamps = candidate.status !== 'no-schedule'
     ? Object.fromEntries(steps.map(step => [step.id, existsSync(stampPath(root, candidate.version, step.id))])) as Partial<Record<StepId, boolean>> : {};
-  const plan = planRehearsal(schedules, now, stamps);
+  const plan = planRehearsal(schedules, now, stamps, intervalHours);
   debug.log('release.rehearsal', 'tick', { ...plan, apply: !!opts.apply });
   if (!opts.apply) return plan;
   const written: RehearsalStamp[] = [];
@@ -278,6 +407,10 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
     const path = stampPath(root, plan.version, step);
     mkdirSync(dirname(path), { recursive: true });
     const stamp: RehearsalStamp = { version: plan.version, cutAt: plan.cutAt, step, outcome: 'running', startedAt: now.toISOString(), ownerPid: process.pid };
+    if (step === 'hard-mid' || step === 'hard-5h') {
+      stamp.hardGateRunId = `hard-${randomUUID()}`;
+      stamp.hardGateLog = join(dirname(path), `${stamp.hardGateRunId}.log`);
+    }
     // Crash-safe exclusive create: the complete JSON is written to a private temp file, then hard-linked into
     // place. link(2) fails with EEXIST like wx, but the stamp can never be observed empty or half-written.
     const temp = `${path}.${process.pid}.${randomUUID()}.claim.tmp`;
@@ -322,13 +455,47 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
             stamp.sha = gitResult(git, ['rev-parse', 'HEAD'], checkout);
             if (!stamp.sha) throw new Error('git rev-parse HEAD returned no sha');
             const leak = (deps.leakCheck ?? runRehearsalLeakCheck)(checkout);
-            stamp.leakCheck = { outcome: leak.status === 0 ? 'ok' : 'fail', sha: stamp.sha, exitCode: leak.status };
-            if (leak.status !== 0) throw new Error(`public export leak-check failed (rc=${leak.status ?? 'spawn'})`);
-            const regressionFiles: string[] = [];
+            const statusIsValid = leak.status === null || (Number.isSafeInteger(leak.status) && leak.status >= 0 && leak.status <= 255);
+            const leakStatus = statusIsValid ? leak.status : null;
+            const leakDetail = leakStatus === 0 ? undefined : sanitizeRehearsalLeakDetail(leak.detail ?? '', checkout);
+            stamp.leakCheck = { outcome: leakStatus === 0 ? 'ok' : 'fail', sha: stamp.sha, exitCode: leakStatus,
+              ...(leakDetail ? { detail: leakDetail } : {}) };
+            if (leakStatus !== 0) throw new Error(`public export leak-check failed (rc=${leakStatus ?? 'spawn'})${leakDetail ? ` · ${leakDetail}` : ''}`);
+            if (plan.run === 'hard-5h' || plan.run === 'hard-mid') {
+              stamp.selection = { shards: 12, remote: 'node-b' };
+              const hardGateRunId = stamp.hardGateRunId;
+              const hardGateLog = stamp.hardGateLog;
+              if (!hardGateRunId || !hardGateLog) throw new Error('hard rehearsal claim has no evidence identity');
+              const hard = await (deps.hardGate ?? runHardGate)(plan.version, checkout, stamp.sha, root, hardGateRunId);
+              stamp.hardGate = hard;
+              if (!existsSync(hardGateLog)) writeFileSync(hardGateLog, `${JSON.stringify(hard)}\n`, { flag: 'wx', mode: 0o600 });
+              if (hard.outcome !== 'error' && (hard.commit !== stamp.sha || hard.executor !== 'pod' || !Array.isArray(hard.introduced)))
+                throw new Error('hard rehearsal result did not measure pinned SHA on a Pod');
+              if (hard.outcome === 'ok' && hard.introduced.length) throw new Error('hard rehearsal gate ok verdict contains introduced failures');
+              stamp.outcome = hard.outcome === 'regression' && hard.introduced.length === 0 ? 'unmeasured' : hard.outcome;
+              const cause = stamp.outcome === 'unmeasured' ? 'regression verdict has no introduced IDs'
+                : hard.outcome === 'error' ? hard.error?.trim() || 'gate returned error without a cause' : undefined;
+              if (cause) stamp.measurementGap = { cause, runId: hardGateRunId, evidence: hardGateLog };
+              const introducedCount: number | null = stamp.outcome === 'unmeasured' || stamp.outcome === 'error' ? null : hard.introduced.length;
+              const preexistingCount: number | null = introducedCount === null ? null : hard.preexisting;
+              const totalFailures: number | null = introducedCount === null || preexistingCount === null ? null : introducedCount + preexistingCount;
+              stamp.summary = oneLine(`hard gate ${hard.outcome} · introduced ${introducedCount ?? 'UNKNOWN'} · preexisting ${preexistingCount ?? 'UNKNOWN'} · total failures ${totalFailures ?? 'UNKNOWN'} · node-b Pod · 12 shards · runId ${hardGateRunId} · evidence ${hardGateLog}${cause ? ` · ${cause}` : ''}`);
+            } else {
             const shardPlan = opts.shards === undefined ? (deps.shardPlan ?? planRehearsalShards)(plan.version, root, checkout, { ...deps.shardPlanDeps, remoteGate: true }) : undefined;
             if (shardPlan) stamp.shardPlan = shardPlan;
             const selection = { shards: opts.shards ?? shardPlan?.shards, remote: opts.remote };
             stamp.selection = selection;
+            if (shardPlan && (shardPlan.testFiles === 0 || shardPlan.gatePlanShards === null)) {
+              stamp.outcome = 'unmeasured';
+              stamp.summary = oneLine(`${shardPlan.testFiles === 0 ? 'no runnable rehearsal shards' : 'rehearsal shard plan unavailable'} · ${shardPlan.unmeasured ?? 'selected test files empty'}`);
+              stamp.endedAt = clock().toISOString();
+              // No RC was launched: this claim is not a completed stage. Leave the ledger free for the next tick.
+              unlinkSync(path);
+              written.push(stamp);
+              debug.log('release.rehearsal', 'step-shortage-retry', { version: stamp.version, step: stamp.step, summary: stamp.summary });
+              return { ...plan, applied: true, stamps: written, notificationFailures };
+            }
+            const regressionFiles: string[] = [];
             const result = await (deps.lightRc ?? ((version, cwd) => runLightRc(version, { ledgerRoot: root, head: stamp.sha, ...selection, rehearsalTui: true, log: (line) => {
                 for (const entry of line.split(/\r?\n/)) {
                   const file = /^- introduced: (.+?)(?: > |$)/.exec(entry)?.[1];
@@ -359,12 +526,25 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
               : result.introduced === null || result.unclassified === null || result.unmeasured !== null || result.unclassified > 0 ? 'unmeasured'
               : result.unmeasured === null && (!result.ok || result.gateExitCode !== 0) ? 'error'
               : planningGap ? 'unmeasured' : 'ok';
-            stamp.summary = oneLine(`introduced ${result.introduced} · preexisting ${result.preexisting ?? 'unmeasured'} · unclassified ${result.unclassified} · ${result.remote ?? 'local'} · gate rc ${result.gateExitCode}${!result.ok ? ' · RC 실패' : ''}${result.unmeasured !== null ? ` · unmeasured: ${result.unmeasured || 'RC reason empty'}` : ''}${stamp.shardPlan?.unmeasured ? ` · unmeasured: ${stamp.shardPlan.unmeasured}` : ''}${shardMismatch ? ` · unmeasured: ${shardMismatch}` : ''}${remoteMismatch ? ` · unmeasured: ${remoteMismatch}` : ''}`);
+            stamp.summary = oneLine(`introduced ${result.introduced ?? 'UNKNOWN'} · preexisting ${result.preexisting ?? 'UNKNOWN'} · unclassified ${result.unclassified ?? 'UNKNOWN'} · ${result.remote ?? 'local'} · gate rc ${result.gateExitCode}${!result.ok ? ' · RC 실패' : ''}${result.unmeasured !== null ? ` · unmeasured: ${result.unmeasured || 'RC reason empty'}` : ''}${stamp.shardPlan?.unmeasured ? ` · unmeasured: ${stamp.shardPlan.unmeasured}` : ''}${shardMismatch ? ` · unmeasured: ${shardMismatch}` : ''}${remoteMismatch ? ` · unmeasured: ${remoteMismatch}` : ''}`);
+            }
           }
         }
       } catch (error) {
         stamp.outcome = 'error';
-        stamp.summary = oneLine(`${String(error instanceof Error ? error.message : error).split(/\r?\n/, 1)[0] ?? 'unknown error'}${stamp.shardPlan?.unmeasured ? ` · unmeasured: ${stamp.shardPlan.unmeasured}` : ''}`);
+        const cause = String(error instanceof Error ? error.message : error).split(/\r?\n/, 1)[0] ?? 'unknown error';
+        if (stamp.hardGateRunId && stamp.hardGateLog) {
+          // The runner opens stderr before launch, so a failed launch or missing JSON may leave an empty file.
+          appendFileSync(stamp.hardGateLog, `${cause}\n`, { mode: 0o600 });
+          stamp.measurementGap = { cause, runId: stamp.hardGateRunId, evidence: stamp.hardGateLog };
+        }
+        stamp.summary = oneLine(`${cause}${stamp.hardGateRunId ? ` · runId ${stamp.hardGateRunId} · evidence ${stamp.hardGateLog}` : ''}${stamp.shardPlan?.unmeasured ? ` · unmeasured: ${stamp.shardPlan.unmeasured}` : ''}`);
+      }
+      if (stamp.hardGateRunId && stamp.hardGateLog && !stamp.measurementGap
+        && (stamp.outcome === 'no-checkout' || stamp.outcome === 'checkout-dirty')) {
+        const cause = stamp.outcome === 'no-checkout' ? 'hard gate checkout unavailable' : 'hard gate checkout dirty';
+        appendFileSync(stamp.hardGateLog, `${cause}\n`, { mode: 0o600 });
+        stamp.measurementGap = { cause, runId: stamp.hardGateRunId, evidence: stamp.hardGateLog };
       }
       await finish(path, stamp);
     }

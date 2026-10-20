@@ -9,6 +9,67 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 describe('pod pool — priority ⊕ per-node capacity', () => {
+  test('MBP lite admission uses the requested 2Gi size and shares the two-slot host cap with standard launches', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mbp-tier-admission-'));
+    const hostLease = new HostPoolLease('mbp-tier-admission', { dir, processStart: () => 'test-start' });
+    const kubectl = (args: readonly string[]) => {
+      if (args.includes('nodes')) return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'mbp-node' }, status: { allocatable: { cpu: '8', memory: '15638Mi' }, conditions: [{ type: 'Ready', status: 'True' }] } }] }), stderr: '' };
+      if (args.includes('top')) return { status: 1, stdout: '', stderr: 'unavailable' };
+      return { status: 0, stdout: JSON.stringify({ items: [] }), stderr: '' };
+    };
+    const pool = new PodPoolScheduler(parsePodPool('k3d-monad-h1:2'), { kubectl, dns: () => 'ready', hostLease, pollMs: 2 });
+    const controller = new AbortController();
+    const releases: Array<() => void> = [];
+    try {
+      const standard = pool.acquireAdmission(controller.signal, undefined, { memoryLimit: '16Gi' }).then((release) => { release(); return 'admitted'; }, () => 'aborted');
+      await Bun.sleep(15);
+      expect(pool.waitReason()).toContain('memorySlots=0');
+      const first = await pool.acquireAdmission(controller.signal, undefined, { memoryLimit: '2Gi' });
+      const second = await pool.acquireAdmission(controller.signal, undefined, { memoryLimit: '2Gi' });
+      releases.push(first, second);
+      expect(pool.waitReason('2Gi')).toContain('memorySlots=');
+      expect(hostLease.live()).toHaveLength(2);
+      const third = pool.acquireAdmission(controller.signal, undefined, { memoryLimit: '2Gi' });
+      await Bun.sleep(15);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 2 });
+      expect(hostLease.live()).toHaveLength(2);
+      first();
+      const thirdRelease = await third;
+      releases.push(thirdRelease);
+      expect(hostLease.live()).toHaveLength(2);
+      controller.abort();
+      expect(await standard).toBe('aborted');
+    } finally {
+      controller.abort();
+      for (const release of releases) release();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test('mixed standard and lite admissions cannot exceed the pool cap', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mixed-tier-admission-'));
+    const hostLease = new HostPoolLease('mixed-tier-admission', { dir, processStart: () => 'test-start' });
+    const status = () => ({ recommended: 2, accountSlots: 0, limitedBy: 'capacity' as const, reason: null,
+      capacitySlots: 2, memorySlots: 4, placeableSlots: 4, running: 0, pending: 0 });
+    const pool = new PodPoolScheduler(parsePodPool('mixed:2'), { status, hostLease, pollMs: 2 });
+    const controller = new AbortController();
+    const releases: Array<() => void> = [];
+    try {
+      const standard = await pool.acquireAdmission(controller.signal, undefined, { memoryLimit: '16Gi' });
+      const lite = await pool.acquireAdmission(controller.signal, undefined, { memoryLimit: '2Gi' });
+      releases.push(standard, lite);
+      let thirdOutcome: string | undefined;
+      const third = pool.acquireAdmission(controller.signal, undefined, { memoryLimit: '2Gi' }).then((release) => { releases.push(release); thirdOutcome = 'admitted'; return 'admitted'; }, () => { thirdOutcome = 'aborted'; return 'aborted'; });
+      await Bun.sleep(20);
+      expect(hostLease.live()).toHaveLength(2);
+      expect(thirdOutcome).toBeUndefined();
+      controller.abort();
+      expect(await third).toBe('aborted');
+    } finally {
+      controller.abort();
+      for (const release of releases) release();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   test('parses context[@ssh][:capacity] in priority order', () => {
     expect(parsePodPool('pool-node-b@node-b:12, k3d-elanous-h1, pool-node-c@node-c:3')).toEqual([
       { context: 'pool-node-b', sshHost: 'node-b', capacity: 12, k3dCluster: 'elanous-pool' },

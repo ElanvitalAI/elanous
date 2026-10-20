@@ -15,6 +15,8 @@ import {
   canExemptChildForTimeoutFailures,
   classifyAgainstBaseline,
   classifyBaselineProcess,
+  classifyBaselineWorktreeAddFailure,
+  withBaselineWorktree,
   classifyTimeoutRerunVariability,
   decideGateChildResponsibility,
   classifyGateTestFailures,
@@ -36,6 +38,7 @@ import {
 import { defaultSeams } from './seams.js';
 import { gateEvidenceNote } from '../harness/review-adapter.js';
 import { debug } from '../debug/log.js';
+import { setGitCommandRunnerForTesting } from '../git-fs/runner.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -1957,6 +1960,39 @@ describe('defaultSeams gate blocking', () => {
       baselineFileCount: 8,
       childResponsibility: 'none',
     });
+  });
+
+  test('git worktree add가 timeout으로 status null이면 시험 미측정이 아니라 준비 인프라 실패로 남긴다', () => {
+    const result = classifyBaselineWorktreeAddFailure({
+      status: null, signal: 'SIGKILL', errorCode: 'ETIMEDOUT', stdout: 'Preparing worktree', stderr: '',
+    }, 60_001);
+    expect(result).toMatchObject({ status: 'unknown', unknownReason: 'infrastructure-failure', childResponsibility: 'none' });
+    expect(result.log).toContain('worktree-add-timeout');
+    expect(result.log).toContain('code null');
+    expect(result.output).toContain('Preparing worktree');
+  });
+
+  test('실제 baseline 진입점도 null Git 종료를 시험 실패로 오귀속하지 않는다', () => {
+    const cwd = repo();
+    let testRan = false;
+    let observedTimeout: number | undefined;
+    let observedKillSignal: string | number | undefined;
+    setGitCommandRunnerForTesting((_cwd, args, options) => {
+      if (args[0] === 'worktree' && args[1] === 'add') {
+        observedTimeout = options?.timeout;
+        observedKillSignal = options?.killSignal;
+        return { status: null, signal: 'SIGKILL', errorCode: 'ETIMEDOUT', stdout: 'Preparing worktree', stderr: '' };
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    });
+    try {
+      const result = withBaselineWorktree(cwd, 'HEAD', () => { testRan = true; return 'ran'; });
+      expect(testRan).toBe(false);
+      expect(observedTimeout).toBe(180_000);
+      expect(observedKillSignal).toBe('SIGKILL');
+      expect(result).toMatchObject({ status: 'unknown', unknownReason: 'infrastructure-failure' });
+      expect((result as { log: string }).log).toContain('worktree-add-timeout');
+    } finally { setGitCommandRunnerForTesting(undefined); }
   });
 
   test('서로 다른 unknown 사유도 생산 분류에서 child-responsibility=none을 보존한다', () => {

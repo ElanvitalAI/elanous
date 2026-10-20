@@ -45,6 +45,7 @@ function fixture() {
     getPendingApprovals: async () => ({ pending: [] }),
     getRunGraphs: async () => ({ graphs: [{ id: 'research-loop', source: 'core' as const, editable: false, nodeCount: 3 }] }),
     getRunGraph: async () => detail,
+    getRunGraphFlat: async () => detail,
     getRunGraphYaml: async () => ({ id: 'research-loop', source: 'core' as const, editable: false, yaml: '' }),
     getGraphKinds: async () => ({ kinds: [] }),
     validateGraph: async () => ({ ok: true, errors: [], ignoredKeys: [] }),
@@ -77,6 +78,48 @@ test('RunGraphView renders a core list and non-interactive outcome-labelled canv
   expect(text).not.toContain('저장');
   expect(text).not.toContain('Save');
   expect(text).not.toContain('Delete');
+  await act(async () => renderer.unmount());
+  queries.clear();
+});
+
+test('RunGraphView uses the server-flattened read-only graph for core unit calls', async () => {
+  const { queries, client } = fixture();
+  const flat: RunGraphDetail = {
+    ...detail,
+    graph_hash: 'flat-hash',
+    nodes: [...detail.nodes, { node_id: 'verify__check', kind: 'gate', recipe: 'check', max_visits: 1 }],
+    edges: [...detail.edges, { from: 'judge', to: 'verify__check' }],
+  };
+  const flatClient = { ...client, getRunGraphFlat: async () => flat } as unknown as NexusClient;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => { renderer = create(<NexusProvider client={flatClient} queryClient={queries}><RunGraphView /></NexusProvider>); });
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+  const canvas = renderer.root.findByType(ReactFlow);
+  expect(canvas.props.nodes.some((node: { id: string }) => node.id === 'verify__check')).toBe(true);
+  await act(async () => renderer.unmount());
+  queries.clear();
+});
+
+test('RunGraphView does not fall back to raw graph when static flattening fails', async () => {
+  const { queries, client } = fixture();
+  const failingClient = { ...client, getRunGraphFlat: async () => { throw new Error('flat unavailable'); } } as unknown as NexusClient;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => { renderer = create(<NexusProvider client={failingClient} queryClient={queries}><RunGraphView /></NexusProvider>); });
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+  expect(renderer.root.findAllByType(ReactFlow)).toHaveLength(0);
+  expect(JSON.stringify(renderer.toJSON())).toContain('정적 그래프를 불러오지 못했습니다.');
+  await act(async () => renderer.unmount());
+  queries.clear();
+});
+
+test('RunGraphView does not show raw graph when the static graph endpoint is unavailable', async () => {
+  const { queries, client } = fixture();
+  const noFlatClient = { ...client, getRunGraphFlat: undefined } as unknown as NexusClient;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => { renderer = create(<NexusProvider client={noFlatClient} queryClient={queries}><RunGraphView /></NexusProvider>); });
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+  expect(renderer.root.findAllByType(ReactFlow)).toHaveLength(0);
+  expect(JSON.stringify(renderer.toJSON())).toContain('정적 그래프 화면을 사용할 수 없습니다.');
   await act(async () => renderer.unmount());
   queries.clear();
 });
@@ -131,6 +174,7 @@ test('a mine graph validates before saving and warns about ignored keys without 
   expect(save).toBeDefined();
   await act(async () => save!.props.onClick());
   await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+  expect(validations).toBe(1);
   expect(JSON.stringify(renderer.toJSON())).toContain('nodes 가 비었다');
   expect(JSON.stringify(renderer.toJSON())).toContain('nodes[0].extra');
   expect(validations).toBe(1);

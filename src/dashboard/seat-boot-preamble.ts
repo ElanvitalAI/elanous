@@ -84,7 +84,7 @@ function buildCardMessages(cwd: string, deps: SeatBootDeps): { messages: LLMMess
   const content =
     `## 자리 부트 카드 — 너는 이 작업 디렉터리의 ${detection.seat} 자리에서 일한다\n` +
     `(판정: ${detection.source === 'cwd' ? `cwd 의 /seats/${detection.seat}` : 'COORD_ID'} · 세션 시작 스냅샷 ${at} · 이후 바뀐 값은 다시 조회하라)\n` +
-    `사람이 다른 일을 먼저 시키지 않았다면, 첫 답에서 자리와 안 읽은 우편 수를 짚고 처리할 일을 제안하라.\n\n` +
+    `사람이 다른 일을 먼저 시키지 않았다면, 첫 답에서 자리 이름·'자리 역할' 절의 역할·안 읽은 우편 수를 각각 명시하고 처리할 일을 제안하라. 역할이 미관측이면 추측하지 말고 미관측이라고 말하라.\n\n` +
     card;
   return {
     messages: [{ role: 'system', content }],

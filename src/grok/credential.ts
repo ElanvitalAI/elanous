@@ -147,6 +147,11 @@ export function readGrokSubscriptionAccess(
   return { key: sub.token, expiresAt: sub.expiresAt };
 }
 
+/** Read only the selected subscription expiry for status/alert surfaces; never return token or account id. */
+export function readGrokSubscriptionExpiry(home?: string): string | null {
+  return readSubscriptionToken(grokAuthFilePath(home))?.expiresAt ?? null;
+}
+
 /** 프록시 필수 헤더. ⛔ `x-grok-client-version` 을 빼면 426 이다(실측). */
 export function grokSubscriptionHeaders(opts: {
   model?: string;

@@ -11,6 +11,9 @@ import { sourceCandidates } from '../../src/self-implement/importer-test-index.j
 
 /** Files the closure follows (code). Changing anything else that is not a test or inert Markdown is a full gate. */
 export const CODE_FILE = /\.(?:[cm]?[jt]sx?)$/;
+/** One release input whose readers use a literal basename in readFileSync(join(import.meta.dir, ...)).
+ *  Other JSON stays a full gate until its dependency edge is proved. */
+export const TRACEABLE_RELEASE_JSON = 'scripts/release-loop/known-issues-0.2.33-approved.json';
 const TEST_FILE = /^(?:[\w.-]+\/)*[\w.-]+\.test\.(?:tsx?|jsx?|mts|cts)$/;
 /** Test-side helpers: their filesystem scans and unresolved code paths make a test opaque (production code is trusted to
  *  reach code only through imports and the literal paths below). */
@@ -159,7 +162,8 @@ export function buildClosureGraph(tree: ClosureTree, options: ClosureOptions = {
     for (const match of code.matchAll(LITERAL)) {
       const value = match[2]!;
       if (!value || value.length > 300 || value.includes('${') || /\s/.test(value) || /^[a-z]+:/i.test(value)) continue;
-      const pathLike = value.startsWith('./') || value.startsWith('../') || (value.includes('/') && /^[\w@.-]+(?:\/[\w@.-]+)+\/?$/.test(value)) || CODE_FILE.test(value);
+      const pathLike = value.startsWith('./') || value.startsWith('../') || (value.includes('/') && /^[\w@.-]+(?:\/[\w@.-]+)+\/?$/.test(value)) || CODE_FILE.test(value)
+        || value === TRACEABLE_RELEASE_JSON.split('/').at(-1);
       if (!pathLike) continue;
       const plain = value.replace(/\/$/, '');
       const hit = resolveLiteral(file, plain);

@@ -28,7 +28,7 @@ import type { ClaudePtyMaturity } from './claude-pty-maturity.js';
  *    그 grok 마저 못 쓰면 갈 곳이 없었다 — 이 칸을 grok «뒤»에 두면 그때만 크레딧으로 돌아온다.
  *    ⛔ 첫 칸의 크레딧 금지(`codexQuotaPolicy`)는 그대로다 — 이 칸은 «체인이 여기까지 왔을 때»만 돈을 쓴다.
  *    ⛔ 기본 체인에는 «없다» — 돈이라 사람이 config 에 «명시»할 때만 켜진다. */
-export const FALLBACK_STEPS = ['codex-rotate', 'grok', 'claude-pty', 'openrouter', 'codex-credits'] as const;
+export const FALLBACK_STEPS = ['codex-rotate', 'grok', 'zai', 'claude-pty', 'openrouter', 'codex-credits'] as const;
 export type FallbackStep = (typeof FALLBACK_STEPS)[number];
 
 /** 기본 체인 — ⛔⭐ **2026-08-20 에 `grok` 이 «기본»으로 들어왔다**(대표 지시).

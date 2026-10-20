@@ -32,15 +32,15 @@ function machine(me: string, store: ReturnType<typeof memory>, beforeWrite?: () 
 }
 
 test('two machines claim, renew for ten ticks, stall, take over at rank times five and never auto-return', () => {
-  const store = memory(), mbp = machine('mbp', store, undefined, 1), node-b = machine('node-b', store, undefined, 2);
-  mbp.tick(); node-b.tick();
+  const store = memory(), mbp = machine('mbp', store, undefined, 1), gateMember = machine('node-b', store, undefined, 2);
+  mbp.tick(); gateMember.tick();
   expect(store.doc?.holder).toBe('mbp');
-  expect(node-b.events).toEqual(['observe']);
-  for (let i = 0; i < 10; i++) { mbp.tick(); node-b.tick(); }
+  expect(gateMember.events).toEqual(['observe']);
+  for (let i = 0; i < 10; i++) { mbp.tick(); gateMember.tick(); }
   expect(store.doc?.holder).toBe('mbp');
-  expect(node-b.events).not.toContain('takeover');
-  for (let i = 0; i < 9; i++) expect(node-b.tick().action).toBe('observe');
-  expect(node-b.tick().action).toBe('takeover');
+  expect(gateMember.events).not.toContain('takeover');
+  for (let i = 0; i < 9; i++) expect(gateMember.tick().action).toBe('observe');
+  expect(gateMember.tick().action).toBe('takeover');
   expect(store.doc).toMatchObject({ holder: 'node-b', state: 'held' });
   expect(mbp.tick().action).toBe('observe');
   expect(store.doc?.holder).toBe('node-b');
@@ -49,40 +49,40 @@ test('two machines claim, renew for ten ticks, stall, take over at rank times fi
 
 test('intervening renewal defeats takeover CAS; candidate resets observation', () => {
   const store = memory(), mbp = machine('mbp', store, undefined, 1);
-  const node-b = machine('node-b', store, () => mbp.tick(), 2);
+  const gateMember = machine('node-b', store, () => mbp.tick(), 2);
   mbp.tick();
-  for (let i = 0; i < 10; i++) expect(node-b.tick().action).toBe('observe');
-  expect(node-b.tick().action).toBe('takeover');
-  expect(node-b.events.at(-1)).toBe('cas-rejected');
+  for (let i = 0; i < 10; i++) expect(gateMember.tick().action).toBe('observe');
+  expect(gateMember.tick().action).toBe('takeover');
+  expect(gateMember.events.at(-1)).toBe('cas-rejected');
   expect(store.doc?.holder).toBe('mbp');
-  expect(node-b.tick().action).toBe('observe');
+  expect(gateMember.tick().action).toBe('observe');
 });
 
 test('60-second observer before every 60-second renewal cannot take over after one unchanged read', () => {
-  const store = memory(), mbp = machine('mbp', store, undefined, 1), node-b = machine('node-b', store, undefined, 2);
+  const store = memory(), mbp = machine('mbp', store, undefined, 1), gateMember = machine('node-b', store, undefined, 2);
   mbp.tick(0);
-  node-b.tick(0, 2);
+  gateMember.tick(0, 2);
   for (let minute = 1; minute <= 10; minute++) {
-    const beforeRenew = node-b.tick(minute * 60_000, 2);
+    const beforeRenew = gateMember.tick(minute * 60_000, 2);
     expect(beforeRenew.action).toBe('observe');
     expect(store.doc?.holder).toBe('mbp');
     mbp.tick(minute * 60_000 + 1, 2);
   }
-  expect(node-b.events).not.toContain('takeover');
+  expect(gateMember.events).not.toContain('takeover');
   expect(store.doc?.holder).toBe('mbp');
-  expect(() => node-b.tick(11 * 60_000 - 1, 1)).toThrow('takeover-ticks must be at least 2');
+  expect(() => gateMember.tick(11 * 60_000 - 1, 1)).toThrow('takeover-ticks must be at least 2');
   expect(store.doc?.holder).toBe('mbp');
 });
 
 test('pending handoff only recipient accepts; corrupt or unreadable lease never takes over', () => {
-  const store = memory(), mbp = machine('mbp', store, undefined, 1), node-b = machine('node-b', store, undefined, 2);
-  expect(node-b.tick().action).toBe('observe');
+  const store = memory(), mbp = machine('mbp', store, undefined, 1), gateMember = machine('node-b', store, undefined, 2);
+  expect(gateMember.tick().action).toBe('observe');
   expect(store.doc).toBeUndefined();
   mbp.tick();
   store.write({ holder: 'node-b', from: 'mbp', state: 'handing-off', generation: 2, renewedAt: 10 }, String(store.gen));
   for (let i = 0; i < 10; i++) expect(mbp.tick().action).toBe('observe');
   expect(store.doc).toMatchObject({ state: 'handing-off', holder: 'node-b' });
-  expect(node-b.tick().action).toBe('accept');
+  expect(gateMember.tick().action).toBe('accept');
   expect(store.doc).toMatchObject({ holder: 'node-b', state: 'held' });
   const cfg = { me: 'node-b', rank: 2, takeoverTicks: 5, now: 0 };
   expect(() => decideTick(initialWatchState, { kind: 'unmeasured', why: 'offline' }, cfg)).toThrow('offline');

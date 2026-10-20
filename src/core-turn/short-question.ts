@@ -105,7 +105,11 @@ function classifyTuiChatIntentBase(text: string, ctx: ShortQuestionContext): Tui
   if (!q || ctx.hasAttachments) return coding(ctx.hasAttachments ? 'attachment' : 'empty');
   if (/(?:하니스|구현|코딩|버그|리팩터|커밋|패치|테스트|시험\s*돌|빌드|배포|\b(?:implement|coding|refactor|commit|patch|tests?|build|deploy)\b)/i.test(q)) return coding('coding');
   // Destructive or executing verbs in any form (not only «…줘») are never a quick turn.
-  if (/(?:지워|지우|삭제|제거|옮겨|옮기|돌려|실행(?!\s*중(?:인)?(?:\s|[?!.~]|$))|설치|되돌려|롤백|재시작|죽여|\b(?:delete|remove|rm|rename|move|run|install|revert|rollback|drop|kill|restart)\b)/i.test(q)) return coding('write-verb');
+  // A no-tool answer can transcribe its first line. Keep the verb for file changes and
+  // remove only this copy phrase, so another write request in the same answer is still caught.
+  const answerOnly = /도구\s*쓰지\s*말고\s*답해\s*:/i.test(q);
+  const writeVerbInput = answerOnly ? q.replace(/첫\s*줄(?:을|를)?\s*그대로\s*옮기고/g, '') : q;
+  if (/(?:지워|지우|삭제|제거|옮겨|옮기|돌려|실행(?!\s*중(?:인)?(?:\s|[?!.~]|$))|설치|되돌려|롤백|재시작|죽여|\b(?:delete|remove|rm|rename|move|run|install|revert|rollback|drop|kill|restart)\b)/i.test(writeVerbInput)) return coding('write-verb');
   // Allowlist, not denylist: every «…줘» request verb must be one a quick turn can do; anything else
   // (지워줘 · 돌려줘 · 옮겨줘 …) keeps the coding goal loop.
   for (const match of q.matchAll(/([가-힣]+?)\s*(?:줘|주세요|줄래|주라)/g)) {

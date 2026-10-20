@@ -42,7 +42,20 @@ freezeIsolationAfterEach(() => {
   freezeIsolationRm(isolatedStateDirForFreeze, { recursive: true, force: true });
 });
 const runPrLand: typeof realRunPrLand = (opts = {}, deps = {}) => realRunPrLand(opts, { prodFreezeRoot: isolatedFreezeRoot, ...deps });
-const runPublish: typeof realRunPublish = (run, prodFreezeRoot, clock) => realRunPublish(run, prodFreezeRoot ?? isolatedFreezeRoot, clock);
+const runPublish: typeof realRunPublish = (run, prodFreezeRoot, clock, approvalRoot) =>
+  realRunPublish(run, prodFreezeRoot ?? isolatedFreezeRoot, clock, approvalRoot);
+function recordApprovalFixture() {
+  const runId = 'fixture-run';
+  const decidedAt = '2026-10-19T00:00:00.000Z';
+  const approval = { outcome: 'approved', graphId: 'release-loop', runId, nodeId: 'approve-publish', decidedAt };
+  const dir = join(isolatedStateDirForFreeze, 'graph-runs', 'release-loop');
+  const file = join(dir, `${runId}.json`);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(file, JSON.stringify({ graphId: 'release-loop', runId, path: ['auto-approve', 'approve-publish', 'publish'],
+    nodes: [{ nodeId: 'approve-publish', ok: true, decidedAt, output: JSON.stringify(approval) }] }));
+  writeFileSync(`${file}.2.decision.json`, JSON.stringify({ nodeId: 'approve-publish', decision: 'approved', decidedAt }));
+  return approval;
+}
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -467,8 +480,11 @@ test('measured graph decision publishes without human approval', async () => {
         const result = runAutoApprove(context, { instanceRoot: root, repo });
         return { exitCode: result.outcome === 'ok' ? 0 : 1, stdout: JSON.stringify(result) + '\n', stderr: '' };
       }
-      const fields = body.includes('gate-node.ts') ? { introduced: [] } : body.includes('prepare-node.ts') ? { out }
-        : body.includes('docs-node.ts') ? { notes: join(root, 'notes.md') } : {};
+      const nodeId = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')).nodeId;
+      const fields = nodeId === 'tui'
+        ? { regress: { pass: 7, fail: 0, results: Array.from({ length: 7 }, (_, i) => ({ id: `R${i + 1}`, title: 'check', ok: true, reason: 'measured' })) } }
+        : body.includes('gate-node.ts') ? { introduced: [] } : body.includes('prepare-node.ts') ? { out }
+          : body.includes('docs-node.ts') ? { notes: join(root, 'notes.md') } : {};
       return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', verdict: 'pass', ...fields }) + '\n', stderr: '' };
     };
     const state = await runGraph(graph, { input: { version: '0.2.5', previousVersion: '0.2.4' }, deps: { root, runBash: fake } });
@@ -482,6 +498,84 @@ test('measured graph decision publishes without human approval', async () => {
     expect(state.nodes.find((n) => n.nodeId === 'auto-approve')?.output).toContain('release-loop metrics');
     expect(commands.some((body) => body.includes('publish-node.ts'))).toBe(true);
     expect(readFileSync(join(root, 'release', '0.2.5', 'auto-approval.md'), 'utf8')).toContain('| 8 | installation files |');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('4/7 TUI result reaches HITL in the same graph run and cannot publish before approval', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-tui-hitl-'));
+  const repo = join(root, 'repo');
+  const out = join(root, 'release', '0.2.5', 'prepared');
+  const graph = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  const published: string[] = [];
+  try {
+    mkdirSync(repo);
+    mkdirSync(join(out, 'dist'), { recursive: true });
+    writeFileSync(join(repo, '.bun-version'), `${Bun.version}\n`);
+    for (let i = 0; i < 5; i++) writeFileSync(join(out, 'dist', `install-${i}`), 'fixture');
+    const runBash = async (body: string, opts: { env?: NodeJS.ProcessEnv }) => {
+      const context = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as GraphContext;
+      if (context.nodeId === 'auto-approve') {
+        const result = runAutoApprove(context, { instanceRoot: root, repo });
+        return { exitCode: result.outcome === 'ok' ? 0 : 1, stdout: JSON.stringify(result) + '\n', stderr: '' };
+      }
+      if (context.nodeId === 'publish') {
+        const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+        process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+        try {
+          const result = runPublish((command, args) => {
+            if (command === 'git') return { status: 0, stdout: args[1]?.endsWith('pages.json')
+              ? JSON.stringify({ pages: [] }) : '# 0.2.5\n\nRelease notes.\n', stderr: '' };
+            if (command === 'bun' && args.includes('publish')) {
+              published.push(context.runId!);
+              return { status: 0, stdout: JSON.stringify({ ok: true, published: true, tag: 'v0.2.5', assets: [] }), stderr: '' };
+            }
+            throw new Error(`unexpected publish command: ${command}`);
+          }, root, undefined, root);
+          return { exitCode: result.outcome === 'ok' ? 0 : 1, stdout: JSON.stringify(result) + '\n', stderr: '' };
+        } finally {
+          if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+          else process.env.ELANOUS_GRAPH_CONTEXT = prior;
+        }
+      }
+      const fields = context.nodeId === 'version-release' ? { commit: 'a'.repeat(40) }
+        : context.nodeId === 'gate' ? { introduced: [] }
+        : context.nodeId === 'prepare' ? { out, commit: 'a'.repeat(40) }
+        : context.nodeId === 'docs' ? { notes: join(root, 'notes.md'), branch: 'release-docs/0.2.5' }
+        : context.nodeId === 'tui' ? { regress: { pass: 4, fail: 3,
+          results: Array.from({ length: 7 }, (_, i) => ({ id: `R${i + 1}`, title: 'check', ok: i < 4, reason: 'measured' })) } } : {};
+      return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', verdict: 'pass', ...fields }) + '\n', stderr: '' };
+    };
+    const first = await runGraph(graph, { input: { version: '0.2.5', previousVersion: '0.2.4' }, deps: { root, runBash } });
+    expect(first.status).toBe('awaiting-approval');
+    expect(first.path.slice(-2)).toEqual(['auto-approve', 'approve-publish']);
+    expect(first.pending?.nodeId).toBe('approve-publish');
+    expect(published).toEqual([]);
+    const auto = JSON.parse(String(first.nodes.find((node) => node.nodeId === 'auto-approve')?.output));
+    expect(auto.tuiSubcheck).toMatchObject({ runId: first.runId, fail: 3, approvalRequired: true });
+    const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', runId: first.runId,
+      input: { version: '0.2.5', previousVersion: '0.2.4' },
+      outputs: { 'auto-approve': auto, 'approve-publish': { outcome: 'approved', graphId: first.graphId,
+        runId: first.runId, nodeId: 'approve-publish', decidedAt: new Date().toISOString() } } });
+    try {
+      expect(runPublish(() => { throw new Error('publish invoked before HITL'); }, root, undefined, root).outcome).toBe('fail');
+    } finally {
+      if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+      else process.env.ELANOUS_GRAPH_CONTEXT = prior;
+    }
+    decideGraphApproval(first.graphId, first.runId, 'approved', 'fixture-approver', root);
+    const resumed = await runGraph(graph, { resumeRunId: first.runId, deps: { root, runBash } });
+    expect(resumed.runId).toBe(first.runId);
+    expect(published).toEqual([first.runId]);
+    const approval = JSON.parse(String(resumed.nodes.find((node) => node.nodeId === 'approve-publish')?.output));
+    expect(approval).toMatchObject({ outcome: 'approved', graphId: first.graphId, runId: first.runId, nodeId: 'approve-publish' });
+    expect(approval.decidedAt).toBeString();
+    const statePath = join(root, 'graph-runs', 'release-loop', `${first.runId}.json`);
+    const persisted = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
+    expect(persisted.nodes.find((node) => node.nodeId === 'approve-publish')?.decidedAt).toBe(approval.decidedAt);
+    const visit = persisted.path.indexOf('approve-publish') + 1;
+    const claim = JSON.parse(readFileSync(`${statePath}.${visit}.decision.json`, 'utf8'));
+    expect(claim).toMatchObject({ nodeId: 'approve-publish', decision: 'approved', decidedAt: approval.decidedAt });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -802,7 +896,7 @@ test('publish uses docs branch notes and page slugs when prerequisites pass', ()
   const prior = process.env.ELANOUS_GRAPH_CONTEXT;
   const calls: Array<[string, string[]]> = [];
   try {
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', runId: 'fixture-run', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': recordApprovalFixture(),
       'version-release': { outcome: 'ok', commit: 'a'.repeat(40) }, gate: { outcome: 'ok' }, pwa: { outcome: 'ok' }, prepare: { outcome: 'ok', out: root, commit: 'a'.repeat(40) }, upgrade: { outcome: 'ok' }, tui: { outcome: 'ok' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' },
     } });
     const result = runPublish((cmd, args) => {
@@ -825,8 +919,8 @@ test('any failed prerequisite refuses publish without calling the release comman
   try {
     for (const failed of ['gate', 'prepare', 'upgrade']) {
       const outputs: Record<string, unknown> = Object.fromEntries(['gate', 'prepare', 'upgrade', 'pwa', 'tui', 'docs'].map((node) => [node, { outcome: node === failed ? 'fail' : 'ok' }]));
-      outputs['approve-publish'] = { outcome: 'approved' };
-      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
+      outputs['approve-publish'] = recordApprovalFixture();
+      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', runId: 'fixture-run', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
       const result = runPublish(() => { throw new Error('release publish was called'); });
       expect(result).toMatchObject({ outcome: 'fail', verdict: 'fail' });
       expect(result.summary).toContain(failed);
@@ -848,15 +942,16 @@ test('publish accepts measured automatic approval but refuses incomplete metrics
     const outputs: GraphContext['outputs'] = {
       'version-release': { outcome: 'ok', commit: 'a'.repeat(40) }, gate: { outcome: 'ok', introduced: [] }, pwa: { outcome: 'ok' },
       prepare: { outcome: 'ok', commit: 'a'.repeat(40), out }, upgrade: { outcome: 'ok' },
-      tui: { outcome: 'ok' }, 'notes-check': { outcome: 'ok' },
+      tui: { outcome: 'ok', regress: { pass: 7, fail: 0,
+        results: Array.from({ length: 7 }, (_, i) => ({ id: `R${i + 1}`, title: 'check', ok: true, reason: 'measured' })) } }, 'notes-check': { outcome: 'ok' },
       docs: { outcome: 'ok', notes: join(root, 'notes.md'), branch: 'release-docs/0.2.5' },
     };
-    const approval = runAutoApprove({ input, outputs }, { instanceRoot: root, repo });
+    const approval = runAutoApprove({ runId: 'fixture-run', input, outputs }, { instanceRoot: root, repo });
     expect(approval).toMatchObject({ outcome: 'ok', decidedBy: 'release-loop metrics' });
     const metrics = approval.metrics;
     expect(metrics.some((metric) => metric.name === 'mac-smoke')).toBe(true);
     const publish = (approvalOutput: Record<string, unknown>, run: Parameters<typeof runPublish>[0]) => {
-      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input, outputs: { ...outputs, 'auto-approve': approvalOutput } });
+      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', runId: 'fixture-run', input, outputs: { ...outputs, 'auto-approve': approvalOutput } });
       return runPublish(run);
     };
     const run = (cmd: string, args: string[]) => ({ status: 0, stderr: '', stdout: cmd === 'git'
@@ -885,7 +980,7 @@ test('publish accepts measured automatic approval but refuses incomplete metrics
 test('publish cannot report a tag that differs from the release CLI result', () => {
   const prior = process.env.ELANOUS_GRAPH_CONTEXT;
   try {
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', runId: 'fixture-run', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': recordApprovalFixture(),
       'version-release': { outcome: 'ok', commit: 'a'.repeat(40) }, gate: { outcome: 'ok' }, pwa: { outcome: 'ok' },
       prepare: { outcome: 'ok', commit: 'a'.repeat(40), out: '/tmp/prepared' }, upgrade: { outcome: 'ok' },
       tui: { outcome: 'ok' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' },
@@ -900,7 +995,7 @@ test('publish cannot report a tag that differs from the release CLI result', () 
 test('publish refuses mismatched prepared commit without reading notes or calling release publish', () => {
   const prior = process.env.ELANOUS_GRAPH_CONTEXT;
   try {
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', runId: 'fixture-run', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': recordApprovalFixture(),
       'version-release': { outcome: 'ok', commit: 'a'.repeat(40) },
       gate: { outcome: 'ok' }, pwa: { outcome: 'ok' }, prepare: { outcome: 'ok', commit: 'b'.repeat(40), out: '/tmp/prepared' },
       upgrade: { outcome: 'ok' }, tui: { outcome: 'ok' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' },
@@ -926,7 +1021,7 @@ test('publish refuses failed upgrade before running any release command', () => 
   let calls = 0;
   try {
     const file = join(root, 'context.json');
-    writeFileSync(file, JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+    writeFileSync(file, JSON.stringify({ nodeId: 'publish', runId: 'fixture-run', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': recordApprovalFixture(),
       gate: { outcome: 'ok' }, pwa: { outcome: 'ok' }, prepare: { outcome: 'ok' }, upgrade: { outcome: 'fail' }, tui: { outcome: 'ok' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' },
     } }));
     process.env.ELANOUS_GRAPH_CONTEXT = file;
@@ -966,7 +1061,7 @@ test('graph docs refuses a missing upgrade output without generating documentati
     mkdirSync(join(root, 'website'), { recursive: true });
     writeFileSync(join(root, 'release/9.9.9/manifest.json'), JSON.stringify({ version: '9.9.9', in: [] }));
     writeFileSync(join(root, 'website/pages.json'), JSON.stringify({ pages: [] }));
-    const graphContext = JSON.stringify({ input: { version: '9.9.9', previousVersion: '0.2.3', base: root }, outputs: { 'approve-publish': { outcome: 'approved' },
+    const graphContext = JSON.stringify({ input: { version: '9.9.9', previousVersion: '0.2.3', base: root }, outputs: { 'approve-publish': recordApprovalFixture(),
       gate: { outcome: 'ok' }, prepare: { outcome: 'ok' }, tui: { outcome: 'ok' },
     } });
     const run = spawnSync(process.execPath, [join(import.meta.dir, 'docs-node.ts'), '--json'], {
@@ -987,7 +1082,7 @@ test('upgrade reports stderr-only failure reason', () => {
   try {
     const candidate = join(root, 'elanous.tgz');
     writeFileSync(candidate, 'fake');
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': recordApprovalFixture(),
       prepare: { outcome: 'ok', candidate, commit: 'a'.repeat(40) }, 'version-release': { outcome: 'ok', commit: 'a'.repeat(40) },
     } });
     const result = runUpgrade(() => ({ status: 2, stdout: '', stderr: 'candidate archive cannot be opened\n' }));
@@ -1093,7 +1188,7 @@ test('docs land refuses an upsert-only response without merge and never deploys'
   const prior = process.env.ELANOUS_GRAPH_CONTEXT;
   const calls: string[] = [];
   try {
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': recordApprovalFixture(),
       publish: { outcome: 'ok', tag: 'v0.2.4' }, docs: { branch: 'release-docs/0.2.4', worktree: join(root, 'tree') },
     } });
     mkdirSync(join(root, 'tree'));
@@ -1138,7 +1233,7 @@ test('publish refuses when approve-publish did not approve, without calling any 
     for (const approval of [undefined, { outcome: 'rejected' }, null]) {
       const outputs: Record<string, unknown> = Object.fromEntries(['gate', 'prepare', 'upgrade', 'pwa', 'tui', 'docs'].map((node) => [node, { outcome: 'ok' }]));
       if (approval !== undefined) outputs['approve-publish'] = approval;
-      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
+      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', runId: 'fixture-run', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
       const result = runPublish((cmd, args) => { calls.push(`${cmd} ${args.join(' ')}`); return { status: 0, stdout: '', stderr: '' }; });
       expect(result.outcome).toBe('fail');
       expect(result.summary).toContain('approve-publish');

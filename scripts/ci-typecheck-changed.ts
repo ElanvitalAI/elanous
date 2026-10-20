@@ -1,7 +1,7 @@
 /** Changed-file tsc gate with a visible ratchet for pre-existing test-only debt. */
 import { execFileSync, execSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import ts from 'typescript';
 import {
@@ -26,6 +26,7 @@ import {
 } from './tsc-baseline-cache.js';
 import { TSC_OOM_RETRY_HEAP_MB, TSC_HEAP_MB, tscEnv } from '../src/typecheck-ratchet.js';
 import { runIncrementalCachedTsc } from './tsc-incremental-cache.js';
+import type { GateRemoteFlags } from '../src/self-implement/gate-remote.js';
 
 /** Inherited GIT_DIR / GIT_WORK_TREE would make `--cwd <other tree>` still read the launcher's repo. */
 function gitEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
@@ -147,12 +148,12 @@ export function changedTsFiles(run: (cmd: string) => string = sh, env: NodeJS.Pr
   let uncountableBase: { command: string; why: string } | undefined;
   if (head && quietRevision(`git rev-parse ${base}`) === head) {
     const main = quietRevision('git rev-parse origin/main');
-    const merged = main && main !== head ? quietRevision('git merge-base HEAD origin/main') : '';
+    const merged = main ? quietRevision('git merge-base HEAD origin/main') : '';
     if (merged && merged !== head) {
       warnings.push(`base=${base} 가 HEAD 와 같은 커밋 — origin/main (${main})과 달라 merge-base 로 재계산`);
       base = merged;
       baseSource = 'recomputed merge-base(origin/main)';
-    } else if (main && main !== head) {
+    } else if ((merged === head && head) || (!merged && main && main !== head)) {
       uncountableBase = { command: `git rev-parse ${base}`, why: `base 가 HEAD(${head}) 와 같아 변경을 셀 수 없다 — TSC_BASE_REF 로 base 를 주라 (못 셌음 ≠ 0)` };
     }
   }
@@ -923,6 +924,10 @@ export type GateIo = {
   baseRef?: string;
   /** Source of TSC_GATE_ROOTS / ELANOUS_TSC_AFFECTED_ROOTS. Defaults to process.env. */
   env?: NodeJS.ProcessEnv;
+  /** Refuse an unbounded root program on the MBP seat before starting tsc. */
+  forbidFullLocal?: boolean;
+  /** Only pr land may measure a dependency-free target with the installed compiler. */
+  allowMissingCheckoutDependencies?: boolean;
   /** Changed gate sources → themselves plus their direct importers. Defaults to the repository import-graph reader. */
   affectedRoots?: (cwd: string, changed: ReadonlySet<string>) => AffectedRoots;
   log: (message: string) => void;
@@ -945,10 +950,11 @@ export function formatOutsideChangedWarning(outsideChanged: readonly { file: str
   return `[tsc-gate] ⚠ 변경 파일 밖 진단 ${total}건이 파일 ${fileCount}개에서 버려짐: ${nameText}`;
 }
 
-function inspectTscResult(tsc: TscRun, changed: ReadonlySet<string>, baseline: ReadonlyMap<string, number>, error: (message: string) => void, warn: (message: string) => void, wholeRepository = false, excludedPrefixes: readonly string[] = [], includedPrefixes: readonly string[] = [], promotionBaseline?: BaselineDiagnostics, excludeTests = false): boolean {
+function inspectTscResult(tsc: TscRun, changed: ReadonlySet<string>, baseline: ReadonlyMap<string, number>, error: (message: string) => void, warn: (message: string) => void, wholeRepository = false, excludedPrefixes: readonly string[] = [], includedPrefixes: readonly string[] = [], promotionBaseline?: BaselineDiagnostics, excludeTests = false, requireAllDiagnostics = false): boolean {
   if (!tsc.ran) {
     error(`[tsc-gate] ⛔ 실행 판정 실패 — ${tsc.why}`);
     if (tsc.out.trim()) error(tsc.out.trim().slice(0, 2000));
+    if (tsc.why?.includes('ENOENT') || tsc.why?.includes('종료코드 127') || /Module not found ["'].*typescript\/bin\/tsc/.test(tsc.out)) error('[tsc-gate] TypeScript 실행 파일을 확인하십시오 — 대상 트리 또는 설치본에서 bun install --frozen-lockfile 뒤 재실행하십시오.');
     error('[tsc-gate] FAIL — tsc 가 정상 실행됐음을 확인할 수 없다(통과로 읽지 않는다).');
     return false;
   }
@@ -968,7 +974,11 @@ function inspectTscResult(tsc: TscRun, changed: ReadonlySet<string>, baseline: R
     warn(`[tsc-gate] ⚠ 기준 진단을 얻지 못했다 — ${promotionBaseline.unavailable} (관측만 · 비차단; 현재 진단은 면제하지 않는다).`);
   }
   const promotionDiff = wholeRepository && baselineDiagnostics ? diffTypecheckDiagnostics(diagnostics, baselineDiagnostics) : undefined;
-  const result = classifyTypecheckErrors(promotionDiff?.added ?? diagnostics, wholeRepository ? new Set((promotionDiff?.added ?? diagnostics).map((diagnostic) => diagnostic.file)) : changed, baseline);
+  // Without the target's declarations, even a diagnostic outside the changed files
+  // may be caused by the missing installation. Do not call that measurement clean.
+  const classified = promotionDiff?.added ?? diagnostics;
+  const result = classifyTypecheckErrors(classified, wholeRepository || requireAllDiagnostics
+    ? new Set(classified.map((diagnostic) => diagnostic.file)) : changed, requireAllDiagnostics ? new Map() : baseline);
   if (promotionDiff?.existing.length) {
     const existingByFile = new Map<string, number>();
     for (const diagnostic of promotionDiff.existing) existingByFile.set(diagnostic.file, (existingByFile.get(diagnostic.file) ?? 0) + 1);
@@ -986,7 +996,7 @@ function inspectTscResult(tsc: TscRun, changed: ReadonlySet<string>, baseline: R
   }
   if (result.outsideChanged.length > 0) warn(formatOutsideChangedWarning(result.outsideChanged));
   if (result.failing.length === 0) return true;
-  const failureScope = wholeRepository ? '저장소 전체 범위' : '변경 파일';
+  const failureScope = wholeRepository ? '저장소 전체 범위' : requireAllDiagnostics ? '대상 트리 타입 진단' : '변경 파일';
   error(`\n[tsc-gate] FAIL — ${failureScope}에 타입 에러 ${result.failing.length}건:`);
   for (const entry of result.failing) error('  ' + entry.line);
   error('\n건드린 src/scripts 파일과 baseline 밖 test 파일은 tsc 클린이어야 합니다(touch-clean).');
@@ -1034,7 +1044,7 @@ export function resolveTscScript(cwd: string, scriptsDir = import.meta.dir, pres
   ].find(present);
 }
 
-/** The installed compiler cannot resolve declarations from a checkout without its own dependencies. */
+/** Identify missing target declarations; partial installations and PWA checks remain fail-closed. */
 export function missingCheckoutTypeDependencies(cwd: string, needsPwa = false, present: (path: string) => boolean = existsSync): string[] {
   const missing: string[] = [];
   if (!present(join(cwd, 'node_modules'))) missing.push('node_modules');
@@ -1122,6 +1132,11 @@ export function runGate(io: Partial<GateIo> = {}): void {
     for (const removal of literalRemovals) warn(`  ${removal.referenceFile}:${removal.line}: ${removal.typeName} -= '${removal.literal}' (${removal.file})`);
   }
   const wholeRepository = requiredFields.length > 0 || removedSymbols.length > 0 || parameterIncreases.length > 0;
+  if (io.forbidFullLocal && wholeRepository) {
+    error('[tsc-gate] FAIL — mbp 로 전체 tsc 승격을 실행하지 않는다. --remote 로 다시 재라 (원격 불가=미측정).');
+    exit(1);
+    return;
+  }
   const pwaChanged = new Set([...changed].filter((file) => file.startsWith('apps/pwa/')));
   const rootChanged = new Set([...changed].filter((file) => !pwaChanged.has(file)));
   // 앱 파일은 앱 설정만 소유한다. 전체 승격은 root 설정만 저장소 전체로 올리고,
@@ -1156,11 +1171,14 @@ export function runGate(io: Partial<GateIo> = {}): void {
   }, { level: 'info' });
   log(`[tsc-gate] root 설정 범위 ${rootScope.size}개 관측 (apps/pwa/** 제외).`);
   if (runsPwa) log(`[tsc-gate] PWA 설정 범위 ${pwaScope.size}개 관측.`);
-  // K-OP-039: PWA checks without app dependencies produce fake type errors.
-  // The target checkout's declarations are required even when a compiler is
-  // supplied by the installed CLI or injected by another gate caller.
+  // K-OP-039: partial installations without PWA dependencies produce fake type errors.
+  // A checkout with no root node_modules can instead be measured by the installed compiler;
+  // missing root/PWA declarations and configuration diagnostics must not become a clean pass.
   const missing = missingCheckoutTypeDependencies(cwd, runsPwa || wholeRepository);
-  if (missing.length > 0) {
+  const installedCompilerCanMeasure = io.allowMissingCheckoutDependencies === true && !io.runTscCmd && missing.includes('node_modules')
+    && missing.includes('bun-types') && missing.every((dependency) =>
+      dependency === 'node_modules' || dependency === 'bun-types' || dependency === 'apps/pwa/node_modules');
+  if (missing.length > 0 && !installedCompilerCanMeasure) {
     const quotedCwd = `'${cwd.replaceAll("'", "'\\''")}'`;
     const install = `cd ${quotedCwd} && bun install --frozen-lockfile${missing.includes('apps/pwa/node_modules') ? ' && (cd apps/pwa && bun install --frozen-lockfile)' : ''}`;
     error(`[tsc-gate] ⛔ 대상 트리 타입 의존성 없음: ${missing.join(', ')} — ${install}`);
@@ -1193,13 +1211,18 @@ export function runGate(io: Partial<GateIo> = {}): void {
     if (!cacheEnabled) return runTscCmd(command);
     return runIncrementalCachedTsc({
       cwd, base, head, changed, config, command, cacheDir: cacheDir!, run: runTscCmd, log,
-      decision: (result) => result.ran && inspectTscResult(result, scope, baseline, () => {}, () => {}, wholeRepository, excluded, included, promotionBaseline, excludeTests),
+      decision: (result) => result.ran && inspectTscResult(result, scope, baseline, () => {}, () => {}, wholeRepository, excluded, included, promotionBaseline, excludeTests, installedCompilerCanMeasure),
     });
   };
   const rootPromotionBaseline = wholeRepository ? readBaselineDiagnostics(base, rootCommand) : undefined;
   const pwaPromotionBaseline = wholeRepository && runsPwa ? readBaselineDiagnostics(base, pwaCommand) : undefined;
   const pwaEnvPromotionBaseline = wholeRepository && runsPwaEnv ? readBaselineDiagnostics(base, pwaEnvCommand) : undefined;
   let rootPlan = planRootCheck({ wholeRepository, rootChanged, env: io.env ?? process.env, cwd, affectedRoots: io.affectedRoots ?? reverseImportAffectedRoots });
+  if (io.forbidFullLocal && rootPlan.mode === 'full') {
+    error(`[tsc-gate] FAIL — mbp 로 전체 tsc 를 실행하지 않는다 (${rootPlan.fallbackReason}). --remote 로 다시 재라 (원격 불가=미측정).`);
+    exit(1);
+    return;
+  }
   let rootsConfig: string | undefined;
   if (rootPlan.mode === 'affected') {
     rootsConfig = cacheEnabled ? 'tsconfig.gate-roots.incremental.json' : `tsconfig.gate-roots.${process.pid}.${Date.now()}.json`;
@@ -1229,18 +1252,25 @@ export function runGate(io: Partial<GateIo> = {}): void {
     rootsConfig ?? TYPECHECK_GATE_CONFIG, rootScope, ['apps/pwa/'], [], rootPromotionBaseline); }
   finally { if (rootsConfig) rmSync(join(cwd, rootsConfig), { force: true }); }
   let unmeasured = !rootTsc.ran;
-  let passed = inspectTscResult(rootTsc, rootScope, baseline, error, warn, wholeRepository, ['apps/pwa/'], [], rootPromotionBaseline);
+  let passed = inspectTscResult(rootTsc, rootScope, baseline, error, warn, wholeRepository, ['apps/pwa/'], [], rootPromotionBaseline, false, installedCompilerCanMeasure);
   if (runsPwa) {
     log(`[tsc-gate] PWA 변경 ${pwaChanged.size}개 관측 — apps/pwa/tsconfig.json 검사.`);
     const pwaTsc = checkedTsc(pwaCommand, 'apps/pwa/tsconfig.json', pwaScope, [], ['apps/pwa/'], pwaPromotionBaseline);
     unmeasured = unmeasured || !pwaTsc.ran;
-    passed = inspectTscResult(pwaTsc, pwaScope, baseline, error, warn, wholeRepository, [], ['apps/pwa/'], pwaPromotionBaseline) && passed;
+    passed = inspectTscResult(pwaTsc, pwaScope, baseline, error, warn, wholeRepository, [], ['apps/pwa/'], pwaPromotionBaseline, false, installedCompilerCanMeasure) && passed;
   }
   if (runsPwaEnv) {
     log(`[tsc-gate] PWA env 패스 — 루트 비시험 ${nonTestRootChanged.size}개 (Next ProcessEnv 선언 포함).`);
     const pwaEnvTsc = checkedTsc(pwaEnvCommand, 'tsconfig.pwa-env.json', pwaEnvScope, ['apps/pwa/'], [], pwaEnvPromotionBaseline, true);
     unmeasured = unmeasured || !pwaEnvTsc.ran;
     passed = inspectTscResult(pwaEnvTsc, pwaEnvScope, baseline, error, warn, wholeRepository, ['apps/pwa/'], [], pwaEnvPromotionBaseline, true) && passed;
+  }
+  if (passed && installedCompilerCanMeasure && missing.includes('apps/pwa/node_modules')) {
+    const quotedCwd = `'${cwd.replaceAll("'", "'\\''")}'`;
+    error(`[tsc-gate] ⛔ 대상 트리 타입 의존성 없음: apps/pwa/node_modules — cd ${quotedCwd} && bun install --frozen-lockfile && (cd apps/pwa && bun install --frozen-lockfile)`);
+    error('[tsc-gate] FAIL — PWA 의존성이 없는 트리의 진단 0건은 통과가 아니다.');
+    exit(1);
+    return;
   }
   if (passed) { log('[tsc-gate] PASS — 변경 파일에 신규 타입 에러 없음.'); return; }
   // ⛔⭐⭐ T67 — ***마지막 줄은 언제나 「판정」이어야 한다.*** 사람도 도구도 마지막 줄을 읽는다.
@@ -1266,6 +1296,26 @@ export function runGate(io: Partial<GateIo> = {}): void {
 //   ⭐ 그래서 막는 자리는 «여기»뿐이다 — 인-프로세스 호출자(`pr-cli.ts`·`seams.ts`)는
 //      argv 를 안 넘기고, 만약 여기서 `process.argv` 를 «읽으면» 형제 게이트가 경고한 그 사고가 난다
 //      (`elanous pr land` 의 인자를 자기 인자로 읽는다 — `src/cli/pr-cli.ts` 의 `args: []` 주석).
+/** Physical MBP/HQ seat shells need a guard even when the caller explicitly selected --local. */
+export function isHeadquartersTypecheckShell(host: string, cwd: string): boolean {
+  const name = host.toLowerCase();
+  if (/macstudio|macmini|host-e|node-b|node-c/.test(name)) return false;
+  return /macbook|(?:^|[-.])mbp(?:[-.]|$)/.test(name) || /(?:^|\/)elanous-hq\/(?:seats|work)\//.test(cwd);
+}
+
+/** HQ/seat shells default to node-b; a gate Pod, remote worker, or CI measures its own checkout locally. */
+export function forbidFullTypecheckOnLocal(env: NodeJS.ProcessEnv, host: string, cwd: string): boolean {
+  if (env.CI || env.KUBERNETES_SERVICE_HOST || env.ELANOUS_GATE_REMOTE_CHILD === '1') return false;
+  return isHeadquartersTypecheckShell(host, cwd);
+}
+
+export const defaultTypecheckRemote = forbidFullTypecheckOnLocal;
+
+export function typecheckDispatchFlags(flags: GateRemoteFlags, env: NodeJS.ProcessEnv, host: string, cwd: string): GateRemoteFlags {
+  return defaultTypecheckRemote(env, host, cwd) && flags.remote === undefined && !flags.local
+    ? { ...flags, remote: 'node-b' } : flags;
+}
+
 if (import.meta.main) void (async () => {
   // GATE-REMOTE (10-06): the only accepted arguments are the dispatch flags `--remote [host]` / `--local` — they choose
   //   «where» the same commit is measured, never «what» (the base stays merge-base(origin/main) on both sides).
@@ -1281,14 +1331,17 @@ if (import.meta.main) void (async () => {
     process.exit(2);
   }
   const repo = sh('git rev-parse --show-toplevel').trim();
+  const onMbp = forbidFullTypecheckOnLocal(process.env, hostname(), repo);
+  const dispatchFlags = typecheckDispatchFlags(flags, process.env, hostname(), repo);
   const baseRef = process.env.TSC_BASE_REF;
   const passEnv = (sha: (ref: string) => string) => (['NODE_OPTIONS', 'TSC_BASE_REF', 'TSC_HEAP_MB'] as const).filter((key) => process.env[key])
     .map((key) => `${key}=${key === 'TSC_BASE_REF' && baseRef !== 'origin/main' ? sha(baseRef!) : process.env[key]}`);
   // exitCode, not exit(): piped stdout/stderr drain before the process ends.
   process.exitCode = await dispatchHeavyCheck({
-    tool: 'ci-typecheck-changed', repo, flags,
+    tool: 'ci-typecheck-changed', repo, flags: dispatchFlags, explicitRemoteOnly: dispatchFlags.remote !== undefined,
+    stableCheckout: true, installPwa: true,
     remoteArgv: (sha) => { const vars = passEnv(sha); return [...(vars.length ? ['env', ...vars] : []), 'bun', 'run', 'scripts/ci-typecheck-changed.ts', '--local']; },
     refs: baseRef ? [baseRef] : [],
-    runLocal: () => { runGate(); return 0; },
+    runLocal: () => { runGate({ forbidFullLocal: onMbp }); return 0; },
   });
 })();

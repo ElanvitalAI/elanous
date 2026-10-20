@@ -23,7 +23,7 @@ const options = (files: Record<string, string>) => ({
 type ParsedGraph = {
   graph_id: string;
   runner_inputs?: unknown;
-  nodes: Array<{ contract?: { inputs?: string[]; outputs?: string[] } }>;
+  nodes: Array<{ call?: string; contract?: { inputs?: string[]; outputs?: string[] } }>;
 };
 
 function declaredRunnerInputs(graph: ParsedGraph, graphName: string): string[] {
@@ -332,7 +332,7 @@ describe('graph-contract-flow', () => {
       .toThrow('ad-loop.yaml must declare runner_inputs');
   });
 
-  test('keeps every target runner declaration equal to its consumed no-producer implement-loop inputs', async () => {
+  test('keeps every target runner declaration equal to shared or called-unit entry inputs', async () => {
     const sources = new Map<string, string>();
     for (const graphName of await Array.fromAsync(new Bun.Glob('*.yaml').scan({ cwd: defaultGraphsDir() }))) {
       sources.set(graphName, await Bun.file(`${defaultGraphsDir()}/${graphName}`).text());
@@ -347,9 +347,7 @@ describe('graph-contract-flow', () => {
       graphName,
       parseDocument(source).toJS() as ParsedGraph,
     ]));
-    const implementInputs = declaredRunnerInputs(parsed.get('implement-loop.yaml')!, 'implement-loop.yaml');
-    const implementInputSet = new Set(implementInputs);
-
+    const implementInputs = new Set(declaredRunnerInputs(parsed.get('implement-loop.yaml')!, 'implement-loop.yaml'));
     for (const graphName of targetGraphs) {
       const graph = parsed.get(graphName)!;
       const actual = declaredRunnerInputs(graph, graphName);
@@ -360,7 +358,15 @@ describe('graph-contract-flow', () => {
       const consumedNoProducerInputs = new Set(graph.nodes
         .flatMap(node => node.contract?.inputs ?? [])
         .filter(input => !otherOutputs.has(input) && !normalizedOtherOutputs.has(input.replace(/[-_]/g, '').toLowerCase())));
-      const expected = [...consumedNoProducerInputs].filter(input => implementInputSet.has(input)).sort();
+      // The common runner surface comes from implement-loop. A called unit may
+      // also require graph-specific entry inputs (recover@1: ask/context/prior).
+      // Keep unrelated no-producer ad-loop inputs outside this runner contract.
+      const calledUnitInputs = new Set(graph.nodes
+        .filter(node => node.call)
+        .flatMap(node => node.contract?.inputs ?? []));
+      const expected = [...consumedNoProducerInputs]
+        .filter(input => implementInputs.has(input) || calledUnitInputs.has(input))
+        .sort();
       expect([...actual].sort(), graphName).toEqual(expected);
     }
 

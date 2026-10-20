@@ -1,0 +1,50 @@
+graph_id: dispatch-pod
+version: 1
+unit:
+  inputs: [ask, context, prior]
+  outputs: [result, evidence]
+  exits: [done, rework, needs-human, failed]
+entry_node: pool-admit
+terminal_nodes: [done, rework, needs-human, failed]
+nodes:
+  - node_id: pool-admit
+    group: dispatch-pod
+    journey_stage: dispatch
+    kind: gate
+    recipe: 'cmd:pod-pool-admission'
+    max_visits: 4
+    terminal_stages: []
+    contract:
+      inputs: [substrate, memory_tier]
+      tools: read-only
+      outputs: [pool_member, result, evidence]
+  - node_id: image-sync
+    group: dispatch-pod
+    journey_stage: dispatch
+    kind: gate
+    recipe: 'cmd:pod-pool-image-sync'
+    max_visits: 4
+    terminal_stages: []
+    contract:
+      inputs: [pool_member]
+      tools: read-only
+      outputs: [image_current, result, evidence]
+  - node_id: credential-refresh
+    group: dispatch-pod
+    journey_stage: dispatch
+    kind: observe
+    recipe: 'cmd:pod-credential-prerefresh'
+    max_visits: 4
+    terminal_stages: []
+    contract:
+      inputs: [pool_member]
+      tools: read-only
+      outputs: [usable_accounts, result, evidence]
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: rework, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: needs-human, kind: hitl, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: observe, recipe: none, max_visits: 1 }
+edges:
+  - { from: pool-admit, on: outcome, map: { done: image-sync, rework: rework, needs-human: needs-human, failed: failed } }
+  - { from: image-sync, on: outcome, map: { done: credential-refresh, rework: rework, needs-human: needs-human, failed: failed } }
+  - { from: credential-refresh, on: outcome, map: { done: done, rework: rework, needs-human: needs-human, failed: failed } }

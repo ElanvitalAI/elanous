@@ -16,6 +16,8 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
+import { memoryQuantityBytes } from '../task-orchestrator/surfaces/pod-lease.js';
+import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
 import { shellQuote } from './task-hand.js';
 
 /** `taskAgent.parentHost` 설정 칸. */
@@ -41,6 +43,11 @@ export const PARENT_HOST_ENV = 'ELANOUS_TA_PARENT_HOST';
 const DEFAULT_REMOTE_ELANOUS = '$HOME/.local/share/elanous/bin/elanous';
 const DEFAULT_REMOTE_CONFIG_DIR = '$HOME/.elanous';
 const HOST_RE = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/;
+
+/** Missing child-provider metadata keeps the established Pod default: the HQ Codex mirror is needed. */
+export function shouldInstallRemoteCodexAccess(effectiveChildProvider: string | undefined): boolean {
+  return effectiveChildProvider === undefined || effectiveChildProvider === 'openai-codex';
+}
 
 /**
  * 켜졌나 — env 가 이긴다(`off`·`0`·빈 값이면 끔). env 가 호스트를 주면 나머지 칸(cwd 등)은 설정에서 받는다.
@@ -74,6 +81,50 @@ export function resolveParentHosts(config: ParentHostSetting | undefined, env: N
 
 /** Capacity sample is read on the host before launch. Unknown or saturated capacity is not a positive weight. */
 export interface ParentHostCapacity { approvalHeadroom: number; load: number }
+
+export interface ParentHostPodFit {
+  state: 'fits' | 'never-fits' | 'unmeasured';
+  memoryLimit: string;
+  requiredBytes: number | null;
+  allocatableBytes: number | null;
+  reason: string;
+}
+
+/** Read node allocatable memory only. This preflight never creates a probe Pod. */
+export function readParentHostPodFit(target: ParentHostConfig, memoryLimit: string, ssh: SshRunner = defaultSshRunner): ParentHostPodFit {
+  const requiredBytes = memoryQuantityBytes(memoryLimit);
+  const unknown = (reason: string, allocatableBytes: number | null = null): ParentHostPodFit =>
+    ({ state: 'unmeasured', memoryLimit, requiredBytes, allocatableBytes, reason });
+  if (requiredBytes === null || requiredBytes <= 0) return unknown('memory-limit-unreadable');
+  // Without an explicit pool, the remote current kubectl context may be unrelated to the launched Job.
+  if (!target.podPool) return unknown('pod-pool-unset');
+  let members: ReturnType<typeof parsePodPool>;
+  try { members = parsePodPool(target.podPool); }
+  catch { return unknown('pod-pool-unreadable'); }
+  if (!members.length) return unknown('pod-pool-empty');
+  let maximum = 0;
+  let unreadable = false;
+  for (const member of members) {
+    let result: ReturnType<SshRunner>;
+    try { result = ssh(target.host, `kubectl --context ${shellQuote(member.context)} get nodes -o json`, 15_000); }
+    catch { unreadable = true; continue; }
+    if (result.status !== 0) { unreadable = true; continue; }
+    try {
+      const parsed = JSON.parse(result.stdout) as { items?: Array<{ status?: { allocatable?: { memory?: unknown } } }> };
+      if (!Array.isArray(parsed.items) || parsed.items.length === 0) { unreadable = true; continue; }
+      for (const node of parsed.items) {
+        const raw = node?.status?.allocatable?.memory;
+        const bytes = typeof raw === 'string' ? memoryQuantityBytes(raw) : null;
+        if (bytes === null || bytes <= 0) { unreadable = true; continue; }
+        maximum = Math.max(maximum, bytes);
+      }
+    } catch { unreadable = true; }
+  }
+  if (maximum >= requiredBytes) return { state: 'fits', memoryLimit, requiredBytes, allocatableBytes: maximum, reason: 'node-allocatable-fits' };
+  if (unreadable || maximum === 0) return unknown('node-allocatable-unmeasured', maximum || null);
+  return { state: 'never-fits', memoryLimit, requiredBytes, allocatableBytes: maximum, reason: 'memory-never-fits' };
+}
+
 const CAPACITY_MARKER = '__ELANOUS_PARENT_CAPACITY__';
 const APPROVAL_MARKER = '__ELANOUS_PARENT_APPROVALS__';
 const LOAD_MARKER = '__ELANOUS_PARENT_LOAD__';
@@ -170,10 +221,12 @@ export function remoteLaunchScript(target: ParentHostConfig, args: readonly stri
 }
 
 /** ssh 실행기(시험 주입). */
-export type SshRunner = (host: string, script: string, timeoutMs: number) => { status: number | null; stdout: string; stderr: string };
+export type SshRunner = (host: string, script: string, timeoutMs: number, stdin?: string) => { status: number | null; stdout: string; stderr: string };
 
-export const defaultSshRunner: SshRunner = (host, script, timeoutMs) => {
-  const result = spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'ControlPath=none', host, script], { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024 });
+export const defaultSshRunner: SshRunner = (host, script, timeoutMs, stdin) => {
+  const result = spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'ControlPath=none', host, script], {
+    encoding: 'utf8', timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, ...(stdin !== undefined ? { input: stdin } : {}),
+  });
   return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? (result.error ? String(result.error) : '') };
 };
 
@@ -300,6 +353,43 @@ export function launchRemoteParent(target: ParentHostConfig, args: readonly stri
     throw new RemoteParentNotLaunchedError(target.host, `${refused}${tail ? `: ${tail.slice(0, 160)}` : ''}`);
   }
   throw new Error(`원격 부모 발사 결과 불확실(${target.host} · rc=${result.status}) — 중복을 피해 로컬로 다시 띄우지 않는다 · 원격에서 ELANOUS_RUN_ID=${env.ELANOUS_RUN_ID ?? '?'} 를 확인: ${(result.stderr.trim().split('\n').pop() || '').slice(0, 160)}`);
+}
+
+/** Install access-only Codex copies over SSH stdin; credentials never enter argv, shell text, or logs. */
+export function installRemoteCodexAccess(target: ParentHostConfig, mirror: { elanousAuth: string; codexAuth: string; account?: string }, ssh: SshRunner = defaultSshRunner): void {
+  let elanous: { version?: number; providers?: Record<string, Record<string, unknown>> };
+  let codex: { auth_mode?: string; tokens?: Record<string, unknown> };
+  try {
+    elanous = JSON.parse(mirror.elanousAuth) as typeof elanous;
+    codex = JSON.parse(mirror.codexAuth) as typeof codex;
+  } catch { throw new Error('invalid local Codex access mirror'); }
+  const provider = elanous.providers?.['openai-codex'];
+  const elanousTokens = provider?.tokens as Record<string, unknown> | undefined;
+  const codexTokens = codex.tokens;
+  if (!Number.isSafeInteger(elanous.version) || Number(elanous.version) < 1
+    || typeof elanousTokens?.accessToken !== 'string' || !elanousTokens.accessToken || elanousTokens.refreshToken !== '' || elanousTokens.refresh_token !== ''
+    || codex.auth_mode !== 'chatgpt'
+    || typeof codexTokens?.access_token !== 'string' || !codexTokens.access_token || codexTokens.refresh_token !== '' || codexTokens.refreshToken !== '')
+    throw new Error('Codex access mirror must contain a versioned store, auth mode, access tokens, and empty refresh tokens');
+
+  const account = mirror.account ?? 'default';
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(account)) throw new Error('invalid Codex mirror account name');
+
+  const payload = JSON.stringify({ elanousVersion: elanous.version, provider, codexAuth: codex, account, storeKey: account === 'default' ? 'openai-codex' : `openai-codex:${account}` });
+  const configDir = remotePath(target.configDir ?? DEFAULT_REMOTE_CONFIG_DIR);
+  // HQ owns token metadata; the remote keeps only the selected named Codex credential in managed account homes.
+  const code = [
+    'const fs=require("node:fs"),path=require("node:path"),os=require("node:os");',
+    'const payload=JSON.parse(fs.readFileSync(0,"utf8"));',
+    'const read=(file)=>{try{return JSON.parse(fs.readFileSync(file,"utf8"))}catch{return {}}};',
+    'const write=(file,value)=>{const temp=file+"."+process.pid+".tmp";try{fs.writeFileSync(temp,JSON.stringify(value),{mode:0o600});fs.chmodSync(temp,0o600);fs.renameSync(temp,file)}catch(error){try{fs.unlinkSync(temp)}catch{};throw error}};',
+    'const elanousFile=path.join(process.argv[1],"auth.json"),configDir=path.dirname(elanousFile);fs.mkdirSync(configDir,{recursive:true,mode:0o700});',
+    'const elanous=read(elanousFile);if(typeof elanous.version!=="number")elanous.version=payload.elanousVersion;elanous.providers={...(elanous.providers||{})};const defaultHome=path.join(os.homedir(),".codex"),managedAccounts=path.join(configDir,"codex-accounts");for(const key of Object.keys(elanous.providers)){if(key.startsWith("openai-codex:"))delete elanous.providers[key]}fs.rmSync(managedAccounts,{recursive:true,force:true});fs.rmSync(path.join(configDir,"remote-codex-mirror.json"),{force:true});',
+    'const accountHome=payload.account==="default"?defaultHome:path.join(configDir,"codex-accounts",payload.account),tokens={...(payload.provider.tokens||{}),refreshToken:"",refresh_token:""};const upsert=(key,codexHome)=>{const current=elanous.providers[key]||{};elanous.providers[key]={...current,...payload.provider,codexHome,chatGPT:{...(current.chatGPT||{}),...(payload.provider.chatGPT||{})},tokens}};upsert("openai-codex",defaultHome);if(payload.storeKey!=="openai-codex")upsert(payload.storeKey,accountHome);write(elanousFile,elanous);',
+    'const incoming=payload.codexAuth;const installCodex=(home)=>{const file=path.join(home,"auth.json");fs.mkdirSync(home,{recursive:true,mode:0o700});const current=read(file),merged={...current,...incoming};merged.auth_mode=incoming.auth_mode;if(Object.prototype.hasOwnProperty.call(incoming,"last_refresh"))merged.last_refresh=incoming.last_refresh;else delete merged.last_refresh;merged.tokens={...(incoming.tokens||{}),refresh_token:"",refreshToken:""};write(file,merged)};installCodex(defaultHome);if(accountHome!==defaultHome)installCodex(accountHome);',
+  ].join('');
+  const result = ssh(target.host, `umask 077; mkdir -p ${configDir} "$HOME/.codex" && bun -e ${shellQuote(code)} ${configDir}`, 20_000, payload);
+  if (result.status !== 0) throw new Error(`remote Codex access mirror failed (ssh rc=${result.status ?? 'unknown'})`);
 }
 
 // ── 관측: 원격 런 원장 거울 ─────────────────────────────────────────────────────────────

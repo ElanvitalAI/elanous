@@ -26,6 +26,7 @@ import {
   type GraphParseIssue,
   type GraphTemplateSpec,
 } from '../../src/self-implement/graph-yaml.js';
+import { flattenGraphTemplate } from '../../src/self-implement/graph-unit-resolver.js';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 
 /** drafts/ · overlays/ 는 스캔에서 뺀다(실측 10-05). 그 이름인 디렉터리와 그 아래는 안 읽는다. */
@@ -104,7 +105,22 @@ function graphFileNames(abs: string): string[] {
 
 /** loadGraphTemplates for harness dirs; the runner's reading for workflow-graph dirs (same result shape). */
 function loadDir(abs: string): GraphLoadResult {
-  if (!isRunnerDir(abs)) return loadGraphTemplates(abs);
+  if (!isRunnerDir(abs)) {
+    const loaded = loadGraphTemplates(abs);
+    if (loaded.scannedFiles === 0) return loaded;
+    const errors = [...loaded.errors];
+    const templates: Record<string, GraphTemplateSpec> = {};
+    for (const file of graphFileNames(abs)) {
+      let source: string;
+      try { source = readFileSync(join(abs, file), 'utf8'); }
+      catch (error) { errors.push({ path: file, message: `읽기 실패: ${String(error)}` }); continue; }
+      const parsed = parseGraphTemplateYaml(source, file);
+      if (!parsed.template || parsed.errors.length) continue;
+      try { templates[parsed.template.graphId] = flattenGraphTemplate(parsed.template, join(abs, file)); }
+      catch (error) { errors.push({ path: file, message: `unit 펼침 실패: ${error instanceof Error ? error.message : String(error)}` }); }
+    }
+    return { ...loaded, templates, errors };
+  }
   const errors: GraphParseIssue[] = [];
   const warnings: GraphParseIssue[] = [];
   const templates: Record<string, GraphTemplateSpec> = {};
@@ -120,7 +136,8 @@ function loadDir(abs: string): GraphLoadResult {
     warnings.push(...result.warnings);
     if (!result.template) continue;
     if (templates[result.template.graphId]) { errors.push({ path: file, message: `graph_id '${result.template.graphId}' 가 중복이다` }); continue; }
-    templates[result.template.graphId] = result.template;
+    try { templates[result.template.graphId] = flattenGraphTemplate(result.template, join(abs, file)); }
+    catch (error) { errors.push({ path: file, message: `unit 펼침 실패: ${error instanceof Error ? error.message : String(error)}` }); }
   }
   return { templates, errors, warnings, scannedFiles: files.length };
 }

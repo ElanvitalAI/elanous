@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, openSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { launchModeOf, rescueAllows } from './rescue.js';
 import { join } from 'node:path';
 import { fetchLinearIssues } from '../connectors/linear.js';
@@ -328,13 +328,46 @@ function logStageFailure(root: string, stage: StewardStage, reason: string): voi
 }
 const SCHEDULE_CHECK_MS = 15 * 60_000;
 
+/** Atomic marker write: stage the payload at `<marker>.tmp-<pid>`, then renameSync it into place so a
+ *  crash mid-write never leaves a half-written marker for the next sync to trip over. */
+export function writeScheduleCheckMarker(
+  marker: string,
+  at: Date,
+  write: (path: string, data: string) => void = writeFileSync,
+): void {
+  const tmp = `${marker}.tmp-${process.pid}`;
+  try {
+    write(tmp, JSON.stringify({ at: at.toISOString() }));
+    renameSync(tmp, marker);
+  } catch (error) {
+    try { rmSync(tmp, { force: true }); } catch { /* Preserve the write or rename error. */ }
+    throw error;
+  }
+}
+
 /** Called by runStewardStage(sync) under its stage slot, never from the checker CLI. */
 async function checkStewardSchedules(root: string, settings: StewardSettings, deps: StewardDeps): Promise<void> {
   const now = (deps.now ?? (() => new Date()))();
   const marker = join(root, 'steward', 'schedule-check.json');
   let previous: { at?: string } = {};
-  try { previous = JSON.parse(readFileSync(marker, 'utf8')) as typeof previous; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(marker, 'utf8'));
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      && (!('at' in parsed) || typeof parsed.at === 'string')) {
+      previous = parsed as typeof previous;
+    } else {
+      debug.log('steward.schedule-check', 'marker-recovered', { reason: 'invalid-marker-shape' });
+    }
+  }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') { /* first run in this window — previous stays {} */ }
+    else if (error instanceof SyntaxError) {
+      // Corrupt marker bytes self-heal: previous stays {} so this check runs now and the fresh
+      // writeScheduleCheckMarker below replaces the broken file. The recovery is observed.
+      debug.log('steward.schedule-check', 'marker-recovered', { reason: redactSecretText(String(error)) });
+    }
+    else throw error;
+  }
   const elapsed = now.getTime() - Date.parse(previous.at ?? '');
   if (Number.isFinite(elapsed) && elapsed >= 0 && elapsed < SCHEDULE_CHECK_MS) return;
   const inventory = deps.scheduleInventory ?? (() => {
@@ -378,7 +411,7 @@ async function checkStewardSchedules(root: string, settings: StewardSettings, de
     debug.log('steward.schedule-check', 'routing', { ownerRequests, opEscalations, recovered });
   }
   debug.log('steward.schedule-check', 'checked', { count: checked.length, findings: findings.length, mode: settings.mode });
-  writeFileSync(marker, JSON.stringify({ at: now.toISOString() }));
+  writeScheduleCheckMarker(marker, now);
 }
 
 function readState(path: string): { issues: Record<string, string>; digestDay?: string } {

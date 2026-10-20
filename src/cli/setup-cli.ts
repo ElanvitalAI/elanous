@@ -182,10 +182,47 @@ function reportCliSkills(deps: SetupCliDeps, apply: boolean): string[] {
   return lines;
 }
 
+/** 최초 셋업 묶음 제안(읽기 전용). 등급·승인 어휘는 문서 원전을 그대로 쓴다 —
+ *  묶음·층 구성 = 내부 문서 `RESEARCH-plugins-connectors-baseline-2026-09-30` §4(0층 «키 없이 항상 켬»),
+ *  항목별 보안 등급·승인 = 같은 문서 §5. §5 표에 등급이 없는 0층 항목(Edge/macOS TTS·스킬)은
+ *  등급을 지어내지 않기 위해 목록에서 뺀다. 실제 설치·자격 부여는 승인 뒤 후속 조각(plan-then-apply). */
+interface SetupBundleItem {
+  name: string;
+  grade: string;
+  approval: string;
+}
+
+const DEFAULT_SETUP_BUNDLE: readonly SetupBundleItem[] = [
+  { name: '셸·파일(작업 트리 안)', grade: '쓰기(로컬)', approval: '기존 모래상자·워크트리 규칙' },
+  { name: 'WebFetch', grade: '읽기', approval: '불요' },
+  { name: 'WebSearch(무료 DuckDuckGo·Jina)', grade: '읽기', approval: '불요' },
+  { name: 'GitHub 공개 읽기(무인증)', grade: '읽기', approval: '불요' },
+  { name: 'PDF/HWP 읽기', grade: '읽기', approval: '불요' },
+  { name: '비전', grade: '읽기', approval: '불요' },
+  { name: 'Obsidian 검색', grade: '읽기', approval: '불요' },
+  { name: 'Obsidian 쓰기', grade: '쓰기(로컬)', approval: 'vault-write-guard' },
+  { name: '기억·일정', grade: '쓰기(로컬)', approval: '기존 모래상자·워크트리 규칙' },
+  { name: 'CDP 브라우저 탐색·읽기', grade: '읽기(네트워크)', approval: '불요(클릭·입력은 쓰기 → 승인)' },
+];
+
+function formatDefaultBundleProposal(): string[] {
+  return [
+    'Setup: 기본 플러그인·커넥터 묶음 제안 (읽기 전용)',
+    `묶음 1/1: 기본 묶음 — 키 없이 항상 켬(0층) · 항목 ${DEFAULT_SETUP_BUNDLE.length}개`,
+    ...DEFAULT_SETUP_BUNDLE.map((item) => `- ${item.name} — 보안 등급: ${item.grade} · 승인: ${item.approval}`),
+    '후속 층(승인 뒤 조각): 1층 로그인된 CLI 재사용 · 2층 원격 MCP 한 번 OAuth · 3층 채널',
+    '제안은 표시만 합니다 — 승인 전 설치 0 · 자격 쓰기 0 · 승인 뒤 설치는 `elanous plugin add <spec>` 경로로(후속 조각)',
+  ];
+}
+
 export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}): void {
   const out = deps.out ?? { log: (value: string) => console.log(value), error: (value: string) => console.error(value) };
   const setExitCode = deps.setExitCode ?? ((code: number) => { process.exitCode = code; });
   const doctorRunner = deps.runDoctor ?? runDoctor;
+  const isFirstRunSetup = (): boolean => deps.firstRunTopics ?? (!deps.getUserConfig && !existsSync(userConfigPath()));
+  const showDefaultBundleProposal = (): void => {
+    for (const line of formatDefaultBundleProposal()) out.log(line);
+  };
   const showCliSkills = (apply: boolean) => {
     out.log('Setup: CLI skills (public GitHub repository reads remain available without login)');
     for (const line of reportCliSkills(deps, apply)) out.log(line);
@@ -206,6 +243,7 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
       if (opts.nonInteractive) {
         out.log(formatSetupReport(doctor, setupSteps(deps), true));
         showCliSkills(false);
+        if (isFirstRunSetup()) showDefaultBundleProposal();
         for (const line of recommendedSetup((deps.getUserConfig ?? getUserConfig)())) out.log(line);
         setExitCode(0);
         return;
@@ -215,7 +253,7 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
         setExitCode(1);
         return;
       }
-      const isFirstRun = deps.firstRunTopics ?? (!deps.getUserConfig && !existsSync(userConfigPath()));
+      const isFirstRun = isFirstRunSetup();
       let steps = setupSteps(deps);
       const provider = steps[1]!;
       if (!provider.complete) {
@@ -230,6 +268,7 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
       }
       out.log(formatSetupReport(doctor, steps, false));
       showCliSkills(false);
+      if (isFirstRun) showDefaultBundleProposal();
       for (const line of recommendedSetup((deps.getUserConfig ?? getUserConfig)())) out.log(line);
       let configured = (deps.getUserConfig ?? getUserConfig)();
       if (!configured.starter?.topics && configured.watch?.enabled !== false

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { GRAPH_SPECS, GRAPH_TEMPLATES } from '../self-implement/graph-templates.js';
 import { edgeMapOf } from '../self-implement/graph-yaml.js';
-import { enterJourneyNode, ensureJourneyKey, exitJourneyNode, JOURNEY_KEY_ENV, JOURNEY_NODE_IDS, journeyJoinFields, withJourneyNode, withJourneyNodeSync } from './graph-journey-nodes.js';
+import { enterJourneyNode, ensureJourneyKey, exitJourneyNode, JOURNEY_KEY_ENV, JOURNEY_NODE_IDS, journeyJoinFields, passJourneyNode, withJourneyNode, withJourneyNodeSync } from './graph-journey-nodes.js';
 
 type Row = { category: string; event: string; data: Record<string, unknown> };
 function capture(fn: () => void): Row[] {
@@ -37,6 +37,21 @@ describe('HARNESS-FULL-GRAPH 여정 노드', () => {
       expect(row.data).toMatchObject({ graphId: 'self-implement', node: 'freeze-check', nodeDeclarationStatus: 'declared', phase: 'journey', journeyKey: key });
     }
     expect(rows[1]!.data.outcome).toBe('open');
+  });
+
+  test('existing author and PR nodes can share the journey observation helper', () => {
+    const rows = capture(() => {
+      passJourneyNode('author', { provenance: 'ta-journey-unit', goalType: 'implement', outcome: 'authored', data: { phase: 'front' } });
+      passJourneyNode('open-pr', { provenance: 'ta-journey-unit', outcome: 'pr-opened' });
+    });
+    expect(rows.map(row => [row.event, row.data.node, row.data.nodeDeclarationStatus])).toEqual([
+      ['pipeline-node-entry', 'author', 'declared'],
+      ['pipeline-node-exit', 'author', 'declared'],
+      ['pipeline-node-entry', 'open-pr', 'declared'],
+      ['pipeline-node-exit', 'open-pr', 'declared'],
+    ]);
+    expect(rows[0]!.data.phase).toBe('front');
+    expect(rows[2]!.data.phase).toBe('journey');
   });
 
   test('조인 키는 한 번 만들어지고 다시 부르면 같은 값이다 · 없으면 조인 칸이 비어 있다', () => {

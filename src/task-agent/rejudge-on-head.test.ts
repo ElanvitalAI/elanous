@@ -1,15 +1,17 @@
 import { describe, expect, spyOn, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { landOrderLedgerPath } from './land-order-ledger.js';
-import { classifyLandFailure, liveLandArgs, type TaskAgentLiveMove } from './live-moves.js';
+import { classifyLandFailure, landRetryPending, liveLandArgs, type TaskAgentLiveMove } from './live-moves.js';
 import { CATCH_UP_CAP, defaultCatchUpMain, defaultRequestRegate, overlapEvidencePath, parseRegateResult, REJUDGE_HEAD_CAP, regateResultPath, regateRunArgs, rejudgeCandidates, rejudgeCardOnHead, rejudgeAsyncResultCard, rejudgeCompletedTaskRegate, rejudgeShadowCard, regateUnmeasured, remoteBoundRunTerminal, type CatchUpGit, type CatchUpRequest, type CatchUpResult, type RegateRequest } from './rejudge-on-head.js';
 import { captureReviewResults, rejudgeCompletedTaskReview, reviewResultPath, TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_RESULT_ENV, TA_REVIEW_COMPLETION_STATE_ENV } from './review-result-capture.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
 import { setUserConfigOverlay } from '../user-config.js';
 import { debug } from '../debug/log.js';
 import { repairReviewDigest } from './repair-review.js';
+import { listGraphRuns } from '../graph-runner/runner.js';
 import type { RepairLaunchRequest } from './repair-cycle.js';
 
 const A = 'a'.repeat(40);
@@ -158,13 +160,30 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
         queue.push(request); return { status: 0, stdout: 'OK #30 queued' };
       },
     } };
-    expect((await rejudgeCardOnHead(f.card().id, deps)).at(-1)).toMatchObject({ step: 'land', decision: 'queued' });
+    expect((await rejudgeCardOnHead(f.card().id, { ...deps, landBudget: { max: 0, requested: 0 } })).at(-1))
+      .toMatchObject({ step: 'land', decision: 'tick-cap' });
+    expect(queue).toHaveLength(0);
+    expect(f.card().landAttempts ?? []).toHaveLength(0);
+    const sharedLandBudget = { max: 1, requested: 0 };
+    expect((await rejudgeCardOnHead(f.card().id, { ...deps, landBudget: sharedLandBudget })).at(-1))
+      .toMatchObject({ step: 'land', decision: 'queued' });
+    expect(sharedLandBudget.requested).toBe(1);
     expect(queue).toEqual([expect.objectContaining({ pr: 30, head: A, reviewResult: resultPath })]);
     expect(f.card().landAttempts).toEqual([expect.objectContaining({ pr: 30, head: A, ok: true })]);
     expect(f.regateRequests).toHaveLength(0);
     expect(f.lands).toHaveLength(0);
     expect((await rejudgeCardOnHead(f.card().id, deps)).at(-1)).toMatchObject({ step: 'land', decision: 'queue-skipped' });
     expect(queue).toHaveLength(1);
+    const direct = fixture();
+    const directHead = '1'.repeat(40);
+    direct.setHead(directHead);
+    direct.onRegate(direct.writeRegate(true));
+    direct.onReview((path) => writeFileSync(path, reviewJson(directHead)));
+    await rejudgeCardOnHead(direct.card().id, direct.deps());
+    direct.setClock('2026-10-11T01:10:00.000Z');
+    expect((await rejudgeCardOnHead(direct.card().id, { ...direct.deps(), landBudget: sharedLandBudget })).at(-1))
+      .toMatchObject({ step: 'land', decision: 'tick-cap' });
+    expect(direct.lands).toHaveLength(0);
   });
 
   test('captured exact-head must-fix enters next-move and launches one same-PR repair worker', async () => {
@@ -792,6 +811,57 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     f.setClock('2026-10-11T01:10:00.000Z');
   };
 
+  test('TA land review-missing refusal enters recover@1, requests a fresh exact-head review, then re-enters land admission once', async () => {
+    const f = fixture();
+    const head = 'e7'.repeat(20);
+    await readyB(f, head);
+    f.queueLand({ status: 1, stdout: '', stderr: '✗ overlap-evidence: review-missing: captured review file unavailable' });
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(listGraphRuns(dirname(f.statePath)).runs.some((run) => run.graphId === 'task-agent-recover-review'
+      && run.unitCalls?.[0]?.entry === 'request-review' && run.unitCalls[0].exit === 'rework' && run.status === 'done')).toBe(true);
+    expect(f.lands).toHaveLength(1);
+    expect(f.reviewRequests).toHaveLength(2);
+    expect(f.reviewRequests[1]?.resultPath).not.toBe(f.reviewRequests[0]?.resultPath);
+    expect(f.decisions()).toContain('review:review-requested');
+    f.setClock('2026-10-11T01:20:00.000Z');
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.lands).toHaveLength(2);
+    expect(f.card().landAttempts?.map((attempt) => attempt.class ?? null)).toEqual(['recovery', null]);
+    const busy = '✗ heavy-remote: 원격 게이트 gate-host-busy node-b saturated';
+    expect(classifyLandFailure({ status: 1, stderr: busy })).toEqual({ class: 'recovery', reason: 'gate-host-busy' });
+    const busyAt = new Date(Date.now() - 31_000).toISOString();
+    const busyCard = { ...f.card(), landAttempts: [{ pr: 30, head, at: busyAt, ok: false, class: 'recovery' as const, reason: 'gate-host-busy' }] };
+    expect(landRetryPending(busyCard, 30, head)).toBe(false);
+    const admitted = { ...busyCard, history: [...(busyCard.history ?? []), { at: busyAt, event: 'rejudge-on-head', kind: 'land', effect: 'recover-wait-retry', pr: 30, head }] };
+    expect(landRetryPending(admitted, 30, head)).toBe(true);
+  });
+
+  test('TA host-busy refusal records its real graph decision and retries through land only after 30 seconds', async () => {
+    const f = fixture();
+    const head = 'e8'.repeat(20);
+    await readyB(f, head);
+    f.queueLand({ status: 1, stdout: '', stderr: '✗ heavy-remote: 원격 게이트 gate-host-busy node-b saturated' });
+    await rejudgeCardOnHead('ta-rj-1', f.deps());
+    expect(f.lands).toHaveLength(1);
+    expect(listGraphRuns(dirname(f.statePath)).runs.some((run) => run.graphId === 'task-agent-recover-wait'
+      && run.unitCalls?.[0]?.entry === 'wait-retry' && run.unitCalls[0].exit === 'rework' && run.status === 'done')).toBe(true);
+    expect(f.card().history?.some((event) => event.event === 'rejudge-on-head' && event.kind === 'land'
+      && event.effect === 'recover-wait-retry' && event.head === head)).toBe(true);
+    const clock = spyOn(Date, 'now').mockReturnValue(new Date('2026-10-11T01:10:00.000Z').getTime());
+    try {
+      expect(landRetryPending(f.card(), 30, head)).toBe(false);
+      await rejudgeCardOnHead('ta-rj-1', f.deps());
+      expect(f.lands).toHaveLength(1);
+      f.setClock('2026-10-11T01:10:31.000Z');
+      clock.mockReturnValue(new Date('2026-10-11T01:10:31.000Z').getTime());
+      expect(landRetryPending(f.card(), 30, head)).toBe(true);
+      await rejudgeCardOnHead('ta-rj-1', f.deps());
+      expect(f.lands).toHaveLength(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   test('TA-LAND-RETRY-ON-INFRA — infra 로 죽은 land 는 다음 틱에 같은 머리로 한 번 더 · 성공하면 landed', async () => {
     const f = fixture();
     await readyB(f, D);
@@ -1025,6 +1095,26 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     if (lands === 0) expect(f.decisions().at(-1)).toBe(digit === '6' ? 'repair:would-repair' : 'land:not-landing');
   });
 
+  test('직접 land도 공유 틱 예산을 지키고 실제 시도한 뒤에만 소비한다', async () => {
+    const f = fixture();
+    const head = '2'.repeat(40);
+    f.setHead(head);
+    f.onRegate(f.writeRegate(true));
+    f.onReview((path) => writeFileSync(path, reviewJson(head)));
+    await rejudgeCardOnHead(f.card().id, f.deps());
+    f.setClock('2026-10-11T01:10:00.000Z');
+    const capped = { max: 0, requested: 0 };
+    expect((await rejudgeCardOnHead(f.card().id, { ...f.deps(), landBudget: capped })).at(-1))
+      .toMatchObject({ step: 'land', decision: 'tick-cap' });
+    expect(f.lands).toHaveLength(0);
+    expect(capped.requested).toBe(0);
+    const allowed = { max: 1, requested: 0 };
+    expect((await rejudgeCardOnHead(f.card().id, { ...f.deps(), landBudget: allowed })).at(-1))
+      .toMatchObject({ step: 'land', decision: 'landed' });
+    expect(f.lands).toHaveLength(1);
+    expect(allowed.requested).toBe(1);
+  });
+
   test('propose-land 가 허용 밖이면 재게이트·land 0(리뷰 재요청만)', async () => {
     const f = fixture();
     f.setHead(B);
@@ -1172,6 +1262,26 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     const f = fixture();
     const card = f.card();
     expect(rejudgeCandidates({ [card.id]: card, other: { ...card, id: 'other', reviewRequests: [] } })).toEqual(['ta-rj-1']);
+  });
+
+  test('주기 후보는 72시간 넘긴 카드를 로그 콜백으로 건너뛰고 mf0·새 카드 순으로 돈다', () => {
+    const f = fixture();
+    const now = new Date('2026-10-19T00:00:00.000Z');
+    const base = { ...f.card(), createdAt: '2026-10-18T00:00:00.000Z' };
+    const card = (id: string, pr: number, createdAt: string, mf0 = false): TaskCard => ({ ...base, id, createdAt,
+      pr: { number: pr, url: `https://github.com/o/r/pull/${pr}` },
+      reviewRequests: [{ pr, head: A, at: createdAt }], history: mf0 ? [{ at: createdAt, event: 'live-move-result', kind: 'review',
+        pr, head: A, verdict: 'pass', reviewed: true, mustFix: 0, effect: 'review result captured' }] : [] });
+    const old = card('old', 31, '2026-10-15T00:00:00.000Z');
+    const fresh = card('fresh', 32, '2026-10-18T23:00:00.000Z');
+    const ready = card('ready', 33, '2026-10-18T12:00:00.000Z', true);
+    const boundary = card('boundary', 34, '2026-10-16T00:00:00.000Z');
+    const skipped: string[] = [];
+    expect(rejudgeCandidates({ old, fresh, ready, boundary }, { now, maxAgeHours: 72, currentHeads: new Map([['ready', A]]),
+      onAgeSkip: (item) => skipped.push(item.id) }))
+      .toEqual(['ready', 'fresh', 'boundary']);
+    expect(skipped).toEqual(['old']);
+    expect(rejudgeCandidates({ fresh, ready }, { now, currentHeads: new Map([['ready', B]]) })).toEqual(['fresh', 'ready']);
   });
 
   test('MERGED/CLOSED bound PR is recorded once and excluded from future ticks', async () => {
@@ -1445,5 +1555,28 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     await defaultRequestRegate(request, { spawn: fakeSpawn, entry: '/e/bin/elanous.mjs', configDir: '/u' });
     expect(seen).toEqual([{ command: process.execPath, args: regateRunArgs('/e/bin/elanous.mjs', '/u', request), options: { detached: true, stdio: 'ignore', cwd: dir } }]);
     expect(regateRunArgs('/e/bin/elanous.mjs', '/u', request)).toEqual(['/e/bin/elanous.mjs', '--config-dir', '/u', 'tasks', 'regate-run', '--card', 'ta-rj-1', '--pr', '30', '--head', B, '--repo', dir, '--out', request.resultPath]);
+  });
+
+  test('defaultRequestRegate runs on node-b and streams its JSON into the HQ result path', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ta-remote-regate-'));
+    const worker = join(dir, 'fake-eln');
+    writeFileSync(worker, `#!/bin/sh\nout=\nwhile [ "$#" -gt 0 ]; do\n  if [ "$1" = --out ]; then shift; out="$1"; fi\n  shift\ndone\nprintf '%s\\n' '{"pr":30,"head":"${B}","passed":true,"status":"passed","baseCommit":"${BASE}","failures":[]}' > "$out"\nprintf '%s\\n' 'worker progress must not reach result JSON'\n`);
+    chmodSync(worker, 0o755);
+    const seen: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
+    const fakeSpawn = ((command: string, args: string[], options: Record<string, unknown>) => {
+      seen.push({ command, args, options });
+      const run = spawnSync('sh', ['-c', args[6]!], { stdio: options.stdio as never });
+      expect(run.status).toBe(0);
+      return { pid: 7, once: (event: string, listener: () => void) => { if (event === 'spawn') queueMicrotask(listener); return undefined; }, removeListener: () => undefined, unref: () => undefined };
+    }) as unknown as import('../cli/tasks-cli.js').DetachedSpawn;
+    const request = { card: 'ta-rj-1', pr: 30, head: B, repoRoot: '/hq/repo', resultPath: join(dir, 'regate-results', 'x.json') };
+    await defaultRequestRegate(request, { spawn: fakeSpawn, remote: { host: 'node-b', cwd: dir, elanous: worker, configDir: dir } });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.command).toBe('ssh');
+    expect(seen[0]!.args.slice(0, 5)).toEqual(['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5']);
+    expect(seen[0]!.args[5]).toBe('node-b');
+    expect(seen[0]!.args[6]).toContain(`--repo ${dir} --out /tmp/elanous-ta-regate-`);
+    expect(seen[0]!.options.stdio).toEqual(['ignore', expect.any(Number), 'ignore']);
+    expect(parseRegateResult(readFileSync(request.resultPath, 'utf8'), 30, B)).toMatchObject({ passed: true, baseCommit: BASE });
   });
 });

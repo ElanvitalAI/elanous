@@ -48,7 +48,7 @@ describe('simCredExpiry — 결함 주입 «자격 만료» (grok 구독)', () =
 
   test('the sweep renders one line per scenario', () => {
     const lines = renderCredExpiry(credExpirySweep());
-    expect(lines[0]).toStartWith('cred-expiry · grok 구독 · 최소 유효 3h00m');
+    expect(lines[0]).toStartWith('cred-expiry · grok 구독 · 최소 유효 1h45m');
     expect(lines).toHaveLength(1 + credExpirySweep().length);
     expect(lines.some((l) => l.includes('발사 dropped(refresh-failed)'))).toBe(true);
   });

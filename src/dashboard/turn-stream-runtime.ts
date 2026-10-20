@@ -66,6 +66,7 @@ export interface DashboardTurnStreamRuntime {
   onText(chunk: string, accumulated: string): void;
   onToolCall(call: DashboardTurnStreamCall): void;
   onToolResult(call: DashboardTurnStreamCall): void;
+  onThought?(text: string): void;
 }
 
 export function createDashboardTurnStreamRuntime(
@@ -102,5 +103,6 @@ export function createDashboardTurnStreamRuntime(
     onText: formatter.onText,
     onToolCall: formatter.onToolCall,
     onToolResult: formatter.onToolResult,
+    ...(formatter.onThought ? { onThought: formatter.onThought } : {}),
   };
 }

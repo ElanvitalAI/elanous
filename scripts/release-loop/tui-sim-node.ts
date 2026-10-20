@@ -16,7 +16,7 @@ import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { copyFileSync, existsSync, mkdtempSync, openSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
-import { parseTuiRegress, regressWarning, tuiChecks, tuiVerdict, type TuiCheck, type TuiRegress } from './tui-node-checks';
+import { parseTuiRegress, regressWarning, tuiChecks, tuiVerdict, validatedTuiRegress, type TuiCheck, type TuiRegress } from './tui-node-checks';
 
 const log = (msg: string) => process.stderr.write(`[tui-node] ${msg}\n`);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -83,7 +83,13 @@ export function measureTuiRegress(worktree: string, runner: typeof spawnSync = s
 export function tuiNodeOutput(commit: string, attempts: Array<{ checks: TuiCheck[]; png?: string }>, regress: TuiRegress, failure?: string) {
   const last = attempts.at(-1);
   const verdict = !last ? 'error' : tuiVerdict(last.checks) === 'fail' ? 'fail' : attempts.length > 1 ? 'flaky' : 'pass';
-  return { verdict, commit, attempts: attempts.length, checks: last?.checks ?? [], png: last?.png, regress, ...(failure ? { error: failure } : {}) };
+  const measured = validatedTuiRegress(regress);
+  const regressSummary = 'unmeasured' in measured
+    ? `regress unmeasured: ${measured.unmeasured}`
+    : `regress ${measured.pass} pass / ${measured.fail} fail${measured.fail ? ` (${measured.results.filter((r) => !r.ok).map((r) => r.id).join(',')})` : ''}`;
+  const checks = last?.checks ?? [];
+  const summary = `TUI ${verdict}: basic ${checks.filter((check) => check.pass).length}/${checks.length} · ${regressSummary}`;
+  return { verdict, summary, commit, attempts: attempts.length, checks, png: last?.png, regress: measured, ...(failure ? { error: failure } : {}) };
 }
 
 async function main(): Promise<number> {

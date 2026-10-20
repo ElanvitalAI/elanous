@@ -1,13 +1,143 @@
 import { describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { packSourceBundle } from './pod-source-bundle.js';
 import { podSourceScript, type PodSource } from './pod-source-receive.js';
 
 describe('podSourceScript', () => {
+  test('pinned image tree becomes a clean per-Pod checkout without cloning files', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-src-image-'));
+    try {
+      const origin = join(root, 'origin');
+      const mirror = join(root, 'mirror.git');
+      const image = join(root, 'image');
+      const imageWithoutMirror = join(root, 'image-no-mirror');
+      const imageGit = join(root, 'pin.git');
+      const marker = join(root, 'image-commit');
+      const cwd = join(root, 'job');
+      for (const path of [origin, image, imageWithoutMirror, cwd]) execFileSync('mkdir', ['-p', path]);
+      execFileSync('git', ['init', '-q', '-b', 'trunk', origin]);
+      execFileSync('git', ['-C', origin, 'config', 'user.email', 'pod@example.com']);
+      execFileSync('git', ['-C', origin, 'config', 'user.name', 'pod']);
+      writeFileSync(join(origin, 'history.txt'), 'parent commit\n');
+      execFileSync('git', ['-C', origin, 'add', 'history.txt']);
+      execFileSync('git', ['-C', origin, 'commit', '-qm', 'parent']);
+      const parent = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      writeFileSync(join(origin, 'README'), 'pinned image contents\n');
+      writeFileSync(join(origin, 'stable.txt'), 'unchanged lower-layer file\n');
+      writeFileSync(join(origin, '.gitignore'), '*.tmp\n');
+      execFileSync('git', ['-C', origin, 'add', 'README', 'stable.txt', '.gitignore']);
+      execFileSync('git', ['-C', origin, 'commit', '-qm', 'pin']);
+      const head = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['clone', '-q', '--bare', origin, mirror]);
+      execFileSync('git', ['clone', '-q', '--bare', '--depth', '1', `file://${origin}`, imageGit]);
+      expect(readFileSync(join(imageGit, 'shallow'), 'utf8').trim()).toBe(head);
+      const packDir = join(imageGit, 'objects', 'pack');
+      const realIndex = readdirSync(packDir).find((name) => name.endsWith('.idx'))!;
+      const appleDoubleIndex = join(packDir, `._${realIndex}`);
+      writeFileSync(appleDoubleIndex, 'not a pack index');
+      for (const name of ['README', 'stable.txt', '.gitignore', 'history.txt']) {
+        copyFileSync(join(origin, name), join(image, name));
+        copyFileSync(join(origin, name), join(imageWithoutMirror, name));
+      }
+      const oldTime = new Date('2020-01-01T00:00:00.000Z');
+      utimesSync(join(image, 'stable.txt'), oldTime, oldTime);
+      writeFileSync(marker, `${head}\n`);
+      writeFileSync(join(origin, 'README'), 'new main contents\n');
+      execFileSync('git', ['-C', origin, 'commit', '-qam', 'advance']);
+      const advanced = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['-C', mirror, 'fetch', '-q', 'origin', '+refs/heads/trunk:refs/heads/trunk']);
+      execFileSync('git', ['-C', mirror, 'update-ref', 'refs/heads/stale', head]);
+      execFileSync('git', ['-C', mirror, 'symbolic-ref', 'HEAD', 'refs/heads/stale']);
+      const options = { imageSourceDir: image, imageCommitFile: marker, imageGitDir: imageGit };
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, mirror, options)}`], { cwd });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+      expect(existsSync(appleDoubleIndex)).toBe(false);
+      execFileSync('git', ['-C', imageGit, 'cat-file', '-e', `${head}^{commit}`], { stdio: 'pipe' });
+      expect(result.stdout.toString()).toContain('ELANOUS_POD_SOURCE_VIA image\n');
+      expect(result.stdout.toString()).toContain('ELANOUS_POD_SOURCE_DELTA mirror\n');
+      expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE default ${advanced}`);
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'status', '--porcelain'], { encoding: 'utf8' }).trim()).toBe('');
+      expect(readFileSync(join(cwd, 'repo', 'README'), 'utf8')).toBe('new main contents\n');
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'rev-parse', 'origin/trunk'], { encoding: 'utf8' }).trim()).toBe(advanced);
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'symbolic-ref', 'refs/remotes/origin/HEAD'], { encoding: 'utf8' }).trim()).toBe('refs/remotes/origin/trunk');
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], { encoding: 'utf8' }).trim()).toBe('origin/trunk');
+      execFileSync('git', ['-C', join(cwd, 'repo'), 'pull', '--ff-only'], { stdio: 'pipe' });
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'branch', '--show-current'], { encoding: 'utf8' }).trim()).toBe('trunk');
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'branch', '-r'], { encoding: 'utf8' })).not.toContain('origin/main');
+      expect(statSync(join(cwd, 'repo', 'stable.txt')).mtimeMs).toBe(oldTime.getTime());
+      const pushOrigin = join(root, 'push.git');
+      execFileSync('git', ['clone', '-q', '--bare', origin, pushOrigin]);
+      execFileSync('git', ['-C', join(cwd, 'repo'), 'remote', 'set-url', '--push', 'origin', pushOrigin]);
+      execFileSync('git', ['-C', join(cwd, 'repo'), 'config', 'push.default', 'simple']);
+      execFileSync('git', ['-C', join(cwd, 'repo'), 'config', 'user.email', 'pod@example.com']);
+      execFileSync('git', ['-C', join(cwd, 'repo'), 'config', 'user.name', 'pod']);
+      writeFileSync(join(cwd, 'repo', 'push-proof.txt'), 'default push follows trunk\n');
+      execFileSync('git', ['-C', join(cwd, 'repo'), 'add', 'push-proof.txt']);
+      execFileSync('git', ['-C', join(cwd, 'repo'), 'commit', '-qm', 'push proof']);
+      execFileSync('git', ['-C', join(cwd, 'repo'), 'push'], { stdio: 'pipe' });
+      expect(execFileSync('git', ['-C', pushOrigin, 'rev-parse', 'refs/heads/trunk'], { encoding: 'utf8' }).trim())
+        .toBe(execFileSync('git', ['-C', join(cwd, 'repo'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
+      execFileSync('git', ['-C', join(cwd, 'repo'), 'fetch', '--unshallow', 'origin'], { stdio: 'pipe' });
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'rev-parse', 'HEAD~3'], { encoding: 'utf8' }).trim()).toBe(parent);
+
+      const corruptImage = join(root, 'corrupt-image');
+      const corruptCwd = join(root, 'corrupt-job');
+      execFileSync('mkdir', ['-p', corruptImage, corruptCwd]);
+      copyFileSync(join(imageWithoutMirror, 'README'), join(corruptImage, 'README'));
+      copyFileSync(join(imageWithoutMirror, 'stable.txt'), join(corruptImage, 'stable.txt'));
+      copyFileSync(join(imageWithoutMirror, '.gitignore'), join(corruptImage, '.gitignore'));
+      copyFileSync(join(imageWithoutMirror, 'history.txt'), join(corruptImage, 'history.txt'));
+      writeFileSync(join(corruptImage, 'README'), 'wrong image bytes\n');
+      const recovered = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, mirror, { ...options, imageSourceDir: corruptImage })}`], { cwd: corruptCwd });
+      expect(recovered.exitCode, recovered.stderr.toString()).toBe(0);
+      expect(recovered.stdout.toString()).toContain('ELANOUS_POD_SOURCE_IMAGE_SKIP source-tree-mismatch\n');
+      expect(recovered.stdout.toString()).toContain('ELANOUS_POD_SOURCE_VIA mirror\n');
+      expect(readFileSync(join(corruptCwd, 'repo', 'README'), 'utf8')).toBe('new main contents\n');
+
+      const extraImage = join(root, 'extra-image');
+      const extraCwd = join(root, 'extra-job');
+      execFileSync('mkdir', ['-p', extraImage, extraCwd]);
+      copyFileSync(join(imageWithoutMirror, 'README'), join(extraImage, 'README'));
+      copyFileSync(join(imageWithoutMirror, 'stable.txt'), join(extraImage, 'stable.txt'));
+      copyFileSync(join(imageWithoutMirror, '.gitignore'), join(extraImage, '.gitignore'));
+      copyFileSync(join(imageWithoutMirror, 'history.txt'), join(extraImage, 'history.txt'));
+      writeFileSync(join(extraImage, 'unexpected.tmp'), 'ignored but not in pinned tree\n');
+      const extra = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, mirror, { ...options, imageSourceDir: extraImage })}`], { cwd: extraCwd });
+      expect(extra.exitCode, extra.stderr.toString()).toBe(0);
+      expect(extra.stdout.toString()).toContain('ELANOUS_POD_SOURCE_IMAGE_SKIP source-tree-mismatch\n');
+      expect(extra.stdout.toString()).toContain('ELANOUS_POD_SOURCE_VIA mirror\n');
+      expect(existsSync(join(extraCwd, 'repo', 'unexpected.tmp'))).toBe(false);
+
+      const noMirrorCwd = join(root, 'no-mirror');
+      execFileSync('mkdir', ['-p', noMirrorCwd]);
+      const noMirror = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, join(root, 'absent'), { ...options, imageSourceDir: imageWithoutMirror })}`], { cwd: noMirrorCwd });
+      expect(noMirror.exitCode, noMirror.stderr.toString()).toBe(0);
+      expect(noMirror.stdout.toString()).toContain('ELANOUS_POD_SOURCE_VIA image\n');
+      expect(noMirror.stdout.toString()).toContain('ELANOUS_POD_SOURCE_DELTA origin\n');
+      expect(execFileSync('git', ['-C', join(noMirrorCwd, 'repo'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(advanced);
+
+      rmSync(join(imageGit, 'shallow'));
+      const missingShallowCwd = join(root, 'missing-shallow');
+      execFileSync('mkdir', ['-p', missingShallowCwd]);
+      const missingShallow = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, mirror, options)}`], { cwd: missingShallowCwd });
+      expect(missingShallow.exitCode, missingShallow.stderr.toString()).toBe(0);
+      expect(missingShallow.stdout.toString()).toContain('ELANOUS_POD_SOURCE_IMAGE_SKIP pin-objects-mismatch\n');
+      expect(missingShallow.stdout.toString()).toContain('ELANOUS_POD_SOURCE_VIA mirror\n');
+
+      writeFileSync(marker, 'dirty\n');
+      const fallback = join(root, 'fallback');
+      execFileSync('mkdir', ['-p', fallback]);
+      const old = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, mirror, options)}`], { cwd: fallback });
+      expect(old.exitCode, old.stderr.toString()).toBe(0);
+      expect(old.stdout.toString()).toContain('ELANOUS_POD_SOURCE_IMAGE_SKIP pin-objects-mismatch');
+      expect(old.stdout.toString()).toContain('ELANOUS_POD_SOURCE_VIA mirror');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('default prefers the mirror, restores origin and reports its route', () => {
     const script = podSourceScript({ kind: 'default' }, 'https://github.com/o/r');
     expect(script).toContain("git clone -q --shared -- '/host-mirror' repo");
@@ -41,7 +171,7 @@ describe('podSourceScript', () => {
       for (const [name, path, via] of [['mirror', mirror, 'mirror'], ['fallback', join(root, 'absent'), 'github']] as const) {
         const cwd = join(root, name);
         execFileSync('mkdir', ['-p', cwd]);
-        const script = podSourceScript(source, origin, path);
+        const script = podSourceScript(source, origin, path, { imageCommitFile: join(root, 'absent-image-commit') });
         const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
         expect(result.exitCode, result.stderr.toString()).toBe(0);
         expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_VIA ${via}\nELANOUS_POD_SOURCE default ${bench}`);
@@ -72,7 +202,7 @@ describe('podSourceScript', () => {
       for (const [name, path, ends] of [['via-mirror', mirror, true], ['via-github', join(root, 'absent'), false]] as const) {
         const cwd = join(root, name);
         execFileSync('mkdir', ['-p', cwd]);
-        const result = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, path, { stageMarkers: true })}`], { cwd });
+        const result = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, path, { stageMarkers: true, imageCommitFile: join(root, 'absent-image-commit') })}`], { cwd });
         expect(result.exitCode, result.stderr.toString()).toBe(0);
         const lines = stageLines(result.stdout.toString());
         expect(lines.map((line) => line.replace(/ \d+$/, ''))).toEqual(ends ? ['ELANOUS_POD_STAGE mirror start', 'ELANOUS_POD_STAGE mirror end'] : ['ELANOUS_POD_STAGE mirror start']);
@@ -113,7 +243,7 @@ describe('podSourceScript', () => {
       const run = (name: string, source: PodSource, useMirror = true) => {
         const cwd = join(root, name);
         execFileSync('mkdir', ['-p', cwd]);
-        const script = podSourceScript(source, origin, useMirror ? mirror : join(root, 'absent'));
+        const script = podSourceScript(source, origin, useMirror ? mirror : join(root, 'absent'), { imageCommitFile: join(root, 'absent-image-commit') });
         const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
         expect(result.exitCode, result.stderr.toString()).toBe(0);
         return { cwd, output: result.stdout.toString() };
@@ -173,7 +303,7 @@ describe('podSourceScript', () => {
       execFileSync('git', ['init', '-q', '--bare', brokenMirror]);
       const brokenCwd = join(root, 'broken');
       execFileSync('mkdir', ['-p', brokenCwd]);
-      const brokenResult = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, brokenMirror)}`], { cwd: brokenCwd });
+      const brokenResult = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, brokenMirror, { imageCommitFile: join(root, 'absent-image-commit') })}`], { cwd: brokenCwd });
       expect(brokenResult.exitCode).toBe(0);
       expect(brokenResult.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_VIA github\nELANOUS_POD_SOURCE default ${head}`);
       // TA-POD-WARMBOOT-PARITY: each fallback names the step that failed, right before the route line.
@@ -184,7 +314,7 @@ describe('podSourceScript', () => {
       execFileSync('git', ['init', '-q', work]);
       execFileSync('git', ['-C', work, '-c', 'user.email=pod@example.com', '-c', 'user.name=pod', 'commit', '-q', '--allow-empty', '-m', 'x']);
       execFileSync('mkdir', ['-p', join(work, 'sub'), join(root, 'clone-failed')]);
-      const cloneFailed = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, join(work, 'sub'))}`], { cwd: join(root, 'clone-failed') });
+      const cloneFailed = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, join(work, 'sub'), { imageCommitFile: join(root, 'absent-image-commit') })}`], { cwd: join(root, 'clone-failed') });
       expect(cloneFailed.exitCode, cloneFailed.stderr.toString()).toBe(0);
       expect(cloneFailed.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_MIRROR_SKIP clone-failed\nELANOUS_POD_SOURCE_VIA github\nELANOUS_POD_SOURCE default ${head}`);
       // The mirror route stays silent about skipping.
@@ -192,7 +322,7 @@ describe('podSourceScript', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test('fetches a thin bundle into a mirror clone and checks out the packed commit', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-src-thin-'));

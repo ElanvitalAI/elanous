@@ -60,11 +60,21 @@ async function capture(mods: Mods, assertCurrentDiagnostics = false): Promise<st
   // publish
   const proot = realpathSync(mkdtempSync(join(tmpdir(), 'cap-pub-'))); roots.push(proot);
   process.env.ELANOUS_STATE_DIR = proot;
+  const runId = 'freeze-off-parity';
+  const decidedAt = '2026-10-04T00:00:00.000Z';
+  const approval = { outcome: 'approved', graphId: 'release-loop', runId, nodeId: 'approve-publish', decidedAt };
+  const graphRunDir = join(proot, 'graph-runs', 'release-loop');
+  mkdirSync(graphRunDir, { recursive: true });
+  const statePath = join(graphRunDir, `${runId}.json`);
+  writeFileSync(statePath, JSON.stringify({ graphId: 'release-loop', runId,
+    path: ['auto-approve', 'approve-publish', 'publish'],
+    nodes: [{ nodeId: 'approve-publish', ok: true, decidedAt, output: JSON.stringify(approval) }] }));
+  writeFileSync(`${statePath}.2.decision.json`, JSON.stringify({ nodeId: 'approve-publish', decision: 'approved', decidedAt }));
   const outputs: Record<string, unknown> = Object.fromEntries(['gate', 'pwa', 'upgrade', 'tui', 'prepare', 'docs'].map((n) => [n, { outcome: 'ok' }]));
-  Object.assign(outputs, { 'approve-publish': { outcome: 'approved' }, prepare: { outcome: 'ok', commit: 'a', out: 'dist' }, 'version-release': { commit: 'a' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' } });
-  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
+  Object.assign(outputs, { 'approve-publish': approval, prepare: { outcome: 'ok', commit: 'a', out: 'dist' }, 'version-release': { commit: 'a' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' } });
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', runId, input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
   const pcalls: string[][] = [];
-  const pub = mods.runPublish((cmd: string, args: string[]) => { pcalls.push([cmd, ...args.map((a) => a.replace(/\/[^ ]*notes\.md$/, '<notes>'))]); return { status: 0, stdout: args.some((a) => a.endsWith('website/pages.json')) ? JSON.stringify({ pages: [] }) : args.includes('publish') ? JSON.stringify({ ok: true, published: true, tag: 'v0.2.4' }) : '# 0.2.4\nHello', stderr: '' }; });
+  const pub = mods.runPublish((cmd: string, args: string[]) => { pcalls.push([cmd, ...args.map((a) => a.replace(/\/[^ ]*notes\.md$/, '<notes>'))]); return { status: 0, stdout: args.some((a) => a.endsWith('website/pages.json')) ? JSON.stringify({ pages: [] }) : args.includes('publish') ? JSON.stringify({ ok: true, published: true, tag: 'v0.2.4' }) : '# 0.2.4\nHello', stderr: '' }; }, undefined, undefined, proot);
   // unattended
   const uroot = realpathSync(mkdtempSync(join(tmpdir(), 'cap-un-'))); roots.push(uroot);
   mkdirSync(join(uroot, 'release/0.2.3'), { recursive: true });

@@ -120,7 +120,7 @@ export function gateTriageShadowFromContext(context: GraphContext, evidence?: Ga
         && item.files.every((file: unknown) => typeof file === 'string') && typeof item.reason === 'string')))
     || (value.loadFlaky !== undefined && (!Array.isArray(value.loadFlaky)
       || !value.loadFlaky.every((item) => typeof item === 'string')))
-    || !['ok', 'regression', 'error'].includes(String(value.outcome))) {
+    || !['ok', 'regression', 'fail', 'error'].includes(String(value.outcome))) {
     throw new Error('gate output is missing or malformed');
   }
   const input = context.input.gateTriageEvidence;
@@ -140,7 +140,10 @@ export function gateTriageShadowFromContext(context: GraphContext, evidence?: Ga
       && item.failureIds.every((id: unknown) => typeof id === 'string'))
       ? { priorDecisions: supplied.priorDecisions as GateTriageEvidence['priorDecisions'] } : {}),
   };
-  return classifyGateShadow(value as unknown as GateResult, observed);
+  // The graph adapter maps a measured gate regression to `fail` for edge routing.
+  // Restore the gate verdict before classifying the shadow; keep the context untouched.
+  const gate = value.outcome === 'fail' ? { ...value, outcome: 'regression' } : value;
+  return classifyGateShadow(gate as unknown as GateResult, observed);
 }
 
 export function logGateTriageShadow(result: GateTriageShadow, version: string): void {

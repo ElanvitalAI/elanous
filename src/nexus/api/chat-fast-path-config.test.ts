@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildUserConfig } from '../../user-config.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 import { handleChatFastPathConfig } from './chat-fast-path-config.js';
 import { startNexusHttpServer } from './http-server.js';
 import { NexusEventBus } from './event-bus.js';
@@ -14,10 +15,12 @@ const priorXdg = process.env.XDG_CONFIG_HOME;
 process.env.XDG_CONFIG_HOME = root;
 const configPath = join(root, 'elanous', 'config.json');
 beforeEach(() => {
+  setElanousConfigDir(join(root, 'elanous'));
   mkdirSync(join(root, 'elanous'), { recursive: true });
   rmSync(configPath, { force: true });
 });
 afterAll(() => {
+  resetElanousConfigDir();
   if (priorXdg === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = priorXdg;
   rmSync(root, { recursive: true, force: true });

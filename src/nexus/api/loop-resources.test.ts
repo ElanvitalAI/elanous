@@ -52,7 +52,7 @@ test('Nexus default view reads the same ledger that the real control API writes'
     const post = (path: string, token: string, body: unknown) => fetch(`${control.url}${path}`, {
       method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(body),
     });
-    expect((await post('/v1/workers/pod', host, { workerId: 'worker-1', machine: 'node-c', key, ttlMs: 30_000 })).status).toBe(200);
+    expect((await post('/v1/workers/pod', host, { workerId: 'worker-1', machine: 'node-c', podUid: 'pod-uid-1', key, ttlMs: 30_000 })).status).toBe(200);
     const leased = await post('/v1/leases/pod-worker', tokens.member, { machine: 'node-c', key, runId: 'run', attemptId: 'attempt', ttlMs: 10_000 });
     expect(leased.status).toBe(200);
     const lease = await leased.json() as { attrs: { leaseId: string } };

@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
-import { dispatchHarnessOnPod, podOrchestrateArgs } from './harness-pod-dispatch.js';
+import { dispatchHarnessOnPod, podOrchestrateArgs, resolveHarnessPodPool } from './harness-pod-dispatch.js';
 import { podMemoryLimitFor } from '../task-orchestrator/surfaces/self-implement-pod.js';
+import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
 import { podSourceScript } from '../task-orchestrator/surfaces/pod-source-receive.js';
 import { HARNESS_RUN_ID_ENV } from './harness-space.js';
 import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
@@ -161,6 +162,33 @@ describe('harness say/ask --substrate pod', () => {
     expect(stamped).toBe('TC');
   });
 
+  test('harness say forwards HQ Codex owner markers into its self-orchestrate Pod child', () => {
+    const keys = ['ELANOUS_REMOTE_CODEX_ACCOUNT', 'ELANOUS_REMOTE_CODEX_USED_PERCENT', 'ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT'] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    let seen: { args: string[]; env: NodeJS.ProcessEnv } | undefined;
+    try {
+      process.env.ELANOUS_REMOTE_CODEX_ACCOUNT = 'owner-team';
+      process.env.ELANOUS_REMOTE_CODEX_USED_PERCENT = '42';
+      process.env.ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT = '60';
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'goal' }, {
+        run: (_command, args, env) => { seen = { args: [...args], env: { ...env } }; return 0; },
+      })).toBe(0);
+      expect(seen?.args.slice(1, 3)).toEqual(['self', 'orchestrate']);
+      expect(seen?.args).toContain('--substrate');
+      expect(seen?.args[seen!.args.indexOf('--substrate') + 1]).toBe('pod');
+      expect(seen?.env).toMatchObject({
+        ELANOUS_REMOTE_CODEX_ACCOUNT: 'owner-team',
+        ELANOUS_REMOTE_CODEX_USED_PERCENT: '42',
+        ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT: '60',
+      });
+    } finally {
+      for (const key of keys) {
+        const value = previous[key];
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
+
   test('POD-OBS: the spawned orchestrator learns the launch home logs.db (the parent universe)', async () => {
     const { logsDbPath } = await import('../mss/logging/log-store.js');
     let stamped: string | undefined;
@@ -181,6 +209,53 @@ describe('harness say/ask --substrate pod', () => {
     expect(noMerge).toContain('--open-pr');
     expect(noMerge).not.toContain('--auto-merge');
     expect(noMerge).not.toContain('--pod-pool');   // 풀은 오케스트레이터가 인자 → 환경 → 설정 순으로 푼다
+  });
+
+  test('mbp pool alias reaches the installed k3d context with capacity at most two', () => {
+    expect(resolveHarnessPodPool('pool-mbp@mbp:2')).toBe('k3d-monad-h1:2');
+    expect(parsePodPool(resolveHarnessPodPool('pool-mbp@mbp:2')!)).toMatchObject([{ context: 'k3d-monad-h1', capacity: 2 }]);
+    expect(resolveHarnessPodPool('pool-node-b@node-b:4,pool-mbp@mbp:1')).toBe('pool-node-b@node-b:4,k3d-monad-h1:1');
+    const args = podOrchestrateArgs({ entrance: 'cli-harness-say', input: 'goal', podPool: 'pool-mbp@mbp:2' }, 'goal.txt');
+    expect(args[args.indexOf('--pod-pool') + 1]).toBe('k3d-monad-h1:2');
+    for (const pool of ['pool-mbp@mbp:8', 'k3d-monad-h1:8', 'pool-mbp@mbp:0']) {
+      expect(() => resolveHarnessPodPool(pool)).toThrow('mbp Pod 풀 상한은 1~2');
+    }
+    for (const pool of ['pool-mbp@mbp', 'k3d-monad-h1']) {
+      expect(() => resolveHarnessPodPool(pool)).toThrow('mbp Pod 풀 스펙 오류');
+    }
+    for (const pool of ['pool-mbp@mbp:2,pool-mbp@mbp:2', 'pool-mbp@mbp:2,k3d-monad-h1:1']) {
+      expect(() => resolveHarnessPodPool(pool)).toThrow('mbp Pod 풀 합산 상한은 2');
+    }
+    expect(() => resolveHarnessPodPool('pool-mbp@mbp:1,k3d-monad-h1:1')).toThrow('mbp Pod 풀 컨텍스트 중복');
+    expect(resolveHarnessPodPool('pool-node-b@node-b:4')).toBe('pool-node-b@node-b:4');
+    expect(resolveHarnessPodPool('k3d-monad-h10:1')).toBe('k3d-monad-h10:1');
+    expect(resolveHarnessPodPool('pool-mbp@mbp2:1')).toBe('pool-mbp@mbp2:1');
+    expect(resolveHarnessPodPool(undefined)).toBeUndefined();
+  });
+
+  test('mbp pool over-capacity is refused before child launch; other pools preserve inherited source', () => {
+    const previous = process.env.ELANOUS_POD_SOURCE_VIA;
+    process.env.ELANOUS_POD_SOURCE_VIA = 'inherited-source';
+    const stderr = spyOn(console, 'error').mockImplementation(() => {});
+    const seen: Array<{ args: readonly string[]; source: string | undefined }> = [];
+    const run = (_cmd: string, args: readonly string[], env: NodeJS.ProcessEnv) => {
+      seen.push({ args, source: env.ELANOUS_POD_SOURCE_VIA }); return 0;
+    };
+    try {
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'goal', podPool: 'pool-mbp@mbp:8' }, { run })).toBe(2);
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'goal', podPool: 'pool-mbp@mbp:2,k3d-monad-h1:1' }, { run })).toBe(2);
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'goal', podPool: 'pool-mbp@mbp' }, { run })).toBe(2);
+      expect(seen).toHaveLength(0);
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'goal', podPool: 'pool-node-b@node-b:4' }, { run })).toBe(0);
+      expect(seen[0]?.source).toBe('inherited-source');
+      expect(seen[0]?.args[seen[0]!.args.indexOf('--pod-pool') + 1]).toBe('pool-node-b@node-b:4');
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'goal', podPool: 'pool-mbp@mbp:2' }, { run })).toBe(0);
+      expect(seen[1]?.args[seen[1]!.args.indexOf('--pod-pool') + 1]).toBe('k3d-monad-h1:2');
+    } finally {
+      stderr.mockRestore();
+      if (previous === undefined) delete process.env.ELANOUS_POD_SOURCE_VIA;
+      else process.env.ELANOUS_POD_SOURCE_VIA = previous;
+    }
   });
 
   test('ask carries a repository-relative goal document only for files inside the repository; say never carries it', () => {

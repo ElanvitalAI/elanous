@@ -4,6 +4,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { debug } from '../debug/log.js';
 import { alternateRepairModel, repairModelAvailability, resolveRepairOwner, runRepairCycle, type RepairLaunchRequest } from './repair-cycle.js';
 import { applyRepairBundle, REPAIR_BUNDLE_REF, type RepairCasDeps, type RepairCasRequest } from './repair-branch-cas.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
@@ -59,6 +60,26 @@ test('exact review must-fix launches one graph-routed commit-only worker, record
   const second = await runRepairCycle(f.input({ request: async (request: RepairLaunchRequest) => { launches.push(request); } }));
   expect(second.decision).toBe('repair-pending');
   expect(launches).toHaveLength(1);
+});
+
+test('accepted repair worker takes the declared next-move → dispatch edge once with the source PR and run identity', async () => {
+  const f = fixture();
+  const edges: Array<Record<string, unknown>> = [];
+  const off = debug.registerSink({ name: 'ta-next-move-edge-test', emit: (record) => {
+    if (record.category === 'self-implement' && record.event === 'graph-edge-taken') edges.push(record.data as Record<string, unknown>);
+  } });
+  try {
+    const launched: RepairLaunchRequest[] = [];
+    const first = await runRepairCycle(f.input({ request: async (request: RepairLaunchRequest) => { launched.push(request); } }));
+    expect(first.decision).toBe('repair-requested');
+    expect(launched).toHaveLength(1);
+    expect(edges).toHaveLength(1);
+    expect(edges[0]).toMatchObject({ graphId: 'self-implement', from: 'next-move', on: 'move', label: 'narrow-relaunch',
+      to: 'dispatch', source: 'graph', taken: 'dispatch', honored: true });
+    expect(readTaskCard(f.card.id, f.statePath)?.repairs?.[0]).toMatchObject({ pr: 30, head: A, runId: launched[0]!.runId, status: 'requested' });
+    expect((await runRepairCycle(f.input({ request: async () => { throw new Error('duplicate launch'); } }))).decision).toBe('repair-pending');
+    expect(edges).toHaveLength(1);
+  } finally { off(); }
 });
 
 test('observation failure after a worker starts leaves its repair requested and prevents a second launch', async () => {
@@ -126,7 +147,7 @@ test('a pushed repair with delayed PR head is unconfirmed, stays on the same att
   expect((await runRepairCycle(f.input({ apply }))).decision).toBe('repair-applied');
   expect(readTaskCard(f.card.id, f.statePath)?.repairs?.[0]).toMatchObject({ status: 'applied', commit: B });
   expect(checks).toBe(3);
-  expect(requests.map(request => [request.confirmationOnly ?? false, request.branch ?? null])).toEqual([[false, null], [true, 'feature'], [true, 'feature']]);
+  expect(requests.map(request => [request.confirmationOnly ?? false, request.branch])).toEqual([[false, 'feature'], [true, 'feature'], [true, 'feature']]);
   expect(readTaskCard(f.card.id, f.statePath)?.repairs).toHaveLength(1);
 });
 
@@ -326,7 +347,7 @@ test('missing card seat launches once at the explicit checklist version owner an
     expect((await runRepairCycle(f.input({ request }))).decision).toBe('repair-requested');
     expect(launches).toHaveLength(1);
     expect(launches[0]?.seat).toBe('MK');
-    expect(readTaskCard(f.card.id, f.statePath)?.history.at(-1)?.detail).toContain('owner MK via checklist 0.2.28/REPAIR-CELL');
+    expect(readTaskCard(f.card.id, f.statePath)?.history.find((entry) => entry.event === 'repair-launched')?.detail).toContain('owner MK via checklist 0.2.28/REPAIR-CELL');
     expect((await runRepairCycle(f.input({ request }))).decision).toBe('repair-pending');
     expect(launches).toHaveLength(1);
   } finally { resetElanousConfigDir(); }
@@ -390,16 +411,16 @@ test('repair model respects tier and measured subscription, without charging Sol
     move: 'narrow-relaunch', runId: 'run-1', resultPath: 'x', status: 'failed', fromModel: 'openai-codex/gpt-6-sol',
     toModel: 'openrouter/openrouter/z-ai/glm-5.3' }] };
   expect(alternateRepairModel(afterGlm).to).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' });
-  expect(alternateRepairModel(afterGlm, { codexSubscription: true, grokSubscription: true }).to).toEqual({ provider: 'openai-codex', model: 'gpt-6-sol' });
-  expect(alternateRepairModel({ ...afterGlm, pr: 31 }, { codexSubscription: true, grokSubscription: true }).to).toEqual({ provider: 'grok', model: 'grok-4.6' });
-  expect(alternateRepairModel(afterGlm, { codexSubscription: false, grokSubscription: true }).to).toEqual({ provider: 'grok', model: 'grok-4.6' });
+  expect(alternateRepairModel({ ...afterGlm, tier: '상' }, { codexSubscription: true, grokSubscription: true }).to).toEqual({ provider: 'openai-codex', model: 'gpt-6-sol' });
+  expect(alternateRepairModel({ ...afterGlm, tier: '상', pr: 31 }, { codexSubscription: true, grokSubscription: true }).to).toEqual({ provider: 'grok', model: 'grok-4.6' });
+  expect(alternateRepairModel({ ...afterGlm, tier: '상' }, { codexSubscription: false, grokSubscription: true }).to).toEqual({ provider: 'grok', model: 'grok-4.6' });
   expect(alternateRepairModel({ ...afterGlm, tier: '특' }, { codexSubscription: false, grokSubscription: false }).to).toEqual({ provider: 'openai-codex', model: 'gpt-6-sol' });
   expect(alternateRepairModel({ ...afterGlm, tier: '중' }, { codexSubscription: true, grokSubscription: true }).to.model).toBe('openrouter/z-ai/glm-5.3-flash');
-  expect(alternateRepairModel({ ...f.card, tier: '하', childLlm: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' } }).to.model).toBe('openrouter/z-ai/glm-5.3');
+  expect(alternateRepairModel({ ...f.card, tier: '하', childLlm: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' } }).to.model).toBe('gpt-6-luna');
 });
 
 test('live quota inputs gate Sol before repair model selection, including missing and exhausted quota', async () => {
-  const card: TaskCard = { ...fixture().card, childLlm: undefined };
+  const card: TaskCard = { ...fixture().card, tier: '상', childLlm: undefined };
   const input = { codexCandidates: [{ name: 'team', reached: false, usedPercent: 42 }],
     grokUsedPercent: 17, maxUsedPercent: { 'openai-codex': 95, grok: 48 } };
   const available = await repairModelAvailability(async () => input);
@@ -433,4 +454,47 @@ test('repair cycle reads quota and passes the tier model to the worker request',
     expect(launches[0]?.model.model).toBe(expected);
     expect(readTaskCard(f.card.id, f.statePath)?.repairs?.[0]?.toModel).toContain(expected);
   }
+});
+
+test('tier-less repair cards dispatch as 중 and never charge Sol on even PRs', () => {
+  const f = fixture();
+  expect(alternateRepairModel(f.card, { codexSubscription: true, grokSubscription: true }).to)
+    .toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
+  const afterGlm: TaskCard = { ...f.card, repairs: [{ pr: 30, head: A, branch: 'feature', at: now.toISOString(),
+    move: 'narrow-relaunch', runId: 'run-1', resultPath: 'x', status: 'failed', fromModel: 'openai-codex/gpt-6-sol',
+    toModel: 'openrouter/openrouter/z-ai/glm-5.3' }] };
+  expect(alternateRepairModel(afterGlm, { codexSubscription: true, grokSubscription: true }).to)
+    .toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' });
+});
+
+test('하-tier repairs rotate glm-5.3 → flash → luna, one step up per failure', () => {
+  const f = fixture();
+  const failed = (toModel: string): TaskCard => ({ ...f.card, tier: '하', repairs: [{ pr: 30, head: A, branch: 'feature', at: now.toISOString(),
+    move: 'narrow-relaunch', runId: 'run-1', resultPath: 'x', status: 'failed', fromModel: 'a', toModel }] });
+  expect(alternateRepairModel({ ...f.card, tier: '하' }).to).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
+  expect(alternateRepairModel(failed('openrouter/openrouter/z-ai/glm-5.3')).to).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' });
+  expect(alternateRepairModel(failed('openrouter/openrouter/z-ai/glm-5.3-flash')).to).toEqual({ provider: 'openai-codex', model: 'gpt-6-luna' });
+  expect(alternateRepairModel(failed('openrouter/openrouter/z-ai/glm-5.3-flash'), { codexSubscription: true, grokSubscription: true }).to)
+    .toEqual({ provider: 'openai-codex', model: 'gpt-6-luna' });
+  expect(alternateRepairModel(failed('openai-codex/gpt-6-luna')).to).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
+});
+
+test('repair launch records the implementation child model as a harness.role-llm event', async () => {
+  const f = fixture();
+  const launches: RepairLaunchRequest[] = [];
+  await runRepairCycle(f.input({ request: async (request: RepairLaunchRequest) => { launches.push(request); } }));
+  const stored = readTaskCard(f.card.id, f.statePath)!;
+  const roleLlm = stored.history.find((entry) => entry.event === 'harness.role-llm');
+  expect(roleLlm?.detail).toBe(`repair child model ${launches[0]!.model.provider}/${launches[0]!.model.model}`);
+  expect(roleLlm?.runId).toBe(launches[0]!.runId);
+  expect(stored.history.at(-1)?.event).toBe('harness.role-llm');
+});
+
+test('rejected repair request leaves no implementation model event', async () => {
+  const f = fixture();
+  const outcome = await runRepairCycle(f.input({ request: async () => { throw new Error('worker admission refused'); } }));
+  expect(outcome.decision).toBe('repair-failed');
+  const stored = readTaskCard(f.card.id, f.statePath)!;
+  expect(stored.repairs?.at(-1)?.status).toBe('failed');
+  expect(stored.history.some((entry) => entry.event === 'harness.role-llm')).toBe(false);
 });

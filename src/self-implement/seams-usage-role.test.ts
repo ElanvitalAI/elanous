@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as llm from '../llm.js';
-import { resolveRoleLlm } from '../user-config.js';
+import { getUserConfig, resolveRoleLlm } from '../user-config.js';
 import { defaultSeams } from './seams.js';
 
 test('goal summary passes classify usage role alongside the unchanged resolved model', async () => {
@@ -11,6 +11,9 @@ test('goal summary passes classify usage role alongside the unchanged resolved m
   const goalFile = join(root, 'goal.md');
   writeFileSync(goalFile, '# Existing goal\n\nSummarize this goal.\n');
   const resolved = resolveRoleLlm('classify');
+  const expectedProvider = llm.getProviderForConfig({
+    ...getUserConfig(), llm: { ...getUserConfig().llm, provider: resolved.provider, model: resolved.model },
+  });
   const calls: Array<{ model?: string; provider?: { name: string }; reasoningEffort?: string; signal?: AbortSignal; usageRole?: string }> = [];
   const stream = spyOn(llm, 'streamLLM').mockImplementation(async (_messages, _onChunk, opts) => {
     calls.push(opts ?? {});
@@ -24,7 +27,7 @@ test('goal summary passes classify usage role alongside the unchanged resolved m
     });
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({
-      usageRole: 'classify', model: resolved.model, provider: { name: resolved.provider }, reasoningEffort: 'low',
+      usageRole: 'classify', model: resolved.model, provider: { name: expectedProvider.name }, reasoningEffort: 'low',
     });
     expect(calls[0]?.signal).toBeInstanceOf(AbortSignal);
   } finally {

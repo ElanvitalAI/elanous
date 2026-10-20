@@ -6,7 +6,7 @@ import { POD_GITHUB_CREDENTIAL_TOKEN_ENV, POD_GITHUB_CREDENTIAL_URL_ENV } from '
 import { ghAutomationEnv, defaultCmdRunner, makePrManager, configuredHunkOverlapMode, extractPrNumber, resolveDeliverableBase, prBaseFromComparison, collectLandedCommitsOnBase, landingHistoryGitLogArgs, type CmdRunner, type CmdResult } from './pr-manager.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE } from '../git-fs/worktree.js';
 import { debug } from '../debug/log.js';
-import { guardNewPr } from '../pr-tool/census.js';
+import { cardIdFromBody, guardNewPr } from '../pr-tool/census.js';
 
 /** 호출 기록 + 프로그램된 응답을 주는 스텁 러너. */
 function stubRunner(responses: Record<string, CmdResult> = {}): { run: CmdRunner; calls: string[][] } {
@@ -187,6 +187,216 @@ describe('makePrManager.upsertPr — 기존 PR 재활용(대표 2026-07-12)', ()
     branch: 'se/apm-x-abc', worktreePath: '/wt', title: '[SE] x', body: 'b', base: 'main',
     commitMessage: 'm', excludePaths: ['node_modules', 'apps/pwa/out'], reuseComment: '🔄 재구현',
   };
+
+  it('카드 후보 inventory 미측정은 새 draft로 관측하고 기존 가지를 강제 push하지 않는다', () => {
+    const { run, calls } = stubRunner({ 'pr list': { ok: true, out: '' }, 'pr create': { ok: true, out: 'https://github.com/o/r/pull/91' } });
+    const body = '칸: PR-GUARD-INVENTORY-UNMEASURED-FU\n카드: ta-123';
+    const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-GUARD-INVENTORY-UNMEASURED-FU', cardId: 'ta-123' }, { status: 'unknown', reason: 'network' });
+    const result = makePrManager(run, guard, () => ({ count: 4, blocked: true })).upsertPr({ ...input, body, seat: 'TC' });
+    expect(result).toMatchObject({ ok: true, reused: false, url: 'https://github.com/o/r/pull/91' });
+    const create = calls.find(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create');
+    expect(create).toContain('--draft');
+    expect(create).toContain('pr-guard:unmeasured');
+    expect(calls).toContainEqual(['git', '-C', '/wt', 'push', '-u', 'origin', input.branch]);
+    expect(calls.some(call => call[0] === 'git' && call.includes('--force'))).toBe(false);
+  });
+
+  it('카드 후보 inventory 검사기가 없을 때도 draft만 만들고 미측정을 표시한다', () => {
+    const { run, calls } = stubRunner({ 'pr list': { ok: true, out: '' }, 'pr create': { ok: true, out: 'https://github.com/o/r/pull/92' } });
+    const result = makePrManager(run).upsertPr({ ...input, body: '칸: PR-GUARD-INVENTORY-UNMEASURED-FU\n카드: ta-123' });
+    expect(result).toMatchObject({ ok: true, reused: false });
+    const create = calls.find(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create');
+    expect(create).toContain('--draft');
+    expect(create).toContain('pr-guard:unmeasured');
+  });
+
+  it('같은 칸·같은 카드의 기존 PR 머리를 합쳐 빠른 전진으로 갱신하고 새 PR을 열지 않는다', () => {
+    const head = 'a'.repeat(40);
+    const body = '칸: PR-SAME-CELL-REUSE\n카드: ta-123';
+    const url = 'https://github.com/o/r/pull/7';
+    const { run, calls } = stubRunner({
+      'pr view 7 --json state': { ok: true, out: JSON.stringify({ state: 'OPEN', headRefOid: head, headRefName: 'old-branch', body, isCrossRepository: false, url }) },
+      'ls-remote --exit-code origin refs/heads/old-branch': { ok: true, out: `${head}\trefs/heads/old-branch` },
+      'rev-parse refs/elanous/pr-reuse/7-aaaaaaaaaaaa': { ok: true, out: head },
+    });
+    const inventory = { status: 'checked' as const, prs: [{ number: 7, headRefName: 'old-branch', title: 'old', draft: true,
+      updatedAt: '2026-10-19T00:00:00Z', headSha: head, labels: [], files: ['src/old.ts'], seat: null,
+      cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }] };
+    const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }, inventory);
+    expect(makePrManager(run, guard).upsertPr({ ...input, body })).toEqual({ ok: true, url, reused: true });
+    expect(calls).toContainEqual(['git', '-C', '/wt', 'push', `--force-with-lease=refs/heads/old-branch:${head}`, 'origin', 'HEAD:refs/heads/old-branch']);
+    expect(calls.some(call => call[0] === 'git' && call[1] === '-C' && call[2] === '/wt' && call[3] === 'push' && call.includes('--force'))).toBe(false);
+    expect(calls.some(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toBe(false);
+  });
+
+  it('충돌 draft의 scratch ref 삭제 실패 stderr 전문을 절단 없이 기록한다', () => {
+    const head = 'a'.repeat(40);
+    const body = '칸: PR-SAME-CELL-REUSE\n카드: ta-123';
+    const url = 'https://github.com/o/r/pull/7';
+    const stderr = `remote: ${'cleanup detail '.repeat(24)}END`;
+    const stdout = `notice: ${'secondary output '.repeat(20)}END`;
+    expect(stderr.length).toBeGreaterThan(220);
+    expect(stdout.length).toBeGreaterThan(220);
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const { run, calls } = stubRunner({
+        'pr view 7 --json state': { ok: true, out: JSON.stringify({ state: 'OPEN', headRefOid: head,
+          headRefName: 'old-branch', body, isCrossRepository: false, isDraft: true, url }) },
+        'ls-remote --exit-code origin refs/heads/old-branch': { ok: true, out: `${head}\trefs/heads/old-branch` },
+        'rev-parse refs/elanous/pr-reuse/7-aaaaaaaaaaaa': { ok: true, out: head },
+        'merge --no-edit': { ok: false, out: '', err: 'merge conflict' },
+        'rev-parse HEAD': { ok: true, out: 'b'.repeat(40) },
+        'repo view --json nameWithOwner': { ok: true, out: 'o/r' },
+        'push origin :refs/heads/elanous-pr-create/': { ok: false, out: stdout, err: stderr },
+        'pr create': { ok: true, out: 'https://github.com/o/r/pull/8' },
+      });
+      const inventory = { status: 'checked' as const, prs: [{ number: 7, headRefName: 'old-branch', title: 'old', draft: true,
+        updatedAt: '2026-10-19T00:00:00Z', headSha: head, labels: [], files: ['src/old.ts'], seat: null,
+        cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }] };
+      const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }, inventory);
+      expect(makePrManager(run, guard).upsertPr({ ...input, body })).toEqual({
+        ok: true, url: 'https://github.com/o/r/pull/8', reused: false, supersededPr: 7,
+      });
+      const scratchRemoval = calls.find(call => call[0] === 'git' && call.includes('push')
+        && call.some(arg => arg.startsWith(':refs/heads/elanous-pr-create/')));
+      expect(scratchRemoval).toBeDefined();
+      const cleanupLog = log.mock.calls.find(([, event]) => event === 'same-cell-scratch-cleanup-failed');
+      expect(cleanupLog).toBeDefined();
+      expect(cleanupLog![2]).toMatchObject({ detail: stderr, stderr, stdout, truncated: false,
+        scratchRef: expect.stringMatching(/^refs\/heads\/elanous-pr-create\//) });
+      expect(cleanupLog![3]).toEqual({ level: 'warn' });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('같은 카드 후보라도 PR 머리가 바뀌면 기존 가지를 밀지 않는다', () => {
+    const head = 'a'.repeat(40);
+    const body = '칸: PR-SAME-CELL-REUSE\n카드: ta-123';
+    const { run, calls } = stubRunner({
+      'pr view 7 --json state': { ok: true, out: JSON.stringify({ state: 'OPEN', headRefOid: 'b'.repeat(40), headRefName: 'old-branch', body, isCrossRepository: false, url: 'https://github.com/o/r/pull/7' }) },
+    });
+    const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }, { status: 'checked', prs: [{
+      number: 7, headRefName: 'old-branch', title: 'old', draft: true, updatedAt: '2026-10-19T00:00:00Z', headSha: head,
+      labels: [], files: ['src/old.ts'], seat: null, cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123',
+    }] });
+    expect(makePrManager(run, guard).upsertPr({ ...input, body })).toMatchObject({ ok: false, reason: 'guard', detail: expect.stringContaining('changed') });
+    expect(calls.some(call => call[0] === 'git' && call.includes('push'))).toBe(false);
+  });
+
+  it('재사용 병합 중 두 번째 같은 칸 PR이 열리면 전체 OPEN 재조회 뒤 push를 거부한다', () => {
+    const head = 'a'.repeat(40);
+    const body = '칸: PR-SAME-CELL-REUSE\n카드: ta-123';
+    const url = 'https://github.com/o/r/pull/7';
+    const { run, calls } = stubRunner({
+      'pr view 7 --json state': { ok: true, out: JSON.stringify({ state: 'OPEN', headRefOid: head, headRefName: 'old-branch', body, isCrossRepository: false, url }) },
+      'ls-remote --exit-code origin refs/heads/old-branch': { ok: true, out: `${head}\trefs/heads/old-branch` },
+      'rev-parse refs/elanous/pr-reuse/7-aaaaaaaaaaaa': { ok: true, out: head },
+    });
+    const first = { number: 7, headRefName: 'old-branch', title: 'old', draft: true,
+      updatedAt: '2026-10-19T00:00:00Z', headSha: head, labels: [], files: ['src/old.ts'], seat: null,
+      cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' };
+    let checks = 0;
+    const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }, {
+      status: 'checked', prs: ++checks === 1 ? [first] : [first, { ...first, number: 8, headRefName: 'second-branch' }],
+    });
+    expect(makePrManager(run, guard).upsertPr({ ...input, body })).toMatchObject({
+      ok: false, reason: 'guard', detail: expect.stringContaining('OPEN PR inventory changed before push'),
+    });
+    expect(checks).toBe(2);
+    expect(calls.some(call => call[0] === 'git' && call.includes('push'))).toBe(false);
+  });
+
+  it('병합 중 PR head가 움직이거나 본문 카드가 모호해지면 push 전에 멈춘다', () => {
+    const head = 'a'.repeat(40);
+    const body = '칸: PR-SAME-CELL-REUSE\n카드: ta-123';
+    const url = 'https://github.com/o/r/pull/7';
+    const { run, calls } = sequentialStubRunner({
+      'pr view 7 --json state': [
+        { ok: true, out: JSON.stringify({ state: 'OPEN', headRefOid: head, headRefName: 'old-branch', body, isCrossRepository: false, url }) },
+        { ok: true, out: JSON.stringify({ state: 'OPEN', headRefOid: 'b'.repeat(40), headRefName: 'old-branch', body, isCrossRepository: false, url }) },
+      ],
+      'ls-remote --exit-code origin refs/heads/old-branch': { ok: true, out: `${head}\trefs/heads/old-branch` },
+      'rev-parse refs/elanous/pr-reuse/7-aaaaaaaaaaaa': { ok: true, out: head },
+    });
+    const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }, { status: 'checked', prs: [{
+      number: 7, headRefName: 'old-branch', title: 'old', draft: true, updatedAt: '2026-10-19T00:00:00Z', headSha: head,
+      labels: [], files: ['src/old.ts'], seat: null, cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123',
+    }] });
+    expect(makePrManager(run, guard).upsertPr({ ...input, body })).toMatchObject({ ok: false, reason: 'guard', detail: expect.stringContaining('before push') });
+    expect(calls.some(call => call[0] === 'git' && call.includes('push'))).toBe(false);
+    const ambiguous = guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }, { status: 'checked', prs: [{
+      number: 7, headRefName: 'old-branch', title: 'old', draft: true, updatedAt: '2026-10-19T00:00:00Z', headSha: head,
+      labels: [], files: ['src/old.ts'], seat: null, cellId: 'PR-SAME-CELL-REUSE', cardId: cardIdFromBody(`${body}\n카드: ta-other`),
+    }] });
+    expect(ambiguous.sameCellReuse).toBeUndefined();
+  });
+
+  it('후보 본문 카드 표식이 충돌하면 같은 가지 force push 전에 거부한다', () => {
+    const { run, calls } = stubRunner({ 'pr list': { ok: true, out: 'https://github.com/o/r/pull/7' } });
+    const body = '칸: PR-SAME-CELL-REUSE\n카드: ta-123\n카드: ta-other';
+    expect(makePrManager(run).upsertPr({ ...input, body })).toMatchObject({
+      ok: false, reason: 'guard', detail: expect.stringContaining('card lineage is ambiguous'),
+    });
+    expect(calls.some(call => call[0] === 'git' && call.includes('push'))).toBe(false);
+    expect(calls.some(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'edit')).toBe(false);
+  });
+
+  it('첫 조회 뒤 다른 카드의 OPEN PR이 생기면 생성 직전 재조회에서 중복 PR을 거부한다', () => {
+    const { run, calls } = stubRunner({ 'pr list': { ok: true, out: '' } });
+    const body = '칸: PR-SAME-CELL-REUSE\n카드: ta-123';
+    let checks = 0;
+    const guard = () => {
+      checks += 1;
+      return guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }, {
+        status: 'checked', prs: checks === 1 ? [] : [{
+          number: 8, headRefName: 'other-run', title: 'other', draft: true,
+          updatedAt: '2026-10-19T00:00:00Z', headSha: 'b'.repeat(40), labels: [],
+          files: ['src/other.ts'], seat: null, cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-other',
+        }],
+      });
+    };
+    expect(makePrManager(run, guard).upsertPr({ ...input, body })).toMatchObject({
+      ok: false, reason: 'guard', detail: expect.stringContaining('same-cell'),
+    });
+    expect(checks).toBe(2);
+    expect(calls.some(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toBe(false);
+  });
+
+  it('첫 조회 뒤 같은 카드 PR이 생기면 새 run 가지를 비강제로 밀었더라도 재사용하지 않고 거부한다', () => {
+    const { run, calls } = stubRunner({ 'pr list': { ok: true, out: '' } });
+    const body = '칸: PR-SAME-CELL-REUSE\n카드: ta-123';
+    let checks = 0;
+    const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }, {
+      status: 'checked', prs: ++checks === 1 ? [] : [{
+        number: 8, headRefName: 'other-run', title: 'same card', draft: true,
+        updatedAt: '2026-10-19T00:00:00Z', headSha: 'b'.repeat(40), labels: [],
+        files: ['src/other.ts'], seat: null, cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123',
+      }],
+    });
+    expect(makePrManager(run, guard).upsertPr({ ...input, body })).toMatchObject({
+      ok: false, reason: 'guard', detail: expect.stringContaining('appeared after run branch push'),
+    });
+    expect(checks).toBe(2);
+    expect(calls.some(call => call[0] === 'git' && call.includes('push') && call.includes('--force'))).toBe(false);
+    expect(calls.some(call => call[0] === 'gh' && call[1] === 'pr' && (call[2] === 'create' || call[2] === 'edit'))).toBe(false);
+  });
+
+  it('새 run 가지 push 뒤 바로 그 가지에 PR이 생겨도 edit 경로를 열지 않는다', () => {
+    const { run, calls } = sequentialStubRunner({
+      '--head se/apm-x-abc': [
+        { ok: true, out: '' },
+        { ok: true, out: 'https://github.com/o/r/pull/9' },
+      ],
+    });
+    const body = '칸: PR-SAME-CELL-REUSE\n카드: ta-123';
+    const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }, { status: 'checked', prs: [] });
+    expect(makePrManager(run, guard).upsertPr({ ...input, body })).toMatchObject({
+      ok: false, reason: 'guard', detail: expect.stringContaining('appeared after push'),
+    });
+    expect(calls.some(call => call[0] === 'gh' && call[1] === 'pr' && (call[2] === 'edit' || call[2] === 'create'))).toBe(false);
+    expect(calls.some(call => call[0] === 'git' && call.includes('push') && call.includes('--force'))).toBe(false);
+  });
 
   it('하니스 신규 PR 생성 직전 공유 open-guard 거부를 적용하고 gh pr create 를 부르지 않는다', () => {
     const { run, calls } = stubRunner({ 'pr list': { ok: true, out: '' } });

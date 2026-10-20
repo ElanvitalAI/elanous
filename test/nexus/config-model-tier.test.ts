@@ -14,6 +14,7 @@ import {
   handleModelTierPut,
 } from '../../src/nexus/api/config-model-tier.js';
 import { __resetXdgDeprecationWarningForTests, reloadUserConfig, userConfigPath } from '../../src/user-config.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
 
 let tmpDir: string;
 const PREV_XDG = process.env.XDG_CONFIG_HOME;
@@ -21,6 +22,7 @@ const PREV_XDG = process.env.XDG_CONFIG_HOME;
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), 'm1-2b-'));
   process.env.XDG_CONFIG_HOME = tmpDir;
+  setElanousConfigDir(join(tmpDir, 'elanous'));
   process.env.ELANOUS_SUPPRESS_XDG_WARNING = '1';
   __resetXdgDeprecationWarningForTests();
   // Force buildUserConfig cache to drop the previous test's state.
@@ -28,6 +30,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  resetElanousConfigDir();
   rmSync(tmpDir, { recursive: true, force: true });
   if (PREV_XDG === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = PREV_XDG;

@@ -3,7 +3,8 @@ import { Command } from 'commander';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assembleSeatQuickPath, assembleSeatTacitKnowledge, collectSeatLadderSections, registerSeatBootCommands, renderSeatBootCard, SEAT_QUICKSTART_MANUAL, SEAT_TRUST_LADDER } from './seat-cli.js';
+import { assembleSeatQuickPath, assembleSeatTacitKnowledge, collectSeatBootSections, collectSeatLadderSections, registerSeatBootCommands, renderSeatBootCard, SEAT_QUICKSTART_MANUAL, SEAT_TRUST_LADDER } from './seat-cli.js';
+import { LAST_SESSION_FILE } from '../dashboard/seat-local-instructions.js';
 import { MsgStore } from '../msg/msg-store.js';
 
 function fixture() {
@@ -79,6 +80,39 @@ test('seat boot reads DM and ALL unread counts without creating or acknowledging
       expect(store.getCursor('MK')).toBe(broadcast.id);
     } finally { store.close(); }
   } finally { log.mockRestore(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('collectSeatBootSections — 안 읽은 우편 수·자리·HANDOFF·예약·지난 세션을 카드에 담는다(공용 조립)', () => {
+  const home = mkdtempSync(join(tmpdir(), 'seat-boot-last-session-'));
+  const seatState = join(home, 'elanous-hq', 'seat-state', 'OP');
+  const seatWork = join(home, 'elanous-hq', 'seats', 'OP');
+  mkdirSync(seatState, { recursive: true });
+  mkdirSync(seatWork, { recursive: true });
+  writeFileSync(join(seatState, 'HANDOFF.md'), '# OP 인계 문서\n');
+  writeFileSync(join(seatWork, 'AGENTS.local.md'), '역할 = 그림자 OP · 판정 제안\n비밀 본문은 카드에 복사하지 않는다\n');
+  writeFileSync(join(seatState, 'scheduled.tsv'), 'at\twhat\tthen\n09:00\tcheck\tdashboard\n');
+  writeFileSync(join(seatWork, LAST_SESSION_FILE), '## 지난 세션 (TUI 가 대화 끝마다 갈아 쓴다 · 사람이 고치지 않는 파일)\n- 끝: 2026-10-18T09:00:00.000Z · exit · 사람 턴 1\n- 마지막 요청: 세션 정리해줘\n- 마지막 답 요지: 정리했다. 다음 점검 10:30 에 깨운다\n- 열린 일: 정리했다. 다음 점검 10:30 에 깨운다\n- 다음 점검 시각(답에서): 10:30\n');
+  const msgPath = join(home, 'state', 'msg', 'messages.db');
+  const store = new MsgStore(msgPath);
+  try {
+    store.post({ from: 'TC', to: 'OP', body: 'private-dm-body-stays-out' });
+    store.post({ from: 'TC', to: 'ALL', body: 'private-broadcast-body-stays-out' });
+    const { sections, unread } = collectSeatBootSections('OP', { home, msgPath });
+    expect(unread).toBe(2);
+    const card = renderSeatBootCard('OP', sections, null);
+    expect(card).toContain('# OP 자리 부팅 카드');
+    expect(card).toContain('안 읽은 msg 2 (OP)');
+    expect(card).toContain('## 자리 역할');
+    expect(card).toContain('역할: 그림자 OP · 판정 제안');
+    expect(card).not.toContain('비밀 본문은 카드에 복사하지 않는다');
+    expect(card).toContain('## HANDOFF');
+    expect(card).toContain('## 예약');
+    expect(card).toContain('## 지난 세션');
+    expect(card).toContain('마지막 요청: 세션 정리해줘');
+    expect(card).toContain('열린 일: 정리했다. 다음 점검 10:30 에 깨운다');
+    expect(card).not.toContain('private-dm-body-stays-out');
+    expect(card).not.toContain('private-broadcast-body-stays-out');
+  } finally { store.close(); rmSync(home, { recursive: true, force: true }); }
 });
 
 test('seat boot does not follow a linked seat directory outside the seat-state root', async () => {

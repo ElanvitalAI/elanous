@@ -4,6 +4,7 @@ import { readPrBaseNameWithRetry } from './pr-land-base-read.js';
 test('a transient unreadable PR base recovers on a short retry', async () => {
   let reads = 0;
   const waits: number[] = [];
+  const unreadable: Array<[number, string | undefined]> = [];
   const result = await readPrBaseNameWithRetry({
     pr: '42', cwd: '/repo',
     run: () => {
@@ -12,11 +13,13 @@ test('a transient unreadable PR base recovers on a short retry', async () => {
         : { ok: true, out: JSON.stringify({ baseRefName: 'main' }), err: '' };
     },
     sleep: async (ms) => { waits.push(ms); },
+    onUnreadable: (attempt, stderr) => { unreadable.push([attempt, stderr]); },
   });
 
   expect(result).toEqual({ baseRefName: 'main', attempts: 2 });
   expect(reads).toBe(2);
   expect(waits).toEqual([100]);
+  expect(unreadable).toEqual([[1, 'transient gh failure']]);
 });
 
 test('repeated unreadable PR base remains unreadable after the bounded retries', async () => {

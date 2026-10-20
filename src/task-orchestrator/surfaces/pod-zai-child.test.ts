@@ -56,6 +56,30 @@ async function spawnGlm(secretKeys: string[] | null, o: { active?: number | null
 }
 
 describe('ZAI-POD-CHILD — glm child Pods on the Z.ai GLM Coding Plan', () => {
+  test('codex Pod carries an admitted zai fallback by Secret name without switching its initial provider', async () => {
+    const run = capture([ZAI_POD_SECRET_KEY]);
+    const result = await podSelfImplementSpawn({
+      kubectl: run.kubectl, sleep: async () => {}, env: {},
+      fallbackConfig: () => ({ llm: { fallbackChain: ['codex-rotate', 'zai'] } }) as never,
+      zaiSettings: () => ({ overage: 'stop', maxConcurrent: 3 }),
+      credentials: () => ({ elanousAuth: JSON.stringify({ version: 1, providers: {
+        'openai-codex': { tokens: { accessToken: 'fake', refreshToken: '' } },
+      } }), codexAuth: JSON.stringify({ tokens: { access_token: 'fake', refresh_token: '' } }), ghToken: 'gh' }),
+      openrouterGhToken: () => 'gh-test',
+    })({ feature: 'implement', spaceId: 'codex-zai-fallback' }).done;
+    expect(result.exitCode).toBe(0);
+    const job = run.applied.find(entry => entry.kind === 'Job')!;
+    const secret = run.applied.find(entry => entry.kind === 'Secret')!;
+    const container = job.spec.template.spec.containers[0];
+    expect(container.args[0]).toContain('/creds/codex-auth.json');
+    expect(container.args[0]).not.toContain('ELANOUS_LLM_PROVIDER=glm');
+    expect(container.env).toContainEqual({ name: ZAI_POD_SECRET_KEY,
+      valueFrom: { secretKeyRef: { name: ZAI_POD_SECRET_NAME, key: ZAI_POD_SECRET_KEY } } });
+    expect(job.metadata.labels[ZAI_POD_EGRESS_LABEL]).toBe('true');
+    expect(job.spec.template.metadata.labels[ZAI_POD_EGRESS_LABEL]).toBe('true');
+    expect(JSON.parse(secret.stringData['llm-fallback-config.json']).llm.fallbackChain).toEqual(['codex-rotate', 'zai']);
+    expect(JSON.stringify(run.applied)).not.toContain(SENTINEL);
+  });
   test('the one list (launch gate ⊕ Pod) admits glm; the child gets --child-llm-provider glm (default model glm-5.3)', () => {
     expect(POD_CHILD_PROVIDERS).toContain('glm');
     expect(podChildProviderOf('glm')).toBe('glm');
@@ -165,12 +189,14 @@ describe('ZAI-POD-CHILD — glm child Pods on the Z.ai GLM Coding Plan', () => {
     const run = capture([ZAI_POD_SECRET_KEY], 0);
     const log = spyOn(debug, 'log').mockImplementation((() => {}) as typeof debug.log);
     try {
-      await podSelfImplementSpawn({ provider: 'openrouter', childModel: OR_FALLBACK, openrouterGhToken: () => 'gh-test', kubectl: run.kubectl, sleep: async () => {}, readKeyCache: (n: string) => (n === 'OPENROUTER_API_KEY' ? 'sk-or-test' : undefined), env: { ZAI_API_KEY: SENTINEL } })({ feature: 'implement', spaceId: 'or-invariant' }).done;
+      await podSelfImplementSpawn({ provider: 'openrouter', childModel: OR_FALLBACK, openrouterGhToken: () => 'gh-test', kubectl: run.kubectl, sleep: async () => {}, readKeyCache: (n: string) => (n === 'OPENROUTER_API_KEY' ? 'sk-or-test' : undefined), env: { ZAI_API_KEY: SENTINEL }, fallbackConfig: () => ({ llm: { fallbackChain: ['zai'] } }) as never })({ feature: 'implement', spaceId: 'or-invariant' }).done;
     } finally { log.mockRestore(); }
     const text = JSON.stringify(run.applied);
     expect(text).not.toContain(ZAI_POD_EGRESS_LABEL);
     expect(text).not.toContain(SENTINEL);
     expect(run.calls.some((args) => args.includes(ZAI_POD_SECRET_NAME) || args.includes(`${ZAI_POD_EGRESS_LABEL}=true`))).toBe(false);
+    const secret = run.applied.find(entry => entry.kind === 'Secret')!;
+    expect(JSON.parse(secret.stringData['llm-fallback-config.json']).llm.fallbackChain).not.toContain('zai');
   });
 
   test('wiring: index.ts treats glm like the other key-in-cluster providers (no codex plan · no --pod-account)', () => {

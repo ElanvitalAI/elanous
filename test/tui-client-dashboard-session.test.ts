@@ -141,3 +141,31 @@ describe('DashboardSession — send interceptor (P2-bridge-ext)', () => {
     }).not.toThrow();
   });
 });
+
+describe('DashboardSession — 추론 요약 thought (TUI-TURN-NARRATION · 결함 #87)', () => {
+  const wrap = (u: Record<string, unknown>) => ({ sessionId: 's', update: u });
+
+  test('_meta.reasoning 이 붙은 agent_thought_chunk 는 onThought 로 간다', () => {
+    const thoughts: string[] = [];
+    const usages: DashboardSessionUsage[] = [];
+    const intercept = _buildSendInterceptorForTest({
+      userText: 'x',
+      onThought: (t) => thoughts.push(t),
+      onUsage: (u) => usages.push(u),
+    });
+    intercept(wrap({
+      sessionUpdate: 'agent_thought_chunk',
+      content: { type: 'text', text: '**파일 목록을 확인합니다**' },
+      _meta: { reasoning: true },
+    }));
+    expect(thoughts).toEqual(['**파일 목록을 확인합니다**']);
+    expect(usages).toEqual([]);
+  });
+
+  test('_meta 없는 thought(usage 봉투 아님)는 여전히 버린다 — onThought 로 새지 않는다', () => {
+    const thoughts: string[] = [];
+    const intercept = _buildSendInterceptorForTest({ userText: 'x', onThought: (t) => thoughts.push(t) });
+    intercept(wrap({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'plain' } }));
+    expect(thoughts).toEqual([]);
+  });
+});

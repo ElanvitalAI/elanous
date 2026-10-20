@@ -22,7 +22,9 @@ import { debug } from '../debug/log.js';
 import { findGitDir } from '../git-fs/locate.js';
 import { getUserConfig, userConfigPath } from '../user-config.js';
 import type { DetachedSpawn } from '../cli/tasks-cli.js';
-import { LIVE_MOVE_HISTORY_EVENT, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
+import { LIVE_MOVE_HISTORY_EVENT, shellQuote, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
+import { reconcileHandMergedCard } from './postland-card.js';
+import { resolveParentHosts, type ParentHostConfig } from './parent-host.js';
 import { LIVE_RETRY_MOVES } from './judge.js';
 import { decisionCardGrounds, decisionRaiseArgs, type DecisionCardEvidence, type NextAction } from './actions.js';
 import { pendingReviewResults, reviewResultPath, TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_RESULT_ENV, TA_REVIEW_COMPLETION_STATE_ENV } from './review-result-capture.js';
@@ -83,6 +85,8 @@ export interface LiveMoveDeps {
   priorDiff?: PriorDiffReader;
   /** Fresh PR head and draft flag for landing; separate from the unchanged review lookup. */
   landPrHead?: (pr: number, cwd: string) => Promise<(PrHeadView & { isDraft: boolean }) | null>;
+  /** TA-CARD-MERGE-RECONCILE — MERGED PR 의 merge SHA·base·mergedAt 관측(시험 주입 · 기본 = `gh pr view`). */
+  handMergePr?: (pr: number, cwd: string) => Promise<HandMergePrView | null>;
   /** One existing pr land operation; inject in tests instead of invoking the CLI. */
   /** TA-REJUDGE-ON-HEAD — `opts.overlapEvidence` 가 있으면 `pr land --overlap-evidence <file>` 로 넘긴다(없으면 종전 인자). */
   land?: (pr: number, head: string, cwd: string, opts?: { overlapEvidence?: string }) => Promise<{ status: number; stdout: string; stderr?: string }>;
@@ -208,25 +212,44 @@ export function liveReviewArgs(entry: string, configDir: string, pr: number, int
   return [resolve(entry), '--config-dir', configDir, 'self', 'review', String(pr), '--json', '--intent', intent];
 }
 
+/** Use the configured node-b checkout for heavy TA workers; absence of parentHost preserves the legacy local path. */
+export function configuredMsb1Worker(): ParentHostConfig | null {
+  const setting = getUserConfig().taskAgent?.parentHost;
+  if (setting === undefined) return null;
+  const target = resolveParentHosts(setting, {} as NodeJS.ProcessEnv).find((entry) => entry.host === 'node-b');
+  if (!target) throw new Error('taskAgent.parentHost configured without a valid node-b worker');
+  return target;
+}
+
+export function remoteTaWorkerCommand(target: ParentHostConfig, args: readonly string[]): string {
+  const entry = target.elanous ? shellQuote(target.elanous) : '$HOME/.local/share/elanous/bin/elanous';
+  const configDir = target.configDir ? shellQuote(target.configDir) : '$HOME/.elanous';
+  return `cd ${shellQuote(target.cwd)} && ${entry} --config-dir ${configDir} ${args.map(shellQuote).join(' ')}`;
+}
+
 /**
  * 지금 도는 진입점으로 같은 우주의 리뷰를 떼어 띄운다 — 기다리지 않는다(결과는 self review 자기 관측에 남는다).
  * TA-REVIEW-RESULT-CAPTURE — `resultPath` 가 있으면 자식 stdout(`--json` 결과)만 그 파일로 받는다(stdin·stderr 는 종전대로 버린다 ·
  * 파이프가 아니라 파일 — 부모가 먼저 끝나도 자식이 EPIPE 로 죽지 않는다). 없으면 종전과 같다(stdio ignore).
  * `opts` 는 시험 몫(spawn·진입점·우주) — 기본은 실물.
  */
-export async function defaultRequestReview(pr: number, intent: string, cwd?: string, opts: { spawn?: DetachedSpawn; entry?: string; configDir?: string; resultPath?: string; cardId?: string; statePath?: string } = {}): Promise<void> {
+export async function defaultRequestReview(pr: number, intent: string, cwd?: string, opts: { spawn?: DetachedSpawn; entry?: string; configDir?: string; resultPath?: string; cardId?: string; statePath?: string; remote?: ParentHostConfig | null } = {}): Promise<void> {
   const { spawnDetachedConfirmed, ELANOUS_CLI_ENTRY } = await import('../cli/tasks-cli.js');
   const { getElanousConfigDirOverride } = await import('../elanous-config-dir.js');
   const { effectiveInstanceRoot } = await import('../instance/resolve.js');
   const configDir = opts.configDir ?? getElanousConfigDirOverride() ?? effectiveInstanceRoot();
   const base = opts.spawn ?? (spawn as unknown as DetachedSpawn);
+  const remote = opts.remote === undefined ? (opts.spawn ? null : configuredMsb1Worker()) : opts.remote;
   const args = liveReviewArgs(opts.entry ?? ELANOUS_CLI_ENTRY, configDir, pr, intent);
   const completionEnv = opts.resultPath && opts.cardId && opts.statePath ? {
     [TA_REVIEW_COMPLETION_CARD_ENV]: opts.cardId,
     [TA_REVIEW_COMPLETION_STATE_ENV]: opts.statePath,
     [TA_REVIEW_COMPLETION_RESULT_ENV]: opts.resultPath,
   } : undefined;
-  if (!opts.resultPath) { await spawnDetachedConfirmed(base, process.execPath, args, undefined, cwd); return; }
+  const workerCommand = remote ? remoteTaWorkerCommand(remote, ['self', 'review', String(pr), '--json', '--model', 'gpt-6-sol', '--intent', intent]) : null;
+  const command = remote ? 'ssh' : process.execPath;
+  const workerArgs = remote ? ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', remote.host, workerCommand!] : args;
+  if (!opts.resultPath) { await spawnDetachedConfirmed(base, command, workerArgs, undefined, cwd); return; }
   let fd: number;
   try {
     mkdirSync(dirname(opts.resultPath), { recursive: true });
@@ -234,13 +257,13 @@ export async function defaultRequestReview(pr: number, intent: string, cwd?: str
   } catch (error) {
     // 결과 파일을 못 열어도 리뷰는 막지 않는다(종전처럼 stdio ignore) — 회수는 상한 뒤 «no result» 줄로 드러난다.
     try { debug.log('task-agent', 'review-result-file-open-failed', { pr, resultPath: opts.resultPath, reason: (error instanceof Error ? error.message : String(error)).slice(-300) }, { level: 'warn' }); } catch { /* fail-soft */ }
-    await spawnDetachedConfirmed(base, process.execPath, args, undefined, cwd);
+    await spawnDetachedConfirmed(base, command, workerArgs, undefined, cwd);
     return;
   }
   const toFile: DetachedSpawn = (command, spawnArgs, options) =>
     (base as unknown as (c: string, a: string[], o: unknown) => ReturnType<DetachedSpawn>)(command, spawnArgs, { ...options, stdio: ['ignore', fd, 'ignore'] });
   try {
-    await spawnDetachedConfirmed(toFile, process.execPath, args, undefined, cwd, completionEnv);
+    await spawnDetachedConfirmed(toFile, command, workerArgs, undefined, cwd, remote ? undefined : completionEnv);
   } finally {
     try { closeSync(fd); } catch { /* the child keeps its own copy */ }
   }
@@ -293,6 +316,35 @@ export async function defaultLandPrHead(pr: number, cwd: string): Promise<(PrHea
     return { head: value.headRefOid, state: value.state, isDraft: value.isDraft,
       ...(typeof value.headRefName === 'string' ? { branch: value.headRefName } : {}),
       ...(typeof value.url === 'string' ? { url: value.url } : {}) };
+  } catch { return null; }
+}
+
+/** TA-CARD-MERGE-RECONCILE — 손수 병합된 PR 의 정산 관측값(merge SHA 가 main 조상 검증의 재료). */
+export interface HandMergePrView {
+  state: string;
+  url?: string;
+  baseRefName?: string;
+  mergedAt?: string;
+  mergeCommit?: string;
+}
+
+export async function defaultHandMergePr(pr: number, cwd: string): Promise<HandMergePrView | null> {
+  const view = (env: NodeJS.ProcessEnv) => runGh(['pr', 'view', String(pr), '--json', 'state,url,baseRefName,mergedAt,mergeCommit'], { env, cwd });
+  let out = view(process.env);
+  if (out.status !== 0) {
+    const noProxy = { ...process.env };
+    for (const key of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']) delete noProxy[key];
+    out = view(noProxy);
+  }
+  if (out.status !== 0) return null;
+  try {
+    const value = JSON.parse(out.stdout) as { state?: unknown; url?: unknown; baseRefName?: unknown; mergedAt?: unknown; mergeCommit?: { oid?: unknown } | null };
+    if (typeof value.state !== 'string') return null;
+    return { state: value.state,
+      ...(typeof value.url === 'string' && value.url ? { url: value.url } : {}),
+      ...(typeof value.baseRefName === 'string' && value.baseRefName ? { baseRefName: value.baseRefName } : {}),
+      ...(typeof value.mergedAt === 'string' && value.mergedAt ? { mergedAt: value.mergedAt } : {}),
+      ...(typeof value.mergeCommit?.oid === 'string' && /^[a-f0-9]{40}$/i.test(value.mergeCommit.oid) ? { mergeCommit: value.mergeCommit.oid } : {}) };
   } catch { return null; }
 }
 
@@ -402,7 +454,7 @@ export async function executeLiveReview(
  *   (`executeLiveLand` ctx `gateAt` = 그 재게이트 요청 시각)에만 이 시도는 «소비됨»으로 빠진다. judgement·infra 와 섞이지 않는다.
  */
 export const LAND_ATTEMPTS_PER_HEAD_ON_INFRA = 2;
-export type LandFailureClass = 'infra' | 'judgement' | 'base-stale';
+export type LandFailureClass = 'infra' | 'judgement' | 'base-stale' | 'recovery';
 
 /** `pr land` 출력 줄 → 인프라 사유. ⛔ 줄 «전체»가 맞아야 한다 — 비슷한 문면을 넓게 받지 않는다. */
 export const LAND_INFRA_OUTPUT_REASONS: ReadonlyArray<{ reason: string; line: RegExp }> = [
@@ -422,6 +474,8 @@ const LAND_INFRA_CONSEQUENCE_LINES: ReadonlyArray<{ of: string; line: RegExp }> 
 ];
 /** REJUDGE base-stale — 겹침 증거의 게이트 base 가 낡았고 그 사이 착지가 PR 파일을 건드렸다(`pr land` · #26060 문면). */
 const LAND_BASE_STALE_LINE = /^✗ overlap-evidence: (base-stale-overlap: .*)$/;
+const LAND_RECOVER_REVIEW = /^✗ (?:ancestor-auto|overlap-evidence): (?:review-missing|review-not-reviewed|review-error|review-no-result|review-unreadable|review-pr-mismatch|review-head-mismatch|review-path-not-for-this-pr-head|review-verdict-null|review-must-fix-unknown)(?:\b|$)/;
+const LAND_RECOVER_BUSY = /^✗ heavy-remote: (?:원격|병합 직전 원격|node-b) 게이트 gate-host-busy(?:\b|\s|$)/;
 /** base-stale 에 «딸려 나오는» 줄 — 증거가 거절되면 `pr land` 가 이어서 낸다(그 줄만 있으면 판정 거절로 세지 않는다). */
 const LAND_BASE_STALE_CONSEQUENCE_LINES: readonly RegExp[] = [/^✗ expected-head: overlap merge approval unavailable for the reviewed head$/];
 /** 실패가 아닌 ✗ 줄 — `pr land` 가 «계속합니다»로 넘어간다(판정에 쓰지 않는다). */
@@ -464,6 +518,10 @@ export function classifyLandFailure(outcome: { status: number; stdout?: string; 
     if (hit) infra.add(hit.reason); else unlisted.push(line);
   }
   const judged = unlisted.filter((line) => !LAND_INFRA_CONSEQUENCE_LINES.some((entry) => infra.has(entry.of) && entry.line.test(line)));
+  if (judged.length === 1 && !infra.size) {
+    if (LAND_RECOVER_REVIEW.test(judged[0]!)) return { class: 'recovery', reason: 'review-missing' };
+    if (LAND_RECOVER_BUSY.test(judged[0]!)) return { class: 'recovery', reason: 'gate-host-busy' };
+  }
   // REJUDGE base-stale — 거절 줄이 base-stale-overlap(⊕ 딸린 줄) «뿐»이고 인프라 사유가 없을 때만. 하나라도 다른 ✗ 줄이 섞이면 judgement(fail-closed).
   const stale = judged.map((line) => LAND_BASE_STALE_LINE.exec(line)?.[1]).find((reason): reason is string => !!reason);
   if (stale && !infra.size && judged.every((line) => LAND_BASE_STALE_LINE.test(line) || LAND_BASE_STALE_CONSEQUENCE_LINES.some((re) => re.test(line)))) {
@@ -520,7 +578,20 @@ function observeLandWorktreeCreateCapped(deps: LiveMoveDeps, data: { card: strin
 /** 같은 머리에 한 번 더 시도해도 되나 — 앞 시도가 «전부» 끝났고(ok:false) «전부» infra 이고 상한 밑일 때만. */
 function landRetryAllowed(prior: readonly LandAttempt[]): boolean {
   return prior.length > 0 && prior.length < LAND_ATTEMPTS_PER_HEAD_ON_INFRA
-    && prior.every((entry) => entry.ok === false && (entry.class === 'infra' || legacyMissingTscRuntime(entry)));
+    && prior.every((entry) => entry.ok === false && (entry.class === 'infra' || entry.class === 'recovery' || legacyMissingTscRuntime(entry)));
+}
+
+function recoveryAdmissionReady(card: TaskCard, prior: readonly LandAttempt[], pr: number, head: string, nowMs = Date.now()): boolean {
+  const last = prior.at(-1);
+  if (last?.class !== 'recovery') return true;
+  if (last.reason === 'gate-host-busy') return nowMs >= Date.parse(last.at) + 30_000
+    && (card.history ?? []).some((event) => event.event === 'rejudge-on-head' && event.kind === 'land'
+      && event.effect === 'recover-wait-retry' && event.pr === pr && event.head?.toLowerCase() === head.toLowerCase()
+      && Date.parse(event.at) >= Date.parse(last.at));
+  if (last.reason === 'review-missing') return (card.reviewRequests ?? []).some((request) => request.pr === pr
+    && request.head.toLowerCase() === head.toLowerCase() && Date.parse(request.at) >= Date.parse(last.at) && !request.error)
+    && !pendingReviewResults(card).some((request) => request.pr === pr && request.head.toLowerCase() === head.toLowerCase());
+  return false;
 }
 
 /** A previous release classified a missing node interpreter as judgement; only that exact recorded shape may be reopened. */
@@ -541,8 +612,9 @@ export function openLandAttempts<T extends Pick<LandAttempt, 'at' | 'class'>>(pr
 }
 
 /** 카드의 이 PR·머리에 인프라 재시도가 남았나(재판정 틱이 «머리 그대로»여도 land 단계까지 가게). */
-export function landRetryPending(card: Pick<TaskCard, 'landAttempts'>, pr: number, head: string): boolean {
-  return landRetryAllowed((card.landAttempts ?? []).filter(sameHeadOf(pr, head)));
+export function landRetryPending(card: TaskCard, pr: number, head: string): boolean {
+  const attempts = (card.landAttempts ?? []).filter(sameHeadOf(pr, head));
+  return landRetryAllowed(attempts) && recoveryAdmissionReady(card, attempts, pr, head);
 }
 
 export const LAND_RETRY_ON_INFRA_EVENT = 'land-retry-on-infra';
@@ -575,7 +647,21 @@ export async function executeLiveLand(
   let view: (PrHeadView & { isDraft: boolean }) | null;
   try { view = await (deps.landPrHead ?? defaultLandPrHead)(pr, cwd); } catch { view = null; }
   if (!view || !/^[0-9a-f]{40}$/i.test(view.head)) return reject(card.id, `PR #${pr} head unknown`, reviewRepo);
-  if (view.state !== 'OPEN') return reject(card.id, `PR #${pr} is ${view.state}`, reviewRepo);
+  if (view.state !== 'OPEN') {
+    // TA-CARD-MERGE-RECONCILE — 실패 카드에 묶인 PR을 사람이 손수 병합한 경우만 이 자리에서 정산한다; 정산이 아니면 종전 거절 그대로.
+    if (view.state === 'MERGED') {
+      let hand: HandMergePrView | null = null;
+      try { hand = await (deps.handMergePr ?? defaultHandMergePr)(pr, cwd); } catch { hand = null; }
+      if (hand?.mergeCommit) {
+        const settled = reconcileHandMergedCard({ number: pr, url: hand.url ?? view.url ?? '', headRefOid: view.head, state: 'MERGED',
+          baseRefName: hand.baseRefName ?? 'main', mergedAt: hand.mergedAt ?? '', mergeCommit: hand.mergeCommit },
+          cwd, deps.statePath ? { statePath: deps.statePath } : {});
+        if (settled.outcome === 'reconciled')
+          return withRepo(observe(deps, { kind, card: card.id, ok: true, executed: true, detail: `PR #${pr} 손 병합 정산 — card ${settled.status} (merge ${settled.mergeSha.slice(0, 12)})` }));
+      }
+    }
+    return reject(card.id, `PR #${pr} is ${view.state}`, reviewRepo);
+  }
   if (view.isDraft !== false) return reject(card.id, `PR #${pr} is draft or draft status unknown`, reviewRepo);
   if (ctx.produced?.prUrl && (!view.url || view.url.trim().replace(/\/+$/, '').toLowerCase() !== ctx.produced.prUrl.trim().replace(/\/+$/, '').toLowerCase())) {
     return reject(card.id, `PR #${pr} URL mismatches run evidence`, reviewRepo);
@@ -622,7 +708,7 @@ export async function executeLiveLand(
         }
       }
       prior = openLandAttempts((current.landAttempts ?? []).filter(sameHeadOf(pr, view!.head)), ctx.gateAt);
-      if (prior.length && !landRetryAllowed(prior)) return undefined;
+      if (prior.length && (!landRetryAllowed(prior) || !recoveryAdmissionReady(current, prior, pr, view!.head, (deps.now ?? (() => new Date()))().getTime()))) return undefined;
       claimed = true;
       return { ...current, landAttempts: [...(current.landAttempts ?? []), { pr, head: view!.head, at }] };
     });
@@ -721,7 +807,7 @@ export async function executeLiveLand(
     detail = (error instanceof Error ? error.message : String(error)).slice(-300);
     failure = classifyLandFailure({ thrown: detail });
   }
-  const retryAllowed = failure?.class === 'infra' && attempt < LAND_ATTEMPTS_PER_HEAD_ON_INFRA;
+  const retryAllowed = (failure?.class === 'infra' || failure?.class === 'recovery') && attempt < LAND_ATTEMPTS_PER_HEAD_ON_INFRA;
   // 인프라 실패로 재시도가 남으면 주기 표시도 푼다 — 같은 주기 id(재판정 틱의 `rejudge:<card>:<head>`)가 그 한 번을 막지 않게.
   if (retryAllowed && cycle) landedCycles.delete(cycle);
   if (worktree && queueConfig && ok) {

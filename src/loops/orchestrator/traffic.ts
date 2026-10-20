@@ -9,7 +9,8 @@ import { withFileLockSync } from '../../storage/file-lock.js';
 import { getUserConfig, ORCHESTRATOR_DEFAULTS, type OrchestratorLoopConfig, type OrchestratorSeat } from '../../user-config.js';
 import { finishAdvice, measureFinish, type FinishAdvice, type FinishMetrics, type MeasureFinishDeps } from './finish-rate.js';
 import { collectAuthorDepth, type AuthorDepthResult, type CollectAuthorDepthDeps } from './author-depth.js';
-import { budgetTrafficTick } from '../budget.js';
+import { probeDegradation, type DegradationSignal } from './degradation.js';
+import { budgetTrafficTick, computeTrafficMetrics24h, readTrafficSamples24h, recordTrafficSample24h, type TrafficSampleDeps } from '../budget.js';
 
 export const TRAFFIC_SEATS = ['OP', 'TC', 'MK', 'UX'] as const;
 export type TrafficCell = Pick<ChecklistItem, 'id' | 'title' | 'owner' | 'status'>;
@@ -33,6 +34,11 @@ export type DispatchCycle = {
 /** Separate journal: never extend or reinterpret seat-requests or per-run state rows. */
 export function recordDispatchCycle(root: string, cycle: DispatchCycle,
   log: (category: string, event: string, data: Record<string, unknown>) => void = debug.log.bind(debug)): void {
+  // 상시 게이트 관측: tick launch 노드와 runTrafficTick 이 지나는 이 배선 자체가 항상 켜져 있으므로
+  // 24h halt 저널은 이 자리에서 쌓인다 — `--metrics` 수동 읽기에만 매달면 관측 부재로 지표가
+  // 언제나 0이 되는 Goodhart 구조가 된다. 관측 전용: append 아래 원장 기록은 절대 막지 않는다.
+  try { observeGateHalt(root, { log }); }
+  catch { /* 게이트 저널은 관측일 뿐 — dispatch 원장은 관측 실패와 무관하게 기록된다 */ }
   const path = join(root, 'orchestrator', 'dispatch-ledger.jsonl');
   try {
     mkdirSync(dirname(path), { recursive: true });
@@ -207,6 +213,10 @@ export function runTrafficTick({ processes, now, caps, openCells, nextRound, tot
       skipped, dispatch: getUserConfig().loops?.orchestrator?.dispatch ?? ORCHESTRATOR_DEFAULTS.dispatch,
     });
   }
+  // 24h metrics journal: observation only, silent on the decision log, never read for this decision path.
+  recordTrafficSample24h(root, { at: now.toISOString(), seats: result.seats }, { log: () => {} });
+  // 게이트 관측은 위 recordDispatchCycle 상시 배선(과 tick launch 노드의 동일 호출)에서 매 사이클
+  // 쌓인다 — 이 틱에서 중복 관측을 또 하지 않는다. 관측 전용, 이 판정 경로는 이 저널을 읽지 않는다.
   let authorShadow: AuthorShadow | null = null;
   let shadowFailure: Record<string, unknown> | null = null;
   try {
@@ -228,9 +238,129 @@ export function runTrafficTick({ processes, now, caps, openCells, nextRound, tot
   return { result, queued, authorShadow };
 }
 
+export type GateObservation = { at: string; level: 'L1' | 'L2' | null };
+
+/** Map a degradation probe to the gate level that stops place/delegate/launch; L2 is the stronger gate. */
+export function gateLevelOf(signal: Pick<DegradationSignal, 'llm' | 'board'>): 'L1' | 'L2' | null {
+  if (!signal.board) return 'L2';
+  if (!signal.llm) return 'L1';
+  return null;
+}
+
+export interface GateHaltDeps {
+  signal?: Pick<DegradationSignal, 'llm' | 'board'>;
+  probe?: (root: string) => Pick<DegradationSignal, 'llm' | 'board'>;
+  log?: (category: string, event: string, data: Record<string, unknown>) => void;
+}
+
+/** Observation-only journal for the 24h gate metric: probe the degradation gates and append the level. */
+export function observeGateHalt(root: string, deps: GateHaltDeps = {}): GateObservation {
+  const log = deps.log ?? debug.log.bind(debug);
+  const signal = deps.signal ?? deps.probe?.(root) ?? probeDegradation(root);
+  const observation: GateObservation = { at: new Date().toISOString(), level: gateLevelOf(signal) };
+  const path = join(root, 'orchestrator', 'gate-halt-24h.jsonl');
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    withFileLockSync(`${path}.lock`, () => {
+      const previous = existsSync(path) ? readFileSync(path, 'utf8') : '';
+      const separator = previous === '' || previous.endsWith('\n') ? '' : '\n';
+      appendFileSync(path, `${separator}${JSON.stringify(observation)}\n`);
+    });
+    log('loop.orchestrator', 'gate-halt-24h', { ...observation, path });
+  } catch (error) {
+    try { log('loop.orchestrator', 'gate-halt-24h-failed', { error: String(error).slice(0, 200) }); }
+    catch { /* Observation cannot change a recorded decision. */ }
+  }
+  return observation;
+}
+
+/** Read the 24h gate journal; torn lines are skipped (same rule as the dispatch ledger). */
+export function readGateObservations24h(root: string, now: Date, windowMinutes = 1440): GateObservation[] {
+  const path = join(root, 'orchestrator', 'gate-halt-24h.jsonl');
+  if (!existsSync(path)) return [];
+  const floor = now.getTime() - windowMinutes * 60_000;
+  return readFileSync(path, 'utf8').split('\n').flatMap(line => {
+    if (!line.trim()) return [];
+    try {
+      const parsed = JSON.parse(line) as GateObservation;
+      const at = Date.parse(parsed.at);
+      if (!Number.isFinite(at) || at < floor || at > now.getTime()) return [];
+      if (parsed.level !== null && parsed.level !== 'L1' && parsed.level !== 'L2') return [];
+      return [parsed];
+    } catch { return []; }
+  });
+}
+
+/** Read the dispatch ledger verbatim journal; torn lines are skipped, kept only for forensics. */
+export function readDispatchLedger(root: string, now: Date, windowMinutes = 1440): DispatchCycle[] {
+  const path = join(root, 'orchestrator', 'dispatch-ledger.jsonl');
+  if (!existsSync(path)) return [];
+  const floor = now.getTime() - windowMinutes * 60_000;
+  return readFileSync(path, 'utf8').split('\n').flatMap(line => {
+    if (!line.trim()) return [];
+    try {
+      const parsed = JSON.parse(line) as DispatchCycle;
+      const at = Date.parse(parsed.at);
+      if (!Number.isFinite(at) || at < floor || at > now.getTime()) return [];
+      return [parsed];
+    } catch { return []; }
+  });
+}
+
+/** Gate-halted minutes: gate-active spans where the verbatim ledger shows zero launch attempts AND the gate's
+ * own skip reason (degraded-skip) — a gate-active span with no demand is not halted time. */
+export function gateHaltedLaunchMinutes({ gate, ledger }: {
+  gate: readonly GateObservation[];
+  ledger?: readonly DispatchCycle[];
+}): { minutes: number; launchAttempts: number; haltedTicks: number; activeObservations: number } {
+  const points = gate.map(observation => ({ observation, t: Date.parse(observation.at) }))
+    .filter(point => Number.isFinite(point.t)).sort((a, b) => a.t - b.t);
+  const cycles = (ledger ?? []).map(cycle => ({ cycle, t: Date.parse(cycle.at) }))
+    .filter(entry => Number.isFinite(entry.t));
+  let minutes = 0;
+  let launchAttempts = 0;
+  let haltedTicks = 0;
+  let activeObservations = 0;
+  for (const point of points) {
+    if (point.observation.level !== null) activeObservations++;
+  }
+  for (let i = 1; i < points.length; i++) {
+    if (points[i].observation.level === null || points[i - 1].observation.level === null) continue;
+    const from = points[i - 1].t;
+    const to = points[i].t;
+    const inSpan = cycles.filter(entry => entry.t >= from && entry.t <= to);
+    const attempts = inSpan.reduce((sum, entry) => sum + entry.cycle.eligible, 0);
+    // Only the ledger's own skip reason proves the gate stopped launches: eligible is structurally 0 while the
+    // gate skips, so attempts === 0 alone would also count zero-demand spans as «halted» (Goodhart).
+    const gateSkipped = inSpan.reduce((sum, entry) => sum + (entry.cycle.skipped['degraded-skip'] ?? 0), 0);
+    launchAttempts += attempts;
+    if (attempts === 0 && gateSkipped > 0) {
+      haltedTicks++;
+      minutes += Math.max(0, (to - from) / 60_000);
+    }
+  }
+  return { minutes, launchAttempts, haltedTicks, activeObservations };
+}
+
 if (import.meta.main) {
   try {
     const args = process.argv.slice(2);
+    if (args.includes('--metrics')) {
+      if (args.some(arg => arg !== '--metrics' && arg !== '--json'))
+        throw new Error('usage: traffic.ts [--version <판>] [--json] | --metrics [--json]');
+      const root = effectiveInstanceRoot();
+      const now = new Date();
+      const observation = observeGateHalt(root);
+      const gate = gateHaltedLaunchMinutes({ gate: readGateObservations24h(root, now), ledger: readDispatchLedger(root, now) });
+      const traffic = computeTrafficMetrics24h(readTrafficSamples24h(root, now));
+      const report = { at: now.toISOString(), version: devVersion().replace(/-dev\.\d+$/, ''), traffic,
+        gate: { ...gate, observation } };
+      if (args.includes('--json')) console.log(JSON.stringify(report));
+      else {
+        const wait = traffic.meanWaitMinutes === null ? '?' : `${traffic.meanWaitMinutes}분`;
+        console.log(`traffic-24h utilization=${traffic.utilizationRate} (${traffic.running}/${traffic.capacity}) · mean-wait=${wait} (표본 ${traffic.waitSamples}) · preemptions=${traffic.preemptedSeatTicks} · gate-halt=${gate.minutes}분 (발사시도 ${gate.launchAttempts}) · ticks=${traffic.sampledTicks} · window=${traffic.windowMinutes}분`);
+      }
+    } else {
     const versionFlag = args.indexOf('--version');
     const version = versionFlag < 0 ? devVersion().replace(/-dev\.\d+$/, '') : args[versionFlag + 1];
     if (!version || version.startsWith('--')
@@ -253,6 +383,7 @@ if (import.meta.main) {
     });
     if (args.includes('--json')) console.log(JSON.stringify({ ...result, mode: cfg.trafficMode, queued, version, authorShadow }));
     else console.log(trafficLine(result, cfg.trafficMode));
+    }
   } catch (error) {
     console.error(`traffic: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;

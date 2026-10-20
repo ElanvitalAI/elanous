@@ -1,0 +1,14 @@
+# These are observations only. No pod admission, image update, or credential
+# refresh is performed by the unit.
+pod-pool-admission:
+  command: >-
+    bun -e 'const args=["harness","queue","backpressure","--json"],p=Bun.spawnSync(["eln",...args]),raw=p.stdout.toString();let parsed;try{parsed=JSON.parse(raw)}catch{};const allowed=p.exitCode===0&&Number.isFinite(parsed?.launchBudget)&&parsed.launchBudget>0;const observed=parsed&&typeof parsed==="object"?{launchBudget:parsed.launchBudget??null,reasons:parsed.reasons??[],signals:Object.fromEntries(Object.entries(parsed.signals??{}).filter(([key])=>["queueDepth","admitWaiting","admitStarvedOver30m","podRecommended","staleParents"].includes(key)))}:{lineCount:raw.split("\n").filter(Boolean).length};console.log(JSON.stringify({outcome:p.exitCode!==0?"failed":allowed?"done":"needs-human",pool_member:{admission:observed},result:{observed},evidence:{command:["eln",...args].join(" "),exitCode:p.exitCode,launchBudget:parsed?.launchBudget??null}}))'
+  timeout_ms: 30000
+pod-pool-image-sync:
+  command: >-
+    bun -e 'const path=require("node:path"),exe=Bun.which("eln"),link=exe?Bun.spawnSync(["readlink",path.resolve(path.dirname(exe),"..","current")]):null,args=["config","get","harness.imageCommit"],p=Bun.spawnSync(["eln",...args]),pin=p.stdout.toString().trim(),installed=link?.stdout.toString().trim()??"",installedPin=path.basename(installed).split("-").at(-1)??"";const ok=p.exitCode===0&&link?.exitCode===0&&!!pin&&!!installed&&installedPin===pin;console.log(JSON.stringify({outcome:p.exitCode!==0||link?.exitCode!==0?"failed":ok?"done":"needs-human",image_current:{configPin:pin||null,installedPath:installed||null,installedPin:installedPin||null},result:{configPin:pin||null,installedPath:installed||null,installedPin:installedPin||null},evidence:{command:["eln",...args].join(" "),readlinkExit:link?.exitCode??null,configExit:p.exitCode,reason:ok?undefined:"installed current link and configured image pin do not exactly match or could not be observed"}}))'
+  timeout_ms: 30000
+pod-credential-prerefresh:
+  command: >-
+    bun -e 'const args=["provider","codex","status","--json"],p=Bun.spawnSync(["eln",...args]),raw=p.stdout.toString();let parsed;try{parsed=JSON.parse(raw)}catch{};const current=parsed&&typeof parsed==="object"&&parsed.current&&typeof parsed.current==="object"?{signalFresh:parsed.current.signalFresh??null,signalAgeMinutes:parsed.current.signalAgeMinutes??null,hasCredits:parsed.current.hasCredits??null}:null;console.log(JSON.stringify({outcome:"needs-human",usable_accounts:{status:current,expiry:"not exposed by a read-only command"},result:{status:"needs-human",reason:"credential expiry cannot be verified without refresh"},evidence:{command:["eln",...args].join(" "),exitCode:p.exitCode,observedKeys:parsed&&typeof parsed==="object"?Object.keys(parsed):[]}}))'
+  timeout_ms: 30000

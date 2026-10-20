@@ -13,7 +13,7 @@
  *   main-sync          → rebase-regate            리베이스(MERGE-INTENT-RESOLVE 의도 해석) 뒤 재게이트
  *   pod-died           → resume-from-salvage      `salvage/run-<6hex>/<leaf>` 가지에서 resume(DRAFT-NOT-ARCHIVE)
  *   evidence-uncovered → derive-evidence-rejudge  런 출력·시험·배선에서 증거를 끌어내 1회 재판정
- *   review-repeat · review-out-of-scope · fabric · launch-failed · gate-failed · unclassified → needs-owner(새 라운드 없음)
+ *   review-repeat · review-out-of-scope · scope-escape · fabric · launch-failed · gate-failed · unclassified → needs-owner(새 라운드 없음)
  *
  * 사다리의 «출처»: `graphs/overlays/stop-heal-ladder.yaml` 이 갈래마다 처방 노드(id = 처방 이름)를 선언한다.
  *    그 갈래에 얹힌 오버레이가 더한 노드 id 가 처방이다(source='graph'). 선언이 없거나 못 읽으면
@@ -50,6 +50,7 @@ export const AUTOHEAL_ACTION_BY_CLASS: Readonly<Record<RunStopClass, AutohealAct
   'evidence-uncovered': 'derive-evidence-rejudge',
   'review-repeat': 'needs-owner',
   'review-out-of-scope': 'needs-owner',
+  'scope-escape': 'needs-owner',
   fabric: 'needs-owner',
   'launch-failed': 'needs-owner',
   'gate-failed': 'needs-owner',
@@ -164,6 +165,12 @@ export interface AutohealDeps {
   writeLedger?: RunLedgerWriter;
   /** 사다리 선언 읽기 — 기본은 활성 템플릿 ⊕ `graphs/overlays`. 던지면 코드 표로 간다. */
   loadLadder?: () => AutohealLadder;
+  /**
+   * 같은 골·칸의 «앞 런» stop 레코드(원장 줄은 `readRunStopRecord` 로 읽는다).
+   * 같은 갈래(class)의 멈춤이 반복되면 자동 재시도를 하지 않고 사유를 골 되먹임 대상으로 넘긴다.
+   * 안 주면 지금과 똑같이 동작한다.
+   */
+  priorStops?: readonly RunStopRecord[];
 }
 
 /**
@@ -184,6 +191,15 @@ export function autohealAlreadyAttempted(ledger: readonly RunLedgerEntry[] | nul
   return ledger.some((e) => e.event === AUTOHEAL_EVENT && e.data?.class === cls && e.data?.mode === mode);
 }
 
+/**
+ * 반복 멈춤 가드 — 앞 런의 stop 레코드 중 같은 갈래(class)가 `threshold` 이상이면 참.
+ * 같은 골에서 같은 갈래가 반복되면 자동 재시도를 끊고 사유를 골 되먹임 대상으로 넘긴다.
+ */
+export function repeatedStop(prior: readonly RunStopRecord[] | undefined, record: RunStopRecord, threshold = 2): boolean {
+  if (!prior) return false;
+  return prior.filter((p) => p.class === record.class).length >= threshold;
+}
+
 function observe(event: string, data: Record<string, unknown>): void {
   try { debug.log('self-implement.autoheal', event, data); } catch { /* observation is fail-soft */ }
 }
@@ -196,6 +212,14 @@ export async function autohealFromStop(ctx: AutohealContext, deps: AutohealDeps 
   const cls = ctx.record.class;
   const { action, source, overlayId } = pickAutohealAction(cls, deps.loadLadder);
   const base = { runId: ctx.runId, class: cls, action, source, ...(overlayId ? { overlayId } : {}), mode };
+
+  if (repeatedStop(deps.priorStops, ctx.record)) {
+    // ⛔ 같은 골에서 같은 갈래의 멈춤이 반복되면 자동 재시도를 하지 않는다 — 사유를 골 되먹임 대상으로 넘긴다.
+    const n = deps.priorStops!.filter((p) => p.class === cls).length;
+    const reason = `repeat-stop: ${cls} ×${n} — feed back to goal: ${ctx.record.cause}`;
+    observe('repeat-stop', { ...base, reason });
+    return { ...base, outcome: 'needs-owner', reason };
+  }
 
   let ledger: readonly RunLedgerEntry[] | null = null;
   try {

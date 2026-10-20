@@ -1,11 +1,11 @@
 import { expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { conflictResolvePrompt, defaultLlmResolve, DEFAULT_MERGE_CONFLICT_INPUT_MAX_CHARS, INFLIGHT_DATA_BEGIN, INFLIGHT_DATA_END, NEUTRALIZED_LINE } from '../autopilot/build/llm-conflict-merge.js';
 import { handTask } from '../task-agent/task-hand.js';
-import { INFLIGHT_FILES_MAX, INFLIGHT_INTENT_MAX_CHARS, INFLIGHT_REGISTRY_FILE, listInflight, registerInflight, removeInflight, removeInflightForPr, type InflightEntry } from './inflight-registry.js';
+import { gcInflight, INFLIGHT_FILES_MAX, INFLIGHT_GC_TTL_MS, INFLIGHT_INTENT_MAX_CHARS, INFLIGHT_REGISTRY_FILE, listInflight, registerInflight, removeInflight, removeInflightForClosedPrs, removeInflightForFinishedRuns, removeInflightForPr, type InflightEntry } from './inflight-registry.js';
 
 const registry = (): string => join(mkdtempSync(join(tmpdir(), 'inflight-')), INFLIGHT_REGISTRY_FILE);
 const at = (iso: string) => () => new Date(iso);
@@ -50,9 +50,9 @@ test('48h 지난 줄은 읽을 때 안 보이고 쓸 때 걷힌다', async () =>
   registerInflight({ runId: 'new', cell: 'NEW', intent: 'new', files: ['src/x.ts'] }, { path, now: at('2026-10-16T12:00:00Z') });
   const later = at('2026-10-17T00:00:01Z');
   const readEvents = await captured(() => { expect(listInflight({ files: ['src/x.ts'] }, { path, now: later }).map((entry) => entry.runId)).toEqual(['new']); });
-  expect(readEvents).toContainEqual(expect.objectContaining({ event: 'expire', data: { phase: 'read', count: 1 } }));
+  expect(readEvents).toContainEqual(expect.objectContaining({ event: 'expire', data: expect.objectContaining({ phase: 'read', count: 1 }) }));
   const writeEvents = await captured(() => registerInflight({ runId: 'n2', cell: 'N2', intent: 'n2', files: [] }, { path, now: later }));
-  expect(writeEvents).toContainEqual(expect.objectContaining({ event: 'expire', data: { phase: 'write', runIds: ['old'] } }));
+  expect(writeEvents).toContainEqual(expect.objectContaining({ event: 'expire', data: expect.objectContaining({ phase: 'write', runIds: ['old'] }) }));
   const disk = JSON.parse(readFileSync(path, 'utf8')) as { entries: InflightEntry[] };
   expect(disk.entries.map((entry) => entry.runId)).toEqual(['new', 'n2']);
 });
@@ -132,7 +132,7 @@ test('defaultLlmResolve 는 등록부 조회 결과를 실제 LLM 프롬프트�
 
 test('handTask --live 발사는 카드 옆 등록부에 runId·칸·의도·대상 파일 한 줄을 남긴다', async () => {
   const statePath = join(mkdtempSync(join(tmpdir(), 'inflight-hand-')), 'task-agent-actions.json');
-  const text = '대상 경로: src/autopilot/build/llm-conflict-merge.ts · src/pr-tool/inflight-registry.ts\n비행 중 의도를 머지 프롬프트에 넣는다.';
+  const text = '대상 경로: src/autopilot/build/llm-conflict-merge.ts · src/pr-tool/inflight-registry.ts\n비행 중 의도를 머지 프롬프트에 넣는다.\n완료 경계 코드: src/pr-tool/inflight-registry.ts 의 등록 행\n완료 경계 실물: 카드의 실행 의도가 등록부에 남는다\n완료 경계 증거 명령: bun test src/pr-tool/inflight-registry.test.ts';
   const result = await handTask({ text, seat: 'UX', checklistId: 'INFLIGHT-REGISTRY', statePath, live: true,
     prelaunchInspector: () => ({ reason: 'no-candidate' }) as never, launcher: (_args, _cwd, context) => ({ runId: context!.runId }) });
   const entries = listInflight({ files: ['src/pr-tool/inflight-registry.ts'] }, { path: join(dirname(statePath), INFLIGHT_REGISTRY_FILE) });
@@ -141,4 +141,115 @@ test('handTask --live 발사는 카드 옆 등록부에 runId·칸·의도·대�
     intent: '비행 중 의도를 머지 프롬프트에 넣는다.',
     files: ['src/autopilot/build/llm-conflict-merge.ts', 'src/pr-tool/inflight-registry.ts'],
   })]);
+});
+
+test('GC: 열림·닫힘·7h 경과 세 줄을 넣으면 열린 줄 하나만 남는다', async () => {
+  const path = registry();
+  const now = at('2026-10-17T00:00:00Z');
+  registerInflight({ runId: 'run-open', cell: 'C-OPEN', intent: '열린 PR', files: ['src/a.ts'], cardId: 'ta-open' }, { path, now });
+  registerInflight({ runId: 'run-closed', cell: 'C-CLOSED', intent: '닫힌 PR', files: ['src/b.ts'], cardId: 'ta-closed' }, { path, now });
+  registerInflight({ runId: 'run-stale', cell: 'C-STALE', intent: '7h 경과', files: ['src/c.ts'], cardId: 'ta-stale' }, { path, now: at('2026-10-16T17:00:00Z') });
+  expect(listInflight({}, { path, now }).map((entry) => entry.runId)).toEqual(['run-open', 'run-closed', 'run-stale']);
+
+  let removed: string[] = [];
+  let kept = -1;
+  const events = await captured(() => {
+    const result = gcInflight({
+      path,
+      now,
+      cards: [
+        { id: 'ta-open', pr: { number: 10, state: 'OPEN' } },
+        { id: 'ta-closed', pr: { number: 11, state: 'CLOSED' } },
+        { id: 'ta-stale', pr: { number: 12, state: 'OPEN' } },
+      ],
+    });
+    removed = result.removed.map(({ entry, reason }) => `${entry.runId}:${reason}`);
+    kept = result.kept;
+  });
+  expect(removed).toEqual(['run-closed:closed-pr', 'run-stale:expired']);
+  expect(kept).toBe(1);
+  expect(events).toContainEqual(expect.objectContaining({ event: 'gc', data: expect.objectContaining({ kept: 1 }) }));
+  expect(listInflight({}, { path, now }).map((entry) => entry.runId)).toEqual(['run-open']);
+  const disk = JSON.parse(readFileSync(path, 'utf8')) as { entries: InflightEntry[] };
+  expect(disk.entries.map((entry) => entry.runId)).toEqual(['run-open']);
+});
+
+test('GC 시한은 6h — 5h59m 은 남고 6h0m1s 는 걷힌다', () => {
+  expect(INFLIGHT_GC_TTL_MS).toBe(6 * 60 * 60 * 1000);
+  const path = registry();
+  const now = at('2026-10-17T00:00:00Z');
+  registerInflight({ runId: 'run-within', cell: 'C-W', intent: 'i', files: ['a.ts'] }, { path, now: at('2026-10-16T18:00:01Z') });
+  registerInflight({ runId: 'run-over', cell: 'C-O', intent: 'i', files: ['a.ts'] }, { path, now: at('2026-10-16T17:59:59Z') });
+  const result = gcInflight({ path, now });
+  expect(result.removed.map(({ entry, reason }) => [entry.runId, reason])).toEqual([['run-over', 'expired']]);
+  expect(result.kept).toBe(1);
+  expect(listInflight({}, { path, now }).map((entry) => entry.runId)).toEqual(['run-within']);
+});
+
+test('GC: 끝난 런과 closedPrs 번호로도 걷는다(카드에 닫힘 상태가 없어도)', () => {
+  const path = registry();
+  const now = at('2026-10-17T00:00:00Z');
+  registerInflight({ runId: 'run-finished', cell: 'C-F', intent: 'i', files: ['a.ts'], cardId: 'ta-f' }, { path, now });
+  registerInflight({ runId: 'run-closed', cell: 'C-C', intent: 'i', files: ['a.ts'], cardId: 'ta-c' }, { path, now });
+  registerInflight({ runId: 'run-keep', cell: 'C-K', intent: 'i', files: ['a.ts'], cardId: 'ta-k' }, { path, now });
+  const result = gcInflight({ path, now, finishedRuns: ['run-finished'], closedPrs: [21], cards: [{ id: 'ta-c', pr: 21 }, { id: 'ta-k', pr: 22 }] });
+  expect(result.removed.map(({ entry, reason }) => [entry.runId, reason])).toEqual([['run-finished', 'finished-run'], ['run-closed', 'closed-pr']]);
+  expect(result.kept).toBe(1);
+  expect(listInflight({}, { path, now }).map((entry) => entry.runId)).toEqual(['run-keep']);
+});
+
+test('런 종료: 끝난 런의 줄만 지운다(카드가 없어도 runId 로 걷는다)', () => {
+  const path = registry();
+  const now = at('2026-10-17T00:00:00Z');
+  registerInflight({ runId: 'run-live', cell: 'C-L', intent: 'i', files: ['a.ts'] }, { path, now });
+  registerInflight({ runId: 'run-done', cell: 'C-D', intent: 'i', files: ['a.ts'] }, { path, now });
+  registerInflight({ runId: 'run-cancelled', cell: 'C-X', intent: 'i', files: ['a.ts'] }, { path, now });
+  expect(removeInflightForFinishedRuns(['run-done', 'run-cancelled'], { path, now })).toBe(2);
+  expect(listInflight({}, { path, now }).map((entry) => entry.runId)).toEqual(['run-live']);
+  const untouched = registry();
+  expect(removeInflightForFinishedRuns([], { path: untouched })).toBe(0);
+  expect(removeInflightForFinishedRuns(['run-nowhere'], { path: untouched })).toBe(0);
+  expect(existsSync(untouched)).toBe(false);
+});
+
+test('PR 닫힘: 닫힌 PR 카드의 줄만 지운다 — 열린 PR 카드·카드 없는 줄은 남는다', () => {
+  const path = registry();
+  const now = at('2026-10-17T00:00:00Z');
+  registerInflight({ runId: 'run-a', cell: 'C1', intent: 'i', files: ['a.ts'], cardId: 'ta-1' }, { path, now });
+  registerInflight({ runId: 'run-b', cell: 'C2', intent: 'i', files: ['a.ts'], cardId: 'ta-2' }, { path, now });
+  registerInflight({ runId: 'run-c', cell: 'C3', intent: 'i', files: ['a.ts'] }, { path, now });
+  expect(removeInflightForClosedPrs([11], [{ id: 'ta-1', pr: { number: 11, state: 'CLOSED' } }, { id: 'ta-2', pr: { number: 12, state: 'OPEN' } }], { path, now })).toBe(1);
+  expect(listInflight({}, { path, now }).map((entry) => entry.runId)).toEqual(['run-b', 'run-c']);
+  const untouched = registry();
+  expect(removeInflightForClosedPrs([99], [{ id: 'ta-9', pr: { number: 98, state: 'OPEN' } }], { path: untouched })).toBe(0);
+  expect(existsSync(untouched)).toBe(false);
+});
+
+test('PR 머지: MERGED 상태 카드의 등록부 줄도 즉시 걷는다', () => {
+  const path = registry();
+  const now = at('2026-10-17T00:00:00Z');
+  registerInflight({ runId: 'run-merged', cell: 'C-M', intent: 'i', files: ['a.ts'], cardId: 'ta-m' }, { path, now });
+  registerInflight({ runId: 'run-open', cell: 'C-O', intent: 'i', files: ['a.ts'], cardId: 'ta-o' }, { path, now });
+  expect(removeInflightForClosedPrs([], [
+    { id: 'ta-m', pr: { number: 31, state: 'MERGED' } },
+    { id: 'ta-o', pr: { number: 32, state: 'OPEN' } },
+  ], { path, now })).toBe(1);
+  expect(listInflight({}, { path, now }).map((entry) => entry.runId)).toEqual(['run-open']);
+});
+
+test('쓰기는 임시 파일 → rename — tmp 를 남기지 않고 등록부를 통째로 갈아끼운다', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'inflight-atomic-'));
+  const path = join(dir, INFLIGHT_REGISTRY_FILE);
+  const now = at('2026-10-17T00:00:00Z');
+  registerInflight({ runId: 'run-a', cell: 'C-A', intent: 'i', files: ['a.ts'] }, { path, now });
+  const first = statSync(path).ino;
+  registerInflight({ runId: 'run-b', cell: 'C-B', intent: 'i', files: ['a.ts', 'b.ts'] }, { path, now });
+  expect(statSync(path).ino).not.toBe(first);
+  expect(readdirSync(dir)).toEqual([INFLIGHT_REGISTRY_FILE]);
+  expect(JSON.parse(readFileSync(path, 'utf8')) as { entries: InflightEntry[] }).toEqual({ entries: [
+    { runId: 'run-a', cell: 'C-A', intent: 'i', files: ['a.ts'], registeredAt: '2026-10-17T00:00:00.000Z' },
+    { runId: 'run-b', cell: 'C-B', intent: 'i', files: ['a.ts', 'b.ts'], registeredAt: '2026-10-17T00:00:00.000Z' },
+  ] });
+  gcInflight({ path, now, finishedRuns: ['run-a'] });
+  expect(readdirSync(dir)).toEqual([INFLIGHT_REGISTRY_FILE]);
 });

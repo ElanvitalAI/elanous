@@ -138,47 +138,58 @@ describe('log-store ⓑ 수호자: 설치 sha 보다 옛 판으로 logs.db 를 �
 
   procfsTest('옛 스크립트·새 cwd의 실제 DB 오프너를 스캔해 수호자 경보까지 낸다', async () => {
     const root = mkdtempSync(join(tmpdir(), 'stale-opener-old-script-'));
-    const oldRoot = join(root, 'old');
-    const newRoot = join(root, 'new');
-    mkdirSync(join(oldRoot, '.git'), { recursive: true });
-    mkdirSync(join(newRoot, '.git'), { recursive: true });
-    const repo = join(import.meta.dir, '../../..');
-    const gitOut = (ref: string): string => {
-      const result = Bun.spawnSync(['git', 'rev-parse', ref], { cwd: repo });
-      expect(result.exitCode).toBe(0);
-      return result.stdout.toString().trim();
-    };
-    const oldSha = gitOut('HEAD^');
-    const installedSha = gitOut('HEAD');
-    writeFileSync(join(oldRoot, '.git', 'HEAD'), `${oldSha}\n`);
-    writeFileSync(join(newRoot, '.git', 'HEAD'), `${installedSha}\n`);
-    const script = join(oldRoot, 'hold-db.ts');
-    const dbPath = join(root, 'logs.db');
-    writeFileSync(script, `import { Database } from 'bun:sqlite';\nconst db = new Database(process.env.TEST_DB!);\ndb.run('CREATE TABLE IF NOT EXISTS hold (x)');\nsetInterval(() => void db, 1000);\n`);
-    const { rows, off } = captureStaleOpenerAlerts('stale-opener-old-script-cwd-test');
-    const child = Bun.spawn([process.execPath, script], {
-      cwd: newRoot, env: { ...process.env, TEST_DB: dbPath }, stdout: 'ignore', stderr: 'pipe',
-    });
     try {
-      let opener: LogDbOpenerInfo | undefined;
-      const deadline = Date.now() + 3000;
-      while (Date.now() < deadline) {
-        opener = scanLogDbOpeners(dbPath).find((candidate) => candidate.pid === child.pid);
-        if (opener) break;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-      expect(opener).toBeDefined();
-      expect(opener!.cwd).toBe(newRoot);
-      expect(opener!.revisionSha).toBe(oldSha);
-      const alerts = alertStaleLogDbOpeners(dbPath, {
-        openers: () => scanLogDbOpeners(dbPath), installedAtMs: Date.now() - 10_000,
+      const oldRoot = join(root, 'old');
+      const newRoot = join(root, 'new');
+      const installedRoot = join(root, 'installed');
+      mkdirSync(join(oldRoot, '.git'), { recursive: true });
+      mkdirSync(join(newRoot, '.git'), { recursive: true });
+      mkdirSync(installedRoot);
+      const gitOut = (args: string[]): string => {
+        const result = Bun.spawnSync(['git', '-C', installedRoot, ...args]);
+        expect(result.exitCode, result.stderr.toString()).toBe(0);
+        return result.stdout.toString().trim();
+      };
+      gitOut(['init', '-q']);
+      writeFileSync(join(installedRoot, 'revision.txt'), 'old\n');
+      gitOut(['add', 'revision.txt']);
+      gitOut(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-qm', 'old']);
+      const oldSha = gitOut(['rev-parse', 'HEAD']);
+      writeFileSync(join(installedRoot, 'revision.txt'), 'new\n');
+      gitOut(['add', 'revision.txt']);
+      gitOut(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-qm', 'new']);
+      const installedSha = gitOut(['rev-parse', 'HEAD']);
+      writeFileSync(join(oldRoot, '.git', 'HEAD'), `${oldSha}\n`);
+      writeFileSync(join(newRoot, '.git', 'HEAD'), `${installedSha}\n`);
+      const script = join(oldRoot, 'hold-db.ts');
+      const dbPath = join(root, 'logs.db');
+      writeFileSync(script, `import { Database } from 'bun:sqlite';\nconst db = new Database(process.env.TEST_DB!);\ndb.run('CREATE TABLE IF NOT EXISTS hold (x)');\nsetInterval(() => void db, 1000);\n`);
+      const { rows, off } = captureStaleOpenerAlerts('stale-opener-old-script-cwd-test');
+      const child = Bun.spawn([process.execPath, script], {
+        cwd: newRoot, env: { ...process.env, TEST_DB: dbPath }, stdout: 'ignore', stderr: 'pipe',
       });
-      expect(alerts.some((alert) => alert.pid === child.pid)).toBeTrue();
-      expect(rows.some((row) => row.data.pid === child.pid && row.data.openerSha === oldSha)).toBeTrue();
+      try {
+        let opener: LogDbOpenerInfo | undefined;
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+          opener = scanLogDbOpeners(dbPath).find((candidate) => candidate.pid === child.pid);
+          if (opener) break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(opener).toBeDefined();
+        expect(opener!.cwd).toBe(newRoot);
+        expect(opener!.revisionSha).toBe(oldSha);
+        const alerts = alertStaleLogDbOpeners(dbPath, {
+          openers: () => scanLogDbOpeners(dbPath), installedAtMs: Date.now() - 10_000, installedRoot,
+        });
+        expect(alerts.some((alert) => alert.pid === child.pid)).toBeTrue();
+        expect(rows.some((row) => row.data.pid === child.pid && row.data.openerSha === oldSha)).toBeTrue();
+      } finally {
+        child.kill('SIGKILL');
+        await child.exited;
+        off();
+      }
     } finally {
-      child.kill('SIGKILL');
-      await child.exited;
-      off();
       rmSync(root, { recursive: true, force: true });
     }
   });

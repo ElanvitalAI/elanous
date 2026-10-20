@@ -1,6 +1,10 @@
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { ORCHESTRATOR_DEFAULTS, type OrchestratorSeat } from '../user-config.js';
+import { debug } from '../debug/log.js';
 import type { ChecklistItem } from '../release-loop/checklist.js';
 import type { TrafficCell, TrafficProcess, TrafficResult, TrafficSeatRow } from './orchestrator/traffic.js';
+import { withFileLockSync } from '../storage/file-lock.js';
 
 const RESOURCE_SEATS: readonly OrchestratorSeat[] = ['OP', 'TC', 'MK', 'UX'];
 
@@ -276,4 +280,95 @@ export function budgetTrafficTick({ processes, now, caps, lastLaunchAt, idleSinc
     if (!row.idle && !retainQueuedCells) row.nextCell = null;
   }
   return { seats, unassigned: launches.filter(process => process.seat === null).length, now, idleMinutes };
+}
+
+/** A tick's seat rows as observed: one journal line per tick, kept for the 24h metrics only. */
+export type TrafficTickSample = { at: string; seats: readonly TrafficSeatRow[] };
+
+export interface TrafficSampleDeps {
+  log?: (category: string, event: string, data: Record<string, unknown>) => void;
+}
+
+/** Observation-only journal for 24h metrics: never read for launch decisions. A failure to record costs one metrics sample, never the tick itself. */
+export function recordTrafficSample24h(root: string, sample: TrafficTickSample,
+  deps: TrafficSampleDeps = {}): void {
+  const log = deps.log ?? debug.log.bind(debug);
+  const path = join(root, 'orchestrator', 'traffic-samples-24h.jsonl');
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    withFileLockSync(`${path}.lock`, () => {
+      // A torn final line has no newline; separate it from the next valid JSONL row.
+      const previous = existsSync(path) ? readFileSync(path, 'utf8') : '';
+      const separator = previous === '' || previous.endsWith('\n') ? '' : '\n';
+      appendFileSync(path, `${separator}${JSON.stringify(sample)}\n`);
+    });
+    log('loop.orchestrator', 'traffic-sample-24h', { at: sample.at, path });
+  } catch (error) {
+    try { log('loop.orchestrator', 'traffic-sample-24h-failed', { error: String(error).slice(0, 200) }); }
+    catch { /* Observation cannot change a recorded decision. */ }
+  }
+}
+
+/** Read the 24h sample journal; torn lines are skipped (same rule as the dispatch ledger). */
+export function readTrafficSamples24h(root: string, now: Date, windowMinutes = 1440): TrafficTickSample[] {
+  const path = join(root, 'orchestrator', 'traffic-samples-24h.jsonl');
+  if (!existsSync(path)) return [];
+  const floor = now.getTime() - windowMinutes * 60_000;
+  return readFileSync(path, 'utf8').split('\n').flatMap(line => {
+    if (!line.trim()) return [];
+    try {
+      const parsed = JSON.parse(line) as TrafficTickSample;
+      const at = Date.parse(parsed.at);
+      if (!Number.isFinite(at) || at < floor || at > now.getTime() || !Array.isArray(parsed.seats)) return [];
+      return [parsed];
+    } catch { return []; }
+  });
+}
+
+export type TrafficMetrics24h = {
+  /** Occupied share of the observed slot budget over all ticks (Σrunning / Σcap). */
+  utilizationRate: number;
+  running: number;
+  capacity: number;
+  /** Mean minutes an idle, empty seat has waited for its next launch; null when no waits were observed. */
+  meanWaitMinutes: number | null;
+  waitSamples: number;
+  /** Seat-ticks where a seat ran on borrowed share — its own base share could not keep it. */
+  preemptedSeatTicks: number;
+  sampledTicks: number;
+  windowMinutes: number;
+  firstSampleAt: string | null;
+  lastSampleAt: string | null;
+};
+
+/** Aggregate the 24h traffic metrics from the observation journal. Pure over the given samples. */
+export function computeTrafficMetrics24h(samples: readonly TrafficTickSample[], windowMinutes = 1440): TrafficMetrics24h {
+  let running = 0;
+  let capacity = 0;
+  let waitSum = 0;
+  let waitSamples = 0;
+  let preemptedSeatTicks = 0;
+  for (const sample of samples) {
+    for (const row of sample.seats) {
+      running += row.running;
+      capacity += row.cap;
+      if (row.borrowed > 0) preemptedSeatTicks++;
+      if (row.idleFor !== null && row.idleFor > 0) {
+        waitSum += row.idleFor;
+        waitSamples++;
+      }
+    }
+  }
+  return {
+    utilizationRate: capacity > 0 ? Math.round((running / capacity) * 1000) / 1000 : 0,
+    running,
+    capacity,
+    meanWaitMinutes: waitSamples > 0 ? Math.round((waitSum / waitSamples) * 10) / 10 : null,
+    waitSamples,
+    preemptedSeatTicks,
+    sampledTicks: samples.length,
+    windowMinutes,
+    firstSampleAt: samples[0]?.at ?? null,
+    lastSampleAt: samples.at(-1)?.at ?? null,
+  };
 }

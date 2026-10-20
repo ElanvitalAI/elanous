@@ -1,16 +1,15 @@
-// Phase 1 (PLAN-config-unification-elanous-root-2026-05-10) ·
-// `userConfigPath()` redirect behavior:
-//   - XDG_CONFIG_HOME explicit → legacy XDG path (back-compat for Phase 6 deprecation window + test isolation)
-//   - else → NEXUS canonical helper (~/.elanous/config.json · honors setElanousConfigDir)
+// Config path precedence (OP 2026-10-18): explicit config dir > selected state root >
+// legacy XDG_CONFIG_HOME > default. XDG-only callers keep the legacy path.
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir, homedir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { userConfigPath } from '../src/user-config';
 import { userConfigPath as nexusUserConfigPath } from '../src/nexus/config/paths';
 import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../src/instance/resolve.js';
+
 
 const prevXdg = process.env.XDG_CONFIG_HOME;
 
@@ -43,15 +42,22 @@ describe('userConfigPath · Phase 1 redirect', () => {
     expect(userConfigPath()).toBe(nexusUserConfigPath());
   });
 
-  test('XDG_CONFIG_HOME explicit → legacy XDG path (back-compat)', () => {
+  test('XDG-only caller retains legacy path when no state root is selected', () => {
     process.env.XDG_CONFIG_HOME = tmpRoot;
-    expect(userConfigPath()).toBe(join(tmpRoot, 'elanous', 'config.json'));
+    const selectedStateDir = process.env.ELANOUS_STATE_DIR;
+    delete process.env.ELANOUS_STATE_DIR;
+    try {
+      expect(userConfigPath()).toBe(join(tmpRoot, 'elanous', 'config.json'));
+    } finally {
+      if (selectedStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = selectedStateDir;
+    }
   });
 
-  test('XDG_CONFIG_HOME wins over setElanousConfigDir for Path A reads', () => {
+  test('explicit config dir wins over legacy XDG for Path A reads', () => {
     process.env.XDG_CONFIG_HOME = tmpRoot;
     setElanousConfigDir(join(tmpRoot, 'daemon-dir'));
-    expect(userConfigPath()).toBe(join(tmpRoot, 'elanous', 'config.json'));
+    expect(userConfigPath()).toBe(join(tmpRoot, 'daemon-dir', 'config.json'));
   });
 
   test('empty XDG_CONFIG_HOME falls through to NEXUS helper', () => {

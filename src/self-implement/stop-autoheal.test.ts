@@ -6,6 +6,7 @@ import type { RunLedgerEntry } from './run-ledger.js';
 import { RUN_STOP_CLASSES, type RunStopClass, type RunStopRecord } from './run-stop.js';
 import {
   AUTOHEAL_ACTION_BY_CLASS, AUTOHEAL_EVENT, autohealAlreadyAttempted, autohealFromStop, parseAutohealMode,
+  repeatedStop,
   pickAutohealAction, resetAutohealProcessMemory, type AutohealAction, type AutohealActions, type AutohealLadder,
 } from './stop-autoheal.js';
 
@@ -39,6 +40,7 @@ const EXPECTED: Record<RunStopClass, AutohealAction> = {
   'evidence-uncovered': 'derive-evidence-rejudge',
   'review-repeat': 'needs-owner',
   'review-out-of-scope': 'needs-owner',
+  'scope-escape': 'needs-owner',
   fabric: 'needs-owner',
   'launch-failed': 'needs-owner',
   'gate-failed': 'needs-owner',
@@ -187,6 +189,41 @@ function ladderFromDisk(): AutohealLadder {
     overlays: loadGraphOverlays(defaultOverlaysDir()).overlays.filter((overlay) => overlay.overlayId.startsWith('stop-heal-ladder-')),
   };
 }
+
+describe('STOP-AUTOHEAL repeat-stop guard', () => {
+  test('repeatedStop: same class in priorStops reaches the threshold; absent prior is false', () => {
+    const prior: RunStopRecord[] = [record('env-unrelated'), record('env-unrelated'), record('main-sync')];
+    expect(repeatedStop(prior, record('env-unrelated'))).toBe(true);
+    expect(repeatedStop(prior, record('main-sync'))).toBe(false);
+    expect(repeatedStop([record('main-sync')], record('main-sync'))).toBe(false);
+    expect(repeatedStop([record('main-sync')], record('main-sync'), 1)).toBe(true);
+    expect(repeatedStop(undefined, record('env-unrelated'))).toBe(false);
+  });
+
+  test('2 same-class priorStops → live mode makes 0 action-seam calls, outcome needs-owner, reason repeat-stop', async () => {
+    const led = memLedger();
+    const spy = spyActions();
+    const priorStops: readonly RunStopRecord[] = [record('env-unrelated'), record('env-unrelated')];
+    const res = await autohealFromStop(
+      { runId: 'r1', record: record('env-unrelated') },
+      { mode: 'live', actions: spy.actions, priorStops, ...led },
+    );
+    expect(spy.calls).toEqual([]);
+    expect(res.outcome).toBe('needs-owner');
+    expect(res.reason!.startsWith('repeat-stop:')).toBe(true);
+    expect(res.reason).toContain('env-unrelated ×2');
+    expect(res.reason).toContain(`feed back to goal: stopped: env-unrelated`);
+    expect(led.entries).toEqual([]);
+  });
+
+  test('absent priorStops preserves existing behavior', async () => {
+    const led = memLedger();
+    const spy = spyActions();
+    const res = await autohealFromStop({ runId: 'r1', record: record('env-unrelated') }, { mode: 'live', actions: spy.actions, ...led });
+    expect(res.outcome).toBe('healed');
+    expect(spy.calls).toEqual(['clean-workspace-regate']);
+  });
+});
 
 describe('STOP-AUTOHEAL ladder declaration (graphs/overlays/stop-heal-ladder.yaml)', () => {
   test('every stop class picks the same action from the overlay as from the code table', async () => {

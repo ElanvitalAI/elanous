@@ -137,6 +137,28 @@ export interface GateExecutorOverride {
   previous: { gateExecutor: unknown; gateRemote: unknown };
 }
 
+/** RESUME-GATE-POOL-OVERRIDE — replace the saved pool for a gate that will be re-run. */
+export interface GatePodPoolOverride {
+  kind: 'gate-pod-pool';
+  at: string;
+  from: string;
+  set: { gatePodPool: string };
+  previous: { gatePodPool: unknown };
+}
+
+export function releaseResumeGatePodPool(state: GraphRunState, opts: { from: string; pool: unknown; at?: string }): GatePodPoolOverride {
+  const input = state.input;
+  if (!input || typeof input !== 'object' || Array.isArray(input) || typeof (input as { version?: unknown }).version !== 'string') throw new Error('release run has no input');
+  if (typeof opts.pool !== 'string' || !opts.pool.trim()) throw new Error('--gate-pod-pool must not be empty');
+  const start = state.path.indexOf(opts.from);
+  if (start < 0) throw new Error(`--from ${opts.from} is not a node on the saved path`);
+  const gate = state.path.indexOf('gate');
+  if (gate >= 0 && start > gate) throw new Error('--gate-pod-pool needs a resume that re-runs gate (--from gate or earlier)');
+  const saved = input as { gatePodPool?: unknown };
+  return { kind: 'gate-pod-pool', at: opts.at ?? new Date().toISOString(), from: opts.from,
+    set: { gatePodPool: opts.pool.trim() }, previous: { gatePodPool: saved.gatePodPool ?? null } };
+}
+
 /**
  * Switch the gate executor of a resumed release run. Not a waiver: the gate node runs again (the restart must be at or
  * before gate) and produces a normal verdict; only where its sweep runs changes.
@@ -156,7 +178,8 @@ export function releaseResumeGateExecutor(state: GraphRunState, opts: { from: st
   // A restart after gate keeps the recorded verdict — switching its executor there would record a choice nothing used.
   if (gate >= 0 && start > gate) throw new Error('--gate-executor needs a resume that re-runs gate (--from gate or earlier)');
   // Back to pod: restore the gateRemote the run started with (an earlier host override replaced it).
-  const firstHost = choice.executor === 'pod' ? state.inputOverrides?.find((item) => item.kind === 'gate-executor' && item.set.gateRemote !== undefined) : undefined;
+  const firstHost = choice.executor === 'pod' ? state.inputOverrides?.find((item): item is GateExecutorOverride =>
+    item.kind === 'gate-executor' && item.set.gateRemote !== undefined) : undefined;
   const restored = firstHost ? firstHost.previous.gateRemote : undefined;
   return {
     kind: 'gate-executor', at: opts.at ?? new Date().toISOString(), from: opts.from,

@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import {
   canonicalGraphJson, edgeMapOf, graphVersionHash, loadGraphTemplates, parseGraphTemplateYaml,
   type GraphNodeKind, type GraphTemplateSpec,
@@ -13,6 +15,43 @@ import { PIPELINE_EDGES_BY_NODE, TERMINAL_STAGES_BY_NODE } from './pipeline-shap
 const GRAPHS_DIR = join(import.meta.dir, '../../graphs');
 
 describe('RFC §5 0단계 — YAML 파서', () => {
+  test('ARG L1 when/skip_when은 오버레이 조건 문법으로 읽고 필수 노드 건너뛰기는 거절한다', () => {
+    const source = `graph_id: t
+version: 1
+entry_node: a
+terminal_nodes: [done]
+nodes:
+  - { node_id: a, kind: agent, recipe: r, max_visits: 1 }
+  - { node_id: optional, kind: agent, recipe: r, max_visits: 1, skip_when: 'substrate == local' }
+  - { node_id: done, kind: git, recipe: r, max_visits: 1 }
+edges:
+  - { from: a, to: optional, when: 'substrate == pod' }
+  - { from: a, to: done }
+  - { from: optional, to: done }
+`;
+    const valid = parseGraphTemplateYaml(source, 'l1.yaml');
+    expect(valid.errors).toEqual([]);
+    expect(valid.template?.nodes[1]?.skipWhen).toBe('substrate == local');
+    expect(valid.template?.edges[0]?.when).toBe('substrate == pod');
+    const branchingSkip = source.replace('  - { from: optional, to: done }',
+      "  - { from: optional, to: done }\n  - { from: optional, to: done, when: 'machines >= 1' }");
+    expect(parseGraphTemplateYaml(branchingSkip).errors)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ path: '<inline>/nodes/optional/skip_when' })]));
+    const fallbackSkip = source.replace('  - { from: optional, to: done }',
+      '  - { from: optional, to: done, fallback: [{ node: a, requires: [probe] }] }');
+    expect(parseGraphTemplateYaml(fallbackSkip).errors)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ path: '<inline>/nodes/optional/skip_when' })]));
+    const protectedWhen = source.replace('from: a, to: optional, when:', 'from: done, to: optional, when:');
+    expect(parseGraphTemplateYaml(protectedWhen).errors)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ path: '<inline>/edges/0/when' })]));
+    expect(parseGraphTemplateYaml(source.replace('substrate == pod', 'substrate && pod')).errors)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ path: '<inline>/edges/0/when' })]));
+    for (const id of ['gate', 'review', 'merge']) {
+      const protectedSource = source.replaceAll('optional', id);
+      expect(parseGraphTemplateYaml(protectedSource).errors)
+        .toEqual(expect.arrayContaining([expect.objectContaining({ path: '<inline>/nodes/1/skip_when' })]));
+    }
+  });
   test('새 종류 observe·hitl·subgraph 를 받으며 알 수 없는 종류는 거절한다', () => {
     for (const kind of ['observe', 'hitl', 'subgraph'] satisfies GraphNodeKind[]) {
       const result = parseGraphTemplateYaml(`
@@ -168,6 +207,18 @@ edges: []
 });
 
 describe('RFC §5 0단계 — 로더 (⛔ 뿌리를 «인자»로)', () => {
+  test('루트 명령 recipes.yaml은 그래프로 파싱하거나 분모에 세지 않는다', () => {
+    const root = mkdtempSync(join(tmpdir(), 'graph-loader-recipes-'));
+    try {
+      writeFileSync(join(root, 'one.yaml'), 'graph_id: one\nversion: 1\nentry_node: done\nterminal_nodes: [done]\nnodes: [{ node_id: done, kind: gate, recipe: none, max_visits: 1 }]\nedges: []\n');
+      writeFileSync(join(root, 'recipes.yaml'), 'investigate:\n  command: "exit 0"\n');
+      const result = loadGraphTemplates(root);
+      expect(result.errors).toEqual([]);
+      expect(result.scannedFiles).toBe(1);
+      expect(Object.keys(result.templates)).toEqual(['one']);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('실물 graphs/ 를 오류 «0» 으로 읽는다', () => {
     const result = loadGraphTemplates(GRAPHS_DIR);
     expect({ errors: result.errors, scanned: result.scannedFiles > 0 }).toEqual({ errors: [], scanned: true });
@@ -386,5 +437,98 @@ describe('ARG-UNIT-CALL — subgraph unit call parsing', () => {
     const call = doc('{ node_id: a, kind: subgraph, recipe: none, max_visits: 1, call: multi@1, call_entry: b, budget: { inner_steps: 5 }, contract: { inputs: [], outputs: [] } }');
     expect(parseGraphTemplateYaml(call).template?.nodes[0]?.callEntry).toBe('b');
     expect(parseGraphTemplateYaml(call.replace('call_entry: b', 'call_entry: ""')).errors.some(e => e.path === '<inline>/nodes/0/call_entry')).toBe(true);
+  });
+});
+
+describe('LAND-UNIT-TRAIN-POLICY — declared policy schema', () => {
+  const policy = `policy:
+  express: { by: [queueFlag, predecessorOf, multiplierTier, p0InCutWindow2h], waitsForBatch: false, directive: "2026-10-19 · prioritize queued P0s, predecessors, multiplier tier, and near-cut work" }
+  batch: { min: 2, max: 4, groupBy: [area, cellPrefix], maxWaitMin: 30, order: [express, predecessor, enqueued], directive: "2026-10-14 · grouped landing by area and cell prefix" }
+  scenarioPrebuild: { source: [src/ux-sim, scenarios/ux-sim, fake-llm, fake-harness], mock: required, directive: "2026-10-19 · scenario prebuild uses fake LLM and harness inputs" }
+  gate: { oncePerBatch: true, directive: "2026-10-19 · one gate per batch" }
+  land: { perPr: squash, pinnedHead: true, ejectOnFail: true, integrationPr: false, directive: "2026-10-19 · squash each PR at its pinned head and eject failures" }
+`;
+  const graph = (declaration: string) => `${declaration}graph_id: land
+version: 1
+entry_node: enqueue
+terminal_nodes: [done]
+nodes: [{ node_id: enqueue, kind: agent, recipe: none, max_visits: 1 }, { node_id: done, kind: gate, recipe: none, max_visits: 1 }]
+edges: [{ from: enqueue, to: done }]
+`;
+
+  test('accepts the complete policy and preserves per-field directive references', () => {
+    const parsed = parseGraphTemplateYaml(graph(policy), 'land.yaml');
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.template?.policy).toMatchObject({
+      express: { waitsForBatch: false, directive: expect.stringContaining('prioritize') },
+      batch: { min: 2, max: 4, directive: expect.stringContaining('grouped landing') },
+      scenarioPrebuild: { mock: 'required', directive: expect.stringContaining('scenario prebuild') },
+      gate: { oncePerBatch: true, directive: expect.stringContaining('one gate') },
+      land: { perPr: 'squash', pinnedHead: true, ejectOnFail: true, integrationPr: false, directive: expect.stringContaining('squash each PR') },
+    });
+  });
+
+  test('non-land graphs ignore the land-only policy schema', () => {
+    const parsed = parseGraphTemplateYaml(graph(policy).replace('graph_id: land', 'graph_id: other'), 'other.yaml');
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.template?.policy).toBeUndefined();
+  });
+
+  test('rejects invalid values in each policy field', () => {
+    const invalidDeclarations = [
+      ['[queueFlag, predecessorOf, multiplierTier, p0InCutWindow2h]', '[queueFlag, queueFlag, multiplierTier, p0InCutWindow2h]', '/express/by'],
+      ['waitsForBatch: false', 'waitsForBatch: true', '/express/waitsForBatch'],
+      ['[area, cellPrefix]', '[area, area]', '/batch/groupBy'],
+      ['maxWaitMin: 30', 'maxWaitMin: 31', '/batch/maxWaitMin'],
+      ['mock: required', 'mock: optional', '/scenarioPrebuild/mock'],
+      ['[src/ux-sim, scenarios/ux-sim, fake-llm, fake-harness]', '[src/ux-sim, src/ux-sim, fake-llm, fake-harness]', '/scenarioPrebuild/source'],
+      ['oncePerBatch: true', 'oncePerBatch: false', '/gate/oncePerBatch'],
+      ['perPr: squash', 'perPr: merge', '/land/perPr'],
+      ['pinnedHead: true', 'pinnedHead: false', '/land/pinnedHead'],
+      ['ejectOnFail: true', 'ejectOnFail: false', '/land/ejectOnFail'],
+      ['integrationPr: false', 'integrationPr: true', '/land/integrationPr'],
+    ] as const;
+    for (const [before, after, path] of invalidDeclarations) {
+      const parsed = parseGraphTemplateYaml(graph(policy.replace(before, after)), 'land.yaml');
+      expect(parsed.errors.some((issue) => issue.path === `land.yaml/policy${path}`)).toBe(true);
+    }
+  });
+
+  test('rejects invalid batch bounds, missing directive links, and undeclared policy keys', () => {
+    const invalidBounds = parseGraphTemplateYaml(graph(policy.replace('min: 2, max: 4', 'min: 1, max: 4')), 'land.yaml');
+    expect(invalidBounds.template).toBeUndefined();
+    expect(invalidBounds.errors.some((issue) => issue.path === 'land.yaml/policy/batch/min')).toBe(true);
+
+    const maxTooHigh = parseGraphTemplateYaml(graph(policy.replace('min: 2, max: 4', 'min: 2, max: 5')), 'land.yaml');
+    expect(maxTooHigh.errors.some((issue) => issue.path === 'land.yaml/policy/batch/max')).toBe(true);
+    const minAfterMax = parseGraphTemplateYaml(graph(policy.replace('min: 2, max: 4', 'min: 4, max: 2')), 'land.yaml');
+    expect(minAfterMax.errors.some((issue) => issue.path === 'land.yaml/policy/batch')).toBe(true);
+    const sameSizeBatch = parseGraphTemplateYaml(graph(policy.replace('min: 2, max: 4', 'min: 3, max: 3')), 'land.yaml');
+    expect(sameSizeBatch.errors.some((issue) => issue.path === 'land.yaml/policy/batch/min')).toBe(true);
+    expect(sameSizeBatch.errors.some((issue) => issue.path === 'land.yaml/policy/batch/max')).toBe(true);
+
+    const missingDirective = parseGraphTemplateYaml(graph(policy.replace(', directive: "2026-10-19 · prioritize queued P0s, predecessors, multiplier tier, and near-cut work"', '')), 'land.yaml');
+    expect(missingDirective.template).toBeUndefined();
+    expect(missingDirective.errors.some((issue) => issue.path === 'land.yaml/policy/express')).toBe(true);
+
+    const invalidDirective = parseGraphTemplateYaml(graph(policy.replace('2026-10-19 · prioritize queued P0s, predecessors, multiplier tier, and near-cut work', '')), 'land.yaml');
+    expect(invalidDirective.template).toBeUndefined();
+    expect(invalidDirective.errors.some((issue) => issue.path === 'land.yaml/policy/express/directive')).toBe(true);
+    const symbolOnlyDirective = parseGraphTemplateYaml(graph(policy.replace('2026-10-19 · prioritize queued P0s, predecessors, multiplier tier, and near-cut work', '---')), 'land.yaml');
+    expect(symbolOnlyDirective.template).toBeUndefined();
+    expect(symbolOnlyDirective.errors.some((issue) => issue.path === 'land.yaml/policy/express/directive')).toBe(true);
+    const separatorOnlyDirective = parseGraphTemplateYaml(graph(policy.replace('2026-10-19 · prioritize queued P0s, predecessors, multiplier tier, and near-cut work', ' · ')), 'land.yaml');
+    expect(separatorOnlyDirective.template).toBeUndefined();
+    expect(separatorOnlyDirective.errors.some((issue) => issue.path === 'land.yaml/policy/express/directive')).toBe(true);
+    const leadingWhitespace = parseGraphTemplateYaml(graph(policy.replace('2026-10-19 · prioritize queued P0s, predecessors, multiplier tier, and near-cut work', '  2026-10-19 queue priority')), 'land.yaml');
+    expect(leadingWhitespace.errors).toEqual([]);
+
+    const unknown = parseGraphTemplateYaml(graph(policy.replace('  gate:', '  surprise: { enabled: true }\n  gate:')), 'land.yaml');
+    expect(unknown.template).toBeUndefined();
+    expect(unknown.errors.some((issue) => issue.path === 'land.yaml/policy')).toBe(true);
+
+    const missingPolicy = parseGraphTemplateYaml(graph(''), 'land.yaml');
+    expect(missingPolicy.template).toBeUndefined();
+    expect(missingPolicy.errors.some((issue) => issue.path === 'land.yaml/policy')).toBe(true);
   });
 });

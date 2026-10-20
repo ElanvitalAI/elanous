@@ -2,6 +2,7 @@ import type { Command } from 'commander';
 import type { LLMProvider } from '../llm.js';
 import { detectProviders, type DetectedProvider } from '../llm/provider-detect.js';
 import { probeProvider, type ProviderProbeResult } from '../llm/provider-probe.js';
+import { openrouterSource } from '../registry/discovery/sources/openrouter.js';
 import {
   getUserConfig, reloadUserConfig, saveUserConfig, userConfigPath,
   type UserConfig,
@@ -20,6 +21,7 @@ export interface LlmDetectDeps {
   config?: () => UserConfig;
   save?: (config: UserConfig) => void;
   output?: (line: string) => void;
+  discoverUpstageModels?: () => Promise<string[] | null>;
 }
 
 export interface LlmDetectResult {
@@ -29,6 +31,15 @@ export interface LlmDetectResult {
   /** Why a selected provider was not written (an explicit llm.provider is never overwritten). */
   notApplied?: string;
   error?: string;
+  /** OpenRouter /models candidates; null means discovery was unavailable, not an empty catalogue. */
+  upstageCandidates?: string[] | null;
+}
+
+async function discoverUpstageModels(): Promise<string[] | null> {
+  const result = await openrouterSource.run({ timeoutMs: 3_000 });
+  if (!result.ok) return null;
+  return result.models.map(({ id }) => id).filter((id) => /^upstage\/[^/]+$/.test(id))
+    .map((id) => `openrouter/${id}`).sort();
 }
 
 /** Discovery alone cannot validate credentials. Only a successful probe can select a provider. */
@@ -76,6 +87,13 @@ export async function runLlmDetect(
     }
   }
 
+  let upstageCandidates: string[] | null | undefined;
+  if (!options.apply && (!options.probe || selected === 'openrouter')
+    && rows.some((row) => row.provider === 'openrouter' && row.available && row.auth === 'apikey')) {
+    try { upstageCandidates = await (deps.discoverUpstageModels ?? discoverUpstageModels)(); }
+    catch { upstageCandidates = null; }
+  }
+
   let applied = false;
   let notApplied: string | undefined;
   const previous = config.llm?.provider ?? 'auto';
@@ -91,7 +109,8 @@ export async function runLlmDetect(
     }
     applied = true;
   }
-  const result: LlmDetectResult = { candidates: rows, selected, applied, ...(notApplied ? { notApplied } : {}) };
+  const result: LlmDetectResult = { candidates: rows, selected, applied,
+    ...(upstageCandidates !== undefined ? { upstageCandidates } : {}), ...(notApplied ? { notApplied } : {}) };
   if (options.json) output(JSON.stringify(result));
   else {
     if (rows.length === 0) output('No LLM providers detected.');
@@ -111,6 +130,9 @@ export async function runLlmDetect(
       }
     }
     if (options.probe && !selected) output('No provider passed the probe; configuration unchanged.');
+    if (upstageCandidates !== undefined) output(upstageCandidates === null
+      ? 'Upstage candidates: catalogue unavailable'
+      : `Upstage candidates: ${upstageCandidates.join(', ') || '(none in OpenRouter /models)'}`);
     if (applied) output(`Applied llm.provider=${selected} — revert: elanous config set llm.provider auto`);
     if (notApplied) output(notApplied);
   }

@@ -8,6 +8,7 @@ import { isAbsolute, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Kubectl } from './self-implement-pod.js';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
+import { debug } from '../../debug/log.js';
 import { parseWarmWorkerReply, type WarmWorkerCommand, type WarmWorkerKey, type WarmWorkerReply } from './pod-warm-worker-protocol.js';
 import type { WarmWorkerOutcome } from './pod-warm-worker-runtime.js';
 
@@ -43,6 +44,8 @@ export interface WarmPodSpec {
   nodeName?: string;
   cutSha: string;
   key: WarmWorkerKey;
+  /** Resident worker tier. A lite Pod is capped at 2 GiB, including each request exec. */
+  memoryLimit?: '2Gi' | '16Gi';
   /** Caller resolves the live host daemon endpoint; no guessed port. */
   hostProbeUrl: string;
   /** Cluster service endpoint to prove production network isolation. */
@@ -187,6 +190,7 @@ function validateSpec(spec: WarmPodSpec): void {
       || normalize(spec.sourceMirrorHostPath) !== spec.sourceMirrorHostPath || !spec.nodeName))
     || !probeValid(spec.hostProbeUrl, 'host.orb.internal')
     || !probeValid(spec.prodProbeUrl, 'core.elanous-prod')
+    || (spec.memoryLimit !== undefined && spec.memoryLimit !== '2Gi' && spec.memoryLimit !== '16Gi')
     || (spec.nodeName !== undefined && !DNS.test(spec.nodeName.replace(/\./g, '-')))) throw new Error('invalid warm Pod spec');
 }
 
@@ -223,9 +227,11 @@ export function warmWorkerPodManifest(spec: WarmPodSpec): Record<string, unknown
           ...(mirror ? [{ name: 'source-mirror', mountPath: '/source-mirror', readOnly: true }] : [])] },
       { name: 'install', image: spec.image, imagePullPolicy: 'IfNotPresent',
         securityContext: { runAsUser: 0, allowPrivilegeEscalation: false },
+        resources: { limits: { memory: spec.memoryLimit ?? '16Gi' }, requests: { memory: '512Mi' } },
         command: ['bun', '-e', WARM_POD_INSTALL],
         volumeMounts: [{ name: 'workspace', mountPath: '/workspace' }] }],
       containers: [{ name: 'worker', image: spec.image, imagePullPolicy: 'IfNotPresent',
+        resources: { limits: { memory: spec.memoryLimit ?? '16Gi' }, requests: { memory: '512Mi' } },
         securityContext: { runAsUser: 0, allowPrivilegeEscalation: false,
           capabilities: { drop: ['ALL'], add: ['CHOWN', 'SETUID', 'SETGID', 'KILL'] } },
         command: ['sleep', 'infinity'], env: [
@@ -240,7 +246,7 @@ export function warmWorkerPodManifest(spec: WarmPodSpec): Record<string, unknown
           { name: 'WARM_HOST_PROBE_URL', value: spec.hostProbeUrl },
           { name: 'WARM_PROD_PROBE_URL', value: spec.prodProbeUrl },
         ],
-        volumeMounts: [{ name: 'workspace', mountPath: '/workspace/repo', subPath: 'repo', readOnly: true },
+        volumeMounts: [{ name: 'workspace', mountPath: '/workspace/repo', subPath: 'repo' },
           { name: 'runtime-data', mountPath: '/workspace/data' }] }],
       volumes: [{ name: 'workspace', emptyDir: {} },
         { name: 'runtime-data', emptyDir: {} },
@@ -252,13 +258,25 @@ export function warmWorkerPodManifest(spec: WarmPodSpec): Record<string, unknown
 export interface WarmPodTransportResult {
   /** Every non-complete response leaves the existing one-shot Job authoritative. */
   status: 'observed' | 'fallback';
-  reason: 'complete' | 'key-drift' | 'pod-unready' | 'pod-replaced' | 'exec-failed' | 'invalid-result' | 'worker-quarantined';
+  reason: 'complete' | 'key-drift' | 'pod-unready' | 'pod-replaced' | 'exec-failed' | 'invalid-result' | 'worker-quarantined'
+    | 'no-candidate' | 'lease-unavailable' | 'context-unavailable';
   reply: WarmWorkerReply | null;
+  /** Original local kubectl error when a remote pool context is absent; no Pod was contacted. */
+  kubectlStderr?: string;
   artifactsDir?: string;
   /** Base64 preserves the exact bytes copied from the same Pod. Keys are artifact suffixes. */
   artifacts?: readonly { file: string; data: Readonly<Record<string, string>> }[];
 }
 const fallback = (reason: WarmPodTransportResult['reason']): WarmPodTransportResult => ({ status: 'fallback', reason, reply: null });
+
+/** A remote pool's internal k3d context must be available locally before acquiring its worker lease. */
+export function probeWarmPodContext(context: string, kubectl: Kubectl = warmKubectl): WarmPodTransportResult | null {
+  if (!/^k3d-[a-z0-9-]+$/.test(context)) return null;
+  const observed = kubectl(['config', 'get-contexts', context, '-o', 'name']);
+  if (observed.status === 0 && observed.stdout.split(/\r?\n/).includes(context)) return null;
+  debug.log('pod.warm', 'context-unavailable', { context, kubectlStderr: observed.stderr }, { level: 'warn' });
+  return { status: 'fallback', reason: 'context-unavailable', reply: null, kubectlStderr: observed.stderr };
+}
 
 function canonicalJson(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalJson);
@@ -330,7 +348,12 @@ function matchesPodManifest(pod: any, spec: WarmPodSpec): boolean {
       // API-server defaults may add resources/termination fields; execution-bearing fields stay exact.
       for (const field of ['name', 'image', 'imagePullPolicy', 'command', 'args', 'workingDir', 'env', 'envFrom',
         'volumeMounts', 'volumeDevices', 'ports', 'securityContext', 'stdin', 'stdinOnce', 'tty', 'lifecycle',
-        'startupProbe', 'livenessProbe', 'readinessProbe', 'resizePolicy', 'restartPolicy']) {
+        'startupProbe', 'livenessProbe', 'readinessProbe', 'resizePolicy', 'restartPolicy', 'resources']) {
+        // Kubernetes materializes an omitted resource stanza as {} on init containers.
+        // Only that empty default is equivalent; limits and requests still must match exactly.
+        if (field === 'resources' && want?.resources === undefined && got?.resources
+          && typeof got.resources === 'object' && !Array.isArray(got.resources)
+          && Object.keys(got.resources).length === 0) continue;
         if (!sameJson(got?.[field], want?.[field])) return false;
       }
     }

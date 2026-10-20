@@ -54,6 +54,10 @@ import { targetScopedGoalText } from './goal-text-path-scope.js';
 import { parseReleaseNoteSection } from '../release-loop/release-note.js';
 import { declaredNewFilePaths } from './goal-new-paths.js';
 import { classifyGoalCommandExecution, type GoalCommandExecutionResult } from './goal-command-execution.js';
+import { identityLines, repositoryIdentifiers } from './goal-author-identity.js';
+export { formatSubmittedAt } from './goal-author-identity.js';
+import { hasUnmetRequirementOutsidePreservationClause } from './goal-author-preservation-obligation.js';
+export { hasUnmetRequirementOutsidePreservationClause } from './goal-author-preservation-obligation.js';
 export { classifyGoalCommandExecution } from './goal-command-execution.js';
 export type { GoalCommandExecutionKind, GoalCommandExecutionResult, GoalCommandExecutionClassification } from './goal-command-execution.js';
 
@@ -4902,59 +4906,6 @@ function preservationClarification(
   return renderedClarification(clarificationQuestions, PRESERVATION_CONTRACT_QUESTION_ID, clarificationResponses);
 }
 
-const EXPLICIT_OBLIGATION_MODAL = /\b(?:must|should|needs?\s+to|is\s+required\s+to)\s+/gi;
-const OBLIGATION_HARD_BOUNDARY = /[.;!?]|\s+but\s+|\s+(?:although|because|while)\s+/i;
-const COORDINATED_OBLIGATION = /\s+(?:and|or)\s+|,\s*(?:(?:and|or)\s+)?/i;
-const OBLIGATION_VERB = /^([a-z]+)/i;
-const PRESERVATION_OBLIGATION_VERB = /^(?:preserve|remain|retain|keep|maintain)$/i;
-// ⛔⭐ 수동태 보존(`must be preserved` · `should be unchanged`)은 동사가 `be` 라 위 배제를 빠져나간다.
-//    실측 2026-08-03: `this behavior should be preserved across releases` 가 요구로 오탐됐다.
-//    ⚠️ 오탐 비용이 낮지 않다 — 이 판정은 clarification 을 만들고, 미답 clarification 은
-//    발사 전 도달 경로를 태운다(`RUN-S13`). ⇒ `be` 뒤의 분사만 좁게 더 본다.
-const PRESERVATION_PARTICIPLE = /^(?:preserved|retained|kept|maintained|unchanged|intact|stable)$/i;
-
-/** Return finite, explicitly modal verb phrases, including verbs that share a modal through coordination. */
-function explicitObligationVerbs(evidence: string): string[] {
-  const modals = Array.from(evidence.matchAll(EXPLICIT_OBLIGATION_MODAL));
-  return modals.flatMap((modal, index) => {
-    const start = (modal.index ?? 0) + modal[0].length;
-    const nextModal = modals[index + 1]?.index ?? evidence.length;
-    const remaining = evidence.slice(start, nextModal);
-    const boundary = remaining.search(OBLIGATION_HARD_BOUNDARY);
-    const obligation = remaining.slice(0, boundary === -1 ? remaining.length : boundary);
-    return obligation.split(COORDINATED_OBLIGATION).flatMap((phrase) => {
-      const verb = OBLIGATION_VERB.exec(phrase.trim())?.[1];
-      return verb ? [verb] : [];
-    });
-  });
-}
-
-/** Persistent evidence remains a preservation contract; only preservation verbs are excluded from explicit modal obligations. */
-/** ⭐ 테스트가 **배포 코드**를 물게 export 한다 — 종전 회귀는 정규식을 복사해 vacuous 였다(`[T]` 반증 자기검증). */
-export function hasUnmetRequirementOutsidePreservationClause(evidence: string): boolean {
-  return explicitObligationPhrases(evidence).some((phrase) => {
-    const [verb, next] = phrase.trim().split(/\s+/, 2);
-    if (!verb) return false;
-    if (PRESERVATION_OBLIGATION_VERB.test(verb)) return false;
-    // `be preserved` / `be unchanged` 처럼 수동태로 쓴 보존은 요구가 아니다.
-    if (/^be$/i.test(verb) && next && PRESERVATION_PARTICIPLE.test(next)) return false;
-    return true;
-  });
-}
-
-/** 배제 판정에 `be <분사>` 를 보려면 동사 하나가 아니라 구가 필요하다. `explicitObligationVerbs` 의 형제. */
-function explicitObligationPhrases(evidence: string): string[] {
-  const modals = Array.from(evidence.matchAll(EXPLICIT_OBLIGATION_MODAL));
-  return modals.flatMap((modal, index) => {
-    const start = (modal.index ?? 0) + modal[0].length;
-    const nextModal = modals[index + 1]?.index ?? evidence.length;
-    const remaining = evidence.slice(start, nextModal);
-    const boundary = remaining.search(OBLIGATION_HARD_BOUNDARY);
-    const obligation = remaining.slice(0, boundary === -1 ? remaining.length : boundary);
-    return obligation.split(COORDINATED_OBLIGATION).map((phrase) => phrase.trim()).filter(Boolean);
-  });
-}
-
 function preservationAmbiguities(facts: CodebaseGrounding | null, groundingError: boolean): string[] {
   if (groundingError) return [];
   return (facts?.persistentEvidence ?? []).filter(hasUnmetRequirementOutsidePreservationClause);
@@ -5979,8 +5930,6 @@ export function defaultGoalAuthorDeps(cwd: string): GoalAuthorDeps {
   };
 }
 
-const IDENTITY_LINE = /^(agent|track|session|submitted):\s*(.*?)\s*$/i;
-
 function missionSlugFallback(goal: string): string {
   return slugify(extractSlugSource(goal));
 }
@@ -5991,71 +5940,6 @@ async function goalSlug(goal: string, slugFn: (goal: string) => Promise<string>)
   } catch {
     return missionSlugFallback(goal);
   }
-}
-
-function repositoryIdentifiers(ask: string): string[] {
-  const lines = ask.split(/\r?\n/);
-  const metadata = leadingIdentityMetadata(ask);
-  const body = metadata.size
-    ? (lines[0]?.trim() === '---' ? lines.slice(lines.slice(1).findIndex((line) => line.trim() === '---') + 2) : lines.slice(lines.findIndex((line) => !IDENTITY_LINE.test(line))))
-    : lines;
-  return body
-    .filter((line) => !line.startsWith('Checkable requested criterion:'))
-    .join('\n')
-    .match(/[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*/g) ?? [];
-}
-
-function leadingIdentityMetadata(ask: string): Map<string, string> {
-  const lines = ask.split(/\r?\n/);
-  let candidates: string[] = [];
-  if (lines[0]?.trim() === '---') {
-    const end = lines.slice(1).findIndex((line) => line.trim() === '---');
-    if (end < 0) return new Map();
-    candidates = lines.slice(1, end + 1);
-  } else if (IDENTITY_LINE.test(lines[0] ?? '')) {
-    candidates = lines.slice(0, lines.findIndex((line) => !IDENTITY_LINE.test(line)) === -1
-      ? lines.length
-      : lines.findIndex((line) => !IDENTITY_LINE.test(line)));
-  }
-
-  const metadata = new Map<string, string>();
-  for (const line of candidates) {
-    const match = IDENTITY_LINE.exec(line);
-    const value = match?.[2].trim();
-    if (match && value && !metadata.has(match[1].toLowerCase())) metadata.set(match[1].toLowerCase(), value);
-  }
-  return metadata;
-}
-
-/** `submitted` 는 KST 로 적는다 — 두 트랙이 같은 벽시계를 인용해야 이력이 정렬된다. */
-export function formatSubmittedAt(at: Date): string {
-  const parts = new Intl.DateTimeFormat('sv-SE', {
-    timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hour12: false,
-  }).format(at);
-  return `${parts.replace(' ', ' ')} KST`;
-}
-
-/**
- * 신원 머리말 — **값이 있는 줄만** 낸다.
- *
- * ⛔ 빈 값·`unknown` 을 찍지 않는다: 부재와 미지가 같은 값이 되면 조회가 거짓을 생산한다.
- *    *"모르면 비워라"* 가 아니라 **"없으면 줄을 쓰지 마라"** 다.
- * ⭐ 우선순위는 **ask 에 이미 적힌 값 > 환경/시계 유도**다(호출자가 명시한 것이 이긴다).
- */
-function identityLines(ask: string, cwd: string, env: NodeJS.ProcessEnv, at: Date): string[] {
-  const metadata = leadingIdentityMetadata(ask);
-  const tree = /[/\\](pilot|axon)[/\\]/i.exec(cwd)?.[1]?.toLowerCase();
-  const track = metadata.get('track') ?? (tree === 'pilot' ? 'S' : tree === 'axon' ? 'T' : undefined);
-  const agent = metadata.get('agent') ?? env.AI_AGENT?.trim();
-  const session = metadata.get('session') ?? env.CLAUDE_CODE_SESSION_ID?.trim();
-  const submitted = metadata.get('submitted') ?? formatSubmittedAt(at);
-  return [
-    agent && `agent: ${agent}`,
-    track && `track: ${track}`,
-    session && `session: ${session}`,
-    submitted && `submitted: ${submitted}`,
-  ].filter((line): line is string => Boolean(line));
 }
 
 /** ⛔⭐ 문서가 «어떤 절 본문»으로 끝나면 그 절이 꼬리 메타를 삼킨다 — 그래서 경계를 준다.

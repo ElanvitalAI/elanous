@@ -4,6 +4,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { HARNESS_CORE_KINDS, hasNodeKind } from '../graph-kinds/registry.js';
+import { parseOverlayCondition } from './graph-overlay-condition.js';
 
 /** ⭐ RFC-graph-templates-as-yaml §5 «0단계» — YAML 저작본을 읽어 실행·해시·원장용 정규형으로.
  *
@@ -36,6 +37,8 @@ export interface GraphNodeSpec {
   /** Entry selected by this call when a unit exposes more than one entry. */
   readonly callEntry?: string;
   readonly budget?: { readonly innerSteps: number };
+  /** L1: skip this optional node when a measured state condition holds. */
+  readonly skipWhen?: string;
 }
 
 export interface GraphEdgeSpec {
@@ -48,6 +51,8 @@ export interface GraphEdgeSpec {
   /** 심이 «주입 안 됐을 때» 내려가는 순서. `requires` 는 그 심 이름들. */
   readonly fallback?: readonly { readonly node: string; readonly requires: readonly string[]; readonly observed?: number }[];
   readonly observed?: number;
+  /** L1: a measured state condition takes precedence over the default edge. */
+  readonly when?: string;
 }
 
 export interface GraphTemplateSpec {
@@ -63,8 +68,39 @@ export interface GraphTemplateSpec {
   /** ⭐ 런 계약(선택) — 이 그래프가 «기본으로» 요구하는 실행 칸 등. 발사 인자가 덮는다(graph-run-contract.ts). */
   readonly runContract?: GraphRunContractSpec;
   readonly unit?: { readonly inputs: readonly string[]; readonly outputs: readonly string[]; readonly exits: readonly string[]; readonly entries?: readonly string[] };
+  /** Non-executable landing policy declaration. The train executor consumes this in a later slice. */
+  readonly policy?: LandUnitTrainPolicySpec;
   readonly nodes: readonly GraphNodeSpec[];
   readonly edges: readonly GraphEdgeSpec[];
+}
+
+export interface LandUnitTrainPolicySpec {
+  readonly express: {
+    readonly by: readonly ('queueFlag' | 'predecessorOf' | 'multiplierTier' | 'p0InCutWindow2h')[];
+    readonly waitsForBatch: false;
+    readonly directive: string;
+  };
+  readonly batch: {
+    readonly min: number;
+    readonly max: number;
+    readonly groupBy: readonly ('area' | 'cellPrefix')[];
+    readonly maxWaitMin: number;
+    readonly order: readonly ('express' | 'predecessor' | 'enqueued')[];
+    readonly directive: string;
+  };
+  readonly scenarioPrebuild: {
+    readonly source: readonly ('src/ux-sim' | 'scenarios/ux-sim' | 'fake-llm' | 'fake-harness')[];
+    readonly mock: 'required';
+    readonly directive: string;
+  };
+  readonly gate: { readonly oncePerBatch: true; readonly directive: string };
+  readonly land: {
+    readonly perPr: 'squash';
+    readonly pinnedHead: true;
+    readonly ejectOnFail: true;
+    readonly integrationPr: false;
+    readonly directive: string;
+  };
 }
 
 export interface GraphParseIssue {
@@ -80,6 +116,7 @@ export interface GraphParseResult {
 
 /** ⚠️ YAML 함정 — `no`/`off`/`yes`/`on` 이 boolean 으로 파싱된다(Norway 문제). 노드 이름에 쓰면 조용히 깨진다. */
 const YAML_TRAP_WORDS = new Set(['true', 'false', 'yes', 'no', 'on', 'off', 'null', '~']);
+export const L1_PROTECTED_ROUTE_NODES = new Set(['gate', 'regate', 'review', 'merge', 'freeze-check']);
 
 function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
@@ -102,6 +139,8 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
 
   const graphId = typeof doc.graph_id === 'string' ? doc.graph_id : undefined;
   if (graphId === undefined) errors.push({ path: `${label}/graph_id`, message: 'graph_id 가 없거나 문자열이 아니다' });
+  const policy = graphId === 'land' ? parseLandUnitTrainPolicy(doc.policy, `${label}/policy`, errors) : undefined;
+  if (graphId === 'land' && doc.policy === undefined) errors.push({ path: `${label}/policy`, message: 'land 유닛에는 착지 열차 policy 가 필요하다' });
   const version = typeof doc.version === 'number' && Number.isInteger(doc.version) ? doc.version : undefined;
   if (version === undefined) errors.push({ path: `${label}/version`, message: 'version 이 없거나 정수가 아니다' });
   const entryNode = typeof doc.entry_node === 'string' ? doc.entry_node : undefined;
@@ -147,6 +186,12 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
         : 'journey_stage 는 비어 있지 않은 문자열이어야 한다' });
       continue;
     }
+    if (n.skip_when !== undefined) {
+      if (typeof n.skip_when !== 'string' || !parseOverlayCondition(n.skip_when).ok)
+        errors.push({ path: `${at}/skip_when`, message: 'skip_when 은 오버레이 조건 한 개(key op literal)여야 한다' });
+      if (L1_PROTECTED_ROUTE_NODES.has(nodeId) || kind === 'gate' || terminalNodes.includes(nodeId))
+        errors.push({ path: `${at}/skip_when`, message: `'${nodeId}' 는 필수 검증·착지·종결 노드라 건너뛸 수 없다` });
+    }
     const contractRaw = n.contract as Record<string, unknown> | undefined;
     const contract: GraphNodeContract | undefined = contractRaw && typeof contractRaw === 'object'
       ? {
@@ -190,6 +235,7 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       ...(kind === 'subgraph' && n.budget && typeof n.budget === 'object' && !Array.isArray(n.budget) &&
         typeof (n.budget as Record<string, unknown>).inner_steps === 'number'
         ? { budget: { innerSteps: (n.budget as { inner_steps: number }).inner_steps } } : {}),
+      ...(typeof n.skip_when === 'string' ? { skipWhen: n.skip_when } : {}),
     });
   }
   if (nodes.length === 0) errors.push({ path: `${label}/nodes`, message: '노드가 하나도 없다' });
@@ -205,6 +251,12 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
     if (!known.has(from)) { errors.push({ path: `${at}/from`, message: `'${from}' 은 선언된 노드가 아니다` }); continue; }
     const hasTo = typeof e.to === 'string';
     const hasMap = e.map !== null && typeof e.map === 'object';
+    if (e.when !== undefined && (typeof e.when !== 'string' || !parseOverlayCondition(e.when).ok))
+      errors.push({ path: `${at}/when`, message: 'when 은 오버레이 조건 한 개(key op literal)여야 한다' });
+    if (e.when !== undefined && (L1_PROTECTED_ROUTE_NODES.has(from) || nodes.some(node => node.nodeId === from && node.kind === 'gate') || terminalNodes.includes(from)))
+      errors.push({ path: `${at}/when`, message: `'${from}' 의 필수 검증·착지 결과는 when 간선으로 덮을 수 없다` });
+    if (e.when !== undefined && (!hasTo || hasMap || e.on !== undefined))
+      errors.push({ path: `${at}/when`, message: 'when 은 to 간선에서만 쓴다' });
     if (hasTo === hasMap) {
       errors.push({ path: at, message: 'to 와 map 중 «정확히 하나»를 써야 한다' });
       continue;
@@ -237,7 +289,20 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       ...(hasMap ? { on: String(e.on), map } : {}),
       ...(fallback.length > 0 ? { fallback } : {}),
       ...(typeof e.observed === 'number' ? { observed: e.observed } : {}),
+      ...(typeof e.when === 'string' ? { when: e.when } : {}),
     });
+  }
+  for (const node of nodes) {
+    if (node.skipWhen === undefined) continue;
+    const outgoing = edges.filter(edge => edge.from === node.nodeId);
+    if (outgoing.length !== 1 || outgoing[0]?.to === undefined || outgoing[0]?.when !== undefined ||
+        (outgoing[0]?.fallback?.length ?? 0) > 0)
+      errors.push({ path: `${label}/nodes/${node.nodeId}/skip_when`, message: 'skip_when 노드에는 분기 없는 무조건 to 후속 간선 하나만 필요하다' });
+  }
+  for (const edge of edges) {
+    if (edge.when === undefined) continue;
+    if (!edges.some(candidate => candidate.from === edge.from && candidate.when === undefined))
+      errors.push({ path: `${label}/edges/${edge.from}/when`, message: 'when 간선에는 모호·미관측 때 탈 무조건 기본 간선이 필요하다' });
   }
 
   if (entryNode !== undefined && !known.has(entryNode)) errors.push({ path: `${label}/entry_node`, message: `'${entryNode}' 는 선언된 노드가 아니다` });
@@ -288,6 +353,7 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
     template: {
       graphId: graphId!, version: version!, entryNode: entryNode!, terminalNodes, nodes, edges,
       ...(unit ? { unit } : {}),
+      ...(policy ? { policy } : {}),
       ...(Array.isArray(journeyStages) ? { journeyStages: journeyStages as string[] } : {}),
       ...(loop ? { loop } : {}),
       ...(typeof doc.docs_only_gate_skip === 'boolean' ? { docsOnlyGateSkip: doc.docs_only_gate_skip } : {}),
@@ -295,6 +361,89 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       ...(runContract.spec ? { runContract: runContract.spec } : {}),
     },
     errors, warnings,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function isEnumList<T extends string>(value: unknown, allowed: readonly T[], expected: readonly T[]): value is T[] {
+  return Array.isArray(value) && value.every((item): item is T => typeof item === 'string' && allowed.includes(item as T))
+    && value.length === expected.length && expected.every((item, index) => value[index] === item);
+}
+
+function isDirectiveText(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const entry = value.replace(/[\p{P}\p{S}\s]/gu, '');
+  return entry.length > 0;
+}
+
+function parseLandUnitTrainPolicy(
+  value: unknown,
+  path: string,
+  errors: GraphParseIssue[],
+): LandUnitTrainPolicySpec | undefined {
+  if (value === undefined) return undefined;
+  const fail = (suffix: string, message: string): void => { errors.push({ path: `${path}${suffix}`, message }); };
+  if (!isRecord(value) || !exactKeys(value, ['express', 'batch', 'scenarioPrebuild', 'gate', 'land'])) {
+    fail('', 'policy 는 express·batch·scenarioPrebuild·gate·land 만 가진 맵이어야 한다');
+    return undefined;
+  }
+  const express = value.express;
+  const batch = value.batch;
+  const scenarioPrebuild = value.scenarioPrebuild;
+  const gate = value.gate;
+  const land = value.land;
+  const field = (name: string, raw: unknown, keys: readonly string[]): Record<string, unknown> | undefined => {
+    if (!isRecord(raw) || !exactKeys(raw, keys)) {
+      fail(`/${name}`, `${name} 필드는 ${keys.join('·')} 키만 가진 맵이어야 한다`);
+      return undefined;
+    }
+    if (!isDirectiveText(raw.directive))
+      fail(`/${name}/directive`, 'directive 는 구두점만으로 된 값이 아닌 비어 있지 않은 문자열이어야 한다');
+    return raw;
+  };
+  const e = field('express', express, ['by', 'waitsForBatch', 'directive']);
+  const b = field('batch', batch, ['min', 'max', 'groupBy', 'maxWaitMin', 'order', 'directive']);
+  const s = field('scenarioPrebuild', scenarioPrebuild, ['source', 'mock', 'directive']);
+  const g = field('gate', gate, ['oncePerBatch', 'directive']);
+  const l = field('land', land, ['perPr', 'pinnedHead', 'ejectOnFail', 'integrationPr', 'directive']);
+
+  if (e && !isEnumList(e.by, ['queueFlag', 'predecessorOf', 'multiplierTier', 'p0InCutWindow2h'], ['queueFlag', 'predecessorOf', 'multiplierTier', 'p0InCutWindow2h']))
+    fail('/express/by', 'by 는 queueFlag·predecessorOf·multiplierTier·p0InCutWindow2h 를 각각 한 번 포함해야 한다');
+  if (e && e.waitsForBatch !== false) fail('/express/waitsForBatch', 'express 는 waitsForBatch: false 여야 한다');
+  if (b) {
+    if (!Number.isSafeInteger(b.min) || b.min !== 2) fail('/batch/min', 'min 은 정확히 2여야 한다');
+    if (!Number.isSafeInteger(b.max) || b.max !== 4) fail('/batch/max', 'max 는 정확히 4여야 한다');
+    if (Number.isSafeInteger(b.min) && Number.isSafeInteger(b.max) && (b.min as number) > (b.max as number)) fail('/batch', 'min 은 max 이하여야 한다');
+    if (!isEnumList(b.groupBy, ['area', 'cellPrefix'], ['area', 'cellPrefix'])) fail('/batch/groupBy', 'groupBy 는 area·cellPrefix 를 각각 한 번 포함해야 한다');
+    if (!Number.isSafeInteger(b.maxWaitMin) || (b.maxWaitMin as number) !== 30) fail('/batch/maxWaitMin', 'maxWaitMin 은 30 정수여야 한다');
+    if (!Array.isArray(b.order) || b.order.length !== 3 || b.order.some((item, index) => item !== ['express', 'predecessor', 'enqueued'][index]))
+      fail('/batch/order', 'order 는 express·predecessor·enqueued 순이어야 한다');
+  }
+  if (s && !isEnumList(s.source, ['src/ux-sim', 'scenarios/ux-sim', 'fake-llm', 'fake-harness'], ['src/ux-sim', 'scenarios/ux-sim', 'fake-llm', 'fake-harness']))
+    fail('/scenarioPrebuild/source', 'source 는 UX sim·fake LLM·fake harness 네 경로를 각각 한 번 포함해야 한다');
+  if (s && s.mock !== 'required') fail('/scenarioPrebuild/mock', 'mock 은 required 여야 한다');
+  if (g && g.oncePerBatch !== true) fail('/gate/oncePerBatch', 'oncePerBatch 는 true 여야 한다');
+  if (l) {
+    if (l.perPr !== 'squash') fail('/land/perPr', 'perPr 은 squash 여야 한다');
+    if (l.pinnedHead !== true) fail('/land/pinnedHead', 'pinnedHead 는 true 여야 한다');
+    if (l.ejectOnFail !== true) fail('/land/ejectOnFail', 'ejectOnFail 은 true 여야 한다');
+    if (l.integrationPr !== false) fail('/land/integrationPr', 'integrationPr 는 false 여야 한다');
+  }
+  if (!e || !b || !s || !g || !l || errors.some((error) => error.path.startsWith(`${path}/`))) return undefined;
+  return {
+    express: { by: e.by as LandUnitTrainPolicySpec['express']['by'], waitsForBatch: false, directive: e.directive as string },
+    batch: { min: b.min as number, max: b.max as number, groupBy: b.groupBy as LandUnitTrainPolicySpec['batch']['groupBy'], maxWaitMin: b.maxWaitMin as number,
+      order: b.order as LandUnitTrainPolicySpec['batch']['order'], directive: b.directive as string },
+    scenarioPrebuild: { source: s.source as LandUnitTrainPolicySpec['scenarioPrebuild']['source'], mock: 'required', directive: s.directive as string },
+    gate: { oncePerBatch: true, directive: g.directive as string },
+    land: { perPr: 'squash', pinnedHead: true, ejectOnFail: true, integrationPr: false, directive: l.directive as string },
   };
 }
 
@@ -330,7 +479,8 @@ export function loadGraphTemplates(dir: string): GraphLoadResult {
   const templates: Record<string, GraphTemplateSpec> = {};
   let files: string[];
   try {
-    files = readdirSync(dir).filter((f) => f.endsWith('.yaml') || f.endsWith('.yml')).sort();
+    // recipes are command catalogs consumed by the runner, not graph templates.
+    files = readdirSync(dir).filter((f) => (f.endsWith('.yaml') || f.endsWith('.yml')) && f !== 'recipes.yaml' && f !== 'recipes.yml').sort();
   } catch (error) {
     return { templates, errors: [{ path: dir, message: `그래프 디렉토리를 못 읽었다: ${error instanceof Error ? error.message : String(error)}` }], warnings, scannedFiles: 0 };
   }

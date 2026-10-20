@@ -1,0 +1,25 @@
+graph_id: verb-harvest
+version: 1
+entry_node: review
+terminal_nodes: [done, rework, needs-human, failed]
+unit:
+  inputs: [ask, context, prior]
+  outputs: [result, evidence]
+  exits: [done, rework, needs-human, failed]
+nodes:
+  - node_id: review
+    kind: judge
+    recipe: 'cmd:harvest-review'
+    max_visits: 1
+    contract:
+      inputs: [ask, context, prior]
+      tools: read-only
+      outputs: [outcome, result, evidence]
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: rework, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: needs-human, kind: hitl, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: observe, recipe: none, max_visits: 1 }
+edges:
+  - from: review
+    on: outcome
+    map: { done: done, rework: rework, needs-human: needs-human, failed: failed }

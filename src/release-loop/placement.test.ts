@@ -625,7 +625,19 @@ test('target declaration is on the first line; an explicitly new file remains el
   addItem('0.2.15', { ...pullCell('later-only'), title: '설명만 있음\n대상 경로: src/release-loop/placement.ts' });
   addItem('0.2.15', { ...pullCell('human-review'), title: '대상 경로: src/release-loop/placement.ts\n\u{1F451} 검토' });
   addItem('0.2.15', { ...pullCell('new-file'), title: '대상 경로: src/new-pull-forward.ts\n신설: 신규 모듈' });
-  expect(planPullForward({ ...pullDeps(), merged24h: 100 }).decisions.map((row) => row.id)).toEqual(['new-file']);
+  addItem('0.2.15', { ...pullCell('new-empty'), title: '대상 경로: src/new-empty.ts\n신설:' });
+  addItem('0.2.15', { ...pullCell('new-other'), title: '대상 경로: src/new-other.ts\n신설: src/old.ts' });
+  expect(planPullForward({ ...pullDeps(), seatCap: { TC: 10, MK: 2 }, merged24h: 100 }).decisions.map((row) => row.id))
+    .toEqual(['new-file', 'new-empty', 'new-other']);
+}, 60_000);
+
+test('pull-forward keeps comma-separated existing target paths eligible', () => {
+  setup();
+  addItem('0.2.15', { ...pullCell('two-files'), title: '대상 경로: src/release-loop/placement.ts, src/release-loop/checklist.ts\n기존 칸' });
+  const base = pullDeps();
+  expect(planPullForward({ ...base, targetPathExists: (path) =>
+    path === 'src/release-loop/placement.ts' || path === 'src/release-loop/checklist.ts',
+    seatCap: { TC: 10, MK: 2 }, merged24h: 100 }).decisions.map((row) => row.id)).toEqual(['two-files']);
 }, 60_000);
 
 test('planPullForward applies P0 ≤3 and the inclusive four-hour landing deadline boundary', () => {
@@ -647,7 +659,7 @@ test('planPullForward applies P0 ≤3 and the inclusive four-hour landing deadli
     ? { ...row, cutAt: new Date(land + 60 * 60 * 1000).toISOString() } : row);
   const boundary = new Date(land - 3.5 * 60 * 60 * 1000);
   expect(planPullForward({ ...base(), schedules: distinct, now: boundary }).decisions).toEqual([]);
-  const noLandBy = distinct.map((row) => row.version === '0.2.14' ? { ...row, landBy: undefined } : row);
+  const noLandBy = distinct.map((row) => row.version === '0.2.14' ? { ...row, landBy: null } : row);
   expect(planPullForward({ ...base(), schedules: noLandBy, now: boundary })
     .decisions.map((row) => row.id)).toEqual(['ready']);
 }, 60_000);

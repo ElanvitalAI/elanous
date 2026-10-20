@@ -39,6 +39,20 @@ function withGraph(yaml: string, run: (root: string, markdown: string) => void):
 }
 
 describe('renderGraphAnatomy', () => {
+  test('anatomy shows the same expanded nodes and edges as the server unit flattener', () => {
+    const root = mkdtempSync(join(tmpdir(), 'graph-anatomy-unit-'));
+    try {
+      mkdirSync(join(root, 'units'));
+      writeFileSync(join(root, 'root.yaml'), `graph_id: root\nversion: 1\nentry_node: start\nterminal_nodes: [done]\nnodes:\n  - { node_id: start, kind: agent, recipe: start, max_visits: 1 }\n  - node_id: unit-call\n    kind: subgraph\n    recipe: none\n    max_visits: 1\n    call: unit@1\n    budget: { inner_steps: 2 }\n    contract: { inputs: [], outputs: [] }\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\nedges:\n  - { from: start, to: unit-call }\n  - { from: unit-call, on: outcome, map: { completed: done } }\n`);
+      writeFileSync(join(root, 'units', 'unit.yaml'), `graph_id: unit\nversion: 1\nunit: { inputs: [], outputs: [], exits: [completed] }\nentry_node: work\nterminal_nodes: [completed]\nnodes:\n  - { node_id: work, kind: agent, recipe: work, max_visits: 1 }\n  - { node_id: completed, kind: observe, recipe: none, max_visits: 1 }\nedges:\n  - { from: work, to: completed }\n`);
+      const markdown = renderGraphAnatomy({ graphsRoot: root, commit: COMMIT, generatedAt: GENERATED_AT });
+      expect(markdown).toContain('unit-call__work');
+      expect(markdown).toContain('start → unit-call__work');
+      expect(markdown).toContain('unit-call__work → done');
+      expect(markdown).not.toContain('start → unit-call ');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('임시 YAML(노드 2 · 간선 1)의 graph_id · nodeId · from → to · 주입 커밋이 보인다', () => {
     withGraph(TWO_NODE, (_root, markdown) => {
       expect(markdown).toContain('sample-loop');
@@ -120,6 +134,7 @@ test('a workflow-graph directory (recipes.yaml beside it) reads recipe-less gate
   const root = mkdtempSync(join(tmpdir(), 'graph-anatomy-runner-'));
   try {
     mkdirSync(join(root, 'announce'));
+    mkdirSync(join(root, 'announce', 'units'));
     writeFileSync(join(root, 'announce', 'recipes.yaml'), "gather:\n  command: 'echo hi'\n");
     writeFileSync(join(root, 'announce', 'announce-loop.yaml'), `graph_id: announce-loop
 version: 1
@@ -127,13 +142,34 @@ entry_node: gather
 terminal_nodes: [done, failed]
 nodes:
   - { node_id: gather, kind: agent, recipe: 'cmd:gather', max_visits: 1 }
+  - node_id: unit-call
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: unit@1
+    budget: { inner_steps: 2 }
+    contract: { inputs: [], outputs: [] }
   - { node_id: done, kind: gate, max_visits: 1 }
   - { node_id: failed, kind: gate, max_visits: 1 }
 edges:
-  - { from: gather, on: outcome, map: { ok: done, fail: failed, error: failed } }
+  - { from: gather, on: outcome, map: { ok: unit-call, fail: failed, error: failed } }
+  - { from: unit-call, on: outcome, map: { completed: done } }
+`);
+    writeFileSync(join(root, 'announce', 'units', 'unit.yaml'), `graph_id: unit
+version: 1
+unit: { inputs: [], outputs: [], exits: [completed] }
+entry_node: unit-work
+terminal_nodes: [completed]
+nodes:
+  - { node_id: unit-work, kind: agent, recipe: work, max_visits: 1 }
+  - { node_id: completed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: unit-work, to: completed }
 `);
     const markdown = renderGraphAnatomy({ graphsRoot: root, commit: COMMIT, generatedAt: GENERATED_AT });
     expect(markdown).toContain('announce-loop');
+    expect(markdown).toContain('unit-call__unit-work');
+    expect(markdown).not.toContain('unit-call ');
     expect(markdown).toContain('gather → failed (fail)');
     expect(markdown).not.toContain("'failed' 는 선언된 노드가 아니다");
     expect(markdown).not.toContain('recipe 가 없다');

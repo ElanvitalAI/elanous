@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -30,6 +30,17 @@ function productionSurfaceEventCount(): number | null {
     db.close();
   }
 }
+
+// TEST-UTTERANCE-ISOLATION 판정선 — bun test 실행 전후(이 파일 전체 시험 전후)로
+// 운영 surface_events.db 행 수가 불변임을 시험 안에서 단언한다. 이 파일의 어떤
+// 시험이 운영 DB 에 행을 쓰면 이 단언이 실패한다(recordInboundTurn 누수 차단 증명).
+let productionSurfaceEventCountAtRunStart: number | null = null;
+beforeAll(() => {
+  productionSurfaceEventCountAtRunStart = productionSurfaceEventCount();
+});
+afterAll(() => {
+  expect(productionSurfaceEventCount()).toBe(productionSurfaceEventCountAtRunStart);
+});
 
 const config = {
   llm: { provider: 'fake', model: 'fake-model' },

@@ -63,6 +63,57 @@ describe('self-implement surface adapter (S1 · parallel self-dev)', () => {
     expect(parseSelfImplementJson('{"stage":"timed-out","ok":false,"branch":"self-impl/finished"}')?.harvestable).toBeUndefined();
     expect(parseSelfImplementJson('{"stage":"timed-out","ok":false,"harvestable":true}')?.harvestable).toBeUndefined();
   });
+  test('Pod failure keeps child classification facts and calls held out-of-scope edits scope-escape', () => {
+    const abandonedClassification = { classification: 'implementation-deficit', classificationBasis: 'no-clean-worktree', worktreeClean: false };
+    const accountAvailability = { reason: 'no-candidate', candidateCount: 0 };
+    const parsed = parseSelfImplementJson(JSON.stringify({ stage: 'soft-stopped', ok: false,
+      detail: 'Out-of-scope edits held in the worktree; gate and publication skipped.',
+      abandonedClassification, supervisorVerdict: 'UNCONVERGEABLE', goalCauseObserved: true,
+      terminationReason: 'goal-only-rework-exhausted', quotaExhaustionAssessment: { accountAvailability } }));
+    expect(parsed?.childEvidence).toEqual({ classification: 'scope-escape', scopeEscape: true, abandonedClassification,
+      detail: 'Out-of-scope edits held in the worktree; gate and publication skipped.',
+      supervisorVerdict: 'UNCONVERGEABLE', goalCauseObserved: true,
+      terminationReason: 'goal-only-rework-exhausted', accountAvailability });
+    expect(parsed?.failureClassification).toBe('implementation-deficit');
+  });
+  test('Pod scope escape requires held edits, and lifted facts redact tokens', () => {
+    for (const row of [
+      { outOfScopeEdits: { count: 0 }, detail: 'No out-of-scope edits held in the worktree.' },
+      { outOfScopeEdits: [], detail: 'Out-of-scope edits were not held in the worktree.' },
+    ]) {
+      const parsed = parseSelfImplementJson(JSON.stringify({ stage: 'soft-stopped', ok: false,
+        abandonedClassification: { classification: 'implementation-deficit' }, ...row }));
+      expect(parsed?.childEvidence?.scopeEscape).toBeUndefined();
+      expect(parsed?.childEvidence?.classification).toBe('implementation-deficit');
+    }
+    const token = `sk-${'a'.repeat(24)}`;
+    const parsed = parseSelfImplementJson(JSON.stringify({ stage: 'soft-stopped', ok: false,
+      abandonedClassification: { classification: 'implementation-deficit', diagnostic: token },
+      quotaExhaustionAssessment: { accountAvailability: { reason: token } } }));
+    expect(JSON.stringify(parsed?.childEvidence)).not.toContain(token);
+  });
+  test('failed Pod copies bounded child error, stderr and structured exit code without inferring failures', () => {
+    const token = `sk-${'b'.repeat(24)}`;
+    const failed = parseSelfImplementJson(JSON.stringify({ stage: 'failed', ok: false, exitCode: 128,
+      error: 'gh pr create failed', detail: `request failed ${token}`, stderr: 'remote rejected\n' + 'x'.repeat(5000) }));
+    expect(failed?.childEvidence).toMatchObject({ error: 'gh pr create failed', exitCode: 128 });
+    expect(failed?.childEvidence?.detail).not.toContain(token);
+    expect(failed?.childEvidence?.detail).toContain('***');
+    expect(failed?.childEvidence?.stderr?.length).toBeLessThanOrEqual(4000);
+    const boundaryToken = `sk-${'c'.repeat(24)}`;
+    const boundary = parseSelfImplementJson(JSON.stringify({ stage: 'failed', ok: false,
+      stderr: 'x'.repeat(3993) + ' ' + boundaryToken }));
+    expect(boundary?.childEvidence?.stderr).not.toContain(boundaryToken);
+    expect(boundary?.childEvidence?.stderr?.endsWith('sk-***')).toBe(true);
+
+    for (const exitCode of [256, -1, 1.5, '128']) {
+      const parsed = parseSelfImplementJson(JSON.stringify({ stage: 'failed', ok: false, exitCode }));
+      expect(parsed?.childEvidence?.exitCode).toBeUndefined();
+    }
+    const successful = parseSelfImplementJson(JSON.stringify({ stage: 'merged', ok: true,
+      error: 'gh pr create succeeded', detail: 'success detail', stderr: 'warning only', exitCode: 0 }));
+    expect(successful?.childEvidence).toBeUndefined();
+  });
   test('exit 0 → completed', async () => {
     const spawn: SelfImplementJobSpawn = () => ({
       address: 'self-impl:x',
@@ -279,6 +330,39 @@ describe('self-implement surface adapter (S1 · parallel self-dev)', () => {
   test('parseSelfImplementJson — picks the last JSON object (ignores earlier noise)', () => {
     const d = parseSelfImplementJson('{"stage":"early"}\nmid\n{"ok":false,"stage":"gate-failed"}');
     expect(d).toMatchObject({ ok: false, stage: 'gate-failed' });
+  });
+
+  test('parseSelfImplementJson — nested child failure supplies the parent disposition without borrowing an earlier result', () => {
+    const old = JSON.stringify({ kind: 'self', ok: false, result: { stage: 'aborted', ok: false, outOfScopeEdits: ['old.ts'] } });
+    const current = JSON.stringify({ kind: 'external', ok: false, result: { stage: 'soft-stopped', ok: false,
+      outOfScopeEdits: ['current.ts'], abandonedClassification: { classification: 'implementation-deficit' },
+      supervisorVerdict: 'UNCONVERGEABLE', goalCauseObserved: true,
+      terminationReason: { kind: 'goal-only-rework-exhausted' },
+      quotaExhaustionAssessment: { accountAvailability: { reason: 'no-candidate', candidateCount: 0 } } } });
+    const graph = JSON.stringify({ kind: 'graph', stage: 'merged', ok: true });
+    const disposition = parseSelfImplementJson(`${old}\n${current}\n${graph}`);
+    expect(disposition).toMatchObject({ stage: 'soft-stopped', ok: false, failureClassification: 'implementation-deficit',
+      childEvidence: { classification: 'scope-escape', scopeEscape: true, outOfScopeEdits: ['current.ts'],
+        supervisorVerdict: 'UNCONVERGEABLE', goalCauseObserved: true,
+        terminationReason: { kind: 'goal-only-rework-exhausted' }, accountAvailability: { reason: 'no-candidate', candidateCount: 0 } } });
+    expect(disposition?.childEvidence?.outOfScopeEdits).not.toContain('old.ts');
+    const malformed = JSON.stringify({ kind: 'self', stage: 'merged', ok: true, result: {} });
+    expect(parseSelfImplementJson(`${old}\n${current}\n${malformed}`)).toMatchObject({ stage: 'soft-stopped', ok: false,
+      failureClassification: 'implementation-deficit', childEvidence: { outOfScopeEdits: ['current.ts'] } });
+  });
+
+  test('parseSelfImplementJson — a later successful nested child stays successful and clears earlier failure evidence', () => {
+    const old = JSON.stringify({ kind: 'self', ok: false, result: { stage: 'aborted', ok: false, outOfScopeEdits: ['old.ts'] } });
+    const current = JSON.stringify({ kind: 'self', ok: true, result: { stage: 'merged', ok: true, prUrl: 'https://example.invalid/pr/1', merged: true } });
+    const disposition = parseSelfImplementJson(`${old}\n${current}`);
+    expect(disposition).toMatchObject({ stage: 'merged', ok: true, prUrl: 'https://example.invalid/pr/1', merged: true });
+    expect(disposition?.childEvidence).toBeUndefined();
+    expect(disposition?.failureClassification).toBeUndefined();
+  });
+
+  test('parseSelfImplementJson — legacy flat stage without ok retains its scope evidence', () => {
+    const disposition = parseSelfImplementJson(JSON.stringify({ stage: 'soft-stopped', outOfScopeEdits: ['x.ts'] }));
+    expect(disposition).toMatchObject({ stage: 'soft-stopped', childEvidence: { classification: 'scope-escape', scopeEscape: true, outOfScopeEdits: ['x.ts'] } });
   });
 
   test('wrong surface kind → throws (guard)', async () => {

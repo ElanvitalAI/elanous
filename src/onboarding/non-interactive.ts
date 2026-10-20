@@ -10,6 +10,7 @@
 
 import type { WizardIO } from '../onboarding.js';
 import type { ChoiceOption, ChooseOpts, StepSpec } from './io-extended.js';
+import type { LlmDetectDeps } from '../cli/llm-detect-cli.js';
 import {
   loadAnswerFile,
   buildEnvOverrides,
@@ -25,6 +26,10 @@ export interface NonInteractiveOptions {
   answers?: AnswerFile;
   /** Inject a custom `process.env` for the env-bridge layer. */
   env?: NodeJS.ProcessEnv;
+  /** Existing configured provider; an explicit choice suppresses auto-probing. */
+  initialProvider?: string;
+  /** Inject `llm detect` dependencies in tests while retaining its real probe selection logic. */
+  llmDetectDeps?: LlmDetectDeps;
 }
 
 interface ResolvedAnswers {
@@ -76,6 +81,28 @@ export function nonInteractiveIO(opts: NonInteractiveOptions = {}): WizardIO {
   let section: AnswerSection | undefined;
   let printedCodexSkipGuidance = false;
   const consumed = new Set<string>();
+  let detectedProvider: string | null | undefined;
+  let providerDetection: Promise<string | null> | undefined;
+
+  const detectProvider = async (): Promise<string | null> => {
+    if (detectedProvider !== undefined) return detectedProvider;
+    providerDetection ??= (async () => {
+      const [{ runLlmDetect }, { detectProviders }] = await Promise.all([
+        import('../cli/llm-detect-cli.js'),
+        import('../llm/provider-detect.js'),
+      ]);
+      const env = opts.env ?? process.env;
+      const result = await runLlmDetect({ probe: true }, {
+        ...opts.llmDetectDeps,
+        detect: opts.llmDetectDeps?.detect ?? (() => detectProviders({ env })),
+        output: () => {},
+      });
+      return result.selected;
+    })();
+    try { detectedProvider = await providerDetection; }
+    catch { detectedProvider = null; }
+    return detectedProvider;
+  };
 
   const peek = (key: string): unknown => {
     if (!section) return undefined;
@@ -112,18 +139,33 @@ export function nonInteractiveIO(opts: NonInteractiveOptions = {}): WizardIO {
       chooseOpts: ChooseOpts = {},
       stepId?: string,
       pickerId?: string,
-    ) => resolveChoice(
-      choices,
-      chooseOpts,
-      stepId,
-      pickerId,
-      section,
-      merged,
-      () => printedCodexSkipGuidance,
-      () => { printedCodexSkipGuidance = true; },
-      (trackedSection, field) => { consumed.add(`${trackedSection}.${field}`); },
-      print,
-    ),
+    ) => {
+      const answerSection = sectionForPicker(stepId, pickerId, section);
+      const field = answerSection === 'llm' ? 'provider' : undefined;
+      const configured = answerSection && field ? merged[answerSection]?.[field] : undefined;
+      const savedProvider = answerSection === 'llm' && configured === undefined
+        && opts.initialProvider !== undefined && opts.initialProvider !== 'auto'
+        ? opts.initialProvider
+        : undefined;
+      const provider = pickerId === 'provider' && answerSection === 'llm' && configured === undefined
+        && (opts.initialProvider === undefined || opts.initialProvider === 'auto')
+        ? await detectProvider()
+        : null;
+      return resolveChoice(
+        choices,
+        chooseOpts,
+        stepId,
+        pickerId,
+        section,
+        merged,
+        () => printedCodexSkipGuidance,
+        () => { printedCodexSkipGuidance = true; },
+        (trackedSection, answerField) => { consumed.add(`${trackedSection}.${answerField}`); },
+        print,
+        provider,
+        savedProvider,
+      );
+    },
     showStep: (spec: StepSpec) => {
       section = STEP_SECTIONS[spec.index];
     },
@@ -145,6 +187,8 @@ function resolveChoice<T>(
   markCodexSkipGuidancePrinted: () => void,
   markConsumed: (section: AnswerSection, field: string) => void,
   print: (text: string) => void,
+  detectedProvider: string | null = null,
+  savedProvider?: string,
 ): T {
   if (choices.length === 0) throw new Error('nonInteractiveIO.choose: options array must not be empty.');
 
@@ -173,7 +217,14 @@ function resolveChoice<T>(
     : choices.find((choice) => choiceValueKey(choice.value) === configured);
   if (answerSection && field && selected) markConsumed(answerSection, field);
 
-  return selected?.value ?? choiceForValue(choices, configured, opts);
+  const detected = answerSection === 'llm' && field === 'provider' && configured === undefined && detectedProvider
+    ? choices.find((choice) => choiceValueKey(choice.value) === detectedProvider)
+    : undefined;
+  const saved = answerSection === 'llm' && field === 'provider' && configured === undefined && savedProvider
+    ? choices.find((choice) => choiceValueKey(choice.value) === savedProvider)
+    : undefined;
+
+  return selected?.value ?? detected?.value ?? saved?.value ?? choiceForValue(choices, configured, opts);
 }
 
 function choiceForValue<T>(

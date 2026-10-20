@@ -77,10 +77,8 @@
 //                   showDashboard-local domain (log-pane state vs
 //                   debug-log buffer + window/workbench/companion
 //                   handles vs prompt-bank store + DetailViewer).
-//                   Static-imported helpers: resolveDashboardChatMain
-//                   LogCommand + dashboardLogHelpLines + the four
-//                   resolveDashboardLog*Action fns + stripAnsi (for
-//                   /log) · debug + resolveDebugCompanionTargets (for
+//                   The /log registration and command helpers live in
+//                   dashboard-log-slash.ts · debug + resolveDebugCompanionTargets (for
 //                   /debug) · getPromptBankStore + buildPromptInjection
 //                   + inspectActiveProvider (for /prompt). The four
 //                   prompt-runtime closures (promptRuntimeState +
@@ -333,7 +331,7 @@ import {
   buildSessionSurfaceStatusLines,
 } from '../../session-runtime/index.js';
 import { handleAutoTtsSlash } from '../auto-tts/auto-tts-host-boot.js';
-import { defaultControlSignalObserver } from '../../input/control-signal-observer.js';
+import { registerDashboardDelegatedSlashes } from './dashboard-delegated-slashes.js';
 import {
   addAllowed,
   hostOf,
@@ -345,17 +343,9 @@ import { inputHistoryDbPath, inputHistoryJsonPath } from '../../input-history.js
 import { termSize, stripAnsi } from '../../tui.js';
 import { SLASH_COMMANDS } from '../../chat/index.js';
 import { buildEssentialHelpLines } from './help-from-registry.js';
+import { registerDashboardLogSlash } from './dashboard-log-slash.js';
 import { HUMAN_MODEL_WORDS, MODEL_CODE_NAMES, humanWordForModel, modelChangeLine, modelOverviewLines, modelScopeLine, modelSwitchScope, parseModelSlashArgs, resolveModelChoice } from './model-choices.js';
 import type { FoldMode } from '../../log-entry.js';
-import { resolveDashboardChatMainLogCommand } from '../input/chat-main-log-command.js';
-import {
-  dashboardLogHelpLines,
-  resolveDashboardLogFilterAction,
-  resolveDashboardLogFoldAction,
-  resolveDashboardLogSearchAction,
-  resolveDashboardLogSizeAction,
-  resolveDashboardLogTurnAction,
-} from '../input/chat-main-log-actions.js';
 import { debug } from '../../debug/log.js';
 import { observeSessionStart } from '../../session/session-start.js';
 import { resolveDebugCompanionTargets } from '../../window/debug-window-consumers.js';
@@ -375,12 +365,10 @@ import {
 } from '../../session/index.js';
 import { safeReadLock as telegramSafeReadLock, defaultLockPath as telegramDefaultLockPath } from '../../telegram-lock.js';
 import { userConfigPath as userConfigPathFn } from '../../user-config.js';
-import { dirname as pathDirname, relative } from 'node:path';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { dirname as pathDirname, relative, resolve as resolvePath } from 'node:path';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { installPlugin, listInstalledPlugins, type InstalledPlugin } from '../../plugins/install/plugin-install.js';
 import type { SurfaceUx } from '../../agent/surface-ux/types.js';
-import type { AskUserQuestionRequest } from '../../ask-user-question/types.js';
-import { DASHBOARD_CLARIFICATION_REQUEST } from '../../esc-abort-gate.js';
-import type { GoalDocumentClarification } from '../../self-implement/goal-author-clarification.js';
 import { renderReplayPreviewLines } from '../replay-preview.js';
 import {
   deriveDaemonHttpBase,
@@ -392,6 +380,8 @@ import { resolveLocalEndpoints, runLocalLLMCompat } from '../../local-llm-test.j
 import { registerTermSlash, type TermSlashHost } from '../../tui/slash/term.js';
 // 옛 입구 re-export shim 은 slash-runtime/index.ts 한 곳뿐(RFC A5 · /mission 과 같은 꼴).
 import { SlashCommandRegistry } from './registry.js';
+import { readDashboardAskClarification } from './ask-clarification.js';
+export { readDashboardAskClarification };
 import { createLoopScheduler, type LoopScheduler } from '../loop-scheduler.js';
 import { registerShellSlash } from './shell-slash.js';
 export { registerShellSlash } from './shell-slash.js';
@@ -670,7 +660,7 @@ export interface DashboardSlashContext {
     /** Host-local pluginHost ref (opaque structural type). */
     host: {
       list(): readonly {
-        source: 'builtin' | 'user';
+        source: 'builtin' | 'user' | 'workspace' | 'installed';
         plugin: { name: string; version: string; description: string };
       }[];
       isActive(name: string): boolean;
@@ -923,9 +913,8 @@ export interface DashboardSlashContext {
 
   // B-3.a additions — /log pane control. Most state (filter / search /
   // freeze / turn-separator / height-bias / fold-mode / chat-only mode)
-  // is showDashboard-local. Static helpers (resolveDashboardChatMainLog
-  // Command + dashboardLogHelpLines + resolveDashboardLog*Action fns +
-  // stripAnsi) are static-imported in this module; only host-local state
+  // is showDashboard-local. The /log command and action helpers live in
+  // dashboard-log-slash.ts; only host-local state
   // readers / mutators land in ctx.
   logSlash: {
     pushDebugBlank(): void;
@@ -1185,49 +1174,6 @@ export type DashboardSlashReturn = 'quit';
 type SelfOrchestrateSlashRuntime = Pick<ToolRuntime<Record<string, unknown>, { output: string }>, 'run'>;
 let selfOrchestrateSlashRuntime: SelfOrchestrateSlashRuntime = selfOrchestrateRuntime;
 
-/**
- * Converts the line-oriented self-dev clarification seam into the existing
- * structured SurfaceUx question contract. A missing, cancelled, or failed
- * surface answer becomes an empty line, which preserves clarification's
- * existing "unanswered → deferred" behavior without exposing answer text to
- * the observation payload emitted by SurfaceUx.
- */
-export async function readDashboardAskClarification(
-  clarification: GoalDocumentClarification,
-  surfaceUx: Pick<SurfaceUx, 'question'> | undefined,
-  notify?: (line: string) => void,
-): Promise<string> {
-  if (!surfaceUx) return '';
-  const request: AskUserQuestionRequest = {
-    questions: [{
-      id: clarification.questionId,
-      header: 'Clarify goal',
-      question: clarification.question,
-      options: clarification.options.map((option) => ({
-        label: option.label,
-        description: option.description,
-      })),
-      includeOther: clarification.includeOther,
-    }],
-  };
-  Object.defineProperty(request, DASHBOARD_CLARIFICATION_REQUEST, { value: true });
-  try {
-    const pending = surfaceUx.question(request);
-    const id = clarification.questionId;
-    notify?.('하니스가 묻는다 — 창에서 고르거나 Esc 로 답 없이 진행');
-    const result = await pending;
-    if (!result || result.cancelled) return '';
-    const answer = result.answers[id];
-    const selectedLabel = Array.isArray(answer) ? answer[0] : answer;
-    const optionIndex = clarification.options.findIndex((option) => option.label === selectedLabel);
-    if (optionIndex >= 0) return String(optionIndex);
-    const other = clarification.includeOther ? result.otherText?.[id]?.trim() : '';
-    return other || '';
-  } catch {
-    return '';
-  }
-}
-
 /** Test seam for verifying the literal /dev payload reaches the runtime front door. */
 export function _setSelfOrchestrateSlashRuntimeForTesting(runtime: SelfOrchestrateSlashRuntime | null): void {
   selfOrchestrateSlashRuntime = runtime ?? selfOrchestrateRuntime;
@@ -1312,6 +1258,36 @@ function parseLoopInterval(raw: string): { intervalMs: number; label: string } |
     : unit === 'h' || unit === '시간' ? `${amount}시간`
     : `${amount}분`;
   return { intervalMs, label };
+}
+
+type DashboardPluginInstallerDeps = {
+  cwd?: string;
+  install?: (path: string) => Promise<InstalledPlugin>;
+};
+
+/** Install one local plugin directory through the same installer and ledger as `eln plugin add`. */
+export async function installDashboardPluginFromPath(
+  spec: string,
+  deps: DashboardPluginInstallerDeps = {},
+): Promise<InstalledPlugin> {
+  const requested = spec.trim();
+  if (!requested) throw new Error('usage: /plugin install <경로>');
+  const path = resolvePath(deps.cwd ?? process.cwd(), requested);
+  let isDirectory = false;
+  try { isDirectory = statSync(path).isDirectory(); } catch { /* report the same path-level failure below */ }
+  if (!isDirectory) throw new Error(`plugin path is not a directory: ${path}`);
+  if (!existsSync(resolvePath(path, 'plugin.json'))) throw new Error(`plugin.json required: ${path}`);
+  return (deps.install ?? installPlugin)(path);
+}
+
+export function unhostedInstalledDashboardPlugins(
+  hostItems: readonly { source: 'builtin' | 'user' | 'workspace' | 'installed'; plugin: { name: string; version: string } }[],
+  installed: readonly InstalledPlugin[] = listInstalledPlugins(),
+): InstalledPlugin[] {
+  const loadedInstallations = new Set(hostItems
+    .filter(it => it.source === 'installed')
+    .map(it => `${it.plugin.name}@${it.plugin.version}`));
+  return installed.filter(it => !loadedInstallations.has(`${it.name}@${it.version}`));
 }
 
 export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedger?: DecisionLedger): SlashCommandRegistry<DashboardSlashContext, DashboardSlashReturn> {
@@ -2026,72 +2002,8 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     ctx.setChatScrollOffset(-1);
   });
 
-  // ── B-1.g ─────────────────────────────────────────────────────────
-  // 3 sub-runtime delegation cases. Each routes sub-commands to a
-  // slashRuntime factory output (controlSignal / browserCdp / widgetHost).
-  // The slashRuntimes are bound to deps inside showDashboard, so we
-  // thread their public APIs through ctx.
-
-  registry.register(['signals', 'signal'], (args, ctx) => {
-    const sub = (args[0] || 'status').toLowerCase();
-    const rt = ctx.controlSignalSlashRuntime;
-    ctx.chatLines.push('');
-    ctx.chatLines.push(ctx.accent(`❯ /signals ${args.join(' ').trim() || 'status'}`));
-    if (sub === 'help') {
-      for (const line of rt.usageLines()) ctx.chatLines.push(line);
-    } else if (sub === 'status') {
-      for (const line of rt.statusLines()) ctx.chatLines.push(line);
-    } else if (sub === 'clear') {
-      defaultControlSignalObserver().clear();
-      ctx.chatLines.push(rt.clearLine());
-    } else if (sub === 'latest') {
-      const parsed = rt.parseFilterTokens(args.slice(1));
-      for (const line of rt.latestLines(parsed.filter)) ctx.chatLines.push(line);
-    } else if (sub === 'list' || sub === 'ls') {
-      const parsed = rt.parseFilterTokens(args.slice(1));
-      for (const line of rt.listLines(parsed.limit, parsed.filter)) ctx.chatLines.push(line);
-    } else if (sub === 'emit') {
-      for (const line of rt.emitLines(args.slice(1))) ctx.chatLines.push(line);
-    } else {
-      for (const line of rt.usageLines()) ctx.chatLines.push(line);
-    }
-    ctx.setChatScrollOffset(-1);
-  });
-
-
-  registry.register(['widget', 'widgets', 'w'], async (args, ctx) => {
-    const sub = (args[0] || 'list').toLowerCase();
-    const host = ctx.widgetHost;
-    ctx.chatLines.push('');
-    ctx.chatLines.push(ctx.accent(`❯ /widget ${sub}${args.slice(1).length ? ' ' + args.slice(1).join(' ') : ''}`));
-    try {
-      if (sub === 'list' || sub === 'ls') {
-        const items = host.available();
-        if (items.length === 0) {
-          ctx.chatLines.push(ctx.muted('  (no widgets found — drop one in ~/.claude/widgets/<name>/widget.ts)'));
-        } else {
-          for (const it of items) {
-            const src = it.source === 'builtin' ? ctx.muted('[built-in]') : ctx.info('[user]');
-            // The original used `C.bold` but ctx doesn't expose `bold`;
-            // we substitute `accent` (visually similar) since handlers
-            // module's color contract is the published ctx subset.
-            ctx.chatLines.push(`  ▢ ${ctx.accent(it.def.type)} ${src}  ${ctx.muted(it.def.description)}`);
-          }
-        }
-      } else if (sub === 'reload' || sub === 'r') {
-        await host.discover();
-        ctx.chatLines.push(ctx.success(`  reloaded — ${host.available().length} widget type(s) discovered`));
-      } else if (sub === 'instances' || sub === 'i') {
-        const count = host.instanceCount();
-        ctx.chatLines.push(`  ${count} widget instance(s) alive`);
-      } else {
-        ctx.chatLines.push(ctx.warning(`  unknown subcommand: ${sub} (try list|reload|instances)`));
-      }
-    } catch (err: unknown) {
-      ctx.chatLines.push(ctx.error(`  error: ${err instanceof Error ? err.message : String(err)}`));
-    }
-    ctx.setChatScrollOffset(-1);
-  });
+  // B-1.g — /signals and /widget delegate to showDashboard-local runtimes.
+  registerDashboardDelegatedSlashes(registry);
 
   // ── B-1.h ─────────────────────────────────────────────────────────
   // Session/context cluster. Reuses ctx fields already wired (chatModeStateRef,
@@ -3307,193 +3219,7 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
 
   // ── B-3.a ─────────────────────────────────────────────────────────
 
-  registry.register('log', async (args, ctx) => {
-    // Log pane control. Routes through resolveDashboardChatMainLog
-    // Command + resolveDashboardLog*Action helpers (all static-imported
-    // above). Host-local state — heightBias / filter / search / freeze /
-    // turnSeparator / foldMode / chatOnly — comes via ctx.logSlash.
-    // Replies go to the chat buffer the person is looking at — never the
-    // debug buffer, which the default layout does not draw.
-    const logCommand = resolveDashboardChatMainLogCommand(args);
-    if (debug.enabled) {
-      debug.log('slash.log.handler', 'enter', {
-        argsCount: args.length,
-        args0: args[0] ?? null,
-        kind: logCommand.kind,
-        // unknown branch carries subcommand
-        unknownSub: logCommand.kind === 'unknown' ? logCommand.subcommand : null,
-      });
-    }
-    if (logCommand.kind === 'help') {
-      const lines = dashboardLogHelpLines();
-      for (const [index, line] of lines.entries()) {
-        if (line === '') {
-          emitReplyToChat(ctx, '');
-        } else if (index === 0) {
-          emitReplyToChat(ctx, ctx.accent(line));
-        } else {
-          emitReplyToChat(ctx, ctx.muted(line));
-        }
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (logCommand.kind === 'size') {
-      const action = resolveDashboardLogSizeAction(logCommand.delta, ctx.logSlash.getLogHeightBias());
-      if (action.kind === 'invalid') {
-        emitReplyToChat(ctx, ctx.warning(action.message));
-      } else {
-        ctx.logSlash.setLogHeightBias(action.nextBias);
-        ctx.logSlash.recomputePaneHeight();
-        emitReplyToChat(ctx, ctx.muted(action.message));
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (logCommand.kind === 'copy-all') {
-      await ctx.logSlash.copyEntireLog();
-      return;
-    }
-    if (logCommand.kind === 'return-to-input') {
-      ctx.logSlash.returnFocusToInput();
-      return;
-    }
-    if (logCommand.kind === 'clear') {
-      ctx.chatLines.length = 0;
-      ctx.attachmentRowMap.clear();
-      ctx.clearLogSearch();
-      ctx.clearLogFilter();
-      emitReplyToChat(ctx, ctx.muted('Log cleared.'));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (logCommand.kind === 'filter') {
-      const q = logCommand.query;
-      const currentQuery = ctx.logSlash.getLogFilterQuery();
-      const activeCount = ctx.chatLines.filter(
-        line => stripAnsi(line).toLowerCase().includes((q || currentQuery).toLowerCase()),
-      ).length;
-      const action = resolveDashboardLogFilterAction(q, currentQuery, activeCount);
-      if (action.kind === 'clear') {
-        ctx.clearLogFilter();
-        emitReplyToChat(ctx, ctx.muted(action.message));
-      } else if (action.kind === 'show-status') {
-        emitReplyToChat(ctx, ctx.muted(action.message));
-      } else {
-        ctx.logSlash.applyLogFilter(q);
-        emitReplyToChat(ctx, ctx.muted(action.message));
-        ctx.setChatScrollOffset(-1);
-      }
-      return;
-    }
-    if (logCommand.kind === 'search') {
-      const q = logCommand.query;
-      const action = resolveDashboardLogSearchAction(q);
-      if (action.kind === 'clear') {
-        ctx.clearLogSearch();
-        emitReplyToChat(ctx, ctx.muted(action.message));
-      } else if (action.kind === 'open-modal') {
-        ctx.logSlash.openLogSearchModal();
-      } else {
-        ctx.logSlash.applyLogSearch(action.query);
-        const count = ctx.logSlash.getLogSearchResultsCount();
-        if (count === 0) {
-          emitReplyToChat(ctx, ctx.muted(`  no matches for "${action.query}"`));
-        } else {
-          emitReplyToChat(ctx, ctx.muted(
-            `  ${count} match${count === 1 ? '' : 'es'} for "${action.query}" — n / N to cycle, Esc to clear`,
-          ));
-          // Jump to the first one.
-          const firstIdx = ctx.logSlash.firstSearchResultLineIdx();
-          if (firstIdx !== null) ctx.logSlash.scrollToSearchLineIdx(firstIdx);
-        }
-      }
-      // Original case had `chatScrollOffset = chatScrollOffset` no-op
-      // — preserved here as no setChatScrollOffset call (intentional).
-      return;
-    }
-    if (logCommand.kind === 'freeze') {
-      if (!ctx.logSlash.isLogFreezeEnabled()) {
-        emitReplyToChat(ctx, ctx.muted('  scroll-freeze DISABLED (ELANOUS_LOG_PAUSE_ON_SCROLL=0).'));
-      } else {
-        const frozenIdx = ctx.logSlash.getLogFrozenTailIndex();
-        if (frozenIdx === null) {
-          emitReplyToChat(ctx, ctx.muted('  scroll-freeze inactive — log tail is live.'));
-        } else {
-          const queued = Math.max(0, ctx.logSlash.chatLinesLength() - frozenIdx);
-          emitReplyToChat(ctx, ctx.muted(`  scroll-freeze active — ${queued} line${queued === 1 ? '' : 's'} queued. Press G to resume.`));
-        }
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (logCommand.kind === 'solo') {
-      const next = ctx.logSlash.toggleSolo();
-      const message = next
-        ? '  log solo ON — chat-only layout active.'
-        : '  log solo OFF — dashboard layout restored.';
-      emitReplyToChat(ctx, ctx.muted(message));
-      if (debug.enabled) {
-        debug.log('slash.log.solo', next ? 'on' : 'off', {
-          newChatOnlyMode: next,
-        });
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (logCommand.kind === 'fold-all') {
-      if (!ctx.logSlash.setAllFolds) {
-        // A host without a fold controller cannot know whether anything is folded — say so, not «nothing».
-        debug.log('log.fold', 'slash-set-all', { expanded: logCommand.expanded, changed: null, reason: 'no-fold-controller' });
-        emitReplyToChat(ctx, ctx.warning('  fold controls are not available in this view'));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const changed = ctx.logSlash.setAllFolds(logCommand.expanded);
-      debug.log('log.fold', 'slash-set-all', { expanded: logCommand.expanded, changed });
-      emitReplyToChat(ctx, ctx.muted(changed > 0
-        ? `  ${logCommand.expanded ? 'unfolded' : 'folded'} ${changed} block${changed === 1 ? '' : 's'}`
-        : `  (nothing to ${logCommand.expanded ? 'unfold' : 'fold'})`));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (logCommand.kind === 'fold') {
-      const action = resolveDashboardLogFoldAction(logCommand.mode, ctx.logSlash.getLogFoldMode());
-      if (action.kind === 'set-mode') {
-        ctx.logSlash.setLogFoldMode(action.mode);
-        emitReplyToChat(ctx, ctx.muted(action.message));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      emitReplyToChat(ctx, ctx.warning(action.message));
-      emitReplyToChat(ctx, ctx.muted(action.usage));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (logCommand.kind === 'turn') {
-      const action = resolveDashboardLogTurnAction(logCommand.arg, ctx.logSlash.getLogTurnSeparatorMode());
-      if (action.kind === 'emit-now') {
-        const prev = ctx.logSlash.getLogTurnSeparatorMode();
-        ctx.logSlash.setLogTurnSeparatorMode(action.nextModeWhileEmitting);
-        ctx.logSlash.pushTurnSeparator();
-        ctx.logSlash.setLogTurnSeparatorMode(prev);
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      if (action.kind === 'set-mode') {
-        ctx.logSlash.setLogTurnSeparatorMode(action.mode);
-        emitReplyToChat(ctx, ctx.muted(action.message));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      emitReplyToChat(ctx, ctx.muted(action.message));
-      emitReplyToChat(ctx, ctx.muted(action.usage));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    emitReplyToChat(ctx, ctx.warning(`  Unknown /log subcommand: ${logCommand.subcommand}. Try /log help.`));
-    ctx.setChatScrollOffset(-1);
-  });
+  registerDashboardLogSlash(registry, emitReplyToChat);
 
   registry.register('debug', async (args, ctx) => {
     // Runtime tracer controls. The `debug` module (debug-log.ts) is a
@@ -4028,14 +3754,28 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     try {
       if (sub === 'list' || sub === 'ls') {
         const items = ctx.plugin.host.list();
-        if (items.length === 0) {
+        const unhosted = unhostedInstalledDashboardPlugins(items);
+        if (items.length === 0 && unhosted.length === 0) {
           ctx.chatLines.push(ctx.muted('  (no plugins found — drop one in ~/.claude/plugins/<name>/plugin.ts)'));
         } else {
           for (const it of items) {
             const marker = ctx.plugin.host.isActive(it.plugin.name) ? ctx.success('●') : ctx.muted('○');
-            const src = it.source === 'builtin' ? ctx.muted('[built-in]') : ctx.info('[user]');
+            const src = it.source === 'builtin' ? ctx.muted('[built-in]')
+              : it.source === 'installed' ? ctx.info('[installed]') : ctx.info(`[${it.source}]`);
             ctx.chatLines.push(`  ${marker} ${ctx.plugin.bold(it.plugin.name)} ${ctx.muted('v' + it.plugin.version)} ${src}  ${ctx.muted(it.plugin.description)}`);
           }
+          for (const it of unhosted) {
+            ctx.chatLines.push(`  ${ctx.muted('○')} ${ctx.plugin.bold(it.name)} ${ctx.muted('v' + it.version)} ${ctx.info(`[installed:${it.market}]`)}`);
+          }
+        }
+      } else if (sub === 'install' || sub === 'add') {
+        const path = args.slice(1).join(' ');
+        if (!path) {
+          ctx.chatLines.push(ctx.warning('  usage: /plugin install <경로>'));
+        } else {
+          const installed = await installDashboardPluginFromPath(path);
+          ctx.chatLines.push(ctx.success(`  installed: ${installed.name}@${installed.version}`));
+          ctx.chatLines.push(ctx.muted('  확인: /plugin list'));
         }
       } else if (sub === 'activate' || sub === 'a') {
         const name = args[1];
@@ -4075,7 +3815,7 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
           ctx.chatLines.push(ctx.success(`  reloaded: ${name}`));
         }
       } else {
-        ctx.chatLines.push(ctx.warning(`  unknown subcommand: ${sub} (try list|activate|deactivate|reload)`));
+        ctx.chatLines.push(ctx.warning(`  unknown subcommand: ${sub} (try install|list|activate|deactivate|reload)`));
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);

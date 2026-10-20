@@ -15,6 +15,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { extname, join, relative, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
+import { passJourneyNode } from '../self-dev/graph-journey-nodes.js';
+import { readJourneyEdge, recordJourneyEdge } from '../self-dev/graph-journey-route.js';
 import { readTaskAgentState, readTaskCard, taskAgentStatePath, TASK_CARD_PREFIX, type CompletionKind, type TaskCard } from './task-hand.js';
 import type { SupervisorJobResult, SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import { executeNextAction, type ActionDeps, type DeliveryKind, type NextAction } from './actions.js';
@@ -327,14 +329,22 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
       checklistId: delivery ? card?.checklistId ?? '' : '',
       ...(delivery ? { delivery } : {}),
     };
-    const liveRetry = !delivery && deps.command !== undefined && deps.loadGate !== undefined
-      && (LIVE_RETRY_MOVES as readonly string[]).includes(judgement.move) && liveMoves.has(judgement.move as TaskAgentLiveMove);
+    const retryMove = !delivery && (LIVE_RETRY_MOVES as readonly string[]).includes(judgement.move);
+    const route = retryMove ? readJourneyEdge('next-move', judgement.move,
+      { move: judgement.move, source: judgeInput.pr ? `pr:${judgeInput.pr}` : `run:${input.runId ?? 'unknown'}`, runId: input.runId }) : null;
+    const liveRetry = retryMove && route?.source === 'graph' && route.to === 'dispatch'
+      && deps.command !== undefined && deps.loadGate !== undefined && liveMoves.has(judgement.move as TaskAgentLiveMove);
     executorResult = await executeNextAction(action, {
       mode: delivery ? (deps.mode ?? 'shadow') : liveRetry ? 'live' : 'shadow',
       command: deps.command ?? (async () => { throw new Error('task-agent shadow path must not run commands'); }),
       observe: (_event, data) => { wouldDo = data.reason; },
       ...(liveRetry ? { liveMoves, retryLaunches, loadGate: deps.loadGate } : {}),
     });
+    if (liveRetry && executorResult === 'done' && route) {
+      passJourneyNode('next-move', { provenance: 'task-agent-terminal', outcome: judgement.move,
+        runId: input.runId ?? undefined, data: { source: judgeInput.pr ? `pr:${judgeInput.pr}` : `run:${input.runId ?? 'unknown'}`, pr: judgeInput.pr ?? null } });
+      recordJourneyEdge(route, 'dispatch');
+    }
   }
   const move: TaskAgentShadowMove = {
     runId: input.runId,

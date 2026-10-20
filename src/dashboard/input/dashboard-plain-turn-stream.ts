@@ -39,6 +39,7 @@ export interface DashboardPlainTurnAcpSend {
     onToolCall: (call: unknown) => void;
     onToolResult: (call: unknown) => void;
     onUsage: (usage: unknown) => void;
+    onThought?: (text: string) => void;
   }): Promise<unknown>;
 }
 
@@ -55,6 +56,8 @@ export interface DashboardPlainTurnStreamDeps {
   onToolCall: (call: unknown) => void;
   onToolResult: (call: unknown) => void;
   onUsage: (usage: unknown) => void;
+  /** TUI-TURN-NARRATION — 추론 요약 문단(선택). */
+  onThought?: (text: string) => void;
 
   /** Auto-TTS hooks. `pushChunk` is fired on every text delta;
    *  `commit` / `cancel` are called by the settle sink in the
@@ -173,6 +176,7 @@ export async function runDashboardPlainTurnStream(
         deps.onToolResult(call);
       },
       onUsage: (usage) => deps.onUsage(usage),
+      ...(deps.onThought ? { onThought: (text: string) => deps.onThought!(text) } : {}),
     });
     settled = deps.abortCtrl.signal.aborted ? 'cancelled' : 'end_turn';
     // Return the cumulative full response so commit / metrics / autocopy

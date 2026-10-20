@@ -6,7 +6,7 @@ import { resolveRepositoryName } from '../harness/repository-name.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { userConfigPath } from '../user-config.js';
-import { addItem, checklistHistory, inspectChecklistTargetPaths, listChecklist, ownerMatches, parseOwner, setItem, validateCeoLoad, type ChecklistItem } from './checklist.js';
+import { addItem, checklistHistory, listChecklist, ownerMatches, parseOwner, setItem, validateCeoLoad, type ChecklistItem } from './checklist.js';
 import { assignedVersions, move, releasedVersion } from './feature-store.js';
 import { debug } from '../debug/log.js';
 import { kstDay, listSchedules, type ReleaseSchedule } from './release-schedule.js';
@@ -455,8 +455,15 @@ export function planPullForward(deps: PullForwardDeps): RebalanceResult {
     else incomplete.add(item.id);
   }
   const targetPathsReady = (title: string): boolean => {
-    const check = inspectChecklistTargetPaths({ title }, { existsAtMain: deps.targetPathExists });
-    return check.targets.length > 0 && check.warnings.length === 0;
+    const lines = title.split(/\r?\n/);
+    const first = /^대상 경로:\s*(.*)$/.exec(lines[0] ?? '');
+    if (!first) return false;
+    // Pull-forward reads existing cells. Preserve its original path token and
+    // second-line 신설: rules; strict authoring has a separate, richer contract.
+    const paths = [...first[1]!.matchAll(/(?:^|[^A-Za-z0-9_.\/-])((?:(?:[A-Za-z0-9_.-]+\/)+)?[A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|yaml|yml|sh|py|css|html|toml|sql|rs|swift))(?![A-Za-z0-9_.\/-])/g)]
+      .map((match) => match[1]!).filter((path) => !path.split('/').includes('..'));
+    const legacyNewFile = /^신설:\s*/.test(lines[1] ?? '');
+    return paths.length > 0 && paths.every((path) => deps.targetPathExists(path) || legacyNewFile);
   };
   const candidates = snapshots.get(source.version)!.filter((item) =>
     (item.priority === 'P0' || item.priority === 'P1') && item.status !== 'green' && item.status !== 'done'

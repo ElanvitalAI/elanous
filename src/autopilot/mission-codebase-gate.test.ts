@@ -1,4 +1,4 @@
-import { describe, test, expect, spyOn } from 'bun:test';
+import { describe, test, expect, spyOn, afterEach } from 'bun:test';
 import { isImplementationGoal, searchCodebase, searchRepositoryDocuments, groundMissionInSkills, groundMissionInMemory, groundMissionInCodebase, groundMissionInCapsules, extractExportedSymbols, refFactsFromDigest, expandHyphenatedSearchTerms, hasRepositorySpecificIdentifier, type SkillPickFn, isCorpusGrounded, isRepositoryImplementationCandidate, defaultSearchTerms, pickSkillsViaLlm } from './mission-codebase-gate.js';
 import type { PersistentGroundingDeps } from '../skills/tools/persistent-grounding.js';
 import type { SkillIndexEntry } from '../skills/index.js';
@@ -14,6 +14,26 @@ import * as modelDefaults from '../llm/model-defaults.js';
 import * as llm from '../llm.js';
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
 
+// ⭐ debug.log 바꿔치기 복원 보장(TF #9714 연쇄 수리 · bun 1.4.2 실측) — 타임아웃으로 버려진 본문은
+// pend 상태로 남아 «다음 테스트 도중»에 재개되고, 그 늦은 finally 가 다음 시험이 방금 설치한 override 를
+// 덮어썐다(cwd seam corpus 657행 연쇄의 실제 메커니즘). afterEach 는 타임아웃 직후·다음 테스트 전에
+// 반드시 돌므로 끝나지 않은 본문도 여기서 복원된다. 각 시험의 finally 복원은 정상 경로 즉시 복원으로 남긴다.
+const pristineDebugLog = debug.log;
+afterEach(() => {
+  (debug as { log: typeof debug.log }).log = pristineDebugLog;
+});
+
+// 이 두 시험은 경계 복원을 직접 반증한다: afterEach 를 제거하면 둘째가 실패한다.
+describe('debug.log 시험 경계 복원', () => {
+  test('첫 시험이 자기 override 를 남긴다', () => {
+    (debug as { log: typeof debug.log }).log = (() => undefined) as typeof debug.log;
+    expect(debug.log).not.toBe(pristineDebugLog);
+  });
+  test('다음 시험은 원본 debug.log 로 시작한다', () => {
+    expect(debug.log).toBe(pristineDebugLog);
+  });
+});
+
 function fakeSkill(over: Partial<SkillIndexEntry>): SkillIndexEntry {
   return {
     name: 'x', description: '', triggers: [], extractedTriggers: [], triggerSource: 'none',
@@ -23,7 +43,6 @@ function fakeSkill(over: Partial<SkillIndexEntry>): SkillIndexEntry {
 
 describe('defaultSearchTerms 관측 계약', () => {
   test('LLM 입력이 500자를 넘으면 실제 절단량과 제한된 ask를 관측한다', async () => {
-    const originalLog = debug.log.bind(debug) as typeof debug.log;
     const logs: { category: string; event: string; data: unknown }[] = [];
     const goal = `${'a'.repeat(500)} tail-token`;
     const client: NonNullable<Parameters<typeof defaultSearchTerms>[1]> = {
@@ -46,7 +65,7 @@ describe('defaultSearchTerms 관측 계약', () => {
         data: { goalChars: goal.length, llmGoalChars: 500, truncatedChars: goal.length - 500 },
       });
     } finally {
-      (debug as { log: typeof debug.log }).log = originalLog;
+      // afterEach owns restoration, even when a timed-out body resumes late.
     }
   });
 
@@ -57,7 +76,6 @@ describe('defaultSearchTerms 관측 계약', () => {
   });
 
   test('LLM 실패는 전문 토큰 폴백과 그 경로를 관측한다', async () => {
-    const originalLog = debug.log.bind(debug) as typeof debug.log;
     const logs: { category: string; event: string; data: unknown }[] = [];
     const goal = `${'한'.repeat(500)} full-goal-token`;
     const client: NonNullable<Parameters<typeof defaultSearchTerms>[1]> = {
@@ -75,7 +93,7 @@ describe('defaultSearchTerms 관측 계약', () => {
         data: { fallbackSource: 'full-goal', fallbackTerms: 1, error: 'test-llm-failure' },
       });
     } finally {
-      (debug as { log: typeof debug.log }).log = originalLog;
+      // afterEach owns restoration, even when a timed-out body resumes late.
     }
   });
 });
@@ -301,7 +319,7 @@ describe('하이픈 검색어 확장', () => {
   test('self-author의 구성 토큰 검색이 goal-author.ts를 찾는다', async () => {
     const files = await searchCodebase(expandHyphenatedSearchTerms(['self-author']), 80);
     expect(files).toContain('src/self-implement/goal-author.ts');
-  });
+  }, 30_000);
 
   test('searchTerms seam을 주입해도 persistent loop를 끄지 않는다', async () => {
     const grounded = await groundMissionInCodebase('self author 계약', {
@@ -320,7 +338,7 @@ describe('하이픈 검색어 확장', () => {
     expect(grounded.persistentEvidenceItems).toEqual([
       { text: 'src/self-implement/goal-author.ts: verified', sourceKind: 'code' },
     ]);
-  });
+  }, 30_000);
 
   test('주입한 서로 다른 terms가 persistent 코드 채널의 codeFiles 후보를 분기한다', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'persistent-grounding-terms-'));
@@ -359,7 +377,6 @@ describe('하이픈 검색어 확장', () => {
   });
 
   test('grounding 집계기가 확장 term으로 저작기 후보를 찾고 관측한다', async () => {
-    const original = debug.log.bind(debug) as typeof debug.log;
     const logs: { category: string; event: string; data: unknown }[] = [];
     (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
       logs.push({ category, event, data });
@@ -381,9 +398,9 @@ describe('하이픈 검색어 확장', () => {
         category: 'grounding.search', event: 'term-expanded', data: { inputTerms: 1, outputTerms: 3 },
       });
     } finally {
-      (debug as { log: typeof debug.log }).log = original;
+      // afterEach owns restoration, even when a timed-out body resumes late.
     }
-  });
+  }, 30_000);
 });
 
 describe('searchCodebase', () => {
@@ -394,7 +411,7 @@ describe('searchCodebase', () => {
     const files = await searchCodebase(['memory', 'decay', 'consolidate', 'archive', 'tier', 'recall'], 8);
     expect(files.some((f) => f.includes('surface-events') || f.includes('memory-'))).toBe(true);
     expect(files.every((f) => !f.includes('.test.'))).toBe(true);
-  });
+  }, 30_000);
   test('고정 fixture 문서를 보존하되 구현 후보에서는 분리한다', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'repository-document-fixture-'));
     const documentPath = join('docs', 'grounding-fixture.md');
@@ -420,7 +437,6 @@ describe('searchCodebase', () => {
   test('집계기는 고정 fixture 문서를 참조로 보존하고 files에는 넣지 않으며 분리 관측을 남긴다', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'grounding-document-fixture-'));
     const documentPath = join('docs', 'grounding-fixture.md');
-    const original = debug.log.bind(debug) as typeof debug.log;
     const logs: { category: string; event: string; data: unknown }[] = [];
     (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
       logs.push({ category, event, data });
@@ -454,14 +470,13 @@ describe('searchCodebase', () => {
       expect(logs.find((log) => log.category === 'grounding.search' && log.event === 'doc-split')?.data)
         .toEqual({ code: 1, docs: 1 });
     } finally {
-      (debug as { log: typeof debug.log }).log = original;
+      // afterEach owns restoration, even when a timed-out body resumes late.
       rmSync(cwd, { recursive: true, force: true });
     }
   });
 
   test('경로에 유일한 파일명 term은 강하게 적용하고 희소성 보정값을 관측한다', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'mission-codebase-gate-'));
-    const original = debug.log.bind(debug) as typeof debug.log;
     const logs: { category: string; event: string; data: unknown }[] = [];
     (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
       logs.push({ category, event, data });
@@ -482,14 +497,13 @@ describe('searchCodebase', () => {
         data: { term: 'common', file: 'src/session/common-fanout.ts', common: false, pathMatches: 1, weight: 25 },
       });
     } finally {
-      (debug as { log: typeof debug.log }).log = original;
+      // afterEach owns restoration, even when a timed-out body resumes late.
       rmSync(cwd, { recursive: true, force: true });
     }
   });
 
   test('흔한 경로 조각은 감쇠되어 내용 일치 정답을 밀어내지 않는다', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'mission-codebase-gate-'));
-    const original = debug.log.bind(debug) as typeof debug.log;
     const logs: { category: string; event: string; data: unknown }[] = [];
     (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
       logs.push({ category, event, data });
@@ -513,20 +527,33 @@ describe('searchCodebase', () => {
         data: { term: 'index', file: 'src/index.ts', common: false, pathMatches: 101, weight: 2 },
       });
     } finally {
-      (debug as { log: typeof debug.log }).log = original;
+      // afterEach owns restoration, even when a timed-out body resumes late.
       rmSync(cwd, { recursive: true, force: true });
     }
   });
 
   test('tooCommon term은 후보와 파일명 히트에 남기고 coverage 가중에서만 제외', async () => {
+    // 실제 저장소 대신 고정 fixture — 실제 저장소 searchCodebase 7회는 단독 2.66s(TF #9714 실측)로 bun
+    // 기본 5s 한도의 절반을 쓰고 부하에서 넘쳤다. fixture 는 tooCommon 역치(commonCount > 200·src+docs+scripts
+    // 파일 수)와 랭킹을 결정론으로 재현한다. 명시 30s 한도는 부하 변동에 대한 두번째 방어선이다.
+    const cwd = mkdtempSync(join(tmpdir(), 'too-common-fixture-'));
     const original = debug.log.bind(debug) as typeof debug.log;
     const logs: { category: string; event: string; data: unknown }[] = [];
-    (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
+    const swap = ((category: string, event: string, data?: unknown) => {
       logs.push({ category, event, data });
     }) as typeof debug.log;
+    (debug as { log: typeof debug.log }).log = swap;
     try {
+      mkdirSync(join(cwd, 'src', 'session'), { recursive: true });
+      mkdirSync(join(cwd, 'src', 'gen'), { recursive: true });
+      // 생성 파일은 파일명에 term 을 안 넣는다 — name-signal 이 대상 파일 하나에만 걸리게(pathMatches=1 → weight 25).
+      writeFileSync(join(cwd, 'src', 'session', 'session-fanout.ts'), 'fanout\n'.repeat(20));
+      for (let i = 0; i < 220; i += 1) writeFileSync(join(cwd, 'src', 'gen', `gen-${String(i).padStart(3, '0')}.ts`), 'fanout\n');
+      execFileSync('git', ['init', '-q'], { cwd });
+      execFileSync('git', ['add', '.'], { cwd });
+
       for (let i = 0; i < 7; i += 1) {
-        const files = await searchCodebase(['fanout'], 80);
+        const files = await searchCodebase(['fanout'], 80, cwd);
         expect(files).toContain('src/session/session-fanout.ts');
         expect(files[0]).toBe('src/session/session-fanout.ts');
         expect(files.every((f) => !f.includes('.test.'))).toBe(true);
@@ -540,9 +567,14 @@ describe('searchCodebase', () => {
         (log.data as { term?: string; file?: string; common?: boolean }).common === true);
       expect(nameSignals).toHaveLength(7);
     } finally {
-      (debug as { log: typeof debug.log }).log = original;
+      // 복원은 소유자 일치(CAS) 가드 — afterEach 가 이미 복원하고 successor 가 자기 override 로 교체한 뒤
+      // 이 본문이 늦게 재개되더라도 successor 의 override 를 덮지 않는다(연쇄 차단).
+      if ((debug as { log: typeof debug.log }).log === swap) {
+        (debug as { log: typeof debug.log }).log = original;
+      }
+      rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });
 
 describe('groundMissionInSkills — skill 인덱스 grounding(P1)', () => {
@@ -622,7 +654,6 @@ describe('groundMissionInMemory — 기억·자기이력·문서벡터 grounding
 describe('groundMissionInCodebase — cwd seam', () => {
   test('호출자가 준 cwd를 persistent·문서 검색·corpus 관측에 함께 고정한다', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'mission-codebase-root-'));
-    const original = debug.log.bind(debug) as typeof debug.log;
     const logs: { category: string; event: string; data: unknown }[] = [];
     const persistentReads: string[] = [];
     (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
@@ -656,7 +687,7 @@ describe('groundMissionInCodebase — cwd seam', () => {
       expect(logs.find((log) => log.category === 'mission.grounding' && log.event === 'corpus')?.data)
         .toMatchObject({ cwd, cwdSource: 'caller' });
     } finally {
-      (debug as { log: typeof debug.log }).log = original;
+      // afterEach owns restoration, even when a timed-out body resumes late.
       rmSync(cwd, { recursive: true, force: true });
     }
   });
@@ -710,7 +741,6 @@ describe('groundMissionInCodebase — cwd seam', () => {
   });
 
   test('cwd를 생략하면 process cwd와 process 출처를 계속 쓰고 실제 검색 경로는 형태를 반환한다', async () => {
-    const original = debug.log.bind(debug) as typeof debug.log;
     const logs: { category: string; event: string; data: unknown }[] = [];
     (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
       logs.push({ category, event, data });
@@ -725,12 +755,11 @@ describe('groundMissionInCodebase — cwd seam', () => {
       expect(logs.find((log) => log.category === 'mission.grounding' && log.event === 'corpus')?.data)
         .toMatchObject({ cwd: process.cwd(), cwdSource: 'process' });
     } finally {
-      (debug as { log: typeof debug.log }).log = original;
+      // afterEach owns restoration, even when a timed-out body resumes late.
     }
-  });
+  }, 30_000);
 
   test('corpus 관측은 persistent 부재·빈 완료 증거·미완 채널을 서로 다른 스칼라로 남긴다', async () => {
-    const original = debug.log.bind(debug) as typeof debug.log;
     const logs: { category: string; event: string; data: unknown }[] = [];
     const quietDeps = {
       searchTerms: async () => ['qxjvplmno'],
@@ -764,12 +793,11 @@ describe('groundMissionInCodebase — cwd seam', () => {
         { persistentEvidence: 0, persistentStopReason: 'end_turn', codeChannel: 'incomplete' },
       ]);
     } finally {
-      (debug as { log: typeof debug.log }).log = original;
+      // afterEach owns restoration, even when a timed-out body resumes late.
     }
-  });
+  }, 30_000);
 
   test('corpus 관측은 예외 경로에도 unavailable persistent 스칼라를 남긴다', async () => {
-    const original = debug.log.bind(debug) as typeof debug.log;
     const logs: { category: string; event: string; data: unknown }[] = [];
     (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
       logs.push({ category, event, data });
@@ -788,12 +816,11 @@ describe('groundMissionInCodebase — cwd seam', () => {
         codeChannel: 'failed',
       });
     } finally {
-      (debug as { log: typeof debug.log }).log = original;
+      // afterEach owns restoration, even when a timed-out body resumes late.
     }
   });
 
   test('timing 관측은 지연 후 실패한 searchTerms·corpus의 실제 경과를 남기며 fail-soft를 유지한다', async () => {
-    const original = debug.log.bind(debug) as typeof debug.log;
     const logs: { category: string; event: string; data: unknown }[] = [];
     const delayMs = 20;
     const sleep = () => new Promise<void>((resolve) => setTimeout(resolve, delayMs));
@@ -828,7 +855,7 @@ describe('groundMissionInCodebase — cwd seam', () => {
       expect(timings[0]!.searchTermsElapsedMs as number).toBeGreaterThanOrEqual(delayMs - 5);
       expect(timings[1]!.corpusElapsedMs as number).toBeGreaterThanOrEqual(delayMs - 5);
     } finally {
-      (debug as { log: typeof debug.log }).log = original;
+      // afterEach owns restoration, even when a timed-out body resumes late.
     }
   });
 });
@@ -1016,7 +1043,6 @@ describe('groundMissionInCodebase — 스킬 계약만 있는 코퍼스도 groun
 
 describe('groundMissionInCodebase — 실행 시간 관측', () => {
   test('전체와 실제 비동기 구간별 비음수 밀리초를 mission.grounding timing으로 남긴다', async () => {
-    const original = debug.log.bind(debug) as typeof debug.log;
     const logs: { category: string; event: string; data: unknown }[] = [];
     (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
       logs.push({ category, event, data });
@@ -1039,7 +1065,7 @@ describe('groundMissionInCodebase — 실행 시간 관측', () => {
         expect(timing?.[key] as number).toBeGreaterThanOrEqual(0);
       }
     } finally {
-      (debug as { log: typeof debug.log }).log = original;
+      // afterEach owns restoration, even when a timed-out body resumes late.
     }
   });
 });

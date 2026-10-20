@@ -22,6 +22,7 @@ import type { BoardNode } from '../task-agent/board.js';
 import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TasksCliDeps } from './tasks-cli.js';
 
 const token = 'secret-acp-token-sentinel';
+const withDoneBoundary = (text: string): string => `${text}\n완료 경계 코드: src/cli/tasks-cli.ts 의 카드 발사\n완료 경계 실물: 지정한 체크리스트 칸이 한 번 발사된다\n완료 경계 증거 명령: bun test src/cli/tasks-cli.test.ts`;
 test('tasks rejudge --all launches at most three new repairs and leaves two for the next tick', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ta-repair-tick-cap-'));
   setElanousConfigDir(dir);
@@ -39,7 +40,7 @@ test('tasks rejudge --all launches at most three new repairs and leaves two for 
       mkdirSync(join(resultPath, '..'), { recursive: true });
       writeFileSync(resultPath, review);
       cards.push({ id, text: 'fix', seat: 'TC', status: 'launched', runId: `run-cap-${n}`,
-        createdAt: '2026-10-15T00:00:00Z', pr: { number: pr, url: `https://github.com/o/r/pull/${pr}` },
+        createdAt: new Date().toISOString(), pr: { number: pr, url: `https://github.com/o/r/pull/${pr}` },
         reviewRequests: [{ pr, head, at: '2026-10-15T00:01:00Z', resultPath }],
         history: [{ at: '2026-10-15T00:02:00Z', event: 'live-move-result', kind: 'review', pr, head,
           verdict: 'fail', reviewed: true, mustFix: 1, reviewRoute: 'api', resultPath,
@@ -62,12 +63,12 @@ test('tasks rejudge --all launches at most three new repairs and leaves two for 
     expect(launched).toHaveLength(3);
     expect(cards.filter((card) => readTaskCard(card.id, statePath)?.repairs?.[0]?.status === 'requested')).toHaveLength(3);
   } finally { resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
-});
+}, 30_000);
 test('tasks adopt-pr binds an existing OPEN PR once without relaunch and queues head rejudge', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ta-adopt-pr-'));
   try {
     const path = join(dir, 'cards.json');
-    const card: TaskCard = { id: 'ta-20261013-adopt', text: 'existing', checklistId: 'EXPORT-CHECK-PWA-DEPS', status: 'launched', runId: 'run-stopped', createdAt: '2026-10-13T00:00:00Z', history: [] };
+    const card: TaskCard = { id: 'ta-20261013-adopt', text: 'existing', checklistId: 'EXPORT-CHECK-PWA-DEPS', status: 'launched', runId: 'run-stopped', createdAt: new Date().toISOString(), history: [] };
     writeTaskCards(path, [card]);
     let launched = 0;
     const deps: TasksCliDeps = {
@@ -856,8 +857,9 @@ test('task hand inlines a relative multiline goal file and logs the carried sent
     expect(createHash('sha256').update(commandText).digest('hex')).toBe(createHash('sha256').update(sentence).digest('hex'));
     expect(output.card.text).toBe(sentence);
     expect(Object.values(JSON.parse(readFileSync(state, 'utf8')).tasks)).toHaveLength(1);
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ event: 'goal-file-inlined', data: { path, chars: sentence.length, sha256: createHash('sha256').update(sentence).digest('hex') } });
+    const inlinedEvents = events.filter((event) => event.event === 'goal-file-inlined');
+    expect(inlinedEvents).toHaveLength(1);
+    expect(inlinedEvents[0]).toMatchObject({ event: 'goal-file-inlined', data: { path, chars: sentence.length, sha256: createHash('sha256').update(sentence).digest('hex') } });
   } finally { off(); }
 });
 
@@ -888,7 +890,7 @@ test('task hand rejects missing, directory, unreadable and empty goal files with
 test('task hand --checklist uses the unchanged cell title when text is omitted and rejects non-path text before launch', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-checklist-hand-'));
   const releaseBoard: BoardNode[] = [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
-    { id: 'cell-1', level: 'task', title: '대상 경로: src/thing.ts\n구현 계약 그대로', status: 'open' },
+    { id: 'cell-1', level: 'task', title: withDoneBoundary('대상 경로: src/thing.ts\n구현 계약 그대로'), status: 'open' },
   ] }];
   const launcherCalls: string[][] = [];
   const deps: TasksCliDeps = {
@@ -898,20 +900,20 @@ test('task hand --checklist uses the unchanged cell title when text is omitted a
 
   const omitted = await run(['tasks', 'hand', '--checklist', 'cell-1', '--live', '--json'], deps);
   expect(omitted.code ?? 0).toBe(0);
-  expect(JSON.parse(omitted.lines[0]!).move.command.at(-1)).toBe('대상 경로: src/thing.ts\n구현 계약 그대로');
+  expect(JSON.parse(omitted.lines[0]!).move.command.at(-1)).toBe(withDoneBoundary('대상 경로: src/thing.ts\n구현 계약 그대로'));
   expect(launcherCalls).toHaveLength(1);
-  expect(launcherCalls[0]!.at(-1)).toBe('대상 경로: src/thing.ts\n구현 계약 그대로');
+  expect(launcherCalls[0]!.at(-1)).toBe(withDoneBoundary('대상 경로: src/thing.ts\n구현 계약 그대로'));
 
-  const valid = await run(['tasks', 'hand', '대상 경로: src/supplied.ts\n세부', '--checklist', 'cell-1', '--live', '--json'], deps);
+  const valid = await run(['tasks', 'hand', withDoneBoundary('대상 경로: src/supplied.ts\n세부'), '--checklist', 'cell-1', '--live', '--json'], deps);
   expect(valid.code ?? 0).toBe(0);
-  expect(JSON.parse(valid.lines[0]!).move.command.at(-1)).toBe('대상 경로: src/supplied.ts\n세부');
-  expect(launcherCalls[1]!.at(-1)).toBe('대상 경로: src/supplied.ts\n세부');
+  expect(JSON.parse(valid.lines[0]!).move.command.at(-1)).toBe(withDoneBoundary('대상 경로: src/supplied.ts\n세부'));
+  expect(launcherCalls[1]!.at(-1)).toBe(withDoneBoundary('대상 경로: src/supplied.ts\n세부'));
 
   const invalid = await run(['tasks', 'hand', '임의의 문면', '--checklist', 'cell-1', '--live'], deps);
   expect(invalid.code).toBe(1);
   expect(invalid.lines).toEqual(['칸 문면을 쓰려면 문면 인자를 빼라']);
   expect(launcherCalls).toHaveLength(2);
-  expect(launcherCalls[0]!.at(-1)).toBe('대상 경로: src/thing.ts\n구현 계약 그대로');
+  expect(launcherCalls[0]!.at(-1)).toBe(withDoneBoundary('대상 경로: src/thing.ts\n구현 계약 그대로'));
 
   const project = await run(['tasks', 'hand', '--checklist', 'project', '--live'], deps);
   expect(project.code).toBe(1);
@@ -925,7 +927,7 @@ test('task hand --checklist uses the unchanged cell title when text is omitted a
 
 test('task hand --checklist reads the current release cell through the default board', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-default-checklist-'));
-  const title = '대상 경로: src/real.ts\n현재 판 칸 원문';
+  const title = withDoneBoundary('대상 경로: src/real.ts\n현재 판 칸 원문');
   setElanousConfigDir(dir);
   try {
     addItem(checklistDevVersion(), { id: 'MK-DEFAULT-BOARD', title });
@@ -943,7 +945,7 @@ test('task hand --checklist reads the current release cell through the default b
 
 test('task hand default board finds an unreleased later version from the isolated checklist ledger', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-later-checklist-'));
-  const title = '대상 경로: src/later-release.ts\n다음 판 칸 원문';
+  const title = withDoneBoundary('대상 경로: src/later-release.ts\n다음 판 칸 원문');
   const [major, minor, patch] = checklistDevVersion().split('.').map(Number);
   const later = `${major}.${minor}.${patch! + 1}`;
   setElanousConfigDir(dir);
@@ -974,19 +976,19 @@ test('task hand finds a later open release cell, prefers the nearest duplicate, 
     taskStatePath: join(dir, 'cards.json'), registerSink: async () => true,
     releaseVersions: () => [latest, current, later],
     releaseBoard: (version) => [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
-      ...(version === later || version === latest ? [{ id: 'NEXT', level: 'task' as const, title: `대상 경로: src/${version}.ts`, status: 'open' as const }] : []),
+      ...(version === later || version === latest ? [{ id: 'NEXT', level: 'task' as const, title: withDoneBoundary(`대상 경로: src/${version}.ts`), status: 'open' as const }] : []),
     ] }],
     taskLauncher: (args) => { launches.push(args); },
   };
   try {
     const next = await run(['tasks', 'hand', '--checklist', 'NEXT', '--live', '--json'], deps);
     expect(next.code ?? 0).toBe(0);
-    expect(JSON.parse(next.lines[0]!).card.text).toBe(`대상 경로: src/${later}.ts`);
-    expect(launches[0]!.at(-1)).toBe(`대상 경로: src/${later}.ts`);
+    expect(JSON.parse(next.lines[0]!).card.text).toBe(withDoneBoundary(`대상 경로: src/${later}.ts`));
+    expect(launches[0]!.at(-1)).toBe(withDoneBoundary(`대상 경로: src/${later}.ts`));
     expect(warnings.some((line) => line.includes(`가장 가까운 판 ${later}`))).toBe(true);
     const pinned = await run(['tasks', 'hand', '--checklist', 'NEXT', '--version', latest, '--live', '--json'], deps);
     expect(pinned.code ?? 0).toBe(0);
-    expect(JSON.parse(pinned.lines[0]!).card.text).toBe(`대상 경로: src/${latest}.ts`);
+    expect(JSON.parse(pinned.lines[0]!).card.text).toBe(withDoneBoundary(`대상 경로: src/${latest}.ts`));
     const missing = await run(['tasks', 'hand', '--checklist', 'ABSENT', '--live'], deps);
     expect(missing.code).toBe(1);
     expect(missing.lines).toEqual(['체크리스트 칸 없음: ABSENT']);
@@ -1013,12 +1015,12 @@ test('task hand prefers the current release cell over an older unreleased duplic
       taskStatePath: join(dir, 'cards.json'), registerSink: async () => true,
       releaseVersions: () => [older, current],
       releaseBoard: (version) => [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
-        { id: 'DUP', level: 'task', title: `대상 경로: src/${version}.ts`, status: 'open' },
+        { id: 'DUP', level: 'task', title: withDoneBoundary(`대상 경로: src/${version}.ts`), status: 'open' },
       ] }],
       taskLauncher: () => {},
     });
     expect(result.code ?? 0).toBe(0);
-    expect(JSON.parse(result.lines[0]!).card.text).toBe(`대상 경로: src/${current}.ts`);
+    expect(JSON.parse(result.lines[0]!).card.text).toBe(withDoneBoundary(`대상 경로: src/${current}.ts`));
     expect(warnings.some((line) => line.includes(`가장 가까운 판 ${current}`))).toBe(true);
   } finally { console.error = originalError; }
 });
@@ -1028,7 +1030,7 @@ test('task hand keeps the current board available and ignores a broken unrelated
   const current = checklistDevVersion();
   const [major, minor, patch] = current.split('.').map(Number);
   const unrelated = `${major}.${minor}.${patch! + 1}`;
-  const title = '대상 경로: src/current.ts';
+  const title = withDoneBoundary('대상 경로: src/current.ts');
   const warnings: string[] = [];
   const originalError = console.error;
   console.error = (...args: unknown[]) => { warnings.push(args.join(' ')); };
@@ -1058,7 +1060,7 @@ test('task hand keeps the current board available and ignores a broken unrelated
 
 test('task hand --checklist passes a non-path cell title unchanged when text is omitted', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-non-path-title-'));
-  const title = '기존 칸 문면\n둘째 줄 그대로';
+  const title = withDoneBoundary('기존 칸 문면\n둘째 줄 그대로');
   const launcherCalls: string[][] = [];
   const result = await run(['tasks', 'hand', '--checklist', 'cell-no-path', '--live', '--json'], {
     taskStatePath: join(dir, 'cards.json'), registerSink: async () => true,
@@ -1309,7 +1311,7 @@ test('ORCH-LIVE-1008: the hand launcher runs the elanous CLI entry, not whatever
 test('live checklist hand sends its slot through the production detached launcher environment', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tasks-slot-launch-'));
   const releaseBoard: BoardNode[] = [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
-    { id: 'TA-DRAFT-NO-LEFTOVER', level: 'task', title: '대상 경로: src/example.ts', status: 'open' },
+    { id: 'TA-DRAFT-NO-LEFTOVER', level: 'task', title: withDoneBoundary('대상 경로: src/example.ts'), status: 'open' },
   ] }];
   const seen: Array<{ command: string; args: string[]; env?: NodeJS.ProcessEnv }> = [];
   const fakeSpawn = ((command: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
@@ -1552,7 +1554,7 @@ test('TA-REJUDGE-ON-HEAD — tasks rejudge --all judges each candidate card and 
   const taskStatePath = join(mkdtempSync(join(tmpdir(), 'tasks-cli-rejudge-')), 'task-agent-actions.json');
   const a = 'a'.repeat(40);
   writeFileSync(taskStatePath, JSON.stringify({ tasks: { 'ta-rj': {
-    id: 'ta-rj', text: 'x', createdAt: '2026-10-11T00:00:00.000Z', status: 'launched', pr: { number: 30, url: 'https://github.com/o/r/pull/30' },
+    id: 'ta-rj', text: 'x', createdAt: new Date().toISOString(), status: 'launched', pr: { number: 30, url: 'https://github.com/o/r/pull/30' },
     reviewRequests: [{ pr: 30, head: a, at: '2026-10-11T00:10:00.000Z' }], history: [],
   } } }));
   const result = await run(['tasks', 'rejudge', '--all'], { taskStatePath, registerSink: async () => true, rejudge: {
@@ -1560,6 +1562,122 @@ test('TA-REJUDGE-ON-HEAD — tasks rejudge --all judges each candidate card and 
     live: { repoCandidates: () => [{ source: 'host', cwd: '/repo' }], prHead: async () => ({ head: a, state: 'OPEN', url: 'https://github.com/o/r/pull/30' }) },
   } });
   expect(result.lines).toEqual([`ta-rj\tPR #30\t${a.slice(0, 12)}→${a.slice(0, 12)}\ttarget\thead-unchanged\tPR #30 head is still the judged head`]);
+});
+
+test('tasks rejudge --all applies configured card age limit while explicit card lookup remains available', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tasks-cli-age-limit-'));
+  const taskStatePath = join(root, 'cards.json');
+  const head = 'a'.repeat(40);
+  const id = 'ta-age-80h';
+  const url = 'https://github.com/o/r/pull/30';
+  setElanousConfigDir(root);
+  try {
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ taskAgent: { rejudgeMaxAgeHours: 96 } }));
+    writeTaskCards(taskStatePath, [{ id, text: 'old card', createdAt: new Date(Date.now() - 80 * 3_600_000).toISOString(),
+      status: 'launched', pr: { number: 30, url }, reviewRequests: [{ pr: 30, head, at: new Date().toISOString() }], history: [] }]);
+    const deps: TasksCliDeps = { taskStatePath, registerSink: async () => true, rejudge: { liveMoves: new Set(),
+      prFiles: async () => ['src/feature.ts'], live: { repoCandidates: () => [{ source: 'host', cwd: root }],
+        prHead: async () => ({ head, state: 'OPEN', url }) } } };
+    const configured = await run(['tasks', 'rejudge', '--all', '--json'], deps);
+    expect(JSON.parse(configured.lines[0]!)?.[0]?.decision).toBe('head-unchanged');
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ taskAgent: { rejudgeMaxAgeHours: 72 } }));
+    const capped = await run(['tasks', 'rejudge', '--all', '--json'], deps);
+    expect(JSON.parse(capped.lines[0]!)).toEqual([]);
+    const explicit = await run(['tasks', 'rejudge', id, '--json'], deps);
+    expect(JSON.parse(explicit.lines[0]!)?.[0]?.decision).toBe('head-unchanged');
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('tasks rejudge --all requests at most one review across remote cards in one tick', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tasks-cli-review-tick-'));
+  const statePath = join(root, 'task-agent-actions.json');
+  const head = 'a'.repeat(40);
+  const cards: TaskCard[] = [30, 31].map((pr) => ({ id: `ta-review-${pr}`, text: 'review', createdAt: new Date().toISOString(),
+    status: 'launched', taLand: true, runId: `run-${pr}`, runChildId: `child-${pr}`,
+    parentHost: { host: 'node-b' }, pr: { number: pr, url: `https://github.com/o/r/pull/${pr}` }, history: [] }));
+  writeTaskCards(statePath, cards);
+  const requested: number[] = [];
+  try {
+    const result = await run(['tasks', 'rejudge', '--all', '--json'], {
+      taskStatePath: statePath, registerSink: async () => true, remoteLedgerMirror: () => {},
+      rejudge: { liveMoves: new Set(['review']), remoteRunTerminal: () => true,
+        live: { repoCandidates: () => [{ source: 'host', cwd: root }],
+          prHead: async (pr) => ({ head, state: 'OPEN', url: `https://github.com/o/r/pull/${pr}` }),
+          requestReview: async (pr) => { requested.push(pr); } } },
+    });
+    const outcomes = JSON.parse(result.lines[0]!) as Array<{ decision: string }>;
+    expect(requested).toEqual([30]);
+    expect(outcomes.map((row) => row.decision)).toContain('tick-cap');
+    expect(readTaskCard('ta-review-31', statePath)?.reviewRequests).toBeUndefined();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('tasks rejudge --all queues one exact-head mf0 card and caps the next land attempt', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tasks-cli-land-tick-'));
+  const statePath = join(root, 'task-agent-actions.json');
+  const head = 'a'.repeat(40);
+  const cards: TaskCard[] = [30, 31].map((pr) => {
+    const id = `ta-land-${pr}`;
+    const resultPath = reviewResultPath(statePath, id, pr, head);
+    mkdirSync(join(resultPath, '..'), { recursive: true });
+    writeFileSync(resultPath, JSON.stringify({ pr: String(pr), headCommit: head, verdict: 'pass', mustFix: [],
+      shouldFix: [], reviewed: true, reviewRoute: 'api' }));
+    return { id, text: 'land', createdAt: new Date(Date.now() - (31 - pr) * 60_000).toISOString(), status: 'launched', taLand: true,
+      pr: { number: pr, url: `https://github.com/o/r/pull/${pr}` },
+      reviewRequests: [{ pr, head, at: new Date().toISOString(), resultPath }],
+      history: [{ at: new Date().toISOString(), event: 'live-move-result', kind: 'review', pr, head,
+        verdict: 'pass', reviewed: true, mustFix: 0, resultPath, effect: 'review result captured' }] };
+  });
+  writeTaskCards(statePath, cards);
+  const queued: number[] = [];
+  try {
+    const result = await run(['tasks', 'rejudge', '--all', '--json'], { taskStatePath: statePath, registerSink: async () => true,
+      rejudge: { liveMoves: new Set(['propose-land']), prFiles: async () => ['src/feature.ts'],
+        live: { repoCandidates: () => [{ source: 'host', cwd: root }],
+          prHead: async (pr) => ({ head, state: 'OPEN', branch: 'feature', url: `https://github.com/o/r/pull/${pr}` }),
+          landPrHead: async (pr) => ({ head, state: 'OPEN', branch: 'feature', isDraft: false, url: `https://github.com/o/r/pull/${pr}` }),
+          landQueueConfig: { command: '/ops/land-enqueue.sh', remote: 'node-b' },
+          landWorktree: { localHead: () => head, localBranch: () => 'feature' },
+          queueLanding: async ({ pr }) => { queued.push(pr); return { status: 0, stdout: `OK #${pr} queued` }; } } },
+    });
+    const outcomes = JSON.parse(result.lines[0]!) as Array<{ card: string; step: string; decision: string }>;
+    expect(queued).toEqual([31]);
+    expect(outcomes.some((row) => row.card === 'ta-land-30' && row.step === 'land' && row.decision === 'tick-cap')).toBe(true);
+    expect(readTaskCard('ta-land-30', statePath)?.landAttempts ?? []).toHaveLength(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('tasks rejudge --all bounds mf0 head probes and does not promote stale-head or wrong-URL reviews', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tasks-cli-head-priority-'));
+  const statePath = join(root, 'cards.json');
+  const head = 'a'.repeat(40);
+  const stale = 'b'.repeat(40);
+  const cards: TaskCard[] = [40, 41, 42, 43, 44].map((pr) => {
+    const at = new Date(Date.now() - (44 - pr) * 60_000).toISOString();
+    return { id: `ta-probe-${pr}`, text: 'reviewed', createdAt: at, status: 'launched',
+      pr: { number: pr, url: `https://github.com/o/r/pull/${pr}` }, reviewRequests: [{ pr, head, at }],
+      history: pr === 44 ? [] : [{ at, event: 'live-move-result', kind: 'review', pr, head, verdict: 'pass', reviewed: true,
+        mustFix: 0, effect: 'review result captured' }] };
+  });
+  writeTaskCards(statePath, cards);
+  const probes: number[] = [];
+  let judging = false;
+  try {
+    const result = await run(['tasks', 'rejudge', '--all', '--json'], { taskStatePath: statePath, registerSink: async () => true,
+      rejudge: { liveMoves: new Set(), prFiles: async () => { judging = true; return ['src/feature.ts']; },
+        live: { repoCandidates: () => [{ source: 'host', cwd: root }], prHead: async (pr) => {
+          if (!judging) probes.push(pr);
+          return { head: pr === 42 ? stale : head, state: 'OPEN',
+            url: `https://github.com/o/r/pull/${pr === 43 ? 999 : pr}` };
+        } } },
+    });
+    const outcomes = JSON.parse(result.lines[0]!) as Array<{ card: string }>;
+    // Newest card 44 has no mf0; only 43/42 are probed, 41/40 never pre-probed.
+    // 43 has a wrong URL, 42 has a stale head, so card 44 remains first by age.
+    expect(probes).toEqual([43, 42, 44]);
+    expect(outcomes[0]?.card).toBe('ta-probe-44');
+    expect(new Set(outcomes.map((row) => row.card)).size).toBe(5);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('tasks rejudge --all selects a formerly unbound remote parent after HQ mirror PR binding', async () => {

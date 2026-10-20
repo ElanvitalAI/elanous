@@ -5,11 +5,22 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parse as yaml } from 'yaml';
 import { LogStore } from '../../src/mss/logging/log-store.js';
-import { runAutoApprove, WARNING_ONLY } from './auto-approve-node.js';
+import { BLOCKING_METRIC_NAMES, runAutoApprove, WARNING_ONLY } from './auto-approve-node.js';
 import type { GraphContext } from './node-verdict.js';
 import { runPublish, waitForAssets } from './publish-node.js';
 import { enableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
 import { effectiveInstanceRoot, prodInstanceRoot, resetEffectiveInstanceRoot } from '../../src/instance/resolve.js';
+
+function recordApproval(root: string, runId: string, decidedAt: string) {
+  const path = join(root, 'graph-runs', 'release-loop', `${runId}.json`);
+  const approval = { outcome: 'approved', graphId: 'release-loop', runId, nodeId: 'approve-publish', decidedAt };
+  mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
+  writeFileSync(path, JSON.stringify({ graphId: 'release-loop', runId,
+    path: ['auto-approve', 'approve-publish', 'publish'],
+    nodes: [{ nodeId: 'approve-publish', ok: true, decidedAt, output: JSON.stringify(approval) }] }));
+  writeFileSync(`${path}.2.decision.json`, JSON.stringify({ nodeId: 'approve-publish', decision: 'approved', decidedAt }));
+  return approval;
+}
 
 // The local freeze universe is isolated too (runPublish → beginLandingMerge reads effectiveInstanceRoot()).
 let isolatedStateDir = '';
@@ -39,7 +50,7 @@ const runner = (answers: Record<string, string[]>) => {
   return { run, calls };
 };
 
-test('publish accepts real auto-approve output with warning-only rows but rejects a missing blocking metric', () => {
+test('publish accepts measured TUI subchecks and mac warning, but rejects a missing blocking metric', () => {
   const root = mkdtempSync(join(tmpdir(), 'release-publish-auto-'));
   const previousContext = process.env.ELANOUS_GRAPH_CONTEXT;
   try {
@@ -53,12 +64,14 @@ test('publish accepts real auto-approve output with warning-only rows but reject
     const commit = 'a'.repeat(40);
     const context: GraphContext = {
       nodeId: 'publish',
+      runId: 'run-publish-subcheck',
       input: { version, previousVersion: '0.2.3' },
       outputs: {
         gate: { outcome: 'ok', introduced: [] },
         pwa: { outcome: 'ok' },
         upgrade: { outcome: 'ok' },
-        tui: { outcome: 'ok', regress: { unmeasured: 'TUI probe timed out' } },
+        tui: { outcome: 'ok', regress: { pass: 7, fail: 0,
+          results: Array.from({ length: 7 }, (_, i) => ({ id: `R${i + 1}`, title: 'check', ok: true, reason: 'passed' })) } },
         'notes-check': { outcome: 'ok' },
         prepare: { outcome: 'ok', out, commit },
         'version-release': { commit },
@@ -71,7 +84,7 @@ test('publish accepts real auto-approve output with warning-only rows but reject
     expect(auto.metrics).toHaveLength(10);
     expect(auto.metrics.filter((metric) => !WARNING_ONLY.has(metric.name))).toHaveLength(8);
     expect(auto.metrics.filter((metric) => WARNING_ONLY.has(metric.name)).map((metric) => [metric.name, metric.value]))
-      .toEqual([['tui-regress', 'unmeasured'], ['mac-smoke', 'warn']]);
+      .toEqual([['tui-regress', 'ok'], ['mac-smoke', 'warn']]);
     context.outputs['auto-approve'] = auto;
     process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
     const calls: string[] = [];
@@ -88,6 +101,43 @@ test('publish accepts real auto-approve output with warning-only rows but reject
     };
     expect(runPublish(run, root)).toMatchObject({ outcome: 'ok', verdict: 'pass', tag: `v${version}` });
     expect(calls.some((call) => call.startsWith('bun bin/elanous.mjs release publish '))).toBe(true);
+
+    for (const foreign of [
+      { ...auto, runId: 'another-run' },
+      { ...auto, tuiSubcheck: { ...auto.tuiSubcheck, fail: 3, failedCheckIds: ['R4'], approvalRequired: true } },
+      { ...auto, metrics: auto.metrics.map((metric, i) => i === 0 ? { ...metric, name: 'metric-0' } : metric) },
+      { ...auto, metrics: auto.metrics.map((metric, i) => i === 1 ? { ...metric, name: auto.metrics[0]!.name } : metric) },
+    ]) {
+      context.outputs['auto-approve'] = foreign;
+      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+      calls.length = 0;
+      expect(runPublish(run, root)).toMatchObject({ outcome: 'fail' });
+      expect(calls).toEqual([]);
+    }
+    context.outputs['auto-approve'] = auto;
+
+    const results = (context.outputs.tui!.regress as { results: Array<{ id: string; ok: boolean }> }).results;
+    context.outputs.tui!.regress = { pass: 4, fail: 3,
+      results: results.map((result) => ({ ...result, ok: !['R4', 'R5', 'R6'].includes(result.id) })) };
+    const subcheck = runAutoApprove(context, { instanceRoot: root, repo });
+    expect(subcheck).toMatchObject({ outcome: 'fail',
+      tuiSubcheck: { fail: 3, failedCheckIds: ['R4', 'R5', 'R6'], approvalRequired: true } });
+    context.outputs['auto-approve'] = subcheck;
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    calls.length = 0;
+    expect(runPublish(run, root)).toMatchObject({ outcome: 'fail', summary: 'publish blocked: neither auto-approve nor approve-publish approved' });
+    expect(calls).toEqual([]);
+    context.outputs['approve-publish'] = { outcome: 'approved', decisionBy: 'human' };
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    expect(runPublish(run, root)).toMatchObject({ outcome: 'fail', summary: 'publish blocked: neither auto-approve nor approve-publish approved' });
+    expect(calls).toEqual([]);
+    context.outputs['approve-publish'] = { outcome: 'approved', graphId: 'release-loop', runId: context.runId,
+      nodeId: 'approve-publish', decidedAt: new Date().toISOString(), decidedBy: 'human' };
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    expect(runPublish(run, root)).toMatchObject({ outcome: 'fail' });
+    expect(calls).toEqual([]);
+    delete context.outputs['approve-publish'];
+    context.outputs.tui!.regress = { pass: 7, fail: 0, results };
 
     const missing = auto.metrics.find((metric) => !WARNING_ONLY.has(metric.name))!;
     context.outputs['auto-approve'] = { ...auto, metrics: auto.metrics.filter((metric) => metric !== missing) };
@@ -123,7 +173,8 @@ test('publish rechecks freeze immediately before irreversible publication; only 
   const root = mkdtempSync(join(tmpdir(), 'publish-freeze-'));
   const previous = { state: process.env.ELANOUS_STATE_DIR, graph: process.env.ELANOUS_GRAPH_CONTEXT };
   const outputs = Object.fromEntries(['gate', 'pwa', 'upgrade', 'tui', 'prepare', 'docs'].map((name) => [name, { outcome: 'ok' }]));
-  Object.assign(outputs, { 'approve-publish': { outcome: 'approved' }, prepare: { outcome: 'ok', commit: 'a', out: 'dist' }, 'version-release': { commit: 'a' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' } });
+  Object.assign(outputs, { 'approve-publish': recordApproval(root, 'run-freeze', new Date().toISOString()),
+    prepare: { outcome: 'ok', commit: 'a', out: 'dist' }, 'version-release': { commit: 'a' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' } });
   let publishCalls = 0;
   const run = (_command: string, args: string[]) => {
     if (args.includes('publish')) publishCalls++;
@@ -132,14 +183,14 @@ test('publish rechecks freeze immediately before irreversible publication; only 
   try {
     process.env.ELANOUS_STATE_DIR = root;
     enableLandingFreeze({ reason: 'drill', by: 'MK' }, root);
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
-    expect(runPublish(run, root)).toMatchObject({ outcome: 'fail', summary: expect.stringContaining('동결 중 · drill') });
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', runId: 'run-freeze', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
+    expect(runPublish(run, root, undefined, root)).toMatchObject({ outcome: 'fail', summary: expect.stringContaining('동결 중 · drill') });
     expect(publishCalls).toBe(0);
     // A frozen publication leaves no in-flight marker behind (so `freeze on` does not wait on it).
     const { inFlightLandingMerges } = await import('../../src/release-loop/landing-freeze.js');
     expect(inFlightLandingMerges(root)).toBe(0);
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version: '0.2.4', previousVersion: '0.2.3', forceFreeze: true }, outputs });
-    expect(runPublish(run, root)).toMatchObject({ outcome: 'ok' });
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', runId: 'run-freeze', input: { version: '0.2.4', previousVersion: '0.2.3', forceFreeze: true }, outputs });
+    expect(runPublish(run, root, undefined, root)).toMatchObject({ outcome: 'ok' });
     expect(publishCalls).toBe(1);
   } finally {
     if (previous.state === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous.state;
@@ -154,8 +205,13 @@ test('publish-at waits after measured auto-approval and prerequisites; omission 
   const version = '0.2.4';
   const commit = 'a'.repeat(40);
   const outputs: GraphContext['outputs'] = {
-    'auto-approve': { outcome: 'ok', decidedBy: 'release-loop metrics', metrics: Array.from({ length: 8 }, (_, i) => ({ name: `metric-${i}`, verdict: 'pass' })) },
-    'version-release': { commit }, gate: { outcome: 'ok' }, pwa: { outcome: 'ok' }, upgrade: { outcome: 'ok' }, tui: { outcome: 'ok' },
+    'auto-approve': { outcome: 'ok', runId: 'run-deadline', decidedBy: 'release-loop metrics',
+      tuiSubcheck: { runId: 'run-deadline', level: 'ok', fail: 0, failedCheckIds: [], approvalRequired: false },
+      metrics: [...BLOCKING_METRIC_NAMES.map((name) => ({ name, verdict: 'pass' })),
+        { name: 'tui-regress', verdict: 'pass' }, { name: 'mac-smoke', verdict: 'pass' }] },
+    'version-release': { commit }, gate: { outcome: 'ok' }, pwa: { outcome: 'ok' }, upgrade: { outcome: 'ok' },
+    tui: { outcome: 'ok', regress: { pass: 7, fail: 0,
+      results: Array.from({ length: 7 }, (_, i) => ({ id: `R${i + 1}`, title: 'check', ok: true, reason: 'measured' })) } },
     prepare: { outcome: 'ok', commit, out: root }, docs: { outcome: 'ok', branch: `release-docs/${version}` },
   };
   let now = Date.parse('2099-10-09T10:59:00Z');
@@ -171,7 +227,7 @@ test('publish-at waits after measured auto-approval and prerequisites; omission 
   };
   const clock = { now: () => now, sleep: (ms: number) => { sleeps.push(ms); now += ms; } };
   const publish = (publishAt?: string, authorized = true) => {
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', input: { version, previousVersion: '0.2.3', ...(publishAt ? { publishAt } : {}) },
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', runId: 'run-deadline', input: { version, previousVersion: '0.2.3', ...(publishAt ? { publishAt } : {}) },
       outputs: authorized ? outputs : { ...outputs, 'auto-approve': { outcome: 'fail' } } });
     calls.length = 0;
     sleeps.length = 0;

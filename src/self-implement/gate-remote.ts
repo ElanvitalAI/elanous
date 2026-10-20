@@ -437,11 +437,13 @@ export interface DispatchOptions {
   /** Set when this invocation cannot be reproduced remotely (e.g. self gate without --base): automatic placement
    *  falls back with this reason; an explicit self gate --remote reports an unmeasured check instead. */
   localOnlyReason?: string;
-  /** Self gate CLI only: explicit --remote must never be measured by a local fallback. */
+  /** Explicit or caller-required remote measurement must never become a local fallback. */
   explicitRemoteOnly?: boolean;
+  /** Keep the remote checkout and TypeScript cache per host slot across repeated checks. */
+  stableCheckout?: boolean;
   /** Self gate CLI only: name the host for both automatic and explicit remote execution. */
   reportRemoteHost?: boolean;
-  /** Self gate's state universe; omitted by other callers and injected tests. */
+  /** Release gate host reservations shared by self gate and changed typecheck. */
   reservationRoot?: string;
   runLocal: () => number | Promise<number>;
   /** Called once with the final remote outcome (never on a local decision), before its output passes through or the
@@ -482,12 +484,14 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
     return opts.runLocal();
   }
   let host = decision.host!;
-  const reservationRoot = opts.tool === 'self-gate' ? opts.reservationRoot ?? (deps.runner ? undefined : gateHostReservationRoot()) : undefined;
+  const reservationRoot = opts.tool === 'self-gate' || opts.tool === 'ci-typecheck-changed'
+    ? opts.reservationRoot ?? (deps.runner ? undefined : gateHostReservationRoot()) : undefined;
   if (reservationRoot) {
     const reservationHost = host.split('@').at(-1)!;
     const first = inspectReleaseGateHost(reservationRoot, reservationHost);
     if (first.status !== 'free') {
-      const alternate = reservationHost === 'node-b' ? 'node-c' : null;
+      // Changed typecheck has a fixed node-b placement; a release reservation makes it unmeasured.
+      const alternate = opts.tool === 'self-gate' && reservationHost === 'node-b' ? 'node-c' : null;
       const other = alternate ? inspectReleaseGateHost(reservationRoot, alternate) : null;
       if (alternate && other?.status === 'free') {
         debug.log('gate.remote', 'host-reserved-reroute', { from: host, to: alternate, reason: first.reason, status: first.status });
@@ -520,7 +524,7 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
   let outcome: RemoteRunOutcome;
   for (;;) {
     try {
-      outcome = runOnRemote({ repo: opts.repo, host, mirror: settings.mirror, argv: opts.remoteArgv, refs: opts.refs, ...(opts.commit !== undefined ? { commit: opts.commit } : {}), installPwa: opts.installPwa, payloadFiles: opts.payloadFiles, hostCap }, deps.runner);
+      outcome = runOnRemote({ repo: opts.repo, host, mirror: settings.mirror, argv: opts.remoteArgv, refs: opts.refs, ...(opts.commit !== undefined ? { commit: opts.commit } : {}), installPwa: opts.installPwa, payloadFiles: opts.payloadFiles, stableCheckout: opts.stableCheckout, hostCap }, deps.runner);
     } catch (error) {
       outcome = { kind: 'infra', reason: `exception: ${error instanceof Error ? error.message : String(error)}` };
     }

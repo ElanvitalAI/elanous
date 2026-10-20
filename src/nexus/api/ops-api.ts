@@ -221,6 +221,18 @@ export function handleOpsApi(req: Request, metaApi: MetaApiOpts | undefined): Re
       ? served(jsonResponse(resourcesFromOverview(peeked.snapshot, peeked.pods, peeked.at)))
       : served(jsonResponse({ stale: true })));
   }
+  if (pathname === '/v1/ops/loops-map') {
+    // LOOP-MAP-API — projects only the shared overview cache's loops snapshot
+    // (name·era·beat cell observedAt; null/unmeasured value and reason preserved);
+    // no new remote fan-out of its own. Loop-edge joining is a later shard.
+    overviewCache ??= createOverviewCache();
+    return overviewCache.get()
+      .then((overview) => served(jsonResponse({
+        generatedAt: overview.generatedAt,
+        cacheAgeMs: overview.cacheAgeMs,
+        loops: overview.loops.map((loop) => ({ name: loop.name, era: loop.era, beat: loop.beat })),
+      })), () => jsonResponse({ error: 'overview-unavailable' }, 500));
+  }
   if (pathname === '/v1/ops/seats') {
     const date = url.searchParams.get('date') ?? todayKst();
     if (!DATE.test(date) || Number.isNaN(Date.parse(`${date}T00:00:00+09:00`))) return jsonResponse({ error: 'invalid-date' }, 400);

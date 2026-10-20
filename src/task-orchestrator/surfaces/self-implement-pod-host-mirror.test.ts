@@ -86,7 +86,7 @@ describe('Pod host mirror Job wiring', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  test('bundle delivery keeps cp/ready after Job creation and full child logs report source-via mirror or github', async () => {
+  test('bundle delivery keeps cp/ready after Job creation and full child logs report source-via image or clone', async () => {
     const events: Array<Record<string, unknown>> = [];
     const off = debug.registerSink({ name: 'pod-host-mirror-source-via-test', emit: (record) => {
       if (record.category === 'self-implement.pod' && record.event === 'source-via') events.push(record.data as Record<string, unknown>);
@@ -102,22 +102,30 @@ describe('Pod host mirror Job wiring', () => {
       expect(bundled.calls.some((call) => call.includes('exec') && call.includes('touch /tmp/source.ready'))).toBe(true);
       const mirrored = fakeLaunch('ELANOUS_POD_SOURCE_VIA mirror\n{"stage":"merged","ok":true}\n');
       await mirrored.launch({ hostMirror: '/srv/mirror.git' }, 'mirror-source');
+      const image = fakeLaunch('ELANOUS_POD_SOURCE_VIA image\nELANOUS_POD_SOURCE_DELTA mirror\n{"stage":"merged","ok":true}\n');
+      await image.launch({ hostMirror: '/srv/mirror.git' }, 'image-source');
+      const imageSkip = fakeLaunch('ELANOUS_POD_SOURCE_IMAGE_SKIP pin-objects-mismatch\nELANOUS_POD_SOURCE_VIA mirror\n{"stage":"merged","ok":true}\n');
+      await imageSkip.launch({ hostMirror: '/srv/mirror.git' }, 'image-skip-source');
       const fallback = fakeLaunch('ELANOUS_POD_SOURCE_VIA github\n{"stage":"merged","ok":true}\n');
       await fallback.launch({}, 'github-source');
       const skipped = fakeLaunch('ELANOUS_POD_SOURCE_MIRROR_SKIP no-mount\nELANOUS_POD_SOURCE_VIA github\n{"stage":"merged","ok":true}\n');
       await skipped.launch({}, 'skip-source');
       const bogus = fakeLaunch('ELANOUS_POD_SOURCE_MIRROR_SKIP made-up\nELANOUS_POD_SOURCE_VIA github\n{"stage":"merged","ok":true}\n');
       await bogus.launch({}, 'bogus-skip-source');
-      expect(events).toEqual([
+      const jobs = new Set(['mirror-source', 'image-source', 'image-skip-source', 'github-source', 'skip-source', 'bogus-skip-source'].map(podJobName));
+      const ownEvents = events.filter((event) => jobs.has(event.job as string));
+      expect(ownEvents).toEqual([
         expect.objectContaining({ job: podJobName('mirror-source'), via: 'mirror' }),
+        expect.objectContaining({ job: podJobName('image-source'), via: 'image', delta: 'mirror' }),
+        expect.objectContaining({ job: podJobName('image-skip-source'), via: 'mirror', imageSkip: 'pin-objects-mismatch' }),
         expect.objectContaining({ job: podJobName('github-source'), via: 'github' }),
         expect.objectContaining({ job: podJobName('skip-source'), via: 'github', mirrorSkip: 'no-mount' }),
         expect.objectContaining({ job: podJobName('bogus-skip-source'), via: 'github' }),
       ]);
       // No SKIP line (mirror, plain github, unknown reason) → no mirrorSkip key at all.
-      expect(Object.keys(events[0]!)).not.toContain('mirrorSkip');
-      expect(Object.keys(events[1]!)).not.toContain('mirrorSkip');
-      expect(Object.keys(events[3]!)).not.toContain('mirrorSkip');
+      expect(Object.keys(ownEvents[0]!)).not.toContain('mirrorSkip');
+      expect(Object.keys(ownEvents[3]!)).not.toContain('mirrorSkip');
+      expect(Object.keys(ownEvents[5]!)).not.toContain('mirrorSkip');
     } finally { off(); }
   });
 });

@@ -9,6 +9,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetUserConfig, reloadUserConfig } from '../src/user-config';
+import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir';
 import {
   resolveLanguageByName, resolveLanguageForFile,
   __resetServerRegistryForTests,
@@ -25,6 +26,7 @@ function writeConfig(json: unknown): void {
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'lsp-registry-'));
+  setElanousConfigDir(join(root, 'elanous'));
   originalXdg = process.env.XDG_CONFIG_HOME;
   process.env.XDG_CONFIG_HOME = root;
   const elanousDir = join(root, 'elanous');
@@ -37,6 +39,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  resetElanousConfigDir();
   rmSync(root, { recursive: true, force: true });
   if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = originalXdg;

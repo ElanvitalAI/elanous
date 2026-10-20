@@ -106,6 +106,26 @@ describe('runGitCommand', () => {
     }
   }, 10_000);
 
+  test('preserves the timeout error code and signal of a real Git subprocess', () => {
+    const fixture = makeRepository();
+    try {
+      const result = runGitCommand(fixture.repo, ['-c', 'alias.slow=!sleep 2', 'slow'], { timeout: 100, killSignal: 'SIGKILL' });
+      expect(result.status).toBeNull();
+      expect(result.signal).toBe('SIGKILL');
+      expect(result.errorCode).toBe('ETIMEDOUT');
+    } finally { fixture.dispose(); }
+  }, 10_000);
+
+  test('does not retry a timed-out Git process even when partial output mentions a lock', () => {
+    let calls = 0;
+    const result = runGitCommand(process.cwd(), ['worktree', 'add'], {}, () => {
+      calls += 1;
+      return { status: null, signal: 'SIGKILL', errorCode: 'ETIMEDOUT', stdout: 'Updating files', stderr: 'index.lock' };
+    });
+    expect(calls).toBe(1);
+    expect(result).toMatchObject({ status: null, signal: 'SIGKILL', errorCode: 'ETIMEDOUT' });
+  });
+
   test('retries an injected index.lock failure through the shared retry loop', () => {
     let calls = 0;
     const lockedRunner: GitRunner = () => {

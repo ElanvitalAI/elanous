@@ -17,9 +17,10 @@ describe('buildGpt6FamilyAddendum — 공식 문면을 «그대로» 옮겼나',
   //   ***방금 바꾼 모델(gpt-6-sol)의 «알려진 실패 양상»에 붙인 것***이다(과잉설계·scope creep).
   //   ⛔ 수를 여기서 세는 이유는 *"절 넷만 가져온다"* 라는 규율이 «양을 제한»하기 때문이다 —
   //     늘릴 때마다 이 줄이 빨개져야 «왜 늘렸나»를 적게 된다. 그래서 핀을 «유지»한다.
-  test('절 다섯을 낸다 — 자율 · 허락의 시점 · 우선순위 · 시험 · 범위', () => {
+  // 5→6 (2026-10-18 · 결함 #87): gpt-6 이 도구 사이에 글을 0자 냈다 → «진행 설명» 절을 더했다.
+  test('절 여섯을 낸다 — 자율 · 허락의 시점 · 우선순위 · 시험 · 범위 · 진행 설명', () => {
     const msgs = buildGpt6FamilyAddendum();
-    expect(msgs.length).toBe(5);
+    expect(msgs.length).toBe(6);
     for (const m of msgs) expect(m.role).toBe('system');
   });
 
@@ -30,6 +31,15 @@ describe('buildGpt6FamilyAddendum — 공식 문면을 «그대로» 옮겼나',
     expect(msgs[4]).toContain('minimal diff');
     expect(msgs[4]).toContain('new architecture');
     expect(msgs[4]).toContain('Preserve the existing workflow');
+  });
+
+  test('신설 절 «진행 설명» 은 맨 끝이고 도구 묶음 전 한 문장을 요구한다', () => {
+    const msgs = buildGpt6FamilyAddendum().map((m) => String(m.content));
+    expect(msgs[5]).toContain('Progress narration');
+    expect(msgs[5]).toContain('Before each batch of tool calls');
+    expect(msgs[5]).toContain('one short plain-text sentence');
+    // 잡무까지 하나씩 말하면 소음이 된다 — 그 제한이 조용히 빠지지 않게.
+    expect(msgs[5]).toContain('Do not narrate routine bookkeeping');
   });
 
   test('⭐ ***순서가 뜻을 갖는다*** — 금지(우선순위)보다 «자율»이 먼저다', () => {
@@ -93,6 +103,17 @@ describe('⛔⭐⭐ 배선 — ***astra 에 «닿는가»***', () => {
     expect(all).toContain('bias towards action');
     expect(all).toContain('take precedence over guidelines provided in a skill');
     expect(all).toContain(GPT6_ADDENDUM_SOURCE);
+  });
+
+  // FU-3(#28961 리뷰): 결함 #87 의 관측 대상은 `gpt-6-sol` 이다 — astra 만 재면 sol 배선이 조용히 빠져도 모른다.
+  test('✅ `gpt-6-sol`·`gpt-6-luna` preamble 에도 «진행 설명» 절이 뜬다', () => {
+    for (const model of ['gpt-6-sol', 'gpt-6-luna']) {
+      expect(getModelFamily(model)).toBe('gpt');
+      const all = buildUniversalPreamble({ cwd, modelFamily: getModelFamily(model) })
+        .map((m) => String(m.content)).join('\n');
+      expect(all).toContain('Progress narration');
+      expect(all).toContain('Before each batch of tool calls');
+    }
   });
 
   test('⛔ codex 계열(terra·sol)은 «무변경» — 이 규율이 안 붙는다', () => {

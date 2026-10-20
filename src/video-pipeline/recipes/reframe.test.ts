@@ -61,7 +61,10 @@ describe('reframe — Affinity 가 없어도 «끝까지» 간다', () => {
   }, T);
 
   test('⛔ 러너가 «없어도» 멈추지 않는다 (앱이 없는 고객 기계의 모습)', () => {
-    const d = mkdtempSync(join(HOME, '.rf-'));             // 홈 아래 — 경로 때문이 아님을 분리한다
+    // This case checks the missing-runner fallback, not whether /tmp is an
+    // Affinity-safe output location. Keep its fixture independent of HOME so
+    // an env -i temporary HOME cannot trip the separate /tmp safety guard.
+    const d = mkdtempSync(join(import.meta.dir, '.rf-'));
     const src = mkSrc(d, 800, 600);
     const out = join(d, 'out.png');
     resetAffinityReachCache();

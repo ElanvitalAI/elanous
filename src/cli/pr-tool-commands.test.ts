@@ -6,7 +6,7 @@ test('pr command list snapshot keeps queue, land, and granularity beside the new
   const root = new Command();
   registerPrCommands(root);
   const pr = root.commands.find(command => command.name() === 'pr');
-  expect(pr?.commands.map(command => command.name())).toEqual(['census', 'open-guard', 'queue', 'land', 'granularity']);
+  expect(pr?.commands.map(command => command.name())).toEqual(['supersede-drafts', 'census', 'open-guard', 'queue', 'land', 'granularity']);
   expect(pr?.commands.find(command => command.name() === 'queue')?.commands.map(command => command.name()))
     .toEqual(['status', 'enqueue', 'run']);
 });

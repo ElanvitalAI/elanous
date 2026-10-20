@@ -38,7 +38,7 @@ import {
 } from './user-config.js';
 import {
   GROK_MODEL, OPENAI_MODEL, ANTHROPIC_MODEL, LOCAL_LLM_MODEL, GEMINI_MODEL,
-  KIMI_MODEL, QWEN_MODEL, GLM_MODEL,
+  KIMI_MODEL, QWEN_MODEL, GLM_MODEL, OPENROUTER_MODEL,
 } from './config.js';
 import { CODEX_DEFAULT_MODEL } from './llm.js';
 import { suggestSetupModel } from './model-tier/index.js';
@@ -514,7 +514,10 @@ const PROVIDER_CHOICES: ProviderChoice[] = [
     defaultBaseUrl: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1' },
   { key: 'glm',          label: 'GLM (Zhipu · Z.ai · GLM-5.1 754B MoE)', defaultModel: GLM_MODEL, needsBaseUrl: true, needsApiKey: true,
     defaultBaseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
+  // Keep `auto` at its established numeric position; scripted onboarding
+  // answers and existing users rely on the stable numbered choices.
   { key: 'auto',         label: 'Auto-detect (pick from env at runtime)', needsBaseUrl: false, needsApiKey: false },
+  { key: 'openrouter',   label: 'OpenRouter', defaultModel: OPENROUTER_MODEL, needsBaseUrl: false, needsApiKey: true },
 ];
 
 /** PLAN-model-intelligence-router · Phase B4 — decide whether the model
@@ -1753,15 +1756,20 @@ export async function runOnboardingNonInteractive(
     answerFilePath?: string;
     /** Override the resolved env when reading env-bridge layer. */
     env?: NodeJS.ProcessEnv;
+    /** Test seam for `llm detect` dependencies while retaining its probe selection logic. */
+    llmDetectDeps?: import('./cli/llm-detect-cli.js').LlmDetectDeps;
   } = {},
 ): Promise<UserConfig> {
   // Lazy import — keeps `expression/config/` out of the cold path.
   const { nonInteractiveIO } = await import('./onboarding/non-interactive.js');
+  const initial = opts.initial ?? buildUserConfig(opts.path ?? userConfigPath());
   const io = nonInteractiveIO({
     answerFilePath: opts.answerFilePath,
     env: opts.env,
+    initialProvider: initial.llm?.provider,
+    llmDetectDeps: opts.llmDetectDeps,
   });
-  const config = await runOnboarding({ ...opts, io, deferComplete: true });
+  const config = await runOnboarding({ ...opts, initial, io, deferComplete: true });
   io.complete?.();
   return config;
 }

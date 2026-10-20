@@ -592,7 +592,8 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     if (!context && !options.kubectl) throw new Error('pod command: kubectl context 를 확인할 수 없다');
     let grokAuth: string | undefined;
     if (llm === 'grok') {
-      const creds = (options.grokCredentials ?? (() => hostGrokCredentials({ env, apiKeyOptIn: false })))();
+      // POD-GROK-VALIDITY-FIT — this Job's deadline is not fitted to the token, so the copy must outlive the whole Job.
+      const creds = (options.grokCredentials ?? (() => hostGrokCredentials({ env, apiKeyOptIn: false, minValidityMs: deadlineSeconds * 1000 })))();
       if (!creds.grokAuth) throw new Error('grok: 구독 자격 없음 · API 키 opt-in 꺼짐 또는 키 없음');
       let parsed: unknown;
       try { parsed = JSON.parse(creds.grokAuth); } catch { throw new Error('grok: Pod 구독 자격 JSON 이 아니다'); }

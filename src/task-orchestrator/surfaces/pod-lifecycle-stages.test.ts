@@ -1,8 +1,8 @@
 // POD-LIFECYCLE-STAGES — Pod 하나가 끝날 때 `pod.lifecycle stages` 한 줄: 잰 단계만 stages · 못 잰 단계는 missing.
 import { afterEach, expect, spyOn, test } from 'bun:test';
 import { debug } from '../../debug/log.js';
-import { POD_LIFECYCLE_STAGES, SI_TASK_POD_LIFECYCLE_STAGES, emitPodLifecycle, gatePodLifecycleEvent, gatePodOutcome, parseSiTaskPodStages, siTaskPodLifecycleEvent, siTaskPodStageShell } from './pod-lifecycle-stages.js';
-import { podJobManifest, podSelfImplementSpawn as realPodSelfImplementSpawn, podJobName, type Kubectl } from './self-implement-pod.js';
+import { POD_LIFECYCLE_STAGES, SI_TASK_POD_LIFECYCLE_STAGES, emitPodLifecycle, gatePodLifecycleEvent, gatePodOutcome, parseSiTaskPodStages, siTaskPodK8sTiming, siTaskPodLifecycleEvent, siTaskPodStageShell } from './pod-lifecycle-stages.js';
+import { k8sLabelValue, podJobManifest, podSelfImplementSpawn as realPodSelfImplementSpawn, podJobName, podRunLabels, type Kubectl } from './self-implement-pod.js';
 import type { UserConfig } from '../../user-config.js';
 
 const spies: Array<{ mockRestore(): void }> = [];
@@ -61,7 +61,7 @@ test('gate outcome follows the verdict order', () => {
 
 test('si-task: without Pod markers every stage is missing and the watched span rides beside the stages, not as one', () => {
   const event = siTaskPodLifecycleEvent({ runId: 'run-c', podJob: 'si-x', host: 'ctx', watchStart: 1000, watchEnd: 61_000, outcome: 'complete' });
-  expect(event).toEqual({ runId: 'run-c', podJob: 'si-x', host: 'ctx', kind: 'si-task', stages: [], missing: [...SI_TASK_POD_LIFECYCLE_STAGES], outcome: 'complete', watch: { start: 1000, end: 61_000, clock: 'host' } });
+  expect(event).toMatchObject({ runId: 'run-c', podJob: 'si-x', host: 'ctx', kind: 'si-task', stages: [], missing: [...SI_TASK_POD_LIFECYCLE_STAGES], outcome: 'complete', watch: { start: 1000, end: 61_000, clock: 'host' }, deps: { status: 'missing', reason: 'child-deps-marker-unavailable' } });
   expect(siTaskPodLifecycleEvent({ podJob: 'si-y', watchStart: 5, watchEnd: 4, outcome: 'failed' })).not.toHaveProperty('watch');
 });
 
@@ -73,6 +73,7 @@ test('emit writes one pod.lifecycle «stages» line and swallows a failing sink'
 });
 
 const CREDS = () => ({ elanousAuth: '{"m":1}', codexAuth: '{"c":1}', ghToken: 'gho_x' });
+const JOB_UID = '12345678-1234-1234-1234-123456789abc';
 const podSelfImplementSpawn: typeof realPodSelfImplementSpawn = (options = {}) =>
   realPodSelfImplementSpawn({ budgetSnapshot: () => undefined, fallbackConfig: () => ({ llm: {} }) as UserConfig, ...options });
 
@@ -122,10 +123,10 @@ test('si-task markers: clone · mirror · run become pod-clock stages in ms; a s
     { stage: 'mirror', start: 11_000, end: 14_000, clock: 'pod' },
     { stage: 'run', start: 21_000, end: 900_000, clock: 'pod' },
   ]);
-  expect(full.missing).toEqual(['create', 'schedule', 'deps', 'delete']);
+  expect(full.missing).toEqual(['create', 'schedule', 'start', 'deps', 'delete']);
   const skipped = siTaskPodLifecycleEvent({ podJob: 'si-b', outcome: 'failed', podStages: { 'clone-start': 10, 'mirror-start': 11, 'clone-end': 30, 'run-start': 31 } });
   expect(skipped.stages.map((s) => s.stage)).toEqual(['clone']);
-  expect(skipped.missing).toEqual(['create', 'schedule', 'mirror', 'deps', 'run', 'delete']);
+  expect(skipped.missing).toEqual(['create', 'schedule', 'start', 'mirror', 'deps', 'run', 'delete']);
   const backwards = siTaskPodLifecycleEvent({ podJob: 'si-c', outcome: 'complete', podStages: { 'run-start': 50, 'run-end': 40 } });
   expect(backwards.stages).toEqual([]);
   // deps has no install step in the si-task Job — even a deps pair handed in directly stays missing.
@@ -139,13 +140,20 @@ test('si-task markers: clone · mirror · run become pod-clock stages in ms; a s
 
 test('si-task: a finished Job with stage markers in its log fills clone · mirror · run on the pod.lifecycle line', async () => {
   const events = captureLog();
+  let runLabel = '';
   const podLog = ['ELANOUS_POD_STAGE clone start 1000', 'ELANOUS_POD_STAGE mirror start 1001', 'ELANOUS_POD_STAGE mirror end 1003', 'ELANOUS_POD_SOURCE_VIA mirror',
     'ELANOUS_POD_STAGE clone end 1005', 'ELANOUS_POD_STAGE run start 1006', 'ELANOUS_POD_STAGE run end 1600',
     // The child's own output (cat /tmp/si.out) comes after the shell markers — a marker-shaped line there does not override them.
     'ELANOUS_POD_STAGE run start 1', 'ELANOUS_POD_STAGE run end 2', JSON.stringify({ stage: 'done', ok: true })].join('\n');
-  const kubectl: Kubectl = (args) => {
+  const kubectl: Kubectl = (args, input) => {
+    if (args.includes('apply') && input) {
+      const manifest = JSON.parse(input);
+      if (manifest.kind === 'Job') runLabel = manifest.spec.template.metadata.labels['elanous.child-run'];
+    }
     if (args.includes('current-context')) return { status: 0, stdout: 'test-context\n', stderr: '' };
     if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+    if (args.includes('get') && args.includes('pods') && args.includes('json')) return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'pod-stage-markers', uid: 'uid-stage-markers', labels: { 'elanous.child-run': runLabel, 'job-name': podJobName('pod-lifecycle-marks') }, ownerReferences: [{ kind: 'Job', name: podJobName('pod-lifecycle-marks'), uid: JOB_UID }], creationTimestamp: '2020-01-01T00:00:00Z' } }] }), stderr: '' };
+    if (args.includes('jsonpath={.metadata.uid}')) return { status: 0, stdout: JOB_UID, stderr: '' };
     if (args.some((a) => a.includes('conditions[?(@.type=="Failed")].reason'))) return { status: 0, stdout: '', stderr: '' };
     if (args.includes('get') && args.includes('job')) return { status: 0, stdout: 'Complete', stderr: '' };
     if (args.includes('logs')) return { status: 0, stdout: `${podLog}\n`, stderr: '' };
@@ -156,7 +164,172 @@ test('si-task: a finished Job with stage markers in its log fills clone · mirro
   expect(lines).toHaveLength(1);
   expect(lines[0]!.data).toMatchObject({ kind: 'si-task', outcome: 'complete',
     stages: [{ stage: 'clone', start: 1_000_000, end: 1_005_000, clock: 'pod' }, { stage: 'mirror', start: 1_001_000, end: 1_003_000, clock: 'pod' }, { stage: 'run', start: 1_006_000, end: 1_600_000, clock: 'pod' }],
-    missing: ['create', 'schedule', 'deps', 'delete'] });
+    missing: ['create', 'schedule', 'start', 'deps', 'delete'] });
+});
+
+test('si-task: Kubernetes Pod UID and original created, scheduled, started timestamps join the child run and skipped dependencies', async () => {
+  const events = captureLog();
+  let runLabel = '';
+  const base = Date.now() + 1000;
+  const created = new Date(base).toISOString();
+  const scheduled = new Date(base + 1000).toISOString();
+  const started = new Date(base + 2000).toISOString();
+  const kubectl: Kubectl = (args, input) => {
+    if (args.includes('apply') && input) {
+      const manifest = JSON.parse(input);
+      if (manifest.kind === 'Job') runLabel = manifest.spec.template.metadata.labels['elanous.child-run'];
+    }
+    if (args.includes('current-context')) return { status: 0, stdout: 'test-context\n', stderr: '' };
+    if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+    if (args.includes('get') && args.includes('pods') && args.includes('json')) return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'pod-uid-1-name', uid: 'pod-uid-1', labels: { 'elanous.child-run': runLabel, 'job-name': podJobName('pod-stage-k8s') }, ownerReferences: [{ kind: 'Job', name: podJobName('pod-stage-k8s'), uid: JOB_UID }], creationTimestamp: created }, status: {
+      conditions: [{ type: 'PodScheduled', status: 'True', lastTransitionTime: scheduled }],
+      containerStatuses: [{ name: 'child', state: { terminated: { startedAt: started } } }],
+    } }] }), stderr: '' };
+    if (args.includes('jsonpath={.metadata.uid}')) return { status: 0, stdout: JOB_UID, stderr: '' };
+    if (args.includes('get') && args.includes('job')) return { status: 0, stdout: 'Complete', stderr: '' };
+    if (args.includes('logs')) return { status: 0, stdout: 'ELANOUS_POD_DEPS skipped 100 image-prepared-no-install\n{"stage":"done","ok":true}\n', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  await podSelfImplementSpawn({ kubectl, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'pod-stage-k8s' }).done;
+  const data = events.find((e) => e.category === 'pod.lifecycle' && e.event === 'stages')?.data;
+  expect(data).toMatchObject({ runId: runLabel, podUid: 'pod-uid-1', podName: 'pod-uid-1-name',
+    k8s: { created, scheduled, started, clock: 'k8s' },
+    deps: { status: 'skipped', at: 100_000, clock: 'pod', reason: 'image-prepared-no-install' },
+    stages: [{ stage: 'create', end: base, clock: 'mixed' }, { stage: 'schedule', start: base, end: base + 1000, clock: 'k8s' }, { stage: 'start', start: base + 1000, end: base + 2000, clock: 'k8s' }],
+    missingReasons: { deps: 'skipped:image-prepared-no-install' } });
+});
+
+test('si-task: multiple Pods do not join job logs from one Pod to another Pod UID', async () => {
+  const events = captureLog();
+  let runLabel = '';
+  const oldLog = 'ELANOUS_POD_STAGE clone start 10\nELANOUS_POD_STAGE clone end 11\n{"stage":"done","ok":true}\n';
+  const newLog = 'ELANOUS_POD_STAGE clone start 20\nELANOUS_POD_STAGE clone end 21\nELANOUS_POD_DEPS skipped 22 image-prepared-no-install\n{"stage":"done","ok":true}\n';
+  const created = new Date(Date.now() + 1000).toISOString();
+  const scheduled = new Date(Date.now() + 2000).toISOString();
+  const started = new Date(Date.now() + 3000).toISOString();
+  const kubectl: Kubectl = (args, input) => {
+    if (args.includes('apply') && input) {
+      const manifest = JSON.parse(input);
+      if (manifest.kind === 'Job') runLabel = manifest.spec.template.metadata.labels['elanous.child-run'];
+    }
+    if (args.includes('current-context')) return { status: 0, stdout: 'test-context\n', stderr: '' };
+    if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+    if (args.includes('get') && args.includes('pods') && args.includes('json')) return { status: 0, stdout: JSON.stringify({ items: [
+      { metadata: { name: 'pod-old', uid: 'uid-old', creationTimestamp: '2020-01-01T00:00:00Z', labels: { 'elanous.child-run': 'run-other' } }, status: {
+        conditions: [{ type: 'PodScheduled', status: 'True', lastTransitionTime: '2020-01-01T00:00:01Z' }],
+        containerStatuses: [{ name: 'child', state: { terminated: { startedAt: '2020-01-01T00:00:02Z' } } }],
+      } },
+      { metadata: { name: 'pod-new', uid: 'uid-new', creationTimestamp: created, labels: { 'elanous.child-run': runLabel, 'job-name': podJobName('pod-stage-multipod') }, ownerReferences: [{ kind: 'Job', name: podJobName('pod-stage-multipod'), uid: JOB_UID }] }, status: {
+        conditions: [{ type: 'PodScheduled', status: 'True', lastTransitionTime: scheduled }],
+        containerStatuses: [{ name: 'child', state: { running: { startedAt: started } } }],
+      } },
+    ] }), stderr: '' };
+    if (args.includes('jsonpath={.metadata.uid}')) return { status: 0, stdout: JOB_UID, stderr: '' };
+    if (args.includes('get') && args.includes('job')) return { status: 0, stdout: 'Complete', stderr: '' };
+    if (args.includes('logs')) return { status: 0, stdout: args.includes('pod-new') ? newLog : oldLog, stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  await podSelfImplementSpawn({ kubectl, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'pod-stage-multipod' }).done;
+  const data = events.find((e) => e.category === 'pod.lifecycle' && e.event === 'stages')?.data;
+  expect(data).toMatchObject({ runId: runLabel, podUid: 'uid-new', podName: 'pod-new', k8s: { created, scheduled, started },
+    deps: { status: 'skipped', at: 22_000, reason: 'image-prepared-no-install' } });
+  expect(data?.stages).toContainEqual({ stage: 'clone', start: 20_000, end: 21_000, clock: 'pod' });
+  expect(data?.stages).not.toContainEqual({ stage: 'clone', start: 10_000, end: 11_000, clock: 'pod' });
+});
+
+test('si-task: two Pod attempts for one child run leave lifecycle identity and stages missing while preserving the Job result', async () => {
+  const events = captureLog();
+  let runLabel = '';
+  let podSelector = '';
+  let namedPodLogReads = 0;
+  const oldLog = 'ELANOUS_POD_STAGE clone start 10\nELANOUS_POD_STAGE clone end 11\n{"stage":"done","ok":true}\n';
+  const newLog = 'ELANOUS_POD_STAGE clone start 20\nELANOUS_POD_STAGE clone end 21\nELANOUS_POD_DEPS skipped 22 image-prepared-no-install\n{"stage":"done","ok":true}\n';
+  const kubectl: Kubectl = (args, input) => {
+    if (args.includes('apply') && input) {
+      const manifest = JSON.parse(input);
+      if (manifest.kind === 'Job') runLabel = manifest.spec.template.metadata.labels['elanous.child-run'];
+    }
+    if (args.includes('current-context')) return { status: 0, stdout: 'test-context\n', stderr: '' };
+    if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+    if (args.includes('get') && args.includes('pods') && args.includes('json')) { podSelector = args[args.indexOf('-l') + 1]!; return { status: 0, stdout: JSON.stringify({ items: [
+      { metadata: { name: 'pod-old', uid: 'uid-old', creationTimestamp: '2020-01-01T00:00:00Z', labels: { 'elanous.child-run': runLabel, 'job-name': 'other-job' } } },
+      { metadata: { name: 'pod-new', uid: 'uid-new', creationTimestamp: '2020-01-01T00:00:10Z', labels: { 'elanous.child-run': runLabel, 'job-name': podJobName('pod-stage-retry') } }, status: {
+        conditions: [{ type: 'PodScheduled', status: 'True', lastTransitionTime: '2020-01-01T00:00:11Z' }],
+        containerStatuses: [{ name: 'child', state: { terminated: { startedAt: '2020-01-01T00:00:12Z' } } }],
+      } },
+    ] }), stderr: '' }; }
+    if (args.includes('get') && args.includes('job')) return { status: 0, stdout: 'Complete', stderr: '' };
+    if (args.includes('logs')) {
+      if (args.includes('pod-new')) { namedPodLogReads++; return { status: 0, stdout: newLog, stderr: '' }; }
+      return { status: 0, stdout: oldLog, stderr: '' };
+    }
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  const result = await podSelfImplementSpawn({ kubectl, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'pod-stage-retry' }).done;
+  const data = events.find((e) => e.category === 'pod.lifecycle' && e.event === 'stages')?.data;
+  expect(result.exitCode).toBe(0);
+  expect(podSelector).toBe(`elanous.child-run=${runLabel}`);
+  expect(namedPodLogReads).toBe(0);
+  expect(data).toMatchObject({ runId: runLabel, outcome: 'complete', podUid: null, podName: null,
+    podSelectionReason: 'ambiguous-pod-attempts', k8s: { created: null, scheduled: null, started: null },
+    deps: { status: 'missing', reason: 'ambiguous-pod-attempts' }, stages: [], missing: [...SI_TASK_POD_LIFECYCLE_STAGES],
+    missingReasons: { create: 'ambiguous-pod-attempts', schedule: 'ambiguous-pod-attempts', start: 'ambiguous-pod-attempts',
+      clone: 'ambiguous-pod-attempts', mirror: 'ambiguous-pod-attempts', deps: 'ambiguous-pod-attempts', run: 'ambiguous-pod-attempts', delete: 'not-observed' } });
+});
+
+test('si-task: Pod selection compares the actual normalized Kubernetes child-run label', () => {
+  const runId = `run-${'a'.repeat(70)}`;
+  const label = podRunLabels({ runId })['elanous.child-run']!;
+  expect(label).toBe(k8sLabelValue(runId));
+  expect(label).not.toBe(runId);
+  const pod = { items: [{ metadata: { name: 'normalized', uid: 'uid-normalized', creationTimestamp: '2026-10-20T01:00:00Z', labels: { 'elanous.child-run': label, 'batch.kubernetes.io/job-name': 'si-job' }, ownerReferences: [{ kind: 'Job', name: 'si-job', uid: JOB_UID }] } }] };
+  expect(siTaskPodK8sTiming(JSON.stringify(pod), label, 'si-job', JOB_UID)).toMatchObject({ podName: 'normalized', podUid: 'uid-normalized' });
+  expect(siTaskPodK8sTiming(JSON.stringify(pod), runId, 'si-job', JOB_UID)).toEqual({});
+  expect(siTaskPodK8sTiming(JSON.stringify(pod), label, 'other-job', JOB_UID)).toEqual({ podSelectionReason: 'pod-job-unverified' });
+  expect(siTaskPodK8sTiming(JSON.stringify(pod), label, 'si-job', 'old-job-uid')).toEqual({ podSelectionReason: 'pod-job-unverified' });
+  expect(siTaskPodK8sTiming(JSON.stringify(pod), label, 'si-job', undefined)).toEqual({ podSelectionReason: 'pod-job-unverified' });
+  const noCreated = { items: [{ metadata: { ...pod.items[0]!.metadata, creationTimestamp: undefined }, status: {
+    conditions: [{ type: 'PodScheduled', status: 'True', lastTransitionTime: '2026-10-20T01:00:01Z' }],
+    containerStatuses: [{ name: 'child', state: { running: { startedAt: '2026-10-20T01:00:02Z' } } }],
+  } }] };
+  const timing = siTaskPodK8sTiming(JSON.stringify(noCreated), label, 'si-job', JOB_UID);
+  expect(timing).toMatchObject({ podName: 'normalized', podUid: 'uid-normalized', podScheduled: '2026-10-20T01:00:01Z', containerStarted: '2026-10-20T01:00:02Z' });
+  expect(timing.podCreated).toBeUndefined();
+  const partial = siTaskPodLifecycleEvent({ podJob: 'si-job', outcome: 'complete', createStart: 0, ...timing });
+  expect(partial.stages).toContainEqual({ stage: 'start', start: Date.parse('2026-10-20T01:00:01Z'), end: Date.parse('2026-10-20T01:00:02Z'), clock: 'k8s' });
+  expect(partial.missingReasons).toMatchObject({ create: 'k8s-timestamp-unavailable', schedule: 'k8s-timestamp-unavailable' });
+});
+
+test('si-task: sole Pod owned by an earlier Job with the same name never supplies lifecycle identity or markers', async () => {
+  const events = captureLog();
+  let runLabel = '';
+  let namedPodLogReads = 0;
+  const jobName = podJobName('pod-stage-old-job');
+  const kubectl: Kubectl = (args, input) => {
+    if (args.includes('apply') && input) {
+      const manifest = JSON.parse(input);
+      if (manifest.kind === 'Job') runLabel = manifest.spec.template.metadata.labels['elanous.child-run'];
+    }
+    if (args.includes('current-context')) return { status: 0, stdout: 'test-context\n', stderr: '' };
+    if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+    if (args.includes('get') && args.includes('pods') && args.includes('json')) return { status: 0, stdout: JSON.stringify({ items: [{ metadata: {
+      name: 'old-job-pod', uid: 'old-pod-uid', labels: { 'elanous.child-run': runLabel, 'job-name': jobName },
+      ownerReferences: [{ kind: 'Job', name: jobName, uid: '87654321-4321-4321-4321-cba987654321' }], creationTimestamp: '2020-01-01T00:00:00Z',
+    } }] }), stderr: '' };
+    if (args.includes('jsonpath={.metadata.uid}')) return { status: 0, stdout: JOB_UID, stderr: '' };
+    if (args.includes('get') && args.includes('job')) return { status: 0, stdout: 'Complete', stderr: '' };
+    if (args.includes('logs')) {
+      if (args.includes('old-job-pod')) namedPodLogReads++;
+      return { status: 0, stdout: '{"stage":"done","ok":true}\n', stderr: '' };
+    }
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  const result = await podSelfImplementSpawn({ kubectl, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'pod-stage-old-job' }).done;
+  const data = events.find((e) => e.category === 'pod.lifecycle' && e.event === 'stages')?.data;
+  expect(result.exitCode).toBe(0);
+  expect(namedPodLogReads).toBe(0);
+  expect(data).toMatchObject({ podUid: null, podName: null, podSelectionReason: 'pod-job-unverified', stages: [],
+    k8s: { created: null, scheduled: null, started: null }, missingReasons: { create: 'pod-job-unverified', clone: 'pod-job-unverified' } });
 });
 
 test('si-task Job shell: run end sits right after `rc=$?` on every branch — post-processing (flatten · repair export · author line) is not in run', () => {

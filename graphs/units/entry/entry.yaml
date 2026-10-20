@@ -1,0 +1,50 @@
+graph_id: entry
+version: 1
+unit:
+  inputs: [ask, context, prior]
+  outputs: [result, evidence]
+  exits: [done, rework, needs-human, failed]
+entry_node: intake
+terminal_nodes: [done, rework, needs-human, failed]
+nodes:
+  - node_id: intake
+    group: entry
+    journey_stage: entry
+    kind: observe
+    recipe: 'cmd:harness-entrance'
+    max_visits: 1
+    terminal_stages: []
+    contract:
+      inputs: [ask, context, prior]
+      tools: read-only
+      outputs: [entrance, journey_key, result, evidence]
+  - node_id: queue
+    group: entry
+    journey_stage: entry
+    kind: gate
+    recipe: 'cmd:harness-queue'
+    max_visits: 1
+    terminal_stages: []
+    contract:
+      inputs: [entrance, seat]
+      tools: read-only
+      outputs: [queue_item, queue_outcome, result, evidence]
+  - node_id: launch-gate
+    group: entry
+    journey_stage: entry
+    kind: gate
+    recipe: 'cmd:pre-launch-gate'
+    max_visits: 1
+    terminal_stages: []
+    contract:
+      inputs: [goal_id, budget]
+      tools: read-only
+      outputs: [launch_decision, result, evidence]
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: rework, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: needs-human, kind: hitl, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: observe, recipe: none, max_visits: 1 }
+edges:
+  - { from: intake, on: outcome, map: { done: queue, rework: rework, needs-human: needs-human, failed: failed } }
+  - { from: queue, on: outcome, map: { done: launch-gate, rework: rework, needs-human: needs-human, failed: failed } }
+  - { from: launch-gate, on: outcome, map: { done: done, rework: rework, needs-human: needs-human, failed: failed } }

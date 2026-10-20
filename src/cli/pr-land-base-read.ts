@@ -14,6 +14,7 @@ export async function readPrBaseNameWithRetry(input: {
   cwd: string;
   run: CmdRunner;
   sleep: (ms: number) => Promise<void>;
+  onUnreadable?: (attempt: number, stderr: string | undefined) => void;
 }): Promise<PrBaseReadResult> {
   for (let attempt = 1; attempt <= PR_LAND_BASE_READ_RETRIES + 1; attempt += 1) {
     const viewed = input.run('gh', ['pr', 'view', input.pr, '--json', 'baseRefName,url'], { cwd: input.cwd });
@@ -28,6 +29,7 @@ export async function readPrBaseNameWithRetry(input: {
     } catch { /* Retry unreadable responses; do not treat them as main. */ }
 
     if (baseRefName !== null) return { baseRefName, attempts: attempt };
+    input.onUnreadable?.(attempt, viewed.err);
     if (attempt <= PR_LAND_BASE_READ_RETRIES) await input.sleep(PR_LAND_BASE_READ_RETRY_DELAY_MS);
   }
   return { baseRefName: null, attempts: PR_LAND_BASE_READ_RETRIES + 1 };

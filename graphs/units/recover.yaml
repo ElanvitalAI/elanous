@@ -1,0 +1,39 @@
+graph_id: recover
+version: 1
+unit:
+  inputs: [ask, context, prior]
+  outputs: [result, evidence]
+  exits: [done, rework, needs-human, failed]
+  entries: [plan, request-review, wait-retry, human-review]
+entry_node: plan
+terminal_nodes: [done, rework, needs-human, failed]
+nodes:
+  - node_id: plan
+    kind: agent
+    recipe: 'cmd:recover-plan'
+    max_visits: 1
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+  - node_id: request-review
+    kind: agent
+    recipe: 'cmd:recover-plan'
+    max_visits: 1
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+  - node_id: wait-retry
+    kind: agent
+    recipe: 'cmd:recover-plan'
+    max_visits: 1
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+  - node_id: human-review
+    kind: agent
+    recipe: 'cmd:recover-plan'
+    max_visits: 1
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: rework, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: needs-human, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: plan, on: outcome, map: { done: done, rework: rework, needs-human: needs-human, failed: failed, fail: failed } }
+  - { from: request-review, on: outcome, map: { done: done, rework: rework, needs-human: needs-human, failed: failed, fail: failed } }
+  - { from: wait-retry, on: outcome, map: { done: done, rework: rework, needs-human: needs-human, failed: failed, fail: failed } }
+  - { from: human-review, on: outcome, map: { done: done, rework: rework, needs-human: needs-human, failed: failed, fail: failed } }

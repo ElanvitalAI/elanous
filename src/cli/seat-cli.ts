@@ -3,6 +3,7 @@ import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'nod
 import { homedir } from 'node:os';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { LAST_SESSION_FILE } from '../dashboard/seat-local-instructions.js';
 import { redactSecretText } from '../debug/log.js';
 import { defaultMsgStorePath, readUnreadCount } from '../msg/msg-store.js';
 import { parseKnowhowItems, splitKnowhow } from '../seat-loop/seat-knowhow.js';
@@ -96,6 +97,40 @@ export function renderSeatBootCard(seat: string, sections: ReadonlyArray<SeatBoo
   return out.join('\n');
 }
 
+/** 자리의 현재 역할 선언 한 줄만 부트 카드에 싣는다. 긴 지시문 본문은 카드로 복사하지 않는다. */
+function seatRoleSection(home: string, seat: string): { source: string; updated: string; rows: readonly string[]; reason?: string } {
+  const root = join(home, 'elanous-hq');
+  const path = join(root, 'seats', seat, 'AGENTS.local.md');
+  if (!existsSync(path)) return { source: path, updated: '미상', rows: [], reason: '미관측: 파일 없음' };
+  try {
+    if (!isRegularSeatPath(home, root, path)) return { source: path, updated: '미상', rows: [], reason: '미관측: 일반 경로가 아님' };
+    const role = readFileSync(path, 'utf8').slice(0, 4096).split(/\r?\n/)
+      .map(line => line.match(/^\s*#?\s*역할\s*=\s*(.+)$/)?.[1])
+      .find(Boolean);
+    return { source: path, updated: statSync(path).mtime.toISOString(), rows: role ? [`역할: ${clean(role)}`] : [],
+      ...(role ? {} : { reason: '미관측: 역할 선언 없음' }) };
+  } catch {
+    return { source: path, updated: '미상', rows: [], reason: '미관측: 읽기 실패' };
+  }
+}
+
+/** «지난 세션» 절 — TUI 가 대화 끝마다 자리 작업 디렉터리 루트에 갈아 쓰는 `LAST_SESSION_FILE`(`dashboard/seat-local-instructions.ts`)이 곧 지난 세션의 정본이다.
+ *  카드도 같은 정본을 읽는다 — 머리 보일러플레이트(`## …`)는 빼고 요약 줄만 실는다. */
+function lastSessionSection(home: string, seat: string): { source: string; updated: string; rows: readonly string[]; reason?: string } {
+  const path = join(home, 'elanous-hq', 'seats', seat, LAST_SESSION_FILE);
+  if (!existsSync(path)) return { source: path, updated: '미상', rows: [], reason: '미관측: 파일 없음' };
+  try {
+    if (!isRegularSeatPath(home, join(home, 'elanous-hq'), path)) return { source: path, updated: '미상', rows: [], reason: '미관측: 일반 경로가 아님' };
+    const rows = readFileSync(path, 'utf8').slice(0, 256_000).split(/\r?\n/)
+      .filter(line => line.trim() && !/^#{1,6}\s/.test(line))
+      .slice(0, MAX_ROWS)
+      .map(line => clean(line.replace(/^[-*]\s*/, '')));
+    return { source: path, updated: statSync(path).mtime.toISOString(), rows, ...(rows.length ? {} : { reason: '미관측: 요약 줄 없음' }) };
+  } catch {
+    return { source: path, updated: '미상', rows: [], reason: '미관측: 읽기 실패' };
+  }
+}
+
 /** 자리 카드의 파일·우편 절(동기) — `eln seat boot` 와 TUI 세션 부트(`dashboard/seat-boot-preamble.ts`)가 같이 쓴다. */
 export function collectSeatBootSections(seat: string, options: { home: string; msgPath: string }): { sections: SeatBootSection[]; unread: number | null } {
   const root = join(options.home, 'elanous-hq', 'seat-state');
@@ -104,11 +139,13 @@ export function collectSeatBootSections(seat: string, options: { home: string; m
   try { unread = readUnreadCount(seat, options.msgPath); }
   catch { /* unavailable is not a measured zero */ }
   const sections: SeatBootSection[] = [
+    { title: '자리 역할', ...seatRoleSection(options.home, seat) },
     { title: 'msg 원장', source: options.msgPath, updated: unread === null ? '미상' : new Date().toISOString(), rows: [`안 읽은 msg ${unread ?? '미관측'} (${seat})`] },
     { title: 'HANDOFF', ...metadata(options.home, root, join(seatDir, 'HANDOFF.md'), 'markdown') },
     { title: 'inbox', ...metadata(options.home, root, join(seatDir, 'inbox.md'), 'markdown') },
     { title: '수확 주장', ...metadata(options.home, root, join(seatDir, 'harvest-claims.tsv'), 'tsv') },
     { title: '예약', ...metadata(options.home, root, join(seatDir, 'scheduled.tsv'), 'tsv') },
+    { title: '지난 세션', ...lastSessionSection(options.home, seat) },
     { title: '공통 메모리 색인', ...metadata(options.home, root, join(root, 'memory', 'MEMORY.md'), 'memory') },
   ];
   return { sections, unread };

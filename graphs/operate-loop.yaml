@@ -13,8 +13,8 @@
 graph_id: operate-loop
 version: 1
 entry_node: operate-plan
-terminal_nodes: [merge, operate-blocked]
-runner_inputs: [goal, worktree, branch, review-intent, head-sha, base-branch]
+terminal_nodes: [landed, operate-blocked, needs-human]
+runner_inputs: [goal, worktree, branch, review-intent, head-sha, base-branch, ask, context, prior]
 docs_only_gate_skip: false
 state: [spec, changed_files, review_summary]
 
@@ -129,6 +129,17 @@ nodes:
       tools: gh-pr-merge
       outputs: [merged]
 
+  - node_id: recover
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: recover@1
+    budget: { inner_steps: 4 }
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+
+  - { node_id: landed, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: needs-human, kind: gate, recipe: none, max_visits: 1 }
+
 edges:
   - from: operate-plan
     to: operate-verify
@@ -171,3 +182,11 @@ edges:
 
   - from: open-pr
     to: merge
+
+  - from: merge
+    on: outcome
+    map: { merged: landed, land-refused: recover, ok: needs-human, fail: needs-human }
+
+  - from: recover
+    on: outcome
+    map: { done: needs-human, rework: needs-human, needs-human: needs-human, failed: needs-human }

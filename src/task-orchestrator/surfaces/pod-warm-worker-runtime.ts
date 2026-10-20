@@ -166,7 +166,7 @@ export class WarmWorkerRuntime {
       || !token(command.workerId) || command.workerId !== this.options.workerId
       || !Number.isSafeInteger(command.generation) || command.generation < 1
       || !Number.isFinite(command.deadlineAt)
-      || !token(command.envProfile) || (command.baselineSha !== undefined && !sha(command.baselineSha))
+      || command.envProfile !== 'gate-v1' || (command.baselineSha !== undefined && !sha(command.baselineSha))
       || !keyValid(command.key)
       || !Array.isArray(command.files) || command.files.length === 0
       || command.files.some(file => !testPath(file)) || new Set(command.files).size !== command.files.length) {
@@ -234,6 +234,7 @@ export class WarmWorkerRuntime {
         ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(dirs.state), TMPDIR: dirs.tmp,
         XDG_CONFIG_HOME: dirs.config, XDG_CACHE_HOME: dirs.cache,
         XDG_DATA_HOME: dirs.data, XDG_STATE_HOME: dirs['xdg-state'], XDG_RUNTIME_DIR: dirs['xdg-runtime'],
+        TZ: 'UTC', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', ELANOUS_TEST_FAKE_LLM: '1',
       };
       let rc = 1;
       try {

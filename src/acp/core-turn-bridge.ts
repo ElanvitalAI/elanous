@@ -54,6 +54,7 @@ import { readOriginSessionMeta } from './origin-session-meta.js';
 import { isFactQuestion } from './fact-question.js';
 import { classifyTuiChatIntent, formatTuiRouteLine, isSeatOpsDirective, type TuiChatRoute } from '../core-turn/short-question.js';
 import { HARNESS_ROLE_ENV } from '../harness/harness-space.js';
+import { createReasoningThoughtBuffer } from './reasoning-thought-buffer.js';
 
 const FACT_QUESTION_INSTRUCTION = '사실·최신 정보 질문이다. WebSearch 를 1~2회 쓰고 검색 결과(제목·스니펫·URL)로 답하라. 출처 링크를 붙여라. 셸·브라우저·파일 도구는 검색 결과로 부족할 때만. 도구 예산에 닿으면 지금까지 근거로 답하고 끝에 «더 찾아볼까요?»를 붙여라.';
 
@@ -382,6 +383,16 @@ export function bridgeCoreTurnToAcp(
             return approvedDispatch(name, args, dispatchCtx);
           }
         : approvedDispatch;
+      // TUI-TURN-NARRATION 조각 2 — 추론 요약을 «문단» 단위로 모아 ACP `agent_thought_chunk`
+      //   (`_meta.reasoning: true`)로 보낸다. 대시보드가 흐린 💭 한 줄로 그린다(`acp-chat.ts`).
+      //   ⛔ 전에는 debug.log 로만 남아 화면엔 «무엇을 하는지»가 0줄이었다(결함 #87).
+      const reasoningThoughts = createReasoningThoughtBuffer((text) => {
+        debug.log('llm.reasoning', 'thought-emitted', { sessionId: turnCtx.sessionId, chars: text.length });
+        void turnCtx.pushSessionUpdate(
+          { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text } },
+          { reasoning: true },
+        );
+      });
       const dispatchResult = await runTurnDispatch({
         sessionId: turnCtx.sessionId,
         ...(originSessionId ? { originSessionId } : {}),
@@ -403,6 +414,7 @@ export function bridgeCoreTurnToAcp(
             // contract is synchronous onText. Chunks are delivered in
             // order because `sessionUpdate` is serialized per-
             // connection on the ACP SDK side.
+            if (delta.length > 0) reasoningThoughts.flush();
             streamedTextSum += delta;
             void turnCtx.push(delta);
           },
@@ -420,6 +432,7 @@ export function bridgeCoreTurnToAcp(
               toolKinds.add(call.name);
               observeToolBudget();
             }
+            reasoningThoughts.flush();
             void turnCtx.pushToolCall(call);
           },
           onToolResult: (call) => { void turnCtx.pushToolResult(call); },
@@ -435,15 +448,15 @@ export function bridgeCoreTurnToAcp(
               ...(resolvedRoute ? { routeProvider: resolvedRoute.provider } : {}),
             });
           },
-          // Codex Responses API reasoning summary stream. Currently
-          // surfaced via forensic only (debug.log) — acts as the
-          // "did the model actually emit reasoning?" verification
-          // signal before we wire the dashboard UI in a fast-follow.
+          // Codex Responses API reasoning summary stream. Surfaced to the
+          // dashboard as `agent_thought_chunk` via `reasoningThoughts`
+          // (TUI-TURN-NARRATION 조각 2) ⊕ the forensic debug.log below.
           // The forensic line carries the streamed delta and the
           // running summary index so a single grep gives the
           // reasoning trace in order. summary_part_added marks the
           // paragraph boundary; summary_delta is the text within.
           onReasoning: (event) => {
+            reasoningThoughts.onEvent(event);
             if (debug.enabled) {
               if (event.kind === 'summary_delta') {
                 debug.log('llm.reasoning', 'codex.summary.delta', {
@@ -459,6 +472,7 @@ export function bridgeCoreTurnToAcp(
             }
           },
           onTurnComplete: async (newMessages) => {
+            reasoningThoughts.flush();
             // Surface runtime-injected synthesis to ACP. emitTurnComplete
             // pushes the final assistant text (which may be the W5-E/F/G
             // force-synthesis output) into history. Compare to what was
@@ -592,7 +606,8 @@ export function bridgeCoreTurnToAcp(
             }
           },
         },
-      });
+      // 오류·취소로 끝나 onTurnComplete 가 안 불려도 마지막 추론 문단을 내보낸다(#28964 리뷰 FU-1 · 빈 버퍼면 무동작).
+      }).finally(() => reasoningThoughts.flush());
       // ⭐ 인증 거절은 코어 턴이 «던지지 않고» 돌려준다 — 여기서 안 읽으면 서버는 end_turn 을 내고
       //   TUI 엔 «✔ 완료»만 남는다(TUI 결함 #22). 던져서 실패 경로(prompt-failed · 오류 줄)로 보낸다.
       const stopReason = (dispatchResult as { stopReason?: unknown } | null | undefined)?.stopReason;

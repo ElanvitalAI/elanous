@@ -1,6 +1,6 @@
 // TUI 실행 상태 — 턴 기록·판독 ⊕ 기동 판 ⊕ stale 판정. 격리 tmp ELANOUS_STATE_DIR 로 실제 manifest 무접촉.
 import { afterAll, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -10,9 +10,11 @@ process.env.ELANOUS_STATE_DIR = stateDir;
 
 const { upsertPtyManifest, getPtyManifest, setPtyManifestDbPathForTesting, updatePtyManifestBuild, updatePtyManifestTurn, markPtyManifestClosed } = await import('./pty-manifest.js');
 const {
-  describePtyRunState, describeTurnCell, formatTurnCell, judgeBuildStaleness, ptyTurnViewOfRow, readCurrentInstallRecord, reportTuiTurn, resetTuiRunStateForTesting,
+  buildSelfHealthLine, describePtyRunState, describeTurnCell, formatTurnCell, judgeBuildStaleness, ptyTurnViewOfRow, readCurrentInstallRecord, reportTuiTurn, resetTuiRunStateForTesting,
   resolveRunningBuild, startTuiRunStateRecorder,
 } = await import('./tui-run-state.js');
+const { createHerdrAgentReporter } = await import('./herdr-agent-report.js');
+const { startTuiSelfReport } = await import('../capture/tui-self-report.js');
 
 const SHA_A = 'a'.repeat(40);
 const SHA_B = 'b'.repeat(40);
@@ -148,9 +150,96 @@ describe('stale judgment', () => {
   });
 });
 
+describe('herdr agent report wiring', () => {
+  test('injected herdr is start on recorder start, turn on busy then idle, release on stop', () => {
+    const order: string[] = [];
+    const herdr = {
+      start: () => order.push('start'),
+      turn: (t: 'busy' | 'idle') => order.push(`turn:${t}`),
+      release: () => order.push('release'),
+    };
+    const stop = startTuiRunStateRecorder('tui:herdr', {
+      now: () => 1,
+      build: () => ({ version: 'v', sha: SHA_A, source: 'installed' }),
+      writeBuild: () => { order.push('build'); return true; },
+      writeTurn: (_id, t) => { order.push(`write:${t}`); return true; },
+      herdr,
+    });
+    reportTuiTurn('busy');
+    reportTuiTurn('idle');
+    stop();
+    // 기동 순서 = 판 → manifest 초기 idle → herdr start · 초기 turn:idle 없음(start 가 이미 idle 을 신고한다).
+    expect(order).toEqual(['build', 'write:idle', 'start', 'write:busy', 'turn:busy', 'write:idle', 'turn:idle', 'release']);
+  });
+
+  test('herdr.turn 이 동기로 던지면 «보낸 상태» 로 적지 않는다 — herdr 기준 값으로 다음 전이를 다시 보낸다 (r4 리뷰 sf)', () => {
+    const calls: string[] = [];
+    const events: string[] = [];
+    let throwNext = true;
+    const herdr = {
+      start: () => {},
+      turn: (t: 'busy' | 'idle') => { calls.push(t); if (throwNext) { throwNext = false; throw new Error('boom'); } },
+      release: () => {},
+    };
+    const stop = startTuiRunStateRecorder('tui:herdr-throw', {
+      now: () => 1,
+      build: () => ({ version: 'v', sha: SHA_A, source: 'installed' }),
+      writeBuild: () => true,
+      writeTurn: () => true,
+      log: (e) => events.push(e),
+      herdr,
+    });
+    reportTuiTurn('busy'); // 던짐 → herdrLast 는 idle 그대로(herdr 는 여전히 idle 로 안다)
+    reportTuiTurn('idle'); // herdr 기준 값도 idle — 보낼 것이 없다
+    reportTuiTurn('busy'); // 다시 busy 를 보낸다(옛 코드는 herdrLast=busy 로 적어 이것도 막았다)
+    stop();
+    expect(calls).toEqual(['busy', 'busy']);
+    expect(events).toContain('herdr-turn-threw');
+  });
+
+  test('writeTurn injected without herdr never runs the herdr binary (spy call count 0, with a positive control)', async () => {
+    // 프로세스 실행 스파이 = 호출마다 한 줄 적는 가짜 herdr. 대조군(실 신고기)이 같은 스파이에 잡히는지 먼저 본다.
+    const dir = mkdtempSync(join(tmpdir(), 'herdr-spy-'));
+    const spyLog = join(dir, 'calls.log');
+    const spyBin = join(dir, 'herdr');
+    writeFileSync(spyBin, `#!/bin/sh\necho "$*" >> '${spyLog}'\n`, { mode: 0o755 });
+    const spyCalls = (): number => (existsSync(spyLog) ? readFileSync(spyLog, 'utf8').split('\n').filter(Boolean).length : 0);
+    const env = { HERDR_ENV: '1', HERDR_PANE_ID: 'wM:p1', HERDR_BIN_PATH: spyBin };
+    const keys = ['HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_BIN_PATH', 'ELANOUS_HERDR_REPORT'] as const;
+    const previous = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+    Object.assign(process.env, env);
+    delete process.env.ELANOUS_HERDR_REPORT;
+    try {
+      // 대조군 — 기본 러너가 스파이를 실제로 부른다(스파이가 살아 있다).
+      const control = createHerdrAgentReporter({ env, sessionId: 'control', seqStore: { read: () => undefined, write: () => {} } })!;
+      control.start();
+      for (let i = 0; i < 100 && spyCalls() < 2; i++) await new Promise((r) => setTimeout(r, 20));
+      expect(spyCalls()).toBe(2);
+      rmSync(spyLog, { force: true });
+
+      const stop = startTuiRunStateRecorder('tui:no-herdr', {
+        now: () => 1,
+        build: () => ({ version: 'v', sha: SHA_A, source: 'installed' }),
+        writeBuild: () => true,
+        writeTurn: () => true,
+      });
+      reportTuiTurn('busy');
+      reportTuiTurn('idle');
+      stop();
+      await new Promise((r) => setTimeout(r, 200));
+      expect(spyCalls()).toBe(0);
+    } finally {
+      for (const key of keys) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('self-report wiring', () => {
   test('startTuiSelfReport opens the run-state recorder after the row is registered and closes it on stop', async () => {
-    const { startTuiSelfReport } = await import('../capture/tui-self-report.js');
     const order: string[] = [];
     const stop = startTuiSelfReport({
       surfaceId: 'tui:wire', now: () => 1, heartbeatMs: 60_000,
@@ -192,5 +281,75 @@ describe('turn cell (H10 · pty list 턴 칸)', () => {
     expect(describeTurnCell(view, 100_000)).toEqual({ state: 'busy', at: 70_000, sinceSec: 30 });
     expect(updatePtyManifestTurn('tui:cell', 'idle', 100_000)).toBe(true);
     expect(formatTurnCell(describeTurnCell(ptyTurnViewOfRow(getPtyManifest('tui:cell')), 100_500))).toBe('idle,0s');
+  });
+});
+
+describe('매 턴 자기 건강 한 줄(TUI-SELF-HEALTH-LINE)', () => {
+  const installedBuild = { version: '0.2.34', sha: SHA_A, source: 'installed' as const, codeRoot: '/r' };
+  const healthy = { build: () => installedBuild, readInstalled: () => ({ sha: SHA_A, installedAt: 100 }) };
+
+  test('낡은 판(installed-moved) → 재기동 필요 — stale-install-check 안내·명령 문면을 그대로 재사용한다', () => {
+    const line = buildSelfHealthLine(null, {
+      build: () => installedBuild,
+      readInstalled: () => ({ sha: SHA_B, installedAt: 200 }),
+      sessionId: 'sess-1',
+    });
+    expect(line).toBe(
+      `[자기 건강] 실행 판 0.2.34@${SHA_A.slice(0, 7)}(installed) · 낡은 판 — 재기동 필요: `
+      + `새 판이 깔렸습니다 (부팅 판 ${SHA_A.slice(0, 7)} → 지금 ${SHA_B.slice(0, 7)}) · `
+      + `TUI 를 다시 띄우면 새 판으로 돕니다 · 다시 띄우기: elanous --resume "sess-1"`,
+    );
+  });
+
+  test('재기동 안내 회차(notifiedCount ≥ 2)도 기존 문면 재료를 그대로 싣는다', () => {
+    const line = buildSelfHealthLine(null, {
+      build: () => installedBuild,
+      readInstalled: () => ({ sha: SHA_B }),
+      notifiedCount: 2,
+    })!;
+    expect(line).toContain('이 TUI 가 뜬 뒤 2번째 새 판');
+  });
+
+  test('같은 판 → 판 최신 · 설치본을 못 잼 → 모름(안 낡았다로 꾸미지 않는다)', () => {
+    expect(buildSelfHealthLine(null, healthy)).toBe(
+      `[자기 건강] 실행 판 0.2.34@${SHA_A.slice(0, 7)}(installed) · 판 최신(same-as-installed)`,
+    );
+    expect(buildSelfHealthLine(null, {
+      build: () => installedBuild,
+      readInstalled: () => ({}),   // 설치본 기록을 못 읽음 → unknown
+    })).toBe(`[자기 건강] 실행 판 0.2.34@${SHA_A.slice(0, 7)}(installed) · 판 낡음 모름(unknown)`);
+  });
+
+  test('체크아웃 판이 움직인 낡은 판도 재기동 필요를 말한다(«새 판이 깔렸습니다» 는 갖다 붙이지 않는다)', () => {
+    const line = buildSelfHealthLine(null, {
+      build: () => ({ version: '0.2.34', sha: SHA_A, source: 'checkout' as const, codeRoot: '/r' }),
+      readInstalled: () => ({ sha: SHA_B }),
+      readCheckoutHead: () => SHA_B,
+      sessionId: 'sess-2',
+    });
+    expect(line).toBe(
+      `[자기 건강] 실행 판 0.2.34@${SHA_A.slice(0, 7)}(checkout) · `
+      + `낡은 판(checkout-moved) — 재기동 필요 · 다시 띄우기: elanous --resume "sess-2"`,
+    );
+  });
+
+  test('직전 30분 자기 오류 집계 — 건수·대표 오류를 말하고, 집계가 없으면 그 축은 말하지 않는다', () => {
+    expect(buildSelfHealthLine({ count: 3, sample: 'llm.response 502 (grok)' }, healthy)).toBe(
+      `[자기 건강] 실행 판 0.2.34@${SHA_A.slice(0, 7)}(installed) · 판 최신(same-as-installed) · `
+      + `직전 30분 자기 오류 3건 — 대표: llm.response 502 (grok)`,
+    );
+    expect(buildSelfHealthLine({ count: 0 }, healthy)).toContain('직전 30분 자기 오류 0건');
+    expect(buildSelfHealthLine(undefined, healthy)).not.toContain('자기 오류');
+  });
+
+  test('크레딧 사용 재료는 주어진 것만 실는다 · 판 축 재료가 깨지면 오류 축만 살아남다(null 은 아니다)', () => {
+    expect(buildSelfHealthLine(null, { ...healthy, creditUsage: '1.2M tokens' })).toContain('크레딧 사용 1.2M tokens');
+    expect(buildSelfHealthLine(null, healthy)).not.toContain('크레딧');
+    // 판 축 재료가 깨져도 오류는 밀려나지 않는다 — 오류가 다음 턴에 말해지는 게 이 줄의 존재 이유다.
+    expect(buildSelfHealthLine({ count: 1, sample: 'boom' }, {
+      ...healthy, readInstalled: () => { throw new Error('boom'); },
+    })).toBe('[자기 건강] 직전 30분 자기 오류 1건 — 대표: boom');
+    // 말할 것이 전혀 없으면 null — 턴에 줄을 얹지 않는다.
+    expect(buildSelfHealthLine(null, { ...healthy, readInstalled: () => { throw new Error('boom'); } })).toBe(null);
   });
 });

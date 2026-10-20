@@ -29,10 +29,13 @@
  * - 관측: `task-agent` · `rejudge-on-head {card, pr, fromHead, toHead, step, decision, reason}` — 수가 난 판단은 카드 history 에도
  *   한 줄(`event:'rejudge-on-head'` · 같은 머리·같은 단계·같은 판단은 한 번).
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { planPrLandRecovery, type PrLandRecoveryPlan } from '../cli/pr-land-recovery.js';
+import { lastJsonObject, runGraph } from '../graph-runner/runner.js';
 import { debug } from '../debug/log.js';
 import { prodInstanceRoot } from '../instance/resolve.js';
 import { getUserConfig } from '../user-config.js';
@@ -44,7 +47,7 @@ import { recordLiveMoveHistory } from './live-move-history.js';
 import { runRepairCycle, type RepairLaunchRequest } from './repair-cycle.js';
 import { repairMustFixFromReview, repairReviewDigest } from './repair-review.js';
 import type { RepairCasOutcome, RepairCasRequest } from './repair-branch-cas.js';
-import { defaultLandPrHead, defaultPrHead, defaultReviewRepoCandidates, executeLiveLand, executeLiveReview, landRetryPending, type LiveMoveDeps, type LiveMoveResult, type PrHeadView, type ReviewRepoCandidate, type TaskAgentLiveMove } from './live-moves.js';
+import { configuredMsb1Worker, defaultLandPrHead, defaultPrHead, defaultReviewRepoCandidates, executeLiveLand, executeLiveReview, landRetryPending, remoteTaWorkerCommand, type LiveMoveDeps, type LiveMoveResult, type PrHeadView, type ReviewRepoCandidate, type TaskAgentLiveMove } from './live-moves.js';
 import { capturedLandReview, captureReviewResults, parseReviewResultOutput, pendingReviewResults, reviewResultPath, type ParsedReviewResult } from './review-result-capture.js';
 import { boundPrTerminal, cardPrNumber, LIVE_MOVE_RESULT_EVENT, readTaskCard, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
 import { verifiedTrainLanding, type TrainLanding } from './train-landing.js';
@@ -98,6 +101,10 @@ export interface RejudgeDeps {
   notifyRepair?: (seat: string, body: string) => void;
   /** Shared new-launch budget for this `tasks rejudge --all` call. */
   repairBudget?: import('./repair-cycle.js').RepairTickBudget;
+  /** One review request across all candidates in one --all tick; standalone card rejudge is uncapped. */
+  reviewBudget?: { max: number; requested: number };
+  /** One land or queue attempt across all candidates in one --all tick. */
+  landBudget?: { max: number; requested: number };
   /** TA-REJUDGE-REBASE-LOOP — origin/main 을 PR 가지에 3-way merge 하고 일반 push. 시험은 주입한다. */
   catchUpMain?: (request: CatchUpRequest) => Promise<CatchUpResult>;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
@@ -265,12 +272,28 @@ export function regateRunArgs(entry: string, configDir: string, request: RegateR
   return [entry, '--config-dir', configDir, 'tasks', 'regate-run', '--card', request.card, '--pr', String(request.pr), '--head', request.head, '--repo', request.repoRoot, '--out', request.resultPath];
 }
 
-export async function defaultRequestRegate(request: RegateRequest, opts: { spawn?: DetachedSpawn; entry?: string; configDir?: string } = {}): Promise<void> {
+export async function defaultRequestRegate(request: RegateRequest, opts: { spawn?: DetachedSpawn; entry?: string; configDir?: string; remote?: import('./parent-host.js').ParentHostConfig | null } = {}): Promise<void> {
   const { spawnDetachedConfirmed, ELANOUS_CLI_ENTRY } = await import('../cli/tasks-cli.js');
   const { getElanousConfigDirOverride } = await import('../elanous-config-dir.js');
   const { effectiveInstanceRoot } = await import('../instance/resolve.js');
   const configDir = opts.configDir ?? getElanousConfigDirOverride() ?? effectiveInstanceRoot();
-  await spawnDetachedConfirmed(opts.spawn ?? (spawn as unknown as DetachedSpawn), process.execPath, regateRunArgs(opts.entry ?? ELANOUS_CLI_ENTRY, configDir, request), undefined, request.repoRoot);
+  const base = opts.spawn ?? (spawn as unknown as DetachedSpawn);
+  const remote = opts.remote === undefined ? (opts.spawn ? null : configuredMsb1Worker()) : opts.remote;
+  if (!remote) {
+    await spawnDetachedConfirmed(base, process.execPath, regateRunArgs(opts.entry ?? ELANOUS_CLI_ENTRY, configDir, request), undefined, request.repoRoot);
+    return;
+  }
+  // The remote worker writes its own result, then SSH carries only that JSON into the HQ result path.
+  const remoteResult = `/tmp/elanous-ta-regate-${randomUUID()}.json`;
+  const script = `${remoteTaWorkerCommand(remote, ['tasks', 'regate-run', '--card', request.card, '--pr', String(request.pr),
+    '--head', request.head, '--repo', remote.cwd, '--out', remoteResult])} >/dev/null; rc=$?; cat '${remoteResult}'; rm -f '${remoteResult}'; exit $rc`;
+  mkdirSync(dirname(request.resultPath), { recursive: true });
+  const fd = openSync(request.resultPath, 'w');
+  const toFile: DetachedSpawn = (command, args, options) =>
+    (base as unknown as (c: string, a: string[], o: unknown) => ReturnType<DetachedSpawn>)(command, args, { ...options, stdio: ['ignore', fd, 'ignore'] });
+  try {
+    await spawnDetachedConfirmed(toFile, 'ssh', ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', remote.host, script]);
+  } finally { closeSync(fd); }
 }
 
 /** 재게이트 결과 파일 — `tasks regate-run` 이 쓴다. */
@@ -513,6 +536,19 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   }
   const step = (s: RejudgeStep, decision: string, reason: string, record: boolean, extra: Partial<RejudgeOutcome> = {}) =>
     emit({ card: card!.id, pr, fromHead, toHead, step: s, decision, reason, ...extra }, record);
+  const requestReview = async (candidate: TaskCard, reason: string, forceNewReview = false): Promise<void> => {
+    const budget = deps.reviewBudget;
+    if (budget && budget.requested >= budget.max) {
+      step('review', 'tick-cap', `review request cap ${budget.max} reached — next tick`, false);
+      return;
+    }
+    // Reserve before awaiting the worker so another candidate cannot launch a second request.
+    if (budget) budget.requested++;
+    const before = { reviewRequests: candidate.reviewRequests, landAttempts: candidate.landAttempts };
+    const result = await executeLiveReview(candidate, pr, { runId: candidate.runId ?? null, stopReason: reason, cwd, forceNewReview }, { ...live, ...(deps.log ? { log: deps.log } : {}) });
+    recordMove(statePath, candidate.id, candidate.runId, 'review', result, pr, before, now, deps.log);
+    step('review', result.executed ? 'review-requested' : 'review-request-failed', result.detail, true);
+  };
 
   // Adoption is a first judgement for the current head, even when the implementation run
   // already asked for a review. A captured failure needs repair; an accepted result must
@@ -526,10 +562,7 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
     } else if (!deps.liveMoves.has('review')) {
       step('review', 'would-review', 'adopted PR first judgement · review not enabled in HQ taskAgent.liveMoves — shadow', false);
     } else {
-      const before = { reviewRequests: card.reviewRequests, landAttempts: card.landAttempts };
-      const result = await executeLiveReview(card, pr, { runId: card.runId ?? null, stopReason: 'adopted-pr-first-judgement', cwd }, { ...live, ...(deps.log ? { log: deps.log } : {}) });
-      recordMove(statePath, card.id, card.runId, 'review', result, pr, before, now, deps.log);
-      step('review', result.executed ? 'review-requested' : 'review-request-failed', result.detail, true);
+      await requestReview(card, 'adopted-pr-first-judgement');
     }
     return outcomes;
   }
@@ -618,12 +651,7 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
 
   if (!reviews.length) {
     if (!deps.liveMoves.has('review')) step('review', 'would-review', 'remote run terminal proven · review not enabled in HQ taskAgent.liveMoves — shadow', false);
-    else {
-      const before = { reviewRequests: card.reviewRequests, landAttempts: card.landAttempts };
-      const result = await executeLiveReview(card, pr, { runId: card.runId ?? null, stopReason: 'remote-run-terminal', cwd }, { ...live, ...(deps.log ? { log: deps.log } : {}) });
-      recordMove(statePath, card.id, card.runId, 'review', result, pr, before, now, deps.log);
-      step('review', result.executed ? 'review-requested' : 'review-request-failed', result.detail, true);
-    }
+    else await requestReview(card, 'remote-run-terminal');
     return outcomes;
   }
 
@@ -642,10 +670,7 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
       if (pendingReviewResults(latest).some((entry) => entry.pr === pr && sameHead(entry.head, toHead))) {
         step('review', 'awaiting-review-result', 'exact-head review result pending', false);
       } else if (!latest.reviewRequests?.some((entry) => entry.pr === pr && sameHead(entry.head, toHead)) && deps.liveMoves.has('review')) {
-        const before = { reviewRequests: latest.reviewRequests, landAttempts: latest.landAttempts };
-        const result = await executeLiveReview(latest, pr, { runId: latest.runId ?? null, stopReason: 'queue-exact-head', cwd }, { ...live, ...(deps.log ? { log: deps.log } : {}) });
-        recordMove(statePath, latest.id, latest.runId, 'review', result, pr, before, now, deps.log);
-        step('review', result.executed ? 'review-requested' : 'review-request-failed', result.detail, true);
+        await requestReview(latest, 'queue-exact-head');
       } else step('review', 'not-landing', 'exact-head PASS/WARN mf0 review not captured', true);
       return outcomes;
     }
@@ -654,8 +679,13 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
     const reviewResult = latest.reviewRequests?.find((entry) => entry.pr === pr && sameHead(entry.head, toHead) && entry.resultPath)?.resultPath;
     if (!reviewResult) { step('land', 'not-landing', 'exact-head review JSON path missing', true); return outcomes; }
     const before = { reviewRequests: latest.reviewRequests, landAttempts: latest.landAttempts };
+    if (deps.landBudget && deps.landBudget.requested >= deps.landBudget.max) {
+      step('land', 'tick-cap', `land attempt cap ${deps.landBudget.max} reached — next tick`, false);
+      return outcomes;
+    }
     const queued = await executeLiveLand(latest, pr, { runId: latest.runId ?? null, cycleId: `queue:${latest.id}:${toHead}`, cwd,
       review, reviewResultPath: reviewResult }, { ...live, landQueueConfig: queueMode, ...(deps.log ? { log: deps.log } : {}) });
+    if (deps.landBudget && queued.executed) deps.landBudget.requested++;
     recordMove(statePath, latest.id, latest.runId, 'propose-land', queued, pr, before, now, deps.log);
     step('land', queued.queued ? 'queued' : queued.ok && !queued.executed ? 'queue-skipped' : 'queue-refused', queued.detail, true);
     return outcomes;
@@ -778,12 +808,7 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   // ② 리뷰 — 지금 머리로 요청한 적이 없으면 다시(같은 머리는 한 번 · 상한은 ① 의 머리 수가 이미 막았다).
   if (!reviews.some((entry) => sameHead(entry.head, toHead))) {
     if (!deps.liveMoves.has('review')) step('review', 'would-review', 'review not enabled in taskAgent.liveMoves — shadow', false);
-    else {
-      const before = { reviewRequests: card.reviewRequests, landAttempts: card.landAttempts };
-      const result = await executeLiveReview(card, pr, { runId: card.runId ?? null, stopReason: 'rejudge-on-head', cwd }, { ...live, ...(deps.log ? { log: deps.log } : {}) });
-      recordMove(statePath, card.id, card.runId, 'review', result, pr, before, now, deps.log);
-      step('review', result.executed ? 'review-requested' : 'review-request-failed', result.detail, true);
-    }
+    else await requestReview(card, 'rejudge-on-head');
     return outcomes;
   }
   const latest = readTaskCard(card.id, statePath) ?? card;
@@ -828,10 +853,15 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
     return outcomes;
   }
   const before = { reviewRequests: latest.reviewRequests, landAttempts: latest.landAttempts };
+  if (deps.landBudget && deps.landBudget.requested >= deps.landBudget.max) {
+    step('land', 'tick-cap', `land attempt cap ${deps.landBudget.max} reached — next tick`, false);
+    return outcomes;
+  }
   // 주기 id — base-stale 재게이트 뒤의 land 는 새 base 를 붙여 앞 land 의 주기 표시(모듈 전역)와 갈린다 · gateAt 이 앞 base-stale 시도를 소비한다.
   const cycleId = `rejudge:${card.id}:${toHead}${regate.staleBase ? `:${regate.baseCommit.slice(0, 12)}` : ''}`;
   const landed = await executeLiveLand(latest, pr, { runId: card.runId ?? null, cycleId, cwd, review, reviewResultPath: reviewResult, overlapEvidence, gateAt: regate.at },
     { ...live, ...(deps.log ? { log: deps.log } : {}) });
+  if (deps.landBudget && landed.executed) deps.landBudget.requested++;
   // LAND-ORDER-LEDGER — executeLiveLand 직후 원장 한 줄(같은 pr+head 는 한 줄만). 쓰기가 실패해도 land 결과는 그대로(삼킨다).
   const landOrderLog = (event: 'appended' | 'append-failed') => { try { log('task-agent.land-order', event, { pr, head: toHead }); } catch { /* fail-soft */ } };
   try {
@@ -844,6 +874,38 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
     landOrderLog('append-failed');
   }
   recordMove(statePath, card.id, card.runId, 'propose-land', landed, pr, before, now, deps.log);
+  if (landed.executed && !landed.ok && /^✗/.test(landed.detail)) {
+    const context = { refusal: landed.detail, pr, head: toHead };
+    const preliminary = planPrLandRecovery(context);
+    if (preliminary.result.action === 'request-review' || preliminary.result.action === 'wait-retry') {
+      const entry = preliminary.result.action;
+      try {
+        const graphPath = entry === 'request-review' ? '../../graphs/units/task-agent-recover-review.yaml' : '../../graphs/units/task-agent-recover-wait.yaml';
+        const graph = await runGraph(join(import.meta.dir, graphPath), {
+          input: { ask: `TA land refusal for PR #${pr}`, context, prior: {} },
+          pinChildUniverse: true,
+          deps: { root: dirname(statePath) },
+        });
+        const output = lastJsonObject(graph.nodes.find((node) => node.nodeId === 'recover')?.output);
+        const plan = graph.status === 'done' && graph.unitCalls?.[0]?.entry === entry
+          && graph.unitCalls[0].exit === 'rework' ? output as unknown as PrLandRecoveryPlan | undefined : undefined;
+        const action = plan?.result?.action;
+        const matched = plan?.outcome === 'rework' && plan.result.pr === pr && plan.result.head === toHead
+          && action === preliminary.result.action && plan.evidence?.refusal === context.refusal.slice(0, 500)
+          && (action !== 'wait-retry' || plan.result.delayMs === 30_000);
+        if (!matched) step('land', 'recover-untrusted', `recover@1 ${entry} produced no pinned matching action`, true);
+        else if (action === 'request-review' && deps.liveMoves.has('review')) {
+          await requestReview(readTaskCard(card.id, statePath) ?? card, 'land-refusal-review-missing', true);
+        } else if (action === 'request-review') {
+          step('review', 'recover-review-disabled', 'recover@1 selected review but taskAgent.liveMoves excludes review', true);
+        } else if (action === 'wait-retry') {
+          step('land', 'recover-wait-retry', `recover@1 ${entry} selected existing retry admission after ${plan.result.delayMs}ms`, true);
+        } else step('land', 'recover-needs-human', `recover@1 ${entry}: ${plan.result.reason}`, true);
+      } catch (error) {
+        step('land', 'recover-failed', `recover@1 ${entry}: ${String(error).slice(0, 200)}`, true);
+      }
+    }
+  }
   // TA-LAND-RETRY-ON-INFRA — 실패한 시도는 갈래·사유·재시도 여부를 사유 줄에 싣는다(다음 틱이 왜 다시 하는지/안 하는지).
   const attempt = landed.landAttempt?.class
     ? ` · land-class ${landed.landAttempt.class} (${landed.landAttempt.reason}) · attempt ${landed.landAttempt.attempt} · ${landed.landAttempt.class === 'base-stale' ? 'base-stale → re-gate on a new base next tick (cap counts)' : landed.landAttempt.retryAllowed ? 'retry allowed on this head' : 'no retry on this head'}`
@@ -862,11 +924,35 @@ function recordMove(statePath: string, cardId: string, runId: string | undefined
 }
 
 /** 재판정 대상 카드 — 기존 리뷰 또는 HQ 가 종결 원장을 검증할 원격 부모 카드. */
-export function rejudgeCandidates(tasks: Readonly<Record<string, TaskCard>>): string[] {
+export function rejudgeCandidates(tasks: Readonly<Record<string, TaskCard>>, opts: {
+  now?: Date; maxAgeHours?: number; onAgeSkip?: (card: TaskCard, ageHours: number | null) => void;
+  /** Fresh remote PR heads; mf0 only gets priority when it matches this head. */
+  currentHeads?: ReadonlyMap<string, string>;
+} = {}): string[] {
+  const now = opts.now?.getTime() ?? Date.now();
+  const maxAgeHours = opts.maxAgeHours;
   return Object.values(tasks).filter((card) => {
     const pr = cardPrNumber(card);
-    return pr !== undefined && !boundPrTerminal(card) && ((card.reviewRequests ?? []).some((entry) => entry.pr === pr)
+    const eligible = pr !== undefined && !boundPrTerminal(card) && ((card.reviewRequests ?? []).some((entry) => entry.pr === pr)
       || (card.status === 'launched' && card.taLand === true && ((!!card.parentHost && !!card.runId && !!card.runChildId)
         || (card.adoptedPr?.pr === pr && typeof card.pr === 'object' && !!card.pr.url && sameUrl(card.adoptedPr.url, card.pr.url)))));
+    if (!eligible) return false;
+    if (maxAgeHours !== undefined) {
+      const created = Date.parse(card.createdAt);
+      const ageHours = Number.isFinite(created) ? Math.max(0, (now - created) / 3_600_000) : null;
+      if (ageHours === null || ageHours > maxAgeHours) { opts.onAgeSkip?.(card, ageHours); return false; }
+    }
+    return true;
+  }).sort((a, b) => {
+    const hasMf0 = (card: TaskCard): number => {
+      const pr = cardPrNumber(card);
+      const head = card.reviewRequests?.filter((entry) => entry.pr === pr).at(-1)?.head;
+      const currentHead = opts.currentHeads?.get(card.id);
+      return pr !== undefined && head && currentHead?.toLowerCase() === head.toLowerCase()
+        && capturedLandReview(card, pr, head)?.mustFixCount === 0 ? 1 : 0;
+    };
+    const ageOrder = (Number.isFinite(Date.parse(b.createdAt)) ? Date.parse(b.createdAt) : 0)
+      - (Number.isFinite(Date.parse(a.createdAt)) ? Date.parse(a.createdAt) : 0);
+    return hasMf0(b) - hasMf0(a) || ageOrder || a.id.localeCompare(b.id);
   }).map((card) => card.id);
 }

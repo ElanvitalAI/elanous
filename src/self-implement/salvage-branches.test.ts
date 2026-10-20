@@ -16,6 +16,7 @@ import {
 } from './salvage-branches.js';
 import { installHarnessSalvageCommand, runHarnessSalvage } from '../harness/harness-salvage-cli.js';
 import { installHarnessCliCommand } from '../harness/harness-cli-command.js';
+import { prodInstanceRoot } from '../instance/resolve.js';
 
 const RUN = 'run-bfe2b5c1-1234-4abc-8def-000000000000';
 const JOB = 'salvage/si-task-faa976af1ac4-220d3a79-k6gzw';
@@ -260,6 +261,63 @@ describe('salvage branches — run → PR | 수확 가지 | 없음 | 모름', ()
       expect(parsed.diffstat).toEqual({ files: 2, insertions: 4, deletions: 1 });
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('원격 부모 거울 원장만 있는 runId — 설치된 salvage 명령이 자기 항목만 출력한다', async () => {
+    const previousHome = process.env.HOME;
+    const home = mkdtempSync(join(tmpdir(), 'salvage-mirror-home-'));
+    try {
+      process.env.HOME = home;
+      // 임시 prodRoot — 로컬·연합 원장에는 없고 «원격 부모 거울 원장만» 있다(재현: 칸 SALVAGE-LSREMOTE-RC128).
+      const mirrorLedgerDir = join(prodInstanceRoot(), 'remote-parents', 'node-b', 'run-ledger');
+      mkdirSync(mirrorLedgerDir, { recursive: true });
+      const mine = 'run-4242c1d2-1234-4abc-8def-000000000001';
+      const stranger = 'run-7777c3d4-1234-4abc-8def-000000000002';
+      const ghost = 'run-9999c5d6-1234-4abc-8def-000000000003';
+      const ledgerLine = (runId: string, event: string, data: Record<string, unknown>) =>
+        `${JSON.stringify({ runId, timestamp: new Date().toISOString(), event, data })}\n`;
+      writeFileSync(
+        join(mirrorLedgerDir, `${mine}.jsonl`),
+        ledgerLine(mine, 'start', { stage: 'implement' })
+          + ledgerLine(mine, 'pr-opened', { number: 4242, prUrl: 'https://github.com/elanous/elanous/pull/4242' }),
+      );
+      writeFileSync(
+        join(mirrorLedgerDir, `${stranger}.jsonl`),
+        ledgerLine(stranger, 'start', { stage: 'implement' })
+          + ledgerLine(stranger, 'pr-opened', { number: 7777, prUrl: 'https://github.com/elanous/elanous/pull/7777' }),
+      );
+      // ghost 는 어떤 원장(거울 포함)에도 없다 — 남의 거울 원장을 오인하면 안 된다.
+
+      const program = new Command();
+      const harness = program.command('harness');
+      const lines: string[] = [];
+      installHarnessSalvageCommand(harness, { git: fakeGit(), print: (line) => lines.push(line) });
+      const previousExitCode = process.exitCode;
+      try {
+        await program.parseAsync(['node', 'x', 'harness', 'salvage', mine, stranger, ghost]);
+      } finally {
+        process.exitCode = previousExitCode ?? 0;
+      }
+      const verdicts = lines;
+
+      // (1) 정확한 runId — 거울 원장의 «실제 항목» 이 production 조회 경로(defaultReadPr)로 회수된다.
+      const found = verdicts.find((line) => line.startsWith(mine));
+      expect(found).toBe(`${mine}  PR #4242`);
+
+      // 다른 runId 도 «자기» 거울 원장에서 자기 항목만 읽는다 — mine 의 4242 와 섞이지 않는다.
+      const strangerVerdict = verdicts.find((line) => line.startsWith(stranger));
+      expect(strangerVerdict).toBe(`${stranger}  PR #7777`);
+
+      // (2) 원장에 없는 runId — 남의 거울 원장(PR 7777)을 오인해 PR 로 판정하지 않는다.
+      const ghostVerdict = verdicts.find((line) => line.startsWith(ghost));
+      expect(ghostVerdict).toContain('PR 모름 — 호스트 원장 없음');
+      expect(ghostVerdict).not.toContain('PR #');
+      expect(lines).toHaveLength(3);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });

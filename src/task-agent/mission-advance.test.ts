@@ -44,6 +44,11 @@ async function diamond(path: string, checklistId = 'CELL-M'): Promise<string> {
   return mission.id;
 }
 
+const doneBoundary = '\n완료 경계 코드: src/task-agent/mission.ts 의 조각 전이\n완료 경계 실물: 선행 PR 착지 뒤 준비된 조각만 발사\n완료 경계 증거 명령: bun test src/task-agent/mission-advance.test.ts';
+function prepareLiveDiamond(path: string, id: string): void {
+  for (const n of [2, 3]) updateTaskCard(path, `${id}-${n}`, (card) => ({ ...card!, text: `${card!.text}${doneBoundary}` }));
+}
+
 test('landedPieces — merged 만 착지 · pending·closed·no-ref·근거 없음은 미착지(추측하지 않는다)', () => {
   const mission = { pieces: ['a', 'b', 'c', 'd', 'e'] };
   expect([...landedPieces(mission, { a: 'merged', b: 'pending', c: 'closed', d: 'no-ref' })]).toEqual(['a']);
@@ -85,12 +90,13 @@ test('선행 PR 병합 → 다음 조각을 한 번 넘긴다 · 두 번 불러�
 test('--live — 새로 준비된 조각만 발사기 한 번 · shadow 로 넘겼던 조각도 live 로 한 번 · 그 뒤로는 0', async () => {
   const path = statePath();
   const id = await diamond(path);
+  prepareLiveDiamond(path, id);
   recordPieceRef(`${id}-1`, { pr: 101 }, path);
   const prs = fakePrs({ 101: 'merged' });
   await advanceMission(id, { statePath: path, readEvidence: prs }); // shadow 먼저
   const calls: string[][] = [];
   const live = await advanceMission(id, { statePath: path, readEvidence: prs, live: true, launcher: (args) => { calls.push(args); } });
-  expect(calls.map((args) => args.at(-1))).toEqual(['two', 'three']);
+  expect(calls.map((args) => args.at(-1))).toEqual([`two${doneBoundary}`, `three${doneBoundary}`]);
   expect(live.handed.every((piece) => piece.launched)).toBe(true);
   expect(readTaskCard(`${id}-2`, path)).toMatchObject({ status: 'launched', handed: { mode: 'live' }, mission: id, after: [`${id}-1`] });
   const again = await advanceMission(id, { statePath: path, readEvidence: prs, live: true, launcher: (args) => { calls.push(args); } });
@@ -101,9 +107,10 @@ test('--live — 새로 준비된 조각만 발사기 한 번 · shadow 로 넘�
 test('발사 실패 — 그 조각은 launch-failed ⊕ 표지에 사유 · 다시 넘기지 않는다', async () => {
   const path = statePath();
   const id = await diamond(path);
+  prepareLiveDiamond(path, id);
   recordPieceRef(`${id}-1`, { pr: 101 }, path);
   const prs = fakePrs({ 101: 'merged' });
-  const failed = await advanceMission(id, { statePath: path, readEvidence: prs, live: true, launcher: (args) => { if (args.at(-1) === 'two') throw new Error('boom'); } });
+  const failed = await advanceMission(id, { statePath: path, readEvidence: prs, live: true, launcher: (args) => { if (args.at(-1) === `two${doneBoundary}`) throw new Error('boom'); } });
   expect(failed.handed.find((piece) => piece.pieceId === `${id}-2`)?.error).toContain('boom');
   expect(readTaskCard(`${id}-2`, path)).toMatchObject({ status: 'launch-failed', handed: { mode: 'live', error: expect.stringContaining('boom') } });
   let calls = 0;
@@ -231,6 +238,7 @@ test('CLI tasks advance — --pr 로 근거를 적고 넘긴다 · 미션 id 와
 test('늦게 끝난 shadow 넘김은 live 표지를 덮지 않는다 — claim 을 잃은 handTask 는 쓰지 않는다', async () => {
   const path = statePath();
   const id = await diamond(path);
+  prepareLiveDiamond(path, id);
   // live 넘김이 이미 가져가 발사했다(디스크 = launched · live claim).
   updateTaskCard(path, `${id}-2`, (current) => ({ ...current!, status: 'launched', handed: { at: 't', mode: 'live', claim: 'live-claim' } }));
   const before = readTaskCard(`${id}-2`, path);

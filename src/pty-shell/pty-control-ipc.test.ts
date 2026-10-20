@@ -606,6 +606,16 @@ describe('pty-control-ipc round-trip', () => {
     await expect(req).resolves.toMatchObject({ status: 'write-failed', reason: 'adapter-write' });
   });
 
+  test('external-input refusal reasons survive IPC settlement unchanged', async () => {
+    for (const reason of ['tui-busy-text-without-enter', 'tui-external-input-queue-full'] as const) {
+      const h = registryHandle('write', () => { throw new Error(reason); });
+      const request = requestRemotePtyControl(h.id, 'input-text', { chars: 'external input' }, 2000);
+      await Bun.sleep(60);
+      await processPtyControlRequests((id) => id === h.id ? h : undefined, () => false);
+      await expect(request).resolves.toEqual({ status: 'write-failed', reason });
+    }
+  });
+
   // ⛔⭐⭐⭐ 외부 쓰기 출처 — `RUN-S25`(밖에서 쓴 문장이 자식의 완료 선언으로 읽힌다)의 «관측» 층.
   //   ⚠️ 판정을 바꾸지 않는다. 바꾸는 것은 「사후에 셀 수 있나」뿐이다.
   describe('externalWriteProvenance', () => {

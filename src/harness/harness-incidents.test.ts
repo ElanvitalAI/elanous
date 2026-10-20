@@ -7,6 +7,7 @@ import { detectBursts, detectCommonCauseBursts, formatIncidentBurstWarning, inci
 import { installHarnessCliCommand, recordClassifiedHarnessPodExit, warnRecentIncidentBurst } from './harness-cli-command.js';
 import * as podDispatch from './harness-pod-dispatch.js';
 import { debug } from '../debug/log.js';
+import { appendRunLedgerEntry, runLedgerDir } from '../self-implement/run-ledger.js';
 
 const roots: string[] = [];
 const oldRoot = process.env.ELANOUS_STATE_DIR;
@@ -522,6 +523,45 @@ test('recorded exit carries entrance, explicit seat, short cwd/host, pid and red
     lastLines: ['[self-dev] run run-fields', expect.stringContaining('pod-error:')] });
   expect(JSON.stringify(recorded)).not.toContain(token);
   expect(readFileSync(join(dir, 'incidents', readdirSync(join(dir, 'incidents'))[0]!), 'utf8')).not.toContain(token);
+});
+
+test('incident reads the child evidence ledger row even when forwarded stdout is truncated', () => {
+  const dir = root();
+  process.env.ELANOUS_STATE_DIR = dir;
+  const childEvidence = { classification: 'scope-escape', scopeEscape: true as const,
+    abandonedClassification: { classification: 'implementation-deficit' }, accountAvailability: { reason: 'no-candidate' } };
+  appendRunLedgerEntry({ runId: 'run-evidence', event: 'pod-child-run', data: { job: 'current', childRunId: 'run-current' } }, runLedgerDir(dir));
+  appendRunLedgerEntry({ runId: 'run-evidence', event: 'pod-child-evidence', data: { job: 'current', childRunId: 'run-current', childEvidence } }, runLedgerDir(dir));
+  recordClassifiedHarnessPodExit('run-evidence', 'pod-failure', 1, { output: 'short tail without child JSON' });
+  expect(readRunExits(dir)).toMatchObject([{ runId: 'run-evidence', reason: 'scope-escape', childEvidence }]);
+});
+
+test('incident ignores earlier Pod evidence after the current attempt has no child JSON', () => {
+  const dir = root();
+  process.env.ELANOUS_STATE_DIR = dir;
+  appendRunLedgerEntry({ runId: 'run-evidence-mask', event: 'pod-child-run', data: {
+    job: 'old', childRunId: 'run-old' } }, runLedgerDir(dir));
+  appendRunLedgerEntry({ runId: 'run-evidence-mask', event: 'pod-child-evidence', data: {
+    job: 'old', childRunId: 'run-old', childEvidence: { scopeEscape: true } } }, runLedgerDir(dir));
+  appendRunLedgerEntry({ runId: 'run-evidence-mask', event: 'pod-child-run', data: {
+    job: 'new', childRunId: 'run-new' } }, runLedgerDir(dir));
+  appendRunLedgerEntry({ runId: 'run-evidence-mask', event: 'pod-child-evidence', data: {
+    job: 'new', childRunId: 'run-new', childEvidence: null } }, runLedgerDir(dir));
+  recordClassifiedHarnessPodExit('run-evidence-mask', 'pod-failure', 1, { output: 'current failure' });
+  expect(readRunExits(dir)).toMatchObject([{ runId: 'run-evidence-mask', reason: 'pod-failure' }]);
+  expect(readRunExits(dir)[0]?.childEvidence).toBeUndefined();
+});
+
+test('incident rejects a malformed persisted scope flag', () => {
+  const dir = root();
+  process.env.ELANOUS_STATE_DIR = dir;
+  appendRunLedgerEntry({ runId: 'run-evidence-malformed', event: 'pod-child-run', data: {
+    job: 'current', childRunId: 'run-current' } }, runLedgerDir(dir));
+  appendRunLedgerEntry({ runId: 'run-evidence-malformed', event: 'pod-child-evidence', data: {
+    job: 'current', childRunId: 'run-current', childEvidence: { scopeEscape: 'false' } } }, runLedgerDir(dir));
+  recordClassifiedHarnessPodExit('run-evidence-malformed', 'pod-failure', 1, { output: 'current failure' });
+  expect(readRunExits(dir)).toMatchObject([{ runId: 'run-evidence-malformed', reason: 'pod-failure' }]);
+  expect(readRunExits(dir)[0]?.childEvidence).toBeUndefined();
 });
 
 test('incidents --json exposes recorded owner and redacted tail without revealing the token', async () => {

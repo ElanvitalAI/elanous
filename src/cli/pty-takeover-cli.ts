@@ -18,7 +18,7 @@ import { inspectControlInbox, type ControlInboxSnapshot } from '../harness/contr
 import { requestRemotePtyControl, type PtyControlAction, type PtyControlPayload, type PtyControlRequestOptions, type PtyControlResult } from '../pty-shell/pty-control-ipc.js';
 import { resolvePtySpecialKey } from '../pty-shell/pty-special-keys.js';
 import { encodeSgrMouse, mouseModeOffReason, type PtyMouseInput } from '../pty-shell/pty-mouse.js';
-import { resizePtyWithOutcome, writePtyWithOutcome } from '../pty-shell/pty-write-outcome.js';
+import { resizePtyWithOutcome, writePtyWithOutcome, writePtyWithOutcomeDetail } from '../pty-shell/pty-write-outcome.js';
 import type { PtyControlTarget, PtyHandle } from '../pty-shell/registry.js';
 import { ptyEventLogTargets, ptyManifestTargets } from '../domains/fleet.js';
 import { loadRunLedger, resolveFederatedRunLedgerDirectories, type RunLedgerEntry } from '../self-implement/run-ledger.js';
@@ -2074,12 +2074,13 @@ async function inject(ref: string, action: 'input-text' | 'input-key', chars: st
   if (!handle) return mapResult(action, id, await deps.requestRemote(id, action, { chars }, { actor }), deps, observed);
   const resolved = localActor(id, actor, deps);
   if (typeof resolved !== 'string') return mapResult(action, id, { status: 'denied', reason: resolved.reason }, deps, observed);
-  const outcome = writePtyWithOutcome(handle, chars, resolved);
-  return mapResult(action, id, outcome === 'success'
+  const outcome = writePtyWithOutcomeDetail(handle, chars, resolved);
+  const control: PtyControlResult = outcome.status === 'success'
     ? { status: 'success' }
-    : outcome === 'denied'
+    : outcome.status === 'denied'
       ? { status: 'denied', reason: 'write-arbiter' }
-      : { status: 'write-failed', reason: 'adapter-write' }, deps, observed);
+      : { status: 'write-failed', reason: outcome.reason ?? 'adapter-write' };
+  return mapResult(action, id, control, deps, observed);
 }
 interface PtyScreenAcquisition {
   readonly id: string;

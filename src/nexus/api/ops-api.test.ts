@@ -140,7 +140,7 @@ test('overview default background snapshot: first read returns pending promptly 
 test('default install with owner bearer refuses all ops data', async () => {
   const { send, run } = fixture(undefined);
   run('run-1', '2026-10-02T00:00:00Z');
-  for (const path of ['/v1/ops/overview', '/v1/ops/release/runs', '/v1/ops/release/runs/run-1/nodes/version-release/log', '/v1/ops/checklist?version=0.2.9']) {
+  for (const path of ['/v1/ops/overview', '/v1/ops/loops-map', '/v1/ops/release/runs', '/v1/ops/release/runs/run-1/nodes/version-release/log', '/v1/ops/checklist?version=0.2.9']) {
     const response = await send(path, { authorization: `Bearer ${OWNER}` });
     expect(response?.status).toBe(403);
     expect(await response?.json()).toEqual({ error: 'forbidden' });
@@ -423,6 +423,76 @@ test('resources: bearerless 401, stale cache answered immediately, and the injec
     expect(podCalls).toBe(1);
     expect(overlaid.pods[0]?.occupied.value).toBe(1);
     expect(overlaid.pods[0]?.occupied.missing).toBeNull();
+  } finally {
+    setOverviewCacheForTest(null);
+  }
+});
+
+test('loops-map: operator gate, projects cached loops with observedAt, preserves unmeasured null·reason, no new source calls', async () => {
+  const { send } = fixture(true);
+  let clock = Date.now();
+  let collects = 0;
+  const cell = <T>(value: T) => okCell(value, 'test ledger', new Date(clock).toISOString());
+  const observedAt = () => new Date(clock).toISOString();
+  const collect = async (): Promise<OverviewSnapshot> => {
+    collects++;
+    return {
+      generatedAt: observedAt(), instanceRoot: '/test', since: '최근 1h',
+      release: { version: cell('0.2.28'), run: cell('none' as const), schedule: cell('none' as const), checklist: cell({ green: 1, yellow: 0, red: 0, done: 0, p0Yellow: 0 }) },
+      tasks: { byOwner: cell({}), done: cell(0),
+        launchable: cell({ count: 0, ids: [], skipped: { noTargetPath: 0, predecessorOpen: 0, alreadyHanded: 0 }, interim: true }),
+        capacity: cell({ podUsed: 1, podTarget: 2, localUsed: 0, localMax: 0, free: 1 }) },
+      machines: { hosts: [], pods: [], parents: cell({ count: 0, staleOver6h: 0, oldestHours: null }) },
+      landings: cell({ count: 0, recent: [] }),
+      loops: [
+        { name: 'version-release', era: 'product', staleAfterSeconds: null, beat: cell({ lastAt: observedAt(), ageSeconds: 60, alive: true }) },
+        { name: 'echo-loop', era: 'seat-era', staleAfterSeconds: 600, beat: unmeasured('loop agent', '측정 대기') },
+      ],
+    };
+  };
+  let podCalls = 0;
+  setOverviewCacheForTest(createOverviewCache({
+    now: () => clock, collect,
+    measurePods: async () => { podCalls++; return []; },
+    schedule: () => ({ unref() {} }) as ReturnType<typeof setInterval>,
+  }));
+  const headers = { 'x-elanous-operator': SECRET };
+  try {
+    // Operator gate: no credential and a forged proxy header are both refused before any collection.
+    expect((await send('/v1/ops/loops-map'))?.status).toBe(403);
+    expect((await send('/v1/ops/loops-map', { 'x-elanous-operator': 'forged-forged-forged-forged' }))?.status).toBe(403);
+    expect(collects).toBe(0);
+    // The overview read fills the shared memo; loops-map then projects it — collector not called again.
+    const expectedGeneratedAt = observedAt();
+    await send('/v1/ops/overview', headers);
+    expect(collects).toBe(1);
+    clock += 5_000;
+    const map = await send('/v1/ops/loops-map', { authorization: `Bearer ${OWNER}` });
+    expect(map?.status).toBe(200);
+    expect(map?.headers.get('cache-control')).toBe('no-store');
+    const body = await map?.json() as {
+      generatedAt: string; cacheAgeMs: number;
+      loops: Array<{ name: string; era: string; beat: { value: unknown; source: string; observedAt: string | null; status: string; reason?: string } }>;
+    };
+    // Cache-response shape: the projected snapshot carries the memo's own generatedAt and age.
+    expect(body.generatedAt).toBe(expectedGeneratedAt);
+    expect(body.cacheAgeMs).toBe(5_000);
+    expect(body.loops.length).toBe(2);
+    // Measured loop: name·era·beat observedAt pass through the projection unchanged.
+    expect(body.loops[0]).toMatchObject({ name: 'version-release', era: 'product' });
+    expect(body.loops[0]?.beat.status).toBe('ok');
+    expect(body.loops[0]?.beat.observedAt).toBe(expectedGeneratedAt);
+    expect(body.loops[0]?.beat.value).toEqual({ lastAt: expectedGeneratedAt, ageSeconds: 60, alive: true });
+    // Unmeasured loop: null value, its reason and the null observedAt are preserved verbatim.
+    expect(body.loops[1]?.name).toBe('echo-loop');
+    expect(body.loops[1]?.era).toBe('seat-era');
+    expect(body.loops[1]?.beat.value).toBeNull();
+    expect(body.loops[1]?.beat.status).toBe('unmeasured');
+    expect(body.loops[1]?.beat.reason).toBe('측정 대기');
+    expect(body.loops[1]?.beat.observedAt).toBeNull();
+    // No additional source call: the loops-map read reused the memo filled by /v1/ops/overview.
+    expect(collects).toBe(1);
+    expect(podCalls).toBe(0);
   } finally {
     setOverviewCacheForTest(null);
   }

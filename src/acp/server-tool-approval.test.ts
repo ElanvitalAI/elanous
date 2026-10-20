@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getUserConfig, resetUserConfig } from '../user-config.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
 import { ClientSideConnection, ndJsonStream } from '@agentclientprotocol/sdk';
 import { createInProcessAcpBridge } from '../tui-client/acp-transport-local.js';
 import type { AcpTransportServer } from './transport/index.js';
@@ -31,6 +32,7 @@ async function withAcpClient(
   mkdirSync(join(root, 'elanous'));
   writeFileSync(join(root, 'elanous', 'config.json'), JSON.stringify(config));
   process.env.XDG_CONFIG_HOME = root;
+  setElanousConfigDir(join(root, 'elanous'));
   resetUserConfig();
   const abort = new AbortController();
   const bridge = createInProcessAcpBridge();
@@ -65,6 +67,7 @@ async function withAcpClient(
   } finally {
     if (prior === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = prior;
+    resetElanousConfigDir();
     resetUserConfig();
     rmSync(root, { recursive: true, force: true });
   }

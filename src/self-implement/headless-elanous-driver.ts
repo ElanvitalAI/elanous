@@ -1329,6 +1329,7 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
     workdir: opts.cwd,
     env: {
       ...(opts.stateDir ? { ELANOUS_STATE_DIR: opts.stateDir } : {}),
+      ...(process.env.XDG_DATA_HOME?.trim() ? { XDG_DATA_HOME: process.env.XDG_DATA_HOME } : {}),
       [CHILD_LIVENESS_HEARTBEAT_ENV]: resolveChildLivenessHeartbeatPath(opts.cwd),
       ...controlInboxEnv(controlInboxDir),
 // ⛔⭐ 뿌리와 «한 벌»로 간다(`OBS-T121`) — 안 주면 자식이 「파생」을 「명시 격리」로 읽는다.

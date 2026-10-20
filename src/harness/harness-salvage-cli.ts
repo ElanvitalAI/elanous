@@ -5,7 +5,9 @@
 import type { Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { normalizeRunId } from './harness-space.js';
-import { loadFederatedRunLedger } from '../self-implement/run-ledger.js';
+import { loadFederatedRunLedger, loadRunLedger } from '../self-implement/run-ledger.js';
+import { prodInstanceRoot } from '../instance/resolve.js';
+import { remoteLedgerMirrorDirs } from '../task-agent/parent-host.js';
 import { getUserConfig } from '../user-config.js';
 import { resolveRepositoryName } from './repository-name.js';
 import {
@@ -35,9 +37,19 @@ export interface HarnessSalvageDeps {
   print?: (line: string) => void;
 }
 
+/** 원격 부모 거울 원장 — remoteLedgerMirrorDirs(prodInstanceRoot()) 를 로컬·연합 원장 «뒤에»만 붙인다(tasks 쪽 원장 조회와 같은 재사용 경로 · 거울 생성·SSH 는 별개 칸). */
+function loadMirroredRunLedger(runId: string): ReturnType<typeof loadRunLedger> {
+  for (const directory of remoteLedgerMirrorDirs(prodInstanceRoot())) {
+    const ledger = loadRunLedger(runId, directory);
+    if (ledger !== null) return ledger;
+  }
+  return null;
+}
+
 function defaultReadPr(runId: string): RunPrState {
   try {
-    return prStateFromLedger(loadFederatedRunLedger(runId, { includeTest: true }));
+    // 로컬·연합 원장 먼저, 없으면 원격 부모 거울 — 순서는 tasks 쪽 원장 조회와 같다.
+    return prStateFromLedger(loadFederatedRunLedger(runId, { includeTest: true }) ?? loadMirroredRunLedger(runId));
   } catch (error) {
     return { status: 'unknown', reason: `원장 읽기 실패 · ${error instanceof Error ? error.message : String(error)}` };
   }

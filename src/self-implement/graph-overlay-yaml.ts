@@ -199,9 +199,24 @@ export function applyGraphOverlays(
     applied.push(overlay.overlayId);
   }
 
-  // ⑵ 계약 없는 노드를 «거부» — 권한 없는 노드가 조용히 들어오는 것을 막는다.
+  // ⑵ 계약 없는 실행 노드를 거부한다. 원본부터 계약이 없는 종결 gate 는
+  // 실행 권한을 갖지 않으므로 원본·결과 모두 recipe=none·출구 없음이고 선언이 그대로일 때만 허용한다.
   for (const node of next.nodes) {
-    if (!node.contract || node.contract.tools === '') {
+    const original = template.nodes.find((candidate) => candidate.nodeId === node.nodeId);
+    const existingTerminalGate = original?.kind === 'gate' && original.recipe === 'none'
+      && original.contract === undefined
+      && JSON.stringify(node) === JSON.stringify(original)
+      && template.terminalNodes.includes(node.nodeId)
+      && next.terminalNodes.includes(node.nodeId)
+      && !template.edges.some((edge) => edge.from === node.nodeId)
+      && !next.edges.some((edge) => edge.from === node.nodeId);
+    const contract = node.contract;
+    const validContract = contract != null && Array.isArray(contract.inputs)
+      && contract.inputs.every((input) => typeof input === 'string')
+      && typeof contract.tools === 'string' && contract.tools.trim() !== ''
+      && Array.isArray(contract.outputs)
+      && contract.outputs.every((output) => typeof output === 'string');
+    if (!existingTerminalGate && !validContract) {
       rejections.push({ kind: 'node-without-contract', overlayId: applied.join(',') || '<none>', nodeId: node.nodeId });
     }
   }

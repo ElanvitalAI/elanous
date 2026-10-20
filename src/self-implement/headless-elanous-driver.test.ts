@@ -108,6 +108,20 @@ async function captureChildEnv(options: Partial<Parameters<typeof runHeadlessGoa
   return env!;
 }
 
+test('headless goal-loop child inherits the parent XDG data root', async () => {
+  const previousXdgDataHome = process.env.XDG_DATA_HOME;
+  const isolatedDataHome = mkdtempSync(join(tmpdir(), 'headless-xdg-data-'));
+  stateDirs.push(isolatedDataHome);
+  process.env.XDG_DATA_HOME = isolatedDataHome;
+  try {
+    const childEnv = await captureChildEnv();
+    expect(childEnv.XDG_DATA_HOME).toBe(isolatedDataHome);
+  } finally {
+    if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = previousXdgDataHome;
+  }
+});
+
 async function captureScreenKey(
   driver: 'tui' | 'goal-loop',
   cwd: string,
@@ -151,7 +165,9 @@ async function captureScreenKey(
 }
 
 test('harness child PTY start and finish share the coord events journal, without the feature prompt', async () => {
-  const since = new Date().toISOString();
+  const stateDir = mkdtempSync(join(tmpdir(), 'headless-coord-journal-'));
+  stateDirs.push(stateDir);
+  process.env.ELANOUS_STATE_DIR = stateDir;
   const result = await runHeadlessGoalLoopPty({
     binRoot: '/tmp/repo', cwd: '/tmp/worktree', featurePrompt: 'PRIVATE FEATURE PROMPT',
     maxWaitSec: 1, maxHardWaitSec: 1, pollMs: 1, activityGraceSec: 100,
@@ -160,8 +176,9 @@ test('harness child PTY start and finish share the coord events journal, without
   expect(result.ok).toBe(true);
   const db = openSurfaceEventsDb();
   try {
-    const rows = listCoordEvents({ since, seat: 'harness-child' }, { db });
+    const rows = listCoordEvents({ since: '1970-01-01T00:00:00.000Z', seat: 'harness-child' }, { db });
     expect(rows.map((row) => row.kind)).toEqual(['started', 'finished']);
+    expect(existsSync(join(stateDir, 'surface_events.db'))).toBe(true);
     expect(rows[0]?.refs.source).toStartWith('elanous://harness/');
     expect(JSON.stringify(rows)).not.toContain('PRIVATE FEATURE PROMPT');
   } finally { db.close(); }

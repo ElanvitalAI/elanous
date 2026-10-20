@@ -27,6 +27,7 @@ const BIN = resolve(REPO, 'bin', 'elanous.mjs');
 // caller (`harness ask` drives this door with the stamp), so these cases spawn it the way that caller does.
 function runDev(args: readonly string[], caller: 'harness-ask' | 'outside' = 'harness-ask'): { code: number | null; stderr: string } {
   const env: NodeJS.ProcessEnv = { ...process.env, ELANOUS_SELF_IMPLEMENT_OBSERVE_ONLY: '1' };
+  delete env.XDG_CONFIG_HOME;
   if (caller === 'harness-ask') env.ELANOUS_HARNESS_ENTRANCE = 'cli-harness-ask';
   else delete env.ELANOUS_HARNESS_ENTRANCE;
   const r = spawnSync('bun', [BIN, '--test', 'dev', ...args], {
