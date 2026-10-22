@@ -5170,6 +5170,28 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.2.35
+
+Source: https://docs.elanous.ai/releases/0-2-35/
+
+## Behavior changes
+
+- The classic TUI remains the default; select the new TUI with `--tui next`. (#29674, #29708, #29998)
+- Stream local conversations and run tools and harness commands in the new TUI. (#29683, #29703, #29841, #29823, #29852)
+- View new conversations, task progress, provider choices, and applied themes in the interface. (#30015, #29743, #29751, #29724, #29770)
+- Added pre-turn compaction and wheel-based log scrolling to the new TUI. (#30030, #29969)
+- Run isolated Pod commands against a specified PR or commit. (#29974)
+- When large tasks are delegated, child steps inherit the parent contract and completion criteria; the completion boundary and decomposition result can be inspected. (#29993, #30026, #30052, #30041, #29753)
+- Preserve saved authentication and the selected model configuration in remote work. (#29746, #30043)
+- Improve release artifact collection and registry error handling; preserve image, test-shard, baseline, and terminal evidence when Pod or gate work fails. (#29632, #29650, #29646, #29662, #29676, #29757, #29853, #29868, #29900, #29941, #29956, #29962, #30009, #30033, #30053, #30117)
+- Improve PR reuse and linking within the same task to reduce duplicates and incorrect associations. (#29735, #29869, #29912, #29915, #29948)
+- Strengthen requirements-first guidance and review decisions to make blocking reasons and positive evidence clearer. (#29822, #29762, #30007, #30023, #30038)
+- Refine hold and ambiguous-result classification, the TUI picker, and idle clipboard and Git checks. (#29889, #29978, #30108, #30044, #30051, #30060)
+
+Plus 142 internal changes.
+
+---
+
 # 0.2.34
 
 Source: https://docs.elanous.ai/releases/0-2-34/
